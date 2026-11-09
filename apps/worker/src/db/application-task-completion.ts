@@ -154,7 +154,7 @@ export async function completeApplicationFillForReview(pool: Pool, input: { read
     if (awaitingApproval || authorizedForSubmission || queueRetry) return turn.status === "waiting_for_approval"
       ? { status: await existingCompletion(client, lease, task, turn, authorizedForSubmission || queueRetry) ? "completed" : "conflict" } : { status: "conflict" }
     if (task.status !== "filling" || task.checkpoint !== "browser_active" || !["in_progress", "waiting_for_dependency", "queued"].includes(turn.status)) return { status: "conflict" }
-    const transitioned = await client.query(`UPDATE "application_tasks" SET "status" = 'waiting_for_authorization', "checkpoint" = 'form_filled', "error" = NULL, "updatedAt" = $4 WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "status" = 'filling' AND "checkpoint" = 'browser_active' RETURNING "id"`, [task.id, lease.userId, lease.sessionId, now])
+    const transitioned = await client.query(`UPDATE "application_tasks" SET "status" = 'waiting_for_authorization', "checkpoint" = 'form_filled', "error" = NULL, "question" = NULL, "updatedAt" = $4 WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "status" = 'filling' AND "checkpoint" = 'browser_active' RETURNING "id"`, [task.id, lease.userId, lease.sessionId, now])
     if (transitioned.rowCount !== 1) return { status: "conflict" }
     await client.query(`INSERT INTO "application_task_events" ("id", "taskId", "type", "actor", "body", "data", "createdAt")
       VALUES ($1, $2, 'form_filled', 'worker', $3, $4::jsonb, $5)`, [randomUUID(), task.id, "Form filled without submission; final user authorization requested.", JSON.stringify({ turnId: lease.turnId }), now])

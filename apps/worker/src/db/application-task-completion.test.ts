@@ -62,7 +62,7 @@ async function approvalFixture(
 
 function fixture(options: {
   subtaskLive?: boolean; subtaskOwnerUserId?: string; subtaskOwner?: string; subtaskAttempt?: number; subtaskInterrupted?: boolean; appStatus?: string; appCheckpoint?: string; appTurnId?: string; sessionStatus?: string
-  turnStatus?: string; turnMissing?: boolean; completionApprovalStatus?: string; approvalMismatch?: ApprovalMismatch; artifactMismatch?: boolean
+  turnStatus?: string; turnMissing?: boolean; completionApprovalStatus?: string; approvalMismatch?: ApprovalMismatch; artifactMismatch?: boolean; initialQuestion?: unknown
 } = {}) {
   const lease = {
     id: "filler-task", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a", parentTaskId: "root-a",
@@ -75,7 +75,7 @@ function fixture(options: {
   const turn = { id: "turn-a", status: options.turnStatus ?? "in_progress", revision: options.turnStatus === "waiting_for_approval" ? 5 : 4 }
   const task = { id: "application-a", userId: "user-a", sessionId: "session-a", jobId: "job-a", fillTurnId: options.appTurnId ?? "turn-a",
     fillTurnSessionId: "session-a", fillTurnUserId: "user-a", status: options.appStatus ?? "filling",
-    checkpoint: options.appCheckpoint ?? "browser_active", resumeId: "resume-a", coverLetterId: null, confirmedAnswers: { eligible: "yes" } }
+    checkpoint: options.appCheckpoint ?? "browser_active", resumeId: "resume-a", coverLetterId: null, confirmedAnswers: { eligible: "yes" }, question: options.initialQuestion ?? null }
   const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
   const client = {
     query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
@@ -101,6 +101,7 @@ function fixture(options: {
         else {
           task.status = String(values[0] === task.id && sql.includes("'waiting_for_authorization'") ? "waiting_for_authorization" : "waiting_for_user")
           task.checkpoint = String(values[0] === task.id && sql.includes("'form_filled'") ? "form_filled" : values[3] ?? task.checkpoint)
+          if (sql.includes('"question" = NULL')) task.question = null
         }
         return { rows: [{ id: task.id }], rowCount: 1 }
       }
@@ -187,6 +188,29 @@ describe("ApplicationTask fill completion", () => {
     expect(test.calls.some(call => call.sql.includes('UPDATE "agent_turns" SET "status" = \'waiting_for_approval\'') && call.values?.[0] === "turn-a")).toBe(true)
     expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_approvals"') && call.values?.[4] === "turn-a")).toBe(true)
     expect(test.calls.filter(call => call.sql.startsWith("BEGIN"))).toHaveLength(1)
+  })
+
+  it("clears the resolved question on successful completion while preserving confirmed answers", async () => {
+    const now = new Date()
+    const priorQuestion = { waitId: "resolved-wait", detail: "required_field" }
+    const test = fixture({ turnStatus: "queued", initialQuestion: priorQuestion })
+    test.lease.leaseExpiresAt = new Date(now.getTime() + 60_000)
+    const confirmedAnswers = test.task.confirmedAnswers
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, now })).resolves.toEqual({ status: "completed" })
+
+    const taskUpdate = test.calls.find(call => call.sql.startsWith('UPDATE "application_tasks"'))
+    expect(taskUpdate?.sql).toContain('"question" = NULL')
+    expect(taskUpdate?.sql).not.toContain('"confirmedAnswers"')
+    expect(test.task.question).toBeNull()
+    expect(test.task.confirmedAnswers).toEqual(confirmedAnswers)
+    expect(test.calls.filter(call => call.sql.includes('INSERT INTO "agent_approvals"'))).toHaveLength(1)
+
+    const stale = fixture({ turnStatus: "queued", initialQuestion: priorQuestion, subtaskLive: false })
+    stale.lease.leaseExpiresAt = new Date(now.getTime() + 60_000)
+    await expect(completeApplicationFillForReview(stale.pool, { lease: stale.lease, now })).resolves.toEqual({ status: "stale" })
+    expect(stale.task.question).toEqual(priorQuestion)
+    expect(stale.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
   })
 
   it("completes a queued Turn only under the exact live child lease and creates the review approval", async () => {
