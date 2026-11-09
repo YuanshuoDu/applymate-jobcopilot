@@ -489,6 +489,7 @@ describe("scheduled pipeline pre-terminal completion", () => {
     })
     gateContinuationMocks.selectResume.mockResolvedValue({ status: "initial" })
     gateContinuationMocks.readCandidate.mockResolvedValue(null)
+    const readPostGateContext = vi.fn(async () => ({ status: "awaiting_plan" as const }))
     const verifyPostGate = vi.fn(async () => null)
     const verifyGate = vi.fn(async () => { order.push("verify-gate"); return gateProof })
     const appendGate = vi.fn(async () => {
@@ -500,7 +501,7 @@ describe("scheduled pipeline pre-terminal completion", () => {
       commandPort: {
         readScheduledAuditResumeContext: vi.fn(async () => ({ status: "not_registered" as const })),
         verifyScheduledAuditCompletion: vi.fn(),
-        readScheduledPostGatePlanningContext: vi.fn(async () => ({ status: "awaiting_plan" as const })),
+        readScheduledPostGatePlanningContext: readPostGateContext,
         verifyScheduledPostGateCompletion: verifyPostGate,
         appendScheduledGate: appendGate,
         resumeScheduledGateChoice: vi.fn(async () => ({ status: "accepted" as const, taskId: "gate-task", requestAttemptCount: 1,

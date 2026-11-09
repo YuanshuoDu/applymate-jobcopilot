@@ -230,12 +230,12 @@ async function diagnoseScheduledPostGateReplay(pool: Pool, scope: TaskGraphReadS
       ...(node.packageRefs === undefined ? {} : { packageRefs: node.packageRefs }),
     })) }
     const key = taskGraphProposalKey(scope.rootTaskId, receipt.gateGraphRevision)
-    const result = await client.query<Record<string, unknown>>(\`SELECT event."itemId", event."taskId", event."actor",
+    const result = await client.query<Record<string, unknown>>(`SELECT event."itemId", event."taskId", event."actor",
       event."idempotencyKey", event."payload" FROM "agent_events" AS event
       JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
       JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
       WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" IN ('item.started', 'item.delta')
-        AND event."idempotencyKey" = $3 AND session."userId" = $4 AND turn."userId" = $4 LIMIT 2\`,
+        AND event."idempotencyKey" = $3 AND session."userId" = $4 AND turn."userId" = $4 LIMIT 2`,
     [scope.sessionId, scope.turnId, key, scope.userId])
     const event = record(result.rows[0]), payload = event && record(event.payload)
     const planReceipt = payload && record(payload.receipt), planNodes = planReceipt && diagnosticDenseArray(planReceipt.nodes)

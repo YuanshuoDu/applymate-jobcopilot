@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
-import { SCHEDULED_GATE_COMPLETION_PROOF_SCHEMA, parseScheduledPostGateHandoff, scheduledPostGateDigest,
-  SCHEDULED_POST_GATE_HANDOFF_SCHEMA } from "./scheduled-post-gate-contract.js"
+import { SCHEDULED_GATE_COMPLETION_PROOF_SCHEMA } from "./scheduled-gate-contract.js"
+import { parseScheduledPostGateHandoff, scheduledPostGateDigest, SCHEDULED_POST_GATE_HANDOFF_SCHEMA } from "./scheduled-post-gate-contract.js"
 import { resumeScheduledPostGate } from "./scheduled-post-gate-handoff.js"
 
 const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
