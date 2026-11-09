@@ -70,14 +70,16 @@ function parseNode(value: unknown, index: number): TaskGraphNodeProposal | TaskG
   const path = `nodes[${index}]`
   if (!plainRecord(value, NODE_KEYS) && !plainRecord(value, NODE_KEYS_WITH_VERIFICATION) && !plainRecord(value, NODE_KEYS_WITH_REPAIR)
     && !hasScheduledTaskGraphPackageRefsShape(value, plainRecord)) return fail("invalid_shape", path, "Node must contain the exact TaskGraph fields and optional typed verification, repair relation, or package references")
-  if (!text(value.key, TASK_GRAPH_LIMITS.maxKeyLength) || !text(value.templateId, TASK_GRAPH_LIMITS.maxTemplateIdLength)
-    || !text(value.goal, TASK_GRAPH_LIMITS.maxGoalLength)) return fail("invalid_shape", path, "key, templateId, and goal must be non-empty and within their length limits")
-  const packageRefs = parseScheduledTaskGraphPackageRefs(value, TASK_GRAPH_LIMITS.maxScheduledPackageRefs, textArray)
-  if (!packageRefs.valid) return fail("invalid_shape", `${path}.packageRefs`, "packageRefs is required only for scheduled Execute nodes and must contain unique valid references")
-  if (!textArray(value.successCriteria, false, TASK_GRAPH_LIMITS.maxSuccessCriteria, TASK_GRAPH_LIMITS.maxCriterionLength)) return fail("invalid_shape", `${path}.successCriteria`, "Success criteria must contain one to eight non-empty strings of at most 320 characters")
-  if (!textArray(value.dependsOn, true, TASK_GRAPH_LIMITS.maxDependencies, TASK_GRAPH_LIMITS.maxKeyLength)) return fail("invalid_shape", `${path}.dependsOn`, "dependsOn must contain at most eight non-empty local keys of at most 128 characters")
-  if (new Set(value.dependsOn).size !== value.dependsOn.length) return fail("invalid_shape", `${path}.dependsOn`, "Dependencies must be unique")
   const node = value as Record<string, unknown>
+  const key = node.key, templateId = node.templateId, goal = node.goal
+  if (!text(key, TASK_GRAPH_LIMITS.maxKeyLength) || !text(templateId, TASK_GRAPH_LIMITS.maxTemplateIdLength)
+    || !text(goal, TASK_GRAPH_LIMITS.maxGoalLength)) return fail("invalid_shape", path, "key, templateId, and goal must be non-empty and within their length limits")
+  const packageRefs = parseScheduledTaskGraphPackageRefs(node, TASK_GRAPH_LIMITS.maxScheduledPackageRefs, textArray)
+  if (!packageRefs.valid) return fail("invalid_shape", `${path}.packageRefs`, "packageRefs is required only for scheduled Execute nodes and must contain unique valid references")
+  const successCriteria = node.successCriteria, dependsOn = node.dependsOn
+  if (!textArray(successCriteria, false, TASK_GRAPH_LIMITS.maxSuccessCriteria, TASK_GRAPH_LIMITS.maxCriterionLength)) return fail("invalid_shape", `${path}.successCriteria`, "Success criteria must contain one to eight non-empty strings of at most 320 characters")
+  if (!textArray(dependsOn, true, TASK_GRAPH_LIMITS.maxDependencies, TASK_GRAPH_LIMITS.maxKeyLength)) return fail("invalid_shape", `${path}.dependsOn`, "dependsOn must contain at most eight non-empty local keys of at most 128 characters")
+  if (new Set(dependsOn).size !== dependsOn.length) return fail("invalid_shape", `${path}.dependsOn`, "Dependencies must be unique")
   let repairOf: TaskGraphRepairOf | undefined
   if (Object.hasOwn(node, "repairOf")) {
     const parsed = parseTaskGraphProposalRepairOf(node.repairOf, index, { plainRecord, text, textArray,
@@ -85,7 +87,7 @@ function parseNode(value: unknown, index: number): TaskGraphNodeProposal | TaskG
     if ("ok" in parsed) return parsed
     repairOf = parsed
   }
-  return { key: value.key as string, templateId: value.templateId as string, goal: value.goal as string, successCriteria: [...value.successCriteria] as string[], dependsOn: [...value.dependsOn] as string[], ...(Object.hasOwn(node, "verification") ? { verification: node.verification as TaskGraphVerificationContract } : {}), ...(repairOf ? { repairOf } : {}), ...(packageRefs.packageRefs ? { packageRefs: packageRefs.packageRefs } : {}) }
+  return { key, templateId, goal, successCriteria: [...successCriteria], dependsOn: [...dependsOn], ...(Object.hasOwn(node, "verification") ? { verification: node.verification as TaskGraphVerificationContract } : {}), ...(repairOf ? { repairOf } : {}), ...(packageRefs.packageRefs ? { packageRefs: packageRefs.packageRefs } : {}) }
 }
 export function isValidTaskGraphRepairRelation(node: TaskGraphNodeProposal, target: TaskGraphNodeProposal & Readonly<{ taskId?: string; verificationDisposition?: TaskGraphVerificationDisposition }>): boolean {
   const relation = node.repairOf, role = taskGraphVerificationRole(node.templateId)

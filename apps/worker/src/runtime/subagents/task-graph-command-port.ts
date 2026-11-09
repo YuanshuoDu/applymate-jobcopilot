@@ -44,6 +44,13 @@ export type {
   TaskGraphScheduledPrepareInput,
 } from "./scheduled-gate-contract.js"
 export type {
+  ScheduledPostGateCompletionProof,
+  ScheduledPostGatePlanningContext,
+  ScheduledPostGateScheduleReceipt,
+  TaskGraphScheduledPostGatePlanInput,
+  TaskGraphScheduledPostGatePlanReadInput,
+} from "./scheduled-post-gate-contract.js"
+export type {
   TaskGraphNativeChildReceipt,
   TaskGraphNativeCommandReceipt,
   TaskGraphNativeNodeView,

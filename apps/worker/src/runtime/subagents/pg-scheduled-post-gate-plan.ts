@@ -2,7 +2,8 @@ import { appendScheduledPostGateTaskGraphProposal, TASK_GRAPH_LIMITS } from "../
 import { BudgetExceededError } from "../budget.js"
 import { enforceRootStepBudget } from "../turns/turn-engine-root-budget.js"
 import { TaskGraphCommandError,
-  type TaskGraphScheduledPostGatePlanInput, type ScheduledPostGatePlanningContext } from "./task-graph-command-port.js"
+  type TaskGraphScheduledPostGatePlanInput, type TaskGraphScheduledPostGatePlanReadInput,
+  type TaskGraphReadScope, type TaskGraphScheduleReceipt, type ScheduledPostGatePlanningContext } from "./task-graph-command-port.js"
 import { appendTaskGraphReceipt, writePlanReceipt } from "./task-graph-pg-events.js"
 import { createSubagentTask } from "./pg-store-create.js"
 import { enqueueGraphTask } from "./task-graph-pg-create.js"
@@ -27,7 +28,6 @@ import {
   SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID, SCHEDULED_POST_GATE_HANDOFF_EVENT, scheduledPostGateDigest,
   scheduledPostGateHandoffKey, scheduledPostGateOwner, type ScheduledPostGateHandoff, type ScheduledPostGateScheduleReceipt,
   parseScheduledPostGateExecuteTaskEnvelope, type ScheduledPostGateCompletionProof,
-  type TaskGraphScheduledPostGatePlanReadInput,
 } from "./scheduled-post-gate-contract.js"
 
 type Row = Record<string, unknown>
@@ -144,7 +144,7 @@ export async function appendScheduledPostGatePlan(client: Queryable,
   const statuses = new Map(created.map(node => [node.key, node.status] as const))
   const state = { ...append.state, nodes: append.state.nodes.map(node => ({ ...node, status: statuses.get(node.key) ?? node.status })) }
   const snapshot = taskGraphSnapshot(state, taskIds, loaded.snapshot.rootSuccessCriteria)
-  const receipt: ScheduledPostGateScheduleReceipt = { status: "accepted", revision: state.revision, nodes: created, readyTaskIds }
+  const receipt = { status: "accepted", revision: state.revision, nodes: created, readyTaskIds } satisfies TaskGraphScheduleReceipt
   const gateProof = context.gateProof, gateOwner = gateProof.prepareProof.receipt.owner
   const owner = scheduledPostGateOwner(scope, context.executionOwner, {
     rootAttemptCount: scope.parentAttemptCount, turnLeaseOwnerId: gateOwner.turnLeaseOwnerId, turnLeaseVersion: gateOwner.turnLeaseVersion,

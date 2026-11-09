@@ -108,7 +108,14 @@ export function createScheduledAutomationGateContinuation(input: Readonly<{
     if ("mode" in continuation) {
       if (continuation.mode === "resume_audit") return resumeScheduledAudit({ command, waitPort, scope: scope.readScope, recoveryStepId, signal })
       const resumed = await resumeScheduledPostGate({ command, waitPort, scope: scope.readScope, recoveryStepId, signal })
-      return resumed.status === "awaiting_plan" ? { status: "replan", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK } : resumed
+      switch (resumed.status) {
+        case "awaiting_plan": return { status: "replan", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK }
+        case "not_registered": return { status: "not_registered" }
+        case "completed": return { status: "completed" }
+        case "waiting_for_dependency": return { status: "waiting_for_dependency", waitId: resumed.waitId }
+        case "blocked": return { status: "blocked", errorCode: resumed.errorCode }
+        default: return { status: "blocked", errorCode: "scheduled_post_gate_resume_invalid" }
+      }
     }
     const gateWait = waitPort.waitScheduledGate
     if (!command.appendScheduledGate || typeof gateWait !== "function"

@@ -3,6 +3,7 @@ import {
   parseScheduledPostGateExecuteTaskEnvelope, parseScheduledPostGateHandoff, scheduledPostGateDigest,
   scheduledPostGateHandoffKey, scheduledPostGateScopeMatchesOwner, SCHEDULED_POST_GATE_HANDOFF_SCHEMA,
 } from "./scheduled-post-gate-contract.js"
+import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 
 const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
   turnLeaseOwnerId: "lease-1", turnLeaseVersion: 3, executionId: "execution-1", executionAttemptCount: 1 }
@@ -83,9 +84,10 @@ describe("scheduled post-Gate contract parsing", () => {
   })
 
   it("matches only the immutable Root and Turn lease provenance", () => {
-    const scope = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
-      parentTaskId: owner.rootTaskId, parentAttemptCount: owner.rootAttemptCount,
-      turnLeaseOwner: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion }
+    const scope: TaskGraphExecutionScope = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+      rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId, stepId: "step-1",
+      turnLeaseOwner: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion,
+      parentLeaseOwner: owner.turnLeaseOwnerId, parentAttemptCount: owner.rootAttemptCount }
     expect(scheduledPostGateScopeMatchesOwner(scope, owner)).toBe(true)
     expect(scheduledPostGateScopeMatchesOwner({ ...scope, turnLeaseVersion: 4 }, owner)).toBe(false)
     expect(scheduledPostGateScopeMatchesOwner({ ...scope, parentAttemptCount: 3 }, owner)).toBe(false)

@@ -5,7 +5,8 @@ import { SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_AUDIT_ROLE
 import type { ScheduledPostGateChildContext } from "./scheduled-post-gate-context.js"
 import type { SubagentLease } from "./types.js"
 
-const mocks = vi.hoisted(() => ({ context: vi.fn() }))
+type ScheduledPostGateContextReader = typeof import("./scheduled-post-gate-context.js").readScheduledPostGateChildContext
+const mocks = vi.hoisted(() => ({ context: vi.fn<ScheduledPostGateContextReader>() }))
 vi.mock("./scheduled-post-gate-context.js", async importOriginal => ({
   ...await importOriginal<typeof import("./scheduled-post-gate-context.js")>(), readScheduledPostGateChildContext: mocks.context,
 }))
@@ -47,7 +48,7 @@ describe("scheduled post-Gate fixed child runtime", () => {
   it("runs only the Gate-bound package partition and persists the bounded Execute result", async () => {
     vi.stubEnv("AGENT_WEB_URL", "https://web.example")
     vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret")
-    const db = client(), pool = { connect: vi.fn(async () => db) }, fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
+    const db = client(), pool = { connect: vi.fn(async () => db) }, fetcher = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
       expect(JSON.parse(String(init?.body))).toEqual({ action: "scheduled_post_gate_execute", owner, handoff, attestation,
         actor: context("execute").actor, packageRefs: refs })
       return response({ status: "completed", structuredResult: { queued: ["pkg-a"], failed: ["pkg-b"] } })
@@ -69,7 +70,7 @@ describe("scheduled post-Gate fixed child runtime", () => {
   it("runs the fixed Audit request without an Execute packageRefs field", async () => {
     vi.stubEnv("AGENT_WEB_URL", "https://web.example")
     vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret")
-    const fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
+    const fetcher = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>
       expect(body.action).toBe("scheduled_post_gate_audit")
       expect(Object.hasOwn(body, "packageRefs")).toBe(false)

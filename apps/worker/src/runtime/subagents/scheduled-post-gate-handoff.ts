@@ -37,6 +37,7 @@ export async function resumeScheduledPostGate(input: Readonly<{ command: TaskGra
   if (first.status === "not_applicable") return { status: "not_registered" }
   if (first.status === "invalid") return { status: "blocked", errorCode: "scheduled_post_gate_resume_invalid" }
   if (first.status === "awaiting_plan") return { status: "awaiting_plan" }
+  if (first.status !== "planned") return { status: "blocked", errorCode: "scheduled_post_gate_resume_invalid" }
   if (!scopeMatchesHandoff(input.scope, first.receipt)) return { status: "blocked", errorCode: "scheduled_post_gate_owner_mismatch" }
   const handoff = first.receipt
   const targets = [...handoff.executeNodes.map(node => node.taskId), handoff.auditTaskId]
@@ -49,8 +50,10 @@ export async function resumeScheduledPostGate(input: Readonly<{ command: TaskGra
   if (wait.status !== "ready") return { status: "blocked", errorCode: `scheduled_post_gate_wait_${wait.status}` }
   if (input.signal.aborted) throw input.signal.reason ?? new Error("scheduled_post_gate_resume_cancelled")
   const current = await command.readScheduledPostGatePlanningContext({ scope: input.scope })
-  if (current.status !== "planned" || current.graphRevision < first.graphRevision
-    || !same(current.receipt, handoff)) return { status: "blocked", errorCode: "scheduled_post_gate_wait_binding_changed" }
+  if (current.status !== "planned") return { status: "blocked", errorCode: "scheduled_post_gate_wait_binding_changed" }
+  if (current.graphRevision < first.graphRevision || !same(current.receipt, handoff)) {
+    return { status: "blocked", errorCode: "scheduled_post_gate_wait_binding_changed" }
+  }
   const proof = await command.verifyScheduledPostGateCompletion({ scope: input.scope })
   if (input.signal.aborted) throw input.signal.reason ?? new Error("scheduled_post_gate_resume_cancelled")
   return postGateProofMatches(proof, handoff) ? { status: "completed" }

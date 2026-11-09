@@ -10,6 +10,7 @@ import { readScheduledPostGateReceipt, validateScheduledPostGateHandoff } from "
 import { SCHEDULED_POST_GATE_AUDIT_ROLE, SCHEDULED_POST_GATE_AUDIT_TASK_TYPE,
   SCHEDULED_POST_GATE_EXECUTE_ROLE, SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE,
   type ScheduledPostGateHandoff } from "./scheduled-post-gate-contract.js"
+import type { ScheduledGateCheckpointEvidence } from "./scheduled-gate-contract.js"
 import type { SubagentLease } from "./types.js"
 import type { TaskGraphReadScope } from "./task-graph-command-port.js"
 import type { TaskGraphSnapshot } from "./task-graph-snapshot.js"
@@ -43,7 +44,7 @@ export async function readScheduledPostGateChildContext(client: Queryable, lease
   if (!handoff || handoff.owner.rootAttemptCount !== live.rootAttemptCount
     || handoff.owner.executionId !== live.executionId || handoff.owner.executionAttemptCount !== live.executionAttemptCount) return null
   const checkpoint = scheduledAuditGateCheckpointEvidence(live.executionState, live.executionStatus)
-  if (!checkpoint || !sameOwner(checkpoint.owner, handoff.owner) || checkpoint.continuationKey !== handoff.continuationKey
+  if (!checkpoint || !sameCheckpointOwner(checkpoint.owner, handoff.owner) || checkpoint.continuationKey !== handoff.continuationKey
     || checkpoint.snapshotDigest !== handoff.snapshotDigest || checkpoint.checkpointDigest !== handoff.gateProof.prepareProof.receipt.checkpointDigest
     || checkpoint.evidenceDigest !== handoff.gateProof.prepareProof.receipt.evidenceDigest
     || checkpoint.analyzeGraphRevision !== handoff.gateProof.prepareProof.receipt.analyzeGraphRevision
@@ -130,6 +131,11 @@ function sameOwner(left: ScheduledAutomationPipelineBridgeScope, right: Schedule
   return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
     && left.rootTaskId === right.rootTaskId && left.rootAttemptCount === right.rootAttemptCount
     && left.turnLeaseOwnerId === right.turnLeaseOwnerId && left.turnLeaseVersion === right.turnLeaseVersion
+}
+function sameCheckpointOwner(left: ScheduledGateCheckpointEvidence["owner"], right: ScheduledPostGateHandoff["owner"]): boolean {
+  return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
+    && left.rootTaskId === right.rootTaskId && left.rootAttemptCount === right.rootAttemptCount
+    && left.executionId === right.executionId && left.executionAttemptCount === right.executionAttemptCount
 }
 function sameLease(row: Row, lease: SubagentLease, now: Date): boolean {
   const expiry = row.leaseExpiresAt instanceof Date ? row.leaseExpiresAt : new Date(String(row.leaseExpiresAt))

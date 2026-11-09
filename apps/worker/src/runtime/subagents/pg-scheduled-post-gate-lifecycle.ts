@@ -34,7 +34,7 @@ export async function prepareScheduledPostGateFinish(client: pg.PoolClient, grap
     return reject(client, input, safeResult, finalize, kind === "execute"
       ? "scheduled_post_gate_execute_result_invalid" : "scheduled_post_gate_audit_result_invalid")
   }
-  const completionTask = { ...task, status: "completed", failureReason: null, result: safeResult }
+  const completionTask = { ...task, status: "completed" as const, failureReason: null, result: safeResult }
   const completionTasks = new Map(loaded.tasks); completionTasks.set(input.taskId, completionTask)
   if (isScheduledTaskGraphSpecializedEnvelope({ snapshot: loaded.snapshot, tasks: completionTasks, node: currentNode, task: completionTask }) !== kind) {
     return reject(client, input, safeResult, finalize, kind === "execute"

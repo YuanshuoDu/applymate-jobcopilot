@@ -14,7 +14,7 @@ describe("terminal decision routing", () => {
     completionGate[SCHEDULED_PIPELINE_COMPLETION] = async input => ({ status: "replan", candidateText: input.candidateText,
       feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK })
     const append = vi.fn(async (..._args: Parameters<TurnExecutionEventWriter["append"]>) => "event-1")
-    const result = await assertCompletionAllowed({ identity, scope: {}, completionGate }, { append }, { id: "step-1", ordinal: 1 },
+    const result = await assertCompletionAllowed({ identity, scope: { userId: "user-1" }, completionGate }, { append }, { id: "step-1", ordinal: 1 },
       new AbortController().signal, () => new Date("2026-01-01T00:00:00.000Z"), "candidate")
 
     expect(result).toEqual({ feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK })

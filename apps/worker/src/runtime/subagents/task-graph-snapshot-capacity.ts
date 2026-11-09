@@ -4,6 +4,10 @@ import { projectScheduledPipelineGraphAtCurrentStage } from "./scheduled-pipelin
 const PACKAGE_REFS_NODE_KEYS = "dependsOn,depth,goal,key,packageRefs,successCriteria,taskId,templateId,verificationDisposition"
 const EXECUTE_TEMPLATE_ID = "scheduled.application.execute"
 
+function text(value: unknown, maxLength: number): value is string {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength
+}
+
 export type TaskGraphSnapshotPackageRefs = Readonly<{
   valid: boolean
   shape: boolean

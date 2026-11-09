@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 import { resumeScheduledPostGate } from "./scheduled-post-gate-handoff.js"
 
 const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
-  parentAttemptCount: 2, turnLeaseOwner: "lease-owner", turnLeaseVersion: 4 }
+  parentAttemptCount: 2, parentLeaseOwner: "root-lease-owner", turnLeaseOwner: "lease-owner", turnLeaseVersion: 4 }
 const handoff = { owner: { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
   rootAttemptCount: 2, turnLeaseOwnerId: scope.turnLeaseOwner, turnLeaseVersion: scope.turnLeaseVersion,
   executionId: "execution-1", executionAttemptCount: 1 }, graphRevision: 9,

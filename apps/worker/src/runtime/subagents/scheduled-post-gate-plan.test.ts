@@ -5,8 +5,14 @@ import {
   SCHEDULED_POST_GATE_EXECUTE_CRITERIA, SCHEDULED_POST_GATE_EXECUTE_GOAL, SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID,
 } from "./scheduled-post-gate-contract.js"
 import type { TaskGraphProposal } from "../planning/task-graph.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 
 const approved = ["package-a", "package-b", "package-c"]
+const typedVerification = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  role: "analyst",
+  criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+} satisfies TaskGraphVerificationContract
 function execute(key: string, packageRefs: readonly string[]) {
   return { key, templateId: SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID, goal: SCHEDULED_POST_GATE_EXECUTE_GOAL,
     successCriteria: SCHEDULED_POST_GATE_EXECUTE_CRITERIA, dependsOn: ["gate"], packageRefs }
@@ -62,7 +68,7 @@ describe("scheduled post-Gate plan shape", () => {
     const valid = proposal([execute("execute-a", approved), audit(["execute-a"])])
     expect(parseScheduledPostGatePlan(valid, 8, approved)).toBeNull()
     expect(parseScheduledPostGatePlan({ ...valid, nodes: [
-      { ...valid.nodes[0]!, verification: { schemaVersion: "unexpected" } }, valid.nodes[1]!,
+      { ...valid.nodes[0]!, verification: typedVerification }, valid.nodes[1]!,
     ] }, 7, approved)).toBeNull()
     expect(parseScheduledPostGatePlan(proposal([execute("execute-a", approved), audit([])]), 7, approved)).toBeNull()
     expect(parseScheduledPostGatePlan(proposal([execute("execute-a", approved), audit(["execute-a", "extra-edge"])]), 7, approved)).toBeNull()
