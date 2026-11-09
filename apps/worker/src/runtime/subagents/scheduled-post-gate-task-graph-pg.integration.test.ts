@@ -231,11 +231,13 @@ async function seedAgentPlanHistory(client: Pool, lease: TurnLease, rootTaskId: 
 
 async function insertEvent(client: Pool, event: { sessionId: string; turnId: string; itemId: string | null; taskId: string | null;
   type: string; actor: string; correlationId: string; idempotencyKey: string; payload: unknown }): Promise<void> {
-  const next = await client.query<{ sequence: string }>(`SELECT (COALESCE(MAX("sequence"), 0) + 1)::text AS "sequence"
-    FROM "agent_events" WHERE "sessionId"=$1 AND "turnId"=$2`, [event.sessionId, event.turnId])
+  const updated = await client.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+    WHERE "id" = $1 RETURNING "eventSequence"`, [event.sessionId])
+  const sequence = updated.rows[0]?.eventSequence
+  if (sequence === undefined) throw new Error("scheduled_post_gate_event_sequence_missing")
   await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10,$11::jsonb)`, [randomUUID(), event.sessionId, event.turnId, event.itemId,
-    event.taskId, next.rows[0]!.sequence, event.type, event.actor, event.correlationId, event.idempotencyKey, JSON.stringify(event.payload)])
+    event.taskId, String(sequence), event.type, event.actor, event.correlationId, event.idempotencyKey, JSON.stringify(event.payload)])
 }
 
 async function executePostGateTask(store: PgSubagentTaskStore, executor: ReturnType<typeof createScheduledPostGateChildExecutor>,
