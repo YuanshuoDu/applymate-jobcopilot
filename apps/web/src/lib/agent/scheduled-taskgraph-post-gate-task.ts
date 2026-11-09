@@ -7,6 +7,7 @@ import { pipelineAgentConfigFrom } from '@/app/api/agent/run/run-helpers'
 import { automationRunOverrides, withAutomationOverrides } from './automation-overrides'
 import { loadRoleConfigs, toRoleConfigMap } from './role-config'
 import { resumeToText, type ApplicationPackage, type PipelineCheckpointState, type RunReport } from './types'
+import type { ScheduledTaskGraphGateCompletion } from './scheduled-taskgraph-gate-service'
 import type { PipelineCtx } from './pipeline-context'
 import { runExecute } from './stages/execute'
 import { runAudit } from './stages/audit'
@@ -52,7 +53,9 @@ export async function runScheduledTaskGraphPostGateTask(value: unknown, signal?:
     const audit = await runAudit(childOutput, [...loaded.ownedJobs], ctx, { syncGmail: false })
     if (!audit.ok || !audit.data || signal?.aborted) return blocked(409, 'scheduled_post_gate_audit_invalid')
     if (!await postGateIsCurrent(request, loaded)) return blocked(409, 'scheduled_post_gate_actor_fenced')
-    const report = reportFromCheckpoint(loaded.checkpoint, loaded.gateInput.packages, loaded.gateInput.gateResult!, childOutput)
+    const gateResult = loaded.gateInput.gateResult
+    if (!isCompletedGateResult(gateResult)) return blocked(409, 'scheduled_post_gate_report_invalid')
+    const report = reportFromCheckpoint(loaded.checkpoint, loaded.gateInput.packages, gateResult, childOutput)
     return report ? Response.json({ status: 'completed', report }) : blocked(409, 'scheduled_post_gate_report_invalid')
   } catch {
     return blocked(409, signal?.aborted ? 'scheduled_post_gate_actor_fenced' : 'scheduled_post_gate_execution_failed')
@@ -78,8 +81,9 @@ async function loadInputs(request: Request): Promise<Loaded | null> {
   const checkpoint = record(execution.state)
   if (!snapshot || turnInput?.automationRunMode !== 'scheduled' || !checkpoint) return null
   const analyzeCheckpoint = scheduledCheckpointForGate(checkpoint)
-  const gateProof = scheduledTaskGraphExecuteGateCompletionProof(request.handoff.gateProof), attestation = request.attestation
-  if (!analyzeCheckpoint || !gateProof || !attestation || scheduledAutomationSnapshotDigest(snapshot) !== request.handoff.snapshotDigest
+  const gateProof = scheduledTaskGraphExecuteGateCompletionProof(request.handoff.gateProof), gate = gateProofGateIdentity(gateProof)
+  const attestation = request.attestation
+  if (!analyzeCheckpoint || !gateProof || !gate || !attestation || scheduledAutomationSnapshotDigest(snapshot) !== request.handoff.snapshotDigest
     || scheduledTaskGraphContinuationKey(request.owner, attestation) !== request.handoff.continuationKey
     || !attestationOwnerMatches(attestation, request.owner)) return null
   const ownedIds = [...scheduledTaskGraphAttestationCandidates(attestation).selectedJobIds]
@@ -88,7 +92,7 @@ async function loadInputs(request: Request): Promise<Loaded | null> {
   const node = request.handoff.executeNodes.find(value => value.taskId === request.actor.taskId)
   const gateInput = await loadScheduledTaskGraphPostGateGateInput({ owner: request.owner, snapshot, analyzeCheckpoint,
     analyzeAttestation: attestation, prepareProof: gateProof.prepareProof,
-    gate: { taskId: gateProof.gate.taskId, attemptCount: gateProof.gate.attemptCount, phase: 'completed', completionProof: gateProof },
+    gate: { taskId: gate.taskId, attemptCount: gate.attemptCount, phase: 'completed', completionProof: gateProof },
     postGate: { actor: request.actor, handoff: request.handoff, ...(request.action === 'scheduled_post_gate_execute' ? { packageRefs: request.packageRefs } : {}) } })
   if (!gateInput?.gateResult || request.action === 'scheduled_post_gate_execute' && (!node || !gateInput.packages)) return null
   return { snapshot, checkpoint, gateInput, ownedJobs }
@@ -96,11 +100,12 @@ async function loadInputs(request: Request): Promise<Loaded | null> {
 
 async function postGateIsCurrent(request: Request, loaded: Loaded): Promise<boolean> {
   const proof = scheduledTaskGraphExecuteGateCompletionProof(request.handoff.gateProof)
-  if (!proof) return false
+  const gate = gateProofGateIdentity(proof)
+  if (!proof || !gate) return false
   return Boolean(await loadScheduledTaskGraphPostGateGateInput({ owner: request.owner, snapshot: loaded.snapshot,
     analyzeCheckpoint: scheduledCheckpointForGate(loaded.checkpoint), analyzeAttestation: request.attestation,
     prepareProof: proof.prepareProof,
-    gate: { taskId: proof.gate.taskId, attemptCount: proof.gate.attemptCount, phase: 'completed', completionProof: proof },
+    gate: { taskId: gate.taskId, attemptCount: gate.attemptCount, phase: 'completed', completionProof: proof },
     postGate: { actor: request.actor, handoff: request.handoff,
       ...(request.action === 'scheduled_post_gate_execute' ? { packageRefs: request.packageRefs } : {}) } }))
 }
@@ -141,7 +146,7 @@ async function buildPipelineContext(request: Request, snapshot: NonNullable<Retu
 }
 
 function reportFromCheckpoint(checkpoint: Record<string, unknown>, packages: readonly ScheduledTaskGraphPreparedPackageRow[],
-  gate: NonNullable<Loaded['gateInput']['gateResult']>, execute: { queued: string[]; failed: string[] }): RunReport | null {
+  gate: ScheduledTaskGraphGateCompletion, execute: { queued: string[]; failed: string[] }): RunReport | null {
   const started = typeof checkpoint.startedAt === 'string' ? Date.parse(checkpoint.startedAt) : Number.NaN
   const scouted = dense(checkpoint.scoutedJobs), analysisFailed = checkpoint.analysisFailed
   if (!Number.isFinite(started) || !scouted || !Number.isSafeInteger(analysisFailed) || Number(analysisFailed) < 0) return null
@@ -150,6 +155,16 @@ function reportFromCheckpoint(checkpoint: Record<string, unknown>, packages: rea
     durationMs: Math.max(0, Date.now() - started) }
   if (gate.approvedJobIds.some(id => !ids.has(id)) || gate.pendingJobIds.some(id => !ids.has(id)) || gate.skippedJobIds.some(id => !ids.has(id))) return null
   return counts
+}
+
+function isCompletedGateResult(value: Loaded['gateInput']['gateResult']): value is ScheduledTaskGraphGateCompletion {
+  return value?.status === 'completed' && value.nextStage === 'execute'
+}
+
+function gateProofGateIdentity(proof: Record<string, unknown> | null): { taskId: string; attemptCount: number } | null {
+  const gate = record(proof?.gate)
+  return gate && validId(gate.taskId) && typeof gate.attemptCount === 'number' && positive(gate.attemptCount)
+    ? { taskId: gate.taskId, attemptCount: gate.attemptCount } : null
 }
 
 function selectPackages(packages: readonly ScheduledTaskGraphPreparedPackageRow[], refs: readonly string[]): ApplicationPackage[] | null {

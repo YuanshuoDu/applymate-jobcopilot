@@ -3,7 +3,8 @@ import { Prisma } from '@prisma/client'
 import { scheduledTaskGraphExecuteGateCompletionProof } from './scheduled-taskgraph-gate-rpc'
 import { parseScheduledTaskGraphGateResult } from './scheduled-taskgraph-gate-service'
 import { lockScheduledTaskGraphPostGateChildFence, type ScheduledTaskGraphPostGateActor } from './scheduled-taskgraph-audit-child-fence'
-import { parseScheduledTaskGraphPipelineOwner, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-prepare-proof'
+import { parseScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-prepare-proof'
+import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 
 const HANDOFF_TYPE = 'agent.plan.scheduled_post_gate_handoff'
 const HANDOFF_SCHEMA = 'agent-harness.v2.scheduled-post-gate-handoff.v1'
@@ -23,7 +24,8 @@ const OWNER_KEYS = ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptC
 const ID = /^[^\u0000-\u001f\u007f]{1,256}$/
 
 export type ScheduledPostGateHandoff = Readonly<Record<string, unknown> & {
-  owner: ScheduledTaskGraphPipelineOwner; gateTaskId: string; gateAttemptCount: number; gateGraphRevision: number; graphRevision: number
+  owner: ScheduledTaskGraphPipelineOwner; gateTaskId: string; gateAttemptCount: number; gateCompletedEventRevision: number
+  gateGraphRevision: number; graphRevision: number
   packageRefs: readonly string[]; executeNodes: readonly Readonly<{ key: string; taskId: string; packageRefs: readonly string[] }>[]; auditTaskId: string
 }>
 export type ScheduledTaskGraphPostGateProofInput = Readonly<{
@@ -44,10 +46,11 @@ export async function scheduledTaskGraphPostGateProofIsCurrent(tx: Prisma.Transa
       || input.gate.attemptCount !== receipt.gateAttemptCount || input.gate.phase !== 'completed'
       || receipt.gateGraphRevision !== gateProof.graphRevision || receipt.gateCompletedEventRevision !== gateProof.graphRevision
       || !input.actorFenceLocked && !await lockScheduledTaskGraphPostGateChildFence(tx, { owner, actor: input.actor })) return false
-    const graph = record(input.graph.content), nodes = dense(graph?.nodes)?.map(record), rows = input.tasks.map(record)
-    if (!graph || graph.schemaVersion !== 'agent-harness.v2.task-graph' || !nodes || rows.some(row => !row)
+    const graph = record(input.graph.content), nodes = records(graph?.nodes), rows = records(input.tasks)
+    if (!graph || graph.schemaVersion !== 'agent-harness.v2.task-graph' || !nodes || !rows
       || input.graph.revision < receipt.graphRevision || !validSuffix(nodes, receipt, input.actor, input.packageRefs)) return false
-    const byId = new Map(rows.map(row => [String(row!.id), row!]))
+    const byId = new Map<string, Record<string, unknown>>()
+    for (const row of rows) byId.set(String(row.id), row)
     if (byId.size !== rows.length || !gateAndTasksCurrent(byId, nodes, receipt, input.actor)) return false
     const [handoffs, proposals] = await Promise.all([
       tx.agentEvent.findMany({ where: { sessionId: owner.sessionId, turnId: owner.turnId, type: HANDOFF_TYPE,
@@ -74,16 +77,19 @@ export function parseScheduledPostGateHandoff(value: unknown): ScheduledPostGate
     || !digest(row.proposalDigest) || !positive(row.gateGraphRevision) || row.gateCompletedEventRevision !== row.gateGraphRevision
     || !positive(row.graphRevision) || row.graphRevision !== row.gateGraphRevision + 1 || !validId(row.auditTaskId)
     || hash(row.gateProof) !== row.gateProofDigest || hash(refs) !== row.packageDigest || execute.length < 1 || execute.length > 3) return null
-  const executeNodes = execute.map(node => {
+  const parsedExecuteNodes = execute.map(node => {
     const nodeRefs = strings(node?.packageRefs, 50)
     return node && exact(node, ['key', 'taskId', 'packageRefs']) && validId(node.key) && validId(node.taskId) && nodeRefs
       ? { key: node.key, taskId: node.taskId, packageRefs: nodeRefs } : null
   })
-  if (executeNodes.some(node => !node) || new Set(executeNodes.map(node => node!.taskId)).size !== executeNodes.length
-    || new Set(executeNodes.map(node => node!.key)).size !== executeNodes.length
-    || !sameSet(executeNodes.flatMap(node => node!.packageRefs), refs)
-    || executeNodes.flatMap(node => node!.packageRefs).length !== refs.length) return null
-  return { ...row, owner, packageRefs: refs, executeNodes: executeNodes as NonNullable<(typeof executeNodes)[number]>[] } as ScheduledPostGateHandoff
+  const executeNodes = parsedExecuteNodes.filter((node): node is NonNullable<(typeof parsedExecuteNodes)[number]> => node !== null)
+  if (executeNodes.length !== parsedExecuteNodes.length || new Set(executeNodes.map(node => node.taskId)).size !== executeNodes.length
+    || new Set(executeNodes.map(node => node.key)).size !== executeNodes.length
+    || !sameSet(executeNodes.flatMap(node => node.packageRefs), refs)
+    || executeNodes.flatMap(node => node.packageRefs).length !== refs.length) return null
+  return { ...row, owner, gateTaskId: row.gateTaskId, gateAttemptCount: row.gateAttemptCount,
+    gateCompletedEventRevision: row.gateCompletedEventRevision, gateGraphRevision: row.gateGraphRevision,
+    graphRevision: row.graphRevision, packageRefs: refs, executeNodes, auditTaskId: row.auditTaskId }
 }
 
 export function parseScheduledPostGateExecuteEnvelope(value: unknown): { queued: string[]; failed: string[] } | null {
@@ -158,15 +164,17 @@ function gateAndTasksCurrent(tasks: Map<string, Record<string, unknown>>, nodes:
 
 function proposalMatches(value: unknown, receipt: ScheduledPostGateHandoff, nodes: Record<string, unknown>[]): boolean {
   const row = record(value), payload = record(row?.payload), eventReceipt = record(payload?.receipt), created = dense(eventReceipt?.nodes)?.map(record)
-  const proposalNodes = receipt.executeNodes.map(reference => {
+  const proposalNodes: Record<string, unknown>[] = []
+  for (const reference of receipt.executeNodes) {
     const node = nodes.find(value => value.taskId === reference.taskId)
-    return node ? { key: node.key, templateId: node.templateId, goal: node.goal, successCriteria: node.successCriteria,
-      dependsOn: node.dependsOn, packageRefs: node.packageRefs } : null
-  })
+    if (!node) return false
+    proposalNodes.push({ key: node.key, templateId: node.templateId, goal: node.goal, successCriteria: node.successCriteria,
+      dependsOn: node.dependsOn, packageRefs: node.packageRefs })
+  }
   const audit = nodes.at(-1)
   if (!audit) return false
   proposalNodes.push({ key: audit.key, templateId: audit.templateId, goal: audit.goal, successCriteria: audit.successCriteria,
-    dependsOn: audit.dependsOn } as never)
+    dependsOn: audit.dependsOn })
   const proposal = { expectedRevision: receipt.gateGraphRevision, nodes: proposalNodes }
   return row?.itemId === graphId(receipt.owner.rootTaskId) && row.taskId === receipt.owner.rootTaskId && row.type === 'item.delta'
     && row.actor === 'orchestrator' && row.idempotencyKey === `${graphId(receipt.owner.rootTaskId)}:proposal:${receipt.gateGraphRevision}`
@@ -207,10 +215,24 @@ function lifecycleKey(root: string, node: string, attempt: number): string {
 function graphId(root: string): string { return `task-graph-${createHash('sha256').update(root).digest('hex')}` }
 function hash(value: unknown): string { return `sha256:${hashHex(value)}` }
 function hashHex(value: unknown): string { return createHash('sha256').update(stable(value), 'utf8').digest('hex') }
-function stable(value: unknown): string { return Array.isArray(value) ? `[${value.map(stable).join(',')}]`
-  : record(value) ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}` : JSON.stringify(value) ?? '' }
+function stable(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`
+  const row = record(value)
+  return row ? `{${Object.keys(row).sort().map(key => `${JSON.stringify(key)}:${stable(row[key])}`).join(',')}}` : JSON.stringify(value) ?? ''
+}
 function record(value: unknown): Record<string, unknown> | null { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null }
 function dense(value: unknown): unknown[] | null { return Array.isArray(value) && Reflect.ownKeys(value).length === value.length + 1 ? value : null }
+function records(value: unknown): Record<string, unknown>[] | null {
+  const items = dense(value)
+  if (!items) return null
+  const rows: Record<string, unknown>[] = []
+  for (const item of items) {
+    const row = record(item)
+    if (!row) return null
+    rows.push(row)
+  }
+  return rows
+}
 function exact(value: unknown, keys: readonly string[]): boolean { const row = record(value), own = row && Reflect.ownKeys(row); return Boolean(row && own?.length === keys.length && own.every(key => typeof key === 'string' && keys.includes(key))) }
 function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null { return exact(value, keys) ? record(value) : null }
 function strings(value: unknown, max: number): string[] | null { const items = dense(value); return items && items.length <= max && items.every(validId) && new Set(items).size === items.length ? items as string[] : null }
@@ -220,4 +242,4 @@ function sameOwner(left: ScheduledTaskGraphPipelineOwner, right: ScheduledTaskGr
 function sameJson(left: unknown, right: unknown): boolean { return stable(left) === stable(right) }
 function validId(value: unknown): value is string { return typeof value === 'string' && ID.test(value) && value.trim() === value }
 function digest(value: unknown): boolean { return typeof value === 'string' && /^sha256:[a-f0-9]{64}$/.test(value) }
-function positive(value: unknown): boolean { return Number.isSafeInteger(value) && Number(value) > 0 }
+function positive(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 }
