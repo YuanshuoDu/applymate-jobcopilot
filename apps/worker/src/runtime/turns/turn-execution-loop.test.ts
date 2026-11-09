@@ -1932,7 +1932,7 @@ describe("owner-agnostic turn execution loop", () => {
         }
         const observation: StepContext["blocks"][number] = { id: TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID,
           layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent", content: progress }
-        return { ...context, blocks: [...context.blocks, observation] }
+        return { ...context, taskGraphRevision: revision, blocks: [...context.blocks, observation] }
       } }
     root.options = { ...root.options, contextBuilder }
 

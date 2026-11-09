@@ -769,7 +769,7 @@ describe("loadCanonicalTurnState", () => {
   it("carries the latest validated v2 agenda receipt into private resume state", async () => {
     const step = { id: "step-1", ordinal: 0, taskId: "root-1", inputThroughSequence: "4", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
     const agenda = buildCognitiveActionAgenda({ schemaVersion: "agent-harness.v2", sessionId: "session-1", turnId: "turn-1", stepId: step.id,
-      inputThroughSequence: 4n, consumedInputIds: [], canonicalJson: "{}", blocks: [] })
+      inputThroughSequence: 4n, consumedInputIds: [], canonicalJson: "{}", blocks: [], taskGraphRevision: 2 })
     const snapshot = { schemaVersion: "agent-harness.v2.objective-progress.v1", advisory: true, revision: 2,
       requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 2, status: "active" }] } as const
     const receipt = buildCognitiveAgendaReceipt({ sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: step.id,
