@@ -174,9 +174,14 @@ describe("TurnEngine", () => {
 
     await expect(new TurnEngine(options).run()).resolves.toMatchObject({ status: "completed" })
 
-    const deltaContext = JSON.stringify(fixture.requests[1]?.messages) ?? ""
-    expect(deltaContext).toContain('"availability":"available"')
-    expect(deltaContext).toContain('"afterStatus":"reported_passed"')
+    const frameText = fixture.requests[1]?.messages
+      .flatMap(message => message.content.flatMap(part => isRecord(part) && typeof part.text === "string" ? [part.text] : []))
+      .find(text => text.startsWith("[harness request context trust=UNTRUSTED_DATA source=cognitive_action_agenda]")) ?? ""
+    const parsedProjection: unknown = JSON.parse(frameText.slice(frameText.indexOf("\n") + 1))
+    const projection = isRecord(parsedProjection) ? parsedProjection : undefined
+    const parsedProgressDelta = projection?.progressDelta
+    const progressDelta = isRecord(parsedProgressDelta) ? parsedProgressDelta : undefined
+    expect(progressDelta).toMatchObject({ availability: "available", requirements: [{ afterStatus: "reported_passed" }] })
     expect(requestedToolNames.flat()).not.toContain("applications.submit")
     expect(executeTool.mock.calls.map(([input]) => input.call.toolName)).toEqual(["jobs.search", "jobs.get"])
     expect(fixture.fake.events.some(event => /approval|authorization/i.test(event.type))).toBe(false)

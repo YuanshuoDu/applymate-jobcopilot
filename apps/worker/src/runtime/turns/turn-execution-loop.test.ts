@@ -65,6 +65,9 @@ const taskGraphFeedbackLead = "TaskGraph required evidence is missing, invalid, 
 function taskGraphCheckpoint(graphRevision: number, digest = "a"): TaskGraphDenialCheckpoint {
   return { schemaVersion: TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskId: "root-1", graphRevision, verificationDigest: digest.repeat(64) }
 }
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
 function checkpointedTaskGraphDenial(checkpoint: TaskGraphDenialCheckpoint) {
   const denial = { ok: false as const, blocker: "task_graph_verification_unverified", feedback: `${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing` }
   Object.defineProperty(denial, TASK_GRAPH_DENIAL_CHECKPOINT, { value: checkpoint })
@@ -1974,10 +1977,16 @@ describe("owner-agnostic turn execution loop", () => {
     root.options = { ...root.options, contextBuilder, completionGate, budget: { maxSteps: 2 } }
 
     const result = await runTurnExecutionLoop(root.options)
-    const finalRequest = JSON.stringify(root.requests[1]?.messages) ?? ""
+    const frame = root.requests[1]?.messages.find(message => message.content.some(part => part.type === "text"
+      && part.text.startsWith("[harness request context trust=UNTRUSTED_DATA source=cognitive_action_agenda]")))
+    const frameText = frame?.content.find(part => part.type === "text"
+      && part.text.startsWith("[harness request context trust=UNTRUSTED_DATA source=cognitive_action_agenda]"))?.text ?? ""
+    const parsedProjection: unknown = JSON.parse(frameText.slice(frameText.indexOf("\n") + 1))
+    const projection = isRecord(parsedProjection) ? parsedProjection : undefined
+    const parsedProgressDelta = projection?.progressDelta
+    const progressDelta = isRecord(parsedProgressDelta) ? parsedProgressDelta : undefined
 
-    expect(finalRequest).toContain('"availability":"available"')
-    expect(finalRequest).toContain('"afterStatus":"reported_passed"')
+    expect(progressDelta).toMatchObject({ availability: "available", requirements: [{ afterStatus: "reported_passed" }] })
     expect(completionGate).toHaveBeenCalledOnce()
     expect(completionGate).toHaveBeenCalledWith(expect.objectContaining({ candidateText: "done:root-1" }))
     expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted", stepCount: 2 })
