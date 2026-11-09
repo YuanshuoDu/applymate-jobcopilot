@@ -1,4 +1,5 @@
 import type { TaskGraphReadScope } from "./task-graph-command-port.js"
+import type { TaskGraphNode } from "../planning/task-graph.js"
 import { materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
 import { loadScopedTaskGraphDependencyContext } from "./task-graph-pg-dependency-context-loader.js"
 import type { Queryable } from "./pg-store-persistence.js"
@@ -10,17 +11,21 @@ import {
 } from "./scheduled-post-gate-contract.js"
 import { isScheduledTaskGraphSpecializedEnvelope } from "./task-graph-pg-specialized-envelope.js"
 import type { GraphIdentityScope, GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
+import type { StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { sourceIntentForTaskGraphNode } from "./task-graph-source-intent-context.js"
 import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 
-type Node = NonNullable<LoadedGraph["snapshot"]>["nodes"][number]
+type Node = StoredTaskGraphNode
+type ReadyNode = Pick<TaskGraphNode, "key" | "dependsOn" | "taskId">
 
 /** Resolve normal dependency context, bypassing StructuredRole only for the immutable server-owned Post-Gate Audit. */
 export async function readyTaskDependencyContext(
-  client: Queryable, scope: GraphIdentityScope, loaded: LoadedGraph, node: Node, row: GraphTaskRow,
+  client: Queryable, scope: GraphIdentityScope, loaded: LoadedGraph, node: ReadyNode, row: GraphTaskRow,
 ): Promise<unknown> {
   if (!loaded.snapshot) throw new Error("task_graph_state_missing")
-  if (await isServerOwnedPostGateAuditReady(client, scope, loaded, node, row)) return {}
+  const storedNode = loaded.snapshot.nodes.find(candidate => candidate.key === node.key && candidate.taskId === row.id
+    && candidate.taskId === node.taskId)
+  if (storedNode && await isServerOwnedPostGateAuditReady(client, scope, loaded, storedNode, row)) return {}
 
   const contextRows = await loadScopedTaskGraphDependencyContext(client, scope, row.id, node.dependsOn, loaded.snapshot.nodes)
   const nodesByKey = new Map(loaded.snapshot.nodes.map(candidate => [candidate.key, candidate] as const))
