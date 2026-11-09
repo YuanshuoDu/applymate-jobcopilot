@@ -170,7 +170,7 @@ describeWithServices("scheduled post-Gate TaskGraph handoff in disposable Postgr
     const completion = await command.verifyScheduledPostGateCompletion?.({ scope: readScopeFor(resumedLease, fixture) })
     expect(completion).toMatchObject({ handoff: { owner: { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
       turnId: fixture.ids.turnId, rootTaskId: fixture.ids.rootTaskId }, execute: [{ taskId: executeTask.taskId }],
-      audit: { taskId: auditTask.taskId, report: zeroReport } })
+      audit: { taskId: auditTask.taskId, report: zeroReport } } })
     const root = await db.query<{ status: string }>(`SELECT "status" FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`,
       [fixture.ids.rootTaskId, fixture.ids.sessionId])
     const turn = await db.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id"=$1 AND "sessionId"=$2`,
