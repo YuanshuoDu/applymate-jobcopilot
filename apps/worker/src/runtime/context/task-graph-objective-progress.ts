@@ -6,7 +6,7 @@ import type { TaskGraphCurrentNode, TaskGraphCurrentState } from "../subagents/t
 import type { ContextSeedBlock } from "./step-context-builder.js"
 
 export const TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID = "task-graph-objective-progress"
-const SCHEMA_VERSION = "agent-harness.v2.objective-progress.v1"
+export const TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION = "agent-harness.v2.objective-progress.v1" as const
 const MAX_REQUIREMENTS = 8
 const MAX_NODES = 16
 const MAX_PACKET_BYTES = 4 * 1024
@@ -165,7 +165,7 @@ export function taskGraphObjectiveProgressObservation(input: Input): ContextSeed
   if (input.resolution.status !== "valid" || input.resolution.requirements.length > MAX_REQUIREMENTS) return undefined
   const graph = currentGraph(input)
   const content = {
-    schemaVersion: SCHEMA_VERSION, advisory: true, revision: graph?.revision ?? null,
+    schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION, advisory: true, revision: graph?.revision ?? null,
     requirements: input.resolution.requirements.map(requirement => ({
       id: requirement.id, kind: requirement.kind, minimum: requirement.minimum,
       status: graph ? statusFor(requirement, graph.nodes, input.rootTaskId, input.taskGraphTemplateRoles) : "unknown" as const,

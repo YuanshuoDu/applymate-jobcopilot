@@ -24,7 +24,7 @@ function profile() {
 }
 
 function fakeStore() {
-  const events: Array<{ id: string; type: string; causationId: string | null; itemId: string | null }> = []
+  const events: Array<{ id: string; type: string; causationId: string | null; itemId: string | null; payload: unknown }> = []
   const batches: string[][] = []
   const items: Array<{ id: string; type: string; phase: string | null; status: string; revision: number }> = []
   const steps: Array<{ id: string; status: string; errorCode: string | null }> = []
@@ -33,8 +33,8 @@ function fakeStore() {
     updateStep: async ({ stepId, status, errorCode }) => { const step = steps.find((entry) => entry.id === stepId)!; step.status = status; step.errorCode = errorCode },
     createItem: async ({ itemId, type, phase, status }) => { items.push({ id: itemId, type, phase, status, revision: 0 }); return { id: itemId, revision: 0 } },
     updateItem: async ({ itemId, expectedRevision, status }) => { const item = items.find((entry) => entry.id === itemId)!; expect(item.revision).toBe(expectedRevision); item.revision += 1; item.status = status; return { id: itemId, revision: item.revision } },
-    appendEvent: async ({ id, type, causationId, itemId }) => { events.push({ id, type, causationId, itemId }); return { id } },
-    appendEvents: async inputs => { batches.push(inputs.map(input => input.id)); for (const input of inputs) events.push({ id: input.id, type: input.type, causationId: input.causationId, itemId: input.itemId }); return inputs.map(input => ({ id: input.id })) },
+    appendEvent: async ({ id, type, causationId, itemId, payload }) => { events.push({ id, type, causationId, itemId, payload }); return { id } },
+    appendEvents: async inputs => { batches.push(inputs.map(input => input.id)); for (const input of inputs) events.push({ id: input.id, type: input.type, causationId: input.causationId, itemId: input.itemId, payload: input.payload }); return inputs.map(input => ({ id: input.id })) },
     recordFinalResponse: vi.fn(async input => {
       if (!input.terminal) return
       items.push({ id: input.terminal.finalItemId, type: "agent_message", phase: "final_answer", status: "completed", revision: 1 })
@@ -44,7 +44,7 @@ function fakeStore() {
         { id: "final-completed", type: "item.completed", itemId: input.terminal.finalItemId, correlationId: input.terminal.finalItemId, causationId: "final-started", payload: {} },
         { id: "turn-completed", type: "turn.completed", itemId: input.terminal.finalItemId, correlationId: "step", causationId: "final-completed", payload: {} },
       ]
-      events.push(...finalEvents.map(event => ({ id: event.id, type: event.type, causationId: event.causationId, itemId: event.itemId })))
+      events.push(...finalEvents.map(event => ({ id: event.id, type: event.type, causationId: event.causationId, itemId: event.itemId, payload: event.payload })))
       return { status: "completed" as const, finalItemId: input.terminal.finalItemId, events: finalEvents }
     }),
   }
@@ -125,6 +125,22 @@ describe("TurnEngine", () => {
     }
     await expect(new TurnEngine(options).run()).resolves.toMatchObject({ status: "completed" })
     expect(seen[0]).toBe("root-1")
+  })
+
+  it("forwards the objective revision callback through the bound context builder", async () => {
+    const fixture = baseOptions()
+    const objectiveProgressGoalRevision = vi.fn(() => "a".repeat(64))
+    const options: TurnEngineOptions = {
+      ...fixture.options,
+      contextBuilder: { ...fixture.options.contextBuilder, objectiveProgressGoalRevision },
+    }
+
+    await expect(new TurnEngine(options).run()).resolves.toMatchObject({ status: "completed" })
+
+    expect(objectiveProgressGoalRevision).toHaveBeenCalled()
+    expect(fixture.fake.events.find(event => event.type === "cognitive.agenda")?.payload).toMatchObject({
+      schemaVersion: "agent-harness.cognitive-agenda-receipt.v2", goalRevision: "a".repeat(64),
+    })
   })
 
   it("keeps claim identity at ordinal zero and forwards a separate root context identity on every Step", async () => {

@@ -13,6 +13,7 @@ import type { TurnQuestionStore } from "./turn-question-contract.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 import type { TurnEngineQueryClient } from "./turn-engine-owner-sql.js"
+import type { CognitiveAgendaReceipt } from "./cognitive-agenda-receipt.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "question" | "error"
 export type TurnEngineItemPhase = "commentary" | "final_answer" | null
@@ -179,6 +180,8 @@ export type TurnEngineOptions = {
     }): Promise<StepContext>
     /** Validates durable discovery memory for recovered replay Steps without building model context. */
     preflightDiscoveryPersonaMemory?(stepIds: readonly string[]): Promise<void>
+    /** Private canonical Turn objective digest source for the Root agenda receipt. */
+    objectiveProgressGoalRevision?(): string | undefined
   }
   /** Preflight callback passed through the root compatibility wrapper before replay. */
   readonly preflightDiscoveryPersonaMemory?: (stepIds: readonly string[]) => Promise<void>
@@ -222,6 +225,8 @@ export type TurnResumeState = {
   readonly taskGraphDenialProgress?: TaskGraphDenialProgress
   readonly inputThroughSequence: bigint
   readonly consumedInputIds: readonly string[]
+  /** Latest validated same-Turn agenda receipt; private recovery input, never model context. */
+  readonly cognitiveAgendaReceipt?: CognitiveAgendaReceipt
   readonly usage: {
     readonly inputTokens: number
     readonly outputTokens: number

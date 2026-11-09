@@ -215,10 +215,11 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       `SELECT MAX("ordinal") AS "maxOrdinal" FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2`, [lease.turnId, lease.sessionId],
     )
     const maxOrdinal = ordinalResult.rows[0]?.maxOrdinal === null || ordinalResult.rows[0]?.maxOrdinal === undefined ? null : Number(ordinalResult.rows[0].maxOrdinal)
-    const resume = buildCanonicalTurnResumeState({ last, maxOrdinal, steps: stepsResult.rows,
+    const baseResume = buildCanonicalTurnResumeState({ last, maxOrdinal, steps: stepsResult.rows,
       persistedToolCallCount: itemsResult.rows.filter(item => item.type === "tool_call").length, items: itemsResult.rows, events: eventsResult.rows,
       scope: { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: rootTaskId ?? "" }, recoveredWaitControl,
       taskGraphDenialProgress })
+    const resume = baseResume && restoredAgenda ? { ...baseResume, cognitiveAgendaReceipt: restoredAgenda } : baseResume
     if (resume?.finalEvidenceRecoveryUsed) snapshot = applyCompletionRecovery(snapshot, "resume", FINAL_EVIDENCE_RECOVERY_FEEDBACK)
     validateAgendaResumeFence(restoredAgenda, stepsResult.rows)
     const intent = turnIntent(turn.input), result = {

@@ -766,6 +766,25 @@ describe("loadCanonicalTurnState", () => {
     expect(eventQuery).toContain(`'${COGNITIVE_AGENDA_EVENT_TYPE}'`)
   })
 
+  it("carries the latest validated v2 agenda receipt into private resume state", async () => {
+    const step = { id: "step-1", ordinal: 0, taskId: "root-1", inputThroughSequence: "4", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
+    const agenda = buildCognitiveActionAgenda({ schemaVersion: "agent-harness.v2", sessionId: "session-1", turnId: "turn-1", stepId: step.id,
+      inputThroughSequence: 4n, consumedInputIds: [], canonicalJson: "{}", blocks: [] })
+    const snapshot = { schemaVersion: "agent-harness.v2.objective-progress.v1", advisory: true, revision: 2,
+      requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 2, status: "active" }] } as const
+    const receipt = buildCognitiveAgendaReceipt({ sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: step.id,
+      agenda, objectiveProgress: { goalRevision: "c".repeat(64), objectiveProgressSnapshot: snapshot,
+        progressDelta: { schemaVersion: "agent-harness.v2.objective-progress-delta.v1", availability: "unavailable",
+          previousPlanRevision: null, currentPlanRevision: 2, requirements: [{ id: "candidate-count", kind: "candidate_count_gte",
+            minimum: 2, beforeStatus: "unknown", afterStatus: "active" }] } } })
+    if (!receipt) throw new Error("v2 agenda fixture should be valid")
+    const event = { ...agendaEvent("20"), payload: receipt }
+    const value = await loadCanonicalTurnState(pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null,
+      modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, steps: [step], events: [event] }), lease)
+
+    expect(value.resume?.cognitiveAgendaReceipt).toEqual(receipt)
+  })
+
   it.each([
     ["foreign user", { userId: "other-user" }],
     ["foreign payload scope", { taskId: "other-root" }],
