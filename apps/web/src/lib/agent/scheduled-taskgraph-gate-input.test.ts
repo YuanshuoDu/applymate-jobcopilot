@@ -4,6 +4,7 @@ import type { Job, Prisma } from '@prisma/client'
 import { hashArtifactContent } from './artifacts/hash'
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { scheduledTaskGraphAnalyzeCheckpointDigest } from './scheduled-taskgraph-gate-checkpoint'
+import type { ScheduledTaskGraphPostGateActor } from './scheduled-taskgraph-audit-child-fence'
 
 const mocks = vi.hoisted(() => ({ session: vi.fn(), jobs: vi.fn(), resume: vi.fn(), facts: vi.fn(), versions: vi.fn(), heads: vi.fn(), graph: vi.fn(), tasks: vi.fn(), task: vi.fn(), events: vi.fn(), queryRaw: vi.fn(), transaction: vi.fn(), gateHistory: vi.fn(), completedAuditFence: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: {
@@ -22,7 +23,7 @@ vi.mock('./scheduled-taskgraph-audit-child-fence', async importOriginal => ({
 }))
 
 import { isScheduledTaskGraphAuditChildGateProofCurrent, isScheduledTaskGraphAuditCompletedReportGateProofCurrent,
-  isScheduledTaskGraphGateProofCurrent, loadScheduledTaskGraphAuditChildGateInput,
+  isScheduledTaskGraphGateProofCurrent, loadScheduledTaskGraphAuditChildGateInput, loadScheduledTaskGraphPostGateGateInput,
   loadScheduledTaskGraphGateInput, scheduledTaskGraphAnalyzeCheckpointForGate, type ScheduledTaskGraphGateInputRequest } from './scheduled-taskgraph-gate-input'
 
 const owner: ScheduledTaskGraphPipelineOwner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1',
@@ -240,6 +241,54 @@ describe('scheduled TaskGraph Gate input reload', () => {
     expect(mocks.gateHistory).toHaveBeenCalledWith(expect.objectContaining({
       auditTask: { id: 'audit-task', status: 'queued', attemptCount: 0 },
     }))
+  })
+
+  it('locks the exact Post-Gate Execute actor and its current execution attempt before Gate proof evaluation', async () => {
+    const { input } = setup()
+    const actor: ScheduledTaskGraphPostGateActor = { kind: 'execute', taskId: 'execute-task', attemptCount: 2, leaseOwner: 'execute-worker-2' }
+    const childSchema = { schemaVersion: 'agent-harness.v2.subagent.result', role: 'executor', taskType: 'scheduled_taskgraph_execute' }
+    mocks.queryRaw.mockResolvedValueOnce([{ id: owner.sessionId, status: 'running' }])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId, rootTaskId: owner.rootTaskId,
+        source: 'automation', executionMode: 'canonical_task_graph', input: { automationRunMode: 'scheduled' }, status: 'waiting_for_dependency',
+        leaseOwnerId: null, leaseExpiresAt: null, leaseStartedAt: null, terminalEventSequence: null, terminalEventAt: null }])
+      .mockResolvedValueOnce([{ id: owner.rootTaskId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+        parentTaskId: null, status: 'waiting', attemptCount: owner.rootAttemptCount, role: 'orchestrator', taskType: 'root',
+        failureReason: null, interruptRequestedAt: null, closedAt: null }])
+      .mockResolvedValueOnce([{ id: actor.taskId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+        parentTaskId: owner.rootTaskId, depth: 1, role: 'executor', taskType: 'scheduled_taskgraph_execute', status: 'running',
+        attemptCount: actor.attemptCount, maxAttempts: 3, leaseOwner: actor.leaseOwner, leaseExpiresAt: new Date(Date.now() + 60_000),
+        interruptRequestedAt: null, closedAt: null, failureReason: null, context: {}, expectedOutputSchema: childSchema,
+        allowedActions: [], hasLiveLease: true }])
+      .mockResolvedValueOnce([{ id: owner.executionId, userId: owner.userId, sessionId: owner.sessionId, status: 'running',
+        attemptCount: owner.executionAttemptCount }])
+      .mockResolvedValueOnce([{ id: 'dispatch-event' }])
+      .mockResolvedValueOnce([])
+    const tx = { $queryRaw: mocks.queryRaw, agentItem: { findFirst: mocks.graph }, subAgentTask: { findMany: mocks.tasks },
+      agentEvent: { findMany: mocks.events } } as unknown as Prisma.TransactionClient
+    mocks.transaction.mockImplementation((work: (client: Prisma.TransactionClient) => Promise<unknown>) => work(tx))
+
+    await expect(loadScheduledTaskGraphPostGateGateInput({ ...input,
+      gate: { taskId: 'gate-task', attemptCount: 1, phase: 'completed', completionProof: {} },
+      postGate: { actor, handoff: {}, packageRefs: [jobRow.id] },
+    })).resolves.toBeNull()
+    expect(mocks.queryRaw).toHaveBeenCalledTimes(7)
+    expect((mocks.queryRaw.mock.calls[4]?.[0] as { values?: unknown[] } | undefined)?.values)
+      .toEqual(expect.arrayContaining(['executor', 'scheduled_taskgraph_execute']))
+    expect(mocks.queryRaw.mock.calls[5]?.[0]).toMatchObject({ sql: expect.stringContaining('FROM "agent_executions"') })
+    expect(mocks.queryRaw.mock.calls[5]?.[0]).toMatchObject({ values: expect.arrayContaining([
+      owner.executionId, owner.userId, owner.sessionId, owner.executionAttemptCount,
+    ]) })
+    expect(mocks.jobs).not.toHaveBeenCalled()
+  })
+
+  it('requires a completed Gate proof before accepting a Post-Gate actor request', async () => {
+    const { input } = setup()
+    const actor: ScheduledTaskGraphPostGateActor = { kind: 'audit', taskId: 'audit-task', attemptCount: 1, leaseOwner: 'audit-worker-1' }
+    const request = { ...input, postGate: { actor, handoff: {} } } as unknown as Parameters<typeof loadScheduledTaskGraphPostGateGateInput>[0]
+    await expect(loadScheduledTaskGraphPostGateGateInput(request)).resolves.toBeNull()
+    expect(mocks.transaction).not.toHaveBeenCalled()
+    expect(mocks.jobs).not.toHaveBeenCalled()
   })
 
   it('admits only the dispatched live Audit actor while Root is parked; generic Gate proof remains running-root-only', async () => {

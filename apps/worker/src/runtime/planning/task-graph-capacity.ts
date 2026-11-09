@@ -20,10 +20,11 @@ export function taskGraphNodeCapacity(value: unknown): TaskGraphNodeCapacity | u
   if (!facts) return undefined
   const { nodeCount, hasTypedVerification, repairRecorded } = facts
   const maxNodes = TASK_GRAPH_LIMITS.maxNodes
-  const reserveActive = hasTypedVerification && !repairRecorded && nodeCount < maxNodes
+  const remaining = Math.max(0, maxNodes - nodeCount)
+  const reserveActive = hasTypedVerification && !repairRecorded && remaining > 0
   const ordinaryLimit = hasTypedVerification && !repairRecorded ? maxNodes - 1 : maxNodes
   return {
-    nodeCount, maxNodes, remaining: maxNodes - nodeCount,
+    nodeCount, maxNodes, remaining,
     ordinaryRemaining: Math.max(0, ordinaryLimit - nodeCount), reserveActive, repairRecorded,
   }
 }
@@ -35,7 +36,7 @@ function parseFacts(value: unknown): TaskGraphCapacityFacts | undefined {
     const row = value as Record<string, unknown>
     if (Reflect.ownKeys(row).length !== 3 || Object.keys(row).sort().join(",") !== "hasTypedVerification,nodeCount,repairRecorded"
       || !Number.isSafeInteger(row.nodeCount) || typeof row.nodeCount !== "number"
-      || row.nodeCount < 0 || row.nodeCount > TASK_GRAPH_LIMITS.maxNodes
+      || row.nodeCount < 0 || row.nodeCount > TASK_GRAPH_LIMITS.maxPersistedNodes
       || typeof row.hasTypedVerification !== "boolean" || typeof row.repairRecorded !== "boolean"
       || row.repairRecorded && !row.hasTypedVerification) return undefined
     return { nodeCount: row.nodeCount, hasTypedVerification: row.hasTypedVerification, repairRecorded: row.repairRecorded }

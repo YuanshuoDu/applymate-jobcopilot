@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import { executionId, executionKey, parseScheduledPipelineCompletionDisposition,
   parseScheduledPipelineExistingAuditResumeDisposition, type TurnExecutionIdentity } from "./turn-execution-types.js"
 import { TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "./turn-question-gate-choice-contract.js"
+import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK } from "../subagents/scheduled-post-gate-contract.js"
 
 const root: TurnExecutionIdentity = {
   kind: "turn", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1",
@@ -32,6 +33,9 @@ describe("scheduled pipeline completion disposition", () => {
     const candidateText = "  Exact candidate with its spacing.  "
     expect(parseScheduledPipelineCompletionDisposition({ status: "completed", candidateText }))
       .toEqual({ status: "completed", candidateText })
+    expect(parseScheduledPipelineCompletionDisposition({ status: "replan", candidateText,
+      feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK }))
+      .toEqual({ status: "replan", candidateText, feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK })
     expect(parseScheduledPipelineCompletionDisposition({ status: "waiting_for_dependency", waitId: "dependency-123", candidateText }))
       .toEqual({ status: "waiting_for_dependency", waitId: "dependency-123", candidateText })
     expect(parseScheduledPipelineCompletionDisposition({ status: "waiting_for_user", waitId: "question-123", candidateText }))
@@ -103,6 +107,8 @@ describe("scheduled existing Audit resume disposition", () => {
       .toEqual({ status: "waiting_for_dependency", waitId: "audit-wait-1" })
     expect(parseScheduledPipelineExistingAuditResumeDisposition({ status: "completed" }))
       .toEqual({ status: "completed" })
+    expect(parseScheduledPipelineExistingAuditResumeDisposition({ status: "replan", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK }))
+      .toEqual({ status: "replan", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK })
   })
 
   it.each([

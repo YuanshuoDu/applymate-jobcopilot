@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Prisma } from '@prisma/client'
-import { lockScheduledTaskGraphAuditChildFence, lockScheduledTaskGraphAuditCompletedReportChildFence, type ScheduledTaskGraphAuditActor,
-  type ScheduledTaskGraphAuditChildFenceInput } from './scheduled-taskgraph-audit-child-fence'
+import { lockScheduledTaskGraphAuditChildFence, lockScheduledTaskGraphAuditCompletedReportChildFence,
+  lockScheduledTaskGraphPostGateChildFence, type ScheduledTaskGraphAuditActor, type ScheduledTaskGraphAuditChildFenceInput,
+  type ScheduledTaskGraphPostGateActor } from './scheduled-taskgraph-audit-child-fence'
 import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 
 const owner: ScheduledTaskGraphPipelineOwner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1',
@@ -35,6 +36,17 @@ function completedReportRows(overrides: { session?: Row; pauses?: readonly Row[]
     status: 'completed', attemptCount: owner.executionAttemptCount }
   return [...values.slice(0, 5), [execution], values[5] ?? []]
 }
+function postGateRows(actor: ScheduledTaskGraphPostGateActor, execution: Row = { id: owner.executionId, userId: owner.userId,
+  sessionId: owner.sessionId, status: 'running', attemptCount: owner.executionAttemptCount }): unknown[][] {
+  const contract = actor.kind === 'execute'
+    ? { role: 'executor', taskType: 'scheduled_taskgraph_execute' }
+    : { role: 'auditor', taskType: 'scheduled_taskgraph_post_gate_audit' }
+  const child = { ...rows()[4]![0] as Row, id: actor.taskId, role: contract.role, taskType: contract.taskType,
+    attemptCount: actor.attemptCount, leaseOwner: actor.leaseOwner,
+    expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result', role: contract.role, taskType: contract.taskType } }
+  const values = rows({ child })
+  return [...values.slice(0, 5), [execution], values[5] ?? []]
+}
 
 function harness(resultRows: unknown[][]) {
   const pending = [...resultRows], query = vi.fn(async (_statement: unknown) => pending.shift() ?? [])
@@ -48,6 +60,36 @@ function sqlAt(query: ReturnType<typeof harness>['query'], index: number): strin
 }
 
 describe('scheduled Audit child owner fence', () => {
+  it.each([
+    [{ kind: 'execute', taskId: 'execute-1', attemptCount: 2, leaseOwner: 'execute-worker-2' }, 'executor', 'scheduled_taskgraph_execute'],
+    [{ kind: 'audit', taskId: 'post-gate-audit-1', attemptCount: 3, leaseOwner: 'audit-worker-3' }, 'auditor', 'scheduled_taskgraph_post_gate_audit'],
+  ] as const)('fences the exact Post-Gate %s actor and execution attempt', async (actor, role, taskType) => {
+    const { tx, query } = harness(postGateRows(actor))
+    await expect(lockScheduledTaskGraphPostGateChildFence(tx, { owner, actor })).resolves.toMatchObject({
+      taskId: actor.taskId, attemptCount: actor.attemptCount, leaseOwner: actor.leaseOwner,
+    })
+    expect(query).toHaveBeenCalledTimes(7)
+    expect(sqlAt(query, 4)).toContain(`\"role\" =`)
+    expect(query.mock.calls[5]?.[0]).toMatchObject({ sql: expect.stringContaining('FROM "agent_executions"') })
+    expect(sqlAt(query, 5)).toContain('FOR UPDATE')
+    expect((query.mock.calls[5]?.[0] as { values?: unknown[] } | undefined)?.values)
+      .toEqual(expect.arrayContaining([owner.executionId, owner.userId, owner.sessionId, owner.executionAttemptCount]))
+    expect((query.mock.calls[4]?.[0] as { values?: unknown[] } | undefined)?.values).toEqual(expect.arrayContaining([role, taskType]))
+  })
+
+  it.each([
+    ['different execution attempt', { id: owner.executionId, userId: owner.userId, sessionId: owner.sessionId,
+      status: 'running', attemptCount: owner.executionAttemptCount + 1 }],
+    ['different execution owner', { id: owner.executionId, userId: 'user-2', sessionId: owner.sessionId,
+      status: 'running', attemptCount: owner.executionAttemptCount }],
+  ] as const)('rejects a Post-Gate actor with a %s', async (_name, execution) => {
+    const actor: ScheduledTaskGraphPostGateActor = { kind: 'execute', taskId: 'execute-1', attemptCount: 2, leaseOwner: 'execute-worker-2' }
+    const { tx, query } = harness(postGateRows(actor, execution))
+    await expect(lockScheduledTaskGraphPostGateChildFence(tx, { owner, actor })).resolves.toBeNull()
+    expect(query).toHaveBeenCalledTimes(6)
+    expect(sqlAt(query, 5)).toContain('FROM "agent_executions"')
+  })
+
   it.each([
     ['child before Root parks', { status: 'in_progress', leaseOwnerId: 'expired-root-lease', leaseExpiresAt: new Date(1), leaseStartedAt: new Date(0) }, 'running'],
     ['child after Root parks', { status: 'waiting_for_dependency', leaseOwnerId: null, leaseExpiresAt: null, leaseStartedAt: null }, 'waiting'],

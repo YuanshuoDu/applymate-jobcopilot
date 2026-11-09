@@ -1,4 +1,4 @@
-import { appendTaskGraphProposal, TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
+import { appendScheduledPostGateTaskGraphProposal, TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { TaskGraphCommandError, type TaskGraphScheduleReceipt } from "./task-graph-command-port.js"
 import { appendTaskGraphReceipt, writePlanReceipt } from "./task-graph-pg-events.js"
 import { createSubagentTask } from "./pg-store-create.js"
@@ -78,8 +78,8 @@ export async function appendScheduledAudit(client: Queryable, input: TaskGraphSc
     || gateProof.gate.completedEventRevision !== loaded.state.revision) throw invalid("gate_proof")
   const current = currentTaskGraph(loaded), gate = current.nodes.find(node => node.key === "gate")
   if (!gate || gate.status !== "completed" || gate.taskId !== gateShape.gate.taskId) throw invalid("gate_incomplete")
-  const append = appendTaskGraphProposal(loaded.state, proposal, { registeredTemplateIds: new Set([SCHEDULED_AUDIT_TEMPLATE_ID]),
-    maxNodes: TASK_GRAPH_LIMITS.maxNodes, maxDepth: TASK_GRAPH_LIMITS.maxDepth })
+  const append = appendScheduledPostGateTaskGraphProposal(loaded.state, proposal, { registeredTemplateIds: new Set([SCHEDULED_AUDIT_TEMPLATE_ID]),
+    maxNodes: TASK_GRAPH_LIMITS.maxPersistedNodes, maxDepth: TASK_GRAPH_LIMITS.maxDepth })
   if (!append.ok || append.state.revision !== loaded.state.revision + 1 || append.addedNodes.length !== 1) throw invalid("append")
   const added = append.addedNodes[0]!
   if (added.key !== SCHEDULED_AUDIT_TEMPLATE_ID || added.templateId !== SCHEDULED_AUDIT_TEMPLATE_ID || added.depth !== 5
@@ -200,9 +200,11 @@ async function lockAuditTask(client: Queryable, scope: GraphIdentityScope, taskI
 
 function validAuditNode(loaded: LoadedGraph, taskId: string): boolean {
   const node = loaded.snapshot?.nodes.find(value => value.key === SCHEDULED_AUDIT_TEMPLATE_ID)
-  return !!node && node.taskId === taskId && node.templateId === SCHEDULED_AUDIT_TEMPLATE_ID && node.depth === 5
+  const current = loaded.snapshot && projectScheduledPipelineGraphAtCurrentStage(loaded.snapshot.nodes)
+  const audit = current?.projection.stage === "audit" ? current.projection.audit : undefined
+  return !!node && !!audit && node.taskId === taskId && node.templateId === SCHEDULED_AUDIT_TEMPLATE_ID && node.depth === audit.depth
     && node.verificationDisposition === "specialized" && node.goal === SCHEDULED_AUDIT_NODE_GOAL
-    && same(node.successCriteria, SCHEDULED_AUDIT_NODE_CRITERIA) && node.dependsOn.length === 1 && node.dependsOn[0] === "gate"
+    && same(node.successCriteria, SCHEDULED_AUDIT_NODE_CRITERIA) && same(node.dependsOn, audit.dependsOn)
 }
 
 function validAuditTaskRow(row: AuditTaskRow, task: NonNullable<LoadedGraph["tasks"] extends ReadonlyMap<string, infer T> ? T : never>): boolean {

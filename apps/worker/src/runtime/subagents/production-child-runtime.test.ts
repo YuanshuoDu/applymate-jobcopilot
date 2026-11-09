@@ -22,6 +22,8 @@ import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snaps
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
 import type { PolicyEvaluationContext } from "@jobcopilot/agent-policy"
 import { SCHEDULED_AUDIT_OUTPUT_SCHEMA, SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE } from "./scheduled-audit-contract.js"
+import { SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_AUDIT_ROLE, SCHEDULED_POST_GATE_AUDIT_TASK_TYPE,
+  SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_EXECUTE_ROLE, SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE } from "./scheduled-post-gate-contract.js"
 
 const artifactStoreMock = vi.hoisted(() => ({ current: null as unknown, sourceDigestReader: null as unknown }))
 const applicationFillExecutorMock = vi.hoisted(() => ({
@@ -31,6 +33,7 @@ const applicationFillExecutorMock = vi.hoisted(() => ({
 }))
 const scheduledGateRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
 const scheduledAuditRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
+const scheduledPostGateRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
 const selectedJobSourceCanary = "APPLYMATE_TRANSIENT_SELECTED_JOB_CANARY"
 vi.mock("./application-fill-for-review.js", () => ({ executeApplicationFillForReview: applicationFillExecutorMock.execute }))
 vi.mock("./scheduled-gate-child-runtime.js", async importOriginal => ({
@@ -40,6 +43,10 @@ vi.mock("./scheduled-gate-child-runtime.js", async importOriginal => ({
 vi.mock("./scheduled-audit-child-runtime.js", async importOriginal => ({
   ...await importOriginal<typeof import("./scheduled-audit-child-runtime.js")>(),
   createScheduledAuditChildExecutor: scheduledAuditRuntimeMock.factory,
+}))
+vi.mock("./scheduled-post-gate-child-runtime.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./scheduled-post-gate-child-runtime.js")>(),
+  createScheduledPostGateChildExecutor: scheduledPostGateRuntimeMock.factory,
 }))
 vi.mock("../tools/artifact-tools.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../tools/artifact-tools.js")>()
@@ -862,6 +869,30 @@ describe("production child runtime", () => {
     expect(scheduledAuditRuntimeMock.factory).toHaveBeenCalledOnce()
     expect(fixed).toHaveBeenCalledWith({ lease: child, continuation })
     expect(modelFactory).not.toHaveBeenCalled()
+  })
+
+  it("dispatches both Post-Gate child types before generic tool or model setup", async () => {
+    const executeChild = { ...lease(), id: "execute-child", role: SCHEDULED_POST_GATE_EXECUTE_ROLE,
+      taskType: SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE, allowedActions: [], expectedOutputSchema: SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA } satisfies SubagentLease
+    const auditChild = { ...lease(), id: "post-gate-audit", role: SCHEDULED_POST_GATE_AUDIT_ROLE,
+      taskType: SCHEDULED_POST_GATE_AUDIT_TASK_TYPE, allowedActions: [], expectedOutputSchema: SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA } satisfies SubagentLease
+    const fixed = vi.fn(async ({ lease: child }: { lease: SubagentLease }) => ({ status: "completed" as const, result: { taskId: child.id } }))
+    scheduledPostGateRuntimeMock.factory.mockReturnValue(fixed)
+    const modelFactory = vi.fn(async () => { throw new Error("Post-Gate tasks must not construct a model") })
+    const toolFactory = vi.fn(async () => { throw new Error("Post-Gate tasks must not construct tools") })
+    const pool = { connect: vi.fn(), query: vi.fn() }, executor = createProductionChildExecutor({
+      pool: pool as never, modelRuntimeFactory: modelFactory, toolRuntimeFactory: toolFactory as never,
+    })
+
+    await expect(executor({ lease: executeChild })).resolves.toEqual({ status: "completed", result: { taskId: executeChild.id } })
+    await expect(executor({ lease: auditChild })).resolves.toEqual({ status: "completed", result: { taskId: auditChild.id } })
+    expect(scheduledPostGateRuntimeMock.factory).toHaveBeenCalledOnce()
+    expect(scheduledPostGateRuntimeMock.factory).toHaveBeenCalledWith({ pool })
+    expect(fixed).toHaveBeenNthCalledWith(1, { lease: executeChild })
+    expect(fixed).toHaveBeenNthCalledWith(2, { lease: auditChild })
+    expect(modelFactory).not.toHaveBeenCalled()
+    expect(toolFactory).not.toHaveBeenCalled()
+    expect(pool.connect).not.toHaveBeenCalled()
   })
 
   it("dispatches the exact application filler directly without constructing model or tool runtimes", async () => {
