@@ -129,7 +129,7 @@ describe("prepareScheduledPostGateFinish", () => {
     { invalid: "Audit role", templateId: SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID, taskRole: SCHEDULED_POST_GATE_EXECUTE_ROLE,
       taskType: SCHEDULED_POST_GATE_AUDIT_TASK_TYPE, failureReason: "scheduled_post_gate_audit_result_invalid" },
     { invalid: "Audit type", templateId: SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID, taskRole: SCHEDULED_POST_GATE_AUDIT_ROLE,
-      taskType: SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE, failureReason: "scheduled_post_gate_audit_result_invalid" },
+      taskType: SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE, failureReason: "scheduled_post_gate_execute_result_invalid" },
   ])("fails closed for a Post-Gate child with the wrong $invalid", async ({ templateId, taskRole, taskType, failureReason }) => {
     const taskId = "execute-task", node = { key: templateId, templateId, taskId, verificationDisposition: "specialized" }
     const failedGraph = { event: { type: "task.failed" } }

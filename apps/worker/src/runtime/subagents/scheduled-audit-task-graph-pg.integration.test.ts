@@ -214,9 +214,10 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     vi.doUnmock(scheduledTaskGraphAuditPrepareSourcePath)
     vi.doUnmock(scheduledWebDbPath)
     vi.resetModules()
+    await cleanupFixtureUsers()
   })
   afterAll(async () => {
-    if (pool && fixtureUsers.length) await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [fixtureUsers])
+    await cleanupFixtureUsers()
     if (disconnectWebDatabase) await disconnectWebDatabase().catch(() => undefined)
     await pool?.end()
     restoreEnv("DATABASE_URL", priorDatabaseUrl)
@@ -536,6 +537,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const turnJobs: TurnJobPayload[] = []
     expect(await dispatchPendingTurnOutbox(pool as never, { add: async (_name, payload) => { turnJobs.push(payload) } })).toBe(1)
     expect(turnJobs).toHaveLength(1)
+    expect(turnJobs.map(job => job.turnId)).toEqual([fixture.ids.turnId])
     let terminalRoot: TurnEngineResult | undefined
     let resumedLease: TurnLease | undefined
     const resumedJob = await runTurnJob({ data: turnJobs[0]!, attemptsMade: 0 }, { pool: pool as never,
@@ -2616,6 +2618,16 @@ async function graphCount(fixture: Fixture): Promise<{ totalNodes: number; scout
     suffixIsChained: Boolean(prepare && gate && audit && prepare.dependsOn.length === 1 && prepare.dependsOn[0] === analyst?.key
       && gate.dependsOn.length === 1 && gate.dependsOn[0] === prepare.key && audit.dependsOn.length === 1 && audit.dependsOn[0] === gate.key) }
 }
+async function cleanupFixtureUsers(): Promise<void> {
+  if (!pool || fixtureUsers.length === 0) return
+  const users = [...fixtureUsers]
+  const sessions = await pool.query<{ id: string }>(`SELECT "id" FROM "agent_sessions" WHERE "userId" = ANY($1::text[])`, [users])
+  const sessionIds = sessions.rows.map(row => row.id)
+  if (sessionIds.length > 0) await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`, [sessionIds])
+  await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [users])
+  fixtureUsers.splice(0, users.length)
+}
+
 function restoreEnv(name: string, value: string | undefined): void { if (value === undefined) delete process.env[name]; else process.env[name] = value }
 function dedicatedDisposableUrl(): string | null {
   const required = process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true"
