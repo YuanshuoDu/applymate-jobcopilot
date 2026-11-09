@@ -63,7 +63,12 @@ function bindStore(store: TurnEngineOptions["store"]): TurnExecutionStore {
   }
 }
 
-function bindContextBuilder(options: TurnEngineOptions, identity: TurnExecutionIdentity): TurnExecutionOptions["contextBuilder"] {
+type BoundContextBuilder = TurnExecutionOptions["contextBuilder"] & {
+  readonly objectiveProgressGoalRevision?: () => string | undefined
+}
+
+function bindContextBuilder(options: TurnEngineOptions, identity: TurnExecutionIdentity): BoundContextBuilder {
+  const objectiveProgressGoalRevision = options.contextBuilder.objectiveProgressGoalRevision
   return {
     build: ({ scope, stepId, snapshot, rootInputId, rootContextInputId, taskId, now, steeringMarkerContext, steeringMarkerState }) => options.contextBuilder.build({
       scope,
@@ -79,6 +84,9 @@ function bindContextBuilder(options: TurnEngineOptions, identity: TurnExecutionI
       steeringMarkerContext,
       steeringMarkerState,
     }),
+    ...(objectiveProgressGoalRevision ? {
+      objectiveProgressGoalRevision: () => objectiveProgressGoalRevision.call(options.contextBuilder),
+    } : {}),
   }
 }
 
