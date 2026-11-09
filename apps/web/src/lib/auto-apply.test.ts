@@ -79,7 +79,12 @@ describe("auto-apply authorization", () => {
     resumeId: "resume_1",
     coverLetterId: null,
   });
-  const makeApproval = async (confirmedAnswers: unknown = null, material: MaterialSnapshot = materialSnapshot(), status = "approved") => {
+  const makeApproval = async (
+    confirmedAnswers: unknown = null,
+    material: MaterialSnapshot = materialSnapshot(),
+    status = "approved",
+    taskId = input.applicationTaskId,
+  ) => {
     const expiresAt = new Date(Date.now() + 60_000), nonceHash = await hashApprovalNonce(input.receiptNonce!);
     const materialHash = await hashAgentReceiptValue("material", material), answersHash = await hashAgentReceiptValue("answers", confirmedAnswers ?? null);
     const scopeHash = await hashApprovalScope({
@@ -88,7 +93,7 @@ describe("auto-apply authorization", () => {
       nonceHash, expiresAt: expiresAt.toISOString(),
     });
     return {
-      id: "approval_1", status, nonceHash, resourceHash: "r".repeat(64), payload: material, taskId: null,
+      id: "approval_1", status, nonceHash, resourceHash: "r".repeat(64), payload: material, taskId,
       sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
       expiresAt, scopeHash, materialHash, answersHash,
     };
@@ -165,8 +170,26 @@ describe("auto-apply authorization", () => {
       topic: "application.submit.dispatch", aggregateId: "session_1", idempotencyKey: expect.stringMatching(/^application-submit:/),
       payload: expect.objectContaining({ workerTaskId: result.taskId, receiptId: "approval_1", submitPayload: expect.objectContaining({ receiptId: "approval_1" }) }),
     }) }));
+    const approvalLockQuery = mocks.approvalLock.mock.calls[0]?.[0] as { text?: string; values?: unknown[] } | undefined;
+    expect(approvalLockQuery?.text).toMatch(/"taskId" = \$\d+/);
+    expect(approvalLockQuery?.values).toContain(input.applicationTaskId);
     expect(mocks.transaction).toHaveBeenCalled();
   }, 15_000);
+
+  it.each(["child_task_1", "application_other"])("rejects an approval bound to another task (%s) before mutation", async taskId => {
+    const approval = await makeApproval();
+    mocks.approvalFindFirst.mockResolvedValueOnce({ ...approval, taskId });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("explicit approval");
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.txTaskEventCreate).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+    expect(mocks.txActivityCreate).not.toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
 
   it("rejects an approval whose answer hash is stale before any submission state changes", async () => {
     const approval = await makeApproval();
@@ -341,13 +364,16 @@ describe("auto-apply authorization", () => {
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
   });
 
-  it("rolls back task and job claims when the transaction cannot lock the approved receipt", async () => {
+  it("rolls back task and job claims when the locked receipt no longer matches the ApplicationTask", async () => {
     mocks.approvalLock.mockResolvedValueOnce([]);
     const { queueAutonomousApplication } = await import("./auto-apply");
 
     await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("receipt changed");
     expect(mocks.txTaskUpdateMany).toHaveBeenCalledTimes(1);
     expect(mocks.jobUpdateMany).toHaveBeenCalledTimes(1);
+    const lockedApprovalQuery = mocks.approvalLock.mock.calls[0]?.[0] as { text?: string; values?: unknown[] } | undefined;
+    expect(lockedApprovalQuery?.text).toContain('"taskId" =');
+    expect(lockedApprovalQuery?.values).toContain(input.applicationTaskId);
     expect(mocks.transactionCommit).not.toHaveBeenCalled();
     expect(mocks.txTaskEventCreate).not.toHaveBeenCalled();
     expect(mocks.outboxCreate).not.toHaveBeenCalled();

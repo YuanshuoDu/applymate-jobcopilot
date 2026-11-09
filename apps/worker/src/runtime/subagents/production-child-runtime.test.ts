@@ -886,6 +886,19 @@ describe("production child runtime", () => {
     expect(pool.query).not.toHaveBeenCalled()
   })
 
+  it("forwards an explicitly supplied application-fill stage observer", async () => {
+    applicationFillExecutorMock.execute.mockClear()
+    const pool = { connect: vi.fn(), query: vi.fn() }
+    const stageObserver = vi.fn()
+    const executor = createOptionalProductionChildExecutor({ enabled: true, pool: pool as never, applicationFillStageObserver: stageObserver })
+    if (!executor) throw new Error("production child executor was not created")
+    const child = { ...lease(), role: "application_filler", taskType: "application_fill_for_review", allowedActions: [] } satisfies SubagentLease
+
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed" })
+    expect(applicationFillExecutorMock.execute).toHaveBeenCalledWith({ pool, lease: child, stageObserver })
+    expect(pool.connect).not.toHaveBeenCalled()
+  })
+
   it("rejects mailbox continuation for an application filler without invoking its completed browser flow", async () => {
     applicationFillExecutorMock.execute.mockClear()
     const pool = { connect: vi.fn(), query: vi.fn() }

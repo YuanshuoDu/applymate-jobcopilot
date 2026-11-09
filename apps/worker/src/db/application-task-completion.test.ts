@@ -4,11 +4,12 @@ import { hashApprovalScope } from "@jobcopilot/agent-protocol"
 import { hashAgentReceiptValue } from "@jobcopilot/shared"
 import { protocolScope, type ApprovalScopeInput } from "../runtime/approval/types.js"
 import { hashArtifactContent } from "../runtime/subagents/artifact-adapters.js"
+import * as artifactAdapters from "../runtime/subagents/artifact-adapters.js"
 import type { SubagentLease } from "../runtime/subagents/types.js"
 import { acknowledgeApplicationFillCancellation, completeApplicationFillForReview, failApplicationFillBeforeBrowser, persistApplicationFillWait } from "./application-task-completion.js"
 
 type FillTaskFixture = { id: string; jobId: string; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown }
-type ApprovalMismatch = "turn" | "user" | "session" | "task" | "job" | "scope" | "payload" | "consumed"
+type ApprovalMismatch = "turn" | "user" | "session" | "task" | "legacy_child" | "job" | "scope" | "payload" | "consumed"
 type ApprovalFixtureRow = {
   id: string; userId: string; sessionId: string; turnId: string; jobId: string; type: string; taskId: string
   status: string; toolCallId: string; payload: unknown; resourceHash: string; materialHash: string
@@ -38,14 +39,15 @@ async function approvalFixture(
   const artifact = await artifactFixture(task, "user-a")
   const row = {
     id: `application-fill:${task.id}:turn-a`, userId: "user-a", sessionId: "session-a", turnId: "turn-a", jobId: task.jobId,
-    type: "submit_application", taskId: "filler-task", status, toolCallId: `application-submit:${task.id}`,
-    payload: artifact.payload, resourceHash: artifact.hash, materialHash: artifact.materialHash, answersHash: artifact.answersHash,
-    nonceHash: "sha256:fixture-nonce-hash", revision, expiresAt: new Date("2099-11-01T00:00:00.000Z"), scopeHash: "",
+    type: "submit_application", taskId: task.id, status, toolCallId: `application-submit:${task.id}`,
+    payload: artifact.payload, resourceHash: artifact.hash.slice("sha256:".length), materialHash: artifact.materialHash, answersHash: artifact.answersHash,
+    nonceHash: "d".repeat(64), revision, expiresAt: new Date("2099-11-01T00:00:00.000Z"), scopeHash: "",
   }
   if (mismatch === "turn") row.turnId = "foreign-turn"
   if (mismatch === "user") row.userId = "foreign-user"
   if (mismatch === "session") row.sessionId = "foreign-session"
   if (mismatch === "task") row.taskId = "foreign-task"
+  if (mismatch === "legacy_child") row.taskId = "filler-task"
   if (mismatch === "job") row.jobId = "foreign-job"
   if (mismatch === "scope") row.resourceHash = "sha256:foreign-resource-hash"
   if (mismatch === "payload") row.payload = { ...artifact.payload, applicationTaskId: "foreign-application" }
@@ -61,7 +63,7 @@ async function approvalFixture(
 
 function fixture(options: {
   subtaskLive?: boolean; subtaskOwnerUserId?: string; subtaskOwner?: string; subtaskAttempt?: number; subtaskInterrupted?: boolean; appStatus?: string; appCheckpoint?: string; appTurnId?: string; sessionStatus?: string
-  turnStatus?: string; completionApprovalStatus?: string; approvalMismatch?: ApprovalMismatch; artifactMismatch?: boolean
+  turnStatus?: string; turnMissing?: boolean; completionApprovalStatus?: string; approvalMismatch?: ApprovalMismatch; artifactMismatch?: boolean; initialQuestion?: unknown
 } = {}) {
   const lease = {
     id: "filler-task", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a", parentTaskId: "root-a",
@@ -74,7 +76,7 @@ function fixture(options: {
   const turn = { id: "turn-a", status: options.turnStatus ?? "in_progress", revision: options.turnStatus === "waiting_for_approval" ? 5 : 4 }
   const task = { id: "application-a", userId: "user-a", sessionId: "session-a", jobId: "job-a", fillTurnId: options.appTurnId ?? "turn-a",
     fillTurnSessionId: "session-a", fillTurnUserId: "user-a", status: options.appStatus ?? "filling",
-    checkpoint: options.appCheckpoint ?? "browser_active", resumeId: "resume-a", coverLetterId: null, confirmedAnswers: { eligible: "yes" } }
+    checkpoint: options.appCheckpoint ?? "browser_active", resumeId: "resume-a", coverLetterId: null, confirmedAnswers: { eligible: "yes" }, question: options.initialQuestion ?? null }
   const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
   const client = {
     query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
@@ -84,7 +86,7 @@ function fixture(options: {
       if (sql.startsWith('SELECT "id" FROM "agent_sessions"') && sql.includes('"status" IN (')) return sql.includes(`'${options.sessionStatus ?? "running"}'`)
         ? { rows: [{ id: "session-a" }], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-a" }], rowCount: 1 }
-      if (sql.includes('FROM "agent_turns"') && sql.includes('SELECT "id", "status", "revision"')) return { rows: [turn], rowCount: 1 }
+      if (sql.includes('FROM "agent_turns"') && sql.includes('SELECT "id", "status", "revision"')) return options.turnMissing ? { rows: [], rowCount: 0 } : { rows: [turn], rowCount: 1 }
       if (sql.includes('FROM "agent_turns"') && sql.includes('SELECT "id"')) return { rows: [{ id: "turn-a" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS "subtask"')) {
         const userId = values[6]
@@ -100,6 +102,7 @@ function fixture(options: {
         else {
           task.status = String(values[0] === task.id && sql.includes("'waiting_for_authorization'") ? "waiting_for_authorization" : "waiting_for_user")
           task.checkpoint = String(values[0] === task.id && sql.includes("'form_filled'") ? "form_filled" : values[3] ?? task.checkpoint)
+          if (sql.includes('"question" = NULL')) task.question = null
         }
         return { rows: [{ id: task.id }], rowCount: 1 }
       }
@@ -140,6 +143,18 @@ function fixture(options: {
 }
 
 describe("ApplicationTask fill completion", () => {
+  it("rejects malformed artifact hashes and rolls back before issuing an approval", async () => {
+    const test = fixture()
+    const hash = vi.spyOn(artifactAdapters, "hashArtifactContent").mockReturnValueOnce(`sha256:${"a".repeat(64)}\n`)
+
+    try {
+      await expect(completeApplicationFillForReview(test.pool, { lease: test.lease })).rejects.toThrow("Application submission artifact hash is invalid")
+    } finally { hash.mockRestore() }
+
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_approvals"'))).toBe(false)
+    expect(test.calls.some(call => call.sql === "ROLLBACK")).toBe(true)
+  })
+
   it("commits the exact bound Turn, task, artifact, approval wait, and session on one client in lock order", async () => {
     const test = fixture()
     const now = new Date()
@@ -154,7 +169,13 @@ describe("ApplicationTask fill completion", () => {
     expect(test.pool.connect).toHaveBeenCalledOnce()
     expect(test.calls.filter(call => call.sql === "BEGIN")).toHaveLength(1)
     expect(test.calls.some(call => call.sql.includes("ON CONFLICT DO NOTHING RETURNING"))).toBe(true)
-    expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_approvals"') && call.values?.[4] === "turn-a")).toBe(true)
+    const approvalInsert = test.calls.find(call => call.sql.includes('INSERT INTO "agent_approvals"'))
+    const artifactInsert = test.calls.find(call => call.sql.includes('INSERT INTO "agent_artifact"'))
+    expect(approvalInsert?.values?.[2]).toBe("application-a")
+    expect(approvalInsert?.values?.[4]).toBe("turn-a")
+    expect(approvalInsert?.values?.[12]).toMatch(/^[a-f0-9]{64}$/)
+    expect(approvalInsert?.values?.[12]).toBe(String(artifactInsert?.values?.[4]).slice("sha256:".length))
+    expect(artifactInsert?.values?.[4]).toMatch(/^sha256:[a-f0-9]{64}$/)
     expect(test.calls.some(call => call.sql.includes('INSERT INTO "application_task_events"') && call.sql.includes("'form_filled'") && call.values?.[1] === "application-a")).toBe(true)
     expect(test.calls.some(call => call.sql.includes('FROM "application_tasks"') && call.values?.slice(0, 3).join(",") === "turn-a,session-a,user-a")).toBe(true)
     expect(test.calls.some(call => call.sql.includes('UPDATE "agent_sessions" SET "status" = \'waiting_for_user\''))).toBe(true)
@@ -171,25 +192,117 @@ describe("ApplicationTask fill completion", () => {
     expect(test.calls.filter(call => call.sql.startsWith("BEGIN"))).toHaveLength(1)
   })
 
+  it("clears the resolved question on successful completion while preserving confirmed answers", async () => {
+    const now = new Date()
+    const priorQuestion = { waitId: "resolved-wait", detail: "required_field" }
+    const test = fixture({ turnStatus: "queued", initialQuestion: priorQuestion })
+    test.lease.leaseExpiresAt = new Date(now.getTime() + 60_000)
+    const confirmedAnswers = test.task.confirmedAnswers
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, now })).resolves.toEqual({ status: "completed" })
+
+    const taskUpdate = test.calls.find(call => call.sql.startsWith('UPDATE "application_tasks"'))
+    expect(taskUpdate?.sql).toContain('"question" = NULL')
+    expect(taskUpdate?.sql).not.toContain('"confirmedAnswers"')
+    expect(test.task.question).toBeNull()
+    expect(test.task.confirmedAnswers).toEqual(confirmedAnswers)
+    expect(test.calls.filter(call => call.sql.includes('INSERT INTO "agent_approvals"'))).toHaveLength(1)
+
+    const stale = fixture({ turnStatus: "queued", initialQuestion: priorQuestion, subtaskLive: false })
+    stale.lease.leaseExpiresAt = new Date(now.getTime() + 60_000)
+    await expect(completeApplicationFillForReview(stale.pool, { lease: stale.lease, now })).resolves.toEqual({ status: "stale" })
+    expect(stale.task.question).toEqual(priorQuestion)
+    expect(stale.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
+  })
+
+  it("completes a queued Turn only under the exact live child lease and creates the review approval", async () => {
+    const now = new Date()
+    const test = fixture({ turnStatus: "queued" })
+    test.lease.leaseExpiresAt = new Date(now.getTime() + 60_000)
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, now })).resolves.toEqual({ status: "completed" })
+
+    const locks = test.calls.filter(call => call.sql.includes("FOR UPDATE")).map(call => call.sql)
+    expect(locks.findIndex(sql => sql.includes('FROM "agent_turns"'))).toBeLessThan(locks.findIndex(sql => sql.includes('FROM "sub_agent_tasks"')))
+    expect(locks.findIndex(sql => sql.includes('FROM "sub_agent_tasks"'))).toBeLessThan(locks.findIndex(sql => sql.includes('FROM "application_tasks"')))
+    const childLeaseLock = test.calls.find(call => call.sql.includes('FROM "sub_agent_tasks" AS "subtask"'))
+    expect(childLeaseLock?.sql).toContain('"subtask"."id" = $1 AND "subtask"."sessionId" = $2 AND "subtask"."turnId" = $3')
+    expect(childLeaseLock?.sql).toContain('"subtask"."leaseOwner" = $4')
+    expect(childLeaseLock?.sql).toContain('"subtask"."attemptCount" = $5')
+    expect(childLeaseLock?.sql).toContain('"subtask"."leaseExpiresAt" > GREATEST($6::timestamptz, clock_timestamp())')
+    expect(childLeaseLock?.sql).toContain('"subtask"."interruptRequestedAt" IS NULL')
+    expect(childLeaseLock?.values).toEqual([test.lease.id, test.lease.sessionId, test.lease.turnId, test.lease.ownerId, test.lease.attemptCount, now, test.lease.userId])
+    expect(test.lease.leaseExpiresAt.getTime()).toBeGreaterThan(now.getTime())
+    expect(test.calls.some(call => call.sql.includes("'form_filled'") && call.sql.includes('INSERT INTO "application_task_events"'))).toBe(true)
+    expect(test.calls.filter(call => call.sql.includes('INSERT INTO "agent_approvals"'))).toHaveLength(1)
+    expect(test.turn.status).toBe("waiting_for_approval")
+
+    const lostLease = fixture({ turnStatus: "queued", subtaskLive: false })
+    lostLease.lease.leaseExpiresAt = new Date(now.getTime() + 60_000)
+    await expect(completeApplicationFillForReview(lostLease.pool, { lease: lostLease.lease, now })).resolves.toEqual({ status: "stale" })
+    expect(lostLease.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
+  })
+
   it("does not write a task, artifact, approval, or wait when the lease attempt is stale", async () => {
     const test = fixture({ subtaskLive: false })
+    const onStaleGate = vi.fn(() => { throw new Error("private diagnostic failure") })
 
-    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease })).resolves.toEqual({ status: "stale" })
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, onStaleGate })).resolves.toEqual({ status: "stale" })
+    expect(onStaleGate).toHaveBeenCalledOnce()
+    expect(onStaleGate).toHaveBeenCalledWith("child_lease_fence")
     expect(test.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
   })
 
   it("rejects an application task whose returned binding differs from the leased Turn", async () => {
     const test = fixture({ appTurnId: "foreign-turn" })
+    const onStaleGate = vi.fn()
 
-    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease })).resolves.toEqual({ status: "stale" })
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, onStaleGate })).resolves.toEqual({ status: "stale" })
+    expect(onStaleGate).toHaveBeenCalledOnce()
+    expect(onStaleGate).toHaveBeenCalledWith("application_task_scope")
+    expect(test.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
+  })
+
+  it.each([
+    ["lease_input_invalid", "lease"], ["session_scope", "session"],
+  ] as const)("reports the fixed %s stale gate", async (expectedGate, failedGate) => {
+    const test = failedGate === "session" ? fixture({ sessionStatus: "paused" }) : fixture()
+    if (failedGate === "lease") test.lease.id = ""
+    const onStaleGate = vi.fn()
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, onStaleGate })).resolves.toEqual({ status: "stale" })
+
+    expect(onStaleGate).toHaveBeenCalledOnce()
+    expect(onStaleGate).toHaveBeenCalledWith(expectedGate)
+    expect(test.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
+  })
+
+  it.each([
+    ["turn_row_unavailable", undefined, true],
+    ["turn_status_interrupted", "interrupted", false],
+    ["turn_status_terminal", "completed", false],
+    ["turn_status_terminal", "failed", false],
+    ["turn_status_terminal", "cancelled", false],
+    ["turn_status_other", "waiting_for_tool", false],
+  ] as const)("reports the fixed %s Turn stale category", async (expectedGate, turnStatus, turnMissing) => {
+    const test = fixture({ ...(turnStatus === undefined ? {} : { turnStatus }), ...(turnMissing ? { turnMissing: true } : {}) })
+    const onStaleGate = vi.fn()
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, onStaleGate })).resolves.toEqual({ status: "stale" })
+
+    expect(onStaleGate).toHaveBeenCalledOnce()
+    expect(onStaleGate).toHaveBeenCalledWith(expectedGate)
     expect(test.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
   })
 
   it("checks the lease user against the owning session and Turn before locking its subtask", async () => {
     const test = fixture({ subtaskOwnerUserId: "user-a" })
     test.lease.userId = "user-b"
+    const onStaleGate = vi.fn()
 
-    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease })).resolves.toEqual({ status: "stale" })
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, onStaleGate })).resolves.toEqual({ status: "stale" })
+    expect(onStaleGate).toHaveBeenCalledOnce()
+    expect(onStaleGate).toHaveBeenCalledWith("child_lease_fence")
 
     const subtaskLock = test.calls.find(call => call.sql.includes('FROM "sub_agent_tasks"'))
     expect(subtaskLock?.sql).toContain('"session"."userId" = $7')
@@ -258,7 +371,7 @@ describe("ApplicationTask fill completion", () => {
     expect(test.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
   })
 
-  it.each(["turn", "user", "session", "task", "job", "scope", "payload", "consumed"] as const)(
+  it.each(["turn", "user", "session", "task", "legacy_child", "job", "scope", "payload", "consumed"] as const)(
     "rejects recovery when approval %s binding differs or was consumed", async mismatch => {
       const status = mismatch === "consumed" ? "consumed" : "approved"
       const test = fixture({
@@ -332,6 +445,16 @@ describe("ApplicationTask fill completion", () => {
 
     expect(test.calls.some(call => call.sql.startsWith('UPDATE "application_tasks"'))).toBe(false)
     expect(test.calls.some(call => call.sql.includes('INSERT INTO "application_task_events"'))).toBe(false)
+  })
+
+  it("keeps a queued Turn stale for wait persistence without writing", async () => {
+    const test = fixture({ turnStatus: "queued" })
+
+    await expect(persistApplicationFillWait(test.pool, {
+      lease: test.lease, checkpoint: "form_answer_required", detail: "required_field",
+    })).resolves.toEqual({ status: "stale" })
+
+    expect(test.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
   })
 
   it("persists a browser-start uncertainty as a wait without creating another artifact or approval", async () => {

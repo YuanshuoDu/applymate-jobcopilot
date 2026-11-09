@@ -6,11 +6,15 @@ import {
   cognitiveAgendaReceiptIdempotencyKey,
   COGNITIVE_AGENDA_EVENT_TYPE,
   COGNITIVE_AGENDA_RECEIPT_SCHEMA_VERSION,
+  COGNITIVE_AGENDA_RECEIPT_V2_SCHEMA_VERSION,
+  COGNITIVE_AGENDA_RECEIPT_MAX_BYTES,
   parseCognitiveAgendaReceipt,
   type CognitiveAgendaReceipt,
   type CognitiveAgendaReceiptScope,
 } from "./cognitive-agenda-receipt.js"
 import type { StepContext } from "../context/step-context-builder.js"
+import { TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION } from "../context/task-graph-objective-progress.js"
+import { taskGraphObjectiveProgressDelta, type ObjectiveProgressSnapshot } from "../context/task-graph-objective-progress-delta.js"
 
 const scope: CognitiveAgendaReceiptScope = { sessionId: "session-1", turnId: "turn-1", taskId: "task-1", stepId: "turn:turn-1:step:0" }
 
@@ -115,6 +119,112 @@ describe("cognitive agenda receipt", () => {
     expect(fenced?.resumeFence).toEqual({ inputThroughSequence: "7", consumedInputIds: ["input-1"] })
     expect(parseCognitiveAgendaReceipt(fenced, scope)).toEqual(fenced)
     expect(parseCognitiveAgendaReceipt(receipt(), scope)?.resumeFence).toBeUndefined()
+  })
+
+  it("writes and strictly reads bounded v2 receipts while preserving v1 compatibility", () => {
+    const objectiveProgressSnapshot: ObjectiveProgressSnapshot = { schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION,
+      advisory: true, revision: 7, requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 3, status: "active" }] }
+    const progressDelta = taskGraphObjectiveProgressDelta(null, objectiveProgressSnapshot, false)
+    const v2 = buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context(7)),
+      objectiveProgress: { goalRevision: "a".repeat(64), objectiveProgressSnapshot, progressDelta } })
+
+    expect(v2).toMatchObject({ schemaVersion: COGNITIVE_AGENDA_RECEIPT_V2_SCHEMA_VERSION, goalRevision: "a".repeat(64),
+      objectiveProgressSnapshot, progressDelta })
+    expect(parseCognitiveAgendaReceipt(v2, scope)).toEqual(v2)
+    expect(parseCognitiveAgendaReceipt(receipt(7), scope)?.schemaVersion).toBe(COGNITIVE_AGENDA_RECEIPT_SCHEMA_VERSION)
+    expect(parseCognitiveAgendaReceipt({ ...v2, goalRevision: 7 }, scope)).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...v2, progressDelta: { ...progressDelta, currentPlanRevision: 8 } }, scope)).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...v2, objectiveProgressSnapshot: { ...objectiveProgressSnapshot, advisory: false } }, scope)).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...v2, privateText: "do not expose" }, scope)).toBeNull()
+  })
+
+  it("preserves the valid agenda when maximum objective progress would exceed the receipt bound", () => {
+    const signal = (prefix: string) => {
+      const ids = Array.from({ length: 4 }, (_, index) => `${prefix}-${"x".repeat(21 - prefix.length)}-${index}`)
+      return { count: ids.length, ids }
+    }
+    const newlyObservedSteering = signal("observed")
+    const agenda: CognitiveActionAgenda = {
+      ...buildCognitiveActionAgenda(context(7)),
+      nextAction: "apply_fresh_steering",
+      blockedBy: { kind: "fresh_steering", ids: newlyObservedSteering.ids },
+      signals: {
+        pendingInputs: signal("pending"),
+        approvals: signal("approval"),
+        activeWaits: signal("wait"),
+        unresolved: signal("unresolved"),
+        completionVerification: { count: 8, ids: [] },
+        steering: { present: true, fresh: true, active: signal("active"), newlyObserved: newlyObservedSteering },
+      },
+    }
+    const current: ObjectiveProgressSnapshot = {
+      schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION,
+      advisory: true,
+      revision: 7,
+      requirements: Array.from({ length: 8 }, (_, index) => ({
+        id: `criterion-${index}-${"x".repeat(52)}`,
+        kind: index % 2 === 0 ? "candidate_count_gte" : "finding_count_gte",
+        minimum: 50,
+        status: "reported_passed",
+      })),
+    }
+    const previous: ObjectiveProgressSnapshot = { ...current, revision: 6,
+      requirements: current.requirements.map(row => ({ ...row, status: "active" })) }
+    const objectiveProgress = { goalRevision: "a".repeat(64), objectiveProgressSnapshot: current,
+      progressDelta: taskGraphObjectiveProgressDelta(previous, current, true) }
+    const value = buildCognitiveAgendaReceipt({ ...scope, inputThroughSequence: 1n, consumedInputIds: [], agenda, objectiveProgress })
+
+    if (!value) throw new Error("oversized v2 receipt should retain its bounded base agenda")
+    expect(value.schemaVersion).toBe(COGNITIVE_AGENDA_RECEIPT_SCHEMA_VERSION)
+    expect(value).toMatchObject({ nextAction: "apply_fresh_steering", blockedBy: { kind: "fresh_steering" }, planRevision: 7,
+      resumeFence: { inputThroughSequence: "1", consumedInputIds: [] } })
+    expect(value).not.toHaveProperty("objectiveProgressSnapshot")
+    expect(value).not.toHaveProperty("progressDelta")
+    expect(Buffer.byteLength(JSON.stringify(value), "utf8")).toBeLessThanOrEqual(COGNITIVE_AGENDA_RECEIPT_MAX_BYTES)
+    expect(parseCognitiveAgendaReceipt(value, scope)).toEqual(value)
+  })
+
+  it("rejects an available delta when its canonical goal digest is missing", () => {
+    const previous: ObjectiveProgressSnapshot = { schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION, advisory: true,
+      revision: 4, requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 3, status: "active" }] }
+    const current: ObjectiveProgressSnapshot = { ...previous, revision: 5, requirements: [{ ...previous.requirements[0], status: "reported_passed" }] }
+    const available = taskGraphObjectiveProgressDelta(previous, current, true)
+    const progress = { goalRevision: null, objectiveProgressSnapshot: current, progressDelta: available }
+    expect(buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context(5)), objectiveProgress: progress })).toBeNull()
+
+    const hashed = buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context(5)),
+      objectiveProgress: { ...progress, goalRevision: "b".repeat(64) } })
+    expect(hashed).not.toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...hashed, goalRevision: null }, scope)).toBeNull()
+  })
+
+  it("requires v2 snapshot and delta revisions to match the top-level plan revision", () => {
+    const snapshot: ObjectiveProgressSnapshot = { schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION,
+      advisory: true, revision: 7, requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 3, status: "active" }] }
+    const delta = taskGraphObjectiveProgressDelta({ ...snapshot, revision: 6 }, snapshot, true)
+    const valid = buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context(7)),
+      objectiveProgress: { goalRevision: "a".repeat(64), objectiveProgressSnapshot: snapshot, progressDelta: delta } })
+    if (!valid || valid.schemaVersion !== COGNITIVE_AGENDA_RECEIPT_V2_SCHEMA_VERSION) throw new Error("valid v2 fixture should be built")
+
+    expect(buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context(8)),
+      objectiveProgress: { goalRevision: "a".repeat(64), objectiveProgressSnapshot: snapshot, progressDelta: delta } })).toBeNull()
+    expect(buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context(7)),
+      objectiveProgress: { goalRevision: "a".repeat(64), objectiveProgressSnapshot: snapshot,
+        progressDelta: { ...delta, currentPlanRevision: 8 } } })).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...valid, planRevision: 8 }, scope)).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...valid, progressDelta: { ...valid.progressDelta, previousPlanRevision: null } }, scope)).toBeNull()
+
+    const unknownSnapshot: ObjectiveProgressSnapshot = { ...snapshot, revision: null,
+      requirements: snapshot.requirements.map(row => ({ ...row, status: "unknown" })) }
+    const unknownDelta = { ...taskGraphObjectiveProgressDelta(null, unknownSnapshot, false), currentPlanRevision: 7 }
+    const unknownRevisionReceipt = buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context(7)),
+      objectiveProgress: { goalRevision: "a".repeat(64), objectiveProgressSnapshot: unknownSnapshot, progressDelta: unknownDelta } })
+    expect(unknownRevisionReceipt).toMatchObject({ planRevision: 7, objectiveProgressSnapshot: { revision: null },
+      progressDelta: { availability: "unavailable", previousPlanRevision: null, currentPlanRevision: 7,
+        requirements: [{ beforeStatus: "unknown", afterStatus: "unknown" }] } })
+    expect(buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context(7)),
+      objectiveProgress: { goalRevision: "a".repeat(64),
+        objectiveProgressSnapshot: { ...unknownSnapshot, requirements: snapshot.requirements }, progressDelta: unknownDelta } })).toBeNull()
   })
 
   it("rejects malformed and oversized payloads without throwing", () => {

@@ -48,6 +48,7 @@ export type ProductionChildRuntimeOptions = {
   readonly resumeLoader?: ChildExecutorOptions["resumeLoader"]
   readonly sameAttemptContinuationLoader?: ChildExecutorOptions["sameAttemptContinuationLoader"]
   readonly jobDiscoveryClient?: JobDiscoveryClient
+  readonly applicationFillStageObserver?: Parameters<typeof import("./application-fill-for-review.js").executeApplicationFillForReview>[0]["stageObserver"]
 }
 
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
@@ -189,7 +190,6 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     validateArguments: (name, input, version) => runtime.registry.validateArguments(name, input, version),
   }
 }
-
 export function childExecutionEnabled(value = process.env.ENABLE_AGENT_CHILD_EXECUTION): boolean { return value === "1" }
 function defaultMailboxReader(pool: pg.Pool): ChildExecutorOptions["mailboxReader"] | undefined {
   const candidate = pool as unknown as { readonly connect?: unknown; readonly query?: unknown }
@@ -222,7 +222,7 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
     if (lease.role === "application_filler" || lease.taskType === "application_fill_for_review") {
       if (lease.role !== "application_filler" || lease.taskType !== "application_fill_for_review") return { status: "failed", failureReason: "application_fill_role_task_type_mismatch", retryDisposition: "terminal" }
       if (continuation) return { status: "failed", failureReason: "application_fill_continuation_unsupported", retryDisposition: "terminal" }
-      return (await import("./application-fill-for-review.js")).executeApplicationFillForReview({ pool: options.pool, lease })
+      return (await import("./application-fill-for-review.js")).executeApplicationFillForReview({ pool: options.pool, lease, ...(options.applicationFillStageObserver ? { stageObserver: options.applicationFillStageObserver } : {}) })
     }
     if (!genericExecutor) {
       const engineStore = options.turnStore ?? createPgTurnEngineStore(options.pool)

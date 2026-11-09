@@ -10,6 +10,40 @@ const goal = 'Fixture native question round'
 const question = 'Which synthetic city should the fixture use?'
 const answer = 'Fixture Dublin'
 const finalText = 'Synthetic question was answered and the canonical turn resumed.'
+type AgentTurnSnapshot = {
+  turn: { status: string; errorPresent: boolean; completedEvents: number; completedEventsCapped: boolean
+    answeredEvents: number; answeredEventsCapped: boolean; finalResponsePresent: boolean; finalResponseMatches: boolean }
+  sessionTurnBindingMatches: boolean
+  questionCount: number
+  questionCountCapped: boolean
+  questions: { id?: string; status: string; content?: { questionId?: string; question?: string; answer?: string | null; toolCallId?: string } }[]
+  questionAnswerMatches: boolean
+  finalAnswer: { exactlyOneFinalAssistantItem: boolean; finalAssistantItemCompleted: boolean; finalAssistantItemHasText: boolean
+    finalAssistantItemTextMatchesExpected: boolean; itemCompletedEventPersistsFinalAnswer: boolean; completionEventTargetsFinalAnswer: boolean }
+  finalItemCount: number
+  finalItemCountCapped: boolean
+  finalItems: { type: string; status: string; phase: string | null; textMatches: boolean }[]
+  eventCount: number
+  eventCountCapped: boolean
+  eventTypes: string[]
+  terminalEventCount: number
+  terminalEventCountCapped: boolean
+  terminalEvents: { finalItemPresent: boolean; finalItemMatchesPersisted: boolean; eventItemBound: boolean }[]
+  stepCount: number
+  stepCountCapped: boolean
+  steps: { status: string }[]
+  taskCount: number
+  taskCountCapped: boolean
+  tasks: { status: string }[]
+  toolResultCount: number
+  toolResultCountCapped: boolean
+  toolResultQuestionRedacted: boolean | null
+}
+
+type AgentPageDiagnostics = Record<'completionEventDelivered' | 'completionEventTargetsExpectedSessionAndTurn'
+  | 'completionEventFinalItemIdMatchesEnvelopeItemId' | 'finalItemCompletedEventDelivered' | 'finalItemHydrationRequestAttempted'
+  | 'finalItemHydrationTargetsExpectedItem' | 'finalItemHydrationSessionBindingMatches' | 'finalItemHydrationTurnBindingMatches'
+  | 'finalItemHydrationResponseOk' | 'finalItemHydrationTextMatchesExpected' | 'finalItemHydrationSucceeded', boolean>
 
 function installFinalDiagnostics(target: { sessionId: string; turnId: string }) {
   const cap = 9
@@ -171,11 +205,13 @@ test('synthetic native question resumes the actual authenticated turn', async ({
       || pathname === '/api/auto-apply' || pathname === '/api/agent/application-tasks')) applicationMutations.push(pathname)
   })
   const requireFixture = createRequire(path.resolve('e2e/application-authenticated-agent.browser.ts'))
-  const { initializeFixtureSse, attachFixtureApplication, inspectFixtureApplication, inspectTurn, closeFixtureDb } = requireFixture('./application-authenticated-agent-db.cjs') as {
+  const { initializeFixtureSse, attachFixtureApplication, inspectFixtureApplication, inspectTurn,
+    installAgentPageDiagnostics, closeFixtureDb } = requireFixture('./application-authenticated-agent-db.cjs') as {
     initializeFixtureSse: () => Promise<void>
     attachFixtureApplication: (sessionId: string, turnId: string) => Promise<void>
     inspectFixtureApplication: (sessionId: string) => Promise<{ jobStatus: string; taskStatus: string; sessionId: string; email: string }>
-    inspectTurn: (sessionId: string, turnId: string, expectedFinalText: string, expectedQuestionAnswer: string, includeQuestionDetails?: boolean) => Promise<{ turn: { status: string; completedEvents: number; completedEventsCapped: boolean; answeredEvents: number; answeredEventsCapped: boolean; finalResponsePresent: boolean; finalResponseMatches: boolean; errorPresent: boolean }; questionCount: number; questionCountCapped: boolean; questions: { id?: string; status: string; content?: { questionId?: string; question?: string; answer?: string | null; toolCallId?: string } }[]; questionAnswerMatches: boolean; finalItemCount: number; finalItemCountCapped: boolean; finalItems: { type: string; status: string; phase: string | null; textMatches: boolean }[]; eventCount: number; eventCountCapped: boolean; terminalEventCount: number; terminalEventCountCapped: boolean; terminalEvents: { finalItemPresent: boolean; finalItemMatchesPersisted: boolean; eventItemBound: boolean }[]; eventTypes: string[]; stepCount: number; stepCountCapped: boolean; steps: { status: string }[]; taskCount: number; taskCountCapped: boolean; tasks: { status: string }[]; toolResultCount: number; toolResultCountCapped: boolean; toolResultQuestionRedacted: boolean | null }>
+    inspectTurn: (sessionId: string, turnId: string, expectedFinalText: string, expectedQuestionAnswer: string, includeQuestionDetails?: boolean) => Promise<AgentTurnSnapshot>
+    installAgentPageDiagnostics: () => void
     closeFixtureDb: () => Promise<void>
   }
   try {
@@ -184,6 +220,7 @@ test('synthetic native question resumes the actual authenticated turn', async ({
     // networking must be independently verified by the caller for all processes.
     await context.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort())
     const page = await context.newPage()
+    await page.addInitScript(installAgentPageDiagnostics)
     await page.goto('/login')
     await page.getByPlaceholder('you@example.com').fill('candidate-a@example.invalid')
     await page.locator('input[type="password"]').fill('Fixture-only-password-123')
@@ -232,13 +269,18 @@ test('synthetic native question resumes the actual authenticated turn', async ({
       }, { timeout: 60_000 }).toBe('waiting_for_user')
     } catch (error) {
       const diagnostic = await inspectTurn(sessionId, turnId, finalText, answer)
-      console.error('Synthetic turn diagnostic', JSON.stringify({ status: diagnostic.turn.status,
-        questionCount: diagnostic.questionCount, questionCountCapped: diagnostic.questionCountCapped,
-        eventCount: diagnostic.eventCount, eventCountCapped: diagnostic.eventCountCapped, eventTypes: diagnostic.eventTypes,
-        toolResultCount: diagnostic.toolResultCount, toolResultCountCapped: diagnostic.toolResultCountCapped,
-        toolResultQuestionRedacted: diagnostic.toolResultQuestionRedacted,
-        stepCount: diagnostic.stepCount, stepCountCapped: diagnostic.stepCountCapped, steps: diagnostic.steps.map(step => ({ status: step.status })),
-        taskCount: diagnostic.taskCount, taskCountCapped: diagnostic.taskCountCapped, tasks: diagnostic.tasks.map(task => ({ status: task.status })) }))
+      console.error('Synthetic turn diagnostic', JSON.stringify({
+        turnWaitingForUser: diagnostic.turn.status === 'waiting_for_user',
+        sessionTurnBindingMatches: diagnostic.sessionTurnBindingMatches,
+        turnErrorPresent: diagnostic.turn.errorPresent,
+        questionPersistedExactlyOnce: diagnostic.questionCount === 1 && diagnostic.questions.length === 1,
+        questionCountCapped: diagnostic.questionCountCapped,
+        questionEventPresent: diagnostic.eventTypes.includes('item.started'),
+        toolResultPresent: diagnostic.toolResultCount > 0,
+        toolResultQuestionRedacted: diagnostic.toolResultQuestionRedacted === true,
+        stepFailed: diagnostic.steps.some(step => step.status === 'failed'),
+        taskFailed: diagnostic.tasks.some(task => task.status === 'failed'),
+      }))
       throw error
     }
     const waiting = await inspectTurn(sessionId, turnId, finalText, answer, true)
@@ -287,6 +329,10 @@ test('synthetic native question resumes the actual authenticated turn', async ({
     await expect(detailsToggle).toHaveAttribute('aria-expanded', 'true')
     const card = page.locator('[data-agent-question-card="true"]')
     await expect(card.getByText(question, { exact: true })).toBeVisible({ timeout: 30_000 })
+    await page.evaluate(({ sessionId, turnId, finalText }) => {
+      const target = window as Window & { __configureAgentQuestionDiagnostics?: (session: string, turn: string, text: string) => void }
+      target.__configureAgentQuestionDiagnostics?.(sessionId, turnId, finalText)
+    }, { sessionId, turnId, finalText })
     await card.getByRole('textbox', { name: question }).fill(answer)
     const submitted = page.waitForResponse(response => response.request().method() === 'POST'
       && new URL(response.url()).origin === origin && new URL(response.url()).pathname === questionPath)
@@ -307,8 +353,12 @@ test('synthetic native question resumes the actual authenticated turn', async ({
       }
       return target?.status ?? 'missing'
     }, { timeout: 60_000 }).toBe('completed')
+    const finalAnswerVisible = () => page.evaluate(expectedText => {
+      const finalItems = Array.from(document.querySelectorAll('[data-agent-item-type="agent_message"][data-agent-phase="final"]'))
+      return finalItems.some(item => item.textContent?.includes(expectedText) === true)
+    }, finalText)
     try {
-      await expect(page.getByText(finalText, { exact: false })).toBeVisible({ timeout: 30_000 })
+      await expect.poll(finalAnswerVisible, { timeout: 30_000 }).toBe(true)
     } catch (error) {
       try {
         const snapshot = await inspectTurn(sessionId, turnId, finalText, answer)
@@ -317,6 +367,28 @@ test('synthetic native question resumes the actual authenticated turn', async ({
         const firstStream = streamObservations[0]
         const firstTimeline = timelineObservations[0]
         const firstFinalItemTimeline = firstFinalItemTimelineObservation
+        const browserDiagnostics = await page.evaluate(expectedText => {
+          const value = (window as Window & { __agentQuestionDiagnostics?: AgentPageDiagnostics }).__agentQuestionDiagnostics
+          const finalItems = Array.from(document.querySelectorAll('[data-agent-item-type="agent_message"][data-agent-phase="final"]'))
+          return { completionEventDelivered: value?.completionEventDelivered === true,
+            completionEventTargetsExpectedSessionAndTurn: value?.completionEventTargetsExpectedSessionAndTurn === true,
+            completionEventFinalItemIdMatchesEnvelopeItemId: value?.completionEventFinalItemIdMatchesEnvelopeItemId === true,
+            finalItemCompletedEventDelivered: value?.finalItemCompletedEventDelivered === true,
+            finalItemHydrationRequestAttempted: value?.finalItemHydrationRequestAttempted === true,
+            finalItemHydrationTargetsExpectedItem: value?.finalItemHydrationTargetsExpectedItem === true,
+            finalItemHydrationSessionBindingMatches: value?.finalItemHydrationSessionBindingMatches === true,
+            finalItemHydrationTurnBindingMatches: value?.finalItemHydrationTurnBindingMatches === true,
+            finalItemHydrationResponseOk: value?.finalItemHydrationResponseOk === true,
+            finalItemHydrationTextMatchesExpected: value?.finalItemHydrationTextMatchesExpected === true,
+            finalItemHydrationSucceeded: value?.finalItemHydrationSucceeded === true,
+            finalAssistantItemRendered: finalItems.length > 0,
+            finalAnswerRendered: finalItems.some(item => item.textContent?.includes(expectedText) === true) }
+        }, finalText).catch(() => ({ completionEventDelivered: false, completionEventTargetsExpectedSessionAndTurn: false,
+          finalItemCompletedEventDelivered: false, completionEventFinalItemIdMatchesEnvelopeItemId: false,
+          finalItemHydrationRequestAttempted: false, finalItemHydrationTargetsExpectedItem: false,
+          finalItemHydrationSessionBindingMatches: false, finalItemHydrationTurnBindingMatches: false,
+          finalItemHydrationResponseOk: false, finalItemHydrationTextMatchesExpected: false,
+          finalAssistantItemRendered: false, finalItemHydrationSucceeded: false, finalAnswerRendered: false }))
         const domDiagnostic = await page.evaluate(({ expectedFinalItemId, expectedText }) => {
           const root = document.querySelector('[data-agent-harness-timeline="true"]')
           const projectedCount = root?.getAttribute('data-agent-completed-final-answer-count') ?? null
@@ -350,6 +422,13 @@ test('synthetic native question resumes the actual authenticated turn', async ({
           answeredEventExactlyOne: snapshot.turn.answeredEvents === 1,
           finalResponsePresent: snapshot.turn.finalResponsePresent,
           finalResponseMatches: snapshot.turn.finalResponseMatches,
+          sessionTurnBindingMatches: snapshot.sessionTurnBindingMatches,
+          exactlyOneFinalAssistantItem: snapshot.finalAnswer.exactlyOneFinalAssistantItem,
+          finalAssistantItemCompleted: snapshot.finalAnswer.finalAssistantItemCompleted,
+          finalAssistantItemHasText: snapshot.finalAnswer.finalAssistantItemHasText,
+          finalAssistantItemTextMatchesExpected: snapshot.finalAnswer.finalAssistantItemTextMatchesExpected,
+          itemCompletedEventPersistsFinalAnswer: snapshot.finalAnswer.itemCompletedEventPersistsFinalAnswer,
+          completionEventTargetsFinalAnswer: snapshot.finalAnswer.completionEventTargetsFinalAnswer,
           persistedFinalItemCount: snapshot.finalItemCount,
           persistedFinalItemCountCapped: snapshot.finalItemCountCapped,
           persistedFinalItemType: persistedFinalItem?.type ?? null,
@@ -397,6 +476,7 @@ test('synthetic native question resumes the actual authenticated turn', async ({
           firstFinalItemTimelineTextMatches: firstFinalItemTimeline?.textMatches === true,
           clientBoundary: clientBoundaryDiagnostic,
           ...domDiagnostic,
+          ...browserDiagnostics,
         }))
       } catch {
         console.error('Synthetic final response diagnostic unavailable')
@@ -405,9 +485,16 @@ test('synthetic native question resumes the actual authenticated turn', async ({
     }
     const finished = await inspectTurn(sessionId, turnId, finalText, answer, true)
     expect(finished.turn).toMatchObject({ status: 'completed', completedEvents: 1, answeredEvents: 1 })
+    expect(finished.sessionTurnBindingMatches).toBe(true)
     expect(finished.turn.finalResponseMatches).toBe(true)
+    expect(finished.finalAnswer).toEqual({ exactlyOneFinalAssistantItem: true, finalAssistantItemCompleted: true,
+      finalAssistantItemHasText: true, finalAssistantItemTextMatchesExpected: true,
+      itemCompletedEventPersistsFinalAnswer: true, completionEventTargetsFinalAnswer: true })
+    expect(finished.questionAnswerMatches).toBe(true)
     expect(finished.questions).toHaveLength(1)
-    expect(finished.questions[0]).toMatchObject({ status: 'completed', content: { question, answer } })
+    expect(finished.questions[0]?.status).toBe('completed')
+    expect(finished.questions[0]?.content?.question === question).toBe(true)
+    expect(finished.questions[0]?.content?.answer === answer).toBe(true)
     // The synthetic link is not an application execution or a result receipt.
     expect(await inspectFixtureApplication(sessionId)).toMatchObject({ jobStatus: 'saved', sessionId })
     expect(applicationMutations).toEqual([])

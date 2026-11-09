@@ -165,6 +165,32 @@ describe("TaskGraph server-owned templates", () => {
     expect(absent.templates).toBe(baseTemplates)
   })
 
+  it("withholds only the reserved application_filler template when preparation is unavailable", async () => {
+    const pool = {} as never
+    const lease = {} as never
+    const retainedTemplates = {
+      scout: TASK_GRAPH_TEMPLATES.scout,
+      analyst: TASK_GRAPH_TEMPLATES.analyst,
+      other_registered_role: TASK_GRAPH_TEMPLATES.prepare,
+    }
+    const taskGraphTemplates = {
+      ...retainedTemplates,
+      application_filler: { role: "application_filler", taskType: "application_fill_for_review", allowedActions: [] },
+    }
+    const applicationFillPreparationLoader = vi.fn(async () => undefined)
+    const result = await taskGraphRuntimeForTurn({
+      enabled: true, pool, lease, now: () => new Date(), taskGraphTemplates,
+      selectedJobPreparationLoader: async () => undefined,
+      applicationFillPreparationLoader,
+    })
+
+    expect(applicationFillPreparationLoader).toHaveBeenCalledWith(pool, lease, expect.any(Date))
+    expect(result.templates).toEqual(retainedTemplates)
+    expect(Object.keys(result.templates ?? {})).toEqual(Object.keys(retainedTemplates))
+    for (const [key, template] of Object.entries(retainedTemplates)) expect(result.templates?.[key]).toBe(template)
+    expect(result.templates).not.toHaveProperty("application_filler")
+  })
+
   it("keeps scheduled automation on the registered Scout and Analyst workflow", async () => {
     const templatesWithDraftRoles = {
       ...taskGraphTemplatesForSelectedJob({ jobId: "job-1" }),
