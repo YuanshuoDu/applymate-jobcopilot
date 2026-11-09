@@ -83,6 +83,34 @@ function diagnosticMachineErrorCode(value: unknown): string | null {
   return typeof value === "string" && SAFE_DIAGNOSTIC_ERROR_CODES.has(value) ? value : "present"
 }
 
+const SAFE_SUBMIT_OUTBOX_ERROR_CATEGORIES = [
+  "queue_delivery_or_ack_failed",
+  "terminal:invalid_intent_payload",
+  "terminal:outbox_identity_mismatch",
+  "terminal:outbox_identity_changed",
+  "terminal:queue_job_identity_mismatch",
+  "terminal:application_task_scope_mismatch",
+  "terminal:worker_task_id_mismatch",
+  "terminal:application_job_state_mismatch",
+  "terminal:attempt_already_claimed_or_terminal",
+  "terminal:application_account_inactive",
+  "terminal:approval_scope_mismatch",
+  "terminal:submission_queued_event_mismatch",
+  "terminal:submission_scope_mismatch",
+  "terminal:submission_attempt_fenced",
+  "terminal:attempt_superseded",
+  "terminal:terminal_submit_reconciled",
+] as const
+const SAFE_SUBMIT_OUTBOX_ERROR_CATEGORY_SET: ReadonlySet<string> = new Set(SAFE_SUBMIT_OUTBOX_ERROR_CATEGORIES)
+type SafeSubmitOutboxErrorCategory = typeof SAFE_SUBMIT_OUTBOX_ERROR_CATEGORIES[number]
+
+function diagnosticSubmitOutboxErrorCategory(value: unknown): "none" | "other" | SafeSubmitOutboxErrorCategory {
+  if (value === null || value === undefined) return "none"
+  return typeof value === "string" && SAFE_SUBMIT_OUTBOX_ERROR_CATEGORY_SET.has(value)
+    ? value as SafeSubmitOutboxErrorCategory
+    : "other"
+}
+
 function serviceUrl(value: string | undefined, kind: "postgres" | "redis"): string | null {
   const required = process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true"
   if (!value) {
@@ -327,6 +355,22 @@ describe("ApplicationTask full-loop stage trace parser", () => {
   })
 })
 
+describe("ApplicationTask submit outbox diagnostic classifier", () => {
+  it("preserves only fixed allowlisted outbox categories", () => {
+    for (const category of SAFE_SUBMIT_OUTBOX_ERROR_CATEGORIES) {
+      expect(diagnosticSubmitOutboxErrorCategory(category)).toBe(category)
+    }
+  })
+
+  it("uses none for absent errors and other for unlisted values", () => {
+    expect(diagnosticSubmitOutboxErrorCategory(null)).toBe("none")
+    expect(diagnosticSubmitOutboxErrorCategory(undefined)).toBe("none")
+    expect(diagnosticSubmitOutboxErrorCategory("unlisted_outbox_detail")).toBe("other")
+    expect(diagnosticSubmitOutboxErrorCategory("terminal:unlisted_detail")).toBe("other")
+    expect(diagnosticSubmitOutboxErrorCategory({ message: "raw error detail" })).toBe("other")
+  })
+})
+
 async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Promise<string> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
@@ -453,7 +497,7 @@ async function waitForStableTurnQueueJobs(turnId: string, stableMs = 750, timeou
 async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
   const turnId = task?.fillTurnId ?? null
   const taskId = task?.id ?? gateTaskId ?? null
-  const [turn, turnDispatch, taskGraph, turnSteps, recentEvents, childDispatches, applicationTaskEvents, submitOutbox, applyJobs, sessionTurns, sessionSubagents] = await Promise.all([
+  const [turn, turnDispatch, taskGraph, turnSteps, recentEvents, childDispatches, applicationTaskEvents, submitOutbox, applyJobs, sessionTurns, sessionSubagents, syntheticJob] = await Promise.all([
     turnId ? testDb.agentTurn.findUnique({ where: { id: turnId }, select: {
       id: true, source: true, status: true, rootTaskId: true, revision: true, error: true,
       leaseOwnerId: true, leaseExpiresAt: true, startedAt: true, completedAt: true,
@@ -483,6 +527,7 @@ async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
     applyQueue ? applyQueue.getJobs(["waiting", "active", "delayed", "completed", "failed", "paused", "waiting-children", "prioritized"], 0, -1) : [],
     testDb.agentTurn.findMany({ where: { sessionId: ids.session }, select: { id: true } }),
     testDb.subAgentTask.findMany({ where: { sessionId: ids.session }, select: { id: true } }),
+    testDb.job.findUnique({ where: { id: ids.job }, select: { status: true, workflowState: true } }),
   ])
   const [sessionTurnJobs, sessionSubagentJobs] = await Promise.all([
     Promise.all(sessionTurns.map(turnRow => matchingQueueJobs(turnQueue, "turnId", turnRow.id))),
@@ -504,6 +549,7 @@ async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
       status: task.status, checkpoint: task.checkpoint, waitId: jsonRecord(task.question)?.waitId ?? null,
       workerTaskId: task.workerTaskId ?? null, errorPresent: Boolean(task.error),
     } : null,
+    syntheticJob: syntheticJob ? { status: syntheticJob.status, workflowState: syntheticJob.workflowState } : null,
     turn: turn ? {
       id: turn.id, source: turn.source, status: turn.status, rootTaskId: turn.rootTaskId, revision: turn.revision,
       errorPresent: Boolean(turn.error), leaseOwnerId: turn.leaseOwnerId, leaseExpiresAt: turn.leaseExpiresAt,
@@ -535,6 +581,7 @@ async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
       idempotencyKey, aggregateId, publishedAt, attemptCount,
       workerTaskId: jsonString(payload, "workerTaskId") ?? null,
       payloadKeys: Object.keys(jsonRecord(payload) ?? {}).sort(), lastErrorPresent: Boolean(lastError),
+      lastErrorCategory: diagnosticSubmitOutboxErrorCategory(lastError),
     })),
     applyQueueJobs,
     sessionTurnIds: sessionTurns.map(turnRow => turnRow.id), sessionSubagentTaskIds: sessionSubagents.map(taskRow => taskRow.id),
