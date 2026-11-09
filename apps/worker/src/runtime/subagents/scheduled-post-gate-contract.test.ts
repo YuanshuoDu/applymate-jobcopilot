@@ -26,7 +26,7 @@ function handoff(overrides: Record<string, unknown> = {}) {
       { key: "execute-b", taskId: "execute-task-b", packageRefs: [refs[1]] }], auditTaskId: "audit-task", ...overrides,
   }
 }
-function digest(value: string): string { return `sha256:${value.padEnd(64, "0").slice(0, 64)}` }
+function digest(value: string): string { return scheduledPostGateDigest(value) }
 function executeEnvelope(queued: unknown, failed: unknown) {
   return { finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
     taskGraphVerificationReport: null, structuredResult: { queued, failed } }

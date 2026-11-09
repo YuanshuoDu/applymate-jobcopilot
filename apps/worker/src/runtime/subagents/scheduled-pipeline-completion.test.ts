@@ -264,11 +264,14 @@ describe("scheduled pipeline pre-terminal completion", () => {
     expect(stageCandidate).toHaveBeenCalledWith({ owner: executionOwner, rootAttemptCount: owner.rootAttemptCount,
       finalStepId: "step-final", finalStepOrdinal: 3, candidateText: "Final candidate" })
     expect(fetcher).not.toHaveBeenCalled()
-    expect(continueAfterGate).toHaveBeenCalledTimes(2)
+    expect(continueAfterGate).toHaveBeenCalledTimes(3)
     expect(continueAfterGate).toHaveBeenNthCalledWith(1, expect.objectContaining({ mode: "resume_post_gate",
       finalStepId: "step-final", recoveryStepId: "step-recovery" }))
     expect(continueAfterGate).toHaveBeenNthCalledWith(2, expect.objectContaining({ mode: "resume_audit",
       finalStepId: "step-final", recoveryStepId: "step-recovery" }))
+    expect(continueAfterGate).toHaveBeenNthCalledWith(3, expect.objectContaining({ owner, executionOwner,
+      attestation: analyzeAttestation, handoff, prepareProof: prepared.prepareProof,
+      scheduledWaitId, finalStepId: "step-final", recoveryStepId: "step-recovery" }))
   })
 
   it("rehydrates the persisted Gate proof after Turn lease replacement without rerunning Gate", async () => {
@@ -287,7 +290,8 @@ describe("scheduled pipeline pre-terminal completion", () => {
     })
 
     await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner: currentOwner, executionOwner: currentExecutionOwner,
-      recoveredCandidate: recoveredCandidate(), candidateText: "Final candidate", bridge: async () => ready,
+      recoveredCandidate: recoveredCandidate(), candidateText: "Final candidate",
+      bridge: async () => ({ status: "ready" as const, attestation: analyzeAttestation }),
       continueAfterGate, fetcher: vi.fn<typeof fetch>(), signal: new AbortController().signal }))
       .resolves.toEqual({ status: "replan", candidateText: "Final candidate", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK })
     expect(calls).toEqual(["post-gate", "rehydrate", "continue"])
@@ -489,7 +493,8 @@ describe("scheduled pipeline pre-terminal completion", () => {
     })
     gateContinuationMocks.selectResume.mockResolvedValue({ status: "initial" })
     gateContinuationMocks.readCandidate.mockResolvedValue(null)
-    const readPostGateContext = vi.fn(async () => ({ status: "awaiting_plan" as const }))
+    const postGateContexts = [{ status: "not_applicable" as const }, { status: "awaiting_plan" as const }]
+    const readPostGateContext = vi.fn(async () => postGateContexts.shift() ?? { status: "not_applicable" as const })
     const verifyPostGate = vi.fn(async () => null)
     const verifyGate = vi.fn(async () => { order.push("verify-gate"); return gateProof })
     const appendGate = vi.fn(async () => {
@@ -530,7 +535,7 @@ describe("scheduled pipeline pre-terminal completion", () => {
       .resolves.toEqual({ status: "replan", candidateText: "Final candidate", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK })
     expect(accepted).toHaveBeenCalledOnce()
     expect(stageCandidate).toHaveBeenCalledOnce()
-    expect(readPostGateContext).toHaveBeenCalledOnce()
+    expect(readPostGateContext).toHaveBeenCalledTimes(2)
     expect(verifyPostGate).not.toHaveBeenCalled()
     expect(appendGate).toHaveBeenCalledOnce()
     expect(verifyGate).toHaveBeenCalledOnce()

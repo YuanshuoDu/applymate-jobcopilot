@@ -118,6 +118,11 @@ describe("scheduled post-Gate child context", () => {
     expect(mocks.snapshotMatches).toHaveBeenCalledWith({ source: "automation", executionMode: "canonical_task_graph",
       input: fixture.live.turnInput }, digest)
     expect(mocks.buildAttestation).toHaveBeenCalledOnce()
+    const childQuery = fixture.client.query.mock.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS child'))?.[0]
+    expect(childQuery).toContain('session."userId" AS "userId"')
+    expect(childQuery).toContain('session."userId" = $2')
+    expect(childQuery).toContain('turn."userId" = $2')
+    expect(childQuery).not.toMatch(/child\."userId"/)
   })
 
   it("binds Audit only to its server-owned task id", async () => {

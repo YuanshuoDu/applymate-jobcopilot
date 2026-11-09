@@ -28,11 +28,15 @@ const handoff = parsedHandoff
 describe("resumeScheduledPostGate", () => {
   it("requests a Root plan when the verified Gate has no durable handoff yet", async () => {
     const read = vi.fn().mockResolvedValue({ status: "awaiting_plan" })
+    const verify = vi.fn()
     const wait = vi.fn()
-    const result = await resumeScheduledPostGate({ command: { readScheduledPostGatePlanningContext: read } as never,
+    const result = await resumeScheduledPostGate({ command: { readScheduledPostGatePlanningContext: read,
+      verifyScheduledPostGateCompletion: verify } as never,
       waitPort: { wait }, scope, recoveryStepId: "recovery-1", signal: new AbortController().signal })
 
     expect(result).toEqual({ status: "awaiting_plan" })
+    expect(read).toHaveBeenCalledOnce()
+    expect(verify).not.toHaveBeenCalled()
     expect(wait).not.toHaveBeenCalled()
   })
 

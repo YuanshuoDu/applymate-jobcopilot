@@ -450,7 +450,7 @@ describe("TaskGraph server-owned templates", () => {
     expect(selectedJobLoader).not.toHaveBeenCalled()
   })
 
-  it("keeps scheduled automation on Scout and Analyst even when selected-job preparation is available", async () => {
+  it("keeps scheduled automation independent of selected-job preparation and exposes only its Post-Gate templates", async () => {
     const selectedJobLoader = vi.fn(async () => ({ jobId: "job-1" }))
     const applicationFillLoader = vi.fn(async () => ({ available: true }))
     const result = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
@@ -463,7 +463,15 @@ describe("TaskGraph server-owned templates", () => {
     })
     expect(selectedJobLoader).not.toHaveBeenCalled()
     expect(applicationFillLoader).not.toHaveBeenCalled()
-    expect(Object.keys(result.templates ?? {})).toEqual(["scout", "analyst"])
+    expect(Object.keys(result.templates ?? {})).toEqual([
+      "scout", "analyst", "scheduled.application.execute", "scheduled.post_gate_audit",
+    ])
+    expect(result.templates?.["scheduled.application.execute"]).toMatchObject({
+      role: "executor", taskType: "scheduled_taskgraph_execute", allowedActions: [],
+    })
+    expect(result.templates?.["scheduled.post_gate_audit"]).toMatchObject({
+      role: "auditor", taskType: "scheduled_taskgraph_post_gate_audit", allowedActions: [],
+    })
     expect(result.templates).not.toHaveProperty("cover_letter_writer")
     expect(result.templates).not.toHaveProperty("cover_letter_reviewer")
     expect(result.templates).not.toHaveProperty("application_filler")

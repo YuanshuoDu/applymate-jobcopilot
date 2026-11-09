@@ -90,7 +90,7 @@ function gateEvidencePrefix(snapshot: TaskGraphSnapshot, current: ReturnType<typ
 }
 
 async function readLiveChild(client: Queryable, lease: SubagentLease, now: Date): Promise<Row | null> {
-  const result = await client.query<Row>(`SELECT child."id", child."userId", child."sessionId", child."turnId", child."rootTaskId",
+  const result = await client.query<Row>(`SELECT child."id", child."sessionId", child."turnId", child."rootTaskId",
       child."parentTaskId", child."role", child."taskType", child."status", child."attemptCount", child."leaseOwner",
       child."leaseExpiresAt", child."interruptRequestedAt", root."attemptCount" AS "rootAttemptCount",
       root."taskType" AS "rootTaskType", root."status" AS "rootStatus", root."leaseOwner" AS "rootLeaseOwner",
@@ -102,10 +102,11 @@ async function readLiveChild(client: Queryable, lease: SubagentLease, now: Date)
     JOIN "agent_sessions" AS session ON session."id" = child."sessionId"
     JOIN "agent_turns" AS turn ON turn."id" = child."turnId" AND turn."sessionId" = child."sessionId"
     JOIN "agent_executions" AS execution ON execution."sessionId" = turn."sessionId" AND execution."userId" = session."userId"
-    WHERE child."id" = $1 AND child."userId" = $2 AND child."sessionId" = $3 AND child."turnId" = $4
+    WHERE child."id" = $1 AND child."sessionId" = $3 AND child."turnId" = $4
       AND child."rootTaskId" = $5 AND child."parentTaskId" = $5 AND child."status" = 'running'
       AND child."leaseOwner" = $6 AND child."attemptCount" = $7 AND child."leaseExpiresAt" > $8
-      AND child."interruptRequestedAt" IS NULL AND turn."userId" = $2 AND session."status" NOT IN ('aborted','archived')
+      AND child."interruptRequestedAt" IS NULL AND session."userId" = $2 AND turn."userId" = $2
+      AND session."status" NOT IN ('aborted','archived')
       AND turn."status" NOT IN ('completed','failed','interrupted','cancelled','closed')
       AND turn."source" = 'automation' AND turn."executionMode" = 'canonical_task_graph'
       AND execution."status" IN ('running','paused','completed')
