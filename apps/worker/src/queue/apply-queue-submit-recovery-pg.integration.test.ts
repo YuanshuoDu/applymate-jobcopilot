@@ -56,7 +56,12 @@ let testQueueRedis: Redis | undefined
 let submitQueue: Queue<ApplyTaskSubmitPayload> | undefined
 const submitJobIds: string[] = []
 
-type Scenario = ApplicationSubmitIdentity & { readonly successorTurnId: string; readonly workerTaskId: string; readonly executionId: string }
+type Scenario = ApplicationSubmitIdentity & {
+  readonly childTaskId: string;
+  readonly successorTurnId: string;
+  readonly workerTaskId: string;
+  readonly executionId: string;
+}
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void
   const promise = new Promise<void>(done => { resolve = done })
@@ -137,7 +142,8 @@ async function seedScenario(label: string): Promise<Scenario> {
   const suffix = `${label}-${randomUUID()}`
   const identity: Scenario = {
     userId: `submit-user-${suffix}`, sessionId: `submit-session-${suffix}`, fillTurnId: `submit-turn-${suffix}`,
-    successorTurnId: `submit-successor-${suffix}`, applicationTaskId: `submit-task-${suffix}`, jobId: `submit-job-${suffix}`,
+    childTaskId: `filler-${suffix}`, successorTurnId: `submit-successor-${suffix}`,
+    applicationTaskId: `submit-task-${suffix}`, jobId: `submit-job-${suffix}`,
     approvalId: `submit-receipt-${suffix}`, constraintHash: "c".repeat(64), workerTaskId: `bullmq-${suffix}`, executionId: randomUUID(),
   }
   await pool.query(`INSERT INTO "${schema}"."agent_sessions" ("id", "userId") VALUES ($1, $2)`, [identity.sessionId, identity.userId])
@@ -145,7 +151,7 @@ async function seedScenario(label: string): Promise<Scenario> {
     identity.fillTurnId, identity.sessionId, identity.userId, identity.successorTurnId,
   ])
   await pool.query(`INSERT INTO "${schema}"."sub_agent_tasks" ("id", "sessionId", "turnId", "role", "taskType", "status") VALUES ($1, $2, $3, 'application_filler', 'application_fill_for_review', 'completed')`, [
-    `filler-${suffix}`, identity.sessionId, identity.fillTurnId,
+    identity.childTaskId, identity.sessionId, identity.fillTurnId,
   ])
   await pool.query(`INSERT INTO "${schema}"."application_tasks" ("id", "userId", "jobId", "sessionId", "fillTurnId", "fillTurnSessionId", "fillTurnUserId", "status", "checkpoint", "workerTaskId", "updatedAt") VALUES ($1, $2, $3, $4, $5, $4, $2, 'filling', 'submission_request_started', $6, NOW())`, [
     identity.applicationTaskId, identity.userId, identity.jobId, identity.sessionId, identity.fillTurnId, identity.workerTaskId,
@@ -157,7 +163,7 @@ async function seedScenario(label: string): Promise<Scenario> {
   return identity
 }
 
-async function prepareSubmitClaim(identity: Scenario): Promise<void> {
+async function prepareSubmitClaim(identity: Scenario, approvalTaskId = identity.applicationTaskId): Promise<void> {
   await pool.query(`INSERT INTO "${schema}"."User" ("id", "accountStatus") VALUES ($1, 'active')`, [identity.userId])
   await pool.query(`UPDATE "${schema}"."application_tasks" SET "status" = 'filling', "checkpoint" = 'submission_authorized', "workerTaskId" = $2 WHERE "id" = $1`, [
     identity.applicationTaskId, identity.workerTaskId,
@@ -165,9 +171,10 @@ async function prepareSubmitClaim(identity: Scenario): Promise<void> {
   await pool.query(`UPDATE "${schema}"."Job" SET "status" = 'saved', "workflowState" = 'queued' WHERE "id" = $1`, [identity.jobId])
   await pool.query(`INSERT INTO "${schema}"."agent_approvals"
     ("id", "userId", "sessionId", "turnId", "taskId", "jobId", "type", "toolCallId", "status", "scopeHash", "expiresAt", "payload")
-    VALUES ($1, $2, $3, $4, $5, $6, 'submit_application', 'application-submit:' || $5, 'approved', $7, NOW() + INTERVAL '1 hour', $8::jsonb)`, [
-    identity.approvalId, identity.userId, identity.sessionId, identity.fillTurnId, identity.applicationTaskId, identity.jobId,
-    identity.constraintHash, JSON.stringify({ applicationTaskId: identity.applicationTaskId, jobId: identity.jobId }),
+    VALUES ($1, $2, $3, $4, $5, $6, 'submit_application', $7, 'approved', $8, NOW() + INTERVAL '1 hour', $9::jsonb)`, [
+    identity.approvalId, identity.userId, identity.sessionId, identity.fillTurnId, approvalTaskId, identity.jobId,
+    `application-submit:${identity.applicationTaskId}`, identity.constraintHash,
+    JSON.stringify({ applicationTaskId: identity.applicationTaskId, jobId: identity.jobId }),
   ])
 }
 
@@ -714,6 +721,31 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
       if (workerRedis && workerRedis.status !== "end") await workerRedis.quit().catch(() => workerRedis?.disconnect())
     }
   }, 20_000)
+
+  it("rejects a child-task-bound synthetic approval before mutating the application task or Job", async () => {
+    const identity = await seedScenario("child-task-bound-submit-approval")
+    await prepareSubmitClaim(identity, identity.childTaskId)
+
+    const approval = await pool.query<{ taskId: string; toolCallId: string; payload: Record<string, string> }>(
+      `SELECT "taskId", "toolCallId", "payload" FROM "${schema}"."agent_approvals" WHERE "id" = $1`,
+      [identity.approvalId],
+    )
+    expect(approval.rows[0]).toEqual({
+      taskId: identity.childTaskId,
+      toolCallId: `application-submit:${identity.applicationTaskId}`,
+      payload: { applicationTaskId: identity.applicationTaskId, jobId: identity.jobId },
+    })
+    const before = await submitRecoverySnapshot(identity)
+    expect(before.task).toMatchObject({ status: "filling", checkpoint: "submission_authorized", workerTaskId: identity.workerTaskId })
+    expect(before.job).toMatchObject({ status: "saved", workflowState: "queued", appliedAt: null })
+
+    await expect(claimUnattendedSubmission(pool, identity, identity.workerTaskId)).resolves.toBe("unavailable")
+
+    const after = await submitRecoverySnapshot(identity)
+    expect(after.task).toEqual(before.task)
+    expect(after.job).toEqual(before.job)
+    expect(after.events).toEqual(before.events)
+  }, 15_000)
 
   it("surfaces a crashed pre-marker claim for review after terminal redelivery", async () => {
     const identity = await seedScenario("crashed-pre-marker-claim")

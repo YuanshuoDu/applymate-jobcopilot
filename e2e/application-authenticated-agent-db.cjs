@@ -42,7 +42,7 @@ async function initializeFixtureSse() {
   } finally { client.release() }
 }
 
-async function inspectTurn(sessionId, turnId) {
+async function inspectTurn(sessionId, turnId, expectedFinalText) {
   const database = await pool.query('SELECT current_database() AS name')
   if (database.rows[0]?.name !== 'application_flow_fixture') throw new Error('Unexpected database')
   const result = await pool.query(`SELECT turn."id", turn."status", turn."revision", turn."finalResponse", turn."error",
@@ -53,20 +53,39 @@ async function inspectTurn(sessionId, turnId) {
     JOIN "User" AS candidate ON candidate."id" = session."userId"
     WHERE session."id" = $1 AND turn."id" = $2`, [sessionId, turnId])
   const row = result.rows[0]
-  if (result.rowCount !== 1 || row.email !== 'candidate-a@example.invalid' || row.turnOwner !== row.sessionOwner) {
-    throw new Error('Unexpected session or turn owner')
-  }
+  const sessionTurnBindingMatches = result.rowCount === 1 && row.email === 'candidate-a@example.invalid' && row.turnOwner === row.sessionOwner
   const items = await pool.query(`SELECT "id", "status", "content" FROM "agent_items"
     WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'question'`, [sessionId, turnId])
   const events = await pool.query(`SELECT "type" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "sequence"`, [sessionId, turnId])
+  const finalAnswer = await pool.query(`SELECT
+    (SELECT COUNT(*) = 1 FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
+      AND "type" = 'agent_message' AND "phase" = 'final_answer') AS "exactlyOneFinalAssistantItem",
+    EXISTS (SELECT 1 FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
+      AND "type" = 'agent_message' AND "phase" = 'final_answer' AND "status" = 'completed'
+      AND "content"->>'text' = $3) AS "finalAssistantItemTextMatchesExpected",
+    EXISTS (SELECT 1 FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
+      AND "type" = 'agent_message' AND "phase" = 'final_answer' AND "status" = 'completed') AS "finalAssistantItemCompleted",
+    EXISTS (SELECT 1 FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
+      AND "type" = 'agent_message' AND "phase" = 'final_answer' AND COALESCE("content"->>'text', '') <> '') AS "finalAssistantItemHasText",
+    EXISTS (SELECT 1 FROM "agent_events" AS event JOIN "agent_items" AS item
+      ON item."id" = event."itemId" AND item."sessionId" = event."sessionId" AND item."turnId" = event."turnId"
+      WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'item.completed'
+        AND event."payload"->>'itemId' = event."itemId" AND event."payload"->>'status' = 'completed'
+        AND item."type" = 'agent_message' AND item."phase" = 'final_answer' AND item."status" = 'completed') AS "itemCompletedEventPersistsFinalAnswer",
+    EXISTS (SELECT 1 FROM "agent_events" AS event JOIN "agent_items" AS item
+      ON item."id" = event."itemId" AND item."sessionId" = event."sessionId" AND item."turnId" = event."turnId"
+      WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'turn.completed'
+        AND event."payload"->>'finalItemId' = event."itemId" AND item."type" = 'agent_message'
+        AND item."phase" = 'final_answer' AND item."status" = 'completed') AS "completionEventTargetsFinalAnswer"`, [sessionId, turnId, expectedFinalText])
   const steps = await pool.query(`SELECT "status", "errorCode", "finishReason" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "ordinal", "attempt"`, [sessionId, turnId])
   const tasks = await pool.query(`SELECT "status", "failureReason" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "createdAt"`, [sessionId, turnId])
   const toolResults = await pool.query(`SELECT COUNT(*)::int AS count,
     BOOL_OR("content"->'output'->>'question' = '[REDACTED]') AS "questionRedacted"
     FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'tool_result'
       AND "content"->>'toolCallId' = 'fixture-native-question'`, [sessionId, turnId])
-  return { turn: row, questions: items.rows, eventTypes: events.rows.map(event => event.type), steps: steps.rows, tasks: tasks.rows,
-    toolResultCount: toolResults.rows[0].count, toolResultQuestionRedacted: toolResults.rows[0].questionRedacted }
+  return { turn: row ?? { status: 'missing', error: null, finalResponse: null, completedEvents: 0, answeredEvents: 0 },
+    sessionTurnBindingMatches, questions: items.rows, eventTypes: events.rows.map(event => event.type), steps: steps.rows, tasks: tasks.rows,
+    finalAnswer: finalAnswer.rows[0], toolResultCount: toolResults.rows[0].count, toolResultQuestionRedacted: toolResults.rows[0].questionRedacted }
 }
 
 // The application/task linkage is synthetic; the question and Turn must
@@ -105,5 +124,130 @@ async function inspectFixtureApplication(sessionId) {
   if (result.rowCount !== 1 || result.rows[0].email !== 'candidate-a@example.invalid') throw new Error('Unexpected fixture application scope')
   return result.rows[0]
 }
-
-module.exports = { initializeFixtureSse, attachFixtureApplication, inspectFixtureApplication, inspectTurn, closeFixtureDb: () => pool.end() }
+function installAgentPageDiagnostics() {
+  const diagnostics = { completionEventDelivered: false, completionEventTargetsExpectedSessionAndTurn: false,
+    completionEventFinalItemIdMatchesEnvelopeItemId: false, finalItemCompletedEventDelivered: false,
+    finalItemHydrationRequestAttempted: false, finalItemHydrationTargetsExpectedItem: false,
+    finalItemHydrationSessionBindingMatches: false, finalItemHydrationTurnBindingMatches: false,
+    finalItemHydrationResponseOk: false, finalItemHydrationTextMatchesExpected: false, finalItemHydrationSucceeded: false,
+  }
+  const completedItems = new Set(), pendingTimelineIds = new Set(), pendingHydrationAppliers = new Map(); let expectedSessionId = '', expectedTurnId = '', expectedFinalText = '', finalItemId = null
+  Object.defineProperty(window, '__agentQuestionDiagnostics', { value: diagnostics })
+  Object.defineProperty(window, '__configureAgentQuestionDiagnostics', { value: (sessionId, turnId, finalText) => { expectedSessionId = sessionId; expectedTurnId = turnId; expectedFinalText = finalText } })
+  const nativeFetch = window.fetch.bind(window)
+  window.fetch = async (input, init) => {
+    let url = null
+    try {
+      url = new URL(typeof input === 'string' || input instanceof URL ? input.toString() : input.url, window.location.href)
+    } catch { /* URL inspection must not change fetch behavior. */ }
+    const sessionMatch = url?.pathname.match(/^\/api\/agent\/sessions\/([^/]+)\/(events|timeline)$/)
+    let pathSessionId = null
+    try { pathSessionId = sessionMatch ? decodeURIComponent(sessionMatch[1]) : null } catch { /* Keep the binding false. */ }
+    const requestSessionMatchesExpected = pathSessionId !== null && pathSessionId === expectedSessionId
+    const requestedItemId = sessionMatch?.[2] === 'timeline' && requestSessionMatchesExpected ? url.searchParams.get('itemId') : null
+    if (requestedItemId) {
+      pendingTimelineIds.add(requestedItemId)
+      diagnostics.finalItemHydrationRequestAttempted = true
+      if (requestedItemId === finalItemId) {
+        diagnostics.finalItemHydrationTargetsExpectedItem = true
+        diagnostics.finalItemHydrationSessionBindingMatches = true
+        diagnostics.finalItemHydrationTurnBindingMatches = diagnostics.completionEventTargetsExpectedSessionAndTurn && completedItems.has(requestedItemId)
+      }
+    }
+    const response = await nativeFetch(input, init)
+    if (!url) return response
+    const parsedUrl = url
+    if (parsedUrl.pathname.endsWith('/events') && response.headers.get('content-type')?.includes('text/event-stream')) {
+      const reader = response.clone().body?.getReader()
+      if (reader) void (async () => {
+        try {
+          const decoder = new TextDecoder()
+          let buffered = ''
+          let eventType = ''
+          let dataLines = []
+          const inspectFrame = () => {
+            const streamSessionMatches = pathSessionId !== null && pathSessionId === expectedSessionId
+            if (eventType === 'item.completed' || eventType === 'turn.completed') {
+              try {
+                const envelope = JSON.parse(dataLines.join('\n'))
+                const payload = envelope.payload && typeof envelope.payload === 'object' && !Array.isArray(envelope.payload)
+                  ? envelope.payload : null
+                const eventTurnId = typeof envelope.turnId === 'string' ? envelope.turnId
+                  : typeof payload?.turnId === 'string' ? payload.turnId : null
+                const expectedTurnEvent = streamSessionMatches && eventTurnId === expectedTurnId
+                if (eventType === 'item.completed' && expectedTurnEvent && typeof envelope.itemId === 'string') {
+                  completedItems.add(envelope.itemId)
+                  if (envelope.itemId === finalItemId) { diagnostics.finalItemCompletedEventDelivered = true; pendingHydrationAppliers.get(envelope.itemId)?.() }
+                }
+                if (eventType === 'turn.completed') {
+                  diagnostics.completionEventDelivered = streamSessionMatches
+                  diagnostics.completionEventTargetsExpectedSessionAndTurn = expectedTurnEvent
+                  if (expectedTurnEvent && payload && typeof payload.finalItemId === 'string') {
+                    finalItemId = payload.finalItemId
+                    diagnostics.completionEventFinalItemIdMatchesEnvelopeItemId = envelope.itemId === finalItemId
+                    diagnostics.finalItemCompletedEventDelivered = completedItems.has(finalItemId)
+                    if (pendingTimelineIds.has(finalItemId)) { diagnostics.finalItemHydrationRequestAttempted = true; diagnostics.finalItemHydrationTargetsExpectedItem = true; pendingHydrationAppliers.get(finalItemId)?.() }
+                  }
+                }
+              } catch { /* Malformed payloads leave the identity checks false. */ }
+            }
+            eventType = ''
+            dataLines = []
+          }
+          while (true) {
+            const next = await reader.read()
+            if (next.done) return
+            buffered += decoder.decode(next.value, { stream: true })
+            const lines = buffered.split(/\r?\n/)
+            buffered = lines.pop() ?? ''
+            for (const line of lines) {
+              if (!line) inspectFrame()
+              else if (line.startsWith('event:')) eventType = line.slice(6).trim()
+              else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+            }
+          }
+        } catch { /* Delivery stays false only when no completion frame was observed. */ }
+      })()
+    }
+    if (requestedItemId) {
+      if (requestedItemId === finalItemId) {
+        diagnostics.finalItemHydrationTargetsExpectedItem = true
+        diagnostics.finalItemHydrationSessionBindingMatches = true
+        diagnostics.finalItemHydrationTurnBindingMatches = diagnostics.completionEventTargetsExpectedSessionAndTurn && completedItems.has(requestedItemId)
+        diagnostics.finalItemHydrationResponseOk = response.ok
+      }
+      const hydration = { responseOk: response.ok, itemMatches: false, textMatches: false, sessionMatches: requestSessionMatchesExpected, turnMatches: false, turnIdObserved: false }
+      const applyHydration = () => {
+        if (requestedItemId !== finalItemId) return
+        if (!hydration.turnIdObserved) hydration.turnMatches = diagnostics.completionEventTargetsExpectedSessionAndTurn && completedItems.has(requestedItemId)
+        diagnostics.finalItemHydrationRequestAttempted = true
+        diagnostics.finalItemHydrationTargetsExpectedItem = true
+        diagnostics.finalItemHydrationSessionBindingMatches = hydration.sessionMatches
+        diagnostics.finalItemHydrationTurnBindingMatches = hydration.turnMatches
+        diagnostics.finalItemHydrationResponseOk = hydration.responseOk
+        diagnostics.finalItemHydrationTextMatchesExpected = hydration.textMatches
+        diagnostics.finalItemHydrationSucceeded = hydration.responseOk && hydration.itemMatches
+          && hydration.textMatches && hydration.sessionMatches && hydration.turnMatches
+      }
+      pendingHydrationAppliers.set(requestedItemId, applyHydration)
+      applyHydration()
+      if (response.ok) {
+        try {
+          void response.clone().json().then(body => {
+            const item = Array.isArray(body.items) && body.items.length === 1 ? body.items[0] : null
+            const content = item?.content && typeof item.content === 'object' && !Array.isArray(item.content) ? item.content : null
+            hydration.itemMatches = item?.id === requestedItemId && item.type === 'agent_message' && item.status === 'completed' && item.phase === 'final_answer'
+            hydration.textMatches = typeof content?.text === 'string' && content.text === expectedFinalText
+            hydration.sessionMatches = typeof item?.sessionId === 'string' ? item.sessionId === expectedSessionId : requestSessionMatchesExpected
+            hydration.turnIdObserved = typeof item?.turnId === 'string'
+            hydration.turnMatches = hydration.turnIdObserved ? item.turnId === expectedTurnId
+              : diagnostics.completionEventTargetsExpectedSessionAndTurn && completedItems.has(requestedItemId)
+            applyHydration()
+          }).catch(applyHydration)
+        } catch { applyHydration() }
+      }
+    }
+    return response
+  }
+}
+module.exports = { initializeFixtureSse, attachFixtureApplication, inspectFixtureApplication, inspectTurn, installAgentPageDiagnostics, closeFixtureDb: () => pool.end() }

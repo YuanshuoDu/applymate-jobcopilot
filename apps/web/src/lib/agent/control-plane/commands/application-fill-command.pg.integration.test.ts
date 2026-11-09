@@ -691,7 +691,7 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
         AND "type" = 'submit_application'
     `
     expect(approvals).toEqual([{
-      id: `application-fill:${value.taskId}:${started.turnId}`, turnId: started.turnId, taskId: lease.id,
+      id: `application-fill:${value.taskId}:${started.turnId}`, turnId: started.turnId, taskId: value.taskId,
       jobId: value.jobId, toolCallId: `application-submit:${value.taskId}`,
       type: "submit_application", status: "pending",
     }])
