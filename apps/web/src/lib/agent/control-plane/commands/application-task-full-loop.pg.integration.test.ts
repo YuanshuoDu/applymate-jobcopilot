@@ -129,7 +129,8 @@ type ApplicationFillExecutorTrace = {
   leaseSignalAbortedAtStart: boolean
   leaseSignalAbortedAtEnd: boolean
 }
-type ApplicationFillStageTrace = { entryValidation: boolean; waitPersistence: boolean; completion: boolean; accepted: boolean; rejected: boolean; waiting: boolean; completed: boolean; stale: boolean; conflict: boolean; failed: boolean; cancelled: boolean; unavailable: boolean; leaseLost: boolean; signalAborted: boolean }
+type ApplicationFillCompletionStaleGate = "lease_input_invalid" | "session_scope" | "turn_scope" | "child_lease_fence" | "application_task_scope"
+type ApplicationFillStageTrace = { entryValidation: boolean; waitPersistence: boolean; completion: boolean; accepted: boolean; rejected: boolean; waiting: boolean; completed: boolean; stale: boolean; conflict: boolean; failed: boolean; cancelled: boolean; unavailable: boolean; leaseLost: boolean; signalAborted: boolean; staleGate?: ApplicationFillCompletionStaleGate }
 type ApplicationTaskRow = {
   id: string; userId: string; jobId: string; sessionId: string | null; fillTurnId: string | null
   status: string; checkpoint: string | null; question: unknown; confirmedAnswers: unknown
@@ -274,16 +275,24 @@ function applicationFillExecutorTraces(child: Child | undefined): Array<Applicat
 
 function applicationFillStageTraces(child: Child | undefined): Array<ApplicationFillStageTrace | { traceInvalid: true }> {
   const prefix = "APPLICATION_FILL_STAGE_TRACE ", keys = ["entryValidation", "waitPersistence", "completion", "accepted", "rejected", "waiting", "completed", "stale", "conflict", "failed", "cancelled", "unavailable", "leaseLost", "signalAborted"]
+  const staleGates = ["lease_input_invalid", "session_scope", "turn_scope", "child_lease_fence", "application_task_scope"]
   const traces: Array<ApplicationFillStageTrace | { traceInvalid: true }> = []
   for (const line of child?.lines ?? []) {
     if (!line.startsWith(prefix)) continue
     try {
       const row = jsonRecord(JSON.parse(line.slice(prefix.length)))
-      if (!row || Object.keys(row).sort().join(",") !== [...keys].sort().join(",") || keys.some(key => typeof row[key] !== "boolean")) {
+      if (!row) {
         traces.push({ traceInvalid: true })
         continue
       }
-      traces.push(Object.fromEntries(keys.map(key => [key, row[key] === true])) as ApplicationFillStageTrace)
+      const hasStaleGate = Object.prototype.hasOwnProperty.call(row, "staleGate"), expectedKeys = [...keys, ...(hasStaleGate ? ["staleGate"] : [])]
+      if (Object.keys(row).sort().join(",") !== expectedKeys.sort().join(",") || keys.some(key => typeof row[key] !== "boolean")
+        || (hasStaleGate && (typeof row.staleGate !== "string" || !staleGates.includes(row.staleGate) || row.completion !== true || row.stale !== true))
+        || (row.completion === true && row.stale === true && !hasStaleGate)) {
+        traces.push({ traceInvalid: true })
+        continue
+      }
+      traces.push({ ...Object.fromEntries(keys.map(key => [key, row[key] === true])), ...(hasStaleGate ? { staleGate: row.staleGate as ApplicationFillCompletionStaleGate } : {}) } as ApplicationFillStageTrace)
     } catch { traces.push({ traceInvalid: true }) }
   }
   return traces.slice(-24)

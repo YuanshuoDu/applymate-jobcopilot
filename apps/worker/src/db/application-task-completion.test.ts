@@ -191,23 +191,46 @@ describe("ApplicationTask fill completion", () => {
 
   it("does not write a task, artifact, approval, or wait when the lease attempt is stale", async () => {
     const test = fixture({ subtaskLive: false })
+    const onStaleGate = vi.fn(() => { throw new Error("private diagnostic failure") })
 
-    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease })).resolves.toEqual({ status: "stale" })
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, onStaleGate })).resolves.toEqual({ status: "stale" })
+    expect(onStaleGate).toHaveBeenCalledOnce()
+    expect(onStaleGate).toHaveBeenCalledWith("child_lease_fence")
     expect(test.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
   })
 
   it("rejects an application task whose returned binding differs from the leased Turn", async () => {
     const test = fixture({ appTurnId: "foreign-turn" })
+    const onStaleGate = vi.fn()
 
-    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease })).resolves.toEqual({ status: "stale" })
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, onStaleGate })).resolves.toEqual({ status: "stale" })
+    expect(onStaleGate).toHaveBeenCalledOnce()
+    expect(onStaleGate).toHaveBeenCalledWith("application_task_scope")
+    expect(test.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
+  })
+
+  it.each([
+    ["lease_input_invalid", "lease"], ["session_scope", "session"], ["turn_scope", "turn"],
+  ] as const)("reports the fixed %s stale gate", async (expectedGate, failedGate) => {
+    const test = failedGate === "session" ? fixture({ sessionStatus: "paused" }) : failedGate === "turn" ? fixture({ turnStatus: "completed" }) : fixture()
+    if (failedGate === "lease") test.lease.id = ""
+    const onStaleGate = vi.fn()
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, onStaleGate })).resolves.toEqual({ status: "stale" })
+
+    expect(onStaleGate).toHaveBeenCalledOnce()
+    expect(onStaleGate).toHaveBeenCalledWith(expectedGate)
     expect(test.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
   })
 
   it("checks the lease user against the owning session and Turn before locking its subtask", async () => {
     const test = fixture({ subtaskOwnerUserId: "user-a" })
     test.lease.userId = "user-b"
+    const onStaleGate = vi.fn()
 
-    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease })).resolves.toEqual({ status: "stale" })
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, onStaleGate })).resolves.toEqual({ status: "stale" })
+    expect(onStaleGate).toHaveBeenCalledOnce()
+    expect(onStaleGate).toHaveBeenCalledWith("child_lease_fence")
 
     const subtaskLock = test.calls.find(call => call.sql.includes('FROM "sub_agent_tasks"'))
     expect(subtaskLock?.sql).toContain('"session"."userId" = $7')

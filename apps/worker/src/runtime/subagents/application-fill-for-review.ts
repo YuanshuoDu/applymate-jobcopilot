@@ -1,7 +1,7 @@
 import type { Pool, PoolClient } from "pg"
 import { unlinkSync } from "node:fs"
 import { withCloakContext } from "../../cloak/pool.js"
-import { acknowledgeApplicationFillCancellation, completeApplicationFillForReview, failApplicationFillBeforeBrowser, persistApplicationFillWait } from "../../db/application-task-completion.js"
+import { acknowledgeApplicationFillCancellation, completeApplicationFillForReview, failApplicationFillBeforeBrowser, persistApplicationFillWait, type ApplicationFillCompletionStaleGate } from "../../db/application-task-completion.js"
 import { generateResumePdf, type ResumeContent } from "../../db/resume-pdf.js"
 import { findFormPattern } from "../../db/form-patterns.js"
 import { tailorResumeKeywords } from "../../db/tailor-resume.js"
@@ -13,7 +13,7 @@ import { evaluateUnattendedApplyControl } from "../../queue/unattended-apply-con
 import { checkRateLimit } from "../../rate-limit.js"
 import type { SubagentExecutionResult, SubagentLease } from "./types.js"
 type WaitDetail = "captcha_required" | "authentication_required" | "mfa_required" | "unknown_sensitive_field" | "required_field" | "stale_review" | "review_required" | "fill_outcome_uncertain" | "unattended_apply_unavailable" | "cancelled"; type WaitCheckpoint = "fill_outcome_uncertain" | "form_answer_required"
-export type ApplicationFillStageObservation = Readonly<{ stage: "entry_validation" | "wait_persistence" | "completion"; outcome: "accepted" | "rejected" | "waiting" | "completed" | "stale" | "conflict" | "failed" | "cancelled" | "unavailable"; leaseLost: boolean; signalAborted: boolean }>
+export type ApplicationFillStageObservation = Readonly<{ stage: "entry_validation" | "wait_persistence" | "completion"; outcome: "accepted" | "rejected" | "waiting" | "completed" | "stale" | "conflict" | "failed" | "cancelled" | "unavailable"; leaseLost: boolean; signalAborted: boolean; staleGate?: ApplicationFillCompletionStaleGate }>
 type StageObserver = (event: ApplicationFillStageObservation) => void; type FillContext = { applicationUserId: string; applicationSessionId: string | null; fillTurnId: string | null; fillTurnSessionId: string | null; fillTurnUserId: string | null; taskStatus: string; checkpoint: string | null; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown; jobUserId: string; jobUrl: string | null; jobTitle: string; jobCompany: string; jobKeywords: string | null; jobDescription: string | null; jobCoverLetter: string | null; accountStatus: string; userName: string | null; userEmail: string; userPhone: string | null; userLocation: string | null; userLinkedin: string | null; personaFields: unknown; resumeContent: unknown; coverLetterContent: string | null; sessionUserId: string; sessionStatus: string; turnUserId: string; turnSessionId: string; turnStatus: string }
 const LOAD_CONTEXT_SQL = [
   'SELECT app."userId" AS "applicationUserId", app."sessionId" AS "applicationSessionId", app."fillTurnId", app."fillTurnSessionId", app."fillTurnUserId", app."status" AS "taskStatus", app."checkpoint", app."resumeId", app."coverLetterId", app."confirmedAnswers", job."userId" AS "jobUserId", job.url AS "jobUrl", job.role AS "jobTitle", job.company AS "jobCompany", job.keywords AS "jobKeywords", job.description AS "jobDescription", job."coverLetter" AS "jobCoverLetter", usr."accountStatus", usr.name AS "userName", usr.email AS "userEmail", usr.phone AS "userPhone", usr.location AS "userLocation", usr.linkedin AS "userLinkedin", usr."personaFields",',
@@ -139,8 +139,11 @@ async function preBrowserFailure(pool: Pool, lease: SubagentLease, reason: strin
 function cancelledOutcome() { return { kind: "wait" as const, detail: "cancelled" as const } }; function needsCompletionReplay(row: FillContext): boolean { return row.turnStatus === "waiting_for_approval" && ((row.taskStatus === "waiting_for_authorization" && row.checkpoint === "form_filled" && row.sessionStatus === "waiting_for_user") || (row.taskStatus === "filling" && row.checkpoint === "submission_authorized" && ["running", "waiting_for_user"].includes(row.sessionStatus)) || (row.taskStatus === "waiting_for_authorization" && row.checkpoint === "queue_retry" && ["running", "waiting_for_user"].includes(row.sessionStatus))) }
 function discardResume(path: string): void { try { unlinkSync(path) } catch { /* temporary file may already be gone */ } }; function observeStage(observer: StageObserver | undefined, event: ApplicationFillStageObservation): void { if (observer) try { observer(event) } catch {} }
 async function completeForReview(pool: Pool, lease: SubagentLease, observer?: StageObserver) {
-  try { const result = await completeApplicationFillForReview(pool, { lease }); if (observer) observeStage(observer, { stage: "completion", outcome: result.status, leaseLost: result.status === "stale" && !lease.signal.aborted, signalAborted: lease.signal.aborted }); return result }
-  catch (error) { if (observer) observeStage(observer, { stage: "completion", outcome: "unavailable", leaseLost: false, signalAborted: lease.signal.aborted }); throw error }
+  try {
+    let staleGate: ApplicationFillCompletionStaleGate | undefined
+    const result = await completeApplicationFillForReview(pool, { lease, ...(observer ? { onStaleGate: (gate: ApplicationFillCompletionStaleGate) => { staleGate = gate } } : {}) })
+    if (observer) observeStage(observer, { stage: "completion", outcome: result.status, leaseLost: result.status === "stale" && !lease.signal.aborted, signalAborted: lease.signal.aborted, ...(result.status === "stale" && staleGate ? { staleGate } : {}) }); return result
+  } catch (error) { if (observer) observeStage(observer, { stage: "completion", outcome: "unavailable", leaseLost: false, signalAborted: lease.signal.aborted }); throw error }
 }
 async function wait(pool: Pool, lease: SubagentLease, checkpoint: WaitCheckpoint, detail: WaitDetail, needs?: FormReviewNeeds, observer?: StageObserver): Promise<SubagentExecutionResult> {
   if (lease.signal.aborted || lease.interruptRequestedAt) return acknowledgeCancellation(pool, lease)

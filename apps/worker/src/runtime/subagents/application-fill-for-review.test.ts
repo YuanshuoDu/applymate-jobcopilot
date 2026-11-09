@@ -140,12 +140,26 @@ describe("executeApplicationFillForReview", () => {
     expect(stageObserver).toHaveBeenCalledWith({ stage: "wait_persistence", outcome: "stale", leaseLost: true, signalAborted: false })
 
     stageObserver.mockClear()
-    vi.mocked(completeApplicationFillForReview).mockResolvedValue({ status: "stale" })
+    vi.mocked(completeApplicationFillForReview).mockImplementation(async (_pool, input) => {
+      input.onStaleGate?.("child_lease_fence")
+      return { status: "stale" }
+    })
     const completionPool = poolFor(context({ taskStatus: "waiting_for_authorization", checkpoint: "form_filled", sessionStatus: "waiting_for_user", turnStatus: "waiting_for_approval" })).pool
 
     await expect(executeApplicationFillForReview({ pool: completionPool, lease: lease(), stageObserver }))
       .resolves.toMatchObject({ status: "failed", failureReason: "lease_lost" })
-    expect(stageObserver).toHaveBeenCalledWith({ stage: "completion", outcome: "stale", leaseLost: true, signalAborted: false })
+    expect(stageObserver).toHaveBeenCalledWith({ stage: "completion", outcome: "stale", leaseLost: true, signalAborted: false, staleGate: "child_lease_fence" })
+    expect(Object.keys(vi.mocked(completeApplicationFillForReview).mock.calls[0]![1]).sort()).toEqual(["lease", "onStaleGate"])
+  })
+
+  it("does not enable stale-gate diagnostics without the opt-in stage observer", async () => {
+    vi.mocked(completeApplicationFillForReview).mockResolvedValue({ status: "stale" })
+    const completionPool = poolFor(context({ taskStatus: "waiting_for_authorization", checkpoint: "form_filled", sessionStatus: "waiting_for_user", turnStatus: "waiting_for_approval" })).pool
+
+    await expect(executeApplicationFillForReview({ pool: completionPool, lease: lease() }))
+      .resolves.toMatchObject({ status: "failed", failureReason: "lease_lost" })
+
+    expect(Object.keys(vi.mocked(completeApplicationFillForReview).mock.calls[0]![1])).toEqual(["lease"])
   })
 
   it.each([
