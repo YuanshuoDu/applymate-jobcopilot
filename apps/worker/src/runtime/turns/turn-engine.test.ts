@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
+import { TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID, TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION } from "../context/task-graph-objective-progress.js"
 import { RootAbortController } from "../interrupt/registry.js"
 import { TurnLeaseError } from "./lease.js"
 import { createToolRouterExecutor, TurnEngine } from "./turn-engine.js"
@@ -141,6 +142,44 @@ describe("TurnEngine", () => {
     expect(fixture.fake.events.find(event => event.type === "cognitive.agenda")?.payload).toMatchObject({
       schemaVersion: "agent-harness.cognitive-agenda-receipt.v2", goalRevision: "a".repeat(64),
     })
+  })
+
+  it("does not expose or grant an external-write tool capability from a reported-passed delta", async () => {
+    const fixture = baseOptions(), digest = "b".repeat(64), baseBuilder = fixture.options.contextBuilder
+    const model = fixture.options.model
+    const requestedToolNames: string[][] = []
+    const executeTool = vi.fn(fixture.options.executeTool)
+    let buildCount = 0
+    const contextBuilder: TurnEngineOptions["contextBuilder"] & { objectiveProgressGoalRevision: () => string } = {
+      ...baseBuilder, objectiveProgressGoalRevision: () => digest,
+      build: async (request: Parameters<NonNullable<TurnEngineOptions["contextBuilder"]["build"]>>[0]) => {
+        const context = await baseBuilder.build(request), revision = ++buildCount
+        const progress: { schemaVersion: typeof TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION; advisory: true; revision: number;
+          requirements: Array<{ id: string; kind: "candidate_count_gte"; minimum: number; status: "active" | "reported_passed" }> } = {
+          schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION, advisory: true, revision,
+          requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 1, status: revision === 1 ? "active" : "reported_passed" }],
+        }
+        const observation: StepContext["blocks"][number] = { id: TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID,
+          layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent", content: progress }
+        return { ...context, taskGraphRevision: revision, blocks: [...context.blocks, observation] }
+      },
+    }
+    const options: TurnEngineOptions = {
+      ...fixture.options, contextBuilder, executeTool,
+      model: { ...model, async *stream(request) {
+        requestedToolNames.push(request.tools.map(tool => tool.name))
+        yield* model.stream(request)
+      } },
+    }
+
+    await expect(new TurnEngine(options).run()).resolves.toMatchObject({ status: "completed" })
+
+    const deltaContext = JSON.stringify(fixture.requests[1]?.messages) ?? ""
+    expect(deltaContext).toContain('"availability":"available"')
+    expect(deltaContext).toContain('"afterStatus":"reported_passed"')
+    expect(requestedToolNames.flat()).not.toContain("applications.submit")
+    expect(executeTool.mock.calls.map(([input]) => input.call.toolName)).toEqual(["jobs.search", "jobs.get"])
+    expect(fixture.fake.events.some(event => /approval|authorization/i.test(event.type))).toBe(false)
   })
 
   it("keeps claim identity at ordinal zero and forwards a separate root context identity on every Step", async () => {

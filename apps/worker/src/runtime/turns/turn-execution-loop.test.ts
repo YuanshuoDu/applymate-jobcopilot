@@ -1954,6 +1954,38 @@ describe("owner-agnostic turn execution loop", () => {
     expect(frameText).not.toContain("objectiveProgressSnapshot")
   })
 
+  it("does not treat a reported-passed progress delta as independent completion proof", async () => {
+    const root = fixture(identity("turn", "root-1")), digest = "e".repeat(64), base = root.options.contextBuilder
+    let buildCount = 0
+    const contextBuilder: TurnExecutionOptions["contextBuilder"] & { objectiveProgressGoalRevision: () => string } = {
+      ...base, objectiveProgressGoalRevision: () => digest, build: async (request: Parameters<typeof base.build>[0]) => {
+        const context = await base.build(request), revision = buildCount + 1
+        buildCount += 1
+        const progress: { schemaVersion: typeof TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION; advisory: true; revision: number;
+          requirements: Array<{ id: string; kind: "candidate_count_gte"; minimum: number; status: "active" | "reported_passed" }> } = {
+          schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION, advisory: true, revision,
+          requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 1, status: revision === 1 ? "active" : "reported_passed" }],
+        }
+        const observation: StepContext["blocks"][number] = { id: TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID,
+          layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent", content: progress }
+        return { ...context, taskGraphRevision: revision, blocks: [...context.blocks, observation] }
+      } },
+    }
+    const completionGate = vi.fn(async () => ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "Independent verification still requires proof." }))
+    root.options = { ...root.options, contextBuilder, completionGate, budget: { maxSteps: 2 } }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const finalRequest = JSON.stringify(root.requests[1]?.messages) ?? ""
+
+    expect(finalRequest).toContain('"availability":"available"')
+    expect(finalRequest).toContain('"afterStatus":"reported_passed"')
+    expect(completionGate).toHaveBeenCalledOnce()
+    expect(completionGate).toHaveBeenCalledWith(expect.objectContaining({ candidateText: "done:root-1" }))
+    expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted", stepCount: 2 })
+    expect(root.events.find(event => event.type === "final.rejected")?.payload).toMatchObject({ code: "task_graph_verification_unverified" })
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+  })
+
   it.each([
     { label: "fresh steering", action: "apply_fresh_steering", blocker: "fresh_steering", steering: true, expected: { activeSteering: 1, newlyObservedSteering: 1 } },
     { label: "pending input", action: "resolve_pending_input", blocker: "pending_input", pending: true, expected: { pendingInputs: 1 } },
