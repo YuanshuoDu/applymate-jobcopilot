@@ -224,7 +224,7 @@ async function startWorker() {
   subagents?.on("error", error => say(`SUBAGENT_WORKER_ERROR ${error.message}`))
   subagents?.on("stalled", jobId => say(`SUBAGENT_JOB_STALLED ${jobId}`))
   if (!turns || !subagents) throw new Error("canonical_turn_or_subagent_consumer_missing")
-  say("CANONICAL_TURN_AND_SUBAGENT_CONSUMERS_READY")
+  void queue.applyWorker.run().catch(() => say("APPLY_WORKER_RUN_FAILED")); say("CANONICAL_TURN_AND_SUBAGENT_CONSUMERS_READY")
   say("WORKER_READY")
   process.stdin.setEncoding("utf8")
   let buffer = ""
