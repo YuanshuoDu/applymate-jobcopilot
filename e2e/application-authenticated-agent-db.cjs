@@ -191,14 +191,15 @@ function installAgentPageDiagnostics() {
     if (parsedUrl.pathname.endsWith('/timeline') && parsedUrl.searchParams.has('itemId') && response.ok) {
       try {
         const requestedItemId = parsedUrl.searchParams.get('itemId')
-        const body = await response.clone().json()
-        const item = Array.isArray(body.items) && body.items.length === 1 ? body.items[0] : null
-        const content = item?.content && typeof item.content === 'object' && !Array.isArray(item.content)
-          ? item.content : null
-        if (item && item.id === requestedItemId && item.type === 'agent_message' && item.status === 'completed'
-          && item.phase === 'final_answer' && typeof content?.text === 'string' && content.text.length > 0) {
-          diagnostics.finalItemHydrationSucceeded = true
-        }
+        void response.clone().json().then(body => {
+          const item = Array.isArray(body.items) && body.items.length === 1 ? body.items[0] : null
+          const content = item?.content && typeof item.content === 'object' && !Array.isArray(item.content)
+            ? item.content : null
+          if (item && item.id === requestedItemId && item.type === 'agent_message' && item.status === 'completed'
+            && item.phase === 'final_answer' && typeof content?.text === 'string' && content.text.length > 0) {
+            diagnostics.finalItemHydrationSucceeded = true
+          }
+        }).catch(() => { /* Diagnostics intentionally retain only Boolean outcomes. */ })
       } catch { /* Diagnostics intentionally retain only Boolean outcomes. */ }
     }
     return response
