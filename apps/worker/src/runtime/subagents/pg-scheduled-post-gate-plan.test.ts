@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { BudgetExceededError } from "../budget.js"
 import { TaskGraphCommandError } from "./task-graph-command-port.js"
-import { appendScheduledPostGatePlan, verifyScheduledPostGateCompletion } from "./pg-scheduled-post-gate-plan.js"
+import { appendScheduledPostGatePlan, readScheduledPostGatePlanningContext, verifyScheduledPostGateCompletion } from "./pg-scheduled-post-gate-plan.js"
 import { scheduledPostGateDigest, SCHEDULED_POST_GATE_AUDIT_CRITERIA, SCHEDULED_POST_GATE_AUDIT_GOAL, SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID,
   SCHEDULED_POST_GATE_EXECUTE_CRITERIA, SCHEDULED_POST_GATE_EXECUTE_GOAL, SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID } from "./scheduled-post-gate-contract.js"
 import type { TaskGraphProposal, TaskGraphState } from "../planning/task-graph.js"
@@ -123,6 +123,26 @@ function configure(proof: unknown = gateProof, approvedRefs: readonly string[] =
 beforeEach(() => { vi.resetAllMocks(); configure() })
 
 describe("scheduled post-Gate PG plan command", () => {
+  it("treats an ordinary native TaskGraph as not applicable before scheduled Gate proof parsing", async () => {
+    const db = client()
+    mocks.load.mockResolvedValue({ ...loaded(), discoveryTurnEligibility: "ordinary" })
+
+    await expect(readScheduledPostGatePlanningContext(db as never, { scope } as never))
+      .resolves.toEqual({ status: "not_applicable" })
+    expect(mocks.receipt).toHaveBeenCalledOnce()
+    expect(mocks.readGate).not.toHaveBeenCalled()
+  })
+
+  it("keeps a scheduled graph with invalid Gate proof fail-closed", async () => {
+    const db = client()
+    mocks.load.mockResolvedValue({ ...loaded(), discoveryTurnEligibility: "scheduled" })
+    mocks.readGate.mockResolvedValue({ status: "invalid" })
+
+    await expect(readScheduledPostGatePlanningContext(db as never, { scope } as never))
+      .resolves.toEqual({ status: "invalid" })
+    expect(mocks.readGate).toHaveBeenCalledOnce()
+  })
+
   it("rejects a non-revise reconciliation operation before any database write", async () => {
     const db = client(), value = input()
     value.operation.decision = "keep" as never

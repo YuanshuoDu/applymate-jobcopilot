@@ -46,6 +46,7 @@ export async function readScheduledPostGatePlanningContext(client: Queryable,
   const receipt = await readScheduledPostGateReceipt(client, input.scope)
   if (receipt) return await validateScheduledPostGateHandoff(client, input.scope, loaded, receipt)
     ? { status: "planned", receipt, graphRevision: loaded.state.revision } : { status: "invalid" }
+  if (loaded.discoveryTurnEligibility === "ordinary") return { status: "not_applicable" }
   return awaitingPostGatePlan(client, input.scope, loaded)
 }
 

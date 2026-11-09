@@ -19,6 +19,8 @@ import { policyFromTask } from "./manager-task-scope.js"
 import { SCHEDULED_POST_GATE_AUDIT_CRITERIA, SCHEDULED_POST_GATE_AUDIT_GOAL,
   SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID, SCHEDULED_POST_GATE_EXECUTE_CRITERIA,
   SCHEDULED_POST_GATE_EXECUTE_GOAL, SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID } from "./scheduled-post-gate-contract.js"
+import { projectScheduledPipelineGraphAtCurrentStage } from "./scheduled-pipeline-graph-shape.js"
+import { parseTaskGraphSnapshot, taskGraphItemId } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import { executionKey } from "../turns/turn-execution-types.js"
 import type { TaskGraphProposal } from "../planning/task-graph.js"
@@ -68,7 +70,7 @@ describeWithServices("scheduled post-Gate TaskGraph handoff in disposable Postgr
 
   it("persists one immutable plan, rehydrates after a new Root lease, and verifies Execute plus Audit", async () => {
     const db = pool ??= new Pool({ connectionString: databaseUrl!, max: 8 })
-    const fixture = await createScheduledGatePrepareFixture(db, redisUrl!, { jobCount: 1 })
+    const fixture = await createScheduledGatePrepareFixture(db, redisUrl!, { jobCount: 2, scoutCount: 2 })
     fixtureUsers.push(fixture.ids.userId)
     const released = await releaseTurnLease(db, fixture.turnLease, "queued")
     expect(released).toBe(true)
@@ -118,6 +120,14 @@ describeWithServices("scheduled post-Gate TaskGraph handoff in disposable Postgr
     const context = await command.readScheduledPostGatePlanningContext?.({ scope: readScope })
     expect(context?.status).toBe("awaiting_plan")
     if (!context || context.status !== "awaiting_plan") throw new Error("scheduled_post_gate_plan_context_missing")
+    const preAppendRows = await db.query<{ content: unknown }>(
+      "SELECT \"content\" FROM \"agent_items\" WHERE \"id\" = $1 AND \"sessionId\" = $2 AND \"turnId\" = $3 AND \"taskId\" = $4 AND \"type\" = 'task_graph'",
+      [taskGraphItemId(fixture.ids.rootTaskId), fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId])
+    if (preAppendRows.rows.length !== 1) throw new Error("scheduled_post_gate_pre_append_snapshot_missing")
+    const preAppendSnapshot = parseTaskGraphSnapshot(preAppendRows.rows[0]!.content)
+    expect(projectScheduledPipelineGraphAtCurrentStage(preAppendSnapshot.nodes)).toMatchObject({
+      version: "v2", projection: { stage: "gate" },
+    })
     const planStep = await startStep(fixture, lease, turnStore)
     const scope = { ...readScope, stepId: planStep }
     const proposal: TaskGraphProposal = { expectedRevision: context.graphRevision, nodes: [

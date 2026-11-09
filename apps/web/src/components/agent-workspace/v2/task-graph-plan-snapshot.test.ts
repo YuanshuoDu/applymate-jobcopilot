@@ -78,16 +78,25 @@ describe('TaskGraph snapshot parser', () => {
     expect(parseTaskGraphSnapshot({ schemaVersion, nodes: [graphNode('a'.repeat(TASK_GRAPH_MAX_IDENTIFIER_LENGTH + 1), 'task-a')] })).toBeNull()
   })
 
-  it('accepts eight nodes at depth eight and rejects larger graph limits', () => {
+  it('accepts eleven-node persisted graphs and retains the depth-eight limit', () => {
     const eightNodes = Array.from({ length: 8 }, (_, index) => graphNode(
       `node-${index}`,
       `task-${index}`,
       index === 0 ? [] : [`node-${index - 1}`],
       index + 1,
     ))
+    const elevenPersistedNodes = Array.from({ length: 11 }, (_, index) => graphNode(
+      `persisted-node-${index}`,
+      `persisted-task-${index}`,
+    ))
+    const twelvePersistedNodes = [
+      ...elevenPersistedNodes,
+      graphNode('persisted-node-11', 'persisted-task-11'),
+    ]
 
     expect(parseTaskGraphSnapshot({ schemaVersion, nodes: eightNodes })?.nodes).toHaveLength(8)
-    expect(parseTaskGraphSnapshot({ schemaVersion, nodes: [...eightNodes, graphNode('node-8', 'task-8')] })).toBeNull()
+    expect(parseTaskGraphSnapshot({ schemaVersion, nodes: elevenPersistedNodes })?.nodes).toHaveLength(11)
+    expect(parseTaskGraphSnapshot({ schemaVersion, nodes: twelvePersistedNodes })).toBeNull()
     expect(parseTaskGraphSnapshot({ schemaVersion, nodes: [graphNode('deep', 'task-deep', [], 9)] })).toBeNull()
   })
 
