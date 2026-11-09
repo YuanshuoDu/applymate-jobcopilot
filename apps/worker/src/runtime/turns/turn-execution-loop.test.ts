@@ -1979,8 +1979,8 @@ describe("owner-agnostic turn execution loop", () => {
     const result = await runTurnExecutionLoop(root.options)
     const frame = root.requests[1]?.messages.find(message => message.content.some(part => part.type === "text"
       && part.text.startsWith("[harness request context trust=UNTRUSTED_DATA source=cognitive_action_agenda]")))
-    const frameText = frame?.content.find(part => part.type === "text"
-      && part.text.startsWith("[harness request context trust=UNTRUSTED_DATA source=cognitive_action_agenda]"))?.text ?? ""
+    const frameText = frame?.content.flatMap(part => part.type === "text" ? [part.text] : [])
+      .find(text => text.startsWith("[harness request context trust=UNTRUSTED_DATA source=cognitive_action_agenda]")) ?? ""
     const parsedProjection: unknown = JSON.parse(frameText.slice(frameText.indexOf("\n") + 1))
     const projection = isRecord(parsedProjection) ? parsedProjection : undefined
     const parsedProgressDelta = projection?.progressDelta
