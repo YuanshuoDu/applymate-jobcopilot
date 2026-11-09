@@ -2,8 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import type { Mock } from "vitest"
 import { SCHEDULED_PIPELINE_ATTESTATION_V1_SCHEMA, type ScheduledPipelineAttestation } from "@jobcopilot/agent-protocol"
 import { createScheduledPostGateChildExecutor, isScheduledPostGateCandidate, isScheduledPostGateLease } from "./scheduled-post-gate-child-runtime.js"
+import { SCHEDULED_GATE_COMPLETION_PROOF_SCHEMA } from "./scheduled-gate-contract.js"
 import { SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_AUDIT_ROLE, SCHEDULED_POST_GATE_AUDIT_TASK_TYPE,
-  SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_EXECUTE_ROLE, SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE } from "./scheduled-post-gate-contract.js"
+  SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_EXECUTE_ROLE, SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE,
+  SCHEDULED_POST_GATE_HANDOFF_SCHEMA, parseScheduledPostGateHandoff, scheduledPostGateDigest } from "./scheduled-post-gate-contract.js"
 import type { readScheduledPostGateChildContext, ScheduledPostGateChildContext } from "./scheduled-post-gate-context.js"
 import type { SubagentLease } from "./types.js"
 
@@ -17,8 +19,12 @@ vi.mock("./scheduled-post-gate-context.js", async importOriginal => ({
 const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
   turnLeaseOwnerId: "root-lease", turnLeaseVersion: 3, executionId: "execution-1", executionAttemptCount: 2 }
 const digest = `sha256:${"a".repeat(64)}`
-const handoff = { owner, snapshotDigest: digest, continuationKey: `scheduled-taskgraph:sha256:${"b".repeat(64)}` }
 const refs = ["pkg-a", "pkg-b"]
+const gateTaskId = "gate-1"
+const gateGraphRevision = 4
+const gateProof = { schemaVersion: SCHEDULED_GATE_COMPLETION_PROOF_SCHEMA, graphRevision: gateGraphRevision,
+  prepareProof: {}, gate: { taskId: gateTaskId, attemptCount: 2, resultDigest: digest, completedEventRevision: gateGraphRevision } }
+const handoff = createHandoff()
 const attestation = { schemaVersion: SCHEDULED_PIPELINE_ATTESTATION_V1_SCHEMA, snapshotDigest: digest, owner: {
   userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
   rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion },
@@ -30,6 +36,20 @@ const attestation = { schemaVersion: SCHEDULED_PIPELINE_ATTESTATION_V1_SCHEMA, s
     dependsOnTaskIds: ["scout-1"], jobIds: refs } } satisfies ScheduledPipelineAttestation
 const actor = { taskId: "execute-1", attemptCount: 1, leaseOwner: "child-lease" }
 const report = { processed: 2, applied: 0, queued: 1, pending: 1, skipped: 0, failed: 0, durationMs: 22 }
+
+function createHandoff() {
+  const packageRefs = refs
+  const executeNodes = [{ key: "execute-1", taskId: "execute-1", packageRefs }]
+  const proposal = { expectedRevision: gateGraphRevision, nodes: executeNodes }
+  const value = parseScheduledPostGateHandoff({ schemaVersion: SCHEDULED_POST_GATE_HANDOFF_SCHEMA, owner, snapshotDigest: digest,
+    continuationKey: `scheduled-taskgraph:sha256:${"b".repeat(64)}`, gateTaskId, gateAttemptCount: 2,
+    gateCompletedEventRevision: gateGraphRevision, gateProofDigest: scheduledPostGateDigest(gateProof), gateProof,
+    gateResultDigest: gateProof.gate.resultDigest, packageRefs, packageDigest: scheduledPostGateDigest(packageRefs),
+    proposalDigest: scheduledPostGateDigest(proposal), gateGraphRevision, graphRevision: gateGraphRevision + 1,
+    executeNodes, auditTaskId: "audit-1" })
+  if (!value) throw new Error("scheduled post-Gate handoff fixture is invalid")
+  return value
+}
 
 function lease(kind: "execute" | "audit", overrides: Partial<SubagentLease> = {}): SubagentLease {
   const execute = kind === "execute"
@@ -47,7 +67,7 @@ function context(kind: "execute" | "audit"): ScheduledPostGateChildContext {
   const common = { owner, handoff, attestation, actor: { ...actor, taskId: kind === "execute" ? "execute-1" : "audit-1" } }
   return kind === "execute" ? { kind, ...common, packageRefs: refs } : { kind, ...common }
 }
-function client() { return { query: vi.fn(async () => ({ rows: [] })), release: vi.fn() } }
+function client() { return { query: vi.fn(async (_sql: string) => ({ rows: [] })), release: vi.fn() } }
 function response(value: unknown, status = 200): Response { return new Response(JSON.stringify(value), { status }) }
 
 afterEach(() => { vi.resetAllMocks(); vi.unstubAllEnvs() })
