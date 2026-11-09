@@ -127,12 +127,23 @@ describe("scheduled specialized TaskGraph envelopes", () => {
     expect(isScheduledTaskGraphSpecializedEnvelope({ ...valid, task: { ...valid.task, role: "reviewer" } })).toBeNull()
   })
 
-  it("recognizes the distinct post-Gate Execute and Audit result envelopes", () => {
-    expect(isScheduledTaskGraphSpecializedEnvelope(postGateFixture("execute"))).toBe("execute")
+  it("accepts a model-proposed Execute key under the server-owned post-Gate template", () => {
+    const execute = postGateFixture("execute")
+    expect(execute.node.key).not.toBe(SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID)
+    expect(execute.node.templateId).toBe(SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID)
+    expect(isScheduledTaskGraphSpecializedEnvelope(execute)).toBe("execute")
     expect(isScheduledTaskGraphSpecializedEnvelope(postGateFixture("audit"))).toBe("audit")
   })
 
   it("fails closed on mismatched post-Gate task identity, topology, result, or depth", () => {
+    const execute = postGateFixture("execute")
+    const unboundExecute = { ...execute, node: { ...execute.node, key: "execute-unbound", taskId: "execute-unbound" },
+      task: { ...execute.task, id: "execute-unbound" } }
+    const executeNode = execute.snapshot.nodes.find(node => node.templateId === SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID)
+    if (!executeNode) throw new Error("Execute fixture node missing")
+    const duplicateExecute = { ...execute, snapshot: { ...execute.snapshot, nodes: [...execute.snapshot.nodes, executeNode] } }
+    expect(isScheduledTaskGraphSpecializedEnvelope(unboundExecute)).toBeNull()
+    expect(isScheduledTaskGraphSpecializedEnvelope(duplicateExecute)).toBeNull()
     const invalid = [
       postGateFixture("execute", { executeTask: { role: "reviewer" } }),
       postGateFixture("execute", { executeTask: { taskType: "scheduled_taskgraph_gate" } }),

@@ -21,20 +21,25 @@ export function isScheduledTaskGraphSpecializedEnvelope(input: SpecializedEnvelo
 }
 
 function scheduledPostGateExecuteEnvelope({ snapshot, node, task }: SpecializedEnvelopeInput): boolean {
-  if (!snapshot || node.key !== SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID || node.templateId !== SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID
-    || node.depth !== 5 || node.verificationDisposition !== "specialized" || node.verification !== undefined
-    || !Array.isArray(node.packageRefs) || !Array.isArray(node.dependsOn) || node.dependsOn.length !== 1 || node.dependsOn[0] !== SCHEDULED_GATE_TEMPLATE_ID
-    || task.id !== node.taskId || task.status !== "completed" || task.failureReason !== null
+  if (!snapshot) return false
+  const currentNode = snapshot.nodes.find(candidate => candidate.key === node.key && candidate.taskId === node.taskId)
+  if (!currentNode || currentNode.templateId !== SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID
+    || currentNode.depth !== 5 || currentNode.verificationDisposition !== "specialized" || currentNode.verification !== undefined
+    || !Array.isArray(currentNode.packageRefs) || !Array.isArray(currentNode.dependsOn) || currentNode.dependsOn.length !== 1
+    || currentNode.dependsOn[0] !== SCHEDULED_GATE_TEMPLATE_ID
+    || task.id !== currentNode.taskId || task.status !== "completed" || task.failureReason !== null
     || task.role !== SCHEDULED_POST_GATE_EXECUTE_ROLE || task.taskType !== SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE
     || !sameJson(task.expectedOutputSchema, SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA) || !sameJson(task.allowedActions, []) || task.contextIsEmpty !== true
-    || !parseScheduledPostGateExecuteTaskEnvelope(task.result, task.status, node.packageRefs)) return false
+    || !parseScheduledPostGateExecuteTaskEnvelope(task.result, task.status, currentNode.packageRefs)) return false
   const gate = snapshot.nodes.find(candidate => candidate.key === SCHEDULED_GATE_TEMPLATE_ID)
   const audit = snapshot.nodes.find(candidate => candidate.key === SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID)
   const executes = snapshot.nodes.filter(candidate => candidate.templateId === SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID)
-  return gate?.depth === 4 && gate.verificationDisposition === "specialized" && audit?.depth === 6
+  const executeKeys = executes.map(candidate => candidate.key), executeTaskIds = executes.map(candidate => candidate.taskId)
+  return gate?.templateId === SCHEDULED_GATE_TEMPLATE_ID && gate.depth === 4 && gate.verificationDisposition === "specialized"
+    && audit?.templateId === SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID && audit.depth === 6
     && audit.verificationDisposition === "specialized" && executes.length >= 1 && executes.length <= 3
-    && new Set(executes.map(candidate => candidate.key)).size === executes.length
-    && sameStringSet(audit.dependsOn, executes.map(candidate => candidate.key))
+    && new Set(executeKeys).size === executes.length && new Set(executeTaskIds).size === executes.length
+    && sameStringSet(audit.dependsOn, executeKeys)
 }
 
 function scheduledPostGateAuditEnvelope({ snapshot, tasks, node, task }: SpecializedEnvelopeInput): boolean {
