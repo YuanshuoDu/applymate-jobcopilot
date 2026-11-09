@@ -1,8 +1,9 @@
 import type pg from "pg"
 import type { SubagentLease } from "./types.js"
 import { markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
-import { dateValue, object as waitObject, safeSubagentWaitJson, waitResult } from "./durable-subagent-wait-store.js"
+import { dateValue, DurableSubagentWaitError, object as waitObject, safeSubagentWaitJson, waitResult, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
 import { resolveDurableWaitOutcome, sameIds, type DurableWaitResume } from "./child-resume-observations.js"
+import { inspectChildWaitSourceLifecycle } from "./child-resume-source-wait-lifecycle.js"
 
 type QueryClient = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -42,6 +43,18 @@ function validStoredOutcome(row: Row, ids: readonly string[], matched: readonly 
       && !!taskIds && sameIds(taskIds, ids)
       && dateValue(outcome.deadlineAt, "outcome.deadlineAt").getTime() === dateValue(row.deadlineAt, "deadlineAt").getTime()
   } catch { return false }
+}
+
+/** Returns only the already-persisted resolved outcome after the same validation used by resume. */
+export function validatedConsumedWaitOutcome(row: Row): DurableSubagentWaitResult {
+  const waitId = typeof row.waitId === "string" ? row.waitId : typeof row.id === "string" ? row.id : ""
+  const result = row.waitResult ?? row.result
+  const normalized = { ...row, id: waitId, waitId, waitResult: result }
+  const ids = strictIds(row.targetTaskIds), matched = strictIds(row.matchedTaskIds, 0)
+  if (!waitId || !ids || !matched || !validStoredOutcome(normalized, ids, matched)) {
+    throw new Error("child_resume_invalid_wait_result")
+  }
+  return waitResult({ ...normalized, result })
 }
 
 function markInputIds(input: Record<string, unknown>, ids: readonly string[]): boolean {
@@ -89,7 +102,7 @@ export async function loadChildConsumedWaitResume(client: QueryClient, lease: Su
       ${waitIdParam}
     ORDER BY candidateStep."attempt" DESC, candidateStep."ordinal" DESC, candidateWait."createdAt" DESC, candidateWait."id" DESC LIMIT 1
   )
-    SELECT wait."id" AS "waitId", wait."stepId", wait."targetTaskIds", wait."idempotencyKey", wait."mode", wait."status", wait."deadlineAt", wait."matchedTaskIds", wait."result" AS "waitResult", step."attempt", step."ordinal", next."id" AS "continuationStepId", next."ordinal" AS "continuationOrdinal", call."content" AS "callContent", call."status" AS "callStatus", result."id" AS "sourceItemId", result."content" AS "resultContent", result."status" AS "resultStatus"
+    SELECT wait."id" AS "waitId", wait."stepId", wait."targetTaskIds", wait."idempotencyKey", wait."mode", wait."status", wait."deadlineAt", wait."resolvedAt", wait."matchedTaskIds", wait."result" AS "waitResult", step."attempt", step."ordinal", next."id" AS "continuationStepId", next."ordinal" AS "continuationOrdinal", call."content" AS "callContent", call."status" AS "callStatus", result."id" AS "sourceItemId", result."content" AS "resultContent", result."status" AS "resultStatus"
     FROM "agent_wait_conditions" AS wait
     JOIN latest_wait ON latest_wait."id" = wait."id"
     JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."sessionId" = wait."sessionId" AND step."turnId" = wait."turnId" AND step."taskId" = wait."parentTaskId"
@@ -125,8 +138,9 @@ export async function loadChildConsumedWaitResume(client: QueryClient, lease: Su
   const targetRows = strictIds(targets.map(target => target.id))
   if (!targetRows || targets.length !== ids.length || !sameIds(targetRows, ids) || targets.some(target => target.parentTaskId !== lease.id
     || target.rootTaskId !== lease.rootTaskId || target.sessionId !== lease.sessionId || target.turnId !== lease.turnId || target.userId !== lease.userId)) throw new Error("child_resume_wait_lineage")
-  const waitRow: Row = { id: row.waitId, targetTaskIds: row.targetTaskIds, status: row.status, deadlineAt: row.deadlineAt,
-    matchedTaskIds: row.matchedTaskIds, result: row.waitResult }
+  const waitRow: Row = { id: row.waitId, userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
+    parentTaskId: lease.id, stepId: row.stepId, idempotencyKey: row.idempotencyKey, targetTaskIds: row.targetTaskIds,
+    mode: row.mode, status: row.status, deadlineAt: row.deadlineAt, resolvedAt: row.resolvedAt, matchedTaskIds: row.matchedTaskIds, result: row.waitResult }
   const matched = strictIds(row.matchedTaskIds, 0)
   if (!matched || matched.some(id => !ids.includes(id)) || !validStoredOutcome(row, ids, matched)) throw new Error("child_resume_invalid_wait_result")
   const call = waitObject(row.callContent), input = waitObject(call.input), request = waitObject(waitObject(row.waitResult).request)
@@ -140,7 +154,6 @@ export async function loadChildConsumedWaitResume(client: QueryClient, lease: Su
     || !Number.isSafeInteger(input.timeoutMs) || Number(input.timeoutMs) < 1 || Number(input.timeoutMs) > 30_000
     || !Number.isSafeInteger(request.timeoutMs) || input.timeoutMs !== request.timeoutMs || !inputIds || !requestIds
     || !sameIds(requestIds, ids) || !sameIds(inputIds, ids)) throw new Error("child_resume_wait_tool_call_conflict")
-  if (row.sourceItemId !== null && row.sourceItemId !== undefined && !validReceipt(row, ids, toolCallId)) throw new Error("child_resume_wait_tool_call_conflict")
   const stepId = typeof row.stepId === "string" ? row.stepId : ""
   const sourceItemId = typeof row.sourceItemId === "string" ? row.sourceItemId : `recovered-wait-result:${String(row.waitId)}`
   const attempt = Number(row.attempt), ordinal = Number(row.ordinal), continuationStepId = typeof row.continuationStepId === "string" ? row.continuationStepId : ""
@@ -150,6 +163,15 @@ export async function loadChildConsumedWaitResume(client: QueryClient, lease: Su
   const output = waitResult(waitRow), outputIds = strictIds(output.taskIds)
   if (output.waitId !== row.waitId || !["ready", "timed_out"].includes(output.status) || !outputIds || !sameIds(outputIds, ids)
     || !markCanonicalSubagentWaitTargetIds({ targetTaskIds: outputIds }, output, outputIds) || !markInputIds(input, ids)) throw new Error("child_resume_invalid_wait_result")
+  const recoveredMarker = Object.hasOwn(waitObject(row.waitResult), "sourceLifecycleRecovery")
+  if (row.sourceItemId !== null && row.sourceItemId !== undefined && !recoveredMarker && !validReceipt(row, ids, toolCallId)) {
+    throw new Error("child_resume_wait_tool_call_conflict")
+  }
+  let lifecycle: Awaited<ReturnType<typeof inspectChildWaitSourceLifecycle>>
+  try { lifecycle = await inspectChildWaitSourceLifecycle(client, lease, waitRow, stepId, output) }
+  catch (error) { if (error instanceof DurableSubagentWaitError) throw new Error("child_resume_wait_tool_call_conflict"); throw error }
+  if ((lifecycle.state !== "waiting" && lifecycle.state !== "recovered") || lifecycle.toolCallId !== toolCallId
+    || lifecycle.resultItemId !== row.sourceItemId) throw new Error("child_resume_wait_tool_call_conflict")
   return { waitId: String(row.waitId), stepId, attempt, ordinal, toolCallId, sourceItemId,
     input: safeSubagentWaitJson(input, 8_192), output, continuationStepId, continuationOrdinal }
 }

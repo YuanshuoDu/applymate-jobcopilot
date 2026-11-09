@@ -125,7 +125,7 @@ function fakePool(rows: OutboxRow[] = [outbox()], events: EventRow[] = [event]) 
     release: vi.fn(),
   }
   const pool = { connect: vi.fn(async () => client) } as unknown as pg.Pool
-  return { client, pool, outboxRows, calls }
+  return { client, pool, outboxRows, eventRows, calls }
 }
 
 function publisher() {
@@ -165,6 +165,111 @@ describe("agent event outbox consumer", () => {
     expect(lock?.values).toEqual(["outbox-1", LEGACY_AGENT_EVENT_OUTBOX_TOPIC])
     expect(mark?.values[2]).toBe(LEGACY_AGENT_EVENT_OUTBOX_TOPIC)
     expect(fake.outboxRows.get("outbox-1")).toMatchObject({ topic: LEGACY_AGENT_EVENT_OUTBOX_TOPIC, publishedAt: expect.any(Date), lastError: null })
+  })
+
+  it.each([
+    { topic: AGENT_EVENT_OUTBOX_TOPIC, toolName: "wait_subagents", eventType: undefined },
+    { topic: LEGACY_AGENT_EVENT_OUTBOX_TOPIC, toolName: "wait_subagents", eventType: undefined },
+    { topic: AGENT_EVENT_OUTBOX_TOPIC, toolName: "agent.wait", eventType: undefined },
+    { topic: LEGACY_AGENT_EVENT_OUTBOX_TOPIC, toolName: "agent.wait", eventType: undefined },
+    { topic: AGENT_EVENT_OUTBOX_TOPIC, toolName: "agent.wait", eventType: "mapped.item.completed" },
+  ])("projects pending $toolName input before publishing $topic without changing stored history", async ({ topic, toolName, eventType }) => {
+    const rawPayload = {
+      itemId: "call-item-1", status: "completed", content: {
+        toolCallId: "call-1", toolName, toolVersion: "1", status: "completed", errorCode: null,
+        input: { idempotencyKey: "opaque-wait-key-001", taskIds: ["+353 87 123 4567", "subagent-123e4567-e89b-42d3-a456-426614174000"], mode: "all", timeoutMs: 5_000, goal: "private extra" },
+      },
+    }
+    const waitEvent: EventRow = {
+      id: "wait-call-event", sessionId: "session-1", turnId: "turn-1", itemId: "call-item-1", taskId: "task-1", sequence: 10n,
+      type: eventType ?? "item.completed", actor: "subagent", correlationId: "call-item-1", causationId: "call-item-started",
+      idempotencyKey: "task:task-1:event:tool-call-completed:call-1:call-item-1:1", payload: rawPayload,
+      createdAt: "2026-09-22T10:00:00.000Z",
+    }
+    const outboxPayload = {
+      eventId: waitEvent.id, sessionId: waitEvent.sessionId, turnId: waitEvent.turnId, itemId: waitEvent.itemId,
+      taskId: waitEvent.taskId, sequence: waitEvent.sequence.toString(), type: waitEvent.type, actor: waitEvent.actor,
+      correlationId: waitEvent.correlationId, causationId: waitEvent.causationId, idempotencyKey: waitEvent.idempotencyKey,
+      payload: waitEvent.payload,
+    }
+    const fake = fakePool([outbox({ id: "wait-call-outbox", topic, payload: outboxPayload })], [waitEvent])
+    const redis = publisher()
+
+    await expect(drainAgentEventOutbox(fake.pool, redis)).resolves.toBe(1)
+
+    const envelope = publishedEnvelope(redis)
+    const envelopePayload = envelope.payload as Record<string, unknown>
+    const content = envelopePayload.content as Record<string, unknown>
+    const input = content.input as Record<string, unknown>
+    expect(input).toMatchObject({
+      idempotencyKey: "[REDACTED]",
+      taskIds: ["[REDACTED]", "[REDACTED]"],
+      mode: "all",
+      timeoutMs: 5_000,
+    })
+    expect(JSON.stringify(envelope)).not.toContain("sk-private-value")
+    expect(JSON.stringify(envelope)).not.toContain("opaque-wait-key-001")
+    expect(JSON.stringify(envelope)).not.toContain("subagent-123e4567-e89b-42d3-a456-426614174000")
+    expect(input).not.toHaveProperty("goal")
+    expect(fake.eventRows.get(waitEvent.id)?.payload).toEqual(rawPayload)
+    expect(fake.outboxRows.get("wait-call-outbox")?.payload).toEqual(outboxPayload)
+    expect(fake.calls.some(call => call.sql.includes('UPDATE "agent_events"'))).toBe(false)
+  })
+
+  it("does not publish a mapped wait event whose completion item identity conflicts", async () => {
+    const badPayload = {
+      itemId: "other-item", status: "completed", content: {
+        toolCallId: "call-1", toolName: "agent.wait", toolVersion: "1", status: "failed", errorCode: "wait_invalid",
+        input: { idempotencyKey: "opaque-key", taskIds: ["subagent-123e4567-e89b-42d3-a456-426614174000"], mode: "all", timeoutMs: 5_000 },
+      },
+    }
+    const badEvent: EventRow = {
+      id: "mapped-wait-mismatch", sessionId: "session-1", turnId: "turn-1", itemId: "call-item-1", taskId: "task-1", sequence: 11n,
+      type: "mapped.item.completed", actor: "subagent", correlationId: "call-item-1", causationId: "call-item-started",
+      idempotencyKey: "mapped-wait-mismatch-key", payload: badPayload, createdAt: "2026-09-22T10:00:00.000Z",
+    }
+    const badOutbox = outbox({ id: "mapped-wait-mismatch-outbox", payload: {
+      eventId: badEvent.id, sessionId: badEvent.sessionId, turnId: badEvent.turnId, itemId: badEvent.itemId,
+      taskId: badEvent.taskId, sequence: badEvent.sequence.toString(), type: badEvent.type, actor: badEvent.actor,
+      correlationId: badEvent.correlationId, causationId: badEvent.causationId, idempotencyKey: badEvent.idempotencyKey,
+      payload: badEvent.payload,
+    } })
+    const fake = fakePool([badOutbox], [badEvent])
+    const redis = publisher()
+
+    await expect(drainAgentEventOutbox(fake.pool, redis)).resolves.toBe(1)
+
+    expect(redis.publish).not.toHaveBeenCalled()
+    expect(fake.outboxRows.get(badOutbox.id)).toMatchObject({ publishedAt: expect.any(Date), lastError: "event_lineage_mismatch" })
+  })
+
+  it.each([
+    { label: "missing", input: undefined },
+    { label: "null", input: null },
+    { label: "scalar", input: "opaque private input" },
+  ])("projects mapped pending agent.wait completion with $label input", async ({ input }) => {
+    const callContent: Record<string, unknown> = { toolCallId: "call-1", toolName: "agent.wait" }
+    if (input !== undefined) callContent.input = input
+    const rawPayload = { itemId: "call-item-1", status: "completed", content: callContent }
+    const waitEvent: EventRow = {
+      id: "mapped-malformed-input", sessionId: "session-1", turnId: "turn-1", itemId: "call-item-1", taskId: "task-1", sequence: 12n,
+      type: "mapped.item.completed", actor: "subagent", correlationId: "call-item-1", causationId: "call-item-started",
+      idempotencyKey: "mapped-malformed-input-key", payload: rawPayload, createdAt: "2026-09-22T10:00:00.000Z",
+    }
+    const fake = fakePool([outbox({ id: "mapped-malformed-input-outbox", payload: {
+      eventId: waitEvent.id, sessionId: waitEvent.sessionId, turnId: waitEvent.turnId, itemId: waitEvent.itemId,
+      taskId: waitEvent.taskId, sequence: waitEvent.sequence.toString(), type: waitEvent.type, actor: waitEvent.actor,
+      correlationId: waitEvent.correlationId, causationId: waitEvent.causationId, idempotencyKey: waitEvent.idempotencyKey,
+      payload: rawPayload,
+    } })], [waitEvent])
+    const redis = publisher()
+
+    await expect(drainAgentEventOutbox(fake.pool, redis)).resolves.toBe(1)
+
+    const publishedPayload = publishedEnvelope(redis).payload as Record<string, unknown>
+    expect(publishedPayload.content).toMatchObject({ toolName: "agent.wait", input: {} })
+    expect(JSON.stringify(publishedEnvelope(redis))).not.toContain("opaque private input")
+    expect(fake.eventRows.get(waitEvent.id)?.payload).toEqual(rawPayload)
   })
 
   it("publishes a sparse mailbox envelope from the canonical event row", async () => {

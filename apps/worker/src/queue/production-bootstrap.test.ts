@@ -166,10 +166,10 @@ async function compositionRuntime(): Promise<{ runtime: CanonicalTurnRuntime; to
   }
 }
 
-async function coordinationRuntime(input: { workerId?: string; manager: AgentTreeManager; store: CoordinationStore; wait: DurableWaitPort; model: ModelAdapter; pool?: Parameters<typeof createCanonicalTurnRuntime>[0]; now?: () => Date; consumeWaitOutcomes?: boolean; stateLoader?: (state: CanonicalTurnState, lease: TurnLease) => CanonicalTurnState | Promise<CanonicalTurnState> }): Promise<{ runtime: CanonicalTurnRuntime; execute: CanonicalTurnRuntime["execute"] }> {
+async function coordinationRuntime(input: { workerId?: string; manager: AgentTreeManager; store: CoordinationStore; wait: DurableWaitPort; model: ModelAdapter; pool?: Parameters<typeof createCanonicalTurnRuntime>[0]; now?: () => Date; consumeWaitOutcomes?: boolean; resolveOwner?: NonNullable<ConstructorParameters<typeof ToolLifecycle>[0]["resolveOwner"]>; stateLoader?: (state: CanonicalTurnState, lease: TurnLease) => CanonicalTurnState | Promise<CanonicalTurnState> }): Promise<{ runtime: CanonicalTurnRuntime; execute: CanonicalTurnRuntime["execute"] }> {
   const read: RuntimeToolDefinition = { schemaVersion, name: "fixture.read", version: "1", description: "Read fixture evidence", capabilities: ["read"], inputSchema: Type.Object({}, { additionalProperties: false }), outputSchema: Type.Object({ jobs: Type.Array(Type.Object({ id: Type.String() }, { additionalProperties: false })) }, { additionalProperties: false }), risk: "read", domain: "jobs", idempotency: "read_only", timeoutMs: 1_000, requiredCapabilities: [], execute: async () => ({ jobs: [{ id: "job-fixture" }] }) }
   const registry = new ToolRegistry([read, ...createCoordinationTools({ manager: input.manager, store: input.store, wait: input.wait })])
-  const router = new ToolRouter(registry, new ToolLifecycle({ sink: new InMemoryToolLifecycleSink(), references: new InMemoryToolResultReferenceStore() }), createCanonicalPolicy(undefined, true))
+  const router = new ToolRouter(registry, new ToolLifecycle({ sink: new InMemoryToolLifecycleSink(), references: new InMemoryToolResultReferenceStore(), resolveOwner: input.resolveOwner }), createCanonicalPolicy(undefined, true))
   const state: CanonicalTurnState = { scope: { userId: "user_fixture" }, goal: "Read fixture state", modelProfileSnapshot: {} as never, toolPolicySnapshot: { role: "orchestrator", capabilities: ["read", "coordination"] }, budgetSnapshot: { limits: { maxSteps: 5 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
   const runtimeOptions: Parameters<typeof createCanonicalTurnRuntime>[1] = {
     workerId: input.workerId ?? "worker_fixture", manager: input.manager, coordinationEnabled: true,
@@ -933,7 +933,18 @@ describe("production Worker bootstrap", () => {
       },
     }
     const parentPrivateObservation: CanonicalTurnState["snapshot"]["toolObservations"] = [{ id: "root-private", content: "parent-private-marker" }]
-    const fixture = await coordinationRuntime({ manager, store: coordinationStore, wait, model, stateLoader: state => ({ ...state, snapshot: { ...state.snapshot, toolObservations: parentPrivateObservation } }) })
+    const resolveRootWaitOwner: NonNullable<ConstructorParameters<typeof ToolLifecycle>[0]["resolveOwner"]> = ({ taskId }) => {
+      const current = durableFixture.state.turn
+      return {
+        kind: "turn", taskId: taskId ?? "root_fixture",
+        lease: {
+          turnId: current.id, sessionId: current.sessionId, userId: current.userId,
+          ownerId: current.leaseOwnerId ?? "worker_fixture", leaseVersion: current.leaseVersion,
+          leaseStartedAt: current.leaseStartedAt ?? now, leaseExpiresAt: current.leaseExpiresAt ?? new Date(now.getTime() + 60_000),
+        },
+      }
+    }
+    const fixture = await coordinationRuntime({ manager, store: coordinationStore, wait, model, resolveOwner: resolveRootWaitOwner, stateLoader: state => ({ ...state, snapshot: { ...state.snapshot, toolObservations: parentPrivateObservation } }) })
     let execute: CanonicalTurnRuntime["execute"] | undefined
     let waitHandoff: Parameters<typeof createTurnQueue>[0]["waitHandoff"] | undefined
     const childQueueFactory = vi.fn(options => {
@@ -1021,6 +1032,7 @@ describe("production Worker bootstrap", () => {
         pool: durableFixture.pool as never,
         now: () => recoveryNow,
         consumeWaitOutcomes: true,
+        resolveOwner: resolveRootWaitOwner,
       })
       type RecoveredTurnPayload = Parameters<typeof runTurnJob>[0]["data"]
       const recoveredJobs: Array<{ name: string; data: RecoveredTurnPayload; options?: { jobId?: string; attempts?: number } }> = []
