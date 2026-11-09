@@ -296,39 +296,54 @@ describe("scheduled pipeline pre-terminal completion", () => {
 
   it("does not call the bridge or Web when Audit resume finds an orphan registration", async () => {
     const bridge = vi.fn(), fetcher = vi.fn<typeof fetch>()
-    const readContext = vi.fn(async () => ({ status: "invalid" as const }))
+    const readPostGateContext = vi.fn(async () => ({ status: "not_applicable" as const }))
+    const readAuditContext = vi.fn(async () => ({ status: "invalid" as const }))
     const continueAfterGate = createScheduledAutomationGateContinuation({
       pool: { connect: vi.fn() } as never,
-      commandPort: { readScheduledAuditResumeContext: readContext, verifyScheduledAuditCompletion: vi.fn() } as never,
+      commandPort: { readScheduledPostGatePlanningContext: readPostGateContext, verifyScheduledPostGateCompletion: vi.fn(),
+        readScheduledAuditResumeContext: readAuditContext, verifyScheduledAuditCompletion: vi.fn() } as never,
       waitPort: { wait: vi.fn() } as never, nativeQuestionWaitEnabled: false,
     })
     await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.",
       signal: new AbortController().signal, bridge, continueAfterGate, fetcher }))
       .resolves.toEqual({ status: "blocked", errorCode: "scheduled_audit_resume_invalid" })
-    expect(readContext).toHaveBeenCalledOnce()
+    expect(readPostGateContext).toHaveBeenCalledOnce()
+    expect(readAuditContext).toHaveBeenCalledOnce()
     expect(bridge).not.toHaveBeenCalled()
     expect(fetcher).not.toHaveBeenCalled()
   })
 
   it("does not trust a bare Web completed report when Audit registration is absent", async () => {
     const order: string[] = [], stageCandidate = vi.fn(async () => { order.push("stage") })
-    const continueAfterGate = vi.fn(async () => { order.push("resume"); return { status: "not_registered" as const } })
+    const continueAfterGate = vi.fn(async (input: Parameters<ScheduledPipelineGateContinuation>[0]) => {
+      if ("mode" in input && input.mode === "resume_post_gate") {
+        order.push("resume-post-gate")
+        return { status: "not_registered" as const }
+      }
+      order.push("resume-audit")
+      return { status: "not_registered" as const }
+    })
     const bridge = vi.fn(async () => { order.push("bridge"); return ready })
     const fetcher = vi.fn<typeof fetch>(async () => { order.push("web"); return response(200,
       { status: "completed", report: { processed: 1, applied: 0, queued: 0, pending: 0, skipped: 1, failed: 0, durationMs: 1 } }) })
     await expect(completeScheduledPipelineBeforeTerminal({ ...base(), stageCandidate, owner, candidateText: "Final.",
       signal: new AbortController().signal, bridge, continueAfterGate, fetcher }))
       .resolves.toEqual({ status: "blocked", errorCode: "scheduled_audit_not_registered" })
-    expect(order).toEqual(["resume", "bridge", "stage", "web", "resume"])
+    expect(order).toEqual(["resume-post-gate", "resume-audit", "bridge", "stage", "web", "resume-audit"])
+    expect(continueAfterGate).toHaveBeenCalledTimes(3)
     expect(stageCandidate).toHaveBeenCalledOnce()
   })
 
   it("rechecks Audit proof after a bare Web completed report before accepting completion", async () => {
     const order: string[] = [], stageCandidate = vi.fn(async () => { order.push("stage") })
     let recoveryCount = 0
-    const continueAfterGate = vi.fn(async () => {
+    const continueAfterGate = vi.fn(async (input: Parameters<ScheduledPipelineGateContinuation>[0]) => {
+      if ("mode" in input && input.mode === "resume_post_gate") {
+        order.push("resume-post-gate")
+        return { status: "not_registered" as const }
+      }
       recoveryCount += 1
-      order.push("resume")
+      order.push("resume-audit")
       return { status: recoveryCount === 1 ? "not_registered" as const : "completed" as const }
     })
     const bridge = vi.fn(async () => { order.push("bridge"); return ready })
@@ -337,7 +352,8 @@ describe("scheduled pipeline pre-terminal completion", () => {
     await expect(completeScheduledPipelineBeforeTerminal({ ...base(), stageCandidate, owner, candidateText: "Final.",
       signal: new AbortController().signal, bridge, continueAfterGate, fetcher }))
       .resolves.toEqual({ status: "completed", candidateText: "Final." })
-    expect(order).toEqual(["resume", "bridge", "stage", "web", "resume"])
+    expect(order).toEqual(["resume-post-gate", "resume-audit", "bridge", "stage", "web", "resume-audit"])
+    expect(continueAfterGate).toHaveBeenCalledTimes(3)
     expect(stageCandidate).toHaveBeenCalledOnce()
   })
 
@@ -346,7 +362,11 @@ describe("scheduled pipeline pre-terminal completion", () => {
       ? response(200, { status: "gate_checkpointed" }) : response(200, analyzeProof()))
     await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.", signal: new AbortController().signal,
       bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher,
-      continueAfterAnalyze: async () => prepared, continueAfterGate: async () => ({ status: "not_registered" }) }))
+      continueAfterAnalyze: async () => prepared, continueAfterGate: async (input: Parameters<ScheduledPipelineGateContinuation>[0]) => {
+        if ("mode" in input && input.mode === "resume_post_gate") return { status: "not_registered" as const }
+        if ("mode" in input && input.mode === "resume_audit") return { status: "not_registered" as const }
+        return { status: "not_registered" as const }
+      } }))
       .resolves.toEqual({ status: "blocked", errorCode: "scheduled_audit_not_registered" })
   })
 
@@ -469,21 +489,23 @@ describe("scheduled pipeline pre-terminal completion", () => {
     })
     gateContinuationMocks.selectResume.mockResolvedValue({ status: "initial" })
     gateContinuationMocks.readCandidate.mockResolvedValue(null)
+    const verifyPostGate = vi.fn(async () => null)
+    const verifyGate = vi.fn(async () => { order.push("verify-gate"); return gateProof })
+    const appendGate = vi.fn(async () => {
+      order.push("append-gate")
+      return { status: "accepted" as const, revision: 5, nodes: [{ key: "gate", taskId: "gate-task" }], readyTaskIds: ["gate-task"] }
+    })
     const gateContinuation = createScheduledAutomationGateContinuation({
       pool: { connect: async () => ({ query: async () => ({ rows: [], rowCount: 1 }), release: () => undefined }) } as never,
       commandPort: {
         readScheduledAuditResumeContext: vi.fn(async () => ({ status: "not_registered" as const })),
-        readScheduledPostGatePlanningContext: vi.fn(async () => ({ status: "not_applicable" as const })),
-        appendScheduledGate: vi.fn(async () => {
-          order.push("append-gate")
-          return { status: "accepted" as const, revision: 5, nodes: [{ key: "gate", taskId: "gate-task" }], readyTaskIds: ["gate-task"] }
-        }),
+        verifyScheduledAuditCompletion: vi.fn(),
+        readScheduledPostGatePlanningContext: vi.fn(async () => ({ status: "awaiting_plan" as const })),
+        verifyScheduledPostGateCompletion: verifyPostGate,
+        appendScheduledGate: appendGate,
         resumeScheduledGateChoice: vi.fn(async () => ({ status: "accepted" as const, taskId: "gate-task", requestAttemptCount: 1,
           resumedAttemptCount: 2, revision: 6, readyTaskIds: ["gate-task"] })),
-        verifyScheduledGateCompletion: vi.fn(async () => {
-          order.push("verify-gate")
-          return gateProof
-        }),
+        verifyScheduledGateCompletion: verifyGate,
       } as never,
       waitPort: {
         waitScheduledGate: vi.fn(async () => {
@@ -493,9 +515,10 @@ describe("scheduled pipeline pre-terminal completion", () => {
       } as never,
       nativeQuestionWaitEnabled: true,
     })
-    const gate = (async () => ({ ok: true as const })) as unknown as TurnEngineCompletionGate
     const accepted = vi.fn(), stageCandidate = vi.fn(async () => undefined)
-    const attached = attachScheduledPipelineCompletion({ gate, owner, bridge: async () => ({ status: "ready", attestation: analyzeAttestation }),
+    const bridge = vi.fn(async () => ({ status: "ready" as const, attestation: analyzeAttestation }))
+    const gate = (async () => ({ ok: true as const })) as unknown as TurnEngineCompletionGate
+    const attached = attachScheduledPipelineCompletion({ gate, owner, bridge,
       continueAfterAnalyze: async () => prepared, continueAfterGate: gateContinuation, fetcher, onWebAccepted: accepted,
       stageCandidate, rootAttemptCount: owner.rootAttemptCount })!
     const complete = attached[SCHEDULED_PIPELINE_COMPLETION]
@@ -506,6 +529,11 @@ describe("scheduled pipeline pre-terminal completion", () => {
       .resolves.toEqual({ status: "replan", candidateText: "Final candidate", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK })
     expect(accepted).toHaveBeenCalledOnce()
     expect(stageCandidate).toHaveBeenCalledOnce()
+    expect(readPostGateContext).toHaveBeenCalledOnce()
+    expect(verifyPostGate).not.toHaveBeenCalled()
+    expect(appendGate).toHaveBeenCalledOnce()
+    expect(verifyGate).toHaveBeenCalledOnce()
+    expect(bridge).toHaveBeenCalledOnce()
     expect(fetcher).toHaveBeenCalledTimes(2)
     expect(order).toEqual(["append-gate", "wait-gate", "verify-gate"])
   })

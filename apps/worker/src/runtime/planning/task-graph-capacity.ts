@@ -17,7 +17,7 @@ export type TaskGraphNodeCapacity = Readonly<{
 
 export function taskGraphNodeCapacity(value: unknown): TaskGraphNodeCapacity | undefined {
   const facts = parseFacts(value)
-  if (!facts) return undefined
+  if (!facts || facts.nodeCount > TASK_GRAPH_LIMITS.maxNodes) return undefined
   const { nodeCount, hasTypedVerification, repairRecorded } = facts
   const maxNodes = TASK_GRAPH_LIMITS.maxNodes
   const remaining = Math.max(0, maxNodes - nodeCount)

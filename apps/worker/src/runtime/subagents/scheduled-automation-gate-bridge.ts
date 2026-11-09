@@ -11,7 +11,8 @@ import { readScheduledGateQuestionCandidate } from "./scheduled-gate-wait-match.
 import { selectScheduledGateResumeWaitAttempt } from "./scheduled-gate-resume-wait.js"
 import { turnScheduledGateChoiceWaitId, type TurnQuestionGateChoiceBinding } from "../turns/turn-question-gate-choice-contract.js"
 import { createHash } from "node:crypto"
-import { resumeScheduledAudit } from "./scheduled-audit-resume.js"
+import { resumeScheduledAudit, scheduledAuditCompletionProofMatches, scheduledAuditWaitKey, validScheduledAuditWait } from "./scheduled-audit-resume.js"
+import { SCHEDULED_AUDIT_TEMPLATE_ID, type ScheduledAuditAppendReceipt, type ScheduledAuditOwner } from "./scheduled-audit-contract.js"
 import { resumeScheduledPostGate } from "./scheduled-post-gate-handoff.js"
 import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK } from "./scheduled-post-gate-contract.js"
 
@@ -107,15 +108,7 @@ export function createScheduledAutomationGateContinuation(input: Readonly<{
     const command = input.commandPort, waitPort = input.waitPort as DurableWaitPort & Partial<DurableWaitScheduledGatePort>
     if ("mode" in continuation) {
       if (continuation.mode === "resume_audit") return resumeScheduledAudit({ command, waitPort, scope: scope.readScope, recoveryStepId, signal })
-      const resumed = await resumeScheduledPostGate({ command, waitPort, scope: scope.readScope, recoveryStepId, signal })
-      switch (resumed.status) {
-        case "awaiting_plan": return { status: "replan", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK }
-        case "not_registered": return { status: "not_registered" }
-        case "completed": return { status: "completed" }
-        case "waiting_for_dependency": return { status: "waiting_for_dependency", waitId: resumed.waitId }
-        case "blocked": return { status: "blocked", errorCode: resumed.errorCode }
-        default: return { status: "blocked", errorCode: "scheduled_post_gate_resume_invalid" }
-      }
+      return mapPostGateResume(await resumeScheduledPostGate({ command, waitPort, scope: scope.readScope, recoveryStepId, signal }))
     }
     const gateWait = waitPort.waitScheduledGate
     if (!command.appendScheduledGate || typeof gateWait !== "function"
@@ -177,8 +170,81 @@ export function createScheduledAutomationGateContinuation(input: Readonly<{
       || gateCompletionProof.prepareProof.receipt.continuationKey !== continuation.prepareProof.receipt.continuationKey) {
       return { status: "blocked", errorCode: "scheduled_gate_completion_unverified" }
     }
-    return { status: "replan", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK }
+    if (!command.readScheduledPostGatePlanningContext || !command.verifyScheduledPostGateCompletion) {
+      return { status: "blocked", errorCode: "scheduled_gate_runtime_unavailable" }
+    }
+    const postGate = await resumeScheduledPostGate({ command, waitPort, scope: scope.readScope, recoveryStepId, signal })
+    if (postGate.status !== "not_registered") return mapPostGateResume(postGate)
+    return continueLegacyScheduledAudit({ command, waitPort, continuation, scope: scope.readScope,
+      recoveryStepId, handoff, attestation: continuation.attestation, gateProof: gateCompletionProof, scheduledOwner })
   }
+}
+
+function mapPostGateResume(result: Awaited<ReturnType<typeof resumeScheduledPostGate>>): ScheduledPipelineGateContinuationResult {
+  switch (result.status) {
+    case "awaiting_plan": return { status: "replan", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK }
+    case "not_registered": return { status: "not_registered" }
+    case "completed": return { status: "completed" }
+    case "waiting_for_dependency": return { status: "waiting_for_dependency", waitId: result.waitId }
+    case "blocked": return { status: "blocked", errorCode: result.errorCode }
+    default: return { status: "blocked", errorCode: "scheduled_post_gate_resume_invalid" }
+  }
+}
+
+async function continueLegacyScheduledAudit(input: Readonly<{
+  command: TaskGraphCommandPort
+  waitPort: DurableWaitPort & Partial<DurableWaitScheduledGatePort>
+  continuation: Extract<ScheduledPipelineGateContinuationInput, { attestation: ScheduledAutomationPipelineAttestation }>
+  scope: TaskGraphReadScope
+  recoveryStepId: string
+  handoff: ScheduledAnalyzeCheckpointHandoff
+  attestation: ScheduledAutomationPipelineAttestation
+  gateProof: ScheduledGateCompletionProof
+  scheduledOwner: Readonly<{ executionId: string; executionAttemptCount: number }>
+}>): Promise<ScheduledPipelineGateContinuationResult> {
+  if (!input.command.appendScheduledAudit || !input.command.verifyScheduledAuditCompletion || typeof input.waitPort.wait !== "function") {
+    return { status: "blocked", errorCode: "scheduled_gate_runtime_unavailable" }
+  }
+  const appended = await input.command.appendScheduledAudit({ scope: { ...input.scope, stepId: input.recoveryStepId },
+    executionOwner: input.scheduledOwner, handoff: input.handoff, attestation: input.attestation,
+    gateProof: input.gateProof, ...(input.continuation.scheduledWaitId !== undefined
+      ? { scheduledWaitId: input.continuation.scheduledWaitId } : {}) })
+  const audit = auditTarget(appended)
+  if (!audit) return { status: "blocked", errorCode: "scheduled_audit_schedule_invalid" }
+  const wait = await input.waitPort.wait({ userId: input.scope.userId, sessionId: input.scope.sessionId, turnId: input.scope.turnId,
+    stepId: input.recoveryStepId, taskId: input.scope.rootTaskId, rootTaskId: input.scope.rootTaskId,
+    targetTaskIds: [audit.taskId], mode: "all", timeoutMs: WAIT_TIMEOUT_MS,
+    idempotencyKey: scheduledAuditWaitKey(audit.taskId, input.recoveryStepId, audit.attemptCount) })
+  if (!validScheduledAuditWait(wait, audit.taskId)) return { status: "blocked", errorCode: "scheduled_audit_wait_invalid" }
+  if (wait.status === "waiting") return { status: "waiting_for_dependency", waitId: wait.waitId }
+  if (wait.status !== "ready") return { status: "blocked", errorCode: `scheduled_audit_wait_${wait.status}` }
+  const proof = await input.command.verifyScheduledAuditCompletion({ scope: input.scope, executionOwner: input.scheduledOwner,
+    gateProof: input.gateProof, auditTaskId: audit.taskId, attemptCount: audit.attemptCount })
+  const owner: ScheduledAuditOwner = { userId: input.continuation.owner.userId, sessionId: input.continuation.owner.sessionId,
+    turnId: input.continuation.owner.turnId, rootTaskId: input.continuation.owner.rootTaskId,
+    rootAttemptCount: input.continuation.owner.rootAttemptCount, executionId: input.handoff.executionId,
+    executionAttemptCount: input.handoff.executionAttemptCount }
+  return scheduledAuditCompletionProofMatches(proof, { owner, snapshotDigest: input.attestation.snapshotDigest,
+    gateProof: input.gateProof, auditTaskId: audit.taskId, attemptCount: audit.attemptCount })
+    ? { status: "completed" } : { status: "blocked", errorCode: "scheduled_audit_completion_unverified" }
+}
+
+function auditTarget(receipt: ScheduledAuditAppendReceipt): { taskId: string; attemptCount: number } | null {
+  try {
+    const row = record(receipt), nodes = row?.nodes, ready = row?.readyTaskIds
+    const node = Array.isArray(nodes) ? record(nodes[0]) : null
+    return row && Array.isArray(nodes) && Array.isArray(ready) && nodes.length === 1
+      && (row.status === "accepted" || row.status === "duplicate") && positive(row.revision)
+      && node?.key === SCHEDULED_AUDIT_TEMPLATE_ID && validId(node.taskId)
+      && row.auditTaskId === node.taskId && positive(row.expectedAttemptCount)
+      && (ready.length === 0 || ready.length === 1 && ready[0] === node.taskId)
+      ? { taskId: node.taskId, attemptCount: row.expectedAttemptCount } : null
+  } catch { return null }
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
 }
 
 type ScheduledGateWaitOutcome = Readonly<{ status: "waiting"; waitId: string; requestAttemptCount: number }>

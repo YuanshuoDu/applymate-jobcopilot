@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { Pool } from "pg"
+import { Pool, type PoolClient } from "pg"
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
 import { claimTurnLease, releaseTurnLease, type TurnLease } from "../turns/lease.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
@@ -16,11 +16,16 @@ import { createScheduledGateChildExecutor } from "./scheduled-gate-child-runtime
 import { createScheduledPostGateChildExecutor } from "./scheduled-post-gate-child-runtime.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { policyFromTask } from "./manager-task-scope.js"
+import { SCHEDULED_GATE_TEMPLATE_ID } from "./scheduled-gate-contract.js"
 import { SCHEDULED_POST_GATE_AUDIT_CRITERIA, SCHEDULED_POST_GATE_AUDIT_GOAL,
   SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID, SCHEDULED_POST_GATE_EXECUTE_CRITERIA,
   SCHEDULED_POST_GATE_EXECUTE_GOAL, SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID } from "./scheduled-post-gate-contract.js"
+import { readScheduledPostGateReceipt, validateScheduledPostGateHandoff } from "./scheduled-post-gate-handoff.js"
+import { loadTaskGraph, lockTaskGraphScope } from "./task-graph-pg-state.js"
+import type { TaskGraphReadScope } from "./task-graph-command-port.js"
 import { projectScheduledPipelineGraphAtCurrentStage } from "./scheduled-pipeline-graph-shape.js"
-import { parseTaskGraphSnapshot, taskGraphItemId } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphItemId,
+  taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import { executionKey } from "../turns/turn-execution-types.js"
 import type { TaskGraphProposal } from "../planning/task-graph.js"
@@ -141,7 +146,16 @@ describeWithServices("scheduled post-Gate TaskGraph handoff in disposable Postgr
     const input = { scope, proposal, operation }
     const admitted = await command.appendScheduledPostGatePlan?.(input)
     expect(admitted?.status).toBe("accepted")
-    const replay = await command.appendScheduledPostGatePlan?.(input)
+    let replay: Awaited<ReturnType<NonNullable<typeof command.appendScheduledPostGatePlan>>> | undefined
+    try {
+      replay = await command.appendScheduledPostGatePlan?.(input)
+    } catch (error: unknown) {
+      if (errorCode(error) === "scheduled_post_gate_receipt_invalid") {
+        const replayDiagnostic = await diagnoseScheduledPostGateReplay(db, scope)
+        throw new Error(`scheduled_post_gate_receipt_invalid_diagnostic:${JSON.stringify(replayDiagnostic)}`)
+      }
+      throw error
+    }
     expect(replay).toMatchObject({ status: "duplicate", revision: admitted?.revision, nodes: admitted?.nodes })
     if (!admitted || admitted.nodes.length !== 2) throw new Error("scheduled_post_gate_plan_not_admitted")
 
@@ -191,6 +205,78 @@ describeWithServices("scheduled post-Gate TaskGraph handoff in disposable Postgr
     expect((await store.get(gateTaskId, fixture.ids.sessionId))?.attemptCount).toBe(1)
   }, 600_000)
 })
+
+type ScheduledPostGateReplayDiagnostic = Readonly<{
+  available: boolean
+  handoffValid: boolean
+  acceptedPlan?: Readonly<{ eventCount: number; identity: boolean; fingerprint: boolean; receipt: boolean; nodes: boolean; readyTaskIds: boolean }>
+}>
+
+/** Read-only, bounded predicate snapshot used only when duplicate receipt validation fails. */
+async function diagnoseScheduledPostGateReplay(pool: Pool, scope: TaskGraphReadScope): Promise<ScheduledPostGateReplayDiagnostic> {
+  let client: PoolClient | undefined, inTransaction = false
+  try {
+    client = await pool.connect()
+    await client.query("BEGIN"); inTransaction = true
+    await client.query("SELECT set_config('app.user_id', $1, true)", [scope.userId])
+    await lockTaskGraphScope(client, scope)
+    const loaded = await loadTaskGraph(client, scope)
+    const receipt = await readScheduledPostGateReceipt(client, scope)
+    if (!receipt || !loaded.snapshot || !loaded.state) return { available: true, handoffValid: false }
+    const handoffValid = await validateScheduledPostGateHandoff(client, scope, loaded, receipt)
+    const gateIndex = loaded.snapshot.nodes.findIndex(node => node.key === SCHEDULED_GATE_TEMPLATE_ID)
+    const proposal = { expectedRevision: receipt.gateGraphRevision, nodes: loaded.snapshot.nodes.slice(gateIndex + 1).map(node => ({
+      key: node.key, templateId: node.templateId, goal: node.goal, successCriteria: node.successCriteria, dependsOn: node.dependsOn,
+      ...(node.packageRefs === undefined ? {} : { packageRefs: node.packageRefs }),
+    })) }
+    const key = taskGraphProposalKey(scope.rootTaskId, receipt.gateGraphRevision)
+    const result = await client.query<Record<string, unknown>>(\`SELECT event."itemId", event."taskId", event."actor",
+      event."idempotencyKey", event."payload" FROM "agent_events" AS event
+      JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+      JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+      WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" IN ('item.started', 'item.delta')
+        AND event."idempotencyKey" = $3 AND session."userId" = $4 AND turn."userId" = $4 LIMIT 2\`,
+    [scope.sessionId, scope.turnId, key, scope.userId])
+    const event = record(result.rows[0]), payload = event && record(event.payload)
+    const planReceipt = payload && record(payload.receipt), planNodes = planReceipt && diagnosticDenseArray(planReceipt.nodes)
+    const expectedNodes = [...receipt.executeNodes.map(node => ({ key: node.key, taskId: node.taskId, status: "queued" })),
+      { key: SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID, taskId: receipt.auditTaskId, status: "waiting" }]
+    const single = result.rows.length === 1
+    return { available: true, handoffValid, acceptedPlan: {
+      eventCount: Math.min(result.rows.length, 2),
+      identity: Boolean(single && event && event.itemId === taskGraphItemId(scope.rootTaskId)
+        && event.taskId === scope.rootTaskId && event.actor === "orchestrator" && event.idempotencyKey === key
+        && payload?.kind === "proposal" && payload.revision === receipt.graphRevision),
+      fingerprint: Boolean(payload && safeDiagnosticSame(payload.fingerprint, taskGraphFingerprint(proposal))),
+      receipt: Boolean(planReceipt && planReceipt.status === "accepted" && planReceipt.revision === receipt.graphRevision),
+      nodes: Boolean(planNodes && safeDiagnosticSame(planNodes, expectedNodes)),
+      readyTaskIds: Boolean(planReceipt && safeDiagnosticSame(planReceipt.readyTaskIds, receipt.executeNodes.map(node => node.taskId))),
+    } }
+  } catch {
+    return { available: false, handoffValid: false }
+  } finally {
+    if (client) {
+      if (inTransaction) await client.query("ROLLBACK").catch(() => undefined)
+      client.release()
+    }
+  }
+}
+
+function diagnosticDenseArray(value: unknown): unknown[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 4) return null
+  const keys = Reflect.ownKeys(value)
+  return keys.length === value.length + 1 && keys.every(key => key === "length" || typeof key === "string"
+    && /^(0|[1-9][0-9]*)$/.test(key) && Number(key) < value.length) ? value : null
+}
+
+function safeDiagnosticSame(left: unknown, right: unknown): boolean {
+  try { return canonicalTaskGraphJson(left) === canonicalTaskGraphJson(right) } catch { return false }
+}
+
+function errorCode(value: unknown): unknown {
+  if (!value || typeof value !== "object") return undefined
+  try { return Reflect.get(value, "code") } catch { return undefined }
+}
 
 async function adoptRootLease(fixture: Awaited<ReturnType<typeof createScheduledGatePrepareFixture>>, lease: TurnLease,
   rootStore: ReturnType<typeof createPgRootTaskStore>, execution: ReturnType<typeof createCanonicalExecutionProjection>): Promise<void> {

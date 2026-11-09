@@ -20,10 +20,27 @@ function snapshot(nodes: readonly Record<string, unknown>[]) {
   return parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes })
 }
 
+function scheduledV2AnalyzeNodes(): Record<string, unknown>[] {
+  const scouts = Array.from({ length: 4 }, (_, index) => ({ key: `scout-${index + 1}`, templateId: "scout",
+    goal: "Find candidates", successCriteria: ["Candidate"], dependsOn: [], depth: 1,
+    taskId: `scout-${index + 1}`, verificationDisposition: "legacy_unverified" }))
+  return [...scouts, { key: "analyst", templateId: "analyst", goal: "Analyze candidates", successCriteria: ["Finding"],
+    dependsOn: scouts.map(node => node.key), depth: 2, taskId: "analyst-1", verificationDisposition: "legacy_unverified" }]
+}
+
+function scheduledPrepareNode() {
+  return { key: "prepare", templateId: "prepare", goal: "Prepare exact materials", successCriteria: ["Prepared"],
+    dependsOn: ["analyst"], depth: 3, taskId: "prepare-1", verificationDisposition: "specialized" }
+}
+
+function scheduledGateNode() {
+  return { key: "gate", templateId: "gate", goal: SCHEDULED_GATE_NODE_GOAL, successCriteria: SCHEDULED_GATE_NODE_CRITERIA,
+    dependsOn: ["prepare"], depth: 4, taskId: "gate-1", verificationDisposition: "specialized" }
+}
+
 function auditFixture(input: Readonly<{ node?: Record<string, unknown>; task?: Partial<GraphTaskRow>; result?: unknown }> = {}) {
   const graph = snapshot([
-    { key: "gate", templateId: "gate", goal: SCHEDULED_GATE_NODE_GOAL, successCriteria: SCHEDULED_GATE_NODE_CRITERIA,
-      dependsOn: [], depth: 4, taskId: "gate-1", verificationDisposition: "specialized" },
+    ...scheduledV2AnalyzeNodes(), scheduledPrepareNode(), scheduledGateNode(),
     { key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_AUDIT_TEMPLATE_ID, goal: SCHEDULED_AUDIT_NODE_GOAL,
       successCriteria: SCHEDULED_AUDIT_NODE_CRITERIA, dependsOn: ["gate"], depth: 5, taskId: "audit-1",
       verificationDisposition: "specialized", ...input.node },
@@ -41,10 +58,7 @@ function auditFixture(input: Readonly<{ node?: Record<string, unknown>; task?: P
 
 function gateFixture() {
   const graph = snapshot([
-    { key: "prepare", templateId: "prepare", goal: "Prepare exact materials", successCriteria: ["Prepared"], dependsOn: [],
-      depth: 3, taskId: "prepare-1", verificationDisposition: "specialized" },
-    { key: "gate", templateId: "gate", goal: SCHEDULED_GATE_NODE_GOAL, successCriteria: SCHEDULED_GATE_NODE_CRITERIA,
-      dependsOn: ["prepare"], depth: 4, taskId: "gate-1", verificationDisposition: "specialized" },
+    ...scheduledV2AnalyzeNodes(), scheduledPrepareNode(), scheduledGateNode(),
   ])
   const prepareResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: "prepare-1", attemptCount: 1,
     snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64), jobs: [{ jobId: "job-1", status: "prepared" }], materials: [] }
@@ -58,7 +72,8 @@ function gateFixture() {
     result: { finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
       taskGraphVerificationReport: null, structuredResult: { status: "completed", nextStage: "execute", approvedJobIds: [],
         pendingJobIds: ["job-1"], skippedJobIds: [], counts: { approved: 0, pending: 1, skipped: 0 } } } }
-  return { snapshot: graph, tasks: new Map([[prepare.id, prepare], [task.id, task]]), node: graph.nodes[1]!, task }
+  return { snapshot: graph, tasks: new Map([[prepare.id, prepare], [task.id, task]]),
+    node: graph.nodes.find(value => value.key === "gate")!, task }
 }
 
 function postGateFixture(kind: "execute" | "audit", overrides: Readonly<{ executeNode?: Record<string, unknown>;
@@ -70,14 +85,7 @@ function postGateFixture(kind: "execute" | "audit", overrides: Readonly<{ execut
     goal: SCHEDULED_POST_GATE_AUDIT_GOAL, successCriteria: SCHEDULED_POST_GATE_AUDIT_CRITERIA, dependsOn: ["execute-1"], depth: 6,
     taskId: "audit-1", verificationDisposition: "specialized", ...overrides.auditNode }
   const graph = snapshot([
-    { key: "scout", templateId: "scout", goal: "Find candidates", successCriteria: ["Candidate"], dependsOn: [], depth: 1,
-      taskId: "scout-1", verificationDisposition: "legacy_unverified" },
-    { key: "analyst", templateId: "analyst", goal: "Analyze candidates", successCriteria: ["Finding"], dependsOn: ["scout"], depth: 2,
-      taskId: "analyst-1", verificationDisposition: "legacy_unverified" },
-    { key: "prepare", templateId: "prepare", goal: "Prepare exact materials", successCriteria: ["Prepared"], dependsOn: ["analyst"],
-      depth: 3, taskId: "prepare-1", verificationDisposition: "specialized" },
-    { key: "gate", templateId: "gate", goal: SCHEDULED_GATE_NODE_GOAL, successCriteria: SCHEDULED_GATE_NODE_CRITERIA,
-      dependsOn: ["prepare"], depth: 4, taskId: "gate-1", verificationDisposition: "specialized" },
+    ...scheduledV2AnalyzeNodes(), scheduledPrepareNode(), scheduledGateNode(),
     executeNode, auditNode,
   ])
   const executeTask: GraphTaskRow = { id: "execute-1", status: "completed", role: SCHEDULED_POST_GATE_EXECUTE_ROLE,
@@ -91,6 +99,12 @@ function postGateFixture(kind: "execute" | "audit", overrides: Readonly<{ execut
   const tasks = new Map([[executeTask.id, executeTask], [auditTask.id, auditTask]])
   const node = graph.nodes.find(value => value.key === (kind === "execute" ? executeNode.key : auditNode.key))!
   return { snapshot: graph, tasks, node, task: kind === "execute" ? executeTask : auditTask }
+}
+
+function withPostGateAuditDependencies(fixture: ReturnType<typeof postGateFixture>, dependsOn: string[]) {
+  const nodes = fixture.snapshot.nodes.map(node => node.key === SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID ? { ...node, dependsOn } : node)
+  const auditNode = nodes.find(node => node.key === SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID)!
+  return { ...fixture, snapshot: { ...fixture.snapshot, nodes }, node: fixture.node.key === auditNode.key ? auditNode : fixture.node }
 }
 
 describe("scheduled specialized TaskGraph envelopes", () => {
@@ -150,12 +164,12 @@ describe("scheduled specialized TaskGraph envelopes", () => {
       postGateFixture("execute", { executeTask: { expectedOutputSchema: SCHEDULED_GATE_OUTPUT_SCHEMA } }),
       postGateFixture("execute", { executeTask: { result: { finalItemId: null, finalText: "", status: "completed", stepCount: 0,
         toolCallCount: 0, taskGraphVerificationReport: null, structuredResult: { queued: ["job-2"], failed: [] } } } }),
-      postGateFixture("execute", { auditNode: { dependsOn: ["execute-1", "scout"] } }),
+      withPostGateAuditDependencies(postGateFixture("execute"), ["execute-1", "scout-1"]),
       postGateFixture("audit", { auditTask: { role: "reviewer" } }),
       postGateFixture("audit", { auditTask: { taskType: SCHEDULED_AUDIT_TASK_TYPE } }),
       postGateFixture("audit", { auditTask: { status: "failed" } }),
       postGateFixture("audit", { executeTask: { status: "failed" } }),
-      postGateFixture("audit", { auditNode: { dependsOn: ["execute-1", "scout"] } }),
+      withPostGateAuditDependencies(postGateFixture("audit"), ["execute-1", "scout-1"]),
     ]
     for (const fixture of invalid) expect(isScheduledTaskGraphSpecializedEnvelope(fixture)).toBeNull()
   })

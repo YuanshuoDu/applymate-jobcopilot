@@ -31,12 +31,11 @@ describe("TaskGraph first-repair capacity", () => {
     })
   })
 
-  it("reads scheduled persisted graphs above eight without granting more generic proposal capacity", () => {
+  it("does not expose generic capacity for persisted graphs above the eight-node limit", () => {
+    expect(TASK_GRAPH_LIMITS.maxNodes).toBe(8)
+    expect(TASK_GRAPH_LIMITS.maxPersistedNodes).toBe(11)
     for (const nodeCount of [9, TASK_GRAPH_LIMITS.maxPersistedNodes]) {
-      expect(taskGraphNodeCapacity({ nodeCount, hasTypedVerification: true, repairRecorded: false })).toEqual({
-        nodeCount, maxNodes: TASK_GRAPH_LIMITS.maxNodes, remaining: 0, ordinaryRemaining: 0,
-        reserveActive: false, repairRecorded: false,
-      })
+      expect(taskGraphNodeCapacity({ nodeCount, hasTypedVerification: true, repairRecorded: false })).toBeUndefined()
     }
   })
 

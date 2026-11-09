@@ -172,12 +172,20 @@ describe("coordination executors", () => {
 
     const preGate = makeRuntime()
     const readScheduledPostGatePlanningContext = vi.fn(async () => ({ status: "not_applicable" } as const))
+    const preGateReceipt: TaskGraphNativeCommandReceipt = {
+      status: "accepted", replay: false, operationId: "pre-gate-spawn-operation", requestFingerprint: "f".repeat(64),
+      graphRevision: 1, nodeKey: "scout-1", dispatchDisposition: "pending",
+      child: { taskId: "pre-gate-child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/pre-gate-child",
+        depth: 1, role: "scout", taskType: "research", status: "queued" },
+    }
+    const appendNativeCoordination = vi.fn(async (_input: TaskGraphNativeCommandInput) => preGateReceipt)
     const options: CoordinationRuntimeOptions = { ...preGate.options, nativeCoordination: {
-      enabled: true, commandPort: { readScheduledPostGatePlanningContext } as unknown as TaskGraphCommandPort,
+      enabled: true, commandPort: { readScheduledPostGatePlanningContext, appendNativeCoordination } as unknown as TaskGraphCommandPort,
       turnLeaseOwner: "worker-1", turnLeaseVersion: 3, parentLeaseOwner: "worker-1", parentAttemptCount: () => 1,
     } }
     await executeSpawn(rootContext, { idempotencyKey: "pre-gate-spawn", role: "scout", taskType: "research", goal: "Spawn" }, options)
-    expect(preGate.manager.spawn).toHaveBeenCalledOnce()
+    expect(appendNativeCoordination).toHaveBeenCalledOnce()
+    expect(preGate.manager.spawn).not.toHaveBeenCalled()
   })
 
   it("requires a coverage-checked plan before either root spawn alias reaches legacy or native persistence", async () => {
@@ -728,15 +736,13 @@ describe("coordination executors", () => {
     const runtime = makeRuntime()
     const lookup = vi.spyOn(runtime.store, "getTask")
 
-    let thrown: unknown
-    try { executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" }), {
+    await expect(executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" }), {
       taskId: "missing", idempotencyKey: "followup-without-plan", goal: "Continue",
     }, {
       ...runtime.options,
       verificationRequirements: { status: "valid", requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 2 }] },
-    }) } catch (error: unknown) { thrown = error }
+    })).rejects.toMatchObject({ code: "coordination_objective_requirements_require_plan" })
 
-    expect(thrown).toMatchObject({ code: "coordination_objective_requirements_require_plan" })
     expect(lookup).not.toHaveBeenCalled()
     expect(runtime.manager.spawn).not.toHaveBeenCalled()
   })

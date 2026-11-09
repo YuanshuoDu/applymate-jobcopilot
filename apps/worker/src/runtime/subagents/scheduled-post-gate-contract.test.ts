@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { SCHEDULED_GATE_COMPLETION_PROOF_SCHEMA } from "./scheduled-gate-contract.js"
 import {
   parseScheduledPostGateExecuteTaskEnvelope, parseScheduledPostGateHandoff, scheduledPostGateDigest,
   scheduledPostGateHandoffKey, scheduledPostGateScopeMatchesOwner, SCHEDULED_POST_GATE_HANDOFF_SCHEMA,
@@ -8,13 +9,18 @@ import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
   turnLeaseOwnerId: "lease-1", turnLeaseVersion: 3, executionId: "execution-1", executionAttemptCount: 1 }
 const refs = ["package-a", "package-b"]
-const proof = { gate: "completed" }
+const snapshotDigest = digest("snapshot")
+const continuationKey = "continuation-1"
+const proof = { schemaVersion: SCHEDULED_GATE_COMPLETION_PROOF_SCHEMA, graphRevision: 7,
+  prepareProof: { receipt: { owner, snapshotDigest, continuationKey, checkpointDigest: digest("checkpoint"),
+    evidenceDigest: digest("evidence"), analyzeGraphRevision: 5 } },
+  gate: { taskId: "gate-task", attemptCount: 1, resultDigest: digest("gate-result"), completedEventRevision: 7 } }
 
 function handoff(overrides: Record<string, unknown> = {}) {
   return {
-    schemaVersion: SCHEDULED_POST_GATE_HANDOFF_SCHEMA, owner, snapshotDigest: digest("snapshot"), continuationKey: "continuation-1",
+    schemaVersion: SCHEDULED_POST_GATE_HANDOFF_SCHEMA, owner, snapshotDigest, continuationKey,
     gateTaskId: "gate-task", gateAttemptCount: 1, gateCompletedEventRevision: 7, gateProofDigest: scheduledPostGateDigest(proof),
-    gateProof: proof, gateResultDigest: digest("gate-result"), packageRefs: refs, packageDigest: scheduledPostGateDigest(refs),
+    gateProof: proof, gateResultDigest: proof.gate.resultDigest, packageRefs: refs, packageDigest: scheduledPostGateDigest(refs),
     proposalDigest: digest("proposal"), gateGraphRevision: 7, graphRevision: 8,
     executeNodes: [{ key: "execute-a", taskId: "execute-task-a", packageRefs: [refs[0]] },
       { key: "execute-b", taskId: "execute-task-b", packageRefs: [refs[1]] }], auditTaskId: "audit-task", ...overrides,
@@ -29,6 +35,7 @@ function executeEnvelope(queued: unknown, failed: unknown) {
 describe("scheduled post-Gate contract parsing", () => {
   it("accepts a frozen handoff whose Execute partitions exactly cover the Gate refs", () => {
     const parsed = parseScheduledPostGateHandoff(handoff())
+    expect(parsed).not.toBeNull()
     expect(parsed?.packageRefs).toEqual(refs)
     expect(parsed?.executeNodes.map(node => node.packageRefs)).toEqual([[refs[0]], [refs[1]]])
     expect(Object.isFrozen(parsed)).toBe(true)

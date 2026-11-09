@@ -129,7 +129,17 @@ describe("scheduled post-Gate PG plan command", () => {
 
     await expect(readScheduledPostGatePlanningContext(db as never, { scope } as never))
       .resolves.toEqual({ status: "not_applicable" })
-    expect(mocks.receipt).toHaveBeenCalledOnce()
+    expect(mocks.receipt).not.toHaveBeenCalled()
+    expect(mocks.readGate).not.toHaveBeenCalled()
+  })
+
+  it("treats an unknown user-source TaskGraph as not applicable before scheduled Gate proof parsing", async () => {
+    const db = client()
+    mocks.load.mockResolvedValue({ ...loaded(), discoveryTurnEligibility: "unknown" })
+
+    await expect(readScheduledPostGatePlanningContext(db as never, { scope } as never))
+      .resolves.toEqual({ status: "not_applicable" })
+    expect(mocks.receipt).not.toHaveBeenCalled()
     expect(mocks.readGate).not.toHaveBeenCalled()
   })
 

@@ -480,8 +480,8 @@ describe("parseTaskGraphSnapshot", () => {
     const oversizedCriteria = Array.from({ length: 9 }, () => "criterion")
     const oversizedDependencies = Array.from({ length: 9 }, (_, index) => `node-${index}`)
 
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes(oversizedNodes))).toThrow("task_graph_snapshot_capacity_invalid")
     for (const snapshot of [
-      snapshotWithNodes(oversizedNodes),
       snapshotWithNodes([{ ...base, key: "k".repeat(129) }]),
       snapshotWithNodes([{ ...base, templateId: "t".repeat(129) }]),
       snapshotWithNodes([{ ...base, taskId: "t".repeat(129) }]),

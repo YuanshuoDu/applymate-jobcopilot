@@ -1,12 +1,29 @@
 import { describe, expect, it, vi } from "vitest"
+import { SCHEDULED_GATE_COMPLETION_PROOF_SCHEMA, parseScheduledPostGateHandoff, scheduledPostGateDigest,
+  SCHEDULED_POST_GATE_HANDOFF_SCHEMA } from "./scheduled-post-gate-contract.js"
 import { resumeScheduledPostGate } from "./scheduled-post-gate-handoff.js"
 
 const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
   parentAttemptCount: 2, parentLeaseOwner: "root-lease-owner", turnLeaseOwner: "lease-owner", turnLeaseVersion: 4 }
-const handoff = { owner: { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+const owner = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
   rootAttemptCount: 2, turnLeaseOwnerId: scope.turnLeaseOwner, turnLeaseVersion: scope.turnLeaseVersion,
-  executionId: "execution-1", executionAttemptCount: 1 }, graphRevision: 9,
-  executeNodes: [{ key: "execute-1", taskId: "execute-task", packageRefs: ["job-1"] }], auditTaskId: "audit-task" }
+  executionId: "execution-1", executionAttemptCount: 1 }
+const snapshotDigest = `sha256:${"a".repeat(64)}`
+const continuationKey = `scheduled-taskgraph:sha256:${"b".repeat(64)}`
+const gateResultDigest = `sha256:${"c".repeat(64)}`
+const gateProof = { schemaVersion: SCHEDULED_GATE_COMPLETION_PROOF_SCHEMA, graphRevision: 8,
+  prepareProof: { receipt: { owner, snapshotDigest, continuationKey,
+    checkpointDigest: `sha256:${"d".repeat(64)}`, evidenceDigest: `sha256:${"e".repeat(64)}`, analyzeGraphRevision: 7 } },
+  gate: { taskId: "gate-task", attemptCount: 1, resultDigest: gateResultDigest, completedEventRevision: 8 } }
+const packageRefs = ["job-1"]
+const executeNodes = [{ key: "execute-1", taskId: "execute-task", packageRefs }]
+const parsedHandoff = parseScheduledPostGateHandoff({ schemaVersion: SCHEDULED_POST_GATE_HANDOFF_SCHEMA, owner,
+  snapshotDigest, continuationKey, gateTaskId: "gate-task", gateAttemptCount: 1, gateCompletedEventRevision: 8,
+  gateProofDigest: scheduledPostGateDigest(gateProof), gateProof, gateResultDigest, packageRefs,
+  packageDigest: scheduledPostGateDigest(packageRefs), proposalDigest: scheduledPostGateDigest({ expectedRevision: 8, nodes: [] }),
+  gateGraphRevision: 8, graphRevision: 9, executeNodes, auditTaskId: "audit-task" })
+if (!parsedHandoff) throw new Error("scheduled post-Gate handoff fixture is invalid")
+const handoff = parsedHandoff
 
 describe("resumeScheduledPostGate", () => {
   it("requests a Root plan when the verified Gate has no durable handoff yet", async () => {
