@@ -42,31 +42,54 @@ async function initializeFixtureSse() {
   } finally { client.release() }
 }
 
-async function inspectTurn(sessionId, turnId, expectedFinalText) {
+async function inspectTurn(sessionId, turnId, expectedFinalText, expectedQuestionAnswer, includeQuestionDetails = false) {
   const database = await pool.query('SELECT current_database() AS name')
   if (database.rows[0]?.name !== 'application_flow_fixture') throw new Error('Unexpected database')
   const result = await pool.query(`SELECT turn."id", turn."status", turn."revision", turn."finalResponse", turn."error",
     session."userId" AS "sessionOwner", turn."userId" AS "turnOwner", candidate."email",
-    (SELECT COUNT(*)::int FROM "agent_events" AS event WHERE event."sessionId" = session."id" AND event."turnId" = turn."id" AND event."type" = 'turn.completed') AS "completedEvents",
-    (SELECT COUNT(*)::int FROM "agent_events" AS event WHERE event."sessionId" = session."id" AND event."turnId" = turn."id" AND event."type" = 'question.answered') AS "answeredEvents"
+    (SELECT LEAST(COUNT(*), 9)::int FROM "agent_events" AS event WHERE event."sessionId" = session."id" AND event."turnId" = turn."id" AND event."type" = 'turn.completed') AS "completedEvents",
+    (SELECT COUNT(*) > 9 FROM "agent_events" AS event WHERE event."sessionId" = session."id" AND event."turnId" = turn."id" AND event."type" = 'turn.completed') AS "completedEventsCapped",
+    (SELECT LEAST(COUNT(*), 9)::int FROM "agent_events" AS event WHERE event."sessionId" = session."id" AND event."turnId" = turn."id" AND event."type" = 'question.answered') AS "answeredEvents",
+    (SELECT COUNT(*) > 9 FROM "agent_events" AS event WHERE event."sessionId" = session."id" AND event."turnId" = turn."id" AND event."type" = 'question.answered') AS "answeredEventsCapped"
     FROM "agent_turns" AS turn JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
     JOIN "User" AS candidate ON candidate."id" = session."userId"
     WHERE session."id" = $1 AND turn."id" = $2`, [sessionId, turnId])
   const row = result.rows[0]
   const sessionTurnBindingMatches = result.rowCount === 1 && row.email === 'candidate-a@example.invalid' && row.turnOwner === row.sessionOwner
-  const items = await pool.query(`SELECT "id", "status", "content" FROM "agent_items"
-    WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'question'`, [sessionId, turnId])
-  const events = await pool.query(`SELECT "type" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "sequence"`, [sessionId, turnId])
+  const items = await pool.query(`SELECT "id", "status", "content", COALESCE("content"->>'answer' = $3, false) AS "answerMatches",
+    LEAST(COUNT(*) OVER(), 9)::int AS "totalCount", (COUNT(*) OVER() > 9) AS "totalCountCapped"
+    FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'question'
+    ORDER BY "createdAt", "id" LIMIT 9`, [sessionId, turnId, expectedQuestionAnswer])
+  const finalItems = await pool.query(`SELECT "type", "status", "phase",
+    COALESCE("content"->>'text' = $3, false) AS "textMatches", LEAST(COUNT(*) OVER(), 9)::int AS "totalCount",
+    (COUNT(*) OVER() > 9) AS "totalCountCapped"
+    FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
+      AND "type" = 'agent_message' AND "phase" = 'final_answer' ORDER BY "createdAt", "id" LIMIT 9`,
+  [sessionId, turnId, expectedFinalText])
+  const events = await pool.query(`SELECT "type", LEAST(COUNT(*) OVER(), 9)::int AS "totalCount", (COUNT(*) OVER() > 9) AS "totalCountCapped"
+    FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "sequence" LIMIT 9`, [sessionId, turnId])
+  const terminalEvents = await pool.query(`SELECT
+    (event."payload"->>'finalItemId' IS NOT NULL) AS "finalItemPresent",
+    EXISTS (SELECT 1 FROM "agent_items" AS final WHERE final."sessionId" = event."sessionId" AND final."turnId" = event."turnId"
+      AND final."id" = (event."payload"->>'finalItemId') AND final."type" = 'agent_message' AND final."phase" = 'final_answer') AS "finalItemMatchesPersisted",
+    COALESCE(event."itemId" = (event."payload"->>'finalItemId'), false) AS "eventItemBound",
+    LEAST(COUNT(*) OVER(), 9)::int AS "totalCount", (COUNT(*) OVER() > 9) AS "totalCountCapped"
+    FROM "agent_events" AS event WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'turn.completed'
+    ORDER BY "sequence" LIMIT 9`, [sessionId, turnId])
+  const steps = await pool.query(`SELECT "status", LEAST(COUNT(*) OVER(), 9)::int AS "totalCount", (COUNT(*) OVER() > 9) AS "totalCountCapped"
+    FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "ordinal", "attempt" LIMIT 9`, [sessionId, turnId])
+  const tasks = await pool.query(`SELECT "status", LEAST(COUNT(*) OVER(), 9)::int AS "totalCount", (COUNT(*) OVER() > 9) AS "totalCountCapped"
+    FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "createdAt" LIMIT 9`, [sessionId, turnId])
   const finalAnswer = await pool.query(`SELECT
     (SELECT COUNT(*) = 1 FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
       AND "type" = 'agent_message' AND "phase" = 'final_answer') AS "exactlyOneFinalAssistantItem",
     EXISTS (SELECT 1 FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
-      AND "type" = 'agent_message' AND "phase" = 'final_answer' AND "status" = 'completed'
-      AND "content"->>'text' = $3) AS "finalAssistantItemTextMatchesExpected",
-    EXISTS (SELECT 1 FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
       AND "type" = 'agent_message' AND "phase" = 'final_answer' AND "status" = 'completed') AS "finalAssistantItemCompleted",
     EXISTS (SELECT 1 FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
       AND "type" = 'agent_message' AND "phase" = 'final_answer' AND COALESCE("content"->>'text', '') <> '') AS "finalAssistantItemHasText",
+    EXISTS (SELECT 1 FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
+      AND "type" = 'agent_message' AND "phase" = 'final_answer' AND "status" = 'completed'
+      AND "content"->>'text' = $3) AS "finalAssistantItemTextMatchesExpected",
     EXISTS (SELECT 1 FROM "agent_events" AS event JOIN "agent_items" AS item
       ON item."id" = event."itemId" AND item."sessionId" = event."sessionId" AND item."turnId" = event."turnId"
       WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'item.completed'
@@ -76,16 +99,52 @@ async function inspectTurn(sessionId, turnId, expectedFinalText) {
       ON item."id" = event."itemId" AND item."sessionId" = event."sessionId" AND item."turnId" = event."turnId"
       WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'turn.completed'
         AND event."payload"->>'finalItemId' = event."itemId" AND item."type" = 'agent_message'
-        AND item."phase" = 'final_answer' AND item."status" = 'completed') AS "completionEventTargetsFinalAnswer"`, [sessionId, turnId, expectedFinalText])
-  const steps = await pool.query(`SELECT "status", "errorCode", "finishReason" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "ordinal", "attempt"`, [sessionId, turnId])
-  const tasks = await pool.query(`SELECT "status", "failureReason" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "createdAt"`, [sessionId, turnId])
-  const toolResults = await pool.query(`SELECT COUNT(*)::int AS count,
+        AND item."phase" = 'final_answer' AND item."status" = 'completed') AS "completionEventTargetsFinalAnswer"`,
+  [sessionId, turnId, expectedFinalText])
+  const toolResults = await pool.query(`SELECT LEAST(COUNT(*), 9)::int AS count, (COUNT(*) > 9) AS "countCapped",
     BOOL_OR("content"->'output'->>'question' = '[REDACTED]') AS "questionRedacted"
     FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'tool_result'
       AND "content"->>'toolCallId' = 'fixture-native-question'`, [sessionId, turnId])
-  return { turn: row ?? { status: 'missing', error: null, finalResponse: null, completedEvents: 0, answeredEvents: 0 },
-    sessionTurnBindingMatches, questions: items.rows, eventTypes: events.rows.map(event => event.type), steps: steps.rows, tasks: tasks.rows,
-    finalAnswer: finalAnswer.rows[0], toolResultCount: toolResults.rows[0].count, toolResultQuestionRedacted: toolResults.rows[0].questionRedacted }
+  const withoutCount = rows => rows.map(({ totalCount, totalCountCapped, ...value }) => value)
+  const turn = {
+    status: row?.status ?? 'missing',
+    errorPresent: row?.error !== null && row?.error !== undefined,
+    completedEvents: row?.completedEvents ?? 0,
+    completedEventsCapped: row?.completedEventsCapped ?? false,
+    answeredEvents: row?.answeredEvents ?? 0,
+    answeredEventsCapped: row?.answeredEventsCapped ?? false,
+    finalResponsePresent: row?.finalResponse !== null && row?.finalResponse !== undefined,
+    finalResponseMatches: typeof row?.finalResponse === 'string' && row.finalResponse.includes(expectedFinalText),
+  }
+  const questions = includeQuestionDetails
+    ? items.rows.map(({ id, status, content }) => ({ id, status, content }))
+    : items.rows.map(({ status }) => ({ status }))
+  return {
+    turn, sessionTurnBindingMatches,
+    questionCount: items.rows[0]?.totalCount ?? 0,
+    questionCountCapped: items.rows[0]?.totalCountCapped ?? false,
+    questions,
+    questionAnswerMatches: items.rows.length === 1 && items.rows[0].answerMatches === true,
+    finalAnswer: finalAnswer.rows[0],
+    finalItemCount: finalItems.rows[0]?.totalCount ?? 0,
+    finalItemCountCapped: finalItems.rows[0]?.totalCountCapped ?? false,
+    finalItems: withoutCount(finalItems.rows),
+    eventCount: events.rows[0]?.totalCount ?? 0,
+    eventCountCapped: events.rows[0]?.totalCountCapped ?? false,
+    eventTypes: events.rows.map(event => event.type),
+    terminalEventCount: terminalEvents.rows[0]?.totalCount ?? 0,
+    terminalEventCountCapped: terminalEvents.rows[0]?.totalCountCapped ?? false,
+    terminalEvents: withoutCount(terminalEvents.rows),
+    stepCount: steps.rows[0]?.totalCount ?? 0,
+    stepCountCapped: steps.rows[0]?.totalCountCapped ?? false,
+    steps: withoutCount(steps.rows),
+    taskCount: tasks.rows[0]?.totalCount ?? 0,
+    taskCountCapped: tasks.rows[0]?.totalCountCapped ?? false,
+    tasks: withoutCount(tasks.rows),
+    toolResultCount: toolResults.rows[0].count,
+    toolResultCountCapped: toolResults.rows[0].countCapped,
+    toolResultQuestionRedacted: toolResults.rows[0].questionRedacted,
+  }
 }
 
 // The application/task linkage is synthetic; the question and Turn must

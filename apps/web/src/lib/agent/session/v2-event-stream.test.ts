@@ -101,6 +101,37 @@ describe("V2 agent event stream", () => {
     await reader.cancel()
   })
 
+  it("keeps the final-item binding in a serialized durable turn completion", async () => {
+    const controller = new AbortController()
+    const finalItemId = "+353 86 123 4567"
+    const terminal = {
+      id: "terminal-event", sessionId: "session_1", turnId: "turn_1", itemId: finalItemId, taskId: "root-task",
+      sequence: BigInt(1), type: "turn.completed", actor: "orchestrator", correlationId: "terminal-correlation",
+      causationId: null, idempotencyKey: null,
+      payload: { turnId: "turn_1", taskId: "root-task", finalItemId, usage: { inputTokens: 1, outputTokens: 1 } },
+    }
+    const stream = createV2EventStream(db([terminal]) as never, {
+      sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal, redisFactory: () => null, dbPollMs: 1, heartbeatMs: 60_000,
+    })
+    const reader = stream.getReader()
+    try {
+      const first = await reader.read()
+      expect(first.done).toBe(false)
+      const text = new TextDecoder().decode(first.value)
+      const data = text.split("data: ")[1]?.split("\n")[0]
+      expect(data).toBeDefined()
+      const frame = JSON.parse(data!) as { type: string; itemId: string | null; payload: { turnId: string; taskId: string; finalItemId: string } }
+      expect(frame).toMatchObject({
+        type: "turn.completed", itemId: finalItemId,
+        payload: { turnId: "turn_1", taskId: "root-task", finalItemId },
+      })
+      expect(frame.itemId).toBe(frame.payload.finalItemId)
+    } finally {
+      controller.abort()
+      await reader.cancel()
+    }
+  })
+
   it("projects raw call, item, event, cause, and idempotency identities on durable SSE", async () => {
     const rawCallId = "+353851234567"
     const callItemId = `turn:turn_1:item:tool-call:${rawCallId}:call-suffix`

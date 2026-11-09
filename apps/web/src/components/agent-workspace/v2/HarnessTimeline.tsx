@@ -2,7 +2,7 @@
 
 import React from 'react'
 import { useI18n } from '@/lib/i18n'
-import { compareItems } from './timeline-reducer-utils'
+import { compareItems, getFinalAnswerDiagnostics } from './timeline-reducer-utils'
 import { HarnessItem } from './HarnessItem'
 import type { SuggestedActionCommand } from './harness-item-types'
 import type { TimelineItem } from './timeline-reducer'
@@ -15,9 +15,12 @@ export interface HarnessTimelineProps {
 /** Groups the normalized reducer projection into stable Turn sections. */
 export function HarnessTimeline({ items, onSuggestedAction }: HarnessTimelineProps) {
   const { t } = useI18n()
+  const diagnostics = getFinalAnswerDiagnostics()
+  const completedFinalAnswerCount = diagnostics
+    ? Math.min(9, items.filter(item => item.type === 'agent_message' && item.status === 'completed' && item.phase === 'final_answer').length) : 0
   const turns = groupTurns(items)
   return (
-    <div data-agent-harness-timeline="true" style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+    <div data-agent-harness-timeline="true" {...(diagnostics ? { 'data-agent-completed-final-answer-count': completedFinalAnswerCount } : {})} style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
       {turns.map((turn, index) => {
         const finalIds = highlightedFinalItemIds(turn.items)
         return (

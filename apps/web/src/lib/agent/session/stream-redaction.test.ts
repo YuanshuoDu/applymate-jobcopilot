@@ -41,6 +41,23 @@ describe("agent stream redaction", () => {
     expect(redactStreamString("Bearer very-secret-token sk-12345678")).toBe("Bearer [REDACTED] [REDACTED]")
   })
 
+  it("preserves a phone-shaped final item ID only when it matches the terminal stream identity", () => {
+    const phoneShapedItemId = "+353 86 123 4567"
+    const terminalIdentity = { ...identity, itemId: phoneShapedItemId }
+    const payload = { turnId, taskId: rootTaskId, finalItemId: phoneShapedItemId, usage: { inputTokens: 1 } }
+    const preserved = redactStreamEventPayload("turn.completed", payload, terminalIdentity) as Record<string, unknown>
+    expect(preserved.finalItemId).toBe(phoneShapedItemId)
+
+    for (const mismatch of [
+      { finalItemId: "+353 86 999 9999" },
+      { turnId: "different-turn" },
+      { taskId: "different-task" },
+    ]) {
+      const redacted = redactStreamEventPayload("turn.completed", { ...payload, ...mismatch }, terminalIdentity)
+      expect(redacted).not.toHaveProperty("finalItemId")
+    }
+  })
+
   it("projects completed final event content to the same safe DTO as timeline replay", () => {
     const text = "A match. [[source:S1]] Filtered [[source:S2]] Unknown [[source:E-private-key]] malformed [[source:S1]"
     const payload = {

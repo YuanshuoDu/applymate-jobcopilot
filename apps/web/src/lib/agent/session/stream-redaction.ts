@@ -43,6 +43,7 @@ export function redactStreamEventPayload(eventType: string, payload: unknown, id
   const finalContent = projectCompletedFinalContent(eventType, payload, identity)
   if (finalContent) return finalContent
   const redacted = redactStreamValue(payload)
+  if (eventType === 'turn.completed') return projectCompletedTurnFinalItemId(payload, redacted, identity)
   if (eventType !== 'item.started' && eventType !== 'item.delta') return redacted
 
   const snapshot = taskGraphSnapshotFromEvent(eventType, payload, identity)
@@ -65,6 +66,15 @@ export function redactStreamEventPayload(eventType: string, payload: unknown, id
       content: redactTaskGraphSnapshot(snapshot, generatedTaskIds),
     },
   }
+}
+
+function projectCompletedTurnFinalItemId(payload: unknown, redacted: unknown, identity: StreamItemIdentity): unknown {
+  if (!isRecord(redacted)) return redacted
+  const output = { ...redacted }
+  delete output.finalItemId
+  if (identity.itemId && isRecord(payload) && payload.turnId === identity.turnId && payload.taskId === identity.taskId
+    && payload.finalItemId === identity.itemId) output.finalItemId = identity.itemId
+  return output
 }
 
 function projectCompletedFinalContent(eventType: string, payload: unknown, identity: StreamItemIdentity): unknown | null {
