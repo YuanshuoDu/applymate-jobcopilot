@@ -1969,8 +1969,7 @@ describe("owner-agnostic turn execution loop", () => {
         const observation: StepContext["blocks"][number] = { id: TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID,
           layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent", content: progress }
         return { ...context, taskGraphRevision: revision, blocks: [...context.blocks, observation] }
-      } },
-    }
+      } }
     const completionGate = vi.fn(async () => ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "Independent verification still requires proof." }))
     root.options = { ...root.options, contextBuilder, completionGate, budget: { maxSteps: 2 } }
 
