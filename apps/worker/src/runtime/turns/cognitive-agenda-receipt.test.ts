@@ -157,7 +157,7 @@ describe("cognitive agenda receipt", () => {
     const delta = taskGraphObjectiveProgressDelta({ ...snapshot, revision: 6 }, snapshot, true)
     const valid = buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context(7)),
       objectiveProgress: { goalRevision: "a".repeat(64), objectiveProgressSnapshot: snapshot, progressDelta: delta } })
-    if (!valid) throw new Error("valid v2 fixture should be built")
+    if (!valid || valid.schemaVersion !== COGNITIVE_AGENDA_RECEIPT_V2_SCHEMA_VERSION) throw new Error("valid v2 fixture should be built")
 
     expect(buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context(8)),
       objectiveProgress: { goalRevision: "a".repeat(64), objectiveProgressSnapshot: snapshot, progressDelta: delta } })).toBeNull()
