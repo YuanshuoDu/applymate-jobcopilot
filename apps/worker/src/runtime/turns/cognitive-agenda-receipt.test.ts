@@ -7,6 +7,7 @@ import {
   COGNITIVE_AGENDA_EVENT_TYPE,
   COGNITIVE_AGENDA_RECEIPT_SCHEMA_VERSION,
   COGNITIVE_AGENDA_RECEIPT_V2_SCHEMA_VERSION,
+  COGNITIVE_AGENDA_RECEIPT_MAX_BYTES,
   parseCognitiveAgendaReceipt,
   type CognitiveAgendaReceipt,
   type CognitiveAgendaReceiptScope,
@@ -135,6 +136,52 @@ describe("cognitive agenda receipt", () => {
     expect(parseCognitiveAgendaReceipt({ ...v2, progressDelta: { ...progressDelta, currentPlanRevision: 8 } }, scope)).toBeNull()
     expect(parseCognitiveAgendaReceipt({ ...v2, objectiveProgressSnapshot: { ...objectiveProgressSnapshot, advisory: false } }, scope)).toBeNull()
     expect(parseCognitiveAgendaReceipt({ ...v2, privateText: "do not expose" }, scope)).toBeNull()
+  })
+
+  it("preserves the valid agenda when maximum objective progress would exceed the receipt bound", () => {
+    const signal = (prefix: string) => {
+      const ids = Array.from({ length: 4 }, (_, index) => `${prefix}-${"x".repeat(21 - prefix.length)}-${index}`)
+      return { count: ids.length, ids }
+    }
+    const newlyObservedSteering = signal("observed")
+    const agenda: CognitiveActionAgenda = {
+      ...buildCognitiveActionAgenda(context(7)),
+      nextAction: "apply_fresh_steering",
+      blockedBy: { kind: "fresh_steering", ids: newlyObservedSteering.ids },
+      signals: {
+        pendingInputs: signal("pending"),
+        approvals: signal("approval"),
+        activeWaits: signal("wait"),
+        unresolved: signal("unresolved"),
+        completionVerification: { count: 8, ids: [] },
+        steering: { present: true, fresh: true, active: signal("active"), newlyObserved: newlyObservedSteering },
+      },
+    }
+    const current: ObjectiveProgressSnapshot = {
+      schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION,
+      advisory: true,
+      revision: 7,
+      requirements: Array.from({ length: 8 }, (_, index) => ({
+        id: `criterion-${index}-${"x".repeat(52)}`,
+        kind: index % 2 === 0 ? "candidate_count_gte" : "finding_count_gte",
+        minimum: 50,
+        status: "reported_passed",
+      })),
+    }
+    const previous: ObjectiveProgressSnapshot = { ...current, revision: 6,
+      requirements: current.requirements.map(row => ({ ...row, status: "active" })) }
+    const objectiveProgress = { goalRevision: "a".repeat(64), objectiveProgressSnapshot: current,
+      progressDelta: taskGraphObjectiveProgressDelta(previous, current, true) }
+    const value = buildCognitiveAgendaReceipt({ ...scope, inputThroughSequence: 1n, consumedInputIds: [], agenda, objectiveProgress })
+
+    if (!value) throw new Error("oversized v2 receipt should retain its bounded base agenda")
+    expect(value.schemaVersion).toBe(COGNITIVE_AGENDA_RECEIPT_SCHEMA_VERSION)
+    expect(value).toMatchObject({ nextAction: "apply_fresh_steering", blockedBy: { kind: "fresh_steering" }, planRevision: 7,
+      resumeFence: { inputThroughSequence: "1", consumedInputIds: [] } })
+    expect(value).not.toHaveProperty("objectiveProgressSnapshot")
+    expect(value).not.toHaveProperty("progressDelta")
+    expect(Buffer.byteLength(JSON.stringify(value), "utf8")).toBeLessThanOrEqual(COGNITIVE_AGENDA_RECEIPT_MAX_BYTES)
+    expect(parseCognitiveAgendaReceipt(value, scope)).toEqual(value)
   })
 
   it("rejects an available delta when its canonical goal digest is missing", () => {

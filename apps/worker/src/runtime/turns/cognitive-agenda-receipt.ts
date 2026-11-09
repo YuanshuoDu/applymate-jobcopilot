@@ -182,6 +182,11 @@ export function buildCognitiveAgendaReceipt(input: AgendaInput): CognitiveAgenda
       receipt = { schemaVersion: COGNITIVE_AGENDA_RECEIPT_V2_SCHEMA_VERSION, ...common,
         goalRevision: input.objectiveProgress.goalRevision, objectiveProgressSnapshot: snapshot, progressDelta: delta,
         ...(hasFence ? { resumeFence: { inputThroughSequence: input.inputThroughSequence!.toString(), consumedInputIds: [...input.consumedInputIds!] } } : {}) }
+      // Progress is advisory; retain the bounded base agenda if its additive payload overflows.
+      if (!bounded(receipt)) {
+        receipt = { schemaVersion: COGNITIVE_AGENDA_RECEIPT_SCHEMA_VERSION, ...common, goalRevision: input.agenda.goalRevision,
+          ...(hasFence ? { resumeFence: { inputThroughSequence: input.inputThroughSequence!.toString(), consumedInputIds: [...input.consumedInputIds!] } } : {}) }
+      }
     } else {
       receipt = { schemaVersion: COGNITIVE_AGENDA_RECEIPT_SCHEMA_VERSION, ...common, goalRevision: input.agenda.goalRevision,
         ...(hasFence ? { resumeFence: { inputThroughSequence: input.inputThroughSequence!.toString(), consumedInputIds: [...input.consumedInputIds!] } } : {}) }
