@@ -364,13 +364,16 @@ describe("auto-apply authorization", () => {
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
   });
 
-  it("rolls back task and job claims when the transaction cannot lock the approved receipt", async () => {
+  it("rolls back task and job claims when the locked receipt no longer matches the ApplicationTask", async () => {
     mocks.approvalLock.mockResolvedValueOnce([]);
     const { queueAutonomousApplication } = await import("./auto-apply");
 
     await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("receipt changed");
     expect(mocks.txTaskUpdateMany).toHaveBeenCalledTimes(1);
     expect(mocks.jobUpdateMany).toHaveBeenCalledTimes(1);
+    const lockedApprovalQuery = mocks.approvalLock.mock.calls[0]?.[0] as { text?: string; values?: unknown[] } | undefined;
+    expect(lockedApprovalQuery?.text).toContain('"taskId" =');
+    expect(lockedApprovalQuery?.values).toContain(input.applicationTaskId);
     expect(mocks.transactionCommit).not.toHaveBeenCalled();
     expect(mocks.txTaskEventCreate).not.toHaveBeenCalled();
     expect(mocks.outboxCreate).not.toHaveBeenCalled();

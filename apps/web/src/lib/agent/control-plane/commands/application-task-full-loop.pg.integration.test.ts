@@ -661,24 +661,27 @@ async function submitQueueJobs() {
   return applyQueue!.getJobs(["waiting", "active", "delayed", "completed", "failed", "paused", "waiting-children", "prioritized"], 0, -1)
 }
 
-async function waitForWorkerRedelivery(child: Child, jobId: string, timeoutMs = 120_000): Promise<string> {
-  const prefix = `APPLY_JOB_ACTIVE ${jobId} `
+type ApplyJobActiveEvent = { jobId: string; attemptsMade: number; attemptsStarted: number; stalledCounter: number }
+
+function parseApplyJobActiveEvent(line: string): ApplyJobActiveEvent | null {
+  const match = /^APPLY_JOB_ACTIVE ([^ ]+) attemptsMade=(\d+) attemptsStarted=(\d+) stalledCounter=(\d+)$/.exec(line)
+  if (!match) return null
+  return { jobId: match[1]!, attemptsMade: Number(match[2]), attemptsStarted: Number(match[3]), stalledCounter: Number(match[4]) }
+}
+
+async function waitForWorkerRedelivery(child: Child, jobId: string, timeoutMs = 120_000): Promise<ApplyJobActiveEvent> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
-    const redelivery = child.lines.find(line => {
-      if (!line.startsWith(prefix)) return false
-      const attemptsStarted = Number(/(?:^| )attemptsStarted=(\d+)/.exec(line)?.[1])
-      return Number.isFinite(attemptsStarted) && attemptsStarted >= 2
-    })
+    const redelivery = child.lines.map(parseApplyJobActiveEvent).find(event => event !== null && event.jobId === jobId
+      && event.attemptsStarted >= 2 && event.stalledCounter >= 1)
     if (redelivery) return redelivery
     if (exited(child)) throw new Error(`Worker exited before BullMQ redelivered ${jobId}; child=${JSON.stringify(childSummary(child))}`)
     await delay(50)
   }
-  const matchingEvents = child.lines.filter(line => line.startsWith(prefix))
-  const observedAttempts = matchingEvents.map(line => Number(/(?:^| )attemptsStarted=(\d+)/.exec(line)?.[1]))
-    .filter(Number.isFinite)
-  const maxAttemptsStarted = observedAttempts.length ? Math.max(...observedAttempts) : null
-  throw new Error(`BullMQ did not redeliver ${jobId}; matchingEventCount=${matchingEvents.length}; maxAttemptsStarted=${maxAttemptsStarted}`)
+  const matchingEvents = child.lines.map(parseApplyJobActiveEvent).filter((event): event is ApplyJobActiveEvent => event?.jobId === jobId)
+  const maxAttemptsStarted = matchingEvents.length ? Math.max(...matchingEvents.map(event => event.attemptsStarted)) : null
+  const maxStalledCounter = matchingEvents.length ? Math.max(...matchingEvents.map(event => event.stalledCounter)) : null
+  throw new Error(`BullMQ did not redeliver ${jobId}; matchingEventCount=${matchingEvents.length}; maxAttemptsStarted=${maxAttemptsStarted}; maxStalledCounter=${maxStalledCounter}`)
 }
 
 function jsonString(value: unknown, key: string): string | undefined {
@@ -1228,22 +1231,49 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(await waitExit(worker!, 5_000)).toBe(true)
     worker = spawnFixture("worker")
     await waitLine(worker, "WORKER_READY", 90_000)
-    const redeliveryEvent = await waitForWorkerRedelivery(worker, String(intent.workerTaskId))
+    const workerTaskId = String(intent.workerTaskId)
+    const redeliveryEvent = await waitForWorkerRedelivery(worker, workerTaskId)
+    expect(redeliveryEvent).toMatchObject({ jobId: workerTaskId })
+    expect(redeliveryEvent.attemptsStarted).toBeGreaterThanOrEqual(2)
+    expect(redeliveryEvent.stalledCounter).toBeGreaterThanOrEqual(1)
     const fixtureStats = await requestFixtureStats()
     expect(fixtureStats.submitCount).toBe(1)
     expect(fixtureStats.blocked).toEqual([])
-    const restartedTask = await testDb.applicationTask.findUniqueOrThrow({ where: { id: gateTaskId } })
+    const restartedTask = await testDb.applicationTask.findUniqueOrThrow({ where: { id: gateTaskId }, select: {
+      id: true, userId: true, jobId: true, sessionId: true, fillTurnId: true, workerTaskId: true, status: true, checkpoint: true,
+    } })
+    expect(restartedTask).toMatchObject({ id: gateTaskId, userId: ids.user, jobId: ids.job,
+      sessionId: ids.session, fillTurnId: successorTurnId, workerTaskId })
     expect(["submission_request_started", "submission_uncertain"]).toContain(restartedTask.checkpoint)
-    const durableOutbox = await testDb.agentOutbox.findMany({ where: { topic: "application.submit.dispatch", aggregateId: ids.session } })
+    const durableOutbox = await testDb.agentOutbox.findMany({ where: { topic: "application.submit.dispatch", aggregateId: ids.session },
+      select: { idempotencyKey: true, aggregateId: true, topic: true, payload: true, publishedAt: true } })
     expect(durableOutbox).toHaveLength(1)
-    expect(durableOutbox[0]).toMatchObject({ publishedAt: expect.any(Date) })
-    const recoveredJob = await applyQueue!.getJob(String(intent.workerTaskId))
-    expect(recoveredJob).toBeDefined()
-    expect(await recoveredJob!.getState()).toMatch(/^(failed|completed|waiting|active|delayed)$/)
-    expect(recoveredJob!.attemptsStarted).toBeGreaterThanOrEqual(2)
-    expect(recoveredJob!.stalledCounter).toBeGreaterThanOrEqual(1)
-    expect(redeliveryEvent).toContain(`attemptsStarted=${recoveredJob!.attemptsStarted}`)
-    expect(redeliveryEvent).toContain(`stalledCounter=${recoveredJob!.stalledCounter}`)
+    expect(durableOutbox[0]).toMatchObject({
+      idempotencyKey: outbox[0]!.idempotencyKey, aggregateId: ids.session, topic: "application.submit.dispatch",
+      payload: intent, publishedAt: expect.any(Date),
+    })
+    const terminalProofs = await testDb.applicationTaskEvent.findMany({ where: {
+      taskId: gateTaskId, type: "submission_terminal_observed", actor: "worker",
+    }, select: { id: true, taskId: true, type: true, actor: true, data: true } })
+    expect(terminalProofs).toHaveLength(1)
+    const terminalProof = terminalProofs[0]!
+    expect(terminalProof).toMatchObject({ taskId: gateTaskId, type: "submission_terminal_observed", actor: "worker" })
+    expect(terminalProof.data).toMatchObject({
+      applicationTaskId: gateTaskId, userId: ids.user, jobId: ids.job, sessionId: ids.session,
+      fillTurnId: successorTurnId, workerTaskId, approvalId: submitApproval.id, receiptId: submitApproval.id,
+      constraintHash: intent.constraintHash,
+      terminalState: expect.stringMatching(/^(completed|failed)$/),
+      attemptsMade: expect.any(Number), attempts: expect.any(Number),
+    })
+    const terminalData = jsonRecord(terminalProof.data)
+    const terminalAttempts = terminalData?.attempts as number
+    const terminalAttemptsMade = terminalData?.attemptsMade as number
+    expect(terminalAttempts).toBeGreaterThanOrEqual(1)
+    expect(terminalAttemptsMade).toBeGreaterThanOrEqual(0)
+    if (terminalData?.terminalState === "failed") {
+      expect(terminalAttemptsMade).toBeGreaterThanOrEqual(terminalAttempts)
+    }
+    expect(redeliveryEvent.jobId).toBe(workerTaskId)
     expect((await requestFixtureStats()).submitCount).toBe(1)
   }, 300_000)
 })
