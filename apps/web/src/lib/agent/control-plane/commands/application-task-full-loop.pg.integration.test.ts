@@ -1223,7 +1223,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
 
     await waitLine(worker!, `APPLY_JOB_ACTIVE ${String(intent.workerTaskId)}`)
     const submitStarted = await waitForTask(task => task.checkpoint === "submission_request_started" || task.checkpoint === "submission_uncertain")
-    expect(submitStarted.status).toBe("waiting_for_authorization")
+    expect(submitStarted.status).toBe(submitStarted.checkpoint === "submission_request_started" ? "filling" : "waiting_for_user")
     worker!.kill("SIGKILL")
     expect(await waitExit(worker!, 5_000)).toBe(true)
     worker = spawnFixture("worker")
