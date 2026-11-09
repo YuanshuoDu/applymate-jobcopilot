@@ -34,6 +34,7 @@ describe('HarnessTimeline', () => {
       matchesTarget: vi.fn(() => false), recordTurnCompleted: vi.fn(), recordFinalItemTarget: vi.fn(), recordFinalItemHydration: vi.fn(),
     }
     vi.stubGlobal('window', { __applymateFinalDiagnostics: diagnostics })
+    vi.stubGlobal('localStorage', { getItem: () => null, setItem: () => undefined })
     let html = ''
     try {
       html = renderToStaticMarkup(<I18nProvider><HarnessTimeline items={[
