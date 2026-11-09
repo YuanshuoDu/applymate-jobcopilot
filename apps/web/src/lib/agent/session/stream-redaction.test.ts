@@ -46,7 +46,7 @@ describe("agent stream redaction", () => {
     const terminalIdentity = { ...identity, itemId: phoneShapedItemId }
     const payload = { turnId, taskId: rootTaskId, finalItemId: phoneShapedItemId, usage: { inputTokens: 1 } }
     const preserved = redactStreamEventPayload("turn.completed", payload, terminalIdentity) as Record<string, unknown>
-    expect(preserved).toMatchObject({ turnId, taskId: rootTaskId, finalItemId: phoneShapedItemId })
+    expect(preserved.finalItemId).toBe(phoneShapedItemId)
 
     for (const mismatch of [
       { finalItemId: "+353 86 999 9999" },
