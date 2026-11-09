@@ -146,6 +146,7 @@ type FixtureStats = {
 }
 type ApplicationFillExecutorTrace = {
   attemptCount: number | null
+  executorInvocationOrdinal: number
   elapsedMs: number
   returned: boolean
   threw: boolean
@@ -273,17 +274,19 @@ function applicationFillExecutorTraces(child: Child | undefined): Array<Applicat
         continue
       }
       const attemptCount = row.attemptCount
+      const executorInvocationOrdinal = row.executorInvocationOrdinal
       const elapsedMs = row.elapsedMs
       const booleans = [row.returned, row.threw, row.statusCompleted, row.statusWaiting, row.statusWaitingForUser,
         row.statusFailed, row.failureReasonLeaseLost, row.leaseSignalAbortedAtStart, row.leaseSignalAbortedAtEnd]
       if (!(attemptCount === null || typeof attemptCount === "number" && Number.isSafeInteger(attemptCount) && attemptCount >= 1)
+        || typeof executorInvocationOrdinal !== "number" || !Number.isSafeInteger(executorInvocationOrdinal) || executorInvocationOrdinal < 1
         || typeof elapsedMs !== "number" || !Number.isSafeInteger(elapsedMs) || elapsedMs < 0
         || booleans.some(value => typeof value !== "boolean")) {
         traces.push({ traceInvalid: true })
         continue
       }
       traces.push({
-        attemptCount, elapsedMs,
+        attemptCount, executorInvocationOrdinal, elapsedMs,
         returned: row.returned === true,
         threw: row.threw === true,
         statusCompleted: row.statusCompleted === true,

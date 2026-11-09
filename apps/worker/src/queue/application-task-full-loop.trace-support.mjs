@@ -1,3 +1,5 @@
+let nextExecutorInvocationOrdinal = 0
+
 export function traceApplicationFillExecutor(executor) {
   if (!executor) return undefined
   return async input => {
@@ -5,6 +7,8 @@ export function traceApplicationFillExecutor(executor) {
     if (lease?.role !== "application_filler" || lease.taskType !== "application_fill_for_review") return executor(input)
 
     const attemptCount = Number.isSafeInteger(lease?.attemptCount) ? lease.attemptCount : null
+    nextExecutorInvocationOrdinal += 1
+    const executorInvocationOrdinal = nextExecutorInvocationOrdinal
     const leaseSignalAbortedAtStart = Boolean(lease?.signal?.aborted)
     const startedAt = Date.now()
     let returned = false
@@ -22,6 +26,7 @@ export function traceApplicationFillExecutor(executor) {
         const status = result?.status
         process.stdout.write(`APPLICATION_FILL_EXEC_TRACE ${JSON.stringify({
           attemptCount,
+          executorInvocationOrdinal,
           elapsedMs: Math.max(0, Date.now() - startedAt),
           returned,
           threw,
