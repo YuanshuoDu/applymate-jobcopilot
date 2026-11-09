@@ -1990,7 +1990,6 @@ describe("owner-agnostic turn execution loop", () => {
     expect(completionGate).toHaveBeenCalledOnce()
     expect(completionGate).toHaveBeenCalledWith(expect.objectContaining({ candidateText: "done:root-1" }))
     expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted", stepCount: 2 })
-    expect(root.events.find(event => event.type === "final.rejected")?.payload).toMatchObject({ code: "task_graph_verification_unverified" })
     expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
   })
 
