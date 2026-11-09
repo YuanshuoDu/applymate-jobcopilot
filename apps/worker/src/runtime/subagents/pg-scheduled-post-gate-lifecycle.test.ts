@@ -55,14 +55,93 @@ describe("prepareScheduledPostGateFinish", () => {
       taskGraphVerificationReport: null, structuredResult: kind === "execute" ? { queued: [], failed: [] } : {
         processed: 0, applied: 0, queued: 0, pending: 0, skipped: 0, failed: 0, durationMs: 0,
       } }
+    const sanitizedResult = Object.fromEntries(Object.entries(resultEnvelope)
+      .filter(([key]) => key !== "taskGraphVerificationReport"))
     const finalize = vi.fn((value: unknown) => value)
 
-    await expect(prepareScheduledPostGateFinish({} as never, graph as never, node as never, {
+    const completed = await prepareScheduledPostGateFinish({} as never, graph as never, node as never, {
       taskId, sessionId: "session-1", attemptCount: 2, taskRole: role, taskType, status: "completed",
-    }, resultEnvelope, finalize)).resolves.toEqual({ graph, status: "completed", result: resultEnvelope, reconcileDependents: true })
+    }, sanitizedResult, finalize)
+    expect(completed).toEqual({ graph, status: "completed", result: resultEnvelope, reconcileDependents: true })
     expect(loadGraph).toHaveBeenCalledWith(expect.anything(), graph.scope, true)
     expect(specializedEnvelope).toHaveBeenCalledOnce()
+    const validationInput = specializedEnvelope.mock.calls[0]?.[0] as { tasks: ReadonlyMap<string, { result: unknown }> }
+    expect(validationInput.tasks.get(taskId)?.result).toEqual(resultEnvelope)
+    expect(validationInput.tasks.get(taskId)?.result).toBe(finalize.mock.calls[0]?.[0])
     expect(finalize).toHaveBeenCalledWith(resultEnvelope, "completed")
+  })
+
+  it.each(["extra field", "missing field", "reserved report value"] as const)("does not canonicalize a sanitized envelope with %s", async shape => {
+    const taskId = "execute-task", node = { key: SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID,
+      templateId: SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID, taskId, verificationDisposition: "specialized" }
+    const graph = { scope: { rootTaskId: "root-1" }, event: { type: "task.completed" } }
+    const task = { id: taskId, status: "running", attemptCount: 1 }
+    loadGraph.mockResolvedValue({ snapshot: { nodes: [node] }, tasks: new Map([[taskId, task]]) })
+    specializedEnvelope.mockReturnValue(null)
+    prepareTransition.mockResolvedValue({ event: { type: "task.failed" } })
+    const sanitized = { finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
+      structuredResult: { queued: [], failed: [] } } as Record<string, unknown>
+    if (shape === "extra field") sanitized.unexpected = true
+    else if (shape === "missing field") delete sanitized.stepCount
+    else sanitized.taskGraphVerificationReport = { forged: true }
+
+    const result = await prepareScheduledPostGateFinish({} as never, graph as never, node as never, {
+      taskId, sessionId: "session-1", attemptCount: 1, taskRole: SCHEDULED_POST_GATE_EXECUTE_ROLE,
+      taskType: SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE, status: "completed",
+    }, sanitized, vi.fn((value: unknown) => value))
+
+    expect(result).toMatchObject({ status: "failed", failureReason: "scheduled_post_gate_execute_result_invalid" })
+    const validationInput = specializedEnvelope.mock.calls[0]?.[0] as { tasks: ReadonlyMap<string, { result: unknown }> }
+    expect(validationInput.tasks.get(taskId)?.result).toEqual(sanitized)
+    if (shape === "reserved report value") {
+      expect(validationInput.tasks.get(taskId)?.result).toHaveProperty("taskGraphVerificationReport", { forged: true })
+    } else {
+      expect(validationInput.tasks.get(taskId)?.result).not.toHaveProperty("taskGraphVerificationReport")
+    }
+  })
+
+  it("does not synthesize the reserved field on a non-record result", async () => {
+    const taskId = "execute-task", node = { key: SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID,
+      templateId: SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID, taskId, verificationDisposition: "specialized" }
+    const graph = { scope: { rootTaskId: "root-1" }, event: { type: "task.completed" } }
+    loadGraph.mockResolvedValue({ snapshot: { nodes: [node] }, tasks: new Map([[taskId, { id: taskId, status: "running", attemptCount: 1 }]]) })
+    specializedEnvelope.mockReturnValue(null)
+    prepareTransition.mockResolvedValue({ event: { type: "task.failed" } })
+    const sanitized = ["malformed"]
+
+    const result = await prepareScheduledPostGateFinish({} as never, graph as never, node as never, {
+      taskId, sessionId: "session-1", attemptCount: 1, taskRole: SCHEDULED_POST_GATE_EXECUTE_ROLE,
+      taskType: SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE, status: "completed",
+    }, sanitized, vi.fn((value: unknown) => value))
+
+    expect(result).toMatchObject({ status: "failed", failureReason: "scheduled_post_gate_execute_result_invalid" })
+    const validationInput = specializedEnvelope.mock.calls[0]?.[0] as { tasks: ReadonlyMap<string, { result: unknown }> }
+    expect(validationInput.tasks.get(taskId)?.result).toBe(sanitized)
+  })
+
+  it.each([
+    { invalid: "template", templateId: "other-template", taskRole: SCHEDULED_POST_GATE_EXECUTE_ROLE,
+      taskType: SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE, failureReason: "scheduled_post_gate_execute_result_invalid" },
+    { invalid: "role", templateId: SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID, taskRole: "analyst",
+      taskType: SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE, failureReason: "scheduled_post_gate_execute_result_invalid" },
+    { invalid: "type", templateId: SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID, taskRole: SCHEDULED_POST_GATE_EXECUTE_ROLE,
+      taskType: "job_discovery", failureReason: "scheduled_post_gate_execute_result_invalid" },
+    { invalid: "Audit role", templateId: SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID, taskRole: SCHEDULED_POST_GATE_EXECUTE_ROLE,
+      taskType: SCHEDULED_POST_GATE_AUDIT_TASK_TYPE, failureReason: "scheduled_post_gate_audit_result_invalid" },
+    { invalid: "Audit type", templateId: SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID, taskRole: SCHEDULED_POST_GATE_AUDIT_ROLE,
+      taskType: SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE, failureReason: "scheduled_post_gate_audit_result_invalid" },
+  ])("fails closed for a Post-Gate child with the wrong $invalid", async ({ templateId, taskRole, taskType, failureReason }) => {
+    const taskId = "execute-task", node = { key: templateId, templateId, taskId, verificationDisposition: "specialized" }
+    const failedGraph = { event: { type: "task.failed" } }
+    prepareTransition.mockResolvedValue(failedGraph)
+    const result = await prepareScheduledPostGateFinish({} as never, {} as never, node as never, {
+      taskId, sessionId: "session-1", attemptCount: 1, taskRole, taskType, status: "completed",
+    }, { finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
+      structuredResult: { queued: [], failed: [] } }, vi.fn((value: unknown) => value))
+
+    expect(result).toMatchObject({ graph: failedGraph, status: "failed", failureReason })
+    expect(loadGraph).not.toHaveBeenCalled()
+    expect(specializedEnvelope).not.toHaveBeenCalled()
   })
 
   it("rejects a stale completed child attempt before trusting its specialized envelope", async () => {
