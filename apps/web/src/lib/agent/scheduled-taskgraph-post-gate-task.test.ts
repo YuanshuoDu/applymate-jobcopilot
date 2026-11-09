@@ -46,7 +46,7 @@ const handoff = { owner, snapshotDigest: 'snapshot-digest', continuationKey: 'co
 const applicationPackage = { job: { id: 'job-1', userId: owner.userId, company: 'Example Co', role: 'Engineer' }, score: 90,
   matchedKeywords: ['TypeScript'], missingKeywords: [], recommendation: 'Strong match.' }
 const gateInput = { packages: [{ userId: owner.userId, sessionId: owner.sessionId, jobId: 'job-1', package: applicationPackage }],
-  materials: [], gateResult: { status: 'completed', approvedJobIds: [], pendingJobIds: ['job-1'], skippedJobIds: [],
+  materials: [], gateResult: { status: 'completed', nextStage: 'execute', approvedJobIds: [], pendingJobIds: ['job-1'], skippedJobIds: [],
     counts: { approved: 0, pending: 1, skipped: 0 } } }
 const ownedJob = { id: 'job-1', userId: owner.userId, company: 'Example Co', role: 'Engineer' }
 const checkpoint = { nextStage: 'execute', startedAt: new Date().toISOString(), scoutedJobs: [ownedJob], analysisFailed: 0 }
