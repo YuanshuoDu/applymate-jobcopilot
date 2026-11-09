@@ -111,6 +111,43 @@ function diagnosticSubmitOutboxErrorCategory(value: unknown): "none" | "other" |
     : "other"
 }
 
+const SAFE_SUBMISSION_ATTEMPT_ERROR_CODES = [
+  "approval_not_found",
+  "approval_scope_mismatch",
+  "approval_integrity_error",
+  "approval_expired",
+  "approval_not_approved",
+  "approval_already_consumed",
+  "approval_nonce_mismatch",
+  "approval_revision_mismatch",
+  "approval_reservation_conflict",
+  "browser_412",
+  "browser_manual",
+  "browser_failed",
+  "idempotency_conflict",
+  "idempotency_replay",
+  "invalid_state",
+  "not_found",
+  "submission_attempt_fenced",
+  "submission_scope_mismatch",
+  "invalid_input",
+  "target_not_found",
+  "submission_in_flight",
+  "stale_artifact",
+  "submission_guard_denied",
+  "provider_invalid_response",
+  "provider_error",
+] as const
+const SAFE_SUBMISSION_ATTEMPT_ERROR_CODE_SET: ReadonlySet<string> = new Set(SAFE_SUBMISSION_ATTEMPT_ERROR_CODES)
+type SafeSubmissionAttemptErrorCode = typeof SAFE_SUBMISSION_ATTEMPT_ERROR_CODES[number]
+
+function diagnosticSubmissionAttemptErrorCode(value: unknown): null | "other" | SafeSubmissionAttemptErrorCode {
+  if (value === null || value === undefined) return null
+  return typeof value === "string" && SAFE_SUBMISSION_ATTEMPT_ERROR_CODE_SET.has(value)
+    ? value as SafeSubmissionAttemptErrorCode
+    : "other"
+}
+
 function serviceUrl(value: string | undefined, kind: "postgres" | "redis"): string | null {
   const required = process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true"
   if (!value) {
@@ -374,6 +411,21 @@ describe("ApplicationTask submit outbox diagnostic classifier", () => {
   })
 })
 
+describe("ApplicationTask submission attempt diagnostic classifier", () => {
+  it("preserves only fixed allowlisted attempt error codes", () => {
+    for (const errorCode of SAFE_SUBMISSION_ATTEMPT_ERROR_CODES) {
+      expect(diagnosticSubmissionAttemptErrorCode(errorCode)).toBe(errorCode)
+    }
+  })
+
+  it("uses null for absent errors and other for unlisted values", () => {
+    expect(diagnosticSubmissionAttemptErrorCode(null)).toBeNull()
+    expect(diagnosticSubmissionAttemptErrorCode(undefined)).toBeNull()
+    expect(diagnosticSubmissionAttemptErrorCode("unlisted_attempt_detail")).toBe("other")
+    expect(diagnosticSubmissionAttemptErrorCode({ message: "raw error detail" })).toBe("other")
+  })
+})
+
 async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Promise<string> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
@@ -500,7 +552,7 @@ async function waitForStableTurnQueueJobs(turnId: string, stableMs = 750, timeou
 async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
   const turnId = task?.fillTurnId ?? null
   const taskId = task?.id ?? gateTaskId ?? null
-  const [turn, turnDispatch, taskGraph, turnSteps, recentEvents, childDispatches, applicationTaskEvents, submitOutbox, applyJobs, sessionTurns, sessionSubagents, syntheticJob] = await Promise.all([
+  const [turn, turnDispatch, taskGraph, turnSteps, recentEvents, childDispatches, applicationTaskEvents, submitOutbox, applyJobs, sessionTurns, sessionSubagents, syntheticJob, submissionAttempts] = await Promise.all([
     turnId ? testDb.agentTurn.findUnique({ where: { id: turnId }, select: {
       id: true, source: true, status: true, rootTaskId: true, revision: true, error: true,
       leaseOwnerId: true, leaseExpiresAt: true, startedAt: true, completedAt: true,
@@ -531,6 +583,9 @@ async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
     testDb.agentTurn.findMany({ where: { sessionId: ids.session }, select: { id: true } }),
     testDb.subAgentTask.findMany({ where: { sessionId: ids.session }, select: { id: true } }),
     testDb.job.findUnique({ where: { id: ids.job }, select: { status: true, workflowState: true } }),
+    testDb.submissionAttempt.findMany({ where: { userId: ids.user, jobId: ids.job }, orderBy: { createdAt: "asc" }, select: {
+      state: true, errorCode: true,
+    } }),
   ])
   const [sessionTurnJobs, sessionSubagentJobs] = await Promise.all([
     Promise.all(sessionTurns.map(turnRow => matchingQueueJobs(turnQueue, "turnId", turnRow.id))),
@@ -585,6 +640,9 @@ async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
       workerTaskId: jsonString(payload, "workerTaskId") ?? null,
       payloadKeys: Object.keys(jsonRecord(payload) ?? {}).sort(), lastErrorPresent: Boolean(lastError),
       lastErrorCategory: diagnosticSubmitOutboxErrorCategory(lastError),
+    })),
+    submissionAttempts: submissionAttempts.map(({ state, errorCode }) => ({
+      state, errorCode: diagnosticSubmissionAttemptErrorCode(errorCode),
     })),
     applyQueueJobs,
     sessionTurnIds: sessionTurns.map(turnRow => turnRow.id), sessionSubagentTaskIds: sessionSubagents.map(taskRow => taskRow.id),

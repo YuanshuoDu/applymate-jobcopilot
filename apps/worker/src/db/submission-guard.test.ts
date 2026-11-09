@@ -67,6 +67,17 @@ describe("submission guard", () => {
     expect(release).toHaveBeenCalledOnce();
   });
 
+  it("rejects a child-task-bound approval before mutating the application task or Job", async () => {
+    const { pool, query } = poolWith({ rowCount: 0, rows: [] });
+
+    await expect(claimUnattendedSubmission(pool, identity, "bull-1")).resolves.toBe("unavailable");
+    const approvalCall = query.mock.calls.find(([sql]) => String(sql).includes('FROM "agent_approvals"'));
+    expect(String(approvalCall?.[0])).toContain('"taskId" = $5');
+    expect(approvalCall?.[1]?.[4]).toBe(identity.applicationTaskId);
+    expect(query.mock.calls.some(([sql]) => String(sql).includes('UPDATE "application_tasks"'))).toBe(false);
+    expect(query.mock.calls.some(([sql]) => String(sql).includes('UPDATE "Job"'))).toBe(false);
+  });
+
   it("does not reset a duplicate claim or touch the Job after its task is claimed", async () => {
     const { pool, query } = poolWith(
       { rowCount: 1, rows: [{ id: "approval-1" }] },
