@@ -10,7 +10,13 @@ const goal = 'Fixture native question round'
 const question = 'Which synthetic city should the fixture use?'
 const answer = 'Fixture Dublin'
 const finalText = 'Synthetic question was answered and the canonical turn resumed.'
-type AgentPageDiagnostics = { completionEventDelivered: boolean; finalItemCompletedEventDelivered: boolean; finalItemHydrationSucceeded: boolean }
+type AgentPageDiagnostics = {
+  completionEventDelivered: boolean
+  completionEventFinalItemIdMatchesEnvelopeItemId: boolean
+  finalItemCompletedEventDelivered: boolean
+  finalItemHydrationRequestAttempted: boolean
+  finalItemHydrationSucceeded: boolean
+}
 
 test('synthetic native question resumes the actual authenticated turn', async ({ browser }) => {
   if (process.env.CI !== 'true' || process.env.APPLICATION_AUTH_DISPOSABLE !== 'true'
@@ -30,11 +36,13 @@ test('synthetic native question resumes the actual authenticated turn', async ({
       || pathname === '/api/auto-apply' || pathname === '/api/agent/application-tasks')) applicationMutations.push(pathname)
   })
   const requireFixture = createRequire(path.resolve('e2e/application-authenticated-agent.browser.ts'))
-  const { initializeFixtureSse, attachFixtureApplication, inspectFixtureApplication, inspectTurn, closeFixtureDb } = requireFixture('./application-authenticated-agent-db.cjs') as {
+  const { initializeFixtureSse, attachFixtureApplication, inspectFixtureApplication, inspectTurn,
+    installAgentPageDiagnostics, closeFixtureDb } = requireFixture('./application-authenticated-agent-db.cjs') as {
     initializeFixtureSse: () => Promise<void>
     attachFixtureApplication: (sessionId: string, turnId: string) => Promise<void>
     inspectFixtureApplication: (sessionId: string) => Promise<{ jobStatus: string; taskStatus: string; sessionId: string; email: string }>
     inspectTurn: (sessionId: string, turnId: string) => Promise<{ turn: { status: string; error: string | null; completedEvents: number; answeredEvents: number; finalResponse: string | null }; questions: { id: string; status: string; content: { questionId?: string; question?: string; answer?: string | null; toolCallId?: string } }[]; eventTypes: string[]; steps: { status: string; errorCode: string | null; finishReason: string | null }[]; tasks: { status: string; failureReason: string | null }[]; finalAnswer: { exactlyOneFinalAssistantItem: boolean; finalAssistantItemCompleted: boolean; finalAssistantItemHasText: boolean; completionEventTargetsFinalAnswer: boolean }; toolResultCount: number; toolResultQuestionRedacted: boolean | null }>
+    installAgentPageDiagnostics: () => void
     closeFixtureDb: () => Promise<void>
   }
   try {
@@ -43,68 +51,7 @@ test('synthetic native question resumes the actual authenticated turn', async ({
     // networking must be independently verified by the caller for all processes.
     await context.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort())
     const page = await context.newPage()
-    await page.addInitScript(() => {
-      const diagnostics: AgentPageDiagnostics = { completionEventDelivered: false, finalItemCompletedEventDelivered: false, finalItemHydrationSucceeded: false }
-      const completedItems = new Set<string>()
-      Object.defineProperty(window, '__agentQuestionDiagnostics', { value: diagnostics })
-      const nativeFetch = window.fetch.bind(window)
-      window.fetch = async (input, init) => {
-        const response = await nativeFetch(input, init)
-        const rawUrl = typeof input === 'string' || input instanceof URL ? input.toString() : input.url
-        const url = new URL(rawUrl, window.location.href)
-        if (url.pathname.endsWith('/events') && response.headers.get('content-type')?.includes('text/event-stream')) {
-          const reader = response.clone().body?.getReader()
-          if (reader) void (async () => {
-            try {
-              const decoder = new TextDecoder()
-              let buffered = ''
-              let eventType = ''
-              let dataLines: string[] = []
-              const inspectFrame = () => {
-                if (eventType === 'item.completed' || eventType === 'turn.completed') {
-                  try {
-                    const envelope = JSON.parse(dataLines.join('\n')) as Record<string, unknown>
-                    const payload = envelope.payload && typeof envelope.payload === 'object' && !Array.isArray(envelope.payload)
-                      ? envelope.payload as Record<string, unknown> : null
-                    if (eventType === 'item.completed' && typeof envelope.itemId === 'string') completedItems.add(envelope.itemId)
-                    if (eventType === 'turn.completed' && payload && typeof payload.finalItemId === 'string') {
-                      diagnostics.completionEventDelivered = true
-                      diagnostics.finalItemCompletedEventDelivered = envelope.itemId === payload.finalItemId
-                        && completedItems.has(payload.finalItemId)
-                    }
-                  } catch { /* Malformed frames are not counted as delivered diagnostics. */ }
-                }
-                eventType = ''
-                dataLines = []
-              }
-              while (true) {
-                const next = await reader.read()
-                if (next.done) return
-                buffered += decoder.decode(next.value, { stream: true })
-                const lines = buffered.split(/\r?\n/)
-                buffered = lines.pop() ?? ''
-                for (const line of lines) {
-                  if (!line) inspectFrame()
-                  else if (line.startsWith('event:')) eventType = line.slice(6).trim()
-                  else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
-                }
-              }
-            } catch { /* A closed stream leaves the delivery diagnostic false. */ }
-          })()
-        }
-        if (response.ok && url.pathname.endsWith('/timeline') && url.searchParams.has('itemId')) {
-          try {
-            const body = await response.clone().json() as { items?: Array<{ type?: unknown; status?: unknown; phase?: unknown; content?: unknown }> }
-            const item = Array.isArray(body.items) && body.items.length === 1 ? body.items[0] : null
-            const content = item?.content && typeof item.content === 'object' && !Array.isArray(item.content)
-              ? item.content as Record<string, unknown> : null
-            diagnostics.finalItemHydrationSucceeded = item?.type === 'agent_message' && item.status === 'completed'
-              && item.phase === 'final_answer' && typeof content?.text === 'string' && content.text.length > 0
-          } catch { /* Diagnostics intentionally retain only Boolean outcomes. */ }
-        }
-        return response
-      }
-    })
+    await page.addInitScript(installAgentPageDiagnostics)
     await page.goto('/login')
     await page.getByPlaceholder('you@example.com').fill('candidate-a@example.invalid')
     await page.locator('input[type="password"]').fill('Fixture-only-password-123')
@@ -233,10 +180,13 @@ test('synthetic native question resumes the actual authenticated turn', async ({
           const value = (window as Window & { __agentQuestionDiagnostics?: AgentPageDiagnostics }).__agentQuestionDiagnostics
           const finalItems = Array.from(document.querySelectorAll('[data-agent-item-type="agent_message"][data-agent-phase="final"]'))
           return { completionEventDelivered: value?.completionEventDelivered === true,
+            completionEventFinalItemIdMatchesEnvelopeItemId: value?.completionEventFinalItemIdMatchesEnvelopeItemId === true,
             finalItemCompletedEventDelivered: value?.finalItemCompletedEventDelivered === true,
+            finalItemHydrationRequestAttempted: value?.finalItemHydrationRequestAttempted === true,
             finalItemHydrationSucceeded: value?.finalItemHydrationSucceeded === true,
             finalAnswerRendered: finalItems.some(item => item.textContent?.includes(expectedText) === true) }
         }, finalText).catch(() => ({ completionEventDelivered: false, finalItemCompletedEventDelivered: false,
+          completionEventFinalItemIdMatchesEnvelopeItemId: false, finalItemHydrationRequestAttempted: false,
           finalItemHydrationSucceeded: false, finalAnswerRendered: false }))
         console.error('Synthetic final response diagnostic', JSON.stringify({
           turnCompleted: snapshot.turn.status === 'completed',

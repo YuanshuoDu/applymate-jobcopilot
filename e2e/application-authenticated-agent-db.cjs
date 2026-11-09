@@ -123,4 +123,87 @@ async function inspectFixtureApplication(sessionId) {
   return result.rows[0]
 }
 
-module.exports = { initializeFixtureSse, attachFixtureApplication, inspectFixtureApplication, inspectTurn, closeFixtureDb: () => pool.end() }
+function installAgentPageDiagnostics() {
+  const diagnostics = {
+    completionEventDelivered: false,
+    completionEventFinalItemIdMatchesEnvelopeItemId: false,
+    finalItemCompletedEventDelivered: false,
+    finalItemHydrationRequestAttempted: false,
+    finalItemHydrationSucceeded: false,
+  }
+  const completedItems = new Set()
+  Object.defineProperty(window, '__agentQuestionDiagnostics', { value: diagnostics })
+  const nativeFetch = window.fetch.bind(window)
+  window.fetch = async (input, init) => {
+    let url = null
+    try {
+      const rawUrl = typeof input === 'string' || input instanceof URL ? input.toString() : input.url
+      url = new URL(rawUrl, window.location.href)
+      if (url.pathname.endsWith('/timeline') && url.searchParams.has('itemId')) {
+        diagnostics.finalItemHydrationRequestAttempted = true
+      }
+    } catch { /* URL inspection must not change fetch behavior. */ }
+    const response = await nativeFetch(input, init)
+    if (!url) return response
+    const parsedUrl = url
+    if (parsedUrl.pathname.endsWith('/events') && response.headers.get('content-type')?.includes('text/event-stream')) {
+      const reader = response.clone().body?.getReader()
+      if (reader) void (async () => {
+        try {
+          const decoder = new TextDecoder()
+          let buffered = ''
+          let eventType = ''
+          let dataLines = []
+          const inspectFrame = () => {
+            if (eventType === 'turn.completed') diagnostics.completionEventDelivered = true
+            if (eventType === 'item.completed' || eventType === 'turn.completed') {
+              try {
+                const envelope = JSON.parse(dataLines.join('\n'))
+                const payload = envelope.payload && typeof envelope.payload === 'object' && !Array.isArray(envelope.payload)
+                  ? envelope.payload : null
+                if (eventType === 'item.completed' && typeof envelope.itemId === 'string') completedItems.add(envelope.itemId)
+                if (eventType === 'turn.completed' && payload && typeof payload.finalItemId === 'string') {
+                  if (envelope.itemId === payload.finalItemId) {
+                    diagnostics.completionEventFinalItemIdMatchesEnvelopeItemId = true
+                    if (completedItems.has(payload.finalItemId)) diagnostics.finalItemCompletedEventDelivered = true
+                  }
+                }
+              } catch { /* Malformed payloads leave the identity checks false. */ }
+            }
+            eventType = ''
+            dataLines = []
+          }
+          while (true) {
+            const next = await reader.read()
+            if (next.done) return
+            buffered += decoder.decode(next.value, { stream: true })
+            const lines = buffered.split(/\r?\n/)
+            buffered = lines.pop() ?? ''
+            for (const line of lines) {
+              if (!line) inspectFrame()
+              else if (line.startsWith('event:')) eventType = line.slice(6).trim()
+              else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+            }
+          }
+        } catch { /* Delivery stays false only when no completion frame was observed. */ }
+      })()
+    }
+    if (parsedUrl.pathname.endsWith('/timeline') && parsedUrl.searchParams.has('itemId') && response.ok) {
+      try {
+        const requestedItemId = parsedUrl.searchParams.get('itemId')
+        const body = await response.clone().json()
+        const item = Array.isArray(body.items) && body.items.length === 1 ? body.items[0] : null
+        const content = item?.content && typeof item.content === 'object' && !Array.isArray(item.content)
+          ? item.content : null
+        if (item && item.id === requestedItemId && item.type === 'agent_message' && item.status === 'completed'
+          && item.phase === 'final_answer' && typeof content?.text === 'string' && content.text.length > 0) {
+          diagnostics.finalItemHydrationSucceeded = true
+        }
+      } catch { /* Diagnostics intentionally retain only Boolean outcomes. */ }
+    }
+    return response
+  }
+}
+
+module.exports = { initializeFixtureSse, attachFixtureApplication, inspectFixtureApplication, inspectTurn,
+  installAgentPageDiagnostics, closeFixtureDb: () => pool.end() }
