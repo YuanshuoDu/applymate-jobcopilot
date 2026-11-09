@@ -129,7 +129,7 @@ type ApplicationFillExecutorTrace = {
   leaseSignalAbortedAtStart: boolean
   leaseSignalAbortedAtEnd: boolean
 }
-type ApplicationFillCompletionStaleGate = "lease_input_invalid" | "session_scope" | "turn_scope" | "child_lease_fence" | "application_task_scope"
+type ApplicationFillCompletionStaleGate = "lease_input_invalid" | "session_scope" | "turn_row_unavailable" | "turn_status_queued" | "turn_status_interrupted" | "turn_status_terminal" | "turn_status_other" | "child_lease_fence" | "application_task_scope"
 type ApplicationFillStageTrace = { entryValidation: boolean; waitPersistence: boolean; completion: boolean; accepted: boolean; rejected: boolean; waiting: boolean; completed: boolean; stale: boolean; conflict: boolean; failed: boolean; cancelled: boolean; unavailable: boolean; leaseLost: boolean; signalAborted: boolean; staleGate?: ApplicationFillCompletionStaleGate }
 type ApplicationTaskRow = {
   id: string; userId: string; jobId: string; sessionId: string | null; fillTurnId: string | null
@@ -275,7 +275,7 @@ function applicationFillExecutorTraces(child: Child | undefined): Array<Applicat
 
 function applicationFillStageTraces(child: Child | undefined): Array<ApplicationFillStageTrace | { traceInvalid: true }> {
   const prefix = "APPLICATION_FILL_STAGE_TRACE ", keys = ["entryValidation", "waitPersistence", "completion", "accepted", "rejected", "waiting", "completed", "stale", "conflict", "failed", "cancelled", "unavailable", "leaseLost", "signalAborted"]
-  const staleGates = ["lease_input_invalid", "session_scope", "turn_scope", "child_lease_fence", "application_task_scope"]
+  const staleGates = ["lease_input_invalid", "session_scope", "turn_row_unavailable", "turn_status_queued", "turn_status_interrupted", "turn_status_terminal", "turn_status_other", "child_lease_fence", "application_task_scope"]
   const traces: Array<ApplicationFillStageTrace | { traceInvalid: true }> = []
   for (const line of child?.lines ?? []) {
     if (!line.startsWith(prefix)) continue
@@ -297,6 +297,35 @@ function applicationFillStageTraces(child: Child | undefined): Array<Application
   }
   return traces.slice(-24)
 }
+
+const APPLICATION_FILL_STALE_GATES: readonly ApplicationFillCompletionStaleGate[] = [
+  "lease_input_invalid", "session_scope", "turn_row_unavailable", "turn_status_queued", "turn_status_interrupted",
+  "turn_status_terminal", "turn_status_other", "child_lease_fence", "application_task_scope",
+]
+
+describe("ApplicationTask full-loop stage trace parser", () => {
+  it.each(APPLICATION_FILL_STALE_GATES)("accepts the sanitized %s category", staleGate => {
+    const trace: ApplicationFillStageTrace = {
+      entryValidation: false, waitPersistence: false, completion: true,
+      accepted: false, rejected: false, waiting: false, completed: false, stale: true,
+      conflict: false, failed: false, cancelled: false, unavailable: false,
+      leaseLost: true, signalAborted: false, staleGate,
+    }
+    const child = { lines: [`APPLICATION_FILL_STAGE_TRACE ${JSON.stringify(trace)}`] } as unknown as Child
+    expect(applicationFillStageTraces(child)).toEqual([trace])
+  })
+
+  it("rejects an unlisted stale category", () => {
+    const trace = {
+      entryValidation: false, waitPersistence: false, completion: true,
+      accepted: false, rejected: false, waiting: false, completed: false, stale: true,
+      conflict: false, failed: false, cancelled: false, unavailable: false,
+      leaseLost: true, signalAborted: false, staleGate: "unlisted_category",
+    }
+    const child = { lines: [`APPLICATION_FILL_STAGE_TRACE ${JSON.stringify(trace)}`] } as unknown as Child
+    expect(applicationFillStageTraces(child)).toEqual([{ traceInvalid: true }])
+  })
+})
 
 async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Promise<string> {
   const until = Date.now() + timeoutMs

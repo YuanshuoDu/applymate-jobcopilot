@@ -62,7 +62,7 @@ async function approvalFixture(
 
 function fixture(options: {
   subtaskLive?: boolean; subtaskOwnerUserId?: string; subtaskOwner?: string; subtaskAttempt?: number; subtaskInterrupted?: boolean; appStatus?: string; appCheckpoint?: string; appTurnId?: string; sessionStatus?: string
-  turnStatus?: string; completionApprovalStatus?: string; approvalMismatch?: ApprovalMismatch; artifactMismatch?: boolean
+  turnStatus?: string; turnMissing?: boolean; completionApprovalStatus?: string; approvalMismatch?: ApprovalMismatch; artifactMismatch?: boolean
 } = {}) {
   const lease = {
     id: "filler-task", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a", parentTaskId: "root-a",
@@ -85,7 +85,7 @@ function fixture(options: {
       if (sql.startsWith('SELECT "id" FROM "agent_sessions"') && sql.includes('"status" IN (')) return sql.includes(`'${options.sessionStatus ?? "running"}'`)
         ? { rows: [{ id: "session-a" }], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-a" }], rowCount: 1 }
-      if (sql.includes('FROM "agent_turns"') && sql.includes('SELECT "id", "status", "revision"')) return { rows: [turn], rowCount: 1 }
+      if (sql.includes('FROM "agent_turns"') && sql.includes('SELECT "id", "status", "revision"')) return options.turnMissing ? { rows: [], rowCount: 0 } : { rows: [turn], rowCount: 1 }
       if (sql.includes('FROM "agent_turns"') && sql.includes('SELECT "id"')) return { rows: [{ id: "turn-a" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS "subtask"')) {
         const userId = values[6]
@@ -210,10 +210,29 @@ describe("ApplicationTask fill completion", () => {
   })
 
   it.each([
-    ["lease_input_invalid", "lease"], ["session_scope", "session"], ["turn_scope", "turn"],
+    ["lease_input_invalid", "lease"], ["session_scope", "session"],
   ] as const)("reports the fixed %s stale gate", async (expectedGate, failedGate) => {
-    const test = failedGate === "session" ? fixture({ sessionStatus: "paused" }) : failedGate === "turn" ? fixture({ turnStatus: "completed" }) : fixture()
+    const test = failedGate === "session" ? fixture({ sessionStatus: "paused" }) : fixture()
     if (failedGate === "lease") test.lease.id = ""
+    const onStaleGate = vi.fn()
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, onStaleGate })).resolves.toEqual({ status: "stale" })
+
+    expect(onStaleGate).toHaveBeenCalledOnce()
+    expect(onStaleGate).toHaveBeenCalledWith(expectedGate)
+    expect(test.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
+  })
+
+  it.each([
+    ["turn_row_unavailable", undefined, true],
+    ["turn_status_queued", "queued", false],
+    ["turn_status_interrupted", "interrupted", false],
+    ["turn_status_terminal", "completed", false],
+    ["turn_status_terminal", "failed", false],
+    ["turn_status_terminal", "cancelled", false],
+    ["turn_status_other", "waiting_for_tool", false],
+  ] as const)("reports the fixed %s Turn stale category", async (expectedGate, turnStatus, turnMissing) => {
+    const test = fixture({ ...(turnStatus === undefined ? {} : { turnStatus }), ...(turnMissing ? { turnMissing: true } : {}) })
     const onStaleGate = vi.fn()
 
     await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, onStaleGate })).resolves.toEqual({ status: "stale" })

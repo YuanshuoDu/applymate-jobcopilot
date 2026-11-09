@@ -17,7 +17,7 @@ type ExistingApprovalRow = { id: string; userId: string; sessionId: string; turn
   toolCallId: string | null; payload: unknown; resourceHash: string | null; materialHash: string | null; answersHash: string | null; scopeHash: string | null; nonceHash: string | null; revision: number; expiresAt: Date | string | null }
 type ExistingArtifactRow = { id: string; userId: string; jobId: string; artifactType: string; lifecycle: string; baseId: string | null; baseHash: string | null
   content: unknown; hash: string; constraintHash: string; provenanceRefs: unknown; evidenceRefs: unknown; previousHash: string | null; version: number }
-type FillStatus = { status: "completed" | "waiting" | "stale" | "conflict" | "failed" | "cancelled" }; export type ApplicationFillCompletionStaleGate = "lease_input_invalid" | "session_scope" | "turn_scope" | "child_lease_fence" | "application_task_scope"
+type FillStatus = { status: "completed" | "waiting" | "stale" | "conflict" | "failed" | "cancelled" }; export type ApplicationFillCompletionStaleGate = "lease_input_invalid" | "session_scope" | "turn_row_unavailable" | "turn_status_queued" | "turn_status_interrupted" | "turn_status_terminal" | "turn_status_other" | "child_lease_fence" | "application_task_scope"
 type WaitCheckpoint = "fill_outcome_uncertain" | "form_answer_required"
 type WaitDetail = "captcha_required" | "authentication_required" | "mfa_required" | "unknown_sensitive_field" | "required_field" | "stale_review" | "review_required" | "fill_outcome_uncertain" | "unattended_apply_unavailable" | "cancelled" | "browser_fill_failed"
 type Client = Pick<PoolClient, "query">; type StaleGateObserver = (gate: ApplicationFillCompletionStaleGate) => void
@@ -40,7 +40,7 @@ async function lockFillScope(client: Client, lease: SubagentLease, now: Date, ca
   if (!session.rows[0]) { if (onStaleGate) reportStaleGate(onStaleGate, "session_scope"); return null }
   const turnResult = await client.query<TurnRow>(`SELECT "id", "status", "revision" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`, [lease.turnId, lease.sessionId, lease.userId])
   const turn = turnResult.rows[0]
-  if (!turn || !(cancellation ? ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency", "interrupted"] : ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency"]).includes(turn.status)) { if (onStaleGate) reportStaleGate(onStaleGate, "turn_scope"); return null }
+  if (!turn || !(cancellation ? ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency", "interrupted"] : ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency"]).includes(turn.status)) { if (onStaleGate) reportStaleGate(onStaleGate, !turn ? "turn_row_unavailable" : turn.status === "queued" ? "turn_status_queued" : turn.status === "interrupted" ? "turn_status_interrupted" : ["completed", "failed", "cancelled"].includes(turn.status) ? "turn_status_terminal" : "turn_status_other"); return null }
   const interruptCheck = cancellation ? "IS NOT NULL" : "IS NULL"
   const subtask = await client.query(`SELECT "subtask"."id" FROM "sub_agent_tasks" AS "subtask"
       INNER JOIN "agent_sessions" AS "session" ON "session"."id" = "subtask"."sessionId" AND "session"."userId" = $7
