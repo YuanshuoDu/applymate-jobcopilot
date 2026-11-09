@@ -56,8 +56,11 @@ const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", root
   turnLeaseOwner: "turn-lease", turnLeaseVersion: 3, parentLeaseOwner: "root-lease", parentAttemptCount: 2, stepId: "plan-step" }
 const refs = ["package-a", "package-b"]
 const digest = `sha256:${"a".repeat(64)}`
+const transientWaitContinuationKey = "transient-prepare-wait-key"
+const stablePrepareReceiptContinuationKey = "stable-prepare-receipt-key"
 const gateProof = { graphRevision: 5, gate: { taskId: "gate-task", attemptCount: 1, completedEventRevision: 5, resultDigest: digest },
-  prepareProof: { receipt: { owner: { turnLeaseOwnerId: "original-turn-lease", turnLeaseVersion: 2 }, snapshotDigest: digest } } }
+  prepareProof: { receipt: { owner: { turnLeaseOwnerId: "original-turn-lease", turnLeaseVersion: 2 }, snapshotDigest: digest,
+    continuationKey: stablePrepareReceiptContinuationKey } } }
 
 function baseState(scoutCount = 2): TaskGraphState {
   const scouts = Array.from({ length: scoutCount }, (_, index) => graphNode(index === 0 ? "scout" : `scout-${index + 1}`,
@@ -110,7 +113,8 @@ function configure(proof: unknown = gateProof, approvedRefs: readonly string[] =
   mocks.validate.mockResolvedValue(true)
   mocks.reconcile.mockResolvedValue(null)
   mocks.readGate.mockResolvedValue({ status: "gate_continuation", handoff: { executionId: "execution-1", executionAttemptCount: 1,
-    continuationKey: "continuation-1" }, prepareProof: { receipt: { snapshotDigest: digest } } })
+    continuationKey: transientWaitContinuationKey }, prepareProof: { receipt: { snapshotDigest: digest,
+      continuationKey: stablePrepareReceiptContinuationKey } } })
   mocks.verifyGate.mockResolvedValue(proof)
   mocks.preparedIds.mockReturnValue(approvedRefs)
   mocks.parseGate.mockReturnValue({ structuredResult: { status: "completed", approvedJobIds: approvedRefs } })
@@ -192,6 +196,16 @@ describe("scheduled post-Gate PG plan command", () => {
     await expect(readScheduledPostGatePlanningContext(db as never, { scope } as never))
       .resolves.toEqual({ status: "invalid" })
     expect(mocks.readGate).toHaveBeenCalledOnce()
+  })
+
+  it("uses the stable Prepare receipt key instead of the transient wait key", async () => {
+    const db = client()
+    mocks.load.mockResolvedValue({ ...loaded(), discoveryTurnEligibility: "scheduled" })
+
+    const context = await readScheduledPostGatePlanningContext(db as never, { scope } as never)
+
+    expect(context).toMatchObject({ status: "awaiting_plan", continuationKey: stablePrepareReceiptContinuationKey })
+    expect(context).not.toMatchObject({ continuationKey: transientWaitContinuationKey })
   })
 
   it("rejects a non-revise reconciliation operation before any database write", async () => {
@@ -302,7 +316,8 @@ describe("scheduled post-Gate PG plan command", () => {
     }), true, expect.any(Object))
 
     const storedHandoff = mocks.event.mock.calls[0]?.[1]?.payload
-    expect(storedHandoff).toMatchObject({ graphRevision: 6, gateGraphRevision: 5, auditTaskId: "audit-task" })
+    expect(storedHandoff).toMatchObject({ graphRevision: 6, gateGraphRevision: 5, auditTaskId: "audit-task",
+      continuationKey: stablePrepareReceiptContinuationKey })
     const replayGraph = { revision: 6, nodes: [
       graphNode("execute-a", SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID, "execute-task-a", ["gate"], 5, "running"),
       graphNode("execute-b", SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID, "execute-task-b", ["gate"], 5, "queued"),

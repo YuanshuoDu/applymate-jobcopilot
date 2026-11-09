@@ -200,7 +200,7 @@ async function awaitingPostGatePlan(client: Queryable, scope: TaskGraphReadScope
   const envelope = preparedIds && parseScheduledGateTaskEnvelope(gateTask.result, gateTask.status, preparedIds)
   if (!gateProof || gateProof.graphRevision !== loaded.state.revision || !envelope || envelope.structuredResult.status !== "completed") return { status: "invalid" }
   return { status: "awaiting_plan", scope, executionOwner, gateProof, packageRefs: [...envelope.structuredResult.approvedJobIds],
-    graphRevision: loaded.state.revision, continuationKey: recovery.handoff.continuationKey,
+    graphRevision: loaded.state.revision, continuationKey: recovery.prepareProof.receipt.continuationKey,
     snapshotDigest: recovery.prepareProof.receipt.snapshotDigest }
 }
 
