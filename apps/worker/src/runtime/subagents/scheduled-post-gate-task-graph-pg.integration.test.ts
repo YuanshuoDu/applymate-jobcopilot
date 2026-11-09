@@ -215,9 +215,28 @@ describeWithServices("scheduled post-Gate TaskGraph handoff in disposable Postgr
 type ScheduledPostGateReplayDiagnostic = Readonly<{
   available: boolean
   handoffValid: boolean
-  stages?: Readonly<{ ownerProof: boolean; gateRow: boolean; gateEvent: boolean; gateEnvelope: boolean; preparePrefix: boolean;
+  stages?: Readonly<{ ownerProof: boolean; ownerProofChecks: ScheduledPostGateOwnerProofChecks;
+    gateRow: boolean; gateEvent: boolean; gateEnvelope: boolean; preparePrefix: boolean;
     suffixShape: boolean; proposalDigestParse: boolean; taskRows: boolean; gateEventCount: number }>
   acceptedPlan?: Readonly<{ eventCount: number; identity: boolean; fingerprint: boolean; receipt: boolean; nodes: boolean; readyTaskIds: boolean }>
+}>
+
+type ScheduledPostGateOwnerProofChecks = Readonly<{
+  scopeIdentity: boolean
+  rootAttempt: boolean
+  graphRevisionFence: boolean
+  gateProofDigest: boolean
+  gateResultDigest: boolean
+  gateGraphRevision: boolean
+  gateCompletedEventRevision: boolean
+  snapshotDigest: boolean
+  continuationKey: boolean
+  proofOwnerIdentity: boolean
+  proofOwnerRootAttempt: boolean
+  proofOwnerTurnLeaseOwner: boolean
+  proofOwnerTurnLeaseVersion: boolean
+  proofOwnerExecutionId: boolean
+  proofOwnerExecutionAttempt: boolean
 }>
 
 /** Read-only, bounded predicate snapshot used only when duplicate receipt validation fails. */
@@ -275,22 +294,26 @@ async function diagnoseScheduledPostGateHandoffStages(client: PoolClient, scope:
   loaded: Awaited<ReturnType<typeof loadTaskGraph>>, receipt: ScheduledPostGateHandoff): Promise<NonNullable<ScheduledPostGateReplayDiagnostic["stages"]>> {
   const snapshot = loaded.snapshot, state = loaded.state
   const proofOwner = receipt.gateProof.prepareProof.receipt.owner
-  const ownerProof = Boolean(snapshot && state && receipt.owner.userId === scope.userId
-    && receipt.owner.sessionId === scope.sessionId && receipt.owner.turnId === scope.turnId
-    && receipt.owner.rootTaskId === scope.rootTaskId && receipt.owner.rootAttemptCount === scope.parentAttemptCount
-    && receipt.graphRevision <= state.revision && safeScheduledPostGateDigest(receipt.gateProof) === receipt.gateProofDigest
-    && receipt.gateResultDigest === receipt.gateProof.gate.resultDigest
-    && receipt.gateGraphRevision === receipt.gateProof.graphRevision
-    && receipt.gateCompletedEventRevision === receipt.gateProof.gate.completedEventRevision
-    && receipt.snapshotDigest === receipt.gateProof.prepareProof.receipt.snapshotDigest
-    && receipt.continuationKey === receipt.gateProof.prepareProof.receipt.continuationKey
-    && receipt.owner.userId === proofOwner.userId && receipt.owner.sessionId === proofOwner.sessionId
-    && receipt.owner.turnId === proofOwner.turnId && receipt.owner.rootTaskId === proofOwner.rootTaskId
-    && receipt.owner.rootAttemptCount === proofOwner.rootAttemptCount
-    && receipt.owner.turnLeaseOwnerId === proofOwner.turnLeaseOwnerId
-    && receipt.owner.turnLeaseVersion === proofOwner.turnLeaseVersion
-    && receipt.owner.executionId === proofOwner.executionId
-    && receipt.owner.executionAttemptCount === proofOwner.executionAttemptCount)
+  const ownerProofChecks: ScheduledPostGateOwnerProofChecks = {
+    scopeIdentity: receipt.owner.userId === scope.userId && receipt.owner.sessionId === scope.sessionId
+      && receipt.owner.turnId === scope.turnId && receipt.owner.rootTaskId === scope.rootTaskId,
+    rootAttempt: receipt.owner.rootAttemptCount === scope.parentAttemptCount,
+    graphRevisionFence: Boolean(state && receipt.graphRevision <= state.revision),
+    gateProofDigest: safeScheduledPostGateDigest(receipt.gateProof) === receipt.gateProofDigest,
+    gateResultDigest: receipt.gateResultDigest === receipt.gateProof.gate.resultDigest,
+    gateGraphRevision: receipt.gateGraphRevision === receipt.gateProof.graphRevision,
+    gateCompletedEventRevision: receipt.gateCompletedEventRevision === receipt.gateProof.gate.completedEventRevision,
+    snapshotDigest: receipt.snapshotDigest === receipt.gateProof.prepareProof.receipt.snapshotDigest,
+    continuationKey: receipt.continuationKey === receipt.gateProof.prepareProof.receipt.continuationKey,
+    proofOwnerIdentity: receipt.owner.userId === proofOwner.userId && receipt.owner.sessionId === proofOwner.sessionId
+      && receipt.owner.turnId === proofOwner.turnId && receipt.owner.rootTaskId === proofOwner.rootTaskId,
+    proofOwnerRootAttempt: receipt.owner.rootAttemptCount === proofOwner.rootAttemptCount,
+    proofOwnerTurnLeaseOwner: receipt.owner.turnLeaseOwnerId === proofOwner.turnLeaseOwnerId,
+    proofOwnerTurnLeaseVersion: receipt.owner.turnLeaseVersion === proofOwner.turnLeaseVersion,
+    proofOwnerExecutionId: receipt.owner.executionId === proofOwner.executionId,
+    proofOwnerExecutionAttempt: receipt.owner.executionAttemptCount === proofOwner.executionAttemptCount,
+  }
+  const ownerProof = Boolean(snapshot && state && Object.values(ownerProofChecks).every(Boolean))
 
   const gateNode = snapshot?.nodes.find(node => node.key === SCHEDULED_GATE_TEMPLATE_ID)
   const gateTask = gateNode && loaded.tasks.get(gateNode.taskId)
@@ -341,7 +364,7 @@ async function diagnoseScheduledPostGateHandoffStages(client: PoolClient, scope:
   const current = currentTaskGraph(loaded)
   const taskRows = Boolean(suffixShape && [...executeNodes, auditNode].every(node => node !== null && node !== undefined
     && diagnosticPostGateTaskMatches(node, loaded, current.nodes)))
-  return { ownerProof, gateRow, gateEvent, gateEnvelope, preparePrefix, suffixShape, proposalDigestParse, taskRows,
+  return { ownerProof, ownerProofChecks, gateRow, gateEvent, gateEnvelope, preparePrefix, suffixShape, proposalDigestParse, taskRows,
     gateEventCount: Math.min(gateEvents.length, 2) }
 }
 
