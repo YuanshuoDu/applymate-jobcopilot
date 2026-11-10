@@ -581,6 +581,21 @@ describe("TaskGraph terminal verification gate", () => {
     expect(queries[1]).toContain("IN ('proposal', 'native_command')")
   })
 
+  it("requires a current non-empty graph only for explicit objective completion", async () => {
+    const absent = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as never
+    await expect(checkTaskGraphTerminalVerification(absent, graphLease, "root-1", false, true))
+      .resolves.toMatchObject({ ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER })
+    await expect(checkTaskGraphTerminalVerification(absent, graphLease, "root-1"))
+      .resolves.toEqual({ ok: true })
+    await expect(checkTaskGraphTerminalVerification(graphClient([], []), graphLease, "root-1", false, true))
+      .resolves.toMatchObject({ ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER })
+
+    const scout = node("scout", "task-scout")
+    await expect(checkTaskGraphTerminalVerification(graphClient([scout], [{
+      id: scout.taskId, status: "completed", role: "scout", failureReason: null, result: storedResult("passed"),
+    }]), graphLease, "root-1", false, true)).resolves.toMatchObject({ ok: true })
+  })
+
   it("fails closed for legacy-unverified and missing durable reports", async () => {
     const legacy = node("legacy", "task-legacy") as Record<string, unknown>
     delete legacy.verification; legacy.verificationDisposition = "legacy_unverified"

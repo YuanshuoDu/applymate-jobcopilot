@@ -1,5 +1,5 @@
 import type { PrismaClient } from "@prisma/client"
-import { InputContentPartSchema, validate } from "@jobcopilot/agent-protocol"
+import { InputContentPartSchema, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, validate } from "@jobcopilot/agent-protocol"
 
 import { invalidCommand, isUniqueViolation, objectiveStartStateConflict, retryActiveConflict } from "./errors"
 import { duplicateCommandResult } from "./agent-command-service"
@@ -72,7 +72,7 @@ async function startOnce(command: ObjectiveStartCommand, db: PrismaClient): Prom
     if (active) throw retryActiveConflict(active.id)
 
     const turn = await createRootTurn(
-      tx, command, command.content, command.objective, undefined, undefined, command.verificationRequirements,
+      tx, command, command.content, command.objective, undefined, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, command.verificationRequirements,
     )
     const facts = await acceptInputFacts(tx, command, command.content, turn, "follow_up", "started", true)
     return { ...facts, disposition: "started" }

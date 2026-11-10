@@ -1,4 +1,4 @@
-import type { InputContentPart, TurnSource } from "@jobcopilot/agent-protocol"
+import type { InputContentPart, TurnIntent, TurnSource } from "@jobcopilot/agent-protocol"
 
 export const COMMAND_DISPOSITIONS = [
   "started",
@@ -107,7 +107,7 @@ export function parseObjectiveVerificationRequirements(value: unknown): Objectiv
 
 export interface StartCommand extends CommandIdentity {
   content: InputContentPart[]
-  intent?: ServerAgentTurnIntent
+  intent?: Extract<TurnIntent, { kind: "interactive_discovery_shortlist" }>
 }
 
 /** User-only fresh root whose immutable goal is separate from its reference content. */
@@ -118,10 +118,7 @@ export interface ObjectiveStartCommand extends CommandIdentity {
 }
 
 /** Server-owned intent metadata persisted with the root Turn input envelope. */
-export interface ServerAgentTurnIntent {
-  kind: "interactive_discovery_shortlist"
-  version: 1
-}
+export type ServerAgentTurnIntent = TurnIntent
 
 export interface MessageCommand extends CommandIdentity {
   content: InputContentPart[]

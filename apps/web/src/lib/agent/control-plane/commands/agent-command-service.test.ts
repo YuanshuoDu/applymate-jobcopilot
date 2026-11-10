@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import { redactSensitiveText } from "@jobcopilot/shared"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 
 import type { PrismaClient } from "@prisma/client"
 
@@ -347,6 +348,7 @@ describe("AgentCommandService", () => {
     expect(fake.state.active?.input).toMatchObject({
       goal: "Find senior backend roles in Dublin",
       content: [{ type: "text", text: longContext }],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
     })
     expect(fake.state.inputs[0]).toMatchObject({
       targetTurnId: result.turnId,
@@ -356,6 +358,22 @@ describe("AgentCommandService", () => {
     expect(fake.state.events.map((event) => event.type)).toEqual(["turn.started", "input.accepted"])
     expect(fake.state.outbox.filter((entry) => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
     expect(fake.state.turns).toHaveLength(1)
+  })
+
+  it("keeps the objective intent on the immutable Turn input when steering", async () => {
+    const fake = makeDb({ sessionStatus: "running" })
+    const started = await new ObjectiveStartCommandService(fake.db).start(objectiveStartCommand("objective_steer_start"))
+    const originalInput = structuredClone(fake.state.active?.input)
+
+    const result = await new AgentCommandService(fake.db).steer({
+      ...startCommand("objective_steer"),
+      expectedTurnId: started.turnId,
+      expectedRevision: 0,
+    })
+
+    expect(result).toMatchObject({ disposition: "steered", turnId: started.turnId })
+    expect(fake.state.active?.input).toEqual(originalInput)
+    expect(fake.state.active?.input).toMatchObject({ intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT })
   })
 
   it("replays the original fresh root before checking later Session state or active Turns", async () => {
@@ -769,6 +787,7 @@ describe("AgentCommandService", () => {
       input: {
         goal: "Find senior backend roles in Dublin",
         content: [{ type: "text", text: "Find senior backend roles in Dublin" }],
+        intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
       },
     })
     expect(fake.state.inputs.find((input) => input.clientMessageId === "client_replace")).toMatchObject({
@@ -1113,6 +1132,48 @@ describe("AgentCommandService", () => {
     await new AgentCommandService(fake.db).retry(retryCommand("retry_discovery"))
 
     expect(fake.state.active?.input).toMatchObject({ goal: "Retry discovery", content, intent })
+  })
+
+  it("preserves objective intent and verification requirements on the retry successor", async () => {
+    const verificationRequirements = {
+      schemaVersion: "agent-harness.v2.objective-requirements.v1",
+      requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }],
+    } as const
+    const input = {
+      goal: "Plan and execute the objective",
+      content: [...content],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      verificationRequirements,
+    }
+    const fake = makeDb({ retryTarget: retryTarget("failed", input) })
+
+    await new AgentCommandService(fake.db).retry(retryCommand("retry_objective"))
+
+    expect(fake.state.active?.input).toMatchObject({
+      goal: "Plan and execute the objective",
+      content,
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      verificationRequirements,
+    })
+  })
+
+  it("preserves the explicit null verification-requirements sentinel on the retry successor", async () => {
+    const input = {
+      goal: "Retry a rejected objective",
+      content: [...content],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      verificationRequirements: null,
+    }
+    const fake = makeDb({ retryTarget: retryTarget("failed", input) })
+
+    await new AgentCommandService(fake.db).retry(retryCommand("retry_objective_rejected"))
+
+    expect(fake.state.active?.input).toMatchObject({
+      goal: "Retry a rejected objective",
+      content,
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      verificationRequirements: null,
+    })
   })
 
   it("returns the original result for a duplicate retry without new durable facts", async () => {
