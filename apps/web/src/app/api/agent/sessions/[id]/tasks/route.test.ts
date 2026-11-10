@@ -450,9 +450,21 @@ describe("agent task query API", () => {
     expect(JSON.stringify(body)).not.toContain("NEW_ROOT_SECRET")
   })
 
-  it("rejects more than nine task IDs and does not query task rows", async () => {
+  it("accepts twelve task IDs for a Root and eleven-node persisted graph", async () => {
     const { GET } = await import("./route")
-    const ids = Array.from({ length: 10 }, (_, index) => `task_${index}`).map(id => `taskId=${id}`).join("&")
+    const ids = Array.from({ length: 12 }, (_, index) => `task_${index}`).map(id => `taskId=${id}`).join("&")
+    const response = await GET(request(`?${ids}`) as never, params)
+
+    expect(response.status).toBe(200)
+    expect(mocks.taskFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { sessionId: "session_1", id: { in: Array.from({ length: 12 }, (_, index) => `task_${index}`) } },
+      take: 12,
+    }))
+  })
+
+  it("rejects more than twelve task IDs and does not query task rows", async () => {
+    const { GET } = await import("./route")
+    const ids = Array.from({ length: 13 }, (_, index) => `task_${index}`).map(id => `taskId=${id}`).join("&")
     const response = await GET(request(`?${ids}`) as never, params)
 
     expect(response.status).toBe(400)

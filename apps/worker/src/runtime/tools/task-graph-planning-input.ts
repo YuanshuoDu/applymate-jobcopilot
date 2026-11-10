@@ -120,7 +120,14 @@ export function buildTaskGraphProposalInputSchema<T extends TSchema>(
   const nodeSchemas: TSchema[] = templates ? templates.map(([templateId, template]) => {
     const role = taskGraphVerificationRole(templateId)
     if (role && template.role !== role) throw new Error("task_graph_verification_template_role_mismatch")
-    return proposalNodeSchema(Type.Literal(templateId), role)
+    const schema = proposalNodeSchema(Type.Literal(templateId), role)
+    if (templateId === "scheduled.application.execute") {
+      const objectSchema = schema as ReturnType<typeof Type.Object> & { required?: string[] }
+      const properties = objectSchema.properties as Record<string, TSchema>
+      properties.packageRefs = Type.Array(Type.String({ minLength: 1, maxLength: 256 }), { maxItems: TASK_GRAPH_LIMITS.maxScheduledPackageRefs, uniqueItems: true })
+      objectSchema.required = [...(objectSchema.required ?? []), "packageRefs"]
+    }
+    return schema
   }) : [proposalNodeSchema(templateIdSchema, undefined, true)]
   const nodeSchema = nodeSchemas.length === 1 ? nodeSchemas[0]! : Type.Union(nodeSchemas as [TSchema, ...TSchema[]])
   return Type.Object({
@@ -152,6 +159,7 @@ export function normalizeTaskGraphPlanningNodes(nodes: readonly TaskGraphModelNo
     normalized.push({
       key: node.key, templateId: node.templateId, goal: node.goal,
       successCriteria: [...node.successCriteria], dependsOn: [...node.dependsOn],
+      ...(node.templateId === "scheduled.application.execute" && node.packageRefs ? { packageRefs: [...node.packageRefs] } : {}),
       ...(node.verification ? { verification: node.verification } : {}),
       ...(repairOf ? { repairOf: { ...repairOf, graphRootTaskId: rootTaskId, criterionIds: [...repairOf.criterionIds] } } : {}),
     })

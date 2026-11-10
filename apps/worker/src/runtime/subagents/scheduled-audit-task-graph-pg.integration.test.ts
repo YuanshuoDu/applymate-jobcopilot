@@ -30,6 +30,7 @@ import { createScheduledGatePrepareFixture } from "./scheduled-gate-prepare-pg-r
 import { scheduledGateRootActions } from "./scheduled-gate-prepare-pg-resume.fixture.js"
 import { parseScheduledAuditReport, SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, SCHEDULED_AUDIT_TASK_TYPE,
   SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
+import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK } from "./scheduled-post-gate-contract.js"
 import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGraphProposalKey,
@@ -213,9 +214,10 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     vi.doUnmock(scheduledTaskGraphAuditPrepareSourcePath)
     vi.doUnmock(scheduledWebDbPath)
     vi.resetModules()
+    await cleanupFixtureUsers()
   })
   afterAll(async () => {
-    if (pool && fixtureUsers.length) await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [fixtureUsers])
+    await cleanupFixtureUsers()
     if (disconnectWebDatabase) await disconnectWebDatabase().catch(() => undefined)
     await pool?.end()
     restoreEnv("DATABASE_URL", priorDatabaseUrl)
@@ -224,9 +226,13 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
   })
 
   it.each([
-    { label: "legacy V1", jobCount: 1, scoutCount: 1, selectedJobCount: 1 },
-    { label: "four-Scout V2", jobCount: 4, scoutCount: 4, selectedJobCount: 2 },
-  ])("replays one Audit child across a Worker restart for $label and releases root only with its private current-attempt proof", async options => {
+    { label: "legacy V1", jobCount: 1, scoutCount: 1, selectedJobCount: 1,
+      freshV2Replan: false, persistedLegacyAudit: false },
+    { label: "fresh four-Scout V2", jobCount: 4, scoutCount: 4, selectedJobCount: 2,
+      freshV2Replan: true, persistedLegacyAudit: false },
+    { label: "four-Scout V2 with persisted legacy Audit", jobCount: 4, scoutCount: 4, selectedJobCount: 2,
+      freshV2Replan: false, persistedLegacyAudit: true },
+  ])("preserves the scheduled Root behavior for $label", async options => {
     const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, options)
     fixtureUsers.push(fixture.ids.userId)
     if (options.scoutCount === 1) {
@@ -311,6 +317,36 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const rootStore = createPgRootTaskStore(pool as never)
     const sessionProjection = createCanonicalSessionProjection(pool as never)
     const projectionIdentity = { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId }
+    if (options.freshV2Replan) {
+      let rootModelStreamCalls = 0
+      const freshRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort,
+        undefined, undefined, undefined, fixture.turnLease, () => { rootModelStreamCalls += 1 })
+      expect(freshRoot.status).not.toBe("completed")
+      expect(rootModelStreamCalls).toBe(1)
+      const replanEvents = await pool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
+        WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId"=$3 AND "type"='final.rejected'
+          AND "payload"->>'code'='scheduled_post_gate_plan_required'`,
+      [fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId])
+      expect(replanEvents.rows).toHaveLength(1)
+      expect(debugRecord(replanEvents.rows[0]?.payload)).toEqual({ code: "scheduled_post_gate_plan_required",
+        blocker: "scheduled_post_gate_plan_required", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK,
+        taskId: fixture.ids.rootTaskId })
+      const graphAfterReplan = await loadTaskGraph(pool as never, fixture.graphScope, false)
+      expect(graphAfterReplan.state?.revision).toBe(gateProof.graphRevision)
+      expect(graphAfterReplan.snapshot?.nodes).toHaveLength(options.scoutCount + 3)
+      expect(graphAfterReplan.snapshot?.nodes.some(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID
+        || node.templateId === "scheduled.application.execute")).toBe(false)
+      expect((await graphCount(fixture)).auditNodes).toBe(0)
+      expect(response.gateCalls()).toBe(1)
+      return
+    }
+    if (options.persistedLegacyAudit) {
+      await stopRunner()
+      await expect(command.appendScheduledAudit!({ scope: { ...scopeBase, stepId: sourceStepId },
+        executionOwner: fixture.executionOwner, handoff: fixture.handoff, attestation: fixture.attestation,
+        gateProof, scheduledWaitId: fixture.prepareChoiceWaitId })).resolves.toMatchObject({ status: "accepted",
+        auditTaskId: expect.any(String), expectedAttemptCount: 1 })
+    }
     const auditReplayCaptures: Array<{ mode: "append_audit" | "resume_audit"; recoveryStepId: string; receipt: unknown }> = []
     const captureAuditAppendReplay = async (recoveryStepId: string, mode: "append_audit" | "resume_audit"): Promise<void> => {
       const receipt = await command.appendScheduledAudit!({ scope: { ...scopeBase, stepId: recoveryStepId },
@@ -341,7 +377,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(pendingRootState.rootResult).toMatchObject({ status: "waiting_for_dependency", waitId: auditWait.waitId })
     const auditTaskId = await findTaskId(SCHEDULED_AUDIT_TASK_TYPE, fixture.ids.rootTaskId)
     expect(auditReplayCaptures).toHaveLength(1)
-    expect(auditReplayCaptures[0]).toMatchObject({ mode: "append_audit", recoveryStepId: pendingTrace.steps[0]?.id,
+    expect(auditReplayCaptures[0]).toMatchObject({ mode: options.persistedLegacyAudit ? "resume_audit" : "append_audit",
+      recoveryStepId: pendingTrace.steps[0]?.id,
       receipt: { status: "duplicate", auditTaskId, expectedAttemptCount: 1 } })
     expect(await graphCount(fixture)).toEqual({ totalNodes: options.scoutCount + 4, scoutNodes: options.scoutCount, analystNodes: 1,
       prepareNodes: 1, gateNodes: 1, auditNodes: 1, analystDependsOnAllScouts: true, suffixIsChained: true })
@@ -350,6 +387,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     [fixture.ids.sessionId, `subagent-dispatch:${auditTaskId}`])
     expect(auditDispatchOutbox.rows).toHaveLength(1)
 
+    if (options.persistedLegacyAudit) runner = startRunner(fixture, response.fetcher)
     const firstTaskOutcome = await dispatchAndWait(runner, auditTaskId, fixture.ids.sessionId)
     if (debugRecord(firstTaskOutcome)?.status !== "retrying") {
       const failedTask = await taskState(auditTaskId)
@@ -499,6 +537,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const turnJobs: TurnJobPayload[] = []
     expect(await dispatchPendingTurnOutbox(pool as never, { add: async (_name, payload) => { turnJobs.push(payload) } })).toBe(1)
     expect(turnJobs).toHaveLength(1)
+    expect(turnJobs.map(job => job.turnId)).toEqual([fixture.ids.turnId])
     let terminalRoot: TurnEngineResult | undefined
     let resumedLease: TurnLease | undefined
     const resumedJob = await runTurnJob({ data: turnJobs[0]!, attemptsMade: 0 }, { pool: pool as never,
@@ -571,7 +610,7 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
   expectedStatus?: "waiting_for_dependency",
   afterAuditWait?: (recoveryStepId: string, mode: "append_audit" | "resume_audit") => Promise<void>,
   afterAuditCompletion?: (recoveryStepId: string, mode: "append_audit" | "resume_audit") => Promise<void>,
-  activeLease: TurnLease = fixture.turnLease): Promise<TurnEngineResult> {
+  activeLease: TurnLease = fixture.turnLease, onModelStream?: () => void): Promise<TurnEngineResult> {
   const phases: Array<{ phase: string; outcome?: string; errorClass?: string; errorCode?: string }> = []
   const safeStatuses = new Set(["ready", "blocked", "not_registered", "completed", "waiting_for_dependency", "waiting_for_choice",
     "waiting_for_external_user", "waiting_for_user", "invalid", "failed", "interrupted"])
@@ -677,7 +716,7 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
       supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null,
       maxOutputTokens: 128, costClass: "low" }
     const model: ModelAdapter = { id: "scheduled-audit-root", profile,
-      async *stream() { throw new Error("scheduled Audit root candidate replay unexpectedly called the model") } }
+      async *stream() { onModelStream?.(); throw new Error("scheduled Audit root candidate replay unexpectedly called the model") } }
     const options: TurnEngineOptions = { lease, rootTaskId: fixture.ids.rootTaskId, taskId: fixture.ids.rootTaskId,
       scope: { userId: fixture.ids.userId }, goal: "Complete the verified scheduled automation",
       snapshot: { system: [], profile: [], steerHistory: [], toolObservations: [],
@@ -2579,6 +2618,16 @@ async function graphCount(fixture: Fixture): Promise<{ totalNodes: number; scout
     suffixIsChained: Boolean(prepare && gate && audit && prepare.dependsOn.length === 1 && prepare.dependsOn[0] === analyst?.key
       && gate.dependsOn.length === 1 && gate.dependsOn[0] === prepare.key && audit.dependsOn.length === 1 && audit.dependsOn[0] === gate.key) }
 }
+async function cleanupFixtureUsers(): Promise<void> {
+  if (!pool || fixtureUsers.length === 0) return
+  const users = [...fixtureUsers]
+  const sessions = await pool.query<{ id: string }>(`SELECT "id" FROM "agent_sessions" WHERE "userId" = ANY($1::text[])`, [users])
+  const sessionIds = sessions.rows.map(row => row.id)
+  if (sessionIds.length > 0) await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`, [sessionIds])
+  await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [users])
+  fixtureUsers.splice(0, users.length)
+}
+
 function restoreEnv(name: string, value: string | undefined): void { if (value === undefined) delete process.env[name]; else process.env[name] = value }
 function dedicatedDisposableUrl(): string | null {
   const required = process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true"

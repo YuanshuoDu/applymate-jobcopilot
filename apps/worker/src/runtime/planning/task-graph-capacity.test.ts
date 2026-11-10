@@ -31,8 +31,16 @@ describe("TaskGraph first-repair capacity", () => {
     })
   })
 
+  it("does not expose generic capacity for persisted graphs above the eight-node limit", () => {
+    expect(TASK_GRAPH_LIMITS.maxNodes).toBe(8)
+    expect(TASK_GRAPH_LIMITS.maxPersistedNodes).toBe(11)
+    for (const nodeCount of [9, TASK_GRAPH_LIMITS.maxPersistedNodes]) {
+      expect(taskGraphNodeCapacity({ nodeCount, hasTypedVerification: true, repairRecorded: false })).toBeUndefined()
+    }
+  })
+
   it("fails closed for malformed facts", () => {
-    for (const value of [undefined, null, [], { nodeCount: 9, hasTypedVerification: true, repairRecorded: false },
+    for (const value of [undefined, null, [], { nodeCount: TASK_GRAPH_LIMITS.maxPersistedNodes + 1, hasTypedVerification: true, repairRecorded: false },
       { nodeCount: 1, hasTypedVerification: false, repairRecorded: true },
       { nodeCount: 1, hasTypedVerification: true, repairRecorded: false, extra: true }]) {
       expect(taskGraphNodeCapacity(value)).toBeUndefined()

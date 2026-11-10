@@ -3,6 +3,8 @@ import {
   parseScheduledAuditRegistrationReceipt,
   parseScheduledAuditReport,
   parseScheduledAuditTaskEnvelope,
+  scheduledAuditProposal,
+  SCHEDULED_AUDIT_TEMPLATE_ID,
   SCHEDULED_AUDIT_REGISTRATION_RECEIPT_SCHEMA,
   type ScheduledAuditReport,
 } from "./scheduled-audit-contract.js"
@@ -23,6 +25,10 @@ const registration = {
 }
 
 describe("scheduled Audit fixed contract", () => {
+  it("keeps the legacy Audit proposal fixed to its Gate dependency", () => {
+    expect(scheduledAuditProposal(12).nodes[0]).toMatchObject({ key: SCHEDULED_AUDIT_TEMPLATE_ID, dependsOn: ["gate"] })
+  })
+
   it("accepts only the exact seven non-negative safe-integer report fields", () => {
     expect(parseScheduledAuditReport(report)).toEqual(report)
     for (const bad of [

@@ -22,6 +22,7 @@ import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment
 import type { TurnEngineQueryClient } from "./turn-engine-owner-sql.js"
 import { TURN_SCHEDULED_GATE_CHOICE_MAX_QUESTION_BYTES, parseTurnQuestionGateChoiceBinding,
   turnScheduledGateChoiceWaitId, type TurnQuestionGateChoiceBinding, type TurnQuestionGateChoiceKind } from "./turn-question-gate-choice-contract.js"
+import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK } from "../subagents/scheduled-post-gate-contract.js"
 
 export const NATIVE_SEMANTIC_NO_PROGRESS: unique symbol = Symbol("native-semantic-no-progress")
 export const NATIVE_SEMANTIC_REJECTION: unique symbol = Symbol("native-semantic-rejection")
@@ -34,6 +35,7 @@ export const SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME: unique symbol = Symbol("s
 export type ScheduledPipelineCompletionDisposition =
   | Readonly<{ status: "completed"; candidateText: string }>
   | Readonly<{ status: "waiting_for_dependency"; waitId: string; candidateText: string }>
+  | Readonly<{ status: "replan"; candidateText: string; feedback: typeof SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK }>
   /** Worker-owned deterministic Prepare choice wait. */
   | Readonly<{ status: "waiting_for_user"; waitId: string; candidateText: string }>
   /** Private, fixed Gate question persisted through the existing Turn question store. */
@@ -44,6 +46,7 @@ export type ScheduledPipelineCompletionDisposition =
 
 export type ScheduledPipelineExistingAuditResumeDisposition = Readonly<{ status: "not_applicable" }>
   | Readonly<{ status: "waiting_for_dependency"; waitId: string }> | Readonly<{ status: "completed" }>
+  | Readonly<{ status: "replan"; feedback: typeof SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK }>
 
 export function parseScheduledPipelineExistingAuditResumeDisposition(value: unknown): ScheduledPipelineExistingAuditResumeDisposition | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
@@ -55,6 +58,8 @@ export function parseScheduledPipelineExistingAuditResumeDisposition(value: unkn
       return typeof key !== "string" || !descriptor?.enumerable || !("value" in descriptor)
     })) return null
     if (keys.length === 1 && keys[0] === "status" && (record.status === "not_applicable" || record.status === "completed")) return { status: record.status }
+    if (record.status === "replan" && keys.length === 2 && keys.includes("status") && keys.includes("feedback")
+      && record.feedback === SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK) return { status: "replan", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK }
     if (record.status === "waiting_for_dependency" && keys.length === 2 && keys.includes("status") && keys.includes("waitId")
       && typeof record.waitId === "string" && record.waitId.trim() === record.waitId && record.waitId.length > 0 && record.waitId.length <= 128) return { status: "waiting_for_dependency", waitId: record.waitId }
     return null
@@ -75,6 +80,11 @@ export function parseScheduledPipelineCompletionDisposition(value: unknown): Sch
     if (record.status === "completed" && keys.length === 2 && keys.includes("status") && keys.includes("candidateText")
       && typeof record.candidateText === "string" && record.candidateText.trim().length > 0) {
       return { status: "completed", candidateText: record.candidateText }
+    }
+    if (record.status === "replan" && keys.length === 3 && keys.includes("status") && keys.includes("candidateText") && keys.includes("feedback")
+      && typeof record.candidateText === "string" && record.candidateText.trim().length > 0
+      && record.feedback === SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK) {
+      return { status: "replan", candidateText: record.candidateText, feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK }
     }
     if (record.status === "waiting_for_dependency" && keys.length === 3 && keys.includes("status") && keys.includes("candidateText") && keys.includes("waitId")
       && typeof record.candidateText === "string" && record.candidateText.trim().length > 0

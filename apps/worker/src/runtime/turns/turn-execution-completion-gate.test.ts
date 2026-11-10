@@ -16,6 +16,7 @@ import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA } from "./task-graph-terminal-asses
 import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "./turn-question-gate-choice-contract.js"
+import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK } from "../subagents/scheduled-post-gate-contract.js"
 
 type GateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate">
 type GateWriter = Pick<TurnExecutionEventWriter, "append">
@@ -44,6 +45,33 @@ function gateWriter(): GateWriter {
 }
 
 describe("assertCompletionAllowed", () => {
+  it("keeps the same Root Turn active for the server-owned post-Gate plan replan", async () => {
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = async input => ({ status: "replan", candidateText: input.candidateText,
+      feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK })
+    const writer = gateWriter()
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
+      .resolves.toEqual({ feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK })
+    expect(writer.append).toHaveBeenCalledWith("final.rejected", step.id, null, expect.objectContaining({
+      code: "scheduled_post_gate_plan_required", blocker: "scheduled_post_gate_plan_required",
+      feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK, taskId: identity.taskId,
+    }), `final-rejected:${step.id}:scheduled-post-gate-plan-required`)
+  })
+
+  it("routes restart recovery through the post-Gate replan feedback path", async () => {
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: false, blocker: "child_tasks_pending", feedback: "children pending" })
+    completionGate[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME] = async () => ({ status: "replan",
+      feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK })
+    const writer = gateWriter()
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
+      .resolves.toEqual({ feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK })
+    expect(writer.append).toHaveBeenCalledWith("final.rejected", step.id, null, expect.objectContaining({
+      code: "scheduled_post_gate_plan_required", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK,
+    }), `final-rejected:${step.id}:scheduled-post-gate-plan-required`)
+  })
+
   it("passes the private scheduled Gate question to the existing final-candidate wait seam", async () => {
     const binding = { schemaVersion: TURN_SCHEDULED_GATE_CHOICE_SCHEMA,
       owner: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 1,

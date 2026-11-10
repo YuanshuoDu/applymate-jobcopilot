@@ -1,7 +1,6 @@
 import type pg from "pg"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
-
 import { createWorkerUsageAuthorizer } from "../../queue/ai-usage-bridge.js"
 import type { SubagentExecutor } from "../../queue/subagent-queue.js"
 import { createWorkerToolRuntime } from "../tools/index.js"
@@ -33,9 +32,9 @@ import { createPrivateSelectedJobToolExecutor, registerProductionChildWaitTool }
 import { createScheduledGateChildExecutor, isScheduledGateTask } from "./scheduled-gate-child-runtime.js"
 import { SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { createScheduledAuditChildExecutor, isScheduledAuditCandidate } from "./scheduled-audit-child-runtime.js"
+import { createScheduledPostGateChildExecutor, isScheduledPostGateCandidate } from "./scheduled-post-gate-child-runtime.js"
 import { createEmptyAnalystCandidateAuthorizer } from "./task-graph-empty-analyst-candidate.js"
 export { createProductionChildPolicy } from "./production-child-policy.js"
-
 export type ProductionChildRuntimeOptions = {
   readonly pool: pg.Pool
   readonly authorizeUsage?: ChildExecutorOptions["authorizeUsage"]
@@ -197,8 +196,9 @@ function defaultMailboxReader(pool: pg.Pool): ChildExecutorOptions["mailboxReade
 }
 /** Build the production child seam only when the explicit feature flag is on. */
 export function createProductionChildExecutor(options: ProductionChildRuntimeOptions): SubagentExecutor {
-  let genericExecutor: SubagentExecutor | undefined, gateExecutor: SubagentExecutor | undefined
+  let genericExecutor: SubagentExecutor | undefined, gateExecutor: SubagentExecutor | undefined, postGateExecutor: SubagentExecutor | undefined
   return async ({ lease, continuation }) => {
+    if (isScheduledPostGateCandidate(lease)) { postGateExecutor ??= createScheduledPostGateChildExecutor({ pool: options.pool }); return postGateExecutor({ lease, ...(continuation ? { continuation } : {}) }) }
     if (isScheduledAuditCandidate(lease)) return createScheduledAuditChildExecutor({ pool: options.pool })({ lease, ...(continuation ? { continuation } : {}) })
     if (lease.taskType === SCHEDULED_GATE_TASK_TYPE) {
       if (!isScheduledGateTask(lease)) return { status: "failed", failureReason: "scheduled_gate_role_task_type_mismatch", retryDisposition: "terminal" }

@@ -1,4 +1,5 @@
 import { reduceTaskGraphFinalSummary, type TaskGraphFinalSummary } from "./task-graph-final-summary.js"
+import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import type { LoadedGraph } from "./task-graph-pg-state.js"
 import type { SubagentTaskStatus } from "./types.js"
 
@@ -31,7 +32,7 @@ export function buildTaskGraphFinalSummaryBinding(loaded: LoadedGraph): TaskGrap
     return null
   }
   if (!loaded.snapshot || !loaded.state || !nonEmpty(loaded.rootTaskId) || !nonEmpty(loaded.item.id)
-    || !Array.isArray(loaded.snapshot.nodes) || loaded.snapshot.nodes.length > 8 || loaded.item.revision !== loaded.state.revision
+    || !Array.isArray(loaded.snapshot.nodes) || loaded.snapshot.nodes.length > TASK_GRAPH_LIMITS.maxPersistedNodes || loaded.item.revision !== loaded.state.revision
     || !Number.isSafeInteger(loaded.item.revision) || loaded.item.revision < 1) {
     throw new Error("task_graph_final_summary_graph_invalid")
   }

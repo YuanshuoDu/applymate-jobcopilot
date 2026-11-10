@@ -10,6 +10,13 @@ function graph(count: number, stage: ScheduledPipelineGraphStage): ScheduledPipe
   if (stage === "audit") nodes.push(node("scheduled_audit", "scheduled_audit", 5, ["gate"]))
   return nodes
 }
+function graphWithExecutes(count: number, executeCount: number): ScheduledPipelineGraphNode[] {
+  const prefix = graph(count, "gate")
+  const executes = Array.from({ length: executeCount }, (_, index) => ({
+    ...node(`execute-${index + 1}`, "scheduled.application.execute", 5, ["gate"]), packageRefs: [`job-${index + 1}`],
+  }))
+  return [...prefix, ...executes, node("scheduled.post_gate_audit", "scheduled.post_gate_audit", 6, executes.map(item => item.key))]
+}
 function node(key: string, templateId: string, depth: number, dependsOn: string[]): ScheduledPipelineGraphNode {
   return { key, templateId, depth, dependsOn }
 }
@@ -37,6 +44,16 @@ describe("projectScheduledPipelineGraph", () => {
     expect(scheduledPipelineV2ScoutMembershipMatches([], [])).toBe(false)
     expect(scheduledPipelineV2ScoutMembershipMatches(["scout-z"], projection!.scouts.slice(0, 1))).toBe(false)
   })
+  it("projects one to three post-Gate Execute nodes and an Audit bound to every Execute", () => {
+    for (const executeCount of [1, 2, 3]) {
+      const nodes = graphWithExecutes(4, executeCount)
+      const projection = projectScheduledPipelineGraph(nodes, "v2", "audit")
+      expect(projection?.stage).toBe("audit")
+      expect(projection?.executes).toHaveLength(executeCount)
+      expect(projectScheduledPipelineGraphAtCurrentStage(nodes)).toMatchObject({ version: "v2", projection: { stage: "audit" } })
+      expect(nodes).toHaveLength(7 + executeCount + 1)
+    }
+  })
   it.each([
     [1, "v2"], [5, "v2"], [2, "v1"], [4, "v1"],
   ] as const)("rejects Scout count %i in %s", (count, version) => {
@@ -50,6 +67,24 @@ describe("projectScheduledPipelineGraph", () => {
     expect(projectScheduledPipelineGraph(wrongDepth, "v2", "prepare")).toBeNull()
     const wrongPrefix = graph(2, "analyze"); wrongPrefix[0] = node("other", "analyst", 1, [])
     expect(projectScheduledPipelineGraph(wrongPrefix, "v2", "analyze")).toBeNull()
+  })
+  it("rejects malformed post-Gate Execute dependencies and an unbounded suffix", () => {
+    expect(projectScheduledPipelineGraph(graphWithExecutes(1, 1), "v1", "audit")).toBeNull()
+    const wrongAudit = graphWithExecutes(2, 2)
+    wrongAudit[wrongAudit.length - 1] = node("scheduled.post_gate_audit", "scheduled.post_gate_audit", 6, ["execute-1"])
+    expect(projectScheduledPipelineGraph(wrongAudit, "v2", "audit")).toBeNull()
+    const wrongExecute = graphWithExecutes(2, 1)
+    wrongExecute[wrongExecute.length - 2] = node("execute-1", "execute", 5, ["analyst"])
+    expect(projectScheduledPipelineGraph(wrongExecute, "v2", "audit")).toBeNull()
+    expect(projectScheduledPipelineGraph(graphWithExecutes(2, 4), "v2", "audit")).toBeNull()
+    const missingPackageRefs = graphWithExecutes(2, 1)
+    missingPackageRefs[missingPackageRefs.length - 2] = node("execute-1", "scheduled.application.execute", 5, ["gate"])
+    expect(projectScheduledPipelineGraph(missingPackageRefs, "v2", "audit")).toBeNull()
+    const duplicatePackageRefs = graphWithExecutes(2, 2)
+    duplicatePackageRefs[duplicatePackageRefs.length - 2] = {
+      ...duplicatePackageRefs[duplicatePackageRefs.length - 2]!, packageRefs: ["job-1"],
+    }
+    expect(projectScheduledPipelineGraph(duplicatePackageRefs, "v2", "audit")).toBeNull()
   })
   it.each([[1, "v1"], [2, "v2"], [4, "v2"]] as const)("infers every complete %s pipeline stage", (count, version) => {
     for (const stage of ["analyze", "prepare", "gate", "audit"] as const) {

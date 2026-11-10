@@ -92,6 +92,63 @@ describe('versioned Plan Ledger contract', () => {
     expect(parseTaskGraphSnapshot({ ...graph, schemaVersion: 'future' })).toBeNull()
   })
 
+  it('projects an eleven-node persisted graph with at most twelve task rows', () => {
+    const nodes = Array.from({ length: 11 }, (_, index) => ({
+      key: `execute-${index}`, templateId: 'scheduled_execute', goal: `Prepare package group ${index}`,
+      successCriteria: ['Preserve verified references'],
+      dependsOn: index === 10 ? Array.from({ length: 8 }, (_, dependency) => `execute-${dependency}`) : [],
+      depth: 2, taskId: `post-gate-task-${index}`,
+    }))
+    const postGateGraph = { schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes }
+    const taskRows = [
+      { id: rootTaskId, sessionId, status: 'running', goal: 'Complete verified work' },
+      ...nodes.map(node => ({ id: node.taskId, sessionId, status: 'queued', goal: node.goal })),
+    ]
+    const ledger = projectPlanLedger({ sessionId, revision: 5, rootTaskId, graph: postGateGraph, tasks: taskRows })
+
+    expect(parseTaskGraphSnapshot(postGateGraph)?.nodes).toHaveLength(11)
+    expect(ledger?.nodes).toHaveLength(11)
+    expect(ledger?.nodes[10]?.dependencies).toHaveLength(8)
+    expect(parsePlanLedger(ledger)?.nodes).toHaveLength(11)
+
+    const overflowNode = { ...nodes[0]!, key: 'execute-overflow', taskId: 'post-gate-task-overflow' }
+    expect(parseTaskGraphSnapshot({ ...postGateGraph, nodes: [...nodes, overflowNode] })).toBeNull()
+    expect(projectPlanLedger({ sessionId, revision: 5, rootTaskId, graph: postGateGraph, tasks: [...taskRows, taskRows[0]!] })).toBeNull()
+    expect(parsePlanLedger({ ...ledger!, nodes: [...ledger!.nodes, { ...ledger!.nodes[0]!, key: 'overflow', dependencies: [] }] })).toBeNull()
+
+    const nineDependencies = nodes.map((node, index) => index === 10
+      ? { ...node, dependsOn: Array.from({ length: 9 }, (_, dependency) => `execute-${dependency}`) } : node)
+    expect(parseTaskGraphSnapshot({ ...postGateGraph, nodes: nineDependencies })).toBeNull()
+    const ledgerWithNineDependencies = { ...ledger!, nodes: ledger!.nodes.map((node, index) => index === 10
+      ? { ...node, dependencies: nodes.slice(0, 9).map(dependency => ({ key: dependency.key, label: dependency.goal, status: 'queued' as const })) }
+      : node) }
+    expect(parsePlanLedger(ledgerWithNineDependencies)).toBeNull()
+  })
+
+  it('accepts the post-Gate Execute package field but keeps it out of public ledger output', () => {
+    const scouts = [
+      { key: 'scout-1', templateId: 'scout', goal: 'Find evidence one', successCriteria: ['Save evidence'], dependsOn: [], depth: 1, taskId: 'task-scout-1' },
+      { key: 'scout-2', templateId: 'scout', goal: 'Find evidence two', successCriteria: ['Save evidence'], dependsOn: [], depth: 1, taskId: 'task-scout-2' },
+    ]
+    const nodes = [...scouts,
+      { key: 'analyst', templateId: 'analyst', goal: 'Review evidence', successCriteria: ['Review findings'], dependsOn: ['scout-1', 'scout-2'], depth: 2, taskId: 'task-analyst' },
+      { key: 'prepare', templateId: 'prepare', goal: 'Prepare approved jobs', successCriteria: ['Prepare jobs'], dependsOn: ['analyst'], depth: 3, taskId: 'task-prepare', verificationDisposition: 'specialized' },
+      { key: 'gate', templateId: 'gate', goal: 'Apply Gate decisions', successCriteria: ['Return strict decisions'], dependsOn: ['prepare'], depth: 4, taskId: 'task-gate', verificationDisposition: 'specialized' },
+      { key: 'execute-1', templateId: 'scheduled.application.execute', goal: 'Execute approved jobs', successCriteria: ['Return bounded results'],
+        dependsOn: ['gate'], depth: 5, taskId: 'task-execute-1', verificationDisposition: 'specialized', packageRefs: ['private-job-77'] },
+      { key: 'scheduled.post_gate_audit', templateId: 'scheduled.post_gate_audit', goal: 'Return the audit report', successCriteria: ['Report every result'],
+        dependsOn: ['execute-1'], depth: 6, taskId: 'task-audit', verificationDisposition: 'specialized' },
+    ]
+    const graph = { schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes }
+    const parsed = parseTaskGraphSnapshot(graph)
+    const ledger = projectPlanLedger({ sessionId, revision: 6, rootTaskId, graph, tasks: [rows[0]] })
+
+    expect(parsed?.nodes).toHaveLength(7)
+    expect(JSON.stringify(parsed)).not.toContain('private-job-77')
+    expect(ledger?.nodes).toHaveLength(7)
+    expect(JSON.stringify(ledger)).not.toContain('private-job-77')
+  })
+
   it('enforces the canonical UTF-8 cap after parsing JSON transport', () => {
     const atLimit = snapshotAtUtf8ByteLimit()
     const encoded = JSON.stringify(atLimit)

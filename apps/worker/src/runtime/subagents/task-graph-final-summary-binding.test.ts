@@ -70,6 +70,15 @@ describe("current TaskGraph final-summary binding", () => {
       .toThrow("task_graph_final_summary_graph_invalid")
   })
 
+  it("binds an eleven-node persisted graph and rejects a twelfth node", () => {
+    const taskIds = Array.from({ length: 11 }, (_, index) => `scheduled-task-${index}`)
+    const rows = taskIds.map(taskId => row(taskId, "executor", "scheduled_execute", null))
+    expect(buildTaskGraphFinalSummaryBinding(graph(9, taskIds, rows))?.members).toHaveLength(11)
+    expect(() => buildTaskGraphFinalSummaryBinding(graph(9, [...taskIds, "scheduled-overflow"], [
+      ...rows, row("scheduled-overflow", "executor", "scheduled_execute", null),
+    ]))).toThrow("task_graph_final_summary_graph_invalid")
+  })
+
   it("preserves the reducer's specific error for duplicate current task identities", () => {
     const duplicate = graph(3, ["scout", "scout"], [row("scout", "scout", "research", {})])
     expect(() => buildTaskGraphFinalSummaryBinding(duplicate))

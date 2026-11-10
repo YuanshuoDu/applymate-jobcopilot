@@ -2,6 +2,8 @@ import type { SubagentTaskStatus } from "../subagents/types.js"
 import type { TaskGraphNativeDelegationMetadata } from "../subagents/task-graph-native-state.js"
 import { taskGraphVerificationRole, validateTaskGraphVerificationContract, type TaskGraphVerificationContract } from "./task-graph-verification.js"
 import { isTaskGraphBlocking, isTaskGraphEventType, isTaskGraphTerminal, sameTaskGraphEvent, taskGraphEventAllowed, taskGraphNextStatus } from "./task-graph-transition-rules.js"
+import { createScheduledPostGateTaskGraphAppender, hasScheduledTaskGraphPackageRefsShape, parseScheduledTaskGraphPackageRefs,
+  parseTaskGraphProposalRepairOf, taskGraphProposalTextArray as textArray } from "./scheduled-post-gate-task-graph-append.js"
 export type TaskGraphNodeStatus = SubagentTaskStatus
 export type TaskGraphVerificationDisposition = "typed" | "legacy_unverified" | "specialized"
 export type TaskGraphRepairOf = Readonly<{ graphRootTaskId: string; nodeKey: string; taskId: string; criterionIds: string[] }>
@@ -9,17 +11,18 @@ export type TaskGraphNodeProposal = Readonly<{
   key: string; templateId: string; goal: string
   /** Explanatory instructions only; these strings are never treated as verification proof. */
   successCriteria: readonly string[]; dependsOn: readonly string[]
-  verification?: TaskGraphVerificationContract; repairOf?: TaskGraphRepairOf; nativeDelegation?: TaskGraphNativeDelegationMetadata
+  verification?: TaskGraphVerificationContract; repairOf?: TaskGraphRepairOf; nativeDelegation?: TaskGraphNativeDelegationMetadata; packageRefs?: readonly string[]
 }>
 export type TaskGraphProposal = Readonly<{ expectedRevision: number; nodes: readonly TaskGraphNodeProposal[] }>
 export type TaskGraphNode = TaskGraphNodeProposal & Readonly<{ depth: number; status: TaskGraphNodeStatus; taskId?: string; failureReason?: string; verificationDisposition?: TaskGraphVerificationDisposition }>
 export type TaskGraphState = Readonly<{ revision: number; nodes: readonly TaskGraphNode[]; appliedEvents: readonly TaskGraphEvent[]; repairSatisfiedNodeKeys?: readonly string[]; repairPendingNodeKeys?: readonly string[] }>
 export type TaskGraphValidationOptions = Readonly<{ registeredTemplateIds: ReadonlySet<string>; maxNodes: number; maxDepth: number }>
-/** Hard persisted-shape limits shared by model validation and snapshot parsing. */
+/** Generic proposal limits stay separate from the larger persisted scheduled graph limit. */
 export const TASK_GRAPH_LIMITS = {
   maxProposalBytes: 32_000,
   maxSnapshotBytes: 40_000,
   maxNodes: 8,
+  maxPersistedNodes: 11, maxScheduledPostGateAppendNodes: 4, maxScheduledPackageRefs: 50,
   maxDepth: 8,
   maxKeyLength: 128,
   maxTemplateIdLength: 128,
@@ -63,38 +66,28 @@ function text(value: unknown, maxLength = Number.MAX_SAFE_INTEGER): value is str
   return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength
 }
 function integer(value: unknown, minimum: number): value is number { return Number.isSafeInteger(value) && (value as number) >= minimum }
-function textArray(value: unknown, allowEmpty: boolean, maxItems: number, maxLength: number): value is string[] {
-  if (!Array.isArray(value) || value.length > maxItems || (!allowEmpty && value.length === 0)) return false
-  const keys = Reflect.ownKeys(value)
-  if (keys.length !== value.length + 1) return false
-  for (const key of keys) {
-    if (key === "length") continue
-    if (typeof key !== "string") return false
-    const index = Number(key)
-    if (!Number.isSafeInteger(index) || index < 0 || index >= value.length || String(index) !== key || !text(value[index], maxLength)) return false
-  }
-  return true
-}
-function parseRepairOf(value: unknown, index: number): TaskGraphRepairOf | TaskGraphFailure {
-  const path = `nodes[${index}].repairOf`
-  if (!plainRecord(value, "criterionIds,graphRootTaskId,nodeKey,taskId") || !text(value.graphRootTaskId, 128)
-    || !text(value.nodeKey, TASK_GRAPH_LIMITS.maxKeyLength) || !text(value.taskId, TASK_GRAPH_LIMITS.maxKeyLength)
-    || !textArray(value.criterionIds, false, TASK_GRAPH_LIMITS.maxSuccessCriteria, 64)
-    || new Set(value.criterionIds).size !== value.criterionIds.length) return fail("invalid_shape", path, "repairOf must name a root, prior node, task, and unique criteria")
-  return { graphRootTaskId: value.graphRootTaskId, nodeKey: value.nodeKey, taskId: value.taskId, criterionIds: [...value.criterionIds] }
-}
 function parseNode(value: unknown, index: number): TaskGraphNodeProposal | TaskGraphFailure {
   const path = `nodes[${index}]`
-  if (!plainRecord(value, NODE_KEYS) && !plainRecord(value, NODE_KEYS_WITH_VERIFICATION) && !plainRecord(value, NODE_KEYS_WITH_REPAIR)) return fail("invalid_shape", path, "Node must contain the exact TaskGraph fields and optional typed verification or repair relation")
-  if (!text(value.key, TASK_GRAPH_LIMITS.maxKeyLength) || !text(value.templateId, TASK_GRAPH_LIMITS.maxTemplateIdLength)
-    || !text(value.goal, TASK_GRAPH_LIMITS.maxGoalLength)) return fail("invalid_shape", path, "key, templateId, and goal must be non-empty and within their length limits")
-  if (!textArray(value.successCriteria, false, TASK_GRAPH_LIMITS.maxSuccessCriteria, TASK_GRAPH_LIMITS.maxCriterionLength)) return fail("invalid_shape", `${path}.successCriteria`, "Success criteria must contain one to eight non-empty strings of at most 320 characters")
-  if (!textArray(value.dependsOn, true, TASK_GRAPH_LIMITS.maxDependencies, TASK_GRAPH_LIMITS.maxKeyLength)) return fail("invalid_shape", `${path}.dependsOn`, "dependsOn must contain at most eight non-empty local keys of at most 128 characters")
-  if (new Set(value.dependsOn).size !== value.dependsOn.length) return fail("invalid_shape", `${path}.dependsOn`, "Dependencies must be unique")
+  if (!plainRecord(value, NODE_KEYS) && !plainRecord(value, NODE_KEYS_WITH_VERIFICATION) && !plainRecord(value, NODE_KEYS_WITH_REPAIR)
+    && !hasScheduledTaskGraphPackageRefsShape(value, plainRecord)) return fail("invalid_shape", path, "Node must contain the exact TaskGraph fields and optional typed verification, repair relation, or package references")
   const node = value as Record<string, unknown>
+  const key = node.key, templateId = node.templateId, goal = node.goal
+  if (!text(key, TASK_GRAPH_LIMITS.maxKeyLength) || !text(templateId, TASK_GRAPH_LIMITS.maxTemplateIdLength)
+    || !text(goal, TASK_GRAPH_LIMITS.maxGoalLength)) return fail("invalid_shape", path, "key, templateId, and goal must be non-empty and within their length limits")
+  const packageRefs = parseScheduledTaskGraphPackageRefs(node, TASK_GRAPH_LIMITS.maxScheduledPackageRefs, textArray)
+  if (!packageRefs.valid) return fail("invalid_shape", `${path}.packageRefs`, "packageRefs is required only for scheduled Execute nodes and must contain unique valid references")
+  const successCriteria = node.successCriteria, dependsOn = node.dependsOn
+  if (!textArray(successCriteria, false, TASK_GRAPH_LIMITS.maxSuccessCriteria, TASK_GRAPH_LIMITS.maxCriterionLength)) return fail("invalid_shape", `${path}.successCriteria`, "Success criteria must contain one to eight non-empty strings of at most 320 characters")
+  if (!textArray(dependsOn, true, TASK_GRAPH_LIMITS.maxDependencies, TASK_GRAPH_LIMITS.maxKeyLength)) return fail("invalid_shape", `${path}.dependsOn`, "dependsOn must contain at most eight non-empty local keys of at most 128 characters")
+  if (new Set(dependsOn).size !== dependsOn.length) return fail("invalid_shape", `${path}.dependsOn`, "Dependencies must be unique")
   let repairOf: TaskGraphRepairOf | undefined
-  if (Object.hasOwn(node, "repairOf")) { const parsed = parseRepairOf(node.repairOf, index); if ("ok" in parsed) return parsed; repairOf = parsed }
-  return { key: value.key as string, templateId: value.templateId as string, goal: value.goal as string, successCriteria: [...value.successCriteria] as string[], dependsOn: [...value.dependsOn] as string[], ...(Object.hasOwn(node, "verification") ? { verification: node.verification as TaskGraphVerificationContract } : {}), ...(repairOf ? { repairOf } : {}) }
+  if (Object.hasOwn(node, "repairOf")) {
+    const parsed = parseTaskGraphProposalRepairOf(node.repairOf, index, { plainRecord, text, textArray,
+      maxKeyLength: TASK_GRAPH_LIMITS.maxKeyLength, maxCriteria: TASK_GRAPH_LIMITS.maxSuccessCriteria })
+    if ("ok" in parsed) return parsed
+    repairOf = parsed
+  }
+  return { key, templateId, goal, successCriteria: [...successCriteria], dependsOn: [...dependsOn], ...(Object.hasOwn(node, "verification") ? { verification: node.verification as TaskGraphVerificationContract } : {}), ...(repairOf ? { repairOf } : {}), ...(packageRefs.packageRefs ? { packageRefs: packageRefs.packageRefs } : {}) }
 }
 export function isValidTaskGraphRepairRelation(node: TaskGraphNodeProposal, target: TaskGraphNodeProposal & Readonly<{ taskId?: string; verificationDisposition?: TaskGraphVerificationDisposition }>): boolean {
   const relation = node.repairOf, role = taskGraphVerificationRole(node.templateId)
@@ -122,14 +115,19 @@ export function createInitialTaskGraphState(): TaskGraphState {
   return { revision: 0, nodes: [], appliedEvents: [] }
 }
 
-export function validateTaskGraphProposal(value: unknown, state: TaskGraphState, options: TaskGraphValidationOptions): TaskGraphValidationResult {
+export function validateTaskGraphProposal(value: unknown, state: TaskGraphState, options: TaskGraphValidationOptions): TaskGraphValidationResult { return validateTaskGraphProposalWithinLimit(value, state, options, TASK_GRAPH_LIMITS.maxNodes, TASK_GRAPH_LIMITS.maxNodes) }
+
+function validateTaskGraphProposalWithinLimit(
+  value: unknown, state: TaskGraphState, options: TaskGraphValidationOptions, hardMaxNodes: number, maxAddedNodes: number,
+): TaskGraphValidationResult {
   if (!integer(state?.revision, 0) || !Array.isArray(state.nodes) || !Array.isArray(state.appliedEvents)) return fail("invalid_state", "state", "TaskGraph state is malformed")
   if (!options || typeof options.registeredTemplateIds?.has !== "function" || !integer(options.maxNodes, 1) || !integer(options.maxDepth, 1)) return fail("invalid_options", "options", "Registered templates and positive node/depth limits are required")
-  const maxNodes = Math.min(options.maxNodes, TASK_GRAPH_LIMITS.maxNodes)
+  const maxNodes = Math.min(options.maxNodes, hardMaxNodes)
   const maxDepth = Math.min(options.maxDepth, TASK_GRAPH_LIMITS.maxDepth)
   if (!plainRecord(value, "expectedRevision,nodes") || !integer(value.expectedRevision, 0) || !Array.isArray(value.nodes)) return fail("invalid_shape", "proposal", "Proposal must contain exactly expectedRevision and nodes")
   if (value.expectedRevision !== state.revision) return fail("revision_mismatch", "expectedRevision", "Proposal revision is stale")
   if (value.nodes.length === 0) return fail("empty_proposal", "nodes", "Proposal must append at least one node")
+  if (value.nodes.length > maxAddedNodes) return fail("node_limit", "nodes", "TaskGraph append limit exceeded")
   if (state.nodes.length + value.nodes.length > maxNodes) return fail("node_limit", "nodes", "TaskGraph node limit exceeded")
   const nodes: TaskGraphNodeProposal[] = []
   const keys = new Set(state.nodes.map(node => node.key))
@@ -175,6 +173,10 @@ export function appendTaskGraphProposal(state: TaskGraphState, value: unknown, o
   if (!validation.ok) return validation
   return { ok: true, state: { revision: state.revision + 1, nodes: [...state.nodes, ...validation.addedNodes], appliedEvents: state.appliedEvents, repairSatisfiedNodeKeys: state.repairSatisfiedNodeKeys, repairPendingNodeKeys: state.repairPendingNodeKeys }, addedNodes: validation.addedNodes }
 }
+
+/** Appends the bounded server-owned suffix after a scheduled Gate, up to the persisted graph ceiling. */
+const appendScheduledPostGate = createScheduledPostGateTaskGraphAppender(validateTaskGraphProposalWithinLimit, TASK_GRAPH_LIMITS)
+export function appendScheduledPostGateTaskGraphProposal(state: TaskGraphState, value: unknown, options: TaskGraphValidationOptions): TaskGraphAppendResult { return appendScheduledPostGate(state, value, options) }
 
 function blockedByDependency(node: TaskGraphNode, byKey: ReadonlyMap<string, TaskGraphNode>, memo: Map<string, boolean>, repaired: ReadonlySet<string>, pending: ReadonlySet<string>): boolean {
   const known = memo.get(node.key)
