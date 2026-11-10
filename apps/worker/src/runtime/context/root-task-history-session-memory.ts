@@ -43,6 +43,7 @@ export type RootTaskHistorySessionAuthorization = Readonly<{
 export type RootTaskHistorySessionAuthorizationResult<T> = Readonly<{
   authorization: RootTaskHistorySessionAuthorization
   historyReadAllowed: boolean
+  searchFootprintReadAllowed: boolean
   workResult: T
 }>
 
@@ -51,6 +52,7 @@ export type AuthorizedRootTaskHistoryWork<T> = (
   client: pg.PoolClient,
   authorization: RootTaskHistorySessionAuthorization,
   historyReadAllowed: boolean,
+  searchFootprintReadAllowed: boolean,
 ) => Promise<T>
 
 function conflict(): TurnEngineError {
@@ -76,7 +78,6 @@ function sequence(value: unknown): string | null {
     return parsed > 0n ? parsed.toString() : null
   } catch { return null }
 }
-
 function validateInput(input: RootTaskHistorySessionAuthorizationInput): void {
   const { lease } = input
   if (!text(lease.userId) || input.scope.userId !== lease.userId || !text(lease.sessionId) || !text(lease.turnId)
@@ -84,7 +85,6 @@ function validateInput(input: RootTaskHistorySessionAuthorizationInput): void {
     || !text(input.rootTaskId) || !Number.isSafeInteger(input.rootAttemptCount) || input.rootAttemptCount < 1
     || !text(input.stepId) || typeof input.environmentGateEnabled !== "boolean") throw conflict()
 }
-
 function authorizationPayload(value: unknown, sessionId: string, userId: string): Omit<RootTaskHistorySessionAuthorization, "eventId"> | null {
   const payload = parseJson(value)
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null
@@ -99,7 +99,6 @@ function authorizationPayload(value: unknown, sessionId: string, userId: string)
     gateEnabledAtCapture: row.gateEnabledAtCapture,
   }
 }
-
 async function lockCurrentOwner(client: pg.PoolClient, input: RootTaskHistorySessionAuthorizationInput): Promise<void> {
   const { lease, rootTaskId, rootAttemptCount } = input
   const root = await lockTaskGraphScope(client, {
@@ -119,7 +118,6 @@ async function lockCurrentOwner(client: pg.PoolClient, input: RootTaskHistorySes
     throw new TurnLeaseError("lease_lost", "Turn step is no longer active")
   }
 }
-
 async function readEvent(client: pg.PoolClient, key: string): Promise<EventRow | null> {
   const id = idempotencyId(key)
   const result = await client.query<EventRow>(`SELECT "id","sessionId","turnId","taskId","sequence","type","actor","itemId",
@@ -128,7 +126,6 @@ async function readEvent(client: pg.PoolClient, key: string): Promise<EventRow |
   if (result.rows.length > 1) throw conflict()
   return result.rows[0] ?? null
 }
-
 async function assertRetainedOwner(client: pg.PoolClient, row: EventRow, input: RootTaskHistorySessionAuthorizationInput): Promise<void> {
   const { lease } = input
   if (row.sessionId !== lease.sessionId || !text(row.turnId) || !text(row.taskId)) throw conflict()
@@ -141,14 +138,12 @@ async function assertRetainedOwner(client: pg.PoolClient, row: EventRow, input: 
       AND task."role"='orchestrator' AND task."taskType"='root'`, [row.taskId, lease.sessionId, row.turnId, lease.userId])
   if (root.rows.length !== 1 || root.rows[0]?.id !== row.taskId) throw conflict()
 }
-
 function validEvent(row: EventRow, key: string): boolean {
   return row.id === idempotencyId(key) && row.idempotencyKey === key
     && row.type === ROOT_TASK_HISTORY_SESSION_AUTHORIZATION_EVENT_TYPE && row.actor === "orchestrator"
     && row.itemId === null && row.causationId === null && text(row.taskId) && row.correlationId === row.taskId
     && sequence(row.sequence) !== null
 }
-
 function expectedOutbox(row: EventRow, payload: RepositoryJsonValue): AgentOutboxIdentity {
   const eventPayload: AgentOutboxPayload = {
     eventId: row.id, sessionId: row.sessionId, turnId: row.turnId, taskId: row.taskId,
@@ -158,20 +153,17 @@ function expectedOutbox(row: EventRow, payload: RepositoryJsonValue): AgentOutbo
   return { id: `agent-outbox-${row.id}`, topic: "agent.events", aggregateId: row.sessionId,
     idempotencyKey: `agent-event:${row.id}`, payload: eventPayload }
 }
-
 async function verifyOutbox(client: pg.PoolClient, expected: AgentOutboxIdentity): Promise<void> {
   const rows = await client.query<Row>(`SELECT "id","topic","aggregateId","idempotencyKey","payload" FROM "agent_outbox"
     WHERE "idempotencyKey"=$1 OR "id"=$2 FOR UPDATE`, [expected.idempotencyKey, expected.id])
   if (rows.rows.length !== 1 || !matchesAgentOutboxIdentity(rows.rows[0], expected)) throw conflict()
 }
-
 async function assertNoOrphanOutbox(client: pg.PoolClient, key: string): Promise<void> {
   const id = idempotencyId(key)
   const rows = await client.query<Row>(`SELECT "id" FROM "agent_outbox"
     WHERE "idempotencyKey"=$1 OR "id"=$2 FOR UPDATE`, [`agent-event:${id}`, `agent-outbox-${id}`])
   if (rows.rows.length !== 0) throw conflict()
 }
-
 async function appendEvent(client: pg.PoolClient, input: RootTaskHistorySessionAuthorizationInput, key: string, value: RepositoryJsonValue): Promise<EventRow> {
   const { lease, rootTaskId } = input, id = idempotencyId(key)
   const next = await client.query<{ eventSequence: string | number | bigint }>(`UPDATE "agent_sessions"
@@ -191,7 +183,6 @@ async function appendEvent(client: pg.PoolClient, input: RootTaskHistorySessionA
   await verifyOutbox(client, outbox)
   return row
 }
-
 async function pinnedAuthorization(client: pg.PoolClient, input: RootTaskHistorySessionAuthorizationInput): Promise<RootTaskHistorySessionAuthorization> {
   const key = AUTHORIZATION_KEY(input.lease.sessionId), prior = await readEvent(client, key)
   if (prior) {
@@ -219,7 +210,18 @@ async function pinnedAuthorization(client: pg.PoolClient, input: RootTaskHistory
   if (!parsed || !validEvent(created, key)) throw conflict()
   return { ...parsed, eventId: created.id }
 }
-
+async function searchFootprintPermission(client: pg.PoolClient, input: RootTaskHistorySessionAuthorizationInput): Promise<boolean> {
+  if (process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY !== "1") return false
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended('applymate:agent-search-footprint-memory:' || $1::text, 0))", [input.lease.userId])
+  const result = await client.query<Row>(`SELECT owner."agentSearchFootprintMemoryEnabled" AS "consentEnabled",
+    owner."agentSearchFootprintMemoryConsentVersion" AS "consentVersion", session."searchFootprintMemoryEnabledAtCreation" AS "snapshotEnabled",
+    session."searchFootprintMemoryConsentVersionAtCreation" AS "snapshotVersion" FROM "User" owner JOIN "agent_sessions" session
+      ON session."userId"=owner."id" WHERE owner."id"=$1 AND session."id"=$2`, [input.lease.userId, input.lease.sessionId])
+  const row = result.rows[0], currentVersion = Number(row?.consentVersion), snapshotVersion = Number(row?.snapshotVersion)
+  return row?.consentEnabled === true && row.snapshotEnabled === true
+    && Number.isSafeInteger(currentVersion) && currentVersion >= 0 && Number.isSafeInteger(snapshotVersion)
+    && snapshotVersion >= 0 && currentVersion === snapshotVersion
+}
 /** Pins consent and executes context work on the caller-owned checked-out transaction client. */
 export async function withRootTaskHistorySessionAuthorization<T>(
   client: pg.PoolClient,
@@ -237,9 +239,10 @@ export async function withRootTaskHistorySessionAuthorization<T>(
     }
     const authorization = await pinnedAuthorization(client, input)
     const historyReadAllowed = input.environmentGateEnabled && authorization.consentEnabled
+    const searchFootprintReadAllowed = await searchFootprintPermission(client, input)
     callbackStarted = true
-    const workResult = await work(client, authorization, historyReadAllowed)
-    return { authorization, historyReadAllowed, workResult }
+    const workResult = await work(client, authorization, historyReadAllowed, searchFootprintReadAllowed)
+    return { authorization, historyReadAllowed, searchFootprintReadAllowed, workResult }
   } catch (error: unknown) {
     if (callbackStarted || error instanceof TurnLeaseError || error instanceof TurnEngineError) throw error
     throw conflict()

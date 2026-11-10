@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import type pg from "pg"
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   ROOT_TASK_HISTORY_MEMORY_SNAPSHOT_EVENT_TYPE, ROOT_TASK_HISTORY_SESSION_AUTHORIZATION_EVENT_TYPE,
   withRootTaskHistorySessionAuthorization, type RootTaskHistorySessionAuthorizationInput,
@@ -14,6 +14,12 @@ const input: RootTaskHistorySessionAuthorizationInput = {
     leaseStartedAt: new Date("2026-10-28T10:00:00Z"), leaseExpiresAt: new Date("2026-10-28T10:05:00Z") },
   rootTaskId: "root-1", rootAttemptCount: 1, stepId: "step-1", environmentGateEnabled: true,
 }
+let priorSearchGate: string | undefined
+beforeEach(() => { priorSearchGate = process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY; delete process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY })
+afterEach(() => {
+  if (priorSearchGate === undefined) delete process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+  else process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = priorSearchGate
+})
 
 type Event = Record<string, unknown> & {
   id: string; sessionId: string; turnId: string; taskId: string; sequence: string; type: string
@@ -22,6 +28,7 @@ type Event = Record<string, unknown> & {
 type Outbox = { id: string; topic: string; aggregateId: string; idempotencyKey: string; payload: unknown }
 type FakeOptions = Readonly<{
   enabled?: boolean; version?: number; gate?: boolean; event?: Event | null; outbox?: Outbox | null
+  searchEnabled?: boolean; searchVersion?: number; snapshotEnabled?: boolean; snapshotVersion?: number
   orphanOutbox?: Outbox | null; failOwner?: boolean; failStep?: boolean
 }>
 
@@ -41,6 +48,10 @@ function fakePool(options: FakeOptions = {}) {
     if (sql.includes('FROM "agent_steps"')) return { rows: options.failStep ? [] : [{ id: values[0] }] }
     if (sql.includes("WITH wall_clock")) return { rows: [{ turnLeaseValid: true, parentLeaseValid: true }] }
     if (sql.includes('FROM "agent_events"')) return { rows: event ? [event] : [] }
+    if (sql.includes('agentSearchFootprintMemoryEnabled')) return { rows: [{
+      consentEnabled: options.searchEnabled ?? false, consentVersion: options.searchVersion ?? 0,
+      snapshotEnabled: options.snapshotEnabled ?? false, snapshotVersion: options.snapshotVersion ?? 0,
+    }] }
     if (sql.includes('FROM "User"')) return { rows: [{ id: input.lease.userId,
       agentTaskHistoryMemoryEnabled: options.enabled ?? true,
       agentTaskHistoryMemoryConsentVersion: options.version ?? 3 }] }
@@ -130,6 +141,44 @@ describe("root task history Session authorization", () => {
     expect(fake.calls.some(call => /root.task.history|historical|prior.outcome/i.test(call.sql))).toBe(false)
     expect(fake.event?.type).toBe(ROOT_TASK_HISTORY_SESSION_AUTHORIZATION_EVENT_TYPE)
     expect(fake.calls.some(call => ["BEGIN", "COMMIT", "ROLLBACK"].includes(call.sql))).toBe(false)
+  })
+
+  it("authorizes search-footprint reads only with the separate server gate and matching current Session snapshot", async () => {
+    const previous = process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+    const restore = () => previous === undefined
+      ? delete process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+      : (process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = previous)
+    try {
+      delete process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+      const gateOffFake = fakePool({ searchEnabled: true, searchVersion: 4, snapshotEnabled: true, snapshotVersion: 4 })
+      const gateOff = await withRootTaskHistorySessionAuthorization(gateOffFake.client, input, async () => "ordinary context")
+      expect(gateOff.searchFootprintReadAllowed).toBe(false)
+      expect(gateOffFake.calls.some(call => call.sql.includes('agentSearchFootprintMemoryEnabled'))).toBe(false)
+      process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = "1"
+      const matchingFake = fakePool({ searchEnabled: true, searchVersion: 4, snapshotEnabled: true, snapshotVersion: 4 })
+      const matching = await withRootTaskHistorySessionAuthorization(matchingFake.client,
+        { ...input, environmentGateEnabled: false }, async (_client, _authorization, historyAllowed, searchAllowed) => {
+          expect(historyAllowed).toBe(false)
+          expect(searchAllowed).toBe(true)
+          return "ordinary context"
+        })
+      expect(matching.searchFootprintReadAllowed).toBe(true)
+      const revoked = await withRootTaskHistorySessionAuthorization(fakePool({ searchEnabled: false, searchVersion: 5, snapshotEnabled: true, snapshotVersion: 4 }).client,
+        input, async () => "ordinary context")
+      expect(revoked.searchFootprintReadAllowed).toBe(false)
+      const reenabled = await withRootTaskHistorySessionAuthorization(fakePool({ searchEnabled: true, searchVersion: 6, snapshotEnabled: true, snapshotVersion: 4 }).client,
+        input, async () => "ordinary context")
+      expect(reenabled.searchFootprintReadAllowed).toBe(false)
+      const legacy = await withRootTaskHistorySessionAuthorization(fakePool({ searchEnabled: true, searchVersion: 0, snapshotEnabled: false, snapshotVersion: 0 }).client,
+        input, async () => "ordinary context")
+      expect(legacy.searchFootprintReadAllowed).toBe(false)
+      expect(matching.historyReadAllowed).toBe(false)
+      expect(matching.workResult).toBe("ordinary context")
+      const scopedRead = matchingFake.calls.find(call => call.sql.includes('agentSearchFootprintMemoryEnabled'))
+      expect(scopedRead?.sql).toContain('ON session."userId"=owner."id"')
+      expect(scopedRead?.sql).toContain('WHERE owner."id"=$1 AND session."id"=$2')
+      expect(scopedRead?.values).toEqual([input.lease.userId, input.lease.sessionId])
+    } finally { restore() }
   })
 
   it("replays the immutable enabled decision after user revocation without rereading User", async () => {
