@@ -103,15 +103,19 @@ describe("V2 agent event stream", () => {
 
   it("keeps the final-item binding in a serialized durable turn completion", async () => {
     const controller = new AbortController()
-    const finalItemId = "+353 86 123 4567"
+    const turnId = "turn_1"
+    const taskId = "root-task"
+    const phoneShapedUuid = "12345678-9012-4def-8abc-123456789abc"
+    const finalItemId = `turn:${turnId}:item:final:turn:${turnId}:step:0:${phoneShapedUuid}`
     const terminal = {
-      id: "terminal-event", sessionId: "session_1", turnId: "turn_1", itemId: finalItemId, taskId: "root-task",
+      id: "terminal-event", sessionId: "session_1", turnId, itemId: finalItemId, taskId,
       sequence: BigInt(1), type: "turn.completed", actor: "orchestrator", correlationId: "terminal-correlation",
       causationId: null, idempotencyKey: null,
-      payload: { turnId: "turn_1", taskId: "root-task", finalItemId, usage: { inputTokens: 1, outputTokens: 1 } },
+      payload: { turnId, taskId, finalItemId, usage: { inputTokens: 1, outputTokens: 1 } },
     }
     const stream = createV2EventStream(db([terminal]) as never, {
-      sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal, redisFactory: () => null, dbPollMs: 1, heartbeatMs: 60_000,
+      sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal,
+      redisFactory: () => null, eventRedisFactory: () => null, dbPollMs: 1, heartbeatMs: 60_000,
     })
     const reader = stream.getReader()
     try {
@@ -120,12 +124,46 @@ describe("V2 agent event stream", () => {
       const text = new TextDecoder().decode(first.value)
       const data = text.split("data: ")[1]?.split("\n")[0]
       expect(data).toBeDefined()
-      const frame = JSON.parse(data!) as { type: string; itemId: string | null; payload: { turnId: string; taskId: string; finalItemId: string } }
+      const frame = JSON.parse(data!) as {
+        type: string; turnId: string; taskId: string; itemId: string | null;
+        payload: { turnId: string; taskId: string; finalItemId: string }
+      }
       expect(frame).toMatchObject({
-        type: "turn.completed", itemId: finalItemId,
-        payload: { turnId: "turn_1", taskId: "root-task", finalItemId },
+        type: "turn.completed", turnId, taskId, itemId: finalItemId,
+        payload: { turnId, taskId, finalItemId },
       })
       expect(frame.itemId).toBe(frame.payload.finalItemId)
+    } finally {
+      controller.abort()
+      await reader.cancel()
+    }
+  })
+
+  it("does not restore a phone-shaped final-item ID into the terminal payload", async () => {
+    const controller = new AbortController()
+    const turnId = "turn_1"
+    const taskId = "root-task"
+    const finalItemId = "+353 86 123 4567"
+    const terminal = {
+      id: "terminal-phone-id-event", sessionId: "session_1", turnId, itemId: finalItemId, taskId,
+      sequence: BigInt(1), type: "turn.completed", actor: "orchestrator", correlationId: "terminal-correlation",
+      causationId: null, idempotencyKey: null,
+      payload: { turnId, taskId, finalItemId, note: "Call +353 86 123 4567" },
+    }
+    const stream = createV2EventStream(db([terminal]) as never, {
+      sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal,
+      redisFactory: () => null, eventRedisFactory: () => null, dbPollMs: 1, heartbeatMs: 60_000,
+    })
+    const reader = stream.getReader()
+    try {
+      const first = await reader.read()
+      const text = new TextDecoder().decode(first.value)
+      const data = text.split("data: ")[1]?.split("\n")[0]
+      expect(data).toBeDefined()
+      const frame = JSON.parse(data!) as { itemId: string | null; payload: Record<string, unknown> }
+      expect(frame.itemId).toBe(finalItemId)
+      for (const key of ["turnId", "taskId", "finalItemId"]) expect(frame.payload).not.toHaveProperty(key)
+      expect(frame.payload.note).toBe("Call [REDACTED_PHONE]")
     } finally {
       controller.abort()
       await reader.cancel()
