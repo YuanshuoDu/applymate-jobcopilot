@@ -245,4 +245,3 @@ export function rootTaskHistorySearchFootprintObservation(value: unknown): Conte
     advisoryOnly: true, notCurrentEvidence: true, ...context,
   } }
 }
-
