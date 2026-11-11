@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest"
 import type { PrismaClient } from "@prisma/client"
-import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, schemaVersion } from "@jobcopilot/agent-protocol"
 import type { ObjectiveStartCommand } from "./types"
 import * as transaction from "./transaction"
+import { parseObjectiveStartBody } from "../../../../app/api/agent/sessions/objective-start-route-helpers"
 
 import { ObjectiveStartCommandService } from "./objective-start"
 
@@ -20,6 +21,21 @@ function unsafeCommand(overrides: Readonly<Record<string, unknown>>): ObjectiveS
 }
 
 describe("ObjectiveStartCommandService validation", () => {
+  it("rejects a client-supplied plan-first intent at the public request boundary", () => {
+    const request = new Request("http://localhost/api/agent/sessions/session_1/start-objective", {
+      method: "POST", headers: { "idempotency-key": "start_1" }, body: "{}",
+    })
+    const parsed = parseObjectiveStartBody({
+      schemaVersion,
+      clientMessageId: "start_1",
+      objective: "Find Dublin roles",
+      content: [{ type: "text", text: "Find Dublin roles" }],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+    }, request, "session_1")
+
+    expect(parsed).toMatchObject({ status: 422 })
+  })
+
   it("trims the objective and accepts the exact 2,000-byte boundary", async () => {
     const transaction = vi.fn(async () => { throw new Error("transaction reached") })
     const service = new ObjectiveStartCommandService({ $transaction: transaction } as unknown as PrismaClient)
