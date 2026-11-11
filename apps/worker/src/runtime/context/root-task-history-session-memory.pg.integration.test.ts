@@ -624,7 +624,10 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     sessions.add(sessionId)
     const entered = deferred<{ enabled: boolean; version: number }>(), release = deferred<void>()
     let mutation: Promise<unknown> | undefined
-    const creation = withAgentSearchFootprintSessionSnapshot(prisma!, userId, async (tx, snapshot) => {
+    const creation = withAgentSearchFootprintSessionSnapshot(prisma!, userId, async (
+      tx: { agentSession: { create(args: { data: Record<string, unknown> }): Promise<unknown> } },
+      snapshot: { enabled: boolean; version: number },
+    ) => {
       await tx.agentSession.create({ data: {
         id: sessionId, userId, goal: "Snapshot race integration", status: "running", source: "test",
         ...sessionSnapshotFields(snapshot),

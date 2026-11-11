@@ -52,7 +52,7 @@ export type AuthorizedRootTaskHistoryWork<T> = (
   client: pg.PoolClient,
   authorization: RootTaskHistorySessionAuthorization,
   historyReadAllowed: boolean,
-  searchFootprintReadAllowed: boolean,
+  searchFootprintReadAllowed?: boolean,
 ) => Promise<T>
 
 function conflict(): TurnEngineError {
