@@ -696,7 +696,6 @@ async function taskGraphRootSurface(
   requestCapture?: HarnessModelRequest[],
   objectiveTaskGraphMode = false,
   objectiveTaskGraphUnavailable?: "coordination" | "child" | "wait",
-  objectiveCompletionEvidence = false,
 ) {
   const objectiveProgressFixture = objectiveProgressOrBoundaryOptions && "graph" in objectiveProgressOrBoundaryOptions
     ? objectiveProgressOrBoundaryOptions : undefined
@@ -707,6 +706,7 @@ async function taskGraphRootSurface(
   const contexts: StepContext[] = []
   const registeredTools: RuntimeToolDefinition[] = []
   let allowedActions: readonly string[] = []
+  let terminalGuard: Parameters<TurnEngineStoreFactory>[1] | undefined
   const roots = {
     ensure: vi.fn(async (input: { allowedActions: readonly string[] }) => {
       allowedActions = [...input.allowedActions]
@@ -757,23 +757,19 @@ async function taskGraphRootSurface(
       reviewer: { role: "reviewer", taskType: "cover_letter_review", allowedActions: ["artifact.review"] },
     } : { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"] } }),
     selectedJobPreparationLoader: async () => selectedJob ? { jobId: "job-1" } : undefined,
-    stateLoader: boundaryOptions.stateLoader ?? (async () => {
-      const loaded = state(scheduledAutomation ? { source: "automation", automationRunMode: "scheduled", contextSnapshotPinned: false }
-        : boundaryOptions.enabled ? { source: "user", contextSnapshotPinned: false } : { source: "user" })
-      return {
-        ...loaded,
-        ...(objectiveCompletionEvidence ? { snapshot: { ...loaded.snapshot, businessRefs: [{ id: "fixture-objective-evidence", kind: "job", ownerId: "user-1", label: "Verified current job" }] } } : {}),
-        toolPolicySnapshot: { capabilities: ["read"] },
-        ...(persistedTurnInput === undefined ? {} : { turnInput: persistedTurnInput }),
-        ...(interactiveDiscovery ? { intent: { kind: "interactive_discovery_shortlist" as const, version: 1 as const } } : {}),
-        ...(objectiveTaskGraphMode ? { intent: { kind: "objective_task_graph_execution" as const, version: 1 as const } } : {}),
-        ...(recoverHiddenMutation ? {
-          pendingToolCalls: [{ call: { id: "persisted-hidden-call", name: recoveredToolName, arguments: recoveredToolName === "jobs.get" ? { jobId: "job-other" } : {} }, toolVersion: "1", stepId: "prior-step", callItem: { id: "persisted-call-item", revision: 0 } }],
-          resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
-        } : {}),
-      }
-    }),
-    rootTaskStore: roots as never, turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => ({ build: async request => {
+    stateLoader: boundaryOptions.stateLoader ?? (async () => ({
+      ...state(scheduledAutomation ? { source: "automation", automationRunMode: "scheduled", contextSnapshotPinned: false }
+        : boundaryOptions.enabled ? { source: "user", contextSnapshotPinned: false } : { source: "user" }),
+      toolPolicySnapshot: { capabilities: ["read"] },
+      ...(persistedTurnInput === undefined ? {} : { turnInput: persistedTurnInput }),
+      ...(interactiveDiscovery ? { intent: { kind: "interactive_discovery_shortlist" as const, version: 1 as const } } : {}),
+      ...(objectiveTaskGraphMode ? { intent: { kind: "objective_task_graph_execution" as const, version: 1 as const } } : {}),
+      ...(recoverHiddenMutation ? {
+        pendingToolCalls: [{ call: { id: "persisted-hidden-call", name: recoveredToolName, arguments: recoveredToolName === "jobs.get" ? { jobId: "job-other" } : {} }, toolVersion: "1", stepId: "prior-step", callItem: { id: "persisted-call-item", revision: 0 } }],
+        resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+      } : {}),
+    })),
+    rootTaskStore: roots as never, turnEngineStoreFactory: (_pool, guard) => { terminalGuard = guard; return store(events) }, contextBuilderFactory: () => ({ build: async request => {
       const built = await contextBuilder().build(request)
       contexts.push(built)
       return built
@@ -819,7 +815,7 @@ async function taskGraphRootSurface(
     if (!tool || typeof tool !== "object" || !("name" in tool) || typeof tool.name !== "string") return []
     return [tool.name]
   }) ?? []
-  return { toolNames, allowedActions, route, events, roots, requests, registeredTools, taskGraphCommandPort, contexts, result }
+  return { toolNames, allowedActions, route, events, roots, requests, registeredTools, taskGraphCommandPort, contexts, result, terminalGuard }
 }
 
 async function routeCanonicalRootMutation(toolName: "agent.spawn" | "spawn_subagent" | "agent.followup", planningEnabled: boolean) {
@@ -2140,7 +2136,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(requestMessages[1]).not.toContain(steerParts[1])
     const agendas = events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE).map(event => event.payload as { planRevision: number; signals: { pendingInputs: { ids: readonly string[] } } })
     expect(agendas.map(agenda => agenda.planRevision)).toEqual([0, 1, 2])
-    expect(agendas.map(agenda => agenda.signals.pendingInputs.ids)).toEqual([[], [steer.id], []])
+    expect(agendas.map(agenda => agenda.signals.pendingInputs.ids)).toEqual([[steer.id], [steer.id], []])
     expect(JSON.stringify(agendas)).not.toContain(originalInput.id)
     expect(JSON.stringify(events)).not.toContain(originalText)
     expect(JSON.stringify(events)).not.toContain(answerText)
@@ -3172,11 +3168,18 @@ describe("createCanonicalTurnRuntime", () => {
     expect(JSON.stringify(objective.events)).toContain("objective_task_graph_root_tool_disabled")
   })
 
-  it("passes the TaskGraph requirement to explicit-objective completion assessment", async () => {
+  it("passes the TaskGraph requirement to explicit-objective terminal assessment", async () => {
     const objective = await taskGraphRootSurface(false, false, "jobs.search", "agent.interrupt", false,
-      undefined, true, false, false, undefined, undefined, true, undefined, true)
+      undefined, true, false, false, undefined, undefined, true)
 
-    expect(objective.roots.checkCompletion).toHaveBeenCalledWith(expect.objectContaining({ requireTaskGraph: true }))
+    const guard = objective.terminalGuard
+    expect(guard).toEqual(expect.any(Function))
+    if (typeof guard !== "function") throw new Error("explicit objective terminal guard was not created")
+    const client = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as never
+    const terminal = { stepId: "step-1", finalItemId: "final-1", finalContent: null, stepCount: 1, toolCallCount: 0,
+      usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, response: "{}" } as never
+    await expect(guard(client, terminal)).resolves.toEqual({ ok: true })
+    expect(objective.roots.checkCompletion).toHaveBeenCalledWith(expect.objectContaining({ requireTaskGraph: true, client }))
   })
 
   it("fails an explicit objective closed when planning is unavailable", async () => {
