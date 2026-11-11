@@ -283,6 +283,10 @@ describe("V2 agent event stream", () => {
           ...(type === "agent.plan.discovery_persona_overflow" ? { observedFactCount: 33, rawValue: "PRIVATE_OVERFLOW_VALUE" } : {}),
           ...(type === "agent.plan.root_task_history_session_authorization" ? { snapshotKey: "PRIVATE_HISTORY_AUTHORIZATION_KEY" } : {}),
           ...(type === "agent.plan.root_task_history_memory_snapshot" ? { id: "root-task-history", value: "PRIVATE_ROOT_TASK_HISTORY_VALUE" } : {}),
+          ...(type === "agent.plan.root_task_history_search_footprint_snapshot" ? {
+            schemaVersion: "agent-harness.v2.root-task-history-search-footprint-snapshot.v1",
+            searchFootprints: { roles: ["PRIVATE_SEARCH_FOOTPRINT_ROLE"], locations: ["PRIVATE_SEARCH_FOOTPRINT_LOCATION"], atsSources: ["PRIVATE_SEARCH_FOOTPRINT_SOURCE"] },
+          } : {}),
           ...(chronologyWitness ? {
             schemaVersion: "agent-harness.v2.root-task-history-chronology-witness.v1",
             boundary: "turn_start", boundaryEventId, xid8: "90000000000000001",
@@ -327,8 +331,9 @@ describe("V2 agent event stream", () => {
               privateEvent(BigInt(8), "agent.plan.root_task_history_session_authorization", "history-authorization"),
               privateEvent(BigInt(9), "agent.plan.root_task_history_memory_snapshot", "history-snapshot"),
               privateEvent(BigInt(10), "agent.plan.root_task_history_chronology_witness", "history-chronology"),
+              privateEvent(BigInt(11), "agent.plan.root_task_history_search_footprint_snapshot", "history-search-footprint"),
               {
-                ...privateEvent(BigInt(11), "agent.plan.denial_checkpoint", "denial-checkpoint"),
+                ...privateEvent(BigInt(12), "agent.plan.denial_checkpoint", "denial-checkpoint"),
                 itemId: null,
                 payload: {
                   schemaVersion: "agent-harness.v2.task-graph-denial-checkpoint.v1",
@@ -338,8 +343,8 @@ describe("V2 agent event stream", () => {
                   verificationDigest: marker,
                 },
               },
-              { ...rejection, sequence: BigInt(12) },
-              { ...visible, sequence: BigInt(13) },
+              { ...rejection, sequence: BigInt(13) },
+              { ...visible, sequence: BigInt(14) },
             ]
     })
     const pubsub = eventRedis()
@@ -372,6 +377,7 @@ describe("V2 agent event stream", () => {
       expect(text).not.toContain("agent.plan.root_task_history_session_authorization")
       expect(text).not.toContain("agent.plan.root_task_history_memory_snapshot")
       expect(text).not.toContain("agent.plan.root_task_history_chronology_witness")
+      expect(text).not.toContain("agent.plan.root_task_history_search_footprint_snapshot")
       expect(text).not.toContain('"verificationDigest"')
       expect(text).not.toContain('"graphRevision"')
       expect(text).not.toContain("task-graph-denial-checkpoint.v1")
@@ -381,6 +387,9 @@ describe("V2 agent event stream", () => {
       expect(text).not.toContain("PRIVATE_OVERFLOW_VALUE")
       expect(text).not.toContain("PRIVATE_HISTORY_AUTHORIZATION_KEY")
       expect(text).not.toContain("PRIVATE_ROOT_TASK_HISTORY_VALUE")
+      expect(text).not.toContain("PRIVATE_SEARCH_FOOTPRINT_ROLE")
+      expect(text).not.toContain("PRIVATE_SEARCH_FOOTPRINT_LOCATION")
+      expect(text).not.toContain("PRIVATE_SEARCH_FOOTPRINT_SOURCE")
       expect(text).not.toContain("PRIVATE_CHRONOLOGY_BOUNDARY_EVENT")
       expect(text).not.toContain("90000000000000001")
       expect(text).not.toContain("root-task-history")
