@@ -561,6 +561,34 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     }
   })
 
+  it("fails closed at the exhausted version for matching old and new Sessions while Task History stays independent", async () => {
+    const userId = await createUser(), maxVersion = 2_147_483_647
+    await setConsent(userId, true, 0)
+    await pool!.query(`UPDATE "User" SET "agentSearchFootprintMemoryEnabled"=TRUE,
+      "agentSearchFootprintMemoryConsentVersion"=$2 WHERE "id"=$1`, [userId, maxVersion])
+
+    const oldSession = await createSession(userId), oldFixture = await createTurn(userId, oldSession)
+    await setSearchSnapshot(userId, oldSession, true, maxVersion)
+    const newSession = await createSession(userId), newFixture = await createTurn(userId, newSession)
+    await setSearchSnapshot(userId, newSession, true, maxVersion)
+
+    const previousGate = process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+    process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = "1"
+    try {
+      const read = (fixture: Fixture) => withContextTransaction(fixture,
+        async (_client, _authorization, historyAllowed, searchAllowed) => ({ historyAllowed, searchAllowed }))
+      for (const fixture of [oldFixture, newFixture]) {
+        const result = await read(fixture)
+        expect(result.historyReadAllowed).toBe(true)
+        expect(result.searchFootprintReadAllowed).toBe(false)
+        expect(result.workResult).toEqual({ historyAllowed: true, searchAllowed: false })
+      }
+    } finally {
+      if (previousGate === undefined) delete process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+      else process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = previousGate
+    }
+  })
+
   it("serializes a search-footprint read with an in-flight revocation", async () => {
     const userId = await createUser(), sessionId = await createSession(userId), fixture = await createTurn(userId, sessionId)
     const enabled = await setSearchConsent(userId, true, 0)

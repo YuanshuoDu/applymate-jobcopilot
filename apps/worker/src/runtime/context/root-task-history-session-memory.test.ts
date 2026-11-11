@@ -181,6 +181,26 @@ describe("root task history Session authorization", () => {
     } finally { restore() }
   })
 
+  it("fails closed at version exhaustion for matching old and new Sessions without changing Task History authorization", async () => {
+    process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = "1"
+    const maxVersion = 2_147_483_647
+    const beforeMax = fakePool({ searchEnabled: true, searchVersion: maxVersion - 1,
+      snapshotEnabled: true, snapshotVersion: maxVersion - 1 })
+    const beforeMaxResult = await withRootTaskHistorySessionAuthorization(beforeMax.client, input, async () => "context")
+    expect(beforeMaxResult.searchFootprintReadAllowed).toBe(true)
+
+    for (const sessionId of ["old-session-at-max", "new-session-at-max"]) {
+      const fake = fakePool({ enabled: true, version: 3, searchEnabled: true, searchVersion: maxVersion,
+        snapshotEnabled: true, snapshotVersion: maxVersion })
+      const result = await withRootTaskHistorySessionAuthorization(fake.client, {
+        ...input, lease: { ...input.lease, sessionId },
+      }, async (_client, _authorization, historyAllowed, searchAllowed) => ({ historyAllowed, searchAllowed }))
+      expect(result.historyReadAllowed).toBe(true)
+      expect(result.searchFootprintReadAllowed).toBe(false)
+      expect(result.workResult).toEqual({ historyAllowed: true, searchAllowed: false })
+    }
+  })
+
   it("replays the immutable enabled decision after user revocation without rereading User", async () => {
     const event = retainedEvent(), fake = fakePool({ enabled: false, version: 4, event, outbox: retainedOutbox(event) })
     const work = vi.fn(async () => "advisory projection")

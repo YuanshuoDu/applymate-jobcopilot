@@ -219,7 +219,7 @@ async function searchFootprintPermission(client: pg.PoolClient, input: RootTaskH
       ON session."userId"=owner."id" WHERE owner."id"=$1 AND session."id"=$2`, [input.lease.userId, input.lease.sessionId])
   const row = result.rows[0], currentVersion = Number(row?.consentVersion), snapshotVersion = Number(row?.snapshotVersion)
   return row?.consentEnabled === true && row.snapshotEnabled === true
-    && Number.isSafeInteger(currentVersion) && currentVersion >= 0 && Number.isSafeInteger(snapshotVersion)
+    && Number.isSafeInteger(currentVersion) && currentVersion >= 0 && currentVersion < 2_147_483_647 && Number.isSafeInteger(snapshotVersion)
     && snapshotVersion >= 0 && currentVersion === snapshotVersion
 }
 /** Pins consent and executes context work on the caller-owned checked-out transaction client. */
