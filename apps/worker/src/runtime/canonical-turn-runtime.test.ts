@@ -696,6 +696,7 @@ async function taskGraphRootSurface(
   requestCapture?: HarnessModelRequest[],
   objectiveTaskGraphMode = false,
   objectiveTaskGraphUnavailable?: "coordination" | "child" | "wait",
+  objectiveCompletionEvidence = false,
 ) {
   const objectiveProgressFixture = objectiveProgressOrBoundaryOptions && "graph" in objectiveProgressOrBoundaryOptions
     ? objectiveProgressOrBoundaryOptions : undefined
@@ -756,18 +757,22 @@ async function taskGraphRootSurface(
       reviewer: { role: "reviewer", taskType: "cover_letter_review", allowedActions: ["artifact.review"] },
     } : { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"] } }),
     selectedJobPreparationLoader: async () => selectedJob ? { jobId: "job-1" } : undefined,
-    stateLoader: boundaryOptions.stateLoader ?? (async () => ({
-      ...state(scheduledAutomation ? { source: "automation", automationRunMode: "scheduled", contextSnapshotPinned: false }
-        : boundaryOptions.enabled ? { source: "user", contextSnapshotPinned: false } : { source: "user" }),
-      toolPolicySnapshot: { capabilities: ["read"] },
-      ...(persistedTurnInput === undefined ? {} : { turnInput: persistedTurnInput }),
-      ...(interactiveDiscovery ? { intent: { kind: "interactive_discovery_shortlist" as const, version: 1 as const } } : {}),
-      ...(objectiveTaskGraphMode ? { intent: { kind: "objective_task_graph_execution" as const, version: 1 as const } } : {}),
-      ...(recoverHiddenMutation ? {
-        pendingToolCalls: [{ call: { id: "persisted-hidden-call", name: recoveredToolName, arguments: recoveredToolName === "jobs.get" ? { jobId: "job-other" } : {} }, toolVersion: "1", stepId: "prior-step", callItem: { id: "persisted-call-item", revision: 0 } }],
-        resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
-      } : {}),
-    })),
+    stateLoader: boundaryOptions.stateLoader ?? (async () => {
+      const loaded = state(scheduledAutomation ? { source: "automation", automationRunMode: "scheduled", contextSnapshotPinned: false }
+        : boundaryOptions.enabled ? { source: "user", contextSnapshotPinned: false } : { source: "user" })
+      return {
+        ...loaded,
+        ...(objectiveCompletionEvidence ? { snapshot: { ...loaded.snapshot, businessRefs: [{ id: "fixture-objective-evidence", kind: "job", ownerId: "user-1", label: "Verified current job" }] } } : {}),
+        toolPolicySnapshot: { capabilities: ["read"] },
+        ...(persistedTurnInput === undefined ? {} : { turnInput: persistedTurnInput }),
+        ...(interactiveDiscovery ? { intent: { kind: "interactive_discovery_shortlist" as const, version: 1 as const } } : {}),
+        ...(objectiveTaskGraphMode ? { intent: { kind: "objective_task_graph_execution" as const, version: 1 as const } } : {}),
+        ...(recoverHiddenMutation ? {
+          pendingToolCalls: [{ call: { id: "persisted-hidden-call", name: recoveredToolName, arguments: recoveredToolName === "jobs.get" ? { jobId: "job-other" } : {} }, toolVersion: "1", stepId: "prior-step", callItem: { id: "persisted-call-item", revision: 0 } }],
+          resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+        } : {}),
+      }
+    }),
     rootTaskStore: roots as never, turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => ({ build: async request => {
       const built = await contextBuilder().build(request)
       contexts.push(built)
@@ -2134,8 +2139,8 @@ describe("createCanonicalTurnRuntime", () => {
     expect(requestMessages[1]).not.toContain(steerParts[0])
     expect(requestMessages[1]).not.toContain(steerParts[1])
     const agendas = events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE).map(event => event.payload as { planRevision: number; signals: { pendingInputs: { ids: readonly string[] } } })
-    expect(agendas.map(agenda => agenda.planRevision)).toEqual([1, 2])
-    expect(agendas.map(agenda => agenda.signals.pendingInputs.ids)).toEqual([[steer.id], []])
+    expect(agendas.map(agenda => agenda.planRevision)).toEqual([0, 1, 2])
+    expect(agendas.map(agenda => agenda.signals.pendingInputs.ids)).toEqual([[], [steer.id], []])
     expect(JSON.stringify(agendas)).not.toContain(originalInput.id)
     expect(JSON.stringify(events)).not.toContain(originalText)
     expect(JSON.stringify(events)).not.toContain(answerText)
@@ -3169,7 +3174,7 @@ describe("createCanonicalTurnRuntime", () => {
 
   it("passes the TaskGraph requirement to explicit-objective completion assessment", async () => {
     const objective = await taskGraphRootSurface(false, false, "jobs.search", "agent.interrupt", false,
-      undefined, true, false, false, undefined, undefined, true)
+      undefined, true, false, false, undefined, undefined, true, undefined, true)
 
     expect(objective.roots.checkCompletion).toHaveBeenCalledWith(expect.objectContaining({ requireTaskGraph: true }))
   })
