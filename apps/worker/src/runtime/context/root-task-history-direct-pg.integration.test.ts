@@ -607,18 +607,25 @@ async function projectSources(sources: readonly Source[]): Promise<void> {
 
 async function deleteSourceFixtures(sources: readonly Source[]): Promise<void> {
   if (!sources.length) return
-  const client = await pool!.connect(), turnIds = sources.map(source => source.turnId)
+  const client = await pool!.connect(), turnIdsBySession = new Map<string, string[]>()
+  for (const source of sources) {
+    const turnIds = turnIdsBySession.get(source.sessionId) ?? []
+    turnIds.push(source.turnId)
+    turnIdsBySession.set(source.sessionId, turnIds)
+  }
   try {
     await client.query("BEGIN")
-    await client.query(`DELETE FROM "agent_outbox" WHERE "aggregateId"=$1 AND "payload"->>'turnId'=ANY($2::text[])`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
-      AND "parentTaskId" IS NOT NULL`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
-      AND "parentTaskId" IS NULL`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "agent_turns" WHERE "sessionId" = $1 AND "id" = ANY($2::text[])`, [sessionId, turnIds])
+    for (const [fixtureSessionId, turnIds] of turnIdsBySession) {
+      await client.query(`DELETE FROM "agent_outbox" WHERE "aggregateId"=$1 AND "payload"->>'turnId'=ANY($2::text[])`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
+        AND "parentTaskId" IS NOT NULL`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
+        AND "parentTaskId" IS NULL`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "agent_turns" WHERE "sessionId" = $1 AND "id" = ANY($2::text[])`, [fixtureSessionId, turnIds])
+    }
     await client.query("COMMIT")
   } catch (error: unknown) {
     await client.query("ROLLBACK").catch(() => undefined)
@@ -681,7 +688,6 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await insertSource(equalCutoff)
     await insertSource(foreignScopeCorrelation)
     await insertSource(otherUser)
-    await insertSource(searchFootprintMatch)
     await insertSource(searchFootprintWrongObjective)
     await insertSource(searchFootprintForeignTenant)
     await insertSource(inconsistentTerminal)
@@ -709,7 +715,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await insertSource(future)
     await insertSource(searchFootprintFuture)
     await projectSources([...matching, otherSession, crossEqualTimeHigherTurnId, crossWrongOrigin, equalCutoff, future,
-      ...crossSessionWrongOriginFillers, searchFootprintMatch, searchFootprintWrongObjective,
+      ...crossSessionWrongOriginFillers, searchFootprintWrongObjective,
       searchFootprintForeignTenant, searchFootprintFuture])
   })
 
@@ -726,19 +732,25 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
   it("projects only bounded prior same-tenant objective Scout criteria through PostgreSQL", async () => {
     const input: DirectRootTaskHistorySearchFootprintLoadInput = { lease, rootTaskId: currentRootTaskId,
       rootAttemptCount: 2, stepId: currentStepId, now: new Date(), searchFootprintReadAllowed: true }
-    const store = createPgDirectRootTaskHistoryStore(pool!)
-    const footprint = await store.loadSearchFootprints(input)
-    expect(footprint).toEqual({ roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] })
-    expect(JSON.stringify(footprint)).not.toMatch(/root-history-footprint|Foreign Objective Role|Foreign Tenant Role|Future Role|Berlin|Cork|Oslo|pageSize|hasCursor|candidateCount|providerFailures|materializationFailures/)
-
-    const client = await pool!.connect()
     try {
-      await client.query("BEGIN")
-      await client.query("SELECT set_config($1,$2,true)", ["app.user_id", otherUserId])
-      await expect(store.loadSearchFootprintsWithClient(client, input)).rejects.toThrow("root_task_history_scope_mismatch")
+      await insertSource(searchFootprintMatch)
+      await projectSources([searchFootprintMatch])
+      const store = createPgDirectRootTaskHistoryStore(pool!)
+      const footprint = await store.loadSearchFootprints(input)
+      expect(footprint).toEqual({ roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] })
+      expect(JSON.stringify(footprint)).not.toMatch(/root-history-footprint|Foreign Objective Role|Foreign Tenant Role|Future Role|Berlin|Cork|Oslo|pageSize|hasCursor|candidateCount|providerFailures|materializationFailures/)
+
+      const client = await pool!.connect()
+      try {
+        await client.query("BEGIN")
+        await client.query("SELECT set_config($1,$2,true)", ["app.user_id", otherUserId])
+        await expect(store.loadSearchFootprintsWithClient(client, input)).rejects.toThrow("root_task_history_scope_mismatch")
+      } finally {
+        await client.query("ROLLBACK").catch(() => undefined)
+        client.release()
+      }
     } finally {
-      await client.query("ROLLBACK").catch(() => undefined)
-      client.release()
+      await deleteSourceFixtures([searchFootprintMatch])
     }
   }, 60_000)
 
