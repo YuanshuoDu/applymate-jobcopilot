@@ -187,6 +187,7 @@ describe("V2 agent event stream", () => {
     expect(initial.frame.payload.email === "[REDACTED]").toBe(true)
 
     const lastEventId = parseAfterSequence(new Request("http://localhost/events", { headers: { "Last-Event-ID": "41" } }))
+    if (typeof lastEventId !== "bigint") throw new Error("Expected valid Last-Event-ID to parse as bigint")
     expect(lastEventId === BigInt(41)).toBe(true)
     const replay = await readTerminalFrame(lastEventId)
     expect(replay.text.includes("event: turn.completed\nid: 42\n")).toBe(true)
