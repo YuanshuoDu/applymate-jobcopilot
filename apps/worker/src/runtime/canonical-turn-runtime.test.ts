@@ -2141,8 +2141,8 @@ describe("createCanonicalTurnRuntime", () => {
     expect(JSON.stringify(events)).not.toContain(originalText)
     expect(JSON.stringify(events)).not.toContain(answerText)
     expect(steerParts.every(part => !JSON.stringify(events).includes(part))).toBe(true)
-    expect(checkpoints.map(checkpoint => checkpoint.consumedInputIds)).toEqual([[], []])
-    expect(checkpoints.map(checkpoint => checkpoint.inputThroughSequence)).toEqual([3n, 3n])
+    expect(checkpoints.map(checkpoint => checkpoint.consumedInputIds)).toEqual([[], [], []])
+    expect(checkpoints.map(checkpoint => checkpoint.inputThroughSequence)).toEqual([3n, 3n, 3n])
     expect(executionResult).toMatchObject({ status: "completed" })
     expect(persistFinal).toHaveBeenCalledOnce()
     const terminal = persistFinal.mock.calls[0]![0].terminal!
