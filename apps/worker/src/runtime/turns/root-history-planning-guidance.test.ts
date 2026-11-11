@@ -73,6 +73,12 @@ function historyBlock(content: JsonValue = defaultHistoryContent()): ContextBloc
 const safeSearchFootprintContent = { kind: "root_task_history_search_footprint", historical: true,
   informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true, roles: ["Backend Engineer"],
   locations: ["Dublin"], atsSources: ["lever"] } satisfies JsonValue
+const malformedSearchFootprintCases: Array<[string, JsonValue]> = [
+  ["unknown field", { ...safeSearchFootprintContent, secret: "PRIVATE" }],
+  ["untrusted flag missing", { ...safeSearchFootprintContent, advisoryOnly: false }],
+  ["non-allowlisted source", { ...safeSearchFootprintContent, atsSources: ["unknown"] }],
+  ["sensitive role", { ...safeSearchFootprintContent, roles: ["person@example.com"] }],
+]
 
 function searchFootprintBlock(content: JsonValue = safeSearchFootprintContent): ContextBlock {
   return { id: "observation:root-task-history-search-footprint", layer: "tool_observation", role: "data",
@@ -474,12 +480,7 @@ describe("root history planning guidance", () => {
     expect(text).not.toContain("lever")
   })
 
-  it.each([
-    ["unknown field", { ...safeSearchFootprintContent, secret: "PRIVATE" }],
-    ["untrusted flag missing", { ...safeSearchFootprintContent, advisoryOnly: false }],
-    ["non-allowlisted source", { ...safeSearchFootprintContent, atsSources: ["unknown"] }],
-    ["sensitive role", { ...safeSearchFootprintContent, roles: ["person@example.com"] }],
-  ] as const)("does not activate for malformed footprint-only context: %s", (_name, content) => {
+  it.each(malformedSearchFootprintCases)("does not activate for malformed footprint-only context: %s", (_name, content) => {
     expect(buildRootHistoryPlanningInstruction(context([searchFootprintBlock(content)]), [])).toBeNull()
   })
 

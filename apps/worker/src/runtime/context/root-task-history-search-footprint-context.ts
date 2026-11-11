@@ -27,6 +27,8 @@ export type RootTaskHistorySearchFootprintContext = Readonly<{
   atsSources: readonly string[]
 }>
 
+type MutableRootTaskHistorySearchFootprintContext = { roles: string[]; locations: string[]; atsSources: string[] }
+
 /** Ephemeral provenance for ordering validated source graphs; never persisted or emitted. */
 export type RootTaskHistorySearchFootprintSource = Readonly<{
   sourceTurnId: string; sourceRootTaskId: string; terminalXid8: string; terminalWitnessEventId: string
@@ -81,7 +83,7 @@ function bounded(context: RootTaskHistorySearchFootprintContext): RootTaskHistor
   return Buffer.byteLength(JSON.stringify(safe), "utf8") <= MAX_BYTES ? safe : undefined
 }
 
-function empty(): RootTaskHistorySearchFootprintContext {
+function empty(): MutableRootTaskHistorySearchFootprintContext {
   return { roles: [], locations: [], atsSources: [] }
 }
 
