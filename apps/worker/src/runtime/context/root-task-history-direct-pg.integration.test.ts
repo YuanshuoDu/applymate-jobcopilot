@@ -4,7 +4,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
-import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
+import { createDiscoveryQueryFootprint } from "../subagents/child-discovery-query-footprint.js"
+import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "../subagents/child-discovery-attempt.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
+import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput,
+  type DirectRootTaskHistorySearchFootprintLoadInput } from "./root-task-history-direct-store.js"
 import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, updateRootObjectiveHistoryProjection } from "./objective-history-projection.js"
 import { projectRootTaskHistory, type ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
 import { acquireRootTaskHistoryChronologyLock, appendRootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.js"
@@ -163,7 +168,8 @@ type Source = Readonly<{
     key: string; templateId: string; role: string; taskType: string; goal: string; successCriteria: readonly string[]; result?: unknown
   }>[]
   failureChildren?: readonly Readonly<{ key: string; templateId: string; role: string; taskType: string; failureReason: string }>[]
-  turnSource?: string; terminalCreatedAt?: Date
+  turnSource?: string; turnExecutionMode?: "canonical_task_graph"; terminalCreatedAt?: Date
+  searchFootprint?: Readonly<{ role: string; location: string; atsSource: "greenhouse" | "lever" | "workday" | "smartrecruiters" | "personio" }>
 }>
 
 const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : describe.skip, suffix = randomUUID()
@@ -194,6 +200,19 @@ function reportedScoutResult(finalItemId: string) {
     structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "partial", summary: "private summary",
       evidence: [{ id: "e1", kind: "job", ref: "job-1", source: "greenhouse" }],
       candidates: [{ jobId: "job-1", source: "greenhouse", url: "https://private.example/1", evidenceIds: ["e1"] }] } }
+}
+function searchFootprintScoutResult(search: NonNullable<Source["searchFootprint"]>) {
+  return {
+    taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "scout-count", status: "passed", reasonCode: "criteria_met" }],
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) },
+    discoveryAttempt: { attemptCount: 1, health: { schemaVersion: DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION,
+      attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0, candidateCount: 7,
+      providerFailures: 1, materializationFailures: 2, hasMore: true },
+      queryFootprint: createDiscoveryQueryFootprint([{ criteria: { targetRoles: [search.role], targetLocations: [search.location],
+        source: search.atsSource, pageSize: 20, hasCursor: true }, outcome: "completed", requestCount: 2,
+        observedCandidateCount: 7, providerFailures: 1, materializationFailures: 2, hasMore: true }]) },
+  }
 }
 const matching: Source[] = [
   { turnId: `root-history-source-a-${suffix}`, rootTaskId: `root-history-root-a-${suffix}`, childId: `root-history-child-a-${suffix}`,
@@ -274,6 +293,26 @@ const otherUser: Source = { turnId: `root-history-other-user-turn-${suffix}`, ro
   childId: `root-history-other-user-child-${suffix}`, finalItemId: `root-history-other-user-final-${suffix}`,
   sessionId: foreignSessionId, userId: otherUserId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1,
   failureChildren: [{ key: "foreign-user", templateId: "analyst", role: "analyst", taskType: "job_analysis", failureReason: "child_resume_unavailable" }] }
+const searchFootprintMatch: Source = { turnId: `root-history-footprint-match-${suffix}`, rootTaskId: `root-history-footprint-match-root-${suffix}`,
+  childId: `root-history-footprint-match-child-${suffix}`, finalItemId: `root-history-footprint-match-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 500,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-01T00:00:00.000Z"),
+  searchFootprint: { role: "Backend Engineer", location: "Dublin", atsSource: "lever" } }
+const searchFootprintWrongObjective: Source = { turnId: `root-history-footprint-objective-${suffix}`, rootTaskId: `root-history-footprint-objective-root-${suffix}`,
+  childId: `root-history-footprint-objective-child-${suffix}`, finalItemId: `root-history-footprint-objective-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: "Search for a different role", criteria, input: { goal: "Search for a different role", successCriteria: criteria },
+  startSequence: 600, turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-02T00:00:00.000Z"),
+  searchFootprint: { role: "Foreign Objective Role", location: "Berlin", atsSource: "workday" } }
+const searchFootprintForeignTenant: Source = { turnId: `root-history-footprint-tenant-${suffix}`, rootTaskId: `root-history-footprint-tenant-root-${suffix}`,
+  childId: `root-history-footprint-tenant-child-${suffix}`, finalItemId: `root-history-footprint-tenant-final-${suffix}`,
+  sessionId: foreignSessionId, userId: otherUserId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 3,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-03T00:00:00.000Z"),
+  searchFootprint: { role: "Foreign Tenant Role", location: "Cork", atsSource: "personio" } }
+const searchFootprintFuture: Source = { turnId: `root-history-footprint-future-${suffix}`, rootTaskId: `root-history-footprint-future-root-${suffix}`,
+  childId: `root-history-footprint-future-child-${suffix}`, finalItemId: `root-history-footprint-future-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 800,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2031-01-01T00:00:00.000Z"),
+  searchFootprint: { role: "Future Role", location: "Oslo", atsSource: "greenhouse" } }
 const future: Source = { turnId: `root-history-future-turn-${suffix}`, rootTaskId: `root-history-future-root-${suffix}`,
   childId: `root-history-future-child-${suffix}`, finalItemId: `root-history-future-final-${suffix}`,
   sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 2101,
@@ -434,29 +473,38 @@ async function insertSource(source: Source): Promise<void> {
   const rootStatus = source.rootStatus ?? status
   const terminalCreatedAt = source.terminalCreatedAt ?? new Date("2026-01-01T00:00:00.000Z")
   const startCreatedAt = new Date(terminalCreatedAt.getTime() - 1)
+  const scoutEnvelope = source.searchFootprint ? { role: "scout" as const, taskType: "job_discovery",
+    expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" as const }, allowedActions: ["jobs.discover"] } : undefined
+  const scoutVerification = source.searchFootprint ? { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+    criteria: [{ id: "scout-count", check: { kind: "candidate_count_gte", minimum: 1 } }] } : undefined
   const children = [
-    { id: source.childId, key: "scout", templateId: "scout", role: "scout", taskType: "scout", status: "completed" as const,
-      failureReason: null, goal: "Find matching roles", successCriteria: ["Find one role"], result: source.scoutResult ?? null },
+    { id: source.childId, key: "scout", templateId: "scout", role: "scout", taskType: scoutEnvelope?.taskType ?? "scout", status: "completed" as const,
+      failureReason: null, goal: "Find matching roles", successCriteria: ["Find one role"], result: source.scoutResult
+        ?? (source.searchFootprint ? searchFootprintScoutResult(source.searchFootprint) : null),
+      allowedActions: scoutEnvelope?.allowedActions ?? [], expectedOutputSchema: scoutEnvelope?.expectedOutputSchema ?? {} },
     ...(source.completedChildren ?? []).map(child => ({
       id: `${source.childId}-${child.key}`, key: child.key, templateId: child.templateId, role: child.role,
       taskType: child.taskType, status: "completed" as const, failureReason: null, goal: child.goal,
-      successCriteria: child.successCriteria, result: child.result ?? null,
+      successCriteria: child.successCriteria, result: child.result ?? null, allowedActions: [], expectedOutputSchema: {},
     })),
     ...(source.failureChildren ?? []).map(failure => ({
       id: `${source.childId}-${failure.key}`, key: `failure-${failure.key}`, templateId: failure.templateId,
       role: failure.role, taskType: failure.taskType, status: "failed" as const, failureReason: failure.failureReason,
       goal: `Inspect ${failure.key} prerequisites`, successCriteria: [`Complete ${failure.key} work`],
-      result: { finalText: `PRIVATE_${failure.key.toUpperCase()}_RESULT` },
+      result: { finalText: `PRIVATE_${failure.key.toUpperCase()}_RESULT` }, allowedActions: [], expectedOutputSchema: {},
     })),
   ]
   const graph = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: children.map(child => ({
     key: child.key, templateId: child.templateId, goal: child.goal, successCriteria: child.successCriteria,
     dependsOn: [], depth: 1, taskId: child.id,
+    ...(child.key === "scout" && scoutEnvelope && scoutVerification ? { verificationDisposition: "typed",
+      verification: scoutVerification, registeredScoutEnvelope: scoutEnvelope } : {}),
   })) })
   await pool!.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
-    "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
-    VALUES ($1, $2, $3, $4, $5, $6::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $7, NULL, NULL, NULL, 1, CURRENT_TIMESTAMP)`,
-  [source.turnId, source.sessionId, source.userId, status, source.turnSource ?? "user", JSON.stringify(source.input), source.rootTaskId])
+    "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "executionMode", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $7, $8, NULL, NULL, NULL, 1, CURRENT_TIMESTAMP)`,
+  [source.turnId, source.sessionId, source.userId, status, source.turnSource ?? "user", JSON.stringify(source.input), source.rootTaskId,
+    source.turnExecutionMode ?? null])
   await pool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
     "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "completedAt", "updatedAt")
     VALUES ($1, $2, $3, $1, NULL, '/source', 0, 'orchestrator', 'root', $4, $5, '[]'::jsonb, $6::jsonb, '[]'::jsonb,
@@ -466,10 +514,11 @@ async function insertSource(source: Source): Promise<void> {
     await pool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
       "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "result", "failureReason",
       "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "completedAt", "updatedAt")
-      VALUES ($1, $2, $3, $4, $4, $5, 1, $6, $7, $8, $9, '[]'::jsonb, $10::jsonb, '[]'::jsonb,
-        '{}'::jsonb, '{}'::jsonb, $11::jsonb, $12, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      VALUES ($1, $2, $3, $4, $4, $5, 1, $6, $7, $8, $9, '[]'::jsonb, $10::jsonb, $11::jsonb,
+        '{}'::jsonb, $12::jsonb, $13::jsonb, $14, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
     [child.id, source.sessionId, source.turnId, source.rootTaskId, `/source/${child.key}`, child.role, child.taskType, child.status,
-      child.goal, JSON.stringify(child.successCriteria), child.result === null ? null : JSON.stringify(child.result), child.failureReason])
+      child.goal, JSON.stringify(child.successCriteria), JSON.stringify(child.allowedActions), JSON.stringify(child.expectedOutputSchema),
+      child.result === null ? null : JSON.stringify(child.result), child.failureReason])
   }
   await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "completedAt", "updatedAt")
     VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
@@ -539,6 +588,7 @@ async function projectSources(sources: readonly Source[]): Promise<void> {
   try {
     await client.query("BEGIN")
     for (const source of sources) {
+      await client.query("SELECT set_config($1,$2,true)", ["app.user_id", source.userId])
       const identity = { userId: source.userId, sessionId: source.sessionId, turnId: source.turnId, rootTaskId: source.rootTaskId }
       const objectiveProjected = await updateRootObjectiveHistoryProjection(client, identity)
       if (!objectiveProjected) throw new Error(`Objective-history projection failed for ${source.turnId}`)
@@ -631,6 +681,9 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await insertSource(equalCutoff)
     await insertSource(foreignScopeCorrelation)
     await insertSource(otherUser)
+    await insertSource(searchFootprintMatch)
+    await insertSource(searchFootprintWrongObjective)
+    await insertSource(searchFootprintForeignTenant)
     await insertSource(inconsistentTerminal)
     await insertSource(streamingTerminalStep)
     await insertSource(failedTerminalStep)
@@ -654,8 +707,10 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     [currentStepId, sessionId, currentTurnId, currentRootTaskId])
     await insertCurrentStartBoundary()
     await insertSource(future)
+    await insertSource(searchFootprintFuture)
     await projectSources([...matching, otherSession, crossEqualTimeHigherTurnId, crossWrongOrigin, equalCutoff, future,
-      ...crossSessionWrongOriginFillers])
+      ...crossSessionWrongOriginFillers, searchFootprintMatch, searchFootprintWrongObjective,
+      searchFootprintForeignTenant, searchFootprintFuture])
   })
 
   afterAll(async () => {
@@ -667,6 +722,25 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       await pool.end()
     }
   })
+
+  it("projects only bounded prior same-tenant objective Scout criteria through PostgreSQL", async () => {
+    const input: DirectRootTaskHistorySearchFootprintLoadInput = { lease, rootTaskId: currentRootTaskId,
+      rootAttemptCount: 2, stepId: currentStepId, now: new Date(), searchFootprintReadAllowed: true }
+    const store = createPgDirectRootTaskHistoryStore(pool!)
+    const footprint = await store.loadSearchFootprints(input)
+    expect(footprint).toEqual({ roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] })
+    expect(JSON.stringify(footprint)).not.toMatch(/root-history-footprint|Foreign Objective Role|Foreign Tenant Role|Future Role|Berlin|Cork|Oslo|pageSize|hasCursor|candidateCount|providerFailures|materializationFailures/)
+
+    const client = await pool!.connect()
+    try {
+      await client.query("BEGIN")
+      await client.query("SELECT set_config($1,$2,true)", ["app.user_id", otherUserId])
+      await expect(store.loadSearchFootprintsWithClient(client, input)).rejects.toThrow("root_task_history_scope_mismatch")
+    } finally {
+      await client.query("ROLLBACK").catch(() => undefined)
+      client.release()
+    }
+  }, 60_000)
 
   it("returns same-user/session Roots with the exact canonical objective and a distinct source Root ID", async () => {
     const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,

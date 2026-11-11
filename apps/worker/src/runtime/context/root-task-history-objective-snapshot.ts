@@ -15,8 +15,14 @@ import {
   createRootTaskHistoryObjectiveSnapshotIdentity, createRootTaskHistoryObjectiveSnapshotPayload,
   readRootTaskHistoryObjectiveSnapshotPayload, rootTaskHistoryObjectiveSnapshotKey,
 } from "./root-task-history-objective-snapshot-codec.js"
+import {
+  createRootTaskHistorySearchFootprintSnapshotIdentity, createRootTaskHistorySearchFootprintSnapshotPayload,
+  readRootTaskHistorySearchFootprintSnapshotPayload, rootTaskHistorySearchFootprintSnapshotKey,
+  type RootTaskHistorySearchFootprintContext,
+} from "./root-task-history-search-footprint-context.js"
 
 export const ROOT_TASK_HISTORY_OBJECTIVE_SNAPSHOT_EVENT_TYPE = ROOT_TASK_HISTORY_MEMORY_SNAPSHOT_EVENT_TYPE
+export const ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_SNAPSHOT_EVENT_TYPE = "agent.plan.root_task_history_search_footprint_snapshot"
 const SAFE_ERROR = "Root task history snapshot could not be verified; start a new Turn."
 
 type Row = Record<string, unknown>
@@ -46,6 +52,16 @@ export type RootTaskHistoryObjectiveSnapshotResult = Readonly<{
   reused: boolean
 }>
 
+export type RootTaskHistorySearchFootprintSnapshotInput = Omit<RootTaskHistoryObjectiveSnapshotInput, "loadOutcomes"> & Readonly<{
+  searchFootprintReadAllowed: boolean
+  loadSearchFootprints: (client: Pick<pg.PoolClient, "query">) => Promise<RootTaskHistorySearchFootprintContext>
+}>
+
+export type RootTaskHistorySearchFootprintSnapshotResult = Readonly<{
+  searchFootprints: RootTaskHistorySearchFootprintContext
+  reused: boolean
+}>
+
 function conflict(): TurnEngineError { return new TurnEngineError("persistence_conflict", SAFE_ERROR) }
 function idempotencyId(key: string): string { return `agent-root-task-history-${createHash("sha256").update(key).digest("hex")}` }
 function sequence(value: unknown): string | null {
@@ -61,9 +77,9 @@ async function readEvent(client: Pick<pg.PoolClient, "query">, key: string): Pro
   return rows.rows[0] ?? null
 }
 
-function validEvent(row: EventRow, key: string): boolean {
+function validEvent(row: EventRow, key: string, eventType = ROOT_TASK_HISTORY_OBJECTIVE_SNAPSHOT_EVENT_TYPE): boolean {
   return row.id === idempotencyId(key) && row.idempotencyKey === key
-    && row.type === ROOT_TASK_HISTORY_OBJECTIVE_SNAPSHOT_EVENT_TYPE && row.actor === "orchestrator"
+    && row.type === eventType && row.actor === "orchestrator"
     && row.itemId === null && row.causationId === null && text(row.turnId) && text(row.taskId)
     && row.correlationId === row.taskId && sequence(row.sequence) !== null
 }
@@ -88,7 +104,8 @@ async function assertNoOrphanOutbox(client: Pick<pg.PoolClient, "query">, key: s
   if (rows.rows.length) throw conflict()
 }
 
-async function assertRetainedOwner(client: Pick<pg.PoolClient, "query">, row: EventRow, input: RootTaskHistoryObjectiveSnapshotInput): Promise<void> {
+async function assertRetainedOwner(client: Pick<pg.PoolClient, "query">, row: EventRow,
+  input: Pick<RootTaskHistoryObjectiveSnapshotInput, "lease" | "rootTaskId">): Promise<void> {
   const result = await client.query<Row>(`SELECT turn."id", root."id" AS "rootId" FROM "agent_turns" turn
     JOIN "agent_sessions" session ON session."id"=turn."sessionId" AND session."userId"=$3
     JOIN "sub_agent_tasks" root ON root."id"=turn."rootTaskId" AND root."sessionId"=turn."sessionId" AND root."turnId"=turn."id"
@@ -99,8 +116,8 @@ async function assertRetainedOwner(client: Pick<pg.PoolClient, "query">, row: Ev
     || result.rows[0]?.rootId !== row.taskId) throw conflict()
 }
 
-async function appendEvent(client: Pick<pg.PoolClient, "query">, input: RootTaskHistoryObjectiveSnapshotInput,
-  key: string, payload: RepositoryJsonValue): Promise<EventRow> {
+async function appendEvent(client: Pick<pg.PoolClient, "query">, input: Pick<RootTaskHistoryObjectiveSnapshotInput, "lease" | "rootTaskId">,
+  key: string, payload: RepositoryJsonValue, eventType = ROOT_TASK_HISTORY_OBJECTIVE_SNAPSHOT_EVENT_TYPE): Promise<EventRow> {
   const id = idempotencyId(key)
   const next = await client.query<{ eventSequence: string | number | bigint }>(`UPDATE "agent_sessions"
     SET "eventSequence"="eventSequence"+1 WHERE "id"=$1 AND "userId"=$2 RETURNING "eventSequence"`,
@@ -109,10 +126,10 @@ async function appendEvent(client: Pick<pg.PoolClient, "query">, input: RootTask
   if (!eventSequence) throw conflict()
   await client.query(`INSERT INTO "agent_events" ("id","sessionId","turnId","itemId","taskId","sequence","type","actor",
     "correlationId","causationId","idempotencyKey","payload") VALUES ($1,$2,$3,NULL,$4,$5,$6,'orchestrator',$4,NULL,$7,$8::jsonb)`,
-  [id, input.lease.sessionId, input.lease.turnId, input.rootTaskId, eventSequence, ROOT_TASK_HISTORY_OBJECTIVE_SNAPSHOT_EVENT_TYPE,
+  [id, input.lease.sessionId, input.lease.turnId, input.rootTaskId, eventSequence, eventType,
     key, JSON.stringify(payload)])
   const event: EventRow = { id, sessionId: input.lease.sessionId, turnId: input.lease.turnId, taskId: input.rootTaskId,
-    sequence: eventSequence, type: ROOT_TASK_HISTORY_OBJECTIVE_SNAPSHOT_EVENT_TYPE, actor: "orchestrator", itemId: null,
+    sequence: eventSequence, type: eventType, actor: "orchestrator", itemId: null,
     correlationId: input.rootTaskId, causationId: null, idempotencyKey: key, payload }
   const outbox = expectedOutbox(event, payload)
   await client.query(`INSERT INTO "agent_outbox" ("id","topic","aggregateId","idempotencyKey","payload") VALUES ($1,$2,$3,$4,$5::jsonb)`,
@@ -142,4 +159,28 @@ export async function withRootTaskHistoryObjectiveSnapshot(
   const outcomes = readRootTaskHistoryObjectiveSnapshotPayload(payload, identity)
   if (!validEvent(event, key) || !outcomes) throw conflict()
   return { outcomes, reused: false }
+}
+
+/** Persists or replays the independently authorized searchFootprints channel under its own event key. */
+export async function withRootTaskHistorySearchFootprintSnapshot(
+  input: RootTaskHistorySearchFootprintSnapshotInput,
+): Promise<RootTaskHistorySearchFootprintSnapshotResult | undefined> {
+  if (input.searchFootprintReadAllowed !== true) return undefined
+  const identity = createRootTaskHistorySearchFootprintSnapshotIdentity(input)
+  if (!identity) return undefined
+  const key = rootTaskHistorySearchFootprintSnapshotKey(identity), prior = await readEvent(input.client, key)
+  if (prior) {
+    await assertRetainedOwner(input.client, prior, input)
+    const searchFootprints = readRootTaskHistorySearchFootprintSnapshotPayload(prior.payload, identity)
+    if (!validEvent(prior, key, ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_SNAPSHOT_EVENT_TYPE) || !searchFootprints) throw conflict()
+    await verifyOutbox(input.client, expectedOutbox(prior, toRepositoryJson(prior.payload)))
+    return { searchFootprints, reused: true }
+  }
+  await assertNoOrphanOutbox(input.client, key)
+  const payload = createRootTaskHistorySearchFootprintSnapshotPayload(identity, await input.loadSearchFootprints(input.client))
+  if (!payload) throw conflict()
+  const event = await appendEvent(input.client, input, key, payload, ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_SNAPSHOT_EVENT_TYPE)
+  const searchFootprints = readRootTaskHistorySearchFootprintSnapshotPayload(payload, identity)
+  if (!validEvent(event, key, ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_SNAPSHOT_EVENT_TYPE) || !searchFootprints) throw conflict()
+  return { searchFootprints, reused: false }
 }

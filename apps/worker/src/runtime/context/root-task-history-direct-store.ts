@@ -1,7 +1,9 @@
 import type pg from "pg"
-import { loadTaskGraph, type GraphIdentityScope } from "../subagents/task-graph-pg-state.js"
+import { currentTaskGraph, loadTaskGraph, type GraphIdentityScope } from "../subagents/task-graph-pg-state.js"
 import { projectLoadedRootTaskHistoryGraph, type LoadedRootTaskHistoryGraphProjection } from "./root-task-history-lesson-projection.js"
 import type { ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
+import { mergeRootTaskHistorySearchFootprintSources, projectRootTaskHistorySearchFootprintContext,
+  type RootTaskHistorySearchFootprintContext, type RootTaskHistorySearchFootprintSource } from "./root-task-history-search-footprint-context.js"
 import { readRootTaskHistoryCandidates, type RootTaskHistoryCandidate } from "./root-task-history-source-store.js"
 import {
   readRootTaskHistoryFence, validateRootTaskHistoryFenceInput, withRootTaskHistoryTransaction,
@@ -13,6 +15,8 @@ type Client = pg.PoolClient
 const GRAPH_LOAD_LIMIT = 8
 
 export type DirectRootTaskHistoryLoadInput = RootTaskHistoryFenceInput
+export type DirectRootTaskHistorySearchFootprintLoadInput = Omit<RootTaskHistoryFenceInput, "crossSessionRootTaskHistoryEnabled">
+  & Readonly<{ searchFootprintReadAllowed: boolean }>
 
 function databaseError(value: unknown): boolean {
   return !!value && typeof value === "object" && "code" in value && typeof value.code === "string"
@@ -57,6 +61,35 @@ async function assertTenantScope(client: Client, userId: string): Promise<void> 
   if (result.rows.length !== 1 || result.rows[0]?.userId !== userId) throw new Error("root_task_history_scope_mismatch")
 }
 
+async function readSearchFootprintsWithClient(client: Client, input: DirectRootTaskHistorySearchFootprintLoadInput): Promise<RootTaskHistorySearchFootprintContext> {
+  if (input.searchFootprintReadAllowed !== true) return { roles: [], locations: [], atsSources: [] }
+  const request: RootTaskHistoryFenceInput = { ...input, crossSessionRootTaskHistoryEnabled: true }
+  const fence = await readRootTaskHistoryFence(client, request)
+  if (!fence?.currentOrigin || !fence.currentStartWitness) return { roles: [], locations: [], atsSources: [] }
+  const candidates = await readRootTaskHistoryCandidates(client, request, fence), sources: RootTaskHistorySearchFootprintSource[] = []
+  let graphLoads = 0
+  for (const candidate of candidates) {
+    if (candidate.sessionId === input.lease.sessionId || graphLoads >= GRAPH_LOAD_LIMIT) continue
+    graphLoads += 1
+    if (!await lockEligibleSourceSession(client, candidate.sessionId, input.lease.userId)) continue
+    const scope: GraphIdentityScope = { userId: input.lease.userId, sessionId: candidate.sessionId,
+      turnId: candidate.turnId, rootTaskId: candidate.rootTaskId, parentTaskId: candidate.rootTaskId }
+    try {
+      const loaded = await loadTaskGraph(client, scope, false)
+      if (!loaded.item || !loaded.snapshot || !loaded.state || !projectLoadedRootTaskHistoryGraph(loaded, true)) continue
+      const footprint = projectRootTaskHistorySearchFootprintContext(currentTaskGraph(loaded))
+      if (footprint && candidate.terminalXid8 && candidate.terminalWitnessEventId) sources.push({
+        sourceTurnId: candidate.turnId, sourceRootTaskId: candidate.rootTaskId,
+        terminalXid8: candidate.terminalXid8, terminalWitnessEventId: candidate.terminalWitnessEventId, footprint,
+      })
+    } catch (error: unknown) {
+      if (graphEvidenceError(error)) continue
+      throw error
+    }
+  }
+  return mergeRootTaskHistorySearchFootprintSources(sources, fence.currentStartWitness.xid8) ?? { roles: [], locations: [], atsSources: [] }
+}
+
 export function createPgDirectRootTaskHistoryStore(pool: Pool) {
   async function readWithClient(client: Client, input: DirectRootTaskHistoryLoadInput): Promise<readonly ValidatedRootTaskHistoryOutcome[]> {
     const fence = await readRootTaskHistoryFence(client, input)
@@ -88,6 +121,17 @@ export function createPgDirectRootTaskHistoryStore(pool: Pool) {
     async load(input: DirectRootTaskHistoryLoadInput): Promise<readonly ValidatedRootTaskHistoryOutcome[]> {
       validateRootTaskHistoryFenceInput(input)
       return withRootTaskHistoryTransaction(pool, input.lease.userId, client => readWithClient(client, input))
+    },
+    async loadSearchFootprintsWithClient(client: Client, input: DirectRootTaskHistorySearchFootprintLoadInput): Promise<RootTaskHistorySearchFootprintContext> {
+      if (input.searchFootprintReadAllowed !== true) return { roles: [], locations: [], atsSources: [] }
+      validateRootTaskHistoryFenceInput({ ...input, crossSessionRootTaskHistoryEnabled: true })
+      await assertTenantScope(client, input.lease.userId)
+      return readSearchFootprintsWithClient(client, input)
+    },
+    async loadSearchFootprints(input: DirectRootTaskHistorySearchFootprintLoadInput): Promise<RootTaskHistorySearchFootprintContext> {
+      if (input.searchFootprintReadAllowed !== true) return { roles: [], locations: [], atsSources: [] }
+      validateRootTaskHistoryFenceInput({ ...input, crossSessionRootTaskHistoryEnabled: true })
+      return withRootTaskHistoryTransaction(pool, input.lease.userId, client => readSearchFootprintsWithClient(client, input))
     },
   }
 }

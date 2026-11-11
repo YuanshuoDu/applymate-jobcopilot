@@ -15,7 +15,8 @@ import type { TurnLease } from "../turns/lease.js"
 import { acquireRootTaskHistoryChronologyLock, appendRootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.js"
 import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
 import { readRootTaskHistoryFence } from "./root-task-history-fence.js"
-import { withRootTaskHistoryObjectiveSnapshot, ROOT_TASK_HISTORY_OBJECTIVE_SNAPSHOT_EVENT_TYPE } from "./root-task-history-objective-snapshot.js"
+import { withRootTaskHistoryObjectiveSnapshot, ROOT_TASK_HISTORY_OBJECTIVE_SNAPSHOT_EVENT_TYPE,
+  ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_SNAPSHOT_EVENT_TYPE } from "./root-task-history-objective-snapshot.js"
 import { readRootTaskHistorySteerEvidence } from "./root-task-history-steer-evidence.js"
 import { withRootTaskHistorySessionAuthorization } from "./root-task-history-session-memory.js"
 import { createPgInputClaimStore } from "./input-claim-store.js"
@@ -380,6 +381,31 @@ function startFixtureWorker(mode: string, input: { turnId: string; forceContextF
   })
   workerProcesses.push(child)
   return child
+}
+
+async function runSearchFootprintSnapshotProcess(mode: "search-footprint-snapshot-write" | "search-footprint-snapshot-replay",
+  input: Record<string, unknown>): Promise<{ searchFootprints: { roles: string[]; locations: string[]; atsSources: string[] }; reused: boolean }> {
+  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, CI: "true", NODE_ENV: "test",
+    DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true",
+    AGENT_RUNTIME_PG_TEST_REQUIRED: "true" }
+  const child = spawn(process.execPath, ["--import", "tsx", restartFixturePath, mode, JSON.stringify(input)], {
+    cwd: workerCwd, env, stdio: ["ignore", "pipe", "pipe"],
+  })
+  let stdout = "", stderr = ""
+  child.stdout?.setEncoding("utf8"); child.stderr?.setEncoding("utf8")
+  child.stdout?.on("data", (chunk: string) => { stdout += chunk })
+  child.stderr?.on("data", (chunk: string) => { stderr += chunk })
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("Search-footprint snapshot process timed out")) }, 30_000)
+    child.once("error", error => { clearTimeout(timeout); reject(error) })
+    child.once("close", code => {
+      clearTimeout(timeout)
+      const line = stdout.split("\n").find(value => value.startsWith("FIXTURE_SEARCH_FOOTPRINT_SNAPSHOT "))
+      if (code !== 0 || !line) { reject(new Error(`Search-footprint snapshot process failed: ${stderr || stdout}`)); return }
+      try { resolve(JSON.parse(line.slice("FIXTURE_SEARCH_FOOTPRINT_SNAPSHOT ".length)) as Awaited<ReturnType<typeof runSearchFootprintSnapshotProcess>>) }
+      catch (error: unknown) { reject(error) }
+    })
+  })
 }
 
 async function waitForFixtureLine(child: WorkerFixtureProcess, marker: string, timeoutMs = 30_000): Promise<string> {
@@ -862,6 +888,49 @@ describePg("root task history objective snapshot PostgreSQL durability", () => {
       expect((await replayPool.query<{ eventSequence: string }>(`SELECT "eventSequence"::text AS "eventSequence" FROM "agent_sessions" WHERE "id"=$1`, [fixture.sessionId])).rows[0]?.eventSequence)
         .toBe(sequenceBeforeReplay)
     } finally { await replayPool.end() }
+  })
+
+  it("replays a footprint-only projection after a separate process restart without an outcomes payload", async () => {
+    const fixture = await createScenario(pool!, false); scenarios.push(fixture)
+    const client = await pool!.connect()
+    let fence: Awaited<ReturnType<typeof readRootTaskHistoryFence>> | undefined
+    try {
+      await client.query("BEGIN")
+      await client.query("SELECT set_config($1,$2,true)", ["app.user_id", fixture.userId])
+      fence = await readRootTaskHistoryFence(client, { lease: fixture.lease, rootTaskId: fixture.rootTaskId,
+        rootAttemptCount: 1, stepId: fixture.stepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true })
+      const steer = await readRootTaskHistorySteerEvidence(client, fixture.scope, { sessionId: fixture.sessionId,
+        turnId: fixture.turnId, stepId: fixture.stepId,
+        lease: { ownerId: fixture.lease.ownerId, leaseVersion: fixture.lease.leaseVersion, now: new Date() } })
+      expect(steer).toEqual({ kind: "no_accepted_steer" })
+      await client.query("COMMIT")
+    } catch (error: unknown) {
+      await client.query("ROLLBACK").catch(() => undefined)
+      throw error
+    } finally { client.release() }
+    if (!fence?.currentOrigin || !fence.currentStartWitness) throw new Error("Search-footprint restart fixture lacks a current objective fence")
+    const searchFootprints = { roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] }
+    const processInput = { lease: { ...fixture.lease,
+      leaseStartedAt: fixture.lease.leaseStartedAt.toISOString(), leaseExpiresAt: fixture.lease.leaseExpiresAt.toISOString() },
+      rootTaskId: fixture.rootTaskId, authorization: { eventId: `search-footprint-auth-${fixture.turnId}`,
+        sessionId: fixture.sessionId, userId: fixture.userId, consentVersion: 1, consentEnabled: false, gateEnabledAtCapture: false },
+      fence: { currentStartSequence: fence.currentStartSequence.toString(), currentStartWitness: fence.currentStartWitness,
+        objectiveDigest: fence.objectiveDigest, currentOrigin: fence.currentOrigin }, acceptedInputRevision: "0", searchFootprints }
+
+    const firstProcess = await runSearchFootprintSnapshotProcess("search-footprint-snapshot-write", processInput)
+    expect(firstProcess).toEqual({ searchFootprints, reused: false })
+    const events = await pool!.query<Record<string, unknown>>(`SELECT "id","sequence","idempotencyKey","payload" FROM "agent_events"
+      WHERE "sessionId"=$1 AND "type"=$2`, [fixture.sessionId, ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_SNAPSHOT_EVENT_TYPE])
+    expect(events.rows).toHaveLength(1)
+    const payload = events.rows[0]?.payload as Record<string, unknown>
+    expect(payload).toEqual({ schemaVersion: "agent-harness.v2.root-task-history-search-footprint-snapshot.v1", searchFootprints })
+    expect(JSON.stringify(payload)).not.toMatch(/outcomes|sourceTurnId|sourceRootTaskId|PRIVATE|sessionId|userId|objectiveDigest/)
+    expect(await snapshotEvent(pool!, fixture.sessionId)).toHaveLength(0)
+
+    const afterRestart = await runSearchFootprintSnapshotProcess("search-footprint-snapshot-replay", processInput)
+    expect(afterRestart).toEqual({ searchFootprints, reused: true })
+    expect((await pool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId"=$1 AND "type"=$2`,
+      [fixture.sessionId, ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_SNAPSHOT_EVENT_TYPE])).rows).toHaveLength(1)
   })
 
   it("rolls back authorization, snapshot event, outbox, and sequence together", async () => {

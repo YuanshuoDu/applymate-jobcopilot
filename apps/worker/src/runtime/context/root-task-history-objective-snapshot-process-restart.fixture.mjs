@@ -12,6 +12,7 @@ import { startProductionWorkerRuntime } from "../../queue/production-worker-runt
 import { readRootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.ts"
 import { readRootTaskHistoryFence, rootTaskHistoryOrigin } from "./root-task-history-fence.ts"
 import { createRootTaskHistoryObjectiveSnapshotIdentity } from "./root-task-history-objective-snapshot-codec.ts"
+import { withRootTaskHistorySearchFootprintSnapshot } from "./root-task-history-objective-snapshot.ts"
 import { readRootTaskHistorySteerEvidence } from "./root-task-history-steer-evidence.ts"
 import { matchesAgentOutboxIdentity } from "../outbox-identity.ts"
 const [, , mode, rawInput] = process.argv
@@ -27,6 +28,28 @@ const commandWaiters = new Map()
 const queuedCommands = []
 const noOpProjection = { start: async () => undefined, finish: async () => undefined }
 function say(line) { process.stdout.write(`${line}\n`) }
+async function runSearchFootprintSnapshotProcess() {
+  if (mode !== "search-footprint-snapshot-write" && mode !== "search-footprint-snapshot-replay") throw new Error("fixture_mode_invalid")
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    await client.query("SELECT set_config($1,$2,true)", ["app.user_id", input.lease.userId])
+    const result = await withRootTaskHistorySearchFootprintSnapshot({
+      client, lease: { ...input.lease, leaseStartedAt: new Date(input.lease.leaseStartedAt), leaseExpiresAt: new Date(input.lease.leaseExpiresAt) },
+      rootTaskId: input.rootTaskId, authorization: input.authorization,
+      fence: { ...input.fence, currentStartSequence: BigInt(input.fence.currentStartSequence) },
+      acceptedInputRevision: BigInt(input.acceptedInputRevision), steerEvidence: { kind: "no_accepted_steer" },
+      searchFootprintReadAllowed: true,
+      loadSearchFootprints: async () => mode === "search-footprint-snapshot-write"
+        ? input.searchFootprints : (() => { throw new Error("replay_must_not_reload_source") })(),
+    })
+    await client.query("COMMIT")
+    say(`FIXTURE_SEARCH_FOOTPRINT_SNAPSHOT ${JSON.stringify(result)}`)
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
+}
 function waitForCommand(command) {
   const queued = queuedCommands.indexOf(command)
   if (queued >= 0) { queuedCommands.splice(queued, 1); return Promise.resolve() }
@@ -617,7 +640,12 @@ async function waitForStop() {
   process.stdin.off("data", onStdinData); process.stdin.pause(); process.stdin.destroy()
 }
 async function run() {
-  if (!process.env.AGENT_RUNTIME_PG_TEST_URL || !process.env.AGENT_TURN_REDIS_TEST_URL) throw new Error("fixture_services_missing")
+  if (!process.env.AGENT_RUNTIME_PG_TEST_URL) throw new Error("fixture_database_missing")
+  if (mode === "search-footprint-snapshot-write" || mode === "search-footprint-snapshot-replay") {
+    await runSearchFootprintSnapshotProcess()
+    return
+  }
+  if (!process.env.AGENT_TURN_REDIS_TEST_URL) throw new Error("fixture_redis_missing")
   instrumentCandidateWindowQueries()
   if (mode === "worker-a" || mode === "worker-a-diagnostic") {
     if (mode === "worker-a-diagnostic" && input.forceContextFailureForDiagnostic !== true) {

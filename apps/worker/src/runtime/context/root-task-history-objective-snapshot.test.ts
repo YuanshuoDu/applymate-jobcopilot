@@ -8,9 +8,11 @@ import type { RootTaskHistorySessionAuthorization } from "./root-task-history-se
 import { ROOT_TASK_HISTORY_MEMORY_SNAPSHOT_EVENT_TYPE } from "./root-task-history-session-memory.js"
 import { createRootTaskHistoryObjectiveSnapshotIdentity, rootTaskHistoryObjectiveSnapshotKey } from "./root-task-history-objective-snapshot-codec.js"
 import {
-  ROOT_TASK_HISTORY_OBJECTIVE_SNAPSHOT_EVENT_TYPE, withRootTaskHistoryObjectiveSnapshot,
-  type RootTaskHistoryObjectiveSnapshotInput,
+  ROOT_TASK_HISTORY_OBJECTIVE_SNAPSHOT_EVENT_TYPE, ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_SNAPSHOT_EVENT_TYPE,
+  withRootTaskHistoryObjectiveSnapshot, withRootTaskHistorySearchFootprintSnapshot,
+  type RootTaskHistoryObjectiveSnapshotInput, type RootTaskHistorySearchFootprintSnapshotInput,
 } from "./root-task-history-objective-snapshot.js"
+import { rootTaskHistorySearchFootprintSnapshotKey } from "./root-task-history-search-footprint-context.js"
 
 const fence: RootTaskHistoryFence = { currentStartSequence: 5n, currentStartWitness: { eventId: "start-witness", xid8: "100" },
   objectiveDigest: "c".repeat(64), currentOrigin: '["user","none"]' }
@@ -66,6 +68,12 @@ function input(client: Pick<pg.PoolClient, "query">, load = vi.fn(async () => [o
     authorization, fence, acceptedInputRevision: 0n, steerEvidence: { kind: "no_accepted_steer" }, loadOutcomes: load }
 }
 
+function searchFootprintInput(client: Pick<pg.PoolClient, "query">,
+  load = vi.fn(async () => ({ roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] }))): RootTaskHistorySearchFootprintSnapshotInput {
+  return { ...input(client), authorization: { ...authorization, consentEnabled: false }, searchFootprintReadAllowed: true,
+    loadSearchFootprints: load }
+}
+
 describe("root task history objective snapshot", () => {
   it("uses the private snapshot event type excluded from public session surfaces", () => {
     expect(ROOT_TASK_HISTORY_OBJECTIVE_SNAPSHOT_EVENT_TYPE).toBe(ROOT_TASK_HISTORY_MEMORY_SNAPSHOT_EVENT_TYPE)
@@ -91,6 +99,42 @@ describe("root task history objective snapshot", () => {
     expect(Buffer.byteLength(payload, "utf8")).toBeLessThanOrEqual(8192)
     expect(load).toHaveBeenCalledOnce()
     expect(fake.calls.some(call => /BEGIN|COMMIT|ROLLBACK/.test(call.sql))).toBe(false)
+  })
+
+  it("persists and replays footprint-only memory through its own event key without outcomes", async () => {
+    const fake = fakeClient(), load = vi.fn(async () => ({ roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] }))
+    const request = searchFootprintInput(fake.client, load), result = await withRootTaskHistorySearchFootprintSnapshot(request)
+    const payload = JSON.stringify(fake.events[0]?.payload)
+    expect(result).toEqual({ searchFootprints: { roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] }, reused: false })
+    expect(fake.events).toHaveLength(1)
+    expect(fake.events[0]).toMatchObject({ id: eventId(rootTaskHistorySearchFootprintSnapshotKey({
+      schemaVersion: "agent-harness.v2.root-task-history-search-footprint-snapshot.v1", sessionId: "session-1", userId: "user-1",
+      searchFootprintReadAllowed: true, objectiveDigest: fence.objectiveDigest, canonicalOrigin: fence.currentOrigin!,
+      intentKind: null, intentVersion: null, acceptedInputRevision: "0", steerEvidence: "no_accepted_steer",
+      startWitnessEventId: "start-witness", startWitnessXid8: "100",
+    })), type: ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_SNAPSHOT_EVENT_TYPE })
+    expect(payload).toContain("searchFootprints")
+    expect(payload).not.toContain("outcomes")
+    expect(payload).not.toContain("old-turn")
+    expect(load).toHaveBeenCalledOnce()
+    const replayLoader = vi.fn(async () => ({ roles: ["different"], locations: [], atsSources: [] }))
+    const replay = await withRootTaskHistorySearchFootprintSnapshot(searchFootprintInput(fake.client, replayLoader))
+    expect(replay).toEqual({ searchFootprints: { roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] }, reused: true })
+    expect(replayLoader).not.toHaveBeenCalled()
+    expect(fake.events).toHaveLength(1)
+    expect(fake.outboxes).toHaveLength(1)
+    const notAuthorized = await withRootTaskHistorySearchFootprintSnapshot({ ...searchFootprintInput(fake.client), searchFootprintReadAllowed: false })
+    expect(notAuthorized).toBeUndefined()
+  })
+
+  it("does not read or persist footprint memory after accepted steering", async () => {
+    const fake = fakeClient(), load = vi.fn(async () => ({ roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] }))
+    const result = await withRootTaskHistorySearchFootprintSnapshot({ ...searchFootprintInput(fake.client, load),
+      steerEvidence: { kind: "accepted_steer" } })
+    expect(result).toBeUndefined()
+    expect(load).not.toHaveBeenCalled()
+    expect(fake.events).toHaveLength(0)
+    expect(fake.outboxes).toHaveLength(0)
   })
 
   it("replays the exact immutable snapshot without rereading source outcomes", async () => {
