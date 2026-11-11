@@ -165,7 +165,7 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
       if (rootTaskHistoryReader && base.buildInTransaction && rootTaskHistoryReader.loadWithClient) {
         built = await buildCanonicalRootTaskHistoryContext({ pool: input.pool, scope: input.scope, lease: input.lease,
           rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount, reader: rootTaskHistoryReader,
-          base: { buildInTransaction: base.buildInTransaction }, request, snapshot,
+          base: { buildInTransaction: base.buildInTransaction.bind(base) }, request, snapshot,
           crossSessionRootTaskHistoryEnabled: input.crossSessionRootTaskHistoryEnabled,
           objectiveHistoryIndexEnabled: input.objectiveHistoryIndexEnabled })
       } else {

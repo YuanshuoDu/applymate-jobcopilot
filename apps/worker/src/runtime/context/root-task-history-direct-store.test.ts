@@ -327,7 +327,7 @@ describe("direct Root-task history PostgreSQL store", () => {
         rootTaskId: prior.rootTaskId, parentTaskId: prior.rootTaskId }, false)
       expect(current).toHaveBeenCalledWith(loaded)
       expect(validate).toHaveBeenCalledWith(loaded, true)
-      expect(test.queries.some(query => query.sql.includes("current_setting('app.user_id'")).toBe(true)
+      expect(test.queries.some(query => query.sql.includes("current_setting('app.user_id'"))).toBe(true)
       expect(JSON.stringify(searchFootprints)).not.toMatch(/pageSize|hasCursor|requestCount|observedCandidateCount|providerFailures|materializationFailures|hasMore|turn-source-3|root-source-3/)
     } finally {
       load.mockRestore(); current.mockRestore(); validate.mockRestore()
