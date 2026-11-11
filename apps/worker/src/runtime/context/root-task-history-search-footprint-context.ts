@@ -92,7 +92,8 @@ function parseOrigin(value: unknown): { kind: string | null; version: number | n
     if (!Array.isArray(parsed) || JSON.stringify(parsed) !== value || typeof parsed[0] !== "string"
       || !parsed[0] || parsed[0].length > 128 || parsed[0].trim() !== parsed[0]) return undefined
     if (parsed.length === 2 && parsed[1] === "none") return { kind: null, version: null }
-    if (parsed.length === 3 && parsed[1] === "interactive_discovery_shortlist" && parsed[2] === 1) return { kind: parsed[1], version: 1 }
+    if (parsed.length === 3 && (parsed[1] === "interactive_discovery_shortlist" || parsed[1] === "objective_task_graph_execution")
+      && parsed[2] === 1) return { kind: parsed[1], version: 1 }
   } catch { return undefined }
   return undefined
 }

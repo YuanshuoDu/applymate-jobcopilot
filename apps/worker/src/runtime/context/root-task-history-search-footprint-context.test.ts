@@ -82,6 +82,27 @@ describe("Root task history search-footprint context", () => {
     expect(JSON.stringify(projection)).not.toContain("Future Role")
   })
 
+  it("accepts only the canonical v1 objective TaskGraph origin for snapshot identity", () => {
+    const input = {
+      lease: { userId: "user-a", sessionId: "current-session" },
+      authorization: { eventId: "session-auth", sessionId: "current-session", userId: "user-a", consentVersion: 1,
+        consentEnabled: false, gateEnabledAtCapture: false },
+      searchFootprintReadAllowed: true,
+      fence: { currentStartSequence: 4n, currentStartWitness: { eventId: "current-start", xid8: "50" },
+        objectiveDigest: "a".repeat(64), currentOrigin: JSON.stringify(["user", "objective_task_graph_execution", 1]) },
+      acceptedInputRevision: 2n, steerEvidence: { kind: "no_accepted_steer" as const },
+    }
+    const identity = createRootTaskHistorySearchFootprintSnapshotIdentity(input)
+    expect(identity).toMatchObject({
+      canonicalOrigin: '["user","objective_task_graph_execution",1]',
+      intentKind: "objective_task_graph_execution",
+      intentVersion: 1,
+    })
+    expect(createRootTaskHistorySearchFootprintSnapshotIdentity({
+      ...input, fence: { ...input.fence, currentOrigin: JSON.stringify(["user", "objective_task_graph_execution", 2]) },
+    })).toBeUndefined()
+  })
+
   it("persists and replays a separate bounded searchFootprints event payload", () => {
     const identity = createRootTaskHistorySearchFootprintSnapshotIdentity({
       lease: { userId: "user-a", sessionId: "current-session" },
