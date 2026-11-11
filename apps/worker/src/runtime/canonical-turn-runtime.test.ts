@@ -2036,10 +2036,10 @@ describe("createCanonicalTurnRuntime", () => {
       expect(context.blocks.some(block => JSON.stringify(block.content).includes("PRIOR_PENDING_FOLLOW_UP"))).toBe(false)
       expect(context.blocks.some(block => JSON.stringify(block.content).includes("PRIOR_MISSING_STATUS"))).toBe(false)
     }
-    expect(rootTaskHistory.load).toHaveBeenCalledTimes(2)
+    expect(rootTaskHistory.load).toHaveBeenCalledTimes(3)
     const historyStepIds = rootTaskHistory.load.mock.calls.map(([input]) => (input as { stepId?: unknown }).stepId)
-    expect(historyStepIds).toHaveLength(2)
-    expect(new Set(historyStepIds).size).toBe(2)
+    expect(historyStepIds).toHaveLength(3)
+    expect(new Set(historyStepIds).size).toBe(3)
     for (const context of contexts) {
       const reference = context.blocks.find(block => block.layer === "pending_input" && block.content !== null && typeof block.content === "object" && !Array.isArray(block.content) && block.content.inputId === originalInput.id)
       expect(reference).toMatchObject({ trust: "external_untrusted", content: { inputId: originalInput.id, text: originalText } })
@@ -3165,6 +3165,12 @@ describe("createCanonicalTurnRuntime", () => {
     expect(objective.allowedActions.slice().sort()).toEqual(objective.toolNames.slice().sort())
     expect(objective.route).not.toHaveBeenCalled()
     expect(JSON.stringify(objective.events)).toContain("objective_task_graph_root_tool_disabled")
+  })
+
+  it("passes the TaskGraph requirement to explicit-objective completion assessment", async () => {
+    const objective = await taskGraphRootSurface(false, false, "jobs.search", "agent.interrupt", false,
+      undefined, true, false, false, undefined, undefined, true)
+
     expect(objective.roots.checkCompletion).toHaveBeenCalledWith(expect.objectContaining({ requireTaskGraph: true }))
   })
 
