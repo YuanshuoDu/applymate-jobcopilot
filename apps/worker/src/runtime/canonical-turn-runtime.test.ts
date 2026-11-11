@@ -1898,7 +1898,7 @@ describe("createCanonicalTurnRuntime", () => {
         ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
       }), nativeQuestionWaitEnabled: true, taskGraphCommandPort: prePlanTaskGraphCommandPort,
       taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
-      selectedJobPreparationLoader: async () => undefined, stateLoader: async () => state({ intent: objectiveIntent, goal: originalText }),
+      selectedJobPreparationLoader: async () => undefined, stateLoader: async () => state({ intent: objectiveIntent, goal: "Find software engineering roles in Germany." }),
       rootTaskStore: rootTasks as never, nativeVerificationFactory: () => nativeVerificationRuntime(), turnEngineStoreFactory: () => questionStore,
       contextBuilderFactory: () => ({ build: request => builder.build(request) }),
       modelRuntimeFactory: async () => ({ adapter: {
