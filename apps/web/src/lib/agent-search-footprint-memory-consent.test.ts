@@ -56,7 +56,7 @@ describe('agent search footprint memory consent storage', () => {
       .resolves.toEqual({ kind: 'stale', consent: { enabled: true, version: 5 } })
     expect(mocks.updateMany).not.toHaveBeenCalled()
 
-    mocks.findUnique.mockResolvedValueOnce(consentRow(false, 5)).mockResolvedValueOnce(consentRow(true, 6))
+    mocks.findUnique.mockResolvedValueOnce(consentRow(true, 5)).mockResolvedValueOnce(consentRow(true, 6))
     mocks.updateMany.mockResolvedValueOnce({ count: 0 })
     await expect(setAgentSearchFootprintMemoryConsent('user-1', { enabled: false, expectedVersion: 5 }))
       .resolves.toEqual({ kind: 'stale', consent: { enabled: true, version: 6 } })
