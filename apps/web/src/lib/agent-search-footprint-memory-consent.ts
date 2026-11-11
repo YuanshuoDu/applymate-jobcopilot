@@ -5,6 +5,7 @@ export type AgentSearchFootprintMemoryConsent = { enabled: boolean; version: num
 export type AgentSearchFootprintMemoryConsentMutation = { enabled: boolean; expectedVersion: number }
 export type AgentSearchFootprintMemoryConsentMutationResult =
   | { kind: 'updated'; consent: AgentSearchFootprintMemoryConsent }
+  | { kind: 'unchanged'; consent: AgentSearchFootprintMemoryConsent }
   | { kind: 'stale'; consent: AgentSearchFootprintMemoryConsent }
   | { kind: 'not_found' }
   | { kind: 'version_exhausted'; consent: AgentSearchFootprintMemoryConsent }
@@ -48,6 +49,7 @@ export async function setAgentSearchFootprintMemoryConsent(
 
     const consent = toConsent(row)
     if (consent.version !== input.expectedVersion) return { kind: 'stale', consent }
+    if (consent.enabled === input.enabled) return { kind: 'unchanged', consent }
     if (consent.version === 2_147_483_647) return { kind: 'version_exhausted', consent }
 
     const update = await tx.user.updateMany({
