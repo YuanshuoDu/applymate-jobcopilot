@@ -43,6 +43,13 @@ describe('agent search footprint memory consent storage', () => {
       .resolves.toEqual({ kind: 'updated', consent: { enabled: false, version: 4 } })
   })
 
+  it('does not change the version when the requested choice is already current', async () => {
+    mocks.findUnique.mockResolvedValueOnce(consentRow(true, 7))
+    await expect(setAgentSearchFootprintMemoryConsent('user-1', { enabled: true, expectedVersion: 7 }))
+      .resolves.toEqual({ kind: 'unchanged', consent: { enabled: true, version: 7 } })
+    expect(mocks.updateMany).not.toHaveBeenCalled()
+  })
+
   it('rejects stale, raced, missing-user, and exhausted-version mutations without changing consent', async () => {
     mocks.findUnique.mockResolvedValueOnce(consentRow(true, 5))
     await expect(setAgentSearchFootprintMemoryConsent('user-1', { enabled: false, expectedVersion: 4 }))
