@@ -23,6 +23,7 @@ export function parsePersistedRetryContent(turnId: string, value: unknown): {
   if (!isRecord(value) || !exactKeys(value, ['goal', 'content', 'clientMessageId', 'selectedJobPreparation', 'intent', 'verificationRequirements']) ||
     !boundedGoal(value.goal) || (value.clientMessageId !== undefined && !boundedString(value.clientMessageId, 256)) ||
     !Array.isArray(value.content) || value.content.length < 1 || value.content.length > MAX_RETRY_PARTS) throw retryInputInvalid(turnId)
+  const goal = value.goal
   const content: InputContentPart[] = []
   let attachmentCount = 0
   for (const part of value.content) {
