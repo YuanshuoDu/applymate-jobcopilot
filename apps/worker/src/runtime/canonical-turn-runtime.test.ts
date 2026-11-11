@@ -1773,7 +1773,7 @@ describe("createCanonicalTurnRuntime", () => {
     const laterAnsweredOlderAnswerText = "Berlin, please."
     const objectiveIntent = { kind: "objective_task_graph_execution" as const, version: 1 as const }
     let questionRecovery: "none" | "waiting" | "answered" = "none"
-    const questionReads: Array<typeof questionRecovery> = []
+    const questionReads: Array<"none" | "waiting" | "answered"> = []
     const planningSummary = { observedPlanRevision: 0, graphRevisionAtAsk: 1, pendingSteerCount: 1,
       unconsumedSteerCount: 1, inputThroughSequence: "3" }
     const priorInputHistory = priorConversation([
