@@ -307,7 +307,8 @@ describe("direct Root-task history PostgreSQL store", () => {
   })
 
   it("loads only a bounded footprint from tenant-fenced, validated prior TaskGraphs", async () => {
-    const prior: Row = { ...candidate(3), sessionId: "prior-session", sourceSessionUserId: "user-1" }
+    const prior: Row = { ...candidate(3), sessionId: "prior-session", sourceSessionUserId: "user-1",
+      terminalStepSessionId: "prior-session", terminalStepEventSessionId: "prior-session" }
     const test = fixture({ candidates: [prior] })
     const footprint = createDiscoveryQueryFootprint([{ criteria: { targetRoles: ["Backend Engineer"], targetLocations: ["Dublin"],
       source: "lever", pageSize: 20, hasCursor: true }, outcome: "completed", requestCount: 2, observedCandidateCount: 7,
