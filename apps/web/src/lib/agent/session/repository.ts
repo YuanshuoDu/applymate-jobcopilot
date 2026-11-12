@@ -9,6 +9,7 @@ import type {
 import { toDurableSubAgentTaskStatus } from "./types"
 import { redactAgentEvent } from "@jobcopilot/shared"
 import { createIdempotentAgentSession } from "./agent-session-create-idempotency"
+import { sessionSnapshotFields, withAgentSearchFootprintSessionSnapshot } from "@/lib/agent-search-footprint-session-snapshot"
 
 type JsonValue = unknown
 
@@ -109,7 +110,7 @@ export interface UpdateAgentSessionInput {
   completedAt?: Date | null
 }
 
-export async function createAgentSession(db: AgentSessionDb, input: CreateAgentSessionInput) {
+export async function createAgentSession(db: AgentSessionDb, input: CreateAgentSessionInput): Promise<unknown> {
   const goal = input.idempotencyKey ? input.goal.trim() : input.goal
   const data = {
     userId: input.userId,
@@ -118,8 +119,16 @@ export async function createAgentSession(db: AgentSessionDb, input: CreateAgentS
     status: input.status ?? "running",
     memorySummary: input.memorySummary ?? "",
   }
-  if (!input.idempotencyKey) return db.agentSession.create({ data })
-  return createIdempotentAgentSession(db.agentSession, { ...data, idempotencyKey: input.idempotencyKey })
+  return withAgentSearchFootprintSessionSnapshot(db, input.userId, async (tx, snapshot, captured) => {
+    if (input.idempotencyKey) {
+      return createIdempotentAgentSession(tx.agentSession, {
+        ...data,
+        idempotencyKey: input.idempotencyKey,
+        ...(captured ? { creationSnapshot: snapshot } : {}),
+      })
+    }
+    return tx.agentSession.create({ data: { ...data, ...(captured ? sessionSnapshotFields(snapshot) : {}) } })
+  })
 }
 
 export async function appendTranscriptEvent(db: AgentSessionDb, input: AppendTranscriptEventInput) {

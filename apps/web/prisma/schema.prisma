@@ -77,6 +77,8 @@ model User {
   preferences      Json? // { targetRoles, targetLocations, salaryExpectation, workAuthorization, openToRelocation, aiSettings }
   agentTaskHistoryMemoryEnabled        Boolean @default(false)
   agentTaskHistoryMemoryConsentVersion Int     @default(0)
+  agentSearchFootprintMemoryEnabled        Boolean @default(false)
+  agentSearchFootprintMemoryConsentVersion Int     @default(0)
   personaFields    Json? // PersonaField[] �?learned answers from form fills
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
@@ -1924,6 +1926,8 @@ model AgentSession {
   status        String
   source        String
   memorySummary String    @default("") @db.Text
+  searchFootprintMemoryEnabledAtCreation        Boolean @default(false)
+  searchFootprintMemoryConsentVersionAtCreation Int     @default(0)
   creationIdempotencyKey String? @db.VarChar(128)
   creationIdempotencyRequestHash String? @db.VarChar(64)
   qualityScore  Float?

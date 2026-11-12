@@ -9,6 +9,7 @@ describe("AgentForkService Turn projection", () => {
     const completedAt = new Date("2026-10-01T00:00:00.000Z")
     const source = {
       id: "source-session", userId: "owner", goal: "Goal", source: "user", memorySummary: null,
+      searchFootprintMemoryEnabledAtCreation: false, searchFootprintMemoryConsentVersionAtCreation: 1,
       turns: [{ id: "turn-1", source: "user", status: "completed", input: { goal: "Goal" }, finalResponse: "Done",
         error: null, modelProfileSnapshot: {}, inputTokens: 1, outputTokens: 2, estimatedCostUsd: 0,
         durationMs: 10, startedAt: completedAt, completedAt, createdAt: completedAt }],
@@ -17,6 +18,7 @@ describe("AgentForkService Turn projection", () => {
     const findFirst = vi.fn(async (args: { where: { id: string } }) => args.where.id === source.id ? source : null)
     const tx = {
       $queryRaw: vi.fn(async () => [{ id: source.id }]),
+      user: { findUnique: vi.fn(async () => ({ agentSearchFootprintMemoryEnabled: true, agentSearchFootprintMemoryConsentVersion: 8 })) },
       agentSession: { findFirst, create: vi.fn(async () => ({})), update: vi.fn(async () => ({})) },
       agentEvent: { findFirst: vi.fn(async () => null), create: vi.fn(async () => ({})) },
       agentTurn: { createMany: vi.fn(async () => ({ count: 1 })) },
@@ -29,6 +31,9 @@ describe("AgentForkService Turn projection", () => {
     })
 
     expect(result.disposition).toBe("forked")
+    expect(tx.agentSession.create).toHaveBeenCalledWith({ data: expect.objectContaining({
+      searchFootprintMemoryEnabledAtCreation: true, searchFootprintMemoryConsentVersionAtCreation: 8,
+    }) })
     const sourceRead = findFirst.mock.calls[1]?.[0] as unknown as { select: { turns: { select: unknown } } }
     expect(sourceRead.select.turns.select).toEqual(agentForkTurnSelect)
     expect(Object.keys(agentForkTurnSelect)).not.toContain("nativeSemanticProgressMode")

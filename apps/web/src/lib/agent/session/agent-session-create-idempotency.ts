@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import type { AgentSearchFootprintSessionSnapshot } from "@/lib/agent-search-footprint-session-snapshot"
 
 export interface AgentSessionCreateIdempotencyInput {
   userId: string
@@ -7,6 +8,7 @@ export interface AgentSessionCreateIdempotencyInput {
   status: string
   memorySummary: string
   idempotencyKey: string
+  creationSnapshot?: AgentSearchFootprintSessionSnapshot
 }
 
 interface AgentSessionCreateDelegate {
@@ -39,8 +41,12 @@ export async function createIdempotentAgentSession(delegateValue: unknown, input
     memorySummary: input.memorySummary,
   }
   const requestHash = createHash("sha256").update(JSON.stringify(data)).digest("hex")
+  const creationSnapshotFields = input.creationSnapshot ? {
+    searchFootprintMemoryEnabledAtCreation: input.creationSnapshot.enabled,
+    searchFootprintMemoryConsentVersionAtCreation: input.creationSnapshot.version,
+  } : {}
   await delegateValue.createMany({
-    data: { ...data, creationIdempotencyKey: input.idempotencyKey, creationIdempotencyRequestHash: requestHash },
+    data: { ...data, ...creationSnapshotFields, creationIdempotencyKey: input.idempotencyKey, creationIdempotencyRequestHash: requestHash },
     skipDuplicates: true,
   })
   const existing = await delegateValue.findUnique({

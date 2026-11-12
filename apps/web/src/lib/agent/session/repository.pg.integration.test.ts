@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { PrismaClient } from "@prisma/client"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { setAgentSearchFootprintMemoryConsent } from "@/lib/agent-search-footprint-memory-consent"
 import { createAgentSession } from "./repository"
 import { AgentSessionIdempotencyConflictError } from "./agent-session-create-idempotency"
 
@@ -74,6 +75,61 @@ describeWithDatabase("agent session creation idempotency on disposable PostgreSQ
 
     expect(sessionId(first)).toBe(sessionId(second))
     await expect(firstClient.agentSession.count({ where: { userId, creationIdempotencyKey: "parallel-same" } })).resolves.toBe(1)
+  })
+
+  it("serializes a keyed create with consent mutation and preserves its snapshot on replay", async () => {
+    const userId = await createTestUser()
+    const request = input(userId, "Apply to Berlin SWE roles", "consent-replay")
+    const [created, consentUpdate] = await Promise.all([
+      createAgentSession(firstClient, request),
+      setAgentSearchFootprintMemoryConsent(userId, { enabled: true, expectedVersion: 0 }, secondClient),
+    ])
+
+    expect(consentUpdate.kind).toBe("updated")
+    const selector = { userId_creationIdempotencyKey: { userId, creationIdempotencyKey: "consent-replay" } }
+    const beforeRevoke = await firstClient.agentSession.findUnique({
+      where: selector,
+      select: {
+        id: true,
+        goal: true,
+        updatedAt: true,
+        creationIdempotencyRequestHash: true,
+        searchFootprintMemoryEnabledAtCreation: true,
+        searchFootprintMemoryConsentVersionAtCreation: true,
+      },
+    })
+    expect(sessionId(created)).toBe(beforeRevoke?.id)
+    expect([
+      [false, 0],
+      [true, 1],
+    ]).toContainEqual([
+      beforeRevoke?.searchFootprintMemoryEnabledAtCreation,
+      beforeRevoke?.searchFootprintMemoryConsentVersionAtCreation,
+    ])
+
+    const revoked = await setAgentSearchFootprintMemoryConsent(userId, { enabled: false, expectedVersion: 1 }, secondClient)
+    expect(revoked).toMatchObject({ kind: "updated", consent: { enabled: false, version: 2 } })
+    const beforeReplay = await firstClient.agentSession.findUnique({ where: selector, select: {
+      id: true,
+      goal: true,
+      updatedAt: true,
+      creationIdempotencyRequestHash: true,
+      searchFootprintMemoryEnabledAtCreation: true,
+      searchFootprintMemoryConsentVersionAtCreation: true,
+    } })
+    const replay = await createAgentSession(secondClient, request)
+    const afterReplay = await firstClient.agentSession.findUnique({ where: selector, select: {
+      id: true,
+      goal: true,
+      updatedAt: true,
+      creationIdempotencyRequestHash: true,
+      searchFootprintMemoryEnabledAtCreation: true,
+      searchFootprintMemoryConsentVersionAtCreation: true,
+    } })
+
+    expect(sessionId(replay)).toBe(beforeReplay?.id)
+    expect(afterReplay).toEqual(beforeReplay)
+    await expect(firstClient.agentSession.count({ where: { userId, creationIdempotencyKey: "consent-replay" } })).resolves.toBe(1)
   })
 
   it("allows only one concurrent intent per key and leaves the winning Session unchanged on replay", async () => {

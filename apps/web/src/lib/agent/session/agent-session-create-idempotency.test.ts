@@ -17,6 +17,14 @@ const input = {
   idempotencyKey: "attempt-1",
 }
 
+function requestHash(value: unknown): string {
+  if (typeof value !== "object" || value === null || !("creationIdempotencyRequestHash" in value)
+    || typeof value.creationIdempotencyRequestHash !== "string") {
+    throw new Error("Session idempotency result has no request hash")
+  }
+  return value.creationIdempotencyRequestHash
+}
+
 describe("agent session creation idempotency helper", () => {
   it("uses an atomic duplicate-safe insert and returns the existing normalized Session", async () => {
     const client = delegate()
@@ -50,6 +58,49 @@ describe("agent session creation idempotency helper", () => {
     client.findUnique.mockResolvedValueOnce({ creationIdempotencyRequestHash: "different-request" })
 
     await expect(createIdempotentAgentSession(client, input)).rejects.toBeInstanceOf(AgentSessionIdempotencyConflictError)
+  })
+
+  it("keeps the original consent snapshot on replay and excludes it from the request hash", async () => {
+    const client = delegate()
+    let stored: Record<string, unknown> | null = null
+    client.createMany.mockImplementation(async ({ data }: { data: Record<string, unknown>; skipDuplicates: true }) => {
+      if (stored) return { count: 0 }
+      stored = { id: "session_1", ...data }
+      return { count: 1 }
+    })
+    client.findUnique.mockImplementation(async () => stored)
+
+    const first = await createIdempotentAgentSession(client, {
+      ...input,
+      creationSnapshot: { enabled: true, version: 4 },
+    })
+    const replay = await createIdempotentAgentSession(client, {
+      ...input,
+      creationSnapshot: { enabled: false, version: 5 },
+    })
+
+    expect(first).toBe(stored)
+    expect(replay).toBe(stored)
+    expect(stored).toMatchObject({
+      searchFootprintMemoryEnabledAtCreation: true,
+      searchFootprintMemoryConsentVersionAtCreation: 4,
+    })
+    expect(client.createMany).toHaveBeenNthCalledWith(1, {
+      data: expect.objectContaining({
+        creationIdempotencyRequestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        searchFootprintMemoryEnabledAtCreation: true,
+        searchFootprintMemoryConsentVersionAtCreation: 4,
+      }),
+      skipDuplicates: true,
+    })
+    expect(client.createMany).toHaveBeenNthCalledWith(2, {
+      data: expect.objectContaining({
+        creationIdempotencyRequestHash: requestHash(first),
+        searchFootprintMemoryEnabledAtCreation: false,
+        searchFootprintMemoryConsentVersionAtCreation: 5,
+      }),
+      skipDuplicates: true,
+    })
   })
 
   it("fails closed when the database client lacks atomic create or lookup methods", async () => {

@@ -9,8 +9,13 @@ import {
 } from "./repository"
 import { AgentSessionIdempotencyConflictError } from "./agent-session-create-idempotency"
 
-function mockDb() {
-  return {
+function mockDb(consent = { enabled: false, version: 0 }) {
+  const db = {
+    $queryRaw: vi.fn(async () => []),
+    user: { findUnique: vi.fn(async () => ({
+      agentSearchFootprintMemoryEnabled: consent.enabled, agentSearchFootprintMemoryConsentVersion: consent.version,
+    })) },
+    $transaction: vi.fn(),
     agentSession: {
       create: vi.fn(async ({ data }) => ({
         id: "session_1",
@@ -57,6 +62,8 @@ function mockDb() {
       updateMany: vi.fn(),
     },
   }
+  db.$transaction.mockImplementation(async (work: (tx: never) => unknown) => work(db as never))
+  return db
 }
 
 describe("agent session repository", () => {
@@ -83,8 +90,15 @@ describe("agent session repository", () => {
         source: "chat",
         status: "running",
         memorySummary: "",
+        searchFootprintMemoryEnabledAtCreation: false,
+        searchFootprintMemoryConsentVersionAtCreation: 0,
       },
     })
+    expect(db.$transaction).toHaveBeenCalledOnce()
+    expect(db.$queryRaw).toHaveBeenCalledOnce()
+    expect(db.user.findUnique).toHaveBeenCalledWith({ where: { id: "user_1" }, select: {
+      agentSearchFootprintMemoryEnabled: true, agentSearchFootprintMemoryConsentVersion: true,
+    } })
     expect(db.agentSession.createMany).not.toHaveBeenCalled()
   })
 
@@ -118,6 +132,7 @@ describe("agent session repository", () => {
       where: { userId_creationIdempotencyKey: { userId: "user_1", creationIdempotencyKey: "attempt-1" } },
     })
     expect(db.agentSession.create).not.toHaveBeenCalled()
+    expect(db.$queryRaw).toHaveBeenCalledOnce()
   })
 
   it("fails closed when a stored key belongs to a different normalized request", async () => {
@@ -131,6 +146,41 @@ describe("agent session repository", () => {
       source: "chat",
       idempotencyKey: "attempt-1",
     })).rejects.toBeInstanceOf(AgentSessionIdempotencyConflictError)
+    expect(db.$queryRaw).toHaveBeenCalledOnce()
+  })
+
+  it("inserts a keyed session with the captured consent snapshot under the same transaction", async () => {
+    const db = mockDb({ enabled: true, version: 7 })
+    const existing = { id: "session_keyed", creationIdempotencyRequestHash: "" }
+    db.agentSession.createMany.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => {
+      Object.assign(existing, data)
+      return { count: 1 }
+    })
+    db.agentSession.findUnique.mockResolvedValueOnce(existing)
+
+    const session = await createAgentSession(db, {
+      userId: "user_1",
+      goal: "Apply to Berlin SWE roles",
+      source: "chat",
+      idempotencyKey: "attempt-snapshot",
+    })
+
+    expect(session).toMatchObject({
+      creationIdempotencyKey: "attempt-snapshot",
+      searchFootprintMemoryEnabledAtCreation: true,
+      searchFootprintMemoryConsentVersionAtCreation: 7,
+    })
+    expect(db.$transaction).toHaveBeenCalledOnce()
+    expect(db.$queryRaw).toHaveBeenCalledOnce()
+    expect(db.agentSession.createMany).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        creationIdempotencyKey: "attempt-snapshot",
+        searchFootprintMemoryEnabledAtCreation: true,
+        searchFootprintMemoryConsentVersionAtCreation: 7,
+      }),
+      skipDuplicates: true,
+    })
+    expect(db.agentSession.findUnique).toHaveBeenCalledOnce()
   })
 
   it("appends transcript events with nullable task metadata", async () => {

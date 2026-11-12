@@ -1302,6 +1302,8 @@ jobs:
           test "$CUSTOM_AGENT_ROLE_PG_TEST_DISPOSABLE" = "true"
           test "$CUSTOM_AGENT_ROLE_PG_TEST_REQUIRED" = "true"
           pnpm --filter @jobcopilot/web exec prisma migrate deploy --schema prisma/schema.prisma
+      - name: Generate Prisma Client for the current schema
+        run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
       - name: Verify CustomAgentRole migration and candidate RLS on disposable PostgreSQL
         run: |
           test "$CI" = "true"
