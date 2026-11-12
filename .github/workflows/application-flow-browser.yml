@@ -22,6 +22,7 @@ jobs:
         project: [desktop-en, desktop-zh, mobile-en, mobile-zh]
     env:
       PROJECT: ${{ matrix.project }}
+      NODE_OPTIONS: --max-old-space-size=4096
     steps:
       - uses: actions/checkout@v4
         with:
