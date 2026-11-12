@@ -7,6 +7,7 @@ import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '../apps/web/src/
 import { buildGroundedTaskGraphFinalResponse } from '../apps/worker/src/runtime/subagents/task-graph-final-response.js'
 import { reduceTaskGraphFinalSummary } from '../apps/worker/src/runtime/subagents/task-graph-final-summary.js'
 import type { TaskGraphFinalSummaryBinding } from '../apps/worker/src/runtime/subagents/task-graph-final-summary-binding.js'
+import { ROLE_RESULT_SCHEMA } from '../apps/worker/src/runtime/subagents/role-results.js'
 
 const SCHEMA = 'agent-harness.v2'
 const GRAPH_SCHEMA = 'agent-harness.v2.task-graph'
@@ -18,14 +19,64 @@ const DISCOVERY_RAW_CANDIDATE_ENVELOPE = JSON.stringify({
   response: DISCOVERY_RAW_MODEL_SENTINEL,
 })
 const DISCOVERY_FINAL_LIMITATION = 'These are structured task reports, not independent verification. Prepared materials do not confirm that an application was submitted or received by an employer.'
+const DISCOVERY_FINAL_ADVICE_HEADER = 'Suggested next steps (optional):'
 const DISCOVERY_FINAL_SECTION_LABELS = [
   'Search results:', 'Analysis results:', 'Preparation outcomes:', 'Artifact references:', 'Reviewer outcomes:',
 ] as const
+const DISCOVERY_FINAL_ADVICE_LINES = new Set([
+  'Inspect the reported Analysis task outcome.',
+  'Inspect the reported Preparation task outcome.',
+  'Inspect the reported Review task outcome.',
+  'Inspect the reported Search task outcome.',
+  'Inspect the reported Draft writing task outcome.',
+  'Inspect the reported Other task outcome.',
+  'Inspect the recorded material review marked needs revision.',
+  'Inspect the recorded material review marked rejected.',
+  'Inspect the recorded material review marked stale.',
+  'View the reported Search results.',
+  'View the reported Analysis results.',
+  'View the reported Preparation results.',
+  'View the reported material results.',
+])
 const DISCOVERY_FINAL_DISPLAY_BINDING: TaskGraphFinalSummaryBinding = {
   graphRevision: 0,
   summary: reduceTaskGraphFinalSummary({ graphRevision: 0, nodes: [] }),
 }
 const DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT = buildGroundedTaskGraphFinalResponse(DISCOVERY_FINAL_DISPLAY_BINDING)
+type DiscoveryDisplayTask = Readonly<{
+  taskId: string
+  role: 'analyst' | 'prepare' | 'scout'
+  taskStatus: 'completed' | 'failed'
+  structuredResult?: unknown
+}>
+function discoveryDisplayBinding(tasks: readonly DiscoveryDisplayTask[]): TaskGraphFinalSummaryBinding {
+  const graphRevision = 7
+  const summary = reduceTaskGraphFinalSummary({ graphRevision, nodes: tasks.map(task => ({
+    kind: 'business' as const, taskId: task.taskId, role: task.role, taskStatus: task.taskStatus,
+    ...(task.structuredResult === undefined ? {} : { structuredResult: task.structuredResult }),
+  })) })
+  return {
+    rootTaskId: 'root-task-display', graphItemId: 'graph-item-display', graphRevision, summary,
+    members: tasks.map((task, nodeIndex) => ({ nodeIndex, nodeKey: `node-${nodeIndex}`, templateId: `${task.role}-template`,
+      taskId: task.taskId, role: task.role, taskType: `${task.role}-task`, taskStatus: task.taskStatus, kind: 'business' as const })),
+  }
+}
+const DISCOVERY_NO_ADVICE_DISPLAY_BINDING = discoveryDisplayBinding([{
+  taskId: 'task-complete-analysis', role: 'analyst', taskStatus: 'completed',
+  structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: 'analyst', status: 'completed', findings: [], evidence: [], summary: DISCOVERY_RAW_MODEL_SENTINEL },
+}])
+const DISCOVERY_NO_ADVICE_FINAL_DISPLAY_TEXT = buildGroundedTaskGraphFinalResponse(DISCOVERY_NO_ADVICE_DISPLAY_BINDING)
+const DISCOVERY_THREE_ADVICE_DISPLAY_BINDING = discoveryDisplayBinding([
+  { taskId: 'task-analysis', role: 'analyst', taskStatus: 'failed' },
+  { taskId: 'task-preparation', role: 'prepare', taskStatus: 'failed' },
+  { taskId: 'task-search', role: 'scout', taskStatus: 'completed', structuredResult: {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: 'scout', status: 'partial',
+    candidates: [{ jobId: 'private-discovery-job', source: 'test-source', url: null, evidenceIds: ['evidence-1'] }],
+    evidence: [{ id: 'evidence-1', kind: 'job', ref: 'private-discovery-job', source: 'test-source' }],
+    summary: DISCOVERY_RAW_MODEL_SENTINEL,
+  } },
+])
+const DISCOVERY_THREE_ADVICE_FINAL_DISPLAY_TEXT = buildGroundedTaskGraphFinalResponse(DISCOVERY_THREE_ADVICE_DISPLAY_BINDING)
 const SESSION_B = 'task-graph-session-b'
 const TURN_B = 'task-graph-turn-b'
 const GOAL_B = 'Compare engineering teams in Amsterdam'
@@ -167,15 +218,43 @@ function isBoundedTaskGraphFinalDisplayText(value: unknown): value is string {
   const taskStatesMatches = lines.flatMap((line, index) => line.startsWith('Task states:') ? [index] : [])
   const taskStatesIndex = taskStatesMatches[0] ?? -1
   const blankLineIndexes = lines.flatMap((line, index) => line.length === 0 ? [index] : [])
-  if (lines.at(-1) !== DISCOVERY_FINAL_LIMITATION || taskStatesMatches.length !== 1
-    || blankLineIndexes.length > 1 || blankLineIndexes.some(index => index !== taskStatesIndex - 1)) return false
+  const adviceHeaderIndexes = lines.flatMap((line, index) => line === DISCOVERY_FINAL_ADVICE_HEADER ? [index] : [])
+  if (lines.at(-1) !== DISCOVERY_FINAL_LIMITATION || taskStatesMatches.length !== 1 || adviceHeaderIndexes.length > 1) return false
   let previousIndex = 0
   for (const label of DISCOVERY_FINAL_SECTION_LABELS) {
     const matches = lines.flatMap((line, index) => line.startsWith(label) ? [index] : [])
     if (matches.length !== 1 || matches[0]! <= previousIndex) return false
     previousIndex = matches[0]!
   }
+  if (taskStatesIndex <= previousIndex) return false
+  const adviceHeaderIndex = adviceHeaderIndexes[0]
+  const footerIndex = lines.length - 1
+  const expectedBlankIndexes = new Set<number>()
+  if (lines[taskStatesIndex - 1] === '') expectedBlankIndexes.add(taskStatesIndex - 1)
+  if (adviceHeaderIndex !== undefined) {
+    if (adviceHeaderIndex <= taskStatesIndex || adviceHeaderIndex >= footerIndex || lines[adviceHeaderIndex - 1] !== '') return false
+    const adviceLines = lines.slice(adviceHeaderIndex + 1, footerIndex)
+    if (adviceLines.length < 1 || adviceLines.length > 3 || new Set(adviceLines).size !== adviceLines.length
+      || adviceLines.some(line => !DISCOVERY_FINAL_ADVICE_LINES.has(line))) return false
+    expectedBlankIndexes.add(adviceHeaderIndex - 1)
+  }
+  if (blankLineIndexes.length !== expectedBlankIndexes.size || blankLineIndexes.some(index => !expectedBlankIndexes.has(index))) return false
+  const taskOutcomeLines = lines.slice(taskStatesIndex, adviceHeaderIndex === undefined ? footerIndex : adviceHeaderIndex - 1)
+  if (!validTaskGraphFinalStateLines(taskOutcomeLines)) return false
   return true
+}
+
+function validTaskGraphFinalStateLines(lines: readonly string[]): boolean {
+  if (lines.length === 1 && ['Task states: unavailable.', 'Task states: no business tasks recorded.'].includes(lines[0]!)) return true
+  if (lines.length < 2 || lines[0] !== 'Task states:') return false
+  const outcome = /^(?:Analysis|Preparation|Review|Search|Draft writing|Other): [1-9]\d* (?:queued|running|retrying|waiting|waiting for user|completed|failed|interrupted|cancelled|closed) tasks?; (?:valid structured result reported (?:completed|partial)|structured result missing|structured result invalid|no terminal structured result yet|task type omitted from result details)\.$/
+  return lines.slice(1).every(line => outcome.test(line))
+}
+
+function expectRejectedDisplayMutation(value: string, before: string, after: string): void {
+  const changed = value.replace(before, after)
+  expect(changed).not.toBe(value)
+  expect(isBoundedTaskGraphFinalDisplayText(changed)).toBe(false)
 }
 
 function planLedgerEnumLabel(locale: 'en' | 'zh', group: 'readiness' | 'status', value: string): string {
@@ -398,38 +477,72 @@ function parsePersistedDiscoveryTrace(value: unknown): PersistedPlanLedgerTrace 
   }
 }
 
-test('accepts bounded TaskGraph final display text and rejects raw or incomplete output', () => {
+test('accepts renderer-grounded TaskGraph display with optional bounded advice and rejects forged output', () => {
+  const noAdvice = DISCOVERY_NO_ADVICE_FINAL_DISPLAY_TEXT
+  const threeAdvice = DISCOVERY_THREE_ADVICE_FINAL_DISPLAY_TEXT
+  expect(buildGroundedTaskGraphFinalResponse(DISCOVERY_NO_ADVICE_DISPLAY_BINDING)).toBe(noAdvice)
+  expect(buildGroundedTaskGraphFinalResponse(DISCOVERY_THREE_ADVICE_DISPLAY_BINDING)).toBe(threeAdvice)
   expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT)).toBe(true)
-  expect(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.split('\n').filter(line => line.length === 0)).toHaveLength(1)
+  expect(isBoundedTaskGraphFinalDisplayText(noAdvice)).toBe(true)
+  expect(noAdvice).not.toContain(DISCOVERY_RAW_MODEL_SENTINEL)
+  expect(noAdvice.split('\n').filter(line => line.length === 0)).toHaveLength(1)
+  expect(isBoundedTaskGraphFinalDisplayText(threeAdvice)).toBe(true)
+  expect(threeAdvice).toContain(DISCOVERY_FINAL_ADVICE_HEADER)
+  expect(threeAdvice).not.toContain(DISCOVERY_RAW_MODEL_SENTINEL)
+  expect(threeAdvice).not.toContain('private-discovery-job')
+  expect(new TextEncoder().encode(threeAdvice).byteLength).toBeLessThanOrEqual(4_096)
+  const threeAdviceLines = threeAdvice.slice(threeAdvice.indexOf(`${DISCOVERY_FINAL_ADVICE_HEADER}\n`) + DISCOVERY_FINAL_ADVICE_HEADER.length + 1,
+    threeAdvice.lastIndexOf(`\n${DISCOVERY_FINAL_LIMITATION}`)).split('\n')
+  expect(threeAdviceLines).toEqual([
+    'Inspect the reported Analysis task outcome.',
+    'Inspect the reported Preparation task outcome.',
+    'Inspect the reported Search task outcome.',
+  ])
+  const threeAdviceLinesText = threeAdvice.split('\n')
+  const taskStatesIndex = threeAdviceLinesText.findIndex(line => line.startsWith('Task states:'))
+  const adviceHeaderIndex = threeAdviceLinesText.indexOf(DISCOVERY_FINAL_ADVICE_HEADER)
+  expect(threeAdviceLinesText.flatMap((line, index) => line.length === 0 ? [index] : []))
+    .toEqual([taskStatesIndex - 1, adviceHeaderIndex - 1])
+  const oneAdvice = threeAdvice.replace(`${threeAdviceLines[1]}\n${threeAdviceLines[2]}\n${DISCOVERY_FINAL_LIMITATION}`, DISCOVERY_FINAL_LIMITATION)
+  expect(oneAdvice).not.toBe(threeAdvice)
+  expect(isBoundedTaskGraphFinalDisplayText(oneAdvice)).toBe(true)
+  expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT)).toBe(true)
   expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_RAW_CANDIDATE_ENVELOPE)).toBe(false)
   expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_RAW_MODEL_SENTINEL)).toBe(false)
   expect(isBoundedTaskGraphFinalDisplayText('')).toBe(false)
   expect(isBoundedTaskGraphFinalDisplayText(' ')).toBe(false)
-  expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace(
-    'Task-reported results:', 'Task results:',
-  ))).toBe(false)
-  expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace(
-    'Reviewer outcomes: not requested.\n', '',
-  ))).toBe(false)
-  expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace(
-    `${DISCOVERY_FINAL_LIMITATION}`, 'Prepared materials do not confirm submission.',
-  ))).toBe(false)
-  expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace(
-    'Task-reported results:\n', 'Task-reported results:\n\n',
-  ))).toBe(false)
-  expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace(
-    'Task states: no business tasks recorded.', 'Task states: no business tasks recorded.\n',
-  ))).toBe(false)
-  const oversized = DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace(
-    DISCOVERY_FINAL_LIMITATION, `${'x'.repeat(4_097)}\n${DISCOVERY_FINAL_LIMITATION}`,
+  expectRejectedDisplayMutation(threeAdvice,
+    `${DISCOVERY_FINAL_ADVICE_HEADER}\n`, `${DISCOVERY_FINAL_ADVICE_HEADER}\n${DISCOVERY_FINAL_ADVICE_HEADER}\n`,
   )
-  expect(isBoundedTaskGraphFinalDisplayText(oversized)).toBe(false)
-  const oversizedUtf8 = DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace(
-    'Task states:', `Task states: ${'é'.repeat(2_000)}`,
+  expectRejectedDisplayMutation(threeAdvice, threeAdviceLines[1]!, threeAdviceLines[0]!)
+  expectRejectedDisplayMutation(threeAdvice, threeAdviceLines[1]!, 'Retry the failed tasks immediately.')
+  expectRejectedDisplayMutation(threeAdvice,
+    `${threeAdviceLines[2]}\n${DISCOVERY_FINAL_LIMITATION}`,
+    `${threeAdviceLines[2]}\nInspect the recorded material review marked needs revision.\n${DISCOVERY_FINAL_LIMITATION}`,
   )
+  const adviceRemoved = threeAdvice.replace(`\n\n${DISCOVERY_FINAL_ADVICE_HEADER}\n${threeAdviceLines.join('\n')}`, '')
+  expect(adviceRemoved).not.toBe(threeAdvice)
+  const adviceMovedBeforeTaskStates = adviceRemoved.replace(
+    '\n\nTask states:', `\n\n${DISCOVERY_FINAL_ADVICE_HEADER}\n${threeAdviceLines[0]}\n\nTask states:`,
+  )
+  expect(adviceMovedBeforeTaskStates).not.toBe(adviceRemoved)
+  expect(isBoundedTaskGraphFinalDisplayText(adviceMovedBeforeTaskStates)).toBe(false)
+  expectRejectedDisplayMutation(threeAdvice,
+    `${threeAdviceLines[2]}\n${DISCOVERY_FINAL_LIMITATION}`,
+    `${threeAdviceLines[2]}\n${'x'.repeat(4_097)}\n${DISCOVERY_FINAL_LIMITATION}`,
+  )
+  expectRejectedDisplayMutation(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT, 'Task-reported results:', 'Task results:')
+  expectRejectedDisplayMutation(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT, 'Reviewer outcomes: not requested.\n', '')
+  expectRejectedDisplayMutation(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT, DISCOVERY_FINAL_LIMITATION, 'Prepared materials do not confirm submission.')
+  expectRejectedDisplayMutation(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT, 'Task-reported results:\n', 'Task-reported results:\n\n')
+  expectRejectedDisplayMutation(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT, 'Task states: no business tasks recorded.', 'Task states: no business tasks recorded.\n')
+  const oversizedUtf8 = DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace('Task states:', `Task states: ${'é'.repeat(2_000)}`)
+  expect(oversizedUtf8).not.toBe(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT)
   expect(oversizedUtf8.length).toBeLessThan(4_096)
   expect(new TextEncoder().encode(oversizedUtf8).byteLength).toBeGreaterThan(4_096)
   expect(isBoundedTaskGraphFinalDisplayText(oversizedUtf8)).toBe(false)
+  expectRejectedDisplayMutation(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT, DISCOVERY_FINAL_LIMITATION,
+    `${'x'.repeat(4_097)}\n${DISCOVERY_FINAL_LIMITATION}`)
 })
 
 // CI wraps the public ledger with persisted TaskGraph/task identities for this browser-only handoff.
