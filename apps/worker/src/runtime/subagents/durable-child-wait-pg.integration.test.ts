@@ -606,7 +606,9 @@ function workerStartGateKey(ids: FixtureIds): string {
   return `fixture:durable-child-wait:start:${ids.waiterTaskId}`
 }
 
-async function waitForMarker(child: WorkerProcess, marker: string, timeoutMs = 20_000): Promise<void> {
+// Recovery includes database proof scans, not just process startup (observed >19s).
+async function waitForMarker(child: WorkerProcess, marker: string,
+  timeoutMs = marker === "WORKER_B_RECOVERED" ? 60_000 : 20_000): Promise<void> {
   const startedAt = Date.now()
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -673,7 +675,8 @@ async function waitForExactStaleDispatchObservation(child: WorkerProcess, abando
   })}`)
 }
 
-async function waitForBoundedLoopMarker(child: WorkerProcess, marker: string, timeoutMs = 20_000): Promise<void> {
+async function waitForBoundedLoopMarker(child: WorkerProcess, marker: string,
+  timeoutMs = marker === "WORKER_B_RECOVERED" ? 60_000 : 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (child.stdoutText.includes(marker)) return
