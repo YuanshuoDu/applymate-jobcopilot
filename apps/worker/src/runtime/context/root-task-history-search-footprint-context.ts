@@ -1,12 +1,13 @@
 import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
-import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, type RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import { toRepositoryJson } from "../turns/turn-engine-output.js"
 import type { TurnLease } from "../turns/lease.js"
 import { projectRootTaskHistoryDiscoveryFootprint } from "./root-task-history-discovery-footprint.js"
 import { parseRootTaskHistoryChronologyXid8 } from "./root-task-history-chronology-witness.js"
 import type { RootTaskHistoryFence } from "./root-task-history-fence.js"
+import { isRootTaskHistoryFootprintOrigin } from "./root-task-history-footprint-origin.js"
 import type { RootTaskHistorySessionAuthorization } from "./root-task-history-session-memory.js"
 import type { RootTaskHistorySteerEvidence } from "./root-task-history-steer-evidence.js"
 import type { ContextSeedBlock } from "./step-context-builder.js"
@@ -87,33 +88,21 @@ function empty(): MutableRootTaskHistorySearchFootprintContext {
   return { roles: [], locations: [], atsSources: [] }
 }
 
-function parseOrigin(value: unknown): { kind: string | null; version: number | null } | undefined {
-  if (typeof value !== "string" || value.length > 512 || value.trim() !== value) return undefined
-  try {
-    const parsed: unknown = JSON.parse(value)
-    if (!Array.isArray(parsed) || JSON.stringify(parsed) !== value || typeof parsed[0] !== "string"
-      || !parsed[0] || parsed[0].length > 128 || parsed[0].trim() !== parsed[0]) return undefined
-    if (parsed.length === 2 && parsed[1] === "none") return { kind: null, version: null }
-    if (parsed.length === 3 && (parsed[1] === "interactive_discovery_shortlist" || parsed[1] === "objective_task_graph_execution")
-      && parsed[2] === 1) return { kind: parsed[1], version: 1 }
-  } catch { return undefined }
-  return undefined
-}
-
 export function createRootTaskHistorySearchFootprintSnapshotIdentity(
   input: RootTaskHistorySearchFootprintSnapshotIdentityInput,
 ): RootTaskHistorySearchFootprintSnapshotIdentity | undefined {
-  const { lease, authorization, fence } = input, origin = parseOrigin(fence.currentOrigin), revision = input.acceptedInputRevision
-  const witness = fence.currentStartWitness
+  const { lease, authorization, fence } = input, origin = fence.searchFootprintOrigin, revision = input.acceptedInputRevision
+  const witness = fence.searchFootprintStartWitness
   if (input.searchFootprintReadAllowed !== true || !lease.userId || !lease.sessionId
     || authorization.userId !== lease.userId || authorization.sessionId !== lease.sessionId
-    || !/^[0-9a-f]{64}$/.test(fence.objectiveDigest) || !origin
+    || !/^[0-9a-f]{64}$/.test(fence.objectiveDigest) || !isRootTaskHistoryFootprintOrigin(origin)
     || typeof revision !== "bigint" || revision < 0n || revision.toString().length > 128
     || input.steerEvidence.kind !== "no_accepted_steer" || !witness?.eventId || witness.eventId.length > 128 || witness.eventId.trim() !== witness.eventId
     || parseRootTaskHistoryChronologyXid8(witness.xid8) === undefined) return undefined
   return { schemaVersion: SNAPSHOT_SCHEMA, sessionId: lease.sessionId, userId: lease.userId,
-    searchFootprintReadAllowed: true, objectiveDigest: fence.objectiveDigest, canonicalOrigin: fence.currentOrigin!,
-    intentKind: origin.kind, intentVersion: origin.version, acceptedInputRevision: revision.toString(),
+    searchFootprintReadAllowed: true, objectiveDigest: fence.objectiveDigest, canonicalOrigin: origin,
+    intentKind: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind, intentVersion: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version,
+    acceptedInputRevision: revision.toString(),
     steerEvidence: "no_accepted_steer", startWitnessEventId: witness.eventId, startWitnessXid8: witness.xid8 }
 }
 

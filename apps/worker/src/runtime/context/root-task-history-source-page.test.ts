@@ -1,10 +1,60 @@
 import { describe, expect, it } from "vitest"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
+import { rootTaskHistoryObjectiveDigest, type RootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
 import {
   buildRootTaskHistorySameSessionPageWindow, parseRootTaskHistoryPage, rootTaskHistoryCursorAdvanced, scanRootTaskHistoryPages,
+  validateRootTaskHistoryCandidate, validateRootTaskHistoryFootprintCandidate,
   type RootTaskHistoryPage, type RootTaskHistorySourceCursor,
 } from "./root-task-history-source-page.js"
 
+const targetInput = { goal: "Find roles", successCriteria: ["Use saved filters"], intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT }
+const footprintFence: RootTaskHistoryFence = {
+  currentStartSequence: 20n, searchFootprintStartWitness: { eventId: "current-footprint-start", xid8: "10" },
+  searchFootprintOrigin: '["user","objective_task_graph_execution",1]',
+  objectiveDigest: rootTaskHistoryObjectiveDigest(targetInput, { goal: "Find roles", successCriteria: ["Use saved filters"] })!,
+}
+const footprintInput: RootTaskHistoryFenceInput = {
+  lease: { turnId: "current-turn", sessionId: "current-session", userId: "user-a", ownerId: "worker", leaseVersion: 1,
+    leaseStartedAt: new Date(1), leaseExpiresAt: new Date(10_000) },
+  rootTaskId: "current-root", rootAttemptCount: 1, stepId: "current-step", now: new Date(2_000),
+  crossSessionRootTaskHistoryEnabled: true, searchFootprintReadAllowed: true,
+}
+
+function objectiveFootprintCandidate(input: unknown = targetInput, turnSource = "user") {
+  return {
+    turnId: "source-turn", sessionId: "source-session", userId: "user-a", rootTaskId: "source-root", turnStatus: "failed",
+    turnSource, sourceSessionUserId: "user-a", sourceSessionStatus: "running", input,
+    taskId: "source-root", taskTurnId: "source-turn", taskRootTaskId: "source-root", parentTaskId: null,
+    taskRole: "orchestrator", taskType: "root", taskStatus: "failed", goal: "Find roles", successCriteria: ["Use saved filters"],
+    startTurnId: "source-turn", startTaskId: "source-root", startItemId: null, startSequence: "1", startType: "turn.started",
+    startActor: "orchestrator", startCorrelationId: "source-turn", startIdempotencyKey: "turn:source-turn:event:turn-started",
+    startPayload: { taskId: "source-root", rootTaskId: "source-root" }, startEventCount: 1,
+    terminalTurnId: "source-turn", terminalTaskId: "source-root", terminalItemId: null, terminalSequence: "3",
+    terminalType: "turn.failed", terminalActor: "orchestrator", terminalCorrelationId: "source-turn",
+    terminalIdempotencyKey: "turn:source-turn:event:turn-failed:task_failed",
+    terminalPayload: { turnId: "source-turn", taskId: "source-root", errorCode: "task_failed", finalItemId: null }, terminalEventCount: 1,
+    terminalEventId: "terminal-event", terminalCreatedAt: new Date("2026-10-07T11:00:00.000Z"),
+    terminalWitnessEventId: "source-terminal-witness",
+    terminalWitnessXid8: "8", terminalWitnessCount: 1,
+  }
+}
+
 describe("root task history source paging", () => {
+  it("validates objective-v1 candidates only in the independent footprint channel", () => {
+    const matching = objectiveFootprintCandidate()
+    expect(validateRootTaskHistoryFootprintCandidate(matching, footprintInput, footprintFence)).toMatchObject({
+      sessionId: "source-session", turnId: "source-turn", rootTaskId: "source-root", terminalXid8: "8",
+    })
+    expect(validateRootTaskHistoryCandidate(matching, footprintInput,
+      { ...footprintFence, currentOrigin: '["user","none"]' })).toBeUndefined()
+    for (const candidate of [
+      objectiveFootprintCandidate({ ...targetInput, intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, version: 2 } }),
+      objectiveFootprintCandidate({ ...targetInput, intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, extra: true } }),
+      objectiveFootprintCandidate({ ...targetInput, input: { ...targetInput, intent: { kind: "interactive_discovery_shortlist", version: 1 } } }),
+      objectiveFootprintCandidate(targetInput, "automation"),
+    ]) expect(validateRootTaskHistoryFootprintCandidate(candidate, footprintInput, footprintFence)).toBeUndefined()
+  })
+
   it("strips the independently carried watermark metadata before candidate validation", () => {
     const rows = [{
       turnId: "turn-1", isPageWatermark: false, pageRawRowCount: 1, pageSentinelCount: 1, pageServerEncoding: "UTF8",

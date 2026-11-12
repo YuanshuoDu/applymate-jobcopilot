@@ -69,7 +69,7 @@ function row(value: unknown): Record<string, unknown> {
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
 }
 /** Rechecks durable reports against the current immutable graph inside the caller's transaction. */
-export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, lease: TurnLease, rootTaskId: string, nativeVerificationPassed = false): Promise<Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>> {
+export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, lease: TurnLease, rootTaskId: string, nativeVerificationPassed = false, requireTaskGraph = false): Promise<Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>> {
   let graphRevision: number | null = null
   let denialCheckpoint: TaskGraphDenialCheckpoint | null = null
   const deny = (code?: GateFeedbackCode, details: readonly GateFeedbackDetail[] = []) => {
@@ -83,8 +83,9 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
     const loaded = await loadTaskGraph(client, scope, true)
     if (!loaded.snapshot) {
       const plans = await client.query(`SELECT 1 FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId" JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId" WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3 AND event."taskId" = $4 AND event."payload"->>'kind' IN ('proposal', 'native_command') AND session."userId" = $5 AND turn."userId" = $5 LIMIT 1`, [lease.sessionId, lease.turnId, taskGraphItemId(rootTaskId), rootTaskId, lease.userId])
-      return plans.rows.length ? deny() : { ok: true }
+      return plans.rows.length || requireTaskGraph ? deny() : { ok: true }
     }
+    if (requireTaskGraph && loaded.snapshot.nodes.length === 0) return deny()
     graphRevision = loaded.item && Number.isSafeInteger(loaded.item.revision) && loaded.item.revision >= 1 ? loaded.item.revision : null
     denialCheckpoint = buildTaskGraphDenialCheckpoint(loaded, rootTaskId)
     const { nodes } = loaded.snapshot, reports = new Map<string, GateReport>()

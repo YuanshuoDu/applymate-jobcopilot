@@ -96,10 +96,11 @@ export async function buildCanonicalRootTaskHistoryContext(input: Readonly<{
       const searchFootprintsAllowed = searchFootprintReadAllowed === true
       if ((!historyReadAllowed && !searchFootprintsAllowed) || steerEvidence.kind !== "no_accepted_steer") return built
       const crossRequest: DirectRootTaskHistoryLoadInput = { ...historyRequest, crossSessionRootTaskHistoryEnabled: true,
+        ...(searchFootprintsAllowed ? { searchFootprintReadAllowed: true } : {}),
         ...(input.objectiveHistoryIndexEnabled === true ? { objectiveHistoryIndexEnabled: true } : {}) }
       const fence = await readRootTaskHistoryFence(transactionClient, crossRequest)
-      if (!fence?.currentOrigin) return built
-      if (historyReadAllowed) {
+      if (!fence) return built
+      if (historyReadAllowed && fence.currentOrigin) {
         const memory = await withRootTaskHistoryObjectiveSnapshot({ client: transactionClient, lease: input.lease,
           rootTaskId: input.rootTaskId, authorization, fence, acceptedInputRevision: built.inputThroughSequence, steerEvidence,
           loadOutcomes: async sameClient => (await input.reader.loadWithClient!(sameClient as pg.PoolClient, crossRequest))
@@ -107,7 +108,8 @@ export async function buildCanonicalRootTaskHistoryContext(input: Readonly<{
         if (memory) built = await replaceBuiltHistory(built, appendCanonicalRootTaskHistoryOutcomes({ snapshot: sameSessionSnapshot,
           sameSessionOutcomes, crossSessionOutcomes: memory.outcomes, crossSessionRootTaskHistoryEnabled: true }))
       }
-      if (searchFootprintsAllowed && input.reader.loadSearchFootprintsWithClient) {
+      if (searchFootprintsAllowed && fence.searchFootprintOrigin && fence.searchFootprintStartWitness
+        && input.reader.loadSearchFootprintsWithClient) {
         const footprintRequest: DirectRootTaskHistorySearchFootprintLoadInput = { ...historyRequest,
           searchFootprintReadAllowed: true,
           ...(input.objectiveHistoryIndexEnabled === true ? { objectiveHistoryIndexEnabled: true } : {}) }

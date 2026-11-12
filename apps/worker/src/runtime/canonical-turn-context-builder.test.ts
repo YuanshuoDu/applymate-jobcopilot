@@ -870,7 +870,9 @@ describe("canonical Turn context builder", () => {
   it("injects only the separate searchFootprints channel when its authorization is on and Task History is off", async () => {
     const database = checkedOutPool(), footprint = { roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] }
     const fence: RootTaskHistoryFence = { currentStartSequence: 20n, currentStartWitness: { eventId: "current-start", xid8: "20" },
-      objectiveDigest: "a".repeat(64), currentOrigin: JSON.stringify(["user", "none"]) }
+      objectiveDigest: "a".repeat(64), currentOrigin: JSON.stringify(["user", "none"]),
+      searchFootprintStartWitness: { eventId: "footprint-start", xid8: "20" },
+      searchFootprintOrigin: JSON.stringify(["user", "objective_task_graph_execution", 1]) }
     rootHistoryHarness.consentEnabled = false
     rootHistoryHarness.searchFootprintReadAllowed = true
     rootHistoryHarness.steerEvidence = { kind: "no_accepted_steer" }
@@ -1001,7 +1003,9 @@ describe("canonical Turn context builder", () => {
       sourceSessionDiffers: true, terminalSequence: 2n, terminalXid8: "2", terminalWitnessEventId: "private-witness",
       taskGraph: { revision: 1, nodes: [{ templateId: "analyst", status: "completed" }] } as unknown as TaskGraphCurrentState }
     const fence: RootTaskHistoryFence = { currentStartSequence: 20n, currentStartWitness: { eventId: "current-start", xid8: "20" },
-      objectiveDigest: "a".repeat(64), currentOrigin: JSON.stringify(["user", "none"]) }
+      objectiveDigest: "a".repeat(64), currentOrigin: JSON.stringify(["user", "none"]),
+      searchFootprintStartWitness: { eventId: "footprint-start", xid8: "20" },
+      searchFootprintOrigin: JSON.stringify(["user", "objective_task_graph_execution", 1]) }
     rootHistoryHarness.consentEnabled = true
     rootHistoryHarness.searchFootprintReadAllowed = true
     rootHistoryHarness.steerEvidence = { kind: "no_accepted_steer" }

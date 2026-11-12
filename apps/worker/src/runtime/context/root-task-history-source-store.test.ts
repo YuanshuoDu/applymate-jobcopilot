@@ -1,6 +1,6 @@
 import type pg from "pg"
 import { describe, expect, it, vi } from "vitest"
-import { readRootTaskHistoryCandidates } from "./root-task-history-source-store.js"
+import { readRootTaskHistoryCandidates, readRootTaskHistoryFootprintCandidates } from "./root-task-history-source-store.js"
 import { rootTaskHistoryIndexKeys, rootTaskHistoryObjectiveDigest, type RootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
 import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION } from "./objective-history-projection.js"
 
@@ -313,6 +313,42 @@ describe("Root history source scan", () => {
     expect(terminalWindow).toContain('ORDER BY (candidate."terminalWitnessXid8")::numeric DESC, candidate."turnId" COLLATE "C" DESC,')
     expect(terminalWindow).toContain('candidate."terminalEventId" COLLATE "C" DESC, candidate."terminalWitnessEventId" COLLATE "C" DESC')
     expect(queries[1]?.sql).toContain('terminal."createdAt" = roots."indexedTerminalAt"')
+  })
+
+  it("scans objective-v1 footprint origins independently while ordinary Task History stays unchanged", async () => {
+    const intent = { kind: "objective_task_graph_execution", version: 1 }
+    const currentOrigin: RootTaskHistoryFence = {
+      ...fence, currentOrigin: undefined,
+      searchFootprintOrigin: '["user","objective_task_graph_execution",1]',
+      searchFootprintStartWitness: { eventId: "footprint-start", xid8: "10" },
+    }
+    const validInput = { goal: "Find roles", successCriteria: ["Use saved filters"], intent }
+    const rows = [
+      row({ input: validInput }),
+      row({ turnId: "wrong-version", input: { ...validInput, intent: { ...intent, version: 2 } } }),
+      row({ turnId: "extra-intent-field", input: { ...validInput, intent: { ...intent, extra: true } } }),
+      row({ turnId: "nested-mismatch", input: { ...validInput, input: { ...validInput, intent: { kind: "interactive_discovery_shortlist", version: 1 } } } }),
+      row({ turnId: "wrong-source", turnSource: "automation" }),
+      row({ turnId: "missing-intent" }),
+    ]
+    const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const clientInstance = client(rows, queries) as unknown as pg.PoolClient
+
+    const footprints = await readRootTaskHistoryFootprintCandidates(clientInstance, input, currentOrigin)
+    expect(footprints.map(value => value.turnId)).toEqual(["source-turn"])
+    expect(queries).toHaveLength(1)
+    expect(queries[0]?.values).toEqual(["current-session", "user-a", "current-turn", "10", null,
+      currentOrigin.objectiveDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION,
+      '["user","objective_task_graph_execution",1]', 64])
+    expect(queries[0]?.sql).toContain("'objective_task_graph_execution'")
+    expect(queries[0]?.sql).toContain('turn."source" IS DISTINCT FROM \'user\'')
+
+    const historyQueries: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const historyRows = [row({ input: validInput })]
+    const history = await readRootTaskHistoryCandidates(client(historyRows, historyQueries) as unknown as pg.PoolClient,
+      input, { ...currentOrigin, currentOrigin: '["user","none"]' })
+    expect(history).toEqual([])
+    expect(historyQueries.some(query => query.sql.includes("'objective_task_graph_execution'"))).toBe(false)
   })
 
   it("requires an existing source AgentSession row, so deleted sessions cannot supply history", async () => {

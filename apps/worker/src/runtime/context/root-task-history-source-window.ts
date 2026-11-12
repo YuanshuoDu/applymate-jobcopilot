@@ -34,12 +34,33 @@ function canonicalOriginMatches(parameter: string): string {
   END`
 }
 
+function footprintOriginMatches(parameter: string): string {
+  const input = `turn."input"`, nested = `(${input}->'input')`, source = `turn."source"`
+  const outerIntent = `(${input}->'intent')`, nestedIntent = `(${nested}->'intent')`
+  const validObjectiveIntent = (json: string) => `(CASE
+    WHEN jsonb_typeof(${json}) = 'object' THEN (${json} ?& ARRAY['kind','version']
+      AND (${json} - 'kind' - 'version') = '{}'::jsonb
+      AND ${json}->>'kind' = 'objective_task_graph_execution' AND ${json}->'version' = '1'::jsonb)
+    ELSE FALSE
+  END)`
+  return `CASE
+    WHEN ${source} IS DISTINCT FROM 'user' THEN FALSE
+    WHEN jsonb_typeof(${input}) IS DISTINCT FROM 'object' THEN FALSE
+    WHEN ${input} ? 'input' AND jsonb_typeof(${nested}) IS DISTINCT FROM 'object' THEN FALSE
+    WHEN ${input} ? 'intent' AND NOT ${validObjectiveIntent(outerIntent)} THEN FALSE
+    WHEN ${nested} ? 'intent' AND NOT ${validObjectiveIntent(nestedIntent)} THEN FALSE
+    WHEN ${input} ? 'intent' OR ${nested} ? 'intent'
+      THEN jsonb_build_array(${source}, 'objective_task_graph_execution', 1) = ${parameter}::jsonb
+    ELSE FALSE
+  END`
+}
+
 /** Builds a total-order page; complete witness counts precede the cursor and the sentinel is metadata only. */
-export function buildRootTaskHistoryCrossSessionWindow(input: RootTaskHistoryCrossSessionWindowInput): Readonly<{
+function buildCrossSessionWindow(input: RootTaskHistoryCrossSessionWindowInput, originMatches: (parameter: string) => string): Readonly<{
   sql: string; values: readonly unknown[]
 }> {
   const compatibility = scheduledAutomationHistoryCompatibilitySql("$5")
-  const origin = canonicalOriginMatches("$8")
+  const origin = originMatches("$8")
   const limit = Number.isFinite(input.limit) ? Math.min(MAX_PAGE_SIZE, Math.max(0, Math.floor(input.limit))) : 0
   const cursorFilter = input.afterCursor ? `WHERE ((candidate."terminalWitnessXid8")::numeric,
         candidate."turnId" COLLATE "C", candidate."terminalEventId" COLLATE "C",
@@ -133,4 +154,16 @@ export function buildRootTaskHistoryCrossSessionWindow(input: RootTaskHistoryCro
       input.scheduledCriteria, input.objectiveDigest, input.semanticsVersion, input.canonicalOrigin, limit,
       ...cursorValues],
   }
+}
+
+export function buildRootTaskHistoryCrossSessionWindow(input: RootTaskHistoryCrossSessionWindowInput): Readonly<{
+  sql: string; values: readonly unknown[]
+}> {
+  return buildCrossSessionWindow(input, canonicalOriginMatches)
+}
+
+export function buildRootTaskHistoryFootprintCrossSessionWindow(input: RootTaskHistoryCrossSessionWindowInput): Readonly<{
+  sql: string; values: readonly unknown[]
+}> {
+  return buildCrossSessionWindow(input, footprintOriginMatches)
 }

@@ -7,6 +7,7 @@ import { Pool, type PoolClient } from "pg"
 import { Redis } from "ioredis"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { TenantScope } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 import { createCanonicalTurnContextBuilder } from "../canonical-turn-context-builder.js"
 import type { DirectRootTaskHistoryReader } from "../canonical-turn-root-task-history.js"
 import { TurnEngine } from "../turns/turn-engine.js"
@@ -892,13 +893,17 @@ describePg("root task history objective snapshot PostgreSQL durability", () => {
 
   it("replays a footprint-only projection after a separate process restart without an outcomes payload", async () => {
     const fixture = await createScenario(pool!, false); scenarios.push(fixture)
+    await pool!.query(`UPDATE "agent_turns" SET "input" = jsonb_set("input", '{intent}', $2::jsonb)
+      WHERE "id"=$1 AND "sessionId"=$3 AND "userId"=$4`, [fixture.turnId,
+      JSON.stringify(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT), fixture.sessionId, fixture.userId])
     const client = await pool!.connect()
     let fence: Awaited<ReturnType<typeof readRootTaskHistoryFence>> | undefined
     try {
       await client.query("BEGIN")
       await client.query("SELECT set_config($1,$2,true)", ["app.user_id", fixture.userId])
       fence = await readRootTaskHistoryFence(client, { lease: fixture.lease, rootTaskId: fixture.rootTaskId,
-        rootAttemptCount: 1, stepId: fixture.stepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true })
+        rootAttemptCount: 1, stepId: fixture.stepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true,
+        searchFootprintReadAllowed: true })
       const steer = await readRootTaskHistorySteerEvidence(client, fixture.scope, { sessionId: fixture.sessionId,
         turnId: fixture.turnId, stepId: fixture.stepId,
         lease: { ownerId: fixture.lease.ownerId, leaseVersion: fixture.lease.leaseVersion, now: new Date() } })
@@ -908,14 +913,14 @@ describePg("root task history objective snapshot PostgreSQL durability", () => {
       await client.query("ROLLBACK").catch(() => undefined)
       throw error
     } finally { client.release() }
-    if (!fence?.currentOrigin || !fence.currentStartWitness) throw new Error("Search-footprint restart fixture lacks a current objective fence")
+    if (!fence?.searchFootprintOrigin || !fence.searchFootprintStartWitness) throw new Error("Search-footprint restart fixture lacks an exact objective-origin fence")
     const searchFootprints = { roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] }
     const processInput = { lease: { ...fixture.lease,
       leaseStartedAt: fixture.lease.leaseStartedAt.toISOString(), leaseExpiresAt: fixture.lease.leaseExpiresAt.toISOString() },
       rootTaskId: fixture.rootTaskId, authorization: { eventId: `search-footprint-auth-${fixture.turnId}`,
         sessionId: fixture.sessionId, userId: fixture.userId, consentVersion: 1, consentEnabled: false, gateEnabledAtCapture: false },
-      fence: { currentStartSequence: fence.currentStartSequence.toString(), currentStartWitness: fence.currentStartWitness,
-        objectiveDigest: fence.objectiveDigest, currentOrigin: fence.currentOrigin }, acceptedInputRevision: "0", searchFootprints }
+      fence: { currentStartSequence: fence.currentStartSequence.toString(), searchFootprintStartWitness: fence.searchFootprintStartWitness,
+        objectiveDigest: fence.objectiveDigest, searchFootprintOrigin: fence.searchFootprintOrigin }, acceptedInputRevision: "0", searchFootprints }
 
     const firstProcess = await runSearchFootprintSnapshotProcess("search-footprint-snapshot-write", processInput)
     expect(firstProcess).toEqual({ searchFootprints, reused: false })

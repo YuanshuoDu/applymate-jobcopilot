@@ -30,6 +30,8 @@ export { AgentSessionControlActionSchema, AgentSessionControlCommandSchema } fro
 export type { AgentSessionControlAction, AgentSessionControlCommand } from './session-control.js'
 export { AgentTurnSchema, TurnSourceSchema, TurnStatusSchema } from './turn.js'
 export type { AgentTurn, TurnSource, TurnStatus } from './turn.js'
+export { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, TurnIntentSchema } from './turn-intent.js'
+export type { TurnIntent } from './turn-intent.js'
 export { AgentStepSchema, AgentStepUsageSchema, StepStatusSchema } from './step.js'
 export type { AgentStep, AgentStepUsage, StepStatus } from './step.js'
 export {

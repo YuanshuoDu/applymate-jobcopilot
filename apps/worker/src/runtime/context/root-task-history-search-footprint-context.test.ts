@@ -88,8 +88,8 @@ describe("Root task history search-footprint context", () => {
       authorization: { eventId: "session-auth", sessionId: "current-session", userId: "user-a", consentVersion: 1,
         consentEnabled: false, gateEnabledAtCapture: false },
       searchFootprintReadAllowed: true,
-      fence: { currentStartSequence: 4n, currentStartWitness: { eventId: "current-start", xid8: "50" },
-        objectiveDigest: "a".repeat(64), currentOrigin: JSON.stringify(["user", "objective_task_graph_execution", 1]) },
+      fence: { currentStartSequence: 4n, searchFootprintStartWitness: { eventId: "footprint-start", xid8: "50" },
+        objectiveDigest: "a".repeat(64), searchFootprintOrigin: JSON.stringify(["user", "objective_task_graph_execution", 1]) },
       acceptedInputRevision: 2n, steerEvidence: { kind: "no_accepted_steer" as const },
     }
     const identity = createRootTaskHistorySearchFootprintSnapshotIdentity(input)
@@ -99,7 +99,14 @@ describe("Root task history search-footprint context", () => {
       intentVersion: 1,
     })
     expect(createRootTaskHistorySearchFootprintSnapshotIdentity({
-      ...input, fence: { ...input.fence, currentOrigin: JSON.stringify(["user", "objective_task_graph_execution", 2]) },
+      ...input, fence: { ...input.fence, searchFootprintOrigin: JSON.stringify(["user", "objective_task_graph_execution", 2]) },
+    })).toBeUndefined()
+    expect(createRootTaskHistorySearchFootprintSnapshotIdentity({
+      ...input, fence: { ...input.fence, searchFootprintOrigin: '["user","objective_task_graph_execution",1,"extra"]' },
+    })).toBeUndefined()
+    expect(createRootTaskHistorySearchFootprintSnapshotIdentity({
+      ...input, fence: { ...input.fence, searchFootprintOrigin: undefined,
+        currentOrigin: '["user","objective_task_graph_execution",1]' },
     })).toBeUndefined()
   })
 
@@ -109,8 +116,8 @@ describe("Root task history search-footprint context", () => {
       authorization: { eventId: "session-auth", sessionId: "current-session", userId: "user-a", consentVersion: 1,
         consentEnabled: false, gateEnabledAtCapture: false },
       searchFootprintReadAllowed: true,
-      fence: { currentStartSequence: 4n, currentStartWitness: { eventId: "current-start", xid8: "50" },
-        objectiveDigest: "a".repeat(64), currentOrigin: '["user","none"]' },
+      fence: { currentStartSequence: 4n, searchFootprintStartWitness: { eventId: "footprint-start", xid8: "50" },
+        objectiveDigest: "a".repeat(64), searchFootprintOrigin: '["user","objective_task_graph_execution",1]' },
       acceptedInputRevision: 2n, steerEvidence: { kind: "no_accepted_steer" },
     })!
     const projection = { roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] }
@@ -128,8 +135,8 @@ describe("Root task history search-footprint context", () => {
       authorization: { eventId: "session-auth", sessionId: "current-session", userId: "user-a", consentVersion: 1,
         consentEnabled: false, gateEnabledAtCapture: false },
       searchFootprintReadAllowed: false,
-      fence: { currentStartSequence: 4n, currentStartWitness: { eventId: "current-start", xid8: "50" },
-        objectiveDigest: "a".repeat(64), currentOrigin: '["user","none"]' },
+      fence: { currentStartSequence: 4n, searchFootprintStartWitness: { eventId: "footprint-start", xid8: "50" },
+        objectiveDigest: "a".repeat(64), searchFootprintOrigin: '["user","objective_task_graph_execution",1]' },
       acceptedInputRevision: 2n, steerEvidence: { kind: "no_accepted_steer" },
     })).toBeUndefined()
     const serializedPayload = payload as Record<string, unknown>

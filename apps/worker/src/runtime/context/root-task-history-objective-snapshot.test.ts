@@ -16,6 +16,9 @@ import { rootTaskHistorySearchFootprintSnapshotKey } from "./root-task-history-s
 
 const fence: RootTaskHistoryFence = { currentStartSequence: 5n, currentStartWitness: { eventId: "start-witness", xid8: "100" },
   objectiveDigest: "c".repeat(64), currentOrigin: '["user","none"]' }
+const footprintFence: RootTaskHistoryFence = { currentStartSequence: 5n,
+  searchFootprintStartWitness: { eventId: "footprint-start-witness", xid8: "100" }, objectiveDigest: "c".repeat(64),
+  searchFootprintOrigin: '["user","objective_task_graph_execution",1]' }
 const authorization: RootTaskHistorySessionAuthorization = { eventId: "authorization-event-1", sessionId: "session-1", userId: "user-1",
   consentVersion: 4, consentEnabled: true, gateEnabledAtCapture: true }
 const outcome: ValidatedRootTaskHistoryOutcome = { sourceTurnId: "old-turn", sourceRootTaskId: "old-root", terminalSequence: 30n,
@@ -70,7 +73,7 @@ function input(client: Pick<pg.PoolClient, "query">, load = vi.fn(async () => [o
 
 function searchFootprintInput(client: Pick<pg.PoolClient, "query">,
   load = vi.fn(async () => ({ roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] }))): RootTaskHistorySearchFootprintSnapshotInput {
-  return { ...input(client), authorization: { ...authorization, consentEnabled: false }, searchFootprintReadAllowed: true,
+  return { ...input(client), fence: footprintFence, authorization: { ...authorization, consentEnabled: false }, searchFootprintReadAllowed: true,
     loadSearchFootprints: load }
 }
 
@@ -109,9 +112,9 @@ describe("root task history objective snapshot", () => {
     expect(fake.events).toHaveLength(1)
     expect(fake.events[0]).toMatchObject({ id: eventId(rootTaskHistorySearchFootprintSnapshotKey({
       schemaVersion: "agent-harness.v2.root-task-history-search-footprint-snapshot.v1", sessionId: "session-1", userId: "user-1",
-      searchFootprintReadAllowed: true, objectiveDigest: fence.objectiveDigest, canonicalOrigin: fence.currentOrigin!,
-      intentKind: null, intentVersion: null, acceptedInputRevision: "0", steerEvidence: "no_accepted_steer",
-      startWitnessEventId: "start-witness", startWitnessXid8: "100",
+      searchFootprintReadAllowed: true, objectiveDigest: footprintFence.objectiveDigest, canonicalOrigin: footprintFence.searchFootprintOrigin!,
+      intentKind: "objective_task_graph_execution", intentVersion: 1, acceptedInputRevision: "0", steerEvidence: "no_accepted_steer",
+      startWitnessEventId: "footprint-start-witness", startWitnessXid8: "100",
     })), type: ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_SNAPSHOT_EVENT_TYPE })
     expect(payload).toContain("searchFootprints")
     expect(payload).not.toContain("outcomes")

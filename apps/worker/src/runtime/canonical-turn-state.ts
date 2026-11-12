@@ -1,5 +1,5 @@
 import type pg from "pg"
-import type { TenantScope, RepositoryJsonValue, TurnSource } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, TurnIntentSchema, validate, type TenantScope, type RepositoryJsonValue, type TurnIntent, type TurnSource } from "@jobcopilot/agent-protocol"
 
 import { loadCanonicalTurnSnapshot } from "./context/canonical-turn-snapshot-loader.js"
 import type { SelectedJobMemoryRecord } from "./context/selected-job-memory.js"
@@ -29,7 +29,7 @@ export type CanonicalTurnState = {
   readonly budgetSnapshot: unknown
   readonly rootTaskId?: string
   readonly rootInputId?: string
-  /** Exact server-owned interactive-discovery intent restored from the Turn envelope. */
+  /** Exact server-owned supported intent restored from the Turn envelope. */
   readonly intent?: CanonicalTurnIntent
   /** Loaded Turns always provide this; optional for existing injected stateLoader fixtures. */
   readonly contextSnapshotPinned?: boolean
@@ -44,8 +44,8 @@ export type CanonicalTurnState = {
   readonly recoveredWaitControl?: import("./turns/turn-execution-wait.js").RecoveredArchivedWaitControl
 }
 
-export type CanonicalTurnIntent = Readonly<{ kind: "interactive_discovery_shortlist"; version: 1 }>
-export const INTERACTIVE_DISCOVERY_INTENT: CanonicalTurnIntent = Object.freeze({ kind: "interactive_discovery_shortlist", version: 1 })
+export type CanonicalTurnIntent = TurnIntent
+export const INTERACTIVE_DISCOVERY_INTENT: Extract<TurnIntent, { kind: "interactive_discovery_shortlist" }> = Object.freeze({ kind: "interactive_discovery_shortlist", version: 1 })
 type Row = Record<string, unknown>
 function turnSource(value: unknown): TurnSource | undefined { return value === "user" || value === "automation" || value === "system" ? value : undefined }
 function automationRunMode(value: unknown): "scheduled" | "manual" | undefined { return value === "scheduled" || value === "manual" ? value : undefined }
@@ -74,11 +74,11 @@ function turnIntent(value: unknown): CanonicalTurnIntent | undefined {
   const root = object(value)
   const input = object(root.input)
   const source = Object.keys(input).length > 0 ? input : root
-  const intent = object(source.intent)
-  if (Object.keys(intent).sort().join(",") !== "kind,version"
-    || intent.kind !== INTERACTIVE_DISCOVERY_INTENT.kind
-    || intent.version !== INTERACTIVE_DISCOVERY_INTENT.version) return undefined
-  return INTERACTIVE_DISCOVERY_INTENT
+  if (!Object.hasOwn(source, "intent")) return undefined
+  const intent = source.intent
+  if (!validate(TurnIntentSchema, intent)) throw new Error("turn_intent_invalid")
+  return (intent as TurnIntent).kind === INTERACTIVE_DISCOVERY_INTENT.kind
+    ? INTERACTIVE_DISCOVERY_INTENT : OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT
 }
 
 function cognitiveAgendaReceipt(events: readonly Row[], lease: TurnLease, rootTaskId: unknown): CognitiveAgendaReceipt | undefined {

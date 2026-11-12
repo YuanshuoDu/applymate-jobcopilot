@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { createDiscoveryQueryFootprint } from "../subagents/child-discovery-query-footprint.js"
 import * as taskGraphState from "../subagents/task-graph-pg-state.js"
@@ -77,6 +78,10 @@ function candidate(index: number, terminalSequence = String(index * 2 + 2), stat
     terminalPayload: status === "failed" ? { turnId, taskId: rootTaskId, errorCode, finalItemId: null }
       : { turnId, taskId: rootTaskId, errorCode }, terminalEventCount: 1,
   }
+}
+
+function objectiveIntentInput(goal = "Explore roles") {
+  return { goal, successCriteria: ["Respect location"], intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT }
 }
 
 function currentStart(sequence = "1000"): Row {
@@ -299,8 +304,9 @@ describe("direct Root-task history PostgreSQL store", () => {
   })
 
   it("does not load a source graph when its durable Root objective differs", async () => {
-    const mismatch = { ...candidate(11), sessionId: "prior-session", sourceSessionUserId: "user-1", goal: "Another objective" }
-    const test = fixture({ candidates: [mismatch] })
+    const mismatch = { ...candidate(11), sessionId: "prior-session", sourceSessionUserId: "user-1", goal: "Another objective",
+      input: objectiveIntentInput("Another objective") }
+    const test = fixture({ candidates: [mismatch], currentInput: objectiveIntentInput() })
     await expect(test.store.loadSearchFootprintsWithClient(test.client,
       { ...test.input, searchFootprintReadAllowed: true })).resolves.toEqual({ roles: [], locations: [], atsSources: [] })
     expect(test.queries.some(query => query.sql.includes('FROM "agent_items" AS item'))).toBe(false)
@@ -308,8 +314,8 @@ describe("direct Root-task history PostgreSQL store", () => {
 
   it("loads only a bounded footprint from tenant-fenced, validated prior TaskGraphs", async () => {
     const prior: Row = { ...candidate(3), sessionId: "prior-session", sourceSessionUserId: "user-1",
-      terminalStepSessionId: "prior-session", terminalStepEventSessionId: "prior-session" }
-    const test = fixture({ candidates: [prior] })
+      terminalStepSessionId: "prior-session", terminalStepEventSessionId: "prior-session", input: objectiveIntentInput() }
+    const test = fixture({ candidates: [prior], currentInput: objectiveIntentInput() })
     const footprint = createDiscoveryQueryFootprint([{ criteria: { targetRoles: ["Backend Engineer"], targetLocations: ["Dublin"],
       source: "lever", pageSize: 20, hasCursor: true }, outcome: "completed", requestCount: 2, observedCandidateCount: 7,
       providerFailures: 0, materializationFailures: 0, hasMore: false }])
@@ -332,6 +338,20 @@ describe("direct Root-task history PostgreSQL store", () => {
       expect(JSON.stringify(searchFootprints)).not.toMatch(/pageSize|hasCursor|requestCount|observedCandidateCount|providerFailures|materializationFailures|hasMore|turn-source-3|root-source-3/)
     } finally {
       load.mockRestore(); current.mockRestore(); validate.mockRestore()
+    }
+  })
+
+  it("does not query footprint history for a missing or malformed current objective intent", async () => {
+    for (const currentInput of [
+      { goal: "Explore roles", successCriteria: ["Respect location"] },
+      { ...objectiveIntentInput(), intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, version: 2 } },
+      { ...objectiveIntentInput(), intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, extra: true } },
+      { ...objectiveIntentInput(), input: { intent: { kind: "interactive_discovery_shortlist", version: 1 } } },
+    ]) {
+      const test = fixture({ currentInput })
+      await expect(test.store.loadSearchFootprintsWithClient(test.client,
+        { ...test.input, searchFootprintReadAllowed: true })).resolves.toEqual({ roles: [], locations: [], atsSources: [] })
+      expect(test.queries.some(query => query.sql.includes("WITH terminal_window AS MATERIALIZED"))).toBe(false)
     }
   })
 

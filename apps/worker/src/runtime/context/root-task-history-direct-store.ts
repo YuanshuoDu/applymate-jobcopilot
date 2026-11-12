@@ -4,7 +4,7 @@ import { projectLoadedRootTaskHistoryGraph, type LoadedRootTaskHistoryGraphProje
 import type { ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
 import { mergeRootTaskHistorySearchFootprintSources, projectRootTaskHistorySearchFootprintContext,
   type RootTaskHistorySearchFootprintContext, type RootTaskHistorySearchFootprintSource } from "./root-task-history-search-footprint-context.js"
-import { readRootTaskHistoryCandidates, type RootTaskHistoryCandidate } from "./root-task-history-source-store.js"
+import { readRootTaskHistoryCandidates, readRootTaskHistoryFootprintCandidates, type RootTaskHistoryCandidate } from "./root-task-history-source-store.js"
 import {
   readRootTaskHistoryFence, validateRootTaskHistoryFenceInput, withRootTaskHistoryTransaction,
   type RootTaskHistoryFenceInput,
@@ -65,8 +65,8 @@ async function readSearchFootprintsWithClient(client: Client, input: DirectRootT
   if (input.searchFootprintReadAllowed !== true) return { roles: [], locations: [], atsSources: [] }
   const request: RootTaskHistoryFenceInput = { ...input, crossSessionRootTaskHistoryEnabled: true }
   const fence = await readRootTaskHistoryFence(client, request)
-  if (!fence?.currentOrigin || !fence.currentStartWitness) return { roles: [], locations: [], atsSources: [] }
-  const candidates = await readRootTaskHistoryCandidates(client, request, fence), sources: RootTaskHistorySearchFootprintSource[] = []
+  if (!fence?.searchFootprintOrigin || !fence.searchFootprintStartWitness) return { roles: [], locations: [], atsSources: [] }
+  const candidates = await readRootTaskHistoryFootprintCandidates(client, request, fence), sources: RootTaskHistorySearchFootprintSource[] = []
   let graphLoads = 0
   for (const candidate of candidates) {
     if (candidate.sessionId === input.lease.sessionId || graphLoads >= GRAPH_LOAD_LIMIT) continue
@@ -87,7 +87,7 @@ async function readSearchFootprintsWithClient(client: Client, input: DirectRootT
       throw error
     }
   }
-  return mergeRootTaskHistorySearchFootprintSources(sources, fence.currentStartWitness.xid8) ?? { roles: [], locations: [], atsSources: [] }
+  return mergeRootTaskHistorySearchFootprintSources(sources, fence.searchFootprintStartWitness.xid8) ?? { roles: [], locations: [], atsSources: [] }
 }
 
 export function createPgDirectRootTaskHistoryStore(pool: Pool) {
