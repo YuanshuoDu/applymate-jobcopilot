@@ -13,6 +13,9 @@ import {
 } from "./native-verification-contract.js"
 import { parseNativeVerificationPacket } from "./native-verification-packet.js"
 import { parseTaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { buildTaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
+import { buildGroundedTaskGraphFinalResponse } from "./task-graph-final-response.js"
+import { loadTaskGraph } from "./task-graph-pg-state.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 import type { SubagentJobPayload } from "./types.js"
 
@@ -289,6 +292,22 @@ function verificationReport(
 }
 
 type CanonicalFixture = Readonly<{ userId: string; sessionId: string; turnId: string; ownerId: string; jobId: string }>
+
+async function currentGroundedTaskGraphResponse(owner: CanonicalFixture, rootTaskId: string): Promise<string> {
+  const client = await pool!.connect()
+  try {
+    await client.query("BEGIN READ ONLY")
+    await client.query("SELECT set_config('app.user_id', $1, true)", [owner.userId])
+    const binding = buildTaskGraphFinalSummaryBinding(await loadTaskGraph(client, {
+      userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId, parentTaskId: rootTaskId,
+    }, false))
+    if (!binding) throw new Error("Current TaskGraph did not produce its final-summary binding")
+    return buildGroundedTaskGraphFinalResponse(binding)
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined)
+    client.release()
+  }
+}
 
 const SAFE_TURN_STATUSES = new Set([
   "queued", "in_progress", "waiting_for_dependency", "waiting_for_user", "waiting_for_approval", "interrupted", "failed", "completed",
@@ -1078,12 +1097,18 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
         `SELECT "status", "finalResponse", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
         [canonical.turnId, canonical.sessionId])
       const rootTaskId = turn.rows[0]?.rootTaskId
+      if (!rootTaskId) throw new Error("Completed canonical Turn lost its root TaskGraph identity")
       const finalItem = await pool!.query<{ content: unknown }>(
         `SELECT "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
           AND "type" = 'agent_message' AND "phase" = 'final_answer' AND "status" = 'completed' ORDER BY "createdAt" DESC LIMIT 1`,
         [canonical.sessionId, canonical.turnId, rootTaskId])
       expect(turn.rows[0]?.status).toBe("completed")
-      expect(persistedFinalCandidate(finalItem.rows[0]?.content, turn.rows[0]?.finalResponse)).toBe(acceptedCandidate)
+      const persistedFinal = persistedFinalCandidate(finalItem.rows[0]?.content, turn.rows[0]?.finalResponse)
+      if (!persistedFinal) throw new Error("The completed Turn final item did not match its serialized response")
+      expect(persistedFinal).toBe(await currentGroundedTaskGraphResponse(canonical, rootTaskId))
+      expect(persistedFinal).toContain("Task-reported results:")
+      expect(persistedFinal).toContain("These are structured task reports, not independent verification.")
+      expect(persistedFinal).not.toContain(acceptedCandidate)
       const completedEvents = await pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_events"
         WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.completed'`, [canonical.sessionId, canonical.turnId])
       expect(completedEvents.rows[0]?.count).toBe(1)

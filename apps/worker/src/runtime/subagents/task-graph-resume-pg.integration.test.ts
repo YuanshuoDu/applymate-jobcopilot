@@ -60,7 +60,9 @@ import { defaultSubagentPolicy, parseSubagentJobPayload, type SubagentLease, typ
 import { subagentDispatchJobId } from "./dispatch-identity.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapshot.js"
-import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
+import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
+import { buildGroundedTaskGraphFinalResponse } from "./task-graph-final-response.js"
+import { loadTaskGraph } from "./task-graph-pg-state.js"
 import { parseStoredTaskGraphVerificationReport, TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION } from "./task-graph-verification-report.js"
 import { hasNoCurrentAttemptTaskGraphToolReceipts } from "./task-graph-empty-analyst-proof.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
@@ -4022,6 +4024,40 @@ async function checkTerminalTaskGraph(pool: Pool, lease: TurnLease, rootTaskId: 
   } finally {
     client.release()
   }
+}
+
+async function currentGroundedTaskGraphResponse(pool: Pool, owner: Fixture, rootTaskId: string): Promise<string> {
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN READ ONLY")
+    await client.query("SELECT set_config('app.user_id', $1, true)", [owner.userId])
+    const binding = buildTaskGraphFinalSummaryBinding(await loadTaskGraph(client, {
+      userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId, parentTaskId: rootTaskId,
+    }, false))
+    if (!binding) throw new Error("Current TaskGraph did not produce its final-summary binding")
+    return buildGroundedTaskGraphFinalResponse(binding)
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined)
+    client.release()
+  }
+}
+
+async function expectGroundedTaskGraphFinalCopies(
+  pool: Pool, owner: Fixture, rootTaskId: string, finalResponse: RecordValue, rawCandidate: string,
+): Promise<void> {
+  const expected = await currentGroundedTaskGraphResponse(pool, owner, rootTaskId)
+  expect(finalResponse.response).toBe(expected)
+  expect(finalResponse.response).not.toContain(rawCandidate)
+  const finalItems = await pool.query<{ content: unknown }>(`SELECT "content" FROM "agent_items"
+    WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "type" = 'agent_message'
+      AND "phase" = 'final_answer' AND "status" = 'completed' ORDER BY "createdAt" DESC LIMIT 1`,
+  [owner.sessionId, owner.turnId, rootTaskId])
+  expect(finalItems.rows).toHaveLength(1)
+  const content = record(finalItems.rows[0]?.content)
+  const final = record(content?.final)
+  expect(content?.text).toBe(expected)
+  expect(final?.response).toBe(expected)
+  expect(final?.summary).toBe(finalResponse.summary)
 }
 
 type FixtureProcessScope = Readonly<{ sessionId: string; turnId: string; selectedQueueName?: string }>
@@ -12614,12 +12650,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           failures: Array.isArray(shortlist?.failures) ? shortlist.failures.filter((failure): failure is string => typeof failure === "string").slice(0, 12) : [],
         }
         const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue | null
-        const finalCandidateText = typeof finalResponse?.response === "string" ? finalResponse.response : ""
-        if (turn.rows[0]?.status !== "completed" || finalCandidateText !== JSON.stringify({
-          schemaVersion: "agent-harness.v2.final", response: "p3-process-restart-discovery-shortlist-ready",
-        })) {
-          throw new Error("Interactive discovery trace final outcome does not preserve its verified model candidate")
+        const rootTaskId = root.rows[0]?.id
+        if (turn.rows[0]?.status !== "completed" || !finalResponse || !rootTaskId) {
+          throw new Error("Interactive discovery trace final outcome did not complete its owned Turn")
         }
+        await expectGroundedTaskGraphFinalCopies(pool!, value, rootTaskId, finalResponse, "p3-process-restart-discovery-shortlist-ready")
+        const finalCandidateText = typeof finalResponse.response === "string" ? finalResponse.response : ""
+        if (!finalCandidateText) throw new Error("Interactive discovery trace final response was unavailable")
         await writeFile(interactiveDiscoveryTraceArtifactPath, JSON.stringify({
           schemaVersion: "agent-harness.v2.interactive-discovery-trace",
           sessionId: value.sessionId,
@@ -13306,8 +13343,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       })}`)
     }
 
-    const root = await pool!.query<{ status: string; result: unknown }>(
-      `SELECT "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "role" = 'orchestrator'`,
+    const root = await pool!.query<{ id: string; status: string; result: unknown }>(
+      `SELECT "id", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "role" = 'orchestrator'`,
       [discoveryOwner.turnId, discoveryOwner.sessionId],
     )
     expect(root.rows).toHaveLength(1)
@@ -13345,7 +13382,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(waits.rows.every(wait => wait.consumedAt instanceof Date)).toBe(true)
     const final = await pool!.query<{ finalResponse: string | null }>(`SELECT "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [discoveryOwner.turnId])
     const finalResponse = JSON.parse(final.rows[0]?.finalResponse ?? "null") as RecordValue
-    expect(finalResponse.response).toBe(JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "Shortlist ready" }))
+    await expectGroundedTaskGraphFinalCopies(pool!, discoveryOwner, root.rows[0]!.id, finalResponse, "Shortlist ready")
     expect(finalResponse.summary).toContain("discovered jobs: 1 (complete)")
   }, 90_000)
 
@@ -14332,11 +14369,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const turn = await pool!.query<{ status: string; finalResponse: string | null; rootTaskId: string | null }>(`SELECT "status", "finalResponse", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId])
     expect(turn.rows[0]?.status).toBe("completed")
     const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue
-    expect(finalResponse.response).toBe(JSON.stringify({
-      schemaVersion: "agent-harness.v2.final", response: "The verified shortlist is ready",
-    }))
     const rootTaskId = turn.rows[0]?.rootTaskId
     expect(rootTaskId).toBeTruthy()
+    if (!rootTaskId) throw new Error("Completed interactive shortlist lost its root TaskGraph identity")
+    await expectGroundedTaskGraphFinalCopies(pool!, value, rootTaskId, finalResponse, "The verified shortlist is ready")
     const rejection = await pool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'final.rejected' AND "payload"->>'blocker' = 'task_graph_verification_unverified'`, [value.turnId, value.sessionId])
     expect(rejection.rowCount).toBeGreaterThan(0)
     const tasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown }>(`SELECT "id", "goal", "status", "failureReason", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3`, [value.turnId, value.sessionId, rootTaskId])
