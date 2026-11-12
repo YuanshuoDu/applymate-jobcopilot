@@ -68,6 +68,14 @@ const TURN_STOPPED_MESSAGE = "Agent turn was stopped before the application subm
 const SUBMISSION_START_OBSERVATION_TIMEOUT_MS = 8_000;
 const BEST_EFFORT_PAGE_CLOSE_TIMEOUT_MS = 1_000;
 
+function fullLoopManualFailureStage(result: HarnessResult): string {
+  if (result.error === CAPTCHA_USER_TAKEOVER_MESSAGE) return "captcha_detected";
+  if (result.error === CHALLENGE_DETECTION_FAILED_MESSAGE) return "challenge_detection_error";
+  if (result.error === "No submit button found") return "submit_control_missing";
+  if (result.error === "Form filled and ready for user review.") return "review_required";
+  return "other";
+}
+
 export const QUEUE_NAME = "apply-tasks";
 
 /** The queue used to enqueue apply tasks */
@@ -791,7 +799,13 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         if (hasCanonicalReceipt) {
           if (!approvedTurnScope) throw new Error("Approved application submission is missing its durable Turn scope.");
           const submit = createBrowserApplicationSubmitProvider({
-            run: runBrowserFlow,
+            run: async (beforeSubmit) => {
+              const result = await runBrowserFlow(beforeSubmit);
+              if (process.env.APPLICATION_TASK_FULL_LOOP_STAGE_OBSERVER_TEST === "true" && result.status === "manual") {
+                console.log(`APPLICATION_TASK_FULL_LOOP_SUBMIT_MANUAL ${fullLoopManualFailureStage(result)}`);
+              }
+              return result;
+            },
             confirmationId: `application:${applicationTaskId}`,
             postSubmitUrl: () => page.url(),
           });

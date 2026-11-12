@@ -139,6 +139,21 @@ const SAFE_SUBMISSION_ATTEMPT_ERROR_CODES = [
   "provider_error",
 ] as const
 const SAFE_SUBMISSION_ATTEMPT_ERROR_CODE_SET: ReadonlySet<string> = new Set(SAFE_SUBMISSION_ATTEMPT_ERROR_CODES)
+
+const SAFE_SUBMIT_MANUAL_FAILURE_STAGES = new Set([
+  "captcha_detected",
+  "challenge_detection_error",
+  "submit_control_missing",
+  "review_required",
+  "other",
+])
+
+function diagnosticSubmitManualFailureStage(lines: readonly string[]): string | null {
+  const prefix = "APPLICATION_TASK_FULL_LOOP_SUBMIT_MANUAL "
+  const value = lines.filter(line => line.startsWith(prefix)).at(-1)?.slice(prefix.length)
+  if (value === undefined) return null
+  return SAFE_SUBMIT_MANUAL_FAILURE_STAGES.has(value) ? value : "other"
+}
 type SafeSubmissionAttemptErrorCode = typeof SAFE_SUBMISSION_ATTEMPT_ERROR_CODES[number]
 
 function diagnosticSubmissionAttemptErrorCode(value: unknown): null | "other" | SafeSubmissionAttemptErrorCode {
@@ -426,6 +441,18 @@ describe("ApplicationTask submission attempt diagnostic classifier", () => {
   })
 })
 
+describe("ApplicationTask full-loop submit failure diagnostics", () => {
+  it("keeps manual failure output to an allowlisted reason enum", () => {
+    expect(diagnosticSubmitManualFailureStage([
+      "APPLICATION_TASK_FULL_LOOP_SUBMIT_MANUAL submit_control_missing",
+    ])).toBe("submit_control_missing")
+    expect(diagnosticSubmitManualFailureStage([
+      "APPLICATION_TASK_FULL_LOOP_SUBMIT_MANUAL raw page text must not be exposed",
+    ])).toBe("other")
+    expect(diagnosticSubmitManualFailureStage([])).toBeNull()
+  })
+})
+
 async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Promise<string> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
@@ -682,6 +709,7 @@ async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
     submissionAttempts: submissionAttempts.map(({ state, errorCode }) => ({
       state, errorCode: diagnosticSubmissionAttemptErrorCode(errorCode),
     })),
+    submitManualFailureStage: diagnosticSubmitManualFailureStage(worker?.lines ?? []),
     applyQueueJobs,
     sessionTurnIds: sessionTurns.map(turnRow => turnRow.id), sessionSubagentTaskIds: sessionSubagents.map(taskRow => taskRow.id),
     recentEvents: recentEvents.map(event => ({ ...event, sequence: event.sequence.toString() })),
@@ -949,6 +977,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
             fixtureStats: await requestFixtureStats().then(fixtureStatsSummary).catch(() => ({ errorPresent: true })),
             applicationFillExecutorTraces: applicationFillExecutorTraces(worker),
             applicationFillStageTraces: applicationFillStageTraces(worker),
+            submitManualFailureStage: diagnosticSubmitManualFailureStage(worker?.lines ?? []),
             workerExited: worker ? exited(worker) : null,
             worker: worker ? childSummary(worker) : null,
             site: site ? childSummary(site) : null,
