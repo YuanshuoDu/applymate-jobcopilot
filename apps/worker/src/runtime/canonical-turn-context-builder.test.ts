@@ -915,6 +915,94 @@ describe("canonical Turn context builder", () => {
     expect(reader.loadSearchFootprintsWithClient).toHaveBeenCalledOnce()
   })
 
+  it("keeps own-session Task History beside separately consented searchFootprints when cross-session Task History is off", async () => {
+    const database = checkedOutPool(), footprint = { roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] }
+    const sameSession: ValidatedRootTaskHistoryOutcome = {
+      sourceTurnId: "private-own-session-turn", sourceRootTaskId: "private-own-session-root", sourceSessionDiffers: false,
+      terminalSequence: 11n, terminalXid8: "11", terminalWitnessEventId: "own-session-witness", sourceNodeOrdinals: [1],
+      nodeLessons: [{ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
+        criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+          check: { role: "analyst", kind: "finding_count_gte", minimum: 2 } }] }],
+      taskGraph: { revision: 4, nodes: [{ templateId: "analyst", status: "failed" }] } as unknown as TaskGraphCurrentState,
+    }
+    const crossSession: ValidatedRootTaskHistoryOutcome = {
+      sourceTurnId: "private-cross-session-turn", sourceRootTaskId: "private-cross-session-root", sourceSessionDiffers: true,
+      terminalSequence: 10n, terminalXid8: "10", terminalWitnessEventId: "cross-session-witness", sourceNodeOrdinals: [1],
+      nodeLessons: [{ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
+        criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+          check: { role: "analyst", kind: "finding_count_gte", minimum: 99 } }] }],
+      taskGraph: { revision: 3, nodes: [{ templateId: "analyst", status: "completed" }] } as unknown as TaskGraphCurrentState,
+    }
+    const fence: RootTaskHistoryFence = { currentStartSequence: 20n, currentStartWitness: { eventId: "current-start", xid8: "20" },
+      objectiveDigest: "a".repeat(64), currentOrigin: JSON.stringify(["user", "none"]),
+      searchFootprintStartWitness: { eventId: "footprint-start", xid8: "20" },
+      searchFootprintOrigin: JSON.stringify(["user", "objective_task_graph_execution", 1]) }
+    rootHistoryHarness.consentEnabled = false
+    rootHistoryHarness.searchFootprintReadAllowed = true
+    rootHistoryHarness.steerEvidence = { kind: "no_accepted_steer" }
+    rootHistoryHarness.fence = fence
+    rootHistoryHarness.searchSnapshotResult = { searchFootprints: footprint, reused: false }
+    rootHistoryHarness.loadSearchSnapshot = true
+    const ownSessionRead = vi.fn(async () => [sameSession]), crossSessionRead = vi.fn(async () => [crossSession])
+    const loadWithClient = vi.fn(async (client: pg.PoolClient, input: DirectRootTaskHistoryLoadInput) => {
+      expect(client).toBe(database.client)
+      return input.crossSessionRootTaskHistoryEnabled === true ? crossSessionRead() : ownSessionRead()
+    })
+    const loadFootprint = vi.fn(async (client: pg.PoolClient, input: { searchFootprintReadAllowed?: boolean }) => {
+      expect(client).toBe(database.client)
+      expect(input.searchFootprintReadAllowed).toBe(true)
+      return footprint
+    })
+    const reader: DirectRootTaskHistoryReader = { load: vi.fn(async () => []), loadWithClient,
+      loadSearchFootprintsWithClient: loadFootprint }
+    const baseContext = (request: StepContextRequest): StepContext => ({ schemaVersion: "agent-harness.v2", sessionId: request.sessionId,
+      turnId: request.turnId, stepId: request.stepId, inputThroughSequence: 7n, consumedInputIds: [], canonicalJson: "{}",
+      blocks: request.snapshot.toolObservations.map(observation => ({ id: `observation:${observation.id}`, layer: "tool_observation",
+        role: "data", trust: "external_untrusted", source: "tool_or_subagent", content: observation.content as StepContext["blocks"][number]["content"] })) })
+    const builder = createCanonicalTurnContextBuilder({ pool: database.pool, store: store([]), baseBuilder: {
+      build: async request => baseContext(request), buildInTransaction: async (_claim, request) => baseContext(request),
+    }, scope, lease, rootTaskId: "root-own-session", rootAttemptCount: 1, planningEnabled: true, selectedJobMode: false,
+    rootTaskHistoryDirectReader: reader, crossSessionRootTaskHistoryEnabled: false,
+    currentRootBudgetReader: async () => unavailableBudget })
+    const context = await builder.build({ scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "step-own-session-footprint",
+      snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [{
+        id: ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_OBSERVATION_ID,
+        content: { kind: "root_task_history_search_footprint", roles: ["FORGED ROLE"], locations: [], atsSources: ["lever"] },
+      }] }, now, lease: { ownerId: lease.ownerId, leaseVersion: lease.leaseVersion, now } })
+    const history = context.blocks.find(block => block.id === "observation:root-task-history")
+    const search = context.blocks.find(block => block.id === `observation:${ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_OBSERVATION_ID}`)
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({ context, model, tools: [{ name: "agent.plan", version: "1" }], sessionId: lease.sessionId,
+      turnId: lease.turnId, stepId: "step-own-session-footprint", userId: scope.userId, taskId: "root-own-session",
+      signal: new AbortController().signal, freshSteering: true })
+    const requestText = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+
+    expect(loadWithClient).toHaveBeenCalledWith(database.client, { lease, rootTaskId: "root-own-session", rootAttemptCount: 1,
+      stepId: "step-own-session-footprint", now })
+    expect(ownSessionRead).toHaveBeenCalledOnce()
+    expect(crossSessionRead).not.toHaveBeenCalled()
+    expect(rootHistoryHarness.snapshot).not.toHaveBeenCalled()
+    expect(history?.content).toMatchObject({ kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true })
+    expect(JSON.stringify(history?.content)).toContain('"minimum":2')
+    expect(JSON.stringify(history?.content)).toContain('"status":"failed"')
+    expect(requestText).toContain('"minimum":2')
+    expect(requestText).toContain('"status":"failed"')
+    expect(requestText).toContain("Backend Engineer")
+    expect(requestText).toContain("Dublin")
+    expect(requestText).toContain("lever")
+    expect(requestText).not.toContain("FORGED ROLE")
+    expect(requestText).not.toContain("private-cross-session-turn")
+    expect(requestText).not.toContain('"minimum":99')
+    expect(search?.content).toEqual({ kind: "root_task_history_search_footprint", historical: true, informationalOnly: true,
+      advisoryOnly: true, notCurrentEvidence: true, ...footprint })
+    const footprintSnapshotInput = rootHistoryHarness.searchSnapshot.mock.calls[0]?.[0] as Record<string, unknown>
+    expect(rootHistoryHarness.searchSnapshot).toHaveBeenCalledOnce()
+    expect(Object.hasOwn(footprintSnapshotInput, "loadOutcomes")).toBe(false)
+    expect(loadFootprint).toHaveBeenCalledOnce()
+    expect(rootHistoryHarness.loadedSearchFootprints).toEqual(footprint)
+    expect(JSON.stringify(search?.content)).not.toMatch(/private-own-session|private-cross-session|outcomes|minimum/)
+  })
+
   it("strips stale footprint input and fails closed for an accepted steer", async () => {
     const database = checkedOutPool(), footprintRead = vi.fn(async () => ({ roles: ["unexpected"], locations: [], atsSources: ["lever"] }))
     rootHistoryHarness.consentEnabled = false
