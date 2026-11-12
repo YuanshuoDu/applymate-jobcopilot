@@ -12603,11 +12603,19 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(workerThree.output.filter(line => line.startsWith("P3_DISCOVERY_CHILD_SETTLED " + analyst!.id + " analyst completed"))).toHaveLength(1)
       expect(workerThree.output.filter(line => line.startsWith("P3_DISCOVERY_RESTORED_FINAL_GRAPH "))).toHaveLength(1)
 
+      const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue | null
+      if (turn.rows[0]?.status !== "completed" || !finalResponse || !rootTaskId) {
+        throw new Error("Interactive discovery restart final outcome did not complete its owned Turn")
+      }
+      await expectGroundedTaskGraphFinalCopies(pool!, value, rootTaskId, finalResponse, "p3-process-restart-discovery-shortlist-ready")
+      const finalCandidateText = typeof finalResponse.response === "string" ? finalResponse.response : ""
+      if (!finalCandidateText) throw new Error("Interactive discovery restart final response was unavailable")
+
       if (interactiveDiscoveryTraceArtifactPath) {
         const graphRows = await pool!.query<TaskGraphItemRow>(
           `SELECT "id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "completedAt", "createdAt", "updatedAt"
            FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "type" = 'task_graph'`,
-          [value.sessionId, value.turnId, root.rows[0]!.id],
+          [value.sessionId, value.turnId, rootTaskId],
         )
         expect(graphRows.rows).toHaveLength(1)
         const graph = graphRows.rows[0]!
@@ -12649,19 +12657,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           }).slice(0, 3),
           failures: Array.isArray(shortlist?.failures) ? shortlist.failures.filter((failure): failure is string => typeof failure === "string").slice(0, 12) : [],
         }
-        const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue | null
-        const rootTaskId = root.rows[0]?.id
-        if (turn.rows[0]?.status !== "completed" || !finalResponse || !rootTaskId) {
-          throw new Error("Interactive discovery trace final outcome did not complete its owned Turn")
-        }
-        await expectGroundedTaskGraphFinalCopies(pool!, value, rootTaskId, finalResponse, "p3-process-restart-discovery-shortlist-ready")
-        const finalCandidateText = typeof finalResponse.response === "string" ? finalResponse.response : ""
-        if (!finalCandidateText) throw new Error("Interactive discovery trace final response was unavailable")
         await writeFile(interactiveDiscoveryTraceArtifactPath, JSON.stringify({
           schemaVersion: "agent-harness.v2.interactive-discovery-trace",
           sessionId: value.sessionId,
           turnId: value.turnId,
-          rootTaskId: root.rows[0]!.id,
+          rootTaskId,
           graphItemId: graph.id,
           graphRevision: graph.revision,
           graph: graph.content,

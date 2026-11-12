@@ -86,7 +86,7 @@ jobs:
           TEST_PATTERN='(?:runs the default canonical brain through BullMQ wait, verifier restart, and exact atomic final publication|restores interactive discovery across a real Worker restart and replays its child dispatch once|replans a canonical discovery Turn from durable child evidence and persists the owner-scoped shortlist|fails an interactive shortlist when its Scout prerequisite fails and cancels dependent work)$'
           pnpm --filter @jobcopilot/worker exec vitest run \
             --no-file-parallelism --maxWorkers=1 --minWorkers=1 \
-            --testNamePattern="$TEST_PATTERN" --reporter=json --outputFile="$RESULT_PATH" \
+            --testNamePattern="$TEST_PATTERN" --reporter=default --reporter=json --outputFile.json="$RESULT_PATH" \
             src/runtime/subagents/native-brain-pg.integration.test.ts \
             src/runtime/subagents/task-graph-resume-pg.integration.test.ts
 
@@ -113,3 +113,11 @@ jobs:
           }
           console.log("Verified all four named bound-final PG cases passed.")
           NODE
+      - name: Preserve structured PG test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-grounded-final-pg-report
+          path: ${{ runner.temp }}/agent-grounded-final-pg.json
+          if-no-files-found: warn
+          retention-days: 1
