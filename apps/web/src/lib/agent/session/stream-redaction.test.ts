@@ -41,21 +41,245 @@ describe("agent stream redaction", () => {
     expect(redactStreamString("Bearer very-secret-token sk-12345678")).toBe("Bearer [REDACTED] [REDACTED]")
   })
 
-  it("preserves a phone-shaped final item ID only when it matches the terminal stream identity", () => {
-    const phoneShapedItemId = "+353 86 123 4567"
-    const terminalIdentity = { ...identity, itemId: phoneShapedItemId }
-    const payload = { turnId, taskId: rootTaskId, finalItemId: phoneShapedItemId, usage: { inputTokens: 1 } }
-    const preserved = redactStreamEventPayload("turn.completed", payload, terminalIdentity) as Record<string, unknown>
-    expect(preserved.finalItemId).toBe(phoneShapedItemId)
+  it("preserves a redacted terminal identity only for a matching generated UUID composite", () => {
+    const phoneShapedTurnId = "12345678-9012-4def-8abc-123456789abc"
+    const generatedTaskId = `root-${phoneShapedTurnId}`
+    const stepId = `turn:${phoneShapedTurnId}:step:12:${phoneShapedTurnId}`
+    const generatedFinalItemId = `turn:${phoneShapedTurnId}:item:final:${stepId}`
+    expect(redactStreamString(phoneShapedTurnId)).not.toBe(phoneShapedTurnId)
+    expect(generatedFinalItemId.length).toBeGreaterThan(128)
+    expect(generatedFinalItemId.length).toBeLessThanOrEqual(256)
 
-    for (const mismatch of [
-      { finalItemId: "+353 86 999 9999" },
+    const terminalIdentity = { ...identity, turnId: phoneShapedTurnId, taskId: generatedTaskId, itemId: generatedFinalItemId }
+    const payload = {
+      turnId: phoneShapedTurnId, taskId: generatedTaskId, finalItemId: generatedFinalItemId,
+      note: "Call +353 86 123 4567 or alex@example.test. Bearer very-secret-token",
+      usage: { inputTokens: 1 },
+    }
+    const preserved = redactStreamEventPayload("turn.completed", payload, terminalIdentity) as Record<string, unknown>
+    expect(preserved).toMatchObject({ turnId: phoneShapedTurnId, taskId: generatedTaskId, finalItemId: generatedFinalItemId })
+    expect(preserved.note).toBe("Call [REDACTED_PHONE] or [REDACTED_EMAIL]. Bearer [REDACTED]")
+
+    const phoneShapedStepUuid = "87654321-0987-4def-8abc-987654321098"
+    expect(redactStreamString(phoneShapedStepUuid)).not.toBe(phoneShapedStepUuid)
+    const nestedStepId = `turn:${phoneShapedTurnId}:step:13:${phoneShapedStepUuid}`
+    const nestedFinalItemId = `turn:${phoneShapedTurnId}:item:final:${nestedStepId}`
+    const nested = redactStreamEventPayload("turn.completed", {
+      turnId: phoneShapedTurnId, taskId: generatedTaskId, finalItemId: nestedFinalItemId,
+    }, { ...identity, turnId: phoneShapedTurnId, taskId: generatedTaskId, itemId: nestedFinalItemId }) as Record<string, unknown>
+    expect(nested).toMatchObject({ turnId: phoneShapedTurnId, taskId: generatedTaskId, finalItemId: nestedFinalItemId })
+
+    const phoneShapedLegacyTurnId = "+353 86 123 4567"
+    const legacyTaskId = `root-${phoneShapedLegacyTurnId}`
+    const legacyFinalItemId = `turn:${phoneShapedLegacyTurnId}:item:final:turn:${phoneShapedLegacyTurnId}:step:12`
+    const rejectedLegacy = redactStreamEventPayload("turn.completed", {
+      turnId: phoneShapedLegacyTurnId, taskId: legacyTaskId, finalItemId: legacyFinalItemId,
+    }, { ...identity, turnId: phoneShapedLegacyTurnId, taskId: legacyTaskId, itemId: legacyFinalItemId }) as Record<string, unknown>
+    expect(rejectedLegacy).not.toHaveProperty("turnId")
+    expect(rejectedLegacy).not.toHaveProperty("taskId")
+    expect(rejectedLegacy).not.toHaveProperty("finalItemId")
+  })
+
+  it("preserves a phone-shaped generated step UUID for a historical CUID turn", () => {
+    const turnId = "c123456789012345678901234"
+    const taskId = `root-${turnId}`
+    const phoneShapedStepUuid = "12345678-9012-4def-8abc-123456789abc"
+    const stepId = `turn:${turnId}:step:7:${phoneShapedStepUuid}`
+    const finalItemId = `turn:${turnId}:item:final:${stepId}`
+    expect(redactStreamString(phoneShapedStepUuid)).not.toBe(phoneShapedStepUuid)
+
+    const projected = redactStreamEventPayload("turn.completed", {
+      turnId, taskId, finalItemId, note: "Call 415-555-0100; Bearer very-secret-token",
+    }, { ...identity, turnId, taskId, itemId: finalItemId }) as Record<string, unknown>
+    expect(projected).toMatchObject({ turnId, taskId, finalItemId })
+    expect(projected.note).toBe("Call [REDACTED_PHONE]; Bearer [REDACTED]")
+  })
+
+  it("preserves a phone-shaped step UUID for a safe historical turn ID", () => {
+    const turnId = "turn-legacy"
+    const taskId = `root-${turnId}`
+    const phoneShapedStepUuid = "87654321-0987-4def-8abc-987654321098"
+    const stepId = `turn:${turnId}:step:3:${phoneShapedStepUuid}`
+    const finalItemId = `turn:${turnId}:item:final:${stepId}`
+    expect(redactStreamString(turnId)).toBe(turnId)
+    expect(redactStreamString(phoneShapedStepUuid)).not.toBe(phoneShapedStepUuid)
+
+    const projected = redactStreamEventPayload("turn.completed", {
+      turnId, taskId, finalItemId, note: "Contact alex@example.test; Bearer legacy-secret-token",
+    }, { ...identity, turnId, taskId, itemId: finalItemId }) as Record<string, unknown>
+    expect(projected).toMatchObject({ turnId, taskId, finalItemId })
+    expect(projected.note).toBe("Contact [REDACTED_EMAIL]; Bearer [REDACTED]")
+
+    const spacedTurnId = `legacy ${phoneShapedStepUuid} id`
+    const spacedTaskId = `root-${spacedTurnId}`
+    const spacedStepId = `turn:${spacedTurnId}:step:4:${phoneShapedStepUuid}`
+    const spacedFinalItemId = `turn:${spacedTurnId}:item:final:${spacedStepId}`
+    expect(redactStreamString(spacedTurnId)).not.toBe(spacedTurnId)
+    const spaced = redactStreamEventPayload("turn.completed", {
+      turnId: spacedTurnId, taskId: spacedTaskId, finalItemId: spacedFinalItemId,
+    }, { ...identity, turnId: spacedTurnId, taskId: spacedTaskId, itemId: spacedFinalItemId }) as Record<string, unknown>
+    expect(spaced).toMatchObject({ turnId: spacedTurnId, taskId: spacedTaskId, finalItemId: spacedFinalItemId })
+
+    const slashTurnId = `legacy/${phoneShapedStepUuid}`
+    const slashTaskId = `root-${slashTurnId}`
+    const slashStepId = `turn:${slashTurnId}:step:5:${phoneShapedStepUuid}`
+    const slashFinalItemId = `turn:${slashTurnId}:item:final:${slashStepId}`
+    expect(redactStreamString(slashTurnId)).not.toBe(slashTurnId)
+    const slash = redactStreamEventPayload("turn.completed", {
+      turnId: slashTurnId, taskId: slashTaskId, finalItemId: slashFinalItemId,
+    }, { ...identity, turnId: slashTurnId, taskId: slashTaskId, itemId: slashFinalItemId }) as Record<string, unknown>
+    expect(slash).toMatchObject({ turnId: slashTurnId, taskId: slashTaskId, finalItemId: slashFinalItemId })
+  })
+
+  it("omits all identity fields for matched or mismatched sensitive IDs", () => {
+    const phoneShapedUuid = "12345678-9012-4def-8abc-123456789abc"
+    const sameLengthPlaceholder = "a".repeat(phoneShapedUuid.length)
+    expect(redactStreamString(`Bearer ${sameLengthPlaceholder}`)).toBe("Bearer [REDACTED]")
+    expect(redactStreamString(`sk-${sameLengthPlaceholder}`)).toBe("[REDACTED]")
+    expect(redactStreamString("id_353861234567")).toBe("id_353861234567")
+    expect(redactStreamString(`z${phoneShapedUuid}z`)).toBe(`z${phoneShapedUuid}z`)
+    const sensitiveComponents = [
+      `legacy Bearer ${phoneShapedUuid}`,
+      `legacy sk-${phoneShapedUuid}`,
+      `prefixBearer ${phoneShapedUuid}`,
+      `prefixsk-${phoneShapedUuid}`,
+      `prefixghp_${phoneShapedUuid}`,
+      `prefixxoxb-${phoneShapedUuid}`,
+      `legacy glpat-${phoneShapedUuid}`,
+      `legacy AIza${phoneShapedUuid}`,
+      `legacy ya29.${phoneShapedUuid}`,
+      `prefixglpat-${phoneShapedUuid}`,
+      `xAIza${phoneShapedUuid}`,
+      `prefixya29.${phoneShapedUuid}`,
+      `candidate+${phoneShapedUuid}@example.test`,
+      "id_353861234567",
+      `z${phoneShapedUuid}z`,
+    ]
+    const canonical = { turnId: "turn-legacy", taskId: "task-legacy", finalItemId: "final-legacy" }
+    const identityFor = (ids: typeof canonical) => ({ ...identity, turnId: ids.turnId, taskId: ids.taskId, itemId: ids.finalItemId })
+    const assertNoIdentity = (projected: Record<string, unknown>) => {
+      for (const key of ["turnId", "taskId", "finalItemId"]) expect(projected).not.toHaveProperty(key)
+      expect(projected.note).toBe("Call [REDACTED_PHONE]; Bearer [REDACTED]")
+    }
+
+    for (const field of ["turnId", "taskId", "finalItemId"] as const) {
+      for (const component of sensitiveComponents) {
+        const matchedIds = { ...canonical, [field]: component }
+        const matched = redactStreamEventPayload("turn.completed", {
+          ...matchedIds, note: "Call +353 86 123 4567; Bearer very-secret-token",
+        }, identityFor(matchedIds)) as Record<string, unknown>
+        assertNoIdentity(matched)
+        expect(JSON.stringify(matched)).not.toContain(component)
+
+        const mismatched = redactStreamEventPayload("turn.completed", {
+          ...matchedIds, note: "Call +353 86 123 4567; Bearer very-secret-token",
+        }, identityFor(canonical)) as Record<string, unknown>
+        assertNoIdentity(mismatched)
+        expect(JSON.stringify(mismatched)).not.toContain(component)
+      }
+    }
+
+    const shortSimilarValues = ["prefixBearer ok", "prefixsk-short", "prefixghp_note", "prefixxoxb-team"]
+    for (const field of ["turnId", "taskId", "finalItemId"] as const) {
+      for (const value of shortSimilarValues) {
+        const safeIds = { ...canonical, [field]: value }
+        const projected = redactStreamEventPayload("turn.completed", safeIds, identityFor(safeIds)) as Record<string, unknown>
+        expect(projected).toMatchObject(safeIds)
+      }
+    }
+  })
+
+  it("fails closed for each missing or wrongly typed terminal identity field", () => {
+    const turnId = "12345678-9012-4def-8abc-123456789abc"
+    const taskId = `root-${turnId}`
+    const stepId = `turn:${turnId}:step:4:${turnId}`
+    const finalItemId = `turn:${turnId}:item:final:${stepId}`
+    const canonical = { turnId, taskId, finalItemId }
+    const terminalIdentity = { ...identity, turnId, taskId, itemId: finalItemId }
+    const fields = ["turnId", "taskId", "finalItemId"] as const
+    const invalid: Array<Record<string, unknown>> = []
+    for (const field of fields) {
+      const missing: Record<string, unknown> = { ...canonical }
+      delete missing[field]
+      invalid.push(missing)
+      invalid.push({ ...canonical, [field]: field === "turnId" ? 7 : field === "taskId" ? null : { id: finalItemId } })
+    }
+
+    for (const payload of invalid) {
+      const projected = redactStreamEventPayload("turn.completed", payload, terminalIdentity) as Record<string, unknown>
+      expect(projected).not.toHaveProperty("turnId")
+      expect(projected).not.toHaveProperty("taskId")
+      expect(projected).not.toHaveProperty("finalItemId")
+    }
+  })
+
+  it("preserves unchanged legacy terminal IDs but never repairs a mismatched identity", () => {
+    const legacy = { turnId: "turn legacy id", taskId: "root legacy id", finalItemId: "final item legacy" }
+    const legacyIdentity = { ...identity, ...legacy, itemId: legacy.finalItemId }
+    const preserved = redactStreamEventPayload("turn.completed", legacy, legacyIdentity) as Record<string, unknown>
+    expect(preserved).toMatchObject(legacy)
+
+    const phoneShapedTurnId = "12345678-9012-4def-8abc-123456789abc"
+    const generatedTaskId = `root-${phoneShapedTurnId}`
+    const stepId = `turn:${phoneShapedTurnId}:step:12:${phoneShapedTurnId}`
+    const finalItemId = `turn:${phoneShapedTurnId}:item:final:${stepId}`
+    const terminalIdentity = { ...identity, turnId: phoneShapedTurnId, taskId: generatedTaskId, itemId: finalItemId }
+    const mismatches = [
       { turnId: "different-turn" },
       { taskId: "different-task" },
-    ]) {
-      const redacted = redactStreamEventPayload("turn.completed", { ...payload, ...mismatch }, terminalIdentity)
+      { finalItemId: `turn:${phoneShapedTurnId}:item:final:other-step` },
+    ]
+    for (const mismatch of mismatches) {
+      const redacted = redactStreamEventPayload("turn.completed", {
+        turnId: phoneShapedTurnId, taskId: generatedTaskId, finalItemId, ...mismatch,
+      }, terminalIdentity) as Record<string, unknown>
+      expect(redacted).not.toHaveProperty("turnId")
+      expect(redacted).not.toHaveProperty("taskId")
       expect(redacted).not.toHaveProperty("finalItemId")
     }
+  })
+
+  it("keeps malformed, overlong, or sensitive step identities redacted", () => {
+    const phoneShapedTurnId = "12345678-9012-4def-8abc-123456789abc"
+    const generatedTaskId = `root-${phoneShapedTurnId}`
+    const stepId = `turn:${phoneShapedTurnId}:step:12:${phoneShapedTurnId}`
+    const generatedFinalItemId = `turn:${phoneShapedTurnId}:item:final:${stepId}`
+    const longStepId = `turn:${phoneShapedTurnId}:step:${"x".repeat(500)}`
+    const longFinalItemId = `turn:${phoneShapedTurnId}:item:final:${longStepId}`
+    const cases = [
+      { turnId: 123, taskId: generatedTaskId, finalItemId: generatedFinalItemId },
+      { turnId: " ", taskId: generatedTaskId, finalItemId: generatedFinalItemId },
+      { turnId: "x".repeat(257), taskId: generatedTaskId, finalItemId: generatedFinalItemId },
+      { turnId: phoneShapedTurnId, taskId: ` ${generatedTaskId}`, finalItemId: generatedFinalItemId },
+      { turnId: phoneShapedTurnId, taskId: "x".repeat(257), finalItemId: generatedFinalItemId },
+      { turnId: phoneShapedTurnId, taskId: generatedTaskId, finalItemId: ` ${generatedFinalItemId}` },
+      { turnId: phoneShapedTurnId, taskId: generatedTaskId, finalItemId: "x".repeat(257) },
+    ]
+    for (const payload of cases) {
+      const event = { ...payload, note: "Call 415-555-0100; Bearer very-secret-token" }
+      const projected = redactStreamEventPayload("turn.completed", event, {
+        ...identity, turnId: typeof payload.turnId === "string" ? payload.turnId : phoneShapedTurnId,
+        taskId: payload.taskId,
+        itemId: typeof payload.finalItemId === "string" ? payload.finalItemId : null,
+      }) as Record<string, unknown>
+      expect(projected).not.toHaveProperty("turnId")
+      expect(projected).not.toHaveProperty("taskId")
+      expect(projected).not.toHaveProperty("finalItemId")
+      expect(projected.note).toBe("Call [REDACTED_PHONE]; Bearer [REDACTED]")
+      expect(JSON.stringify(projected)).not.toContain("very-secret-token")
+    }
+
+    const sensitiveStep = `turn:${phoneShapedTurnId}:step:12:Bearer very-secret-token`
+    const sensitiveFinalItemId = `turn:${phoneShapedTurnId}:item:final:${sensitiveStep}`
+    const sensitive = redactStreamEventPayload("turn.completed", {
+      turnId: phoneShapedTurnId, taskId: generatedTaskId, finalItemId: sensitiveFinalItemId,
+      note: "Call 415-555-0100; Bearer very-secret-token",
+    }, { ...identity, turnId: phoneShapedTurnId, taskId: generatedTaskId, itemId: sensitiveFinalItemId }) as Record<string, unknown>
+    expect(sensitive).not.toHaveProperty("turnId")
+    expect(sensitive).not.toHaveProperty("taskId")
+    expect(sensitive).not.toHaveProperty("finalItemId")
+    expect(sensitive.note).toBe("Call [REDACTED_PHONE]; Bearer [REDACTED]")
+    expect(JSON.stringify(sensitive)).not.toContain("very-secret-token")
   })
 
   it("projects completed final event content to the same safe DTO as timeline replay", () => {
