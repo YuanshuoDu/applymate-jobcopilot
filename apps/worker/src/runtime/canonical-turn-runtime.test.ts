@@ -97,6 +97,7 @@ import type { SteeringReconciliationOperation } from "./subagents/steering-recon
 import { buildTaskGraphPlanningFacts } from "./subagents/task-graph-planning-facts.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
+import { buildGroundedTaskGraphFinalResponse } from "./subagents/task-graph-final-response.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT, type TurnExecutionStore } from "./turns/turn-execution-types.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA } from "./turns/task-graph-terminal-assessment.js"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
@@ -2074,10 +2075,12 @@ describe("createCanonicalTurnRuntime", () => {
     const terminal = persistFinal.mock.calls[0]![0].terminal!
     const terminalContent = terminal.finalContent as { text: string; final: { response: string; summary: string } }
     expect(terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toEqual(finalSummaryBinding)
-    expect(terminalContent).toMatchObject({ text: "I found sourced roles.", final: {
-      response: "I found sourced roles.", summary: formatTaskGraphFinalSummary(finalSummaryBinding.summary),
+    const groundedResponse = buildGroundedTaskGraphFinalResponse(finalSummaryBinding)
+    expect(terminalContent).toMatchObject({ text: groundedResponse, final: {
+      response: groundedResponse, summary: formatTaskGraphFinalSummary(finalSummaryBinding.summary),
     } })
     expect(terminalContent.final.response).toBe(terminalContent.text)
+    expect(terminalContent.text).not.toContain("I found sourced roles.")
     expect(JSON.stringify(terminalContent)).not.toContain("TASK_GRAPH_FINAL_SUMMARY_BINDING")
   })
 
