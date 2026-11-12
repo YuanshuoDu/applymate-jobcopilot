@@ -77,11 +77,61 @@ describe('AgentComposerTaskRecoveryController', () => {
     expect((await controller.load()).kind).toBe('ready')
     const open = vi.fn()
 
-    await expect(controller.openAccepted(attemptKey, open)).resolves.toBe(true)
+    await expect(controller.openAccepted(attemptKey, open)).resolves.toBe('opened')
 
     expect(open).toHaveBeenCalledWith('session-1', 'turn-1')
     expect(storage.store.removeResolved).toHaveBeenCalledWith(scopeA, attemptKey)
     expect(calls.some(call => call.path.includes('/sessions') || call.path.includes('/start-objective'))).toBe(false)
+  })
+
+  it('consumes an accepted marker before an open callback can reload the controller', async () => {
+    const calls: Array<{ path: string; init?: RequestInit }> = []
+    const storage = fakeStore(row(scopeA, 'accepted'))
+    const remove = storage.store.removeResolved
+    const order: string[] = []
+    storage.store.removeResolved = vi.fn(async () => { order.push('remove'); return remove() })
+    const controller = new AgentComposerTaskRecoveryController({ fetcher: fakeFetcher('accepted', calls), store: storage.store })
+    await controller.load()
+    const open = vi.fn(async () => { order.push('open'); await controller.load() })
+
+    await expect(controller.openAccepted(attemptKey, open)).resolves.toBe('opened')
+
+    expect(order).toEqual(['remove', 'open'])
+    expect(storage.store.removeResolved).toHaveBeenCalledWith(scopeA, attemptKey)
+    await expect(controller.load()).resolves.toMatchObject({ kind: 'ready', attempts: [] })
+  })
+
+  it('keeps a consumed marker cleared when the local open callback fails', async () => {
+    const calls: Array<{ path: string; init?: RequestInit }> = []
+    const storage = fakeStore(row(scopeA, 'accepted'))
+    const controller = new AgentComposerTaskRecoveryController({ fetcher: fakeFetcher('accepted', calls), store: storage.store })
+    await controller.load()
+
+    await expect(controller.openAccepted(attemptKey, () => { throw new Error('Navigation failed') })).resolves.toBe('consumed')
+
+    expect(storage.store.removeResolved).toHaveBeenCalledWith(scopeA, attemptKey)
+    await expect(controller.load()).resolves.toMatchObject({ kind: 'ready', attempts: [] })
+    expect(calls.some(call => call.path.includes('/sessions') || call.path.includes('/start-objective'))).toBe(false)
+  })
+
+  it('rejects a duplicate accepted open while the first callback is pending', async () => {
+    const calls: Array<{ path: string; init?: RequestInit }> = []
+    const storage = fakeStore(row(scopeA, 'accepted'))
+    const controller = new AgentComposerTaskRecoveryController({ fetcher: fakeFetcher('accepted', calls), store: storage.store })
+    await controller.load()
+    let beginOpen!: () => void
+    let finishOpen!: () => void
+    const openStarted = new Promise<void>(resolve => { beginOpen = resolve })
+    const waitForOpen = new Promise<void>(resolve => { finishOpen = resolve })
+    const open = vi.fn(async () => { beginOpen(); await waitForOpen })
+    const first = controller.openAccepted(attemptKey, open)
+    await openStarted
+
+    await expect(controller.openAccepted(attemptKey, vi.fn())).resolves.toBe(false)
+    finishOpen()
+    await expect(first).resolves.toBe('opened')
+    expect(open).toHaveBeenCalledTimes(1)
+    expect(storage.store.removeResolved).toHaveBeenCalledTimes(1)
   })
 
   it('locks accepted receipt evidence from prepared and session-known local attempts', async () => {
@@ -92,7 +142,7 @@ describe('AgentComposerTaskRecoveryController', () => {
       const snapshot = await controller.load()
 
       expect(snapshot).toMatchObject({ kind: 'ready', attempts: [{ attemptKey, state: { kind: 'accepted' } }] })
-      await expect(controller.openAccepted(attemptKey, vi.fn())).resolves.toBe(true)
+      await expect(controller.openAccepted(attemptKey, vi.fn())).resolves.toBe('opened')
       expect(storage.store.advance).toHaveBeenCalledWith(scopeA, attemptKey, 'accepted')
       expect(storage.store.removeResolved).toHaveBeenCalledWith(scopeA, attemptKey)
     }

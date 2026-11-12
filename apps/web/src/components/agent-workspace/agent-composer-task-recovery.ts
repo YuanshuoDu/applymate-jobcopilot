@@ -92,8 +92,8 @@ export class AgentComposerTaskRecoveryController {
     finally { this.busy.delete(attemptKey) }
   }
 
-  /** Opens only a freshly reconciled accepted receipt; successful open consumes that local marker. */
-  async openAccepted(attemptKey: string, open: (sessionId: string, turnId: string) => void | Promise<void>): Promise<boolean> {
+  /** Consumes a freshly confirmed accepted marker before navigation can change controller identity. */
+  async openAccepted(attemptKey: string, open: (sessionId: string, turnId: string) => void | Promise<void>): Promise<'opened' | 'consumed' | false> {
     const scope = this.accountScope, generation = this.generation
     if (!scope) return false
     try {
@@ -104,17 +104,13 @@ export class AgentComposerTaskRecoveryController {
       if (state.kind !== 'accepted') return false
       await this.verifyCurrentScope(scope, generation)
       this.assertIdentity(scope, generation)
-      await open(state.sessionId, state.turnId)
-      await this.verifyCurrentScope(scope, generation)
+      if (!this.entries.has(attemptKey)) return false
+      if (!(await this.store.removeResolved(scope, attemptKey))) return false
       this.assertIdentity(scope, generation)
-      const row = this.entries.get(attemptKey)
-      if (row) {
-        this.assertIdentity(scope, generation)
-        await this.store.removeResolved(scope, attemptKey)
-        this.assertIdentity(scope, generation)
-      }
       this.entries.delete(attemptKey)
-      return true
+      // The accepted receipt remains on the server if this local navigation callback fails.
+      try { await open(state.sessionId, state.turnId); return 'opened' }
+      catch { return 'consumed' }
     } catch { return false }
   }
 

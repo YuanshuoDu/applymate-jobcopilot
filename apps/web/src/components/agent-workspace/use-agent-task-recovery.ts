@@ -78,6 +78,7 @@ export function useAgentTaskRecovery(options: Options) {
   const [snapshot, setSnapshot] = useState<RecoverySnapshotState>({ kind: 'loading' })
   const snapshotRef = useRef(snapshot)
   snapshotRef.current = snapshot
+  const mountedRef = useRef(true)
   const openAcceptedRef = useRef(options.onOpenAccepted)
   openAcceptedRef.current = options.onOpenAccepted
 
@@ -101,7 +102,10 @@ export function useAgentTaskRecovery(options: Options) {
       document.removeEventListener('visibilitychange', onVisible)
     }
   }, [refresh])
-  useEffect(() => () => { gate.dispose(); controller.dispose() }, [controller, gate])
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false; gate.dispose(); controller.dispose() }
+  }, [controller, gate])
 
   const setNotice = useCallback((attemptKey: string, state: AgentComposerTaskRecoveryNoticeState) => {
     setSnapshot(previous => previous.kind === 'ready'
@@ -155,10 +159,13 @@ export function useAgentTaskRecovery(options: Options) {
             if (!gate.isStartCurrent(token) || id !== sessionId || turn !== turnId) throw new Error('Stale task recovery action')
             await openAcceptedRef.current(id, turn)
           })
+    if (action === 'open') {
+      if (result !== false && mountedRef.current && gate.isSelectionCurrent(token.selectedSessionId)) void refresh()
+      return
+    }
     if (!gate.isStartCurrent(token)) return
-    if (action === 'remove' || action === 'open') {
-      if (result) void refresh()
-    } else setNotice(key, result as AgentComposerTaskRecoveryNoticeState)
+    if (action === 'remove') { if (result) void refresh() }
+    else setNotice(key, result as AgentComposerTaskRecoveryNoticeState)
   }, [controller, gate, refresh, setNotice])
 
   const notices = snapshot.kind === 'ready'
