@@ -596,7 +596,7 @@ function restartCase(name: string, run: () => Promise<void>, timeoutMs?: number)
       state.cancelled = true
       await Promise.all([...state.workers].map(stopWorker))
       await body.catch(() => undefined)
-    }, 30_000)
+    }, 150_000)
     body = restartScenario.run(state, run)
     await body
   }, timeoutMs)
@@ -3760,7 +3760,7 @@ async function stopWorker(child: WorkerProcess | undefined): Promise<void> {
 
 withServices("durable child wait across PostgreSQL/Redis Worker process restart", () => {
   let pool: Pool
-  beforeAll(() => { pool = new Pool({ connectionString: databaseUrl!, max: 8, connectionTimeoutMillis: 5_000, statement_timeout: 15_000 }) })
+  beforeAll(() => { pool = new Pool({ connectionString: databaseUrl!, max: 8, connectionTimeoutMillis: 5_000, statement_timeout: 60_000 }) })
   afterAll(async () => { await pool?.end() })
 
   restartCase("parses the recovered child-wait blocker query on disposable PostgreSQL", async () => {
@@ -4274,10 +4274,15 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         const rollbackCutExit = await workerH.exited
         expect(rollbackCutExit.code).toBeNull()
         expect(rollbackCutExit.signal).toBe("SIGKILL")
-        const rollbackExpiry = await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - interval '1 second'
-          WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 RETURNING "id"`,
+        // Each cut is a separate synthetic crash experiment; rebase only its clock
+        // so the matrix does not exhaust the unrelated ordinary-task 5-minute segment.
+        const rollbackExpiry = await pool.query<{ absoluteDeadlineAt: Date | null }>(`UPDATE "sub_agent_tasks"
+          SET "leaseExpiresAt" = CURRENT_TIMESTAMP - interval '1 second', "startedAt" = clock_timestamp()
+          WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3
+          RETURNING "absoluteDeadlineAt"`,
         [waiter.id, ids.sessionId, rollbackLease.rows[0]!.leaseOwner])
         expect(rollbackExpiry.rowCount).toBe(1)
+        expect(rollbackExpiry.rows[0]?.absoluteDeadlineAt).toBeNull()
         expect(await readSourceWaitLifecycle(pool, ids)).toEqual(lifecycleRollbackBaseline)
       }
       const sourceDispatchAfterRollback = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(

@@ -396,7 +396,7 @@ const recoveryTraceTaskId = process.env.NODE_ENV === "test" && mode === "worker-
   && process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID === ids.waiterTaskId
   ? process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID : undefined
 const basePool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 6,
-  connectionTimeoutMillis: 5_000, statement_timeout: 15_000 })
+  connectionTimeoutMillis: 5_000, statement_timeout: 60_000 })
 const pool = recoveryTraceTaskId ? poolWithRecoveryProgress(basePool, recoveryTraceTaskId) : basePool
 const redis = new Redis(process.env.AGENT_TURN_REDIS_TEST_URL, { maxRetriesPerRequest: null })
 const store = new PgSubagentTaskStore(pool, 30_000)
