@@ -395,8 +395,9 @@ function poolWithRecoveryProgress(basePool, targetTaskId) {
 const recoveryTraceTaskId = process.env.NODE_ENV === "test" && mode === "worker-b-crash-resume"
   && process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID === ids.waiterTaskId
   ? process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID : undefined
-const basePool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 6,
-  connectionTimeoutMillis: 5_000, statement_timeout: 60_000 })
+// Crash barriers intentionally hold session locks; the parent watchdog owns this
+// process lifetime. Query deadlines here would fabricate heartbeat lease loss.
+const basePool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 6 })
 const pool = recoveryTraceTaskId ? poolWithRecoveryProgress(basePool, recoveryTraceTaskId) : basePool
 const redis = new Redis(process.env.AGENT_TURN_REDIS_TEST_URL, { maxRetriesPerRequest: null })
 const store = new PgSubagentTaskStore(pool, 30_000)
