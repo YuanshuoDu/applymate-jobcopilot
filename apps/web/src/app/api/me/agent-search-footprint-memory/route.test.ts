@@ -58,14 +58,21 @@ describe('/api/me/agent-search-footprint-memory', () => {
     expect(mocks.set).not.toHaveBeenCalled()
   })
 
-  it('returns stale, exhausted, missing-user, and unauthorized outcomes without leaking cacheable data', async () => {
+  it('returns stale, terminal revocation, exhausted re-enable, missing-user, and unauthorized outcomes', async () => {
     const { GET, POST } = await import('./route')
     mocks.set.mockResolvedValueOnce({ kind: 'stale', consent: { enabled: true, version: 4 } })
     const stale = await POST(request({ enabled: false, expectedVersion: 3 }) as never)
     expect(stale.status).toBe(409)
     await expect(stale.json()).resolves.toEqual({ error: 'VERSION_CONFLICT', enabled: true, version: 4 })
-    mocks.set.mockResolvedValueOnce({ kind: 'version_exhausted', consent: { enabled: true, version: 2_147_483_647 } })
-    expect((await POST(request({ enabled: false, expectedVersion: 2_147_483_647 }) as never)).status).toBe(409)
+    const maxVersion = 2_147_483_647
+    mocks.set.mockResolvedValueOnce({ kind: 'updated', consent: { enabled: false, version: maxVersion } })
+    const terminalRevocation = await POST(request({ enabled: false, expectedVersion: maxVersion }) as never)
+    expect(terminalRevocation.status).toBe(200)
+    await expect(terminalRevocation.json()).resolves.toEqual({ enabled: false, version: maxVersion })
+    mocks.set.mockResolvedValueOnce({ kind: 'version_exhausted', consent: { enabled: false, version: maxVersion } })
+    const reenable = await POST(request({ enabled: true, expectedVersion: maxVersion }) as never)
+    expect(reenable.status).toBe(409)
+    await expect(reenable.json()).resolves.toEqual({ error: 'VERSION_EXHAUSTED', enabled: false, version: maxVersion })
     mocks.get.mockResolvedValueOnce(null)
     expect((await GET(request() as never)).status).toBe(404)
     mocks.requireAuth.mockResolvedValueOnce(Response.json({ error: 'Unauthorized' }, { status: 401 }))

@@ -1,6 +1,8 @@
 import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 
+const MAX_CONSENT_VERSION = 2_147_483_647
+
 export type AgentSearchFootprintMemoryConsent = { enabled: boolean; version: number }
 export type AgentSearchFootprintMemoryConsentMutation = { enabled: boolean; expectedVersion: number }
 export type AgentSearchFootprintMemoryConsentMutationResult =
@@ -50,13 +52,14 @@ export async function setAgentSearchFootprintMemoryConsent(
     const consent = toConsent(row)
     if (consent.version !== input.expectedVersion) return { kind: 'stale', consent }
     if (consent.enabled === input.enabled) return { kind: 'unchanged', consent }
-    if (consent.version === 2_147_483_647) return { kind: 'version_exhausted', consent }
+    const terminalRevocation = consent.version === MAX_CONSENT_VERSION
+    if (terminalRevocation && input.enabled) return { kind: 'version_exhausted', consent }
 
     const update = await tx.user.updateMany({
       where: { id: userId, agentSearchFootprintMemoryConsentVersion: input.expectedVersion },
       data: {
         agentSearchFootprintMemoryEnabled: input.enabled,
-        agentSearchFootprintMemoryConsentVersion: { increment: 1 },
+        ...(terminalRevocation ? {} : { agentSearchFootprintMemoryConsentVersion: { increment: 1 } }),
       },
     })
     if (update.count !== 1) {
@@ -66,6 +69,6 @@ export async function setAgentSearchFootprintMemoryConsent(
       })
       return latest ? { kind: 'stale', consent: toConsent(latest) } : { kind: 'not_found' }
     }
-    return { kind: 'updated', consent: { enabled: input.enabled, version: consent.version + 1 } }
+    return { kind: 'updated', consent: { enabled: input.enabled, version: terminalRevocation ? consent.version : consent.version + 1 } }
   }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted })
 }
