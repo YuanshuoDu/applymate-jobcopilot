@@ -24,22 +24,22 @@ import { repairConsumedChildWaitSources } from "./child-resume-consumed-wait-rep
 import { createProductionChildResumeLoaders } from "./production-child-resume-loaders.js"
 import { actionList, asObject, INSERT_TASK, json } from "./pg-store-persistence.js"
 import type { SubagentLease } from "./types.js"
-import { CHILD_WAIT_CLAIM_RECOVERY_SQL, CHILD_WAIT_CONSUMED_SQL, CHILD_WAIT_RESUMABLE_SQL as CHILD_WAIT_EXPIRY_RESUMABLE_SQL, hasBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
+import { CHILD_WAIT_CLAIM_RECOVERY_SQL, CHILD_WAIT_CONSUMED_SQL, CHILD_WAIT_RESUMABLE_SQL as CHILD_WAIT_EXPIRY_RESUMABLE_SQL, hasBlockingExternalCall as queryBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
 import { CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL, CHILD_WAIT_CALL_LIFECYCLE_SQL,
   CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL, CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL,
   childWaitContinuationKeyMatchesSafeProjection } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL,
   HISTORICAL_SOURCE_STEP_BINDING_SQL, HISTORICAL_SOURCE_STEP_PREFIX_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
-import { readChildWaitSourceCallProjection } from "./pg-store-expiry-child-wait-source-proof.js"
+import { readChildWaitSourceCallProjection as queryChildWaitSourceCallProjection } from "./pg-store-expiry-child-wait-source-proof.js"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
 import type { TerminalCallProjection } from "./pg-store-expiry-historical-wait-binding.js"
 import { historicalWaitClaimProofBundle, historicalWaitClaimProjectionEnvelope,
   historicalWaitClaimProofsSql, historicalWaitProjectionsSql } from "./pg-store-expiry-historical-wait-claim-collision.js"
 import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey, parseCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
-import { diagnoseChildWaitTerminalCallProjections, readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
+import { diagnoseChildWaitTerminalCallProjections as queryChildWaitTerminalCallProjectionsDiagnostic, readChildWaitTerminalCallProjections as queryChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
 import { historicalSourceStepCallChainBinding, historicalSourceStepCallCountBinding, historicalSourceStepEventChainBinding,
-  readCanonicalHistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
-import { readCanonicalHistoricalSourceStepContinuationPrefix } from "./pg-store-expiry-historical-source-step-continuation-prefix.js"
+  readCanonicalHistoricalSourceStepPrefix as queryCanonicalHistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
+import { readCanonicalHistoricalSourceStepContinuationPrefix as queryCanonicalHistoricalSourceStepContinuationPrefix } from "./pg-store-expiry-historical-source-step-continuation-prefix.js"
 import { historicalSourceStepCallChainDiagnosticSql } from "./pg-store-expiry-historical-source-step-call-binding-diagnostics.js"
 import { CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL } from "./pg-store-expiry-step-completion-proof.js"
 import { MAX_STEP_CHAIN_EVENTS, MAX_STEP_TOOL_CALLS, readCanonicalWaitStepToolChain } from "./pg-store-expiry-step-tool-chain-proof.js"
@@ -570,6 +570,22 @@ function assertRestartActive(): void {
   if (restartScenario.getStore()?.cancelled) throw new Error("Child-wait fixture scenario cancelled")
 }
 
+function restartRead<Args extends unknown[], Result>(read: (...args: Args) => Promise<Result>) {
+  return async (...args: Args): Promise<Result> => {
+    assertRestartActive()
+    const value = await read(...args)
+    assertRestartActive()
+    return value
+  }
+}
+
+const hasBlockingExternalCall = restartRead(queryBlockingExternalCall)
+const readChildWaitSourceCallProjection = restartRead(queryChildWaitSourceCallProjection)
+const diagnoseChildWaitTerminalCallProjections = restartRead(queryChildWaitTerminalCallProjectionsDiagnostic)
+const readChildWaitTerminalCallProjections = restartRead(queryChildWaitTerminalCallProjections)
+const readCanonicalHistoricalSourceStepPrefix = restartRead(queryCanonicalHistoricalSourceStepPrefix)
+const readCanonicalHistoricalSourceStepContinuationPrefix = restartRead(queryCanonicalHistoricalSourceStepContinuationPrefix)
+
 function restartCase(name: string, run: () => Promise<void>, timeoutMs?: number): void {
   it(name, async ({ onTestFailed }) => {
     const state = { cancelled: false, workers: new Set<WorkerProcess>() }
@@ -714,6 +730,7 @@ function workerFailureReasonCategory(child: WorkerProcess, marker: "WORKER_A_WAI
 }
 
 async function workerFailureDiagnostic(pool: Pool, child: WorkerProcess, ids: FixtureIds): Promise<string> {
+  assertRestartActive()
   const status = workerResultStatus(child, "WORKER_A_WAITING")
   const diagnostic: Record<string, unknown> = { sample: "post_commit_read_committed_task_scope", status,
     markerFailureReasonCategory: status === "failed" ? workerFailureReasonCategory(child, "WORKER_A_WAITING") : null,
@@ -739,6 +756,7 @@ async function workerFailureDiagnostic(pool: Pool, child: WorkerProcess, ids: Fi
       : WORKER_FAILURE_REASON_CATEGORIES.includes(row.failureReason as WorkerFailureReasonCategory)
         ? row.failureReason : "other"
   } catch {
+    assertRestartActive()
     diagnostic.taskQuery = "unavailable"
   } finally {
     if (client) {
@@ -796,6 +814,7 @@ function boundedRecoveryTrace(child: WorkerProcess, stdoutOnly = false): Record<
 async function diagnoseWorkerFBlocker(
   pool: Pool, ids: FixtureIds, continuationStepId: string, sourceCallId: string, claimCallId: string,
 ): Promise<Record<string, unknown>> {
+  assertRestartActive()
   let client: PoolClient | undefined
   let transactionStarted = false
   try {
@@ -825,6 +844,7 @@ async function diagnoseWorkerFBlocker(
       taskStatus: diagnosticTaskStatus(row.status), attemptCount: row.attemptCount,
       leaseOwnerPresent: true, leaseExpired: row.leaseExpiresAt.getTime() <= Date.now(), claimProof, blocker, ...startDiagnostics }
   } catch {
+    assertRestartActive()
     return { snapshot: "post_recovery_attempt_read_committed", predicateProbe: "unavailable" }
   } finally {
     if (client) {
@@ -838,6 +858,7 @@ async function diagnoseWorkerFStartCandidates(
   client: PoolClient, task: BlockingTaskSnapshot, continuationStepId: string,
   sourceCallId: string, claimCallId: string, blocker: boolean,
 ): Promise<Record<string, unknown>> {
+  assertRestartActive()
   const sourceProjection = await readChildWaitSourceCallProjection(client, task as unknown as Record<string, unknown>, continuationStepId)
   const terminalCallProjections = await readChildWaitTerminalCallProjections(client, task as unknown as Record<string, unknown>)
   const sourceProjections = terminalCallProjections.filter(projection => projection.sourceWait.claimKeyDigest === null)
@@ -850,6 +871,7 @@ async function diagnoseWorkerFStartCandidates(
   )
   const classified = []
   for (const [index, start] of starts.rows.slice(0, 16).entries()) {
+    assertRestartActive()
     const blockedWhenOmitted = await hasBlockingExternalCall(client,
       task as unknown as Record<string, unknown>, start.id, continuationStepId)
     const lane = start.correlationId === sourceCallId ? "source_wait"
@@ -880,6 +902,7 @@ async function diagnoseWorkerFStartCandidates(
 
 async function diagnoseHistoricalSourceFinalBinding(client: PoolClient, task: BlockingTaskSnapshot,
   continuationStepId: string, sourceCallId: string): Promise<Record<string, unknown>> {
+  assertRestartActive()
   const sourceProjection = await readChildWaitSourceCallProjection(client, task as unknown as Record<string, unknown>, continuationStepId)
   const projections = await readChildWaitTerminalCallProjections(client, task as unknown as Record<string, unknown>)
   const sourceProjections = projections.filter(projection => projection.sourceWait.claimKeyDigest === null
@@ -982,10 +1005,12 @@ async function diagnoseHistoricalSourceFinalBinding(client: PoolClient, task: Bl
 
 async function expectHistoricalWaitUnblocked(client: PoolClient, task: BlockingTaskSnapshot,
   continuationStepId: string, sourceCallId: string, claimCallId: string, message: string): Promise<void> {
+  assertRestartActive()
   try {
     await expect(hasBlockingExternalCall(client, task as unknown as Record<string, unknown>, undefined, continuationStepId), message)
       .resolves.toBe(false)
   } catch (error: unknown) {
+    assertRestartActive()
     const diagnostic = await withHistoricalWaitDiagnosticSavepoint(client, async () => {
       const starts = await diagnoseWorkerFStartCandidates(client, task, continuationStepId, sourceCallId, claimCallId, true)
       const sourceReader = await diagnoseHistoricalWaitSourceProjection(client, task, sourceCallId)
@@ -1005,6 +1030,7 @@ async function expectHistoricalWaitUnblocked(client: PoolClient, task: BlockingT
 
 async function diagnoseHistoricalWaitSourceProjection(client: PoolClient, task: BlockingTaskSnapshot,
   sourceCallId: string): Promise<Record<string, unknown>> {
+  assertRestartActive()
   const claimStageDiagnostics = await diagnoseChildWaitTerminalCallProjections(client, task as unknown as Record<string, unknown>)
   const projections = await readChildWaitTerminalCallProjections(client, task as unknown as Record<string, unknown>)
   let sourceProjectionCount = 0
@@ -1051,6 +1077,7 @@ async function diagnoseHistoricalWaitSourceProjection(client: PoolClient, task: 
       rootTaskId: task.rootTaskId, userId: task.userId, ownerId: task.leaseOwner, attemptCount: task.attemptCount,
       leaseExpiresAt: task.leaseExpiresAt } as never, wait, stepId, asObject(wait.result).outcome as never)
   } catch (error: unknown) {
+    assertRestartActive()
     lifecycleRejectStage = error && typeof error === "object" && "sourceLifecycleStage" in error
       ? String(error.sourceLifecycleStage) : "unknown"
   }
@@ -1104,7 +1131,9 @@ async function diagnoseHistoricalWaitSourceProjection(client: PoolClient, task: 
         [task.sessionId, task.turnId, task.id, from.toString(), through.toString()])
         prefixWindowEventCount = Number(eventWindow.rows[0]?.count ?? 0)
       }
-    } catch { prefixWindowBoundaryAvailable = false }
+    } catch {
+      assertRestartActive()
+      prefixWindowBoundaryAvailable = false }
   }
   const sourceStart = await client.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_events"
     WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "itemId" = $4 AND "type" = 'tool_call.started'
@@ -1121,7 +1150,9 @@ async function diagnoseHistoricalWaitSourceProjection(client: PoolClient, task: 
             resultItemId: lifecycle.resultItemId, waitKind: "normal_waiting" as const }
       prefixAvailable = Boolean(await readCanonicalHistoricalSourceStepPrefix(client,
         { id: task.id, sessionId: task.sessionId, turnId: task.turnId }, prefixInput))
-    } catch { prefixAvailable = false }
+    } catch {
+      assertRestartActive()
+      prefixAvailable = false }
   }
   let rejectStage = "none"
   const sourceStartCount = Number(sourceStart.rows[0]?.count ?? 0)
@@ -1173,6 +1204,7 @@ async function diagnoseHistoricalWaitSourceProjection(client: PoolClient, task: 
 async function diagnoseWorkerFClaimProof(
   client: PoolClient, task: BlockingTaskSnapshot, continuationStepId: string, sourceCallId: string, claimCallId: string,
 ): Promise<Record<string, unknown>> {
+  assertRestartActive()
   const projectedSourceContent = projectWaitCallEventContent({ toolName: "wait_subagents", toolCallId: sourceCallId })
   const projectedSourceCallId = projectedSourceContent && typeof projectedSourceContent === "object" && !Array.isArray(projectedSourceContent)
     ? (projectedSourceContent as Record<string, unknown>).toolCallId : null
@@ -1332,6 +1364,7 @@ async function diagnoseWorkerFClaimProof(
 
 async function diagnoseHistoricalClaimFinal(client: PoolClient, task: BlockingTaskSnapshot,
   continuationStepId: string, sourceCallId: string, claimCallId: string): Promise<Record<string, unknown>> {
+  assertRestartActive()
   const projections = await readChildWaitTerminalCallProjections(client, task as unknown as Record<string, unknown>)
   const claims = projections.filter(projection => projection.sourceWait.claimKeyDigest !== null
     && projection.rawCallId === claimCallId && projection.sourceWait.sourceCallId === sourceCallId
@@ -1392,6 +1425,7 @@ async function diagnoseAcceptedClaimTerminalSettlement(client: PoolClient, task:
   claim: Awaited<ReturnType<typeof readChildWaitTerminalCallProjections>>[number]): Promise<{
     settlement: boolean | null; candidateCount: number; matchedCount: number; truncated: boolean
   }> {
+  assertRestartActive()
   const candidates = await client.query<{ id: string }>(`SELECT terminal."id" FROM "agent_events" AS started
     JOIN LATERAL (SELECT settled."id", settled."sequence" FROM "agent_events" AS settled
       WHERE settled."sessionId" = started."sessionId" AND settled."turnId" = started."turnId"
@@ -1404,6 +1438,7 @@ async function diagnoseAcceptedClaimTerminalSettlement(client: PoolClient, task:
   [claim.startEventId, task.sessionId, task.turnId, task.id, claim.callItemId, claim.rawCallId])
   let matchedCount = 0
   for (const terminal of candidates.rows) {
+    assertRestartActive()
     const proof = await client.query<{ settled: boolean }>(WORKER_F_SAME_CALL_ID_TERMINAL_PROOF_SQL, [
       task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
       task.leaseExpiresAt, task.userId, claim.rawCallId, claim.projectedCallId, claim.callItemId,
@@ -1527,6 +1562,7 @@ function diagnosticJson(value: unknown): string {
 }
 
 async function boundedExternalCallBlockerDiagnostic(pool: Pool, ids: FixtureIds): Promise<Record<string, unknown>> {
+  assertRestartActive()
   const counts: BlockerCounts = {
     currentSourceWait: { starts: 0, projectedCompletions: 0, uniquelyBlocking: 0 },
     historicalWaitSource: { starts: 0, projectedCompletions: 0, uniquelyBlocking: 0 },
@@ -1588,6 +1624,7 @@ async function boundedExternalCallBlockerDiagnostic(pool: Pool, ids: FixtureIds)
     }
     const baseBlocked = await hasBlockingExternalCall(client, task, undefined, continuationId)
     for (const row of boundedStarts) {
+      assertRestartActive()
       const category = categoryFor(row)
       counts[category].starts++
       const content = asObject(row.itemContent)
@@ -1608,6 +1645,7 @@ async function boundedExternalCallBlockerDiagnostic(pool: Pool, ids: FixtureIds)
         : uniqueBlockingCategories.length > 1 ? "multiple" : "multiple_or_unattributed",
     }
   } catch {
+    assertRestartActive()
     return { status: "unavailable" }
   } finally {
     if (client) {
@@ -1640,6 +1678,7 @@ async function waitFor<T>(read: () => Promise<T | null>, timeoutMs = 20_000): Pr
 }
 
 async function readWaitClaimState(pool: Pool, ids: FixtureIds, stepId: string, callId: string, attempt: number) {
+  assertRestartActive()
   const callResult = await pool.query<{ id: string; status: string; revision: number; content: Record<string, unknown>; stepId: string }>(
     `SELECT "id", "status", "revision", "content", "stepId" FROM "agent_items"
      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4 AND "type" = 'tool_call'
@@ -1684,6 +1723,7 @@ async function readWaitClaimState(pool: Pool, ids: FixtureIds, stepId: string, c
 }
 
 async function readSourceWaitLifecycle(pool: Pool, ids: FixtureIds) {
+  assertRestartActive()
   const stepId = `task:${ids.waiterTaskId}:step:0:attempt:1`
   const callId = PHONE_SHAPED_WAIT_TOOL_CALL_ID
   const [waitResult, callResult, sessionResult] = await Promise.all([
@@ -1792,6 +1832,7 @@ function diagnosticWaitInput(value: unknown): boolean {
 async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: BlockingTaskSnapshot,
   projections: Awaited<ReturnType<typeof readChildWaitTerminalCallProjections>>, waitId: string | undefined,
   sourceStepId: string, continuationStepId: string, sourceCallId: string, sourceCallItemId: string, sourceResultItemId: string) {
+  assertRestartActive()
   const matching = projections.filter(projection => projection.sourceWait.waitId === waitId && projection.sourceWait.claimKeyDigest === null)
   const projectionKind = matching.length !== 1 ? matching.length === 0 ? "missing" : "ambiguous"
     : matching[0]?.sourceStepHandoff ? "handoff" : matching[0]?.sourceStepPrefix ? "prefix" : "no_prefix"
@@ -1799,13 +1840,17 @@ async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: Bloc
     resultItemId: sourceResultItemId, waitKind: "recovered" as const }
   const sourceScope = { ...task, leaseOwner: task.leaseOwner ?? undefined, leaseExpiresAt: task.leaseExpiresAt ?? undefined }
   let defaultPrefixPresent = false, recoveredPrefixPresent = false, nestedContinuationPresent = false
-  try { defaultPrefixPresent = Boolean(await readCanonicalHistoricalSourceStepPrefix(client, sourceScope, args)) } catch { /* fixed diagnostic only */ }
+  try { defaultPrefixPresent = Boolean(await readCanonicalHistoricalSourceStepPrefix(client, sourceScope, args)) } catch {
+    assertRestartActive()
+    /* fixed diagnostic only */ }
   let recoveredPrefix: Awaited<ReturnType<typeof readCanonicalHistoricalSourceStepPrefix>> = null
   try {
     recoveredPrefix = await readCanonicalHistoricalSourceStepPrefix(client, sourceScope, { ...args, terminalMode: "recovered_handoff" })
     recoveredPrefixPresent = Boolean(recoveredPrefix)
     nestedContinuationPresent = Boolean(recoveredPrefix?.continuationPrefix)
-  } catch { /* fixed diagnostic only */ }
+  } catch {
+    assertRestartActive()
+    /* fixed diagnostic only */ }
 
   const [steps, items, anchors, parentRows, sourceCallRows] = await Promise.all([
     client.query<{ sourceStatus: string | null; continuationStatus: string | null; sourceCount: number; continuationCount: number;
@@ -1881,7 +1926,9 @@ async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: Bloc
       sourceWindowEvents = window.rows
       sourceWindowAnchored = sourceWindowEvents[0]?.id === startEvent.id && sourceWindowEvents.at(-1)?.id === endEvent.id
     }
-  } catch { /* fixed diagnostic only */ }
+  } catch {
+    assertRestartActive()
+    /* fixed diagnostic only */ }
   const globalKeyRows = continuationKeys.length ? await client.query<{ idempotencyKey: string; boundedCount: number }>(`SELECT event."idempotencyKey",
       LEAST(COUNT(*), 2)::int AS "boundedCount" FROM "agent_events" AS event
     WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3 AND event."idempotencyKey" = ANY($4::text[])
@@ -1894,7 +1941,9 @@ async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: Bloc
   const continuationEvents = windowKeyRows.map(rows => rows[0]).filter((event): event is RecoveredHandoffProofEvent => Boolean(event))
   const orderedContinuationChain = continuationEvents.length === continuationKeys.length
     && continuationEvents.every((event, index) => {
-      try { return index === 0 || BigInt(event.sequence) > BigInt(continuationEvents[index - 1]!.sequence) } catch { return false }
+      try { return index === 0 || BigInt(event.sequence) > BigInt(continuationEvents[index - 1]!.sequence) } catch {
+        assertRestartActive()
+        return false }
     })
   const continuationCausationChain = continuationEvents.length === continuationKeys.length
     && continuationEvents.slice(1).every((event, index) => event.causationId === continuationEvents[index]!.id)
@@ -1926,7 +1975,9 @@ async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: Bloc
     && diagnosticWaitInput(continuationContent.input) && diagnosticWaitInput(sourceCallInput)
     && diagnosticSameJson(continuationContent.input, sourceCallInput))
   const continuationSequenceOrderValid = continuationEvents.length === continuationKeys.length && continuationEvents.every((event, index) => {
-    try { return index === 0 || BigInt(event.sequence) > BigInt(continuationEvents[index - 1]!.sequence) } catch { return false }
+    try { return index === 0 || BigInt(event.sequence) > BigInt(continuationEvents[index - 1]!.sequence) } catch {
+      assertRestartActive()
+      return false }
   })
   const continuationEventFieldsValid = continuationEvents.length === 7 && continuationEvents.every((event, index) => {
     const types = ["step.started", "cognitive.agenda", "model.started", "model.completed", "model.usage", "item.started", "tool_call.started"]
@@ -1939,7 +1990,9 @@ async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: Bloc
   }) && continuationSequenceOrderValid
   let agendaReceiptValid = false
   try { agendaReceiptValid = continuationEvents.length === 7 && Boolean(parseCognitiveAgendaReceipt(continuationEvents[1]!.payload,
-    { sessionId: task.sessionId, turnId: task.turnId, taskId: task.id, stepId: continuationStepId })) } catch { /* fixed diagnostic only */ }
+    { sessionId: task.sessionId, turnId: task.turnId, taskId: task.id, stepId: continuationStepId })) } catch {
+      assertRestartActive()
+      /* fixed diagnostic only */ }
   const startModelPayload = asObject(continuationEvents[2]?.payload)
   const doneModelPayload = asObject(continuationEvents[3]?.payload)
   const usagePayload = asObject(continuationEvents[4]?.payload)
@@ -1965,7 +2018,9 @@ async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: Bloc
   const parentPayload = asObject(taskParent?.payload)
   let taskParentPrecedes = false
   try { taskParentPrecedes = Boolean(taskParent && continuationEvents[0] && BigInt(taskParent.sequence) < BigInt(continuationEvents[0]!.sequence)) }
-  catch { /* fixed diagnostic only */ }
+  catch {
+    assertRestartActive()
+    /* fixed diagnostic only */ }
   const taskParentExact = Boolean(taskParent && taskParent.sessionId === task.sessionId && taskParent.turnId === task.turnId
     && taskParent.taskId === task.id && taskParent.type === "task.started" && taskParent.actor === "subagent" && taskParent.itemId === null
     && taskParent.correlationId === task.turnId && taskParent.causationId === null
@@ -1992,7 +2047,9 @@ async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: Bloc
         sourceStepId, sourceAttempt: 1, sourceCallItemId, sourceCallId, sourceCallInput: directSourceCallItem.input,
         windowEvents: sourceWindowEvents as never, windowStartEventId: startEvent.id, windowEndEventId: endEvent.id,
       })
-  } catch { directContinuationReaderError = true }
+  } catch {
+    assertRestartActive()
+    directContinuationReaderError = true }
   const lastContinuationRead = continuationReaderTrace.at(-1)
   const continuationRejectStage = directContinuationReaderError ? "query_exception" : directContinuationProof ? "accepted"
     : !lastContinuationRead ? "input_or_window_gate"
@@ -2010,7 +2067,9 @@ async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: Bloc
       return { ...result, rows: result.rows.filter((event: { id: string }) => !continuationEventIds.has(event.id)) }
     } } as unknown as PoolClient
     try { sourceOnlyProof = await readCanonicalHistoricalSourceStepPrefix(sourceOnlyClient, sourceScope, { ...args, terminalMode: "recovered_handoff" }) }
-    catch { sourceOnlyProof = null }
+    catch {
+      assertRestartActive()
+      sourceOnlyProof = null }
   }
   const sourceOnlyProofIds = new Set(sourceOnlyProof?.events.map(event => event.id) ?? [])
   const continuationProofIds = new Set(directContinuationProof?.events.map(event => event.id) ?? [])
@@ -2044,15 +2103,18 @@ async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: Bloc
 let historicalWaitDiagnosticSavepointOrdinal = 0
 
 async function withHistoricalWaitDiagnosticSavepoint<T>(client: PoolClient, probe: () => Promise<T>): Promise<T | undefined> {
+  assertRestartActive()
   const name = `historical_wait_diagnostic_${++historicalWaitDiagnosticSavepointOrdinal}`
-  try { await client.query(`SAVEPOINT ${name}`) } catch { return undefined }
+  try { await client.query(`SAVEPOINT ${name}`) } catch { assertRestartActive(); return undefined }
   try {
     const result = await probe()
+    assertRestartActive()
     await client.query(`RELEASE SAVEPOINT ${name}`)
     return result
   } catch {
     await client.query(`ROLLBACK TO SAVEPOINT ${name}`).catch(() => undefined)
     await client.query(`RELEASE SAVEPOINT ${name}`).catch(() => undefined)
+    assertRestartActive()
     return undefined
   }
 }
@@ -2060,6 +2122,7 @@ async function withHistoricalWaitDiagnosticSavepoint<T>(client: PoolClient, prob
 async function historicalWaitBindingAccepts(client: PoolClient, task: BlockingTaskSnapshot, projection: unknown,
   collisionProjections: readonly TerminalCallProjection[] = [projection as TerminalCallProjection],
   envelopeOverride?: Record<string, unknown>): Promise<boolean> {
+  assertRestartActive()
   const envelope = envelopeOverride ?? historicalWaitClaimProjectionEnvelope(projection as TerminalCallProjection, collisionProjections)
   const result = await client.query<{ accepted: boolean }>(`WITH input AS (SELECT $9::jsonb AS value),
     proof AS (SELECT input.value->'projection' AS value FROM input),
@@ -2119,6 +2182,7 @@ type HistoricalWaitBindingDiagnostic = Readonly<{
 /** Failure-only, de-identified stages for the final claim binding; never returns IDs, keys, payloads, SQL, or exceptions. */
 async function diagnoseHistoricalWaitBinding(client: PoolClient, task: BlockingTaskSnapshot, claimProjection: unknown,
   sourceProjection: unknown): Promise<HistoricalWaitBindingDiagnostic> {
+  assertRestartActive()
   try {
     const claim = asObject(claimProjection), claimWait = asObject(claim.sourceWait)
     const sourceWait = asObject(asObject(sourceProjection).sourceWait)
@@ -2247,10 +2311,13 @@ async function diagnoseHistoricalWaitBinding(client: PoolClient, task: BlockingT
     return { diagnosticStatus: "evaluated", stage, ownerFence, sourceProjectionBound, nestedSourceMatches, sourceClaimSeparated,
       topLevelClaimRowCount, claimStartLifecycle, claimStepFirstLater, claimCallShape, claimKeyMatches, claimKeyCandidateCount,
       claimResultChainPresent, stepChainEventCount, stepChainCallCount }
-  } catch { return { diagnosticStatus: "unavailable" } }
+  } catch {
+    assertRestartActive()
+    return { diagnosticStatus: "unavailable" } }
 }
 
 async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, continuationStepId: string): Promise<void> {
+  assertRestartActive()
   const client = await pool.connect()
   try {
     await client.query("BEGIN")
@@ -2544,6 +2611,7 @@ async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, 
 async function expectCompletedClaimBeforeItemEventSafety(
   pool: Pool, ids: FixtureIds, continuationStepId: string, callId: string, attempt: number,
 ): Promise<void> {
+  assertRestartActive()
   const client = await pool.connect()
   try {
     await client.query("BEGIN")
@@ -2903,6 +2971,7 @@ async function expectCompletedClaimBeforeItemEventSafety(
           `task:${ids.waiterTaskId}:event:tool-result-completed:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:${recoveredResultItemId}:1`])
       expect(changedResultComplete.rows).toHaveLength(1)
       for (const event of [changedResultStart.rows[0]!, changedResultComplete.rows[0]!]) {
+        assertRestartActive()
         const isResultComplete = event.id === changedResultComplete.rows[0]!.id
         const outbox = await client.query(`UPDATE "agent_outbox" SET "payload" =
             jsonb_set(jsonb_set(jsonb_set("payload", '{itemId}', to_jsonb($2::text), false),
@@ -3127,6 +3196,7 @@ async function expectCompletedClaimBeforeItemEventSafety(
 }
 
 async function expectCompletedSourceWaitLifecycle(pool: Pool, ids: FixtureIds, priorTool = false, priorToolFailed = false): Promise<void> {
+  assertRestartActive()
   const stepId = `task:${ids.waiterTaskId}:step:0:attempt:1`
   const callItemId = `task:${ids.waiterTaskId}:item:tool-call:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:attempt:1`
   const resultItemId = `task:${ids.waiterTaskId}:item:tool-result:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:attempt:1`
@@ -3299,6 +3369,7 @@ async function expectMalformedClaimOutcomeRejected(
   pool: Pool, taskStore: PgSubagentTaskStore, ids: FixtureIds, waitId: string,
   validResult: Record<string, unknown>, label: string, corrupt: (outcome: Record<string, unknown>) => void,
 ): Promise<void> {
+  assertRestartActive()
   const malformedResult = structuredClone(validResult)
   const malformedOutcome = asObject(malformedResult.outcome)
   corrupt(malformedOutcome)
@@ -3326,7 +3397,9 @@ async function expectMalformedClaimOutcomeRejected(
   const traceLog = vi.spyOn(console, "info").mockImplementation(() => undefined)
   try {
     process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID = ids.waiterTaskId
+    assertRestartActive()
     const recovery = await new AgentTreeManager(taskStore, { heartbeatMs: 2_000 }).recover(50)
+    assertRestartActive()
     expect(recovery.rows.some(row => row.id === ids.waiterTaskId), `${label}: manager.recover requeued the malformed wait`).toBe(false)
     const traceLine = traceLog.mock.calls.map(([value]) => String(value))
       .find(value => value.startsWith("WORKER_B_RECOVERY_PREDICATE_TRACE "))
@@ -3366,6 +3439,7 @@ async function seedFixedWaitTarget(pool: Pool, input: {
   userId: string; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string;
   policy: ReturnType<typeof defaultSubagentPolicy>; id?: string;
 }): Promise<string> {
+  assertRestartActive()
   const client = await pool.connect()
   try {
     await client.query("BEGIN")
@@ -3417,6 +3491,7 @@ async function seedFixedWaitTarget(pool: Pool, input: {
 
 async function seedLoopWaitScenario(pool: Pool, taskStore: PgSubagentTaskStore, ids: FixtureIds, suffix: string,
   policy: ReturnType<typeof defaultSubagentPolicy>): Promise<void> {
+  assertRestartActive()
   await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`,
     [ids.userId, `${ids.userId}@example.invalid`])
   await pool.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
@@ -3446,6 +3521,7 @@ async function seedLoopWaitScenario(pool: Pool, taskStore: PgSubagentTaskStore, 
 
 async function finishLoopWaitTarget(pool: Pool, taskStore: PgSubagentTaskStore, ids: FixtureIds,
   policy: ReturnType<typeof defaultSubagentPolicy>, targetTaskId = ids.targetTaskId): Promise<void> {
+  assertRestartActive()
   const targetLease = await taskStore.claim({ taskId: targetTaskId, sessionId: ids.sessionId,
     ownerId: "loop-fixture-child-finisher", policy, now: new Date() })
   if (!targetLease?.leaseExpiresAt || !targetLease.turnId) throw new Error("Loop fixture target lease is unavailable")
@@ -3475,7 +3551,9 @@ async function seedExpiredUnsettledRecoveryBlockers(input: {
   userId: string; suffix: string; policy: ReturnType<typeof defaultSubagentPolicy>;
   sessionIds: string[]; taskIds: string[]; count: number;
 }): Promise<void> {
+  assertRestartActive()
   for (let index = 0; index < input.count; index++) {
+    assertRestartActive()
     const order = String(index).padStart(2, "0")
     const sessionId = `durable-child-wait-backlog-${input.suffix}-${order}`
     const turnId = `durable-child-wait-backlog-turn-${input.suffix}-${order}`
@@ -3520,6 +3598,7 @@ async function seedExpiredUnsettledRecoveryBlockers(input: {
 }
 
 async function readBlockerDurableState(pool: Pool, taskIds: readonly string[]): Promise<Array<{ dispatchOutbox: unknown[] }>> {
+  assertRestartActive()
   const result = await pool.query<{ dispatchOutbox: unknown[] }>(`SELECT to_jsonb(session) AS "session", to_jsonb(turn) AS "turn", to_jsonb(root) AS "root",
       to_jsonb(task) AS "task",
       COALESCE((SELECT jsonb_agg(to_jsonb(step) ORDER BY step."id") FROM "agent_steps" AS step
@@ -3549,6 +3628,7 @@ async function readBlockerDurableState(pool: Pool, taskIds: readonly string[]): 
 async function readRecoveryCandidateRank(pool: Pool, waiterTaskId: string, blockerTaskIds: readonly string[]): Promise<{
   targetPageRank: string; candidateCount: string; fixturePageRank: string; fixtureCandidateCount: string; fixtureBlockerCount: string; observedAt: Date;
 }> {
+  assertRestartActive()
   const result = await pool.query(`WITH horizon AS (SELECT clock_timestamp() AS "at"), eligible AS (
       SELECT task."id", task."sessionId", task."rootTaskId",
         ROW_NUMBER() OVER (ORDER BY task."sessionId", task."rootTaskId" NULLS LAST, task."id") AS "pageRank",
@@ -3585,6 +3665,7 @@ function boundedCount(value: unknown): number | null {
 }
 
 async function diagnoseZeroWaitWake(pool: Pool, ids: FixtureIds, report: WaitResolverReport): Promise<void> {
+  assertRestartActive()
   try {
     const result = await pool.query<{ waitRows: string; waitWaiting: string; waitReady: string; waitTimedOut: string;
       waitSuspended: boolean | null; waitConsumed: boolean | null; parentRows: string; parentWaiting: string; parentRunning: string;
@@ -3663,6 +3744,7 @@ async function diagnoseZeroWaitWake(pool: Pool, ids: FixtureIds, report: WaitRes
         postSampleUnlockedRankAtMost25: targetRank !== null && targetRank <= 25, actualSelectionProven: false },
     })}\n`)
   } catch {
+    assertRestartActive()
     process.stderr.write(`WAIT_RESOLVER_ZERO_DIAGNOSTIC ${JSON.stringify({
       sample: "post-reconcile-read-committed-unlocked-sample", resolver: { scanned: report.scanned, resolved: report.resolved, woken: report.woken },
       diagnosticQueryFailed: true,
@@ -3700,6 +3782,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     }
   })
 
+  // Preserve the core budget and allow one bounded startup per injected rollback cut.
   restartCase("recovers registered, pre-continuation, and streaming-continuation crash cuts on one attempt", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = {
@@ -4149,6 +4232,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       let rollbackDispatchGeneration = 0
       let rollbackPublishedAttemptCount = 0
       for (const stage of SOURCE_LIFECYCLE_CRASH_STAGES) {
+        assertRestartActive()
         queuePaused = true
         await queue.pause()
         ids.sourceLifecycleCrashStage = stage
@@ -4584,6 +4668,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         } },
       ]
       for (const malformed of malformedOutcomeCases) {
+        assertRestartActive()
         await expectMalformedClaimOutcomeRejected(pool, taskStore, ids, acknowledged!.waitId,
           validWaitResult, malformed.label, malformed.corrupt)
       }
@@ -4924,7 +5009,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       try { await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId]) } catch { /* preserve the original failure */ }
       await queueRedis.quit().catch(() => queueRedis.disconnect())
     }
-  }, 300_000)
+  }, 300_000 + SOURCE_LIFECYCLE_CRASH_STAGES.length * 20_000)
 
   restartCase("repairs a legacy consumed wait before production restart loaders and reenters idempotently", async () => {
     const suffix = randomUUID()
@@ -5912,6 +5997,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(sourceWaitSteps.rows.find(row => row.waitId === secondWait!.waitId)?.sourceStepId).toBe(secondWait!.stepId)
       const claimSteps: Array<{ waitId: string; sourceStepId: string; sourceOrdinal: number; claimStepId: string; claimOrdinal: number }> = []
       for (const source of sourceWaitSteps.rows) {
+        assertRestartActive()
         const sourceMatch = new RegExp(`^task:${ids.waiterTaskId}:step:(0|[1-9]\\d*):attempt:(1|[1-9]\\d*)$`).exec(source.sourceStepId)
         if (!sourceMatch || !Number.isSafeInteger(Number(sourceMatch[1])) || Number(sourceMatch[2]) !== source.sourceAttempt
           || !Number.isSafeInteger(Number(sourceMatch[1]) + 1)) throw new Error("two_historical_wait_source_logical_step_invalid")
@@ -6392,6 +6478,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
             payload: { itemId: duplicateResultItemId, status: "completed", content: duplicateResultContent } },
         ]
         for (const [index, event] of duplicateEvents.entries()) {
+          assertRestartActive()
           const eventId = `fixture-duplicate-claim-event:${suffix}:${index}`
           await checkClient.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
             VALUES ($1, $2, $3, $4, $5, $6, $7, 'subagent', $8, $9, $10, $11::jsonb)`, [
@@ -6898,6 +6985,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
           "the final PostgreSQL binding must reject a recovered handoff missing an event anchor").resolves.toBe(false)
 
         const expectHandoffProducerRejected = async (label: string, mutate: () => Promise<{ rowCount: number | null }>) => {
+          assertRestartActive()
           await checkClient.query("SAVEPOINT recovered_handoff_source_tamper")
           try {
             const changed = await mutate()
@@ -7203,6 +7291,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     }
   }, 150_000)
 
+  // Four real Worker starts and the receipt-tamper matrix share this aggregate budget.
   restartCase("accepts PG-scale-8 receipt usage before failing closed on a later streaming step", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = {
@@ -7423,6 +7512,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         expect(BigInt(allowedStepCompletion.rows[0]!.modelSequence)).toBeLessThan(BigInt(allowedStepCompletion.rows[0]!.claimSequence))
         expect(BigInt(allowedStepCompletion.rows[0]!.sequence)).toBeGreaterThan(BigInt(claimResultEvents.rows[0]!.completedSequence))
         for (const causationId of [claimResultEvents.rows[0]!.startedId, claimResultEvents.rows[0]!.completedId]) {
+          assertRestartActive()
           await settlementClient.query("SAVEPOINT claim_result_cause_only")
           try {
             const sequence = await settlementClient.query<{ eventSequence: string }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
@@ -7488,6 +7578,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
               payload: { itemId: orderedResultItemId, status: "completed", content: orderedResultContent } },
           ]
           for (let index = 0; index < orderedEvents.length; index += 1) {
+            assertRestartActive()
             const event = orderedEvents[index]!
             await settlementClient.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor",
                 "correlationId", "causationId", "idempotencyKey", "payload")
@@ -7572,6 +7663,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
           "the same source proof must not transfer to another tenant").resolves.toBe(false)
 
         const expectSourceProducerRejected = async (label: string, mutate: () => Promise<{ rowCount: number | null }>) => {
+          assertRestartActive()
           await settlementClient.query("SAVEPOINT historical_wait_source_tamper")
           try {
             const changed = await mutate()
@@ -7630,6 +7722,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         // The source projection above is the real normal waiting prefix for this same PG fixture;
         // these canonical outcome checks exercise normal-source settlement, not a prefix mock.
         const expectSelfConsistentOutcomeRejected = async (label: string, status: "ready" | "timed_out", matchedTaskIds: string[], outcome: Record<string, unknown>) => {
+          assertRestartActive()
           await settlementClient.query("SAVEPOINT self_consistent_malformed_wait_outcome")
           try {
             const changedWait = await settlementClient.query(`UPDATE "agent_wait_conditions" SET "status" = $5, "matchedTaskIds" = $6::jsonb,
@@ -7678,6 +7771,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         await expectSelfConsistentOutcomeRejected("empty matched snapshot", "ready", [], emptyMatchOutcome)
 
         const expectOutcomeRejected = async (update: string, values: (string | number)[], label: string) => {
+          assertRestartActive()
           await settlementClient.query("SAVEPOINT malformed_wait_outcome")
           try {
             const changed = await settlementClient.query(update, values)
@@ -7831,7 +7925,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       try { await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId]) } catch { /* preserve the original failure */ }
       await queueRedis.quit().catch(() => queueRedis.disconnect())
     }
-  }, 90_000)
+  }, 180_000)
 
   restartCase("selects the latest sequential wait by step ordinal at maxAttempts", async () => {
     const client = await pool.connect()
