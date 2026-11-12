@@ -6,7 +6,8 @@ import { useCallback, useEffect, useState } from 'react'
 type Consent = { enabled: boolean; version: number }
 const ENDPOINT = '/api/me/agent-search-footprint-memory'
 const MAX_CONSENT_VERSION = 2_147_483_647
-const VERSION_EXHAUSTED_MESSAGE = 'Search history is unavailable because the consent version limit was reached. This setting cannot currently be changed.'
+const ENABLED_AT_LIMIT_MESSAGE = 'Search history is unavailable. You can turn off the saved choice here, but it cannot be turned on again.'
+const DISABLED_AT_LIMIT_MESSAGE = 'Search history is unavailable and this choice is off. It cannot be turned on again.'
 
 function parseConsent(value: unknown): Consent | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -75,6 +76,7 @@ export function AgentSearchFootprintMemoryConsent() {
   }
 
   const unavailable = consent?.version === MAX_CONSENT_VERSION
+  const lockedOff = unavailable && consent?.enabled === false
 
   return (
     <section aria-labelledby="search-footprint-memory-title" style={{ margin: '0 10px 12px', padding: 10, border: '1px solid var(--border)', borderRadius: 8 }}>
@@ -82,23 +84,20 @@ export function AgentSearchFootprintMemoryConsent() {
       <p style={{ margin: '5px 0 8px', color: 'var(--text-muted)', fontSize: 10, lineHeight: 1.5 }}>
         With your consent enabled, future sessions may refer to bounded role, location, and source criteria from earlier sessions as advisory context when available. Each objective still requires a fresh search. Separate from Task History; grants no action, approval, or submission authority.
       </p>
-      {unavailable ? (
-        <div role="status" style={{ marginTop: 6, color: 'var(--text-muted)', fontSize: 10 }}>{VERSION_EXHAUSTED_MESSAGE}</div>
-      ) : (
-        <>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 11, cursor: loading || saving || !consent ? 'wait' : 'pointer' }}>
-            <input
-              type="checkbox"
-              aria-label="Allow future sessions to refer to bounded search criteria"
-              checked={consent?.enabled ?? false}
-              disabled={loading || saving || !consent}
-              onChange={event => { void update(event.currentTarget.checked) }}
-            />
-            {loading ? 'Loading…' : consent?.enabled ? 'On' : 'Off'}
-          </label>
-          {message && <div role="status" style={{ marginTop: 6, color: 'var(--text-muted)', fontSize: 10 }}>{message}</div>}
-        </>
-      )}
+      {unavailable && <div role="status" style={{ marginTop: 6, color: 'var(--text-muted)', fontSize: 10 }}>
+        {consent?.enabled ? ENABLED_AT_LIMIT_MESSAGE : DISABLED_AT_LIMIT_MESSAGE}
+      </div>}
+      <label style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 11, cursor: loading || saving || !consent || lockedOff ? 'wait' : 'pointer' }}>
+        <input
+          type="checkbox"
+          aria-label="Allow future sessions to refer to bounded search criteria"
+          checked={consent?.enabled ?? false}
+          disabled={loading || saving || !consent || lockedOff}
+          onChange={event => { void update(event.currentTarget.checked) }}
+        />
+        {loading ? 'Loading…' : unavailable && consent?.enabled ? 'On (unavailable)' : consent?.enabled ? 'On' : 'Off'}
+      </label>
+      {message && <div role="status" style={{ marginTop: 6, color: 'var(--text-muted)', fontSize: 10 }}>{message}</div>}
       {!loading && !consent && <button type="button" onClick={() => { void reload() }} style={{ marginTop: 6 }}>Retry</button>}
     </section>
   )

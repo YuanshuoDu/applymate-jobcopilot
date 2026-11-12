@@ -50,7 +50,18 @@ describe('agent search footprint memory consent storage', () => {
     expect(mocks.updateMany).not.toHaveBeenCalled()
   })
 
-  it('rejects stale, raced, missing-user, and exhausted-version mutations without changing consent', async () => {
+  it('keeps unchanged choices idempotent at version exhaustion', async () => {
+    const maxVersion = 2_147_483_647
+    mocks.findUnique.mockResolvedValueOnce(consentRow(true, maxVersion))
+    await expect(setAgentSearchFootprintMemoryConsent('user-1', { enabled: true, expectedVersion: maxVersion }))
+      .resolves.toEqual({ kind: 'unchanged', consent: { enabled: true, version: maxVersion } })
+    mocks.findUnique.mockResolvedValueOnce(consentRow(false, maxVersion))
+    await expect(setAgentSearchFootprintMemoryConsent('user-1', { enabled: false, expectedVersion: maxVersion }))
+      .resolves.toEqual({ kind: 'unchanged', consent: { enabled: false, version: maxVersion } })
+    expect(mocks.updateMany).not.toHaveBeenCalled()
+  })
+
+  it('handles stale, raced, missing-user, terminal opt-out, and exhausted re-enable mutations', async () => {
     mocks.findUnique.mockResolvedValueOnce(consentRow(true, 5))
     await expect(setAgentSearchFootprintMemoryConsent('user-1', { enabled: false, expectedVersion: 4 }))
       .resolves.toEqual({ kind: 'stale', consent: { enabled: true, version: 5 } })
@@ -64,8 +75,18 @@ describe('agent search footprint memory consent storage', () => {
     mocks.findUnique.mockResolvedValueOnce(null)
     await expect(setAgentSearchFootprintMemoryConsent('missing', { enabled: true, expectedVersion: 0 }))
       .resolves.toEqual({ kind: 'not_found' })
-    mocks.findUnique.mockResolvedValueOnce(consentRow(true, 2_147_483_647))
+    const maxVersion = 2_147_483_647
+    mocks.findUnique.mockResolvedValueOnce(consentRow(true, maxVersion))
     await expect(setAgentSearchFootprintMemoryConsent('user-1', { enabled: false, expectedVersion: 2_147_483_647 }))
-      .resolves.toEqual({ kind: 'version_exhausted', consent: { enabled: true, version: 2_147_483_647 } })
+      .resolves.toEqual({ kind: 'updated', consent: { enabled: false, version: maxVersion } })
+    expect(mocks.updateMany).toHaveBeenLastCalledWith({ where: { id: 'user-1', agentSearchFootprintMemoryConsentVersion: maxVersion }, data: {
+      agentSearchFootprintMemoryEnabled: false,
+    } })
+
+    const updatesAfterRevocation = mocks.updateMany.mock.calls.length
+    mocks.findUnique.mockResolvedValueOnce(consentRow(false, maxVersion))
+    await expect(setAgentSearchFootprintMemoryConsent('user-1', { enabled: true, expectedVersion: maxVersion }))
+      .resolves.toEqual({ kind: 'version_exhausted', consent: { enabled: false, version: maxVersion } })
+    expect(mocks.updateMany).toHaveBeenCalledTimes(updatesAfterRevocation)
   })
 })
