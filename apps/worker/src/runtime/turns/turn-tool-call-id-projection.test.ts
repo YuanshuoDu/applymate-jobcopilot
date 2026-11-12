@@ -3,6 +3,7 @@ import { redactSensitiveText } from "@jobcopilot/shared"
 import type { TaskExecutionOwnerFence } from "../execution-owner.js"
 import type { ContextSeedBlock, StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import { contextToModelMessages } from "./turn-engine-messages.js"
+import type { ChildToolReplayReceipt, ChildWaitReplayReceipt } from "./turn-execution-options.js"
 import {
   normalizeProjectedToolCallIds,
   projectChildToolCallIdsForModelContext,
@@ -12,6 +13,7 @@ const PHONE_ID = "provider-call:+14155550134"
 const EMAIL_ID = "provider-call:person@example.invalid"
 const TOKEN_ID = "Bearer abcdefghijklmnop"
 const STEP_ID = "task-step:3:attempt:1"
+const RESERVED_ID = "toolcall-source-1"
 
 function owner(overrides: Partial<TaskExecutionOwnerFence> = {}): TaskExecutionOwnerFence {
   return {
@@ -23,6 +25,18 @@ function owner(overrides: Partial<TaskExecutionOwnerFence> = {}): TaskExecutionO
 
 function observation(toolCallId: string, id: string): ContextSeedBlock {
   return { id, content: { toolCallId, toolName: "wait_subagents", input: { mode: "any" }, status: "completed", output: { ready: true } } }
+}
+
+function reservedObservation(id = RESERVED_ID, itemId = "result-1"): ContextSeedBlock {
+  return { id: `child-resume:${itemId}`, content: { toolCallId: id, toolName: "jobs.search", input: { query: "Dublin" },
+    status: "completed", output: { jobs: [] }, errorCode: null } }
+}
+
+function receipt(overrides: Partial<ChildToolReplayReceipt> = {}): ChildToolReplayReceipt {
+  return { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", taskId: "child-1",
+    attempt: 1, stepId: "old-step", toolCallId: RESERVED_ID, toolName: "jobs.search", input: { query: "Dublin" },
+    callItem: { id: "call-1", revision: 2 }, resultItem: { id: "result-1", revision: 3 },
+    result: { status: "completed", output: { jobs: [] }, errorCode: null }, ...overrides }
 }
 
 function snapshot(toolObservations: readonly ContextSeedBlock[]): StepContextSnapshot {
@@ -94,7 +108,7 @@ describe("child model-context tool-call ID projection", () => {
     const workerAAlias = [...workerA.aliasToCanonical.keys()][0]!
     const otherScopeAlias = [...otherScope.aliasToCanonical.keys()][0]!
     expect(otherScopeAlias).not.toBe(workerAAlias)
-    expect(() => normalizeProjectedToolCallIds([{ id: workerAAlias }], otherScope.aliasToCanonical))
+    expect(() => normalizeProjectedToolCallIds([{ id: workerAAlias }], otherScope))
       .toThrow("child_tool_call_projection_unknown_alias")
   })
 
@@ -103,9 +117,10 @@ describe("child model-context tool-call ID projection", () => {
     const firstCandidate = [...projectChildToolCallIdsForModelContext(original, owner(), STEP_ID).aliasToCanonical.keys()][0]!
     const colliding = snapshot([
       observation(PHONE_ID, "phone-result"),
-      observation(firstCandidate, "alias-shaped-raw-result"),
+      reservedObservation(firstCandidate, "alias-shaped-raw-result"),
     ])
-    const projected = projectChildToolCallIdsForModelContext(colliding, owner(), STEP_ID)
+    const projected = projectChildToolCallIdsForModelContext(colliding, owner(), STEP_ID, [receipt({ toolCallId: firstCandidate,
+      resultItem: { id: "alias-shaped-raw-result", revision: 3 } })])
     const phoneAlias = [...projected.aliasToCanonical.entries()].find(([, raw]) => raw === PHONE_ID)?.[0]
     expect(phoneAlias).toBeDefined()
     expect(phoneAlias).not.toBe(firstCandidate)
@@ -151,11 +166,12 @@ describe("child model-context tool-call ID projection", () => {
   it("maps returned aliases back once, while rejecting duplicate, unknown, malformed, and root-scoped IDs", () => {
     const projection = projectChildToolCallIdsForModelContext(snapshot([observation(PHONE_ID, "phone-result")]), owner(), STEP_ID)
     const alias = [...projection.aliasToCanonical.keys()][0]!
-    expect(normalizeProjectedToolCallIds([{ id: alias, name: "wait_subagents" }], projection.aliasToCanonical))
+    expect(normalizeProjectedToolCallIds([{ id: alias, name: "wait_subagents" }], projection))
       .toEqual([{ id: PHONE_ID, name: "wait_subagents" }])
-    expect(() => normalizeProjectedToolCallIds([{ id: alias }, { id: PHONE_ID }], projection.aliasToCanonical))
+    expect(() => normalizeProjectedToolCallIds([{ id: alias }, { id: PHONE_ID }], projection))
       .toThrow("child_tool_call_projection_duplicate_model_id")
-    expect(() => normalizeProjectedToolCallIds([{ id: "toolcall" + "a".repeat(64) + "a" }], new Map()))
+    const emptyProjection = projectChildToolCallIdsForModelContext(snapshot([]), owner(), STEP_ID)
+    expect(() => normalizeProjectedToolCallIds([{ id: "toolcall" + "a".repeat(64) + "a" }], emptyProjection))
       .toThrow("child_tool_call_projection_unknown_alias")
     expect(() => projectChildToolCallIdsForModelContext(snapshot([observation("", "bad")]), owner(), STEP_ID))
       .toThrow("child_tool_call_projection_invalid_id")
@@ -164,5 +180,75 @@ describe("child model-context tool-call ID projection", () => {
     expect(() => projectChildToolCallIdsForModelContext(snapshot([observation(PHONE_ID, "phone-result")]), owner({
       taskId: "root-1",
     }), STEP_ID)).toThrow("child_tool_call_projection_scope_invalid")
+  })
+
+  it("projects a reserved ID only with an exact scoped item receipt and matches the returned tool call", () => {
+    const original = snapshot([reservedObservation()])
+    const projected = projectChildToolCallIdsForModelContext(original, owner({ attemptCount: 2 }), STEP_ID, [receipt()])
+    const alias = [...projected.aliasToCanonical.keys()][0]!
+    expect(alias).toMatch(/^toolcall[a-p]{64}[a-z]+$/)
+    expect(projected.aliasToCanonical.get(alias)).toBe(RESERVED_ID)
+    expect(normalizeProjectedToolCallIds([{ id: alias, name: "jobs.search", arguments: { query: "Dublin" } }], projected))
+      .toEqual([{ id: RESERVED_ID, name: "jobs.search", arguments: { query: "Dublin" } }])
+    expect(() => normalizeProjectedToolCallIds([{ id: alias, name: "jobs.search", arguments: { query: "Cork" } }], projected))
+      .toThrow("child_tool_call_projection_receipt_invalid")
+  })
+
+  it("fails closed for absent, sparse, mismatched, wrong-owner, and unmapped reserved receipts", () => {
+    const original = snapshot([reservedObservation()])
+    expect(() => projectChildToolCallIdsForModelContext(original, owner(), STEP_ID))
+      .toThrow("child_tool_call_projection_receipt_invalid")
+    expect(() => projectChildToolCallIdsForModelContext(original, owner(), STEP_ID, [receipt({ resultItem: { id: "other-result", revision: 3 } })]))
+      .toThrow("child_tool_call_projection_receipt_invalid")
+    expect(() => projectChildToolCallIdsForModelContext(original, owner(), STEP_ID, [receipt({ taskId: "other-child" })]))
+      .toThrow("child_tool_call_projection_receipt_invalid")
+    expect(() => projectChildToolCallIdsForModelContext(original, owner(), STEP_ID, [receipt({ callItem: { id: "call-1", revision: -1 } })]))
+      .toThrow("child_tool_call_projection_receipt_invalid")
+    expect(() => projectChildToolCallIdsForModelContext(snapshot([reservedObservation("toolcall", "result-1")]), owner(), STEP_ID, [receipt()]))
+      .toThrow("child_tool_call_projection_receipt_invalid")
+    const emptyProjection = projectChildToolCallIdsForModelContext(snapshot([]), owner(), STEP_ID)
+    expect(() => normalizeProjectedToolCallIds([{ id: "toolcall-fresh", name: "jobs.search", arguments: { query: "Dublin" } }], emptyProjection))
+      .toThrow("child_tool_call_projection_unknown_alias")
+  })
+
+  it("rejects a redacted nonreserved historical alias without complete item proof", () => {
+    const rawId = "+353 87 123 4567", projected = projectChildToolCallIdsForModelContext(
+      snapshot([reservedObservation(rawId, "unpersisted-result")]), owner(), STEP_ID,
+      [receipt({ toolCallId: rawId, resultItem: { id: "unpersisted-result", revision: 3 }, callItem: { id: "call-1", revision: -1 } })],
+    )
+    const alias = [...projected.aliasToCanonical.keys()][0]!
+    expect(alias).toMatch(/^toolcall/)
+    expect(() => normalizeProjectedToolCallIds([{ id: alias, name: "jobs.search", arguments: { query: "Dublin" } }], projected))
+      .toThrow("child_tool_call_projection_receipt_invalid")
+  })
+
+  it("requires loader-linked wait proof instead of accepting a generic wait tool receipt", () => {
+    const rawWaitInput = { idempotencyKey: TOKEN_ID, taskIds: ["child-leaf"], mode: "all", timeoutMs: 5_000 }
+    const waitInput = { ...rawWaitInput, idempotencyKey: redactSensitiveText(rawWaitInput.idempotencyKey) }
+    expect(waitInput.idempotencyKey).not.toBe(rawWaitInput.idempotencyKey)
+    const output = { waitId: "wait-1", status: "ready", taskIds: ["child-leaf"], deadlineAt: "2099-01-01T00:00:00.000Z",
+      matchedTaskIds: ["child-leaf"], tasks: [] }
+    const waitReceipt: ChildWaitReplayReceipt = { ...receipt({ toolCallId: RESERVED_ID, toolName: "wait_subagents", input: rawWaitInput,
+      callItem: { id: "wait-call-item", revision: 2 }, resultItem: { id: "wait-result-item", revision: 3 },
+      result: { status: "completed", output, errorCode: null } }), waitId: "wait-1", source: {
+      attempt: 1, stepId: "old-step", ordinal: 2, toolCallId: RESERVED_ID, sourceItemId: "wait-result-item",
+      callItem: { id: "wait-call-item", revision: 2 }, resultItem: { id: "wait-result-item", revision: 3 }, input: waitInput,
+      persistedResult: { status: "completed", output: { ...output, status: "waiting", matchedTaskIds: [] }, errorCode: null },
+      continuationStepId: "continuation-step", continuationOrdinal: 3,
+    } }
+    const source = { id: "child-resume:wait-result-item", content: { toolCallId: RESERVED_ID, toolName: "wait_subagents", input: waitInput,
+      status: "completed", output, errorCode: null } }
+    const projected = projectChildToolCallIdsForModelContext(snapshot([source]), owner({ attemptCount: 2 }), STEP_ID, [], [waitReceipt])
+    const alias = [...projected.aliasToCanonical.keys()][0]!
+    expect(normalizeProjectedToolCallIds([{ id: alias, name: "wait_subagents", arguments: waitInput }], projected))
+      .toEqual([{ id: RESERVED_ID, name: "wait_subagents", arguments: waitInput }])
+    expect(() => normalizeProjectedToolCallIds([{ id: alias, name: "wait_subagents", arguments: { ...waitInput, idempotencyKey: "wrong-key" } }], projected))
+      .toThrow("child_tool_call_projection_receipt_invalid")
+    const wrongSourceKey = { ...waitReceipt, source: { ...waitReceipt.source, input: { ...waitInput, idempotencyKey: "wrong-key" } } }
+    expect(() => projectChildToolCallIdsForModelContext(snapshot([source]), owner({ attemptCount: 2 }), STEP_ID, [], [wrongSourceKey]))
+      .toThrow("child_tool_call_projection_receipt_invalid")
+    expect(() => projectChildToolCallIdsForModelContext(snapshot([source]), owner({ attemptCount: 2 }), STEP_ID,
+      [{ ...waitReceipt, source: undefined } as unknown as ChildToolReplayReceipt]))
+      .toThrow("child_tool_call_projection_receipt_invalid")
   })
 })

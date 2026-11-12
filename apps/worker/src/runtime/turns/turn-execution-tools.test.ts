@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest"
 import { executeTools, recoverPersistedToolCalls } from "./turn-execution-tools.js"
 import { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
+import type { ChildToolReplayReceipt } from "./turn-execution-options.js"
 import type { ToolCallRecovery } from "./turn-engine-types.js"
 import type { ChildWaitClaimRecovery } from "../subagents/child-durable-wait-replay.js"
 import { createAskUserTool } from "../tools/ask-user.js"
@@ -265,21 +266,28 @@ describe("executeTools persisted replay", () => {
   const resumedCall = { id: "model-call-9", name: "jobs.search", arguments: { query: "Dublin" } }
   const resumedOutput = { jobs: [{ id: "job-1" }] }
 
-  function childResumeReplayFixture(overrides: { id?: string; content?: Record<string, unknown>; attemptCount?: number } = {}) {
+  function childResumeReplayFixture(overrides: { id?: string; content?: Record<string, unknown>; attemptCount?: number; withoutReceipt?: boolean } = {}) {
     const executeTool = vi.fn()
     const createdItems: Array<Record<string, unknown>> = []
     const updates: Array<Record<string, unknown>> = []
     const events: Array<{ type: string; payload: unknown }> = []
+    const content = { toolCallId: resumedCall.id, toolName: resumedCall.name, input: resumedCall.arguments, status: "completed", output: resumedOutput, errorCode: null,
+      ...overrides.content }
+    const receipt: ChildToolReplayReceipt = {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", taskId: "child-1",
+      attempt: 2, stepId: "source-step-2", toolCallId: resumedCall.id, toolName: resumedCall.name, input: resumedCall.arguments,
+      callItem: { id: "source-call-1", revision: 1 }, resultItem: { id: "source-result-1", revision: 2 },
+      result: { status: content.status === "failed" ? "failed" : "completed", output: content.output,
+        errorCode: typeof content.errorCode === "string" ? content.errorCode : null },
+    }
     const options = {
       identity: { kind: "task", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "child-1", rootTaskId: "root-1", ownerId: "worker-2", attemptCount: overrides.attemptCount ?? 3, leaseExpiresAt: new Date("2026-09-10T00:00:00.000Z") },
       scope: { userId: "user-1" },
       snapshot: {
         system: [], profile: [], steerHistory: [], businessRefs: [],
-        toolObservations: [{ id: overrides.id ?? "child-resume:source-result-1", content: {
-          toolCallId: resumedCall.id, toolName: resumedCall.name, input: resumedCall.arguments, status: "completed", output: resumedOutput, errorCode: null,
-          ...overrides.content,
-        } }],
+        toolObservations: [{ id: overrides.id ?? "child-resume:source-result-1", content }],
       },
+      ...(overrides.withoutReceipt ? {} : { childToolReplayReceipts: [receipt] }),
       executeTool,
       idFactory: (prefix: string) => `${prefix}:attempt:${overrides.attemptCount ?? 3}`,
       signal: new AbortController().signal,
@@ -546,6 +554,16 @@ describe("executeTools persisted replay", () => {
     expect(fixture.executeTool).not.toHaveBeenCalled()
     expect(onCallPersisted).toHaveBeenCalledTimes(1)
     expect(result.wait).toBeNull()
+  })
+
+  it("rejects a child-resume replay without a typed item receipt before persistence", async () => {
+    const fixture = childResumeReplayFixture({ withoutReceipt: true })
+
+    await expect(replayChildResume(fixture)).rejects.toMatchObject({ code: "invalid_output" })
+
+    expect(fixture.createdItems).toHaveLength(0)
+    expect(fixture.events).toHaveLength(0)
+    expect(fixture.executeTool).not.toHaveBeenCalled()
   })
 
   it("persists the exact failed result code without exception prose", async () => {

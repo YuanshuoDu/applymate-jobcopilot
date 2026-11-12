@@ -15,6 +15,12 @@ export type BatchAppendEntry =
   | (BatchAppendEntryBase & { type: typeof STEERING_MARKER_EVENT_TYPE; actor?: "system" })
   | (BatchAppendEntryBase & { type: string; actor?: never })
 
+export type PersistedToolExecutionReceipt = Readonly<{
+  toolCallId: string; toolName: string; input: RepositoryJsonValue
+  callItem: Readonly<{ id: string; revision: number }>; resultItem: Readonly<{ id: string; revision: number }>
+  result: Readonly<{ status: TurnEngineToolResult["status"]; output: RepositoryJsonValue; errorCode: string | null }>
+}>
+
 export class TurnExecutionEventWriter {
   private causationId: string | null = null
   private readonly key: string
@@ -106,10 +112,12 @@ export async function executeToolWithItems(
   call: TurnEngineToolCall,
   now: () => Date,
   onCallItemPersisted?: () => void,
+  onResultItemPersisted?: (receipt: PersistedToolExecutionReceipt) => void,
 ): Promise<TurnEngineToolResult> {
+  const input = toRepositoryJson(call.arguments)
   const callItem = await writer.startItem({
     id: itemId(options, `item:tool-call:${call.id}`), stepId: step.id, type: "tool_call", phase: null,
-    content: { toolCallId: call.id, toolName: call.name, toolVersion: "1", input: toRepositoryJson(call.arguments) }, now: now(),
+    content: { toolCallId: call.id, toolName: call.name, toolVersion: "1", input }, now: now(),
   })
   onCallItemPersisted?.()
   const startKey = options.childWaitCallStartKey?.(step.id, call) ?? `tool-started:${call.id}`
@@ -139,7 +147,7 @@ export async function executeToolWithItems(
   }
   await writer.completeItem(callItem, {
     toolCallId: call.id, toolName: call.name, toolVersion: result.toolVersion,
-    status: result.status, errorCode: result.errorCode, input: toRepositoryJson(call.arguments),
+    status: result.status, errorCode: result.errorCode, input,
   }, now(), `tool-call-completed:${call.id}`)
   await writer.append(
     result.status === "completed" ? "tool_call.completed" : "tool_call.failed", call.id, callItem.id,
@@ -150,7 +158,11 @@ export async function executeToolWithItems(
     id: itemId(options, `item:tool-result:${call.id}`), stepId: step.id, type: "tool_result", phase: null,
     content: { toolCallId: call.id, output: toRepositoryJson(result.output ?? null), errorCode: result.errorCode }, now: now(),
   })
-  await writer.completeItem(resultItem, { toolCallId: call.id, output: toRepositoryJson(result.output ?? null), errorCode: result.errorCode }, now(), `tool-result-completed:${call.id}`)
+  const output = toRepositoryJson(result.output ?? null)
+  await writer.completeItem(resultItem, { toolCallId: call.id, output, errorCode: result.errorCode }, now(), `tool-result-completed:${call.id}`)
+  onResultItemPersisted?.({ toolCallId: call.id, toolName: call.name, input,
+    callItem: { id: callItem.id, revision: callItem.revision }, resultItem: { id: resultItem.id, revision: resultItem.revision },
+    result: { status: result.status, output, errorCode: result.errorCode } })
   if (pauseError) throw pauseError
   return result
 }

@@ -218,7 +218,7 @@ describe("TurnExecutionEventWriter", () => {
     expect(projected).toContain("inputAvailable")
   })
 
-  it("preserves completed tool-call input for replay after restoring persisted items", async () => {
+  it("returns a receipt only after both replay items persist and preserves their revisions", async () => {
     const events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }> = []
     const items = new Map<string, { id: string; stepId: string | null; type: string; status: string; revision: number; content: unknown }>()
     const base = options(identity("turn", "root-1"), events)
@@ -249,8 +249,13 @@ describe("TurnExecutionEventWriter", () => {
       },
     }
     const writer = new TurnExecutionEventWriter(executionOptions)
+    const persistedReceipts: Array<{ toolCallId: string; toolName: string; input: unknown; callItem: { id: string; revision: number }; resultItem: { id: string; revision: number }; result: { status: string; output: unknown; errorCode: string | null } }> = []
 
-    await executeToolWithItems(executionOptions, writer, { id: "step-1", ordinal: 0 }, call, () => new Date("2026-09-25T00:00:00.000Z"))
+    await executeToolWithItems(executionOptions, writer, { id: "step-1", ordinal: 0 }, call, () => new Date("2026-09-25T00:00:00.000Z"), undefined, receipt => persistedReceipts.push(receipt))
+    const callItem = [...items.values()].find(item => item.type === "tool_call")!, resultItem = [...items.values()].find(item => item.type === "tool_result")!
+    expect(persistedReceipts).toEqual([{ toolCallId: call.id, toolName: call.name, input: call.arguments,
+      callItem: { id: callItem.id, revision: callItem.revision }, resultItem: { id: resultItem.id, revision: resultItem.revision },
+      result: { status: "completed", output: { taskId: "task-1" }, errorCode: null } }])
 
     const restored = restoreToolCallState([...items.values()], [])
     expect(restored.pending).toEqual([])

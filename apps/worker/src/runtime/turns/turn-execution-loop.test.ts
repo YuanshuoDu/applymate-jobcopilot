@@ -12,6 +12,7 @@ import { nativeVerificationFeedbackText } from "../canonical-turn-native-verific
 import { buildCanonicalTurnResumeState } from "../canonical-turn-wait-resume-accounting.js"
 import type { NativeVerificationFeedback } from "../subagents/native-verification-port.js"
 import type { ChildWaitOrphanRecovery } from "../subagents/child-durable-wait-replay.js"
+import type { ChildToolReplayReceipt } from "./turn-execution-options.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
 import { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { createPgTurnEngineStore } from "./turn-engine-store.js"
@@ -2125,6 +2126,121 @@ describe("owner-agnostic turn execution loop", () => {
     expect(child.options.snapshot.toolObservations).toEqual([observation])
   })
 
+  it("replays a reserved historical child ID only with its complete typed item receipt", async () => {
+    const rawCallId = "toolcall-historical-1", input = { query: "Dublin" }, output = { jobs: [] }
+    const observation = { id: "child-resume:result-item-1", content: {
+      toolCallId: rawCallId, toolName: "jobs.search", input, status: "completed", output, errorCode: null,
+    } }
+    const child = fixture(identity("task", "child-1", 2), undefined, [observation])
+    const receipt: ChildToolReplayReceipt = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+      taskId: "child-1", attempt: 1, stepId: "prior-step", toolCallId: rawCallId, toolName: "jobs.search", input,
+      callItem: { id: "call-item-1", revision: 2 }, resultItem: { id: "result-item-1", revision: 3 },
+      result: { status: "completed", output, errorCode: null } }
+    const executeTool = vi.fn(child.options.executeTool), model = child.options.model
+    child.options = { ...child.options, executeTool, childToolReplayReceipts: [receipt], model: { ...model, async *stream(request: HarnessModelRequest) {
+      child.requests.push(request)
+      if (child.requests.length === 1) {
+        const use = request.messages.flatMap(message => message.content).find(part => part.type === "tool_use")
+        if (!use || use.type !== "tool_use") throw new Error("reserved_alias_missing")
+        yield { type: "tool_call_completed", callId: use.id, name: "jobs.search", arguments: input }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } else {
+        yield { type: "text_delta", text: "replayed safely" }
+        yield { type: "completed", finishReason: "stop" }
+      }
+    } } }
+
+    const result = await runTurnExecutionLoop(child.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1, finalText: "replayed safely" })
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(child.events.filter(event => event.type === "tool_call.started" && event.payload !== undefined)).toHaveLength(1)
+    expect(JSON.stringify(child.requests.map(request => request.messages))).not.toContain(rawCallId)
+  })
+
+  it("rejects absent or unmapped reserved child IDs before call/result writes and tool execution", async () => {
+    for (const mode of ["missing-observation-receipt", "unmapped-model-call"] as const) {
+      const reserved = "toolcall-untrusted", child = fixture(identity("task", "child-1"), undefined,
+        mode === "missing-observation-receipt" ? [{ id: "child-resume:result-1", content: {
+          toolCallId: reserved, toolName: "jobs.search", input: { query: "Dublin" }, status: "completed", output: { jobs: [] }, errorCode: null,
+        } }] : [])
+      const executeTool = vi.fn(child.options.executeTool), model = child.options.model
+      let modelCalls = 0
+      child.options = { ...child.options, executeTool, model: { ...model, async *stream(request: HarnessModelRequest) {
+        child.requests.push(request); modelCalls += 1
+        if (mode === "unmapped-model-call") yield { type: "tool_call_completed", callId: reserved, name: "jobs.search", arguments: { query: "Dublin" } }
+        else yield { type: "text_delta", text: "must not reach provider" }
+        yield { type: "completed", finishReason: mode === "unmapped-model-call" ? "tool_calls" : "stop" }
+      } } }
+
+      const result = await runTurnExecutionLoop(child.options)
+      expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+      expect(modelCalls).toBe(mode === "unmapped-model-call" ? 1 : 0)
+      expect(executeTool).not.toHaveBeenCalled()
+      expect(child.events.some(event => event.type === "tool_call.started" && event.payload !== undefined)).toBe(false)
+      expect(child.events.some(event => event.type === "item.started" && event.payload !== undefined && ["tool_call", "tool_result"].includes(String((event.payload as { type?: unknown })?.type)))).toBe(false)
+    }
+  })
+
+  it("fails closed before replay persistence for redacted history and recovered wait-only evidence", async () => {
+    const cases = [
+      { id: "child-resume:result-item-1", toolCallId: "+353 87 123 4567", toolName: "jobs.search",
+        input: { query: "Dublin" }, output: { jobs: [] } },
+      { id: "child-resume:recovered-wait-result:wait-1", toolCallId: "wait-call", toolName: "wait_subagents",
+        input: { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 },
+        output: { waitId: "wait-1", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-01-01T00:00:00.000Z",
+          matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: null, failureReason: null }] } },
+    ] as const
+    for (const source of cases) {
+      const child = fixture(identity("task", "child-1", 2), undefined, [{ id: source.id, content: {
+        toolCallId: source.toolCallId, toolName: source.toolName, input: source.input, status: "completed", output: source.output, errorCode: null,
+      } }])
+      const executeTool = vi.fn(child.options.executeTool), model = child.options.model
+      child.options = { ...child.options, tools: [{ name: source.toolName, version: "1" }], executeTool, model: { ...model, async *stream(request: HarnessModelRequest) {
+        child.requests.push(request)
+        const use = request.messages.flatMap(message => message.content).find(part => part.type === "tool_use")
+        if (!use || use.type !== "tool_use") throw new Error("historical_alias_missing")
+        yield { type: "tool_call_completed", callId: use.id, name: source.toolName, arguments: source.input }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } } }
+
+      const result = await runTurnExecutionLoop(child.options)
+      expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+      expect(executeTool).not.toHaveBeenCalled()
+      expect(child.events.some(event => event.type === "tool_call.started" && event.payload !== undefined)).toBe(false)
+      expect(child.events.some(event => event.type === "item.started" && event.payload !== undefined
+        && ["tool_call", "tool_result"].includes(String((event.payload as { type?: unknown })?.type)))).toBe(false)
+    }
+  })
+
+  it("uses current-loop persisted handles to authorize exact unsafe replay without a second dispatch", async () => {
+    const rawCallId = "+353 87 123 4567", input = { location: "Dublin" }, child = fixture(identity("task", "child-1"))
+    const executeTool = vi.fn(async ({ call }: Parameters<TurnExecutionOptions["executeTool"]>[0]) => ({
+      id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: { jobs: [] }, errorCode: null,
+    }))
+    const model = child.options.model
+    child.options = { ...child.options, executeTool, model: { ...model, async *stream(request: HarnessModelRequest) {
+      child.requests.push(request)
+      if (child.requests.length === 1) {
+        yield { type: "tool_call_completed", callId: rawCallId, name: "jobs.search", arguments: input }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } else if (child.requests.length === 2) {
+        const use = request.messages.flatMap(message => message.content).find(part => part.type === "tool_use" && part.name === "jobs.search")
+        if (!use || use.type !== "tool_use") throw new Error("persisted_alias_missing")
+        yield { type: "tool_call_completed", callId: use.id, name: "jobs.search", arguments: input }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } else {
+        yield { type: "text_delta", text: "completed after exact replay" }
+        yield { type: "completed", finishReason: "stop" }
+      }
+    } } }
+
+    const result = await runTurnExecutionLoop(child.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 3, toolCallCount: 1, finalText: "completed after exact replay" })
+    expect(executeTool).toHaveBeenCalledOnce()
+    expect(child.events.filter(event => event.type === "tool_call.started" && event.payload !== undefined)).toHaveLength(1)
+    expect(JSON.stringify(child.requests.map(request => request.messages))).not.toContain(rawCallId)
+  })
+
   it("projects a fresh unsafe child call observation on the following model step", async () => {
     const rawCallId = "+353 87 123 4567", input = { location: "Dublin" }
     const child = fixture(identity("task", "child-1")), executeTool = vi.fn(child.options.executeTool), model = child.options.model
@@ -2157,7 +2273,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(child.options.snapshot.toolObservations).toEqual([])
   })
 
-  it("keeps duplicate child-call rejection private after an unsafe ID is aliased on the next step", async () => {
+  it("suppresses an exact replay collision after an unsafe ID is aliased on the next step", async () => {
     const rawCallId = "+353 87 123 4567", input = { location: "Dublin" }
     const child = fixture(identity("task", "child-1")), executeTool = vi.fn(child.options.executeTool), model = child.options.model
     let modelCalls = 0, replayAlias = ""
@@ -2179,7 +2295,7 @@ describe("owner-agnostic turn execution loop", () => {
     const terminalEvents = child.events.filter(event => event.payload !== undefined && (event.type === "task.failed"
       || (event.type === "item.completed" && event.itemId === failedEvent?.itemId)))
     const persistedCalls = child.events.filter(event => event.type === "tool_call.started" && event.payload !== undefined)
-    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress" })
     expect(executeTool).toHaveBeenCalledOnce()
     expect(executeTool.mock.calls[0]?.[0].call.id).toBe(rawCallId)
     expect(replayAlias).not.toBe(rawCallId)

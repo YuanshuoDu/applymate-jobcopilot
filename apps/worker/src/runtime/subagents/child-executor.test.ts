@@ -11,6 +11,7 @@ import { childContextSnapshot, createChildContextBuilder, type ChildMailboxHydra
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { prepareToolResultJson, type CanonicalToolSourceName } from "../tools/tool-result-reference-types.js"
 import type { SubagentLease } from "./types.js"
+import type { ChildToolReplayReceipt } from "../turns/turn-execution-options.js"
 import type { TreeBudgetExecutionLimits, TreeBudgetReservation, TreeBudgetReservationStore } from "./tree-budget-types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import { ToolRegistry } from "../tools/registry.js"
@@ -1163,6 +1164,48 @@ describe("child executor composition", () => {
 
     await expect(executor({ lease: child })).resolves.toMatchObject({ status: "failed", failureReason: "child_resume_evidence_unavailable", retryDisposition: "terminal" })
     expect(modelRuntimeFactory).not.toHaveBeenCalled()
+  })
+
+  it("forwards validated resume receipts so reserved aliases replay without dispatch", async () => {
+    const child = lease(), requests: HarnessModelRequest[] = [], rawCallId = "toolcall-history-1"
+    const input = { query: "Dublin" }, output = { jobs: [{ id: "job-1" }] }
+    const receipt: ChildToolReplayReceipt = {
+      userId: child.userId, sessionId: child.sessionId, turnId: child.turnId!, rootTaskId: child.rootTaskId,
+      taskId: child.id, attempt: 1, stepId: "prior-step", toolCallId: rawCallId, toolName: "jobs.search", input,
+      callItem: { id: "call-item-1", revision: 2 }, resultItem: { id: "result-item-1", revision: 3 },
+      result: { status: "completed", output, errorCode: null },
+    }
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        if (requests.length === 1) {
+          const call = request.messages.flatMap(message => message.content).find(part => part.type === "tool_use")
+          if (!call || call.type !== "tool_use") throw new Error("reserved_alias_missing")
+          yield { type: "tool_call_completed", callId: call.id, name: "jobs.search", arguments: input }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: "resumed safely" }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }
+    const router = vi.fn(async (_context, request) => ({ ...request, status: "completed" as const, output, errorCode: null }))
+    const executor = createChildExecutor({
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => model, toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")], router),
+      resumeLoader: async () => ({
+        resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+        observations: [{ id: `child-resume:${receipt.resultItem.id}`, content: { toolCallId: rawCallId, toolName: "jobs.search", input, status: "completed", output, errorCode: null } }],
+        childToolReplayReceipts: [receipt],
+      }),
+    })
+
+    const result = await executor({ lease: child })
+    expect(result).toMatchObject({ status: "completed", result: { stepCount: 3, toolCallCount: 2, finalText: "resumed safely" } })
+    expect(router).not.toHaveBeenCalled()
+    expect(requests).toHaveLength(2)
+    expect(JSON.stringify(requests[0]?.messages)).not.toContain(rawCallId)
   })
 
   it("returns a terminal disposition for deterministic recovered history conflicts", async () => {
