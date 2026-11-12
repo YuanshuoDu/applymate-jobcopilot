@@ -180,6 +180,10 @@ const foreignSessionId = `root-history-foreign-session-${suffix}`
 const archivedSessionId = `root-history-archived-session-${suffix}`
 const currentTurnId = `root-history-current-turn-${suffix}`, currentRootTaskId = `root-history-current-root-${suffix}`
 const currentStepId = `root-history-current-step-${suffix}`, workerId = `worker-${suffix}`
+const footprintCurrentSessionId = `root-history-footprint-current-session-${suffix}`
+const footprintCurrentTurnId = `root-history-footprint-current-turn-${suffix}`
+const footprintCurrentRootTaskId = `root-history-footprint-current-root-${suffix}`
+const footprintCurrentStepId = `root-history-footprint-current-step-${suffix}`
 const scheduledCurrentTurnId = `root-history-scheduled-current-turn-${suffix}`
 const scheduledCurrentRootTaskId = `root-history-scheduled-current-root-${suffix}`
 const scheduledCurrentStepId = `root-history-scheduled-current-step-${suffix}`
@@ -409,6 +413,29 @@ async function insertCurrentStartBoundary(input: Readonly<{
   } finally { client.release() }
 }
 
+async function insertFootprintCurrentTurn(): Promise<TurnLease> {
+  const leaseExpiresAt = new Date(Date.now() + 5 * 60_000), input = { goal: objective, successCriteria: criteria }
+  await insertSession(footprintCurrentSessionId, userId, FIXTURE_EVENT_SEQUENCE)
+  await pool!.query(`INSERT INTO "agent_turns" ("id","sessionId","userId","status","source","input","modelProfileSnapshot",
+    "toolPolicySnapshot","budgetSnapshot","rootTaskId","leaseOwnerId","leaseExpiresAt","leaseStartedAt","leaseVersion","updatedAt")
+    VALUES ($1,$2,$3,'in_progress','user',$4::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,$5,$6,$7,CURRENT_TIMESTAMP,1,CURRENT_TIMESTAMP)`,
+  [footprintCurrentTurnId, footprintCurrentSessionId, userId, JSON.stringify(input), footprintCurrentRootTaskId, workerId, leaseExpiresAt])
+  await pool!.query(`INSERT INTO "sub_agent_tasks" ("id","sessionId","turnId","rootTaskId","parentTaskId","path","depth","role","taskType","status","goal",
+    "constraints","successCriteria","allowedActions","context","expectedOutputSchema","modelProfileSnapshot","toolPolicySnapshot","budgetSnapshot",
+    "attemptCount","maxAttempts","leaseOwner","leaseExpiresAt","completedAt","updatedAt")
+    VALUES ($1,$2,$3,$1,NULL,'/footprint-current',0,'orchestrator','root','running',$4,'[]'::jsonb,$5::jsonb,'[]'::jsonb,
+      '{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,2,3,$6,$7,NULL,CURRENT_TIMESTAMP)`,
+  [footprintCurrentRootTaskId, footprintCurrentSessionId, footprintCurrentTurnId, objective, JSON.stringify(criteria), workerId, leaseExpiresAt])
+  await pool!.query(`INSERT INTO "agent_steps" ("id","sessionId","turnId","taskId","ordinal","attempt","status","inputThroughSequence","consumedInputIds","modelProfileSnapshot")
+    VALUES ($1,$2,$3,$4,1,1,'streaming',0,'[]'::jsonb,'{}'::jsonb)`,
+  [footprintCurrentStepId, footprintCurrentSessionId, footprintCurrentTurnId, footprintCurrentRootTaskId])
+  await insertCurrentStartBoundary({ userId, sessionId: footprintCurrentSessionId, turnId: footprintCurrentTurnId,
+    rootTaskId: footprintCurrentRootTaskId, eventId: `root-history-footprint-current-start-${suffix}`,
+    goal: objective, sequence: CURRENT_START_SEQUENCE, createdAt: currentStartCreatedAt })
+  return { turnId: footprintCurrentTurnId, sessionId: footprintCurrentSessionId, userId, ownerId: workerId,
+    leaseVersion: 1, leaseStartedAt: new Date(), leaseExpiresAt }
+}
+
 async function insertScheduledCurrentTurn(input: unknown): Promise<TurnLease> {
   const leaseExpiresAt = new Date(Date.now() + 5 * 60_000)
   await pool!.query(`INSERT INTO "agent_turns" ("id","sessionId","userId","status","source","input","modelProfileSnapshot",
@@ -605,7 +632,7 @@ async function projectSources(sources: readonly Source[]): Promise<void> {
   }
 }
 
-async function deleteSourceFixtures(sources: readonly Source[]): Promise<void> {
+async function deleteSourceFixtures(sources: readonly Pick<Source, "sessionId" | "turnId">[]): Promise<void> {
   if (!sources.length) return
   const client = await pool!.connect(), turnIdsBySession = new Map<string, string[]>()
   for (const source of sources) {
@@ -713,28 +740,32 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     [currentStepId, sessionId, currentTurnId, currentRootTaskId])
     await insertCurrentStartBoundary()
     await insertSource(future)
-    await insertSource(searchFootprintFuture)
     await projectSources([...matching, otherSession, crossEqualTimeHigherTurnId, crossWrongOrigin, equalCutoff, future,
       ...crossSessionWrongOriginFillers, searchFootprintWrongObjective,
-      searchFootprintForeignTenant, searchFootprintFuture])
+      searchFootprintForeignTenant])
   })
 
   afterAll(async () => {
     if (pool) {
       await setObjectiveHistoryIndexReady(false).catch(() => undefined)
       await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`,
-        [[sessionId, otherSessionId, scheduledSessionId, foreignSessionId, archivedSessionId]]).catch(() => undefined)
+        [[sessionId, otherSessionId, scheduledSessionId, foreignSessionId, archivedSessionId, footprintCurrentSessionId]]).catch(() => undefined)
       await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [[userId, otherUserId]]).catch(() => undefined)
       await pool.end()
     }
   })
 
   it("projects only bounded prior same-tenant objective Scout criteria through PostgreSQL", async () => {
-    const input: DirectRootTaskHistorySearchFootprintLoadInput = { lease, rootTaskId: currentRootTaskId,
-      rootAttemptCount: 2, stepId: currentStepId, now: new Date(), searchFootprintReadAllowed: true }
+    const currentFixture = { sessionId: footprintCurrentSessionId, turnId: footprintCurrentTurnId }
     try {
       await insertSource(searchFootprintMatch)
       await projectSources([searchFootprintMatch])
+      const footprintLease = await insertFootprintCurrentTurn()
+      // Give the future fixture a real post-boundary XID; timestamps alone do not make it future.
+      await insertSource(searchFootprintFuture)
+      await projectSources([searchFootprintFuture])
+      const input: DirectRootTaskHistorySearchFootprintLoadInput = { lease: footprintLease, rootTaskId: footprintCurrentRootTaskId,
+        rootAttemptCount: 2, stepId: footprintCurrentStepId, now: new Date(), searchFootprintReadAllowed: true }
       const store = createPgDirectRootTaskHistoryStore(pool!)
       const footprint = await store.loadSearchFootprints(input)
       expect(footprint).toEqual({ roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] })
@@ -750,7 +781,11 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
         client.release()
       }
     } finally {
-      await deleteSourceFixtures([searchFootprintMatch])
+      try {
+        await deleteSourceFixtures([searchFootprintMatch, searchFootprintFuture, currentFixture])
+      } finally {
+        await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2`, [footprintCurrentSessionId, userId])
+      }
     }
   }, 60_000)
 
