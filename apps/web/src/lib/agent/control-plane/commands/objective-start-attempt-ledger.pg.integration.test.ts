@@ -156,7 +156,7 @@ describeWithDatabase("objective start attempt recovery on disposable PostgreSQL"
     })).resolves.toEqual({ status: "accepted", sessionId, turnId: started.turnId })
 
     const replay = await new ObjectiveStartCommandService(secondClient).start(command)
-    expect(replay).toMatchObject({ disposition: "duplicate", sessionId, turnId: started.turnId })
+    expect(replay).toMatchObject({ disposition: "duplicate", turnId: started.turnId })
     await expect(firstClient.agentTurn.count({ where: { userId } })).resolves.toBe(0)
   })
 

@@ -56,6 +56,42 @@ describe("objective start attempt ledger", () => {
     expect(objectiveStartRequestHash({ ...command, verificationRequirements: null })).not.toBe(normalized)
   })
 
+  it("hashes JSON-persisted object keys canonically while preserving array order", () => {
+    const ordered = {
+      ...command,
+      content: [
+        { type: "attachment_ref" as const, attachmentId: "resume_1", mediaType: "application/pdf", filename: "cv.pdf" },
+        { type: "text" as const, text: "Context stays byte-for-byte." },
+      ],
+    }
+    const reorderedKeys = {
+      ...command,
+      content: [
+        { filename: "cv.pdf", mediaType: "application/pdf", attachmentId: "resume_1", type: "attachment_ref" as const },
+        { text: "Context stays byte-for-byte.", type: "text" as const },
+      ],
+    }
+    const omittedOptionalFilename = {
+      ...command,
+      content: [
+        { type: "attachment_ref" as const, attachmentId: "resume_1", mediaType: "application/pdf", filename: undefined },
+        ordered.content[1],
+      ],
+    }
+    const withoutFilename = {
+      ...command,
+      content: [
+        { type: "attachment_ref" as const, attachmentId: "resume_1", mediaType: "application/pdf" },
+        ordered.content[1],
+      ],
+    }
+
+    expect(objectiveStartRequestHash(reorderedKeys)).toBe(objectiveStartRequestHash(ordered))
+    expect(objectiveStartRequestHash(omittedOptionalFilename)).toBe(objectiveStartRequestHash(withoutFilename))
+    expect(objectiveStartRequestHash({ ...ordered, content: [...ordered.content].reverse() })).not.toBe(objectiveStartRequestHash(ordered))
+    expect(objectiveStartRequestHash({ ...ordered, content: [ordered.content[0], { type: "text", text: "Changed context" }] })).not.toBe(objectiveStartRequestHash(ordered))
+  })
+
   it("uses one owner-and-key transaction advisory lock", async () => {
     const queryRaw = vi.fn().mockResolvedValue([])
     await lockObjectiveStartAttempt({ $queryRaw: queryRaw } as unknown as CommandTransaction, "user_1", "attempt_1")

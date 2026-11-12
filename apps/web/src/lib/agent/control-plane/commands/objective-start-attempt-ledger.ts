@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 import { Prisma, type PrismaClient } from "@prisma/client"
 import { InputContentPartSchema, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, TurnIntentSchema, validate, type InputContentPart } from "@jobcopilot/agent-protocol"
+import { canonicalJson } from "@jobcopilot/shared"
 
 import { objectiveStartIdempotencyConflict } from "./errors"
 import { stateWithAvailableReceiptTarget } from "./objective-start-attempt-read-model"
@@ -45,8 +46,10 @@ function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
 
+function persistedCanonicalJson(value: unknown): string { return canonicalJson(JSON.parse(JSON.stringify(value) ?? "null")) }
+
 function sameJson(left: unknown, right: unknown): boolean {
-  try { return JSON.stringify(left) === JSON.stringify(right) } catch { return false }
+  try { return persistedCanonicalJson(left) === persistedCanonicalJson(right) } catch { return false }
 }
 
 function validLegacyInputLifecycle(input: LegacyInputLifecycle): boolean {
@@ -68,7 +71,7 @@ export function objectiveStartRequestHash(command: AttemptIdentity): string {
       ? { present: true, value: command.verificationRequirements ?? null }
       : { present: false },
   }
-  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex")
+  return createHash("sha256").update(persistedCanonicalJson(canonical)).digest("hex")
 }
 
 export async function lockObjectiveStartAttempt(tx: CommandTransaction, userId: string, clientMessageId: string): Promise<void> {
