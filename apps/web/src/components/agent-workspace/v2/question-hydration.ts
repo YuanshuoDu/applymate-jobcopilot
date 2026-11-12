@@ -1,4 +1,9 @@
-import { normalizeTimelineEvent } from './timeline-reducer'
+import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
+import { isCanonicalTaskGraphSourceManifestWeb, projectFinalAnswerWithTaskGraphSources } from '@/lib/agent/session/final-task-graph-source-manifest'
+import { normalizeTimelineEvent, normalizeTimelineItem } from './timeline-reducer'
+import { getFinalAnswerDiagnostics } from './timeline-reducer-utils'
+
+const SAFE_FINAL_ITEM_FIELDS = ['schemaVersion', 'id', 'sessionId', 'turnId', 'stepId', 'taskId', 'type', 'status', 'phase', 'revision', 'content', 'startedAt', 'completedAt', 'createdAt', 'updatedAt']
 
 export interface QuestionHydrationPumpOptions {
   sessionId: string
@@ -130,11 +135,23 @@ function questionStubKey(value: unknown, sessionId: string): string | null {
 
 function finalItemHydrationTarget(value: unknown, sessionId: string): FinalItemHydrationTarget | null {
   const event = normalizeTimelineEvent(value)
-  if (!event || event.type !== 'turn.completed' || event.actor !== 'orchestrator' || event.sessionId !== sessionId ||
-    !safeId(event.turnId) || !safeId(event.itemId) || event.sequence === null || !isRecord(event.payload)) return null
-  const payload = event.payload
-  if (!safeId(payload.turnId) || payload.turnId !== event.turnId || !safeId(payload.taskId) || payload.taskId !== event.taskId ||
-    !safeId(payload.finalItemId) || payload.finalItemId !== event.itemId) return null
+  if (!event) return null
+  const diagnostics = getFinalAnswerDiagnostics()
+  const targetSessionMatches = event.sessionId === sessionId
+  const targetTurnMatches = targetSessionMatches && diagnostics?.matchesTarget(event.sessionId, event.turnId) === true
+  const payload = isRecord(event.payload) ? event.payload : null
+  const itemPresent = safeId(event.itemId)
+  const payloadTurnMatches = Boolean(payload && safeId(payload.turnId) && payload.turnId === event.turnId)
+  const payloadTaskMatches = Boolean(payload && safeId(payload.taskId) && payload.taskId === event.taskId)
+  const finalItemMatchesEventItem = Boolean(payload && safeId(payload.finalItemId) && payload.finalItemId === event.itemId)
+  const targetAccepted = event.type === 'turn.completed' && event.actor === 'orchestrator' && targetSessionMatches &&
+    safeId(event.turnId) && itemPresent && event.sequence !== null && payload !== null && payloadTurnMatches &&
+    payloadTaskMatches && finalItemMatchesEventItem
+  if (event.type === 'turn.completed' && targetTurnMatches) diagnostics?.recordFinalItemTarget({
+    targetSessionMatches, targetTurnMatches, actorMatches: event.actor === 'orchestrator', sequencePresent: event.sequence !== null,
+    itemPresent, payloadRecord: payload !== null, payloadTurnMatches, payloadTaskMatches, finalItemMatchesEventItem, targetAccepted,
+  })
+  if (!targetAccepted || !safeId(event.itemId) || !safeId(event.turnId)) return null
   return { itemId: event.itemId, turnId: event.turnId }
 }
 
@@ -158,4 +175,22 @@ function safeId(value: unknown): value is string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+export async function hydrateFinalItemFromResponse(items: unknown[] | undefined, target: FinalItemHydrationTarget, sessionId: string, onProjection?: () => void) {
+  if (!items || items.length !== 1 || !isRecord(items[0]) || items[0].schemaVersion !== AGENT_STREAM_SCHEMA_VERSION || !hasExactKeys(items[0], SAFE_FINAL_ITEM_FIELDS)) return null
+  const item = normalizeTimelineItem(items[0]), content = item?.content
+  if (!item || !safeId(target.itemId) || !safeId(target.turnId) || item.id !== target.itemId || item.sessionId !== sessionId ||
+    item.turnId !== target.turnId || item.type !== 'agent_message' || item.status !== 'completed' || item.phase !== 'final_answer' || !isRecord(content)) return null
+  const projectedContent = projectFinalAnswerWithTaskGraphSources(content)
+  if (!projectedContent) return null
+  onProjection?.()
+  const { taskGraphSources, ...answerContent } = projectedContent
+  const safeContent = taskGraphSources && await isCanonicalTaskGraphSourceManifestWeb(item.id, taskGraphSources)
+    ? { ...answerContent, taskGraphSources } : answerContent
+  return { ...item, content: safeContent }
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).length === keys.length && keys.every(key => Object.prototype.hasOwnProperty.call(value, key))
 }

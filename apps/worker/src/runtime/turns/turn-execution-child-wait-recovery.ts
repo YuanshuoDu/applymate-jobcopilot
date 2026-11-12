@@ -6,6 +6,11 @@ import type { TurnExecutionOptions } from "./turn-execution-options.js"
 type Recovery = ChildWaitClaimRecovery | ChildWaitOrphanRecovery
 type Observation = { readonly id: string; readonly content: ReturnType<typeof toRepositoryJson> }
 
+function claimedWaitObservation(recovery: ChildWaitClaimRecovery): Observation {
+  return { id: `tool-result:${recovery.call.id}`, content: toRepositoryJson({ toolCallId: recovery.call.id,
+    toolName: recovery.call.name, input: recovery.call.arguments, status: "completed", output: recovery.output ?? null, errorCode: null }) }
+}
+
 function assertCurrentOwner(options: TurnExecutionOptions, recovery: Recovery): void {
   const owner = options.identity, expected = recovery.owner
   if (owner.kind !== "task" || owner.taskId !== expected.id || owner.userId !== expected.userId
@@ -29,15 +34,23 @@ async function closeRecoveredStep(options: TurnExecutionOptions, writer: TurnExe
 
 async function finishRecovery(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, recovery: ChildWaitClaimRecovery, now: () => Date): Promise<Observation> {
   assertCurrentOwner(options, recovery)
-  const result = await persistChildWaitClaimRecovery(options, writer, recovery, now)
+  await persistChildWaitClaimRecovery(options, writer, recovery, now)
   await closeRecoveredStep(options, writer, recovery, now)
-  return { id: `tool-result:${result.id}`, content: toRepositoryJson({ toolCallId: result.id, toolName: result.toolName,
-    input: recovery.call.arguments, status: result.status, output: result.output ?? null, errorCode: result.errorCode }) }
+  return claimedWaitObservation(recovery)
 }
 
 export async function recoverChildWaitClaim(
   options: TurnExecutionOptions, writer: TurnExecutionEventWriter, recovery: ChildWaitClaimRecovery, now: () => Date,
 ): Promise<Observation> {
+  if (recovery.stepStatus === "completed") {
+    assertCurrentOwner(options, recovery)
+    if (recovery.callItem.status !== "completed" || recovery.callItem.revision !== 1
+      || recovery.resultItem?.status !== "completed" || recovery.resultItem.revision !== 1
+      || typeof recovery.claimEventId !== "string" || !recovery.claimEventId.trim()) {
+      throw new Error("child_resume_wait_tool_call_conflict")
+    }
+    return claimedWaitObservation(recovery)
+  }
   return finishRecovery(options, writer, recovery, now)
 }
 

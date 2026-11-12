@@ -3,6 +3,7 @@ import { Prisma, type Job } from "@prisma/client";
 import { APPLYMATE_BACKING, loadUserAiConfig, resolveConfig } from "@/lib/model-router";
 import { db } from "@/lib/db";
 import { runAgentPipeline } from "@/lib/agent/run-service";
+import { isScheduledTaskGraphPostGateAction, runScheduledTaskGraphPostGateTask } from "@/lib/agent/scheduled-taskgraph-post-gate-task";
 import { isScheduledPrepareChoiceWaitId, validateScheduledPrepareWaitIdentity } from "@/lib/agent/scheduled-taskgraph-run-service";
 import type { ScheduledTaskGraphAuditExecuteRpcRequest } from "@/lib/agent/scheduled-taskgraph-gate-rpc";
 import { runScheduledTaskGraphActionRpc } from "@/lib/agent/scheduled-taskgraph-gate-runtime-rpc";
@@ -40,6 +41,8 @@ async function canonicalQuestionItemMissing(owner: ScheduledTaskGraphRequestOwne
 export async function POST(request: Request): Promise<Response> {
   const secret = process.env.AGENT_WORKER_SECRET;
   if (!secret || request.headers.get("x-agent-worker-secret") !== secret) return blocked(401, "scheduled_pipeline_unauthorized");
+  const rawBody = await request.clone().json().catch(() => null);
+  if (isScheduledTaskGraphPostGateAction(rawBody)) return runScheduledTaskGraphPostGateTask(rawBody, request.signal);
   const parsed = await parseScheduledTaskGraphPipelineRequest(request);
   if (!parsed) return blocked(400, "scheduled_pipeline_request_invalid");
   let body: ScheduledTaskGraphPipelineBody;

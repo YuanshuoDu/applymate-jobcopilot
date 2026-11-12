@@ -25,6 +25,7 @@ export type ChildToolCallIdProjection = {
   readonly aliasToCanonical: ReadonlyMap<string, string>
   readonly aliasToReceipt: ReadonlyMap<string, ChildToolReplayReceipt | ChildWaitReplayReceipt>
   readonly aliasWithoutReceipt: ReadonlySet<string>
+  readonly canonicalWithoutReceipt: ReadonlySet<string>
 }
 
 export function projectChildToolCallIdsForModelContext(
@@ -62,11 +63,12 @@ export function projectChildToolCallIdsForModelContext(
     observations.push({ index, id, content, historical, ...(matches[0] ? { receipt: matches[0] } : {}) })
   }
 
-  if (observations.length === 0) return { snapshot, aliasToCanonical: new Map(), aliasToReceipt: new Map(), aliasWithoutReceipt: new Set() }
+  if (observations.length === 0) return { snapshot, aliasToCanonical: new Map(), aliasToReceipt: new Map(), aliasWithoutReceipt: new Set(), canonicalWithoutReceipt: new Set() }
 
   const aliases = new Map<string, string>()
   const aliasToReceipt = new Map<string, ChildToolReplayReceipt | ChildWaitReplayReceipt>()
   const aliasWithoutReceipt = new Set<string>()
+  const canonicalWithoutReceipt = new Set<string>()
   const canonicalToAlias = new Map<string, string>()
   const usedAliases = new Set<string>()
   const maxCandidates = originalIds.size * 2 + 1
@@ -83,7 +85,7 @@ export function projectChildToolCallIdsForModelContext(
     if (!alias) projectionError("child_tool_call_projection_collision_limit")
     aliases.set(alias, observation.id)
     if (observation.receipt) aliasToReceipt.set(alias, observation.receipt)
-    else if (observation.historical) aliasWithoutReceipt.add(alias)
+    else { aliasWithoutReceipt.add(alias); canonicalWithoutReceipt.add(observation.id) }
     canonicalToAlias.set(observation.id, alias)
     usedAliases.add(alias)
   }
@@ -98,7 +100,7 @@ export function projectChildToolCallIdsForModelContext(
       content: { ...content, toolCallId: alias },
     } : observation
   })
-  return { snapshot: { ...snapshot, toolObservations }, aliasToCanonical: aliases, aliasToReceipt, aliasWithoutReceipt }
+  return { snapshot: { ...snapshot, toolObservations }, aliasToCanonical: aliases, aliasToReceipt, aliasWithoutReceipt, canonicalWithoutReceipt }
 }
 
 export function normalizeProjectedToolCallIds<TCall extends { readonly id: string }>(
@@ -110,6 +112,7 @@ export function normalizeProjectedToolCallIds<TCall extends { readonly id: strin
     if (typeof call.id !== "string" || call.id.length < 1 || call.id.length > 256 || !call.id.trim()) {
       projectionError("child_tool_call_projection_invalid_model_id")
     }
+    if (projection.canonicalWithoutReceipt.has(call.id)) projectionError("child_tool_call_projection_receipt_invalid")
     const canonicalId = projection.aliasToCanonical.get(call.id)
     if (canonicalId === undefined && isReservedPrefix(call.id)) {
       projectionError("child_tool_call_projection_unknown_alias")

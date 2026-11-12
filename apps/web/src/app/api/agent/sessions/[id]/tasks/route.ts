@@ -16,7 +16,8 @@ import {
 import { taskDto, type TaskQueryRow } from "../../query-dto"
 import { projectInteractiveDiscoveryShortlist } from "./interactive-discovery-shortlist"
 
-const MAX_REFERENCED_TASK_IDS = 9
+const MAX_TASK_GRAPH_NODES = 11
+const MAX_REFERENCED_TASK_IDS = MAX_TASK_GRAPH_NODES + 1
 const MAX_TASK_ID_LENGTH = 128
 const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
 
@@ -95,7 +96,7 @@ function sameIds(left: readonly string[], right: readonly string[]): boolean {
 
 function persistedGraphTaskIds(graph: PersistedTaskGraph): string[] | null {
   const snapshot = parseTaskGraphSnapshot(graph.content)
-  if (!snapshot || snapshot.nodes.length === 0 || !graph.taskId || !graph.turnId
+  if (!snapshot || snapshot.nodes.length === 0 || snapshot.nodes.length > MAX_TASK_GRAPH_NODES || !graph.taskId || !graph.turnId
     || graph.id.length < 1 || graph.id.length > MAX_TASK_ID_LENGTH || graph.id.trim() !== graph.id
     || graph.turnId.length > MAX_TASK_ID_LENGTH || graph.turnId.trim() !== graph.turnId
     || graph.taskId.length > MAX_TASK_ID_LENGTH || graph.taskId.trim() !== graph.taskId) return null

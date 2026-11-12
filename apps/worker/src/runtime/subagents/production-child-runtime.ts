@@ -1,7 +1,6 @@
 import type pg from "pg"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
-
 import { createWorkerUsageAuthorizer } from "../../queue/ai-usage-bridge.js"
 import type { SubagentExecutor } from "../../queue/subagent-queue.js"
 import { createWorkerToolRuntime } from "../tools/index.js"
@@ -14,9 +13,8 @@ import { durableLifecycleSink } from "../canonical-turn-runtime.js"
 import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import { createChildExecutor, type ChildExecutorOptions, type ChildToolRuntime } from "./child-executor.js"
-import { loadChildSameAttemptContinuation } from "./child-mailbox-continuation.js"
-import { loadChildAttemptResume } from "./child-resume.js"
-import { commitDurableSubagentWaitResume, loadDurableSubagentWaitResume } from "./durable-subagent-wait-resume.js"
+import { commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.js"
+import { createProductionChildResumeLoaders } from "./production-child-resume-loaders.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
 import { assertPersistedWriterReviewDependency, createTaskGraphWriterReviewFeedbackFrame, TaskGraphWriterReviewFeedbackError, writerReviewDependencyFromTaskContext, type TaskGraphWriterReviewDependency, type TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
@@ -34,9 +32,9 @@ import { createPrivateSelectedJobToolExecutor, registerProductionChildWaitTool }
 import { createScheduledGateChildExecutor, isScheduledGateTask } from "./scheduled-gate-child-runtime.js"
 import { SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { createScheduledAuditChildExecutor, isScheduledAuditCandidate } from "./scheduled-audit-child-runtime.js"
+import { createScheduledPostGateChildExecutor, isScheduledPostGateCandidate } from "./scheduled-post-gate-child-runtime.js"
 import { createEmptyAnalystCandidateAuthorizer } from "./task-graph-empty-analyst-candidate.js"
 export { createProductionChildPolicy } from "./production-child-policy.js"
-
 export type ProductionChildRuntimeOptions = {
   readonly pool: pg.Pool
   readonly authorizeUsage?: ChildExecutorOptions["authorizeUsage"]
@@ -48,6 +46,7 @@ export type ProductionChildRuntimeOptions = {
   readonly resumeLoader?: ChildExecutorOptions["resumeLoader"]
   readonly sameAttemptContinuationLoader?: ChildExecutorOptions["sameAttemptContinuationLoader"]
   readonly jobDiscoveryClient?: JobDiscoveryClient
+  readonly applicationFillStageObserver?: Parameters<typeof import("./application-fill-for-review.js").executeApplicationFillForReview>[0]["stageObserver"]
 }
 
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
@@ -189,30 +188,17 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     validateArguments: (name, input, version) => runtime.registry.validateArguments(name, input, version),
   }
 }
-
 export function childExecutionEnabled(value = process.env.ENABLE_AGENT_CHILD_EXECUTION): boolean { return value === "1" }
 function defaultMailboxReader(pool: pg.Pool): ChildExecutorOptions["mailboxReader"] | undefined {
   const candidate = pool as unknown as { readonly connect?: unknown; readonly query?: unknown }
   if (typeof candidate.connect !== "function" || typeof candidate.query !== "function") return undefined
   return new PgCoordinationStore(pool)
 }
-function defaultResumeLoader(pool: pg.Pool): ChildExecutorOptions["resumeLoader"] | undefined {
-  const candidate = pool as unknown as { readonly connect?: unknown }
-  if (typeof candidate.connect !== "function") return undefined
-  return async lease => {
-    const wait = await loadDurableSubagentWaitResume(pool, lease)
-    return loadChildAttemptResume(pool, lease, new Date(), wait)
-  }
-}
-function defaultSameAttemptContinuationLoader(pool: pg.Pool): ChildExecutorOptions["sameAttemptContinuationLoader"] | undefined {
-  const candidate = pool as unknown as { readonly connect?: unknown }
-  if (typeof candidate.connect !== "function") return undefined
-  return lease => loadChildSameAttemptContinuation(pool, lease)
-}
 /** Build the production child seam only when the explicit feature flag is on. */
 export function createProductionChildExecutor(options: ProductionChildRuntimeOptions): SubagentExecutor {
-  let genericExecutor: SubagentExecutor | undefined, gateExecutor: SubagentExecutor | undefined
+  let genericExecutor: SubagentExecutor | undefined, gateExecutor: SubagentExecutor | undefined, postGateExecutor: SubagentExecutor | undefined
   return async ({ lease, continuation }) => {
+    if (isScheduledPostGateCandidate(lease)) { postGateExecutor ??= createScheduledPostGateChildExecutor({ pool: options.pool }); return postGateExecutor({ lease, ...(continuation ? { continuation } : {}) }) }
     if (isScheduledAuditCandidate(lease)) return createScheduledAuditChildExecutor({ pool: options.pool })({ lease, ...(continuation ? { continuation } : {}) })
     if (lease.taskType === SCHEDULED_GATE_TASK_TYPE) {
       if (!isScheduledGateTask(lease)) return { status: "failed", failureReason: "scheduled_gate_role_task_type_mismatch", retryDisposition: "terminal" }
@@ -222,12 +208,13 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
     if (lease.role === "application_filler" || lease.taskType === "application_fill_for_review") {
       if (lease.role !== "application_filler" || lease.taskType !== "application_fill_for_review") return { status: "failed", failureReason: "application_fill_role_task_type_mismatch", retryDisposition: "terminal" }
       if (continuation) return { status: "failed", failureReason: "application_fill_continuation_unsupported", retryDisposition: "terminal" }
-      return (await import("./application-fill-for-review.js")).executeApplicationFillForReview({ pool: options.pool, lease })
+      return (await import("./application-fill-for-review.js")).executeApplicationFillForReview({ pool: options.pool, lease, ...(options.applicationFillStageObserver ? { stageObserver: options.applicationFillStageObserver } : {}) })
     }
     if (!genericExecutor) {
       const engineStore = options.turnStore ?? createPgTurnEngineStore(options.pool)
       const treeBudget = options.treeBudget ?? createPgTreeBudgetReservationStore(options.pool)
       const authorizeUsage = options.authorizeUsage ?? createWorkerUsageAuthorizer()
+      const resumeLoaders = createProductionChildResumeLoaders(options.pool)
       genericExecutor = createChildExecutor({
         store: bindStore(engineStore), treeBudget, authorizeUsage,
         authorizeEmptyAnalystCandidate: createEmptyAnalystCandidateAuthorizer(options.pool),
@@ -235,11 +222,11 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
         toolRuntimeFactory: options.toolRuntimeFactory ?? (({ task, lease: childLease, owner }) => defaultTools(options.pool, engineStore, task, childLease, owner, options.jobDiscoveryClient, {
           authorizeUsage, treeBudget, modelRuntimeFactory: options.modelRuntimeFactory,
         })),
-        mailboxReader: options.mailboxReader ?? defaultMailboxReader(options.pool), resumeLoader: options.resumeLoader ?? defaultResumeLoader(options.pool),
+        mailboxReader: options.mailboxReader ?? defaultMailboxReader(options.pool), resumeLoader: options.resumeLoader ?? resumeLoaders.resumeLoader,
         durableWaitResumeCommitter: (lease, wait, nextStepOrdinal) => commitDurableSubagentWaitResume(options.pool, lease, {
           waitId: wait.waitId, stepId: wait.stepId, nextStepOrdinal,
         }),
-        sameAttemptContinuationLoader: options.sameAttemptContinuationLoader ?? defaultSameAttemptContinuationLoader(options.pool),
+        sameAttemptContinuationLoader: options.sameAttemptContinuationLoader ?? resumeLoaders.sameAttemptContinuationLoader,
       })
     }
     return genericExecutor({ lease, ...(continuation ? { continuation } : {}) })

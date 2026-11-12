@@ -22,6 +22,8 @@ import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snaps
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
 import type { PolicyEvaluationContext } from "@jobcopilot/agent-policy"
 import { SCHEDULED_AUDIT_OUTPUT_SCHEMA, SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE } from "./scheduled-audit-contract.js"
+import { SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_AUDIT_ROLE, SCHEDULED_POST_GATE_AUDIT_TASK_TYPE,
+  SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_EXECUTE_ROLE, SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE } from "./scheduled-post-gate-contract.js"
 
 const artifactStoreMock = vi.hoisted(() => ({ current: null as unknown, sourceDigestReader: null as unknown }))
 const applicationFillExecutorMock = vi.hoisted(() => ({
@@ -31,6 +33,7 @@ const applicationFillExecutorMock = vi.hoisted(() => ({
 }))
 const scheduledGateRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
 const scheduledAuditRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
+const scheduledPostGateRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
 const selectedJobSourceCanary = "APPLYMATE_TRANSIENT_SELECTED_JOB_CANARY"
 vi.mock("./application-fill-for-review.js", () => ({ executeApplicationFillForReview: applicationFillExecutorMock.execute }))
 vi.mock("./scheduled-gate-child-runtime.js", async importOriginal => ({
@@ -40,6 +43,10 @@ vi.mock("./scheduled-gate-child-runtime.js", async importOriginal => ({
 vi.mock("./scheduled-audit-child-runtime.js", async importOriginal => ({
   ...await importOriginal<typeof import("./scheduled-audit-child-runtime.js")>(),
   createScheduledAuditChildExecutor: scheduledAuditRuntimeMock.factory,
+}))
+vi.mock("./scheduled-post-gate-child-runtime.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./scheduled-post-gate-child-runtime.js")>(),
+  createScheduledPostGateChildExecutor: scheduledPostGateRuntimeMock.factory,
 }))
 vi.mock("../tools/artifact-tools.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../tools/artifact-tools.js")>()
@@ -864,6 +871,30 @@ describe("production child runtime", () => {
     expect(modelFactory).not.toHaveBeenCalled()
   })
 
+  it("dispatches both Post-Gate child types before generic tool or model setup", async () => {
+    const executeChild = { ...lease(), id: "execute-child", role: SCHEDULED_POST_GATE_EXECUTE_ROLE,
+      taskType: SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE, allowedActions: [], expectedOutputSchema: SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA } satisfies SubagentLease
+    const auditChild = { ...lease(), id: "post-gate-audit", role: SCHEDULED_POST_GATE_AUDIT_ROLE,
+      taskType: SCHEDULED_POST_GATE_AUDIT_TASK_TYPE, allowedActions: [], expectedOutputSchema: SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA } satisfies SubagentLease
+    const fixed = vi.fn(async ({ lease: child }: { lease: SubagentLease }) => ({ status: "completed" as const, result: { taskId: child.id } }))
+    scheduledPostGateRuntimeMock.factory.mockReturnValue(fixed)
+    const modelFactory = vi.fn(async () => { throw new Error("Post-Gate tasks must not construct a model") })
+    const toolFactory = vi.fn(async () => { throw new Error("Post-Gate tasks must not construct tools") })
+    const pool = { connect: vi.fn(), query: vi.fn() }, executor = createProductionChildExecutor({
+      pool: pool as never, modelRuntimeFactory: modelFactory, toolRuntimeFactory: toolFactory as never,
+    })
+
+    await expect(executor({ lease: executeChild })).resolves.toEqual({ status: "completed", result: { taskId: executeChild.id } })
+    await expect(executor({ lease: auditChild })).resolves.toEqual({ status: "completed", result: { taskId: auditChild.id } })
+    expect(scheduledPostGateRuntimeMock.factory).toHaveBeenCalledOnce()
+    expect(scheduledPostGateRuntimeMock.factory).toHaveBeenCalledWith({ pool })
+    expect(fixed).toHaveBeenNthCalledWith(1, { lease: executeChild })
+    expect(fixed).toHaveBeenNthCalledWith(2, { lease: auditChild })
+    expect(modelFactory).not.toHaveBeenCalled()
+    expect(toolFactory).not.toHaveBeenCalled()
+    expect(pool.connect).not.toHaveBeenCalled()
+  })
+
   it("dispatches the exact application filler directly without constructing model or tool runtimes", async () => {
     applicationFillExecutorMock.execute.mockClear()
     const pool = { connect: vi.fn(), query: vi.fn() }
@@ -884,6 +915,19 @@ describe("production child runtime", () => {
     expect(toolFactory).not.toHaveBeenCalled()
     expect(pool.connect).not.toHaveBeenCalled()
     expect(pool.query).not.toHaveBeenCalled()
+  })
+
+  it("forwards an explicitly supplied application-fill stage observer", async () => {
+    applicationFillExecutorMock.execute.mockClear()
+    const pool = { connect: vi.fn(), query: vi.fn() }
+    const stageObserver = vi.fn()
+    const executor = createOptionalProductionChildExecutor({ enabled: true, pool: pool as never, applicationFillStageObserver: stageObserver })
+    if (!executor) throw new Error("production child executor was not created")
+    const child = { ...lease(), role: "application_filler", taskType: "application_fill_for_review", allowedActions: [] } satisfies SubagentLease
+
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed" })
+    expect(applicationFillExecutorMock.execute).toHaveBeenCalledWith({ pool, lease: child, stageObserver })
+    expect(pool.connect).not.toHaveBeenCalled()
   })
 
   it("rejects mailbox continuation for an application filler without invoking its completed browser flow", async () => {
@@ -1008,11 +1052,18 @@ describe("production child runtime", () => {
   it("uses the server-owned default resume loader for a recovered attempt", async () => {
     const child = { ...lease(), attemptCount: 2, leaseExpiresAt: new Date("2099-09-14T12:00:00.000Z") }
     const client = {
-      query: vi.fn(async (sql: string) => {
+      query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
         if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
-        if (sql.includes('SELECT task."id"')) return {
-          rows: [{ id: child.id, userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, status: "running", leaseOwner: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: child.leaseExpiresAt, interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1,
-        }
+        if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return values[0] === child.sessionId && values[1] === child.userId
+          ? { rows: [{ id: child.sessionId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT task."id"')) return values[0] === child.id && values[1] === child.sessionId && values[2] === child.turnId
+          && values[3] === child.rootTaskId && values[4] === child.userId ? {
+          rows: [{ id: child.id, userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, parentTaskId: child.parentTaskId, status: "running", leaseOwner: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: child.leaseExpiresAt, interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1,
+        } : { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"')) return { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT "id" FROM "sub_agent_tasks"') && sql.includes("FOR UPDATE")) return values[0] === child.id && values[1] === child.sessionId
+          && values[2] === child.turnId && values[3] === child.rootTaskId && values[4] === child.ownerId && values[5] === child.attemptCount
+          ? { rows: [{ id: child.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
         if (sql.includes('FROM "agent_steps"')) return { rows: [], rowCount: 0 }
         throw new Error(`unexpected resume query: ${sql}`)
       }),
@@ -1041,8 +1092,18 @@ describe("production child runtime", () => {
     })
     if (!executor) throw new Error("child executor was not created")
     await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed" })
-    expect(poolWithConnect.connect).toHaveBeenCalledTimes(2)
+    expect(poolWithConnect.connect).toHaveBeenCalledTimes(3)
     expect(client.query.mock.calls.map(([sql]) => sql)).toContain("SELECT set_config($1, $2, true)")
+    const queries = client.query.mock.calls.map(([sql]) => sql)
+    const sessionLock = queries.findIndex(sql => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
+    const taskLock = queries.findIndex(sql => sql.includes('SELECT task."id"') && sql.includes('task."parentTaskId"'))
+    const consumedWaitScan = queries.findIndex(sql => sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"'))
+    expect(sessionLock).toBeGreaterThan(-1)
+    expect(taskLock).toBeGreaterThan(sessionLock)
+    expect(consumedWaitScan).toBeGreaterThan(taskLock)
+    expect(client.query.mock.calls[sessionLock]?.[1]).toEqual([child.sessionId, child.userId])
+    expect(client.query.mock.calls[taskLock]?.[1]).toEqual([child.id, child.sessionId, child.turnId, child.rootTaskId, child.userId])
+    expect(client.query.mock.calls[consumedWaitScan]?.[1]).toEqual([child.id, 257])
   })
 
   it("uses the server-owned same-attempt loader and forwards mailbox continuation in production", async () => {
@@ -1064,11 +1125,19 @@ describe("production child runtime", () => {
       query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
         queries.push({ sql, values })
         if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
-        if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR SHARE")) return { rows: [{ id: child.sessionId }], rowCount: 1 }
+        if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return values[0] === child.sessionId && values[1] === child.userId
+          ? { rows: [{ id: child.sessionId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR SHARE")) return values[0] === child.sessionId && values[1] === child.userId
+          ? { rows: [{ id: child.sessionId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"')) return { rows: [], rowCount: 0 }
         if (sql.includes('FROM "agent_wait_conditions" AS wait')) return { rows: [], rowCount: 0 }
-        if (sql.includes('SELECT task."id"')) return { rows: [{ id: child.id, userId: child.userId, sessionId: child.sessionId, turnId: child.turnId,
-          rootTaskId: child.rootTaskId, status: "running", leaseOwner: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: refreshedExpiry,
-          interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1 }
+        if (sql.includes('SELECT task."id"')) return values[0] === child.id && values[1] === child.sessionId && values[2] === child.turnId
+          && values[3] === child.rootTaskId && values[4] === child.userId ? { rows: [{ id: child.id, userId: child.userId, sessionId: child.sessionId, turnId: child.turnId,
+            rootTaskId: child.rootTaskId, parentTaskId: child.parentTaskId, status: "running", leaseOwner: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: refreshedExpiry,
+            interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT "id" FROM "sub_agent_tasks"') && sql.includes("FOR UPDATE")) return values[0] === child.id && values[1] === child.sessionId
+          && values[2] === child.turnId && values[3] === child.rootTaskId && values[4] === child.ownerId && values[5] === child.attemptCount
+          ? { rows: [{ id: child.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
         if (sql.includes('FROM "agent_steps" AS step')) return { rows: sql.includes('step."attempt" = $6') ? [currentStep] : [], rowCount: sql.includes('step."attempt" = $6') ? 1 : 0 }
         if (sql.includes('FROM "agent_items" AS item')) return { rows: sql.includes('step."attempt" = $6') ? [completedCall, completedResult, finalItem] : [], rowCount: sql.includes('step."attempt" = $6') ? 3 : 0 }
         throw new Error(`unexpected same-attempt continuation query: ${sql}`)
@@ -1100,8 +1169,17 @@ describe("production child runtime", () => {
     if (!executor) throw new Error("child executor was not created")
     const continued = await executor({ lease: child, continuation: { kind: "mailbox_input_pending", missingMessageIds: [mailbox.id], observedMessageIds: [] } })
     if (continued.status !== "completed") throw new Error(`same-attempt continuation outcome: ${JSON.stringify(continued)}`)
-    expect(poolConnect).toHaveBeenCalledOnce()
+    expect(poolConnect).toHaveBeenCalledTimes(2)
     expect(queries.some(query => query.sql.includes("FOR SHARE"))).toBe(true)
+    const sessionLock = queries.findIndex(query => query.sql.includes('FROM "agent_sessions"') && query.sql.includes("FOR UPDATE"))
+    const taskLock = queries.findIndex(query => query.sql.includes('SELECT task."id"') && query.sql.includes('task."parentTaskId"'))
+    const consumedWaitScan = queries.findIndex(query => query.sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"'))
+    expect(sessionLock).toBeGreaterThan(-1)
+    expect(taskLock).toBeGreaterThan(sessionLock)
+    expect(consumedWaitScan).toBeGreaterThan(taskLock)
+    expect(queries[sessionLock]?.values).toEqual([child.sessionId, child.userId])
+    expect(queries[taskLock]?.values).toEqual([child.id, child.sessionId, child.turnId, child.rootTaskId, child.userId])
+    expect(queries[consumedWaitScan]?.values).toEqual([child.id, 257])
     expect(queries.find(query => query.sql.includes('FROM "agent_steps" AS step') && query.sql.includes('step."attempt" = $6'))?.values)
       .toEqual([child.id, child.sessionId, child.turnId, child.userId, child.rootTaskId, child.attemptCount])
     expect(ordinals).toEqual([1])

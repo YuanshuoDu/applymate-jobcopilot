@@ -26,7 +26,7 @@ import { appendCanonicalRootTaskHistory, appendCanonicalRootTaskHistoryOutcomes,
 import { withRootTaskHistorySessionAuthorization } from "./context/root-task-history-session-memory.js"
 import { withRootTaskHistoryObjectiveSnapshot } from "./context/root-task-history-objective-snapshot.js"
 import { readRootTaskHistorySteerEvidence } from "./context/root-task-history-steer-evidence.js"
-import { readRootTaskHistoryFence } from "./context/root-task-history-fence.js"
+import { readRootTaskHistoryFence, rootTaskHistoryObjectiveDigest } from "./context/root-task-history-fence.js"
 import { canonicalJson } from "./context/context-snapshot-json.js"
 import { loadOrCreateDiscoveryPersonaSnapshot } from "./context/discovery-persona-facts-pg.js"
 import { discoveryPersonaContextBlocks } from "./context/discovery-persona-context-blocks.js"
@@ -166,6 +166,8 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
     ? input.rootTaskHistoryDirectReader ?? createPgDirectRootTaskHistoryStore(input.pool)
     : undefined
   return {
+    objectiveProgressGoalRevision: () => input.rootTaskObjective
+      ? rootTaskHistoryObjectiveDigest(input.turnInput, { goal: input.rootTaskObjective.goal, successCriteria: input.rootTaskObjective.successCriteria }) : undefined,
     build: async request => {
       let snapshot: StepContextSnapshot = request.snapshot
       if (input.selectedJobMode) {

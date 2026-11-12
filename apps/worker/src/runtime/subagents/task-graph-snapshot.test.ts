@@ -67,6 +67,18 @@ function storedNode(key: string, dependsOn: string[] = []) {
   }
 }
 
+function scheduledPostGateNodes(executePackageRefs: readonly string[] = ["job-1", "job-2"]) {
+  const scouts = [storedNode("scout-1"), storedNode("scout-2")]
+  const analyst = { ...storedNode("analyst", scouts.map(node => node.key)), templateId: "analyst", depth: 2 }
+  const prepare = { ...storedNode("prepare", ["analyst"]), templateId: "prepare", depth: 3, verificationDisposition: "specialized" }
+  const gate = { ...storedNode("gate", ["prepare"]), templateId: "gate", depth: 4, verificationDisposition: "specialized" }
+  const execute = { ...storedNode("execute-1", ["gate"]), templateId: "scheduled.application.execute", packageRefs: [...executePackageRefs],
+    depth: 5, verificationDisposition: "specialized" }
+  const audit = { ...storedNode("scheduled.post_gate_audit", ["execute-1"]), templateId: "scheduled.post_gate_audit", depth: 6,
+    verificationDisposition: "specialized" }
+  return [...scouts, analyst, prepare, gate, execute, audit]
+}
+
 const analystVerification = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
   role: "analyst",
@@ -194,6 +206,52 @@ describe("parseTaskGraphSnapshot", () => {
       [], ...Array.from({ length: 7 }, (_, index) => [`historical-${index + 1}`]),
     ])
     expect(current.nodes.every(node => node.status === "completed" && node.verificationDisposition === "typed")).toBe(true)
+  })
+
+  it("round-trips a persisted scheduled graph with eleven nodes while rejecting a twelfth", () => {
+    const scouts = Array.from({ length: 4 }, (_, index) => storedNode(`scout-${index + 1}`))
+    const analyst = { ...storedNode("analyst", scouts.map(node => node.key)), templateId: "analyst", depth: 2 }
+    const prepare = { ...storedNode("prepare", ["analyst"]), templateId: "prepare", depth: 3, verificationDisposition: "specialized" }
+    const gate = { ...storedNode("gate", ["prepare"]), templateId: "gate", depth: 4, verificationDisposition: "specialized" }
+    const executes = Array.from({ length: 3 }, (_, index) => ({ ...storedNode(`execute-${index + 1}`, ["gate"]),
+      templateId: "scheduled.application.execute", packageRefs: [`job-${index + 1}`], depth: 5, verificationDisposition: "specialized" }))
+    const audit = { ...storedNode("scheduled.post_gate_audit", executes.map(node => node.key)), templateId: "scheduled.post_gate_audit",
+      depth: 6, verificationDisposition: "specialized" }
+    const nodes = [...scouts, analyst, prepare, gate, ...executes, audit]
+    const parsed = parseTaskGraphSnapshot(snapshotWithNodes(nodes))
+    const current = taskGraphState(parsed, 11, new Map(parsed.nodes.map(node => [node.taskId, {
+      status: "completed" as const, failureReason: null,
+    }])), [])
+    expect(parsed.nodes).toHaveLength(TASK_GRAPH_LIMITS.maxPersistedNodes)
+    expect(parseTaskGraphSnapshot(canonicalTaskGraphJson(parsed))).toEqual(parsed)
+    expect(current.nodes).toHaveLength(TASK_GRAPH_LIMITS.maxPersistedNodes)
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes([...nodes, storedNode("scheduled-overflow")]))).toThrow("task_graph_snapshot_invalid")
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes(Array.from({ length: TASK_GRAPH_LIMITS.maxNodes + 1 }, (_, index) => storedNode(`generic-${index}`)))))
+      .toThrow("task_graph_snapshot_capacity_invalid")
+  })
+
+  it("preserves typed packageRefs only on specialized scheduled Execute nodes", () => {
+    const nodes = scheduledPostGateNodes()
+    const executeNode = nodes[5]!
+    const parsed = parseTaskGraphSnapshot(snapshotWithNodes(nodes))
+    const statuses = new Map(nodes.map(node => [node.taskId, { status: "completed" as const, failureReason: null }]))
+    const taskIds = new Map(nodes.map(node => [node.key, node.taskId]))
+    const state = taskGraphState(parsed, 1, statuses, [])
+    const written = taskGraphSnapshot(state, taskIds)
+    expect(parsed.nodes[5]?.packageRefs).toEqual(["job-1", "job-2"])
+    expect(written.nodes[5]?.packageRefs).toEqual(["job-1", "job-2"])
+    for (const invalid of [
+      { ...executeNode, templateId: "scout" },
+      { ...executeNode, packageRefs: ["job-1", "job-1"] },
+      { ...executeNode, packageRefs: [" job-1"] },
+      { ...executeNode, verificationDisposition: "legacy_unverified" },
+      { ...executeNode, packageRefs: undefined },
+    ]) {
+      expect(() => parseTaskGraphSnapshot(snapshotWithNodes([...nodes.slice(0, 5), invalid, nodes[6]]))).toThrow()
+    }
+    const missingRefs = { ...executeNode }
+    Reflect.deleteProperty(missingRefs, "packageRefs")
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes([...nodes.slice(0, 5), missingRefs, nodes[6]]))).toThrow()
   })
 
   it("strictly round-trips a registered Scout envelope while keeping undeclared legacy snapshots compatible", () => {
@@ -422,8 +480,8 @@ describe("parseTaskGraphSnapshot", () => {
     const oversizedCriteria = Array.from({ length: 9 }, () => "criterion")
     const oversizedDependencies = Array.from({ length: 9 }, (_, index) => `node-${index}`)
 
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes(oversizedNodes))).toThrow("task_graph_snapshot_capacity_invalid")
     for (const snapshot of [
-      snapshotWithNodes(oversizedNodes),
       snapshotWithNodes([{ ...base, key: "k".repeat(129) }]),
       snapshotWithNodes([{ ...base, templateId: "t".repeat(129) }]),
       snapshotWithNodes([{ ...base, taskId: "t".repeat(129) }]),

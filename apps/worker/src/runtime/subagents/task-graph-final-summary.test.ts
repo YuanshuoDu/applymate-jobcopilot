@@ -274,6 +274,13 @@ describe("TaskGraph final-summary reducer", () => {
     ] })).toThrow("task_graph_final_summary_task_identity_conflict")
   })
 
+  it("reduces persisted summaries with eleven graph members and rejects a twelfth", () => {
+    const nodes = Array.from({ length: 11 }, (_, index) => node(`task-${index}`, "executor", "completed"))
+    expect(reduceTaskGraphFinalSummary({ graphRevision: 1, nodes }).taskOutcomes).toHaveLength(11)
+    expect(() => reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [...nodes, node("task-overflow", "executor", "completed")] }))
+      .toThrow("task_graph_final_summary_envelope_invalid")
+  })
+
   it("rejects unsafe provenance and result identifiers without asserting zero", () => {
     expect(() => reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [node("task/unsafe", "scout", "completed", scoutResult(["job-1"]))] }))
       .toThrow("task_graph_final_summary_node_invalid")

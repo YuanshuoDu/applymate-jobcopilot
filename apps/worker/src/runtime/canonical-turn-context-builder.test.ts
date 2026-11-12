@@ -35,7 +35,7 @@ import type { DirectRootTaskHistoryLoadInput } from "./context/root-task-history
 import type { StepContext } from "./context/step-context-builder.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { RootTaskHistorySessionAuthorizationInput, AuthorizedRootTaskHistoryWork } from "./context/root-task-history-session-memory.js"
-import type { RootTaskHistoryFence } from "./context/root-task-history-fence.js"
+import { rootTaskHistoryObjectiveDigest, type RootTaskHistoryFence } from "./context/root-task-history-fence.js"
 import type { RootTaskHistorySteerEvidence } from "./context/root-task-history-steer-evidence.js"
 
 const discoveryPersona = vi.hoisted(() => ({ load: vi.fn() }))
@@ -290,6 +290,26 @@ function loadedHistoryGraphFixture(): LoadedGraph {
 }
 
 describe("canonical Turn context builder", () => {
+  it("derives the private Root goal revision from the persisted Turn and matching Root objective", () => {
+    const turnInput = { input: { goal: "Find EU roles", successCriteria: ["Return verified candidates"], verificationRequirements: {
+      schemaVersion: "agent-harness.v2.objective-requirements.v1",
+      requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }],
+    } } }
+    const rootTaskObjective = { goal: "Find EU roles", successCriteria: ["Return verified candidates"] }
+    const builder = createCanonicalTurnContextBuilder({
+      pool: { connect: async () => { throw new Error("digest source does not need a database connection") } } as unknown as Pick<pg.Pool, "connect">,
+      store: store([]), scope, lease, rootTaskId: "root-a", rootAttemptCount: 1, turnInput, rootTaskObjective,
+      planningEnabled: true, selectedJobMode: false,
+    })
+    expect(builder.objectiveProgressGoalRevision?.()).toBe(rootTaskHistoryObjectiveDigest(turnInput, rootTaskObjective))
+    expect(builder.objectiveProgressGoalRevision?.()).toMatch(/^[a-f0-9]{64}$/)
+    expect(createCanonicalTurnContextBuilder({
+      pool: { connect: async () => { throw new Error("digest source does not need a database connection") } } as unknown as Pick<pg.Pool, "connect">,
+      store: store([]), scope, lease, rootTaskId: "root-a", rootAttemptCount: 1,
+      turnInput: { input: { goal: "Replaced goal" } }, rootTaskObjective, planningEnabled: true, selectedJobMode: false,
+    }).objectiveProgressGoalRevision?.()).toBeUndefined()
+  })
+
   it("adds the frozen Persona projection ephemerally to ordinary planning context after the base build", async () => {
     const projection = { schemaVersion: "applymate.discovery-persona-projection.v1" as const, purpose: "discovery" as const,
       facts: [{ factId: "persona-fact-1", key: "preferred_location", label: "Preferred location", category: "preferences",

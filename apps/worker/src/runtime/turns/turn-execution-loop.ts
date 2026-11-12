@@ -12,7 +12,8 @@ import { publishCommentary, publishReasoningSummary, TurnExecutionEventWriter } 
 import { READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive, assertModelAllowance, makeExecutionId, resumedBudgetLimits, updateExecutionStep, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
 import { buildCognitiveActionAgenda, excludeUnconsumedRootReferenceFromAgenda } from "./cognitive-action-agenda.js"
-import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
+import { COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
+import { buildCognitiveAgendaStepReceipt } from "./cognitive-agenda-progress-delta.js"
 import { executeTools, hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
 import { stopForRepeatedTaskGraphDenial } from "./turn-execution-final-candidate.js"
 import { nativeQuestionCallId, recoverPendingNativeQuestion } from "./turn-execution-question.js"
@@ -25,6 +26,7 @@ import { completeTurnExecutionFinalAnswer, replayScheduledFinalAnswer } from "./
 import { scheduledPipelineRecoveryStepMarker, withScheduledPipelineRecoveryStepProfile } from "../subagents/scheduled-pipeline-recovery-step.js"
 import { handleTurnExecutionStepError, matchedTaskGraphDenialCheckpoint, terminalizeTurnExecutionError, withTaskGraphDenialCheckpoint } from "./turn-engine-no-progress-terminalization.js"
 const DEFAULT_MAX_STEPS = 32
+type ObjectiveProgressContextBuilder = TurnExecutionOptions["contextBuilder"] & { readonly objectiveProgressGoalRevision?: () => string | undefined }
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
   const signal = options.signal ?? new AbortController().signal, now = options.now ?? (() => new Date())
   const writer = new TurnExecutionEventWriter({ ...options, signal, now })
@@ -43,7 +45,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
   if (options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId && recoveredCandidate !== undefined) {
     recoveredScheduledCandidate = takeRecoveredScheduledPipelineCandidate({ owner: options.identity, candidateText: recoveredCandidate })
   }
-  let steeringMarkerState = options.steeringMarkerState
+  let steeringMarkerState = options.steeringMarkerState, priorAgendaReceipt = options.resume?.cognitiveAgendaReceipt
   const seenCallIds = new Set<string>()
   let lastStep: TurnEngineStep | null = null, closedSteps = new Set<string>(), receiptClosedSteps = new Set<string>()
   try {
@@ -144,15 +146,14 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           const terminal = await stopForRepeatedTaskGraphDenial({ options: withTaskGraphDenialCheckpoint(options, checkpoint, readCheckpoint), writer, step, context, stepCount: steps, toolCallCount: toolCalls, usage: budget.usage(), now })
           closedSteps.add(step.id); return terminal
         }
-        const receipt = buildCognitiveAgendaReceipt({
-          sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, stepId: step.id,
-          inputThroughSequence, consumedInputIds,
-          agenda: buildCognitiveActionAgenda(agendaContext, { freshSteering }),
-        })
+        const receipt = buildCognitiveAgendaStepReceipt({ scope: { sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, stepId: step.id }, rootTaskId: options.identity.rootTaskId,
+          context: agendaContext, agenda: buildCognitiveActionAgenda(agendaContext, { freshSteering }), previousReceipt: priorAgendaReceipt,
+          objectiveProgressGoalRevision: (options.contextBuilder as ObjectiveProgressContextBuilder).objectiveProgressGoalRevision, inputThroughSequence, consumedInputIds })
         const receiptKey = cognitiveAgendaReceiptIdempotencyKey(step.id)
         if (!receipt || !receiptKey) throw new TurnEngineError("invalid_output", "Cognitive agenda receipt could not be built")
         try {
           await writer.append(COGNITIVE_AGENDA_EVENT_TYPE, step.id, null, receipt, receiptKey)
+          priorAgendaReceipt = receipt
         } catch {
           throw new TurnEngineError("persistence_conflict", "Cognitive agenda receipt could not be persisted")
         }

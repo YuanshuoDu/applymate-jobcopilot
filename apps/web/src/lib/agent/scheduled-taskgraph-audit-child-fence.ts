@@ -3,6 +3,10 @@ import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipe
 
 const AUDIT_TYPE = 'scheduled_taskgraph_audit'
 const AUDIT_SCHEMA = { schemaVersion: 'agent-harness.v2.subagent.result', role: 'auditor', taskType: AUDIT_TYPE }
+const POST_GATE_EXECUTE = { role: 'executor', taskType: 'scheduled_taskgraph_execute',
+  schema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'executor', taskType: 'scheduled_taskgraph_execute' } } as const
+const POST_GATE_AUDIT = { role: 'auditor', taskType: 'scheduled_taskgraph_post_gate_audit',
+  schema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'auditor', taskType: 'scheduled_taskgraph_post_gate_audit' } } as const
 const TURN_STATUSES = new Set(['queued', 'in_progress', 'waiting_for_dependency'])
 const ROOT_STATUSES = new Set(['running', 'waiting'])
 
@@ -14,6 +18,7 @@ export type ScheduledTaskGraphAuditChildFenceInput = Readonly<{
 export type ScheduledTaskGraphAuditChildFence = Readonly<{
   taskId: string; attemptCount: number; leaseOwner: string; rootStatus: string; turnStatus: string
 }>
+export type ScheduledTaskGraphPostGateActor = Readonly<{ kind: 'execute' | 'audit'; taskId: string; attemptCount: number; leaseOwner: string }>
 
 export function scheduledTaskGraphAuditTaskMatches(task: Record<string, unknown>, owner: ScheduledTaskGraphPipelineOwner): boolean {
   const status = task.status, attempt = task.attemptCount
@@ -37,8 +42,19 @@ export async function lockScheduledTaskGraphAuditCompletedReportChildFence(tx: P
   return lockAuditChildFence(tx, input, 'completed_report')
 }
 
+/** Locks the same owner chain for the exact server-owned post-Gate actor type. */
+export async function lockScheduledTaskGraphPostGateChildFence(tx: Prisma.TransactionClient, input: {
+  owner: ScheduledTaskGraphPipelineOwner; actor: ScheduledTaskGraphPostGateActor
+}): Promise<ScheduledTaskGraphAuditChildFence | null> {
+  if (input.actor.kind !== 'execute' && input.actor.kind !== 'audit') return null
+  return lockAuditChildFence(tx, { owner: input.owner, auditActor: { taskId: input.actor.taskId,
+    attemptCount: input.actor.attemptCount, leaseOwner: input.actor.leaseOwner } }, 'execution',
+    input.actor.kind === 'execute' ? POST_GATE_EXECUTE : POST_GATE_AUDIT, true)
+}
+
 async function lockAuditChildFence(tx: Prisma.TransactionClient, input: ScheduledTaskGraphAuditChildFenceInput,
-  phase: 'execution' | 'completed_report'): Promise<ScheduledTaskGraphAuditChildFence | null> {
+  phase: 'execution' | 'completed_report', contract = { role: 'auditor', taskType: AUDIT_TYPE, schema: AUDIT_SCHEMA },
+  lockExecutionAttempt = false): Promise<ScheduledTaskGraphAuditChildFence | null> {
   if (phase !== 'execution' && phase !== 'completed_report') return null
   const { owner, auditActor } = input
   if (!validOwner(owner) || !validActor(auditActor)) return null
@@ -93,20 +109,21 @@ async function lockAuditChildFence(tx: Prisma.TransactionClient, input: Schedule
         ("leaseExpiresAt" > clock_timestamp()) AS "hasLiveLease"
       FROM "sub_agent_tasks" WHERE "id" = ${auditActor.taskId} AND "sessionId" = ${owner.sessionId}
         AND "turnId" = ${owner.turnId} AND "rootTaskId" = ${owner.rootTaskId} AND "parentTaskId" = ${owner.rootTaskId}
-        AND "depth" = 1 AND "role" = 'auditor' AND "taskType" = ${AUDIT_TYPE} AND "status" = 'running'
+        AND "depth" = 1 AND "role" = ${contract.role} AND "taskType" = ${contract.taskType} AND "status" = 'running'
         AND "attemptCount" = ${auditActor.attemptCount} AND "maxAttempts" >= ${auditActor.attemptCount}
         AND "leaseOwner" = ${auditActor.leaseOwner} AND "leaseExpiresAt" > clock_timestamp()
         AND "interruptRequestedAt" IS NULL AND "closedAt" IS NULL AND "failureReason" IS NULL
-        AND "context" = '{}'::jsonb AND "expectedOutputSchema" = ${JSON.stringify(AUDIT_SCHEMA)}::jsonb
+        AND "context" = '{}'::jsonb AND "expectedOutputSchema" = ${JSON.stringify(contract.schema)}::jsonb
         AND "allowedActions" = '[]'::jsonb FOR UPDATE
     `)
     const child = children[0]
     if (children.length !== 1 || !child || child.hasLiveLease !== true || child.id !== auditActor.taskId
       || child.sessionId !== owner.sessionId || child.turnId !== owner.turnId || child.rootTaskId !== owner.rootTaskId
-      || child.parentTaskId !== owner.rootTaskId || child.depth !== 1 || child.role !== 'auditor' || child.taskType !== AUDIT_TYPE
+      || child.parentTaskId !== owner.rootTaskId || child.depth !== 1 || child.role !== contract.role || child.taskType !== contract.taskType
       || child.status !== 'running' || child.attemptCount !== auditActor.attemptCount || child.leaseOwner !== auditActor.leaseOwner
       || child.interruptRequestedAt != null || child.closedAt != null || child.failureReason !== null
-      || !sameJson(child.context, {}) || !sameJson(child.expectedOutputSchema, AUDIT_SCHEMA) || !sameJson(child.allowedActions, [])) return null
+      || !sameJson(child.context, {}) || !sameJson(child.expectedOutputSchema, contract.schema) || !sameJson(child.allowedActions, [])) return null
+    if (lockExecutionAttempt && !await currentExecutionAttempt(tx, owner)) return null
     if (phase === 'completed_report') {
       const executions = await tx.$queryRaw<Array<Record<string, unknown>>>(Prisma.sql`
         SELECT "id", "userId", "sessionId", "status", "attemptCount" FROM "agent_executions"
@@ -129,6 +146,18 @@ async function lockAuditChildFence(tx: Prisma.TransactionClient, input: Schedule
     return { taskId: auditActor.taskId, attemptCount: auditActor.attemptCount, leaseOwner: auditActor.leaseOwner,
       rootStatus: String(root.status), turnStatus: String(turn.status) }
   } catch { return null }
+}
+
+async function currentExecutionAttempt(tx: Prisma.TransactionClient, owner: ScheduledTaskGraphPipelineOwner): Promise<boolean> {
+  const rows = await tx.$queryRaw<Array<Record<string, unknown>>>(Prisma.sql`
+    SELECT "id", "userId", "sessionId", "status", "attemptCount" FROM "agent_executions"
+    WHERE "id" = ${owner.executionId} AND "userId" = ${owner.userId} AND "sessionId" = ${owner.sessionId}
+      AND "attemptCount" = ${owner.executionAttemptCount} AND "status" IN ('running', 'paused', 'completed') FOR UPDATE
+  `)
+  const execution = rows[0]
+  return rows.length === 1 && execution?.id === owner.executionId && execution.userId === owner.userId
+    && execution.sessionId === owner.sessionId && execution.attemptCount === owner.executionAttemptCount
+    && ['running', 'paused', 'completed'].includes(String(execution.status))
 }
 
 export async function scheduledTaskGraphAuditChildFenceIsCurrent(tx: Prisma.TransactionClient,

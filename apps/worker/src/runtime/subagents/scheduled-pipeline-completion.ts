@@ -10,6 +10,8 @@ import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { parseScheduledTaskGraphContinuationReceipt, scheduledTaskGraphStableContinuationKey } from "./scheduled-taskgraph-continuation-receipt.js"
 import type { ScheduledPipelineGateContinuationInput, ScheduledPipelineGateContinuationResult } from "./scheduled-automation-gate-bridge.js"
 import { parseScheduledPipelinePrepareContinuationResult } from "./scheduled-pipeline-completion-proof.js"
+import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK } from "./scheduled-post-gate-contract.js"
+import { mapScheduledGateContinuationResult, mapScheduledPostGateResumeResult } from "./scheduled-pipeline-post-gate-completion.js"
 
 export type ScheduledPipelineDependencyWait = Readonly<{ status: "waiting_for_dependency"; waitId: string }>
 export type ScheduledPipelineChoiceWait = Readonly<{ status: "waiting_for_choice"; waitId: string }>
@@ -57,6 +59,15 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
       || input.rootAttemptCount !== input.owner.rootAttemptCount) throw new Error("scheduled_candidate_owner_invalid")
     const candidate = { owner: input.executionOwner, rootAttemptCount: input.rootAttemptCount,
       finalStepId: input.finalStepId, finalStepOrdinal: input.finalStepOrdinal, candidateText: input.candidateText }
+    const resumePostGate = async (stage = true): Promise<ScheduledPipelineCompletionDisposition | null> => {
+      if (!input.continueAfterGate) return null
+      const result = await input.continueAfterGate({ owner: input.owner, executionOwner: input.executionOwner,
+        mode: "resume_post_gate", finalStepId: input.finalStepId, recoveryStepId: input.recoveryStepId, signal: input.signal })
+      const disposition = mapScheduledPostGateResumeResult(result, input.candidateText)
+      if (!disposition) return null
+      if (stage) await input.stageCandidate(candidate)
+      return disposition
+    }
     const resumeAudit = async (stage = true): Promise<ScheduledPipelineCompletionDisposition | null> => {
       if (!input.continueAfterGate) return null
       const result = await input.continueAfterGate({ owner: input.owner, executionOwner: input.executionOwner,
@@ -73,7 +84,7 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
           attestation: evidence.attestation, handoff: result.handoff, prepareProof: result.prepareProof,
           ...(result.scheduledWaitId ? { scheduledWaitId: result.scheduledWaitId } : {}),
           finalStepId: input.finalStepId, recoveryStepId: input.recoveryStepId, signal: input.signal })
-        return mapGateContinuationResult(continued, input.candidateText)
+        return mapScheduledGateContinuationResult(continued, input.candidateText)
       }
       if (result.status === "blocked") return result
       if (result.status === "completed") {
@@ -86,6 +97,8 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
       }
       return { status: "blocked", errorCode: "scheduled_audit_resume_result_invalid" }
     }
+    const postGate = await resumePostGate()
+    if (postGate) return postGate
     if (input.continueAfterGate) {
       const recovered = await resumeAudit()
       if (recovered) return recovered
@@ -126,7 +139,7 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
         prepareProof: prepared.prepareProof as Extract<ScheduledPipelineGateContinuationInput, { prepareProof: unknown }>["prepareProof"],
         ...(prepared.choice.required ? { scheduledWaitId: prepared.choice.scheduledWaitId } : {}),
         finalStepId: input.finalStepId, recoveryStepId: input.recoveryStepId, signal: input.signal })
-      return mapGateContinuationResult(gateResult, input.candidateText)
+      return mapScheduledGateContinuationResult(gateResult, input.candidateText)
     }
     return { status: "blocked", errorCode: "scheduled_pipeline_handoff_result_invalid" }
   } catch (error: unknown) {
@@ -135,23 +148,17 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
     throw new TurnStateRefreshRetryError()
   }
 }
-function mapGateContinuationResult(result: ScheduledPipelineGateContinuationResult, candidateText: string): ScheduledPipelineCompletionDisposition {
-  if (result.status === "waiting_for_dependency") return { status: result.status, waitId: result.waitId, candidateText }
-  if (result.status === "waiting_for_choice") return { status: "waiting_for_scheduled_gate_choice", waitId: result.waitId,
-    question: result.question, binding: result.binding, candidateText }
-  if (result.status === "waiting_for_external_user") return { status: result.status, externalWaitId: result.waitId, candidateText }
-  if (result.status === "blocked") return result
-  if (result.status === "completed") return { status: "completed", candidateText }
-  return { status: "blocked", errorCode: result.status === "not_registered" ? "scheduled_audit_not_registered" : "scheduled_pipeline_gate_recovery_unexpected" }
-}
 function recoveredGateMatches(owner: ScheduledAutomationPipelineBridgeScope, attestation: ScheduledAutomationPipelineAttestation, recovery: Extract<ScheduledPipelineGateContinuationResult, { status: "gate_continuation" }>): boolean {
   const { handoff, prepareProof } = recovery, receipt = prepareProof.receipt, bound = receipt.owner
+  const proofOwner: ScheduledAutomationPipelineBridgeScope = { userId: bound.userId, sessionId: bound.sessionId,
+    turnId: bound.turnId, rootTaskId: bound.rootTaskId, rootAttemptCount: bound.rootAttemptCount,
+    turnLeaseOwnerId: bound.turnLeaseOwnerId, turnLeaseVersion: bound.turnLeaseVersion }
   return attestation.owner.userId === owner.userId && attestation.owner.sessionId === owner.sessionId
     && attestation.owner.turnId === owner.turnId && attestation.owner.rootTaskId === owner.rootTaskId
     && attestation.owner.rootAttemptCount === owner.rootAttemptCount
-    && attestation.owner.turnLeaseOwnerId === owner.turnLeaseOwnerId && attestation.owner.turnLeaseVersion === owner.turnLeaseVersion
+    && attestation.owner.turnLeaseOwnerId === proofOwner.turnLeaseOwnerId && attestation.owner.turnLeaseVersion === proofOwner.turnLeaseVersion
     && handoff.status === "analyze_checkpointed" && /^sha256:[a-f0-9]{64}$/.test(handoff.claimTokenDigest)
-    && handoff.continuationKey === scheduledTaskGraphContinuationKey(owner, attestation, handoff.executionId, handoff.executionAttemptCount)
+    && handoff.continuationKey === scheduledTaskGraphContinuationKey(proofOwner, attestation, handoff.executionId, handoff.executionAttemptCount)
     && bound.userId === owner.userId && bound.sessionId === owner.sessionId && bound.turnId === owner.turnId
     && bound.rootTaskId === owner.rootTaskId && bound.rootAttemptCount === owner.rootAttemptCount
     && bound.executionId === handoff.executionId && bound.executionAttemptCount === handoff.executionAttemptCount
@@ -187,7 +194,7 @@ export function attachScheduledPipelineCompletion(input: Readonly<{
       bridge: input.bridge, ...(input.continueAfterAnalyze ? { continueAfterAnalyze: input.continueAfterAnalyze } : {}),
       ...(input.continueAfterGate ? { continueAfterGate: input.continueAfterGate } : {}),
       ...(input.fetcher ? { fetcher: input.fetcher } : {}), ...(isOwnershipLost ? { isOwnershipLost } : {}) })
-    if (disposition.status === "completed" || disposition.status === "waiting_for_user" || disposition.status === "waiting_for_scheduled_gate_choice"
+    if (disposition.status === "completed" || disposition.status === "replan" || disposition.status === "waiting_for_user" || disposition.status === "waiting_for_scheduled_gate_choice"
       || disposition.status === "waiting_for_external_user"
       || disposition.status === "waiting_for_dependency") input.onWebAccepted()
     return disposition
@@ -202,8 +209,15 @@ export function attachScheduledPipelineCompletion(input: Readonly<{
         || identity.ownerId !== owner.turnLeaseOwnerId || identity.leaseVersion !== owner.turnLeaseVersion
         || candidateText !== recovered.candidateText) return { status: "not_applicable" }
       try {
-        const result = await resumeGate({ owner, executionOwner: identity, mode: "resume_audit",
+        let result = await resumeGate({ owner, executionOwner: identity, mode: "resume_post_gate",
           finalStepId: recovered.finalStepId, recoveryStepId: stepId, signal })
+        if (result.status === "not_registered") result = await resumeGate({ owner, executionOwner: identity, mode: "resume_audit",
+          finalStepId: recovered.finalStepId, recoveryStepId: stepId, signal })
+        if (result.status === "replan") {
+          if (result.feedback !== SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK) return { status: "not_applicable" }
+          input.onWebAccepted()
+          return { status: "replan", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK }
+        }
         if (result.status === "waiting_for_dependency" && result.waitId.trim() === result.waitId
           && result.waitId.length > 0 && result.waitId.length <= 128) {
           input.onWebAccepted()

@@ -1229,6 +1229,7 @@ draft
 | [#685](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/685) — bounded Root TaskGraph outcome recall | [#686](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/686) |
 | [#885](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/885) — pin automation runner mode per Turn | this PR |
 | [#916](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/916) — scheduled Gate as a durable TaskGraph task | Implemented and merged as [PR #926](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/926); this mapping does not imply activation or Phase-gate completion |
+| [#1095](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/1095) — isolated ApplicationTask Gate-to-submit full-loop harness | In implementation; synthetic PostgreSQL/Redis/browser evidence only, no employer receipt or rollout evidence |
 
 ---
 

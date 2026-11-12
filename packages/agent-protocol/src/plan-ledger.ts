@@ -1,11 +1,11 @@
-import { parsePersistedTaskGraphNode, validTaskGraphResultEnvelopeKeys } from './plan-ledger-task-graph-metadata.js'
-import { isStrictNativeTaskGraphNode } from './plan-ledger-native-metadata.js'
+import { validTaskGraphResultEnvelopeKeys } from './plan-ledger-task-graph-metadata.js'
+import { parsePlanLedgerTaskGraphSnapshotNodes, PLAN_LEDGER_MAX_PERSISTED_NODES, PLAN_LEDGER_MAX_SNAPSHOT_BYTES } from './plan-ledger-package-refs.js'
 
 export const PLAN_LEDGER_SCHEMA_VERSION = 'agent-harness.v2.plan-ledger'
 export const TASK_GRAPH_SCHEMA_VERSION = 'agent-harness.v2.task-graph', TASK_GRAPH_MAX_IDENTIFIER_LENGTH = 128
 const RESULT_VERSION = 'agent-harness.v2.subagent.result'
-const MAX_NODES = 8, MAX_ID = TASK_GRAPH_MAX_IDENTIFIER_LENGTH, MAX_PRIVATE_RESULT_ID = 256, MAX_LEDGER_BYTES = 16_000
-const MAX_DEPTH = 8, MAX_SNAPSHOT_BYTES = 40_000, MAX_SUCCESS_CRITERIA = 8, MAX_DEPENDENCIES = 8, MAX_GOAL_LENGTH = 1_200, MAX_CRITERION_LENGTH = 320
+const MAX_TASK_ROWS = 12, MAX_ID = TASK_GRAPH_MAX_IDENTIFIER_LENGTH, MAX_PRIVATE_RESULT_ID = 256, MAX_LEDGER_BYTES = 16_000
+const MAX_DEPENDENCIES = 8
 const STATUSES = ['queued', 'running', 'retrying', 'waiting', 'waiting_for_user', 'completed', 'failed', 'interrupted', 'cancelled', 'closed'] as const
 const TERMINAL = new Set(['completed', 'failed', 'interrupted', 'cancelled', 'closed'])
 const BLOCKING = new Set(['failed', 'interrupted', 'cancelled', 'closed'])
@@ -27,9 +27,9 @@ const RuntimeTextEncoder = (globalThis as typeof globalThis & { TextEncoder?: ne
 export function projectPlanLedger(value: unknown): PlanLedger | null {
   try {
     if (!record(value) || !identifier(value.sessionId) || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1
-      || (value.rootTaskId !== null && !identifier(value.rootTaskId)) || !dense(value.tasks, MAX_NODES + 1)) return null
+      || (value.rootTaskId !== null && !identifier(value.rootTaskId)) || !dense(value.tasks, MAX_TASK_ROWS)) return null
     const graph = parseTaskGraphSnapshot(value.graph)
-    if (!graph || graph.nodes.length === 0 || value.tasks.length > MAX_NODES + 1
+    if (!graph || graph.nodes.length === 0 || value.tasks.length > MAX_TASK_ROWS
       || graph.nodes.some(node => !identifier(node.key) || !identifier(node.templateId) || !identifier(node.taskId)
         || !node.dependsOn.every(identifier))) return null
     const tasks = new Map<string, Record<string, unknown>>()
@@ -71,14 +71,14 @@ export function parsePlanLedger(value: unknown): PlanLedger | null {
     if (!record(parsed) || !exact(parsed, ['schemaVersion', 'sessionId', 'revision', 'goal', 'nodes'])
       || parsed.schemaVersion !== PLAN_LEDGER_SCHEMA_VERSION || !identifier(parsed.sessionId)
       || !Number.isSafeInteger(parsed.revision) || Number(parsed.revision) < 1
-      || (parsed.goal !== null && !displayTextIsSafe(parsed.goal, 240)) || !dense(parsed.nodes, MAX_NODES) || parsed.nodes.length === 0) return null
+      || (parsed.goal !== null && !displayTextIsSafe(parsed.goal, 240)) || !dense(parsed.nodes, PLAN_LEDGER_MAX_PERSISTED_NODES) || parsed.nodes.length === 0) return null
     const keys = new Set<string>()
     const nodes: PlanLedger['nodes'][number][] = []
     for (const raw of parsed.nodes) {
       if (!record(raw) || !exact(raw, ['key', 'goal', 'status', 'resultAvailable', 'evidencePreview', 'readiness', 'dependencies'])
         || !identifier(raw.key) || keys.has(raw.key) || !displayTextIsSafe(raw.goal, 240)
         || (raw.status !== null && !isStatus(raw.status)) || typeof raw.resultAvailable !== 'boolean'
-        || !isReadiness(raw.readiness) || !dense(raw.dependencies, MAX_NODES) || !safePreview(raw.evidencePreview)) return null
+        || !isReadiness(raw.readiness) || !dense(raw.dependencies, MAX_DEPENDENCIES) || !safePreview(raw.evidencePreview)) return null
       keys.add(raw.key)
       const dependencies: Array<{ key: string; label: string; status: PlanLedgerStatus | null }> = []
       for (const dependency of raw.dependencies) {
@@ -169,27 +169,9 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot | null
   try {
     const content = typeof value === 'string' ? JSON.parse(value) as unknown : value
     if (!record(content) || !exact(content, ['schemaVersion', 'nodes']) || content.schemaVersion !== TASK_GRAPH_SCHEMA_VERSION
-      || !strictDense(content.nodes, MAX_NODES) || bytes(content) > MAX_SNAPSHOT_BYTES) return null
-    const nodes: TaskGraphSnapshotNode[] = [], keys = new Set<string>(), ids = new Set<string>()
-    for (const raw of content.nodes) {
-      const native = isStrictNativeTaskGraphNode(raw)
-      const node = parsePersistedTaskGraphNode(raw)
-      const goalLength = native ? 4_000 : MAX_GOAL_LENGTH
-      const criteriaCount = native ? 32 : MAX_SUCCESS_CRITERIA
-      const criterionLength = native ? 1_000 : MAX_CRITERION_LENGTH
-      if (!node || !text(node.key, TASK_GRAPH_MAX_IDENTIFIER_LENGTH) || !text(node.templateId, TASK_GRAPH_MAX_IDENTIFIER_LENGTH)
-        || !text(node.goal, goalLength) || !text(node.taskId, TASK_GRAPH_MAX_IDENTIFIER_LENGTH)
-        || !strictDense(node.successCriteria, criteriaCount) || node.successCriteria.length === 0 && !native
-        || !node.successCriteria.every(item => text(item, criterionLength))
-        || !strictDense(node.dependsOn, MAX_DEPENDENCIES) || !node.dependsOn.every(item => text(item, TASK_GRAPH_MAX_IDENTIFIER_LENGTH))
-        || new Set(node.dependsOn).size !== node.dependsOn.length || !Number.isSafeInteger(node.depth)
-        || Number(node.depth) < 1 || Number(node.depth) > MAX_DEPTH || keys.has(node.key) || ids.has(node.taskId)) return null
-      keys.add(node.key); ids.add(node.taskId)
-      const projected = { ...node, successCriteria: [...node.successCriteria], dependsOn: [...node.dependsOn], depth: Number(node.depth) }
-      nodes.push(projected)
-    }
-    if (nodes.some(node => node.dependsOn.some(key => !keys.has(key))) || !acyclic(nodes)) return null
-    return { nodes }
+      || bytes(content) > PLAN_LEDGER_MAX_SNAPSHOT_BYTES) return null
+    const nodes = parsePlanLedgerTaskGraphSnapshotNodes(content.nodes)
+    return nodes ? { nodes } : null
   } catch { return null }
 }
 
@@ -237,9 +219,6 @@ function exact(value: Record<string, unknown>, keys: readonly string[]): boolean
   const own = Reflect.ownKeys(value); return own.length === keys.length && own.every(key => typeof key === 'string' && keys.includes(key))
 }
 function dense(value: unknown, maximum: number): value is unknown[] { return Array.isArray(value) && value.length <= maximum && Reflect.ownKeys(value).length === value.length + 1 }
-function strictDense(value: unknown, maximum: number): value is unknown[] {
-  return dense(value, maximum) && Array.from({ length: value.length }, (_, index) => String(index)).every(key => Object.hasOwn(value, key))
-}
 function parseJsonRecord(value: unknown): Record<string, unknown> | null { const parsed = typeof value === 'string' ? JSON.parse(value) as unknown : value; return record(parsed) ? parsed : null }
 function bytes(value: unknown): number { const encoded = JSON.stringify(value) ?? ''; return RuntimeTextEncoder ? new RuntimeTextEncoder().encode(encoded).byteLength : encoded.length * 3 }
 function smallInteger(value: unknown, maximum: number): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= maximum }

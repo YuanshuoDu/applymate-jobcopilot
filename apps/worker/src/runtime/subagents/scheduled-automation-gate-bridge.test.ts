@@ -10,6 +10,7 @@ vi.mock("./scheduled-gate-wait-match.js", () => ({ readScheduledGateQuestionCand
 
 import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
 import { scheduledAuditWaitKey } from "./scheduled-audit-resume.js"
+import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK } from "./scheduled-post-gate-contract.js"
 import { scheduledGateQuestionText } from "../turns/turn-execution-types.js"
 
 const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
@@ -56,6 +57,8 @@ function dependencies(overrides: Record<string, unknown> = {}) {
     appendScheduledAudit: vi.fn(async () => auditReceipt()),
     verifyScheduledAuditCompletion: vi.fn(async () => auditCompletionProof()),
     readScheduledAuditResumeContext: vi.fn(async () => ({ status: "not_registered" as const })),
+    readScheduledPostGatePlanningContext: vi.fn(async () => ({ status: "not_applicable" as const })),
+    verifyScheduledPostGateCompletion: vi.fn(async () => null),
     ...overrides,
   }
   const waitPort = { waitScheduledGate: vi.fn(async (_invocation: DurableWaitScheduledGateInvocation) =>
@@ -107,6 +110,38 @@ describe("scheduled automation Gate continuation", () => {
       .toBeLessThan(deps.waitPort.wait.mock.invocationCallOrder[0]!)
     expect(deps.waitPort.wait.mock.invocationCallOrder[0])
       .toBeLessThan(deps.commandPort.verifyScheduledAuditCompletion.mock.invocationCallOrder[0]!)
+  })
+
+  it("replans only when the verified Gate belongs to a fresh eligible post-Gate graph", async () => {
+    mock.selectResume.mockResolvedValue({ status: "initial" })
+    mock.readCandidate.mockResolvedValue(null)
+    const deps = dependencies({
+      readScheduledPostGatePlanningContext: vi.fn(async () => ({ status: "awaiting_plan" as const })),
+      verifyScheduledPostGateCompletion: vi.fn(),
+    })
+    const run = createScheduledAutomationGateContinuation({ ...deps, nativeQuestionWaitEnabled: true } as never)
+
+    await expect(run(continuation as never)).resolves.toEqual({
+      status: "replan", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK,
+    })
+    expect(deps.commandPort.appendScheduledAudit).not.toHaveBeenCalled()
+    expect(deps.waitPort.wait).not.toHaveBeenCalled()
+  })
+
+  it("fails closed instead of falling back to Audit when the eligible post-Gate graph is invalid", async () => {
+    mock.selectResume.mockResolvedValue({ status: "initial" })
+    mock.readCandidate.mockResolvedValue(null)
+    const deps = dependencies({
+      readScheduledPostGatePlanningContext: vi.fn(async () => ({ status: "invalid" as const })),
+      verifyScheduledPostGateCompletion: vi.fn(),
+    })
+    const run = createScheduledAutomationGateContinuation({ ...deps, nativeQuestionWaitEnabled: true } as never)
+
+    await expect(run(continuation as never)).resolves.toEqual({
+      status: "blocked", errorCode: "scheduled_post_gate_resume_invalid",
+    })
+    expect(deps.commandPort.appendScheduledAudit).not.toHaveBeenCalled()
+    expect(deps.waitPort.wait).not.toHaveBeenCalled()
   })
 
   it("returns a new Gate question after an answered historical question under the active recovery step", async () => {

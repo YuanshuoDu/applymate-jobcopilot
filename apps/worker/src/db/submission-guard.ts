@@ -169,7 +169,7 @@ export async function updateJobForSubmission(
       `UPDATE "Job" SET status = $1, "workflowState" = $2,
          "appliedAt" = CASE WHEN $3 THEN NOW() ELSE "appliedAt" END, "updatedAt" = NOW()
        WHERE id = $4 AND "userId" = $5
-         AND ($6::text[] IS NULL OR "workflowState" = ANY($6::text[]))`,
+         AND ($6::text[] IS NULL OR "workflowState"::text = ANY($6::text[]))`,
       [input.status, input.workflowState, input.applied === true, identity.jobId, identity.userId, input.expectedWorkflowStates ?? null],
     );
     return result.rowCount === 1;

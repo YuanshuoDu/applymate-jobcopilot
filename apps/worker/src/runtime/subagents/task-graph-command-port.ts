@@ -22,6 +22,7 @@ import type { DiscoveryQueryFootprint } from "./child-discovery-query-footprint.
 import type { TaskGraphHistoricalDiscoveryPage, TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
 import type { TaskGraphSourceCheckpoint, TaskGraphSourceIntentNode } from "./task-graph-pg-source-provenance.js"
 import type { TaskGraphScheduledAuditInput, TaskGraphScheduledAuditCompletionInput, TaskGraphScheduledAuditInvocationInput, TaskGraphScheduledAuditResumeInput, ScheduledAuditAppendReceipt, ScheduledAuditCompletionProof, ScheduledAuditInvocationProof, ScheduledAuditResumeContext } from "./scheduled-audit-contract.js"
+import type { ScheduledPostGatePlanningContext, TaskGraphScheduledPostGatePlanInput, TaskGraphScheduledPostGatePlanReadInput, ScheduledPostGateCompletionProof, ScheduledPostGateScheduleReceipt } from "./scheduled-post-gate-contract.js"
 export type { TaskGraphExecutionScope, TaskGraphScheduleInput, TaskGraphScheduleNode, TaskGraphScheduleReceipt, TaskGraphScheduledPrepareReceipt, TaskGraphTaskTemplate } from "./task-graph-schedule-input.js"
 import type {
   ScheduledAnalyzeCheckpointHandoff,
@@ -34,14 +35,11 @@ import type {
   TaskGraphScheduledPrepareInput,
 } from "./scheduled-gate-contract.js"
 export type {
-  ScheduledAnalyzeCheckpointHandoff,
-  ScheduledTaskGraphExecutionOwner,
-  TaskGraphScheduledGateCompletionInput,
-  TaskGraphScheduledGateInput,
-  TaskGraphScheduledGateResumeInput,
-  TaskGraphScheduledGateResumeReceipt,
-  TaskGraphScheduledPrepareInput,
+  ScheduledAnalyzeCheckpointHandoff, ScheduledTaskGraphExecutionOwner, TaskGraphScheduledGateCompletionInput,
+  TaskGraphScheduledGateInput, TaskGraphScheduledGateResumeInput, TaskGraphScheduledGateResumeReceipt, TaskGraphScheduledPrepareInput,
 } from "./scheduled-gate-contract.js"
+export type { ScheduledPostGateCompletionProof, ScheduledPostGatePlanningContext, ScheduledPostGateScheduleReceipt,
+  TaskGraphScheduledPostGatePlanInput, TaskGraphScheduledPostGatePlanReadInput } from "./scheduled-post-gate-contract.js"
 export type {
   TaskGraphNativeChildReceipt,
   TaskGraphNativeCommandReceipt,
@@ -225,6 +223,10 @@ export type TaskGraphCommandPort = Readonly<{
   verifyScheduledAuditCompletion?(input: TaskGraphScheduledAuditCompletionInput): Promise<ScheduledAuditCompletionProof | null>
   readScheduledAuditInvocationProof?(input: TaskGraphScheduledAuditInvocationInput): Promise<ScheduledAuditInvocationProof | null>
   readScheduledAuditResumeContext?(input: TaskGraphScheduledAuditResumeInput): Promise<ScheduledAuditResumeContext>
+  /** Root-only proof-gated post-Gate plan admission and restart rehydration. */
+  appendScheduledPostGatePlan?(input: TaskGraphScheduledPostGatePlanInput): Promise<ScheduledPostGateScheduleReceipt>
+  readScheduledPostGatePlanningContext?(input: TaskGraphScheduledPostGatePlanReadInput): Promise<ScheduledPostGatePlanningContext>
+  verifyScheduledPostGateCompletion?(input: TaskGraphScheduledPostGatePlanReadInput): Promise<ScheduledPostGateCompletionProof | null>
   appendAndScheduleWithReconciliation?(input: TaskGraphScheduleInput, operation: import("./steering-reconciliation-contract.js").SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt>
   reconcileSteering?(operation: import("./steering-reconciliation-contract.js").SteeringReconciliationOperation): Promise<TaskGraphKeepReconciliationReceipt>
   /** Native root coordination is optional for legacy ports; production callers must fail closed if absent. */

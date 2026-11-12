@@ -162,7 +162,37 @@ describe("TaskGraph server-owned templates", () => {
 
     expect(loader).toHaveBeenCalledWith(base.pool, base.lease, expect.any(Date))
     expect(available.templates?.application_filler).toMatchObject({ role: "application_filler", taskType: "application_fill_for_review", allowedActions: [] })
+    expect(available.templates).not.toHaveProperty("scheduled.application.execute")
+    expect(available.templates).not.toHaveProperty("scheduled.post_gate_audit")
     expect(absent.templates).toBe(baseTemplates)
+    expect(absent.templates).not.toHaveProperty("scheduled.application.execute")
+    expect(absent.templates).not.toHaveProperty("scheduled.post_gate_audit")
+  })
+
+  it("withholds only the reserved application_filler template when preparation is unavailable", async () => {
+    const pool = {} as never
+    const lease = {} as never
+    const retainedTemplates = {
+      scout: TASK_GRAPH_TEMPLATES.scout,
+      analyst: TASK_GRAPH_TEMPLATES.analyst,
+      other_registered_role: TASK_GRAPH_TEMPLATES.prepare,
+    }
+    const taskGraphTemplates = {
+      ...retainedTemplates,
+      application_filler: { role: "application_filler", taskType: "application_fill_for_review", allowedActions: [] },
+    }
+    const applicationFillPreparationLoader = vi.fn(async () => undefined)
+    const result = await taskGraphRuntimeForTurn({
+      enabled: true, pool, lease, now: () => new Date(), taskGraphTemplates,
+      selectedJobPreparationLoader: async () => undefined,
+      applicationFillPreparationLoader,
+    })
+
+    expect(applicationFillPreparationLoader).toHaveBeenCalledWith(pool, lease, expect.any(Date))
+    expect(result.templates).toEqual(retainedTemplates)
+    expect(Object.keys(result.templates ?? {})).toEqual(Object.keys(retainedTemplates))
+    for (const [key, template] of Object.entries(retainedTemplates)) expect(result.templates?.[key]).toBe(template)
+    expect(result.templates).not.toHaveProperty("application_filler")
   })
 
   it("keeps scheduled automation on the registered Scout and Analyst workflow", async () => {
@@ -195,7 +225,15 @@ describe("TaskGraph server-owned templates", () => {
     }))
 
     expect(approved.scheduledDraftMode).toBe(false)
-    expect(Object.keys(approved.templates ?? {})).toEqual(["scout", "analyst"])
+    expect(Object.keys(approved.templates ?? {})).toEqual([
+      "scout", "analyst", "scheduled.application.execute", "scheduled.post_gate_audit",
+    ])
+    expect(approved.templates?.["scheduled.application.execute"]).toMatchObject({
+      role: "executor", taskType: "scheduled_taskgraph_execute", allowedActions: [],
+    })
+    expect(approved.templates?.["scheduled.post_gate_audit"]).toMatchObject({
+      role: "auditor", taskType: "scheduled_taskgraph_post_gate_audit", allowedActions: [],
+    })
     expect(approved.templates?.scout).toMatchObject({
       role: TASK_GRAPH_TEMPLATES.scout.role,
       taskType: TASK_GRAPH_TEMPLATES.scout.taskType,
@@ -205,7 +243,9 @@ describe("TaskGraph server-owned templates", () => {
     expect(approved.templates?.analyst).toBe(TASK_GRAPH_TEMPLATES.analyst)
     expect(approved.templates).not.toHaveProperty("application_filler")
     for (const result of [approved, autoApply, approvalNotRequired]) {
-      expect(Object.keys(result.templates ?? {})).toEqual(["scout", "analyst"])
+      expect(Object.keys(result.templates ?? {})).toEqual([
+        "scout", "analyst", "scheduled.application.execute", "scheduled.post_gate_audit",
+      ])
       expect(result.templates).not.toHaveProperty("cover_letter_writer")
       expect(result.templates).not.toHaveProperty("cover_letter_reviewer")
       expect(result.templates).not.toHaveProperty("other_registered_role")
@@ -223,9 +263,13 @@ describe("TaskGraph server-owned templates", () => {
     expect(manual.templates?.analyst.context).toEqual({
       scheduledAutomationCriteria: { targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70 },
     })
+    expect(manual.templates).not.toHaveProperty("scheduled.application.execute")
+    expect(manual.templates).not.toHaveProperty("scheduled.post_gate_audit")
     expect(manual.templates).not.toHaveProperty("prepare")
     expect(userTurn.scheduledDraftMode).toBe(false)
     expect(userTurn.templates).toMatchObject({ scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst })
+    expect(userTurn.templates).not.toHaveProperty("scheduled.application.execute")
+    expect(userTurn.templates).not.toHaveProperty("scheduled.post_gate_audit")
     expect(userTurn.templates).not.toHaveProperty("prepare")
   })
 
@@ -432,7 +476,7 @@ describe("TaskGraph server-owned templates", () => {
     expect(selectedJobLoader).not.toHaveBeenCalled()
   })
 
-  it("keeps scheduled automation on Scout and Analyst even when selected-job preparation is available", async () => {
+  it("keeps scheduled automation independent of selected-job preparation and exposes only its Post-Gate templates", async () => {
     const selectedJobLoader = vi.fn(async () => ({ jobId: "job-1" }))
     const applicationFillLoader = vi.fn(async () => ({ available: true }))
     const result = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
@@ -445,7 +489,15 @@ describe("TaskGraph server-owned templates", () => {
     })
     expect(selectedJobLoader).not.toHaveBeenCalled()
     expect(applicationFillLoader).not.toHaveBeenCalled()
-    expect(Object.keys(result.templates ?? {})).toEqual(["scout", "analyst"])
+    expect(Object.keys(result.templates ?? {})).toEqual([
+      "scout", "analyst", "scheduled.application.execute", "scheduled.post_gate_audit",
+    ])
+    expect(result.templates?.["scheduled.application.execute"]).toMatchObject({
+      role: "executor", taskType: "scheduled_taskgraph_execute", allowedActions: [],
+    })
+    expect(result.templates?.["scheduled.post_gate_audit"]).toMatchObject({
+      role: "auditor", taskType: "scheduled_taskgraph_post_gate_audit", allowedActions: [],
+    })
     expect(result.templates).not.toHaveProperty("cover_letter_writer")
     expect(result.templates).not.toHaveProperty("cover_letter_reviewer")
     expect(result.templates).not.toHaveProperty("application_filler")

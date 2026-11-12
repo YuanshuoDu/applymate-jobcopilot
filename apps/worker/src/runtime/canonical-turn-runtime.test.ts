@@ -5308,7 +5308,8 @@ describe("createCanonicalTurnRuntime", () => {
       selectedJobPreparationLoader: async () => undefined,
       rootTaskStore: roots as never,
       toolRuntimeFactory: ({ pool, policy, manager }) => createWorkerToolRuntime(
-        pool, { sink: lifecycle }, policy, { manager, store: coordinationStore, wait },
+        pool, { sink: lifecycle, resolveOwner: () => ({ kind: "turn", taskId: "root-1", lease }) },
+        policy, { manager, store: coordinationStore, wait },
       ),
       turnEngineStoreFactory: () => store(),
       contextBuilderFactory,

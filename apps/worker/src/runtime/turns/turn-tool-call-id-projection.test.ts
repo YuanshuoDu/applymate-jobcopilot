@@ -164,12 +164,26 @@ describe("child model-context tool-call ID projection", () => {
   })
 
   it("maps returned aliases back once, while rejecting duplicate, unknown, malformed, and root-scoped IDs", () => {
-    const projection = projectChildToolCallIdsForModelContext(snapshot([observation(PHONE_ID, "phone-result")]), owner(), STEP_ID)
+    const input = { query: "Dublin" }, output = { jobs: [] }
+    const source = { id: `tool-result:${PHONE_ID}`, content: {
+      toolCallId: PHONE_ID, toolName: "jobs.search", input, status: "completed", output, errorCode: null,
+    } }
+    const replayReceipt = receipt({ toolCallId: PHONE_ID, toolName: "jobs.search", input, stepId: STEP_ID,
+      resultItem: { id: `result-${PHONE_ID}`, revision: 3 }, result: { status: "completed", output, errorCode: null } })
+    const projection = projectChildToolCallIdsForModelContext(snapshot([source]), owner(), STEP_ID, [replayReceipt])
     const alias = [...projection.aliasToCanonical.keys()][0]!
-    expect(normalizeProjectedToolCallIds([{ id: alias, name: "wait_subagents" }], projection))
-      .toEqual([{ id: PHONE_ID, name: "wait_subagents" }])
-    expect(() => normalizeProjectedToolCallIds([{ id: alias }, { id: PHONE_ID }], projection))
+    expect(normalizeProjectedToolCallIds([{ id: alias, name: "jobs.search", arguments: input }], projection))
+      .toEqual([{ id: PHONE_ID, name: "jobs.search", arguments: input }])
+    expect(() => normalizeProjectedToolCallIds([{ id: alias, name: "jobs.search", arguments: input }, { id: PHONE_ID }], projection))
       .toThrow("child_tool_call_projection_duplicate_model_id")
+    const missingReceiptProjection = projectChildToolCallIdsForModelContext(snapshot([source]), owner(), STEP_ID)
+    const missingReceiptAlias = [...missingReceiptProjection.aliasToCanonical.keys()][0]!
+    expect(() => normalizeProjectedToolCallIds([{ id: missingReceiptAlias, name: "jobs.search", arguments: input }], missingReceiptProjection))
+      .toThrow("child_tool_call_projection_receipt_invalid")
+    expect(() => normalizeProjectedToolCallIds([{ id: PHONE_ID, name: "jobs.search", arguments: input }], missingReceiptProjection))
+      .toThrow("child_tool_call_projection_receipt_invalid")
+    expect(normalizeProjectedToolCallIds([{ id: "fresh-provider-call", name: "jobs.search", arguments: input }], missingReceiptProjection))
+      .toEqual([{ id: "fresh-provider-call", name: "jobs.search", arguments: input }])
     const emptyProjection = projectChildToolCallIdsForModelContext(snapshot([]), owner(), STEP_ID)
     expect(() => normalizeProjectedToolCallIds([{ id: "toolcall" + "a".repeat(64) + "a" }], emptyProjection))
       .toThrow("child_tool_call_projection_unknown_alias")
@@ -190,6 +204,12 @@ describe("child model-context tool-call ID projection", () => {
     expect(projected.aliasToCanonical.get(alias)).toBe(RESERVED_ID)
     expect(normalizeProjectedToolCallIds([{ id: alias, name: "jobs.search", arguments: { query: "Dublin" } }], projected))
       .toEqual([{ id: RESERVED_ID, name: "jobs.search", arguments: { query: "Dublin" } }])
+    const malformedAliases = [alias.slice(0, -1), `${alias.slice(0, 8)}${alias[8] === "a" ? "b" : "a"}${alias.slice(9)}`]
+    for (const malformed of malformedAliases) {
+      expect(malformed).not.toBe(alias)
+      expect(() => normalizeProjectedToolCallIds([{ id: malformed, name: "jobs.search", arguments: { query: "Dublin" } }], projected))
+        .toThrow("child_tool_call_projection_unknown_alias")
+    }
     expect(() => normalizeProjectedToolCallIds([{ id: alias, name: "jobs.search", arguments: { query: "Cork" } }], projected))
       .toThrow("child_tool_call_projection_receipt_invalid")
   })

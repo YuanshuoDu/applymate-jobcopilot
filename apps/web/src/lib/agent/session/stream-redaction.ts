@@ -13,6 +13,17 @@ import { parseFinalTaskGraphSourceManifest } from './final-task-graph-source-man
 const TASK_GRAPH_PROPOSAL_KEYS = ['kind', 'fingerprint', 'receipt', 'revision', 'item'] as const
 const TASK_GRAPH_PROPOSAL_CONTENT_KEYS = [...TASK_GRAPH_PROPOSAL_KEYS, 'content'] as const
 const TASK_GRAPH_LIFECYCLE_KEYS = ['kind', 'event', 'revision', 'item'] as const
+// Terminal hydration and its item API currently accept IDs up to 256 characters.
+const MAX_TERMINAL_ID_LENGTH = 256
+// Mirror the shared structural-ID credential check; some prefixes are not handled by redactSensitiveText.
+const ID_CREDENTIAL_PREFIX = /(?<![a-z0-9])(?:bearer\b|sk[-_]|xox[baprs]-|gh[pousr]_|github_pat_|ghs_|secret[_:-]|password[_:-]|api[_-]?key[_:-]|token[_:-])|(?:password|secret|token|api[_-]?key)=/i
+const EMBEDDED_ID_CREDENTIAL_MARKER = /(?:glpat-|AIza|ya29\.)/i
+const EMBEDDED_ID_CREDENTIAL_TOKEN = /(?:Bearer\s+|(?:sk[-_]|gh[pousr]_|github_pat_|xox[baprs]-))[a-z0-9._~+/=-]{8,}/i
+const UUID_V4_COMPONENT = /[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/giu
+// Capture any non-ASCII-alphanumeric delimiter and preserve it during equal-length UUID masking.
+const UUID_V4_COMPONENTS = /(^|[^A-Za-z0-9])([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(?=$|[^A-Za-z0-9])/giu
+const STABLE_ID_COMPONENT = /(^|[:._-])([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{32,64})(?=$|[:._-])/gi
+const PHONE_SHAPED_UNDERSCORE_ID_COMPONENT = /_(\+?[\d\s().-]*\d)(?=$|[_:.-])/g
 const TASK_GRAPH_ITEM_KEYS = [
   'schemaVersion', 'id', 'sessionId', 'turnId', 'stepId', 'taskId', 'type', 'status', 'phase', 'revision',
   'content', 'startedAt', 'completedAt', 'createdAt', 'updatedAt',
@@ -43,6 +54,7 @@ export function redactStreamEventPayload(eventType: string, payload: unknown, id
   const finalContent = projectCompletedFinalContent(eventType, payload, identity)
   if (finalContent) return finalContent
   const redacted = redactStreamValue(payload)
+  if (eventType === 'turn.completed') return projectCompletedTurnIdentity(payload, redacted, identity)
   if (eventType !== 'item.started' && eventType !== 'item.delta') return redacted
 
   const snapshot = taskGraphSnapshotFromEvent(eventType, payload, identity)
@@ -65,6 +77,52 @@ export function redactStreamEventPayload(eventType: string, payload: unknown, id
       content: redactTaskGraphSnapshot(snapshot, generatedTaskIds),
     },
   }
+}
+
+function projectCompletedTurnIdentity(payload: unknown, redacted: unknown, identity: StreamItemIdentity): unknown {
+  if (!isRecord(redacted)) return redacted
+  const output = { ...redacted }
+  for (const key of ['turnId', 'taskId', 'finalItemId'] as const) delete output[key]
+  if (!isRecord(payload)) return output
+
+  const turnId = payload.turnId, taskId = payload.taskId, finalItemId = payload.finalItemId
+  if (!isSafeTerminalIdentity(turnId) || !isSafeTerminalIdentity(taskId) || !isSafeTerminalIdentity(finalItemId)) return output
+  if (turnId !== identity.turnId || taskId !== identity.taskId || finalItemId !== identity.itemId) return output
+
+  if (![turnId, taskId, finalItemId].every(isSafeTerminalIdentityContent)) return output
+  output.turnId = turnId
+  output.taskId = taskId
+  output.finalItemId = finalItemId
+  return output
+}
+
+function isSafeTerminalIdentityContent(value: string): boolean {
+  if (ID_CREDENTIAL_PREFIX.test(value) || EMBEDDED_ID_CREDENTIAL_MARKER.test(value) || EMBEDDED_ID_CREDENTIAL_TOKEN.test(value)
+    || hasPhoneShapedUnderscoreIdComponent(value) || hasUnseparatedUuidComponent(value)) return false
+  const safeText = value.replace(UUID_V4_COMPONENTS, (_match, separator: string, component: string) => `${separator}${'a'.repeat(component.length)}`)
+  return redactSensitiveText(safeText) === safeText
+}
+
+function hasUnseparatedUuidComponent(value: string): boolean {
+  return Array.from(value.matchAll(UUID_V4_COMPONENT)).some(match => {
+    const start = match.index ?? 0, end = start + match[0].length
+    return !isIdentityDelimiter(value[start - 1]) || !isIdentityDelimiter(value[end])
+  })
+}
+
+function isIdentityDelimiter(value: string | undefined): boolean {
+  return value === undefined || !/[A-Za-z0-9]/u.test(value)
+}
+
+function hasPhoneShapedUnderscoreIdComponent(value: string): boolean {
+  const withoutStableId = value.replace(STABLE_ID_COMPONENT, '$1opaque')
+  return Array.from(withoutStableId.matchAll(PHONE_SHAPED_UNDERSCORE_ID_COMPONENT))
+    .some(([, component]) => !!component && component.replace(/\D/g, '').length >= 10)
+}
+
+function isSafeTerminalIdentity(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_TERMINAL_ID_LENGTH
+    && value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value)
 }
 
 function projectCompletedFinalContent(eventType: string, payload: unknown, identity: StreamItemIdentity): unknown | null {

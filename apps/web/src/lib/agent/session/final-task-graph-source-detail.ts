@@ -18,6 +18,8 @@ import {
   type TaskGraphSourceTaskStatus,
 } from './final-task-graph-source-manifest'
 
+const MAX_TASK_GRAPH_NODES = 11
+
 export interface FinalTaskGraphSourceDetail {
   readonly goal: string
   readonly role: TaskGraphSourceRole
@@ -78,7 +80,7 @@ export function projectFinalTaskGraphSourceDetail(input: {
     || graph.turnId !== finalItem.turnId || graph.taskId !== turn.rootTaskId
     || graph.type !== 'task_graph' || graph.revision !== manifest.graphRevision) return null
   const snapshot = parseTaskGraphSnapshot(graph.content)
-  if (!snapshot || snapshot.nodes.length < 1 || snapshot.nodes.length > 8) return null
+  if (!snapshot || snapshot.nodes.length < 1 || snapshot.nodes.length > MAX_TASK_GRAPH_NODES) return null
   const taskIds = [turn.rootTaskId as string, ...snapshot.nodes.map(node => node.taskId)]
   if (new Set(taskIds).size !== taskIds.length || taskIds.some(id => !boundedId(id))) return null
 

@@ -101,6 +101,144 @@ describe("V2 agent event stream", () => {
     await reader.cancel()
   })
 
+  it("keeps the final-item binding in a serialized durable turn completion", async () => {
+    const controller = new AbortController()
+    const turnId = "turn_1"
+    const taskId = "root-task"
+    const phoneShapedUuid = "12345678-9012-4def-8abc-123456789abc"
+    const finalItemId = `turn:${turnId}:item:final:turn:${turnId}:step:0:${phoneShapedUuid}`
+    const terminal = {
+      id: "terminal-event", sessionId: "session_1", turnId, itemId: finalItemId, taskId,
+      sequence: BigInt(1), type: "turn.completed", actor: "orchestrator", correlationId: "terminal-correlation",
+      causationId: null, idempotencyKey: null,
+      payload: { turnId, taskId, finalItemId, usage: { inputTokens: 1, outputTokens: 1 } },
+    }
+    const stream = createV2EventStream(db([terminal]) as never, {
+      sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal,
+      redisFactory: () => null, eventRedisFactory: () => null, dbPollMs: 1, heartbeatMs: 60_000,
+    })
+    const reader = stream.getReader()
+    try {
+      const first = await reader.read()
+      expect(first.done).toBe(false)
+      const text = new TextDecoder().decode(first.value)
+      const data = text.split("data: ")[1]?.split("\n")[0]
+      expect(data).toBeDefined()
+      const frame = JSON.parse(data!) as {
+        type: string; turnId: string; taskId: string; itemId: string | null;
+        payload: { turnId: string; taskId: string; finalItemId: string }
+      }
+      expect(frame).toMatchObject({
+        type: "turn.completed", turnId, taskId, itemId: finalItemId,
+        payload: { turnId, taskId, finalItemId },
+      })
+      expect(frame.itemId).toBe(frame.payload.finalItemId)
+    } finally {
+      controller.abort()
+      await reader.cancel()
+    }
+  })
+
+  it("does not restore a phone-shaped final-item ID into the terminal payload", async () => {
+    const controller = new AbortController()
+    const turnId = "turn_1"
+    const taskId = "root-task"
+    const finalItemId = "+353 86 123 4567"
+    const terminal = {
+      id: "terminal-phone-id-event", sessionId: "session_1", turnId, itemId: finalItemId, taskId,
+      sequence: BigInt(1), type: "turn.completed", actor: "orchestrator", correlationId: "terminal-correlation",
+      causationId: null, idempotencyKey: null,
+      payload: { turnId, taskId, finalItemId, note: "Call +353 86 123 4567" },
+    }
+    const stream = createV2EventStream(db([terminal]) as never, {
+      sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal,
+      redisFactory: () => null, eventRedisFactory: () => null, dbPollMs: 1, heartbeatMs: 60_000,
+    })
+    const reader = stream.getReader()
+    try {
+      const first = await reader.read()
+      const text = new TextDecoder().decode(first.value)
+      const data = text.split("data: ")[1]?.split("\n")[0]
+      expect(data).toBeDefined()
+      const frame = JSON.parse(data!) as { itemId: string | null; payload: Record<string, unknown> }
+      expect(frame.itemId).toBe(finalItemId)
+      for (const key of ["turnId", "taskId", "finalItemId"]) expect(frame.payload).not.toHaveProperty(key)
+      expect(frame.payload.note).toBe("Call [REDACTED_PHONE]")
+    } finally {
+      controller.abort()
+      await reader.cancel()
+    }
+  })
+
+  it("preserves validated terminal identities in durable SSE and Last-Event-ID replay", async () => {
+    const sessionId = "session-synthetic"
+    const turnId = "12345678-1234-4234-8234-123456789012"
+    const taskId = `root-${turnId}`
+    const stepId = `turn:${turnId}:step:0:12345678-1234-4234-8234-123456789012`
+    const finalItemId = `turn:${turnId}:item:final:${stepId}`
+    const terminal = {
+      id: "terminal-event-synthetic", sessionId, turnId, itemId: finalItemId, taskId,
+      sequence: BigInt(42), type: "turn.completed", actor: "orchestrator", correlationId: stepId,
+      causationId: null, idempotencyKey: `turn:${turnId}:event:turn-completed`,
+      payload: {
+        turnId, taskId, finalItemId, note: "Call 415-555-2671",
+        authorization: "Bearer synthetic-secret-token", email: "candidate@example.test",
+      },
+    }
+    const database = db([terminal])
+    const readTerminalFrame = async (afterSequence: bigint) => {
+      const controller = new AbortController()
+      const stream = createV2EventStream(database as never, {
+        sessionId, afterSequence, signal: controller.signal, redisFactory: () => null, eventRedisFactory: () => null, dbPollMs: 1, heartbeatMs: 60_000,
+      })
+      const reader = stream.getReader()
+      try {
+        const text = new TextDecoder().decode((await reader.read()).value)
+        const data = text.split("data: ")[1]?.split("\n")[0]
+        if (!data) throw new Error("Stream frame is missing its data payload")
+        return {
+          text,
+          frame: JSON.parse(data) as {
+            type: string; turnId: string; taskId: string; itemId: string | null; payload: Record<string, unknown>
+          },
+        }
+      } finally {
+        controller.abort()
+        await reader.cancel()
+      }
+    }
+    const assertTerminalIdentity = (frame: Awaited<ReturnType<typeof readTerminalFrame>>["frame"]) => {
+      expect(frame.type === "turn.completed").toBe(true)
+      expect(frame.turnId === turnId).toBe(true)
+      expect(frame.taskId === taskId).toBe(true)
+      expect(frame.itemId === finalItemId).toBe(true)
+      expect(frame.payload.turnId === frame.turnId).toBe(true)
+      expect(frame.payload.taskId === frame.taskId).toBe(true)
+      expect(frame.payload.finalItemId === frame.itemId).toBe(true)
+    }
+
+    const initial = await readTerminalFrame(BigInt(0))
+    expect(initial.text.includes("event: turn.completed\nid: 42\n")).toBe(true)
+    assertTerminalIdentity(initial.frame)
+    expect(initial.frame.payload.note === "Call [REDACTED_PHONE]").toBe(true)
+    expect(initial.frame.payload.authorization === "[REDACTED]").toBe(true)
+    expect(initial.frame.payload.email === "[REDACTED]").toBe(true)
+
+    const lastEventId = parseAfterSequence(new Request("http://localhost/events", { headers: { "Last-Event-ID": "41" } }))
+    if (typeof lastEventId !== "bigint") throw new Error("Expected valid Last-Event-ID to parse as bigint")
+    expect(lastEventId === BigInt(41)).toBe(true)
+    const replay = await readTerminalFrame(lastEventId)
+    expect(replay.text.includes("event: turn.completed\nid: 42\n")).toBe(true)
+    assertTerminalIdentity(replay.frame)
+    expect(replay.frame.payload.note === "Call [REDACTED_PHONE]").toBe(true)
+    expect(replay.frame.payload.authorization === "[REDACTED]").toBe(true)
+    expect(replay.frame.payload.email === "[REDACTED]").toBe(true)
+    expect(JSON.stringify(initial.frame) === JSON.stringify(replay.frame)).toBe(true)
+    expect(database.agentEvent.findMany).toHaveBeenLastCalledWith(expect.objectContaining({
+      where: { sessionId, sequence: { gt: BigInt(41) } },
+    }))
+  })
+
   it("projects raw call, item, event, cause, and idempotency identities on durable SSE", async () => {
     const rawCallId = "+353851234567"
     const callItemId = `turn:turn_1:item:tool-call:${rawCallId}:call-suffix`

@@ -182,7 +182,7 @@ function rootRecoveryPool(turnStatus: string | "missing" | "mismatched", rootOve
     }
     if (sql.includes("FOR UPDATE OF task")) return { rows: [{ ...root, status: rootStatus, sessionStatus: "running" }], rowCount: 1 }
     if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
-    if (sql.includes('SELECT item."id"')) return { rows: [{ id: itemId, revision, content: snapshot, createdAt: now }], rowCount: 1 }
+    if (sql.startsWith('SELECT item."id", item."revision", item."content", item."createdAt"')) return { rows: [{ id: itemId, revision, content: snapshot, createdAt: now }], rowCount: 1 }
     if (sql.includes('SELECT task."id", task."status", task."role"')) {
       const requested = values?.[0] as string[]
       return { rows: requested.flatMap(id => { const task = tasks.get(id); return task ? [{ ...task, status: statuses.get(id) }] : [] }), rowCount: requested.length }
@@ -938,7 +938,7 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
       if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ scanHorizon: checkedAt, checkedAt }], rowCount: 1 }
       if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: 1, userId: "user-1" }], rowCount: 1 }
       if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
-      if (sql.includes('SELECT item."id"')) return { rows: [{ id: taskGraphItemId("root-1"), revision, content: snapshot, createdAt: checkedAt }], rowCount: 1 }
+      if (sql.startsWith('SELECT item."id", item."revision", item."content", item."createdAt"')) return { rows: [{ id: taskGraphItemId("root-1"), revision, content: snapshot, createdAt: checkedAt }], rowCount: 1 }
       if (sql.includes('SELECT task."id", task."status", task."role"')) return { rows: [{ id: "child-1", status: taskStatus, role: "analyst", taskType: "analysis", expectedOutputSchema: {}, failureReason: taskFailureReason, result: taskResult }], rowCount: 1 }
       if (sql.includes('SELECT event."type", event."itemId"')) return {
         rows: [proposalRow, ...(lifecyclePayload ? [lifecycleEventRow(JSON.parse(lifecyclePayload))] : [])], rowCount: lifecyclePayload ? 2 : 1,
@@ -992,7 +992,7 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
       }
       if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: 1, userId: "user-1" }], rowCount: 1 }
       if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
-      if (sql.includes('SELECT item."id"')) return { rows: [{ id: taskGraphItemId("root-1"), revision, content: snapshot, createdAt: new Date("2026-09-01T00:00:00.000Z") }], rowCount: 1 }
+      if (sql.startsWith('SELECT item."id", item."revision", item."content", item."createdAt"')) return { rows: [{ id: taskGraphItemId("root-1"), revision, content: snapshot, createdAt: new Date("2026-09-01T00:00:00.000Z") }], rowCount: 1 }
       if (sql.includes('SELECT task."id", task."status", task."role"')) return { rows: [{ id: "child-1", status: taskStatus, role: "analyst", taskType: "analysis", expectedOutputSchema: {}, failureReason: null, result: null }], rowCount: 1 }
       if (sql.includes('SELECT event."type", event."itemId"')) return {
         rows: [proposalRow, ...(lifecyclePayload ? [lifecycleEventRow(JSON.parse(lifecyclePayload))] : [])], rowCount: lifecyclePayload ? 2 : 1,
@@ -1046,7 +1046,7 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
       }
       if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: 1, userId: "user-1" }], rowCount: 1 }
       if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
-      if (sql.includes('SELECT item."id"')) return { rows: [{ id: taskGraphItemId("root-1"), revision, content: snapshot, createdAt: new Date("2026-09-01T00:00:00Z") }], rowCount: 1 }
+      if (sql.startsWith('SELECT item."id", item."revision", item."content", item."createdAt"')) return { rows: [{ id: taskGraphItemId("root-1"), revision, content: snapshot, createdAt: new Date("2026-09-01T00:00:00Z") }], rowCount: 1 }
       if (sql.includes('SELECT task."id", task."status", task."role"')) return {
         rows: [...statuses].map(([id, taskStatus]) => ({ id, status: taskStatus, role: "analyst", taskType: "analysis", expectedOutputSchema: {}, failureReason: null, result: null })), rowCount: statuses.size,
       }

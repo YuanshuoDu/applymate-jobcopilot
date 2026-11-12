@@ -2,6 +2,65 @@ import type { TimelineEvent, TimelineItem, TimelineItemSource } from './timeline
 
 /** Index helpers for the canonical Phase 9 timeline state root. */
 
+export interface FinalTurnCompletedDiagnostic {
+  eventNameMatches: boolean; rawTypeMatches: boolean; rawSessionMatches: boolean; rawTurnMatches: boolean
+  rawActorMatches: boolean; rawPayloadRecord: boolean; rawPayloadTurnMatches: boolean; rawFinalItemMatchesEventItem: boolean
+  normalized: boolean; normalizedSessionMatches: boolean; normalizedTurnMatches: boolean
+}
+
+export interface FinalItemTargetDiagnostic {
+  targetSessionMatches: boolean; targetTurnMatches: boolean; actorMatches: boolean; sequencePresent: boolean
+  itemPresent: boolean; payloadRecord: boolean; payloadTurnMatches: boolean; payloadTaskMatches: boolean
+  finalItemMatchesEventItem: boolean; targetAccepted: boolean
+}
+
+export interface FinalItemHydrationDiagnostic {
+  requestStarted: boolean; responseReceived: boolean; responseCategory: 'ok' | 'non_ok' | 'unavailable'
+  jsonParsed: boolean; itemCountCategory: 'zero' | 'one' | 'many' | 'unavailable'
+  itemAccepted: boolean; projectionAccepted: boolean; replayDispatched: boolean
+}
+
+interface FinalAnswerDiagnosticsObserver {
+  matchesTarget(sessionId: unknown, turnId: unknown): boolean
+  recordTurnCompleted(summary: FinalTurnCompletedDiagnostic): void
+  recordFinalItemTarget(summary: FinalItemTargetDiagnostic): void
+  recordFinalItemHydration(summary: FinalItemHydrationDiagnostic): void
+}
+
+/** Returns only the E2E-installed observer; every diagnostic callback is fail-silent. */
+export function getFinalAnswerDiagnostics(): FinalAnswerDiagnosticsObserver | null {
+  if (typeof window === 'undefined') return null
+  const observer = (window as Window & { __applymateFinalDiagnostics?: unknown }).__applymateFinalDiagnostics
+  if (!isRecord(observer) || typeof observer.matchesTarget !== 'function' || typeof observer.recordTurnCompleted !== 'function' ||
+    typeof observer.recordFinalItemTarget !== 'function' || typeof observer.recordFinalItemHydration !== 'function') return null
+  const typed = observer as unknown as FinalAnswerDiagnosticsObserver
+  return {
+    matchesTarget: (sessionId, turnId) => safely(() => typed.matchesTarget(sessionId, turnId) === true, false),
+    recordTurnCompleted: summary => safely(() => typed.recordTurnCompleted(summary), undefined),
+    recordFinalItemTarget: summary => safely(() => typed.recordFinalItemTarget(summary), undefined),
+    recordFinalItemHydration: summary => safely(() => typed.recordFinalItemHydration(summary), undefined),
+  }
+}
+
+export function observeFinalTurnCompleted(frameName: string, value: unknown, event: TimelineEvent | null, sessionId: string): void {
+  const diagnostics = getFinalAnswerDiagnostics()
+  if (!diagnostics) return
+  const raw = isRecord(value) ? value : null
+  if (frameName !== 'turn.completed' && raw?.type !== 'turn.completed') return
+  const payload = raw && isRecord(raw.payload) ? raw.payload : null
+  diagnostics.recordTurnCompleted({
+    eventNameMatches: frameName === 'turn.completed', rawTypeMatches: raw?.type === 'turn.completed',
+    rawSessionMatches: raw?.sessionId === sessionId, rawTurnMatches: Boolean(raw && diagnostics.matchesTarget(raw.sessionId, raw.turnId)),
+    rawActorMatches: raw?.actor === 'orchestrator', rawPayloadRecord: payload !== null,
+    rawPayloadTurnMatches: Boolean(raw && payload && payload.turnId === raw.turnId),
+    rawFinalItemMatchesEventItem: Boolean(raw && payload && payload.finalItemId === raw.itemId),
+    normalized: event?.type === 'turn.completed', normalizedSessionMatches: event?.sessionId === sessionId,
+    normalizedTurnMatches: Boolean(event && diagnostics.matchesTarget(event.sessionId, event.turnId)),
+  })
+}
+
+function safely<T>(run: () => T, fallback: T): T { try { return run() } catch { return fallback } }
+
 export function buildEventIndexes(input: TimelineEvent[]) {
   const events = [...new Map(input.map(event => [event.id, event])).values()].sort(compareEvents)
   const byId = new Map<string, TimelineEvent>()
