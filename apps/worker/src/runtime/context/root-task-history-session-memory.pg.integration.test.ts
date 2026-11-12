@@ -561,7 +561,7 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     }
   })
 
-  it("fails closed at the exhausted version for matching old and new Sessions while Task History stays independent", async () => {
+  it("keeps matching old and new Sessions denied at the exhausted version after terminal opt-out", async () => {
     const userId = await createUser(), maxVersion = 2_147_483_647
     await setConsent(userId, true, 0)
     await pool!.query(`UPDATE "User" SET "agentSearchFootprintMemoryEnabled"=TRUE,
@@ -577,6 +577,21 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     try {
       const read = (fixture: Fixture) => withContextTransaction(fixture,
         async (_client, _authorization, historyAllowed, searchAllowed) => ({ historyAllowed, searchAllowed }))
+      for (const fixture of [oldFixture, newFixture]) {
+        const result = await read(fixture)
+        expect(result.historyReadAllowed).toBe(true)
+        expect(result.searchFootprintReadAllowed).toBe(false)
+        expect(result.workResult).toEqual({ historyAllowed: true, searchAllowed: false })
+      }
+
+      const revoked = await pool!.query<{ enabled: boolean; version: number }>(`UPDATE "User"
+        SET "agentSearchFootprintMemoryEnabled"=FALSE
+        WHERE "id"=$1 AND "agentSearchFootprintMemoryEnabled"=TRUE
+          AND "agentSearchFootprintMemoryConsentVersion"=$2
+        RETURNING "agentSearchFootprintMemoryEnabled" AS "enabled",
+          "agentSearchFootprintMemoryConsentVersion" AS "version"`, [userId, maxVersion])
+      expect(revoked.rows[0]).toEqual({ enabled: false, version: maxVersion })
+
       for (const fixture of [oldFixture, newFixture]) {
         const result = await read(fixture)
         expect(result.historyReadAllowed).toBe(true)

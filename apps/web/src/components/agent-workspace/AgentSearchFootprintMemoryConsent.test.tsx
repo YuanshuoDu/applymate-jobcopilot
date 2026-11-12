@@ -24,7 +24,7 @@ vi.mock('react', async (importOriginal) => {
 import { AgentSearchFootprintMemoryConsent } from './AgentSearchFootprintMemoryConsent'
 
 const MAX_CONSENT_VERSION = 2_147_483_647
-type CheckboxProps = { onChange: (event: { currentTarget: { checked: boolean } }) => void }
+type CheckboxProps = { checked: boolean; disabled: boolean; onChange: (event: { currentTarget: { checked: boolean } }) => void }
 
 function findCheckbox(value: React.ReactNode): React.ReactElement<CheckboxProps> | undefined {
   for (const child of React.Children.toArray(value)) {
@@ -75,15 +75,32 @@ describe('AgentSearchFootprintMemoryConsent', () => {
     expect(html).not.toContain('disabled=""')
   })
 
-  it.each([true, false])('shows history unavailable and no toggle at the version limit (saved choice: %s)', enabled => {
-    hookState.overrides = [{ enabled, version: MAX_CONSENT_VERSION }, false, false, '']
+  it('allows an enabled exhausted choice to be turned off once', async () => {
+    hookState.overrides = [{ enabled: true, version: MAX_CONSENT_VERSION }, false, false, '']
+    const fetchMock = vi.fn(async () => response(200, { enabled: false, version: MAX_CONSENT_VERSION }))
+    vi.stubGlobal('fetch', fetchMock)
+    const checkbox = checkboxFromComponent()
+    hookState.overrides = [{ enabled: true, version: MAX_CONSENT_VERSION }, false, false, '']
     const html = renderToStaticMarkup(<AgentSearchFootprintMemoryConsent />)
 
-    expect(html).toContain('Search history is unavailable because the consent version limit was reached')
-    expect(html).toContain('This setting cannot currently be changed')
-    expect(html).not.toContain('<input')
-    expect(html).not.toContain('>On</label>')
-    expect(html).not.toContain('>Off</label>')
+    expect(html).toContain('Search history is unavailable. You can turn off the saved choice here')
+    expect(checkbox.props.checked).toBe(true)
+    expect(checkbox.props.disabled).toBe(false)
+    expect(html).toContain('>On (unavailable)</label>')
+    checkbox.props.onChange({ currentTarget: { checked: false } })
+    await vi.waitFor(() => expect(hookState.setters[0]).toHaveBeenCalledWith({ enabled: false, version: MAX_CONSENT_VERSION }))
+    expect(fetchMock).toHaveBeenCalledWith('/api/me/agent-search-footprint-memory', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: false, expectedVersion: MAX_CONSENT_VERSION }),
+    })
+
+    hookState.overrides = [{ enabled: false, version: MAX_CONSENT_VERSION }, false, false, '']
+    const disabledCheckbox = checkboxFromComponent()
+    hookState.overrides = [{ enabled: false, version: MAX_CONSENT_VERSION }, false, false, '']
+    const disabledHtml = renderToStaticMarkup(<AgentSearchFootprintMemoryConsent />)
+    expect(disabledHtml).toContain('this choice is off. It cannot be turned on again')
+    expect(disabledCheckbox.props.checked).toBe(false)
+    expect(disabledCheckbox.props.disabled).toBe(true)
     expect(html).not.toContain('This setting changed elsewhere')
   })
 
@@ -111,19 +128,20 @@ describe('AgentSearchFootprintMemoryConsent', () => {
     })
   })
 
-  it('shows exhaustion rather than a stale-choice message after an exhausted response', async () => {
-    hookState.overrides = [{ enabled: false, version: MAX_CONSENT_VERSION - 1 }, false, false, '']
+  it('keeps an exhausted opt-out locked off after a rejected re-enable response', async () => {
+    hookState.overrides = [{ enabled: false, version: MAX_CONSENT_VERSION }, false, false, '']
     vi.stubGlobal('fetch', vi.fn(async () => response(409, {
-      error: 'VERSION_EXHAUSTED', enabled: true, version: MAX_CONSENT_VERSION,
+      error: 'VERSION_EXHAUSTED', enabled: false, version: MAX_CONSENT_VERSION,
     })))
     checkboxFromComponent().props.onChange({ currentTarget: { checked: true } })
 
-    await vi.waitFor(() => expect(hookState.setters[0]).toHaveBeenCalledWith({ enabled: true, version: MAX_CONSENT_VERSION }))
+    await vi.waitFor(() => expect(hookState.setters[0]).toHaveBeenCalledWith({ enabled: false, version: MAX_CONSENT_VERSION }))
     expect(hookState.setters[3]).not.toHaveBeenCalledWith('This setting changed elsewhere. The latest saved choice is shown.')
-    hookState.overrides = [{ enabled: true, version: MAX_CONSENT_VERSION }, false, false, '']
+    hookState.overrides = [{ enabled: false, version: MAX_CONSENT_VERSION }, false, false, '']
     const html = renderToStaticMarkup(<AgentSearchFootprintMemoryConsent />)
     expect(html).toContain('Search history is unavailable')
-    expect(html).not.toContain('<input')
+    expect(html).toContain('<input')
+    expect(checkboxFromComponent().props.disabled).toBe(true)
   })
 
   it.each([
