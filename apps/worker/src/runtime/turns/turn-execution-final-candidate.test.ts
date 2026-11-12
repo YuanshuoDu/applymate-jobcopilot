@@ -285,7 +285,7 @@ describe("atomic TaskGraph finalization recovery", () => {
     expect(refreshed.system[0]?.content).toContain("graph revision 41")
   })
 
-  it("formats current task outcomes in final.summary without changing model response or exposing private task data", async () => {
+  it("grounds the bound final response in current TaskGraph results instead of model overclaims", async () => {
     const partialScoutResult = (jobId: string) => ({
       schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "partial",
       candidates: [{ jobId, source: "private-source", url: `https://private.test/${jobId}`, evidenceIds: [`private-evidence:${jobId}`] }],
@@ -334,7 +334,7 @@ describe("atomic TaskGraph finalization recovery", () => {
       idFactory: (value: string) => value,
     } as unknown as TurnExecutionOptions
     const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [{ id: "job-1", kind: "job" as const, ownerId: "user-1" }], toolObservations: [] }
-    const candidate = "The model's final answer remains exactly as generated."
+    const candidate = "All requested work is complete; I prepared every job and submitted all applications to employers."
 
     const outcome = await completeWithTestDefaults({
       options, writer: { append: vi.fn(async () => "event-1") } as unknown as TurnExecutionEventWriter,
@@ -344,10 +344,25 @@ describe("atomic TaskGraph finalization recovery", () => {
       signal: new AbortController().signal, now: () => new Date(), onStepClosed: vi.fn(),
     })
 
-    expect(outcome).toMatchObject({ kind: "completed", result: { finalText: candidate } })
+    expect(outcome).toMatchObject({ kind: "completed" })
     const recorded = saved[0] as { response: string; terminal: { finalItemId: string; finalContent: { text: string; final: { response: string; summary: string; taskGraphSources?: unknown }; taskGraphSources?: { schemaVersion: string; graphRevision: number; sources: readonly { sourceKey: string; nodeIndex: number; role: string; taskStatus: string; resultState: string }[] } }; [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: typeof binding } }
-    const serialized = JSON.parse(recorded.response) as { response: string; summary: string }
-    expect(serialized.response).toBe(candidate)
+    const serialized = JSON.parse(recorded.response) as { response: string; summary: string; completed: boolean }
+    expect(serialized.response).not.toContain(candidate)
+    expect(serialized.response).not.toContain("All requested work is complete")
+    expect(serialized.response).not.toContain("submitted all applications")
+    expect(serialized.completed).toBe(true)
+    expect(outcome.kind === "completed" && outcome.result.finalText).toBe(serialized.response)
+    expect(serialized.response).toContain("Search results: 2 unique jobs reported (partial coverage).")
+    expect(serialized.response).toContain("Analysis results: unavailable (no valid structured result).")
+    expect(serialized.response).toContain("Analysis: 1 failed task; structured result missing.")
+    expect(serialized.response).toContain("Preparation outcomes: 4 job outcome records reported (partial coverage).")
+    expect(serialized.response).toContain("Preparation statuses reported: prepared 2, skipped 1, failed 1.")
+    expect(serialized.response).toContain("These records may repeat a job across tasks and do not count applications or submissions.")
+    expect(serialized.response).toContain("Artifact references: 0 artifact references reported (partial coverage).")
+    expect(serialized.response).toContain("Reviewer outcomes: unavailable (no valid structured result).")
+    expect(serialized.response).toContain("Review: 1 completed task; structured result invalid.")
+    expect(serialized.response).toContain("These are structured task reports, not independent verification.")
+    expect(serialized.response).toContain("Prepared materials do not confirm that an application was submitted or received by an employer.")
     const expectedOverview = "Recorded task outcomes (earlier attempts may be superseded; not verification): role=analyst, task state=failed, result structure=missing, reported result status=not reported: 1; role=prepare, task state=completed, result structure=valid, reported result status=completed: 1; role=prepare, task state=completed, result structure=valid, reported result status=partial: 1; role=reviewer, task state=completed, result structure=invalid, reported result status=not reported: 1; role=scout, task state=completed, result structure=valid, reported result status=partial: 1; 1 outcome group omitted."
     expect(serialized.summary).toBe(formatTaskGraphFinalSummary(binding.summary))
     expect(serialized.summary.slice(serialized.summary.indexOf("Recorded task outcomes"))).toBe(expectedOverview)
@@ -356,8 +371,8 @@ describe("atomic TaskGraph finalization recovery", () => {
     expect(serialized.summary).toContain("Prepare-reported outcome records (observed per task; repeated jobs may count separately; submission not verified): prepared=2, skipped=1, failed=1.")
     expect(serialized.summary.length).toBeLessThanOrEqual(1_000)
     expect(new TextEncoder().encode(serialized.summary).byteLength).toBeLessThanOrEqual(1_000)
-    expect(recorded.terminal.finalContent.text).toBe(candidate)
-    expect(recorded.terminal.finalContent.final.response).toBe(candidate)
+    expect(recorded.terminal.finalContent.text).toBe(serialized.response)
+    expect(recorded.terminal.finalContent.final.response).toBe(serialized.response)
     expect(recorded.terminal.finalContent.final.summary).toBe(serialized.summary)
     expect(recorded.terminal.finalContent.taskGraphSources).toMatchObject({
       schemaVersion: "agent-harness.v2.task-graph-sources.v1", graphRevision: 41,
@@ -370,6 +385,7 @@ describe("atomic TaskGraph finalization recovery", () => {
     expect(recorded.terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toBe(binding)
     for (const privateValue of ["task-private-", "job-private-", "root-private-id", "PRIVATE_TASK_PROSE_DO_NOT_RENDER", "PRIVATE_FAILURE_REASON", "private.test", "graphRevision"]) {
       expect(serialized.summary).not.toContain(privateValue)
+      expect(serialized.response).not.toContain(privateValue)
     }
     expect(JSON.stringify(recorded)).not.toContain("task_graph_final_summary_binding")
   })
