@@ -9,4 +9,4 @@ RUN --network=none pnpm --filter @jobcopilot/agent-protocol build && pnpm --filt
 RUN --network=none node e2e/application-authenticated-preparation-adapter.test.cjs
 RUN --network=none node e2e/application-authenticated-preparation-inject.test.cjs
 RUN --network=none DATABASE_URL=postgresql://fixture:fixture@db:5432/application_flow_fixture APPLICATION_AUTH_PREPARATION_BUILD=true node e2e/application-authenticated-preparation-inject.cjs
-RUN --network=none NEXT_FONT_GOOGLE_MOCKED_RESPONSES=/workspace/e2e/application-authenticated-font.cjs AUTH_SECRET=fixture-only-secret-at-least-32-bytes DATABASE_URL=postgresql://fixture:fixture@db:5432/application_flow_fixture DIRECT_URL=postgresql://fixture:fixture@db:5432/application_flow_fixture pnpm --filter web build
+RUN --network=none NODE_OPTIONS=--max-old-space-size=4096 NEXT_FONT_GOOGLE_MOCKED_RESPONSES=/workspace/e2e/application-authenticated-font.cjs AUTH_SECRET=fixture-only-secret-at-least-32-bytes DATABASE_URL=postgresql://fixture:fixture@db:5432/application_flow_fixture DIRECT_URL=postgresql://fixture:fixture@db:5432/application_flow_fixture pnpm --filter web build
