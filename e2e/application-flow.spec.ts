@@ -296,7 +296,6 @@ async function install(page: Page, options: { stale?: boolean; taskCheckpoint?: 
     }
     if (options.realAgent && pathname === '/api/me/agent-search-footprint-memory' && request.method() === 'GET') return json(route, { enabled: false, version: 0 })
     if (options.realAgent && pathname === '/api/me/agent-task-history-memory' && request.method() === 'GET') return json(route, { enabled: false, version: 0 })
-    if (options.realAgent && pathname === '/api/me/agent-search-footprint-memory' && request.method() === 'GET') return json(route, { enabled: false, version: 0 })
     if (options.realAgent && pathname === '/api/agent') return json(route, { autoApply: false, requireApproval: true, isRunning: false })
     if (pathname === '/api/resume/intake' && request.method() === 'POST') return json(route, { parsed: resume().content })
     // Synthetic response only: real ZIP generation and audit signatures are covered by isolated route tests.
