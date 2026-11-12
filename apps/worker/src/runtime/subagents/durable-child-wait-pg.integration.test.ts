@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
+import { AsyncLocalStorage } from "node:async_hooks"
 import { fileURLToPath } from "node:url"
 import { Queue, Worker } from "bullmq"
 import { Pool, type PoolClient } from "pg"
@@ -544,6 +545,7 @@ type RestoredWaitObservationSummary = {
 }
 
 function launchWorker(mode: "worker-a" | "worker-a-prior-tool" | "worker-a-prior-tool-failed" | "worker-a-crash" | "worker-b-crash-before-resume" | "worker-b-crash-resume" | "worker-b-crash-source-lifecycle" | "worker-b-crash-after-wait-ack" | "worker-b-crash-before-claim" | "worker-b-crash-after-orphan-reissue" | "worker-b-crash-after-claim-result" | "worker-b-loop-preclaim" | "worker-b-loop-claim-recovery-cut" | "worker-b-loop-claim-item-completed-cut" | "worker-b-loop-usage-lineage-cut" | "worker-b-loop-usage-lineage-reject" | "worker-b-loop-final" | "worker-b-loop-multi-preclaim" | "worker-b-loop-multi-complete-cut" | "worker-b-loop-two-waits" | "worker-b-loop-multi-reject" | "worker-b-legacy-consumed-seed" | "worker-b-legacy-consumed-source-only" | "worker-b-legacy-consumed-recovery" | "worker-b-legacy-consumed-final" | "worker-b", queueName: string, ids: FixtureIds): WorkerProcess {
+  assertRestartActive()
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, queueName, JSON.stringify(ids)], {
     cwd: workerCwd,
     env: { ...process.env, DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!, AGENT_TURN_REDIS_TEST_URL: redisUrl!,
@@ -559,7 +561,29 @@ function launchWorker(mode: "worker-a" | "worker-a-prior-tool" | "worker-a-prior
   child.stderr?.on("data", (chunk: string) => { child.stderrText += chunk })
   child.exited = new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal })))
   child.closed = new Promise(resolve => child.once("close", (code, signal) => resolve({ code, signal })))
+  restartScenario.getStore()?.workers.add(child)
   return child
+}
+
+const restartScenario = new AsyncLocalStorage<{ cancelled: boolean; workers: Set<WorkerProcess> }>()
+function assertRestartActive(): void {
+  if (restartScenario.getStore()?.cancelled) throw new Error("Child-wait fixture scenario cancelled")
+}
+
+function restartCase(name: string, run: () => Promise<void>, timeoutMs?: number): void {
+  it(name, async ({ onTestFailed }) => {
+    const state = { cancelled: false, workers: new Set<WorkerProcess>() }
+    let body: Promise<void>
+    // Vitest's wall-clock timeout does not cancel an async body. Drain its finally
+    // before another case can change REDIS_URL or close the shared connections.
+    onTestFailed(async () => {
+      state.cancelled = true
+      await Promise.all([...state.workers].map(stopWorker))
+      await body.catch(() => undefined)
+    }, 30_000)
+    body = restartScenario.run(state, run)
+    await body
+  }, timeoutMs)
 }
 
 function workerStartGateKey(ids: FixtureIds): string {
@@ -567,9 +591,14 @@ function workerStartGateKey(ids: FixtureIds): string {
 }
 
 async function waitForMarker(child: WorkerProcess, marker: string, timeoutMs = 20_000): Promise<void> {
+  const startedAt = Date.now()
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    if (child.stdoutText.includes(marker)) return
+    assertRestartActive()
+    if (child.stdoutText.includes(marker)) {
+      if (Date.now() - startedAt >= 1_000) console.info("child-wait fixture stage", { marker, elapsedMs: Date.now() - startedAt })
+      return
+    }
     if (child.exitCode !== null || child.signalCode !== null) {
       const exit = await child.closed
       throw new Error(`Worker exited before ${marker} (code=${exit.code}, signal=${exit.signal}); stdout: ${child.stdoutText}; stderr: ${child.stderrText}`)
@@ -1602,6 +1631,7 @@ function expectRestoredWaitObservation(child: WorkerProcess, state: RestoredWait
 async function waitFor<T>(read: () => Promise<T | null>, timeoutMs = 20_000): Promise<T> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
+    assertRestartActive()
     const value = await read()
     if (value !== null) return value
     await new Promise(resolve => setTimeout(resolve, 40))
@@ -3648,10 +3678,10 @@ async function stopWorker(child: WorkerProcess | undefined): Promise<void> {
 
 withServices("durable child wait across PostgreSQL/Redis Worker process restart", () => {
   let pool: Pool
-  beforeAll(() => { pool = new Pool({ connectionString: databaseUrl!, max: 8 }) })
+  beforeAll(() => { pool = new Pool({ connectionString: databaseUrl!, max: 8, connectionTimeoutMillis: 5_000, statement_timeout: 15_000 }) })
   afterAll(async () => { await pool?.end() })
 
-  it("parses the recovered child-wait blocker query on disposable PostgreSQL", async () => {
+  restartCase("parses the recovered child-wait blocker query on disposable PostgreSQL", async () => {
     const suffix = randomUUID()
     const snapshot: BlockingTaskSnapshot = {
       id: `missing-wait-task-${suffix}`, userId: `missing-wait-user-${suffix}`,
@@ -3670,7 +3700,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     }
   })
 
-  it("recovers registered, pre-continuation, and streaming-continuation crash cuts on one attempt", async () => {
+  restartCase("recovers registered, pre-continuation, and streaming-continuation crash cuts on one attempt", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = {
       userId: `durable-child-wait-user-${suffix}`,
@@ -4348,7 +4378,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       try {
         const stalledRecoveryMonitor = new Worker<unknown, unknown>(queueName, async (): Promise<unknown> => {
           throw new Error("stalled-recovery-monitor-must-not-process-jobs")
-        }, { connection: queueRedis.duplicate(), concurrency: 1, lockDuration: 15_000, stalledInterval: 250,
+        }, { connection: queueRedis.duplicate(), concurrency: 1, lockDuration: 5_000, stalledInterval: 250,
           autorun: false, skipVersionCheck: true })
         stalledRecoveryWorker = stalledRecoveryMonitor
         try {
@@ -4570,7 +4600,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       try {
         const stalledRecoveryMonitor = new Worker<unknown, unknown>(queueName, async (): Promise<unknown> => {
           throw new Error("stalled-recovery-monitor-must-not-process-jobs")
-        }, { connection: queueRedis.duplicate(), concurrency: 1, lockDuration: 15_000, stalledInterval: 250,
+        }, { connection: queueRedis.duplicate(), concurrency: 1, lockDuration: 5_000, stalledInterval: 250,
           autorun: false, skipVersionCheck: true })
         stalledRecoveryWorker = stalledRecoveryMonitor
         try {
@@ -4674,7 +4704,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       queuePaused = true
       const finalStalledMonitor = new Worker<unknown, unknown>(queueName, async (): Promise<unknown> => {
         throw new Error("final-stalled-monitor-must-not-process-jobs")
-      }, { connection: queueRedis.duplicate(), concurrency: 1, lockDuration: 15_000, stalledInterval: 250,
+      }, { connection: queueRedis.duplicate(), concurrency: 1, lockDuration: 5_000, stalledInterval: 250,
         autorun: false, skipVersionCheck: true })
       stalledRecoveryWorker = finalStalledMonitor
       try {
@@ -4896,7 +4926,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     }
   }, 300_000)
 
-  it("repairs a legacy consumed wait before production restart loaders and reenters idempotently", async () => {
+  restartCase("repairs a legacy consumed wait before production restart loaders and reenters idempotently", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = {
       userId: `durable-child-wait-legacy-user-${suffix}`,
@@ -5219,7 +5249,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     }
   }, 180_000)
 
-  it("repairs an attempt-1 consumed wait under a synthetic attempt-2 lease before the production loader", async () => {
+  restartCase("repairs an attempt-1 consumed wait under a synthetic attempt-2 lease before the production loader", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = {
       userId: `durable-child-wait-legacy-a2-user-${suffix}`,
@@ -5499,7 +5529,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     }
   }, 180_000)
 
-  it("fails closed on a multi-call orphan receipt before executor or dispatcher use", async () => {
+  restartCase("fails closed on a multi-call orphan receipt before executor or dispatcher use", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = {
       userId: `durable-child-wait-multi-user-${suffix}`,
@@ -5637,7 +5667,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     }
   }, 60_000)
 
-  it("settles a real multi-tool continuation across a PostgreSQL/Redis process restart without replay", async () => {
+  restartCase("settles a real multi-tool continuation across a PostgreSQL/Redis process restart without replay", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = {
       userId: `durable-child-wait-multi-user-${suffix}`,
@@ -5807,7 +5837,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     }
   }, 180_000)
 
-  it("rebinds two distinct historical waits and completed claims across a PostgreSQL/Redis process restart", async () => {
+  restartCase("rebinds two distinct historical waits and completed claims across a PostgreSQL/Redis process restart", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = { userId: `durable-child-wait-two-user-${suffix}`, sessionId: `durable-child-wait-two-session-${suffix}`,
       turnId: `durable-child-wait-two-turn-${suffix}`, rootTaskId: "", waiterTaskId: "", targetTaskId: "",
@@ -6649,6 +6679,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         phase: "final", status: "completed", finalText: FINAL_MARKER, executorCalls: 0, dispatcherCalls: 0,
       })
       expect(await readClaimLifecycle()).toEqual(claimsBeforeRestart)
+      // LOOP_RESUMED is emitted inside the executor, before store.finish persists completion.
+      await waitForMarker(workerD, "WORKER_B_RESUMED")
       expect((await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null }>(
         `SELECT "status", "attemptCount", "leaseOwner" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
       [ids.waiterTaskId, ids.sessionId])).rows[0]).toMatchObject({ status: "completed", attemptCount: 1, leaseOwner: null })
@@ -6669,7 +6701,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     }
   }, 90_000)
 
-  it("rejects reordered nested prefix events for a recovered wait with a real prior noop", async () => {
+  restartCase("rejects reordered nested prefix events for a recovered wait with a real prior noop", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = { userId: `durable-child-wait-prior-crash-user-${suffix}`,
       sessionId: `durable-child-wait-prior-crash-session-${suffix}`, turnId: `durable-child-wait-prior-crash-turn-${suffix}`,
@@ -7171,7 +7203,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     }
   }, 150_000)
 
-  it("accepts PG-scale-8 receipt usage before failing closed on a later streaming step", async () => {
+  restartCase("accepts PG-scale-8 receipt usage before failing closed on a later streaming step", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = {
       userId: `durable-child-wait-round-user-${suffix}`,
@@ -7801,7 +7833,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     }
   }, 90_000)
 
-  it("selects the latest sequential wait by step ordinal at maxAttempts", async () => {
+  restartCase("selects the latest sequential wait by step ordinal at maxAttempts", async () => {
     const client = await pool.connect()
     try {
       await client.query(`CREATE TEMP TABLE "sub_agent_tasks" (

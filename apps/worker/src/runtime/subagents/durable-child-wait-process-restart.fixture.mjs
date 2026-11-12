@@ -1,29 +1,31 @@
+// Build the current Worker before this suite (CI uses turbo build --filter=@jobcopilot/worker).
+// Reuse emitted JS across real process restarts; TSX only resolves workspace extensionless imports.
 import { Pool } from "pg"
 import { Redis } from "ioredis"
 import { Worker } from "bullmq"
-import { AgentTreeManager } from "./manager.ts"
-import { PgSubagentTaskStore } from "./pg-store.ts"
-import { parseSubagentJobPayload } from "./types.ts"
-import { parseSubagentDispatchJobId } from "./dispatch-identity.ts"
-import { runSubagentQueueJob } from "../../queue/subagent-pause-dispatch.ts"
-import { createPgTurnEngineStore } from "../turns/turn-engine-store.ts"
-import { executionOwnerFence } from "../execution-owner.ts"
-import { registerDurableSubagentWait } from "./durable-subagent-wait-store.ts"
-import { startDurableWaitResolver } from "./durable-wait-resolver.ts"
-import { loadDurableSubagentWaitResume, commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.ts"
-import { loadChildAttemptResume } from "./child-resume.ts"
-import { repairConsumedChildWaitSources } from "./child-resume-consumed-wait-repair.ts"
-import { loadChildWaitCallRecovery } from "./child-resume-wait-call-recovery.ts"
-import { createProductionChildResumeLoaders } from "./production-child-resume-loaders.ts"
-import { acknowledgeDurableWaitAtContinuationStart, childResultStatus } from "./child-executor-admission.ts"
-import { createChildDurableWaitReplay } from "./child-durable-wait-replay.ts"
-import { TurnExecutionEventWriter, executeToolWithItems } from "../turns/turn-execution-events.ts"
-import { recoverPersistedToolCalls } from "../turns/turn-execution-tools.ts"
-import { childWaitClaimEventKey } from "./child-durable-wait-replay.ts"
+import { AgentTreeManager } from "../../../dist/runtime/subagents/manager.js"
+import { PgSubagentTaskStore } from "../../../dist/runtime/subagents/pg-store.js"
+import { parseSubagentJobPayload } from "../../../dist/runtime/subagents/types.js"
+import { parseSubagentDispatchJobId } from "../../../dist/runtime/subagents/dispatch-identity.js"
+import { runSubagentQueueJob } from "../../../dist/queue/subagent-pause-dispatch.js"
+import { createPgTurnEngineStore } from "../../../dist/runtime/turns/turn-engine-store.js"
+import { executionOwnerFence } from "../../../dist/runtime/execution-owner.js"
+import { registerDurableSubagentWait } from "../../../dist/runtime/subagents/durable-subagent-wait-store.js"
+import { startDurableWaitResolver } from "../../../dist/runtime/subagents/durable-wait-resolver.js"
+import { loadDurableSubagentWaitResume, commitDurableSubagentWaitResume } from "../../../dist/runtime/subagents/durable-subagent-wait-resume.js"
+import { loadChildAttemptResume } from "../../../dist/runtime/subagents/child-resume.js"
+import { repairConsumedChildWaitSources } from "../../../dist/runtime/subagents/child-resume-consumed-wait-repair.js"
+import { loadChildWaitCallRecovery } from "../../../dist/runtime/subagents/child-resume-wait-call-recovery.js"
+import { createProductionChildResumeLoaders } from "../../../dist/runtime/subagents/production-child-resume-loaders.js"
+import { acknowledgeDurableWaitAtContinuationStart, childResultStatus } from "../../../dist/runtime/subagents/child-executor-admission.js"
+import { createChildDurableWaitReplay } from "../../../dist/runtime/subagents/child-durable-wait-replay.js"
+import { TurnExecutionEventWriter, executeToolWithItems } from "../../../dist/runtime/turns/turn-execution-events.js"
+import { recoverPersistedToolCalls } from "../../../dist/runtime/turns/turn-execution-tools.js"
+import { childWaitClaimEventKey } from "../../../dist/runtime/subagents/child-durable-wait-replay.js"
 import { canonicalJson, redactSensitiveText } from "@jobcopilot/shared"
-import { contextToModelMessages } from "../turns/turn-engine-messages.ts"
-import { runTurnExecutionLoop } from "../turns/turn-execution-loop.ts"
-import { projectChildToolCallIdsForModelContext } from "../turns/turn-tool-call-id-projection.ts"
+import { contextToModelMessages } from "../../../dist/runtime/turns/turn-engine-messages.js"
+import { runTurnExecutionLoop } from "../../../dist/runtime/turns/turn-execution-loop.js"
+import { projectChildToolCallIdsForModelContext } from "../../../dist/runtime/turns/turn-tool-call-id-projection.js"
 import { readRecoveryStateSnapshot } from "./durable-child-wait-recovery-diagnostics.fixture.mjs"
 
 const [, , mode, queueName, rawIds] = process.argv
@@ -393,7 +395,8 @@ function poolWithRecoveryProgress(basePool, targetTaskId) {
 const recoveryTraceTaskId = process.env.NODE_ENV === "test" && mode === "worker-b-crash-resume"
   && process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID === ids.waiterTaskId
   ? process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID : undefined
-const basePool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 6 })
+const basePool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 6,
+  connectionTimeoutMillis: 5_000, statement_timeout: 15_000 })
 const pool = recoveryTraceTaskId ? poolWithRecoveryProgress(basePool, recoveryTraceTaskId) : basePool
 const redis = new Redis(process.env.AGENT_TURN_REDIS_TEST_URL, { maxRetriesPerRequest: null })
 const store = new PgSubagentTaskStore(pool, 30_000)
@@ -1572,7 +1575,7 @@ const worker = new Worker(queueName, async job => {
     }
   }
   return runSubagentQueueJob(pool, manager, executeWithDiagnostics, job.data, identity)
-}, { connection: redis, concurrency: 1, lockDuration: 15_000, skipVersionCheck: true,
+}, { connection: redis, concurrency: 1, lockDuration: 5_000, skipVersionCheck: true,
   ...(holdFinalWorkerForStaleDispatch ? { stalledInterval: 5_000 } : {}),
   autorun: mode !== "worker-b-loop-final" })
 
