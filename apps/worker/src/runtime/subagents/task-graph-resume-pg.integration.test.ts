@@ -4,7 +4,7 @@ import { spawn, type ChildProcess } from "node:child_process"
 import { isDeepStrictEqual } from "node:util"
 import { fileURLToPath } from "node:url"
 import { Queue, QueueEvents } from "bullmq"
-import { Pool, type PoolClient } from "pg"
+import { Pool, type PoolClient, type QueryConfig, type QueryResult, type QueryResultRow } from "pg"
 import { Redis } from "ioredis"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
@@ -570,6 +570,19 @@ const CHILD_OUTCOME_FAILURE_CODES = new Set([
   "policy_rewrite_expands_permissions", "tool_not_found", "tool_version_mismatch", "duplicate_tool", "invalid_definition",
   "schema_error", "tool_result_replay_uncertain", "tool_recovery_aborted", "invalid_structured_result",
 ])
+const SELECTED_JOB_REVIEW_FAILURE_CODES = new Set([
+  ...CHILD_OUTCOME_FAILURE_CODES,
+  "private_artifact_read_unavailable", "private_artifact_read_failed", "private_artifact_read_input_invalid",
+  "private_artifact_tool_unavailable", "private_artifact_tool_policy_denied", "not_found", "stale_hash",
+])
+const SELECTED_JOB_REVIEW_EXIT_SIGNALS = new Set([
+  "SIGABRT", "SIGALRM", "SIGBUS", "SIGCHLD", "SIGCONT", "SIGFPE", "SIGHUP", "SIGILL", "SIGINT",
+  "SIGIO", "SIGIOT", "SIGKILL", "SIGPIPE", "SIGPOLL", "SIGPROF", "SIGPWR", "SIGQUIT", "SIGSEGV",
+  "SIGSTKFLT", "SIGSTOP", "SIGSYS", "SIGTERM", "SIGTRAP", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG",
+  "SIGUSR1", "SIGUSR2", "SIGVTALRM", "SIGXCPU", "SIGXFSZ",
+])
+const SELECTED_JOB_DIAGNOSTIC_CHECKOUT_TIMEOUT_MS = 500
+const SELECTED_JOB_DIAGNOSTIC_QUERY_TIMEOUT_MS = 1_000
 const ROOT_FAILURE_SQLSTATE_CODES = new Set(["40P01", "40001", "55P03", "57014", "23505", "23503", "23502", "23514", "22P02", "42P01", "42703", "42501"])
 const FINAL_TERMINAL_REASONS = new Set([
   "goal_satisfied", "partial_result", "budget_exhausted", "no_progress", "unrecoverable_error", "final_unverified",
@@ -2718,6 +2731,204 @@ function selectedWriterResultShape(value: unknown): RecordValue {
   }
 }
 
+type SelectedJobRestartFailureDiagnostic = Readonly<{
+  databaseState: "available" | "partial" | "unavailable"
+  transactionRolledBack: boolean | null
+  reviewerPresent: boolean
+  reviewerUnique: boolean
+  reviewerStatus: string
+  reviewerAttemptCount: number | "unknown"
+  reviewerResultPresent: boolean
+  reviewerFailureCategory: string
+  readCallPresent: boolean
+  readCallUnique: boolean
+  readCallStatus: string
+  readResultPresent: boolean
+  readResultUnique: boolean
+  readResultStatus: string
+  readOutputPresent: boolean
+  readErrorCategory: string
+  workerExited: boolean
+  workerExitCode: number | "unknown" | null
+  workerSignal: string
+  workerStderrObserved: boolean
+  workerTerminationRequested: boolean
+}>
+
+function selectedJobDiagnosticQuery<Row extends QueryResultRow>(
+  client: PoolClient,
+  text: string,
+  values: unknown[] = [],
+): Promise<QueryResult<Row>> {
+  // node-postgres honors this per-query setting at runtime; its type package omits the config field.
+  const config: QueryConfig<unknown[]> & { query_timeout: number } = {
+    text, values, query_timeout: SELECTED_JOB_DIAGNOSTIC_QUERY_TIMEOUT_MS,
+  }
+  return client.query<Row, unknown[]>(config)
+}
+
+function selectedJobRestartWorkerDiagnostic(worker: ProcessFixtureChild): Pick<SelectedJobRestartFailureDiagnostic,
+  "workerExited" | "workerExitCode" | "workerSignal" | "workerStderrObserved" | "workerTerminationRequested"> {
+  return {
+    workerExited: processFixtureExited(worker),
+    workerExitCode: worker.exitCode === null ? null : Number.isSafeInteger(worker.exitCode) ? worker.exitCode : "unknown",
+    workerSignal: worker.signalCode === null ? "none" : diagnosticEnum(worker.signalCode, SELECTED_JOB_REVIEW_EXIT_SIGNALS) ?? "unknown",
+    workerStderrObserved: worker.errors.length > 0,
+    workerTerminationRequested: worker.terminationSignal !== undefined && worker.terminationSignal !== null,
+  }
+}
+
+function selectedJobRestartUnavailableDiagnostic(worker: ProcessFixtureChild): SelectedJobRestartFailureDiagnostic {
+  return {
+    databaseState: "unavailable", transactionRolledBack: null,
+    reviewerPresent: false, reviewerUnique: false, reviewerStatus: "unknown", reviewerAttemptCount: "unknown",
+    reviewerResultPresent: false, reviewerFailureCategory: "unknown",
+    readCallPresent: false, readCallUnique: false, readCallStatus: "unknown",
+    readResultPresent: false, readResultUnique: false, readResultStatus: "unknown",
+    readOutputPresent: false, readErrorCategory: "unknown",
+    ...selectedJobRestartWorkerDiagnostic(worker),
+  }
+}
+
+function selectedJobReviewFailureCategory(value: unknown): string {
+  if (value === null || value === undefined) return "none"
+  return diagnosticEnum(value, SELECTED_JOB_REVIEW_FAILURE_CODES) ?? "unknown"
+}
+
+function selectedJobReviewItemStatus(rows: readonly { status: unknown }[]): string {
+  if (rows.length === 0) return "missing"
+  if (rows.length > 1) return "multiple"
+  return diagnosticEnum(rows[0]?.status, ITEM_DIAGNOSTIC_STATUSES) ?? "other"
+}
+
+async function selectedJobRestartFailureDiagnostic(
+  pool: Pool,
+  value: Fixture,
+  trace: SelectedJobArtifactReviewTrace,
+  worker: ProcessFixtureChild,
+): Promise<SelectedJobRestartFailureDiagnostic> {
+  let databaseState: SelectedJobRestartFailureDiagnostic["databaseState"] = "unavailable"
+  let transactionRolledBack: boolean | null = null
+  let reviewerPresent = false
+  let reviewerUnique = false
+  let reviewerStatus = "unknown"
+  let reviewerAttemptCount: number | "unknown" = "unknown"
+  let reviewerResultPresent = false
+  let reviewerFailureCategory = "unknown"
+  let readCallPresent = false
+  let readCallUnique = false
+  let readCallStatus = "unknown"
+  let readResultPresent = false
+  let readResultUnique = false
+  let readResultStatus = "unknown"
+  let readOutputPresent = false
+  let readErrorCategory = "unknown"
+  let client: PoolClient | undefined
+  let transactionOpen = false
+  let destroyClient = false
+
+  const checkoutPromise = pool.connect()
+  let checkoutTimer: ReturnType<typeof setTimeout> | undefined
+  const checkout = await Promise.race([
+    checkoutPromise.then(connected => ({ kind: "connected" as const, connected }), () => ({ kind: "failed" as const })),
+    new Promise<{ kind: "timeout" }>(resolve => {
+      checkoutTimer = setTimeout(() => resolve({ kind: "timeout" }), SELECTED_JOB_DIAGNOSTIC_CHECKOUT_TIMEOUT_MS)
+    }),
+  ])
+  if (checkoutTimer) clearTimeout(checkoutTimer)
+  if (checkout.kind === "connected") client = checkout.connected
+  else if (checkout.kind === "timeout") void checkoutPromise.then(lateClient => lateClient.release(), () => undefined)
+
+  if (client) {
+    try {
+      transactionOpen = true
+      await selectedJobDiagnosticQuery(client, "BEGIN READ ONLY")
+      await selectedJobDiagnosticQuery(client, "SET LOCAL statement_timeout = '750ms'")
+      const task = await selectedJobDiagnosticQuery<{
+        status: unknown
+        attemptCount: unknown
+        failureReason: unknown
+        resultPresent: boolean
+      }>(client, `SELECT task."status", task."attemptCount", task."failureReason", (task."result" IS NOT NULL) AS "resultPresent"
+          FROM "sub_agent_tasks" AS task
+          JOIN "agent_sessions" AS owner_session ON owner_session."id" = task."sessionId" AND owner_session."userId" = $1
+          JOIN "agent_turns" AS owner_turn ON owner_turn."id" = task."turnId" AND owner_turn."sessionId" = task."sessionId"
+            AND owner_turn."userId" = owner_session."userId" AND owner_turn."rootTaskId" = task."rootTaskId"
+          WHERE task."id" = $5 AND task."sessionId" = $2 AND task."turnId" = $3
+            AND task."rootTaskId" = $4 AND task."parentTaskId" = $4
+            AND task."role" = 'reviewer' AND task."taskType" = 'cover_letter_review'
+          LIMIT 2`, [value.userId, value.sessionId, value.turnId, trace.rootTaskId, trace.stopReviewerTask.id])
+      databaseState = "available"
+      reviewerPresent = task.rows.length > 0
+      reviewerUnique = task.rows.length === 1
+      if (reviewerUnique) {
+        const row = task.rows[0]!
+        reviewerStatus = diagnosticEnum(row.status, TASK_DIAGNOSTIC_STATUSES) ?? "other"
+        reviewerAttemptCount = Number.isSafeInteger(row.attemptCount) && Number(row.attemptCount) >= 0
+          ? Number(row.attemptCount) : "unknown"
+        reviewerResultPresent = row.resultPresent === true
+        reviewerFailureCategory = selectedJobReviewFailureCategory(row.failureReason)
+
+        const attemptForCall = reviewerAttemptCount === "unknown" ? trace.stopReviewerTask.attemptCount : reviewerAttemptCount
+        const readCallId = `${SELECTED_JOB_REVIEW_READ_CALL_ID}:attempt:${attemptForCall}`
+        const items = await selectedJobDiagnosticQuery<{
+          itemType: unknown
+          status: unknown
+          outputPresent: boolean
+          errorCode: unknown
+        }>(client, `SELECT item."type" AS "itemType", item."status", (item."content" ? 'output') AS "outputPresent",
+              item."content"->>'errorCode' AS "errorCode"
+            FROM "agent_items" AS item
+            JOIN "sub_agent_tasks" AS task ON task."id" = item."taskId" AND task."sessionId" = item."sessionId"
+              AND task."turnId" = item."turnId" AND task."rootTaskId" = $4 AND task."parentTaskId" = $4
+              AND task."role" = 'reviewer' AND task."taskType" = 'cover_letter_review'
+            JOIN "agent_sessions" AS owner_session ON owner_session."id" = task."sessionId" AND owner_session."userId" = $1
+            JOIN "agent_turns" AS owner_turn ON owner_turn."id" = task."turnId" AND owner_turn."sessionId" = task."sessionId"
+              AND owner_turn."userId" = owner_session."userId" AND owner_turn."rootTaskId" = task."rootTaskId"
+            WHERE task."id" = $5 AND item."sessionId" = $2 AND item."turnId" = $3
+              AND item."content"->>'toolCallId' = $6
+              AND ((item."type" = 'tool_call' AND item."content"->>'toolName' = 'artifact.version.read')
+                OR item."type" = 'tool_result')
+            ORDER BY item."createdAt", item."id" LIMIT 4`,
+        [value.userId, value.sessionId, value.turnId, trace.rootTaskId, trace.stopReviewerTask.id, readCallId])
+        const calls = items.rows.filter(item => item.itemType === "tool_call")
+        const results = items.rows.filter(item => item.itemType === "tool_result")
+        readCallPresent = calls.length > 0
+        readCallUnique = calls.length === 1
+        readCallStatus = selectedJobReviewItemStatus(calls)
+        readResultPresent = results.length > 0
+        readResultUnique = results.length === 1
+        readResultStatus = selectedJobReviewItemStatus(results)
+        readOutputPresent = results.some(item => item.outputPresent === true)
+        readErrorCategory = results.length === 1
+          ? selectedJobReviewFailureCategory(results[0]?.errorCode) : results.length > 1 ? "multiple" : "none"
+      }
+    } catch {
+      destroyClient = true
+      if (databaseState === "available") databaseState = "partial"
+    } finally {
+      if (transactionOpen) {
+        try {
+          await selectedJobDiagnosticQuery(client, "ROLLBACK")
+          transactionRolledBack = true
+        } catch {
+          destroyClient = true
+          transactionRolledBack = false
+        }
+      }
+      client.release(destroyClient)
+    }
+  }
+
+  return {
+    databaseState, transactionRolledBack, reviewerPresent, reviewerUnique, reviewerStatus,
+    reviewerAttemptCount, reviewerResultPresent, reviewerFailureCategory,
+    readCallPresent, readCallUnique, readCallStatus, readResultPresent, readResultUnique,
+    readResultStatus, readOutputPresent, readErrorCategory,
+    ...selectedJobRestartWorkerDiagnostic(worker),
+  }
+}
+
 async function reviewSelectedJobThroughRestartedWorker(
   pool: Pool,
   value: Fixture,
@@ -2801,14 +3012,32 @@ async function reviewSelectedJobThroughRestartedWorker(
   worker.stdin?.write(`start-selected-job-review:${trace.stopReviewerTask.id}\n`)
   try {
     await waitForProcessLine(worker, `P3_SELECTED_JOB_STOP_REVIEW_READY ${trace.stopReviewerTask.id}`, 30_000)
-  } catch {
+  } catch (failure) {
     const stopReviewPhaseLines = new Set(worker.output.slice(stopReviewPhaseStart))
-    throw new Error("Selected-job stop-review READY was not reached; phases=" + JSON.stringify({
+    let evidence: SelectedJobRestartFailureDiagnostic
+    try {
+      evidence = await selectedJobRestartFailureDiagnostic(pool, value, trace, worker)
+    } catch {
+      evidence = selectedJobRestartUnavailableDiagnostic(worker)
+    }
+    const phaseEvidence = {
       commandReceived: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.commandReceived),
       round1Entered: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.round1Entered),
       artifactVersionReadYieldReached: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.artifactVersionReadYieldReached),
       round2Entered: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.round2Entered),
       readyEmissionReached: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.readyEmissionReached),
+    }
+    try {
+      console.error("Selected-job stop-review bounded failure evidence=" + JSON.stringify({
+        waitFailure: processLineWaitFailureKind(failure, "P3_SELECTED_JOB_STOP_REVIEW_READY "),
+        phases: phaseEvidence, ...evidence,
+      }))
+    } catch {
+      // Preserve the original marker-wait failure if diagnostic output is unavailable.
+    }
+    throw new Error("Selected-job stop-review READY was not reached; evidence=" + JSON.stringify({
+      waitFailure: processLineWaitFailureKind(failure, "P3_SELECTED_JOB_STOP_REVIEW_READY "),
+      phases: phaseEvidence, ...evidence,
     }))
   }
   const liveStopTask = await trace.store.get(trace.stopReviewerTask.id, value.sessionId)
