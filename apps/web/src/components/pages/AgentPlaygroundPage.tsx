@@ -16,7 +16,7 @@ import { AgentSessionPauseResumeControl, parseAgentSessionControlStatus, postAge
 import { sessionHeaderSubtitle, type AgentSessionsResponse } from '@/components/agent-workspace/session-view-model'
 import type { LogEntry, QuestionOption } from '@/components/agent-workspace/live-run-types'
 import type { SubmissionPolicySettings } from '@/components/agent-workspace/automation-policy'
-import { useAgentSessionState, useAgentSessionUrl, type ActiveTurnStatus } from '@/components/agent-workspace/agent-session-state'
+import { selectedSessionControlStatusValue, useAgentSessionState, useAgentSessionUrl, type ActiveTurnStatus } from '@/components/agent-workspace/agent-session-state'
 import { AgentTurnComposerProvider, useAgentTurnComposer } from '@/components/agent-workspace/agent-turn-commands'
 import { useAgentTimeline } from '@/components/agent-workspace/v2/use-agent-timeline'
 import { useI18n } from '@/lib/i18n'
@@ -52,11 +52,11 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
   const { sessionId, setSessionId } = useAgentSessionUrl()
   const selectedSessionId = sessionId
   const timeline = useAgentTimeline(selectedSessionId)
-  const { activeTurn, refetch: refetchTurnState } = useAgentSessionState(sessionId)
-  const { data: controlSessionData, refetch: refetchControlSession } = useApi<{ session?: { status?: unknown } }>(selectedSessionId ? `/api/agent/sessions/${encodeURIComponent(selectedSessionId)}` : '', { cache: false, enabled: Boolean(selectedSessionId) })
-  const controlStatus = parseAgentSessionControlStatus(controlSessionData?.session?.status)
+  const { activeTurn, turnStateReadiness, refetch: refetchTurnState } = useAgentSessionState(sessionId)
+  const { data: controlSessionData, refetch: refetchControlSession } = useApi<{ session?: { id?: string; status?: unknown } }>(selectedSessionId ? `/api/agent/sessions/${encodeURIComponent(selectedSessionId)}` : '', { cache: false, enabled: Boolean(selectedSessionId) })
+  const controlStatus = parseAgentSessionControlStatus(selectedSessionControlStatusValue(selectedSessionId, controlSessionData?.session))
   useAgentSessionControlRefresh(selectedSessionId, controlStatus, refetchControlSession, refetchTurnState)
-  const turnComposer = useAgentTurnComposer(sessionId, activeTurn, refetchTurnState, controlStatus)
+  const turnComposer = useAgentTurnComposer(sessionId, activeTurn, refetchTurnState, controlStatus, turnStateReadiness)
   const [conversationTitle, setConversationTitle] = useState<string | null>(null)
   const [conversationSubtitle, setConversationSubtitle] = useState<string | null>(null)
   const [sessionsRefreshVersion, setSessionsRefreshVersion] = useState(0)

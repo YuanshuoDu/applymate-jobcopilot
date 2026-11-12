@@ -1231,6 +1231,7 @@ draft
 | [#916](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/916) — scheduled Gate as a durable TaskGraph task | Implemented and merged as [PR #926](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/926); this mapping does not imply activation or Phase-gate completion |
 | [#1095](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/1095) — isolated ApplicationTask Gate-to-submit full-loop harness | In implementation; synthetic PostgreSQL/Redis/browser evidence only, no employer receipt or rollout evidence |
 | [#1111](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/1111) — durable plan-first execution for explicit objectives | In implementation |
+| [#1119](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/1119) — explicit Composer Task mode; depends on [#1111](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/1111); ordinary Chat/steer/follow-up stays unchanged; Task is unavailable during an active Turn (no replacement) | In implementation |
 
 ---
 

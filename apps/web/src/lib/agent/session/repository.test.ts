@@ -7,6 +7,7 @@ import {
   createSubAgentTask,
   completeSubAgentTask,
 } from "./repository"
+import { AgentSessionIdempotencyConflictError } from "./agent-session-create-idempotency"
 
 function mockDb() {
   return {
@@ -23,6 +24,8 @@ function mockDb() {
         id: "session_1",
         ...data,
       })),
+      createMany: vi.fn(async (_args: { data: Record<string, unknown>; skipDuplicates: true }) => ({ count: 1 })),
+      findUnique: vi.fn(async (): Promise<unknown> => null),
     },
     agentTranscriptEvent: {
       create: vi.fn(async ({ data }) => ({
@@ -82,6 +85,52 @@ describe("agent session repository", () => {
         memorySummary: "",
       },
     })
+    expect(db.agentSession.createMany).not.toHaveBeenCalled()
+  })
+
+  it("atomically inserts or returns the same user's session for a stable key", async () => {
+    const db = mockDb()
+    const existing = { id: "session_existing", creationIdempotencyRequestHash: "" }
+    db.agentSession.createMany.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => {
+      existing.creationIdempotencyRequestHash = String(data.creationIdempotencyRequestHash)
+      return { count: 0 }
+    })
+    db.agentSession.findUnique.mockResolvedValueOnce(existing)
+
+    const session = await createAgentSession(db, {
+      userId: "user_1",
+      goal: "  Apply to Berlin SWE roles  ",
+      source: "chat",
+      idempotencyKey: "attempt-1",
+    })
+
+    expect(session).toBe(existing)
+    expect(db.agentSession.createMany).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: "user_1",
+        goal: "Apply to Berlin SWE roles",
+        creationIdempotencyKey: "attempt-1",
+        creationIdempotencyRequestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }),
+      skipDuplicates: true,
+    })
+    expect(db.agentSession.findUnique).toHaveBeenCalledWith({
+      where: { userId_creationIdempotencyKey: { userId: "user_1", creationIdempotencyKey: "attempt-1" } },
+    })
+    expect(db.agentSession.create).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when a stored key belongs to a different normalized request", async () => {
+    const db = mockDb()
+    db.agentSession.createMany.mockResolvedValueOnce({ count: 0 })
+    db.agentSession.findUnique.mockResolvedValueOnce({ creationIdempotencyRequestHash: "another-request" })
+
+    await expect(createAgentSession(db, {
+      userId: "user_1",
+      goal: "Apply to Berlin SWE roles",
+      source: "chat",
+      idempotencyKey: "attempt-1",
+    })).rejects.toBeInstanceOf(AgentSessionIdempotencyConflictError)
   })
 
   it("appends transcript events with nullable task metadata", async () => {

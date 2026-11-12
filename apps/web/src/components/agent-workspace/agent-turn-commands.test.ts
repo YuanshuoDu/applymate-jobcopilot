@@ -68,17 +68,28 @@ describe('agent Turn commands', () => {
     expect(reconcileComposerMessage(accepted, 'message_4', { status: 'failed', error: '409 Turn changed' })[0]).toMatchObject({ status: 'failed', error: '409 Turn changed' })
   })
 
-  it('passes the authoritative Session status and Turn refresh through the controller', () => {
+  it('passes authoritative Session and Turn state through the composer controller', () => {
     const refetch = vi.fn()
     const captured: { controller: TurnComposerController | null } = { controller: null }
     function Probe() {
-      captured.controller = useAgentTurnComposer('session_1', activeTurn, refetch, 'running')
+      captured.controller = useAgentTurnComposer('session_1', activeTurn, refetch, 'running', 'ready')
       return null
     }
 
     renderToString(React.createElement(Probe))
     expect(captured.controller?.sessionStatus).toBe('running')
+    expect(captured.controller?.turnStateReadiness).toBe('ready')
     captured.controller?.refresh?.()
     expect(refetch).toHaveBeenCalledOnce()
+  })
+
+  it.each(['loading', 'error'] as const)('preserves fail-closed %s readiness in the controller', (readiness) => {
+    const captured: { controller: TurnComposerController | null } = { controller: null }
+    function Probe() {
+      captured.controller = useAgentTurnComposer('session_1', null, vi.fn(), 'running', readiness)
+      return null
+    }
+    renderToString(React.createElement(Probe))
+    expect(captured.controller?.turnStateReadiness).toBe(readiness)
   })
 })

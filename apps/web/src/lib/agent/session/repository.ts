@@ -8,6 +8,7 @@ import type {
 } from "./types"
 import { toDurableSubAgentTaskStatus } from "./types"
 import { redactAgentEvent } from "@jobcopilot/shared"
+import { createIdempotentAgentSession } from "./agent-session-create-idempotency"
 
 type JsonValue = unknown
 
@@ -36,6 +37,7 @@ export interface CreateAgentSessionInput {
   source: AgentSessionSource
   status?: AgentSessionStatus
   memorySummary?: string
+  idempotencyKey?: string
 }
 
 export interface AppendTranscriptEventInput {
@@ -108,15 +110,16 @@ export interface UpdateAgentSessionInput {
 }
 
 export async function createAgentSession(db: AgentSessionDb, input: CreateAgentSessionInput) {
-  return db.agentSession.create({
-    data: {
-      userId: input.userId,
-      goal: input.goal,
-      source: input.source,
-      status: input.status ?? "running",
-      memorySummary: input.memorySummary ?? "",
-    },
-  })
+  const goal = input.idempotencyKey ? input.goal.trim() : input.goal
+  const data = {
+    userId: input.userId,
+    goal,
+    source: input.source,
+    status: input.status ?? "running",
+    memorySummary: input.memorySummary ?? "",
+  }
+  if (!input.idempotencyKey) return db.agentSession.create({ data })
+  return createIdempotentAgentSession(db.agentSession, { ...data, idempotencyKey: input.idempotencyKey })
 }
 
 export async function appendTranscriptEvent(db: AgentSessionDb, input: AppendTranscriptEventInput) {
