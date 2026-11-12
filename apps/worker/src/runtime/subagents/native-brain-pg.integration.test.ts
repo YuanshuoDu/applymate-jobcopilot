@@ -697,20 +697,21 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
     const previousDatabaseUrl = process.env.DATABASE_URL
     process.env.DATABASE_URL = databaseUrl!
     noteCanonicalBrainPhase("module_imports_started")
+    // Vitest stalls when these runtime modules are loaded concurrently.
     const [
       { createCanonicalTurnRuntime }, { createPgTaskGraphCommandPort }, { TASK_GRAPH_TEMPLATES },
       { createProductionWorkerBootstrap }, { createProductionChildExecutor }, { enqueueTurn },
       { closePool }, { persistedFinalCandidate },
-    ] = await Promise.all([
-      import("../canonical-turn-runtime.js").then(module => { noteCanonicalBrainPhase("imported_runtime"); return module }),
-      import("./pg-task-graph-command-port.js").then(module => { noteCanonicalBrainPhase("imported_command_port"); return module }),
-      import("./task-graph-templates.js").then(module => { noteCanonicalBrainPhase("imported_templates"); return module }),
-      import("../../queue/production-bootstrap.js").then(module => { noteCanonicalBrainPhase("imported_bootstrap"); return module }),
-      import("./production-child-runtime.js").then(module => { noteCanonicalBrainPhase("imported_child_runtime"); return module }),
-      import("../turns/turn-queue.js").then(module => { noteCanonicalBrainPhase("imported_turn_queue"); return module }),
-      import("../../db/apply-results.js").then(module => { noteCanonicalBrainPhase("imported_apply_results"); return module }),
-      import("../turns/turn-execution-final-candidate.js").then(module => { noteCanonicalBrainPhase("imported_final_candidate"); return module }),
-    ])
+    ] = [
+      await import("../canonical-turn-runtime.js").then(module => { noteCanonicalBrainPhase("imported_runtime"); return module }),
+      await import("./pg-task-graph-command-port.js").then(module => { noteCanonicalBrainPhase("imported_command_port"); return module }),
+      await import("./task-graph-templates.js").then(module => { noteCanonicalBrainPhase("imported_templates"); return module }),
+      await import("../../queue/production-bootstrap.js").then(module => { noteCanonicalBrainPhase("imported_bootstrap"); return module }),
+      await import("./production-child-runtime.js").then(module => { noteCanonicalBrainPhase("imported_child_runtime"); return module }),
+      await import("../turns/turn-queue.js").then(module => { noteCanonicalBrainPhase("imported_turn_queue"); return module }),
+      await import("../../db/apply-results.js").then(module => { noteCanonicalBrainPhase("imported_apply_results"); return module }),
+      await import("../turns/turn-execution-final-candidate.js").then(module => { noteCanonicalBrainPhase("imported_final_candidate"); return module }),
+    ]
     noteCanonicalBrainPhase("module_imports_completed")
 
     const acceptedCandidate = "Fact 42 is present in the owned job description."
