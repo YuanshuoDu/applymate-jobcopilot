@@ -9576,7 +9576,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(rootRuntimeExecutions).toBe(3)
     expect(resumedGraphReachedModel).toBe(true)
     expect(followUpGraphReachedModel).toBe(true)
-    expect(JSON.stringify(turn.rows[0]?.finalResponse)).toContain(FINAL_MARKER)
+    const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue
+    await expectGroundedTaskGraphFinalCopies(pool!, owner, rootTaskId!, finalResponse, FINAL_MARKER)
 
     const children = await pool!.query<{ id: string; goal: string; status: string; result: RecordValue | null; context: RecordValue; role: string; failureReason: string | null }>(
       `SELECT "id", "goal", "status", "result", "context", "role", "failureReason" FROM "sub_agent_tasks"
@@ -9740,6 +9741,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       })
       const rootTaskId = beforeTurn.rows[0]?.rootTaskId
       expect(rootTaskId).toBeTruthy()
+      if (!rootTaskId) throw new Error("Restart fixture did not persist its root TaskGraph identity")
 
       const graphBefore = await pool!.query<TaskGraphItemRow>(
         "SELECT \"id\", \"sessionId\", \"turnId\", \"stepId\", \"taskId\", \"type\", \"status\", \"phase\", \"revision\", \"content\", \"startedAt\", \"completedAt\", \"createdAt\", \"updatedAt\" FROM \"agent_items\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"taskId\" = $3 AND \"type\" = 'task_graph'",
@@ -10024,7 +10026,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         [restartOwner.turnId],
       )
       expect(resumedTurn.rows[0]).toMatchObject({ status: "completed", leaseVersion: 3, rootTaskId })
-      expect(resumedTurn.rows[0]?.finalResponse).toContain("p3-process-restart-parent-resumed-after-follow-up")
+      const finalResponse = JSON.parse(resumedTurn.rows[0]?.finalResponse ?? "null") as RecordValue
+      await expectGroundedTaskGraphFinalCopies(
+        pool!, restartOwner, rootTaskId, finalResponse, "p3-process-restart-parent-resumed-after-follow-up",
+      )
 
       const graphAfterResume = await pool!.query<TaskGraphItemRow>(
         "SELECT \"id\", \"sessionId\", \"turnId\", \"stepId\", \"taskId\", \"type\", \"status\", \"phase\", \"revision\", \"content\", \"startedAt\", \"completedAt\", \"createdAt\", \"updatedAt\" FROM \"agent_items\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"taskId\" = $3 AND \"type\" = 'task_graph'",
@@ -11415,7 +11420,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     )
     expect(turn.rows[0]?.rootTaskId).toBe(rootTaskId)
     expect(turn.rows[0]?.status).toBe("completed")
-    expect(turn.rows[0]?.finalResponse).toContain("operational failure was replaced and verified")
+    const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue
+    await expectGroundedTaskGraphFinalCopies(
+      pool!, value, rootTaskId, finalResponse, "The operational failure was replaced and verified with fresh Scout and Analyst tasks.",
+    )
     if (replacementWaitResumePath === "same_adapter") {
       expect(rootExecutions).toBe(2)
     } else {
@@ -14684,7 +14692,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       `SELECT "status", "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
       [value.turnId, value.sessionId, value.userId],
     )
-    expect(turn.rows[0]).toMatchObject({ status: "completed", finalResponse: expect.stringContaining("cohort coverage was verified") })
+    expect(turn.rows[0]?.status).toBe("completed")
+    const rootTaskId = turn.rows[0]?.rootTaskId
+    if (!rootTaskId) throw new Error("Completed coverage repair lost its root TaskGraph identity")
+    const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue
+    await expectGroundedTaskGraphFinalCopies(
+      pool!, value, rootTaskId, finalResponse,
+      "The declared cohort coverage was verified after repair",
+    )
     const tasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown }>(
       `SELECT "id", "goal", "status", "failureReason", "result" FROM "sub_agent_tasks"
        WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3`, [value.turnId, value.sessionId, turn.rows[0]?.rootTaskId],
@@ -15642,7 +15657,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       [value.turnId, value.sessionId, value.userId],
     )
     expect(turn.rows[0]?.status).toBe(emptyAnalyst ? "failed" : "completed")
-    if (!emptyAnalyst) expect(turn.rows[0]?.finalResponse).toContain("Both Scout sources passed")
+    if (!emptyAnalyst) {
+      const rootTaskId = turn.rows[0]?.rootTaskId
+      if (!rootTaskId) throw new Error("Completed Scout union lost its root TaskGraph identity")
+      const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue
+      await expectGroundedTaskGraphFinalCopies(
+        pool!, value, rootTaskId, finalResponse,
+        "Both Scout sources passed the current union checks",
+      )
+    }
     const tasks = await pool!.query<{ id: string; goal: string; status: string; result: unknown; failureReason: string | null }>(
       `SELECT "id", "goal", "status", "result", "failureReason" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3`,
       [value.turnId, value.sessionId, turn.rows[0]?.rootTaskId],
@@ -16584,8 +16607,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       [value.turnId, value.sessionId],
     )
     expect(finalTurn.rows[0]?.status).toBe("completed")
-    expect(finalTurn.rows[0]?.finalResponse).toContain("Lease recovery repair unlocked the original dependent")
     expect(finalTurn.rows[0]?.rootTaskId).toBe(rootTaskId)
+    const finalResponse = JSON.parse(finalTurn.rows[0]?.finalResponse ?? "null") as RecordValue
+    await expectGroundedTaskGraphFinalCopies(
+      pool!, value, rootTaskId, finalResponse, "Lease recovery repair unlocked the original dependent",
+    )
     const completedTasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown }>(
       "SELECT \"id\", \"goal\", \"status\", \"failureReason\", \"result\" FROM \"sub_agent_tasks\" WHERE \"turnId\" = $1 AND \"sessionId\" = $2 AND \"parentTaskId\" = $3",
       [value.turnId, value.sessionId, rootTaskId],
