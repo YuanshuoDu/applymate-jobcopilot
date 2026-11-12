@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from '@jobcopilot/agent-protocol'
 
 import { isRetryableTurnStatus, parsePersistedRetryContent } from './retry-input'
 
@@ -53,6 +54,35 @@ describe('persisted retry input', () => {
     })
   })
 
+  it('preserves the objective intent and valid verification requirements on retry', () => {
+    const verificationRequirements = {
+      schemaVersion: 'agent-harness.v2.objective-requirements.v1',
+      requirements: [{ id: 'candidate-count', check: { kind: 'candidate_count_gte', minimum: 3 } }],
+    } as const
+    const result = parsePersistedRetryContent('turn-objective', {
+      goal: 'Plan and execute the objective',
+      content: [{ type: 'text', text: 'Plan and execute the objective' }],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      verificationRequirements,
+    })
+
+    expect(result).toEqual({
+      goal: 'Plan and execute the objective',
+      content: [{ type: 'text', text: 'Plan and execute the objective' }],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      verificationRequirements,
+    })
+  })
+
+  it('preserves the null verification-requirements sentinel and rejects malformed persisted requirements', () => {
+    const base = { goal: 'Retry objective', content: [{ type: 'text', text: 'Retry objective' }] }
+    expect(parsePersistedRetryContent('turn-null', { ...base, verificationRequirements: null }))
+      .toMatchObject({ verificationRequirements: null })
+    expect(() => parsePersistedRetryContent('turn-invalid', {
+      ...base, verificationRequirements: { schemaVersion: 'unsupported', requirements: [] },
+    })).toThrow()
+  })
+
   it('rejects unknown persisted keys, empty text, and unsupported content parts', () => {
     expect(() => parsePersistedRetryContent('turn-1', {
       goal: 'Retry', content: [{ type: 'text', text: 'Retry' }], unexpected: true,
@@ -74,6 +104,8 @@ describe('persisted retry input', () => {
       { kind: 'interactive_discovery_shortlist', version: 1, extra: true },
       { kind: 'other', version: 1 },
       { kind: 'interactive_discovery_shortlist', version: 2 },
+      { kind: 'objective_task_graph_execution', version: 1, extra: true },
+      { kind: 'objective_task_graph_execution', version: 2 },
     ]) {
       expect(() => parsePersistedRetryContent('turn-4', { ...base, intent })).toThrow()
     }

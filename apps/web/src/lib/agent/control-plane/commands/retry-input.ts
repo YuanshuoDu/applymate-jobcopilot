@@ -1,7 +1,7 @@
-import type { InputContentPart } from '@jobcopilot/agent-protocol'
+import { TurnIntentSchema, validate, type InputContentPart, type TurnIntent } from '@jobcopilot/agent-protocol'
 
 import { retryInputInvalid } from './errors'
-import type { ServerAgentTurnIntent } from './types'
+import { parseObjectiveVerificationRequirements, type ObjectiveVerificationRequirements } from './types'
 
 const RETRYABLE_STATUSES = new Set(['failed', 'interrupted', 'cancelled'])
 const MAX_RETRY_PARTS = 32
@@ -13,10 +13,17 @@ export function isRetryableTurnStatus(status: string): boolean {
   return RETRYABLE_STATUSES.has(status)
 }
 
-export function parsePersistedRetryContent(turnId: string, value: unknown): { goal: string; content: InputContentPart[]; selectedJobPreparation?: { jobId: string }; intent?: ServerAgentTurnIntent } {
-  if (!isRecord(value) || !exactKeys(value, ['goal', 'content', 'clientMessageId', 'selectedJobPreparation', 'intent']) ||
+export function parsePersistedRetryContent(turnId: string, value: unknown): {
+  goal: string
+  content: InputContentPart[]
+  selectedJobPreparation?: { jobId: string }
+  intent?: TurnIntent
+  verificationRequirements?: ObjectiveVerificationRequirements | null
+} {
+  if (!isRecord(value) || !exactKeys(value, ['goal', 'content', 'clientMessageId', 'selectedJobPreparation', 'intent', 'verificationRequirements']) ||
     !boundedGoal(value.goal) || (value.clientMessageId !== undefined && !boundedString(value.clientMessageId, 256)) ||
     !Array.isArray(value.content) || value.content.length < 1 || value.content.length > MAX_RETRY_PARTS) throw retryInputInvalid(turnId)
+  const goal = value.goal
   const content: InputContentPart[] = []
   let attachmentCount = 0
   for (const part of value.content) {
@@ -36,20 +43,29 @@ export function parsePersistedRetryContent(turnId: string, value: unknown): { go
     ? undefined
     : parseSelectedJobPreparation(value.selectedJobPreparation)
   if (value.selectedJobPreparation !== undefined && !selectedJobPreparation) throw retryInputInvalid(turnId)
-  const intent = value.intent === undefined ? undefined : parseServerAgentTurnIntent(value.intent)
-  if (value.intent !== undefined && !intent) throw retryInputInvalid(turnId)
-  return { goal: value.goal, content, ...(selectedJobPreparation ? { selectedJobPreparation } : {}), ...(intent ? { intent } : {}) }
+  const hasIntent = Object.hasOwn(value, 'intent')
+  const intent = hasIntent && validate(TurnIntentSchema, value.intent) ? value.intent as TurnIntent : undefined
+  if (hasIntent && !intent) throw retryInputInvalid(turnId)
+  let verificationRequirements: ObjectiveVerificationRequirements | null | undefined
+  if (Object.hasOwn(value, 'verificationRequirements')) {
+    if (value.verificationRequirements === null) verificationRequirements = null
+    else {
+      verificationRequirements = parseObjectiveVerificationRequirements(value.verificationRequirements) ?? undefined
+      if (!verificationRequirements) throw retryInputInvalid(turnId)
+    }
+  }
+  return {
+    goal,
+    content,
+    ...(selectedJobPreparation ? { selectedJobPreparation } : {}),
+    ...(intent ? { intent } : {}),
+    ...(Object.hasOwn(value, 'verificationRequirements') ? { verificationRequirements } : {}),
+  }
 }
 
 function parseSelectedJobPreparation(value: unknown): { jobId: string } | null {
   if (!isRecord(value) || !exactKeys(value, ['jobId']) || !boundedString(value.jobId, 256)) return null
   return { jobId: value.jobId }
-}
-
-function parseServerAgentTurnIntent(value: unknown): ServerAgentTurnIntent | null {
-  if (!isRecord(value) || !exactKeys(value, ['kind', 'version']) ||
-    value.kind !== 'interactive_discovery_shortlist' || value.version !== 1) return null
-  return { kind: 'interactive_discovery_shortlist', version: 1 }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

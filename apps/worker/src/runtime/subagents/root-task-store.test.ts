@@ -395,7 +395,7 @@ describe("createPgRootTaskStore", () => {
 
   it("forwards the independent native proof only for native nodes and keeps legacy nodes fail-closed", async () => {
     const nativeOnly = createPgRootTaskStore(verificationCompletionPool([nativeGraphNode()]).pool)
-    await expect(nativeOnly.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, nativeVerificationPassed: true }))
+    await expect(nativeOnly.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, nativeVerificationPassed: true, requireTaskGraph: true }))
       .resolves.toMatchObject({ ok: true, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: { graphRevision: 1 } })
     await expect(nativeOnly.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, nativeVerificationPassed: false }))
       .resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified", feedback: expect.stringContaining("issue=legacy_unverified") })
@@ -591,6 +591,15 @@ describe("createPgRootTaskStore", () => {
   it("allows completion when every descendant is terminal", async () => {
     const fake = completionPool(["completed", "failed", "interrupted", "cancelled", "closed"].map((status, index) => ({ id: `child-${index}`, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-turn-1", userId: lease.userId, status })))
     await expect(createPgRootTaskStore(fake.pool).checkCompletion!({ lease, rootTaskId: "root-turn-1" })).resolves.toEqual({ ok: true })
+  })
+
+  it("requires the objective TaskGraph through the transaction-owned completion seam", async () => {
+    const fake = completionPool([], true, false, false)
+    const store = createPgRootTaskStore(fake.pool)
+    await expect(store.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, requireTaskGraph: true }))
+      .resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+    await expect(store.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true }))
+      .resolves.toEqual({ ok: true })
   })
 
   it("checks durable graph proof on the caller transaction without opening a nested transaction", async () => {

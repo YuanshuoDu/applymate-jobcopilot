@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest"
 import type { PrismaClient } from "@prisma/client"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, schemaVersion } from "@jobcopilot/agent-protocol"
 import type { ObjectiveStartCommand } from "./types"
 import * as transaction from "./transaction"
+import { parseObjectiveStartBody } from "../../../../app/api/agent/sessions/objective-start-route-helpers"
 
 import { ObjectiveStartCommandService } from "./objective-start"
 
@@ -19,6 +21,21 @@ function unsafeCommand(overrides: Readonly<Record<string, unknown>>): ObjectiveS
 }
 
 describe("ObjectiveStartCommandService validation", () => {
+  it("rejects a client-supplied plan-first intent at the public request boundary", () => {
+    const request = new Request("http://localhost/api/agent/sessions/session_1/start-objective", {
+      method: "POST", headers: { "idempotency-key": "start_1" }, body: "{}",
+    })
+    const parsed = parseObjectiveStartBody({
+      schemaVersion,
+      clientMessageId: "start_1",
+      objective: "Find Dublin roles",
+      content: [{ type: "text", text: "Find Dublin roles" }],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+    }, request, "session_1")
+
+    expect(parsed).toMatchObject({ status: 422 })
+  })
+
   it("trims the objective and accepts the exact 2,000-byte boundary", async () => {
     const transaction = vi.fn(async () => { throw new Error("transaction reached") })
     const service = new ObjectiveStartCommandService({ $transaction: transaction } as unknown as PrismaClient)
@@ -100,18 +117,24 @@ describe("ObjectiveStartCommandService validation", () => {
     const service = new ObjectiveStartCommandService(db)
 
     try {
-      await service.start(command("Find Dublin roles"))
+      await service.start(unsafeCommand({
+        ...command("Find Dublin roles"),
+        intent: { kind: "interactive_discovery_shortlist", version: 1 },
+      }))
       expect(createRootTurn.mock.calls[0]?.[6]).toBeUndefined()
+      expect(createRootTurn.mock.calls[0]?.[5]).toEqual(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
       expect(Object.hasOwn(createRootTurn.mock.calls[0]?.[1] ?? {}, "verificationRequirements")).toBe(false)
 
       createRootTurn.mockClear()
       await service.start(unsafeCommand({ ...command("Find Dublin roles"), verificationRequirements: validRequirements }))
       expect(createRootTurn.mock.calls[0]?.[6]).toEqual(validRequirements)
+      expect(createRootTurn.mock.calls[0]?.[5]).toEqual(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
 
       createRootTurn.mockClear()
       const malformed = { raw: "must not escape" }
       await service.start(unsafeCommand({ ...command("Find Dublin roles"), verificationRequirements: malformed }))
       expect(createRootTurn.mock.calls[0]?.[6]).toBeNull()
+      expect(createRootTurn.mock.calls[0]?.[5]).toEqual(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
       expect(createRootTurn.mock.calls[0]?.[1]).toMatchObject({ source: "user", verificationRequirements: null })
       expect(createRootTurn.mock.calls[0]?.[1]).not.toMatchObject({ verificationRequirements: malformed })
     } finally {
@@ -152,6 +175,7 @@ describe("ObjectiveStartCommandService validation", () => {
       }))
       const persistedInput = tx.agentTurn.create.mock.calls[0]?.[0]?.data.input
       expect(persistedInput).toMatchObject({ verificationRequirements: validRequirements })
+      expect(persistedInput).toMatchObject({ intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT })
 
       const replay = await service.start(unsafeCommand({
         ...command("Find Dublin roles"), verificationRequirements: replayRequirements,
