@@ -17,18 +17,32 @@ import type { DiscoveryShortlistResult } from "./subagents/discovery-shortlist.j
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
 
 type Row = Record<string, unknown>
+const OBJECTIVE_TASK_GRAPH_CONTROL_TOOLS = new Set(["agent.plan", "agent.ask_user", "agent.wait", "agent.list", "agent.reconcile"])
+
+/** Root objectives may coordinate through TaskGraph and read evidence; child writes remain template-bound. */
+export function objectiveTaskGraphRootToolAllowed(value: unknown): boolean {
+  const tool = object(value)
+  return typeof tool.name === "string" && OBJECTIVE_TASK_GRAPH_CONTROL_TOOLS.has(tool.name)
+}
 
 export function createCanonicalRootToolGuards(input: {
   readonly interactiveDiscoveryMode: boolean
   readonly selectedJobMode: boolean
+  readonly objectiveTaskGraphMode?: boolean
+  readonly objectiveRootTools?: readonly unknown[]
   readonly routeTool: TurnEngineToolExecutor
   readonly validateArguments: (name: string, value: unknown) => boolean | string
 }): {
   readonly executeTool: TurnEngineToolExecutor
   readonly validateToolArguments: (name: string, value: unknown) => boolean | string
 } {
+  const objectiveTools = new Set((input.objectiveRootTools ?? []).flatMap(value => {
+    const name = object(value).name
+    return typeof name === "string" ? [name] : []
+  }))
   const denied = (name: string): string | undefined => input.interactiveDiscoveryMode && !interactiveDiscoveryRootToolAllowed(name)
     ? "interactive_discovery_root_tool_disabled"
+    : input.objectiveTaskGraphMode && !objectiveTools.has(name) ? "objective_task_graph_root_tool_disabled"
     : input.selectedJobMode && !selectedJobToolAllowed(name) ? "selected_job_root_tool_disabled" : undefined
   return {
     executeTool: request => {
@@ -53,6 +67,23 @@ export async function failInteractiveDiscoveryUnavailable(input: {
   const result = { status: "failed" as const, errorCode: "interactive_discovery_unavailable", stepCount: 0, toolCallCount: 0 }
   const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot, toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions: [], now: now() })
   await rootTasks.finish({ lease, rootTaskId: root.id, result, metadata: { interactiveDiscoveryShortlist: failedInteractiveDiscoveryShortlist("discovery_runtime_unavailable") }, now: now() })
+  await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
+  await sessionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
+  return { status: "failed", summary: result.errorCode }
+}
+
+export async function failObjectiveTaskGraphUnavailable(input: {
+  readonly lease: TurnLease
+  readonly state: CanonicalTurnState
+  readonly rootTasks: RootTaskStore
+  readonly executionProjection: CanonicalExecutionProjection
+  readonly sessionProjection: CanonicalSessionProjection
+  readonly now: () => Date
+}): Promise<TurnExecutionResult> {
+  const { lease, state, rootTasks, executionProjection, sessionProjection, now } = input
+  const result = { status: "failed" as const, errorCode: "objective_task_graph_unavailable", stepCount: 0, toolCallCount: 0 }
+  const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot, toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions: [], now: now() })
+  await rootTasks.finish({ lease, rootTaskId: root.id, result, now: now() })
   await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
   await sessionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
   return { status: "failed", summary: result.errorCode }
