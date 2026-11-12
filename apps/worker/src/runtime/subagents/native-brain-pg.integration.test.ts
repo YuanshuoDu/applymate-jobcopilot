@@ -295,6 +295,9 @@ type CanonicalFixture = Readonly<{ userId: string; sessionId: string; turnId: st
 
 type CanonicalBrainPhase =
   | "fixture_seeded"
+  | "module_imports_started" | "imported_runtime" | "imported_command_port" | "imported_templates"
+  | "imported_bootstrap" | "imported_child_runtime" | "imported_turn_queue" | "imported_apply_results"
+  | "imported_final_candidate" | "module_imports_completed"
   | "initial_stack_starting" | "initial_runtime_ready" | "initial_bootstrap_ready"
   | "turn_enqueue_started" | "turn_enqueued"
   | "durable_child_wait_started" | "durable_child_wait_ready"
@@ -693,15 +696,22 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
 
     const previousDatabaseUrl = process.env.DATABASE_URL
     process.env.DATABASE_URL = databaseUrl!
+    noteCanonicalBrainPhase("module_imports_started")
     const [
       { createCanonicalTurnRuntime }, { createPgTaskGraphCommandPort }, { TASK_GRAPH_TEMPLATES },
       { createProductionWorkerBootstrap }, { createProductionChildExecutor }, { enqueueTurn },
       { closePool }, { persistedFinalCandidate },
     ] = await Promise.all([
-      import("../canonical-turn-runtime.js"), import("./pg-task-graph-command-port.js"), import("./task-graph-templates.js"),
-      import("../../queue/production-bootstrap.js"), import("./production-child-runtime.js"), import("../turns/turn-queue.js"),
-      import("../../db/apply-results.js"), import("../turns/turn-execution-final-candidate.js"),
+      import("../canonical-turn-runtime.js").then(module => { noteCanonicalBrainPhase("imported_runtime"); return module }),
+      import("./pg-task-graph-command-port.js").then(module => { noteCanonicalBrainPhase("imported_command_port"); return module }),
+      import("./task-graph-templates.js").then(module => { noteCanonicalBrainPhase("imported_templates"); return module }),
+      import("../../queue/production-bootstrap.js").then(module => { noteCanonicalBrainPhase("imported_bootstrap"); return module }),
+      import("./production-child-runtime.js").then(module => { noteCanonicalBrainPhase("imported_child_runtime"); return module }),
+      import("../turns/turn-queue.js").then(module => { noteCanonicalBrainPhase("imported_turn_queue"); return module }),
+      import("../../db/apply-results.js").then(module => { noteCanonicalBrainPhase("imported_apply_results"); return module }),
+      import("../turns/turn-execution-final-candidate.js").then(module => { noteCanonicalBrainPhase("imported_final_candidate"); return module }),
     ])
+    noteCanonicalBrainPhase("module_imports_completed")
 
     const acceptedCandidate = "Fact 42 is present in the owned job description."
     const rejectedCandidate = "The owned job description says Fact 42 is absent."
