@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from 'vitest'
-import { AgentComposerTaskAttemptRegistry } from './agent-composer-task-attempts'
 import {
   addSelectedComposerFiles,
   canSubmitComposerTask,
@@ -16,6 +15,10 @@ const blank: ComposerTaskAvailabilityInput = {
   selectedSessionId: null, composerSessionId: null, hasActiveTurn: false, turnStateReadiness: 'ready', sessionStatus: null,
   isRestoring: false, waitingForAnswer: false, isBusy: false, hasLiveBlocks: false,
 }
+
+const acceptedOutcome = (result: { sessionId: string; objective: string; inputId: string; turnId: string; disposition: 'started' | 'duplicate'; sequence: string }) => ({
+  kind: 'accepted' as const, attemptKey: 'attempt-1', accountScope: 'a'.repeat(64), result,
+})
 
 describe('Agent composer Task mode', () => {
   it('preserves attachment deduplication and start-lock rejection', () => {
@@ -110,44 +113,40 @@ describe('Agent composer Task mode', () => {
     expect(routeComposerSubmission('task', '   ', { startTask, sendChat })).toBe(false)
   })
 
-  it('consumes an accepted blank-workspace task and releases coordinator identity for the next task', async () => {
+  it('consumes an accepted blank-workspace task after recording its accepted status', async () => {
     const result = { sessionId: 'session-new', objective: 'Find roles', inputId: 'input-1', turnId: 'turn-1', disposition: 'started' as const, sequence: '1' }
-    const coordinator = { start: vi.fn(async () => result), discard: vi.fn() }
-    const attemptRegistry = { get: vi.fn(() => coordinator) }
+    const outcome = acceptedOutcome(result)
+    const startRecoverableTask = vi.fn(async () => outcome)
+    const consumeAcceptedAttempt = vi.fn(async () => undefined)
     const setTaskStartBusy = vi.fn(), setStartBusy = vi.fn(), setAddMenuOpen = vi.fn()
     const waitForSessionSwitch = vi.fn(), setChatInput = vi.fn(), onSessionRecorded = vi.fn()
     await submitComposerTask({
       mode: 'task', availability: resolveComposerTaskAvailability(blank), objectiveDraft: 'Find roles',
       attachedFileCount: 0, isBusy: false, selectedSessionId: null, selectedSessionRef: { current: null },
-      attemptRegistry, startLockRef: { current: false }, setTaskStartBusy, setStartBusy, setAddMenuOpen,
+      startRecoverableTask, consumeAcceptedAttempt, startLockRef: { current: false }, setTaskStartBusy, setStartBusy, setAddMenuOpen,
       waitForSessionSwitch, turnComposerRef: { current: null }, setChatInput, shouldFollowScrollRef: { current: false },
       onSessionRecorded, notifyInfo: vi.fn(), notifyError: vi.fn(), preserveDraft: vi.fn(),
     })
-    expect(coordinator.start).toHaveBeenCalledWith('Find roles', '')
-    expect(attemptRegistry.get).toHaveBeenCalledWith({ kind: 'new-session' }, 'Find roles')
-    expect(coordinator.discard).toHaveBeenCalledOnce()
+    expect(startRecoverableTask).toHaveBeenCalledWith('Find roles', { kind: 'new-session' })
     expect(waitForSessionSwitch).toHaveBeenCalledOnce()
     expect(setChatInput).toHaveBeenCalledWith('')
-    expect(onSessionRecorded).toHaveBeenCalledWith('session-new', 'Find roles', 'Task · Running')
+    expect(onSessionRecorded).toHaveBeenCalledWith('session-new', 'Find roles', 'Task · Accepted')
+    expect(consumeAcceptedAttempt).toHaveBeenCalledWith(outcome)
     expect(setTaskStartBusy).toHaveBeenNthCalledWith(1, true)
     expect(setTaskStartBusy).toHaveBeenLastCalledWith(false)
   })
 
   it('keeps a selected Session task draft retryable after a start failure', async () => {
-    const coordinator = { start: vi.fn(async () => { throw new Error('Network outcome unknown') }), discard: vi.fn() }
-    const attemptRegistry = { get: vi.fn(() => coordinator) }
+    const startRecoverableTask = vi.fn(async () => { throw new Error('Network outcome unknown') })
     const setChatInput = vi.fn(), notifyError = vi.fn(), onSessionRecorded = vi.fn()
     await submitComposerTask({
       mode: 'task', availability: resolveComposerTaskAvailability({ ...blank, selectedSessionId: 'session-idle', composerSessionId: 'session-idle', sessionStatus: 'running' }),
       objectiveDraft: 'Finish the application audit', attachedFileCount: 0, isBusy: false,
-      selectedSessionId: 'session-idle', selectedSessionRef: { current: 'session-idle' }, attemptRegistry,
+      selectedSessionId: 'session-idle', selectedSessionRef: { current: 'session-idle' }, startRecoverableTask, consumeAcceptedAttempt: vi.fn(async () => undefined),
       startLockRef: { current: false }, setTaskStartBusy: vi.fn(), setStartBusy: vi.fn(), setAddMenuOpen: vi.fn(),
       waitForSessionSwitch: vi.fn(), turnComposerRef: { current: null }, setChatInput, shouldFollowScrollRef: { current: false },
       onSessionRecorded, notifyInfo: vi.fn(), notifyError, preserveDraft: vi.fn(),
     })
-    expect(coordinator.start).toHaveBeenCalledWith('Finish the application audit', '', 'session-idle')
-    expect(attemptRegistry.get).toHaveBeenCalledWith({ kind: 'selected-session', sessionId: 'session-idle' }, 'Finish the application audit')
-    expect(coordinator.discard).not.toHaveBeenCalled()
     expect(setChatInput).toHaveBeenCalledWith(expect.any(Function))
     const restoreDraft = setChatInput.mock.calls[0]?.[0] as (current: string) => string
     expect(restoreDraft('')).toBe('Finish the application audit')
@@ -158,80 +157,63 @@ describe('Agent composer Task mode', () => {
 
   it('keeps a failed draft bound to its original Session if selection changes while pending', async () => {
     const selectedSessionRef = { current: 'session-a' }
-    const coordinator = { start: vi.fn(async () => { selectedSessionRef.current = 'session-b'; throw new Error('Network outcome unknown') }), discard: vi.fn() }
-    const attemptRegistry = { get: vi.fn(() => coordinator) }
+    const startRecoverableTask = vi.fn(async () => { selectedSessionRef.current = 'session-b'; throw new Error('Network outcome unknown') })
     const preserveDraft = vi.fn(), setChatInput = vi.fn()
     await submitComposerTask({
       mode: 'task', availability: resolveComposerTaskAvailability({ ...blank, selectedSessionId: 'session-a', composerSessionId: 'session-a', sessionStatus: 'running' }),
       objectiveDraft: 'Keep this task on A', attachedFileCount: 0, isBusy: false, selectedSessionId: 'session-a',
-      selectedSessionRef, attemptRegistry, startLockRef: { current: false }, setTaskStartBusy: vi.fn(), setStartBusy: vi.fn(),
+      selectedSessionRef, startRecoverableTask, consumeAcceptedAttempt: vi.fn(async () => undefined), startLockRef: { current: false }, setTaskStartBusy: vi.fn(), setStartBusy: vi.fn(),
       setAddMenuOpen: vi.fn(), waitForSessionSwitch: vi.fn(), turnComposerRef: { current: { setChatInput: vi.fn() } },
       setChatInput, shouldFollowScrollRef: { current: false }, onSessionRecorded: vi.fn(), notifyInfo: vi.fn(),
       notifyError: vi.fn(), preserveDraft,
     })
     expect(preserveDraft).toHaveBeenCalledWith('session-a', 'Keep this task on A')
     expect(setChatInput).not.toHaveBeenCalled()
-    expect(coordinator.discard).not.toHaveBeenCalled()
   })
 
-  it('keeps A retry identity when B succeeds and consumes only B through the submission path', async () => {
-    const calls: Array<{ url: string; key: string | null }> = []
-    let aStarts = 0
-    const fetcher: typeof fetch = async (input, init) => {
-      const url = String(input)
-      const key = new Headers(init?.headers).get('Idempotency-Key')
-      calls.push({ url, key })
-      if (url.endsWith('/session-a/start-objective') && aStarts++ === 0) throw new Error('Network outcome unknown')
-      return Response.json({ inputId: 'input-1', turnId: 'turn-1', disposition: 'started', sequence: '1' })
-    }
-    let nextId = 0
-    const attemptRegistry = new AgentComposerTaskAttemptRegistry({ fetcher, makeClientMessageId: () => `task-${++nextId}` })
-    const errors: string[] = []
+  it('routes changed drafts to the durable attempt gate without sending Chat', async () => {
+    const calls: Array<{ objective: string; sessionId: string }> = []
+    const startRecoverableTask = vi.fn(async (objective: string, target: { kind: string; sessionId?: string }) => {
+      calls.push({ objective, sessionId: target.sessionId ?? target.kind })
+      return { kind: 'recovery' as const, attemptKey: 'attempt-a', state: { kind: 'unknown' as const } }
+    })
     const submit = (sessionId: string, objectiveDraft: string) => submitComposerTask({
       mode: 'task',
       availability: resolveComposerTaskAvailability({ ...blank, selectedSessionId: sessionId, composerSessionId: sessionId, sessionStatus: 'running' }),
       objectiveDraft, attachedFileCount: 0, isBusy: false, selectedSessionId: sessionId,
-      selectedSessionRef: { current: sessionId }, attemptRegistry, startLockRef: { current: false },
+      selectedSessionRef: { current: sessionId }, startRecoverableTask, consumeAcceptedAttempt: vi.fn(async () => undefined), startLockRef: { current: false },
       setTaskStartBusy: vi.fn(), setStartBusy: vi.fn(), setAddMenuOpen: vi.fn(), waitForSessionSwitch: vi.fn(),
       turnComposerRef: { current: null }, setChatInput: vi.fn(), shouldFollowScrollRef: { current: false },
-      onSessionRecorded: vi.fn(), notifyInfo: vi.fn(), notifyError: message => errors.push(message), preserveDraft: vi.fn(),
+      onSessionRecorded: vi.fn(), notifyInfo: vi.fn(), notifyError: vi.fn(), preserveDraft: vi.fn(),
     })
 
     await submit('session-a', 'Objective A')
     await submit('session-a', 'Changed Objective A')
-    await submit('session-b', 'Objective B')
-    await submit('session-a', 'Objective A')
-
-    const aKeys = calls.filter(call => call.url.endsWith('/session-a/start-objective')).map(call => call.key)
-    const bKeys = calls.filter(call => call.url.endsWith('/session-b/start-objective')).map(call => call.key)
-    expect(aKeys).toEqual(['task-1', 'task-1'])
-    expect(bKeys).toEqual(['task-2'])
-    expect(errors).toContain('Resolve or abandon the existing task attempt for this Session before changing its objective.')
+    expect(calls).toEqual([
+      { objective: 'Objective A', sessionId: 'session-a' },
+      { objective: 'Changed Objective A', sessionId: 'session-a' },
+    ])
   })
 
   it('keeps the new selection when the selected Session changes during an accepted start', async () => {
     vi.stubGlobal('window', { dispatchEvent: vi.fn() })
     const result = { sessionId: 'session-a', objective: 'Finish the audit', inputId: 'input-1', turnId: 'turn-1', disposition: 'started' as const, sequence: '1' }
     const selectedSessionRef = { current: 'session-a' }
-    const coordinator = {
-      start: vi.fn(async () => { selectedSessionRef.current = 'session-b'; return result }),
-      discard: vi.fn(),
-    }
-    const attemptRegistry = { get: vi.fn(() => coordinator) }
+    const startRecoverableTask = vi.fn(async () => { selectedSessionRef.current = 'session-b'; return acceptedOutcome(result) })
     const setChatInput = vi.fn(), notifyInfo = vi.fn(), onSessionRecorded = vi.fn()
     try {
       await submitComposerTask({
         mode: 'task', availability: resolveComposerTaskAvailability({ ...blank, selectedSessionId: 'session-a', composerSessionId: 'session-a', sessionStatus: 'running' }),
         objectiveDraft: 'Finish the audit', attachedFileCount: 0, isBusy: false, selectedSessionId: 'session-a',
-        selectedSessionRef, attemptRegistry, startLockRef: { current: false }, setTaskStartBusy: vi.fn(),
+        selectedSessionRef, startRecoverableTask, consumeAcceptedAttempt: vi.fn(async () => undefined), startLockRef: { current: false }, setTaskStartBusy: vi.fn(),
         setStartBusy: vi.fn(), setAddMenuOpen: vi.fn(), waitForSessionSwitch: vi.fn(),
         turnComposerRef: { current: null }, setChatInput, shouldFollowScrollRef: { current: false },
         onSessionRecorded, notifyInfo, notifyError: vi.fn(), preserveDraft: vi.fn(),
       })
-      expect(coordinator.discard).toHaveBeenCalledOnce()
+      expect(startRecoverableTask).toHaveBeenCalledOnce()
       expect(setChatInput).not.toHaveBeenCalled()
       expect(onSessionRecorded).not.toHaveBeenCalled()
-      expect(notifyInfo).toHaveBeenCalledWith('Task started', expect.any(String))
+      expect(notifyInfo).toHaveBeenCalledWith('Task start accepted', expect.any(String))
     } finally {
       vi.unstubAllGlobals()
     }

@@ -7,9 +7,9 @@ import { AgentComposer, type ComposerAttachment, type ComposerJob, type Composer
 import { attachmentComposerContext, jobComposerContext, resumeComposerContext } from './AgentUnifiedStream.helpers'
 import { AgentTurnComposerProvider, sendAgentTurnMessage, useAgentTurnComposerContext } from './agent-turn-commands'
 import { addSelectedComposerFiles, canShowObjectiveContextEntry, newClientMessageId, submitComposerTask, useObjectiveSessionSwitchLock, type AgentComposerMode } from './agent-composer-task-mode'
-import { AgentComposerTaskAttemptRegistry } from './agent-composer-task-attempts'
 import { composerTaskUnavailableMessage, resolveComposerTaskAvailability } from './agent-composer-task-availability'
 import { useTaskDraftRecovery } from './agent-composer-task-draft-recovery'
+import { useAgentTaskRecovery } from './use-agent-task-recovery'
 export { canShowObjectiveContextEntry } from './agent-composer-task-mode'
 import type { AgentTranscriptEvent } from './session-view-model'
 import type { AgentUnifiedStreamProps } from './AgentUnifiedStream.types'
@@ -52,6 +52,7 @@ export function AgentUnifiedStreamComposer({
   selectedSessionRef.current = resumeSessionId ?? null
   const preserveTaskDraft = useTaskDraftRecovery(resumeSessionId ?? null, turnComposer?.sessionId ?? null,
     timelineRestoring, turnComposer?.chatInput ?? chatInput, turnComposerRef, setChatInput)
+  const taskRecovery = useAgentTaskRecovery({ selectedSessionId: resumeSessionId ?? null, onOpenAccepted: sessionId => onSessionRecorded(sessionId) })
   const sessionStartLockRef = useRef(false)
   const objectiveDraftPendingRef = useRef(false)
   const objectiveStartInFlightRef = useRef(false)
@@ -61,8 +62,6 @@ export function AgentUnifiedStreamComposer({
   const [objectiveDraftPending, setObjectiveDraftPending] = useState(false)
   const [composerMode, setComposerMode] = useState<AgentComposerMode>('chat')
   const [taskStartBusy, setTaskStartBusy] = useState(false)
-  const taskAttemptRegistryRef = useRef<AgentComposerTaskAttemptRegistry | null>(null)
-  if (!taskAttemptRegistryRef.current) taskAttemptRegistryRef.current = new AgentComposerTaskAttemptRegistry()
   const taskAvailability = resolveComposerTaskAvailability({
     selectedSessionId: resumeSessionId ?? null,
     composerSessionId: turnComposer?.sessionId ?? null,
@@ -74,7 +73,8 @@ export function AgentUnifiedStreamComposer({
       || objectiveSessionSwitchPendingRef.current || Boolean(turnComposer?.sending),
     hasLiveBlocks: liveBlocks.length > 0,
   })
-  const taskModeHelp = taskAvailability.kind === 'unavailable' ? composerTaskUnavailableMessage(taskAvailability.reason) : 'Start a plan-first task from this blank workspace or idle Session.'
+  const taskModeHelp = taskRecovery.disabledMessage ?? (taskAvailability.kind === 'unavailable'
+    ? composerTaskUnavailableMessage(taskAvailability.reason) : 'Start a plan-first task from this blank workspace or idle Session.')
   function refuseSendDuringSessionSwitch() {
     if (!objectiveSessionSwitchPendingRef.current) return false
     toast.info('Task is switching', 'Wait for the new task to finish opening before sending more context.'); return true
@@ -83,13 +83,11 @@ export function AgentUnifiedStreamComposer({
   const turnComposerForAgentComposer = turnComposer ? { ...turnComposer, send: (text: string) => {
     if (refuseSendDuringSessionSwitch()) return; turnComposer.send(text)
   } } : null
-
   function setObjectiveStartBusy(busy: boolean) {
     objectiveStartInFlightRef.current = busy
     setChatLoading(busy)
     objectiveSwitchLock.sync()
   }
-
   const waitForObjectiveSessionSwitch = objectiveSwitchLock.wait
   function appendComposerContext(text: string) {
     if (isOrdinaryComposerInputLocked(objectiveStartInFlightRef.current, objectiveSessionSwitchPendingRef.current)) {
@@ -182,10 +180,11 @@ export function AgentUnifiedStreamComposer({
       objectiveDraft: text,
       attachedFileCount: attachedFiles.length,
       isBusy: chatLoading || taskStartBusy || objectiveDraftPending || objectiveStartInFlightRef.current
-        || objectiveSessionSwitchPendingRef.current || Boolean(turnComposer?.sending),
+        || objectiveSessionSwitchPendingRef.current || Boolean(turnComposer?.sending) || !taskRecovery.canStartTask,
       selectedSessionId: resumeSessionId ?? null,
       selectedSessionRef,
-      attemptRegistry: taskAttemptRegistryRef.current!,
+      startRecoverableTask: taskRecovery.startTask,
+      consumeAcceptedAttempt: taskRecovery.consumeAccepted,
       startLockRef: sessionStartLockRef,
       setTaskStartBusy,
       setStartBusy: setObjectiveStartBusy,
@@ -227,15 +226,16 @@ export function AgentUnifiedStreamComposer({
         onAccepted={(sessionId, objective) => {
           shouldFollowScrollRef.current = true
           waitForObjectiveSessionSwitch()
-          onSessionRecorded(sessionId, objective, 'Task · Running')
+          onSessionRecorded(sessionId, objective, 'Task · Accepted')
         }}
       />
+      {taskRecovery.notices}
       <AgentTurnComposerProvider value={turnComposerForAgentComposer}><AgentComposer
         waitingForAnswer={waitingForAnswer} chips={chips} chatInput={chatInput}
         chatLoading={chatLoading} addMenuOpen={addMenuOpen} attachedFiles={attachedFiles}
         composerJobs={composerJobs} composerResumes={composerResumes}
         inputRef={inputRef} fileInputRef={fileInputRef}
-        composerMode={composerMode} taskModeAvailable={taskAvailability.kind === 'available'} taskModeUnavailableMessage={taskModeHelp}
+        composerMode={composerMode} taskModeAvailable={taskAvailability.kind === 'available' && taskRecovery.canStartTask} taskModeUnavailableMessage={taskModeHelp}
         taskStartBusy={taskStartBusy} onComposerModeChange={setComposerMode} onStartTask={startTask}
         onChatInputChange={value => { if (isOrdinaryComposerInputLocked(objectiveStartInFlightRef.current, objectiveSessionSwitchPendingRef.current)) return; setChatInput(value) }}
         onAddMenuOpenChange={setAddMenuOpen} onSendChat={sendChat}

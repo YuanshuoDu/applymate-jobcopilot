@@ -1,14 +1,14 @@
-import { createHash } from "node:crypto"
 import { Prisma, type PrismaClient } from "@prisma/client"
 import { InputContentPartSchema, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, TurnIntentSchema, validate, type InputContentPart } from "@jobcopilot/agent-protocol"
-import { canonicalJson } from "@jobcopilot/shared"
 
 import { objectiveStartIdempotencyConflict } from "./errors"
 import { stateWithAvailableReceiptTarget } from "./objective-start-attempt-read-model"
+import { objectiveStartRequestHash, samePersistedJson } from "./objective-start-attempt-request-identity"
 import type { CommandTransaction } from "./transaction"
 import { parseObjectiveVerificationRequirements, type ObjectiveStartCommand } from "./types"
 
 export { listObjectiveStartAttempts } from "./objective-start-attempt-read-model"
+export { objectiveStartRequestHash } from "./objective-start-attempt-request-identity"
 
 export type ObjectiveStartReceipt = Readonly<{
   sessionId: string
@@ -40,16 +40,8 @@ type LegacyLookup =
 
 type LegacyInputLifecycle = { status: string; consumedByStepId: string | null; consumedAt: Date | null; cancelledAt: Date | null }
 
-type AttemptIdentity = Pick<ObjectiveStartCommand, "userId" | "clientMessageId" | "sessionId" | "objective" | "content" | "verificationRequirements">
-
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null
-}
-
-function persistedCanonicalJson(value: unknown): string { return canonicalJson(JSON.parse(JSON.stringify(value) ?? "null")) }
-
-function sameJson(left: unknown, right: unknown): boolean {
-  try { return persistedCanonicalJson(left) === persistedCanonicalJson(right) } catch { return false }
 }
 
 function validLegacyInputLifecycle(input: LegacyInputLifecycle): boolean {
@@ -59,19 +51,6 @@ function validLegacyInputLifecycle(input: LegacyInputLifecycle): boolean {
   if (input.status === "accepted" || input.status === "queued") return !hasConsumer && input.consumedAt === null && input.cancelledAt === null
   if (input.status === "consumed") return hasConsumer && hasConsumedAt && input.cancelledAt === null
   return input.status === "cancelled" && hasCancelledAt && hasConsumer === hasConsumedAt
-}
-
-export function objectiveStartRequestHash(command: AttemptIdentity): string {
-  const hasRequirements = Object.hasOwn(command, "verificationRequirements")
-  const canonical = {
-    sessionId: command.sessionId,
-    objective: command.objective.trim(),
-    content: command.content,
-    verificationRequirements: hasRequirements
-      ? { present: true, value: command.verificationRequirements ?? null }
-      : { present: false },
-  }
-  return createHash("sha256").update(persistedCanonicalJson(canonical)).digest("hex")
 }
 
 export async function lockObjectiveStartAttempt(tx: CommandTransaction, userId: string, clientMessageId: string): Promise<void> {
@@ -134,7 +113,7 @@ async function findLegacyObjectiveStart(tx: CommandTransaction, userId: string, 
     || turnInput?.clientMessageId !== clientMessageId || input.targetTurn.source !== "user"
     || typeof objective !== "string" || !objective || objective !== objective.trim()
     || !Array.isArray(content) || !content.every((part) => validate(InputContentPartSchema, part))
-    || !sameJson(content, input.content)
+    || !samePersistedJson(content, input.content)
     || (requirementsPresent && rawRequirements !== null && requirements === null)) return { kind: "unverified" }
 
   const event = await tx.agentEvent.findFirst({

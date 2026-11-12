@@ -2,6 +2,7 @@ import type { ObjectiveStartResult } from './agent-objective-start-command'
 import { useCallback, useEffect, useRef, type Dispatch, type MutableRefObject, type RefObject, type SetStateAction } from 'react'
 import { isOrdinaryComposerInputLocked, shouldReleaseInputAfterSessionSelection } from './AgentObjectiveContextForm'
 import { composerTaskUnavailableMessage, type ComposerTaskAvailability, type ComposerTaskTarget } from './agent-composer-task-availability'
+import type { RecoverableComposerTaskOutcome } from './agent-composer-task-recoverable-start'
 
 export type AgentComposerMode = 'chat' | 'task'
 
@@ -49,10 +50,6 @@ export interface ComposerObjectiveStartPort {
 }
 
 export type ComposerObjectiveStartCoordinatorPort = ComposerObjectiveStartPort & { discard(): void }
-
-export interface ComposerTaskAttemptRegistryPort {
-  get(target: ComposerTaskTarget, objectiveDraft: string): ComposerObjectiveStartCoordinatorPort
-}
 
 export function startComposerTask(
   coordinator: ComposerObjectiveStartPort,
@@ -136,7 +133,8 @@ export interface SubmitComposerTaskOptions {
   readonly isBusy: boolean
   readonly selectedSessionId: string | null
   readonly selectedSessionRef: MutableRefObject<string | null>
-  readonly attemptRegistry: ComposerTaskAttemptRegistryPort
+  readonly startRecoverableTask: (objective: string, target: ComposerTaskTarget) => Promise<RecoverableComposerTaskOutcome>
+  readonly consumeAcceptedAttempt: (outcome: Extract<RecoverableComposerTaskOutcome, { kind: 'accepted' }>) => Promise<void>
   readonly startLockRef: MutableRefObject<boolean>
   readonly setTaskStartBusy: (busy: boolean) => void
   readonly setStartBusy: (busy: boolean) => void
@@ -175,12 +173,28 @@ export async function submitComposerTask(options: SubmitComposerTaskOptions): Pr
   const selectedSessionAtStart = options.selectedSessionId
   try {
     const objective = options.objectiveDraft.trim()
-    const coordinator = options.attemptRegistry.get(target, objective)
-    const result = await startComposerTask(coordinator, objective, target)
-    coordinator.discard()
+    const outcome = await options.startRecoverableTask(objective, target)
     if (options.selectedSessionRef.current !== selectedSessionAtStart) {
       window.dispatchEvent(new Event('applymate:sessions-changed'))
-      options.notifyInfo('Task started', 'The selected Session changed while the task was starting; the current selection was kept.')
+      if (outcome.kind === 'accepted' || outcome.kind === 'recovery' && outcome.state.kind === 'accepted') {
+        options.notifyInfo('Task start accepted', 'The selected Session changed while the task was starting. Open the accepted task from its recovery notice.')
+      } else {
+        options.preserveDraft(selectedSessionAtStart, objective)
+        options.notifyInfo('Task draft saved for its Session', 'Switch back to the original Session to review or retry this task. The current Session draft was left unchanged.')
+      }
+      return
+    }
+    if (outcome.kind === 'stale') return
+    if (outcome.kind !== 'accepted') {
+      if (outcome.kind === 'recovery' && outcome.state.kind === 'accepted') {
+        options.notifyInfo('Task start accepted', 'Open the accepted task from the recovery notice to view its current status.')
+      } else if (outcome.kind === 'recovery' && outcome.state.kind === 'unknown') {
+        options.notifyInfo('Task outcome needs review', 'Check the recovery notice before starting another task.')
+      } else if (outcome.kind === 'recovery' && outcome.state.kind === 'abandoned') {
+        options.notifyInfo('Task start abandoned', 'Remove its recovery notice after reviewing it before starting another task.')
+      } else {
+        options.notifyError('Task recovery is unavailable. Keep this draft and retry only after recovery can confirm the prior attempt.')
+      }
       return
     }
     if (target.kind === 'new-session') options.waitForSessionSwitch()
@@ -188,7 +202,8 @@ export async function submitComposerTask(options: SubmitComposerTaskOptions): Pr
     if (currentComposer) currentComposer.setChatInput('')
     else options.setChatInput('')
     options.shouldFollowScrollRef.current = true
-    options.onSessionRecorded(result.sessionId, result.objective, 'Task · Running')
+    options.onSessionRecorded(outcome.result.sessionId, outcome.result.objective, 'Task · Accepted')
+    try { await options.consumeAcceptedAttempt(outcome) } catch { /* The accepted local marker remains recoverable. */ }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Task start failed.'
     if (options.selectedSessionRef.current !== selectedSessionAtStart) {
