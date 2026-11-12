@@ -6073,6 +6073,167 @@ function leaseRecoveryFixtureDiagnosticProjection(value: unknown): RecordValue |
   }
 }
 
+type AnalystWaitDiagLeaseScope = Readonly<{
+  userMatchesFixture: boolean
+  sessionMatchesFixture: boolean
+  turnMatchesFixture: boolean
+  rootMatchKnown: boolean
+  rootMatchesFixture: boolean | null
+  roleMatchKnown: boolean
+  roleMatchesExpected: boolean
+}>
+type AnalystWaitDiagLeaseObservation = Readonly<{
+  userMatchesFixture: boolean
+  sessionMatchesFixture: boolean
+  turnMatchesFixture: boolean
+  leaseRootTaskId: string
+  roleMatchKnown: boolean
+  roleMatchesExpected: boolean
+}>
+type AnalystWaitDiagState = {
+  leaseArrivals: number
+  leaseObservations: AnalystWaitDiagLeaseObservation[]
+  leaseObservationOverflow: boolean
+  expectedRootTaskId: string | null
+  helperExits: number
+  rootTurnStateReads: number
+  lastHelperExit: RecordValue | null
+}
+type AnalystWaitDiagContext = Readonly<{
+  state: AnalystWaitDiagState
+  sessionId: string
+  userId: string
+  leaseScope: AnalystWaitDiagLeaseScope
+}>
+type AnalystWaitDiagWaitRow = {
+  id: string
+  status: string
+  suspendedAt: Date | null
+  userId: string
+  sessionId: string
+  turnId: string
+  parentTaskId: string
+}
+
+function analystWaitDiagIncrement(value: number): number { return Math.min(99, value + 1) }
+
+function analystWaitDiagObserveLease(
+  lease: SubagentTaskRecord,
+  fixtureValue: Fixture,
+): AnalystWaitDiagLeaseObservation {
+  const expectedRole = lease.goal === "Find at least two owner jobs" || lease.goal === "Recheck after new owner evidence is available"
+    ? "scout"
+    : lease.goal === "Score only after Scout proof" || lease.goal.startsWith("Score supplemental typed task ")
+      ? "analyst" : null
+  return {
+    userMatchesFixture: lease.userId === fixtureValue.userId,
+    sessionMatchesFixture: lease.sessionId === fixtureValue.sessionId,
+    turnMatchesFixture: lease.turnId === fixtureValue.turnId,
+    leaseRootTaskId: lease.rootTaskId,
+    roleMatchKnown: expectedRole !== null,
+    roleMatchesExpected: expectedRole !== null && lease.role === expectedRole,
+  }
+}
+
+function analystWaitDiagLeaseScope(
+  observation: AnalystWaitDiagLeaseObservation,
+  expectedRootTaskId: string | null,
+): AnalystWaitDiagLeaseScope {
+  return {
+    userMatchesFixture: observation.userMatchesFixture,
+    sessionMatchesFixture: observation.sessionMatchesFixture,
+    turnMatchesFixture: observation.turnMatchesFixture,
+    rootMatchKnown: expectedRootTaskId !== null,
+    rootMatchesFixture: expectedRootTaskId === null ? null : observation.leaseRootTaskId === expectedRootTaskId,
+    roleMatchKnown: observation.roleMatchKnown,
+    roleMatchesExpected: observation.roleMatchesExpected,
+  }
+}
+
+function analystWaitDiagRecordLease(state: AnalystWaitDiagState, lease: SubagentLease, fixtureValue: Fixture): void {
+  state.leaseArrivals = analystWaitDiagIncrement(state.leaseArrivals)
+  if (state.leaseObservations.length >= 99) {
+    state.leaseObservationOverflow = true
+    return
+  }
+  state.leaseObservations.push(analystWaitDiagObserveLease(lease, fixtureValue))
+}
+
+async function analystWaitDiagRecordHelperExit(
+  pool: Pool,
+  turnId: string,
+  context: AnalystWaitDiagContext,
+  row: AnalystWaitDiagWaitRow | undefined,
+  outcome: "suspended" | "ready_before_suspend" | "timed_out",
+): Promise<void> {
+  const state = context.state
+  state.helperExits = analystWaitDiagIncrement(state.helperExits)
+  const projection: RecordValue = {
+    outcome,
+    waitRowFound: row !== undefined,
+    waitStatus: row ? diagnosticEnum(row.status, WAIT_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+    waitSuspended: row ? row.suspendedAt instanceof Date : false,
+    waitUserMatchesFixture: row ? row.userId === context.userId : null,
+    waitSessionMatchesFixture: row ? row.sessionId === context.sessionId : null,
+    waitTurnMatchesFixture: row ? row.turnId === turnId : null,
+    waitParentMatchesRoot: row && state.expectedRootTaskId ? row.parentTaskId === state.expectedRootTaskId : null,
+    leaseScope: context.leaseScope,
+  }
+  if (state.rootTurnStateReads >= 16) {
+    projection.rootTurnRead = "limit_reached"
+    state.lastHelperExit = projection
+    return
+  }
+  state.rootTurnStateReads = analystWaitDiagIncrement(state.rootTurnStateReads)
+  try {
+    const result = await pool.query<{ status: string; leaseOwnerId: string | null; rootTaskId: string | null }>(
+      `SELECT "status", "leaseOwnerId", "rootTaskId" FROM "agent_turns"
+       WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 LIMIT 1`,
+      [turnId, context.sessionId, context.userId],
+    )
+    const turn = result.rows[0]
+    projection.rootTurnRead = turn ? "read" : "missing"
+    projection.rootTurnStatus = turn ? diagnosticEnum(turn.status, TURN_DIAGNOSTIC_STATUSES) ?? "other" : "missing"
+    projection.rootTurnLeaseOwnerPresent = turn ? turn.leaseOwnerId !== null : null
+    projection.rootTurnRootMatchesFixture = turn && state.expectedRootTaskId
+      ? turn.rootTaskId === state.expectedRootTaskId : null
+  } catch {
+    projection.rootTurnRead = "query_failed"
+  }
+  state.lastHelperExit = projection
+}
+
+function analystWaitDiagProjection(state: AnalystWaitDiagState): RecordValue {
+  const scopes = state.leaseObservations.map(observation => analystWaitDiagLeaseScope(observation, state.expectedRootTaskId))
+  const fixtureScopeMatches = scopes.filter(scope => scope.userMatchesFixture && scope.sessionMatchesFixture
+    && scope.turnMatchesFixture && scope.rootMatchesFixture === true).length
+  const foreignScopeArrivals = scopes.filter(scope => !scope.userMatchesFixture || !scope.sessionMatchesFixture
+    || !scope.turnMatchesFixture || scope.rootMatchesFixture === false).length
+  const unknownRootScopeArrivals = scopes.filter(scope => scope.userMatchesFixture && scope.sessionMatchesFixture
+    && scope.turnMatchesFixture && !scope.rootMatchKnown).length
+  const roleMatches = scopes.filter(scope => scope.roleMatchKnown && scope.roleMatchesExpected).length
+  const roleMismatches = scopes.filter(scope => scope.roleMatchKnown && !scope.roleMatchesExpected).length
+  const unknownExpectedRole = scopes.filter(scope => !scope.roleMatchKnown).length
+  const foreignRoleMatches = scopes.filter(scope => scope.roleMatchKnown && scope.roleMatchesExpected
+    && (!scope.userMatchesFixture || !scope.sessionMatchesFixture || !scope.turnMatchesFixture || scope.rootMatchesFixture === false)).length
+  return {
+    lastHelperExit: state.lastHelperExit,
+    helperExits: diagnosticBoundedCount(state.helperExits),
+    rootTurnStateReads: diagnosticBoundedCount(state.rootTurnStateReads),
+    leaseArrivals: diagnosticBoundedCount(state.leaseArrivals),
+    leaseObservationOverflow: state.leaseObservationOverflow,
+    fixtureScopeMatches: diagnosticBoundedCount(fixtureScopeMatches),
+    foreignScopeArrivals: diagnosticBoundedCount(foreignScopeArrivals),
+    unknownRootScopeArrivals: diagnosticBoundedCount(unknownRootScopeArrivals),
+    roleMatches: diagnosticBoundedCount(roleMatches),
+    roleMismatches: diagnosticBoundedCount(roleMismatches),
+    unknownExpectedRole: diagnosticBoundedCount(unknownExpectedRole),
+    foreignRoleMatches: diagnosticBoundedCount(foreignRoleMatches),
+    leaseScopeSnapshots: scopes.slice(-8),
+    leaseScopeSnapshotsOmitted: diagnosticBoundedCount(Math.max(0, scopes.length - 8)),
+  }
+}
+
 async function waitForPersistedTaskWait(
   pool: Pool,
   turnId: string,
@@ -6080,18 +6241,38 @@ async function waitForPersistedTaskWait(
   timeoutMs = 20_000,
   diagnosticToolCallId?: string,
   diagnosticFixtureCounters?: LeaseRecoveryFixtureDiagnostics,
+  analystWaitDiag?: AnalystWaitDiagContext,
 ): Promise<{ id: string }> {
   const deadline = Date.now() + timeoutMs
+  let lastWaitRow: AnalystWaitDiagWaitRow | undefined
   while (Date.now() < deadline) {
-    const result = await pool.query<{ id: string; status: string; suspendedAt: Date | null }>(
-      `SELECT "id", "status", "suspendedAt" FROM "agent_wait_conditions" WHERE "turnId" = $1 AND "idempotencyKey" = $2`,
-      [turnId, idempotencyKey],
-    )
-    const row = result.rows[0]
-    if (row?.status === "waiting" && row.suspendedAt instanceof Date) return { id: row.id }
-    if (row?.status === "ready") throw new Error("Follow-up child completed before its durable parent wait suspended")
+    let row: { id: string; status: string; suspendedAt: Date | null } | AnalystWaitDiagWaitRow | undefined
+    if (analystWaitDiag) {
+      const result = await pool.query<AnalystWaitDiagWaitRow>(
+        `SELECT "id", "status", "suspendedAt", "userId", "sessionId", "turnId", "parentTaskId"
+         FROM "agent_wait_conditions" WHERE "turnId" = $1 AND "idempotencyKey" = $2`,
+        [turnId, idempotencyKey],
+      )
+      row = result.rows[0]
+      lastWaitRow = result.rows[0]
+    } else {
+      const result = await pool.query<{ id: string; status: string; suspendedAt: Date | null }>(
+        `SELECT "id", "status", "suspendedAt" FROM "agent_wait_conditions" WHERE "turnId" = $1 AND "idempotencyKey" = $2`,
+        [turnId, idempotencyKey],
+      )
+      row = result.rows[0]
+    }
+    if (row?.status === "waiting" && row.suspendedAt instanceof Date) {
+      if (analystWaitDiag) await analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "suspended")
+      return { id: row.id }
+    }
+    if (row?.status === "ready") {
+      if (analystWaitDiag) await analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "ready_before_suspend")
+      throw new Error("Follow-up child completed before its durable parent wait suspended")
+    }
     await new Promise(resolve => setTimeout(resolve, 20))
   }
+  if (analystWaitDiag) await analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "timed_out")
   const diagnostics = diagnosticToolCallId
     ? `; state=${await persistedWaitTimeoutDiagnostics(pool, turnId, idempotencyKey, diagnosticToolCallId, diagnosticFixtureCounters)}`
     : ""
@@ -14052,6 +14233,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let terminalGateLease: TurnLease | undefined
     let failedReportBeforeRepair: unknown
     let rootExecution = 0
+    const analystWaitDiagState: AnalystWaitDiagState = {
+      leaseArrivals: 0, leaseObservations: [], leaseObservationOverflow: false, expectedRootTaskId: null,
+      helperExits: 0, rootTurnStateReads: 0, lastHelperExit: null,
+    }
     const privateWaitDiagnostics = instrumentPrivateWaitReader(pool!, () => rootExecution)
     const rootRuntime = await canonical.createCanonicalTurnRuntime(privateWaitDiagnostics.pool, {
       workerId: value.ownerId, productionFlags: flags,
@@ -14212,6 +14397,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 )
                 const hiddenRootTaskId = serverTurn.rows[0]?.rootTaskId
                 if (!hiddenRootTaskId) throw new Error("repair fixture could not read the server-owned root identity")
+                analystWaitDiagState.expectedRootTaskId = hiddenRootTaskId
                 expect(JSON.stringify(graph)).not.toContain(hiddenRootTaskId)
               }
               const dependentBeforeRepair = await pool!.query<{ id: string; status: string }>(`SELECT "id", "status" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "goal" = $3`, [value.turnId, value.sessionId, "Score only after Scout proof"])
@@ -14372,7 +14558,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               ? `p3-verifier-repair-initial-wait:${value.turnId}`
               : `p3-verifier-repair-wait:${value.turnId}`
             setExecutionStage("wait_for_persisted_wait")
-            await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
+            const analystWaitDiag: AnalystWaitDiagContext | undefined = !hardExecutorFailure && task.role === "analyst" ? {
+              state: analystWaitDiagState,
+              sessionId: value.sessionId,
+              userId: value.userId,
+              leaseScope: analystWaitDiagLeaseScope(
+                analystWaitDiagObserveLease(task, value), analystWaitDiagState.expectedRootTaskId,
+              ),
+            } : undefined
+            await waitForPersistedTaskWait(pool!, value.turnId, waitKey, undefined, undefined, undefined, analystWaitDiag)
             setExecutionStage("wait_persisted")
             setExecutionStage("tool_result_inspection")
             const inspections = jobIds.map(expectedJobId =>
@@ -14461,6 +14655,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           }
         }
         const isInitialScout = lease.goal === "Find at least two owner jobs"
+        if (!hardExecutorFailure) {
+          analystWaitDiagRecordLease(analystWaitDiagState, lease, value)
+        }
         if (isInitialScout) {
           initialScoutReadDiagnostic.sessionMatchesFixture = lease.sessionId === value.sessionId
           initialScoutReadDiagnostic.turnMatchesFixture = lease.turnId === value.turnId
@@ -14559,6 +14756,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               adapterStage: diagnosticEnum(outcome.adapterStage, REPAIR_CHILD_EXECUTION_STAGES) ?? "other",
             })),
         ) },
+        { label: "analystWaitBoundary", value: "", safeValue: JSON.stringify(analystWaitDiagProjection(analystWaitDiagState)) },
         { label: "childExecutionEvidence", value: "", safeValue: JSON.stringify({
           outcomes: repairChildOutcomeDiagnostics.slice(-8),
           lookups: repairToolLookupDiagnostics.slice(-8),
