@@ -308,8 +308,9 @@ describeWithDatabase("objective start attempt recovery on disposable PostgreSQL"
     })
     const stoppedReplay = await new ObjectiveStartCommandService(secondClient).start(cancelledCommand)
     expect(stoppedReplay).toMatchObject({ ...cancelledFacts, disposition: "duplicate" })
+    // This count is user-wide; the consumed legacy case above already adopted one attempt.
     await expect(outcomeCounts(firstClient, userId, cancelledSessionId)).resolves.toEqual({
-      attempts: 1, sessions: 1, turns: 1, inputs: 1, events: 2, outbox: 3,
+      attempts: 2, sessions: 1, turns: 1, inputs: 1, events: 2, outbox: 3,
     })
   })
 
