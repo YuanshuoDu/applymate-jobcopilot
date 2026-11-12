@@ -53,6 +53,7 @@ function makeDb(options: {
   let rollbacks = 0
   let sequence = BigInt(0)
   let inputs: Row[] = [...(options.initialInputs ?? [])]
+  let objectiveStartAttempts: Row[] = []
   let items: Row[] = []
   let events: Row[] = []
   let outbox: Row[] = []
@@ -136,6 +137,10 @@ function makeDb(options: {
         const where = whereOf(args)
         return inputs.find((input) => input.sessionId === where.sessionId && input.clientMessageId === where.clientMessageId) ?? null
       }),
+      findMany: vi.fn(async (args: unknown) => {
+        const where = whereOf(args)
+        return inputs.filter((input) => input.userId === where.userId && input.clientMessageId === where.clientMessageId).slice(0, 2)
+      }),
       create: vi.fn(async (args: unknown) => {
         const data = (args as { data: Row }).data
         inputs.push(data)
@@ -181,6 +186,21 @@ function makeDb(options: {
         return event
       }),
     },
+    agentObjectiveStartAttempt: {
+      findUnique: vi.fn(async (args: unknown) => {
+        const where = whereOf(args).userId_clientMessageId as Row | undefined
+        return objectiveStartAttempts.find((attempt) => attempt.userId === where?.userId && attempt.clientMessageId === where?.clientMessageId) ?? null
+      }),
+      findMany: vi.fn(async (args: unknown) => {
+        const where = whereOf(args)
+        return objectiveStartAttempts.filter((attempt) => attempt.userId === where.userId)
+      }),
+      create: vi.fn(async (args: unknown) => {
+        const data = (args as { data: Row }).data
+        objectiveStartAttempts.push(data)
+        return data
+      }),
+    },
     agentOutbox: {
       create: vi.fn(async (args: unknown) => {
         if (options.failOutbox || options.failDispatchOutbox) throw new Error("outbox unavailable")
@@ -207,6 +227,7 @@ function makeDb(options: {
         sessionStatus,
         sequence,
         inputs: inputs.map((input) => ({ ...input })),
+        objectiveStartAttempts: objectiveStartAttempts.map((attempt) => ({ ...attempt })),
         items: [...items],
         events: [...events],
         outbox: [...outbox],
@@ -221,6 +242,7 @@ function makeDb(options: {
         sessionStatus = before.sessionStatus
         sequence = before.sequence
         inputs = before.inputs
+        objectiveStartAttempts = before.objectiveStartAttempts
         items = before.items
         events = before.events
         outbox = before.outbox
@@ -253,6 +275,7 @@ function makeDb(options: {
       get sessionStatus() { return sessionStatus },
       setSessionStatus(value: string) { sessionStatus = value },
       get inputs() { return inputs },
+      get objectiveStartAttempts() { return objectiveStartAttempts },
       get items() { return items },
       get events() { return events },
       get outbox() { return outbox },

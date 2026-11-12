@@ -1234,6 +1234,7 @@ draft
 | [#1119](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/1119) — explicit Composer Task mode; depends on [#1111](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/1111); ordinary Chat/steer/follow-up stays unchanged; Task is unavailable during an active Turn (no replacement) | In implementation |
 | [#1112](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/1112) — separate search-footprint opt-in and creation-time authorization | This PR; default off, with no retrieval or model-context injection |
 | [#1113](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/1113) — retrieve bounded search footprints for later-session advisory context | Follow-up to #1112; requires the distinct Worker authorization result |
+| [#1121](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/1121) — durable explicit Task start recovery and abandonment fence | In implementation; depends on [#1119](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/1119), [#1111](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/1111) and [#1112](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/1112); accepted work is recovered without execution replay |
 
 ---
 

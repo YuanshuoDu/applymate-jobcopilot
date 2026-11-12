@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import type { AgentSearchFootprintSessionSnapshot } from "@/lib/agent-search-footprint-session-snapshot"
+import { withAgentSearchFootprintSessionSnapshot, type AgentSearchFootprintSessionSnapshot } from "@/lib/agent-search-footprint-session-snapshot"
 
 export interface AgentSessionCreateIdempotencyInput {
   userId: string
@@ -57,4 +57,19 @@ export async function createIdempotentAgentSession(delegateValue: unknown, input
   }
   if (existing.creationIdempotencyRequestHash !== requestHash) throw new AgentSessionIdempotencyConflictError()
   return existing
+}
+
+export async function reconcileIdempotentAgentSession(clientValue: unknown, userId: string, idempotencyKey: string) {
+  if (!clientValue || typeof clientValue !== "object" || !("$transaction" in clientValue)
+    || typeof clientValue.$transaction !== "function") {
+    throw new Error("Session reconciliation requires an interactive transaction client")
+  }
+  return withAgentSearchFootprintSessionSnapshot(clientValue, userId, async (tx, _snapshot, captured) => {
+    if (!captured) throw new Error("Session reconciliation could not acquire the consent snapshot lock")
+    const session = await tx.agentSession.findUnique({
+      where: { userId_creationIdempotencyKey: { userId, creationIdempotencyKey: idempotencyKey } },
+      select: { id: true },
+    })
+    return session ? { state: "found" as const, sessionId: session.id } : { state: "unknown" as const }
+  })
 }

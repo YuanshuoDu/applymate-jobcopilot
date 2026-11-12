@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { createHash } from "node:crypto"
+import { taskRecoveryAccountScope } from "@/lib/agent/control-plane/commands/objective-start-attempt-read-model"
 
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
@@ -195,6 +197,7 @@ describe("agent sessions API", () => {
     const res = await POST(postRequest({ goal: "  Create Berlin SWE automation  " }) as never)
 
     expect(res.status).toBe(201)
+    expect(res.headers.get("X-Account-Scope")).toBeNull()
     await expect(res.json()).resolves.toEqual({
       session: {
         id: "session_1",
@@ -218,6 +221,44 @@ describe("agent sessions API", () => {
         memorySummary: "",
       },
     })
+  })
+
+  it("creates a keyed recoverable session only for the authenticated account scope and echoes that scope", async () => {
+    const scope = taskRecoveryAccountScope("user_1")
+    const requestHash = createHash("sha256").update(JSON.stringify({
+      userId: "user_1", goal: "Create a task", source: "chat", status: "running", memorySummary: "",
+    })).digest("hex")
+    mocks.createMany.mockResolvedValueOnce({ count: 1 })
+    mocks.findUnique.mockResolvedValueOnce({
+      id: "session_1", goal: "Create a task", status: "running", source: "chat", memorySummary: "",
+      qualityScore: null, currentTaskId: null, createdAt: new Date("2026-06-18T08:00:00Z"),
+      updatedAt: new Date("2026-06-18T08:00:00Z"), completedAt: null,
+      creationIdempotencyRequestHash: requestHash,
+    })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest({ goal: "Create a task" }, {
+      "Idempotency-Key": "recoverable-create-1", "X-Expected-Account-Scope": scope,
+    }) as never)
+
+    expect(res.status).toBe(201)
+    expect(res.headers.get("X-Account-Scope")).toBe(scope)
+    expect(res.headers.get("Cache-Control")).toBe("private, no-store")
+    expect(mocks.createMany).toHaveBeenCalledWith({
+      data: expect.objectContaining({ userId: "user_1", goal: "Create a task", creationIdempotencyKey: "recoverable-create-1" }),
+      skipDuplicates: true,
+    })
+  })
+
+  it("rejects an account scope mismatch before session creation", async () => {
+    const { POST } = await import("./route")
+    const res = await POST(postRequest({ goal: "Create a task" }, { "X-Expected-Account-Scope": "b".repeat(64) }) as never)
+
+    expect(res.status).toBe(409)
+    expect(res.headers.get("X-Account-Scope")).toBe(taskRecoveryAccountScope("user_1"))
+    await expect(res.json()).resolves.toEqual({ error: "Task recovery account scope changed" })
+    expect(mocks.create).not.toHaveBeenCalled()
+    expect(mocks.createMany).not.toHaveBeenCalled()
   })
 
   it("rejects session creation without a goal", async () => {

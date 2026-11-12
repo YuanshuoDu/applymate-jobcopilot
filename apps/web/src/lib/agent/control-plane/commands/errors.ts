@@ -19,6 +19,7 @@ export type AgentCommandErrorCode =
   | "session_control_idempotency_conflict"
   | "objective_replacement_state_conflict"
   | "objective_start_state_conflict"
+  | "objective_start_idempotency_conflict"
 
 export class AgentCommandError extends Error {
   readonly status: 404 | 409 | 422
@@ -151,6 +152,14 @@ export function objectiveStartStateConflict(status: string): AgentCommandError {
     "The Session must be running to start a new objective",
     409,
     { status },
+  )
+}
+
+export function objectiveStartIdempotencyConflict(): AgentCommandError {
+  return new AgentCommandError(
+    "objective_start_idempotency_conflict",
+    "The objective start key was already accepted or abandoned for a different attempt",
+    409,
   )
 }
 

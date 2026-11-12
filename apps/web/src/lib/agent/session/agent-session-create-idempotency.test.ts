@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest"
-import { AgentSessionIdempotencyConflictError, createIdempotentAgentSession } from "./agent-session-create-idempotency"
+import {
+  AgentSessionIdempotencyConflictError,
+  createIdempotentAgentSession,
+  reconcileIdempotentAgentSession,
+} from "./agent-session-create-idempotency"
 
 function delegate() {
   return {
@@ -112,5 +116,36 @@ describe("agent session creation idempotency helper", () => {
 
     await expect(createIdempotentAgentSession(client, { ...input, idempotencyKey: "x".repeat(129) })).rejects.toThrow("1 to 128")
     expect(client.createMany).not.toHaveBeenCalled()
+  })
+
+  it("reconciles only by owner and create key under the consent transaction lock", async () => {
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      user: { findUnique: vi.fn().mockResolvedValue({
+        agentSearchFootprintMemoryEnabled: true,
+        agentSearchFootprintMemoryConsentVersion: 4,
+      }) },
+      agentSession: { findUnique: vi.fn().mockResolvedValue({ id: "session_1", goal: "private goal" }) },
+    }
+    const client = { $transaction: vi.fn(async (work: (value: typeof tx) => Promise<unknown>) => work(tx)) }
+
+    await expect(reconcileIdempotentAgentSession(client, "user_1", "create-key-1"))
+      .resolves.toEqual({ state: "found", sessionId: "session_1" })
+    expect((tx.$queryRaw.mock.calls[0]?.[0] as readonly string[]).join(" "))
+      .toContain("applymate:agent-search-footprint-memory:")
+    expect(tx.agentSession.findUnique).toHaveBeenCalledWith({
+      where: { userId_creationIdempotencyKey: { userId: "user_1", creationIdempotencyKey: "create-key-1" } },
+      select: { id: true },
+    })
+    expect(JSON.stringify(await reconcileIdempotentAgentSession({
+      $transaction: async (work: (value: typeof tx) => Promise<unknown>) => work({
+        ...tx, agentSession: { findUnique: vi.fn().mockResolvedValue(null) },
+      }),
+    }, "user_1", "missing"))).toBe(JSON.stringify({ state: "unknown" }))
+  })
+
+  it("fails closed when reconciliation cannot open and verify the consent transaction", async () => {
+    await expect(reconcileIdempotentAgentSession({ agentSession: { findUnique: vi.fn() } }, "user_1", "create-key-1"))
+      .rejects.toThrow("interactive transaction client")
   })
 })

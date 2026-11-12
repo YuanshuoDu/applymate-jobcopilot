@@ -107,6 +107,7 @@ model User {
   agentActionReservations     AgentActionReservation[]
   agentTurns                  AgentTurn[]
   agentInputs                 AgentInput[]
+  agentObjectiveStartAttempts AgentObjectiveStartAttempt[]
   applicationTasks            ApplicationTask[]
   formPatterns                FormPattern[]
   agentAutomations            AgentAutomation[]
@@ -2138,9 +2139,36 @@ model AgentInput {
   consumedByStep AgentStep?   @relation("AgentStepConsumedInputs", fields: [consumedByStepId], references: [id], onDelete: SetNull)
 
   @@unique([sessionId, clientMessageId])
+  @@index([userId, clientMessageId])
   @@index([sessionId, status, acceptedSequence])
   @@index([targetTurnId, status, acceptedSequence])
   @@map("agent_inputs")
+}
+
+enum AgentObjectiveStartAttemptStatus {
+  accepted
+  abandoned
+
+  @@map("agent_objective_start_attempt_status")
+}
+
+model AgentObjectiveStartAttempt {
+  userId           String
+  clientMessageId  String                              @db.VarChar(256)
+  status           AgentObjectiveStartAttemptStatus
+  sessionId        String?
+  requestHash      String?                             @db.VarChar(64)
+  inputId          String?
+  turnId           String?
+  acceptedSequence BigInt?
+  createdAt        DateTime                            @default(now()) @db.Timestamp(3)
+  updatedAt        DateTime                            @default(now()) @updatedAt @db.Timestamp(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, clientMessageId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("agent_objective_start_attempts")
 }
 
 model AgentItem {

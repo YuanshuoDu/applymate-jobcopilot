@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { PrismaClient } from "@prisma/client"
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, schemaVersion } from "@jobcopilot/agent-protocol"
 import type { ObjectiveStartCommand } from "./types"
@@ -11,10 +11,45 @@ const command = (objective: string, source: "user" | "automation" = "user") => (
   sessionId: "session_1", userId: "user_1", clientMessageId: "start_1", source,
   objective, content: [{ type: "text" as const, text: "Supporting context" }],
 })
+const ledgerMocks = vi.hoisted(() => {
+  const accepted = new Map<string, { requestHash: string; sessionId: string; receipt: { inputId: string; turnId: string; sequence: string } }>()
+  return {
+    accepted,
+    lock: vi.fn(async () => undefined),
+    hash: vi.fn((value: { sessionId: string; objective: string; content: unknown; verificationRequirements?: unknown }) =>
+      JSON.stringify([value.sessionId, value.objective.trim(), value.content, Object.hasOwn(value, "verificationRequirements") ? value.verificationRequirements : "omitted"])),
+    lookup: vi.fn(async (_tx: unknown, commandValue: { userId: string; clientMessageId: string; sessionId: string }, requestHash: string) => {
+      const row = accepted.get(`${commandValue.userId}:${commandValue.clientMessageId}`)
+      if (!row) return null
+      if (row.requestHash !== requestHash || row.sessionId !== commandValue.sessionId) {
+        throw Object.assign(new Error("objective start idempotency conflict"), { code: "objective_start_idempotency_conflict", status: 409 })
+      }
+      return row.receipt
+    }),
+    record: vi.fn(async (_tx: unknown, commandValue: { userId: string; clientMessageId: string }, requestHash: string, receipt: { sessionId: string; inputId: string; turnId: string; sequence: string }) => {
+      accepted.set(`${commandValue.userId}:${commandValue.clientMessageId}`, { requestHash, sessionId: receipt.sessionId, receipt })
+    }),
+  }
+})
+
+vi.mock("./objective-start-attempt-ledger", () => ({
+  lockObjectiveStartAttempt: ledgerMocks.lock,
+  objectiveStartRequestHash: ledgerMocks.hash,
+  lookupAttemptForStart: ledgerMocks.lookup,
+  recordAcceptedObjectiveStart: ledgerMocks.record,
+}))
 const validRequirements = {
   schemaVersion: "agent-harness.v2.objective-requirements.v1",
   requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }],
 }
+
+beforeEach(() => {
+  ledgerMocks.accepted.clear()
+  ledgerMocks.lock.mockClear()
+  ledgerMocks.hash.mockClear()
+  ledgerMocks.lookup.mockClear()
+  ledgerMocks.record.mockClear()
+})
 
 function unsafeCommand(overrides: Readonly<Record<string, unknown>>): ObjectiveStartCommand {
   return { ...command("Find Dublin roles"), ...overrides } as unknown as ObjectiveStartCommand
@@ -118,7 +153,7 @@ describe("ObjectiveStartCommandService validation", () => {
 
     try {
       await service.start(unsafeCommand({
-        ...command("Find Dublin roles"),
+        ...command("Find Dublin roles"), clientMessageId: "start_absent",
         intent: { kind: "interactive_discovery_shortlist", version: 1 },
       }))
       expect(createRootTurn.mock.calls[0]?.[6]).toBeUndefined()
@@ -126,13 +161,13 @@ describe("ObjectiveStartCommandService validation", () => {
       expect(Object.hasOwn(createRootTurn.mock.calls[0]?.[1] ?? {}, "verificationRequirements")).toBe(false)
 
       createRootTurn.mockClear()
-      await service.start(unsafeCommand({ ...command("Find Dublin roles"), verificationRequirements: validRequirements }))
+      await service.start(unsafeCommand({ ...command("Find Dublin roles"), clientMessageId: "start_valid", verificationRequirements: validRequirements }))
       expect(createRootTurn.mock.calls[0]?.[6]).toEqual(validRequirements)
       expect(createRootTurn.mock.calls[0]?.[5]).toEqual(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
 
       createRootTurn.mockClear()
       const malformed = { raw: "must not escape" }
-      await service.start(unsafeCommand({ ...command("Find Dublin roles"), verificationRequirements: malformed }))
+      await service.start(unsafeCommand({ ...command("Find Dublin roles"), clientMessageId: "start_invalid", verificationRequirements: malformed }))
       expect(createRootTurn.mock.calls[0]?.[6]).toBeNull()
       expect(createRootTurn.mock.calls[0]?.[5]).toEqual(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
       expect(createRootTurn.mock.calls[0]?.[1]).toMatchObject({ source: "user", verificationRequirements: null })
@@ -143,13 +178,10 @@ describe("ObjectiveStartCommandService validation", () => {
     }
   })
 
-  it("replays the original Turn and input when the same message ID carries different requirements", async () => {
-    const existingInput = {
-      id: "input_1", targetTurnId: "turn_1", delivery: "follow_up", acceptedSequence: BigInt(1),
-    }
+  it("replays an identical attempt and conflicts when the same key changes requirements", async () => {
     const tx = {
       $queryRaw: vi.fn().mockResolvedValue([{ id: "session_1", status: "running" }]),
-      agentInput: { findFirst: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(existingInput) },
+      agentInput: { findFirst: vi.fn().mockResolvedValue(null) },
       agentTurn: {
         create: vi.fn().mockResolvedValue({ id: "turn_1" }),
         findFirst: vi.fn().mockResolvedValue(null),
@@ -178,13 +210,12 @@ describe("ObjectiveStartCommandService validation", () => {
       expect(persistedInput).toMatchObject({ intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT })
 
       const replay = await service.start(unsafeCommand({
-        ...command("Find Dublin roles"), verificationRequirements: replayRequirements,
+        ...command("Find Dublin roles"), verificationRequirements: validRequirements,
       }))
-
-      expect(replay).toMatchObject({
-        inputId: original.inputId, turnId: original.turnId, disposition: "duplicate",
-      })
-      expect(tx.agentInput.findFirst).toHaveBeenCalledTimes(2)
+      expect(replay).toMatchObject({ inputId: original.inputId, turnId: original.turnId, disposition: "duplicate" })
+      await expect(service.start(unsafeCommand({
+        ...command("Find Dublin roles"), verificationRequirements: replayRequirements,
+      }))).rejects.toMatchObject({ code: "objective_start_idempotency_conflict", status: 409 })
       expect(tx.agentTurn.create).toHaveBeenCalledOnce()
       expect(acceptInputFacts).toHaveBeenCalledOnce()
       expect(tx.agentTurn.create.mock.calls[0]?.[0]?.data.input).toEqual(persistedInput)
