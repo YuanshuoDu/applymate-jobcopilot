@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto"
 import type { PrismaClient } from "@prisma/client"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 import { startApplicationFillForReview } from "./application-fill-command"
 import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, invalidCommand, isUniqueViolation, objectiveReplacementStateConflict, retryActiveConflict, retryTargetChanged, retryTargetInvalid, turnWaitRequiresDedicatedAction } from "./errors"
 import { assertContent, dispositionFromEvent } from "./command-content"
@@ -209,14 +210,13 @@ export class AgentCommandService {
       const interruptCommand: InterruptCommand = {
         sessionId: command.sessionId,
         userId: command.userId,
-        clientMessageId: randomUUID(),
-        source: "user",
+        clientMessageId: randomUUID(), source: "user",
         expectedTurnId: active.id,
         expectedRevision: active.revision,
       }
       await interruptActiveTurn(tx, interruptCommand, active)
 
-      const successor = await createRootTurn(tx, command, command.content)
+      const successor = await createRootTurn(tx, command, command.content, undefined, undefined, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
       const accepted = await acceptInputFacts(
         tx, command, command.content, successor, "follow_up", "started", true,
       )
@@ -242,7 +242,7 @@ export class AgentCommandService {
       if (active) throw retryActiveConflict(active.id)
       const persisted = parsePersistedRetryContent(target.id, target.input)
 
-      const created = await createRootTurn(tx, command, persisted.content, persisted.goal, persisted.selectedJobPreparation, persisted.intent)
+      const created = await createRootTurn(tx, command, persisted.content, persisted.goal, persisted.selectedJobPreparation, persisted.intent, persisted.verificationRequirements)
       const facts = await acceptInputFacts(tx, command, persisted.content, created, "follow_up", "started", true)
       return { ...facts, disposition: "started" as const }
     })

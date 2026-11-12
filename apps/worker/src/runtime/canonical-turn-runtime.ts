@@ -127,7 +127,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const setup = await prepareCanonicalTurnSetup({ pool, lease, signal, now, options, manager, rootTasks, executionProjection, sessionProjection, coordinationEnabled, childExecutionEnabled, consumeWaitOutcomes })
     if ("earlyResult" in setup) return setup.earlyResult
     let state = setup.state
-    const { interactiveDiscoveryMode, taskGraphPlanningEnabled, selectedJobMode, scheduledDraftMode, selectedJobPreparation,
+    const { interactiveDiscoveryMode, objectiveTaskGraphMode, taskGraphPlanningEnabled, selectedJobMode, scheduledDraftMode, selectedJobPreparation,
       turnCoordination, nativeQuestionWaitEnabled, toolCapabilities, lifecycle, toolRuntime, rootTools, root, durableWaitPort } = setup
     let acceptedGraphWitness: Extract<Awaited<ReturnType<typeof selectedJobArtifactCompletionGateWithWitness>>, { ok: true }>['witness'] | undefined
     const nativeVerification = createCanonicalNativeVerificationRuntime({
@@ -145,9 +145,9 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       draftHeadReader: options.selectedJobArtifactHeadReader, sourceDigestLoader: options.selectedJobSourceDigestLoader,
     }) : undefined
     const terminalGuard = createCanonicalTurnTerminalGuard({
-      enabled: selectedJobMode || !!rootTasks.checkCompletion || taskGraphPlanningEnabled, nativeVerification,
+      enabled: selectedJobMode || objectiveTaskGraphMode || !!rootTasks.checkCompletion || taskGraphPlanningEnabled, nativeVerification,
       checkRootGraph: rootTasks.checkCompletion || taskGraphPlanningEnabled ? async (client, nativeVerificationPassed) =>
-        rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true, nativeVerificationPassed, client }) : undefined,
+        rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true, nativeVerificationPassed, client, requireTaskGraph: objectiveTaskGraphMode }) : undefined,
       finalizeSelectedJob: selectedJobMode ? client => selectedJobArtifactFinalizationGuard({ client, commandPort: options.taskGraphCommandPort, lease, root, selectedJobId: selectedJobPreparation?.jobId, acceptedGraphWitness,
         readCurrentDraftHead: findCurrentDraftHeadWithClient, readCurrentSourceDigest: (queryClient, scope) => readSelectedJobSourceDigestWithClient(queryClient, scope.userId, scope.jobId), readCurrentReviewReceipt: findReviewReceiptWithClient,
       }) : scheduledDraftRuntime ? client => scheduledDraftRuntime.finalize(client) : undefined,
@@ -194,7 +194,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       ? undefined : recoveredScheduledCandidate?.candidateText ?? nativeRecovery.candidateText
     const modelSnapshot = preparedContext.modelSnapshot
     const routeTool = createToolRouterExecutor(toolRuntime.router)
-    const rootToolGuards = createCanonicalRootToolGuards({ interactiveDiscoveryMode, selectedJobMode, routeTool, validateArguments: (name, args) => toolRuntime.registry.validateArguments(name, args, "1") })
+    const rootToolGuards = createCanonicalRootToolGuards({ interactiveDiscoveryMode, selectedJobMode, objectiveTaskGraphMode, objectiveRootTools: rootTools, routeTool, validateArguments: (name, args) => toolRuntime.registry.validateArguments(name, args, "1") })
     const inputStore = createPgInputClaimStore(pool, state.scope)
     const contextBuilder = createCanonicalTurnContextBuilder({
       pool, store: inputStore, baseBuilder: options.contextBuilderFactory?.({ pool, scope: state.scope }), scope: state.scope, lease,
@@ -209,9 +209,9 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     let webOwnsExecution = false
     const rootCompletionGate = scheduledPipeline.attachCompletion({ gate: createCanonicalRootCompletionGate({
-      enabled: !!rootTasks.checkCompletion || selectedJobMode || interactiveDiscoveryMode || taskGraphPlanningEnabled, nativeVerification,
+      enabled: !!rootTasks.checkCompletion || selectedJobMode || interactiveDiscoveryMode || objectiveTaskGraphMode || taskGraphPlanningEnabled, nativeVerification,
       onCandidateStart: () => { acceptedGraphWitness = undefined; scheduledDraftRuntime?.clear() },
-      checkChildren: () => rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true, nativeVerificationPassed: nativeVerification.accepted() }),
+      checkChildren: () => rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true, nativeVerificationPassed: nativeVerification.accepted(), requireTaskGraph: objectiveTaskGraphMode }),
       readTaskGraphDenialCheckpoint: taskGraphDenialCheckpointReader({ enabled: taskGraphPlanningEnabled, rootTasks, lease, rootTaskId: root.id, now }),
       interactiveDiscovery: interactiveDiscoveryMode ? () => interactiveDiscoveryCompletionGate({ pool, lease, root, load: options.interactiveDiscoveryShortlistLoader, accept: shortlist => { acceptedDiscoveryShortlist = shortlist }, markUnavailable: () => { discoveryFailureCode = "discovery_runtime_unavailable" } }) : undefined,
       selectedJobMode, selectedJobCompletion: selectedJobCompletion ?? (scheduledDraftRuntime ? () => scheduledDraftRuntime.complete() : undefined),
