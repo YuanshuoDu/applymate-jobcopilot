@@ -4,6 +4,7 @@ import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.ts"
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
 import { createProductionChildExecutor } from "./production-child-runtime.ts"
+import { createProductionChildResumeLoaders } from "./production-child-resume-loaders.ts"
 import { AgentTreeManager } from "./manager.ts"
 import { PgSubagentTaskStore } from "./pg-store.ts"
 import { commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.ts"
@@ -19,7 +20,9 @@ const CRASH_TEST_LEASE_MS = 3_000
 const CRASH_TEST_HEARTBEAT_MS = 500
 const SAFE_RECOVERY_ERROR_CODES = new Set([
   "subagent_dispatch_delivery_uncertain", "lost", "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01",
-  "ECONNRESET", "ETIMEDOUT",
+  "ECONNRESET", "ETIMEDOUT", "child_resume_owner_mismatch", "child_resume_lease_expired",
+  "child_resume_wait_tool_call_conflict", "child_resume_wait_step_lineage", "child_resume_wait_lineage", "child_resume_invalid_wait_result",
+  "child_resume_step_lineage", "child_resume_item_lineage", "child_resume_step_limit", "child_resume_item_limit", "child_resume_usage_overflow",
 ])
 let bootstrap
 async function pauseSubagentClaims() {
@@ -28,25 +31,20 @@ async function pauseSubagentClaims() {
 }
 const profile = { provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
   continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false,
-  supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false,
-  maxContextTokens: null, maxOutputTokens: 256, costClass: "low" }
-const flags = { cognitiveLoopEnabled: false, planningEnabled: true, planningExecutionEnabled: true, taskGraphPlanningEnabled: true,
-  childExecutionEnabled: true, coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false }
+  supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 256, costClass: "low" }
+const flags = { cognitiveLoopEnabled: false, planningEnabled: true, planningExecutionEnabled: true, taskGraphPlanningEnabled: true, childExecutionEnabled: true,
+  coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false }
 const FIXTURE_FAILURE_CODES = new Set([
-  "p1143_children_did_not_overlap_in_running_state", "p1143_delegate_tool_missing", "p1143_grandchild_coordination_leaked",
-  "p1143_grandchild_discover_tool_missing", "p1143_grandchild_discovery_failed", "p1143_grandchild_source_bound_job_missing",
-  "p1143_grandchild_source_evidence_missing", "p1143_parent_current_reads_missing", "p1143_parent_discovery_tool_missing",
-  "p1143_parent_discovery_failed", "p1143_parent_lease_unavailable", "p1143_alpha_delegate_failed", "p1143_beta_delegate_failed",
-  "p1143_parent_wait_failed", "p1143_parent_job_read_failed", "p1143_fixture_tool_result_unexpected_error",
-  "p1143_fixture_tool_pair_request_invalid", "p1143_fixture_tool_pair_call_invalid", "p1143_fixture_tool_pair_call_ambiguous",
-  "p1143_fixture_tool_pair_result_ambiguous", "p1143_fixture_tool_pair_result_invalid", "p1143_fixture_wait_input_invalid",
-  "p1143_root_plan_tool_missing", "p1143_root_scout_task_missing", "p1143_root_scout_verification_missing",
-  "p1143_scout_results_not_available_after_wait", "p1143_scout_results_tool_missing", "p1143_second_delegate_tool_missing",
-  "p1143_source_escalation_was_not_rejected", "p1143_stale_step_created_child", "p1143_stale_step_was_accepted",
-  "p1143_step_fence_fixture_missing_steps", "p1143_fixture_requires_disposable_ci_services", "p1143_parent_did_not_suspend_without_lease",
-  "p1143_root_graph_completion_unverified", "p1143_root_turn_did_not_complete_after_child_join", "p1143_root_turn_failed",
-  "p1143_subagent_queue_unavailable",
-  "p1143_crash_child_did_not_claim",
+  "p1143_children_did_not_overlap_in_running_state", "p1143_delegate_tool_missing", "p1143_grandchild_coordination_leaked", "p1143_grandchild_discover_tool_missing",
+  "p1143_grandchild_discovery_failed", "p1143_grandchild_source_bound_job_missing", "p1143_grandchild_source_evidence_missing", "p1143_parent_current_reads_missing",
+  "p1143_parent_discovery_tool_missing", "p1143_parent_discovery_failed", "p1143_parent_lease_unavailable", "p1143_alpha_delegate_failed",
+  "p1143_beta_delegate_failed", "p1143_parent_wait_failed", "p1143_parent_job_read_failed", "p1143_fixture_tool_result_unexpected_error",
+  "p1143_fixture_tool_pair_request_invalid", "p1143_fixture_tool_pair_call_invalid", "p1143_fixture_tool_pair_call_ambiguous", "p1143_fixture_tool_pair_result_ambiguous",
+  "p1143_fixture_tool_pair_result_invalid", "p1143_fixture_wait_input_invalid", "p1143_root_plan_tool_missing", "p1143_root_scout_task_missing",
+  "p1143_root_scout_verification_missing", "p1143_scout_results_not_available_after_wait", "p1143_scout_results_tool_missing", "p1143_second_delegate_tool_missing",
+  "p1143_source_escalation_was_not_rejected", "p1143_stale_step_created_child", "p1143_stale_step_was_accepted", "p1143_step_fence_fixture_missing_steps",
+  "p1143_fixture_requires_disposable_ci_services", "p1143_parent_did_not_suspend_without_lease", "p1143_root_graph_completion_unverified", "p1143_root_turn_did_not_complete_after_child_join",
+  "p1143_root_turn_failed", "p1143_resume_loader_unavailable", "p1143_subagent_queue_unavailable", "p1143_crash_child_did_not_claim",
 ])
 function reportParentJoinState(state) {
   const count = value => value >= 2 ? "BOTH" : value === 1 ? "ONE" : "NONE"
@@ -82,9 +80,7 @@ const ACK_LIFECYCLE_STAGES = new Set([
 function waitResumeCommitter() {
   return async (lease, wait, nextStepOrdinal) => {
     try {
-      return await commitDurableSubagentWaitResume(pool, lease, {
-        waitId: wait.waitId, stepId: wait.stepId, nextStepOrdinal,
-      })
+      return await commitDurableSubagentWaitResume(pool, lease, { waitId: wait.waitId, stepId: wait.stepId, nextStepOrdinal })
     } catch (error) {
       try {
         const record = error && typeof error === "object" ? error : {}
@@ -96,17 +92,16 @@ function waitResumeCommitter() {
     }
   }
 }
-const { rootModelRuntime, discoveryClient, childModelRuntime } = createNestedScoutFixtureScripts({ mode, profile, ids, pool, say,
-  pauseSubagentClaims, reportParentJoinState })
+const { rootModelRuntime, discoveryClient, childModelRuntime } = createNestedScoutFixtureScripts({ mode, profile, ids, pool, say, pauseSubagentClaims, reportParentJoinState })
 function command(name) {
   const index = commands.indexOf(name)
   if (index >= 0) { commands.splice(index, 1); return Promise.resolve() }
   return new Promise(resolve => { const values = waiters.get(name) ?? []; values.push(resolve); waiters.set(name, values) })
 }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
-function recoveryErrorClass(error) {
+function recoveryErrorClass(error, includeMessage = false) {
   try {
-    const code = error && typeof error === "object" ? error.code : null
+    const code = error && typeof error === "object" ? error.code ?? (includeMessage ? error.message : null) : null
     if (typeof code === "string") return SAFE_RECOVERY_ERROR_CODES.has(code) ? code : "other"
     return error instanceof Error ? "error" : "unknown"
   } catch { return "unknown" }
@@ -151,9 +146,14 @@ async function start(mode) {
     modelRuntimeFactory: () => rootModelRuntime(),
   })
   const markerState = { closedStepRejected: false, parallelObserved: false }
+  const productionResumeLoader = createProductionChildResumeLoaders(pool).resumeLoader
+  if (typeof productionResumeLoader !== "function") throw new Error("p1143_resume_loader_unavailable")
   const executeChild = createProductionChildExecutor({ pool, subagentManager: () => runtime.manager,
     authorizeUsage: async () => ({ settle: async () => undefined }), jobDiscoveryClient: discoveryClient(),
-    modelRuntimeFactory: input => childModelRuntime({ ...input, runtime, markerState }), durableWaitResumeCommitter: waitResumeCommitter() })
+    resumeLoader: async lease => {
+      try { return await productionResumeLoader(lease) }
+      catch (error) { say(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${recoveryErrorClass(error, true)}`); throw error }
+    }, modelRuntimeFactory: input => childModelRuntime({ ...input, runtime, markerState }), durableWaitResumeCommitter: waitResumeCommitter() })
   const execute = createCrashFixtureExecutor(mode, executeChild, say)
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 100,
     waitResolver: { intervalMs: 20, ownerId: `${ownerId}-wait-resolver` },
