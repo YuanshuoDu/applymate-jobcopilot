@@ -168,6 +168,7 @@ describePg("mandatory-start recovery on disposable PostgreSQL", () => {
     roleCreated = true
     await runtime.$executeRawUnsafe(`GRANT USAGE ON SCHEMA "${schema}" TO "${runtimeRole}"`)
     await runtime.$executeRawUnsafe(`GRANT SELECT ON "agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps" TO "${runtimeRole}"`)
+    await runtime.$executeRawUnsafe(`GRANT UPDATE ("status") ON "agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps" TO "${runtimeRole}"`)
     await runtime.$executeRawUnsafe(`GRANT SELECT, INSERT, UPDATE ON "agent_root_usage_reservations", ai_usage_events, ai_budgets TO "${runtimeRole}"`)
     await scopedAdmin.$executeRaw`INSERT INTO "agent_sessions" ("id", "userId", "status") VALUES (${sessionId}, ${userId}, 'running'), (${otherSessionId}, ${otherUserId}, 'running')`
     await scopedAdmin.$executeRaw`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "rootTaskId", "status", "leaseOwnerId", "leaseVersion", "leaseExpiresAt")

@@ -4,7 +4,7 @@ import { Pool } from "pg"
 import { Redis } from "ioredis"
 import { Queue } from "bullmq"
 import { ModelAdapterRegistry, type HarnessModelRequest, type ModelAdapter, type ModelStreamEvent } from "@jobcopilot/agent-model"
-import type { WorkerUsageAuthorizationInput } from "../../queue/ai-usage-bridge.js"
+import type { WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import {
   NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA,
   NATIVE_VERIFICATION_PACKET_CONTEXT_KEY,
@@ -500,7 +500,12 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
     const authorizeUsage = async (input: WorkerUsageAuthorizationInput) => {
       const taskId = input.executionOwner?.kind === "task" ? input.executionOwner.taskId : "turn"
       usageAuthorizations.push(`${taskId}:${input.featureKey}`)
-      return { settle: async () => { usageSettlements.push(taskId) } }
+      return {
+        outputReservationRequired: false,
+        maxOutputTokens: null,
+        settle: async () => { usageSettlements.push(taskId) },
+        settleUnknown: async (_settlement: WorkerUsageSettlementInput) => { usageSettlements.push(taskId) },
+      }
     }
     const executor = createProductionChildExecutor({
       pool: pool!, authorizeUsage, modelRuntimeFactory,
@@ -718,11 +723,17 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
     const rejectedCandidate = "The owned job description says Fact 42 is absent."
     const usageAuthorizations: WorkerUsageAuthorizationInput[] = []
     const usageSettlements: Array<{ inputTokens: number; outputTokens: number; estimatedCostUsd: number }> = []
+    const unknownUsageSettlements: WorkerUsageSettlementInput[] = []
     const authorizeUsage = async (input: WorkerUsageAuthorizationInput) => {
       usageAuthorizations.push(input)
-      return { settle: async (settlement: { inputTokens: number; outputTokens: number; estimatedCostUsd: number }) => {
-        usageSettlements.push(settlement)
-      } }
+      return {
+        outputReservationRequired: false,
+        maxOutputTokens: null,
+        settle: async (settlement: { inputTokens: number; outputTokens: number; estimatedCostUsd: number }) => {
+          usageSettlements.push(settlement)
+        },
+        settleUnknown: async (settlement: WorkerUsageSettlementInput) => { unknownUsageSettlements.push(settlement) },
+      }
     }
     let rootModelStreams = 0
     const rootRequestDiagnostics: Array<Readonly<{
@@ -1251,6 +1262,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       expect(Number(usage.rows[0]?.estimatedCostUsd)).toBeGreaterThan(0)
       expect(usageAuthorizations.length).toBeGreaterThanOrEqual(6)
       expect(usageSettlements).toHaveLength(usageAuthorizations.length)
+      expect(unknownUsageSettlements).toEqual([])
       const settledInputTokens = usageSettlements.reduce((sum, item) => sum + item.inputTokens, 0)
       const settledOutputTokens = usageSettlements.reduce((sum, item) => sum + item.outputTokens, 0)
       const settledCost = usageSettlements.reduce((sum, item) => sum + item.estimatedCostUsd, 0)

@@ -229,7 +229,7 @@ describe("failed Scout discovery recovery flow", () => {
     const stores = workerStores()
     const completed = await createChildExecutor({
       store: stores.store, treeBudget: stores.budget,
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => scriptedModel(["jobs.discover", "jobs.get"], modelFinalText),
       toolRuntimeFactory: () => ({
         definitions, router,
@@ -333,7 +333,7 @@ describe("failed Scout discovery recovery flow", () => {
     const stores = workerStores()
     const executor = createChildExecutor({
       store: stores.store, treeBudget: stores.budget,
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => scriptedModel(["jobs.discover"], "not-json"),
       toolRuntimeFactory: () => ({
         definitions: [discovery], router,
@@ -391,7 +391,7 @@ describe("failed Scout discovery recovery flow", () => {
     const readRouter = new ToolRouter(new ToolRegistry(readDefinitions), new ToolLifecycle({ sink: readSink }), readPolicy())
     const freshExecutor = createChildExecutor({
       store: readStores.store, treeBudget: readStores.budget,
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => scriptedModel(["jobs.get"], typedScoutResult(recoveredJobId)),
       toolRuntimeFactory: () => ({
         definitions: readDefinitions, router: readRouter,
@@ -414,7 +414,7 @@ describe("failed Scout discovery recovery flow", () => {
     const forgedRouter = new ToolRouter(new ToolRegistry(forgedDefinitions), new ToolLifecycle({ sink: forgedSink }), readPolicy())
     const forged = await createChildExecutor({
       store: forgedStores.store, treeBudget: forgedStores.budget,
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => scriptedModel([], typedScoutResult(recoveredJobId)),
       toolRuntimeFactory: () => ({ definitions: forgedDefinitions, router: forgedRouter, validateArguments: () => true }),
     })({ lease: freshLease })

@@ -238,7 +238,11 @@ async function executePrepareChild(pool: Pool, redisUrl: string, seed: Scheduled
       if (!text) throw new Error("scheduled Prepare fixture received an unexpected material prompt")
       yield { type: "text_delta", text }; yield { type: "completed", finishReason: "stop" }
     } })
-  const authorizeUsage = async (_input: WorkerUsageAuthorizationInput) => ({ settle: async (_value: WorkerUsageSettlementInput) => undefined })
+  const authorizeUsage = async (_input: WorkerUsageAuthorizationInput) => ({
+    outputReservationRequired: false,
+    maxOutputTokens: null,
+    settle: async (_value: WorkerUsageSettlementInput) => undefined,
+  })
   const executor = runtime.createProductionChildExecutor({ pool: pool as never, authorizeUsage, modelRuntimeFactory })
   const manager = new managerModule.AgentTreeManager(new store.PgSubagentTaskStore(pool as never))
   const redis = new Redis(redisUrl, { maxRetriesPerRequest: null, connectTimeout: 2_000, retryStrategy: attempt => attempt > 3 ? null : 100 })
