@@ -288,6 +288,7 @@ async function install(page: Page, options: { stale?: boolean; taskCheckpoint?: 
       if (pathname === prefix && (method === 'GET' || method === 'PATCH')) return json(route, { session: { id: 'original-session', goal: 'Fixture application task', status: 'waiting_for_approval', updatedAt: time, tasks: [], approvals: [], applicationTasks: [], questions: [], artifacts: [], qualityScore: 100 } })
       state.unexpected.push(pathname); return json(route, { error: 'Unexpected agent request' }, 404)
     }
+    if (options.realAgent && pathname === '/api/me/agent-search-footprint-memory' && request.method() === 'GET') return json(route, { enabled: false, version: 0 })
     if (options.realAgent && pathname === '/api/me/agent-task-history-memory' && request.method() === 'GET') return json(route, { enabled: false, version: 0 })
     if (options.realAgent && pathname === '/api/agent') return json(route, { autoApply: false, requireApproval: true, isRunning: false })
     if (pathname === '/api/resume/intake' && request.method() === 'POST') return json(route, { parsed: resume().content })
@@ -6475,6 +6476,9 @@ test('application review opens the original real Agent session without submittin
   await expect(page.locator('[data-agent-approval-ledger="true"]')).toBeVisible()
   await expect(page.locator('[data-agent-approval-ledger="true"] button').first()).toBeEnabled()
   expect(state.agentRequests.some(item => item.path === '/api/agent/sessions/original-session/timeline')).toBe(true)
+  const footprintReads = state.requestOwners.filter(request => request.path === '/api/me/agent-search-footprint-memory')
+  expect(footprintReads.length).toBeGreaterThan(0)
+  expect(footprintReads.every(request => request.method === 'GET' && request.userId === 'fixture-user')).toBe(true)
   expect(state.agentRequests.filter(item => item.method === 'POST')).toEqual([])
   await page.locator('[data-agent-approval-ledger="true"] button').first().click()
   await expect.poll(() => state.agentRequests.filter(item => item.method === 'POST').length).toBe(1)
