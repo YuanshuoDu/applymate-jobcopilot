@@ -412,8 +412,101 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
     await adminPool.query(`GRANT UPDATE ("publishedAt", "attemptCount", "lastError", "payload") ON "agent_outbox" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT, INSERT, UPDATE ON "agent_steps", "agent_items", "agent_events", "agent_tree_budget_reservations" TO ${RUNTIME_ROLE}`)
-    await adminPool.query(`GRANT SELECT, INSERT, UPDATE ON ai_usage_events, ai_budgets TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`REVOKE UPDATE, DELETE ON "agent_root_usage_reservations", ai_usage_events, ai_budgets FROM ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT SELECT, INSERT ON "agent_root_usage_reservations" TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT UPDATE ("status", "actualOutputTokens", "outcomeStatus", "errorCode", "updatedAt", "startedAt", "settledAt", "releasedAt")
+      ON "agent_root_usage_reservations" TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT SELECT, INSERT ON ai_usage_events, ai_budgets TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT UPDATE (status, input_tokens, output_tokens, estimated_cost_usd, error_code, provider_started_at)
+      ON ai_usage_events TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT UPDATE (used, "limit", updated_at) ON ai_budgets TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT INSERT ON "agent_outbox" TO ${RUNTIME_ROLE}`)
+
+    const usagePrivileges = await adminPool.query<{
+      reservationReadInsert: boolean
+      reservationTableUpdate: boolean
+      reservationTableDelete: boolean
+      reservationLifecycleUpdate: boolean
+      reservationOwnerUpdate: boolean
+      usageReadInsert: boolean
+      usageTableUpdate: boolean
+      usageTableDelete: boolean
+      usageStartAndSettlementUpdate: boolean
+      usageIdentityUpdate: boolean
+      budgetReadInsert: boolean
+      budgetTableUpdate: boolean
+      budgetTableDelete: boolean
+      budgetLifecycleUpdate: boolean
+      budgetOwnerUpdate: boolean
+      reservationRlsEnabled: boolean
+      reservationTenantPolicy: boolean
+      runtimeRoleNoLogin: boolean
+      runtimeRoleNoSuperuser: boolean
+      runtimeRoleNoBypassRls: boolean
+    }>(`SELECT
+        has_table_privilege($1, 'public.agent_root_usage_reservations', 'SELECT')
+          AND has_table_privilege($1, 'public.agent_root_usage_reservations', 'INSERT') AS "reservationReadInsert",
+        has_table_privilege($1, 'public.agent_root_usage_reservations', 'UPDATE') AS "reservationTableUpdate",
+        has_table_privilege($1, 'public.agent_root_usage_reservations', 'DELETE') AS "reservationTableDelete",
+        has_column_privilege($1, 'public.agent_root_usage_reservations', 'status', 'UPDATE')
+          AND has_column_privilege($1, 'public.agent_root_usage_reservations', 'actualOutputTokens', 'UPDATE')
+          AND has_column_privilege($1, 'public.agent_root_usage_reservations', 'outcomeStatus', 'UPDATE')
+          AND has_column_privilege($1, 'public.agent_root_usage_reservations', 'errorCode', 'UPDATE')
+          AND has_column_privilege($1, 'public.agent_root_usage_reservations', 'updatedAt', 'UPDATE')
+          AND has_column_privilege($1, 'public.agent_root_usage_reservations', 'startedAt', 'UPDATE')
+          AND has_column_privilege($1, 'public.agent_root_usage_reservations', 'settledAt', 'UPDATE')
+          AND has_column_privilege($1, 'public.agent_root_usage_reservations', 'releasedAt', 'UPDATE') AS "reservationLifecycleUpdate",
+        has_column_privilege($1, 'public.agent_root_usage_reservations', 'userId', 'UPDATE') AS "reservationOwnerUpdate",
+        has_table_privilege($1, 'public.ai_usage_events', 'SELECT')
+          AND has_table_privilege($1, 'public.ai_usage_events', 'INSERT') AS "usageReadInsert",
+        has_table_privilege($1, 'public.ai_usage_events', 'UPDATE') AS "usageTableUpdate",
+        has_table_privilege($1, 'public.ai_usage_events', 'DELETE') AS "usageTableDelete",
+        has_column_privilege($1, 'public.ai_usage_events', 'status', 'UPDATE')
+          AND has_column_privilege($1, 'public.ai_usage_events', 'input_tokens', 'UPDATE')
+          AND has_column_privilege($1, 'public.ai_usage_events', 'output_tokens', 'UPDATE')
+          AND has_column_privilege($1, 'public.ai_usage_events', 'estimated_cost_usd', 'UPDATE')
+          AND has_column_privilege($1, 'public.ai_usage_events', 'error_code', 'UPDATE')
+          AND has_column_privilege($1, 'public.ai_usage_events', 'provider_started_at', 'UPDATE') AS "usageStartAndSettlementUpdate",
+        has_column_privilege($1, 'public.ai_usage_events', 'user_id', 'UPDATE') AS "usageIdentityUpdate",
+        has_table_privilege($1, 'public.ai_budgets', 'SELECT')
+          AND has_table_privilege($1, 'public.ai_budgets', 'INSERT') AS "budgetReadInsert",
+        has_table_privilege($1, 'public.ai_budgets', 'UPDATE') AS "budgetTableUpdate",
+        has_table_privilege($1, 'public.ai_budgets', 'DELETE') AS "budgetTableDelete",
+        has_column_privilege($1, 'public.ai_budgets', 'used', 'UPDATE')
+          AND has_column_privilege($1, 'public.ai_budgets', 'limit', 'UPDATE')
+          AND has_column_privilege($1, 'public.ai_budgets', 'updated_at', 'UPDATE') AS "budgetLifecycleUpdate",
+        has_column_privilege($1, 'public.ai_budgets', 'user_id', 'UPDATE') AS "budgetOwnerUpdate",
+        (SELECT c.relrowsecurity FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public' AND c.relname = 'agent_root_usage_reservations') AS "reservationRlsEnabled",
+        EXISTS (SELECT 1 FROM pg_policies AS p WHERE p.schemaname = 'public'
+          AND p.tablename = 'agent_root_usage_reservations' AND p.policyname = 'agent_root_usage_reservations_user_isolation'
+          AND p.qual LIKE '%app.user_id%' AND p.with_check LIKE '%app.user_id%') AS "reservationTenantPolicy",
+        (SELECT NOT rolcanlogin FROM pg_roles WHERE rolname = $1) AS "runtimeRoleNoLogin",
+        (SELECT NOT rolsuper FROM pg_roles WHERE rolname = $1) AS "runtimeRoleNoSuperuser",
+        (SELECT NOT rolbypassrls FROM pg_roles WHERE rolname = $1) AS "runtimeRoleNoBypassRls"`, [RUNTIME_ROLE])
+    expect(usagePrivileges.rows).toEqual([{
+      reservationReadInsert: true,
+      reservationTableUpdate: false,
+      reservationTableDelete: false,
+      reservationLifecycleUpdate: true,
+      reservationOwnerUpdate: false,
+      usageReadInsert: true,
+      usageTableUpdate: false,
+      usageTableDelete: false,
+      usageStartAndSettlementUpdate: true,
+      usageIdentityUpdate: false,
+      budgetReadInsert: true,
+      budgetTableUpdate: false,
+      budgetTableDelete: false,
+      budgetLifecycleUpdate: true,
+      budgetOwnerUpdate: false,
+      reservationRlsEnabled: true,
+      reservationTenantPolicy: true,
+      runtimeRoleNoLogin: true,
+      runtimeRoleNoSuperuser: true,
+      runtimeRoleNoBypassRls: true,
+    }])
+
     await seedFixture(adminPool, userA)
     await seedFixture(adminPool, userB)
 
