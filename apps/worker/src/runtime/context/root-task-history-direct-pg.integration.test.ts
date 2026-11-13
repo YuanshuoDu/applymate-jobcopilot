@@ -107,6 +107,7 @@ function queryLevelDuplicateWitnessPool(pool: PgPool, witnessId: string): Pick<P
           return originalQuery(sql, values ? [...values] : undefined)
         }
         const witnessIdParameter = (values?.length ?? 0) + 1
+        await originalQuery("SET LOCAL max_parallel_workers_per_gather = 0")
         return originalQuery(queryLevelDuplicateWitnessSql(sql, witnessIdParameter), [...(values ?? []), witnessId])
       }
       return new Proxy(client, {
