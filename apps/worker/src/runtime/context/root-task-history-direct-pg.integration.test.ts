@@ -850,19 +850,47 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
   it("keeps full cross-session witness multiplicity across keyset pages without weakening table constraints", async () => {
     const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
       rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true }
+    type KeysetPhase =
+      | "pool_checkout_started" | "pool_checkout_acquired"
+      | "transaction_begin_started" | "transaction_begin_completed"
+      | "statement_timeout_started" | "statement_timeout_set"
+      | "tenant_config_started" | "tenant_config_completed"
+      | "fence_read_started" | "fence_read_completed"
+      | "base_witness_read_started" | "base_witness_read_completed"
+      | "first_page_query_started" | "first_page_query_completed"
+      | "second_page_query_started" | "second_page_query_completed"
+      | "empty_page_query_started" | "empty_page_query_completed"
+      | "persisted_count_read_started" | "persisted_count_read_completed"
+      | "rollback_started" | "rollback_succeeded" | "rollback_failed"
+      | "client_release_started" | "client_released"
+      | "post_transaction_history_load_started" | "post_transaction_history_load_completed"
+    const phase = (value: KeysetPhase) => console.info(`[root-history-keyset-pg-phase] ${value}`)
+    phase("pool_checkout_started")
     const client = await pool!.connect()
+    phase("pool_checkout_acquired")
     let baseWitnessId: string | undefined
     try {
+      phase("transaction_begin_started")
       await client.query("BEGIN")
+      phase("transaction_begin_completed")
+      phase("statement_timeout_started")
+      await client.query("SET LOCAL statement_timeout = '10s'")
+      phase("statement_timeout_set")
+      phase("tenant_config_started")
       await client.query("SELECT set_config($1,$2,true)", ["app.user_id", userId])
+      phase("tenant_config_completed")
+      phase("fence_read_started")
       const fence = await readRootTaskHistoryFence(client, input)
+      phase("fence_read_completed")
       expect(fence?.currentStartWitness?.xid8).toBeTruthy()
       expect(fence?.currentOrigin).toBeTruthy()
       if (!fence?.currentStartWitness || !fence.currentOrigin) throw new Error("Cross-session fence is unavailable")
+      phase("base_witness_read_started")
       const witness = await client.query<{ id: string }>(`SELECT "id" FROM "agent_events"
         WHERE "sessionId" = $1 AND "turnId" = $2 AND "causationId" = $3
           AND "type" = 'agent.plan.root_task_history_chronology_witness'`,
       [otherSessionId, equalCutoff.turnId, terminalEventKey(equalCutoff)])
+      phase("base_witness_read_completed")
       expect(witness.rows).toHaveLength(1)
       baseWitnessId = witness.rows[0]?.id
       expect(baseWitnessId).toBeTruthy()
@@ -875,17 +903,27 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
         objectiveDigest: fence.objectiveDigest, semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION,
         canonicalOrigin: fence.currentOrigin, limit: 1,
       }
-      const readPage = async (afterCursor?: RootTaskHistoryCrossSessionWindowInput["afterCursor"]) => {
+      const pagePhases = {
+        first: ["first_page_query_started", "first_page_query_completed"],
+        second: ["second_page_query_started", "second_page_query_completed"],
+        empty: ["empty_page_query_started", "empty_page_query_completed"],
+      } as const satisfies Record<"first" | "second" | "empty", readonly [KeysetPhase, KeysetPhase]>
+      const readPage = async (
+        kind: keyof typeof pagePhases,
+        afterCursor?: RootTaskHistoryCrossSessionWindowInput["afterCursor"],
+      ) => {
+        phase(pagePhases[kind][0])
         const query = buildRootTaskHistoryCrossSessionWindow({ ...window, ...(afterCursor ? { afterCursor } : {}) })
         const result = await client.query<Record<string, unknown>>(
           queryLevelDuplicateWitnessSql(query.sql, query.values.length + 1), [...query.values, baseWitnessId])
+        phase(pagePhases[kind][1])
         const pageRows = result.rows.filter(row => row.isPageWatermark !== true)
         const watermarks = result.rows.filter(row => row.isPageWatermark === true)
         expect(watermarks).toHaveLength(1)
         return { pageRows, watermark: watermarks[0] }
       }
 
-      const first = await readPage()
+      const first = await readPage("first")
       expect(first.pageRows).toHaveLength(1)
       expect(first.pageRows[0]?.terminalEventId).toBe(terminalEventKey(equalCutoff))
       expect(Number(first.pageRows[0]?.terminalWitnessCount)).toBe(2)
@@ -900,32 +938,44 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
         terminalEventId: String(first.watermark?.pageCursorTerminalEventId),
         witnessEventId: String(first.watermark?.pageCursorWitnessEventId),
       }
-      const second = await readPage(cursor)
+      const second = await readPage("second", cursor)
       expect(second.pageRows).toHaveLength(1)
       expect(second.pageRows[0]?.terminalEventId).toBe(terminalEventKey(equalCutoff))
       expect(second.pageRows[0]?.terminalWitnessEventId).toBe(baseWitnessId)
       expect(Number(second.pageRows[0]?.terminalWitnessCount)).toBe(2)
       expect(second.watermark?.pageRawRowCount).toBe(1)
 
-      const empty = await readPage({ xid8: "1", turnId: "", terminalEventId: "", witnessEventId: "" })
+      const empty = await readPage("empty", { xid8: "1", turnId: "", terminalEventId: "", witnessEventId: "" })
       expect(empty.pageRows).toHaveLength(0)
       expect(empty.watermark?.pageRawRowCount).toBe(0)
       expect(empty.watermark?.pageCursorXid8).toBeNull()
       expect(empty.watermark?.pageCursorTurnId).toBeNull()
       expect(empty.watermark?.pageCursorTerminalEventId).toBeNull()
       expect(empty.watermark?.pageCursorWitnessEventId).toBeNull()
+      phase("persisted_count_read_started")
       const persistedWitnesses = await client.query<{ count: string }>(`SELECT COUNT(*)::text AS "count" FROM "agent_events"
         WHERE "sessionId" = $1 AND "turnId" = $2 AND "causationId" = $3
           AND "type" = 'agent.plan.root_task_history_chronology_witness'`,
       [otherSessionId, equalCutoff.turnId, terminalEventKey(equalCutoff)])
+      phase("persisted_count_read_completed")
       expect(persistedWitnesses.rows[0]?.count).toBe("1")
     } finally {
-      await client.query("ROLLBACK").catch(() => undefined)
+      phase("rollback_started")
+      try {
+        await client.query("ROLLBACK")
+        phase("rollback_succeeded")
+      } catch {
+        phase("rollback_failed")
+      }
+      phase("client_release_started")
       client.release()
+      phase("client_released")
     }
 
+    phase("post_transaction_history_load_started")
     const historyWithShadowWitness = await createPgDirectRootTaskHistoryStore(
       queryLevelDuplicateWitnessPool(pool!, baseWitnessId!)).load(input)
+    phase("post_transaction_history_load_completed")
     expect(historyWithShadowWitness.some(item => item.sourceTurnId === equalCutoff.turnId)).toBe(false)
     expect(historyWithShadowWitness.map(item => item.sourceTurnId)).toContain(otherSession.turnId)
   }, 60_000)
