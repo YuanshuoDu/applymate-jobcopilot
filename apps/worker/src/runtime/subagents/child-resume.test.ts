@@ -154,6 +154,16 @@ function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], consume
         const rows = persistedItems.filter(row => (row.content as Row).toolCallId === values[3])
         return { rows, rowCount: rows.length }
       }
+      if (sql.startsWith('SELECT "id", "sessionId", "turnId", "taskId", "itemId", "type", "actor", "correlationId", "causationId", "sequence", "idempotencyKey", "payload" FROM "agent_events" WHERE')) {
+        const keys = Array.isArray(values[6]) ? values[6] as string[] : []
+        const lifeIdPrefix = String(values[7] ?? ""), lifeKeyPrefix = String(values[8] ?? "")
+        const policyId = String(values[9] ?? ""), policyKey = String(values[10] ?? "")
+        const visible = persistedEvents.filter(row => row.sessionId === values[0] && row.turnId === values[1] && row.taskId === values[2]
+          && (row.itemId === values[3] || row.correlationId === values[4] || row.itemId === values[5] || row.correlationId === values[5]
+            || keys.includes(String(row.idempotencyKey)) || String(row.id).startsWith(lifeIdPrefix)
+            || String(row.idempotencyKey).startsWith(lifeKeyPrefix) || row.id === policyId || row.idempotencyKey === policyKey))
+        return { rows: visible, rowCount: visible.length }
+      }
       if (sql.startsWith('SELECT "id", "itemId", "type", "actor", "correlationId", "causationId", "sequence",') && sql.includes('FROM "agent_events" WHERE')) {
         const keys = Array.isArray(values[6]) ? values[6] as string[] : []
         const rows = persistedEvents.filter(row => row.itemId === values[3] || row.correlationId === values[4]

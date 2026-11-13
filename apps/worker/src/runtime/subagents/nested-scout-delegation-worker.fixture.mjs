@@ -1,6 +1,7 @@
 import { Pool } from "pg"
 import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.ts"
+import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
 import { createProductionChildExecutor } from "./production-child-runtime.ts"
 import { commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.ts"
@@ -139,11 +140,19 @@ async function rootCompleted() {
     const turn = await pool.query(`SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [ids.turnId, ids.sessionId])
     if (turn.rows[0]?.status === "failed") throw new Error("p1143_root_turn_failed")
     if (turn.rows[0]?.status !== "completed") { await sleep(100); continue }
-    const latest = await pool.query(`SELECT "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
-      AND "type" = 'task_graph' ORDER BY "revision" DESC LIMIT 1`, [ids.sessionId, ids.turnId])
-    const graph = latest.rows[0]?.content
-    const nodes = graph && typeof graph === "object" && !Array.isArray(graph) ? graph.nodes : null
-    const node = Array.isArray(nodes) && nodes.length === 1 ? nodes[0] : null
+    const roots = await pool.query(`SELECT "rootTaskId" FROM "agent_turns"
+      WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [ids.turnId, ids.sessionId, ids.userId])
+    const rootTaskId = roots.rows[0]?.rootTaskId
+    if (roots.rowCount !== 1 || typeof rootTaskId !== "string" || !rootTaskId) {
+      throw new Error("p1143_root_graph_completion_unverified")
+    }
+    // agent_items stores the plan snapshot; runtime status/readiness/report come from the production read model.
+    const loaded = await loadTaskGraph(pool, {
+      userId: ids.userId, sessionId: ids.sessionId, turnId: ids.turnId,
+      rootTaskId, parentTaskId: rootTaskId,
+    }, false)
+    const state = currentTaskGraph(loaded)
+    const node = state.nodes.length === 1 ? state.nodes[0] : null
     if (!node || typeof node !== "object" || Array.isArray(node) || node.status !== "completed"
       || node.readiness !== "terminal" || node.verificationReport?.status !== "passed") {
       throw new Error("p1143_root_graph_completion_unverified")
