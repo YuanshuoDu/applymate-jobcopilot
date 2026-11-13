@@ -14373,6 +14373,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let initialPlanTaskIds: string[] | undefined
     let terminalGateLease: TurnLease | undefined
     let failedReportBeforeRepair: unknown
+    let locationPreflightStage = "not_started"
     let rootExecution = 0
     const analystWaitDiagState: AnalystWaitDiagState = {
       leaseArrivals: 0, leaseObservations: [], leaseObservationOverflow: false, expectedRootTaskId: null,
@@ -14541,11 +14542,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 analystWaitDiagState.expectedRootTaskId = hiddenRootTaskId
                 expect(JSON.stringify(graph)).not.toContain(hiddenRootTaskId)
               }
+              locationPreflightStage = "confirm_dependent_wait"
               const dependentBeforeRepair = await pool!.query<{ id: string; status: string }>(`SELECT "id", "status" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "goal" = $3`, [value.turnId, value.sessionId, "Score only after Scout proof"])
               expect(dependentBeforeRepair.rows).toHaveLength(1)
               expect(dependentBeforeRepair.rows[0]?.status).toBe("waiting")
               const earlyDispatch = await pool!.query(`SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`, [value.sessionId, `subagent-dispatch:${dependentBeforeRepair.rows[0]!.id}`])
               expect(earlyDispatch.rowCount).toBe(0)
+              locationPreflightStage = "dependent_wait_confirmed"
               if (!optimisticFinalAttempted) {
                 const initialWait = waitOutcomeFromRequest(request, 1)
                 expect(initialWait.status).toBe("ready")
@@ -14572,22 +14575,27 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               }
               if (!repairPlanSent) {
                 if (!repairJobSeeded) {
+                  locationPreflightStage = "seed_repair_job"
                   await insertJob(locationMismatch ? thirdJobId : secondJobId)
                   repairJobSeeded = true
                 }
                 if (locationConflict) {
+                  locationPreflightStage = "mutate_source_location"
                   const changedLocation = await pool!.query(`UPDATE "Job" SET "location" = 'Cork', "updatedAt" = CURRENT_TIMESTAMP
                     WHERE "id" = $1 AND "userId" = $2 RETURNING "id"`, [firstJobId, value.userId])
                   expect(changedLocation.rowCount).toBe(1)
                 }
                 if (!scout?.taskId || typeof graph?.revision !== "number") throw new Error("repair fixture lost its current target identity")
+                locationPreflightStage = "read_failed_scout"
                 const target = await pool!.query<{ result: unknown; status: string; failureReason: string | null }>(`SELECT "result", "status", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [scout.taskId, value.sessionId, value.turnId])
                 const taskResult = record(target.rows[0]?.result)
                 failedReportBeforeRepair = taskResult?.taskGraphVerificationReport
+                locationPreflightStage = "failed_scout_row_assertion"
                 expect(target.rows[0]).toMatchObject({
                   status: "failed",
                   failureReason: hardExecutorFailure ? "task_graph_verification_unverified" : "task_graph_verification_failed",
                 })
+                locationPreflightStage = "failed_report_assertion"
                 if (hardExecutorFailure) {
                   expectUnverifiedVerificationReport(failedReportBeforeRepair, "candidate-count")
                 } else if (locationEnabled) {
@@ -14602,7 +14610,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   expect(record(failedReportBeforeRepair)).toMatchObject({ status: "failed", reasonCode: "criterion_not_met", criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }] })
                   expect(String(record(failedReportBeforeRepair)?.evidenceDigest)).toMatch(/^[a-f0-9]{64}$/)
                 }
+                locationPreflightStage = "failed_report_confirmed"
                 if (locationEnabled) {
+                  locationPreflightStage = "read_root_identity"
                   const turnRoot = await pool!.query<{ rootTaskId: string | null }>(`SELECT "rootTaskId" FROM "agent_turns"
                     WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [value.turnId, value.sessionId, value.userId])
                   const rootTaskId = turnRoot.rows[0]?.rootTaskId
@@ -14610,9 +14620,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   if (!rootTaskId || !failedScoutTaskId) throw new Error("Location fixture lost its persisted root or failed Scout identity")
                   const graphScope = { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
                     rootTaskId, parentTaskId: rootTaskId }
+                  locationPreflightStage = "load_task_graph"
                   const loaded = await loadTaskGraph(pool!, graphScope, false)
                   const snapshot = loaded.snapshot
                   const node = snapshot?.nodes.find(candidate => candidate.key === "scout" && candidate.taskId === scout.taskId)
+                  locationPreflightStage = "read_persisted_scout"
                   const persisted = await pool!.query<{ attemptCount: number; result: unknown }>(`SELECT "attemptCount", "result"
                     FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3
                       AND "rootTaskId" = $4 AND "parentTaskId" = $4 AND "status" = 'failed'`,
@@ -14624,10 +14636,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                     ...graphScope, taskId: failedScoutTaskId, userId, attemptCount,
                   })
                   const currentAttempt = Number(row.attemptCount)
+                  locationPreflightStage = "reverify_current_attempt"
                   const currentProof = await reverifyFailedTaskGraphNodeEvidence(pool!, {
                     scope: verificationScope(value.userId, currentAttempt), snapshot, node, structuredResult, includeObservedLocation: true,
                   })
+                  locationPreflightStage = "current_attempt_status_assertion"
                   expect(currentProof.report.status).toBe("failed")
+                  locationPreflightStage = "current_attempt_criteria_assertion"
                   expect(currentProof.report.criteria).toEqual(locationMismatch ? [
                     { criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" },
                     { criterionId: "candidate-location", status: "failed", reasonCode: "criterion_not_met" },
@@ -14635,6 +14650,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                     { criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" },
                     { criterionId: "candidate-location", status: "passed", reasonCode: "criteria_met" },
                   ])
+                  locationPreflightStage = "current_attempt_projection_assertion"
                   expect(currentProof.projection).toMatchObject({
                     schemaVersion: "agent-harness.v2.task-graph-verification-evidence.v2",
                     role: "scout",
@@ -14645,20 +14661,25 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                       { jobId: firstJobId, observedLocation: "dublin", locationEvidenceStatus: "verified" },
                     ],
                   })
+                  locationPreflightStage = "reverify_foreign_owner"
                   const foreignProof = await reverifyFailedTaskGraphNodeEvidence(pool!, {
                     scope: verificationScope(locationForeignOwner.userId, currentAttempt), snapshot, node, structuredResult, includeObservedLocation: true,
                   })
+                  locationPreflightStage = "foreign_owner_assertion"
                   expect(foreignProof.report).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
                   expect(foreignProof.projection).toBeUndefined()
 
+                  locationPreflightStage = "bump_attempt_for_stale_proof"
                   const bumped = await pool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = $2
                     WHERE "id" = $1 AND "sessionId" = $3 AND "turnId" = $4 AND "status" = 'failed' AND "attemptCount" = $5`,
                   [scout.taskId, currentAttempt + 1, value.sessionId, value.turnId, currentAttempt])
                   expect(bumped.rowCount).toBe(1)
                   try {
+                    locationPreflightStage = "reverify_stale_attempt"
                     const priorAttemptProof = await reverifyFailedTaskGraphNodeEvidence(pool!, {
                       scope: verificationScope(value.userId, currentAttempt + 1), snapshot, node, structuredResult, includeObservedLocation: true,
                     })
+                    locationPreflightStage = "stale_attempt_assertion"
                     expect(priorAttemptProof.report).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_missing" })
                     expect(priorAttemptProof.projection).toBeUndefined()
                   } finally {
@@ -14667,6 +14688,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                     [scout.taskId, currentAttempt, value.sessionId, value.turnId, currentAttempt + 1])
                     expect(restored.rowCount).toBe(1)
                   }
+                  locationPreflightStage = "preflight_complete"
                 }
                 repairPlanSent = true
                 const repairOf = { nodeKey: "scout", taskId: scout.taskId, criterionIds: [repairCriterionId] }
@@ -15025,6 +15047,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           lookups: repairToolLookupDiagnostics.slice(-8),
         }) },
         { label: "repairStage", value: repairStage, safeValue: repairStage },
+        { label: "locationPreflightStage", value: locationPreflightStage, safeValue: locationPreflightStage },
         { label: "terminalGateLeaseCaptured", value: "", safeValue: String(Boolean(terminalGateLease)) },
         { label: "optimisticFinalAttempted", value: "", safeValue: String(optimisticFinalAttempted) },
         { label: "waitFailureKind", value: failureKind, safeValue: failureKind },
