@@ -25,8 +25,12 @@ const flags = { cognitiveLoopEnabled: false, planningEnabled: true, planningExec
   childExecutionEnabled: true, coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false }
 const FIXTURE_FAILURE_CODES = new Set([
   "p1143_children_did_not_overlap_in_running_state", "p1143_delegate_tool_missing", "p1143_grandchild_coordination_leaked",
-  "p1143_grandchild_discover_tool_missing", "p1143_grandchild_source_bound_job_missing", "p1143_grandchild_source_evidence_missing",
-  "p1143_parent_current_reads_missing", "p1143_parent_discovery_tool_missing", "p1143_parent_lease_unavailable",
+  "p1143_grandchild_discover_tool_missing", "p1143_grandchild_discovery_failed", "p1143_grandchild_source_bound_job_missing",
+  "p1143_grandchild_source_evidence_missing", "p1143_parent_current_reads_missing", "p1143_parent_discovery_tool_missing",
+  "p1143_parent_discovery_failed", "p1143_parent_lease_unavailable", "p1143_alpha_delegate_failed", "p1143_beta_delegate_failed",
+  "p1143_parent_wait_failed", "p1143_parent_job_read_failed", "p1143_fixture_tool_result_unexpected_error",
+  "p1143_fixture_tool_pair_request_invalid", "p1143_fixture_tool_pair_call_invalid", "p1143_fixture_tool_pair_call_ambiguous",
+  "p1143_fixture_tool_pair_result_ambiguous", "p1143_fixture_tool_pair_result_invalid", "p1143_fixture_wait_input_invalid",
   "p1143_root_plan_tool_missing", "p1143_root_scout_task_missing", "p1143_root_scout_verification_missing",
   "p1143_scout_results_not_available_after_wait", "p1143_scout_results_tool_missing", "p1143_second_delegate_tool_missing",
   "p1143_source_escalation_was_not_rejected", "p1143_stale_step_created_child", "p1143_stale_step_was_accepted",

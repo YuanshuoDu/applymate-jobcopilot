@@ -1,9 +1,19 @@
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.ts"
 import { ROLE_RESULT_SCHEMA } from "./role-results.ts"
 import { PgSubagentTaskStore } from "./pg-store.ts"
+import { findExactToolResult, findUniqueWaitInput } from "./nested-scout-fixture-tool-pairs.mjs"
 
 export function createNestedScoutFixtureScripts({ mode, profile, ids, pool, say, pauseSubagentClaims, reportParentJoinState }) {
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null }
+const discoverInput = { targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], source: "greenhouse", pageSize: 10 }
+const deniedSourceInput = { goal: "Try to escape the discovered source", sourceSlice: ["lever"] }
+const delegateAlphaInput = { goal: "Read the Fixture Alpha role", sourceSlice: ["greenhouse"] }
+const delegateBetaInput = { goal: "Read the Fixture Beta role", sourceSlice: ["greenhouse"] }
+function outputFor(request, name, input, errorCode = "p1143_fixture_tool_result_unexpected_error") {
+  const result = findExactToolResult(request, { name, input })
+  if (result?.isError) throw new Error(errorCode)
+  return result?.output ?? null
+}
 function graphFrom(request) {
   for (const message of [...(request.messages ?? [])].reverse()) for (const part of [...(message.content ?? [])].reverse()) {
     if (part?.type !== "text" || !part.text.includes('"kind":"task_graph_current"')) continue
@@ -11,36 +21,6 @@ function graphFrom(request) {
   }
   return null
 }
-function toolResult(request, callId) {
-  for (const message of [...(request.messages ?? [])].reverse()) for (const part of [...(message.content ?? [])].reverse()) {
-    if (part?.type !== "tool_result" || part.toolUseId !== callId || typeof part.content !== "string") continue
-    try { return JSON.parse(part.content) } catch { return null }
-  }
-  return null
-}
-function toolOutputForName(request, name) {
-  const messages = request.messages ?? []
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    for (const part of [...(messages[index].content ?? [])].reverse()) {
-      if (part?.type !== "tool_use" || part.name !== name || typeof part.id !== "string") continue
-      for (let resultIndex = index + 1; resultIndex < messages.length; resultIndex += 1) {
-        for (const result of messages[resultIndex].content ?? []) {
-          if (result?.type !== "tool_result" || result.toolUseId !== part.id || typeof result.content !== "string") continue
-          try { return { output: JSON.parse(result.content), isError: result.isError === true } } catch { return null }
-        }
-      }
-    }
-  }
-  return null
-}
-
-function toolFailed(request, callId) {
-  for (const message of [...(request.messages ?? [])].reverse()) for (const part of [...(message.content ?? [])].reverse()) {
-    if (part?.type === "tool_result" && part.toolUseId === callId) return part.isError === true
-  }
-  return false
-}
-
 function hasTerminalWaitOutcome(waitOutput, expectedTaskIds) {
   const terminal = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
   if (!waitOutput || expectedTaskIds.length !== 2 || new Set(expectedTaskIds).size !== 2
@@ -147,15 +127,16 @@ function childModelRuntime({ task, runtime, markerState }) {
     if (task.depth === 2) {
       await waitForTwoRunningChildren(task, markerState)
       const discoverCall = `p1143-child-discover:${task.id}`
-      const receipt = toolResult(request, discoverCall)
+      const receipt = findExactToolResult(request, { name: "jobs.discover", input: discoverInput })
       if (!receipt) {
         if (!request.tools.some(tool => tool.name === "jobs.discover")) throw new Error("p1143_grandchild_discover_tool_missing")
         if (request.tools.some(tool => tool.name === "scout.delegate" || tool.name === "scout.results")) throw new Error("p1143_grandchild_coordination_leaked")
-        yield toolCall(discoverCall, "jobs.discover", { targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], source: "greenhouse", pageSize: 10 })
+        yield toolCall(discoverCall, "jobs.discover", discoverInput)
         yield completed(); return
       }
+      if (receipt.isError) throw new Error("p1143_grandchild_discovery_failed")
       say("P1143_CHILD_DISCOVERY_RESULT_RECEIVED")
-      const jobs = Array.isArray(object(receipt)?.jobs) ? receipt.jobs.map(object) : []
+      const jobs = Array.isArray(object(receipt.output)?.jobs) ? receipt.output.jobs.map(object) : []
       const wanted = task.goal.includes("Alpha") ? "Fixture Alpha" : "Fixture Beta"
       const job = jobs.find(value => value?.company === wanted && value.source === "greenhouse")
       if (!job) throw new Error("p1143_grandchild_source_bound_job_missing")
@@ -174,26 +155,31 @@ function childModelRuntime({ task, runtime, markerState }) {
       markerState.subagentClaimsPaused = true
       say("P1143_SUBAGENT_CLAIMS_PAUSED")
     }
-    if (!toolResult(request, discoverCall)) {
+    const discovery = findExactToolResult(request, { name: "jobs.discover", input: discoverInput })
+    if (!discovery) {
       if (!request.tools.some(tool => tool.name === "jobs.discover")) throw new Error("p1143_parent_discovery_tool_missing")
       if (task.depth === 1) say("P1143_PARENT_DISCOVER_REQUESTED")
-      yield toolCall(discoverCall, "jobs.discover", { targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], source: "greenhouse", pageSize: 10 })
+      yield toolCall(discoverCall, "jobs.discover", discoverInput)
       yield completed(); return
     }
+    if (discovery.isError) throw new Error("p1143_parent_discovery_failed")
     const deniedSourceCall = `p1143-delegate-lever:${task.id}`
-    if (!toolFailed(request, deniedSourceCall)) {
-      if (toolResult(request, deniedSourceCall)) throw new Error("p1143_source_escalation_was_not_rejected")
+    const deniedSource = findExactToolResult(request, { name: "scout.delegate", input: deniedSourceInput })
+    if (!deniedSource) {
       if (!request.tools.some(tool => tool.name === "scout.delegate")) throw new Error("p1143_delegate_tool_missing")
       say("P1143_SOURCE_ESCALATION_REQUESTED")
-      yield toolCall(deniedSourceCall, "scout.delegate", { goal: "Try to escape the discovered source", sourceSlice: ["lever"] })
+      yield toolCall(deniedSourceCall, "scout.delegate", deniedSourceInput)
       yield completed(); return
     }
+    if (!deniedSource.isError) throw new Error("p1143_source_escalation_was_not_rejected")
     say("P1143_SOURCE_ESCALATION_REJECTED")
-    if (!toolResult(request, delegateOne)) {
+    const alphaResult = findExactToolResult(request, { name: "scout.delegate", input: delegateAlphaInput })
+    if (!alphaResult) {
       if (!request.tools.some(tool => tool.name === "scout.delegate")) throw new Error("p1143_delegate_tool_missing")
-      yield toolCall(delegateOne, "scout.delegate", { goal: "Read the Fixture Alpha role", sourceSlice: ["greenhouse"] })
+      yield toolCall(delegateOne, "scout.delegate", delegateAlphaInput)
       yield completed(); return
     }
+    if (alphaResult.isError) throw new Error("p1143_alpha_delegate_failed")
     if (!markerState.closedStepRejected) {
       const old = await pool.query(`SELECT "stepId" FROM "agent_items" WHERE "taskId" = $1 AND "type" = 'tool_call' AND content->>'toolCallId' = $2`, [task.id, delegateOne])
       const current = await pool.query(`SELECT "id" FROM "agent_steps" WHERE "taskId" = $1 AND "status" = 'streaming' ORDER BY "ordinal" DESC LIMIT 1`, [task.id])
@@ -204,13 +190,19 @@ function childModelRuntime({ task, runtime, markerState }) {
       await rejectStepReplay(task, runtime.manager, delegateOne, String(current.rows[0].id))
       say("P1143_FOREIGN_CALL_STEP_REJECTED")
     }
-    if (!toolResult(request, delegateTwo)) {
+    const betaResult = findExactToolResult(request, { name: "scout.delegate", input: delegateBetaInput })
+    if (!betaResult) {
       if (!request.tools.some(tool => tool.name === "scout.delegate")) throw new Error("p1143_second_delegate_tool_missing")
-      yield toolCall(delegateTwo, "scout.delegate", { goal: "Read the Fixture Beta role", sourceSlice: ["greenhouse"] })
+      yield toolCall(delegateTwo, "scout.delegate", delegateBetaInput)
       yield completed(); return
     }
-    const delegateResults = [toolResult(request, delegateOne), toolResult(request, delegateTwo)], childIds = delegateResults.map(value => object(value)?.taskId).filter(id => typeof id === "string")
-    const waitResult = toolOutputForName(request, "wait_subagents"), waitOutput = object(waitResult?.output), terminalWaitMatch = hasTerminalWaitOutcome(waitOutput, childIds), joined = toolResult(request, resultsCall), issueScoutResults = terminalWaitMatch && !joined
+    if (betaResult.isError) throw new Error("p1143_beta_delegate_failed")
+    const delegateResults = [alphaResult.output, betaResult.output], childIds = delegateResults.map(value => object(value)?.taskId).filter(id => typeof id === "string")
+    const waitInput = findUniqueWaitInput(request, childIds)
+    const waitResult = waitInput ? findExactToolResult(request, { name: "wait_subagents", input: waitInput }) : null
+    if (waitResult?.isError) throw new Error("p1143_parent_wait_failed")
+    const waitOutput = object(waitResult?.output), terminalWaitMatch = hasTerminalWaitOutcome(waitOutput, childIds)
+    const joined = outputFor(request, "scout.results", {}), issueScoutResults = terminalWaitMatch && !joined
     reportParentJoinState({ delegateResultCount: delegateResults.filter(Boolean).length, childIdCount: childIds.length, waitResultPresent: waitResult !== null, terminalWaitMatch, scoutResultsIssued: issueScoutResults })
     if (issueScoutResults) {
       if (!request.tools.some(tool => tool.name === "scout.results")) throw new Error("p1143_scout_results_tool_missing")
@@ -226,15 +218,15 @@ function childModelRuntime({ task, runtime, markerState }) {
     const children = Array.isArray(object(joined)?.children) ? joined.children.map(object) : []
     const candidates = children.flatMap(child => Array.isArray(child?.candidates) ? child.candidates.map(object) : [])
     for (const candidate of candidates) {
-      const callId = `p1143-parent-job-get:${task.id}:${candidate?.jobId}`
-      if (!toolResult(request, callId)) {
-        yield toolCall(callId, "jobs.get", { jobId: candidate?.jobId })
+      const callId = `p1143-parent-job-get:${task.id}:${candidate?.jobId}`, input = { jobId: candidate?.jobId }
+      if (!findExactToolResult(request, { name: "jobs.get", input })) {
+        yield toolCall(callId, "jobs.get", input)
         yield completed(); return
       }
     }
     const jobs = candidates.map(candidate => ({
       candidate,
-      result: toolResult(request, `p1143-parent-job-get:${task.id}:${candidate?.jobId}`),
+      result: outputFor(request, "jobs.get", { jobId: candidate?.jobId }, "p1143_parent_job_read_failed"),
     }))
     if (jobs.length !== 2 || jobs.some(item => object(object(item.result)?.job)?.id !== item.candidate?.jobId)) throw new Error("p1143_parent_current_reads_missing")
     const evidence = jobs.map(({ candidate, result }) => ({ id: `model-read:${candidate?.jobId}`, kind: "job", ref: candidate?.jobId, source: object(object(result)?.job)?.source }))
