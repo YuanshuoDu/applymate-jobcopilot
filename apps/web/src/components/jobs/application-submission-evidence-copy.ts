@@ -18,7 +18,7 @@ const ENGLISH = {
   unknown: "Unknown",
   localRecordLabel: "Run record",
   localRecorded: "Linked",
-  employerReceiptLabel: "Employer receipt",
+  employerReceiptLabel: "Receipt from employer",
   employerUnverified: "Not verified",
   unavailableNotice: "Detailed submission evidence is unavailable.",
 }

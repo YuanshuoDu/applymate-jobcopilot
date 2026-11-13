@@ -53,7 +53,7 @@ describe('application task card', () => {
     }} />)
     expect(html).toContain('Submission details')
     expect(html).toContain('Automation result')
-    expect(html).toContain('Employer receipt')
+    expect(html).toContain('Receipt from employer')
     expect(html).toContain('Not verified')
     expect(html).toContain('Detailed submission evidence is unavailable.')
     expect(html).not.toContain('confirmed')

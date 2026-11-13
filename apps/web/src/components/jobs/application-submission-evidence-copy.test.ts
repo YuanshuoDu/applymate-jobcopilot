@@ -16,7 +16,7 @@ describe("application submission evidence copy", () => {
       workerReportValue: "Unknown",
       localRecordLabel: "Run record",
       localRecordValue: "Unknown",
-      employerReceiptLabel: "Employer receipt",
+      employerReceiptLabel: "Receipt from employer",
       employerReceiptValue: "Not verified",
       unavailableNotice: "Detailed submission evidence is unavailable.",
     })
