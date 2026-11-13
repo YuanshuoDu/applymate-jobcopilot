@@ -161,7 +161,12 @@ function modelProfile() {
 }
 const nativeVerifierExecutor = createProductionChildExecutor({
   pool,
-  authorizeUsage: async () => ({ settle: async () => undefined }),
+  authorizeUsage: async () => ({
+    outputReservationRequired: false,
+    maxOutputTokens: null,
+    settle: async () => undefined,
+    settleUnknown: async () => undefined,
+  }),
   modelRuntimeFactory: async ({ task }) => {
     const control = parseNativeVerificationControl(task.expectedOutputSchema)
     const packet = control ? parseNativeVerificationPacket(task.context, control) : null
@@ -599,7 +604,12 @@ async function startRuntime(firstWorker) {
     return { status: "completed", result: { proof: "objective-snapshot-child-completed", taskId: lease.id } }
   }
   const runtimeOptions = {
-    authorizeUsage: async () => ({ settle() {} }),
+    authorizeUsage: async () => ({
+      outputReservationRequired: false,
+      maxOutputTokens: null,
+      settle: async () => undefined,
+      settleUnknown: async () => undefined,
+    }),
     modelRuntimeFactory() {
       let calls = 0
       return { adapter: { id: "objective-snapshot-fixture-model", profile: modelProfile(), async *stream(request) {
@@ -686,7 +696,12 @@ async function startRuntime(firstWorker) {
           instrumentTurnEngineStore(storePool, terminalGuard, mergedOptions.turnEngineStoreFactory),
       })
     },
-    createWorkerUsageAuthorizer() { return async () => ({ settle() {} }) },
+    createWorkerUsageAuthorizer() { return async () => ({
+      outputReservationRequired: false,
+      maxOutputTokens: null,
+      settle: async () => undefined,
+      settleUnknown: async () => undefined,
+    }) },
     createCanonicalExecutionProjection() { return noOpProjection }, createCanonicalSessionProjection() { return noOpProjection },
     startProductionAgentRuntime(startupOptions) {
       return startProductionAgentRuntimeHelper({ ...startupOptions, bootstrapOptions: runtime => {
