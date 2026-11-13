@@ -69,13 +69,13 @@ function observeQueries(pool: PgPool, afterQuery: (sql: string, values?: readonl
 
 function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number): string {
   const witnessId = `$${witnessIdParameter}`
-  return `WITH "agent_events" AS MATERIALIZED (
+  return `WITH "agent_events" AS NOT MATERIALIZED (
       SELECT * FROM public."agent_events"
       UNION ALL
       SELECT (jsonb_populate_record(NULL::public.agent_events,
         to_jsonb(source_witness) || jsonb_build_object('id', source_witness."id" || ':query-duplicate'))).*
       FROM public."agent_events" AS source_witness WHERE source_witness."id" = ${witnessId}
-    ), "agent_outbox" AS MATERIALIZED (
+    ), "agent_outbox" AS NOT MATERIALIZED (
       SELECT * FROM public."agent_outbox"
       UNION ALL
       SELECT (jsonb_populate_record(NULL::public.agent_outbox,
