@@ -67,16 +67,29 @@ function observeQueries(pool: PgPool, afterQuery: (sql: string, values?: readonl
   }
 }
 
-function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number): string {
+function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number, fixtureScopeParameter: number): string {
   const witnessId = `$${witnessIdParameter}`
-  return `WITH "agent_events" AS NOT MATERIALIZED (
-      SELECT * FROM public."agent_events"
+  const fixtureScope = `$${fixtureScopeParameter}`
+  return `WITH "fixture_scope" AS MATERIALIZED (
+      SELECT DISTINCT scope."sessionId", scope."turnId"
+      FROM jsonb_to_recordset(${fixtureScope}::jsonb) AS scope("sessionId" text, "turnId" text)
+    ), "fixture_events" AS MATERIALIZED (
+      SELECT source_event.*
+      FROM "fixture_scope" AS scope
+      CROSS JOIN LATERAL (
+        SELECT event.* FROM public."agent_events" AS event
+        WHERE event."sessionId" = scope."sessionId" AND event."turnId" = scope."turnId"
+      ) AS source_event
+    ), "agent_events" AS NOT MATERIALIZED (
+      SELECT * FROM "fixture_events"
       UNION ALL
       SELECT (jsonb_populate_record(NULL::public.agent_events,
         to_jsonb(source_witness) || jsonb_build_object('id', source_witness."id" || ':query-duplicate'))).*
-      FROM public."agent_events" AS source_witness WHERE source_witness."id" = ${witnessId}
+      FROM "fixture_events" AS source_witness WHERE source_witness."id" = ${witnessId}
     ), "agent_outbox" AS NOT MATERIALIZED (
-      SELECT * FROM public."agent_outbox"
+      SELECT source_dispatch.*
+      FROM "fixture_events" AS event
+      JOIN public."agent_outbox" AS source_dispatch ON source_dispatch."id" = 'agent-outbox-' || event."id"
       UNION ALL
       SELECT (jsonb_populate_record(NULL::public.agent_outbox,
         to_jsonb(source_dispatch) || jsonb_build_object(
@@ -88,7 +101,7 @@ function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number):
             'correlationId', shadow_witness."correlationId", 'causationId', shadow_witness."causationId",
             'idempotencyKey', shadow_witness."idempotencyKey", 'payload', shadow_witness.payload)))).*
       FROM "agent_events" AS shadow_witness
-      JOIN public."agent_events" AS source_witness
+      JOIN "fixture_events" AS source_witness
         ON shadow_witness."id" = source_witness."id" || ':query-duplicate'
       JOIN public."agent_outbox" AS source_dispatch ON source_dispatch."id" = 'agent-outbox-' || source_witness."id"
     )
@@ -97,7 +110,7 @@ function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number):
     CROSS JOIN (SELECT $3::text) AS "root_task_history_parameter_type_anchor"`
 }
 
-function queryLevelDuplicateWitnessPool(pool: PgPool, witnessId: string): Pick<PgPool, "connect"> {
+function queryLevelDuplicateWitnessPool(pool: PgPool, witnessId: string, fixtureScope: string): Pick<PgPool, "connect"> {
   return {
     connect: async () => {
       const client = await pool.connect()
@@ -107,8 +120,10 @@ function queryLevelDuplicateWitnessPool(pool: PgPool, witnessId: string): Pick<P
           return originalQuery(sql, values ? [...values] : undefined)
         }
         const witnessIdParameter = (values?.length ?? 0) + 1
+        const fixtureScopeParameter = witnessIdParameter + 1
         await originalQuery("SET LOCAL max_parallel_workers_per_gather = 0")
-        return originalQuery(queryLevelDuplicateWitnessSql(sql, witnessIdParameter), [...(values ?? []), witnessId])
+        return originalQuery(queryLevelDuplicateWitnessSql(sql, witnessIdParameter, fixtureScopeParameter),
+          [...(values ?? []), witnessId, fixtureScope])
       }
       return new Proxy(client, {
         get(target, property) {
@@ -302,6 +317,18 @@ const mismatchedStepReceipt: Source = { turnId: `root-history-mismatched-step-ev
 const duplicateStepReceipt: Source = { turnId: `root-history-duplicate-step-event-turn-${suffix}`, rootTaskId: `root-history-duplicate-step-event-root-${suffix}`,
   childId: `root-history-duplicate-step-event-child-${suffix}`, finalItemId: `root-history-duplicate-step-event-final-${suffix}`, sessionId, userId,
   goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 44, stepReceipt: "duplicate" }
+const initialRootHistorySources: readonly Source[] = [
+  ...matching, mismatched, changedCriteria, selectedJob, otherSession, crossEqualTimeHigherTurnId,
+  crossWrongSource, crossWrongOrigin, archivedSource, equalCutoff, foreignScopeCorrelation, otherUser,
+  inconsistentTerminal, streamingTerminalStep, failedTerminalStep, missingStepReceipt, mismatchedStepReceipt,
+  duplicateStepReceipt, ...crossSessionWrongOriginFillers,
+]
+const duplicateWitnessFixtureScope = [
+  { sessionId, turnId: currentTurnId },
+  ...initialRootHistorySources.map(source => ({ sessionId: source.sessionId, turnId: source.turnId })),
+  { sessionId: future.sessionId, turnId: future.turnId },
+]
+const duplicateWitnessFixtureScopeJson = JSON.stringify(duplicateWitnessFixtureScope)
 let pool: PgPool | undefined
 let lease: TurnLease
 
@@ -620,25 +647,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await insertSession(foreignSessionId, otherUserId, FIXTURE_EVENT_SEQUENCE)
     await insertSession(archivedSessionId, userId, FIXTURE_EVENT_SEQUENCE)
     await pool.query(`UPDATE "agent_sessions" SET "status" = 'archived' WHERE "id" = $1`, [archivedSessionId])
-    for (const source of matching) await insertSource(source)
-    await insertSource(mismatched)
-    await insertSource(changedCriteria)
-    await insertSource(selectedJob)
-    await insertSource(otherSession)
-    await insertSource(crossEqualTimeHigherTurnId)
-    await insertSource(crossWrongSource)
-    await insertSource(crossWrongOrigin)
-    await insertSource(archivedSource)
-    await insertSource(equalCutoff)
-    await insertSource(foreignScopeCorrelation)
-    await insertSource(otherUser)
-    await insertSource(inconsistentTerminal)
-    await insertSource(streamingTerminalStep)
-    await insertSource(failedTerminalStep)
-    await insertSource(missingStepReceipt)
-    await insertSource(mismatchedStepReceipt)
-    await insertSource(duplicateStepReceipt)
-    for (const source of crossSessionWrongOriginFillers) await insertSource(source)
+    for (const source of initialRootHistorySources) await insertSource(source)
     const input = { goal: objective, successCriteria: criteria }
     await pool.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
       "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
@@ -851,6 +860,27 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
   it("keeps full cross-session witness multiplicity across keyset pages without weakening table constraints", async () => {
     const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
       rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true }
+    expect(duplicateWitnessFixtureScope).toEqual([
+      { sessionId, turnId: currentTurnId },
+      ...initialRootHistorySources.map(source => ({ sessionId: source.sessionId, turnId: source.turnId })),
+      { sessionId: future.sessionId, turnId: future.turnId },
+    ])
+    expect(duplicateWitnessFixtureScope).toHaveLength(initialRootHistorySources.length + 2)
+    expect([...new Set(duplicateWitnessFixtureScope.map(scope => scope.sessionId))].sort()).toEqual(
+      [archivedSessionId, foreignSessionId, otherSessionId, sessionId].sort())
+    expect(duplicateWitnessFixtureScope).toEqual(expect.arrayContaining([
+      { sessionId: otherSessionId, turnId: equalCutoff.turnId },
+      { sessionId: otherSessionId, turnId: otherSession.turnId },
+      { sessionId: otherSessionId, turnId: crossEqualTimeHigherTurnId.turnId },
+      { sessionId: otherSessionId, turnId: crossWrongOrigin.turnId },
+      { sessionId: otherSessionId, turnId: crossWrongSource.turnId },
+      { sessionId: archivedSessionId, turnId: archivedSource.turnId },
+      { sessionId: foreignSessionId, turnId: otherUser.turnId },
+      { sessionId, turnId: foreignScopeCorrelation.turnId },
+      ...crossSessionWrongOriginFillers.map(source => ({ sessionId: source.sessionId, turnId: source.turnId })),
+    ]))
+    expect(duplicateWitnessFixtureScope).not.toContainEqual({ sessionId: scheduledSessionId, turnId: scheduledCurrentTurnId })
+
     type KeysetPhase =
       | "pool_checkout_started" | "pool_checkout_acquired"
       | "transaction_begin_started" | "transaction_begin_completed"
@@ -917,7 +947,8 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
         phase(pagePhases[kind][0])
         const query = buildRootTaskHistoryCrossSessionWindow({ ...window, ...(afterCursor ? { afterCursor } : {}) })
         const result = await client.query<Record<string, unknown>>(
-          queryLevelDuplicateWitnessSql(query.sql, query.values.length + 1), [...query.values, baseWitnessId])
+          queryLevelDuplicateWitnessSql(query.sql, query.values.length + 1, query.values.length + 2),
+          [...query.values, baseWitnessId, duplicateWitnessFixtureScopeJson])
         phase(pagePhases[kind][1])
         const pageRows = result.rows.filter(row => row.isPageWatermark !== true)
         const watermarks = result.rows.filter(row => row.isPageWatermark === true)
@@ -976,7 +1007,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
 
     phase("post_transaction_history_load_started")
     const historyWithShadowWitness = await createPgDirectRootTaskHistoryStore(
-      queryLevelDuplicateWitnessPool(pool!, baseWitnessId!)).load(input)
+      queryLevelDuplicateWitnessPool(pool!, baseWitnessId!, duplicateWitnessFixtureScopeJson)).load(input)
     phase("post_transaction_history_load_completed")
     expect(historyWithShadowWitness.some(item => item.sourceTurnId === equalCutoff.turnId)).toBe(false)
     expect(historyWithShadowWitness.map(item => item.sourceTurnId)).toContain(otherSession.turnId)
