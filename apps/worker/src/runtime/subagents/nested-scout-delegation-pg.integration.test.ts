@@ -216,12 +216,30 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
          WHERE "sessionId" = $1 AND "parentTaskId" = "rootTaskId" AND "depth" = 1 AND "role" = 'scout'`, [ids.sessionId])
       expect(parent.rows).toHaveLength(1)
       expect(parent.rows[0]).toMatchObject({ status: "waiting", leaseOwner: null })
-      const deniedSource = await pool.query<{ status: string; errorCode: string | null; input: unknown }>(
-        `SELECT status, content->>'errorCode' AS "errorCode", content->'input' AS input FROM "agent_items"
-         WHERE "taskId" = $1 AND "type" = 'tool_call' AND content->>'toolCallId' = $2`,
-        [parent.rows[0]!.id, `p1143-delegate-lever:${parent.rows[0]!.id}`])
+      const deniedSource = await pool.query<{ status: string; outcomeStatus: string; errorCode: string | null; input: unknown;
+        resultCount: number; resultItemStatus: string | null; resultErrorCode: string | null; failedEventCount: number }>(
+        `SELECT call."status", call."content"->>'status' AS "outcomeStatus", call."content"->>'errorCode' AS "errorCode",
+            call."content"->'input' AS input,
+            (SELECT count(*)::int FROM "agent_items" result WHERE result."sessionId" = call."sessionId"
+              AND result."turnId" = call."turnId" AND result."taskId" = call."taskId" AND result."type" = 'tool_result'
+              AND result."content"->>'toolCallId' = $2) AS "resultCount",
+            (SELECT result."status" FROM "agent_items" result WHERE result."sessionId" = call."sessionId"
+              AND result."turnId" = call."turnId" AND result."taskId" = call."taskId" AND result."type" = 'tool_result'
+              AND result."content"->>'toolCallId' = $2 LIMIT 1) AS "resultItemStatus",
+            (SELECT result."content"->>'errorCode' FROM "agent_items" result WHERE result."sessionId" = call."sessionId"
+              AND result."turnId" = call."turnId" AND result."taskId" = call."taskId" AND result."type" = 'tool_result'
+              AND result."content"->>'toolCallId' = $2 LIMIT 1) AS "resultErrorCode",
+            (SELECT count(*)::int FROM "agent_events" event WHERE event."sessionId" = call."sessionId"
+              AND event."turnId" = call."turnId" AND event."taskId" = call."taskId" AND event."type" = 'tool_call.failed'
+              AND event."correlationId" = $2 AND event."itemId" = call."id"
+              AND event."payload"->>'errorCode' = $3) AS "failedEventCount"
+          FROM "agent_items" call WHERE call."taskId" = $1 AND call."type" = 'tool_call'
+            AND call."content"->>'toolCallId' = $2`,
+        [parent.rows[0]!.id, `p1143-delegate-lever:${parent.rows[0]!.id}`, "nested_scout_source_scope_unavailable"])
       expect(deniedSource.rows).toHaveLength(1)
-      expect(deniedSource.rows[0]).toMatchObject({ status: "failed", errorCode: "nested_scout_source_scope_unavailable" })
+      expect(deniedSource.rows[0]).toMatchObject({ status: "completed", outcomeStatus: "failed",
+        errorCode: "nested_scout_source_scope_unavailable", resultCount: 1, resultItemStatus: "completed",
+        resultErrorCode: "nested_scout_source_scope_unavailable", failedEventCount: 1 })
       const deniedInput = deniedSource.rows[0]!.input as Record<string, unknown>
       expect(deniedInput.sourceSlice).toEqual(["lever"])
       const nested = await pool.query<{ id: string; status: string; depth: number; goal: string; attemptCount: number }>(
