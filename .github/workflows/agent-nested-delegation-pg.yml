@@ -46,7 +46,6 @@ jobs:
       AGENT_TURN_REDIS_TEST_DISPOSABLE: 'true'
       AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
       REDIS_URL: redis://127.0.0.1:6379/15
-      REPORT_PATH: ${{ runner.temp }}/nested-delegation-pg.json
     steps:
       - uses: actions/checkout@v4
         with:
@@ -75,6 +74,8 @@ jobs:
       - name: Build Worker dependencies
         run: pnpm turbo build --filter=@jobcopilot/worker
       - name: Run eight PostgreSQL primitive cases
+        env:
+          REPORT_PATH: ${{ runner.temp }}/nested-delegation-pg.json
         run: |
           pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
             src/runtime/subagents/parent-execution-fence-pg.integration.test.ts \
@@ -82,6 +83,8 @@ jobs:
       - name: Require the exact passing case set
         if: always()
         shell: bash
+        env:
+          REPORT_PATH: ${{ runner.temp }}/nested-delegation-pg.json
         run: |
           node <<'NODE'
           const fs = require('node:fs')
