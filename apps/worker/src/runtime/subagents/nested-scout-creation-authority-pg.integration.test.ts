@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool } from "pg"
+import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { AgentTreeManager } from "./manager.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { createSubagentTask } from "./pg-store-create.js"
@@ -8,7 +9,7 @@ import { transaction } from "./pg-store-persistence.js"
 import { normalizeSubagentPolicy } from "./types.js"
 import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
-import { TASK_GRAPH_ITEM_TYPE, taskGraphItemId } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
 
 const DATABASE = "applymate_nested_delegation_ci"
 function disposableUrl(): string | null {
@@ -57,11 +58,23 @@ describePg("nested Scout creation authority: disposable PostgreSQL", () => {
         await client.query(`SELECT set_config('app.user_id', $1, true)`, [ids.user])
         return createSubagentTask(client, profileSpec, true, { nestedScoutAuthority: "parent_template", taskGraphChildDeadline: true })
       })
+      const proposal = { expectedRevision: 0, nodes: [{ key: "scout", templateId: "scout", goal: profileSpec.goal,
+        successCriteria: profileSpec.successCriteria, dependsOn: [] }] }
+      const graphContent = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ ...proposal.nodes[0],
+        depth: 1, taskId: parent.id }] })
       const graphItem = taskGraphItemId(ids.root)
-      await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "content", "updatedAt") VALUES ($1, $2, $3, $4, $5, 'completed', '{}'::jsonb, CURRENT_TIMESTAMP)`, [graphItem, ids.session, ids.turn, ids.root, TASK_GRAPH_ITEM_TYPE])
+      const graphRevision = 1, now = new Date().toISOString()
+      const item = { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: graphItem, sessionId: ids.session, turnId: ids.turn,
+        stepId: null, taskId: ids.root, type: TASK_GRAPH_ITEM_TYPE, status: "streaming", phase: null, revision: graphRevision,
+        content: graphContent, startedAt: now, completedAt: null, createdAt: now, updatedAt: now }
+      const receipt = { status: "accepted", revision: graphRevision,
+        nodes: [{ key: "scout", taskId: parent.id, status: "queued" }], readyTaskIds: [parent.id] }
+      await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "updatedAt")
+        VALUES ($1, $2, $3, NULL, $4, $5, 'streaming', NULL, $6, $7::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      [graphItem, ids.session, ids.turn, ids.root, TASK_GRAPH_ITEM_TYPE, graphRevision, JSON.stringify(graphContent)])
       await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
-        VALUES ($1, $2, $3, $4, $5, 1, 'item.started', 'orchestrator', 'plan-step', $6, $7::jsonb)`, [randomUUID(), ids.session, ids.turn, graphItem, ids.root, randomUUID(),
-        JSON.stringify({ kind: "proposal", receipt: { revision: 1, nodes: [{ key: "scout", taskId: parent.id, status: "queued" }], readyTaskIds: [parent.id] } })])
+        VALUES ($1, $2, $3, $4, $5, 1, 'item.started', 'orchestrator', $3, $6, $7::jsonb)`, [randomUUID(), ids.session, ids.turn, graphItem, ids.root,
+        taskGraphProposalKey(ids.root, 0), JSON.stringify({ kind: "proposal", fingerprint: taskGraphFingerprint(proposal), revision: graphRevision, receipt, item })])
       manager = new AgentTreeManager(new PgSubagentTaskStore(pool), { heartbeatMs: 300_000 })
       const lease = await manager.claim({ taskId: parent.id, sessionId: ids.session, rootTaskId: ids.root, ownerId: "nested-authority-worker" })
       if (!lease) throw Error("Profile Scout fixture could not be claimed")

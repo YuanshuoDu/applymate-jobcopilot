@@ -11,6 +11,10 @@ const [, , mode, rawIds] = process.argv
 const ids = JSON.parse(rawIds)
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 10 })
 let bootstrap
+async function pauseSubagentClaims() {
+  if (!bootstrap?.subagents) throw new Error("p1143_subagent_queue_unavailable")
+  await bootstrap.subagents.queue.worker.pause(true)
+}
 const profile = { provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
   continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false,
   supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false,
@@ -30,7 +34,7 @@ process.stdin.on("data", chunk => {
   }
 })
 function say(value) { process.stdout.write(value + "\n") }
-const { rootModelRuntime, discoveryClient, childModelRuntime } = createNestedScoutFixtureScripts({ mode, profile, ids, pool, say })
+const { rootModelRuntime, discoveryClient, childModelRuntime } = createNestedScoutFixtureScripts({ mode, profile, ids, pool, say, pauseSubagentClaims })
 function command(name) {
   const index = commands.indexOf(name)
   if (index >= 0) { commands.splice(index, 1); return Promise.resolve() }
@@ -52,7 +56,6 @@ async function start(mode) {
     waitResolver: { intervalMs: 20, ownerId: `${ownerId}-wait-resolver` },
     subagents: { intervalMs: 20, execute: executeChild } })
   if (mode === "park") {
-    await bootstrap.subagents?.queue.worker.pause()
     const { enqueueTurn } = await import("../turns/turn-queue.ts")
     await enqueueTurn(pool, bootstrap.turns.queue, { turnId: ids.turnId, sessionId: ids.sessionId, ownerId })
   }

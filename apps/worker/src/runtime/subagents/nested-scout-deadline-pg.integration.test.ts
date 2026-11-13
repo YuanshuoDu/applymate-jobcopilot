@@ -64,7 +64,7 @@ async function seedGraph(pool: Pool): Promise<Fixture> {
     proposal: { expectedRevision: 0, nodes: [
       { key: "scout", templateId: "scout", goal: "Find relevant jobs", successCriteria: ["Return candidates"], dependsOn: [],
         verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
-          criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }] } },
+          criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] } },
       { key: "sibling", templateId: "analyst", goal: "Independent sibling", successCriteria: ["Inspect evidence"], dependsOn: [],
         verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
           criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }] } },

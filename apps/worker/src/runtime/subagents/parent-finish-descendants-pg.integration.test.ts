@@ -205,7 +205,9 @@ describePg("parent finish descendant barrier: disposable PostgreSQL", () => {
       await work(() => blocker.query("BEGIN"), "Blocker begin")
       blockerOpen = true
       const blockerPid = Number((await work(() => blocker.query(`SELECT pg_backend_pid() AS pid`), "Blocker PID probe")).rows[0]!.pid)
-      await work(() => blocker.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [value.sessionId]), "Session lock")
+      const blockerLock = await work(() => blocker.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [value.sessionId]), "Session lock")
+      const blockerRowLocked = blockerLock.rowCount === 1
+      expect(blockerRowLocked).toBe(true)
       const request: SubagentTaskSpec = { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
         parentTaskId: value.parentId, role: "scout", taskType: "research", goal: "Concurrent read-only child",
         allowedActions: ["jobs.search"] }
@@ -214,16 +216,40 @@ describePg("parent finish descendant barrier: disposable PostgreSQL", () => {
         attemptCount: lease.attemptCount, status: "completed", result: { status: "completed" }, now: new Date() }))
       pendingOperations = [spawn, finish]
       await bounded(lockRequestsReady, remaining(3_000), "Both session lock requests")
+      const distinctWaiterPids = new Set(lockPids).size === 2
+      expect(distinctWaiterPids).toBe(true)
       const deadline = Math.min(started + 12_000, Date.now() + 5_000)
       let bothBlocked = false
+      let bothActiveLockWaiters = false
+      let bothChainsReachBlocker = false
       while (Date.now() < deadline && !bothBlocked) {
-        const status = await work(() => probe.query<{ blocked: boolean }>(
-          `SELECT $2::int = ANY(pg_blocking_pids($1::int)) AS blocked`, [lockPids[0], blockerPid]), "Spawn lock wait probe")
-        const second = await work(() => probe.query<{ blocked: boolean }>(
-          `SELECT $2::int = ANY(pg_blocking_pids($1::int)) AS blocked`, [lockPids[1], blockerPid]), "Finish lock wait probe")
-        bothBlocked = status.rows[0]?.blocked === true && second.rows[0]?.blocked === true
+        const status = await work(() => probe.query<{
+          pid: number; state: string | null; waitEventType: string | null; blockingPids: number[]
+        }>(`SELECT activity.pid, activity.state, activity.wait_event_type AS "waitEventType",
+            pg_blocking_pids(activity.pid) AS "blockingPids"
+          FROM pg_stat_activity AS activity WHERE activity.pid = ANY($1::int[])`, [lockPids]), "Session lock chain probe")
+        const byPid = new Map(status.rows.map(row => [Number(row.pid), row]))
+        const allowedPids = new Set([blockerPid, ...lockPids])
+        const reachesBlocker = (pid: number, visited = new Set<number>()): boolean => {
+          if (pid === blockerPid) return true
+          if (visited.has(pid)) return false
+          visited.add(pid)
+          const row = byPid.get(pid)
+          if (!row || row.state !== "active" || row.waitEventType !== "Lock" || !Array.isArray(row.blockingPids)) return false
+          const blockers = row.blockingPids.map(Number)
+          return blockers.length > 0 && blockers.every(blocker => allowedPids.has(blocker))
+            && blockers.every(blocker => reachesBlocker(blocker, new Set(visited)))
+        }
+        bothActiveLockWaiters = lockPids.every(pid => {
+          const row = byPid.get(pid)
+          return row?.state === "active" && row.waitEventType === "Lock"
+        })
+        bothChainsReachBlocker = lockPids.every(pid => reachesBlocker(pid))
+        bothBlocked = bothActiveLockWaiters && bothChainsReachBlocker
       }
-      expect(bothBlocked).toBe(true)
+      expect({ blockerRowLocked, distinctWaiterPids, bothActiveLockWaiters, bothChainsReachBlocker }).toEqual({
+        blockerRowLocked: true, distinctWaiterPids: true, bothActiveLockWaiters: true, bothChainsReachBlocker: true,
+      })
       await work(() => blocker.query("COMMIT"), "Blocker commit")
       blockerOpen = false
       const [spawned, finished] = await Promise.all([

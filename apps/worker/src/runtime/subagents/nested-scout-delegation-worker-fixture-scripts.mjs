@@ -2,7 +2,7 @@ import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-v
 import { ROLE_RESULT_SCHEMA } from "./role-results.ts"
 import { PgSubagentTaskStore } from "./pg-store.ts"
 
-export function createNestedScoutFixtureScripts({ mode, profile, ids, pool, say }) {
+export function createNestedScoutFixtureScripts({ mode, profile, ids, pool, say, pauseSubagentClaims }) {
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null }
 function graphFrom(request) {
   for (const message of [...(request.messages ?? [])].reverse()) for (const part of [...(message.content ?? [])].reverse()) {
@@ -168,6 +168,10 @@ function childModelRuntime({ task, runtime, markerState }) {
       yield { type: "completed", finishReason: "stop" }; return
     }
 
+    if (mode === "park" && !markerState.subagentClaimsPaused) {
+      await pauseSubagentClaims()
+      markerState.subagentClaimsPaused = true
+    }
     if (!toolResult(request, discoverCall)) {
       if (!request.tools.some(tool => tool.name === "jobs.discover")) throw new Error("p1143_parent_discovery_tool_missing")
       yield toolCall(discoverCall, "jobs.discover", { targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], source: "greenhouse", pageSize: 10 })
