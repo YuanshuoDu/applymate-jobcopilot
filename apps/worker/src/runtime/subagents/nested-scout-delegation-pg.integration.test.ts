@@ -68,6 +68,11 @@ const SAFE_RECOVERY_ERROR_CODES = [
 ] as const
 const SAFE_RECOVERY_DIAGNOSTIC_MARKERS = new Set(SAFE_RECOVERY_STAGES.flatMap(stage =>
   SAFE_RECOVERY_ERROR_CODES.map(code => `P1143_RECOVERY_ERROR:${stage}:${code}`)))
+const SAFE_CHILD_RESUME_LOADER_CODES = [
+  ...SAFE_RECOVERY_ERROR_CODES, "child_resume_owner_mismatch", "child_resume_lease_expired", "child_resume_wait_tool_call_conflict",
+  "child_resume_wait_step_lineage", "child_resume_wait_lineage", "child_resume_invalid_wait_result", "child_resume_step_lineage",
+  "child_resume_item_lineage", "child_resume_step_limit", "child_resume_item_limit", "child_resume_usage_overflow",
+] as const
 const SAFE_WAIT_RESUME_STAGES = [
   "required_value", "resume_scope", "source_step", "source_call_count", "source_call_input", "source_item_set", "wait_record_shape",
   "provenance_marker", "source_receipt_missing", "source_marker_without_result", "source_recovered_receipt_mismatch",
@@ -96,8 +101,14 @@ function progressQuery<Row extends QueryResultRow>(text: string, values: unknown
   return pool.query<Row, unknown[]>(config)
 }
 
+function isSafeChildResumeLoaderDiagnostic(value: string): boolean {
+  const match = value.match(/^P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:([A-Za-z0-9_]+)$/)
+  return !!match && SAFE_CHILD_RESUME_LOADER_CODES.includes(match[1] as typeof SAFE_CHILD_RESUME_LOADER_CODES[number])
+}
+
 function seenMainProgress(output: string[]) {
-  return [...new Set(output.filter(value => MAIN_PROGRESS_MARKERS.has(value) || SAFE_RECOVERY_DIAGNOSTIC_MARKERS.has(value)))]
+  return [...new Set(output.filter(value => MAIN_PROGRESS_MARKERS.has(value)
+    || SAFE_RECOVERY_DIAGNOSTIC_MARKERS.has(value) || isSafeChildResumeLoaderDiagnostic(value)))]
 }
 
 async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
