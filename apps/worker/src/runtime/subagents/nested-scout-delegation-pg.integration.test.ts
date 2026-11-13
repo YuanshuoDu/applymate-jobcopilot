@@ -37,11 +37,21 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
           THEN jsonb_array_length("content"->'nodes') ELSE 0 END AS "nodeCount"
         FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'task_graph'
         ORDER BY "revision" DESC LIMIT 1`, [ids.sessionId, ids.turnId]),
-      progressQuery<{ status: string; count: number }>(`SELECT "status", count(*)::int AS "count" FROM "agent_steps"
-        WHERE "sessionId" = $1 AND "turnId" = $2 GROUP BY "status" ORDER BY "status"`, [ids.sessionId, ids.turnId]),
-      progressQuery<{ depth: number; role: string; status: string; count: number }>(`SELECT "depth", "role", "status", count(*)::int AS "count"
+      progressQuery<{ status: string; errorCode: string | null; count: number }>(`SELECT "status",
+          CASE WHEN "errorCode" IS NULL THEN NULL
+            WHEN "errorCode" IN ('invalid_output', 'model_execution_failed', 'tool_execution_failed', 'subagent_lease_lost',
+              'nested_scout_final_wait_owner_unavailable', 'nested_scout_final_wait_unavailable', 'nested_scout_final_wait_children_invalid')
+              THEN "errorCode" ELSE 'other' END AS "errorCode",
+          count(*)::int AS "count" FROM "agent_steps"
+        WHERE "sessionId" = $1 AND "turnId" = $2 GROUP BY "status", 2 ORDER BY "status", 2`, [ids.sessionId, ids.turnId]),
+      progressQuery<{ depth: number; role: string; status: string; failureCode: string | null; count: number }>(`SELECT "depth", "role", "status",
+          CASE WHEN "failureReason" IS NULL THEN NULL
+            WHEN "failureReason" IN ('turn_execution_failed', 'invalid_structured_result', 'attempt_limit_exhausted', 'deadline_exceeded',
+              'subagent_lease_lost', 'nested_scout_final_wait_owner_unavailable', 'nested_scout_final_wait_unavailable', 'nested_scout_final_wait_children_invalid')
+              THEN "failureReason" ELSE 'other' END AS "failureCode",
+          count(*)::int AS "count"
         FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2
-        GROUP BY "depth", "role", "status" ORDER BY "depth", "role", "status"`, [ids.sessionId, ids.turnId]),
+        GROUP BY "depth", "role", "status", 4 ORDER BY "depth", "role", "status", 4`, [ids.sessionId, ids.turnId]),
       progressQuery<{ toolName: string; status: string; errorCode: string | null; count: number }>(`SELECT
           CASE WHEN content->>'toolName' IN ('agent.plan', 'agent.wait', 'jobs.discover', 'scout.delegate', 'scout.results', 'jobs.get', 'wait_subagents')
             THEN content->>'toolName' ELSE 'other' END AS "toolName",
@@ -58,12 +68,22 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       turnStatus: turn.rows[0]?.status ?? "missing",
       graphRecordCount: graph.rows.length,
       graphNodeCount: graph.rows[0]?.nodeCount ?? 0,
-      stepStatuses: steps.rows,
-      tasksByDepthRoleStatus: tasks.rows,
+      stepsByStatusAndErrorCode: steps.rows,
+      tasksByDepthRoleStatusAndFailureCode: tasks.rows,
       toolOutcomes: tools.rows,
     }
   } catch {
     return { observedPhases, fixtureFailure, databaseDiagnosticAvailable: false }
+  }
+}
+
+async function waitForParkMarker(ids: FixtureIds, worker: FixtureProcess, marker: string, timeoutMs: number): Promise<void> {
+  try {
+    await worker.waitForLine(marker, timeoutMs)
+  } catch (error) {
+    const diagnostic = await readMainProgressDiagnostic(ids, worker.output)
+    console.info(`P1143_MAIN_PROGRESS_DIAGNOSTIC:${JSON.stringify({ waitingFor: marker, ...diagnostic })}`)
+    throw error
   }
 }
 
@@ -186,16 +206,10 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
     try {
       await seed(ids)
       first = launch("park", ids)
-      try {
-        await first.waitForLine("P1143_SOURCE_ESCALATION_REJECTED", 45_000)
-      } catch (error) {
-        const diagnostic = await readMainProgressDiagnostic(ids, first.output)
-        console.info(`P1143_MAIN_PROGRESS_DIAGNOSTIC:${JSON.stringify(diagnostic)}`)
-        throw error
-      }
-      await first.waitForLine("P1143_CLOSED_STEP_REPLAY_REJECTED", 45_000)
-      await first.waitForLine("P1143_FOREIGN_CALL_STEP_REJECTED", 45_000)
-      await first.waitForLine("P1143_PARENT_WAITING", 45_000)
+      await waitForParkMarker(ids, first, "P1143_SOURCE_ESCALATION_REJECTED", 45_000)
+      await waitForParkMarker(ids, first, "P1143_CLOSED_STEP_REPLAY_REJECTED", 45_000)
+      await waitForParkMarker(ids, first, "P1143_FOREIGN_CALL_STEP_REJECTED", 45_000)
+      await waitForParkMarker(ids, first, "P1143_PARENT_WAITING", 45_000)
 
       const parent = await pool.query<{ id: string; rootTaskId: string; status: string; leaseOwner: string | null }>(
         `SELECT "id", "rootTaskId", "status", "leaseOwner" FROM "sub_agent_tasks"

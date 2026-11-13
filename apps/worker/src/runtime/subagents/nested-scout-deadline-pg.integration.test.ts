@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
 import { Pool } from "pg"
+import { executionOwnerFence } from "../execution-owner.js"
 import { claimTurnLease } from "../turns/lease.js"
+import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { AgentTreeManager } from "./manager.js"
 import { createPgRootTaskStore } from "./root-task-store.js"
@@ -56,10 +58,12 @@ async function seedGraph(pool: Pool): Promise<Fixture> {
   const rootActions = [...new Set(Object.values(templates).flatMap(template => template.allowedActions))]
   const root = await createPgRootTaskStore(pool).ensure({ lease: turnLease, goal: "Nested Scout deadline",
     allowedActions: rootActions, budgetSnapshot: { subagentPolicy: policy } })
-  const stepId = `nested-root-step-${suffix}`
-  await pool.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status",
-      "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
-    VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`, [stepId, sessionId, turnId, root.id])
+  const rootStep = await createPgTurnEngineStore(pool).startStep({
+    owner: executionOwnerFence({ kind: "turn", taskId: root.id, lease: turnLease }),
+    stepId: `nested-root-step-${suffix}`, ordinal: 0, attempt: 1, inputThroughSequence: 0n,
+    consumedInputIds: [], modelProfileSnapshot: {}, now: new Date(),
+  })
+  const stepId = rootStep.id
   const graph = await createPgTaskGraphCommandPort(pool).appendAndSchedule({
     scope: { userId, sessionId, turnId, rootTaskId: root.id, parentTaskId: root.id, stepId,
       turnLeaseOwner: turnLease.ownerId, turnLeaseVersion: turnLease.leaseVersion,
@@ -88,10 +92,11 @@ async function seedGraph(pool: Pool): Promise<Fixture> {
 
 async function spawnChild(f: Fixture, key: string) {
   const stepId = `nested-scout-step-${key}-${f.suffix}`, toolCallId = `nested-scout-call-${key}-${f.suffix}`
-  await pool.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status",
-      "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
-    VALUES ($1, $2, $3, $4, 1, $5, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
-  [stepId, f.sessionId, f.turnId, f.parentScoutId, f.parentLease.attemptCount])
+  await createPgTurnEngineStore(pool).startStep({
+    owner: executionOwnerFence({ kind: "task", lease: f.parentLease }),
+    stepId, ordinal: 0, attempt: f.parentLease.attemptCount, inputThroughSequence: 0n,
+    consumedInputIds: [], modelProfileSnapshot: {}, now: new Date(),
+  })
   await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "updatedAt")
     VALUES ($1, $2, $3, $4, $5, 'tool_call', 'started', 'commentary', 0, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
   [`nested-scout-call-item-${key}-${f.suffix}`, f.sessionId, f.turnId, stepId, f.parentScoutId,
