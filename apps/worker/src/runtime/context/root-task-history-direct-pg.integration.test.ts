@@ -69,13 +69,13 @@ function observeQueries(pool: PgPool, afterQuery: (sql: string, values?: readonl
 
 function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number): string {
   const witnessId = `$${witnessIdParameter}`
-  return `WITH "agent_events" AS MATERIALIZED (
+  return `WITH "agent_events" AS NOT MATERIALIZED (
       SELECT * FROM public."agent_events"
       UNION ALL
       SELECT (jsonb_populate_record(NULL::public.agent_events,
         to_jsonb(source_witness) || jsonb_build_object('id', source_witness."id" || ':query-duplicate'))).*
       FROM public."agent_events" AS source_witness WHERE source_witness."id" = ${witnessId}
-    ), "agent_outbox" AS MATERIALIZED (
+    ), "agent_outbox" AS NOT MATERIALIZED (
       SELECT * FROM public."agent_outbox"
       UNION ALL
       SELECT (jsonb_populate_record(NULL::public.agent_outbox,
@@ -107,6 +107,7 @@ function queryLevelDuplicateWitnessPool(pool: PgPool, witnessId: string): Pick<P
           return originalQuery(sql, values ? [...values] : undefined)
         }
         const witnessIdParameter = (values?.length ?? 0) + 1
+        await originalQuery("SET LOCAL max_parallel_workers_per_gather = 0")
         return originalQuery(queryLevelDuplicateWitnessSql(sql, witnessIdParameter), [...(values ?? []), witnessId])
       }
       return new Proxy(client, {
@@ -873,6 +874,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       phase("transaction_begin_started")
       await client.query("BEGIN")
       phase("transaction_begin_completed")
+      await client.query("SET LOCAL max_parallel_workers_per_gather = 0")
       phase("statement_timeout_started")
       await client.query("SET LOCAL statement_timeout = '10s'")
       phase("statement_timeout_set")
