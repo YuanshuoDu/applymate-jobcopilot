@@ -51,6 +51,14 @@ const SAFE_WAIT_RESUME_STAGES = [
   "source_result_completion_content", "source_waiting_output_missing", "source_event_chain", "reconciliation", "safe_result_shape",
   "source_start_event", "other",
 ] as const
+const SAFE_RELATED_EVENT_TYPES = new Set([
+  "item.started", "item.delta", "item.completed", "item.failed", "item.interrupted",
+  "tool_call.started", "tool_call.completed", "tool_call.failed", "tool_call.interrupted",
+  "model.started", "model.completed", "model.usage", "step.started", "step.completed", "step.failed", "step.interrupted",
+  "cognitive.agenda", "task.created", "task.updated", "task.completed", "task.failed",
+])
+const SAFE_EVENT_ACTORS = new Set(["subagent", "tool", "orchestrator", "user", "system"])
+const SAFE_WAIT_LIFECYCLE_TYPES = new Set(["item.started", "item.completed", "tool_call.started", "tool_call.completed"])
 
 function isSafeFixtureFailure(value: string): boolean {
   const match = value.match(/^P1143_FIXTURE_FAILURE:(p1143_[a-z_]+|redacted)$/)
@@ -333,7 +341,7 @@ async function readSourceEventChainDiagnostic(ids: FixtureIds) {
   }
   type EventRow = {
     id: string; itemId: string | null; type: string; actor: string; correlationId: string; causationId: string | null;
-    sequence: string | number; idempotencyKey: string; payload: unknown;
+    sequence: string | number; idempotencyKey: string | null; payload: unknown;
   }
   const unavailable = { available: false }
   try {
@@ -443,8 +451,31 @@ async function readSourceEventChainDiagnostic(ids: FixtureIds) {
       FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
         AND "causationId" = ANY($4::text[]) AND "id" <> ALL($5::text[])`,
       [ids.sessionId, ids.turnId, context.parentTaskId, causationSourceEventIds, expectedEventIds])
-    const duplicateExpectedCount = Object.values(eventCountsByRank).reduce((total, count) => total + Math.max(0, count - 1), 0)
-    const extraRelatedEventCount = related.filter(row => !keys.includes(row.idempotencyKey)).length + duplicateExpectedCount
+    const expectedEventIdSet = new Set(expectedEventIds)
+    const extraRelatedRows = related.filter(row => !expectedEventIdSet.has(row.id))
+    const extraRelatedGroups = new Map<string, {
+      eventType: string; actor: string; matchesCallItem: boolean; matchesCallIdCorrelation: boolean;
+      matchesResultItem: boolean; matchesResultCorrelation: boolean; expectedLifecycleKey: boolean;
+      causedByExpectedLifecycleEvent: boolean; waitLifecycleType: boolean; count: number;
+    }>()
+    for (const row of extraRelatedRows) {
+      const eventType = SAFE_RELATED_EVENT_TYPES.has(row.type) ? row.type : "other"
+      const actor = SAFE_EVENT_ACTORS.has(row.actor) ? row.actor : "other"
+      const matchesCallItem = row.itemId === context.callItemId
+      const matchesCallIdCorrelation = row.correlationId === context.callId
+      const matchesResultItem = row.itemId === context.resultItemId
+      const matchesResultCorrelation = row.correlationId === context.resultItemId
+      const expectedLifecycleKey = typeof row.idempotencyKey === "string" && keys.includes(row.idempotencyKey)
+      const causedByExpectedLifecycleEvent = causationSourceEventIds.includes(row.causationId ?? "")
+      const waitLifecycleType = SAFE_WAIT_LIFECYCLE_TYPES.has(eventType)
+      const groupKey = JSON.stringify([eventType, actor, matchesCallItem, matchesCallIdCorrelation, matchesResultItem,
+        matchesResultCorrelation, expectedLifecycleKey, causedByExpectedLifecycleEvent, waitLifecycleType])
+      const group = extraRelatedGroups.get(groupKey)
+      if (group) group.count += 1
+      else extraRelatedGroups.set(groupKey, { eventType, actor, matchesCallItem, matchesCallIdCorrelation, matchesResultItem,
+        matchesResultCorrelation, expectedLifecycleKey, causedByExpectedLifecycleEvent, waitLifecycleType, count: 1 })
+    }
+    const extraRelatedEventCount = extraRelatedRows.length
     return {
       available: true,
       contextFound: true,
@@ -475,6 +506,7 @@ async function readSourceEventChainDiagnostic(ids: FixtureIds) {
       callCompletionRawMatches,
       callCompletionProjectedMatches,
       extraRelatedEventCount,
+      extraRelatedEventGroups: [...extraRelatedGroups.values()],
       extraCausalEventCount: extraCausalResult.rows[0]?.extraCausalEventCount ?? 0,
     }
   } catch {
