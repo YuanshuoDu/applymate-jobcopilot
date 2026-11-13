@@ -17,7 +17,9 @@ const MAIN_PROGRESS_MARKERS = new Set([
   "P1143_ROOT_MODEL_STREAM_STARTED", "P1143_ROOT_PLAN_REQUESTED", "P1143_PARENT_ADAPTER_STARTED",
   "P1143_SUBAGENT_CLAIMS_PAUSED", "P1143_PARENT_DISCOVER_REQUESTED", "P1143_SOURCE_ESCALATION_REQUESTED",
   "P1143_SOURCE_ESCALATION_REJECTED", "P1143_CLOSED_STEP_REPLAY_REJECTED", "P1143_FOREIGN_CALL_STEP_REJECTED",
-  "P1143_PARENT_WAITING", "P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL", "P1143_CHILD_DISCOVERY_RESULT_RECEIVED",
+  "P1143_PARENT_WAITING", "P1143_CRASH_CHILD_MODEL_STARTED", "P1143_CHILD_WORKER_CLAIMED_RUNNING",
+  "P1143_CHILD_SCOUT_RECLAIMED",
+  "P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL", "P1143_CHILD_DISCOVERY_RESULT_RECEIVED",
   "P1143_CHILD_ROLE_RESULT_STREAMED", "P1143_PARENT_SCOUT_RESULTS_RECEIVED", "P1143_PARENT_ROLE_RESULT_STREAMED",
   "P1143_ROOT_GRAPH_COMPLETED", "P1143_PARENT_DELEGATE_RESULTS_BOTH", "P1143_PARENT_DELEGATE_RESULTS_ONE",
   "P1143_PARENT_DELEGATE_RESULTS_NONE", "P1143_PARENT_DELEGATE_TASK_IDS_BOTH", "P1143_PARENT_DELEGATE_TASK_IDS_ONE",
@@ -40,7 +42,7 @@ const SAFE_DIAGNOSTIC_ERROR_CODES = [
   "p1143_source_escalation_was_not_rejected", "p1143_stale_step_created_child", "p1143_stale_step_was_accepted",
   "p1143_step_fence_fixture_missing_steps", "p1143_fixture_requires_disposable_ci_services", "p1143_parent_did_not_suspend_without_lease",
   "p1143_root_graph_completion_unverified", "p1143_root_turn_did_not_complete_after_child_join", "p1143_root_turn_failed",
-  "p1143_subagent_queue_unavailable",
+  "p1143_subagent_queue_unavailable", "p1143_crash_child_did_not_claim",
 ] as const
 const SAFE_WAIT_RESUME_CODES = ["wait_invalid", "wait_scope_error", "wait_conflict", "other"] as const
 const SAFE_WAIT_RESUME_STAGES = [
@@ -551,7 +553,7 @@ const databaseUrl = disposableUrl()
 const describePg = databaseUrl ? describe : describe.skip
 let pool: Pool
 
-function launch(mode: "park" | "resume", ids: FixtureIds): FixtureProcess {
+function launch(mode: "park" | "crash-child" | "resume", ids: FixtureIds): FixtureProcess {
   const child = spawn(process.execPath, ["--import", "tsx", PROCESS_FIXTURE, mode, JSON.stringify(ids)], {
     cwd: process.cwd(), env: { ...process.env, BULLMQ_STALLED_INTERVAL_MS: "30000" }, stdio: ["pipe", "pipe", "pipe"],
   })
@@ -584,6 +586,48 @@ function launch(mode: "park" | "resume", ids: FixtureIds): FixtureProcess {
       throw new Error(`Worker fixture did not reach ${marker}`)
     },
   }
+}
+
+async function waitForExpiredCrashLease(ids: FixtureIds, parentTaskId: string, childTaskId: string, ownerId: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const result = await progressQuery<{ status: string; leaseOwner: string | null; attemptCount: number; expired: boolean;
+      parentStatus: string; suspendedWaitPresent: boolean }>(`SELECT child."status", child."leaseOwner", child."attemptCount",
+        child."leaseExpiresAt" <= clock_timestamp() AS "expired", parent."status" AS "parentStatus",
+        EXISTS (SELECT 1 FROM "agent_wait_conditions" AS wait WHERE wait."parentTaskId" = parent."id"
+          AND wait."sessionId" = child."sessionId" AND wait."turnId" = child."turnId"
+          AND wait."status" = 'waiting' AND wait."suspendedAt" IS NOT NULL) AS "suspendedWaitPresent"
+      FROM "sub_agent_tasks" AS child JOIN "sub_agent_tasks" AS parent ON parent."id" = child."parentTaskId"
+        AND parent."sessionId" = child."sessionId" AND parent."turnId" = child."turnId"
+      WHERE child."id" = $1 AND child."sessionId" = $2 AND parent."id" = $3 AND child."depth" = 2
+        AND child."role" = 'scout' AND child."taskType" = 'job_discovery'`, [childTaskId, ids.sessionId, parentTaskId])
+    const row = result.rows[0]
+    if (row?.status === "running" && row.leaseOwner === ownerId && row.attemptCount === 1
+      && row.expired && row.parentStatus === "waiting" && row.suspendedWaitPresent) return
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  throw new Error("Nested Scout child lease did not expire while parent durable wait remained suspended")
+}
+
+async function waitForReclaimedCrashChild(ids: FixtureIds, childTaskId: string, previousOwnerId: string, timeoutMs: number): Promise<string> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const result = await progressQuery<{ status: string; attemptCount: number; leaseOwner: string | null; dispatchOwner: string;
+      dispatchAttemptCount: number; dispatchPublished: boolean }>(`SELECT task."status", task."attemptCount", task."leaseOwner",
+        dispatch."payload"->>'ownerId' AS "dispatchOwner", dispatch."attemptCount" AS "dispatchAttemptCount",
+        dispatch."publishedAt" IS NOT NULL AS "dispatchPublished"
+      FROM "sub_agent_tasks" AS task JOIN "agent_outbox" AS dispatch ON dispatch."aggregateId" = task."sessionId"
+        AND dispatch."topic" = 'agent.subagent.dispatch' AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
+      WHERE task."id" = $1 AND task."sessionId" = $2 AND task."depth" = 2
+        AND task."role" = 'scout' AND task."taskType" = 'job_discovery'`, [childTaskId, ids.sessionId])
+    const row = result.rows[0]
+    if (row?.attemptCount === 2 && (row.status === "running" || row.status === "completed")
+      && row.leaseOwner !== previousOwnerId && row.dispatchOwner !== previousOwnerId
+      && row.dispatchAttemptCount > 1 && row.dispatchPublished
+      && (row.status === "completed" ? row.leaseOwner === null : row.leaseOwner === row.dispatchOwner)) return row.dispatchOwner
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  throw new Error("Nested Scout child was not safely reclaimed under a new owner")
 }
 
 function waitForClose(child: ChildProcess, timeoutMs = 15_000): Promise<void> {
@@ -633,14 +677,14 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
   beforeAll(() => { pool = new Pool({ connectionString: databaseUrl!, max: 8 }) })
   afterAll(async () => { await pool.end() })
 
-  it("waits for two source-bound Scout children across Worker restart in an ordinary user TaskGraph", async () => {
+  it("reclaims a crashed running Scout child after lease expiry and joins source-bound children across Worker restart", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = {
       userId: `nested-scout-user-${suffix}`, sessionId: `nested-scout-session-${suffix}`,
       turnId: `nested-scout-turn-${suffix}`, alphaJobId: randomUUID(),
       betaJobId: randomUUID(), foreignJobId: randomUUID(),
     }
-    let first: FixtureProcess | undefined, restarted: FixtureProcess | undefined
+    let first: FixtureProcess | undefined, crashing: FixtureProcess | undefined, restarted: FixtureProcess | undefined
     try {
       await seed(ids)
       first = launch("park", ids)
@@ -702,7 +746,29 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
 
       await killAndWait(first.child)
       first = undefined
+      crashing = launch("crash-child", ids)
+      await waitForMainMarker(ids, crashing, "P1143_CRASH_CHILD_MODEL_STARTED", 30_000)
+      await waitForMainMarker(ids, crashing, "P1143_CHILD_WORKER_CLAIMED_RUNNING", 30_000)
+      const claimedChildren = await pool.query<{ id: string; status: string; leaseOwner: string | null; leaseLive: boolean; attemptCount: number }>(
+        `SELECT child."id", child."status", child."leaseOwner", child."leaseExpiresAt" > clock_timestamp() AS "leaseLive", child."attemptCount"
+         FROM "sub_agent_tasks" AS child WHERE child."sessionId" = $1 AND child."parentTaskId" = $2 AND child."depth" = 2
+         ORDER BY child."id"`, [ids.sessionId, parent.rows[0]!.id])
+      expect(claimedChildren.rows).toHaveLength(2)
+      expect(claimedChildren.rows.filter(row => row.status === "running")).toHaveLength(1)
+      expect(claimedChildren.rows.filter(row => row.status === "queued")).toHaveLength(1)
+      const crashedChild = claimedChildren.rows.find(row => row.status === "running")!
+      expect(crashedChild).toMatchObject({ leaseLive: true, attemptCount: 1 })
+      expect(crashedChild.leaseOwner).toEqual(expect.any(String))
+      const callsBeforeCrash = await pool.query<{ count: number }>(`SELECT count(*)::int AS count FROM "agent_items"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "type" = 'tool_call'`,
+      [ids.sessionId, ids.turnId, crashedChild.id])
+      expect(callsBeforeCrash.rows[0]?.count).toBe(0)
+      await killAndWait(crashing.child)
+      crashing = undefined
+      await waitForExpiredCrashLease(ids, parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!, 30_000)
       restarted = launch("resume", ids)
+      await waitForMainMarker(ids, restarted, "P1143_CHILD_SCOUT_RECLAIMED", 30_000)
+      const reclaimedOwner = await waitForReclaimedCrashChild(ids, crashedChild.id, crashedChild.leaseOwner!, 30_000)
       await waitForMainMarker(ids, restarted, "P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL", 240_000)
       await waitForMainMarker(ids, restarted, "P1143_ROOT_GRAPH_COMPLETED", 240_000)
 
@@ -717,6 +783,22 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       expect(finalChildren.rows).toHaveLength(2)
       expect(finalChildren.rows.every(row => row.status === "completed")).toBe(true)
       expect(finalChildren.rows.every(row => row.attemptCount > initialAttempts.get(row.id)!)).toBe(true)
+      expect(finalChildren.rows.find(row => row.id === crashedChild.id)?.attemptCount).toBe(2)
+      const reclaimedDispatch = await pool.query<{ ownerId: string | null; attemptCount: number; publishedAt: Date | null }>(
+        `SELECT "payload"->>'ownerId' AS "ownerId", "attemptCount", "publishedAt" FROM "agent_outbox"
+         WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,
+        [ids.sessionId, `subagent-dispatch:${crashedChild.id}`])
+      expect(reclaimedDispatch.rows).toHaveLength(1)
+      expect(reclaimedDispatch.rows[0]?.ownerId).toBe(reclaimedOwner)
+      expect(reclaimedDispatch.rows[0]?.ownerId).not.toBe(crashedChild.leaseOwner)
+      expect(reclaimedDispatch.rows[0]?.attemptCount).toBeGreaterThan(1)
+      expect(reclaimedDispatch.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      const reclaimedCalls = await pool.query<{ calls: number; results: number }>(`SELECT
+          count(*) FILTER (WHERE "type" = 'tool_call')::int AS calls,
+          count(*) FILTER (WHERE "type" = 'tool_result')::int AS results
+        FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+          AND "content"->>'toolCallId' = $4`, [ids.sessionId, ids.turnId, crashedChild.id, `p1143-child-discover:${crashedChild.id}`])
+      expect(reclaimedCalls.rows[0]).toEqual({ calls: 1, results: 1 })
       for (const child of finalChildren.rows) {
         const result = child.result as Record<string, unknown>
         const structured = result.structuredResult as Record<string, unknown>
@@ -759,6 +841,7 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       }
     } finally {
       if (first) await killAndWait(first.child)
+      if (crashing) await killAndWait(crashing.child)
       if (restarted) await stop(restarted.child)
       await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId])
     }

@@ -4,6 +4,8 @@ import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.ts"
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
 import { createProductionChildExecutor } from "./production-child-runtime.ts"
+import { AgentTreeManager } from "./manager.ts"
+import { PgSubagentTaskStore } from "./pg-store.ts"
 import { commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.ts"
 import { createProductionWorkerBootstrap } from "../../queue/production-bootstrap.ts"
 import { createSubagentQueue } from "../../queue/subagent-queue.ts"
@@ -13,6 +15,8 @@ import { createNestedScoutFixtureScripts } from "./nested-scout-delegation-worke
 const [, , mode, rawIds] = process.argv
 const ids = JSON.parse(rawIds)
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 10 })
+const CRASH_TEST_LEASE_MS = 3_000
+const CRASH_TEST_HEARTBEAT_MS = 500
 let bootstrap
 async function pauseSubagentClaims() {
   if (!bootstrap?.subagents) throw new Error("p1143_subagent_queue_unavailable")
@@ -38,6 +42,7 @@ const FIXTURE_FAILURE_CODES = new Set([
   "p1143_step_fence_fixture_missing_steps", "p1143_fixture_requires_disposable_ci_services", "p1143_parent_did_not_suspend_without_lease",
   "p1143_root_graph_completion_unverified", "p1143_root_turn_did_not_complete_after_child_join", "p1143_root_turn_failed",
   "p1143_subagent_queue_unavailable",
+  "p1143_crash_child_did_not_claim",
 ])
 function reportParentJoinState(state) {
   const count = value => value >= 2 ? "BOTH" : value === 1 ? "ONE" : "NONE"
@@ -100,6 +105,7 @@ async function start(mode) {
   const runtime = await createCanonicalTurnRuntime(pool, {
     workerId: ownerId, productionFlags: flags, taskGraphCommandPort: createPgTaskGraphCommandPort(pool),
     taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => ({ settle: async () => undefined }),
+    ...(mode === "park" ? {} : { manager: new AgentTreeManager(new PgSubagentTaskStore(pool, CRASH_TEST_LEASE_MS), { heartbeatMs: CRASH_TEST_HEARTBEAT_MS }) }),
     modelRuntimeFactory: () => rootModelRuntime(),
   })
   const markerState = { closedStepRejected: false, parallelObserved: false }
@@ -110,7 +116,7 @@ async function start(mode) {
     waitResolver: { intervalMs: 20, ownerId: `${ownerId}-wait-resolver` },
     subagents: { intervalMs: 20, execute: executeChild, queueFactory: options => {
       const consumer = createSubagentQueue(options)
-      consumer.worker.concurrency = mode === "park" ? 1 : 2
+      consumer.worker.concurrency = mode === "park" || mode === "crash-child" ? 1 : 2
       return consumer
     } } })
   if (mode === "park") {
@@ -132,6 +138,22 @@ async function parentWaiting() {
     await sleep(50)
   }
   throw new Error("p1143_parent_did_not_suspend_without_lease")
+}
+
+async function crashChildClaimed() {
+  const deadline = Date.now() + 30_000
+  while (Date.now() < deadline) {
+    const result = await pool.query(`SELECT count(*)::int AS count FROM "sub_agent_tasks" AS child
+      JOIN "sub_agent_tasks" AS parent ON parent."id" = child."parentTaskId" AND parent."sessionId" = child."sessionId"
+      WHERE child."sessionId" = $1 AND child."depth" = 2 AND child."role" = 'scout'
+        AND child."taskType" = 'job_discovery' AND child."status" = 'running' AND child."leaseOwner" IS NOT NULL
+        AND parent."status" = 'waiting' AND EXISTS (SELECT 1 FROM "agent_wait_conditions" AS wait
+          WHERE wait."parentTaskId" = parent."id" AND wait."sessionId" = child."sessionId"
+            AND wait."turnId" = child."turnId" AND wait."status" = 'waiting' AND wait."suspendedAt" IS NOT NULL)`, [ids.sessionId])
+    if (result.rows[0]?.count === 1) { say("P1143_CHILD_WORKER_CLAIMED_RUNNING"); return }
+    await sleep(25)
+  }
+  throw new Error("p1143_crash_child_did_not_claim")
 }
 
 async function rootCompleted() {
@@ -171,6 +193,7 @@ try {
   }
   const { runtime } = await start(mode)
   if (mode === "park") await parentWaiting()
+  else if (mode === "crash-child") await crashChildClaimed()
   else await rootCompleted()
   await command("shutdown")
 } catch (error) {

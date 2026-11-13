@@ -125,6 +125,8 @@ function childModelRuntime({ task, runtime, markerState }) {
   const delegateTwo = `p1143-delegate-beta:${task.id}`, resultsCall = `p1143-results:${task.id}`
   return { id: `p1143-${task.depth}-${task.id}`, profile, async *stream(request) {
     if (task.depth === 2) {
+      if (mode === "resume" && task.attemptCount === 2) say("P1143_CHILD_SCOUT_RECLAIMED")
+      if (mode === "crash-child") { say("P1143_CRASH_CHILD_MODEL_STARTED"); await new Promise(() => {}) }
       await waitForTwoRunningChildren(task, markerState)
       const discoverCall = `p1143-child-discover:${task.id}`
       const receipt = findExactToolResult(request, { name: "jobs.discover", input: discoverInput })
