@@ -14,9 +14,11 @@ import { findUnobservedMailboxMessageIds } from "./subagent-mailbox-completion.j
 import { interruptSubtree as interruptStoreSubtree, interruptTree as interruptStoreTree, interruptTurn as interruptStoreTurn, prepareTaskGraphFinish, recoverExpired as recoverStoreExpired } from "./pg-store-lifecycle.js"
 import type { SubagentFinishResult } from "./types.js"
 import { closeSubagentTask } from "./pg-store-close.js"
+import { createSubagentWithSpawnFromLease, persistSubagentSpawnOutbox } from "./pg-store-create-execution-scoped.js"
 import { lockScheduledGateFinish } from "./pg-store-gate-finish.js"
 import { recoverExpiredTaskGraphChildren } from "./pg-store-task-graph-deadline-recovery.js"
 import { SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
+import type { AtomicSubagentSpawnFromLeaseInput } from "./types.js"
 export class PgSubagentTaskStore implements SubagentStore {
   constructor(private readonly pool: PgSubagentPool, private readonly leaseMs = 60_000) {}
   async get(taskId: string, sessionId: string): Promise<SubagentTaskRecord | null> {
@@ -51,17 +53,17 @@ export class PgSubagentTaskStore implements SubagentStore {
         else if (input.parentTaskId) throw new Error("Subagent child requires an owning Turn")
         await assertFallbackPlannerRootCanDispatch(client, input)
         const task = await createSubagentTask(client, input, true)
-        const operation = await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.subagent.spawn', $2, $3, $4::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`,
-          [`spawn-operation-${randomUUID()}`, input.sessionId, key, JSON.stringify({ taskId: task.id })])
-        if (operation.rowCount !== 1) throw new DuplicateSpawnSignal()
-        await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.subagent.dispatch', $2, $3, $4::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`,
-          [`subagent-dispatch-${randomUUID()}`, input.sessionId, `subagent-dispatch:${task.id}`, JSON.stringify({ taskId: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, ownerId: `coordination-${randomUUID()}` })])
+        const outbox = await persistSubagentSpawnOutbox(client, input.sessionId, key, task)
+        if (!outbox.operationCreated) throw new DuplicateSpawnSignal()
         return { task, duplicate: false }
       })
     } catch (error: unknown) {
       if (error instanceof DuplicateSpawnSignal) return { task: null, duplicate: true }
       throw error
     }
+  }
+  createWithSpawnFromLease(input: AtomicSubagentSpawnFromLeaseInput): Promise<AtomicSubagentSpawnResult> {
+    return createSubagentWithSpawnFromLease(this.pool, input)
   }
   async claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date; dispatchIdentity?: SubagentDispatchIdentity }): Promise<SubagentTaskRecord | null> {
     return claimSubagentTask(this.pool, input, this.leaseMs)

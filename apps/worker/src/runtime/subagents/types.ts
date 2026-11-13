@@ -1,5 +1,6 @@
 import type pg from "pg"
 import type { SubagentDispatchIdentity } from "./dispatch-identity.js"
+import type { SubagentParentExecutionFence } from "./parent-execution-fence.js"
 
 export const SUBAGENT_LEASE_WINDOW_MS = 60_000
 export const SUBAGENT_HEARTBEAT_INTERVAL_MS = 20_000
@@ -64,6 +65,10 @@ export type SubagentTaskSpec = {
 export type AtomicSubagentSpawnInput = SubagentTaskSpec & {
   policy: SubagentPolicy
   spawnIdempotencyKey: string
+}
+
+export type AtomicSubagentSpawnFromLeaseInput = AtomicSubagentSpawnInput & {
+  parentExecutionFence: SubagentParentExecutionFence
 }
 
 export type AtomicSubagentSpawnResult = {
@@ -138,6 +143,7 @@ export type SubagentFinishResult = "completed" | "retrying" | "failed" | "waitin
 export type SubagentStore = {
   create(input: SubagentTaskSpec & { policy: SubagentPolicy }): Promise<SubagentTaskRecord>
   createWithSpawn?(input: AtomicSubagentSpawnInput): Promise<AtomicSubagentSpawnResult>
+  createWithSpawnFromLease?(input: AtomicSubagentSpawnFromLeaseInput): Promise<AtomicSubagentSpawnResult>
   get(taskId: string, sessionId: string): Promise<SubagentTaskRecord | null>
   claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date; dispatchIdentity?: SubagentDispatchIdentity }): Promise<SubagentTaskRecord | null>
   matchesPublishedDispatch?(input: { payload: SubagentJobPayload; dispatchIdentity: SubagentDispatchIdentity }): Promise<boolean>

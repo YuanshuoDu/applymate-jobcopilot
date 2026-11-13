@@ -15,6 +15,7 @@ import {
 } from "./types.js"
 import { isSubagentRetryDue } from "./retry-policy.js"
 import { isTaskPathWithin, normalizeTaskPath, policyFromTask } from "./manager-task-scope.js"
+import { spawnSubagentFromLease } from "./parent-execution-fence.js"
 import { runClaimedSubagent, type SubagentRunOutcome } from "./manager-run-outcome.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
 import { SubagentDispatchIdentityMismatchError, SUBAGENT_DISPATCH_IDENTITY_MISMATCH, type SubagentDispatchIdentity } from "./dispatch-identity.js"
@@ -73,6 +74,10 @@ export class AgentTreeManager {
     const createWithSpawn = this.store.createWithSpawn
     if (!createWithSpawn) return { task: await this.store.create({ ...spec, policy }), duplicate: false, atomic: false }
     return { ...(await createWithSpawn.call(this.store, { ...spec, policy, spawnIdempotencyKey })), atomic: true }
+  }
+
+  async spawnFromLease(spec: SubagentTaskSpec, spawnIdempotencyKey: string, parentLease: SubagentLease): Promise<AtomicSubagentSpawnResult & { atomic: true }> {
+    return spawnSubagentFromLease(this.store, spec, spawnIdempotencyKey, parentLease)
   }
 
   async claim(payload: SubagentJobPayload, now = this.now(), dispatchIdentity?: SubagentDispatchIdentity): Promise<SubagentLease | null> {

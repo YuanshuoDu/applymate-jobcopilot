@@ -12,6 +12,7 @@ import {
   type SubagentStore,
   type SubagentTaskRecord,
   type SubagentTaskSpec,
+  type AtomicSubagentSpawnFromLeaseInput,
 } from "./types.js"
 import { normalizeSubagentPolicy } from "./types.js"
 
@@ -29,6 +30,7 @@ class MemoryStore implements SubagentStore {
   readonly finishRetryDispositions: Array<SubagentExecutionResult["retryDisposition"]> = []
   readonly claimDispatchIdentities: Array<SubagentDispatchIdentity | undefined> = []
   matchesPublishedDispatch: SubagentStore["matchesPublishedDispatch"]
+  createWithSpawnFromLease: SubagentStore["createWithSpawnFromLease"]
   heartbeatResult: "renewed" | "interrupted" | "lost" | null = null
   claimError: unknown = null
   readonly releaseCalls: Array<{ taskId: string; attemptCount: number }> = []
@@ -153,6 +155,14 @@ function spec(overrides: Partial<SubagentTaskSpec> = {}): SubagentTaskSpec {
 
 function payload(task: SubagentTaskRecord, ownerId = "worker-1"): SubagentJobPayload {
   return { taskId: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, ownerId }
+}
+
+function currentLease(task: SubagentTaskRecord, overrides: Partial<SubagentLease> = {}): SubagentLease {
+  return {
+    ...task, status: "running", leaseOwner: "lease-owner", attemptCount: 1,
+    leaseExpiresAt: new Date("2099-01-01T00:00:00.000Z"), ownerId: "lease-owner",
+    signal: new AbortController().signal, ...overrides,
+  }
 }
 
 async function fullLimiterFixture() {
@@ -285,6 +295,58 @@ describe("AgentTreeManager", () => {
     expect(child.rootTaskId).toBe(parent.id)
     expect(child.depth).toBe(1)
     expect((child.budgetSnapshot as { subagentPolicy: SubagentPolicy }).subagentPolicy).toEqual({ maxDepth: 2, maxFanOut: 2, maxConcurrency: 1, maxAttempts: 1 })
+  })
+
+  it("uses only the fenced store capability and returns an atomic nested spawn", async () => {
+    const store = new MemoryStore()
+    const createScoped = vi.fn(async (_input: AtomicSubagentSpawnFromLeaseInput) => ({ task: null, duplicate: false }))
+    store.createWithSpawnFromLease = createScoped
+    const createLegacy = vi.spyOn(store, "create")
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const parentPolicy = normalizeSubagentPolicy({ maxConcurrency: 3, maxDepth: 7, maxFanOut: 5, maxAttempts: 4 })
+    const root = await manager.spawn(spec({ turnId: "turn-1", policy: parentPolicy }))
+    const parent = await manager.spawn(spec({ turnId: "turn-1", parentTaskId: root.id }))
+    createLegacy.mockClear()
+    const lease = currentLease(parent, { attemptCount: 2 })
+    const requested = spec({ turnId: "turn-1", parentTaskId: parent.id, policy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 8 } })
+
+    await expect(manager.spawnFromLease(requested, "spawn-key", lease)).resolves.toEqual({ task: null, duplicate: false, atomic: true })
+    expect(createLegacy).not.toHaveBeenCalled()
+    expect(createScoped).toHaveBeenCalledOnce()
+    const input = createScoped.mock.calls[0]?.[0]
+    expect(input?.parentExecutionFence).toEqual({
+      id: parent.id, userId: parent.userId, sessionId: parent.sessionId, turnId: "turn-1",
+      rootTaskId: root.id, ownerId: "lease-owner", attemptCount: 2,
+    })
+    expect(input?.policy).toEqual({ maxConcurrency: 3, maxDepth: 2, maxFanOut: 2, maxAttempts: 3 })
+    expect(Object.keys(input?.parentExecutionFence ?? {}).sort()).toEqual([
+      "attemptCount", "id", "ownerId", "rootTaskId", "sessionId", "turnId", "userId",
+    ])
+  })
+
+  it("fails closed when the store has no fenced create capability", async () => {
+    const store = new MemoryStore()
+    const create = vi.spyOn(store, "create")
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const parent = await manager.spawn(spec({ turnId: "turn-1" }))
+    create.mockClear()
+    const lease = currentLease(parent)
+
+    await expect(manager.spawnFromLease(spec({ turnId: "turn-1", parentTaskId: parent.id }), "spawn-key", lease))
+      .rejects.toMatchObject({ code: "not_available" })
+    expect(create).not.toHaveBeenCalled()
+  })
+
+  it("rejects a lease/spec mismatch before calling the fenced store", async () => {
+    const store = new MemoryStore()
+    const createScoped = vi.fn(async (_input: AtomicSubagentSpawnFromLeaseInput) => ({ task: null, duplicate: false }))
+    store.createWithSpawnFromLease = createScoped
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const parent = await manager.spawn(spec({ turnId: "turn-1" }))
+
+    await expect(manager.spawnFromLease(spec({ turnId: "turn-2", parentTaskId: parent.id }), "spawn-key", currentLease(parent)))
+      .rejects.toMatchObject({ code: "lost" })
+    expect(createScoped).not.toHaveBeenCalled()
   })
 
   it("releases the session slot on completion and retries a failed task", async () => {
