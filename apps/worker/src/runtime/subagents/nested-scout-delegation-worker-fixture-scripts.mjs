@@ -2,7 +2,7 @@ import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-v
 import { ROLE_RESULT_SCHEMA } from "./role-results.ts"
 import { PgSubagentTaskStore } from "./pg-store.ts"
 
-export function createNestedScoutFixtureScripts({ mode, profile, ids, pool, say, pauseSubagentClaims }) {
+export function createNestedScoutFixtureScripts({ mode, profile, ids, pool, say, pauseSubagentClaims, reportParentJoinState }) {
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null }
 function graphFrom(request) {
   for (const message of [...(request.messages ?? [])].reverse()) for (const part of [...(message.content ?? [])].reverse()) {
@@ -209,14 +209,14 @@ function childModelRuntime({ task, runtime, markerState }) {
       yield toolCall(delegateTwo, "scout.delegate", { goal: "Read the Fixture Beta role", sourceSlice: ["greenhouse"] })
       yield completed(); return
     }
-    const waitOutput = object(toolOutputForName(request, "wait_subagents")?.output)
-    const childIds = [delegateOne, delegateTwo].map(callId => object(toolResult(request, callId))?.taskId).filter(id => typeof id === "string")
-    if (hasTerminalWaitOutcome(waitOutput, childIds) && !toolResult(request, resultsCall)) {
+    const delegateResults = [toolResult(request, delegateOne), toolResult(request, delegateTwo)], childIds = delegateResults.map(value => object(value)?.taskId).filter(id => typeof id === "string")
+    const waitResult = toolOutputForName(request, "wait_subagents"), waitOutput = object(waitResult?.output), terminalWaitMatch = hasTerminalWaitOutcome(waitOutput, childIds), joined = toolResult(request, resultsCall), issueScoutResults = terminalWaitMatch && !joined
+    reportParentJoinState({ delegateResultCount: delegateResults.filter(Boolean).length, childIdCount: childIds.length, waitResultPresent: waitResult !== null, terminalWaitMatch, scoutResultsIssued: issueScoutResults })
+    if (issueScoutResults) {
       if (!request.tools.some(tool => tool.name === "scout.results")) throw new Error("p1143_scout_results_tool_missing")
       yield toolCall(resultsCall, "scout.results", {})
       yield completed(); return
     }
-    const joined = toolResult(request, resultsCall)
     if (!joined) {
       yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [], evidence: [], summary: "Premature candidate before child outcomes" }) }
       yield { type: "completed", finishReason: "stop" }; return

@@ -16,8 +16,34 @@ const MAIN_PROGRESS_MARKERS = new Set([
   "P1143_SOURCE_ESCALATION_REJECTED", "P1143_CLOSED_STEP_REPLAY_REJECTED", "P1143_FOREIGN_CALL_STEP_REJECTED",
   "P1143_PARENT_WAITING", "P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL", "P1143_CHILD_DISCOVERY_RESULT_RECEIVED",
   "P1143_CHILD_ROLE_RESULT_STREAMED", "P1143_PARENT_SCOUT_RESULTS_RECEIVED", "P1143_PARENT_ROLE_RESULT_STREAMED",
-  "P1143_ROOT_GRAPH_COMPLETED",
+  "P1143_ROOT_GRAPH_COMPLETED", "P1143_PARENT_DELEGATE_RESULTS_BOTH", "P1143_PARENT_DELEGATE_RESULTS_ONE",
+  "P1143_PARENT_DELEGATE_RESULTS_NONE", "P1143_PARENT_DELEGATE_TASK_IDS_BOTH", "P1143_PARENT_DELEGATE_TASK_IDS_ONE",
+  "P1143_PARENT_DELEGATE_TASK_IDS_NONE", "P1143_PARENT_WAIT_RESULT_PRESENT", "P1143_PARENT_WAIT_RESULT_MISSING",
+  "P1143_PARENT_WAIT_TERMINAL_MATCH", "P1143_PARENT_WAIT_TERMINAL_NO_MATCH", "P1143_PARENT_SCOUT_RESULTS_ISSUED",
+  "P1143_PARENT_SCOUT_RESULTS_NOT_ISSUED",
 ])
+const SAFE_DIAGNOSTIC_ERROR_CODES = [
+  "invalid_output", "model_execution_failed", "tool_execution_failed", "subagent_lease_lost", "nested_scout_final_wait_owner_unavailable",
+  "nested_scout_final_wait_unavailable", "nested_scout_final_wait_children_invalid", "turn_execution_failed", "model_incomplete",
+  "budget_exhausted", "step_limit", "no_progress", "evidence_missing", "evidence_conflict", "final_unverified", "persistence_conflict",
+  "schema_error", "discovery_memory_overflow", "tool_result_replay_uncertain", "tool_recovery_aborted", "invalid_structured_result",
+  "attempt_limit_exhausted", "deadline_exceeded", "task_graph_verification_unverified", "task_graph_verification_failed",
+  "nested_scout_source_scope_unavailable", "task_graph_snapshot_invalid", "child_action_denied", "wait_conflict", "wait_scope_error",
+  "wait_invalid", "provider_unavailable", "p1143_children_did_not_overlap_in_running_state", "p1143_delegate_tool_missing",
+  "p1143_grandchild_coordination_leaked", "p1143_grandchild_discover_tool_missing", "p1143_grandchild_source_bound_job_missing",
+  "p1143_grandchild_source_evidence_missing", "p1143_parent_current_reads_missing", "p1143_parent_discovery_tool_missing",
+  "p1143_parent_lease_unavailable", "p1143_root_plan_tool_missing", "p1143_root_scout_task_missing", "p1143_root_scout_verification_missing",
+  "p1143_scout_results_not_available_after_wait", "p1143_scout_results_tool_missing", "p1143_second_delegate_tool_missing",
+  "p1143_source_escalation_was_not_rejected", "p1143_stale_step_created_child", "p1143_stale_step_was_accepted",
+  "p1143_step_fence_fixture_missing_steps", "p1143_fixture_requires_disposable_ci_services", "p1143_parent_did_not_suspend_without_lease",
+  "p1143_root_graph_completion_unverified", "p1143_root_turn_did_not_complete_after_child_join", "p1143_root_turn_failed",
+  "p1143_subagent_queue_unavailable",
+] as const
+
+function isSafeFixtureFailure(value: string): boolean {
+  const match = value.match(/^P1143_FIXTURE_FAILURE:(p1143_[a-z_]+|redacted)$/)
+  return !!match && (match[1] === "redacted" || SAFE_DIAGNOSTIC_ERROR_CODES.includes(match[1] as typeof SAFE_DIAGNOSTIC_ERROR_CODES[number]))
+}
 
 function progressQuery<Row extends QueryResultRow>(text: string, values: unknown[] = []): Promise<QueryResult<Row>> {
   const config: QueryConfig<unknown[]> & { query_timeout: number } = { text, values, query_timeout: MAIN_PROGRESS_QUERY_TIMEOUT_MS }
@@ -30,9 +56,9 @@ function seenMainProgress(output: string[]) {
 
 async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
   const observedPhases = seenMainProgress(output)
-  const fixtureFailure = output.find(value => /^P1143_FIXTURE_FAILURE:(?:p1143_[a-z_]+|redacted)$/.test(value)) ?? null
+  const fixtureFailure = output.find(isSafeFixtureFailure) ?? null
   try {
-    const [turn, graph, steps, tasks, waits, tools] = await Promise.all([
+    const [turn, graph, steps, tasks, parentSteps, waits, tools] = await Promise.all([
       progressQuery<{ status: string }>(`SELECT CASE WHEN "status" IN ('queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval',
           'waiting_for_user', 'completed', 'failed', 'interrupted') THEN "status" ELSE 'other' END AS "status"
         FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
@@ -43,38 +69,42 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
         ORDER BY "revision" DESC LIMIT 1`, [ids.sessionId, ids.turnId]),
       progressQuery<{ status: string; errorCode: string | null; count: number }>(`SELECT CASE WHEN "status" IN ('started', 'streaming', 'completed', 'failed',
           'interrupted', 'waiting_for_tool', 'waiting_for_approval', 'waiting_for_user') THEN "status" ELSE 'other' END AS "status",
-          CASE WHEN "errorCode" IS NULL THEN NULL
-            WHEN "errorCode" IN ('invalid_output', 'model_execution_failed', 'tool_execution_failed', 'subagent_lease_lost',
-              'nested_scout_final_wait_owner_unavailable', 'nested_scout_final_wait_unavailable', 'nested_scout_final_wait_children_invalid',
-              'turn_execution_failed', 'model_incomplete', 'budget_exhausted', 'step_limit', 'no_progress', 'evidence_missing',
-              'evidence_conflict', 'final_unverified', 'persistence_conflict', 'schema_error', 'discovery_memory_overflow',
-              'tool_result_replay_uncertain', 'tool_recovery_aborted')
-              THEN "errorCode" ELSE 'other' END AS "errorCode",
+          CASE WHEN "errorCode" IS NULL THEN NULL WHEN "errorCode" = ANY($3::text[])
+            THEN "errorCode" ELSE 'other' END AS "errorCode",
           count(*)::int AS "count" FROM "agent_steps"
-        WHERE "sessionId" = $1 AND "turnId" = $2 GROUP BY 1, 2 ORDER BY 1, 2`, [ids.sessionId, ids.turnId]),
+        WHERE "sessionId" = $1 AND "turnId" = $2 GROUP BY 1, 2 ORDER BY 1, 2`, [ids.sessionId, ids.turnId, SAFE_DIAGNOSTIC_ERROR_CODES]),
       progressQuery<{ depth: number; role: string; status: string; failureCode: string | null; structuredFailureCategory: string | null;
-        executorResultStatus: string; count: number }>(`SELECT "depth",
+        executorResultStatus: string; attemptCountMax: number; nextAttemptAtPresent: boolean; count: number }>(`SELECT "depth",
           CASE WHEN "role" = 'scout' THEN "role" ELSE 'other' END AS "role",
           CASE WHEN "status" IN ('queued', 'running', 'retrying', 'waiting', 'waiting_for_user', 'completed', 'failed', 'interrupted', 'cancelled', 'closed')
             THEN "status" ELSE 'other' END AS "status",
-          CASE WHEN "failureReason" IS NULL THEN NULL
-            WHEN "failureReason" IN ('turn_execution_failed', 'invalid_structured_result', 'attempt_limit_exhausted', 'deadline_exceeded',
-              'subagent_lease_lost', 'nested_scout_final_wait_owner_unavailable', 'nested_scout_final_wait_unavailable', 'nested_scout_final_wait_children_invalid',
-              'task_graph_verification_unverified', 'task_graph_verification_failed', 'budget_exhausted', 'step_limit',
-              'evidence_missing', 'evidence_conflict', 'final_unverified', 'model_incomplete')
-              THEN "failureReason" ELSE 'other' END AS "failureCode",
+          CASE WHEN "failureReason" IS NULL THEN NULL WHEN "failureReason" = ANY($3::text[])
+            THEN "failureReason" ELSE 'other' END AS "failureCode",
           CASE WHEN "result"->>'structuredOutputFailureCategory' IN
             ('missing_final_output', 'result_too_large', 'result_shape_invalid', 'evidence_binding_invalid')
             THEN "result"->>'structuredOutputFailureCategory' ELSE NULL END AS "structuredFailureCategory",
           CASE WHEN "result"->>'status' IN ('completed', 'failed') THEN "result"->>'status' ELSE 'other' END AS "executorResultStatus",
+          max("attemptCount")::int AS "attemptCountMax", bool_or("nextAttemptAt" IS NOT NULL) AS "nextAttemptAtPresent",
           count(*)::int AS "count"
         FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2
-        GROUP BY "depth", "role", "status", 4, 5, 6 ORDER BY "depth", "role", "status", 4, 5, 6`, [ids.sessionId, ids.turnId]),
-      progressQuery<{ status: string; suspended: boolean; count: number }>(`SELECT CASE WHEN "status" IN ('waiting', 'ready', 'timed_out', 'interrupted', 'closed')
-            THEN "status" ELSE 'other' END AS "status",
+        GROUP BY "depth", "role", "status", 4, 5, 6 ORDER BY "depth", "role", "status", 4, 5, 6`, [ids.sessionId, ids.turnId, SAFE_DIAGNOSTIC_ERROR_CODES]),
+      progressQuery<{ status: string; errorCode: string | null; count: number }>(`SELECT CASE WHEN latest."status" IN
+            ('started', 'streaming', 'completed', 'failed', 'interrupted', 'waiting_for_tool', 'waiting_for_approval', 'waiting_for_user')
+            THEN latest."status" ELSE 'other' END AS "status",
+          CASE WHEN latest."errorCode" IS NULL THEN NULL WHEN latest."errorCode" = ANY($3::text[])
+            THEN latest."errorCode" ELSE 'other' END AS "errorCode", count(*)::int AS "count"
+        FROM (SELECT DISTINCT ON (task."id") step."status", step."errorCode" FROM "sub_agent_tasks" task
+          JOIN "agent_steps" step ON step."taskId" = task."id" AND step."sessionId" = task."sessionId" AND step."turnId" = task."turnId"
+          WHERE task."sessionId" = $1 AND task."turnId" = $2 AND task."depth" = 1 AND task."role" = 'scout'
+          ORDER BY task."id", step."ordinal" DESC) latest GROUP BY 1, 2 ORDER BY 1, 2`, [ids.sessionId, ids.turnId, SAFE_DIAGNOSTIC_ERROR_CODES]),
+      progressQuery<{ status: string; targetCount: string; suspended: boolean; count: number }>(`SELECT
+          CASE WHEN "status" IN ('waiting', 'ready', 'timed_out', 'interrupted', 'closed') THEN "status" ELSE 'other' END AS "status",
+          CASE WHEN jsonb_typeof("targetTaskIds") <> 'array' THEN 'invalid'
+            WHEN jsonb_array_length("targetTaskIds") = 0 THEN 'zero' WHEN jsonb_array_length("targetTaskIds") = 1 THEN 'one'
+            WHEN jsonb_array_length("targetTaskIds") = 2 THEN 'two' ELSE 'other' END AS "targetCount",
           ("suspendedAt" IS NOT NULL) AS "suspended", count(*)::int AS "count"
         FROM "agent_wait_conditions" WHERE "sessionId" = $1 AND "turnId" = $2
-        GROUP BY 1, 2 ORDER BY 1, 2`, [ids.sessionId, ids.turnId]),
+        GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`, [ids.sessionId, ids.turnId]),
       progressQuery<{ toolName: string; itemType: string; itemStatus: string; outcomeStatus: string | null; errorCode: string | null; count: number }>(`SELECT
           CASE WHEN COALESCE(call."content"->>'toolName', item."content"->>'toolName') IN
             ('agent.plan', 'agent.wait', 'jobs.discover', 'scout.delegate', 'scout.results', 'jobs.get', 'wait_subagents')
@@ -86,25 +116,20 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
               IN ('completed', 'failed', 'cancelled', 'waiting', 'ready', 'timed_out', 'interrupted', 'closed')
             THEN CASE WHEN item."type" = 'tool_call' THEN item."content"->>'status'
               WHEN item."type" = 'tool_result' THEN item."content"->'output'->>'status' END ELSE NULL END AS "outcomeStatus",
-          CASE WHEN item."content"->>'errorCode' IS NULL THEN NULL
-            WHEN item."content"->>'errorCode' IN ('nested_scout_source_scope_unavailable', 'task_graph_snapshot_invalid', 'invalid_output',
-              'child_action_denied', 'nested_scout_final_wait_owner_unavailable', 'nested_scout_final_wait_unavailable',
-              'nested_scout_final_wait_children_invalid', 'tool_execution_failed', 'model_execution_failed', 'turn_execution_failed',
-              'model_incomplete', 'budget_exhausted', 'step_limit', 'no_progress', 'evidence_missing', 'evidence_conflict',
-              'final_unverified', 'persistence_conflict', 'schema_error', 'wait_conflict', 'wait_scope_error', 'wait_invalid',
-              'tool_result_replay_uncertain', 'tool_recovery_aborted', 'provider_unavailable')
-              THEN item."content"->>'errorCode' ELSE 'other' END AS "errorCode",
+          CASE WHEN item."content"->>'errorCode' IS NULL THEN NULL WHEN item."content"->>'errorCode' = ANY($3::text[])
+            THEN item."content"->>'errorCode' ELSE 'other' END AS "errorCode",
           count(*)::int AS "count"
         FROM "agent_items" AS item
         LEFT JOIN "agent_items" AS call ON item."type" = 'tool_result' AND call."sessionId" = item."sessionId"
           AND call."turnId" = item."turnId" AND call."taskId" = item."taskId" AND call."type" = 'tool_call'
           AND call."content"->>'toolCallId' = item."content"->>'toolCallId'
         WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."type" IN ('tool_call', 'tool_result')
-        GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5`, [ids.sessionId, ids.turnId]),
+        GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5`, [ids.sessionId, ids.turnId, SAFE_DIAGNOSTIC_ERROR_CODES]),
     ])
-    const safeTaskGroups = tasks.rows.filter(row => row.role === "scout").map(({ depth, status, failureCode, structuredFailureCategory, executorResultStatus, count }) => ({
+    const safeTaskGroups = tasks.rows.filter(row => row.role === "scout").map(({ depth, status, failureCode, structuredFailureCategory,
+      executorResultStatus, attemptCountMax, nextAttemptAtPresent, count }) => ({
       tier: depth === 1 ? "parent_scout" : depth === 2 ? "depth_two_scout" : "other_scout", status, failureCode,
-      structuredFailureCategory, executorResultStatus, count,
+      structuredFailureCategory, executorResultStatus, attemptCountMax, nextAttemptAtPresent, count,
     }))
     return {
       observedPhases, fixtureFailure,
@@ -112,6 +137,7 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       graphRecordCount: graph.rows.length,
       graphNodeCount: graph.rows[0]?.nodeCount ?? 0,
       stepsByStatusAndErrorCode: steps.rows,
+      latestParentStepByStatusAndErrorCode: parentSteps.rows,
       parentAndChildScoutStatuses: safeTaskGroups,
       waitsByStatusAndSuspended: waits.rows,
       toolOutcomes: tools.rows,
@@ -174,7 +200,7 @@ function launch(mode: "park" | "resume", ids: FixtureIds): FixtureProcess {
   child.stderr?.on("data", (chunk: string) => {
     const text = String(chunk)
     const failure = text.match(/P1143_FIXTURE_FAILURE:(p1143_[a-z_]+|redacted)/)
-    if (failure) output.push(`P1143_FIXTURE_FAILURE:${failure[1]}`)
+    if (failure) output.push(`P1143_FIXTURE_FAILURE:${failure[1] === "redacted" || SAFE_DIAGNOSTIC_ERROR_CODES.includes(failure[1] as typeof SAFE_DIAGNOSTIC_ERROR_CODES[number]) ? failure[1] : "redacted"}`)
   })
   return {
     child, output,
@@ -182,7 +208,7 @@ function launch(mode: "park" | "resume", ids: FixtureIds): FixtureProcess {
       const deadline = Date.now() + timeoutMs
       while (Date.now() < deadline) {
         if (output.includes(marker)) return
-        const fixtureFailure = output.find(value => /^P1143_FIXTURE_FAILURE:(?:p1143_[a-z_]+|redacted)$/.test(value))
+        const fixtureFailure = output.find(isSafeFixtureFailure)
         if (fixtureFailure) throw new Error(`Worker fixture failed before ${marker}: ${fixtureFailure}`)
         if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Worker fixture exited before ${marker}`)
         await new Promise(resolve => setTimeout(resolve, 50))

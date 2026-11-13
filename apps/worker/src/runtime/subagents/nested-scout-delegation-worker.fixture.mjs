@@ -22,6 +22,25 @@ const profile = { provider: "fixture", model: "fixture-model", nativeTools: true
   maxContextTokens: null, maxOutputTokens: 256, costClass: "low" }
 const flags = { cognitiveLoopEnabled: false, planningEnabled: true, planningExecutionEnabled: true, taskGraphPlanningEnabled: true,
   childExecutionEnabled: true, coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false }
+const FIXTURE_FAILURE_CODES = new Set([
+  "p1143_children_did_not_overlap_in_running_state", "p1143_delegate_tool_missing", "p1143_grandchild_coordination_leaked",
+  "p1143_grandchild_discover_tool_missing", "p1143_grandchild_source_bound_job_missing", "p1143_grandchild_source_evidence_missing",
+  "p1143_parent_current_reads_missing", "p1143_parent_discovery_tool_missing", "p1143_parent_lease_unavailable",
+  "p1143_root_plan_tool_missing", "p1143_root_scout_task_missing", "p1143_root_scout_verification_missing",
+  "p1143_scout_results_not_available_after_wait", "p1143_scout_results_tool_missing", "p1143_second_delegate_tool_missing",
+  "p1143_source_escalation_was_not_rejected", "p1143_stale_step_created_child", "p1143_stale_step_was_accepted",
+  "p1143_step_fence_fixture_missing_steps", "p1143_fixture_requires_disposable_ci_services", "p1143_parent_did_not_suspend_without_lease",
+  "p1143_root_graph_completion_unverified", "p1143_root_turn_did_not_complete_after_child_join", "p1143_root_turn_failed",
+  "p1143_subagent_queue_unavailable",
+])
+function reportParentJoinState(state) {
+  const count = value => value >= 2 ? "BOTH" : value === 1 ? "ONE" : "NONE"
+  say(`P1143_PARENT_DELEGATE_RESULTS_${count(state.delegateResultCount)}`)
+  say(`P1143_PARENT_DELEGATE_TASK_IDS_${count(state.childIdCount)}`)
+  say(state.waitResultPresent ? "P1143_PARENT_WAIT_RESULT_PRESENT" : "P1143_PARENT_WAIT_RESULT_MISSING")
+  say(state.terminalWaitMatch ? "P1143_PARENT_WAIT_TERMINAL_MATCH" : "P1143_PARENT_WAIT_TERMINAL_NO_MATCH")
+  say(state.scoutResultsIssued ? "P1143_PARENT_SCOUT_RESULTS_ISSUED" : "P1143_PARENT_SCOUT_RESULTS_NOT_ISSUED")
+}
 let stdin = ""
 const commands = []
 const waiters = new Map()
@@ -35,7 +54,8 @@ process.stdin.on("data", chunk => {
   }
 })
 function say(value) { process.stdout.write(value + "\n") }
-const { rootModelRuntime, discoveryClient, childModelRuntime } = createNestedScoutFixtureScripts({ mode, profile, ids, pool, say, pauseSubagentClaims })
+const { rootModelRuntime, discoveryClient, childModelRuntime } = createNestedScoutFixtureScripts({ mode, profile, ids, pool, say,
+  pauseSubagentClaims, reportParentJoinState })
 function command(name) {
   const index = commands.indexOf(name)
   if (index >= 0) { commands.splice(index, 1); return Promise.resolve() }
@@ -113,7 +133,7 @@ try {
   else await rootCompleted()
   await command("shutdown")
 } catch (error) {
-  const code = error instanceof Error && /^p1143_[a-z_]+$/.test(error.message) ? error.message : "redacted"
+  const code = error instanceof Error && FIXTURE_FAILURE_CODES.has(error.message) ? error.message : "redacted"
   say(`P1143_FIXTURE_FAILURE:${code}`)
   process.exitCode = 1
 } finally {
