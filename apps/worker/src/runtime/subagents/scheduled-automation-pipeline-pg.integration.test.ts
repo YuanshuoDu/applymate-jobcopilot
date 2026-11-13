@@ -1697,6 +1697,21 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     expect(dependencies).not.toBeNull()
     expect(dependencies!.bindings.map(binding => binding.nodeKey)).toEqual(["scheduled-scout-a", "scheduled-scout-b"])
     const analystResult = roleResult("analyst", value.jobId)
+    const persistedAnalystResult = await pool!.query(`UPDATE "sub_agent_tasks" AS task
+      SET "result" = jsonb_set(task."result", '{structuredResult}', $5::jsonb)
+      FROM "agent_sessions" AS session
+      JOIN "agent_turns" AS turn ON turn."sessionId" = session."id"
+      WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3
+        AND task."rootTaskId" = $4 AND task."parentTaskId" = $4
+        AND session."id" = task."sessionId" AND session."userId" = $6
+        AND turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+        AND turn."userId" = $6 AND turn."rootTaskId" = task."rootTaskId"
+      RETURNING task."id" AS "id", task."sessionId" AS "sessionId", task."turnId" AS "turnId", session."userId" AS "userId"`,
+    [analyst.taskId, value.sessionId, value.turnId, value.rootTaskId, JSON.stringify(analystResult), value.userId])
+    expect(persistedAnalystResult.rowCount).toBe(1)
+    expect(persistedAnalystResult.rows).toEqual([{
+      id: analyst.taskId, sessionId: value.sessionId, turnId: value.turnId, userId: value.userId,
+    }])
     const analystProof = await verifyCompletedTaskGraphNodeEvidence(pool!, {
       scope: { ...scope, taskId: analyst.taskId, attemptCount: 1 }, snapshot, node: analyst,
       structuredResult: analystResult, dependencies: dependencies!.projections,
