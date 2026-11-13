@@ -14,7 +14,9 @@ const MAIN_PROGRESS_MARKERS = new Set([
   "P1143_ROOT_MODEL_STREAM_STARTED", "P1143_ROOT_PLAN_REQUESTED", "P1143_PARENT_ADAPTER_STARTED",
   "P1143_SUBAGENT_CLAIMS_PAUSED", "P1143_PARENT_DISCOVER_REQUESTED", "P1143_SOURCE_ESCALATION_REQUESTED",
   "P1143_SOURCE_ESCALATION_REJECTED", "P1143_CLOSED_STEP_REPLAY_REJECTED", "P1143_FOREIGN_CALL_STEP_REJECTED",
-  "P1143_PARENT_WAITING", "P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL", "P1143_ROOT_GRAPH_COMPLETED",
+  "P1143_PARENT_WAITING", "P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL", "P1143_CHILD_DISCOVERY_RESULT_RECEIVED",
+  "P1143_CHILD_ROLE_RESULT_STREAMED", "P1143_PARENT_SCOUT_RESULTS_RECEIVED", "P1143_PARENT_ROLE_RESULT_STREAMED",
+  "P1143_ROOT_GRAPH_COMPLETED",
 ])
 
 function progressQuery<Row extends QueryResultRow>(text: string, values: unknown[] = []): Promise<QueryResult<Row>> {
@@ -43,21 +45,31 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
           'interrupted', 'waiting_for_tool', 'waiting_for_approval', 'waiting_for_user') THEN "status" ELSE 'other' END AS "status",
           CASE WHEN "errorCode" IS NULL THEN NULL
             WHEN "errorCode" IN ('invalid_output', 'model_execution_failed', 'tool_execution_failed', 'subagent_lease_lost',
-              'nested_scout_final_wait_owner_unavailable', 'nested_scout_final_wait_unavailable', 'nested_scout_final_wait_children_invalid')
+              'nested_scout_final_wait_owner_unavailable', 'nested_scout_final_wait_unavailable', 'nested_scout_final_wait_children_invalid',
+              'turn_execution_failed', 'model_incomplete', 'budget_exhausted', 'step_limit', 'no_progress', 'evidence_missing',
+              'evidence_conflict', 'final_unverified', 'persistence_conflict', 'schema_error', 'discovery_memory_overflow',
+              'tool_result_replay_uncertain', 'tool_recovery_aborted')
               THEN "errorCode" ELSE 'other' END AS "errorCode",
           count(*)::int AS "count" FROM "agent_steps"
         WHERE "sessionId" = $1 AND "turnId" = $2 GROUP BY 1, 2 ORDER BY 1, 2`, [ids.sessionId, ids.turnId]),
-      progressQuery<{ depth: number; role: string; status: string; failureCode: string | null; count: number }>(`SELECT "depth",
+      progressQuery<{ depth: number; role: string; status: string; failureCode: string | null; structuredFailureCategory: string | null;
+        executorResultStatus: string; count: number }>(`SELECT "depth",
           CASE WHEN "role" = 'scout' THEN "role" ELSE 'other' END AS "role",
           CASE WHEN "status" IN ('queued', 'running', 'retrying', 'waiting', 'waiting_for_user', 'completed', 'failed', 'interrupted', 'cancelled', 'closed')
             THEN "status" ELSE 'other' END AS "status",
           CASE WHEN "failureReason" IS NULL THEN NULL
             WHEN "failureReason" IN ('turn_execution_failed', 'invalid_structured_result', 'attempt_limit_exhausted', 'deadline_exceeded',
-              'subagent_lease_lost', 'nested_scout_final_wait_owner_unavailable', 'nested_scout_final_wait_unavailable', 'nested_scout_final_wait_children_invalid')
+              'subagent_lease_lost', 'nested_scout_final_wait_owner_unavailable', 'nested_scout_final_wait_unavailable', 'nested_scout_final_wait_children_invalid',
+              'task_graph_verification_unverified', 'task_graph_verification_failed', 'budget_exhausted', 'step_limit',
+              'evidence_missing', 'evidence_conflict', 'final_unverified', 'model_incomplete')
               THEN "failureReason" ELSE 'other' END AS "failureCode",
+          CASE WHEN "result"->>'structuredOutputFailureCategory' IN
+            ('missing_final_output', 'result_too_large', 'result_shape_invalid', 'evidence_binding_invalid')
+            THEN "result"->>'structuredOutputFailureCategory' ELSE NULL END AS "structuredFailureCategory",
+          CASE WHEN "result"->>'status' IN ('completed', 'failed') THEN "result"->>'status' ELSE 'other' END AS "executorResultStatus",
           count(*)::int AS "count"
         FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2
-        GROUP BY "depth", "role", "status", 4 ORDER BY "depth", "role", "status", 4`, [ids.sessionId, ids.turnId]),
+        GROUP BY "depth", "role", "status", 4, 5, 6 ORDER BY "depth", "role", "status", 4, 5, 6`, [ids.sessionId, ids.turnId]),
       progressQuery<{ status: string; suspended: boolean; count: number }>(`SELECT CASE WHEN "status" IN ('waiting', 'ready', 'timed_out', 'interrupted', 'closed')
             THEN "status" ELSE 'other' END AS "status",
           ("suspendedAt" IS NOT NULL) AS "suspended", count(*)::int AS "count"
@@ -77,7 +89,10 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
           CASE WHEN item."content"->>'errorCode' IS NULL THEN NULL
             WHEN item."content"->>'errorCode' IN ('nested_scout_source_scope_unavailable', 'task_graph_snapshot_invalid', 'invalid_output',
               'child_action_denied', 'nested_scout_final_wait_owner_unavailable', 'nested_scout_final_wait_unavailable',
-              'nested_scout_final_wait_children_invalid', 'tool_execution_failed', 'model_execution_failed')
+              'nested_scout_final_wait_children_invalid', 'tool_execution_failed', 'model_execution_failed', 'turn_execution_failed',
+              'model_incomplete', 'budget_exhausted', 'step_limit', 'no_progress', 'evidence_missing', 'evidence_conflict',
+              'final_unverified', 'persistence_conflict', 'schema_error', 'wait_conflict', 'wait_scope_error', 'wait_invalid',
+              'tool_result_replay_uncertain', 'tool_recovery_aborted', 'provider_unavailable')
               THEN item."content"->>'errorCode' ELSE 'other' END AS "errorCode",
           count(*)::int AS "count"
         FROM "agent_items" AS item
@@ -87,8 +102,9 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
         WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."type" IN ('tool_call', 'tool_result')
         GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5`, [ids.sessionId, ids.turnId]),
     ])
-    const safeTaskGroups = tasks.rows.filter(row => row.role === "scout").map(({ depth, status, failureCode, count }) => ({
-      tier: depth === 1 ? "parent_scout" : depth === 2 ? "depth_two_scout" : "other_scout", status, failureCode, count,
+    const safeTaskGroups = tasks.rows.filter(row => row.role === "scout").map(({ depth, status, failureCode, structuredFailureCategory, executorResultStatus, count }) => ({
+      tier: depth === 1 ? "parent_scout" : depth === 2 ? "depth_two_scout" : "other_scout", status, failureCode,
+      structuredFailureCategory, executorResultStatus, count,
     }))
     return {
       observedPhases, fixtureFailure,

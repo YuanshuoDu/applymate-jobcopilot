@@ -154,6 +154,7 @@ function childModelRuntime({ task, runtime, markerState }) {
         yield toolCall(discoverCall, "jobs.discover", { targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], source: "greenhouse", pageSize: 10 })
         yield completed(); return
       }
+      say("P1143_CHILD_DISCOVERY_RESULT_RECEIVED")
       const jobs = Array.isArray(object(receipt)?.jobs) ? receipt.jobs.map(object) : []
       const wanted = task.goal.includes("Alpha") ? "Fixture Alpha" : "Fixture Beta"
       const job = jobs.find(value => value?.company === wanted && value.source === "greenhouse")
@@ -163,6 +164,7 @@ function childModelRuntime({ task, runtime, markerState }) {
       const evidence = { id: sourceEvidenceId, kind: "job", ref: job.id, source: job.source }
       yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
         candidates: [{ jobId: job.id, source: job.source, url: job.url, evidenceIds: [sourceEvidenceId] }], evidence: [evidence], summary: "Read the assigned source-bound fixture role" }) }
+      say("P1143_CHILD_ROLE_RESULT_STREAMED")
       yield { type: "completed", finishReason: "stop" }; return
     }
 
@@ -219,6 +221,7 @@ function childModelRuntime({ task, runtime, markerState }) {
       yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [], evidence: [], summary: "Premature candidate before child outcomes" }) }
       yield { type: "completed", finishReason: "stop" }; return
     }
+    say("P1143_PARENT_SCOUT_RESULTS_RECEIVED")
     if (object(joined)?.availability !== "available") throw new Error("p1143_scout_results_not_available_after_wait")
     const children = Array.isArray(object(joined)?.children) ? joined.children.map(object) : []
     const candidates = children.flatMap(child => Array.isArray(child?.candidates) ? child.candidates.map(object) : [])
@@ -238,6 +241,7 @@ function childModelRuntime({ task, runtime, markerState }) {
     yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
       candidates: jobs.map(({ candidate, result }) => ({ jobId: candidate?.jobId, source: object(object(result)?.job)?.source,
         url: object(object(result)?.job)?.url, evidenceIds: [`model-read:${candidate?.jobId}`] })), evidence, summary: "Joined two bounded read-only Scouts and reread each current job" }) }
+    say("P1143_PARENT_ROLE_RESULT_STREAMED")
     yield { type: "completed", finishReason: "stop" }
   } }
 }
