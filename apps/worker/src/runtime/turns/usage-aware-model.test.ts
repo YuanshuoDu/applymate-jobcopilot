@@ -3,9 +3,9 @@ import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobco
 import { estimateSharedAiCost } from "@jobcopilot/shared"
 import { createHarnessModelRuntime, type HarnessFetch } from "../harness-model.js"
 
-import { createUsageAwareModelAdapter } from "./usage-aware-model.js"
+import { createUsageAwareModelAdapter as createUsageAwareModelAdapterImpl } from "./usage-aware-model.js"
 import { ContextEstimateExceededError } from "./model-request-admission.js"
-import type { WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
+import type { WorkerUsageAuthorization, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { TreeBudgetReservation, TreeBudgetReservationStore } from "../subagents/tree-budget-types.js"
 
@@ -39,6 +39,22 @@ function store(behavior: (status: "consumed" | "released") => Promise<void> = as
       settle: vi.fn(async input => { statuses.push(input.status); await behavior(input.status) ; return reservation(input.status) }),
     },
   }
+}
+
+function createUsageAwareModelAdapter(adapterValue: ModelAdapter, options: Parameters<typeof createUsageAwareModelAdapterImpl>[1]): ModelAdapter {
+  return createUsageAwareModelAdapterImpl(adapterValue, {
+    ...options,
+    authorize: async input => {
+      const authorization = await options.authorize(input)
+      return {
+        outputReservationRequired: false, maxOutputTokens: null, ...authorization,
+        settleUnknown: authorization.settleUnknown ?? (async value => {
+          // Test spies represent a broker that accepts nullable usage reports.
+          await (authorization.settle as unknown as (value: WorkerUsageSettlementInput) => Promise<void> | void)(value)
+        }),
+      }
+    },
+  })
 }
 
 function adapter(events: readonly ModelStreamEvent[] = [{ type: "usage", inputTokens: 2, outputTokens: 3 }, { type: "completed", finishReason: "stop" }]): ModelAdapter {
@@ -101,13 +117,13 @@ function spreadPrivateOutputAdapter(adapter: ModelAdapter): ModelAdapter {
 describe("usage-aware model owner seam", () => {
   it("sends a child owner envelope and consumes one shared tree step", async () => {
     const fixture = store()
-    const authorize = vi.fn(async () => ({ settle: vi.fn(async () => undefined) }))
+    const authorize = vi.fn(async () => ({ start: async () => null, settle: vi.fn(async () => undefined) }))
     const events: ModelStreamEvent[] = []
     for await (const event of createUsageAwareModelAdapter(adapter(), { owner, authorize, treeBudget: fixture.store }).stream(request)) events.push(event)
     expect(events).toHaveLength(2)
     expect(authorize).toHaveBeenCalledWith(expect.objectContaining({
       executionOwner: { kind: "task", taskId: "child-1", rootTaskId: "root-1", ownerId: "worker-1", attemptCount: 2 },
-      attemptId: "child-1:2",
+      attemptId: "route-1",
     }))
     expect(fixture.statuses).toEqual(["consumed"])
   })
@@ -121,7 +137,7 @@ describe("usage-aware model owner seam", () => {
 
   it("keeps the reservation active when tree settlement itself fails", async () => {
     const fixture = store(async status => { if (status === "consumed") throw new Error("tree_store_unavailable") })
-    const model = createUsageAwareModelAdapter(adapter(), { owner, treeBudget: fixture.store, authorize: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })) })
+    const model = createUsageAwareModelAdapter(adapter(), { owner, treeBudget: fixture.store, authorize: vi.fn(async () => ({ start: async () => null, settle: vi.fn(async () => undefined) })) })
     await expect((async () => { for await (const _event of model.stream(request)) return undefined })()).rejects.toThrow("tree_store_unavailable")
     expect(fixture.statuses).toEqual(["consumed"])
   })
@@ -130,10 +146,103 @@ describe("usage-aware model owner seam", () => {
     const fixture = store()
     const model = createUsageAwareModelAdapter(adapter(), {
       owner, treeBudget: fixture.store,
-      authorize: vi.fn(async () => ({ settle: vi.fn(async () => { throw new Error("account_settlement_unknown") }) })),
+      authorize: vi.fn(async () => ({ start: async () => null, settle: vi.fn(async () => { throw new Error("account_settlement_unknown") }) })),
     })
     await expect((async () => { for await (const _event of model.stream(request)) return undefined })()).rejects.toThrow("account_settlement_unknown")
     expect(fixture.statuses).toEqual([])
+  })
+
+  it("settles missing provider usage as unknown rather than zero", async () => {
+    const settlement = vi.fn(async () => undefined)
+    const model = createUsageAwareModelAdapter(adapter([{ type: "completed", finishReason: "stop" }]), {
+      owner, authorize: vi.fn(async () => ({ start: async () => null, settle: settlement })),
+    })
+    for await (const _event of model.stream(request)) undefined
+    expect(settlement).toHaveBeenCalledWith({ status: "success", inputTokens: null, outputTokens: null, estimatedCostUsd: null })
+  })
+
+  it("keeps unknown pricing unknown when a capped request reports non-empty usage", async () => {
+    const order: string[] = [], settlement = vi.fn(async () => undefined)
+    const model = createUsageAwareModelAdapter(adapter([
+      { type: "usage", inputTokens: 4, outputTokens: 2, estimatedCostUsd: 0 },
+      { type: "completed", finishReason: "stop" },
+    ]), {
+      owner, authorize: vi.fn(async () => ({ outputReservationRequired: true, maxOutputTokens: 23, start: async () => { order.push("start"); return 23 }, settle: settlement })),
+    })
+    for await (const _event of model.stream({ ...request, maxOutputTokens: 64 })) order.push("provider-event")
+    expect(order[0]).toBe("start")
+    expect(settlement).toHaveBeenCalledWith({ status: "success", inputTokens: 4, outputTokens: 2, estimatedCostUsd: null })
+  })
+
+  it("keeps unknown prices null without an output cap and preserves a catalogued free model at zero", async () => {
+    const unknownSettlement = vi.fn(async () => undefined)
+    const unknownModel = { ...adapter([{ type: "usage", inputTokens: 4, outputTokens: 2, estimatedCostUsd: 0 }]), profile: { ...profile, provider: "custom", model: "unknown-model" } }
+    const unknownWrapped = createUsageAwareModelAdapter(unknownModel, {
+      owner, authorize: vi.fn(async () => ({ start: async () => null, settle: unknownSettlement })),
+    })
+    for await (const _event of unknownWrapped.stream(request)) undefined
+    expect(unknownSettlement).toHaveBeenCalledWith({ status: "success", inputTokens: 4, outputTokens: 2, estimatedCostUsd: null })
+
+    const freeSettlement = vi.fn(async () => undefined)
+    const freeModel = { ...adapter([{ type: "usage", inputTokens: 4, outputTokens: 2, estimatedCostUsd: 0 }]), profile: { ...profile, provider: "qwen", model: "qwen3.7-flash" } }
+    const freeWrapped = createUsageAwareModelAdapter(freeModel, {
+      owner, authorize: vi.fn(async () => ({ start: async () => null, settle: freeSettlement })),
+    })
+    for await (const _event of freeWrapped.stream(request)) undefined
+    expect(freeSettlement).toHaveBeenCalledWith({ status: "success", inputTokens: 4, outputTokens: 2, estimatedCostUsd: 0 })
+  })
+
+  it("sends the server-admitted output ceiling in the MiniMax provider request", async () => {
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => new Response("unavailable", { status: 503 }))
+    const fetcher = fetchMock as unknown as HarnessFetch
+    const authorize = vi.fn(async () => ({ outputReservationRequired: true, maxOutputTokens: 23, start: async () => 23, settle: vi.fn() }))
+    const runtime = harnessRuntime(fetcher, [5000])
+    const model = createUsageAwareModelAdapter(runtime.adapter, { owner, authorize })
+
+    await expect((async () => { for await (const _event of model.stream({ ...request, maxOutputTokens: 64 })) return undefined })())
+      .rejects.toMatchObject({ code: "provider_error" })
+    expect(authorize).toHaveBeenCalledWith(expect.objectContaining({ requestedOutputTokens: 64 }))
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as { max_completion_tokens?: number }
+    expect(body.max_completion_tokens).toBe(23)
+  })
+
+  it("rejects missing or inconsistent strict output starts before the provider", async () => {
+    const invalidAuthorizations: WorkerUsageAuthorization[] = [
+      { outputReservationRequired: true, maxOutputTokens: 23, settle: vi.fn() },
+      { outputReservationRequired: true, maxOutputTokens: 23, start: async () => null, settle: vi.fn() },
+      { outputReservationRequired: true, maxOutputTokens: 23, start: async () => 24, settle: vi.fn() },
+    ]
+    for (const authorization of invalidAuthorizations) {
+      const fetchMock = vi.fn(async () => new Response("unexpected provider call", { status: 503 }))
+      const authorize = vi.fn(async () => authorization)
+      const model = createUsageAwareModelAdapter(harnessRuntime(fetchMock as unknown as HarnessFetch, [5000]).adapter, { owner, authorize })
+
+      await expect((async () => { for await (const _event of model.stream({ ...request, maxOutputTokens: 64 })) return undefined })())
+        .rejects.toThrow()
+      expect(fetchMock).not.toHaveBeenCalled()
+    }
+  })
+
+  it("rejects a raw authorization with unknown output mode before any provider request", async () => {
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => new Response("unexpected", { status: 503 }))
+    const authorize = vi.fn(async () => ({ start: async () => 23, settle: vi.fn() }))
+    const model = createUsageAwareModelAdapterImpl(harnessRuntime(fetchMock as unknown as HarnessFetch, [5000]).adapter, { owner, authorize })
+
+    await expect((async () => { for await (const _event of model.stream({ ...request, maxOutputTokens: 64 })) return undefined })())
+      .rejects.toThrow()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("allows a missing start only with explicit non-strict admission", async () => {
+    const provider = vi.fn()
+    const noStart: WorkerUsageAuthorization = { outputReservationRequired: false, maxOutputTokens: null, settle: vi.fn() }
+    const model = createUsageAwareModelAdapter({
+      ...adapter([{ type: "completed", finishReason: "stop" }]),
+      async *stream() { provider(); yield { type: "completed", finishReason: "stop" } },
+    }, { owner, authorize: vi.fn(async () => noStart) })
+
+    for await (const _event of model.stream(request)) undefined
+    expect(provider).toHaveBeenCalledOnce()
   })
 
   it("releases a child reservation after a known zero-usage local context rejection", async () => {
@@ -141,10 +250,10 @@ describe("usage-aware model owner seam", () => {
     const settle = vi.fn(async (value: WorkerUsageSettlementInput) => { settlements.push(value) })
     const model = createUsageAwareModelAdapter(rejectingAdapter(new ContextEstimateExceededError({
       provider: profile.provider, model: profile.model, guaranteedNoProviderAttempt: true,
-    })), { owner, treeBudget: fixture.store, authorize: vi.fn(async () => ({ settle })) })
+    })), { owner, treeBudget: fixture.store, authorize: vi.fn(async () => ({ start: async () => null, settle })) })
     await expect((async () => { for await (const _event of model.stream(request)) return undefined })())
       .rejects.toMatchObject({ code: "context_estimate_exceeded", guaranteedNoProviderAttempt: true })
-    expect(settlements).toEqual([{ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0,
+    expect(settlements).toEqual([{ status: "error", inputTokens: null, outputTokens: null, estimatedCostUsd: null,
       errorCode: "context_estimate_exceeded" }])
     expect(fixture.statuses).toEqual(["released"])
   })
@@ -153,7 +262,7 @@ describe("usage-aware model owner seam", () => {
     const fixture = store()
     const model = createUsageAwareModelAdapter(rejectingAdapter(new ContextEstimateExceededError({
       provider: profile.provider, model: profile.model, guaranteedNoProviderAttempt: false,
-    })), { owner, treeBudget: fixture.store, authorize: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })) })
+    })), { owner, treeBudget: fixture.store, authorize: vi.fn(async () => ({ start: async () => null, settle: vi.fn(async () => undefined) })) })
     await expect((async () => { for await (const _event of model.stream(request)) return undefined })())
       .rejects.toMatchObject({ code: "context_estimate_exceeded", guaranteedNoProviderAttempt: false })
     expect(fixture.statuses).toEqual(["consumed"])
@@ -164,14 +273,14 @@ describe("usage-aware model owner seam", () => {
     const model = createUsageAwareModelAdapter(rejectingAdapter(new ContextEstimateExceededError({
       provider: profile.provider, model: profile.model, guaranteedNoProviderAttempt: true,
     })), { owner, treeBudget: fixture.store,
-      authorize: vi.fn(async () => ({ settle: vi.fn(async () => { throw new Error("account settlement unknown") }) })) })
+      authorize: vi.fn(async () => ({ start: async () => null, settle: vi.fn(async () => { throw new Error("account settlement unknown") }) })) })
     await expect((async () => { for await (const _event of model.stream(request)) return undefined })())
       .rejects.toMatchObject({ code: "context_estimate_exceeded", guaranteedNoProviderAttempt: true })
     expect(fixture.statuses).toEqual([])
   })
 
   it("releases the child reservation without authorizing or settling when every Harness route fails preflight through a spread wrapper", async () => {
-    const fixture = store(), settlement = vi.fn(), authorize = vi.fn(async () => ({ settle: settlement }))
+    const fixture = store(), settlement = vi.fn(), authorize = vi.fn(async () => ({ start: async () => null, settle: settlement }))
     const fetcher = vi.fn(async () => { throw new Error("preflight reached fetch") })
     const runtime = harnessRuntime(fetcher, [500, 500])
     const model = createUsageAwareModelAdapter(spreadPrivateOutputAdapter(runtime.adapter), { owner, authorize, treeBudget: fixture.store })
@@ -186,7 +295,7 @@ describe("usage-aware model owner seam", () => {
 
   it("authorizes the fitting fallback after its preflight and settles only that route through a spread wrapper", async () => {
     const order: string[] = [], fixture = store()
-    const fetcher: HarnessFetch = vi.fn(async url => {
+    const fetchMock = vi.fn(async (url: RequestInfo | URL, _init?: RequestInit) => {
       order.push("fetch")
       expect(url).toContain("anthropic")
       return new Response([
@@ -197,9 +306,10 @@ describe("usage-aware model owner seam", () => {
         'event: message_stop\ndata: {"type":"message_stop"}',
       ].join("\n\n"), { headers: { "Content-Type": "text/event-stream" } })
     })
+    const fetcher = fetchMock as unknown as HarnessFetch
     const runtime = harnessRuntime(fetcher, [500, 5000], () => { order.push("preflight") })
     const settlement = vi.fn(async () => undefined)
-    const authorize = vi.fn(async input => { order.push(`authorize:${input.provider}`); return { settle: settlement, release: vi.fn() } })
+    const authorize = vi.fn(async input => { order.push(`authorize:${input.provider}`); return { outputReservationRequired: true, maxOutputTokens: 23, start: async () => 23, settle: settlement, release: vi.fn() } })
     const model = createUsageAwareModelAdapter(spreadPrivateOutputAdapter(runtime.adapter), { owner, authorize, treeBudget: fixture.store })
 
     const events: ModelStreamEvent[] = []
@@ -208,6 +318,8 @@ describe("usage-aware model owner seam", () => {
     expect(order).toEqual(["preflight", "preflight", "authorize:anthropic", "fetch"])
     expect(authorize).toHaveBeenCalledTimes(1)
     expect(settlement).toHaveBeenCalledOnce()
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as { max_tokens?: number }
+    expect(body.max_tokens).toBe(23)
     expect(fixture.statuses).toEqual(["consumed"])
   })
 
@@ -218,7 +330,7 @@ describe("usage-aware model owner seam", () => {
     const authorize = vi.fn(async input => {
       const settle = vi.fn(async () => undefined), release = vi.fn(async () => undefined)
       settled.set(input.provider, settle); released.set(input.provider, release)
-      return { settle, release }
+      return { start: async () => null, settle, release }
     })
     const model = createUsageAwareModelAdapter(runtime.adapter, { owner, authorize, treeBudget: fixture.store })
 
@@ -226,8 +338,8 @@ describe("usage-aware model owner seam", () => {
     expect(authorize.mock.calls.map(([input]) => `${input.provider}/${input.model}`)).toEqual([
       "minimax/MiniMax-M3", "anthropic/claude-sonnet-5",
     ])
-    expect(settled.get("minimax")).toHaveBeenCalledWith({ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "provider_rerouted" })
-    expect(settled.get("anthropic")).toHaveBeenCalledWith({ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "provider_error" })
+    expect(settled.get("minimax")).toHaveBeenCalledWith({ status: "error", inputTokens: null, outputTokens: null, estimatedCostUsd: null, errorCode: "provider_rerouted" })
+    expect(settled.get("anthropic")).toHaveBeenCalledWith({ status: "error", inputTokens: null, outputTokens: null, estimatedCostUsd: null, errorCode: "provider_error" })
     expect([...released.values()].every(release => !release.mock.calls.length)).toBe(true)
     expect(fetcher).toHaveBeenCalledTimes(2)
     expect(fixture.statuses).toEqual(["consumed"])
@@ -254,7 +366,7 @@ describe("usage-aware model owner seam", () => {
       const settle = vi.fn(async () => { order.push(`settle:${input.provider}`) })
       const release = vi.fn()
       settled.set(input.provider, settle); released.set(input.provider, release)
-      return { settle, release }
+      return { start: async () => null, settle, release }
     })
     const model = createUsageAwareModelAdapter(spreadPrivateOutputAdapter(modelRuntime.adapter), { owner, authorize, treeBudget: fixture.store })
     const events: ModelStreamEvent[] = []
@@ -284,9 +396,9 @@ describe("usage-aware model owner seam", () => {
 
   it("releases account and child credit once when async authorization resolves after cancellation", async () => {
     const controller = new AbortController(), fixture = store()
-    let beginAuthorization!: () => void, finishAuthorization!: (value: { settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }) => void
+    let beginAuthorization!: () => void, finishAuthorization!: (value: { start: () => Promise<null>; settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }) => void
     const authorizationStarted = new Promise<void>(resolve => { beginAuthorization = resolve })
-    const authorization = new Promise<{ settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }>(resolve => { finishAuthorization = resolve })
+    const authorization = new Promise<{ start: () => Promise<null>; settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }>(resolve => { finishAuthorization = resolve })
     const settle = vi.fn(), release = vi.fn(async () => undefined), fetcher = vi.fn(async () => { throw new Error("cancelled request reached provider") })
     const runtime = harnessRuntime(fetcher, [5000])
     const model = createUsageAwareModelAdapter(runtime.adapter, {
@@ -295,7 +407,7 @@ describe("usage-aware model owner seam", () => {
     const pending = (async () => { for await (const _event of model.stream({ ...request, signal: controller.signal })) return undefined })()
     await authorizationStarted
     controller.abort(new Error("cancelled during authorization"))
-    finishAuthorization({ settle, release })
+    finishAuthorization({ start: async () => null, settle, release })
 
     await expect(pending).rejects.toThrow("cancelled during authorization")
     expect(fetcher).not.toHaveBeenCalled()
@@ -308,7 +420,7 @@ describe("usage-aware model owner seam", () => {
     const controller = new AbortController(), fixture = store()
     controller.abort(new Error("already cancelled"))
     const fetcher = vi.fn(async () => { throw new Error("cancelled request reached provider") })
-    const authorize = vi.fn(async () => ({ settle: vi.fn(), release: vi.fn() }))
+    const authorize = vi.fn(async () => ({ start: async () => null, settle: vi.fn(), release: vi.fn() }))
     const model = createUsageAwareModelAdapter(harnessRuntime(fetcher, [5000]).adapter, { owner, treeBudget: fixture.store, authorize })
 
     await expect((async () => { for await (const _event of model.stream({ ...request, signal: controller.signal })) return undefined })())
@@ -335,7 +447,7 @@ describe("usage-aware model owner seam", () => {
     const ordinary = adapter([{ type: "completed", finishReason: "stop" }])
     const wrapped = createUsageAwareModelAdapter({
       ...ordinary, async *stream() { order.push("provider"); yield { type: "completed", finishReason: "stop" } },
-    }, { owner, authorize: vi.fn(async () => { order.push("authorize"); return { settle: vi.fn(async () => undefined) } }) })
+    }, { owner, authorize: vi.fn(async () => { order.push("authorize"); return { start: async () => null, settle: vi.fn(async () => undefined) } }) })
 
     for await (const _event of wrapped.stream(request)) undefined
     expect(order).toEqual(["authorize", "provider"])

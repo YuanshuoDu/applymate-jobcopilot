@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
 import { waitForNativeVerification } from "../canonical-turn-native-verification-wait.js"
 import type { HarnessModelRequest, ModelAdapter, ModelCapabilityProfile } from "@jobcopilot/agent-model"
-import type { WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
+import type { WorkerKnownUsageSettlementInput, WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { releaseTurnLease, type TurnLease } from "../turns/lease.js"
 import {
   canonicalNativeVerificationJson, digestNativeVerificationValue, NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, parseNativeVerificationControl,
@@ -334,13 +334,15 @@ async function executeControlWithProduction(taskId: string): Promise<{
   requests: HarnessModelRequest[]
   packets: ReturnType<typeof parseNativeVerificationPacket>[]
   usageAuthorizations: WorkerUsageAuthorizationInput[]
-  usageSettlements: WorkerUsageSettlementInput[]
+  usageSettlements: WorkerKnownUsageSettlementInput[]
+  unknownUsageSettlements: WorkerUsageSettlementInput[]
 }> {
   const [{ AgentTreeManager }, { createProductionChildExecutor }, { PgSubagentTaskStore }, { runSubagentQueueJob }] = await Promise.all([
     import("./manager.js"), import("./production-child-runtime.js"), import("./pg-store.js"), import("../../queue/subagent-pause-dispatch.js"),
   ])
   const requests: HarnessModelRequest[] = [], packets: ReturnType<typeof parseNativeVerificationPacket>[] = []
-  const usageAuthorizations: WorkerUsageAuthorizationInput[] = [], usageSettlements: WorkerUsageSettlementInput[] = []
+  const usageAuthorizations: WorkerUsageAuthorizationInput[] = []
+  const usageSettlements: WorkerKnownUsageSettlementInput[] = [], unknownUsageSettlements: WorkerUsageSettlementInput[] = []
   const profile: ModelCapabilityProfile = {
     provider: "fixture", model: "native-answer-evidence-deterministic", nativeTools: true, structuredOutput: true, streaming: true,
     continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false,
@@ -351,7 +353,12 @@ async function executeControlWithProduction(taskId: string): Promise<{
     pool: pool!,
     authorizeUsage: async input => {
       usageAuthorizations.push(input)
-      return { settle: async value => { usageSettlements.push(value) } }
+      return {
+        outputReservationRequired: false,
+        maxOutputTokens: null,
+        settle: async value => { usageSettlements.push(value) },
+        settleUnknown: async value => { unknownUsageSettlements.push(value) },
+      }
     },
     modelRuntimeFactory: ({ task }) => {
       const control = parseNativeVerificationControl(task.expectedOutputSchema)
@@ -382,7 +389,7 @@ async function executeControlWithProduction(taskId: string): Promise<{
     const outcome = await runSubagentQueueJob(pool as unknown as PgSubagentPool, manager, executor, {
       taskId, sessionId: ids.session, rootTaskId: ids.root, ownerId: `native-answer-evidence-${randomUUID()}`,
     })
-    return { outcome, requests, packets, usageAuthorizations, usageSettlements }
+    return { outcome, requests, packets, usageAuthorizations, usageSettlements, unknownUsageSettlements }
   } finally { await manager.shutdown() }
 }
 
@@ -593,6 +600,7 @@ describePg("native verification PostgreSQL producer and readback", () => {
     expect(executed.usageAuthorizations).toHaveLength(1)
     expect(executed.usageAuthorizations[0]?.executionOwner).toMatchObject({ kind: "task", taskId: rootTaskIds[0], rootTaskId: ids.root })
     expect(executed.usageSettlements).toEqual([{ status: "success", inputTokens: 173, outputTokens: 41, estimatedCostUsd: 0.013 }])
+    expect(executed.unknownUsageSettlements).toEqual([])
 
     const completedControl = await pool!.query<{ status: string; attemptCount: number; failureReason: string | null; result: unknown }>(
       `SELECT "status", "attemptCount", "failureReason", "result" FROM "sub_agent_tasks" WHERE "id" = $1`, [rootTaskIds[0]])

@@ -114,7 +114,12 @@ try {
         },
       })
     },
-    createWorkerUsageAuthorizer() { return async () => ({ settle() {} }) },
+    createWorkerUsageAuthorizer() { return async () => ({
+      outputReservationRequired: false,
+      maxOutputTokens: null,
+      settle: async () => undefined,
+      settleUnknown: async () => undefined,
+    }) },
     createCanonicalExecutionProjection() { return noOpProjection },
     createCanonicalSessionProjection() { return noOpProjection },
     startProductionAgentRuntime(startupOptions) {

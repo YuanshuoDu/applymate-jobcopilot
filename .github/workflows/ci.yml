@@ -529,6 +529,38 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 20, cache: pnpm }
       - run: pnpm install --frozen-lockfile
+      - name: Prepare the candidate role before the token-ledger migration
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+        run: |
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          pnpm --filter @jobcopilot/worker exec node - <<'NODE'
+          const { readFileSync } = require("node:fs")
+          const { Client } = require("pg")
+          const { resolve } = require("node:path")
+          const grants = readFileSync(resolve(process.env.GITHUB_WORKSPACE, "apps/web/prisma/rls/role-grants.sql"), "utf8")
+          const roleBlock = grants.match(/DO \$\$[\s\S]*?CREATE ROLE applymate_candidate[\s\S]*?END \$\$;/)?.[0]
+          const membership = grants.match(/^GRANT applymate_candidate TO CURRENT_USER;$/m)?.[0]
+          const schemaUsage = grants.match(/^GRANT USAGE ON SCHEMA public TO applymate_candidate;$/m)?.[0]
+          if (!roleBlock || !membership || !schemaUsage) throw new Error("Could not find the minimal candidate role setup in role-grants.sql")
+          async function main() {
+            const client = new Client({ connectionString: process.env.DATABASE_URL })
+            await client.connect()
+            try {
+              await client.query("BEGIN")
+              await client.query(roleBlock)
+              await client.query(membership)
+              await client.query(schemaUsage)
+              await client.query("COMMIT")
+            } catch (error) {
+              await client.query("ROLLBACK").catch(() => undefined)
+              throw error
+            } finally {
+              await client.end()
+            }
+          }
+          main().catch(error => { console.error(error); process.exitCode = 1 })
+          NODE
       - name: Apply existing migrations to the disposable PostgreSQL service
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
@@ -549,6 +581,23 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
         run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
+      - name: Verify root usage migration grants and tenant RLS on disposable PostgreSQL
+        env:
+          CI: "true"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "$DATABASE_URL"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism \
+            src/lib/agent/control-plane/agent-root-usage-migration.pg.integration.test.ts \
+            src/lib/agent/control-plane/agent-usage-reconciliation.pg.integration.test.ts \
+            src/lib/agent/control-plane/agent-root-usage-reservations.pg.integration.test.ts
       - name: Build Worker workspace before focused test
         run: pnpm turbo build --filter=@jobcopilot/worker
       - name: Verify fair child-wait reconciliation on disposable PostgreSQL

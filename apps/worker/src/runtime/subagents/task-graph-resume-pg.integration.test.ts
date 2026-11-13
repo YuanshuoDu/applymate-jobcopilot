@@ -67,8 +67,15 @@ import { parseStoredTaskGraphVerificationReport, TASK_GRAPH_EMPTY_ANALYST_VERIFI
 import { hasNoCurrentAttemptTaskGraphToolReceipts } from "./task-graph-empty-analyst-proof.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
+import type { WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
+const authorizeUnreservedUsage = async () => ({
+  outputReservationRequired: false,
+  maxOutputTokens: null,
+  settle: async () => undefined,
+  settleUnknown: async (_settlement: WorkerUsageSettlementInput) => undefined,
+})
 const ANALYST_WAIT_DIAGNOSTIC_CHECKOUT_TIMEOUT_MS = 500
 const ANALYST_WAIT_DIAGNOSTIC_QUERY_TIMEOUT_MS = 750
 const PLAN_CALL_ID = "p3-resume-plan"
@@ -9648,7 +9655,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       taskGraphTemplates: {
         ...TASK_GRAPH_TEMPLATES,
       },
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: () => {
         const execution = ++rootRuntimeExecutions
         let modelRounds = 0
@@ -11022,7 +11029,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       taskGraphTemplates: {
         analyst: { role: "analyst", taskType: "research", allowedActions: ["jobs.search"] },
       },
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: () => {
         const execution = ++rootRuntimeExecutions
         let modelRounds = 0
@@ -11501,7 +11508,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         },
       },
       taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES },
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: () => {
         const execution = ++rootExecutions
         let round = 0
@@ -12164,7 +12171,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       taskGraphTemplates: {
         analyst: { role: "analyst", taskType: "research", allowedActions: ["jobs.search"] },
       },
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: () => {
         const execution = ++rootRuntimeExecutions
         let modelRounds = 0
@@ -13261,7 +13268,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const rootRuntime = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: discoveryOwner.ownerId, productionFlags: flags,
       taskGraphCommandPort: diagnosticDiscoveryCommandPort,
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: () => {
         const execution = ++rootExecution
         let round = 0
@@ -13671,7 +13678,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       },
     })
     const productionChildExecutor = createProductionChildExecutor({
-      pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
+      pool: pool!, authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: ({ task }) => {
         if (task.role === "auditor" && task.taskType === "native_verification") {
           const control = parseNativeVerificationControl(task.expectedOutputSchema)
@@ -14008,7 +14015,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
       taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES },
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: () => {
         const execution = ++rootExecution
         let round = 0
@@ -14082,7 +14089,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       },
     })
     const childExecutor = createProductionChildExecutor({
-      pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
+      pool: pool!, authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: ({ task }) => {
         const lease = childLeaseByTaskId.get(task.id)
         if (lease) {
@@ -14346,7 +14353,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
       taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES },
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: () => {
         const execution = ++rootExecution
         let round = 0
@@ -14616,7 +14623,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     const childLeaseByTaskId = new Map<string, SubagentLease>()
     const childExecutor = createProductionChildExecutor({
-      pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
+      pool: pool!, authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: ({ task }) => {
         const diagnosticSlot = repairDiagnosticSlotForTask(task.id, task.role)
         let round = 0
@@ -15014,7 +15021,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
-      taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES }, authorizeUsage: async () => ({ settle: async () => undefined }),
+      taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES }, authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: () => {
         const execution = ++rootExecution
         let round = 0
@@ -15105,7 +15112,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       },
     })
     const childExecutor = createProductionChildExecutor({
-      pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
+      pool: pool!, authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: ({ task }) => {
         let round = 0
         const callId = task.id === initialTaskIds[0]
@@ -15454,7 +15461,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           readTerminalProof: readNativeVerificationTerminalProofWithClient,
         }
       },
-      taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES }, authorizeUsage: async () => ({ settle: async () => undefined }),
+      taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES }, authorizeUsage: authorizeUnreservedUsage,
       stateLoader: async (statePool, lease, now, loaderOptions) => {
         const boundary = emptyAnalystRuntimeDiagnostics.stateLoader
         boundary.calls += 1
@@ -15713,7 +15720,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       firstAdapterFailureStage: "not_started", firstAdapterFailureClass: "none",
     }
     const childExecutor = createProductionChildExecutor({
-      pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
+      pool: pool!, authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: ({ task }) => {
         let round = 0
         const callId = `p3-scout-union-search:${task.id}:${task.attemptCount}`
@@ -16668,7 +16675,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
       taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES },
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: authorizeUnreservedUsage,
       stateLoader: async (statePool, lease, now, loaderOptions) => {
         fixtureInvocationCounters.startupStage = "state_loading"
         const state = await turnState.loadCanonicalTurnState(statePool, lease, now, loaderOptions)
@@ -16891,7 +16898,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       },
     })
     const childExecutor = createProductionChildExecutor({
-      pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
+      pool: pool!, authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: ({ task }) => {
         let round = 0
         const callId = "p3-lease-recovery-search:" + task.id + ":" + task.attemptCount

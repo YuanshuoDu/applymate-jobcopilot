@@ -1233,6 +1233,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       let toolModelCalls = 0
       let materialModelCalls = 0
       const usageSettlements: Array<{ stepId: string; settlement: WorkerUsageSettlementInput }> = []
+      const unknownUsageSettlements: Array<{ stepId: string; settlement: WorkerUsageSettlementInput }> = []
       let resolveMaterialCallStarted!: () => void
       let resolveMaterialCallSettled!: () => void
       const materialCallStarted = new Promise<void>(resolve => { resolveMaterialCallStarted = resolve })
@@ -1277,7 +1278,14 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         },
       })
       const authorizeUsage = async (input: WorkerUsageAuthorizationInput) => ({
+        outputReservationRequired: false as const,
+        maxOutputTokens: null,
         settle: async (settlement: WorkerUsageSettlementInput) => { usageSettlements.push({ stepId: input.stepId, settlement }) },
+        settleUnknown: async (settlement: WorkerUsageSettlementInput) => {
+          const entry = { stepId: input.stepId, settlement }
+          unknownUsageSettlements.push(entry)
+          usageSettlements.push(entry)
+        },
       })
       const executor = childRuntime.createProductionChildExecutor({ pool: pool!, authorizeUsage, modelRuntimeFactory })
       const manager = new childManager.AgentTreeManager(new childStore.PgSubagentTaskStore(pool!))
@@ -1366,6 +1374,9 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
           { stepId: ledger.outerSteps[0]!.id, settlement: expect.objectContaining({ status: "success" }) },
           { stepId: ledger.materialSteps[0]!.id, settlement: expect.objectContaining({ status: "error" }) },
         ]))
+        expect(unknownUsageSettlements).toHaveLength(2)
+        expect(unknownUsageSettlements.every(({ settlement }) => settlement.inputTokens === null
+          && settlement.outputTokens === null && settlement.estimatedCostUsd === null)).toBe(true)
         await prepareWorker.close()
         prepareWorker = undefined
         return
@@ -1435,6 +1446,9 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       expect(usageSettlements).toHaveLength(2 + (scenario.mode === "zero-eligible" ? 0 : 1))
       expect(usageSettlements.every(row => row.settlement.status === "success")).toBe(true)
       expect(usageSettlements.map(row => row.stepId).sort()).toEqual(ledger.steps.map(row => row.id).sort())
+      expect(unknownUsageSettlements).toHaveLength(2 + (scenario.mode === "zero-eligible" ? 0 : 1))
+      expect(unknownUsageSettlements.every(({ settlement }) => settlement.inputTokens === null
+        && settlement.outputTokens === null && settlement.estimatedCostUsd === null)).toBe(true)
       expect(completedPrepare.rows[0]?.result.taskGraphScheduledPrepareProofFacts).toMatchObject({
         completion: { nodes: expect.arrayContaining([expect.objectContaining({ taskId: prepareTaskId, attemptCount: 1,
           role: "prepare", status: "completed", verification: "passed" })]) },

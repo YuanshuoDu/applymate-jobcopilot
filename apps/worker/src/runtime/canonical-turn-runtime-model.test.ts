@@ -8,8 +8,9 @@ import {
   type ModelStreamEvent,
 } from "@jobcopilot/agent-model"
 import { estimateSharedAiCost } from "@jobcopilot/shared"
+import type { WorkerUsageSettlementInput } from "../queue/ai-usage-bridge.js"
 import type { HarnessModelRuntime } from "./harness-model.js"
-import { defaultAuthorization, modelWithUsage } from "./canonical-turn-runtime-model.js"
+import { defaultAuthorization, modelWithUsage as createModelWithUsage, type UsageAuthorization, type UsageAuthorizer } from "./canonical-turn-runtime-model.js"
 import { createHarnessModelRuntime, type HarnessFetch } from "./harness-model.js"
 import type { TurnLease } from "./turns/lease.js"
 
@@ -63,6 +64,19 @@ function adapter(
 
 function runtime(value: ModelAdapter): HarnessModelRuntime {
   return { adapter: value, registry: {} as never, candidates: [] }
+}
+
+function modelWithUsage(value: HarnessModelRuntime, currentLease: TurnLease, authorize: UsageAuthorizer): ModelAdapter {
+  return createModelWithUsage(value, currentLease, async input => {
+    const authorization = await authorize(input)
+    return {
+      outputReservationRequired: false, maxOutputTokens: null, ...authorization,
+      settleUnknown: authorization.settleUnknown ?? (async value => {
+        // Test spies represent a broker that accepts nullable usage reports.
+        await (authorization.settle as unknown as (value: WorkerUsageSettlementInput) => Promise<void> | void)(value)
+      }),
+    }
+  })
 }
 
 async function collect(events: AsyncIterable<ModelStreamEvent>): Promise<ModelStreamEvent[]> {
@@ -142,7 +156,7 @@ describe("canonical turn runtime usage model", () => {
   it("authorizes against the lease identity, autoApply feature, adapter route, and request step", async () => {
     const order: string[] = []
     const events = [{ type: "completed", finishReason: "stop" } satisfies ModelStreamEvent]
-    const authorize = vi.fn(async () => { order.push("authorize"); return { settle: vi.fn() } })
+    const authorize = vi.fn(async () => { order.push("authorize"); return { start: async () => null, settle: vi.fn() } })
     const wrapped = modelWithUsage(runtime(adapter(async function* () { order.push("stream"); yield* events })), lease, authorize)
 
     await collect(wrapped.stream(request("step-from-request")))
@@ -153,6 +167,7 @@ describe("canonical turn runtime usage model", () => {
       sessionId: "session-1",
       turnId: "turn-1",
       stepId: "step-from-request",
+      attemptId: "route-1",
       leaseOwnerId: "worker-7",
       leaseVersion: 4,
       featureKey: "autoApply",
@@ -164,7 +179,7 @@ describe("canonical turn runtime usage model", () => {
 
   it("settles stream usage once after successful completion", async () => {
     const settlement = vi.fn()
-    const authorize = vi.fn(async () => ({ settle: settlement }))
+    const authorize = vi.fn(async () => ({ start: async () => null, settle: settlement }))
     const wrapped = modelWithUsage(runtime(adapter(async function* () {
       yield { type: "usage", inputTokens: 17, outputTokens: 6, estimatedCostUsd: 0.025 }
       yield { type: "completed", finishReason: "stop" }
@@ -175,6 +190,40 @@ describe("canonical turn runtime usage model", () => {
     expect(settlement).toHaveBeenCalledWith({ status: "success", inputTokens: 17, outputTokens: 6, estimatedCostUsd: 0.025 })
   })
 
+  it("preserves unknown cost pricing as null after an output reservation starts", async () => {
+    const order: string[] = [], settlement = vi.fn()
+    const wrapped = modelWithUsage(runtime(adapter(async function* () {
+      order.push("provider")
+      yield { type: "usage", inputTokens: 17, outputTokens: 6, estimatedCostUsd: 0 }
+      yield { type: "completed", finishReason: "stop" }
+    })), lease, async () => {
+      order.push("authorize")
+      return { outputReservationRequired: true, maxOutputTokens: 23, start: async () => { order.push("start"); return 23 }, settle: settlement }
+    })
+
+    await expect(collect(wrapped.stream({ ...request(), maxOutputTokens: 64 }))).resolves.toHaveLength(2)
+    expect(order).toEqual(["authorize", "start", "provider"])
+    expect(settlement).toHaveBeenCalledWith({ status: "success", inputTokens: 17, outputTokens: 6, estimatedCostUsd: null })
+  })
+
+  it("keeps an unknown model price null without a cap and preserves a catalogued free price", async () => {
+    const settleUnknown = vi.fn()
+    const unknownAdapter = { ...adapter(async function* () {
+      yield { type: "usage", inputTokens: 17, outputTokens: 6, estimatedCostUsd: 0 }
+      yield { type: "completed", finishReason: "stop" }
+    }), profile: { ...profile, provider: "custom", model: "unknown-model" } }
+    await collect(modelWithUsage(runtime(unknownAdapter), lease, async () => ({ start: async () => null, settle: settleUnknown })).stream(request()))
+    expect(settleUnknown).toHaveBeenCalledWith({ status: "success", inputTokens: 17, outputTokens: 6, estimatedCostUsd: null })
+
+    const settleFree = vi.fn()
+    const freeAdapter = { ...adapter(async function* () {
+      yield { type: "usage", inputTokens: 17, outputTokens: 6, estimatedCostUsd: 0 }
+      yield { type: "completed", finishReason: "stop" }
+    }), profile: { ...profile, provider: "qwen", model: "qwen3.7-flash" } }
+    await collect(modelWithUsage(runtime(freeAdapter), lease, async () => ({ start: async () => null, settle: settleFree })).stream(request()))
+    expect(settleFree).toHaveBeenCalledWith({ status: "success", inputTokens: 17, outputTokens: 6, estimatedCostUsd: 0 })
+  })
+
   it("settles a consumer-interrupted provider stream once with partial usage and closes its iterator", async () => {
     const settlement = vi.fn(), providerClosed = vi.fn()
     const wrapped = modelWithUsage(runtime(adapter(async function* () {
@@ -182,7 +231,7 @@ describe("canonical turn runtime usage model", () => {
         yield { type: "usage", inputTokens: 17, outputTokens: 6, estimatedCostUsd: 0.025 }
         yield { type: "text_delta", text: "partial" }
       } finally { providerClosed() }
-    })), lease, async () => ({ settle: settlement }))
+    })), lease, async () => ({ start: async () => null, settle: settlement }))
     const iterator = wrapped.stream(request())[Symbol.asyncIterator]()
 
     await expect(iterator.next()).resolves.toMatchObject({
@@ -205,7 +254,7 @@ describe("canonical turn runtime usage model", () => {
     const wrapped = modelWithUsage(runtime(adapter(async function* () {
       yield { type: "usage", inputTokens: 8, outputTokens: 3, estimatedCostUsd: 0.01 }
       throw failure
-    })), lease, async () => ({ settle: settlement }))
+    })), lease, async () => ({ start: async () => null, settle: settlement }))
 
     await expect(collect(wrapped.stream(request()))).rejects.toBe(failure)
     expect(settlement).toHaveBeenCalledTimes(1)
@@ -218,7 +267,7 @@ describe("canonical turn runtime usage model", () => {
     const wrapped = modelWithUsage(runtime(adapter(
       async function* () { yield { type: "completed", finishReason: "stop" } },
       async () => providerResponse,
-    )), lease, async () => ({ settle: settlement }))
+    )), lease, async () => ({ start: async () => null, settle: settlement }))
 
     await expect(wrapped.complete?.(request())).resolves.toBe(providerResponse)
     expect(settlement).toHaveBeenCalledTimes(1)
@@ -241,11 +290,11 @@ describe("canonical turn runtime usage model", () => {
     const wrapped = modelWithUsage(runtime(adapter(
       async function* () { yield { type: "completed", finishReason: "stop" } },
       async () => { throw failure },
-    )), lease, async () => ({ settle: settlement }))
+    )), lease, async () => ({ start: async () => null, settle: settlement }))
 
     await expect(wrapped.complete?.(request())).rejects.toBe(failure)
     expect(settlement).toHaveBeenCalledTimes(1)
-    expect(settlement).toHaveBeenCalledWith({ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "complete_provider_error" })
+    expect(settlement).toHaveBeenCalledWith({ status: "error", inputTokens: null, outputTokens: null, estimatedCostUsd: null, errorCode: "complete_provider_error" })
   })
 
   it("fails closed before invoking the provider when default authorization is used", async () => {
@@ -263,7 +312,7 @@ describe("canonical turn runtime usage model", () => {
     const fetcher = vi.fn(async () => { throw new Error("preflight reached fetch") })
     const runtime = harnessRuntime(fetcher, [500, 500])
     const settlement = vi.fn()
-    const authorize = vi.fn(async () => ({ settle: settlement }))
+    const authorize = vi.fn(async () => ({ start: async () => null, settle: settlement }))
     const wrapped = modelWithUsage(runtime, lease, authorize)
 
     await expect(collect(wrapped.stream(oversizedRequest())))
@@ -278,7 +327,7 @@ describe("canonical turn runtime usage model", () => {
     const fetcher: HarnessFetch = vi.fn(async url => { order.push("fetch"); expect(url).toContain("anthropic"); return fittingFallbackResponse() })
     const runtime = harnessRuntime(fetcher, [500, 5000], () => { order.push("preflight") })
     const settlement = vi.fn()
-    const authorize = vi.fn(async input => { order.push(`authorize:${input.provider}`); return { settle: settlement } })
+    const authorize = vi.fn(async input => { order.push(`authorize:${input.provider}`); return { start: async () => null, settle: settlement } })
     const wrapped = modelWithUsage(runtime, lease, authorize)
 
     const events = await collect(wrapped.stream(oversizedRequest()))
@@ -286,6 +335,38 @@ describe("canonical turn runtime usage model", () => {
     expect(order).toEqual(["preflight", "preflight", "authorize:anthropic", "fetch"])
     expect(authorize).toHaveBeenCalledTimes(1)
     expect(settlement).toHaveBeenCalledOnce()
+  })
+
+  it("sends the server-admitted output ceiling in the MiniMax provider request", async () => {
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => new Response("unavailable", { status: 503 }))
+    const fetcher = fetchMock as unknown as HarnessFetch
+    const authorize = vi.fn(async () => ({ outputReservationRequired: true, maxOutputTokens: 23, start: async () => 23, settle: vi.fn() }))
+    const wrapped = modelWithUsage(harnessRuntime(fetcher, [5000]), lease, authorize)
+
+    await expect(collect(wrapped.stream({ ...request(), maxOutputTokens: 64 }))).rejects.toMatchObject({ code: "provider_error" })
+    expect(authorize).toHaveBeenCalledWith(expect.objectContaining({ requestedOutputTokens: 64 }))
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as { max_completion_tokens?: number }
+    expect(body.max_completion_tokens).toBe(23)
+  })
+
+  it("rejects invalid strict output admission before stream or complete provider calls", async () => {
+    const invalid: UsageAuthorization[] = [
+      { outputReservationRequired: true, maxOutputTokens: 23, settle: vi.fn() },
+      { outputReservationRequired: true, maxOutputTokens: 23, start: async () => null, settle: vi.fn() },
+      { outputReservationRequired: true, maxOutputTokens: 23, start: async () => 24, settle: vi.fn() },
+      { outputReservationRequired: true, maxOutputTokens: 70, start: async () => 70, settle: vi.fn() },
+      { start: async () => 23, settle: vi.fn() },
+    ]
+    for (const authorization of invalid) {
+      const stream = vi.fn(async function* () { yield { type: "completed", finishReason: "stop" } satisfies ModelStreamEvent })
+      const complete = vi.fn(async () => response({ inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0.01 }))
+      const wrapped = createModelWithUsage(runtime(adapter(stream, complete)), lease, async () => authorization)
+
+      await expect(collect(wrapped.stream({ ...request(), maxOutputTokens: 64 }))).rejects.toThrow()
+      await expect(wrapped.complete!({ ...request(), maxOutputTokens: 64 })).rejects.toThrow()
+      expect(stream).not.toHaveBeenCalled()
+      expect(complete).not.toHaveBeenCalled()
+    }
   })
 
   it("authorizes and settles each started Harness route independently", async () => {
@@ -301,7 +382,7 @@ describe("canonical turn runtime usage model", () => {
       order.push(`authorize:${input.provider}`)
       const settle = vi.fn(), release = vi.fn()
       settlements.set(input.provider, settle)
-      return { settle, release }
+      return { start: async () => null, settle, release }
     })
     const wrapped = modelWithUsage(runtime, lease, authorize)
 
@@ -334,7 +415,7 @@ describe("canonical turn runtime usage model", () => {
       order.push(`authorize:${input.provider}`)
       const settle = vi.fn(async () => { order.push(`settle:${input.provider}`) })
       settlements.set(input.provider, settle)
-      return { settle, release: vi.fn() }
+      return { start: async () => null, settle, release: vi.fn() }
     })
     const wrapped = modelWithUsage(modelRuntime, lease, authorize)
 
@@ -362,7 +443,7 @@ describe("canonical turn runtime usage model", () => {
   it("settles final Harness failure with observed usage exactly once", async () => {
     const settle = vi.fn(), release = vi.fn()
     const modelRuntime = harnessRuntime(vi.fn(async () => failedMinimaxStreamResponse()), [5000])
-    const wrapped = modelWithUsage(modelRuntime, lease, async () => ({ settle, release }))
+    const wrapped = modelWithUsage(modelRuntime, lease, async () => ({ start: async () => null, settle, release }))
 
     await expect(collect(wrapped.stream(request()))).rejects.toMatchObject({ code: "provider_error" })
     expect(settle).toHaveBeenCalledTimes(1)
@@ -389,21 +470,21 @@ describe("canonical turn runtime usage model", () => {
     const order: string[] = [], settlement = vi.fn(), release = vi.fn()
     const fetcher = vi.fn(async () => { order.push("fetch"); return new Response("unavailable", { status: 503 }) })
     const runtime = harnessRuntime(fetcher, [5000], () => { order.push("preflight") })
-    const authorize = vi.fn(async () => { order.push("authorize"); return { settle: settlement, release } })
+    const authorize = vi.fn(async () => { order.push("authorize"); return { start: async () => null, settle: settlement, release } })
     const wrapped = modelWithUsage(runtime, lease, authorize)
 
     await expect(collect(wrapped.stream(request()))).rejects.toMatchObject({ code: "provider_error" })
     expect(order).toEqual(["preflight", "authorize", "fetch"])
     expect(settlement).toHaveBeenCalledOnce()
-    expect(settlement).toHaveBeenCalledWith({ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "provider_error" })
+    expect(settlement).toHaveBeenCalledWith({ status: "error", inputTokens: null, outputTokens: null, estimatedCostUsd: null, errorCode: "provider_error" })
     expect(release).not.toHaveBeenCalled()
   })
 
   it("releases the same authorization once when cancellation arrives during async authorization", async () => {
     const controller = new AbortController(), fetcher = vi.fn(async () => { throw new Error("cancelled request reached provider") })
-    let beginAuthorization!: () => void, finishAuthorization!: (value: { settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }) => void
+    let beginAuthorization!: () => void, finishAuthorization!: (value: { start: () => Promise<null>; settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }) => void
     const authorizationStarted = new Promise<void>(resolve => { beginAuthorization = resolve })
-    const authorization = new Promise<{ settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }>(resolve => { finishAuthorization = resolve })
+    const authorization = new Promise<{ start: () => Promise<null>; settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }>(resolve => { finishAuthorization = resolve })
     const settlement = vi.fn(), release = vi.fn()
     const wrapped = modelWithUsage(harnessRuntime(fetcher, [5000]), lease, vi.fn(() => {
       beginAuthorization()
@@ -412,7 +493,7 @@ describe("canonical turn runtime usage model", () => {
     const pending = collect(wrapped.stream({ ...request(), signal: controller.signal }))
     await authorizationStarted
     controller.abort(new Error("cancelled during authorization"))
-    finishAuthorization({ settle: settlement, release })
+    finishAuthorization({ start: async () => null, settle: settlement, release })
 
     await expect(pending).rejects.toThrow("cancelled during authorization")
     expect(fetcher).not.toHaveBeenCalled()
@@ -422,15 +503,15 @@ describe("canonical turn runtime usage model", () => {
 
   it("releases eager non-Harness authorization once when cancellation arrives during authorization", async () => {
     const controller = new AbortController(), provider = vi.fn(async function* () { yield { type: "completed", finishReason: "stop" } satisfies ModelStreamEvent })
-    let beginAuthorization!: () => void, finishAuthorization!: (value: { settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }) => void
+    let beginAuthorization!: () => void, finishAuthorization!: (value: { start: () => Promise<null>; settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }) => void
     const authorizationStarted = new Promise<void>(resolve => { beginAuthorization = resolve })
-    const authorization = new Promise<{ settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }>(resolve => { finishAuthorization = resolve })
+    const authorization = new Promise<{ start: () => Promise<null>; settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }>(resolve => { finishAuthorization = resolve })
     const settlement = vi.fn(), release = vi.fn()
     const wrapped = modelWithUsage(runtime(adapter(provider)), lease, vi.fn(() => { beginAuthorization(); return authorization }))
     const pending = collect(wrapped.stream({ ...request(), signal: controller.signal }))
     await authorizationStarted
     controller.abort(new Error("cancelled during eager authorization"))
-    finishAuthorization({ settle: settlement, release })
+    finishAuthorization({ start: async () => null, settle: settlement, release })
 
     await expect(pending).rejects.toThrow("cancelled during eager authorization")
     expect(provider).not.toHaveBeenCalled()
