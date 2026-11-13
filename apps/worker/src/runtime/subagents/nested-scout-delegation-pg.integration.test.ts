@@ -27,6 +27,12 @@ const MAIN_PROGRESS_MARKERS = new Set([
   "P1143_PARENT_DELEGATE_TASK_IDS_NONE", "P1143_PARENT_WAIT_RESULT_PRESENT", "P1143_PARENT_WAIT_RESULT_MISSING",
   "P1143_PARENT_WAIT_TERMINAL_MATCH", "P1143_PARENT_WAIT_TERMINAL_NO_MATCH", "P1143_PARENT_SCOUT_RESULTS_ISSUED",
   "P1143_PARENT_SCOUT_RESULTS_NOT_ISSUED",
+  "P1143_PARENT_MODEL_STREAM_ENTERED", "P1143_PARENT_RESUME_MODEL_FIRST_ATTEMPT", "P1143_PARENT_RESUME_MODEL_RETRIED",
+  "P1143_PARENT_RESUME_WAIT_INPUT_PRESENT", "P1143_PARENT_RESUME_WAIT_INPUT_MISSING",
+  "P1143_PARENT_RESUME_WAIT_RESULT_PRESENT", "P1143_PARENT_RESUME_WAIT_RESULT_MISSING",
+  "P1143_PARENT_RESUME_WAIT_CONTEXT_READY", "P1143_PARENT_RESUME_WAIT_CONTEXT_TIMED_OUT",
+  "P1143_PARENT_RESUME_WAIT_CONTEXT_WAITING", "P1143_PARENT_RESUME_WAIT_CONTEXT_FAILED",
+  "P1143_PARENT_RESUME_WAIT_CONTEXT_OTHER",
 ])
 const SAFE_DIAGNOSTIC_ERROR_CODES = [
   "invalid_output", "model_execution_failed", "tool_execution_failed", "subagent_lease_lost", "nested_scout_final_wait_owner_unavailable",
@@ -44,6 +50,12 @@ const SAFE_DIAGNOSTIC_ERROR_CODES = [
   "p1143_step_fence_fixture_missing_steps", "p1143_fixture_requires_disposable_ci_services", "p1143_parent_did_not_suspend_without_lease",
   "p1143_root_graph_completion_unverified", "p1143_root_turn_did_not_complete_after_child_join", "p1143_root_turn_failed",
   "p1143_subagent_queue_unavailable", "p1143_crash_child_did_not_claim",
+  "child_resume_unavailable", "child_resume_evidence_unavailable", "child_resume_wait_step_lineage",
+  "child_children_pending_continuation_unavailable", "child_mailbox_continuation_unavailable",
+  "child_mailbox_continuation_checkpoint_unavailable", "child_mailbox_continuation_checkpoint_invalid",
+  "child_mailbox_continuation_unsupported", "child_turn_missing", "selected_job_context_unavailable",
+  "writer_dependency_unavailable", "selected_job_sources_unavailable", "selected_job_output_contract_unavailable",
+  "subagent_role_unknown",
 ] as const
 const SAFE_WAIT_RESUME_CODES = ["wait_invalid", "wait_scope_error", "wait_conflict", "other"] as const
 const SAFE_RECOVERY_STAGES = ["manager_recover", "dispatch"] as const
@@ -134,14 +146,14 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
           JOIN "agent_steps" step ON step."taskId" = task."id" AND step."sessionId" = task."sessionId" AND step."turnId" = task."turnId"
           WHERE task."sessionId" = $1 AND task."turnId" = $2 AND task."depth" = 1 AND task."role" = 'scout'
           ORDER BY task."id", step."ordinal" DESC) latest GROUP BY 1, 2 ORDER BY 1, 2`, [ids.sessionId, ids.turnId, SAFE_DIAGNOSTIC_ERROR_CODES]),
-      progressQuery<{ status: string; targetCount: string; suspended: boolean; count: number }>(`SELECT
+      progressQuery<{ status: string; targetCount: string; suspended: boolean; consumed: boolean; count: number }>(`SELECT
           CASE WHEN "status" IN ('waiting', 'ready', 'timed_out', 'interrupted', 'closed') THEN "status" ELSE 'other' END AS "status",
           CASE WHEN jsonb_typeof("targetTaskIds") <> 'array' THEN 'invalid'
             WHEN jsonb_array_length("targetTaskIds") = 0 THEN 'zero' WHEN jsonb_array_length("targetTaskIds") = 1 THEN 'one'
             WHEN jsonb_array_length("targetTaskIds") = 2 THEN 'two' ELSE 'other' END AS "targetCount",
-          ("suspendedAt" IS NOT NULL) AS "suspended", count(*)::int AS "count"
+          ("suspendedAt" IS NOT NULL) AS "suspended", ("consumedAt" IS NOT NULL) AS "consumed", count(*)::int AS "count"
         FROM "agent_wait_conditions" WHERE "sessionId" = $1 AND "turnId" = $2
-        GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`, [ids.sessionId, ids.turnId]),
+        GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4`, [ids.sessionId, ids.turnId]),
       progressQuery<{ toolName: string; itemType: string; itemStatus: string; outcomeStatus: string | null; errorCode: string | null; count: number }>(`SELECT
           CASE WHEN COALESCE(call."content"->>'toolName', item."content"->>'toolName') IN
             ('agent.plan', 'agent.wait', 'jobs.discover', 'scout.delegate', 'scout.results', 'jobs.get', 'wait_subagents')
@@ -168,8 +180,9 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       tier: depth === 1 ? "parent_scout" : depth === 2 ? "depth_two_scout" : "other_scout", status, failureCode,
       structuredFailureCategory, executorResultStatus, attemptCountMax, nextAttemptAtPresent, count,
     }))
-    const acknowledgement = await readWaitAcknowledgementDiagnostic(ids)
-    const sourceEventChain = await readSourceEventChainDiagnostic(ids)
+    const [acknowledgement, sourceEventChain, parentResumeProgress] = await Promise.all([
+      readWaitAcknowledgementDiagnostic(ids), readSourceEventChainDiagnostic(ids), readParentResumeProgressDiagnostic(ids),
+    ])
     return {
       observedPhases, fixtureFailure, waitResumeCommitFailures,
       turnStatus: turn.rows[0]?.status ?? "missing",
@@ -182,9 +195,94 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       toolOutcomes: tools.rows,
       waitAcknowledgement: acknowledgement,
       sourceEventChain,
+      parentResumeProgress,
     }
   } catch {
     return { observedPhases, fixtureFailure, waitResumeCommitFailures, databaseDiagnosticAvailable: false }
+  }
+}
+
+async function readParentResumeProgressDiagnostic(ids: FixtureIds) {
+  type ProgressRow = {
+    parentCount: number; parentStatus: string; parentAttemptClass: string; parentLeasePresent: boolean;
+    parentFailureCode: string | null; parentResultStatus: string; parentRetryDisposition: string | null;
+    structuredFailureCategory: string | null; waitCount: number; waitStatus: string;
+    waitConsumed: boolean; waitSuspended: boolean; sourceStepPresent: boolean;
+    sourceStepStatus: string; sourceStepScopeMatches: boolean; continuationStepCount: number;
+    latestContinuationStatus: string; latestParentStepStatus: string; latestParentStepErrorCode: string | null;
+    resumeStage: string;
+  }
+  try {
+    const result = await progressQuery<ProgressRow>(`WITH parent_rows AS (
+        SELECT task."id", task."status", task."attemptCount", task."leaseOwner", task."failureReason", task."result",
+          task."sessionId", task."turnId"
+        FROM "sub_agent_tasks" AS task
+        JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $1
+        WHERE task."sessionId" = $2 AND task."turnId" = $3 AND task."depth" = 1 AND task."role" = 'scout'
+      ), parent AS (
+        SELECT * FROM parent_rows ORDER BY "id" LIMIT 1
+      ), latest_wait AS (
+        SELECT wait.* FROM parent JOIN "agent_wait_conditions" AS wait
+          ON wait."parentTaskId" = parent."id" AND wait."sessionId" = parent."sessionId" AND wait."turnId" = parent."turnId"
+        ORDER BY wait."createdAt" DESC, wait."id" DESC LIMIT 1
+      ), source_step AS (
+        SELECT step."id", step."taskId", step."sessionId", step."turnId", step."attempt", step."ordinal", step."status"
+        FROM latest_wait AS wait JOIN "agent_steps" AS step ON step."id" = wait."stepId"
+      ), continuations AS (
+        SELECT step."id", step."ordinal", step."status" FROM parent JOIN latest_wait AS wait ON true
+        JOIN source_step AS source ON true
+        JOIN "agent_steps" AS step ON step."taskId" = parent."id" AND step."sessionId" = parent."sessionId"
+          AND step."turnId" = parent."turnId" AND step."attempt" = parent."attemptCount"
+          AND step."ordinal" > source."ordinal"
+        WHERE source."taskId" = parent."id" AND source."sessionId" = parent."sessionId" AND source."turnId" = parent."turnId"
+      ), latest_parent_step AS (
+        SELECT step."status", step."errorCode" FROM parent JOIN "agent_steps" AS step
+          ON step."taskId" = parent."id" AND step."sessionId" = parent."sessionId" AND step."turnId" = parent."turnId"
+          AND step."attempt" = parent."attemptCount"
+        ORDER BY step."ordinal" DESC, step."id" DESC LIMIT 1
+      )
+      SELECT (SELECT count(*)::int FROM parent_rows) AS "parentCount",
+        COALESCE((SELECT CASE WHEN "status" IN ('queued', 'running', 'retrying', 'waiting', 'waiting_for_user', 'completed', 'failed', 'interrupted', 'cancelled', 'closed')
+          THEN "status" ELSE 'other' END FROM parent), 'missing') AS "parentStatus",
+        COALESCE((SELECT CASE WHEN "attemptCount" > 1 THEN 'retried' ELSE 'first' END FROM parent), 'missing') AS "parentAttemptClass",
+        COALESCE((SELECT "leaseOwner" IS NOT NULL FROM parent), false) AS "parentLeasePresent",
+        (SELECT CASE WHEN "failureReason" IS NULL THEN NULL WHEN "failureReason" = ANY($4::text[])
+          THEN "failureReason" ELSE 'other' END FROM parent) AS "parentFailureCode",
+        COALESCE((SELECT CASE WHEN "result"->>'status' IN ('completed', 'failed') THEN "result"->>'status' ELSE 'other' END FROM parent), 'missing') AS "parentResultStatus",
+        (SELECT CASE WHEN "result"->>'retryDisposition' IN ('retryable', 'terminal') THEN "result"->>'retryDisposition' ELSE NULL END FROM parent) AS "parentRetryDisposition",
+        (SELECT CASE WHEN "result"->>'structuredOutputFailureCategory' IN
+            ('missing_final_output', 'result_too_large', 'result_shape_invalid', 'evidence_binding_invalid')
+          THEN "result"->>'structuredOutputFailureCategory' ELSE NULL END FROM parent) AS "structuredFailureCategory",
+        (SELECT count(*)::int FROM latest_wait) AS "waitCount",
+        COALESCE((SELECT CASE WHEN "status" IN ('waiting', 'ready', 'timed_out', 'interrupted', 'closed') THEN "status" ELSE 'other' END FROM latest_wait), 'missing') AS "waitStatus",
+        COALESCE((SELECT "consumedAt" IS NOT NULL FROM latest_wait), false) AS "waitConsumed",
+        COALESCE((SELECT "suspendedAt" IS NOT NULL FROM latest_wait), false) AS "waitSuspended",
+        EXISTS (SELECT 1 FROM source_step) AS "sourceStepPresent",
+        COALESCE((SELECT CASE WHEN "status" IN ('started', 'streaming', 'completed', 'failed', 'interrupted', 'waiting_for_tool', 'waiting_for_approval', 'waiting_for_user')
+          THEN "status" ELSE 'other' END FROM source_step), 'missing') AS "sourceStepStatus",
+        COALESCE((SELECT source."taskId" = parent."id" AND source."sessionId" = parent."sessionId" AND source."turnId" = parent."turnId"
+          FROM source_step AS source JOIN parent ON true), false) AS "sourceStepScopeMatches",
+        (SELECT count(*)::int FROM continuations) AS "continuationStepCount",
+        COALESCE((SELECT CASE WHEN "status" IN ('started', 'streaming', 'completed', 'failed', 'interrupted', 'waiting_for_tool', 'waiting_for_approval', 'waiting_for_user')
+          THEN "status" ELSE 'other' END FROM continuations ORDER BY "ordinal" DESC, "id" DESC LIMIT 1), 'missing') AS "latestContinuationStatus",
+        COALESCE((SELECT CASE WHEN "status" IN ('started', 'streaming', 'completed', 'failed', 'interrupted', 'waiting_for_tool', 'waiting_for_approval', 'waiting_for_user')
+          THEN "status" ELSE 'other' END FROM latest_parent_step), 'missing') AS "latestParentStepStatus",
+        (SELECT CASE WHEN "errorCode" IS NULL THEN NULL WHEN "errorCode" = ANY($4::text[]) THEN "errorCode" ELSE 'other' END FROM latest_parent_step) AS "latestParentStepErrorCode",
+        COALESCE((SELECT CASE
+          WHEN parent."status" = 'failed' AND wait."consumedAt" IS NOT NULL THEN 'parent_failed_after_consumption'
+          WHEN parent."status" = 'failed' AND wait."status" IN ('ready', 'timed_out') THEN 'parent_failed_before_consumption'
+          WHEN parent."status" = 'failed' AND wait."suspendedAt" IS NOT NULL THEN 'parent_failed_while_suspended'
+          WHEN wait."status" = 'waiting' AND wait."suspendedAt" IS NOT NULL THEN 'wait_suspended'
+          WHEN wait."status" IN ('ready', 'timed_out') AND wait."consumedAt" IS NULL THEN 'wait_ready_unconsumed'
+          WHEN wait."consumedAt" IS NOT NULL AND EXISTS (SELECT 1 FROM continuations) THEN 'continuation_started'
+          WHEN wait."consumedAt" IS NOT NULL THEN 'wait_consumed_no_continuation'
+          WHEN wait."status" IN ('interrupted', 'closed') THEN 'wait_terminal_without_consumption'
+          ELSE 'other' END FROM parent JOIN latest_wait AS wait ON true),
+          CASE WHEN EXISTS (SELECT 1 FROM parent) THEN 'wait_missing' ELSE 'parent_missing' END) AS "resumeStage"`,
+    [ids.userId, ids.sessionId, ids.turnId, SAFE_DIAGNOSTIC_ERROR_CODES])
+    return result.rows[0] ?? { available: false }
+  } catch {
+    return { available: false }
   }
 }
 

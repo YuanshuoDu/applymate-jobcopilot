@@ -100,8 +100,7 @@ async function rejectStepReplay(task, manager, callId, stepId) {
     if (error instanceof Error && error.message === "p1143_stale_step_was_accepted") throw error
     if (object(error)?.code !== "lost") throw error
   }
-  const after = await pool.query(`SELECT count(*) FROM "sub_agent_tasks" WHERE "parentTaskId" = $1`, [task.id])
-  if (before.rows[0]?.count !== after.rows[0]?.count) throw new Error("p1143_stale_step_created_child")
+  const after = await pool.query(`SELECT count(*) FROM "sub_agent_tasks" WHERE "parentTaskId" = $1`, [task.id]); if (before.rows[0]?.count !== after.rows[0]?.count) throw new Error("p1143_stale_step_created_child")
 }
 async function waitForTwoRunningChildren(task, markerState) {
   if (markerState.parallelObserved) return
@@ -113,10 +112,7 @@ async function waitForTwoRunningChildren(task, markerState) {
         AND sibling."taskType" = 'job_discovery' AND sibling."status" = 'running'
         AND NULLIF(btrim(sibling."leaseOwner"), '') IS NOT NULL AND sibling."leaseExpiresAt" > clock_timestamp()`,
       values: [task.parentTaskId, task.sessionId, task.turnId, task.rootTaskId], query_timeout: 1_000 })
-    if (result.rows[0]?.count === 2) {
-      if (!markerState.parallelObserved) { markerState.parallelObserved = true; say("P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL") }
-      return
-    }
+    if (result.rows[0]?.count === 2) { markerState.parallelObserved = true; say("P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL"); return }
     await new Promise(resolve => setTimeout(resolve, 25))
   }
   throw new Error("p1143_children_did_not_overlap_in_running_state")
@@ -126,6 +122,7 @@ function childModelRuntime({ task, runtime, markerState }) {
   const discoverCall = `p1143-discover:${task.id}`, delegateOne = `p1143-delegate-alpha:${task.id}`
   const delegateTwo = `p1143-delegate-beta:${task.id}`, resultsCall = `p1143-results:${task.id}`
   return { id: `p1143-${task.depth}-${task.id}`, profile, async *stream(request) {
+    if (task.depth === 1) { say("P1143_PARENT_MODEL_STREAM_ENTERED"); if (mode === "resume") say(task.attemptCount > 1 ? "P1143_PARENT_RESUME_MODEL_RETRIED" : "P1143_PARENT_RESUME_MODEL_FIRST_ATTEMPT") }
     if (task.depth === 2) {
       if (mode === "resume" && task.attemptCount === 2) say("P1143_CHILD_SCOUT_RECLAIMED")
       await waitForTwoRunningChildren(task, markerState)
@@ -201,10 +198,14 @@ function childModelRuntime({ task, runtime, markerState }) {
     }
     if (betaResult.isError) throw new Error("p1143_beta_delegate_failed")
     const delegateResults = [alphaResult.output, betaResult.output], childIds = delegateResults.map(value => object(value)?.taskId).filter(id => typeof id === "string")
-    const waitInput = findUniqueWaitInput(request, childIds)
-    const waitResult = waitInput ? findExactToolResult(request, { name: "wait_subagents", input: waitInput }) : null
+    const waitInput = findUniqueWaitInput(request, childIds), waitResult = waitInput ? findExactToolResult(request, { name: "wait_subagents", input: waitInput }) : null
     if (waitResult?.isError) throw new Error("p1143_parent_wait_failed")
     const waitOutput = object(waitResult?.output), terminalWaitMatch = hasTerminalWaitOutcome(waitOutput, childIds)
+    if (task.depth === 1 && mode === "resume") {
+      say(waitInput ? "P1143_PARENT_RESUME_WAIT_INPUT_PRESENT" : "P1143_PARENT_RESUME_WAIT_INPUT_MISSING"); say(waitResult ? "P1143_PARENT_RESUME_WAIT_RESULT_PRESENT" : "P1143_PARENT_RESUME_WAIT_RESULT_MISSING")
+      const status = ["ready", "timed_out", "waiting", "failed"].includes(waitOutput?.status) ? waitOutput.status : "other"
+      say(`P1143_PARENT_RESUME_WAIT_CONTEXT_${status.toUpperCase()}`)
+    }
     const joined = outputFor(request, "scout.results", {}), issueScoutResults = terminalWaitMatch && !joined
     reportParentJoinState({ delegateResultCount: delegateResults.filter(Boolean).length, childIdCount: childIds.length, waitResultPresent: waitResult !== null, terminalWaitMatch, scoutResultsIssued: issueScoutResults })
     if (issueScoutResults) {
