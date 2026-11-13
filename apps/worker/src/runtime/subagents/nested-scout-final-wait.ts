@@ -62,7 +62,7 @@ async function readCurrentChildren(pool: Pick<pg.Pool, "connect">, input: Prepar
         step."taskId" AS "stepTaskId", step."sessionId" AS "stepSessionId", step."turnId" AS "stepTurnId", step."attempt" AS "stepAttempt",
         session."id" AS "sessionId", session."userId" AS "sessionUserId", session."status" AS "sessionStatus",
         turn."id" AS "turnId", turn."sessionId" AS "turnSessionId", turn."rootTaskId" AS "turnRootTaskId",
-        parent."id" AS "parentId", parent."userId" AS "parentUserId", parent."sessionId" AS "parentSessionId", parent."turnId" AS "parentTurnId",
+        parent."id" AS "parentId", session."userId" AS "parentUserId", parent."sessionId" AS "parentSessionId", parent."turnId" AS "parentTurnId",
         parent."rootTaskId" AS "parentRootTaskId", parent."parentTaskId" AS "parentTaskId", parent."depth" AS "parentDepth",
         parent."path" AS "parentPath", parent."role" AS "parentRole", parent."taskType" AS "parentTaskType", parent."context" AS "parentContext",
         parent."status" AS "parentStatus", parent."leaseOwner" AS "parentLeaseOwner", parent."attemptCount" AS "parentAttemptCount",
@@ -73,18 +73,22 @@ async function readCurrentChildren(pool: Pick<pg.Pool, "connect">, input: Prepar
       WHERE step."id" = $1 AND step."ordinal" = $2 AND step."status" = 'streaming' AND step."taskId" = $3
         AND step."sessionId" = $4 AND step."turnId" = $5 AND step."attempt" = $6
         AND session."userId" = $7 AND session."status" NOT IN ('aborted', 'archived')
-        AND turn."rootTaskId" = $8 AND parent."userId" = $7 AND parent."rootTaskId" = $8 AND parent."parentTaskId" = $8
+        AND turn."rootTaskId" = $8 AND parent."rootTaskId" = $8 AND parent."parentTaskId" = $8
         AND parent."depth" = 1 AND parent."role" = 'scout' AND parent."taskType" = 'job_discovery'
         AND parent."status" = 'running' AND parent."leaseOwner" = $9 AND parent."attemptCount" = $6
         AND parent."interruptRequestedAt" IS NULL AND parent."leaseExpiresAt" > clock_timestamp()`,
     [input.step.id, input.step.ordinal, lease.id, lease.sessionId, lease.turnId, lease.attemptCount, lease.userId, lease.rootTaskId, lease.ownerId])
     const row = owner.rows[0]
     if (!row || !validOwnerRow(row, input, lease)) throw new Error("nested_scout_final_wait_owner_unavailable")
-    const result = await client.query<WaitRow>(`SELECT child."id" AS "taskId", child."userId", child."sessionId", child."turnId",
+    const result = await client.query<WaitRow>(`SELECT child."id" AS "taskId", childSession."userId" AS "userId", child."sessionId", child."turnId",
         child."rootTaskId", child."parentTaskId", child."depth", child."path", child."status", child."role", child."taskType", child."context",
         parent."path" AS "parentPath"
       FROM "sub_agent_tasks" child JOIN "sub_agent_tasks" parent ON parent."id" = child."parentTaskId"
-      WHERE child."parentTaskId" = $1 ORDER BY child."createdAt", child."id" LIMIT 3`, [lease.id])
+      JOIN "agent_sessions" childSession ON childSession."id" = child."sessionId"
+      WHERE child."parentTaskId" = $1 AND childSession."userId" = $2 AND child."sessionId" = $3
+        AND child."turnId" = $4 AND child."rootTaskId" = $5 AND child."depth" = 2
+        AND parent."sessionId" = $3 AND parent."turnId" = $4 AND parent."rootTaskId" = $5 AND parent."depth" = 1
+      ORDER BY child."createdAt", child."id" LIMIT 3`, [lease.id, lease.userId, lease.sessionId, lease.turnId, lease.rootTaskId])
     if (result.rows.length > 2) throw new Error("nested_scout_final_wait_children_invalid")
     const children = result.rows.map(child => readChildRow(child, lease))
     await client.query("COMMIT"); transaction = false

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs"
 import { describe, expect, it, vi } from "vitest"
 import type { PrepareFinalDependencyWaitInput } from "../turns/turn-execution-options.js"
 import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
@@ -49,11 +50,14 @@ const ownerRow = () => ({ stepId: "step-1", stepOrdinal: 2, stepStatus: "streami
 const childRow = (overrides: Record<string, unknown> = {}) => ({ taskId: "child-a", userId: "user-1", sessionId: "session-1", turnId: "turn-1",
   rootTaskId: "root-task", parentTaskId: "parent-task", depth: 2, path: "/root-task/parent-task/child-a", parentPath: "/root-task/parent-task",
   status: "running", role: "scout", taskType: "job_discovery", context: child("child-a").context, ...overrides })
-function poolFixture(options: { ownerRows?: Record<string, unknown>[]; childRows?: Record<string, unknown>[]; failChildren?: boolean } = {}) {
+function poolFixture(options: { ownerRows?: Record<string, unknown>[]; childRows?: Record<string, unknown>[]; failChildren?: boolean; subAgentTaskHasUserId?: boolean } = {}) {
   const sequence: string[] = []
   const client = {
-    query: vi.fn(async (sql: string) => {
+    query: vi.fn(async (sql: string, _params?: readonly unknown[]) => {
       sequence.push(sql)
+      if (options.subAgentTaskHasUserId === false && /\b(parent|child)\."userId"/.test(sql)) {
+        throw Object.assign(new Error('column "userId" does not exist'), { code: "42703" })
+      }
       if (sql.includes("FROM \"agent_steps\" step")) return { rows: options.ownerRows ?? [ownerRow()], rowCount: (options.ownerRows ?? [ownerRow()]).length }
       if (sql.includes("FROM \"sub_agent_tasks\" child")) {
         if (options.failChildren) throw new Error("private database detail")
@@ -130,6 +134,17 @@ describe("nested Scout final dependency wait", () => {
     expect(fixture.client.query.mock.calls.map(([sql]) => sql).join("\n")).toContain('parent."leaseExpiresAt" > clock_timestamp()')
     expect(fixture.client.query.mock.calls.at(-1)?.[0]).toBe("COMMIT")
     expect(fixture.sequence.at(-1)).toBe("RELEASE")
+  })
+
+  it("reads owner and child rows using the columns present in the Prisma schema", async () => {
+    const schema = readFileSync(new URL("../../../../../apps/web/prisma/schema.prisma", import.meta.url), "utf8")
+    const taskModel = schema.match(/model SubAgentTask\s*\{([\s\S]*?)^\}/m)?.[1]
+    expect(taskModel).toBeDefined()
+    const hasUserIdColumn = (taskModel ?? "").split(/\r?\n/).some(line => /^\s*userId\s+/.test(line))
+    expect(hasUserIdColumn).toBe(false)
+
+    const fixture = poolFixture({ subAgentTaskHasUserId: hasUserIdColumn })
+    await expect(createNestedScoutFinalWait({ pool: fixture.pool, lease })(waitInput())).resolves.toEqual({ taskIds: ["child-a"] })
   })
 
   it("fails closed on stale Step ownership and always rolls back before release", async () => {

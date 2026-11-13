@@ -4,6 +4,7 @@ import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
 import { createProductionChildExecutor } from "./production-child-runtime.ts"
 import { createProductionWorkerBootstrap } from "../../queue/production-bootstrap.ts"
+import { createSubagentQueue } from "../../queue/subagent-queue.ts"
 import { enqueueTurn } from "../turns/turn-queue.ts"
 import { createNestedScoutFixtureScripts } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 
@@ -54,7 +55,11 @@ async function start(mode) {
     modelRuntimeFactory: input => childModelRuntime({ ...input, runtime, markerState }) })
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 100,
     waitResolver: { intervalMs: 20, ownerId: `${ownerId}-wait-resolver` },
-    subagents: { intervalMs: 20, execute: executeChild } })
+    subagents: { intervalMs: 20, execute: executeChild, queueFactory: options => {
+      const consumer = createSubagentQueue(options)
+      consumer.worker.concurrency = mode === "park" ? 1 : 2
+      return consumer
+    } } })
   if (mode === "park") {
     const { enqueueTurn } = await import("../turns/turn-queue.ts")
     await enqueueTurn(pool, bootstrap.turns.queue, { turnId: ids.turnId, sessionId: ids.sessionId, ownerId })

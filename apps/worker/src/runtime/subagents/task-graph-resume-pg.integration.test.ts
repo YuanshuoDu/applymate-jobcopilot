@@ -5591,8 +5591,12 @@ async function processRestartFailureDiagnostic(
     restartRuntimeStateDiagnostics(pool, turnId),
     agentPlanLifecycleDiagnostics(pool, turnId, "p3-process-restart-follow-up-plan"),
   ])
-  const childOutcome = latestProcessFixtureJsonDiagnostic(workerOutput, "P3_CHILD_OUTCOME ", PROCESS_RESTART_CHILD_OUTCOME_DIAGNOSTIC_FIELDS)
-  const childException = latestProcessFixtureJsonDiagnostic(workerOutput, "P3_CHILD_EXCEPTION ", PROCESS_RESTART_CHILD_EXCEPTION_DIAGNOSTIC_FIELDS)
+  const childOutcome = latestProcessFixtureJsonDiagnostic(
+    workerOutput, "P3_CHILD_OUTCOME ", PROCESS_RESTART_CHILD_OUTCOME_DIAGNOSTIC_FIELDS, true,
+  )
+  const childException = latestProcessFixtureJsonDiagnostic(
+    workerOutput, "P3_CHILD_EXCEPTION ", PROCESS_RESTART_CHILD_EXCEPTION_DIAGNOSTIC_FIELDS, true,
+  )
   return {
     rootStage: latestProcessFixtureStage(workerOutput, [
       ["P3_SECOND_WORKER_READY ", "worker_ready"],
@@ -5634,6 +5638,14 @@ const PROCESS_RESTART_CHILD_EXCEPTION_DIAGNOSTIC_FIELDS = {
   errorName: new Set(["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "AbortError", "TimeoutError", "other"]),
   failureCode: new Set(["invalid_structured_result", "model_incomplete", "invalid_output", "tool_execution_failed", "timeout", "cancelled", "step_limit", "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "final_unverified", "child_turn_missing", "child_resume_unavailable", "child_resume_evidence_unavailable", "selected_job_sources_unavailable", "selected_job_context_unavailable", "subagent_role_unknown", "database_deadlock", "database_serialization", "fixture_error", "other"]),
 }
+const PROCESS_RESTART_CHILD_LEASE_SCOPE_PHASES = new Set([
+  "dispatch_context", "source_wait_state", "source_dispatch_state", "source_lookup", "source_verification",
+  "source_completion", "dependent_dispatch", "dependency_context", "follow_up_context", "child_outcome",
+  "child_exception", "diagnostic_limit_reached",
+])
+const PROCESS_RESTART_CHILD_LEASE_SCOPE_BOOLEAN_FIELDS = [
+  "leaseUserMatchesFixture", "leaseSessionMatchesFixture", "leaseTurnMatchesFixture",
+] as const
 
 const PROCESS_RESTART_VERIFIER_EVIDENCE_PREFIX = "P3_RESTART_VERIFIER_EVIDENCE_DIAGNOSTIC "
 const PROCESS_RESTART_VERIFIER_EVIDENCE_ROLES = new Set(["scout", "analyst", "other"])
@@ -5765,7 +5777,7 @@ function processChildRuntimeScopeDiagnostics(output: readonly string[]): RecordV
 }
 
 function latestProcessFixtureJsonDiagnostic(
-  output: readonly string[], prefix: string, fields: Readonly<Record<string, ReadonlySet<string>>>,
+  output: readonly string[], prefix: string, fields: Readonly<Record<string, ReadonlySet<string>>>, includeChildLeaseScope = false,
 ): RecordValue | null {
   const line = [...output].reverse().find(value => value.startsWith(prefix))
   const raw = line ? diagnosticJsonRecord(line.slice(prefix.length)) : null
@@ -5774,6 +5786,12 @@ function latestProcessFixtureJsonDiagnostic(
   for (const [field, allowed] of Object.entries(fields)) result[field] = diagnosticEnum(raw[field], allowed) ?? "other"
   if (Object.hasOwn(raw, "hasResult")) result.hasResult = raw.hasResult === true
   if (Object.hasOwn(raw, "hasStructuredResult")) result.hasStructuredResult = raw.hasStructuredResult === true
+  if (includeChildLeaseScope) {
+    result.phase = diagnosticEnum(raw.phase, PROCESS_RESTART_CHILD_LEASE_SCOPE_PHASES) ?? "other"
+    for (const field of PROCESS_RESTART_CHILD_LEASE_SCOPE_BOOLEAN_FIELDS) {
+      result[field] = typeof raw[field] === "boolean" ? raw[field] : null
+    }
+  }
   return result
 }
 
@@ -6543,22 +6561,28 @@ async function restartFollowUpWaitDiagnostics(
 describe("compact TaskGraph wait failure diagnostics", () => {
   it("projects restart child markers through the safe diagnostic allowlists", () => {
     const outcome = latestProcessFixtureJsonDiagnostic([
-      `P3_CHILD_OUTCOME ${JSON.stringify({ role: "analyst", status: "failed", failureCode: "invalid_output", resultStatus: "missing", hasResult: false, hasStructuredResult: false, prompt: "private" })}`,
-    ], "P3_CHILD_OUTCOME ", PROCESS_RESTART_CHILD_OUTCOME_DIAGNOSTIC_FIELDS)
+      `P3_CHILD_OUTCOME ${JSON.stringify({ role: "analyst", status: "failed", failureCode: "invalid_output", resultStatus: "missing", hasResult: false, hasStructuredResult: false, phase: "child_outcome", leaseUserMatchesFixture: true, leaseSessionMatchesFixture: false, leaseTurnMatchesFixture: true, taskId: "private task", prompt: "private" })}`,
+    ], "P3_CHILD_OUTCOME ", PROCESS_RESTART_CHILD_OUTCOME_DIAGNOSTIC_FIELDS, true)
     const exception = latestProcessFixtureJsonDiagnostic([
-      `P3_CHILD_EXCEPTION ${JSON.stringify({ role: "analyst", stage: "execute_child", errorName: "TypeError", failureCode: "other", message: "private provider response" })}`,
-    ], "P3_CHILD_EXCEPTION ", PROCESS_RESTART_CHILD_EXCEPTION_DIAGNOSTIC_FIELDS)
+      `P3_CHILD_EXCEPTION ${JSON.stringify({ role: "analyst", stage: "execute_child", errorName: "TypeError", failureCode: "other", phase: "raw owner text", leaseUserMatchesFixture: "true", leaseSessionMatchesFixture: null, leaseTurnMatchesFixture: false, userId: "private user", message: "private provider response" })}`,
+    ], "P3_CHILD_EXCEPTION ", PROCESS_RESTART_CHILD_EXCEPTION_DIAGNOSTIC_FIELDS, true)
     const knownFailure = latestProcessFixtureJsonDiagnostic([
       `P3_CHILD_EXCEPTION ${JSON.stringify({ role: "analyst", stage: "execute_child", errorName: "Error", failureCode: "child_resume_unavailable" })}`,
     ], "P3_CHILD_EXCEPTION ", PROCESS_RESTART_CHILD_EXCEPTION_DIAGNOSTIC_FIELDS)
 
     expect(outcome).toEqual({
       role: "analyst", status: "failed", failureCode: "invalid_output", resultStatus: "missing",
-      hasResult: false, hasStructuredResult: false,
+      hasResult: false, hasStructuredResult: false, phase: "child_outcome",
+      leaseUserMatchesFixture: true, leaseSessionMatchesFixture: false, leaseTurnMatchesFixture: true,
     })
-    expect(exception).toEqual({ role: "analyst", stage: "execute_child", errorName: "TypeError", failureCode: "other" })
+    expect(exception).toEqual({
+      role: "analyst", stage: "execute_child", errorName: "TypeError", failureCode: "other", phase: "other",
+      leaseUserMatchesFixture: null, leaseSessionMatchesFixture: null, leaseTurnMatchesFixture: false,
+    })
     expect(knownFailure).toEqual({ role: "analyst", stage: "execute_child", errorName: "Error", failureCode: "child_resume_unavailable" })
     expect(JSON.stringify({ outcome, exception, knownFailure })).not.toContain("private")
+    expect(JSON.stringify({ outcome, exception, knownFailure })).not.toContain("userId")
+    expect(JSON.stringify({ outcome, exception, knownFailure })).not.toContain("taskId")
   })
 
   it("projects child runtime scope markers to bounded booleans and counts", () => {
