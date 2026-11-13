@@ -164,6 +164,10 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
     expires: '2099-01-01T00:00:00.000Z',
   }))
   await page.route('**/api/me', route => json(route, { id: 'agent-supervisor-fixture', email: 'fixture@applymate.local', name: 'Fixture', plan: 'pro', onboardedAt: times.created }))
+  await page.route('**/api/me/agent-search-footprint-memory', route => {
+    if (route.request().method() === 'GET') return json(route, { enabled: false, version: 0 })
+    return json(route, { error: 'method_not_allowed' }, 405)
+  })
   await page.route('**/api/me/agent-task-history-memory', async route => {
     if (route.request().method() === 'GET') return json(route, fixture.historyMemoryConsent)
     if (route.request().method() !== 'POST') return json(route, { error: 'method_not_allowed' }, 405)
@@ -206,6 +210,12 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
   await page.route('**/api/agent', route => json(route, { autoApply: false, requireApproval: true, isRunning: false }))
   await page.route('**/api/agent/roles', route => json(route, []))
   await page.route('**/api/agent/roles/custom', route => json(route, []))
+  await page.route(/\/api\/agent\/objective-start-attempts(?:\?.*)?$/, route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    headers: { 'Cache-Control': 'private, no-store', 'X-Account-Scope': 'fixture-agent-account-scope' },
+    body: JSON.stringify({ accountScope: 'fixture-agent-account-scope', attempts: [] }),
+  }))
   await page.route('**/api/agent/automations', route => json(route, { automations: [] }))
   await page.route('**/api/agent/health', route => json(route, { successRate: 100, captchaRate: 0, avgDurationMs: 1200, patternCacheRate: 100, last24hRuns: 1 }))
   await page.route('**/api/notifications**', route => json(route, { notifications: [], unreadCount: 0 }))

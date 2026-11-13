@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { createHash } from "node:crypto"
+import { taskRecoveryAccountScope } from "@/lib/agent/control-plane/commands/objective-start-attempt-read-model"
 
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
@@ -6,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   findFirst: vi.fn(),
   updateMany: vi.fn(),
   create: vi.fn(),
+  createMany: vi.fn(),
+  findUnique: vi.fn(),
 }))
 
 vi.mock("@/lib/api-helpers", () => ({
@@ -22,6 +26,8 @@ vi.mock("@/lib/db", () => ({
       findFirst: mocks.findFirst,
       updateMany: mocks.updateMany,
       create: mocks.create,
+      createMany: mocks.createMany,
+      findUnique: mocks.findUnique,
     },
   },
 }))
@@ -30,9 +36,10 @@ function getRequest() {
   return new Request("http://localhost/api/agent/sessions")
 }
 
-function postRequest(body: unknown) {
+function postRequest(body: unknown, headers: Record<string, string> = {}) {
   return new Request("http://localhost/api/agent/sessions", {
     method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
   })
 }
@@ -45,13 +52,15 @@ describe("agent sessions API", () => {
     mocks.findFirst.mockReset()
     mocks.updateMany.mockReset()
     mocks.create.mockReset()
+    mocks.createMany.mockReset().mockResolvedValue({ count: 1 })
+    mocks.findUnique.mockReset().mockResolvedValue(null)
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.findMany.mockResolvedValue([])
     mocks.updateMany.mockResolvedValue({ count: 0 })
     mocks.findFirst.mockResolvedValue(null)
   })
 
-  it("lists sessions and limits stale cleanup to legacy chats without canonical Turns", async () => {
+  it("lists sessions and exempts only explicit pending chats from stale cleanup", async () => {
     const rows = [
       {
         id: "session_1",
@@ -136,6 +145,7 @@ describe("agent sessions API", () => {
         approvals: { none: { status: "pending" } },
         tasks: { none: { status: { in: ["queued", "running", "retrying", "waiting_for_user"] } } },
         turns: { none: {} },
+        OR: [{ creationIdempotencyKey: null }, { tasks: { some: {} } }],
       },
       data: { status: "completed", completedAt: expect.any(Date) },
     })
@@ -187,6 +197,7 @@ describe("agent sessions API", () => {
     const res = await POST(postRequest({ goal: "  Create Berlin SWE automation  " }) as never)
 
     expect(res.status).toBe(201)
+    expect(res.headers.get("X-Account-Scope")).toBeNull()
     await expect(res.json()).resolves.toEqual({
       session: {
         id: "session_1",
@@ -212,6 +223,44 @@ describe("agent sessions API", () => {
     })
   })
 
+  it("creates a keyed recoverable session only for the authenticated account scope and echoes that scope", async () => {
+    const scope = taskRecoveryAccountScope("user_1")
+    const requestHash = createHash("sha256").update(JSON.stringify({
+      userId: "user_1", goal: "Create a task", source: "chat", status: "running", memorySummary: "",
+    })).digest("hex")
+    mocks.createMany.mockResolvedValueOnce({ count: 1 })
+    mocks.findUnique.mockResolvedValueOnce({
+      id: "session_1", goal: "Create a task", status: "running", source: "chat", memorySummary: "",
+      qualityScore: null, currentTaskId: null, createdAt: new Date("2026-06-18T08:00:00Z"),
+      updatedAt: new Date("2026-06-18T08:00:00Z"), completedAt: null,
+      creationIdempotencyRequestHash: requestHash,
+    })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest({ goal: "Create a task" }, {
+      "Idempotency-Key": "recoverable-create-1", "X-Expected-Account-Scope": scope,
+    }) as never)
+
+    expect(res.status).toBe(201)
+    expect(res.headers.get("X-Account-Scope")).toBe(scope)
+    expect(res.headers.get("Cache-Control")).toBe("private, no-store")
+    expect(mocks.createMany).toHaveBeenCalledWith({
+      data: expect.objectContaining({ userId: "user_1", goal: "Create a task", creationIdempotencyKey: "recoverable-create-1" }),
+      skipDuplicates: true,
+    })
+  })
+
+  it("rejects an account scope mismatch before session creation", async () => {
+    const { POST } = await import("./route")
+    const res = await POST(postRequest({ goal: "Create a task" }, { "X-Expected-Account-Scope": "b".repeat(64) }) as never)
+
+    expect(res.status).toBe(409)
+    expect(res.headers.get("X-Account-Scope")).toBe(taskRecoveryAccountScope("user_1"))
+    await expect(res.json()).resolves.toEqual({ error: "Task recovery account scope changed" })
+    expect(mocks.create).not.toHaveBeenCalled()
+    expect(mocks.createMany).not.toHaveBeenCalled()
+  })
+
   it("rejects session creation without a goal", async () => {
     const { POST } = await import("./route")
 
@@ -220,6 +269,33 @@ describe("agent sessions API", () => {
     expect(res.status).toBe(400)
     await expect(res.json()).resolves.toEqual({ error: "Session goal is required" })
     expect(mocks.create).not.toHaveBeenCalled()
+  })
+
+  it("rejects an oversized session idempotency key before writing", async () => {
+    const { POST } = await import("./route")
+    const res = await POST(postRequest({ goal: "Create a task" }, { "Idempotency-Key": "x".repeat(129) }) as never)
+
+    expect(res.status).toBe(400)
+    await expect(res.json()).resolves.toEqual({ error: "Idempotency-Key must contain 1 to 128 visible ASCII characters" })
+    expect(mocks.createMany).not.toHaveBeenCalled()
+  })
+
+  it("returns conflict when an authenticated key is reused with a different request", async () => {
+    mocks.createMany.mockResolvedValueOnce({ count: 0 })
+    mocks.findUnique.mockResolvedValueOnce({ creationIdempotencyRequestHash: "different-request" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest({ goal: "Create a task" }, { "Idempotency-Key": "attempt-1" }) as never)
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toEqual({ error: "Idempotency-Key was already used for a different session request" })
+    expect(mocks.createMany).toHaveBeenCalledWith({
+      data: expect.objectContaining({ userId: "user_1", goal: "Create a task", creationIdempotencyKey: "attempt-1" }),
+      skipDuplicates: true,
+    })
+    expect(mocks.findUnique).toHaveBeenCalledWith({
+      where: { userId_creationIdempotencyKey: { userId: "user_1", creationIdempotencyKey: "attempt-1" } },
+    })
   })
 
   it("returns auth errors without querying sessions", async () => {

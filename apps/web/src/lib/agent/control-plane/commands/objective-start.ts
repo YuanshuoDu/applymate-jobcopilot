@@ -2,13 +2,12 @@ import type { PrismaClient } from "@prisma/client"
 import { InputContentPartSchema, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, validate } from "@jobcopilot/agent-protocol"
 
 import { invalidCommand, isUniqueViolation, objectiveStartStateConflict, retryActiveConflict } from "./errors"
-import { duplicateCommandResult } from "./agent-command-service"
 import { lockOwnedSessionForObjectiveReplacement } from "./session-control"
+import { lockObjectiveStartAttempt, lookupAttemptForStart, objectiveStartRequestHash, recordAcceptedObjectiveStart } from "./objective-start-attempt-ledger"
 import {
   acceptInputFacts,
   createRootTurn,
   findActiveTurn,
-  findExistingCommand,
   type CommandTransaction,
 } from "./transaction"
 import {
@@ -62,10 +61,30 @@ function hasBoundedContent(value: unknown): value is ObjectiveStartCommand["cont
 }
 
 async function startOnce(command: ObjectiveStartCommand, db: PrismaClient): Promise<ObjectiveStartResult> {
+  const requestHash = objectiveStartRequestHash(command)
   return db.$transaction(async (tx) => {
+    await lockObjectiveStartAttempt(tx, command.userId, command.clientMessageId)
+    const existingAttempt = await lookupAttemptForStart(tx, command, requestHash)
+    if (existingAttempt) {
+      return {
+        inputId: existingAttempt.inputId,
+        turnId: existingAttempt.turnId,
+        sequence: existingAttempt.sequence,
+        disposition: "duplicate",
+        originalDisposition: "started",
+      }
+    }
     const status = await lockOwnedSessionForObjectiveReplacement(tx, command.sessionId, command.userId)
-    const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
-    if (existing) return { ...await duplicateCommandResult(tx, command, existing, "follow_up"), disposition: "duplicate" }
+    const racedAttempt = await lookupAttemptForStart(tx, command, requestHash)
+    if (racedAttempt) {
+      return {
+        inputId: racedAttempt.inputId,
+        turnId: racedAttempt.turnId,
+        sequence: racedAttempt.sequence,
+        disposition: "duplicate",
+        originalDisposition: "started",
+      }
+    }
     if (status !== "running") throw objectiveStartStateConflict(status)
 
     const active = await findActiveTurn(tx, command.sessionId, command.userId)
@@ -75,6 +94,7 @@ async function startOnce(command: ObjectiveStartCommand, db: PrismaClient): Prom
       tx, command, command.content, command.objective, undefined, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, command.verificationRequirements,
     )
     const facts = await acceptInputFacts(tx, command, command.content, turn, "follow_up", "started", true)
+    await recordAcceptedObjectiveStart(tx, command, requestHash, { sessionId: command.sessionId, ...facts })
     return { ...facts, disposition: "started" }
   })
 }

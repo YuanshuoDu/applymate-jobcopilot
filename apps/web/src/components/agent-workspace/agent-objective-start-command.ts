@@ -15,8 +15,6 @@ export interface ObjectiveStartResult {
 }
 
 interface ObjectiveStartAttempt extends ObjectiveContextDraft {
-  readonly objectiveDraft: string
-  readonly contextDraft: string
   readonly clientMessageId: string
 }
 
@@ -50,22 +48,25 @@ export function validateObjectiveContextDraft(draft: ObjectiveContextDraft): Obj
   return { objective, context }
 }
 
-/** Coordinates explicit retries without creating a second Session or root. */
+/** Reuses the known Session and request identity for explicit in-memory retries. */
 export class AgentObjectiveStartCoordinator {
   private sessionId: string | null = null
+  private targetKey: string | null = null
   private attempt: ObjectiveStartAttempt | null = null
+  private attemptIdentityKey: string | null = null
   private inFlight: Promise<ObjectiveStartResult> | null = null
-  private accepted: ObjectiveStartResult | null = null
+  private inFlightIdentityKey: string | null = null
+  private accepted: { readonly identityKey: string; readonly result: ObjectiveStartResult } | null = null
 
   constructor(
     private readonly fetcher: typeof fetch = fetch,
     private readonly makeClientMessageId: () => string = newClientMessageId,
   ) {}
 
-  start(objectiveDraft: string, contextDraft: string): Promise<ObjectiveStartResult> {
-    if (this.inFlight) return this.inFlight
-    if (this.accepted) return Promise.resolve(this.accepted)
-
+  start(objectiveDraft: string, contextDraft: string, selectedSessionId?: string): Promise<ObjectiveStartResult> {
+    if (selectedSessionId !== undefined && !isIdentifier(selectedSessionId)) {
+      return Promise.reject(invalidInput("Selected Session ID is invalid"))
+    }
     let draft: ObjectiveContextDraft
     try {
       draft = validateObjectiveContextDraft({ objective: objectiveDraft, context: contextDraft })
@@ -73,47 +74,85 @@ export class AgentObjectiveStartCoordinator {
       return Promise.reject(error)
     }
 
-    if (!this.attempt || this.attempt.objectiveDraft !== objectiveDraft || this.attempt.contextDraft !== contextDraft) {
-      this.attempt = { ...draft, objectiveDraft, contextDraft, clientMessageId: this.makeClientMessageId() }
+    const targetKey = selectedSessionId === undefined || (this.targetKey === "new-session" && selectedSessionId === this.sessionId)
+      ? "new-session" : `session:${selectedSessionId}`
+    const identityKey = objectiveStartIdentity(targetKey, draft)
+    if (this.inFlight) {
+      if (this.inFlightIdentityKey === identityKey) return this.inFlight
+      return Promise.reject(new ObjectiveStartCommandError(
+        409, "objective_start_in_progress", "An objective start is already in progress for a different task or Session",
+      ))
+    }
+    if (this.targetKey !== targetKey) {
+      this.targetKey = targetKey
+      this.sessionId = selectedSessionId ?? null
+      this.attempt = null
+      this.attemptIdentityKey = null
+      this.accepted = null
+    }
+    if (this.accepted?.identityKey === identityKey) return Promise.resolve(this.accepted.result)
+    this.accepted = null
+
+    if (!this.attempt || this.attemptIdentityKey !== identityKey) {
+      this.attempt = { ...draft, clientMessageId: this.makeClientMessageId() }
+      this.attemptIdentityKey = identityKey
     }
     const attempt = this.attempt
-    const operation = this.admit(attempt)
+    const operation = this.admit(attempt, identityKey)
     this.inFlight = operation
+    this.inFlightIdentityKey = identityKey
     void operation.then(
-      () => { if (this.inFlight === operation) this.inFlight = null },
-      () => { if (this.inFlight === operation) this.inFlight = null },
+      () => {
+        if (this.inFlight === operation) {
+          this.inFlight = null
+          this.inFlightIdentityKey = null
+        }
+      },
+      () => {
+        if (this.inFlight === operation) {
+          this.inFlight = null
+          this.inFlightIdentityKey = null
+        }
+      },
     )
     return operation
   }
 
   draftEdited(): void {
-    if (this.inFlight || this.accepted) return
-    this.attempt = null
+    // The normalized payload passed to start() determines whether this is a new attempt.
   }
 
   discard(): void {
     if (this.inFlight) return
     this.sessionId = null
+    this.targetKey = null
     this.attempt = null
+    this.attemptIdentityKey = null
+    this.inFlightIdentityKey = null
     this.accepted = null
   }
 
-  private async admit(attempt: ObjectiveStartAttempt): Promise<ObjectiveStartResult> {
-    if (!this.sessionId) this.sessionId = await createObjectiveSession(attempt.objective, this.fetcher)
+  private async admit(attempt: ObjectiveStartAttempt, identityKey: string): Promise<ObjectiveStartResult> {
+    if (!this.sessionId) this.sessionId = await createObjectiveSession(attempt, this.fetcher)
     const sessionId = this.sessionId
     if (!sessionId) throw new ObjectiveStartCommandError(502, "invalid_session_response", "Session creation returned no usable Session ID")
     const result = await startAgentObjective(sessionId, attempt, this.fetcher)
-    this.accepted = { ...result, sessionId, objective: attempt.objective }
-    return this.accepted
+    const accepted = { ...result, sessionId, objective: attempt.objective }
+    this.accepted = { identityKey, result: accepted }
+    return accepted
   }
 }
 
-async function createObjectiveSession(objective: string, fetcher: typeof fetch): Promise<string> {
+function objectiveStartIdentity(targetKey: string, draft: ObjectiveContextDraft): string {
+  return JSON.stringify([targetKey, draft.objective, draft.context])
+}
+
+async function createObjectiveSession(attempt: ObjectiveStartAttempt, fetcher: typeof fetch): Promise<string> {
   const response = await fetcher("/api/agent/sessions", {
     method: "POST",
     credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ goal: objective }),
+    headers: { "Content-Type": "application/json", "Idempotency-Key": attempt.clientMessageId },
+    body: JSON.stringify({ goal: attempt.objective }),
   })
   const body: unknown = await response.json().catch(() => null)
   if (!response.ok) throw responseError(response.status, body, "Session creation failed")

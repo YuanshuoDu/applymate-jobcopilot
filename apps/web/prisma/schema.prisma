@@ -77,6 +77,8 @@ model User {
   preferences      Json? // { targetRoles, targetLocations, salaryExpectation, workAuthorization, openToRelocation, aiSettings }
   agentTaskHistoryMemoryEnabled        Boolean @default(false)
   agentTaskHistoryMemoryConsentVersion Int     @default(0)
+  agentSearchFootprintMemoryEnabled        Boolean @default(false)
+  agentSearchFootprintMemoryConsentVersion Int     @default(0)
   personaFields    Json? // PersonaField[] �?learned answers from form fills
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
@@ -105,6 +107,7 @@ model User {
   agentActionReservations     AgentActionReservation[]
   agentTurns                  AgentTurn[]
   agentInputs                 AgentInput[]
+  agentObjectiveStartAttempts AgentObjectiveStartAttempt[]
   applicationTasks            ApplicationTask[]
   formPatterns                FormPattern[]
   agentAutomations            AgentAutomation[]
@@ -1924,6 +1927,10 @@ model AgentSession {
   status        String
   source        String
   memorySummary String    @default("") @db.Text
+  searchFootprintMemoryEnabledAtCreation        Boolean @default(false)
+  searchFootprintMemoryConsentVersionAtCreation Int     @default(0)
+  creationIdempotencyKey String? @db.VarChar(128)
+  creationIdempotencyRequestHash String? @db.VarChar(64)
   qualityScore  Float?
   currentTaskId String?
   lastViewedAt  DateTime?
@@ -1961,6 +1968,7 @@ model AgentSession {
   @@index([userId, lastViewedAt(sort: Desc)])
   @@index([userId, status])
   @@unique([id, userId])
+  @@unique([userId, creationIdempotencyKey])
   @@map("agent_sessions")
 }
 
@@ -2131,9 +2139,36 @@ model AgentInput {
   consumedByStep AgentStep?   @relation("AgentStepConsumedInputs", fields: [consumedByStepId], references: [id], onDelete: SetNull)
 
   @@unique([sessionId, clientMessageId])
+  @@index([userId, clientMessageId])
   @@index([sessionId, status, acceptedSequence])
   @@index([targetTurnId, status, acceptedSequence])
   @@map("agent_inputs")
+}
+
+enum AgentObjectiveStartAttemptStatus {
+  accepted
+  abandoned
+
+  @@map("agent_objective_start_attempt_status")
+}
+
+model AgentObjectiveStartAttempt {
+  userId           String
+  clientMessageId  String                              @db.VarChar(256)
+  status           AgentObjectiveStartAttemptStatus
+  sessionId        String?
+  requestHash      String?                             @db.VarChar(64)
+  inputId          String?
+  turnId           String?
+  acceptedSequence BigInt?
+  createdAt        DateTime                            @default(now()) @db.Timestamp(3)
+  updatedAt        DateTime                            @default(now()) @updatedAt @db.Timestamp(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, clientMessageId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("agent_objective_start_attempts")
 }
 
 model AgentItem {
