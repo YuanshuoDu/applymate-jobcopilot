@@ -69,6 +69,8 @@ import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
+const ANALYST_WAIT_DIAGNOSTIC_CHECKOUT_TIMEOUT_MS = 500
+const ANALYST_WAIT_DIAGNOSTIC_QUERY_TIMEOUT_MS = 750
 const PLAN_CALL_ID = "p3-resume-plan"
 const WAIT_CALL_ID = "p3-resume-wait"
 const DISCOVERY_RESTART_WAIT_CALL_ID = "p3-process-restart-discovery-wait-call"
@@ -6159,13 +6161,104 @@ function analystWaitDiagRecordLease(state: AnalystWaitDiagState, lease: Subagent
   state.leaseObservations.push(analystWaitDiagObserveLease(lease, fixtureValue))
 }
 
-async function analystWaitDiagRecordHelperExit(
+function analystWaitDiagUnavailableRootTurn(): RecordValue {
+  return {
+    rootTurnRead: "unavailable", rootTurnStatus: "unknown",
+    rootTurnLeaseOwnerPresent: null, rootTurnRootMatchesFixture: null,
+  }
+}
+
+function analystWaitDiagQuery<Row extends QueryResultRow>(
+  client: PoolClient,
+  text: string,
+  values: unknown[],
+): Promise<QueryResult<Row>> {
+  // node-postgres honors this per-query timeout; the outer deadline also destroys a client if it stalls.
+  const config: QueryConfig<unknown[]> & { query_timeout: number } = {
+    text, values, query_timeout: ANALYST_WAIT_DIAGNOSTIC_QUERY_TIMEOUT_MS,
+  }
+  return client.query<Row, unknown[]>(config)
+}
+
+async function analystWaitDiagReadRootTurn(
+  pool: Pool,
+  turnId: string,
+  context: AnalystWaitDiagContext,
+): Promise<RecordValue> {
+  try {
+    const checkoutPromise = pool.connect()
+    let checkoutTimer: ReturnType<typeof setTimeout> | undefined
+    const checkout = await Promise.race([
+      checkoutPromise.then(client => ({ kind: "connected" as const, client }), () => ({ kind: "failed" as const })),
+      new Promise<{ kind: "timeout" }>(resolve => {
+        checkoutTimer = setTimeout(() => resolve({ kind: "timeout" }), ANALYST_WAIT_DIAGNOSTIC_CHECKOUT_TIMEOUT_MS)
+      }),
+    ])
+    if (checkoutTimer) clearTimeout(checkoutTimer)
+    if (checkout.kind === "timeout") {
+      void checkoutPromise.then(client => { try { client.release() } catch { /* bounded diagnostic cleanup */ } }, () => undefined)
+      return analystWaitDiagUnavailableRootTurn()
+    }
+    if (checkout.kind === "failed") return analystWaitDiagUnavailableRootTurn()
+
+    const client = checkout.client
+    let released = false
+    const release = (error?: Error): boolean => {
+      if (released) return true
+      released = true
+      try { client.release(error); return true } catch { return false }
+    }
+    try {
+      const queryPromise = analystWaitDiagQuery<{
+        status: string
+        leaseOwnerId: string | null
+        rootTaskId: string | null
+      }>(client,
+        `SELECT "status", "leaseOwnerId", "rootTaskId" FROM "agent_turns"
+         WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 LIMIT 1`,
+        [turnId, context.sessionId, context.userId],
+      )
+      let queryTimer: ReturnType<typeof setTimeout> | undefined
+      const query = await Promise.race([
+        queryPromise.then(result => ({ kind: "read" as const, result }), () => ({ kind: "failed" as const })),
+        new Promise<{ kind: "timeout" }>(resolve => {
+          queryTimer = setTimeout(() => resolve({ kind: "timeout" }), ANALYST_WAIT_DIAGNOSTIC_QUERY_TIMEOUT_MS)
+        }),
+      ])
+      if (queryTimer) clearTimeout(queryTimer)
+      if (query.kind === "timeout") {
+        release(new Error("bounded Analyst wait diagnostic query timeout"))
+        return analystWaitDiagUnavailableRootTurn()
+      }
+      if (query.kind === "failed") {
+        release(new Error("bounded Analyst wait diagnostic query failed"))
+        return analystWaitDiagUnavailableRootTurn()
+      }
+      if (!release()) return analystWaitDiagUnavailableRootTurn()
+      const turn = query.result.rows[0]
+      return {
+        rootTurnRead: turn ? "read" : "missing",
+        rootTurnStatus: turn ? diagnosticEnum(turn.status, TURN_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+        rootTurnLeaseOwnerPresent: turn ? turn.leaseOwnerId !== null : null,
+        rootTurnRootMatchesFixture: turn && context.state.expectedRootTaskId
+          ? turn.rootTaskId === context.state.expectedRootTaskId : null,
+      }
+    } catch {
+      release(new Error("bounded Analyst wait diagnostic query failed"))
+      return analystWaitDiagUnavailableRootTurn()
+    }
+  } catch {
+    return analystWaitDiagUnavailableRootTurn()
+  }
+}
+
+function analystWaitDiagRecordHelperExit(
   pool: Pool,
   turnId: string,
   context: AnalystWaitDiagContext,
   row: AnalystWaitDiagWaitRow | undefined,
   outcome: "suspended" | "ready_before_suspend" | "timed_out",
-): Promise<void> {
+): Promise<void> | undefined {
   const state = context.state
   state.helperExits = analystWaitDiagIncrement(state.helperExits)
   const projection: RecordValue = {
@@ -6179,28 +6272,30 @@ async function analystWaitDiagRecordHelperExit(
     waitParentMatchesRoot: row && state.expectedRootTaskId ? row.parentTaskId === state.expectedRootTaskId : null,
     leaseScope: context.leaseScope,
   }
+  if (outcome === "suspended") {
+    projection.rootTurnRead = "not_sampled_on_success"
+    projection.rootTurnStatus = "not_sampled"
+    projection.rootTurnLeaseOwnerPresent = null
+    projection.rootTurnRootMatchesFixture = null
+    state.lastHelperExit = projection
+    return
+  }
   if (state.rootTurnStateReads >= 16) {
     projection.rootTurnRead = "limit_reached"
+    projection.rootTurnStatus = "unknown"
+    projection.rootTurnLeaseOwnerPresent = null
+    projection.rootTurnRootMatchesFixture = null
     state.lastHelperExit = projection
     return
   }
   state.rootTurnStateReads = analystWaitDiagIncrement(state.rootTurnStateReads)
-  try {
-    const result = await pool.query<{ status: string; leaseOwnerId: string | null; rootTaskId: string | null }>(
-      `SELECT "status", "leaseOwnerId", "rootTaskId" FROM "agent_turns"
-       WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 LIMIT 1`,
-      [turnId, context.sessionId, context.userId],
-    )
-    const turn = result.rows[0]
-    projection.rootTurnRead = turn ? "read" : "missing"
-    projection.rootTurnStatus = turn ? diagnosticEnum(turn.status, TURN_DIAGNOSTIC_STATUSES) ?? "other" : "missing"
-    projection.rootTurnLeaseOwnerPresent = turn ? turn.leaseOwnerId !== null : null
-    projection.rootTurnRootMatchesFixture = turn && state.expectedRootTaskId
-      ? turn.rootTaskId === state.expectedRootTaskId : null
-  } catch {
-    projection.rootTurnRead = "query_failed"
-  }
-  state.lastHelperExit = projection
+  return analystWaitDiagReadRootTurn(pool, turnId, context).then(rootTurn => {
+    Object.assign(projection, rootTurn)
+    state.lastHelperExit = projection
+  }, () => {
+    Object.assign(projection, analystWaitDiagUnavailableRootTurn())
+    state.lastHelperExit = projection
+  })
 }
 
 function analystWaitDiagProjection(state: AnalystWaitDiagState): RecordValue {
@@ -6263,16 +6358,25 @@ async function waitForPersistedTaskWait(
       row = result.rows[0]
     }
     if (row?.status === "waiting" && row.suspendedAt instanceof Date) {
-      if (analystWaitDiag) await analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "suspended")
+      if (analystWaitDiag) {
+        const diagnostic = analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "suspended")
+        if (diagnostic) await diagnostic
+      }
       return { id: row.id }
     }
     if (row?.status === "ready") {
-      if (analystWaitDiag) await analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "ready_before_suspend")
+      if (analystWaitDiag) {
+        const diagnostic = analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "ready_before_suspend")
+        if (diagnostic) await diagnostic
+      }
       throw new Error("Follow-up child completed before its durable parent wait suspended")
     }
     await new Promise(resolve => setTimeout(resolve, 20))
   }
-  if (analystWaitDiag) await analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "timed_out")
+  if (analystWaitDiag) {
+    const diagnostic = analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "timed_out")
+    if (diagnostic) await diagnostic
+  }
   const diagnostics = diagnosticToolCallId
     ? `; state=${await persistedWaitTimeoutDiagnostics(pool, turnId, idempotencyKey, diagnosticToolCallId, diagnosticFixtureCounters)}`
     : ""
