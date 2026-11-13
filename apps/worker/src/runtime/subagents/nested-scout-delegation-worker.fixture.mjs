@@ -85,6 +85,7 @@ async function rootCompleted() {
   const deadline = Date.now() + 250_000
   while (Date.now() < deadline) {
     const turn = await pool.query(`SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [ids.turnId, ids.sessionId])
+    if (turn.rows[0]?.status === "failed") throw new Error("p1143_root_turn_failed")
     if (turn.rows[0]?.status !== "completed") { await sleep(100); continue }
     const latest = await pool.query(`SELECT "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
       AND "type" = 'task_graph' ORDER BY "revision" DESC LIMIT 1`, [ids.sessionId, ids.turnId])
