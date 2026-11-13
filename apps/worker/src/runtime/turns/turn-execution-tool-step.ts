@@ -1,68 +1,69 @@
-import type { TurnExecutionOptions } from "./turn-execution-options.js"
-import type { TurnBudgetLedger } from "../budget.js"
-import { assertExecutionAlive, updateExecutionStep } from "./turn-engine-helpers.js"
-import { publishCommentary, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { executeTools } from "./turn-execution-tools.js"
+import { type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
+import { updateExecutionStep, assertExecutionAlive } from "./turn-engine-helpers.js"
+import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { ModelStepResult } from "./turn-engine-model.js"
-import type { TurnEngineResult, TurnEngineStep } from "./turn-engine-types.js"
-import type { StepContextSnapshot } from "../context/step-context-builder.js"
-import type { SteeringMarkerPayload } from "../context/steering-marker.js"
+import type { TurnExecutionOptions } from "./turn-execution-types.js"
 
-export type TurnExecutionToolStepResult = Readonly<{
-  wait: TurnEngineResult | null
-  snapshot: StepContextSnapshot
-  steeringMarkerState: { readonly active: readonly SteeringMarkerPayload[] } | undefined
-}>
+type ToolOutcome = Awaited<ReturnType<typeof executeTools>>
+type MarkerState = TurnExecutionOptions["steeringMarkerState"]
 
-export async function executeTurnExecutionToolStep(input: Readonly<{
+export type TurnExecutionToolStepResult =
+  | Readonly<{ kind: "question_wait"; wait: TurnEngineResult }>
+  | Readonly<{ kind: "settled"; wait: TurnEngineResult | null }>
+
+export async function executeTurnToolStep(input: {
   options: TurnExecutionOptions
-  executionOptions: TurnExecutionOptions
+  executeOptions: TurnExecutionOptions
   writer: TurnExecutionEventWriter
   step: TurnEngineStep
   output: ModelStepResult
-  snapshot: StepContextSnapshot
+  snapshot: TurnExecutionOptions["snapshot"]
   seenCallIds: Set<string>
   signal: AbortSignal
   now: () => Date
-  steeringMarkerState: { readonly active: readonly SteeringMarkerPayload[] } | undefined
-  budget: TurnBudgetLedger
-  questionIntent: boolean
-  commentaryText: string | null
-  onToolCallsAccounted: (count: number) => void
-  onStepClosed: () => void
-}>): Promise<TurnExecutionToolStepResult> {
-  const { options, executionOptions, writer, step, output, signal, now, budget } = input
-  budget.reserveToolCalls(output.toolCalls.length)
-  if (input.commentaryText) await publishCommentary(writer, options, step, input.commentaryText, now)
+  steeringMarkerState: MarkerState
+  questionIntentCallId: string | null
+  closedSteps: Set<string>
+  excludedToolCallIds: Set<string>
+  resetContinuation: () => void
+  onToolCallsSettled: (persistedToolCallCount: number) => void
+  onOutcome: (outcome: ToolOutcome) => void
+  runTools?: typeof executeTools
+}): Promise<TurnExecutionToolStepResult> {
   let persistedToolCallCount = 0
-  let outcome: Awaited<ReturnType<typeof executeTools>>
+  let outcome: ToolOutcome
   try {
-    outcome = await executeTools(executionOptions, writer, step, output, input.snapshot, input.seenCallIds,
-      signal, now, input.steeringMarkerState, () => { persistedToolCallCount += 1 })
+    outcome = await (input.runTools ?? executeTools)(
+      input.executeOptions, input.writer, input.step, input.output, input.snapshot, input.seenCallIds, input.signal,
+      input.now, input.steeringMarkerState, () => { persistedToolCallCount += 1 }, input.excludedToolCallIds,
+    )
   } finally {
-    budget.accountToolCalls(output.toolCalls.length)
-    input.onToolCallsAccounted(persistedToolCallCount)
+    input.onToolCallsSettled(persistedToolCallCount)
   }
-  if (input.questionIntent && outcome.wait?.status === "waiting_for_user") {
-    input.onStepClosed()
-    return { wait: outcome.wait, snapshot: outcome.snapshot, steeringMarkerState: outcome.steeringMarkerState }
+  input.onOutcome(outcome)
+  if (input.questionIntentCallId && outcome.wait?.status === "waiting_for_user") {
+    input.closedSteps.add(input.step.id)
+    return { kind: "question_wait", wait: outcome.wait }
   }
-  assertExecutionAlive(options, signal)
+  // Tool results are server-owned context; do not reuse a provider cursor across this boundary.
+  input.resetContinuation()
+  assertExecutionAlive(input.options, input.signal)
   const wait = outcome.wait
   const stepStatus = wait?.status === "waiting_for_dependency"
     ? "waiting_for_tool"
     : wait?.status === "waiting_for_approval" || wait?.status === "waiting_for_user" ? wait.status : "completed"
-  await updateExecutionStep(options, {
-    stepId: step.id, status: stepStatus, finishReason: output.finishReason, errorCode: wait?.errorCode ?? null,
-    inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
-    estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now(),
+  await updateExecutionStep(input.options, {
+    stepId: input.step.id, status: stepStatus, finishReason: input.output.finishReason, errorCode: wait?.errorCode ?? null,
+    inputTokens: input.output.usage?.inputTokens ?? 0, outputTokens: input.output.usage?.outputTokens ?? 0,
+    estimatedCostUsd: input.output.usage?.estimatedCostUsd ?? 0, now: input.now(),
   })
-  await writer.append(
-    "step.completed", step.id, null,
-    { stepId: step.id, status: wait?.status ?? "completed", toolCallCount: output.toolCalls.length, taskId: options.identity.taskId },
-    `step-completed:${step.id}`,
+  await input.writer.append(
+    "step.completed", input.step.id, null,
+    { stepId: input.step.id, status: wait?.status ?? "completed", toolCallCount: input.output.toolCalls.length, taskId: input.options.identity.taskId },
+    "step-completed:" + input.step.id,
   )
-  input.onStepClosed()
-  if (wait?.status === "waiting_for_user") await options.store.waitForUser?.({ identity: options.identity, now: now() })
-  return { wait, snapshot: outcome.snapshot, steeringMarkerState: outcome.steeringMarkerState }
+  input.closedSteps.add(input.step.id)
+  if (wait?.status === "waiting_for_user") await input.options.store.waitForUser?.({ identity: input.options.identity, now: input.now() })
+  return { kind: "settled", wait }
 }

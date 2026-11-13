@@ -702,17 +702,59 @@ async function waitForExpiredCrashLease(ids: FixtureIds, parentTaskId: string, c
         child."leaseExpiresAt" <= clock_timestamp() AS "expired", parent."status" AS "parentStatus",
         EXISTS (SELECT 1 FROM "agent_wait_conditions" AS wait WHERE wait."parentTaskId" = parent."id"
           AND wait."sessionId" = child."sessionId" AND wait."turnId" = child."turnId"
-          AND wait."status" = 'waiting' AND wait."suspendedAt" IS NOT NULL) AS "suspendedWaitPresent"
+          AND wait."status" IN ('waiting', 'timed_out') AND wait."suspendedAt" IS NOT NULL) AS "suspendedWaitPresent"
       FROM "sub_agent_tasks" AS child JOIN "sub_agent_tasks" AS parent ON parent."id" = child."parentTaskId"
         AND parent."sessionId" = child."sessionId" AND parent."turnId" = child."turnId"
       WHERE child."id" = $1 AND child."sessionId" = $2 AND parent."id" = $3 AND child."depth" = 2
         AND child."role" = 'scout' AND child."taskType" = 'job_discovery'`, [childTaskId, ids.sessionId, parentTaskId])
     const row = result.rows[0]
     if (row?.status === "running" && row.leaseOwner === ownerId && row.attemptCount === 1
-      && row.expired && row.parentStatus === "waiting" && row.suspendedWaitPresent) return
+      && row.expired && ["waiting", "queued"].includes(row.parentStatus) && row.suspendedWaitPresent) return
     await new Promise(resolve => setTimeout(resolve, 50))
   }
-  throw new Error("Nested Scout child lease did not expire while parent durable wait remained suspended")
+  throw new Error("Nested Scout child lease did not expire while its durable wait remained suspended")
+}
+
+async function expireSuspendedWait(ids: FixtureIds, parentTaskId: string): Promise<void> {
+  const expired = await progressQuery<{ id: string }>(`UPDATE "agent_wait_conditions" SET "deadlineAt" = clock_timestamp() - interval '1 millisecond',
+      "updatedAt" = clock_timestamp()
+    WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3 AND "status" = 'waiting'
+      AND "suspendedAt" IS NOT NULL AND "consumedAt" IS NULL RETURNING "id"`, [ids.sessionId, ids.turnId, parentTaskId])
+  if (expired.rowCount === 1) return
+  const existing = await progressQuery<{ status: string; consumedAt: Date | null }>(`SELECT "status", "consumedAt" FROM "agent_wait_conditions"
+    WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3 AND "suspendedAt" IS NOT NULL
+    ORDER BY "createdAt" DESC LIMIT 1`, [ids.sessionId, ids.turnId, parentTaskId])
+  if (existing.rows[0]?.status !== "timed_out" || existing.rows[0]?.consumedAt !== null) throw new Error("Expected one suspended wait to expire")
+}
+
+async function waitForTimedOutParentWait(ids: FixtureIds, parentTaskId: string, waitId: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const result = await progressQuery<{ status: string; parentStatus: string }>(`SELECT wait."status", parent."status" AS "parentStatus"
+      FROM "agent_wait_conditions" wait JOIN "sub_agent_tasks" parent ON parent."id" = wait."parentTaskId"
+        AND parent."sessionId" = wait."sessionId" AND parent."turnId" = wait."turnId"
+      WHERE wait."id" = $1 AND wait."sessionId" = $2 AND wait."turnId" = $3 AND wait."parentTaskId" = $4
+        AND wait."suspendedAt" IS NOT NULL`, [waitId, ids.sessionId, ids.turnId, parentTaskId])
+    if (result.rows[0]?.status === "timed_out" && result.rows[0]?.parentStatus === "queued") return
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  throw new Error("Suspended child wait did not time out and queue its parent")
+}
+
+async function waitForFinalWaitAfterTimeout(ids: FixtureIds, parentTaskId: string, initialWaitId: string, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const result = await progressQuery<{ id: string; status: string; stepId: string; idempotencyKey: string; targetTaskIds: unknown;
+      suspendedAt: Date | null; consumedAt: Date | null }>(`SELECT "id", "status", "stepId", "idempotencyKey", "targetTaskIds", "suspendedAt", "consumedAt"
+      FROM "agent_wait_conditions" WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3
+      ORDER BY "createdAt", "id"`, [ids.sessionId, ids.turnId, parentTaskId])
+    const oldWait = result.rows.find(row => row.id === initialWaitId)
+    const nextWait = result.rows.find(row => row.id !== initialWaitId)
+    if (result.rows.length >= 2 && oldWait?.status === "timed_out" && oldWait.consumedAt instanceof Date
+      && nextWait?.suspendedAt instanceof Date && ["waiting", "ready"].includes(nextWait.status)) return result.rows
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  throw new Error("Resumed parent did not register a second suspended final wait")
 }
 
 async function waitForReclaimedCrashChild(ids: FixtureIds, childTaskId: string, previousOwnerId: string, timeoutMs: number): Promise<string> {
@@ -838,14 +880,15 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       expect(nested.rows.every(row => row.status === "queued" && row.attemptCount === 0)).toBe(true)
       const expectedJobByChild = new Map(nested.rows.map(row => [row.id, row.goal.includes("Alpha") ? ids.alphaJobId : ids.betaJobId] as const))
       const initialAttempts = new Map(nested.rows.map(row => [row.id, row.attemptCount] as const))
-      const wait = await pool.query<{ status: string; suspendedAt: Date | null; targetTaskIds: unknown }>(
-        `SELECT "status", "suspendedAt", "targetTaskIds" FROM "agent_wait_conditions"
+      const wait = await pool.query<{ id: string; status: string; stepId: string; idempotencyKey: string; suspendedAt: Date | null; targetTaskIds: unknown }>(
+        `SELECT "id", "status", "stepId", "idempotencyKey", "suspendedAt", "targetTaskIds" FROM "agent_wait_conditions"
          WHERE "turnId" = $1 AND "parentTaskId" = $2 ORDER BY "createdAt" DESC LIMIT 1`, [ids.turnId, parent.rows[0]!.id])
       expect(wait.rows).toHaveLength(1)
       expect(wait.rows[0]?.status).toBe("waiting")
       expect(wait.rows[0]?.suspendedAt).toBeInstanceOf(Date)
       const targets = Array.isArray(wait.rows[0]?.targetTaskIds) ? wait.rows[0]!.targetTaskIds as string[] : []
       expect([...targets].sort()).toEqual(nested.rows.map(row => row.id).sort())
+      const initialWaitId = wait.rows[0]!.id
       const premature = await pool.query(`SELECT 1 FROM "agent_events" WHERE "sessionId" = $1 AND "taskId" = $2 AND "type" = 'task.completed'`,
         [ids.sessionId, parent.rows[0]!.id])
       expect(premature.rowCount).toBe(0)
@@ -874,6 +917,8 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
         WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "type" = 'model.started'`,
       [ids.sessionId, ids.turnId, crashedChild.id])
       expect(modelStartsBeforeCrash.rows[0]?.count).toBe(0)
+      await expireSuspendedWait(ids, parent.rows[0]!.id)
+      await waitForTimedOutParentWait(ids, parent.rows[0]!.id, initialWaitId, 30_000)
       await killAndWait(crashing.child)
       crashing = undefined
       await waitForExpiredCrashLease(ids, parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!, 30_000)
@@ -881,6 +926,7 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       await waitForMainMarker(ids, restarted, "P1143_RECOVERY_DEPTH2_QUEUED", 30_000)
       await waitForMainMarker(ids, restarted, "P1143_CHILD_SCOUT_RECLAIMED", 30_000)
       const reclaimedOwner = await waitForReclaimedCrashChild(ids, crashedChild.id, crashedChild.leaseOwner!, 30_000)
+      const resumedWaits = await waitForFinalWaitAfterTimeout(ids, parent.rows[0]!.id, initialWaitId, 60_000)
       await waitForMainMarker(ids, restarted, "P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL", 240_000)
       await waitForMainMarker(ids, restarted, "P1143_ROOT_GRAPH_COMPLETED", 240_000)
 
@@ -896,6 +942,18 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       expect(finalChildren.rows.every(row => row.status === "completed")).toBe(true)
       expect(finalChildren.rows.every(row => row.attemptCount > initialAttempts.get(row.id)!)).toBe(true)
       expect(finalChildren.rows.find(row => row.id === crashedChild.id)?.attemptCount).toBe(2)
+      const waitHistory = await pool.query<{ id: string; status: string; stepId: string; idempotencyKey: string;
+        targetTaskIds: unknown; suspendedAt: Date | null; consumedAt: Date | null }>(`SELECT "id", "status", "stepId", "idempotencyKey", "targetTaskIds", "suspendedAt", "consumedAt"
+        FROM "agent_wait_conditions" WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3 ORDER BY "createdAt", "id"`,
+      [ids.sessionId, ids.turnId, parent.rows[0]!.id])
+      expect(resumedWaits).toHaveLength(2)
+      expect(waitHistory.rows).toHaveLength(2)
+      expect(waitHistory.rows.map(row => row.status)).toEqual(["timed_out", "ready"])
+      expect(waitHistory.rows.every(row => row.suspendedAt instanceof Date && row.consumedAt instanceof Date)).toBe(true)
+      expect(new Set(waitHistory.rows.map(row => row.stepId)).size).toBe(2)
+      expect(new Set(waitHistory.rows.map(row => row.idempotencyKey)).size).toBe(2)
+      expect(waitHistory.rows.map(row => row.targetTaskIds).map(value => Array.isArray(value) ? [...value].sort() : []))
+        .toEqual([targets.sort(), targets.sort()])
       const reclaimedDispatch = await pool.query<{ ownerId: string | null; attemptCount: number; publishedAt: Date | null }>(
         `SELECT "payload"->>'ownerId' AS "ownerId", "attemptCount", "publishedAt" FROM "agent_outbox"
          WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,

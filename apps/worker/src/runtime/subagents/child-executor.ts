@@ -1,5 +1,6 @@
 import type { ModelAdapter } from "@jobcopilot/agent-model"
-import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
+import { loadWorkerAiConfig } from "@jobcopilot/shared/llm"
+import { applyChildModelProfileSnapshot } from "./child-model-config-snapshot.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { getSubagentRolePolicy } from "./role-policy.js"
@@ -22,7 +23,7 @@ import type { DiscoveryAttemptSidecar } from "./child-discovery-attempt.js"
 import type { DiscoveryRecoverySnapshot } from "./task-graph-discovery-recovery-contract.js"
 import { SubagentLeaseError, type SubagentContinuation, type SubagentExecutionResult, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
-import { childWaitReplayExecutionOptions, childWaitResumeCursorIsValid, createChildDurableWaitReplay } from "./child-durable-wait-replay.js"
+import { childWaitReplayExecutionOptions, childWaitResumeCursorIsValid, createChildDurableWaitReplay, isServerGeneratedFinalDependencyWait } from "./child-durable-wait-replay.js"
 import type { TurnResumeState } from "../turns/turn-engine-types.js"
 import { createToolRouterExecutor } from "../turns/turn-engine-helpers.js"
 import { runTurnExecutionLoop } from "../turns/turn-execution-loop.js"
@@ -53,19 +54,8 @@ export type ChildExecutorOptions = {
 }
 
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
-function configWithSnapshot(config: AiConfig, snapshot: unknown): AiConfig {
-  const value = record(snapshot)
-  const provider = value.provider
-  const model = value.model
-  return {
-    ...config,
-    ...(typeof provider === "string" ? { provider: provider as AiConfig["provider"] } : {}),
-    ...(typeof model === "string" && model.trim() ? { model } : {}),
-  }
-}
-
 async function defaultModel(task: SubagentTaskRecord): Promise<ModelAdapter> {
-  const config = configWithSnapshot(await loadWorkerAiConfig(task.userId), task.modelProfileSnapshot)
+  const config = applyChildModelProfileSnapshot(await loadWorkerAiConfig(task.userId), task.modelProfileSnapshot)
   return (await createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false })).adapter
 }
 
@@ -175,7 +165,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       observedEvidence, privateCallIds,
     })
     const executeTool: typeof routedTool = async input => {
-      const replayedWait = durableWaitReplay?.execute(input)
+      const replayedWait = isServerGeneratedFinalDependencyWait(input) ? undefined : durableWaitReplay?.execute(input)
       if (replayedWait) return replayedWait
       if (selectedJobPreparation && isSelectedJobReadTool(input.call.toolName)) privateCallIds.add(input.call.id)
       const toolResult = await dispatchTool(input)

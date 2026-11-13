@@ -1,59 +1,113 @@
 import { describe, expect, it, vi } from "vitest"
-import { createTurnBudgetLedger } from "../budget.js"
-import type { TurnExecutionOptions } from "./turn-execution-options.js"
-import { TurnExecutionEventWriter } from "./turn-execution-events.js"
-import type { TurnEngineToolResult } from "./turn-engine-types.js"
-import { executeTurnExecutionToolStep } from "./turn-execution-tool-step.js"
+import type { TurnEngineResult, TurnEngineStep } from "./turn-engine-types.js"
+import type { ModelStepResult } from "./turn-engine-model.js"
+import type { TurnExecutionOptions } from "./turn-execution-types.js"
+import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
+import { executeTools } from "./turn-execution-tools.js"
+import { executeTurnToolStep } from "./turn-execution-tool-step.js"
 
-describe("turn execution tool step closure", () => {
-  it("uses the ordinary wait tool result, accounts its budget, and closes the waiting step once", async () => {
-    const identity = { kind: "task" as const, userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "parent-1",
-      rootTaskId: "root-1", ownerId: "worker-1", attemptCount: 1, leaseExpiresAt: new Date("2026-11-13T12:00:00Z") }
-    const childId = "subagent-00000000-0000-4000-8000-000000000001"
-    const waitOutput = {
-      waitId: "00000000-0000-4000-8000-000000000002", status: "waiting", taskIds: [childId],
-      deadlineAt: "2026-11-13T12:00:30.000Z", matchedTaskIds: [],
-      tasks: [{ taskId: childId, status: "running", role: "scout", result: null, failureReason: null }],
-    }
-    const events: string[] = [], stepUpdates: unknown[] = [], createdItems: string[] = []
-    const options = {
-      identity, scope: { userId: identity.userId }, goal: "inspect the child result",
-      snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
-      contextBuilder: { build: vi.fn() }, model: {}, tools: [{ name: "wait_subagents", version: "1" }],
-      executeTool: vi.fn(async ({ call }: { call: { id: string; toolName: string } }): Promise<TurnEngineToolResult> => ({
-        id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed", output: waitOutput, errorCode: null,
-      })),
-      store: {
-        appendEvent: vi.fn(async ({ id, type }: { id: string; type: string }) => { events.push(type); return { id } }),
-        createItem: vi.fn(async ({ itemId }: { itemId: string }) => { createdItems.push(itemId); return { id: itemId, revision: 0 } }),
-        updateItem: vi.fn(async ({ itemId, expectedRevision }: { itemId: string; expectedRevision: number }) => ({ id: itemId, revision: expectedRevision + 1 })),
-        updateStep: vi.fn(async input => { stepUpdates.push(input) }),
-      },
-      idFactory: (prefix: string) => prefix,
-    } as unknown as TurnExecutionOptions
-    const output = {
-      text: "", reasoningSummary: "", toolCalls: [{ id: "runtime-wait", name: "wait_subagents", arguments: {
-        idempotencyKey: "runtime-wait-key", taskIds: [childId], mode: "all", timeoutMs: 30_000,
-      } }], provider: "runtime", model: "runtime", finishReason: "stop" as const, usage: null, continuation: null,
-    }
-    const budget = createTurnBudgetLedger({ maxToolCalls: 1 })
-    const closed = vi.fn(), accounted = vi.fn()
-    const result = await executeTurnExecutionToolStep({
-      options, executionOptions: options, writer: new TurnExecutionEventWriter(options), step: { id: "step-1", ordinal: 1 }, output,
-      snapshot: options.snapshot, seenCallIds: new Set(), signal: new AbortController().signal,
-      now: () => new Date("2026-11-13T12:00:00Z"), steeringMarkerState: undefined, budget,
-      questionIntent: false, commentaryText: null, onToolCallsAccounted: accounted, onStepClosed: closed,
-    })
+const identity = {
+  kind: "task" as const, userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "task-1",
+  rootTaskId: "root-1", ownerId: "worker-1", attemptCount: 2, leaseExpiresAt: new Date("2026-10-01T00:00:00.000Z"),
+}
+const step: TurnEngineStep = { id: "step-1", ordinal: 1 }
+const output: ModelStepResult = {
+  text: "", reasoningSummary: "", toolCalls: [{ id: "tool-call-1", name: "wait_subagents", arguments: {} }],
+  provider: "fixture", model: "fixture-model", finishReason: "tool_calls", usage: null, continuation: null,
+}
+const snapshot: TurnExecutionOptions["snapshot"] = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
 
-    expect(result.wait).toMatchObject({ status: "waiting_for_dependency" })
-    expect(options.executeTool).toHaveBeenCalledTimes(1)
-    expect(options.executeTool).toHaveBeenCalledWith(expect.objectContaining({ call: expect.objectContaining({ toolName: "wait_subagents" }) }))
-    expect(stepUpdates).toHaveLength(1)
-    expect(stepUpdates[0]).toMatchObject({ status: "waiting_for_tool", finishReason: "stop" })
-    expect(events.filter(type => type === "step.completed")).toHaveLength(1)
-    expect(createdItems).toHaveLength(2)
-    expect(closed).toHaveBeenCalledTimes(1)
-    expect(accounted).toHaveBeenCalledWith(1)
-    expect(budget.snapshot().used.toolCalls).toBe(1)
+function setup(wait: TurnEngineResult | null, questionIntentCallId: string | null = null, suppliedRunTools?: typeof executeTools) {
+  const updates: unknown[] = [], events: unknown[] = [], timeline: string[] = []
+  const updateStep = vi.fn(async (value: unknown) => { updates.push(value); timeline.push("step-update") })
+  const waitForUser = vi.fn(async () => { timeline.push("wait-for-user") })
+  const append = vi.fn(async (...args: unknown[]) => { events.push(args); timeline.push("step-event"); return "event-1" })
+  const options = { identity, store: { updateStep, waitForUser } } as unknown as TurnExecutionOptions
+  const writer = { append } as unknown as TurnExecutionEventWriter
+  const settled = vi.fn(), observedOutcomes: unknown[] = [], resetContinuation = vi.fn(), closedSteps = new Set<string>()
+  const outcome = { wait, snapshot, steeringMarkerState: undefined, receipts: [] } as Awaited<ReturnType<typeof executeTools>>
+  const runTools: typeof executeTools = suppliedRunTools ?? (async (...args) => {
+    args[9]?.()
+    return outcome
+  })
+  const run = (signal = new AbortController().signal) => executeTurnToolStep({
+    options, executeOptions: options, writer, step, output, snapshot, seenCallIds: new Set(), signal,
+    now: () => new Date("2026-10-01T00:00:00.000Z"), steeringMarkerState: undefined, questionIntentCallId, closedSteps,
+    excludedToolCallIds: new Set(), resetContinuation, onToolCallsSettled: settled,
+    onOutcome: value => observedOutcomes.push(value), runTools,
+  })
+  return { run, updates, events, timeline, updateStep, waitForUser, settled, observedOutcomes, resetContinuation, closedSteps }
+}
+
+describe("executeTurnToolStep", () => {
+  it("accounts persisted calls and completes a normal tool step", async () => {
+    const fixture = setup(null)
+    await expect(fixture.run()).resolves.toEqual({ kind: "settled", wait: null })
+
+    expect(fixture.settled).toHaveBeenCalledWith(1)
+    expect(fixture.updateStep).toHaveBeenCalledWith(expect.objectContaining({ status: "completed", stepId: step.id }))
+    expect(fixture.events[0]).toEqual(expect.arrayContaining([
+      "step.completed", step.id, null, expect.objectContaining({ status: "completed", toolCallCount: 1 }),
+    ]))
+    expect(fixture.resetContinuation).toHaveBeenCalledOnce()
+    expect(fixture.closedSteps.has(step.id)).toBe(true)
+  })
+
+  it("persists dependency waits with the waiting-for-tool step status", async () => {
+    const wait = { status: "waiting_for_dependency", waitId: "wait-1", stepCount: 0, toolCallCount: 0 } as const
+    const fixture = setup(wait)
+    await expect(fixture.run()).resolves.toEqual({ kind: "settled", wait })
+
+    expect(fixture.updateStep).toHaveBeenCalledWith(expect.objectContaining({ status: "waiting_for_tool" }))
+    expect(fixture.events[0]).toEqual(expect.arrayContaining([
+      "step.completed", step.id, null, expect.objectContaining({ status: "waiting_for_dependency" }),
+    ]))
+    expect(fixture.closedSteps.has(step.id)).toBe(true)
+  })
+
+  it("stores ordinary user waits after closing the step", async () => {
+    const wait = { status: "waiting_for_user", waitId: "question-1", stepCount: 0, toolCallCount: 0 } as const
+    const fixture = setup(wait)
+    await fixture.run()
+
+    expect(fixture.updateStep).toHaveBeenCalledWith(expect.objectContaining({ status: "waiting_for_user" }))
+    expect(fixture.timeline).toEqual(["step-update", "step-event", "wait-for-user"])
+    expect(fixture.closedSteps.has(step.id)).toBe(true)
+  })
+
+  it("returns native question waits before ordinary step finalization", async () => {
+    const wait = { status: "waiting_for_user", waitId: "question-1", stepCount: 0, toolCallCount: 0 } as const
+    const fixture = setup(wait, "ask-call")
+    await expect(fixture.run()).resolves.toMatchObject({ kind: "question_wait", wait })
+
+    expect(fixture.settled).toHaveBeenCalledWith(1)
+    expect(fixture.updateStep).not.toHaveBeenCalled()
+    expect(fixture.events).toHaveLength(0)
+    expect(fixture.waitForUser).not.toHaveBeenCalled()
+    expect(fixture.resetContinuation).not.toHaveBeenCalled()
+    expect(fixture.closedSteps.has(step.id)).toBe(true)
+  })
+
+  it("resets the model continuation before rejecting a lost execution", async () => {
+    const fixture = setup(null)
+    const controller = new AbortController()
+    controller.abort(new Error("interrupted"))
+
+    await expect(fixture.run(controller.signal)).rejects.toThrow("execution_lost")
+
+    expect(fixture.resetContinuation).toHaveBeenCalledOnce()
+    expect(fixture.updateStep).not.toHaveBeenCalled()
+    expect(fixture.settled).toHaveBeenCalledWith(1)
+  })
+
+  it("settles tool-call accounting when execution throws", async () => {
+    const error = new Error("fixture failure")
+    const runTools: typeof executeTools = async () => { throw error }
+    const fixture = setup(null, null, runTools)
+
+    await expect(fixture.run()).rejects.toBe(error)
+
+    expect(fixture.settled).toHaveBeenLastCalledWith(0)
+    expect(fixture.resetContinuation).not.toHaveBeenCalled()
   })
 })

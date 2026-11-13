@@ -18,6 +18,16 @@ import { lookupArchivedWaitControl, parseArchivedWaitReference } from "./durable
 import { recoverChildWaitClaim, recoverChildWaitOrphan } from "./turn-execution-child-wait-recovery.js"
 type MarkerState = { readonly active: readonly SteeringMarkerPayload[] } | undefined
 type ToolOutcome = { readonly wait: TurnEngineResult | null; readonly snapshot: TurnExecutionOptions["snapshot"]; readonly steeringMarkerState: MarkerState; readonly receipts: readonly PersistedToolExecutionReceipt[] }
+export function withServerGeneratedFinalDependencyWait(options: TurnExecutionOptions, stepId: string, toolCallId: string): TurnExecutionOptions {
+  const matches = (candidateStepId: string, call: { id: string; name: string }) => candidateStepId === stepId && call.name === "wait_subagents" && call.id === toolCallId
+  return { ...options,
+    childWaitCallStartKey: (candidateStepId, call) => matches(candidateStepId, call) ? undefined : options.childWaitCallStartKey?.(candidateStepId, call),
+    childWaitCallStarted: (candidateStepId, call, eventId) => { if (!matches(candidateStepId, call)) options.childWaitCallStarted?.(candidateStepId, call, eventId) },
+    executeTool: input => matches(input.stepId, { id: input.call.id, name: input.call.toolName })
+      ? options.executeTool({ ...input, serverGeneratedFinalDependencyWait: { stepId, toolCallId } })
+      : Promise.reject(new TurnEngineError("invalid_output", "Generated final wait call changed")),
+  }
+}
 const CHILD_RESUME_ID_PREFIX = "child-resume:"
 const REPLAY_TOOL_CALL_ID_PREFIX = "task-graph-replay-v1:"
 function childResumeSourceId(id: string): string | null {

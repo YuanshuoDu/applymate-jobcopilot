@@ -4558,7 +4558,7 @@ describe("private final dependency wait admission", () => {
       deadlineAt: "2026-11-13T12:00:30.000Z", matchedTaskIds: [],
       tasks: [{ taskId: childId, status: "running", role: "scout", result: null, failureReason: null }],
     }
-    const execute = vi.fn(async ({ call }: { call: { id: string; toolName: string } }) => ({
+    const execute = vi.fn(async ({ call }: Parameters<TurnExecutionOptions["executeTool"]>[0]) => ({
       id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, errorCode: null, output: waitOutput,
     }))
     const completionGate = vi.fn(async () => ({ ok: true as const }))
@@ -4584,6 +4584,10 @@ describe("private final dependency wait admission", () => {
     expect(waitCall).toMatchObject({ toolName: "wait_subagents", input: {
       taskIds: [childId], mode: "all", timeoutMs: 30_000,
     } })
+    expect(execute.mock.calls[0]?.[0].serverGeneratedFinalDependencyWait).toEqual({
+      stepId: input.step.id, toolCallId: waitCall?.id,
+    })
+    expect(waitCall?.input).not.toHaveProperty("serverGeneratedFinalDependencyWait")
     expect(root.stepStatuses).toEqual(["waiting_for_tool"])
     expect(new Set(root.events.filter(event => event.type === "step.completed").map(event => event.id)).size).toBe(1)
     expect(root.events.some(event => event.type === "turn.completed" || event.type === "turn.failed")).toBe(false)

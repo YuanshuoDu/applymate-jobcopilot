@@ -745,6 +745,74 @@ describe("child executor composition", () => {
     }
   })
 
+  it("dispatches only the loop-injected final wait after a timed-out continuation", async () => {
+    const grandchildId = "subagent-12345678-1234-4234-9234-123456789013"
+    const child = { ...lease(), taskType: "job_discovery", allowedActions: ["wait_subagents"],
+      context: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER } }
+    const requests: HarnessModelRequest[] = [], events: Array<{ type: string; taskId: string }> = [], eventPayloads: unknown[] = []
+    const dispatch = vi.fn(), eventKeys: string[] = []
+    const originalInput = { idempotencyKey: "expired-wait-key", taskIds: [grandchildId], mode: "all", timeoutMs: 5_000 }
+    const oldOutput = {
+      waitId: "12345678-1234-4234-9234-000000000014", status: "timed_out", taskIds: [grandchildId],
+      deadlineAt: "2026-09-09T10:59:59.000Z", matchedTaskIds: [],
+      tasks: [{ taskId: grandchildId, status: "running", role: "scout", result: null, failureReason: null }],
+    }
+    const durableWait = {
+      waitId: oldOutput.waitId, stepId: `task:${child.id}:step:0:attempt:${child.attemptCount}`, attempt: child.attemptCount,
+      ordinal: 0, toolCallId: "old-provider-call", sourceItemId: "old-result", continuationStepId: `task:${child.id}:step:1:attempt:${child.attemptCount}`,
+      continuationOrdinal: 1, input: originalInput, output: oldOutput,
+    } as const
+    const resumeLoader = async () => ({
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [],
+        usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+      observations: [{ id: "child-resume:old-result", content: {
+        toolCallId: durableWait.toolCallId, toolName: "wait_subagents", input: originalInput, status: "completed", output: oldOutput, errorCode: null,
+      } }], durableWait,
+    })
+    const model: ModelAdapter = { id: "fixture-model", profile, async *stream(request) {
+      requests.push(request)
+      yield { type: "text_delta", text: "A tentative answer before the active child finishes." }
+      yield { type: "completed", finishReason: "stop" }
+    } }
+    const waitTool = createDurableSubagentWaitTool({ connect: async () => { throw new Error("owner_fenced_dispatch_must_not_connect") } } as never, child)
+    const waitOutput = {
+      waitId: "12345678-1234-4234-9234-000000000015", status: "waiting", taskIds: [grandchildId],
+      deadlineAt: "2026-09-09T11:00:30.000Z", matchedTaskIds: [],
+      tasks: [{ taskId: grandchildId, status: "running", role: "scout", result: null, failureReason: null }],
+    }
+    const runtime = childToolRuntime([waitTool], async (_context, request) => {
+      dispatch(request)
+      return { ...request, status: "completed", output: waitOutput, errorCode: null }
+    })
+    const callback = vi.fn(() => ({ taskIds: [grandchildId] }))
+    const store = executionStore(events, requests, eventPayloads), appendEvent = store.appendEvent
+    vi.spyOn(store, "appendEvent").mockImplementation(async input => {
+      eventKeys.push(input.idempotencyKey)
+      return appendEvent(input)
+    })
+    const executor = createChildExecutor({
+      store, treeBudget: budgetStore().store,
+      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => ({ ...runtime, prepareFinalDependencyWait: callback }),
+      resumeLoader, durableWaitResumeCommitter: async () => true, now: () => new Date("2026-09-09T11:00:00.000Z"),
+    })
+
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "waiting", result: { stepCount: 2 } })
+
+    expect(callback).toHaveBeenCalledOnce()
+    expect(dispatch).toHaveBeenCalledOnce()
+    expect(dispatch.mock.calls[0]?.[0]).toMatchObject({ toolName: "wait_subagents", input: {
+      taskIds: [grandchildId], mode: "all", timeoutMs: 30_000,
+    } })
+    expect(dispatch.mock.calls[0]?.[0].input).not.toHaveProperty("serverGeneratedFinalDependencyWait")
+    const finalCallId = dispatch.mock.calls[0]?.[0].id
+    expect(eventKeys).toContain(`task:${child.id}:event:tool-started:${finalCallId}`)
+    expect(eventKeys.some(key => key.includes("child-wait-claim"))).toBe(false)
+    expect(events.filter(event => ["tool_call.started", "tool_call.completed", "tool_call.failed"].includes(event.type))).toEqual([
+      { type: "tool_call.started", taskId: child.id }, { type: "tool_call.completed", taskId: child.id },
+    ])
+  })
+
   it("denies a fresh wait call for the built-in Scout policy even when the task action allows it", async () => {
     const child = { ...lease(), allowedActions: ["wait_subagents"] }
     const requests: HarnessModelRequest[] = [], events: Array<{ type: string; taskId: string }> = [], eventPayloads: unknown[] = []
