@@ -1261,8 +1261,13 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       expect(Number(usage.rows[0]?.outputTokens)).toBeGreaterThan(0)
       expect(Number(usage.rows[0]?.estimatedCostUsd)).toBeGreaterThan(0)
       expect(usageAuthorizations.length).toBeGreaterThanOrEqual(6)
-      expect(usageSettlements).toHaveLength(usageAuthorizations.length)
-      expect(unknownUsageSettlements).toEqual([])
+      expect(usageSettlements.length + unknownUsageSettlements.length).toBe(usageAuthorizations.length)
+      expect(unknownUsageSettlements).toHaveLength(targetChildProviderFailures)
+      expect(unknownUsageSettlements.every(settlement =>
+        settlement.status === "error"
+        && settlement.inputTokens === null
+        && settlement.outputTokens === null
+        && settlement.estimatedCostUsd === null)).toBe(true)
       const settledInputTokens = usageSettlements.reduce((sum, item) => sum + item.inputTokens, 0)
       const settledOutputTokens = usageSettlements.reduce((sum, item) => sum + item.outputTokens, 0)
       const settledCost = usageSettlements.reduce((sum, item) => sum + item.estimatedCostUsd, 0)
