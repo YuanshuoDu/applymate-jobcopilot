@@ -1,5 +1,5 @@
 import { schemaVersion } from "@jobcopilot/agent-protocol"
-import { normalizeAgentLocationAllowlist } from "@jobcopilot/shared"
+import { normalizeAgentLocationAllowlist } from "@jobcopilot/shared/agent-location-normalization"
 import type { ObjectiveVerificationRequirements } from "@/lib/agent/control-plane/commands/types"
 
 export interface ObjectiveContextDraft {
