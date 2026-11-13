@@ -17,6 +17,7 @@ const DISCOVER_EVIDENCE_KEYS = ["evidenceId", "jobId", "kind", "source", "url", 
 const DISCOVER_USAGE_SCOPE_KEYS = ["ledgerKey", "toolCallId", "sessionId", "turnId", "stepId"] as const
 const DISCOVER_USAGE_REQUIRED_KEYS = ["toolName", "toolVersion", "requests", "jobsProcessed", "jobsSucceeded", "jobsFailed", "aiCalls", "providers", "estimatedCostUsd", "durationMs"]
 const DISCOVER_INTERNAL_USAGE_KEYS = new Set<string>(DISCOVER_USAGE_SCOPE_KEYS)
+const MAX_DISCOVER_USAGE_LEDGER_KEY_LENGTH = 1_284
 const DISCOVER_EVIDENCE_KINDS = new Set<unknown>(["source", "enrichment", "analysis", "comparison"])
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -105,7 +106,9 @@ function validDiscoverUsage(value: unknown): value is Record<string, unknown> {
     && !isNonNegativeInteger(ownDataValue(value, "providerFailures"))) return false
   const estimatedCostUsd = ownDataValue(value, "estimatedCostUsd")
   return ["toolName", "toolVersion"].every(key => isId(ownDataValue(value, key)))
-    && (scopeKeyCount === 0 || DISCOVER_USAGE_SCOPE_KEYS.every(key => isId(ownDataValue(value, key))))
+    && (scopeKeyCount === 0 || DISCOVER_USAGE_SCOPE_KEYS.every(key => key === "ledgerKey"
+      ? boundedString(ownDataValue(value, key), MAX_DISCOVER_USAGE_LEDGER_KEY_LENGTH, 1)
+      : isId(ownDataValue(value, key))))
     && isBoundedArray(ownDataValue(value, "providers"), 32, item => isNonEmptyText(item, 80))
     && typeof estimatedCostUsd === "number" && Number.isFinite(estimatedCostUsd) && estimatedCostUsd >= 0
 }

@@ -38,6 +38,20 @@ function discoveryPolicy() {
 }
 
 describe("jobs.discover tool", () => {
+  it("accepts only the full composite ledger-key bound while keeping scope IDs capped", () => {
+    const tool = createJobsDiscoverTool({ client: { discover: vi.fn(async () => output) }, fence })
+    const registry = new ToolRegistry([tool as RuntimeToolDefinition])
+    const boundedOutput = { ...output, usage: { ...output.usage, ledgerKey: "l".repeat(1_284) } }
+
+    expect(() => registry.validators.validate(tool.outputSchema, boundedOutput, "jobs.discover output")).not.toThrow()
+    expect(() => registry.validators.validate(tool.outputSchema, {
+      ...boundedOutput, usage: { ...boundedOutput.usage, ledgerKey: `${boundedOutput.usage.ledgerKey}x` },
+    }, "jobs.discover output")).toThrow("jobs.discover output failed schema validation")
+    expect(() => registry.validators.validate(tool.outputSchema, {
+      ...boundedOutput, usage: { ...boundedOutput.usage, stepId: "s".repeat(257) },
+    }, "jobs.discover output")).toThrow("jobs.discover output failed schema validation")
+  })
+
   it("exposes only criteria as model input and keeps saved Job evidence in its output", async () => {
     const client: JobDiscoveryClient = { discover: vi.fn(async (_request: JobDiscoveryRequest) => output) }
     const tool = createJobsDiscoverTool({ client, fence })

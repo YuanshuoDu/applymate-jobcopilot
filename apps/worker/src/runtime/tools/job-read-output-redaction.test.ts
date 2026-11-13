@@ -129,6 +129,26 @@ describe("job read output redaction", () => {
     expect(redactJobReadOutput("jobs.discover", output)).toMatchObject({ usage: { providerFailures: 1 } })
   })
 
+  it("accepts a five-part ledger key up to 1284 characters and keeps scope IDs capped at 256", () => {
+    const output = discoverOutput()
+    const scope = ["u", "s", "t", "p", "c"].map(prefix => prefix.repeat(256))
+    output.usage.ledgerKey = scope.join(":")
+    output.usage.toolCallId = scope[4]!
+    output.usage.sessionId = scope[1]!
+    output.usage.turnId = scope[2]!
+    output.usage.stepId = scope[3]!
+
+    const safe = redactJobReadOutput("jobs.discover", output)
+    expect(output.usage.ledgerKey).toHaveLength(1_284)
+    expect(safe).not.toBe("[REDACTED]")
+    expect(safe).not.toHaveProperty("usage.ledgerKey")
+
+    const overlongLedgerKey = { ...output, usage: { ...output.usage, ledgerKey: `${output.usage.ledgerKey}x` } }
+    expect(redactJobReadOutput("jobs.discover", overlongLedgerKey)).toBe("[REDACTED]")
+    const overlongScopeId = { ...output, usage: { ...output.usage, stepId: "p".repeat(257) } }
+    expect(redactJobReadOutput("jobs.discover", overlongScopeId)).toBe("[REDACTED]")
+  })
+
   it("fails closed for unknown or missing discover object fields", () => {
     const extraTopLevel = discoverOutput()
     Object.assign(extraTopLevel, { unexpected: "private" })
