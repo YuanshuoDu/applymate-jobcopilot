@@ -39,7 +39,13 @@ async function startFixtureProductionRuntime({
       return createCanonicalTurnRuntime(runtimePool, { ...runtimeOptions, ...productionOptions })
     },
     createWorkerUsageAuthorizer() {
-      return async () => ({ settle() {} })
+      return async () => ({
+        outputReservationRequired: false,
+        maxOutputTokens: null,
+        release() {},
+        settle() {},
+        settleUnknown() {},
+      })
     },
     createCanonicalExecutionProjection() { return noOpProjection },
     createCanonicalSessionProjection() { return noOpProjection },
