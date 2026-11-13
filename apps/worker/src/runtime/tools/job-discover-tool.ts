@@ -6,6 +6,7 @@ import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionConte
 import { captureDiscoveryQueryCriteria, type DiscoveryQueryCapture } from "../subagents/child-discovery-query-footprint.js"
 
 const id = Type.String({ minLength: 1, maxLength: 256 })
+const usageLedgerKey = Type.String({ minLength: 1, maxLength: 1_284 })
 const nonEmptyText = (maxLength: number) => Type.String({ minLength: 1, maxLength })
 const JobDiscoverInputSchema = Type.Object({
   targetRoles: Type.Array(nonEmptyText(160), { minItems: 1, maxItems: 8 }),
@@ -26,7 +27,7 @@ const EvidenceSchema = Type.Object({
   source: nonEmptyText(80), url: nonEmptyText(4096), summary: nonEmptyText(1000),
 }, { additionalProperties: false })
 const UsageSchema = Type.Object({
-  ledgerKey: id, toolName: id, toolVersion: id, toolCallId: id, sessionId: id, turnId: id, stepId: id,
+  ledgerKey: usageLedgerKey, toolName: id, toolVersion: id, toolCallId: id, sessionId: id, turnId: id, stepId: id,
   requests: Type.Integer({ minimum: 0 }), jobsProcessed: Type.Integer({ minimum: 0 }), jobsSucceeded: Type.Integer({ minimum: 0 }),
   jobsFailed: Type.Integer({ minimum: 0 }), providerFailures: Type.Optional(Type.Integer({ minimum: 0 })), aiCalls: Type.Integer({ minimum: 0 }),
   providers: Type.Array(nonEmptyText(80), { maxItems: 32 }), estimatedCostUsd: Type.Number({ minimum: 0 }), durationMs: Type.Integer({ minimum: 0 }),

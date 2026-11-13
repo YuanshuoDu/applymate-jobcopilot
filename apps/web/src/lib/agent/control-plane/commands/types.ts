@@ -1,4 +1,5 @@
 import type { InputContentPart, TurnIntent, TurnSource } from "@jobcopilot/agent-protocol"
+import { normalizeAgentLocationAllowlist } from "@jobcopilot/shared"
 
 export const COMMAND_DISPOSITIONS = [
   "started",
@@ -23,16 +24,27 @@ export interface SelectedJobPreparationScope {
 }
 
 export const OBJECTIVE_VERIFICATION_REQUIREMENTS_SCHEMA_VERSION = "agent-harness.v2.objective-requirements.v1" as const
+export const OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION = "agent-harness.v2.objective-requirements.v2" as const
 
 export type ObjectiveVerificationRequirementKind = "candidate_count_gte" | "finding_count_gte"
-
-export type ObjectiveVerificationRequirements = Readonly<{
-  schemaVersion: typeof OBJECTIVE_VERIFICATION_REQUIREMENTS_SCHEMA_VERSION
-  requirements: readonly Readonly<{
-    id: string
-    check: Readonly<{ kind: ObjectiveVerificationRequirementKind; minimum: number }>
-  }>[]
+type ObjectiveVerificationCountRequirement = Readonly<{
+  id: string
+  check: Readonly<{ kind: ObjectiveVerificationRequirementKind; minimum: number }>
 }>
+type ObjectiveVerificationLocationRequirement = Readonly<{
+  id: "candidate-location"
+  check: Readonly<{ kind: "candidate_location_in"; locations: readonly string[] }>
+}>
+
+export type ObjectiveVerificationRequirements =
+  | Readonly<{
+      schemaVersion: typeof OBJECTIVE_VERIFICATION_REQUIREMENTS_SCHEMA_VERSION
+      requirements: readonly ObjectiveVerificationCountRequirement[]
+    }>
+  | Readonly<{
+      schemaVersion: typeof OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION
+      requirements: readonly (ObjectiveVerificationCountRequirement | ObjectiveVerificationLocationRequirement)[]
+    }>
 
 const OBJECTIVE_REQUIREMENT_ID = /^[a-z][a-z0-9._-]{0,63}$/
 
@@ -82,27 +94,67 @@ function denseRequirements(value: unknown): unknown[] | null {
 /** Parses only the fixed user-intent subset; malformed values never escape this boundary. */
 export function parseObjectiveVerificationRequirements(value: unknown): ObjectiveVerificationRequirements | null {
   const block = exactDataRecord(value, ["schemaVersion", "requirements"])
-  if (!block || block.schemaVersion !== OBJECTIVE_VERIFICATION_REQUIREMENTS_SCHEMA_VERSION) return null
+  if (!block || (block.schemaVersion !== OBJECTIVE_VERIFICATION_REQUIREMENTS_SCHEMA_VERSION &&
+      block.schemaVersion !== OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION)) return null
+  const version = block.schemaVersion
   const rows = denseRequirements(block.requirements)
   if (!rows) return null
   const ids = new Set<string>()
-  const requirements: ObjectiveVerificationRequirements["requirements"][number][] = []
+  const requirements: (ObjectiveVerificationCountRequirement | ObjectiveVerificationLocationRequirement)[] = []
+  let hasLocationRequirement = false
   for (const row of rows) {
     const entry = exactDataRecord(row, ["id", "check"])
     if (!entry || typeof entry.id !== "string" || !OBJECTIVE_REQUIREMENT_ID.test(entry.id) || ids.has(entry.id)) return null
+    ids.add(entry.id)
+    const checkKind = ownDataKind(entry.check)
+    if (checkKind === "candidate_location_in") {
+      if (version !== OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION || entry.id !== "candidate-location" || hasLocationRequirement) return null
+      const check = exactDataRecord(entry.check, ["kind", "locations"])
+      const locations = check && normalizeAgentLocationAllowlist(check.locations)
+      if (!check || !locations) return null
+      hasLocationRequirement = true
+      requirements.push({ id: "candidate-location", check: { kind: "candidate_location_in", locations } })
+      continue
+    }
     const check = exactDataRecord(entry.check, ["kind", "minimum"])
     if (!check || (check.kind !== "candidate_count_gte" && check.kind !== "finding_count_gte") ||
         !Number.isSafeInteger(check.minimum) || Number(check.minimum) < 1 || Number(check.minimum) > 50) return null
-    ids.add(entry.id)
     requirements.push({ id: entry.id, check: { kind: check.kind, minimum: Number(check.minimum) } })
   }
+  if (version === OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION && !hasLocationRequirement) return null
+  if (version === OBJECTIVE_VERIFICATION_REQUIREMENTS_SCHEMA_VERSION) {
+    const countRequirements = requirements.filter(
+      (entry): entry is ObjectiveVerificationCountRequirement => entry.check.kind !== "candidate_location_in",
+    )
+    return Object.freeze({
+      schemaVersion: OBJECTIVE_VERIFICATION_REQUIREMENTS_SCHEMA_VERSION,
+      requirements: Object.freeze(countRequirements.map((entry) => Object.freeze({
+        id: entry.id, check: Object.freeze({ ...entry.check }),
+      }))),
+    })
+  }
   return Object.freeze({
-    schemaVersion: OBJECTIVE_VERIFICATION_REQUIREMENTS_SCHEMA_VERSION,
-    requirements: Object.freeze(requirements.map((entry) => Object.freeze({
-      ...entry,
-      check: Object.freeze({ ...entry.check }),
-    }))),
+    schemaVersion: OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+    requirements: Object.freeze(requirements.map((entry) => entry.check.kind === "candidate_location_in"
+      ? Object.freeze({ id: "candidate-location" as const, check: Object.freeze({ ...entry.check }) })
+      : Object.freeze({ id: entry.id, check: Object.freeze({ ...entry.check }) }))),
   })
+}
+
+function ownDataKind(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, "kind")
+    return descriptor && "value" in descriptor && descriptor.enumerable ? descriptor.value : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export function objectiveLocationVerificationEnabled(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+  return environment.AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED === "1"
 }
 
 export interface StartCommand extends CommandIdentity {

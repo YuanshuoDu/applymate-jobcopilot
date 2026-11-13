@@ -9,6 +9,7 @@ import {
 } from "./task-graph-verification.js"
 import {
   TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
+  TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION,
   evaluateFindingsCoverScoutCandidates,
   evaluateFindingsFromScoutDependency,
   parseTaskGraphVerificationEvidenceProjection,
@@ -108,6 +109,57 @@ describe("TaskGraph cross-node verification selectors", () => {
     expect(evaluateFindingsCoverScoutCandidates("scout-a", [], dependencies, 75, digest)).toBe("passed")
     expect(evaluateFindingsFromScoutDependency("scout-a", [], dependencies, "b".repeat(64))).toBe("criterion_not_met")
     expect(evaluateFindingsCoverScoutCandidates("scout-a", [], dependencies, 75)).toBe("criterion_not_met")
+  })
+
+  it("preserves strict v1 projections and parses trusted location fields only in v2", () => {
+    const jobEvidence = "read:job:job-1"
+    const v1 = parseTaskGraphVerificationEvidenceProjection({
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout",
+      candidates: [{ jobId: "job-1", evidenceIds: [jobEvidence] }], evidenceIds: [jobEvidence],
+    })
+    expect(v1).toMatchObject({ ok: true, value: { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION } })
+    if (v1.ok) expect(v1.value.items[0]).not.toHaveProperty("observedLocation")
+
+    const verified = parseTaskGraphVerificationEvidenceProjection({
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, role: "scout",
+      candidates: [{ jobId: "job-1", evidenceIds: [jobEvidence], observedLocation: "dublin, ireland", locationEvidenceStatus: "verified" }],
+      evidenceIds: [jobEvidence],
+    })
+    expect(verified).toMatchObject({ ok: true, value: { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION,
+      items: [{ observedLocation: "dublin, ireland", locationEvidenceStatus: "verified" }] } })
+  })
+
+  it.each([
+    ["missing", null],
+    ["conflicting", null],
+  ] as const)("accepts only null location payloads for %s evidence status", (locationEvidenceStatus, observedLocation) => {
+    const jobEvidence = "read:job:job-1"
+    expect(parseTaskGraphVerificationEvidenceProjection({
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, role: "scout",
+      candidates: [{ jobId: "job-1", evidenceIds: [jobEvidence], observedLocation, locationEvidenceStatus }], evidenceIds: [jobEvidence],
+    })).toMatchObject({ ok: true })
+  })
+
+  it.each([
+    ["verified null", null, "verified"],
+    ["missing with text", "dublin", "missing"],
+    ["conflicting with text", "dublin", "conflicting"],
+    ["non-canonical text", " Dublin ", "verified"],
+  ] as const)("rejects v2 location projection with %s", (_label, observedLocation, locationEvidenceStatus) => {
+    const jobEvidence = "read:job:job-1"
+    expect(parseTaskGraphVerificationEvidenceProjection({
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, role: "scout",
+      candidates: [{ jobId: "job-1", evidenceIds: [jobEvidence], observedLocation, locationEvidenceStatus }], evidenceIds: [jobEvidence],
+    })).toMatchObject({ ok: false, reasonCode: "canonical_evidence_invalid" })
+  })
+
+  it("rejects model-like location fields under the unchanged v1 projection schema", () => {
+    const jobEvidence = "read:job:job-1"
+    expect(parseTaskGraphVerificationEvidenceProjection({
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout",
+      candidates: [{ jobId: "job-1", evidenceIds: [jobEvidence], observedLocation: "dublin", locationEvidenceStatus: "verified" }],
+      evidenceIds: [jobEvidence],
+    })).toMatchObject({ ok: false, reasonCode: "result_invalid" })
   })
 
   it("rejects a zero Scout projection that lacks its canonical full-search receipt", () => {

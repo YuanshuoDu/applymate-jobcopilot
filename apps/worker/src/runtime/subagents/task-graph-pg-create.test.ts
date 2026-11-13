@@ -3,7 +3,7 @@ import type pg from "pg"
 import { createGraphTasks } from "./task-graph-pg-create.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, type TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import { createInitialTaskGraphState, TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphState } from "../planning/task-graph.js"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
 import { parseTaskGraphSnapshot, taskGraphSnapshot } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
 import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
@@ -99,6 +99,20 @@ function ownedTurnScopeRow(sql: string, values?: unknown[]) {
 }
 
 describe("createGraphTasks", () => {
+  it("rejects invalid canonical requirements before any database reads or child writes", async () => {
+    const query = vi.fn(async () => ({ rows: [], rowCount: 1 }))
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const input: TaskGraphScheduleInput = {
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
+      proposal: { expectedRevision: 0, nodes: [plannedNode({ key: "analysis", templateId: "analyst", goal: "Analyze results", successCriteria: ["done"], dependsOn: [] })] },
+      templates: { analyst: { role: "analyst", taskType: "analysis", allowedActions: [] } },
+      verificationRequirements: { status: "invalid" },
+    }
+    await expect(createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 4, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map()))
+      .rejects.toMatchObject({ code: "task_graph_objective_requirements_invalid" })
+    expect(query).not.toHaveBeenCalled()
+  })
+
   it("strictly rejects an initial plan missing one canonical requirement before database work", async () => {
     const query = vi.fn(async () => ({ rows: [], rowCount: 1 }))
     const client = { query } as unknown as Pick<pg.PoolClient, "query">
@@ -117,6 +131,51 @@ describe("createGraphTasks", () => {
     await expect(createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 4, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map()))
       .rejects.toMatchObject({ code: "task_graph_objective_coverage_incomplete", requirements: [
         { id: "candidate-count", kind: "candidate_count_gte", role: "scout", minimum: 2 },
+      ] })
+    expect(query).not.toHaveBeenCalled()
+  })
+
+  it("rejects a location objective without exact Scout coverage before child or outbox writes", async () => {
+    const query = vi.fn(async () => ({ rows: [], rowCount: 1 }))
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const input: TaskGraphScheduleInput = {
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
+      proposal: { expectedRevision: 0, nodes: [plannedNode({ key: "analysis", templateId: "analyst", goal: "Analyze results", successCriteria: ["done"], dependsOn: [] })] },
+      templates: {
+        analyst: { role: "analyst", taskType: "analysis", allowedActions: [] },
+        scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+      },
+      verificationRequirements: { status: "valid", requirements: [
+        { id: "candidate-location", kind: "candidate_location_in", locations: ["dublin"] },
+      ] },
+    }
+    await expect(createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 4, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map()))
+      .rejects.toMatchObject({ code: "task_graph_objective_coverage_incomplete", requirements: [
+        { id: "candidate-location", kind: "candidate_location_in", role: "scout", locations: ["dublin"] },
+      ] })
+    expect(query).not.toHaveBeenCalled()
+  })
+
+  it("rejects a mixed v2-location and v1-count Scout plan before child or outbox writes", async () => {
+    const query = vi.fn(async () => ({ rows: [], rowCount: 1 }))
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const input: TaskGraphScheduleInput = {
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
+      proposal: { expectedRevision: 0, nodes: [
+        { key: "location-scout", templateId: "scout", goal: "Find jobs in the requested location", successCriteria: ["Return matching jobs"], dependsOn: [], verification: {
+          schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+          criteria: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["dublin"] } }],
+        } },
+        { key: "legacy-scout", templateId: "scout", goal: "Find additional jobs", successCriteria: ["Return jobs"], dependsOn: [], verification: scoutVerification },
+      ] },
+      templates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      verificationRequirements: { status: "valid", requirements: [
+        { id: "candidate-location", kind: "candidate_location_in", locations: ["dublin"] },
+      ] },
+    }
+    await expect(createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 4, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map()))
+      .rejects.toMatchObject({ code: "task_graph_objective_coverage_incomplete", requirements: [
+        { id: "candidate-location", kind: "candidate_location_in", role: "scout", locations: ["dublin"] },
       ] })
     expect(query).not.toHaveBeenCalled()
   })

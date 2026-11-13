@@ -69,7 +69,7 @@ describe("start-objective command API", () => {
     })
   })
 
-  it("forwards valid requirements and reduces present-invalid values to the null sentinel", async () => {
+  it("forwards valid v1 requirements and rejects malformed requirement blocks before service dispatch", async () => {
     const { POST } = await import("./route")
     const valid = await POST(request(body({ verificationRequirements: validRequirements })) as never, params)
     expect(valid.status).toBe(202)
@@ -83,9 +83,44 @@ describe("start-objective command API", () => {
       requirements: [{ id: "candidate-count", check: { kind: "evidence_count_gte", minimum: 3 } }],
     }
     const invalid = await POST(request(body({ verificationRequirements: malformed })) as never, params)
-    expect(invalid.status).toBe(202)
-    expect(mocks.start).toHaveBeenCalledWith(expect.objectContaining({ source: "user", verificationRequirements: null }))
-    expect(mocks.start.mock.calls[0]?.[0]).not.toHaveProperty("verificationRequirements.requirements")
+    expect(invalid.status).toBe(422)
+    expect(mocks.start).not.toHaveBeenCalled()
+
+      const unknownV2 = await POST(request(body({ verificationRequirements: {
+        schemaVersion: "agent-harness.v2.objective-requirements.v2",
+        requirements: [{ id: "candidate-location", check: { kind: "candidate_location_aliases", locations: ["Dublin"] } }],
+      } })) as never, params)
+      expect(unknownV2.status).toBe(422)
+      expect(mocks.start).not.toHaveBeenCalled()
+  })
+
+  it("rejects location requirements while gated off and forwards canonical v2 after enablement", async () => {
+    const locationRequirements = {
+      schemaVersion: "agent-harness.v2.objective-requirements.v2",
+      requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin", " Berlin ", "dublin"] } }],
+    }
+    vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "0")
+    try {
+      const { POST } = await import("./route")
+      const disabled = await POST(request(body({ verificationRequirements: locationRequirements })) as never, params)
+      expect(disabled.status).toBe(422)
+      await expect(disabled.json()).resolves.toMatchObject({
+        error: { code: "objective_location_verification_unavailable" },
+      })
+      expect(mocks.start).not.toHaveBeenCalled()
+
+      vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "1")
+      const enabled = await POST(request(body({ verificationRequirements: locationRequirements })) as never, params)
+      expect(enabled.status).toBe(202)
+      expect(mocks.start).toHaveBeenCalledWith(expect.objectContaining({
+        verificationRequirements: {
+          schemaVersion: "agent-harness.v2.objective-requirements.v2",
+          requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["berlin", "dublin"] } }],
+        },
+      }))
+    } finally {
+      vi.unstubAllEnvs()
+    }
   })
 
   it("does not admit malformed request bytes to the command or model context", async () => {

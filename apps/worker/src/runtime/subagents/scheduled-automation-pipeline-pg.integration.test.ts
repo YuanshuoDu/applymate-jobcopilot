@@ -785,10 +785,10 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     }, discoveryOutput(value), 1)
     await persistToolReceipt(pool!, value, value.scoutTaskId, "scout-step", "jobs.get", "scout-read-call", {
       jobId: value.jobId,
-    }, { job: { id: value.jobId, source: "fixture" } }, 2)
+    }, { job: { id: value.jobId, source: "fixture", location: "Dublin" } }, 2)
     await persistToolReceipt(pool!, value, value.analystTaskId, "analyst-step", "jobs.get", "analyst-read-call", {
       jobId: value.jobId,
-    }, { job: { id: value.jobId, source: "fixture" } }, 3)
+    }, { job: { id: value.jobId, source: "fixture", location: "Dublin" } }, 3)
 
     const scope = {
       userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
@@ -1606,6 +1606,8 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     const snapshot = graphSnapshot(value)
     await seedGraph(pool!, value, snapshot, true)
     const discovery = emptyDiscoveryOutput(value)
+    expect(discovery.usage.ledgerKey.length).toBeGreaterThan(256)
+    expect(discovery.usage.ledgerKey.length).toBeLessThanOrEqual(1_284)
     await persistToolReceipt(pool!, value, value.scoutTaskId, "scout-step", "jobs.discover", "zero-discover", {
       targetRoles: ["Software Engineer"], targetLocations: ["Dublin"],
     }, discovery, 1)
@@ -1682,13 +1684,13 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     }, emptyDiscoveryOutput(value, emptyCallSuffix), 1)
     await persistToolReceipt(pool!, value, populatedScout.taskId, "scout-step", "jobs.discover", "discover-call", {
       query: "Software Engineer Dublin",
-    }, discoveryOutput(value), 2)
+    }, discoveryOutput(value, "https://jobs.example.invalid/union"), 2)
     await persistToolReceipt(pool!, value, populatedScout.taskId, "scout-step", "jobs.get", "union-scout-read", {
       jobId: value.jobId,
-    }, { job: { id: value.jobId, source: "fixture" } }, 3)
+    }, { job: { id: value.jobId, source: "fixture", location: "Dublin" } }, 3)
     await persistToolReceipt(pool!, value, analyst.taskId, "analyst-step", "jobs.get", "union-analyst-read", {
       jobId: value.jobId,
-    }, { job: { id: value.jobId, source: "fixture" } }, 4)
+    }, { job: { id: value.jobId, source: "fixture", location: "Dublin" } }, 4)
 
     const emptyProof = await verifyCompletedTaskGraphNodeEvidence(pool!, {
       scope: { ...scope, taskId: emptyScout.taskId, attemptCount: 1 }, snapshot, node: emptyScout, structuredResult: emptyRoleResult("scout"),
@@ -1709,6 +1711,21 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     expect(dependencies).not.toBeNull()
     expect(dependencies!.bindings.map(binding => binding.nodeKey)).toEqual(["scheduled-scout-a", "scheduled-scout-b"])
     const analystResult = roleResult("analyst", value.jobId)
+    const persistedAnalystResult = await pool!.query(`UPDATE "sub_agent_tasks" AS task
+      SET "result" = jsonb_set(task."result", '{structuredResult}', $5::jsonb)
+      FROM "agent_sessions" AS session
+      JOIN "agent_turns" AS turn ON turn."sessionId" = session."id"
+      WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3
+        AND task."rootTaskId" = $4 AND task."parentTaskId" = $4
+        AND session."id" = task."sessionId" AND session."userId" = $6
+        AND turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+        AND turn."userId" = $6 AND turn."rootTaskId" = task."rootTaskId"
+      RETURNING task."id" AS "id", task."sessionId" AS "sessionId", task."turnId" AS "turnId", session."userId" AS "userId"`,
+    [analyst.taskId, value.sessionId, value.turnId, value.rootTaskId, JSON.stringify(analystResult), value.userId])
+    expect(persistedAnalystResult.rowCount).toBe(1)
+    expect(persistedAnalystResult.rows).toEqual([{
+      id: analyst.taskId, sessionId: value.sessionId, turnId: value.turnId, userId: value.userId,
+    }])
     const analystProof = await verifyCompletedTaskGraphNodeEvidence(pool!, {
       scope: { ...scope, taskId: analyst.taskId, attemptCount: 1 }, snapshot, node: analyst,
       structuredResult: analystResult, dependencies: dependencies!.projections,
@@ -1790,7 +1807,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       WHERE "id" = $1 AND "sessionId" = $3`, [analyst.taskId, JSON.stringify(outOfUnionResult), value.sessionId])
     await persistToolReceipt(pool!, value, analyst.taskId, "analyst-step", "jobs.get", "all-empty-analyst-read", {
       jobId: value.jobId,
-    }, { job: { id: value.jobId, source: "fixture" } }, 3)
+    }, { job: { id: value.jobId, source: "fixture", location: "Dublin" } }, 3)
     const allEmptyProof = await verifyCompletedTaskGraphNodeEvidence(pool!, {
       scope: { ...scope, taskId: analyst.taskId, attemptCount: 1 }, snapshot, node: analyst,
       structuredResult: outOfUnionResult, dependencies: dependencies!.projections,
@@ -2210,13 +2227,27 @@ async function persistToolEvent(database: PgPool, value: Fixture, taskId: string
   ])
 }
 
-function discoveryOutput(value: Fixture) {
+function discoveryOutput(value: Fixture, url = "https://jobs.example.invalid/fixture") {
+  const toolCallId = `discover-call-${value.turnId}`
+  const stepId = `scout-step-${toolCallId}`
+  const evidenceId = "fixture-discovery-evidence"
   return {
-    jobs: [{ id: value.jobId, source: "fixture" }], evidence: [], nextCursor: null,
+    jobs: [{
+      id: value.jobId, title: "Software Engineer", company: "Fixture Systems", location: "Dublin",
+      url, description: "Build reliable TypeScript services for European customers.",
+      fullDescription: "Build reliable TypeScript services for European customers.", salary: null, logo: null,
+      source: "fixture", evidenceRefs: [evidenceId],
+    }],
+    evidence: [{
+      evidenceId, jobId: value.jobId, kind: "source", source: "fixture",
+      url, summary: "Fixture job listing",
+    }],
+    nextCursor: null,
     usage: {
-      ledgerKey: "scheduled-pipeline-fixture-ledger", toolName: "jobs.discover", toolVersion: "1",
-      toolCallId: `discover-call-${value.turnId}`, sessionId: value.sessionId, turnId: value.turnId,
-      stepId: `scout-step-discover-call-${value.turnId}`, requests: 1, jobsProcessed: 1, jobsSucceeded: 1,
+      ledgerKey: [value.userId, value.sessionId, value.turnId, stepId, toolCallId].join(":"),
+      toolName: "jobs.discover", toolVersion: "1",
+      toolCallId, sessionId: value.sessionId, turnId: value.turnId,
+      stepId, requests: 1, jobsProcessed: 1, jobsSucceeded: 1,
       jobsFailed: 0, providerFailures: 0, aiCalls: 0, providers: ["fixture"], estimatedCostUsd: 0, durationMs: 1,
     },
   }

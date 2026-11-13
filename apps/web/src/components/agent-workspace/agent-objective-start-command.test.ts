@@ -55,6 +55,85 @@ describe('objective start command', () => {
     })
   })
 
+  it('sends explicit locations as a versioned requirement with a stable criterion ID', async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = []
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ input, init })
+      return calls.length === 1
+        ? jsonResponse({ session: { id: 'session_1' } }, 201)
+        : jsonResponse(successBody(), 202)
+    }) as typeof fetch
+    const coordinator = new AgentObjectiveStartCoordinator(fetcher, () => 'location-key')
+    await coordinator.start('Find roles', '', 'Dublin, Ireland\nBerlin\n Dublin ')
+
+    expect(JSON.parse(String(calls[1]?.init?.body))).toMatchObject({
+      verificationRequirements: {
+        schemaVersion: 'agent-harness.v2.objective-requirements.v2',
+        requirements: [{
+          id: 'candidate-location',
+          check: { kind: 'candidate_location_in', locations: ['berlin', 'dublin', 'dublin, ireland'] },
+        }],
+      },
+    })
+  })
+
+  it('preserves existing count requirements when appending the location criterion', async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = []
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ input, init })
+      return calls.length === 1
+        ? jsonResponse({ session: { id: 'session_1' } }, 201)
+        : jsonResponse(successBody(), 202)
+    }) as typeof fetch
+    const existingRequirements = {
+      schemaVersion: 'agent-harness.v2.objective-requirements.v1' as const,
+      requirements: [{ id: 'candidate-count', check: { kind: 'candidate_count_gte' as const, minimum: 3 } }],
+    }
+    await new AgentObjectiveStartCoordinator(fetcher, () => 'mixed-requirements')
+      .start('Find roles', '', 'Dublin', existingRequirements)
+
+    expect(JSON.parse(String(calls[1]?.init?.body))).toMatchObject({
+      verificationRequirements: {
+        schemaVersion: 'agent-harness.v2.objective-requirements.v2',
+        requirements: [
+          { id: 'candidate-count', check: { kind: 'candidate_count_gte', minimum: 3 } },
+          { id: 'candidate-location', check: { kind: 'candidate_location_in', locations: ['dublin'] } },
+        ],
+      },
+    })
+  })
+
+  it('rejects invalid explicit location lists before creating a Session', async () => {
+    let calls = 0
+    const fetcher = (async () => {
+      calls += 1
+      return jsonResponse({ session: { id: 'session_1' } }, 201)
+    }) as typeof fetch
+    const coordinator = new AgentObjectiveStartCoordinator(fetcher, () => 'invalid-locations')
+    await expect(coordinator.start('Find roles', '', 'x'.repeat(129)))
+      .rejects.toMatchObject({ status: 422, code: 'invalid_command' })
+    await expect(coordinator.start('Find roles', '', Array.from({ length: 9 }, (_, index) => `City ${index}`).join('\n')))
+      .rejects.toMatchObject({ status: 422, code: 'invalid_command' })
+    expect(calls).toBe(0)
+  })
+
+  it('does not replace a requirement that already uses the stable location criterion ID', async () => {
+    let calls = 0
+    const fetcher = (async () => {
+      calls += 1
+      return jsonResponse({ session: { id: 'session_1' } }, 201)
+    }) as typeof fetch
+    const existingRequirements = {
+      schemaVersion: 'agent-harness.v2.objective-requirements.v1' as const,
+      requirements: [{ id: 'candidate-location', check: { kind: 'candidate_count_gte' as const, minimum: 3 } }],
+    }
+
+    await expect(new AgentObjectiveStartCoordinator(fetcher, () => 'collision')
+      .start('Find roles', '', 'Dublin', existingRequirements))
+      .rejects.toMatchObject({ status: 422, code: 'invalid_command' })
+    expect(calls).toBe(0)
+  })
+
   it('uses the objective only for exactly empty background and preserves whitespace-only text', async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = []
     const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
