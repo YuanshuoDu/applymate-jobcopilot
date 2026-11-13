@@ -121,7 +121,7 @@ WITH current_task AS (
     AND submitted."artifactHash" = $12 AND submitted."state" = 'submitted'
     AND NULLIF(BTRIM(submitted."responseRef"), '') IS NOT NULL
     AND (($13 = 'correlated' AND submitted."responseRef" = 'application:' || task."id")
-      OR ($13 = 'unavailable' AND submitted."responseRef" <> 'application:' || task."id'))
+      OR ($13 = 'unavailable' AND submitted."responseRef" <> 'application:' || task."id"))
 ), queued AS (
   SELECT COUNT(*) = 1 AS unique_event,
     COUNT(*) FILTER (WHERE event."actor" = 'user'
