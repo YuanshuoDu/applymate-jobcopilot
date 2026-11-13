@@ -52,20 +52,51 @@ async function seed(pool: Pool, f: Fixture): Promise<void> {
   await pool.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [f.rootId])
   await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [f.rootId, f.turnId])
   await pool.query(`INSERT INTO "sub_agent_tasks" ${columns} VALUES
-    ($1, $2, $3, $4, $4, '/root/parent', 1, 'scout', 'research', 'queued', 'parent', '{}'::jsonb, '[]'::jsonb,
+    ($1, $2, $3, $4, $4, '/root/parent', 1, 'scout', 'job_discovery', 'queued', 'parent', '{}'::jsonb, '[]'::jsonb,
       '["jobs.search"]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 0, 3, CURRENT_TIMESTAMP)`,
   [f.parentId, f.sessionId, f.turnId, f.rootId])
 }
 
 async function insertDescendant(pool: Pool, f: Fixture, input: {
-  id: string; parentTaskId: string; path: string; depth: number; status: "running" | "completed";
+  id: string; parentTaskId: string; path: string; depth: number; status: "queued" | "running" | "completed";
+  taskType?: "job_discovery" | "research";
 }): Promise<void> {
   await pool.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path",
       "depth", "role", "taskType", "status", "goal", "constraints", "successCriteria", "allowedActions", "context",
       "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
-    VALUES ($1, $2, $3, $4, $5, $6, $7, 'scout', 'research', $8, 'descendant', '{}'::jsonb, '[]'::jsonb,
+    VALUES ($1, $2, $3, $4, $5, $6, $7, 'scout', $8, $9, 'descendant', '{}'::jsonb, '[]'::jsonb,
       '["jobs.search"]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 3, CURRENT_TIMESTAMP)`,
-  [input.id, f.sessionId, f.turnId, f.rootId, input.parentTaskId, input.path, input.depth, input.status])
+  [input.id, f.sessionId, f.turnId, f.rootId, input.parentTaskId, input.path, input.depth, input.taskType ?? "research", input.status])
+}
+
+async function insertDispatch(pool: Pool, sessionId: string, taskId: string, rootTaskId: string): Promise<void> {
+  await pool.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
+    VALUES ($1, 'agent.subagent.dispatch', $2, $3, $4::jsonb)`,
+  [randomUUID(), sessionId, `subagent-dispatch:${taskId}`,
+    JSON.stringify({ taskId, sessionId, rootTaskId, ownerId: `fixture-${randomUUID()}` })])
+}
+
+async function insertOtherTree(pool: Pool, f: Fixture): Promise<{ rootId: string; taskId: string }> {
+  const suffix = randomUUID(), turnId = `finish-other-turn-${suffix}`, rootId = `finish-other-root-${suffix}`
+  const taskId = `finish-other-child-${suffix}`
+  await pool.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input",
+      "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
+    VALUES ($1, $2, $3, 'in_progress', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+  [turnId, f.sessionId, f.userId])
+  const columns = `("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType",
+    "status", "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema",
+    "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")`
+  await pool.query(`INSERT INTO "sub_agent_tasks" ${columns} VALUES
+    ($1, $2, $3, NULL, NULL, '/other-root', 0, 'orchestrator', 'root', 'running', 'other root', '{}'::jsonb, '[]'::jsonb,
+      '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 0, 3, CURRENT_TIMESTAMP)`,
+  [rootId, f.sessionId, turnId])
+  await pool.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [rootId])
+  await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [rootId, turnId])
+  await insertDescendant(pool, { ...f, turnId, rootId, parentId: rootId }, {
+    id: taskId, parentTaskId: rootId, path: `/other-root/${taskId}`, depth: 1, status: "queued",
+  })
+  await insertDispatch(pool, f.sessionId, taskId, rootId)
+  return { rootId, taskId }
 }
 
 async function clean(pool: Pool, f: Fixture): Promise<void> {
@@ -101,12 +132,14 @@ function capture<T>(promise: Promise<T>): Promise<{ ok: true; value: T } | { ok:
 describePg("parent finish descendant barrier: disposable PostgreSQL", () => {
   let pool: Pool
   let value: Fixture
+  let additionalFixtures: Fixture[] = []
   let store: PgSubagentTaskStore
   let lease: SubagentLease
   const parentOwner = "finish-parent-worker"
 
   beforeAll(() => { pool = new Pool({ connectionString: url!, max: 8 }) })
   beforeEach(async () => {
+    additionalFixtures = []
     value = fixture()
     await seed(pool, value)
     store = new PgSubagentTaskStore(pool)
@@ -115,7 +148,10 @@ describePg("parent finish descendant barrier: disposable PostgreSQL", () => {
     if (!claimed?.leaseExpiresAt) throw new Error("Fixture parent could not be claimed")
     lease = { ...claimed, ownerId: parentOwner, leaseExpiresAt: claimed.leaseExpiresAt, signal: new AbortController().signal }
   })
-  afterEach(async () => { if (value) await clean(pool, value) })
+  afterEach(async () => {
+    if (value) await clean(pool, value)
+    for (const extra of additionalFixtures) await clean(pool, extra)
+  })
   afterAll(async () => { await pool.end() })
 
   it.each(["direct active child", "active grandchild below a terminal child"] as const)(
@@ -155,6 +191,64 @@ describePg("parent finish descendant barrier: disposable PostgreSQL", () => {
     const parent = (await pool.query(`SELECT "status", "leaseOwner", "result" FROM "sub_agent_tasks" WHERE "id" = $1`,
       [value.parentId])).rows[0]
     expect(parent).toMatchObject({ status: "running", leaseOwner: parentOwner, result: null })
+  })
+
+  it("interrupts a scoped depth-two Scout subtree, fences late finishes, and preserves other trees and tenants", async () => {
+    const runningChildId = `finish-running-child-${randomUUID()}`
+    await insertDescendant(pool, value, { id: runningChildId, parentTaskId: value.parentId,
+      path: `/root/parent/${runningChildId}`, depth: 2, status: "queued", taskType: "job_discovery" })
+    const childOwner = `finish-child-worker-${randomUUID()}`
+    const claimedChild = await store.claim({ taskId: runningChildId, sessionId: value.sessionId, ownerId: childOwner,
+      policy: { maxConcurrency: 4, maxDepth: 2, maxFanOut: 2, maxAttempts: 3 }, now: new Date() })
+    if (!claimedChild?.leaseExpiresAt) throw new Error("Fixture child could not be claimed")
+    const childLease: SubagentLease = { ...claimedChild, ownerId: childOwner,
+      leaseExpiresAt: claimedChild.leaseExpiresAt, signal: new AbortController().signal }
+    const queuedChildId = `finish-queued-child-${randomUUID()}`
+    await insertDescendant(pool, value, { id: queuedChildId, parentTaskId: value.parentId,
+      path: `/root/parent/${queuedChildId}`, depth: 2, status: "queued", taskType: "job_discovery" })
+    await insertDispatch(pool, value.sessionId, queuedChildId, value.rootId)
+
+    const otherTree = await insertOtherTree(pool, value)
+    const foreign = fixture()
+    additionalFixtures.push(foreign)
+    await seed(pool, foreign)
+    const interrupted = await store.interruptSubtree({ sessionId: value.sessionId, rootTaskId: value.rootId,
+      targetPath: "/root/parent", now: new Date() })
+
+    expect(interrupted).toBe(3)
+    const targetIds = [value.parentId, runningChildId, queuedChildId]
+    const rows = await pool.query(`SELECT "id", "status", "leaseOwner", "leaseExpiresAt", "interruptRequestedAt"
+      FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[])`, [targetIds])
+    const byId = new Map(rows.rows.map(row => [String(row.id), row]))
+    for (const id of [value.parentId, runningChildId]) {
+      expect(byId.get(id)).toMatchObject({ status: "running" })
+      expect(byId.get(id)?.interruptRequestedAt).toBeInstanceOf(Date)
+    }
+    expect(byId.get(value.parentId)?.leaseOwner).toBe(parentOwner)
+    expect(byId.get(runningChildId)?.leaseOwner).toBe(childOwner)
+    expect(byId.get(queuedChildId)).toMatchObject({ status: "interrupted", leaseOwner: null, leaseExpiresAt: null })
+    expect(byId.get(queuedChildId)?.interruptRequestedAt).toBeInstanceOf(Date)
+
+    const dispatch = await pool.query(`SELECT "idempotencyKey" FROM "agent_outbox"
+      WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1
+        AND "idempotencyKey" = ANY($2::text[]) ORDER BY "idempotencyKey"`,
+    [value.sessionId, [`subagent-dispatch:${queuedChildId}`, `subagent-dispatch:${otherTree.taskId}`]])
+    expect(dispatch.rows).toEqual([{ idempotencyKey: `subagent-dispatch:${otherTree.taskId}` }])
+
+    const untouched = await pool.query(`SELECT "id", "status", "interruptRequestedAt" FROM "sub_agent_tasks"
+      WHERE "id" = ANY($1::text[]) ORDER BY "id"`, [[otherTree.rootId, otherTree.taskId, foreign.parentId]])
+    const untouchedById = new Map(untouched.rows.map(row => [String(row.id), row]))
+    expect(untouchedById.get(otherTree.rootId)).toMatchObject({ status: "running", interruptRequestedAt: null })
+    expect(untouchedById.get(otherTree.taskId)).toMatchObject({ status: "queued", interruptRequestedAt: null })
+    expect(untouchedById.get(foreign.parentId)).toMatchObject({ status: "queued", interruptRequestedAt: null })
+
+    for (const lateLease of [childLease, lease]) {
+      await expect(store.finish({ taskId: lateLease.id, sessionId: lateLease.sessionId, ownerId: lateLease.ownerId,
+        attemptCount: lateLease.attemptCount, status: "completed", result: { status: "completed" },
+        mailboxMessageIds: [], now: new Date() })).resolves.toBe("interrupted")
+    }
+    const final = await pool.query(`SELECT "id", "status" FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[])`, [targetIds])
+    expect(final.rows.every(row => row.status === "interrupted")).toBe(true)
   })
 
   it("serializes a racing spawn and finish so a newly created descendant cannot slip through", async () => {

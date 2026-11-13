@@ -99,6 +99,7 @@ jobs:
               'returns children_pending without persisting success when a direct active child exists',
               'returns children_pending without persisting success when a active grandchild below a terminal child exists',
               'keeps stale owners fenced instead of reporting children_pending',
+              'interrupts a scoped depth-two Scout subtree, fences late finishes, and preserves other trees and tenants',
               'serializes a racing spawn and finish so a newly created descendant cannot slip through',
             ]],
             ['/src/runtime/subagents/nested-scout-deadline-pg.integration.test.ts', [
@@ -114,11 +115,11 @@ jobs:
           ])
           const files = report.testResults
           const cases = files?.flatMap(file => file.assertionResults ?? []) ?? []
-          if (!report.success || report.numTotalTests !== 11 || report.numPassedTests !== 11 ||
+          if (!report.success || report.numTotalTests !== 12 || report.numPassedTests !== 12 ||
               report.numFailedTests !== 0 || report.numPendingTests !== 0 || report.numTodoTests !== 0 ||
-              files?.length !== expected.size || cases.length !== 11 ||
+              files?.length !== expected.size || cases.length !== 12 ||
               cases.some(test => test.status !== 'passed')) {
-            throw new Error('Expected all eleven PostgreSQL cases to pass with no failed, skipped, pending or todo tests')
+            throw new Error('Expected all twelve PostgreSQL cases to pass with no failed, skipped, pending or todo tests')
           }
           for (const result of files) {
             const name = result.name.replaceAll('\\', '/')
