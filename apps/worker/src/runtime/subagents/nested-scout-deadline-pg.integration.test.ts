@@ -6,6 +6,7 @@ import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-v
 import { AgentTreeManager } from "./manager.js"
 import { createPgRootTaskStore } from "./root-task-store.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
+import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { recoverExpiredTaskGraphChildren } from "./pg-store-task-graph-deadline-recovery.js"
 import { recoverExpiredNestedScoutChildren } from "./nested-scout-deadline-recovery.js"
@@ -51,8 +52,7 @@ async function seedGraph(pool: Pool): Promise<Fixture> {
   [turnId, sessionId, userId])
   const turnLease = await claimTurnLease(pool, { turnId, sessionId, ownerId: `turn-owner-${suffix}` })
   const policy = { maxConcurrency: 4, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 }
-  const templates = { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
-    analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.search"] } }
+  const templates = { scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst }
   const rootActions = [...new Set(Object.values(templates).flatMap(template => template.allowedActions))]
   const root = await createPgRootTaskStore(pool).ensure({ lease: turnLease, goal: "Nested Scout deadline",
     allowedActions: rootActions, budgetSnapshot: { subagentPolicy: policy } })

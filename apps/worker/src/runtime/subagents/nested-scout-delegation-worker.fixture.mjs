@@ -48,7 +48,7 @@ async function start(mode) {
     taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => ({ settle: async () => undefined }),
     modelRuntimeFactory: () => rootModelRuntime(),
   })
-  const markerState = { blocked: new Set(), closedStepRejected: false, parallelObserved: false }
+  const markerState = { closedStepRejected: false, parallelObserved: false }
   const executeChild = createProductionChildExecutor({ pool, subagentManager: () => runtime.manager,
     authorizeUsage: async () => ({ settle: async () => undefined }), jobDiscoveryClient: discoveryClient(),
     modelRuntimeFactory: input => childModelRuntime({ ...input, runtime, markerState }) })

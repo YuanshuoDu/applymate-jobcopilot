@@ -78,8 +78,9 @@ function rootModelRuntime() {
       yield { type: "completed", finishReason: "stop" }; return
     }
     if (typeof scout?.taskId !== "string") throw new Error("p1143_root_scout_task_missing")
-    yield toolCall("p1143-root-wait", "agent.wait", {
-      idempotencyKey: `p1143-root-wait:${ids.turnId}`, taskIds: [scout.taskId], mode: "all", timeoutMs: 240_000,
+    const waitOrdinal = (request.messages ?? []).flatMap(message => message.content ?? []).filter(part => part?.type === "tool_use" && part.name === "agent.wait").length
+    yield toolCall(`p1143-root-wait-${waitOrdinal}`, "agent.wait", {
+      idempotencyKey: `p1143-root-wait:${ids.turnId}:${waitOrdinal}`, taskIds: [scout.taskId], mode: "all", timeoutMs: 30_000,
     })
     yield completed()
   } }, registry: {}, candidates: [] }
@@ -144,11 +145,6 @@ function childModelRuntime({ task, runtime, markerState }) {
   const delegateTwo = `p1143-delegate-beta:${task.id}`, resultsCall = `p1143-results:${task.id}`
   return { id: `p1143-${task.depth}-${task.id}`, profile, async *stream(request) {
     if (task.depth === 2) {
-      if (mode === "park") {
-        markerState.blocked.add(task.id)
-        if (markerState.blocked.size === 2) say("P1143_TWO_GRANDCHILDREN_BLOCKED")
-        await new Promise(() => {})
-      }
       await waitForTwoRunningChildren(task, markerState)
       const discoverCall = `p1143-child-discover:${task.id}`
       const receipt = toolResult(request, discoverCall)

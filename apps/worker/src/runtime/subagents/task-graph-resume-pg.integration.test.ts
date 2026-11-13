@@ -4002,11 +4002,23 @@ function repairWaitOutcomeFromRequest(
   callId: string,
   expectedTaskIds: readonly string[],
   resolvedOriginal?: unknown,
+  onCallDiagnostic?: (diagnostic: RepairWaitCallInputDiagnostic) => void,
 ): RecordValue {
   const waitCall = toolUseFromRequest(request, callId)
   const waitInput = record(waitCall?.input)
+  const requestedTaskIds = stringIds(waitInput?.taskIds)
+  const callDiagnostic: RepairWaitCallInputDiagnostic = {
+    callFound: waitCall !== null,
+    nameMatches: waitCall?.name === "agent.wait",
+    inputExists: waitInput !== null,
+    modeAll: waitInput?.mode === "all",
+    taskIdsSetMatches: requestedTaskIds !== null && sameUniqueIds(requestedTaskIds, expectedTaskIds),
+    expectedTaskCount: boundedRepairWaitDiagnosticCount(expectedTaskIds.length),
+    requestTaskCount: requestedTaskIds === null ? null : boundedRepairWaitDiagnosticCount(requestedTaskIds.length),
+  }
+  try { onCallDiagnostic?.(callDiagnostic) } catch { /* Diagnostics must not change the fixture result. */ }
   if (waitCall?.name !== "agent.wait" || !waitInput
-    || !sameUniqueIds(stringIds(waitInput.taskIds) ?? [], expectedTaskIds) || waitInput.mode !== "all") {
+    || !sameUniqueIds(requestedTaskIds ?? [], expectedTaskIds) || waitInput.mode !== "all") {
     throw new Error("Repair wait call did not match the accepted plan task IDs")
   }
   const original = record(resolvedOriginal === undefined ? latestToolResult(request, callId) : resolvedOriginal)
@@ -4035,6 +4047,16 @@ function repairWaitOutcomeFromRequest(
   }
   return outcome
 }
+
+type RepairWaitCallInputDiagnostic = Readonly<{
+  callFound: boolean
+  nameMatches: boolean
+  inputExists: boolean
+  modeAll: boolean
+  taskIdsSetMatches: boolean
+  expectedTaskCount: number
+  requestTaskCount: number | null
+}>
 
 type RepairWaitReference = { readonly id: string; readonly sizeBytes: number; readonly sha256: string }
 type RepairWaitFailureClass =
@@ -11358,6 +11380,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const independentCompletionAllowed = new Promise<void>(resolve => { releaseIndependentCompletion = resolve })
     let replacementPlanResultDiagnostic = "not_observed"
     let replacementPlanCommandDiagnostic = "not_called"
+    let replacementWaitCallDiagnostic = "not_observed"
     let canonicalExecutionDiagnostic = "not_observed"
     let modelCallbackStageDiagnostic = "not_entered"
     let modelCallbackStatusDiagnostic = "not_observed"
@@ -11825,7 +11848,24 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             // A durable wait may resume the same adapter or create a fresh one.
             // Both paths must consume the replacement wait result and verify the new graph.
             if ((execution === 2 && round === replacementAcceptedRound + 1) || (execution === 3 && round === 1)) {
-              const outcome = repairWaitOutcomeFromRequest(request, replacementWaitCallId, replacementTaskIds)
+              const outcome = repairWaitOutcomeFromRequest(request, replacementWaitCallId, replacementTaskIds, undefined, callDiagnostic => {
+                const acceptedPlanResult = record(latestToolResult(request, replacementPlanCallId))
+                const acceptedPlanNodes = Array.isArray(acceptedPlanResult?.nodes) ? acceptedPlanResult.nodes.map(record) : []
+                const acceptedPlanTaskIds = stringIds(acceptedPlanNodes.map(node => node?.taskId))
+                replacementWaitCallDiagnostic = JSON.stringify({
+                  phase: "replacement_wait_resume",
+                  callbackExecution: boundedRepairWaitDiagnosticCount(execution),
+                  callbackRound: boundedRepairWaitDiagnosticCount(round),
+                  resumeKind: execution === 2 ? "same_adapter" : execution === 3 ? "fresh_adapter" : "other",
+                  acceptedPlanWasObserved: replacementPlanAccepted,
+                  acceptedPlanReceiptFound: acceptedPlanResult !== null,
+                  acceptedPlanReceiptAccepted: acceptedPlanResult?.status === "accepted",
+                  acceptedPlanReceiptNodeCount: boundedRepairWaitDiagnosticCount(acceptedPlanNodes.length),
+                  expectedTaskIdsMatchAcceptedReceipt: acceptedPlanTaskIds !== null
+                    && sameUniqueIds(acceptedPlanTaskIds, replacementTaskIds),
+                  ...callDiagnostic,
+                })
+              })
               expect(outcome.status).toBe("ready")
               const waitTaskStatuses = new Map<string, unknown>()
               for (const value of Array.isArray(outcome.tasks) ? outcome.tasks : []) {
@@ -11926,7 +11966,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForTurnStatus(pool!, value.turnId, "completed", 90_000, replacementWaitCallId)
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Turn status wait failed"
-      throw new Error(reason + "; replacementPlanCommand=" + replacementPlanCommandDiagnostic + "; replacementPlanResult=" + replacementPlanResultDiagnostic + "; canonicalExecution=" + canonicalExecutionDiagnostic + "; rootExecutions=" + rootExecutions + "; modelCallbackStage=" + modelCallbackStageDiagnostic + "; modelCallbackStatuses=" + modelCallbackStatusDiagnostic + "; modelCallbackFailure=" + modelCallbackFailureDiagnostic)
+      throw new Error(reason + "; replacementPlanCommand=" + replacementPlanCommandDiagnostic + "; replacementPlanResult=" + replacementPlanResultDiagnostic + "; canonicalExecution=" + canonicalExecutionDiagnostic + "; rootExecutions=" + rootExecutions + "; modelCallbackStage=" + modelCallbackStageDiagnostic + "; modelCallbackStatuses=" + modelCallbackStatusDiagnostic + "; modelCallbackFailure=" + modelCallbackFailureDiagnostic + "; replacementWaitCall=" + replacementWaitCallDiagnostic)
     }
     const turn = await pool!.query<{ rootTaskId: string | null; finalResponse: string | null; status: string }>(
       `SELECT "rootTaskId", "finalResponse", "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
