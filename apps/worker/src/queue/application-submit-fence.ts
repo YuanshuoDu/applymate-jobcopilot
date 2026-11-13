@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto"
 import type { Pool, PoolClient } from "pg"
+import { recordApplicationSubmissionEvidence } from "./application-submission-evidence.js"
 
 export type ApplicationSubmitIdentity = Readonly<{
   sessionId: string
@@ -102,6 +103,8 @@ export async function recordSubmissionExecutionSettled(pool: Pool, scope: Applic
   if (!validIdentity(scope) || !scope.workerTaskId.trim() || !scope.executionId.trim()) return false
   const client = await pool.connect()
   let transactionOpen = false
+  let projectEvidence = false
+  let settled = false
   try {
     await client.query("BEGIN"); transactionOpen = true
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", scope.userId])
@@ -131,9 +134,17 @@ export async function recordSubmissionExecutionSettled(pool: Pool, scope: Applic
     })
     if (fenced.kind === "superseded") await appendFencedSubmitAudit(client, scope, "submission_execution_settled")
     await client.query("COMMIT"); transactionOpen = false
-    return fenced.kind === "current" && fenced.value
+    if (fenced.kind === "current") {
+      projectEvidence = true
+      settled = fenced.value
+    }
   } catch (error: unknown) {
     if (transactionOpen) await client.query("ROLLBACK").catch(() => undefined)
     throw error
   } finally { client.release() }
+  if (projectEvidence) {
+    // This read model is optional and cannot turn a settled submit into a retry.
+    try { await recordApplicationSubmissionEvidence(pool, scope) } catch { /* Missing projection remains unknown. */ }
+  }
+  return settled
 }
