@@ -107,8 +107,8 @@ export {
   projectTaskEvidencePreview,
 } from './plan-ledger.js'
 export type { PlanLedger, PlanLedgerEvidencePreview, PlanLedgerReadiness, PlanLedgerStatus, TaskGraphSnapshot, TaskGraphSnapshotNode } from './plan-ledger.js'
-export { parseTaskGraphVerificationSummary, projectTaskGraphVerificationSummary, TASK_GRAPH_VERIFICATION_DISPLAY_VERSION } from './plan-ledger-task-graph-verification-display.js'
-export type { TaskGraphVerificationDisplayCheck, TaskGraphVerificationDisplayNode, TaskGraphVerificationSummary } from './plan-ledger-task-graph-verification-display.js'
+export { parseTaskGraphVerificationSummary, projectTaskGraphVerificationSummary, TASK_GRAPH_VERIFICATION_DISPLAY_V2_VERSION, TASK_GRAPH_VERIFICATION_DISPLAY_VERSION } from './plan-ledger-task-graph-verification-display.js'
+export type { TaskGraphVerificationDisplayCheck, TaskGraphVerificationDisplayNode, TaskGraphVerificationDisplayReason, TaskGraphVerificationDisplayVersion, TaskGraphVerificationSummary } from './plan-ledger-task-graph-verification-display.js'
 export type {
   ModelCapabilities,
   ModelContentPart,
