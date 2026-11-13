@@ -9,9 +9,12 @@ import { applyCompletionRecovery, tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVER
 import { completeTurnCandidate } from "./turn-execution-final-candidate.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
-import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
+import { buildGroundedTaskGraphFinalResponse } from "../subagents/task-graph-final-response.js"
+import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
 import { reduceTaskGraphFinalSummary } from "../subagents/task-graph-final-summary.js"
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
+import { taskGraphItemId, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
+import type { GraphTaskRow, LoadedGraph } from "../subagents/task-graph-pg-state.js"
 
 const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
 const { updateRootObjectiveHistoryProjectionMock } = vi.hoisted(() => ({ updateRootObjectiveHistoryProjectionMock: vi.fn(async () => true) }))
@@ -408,6 +411,79 @@ describe("atomic Turn terminal commit", () => {
       ...boundInput, response: JSON.stringify(changedFinal), finalContent: { text: changedFinal.response, final: changedFinal },
     }, guard)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
     expect(guard).toHaveBeenCalledOnce()
+  })
+
+  it("atomically records the grounded bound reply and its matching final-step receipt once", async () => {
+    const fake = makePool()
+    const task: GraphTaskRow = { id: "child-1", role: "scout", taskType: "research", status: "completed", failureReason: null,
+      result: { status: "completed" } }
+    const taskGraphSnapshot: TaskGraphSnapshot = {
+      schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, rootSuccessCriteria: ["Identify a source-backed role."],
+      nodes: [{ taskId: task.id, key: "research", templateId: "scout", goal: "Find a relevant role", successCriteria: ["Report a source-backed role."], dependsOn: [], depth: 0 }],
+    }
+    const loaded: LoadedGraph = {
+      rootTaskId: owner.rootTaskId, item: { id: taskGraphItemId(owner.rootTaskId), revision: 1, content: {}, createdAt: new Date(0) },
+      snapshot: taskGraphSnapshot,
+      state: taskGraphState(taskGraphSnapshot, 1, new Map([[task.id, { status: task.status, failureReason: task.failureReason }]]), []),
+      tasks: new Map([[task.id, task]]),
+    }
+    const binding = buildTaskGraphFinalSummaryBinding(loaded)
+    if (!binding) throw new Error("Expected a current TaskGraph final-summary binding")
+    const rawModelCandidate = "All requested jobs were prepared and every application was submitted."
+    const groundedResponse = buildGroundedTaskGraphFinalResponse(binding)
+    const completionGate = vi.fn(async () => ({ ok: true as const, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding }))
+    const finalizationGuard = vi.fn(async (_client: pg.PoolClient, terminal: Parameters<TurnEngineTerminalGuard>[1]) => {
+      expect(terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toBe(binding)
+      const finalContent = terminal.finalContent as { text: string; final: { response: string; summary: string } }
+      const serialized = JSON.parse(terminal.response) as { response: string; summary: string }
+      expect(finalContent.text).toBe(groundedResponse)
+      expect(finalContent.final.response).toBe(groundedResponse)
+      expect(serialized.response).toBe(groundedResponse)
+      expect(serialized.summary).toBe(formatTaskGraphFinalSummary(binding.summary))
+      expect(terminal.response).not.toContain(rawModelCandidate)
+      return { ok: true as const }
+    })
+    const recordFinalResponse = vi.fn(async (candidate: Parameters<NonNullable<TurnExecutionOptions["store"]["recordFinalResponse"]>>[0]) => {
+      if (!candidate.terminal) return undefined
+      if (candidate.identity.kind !== "turn") throw new Error("Expected a root Turn owner")
+      return commitTurnTerminal(fake.pool, { ...candidate.terminal, owner: candidate.identity, response: candidate.response, now: candidate.now }, finalizationGuard)
+    })
+    const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [{ id: "job-1", kind: "job" as const, ownerId: owner.userId }], toolObservations: [] }
+    const options = {
+      identity: owner, goal: "Find and prepare suitable roles", snapshot, completionGate, tools: [],
+      store: { updateStep: vi.fn(async () => undefined), recordFinalResponse }, idFactory: (value: string) => value,
+    } as unknown as TurnExecutionOptions
+    const onStepClosed = vi.fn()
+    const outcome = await completeTurnCandidate({
+      options, writer: { append: vi.fn(async () => ({ id: "step-completed-event" })) } as unknown as TurnExecutionEventWriter,
+      step: { id: input.stepId, ordinal: 1 },
+      output: { text: rawModelCandidate, reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model",
+        finishReason: "stop", usage: null, continuation: null },
+      finalResponseText: rawModelCandidate, snapshot, stepCount: 2, toolCallCount: 1,
+      usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.001 },
+      signal: new AbortController().signal, now: () => now, onStepClosed,
+    })
+
+    expect(outcome).toMatchObject({ kind: "completed" })
+    expect(completionGate).toHaveBeenCalledOnce()
+    expect(recordFinalResponse).toHaveBeenCalledOnce()
+    expect(finalizationGuard).toHaveBeenCalledOnce()
+    expect(onStepClosed).toHaveBeenCalledOnce()
+    const recorded = recordFinalResponse.mock.calls[0]?.[0]
+    if (!recorded?.terminal) throw new Error("Expected the grounded final response to be recorded atomically")
+    const finalText = JSON.parse(recorded.response) as { response: string; summary: string }
+    expect(outcome.kind === "completed" && outcome.result.finalText).toBe(finalText.response)
+    expect(finalText.response).toBe(groundedResponse)
+    expect(finalText.response).not.toBe(rawModelCandidate)
+    expect(fake.state.turn.finalResponse).toBe(recorded.response)
+    expect(fake.state.turn.status).toBe("completed")
+    expect(fake.state.root.status).toBe("completed")
+    expect(fake.items.get(recorded.terminal.finalItemId)?.content).toEqual(recorded.terminal.finalContent)
+    const completedItemEvent = [...fake.events.values()].find(event => event.type === "item.completed" && event.itemId === recorded.terminal?.finalItemId)
+    expect((completedItemEvent?.payload as Row | undefined)?.content).toEqual(recorded.terminal.finalContent)
+    const stepReceipt = fake.calls.find(call => call.sql.includes('FROM "agent_steps" AS step'))
+    expect(stepReceipt?.values?.slice(3, 6)).toEqual([input.stepId, recorded.terminal.finalItemId,
+      `turn:${owner.turnId}:event:final-completed:${recorded.terminal.finalItemId}:1`])
   })
 
   it("validates before terminal writes and bypasses the guard on committed replay after source changes", async () => {

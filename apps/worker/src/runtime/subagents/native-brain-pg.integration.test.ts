@@ -13,6 +13,9 @@ import {
 } from "./native-verification-contract.js"
 import { parseNativeVerificationPacket } from "./native-verification-packet.js"
 import { parseTaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { buildTaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
+import { buildGroundedTaskGraphFinalResponse } from "./task-graph-final-response.js"
+import { loadTaskGraph } from "./task-graph-pg-state.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 import type { SubagentJobPayload } from "./types.js"
 
@@ -289,6 +292,63 @@ function verificationReport(
 }
 
 type CanonicalFixture = Readonly<{ userId: string; sessionId: string; turnId: string; ownerId: string; jobId: string }>
+
+type CanonicalBrainPhase =
+  | "fixture_seeded"
+  | "module_imports_started" | "imported_runtime" | "imported_command_port" | "imported_templates"
+  | "imported_bootstrap" | "imported_child_runtime" | "imported_turn_queue" | "imported_apply_results"
+  | "imported_final_candidate" | "module_imports_completed"
+  | "initial_stack_starting" | "initial_runtime_ready" | "initial_bootstrap_ready"
+  | "turn_enqueue_started" | "turn_enqueued"
+  | "durable_child_wait_started" | "durable_child_wait_ready"
+  | "subagent_resume_started" | "subagent_resumed"
+  | "accepted_candidate_wait_started" | "accepted_candidate_ready"
+  | "accepted_queue_pause_started" | "accepted_queue_paused" | "accepted_candidate_released"
+  | "accepted_control_wait_started" | "accepted_control_wait_ready"
+  | "first_bootstrap_close_started" | "first_bootstrap_closed"
+  | "restart_stack_starting" | "restart_runtime_ready" | "restart_bootstrap_ready"
+  | "restart_queue_resume_started" | "restart_queue_resumed"
+  | "terminal_turn_wait_started" | "terminal_turn_wait_ready"
+  | "final_record_read_started" | "final_record_read_complete"
+  | "grounded_readback_started" | "grounded_readback_complete"
+  | "final_readback_pool_connect_started" | "final_readback_pool_acquired"
+  | "final_readback_transaction_started" | "final_readback_transaction_ready"
+  | "final_readback_load_started" | "final_readback_load_completed"
+  | "final_readback_rollback_started" | "final_readback_rollback_settled" | "final_readback_client_released"
+  | "cleanup_started" | "cleanup_queue_gate_started" | "cleanup_queue_gate_settled"
+  | "cleanup_bootstrap_close_started" | "cleanup_bootstrap_close_settled"
+  | "cleanup_pool_close_started" | "cleanup_pool_close_settled"
+  | "cleanup_fixture_delete_started" | "cleanup_fixture_delete_settled" | "cleanup_completed"
+
+function noteCanonicalBrainPhase(phase: CanonicalBrainPhase): void {
+  process.stdout.write(`NATIVE_BRAIN_PG_PHASE ${phase}\n`)
+}
+
+async function currentGroundedTaskGraphResponse(owner: CanonicalFixture, rootTaskId: string): Promise<string> {
+  noteCanonicalBrainPhase("final_readback_pool_connect_started")
+  const client = await pool!.connect()
+  noteCanonicalBrainPhase("final_readback_pool_acquired")
+  try {
+    noteCanonicalBrainPhase("final_readback_transaction_started")
+    await client.query("BEGIN READ ONLY")
+    noteCanonicalBrainPhase("final_readback_transaction_ready")
+    await client.query("SELECT set_config('app.user_id', $1, true)", [owner.userId])
+    noteCanonicalBrainPhase("final_readback_load_started")
+    const graph = await loadTaskGraph(client, {
+      userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId, parentTaskId: rootTaskId,
+    }, false)
+    noteCanonicalBrainPhase("final_readback_load_completed")
+    const binding = buildTaskGraphFinalSummaryBinding(graph)
+    if (!binding) throw new Error("Current TaskGraph did not produce its final-summary binding")
+    return buildGroundedTaskGraphFinalResponse(binding)
+  } finally {
+    noteCanonicalBrainPhase("final_readback_rollback_started")
+    await client.query("ROLLBACK").catch(() => undefined)
+    noteCanonicalBrainPhase("final_readback_rollback_settled")
+    client.release()
+    noteCanonicalBrainPhase("final_readback_client_released")
+  }
+}
 
 const SAFE_TURN_STATUSES = new Set([
   "queued", "in_progress", "waiting_for_dependency", "waiting_for_user", "waiting_for_approval", "interrupted", "failed", "completed",
@@ -632,18 +692,27 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       jobId: fixtureJobId(),
     }
     await seedCanonicalFixture(canonical)
+    noteCanonicalBrainPhase("fixture_seeded")
 
     const previousDatabaseUrl = process.env.DATABASE_URL
     process.env.DATABASE_URL = databaseUrl!
+    noteCanonicalBrainPhase("module_imports_started")
+    // Vitest stalls when these runtime modules are loaded concurrently.
     const [
       { createCanonicalTurnRuntime }, { createPgTaskGraphCommandPort }, { TASK_GRAPH_TEMPLATES },
       { createProductionWorkerBootstrap }, { createProductionChildExecutor }, { enqueueTurn },
       { closePool }, { persistedFinalCandidate },
-    ] = await Promise.all([
-      import("../canonical-turn-runtime.js"), import("./pg-task-graph-command-port.js"), import("./task-graph-templates.js"),
-      import("../../queue/production-bootstrap.js"), import("./production-child-runtime.js"), import("../turns/turn-queue.js"),
-      import("../../db/apply-results.js"), import("../turns/turn-execution-final-candidate.js"),
-    ])
+    ] = [
+      await import("../canonical-turn-runtime.js").then(module => { noteCanonicalBrainPhase("imported_runtime"); return module }),
+      await import("./pg-task-graph-command-port.js").then(module => { noteCanonicalBrainPhase("imported_command_port"); return module }),
+      await import("./task-graph-templates.js").then(module => { noteCanonicalBrainPhase("imported_templates"); return module }),
+      await import("../../queue/production-bootstrap.js").then(module => { noteCanonicalBrainPhase("imported_bootstrap"); return module }),
+      await import("./production-child-runtime.js").then(module => { noteCanonicalBrainPhase("imported_child_runtime"); return module }),
+      await import("../turns/turn-queue.js").then(module => { noteCanonicalBrainPhase("imported_turn_queue"); return module }),
+      await import("../../db/apply-results.js").then(module => { noteCanonicalBrainPhase("imported_apply_results"); return module }),
+      await import("../turns/turn-execution-final-candidate.js").then(module => { noteCanonicalBrainPhase("imported_final_candidate"); return module }),
+    ]
+    noteCanonicalBrainPhase("module_imports_completed")
 
     const acceptedCandidate = "Fact 42 is present in the owned job description."
     const rejectedCandidate = "The owned job description says Fact 42 is absent."
@@ -963,6 +1032,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
             requirement: { nativeTools: true, structuredOutput: true, streaming: true }, reason: "Deterministic native-brain PG acceptance" }],
         }),
       })
+      noteCanonicalBrainPhase(generation === 1 ? "initial_runtime_ready" : "restart_runtime_ready")
       try {
         const bootstrap = await createProductionWorkerBootstrap({
           pool: pool!, runtime, ownerId: `${canonical.ownerId}-${generation}`,
@@ -970,6 +1040,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
           waitResolver: { intervalMs: 50, batchSize: 20, ownerId: `${canonical.ownerId}-wait-${generation}` },
           subagents: { execute: childExecutor, intervalMs: 50 },
         })
+        noteCanonicalBrainPhase(generation === 1 ? "initial_bootstrap_ready" : "restart_bootstrap_ready")
         return bootstrap
       } catch (error: unknown) {
         await runtime.close().catch(() => undefined)
@@ -979,10 +1050,14 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
 
     let bootstrap: Awaited<ReturnType<typeof makeStack>> | undefined
     try {
+      noteCanonicalBrainPhase("initial_stack_starting")
       bootstrap = await makeStack(1)
       if (!bootstrap.subagents) throw new Error("canonical default bootstrap omitted its actual child queue")
       await bootstrap.subagents.queue.worker.pause(true)
+      noteCanonicalBrainPhase("turn_enqueue_started")
       await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: canonical.turnId, sessionId: canonical.sessionId, ownerId: `${canonical.ownerId}-1` })
+      noteCanonicalBrainPhase("turn_enqueued")
+      noteCanonicalBrainPhase("durable_child_wait_started")
       await waitForDatabase("durable target child wait", async () => (await pool!.query<{
         turnStatus: string; childStatus: string; waitStatus: string; taskId: string
       }>(`SELECT turn."status" AS "turnStatus", child."status" AS "childStatus", wait."status" AS "waitStatus", child."id" AS "taskId"
@@ -993,7 +1068,11 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
         WHERE child."sessionId" = $1 AND child."turnId" = $2 AND child."role" = 'analyst' AND child."goal" = $3
         ORDER BY child."createdAt" LIMIT 1`, [canonical.sessionId, canonical.turnId, childGoal])).rows[0],
       value => value?.turnStatus === "waiting_for_dependency" && value.childStatus === "queued" && value.waitStatus === "waiting")
+      noteCanonicalBrainPhase("durable_child_wait_ready")
+      noteCanonicalBrainPhase("subagent_resume_started")
       await bootstrap.subagents.queue.worker.resume()
+      noteCanonicalBrainPhase("subagent_resumed")
+      noteCanonicalBrainPhase("accepted_candidate_wait_started")
       await Promise.race([acceptedCandidateEntered, delay(90_000).then(() => {
         return Promise.all([
           pool!.query<{ turnStatus: string | null; turnErrorCode: string | null; rootStepErrorCode: string | null; finalRejectedCount: number;
@@ -1033,14 +1112,19 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
           throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}; requestTrace=${JSON.stringify(rootRequestDiagnostics)}; judgeTrace=${JSON.stringify(canonicalJudgeDiagnostics)}; persistedState=${JSON.stringify(safeState)}; childFixture=${JSON.stringify({ modelRequests: targetChildModelRequests, requestsWithSearch: targetChildRequestsWithSearch, searchCalls: targetChildSearchCalls, providerFailures: targetChildProviderFailures })}; childRecovery=${JSON.stringify({ lastWaitDisposition, transitions: childRecoveryDiagnostics, children: childState })}`)
         })
       })])
+      noteCanonicalBrainPhase("accepted_candidate_ready")
+      noteCanonicalBrainPhase("accepted_queue_pause_started")
       const { SUBAGENT_QUEUE_NAME } = await import("../../queue/subagent-queue.js")
       queuePauseGate = new Queue<SubagentJobPayload, unknown, string>(SUBAGENT_QUEUE_NAME, {
         connection: redis!, skipVersionCheck: true,
       })
       await queuePauseGate.pause()
       expect(await queuePauseGate.isPaused()).toBe(true)
+      noteCanonicalBrainPhase("accepted_queue_paused")
       releaseAcceptedCandidate()
+      noteCanonicalBrainPhase("accepted_candidate_released")
 
+      noteCanonicalBrainPhase("accepted_control_wait_started")
       const pendingRootControl = await waitForDatabase("durable accepted root-goal wait", async () => {
         const turn = (await pool!.query<{ status: string; rootTaskId: string | null }>(
           `SELECT "status", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
@@ -1060,30 +1144,48 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
         return { turnStatus: turn?.status, control: accepted && { id: accepted.id, status: accepted.status }, wait: wait?.rows[0]?.status }
       }, value => value.turnStatus === "waiting_for_dependency" && value.control?.status === "queued" && value.wait === "waiting")
       const rootStreamsAtCandidate = rootModelStreams
+      noteCanonicalBrainPhase("accepted_control_wait_ready")
+      noteCanonicalBrainPhase("first_bootstrap_close_started")
       await bootstrap.close()
+      noteCanonicalBrainPhase("first_bootstrap_closed")
+      noteCanonicalBrainPhase("restart_stack_starting")
       bootstrap = await makeStack(2)
       if (!bootstrap.subagents) throw new Error("recreated bootstrap omitted its actual child queue")
       const recreatedQueue = bootstrap.subagents.queue.queue as unknown as Queue<SubagentJobPayload, unknown, string>
       expect(await recreatedQueue.isPaused()).toBe(true)
+      noteCanonicalBrainPhase("restart_queue_resume_started")
       await recreatedQueue.resume()
       expect(await recreatedQueue.isPaused()).toBe(false)
+      noteCanonicalBrainPhase("restart_queue_resumed")
       await queuePauseGate.close()
       queuePauseGate = undefined
+      noteCanonicalBrainPhase("terminal_turn_wait_started")
       await waitForDatabase("canonical terminal Turn", async () => (await pool!.query<{ status: string; finalResponse: string | null }>(
         `SELECT "status", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
         [canonical.turnId, canonical.sessionId])).rows[0], value => value?.status === "completed" && typeof value.finalResponse === "string")
+      noteCanonicalBrainPhase("terminal_turn_wait_ready")
       expect(rootModelStreams).toBe(rootStreamsAtCandidate)
 
+      noteCanonicalBrainPhase("final_record_read_started")
       const turn = await pool!.query<{ status: string; finalResponse: string | null; rootTaskId: string | null }>(
         `SELECT "status", "finalResponse", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
         [canonical.turnId, canonical.sessionId])
       const rootTaskId = turn.rows[0]?.rootTaskId
+      if (!rootTaskId) throw new Error("Completed canonical Turn lost its root TaskGraph identity")
       const finalItem = await pool!.query<{ content: unknown }>(
         `SELECT "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
           AND "type" = 'agent_message' AND "phase" = 'final_answer' AND "status" = 'completed' ORDER BY "createdAt" DESC LIMIT 1`,
         [canonical.sessionId, canonical.turnId, rootTaskId])
       expect(turn.rows[0]?.status).toBe("completed")
-      expect(persistedFinalCandidate(finalItem.rows[0]?.content, turn.rows[0]?.finalResponse)).toBe(acceptedCandidate)
+      const persistedFinal = persistedFinalCandidate(finalItem.rows[0]?.content, turn.rows[0]?.finalResponse)
+      if (!persistedFinal) throw new Error("The completed Turn final item did not match its serialized response")
+      noteCanonicalBrainPhase("final_record_read_complete")
+      noteCanonicalBrainPhase("grounded_readback_started")
+      expect(persistedFinal).toBe(await currentGroundedTaskGraphResponse(canonical, rootTaskId))
+      noteCanonicalBrainPhase("grounded_readback_complete")
+      expect(persistedFinal).toContain("Task-reported results:")
+      expect(persistedFinal).toContain("These are structured task reports, not independent verification.")
+      expect(persistedFinal).not.toContain(acceptedCandidate)
       const completedEvents = await pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_events"
         WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.completed'`, [canonical.sessionId, canonical.turnId])
       expect(completedEvents.rows[0]?.count).toBe(1)
@@ -1174,17 +1276,27 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       expect(publicText).not.toContain(NATIVE_VERIFICATION_PACKET_CONTEXT_KEY)
       expect(publicText).not.toContain(NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA)
     } finally {
+      noteCanonicalBrainPhase("cleanup_started")
       releaseAcceptedCandidate()
       if (queuePauseGate) {
+        noteCanonicalBrainPhase("cleanup_queue_gate_started")
         await queuePauseGate.resume().catch(() => undefined)
         await queuePauseGate.close().catch(() => undefined)
+        noteCanonicalBrainPhase("cleanup_queue_gate_settled")
       }
+      noteCanonicalBrainPhase("cleanup_bootstrap_close_started")
       await bootstrap?.close().catch(() => undefined)
+      noteCanonicalBrainPhase("cleanup_bootstrap_close_settled")
+      noteCanonicalBrainPhase("cleanup_pool_close_started")
       await closePool().catch(() => undefined)
+      noteCanonicalBrainPhase("cleanup_pool_close_settled")
       if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL
       else process.env.DATABASE_URL = previousDatabaseUrl
+      noteCanonicalBrainPhase("cleanup_fixture_delete_started")
       await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [canonical.sessionId]).catch(() => undefined)
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [canonical.userId]).catch(() => undefined)
+      noteCanonicalBrainPhase("cleanup_fixture_delete_settled")
+      noteCanonicalBrainPhase("cleanup_completed")
     }
   }, 180_000)
 })
