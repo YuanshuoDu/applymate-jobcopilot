@@ -9,6 +9,7 @@ import { readNeonUsage } from '@/lib/admin/neon-usage'
 import { readAzureKeyVaultUsage } from '@/lib/admin/azure-key-vault-usage'
 import { quotaPeriodBounds, type QuotaPeriod } from '@/lib/api-usage/quota-period'
 import { MODEL_CATALOGUE } from '@/lib/model-router'
+import { loadOptimizationRows } from './optimization-rows'
 
 type JobRow = { provider: string; operation: string; credentialSource: string; calls: number; jobs: number; errors: number; avgLatency: number | null; lastEventAt: Date | null }
 type AiRow = { provider: string; model: string; credentialSource: string; calls: number; inputTokens: number; outputTokens: number; cost: number; errors: number; avgLatency: number | null; lastEventAt: Date | null }
@@ -16,7 +17,6 @@ type ExternalRow = { provider: string; operation: string; credentialSource: stri
 type TrendRow = { day: Date; category: string; calls: number; errors: number; units: number; cost: number }
 type UserSummaryRow = { userId: string; category: 'job' | 'ai' | 'external'; calls: number; jobs: number; tokens: number; bytes: number; cost: number; errors: number; avgLatency: number | null; lastEventAt: Date | null }
 type UserDetailRow = UserSummaryRow & { provider: string; operationModel: string; featureKey: string | null; runtime: string; credentialSource: string }
-type OptimizationRow = { eventType: string; provider: string | null; events: number; requestsAvoided: number; jobsReturned: number; netNewJobs: number; validApplyUrls: number; completeDescriptions: number }
 const number = (value: unknown) => Number(value ?? 0)
 const latestEvent = (rows: Array<{ lastEventAt: Date | string | null }>) => rows.reduce<Date | null>((latest, row) => {
   if (!row.lastEventAt) return latest
@@ -33,22 +33,6 @@ function externalCostKnown(provider: (typeof EXTERNAL_API_PROVIDERS)[number]): b
   if (provider.billing === 'free') return true
   if (provider.billing === 'unknown') return false
   return configuredExternalCost(provider.key)
-}
-
-async function loadOptimizationRows(since: Date, provider: string | undefined): Promise<OptimizationRow[]> {
-  const providerFilter = provider ? Prisma.sql`AND provider = ${provider}` : Prisma.empty
-  try {
-    return (await db.$queryRaw<OptimizationRow[]>`
-      SELECT event_type AS "eventType", provider, COUNT(*)::int AS events,
-        SUM(requests_avoided)::int AS "requestsAvoided", SUM(jobs_returned)::int AS "jobsReturned",
-        SUM(net_new_jobs)::int AS "netNewJobs", SUM(valid_apply_urls)::int AS "validApplyUrls",
-        SUM(complete_descriptions)::int AS "completeDescriptions"
-      FROM discovery_optimization_events
-      WHERE created_at >= ${since} ${providerFilter}
-      GROUP BY event_type, provider ORDER BY "requestsAvoided" DESC`) ?? []
-  } catch {
-    return []
-  }
 }
 
 async function loadExternalRows(since: Date, provider: string | undefined): Promise<ExternalRow[]> {
@@ -95,7 +79,7 @@ export async function GET(request: NextRequest) {
         COALESCE(SUM(estimated_cost_usd), 0)::float AS cost,
         COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
         ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
-      FROM ai_usage_events WHERE created_at >= ${since} ${aiProviderFilter}
+      FROM ai_usage_events WHERE created_at >= ${since} ${aiProviderFilter} AND status IN ('success', 'error')
       GROUP BY provider, model, credential_source ORDER BY cost DESC, calls DESC`,
     loadExternalRows(since, provider),
     db.$queryRaw<TrendRow[]>`
@@ -108,7 +92,7 @@ export async function GET(request: NextRequest) {
         UNION ALL
         SELECT DATE_TRUNC('day', created_at), 'ai', COUNT(*), COUNT(*) FILTER (WHERE status = 'error'),
           SUM(input_tokens + output_tokens), SUM(estimated_cost_usd)
-        FROM ai_usage_events WHERE created_at >= ${since} ${aiProviderFilter} GROUP BY DATE_TRUNC('day', created_at)
+        FROM ai_usage_events WHERE created_at >= ${since} ${aiProviderFilter} AND status IN ('success', 'error') GROUP BY DATE_TRUNC('day', created_at)
         UNION ALL
         SELECT DATE_TRUNC('day', created_at), 'external', SUM(request_count), COUNT(*) FILTER (WHERE status = 'error'),
           SUM(input_bytes + output_bytes), SUM(estimated_cost_usd)
@@ -131,7 +115,7 @@ export async function GET(request: NextRequest) {
         COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
         ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
       FROM ai_usage_events
-      WHERE user_id IS NOT NULL AND created_at >= ${since} ${aiProviderFilter}
+      WHERE user_id IS NOT NULL AND created_at >= ${since} ${aiProviderFilter} AND status IN ('success', 'error')
       GROUP BY user_id
       UNION ALL
       SELECT user_id AS "userId", 'external' AS category, SUM(request_count)::int AS calls, 0::int AS jobs,
@@ -158,7 +142,7 @@ export async function GET(request: NextRequest) {
         COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
         ROUND(AVG(latency_ms))::int AS "avgLatency", MAX(created_at) AS "lastEventAt"
       FROM ai_usage_events
-      WHERE user_id = ${selectedUserId} AND created_at >= ${since} ${aiProviderFilter}
+      WHERE user_id = ${selectedUserId} AND created_at >= ${since} ${aiProviderFilter} AND status IN ('success', 'error')
       GROUP BY user_id, provider, model, feature_key, runtime, credential_source
       UNION ALL
       SELECT user_id AS "userId", 'external' AS category, provider, operation AS "operationModel",
@@ -189,7 +173,7 @@ export async function GET(request: NextRequest) {
       if (quota.metric === 'jobs') used = number((await db.jobApiUsageEvent.aggregate({ where, _sum: { jobsReturned: true } }))._sum.jobsReturned)
       else used = number((await db.jobApiUsageEvent.aggregate({ where, _sum: { requestCount: true } }))._sum.requestCount)
     } else {
-      const rows = await db.aiUsageEvent.aggregate({ where: { provider: quota.provider, credentialSource: 'platform', createdAt: { gte: bounds.start, lt: bounds.end } }, _sum: { inputTokens: true, outputTokens: true, estimatedCostUsd: true }, _count: true })
+      const rows = await db.aiUsageEvent.aggregate({ where: { provider: quota.provider, credentialSource: 'platform', status: { in: ['success', 'error'] }, createdAt: { gte: bounds.start, lt: bounds.end } }, _sum: { inputTokens: true, outputTokens: true, estimatedCostUsd: true }, _count: true })
       if (quota.metric === 'input_tokens') used = number(rows._sum.inputTokens)
       else if (quota.metric === 'output_tokens') used = number(rows._sum.outputTokens)
       else if (quota.metric === 'cost_usd') used = number(rows._sum.estimatedCostUsd)

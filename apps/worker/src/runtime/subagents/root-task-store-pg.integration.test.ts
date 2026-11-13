@@ -124,6 +124,25 @@ describePg("Root TaskStore steering finalization on disposable PostgreSQL", () =
     await admin.end()
   })
 
+  it("marks a newly inserted Root and leaves the legacy seeded Root unmarked", async () => {
+    const legacy = await admin!.query<{ outputTokenReservationVersion: number | null }>(
+      `SELECT "outputTokenReservationVersion" FROM "sub_agent_tasks" WHERE "id" = $1`, [ids.root],
+    )
+    expect(legacy.rows[0]?.outputTokenReservationVersion).toBeNull()
+    await admin!.query(`UPDATE "agent_turns" SET "rootTaskId" = NULL WHERE "id" = $1`, [ids.turn])
+    await createPgRootTaskStore(admin as unknown as PgSubagentPool).ensure({
+      lease, goal: "Create a versioned Root", budgetSnapshot: { limits: { maxOutputTokens: 2_048 } },
+    })
+    const created = await admin!.query<{ outputTokenReservationVersion: number | null }>(
+      `SELECT "outputTokenReservationVersion" FROM "sub_agent_tasks" WHERE "id" = $1`, [`root-${ids.turn}`],
+    )
+    const legacyAfter = await admin!.query<{ outputTokenReservationVersion: number | null }>(
+      `SELECT "outputTokenReservationVersion" FROM "sub_agent_tasks" WHERE "id" = $1`, [ids.root],
+    )
+    expect(created.rows[0]?.outputTokenReservationVersion).toBe(1)
+    expect(legacyAfter.rows[0]?.outputTokenReservationVersion).toBeNull()
+  })
+
   it("rolls back Root finish when consumed steering has no persisted decision receipt", async () => {
     const projectedSteer = await admin!.query<{ inputClientMessageId: string; acceptedClientMessageId: string; itemClientMessageId: string }>(
       `SELECT input."clientMessageId" AS "inputClientMessageId", event."payload"->>'clientMessageId' AS "acceptedClientMessageId",

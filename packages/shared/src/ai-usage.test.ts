@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import { estimateSharedAiCost, recordSharedAiUsage, sharedAiUsageErrorCode } from "./ai-usage.js";
+import { estimateSharedAiCost, hasSharedAiPrice, recordSharedAiUsage, sharedAiUsageErrorCode } from "./ai-usage.js";
 
 describe("shared AI usage", () => {
   it("uses the catalogue prices for every built-in model provider", () => {
     expect(estimateSharedAiCost({ provider: "anthropic", model: "claude-sonnet-5", credentialSource: "platform", inputTokens: 1_000_000, outputTokens: 1_000_000, latencyMs: 1, status: "success" })).toBe(18);
     expect(estimateSharedAiCost({ provider: "qwen", model: "qwen3.7-plus", credentialSource: "platform", inputTokens: 1_000_000, outputTokens: 1_000_000, latencyMs: 1, status: "success" })).toBe(1.4);
     expect(estimateSharedAiCost({ provider: "zhipu", model: "glm-5.1", credentialSource: "platform", inputTokens: 1_000_000, outputTokens: 1_000_000, latencyMs: 1, status: "success" })).toBe(4.55);
+    expect(hasSharedAiPrice("qwen", "qwen3.7-flash")).toBe(true);
+    expect(hasSharedAiPrice("custom", "unknown-model")).toBe(false);
   });
 
   it("estimates known provider cost and stores only operational metadata", async () => {
