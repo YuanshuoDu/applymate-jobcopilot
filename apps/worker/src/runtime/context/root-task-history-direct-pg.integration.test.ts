@@ -873,6 +873,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       phase("transaction_begin_started")
       await client.query("BEGIN")
       phase("transaction_begin_completed")
+      await client.query("SET LOCAL max_parallel_workers_per_gather = 0")
       phase("statement_timeout_started")
       await client.query("SET LOCAL statement_timeout = '10s'")
       phase("statement_timeout_set")
