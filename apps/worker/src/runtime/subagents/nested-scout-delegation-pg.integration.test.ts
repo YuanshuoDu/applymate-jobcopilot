@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from "node:util"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool, type QueryConfig, type QueryResult, type QueryResultRow } from "pg"
 import { projectWaitCallCompletionPayload } from "../turns/turn-execution-wait-event-projection.js"
+import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 
 const DATABASE_NAME = "applymate_nested_delegation_ci"
 const PROCESS_FIXTURE = fileURLToPath(new URL("./nested-scout-delegation-worker.fixture.mjs", import.meta.url))
@@ -727,14 +728,19 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
         expect(candidates[0]?.jobId).not.toBe(ids.foreignJobId)
         expect(JSON.stringify(structured.evidence)).toContain(String(candidates[0]?.jobId))
       }
-      const taskGraph = await pool.query<{ content: unknown }>(
-        `SELECT "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'task_graph' ORDER BY "revision" DESC LIMIT 1`,
-        [ids.sessionId, ids.turnId])
-      const graph = taskGraph.rows[0]?.content as Record<string, unknown>
-      const nodes = graph.nodes as Array<Record<string, unknown>>
+      const root = await pool.query<{ rootTaskId: string }>(
+        `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+        [ids.turnId, ids.sessionId, ids.userId])
+      expect(root.rows).toHaveLength(1)
+      const rootTaskId = root.rows[0]!.rootTaskId
+      const loadedGraph = await loadTaskGraph(pool, {
+        userId: ids.userId, sessionId: ids.sessionId, turnId: ids.turnId,
+        rootTaskId, parentTaskId: rootTaskId,
+      }, false)
+      const nodes = currentTaskGraph(loadedGraph).nodes
       expect(nodes).toHaveLength(1)
       expect(nodes[0]).toMatchObject({ templateId: "scout", status: "completed", readiness: "terminal" })
-      expect((nodes[0]?.verificationReport as Record<string, unknown>)?.status).toBe("passed")
+      expect(nodes[0]?.verificationReport?.status).toBe("passed")
       expect(nodes[0]?.resultProjection).toBeDefined()
       const parentReads = await pool.query<{ toolCallId: string; input: unknown; status: string }>(
         `SELECT content->>'toolCallId' AS "toolCallId", content->'input' AS input, status FROM "agent_items"
