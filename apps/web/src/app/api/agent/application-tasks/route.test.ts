@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   updateMany: vi.fn(),
   queryRaw: vi.fn(),
   taskUpdate: vi.fn(),
+  approvalFindMany: vi.fn(),
   approvalUpdateMany: vi.fn(),
   eventCreate: vi.fn(),
   fillerFindMany: vi.fn(),
@@ -27,7 +28,7 @@ vi.mock("@/lib/db", () => ({
   db: {
     applicationTask: { findMany: mocks.findMany, findFirst: mocks.findFirst, updateMany: mocks.updateMany, update: mocks.taskUpdate },
     subAgentTask: { findMany: mocks.fillerFindMany },
-    agentApproval: { updateMany: mocks.approvalUpdateMany },
+    agentApproval: { findMany: mocks.approvalFindMany, updateMany: mocks.approvalUpdateMany },
     applicationTaskEvent: { create: mocks.eventCreate },
     $transaction: mocks.transaction,
   },
@@ -59,6 +60,7 @@ describe("GET /api/agent/application-tasks retry readiness projection", () => {
   beforeEach(() => {
     Object.values(mocks).forEach(mock => mock.mockReset())
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
+    mocks.approvalFindMany.mockResolvedValue([])
     mocks.findMany.mockResolvedValue([retryReadinessTask()])
   })
 
@@ -96,6 +98,93 @@ describe("GET /api/agent/application-tasks retry readiness projection", () => {
     mocks.findMany.mockResolvedValueOnce([retryReadinessTask({ fillTurn: { ...retryReadinessTask().fillTurn, subAgentTasks: fillers } })])
 
     await expect((await getReadiness()).json()).resolves.toEqual({ tasks: [{ id: "task_1", cancelledFillRetryReady: false }] })
+  })
+})
+
+describe("GET /api/agent/application-tasks Task view", () => {
+  beforeEach(() => {
+    Object.values(mocks).forEach(mock => mock.mockReset())
+    mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
+    mocks.approvalFindMany.mockResolvedValue([])
+  })
+
+  async function getTasks() {
+    const { GET } = await import("./route")
+    return GET(new Request("http://localhost/api/agent/application-tasks") as never)
+  }
+
+  it("returns the existing Task summary with a bounded sanitized evidence projection", async () => {
+    mocks.findMany
+      .mockResolvedValueOnce([{
+        id: "task_1", userId: "user_1", jobId: "job_1", sessionId: "session_1", fillTurnId: "turn_private",
+        fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: "worker_private",
+        status: "submitted", checkpoint: "submission_verified", updatedAt: new Date("2026-11-12T10:00:00Z"),
+        job: { company: "Example", role: "Engineer", url: "https://private.example/apply" },
+      }])
+      .mockResolvedValueOnce([{
+        id: "task_1", userId: "user_1", jobId: "job_1", sessionId: "session_1", fillTurnId: "turn_private",
+        fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: "worker_private",
+        status: "submitted", checkpoint: "submission_verified", updatedAt: new Date("2026-11-12T10:00:00Z"),
+        events: [
+          { id: "queued", type: "submission_queued", actor: "user", data: { applicationTaskId: "task_1", userId: "user_1", jobId: "job_1", sessionId: "session_1", fillTurnId: "turn_private", approvalId: "approval_private", receiptId: "approval_private", constraintHash: "hash_private", workerTaskId: "worker_private" } },
+          { id: "started", type: "submission_execution_started", actor: "worker", data: { executionId: "execution_private", workerTaskId: "worker_private", applicationTaskId: "task_1", userId: "user_1", jobId: "job_1", sessionId: "session_1", fillTurnId: "turn_private", approvalId: "approval_private", constraintHash: "hash_private" } },
+          { id: "settled", type: "submission_execution_settled", actor: "worker", data: { executionId: "execution_private", workerTaskId: "worker_private", applicationTaskId: "task_1", userId: "user_1", jobId: "job_1", sessionId: "session_1", fillTurnId: "turn_private", approvalId: "approval_private", constraintHash: "hash_private" } },
+          { id: "evidence", type: "submission_evidence_recorded", actor: "worker", data: { schemaVersion: 1, userId: "user_1", sessionId: "session_1", fillTurnId: "turn_private", applicationTaskId: "task_1", jobId: "job_1", approvalId: "approval_private", constraintHash: "hash_private", workerTaskId: "worker_private", executionId: "execution_private", attemptId: "attempt_private", artifactHash: "artifact_private", workerReport: "recorded_submitted", localRecord: "correlated", siteOutcome: "unverified" } },
+        ],
+      }])
+    mocks.approvalFindMany.mockResolvedValueOnce([{
+      id: "approval_private", userId: "user_1", sessionId: "session_1", taskId: "task_1", turnId: "turn_private", jobId: "job_1",
+      toolCallId: "application-submit:task_1", type: "submit_application", status: "consumed", scopeHash: "hash_private", resourceHash: "artifact_private",
+    }])
+
+    const response = await getTasks()
+
+    expect(response.status).toBe(200)
+    const body = await response.json()
+    expect(body).toEqual({
+      tasks: [{
+        id: "task_1", userId: "user_1", jobId: "job_1", sessionId: "session_1", status: "submitted",
+        checkpoint: "submission_verified", updatedAt: "2026-11-12T10:00:00.000Z",
+        job: { company: "Example", role: "Engineer" },
+        submissionEvidence: { visible: true, availability: "available", workerReport: "submitted", localRecord: "recorded", employerReceipt: "unverified" },
+      }],
+      summary: { submitted: 1, skipped: 0, failed: 0, needsUser: 0, inProgress: 0 },
+    })
+    const serialized = JSON.stringify(body)
+    expect(serialized).not.toContain("worker_private")
+    expect(serialized).not.toContain("turn_private")
+    expect(serialized).not.toContain("attempt_private")
+    expect(serialized).not.toContain("artifact_private")
+    expect(serialized).not.toContain("hash_private")
+    expect(serialized).not.toContain("execution_private")
+    expect(serialized).not.toContain("https://")
+    expect(serialized).not.toContain("submission_evidence_recorded")
+    expect(serialized).not.toContain("recorded_submitted")
+    expect(serialized).not.toContain("schemaVersion")
+    expect(mocks.findMany.mock.calls[0]?.[0]).toMatchObject({ where: { userId: "user_1" }, take: 100 })
+    expect(mocks.findMany.mock.calls[1]?.[0]).toMatchObject({ where: { userId: "user_1", id: { in: ["task_1"] } } })
+    expect(mocks.approvalFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { userId: "user_1", id: { in: ["approval_private"] }, taskId: { in: ["task_1"] } },
+    }))
+  })
+
+  it("keeps the normal Task GET successful when the optional event read is denied", async () => {
+    mocks.findMany
+      .mockResolvedValueOnce([{
+        id: "task_legacy", userId: "user_1", jobId: "job_legacy", sessionId: null, fillTurnId: null,
+        fillTurnSessionId: null, fillTurnUserId: null, workerTaskId: null,
+        status: "submitted", checkpoint: "submission_verified", updatedAt: new Date("2026-11-12T10:00:00Z"),
+        job: { company: "Legacy", role: "Analyst" },
+      }])
+      .mockRejectedValueOnce(new Error("private database permission details"))
+
+    const response = await getTasks()
+    const body = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(body).toContain('"id":"task_legacy"')
+    expect(body).toContain('"availability":"unavailable"')
+    expect(body).not.toContain("private database permission details")
   })
 })
 

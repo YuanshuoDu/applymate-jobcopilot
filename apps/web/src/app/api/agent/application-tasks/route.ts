@@ -2,7 +2,8 @@ import { NextRequest } from "next/server"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { Prisma } from "@prisma/client"
 import { db } from "@/lib/db"
-import { applicationTaskSummary } from "@/lib/agent/application-task-view"
+import { applicationTaskSummary, projectApplicationTaskReadViews } from "@/lib/agent/application-task-view"
+import { readApplicationSubmissionEvidence } from "@/lib/agent/application-submission-evidence-read"
 import { sanitizeConfirmedAnswers } from "@/lib/agent/application-task-input"
 import { applicationFillTaskGraphEnabled, queueApplicationFill } from "@/lib/auto-apply"
 import { isApplicationFillRetryReadyProjection } from "@/lib/agent/control-plane/commands/application-fill-preflight"
@@ -73,9 +74,12 @@ export async function GET(req: NextRequest) {
     response.headers.set("Cache-Control", "no-store, private")
     return response
   }
-  const tasks = await db.applicationTask.findMany({ where: { userId: auth.userId }, orderBy: { updatedAt: "desc" }, take: 100,
-    include: { job: { select: { company: true, role: true, url: true, workflowState: true } }, events: { orderBy: { createdAt: "desc" }, take: 20 } } })
-  return ok({ tasks, summary: applicationTaskSummary(tasks) })
+  const tasks = await db.applicationTask.findMany({
+    where: { userId: auth.userId }, orderBy: { updatedAt: "desc" }, take: 100,
+    select: { id: true, userId: true, jobId: true, sessionId: true, fillTurnId: true, fillTurnSessionId: true, fillTurnUserId: true, workerTaskId: true,
+      status: true, checkpoint: true, updatedAt: true, job: { select: { company: true, role: true } } } })
+  const submissionEvidence = await readApplicationSubmissionEvidence(db, auth.userId, tasks)
+  return ok({ tasks: projectApplicationTaskReadViews(tasks, submissionEvidence), summary: applicationTaskSummary(tasks) })
 }
 
 export async function DELETE(req: NextRequest) {
