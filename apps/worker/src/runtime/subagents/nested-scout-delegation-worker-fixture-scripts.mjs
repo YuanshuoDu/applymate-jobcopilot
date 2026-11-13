@@ -109,7 +109,8 @@ async function waitForTwoRunningChildren(task, markerState) {
     const result = await pool.query({ text: `SELECT count(*)::int AS count FROM "sub_agent_tasks" sibling
       WHERE sibling."parentTaskId" = $1 AND sibling."sessionId" = $2 AND sibling."turnId" = $3
         AND sibling."rootTaskId" = $4 AND sibling."depth" = 2 AND sibling."role" = 'scout'
-        AND sibling."taskType" = 'job_discovery' AND sibling."status" = 'running'`,
+        AND sibling."taskType" = 'job_discovery' AND sibling."status" = 'running'
+        AND NULLIF(btrim(sibling."leaseOwner"), '') IS NOT NULL AND sibling."leaseExpiresAt" > clock_timestamp()`,
       values: [task.parentTaskId, task.sessionId, task.turnId, task.rootTaskId], query_timeout: 1_000 })
     if (result.rows[0]?.count === 2) {
       if (!markerState.parallelObserved) { markerState.parallelObserved = true; say("P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL") }

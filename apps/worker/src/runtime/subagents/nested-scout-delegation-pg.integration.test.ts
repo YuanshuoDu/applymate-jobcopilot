@@ -18,6 +18,7 @@ const MAIN_PROGRESS_MARKERS = new Set([
   "P1143_SUBAGENT_CLAIMS_PAUSED", "P1143_PARENT_DISCOVER_REQUESTED", "P1143_SOURCE_ESCALATION_REQUESTED",
   "P1143_SOURCE_ESCALATION_REJECTED", "P1143_CLOSED_STEP_REPLAY_REJECTED", "P1143_FOREIGN_CALL_STEP_REJECTED",
   "P1143_PARENT_WAITING", "P1143_CRASH_CHILD_MODEL_STARTED", "P1143_CHILD_WORKER_CLAIMED_RUNNING",
+  "P1143_RECOVERY_DEPTH2_QUEUED", "P1143_RECOVERY_DEPTH2_NOT_QUEUED", "P1143_RECOVERY_NO_DEPTH2_ROW",
   "P1143_CHILD_SCOUT_RECLAIMED",
   "P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL", "P1143_CHILD_DISCOVERY_RESULT_RECEIVED",
   "P1143_CHILD_ROLE_RESULT_STREAMED", "P1143_PARENT_SCOUT_RESULTS_RECEIVED", "P1143_PARENT_ROLE_RESULT_STREAMED",
@@ -45,6 +46,13 @@ const SAFE_DIAGNOSTIC_ERROR_CODES = [
   "p1143_subagent_queue_unavailable", "p1143_crash_child_did_not_claim",
 ] as const
 const SAFE_WAIT_RESUME_CODES = ["wait_invalid", "wait_scope_error", "wait_conflict", "other"] as const
+const SAFE_RECOVERY_STAGES = ["manager_recover", "dispatch"] as const
+const SAFE_RECOVERY_ERROR_CODES = [
+  "subagent_dispatch_delivery_uncertain", "lost", "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01",
+  "ECONNRESET", "ETIMEDOUT", "error", "unknown", "other",
+] as const
+const SAFE_RECOVERY_DIAGNOSTIC_MARKERS = new Set(SAFE_RECOVERY_STAGES.flatMap(stage =>
+  SAFE_RECOVERY_ERROR_CODES.map(code => `P1143_RECOVERY_ERROR:${stage}:${code}`)))
 const SAFE_WAIT_RESUME_STAGES = [
   "required_value", "resume_scope", "source_step", "source_call_count", "source_call_input", "source_item_set", "wait_record_shape",
   "provenance_marker", "source_receipt_missing", "source_marker_without_result", "source_recovered_receipt_mismatch",
@@ -74,7 +82,7 @@ function progressQuery<Row extends QueryResultRow>(text: string, values: unknown
 }
 
 function seenMainProgress(output: string[]) {
-  return [...new Set(output.filter(value => MAIN_PROGRESS_MARKERS.has(value)))]
+  return [...new Set(output.filter(value => MAIN_PROGRESS_MARKERS.has(value) || SAFE_RECOVERY_DIAGNOSTIC_MARKERS.has(value)))]
 }
 
 async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
@@ -767,6 +775,7 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       crashing = undefined
       await waitForExpiredCrashLease(ids, parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!, 30_000)
       restarted = launch("resume", ids)
+      await waitForMainMarker(ids, restarted, "P1143_RECOVERY_DEPTH2_QUEUED", 30_000)
       await waitForMainMarker(ids, restarted, "P1143_CHILD_SCOUT_RECLAIMED", 30_000)
       const reclaimedOwner = await waitForReclaimedCrashChild(ids, crashedChild.id, crashedChild.leaseOwner!, 30_000)
       await waitForMainMarker(ids, restarted, "P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL", 240_000)

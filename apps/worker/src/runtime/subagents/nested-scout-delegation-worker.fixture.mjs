@@ -17,6 +17,10 @@ const ids = JSON.parse(rawIds)
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 10 })
 const CRASH_TEST_LEASE_MS = 3_000
 const CRASH_TEST_HEARTBEAT_MS = 500
+const SAFE_RECOVERY_ERROR_CODES = new Set([
+  "subagent_dispatch_delivery_uncertain", "lost", "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01",
+  "ECONNRESET", "ETIMEDOUT",
+])
 let bootstrap
 async function pauseSubagentClaims() {
   if (!bootstrap?.subagents) throw new Error("p1143_subagent_queue_unavailable")
@@ -100,12 +104,50 @@ function command(name) {
   return new Promise(resolve => { const values = waiters.get(name) ?? []; values.push(resolve); waiters.set(name, values) })
 }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
+function recoveryErrorClass(error) {
+  try {
+    const code = error && typeof error === "object" ? error.code : null
+    if (typeof code === "string") return SAFE_RECOVERY_ERROR_CODES.has(code) ? code : "other"
+    return error instanceof Error ? "error" : "unknown"
+  } catch { return "unknown" }
+}
 async function start(mode) {
   const ownerId = `p1143-worker-${process.pid}`
+  const manager = mode === "park" ? undefined : new AgentTreeManager(
+    new PgSubagentTaskStore(pool, CRASH_TEST_LEASE_MS), { heartbeatMs: CRASH_TEST_HEARTBEAT_MS },
+  )
+  let recoveryStage = "manager_recover"
+  if (mode === "resume" && manager) {
+    const recoveryMarkers = new Set()
+    const reportRecoveryMarker = marker => { if (!recoveryMarkers.has(marker)) { recoveryMarkers.add(marker); say(marker) } }
+    const recover = manager.recover.bind(manager)
+    manager.recover = async (...args) => {
+      recoveryStage = "manager_recover"
+      try {
+        const report = await recover(...args)
+        recoveryStage = "dispatch"
+        const depthTwo = report.rows.filter(row => row.depth === 2 && row.role === "scout" && row.taskType === "job_discovery")
+        reportRecoveryMarker(depthTwo.some(row => row.status === "queued") ? "P1143_RECOVERY_DEPTH2_QUEUED"
+          : depthTwo.length ? "P1143_RECOVERY_DEPTH2_NOT_QUEUED" : "P1143_RECOVERY_NO_DEPTH2_ROW")
+        return report
+      } catch (error) {
+        recoveryStage = "manager_recover"
+        throw error
+      }
+    }
+    const originalConsoleError = console.error.bind(console)
+    console.error = (...args) => {
+      if (args[0] === "[subagent-recovery] scan failed:") {
+        say(`P1143_RECOVERY_ERROR:${recoveryStage}:${recoveryErrorClass(args[1])}`)
+        return
+      }
+      originalConsoleError(...args)
+    }
+  }
   const runtime = await createCanonicalTurnRuntime(pool, {
     workerId: ownerId, productionFlags: flags, taskGraphCommandPort: createPgTaskGraphCommandPort(pool),
     taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => ({ settle: async () => undefined }),
-    ...(mode === "park" ? {} : { manager: new AgentTreeManager(new PgSubagentTaskStore(pool, CRASH_TEST_LEASE_MS), { heartbeatMs: CRASH_TEST_HEARTBEAT_MS }) }),
+    ...(manager ? { manager } : {}),
     modelRuntimeFactory: () => rootModelRuntime(),
   })
   const markerState = { closedStepRejected: false, parallelObserved: false }
