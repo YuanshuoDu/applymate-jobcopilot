@@ -1,0 +1,126 @@
+name: Root history PostgreSQL stall acceptance
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  root-history-pg:
+    name: All 13 Root history cases on disposable PostgreSQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: applymate_agent_brain_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d applymate_agent_brain_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Apply existing migrations to disposable PostgreSQL
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+        run: pnpm --filter @jobcopilot/web exec prisma migrate deploy --schema prisma/schema.prisma
+      - name: Generate Web Prisma client for Worker fixtures
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+        run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
+      - name: Build Worker and workspace dependencies
+        run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Verify all 13 Root history cases on disposable PostgreSQL
+        env:
+          CI: "true"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+          RESULT_PATH: ${{ runner.temp }}/agent-root-history-pg.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly EXPECTED_PG_URL=postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "$EXPECTED_PG_URL"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "$EXPECTED_PG_URL"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run \
+            --no-file-parallelism --maxWorkers=1 --minWorkers=1 \
+            --reporter=default --reporter=json --outputFile.json="$RESULT_PATH" \
+            src/runtime/context/root-task-history-direct-pg.integration.test.ts
+          node - "$RESULT_PATH" <<'NODE'
+          const { readFileSync } = require("node:fs")
+          const path = require("node:path")
+          const report = JSON.parse(readFileSync(process.argv[2], "utf8"))
+          const file = "root-task-history-direct-pg.integration.test.ts"
+          const expected = [
+            "returns same-user/session Roots with the exact canonical objective and a distinct source Root ID",
+            "advances an empty strict-validation page and finds valid same-session history after 64 raw rows",
+            "exhausts the same-session raw budget without starving the independent cross-session lane",
+            "uses UTF-8 C-collation order for same-xid cross-session cursor pages",
+            "keeps full cross-session witness multiplicity across keyset pages without weakening table constraints",
+            "reloads owner-scoped history and merges only witnessed terminal-before-start outcomes by xid8",
+            "rechecks a source session lifecycle change after the bounded terminal scan",
+            "skips a locked cross-session source instead of blocking its graph reload",
+            "finds exact same-session objectives behind more than 64 newer unrelated indexed outcomes",
+            "filters changed typed contracts before the indexed limit and keeps fallback recall bounded",
+            "holds readiness through indexed candidate selection while an explicit reset is attempted",
+            "filters more than 64 newer cross-session wrong-origin rows before loading graphs",
+            "keeps matching scheduled history behind malformed and mismatched rows in indexed and legacy windows",
+          ]
+          const suites = report.testResults ?? []
+          const results = suites.flatMap(suite => (suite.assertionResults ?? []).map(test => ({
+            file: path.basename(suite.name ?? ""), title: test.title, status: test.status,
+          })))
+          const exactCases = suites.length === 1 && path.basename(suites[0].name ?? "") === file
+            && results.length === expected.length
+            && expected.every(title => results.filter(result => result.file === file && result.title === title
+              && result.status === "passed").length === 1)
+          const exactCounts = report.numTotalTests === 13 && report.numPassedTests === 13
+            && report.numFailedTests === 0 && report.numPendingTests === 0 && report.numTodoTests === 0
+          if (!exactCases || !exactCounts) {
+            console.error("Root history PostgreSQL acceptance did not execute and pass exactly all 13 named cases.")
+            console.error(JSON.stringify({ total: report.numTotalTests, passed: report.numPassedTests,
+              failed: report.numFailedTests, pending: report.numPendingTests, todo: report.numTodoTests,
+              statuses: results.map(({ title, status }) => ({ title, status })) }))
+            process.exit(1)
+          }
+          console.log("Verified all 13 named Root history PostgreSQL cases passed with no skips.")
+          NODE
+      - name: Preserve structured PostgreSQL test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-root-history-pg-report
+          path: ${{ runner.temp }}/agent-root-history-pg.json
+          if-no-files-found: warn
+          retention-days: 1
