@@ -16,9 +16,19 @@ import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
 import {
   createWorkerUsageAuthorizer,
+  type WorkerUsageAuthorization,
   type WorkerUsageAuthorizationInput,
   type WorkerUsageSettlementInput,
 } from "../../queue/ai-usage-bridge.js"
+
+function noReservationUsageAuthorization(): WorkerUsageAuthorization {
+  return {
+    outputReservationRequired: false,
+    maxOutputTokens: null,
+    settle: async () => undefined,
+    settleUnknown: async (_settlement: WorkerUsageSettlementInput) => undefined,
+  }
+}
 
 const usageRouteMocks = vi.hoisted(() => ({
   database: null as unknown,
@@ -703,7 +713,7 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       pool: executionPool as unknown as PgPool,
       turnStore: createPgTurnEngineStore(executionPool as never),
       treeBudget: createPgTreeBudgetReservationStore(executionPool as never),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => noReservationUsageAuthorization(),
       modelRuntimeFactory: ({ task }) => ({
         id: `pg-child-fixture-model-${task.id}`, profile: modelProfile,
         async *stream(request: HarnessModelRequest) {
@@ -864,6 +874,10 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       settlement?: WorkerUsageSettlementInput
     }
     const captured: CapturedUsage[] = []
+    const forwardedAuthorizations: Array<{
+      readonly source: Awaited<ReturnType<typeof bridge>>
+      readonly forwarded: Awaited<ReturnType<typeof bridge>>
+    }> = []
     const inputByTask = new Map<string, WorkerUsageAuthorizationInput>()
     const staleFenceChecks = new Set<string>()
     const authorizeUsage = async (input: WorkerUsageAuthorizationInput) => {
@@ -876,6 +890,14 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       const reservation = await bridge(callerInput)
       const operationId = operationIdByStep.get(input.stepId)
       if (!operationId) throw new Error("The real usage route returned no operation identity")
+      expect(typeof reservation.outputReservationRequired).toBe("boolean")
+      expect(reservation.outputReservationRequired
+        ? Number.isSafeInteger(reservation.maxOutputTokens) && Number(reservation.maxOutputTokens) > 0
+        : reservation.maxOutputTokens === null).toBe(true)
+      expect(typeof reservation.start).toBe("function")
+      expect(typeof reservation.release).toBe("function")
+      expect(typeof reservation.settle).toBe("function")
+      expect(typeof reservation.settleUnknown).toBe("function")
       const reserved = await adminPool!.query<{ status: string; userId: string | null; credentialSource: string; runtime: string }>(
         `SELECT status, user_id AS "userId", credential_source AS "credentialSource", runtime
           FROM ai_usage_events WHERE id = $1`, [operationId],
@@ -889,7 +911,8 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       expect(snapshot.budgets).toEqual([{ month: usageMonth, used: reservationCount, limit: 10 }])
       const entry: CapturedUsage = { input, operationId, reservation }
       captured.push(entry)
-      return {
+      const forwarded: Awaited<ReturnType<typeof bridge>> = {
+        ...reservation,
         settle: async (settlement: WorkerUsageSettlementInput) => {
           await reservation.settle(settlement)
           entry.settlement = settlement
@@ -903,6 +926,8 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
           }])
         },
       }
+      forwardedAuthorizations.push({ source: reservation, forwarded })
+      return forwarded
     }
 
     const modelProfile = {
@@ -976,6 +1001,14 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       expect(captured).toHaveLength(4)
       expect(new Set(captured.map(value => value.input.stepId)).size).toBe(4)
       expect(new Set(captured.map(value => value.operationId)).size).toBe(4)
+      expect(forwardedAuthorizations).toHaveLength(captured.length)
+      for (const { source, forwarded } of forwardedAuthorizations) {
+        expect(forwarded.outputReservationRequired).toBe(source.outputReservationRequired)
+        expect(forwarded.maxOutputTokens).toBe(source.maxOutputTokens)
+        expect(forwarded.start).toBe(source.start)
+        expect(forwarded.release).toBe(source.release)
+        expect(forwarded.settleUnknown).toBe(source.settleUnknown)
+      }
       expect(captured.map(value => value.settlement)).toEqual(expect.arrayContaining([
         { status: "success", inputTokens: 21, outputTokens: 4, estimatedCostUsd: 0.002 },
         { status: "success", inputTokens: 22, outputTokens: 5, estimatedCostUsd: 0.003 },
@@ -1006,7 +1039,11 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       ])).toEqual(beforeForeign)
 
       const authorizeRequests = requests.filter(request => request.body.operation === "authorize")
+      const startRequests = requests.filter(request => request.body.operation === "start")
       expect(authorizeRequests.filter(request => request.status === 200)).toHaveLength(4)
+      expect(startRequests).toHaveLength(captured.length)
+      expect(startRequests.map(request => request.body.input?.operationId))
+        .toEqual(expect.arrayContaining(captured.map(value => value.operationId)))
       expect(authorizeRequests.filter(request => request.status === 409).map(request => request.response)).toEqual([
         expect.objectContaining({ code: "usage_fence_rejected" }),
         expect.objectContaining({ code: "usage_fence_rejected" }),
