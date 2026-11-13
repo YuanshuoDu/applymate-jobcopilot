@@ -110,7 +110,7 @@ jobs:
               'rolls back the parent failure when an active child violates inherited deadline',
             ]],
             ['/src/runtime/subagents/nested-scout-creation-authority-pg.integration.test.ts', [
-              'rejects generic Root attempts to mint the Scout profile while allowing only a persisted profile Scout to create a fenced read-scoped child',
+              'rejects unregistered and privilege-escalation nested Scout attempts while allowing a persisted profile Scout to create fenced read-scoped children',
             ]],
           ])
           const files = report.testResults
