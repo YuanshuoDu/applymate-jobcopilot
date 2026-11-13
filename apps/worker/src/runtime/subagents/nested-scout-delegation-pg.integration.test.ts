@@ -243,8 +243,8 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
     const suffix = randomUUID()
     const ids: FixtureIds = {
       userId: `nested-scout-user-${suffix}`, sessionId: `nested-scout-session-${suffix}`,
-      turnId: `nested-scout-turn-${suffix}`, alphaJobId: `nested-scout-alpha-${suffix}`,
-      betaJobId: `nested-scout-beta-${suffix}`, foreignJobId: `nested-scout-foreign-${suffix}`,
+      turnId: `nested-scout-turn-${suffix}`, alphaJobId: randomUUID(),
+      betaJobId: randomUUID(), foreignJobId: randomUUID(),
     }
     let first: FixtureProcess | undefined, restarted: FixtureProcess | undefined
     try {
