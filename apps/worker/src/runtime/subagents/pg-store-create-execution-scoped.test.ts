@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest"
 import { createSubagentWithSpawnFromLease } from "./pg-store-create-execution-scoped.js"
-import { normalizeSubagentPolicy, type AtomicSubagentSpawnFromLeaseInput, type PgSubagentPool } from "./types.js"
+import { NestedScoutBudgetPolicyError, normalizeSubagentPolicy, type AtomicSubagentSpawnFromLeaseInput, type PgSubagentPool } from "./types.js"
 import { SELECT_TASK } from "./pg-store-persistence.js"
+import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 
 const fence = { id: "parent-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", ownerId: "owner-1", attemptCount: 2 }
 const parentPolicy = normalizeSubagentPolicy({ maxConcurrency: 2, maxDepth: 2, maxFanOut: 1, maxAttempts: 2 })
@@ -23,6 +25,8 @@ type FixtureOptions = {
   activeChildren?: number
   missingSession?: boolean
   missingTurn?: boolean
+  omitRootBudgetSnapshot?: boolean
+  nested?: boolean
   turnRootTaskId?: string
 }
 
@@ -36,12 +40,18 @@ function fixture(options: FixtureOptions = {}) {
     maxAttempts: parentPolicy.maxAttempts, leaseOwner: fence.ownerId, leaseExpiresAt: new Date("2099-01-01T00:00:00Z"),
     absoluteDeadlineAt: new Date("2099-01-01T00:00:00Z"),
     interruptRequestedAt: null, budgetSnapshot: { subagentPolicy: parentPolicy }, toolPolicySnapshot: {}, modelProfileSnapshot: {},
+    ...(options.nested ? {
+      role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read", "wait_subagents", "scout.delegate", "scout.results"],
+      context: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER },
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+    } : {}),
     ...options.parent,
   }
-  const root = {
+  const root: Record<string, unknown> = {
     id: fence.rootTaskId, rootTaskId: fence.rootTaskId, turnId: fence.turnId, parentTaskId: null,
-    status: "running", interruptRequestedAt: null, absoluteDeadlineAt: new Date("2099-01-01T00:00:00Z"), ...options.root,
+    status: "running", interruptRequestedAt: null, absoluteDeadlineAt: new Date("2099-01-01T00:00:00Z"), budgetSnapshot: {}, ...options.root,
   }
+  if (options.omitRootBudgetSnapshot) delete root.budgetSnapshot
   let inserted: Record<string, unknown> | null = null
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
@@ -63,6 +73,9 @@ function fixture(options: FixtureOptions = {}) {
         return { rows: replay ? [replay] : [], rowCount: replay ? 1 : 0 }
       }
       if (sql.startsWith('SELECT root."id"')) return { rows: [root], rowCount: 1 }
+      if (sql.includes('FROM "agent_events" AS event')) return { rows: [{ type: "item.started", itemId: "task-graph:root-1", taskId: "root-1",
+        idempotencyKey: "proposal:0", payload: { kind: "proposal", receipt: { revision: 1,
+          nodes: [{ key: "scout", taskId: fence.id, status: "queued" }], readyTaskIds: [fence.id] } } }], rowCount: 1 }
       if (sql.includes('SELECT task.*, session."userId"')) return { rows: [parent], rowCount: 1 }
       if (sql.includes("AS \"leaseLive\"")) return { rows: [{ leaseLive: options.live ?? true,
         deadlineLive: options.deadlineLive ?? true, rootDeadlineLive: options.rootDeadlineLive ?? true }], rowCount: 1 }
@@ -101,6 +114,17 @@ function fixture(options: FixtureOptions = {}) {
   return { calls, inserted: () => inserted, pool: { connect: async () => client } as unknown as PgSubagentPool }
 }
 
+const nestedInput: AtomicSubagentSpawnFromLeaseInput = {
+  ...input,
+  role: "scout", taskType: "job_discovery", goal: "Search assigned source",
+  allowedActions: ["jobs.discover", "tool_results.read"],
+  context: { nestedScoutSourceSlice: ["greenhouse"], nestedScoutQueryScope: [
+    { source: "greenhouse", targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], maxPageSize: 10 },
+  ] },
+  expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+  parentExecutionFence: { ...fence, step: { stepId: "step-1", toolCallId: "call-1" } },
+}
+
 describe("lease-scoped atomic subagent creation", () => {
   it("rejects private nested Scout scope without a source-step fence before replay", async () => {
     const state = fixture({ existing: { taskId: "child-existing" } })
@@ -131,6 +155,69 @@ describe("lease-scoped atomic subagent creation", () => {
     expect(replay).toBeLessThan(insert)
     expect(names.filter(sql => sql.startsWith('INSERT INTO "agent_outbox"'))).toHaveLength(2)
     expect(names).toContain("COMMIT")
+  })
+
+  it("admits nested Scouts when the locked root snapshot is default or has only shared step/tool limits", async () => {
+    for (const budgetSnapshot of [{}, { limits: { maxSteps: 8, maxToolCalls: 16 } }]) {
+      const state = fixture({ nested: true, root: { budgetSnapshot } })
+      const result = await createSubagentWithSpawnFromLease(state.pool, nestedInput)
+      expect(result).toMatchObject({ duplicate: false, task: { role: "scout", taskType: "job_discovery", depth: 2 } })
+      const rootLock = state.calls.find(([sql]) => sql.includes('SELECT "id", "rootTaskId", "turnId", "parentTaskId"'))
+      expect(rootLock?.[0]).toContain('"budgetSnapshot"')
+      expect(rootLock?.[1]).toEqual([fence.rootTaskId, fence.sessionId])
+    }
+  })
+
+  it.each([
+    ["maxInputTokens", 0], ["maxOutputTokens", 0], ["maxCostUsd", 0],
+  ] as const)("rejects nested admission with root %s cap before replay or writes", async (key, limit) => {
+    const state = fixture({ nested: true, root: { budgetSnapshot: { limits: { [key]: limit } } }, existing: { taskId: "child-existing" } })
+    await expect(createSubagentWithSpawnFromLease(state.pool, nestedInput)).rejects.toBeInstanceOf(NestedScoutBudgetPolicyError)
+    expect(state.calls.some(([sql]) => sql.startsWith('SELECT "payload" FROM "agent_outbox"'))).toBe(false)
+    expect(state.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+    expect(state.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it("uses canonical parsing for malformed cap values and allows an exact no-cap nested replay", async () => {
+    const replayTask = {
+      id: "child-existing", userId: fence.userId, sessionId: fence.sessionId, turnId: fence.turnId,
+      rootTaskId: fence.rootTaskId, parentTaskId: fence.id, path: "/root-1/parent-1/child-existing", depth: 2,
+      role: "scout", taskType: "job_discovery", status: "queued", goal: nestedInput.goal, attemptCount: 0,
+      maxAttempts: 2, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null,
+      budgetSnapshot: {}, toolPolicySnapshot: {},
+    }
+    const malformed = fixture({ nested: true, root: { budgetSnapshot: { limits: {
+      maxInputTokens: "100", maxOutputTokens: -1, maxCostUsd: null,
+    } } }, existing: { taskId: "child-existing" }, replayTask })
+    await expect(createSubagentWithSpawnFromLease(malformed.pool, nestedInput)).resolves.toMatchObject({ duplicate: true })
+    expect(malformed.calls.some(([sql]) => sql.startsWith('SELECT "payload" FROM "agent_outbox"'))).toBe(true)
+    expect(malformed.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+  })
+
+  it("fails closed when the locked root row has no budget snapshot field", async () => {
+    const state = fixture({ nested: true, omitRootBudgetSnapshot: true, existing: { taskId: "child-existing" } })
+    await expect(createSubagentWithSpawnFromLease(state.pool, nestedInput)).rejects.toMatchObject({ code: "lost" })
+    expect(state.calls.some(([sql]) => sql.startsWith('SELECT "payload" FROM "agent_outbox"'))).toBe(false)
+    expect(state.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+  })
+
+  it("checks tenant and current-step fences before a root budget denial", async () => {
+    const cases: FixtureOptions[] = [
+      { missingSession: true, root: { budgetSnapshot: { limits: { maxCostUsd: 0 } } } },
+      { stepLive: false, root: { budgetSnapshot: { limits: { maxCostUsd: 0 } } } },
+    ]
+    for (const options of cases) {
+      const state = fixture({ nested: true, ...options })
+      await expect(createSubagentWithSpawnFromLease(state.pool, nestedInput)).rejects.toMatchObject({ code: "lost" })
+      expect(state.calls.some(([sql]) => sql.startsWith('SELECT "payload" FROM "agent_outbox"'))).toBe(false)
+      expect(state.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+      if (options.stepLive === false) {
+        const step = state.calls.findIndex(([sql]) => sql.includes('FROM "agent_steps" AS step'))
+        const root = state.calls.findIndex(([sql]) => sql.includes('SELECT "id", "rootTaskId", "turnId", "parentTaskId"'))
+        expect(root).toBeGreaterThan(-1)
+        expect(step).toBeGreaterThan(root)
+      }
+    }
   })
 
   it("replays only a child bound to the current parent execution scope", async () => {

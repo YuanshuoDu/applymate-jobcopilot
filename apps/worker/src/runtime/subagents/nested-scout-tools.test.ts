@@ -8,7 +8,7 @@ import {
   createNestedScoutTools, deriveNestedScoutSourceScope, nestedScoutQueryAllowed,
   nestedScoutTaskScopeFromContext, readDirectScoutChildren, restrictNestedScoutScope,
 } from "./nested-scout-tools.js"
-import type { SubagentLease } from "./types.js"
+import { NestedScoutBudgetPolicyError, SubagentLeaseError, type SubagentLease } from "./types.js"
 
 const profile = { sourceSlice: NESTED_SCOUT_ALLOWED_SOURCES }
 const health = {
@@ -98,6 +98,21 @@ describe("nested Scout tools", () => {
       constraints: ["Do not invent role requirements.", "Use only the server-published Scout tools and immutable discovery scope in task context."],
       context: expect.objectContaining({ nestedScoutSourceSlice: ["greenhouse"] }),
     }), expect.stringMatching(/^scout-delegate:/), lease, { stepId: "step-7", toolCallId: "call-9" })
+  })
+
+  it("maps only the typed unsupported-budget denial and preserves lease-loss errors", async () => {
+    const toolsFor = (spawnFromLease: ReturnType<typeof vi.fn>) => createNestedScoutTools({
+      pool: { connect: async () => { throw new Error("not used") } } as never,
+      lease, profile, subagentManager: () => ({ spawnFromLease } as never), discoveryAttemptSidecar: () => sidecar(),
+    })
+    const unsupportedBudget = toolsFor(vi.fn(async () => { throw new NestedScoutBudgetPolicyError() }))
+    await expect(unsupportedBudget[0]!.execute(executionContext(), { goal: "Check jobs", sourceSlice: ["greenhouse"] }))
+      .rejects.toMatchObject({ name: "ToolExecutionError", code: "nested_scout_budget_unsupported", message: "Nested Scout access is unavailable" })
+
+    const leaseLost = new SubagentLeaseError("lost", "Parent execution lease is no longer current")
+    const staleLease = toolsFor(vi.fn(async () => { throw leaseLost }))
+    await expect(staleLease[0]!.execute(executionContext(), { goal: "Check jobs", sourceSlice: ["greenhouse"] }))
+      .rejects.toBe(leaseLost)
   })
 
   it("fails closed when the parent scope or canonical manager is unavailable", async () => {

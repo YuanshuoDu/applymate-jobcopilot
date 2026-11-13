@@ -2,30 +2,32 @@ import { randomUUID } from "node:crypto"
 import { assertSessionWorkAdmission } from "../session-gate.js"
 import { assertSpawnSpecMatchesParentFence, clampNestedSubagentPolicy, type SubagentParentExecutionFence } from "./parent-execution-fence.js"
 import { assertCurrentParentExecutionStep } from "./nested-spawn-step-fence.js"
-import { inheritSubagentPolicy, isTerminalSubagentStatus, SubagentLeaseError, type AtomicSubagentSpawnFromLeaseInput,
+import { inheritSubagentPolicy, isTerminalSubagentStatus, NestedScoutBudgetPolicyError, SubagentLeaseError, type AtomicSubagentSpawnFromLeaseInput,
   type AtomicSubagentSpawnResult, type PgSubagentPool, type SubagentTaskRecord } from "./types.js"
 import { policyFromTask } from "./manager-task-scope.js"
 import { assertFallbackPlannerRootCanDispatch, createSubagentTask, lockSubagentSession } from "./pg-store-create.js"
 import { dateValue, rowToTask, SELECT_TASK, spawnKey, transaction, type Queryable } from "./pg-store-persistence.js"
 import { hasPersistedTaskGraphMembership, type GraphIdentityScope } from "./task-graph-pg-state.js"
-import { hasNestedScoutPrivateContext, isNestedScoutCreationAuthorityValid } from "./nested-scout-creation-authority.js"
+import { hasNestedScoutPrivateContext, hasUnsupportedNestedScoutBudgetLimits, isNestedScoutCreationAuthorityValid } from "./nested-scout-creation-authority.js"
 
 function denyStaleFence(): never {
   throw new SubagentLeaseError("lost", "Parent execution lease is no longer current")
 }
 
-async function lockCurrentParent(client: Queryable, fence: SubagentParentExecutionFence): Promise<SubagentTaskRecord> {
+type CurrentParentExecution = Readonly<{ task: SubagentTaskRecord; rootBudgetSnapshot: unknown }>
+
+async function lockCurrentParent(client: Queryable, fence: SubagentParentExecutionFence): Promise<CurrentParentExecution> {
   const binding = await client.query<{ rootTaskId: string }>(
     `SELECT "rootTaskId" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`, [fence.id, fence.sessionId],
   )
   const rootTaskId = binding.rows[0]?.rootTaskId
   if (typeof rootTaskId !== "string" || rootTaskId !== fence.rootTaskId) return denyStaleFence()
-  const root = await client.query<{ id: string; rootTaskId: string; turnId: string; parentTaskId: string | null; status: string; interruptRequestedAt: unknown; absoluteDeadlineAt: Date | null }>(
-    `SELECT "id", "rootTaskId", "turnId", "parentTaskId", "status", "interruptRequestedAt", "absoluteDeadlineAt"
+  const root = await client.query<{ id: string; rootTaskId: string; turnId: string; parentTaskId: string | null; status: string; interruptRequestedAt: unknown; absoluteDeadlineAt: Date | null; budgetSnapshot: unknown }>(
+    `SELECT "id", "rootTaskId", "turnId", "parentTaskId", "status", "interruptRequestedAt", "absoluteDeadlineAt", "budgetSnapshot"
       FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 FOR UPDATE`, [rootTaskId, fence.sessionId],
   )
   const rootRow = root.rows[0]
-  if (!rootRow || rootRow.id !== fence.rootTaskId || rootRow.rootTaskId !== fence.rootTaskId
+  if (!rootRow || !Object.hasOwn(rootRow, "budgetSnapshot") || rootRow.id !== fence.rootTaskId || rootRow.rootTaskId !== fence.rootTaskId
     || rootRow.turnId !== fence.turnId || rootRow.parentTaskId !== null
     || rootRow.interruptRequestedAt != null || isTerminalSubagentStatus(rootRow.status)) return denyStaleFence()
   const parent = await client.query(
@@ -48,7 +50,7 @@ async function lockCurrentParent(client: Queryable, fence: SubagentParentExecuti
   )
   if (expiry.rows[0]?.leaseLive !== true || expiry.rows[0]?.deadlineLive !== true
     || expiry.rows[0]?.rootDeadlineLive !== true) return denyStaleFence()
-  return rowToTask(parentRow)
+  return { task: rowToTask(parentRow), rootBudgetSnapshot: rootRow.budgetSnapshot }
 }
 
 async function lockFenceScope(client: Queryable, fence: SubagentParentExecutionFence): Promise<void> {
@@ -84,7 +86,8 @@ export async function createSubagentWithSpawnFromLease(
     await client.query(`SELECT set_config('app.user_id', $1, true)`, [fence.userId])
     await lockFenceScope(client, fence)
     assertSpawnSpecMatchesParentFence(taskInput, fence)
-    const parent = await lockCurrentParent(client, fence)
+    const parentExecution = await lockCurrentParent(client, fence)
+    const parent = parentExecution.task
     await assertCurrentParentExecutionStep(client, fence)
     let nestedScoutAuthority: "child_execution" | undefined
     if (hasNestedScoutPrivateContext(taskInput.context)) {
@@ -95,6 +98,7 @@ export async function createSubagentWithSpawnFromLease(
         || !isNestedScoutCreationAuthorityValid("child_execution", {
           ...taskInput, depth: 2, parentTaskId: fence.id, rootTaskId: fence.rootTaskId,
         })) return denyStaleFence()
+      if (hasUnsupportedNestedScoutBudgetLimits(parentExecution.rootBudgetSnapshot)) throw new NestedScoutBudgetPolicyError()
       nestedScoutAuthority = "child_execution"
     }
     const key = spawnKey(fence.sessionId, spawnIdempotencyKey)

@@ -177,6 +177,13 @@ export class SubagentLeaseError extends Error {
   }
 }
 
+export class NestedScoutBudgetPolicyError extends Error {
+  constructor() {
+    super("Nested Scout cannot enforce configured root token or cost limits")
+    this.name = "NestedScoutBudgetPolicyError"
+  }
+}
+
 export const TERMINAL_SUBAGENT_STATUSES: readonly SubagentTaskStatus[] = [
   "completed", "failed", "interrupted", "cancelled", "closed",
 ]

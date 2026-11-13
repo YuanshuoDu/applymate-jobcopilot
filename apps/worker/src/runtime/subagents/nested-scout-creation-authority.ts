@@ -1,12 +1,14 @@
 import { NESTED_SCOUT_PROFILE_MARKER, nestedScoutPlainRecord, nestedScoutStringArray } from "./nested-scout-profile.js"
 import { nestedScoutTaskScopeStateFromContext } from "./nested-scout-tools.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { limits as canonicalTurnLimits } from "../canonical-turn-config.js"
 
 export type NestedScoutCreationAuthority = "parent_template" | "child_execution"
 export const NESTED_SCOUT_PROTECTED_ACTIONS = ["scout.delegate", "scout.results"] as const
 const PRIVATE_CONTEXT_KEYS = ["nestedScoutProfile", "nestedScoutSourceSlice", "nestedScoutQueryScope"] as const
 const PROFILE_ACTIONS = ["wait_subagents", ...NESTED_SCOUT_PROTECTED_ACTIONS] as const
 const READ_ACTIONS = ["jobs.discover", "tool_results.read"] as const
+const UNSUPPORTED_NESTED_LIMITS = ["maxInputTokens", "maxOutputTokens", "maxCostUsd"] as const
 export type NestedScoutCreationTaskShape = Readonly<{
   role?: unknown; taskType?: unknown; depth?: unknown; parentTaskId?: unknown; rootTaskId?: unknown
   expectedOutputSchema?: unknown; context?: unknown; allowedActions?: unknown
@@ -26,6 +28,12 @@ export function hasNestedScoutProtectedActions(value: unknown): boolean {
 
 export function filterNestedScoutProtectedActions(value: unknown): string[] {
   return (nestedScoutStringArray(value, 0, 256) ?? []).filter(action => !NESTED_SCOUT_PROTECTED_ACTIONS.includes(action as typeof NESTED_SCOUT_PROTECTED_ACTIONS[number]))
+}
+
+/** These root limits have no shared tree ledger, so nested Scout admission must not discard them. */
+export function hasUnsupportedNestedScoutBudgetLimits(value: unknown): boolean {
+  const limits = canonicalTurnLimits(value)
+  return limits !== undefined && UNSUPPORTED_NESTED_LIMITS.some(key => limits[key] !== undefined)
 }
 
 export function isNestedScoutCreationAuthorityValid(authority: unknown, task: NestedScoutCreationTaskShape): authority is NestedScoutCreationAuthority {
