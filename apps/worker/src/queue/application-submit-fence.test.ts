@@ -147,6 +147,50 @@ describe("application submit fence", () => {
       identity.sessionId, identity.fillTurnId, identity.approvalId, identity.constraintHash,
     ])
     expect(transactionCalls.filter(sql => sql === "COMMIT")).toHaveLength(2)
-    expect(release).toHaveBeenCalledTimes(2)
+    expect(release).toHaveBeenCalledTimes(4)
+  })
+
+  it("tries optional evidence only after current settlement commits and releases, swallowing projection failure", async () => {
+    const test = client()
+    const order: string[] = []
+    const settlementQuery = vi.fn(async (sql: string, values?: unknown[]) => {
+      if (sql.includes("submission_execution_settled")) return { rows: [], rowCount: 1 }
+      return test.query(sql, values)
+    })
+    const projectionClient = {
+      query: vi.fn(async () => { throw new Error("projection unavailable") }),
+      release: vi.fn(() => { order.push("projection_release") }),
+    }
+    const pool = { connect: vi.fn()
+      .mockImplementationOnce(async () => ({ query: settlementQuery, release: () => { order.push("settlement_release") } }))
+      .mockImplementationOnce(async () => projectionClient) } as unknown as Pool
+
+    await expect(recordSubmissionExecutionSettled(pool, { ...identity, workerTaskId: "bull-a", executionId: "execution-a" }))
+      .resolves.toBe(true)
+    expect(order).toEqual(["settlement_release", "projection_release"])
+  })
+
+  it("does not project a superseded settlement", async () => {
+    const test = client("successor-turn")
+    const pool = { connect: vi.fn(async () => ({ query: test.query, release: vi.fn() })) } as unknown as Pool
+
+    await expect(recordSubmissionExecutionSettled(pool, { ...identity, workerTaskId: "bull-old", executionId: "execution-old" }))
+      .resolves.toBe(false)
+    expect(pool.connect).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not run the projection after a failed settlement transaction", async () => {
+    const test = client()
+    const failure = new Error("settlement commit failed")
+    const query = vi.fn(async (sql: string, values?: unknown[]) => {
+      if (sql === "COMMIT") throw failure
+      return test.query(sql, values)
+    })
+    const pool = { connect: vi.fn(async () => ({ query, release: vi.fn() })) } as unknown as Pool
+
+    await expect(recordSubmissionExecutionSettled(pool, { ...identity, workerTaskId: "bull-a", executionId: "execution-a" }))
+      .rejects.toBe(failure)
+    expect(pool.connect).toHaveBeenCalledTimes(1)
+    expect(query).toHaveBeenCalledWith("ROLLBACK")
   })
 })
