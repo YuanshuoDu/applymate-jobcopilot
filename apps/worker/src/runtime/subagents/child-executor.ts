@@ -206,7 +206,8 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       budget,
       // A retry is a new durable attempt, so generated IDs include its attempt number.
       idFactory: prefix => `${prefix}:attempt:${lease.attemptCount}`,
-      resume, ...childWaitReplayExecutionOptions(durableWaitReplay, restored?.childWaitClaimRecovery, restored?.childWaitOrphanRecovery),
+      resume, childToolReplayReceipts: restored?.childToolReplayReceipts, childWaitReplayReceipts: restored?.childWaitReplayReceipts,
+      ...childWaitReplayExecutionOptions(durableWaitReplay, restored?.childWaitClaimRecovery, restored?.childWaitOrphanRecovery),
       isOwnershipLost: (error, signal) => signal.aborted || error instanceof SubagentLeaseError,
       signalError: () => new Error("subagent_lease_lost"),
       ...(adapter.profile.nativeTools && adapter.profile.structuredOutput && structuredRole ? { outputSchema: structuredResultOutputSchema(structuredRole) } : {}),

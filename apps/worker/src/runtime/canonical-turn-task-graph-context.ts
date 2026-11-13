@@ -109,36 +109,47 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   const state = record(value)
   if (!state || !Number.isSafeInteger(state.revision) || Number(state.revision) < 0 || !Array.isArray(state.nodes) || state.nodes.length > MAX_NODES) throw new Error("task_graph_current_state_invalid")
   const rootSuccessCriteria = readRootPlanCriteriaObservation(state)
-  let projectedBytes = 0
-  let projectedItems = 0
   let verificationBytes = 0
   let queryFootprintBytes = 0
   const turn: TaskGraphDiscoveryTurnEligibility = ownEnumerableDataValue(state, "discoveryTurnEligibility") === "ordinary" ? "ordinary" : "unknown"
   const nodes = state.nodes.map(value => {
     const item = node(value, turn)
-    const bytes = taskGraphResultProjectionBytes(item.resultProjection!)
-    const count = taskGraphResultProjectionItems(item.resultProjection!)
     verificationBytes += taskGraphCurrentVerificationMetadataBytes(item) + Math.max(0, taskGraphStructuredFailureCategoryBytes(item.structuredOutputFailureCategory) - 1) + (item.discoveryAttemptHealth ? Buffer.byteLength(JSON.stringify(item.discoveryAttemptHealth), "utf8") : 0)
     if (item.discoveryQueryFootprint) queryFootprintBytes += Buffer.byteLength(JSON.stringify(item.discoveryQueryFootprint), "utf8")
     if (verificationBytes > MAX_VERIFICATION_CONTEXT_BYTES) throw new Error("task_graph_current_verification_too_large")
-    if (projectedBytes + bytes > MAX_RESULT_PROJECTION_TOTAL_BYTES
-      || projectedItems + count > MAX_RESULT_PROJECTION_TOTAL_ITEMS) {
-      return { ...item, resultProjection: UNAVAILABLE_PROJECTION }
+    return item
+  })
+  let projectedBytes = 0
+  let projectedItems = 0
+  const prioritizedIndexes: number[] = []
+  const ordinaryIndexes: number[] = []
+  nodes.forEach((item, index) => {
+    if (item.verificationReport?.status === "failed" || item.verificationReport?.status === "unverified") prioritizedIndexes.push(index)
+    else ordinaryIndexes.push(index)
+  })
+  const projectedNodes = [...nodes]
+  for (const index of [...prioritizedIndexes, ...ordinaryIndexes]) {
+    const item = nodes[index]!
+    const bytes = taskGraphResultProjectionBytes(item.resultProjection!)
+    const count = taskGraphResultProjectionItems(item.resultProjection!)
+    if (projectedBytes + bytes > MAX_RESULT_PROJECTION_TOTAL_BYTES || projectedItems + count > MAX_RESULT_PROJECTION_TOTAL_ITEMS) {
+      projectedNodes[index] = { ...item, resultProjection: UNAVAILABLE_PROJECTION }
+      continue
     }
     projectedBytes += bytes
     projectedItems += count
-    return item
-  })
-  const keys = new Set(nodes.map(item => item.key))
-  if (keys.size !== nodes.length || !validateTaskGraphCurrentVerificationGraph(nodes)) throw new Error("task_graph_current_state_invalid:dependencies")
-  const contextNodes = verificationBytes + queryFootprintBytes <= MAX_VERIFICATION_CONTEXT_BYTES ? nodes
-    : nodes.map(({ discoveryQueryFootprint: _omitted, ...item }) => item)
+  }
+  const allocatedNodes = projectedNodes
+  const keys = new Set(allocatedNodes.map(item => item.key))
+  if (keys.size !== allocatedNodes.length || !validateTaskGraphCurrentVerificationGraph(allocatedNodes)) throw new Error("task_graph_current_state_invalid:dependencies")
+  const contextNodes = verificationBytes + queryFootprintBytes <= MAX_VERIFICATION_CONTEXT_BYTES ? allocatedNodes
+    : allocatedNodes.map(({ discoveryQueryFootprint: _omitted, ...item }) => item)
   let planningFacts: unknown
   try { planningFacts = Object.getOwnPropertyDescriptor(state, "planningFacts")?.value } catch { planningFacts = undefined }
   const baseContent = withTaskGraphCurrentPlanningObservation({
     kind: "task_graph_current", revision: Number(state.revision),
     ...(rootSuccessCriteria?.length ? { rootSuccessCriteria } : {}), ...taskGraphReviewConflictObservation(contextNodes), nodes: contextNodes,
-  }, planningFacts, Number(state.revision), nodes, MAX_TEXT)
+  }, planningFacts, Number(state.revision), allocatedNodes, MAX_TEXT)
   let sourceIntent: unknown
   try { sourceIntent = Object.getOwnPropertyDescriptor(state, "sourceIntent")?.value } catch { sourceIntent = undefined }
   const content = withTaskGraphRootSourceIntent(baseContent, sourceIntent, MAX_TEXT)

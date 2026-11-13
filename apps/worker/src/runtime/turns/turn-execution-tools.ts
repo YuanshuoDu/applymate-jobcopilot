@@ -2,23 +2,22 @@ import { createHash } from "node:crypto"
 import type { ModelStepResult } from "./turn-engine-model.js"
 import { findToolResultObservation, stableJson } from "./turn-engine-replay.js"
 import { toRepositoryJson, TurnEngineError, type TurnEngineResult, type TurnEngineStep, type ToolCallRecovery } from "./turn-engine-types.js"
-import { executeToolWithItems, TurnExecutionEventWriter } from "./turn-execution-events.js"
+import { executeToolWithItems, TurnExecutionEventWriter, type PersistedToolExecutionReceipt } from "./turn-execution-events.js"
 import { persistRecoveredToolCall } from "./turn-execution-tool-recovery.js"
-import { executionId, type TurnExecutionIdentity, type TurnExecutionOptions } from "./turn-execution-types.js"
+import { executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
+import type { ChildWaitReplayReceipt } from "./turn-execution-options.js"
 import { assertExecutionAlive } from "./turn-engine-helpers.js"
 import type { StepContext } from "../context/step-context-builder.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
-import { isDurableWaitId, prepareDurableWaitOutput } from "../tools/redaction.js"
-import { isCanonicalRawSubagentWaitId } from "../subagents/subagent-wait-structural-ids.js"
+import { dependencyWaitReceipt } from "./turn-execution-dependency-wait.js"
 import { nativeReceiptFromToolCall } from "../tools/task-graph-coordination-bridge.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
 import { executeNativeQuestionTool, nativeQuestionResultCall, PreparedQuestionRetryError, questionWaitResult, recoverableNativeQuestionCalls, rejectQuestionReplay } from "./turn-execution-question.js"
 import { hasResolvedWaitOutcome } from "./turn-execution-wait.js"
 import { lookupArchivedWaitControl, parseArchivedWaitReference } from "./durable-wait-control.js"
 import { recoverChildWaitClaim, recoverChildWaitOrphan } from "./turn-execution-child-wait-recovery.js"
-
 type MarkerState = { readonly active: readonly SteeringMarkerPayload[] } | undefined
-type ToolOutcome = { readonly wait: TurnEngineResult | null; readonly snapshot: TurnExecutionOptions["snapshot"]; readonly steeringMarkerState: MarkerState }
+type ToolOutcome = { readonly wait: TurnEngineResult | null; readonly snapshot: TurnExecutionOptions["snapshot"]; readonly steeringMarkerState: MarkerState; readonly receipts: readonly PersistedToolExecutionReceipt[] }
 const CHILD_RESUME_ID_PREFIX = "child-resume:"
 const REPLAY_TOOL_CALL_ID_PREFIX = "task-graph-replay-v1:"
 function childResumeSourceId(id: string): string | null {
@@ -48,6 +47,7 @@ async function persistChildResumeReplay(
   const errorCode = source.errorCode
   if ((source.status === "completed" && errorCode !== null) || (source.status === "failed" && (typeof errorCode !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/.test(errorCode)))) throw new TurnEngineError("invalid_output", "Child resume result error is invalid")
   if (!Object.prototype.hasOwnProperty.call(source, "input") || !Object.prototype.hasOwnProperty.call(source, "output")) throw new TurnEngineError("invalid_output", "Child resume result content is incomplete")
+  if (!hasChildResumeReplayReceipt(options, call, source, sourceResultItemId)) throw new TurnEngineError("invalid_output", "Child resume receipt is invalid")
   const toolCallId = replayCallId(step.id, call.id)
   const toolVersion = "1"
   const replaySource = { toolCallId: call.id, resultItemId: sourceResultItemId }
@@ -73,6 +73,19 @@ async function persistChildResumeReplay(
   })
   await writer.completeItem(resultItem, resultContent, now(), `tool-result-completed:${toolCallId}`)
 }
+function hasChildResumeReplayReceipt(options: TurnExecutionOptions, call: ModelStepResult["toolCalls"][number], source: Record<string, unknown>, sourceItemId: string): boolean {
+  const owner = options.identity; if (owner.kind !== "task") return false
+  return [...options.childToolReplayReceipts ?? [], ...options.childWaitReplayReceipts ?? []].some(receipt => {
+    const wait = "source" in receipt ? (receipt as ChildWaitReplayReceipt).source : undefined, input = wait?.input ?? receipt.input
+    const waitProof = call.name === "wait_subagents" ? !!wait && wait.sourceItemId === sourceItemId && wait.persistedResult.status === "completed" && wait.persistedResult.errorCode === null
+      && wait.attempt === receipt.attempt && wait.stepId === receipt.stepId && wait.toolCallId === call.id && stableJson(wait.callItem) === stableJson(receipt.callItem) && stableJson(wait.resultItem) === stableJson(receipt.resultItem) : !wait
+    return waitProof && receipt.userId === owner.userId && receipt.sessionId === owner.sessionId && receipt.turnId === owner.turnId && receipt.rootTaskId === owner.rootTaskId && receipt.taskId === owner.taskId && Number.isSafeInteger(receipt.attempt)
+      && receipt.attempt > 0 && receipt.attempt <= owner.attemptCount && receipt.toolCallId === call.id && receipt.toolName === call.name
+      && receipt.resultItem.id === sourceItemId && receipt.callItem.id !== sourceItemId && [receipt.callItem.revision, receipt.resultItem.revision].every(revision => Number.isSafeInteger(revision) && revision >= 0)
+      && stableJson(source.input) === stableJson(call.arguments) && stableJson(source.input) === stableJson(input)
+      && receipt.result.status === source.status && stableJson(receipt.result.output) === stableJson(source.output) && source.errorCode === (receipt.result.status === "failed" ? "tool_execution_failed" : null)
+  })
+}
 export function hasFreshSteering(context: StepContext, consumedInputIds: readonly string[]): boolean {
   if (context.steeringMarkerControl && (context.steeringMarkerControl.activeInputIds.length > 0 || context.steeringMarkerControl.newlyObservedInputIds.length > 0)) return true
   const consumedBeforeBuild = new Set(consumedInputIds)
@@ -93,12 +106,13 @@ export function rememberSteeringMarkers(current: MarkerState, additions: readonl
 export async function executeTools(
   options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, output: ModelStepResult,
   initial: TurnExecutionOptions["snapshot"], seen: Set<string>, signal: AbortSignal, now: () => Date, markerState: MarkerState,
-  onToolCallPersisted: () => void,
+  onToolCallPersisted: () => void, projectedReplayCallIds: ReadonlySet<string> = new Set(),
 ): Promise<ToolOutcome> {
   let snapshot = initial
+  const receipts: PersistedToolExecutionReceipt[] = []
   for (const call of output.toolCalls) {
     assertExecutionAlive(options, signal)
-    if (seen.has(call.id)) throw new TurnEngineError("invalid_output", "Tool call was repeated in the Turn")
+    if (seen.has(call.id) && !projectedReplayCallIds.has(call.id)) throw new TurnEngineError("invalid_output", "Tool call was repeated in the Turn")
     seen.add(call.id)
     const replayEntries = snapshot.toolObservations.filter(observation => {
       if (!observation.content || typeof observation.content !== "object" || Array.isArray(observation.content)) return false
@@ -131,18 +145,18 @@ export async function executeTools(
         throw new TurnEngineError("persistence_conflict", "Archived wait replay is unavailable")
       }
       const wait = replayed.status === "completed" ? dependencyWaitReceipt(replayed.output, call.name, options.identity.kind) : null
-      if (wait && !hasResolvedWaitOutcome(snapshot, wait.waitId, replayed.input)) return { wait: { status: "waiting_for_dependency", waitId: wait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState }
+      if (wait && !hasResolvedWaitOutcome(snapshot, wait.waitId, replayed.input)) return { wait: { status: "waiting_for_dependency", waitId: wait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState, receipts }
       if (hasNativeCoordinationReceipt(call.name, replayed.status, replayed.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
       continue
     }
     if (sourceResultItemId && !claimedWaitSurface) throw new TurnEngineError("invalid_output", "Child resume receipt is invalid")
     const result = call.name === "agent.ask_user"
       ? await executeNativeQuestionTool(options, writer, step, call, output, now, onToolCallPersisted)
-      : await executeToolWithItems(options, writer, step, call, now, onToolCallPersisted)
+      : await executeToolWithItems(options, writer, step, call, now, onToolCallPersisted, receipt => receipts.push(receipt))
     assertExecutionAlive(options, signal)
     const questionCall = nativeQuestionResultCall(options.identity, step.id, call, result)
-    if (result.status === "failed" && result.errorCode === "policy_requires_approval") return { wait: { status: "waiting_for_approval", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState: markerState }
-    if (result.status === "failed" && (result.errorCode === "policy_requires_user_input" || result.errorCode === "gmail_oauth_required")) return { wait: { status: "waiting_for_user", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState: markerState }
+    if (result.status === "failed" && result.errorCode === "policy_requires_approval") return { wait: { status: "waiting_for_approval", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState: markerState, receipts }
+    if (result.status === "failed" && (result.errorCode === "policy_requires_user_input" || result.errorCode === "gmail_oauth_required")) return { wait: { status: "waiting_for_user", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState: markerState, receipts }
     const failedWaitCall = result.status === "failed" && (call.name === "agent.wait" || call.name === "wait_subagents")
     const invalidWaitOutput = failedWaitCall && (result.errorCode === "durable_wait_receipt_invalid"
       || (result.errorCode === "schema_error" && options.validateToolArguments?.(call.name, call.arguments) === true))
@@ -154,16 +168,16 @@ export async function executeTools(
       toolName: call.name, input: call.arguments, stepId: step.id, output: result.status === "completed" ? result.output : null,
       identity: options.identity, now: now(), reader: options.durableWaitControlReader, stepAdmission: "fresh_streaming_root",
     })
-    if (archivedWait) return { wait: { status: "waiting_for_dependency", waitId: archivedWait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState }
-    if (questionCall) return { wait: await questionWaitResult(options, questionCall.stepId, questionCall.toolCallId, now, 0, 0), snapshot, steeringMarkerState: markerState }
+    if (archivedWait) return { wait: { status: "waiting_for_dependency", waitId: archivedWait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState, receipts }
+    if (questionCall) return { wait: await questionWaitResult(options, questionCall.stepId, questionCall.toolCallId, now, 0, 0), snapshot, steeringMarkerState: markerState, receipts }
     if (call.name === "agent.plan" && result.status === "completed" && hasAcceptedTaskGraphPlan(result.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
     else if (hasNativeCoordinationReceipt(call.name, result.status, result.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
     else if ((call.name === "agent.wait" || call.name === "wait_subagents") && options.identity.kind === "turn"
       && result.status === "completed" && isInlineReadyWait(result.output)) snapshot = await options.refreshTaskGraphAfterReadyWait?.(snapshot) ?? snapshot
     const wait = result.status === "completed" ? dependencyWaitReceipt(result.output, call.name, options.identity.kind) : null
-    if (wait) return { wait: { status: "waiting_for_dependency", waitId: wait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState }
+    if (wait) return { wait: { status: "waiting_for_dependency", waitId: wait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState, receipts }
   }
-  return { wait: null, snapshot, steeringMarkerState: markerState }
+  return { wait: null, snapshot, steeringMarkerState: markerState, receipts }
 }
 export async function recoverPersistedToolCalls(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, now: () => Date): Promise<readonly { id: string; content: ReturnType<typeof toRepositoryJson> }[]> {
   const recovery = await recoverableNativeQuestionCalls(options, options.toolCallRecovery ?? [], now)
@@ -219,28 +233,8 @@ export async function recoverPersistedToolCalls(options: TurnExecutionOptions, w
   }
   return observations
 }
-type DependencyWaitReceipt = { readonly waitId: string; readonly deadlineAt: string; readonly matchedTaskIds: readonly string[] }
 function hasAcceptedTaskGraphPlan(value: unknown): boolean {
   const status = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>).status : null
   return status === "accepted" || status === "duplicate"
 }
 function isInlineReadyWait(value: unknown): boolean { return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, unknown>).status === "ready") }
-function dependencyWaitReceipt(value: unknown, toolName: string, ownerKind: TurnExecutionIdentity["kind"]): DependencyWaitReceipt | null {
-  if (toolName !== "agent.wait" && toolName !== "wait_subagents") return null
-  let safeValue: unknown
-  try { safeValue = prepareDurableWaitOutput(value, toolName, ownerKind).safe }
-  catch { throw new TurnEngineError("invalid_output", "Durable wait receipt is invalid") }
-  if (!safeValue || typeof safeValue !== "object" || Array.isArray(safeValue)) throw new TurnEngineError("invalid_output", "Durable wait receipt is invalid")
-  const record = safeValue as Record<string, unknown>
-  if (record.status !== "waiting") return null
-  const waitId = record.waitId
-  if (!validWaitIdForOwner(toolName, waitId, ownerKind) || typeof record.deadlineAt !== "string" || !record.deadlineAt.trim()
-    || !Array.isArray(record.matchedTaskIds) || !record.matchedTaskIds.every(item => typeof item === "string" && item.trim().length > 0)) {
-    throw new TurnEngineError("invalid_output", "Durable wait receipt is invalid")
-  }
-  return { waitId, deadlineAt: record.deadlineAt, matchedTaskIds: record.matchedTaskIds }
-}
-function validWaitIdForOwner(toolName: string, value: unknown, ownerKind: TurnExecutionIdentity["kind"]): value is string {
-  if (ownerKind === "turn") return (toolName === "agent.wait" || toolName === "wait_subagents") && isDurableWaitId(value)
-  return ownerKind === "task" && toolName === "wait_subagents" && isCanonicalRawSubagentWaitId(value)
-}
