@@ -3,9 +3,11 @@ import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { isDeepStrictEqual } from "node:util"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { Pool, type QueryConfig, type QueryResult, type QueryResultRow } from "pg"
+import { Pool, type PoolClient, type QueryConfig, type QueryResult, type QueryResultRow } from "pg"
 import { projectWaitCallCompletionPayload } from "../turns/turn-execution-wait-event-projection.js"
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
+import { loadChildAttemptResume } from "./child-resume.js"
+import type { SubagentLease } from "./types.js"
 
 const DATABASE_NAME = "applymate_nested_delegation_ci"
 const PROCESS_FIXTURE = fileURLToPath(new URL("./nested-scout-delegation-worker.fixture.mjs", import.meta.url))
@@ -824,9 +826,89 @@ async function seed(ids: FixtureIds): Promise<void> {
   }
 }
 
+async function seedResumeLockRows(ids: FixtureIds, rootId: string, childId: string, ownerId: string): Promise<void> {
+  await seed(ids)
+  await pool.query(`UPDATE "agent_turns" SET "status" = 'in_progress' WHERE "id" = $1 AND "sessionId" = $2`, [ids.turnId, ids.sessionId])
+  const columns = `("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")`
+  await pool.query(`INSERT INTO "sub_agent_tasks" ${columns} VALUES
+    ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'root', '{}'::jsonb, '[]'::jsonb, '["jobs.search"]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 0, 3, CURRENT_TIMESTAMP)`,
+  [rootId, ids.sessionId, ids.turnId])
+  await pool.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1 AND "sessionId" = $2`, [rootId, ids.sessionId])
+  await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2 AND "sessionId" = $3`, [rootId, ids.turnId, ids.sessionId])
+  await pool.query(`INSERT INTO "sub_agent_tasks" ${columns} VALUES
+    ($1, $2, $3, $4, $4, $5, 1, 'scout', 'research', 'running', 'resume lock fixture', '[]'::jsonb, '[]'::jsonb, '["jobs.search"]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 3, CURRENT_TIMESTAMP)`,
+  [childId, ids.sessionId, ids.turnId, rootId, `/${rootId}/${childId}`])
+  await pool.query(`UPDATE "sub_agent_tasks" SET "leaseOwner" = $1, "leaseExpiresAt" = clock_timestamp() + interval '2 minutes'
+    WHERE "id" = $2 AND "sessionId" = $3`, [ownerId, childId, ids.sessionId])
+}
+
+async function waitForLockWait(applicationName: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const result = await progressQuery<{ waiting: boolean }>(`SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+      WHERE "application_name" = $1 AND "state" = 'active' AND "wait_event_type" = 'Lock' AND "query" LIKE '%FOR SHARE%') AS "waiting"`, [applicationName])
+    if (result.rows[0]?.waiting) return
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error("Child resume did not block on the Session lock barrier")
+}
+async function assertChildResumeLockOrder(): Promise<void> {
+  const suffix = randomUUID()
+  const ids: FixtureIds = { userId: `resume-lock-user-${suffix}`, sessionId: `resume-lock-session-${suffix}`,
+    turnId: `resume-lock-turn-${suffix}`, alphaJobId: randomUUID(), betaJobId: randomUUID(), foreignJobId: randomUUID() }
+  const rootId = `resume-lock-root-${suffix}`, childId = `resume-lock-child-${suffix}`, ownerId = `resume-lock-owner-${suffix}`
+  const applicationName = `child-resume-lock-${suffix}`
+  let writer: PoolClient | undefined
+  let resumePool: Pool | undefined
+  let resumeOutcome: Promise<{ ok: true; value: unknown } | { ok: false; error: unknown }> | undefined
+  try {
+    await seedResumeLockRows(ids, rootId, childId, ownerId)
+    writer = await pool.connect()
+    await writer.query("BEGIN")
+    await writer.query("SET LOCAL lock_timeout = '3s'")
+    const sessionLock = await writer.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`, [ids.sessionId, ids.userId])
+    expect(sessionLock.rows).toHaveLength(1)
+    const resumeUrl = new URL(databaseUrl!)
+    resumeUrl.searchParams.set("application_name", applicationName)
+    resumePool = new Pool({ connectionString: resumeUrl.toString(), max: 1 })
+    const lease: SubagentLease = {
+      id: childId, userId: ids.userId, sessionId: ids.sessionId, turnId: ids.turnId, rootTaskId: rootId, parentTaskId: rootId,
+      path: `/${rootId}/${childId}`, depth: 1, role: "scout", taskType: "research", status: "running", goal: "Resume lock fixture",
+      constraints: [], successCriteria: [], allowedActions: ["jobs.search"], context: {}, expectedOutputSchema: {},
+      modelProfileSnapshot: {}, result: null, failureReason: null, attemptCount: 1, maxAttempts: 3, leaseOwner: ownerId,
+      leaseExpiresAt: new Date(Date.now() + 120_000), interruptRequestedAt: null, budgetSnapshot: {}, toolPolicySnapshot: {},
+      ownerId, signal: new AbortController().signal,
+    }
+    resumeOutcome = loadChildAttemptResume(resumePool, lease).then(
+      value => ({ ok: true as const, value }), error => ({ ok: false as const, error }))
+    await waitForLockWait(applicationName, 5_000)
+    const turnLock = await writer.query(`SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`,
+      [ids.turnId, ids.sessionId, ids.userId])
+    const rootLock = await writer.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`,
+      [rootId, ids.sessionId, ids.turnId])
+    const childLock = await writer.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 FOR UPDATE`,
+      [childId, ids.sessionId, ids.turnId, rootId])
+    expect(turnLock.rows).toHaveLength(1)
+    expect(rootLock.rows).toHaveLength(1)
+    expect(childLock.rows).toHaveLength(1)
+    await writer.query("COMMIT")
+    writer.release()
+    writer = undefined
+    const resumed = await resumeOutcome
+    if (!resumed.ok) throw new Error("Child resume loader failed under ordered lock barrier")
+    expect(resumed.value).toBeUndefined()
+  } finally {
+    if (writer) { await writer.query("ROLLBACK").catch(() => undefined); writer.release() }
+    if (resumeOutcome) await resumeOutcome
+    if (resumePool) await resumePool.end()
+    await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId])
+  }
+}
+
 describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
   beforeAll(() => { pool = new Pool({ connectionString: databaseUrl!, max: 8 }) })
   afterAll(async () => { await pool.end() })
+
 
   it("reclaims a claimed Scout child after a pre-model Worker crash and joins source-bound children across Worker restart", async () => {
     const suffix = randomUUID()
@@ -837,6 +919,7 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
     }
     let first: FixtureProcess | undefined, crashing: FixtureProcess | undefined, restarted: FixtureProcess | undefined
     try {
+      await assertChildResumeLockOrder()
       await seed(ids)
       first = launch("park", ids)
       await waitForMainMarker(ids, first, "P1143_SOURCE_ESCALATION_REJECTED", 45_000)

@@ -8,6 +8,7 @@ import { loadChildConsumedWaitResume } from "./child-resume-consumed-wait.js"
 import { loadChildWaitCallRecovery } from "./child-resume-wait-call-recovery.js"
 import type { ChildWaitClaimRecovery, ChildWaitOrphanRecovery } from "./child-durable-wait-replay.js"
 import { childWaitLogicalResumeCursor } from "./child-resume-wait-call-contract.js"
+import { lockAndLoadCurrentChildResume } from "./child-resume-locks.js"
 export { loadChildConsumedWaitResume } from "./child-resume-consumed-wait.js"
 type QueryClient = Pick<pg.PoolClient, "query" | "release">
 type ResumePool = Pick<pg.Pool, "connect">
@@ -26,8 +27,6 @@ export type ChildResumeLoader = (lease: SubagentLease) => Promise<ChildAttemptRe
 export type ChildSameAttemptResume = ChildAttemptResume & { readonly previousFinalText: string; readonly leaseExpiresAt: Date }
 export type ChildSameAttemptResumeLoader = (lease: SubagentLease) => Promise<ChildSameAttemptResume | null>
 
-const TERMINAL_TURN_STATUSES = "('completed', 'failed', 'interrupted', 'cancelled')"
-const TERMINAL_ROOT_STATUSES = "('completed', 'failed', 'interrupted', 'cancelled', 'closed')"
 const MAX_PRIOR_STEPS = 256; const MAX_PRIOR_ITEMS = 1024
 function text(row: Row, key: string): string {
   const value = row[key]
@@ -56,11 +55,6 @@ function ids(row: Row): readonly string[] {
   })
 }
 
-function currentTaskSql(): string {
-  return `SELECT task."id", task."sessionId", task."turnId", task."rootTaskId", task."status", task."leaseOwner", task."attemptCount", task."leaseExpiresAt", task."interruptRequestedAt", session."userId" AS "userId", turn."status" AS "turnStatus", root."status" AS "rootStatus"
-    FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId" JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId" AND root."turnId" = task."turnId"
-    WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 AND session."userId" = $5 AND task."status" = 'running' AND task."leaseOwner" = $6 AND task."attemptCount" = $7 AND task."leaseExpiresAt" > CURRENT_TIMESTAMP AND task."interruptRequestedAt" IS NULL AND session."status" NOT IN ('aborted', 'archived') AND turn."status" NOT IN ${TERMINAL_TURN_STATUSES} AND root."status" NOT IN ${TERMINAL_ROOT_STATUSES} FOR SHARE`
-}
 function stepsSql(): string {
   return `SELECT step."id", step."sessionId", step."turnId", step."taskId", step."ordinal", step."attempt", step."status", step."inputThroughSequence", step."consumedInputIds", step."inputTokens", step."outputTokens", step."estimatedCostUsd", task."rootTaskId" AS "rootTaskId"
     FROM "agent_steps" AS step JOIN "sub_agent_tasks" AS task ON task."id" = step."taskId" AND task."sessionId" = step."sessionId" AND task."turnId" = step."turnId" JOIN "agent_sessions" AS session ON session."id" = step."sessionId" JOIN "agent_turns" AS turn ON turn."id" = step."turnId" AND turn."sessionId" = step."sessionId" JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId" AND root."turnId" = task."turnId"
@@ -86,18 +80,6 @@ function waitResumeItemsSql(): string {
     WHERE item."taskId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5
       AND step."attempt" <= $6
     ORDER BY step."attempt" ASC, step."ordinal" ASC, item."createdAt" ASC, item."id" ASC LIMIT ${MAX_PRIOR_ITEMS + 1}`
-}
-
-function assertTask(row: Row, lease: SubagentLease, now: Date): void {
-  if (text(row, "id") !== lease.id || text(row, "userId") !== lease.userId || text(row, "sessionId") !== lease.sessionId
-    || text(row, "turnId") !== lease.turnId || text(row, "rootTaskId") !== lease.rootTaskId || text(row, "leaseOwner") !== lease.ownerId
-    || integer(row, "attemptCount", 1) !== lease.attemptCount || row.status !== "running" || row.turnStatus === undefined
-    || row.rootStatus === undefined || row.interruptRequestedAt !== null
-    || typeof row.turnStatus !== "string" || TERMINAL_TURN_STATUSES.includes(`'${row.turnStatus}'`)
-    || typeof row.rootStatus !== "string" || TERMINAL_ROOT_STATUSES.includes(`'${row.rootStatus}'`)) throw new Error("child_resume_owner_mismatch")
-  const expires = row.leaseExpiresAt instanceof Date ? row.leaseExpiresAt : new Date(String(row.leaseExpiresAt))
-  if (!Number.isFinite(expires.getTime()) || expires.getTime() <= now.getTime()) throw new Error("child_resume_lease_expired")
-  if (lease.interruptRequestedAt !== null) throw new Error("child_resume_lease_expired")
 }
 
 function summarizePriorAttempts(stepRows: readonly Row[], itemRows: readonly Row[], lease: SubagentLease): ChildAttemptResume {
@@ -144,9 +126,7 @@ export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLe
   try {
     await client.query("BEGIN")
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", lease.userId])
-    const current = await client.query<Row>(currentTaskSql(), [lease.id, lease.sessionId, lease.turnId, lease.rootTaskId, lease.userId, lease.ownerId, lease.attemptCount])
-    if (!current.rows[0]) throw new Error("child_resume_owner_mismatch")
-    assertTask(current.rows[0], lease, now)
+    await lockAndLoadCurrentChildResume(client, lease, now)
     if (durableWait && durableWait.attempt !== lease.attemptCount) throw new Error("child_resume_wait_step_lineage")
     const acknowledgedWait = durableWait ? await loadChildConsumedWaitResume(client, lease, durableWait.waitId) : undefined
     const waitResume = acknowledgedWait ?? durableWait ?? await loadChildConsumedWaitResume(client, lease)
