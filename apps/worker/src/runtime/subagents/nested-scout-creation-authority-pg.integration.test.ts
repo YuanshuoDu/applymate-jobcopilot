@@ -52,10 +52,10 @@ describePg("nested Scout creation authority: disposable PostgreSQL", () => {
         const outbox = await pool.query(`SELECT count(*)::int AS "count" FROM "agent_outbox" WHERE "aggregateId" = $1`, [ids.session])
         return { tasks: Number(tasks.rows[0]?.count), outbox: Number(outbox.rows[0]?.count) }
       }
-      const insertStep = async (taskId: string, stepId: string, attemptCount: number) => pool.query(
+      const insertStep = async (taskId: string, stepId: string, attemptCount: number, ordinal: number) => pool.query(
         `INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "startedAt")
-          VALUES ($1, $2, $3, $4, 1, $5, 'waiting_for_tool', 0, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
-        [stepId, ids.session, ids.turn, taskId, attemptCount],
+          VALUES ($1, $2, $3, $4, $5, $6, 'waiting_for_tool', 0, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+        [stepId, ids.session, ids.turn, taskId, ordinal, attemptCount],
       )
       const insertToolCall = async (taskId: string, stepId: string, callId: string) => pool.query(
         `INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "startedAt", "updatedAt")
@@ -85,7 +85,7 @@ describePg("nested Scout creation authority: disposable PostgreSQL", () => {
       const unregisteredLease = await unregisteredManager.claim({ taskId: unregistered.id, sessionId: ids.session, rootTaskId: ids.root, ownerId: "unregistered-scout-worker" })
       if (!unregisteredLease) throw Error("Unregistered profile Scout fixture could not be claimed")
       const unregisteredStepId = `nested-authority-unregistered-step-${suffix}`, unregisteredCallId = `nested-authority-unregistered-call-${suffix}`
-      await insertStep(unregistered.id, unregisteredStepId, unregisteredLease.attemptCount)
+      await insertStep(unregistered.id, unregisteredStepId, unregisteredLease.attemptCount, 1)
       await insertToolCall(unregistered.id, unregisteredStepId, unregisteredCallId)
       const beforeUnregisteredSpawn = await sessionCounts()
       await expect(unregisteredManager.spawnFromLease(childSpecFor(unregistered.id), `unregistered-${suffix}`, unregisteredLease,
@@ -115,7 +115,7 @@ describePg("nested Scout creation authority: disposable PostgreSQL", () => {
       const lease = await manager.claim({ taskId: parent.id, sessionId: ids.session, rootTaskId: ids.root, ownerId: "nested-authority-worker" })
       if (!lease) throw Error("Profile Scout fixture could not be claimed")
       const stepId = `nested-authority-step-${suffix}`, callId = `nested-authority-call-${suffix}`
-      await insertStep(parent.id, stepId, lease.attemptCount)
+      await insertStep(parent.id, stepId, lease.attemptCount, 2)
       await insertToolCall(parent.id, stepId, callId)
       const childSpec = childSpecFor(parent.id)
       const spawnKey = `nested-authority-${suffix}`
@@ -186,7 +186,7 @@ describePg("nested Scout creation authority: disposable PostgreSQL", () => {
       const childLease = await manager.claim({ taskId: childId, sessionId: ids.session, rootTaskId: ids.root, ownerId: "nested-child-worker" })
       if (!childLease) throw Error("Depth-two Scout fixture could not be claimed")
       const childStepId = `nested-authority-depth-two-step-${suffix}`, childCallId = `nested-authority-depth-two-call-${suffix}`
-      await insertStep(childId, childStepId, childLease.attemptCount)
+      await insertStep(childId, childStepId, childLease.attemptCount, 3)
       await insertToolCall(childId, childStepId, childCallId)
       const beforeDepthTwoSpawn = await treeCounts(parent.id)
       await expect(manager.spawnFromLease(childSpecFor(childId), `${spawnKey}-depth-two`, childLease,
