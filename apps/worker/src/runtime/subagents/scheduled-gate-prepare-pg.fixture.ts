@@ -70,7 +70,7 @@ export async function seedScheduledGatePrepareFixture(
     await client.query("BEGIN")
     await seedOwnerRows(client, ids, snapshot, scheduleSnapshot, multiPlan, selectedJobIds, sourceByJobId)
     await seedJobs(client, jobRecords)
-    await seedReceipts(client, ids, snapshot, multiPlan, scheduleSnapshot, selectedJobIds)
+    await seedReceipts(client, ids, snapshot, multiPlan, scheduleSnapshot, selectedJobIds, jobRecords)
     await verifyAndPersistPrefix(client, ids, graphScopeV1, snapshot, multiPlan, selectedJobIds,
       sourceByJobId, Math.max(82, minScore))
     const analyzeGraphRevision = scheduledAnalyzePrefixGraphRevision(scoutCount)
@@ -228,8 +228,15 @@ async function seedJobs(client: PoolClient, jobs: readonly ScheduledGatePrepareF
 }
 
 async function seedReceipts(client: PoolClient, ids: ScheduledGatePrepareSeedFixture["ids"], snapshot: TaskGraphSnapshot,
-  plan: ScheduledMultiScoutPrefixPlan | null, schedule: ScheduledAutomationSnapshot, selectedJobIds: readonly string[]): Promise<void> {
+  plan: ScheduledMultiScoutPrefixPlan | null, schedule: ScheduledAutomationSnapshot, selectedJobIds: readonly string[],
+  jobRecords: readonly ScheduledGatePrepareFixtureJobRecord[]): Promise<void> {
   const sources = snapshot.nodes.filter(node => node.templateId === "scout")
+  const recordsById = new Map(jobRecords.map(job => [job.id, job] as const))
+  const jobReadOutput = (id: string): { job: { id: string; source: string; location: string } } => {
+    const job = recordsById.get(id)
+    if (!job) throw new Error("scheduled_gate_prepare_read_job_missing")
+    return { job: { id: job.id, source: job.source, location: job.location } }
+  }
   let ordinal = 1
   for (const [index, node] of sources.entries()) {
     const multi = plan !== null, source = plan?.scouts[index]
@@ -239,16 +246,16 @@ async function seedReceipts(client: PoolClient, ids: ScheduledGatePrepareSeedFix
     const callSuffix = multi ? `${node.key}-discover` : "discover"
     const discoveryInput = multi ? { targetRoles: schedule.targetRoles, targetLocations: schedule.targetLocations, source: provider } : { query: "Software Engineer Dublin" }
     await persistToolReceipt(client, ids, node.taskId, stepSuffix, "jobs.discover", callSuffix, discoveryInput,
-      discoveryOutput(ids, candidateIds, stepSuffix, callSuffix, provider), ordinal++)
+      discoveryOutput(ids, candidateIds, stepSuffix, callSuffix, provider, jobRecords), ordinal++)
     for (const [candidateIndex, jobId] of candidateIds.entries()) {
       const readSuffix = multi ? `${node.key}-read-${candidateIndex}` : `scout-read-${candidateIndex}`
       await persistToolReceipt(client, ids, node.taskId, stepSuffix, "jobs.get", readSuffix, { jobId },
-        { job: { id: jobId, source: sourceByJobId(plan, jobId) } }, ordinal++)
+        jobReadOutput(jobId), ordinal++)
     }
   }
   for (const [index, jobId] of selectedJobIds.entries()) {
     await persistToolReceipt(client, ids, ids.analystTaskId, "analyst-step", `jobs.get`, `analyst-read-${index}`, { jobId },
-      { job: { id: jobId, source: sourceByJobId(plan, jobId) } }, ordinal++)
+      jobReadOutput(jobId), ordinal++)
   }
 }
 
@@ -328,9 +335,20 @@ function roleResult(role: "scout" | "analyst", jobIds: readonly string[], score:
 }
 
 function discoveryOutput(ids: ScheduledGatePrepareSeedFixture["ids"], jobIds: readonly string[], stepSuffix: string,
-  callSuffix: string, source: string): Record<string, unknown> {
+  callSuffix: string, source: string, jobRecords: readonly ScheduledGatePrepareFixtureJobRecord[]): Record<string, unknown> {
   const toolCallId = `${callSuffix}-${ids.turnId}`, stepId = `${stepSuffix}-${callSuffix}-${ids.turnId}`
-  return { jobs: jobIds.map(id => ({ id, source })), evidence: [], nextCursor: null, usage: {
+  const recordsById = new Map(jobRecords.map(job => [job.id, job] as const))
+  const jobs = jobIds.map(id => {
+    const job = recordsById.get(id)
+    if (!job) throw new Error("scheduled_gate_prepare_discovery_job_missing")
+    const evidenceId = `fixture-source-${id}`
+    return { id: job.id, title: job.role, company: job.company, location: job.location, url: job.url,
+      description: job.description, fullDescription: job.description, salary: job.salary, logo: null, source: job.source,
+      evidenceRefs: [evidenceId] }
+  })
+  const evidence = jobs.map(job => ({ evidenceId: job.evidenceRefs[0], jobId: job.id, kind: "source", source: job.source,
+    url: job.url, summary: "Fixture source observation." }))
+  return { jobs, evidence, nextCursor: null, usage: {
     ledgerKey: `scheduled-gate-discovery-${callSuffix === "discover" ? ids.turnId : toolCallId}`, toolName: "jobs.discover", toolVersion: "1",
     toolCallId, sessionId: ids.sessionId, turnId: ids.turnId, stepId, requests: 1, jobsProcessed: jobIds.length,
     jobsSucceeded: jobIds.length, jobsFailed: 0, providerFailures: 0, aiCalls: 0, providers: [source], estimatedCostUsd: 0, durationMs: 1,
