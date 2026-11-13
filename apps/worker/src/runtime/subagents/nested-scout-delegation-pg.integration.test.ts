@@ -28,6 +28,7 @@ const MAIN_PROGRESS_MARKERS = new Set([
   "P1143_PARENT_WAIT_TERMINAL_MATCH", "P1143_PARENT_WAIT_TERMINAL_NO_MATCH", "P1143_PARENT_SCOUT_RESULTS_ISSUED",
   "P1143_PARENT_SCOUT_RESULTS_NOT_ISSUED",
   "P1143_PARENT_MODEL_STREAM_ENTERED", "P1143_PARENT_RESUME_MODEL_FIRST_ATTEMPT", "P1143_PARENT_RESUME_MODEL_RETRIED",
+  "P1143_PARENT_RESUME_FINAL_CANDIDATE",
   "P1143_PARENT_RESUME_WAIT_INPUT_PRESENT", "P1143_PARENT_RESUME_WAIT_INPUT_MISSING",
   "P1143_PARENT_RESUME_WAIT_RESULT_PRESENT", "P1143_PARENT_RESUME_WAIT_RESULT_MISSING",
   "P1143_PARENT_RESUME_WAIT_CONTEXT_READY", "P1143_PARENT_RESUME_WAIT_CONTEXT_TIMED_OUT",
@@ -741,7 +742,7 @@ async function waitForTimedOutParentWait(ids: FixtureIds, parentTaskId: string, 
   throw new Error("Suspended child wait did not time out and queue its parent")
 }
 
-async function waitForFinalWaitAfterTimeout(ids: FixtureIds, parentTaskId: string, initialWaitId: string, timeoutMs: number) {
+async function waitForFinalWaitAfterTimeout(ids: FixtureIds, parentTaskId: string, initialWaitId: string, timeoutMs: number, worker: FixtureProcess) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const result = await progressQuery<{ id: string; status: string; stepId: string; idempotencyKey: string; targetTaskIds: unknown;
@@ -754,6 +755,8 @@ async function waitForFinalWaitAfterTimeout(ids: FixtureIds, parentTaskId: strin
       && nextWait?.suspendedAt instanceof Date && ["waiting", "ready"].includes(nextWait.status)) return result.rows
     await new Promise(resolve => setTimeout(resolve, 50))
   }
+  const diagnostic = await readMainProgressDiagnostic(ids, worker.output)
+  console.info(`P1143_FINAL_WAIT_PROGRESS_DIAGNOSTIC:${JSON.stringify({ waitingFor: "second_suspended_final_wait", ...diagnostic })}`)
   throw new Error("Resumed parent did not register a second suspended final wait")
 }
 
@@ -926,7 +929,7 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       await waitForMainMarker(ids, restarted, "P1143_RECOVERY_DEPTH2_QUEUED", 30_000)
       await waitForMainMarker(ids, restarted, "P1143_CHILD_SCOUT_RECLAIMED", 30_000)
       const reclaimedOwner = await waitForReclaimedCrashChild(ids, crashedChild.id, crashedChild.leaseOwner!, 30_000)
-      const resumedWaits = await waitForFinalWaitAfterTimeout(ids, parent.rows[0]!.id, initialWaitId, 60_000)
+      const resumedWaits = await waitForFinalWaitAfterTimeout(ids, parent.rows[0]!.id, initialWaitId, 60_000, restarted)
       await waitForMainMarker(ids, restarted, "P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL", 240_000)
       await waitForMainMarker(ids, restarted, "P1143_ROOT_GRAPH_COMPLETED", 240_000)
 

@@ -33,7 +33,6 @@ function hasTerminalWaitOutcome(waitOutput, expectedTaskIds) {
   return sameIds(taskIds) && tasks.length === expectedTaskIds.length
     && sameIds(tasks.map(task => task?.taskId)) && tasks.every(task => terminal.has(task?.status))
 }
-
 function toolCall(callId, name, args) { return { type: "tool_call_completed", callId, name, arguments: args } }
 function completed() { return { type: "completed", finishReason: "tool_calls" } }
 function rootModelRuntime() {
@@ -214,6 +213,7 @@ function childModelRuntime({ task, runtime, markerState }) {
       yield completed(); return
     }
     if (!joined) {
+      if (task.depth === 1 && mode === "resume") say("P1143_PARENT_RESUME_FINAL_CANDIDATE")
       yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [], evidence: [], summary: "Premature candidate before child outcomes" }) }
       yield { type: "completed", finishReason: "stop" }; return
     }
