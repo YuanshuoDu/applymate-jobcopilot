@@ -125,22 +125,44 @@ describePg("Root TaskStore steering finalization on disposable PostgreSQL", () =
   })
 
   it("marks a newly inserted Root and leaves the legacy seeded Root unmarked", async () => {
-    const legacy = await admin!.query<{ outputTokenReservationVersion: number | null }>(
-      `SELECT "outputTokenReservationVersion" FROM "sub_agent_tasks" WHERE "id" = $1`, [ids.root],
-    )
-    expect(legacy.rows[0]?.outputTokenReservationVersion).toBeNull()
-    await admin!.query(`UPDATE "agent_turns" SET "rootTaskId" = NULL WHERE "id" = $1`, [ids.turn])
-    await createPgRootTaskStore(admin as unknown as PgSubagentPool).ensure({
-      lease, goal: "Create a versioned Root", budgetSnapshot: { limits: { maxOutputTokens: 2_048 } },
-    })
-    const created = await admin!.query<{ outputTokenReservationVersion: number | null }>(
-      `SELECT "outputTokenReservationVersion" FROM "sub_agent_tasks" WHERE "id" = $1`, [`root-${ids.turn}`],
-    )
-    const legacyAfter = await admin!.query<{ outputTokenReservationVersion: number | null }>(
-      `SELECT "outputTokenReservationVersion" FROM "sub_agent_tasks" WHERE "id" = $1`, [ids.root],
-    )
-    expect(created.rows[0]?.outputTokenReservationVersion).toBe(1)
-    expect(legacyAfter.rows[0]?.outputTokenReservationVersion).toBeNull()
+    const turnState = await admin!.query<{
+      rootTaskId: string | null
+      objectiveDigest: string | null
+      canonicalOriginDigest: string | null
+      objectiveIndexSemanticsVersion: number | null
+    }>(`SELECT "rootTaskId", "objectiveDigest", "canonicalOriginDigest", "objectiveIndexSemanticsVersion"
+        FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+    [ids.turn, ids.session, ids.user])
+    const seededTurn = turnState.rows[0]
+    if (!seededTurn) throw new Error("Root TaskStore fixture Turn was missing")
+    const createdRootId = `root-${ids.turn}`
+    try {
+      const legacy = await admin!.query<{ outputTokenReservationVersion: number | null }>(
+        `SELECT "outputTokenReservationVersion" FROM "sub_agent_tasks" WHERE "id" = $1`, [ids.root],
+      )
+      expect(legacy.rows[0]?.outputTokenReservationVersion).toBeNull()
+      await admin!.query(`UPDATE "agent_turns" SET "rootTaskId" = NULL WHERE "id" = $1`, [ids.turn])
+      await createPgRootTaskStore(admin as unknown as PgSubagentPool).ensure({
+        lease, goal: "Create a versioned Root", budgetSnapshot: { limits: { maxOutputTokens: 2_048 } },
+      })
+      const created = await admin!.query<{ outputTokenReservationVersion: number | null }>(
+        `SELECT "outputTokenReservationVersion" FROM "sub_agent_tasks" WHERE "id" = $1`, [`root-${ids.turn}`],
+      )
+      const legacyAfter = await admin!.query<{ outputTokenReservationVersion: number | null }>(
+        `SELECT "outputTokenReservationVersion" FROM "sub_agent_tasks" WHERE "id" = $1`, [ids.root],
+      )
+      expect(created.rows[0]?.outputTokenReservationVersion).toBe(1)
+      expect(legacyAfter.rows[0]?.outputTokenReservationVersion).toBeNull()
+    } finally {
+      await admin!.query(`UPDATE "agent_turns" SET "rootTaskId" = $1, "objectiveDigest" = $2,
+        "canonicalOriginDigest" = $3, "objectiveIndexSemanticsVersion" = $4
+        WHERE "id" = $5 AND "sessionId" = $6 AND "userId" = $7`,
+      [seededTurn.rootTaskId, seededTurn.objectiveDigest, seededTurn.canonicalOriginDigest,
+        seededTurn.objectiveIndexSemanticsVersion, ids.turn, ids.session, ids.user])
+      await admin!.query(`DELETE FROM "sub_agent_tasks"
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1 AND "parentTaskId" IS NULL`,
+      [createdRootId, ids.session, ids.turn])
+    }
   })
 
   it("rolls back Root finish when consumed steering has no persisted decision receipt", async () => {
