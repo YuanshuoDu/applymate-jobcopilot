@@ -1,30 +1,36 @@
-import type {
-  TaskGraphVerificationCheck,
-  TaskGraphVerificationContract,
-  TaskGraphVerificationReasonCode,
-  TaskGraphVerificationRole,
-  TaskGraphVerificationValidationError,
-} from "./task-graph-verification-contract.js"
+import type { TaskGraphVerificationCheck, TaskGraphVerificationContract, TaskGraphVerificationReasonCode, TaskGraphVerificationRole, TaskGraphVerificationValidationError } from "./task-graph-verification-contract.js"
 import { taskGraphVerificationCheckDependencyNodeKeys } from "./task-graph-verification-scout-union.js"
+import { normalizeAgentLocation } from "@jobcopilot/shared"
 
 export const TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION = "agent-harness.v2.task-graph-verification-evidence.v1" as const
-export const TASK_GRAPH_VERIFICATION_LIMITS = Object.freeze({
-  maxCriteria: 8,
-  maxItems: 50,
-  maxCriterionIdLength: 64,
-  maxScore: 10,
-})
+export const TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION = "agent-harness.v2.task-graph-verification-evidence.v2" as const
+export const TASK_GRAPH_VERIFICATION_LIMITS = Object.freeze({ maxCriteria: 8, maxItems: 50, maxCriterionIdLength: 64, maxScore: 10 })
 
 export type TaskGraphVerificationCandidateProjection = Readonly<{ jobId: string; evidenceIds: readonly string[] }>
+export type TaskGraphVerificationCandidateProjectionV2 = Readonly<{ jobId: string; evidenceIds: readonly string[]; observedLocation: string | null; locationEvidenceStatus: "verified" | "missing" | "conflicting" }>
 export type TaskGraphVerificationFindingProjection = Readonly<{ jobId: string; score: number; evidenceIds: readonly string[] }>
 export type TaskGraphEmptyDiscoveryReceiptProjection = Readonly<{ digest: string }>
 export type TaskGraphVerificationEvidenceProjection =
   | Readonly<{ schemaVersion: typeof TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION; role: "scout"; candidates: readonly TaskGraphVerificationCandidateProjection[]; evidenceIds: readonly string[]; emptyDiscoveryReceipt?: TaskGraphEmptyDiscoveryReceiptProjection }>
   | Readonly<{ schemaVersion: typeof TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION; role: "analyst"; findings: readonly TaskGraphVerificationFindingProjection[]; evidenceIds: readonly string[]; emptyDiscoveryReceipt?: TaskGraphEmptyDiscoveryReceiptProjection }>
+  | Readonly<{ schemaVersion: typeof TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION; role: "scout"; candidates: readonly TaskGraphVerificationCandidateProjectionV2[]; evidenceIds: readonly string[]; emptyDiscoveryReceipt?: TaskGraphEmptyDiscoveryReceiptProjection }>
+  | Readonly<{ schemaVersion: typeof TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION; role: "analyst"; findings: readonly TaskGraphVerificationFindingProjection[]; evidenceIds: readonly string[]; emptyDiscoveryReceipt?: TaskGraphEmptyDiscoveryReceiptProjection }>
 export type TaskGraphVerificationDependencyEvidence = ReadonlyMap<string, TaskGraphVerificationEvidenceProjection>
 
-type ParsedItem = Readonly<{ jobId: string; evidenceIds: readonly string[]; score?: number }>
-export type TaskGraphVerificationParsedProjection = Readonly<{ role: TaskGraphVerificationRole; items: readonly ParsedItem[]; evidenceIds: readonly string[]; emptyDiscoveryDigest?: string }>
+type ParsedItem = Readonly<{
+  jobId: string
+  evidenceIds: readonly string[]
+  score?: number
+  observedLocation?: string | null
+  locationEvidenceStatus?: "verified" | "missing" | "conflicting"
+}>
+export type TaskGraphVerificationParsedProjection = Readonly<{
+  schemaVersion: typeof TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION | typeof TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION
+  role: TaskGraphVerificationRole
+  items: readonly ParsedItem[]
+  evidenceIds: readonly string[]
+  emptyDiscoveryDigest?: string
+}>
 export type TaskGraphVerificationProjectionParse =
   | Readonly<{ ok: true; value: TaskGraphVerificationParsedProjection }>
   | Readonly<{ ok: false; reasonCode: Exclude<TaskGraphVerificationReasonCode, "criteria_met" | "criterion_not_met" | "reported_score_below_minimum" | "contract_invalid"> }>
@@ -88,7 +94,13 @@ export function parseTaskGraphVerificationEvidenceProjection(value: unknown): Ta
     ? hasEmptyDiscoveryReceipt ? "candidates,emptyDiscoveryReceipt,evidenceIds,role,schemaVersion" : "candidates,evidenceIds,role,schemaVersion"
     : hasEmptyDiscoveryReceipt ? "emptyDiscoveryReceipt,evidenceIds,findings,role,schemaVersion" : "evidenceIds,findings,role,schemaVersion"
   const row = exactRecord(value, keys)
-  if (!row || row.schemaVersion !== TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION || row.role !== role) return { ok: false, reasonCode: "projection_invalid" }
+  if (!row || row.role !== role) return { ok: false, reasonCode: "projection_invalid" }
+  const version = row.schemaVersion === TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION
+    ? TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION
+    : row.schemaVersion === TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION
+      ? TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION : undefined
+  if (!version) return { ok: false, reasonCode: "projection_invalid" }
+  const hasObservedLocation = version === TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION
   let emptyDiscoveryDigest: string | undefined
   if (hasEmptyDiscoveryReceipt) {
     const receipt = exactRecord(row.emptyDiscoveryReceipt, "digest")
@@ -109,7 +121,9 @@ export function parseTaskGraphVerificationEvidenceProjection(value: unknown): Ta
   } else if (evidenceIds.some(id => !canonicalReadEvidenceId(id))) return { ok: false, reasonCode: "canonical_evidence_invalid" }
   const seenJobs = new Set<string>(), items: ParsedItem[] = []
   for (const valueItem of rows) {
-    const item = role === "scout" ? exactRecord(valueItem, "evidenceIds,jobId") : exactRecord(valueItem, "evidenceIds,jobId,score")
+    const item = role === "scout"
+      ? exactRecord(valueItem, hasObservedLocation ? "evidenceIds,jobId,locationEvidenceStatus,observedLocation" : "evidenceIds,jobId")
+      : exactRecord(valueItem, "evidenceIds,jobId,score")
     if (!item || !boundedText(item.jobId)) return { ok: false, reasonCode: "result_invalid" }
     if (seenJobs.has(item.jobId)) return { ok: false, reasonCode: "result_ambiguous" }
     seenJobs.add(item.jobId)
@@ -117,9 +131,21 @@ export function parseTaskGraphVerificationEvidenceProjection(value: unknown): Ta
     if (!refs || refs.some(ref => !boundedText(ref, 269)) || new Set(refs).size !== refs.length
       || (role === "analyst" && (typeof item.score !== "number" || !Number.isFinite(item.score) || item.score < 0 || item.score > TASK_GRAPH_VERIFICATION_LIMITS.maxScore))) return { ok: false, reasonCode: "result_invalid" }
     if (refs.some(ref => !canonicalIds.has(ref)) || !refs.includes("read:job:" + item.jobId)) return { ok: false, reasonCode: "result_evidence_unbound" }
+    if (role === "scout" && hasObservedLocation) {
+      if (item.locationEvidenceStatus !== "verified" && item.locationEvidenceStatus !== "missing" && item.locationEvidenceStatus !== "conflicting") {
+        return { ok: false, reasonCode: "canonical_evidence_invalid" }
+      }
+      const observedLocation = item.observedLocation
+      if (item.locationEvidenceStatus === "verified") {
+        const normalized = normalizeAgentLocation(observedLocation)
+        if (typeof observedLocation !== "string" || !boundedText(observedLocation, 1500) || !normalized || normalized !== observedLocation) return { ok: false, reasonCode: "canonical_evidence_invalid" }
+      } else if (observedLocation !== null) return { ok: false, reasonCode: "canonical_evidence_invalid" }
+      items.push({ jobId: item.jobId, evidenceIds: refs, observedLocation: observedLocation as string | null, locationEvidenceStatus: item.locationEvidenceStatus })
+      continue
+    }
     items.push({ jobId: item.jobId, evidenceIds: refs, ...(role === "analyst" ? { score: item.score as number } : {}) })
   }
-  return { ok: true, value: { role, items, evidenceIds, ...(emptyDiscoveryDigest ? { emptyDiscoveryDigest } : {}) } }
+  return { ok: true, value: { schemaVersion: version, role, items, evidenceIds, ...(emptyDiscoveryDigest ? { emptyDiscoveryDigest } : {}) } }
 }
 
 export function parseFindingsFromScoutDependencyCheck(

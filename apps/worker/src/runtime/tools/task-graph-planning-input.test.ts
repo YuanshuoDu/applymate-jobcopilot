@@ -1,7 +1,7 @@
 import { Type } from "@sinclair/typebox"
 import { Value } from "@sinclair/typebox/value"
 import { describe, expect, it } from "vitest"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification-contract.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification-contract.js"
 import {
   buildTaskGraphProposalInputSchema,
   normalizeTaskGraphPlanningNodes,
@@ -41,6 +41,25 @@ describe("agent.plan proposal schema construction", () => {
     expect(() => buildTaskGraphProposalInputSchema(Type.String(), [
       ["scout", { role: "analyst", taskType: "job_analysis", allowedActions: [] }],
     ])).toThrow("task_graph_verification_template_role_mismatch")
+  })
+
+  it("accepts a v2 Scout location check while keeping the new check out of v1", () => {
+    const templates = [["scout", { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] }]] as const
+    const schema = buildTaskGraphProposalInputSchema(Type.Literal("scout"), templates)
+    const v2Verification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout" as const,
+      criteria: [{ id: "candidate-location", check: { kind: "candidate_location_in" as const, locations: ["Dublin", "Berlin"] } }],
+    }
+    const node: TaskGraphModelNodeProposal = { key: "scout-locations", templateId: "scout", goal: "Find roles in the requested locations",
+      successCriteria: ["Only report roles with verified locations"], dependsOn: [], verification: v2Verification }
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [node] })).toBe(true)
+    expect(normalizeTaskGraphPlanningNodes([node], "root-task").ok).toBe(true)
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [{ ...node, verification: {
+      ...v2Verification, schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+    } }] })).toBe(false)
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [{ ...node, verification: {
+      ...v2Verification, criteria: [{ ...v2Verification.criteria[0], check: { ...v2Verification.criteria[0].check, extra: true } }],
+    } }] })).toBe(false)
   })
 
   it("requires bounded unique Gate package refs only on scheduled Execute proposals", () => {

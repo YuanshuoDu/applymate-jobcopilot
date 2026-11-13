@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import * as verification from "./task-graph-pg-verification.js"
-import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-dependency-verification.js"
+import { isValidScoutTaskEnvelope, verifyCompletedScoutDependencies } from "./task-graph-pg-completed-dependency-verification.js"
 import { parseTaskGraphSnapshot, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, taskGraphVerificationDependencyNodeKeys, type TaskGraphVerificationEvaluation, type TaskGraphVerificationEvidenceProjection } from "../planning/task-graph-verification.js"
 import { validateTaskGraphVerificationDependencySelectors } from "../planning/task-graph-verification-cross-node.js"
@@ -34,6 +34,15 @@ function graph(overrides: { source?: Record<string, unknown>; analyst?: Record<s
 }
 
 describe("verifyCompletedScoutDependencies", () => {
+  it("exposes the same task-envelope fence for repair receipt revalidation", () => {
+    const value = graph()
+    const source = value.snapshot.nodes[0]!
+    expect(isValidScoutTaskEnvelope(source, value.task.taskType, value.task.expectedOutputSchema, value.task.allowedActions)).toBe(true)
+    expect(isValidScoutTaskEnvelope(source, "other", value.task.expectedOutputSchema, value.task.allowedActions)).toBe(false)
+    expect(isValidScoutTaskEnvelope(source, value.task.taskType, value.task.expectedOutputSchema, ["agent.plan"])).toBe(false)
+    expect(isValidScoutTaskEnvelope(source, value.task.taskType, { schemaVersion: "wrong", role: "scout" }, value.task.allowedActions)).toBe(false)
+  })
+
   it("accepts a declared custom Scout envelope when the completed task and recomputed report match it", async () => {
     const value = graph({
       source: { registeredScoutEnvelope: customScoutEnvelope },

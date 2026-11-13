@@ -129,12 +129,12 @@ describe("agent.plan tool executor", () => {
     })
   })
 
-  it("keeps invalid optional requirements distinct while allowing prose-only planning", async () => {
+  it("fails closed for invalid canonical requirements before scheduling planning work", async () => {
     const invalid = resolveRootTaskVerificationRequirements({ input: { verificationRequirements: { malformed: true } } })
     expect(invalid).toEqual({ status: "invalid" })
     const { tool, commandPort } = setup(undefined, invalid)
-    await expect(tool.execute(context(), proposal)).resolves.toEqual(receipt)
-    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+    await expect(tool.execute(context(), proposal)).rejects.toMatchObject({ code: "task_graph_objective_requirements_invalid" })
+    expect(commandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
   })
 
   it("rejects malformed model proposals before the scheduler port runs", () => {
@@ -211,7 +211,8 @@ describe("agent.plan tool executor", () => {
     expect(tool.description).toContain("reported_score_gte checks an Analyst-reported number, not its correctness")
     expect(tool.description).toContain("findings_from_scout_dependency")
     expect(tool.description).toContain("findings_cover_scout_candidates_gte is Analyst-only")
-    expect(tool.description).toContain("Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte, findings_from_scout_dependency, findings_cover_scout_candidates_gte, findings_from_scout_union, findings_cover_scout_candidate_union_gte, findings_cover_each_scout_candidates_gte")
+    expect(tool.description).toContain("Allowed checks: candidate_count_gte, candidate_location_in (v2 Scout only), finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte, findings_from_scout_dependency, findings_cover_scout_candidates_gte, findings_from_scout_union, findings_cover_scout_candidate_union_gte, findings_cover_each_scout_candidates_gte")
+    expect(tool.description).toContain("use agent-harness.v2.task-graph-verification.v2 only when a canonical candidate_location_in requirement is present")
     expect(tool.description).toContain("findings_from_scout_union is Analyst-only and selects 2 to 8 unique direct typed Scout keys")
     expect(tool.description).toContain("it requires nonempty findings and a nonempty deduplicated candidate union, and every finding must belong to that selected group")
     expect(tool.description).toContain("findings_cover_scout_candidate_union_gte uses its own selected group")

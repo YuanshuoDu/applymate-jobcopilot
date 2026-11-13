@@ -76,4 +76,15 @@ describe("agent retry command API", () => {
     expect(unauthorized.status).toBe(401)
     expect(mocks.retry).toHaveBeenCalledTimes(1)
   })
+
+  it("maps persisted retry validation failures to a conflict response", async () => {
+    mocks.retry.mockRejectedValueOnce(new (await import("@/lib/agent/control-plane/commands")).AgentCommandError(
+      "retry_input_invalid", "invalid retry input", 409,
+    ))
+    const { POST } = await import("./route")
+    const response = await POST(request({ clientMessageId: "retry_invalid_requirements" }) as never, params)
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "retry_input_invalid" } })
+  })
 })

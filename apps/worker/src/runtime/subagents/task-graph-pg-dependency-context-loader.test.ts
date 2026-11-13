@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
 import type { Queryable } from "./pg-store-persistence.js"
 import { ROLE_RESULT_SCHEMA, validateRoleResult } from "./role-results.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "./task-graph-command-port.js"
@@ -101,6 +101,29 @@ describe("loadScopedTaskGraphDependencyContext", () => {
       { query: vi.fn(async () => ({ rows: fixture.rows, rowCount: fixture.rows.length })) } as unknown as Queryable,
       fixture.scope, "child-task", ["source"], fixture.nodes,
     )).rejects.toThrow("task_graph_dependency_repair_composite_unverified")
+  })
+
+  it("does not complete a location repair when the failed target partial has no persisted role result", async () => {
+    const location = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout" as const,
+      criteria: [{ id: "location", check: { kind: "candidate_location_in" as const, locations: ["Dublin"] } }] }
+    const nodes = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+      { key: "source", taskId: "source-task", templateId: "scout", goal: "Find in Dublin", successCriteria: ["verified location"], dependsOn: [], depth: 1, verificationDisposition: "typed", verification: location },
+      { key: "consumer", taskId: "child-task", templateId: "analyst", goal: "Analyze", successCriteria: ["analyze"], dependsOn: ["source"], depth: 2 },
+      { key: "source-repair", taskId: "repair-task", templateId: "scout", goal: "Repair source", successCriteria: ["verified location"], dependsOn: [], depth: 2,
+        verificationDisposition: "typed", verification: location,
+        repairOf: { graphRootTaskId: scope.rootTaskId, nodeKey: "source", taskId: "source-task", criterionIds: ["location"] } },
+    ] }).nodes
+    const report = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
+      criteria: [{ criterionId: "location", status: "unverified", reasonCode: "result_invalid" }], evidenceDigest: null, resultDigest: null }
+    const rows: Array<Record<string, unknown>> = [
+      { id: "child-task", status: "waiting", context: {}, ...scope },
+      { id: "source-task", status: "failed", role: "scout", failureReason: "task_graph_verification_unverified", expectedOutputSchema: { role: "scout" },
+        result: { taskGraphVerificationReport: report }, context: {}, ...scope },
+    ]
+    await expect(loadScopedTaskGraphDependencyContext(
+      { query: vi.fn(async () => ({ rows, rowCount: rows.length })) } as unknown as Queryable,
+      scope, "child-task", ["source"], nodes,
+    )).rejects.toThrow("task_graph_dependency_repair_original_partial_unavailable")
   })
 
   it.each([

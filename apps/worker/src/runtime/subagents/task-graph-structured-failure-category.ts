@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import {
   TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2,
   validateTaskGraphVerificationContract,
 } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-verification-report.js"
@@ -15,7 +16,6 @@ export type TaskGraphStructuredOutputFailureCategory =
 const CATEGORIES = new Set<TaskGraphStructuredOutputFailureCategory>([
   "missing_final_output", "result_too_large", "result_shape_invalid", "evidence_binding_invalid",
 ])
-const CRITERION_ID = /^[a-z][a-z0-9._-]{0,63}$/
 const PROJECTED_KEYS = "native,nativeResult,repairOf,repairReceipt,status,templateId,verification,verificationReport"
 const PRIVATE_METADATA_KEYS = ["repairOf", "repairReceipt", "native", "nativeResult"] as const
 
@@ -92,16 +92,11 @@ export function classifyTaskGraphStructuredOutputFailure(
 
   const verification = dataRecord(node.verification)
   if (!verification || !exactKeys(verification, "criteria,role,schemaVersion")
-    || verification.schemaVersion !== TASK_GRAPH_VERIFICATION_SCHEMA_VERSION || verification.role !== role) return undefined
-  const contractCriteria = dataArray(verification.criteria, 1, 8)
-  if (!contractCriteria) return undefined
-  const criterionIds: string[] = []
-  for (const item of contractCriteria) {
-    const criterion = dataRecord(item)
-    if (!criterion || !exactKeys(criterion, "check,id") || typeof criterion.id !== "string" || !CRITERION_ID.test(criterion.id)) return undefined
-    criterionIds.push(criterion.id)
-  }
-  if (new Set(criterionIds).size !== criterionIds.length) return undefined
+    || (verification.schemaVersion !== TASK_GRAPH_VERIFICATION_SCHEMA_VERSION
+      && verification.schemaVersion !== TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2) || verification.role !== role) return undefined
+  const validContract = validateTaskGraphVerificationContract(verification, role)
+  if (!validContract.ok) return undefined
+  const criterionIds = validContract.contract.criteria.map(criterion => criterion.id)
 
   if (!exactKeys(report, "criteria,evidenceDigest,reasonCode,resultDigest,status,verifierVersion")
     || report.verifierVersion !== TASK_GRAPH_VERIFIER_VERSION || report.status !== "unverified"

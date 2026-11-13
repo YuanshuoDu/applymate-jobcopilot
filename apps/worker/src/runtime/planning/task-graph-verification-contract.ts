@@ -3,11 +3,15 @@ import {
   parseFindingsCoverScoutCandidatesCheck,
   parseFindingsFromScoutDependencyCheck,
 } from "./task-graph-verification-cross-node.js"
+import { normalizeAgentLocationAllowlist } from "@jobcopilot/shared"
 
 export const TASK_GRAPH_VERIFICATION_SCHEMA_VERSION = "agent-harness.v2.task-graph-verification.v1" as const
+export const TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 = "agent-harness.v2.task-graph-verification.v2" as const
+export type TaskGraphVerificationSchemaVersion = typeof TASK_GRAPH_VERIFICATION_SCHEMA_VERSION | typeof TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2
 export type TaskGraphVerificationRole = "scout" | "analyst"
 export type TaskGraphVerificationCheck =
   | Readonly<{ kind: "candidate_count_gte"; minimum: number }>
+  | Readonly<{ kind: "candidate_location_in"; locations: readonly string[] }>
   | Readonly<{ kind: "finding_count_gte"; minimum: number }>
   | Readonly<{ kind: "evidence_count_gte"; minimum: number }>
   | Readonly<{ kind: "all_candidates_have_evidence"; minimumItems: number }>
@@ -22,7 +26,7 @@ export type TaskGraphVerificationCheck =
 
 export type TaskGraphVerificationCriterion = Readonly<{ id: string; check: TaskGraphVerificationCheck }>
 export type TaskGraphVerificationContract = Readonly<{
-  schemaVersion: typeof TASK_GRAPH_VERIFICATION_SCHEMA_VERSION
+  schemaVersion: TaskGraphVerificationSchemaVersion
   role: TaskGraphVerificationRole
   criteria: readonly TaskGraphVerificationCriterion[]
 }>
@@ -111,7 +115,7 @@ function parseUnionCheck(
   return { kind, dependencyNodeKeys, minimumPercent: Number(row.minimumPercent) }
 }
 
-function parseCheck(value: unknown, role: TaskGraphVerificationRole, path: string): TaskGraphVerificationCheck | TaskGraphVerificationValidationError {
+function parseCheck(value: unknown, role: TaskGraphVerificationRole, path: string, allowLocation: boolean): TaskGraphVerificationCheck | TaskGraphVerificationValidationError {
   let kind: string | undefined
   try {
     if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -124,6 +128,12 @@ function parseCheck(value: unknown, role: TaskGraphVerificationRole, path: strin
     const check = exactRecord(value, "kind,minimum")
     if (!check || !positiveBoundedInteger(check.minimum)) return { code: "invalid_shape", path }
     return { kind: "candidate_count_gte", minimum: check.minimum }
+  }
+  if (kind === "candidate_location_in" && role === "scout" && allowLocation) {
+    const check = exactRecord(value, "kind,locations")
+    const locations = check && normalizeAgentLocationAllowlist(check.locations)
+    if (!locations) return { code: "invalid_shape", path }
+    return { kind: "candidate_location_in", locations }
   }
   if (kind === "finding_count_gte" && role === "analyst") {
     const check = exactRecord(value, "kind,minimum")
@@ -165,7 +175,9 @@ export function validateTaskGraphVerificationContract(value: unknown, templateId
   const role = Object.hasOwn(TEMPLATE_ROLES, templateId) ? TEMPLATE_ROLES[templateId] : undefined
   if (!role) return invalid("unsupported_template", "verification")
   const contract = exactRecord(value, "criteria,role,schemaVersion")
-  if (!contract || contract.schemaVersion !== TASK_GRAPH_VERIFICATION_SCHEMA_VERSION) return invalid("invalid_shape", "verification")
+  const schemaVersion = contract?.schemaVersion
+  if (!contract || (schemaVersion !== TASK_GRAPH_VERIFICATION_SCHEMA_VERSION
+    && schemaVersion !== TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2)) return invalid("invalid_shape", "verification")
   const criteriaInput = denseList(contract.criteria, TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria, false)
   if (!criteriaInput) return invalid("invalid_shape", "verification")
   if (contract.role !== role) return invalid("role_mismatch", "verification.role")
@@ -176,12 +188,12 @@ export function validateTaskGraphVerificationContract(value: unknown, templateId
       return invalid("invalid_shape", path)
     }
     if (ids.has(row.id)) return invalid("duplicate_id", `${path}.id`)
-    const check = parseCheck(row.check, role, `${path}.check`)
+    const check = parseCheck(row.check, role, `${path}.check`, schemaVersion === TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2)
     if ("code" in check) return invalid(check.code, check.path)
     ids.add(row.id)
     criteria.push({ id: row.id, check })
   }
-  return { ok: true, contract: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role, criteria } }
+  return { ok: true, contract: { schemaVersion, role, criteria } }
 }
 
 export function taskGraphVerificationRole(templateId: string): TaskGraphVerificationRole | undefined {

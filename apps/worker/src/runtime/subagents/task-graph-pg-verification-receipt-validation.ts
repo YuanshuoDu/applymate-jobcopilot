@@ -1,11 +1,17 @@
 import { createHash } from "node:crypto"
+import { Buffer } from "node:buffer"
+import { parseDurableDiscoveryReference } from "./child-durable-discovery.js"
+import { redactJobReadOutput } from "../tools/job-read-output-redaction.js"
 import type { TaskGraphReplayReceipt } from "./task-graph-pg-event-validation.js"
 
 export type TaskGraphVerificationScope = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string; taskId: string; attemptCount: number }>
 type Row = Record<string, unknown>
-const EVIDENCE_TOOLS = new Set(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"])
+const EVIDENCE_TOOLS = new Set(["jobs.search", "jobs.get", "jobs.discover", "tool_results.read", "persona.retrieve", "resume.get_base"])
 const MAX_TOTAL_BYTES = 2 * 1024 * 1024
 const MAX_OBSERVATION_BYTES = 512 * 1024
+const MAX_DURABLE_CHUNK_BYTES = 4096
+const TOOL_RESULT_REF = /^tool-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const SHA256 = /^[0-9a-f]{64}$/
 
 export function validateTaskGraphVerificationItems(values: readonly unknown[], scope: TaskGraphVerificationScope): Row[] {
   const parsed = values.map(record)
@@ -43,7 +49,9 @@ export function canonicalTaskGraphReadObservations(items: readonly Row[], outcom
   for (const call of items.filter(item => item.type === "tool_call")) {
     const content = call.content as Row, callId = String(content.toolCallId), toolName = String(content.toolName)
     if (outcomes.get(callId) !== "completed" || !EVIDENCE_TOOLS.has(toolName)) continue
-    const output = (results.get(callId)?.content as Row).output, encoded = JSON.stringify(output)
+    const result = results.get(callId)?.content as Row | undefined
+    if (!result || !Object.hasOwn(result, "output")) throw new Error("task_graph_verification_output_invalid")
+    const output = result.output, encoded = JSON.stringify(output)
     if (encoded === undefined) throw new Error("task_graph_verification_output_invalid")
     totalBytes += Buffer.byteLength(encoded, "utf8")
     if (totalBytes > MAX_TOTAL_BYTES || Buffer.byteLength(encoded, "utf8") > MAX_OBSERVATION_BYTES || truncated(output)) throw new Error("task_graph_verification_output_invalid")
@@ -54,19 +62,79 @@ export function canonicalTaskGraphReadObservations(items: readonly Row[], outcom
       if (candidate.trim().length === 0) return fallback
       return candidate.length <= 256 ? candidate : undefined
     }
+    const observedSource = (value: Row): string | null | undefined => {
+      const candidate = value.source
+      if (candidate === undefined || candidate === null) return null
+      if (typeof candidate !== "string" || candidate.length > 256) return undefined
+      if (candidate.trim().length === 0) return null
+      return candidate
+    }
+    const location = (value: Row): string | null | undefined => {
+      const candidate = value.location
+      if (candidate === undefined || candidate === null) return null
+      return typeof candidate === "string" && candidate.length <= 500 ? candidate : undefined
+    }
     const row = record(output)
     let projected: unknown
+    let projectedInput: unknown = {}
     if (toolName === "jobs.search" && row && denseRecords(row.jobs, "id")) {
-      const jobs = (row.jobs as Row[]).map(job => ({ id: job.id, source: source(job, "jobs.read") })); if (jobs.some(job => !job.source)) throw new Error("task_graph_verification_output_invalid"); projected = { jobs }
-    } else if (toolName === "jobs.get" && row && record(row.job) && text((row.job as Row).id)) {
-      const job = row.job as Row, canonicalSource = source(job, "jobs.read"); if (!canonicalSource) throw new Error("task_graph_verification_output_invalid"); projected = { job: { id: job.id, source: canonicalSource } }
+      const jobs = (row.jobs as Row[]).map(job => ({ id: job.id, source: source(job, "jobs.read"), observedSource: observedSource(job), location: location(job) }))
+      if (jobs.some(job => !job.source || job.observedSource === undefined || job.location === undefined)) throw new Error("task_graph_verification_output_invalid")
+      projected = { jobs }
+    } else if (toolName === "jobs.get" && row && (row.job === null || record(row.job) && text((row.job as Row).id))) {
+      if (row.job === null) projected = { job: null }
+      else {
+        const job = row.job as Row
+        const canonicalSource = source(job, "jobs.read"), actualSource = observedSource(job), actualLocation = location(job)
+        if (!canonicalSource || actualSource === undefined || actualLocation === undefined) throw new Error("task_graph_verification_output_invalid")
+        projected = { job: { id: job.id, source: canonicalSource, observedSource: actualSource, location: actualLocation } }
+      }
+    } else if (toolName === "jobs.discover") {
+      let reference
+      try { reference = parseDurableDiscoveryReference(output) }
+      catch { throw new Error("task_graph_verification_output_invalid") }
+      if (reference) projected = { $ref: reference.ref, sizeBytes: reference.byteCount, sha256: reference.sha256 }
+      else {
+        const safe = redactJobReadOutput(toolName, output)
+        if (safe === "[REDACTED]" || !record(safe)) throw new Error("task_graph_verification_output_invalid")
+        projected = safe
+      }
+    } else if (toolName === "tool_results.read") {
+      const safe = canonicalToolResultRead(content.input, output)
+      if (!safe) throw new Error("task_graph_verification_output_invalid")
+      projectedInput = safe.input
+      projected = safe.output
     } else if (toolName === "persona.retrieve" && row && denseRecords(row.facts, "id")) {
       const facts = (row.facts as Row[]).map(fact => ({ id: fact.id, source: source(fact, "persona.retrieve") })); if (facts.some(fact => !fact.source)) throw new Error("task_graph_verification_output_invalid"); projected = { facts }
     } else if (toolName === "resume.get_base" && row && record(row.resume) && text((row.resume as Row).id)) projected = { resume: { id: (row.resume as Row).id } }
     else throw new Error("task_graph_verification_output_invalid")
-    observations.push({ id: `tool-result:${callId}`, content: { toolCallId: callId, toolName, input: {}, status: "completed", output: projected, errorCode: null } })
+    observations.push({ id: `tool-result:${callId}`, content: { toolCallId: callId, toolName, input: projectedInput, status: "completed", output: projected, errorCode: null } })
   }
   return observations
+}
+
+function canonicalToolResultRead(input: unknown, output: unknown): { input: Row; output: Row } | undefined {
+  const request = exactRecord(input, ["referenceId"], ["cursor"]), result = exactRecord(output, ["ref", "sha256", "byteCount", "chunk", "nextCursor"])
+  if (!request || !result || typeof request.referenceId !== "string" || !TOOL_RESULT_REF.test(request.referenceId)
+    || result.ref !== request.referenceId || typeof result.sha256 !== "string" || !SHA256.test(result.sha256)
+    || !Number.isSafeInteger(result.byteCount) || (result.byteCount as number) < 0 || (result.byteCount as number) > 1024 * 1024
+    || typeof result.chunk !== "string" || Buffer.byteLength(result.chunk, "utf8") > MAX_DURABLE_CHUNK_BYTES
+    || Buffer.from(result.chunk, "utf8").toString("utf8") !== result.chunk
+    || result.nextCursor !== null && (typeof result.nextCursor !== "string" || !/^(0|[1-9]\d*)$/.test(result.nextCursor))) return undefined
+  if (request.cursor !== undefined && (typeof request.cursor !== "string" || request.cursor.length > 32
+    || !/^(0|[1-9]\d*)$/.test(request.cursor) || !Number.isSafeInteger(Number(request.cursor)))) return undefined
+  if (result.nextCursor !== null && Number(result.nextCursor) > (result.byteCount as number)) return undefined
+  const canonicalInput = request.cursor === undefined ? { referenceId: request.referenceId } : { referenceId: request.referenceId, cursor: request.cursor }
+  return { input: canonicalInput, output: { ref: result.ref, sha256: result.sha256, byteCount: result.byteCount, chunk: result.chunk, nextCursor: result.nextCursor } }
+}
+
+function exactRecord(value: unknown, required: readonly string[], optional: readonly string[] = []): Row | undefined {
+  const parsed = record(value)
+  if (!parsed) return undefined
+  const allowed = new Set([...required, ...optional]), keys = Reflect.ownKeys(parsed)
+  if (keys.length < required.length || keys.length > allowed.size || keys.some(key => typeof key !== "string" || !allowed.has(key))) return undefined
+  for (const key of keys) { const descriptor = Object.getOwnPropertyDescriptor(parsed, key); if (!descriptor?.enumerable || !("value" in descriptor)) return undefined }
+  return required.every(key => Object.hasOwn(parsed, key)) ? parsed : undefined
 }
 
 export function taskGraphEvidenceDigest(items: readonly Row[], outcomes: ReadonlyMap<string, "completed" | "failed">, evidenceIds: readonly string[], resultDigest: string, replayReceipts: readonly TaskGraphReplayReceipt[]): string {

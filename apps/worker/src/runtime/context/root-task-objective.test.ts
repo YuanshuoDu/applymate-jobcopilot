@@ -12,6 +12,10 @@ const objectiveRequirements = (minimum = 3) => ({
     { id: "finding_count", check: { kind: "finding_count_gte", minimum: 1 } },
   ],
 })
+const locationRequirements = (locations: unknown) => ({
+  schemaVersion: "agent-harness.v2.objective-requirements.v2",
+  requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations } }],
+})
 
 describe("canonical root task objective", () => {
   it("uses the canonical nested Turn goal and validates typed content parts", () => {
@@ -146,7 +150,7 @@ describe("canonical Turn verification requirements", () => {
   })
 
   it.each([
-    ["wrong schema version", { ...objectiveRequirements(), schemaVersion: "agent-harness.v2.objective-requirements.v2" }],
+    ["wrong schema version", { ...objectiveRequirements(), schemaVersion: "agent-harness.v2.objective-requirements.v3" }],
     ["unknown block key", { ...objectiveRequirements(), hidden: "private" }],
     ["wrong requirements type", { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: {} }],
     ["empty list", { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: [] }],
@@ -163,6 +167,26 @@ describe("canonical Turn verification requirements", () => {
     ["unknown check key", { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: [{ id: "one", check: { kind: "candidate_count_gte", minimum: 1, note: "extra" } }] }],
     ["oversized list", { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: Array.from({ length: 9 }, (_, index) => ({ id: `requirement-${index}`, check: { kind: "candidate_count_gte", minimum: 1 } })) }],
   ])("marks %s invalid", (_name, value) => {
+    expect(resolveRootTaskVerificationRequirements({ input: { verificationRequirements: value } })).toEqual({ status: "invalid" })
+  })
+
+  it("accepts v2 location allowlists in canonical normalized form", () => {
+    expect(resolveRootTaskVerificationRequirements({ input: { verificationRequirements: locationRequirements([" Dublin ", "BERLIN", "dublin"]) } }))
+      .toEqual({ status: "valid", requirements: [{ id: "candidate-location", kind: "candidate_location_in", locations: ["berlin", "dublin"] }] })
+    expect(resolveRootTaskVerificationRequirements({ input: { verificationRequirements: {
+      schemaVersion: "agent-harness.v2.objective-requirements.v2",
+      requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } }],
+    } } })).toEqual({ status: "valid", requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 2 }] })
+  })
+
+  it.each([
+    ["v1 location check", { ...objectiveRequirements(), requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin"] } }] }],
+    ["missing locations", locationRequirements(undefined)],
+    ["empty locations", locationRequirements([])],
+    ["too many locations", locationRequirements(Array.from({ length: 9 }, (_, index) => `place-${index}`))],
+    ["invalid location", locationRequirements(["Dublin", 3])],
+    ["extra check key", { ...locationRequirements(["Dublin"]), requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin"], minimum: 1 } }] }],
+  ])("fails closed for %s", (_name, value) => {
     expect(resolveRootTaskVerificationRequirements({ input: { verificationRequirements: value } })).toEqual({ status: "invalid" })
   })
 
@@ -228,6 +252,14 @@ describe("canonical Turn verification requirements", () => {
       { id: "finding_count", kind: "finding_count_gte", minimum: 1 },
       { id: "candidate-count", kind: "candidate_count_gte", minimum: 3 },
     ] })
+    expect(resolveRootTaskVerificationRequirements({
+      verificationRequirements: locationRequirements(["Dublin", "Berlin"]),
+      input: { verificationRequirements: locationRequirements(["berlin", "dublin"]) },
+    })).toEqual({ status: "valid", requirements: [{ id: "candidate-location", kind: "candidate_location_in", locations: ["berlin", "dublin"] }] })
+    expect(resolveRootTaskVerificationRequirements({
+      verificationRequirements: locationRequirements(["Dublin"]),
+      input: { verificationRequirements: locationRequirements(["Berlin"]) },
+    })).toEqual({ status: "invalid" })
   })
 
   it("keeps invalid typed intent separate from the existing prose objective", () => {

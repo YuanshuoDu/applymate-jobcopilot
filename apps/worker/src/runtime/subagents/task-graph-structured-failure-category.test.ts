@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer"
 import { describe, expect, it } from "vitest"
 
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-verification-report.js"
 import {
@@ -85,6 +85,20 @@ describe("classifyTaskGraphStructuredOutputFailure", () => {
   it("supports either exact ordinary role with the matching output marker", () => {
     expect(classifyTaskGraphStructuredOutputFailure(eligible("evidence_binding_invalid", "analyst")))
       .toBe("evidence_binding_invalid")
+  })
+
+  it("accepts a validated v2 Scout criterion and rejects that check under the unchanged v1 schema", () => {
+    const valid = eligible()
+    const locationVerification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_location_in", locations: ["dublin"] } }],
+    }
+    expect(classifyTaskGraphStructuredOutputFailure({
+      ...valid, snapshotNode: { ...valid.snapshotNode, verification: locationVerification },
+    })).toBe("result_shape_invalid")
+    expect(classifyTaskGraphStructuredOutputFailure({
+      ...valid, snapshotNode: { ...valid.snapshotNode, verification: { ...locationVerification, schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } },
+    })).toBeUndefined()
   })
 
   it("omits categories when any identity, role, marker, status, reason, or report binding differs", () => {
