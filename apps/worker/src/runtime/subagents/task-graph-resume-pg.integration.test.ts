@@ -4,7 +4,7 @@ import { spawn, type ChildProcess } from "node:child_process"
 import { isDeepStrictEqual } from "node:util"
 import { fileURLToPath } from "node:url"
 import { Queue, QueueEvents } from "bullmq"
-import { Pool, type PoolClient } from "pg"
+import { Pool, type PoolClient, type QueryConfig, type QueryResult, type QueryResultRow } from "pg"
 import { Redis } from "ioredis"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
@@ -69,6 +69,8 @@ import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
+const ANALYST_WAIT_DIAGNOSTIC_CHECKOUT_TIMEOUT_MS = 500
+const ANALYST_WAIT_DIAGNOSTIC_QUERY_TIMEOUT_MS = 750
 const PLAN_CALL_ID = "p3-resume-plan"
 const WAIT_CALL_ID = "p3-resume-wait"
 const DISCOVERY_RESTART_WAIT_CALL_ID = "p3-process-restart-discovery-wait-call"
@@ -570,6 +572,19 @@ const CHILD_OUTCOME_FAILURE_CODES = new Set([
   "policy_rewrite_expands_permissions", "tool_not_found", "tool_version_mismatch", "duplicate_tool", "invalid_definition",
   "schema_error", "tool_result_replay_uncertain", "tool_recovery_aborted", "invalid_structured_result",
 ])
+const SELECTED_JOB_REVIEW_FAILURE_CODES = new Set([
+  ...CHILD_OUTCOME_FAILURE_CODES,
+  "private_artifact_read_unavailable", "private_artifact_read_failed", "private_artifact_read_input_invalid",
+  "private_artifact_tool_unavailable", "private_artifact_tool_policy_denied", "not_found", "stale_hash",
+])
+const SELECTED_JOB_REVIEW_EXIT_SIGNALS = new Set([
+  "SIGABRT", "SIGALRM", "SIGBUS", "SIGCHLD", "SIGCONT", "SIGFPE", "SIGHUP", "SIGILL", "SIGINT",
+  "SIGIO", "SIGIOT", "SIGKILL", "SIGPIPE", "SIGPOLL", "SIGPROF", "SIGPWR", "SIGQUIT", "SIGSEGV",
+  "SIGSTKFLT", "SIGSTOP", "SIGSYS", "SIGTERM", "SIGTRAP", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG",
+  "SIGUSR1", "SIGUSR2", "SIGVTALRM", "SIGXCPU", "SIGXFSZ",
+])
+const SELECTED_JOB_DIAGNOSTIC_CHECKOUT_TIMEOUT_MS = 500
+const SELECTED_JOB_DIAGNOSTIC_QUERY_TIMEOUT_MS = 1_000
 const ROOT_FAILURE_SQLSTATE_CODES = new Set(["40P01", "40001", "55P03", "57014", "23505", "23503", "23502", "23514", "22P02", "42P01", "42703", "42501"])
 const FINAL_TERMINAL_REASONS = new Set([
   "goal_satisfied", "partial_result", "budget_exhausted", "no_progress", "unrecoverable_error", "final_unverified",
@@ -2718,6 +2733,204 @@ function selectedWriterResultShape(value: unknown): RecordValue {
   }
 }
 
+type SelectedJobRestartFailureDiagnostic = Readonly<{
+  databaseState: "available" | "partial" | "unavailable"
+  transactionRolledBack: boolean | null
+  reviewerPresent: boolean
+  reviewerUnique: boolean
+  reviewerStatus: string
+  reviewerAttemptCount: number | "unknown"
+  reviewerResultPresent: boolean
+  reviewerFailureCategory: string
+  readCallPresent: boolean
+  readCallUnique: boolean
+  readCallStatus: string
+  readResultPresent: boolean
+  readResultUnique: boolean
+  readResultStatus: string
+  readOutputPresent: boolean
+  readErrorCategory: string
+  workerExited: boolean
+  workerExitCode: number | "unknown" | null
+  workerSignal: string
+  workerStderrObserved: boolean
+  workerTerminationRequested: boolean
+}>
+
+function selectedJobDiagnosticQuery<Row extends QueryResultRow>(
+  client: PoolClient,
+  text: string,
+  values: unknown[] = [],
+): Promise<QueryResult<Row>> {
+  // node-postgres honors this per-query setting at runtime; its type package omits the config field.
+  const config: QueryConfig<unknown[]> & { query_timeout: number } = {
+    text, values, query_timeout: SELECTED_JOB_DIAGNOSTIC_QUERY_TIMEOUT_MS,
+  }
+  return client.query<Row, unknown[]>(config)
+}
+
+function selectedJobRestartWorkerDiagnostic(worker: ProcessFixtureChild): Pick<SelectedJobRestartFailureDiagnostic,
+  "workerExited" | "workerExitCode" | "workerSignal" | "workerStderrObserved" | "workerTerminationRequested"> {
+  return {
+    workerExited: processFixtureExited(worker),
+    workerExitCode: worker.exitCode === null ? null : Number.isSafeInteger(worker.exitCode) ? worker.exitCode : "unknown",
+    workerSignal: worker.signalCode === null ? "none" : diagnosticEnum(worker.signalCode, SELECTED_JOB_REVIEW_EXIT_SIGNALS) ?? "unknown",
+    workerStderrObserved: worker.errors.length > 0,
+    workerTerminationRequested: worker.terminationSignal !== undefined && worker.terminationSignal !== null,
+  }
+}
+
+function selectedJobRestartUnavailableDiagnostic(worker: ProcessFixtureChild): SelectedJobRestartFailureDiagnostic {
+  return {
+    databaseState: "unavailable", transactionRolledBack: null,
+    reviewerPresent: false, reviewerUnique: false, reviewerStatus: "unknown", reviewerAttemptCount: "unknown",
+    reviewerResultPresent: false, reviewerFailureCategory: "unknown",
+    readCallPresent: false, readCallUnique: false, readCallStatus: "unknown",
+    readResultPresent: false, readResultUnique: false, readResultStatus: "unknown",
+    readOutputPresent: false, readErrorCategory: "unknown",
+    ...selectedJobRestartWorkerDiagnostic(worker),
+  }
+}
+
+function selectedJobReviewFailureCategory(value: unknown): string {
+  if (value === null || value === undefined) return "none"
+  return diagnosticEnum(value, SELECTED_JOB_REVIEW_FAILURE_CODES) ?? "unknown"
+}
+
+function selectedJobReviewItemStatus(rows: readonly { status: unknown }[]): string {
+  if (rows.length === 0) return "missing"
+  if (rows.length > 1) return "multiple"
+  return diagnosticEnum(rows[0]?.status, ITEM_DIAGNOSTIC_STATUSES) ?? "other"
+}
+
+async function selectedJobRestartFailureDiagnostic(
+  pool: Pool,
+  value: Fixture,
+  trace: SelectedJobArtifactReviewTrace,
+  worker: ProcessFixtureChild,
+): Promise<SelectedJobRestartFailureDiagnostic> {
+  let databaseState: SelectedJobRestartFailureDiagnostic["databaseState"] = "unavailable"
+  let transactionRolledBack: boolean | null = null
+  let reviewerPresent = false
+  let reviewerUnique = false
+  let reviewerStatus = "unknown"
+  let reviewerAttemptCount: number | "unknown" = "unknown"
+  let reviewerResultPresent = false
+  let reviewerFailureCategory = "unknown"
+  let readCallPresent = false
+  let readCallUnique = false
+  let readCallStatus = "unknown"
+  let readResultPresent = false
+  let readResultUnique = false
+  let readResultStatus = "unknown"
+  let readOutputPresent = false
+  let readErrorCategory = "unknown"
+  let client: PoolClient | undefined
+  let transactionOpen = false
+  let destroyClient = false
+
+  const checkoutPromise = pool.connect()
+  let checkoutTimer: ReturnType<typeof setTimeout> | undefined
+  const checkout = await Promise.race([
+    checkoutPromise.then(connected => ({ kind: "connected" as const, connected }), () => ({ kind: "failed" as const })),
+    new Promise<{ kind: "timeout" }>(resolve => {
+      checkoutTimer = setTimeout(() => resolve({ kind: "timeout" }), SELECTED_JOB_DIAGNOSTIC_CHECKOUT_TIMEOUT_MS)
+    }),
+  ])
+  if (checkoutTimer) clearTimeout(checkoutTimer)
+  if (checkout.kind === "connected") client = checkout.connected
+  else if (checkout.kind === "timeout") void checkoutPromise.then(lateClient => lateClient.release(), () => undefined)
+
+  if (client) {
+    try {
+      transactionOpen = true
+      await selectedJobDiagnosticQuery(client, "BEGIN READ ONLY")
+      await selectedJobDiagnosticQuery(client, "SET LOCAL statement_timeout = '750ms'")
+      const task = await selectedJobDiagnosticQuery<{
+        status: unknown
+        attemptCount: unknown
+        failureReason: unknown
+        resultPresent: boolean
+      }>(client, `SELECT task."status", task."attemptCount", task."failureReason", (task."result" IS NOT NULL) AS "resultPresent"
+          FROM "sub_agent_tasks" AS task
+          JOIN "agent_sessions" AS owner_session ON owner_session."id" = task."sessionId" AND owner_session."userId" = $1
+          JOIN "agent_turns" AS owner_turn ON owner_turn."id" = task."turnId" AND owner_turn."sessionId" = task."sessionId"
+            AND owner_turn."userId" = owner_session."userId" AND owner_turn."rootTaskId" = task."rootTaskId"
+          WHERE task."id" = $5 AND task."sessionId" = $2 AND task."turnId" = $3
+            AND task."rootTaskId" = $4 AND task."parentTaskId" = $4
+            AND task."role" = 'reviewer' AND task."taskType" = 'cover_letter_review'
+          LIMIT 2`, [value.userId, value.sessionId, value.turnId, trace.rootTaskId, trace.stopReviewerTask.id])
+      databaseState = "available"
+      reviewerPresent = task.rows.length > 0
+      reviewerUnique = task.rows.length === 1
+      if (reviewerUnique) {
+        const row = task.rows[0]!
+        reviewerStatus = diagnosticEnum(row.status, TASK_DIAGNOSTIC_STATUSES) ?? "other"
+        reviewerAttemptCount = Number.isSafeInteger(row.attemptCount) && Number(row.attemptCount) >= 0
+          ? Number(row.attemptCount) : "unknown"
+        reviewerResultPresent = row.resultPresent === true
+        reviewerFailureCategory = selectedJobReviewFailureCategory(row.failureReason)
+
+        const attemptForCall = reviewerAttemptCount === "unknown" ? trace.stopReviewerTask.attemptCount : reviewerAttemptCount
+        const readCallId = `${SELECTED_JOB_REVIEW_READ_CALL_ID}:attempt:${attemptForCall}`
+        const items = await selectedJobDiagnosticQuery<{
+          itemType: unknown
+          status: unknown
+          outputPresent: boolean
+          errorCode: unknown
+        }>(client, `SELECT item."type" AS "itemType", item."status", (item."content" ? 'output') AS "outputPresent",
+              item."content"->>'errorCode' AS "errorCode"
+            FROM "agent_items" AS item
+            JOIN "sub_agent_tasks" AS task ON task."id" = item."taskId" AND task."sessionId" = item."sessionId"
+              AND task."turnId" = item."turnId" AND task."rootTaskId" = $4 AND task."parentTaskId" = $4
+              AND task."role" = 'reviewer' AND task."taskType" = 'cover_letter_review'
+            JOIN "agent_sessions" AS owner_session ON owner_session."id" = task."sessionId" AND owner_session."userId" = $1
+            JOIN "agent_turns" AS owner_turn ON owner_turn."id" = task."turnId" AND owner_turn."sessionId" = task."sessionId"
+              AND owner_turn."userId" = owner_session."userId" AND owner_turn."rootTaskId" = task."rootTaskId"
+            WHERE task."id" = $5 AND item."sessionId" = $2 AND item."turnId" = $3
+              AND item."content"->>'toolCallId' = $6
+              AND ((item."type" = 'tool_call' AND item."content"->>'toolName' = 'artifact.version.read')
+                OR item."type" = 'tool_result')
+            ORDER BY item."createdAt", item."id" LIMIT 4`,
+        [value.userId, value.sessionId, value.turnId, trace.rootTaskId, trace.stopReviewerTask.id, readCallId])
+        const calls = items.rows.filter(item => item.itemType === "tool_call")
+        const results = items.rows.filter(item => item.itemType === "tool_result")
+        readCallPresent = calls.length > 0
+        readCallUnique = calls.length === 1
+        readCallStatus = selectedJobReviewItemStatus(calls)
+        readResultPresent = results.length > 0
+        readResultUnique = results.length === 1
+        readResultStatus = selectedJobReviewItemStatus(results)
+        readOutputPresent = results.some(item => item.outputPresent === true)
+        readErrorCategory = results.length === 1
+          ? selectedJobReviewFailureCategory(results[0]?.errorCode) : results.length > 1 ? "multiple" : "none"
+      }
+    } catch {
+      destroyClient = true
+      if (databaseState === "available") databaseState = "partial"
+    } finally {
+      if (transactionOpen) {
+        try {
+          await selectedJobDiagnosticQuery(client, "ROLLBACK")
+          transactionRolledBack = true
+        } catch {
+          destroyClient = true
+          transactionRolledBack = false
+        }
+      }
+      client.release(destroyClient)
+    }
+  }
+
+  return {
+    databaseState, transactionRolledBack, reviewerPresent, reviewerUnique, reviewerStatus,
+    reviewerAttemptCount, reviewerResultPresent, reviewerFailureCategory,
+    readCallPresent, readCallUnique, readCallStatus, readResultPresent, readResultUnique,
+    readResultStatus, readOutputPresent, readErrorCategory,
+    ...selectedJobRestartWorkerDiagnostic(worker),
+  }
+}
+
 async function reviewSelectedJobThroughRestartedWorker(
   pool: Pool,
   value: Fixture,
@@ -2801,14 +3014,32 @@ async function reviewSelectedJobThroughRestartedWorker(
   worker.stdin?.write(`start-selected-job-review:${trace.stopReviewerTask.id}\n`)
   try {
     await waitForProcessLine(worker, `P3_SELECTED_JOB_STOP_REVIEW_READY ${trace.stopReviewerTask.id}`, 30_000)
-  } catch {
+  } catch (failure) {
     const stopReviewPhaseLines = new Set(worker.output.slice(stopReviewPhaseStart))
-    throw new Error("Selected-job stop-review READY was not reached; phases=" + JSON.stringify({
+    let evidence: SelectedJobRestartFailureDiagnostic
+    try {
+      evidence = await selectedJobRestartFailureDiagnostic(pool, value, trace, worker)
+    } catch {
+      evidence = selectedJobRestartUnavailableDiagnostic(worker)
+    }
+    const phaseEvidence = {
       commandReceived: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.commandReceived),
       round1Entered: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.round1Entered),
       artifactVersionReadYieldReached: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.artifactVersionReadYieldReached),
       round2Entered: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.round2Entered),
       readyEmissionReached: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.readyEmissionReached),
+    }
+    try {
+      console.error("Selected-job stop-review bounded failure evidence=" + JSON.stringify({
+        waitFailure: processLineWaitFailureKind(failure, "P3_SELECTED_JOB_STOP_REVIEW_READY "),
+        phases: phaseEvidence, ...evidence,
+      }))
+    } catch {
+      // Preserve the original marker-wait failure if diagnostic output is unavailable.
+    }
+    throw new Error("Selected-job stop-review READY was not reached; evidence=" + JSON.stringify({
+      waitFailure: processLineWaitFailureKind(failure, "P3_SELECTED_JOB_STOP_REVIEW_READY "),
+      phases: phaseEvidence, ...evidence,
     }))
   }
   const liveStopTask = await trace.store.get(trace.stopReviewerTask.id, value.sessionId)
@@ -5844,6 +6075,260 @@ function leaseRecoveryFixtureDiagnosticProjection(value: unknown): RecordValue |
   }
 }
 
+type AnalystWaitDiagLeaseScope = Readonly<{
+  userMatchesFixture: boolean
+  sessionMatchesFixture: boolean
+  turnMatchesFixture: boolean
+  rootMatchKnown: boolean
+  rootMatchesFixture: boolean | null
+  roleMatchKnown: boolean
+  roleMatchesExpected: boolean
+}>
+type AnalystWaitDiagLeaseObservation = Readonly<{
+  userMatchesFixture: boolean
+  sessionMatchesFixture: boolean
+  turnMatchesFixture: boolean
+  leaseRootTaskId: string
+  roleMatchKnown: boolean
+  roleMatchesExpected: boolean
+}>
+type AnalystWaitDiagState = {
+  leaseArrivals: number
+  leaseObservations: AnalystWaitDiagLeaseObservation[]
+  leaseObservationOverflow: boolean
+  expectedRootTaskId: string | null
+  helperExits: number
+  rootTurnStateReads: number
+  lastHelperExit: RecordValue | null
+}
+type AnalystWaitDiagContext = Readonly<{
+  state: AnalystWaitDiagState
+  sessionId: string
+  userId: string
+  leaseScope: AnalystWaitDiagLeaseScope
+}>
+type AnalystWaitDiagWaitRow = {
+  id: string
+  status: string
+  suspendedAt: Date | null
+  userId: string
+  sessionId: string
+  turnId: string
+  parentTaskId: string
+}
+
+function analystWaitDiagIncrement(value: number): number { return Math.min(99, value + 1) }
+
+function analystWaitDiagObserveLease(
+  lease: SubagentTaskRecord,
+  fixtureValue: Fixture,
+): AnalystWaitDiagLeaseObservation {
+  const expectedRole = lease.goal === "Find at least two owner jobs" || lease.goal === "Recheck after new owner evidence is available"
+    ? "scout"
+    : lease.goal === "Score only after Scout proof" || lease.goal.startsWith("Score supplemental typed task ")
+      ? "analyst" : null
+  return {
+    userMatchesFixture: lease.userId === fixtureValue.userId,
+    sessionMatchesFixture: lease.sessionId === fixtureValue.sessionId,
+    turnMatchesFixture: lease.turnId === fixtureValue.turnId,
+    leaseRootTaskId: lease.rootTaskId,
+    roleMatchKnown: expectedRole !== null,
+    roleMatchesExpected: expectedRole !== null && lease.role === expectedRole,
+  }
+}
+
+function analystWaitDiagLeaseScope(
+  observation: AnalystWaitDiagLeaseObservation,
+  expectedRootTaskId: string | null,
+): AnalystWaitDiagLeaseScope {
+  return {
+    userMatchesFixture: observation.userMatchesFixture,
+    sessionMatchesFixture: observation.sessionMatchesFixture,
+    turnMatchesFixture: observation.turnMatchesFixture,
+    rootMatchKnown: expectedRootTaskId !== null,
+    rootMatchesFixture: expectedRootTaskId === null ? null : observation.leaseRootTaskId === expectedRootTaskId,
+    roleMatchKnown: observation.roleMatchKnown,
+    roleMatchesExpected: observation.roleMatchesExpected,
+  }
+}
+
+function analystWaitDiagRecordLease(state: AnalystWaitDiagState, lease: SubagentLease, fixtureValue: Fixture): void {
+  state.leaseArrivals = analystWaitDiagIncrement(state.leaseArrivals)
+  if (state.leaseObservations.length >= 99) {
+    state.leaseObservationOverflow = true
+    return
+  }
+  state.leaseObservations.push(analystWaitDiagObserveLease(lease, fixtureValue))
+}
+
+function analystWaitDiagUnavailableRootTurn(): RecordValue {
+  return {
+    rootTurnRead: "unavailable", rootTurnStatus: "unknown",
+    rootTurnLeaseOwnerPresent: null, rootTurnRootMatchesFixture: null,
+  }
+}
+
+function analystWaitDiagQuery<Row extends QueryResultRow>(
+  client: PoolClient,
+  text: string,
+  values: unknown[],
+): Promise<QueryResult<Row>> {
+  // node-postgres honors this per-query timeout; the outer deadline also destroys a client if it stalls.
+  const config: QueryConfig<unknown[]> & { query_timeout: number } = {
+    text, values, query_timeout: ANALYST_WAIT_DIAGNOSTIC_QUERY_TIMEOUT_MS,
+  }
+  return client.query<Row, unknown[]>(config)
+}
+
+async function analystWaitDiagReadRootTurn(
+  pool: Pool,
+  turnId: string,
+  context: AnalystWaitDiagContext,
+): Promise<RecordValue> {
+  try {
+    const checkoutPromise = pool.connect()
+    let checkoutTimer: ReturnType<typeof setTimeout> | undefined
+    const checkout = await Promise.race([
+      checkoutPromise.then(client => ({ kind: "connected" as const, client }), () => ({ kind: "failed" as const })),
+      new Promise<{ kind: "timeout" }>(resolve => {
+        checkoutTimer = setTimeout(() => resolve({ kind: "timeout" }), ANALYST_WAIT_DIAGNOSTIC_CHECKOUT_TIMEOUT_MS)
+      }),
+    ])
+    if (checkoutTimer) clearTimeout(checkoutTimer)
+    if (checkout.kind === "timeout") {
+      void checkoutPromise.then(client => { try { client.release() } catch { /* bounded diagnostic cleanup */ } }, () => undefined)
+      return analystWaitDiagUnavailableRootTurn()
+    }
+    if (checkout.kind === "failed") return analystWaitDiagUnavailableRootTurn()
+
+    const client = checkout.client
+    let released = false
+    const release = (error?: Error): boolean => {
+      if (released) return true
+      released = true
+      try { client.release(error); return true } catch { return false }
+    }
+    try {
+      const queryPromise = analystWaitDiagQuery<{
+        status: string
+        leaseOwnerId: string | null
+        rootTaskId: string | null
+      }>(client,
+        `SELECT "status", "leaseOwnerId", "rootTaskId" FROM "agent_turns"
+         WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 LIMIT 1`,
+        [turnId, context.sessionId, context.userId],
+      )
+      let queryTimer: ReturnType<typeof setTimeout> | undefined
+      const query = await Promise.race([
+        queryPromise.then(result => ({ kind: "read" as const, result }), () => ({ kind: "failed" as const })),
+        new Promise<{ kind: "timeout" }>(resolve => {
+          queryTimer = setTimeout(() => resolve({ kind: "timeout" }), ANALYST_WAIT_DIAGNOSTIC_QUERY_TIMEOUT_MS)
+        }),
+      ])
+      if (queryTimer) clearTimeout(queryTimer)
+      if (query.kind === "timeout") {
+        release(new Error("bounded Analyst wait diagnostic query timeout"))
+        return analystWaitDiagUnavailableRootTurn()
+      }
+      if (query.kind === "failed") {
+        release(new Error("bounded Analyst wait diagnostic query failed"))
+        return analystWaitDiagUnavailableRootTurn()
+      }
+      if (!release()) return analystWaitDiagUnavailableRootTurn()
+      const turn = query.result.rows[0]
+      return {
+        rootTurnRead: turn ? "read" : "missing",
+        rootTurnStatus: turn ? diagnosticEnum(turn.status, TURN_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+        rootTurnLeaseOwnerPresent: turn ? turn.leaseOwnerId !== null : null,
+        rootTurnRootMatchesFixture: turn && context.state.expectedRootTaskId
+          ? turn.rootTaskId === context.state.expectedRootTaskId : null,
+      }
+    } catch {
+      release(new Error("bounded Analyst wait diagnostic query failed"))
+      return analystWaitDiagUnavailableRootTurn()
+    }
+  } catch {
+    return analystWaitDiagUnavailableRootTurn()
+  }
+}
+
+function analystWaitDiagRecordHelperExit(
+  pool: Pool,
+  turnId: string,
+  context: AnalystWaitDiagContext,
+  row: AnalystWaitDiagWaitRow | undefined,
+  outcome: "suspended" | "ready_before_suspend" | "timed_out",
+): Promise<void> | undefined {
+  const state = context.state
+  state.helperExits = analystWaitDiagIncrement(state.helperExits)
+  const projection: RecordValue = {
+    outcome,
+    waitRowFound: row !== undefined,
+    waitStatus: row ? diagnosticEnum(row.status, WAIT_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+    waitSuspended: row ? row.suspendedAt instanceof Date : false,
+    waitUserMatchesFixture: row ? row.userId === context.userId : null,
+    waitSessionMatchesFixture: row ? row.sessionId === context.sessionId : null,
+    waitTurnMatchesFixture: row ? row.turnId === turnId : null,
+    waitParentMatchesRoot: row && state.expectedRootTaskId ? row.parentTaskId === state.expectedRootTaskId : null,
+    leaseScope: context.leaseScope,
+  }
+  if (outcome === "suspended") {
+    projection.rootTurnRead = "not_sampled_on_success"
+    projection.rootTurnStatus = "not_sampled"
+    projection.rootTurnLeaseOwnerPresent = null
+    projection.rootTurnRootMatchesFixture = null
+    state.lastHelperExit = projection
+    return
+  }
+  if (state.rootTurnStateReads >= 16) {
+    projection.rootTurnRead = "limit_reached"
+    projection.rootTurnStatus = "unknown"
+    projection.rootTurnLeaseOwnerPresent = null
+    projection.rootTurnRootMatchesFixture = null
+    state.lastHelperExit = projection
+    return
+  }
+  state.rootTurnStateReads = analystWaitDiagIncrement(state.rootTurnStateReads)
+  return analystWaitDiagReadRootTurn(pool, turnId, context).then(rootTurn => {
+    Object.assign(projection, rootTurn)
+    state.lastHelperExit = projection
+  }, () => {
+    Object.assign(projection, analystWaitDiagUnavailableRootTurn())
+    state.lastHelperExit = projection
+  })
+}
+
+function analystWaitDiagProjection(state: AnalystWaitDiagState): RecordValue {
+  const scopes = state.leaseObservations.map(observation => analystWaitDiagLeaseScope(observation, state.expectedRootTaskId))
+  const fixtureScopeMatches = scopes.filter(scope => scope.userMatchesFixture && scope.sessionMatchesFixture
+    && scope.turnMatchesFixture && scope.rootMatchesFixture === true).length
+  const foreignScopeArrivals = scopes.filter(scope => !scope.userMatchesFixture || !scope.sessionMatchesFixture
+    || !scope.turnMatchesFixture || scope.rootMatchesFixture === false).length
+  const unknownRootScopeArrivals = scopes.filter(scope => scope.userMatchesFixture && scope.sessionMatchesFixture
+    && scope.turnMatchesFixture && !scope.rootMatchKnown).length
+  const roleMatches = scopes.filter(scope => scope.roleMatchKnown && scope.roleMatchesExpected).length
+  const roleMismatches = scopes.filter(scope => scope.roleMatchKnown && !scope.roleMatchesExpected).length
+  const unknownExpectedRole = scopes.filter(scope => !scope.roleMatchKnown).length
+  const foreignRoleMatches = scopes.filter(scope => scope.roleMatchKnown && scope.roleMatchesExpected
+    && (!scope.userMatchesFixture || !scope.sessionMatchesFixture || !scope.turnMatchesFixture || scope.rootMatchesFixture === false)).length
+  return {
+    lastHelperExit: state.lastHelperExit,
+    helperExits: diagnosticBoundedCount(state.helperExits),
+    rootTurnStateReads: diagnosticBoundedCount(state.rootTurnStateReads),
+    leaseArrivals: diagnosticBoundedCount(state.leaseArrivals),
+    leaseObservationOverflow: state.leaseObservationOverflow,
+    fixtureScopeMatches: diagnosticBoundedCount(fixtureScopeMatches),
+    foreignScopeArrivals: diagnosticBoundedCount(foreignScopeArrivals),
+    unknownRootScopeArrivals: diagnosticBoundedCount(unknownRootScopeArrivals),
+    roleMatches: diagnosticBoundedCount(roleMatches),
+    roleMismatches: diagnosticBoundedCount(roleMismatches),
+    unknownExpectedRole: diagnosticBoundedCount(unknownExpectedRole),
+    foreignRoleMatches: diagnosticBoundedCount(foreignRoleMatches),
+    leaseScopeSnapshots: scopes.slice(-8),
+    leaseScopeSnapshotsOmitted: diagnosticBoundedCount(Math.max(0, scopes.length - 8)),
+  }
+}
+
 async function waitForPersistedTaskWait(
   pool: Pool,
   turnId: string,
@@ -5851,17 +6336,46 @@ async function waitForPersistedTaskWait(
   timeoutMs = 20_000,
   diagnosticToolCallId?: string,
   diagnosticFixtureCounters?: LeaseRecoveryFixtureDiagnostics,
+  analystWaitDiag?: AnalystWaitDiagContext,
 ): Promise<{ id: string }> {
   const deadline = Date.now() + timeoutMs
+  let lastWaitRow: AnalystWaitDiagWaitRow | undefined
   while (Date.now() < deadline) {
-    const result = await pool.query<{ id: string; status: string; suspendedAt: Date | null }>(
-      `SELECT "id", "status", "suspendedAt" FROM "agent_wait_conditions" WHERE "turnId" = $1 AND "idempotencyKey" = $2`,
-      [turnId, idempotencyKey],
-    )
-    const row = result.rows[0]
-    if (row?.status === "waiting" && row.suspendedAt instanceof Date) return { id: row.id }
-    if (row?.status === "ready") throw new Error("Follow-up child completed before its durable parent wait suspended")
+    let row: { id: string; status: string; suspendedAt: Date | null } | AnalystWaitDiagWaitRow | undefined
+    if (analystWaitDiag) {
+      const result = await pool.query<AnalystWaitDiagWaitRow>(
+        `SELECT "id", "status", "suspendedAt", "userId", "sessionId", "turnId", "parentTaskId"
+         FROM "agent_wait_conditions" WHERE "turnId" = $1 AND "idempotencyKey" = $2`,
+        [turnId, idempotencyKey],
+      )
+      row = result.rows[0]
+      lastWaitRow = result.rows[0]
+    } else {
+      const result = await pool.query<{ id: string; status: string; suspendedAt: Date | null }>(
+        `SELECT "id", "status", "suspendedAt" FROM "agent_wait_conditions" WHERE "turnId" = $1 AND "idempotencyKey" = $2`,
+        [turnId, idempotencyKey],
+      )
+      row = result.rows[0]
+    }
+    if (row?.status === "waiting" && row.suspendedAt instanceof Date) {
+      if (analystWaitDiag) {
+        const diagnostic = analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "suspended")
+        if (diagnostic) await diagnostic
+      }
+      return { id: row.id }
+    }
+    if (row?.status === "ready") {
+      if (analystWaitDiag) {
+        const diagnostic = analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "ready_before_suspend")
+        if (diagnostic) await diagnostic
+      }
+      throw new Error("Follow-up child completed before its durable parent wait suspended")
+    }
     await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  if (analystWaitDiag) {
+    const diagnostic = analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "timed_out")
+    if (diagnostic) await diagnostic
   }
   const diagnostics = diagnosticToolCallId
     ? `; state=${await persistedWaitTimeoutDiagnostics(pool, turnId, idempotencyKey, diagnosticToolCallId, diagnosticFixtureCounters)}`
@@ -13823,6 +14337,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let terminalGateLease: TurnLease | undefined
     let failedReportBeforeRepair: unknown
     let rootExecution = 0
+    const analystWaitDiagState: AnalystWaitDiagState = {
+      leaseArrivals: 0, leaseObservations: [], leaseObservationOverflow: false, expectedRootTaskId: null,
+      helperExits: 0, rootTurnStateReads: 0, lastHelperExit: null,
+    }
     const privateWaitDiagnostics = instrumentPrivateWaitReader(pool!, () => rootExecution)
     const rootRuntime = await canonical.createCanonicalTurnRuntime(privateWaitDiagnostics.pool, {
       workerId: value.ownerId, productionFlags: flags,
@@ -13983,6 +14501,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 )
                 const hiddenRootTaskId = serverTurn.rows[0]?.rootTaskId
                 if (!hiddenRootTaskId) throw new Error("repair fixture could not read the server-owned root identity")
+                analystWaitDiagState.expectedRootTaskId = hiddenRootTaskId
                 expect(JSON.stringify(graph)).not.toContain(hiddenRootTaskId)
               }
               const dependentBeforeRepair = await pool!.query<{ id: string; status: string }>(`SELECT "id", "status" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "goal" = $3`, [value.turnId, value.sessionId, "Score only after Scout proof"])
@@ -14143,7 +14662,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               ? `p3-verifier-repair-initial-wait:${value.turnId}`
               : `p3-verifier-repair-wait:${value.turnId}`
             setExecutionStage("wait_for_persisted_wait")
-            await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
+            const analystWaitDiag: AnalystWaitDiagContext | undefined = !hardExecutorFailure && task.role === "analyst" ? {
+              state: analystWaitDiagState,
+              sessionId: value.sessionId,
+              userId: value.userId,
+              leaseScope: analystWaitDiagLeaseScope(
+                analystWaitDiagObserveLease(task, value), analystWaitDiagState.expectedRootTaskId,
+              ),
+            } : undefined
+            await waitForPersistedTaskWait(pool!, value.turnId, waitKey, undefined, undefined, undefined, analystWaitDiag)
             setExecutionStage("wait_persisted")
             setExecutionStage("tool_result_inspection")
             const inspections = jobIds.map(expectedJobId =>
@@ -14232,6 +14759,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           }
         }
         const isInitialScout = lease.goal === "Find at least two owner jobs"
+        if (!hardExecutorFailure) {
+          analystWaitDiagRecordLease(analystWaitDiagState, lease, value)
+        }
         if (isInitialScout) {
           initialScoutReadDiagnostic.sessionMatchesFixture = lease.sessionId === value.sessionId
           initialScoutReadDiagnostic.turnMatchesFixture = lease.turnId === value.turnId
@@ -14330,6 +14860,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               adapterStage: diagnosticEnum(outcome.adapterStage, REPAIR_CHILD_EXECUTION_STAGES) ?? "other",
             })),
         ) },
+        { label: "analystWaitBoundary", value: "", safeValue: JSON.stringify(analystWaitDiagProjection(analystWaitDiagState)) },
         { label: "childExecutionEvidence", value: "", safeValue: JSON.stringify({
           outcomes: repairChildOutcomeDiagnostics.slice(-8),
           lookups: repairToolLookupDiagnostics.slice(-8),
