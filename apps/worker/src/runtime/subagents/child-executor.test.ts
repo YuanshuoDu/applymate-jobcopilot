@@ -19,6 +19,7 @@ import { executionOwnerFence } from "../execution-owner.js"
 import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
 import { createDurableSubagentWaitTool } from "./durable-subagent-wait-tool.js"
 import { markCanonicalSubagentWaitId, markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
+import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 import type { DurableWaitResume } from "./child-resume-observations.js"
 import type { WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA, canonicalNativeVerificationJson, digestNativeVerificationValue, type NativeVerificationControl, type NativeVerificationPacket } from "./native-verification-contract.js"
@@ -1018,6 +1019,52 @@ describe("child executor composition", () => {
     expect(modelInput).toContain("resolved-wait")
     expect(modelInput).toContain("grandchild-1")
     expect(router).not.toHaveBeenCalled()
+  })
+
+  it("continues children_pending from the same-attempt checkpoint without trusting descendant observations as evidence", async () => {
+    const child: SubagentLease = {
+      ...structuredLease("scout"), taskType: "job_discovery", depth: 1, parentTaskId: "root-1",
+      context: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER },
+      allowedActions: ["jobs.get", "wait_subagents", "scout.delegate", "scout.results"],
+    }
+    const requests: HarnessModelRequest[] = [], startedOrdinals: number[] = []
+    const sameAttemptContinuationLoader = vi.fn(async () => ({
+      resume: { nextOrdinal: 7, stepCount: 7, toolCallCount: 2, inputThroughSequence: 12n, consumedInputIds: [],
+        usage: { inputTokens: 30, outputTokens: 9, estimatedCostUsd: 0.04 } },
+      observations: [
+        restoredRead("delegation", "scout.delegate", { taskId: "grandchild-1", status: "queued" }),
+        restoredRead("descendant-results", "scout.results", { availability: "available", children: [{
+          taskId: "grandchild-1", status: "completed", candidates: [{ jobId: "job-1", source: "greenhouse" }],
+        }] }),
+        restoredRead("descendant-wait", "wait_subagents", { status: "ready", taskIds: ["grandchild-1"] }),
+      ],
+      previousFinalText: "I delegated the additional read-only search.",
+      leaseExpiresAt: new Date("2099-09-09T12:30:00.000Z"),
+    }))
+    const baseStore = executionStore([], requests)
+    const store: TurnExecutionStore = { ...baseStore, startStep: async input => {
+      startedOrdinals.push(input.ordinal)
+      return { id: input.stepId, ordinal: input.ordinal }
+    } }
+    const resumeLoader = vi.fn(async () => undefined)
+    const executor = createChildExecutor({
+      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => textOnlyModel(JSON.stringify(validScoutResult()), request => requests.push(request)),
+      toolRuntimeFactory: () => childToolRuntime([]), resumeLoader, sameAttemptContinuationLoader,
+    })
+
+    const result = await executor({ lease: child, continuation: { kind: "children_pending" } })
+    const context = JSON.stringify(requests[0]?.messages)
+
+    expect(result).toMatchObject({ status: "failed", failureReason: "invalid_structured_result" })
+    expect(result).not.toHaveProperty("mailboxMessageIds")
+    expect(sameAttemptContinuationLoader).toHaveBeenCalledOnce()
+    expect(resumeLoader).not.toHaveBeenCalled()
+    expect(startedOrdinals).toEqual([7])
+    expect(context).toContain("delegation")
+    expect(context).toContain("descendant-results")
+    expect(context).toContain("descendant-wait")
+    expect(context).toContain("grandchild-1")
   })
 
   it("binds restored jobs, persona, and resume evidence before a resumed provider call", async () => {

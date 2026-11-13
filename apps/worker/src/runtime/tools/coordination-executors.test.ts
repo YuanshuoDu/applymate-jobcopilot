@@ -322,6 +322,26 @@ describe("coordination executors", () => {
     expect(runtime.store.activities).toHaveLength(0)
   })
 
+  it.each([
+    ["profile marker", { context: { nestedScoutProfile: "applymate:nested-scout-profile:v1" } }],
+    ["source scope", { context: { nestedScoutSourceSlice: ["greenhouse"] } }],
+    ["delegate action", { allowedActions: ["scout.delegate"] }],
+    ["results action", { allowedActions: ["scout.results"] }],
+  ])("rejects model supplied nested Scout %s before either spawn path", async (_label, override) => {
+    const runtime = makeRuntime()
+    const appendNativeCoordination = vi.fn()
+    const nativeOptions = { ...runtime.options, nativeCoordination: {
+      enabled: true, commandPort: { appendNativeCoordination } as unknown as TaskGraphCommandPort,
+      turnLeaseOwner: "worker-1", turnLeaseVersion: 1, parentLeaseOwner: "worker-1", parentAttemptCount: () => 1,
+    } }
+    const spawn = { idempotencyKey: "reserved-nested-scout", role: "scout", taskType: "research", goal: "Search", ...override } as SpawnSubagentInput
+    await expect(executeSpawn(context(), spawn, runtime.options)).rejects.toMatchObject({ code: "coordination_invalid_input" })
+    await expect(executeSpawn(context({ taskId: "root-1", rootTaskId: "root-1" }), spawn, nativeOptions)).rejects.toMatchObject({ code: "coordination_invalid_input" })
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(runtime.store.activities).toHaveLength(0)
+    expect(appendNativeCoordination).not.toHaveBeenCalled()
+  })
+
   it("routes planner-root spawn aliases through the native command with stable replay identity", async () => {
     const runtime = makeRuntime()
     const calls: TaskGraphNativeCommandInput[] = []

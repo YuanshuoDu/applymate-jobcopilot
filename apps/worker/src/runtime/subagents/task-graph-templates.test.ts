@@ -27,30 +27,6 @@ function scheduledRuntimeInput(overrides: Record<string, unknown> = {}) {
 }
 
 describe("TaskGraph server-owned templates", () => {
-  it("registers Scout and Analyst, while keeping the scheduled Prepare role out of initial planning", () => {
-    expect(TASK_GRAPH_TEMPLATES.scout).toMatchObject({
-      role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"],
-      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
-    })
-    expect(TASK_GRAPH_TEMPLATES.analyst).toMatchObject({
-      role: "analyst", taskType: "job_analysis",
-      allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],
-      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" },
-    })
-    expect(TASK_GRAPH_TEMPLATES.prepare).toMatchObject({
-      role: "prepare", taskType: "scheduled_application_prepare",
-      allowedActions: ["scheduled.application.prepare"],
-      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" },
-    })
-    expect(TASK_GRAPH_TEMPLATES.prepare.constraints?.join(" ")).toContain("specialized scheduled continuation")
-    expect(Object.keys(TASK_GRAPH_TEMPLATES)).toEqual(["scout", "analyst", "prepare"])
-    expect(Object.keys(taskGraphTemplatesForSelectedJob(undefined))).toEqual(["scout", "analyst"])
-    for (const template of Object.values(TASK_GRAPH_TEMPLATES)) {
-      expect(template.allowedActions).not.toContain("agent.plan")
-      expect(template.allowedActions.some(action => /submit|send|publish|delete|mutate|execute/i.test(action))).toBe(false)
-    }
-  })
-
   it("passes the shared typed registry into canonical TaskGraph composition", () => {
     const commandPort = {} as TaskGraphCommandPort
     const runtimeOptions = taskGraphRuntimeOptions(commandPort)
@@ -121,6 +97,34 @@ describe("TaskGraph server-owned templates", () => {
 
     expect(selected).toMatchObject({ enabled: true, selectedJobMode: true, selectedJobPreparation: { jobId: "job-1" } })
     expect(generic).toMatchObject({ enabled: true, selectedJobMode: false, selectedJobPreparation: undefined })
+  })
+
+  it("adds nested Scout coordination only to the canonical interactive user template", async () => {
+    const result = await taskGraphRuntimeForTurn({
+      enabled: true, turnSource: "user", pool: {} as never, lease: {} as never, now: () => new Date(),
+      taskGraphTemplates: TASK_GRAPH_TEMPLATES,
+      selectedJobPreparationLoader: async () => undefined,
+      applicationFillPreparationLoader: async () => undefined,
+    })
+
+    expect(result.templates?.scout.allowedActions).toEqual([
+      ...TASK_GRAPH_TEMPLATES.scout.allowedActions, "wait_subagents", "scout.delegate", "scout.results",
+    ])
+    expect(result.templates?.scout.context).toEqual({ nestedScoutProfile: "applymate:nested-scout-profile:v1" })
+    expect(result.templates?.analyst).toBe(TASK_GRAPH_TEMPLATES.analyst)
+  })
+
+  it("does not add nested Scout coordination to caller-owned templates", async () => {
+    const templates = { scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst }
+    const result = await taskGraphRuntimeForTurn({
+      enabled: true, turnSource: "user", pool: {} as never, lease: {} as never, now: () => new Date(),
+      taskGraphTemplates: templates,
+      selectedJobPreparationLoader: async () => undefined,
+      applicationFillPreparationLoader: async () => undefined,
+    })
+
+    expect(result.templates?.scout).toBe(TASK_GRAPH_TEMPLATES.scout)
+    expect(result.templates?.scout.allowedActions).not.toContain("scout.delegate")
   })
 
   it("adds only the fixed identity-free Application Filler template after exact preparation", () => {

@@ -27,6 +27,17 @@ describe("subagent parent execution fence", () => {
     expect(Object.isFrozen(fence)).toBe(true)
   })
 
+  it("captures a detached immutable step fence only when supplied by the caller", () => {
+    const step = { stepId: "step-1", toolCallId: "call-1" }
+    const fence = captureSubagentParentExecutionFence(spec, lease(), step)
+    expect(fence.step).toEqual(step)
+    expect(fence.step).not.toBe(step)
+    expect(Object.isFrozen(fence.step)).toBe(true)
+    expect(captureSubagentParentExecutionFence(spec, lease()).step).toBeUndefined()
+    expect(() => captureSubagentParentExecutionFence(spec, lease(), null as never))
+      .toThrowError(expect.objectContaining({ code: "lost" }))
+  })
+
   it.each([
     ["userId", "user-2"], ["sessionId", "session-2"], ["turnId", "turn-2"], ["parentTaskId", "other-parent"],
   ] as const)("rejects a mismatched %s", (field, value) => {

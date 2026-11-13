@@ -9,6 +9,9 @@ import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
 import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { selectVerifiedScheduledDraftCandidate } from "./scheduled-draft-candidate.js"
+import * as pgCreate from "./pg-store-create.js"
+import { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
+import { templatesForInteractiveScoutDelegation } from "./nested-scout-profile.js"
 
 vi.mock("./scheduled-draft-candidate.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./scheduled-draft-candidate.js")>()
@@ -76,7 +79,7 @@ function ownedTurnScopeRow(sql: string, values?: unknown[]) {
       ? { rows: [{ id: "root-1", turnId: "turn-1", status: "running", interruptRequestedAt: null }], rowCount: 1 }
       : { rows: [], rowCount: 0 }
   }
-  if (sql.startsWith('SELECT "id", "rootTaskId", "path", "depth"') && sql.includes("FOR UPDATE")) {
+  if (sql.startsWith('SELECT "id", "rootTaskId", "parentTaskId", "path", "depth"') && sql.includes("FOR UPDATE")) {
     return values?.[0] === "root-1" && values?.[1] === "session-1"
       ? { rows: [{
         id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running",
@@ -169,6 +172,25 @@ describe("createGraphTasks", () => {
 
     await expect(create("application_filler", "application_filler", "application_fill_for_review")).resolves.toEqual([])
     await expect(create("analyst", "analyst", "research")).resolves.toEqual(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"])
+  })
+
+  it("passes nested Scout authority only for the registered interactive template", async () => {
+    const create = vi.spyOn(pgCreate, "createSubagentTask").mockResolvedValue(taskRow("scout") as never)
+    const template = templatesForInteractiveScoutDelegation(TASK_GRAPH_TEMPLATES, TASK_GRAPH_TEMPLATES)!.scout!
+    const schedule = (scout: NonNullable<typeof template>): TaskGraphScheduleInput => ({
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
+      proposal: { expectedRevision: 0, nodes: [{ key: "scout", templateId: "scout", goal: "Discover", successCriteria: ["done"], dependsOn: [], verification: scoutVerification }] },
+      templates: { scout },
+    })
+    try {
+      await createGraphTasks({ query: vi.fn(async () => ({ rows: [], rowCount: 1 })) } as unknown as Pick<pg.PoolClient, "query">,
+        schedule(template), { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map())
+      expect(create.mock.calls[0]?.[3]).toMatchObject({ nestedScoutAuthority: "parent_template" })
+      await createGraphTasks({ query: vi.fn(async () => ({ rows: [], rowCount: 1 })) } as unknown as Pick<pg.PoolClient, "query">,
+        schedule({ ...template, constraints: [...(template.constraints ?? []), "forged sibling"] }),
+        { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map())
+      expect(create.mock.calls[1]?.[3]).not.toHaveProperty("nestedScoutAuthority")
+    } finally { create.mockRestore() }
   })
 
   it("rejects a second application filler across the existing Turn graph and new proposal before database access", async () => {
@@ -285,7 +307,7 @@ describe("createGraphTasks", () => {
     const query = vi.fn(async (sql: string, values?: unknown[]) => {
       const admission = ownedTurnScopeRow(sql, values)
       if (admission) return admission
-      if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{
+      if (sql.includes('SELECT "id", "rootTaskId", "parentTaskId", "path"')) return { rows: [{
         id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running",
         allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],
         modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
@@ -364,7 +386,7 @@ describe("createGraphTasks", () => {
 
   it("rejects a plan transitively dependent on a completed legacy-unverified source", async () => {
     const query = vi.fn(async (sql: string) => {
-      if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{
+      if (sql.includes('SELECT "id", "rootTaskId", "parentTaskId", "path"')) return { rows: [{
         id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running", allowedActions: [],
         modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
       }], rowCount: 1 }
@@ -426,7 +448,7 @@ describe("createGraphTasks", () => {
     const query = vi.fn(async (sql: string, values?: unknown[]) => {
       const admission = ownedTurnScopeRow(sql, values)
       if (admission) return admission
-      if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{
+      if (sql.includes('SELECT "id", "rootTaskId", "parentTaskId", "path"')) return { rows: [{
         id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running", allowedActions: [],
         modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
       }], rowCount: 1 }
@@ -470,7 +492,7 @@ describe("createGraphTasks", () => {
       evidence: [{ id: "job-evidence", kind: "job", ref: "job-1", source: "greenhouse" }], summary: "Found one job",
     }
     const query = vi.fn(async (sql: string) => {
-      if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{
+      if (sql.includes('SELECT "id", "rootTaskId", "parentTaskId", "path"')) return { rows: [{
         id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running", allowedActions: [],
         modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
       }], rowCount: 1 }
@@ -508,7 +530,7 @@ describe("createGraphTasks", () => {
       const admission = ownedTurnScopeRow(sql, values)
       if (admission) return admission
       calls.push({ sql, values })
-      if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{
+      if (sql.includes('SELECT "id", "rootTaskId", "parentTaskId", "path"')) return { rows: [{
         id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running", allowedActions: [],
         modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
       }], rowCount: 1 }
@@ -715,7 +737,7 @@ describe("createGraphTasks", () => {
     const query = vi.fn(async (sql: string, values?: unknown[]) => {
       const admission = ownedTurnScopeRow(sql, values)
       if (admission) return admission
-      if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{
+      if (sql.includes('SELECT "id", "rootTaskId", "parentTaskId", "path"')) return { rows: [{
         id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running", allowedActions: [],
         modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
       }], rowCount: 1 }
@@ -991,7 +1013,7 @@ function repairFixture(options: RepairFixtureOptions = {}) {
     if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) return { rows: [{ id: `repair-next-${++insertedChildren}` }], rowCount: 1 }
     if (sql.startsWith('SELECT task.*, session."userId"')) return { rows: [{ ...taskRow(repairTemplateId), id: `repair-next-${insertedChildren}`, goal: insertedChildren === 1 ? repairNode.goal : "Continue bounded analysis" }], rowCount: 1 }
     if (sql.startsWith('INSERT INTO "agent_outbox"')) return { rows: [{ id: "outbox-1" }], rowCount: 1 }
-    if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{ id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running", allowedActions: [], modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {} }], rowCount: 1 }
+    if (sql.includes('SELECT "id", "rootTaskId", "parentTaskId", "path"')) return { rows: [{ id: "root-1", rootTaskId: "root-1", parentTaskId: null, path: "/root-1", depth: 0, status: "running", allowedActions: [], modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {} }], rowCount: 1 }
     return { rows: [], rowCount: 1 }
   })
   return { client: { query } as unknown as Pick<pg.PoolClient, "query">, query, input, current, taskIds, parent: { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 4, maxAttempts: 2 } } } }

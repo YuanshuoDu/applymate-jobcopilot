@@ -4,6 +4,7 @@ import { lifecycleTarget, visibleTask } from "./coordination-visibility.js"
 import type { ToolExecutionContext } from "./types.js"
 import { APPLICATION_FILLER_ROLE, getSubagentRolePolicy, isHarnessSubagentRole } from "../subagents/role-policy.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
+import { hasNestedScoutPrivateContext, hasNestedScoutProtectedActions } from "../subagents/nested-scout-creation-authority.js"
 import { appendNativeCoordination, nativeCoordinationKey, nativeCoordinationOutput, plannerEnabledRoot } from "./task-graph-coordination-bridge.js"
 import { buildScoutAnalystAggregate } from "./coordination-result-aggregate.js"
 import {
@@ -61,6 +62,9 @@ function managerKey(value: string | undefined): string {
   return value
 }
 export async function executeSpawn(context: ToolExecutionContext, input: SpawnSubagentInput, options: CoordinationExecutorOptions) {
+  if (hasNestedScoutPrivateContext(input.context) || hasNestedScoutProtectedActions(input.allowedActions)) {
+    throw new CoordinationError("coordination_invalid_input", "Nested Scout authority is server-controlled")
+  }
   await assertPostGateChildCreationAllowed(context, options)
   assertRootChildCreationUsesCoveragePlan(context, options.verificationRequirements)
   const policy = typeof input.role === "string" ? getSubagentRolePolicy(input.role) : null

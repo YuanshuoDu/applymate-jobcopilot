@@ -1,6 +1,7 @@
 import { inheritSubagentPolicy, SubagentLeaseError, type AtomicSubagentSpawnResult, type SubagentLease,
   type SubagentPolicy, type SubagentStore, type SubagentTaskSpec } from "./types.js"
 import { policyFromTask } from "./manager-task-scope.js"
+import { captureParentExecutionStepFence } from "./nested-spawn-step-fence.js"
 
 export type SubagentParentExecutionFence = Readonly<{
   id: string
@@ -10,7 +11,10 @@ export type SubagentParentExecutionFence = Readonly<{
   rootTaskId: string
   ownerId: string
   attemptCount: number
+  step?: ParentExecutionStepFence
 }>
+
+export type ParentExecutionStepFence = Readonly<{ stepId: string; toolCallId: string }>
 
 function isNonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0
@@ -33,6 +37,7 @@ export function assertSpawnSpecMatchesParentFence(
 export function captureSubagentParentExecutionFence(
   spec: Pick<SubagentTaskSpec, "userId" | "sessionId" | "turnId" | "parentTaskId">,
   lease: SubagentLease,
+  step?: ParentExecutionStepFence,
 ): SubagentParentExecutionFence {
   if (lease.signal?.aborted) lost("Parent execution lease is aborted")
   if (lease.status !== "running" || !isNonEmpty(lease.id) || !isNonEmpty(lease.userId)
@@ -49,6 +54,7 @@ export function captureSubagentParentExecutionFence(
     rootTaskId: lease.rootTaskId,
     ownerId: lease.ownerId,
     attemptCount: lease.attemptCount,
+    ...(step === undefined ? {} : { step: captureParentExecutionStepFence(step) }),
   })
   assertSpawnSpecMatchesParentFence(spec, fence)
   return fence
@@ -63,8 +69,9 @@ export async function spawnSubagentFromLease(
   spec: SubagentTaskSpec,
   spawnIdempotencyKey: string,
   parentLease: SubagentLease,
+  step?: ParentExecutionStepFence,
 ): Promise<AtomicSubagentSpawnResult & { atomic: true }> {
-  const parentExecutionFence = captureSubagentParentExecutionFence(spec, parentLease)
+  const parentExecutionFence = captureSubagentParentExecutionFence(spec, parentLease, step)
   const createWithSpawnFromLease = store.createWithSpawnFromLease
   if (!createWithSpawnFromLease) throw new SubagentLeaseError("not_available", "Lease-fenced subagent spawn is unavailable")
   const policy = clampNestedSubagentPolicy(inheritSubagentPolicy(policyFromTask(parentLease), spec.policy))

@@ -1,8 +1,9 @@
 import { isSessionPauseRequestedError } from "../session-gate.js"
 import { SubagentLeaseError } from "./types.js"
-import type { SubagentExecutionResult, SubagentFinishResult, SubagentJobPayload, SubagentLease, SubagentMailboxContinuation, SubagentStore } from "./types.js"
+import type { SubagentContinuation, SubagentExecutionResult, SubagentFinishResult, SubagentJobPayload, SubagentLease, SubagentStore } from "./types.js"
 
 const MAX_MAILBOX_CONTINUATIONS = 3
+const MAX_CHILDREN_PENDING_CONTINUATIONS = 1
 const MAX_PENDING_MESSAGE_IDS = 20
 
 function uniqueIds(ids: readonly string[] | undefined): string[] {
@@ -24,14 +25,15 @@ export async function runClaimedSubagent(
   payload: SubagentJobPayload,
   lease: SubagentLease,
   active: { lost: Promise<SubagentLeaseError>; interrupted: boolean },
-  execute: (input: { lease: SubagentLease; continuation?: SubagentMailboxContinuation }) => Promise<SubagentExecutionResult>,
+  execute: (input: { lease: SubagentLease; continuation?: SubagentContinuation }) => Promise<SubagentExecutionResult>,
   now: () => Date,
   dispose: () => void,
 ): Promise<SubagentRunOutcome> {
   try {
     const observed = new Set<string>()
-    let continuation: SubagentMailboxContinuation | undefined
-    let continuationCount = 0
+    let continuation: SubagentContinuation | undefined
+    let mailboxContinuationCount = 0
+    let childrenPendingContinuationCount = 0
     let result: SubagentExecutionResult
     while (true) {
       try {
@@ -58,9 +60,10 @@ export async function runClaimedSubagent(
         }
       }
       for (const id of uniqueIds(result.mailboxMessageIds)) observed.add(id)
-      if (continuation && result.status === "failed") {
+      if (continuation?.kind === "mailbox_input_pending" && result.status === "failed") {
         result = { ...result, failureReason: result.failureReason ?? "subagent_mailbox_continuation_failed", retryDisposition: "terminal" }
-      } else if (continuation && result.status === "completed" && !continuation.missingMessageIds.every(id => observed.has(id))) {
+      } else if (continuation?.kind === "mailbox_input_pending" && result.status === "completed"
+        && !continuation.missingMessageIds.every(id => observed.has(id))) {
         result = { status: "failed", failureReason: "subagent_mailbox_input_unavailable", retryDisposition: "terminal" }
       }
       const finished = await store.finish({
@@ -71,16 +74,24 @@ export async function runClaimedSubagent(
       })
       if (!finished) return { taskId: payload.taskId, status: "lease_lost", reason: "Subagent lease was fenced" }
       if (typeof finished === "string") return { taskId: payload.taskId, status: finished }
+      if (finished.status === "children_pending") {
+        if (result.status !== "completed" || childrenPendingContinuationCount >= MAX_CHILDREN_PENDING_CONTINUATIONS) {
+          return await finishContinuationFailure(store, payload, lease, "subagent_children_pending_continuation_limit", now)
+        }
+        childrenPendingContinuationCount += 1
+        continuation = { kind: "children_pending" }
+        continue
+      }
       const rawMissingMessageIds = pendingIds(finished) ?? []
       const missingMessageIds = uniqueIds(rawMissingMessageIds)
       if (result.status !== "completed" || missingMessageIds.length === 0 || missingMessageIds.length !== rawMissingMessageIds.length
         || missingMessageIds.length > MAX_PENDING_MESSAGE_IDS || missingMessageIds.some(id => observed.has(id))) {
-        return await finishMailboxFailure(store, payload, lease, "subagent_mailbox_no_progress", now)
+        return await finishContinuationFailure(store, payload, lease, "subagent_mailbox_no_progress", now)
       }
-      if (continuationCount >= MAX_MAILBOX_CONTINUATIONS) {
-        return await finishMailboxFailure(store, payload, lease, "subagent_mailbox_continuation_limit", now)
+      if (mailboxContinuationCount >= MAX_MAILBOX_CONTINUATIONS) {
+        return await finishContinuationFailure(store, payload, lease, "subagent_mailbox_continuation_limit", now)
       }
-      continuationCount += 1
+      mailboxContinuationCount += 1
       continuation = { kind: "mailbox_input_pending", missingMessageIds: uniqueIds(missingMessageIds), observedMessageIds: [...observed] }
     }
   } finally {
@@ -88,7 +99,7 @@ export async function runClaimedSubagent(
   }
 }
 
-async function finishMailboxFailure(
+async function finishContinuationFailure(
   store: Pick<SubagentStore, "finish">,
   payload: SubagentJobPayload,
   lease: SubagentLease,

@@ -8,17 +8,19 @@ import { settleAndPersistModelUsage } from "./turn-execution-budget-overrun.js"
 import { normalizeProjectedToolCallIds, projectChildToolCallIdsForModelContext } from "./turn-tool-call-id-projection.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
-import { publishCommentary, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
+import { publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionOptions } from "./turn-execution-types.js"
-import { assertExecutionAlive, assertModelAllowance, makeExecutionId, resumedBudgetLimits, updateExecutionStep, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
+import { assertExecutionAlive, assertModelAllowance, makeExecutionId, resumedBudgetLimits, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
 import { buildCognitiveActionAgenda, excludeUnconsumedRootReferenceFromAgenda } from "./cognitive-action-agenda.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
 import { buildCognitiveAgendaStepReceipt } from "./cognitive-agenda-progress-delta.js"
-import { executeTools, hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
+import { hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
 import { stopForRepeatedTaskGraphDenial } from "./turn-execution-final-candidate.js"
 import { nativeQuestionCallId, recoverPendingNativeQuestion } from "./turn-execution-question.js"
 import { hasNewlyAcceptedInput } from "../context/step-context-support.js"
 import { handoffRecoveredArchivedWait } from "./turn-execution-wait.js"
+import { assertFinalDependencyWaitAvailable, prepareFinalDependencyWaitCall } from "./turn-execution-final-dependency-wait.js"
+import { executeTurnExecutionToolStep } from "./turn-execution-tool-step.js"
 import { createTaskGraphDenialProgressTracker } from "./task-graph-denial-progress.js"
 import { takeRecoveredScheduledPipelineCandidate } from "../subagents/scheduled-pipeline-candidate-store.js"
 import { prepareTurnFinalAnswerEvidenceRequest, resolveTurnFinalAnswerMarkers } from "./turn-execution-evidence.js"
@@ -181,49 +183,35 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         }
         output = toolCallProjection ? { ...output, toolCalls: normalizeProjectedToolCallIds(output.toolCalls, toolCallProjection.aliasToCanonical) } : output; stepOutput = output; continuation = output.continuation ?? undefined
         await publishReasoningSummary(writer, options, step, resolveTurnFinalAnswerMarkers(output.reasoningSummary, null).text, now)
-        if (output.toolCalls.length > 0) {
-          const questionCallId = nativeQuestionCallId(output, options.identity)
+        let actionableOutput = output
+        let generatedDependencyWait = false
+        if (output.toolCalls.length === 0 && output.finishReason === "stop" && output.provider !== "recovered"
+          && options.identity.kind === "task" && options.prepareFinalDependencyWait) {
+          assertExecutionAlive(options, signal)
+          const waitRequest = await options.prepareFinalDependencyWait({ identity: options.identity, step, context, snapshot, signal })
+          assertExecutionAlive(options, signal)
+          const waitCall = prepareFinalDependencyWaitCall(options.identity, step, waitRequest)
+          if (waitCall) {
+            assertFinalDependencyWaitAvailable(options, waitCall)
+            actionableOutput = { ...output, toolCalls: [waitCall] }
+            generatedDependencyWait = true
+          }
+        }
+        if (actionableOutput.toolCalls.length > 0) {
+          const questionCallId = nativeQuestionCallId(actionableOutput, options.identity)
           if (questionCallId && (!executionOptions.store.stageQuestionUsage || !executionOptions.store.cancelPausedQuestion)) throw new TurnEngineError("invalid_output", "Native question store is unavailable")
           questionIntentCallId = questionCallId
-          denialProgress.clear(); progress.observe({ snapshot, toolCalls: output.toolCalls }, progressCheckpointFromStepContext(context))
-          budget.reserveToolCalls(output.toolCalls.length)
-          if (output.text) await publishCommentary(writer, options, step, resolveTurnFinalAnswerMarkers(output.text, null).text, now)
-          let outcome: { wait: TurnEngineResult | null; snapshot: typeof options.snapshot; steeringMarkerState: typeof steeringMarkerState }
-          let persistedToolCallCount = 0
-          try {
-            outcome = await executeTools(executionOptions, writer, step, output, snapshot, seenCallIds, signal, now, steeringMarkerState, () => { persistedToolCallCount += 1 })
-          } finally {
-            budget.accountToolCalls(output.toolCalls.length)
-            toolCalls += persistedToolCallCount
-          }
+          denialProgress.clear(); progress.observe({ snapshot, toolCalls: actionableOutput.toolCalls }, progressCheckpointFromStepContext(context))
+          const outcome = await executeTurnExecutionToolStep({ options, executionOptions, writer, step, output: actionableOutput,
+            snapshot, seenCallIds, signal, now, steeringMarkerState, budget, questionIntent: questionIntentCallId !== null,
+            commentaryText: generatedDependencyWait ? null : resolveTurnFinalAnswerMarkers(output.text, null).text,
+            onToolCallsAccounted: count => { toolCalls += count }, onStepClosed: () => { closedSteps.add(step.id) } })
           snapshot = outcome.snapshot
           steeringMarkerState = outcome.steeringMarkerState
-          if (questionIntentCallId && outcome.wait?.status === "waiting_for_user") {
-            closedSteps.add(step.id)
-            return { ...outcome.wait, stepCount: steps, toolCallCount: toolCalls }
-          }
+          if (questionIntentCallId && outcome.wait?.status === "waiting_for_user") return { ...outcome.wait, stepCount: steps, toolCallCount: toolCalls }
           // Tool results are server-owned context; do not reuse a provider cursor across this boundary.
           continuation = undefined
-          assertExecutionAlive(options, signal)
-          const wait = outcome.wait
-          const stepStatus = wait?.status === "waiting_for_dependency"
-            ? "waiting_for_tool"
-            : wait?.status === "waiting_for_approval" || wait?.status === "waiting_for_user" ? wait.status : "completed"
-          await updateExecutionStep(options, {
-            stepId: step.id, status: stepStatus, finishReason: output.finishReason, errorCode: wait?.errorCode ?? null,
-            inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
-            estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now(),
-          })
-          await writer.append(
-            "step.completed", step.id, null,
-            { stepId: step.id, status: wait?.status ?? "completed", toolCallCount: output.toolCalls.length, taskId: options.identity.taskId },
-            `step-completed:${step.id}`,
-          )
-          closedSteps.add(step.id)
-          if (wait) {
-            if (wait.status === "waiting_for_user") await options.store.waitForUser?.({ identity: options.identity, now: now() })
-            return { ...wait, stepCount: steps, toolCallCount: toolCalls }
-          }
+          if (outcome.wait) return { ...outcome.wait, stepCount: steps, toolCallCount: toolCalls }
           continue
         }
         const outcome = await completeTurnExecutionFinalAnswer({ options, writer, step, output, bindingMap: answerEvidenceBindingMap,

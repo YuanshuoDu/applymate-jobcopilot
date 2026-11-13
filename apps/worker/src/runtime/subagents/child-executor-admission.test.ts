@@ -3,9 +3,10 @@ import { Type } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import type { RuntimeToolDefinition } from "../tools/types.js"
 import type { DurableWaitResume } from "./child-resume-observations.js"
-import { acknowledgeDurableWaitAtContinuationStart, canManageChildrenWithWaitAction, visibleChildDefinitions } from "./child-executor-admission.js"
+import { acknowledgeDurableWaitAtContinuationStart, canManageChildrenWithWaitAction, canResumeChildWait, visibleChildDefinitions } from "./child-executor-admission.js"
 import { createDurableSubagentWaitTool } from "./durable-subagent-wait-tool.js"
 import type { SubagentLease } from "./types.js"
+import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 
 const baseLease = {
   id: "child-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
@@ -90,6 +91,58 @@ describe("child wait admission", () => {
       expect(visible.some(tool => tool.domain === "coordination")).toBe(false)
     }
     expect(visibleChildDefinitions({ role: "scout", allowedActions: ["jobs.search"] }, [readTool()]).map(tool => tool.name)).toContain("jobs.search")
+  })
+
+  it("filters Scout delegation, results, and wait coordination actions without a nested profile", () => {
+    const pool = { connect: async () => { throw new Error("unexpected_wait_execution") } }
+    const wait = createDurableSubagentWaitTool(pool as never, baseLease as SubagentLease)
+    const delegate = {
+      ...readTool("scout.delegate", "coordination"), risk: "internal_write" as const,
+      capabilities: ["coordination"] as const, idempotency: "requires_key" as const, requiredCapabilities: ["coordination"] as const,
+    }
+    const results = readTool("scout.results", "coordination")
+
+    expect(visibleChildDefinitions(
+      { role: "scout", allowedActions: ["scout.delegate", "scout.results", "wait_subagents"] },
+      [delegate, results, wait],
+    )).toEqual([])
+    expect(visibleChildDefinitions({ role: "scout", allowedActions: ["scout.delegate"] }, [delegate])).toEqual([])
+    expect(visibleChildDefinitions({ role: "scout", allowedActions: ["scout.results"] }, [results])).toEqual([])
+    expect(visibleChildDefinitions({ role: "scout", allowedActions: ["wait_subagents"] }, [wait])).toEqual([])
+  })
+
+  it("admits only the exact nested Scout profile and exact coordination tool tuples", () => {
+    const pool = { connect: async () => { throw new Error("unexpected_wait_execution") } }
+    const wait = createDurableSubagentWaitTool(pool as never, baseLease as SubagentLease)
+    const delegate = {
+      ...readTool("scout.delegate", "coordination"), risk: "internal_write" as const,
+      capabilities: ["coordination"] as const, idempotency: "requires_key" as const, requiredCapabilities: ["read"] as const,
+    }
+    const results = { ...readTool("scout.results", "coordination"), requiredCapabilities: ["read"] as const }
+    const task = {
+      role: "scout", taskType: "job_discovery", depth: 1, parentTaskId: "root-1", rootTaskId: "root-1",
+      context: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER },
+      allowedActions: ["scout.delegate", "scout.results", "wait_subagents"],
+    }
+
+    expect(visibleChildDefinitions(task, [delegate, results, wait]).map(tool => tool.name))
+      .toEqual(["scout.delegate", "scout.results", "wait_subagents"])
+    expect(visibleChildDefinitions({ ...task, depth: 2 }, [delegate, results, wait])).toEqual([])
+    expect(visibleChildDefinitions({ ...task, context: {} }, [delegate, results, wait])).toEqual([])
+    expect(visibleChildDefinitions(task, [{ ...delegate, version: "2" }, results, wait]).map(tool => tool.name))
+      .toEqual(["scout.results", "wait_subagents"])
+  })
+
+  it("resumes durable waits only for role policy or the exact nested Scout profile", () => {
+    const nested = {
+      role: "scout", taskType: "job_discovery", depth: 1, parentTaskId: "root-1", rootTaskId: "root-1",
+      context: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER }, allowedActions: ["wait_subagents"],
+    }
+    expect(canResumeChildWait(nested, { canManageChildren: false })).toBe(true)
+    expect(canResumeChildWait({ ...nested, depth: 2 }, { canManageChildren: false })).toBe(false)
+    expect(canResumeChildWait({ ...nested, context: {} }, { canManageChildren: false })).toBe(false)
+    expect(canResumeChildWait({ role: "analyst", allowedActions: ["wait_subagents"] }, { canManageChildren: true })).toBe(true)
+    expect(canResumeChildWait({ role: "scout", allowedActions: ["wait_subagents"] }, { canManageChildren: false })).toBe(false)
   })
 
   it("rejects aliases and wrong versions even when the exact action is persisted", () => {

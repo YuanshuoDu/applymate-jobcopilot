@@ -81,6 +81,34 @@ describe("jobs.discover tool", () => {
     expect(onEffectiveCriteria).not.toHaveBeenCalled()
   })
 
+  it("enforces the persisted nested Scout scope before discovery or footprint capture", async () => {
+    const client: JobDiscoveryClient = { discover: vi.fn(async () => output) }
+    const onEffectiveCriteria = vi.fn()
+    const nestedFence: JobDiscoveryExecutionFence = {
+      ...fence,
+      nestedScoutScope: { sourceSlice: ["greenhouse"], queries: [{
+        source: "greenhouse", targetRoles: ["Engineer"], targetLocations: ["Dublin"], maxPageSize: 5,
+      }] },
+    }
+    const tool = createJobsDiscoverTool({ client, fence: nestedFence, onEffectiveCriteria })
+
+    await expect(tool.execute(context(), { ...input, source: "lever" })).rejects.toMatchObject({ code: "nested_scout_scope_denied" })
+    await expect(tool.execute(context(), { ...input, targetRoles: ["Engineer", "Designer"] })).rejects.toMatchObject({ code: "nested_scout_scope_denied" })
+    await expect(tool.execute(context(), { ...input, pageSize: undefined })).rejects.toMatchObject({ code: "nested_scout_scope_denied" })
+    expect(client.discover).not.toHaveBeenCalled()
+    expect(onEffectiveCriteria).not.toHaveBeenCalled()
+
+    await expect(tool.execute(context(), { ...input, source: "greenhouse", pageSize: 5 })).resolves.toEqual(output)
+    expect(client.discover).toHaveBeenCalledOnce()
+  })
+
+  it("fails closed when a nested scope marker is present but malformed", async () => {
+    const client: JobDiscoveryClient = { discover: vi.fn(async () => output) }
+    const tool = createJobsDiscoverTool({ client, fence: { ...fence, nestedScoutScope: null } })
+    await expect(tool.execute(context(), input)).rejects.toMatchObject({ code: "nested_scout_scope_denied" })
+    expect(client.discover).not.toHaveBeenCalled()
+  })
+
   it("captures only effective post-policy criteria while leaving the client cursor intact", async () => {
     const client: JobDiscoveryClient = { discover: vi.fn(async () => output) }
     const onEffectiveCriteria = vi.fn()

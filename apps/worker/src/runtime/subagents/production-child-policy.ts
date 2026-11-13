@@ -3,6 +3,7 @@ import { PolicyEngine } from "@jobcopilot/agent-policy"
 import { ROLE_RESULT_SCHEMA, type StructuredRole } from "./role-results.js"
 import { getSubagentRolePolicy } from "./role-policy.js"
 import { canManageChildrenWithWaitAction } from "./child-executor-admission.js"
+import { nestedScoutProfileForTask } from "./nested-scout-profile.js"
 import type { SubagentTaskRecord } from "./types.js"
 
 const SCHEDULED_PREPARE_TOOL = "scheduled.application.prepare"
@@ -40,6 +41,28 @@ const DURABLE_CHILD_WAIT_ALLOW = {
   risks: ["internal_write"], domains: ["coordination"], outcome: "allow",
   reasonCode: "server_durable_child_wait", reason: "The server enabled the exact durable child wait tool",
 } satisfies PolicyRule
+const DURABLE_CHILD_WAIT_DENY = {
+  id: "canonical-durable-child-wait-deny", roles: ["subagent"], tools: ["wait_subagents"],
+  outcome: "deny", reasonCode: "server_nested_scout_profile_required", reason: "Durable child waiting requires an authorized child manager",
+} satisfies PolicyRule
+const NESTED_SCOUT_DELEGATE_ALLOW = {
+  id: "canonical-nested-scout-delegate", roles: ["subagent"], tools: ["scout.delegate"], toolVersions: ["1"],
+  risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["read"], outcome: "allow",
+  reasonCode: "server_nested_scout_delegate", reason: "The server enabled bounded nested Scout delegation",
+} satisfies PolicyRule
+const NESTED_SCOUT_RESULTS_ALLOW = {
+  id: "canonical-nested-scout-results", roles: ["subagent"], tools: ["scout.results"], toolVersions: ["1"],
+  risks: ["read"], domains: ["coordination"], requiredCapabilities: ["read"], outcome: "allow",
+  reasonCode: "server_nested_scout_results", reason: "The server enabled bounded descendant result projection",
+} satisfies PolicyRule
+const NESTED_SCOUT_DELEGATE_DENY = {
+  id: "canonical-nested-scout-delegate-deny", roles: ["subagent"], tools: ["scout.delegate"],
+  outcome: "deny", reasonCode: "server_nested_scout_profile_required", reason: "Nested Scout delegation requires its exact server-owned profile",
+} satisfies PolicyRule
+const NESTED_SCOUT_RESULTS_DENY = {
+  id: "canonical-nested-scout-results-deny", roles: ["subagent"], tools: ["scout.results"],
+  outcome: "deny", reasonCode: "server_nested_scout_profile_required", reason: "Nested Scout results require their exact server-owned profile",
+} satisfies PolicyRule
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
@@ -60,7 +83,8 @@ function selectedJobPolicyRule(role: string, selectedJob: boolean): PolicyRule |
   return undefined
 }
 
-export function createProductionChildPolicy(task: Pick<SubagentTaskRecord, "role" | "taskType" | "toolPolicySnapshot"> & Partial<Pick<SubagentTaskRecord, "allowedActions">>, selectedJob: boolean): PolicyEngine {
+export function createProductionChildPolicy(task: Pick<SubagentTaskRecord, "role" | "taskType" | "toolPolicySnapshot">
+  & Partial<Pick<SubagentTaskRecord, "allowedActions" | "depth" | "parentTaskId" | "rootTaskId" | "context">>, selectedJob: boolean): PolicyEngine {
   const snapshot = record(task.toolPolicySnapshot)
   const hasMatrixField = Object.prototype.hasOwnProperty.call(snapshot, "version") || Object.prototype.hasOwnProperty.call(snapshot, "rules")
   const configured = typeof snapshot.version === "string" && Array.isArray(snapshot.rules)
@@ -73,18 +97,27 @@ export function createProductionChildPolicy(task: Pick<SubagentTaskRecord, "role
     ? configuredRules.filter(rule => rule.outcome === "deny" && rule.roles.includes("subagent")
       && (!rule.tools || rule.tools.includes(SCHEDULED_PREPARE_TOOL)))
     : []
-  const explicitWaitDenies = configuredRules.filter(rule => rule.outcome === "deny" && rule.roles.includes("subagent")
-    && rule.tools?.includes("wait_subagents"))
-  const priorityDenies = [...new Set([...explicitDiscoveryDenies, ...explicitPrepareDenies, ...explicitWaitDenies])]
-  const remainingConfiguredRules = configuredRules.filter(rule => !priorityDenies.includes(rule))
+  const configuredWaitRules = configuredRules.filter(rule => rule.roles.includes("subagent") && rule.tools?.includes("wait_subagents"))
+  const explicitWaitDenies = configuredWaitRules.filter(rule => rule.outcome === "deny")
+  const nestedScout = nestedScoutProfileForTask(task) !== null
+  const nestedTools = ["scout.delegate", "scout.results"]
+  const configuredNestedRules = configuredRules.filter(rule => rule.roles.includes("subagent") && rule.tools?.some(tool => nestedTools.includes(tool)))
+  const explicitNestedDenies = nestedScout ? configuredNestedRules.filter(rule => rule.outcome === "deny") : []
+  const nestedProfileDenies = nestedScout ? [] : [NESTED_SCOUT_DELEGATE_DENY, NESTED_SCOUT_RESULTS_DENY]
+  const priorityDenies = [...new Set([...explicitDiscoveryDenies, ...explicitPrepareDenies, ...explicitWaitDenies,
+    ...explicitNestedDenies, ...nestedProfileDenies])]
+  const remainingConfiguredRules = configuredRules.filter(rule => !priorityDenies.includes(rule) && !configuredNestedRules.includes(rule))
   const discoveryRule = task.role === "scout" && !selectedJob ? [SCOUT_DISCOVERY_WRITE_RULE] : []
   const prepareRule = task.role === "prepare" && task.taskType === SCHEDULED_PREPARE_TASK_TYPE ? [SCHEDULED_PREPARE_WRITE_RULE] : []
   const taskRule = selectedJobPolicyRule(task.role, selectedJob)
-  const waitRule = canManageChildrenWithWaitAction(getSubagentRolePolicy(task.role), task.allowedActions) ? [DURABLE_CHILD_WAIT_ALLOW] : []
+  const waitRule = canManageChildrenWithWaitAction(getSubagentRolePolicy(task.role), task.allowedActions) || nestedScout
+    ? [DURABLE_CHILD_WAIT_ALLOW] : []
+  const waitProfileDeny = waitRule.length > 0 ? [] : [DURABLE_CHILD_WAIT_DENY]
+  const nestedRules = nestedScout ? [NESTED_SCOUT_DELEGATE_ALLOW, NESTED_SCOUT_RESULTS_ALLOW] : []
   const rules: PolicyRule[] = [
-    ...priorityDenies, ...discoveryRule, ...waitRule, SUBAGENT_INTERNAL_WRITE_DENY,
+    ...priorityDenies, ...waitProfileDeny, ...discoveryRule, ...waitRule, ...nestedRules, SUBAGENT_INTERNAL_WRITE_DENY,
     ...prepareRule, SCHEDULED_PREPARE_VARIANT_DENY,
-    ...remainingConfiguredRules, SUBAGENT_READ_RULE, ...(taskRule ? [taskRule] : []),
+    ...remainingConfiguredRules.filter(rule => !configuredWaitRules.includes(rule)), SUBAGENT_READ_RULE, ...(taskRule ? [taskRule] : []),
   ]
   return new PolicyEngine({ snapshot: { version: configured?.version ?? "policy.v1", rules } })
 }

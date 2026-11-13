@@ -137,8 +137,12 @@ export type SubagentMailboxContinuation = {
   readonly observedMessageIds: readonly string[]
 }
 
+export type SubagentChildrenPendingContinuation = { readonly kind: "children_pending" }
+export type SubagentContinuation = SubagentMailboxContinuation | SubagentChildrenPendingContinuation
+
 export type SubagentFinishResult = "completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted"
   | { readonly status: "input_pending"; readonly messageIds: readonly string[] }
+  | { readonly status: "children_pending" }
 
 export type SubagentStore = {
   create(input: SubagentTaskSpec & { policy: SubagentPolicy }): Promise<SubagentTaskRecord>

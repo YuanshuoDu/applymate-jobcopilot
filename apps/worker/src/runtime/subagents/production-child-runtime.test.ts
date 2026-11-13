@@ -24,6 +24,7 @@ import type { PolicyEvaluationContext } from "@jobcopilot/agent-policy"
 import { SCHEDULED_AUDIT_OUTPUT_SCHEMA, SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE } from "./scheduled-audit-contract.js"
 import { SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_AUDIT_ROLE, SCHEDULED_POST_GATE_AUDIT_TASK_TYPE,
   SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_EXECUTE_ROLE, SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE } from "./scheduled-post-gate-contract.js"
+import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 
 const artifactStoreMock = vi.hoisted(() => ({ current: null as unknown, sourceDigestReader: null as unknown }))
 const applicationFillExecutorMock = vi.hoisted(() => ({
@@ -442,7 +443,7 @@ describe("production child runtime", () => {
     expect(discoveryDecision(policy)).toMatchObject({ outcome: "deny", reasonCode: "configured_internal_write_deny" })
   })
 
-  it("completes the same-Turn provider discovery to Analyst read and owner shortlist path", async () => {
+  it("composes a server-authorized Scout delegation through the default production tool runtime", async () => {
     const ownerUserId = "user-1"
     const providerUrl = "https://jobs.example/1"
     const scheduledAutomationSnapshot = {
@@ -548,6 +549,7 @@ describe("production child runtime", () => {
     const ownerGateCalls: unknown[][] = []
     const provenanceQueries: string[] = []
     const provenanceParameters: Array<readonly unknown[] | undefined> = []
+    const nestedWaitQueries: string[] = []
     const provenanceConnection = {
       query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
         provenanceQueries.push(sql)
@@ -558,6 +560,28 @@ describe("production child runtime", () => {
       }),
       release: vi.fn(),
     }
+    const nestedWaitConnection = {
+      query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+        nestedWaitQueries.push(sql)
+        if (sql === "BEGIN READ ONLY" || sql === "COMMIT" || sql === "ROLLBACK" || sql === "SELECT set_config('app.user_id', $1, true)") return { rows: [] }
+        if (sql.includes('FROM "agent_steps" step')) {
+          const [stepId, stepOrdinal, taskId, sessionId, turnId, attempt, userId, rootTaskId, ownerId] = values ?? []
+          return { rows: [{
+            stepId, stepOrdinal, stepStatus: "streaming", stepTaskId: taskId, stepSessionId: sessionId, stepTurnId: turnId,
+            stepAttempt: attempt, sessionId, sessionUserId: userId, sessionStatus: "running", turnId,
+            turnSessionId: sessionId, turnRootTaskId: rootTaskId, parentId: taskId, parentUserId: userId,
+            parentSessionId: sessionId, parentTurnId: turnId, parentRootTaskId: rootTaskId, parentTaskId: rootTaskId,
+            parentDepth: 1, parentPath: `/${String(rootTaskId)}/${String(taskId)}`, parentRole: "scout",
+            parentTaskType: "job_discovery", parentContext: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER },
+            parentStatus: "running", parentLeaseOwner: ownerId, parentAttemptCount: attempt, parentInterruptRequestedAt: null,
+          }] }
+        }
+        if (sql.includes('FROM "sub_agent_tasks" child')) return { rows: [] }
+        throw new Error(`unexpected nested wait query: ${sql}`)
+      }),
+      release: vi.fn(),
+    }
+    let poolConnections = 0
     const poolFixture = {
       query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
         if (sql.includes('FROM "Job" WHERE "id" = $1 AND "userId" = $2')) {
@@ -577,7 +601,7 @@ describe("production child runtime", () => {
         }
         throw new Error(`unexpected composed discovery fixture query: ${sql}`)
       }),
-      connect: vi.fn(async () => provenanceConnection),
+      connect: vi.fn(async () => poolConnections++ === 0 ? provenanceConnection : nestedWaitConnection),
     }
     const scoutRequests: HarnessModelRequest[] = []
     const scoutModel: ModelAdapter = {
@@ -586,6 +610,11 @@ describe("production child runtime", () => {
         scoutRequests.push(request)
         if (scoutRequests.length === 1) {
           yield { type: "tool_call_completed", callId: "scout-discover-call", name: "jobs.discover", arguments: { targetRoles: ["Engineer"], targetLocations: ["Dublin"], pageSize: 2 } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        if (scoutRequests.length === 2) {
+          yield { type: "tool_call_completed", callId: "scout-delegate-call", name: "scout.delegate", arguments: { goal: "Find another role source", sourceSlice: ["greenhouse"] } }
           yield { type: "completed", finishReason: "tool_calls" }
           return
         }
@@ -610,19 +639,34 @@ describe("production child runtime", () => {
     }
     const scoutLease: SubagentLease = {
       ...lease(), id: "scout-task", userId: ownerUserId, role: "scout", taskType: "job_discovery",
-      allowedActions: ["jobs.search", "jobs.get", "jobs.discover"],
+      allowedActions: ["jobs.search", "jobs.get", "jobs.discover", "wait_subagents", "scout.delegate", "scout.results"],
+      context: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER },
       expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, leaseExpiresAt: new Date(Date.now() + 60_000),
     }
+    const nestedChild = { ...scoutLease, id: "grandchild-scout", parentTaskId: scoutLease.id, rootTaskId: scoutLease.rootTaskId, depth: 2 }
+    const manager = { spawnFromLease: vi.fn(async () => ({ task: nestedChild, duplicate: false, atomic: true as const })) }
+    const managerProvider = vi.fn(() => manager)
     const turnPersistence = recordingStore()
     const scoutExecutor = createOptionalProductionChildExecutor({
       enabled: true, pool: poolFixture as never, turnStore: turnPersistence.engineStore, treeBudget: budget(),
       authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => scoutModel,
       jobDiscoveryClient: discoveryClient, mailboxReader: emptyMailboxReader, resumeLoader: async () => undefined,
+      subagentManager: managerProvider,
     })
     if (!scoutExecutor) throw new Error("generic Scout child executor was not created")
 
     const scoutExecution = await scoutExecutor({ lease: scoutLease })
     expect(scoutExecution).toMatchObject({ status: "completed" })
+    expect(managerProvider).toHaveBeenCalledOnce()
+    expect(manager.spawnFromLease).toHaveBeenCalledOnce()
+    expect(manager.spawnFromLease).toHaveBeenCalledWith(expect.objectContaining({
+      userId: ownerUserId, sessionId: scoutLease.sessionId, turnId: scoutLease.turnId,
+      parentTaskId: scoutLease.id, role: "scout", taskType: "job_discovery",
+      context: expect.objectContaining({ nestedScoutSourceSlice: ["greenhouse"] }),
+      policy: expect.objectContaining({ maxDepth: 2, maxFanOut: 2 }),
+    }), expect.stringMatching(/^scout-delegate:/), scoutLease, expect.objectContaining({
+      stepId: expect.any(String), toolCallId: "scout-delegate-call",
+    }))
     const scoutChildResult = completedResult(scoutExecution.result)
     expect(scoutChildResult).toMatchObject({ discoveryAttempt: {
       attemptCount: scoutLease.attemptCount,
@@ -642,6 +686,8 @@ describe("production child runtime", () => {
     ])
     expect(provenanceParameters[1]).toEqual(["app.user_id", ownerUserId])
     expect(provenanceConnection.release).toHaveBeenCalledOnce()
+    expect(nestedWaitQueries).toEqual(["BEGIN READ ONLY", "SELECT set_config('app.user_id', $1, true)", expect.stringContaining('FROM "agent_steps" step'), expect.stringContaining('FROM "sub_agent_tasks" child'), "COMMIT"])
+    expect(nestedWaitConnection.release).toHaveBeenCalledOnce()
     expect(JSON.stringify(scoutChildResult.discoveryAttempt)).not.toMatch(/provider-private|ledgerKey|toolCallId|sessionId|turnId|stepId|estimatedCost|providerUrl|jobId/i)
     const scoutResult = completedResult(scoutChildResult.structuredResult)
     const savedScoutJob = [...savedJobs.values()].find(row => row.userId === ownerUserId && row.url === providerUrl)
@@ -653,6 +699,7 @@ describe("production child runtime", () => {
     expect(advertisedTools(scoutRequests[0]!).find(tool => tool.name === "jobs.discover")).toMatchObject({
       risk: "internal_write", domain: "jobs", capabilities: ["read", "write"], requiredCapabilities: ["read"],
     })
+    expect(advertisedTools(scoutRequests[0]!).map(tool => tool.name)).toEqual(expect.arrayContaining(["scout.delegate", "scout.results", "wait_subagents"]))
     expect(discoveryRequests[0]).toMatchObject({
       userId: ownerUserId, sessionId: "session-1", turnId: "turn-1", taskId: scoutLease.id, rootTaskId: scoutLease.rootTaskId,
       role: "scout", leaseOwner: "worker-1", attemptCount: scoutLease.attemptCount,

@@ -4,6 +4,7 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { JobDiscoveryClientError, type JobDiscoveryClient, type JobDiscoveryCriteria, type JobDiscoveryRequest } from "./job-discovery-client.js"
 import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "./types.js"
 import { captureDiscoveryQueryCriteria, type DiscoveryQueryCapture } from "../subagents/child-discovery-query-footprint.js"
+import { nestedScoutQueryAllowed, type NestedScoutTaskScope } from "../subagents/nested-scout-tools.js"
 
 const id = Type.String({ minLength: 1, maxLength: 256 })
 const nonEmptyText = (maxLength: number) => Type.String({ minLength: 1, maxLength })
@@ -39,6 +40,8 @@ const JobDiscoverOutputSchema = Type.Object({
 export type JobDiscoveryExecutionFence = Readonly<{
   userId: string; sessionId: string; turnId: string; taskId: string; rootTaskId: string
   role: "scout"; leaseOwner: string; attemptCount: number
+  /** Present only for nested Scouts; null means a nested scope was present but invalid. */
+  nestedScoutScope?: NestedScoutTaskScope | null
 }>
 export type JobDiscoverToolOptions = Readonly<{
   client: JobDiscoveryClient
@@ -76,6 +79,10 @@ export function createJobsDiscoverTool(options: JobDiscoverToolOptions): Runtime
         targetRoles: input.targetRoles, targetLocations: input.targetLocations,
         ...(input.source === undefined ? {} : { source: input.source }), ...(input.pageSize === undefined ? {} : { pageSize: input.pageSize }),
         ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+      }
+      if (Object.hasOwn(options.fence, "nestedScoutScope")
+        && (!options.fence.nestedScoutScope || !nestedScoutQueryAllowed(options.fence.nestedScoutScope, criteria))) {
+        throw new ToolExecutionError("nested_scout_scope_denied", "The nested Scout query exceeds its inherited search scope")
       }
       try { options.onEffectiveCriteria?.(context, captureDiscoveryQueryCriteria(criteria)) } catch { /* Footprint capture cannot change discovery. */ }
       try {

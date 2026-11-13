@@ -250,9 +250,15 @@ function recoveredDispatchPool() {
 }
 
 describe("Subagent queue", () => {
-  it("keeps retry and mailbox outcome fields in the queue executor contract", async () => {
-    const execute: SubagentExecutor = async () => ({ status: "failed", failureReason: "temporary", retryDisposition: "retryable", mailboxMessageIds: ["mailbox-1"] })
+  it("keeps mailbox fields and accepts the typed children-pending continuation", async () => {
+    const received: unknown[] = []
+    const execute: SubagentExecutor = async ({ continuation }) => {
+      received.push(continuation)
+      return { status: "failed", failureReason: "temporary", retryDisposition: "retryable", mailboxMessageIds: ["mailbox-1"] }
+    }
     await expect(execute({ lease: {} as never })).resolves.toMatchObject({ retryDisposition: "retryable", mailboxMessageIds: ["mailbox-1"] })
+    await execute({ lease: {} as never, continuation: { kind: "children_pending" } })
+    expect(received).toContainEqual({ kind: "children_pending" })
   })
   it("uses a strict payload and deterministic job id", async () => {
     const queue = { add: vi.fn().mockResolvedValue(undefined) }

@@ -324,6 +324,21 @@ describe("AgentTreeManager", () => {
     ])
   })
 
+  it("forwards the real parent step fence without changing the three-argument primitive", async () => {
+    const store = new MemoryStore()
+    const createScoped = vi.fn(async (_input: AtomicSubagentSpawnFromLeaseInput) => ({ task: null, duplicate: false }))
+    store.createWithSpawnFromLease = createScoped
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const parent = await manager.spawn(spec({ turnId: "turn-1" }))
+    const requested = spec({ turnId: "turn-1", parentTaskId: parent.id })
+    const lease = currentLease(parent)
+
+    await manager.spawnFromLease(requested, "spawn-step", lease, { stepId: "step-1", toolCallId: "call-1" })
+    expect(createScoped.mock.calls[0]?.[0].parentExecutionFence.step).toEqual({ stepId: "step-1", toolCallId: "call-1" })
+    await manager.spawnFromLease(requested, "spawn-legacy", lease)
+    expect(createScoped.mock.calls[1]?.[0].parentExecutionFence.step).toBeUndefined()
+  })
+
   it("fails closed when the store has no fenced create capability", async () => {
     const store = new MemoryStore()
     const create = vi.spyOn(store, "create")

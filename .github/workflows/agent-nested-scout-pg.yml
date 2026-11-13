@@ -1,0 +1,143 @@
+name: Agent nested Scout durable PostgreSQL acceptance
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  nested-scout-runtime-postgres:
+    name: Nested Scout Worker restart on disposable PostgreSQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: applymate_nested_delegation_ci
+          POSTGRES_USER: nested_fixture
+          POSTGRES_PASSWORD: nested_fixture_only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nested_fixture -d applymate_nested_delegation_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      CI: 'true'
+      DATABASE_URL: postgresql://nested_fixture:nested_fixture_only@127.0.0.1:5432/applymate_nested_delegation_ci
+      AGENT_RUNTIME_PG_TEST_URL: postgresql://nested_fixture:nested_fixture_only@127.0.0.1:5432/applymate_nested_delegation_ci
+      AGENT_RUNTIME_PG_TEST_DISPOSABLE: 'true'
+      AGENT_RUNTIME_PG_TEST_REQUIRED: 'true'
+      RUN_AGENT_TURN_REDIS_INTEGRATION: '1'
+      AGENT_TURN_REDIS_TEST_DISPOSABLE: 'true'
+      AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+      REDIS_URL: redis://127.0.0.1:6379/15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Guard disposable loopback services
+        shell: bash
+        run: |
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "postgresql://nested_fixture:nested_fixture_only@127.0.0.1:5432/applymate_nested_delegation_ci"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "$DATABASE_URL"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          test "$RUN_AGENT_TURN_REDIS_INTEGRATION" = "1"
+          test "$AGENT_TURN_REDIS_TEST_DISPOSABLE" = "true"
+          test "$AGENT_TURN_REDIS_TEST_URL" = "redis://127.0.0.1:6379/15"
+          test "$REDIS_URL" = "$AGENT_TURN_REDIS_TEST_URL"
+      - name: Apply existing migrations
+        run: pnpm --filter @jobcopilot/web exec prisma migrate deploy --schema prisma/schema.prisma
+      - name: Generate Prisma client
+        run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
+      - name: Build Worker dependencies
+        run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Run nested Scout PostgreSQL acceptance cases
+        env:
+          REPORT_PATH: ${{ runner.temp }}/nested-scout-runtime-pg.json
+        run: |
+          set -euo pipefail
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
+            src/runtime/subagents/nested-scout-delegation-pg.integration.test.ts \
+            src/runtime/subagents/parent-finish-descendants-pg.integration.test.ts \
+            src/runtime/subagents/nested-scout-deadline-pg.integration.test.ts \
+            src/runtime/subagents/nested-scout-creation-authority-pg.integration.test.ts \
+            --reporter=default --reporter=json --outputFile.json="$REPORT_PATH"
+      - name: Require exact passing PostgreSQL case set
+        if: always()
+        shell: bash
+        env:
+          REPORT_PATH: ${{ runner.temp }}/nested-scout-runtime-pg.json
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs')
+          const report = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, 'utf8'))
+          const expected = new Map([
+            ['/src/runtime/subagents/nested-scout-delegation-pg.integration.test.ts', [
+              'waits for two source-bound Scout children across Worker restart in an ordinary user TaskGraph',
+            ]],
+            ['/src/runtime/subagents/parent-finish-descendants-pg.integration.test.ts', [
+              'returns children_pending without persisting success when a direct active child exists',
+              'returns children_pending without persisting success when a active grandchild below a terminal child exists',
+              'keeps stale owners fenced instead of reporting children_pending',
+              'serializes a racing spawn and finish so a newly created descendant cannot slip through',
+            ]],
+            ['/src/runtime/subagents/nested-scout-deadline-pg.integration.test.ts', [
+              'terminalizes a depth-two queued child by absolute deadline regardless of lease state',
+              'terminalizes a depth-two waiting child by absolute deadline regardless of lease state',
+              'terminalizes a depth-two running child by absolute deadline regardless of lease state',
+              'cascades a failed TaskGraph Scout deadline only through its own children',
+              'rolls back the parent failure when an active child violates inherited deadline',
+            ]],
+            ['/src/runtime/subagents/nested-scout-creation-authority-pg.integration.test.ts', [
+              'rejects generic Root attempts to mint the Scout profile while allowing only a persisted profile Scout to create a fenced read-scoped child',
+            ]],
+          ])
+          const files = report.testResults
+          const cases = files?.flatMap(file => file.assertionResults ?? []) ?? []
+          if (!report.success || report.numTotalTests !== 11 || report.numPassedTests !== 11 ||
+              report.numFailedTests !== 0 || report.numPendingTests !== 0 || report.numTodoTests !== 0 ||
+              files?.length !== expected.size || cases.length !== 11 ||
+              cases.some(test => test.status !== 'passed')) {
+            throw new Error('Expected all eleven PostgreSQL cases to pass with no failed, skipped, pending or todo tests')
+          }
+          for (const result of files) {
+            const name = result.name.replaceAll('\\', '/')
+            const suffix = [...expected.keys()].find(path => name.endsWith(path))
+            const actual = result.assertionResults?.map(test => test.title).sort()
+            const wanted = expected.get(suffix)?.slice().sort()
+            if (!wanted || JSON.stringify(actual) !== JSON.stringify(wanted)) {
+              throw new Error('PostgreSQL report did not match the exact four-file case catalog')
+            }
+          }
+          if ([...expected.keys()].some(path => !files.some(result => result.name.replaceAll('\\', '/').endsWith(path)))) {
+            throw new Error('PostgreSQL report omitted an expected test file')
+          }
+          NODE
+      - name: Preserve PostgreSQL acceptance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-nested-scout-runtime-pg-report
+          path: ${{ runner.temp }}/nested-scout-runtime-pg.json
+          if-no-files-found: warn
+          retention-days: 1

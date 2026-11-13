@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto"
 import { assertSessionWorkAdmission } from "../session-gate.js"
 import { assertSpawnSpecMatchesParentFence, clampNestedSubagentPolicy, type SubagentParentExecutionFence } from "./parent-execution-fence.js"
+import { assertCurrentParentExecutionStep } from "./nested-spawn-step-fence.js"
 import { inheritSubagentPolicy, isTerminalSubagentStatus, SubagentLeaseError, type AtomicSubagentSpawnFromLeaseInput,
   type AtomicSubagentSpawnResult, type PgSubagentPool, type SubagentTaskRecord } from "./types.js"
 import { policyFromTask } from "./manager-task-scope.js"
 import { assertFallbackPlannerRootCanDispatch, createSubagentTask, lockSubagentSession } from "./pg-store-create.js"
-import { rowToTask, SELECT_TASK, spawnKey, transaction, type Queryable } from "./pg-store-persistence.js"
+import { dateValue, rowToTask, SELECT_TASK, spawnKey, transaction, type Queryable } from "./pg-store-persistence.js"
+import { hasPersistedTaskGraphMembership, type GraphIdentityScope } from "./task-graph-pg-state.js"
+import { hasNestedScoutPrivateContext, isNestedScoutCreationAuthorityValid } from "./nested-scout-creation-authority.js"
 
 function denyStaleFence(): never {
   throw new SubagentLeaseError("lost", "Parent execution lease is no longer current")
@@ -17,8 +20,8 @@ async function lockCurrentParent(client: Queryable, fence: SubagentParentExecuti
   )
   const rootTaskId = binding.rows[0]?.rootTaskId
   if (typeof rootTaskId !== "string" || rootTaskId !== fence.rootTaskId) return denyStaleFence()
-  const root = await client.query<{ id: string; rootTaskId: string; turnId: string; parentTaskId: string | null; status: string; interruptRequestedAt: unknown }>(
-    `SELECT "id", "rootTaskId", "turnId", "parentTaskId", "status", "interruptRequestedAt"
+  const root = await client.query<{ id: string; rootTaskId: string; turnId: string; parentTaskId: string | null; status: string; interruptRequestedAt: unknown; absoluteDeadlineAt: Date | null }>(
+    `SELECT "id", "rootTaskId", "turnId", "parentTaskId", "status", "interruptRequestedAt", "absoluteDeadlineAt"
       FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 FOR UPDATE`, [rootTaskId, fence.sessionId],
   )
   const rootRow = root.rows[0]
@@ -37,10 +40,14 @@ async function lockCurrentParent(client: Queryable, fence: SubagentParentExecuti
     || parentRow.rootTaskId !== fence.rootTaskId || parentRow.status !== "running"
     || parentRow.leaseOwner !== fence.ownerId || Number(parentRow.attemptCount) !== fence.attemptCount
     || parentRow.interruptRequestedAt != null) return denyStaleFence()
-  const expiry = await client.query<{ leaseLive: boolean }>(
-    `SELECT $1::timestamptz > clock_timestamp() AS "leaseLive"`, [parentRow.leaseExpiresAt],
+  const expiry = await client.query<{ leaseLive: boolean; deadlineLive: boolean; rootDeadlineLive: boolean }>(
+    `SELECT $1::timestamptz > clock_timestamp() AS "leaseLive",
+      ($2::timestamptz IS NULL OR $2::timestamptz > clock_timestamp()) AS "deadlineLive",
+      ($3::timestamptz IS NULL OR $3::timestamptz > clock_timestamp()) AS "rootDeadlineLive"`,
+    [parentRow.leaseExpiresAt, parentRow.absoluteDeadlineAt ?? null, rootRow.absoluteDeadlineAt],
   )
-  if (expiry.rows[0]?.leaseLive !== true) return denyStaleFence()
+  if (expiry.rows[0]?.leaseLive !== true || expiry.rows[0]?.deadlineLive !== true
+    || expiry.rows[0]?.rootDeadlineLive !== true) return denyStaleFence()
   return rowToTask(parentRow)
 }
 
@@ -78,6 +85,18 @@ export async function createSubagentWithSpawnFromLease(
     await lockFenceScope(client, fence)
     assertSpawnSpecMatchesParentFence(taskInput, fence)
     const parent = await lockCurrentParent(client, fence)
+    await assertCurrentParentExecutionStep(client, fence)
+    let nestedScoutAuthority: "child_execution" | undefined
+    if (hasNestedScoutPrivateContext(taskInput.context)) {
+      const parentGraph: GraphIdentityScope = { userId: fence.userId, sessionId: fence.sessionId,
+        turnId: fence.turnId, rootTaskId: fence.rootTaskId, parentTaskId: fence.rootTaskId }
+      if (!fence.step || !isNestedScoutCreationAuthorityValid("parent_template", parent)
+        || !await hasPersistedTaskGraphMembership(client, parentGraph, fence.id)
+        || !isNestedScoutCreationAuthorityValid("child_execution", {
+          ...taskInput, depth: 2, parentTaskId: fence.id, rootTaskId: fence.rootTaskId,
+        })) return denyStaleFence()
+      nestedScoutAuthority = "child_execution"
+    }
     const key = spawnKey(fence.sessionId, spawnIdempotencyKey)
     const existing = await client.query<{ payload: unknown }>(
       `SELECT "payload" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.spawn'
@@ -91,7 +110,17 @@ export async function createSubagentWithSpawnFromLease(
     await assertSessionWorkAdmission(client, { userId: fence.userId, sessionId: fence.sessionId, turnId: fence.turnId })
     await assertFallbackPlannerRootCanDispatch(client, taskInput)
     const policy = clampNestedSubagentPolicy(inheritSubagentPolicy(policyFromTask(parent), input.policy))
-    const task = await createSubagentTask(client, { ...taskInput, policy }, true)
+    const created = await createSubagentTask(client, { ...taskInput, policy }, true, {
+      taskGraphChildDeadline: true, ...(nestedScoutAuthority ? { nestedScoutAuthority } : {}),
+    })
+    const deadline = await client.query<{ absoluteDeadlineAt: Date | string | null }>(`UPDATE "sub_agent_tasks" AS child
+      SET "absoluteDeadlineAt" = LEAST(child."absoluteDeadlineAt", COALESCE(parent."absoluteDeadlineAt", child."absoluteDeadlineAt")),
+        "updatedAt" = clock_timestamp()
+      FROM "sub_agent_tasks" AS parent
+      WHERE child."id" = $1 AND child."sessionId" = $2 AND child."absoluteDeadlineAt" IS NOT NULL
+        AND parent."id" = $3 AND parent."sessionId" = $2 RETURNING child."absoluteDeadlineAt"`, [created.id, fence.sessionId, fence.id])
+    if (!deadline.rows[0]) throw new Error("Nested child deadline could not be bounded")
+    const task = { ...created, absoluteDeadlineAt: dateValue(deadline.rows[0].absoluteDeadlineAt) }
     const outbox = await persistSubagentSpawnOutbox(client, fence.sessionId, key, task)
     if (!outbox.operationCreated) throw new Error("Fenced spawn idempotency record already exists")
     if (!outbox.dispatchCreated) throw new Error("Fenced spawn dispatch already exists")

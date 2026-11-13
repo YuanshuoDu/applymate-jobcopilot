@@ -20,6 +20,7 @@ import { assertPersistedWriterReviewDependency, createTaskGraphWriterReviewFeedb
 import { PgCoordinationStore } from "../mailbox/store.js"
 import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
+import type { AgentTreeManager } from "./manager.js"
 import { createJobDiscoveryClient, type JobDiscoveryClient } from "../tools/job-discovery-client.js"
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { ArtifactToolRevisionContext } from "../tools/artifact-tools.js"
@@ -34,6 +35,9 @@ import { SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { createScheduledAuditChildExecutor, isScheduledAuditCandidate } from "./scheduled-audit-child-runtime.js"
 import { createScheduledPostGateChildExecutor, isScheduledPostGateCandidate } from "./scheduled-post-gate-child-runtime.js"
 import { createEmptyAnalystCandidateAuthorizer } from "./task-graph-empty-analyst-candidate.js"
+import { nestedScoutProfileForTask } from "./nested-scout-profile.js"
+import { createNestedScoutTools } from "./nested-scout-tools.js"
+import { createNestedScoutFinalWait } from "./nested-scout-final-wait.js"
 export { createProductionChildPolicy } from "./production-child-policy.js"
 export type ProductionChildRuntimeOptions = {
   readonly pool: pg.Pool
@@ -45,6 +49,7 @@ export type ProductionChildRuntimeOptions = {
   readonly mailboxReader?: ChildExecutorOptions["mailboxReader"]
   readonly resumeLoader?: ChildExecutorOptions["resumeLoader"]
   readonly sameAttemptContinuationLoader?: ChildExecutorOptions["sameAttemptContinuationLoader"]
+  readonly subagentManager?: () => Pick<AgentTreeManager, "spawnFromLease"> | undefined
   readonly jobDiscoveryClient?: JobDiscoveryClient
   readonly applicationFillStageObserver?: Parameters<typeof import("./application-fill-for-review.js").executeApplicationFillForReview>[0]["stageObserver"]
 }
@@ -105,7 +110,7 @@ function withoutIdentity<T extends { identity: ExecutionOwnerFence }>(input: T):
   return rest
 }
 
-async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: SubagentTaskRecord, lease: SubagentLease, owner: ExecutionOwnerFence, discoveryClient?: JobDiscoveryClient, prepareOptions?: ScheduledPrepareRuntimeOptions): Promise<ChildToolRuntime> {
+async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: SubagentTaskRecord, lease: SubagentLease, owner: ExecutionOwnerFence, discoveryClient?: JobDiscoveryClient, prepareOptions?: ScheduledPrepareRuntimeOptions, subagentManager?: ProductionChildRuntimeOptions["subagentManager"]): Promise<ChildToolRuntime> {
   const executionOwner: ExecutionOwner = { kind: "task", lease }
   const selectedJobRole = task.role === "scout" || task.role === "analyst" || task.role === "writer" || task.role === "reviewer"
   const selectedJob = selectedJobRole ? selectedJobId(lease) : undefined
@@ -158,6 +163,7 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
   const recordPolicyDecision = durablePolicyDecisionRecorder(store, owner, lease.attemptCount)
   const discoveryFence = childDiscoveryExecutionFence(task, lease, selectedJob, selectedJobPreparation)
   const discoveryObservers = discoveryFence ? await createChildDiscoveryObservers(pool, lease, discoveryFence) : undefined
+  const nestedScoutProfile = nestedScoutProfileForTask(task)
   const scheduledPrepare = task.role === "prepare" && task.taskType === "scheduled_application_prepare" && prepareOptions
     ? createScheduledApplicationPrepareRuntime({ pool, task, lease, owner, authorize: prepareOptions.authorizeUsage,
       treeBudget: prepareOptions.treeBudget, resolveModel: () => resolveScheduledPrepareModel(task, prepareOptions.modelRuntimeFactory) })
@@ -168,6 +174,10 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     ...(discoveryObservers ? { onDiscoveryAttemptLifecycleEvent: discoveryObservers.observeLifecycleEvent } : {}),
   }, toolPolicy, undefined, undefined, artifacts ? { store: artifacts } : undefined, undefined,
   discoveryFence ? { client: discoveryClient ?? createJobDiscoveryClient(), fence: discoveryFence, ...(discoveryObservers ? { onEffectiveCriteria: discoveryObservers.observeEffectiveCriteria } : {}) } : undefined, scheduledPrepare, recordPolicyDecision)
+  if (nestedScoutProfile) {
+    for (const definition of createNestedScoutTools({ pool, lease, profile: nestedScoutProfile, subagentManager: subagentManager ?? (() => undefined),
+      discoveryAttemptSidecar: () => discoveryObservers?.discoveryAttemptSidecar() })) runtime.registry.register(definition)
+  }
   registerProductionChildWaitTool({ pool, task, lease, registry: runtime.registry })
   return {
     definitions: runtime.registry.list(), router: runtime.router,
@@ -185,6 +195,7 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
         recordPolicyDecision,
       }),
     } : {}),
+    ...(nestedScoutProfile ? { prepareFinalDependencyWait: createNestedScoutFinalWait({ pool, lease }) } : {}),
     validateArguments: (name, input, version) => runtime.registry.validateArguments(name, input, version),
   }
 }
@@ -221,7 +232,7 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
         modelRuntimeFactory: options.modelRuntimeFactory,
         toolRuntimeFactory: options.toolRuntimeFactory ?? (({ task, lease: childLease, owner }) => defaultTools(options.pool, engineStore, task, childLease, owner, options.jobDiscoveryClient, {
           authorizeUsage, treeBudget, modelRuntimeFactory: options.modelRuntimeFactory,
-        })),
+        }, options.subagentManager)),
         mailboxReader: options.mailboxReader ?? defaultMailboxReader(options.pool), resumeLoader: options.resumeLoader ?? resumeLoaders.resumeLoader,
         durableWaitResumeCommitter: (lease, wait, nextStepOrdinal) => commitDurableSubagentWaitResume(options.pool, lease, {
           waitId: wait.waitId, stepId: wait.stepId, nextStepOrdinal,

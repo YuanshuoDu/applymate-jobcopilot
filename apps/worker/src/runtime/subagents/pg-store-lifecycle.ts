@@ -1,5 +1,4 @@
 import type pg from "pg"
-import { appendInternalAcceptedInterrupt } from "./task-interrupt-outbox.js"
 import { verifyTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
 import type { TaskGraphVerificationReport } from "./task-graph-verification-report.js"
@@ -8,17 +7,16 @@ import { verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-tas
 import { taskGraphVerificationDependencyNodeKeys } from "../planning/task-graph-verification.js"
 import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-dependency-verification.js"
 import { canonicalTaskGraphJson, taskGraphLifecycleKey, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
-import { dateValue, json, transaction } from "./pg-store-persistence.js"
+import { dateValue, transaction } from "./pg-store-persistence.js"
 import type { PgSubagentPool, SubagentTaskRecord } from "./types.js"
 import { recoverExpired as recoverExpiredImpl } from "./pg-store-expiry-recovery.js"
-import { deleteGraphDispatch, persistGraphTransition, prepareGraphTransition, reconcileGraphDependents, taskGraphEventType, type GraphTransitionPreparation } from "./task-graph-pg-lifecycle.js"
+import { prepareGraphTransition, taskGraphEventType, type GraphTransitionPreparation } from "./task-graph-pg-lifecycle.js"
 import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { validateScheduledGateTaskGraphFinish } from "./pg-scheduled-task-graph-gate-verification.js"
 import { SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE, SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import { prepareScheduledPostGateFinish } from "./pg-scheduled-post-gate-lifecycle.js"
 import { plainObject, stripNonterminalDiscoveryRecovery, stripTaskGraphMetadata, taskGraphVerificationResult, unverifiedFailureReport } from "./pg-store-lifecycle-result.js"
-type Selector = Readonly<{ sessionId: string; userId?: string; turnId?: string; rootTaskId?: string; targetPath?: string }>
-type Candidate = Record<string, unknown> & Readonly<{ id: string; status: string; attemptCount: number; sessionId: string; userId: string; rootTaskId?: string; turnId?: string | null }>
+import { interruptMatchingInSession, type SubagentInterruptSelector } from "./pg-store-subtree-interrupt.js"
 export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { taskId: string; sessionId: string; attemptCount: number; status: string; retry: boolean; failureReason?: string; result: unknown; ownerId?: string; taskRole?: string; taskType?: string }): Promise<{ graph: GraphTransitionPreparation; status: string; failureReason?: string; result: unknown; reconcileDependents?: boolean }> {
   const safeInputResult = stripTaskGraphMetadata(input.result)
   const finalizedResult = (value: unknown, status: string): unknown => stripNonterminalDiscoveryRecovery(value, status, input.retry)
@@ -193,7 +191,7 @@ export async function interruptTurn(pool: PgSubagentPool, input: { userId: strin
 export async function interruptSubtree(pool: PgSubagentPool, input: { sessionId: string; rootTaskId: string; targetPath: string; now: Date }): Promise<number> {
   return interruptMatching(pool, { sessionId: input.sessionId, rootTaskId: input.rootTaskId, targetPath: input.targetPath }, input.now)
 }
-async function interruptMatching(pool: PgSubagentPool, selector: Selector, now: Date): Promise<number> {
+async function interruptMatching(pool: PgSubagentPool, selector: SubagentInterruptSelector, now: Date): Promise<number> {
   return transaction(pool, async client => {
     const session = await client.query(`SELECT "userId", "status" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [selector.sessionId])
     const sessionRow = session.rows[0] as Record<string, unknown> | undefined
@@ -201,50 +199,7 @@ async function interruptMatching(pool: PgSubagentPool, selector: Selector, now: 
       || (selector.userId && sessionRow.userId !== selector.userId)) return 0
     const userId = String(sessionRow.userId)
     await client.query(`SELECT set_config('app.user_id', $1, true)`, [userId])
-    const { sql, values } = selectorWhere(selector)
-    const selected = await client.query(`SELECT task."id", task."status", task."attemptCount", task."turnId" FROM "sub_agent_tasks" AS task
-      JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
-      WHERE ${sql} AND session."userId" = $${values.length + 1}
-        AND task."status" IN ('queued', 'running', 'retrying', 'waiting', 'waiting_for_user')
-      ORDER BY task."rootTaskId", task."id"`, [...values, userId])
-    let changed = 0
-    for (const raw of selected.rows as Candidate[]) {
-      const running = raw.status === "running"
-      const graph = running ? null : await prepareGraphTransition(client, {
-        taskId: raw.id, sessionId: selector.sessionId, type: "task.interrupted", attemptCount: Number(raw.attemptCount),
-      })
-      if (graph && "blocked" in graph) continue
-      const update = running
-        ? `UPDATE "sub_agent_tasks" SET "interruptRequestedAt" = COALESCE("interruptRequestedAt", $3), "updatedAt" = $3
-            WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' RETURNING to_char("interruptRequestedAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS "interruptRequestedAt"`
-        : `UPDATE "sub_agent_tasks" SET "interruptRequestedAt" = COALESCE("interruptRequestedAt", $3), "status" = 'interrupted',
-            "nextAttemptAt" = NULL, "completedAt" = $3, "updatedAt" = $3
-            WHERE "id" = $1 AND "sessionId" = $2 AND "status" = $4 RETURNING to_char("interruptRequestedAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS "interruptRequestedAt"`
-      const params = running ? [raw.id, selector.sessionId, now] : [raw.id, selector.sessionId, now, raw.status]
-      const result = await client.query<{ interruptRequestedAt: string }>(update, params)
-      if (result.rowCount !== 1) continue
-      changed++
-      if (selector.targetPath && typeof raw.turnId === "string" && raw.turnId) await appendInternalAcceptedInterrupt(client, userId, { sessionId: selector.sessionId, turnId: raw.turnId, taskId: raw.id, interruptRequestedAt: result.rows[0]!.interruptRequestedAt })
-      if (!running) {
-        await deleteGraphDispatch(client, selector.sessionId, raw.id)
-        if (graph) {
-          await persistGraphTransition(client, graph, now)
-          await reconcileGraphDependents(client, graph.scope, now)
-        }
-      }
-    }
-    return changed
+    return interruptMatchingInSession(client, selector, userId, now)
   })
-}
-function selectorWhere(selector: Selector): { sql: string; values: unknown[] } {
-  const values: unknown[] = [selector.sessionId]
-  const parts = [`task."sessionId" = $1`]
-  if (selector.turnId) { values.push(selector.turnId); parts.push(`task."turnId" = $${values.length}`) }
-  if (selector.rootTaskId) { values.push(selector.rootTaskId); parts.push(`task."rootTaskId" = $${values.length}`) }
-  if (selector.targetPath) {
-    values.push(selector.targetPath)
-    parts.push(`(task."path" = $${values.length} OR task."path" LIKE $${values.length} || '/%')`)
-  }
-  return { sql: parts.join(" AND "), values }
 }
 export async function recoverExpired(pool: PgSubagentPool, input: { now: Date; limit: number }): Promise<SubagentTaskRecord[]> { return recoverExpiredImpl(pool, input) }

@@ -15,6 +15,9 @@ type FixtureOptions = {
   parent?: Record<string, unknown>
   root?: Record<string, unknown>
   live?: boolean
+  deadlineLive?: boolean
+  rootDeadlineLive?: boolean
+  stepLive?: boolean
   existing?: { taskId: string }
   replayTask?: Record<string, unknown>
   activeChildren?: number
@@ -31,12 +34,13 @@ function fixture(options: FixtureOptions = {}) {
     status: "running", goal: "inspect", constraints: [], successCriteria: [], allowedActions: ["jobs.search"],
     context: {}, expectedOutputSchema: {}, result: null, failureReason: null, attemptCount: fence.attemptCount,
     maxAttempts: parentPolicy.maxAttempts, leaseOwner: fence.ownerId, leaseExpiresAt: new Date("2099-01-01T00:00:00Z"),
+    absoluteDeadlineAt: new Date("2099-01-01T00:00:00Z"),
     interruptRequestedAt: null, budgetSnapshot: { subagentPolicy: parentPolicy }, toolPolicySnapshot: {}, modelProfileSnapshot: {},
     ...options.parent,
   }
   const root = {
     id: fence.rootTaskId, rootTaskId: fence.rootTaskId, turnId: fence.turnId, parentTaskId: null,
-    status: "running", interruptRequestedAt: null, ...options.root,
+    status: "running", interruptRequestedAt: null, absoluteDeadlineAt: new Date("2099-01-01T00:00:00Z"), ...options.root,
   }
   let inserted: Record<string, unknown> | null = null
   const client = {
@@ -60,13 +64,15 @@ function fixture(options: FixtureOptions = {}) {
       }
       if (sql.startsWith('SELECT root."id"')) return { rows: [root], rowCount: 1 }
       if (sql.includes('SELECT task.*, session."userId"')) return { rows: [parent], rowCount: 1 }
-      if (sql.includes("> clock_timestamp()")) return { rows: [{ leaseLive: options.live ?? true }], rowCount: 1 }
+      if (sql.includes("AS \"leaseLive\"")) return { rows: [{ leaseLive: options.live ?? true,
+        deadlineLive: options.deadlineLive ?? true, rootDeadlineLive: options.rootDeadlineLive ?? true }], rowCount: 1 }
+      if (sql.includes('FROM "agent_steps" AS step')) return { rows: options.stepLive === false ? [] : [{ id: "step-1" }], rowCount: options.stepLive === false ? 0 : 1 }
       if (sql.startsWith('SELECT "payload" FROM "agent_outbox"')) return {
         rows: options.existing ? [{ payload: options.existing }] : [], rowCount: options.existing ? 1 : 0,
       }
       if (sql.startsWith('SELECT session."id" FROM "agent_sessions"')) return { rows: [{ id: fence.sessionId }], rowCount: 1 }
       if (sql.includes('SELECT root."allowedActions"')) return { rows: [], rowCount: 0 }
-      if (sql.startsWith('SELECT "id", "rootTaskId", "path"')) return { rows: [parent], rowCount: 1 }
+      if (sql.startsWith('SELECT "id", "rootTaskId", "parentTaskId", "path"')) return { rows: [parent], rowCount: 1 }
       if (sql.includes("COUNT(*)")) return { rows: [{ count: options.activeChildren ?? 0 }], rowCount: 1 }
       if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) {
         const values = params ?? []
@@ -77,9 +83,15 @@ function fixture(options: FixtureOptions = {}) {
           allowedActions: JSON.parse(String(values[12])), context: JSON.parse(String(values[13])),
           expectedOutputSchema: JSON.parse(String(values[14])), modelProfileSnapshot: JSON.parse(String(values[15])),
           toolPolicySnapshot: JSON.parse(String(values[16])), budgetSnapshot: JSON.parse(String(values[17])),
-          maxAttempts: values[18],
+          maxAttempts: values[18], absoluteDeadlineAt: new Date(Date.now() + 60 * 60 * 1000),
         }
         return { rows: [{ id: values[0] }], rowCount: 1 }
+      }
+      if (sql.startsWith('UPDATE "sub_agent_tasks" AS child')) {
+        const childDeadline = inserted?.absoluteDeadlineAt as Date
+        const parentDeadline = parent.absoluteDeadlineAt as Date | null
+        const absoluteDeadlineAt = parentDeadline && parentDeadline < childDeadline ? parentDeadline : childDeadline
+        return { rows: [{ absoluteDeadlineAt }], rowCount: 1 }
       }
       if (sql.startsWith('INSERT INTO "agent_outbox"')) return { rows: [], rowCount: 1 }
       return { rows: [], rowCount: 0 }
@@ -90,6 +102,15 @@ function fixture(options: FixtureOptions = {}) {
 }
 
 describe("lease-scoped atomic subagent creation", () => {
+  it("rejects private nested Scout scope without a source-step fence before replay", async () => {
+    const state = fixture({ existing: { taskId: "child-existing" } })
+    await expect(createSubagentWithSpawnFromLease(state.pool, {
+      ...input, context: { nestedScoutSourceSlice: ["greenhouse"], nestedScoutQueryScope: [] },
+    })).rejects.toMatchObject({ code: "lost" })
+    expect(state.calls.some(([sql]) => sql.startsWith('SELECT "payload" FROM "agent_outbox"'))).toBe(false)
+    expect(state.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+  })
+
   it("locks Session, Turn, Root and parent before atomically creating a child and both outboxes", async () => {
     const state = fixture()
     const result = await createSubagentWithSpawnFromLease(state.pool, input)
@@ -124,6 +145,51 @@ describe("lease-scoped atomic subagent creation", () => {
     await expect(createSubagentWithSpawnFromLease(state.pool, input)).resolves.toEqual({ task: expect.objectContaining({ id: "child-existing" }), duplicate: true })
     expect(state.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
     expect(state.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(state.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" AS child'))).toBe(false)
+  })
+
+  it("checks the exact live Scout delegate call before idempotent replay", async () => {
+    const stepInput: AtomicSubagentSpawnFromLeaseInput = {
+      ...input, parentExecutionFence: { ...fence, step: { stepId: "step-1", toolCallId: "call-1" } },
+    }
+    const state = fixture({ existing: { taskId: "child-existing" }, replayTask: {
+      id: "child-existing", userId: fence.userId, sessionId: fence.sessionId, turnId: fence.turnId,
+      rootTaskId: fence.rootTaskId, parentTaskId: fence.id, depth: 2, path: "/root-1/parent-1/child-existing",
+      role: "scout", taskType: "research", status: "queued", goal: "inspect", attemptCount: 0,
+      maxAttempts: 2, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null, budgetSnapshot: {},
+      toolPolicySnapshot: {}, absoluteDeadlineAt: new Date("2099-01-01T00:00:00Z"),
+    } })
+    await expect(createSubagentWithSpawnFromLease(state.pool, stepInput)).resolves.toMatchObject({ duplicate: true })
+    const stepCheck = state.calls.findIndex(([sql]) => sql.includes('FROM "agent_steps" AS step'))
+    const replay = state.calls.findIndex(([sql]) => sql.startsWith('SELECT "payload" FROM "agent_outbox"'))
+    expect(stepCheck).toBeGreaterThan(-1)
+    expect(stepCheck).toBeLessThan(replay)
+    expect(state.calls[stepCheck]?.[0]).toContain(`item."status" = 'started'`)
+  })
+
+  it("rejects a stale in-flight call and expired parent deadline before replay or insertion", async () => {
+    const stepInput: AtomicSubagentSpawnFromLeaseInput = {
+      ...input, parentExecutionFence: { ...fence, step: { stepId: "step-1", toolCallId: "call-1" } },
+    }
+    for (const options of [{ stepLive: false }, { deadlineLive: false }, { rootDeadlineLive: false }]) {
+      const state = fixture({ ...options, existing: { taskId: "child-existing" } })
+      await expect(createSubagentWithSpawnFromLease(state.pool, stepInput)).rejects.toMatchObject({ code: "lost" })
+      expect(state.calls.some(([sql]) => sql.startsWith('SELECT "payload" FROM "agent_outbox"'))).toBe(false)
+      expect(state.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+      expect(state.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+    }
+  })
+
+  it("sets a DB-created child deadline and clamps it to the parent's deadline", async () => {
+    const parentDeadline = new Date(Date.now() + 5 * 60 * 1000)
+    const state = fixture({ parent: { absoluteDeadlineAt: parentDeadline } })
+    const result = await createSubagentWithSpawnFromLease(state.pool, input)
+    if (!result.task) throw new Error("Expected a nested child task")
+    expect(result.task.absoluteDeadlineAt).toEqual(parentDeadline)
+    const insert = state.calls.find(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))
+    expect(insert?.[1]?.[19]).toBe(true)
+    expect(state.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" AS child')
+      && sql.includes('LEAST(child."absoluteDeadlineAt"'))).toBe(true)
   })
 
   it.each([
