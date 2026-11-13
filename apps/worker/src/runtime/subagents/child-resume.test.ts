@@ -221,6 +221,26 @@ describe("child attempt durable resume", () => {
     expect(db.client.query.mock.calls.map(([sql]) => sql)).toContain("SELECT set_config($1, $2, true)")
   })
 
+  it("returns historical reserved-ID replay authority only with selected persisted revisions", async () => {
+    const child = lease(), input = { query: "Dublin" }, output = { jobs: [] }
+    const db = fakePool(child, [step(child)], [
+      item(child, { id: "call-item", revision: 2, content: { toolCallId: "toolcall-resume-1", toolName: "jobs.search", input } }),
+      item(child, { id: "result-item", revision: 3, type: "tool_result", content: { toolCallId: "toolcall-resume-1", output, errorCode: null } }),
+    ])
+
+    const restored = await loadChildAttemptResume(db.pool as never, child)
+    expect(restored?.observations).toEqual([{ id: "child-resume:result-item", content: {
+      toolCallId: "toolcall-resume-1", toolName: "jobs.search", input, status: "completed", output, errorCode: null,
+    } }])
+    expect(restored?.childToolReplayReceipts).toEqual([{
+      userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, taskId: child.id,
+      attempt: 1, stepId: "step-1", toolCallId: "toolcall-resume-1", toolName: "jobs.search", input,
+      callItem: { id: "call-item", revision: 2 }, resultItem: { id: "result-item", revision: 3 },
+      result: { status: "completed", output, errorCode: null },
+    }])
+    expect(restored?.childWaitReplayReceipts).toBeUndefined()
+  })
+
   it("trusts the live database lease after heartbeat extends beyond the lease snapshot expiry", async () => {
     const now = new Date("2026-10-29T16:00:00.000Z")
     const staleLease = lease({ leaseExpiresAt: new Date("2026-10-29T15:59:00.000Z") })

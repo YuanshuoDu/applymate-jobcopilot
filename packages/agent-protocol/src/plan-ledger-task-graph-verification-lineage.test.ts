@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest"
 import { projectPlanLedger } from "./plan-ledger.js"
 import { validTaskGraphResultEnvelopeKeys } from "./plan-ledger-task-graph-metadata.js"
 import { projectTaskGraphVerificationSummary } from "./plan-ledger-task-graph-verification-display.js"
+import { hasCurrentTaskGraphVerificationLineage } from "./plan-ledger-task-graph-verification-lineage.js"
 
 const sessionId = "session-lineage", turnId = "turn-lineage", rootTaskId = "root-lineage"
 const evidenceDigest = "a".repeat(64), resultDigest = "b".repeat(64)
@@ -147,13 +148,75 @@ describe("TaskGraph verification current lineage", () => {
       row("task-repair", "scout", "completed", envelope(report(scoutCriteria), { taskGraphRepairReceipt: receipt }))]
     expect(summary([target, repair], rows)?.nodes.map(item => item && "status" in item ? item.status : item)).toEqual(["failed", "passed"])
 
-    const noLongerFailed = [rows[0], row("task-target", "scout", "completed", envelope(report(scoutCriteria))), rows[2]]
-    expect(summary([target, repair], noLongerFailed)?.nodes[1]).toEqual({ status: "unavailable" })
+    const passedTarget = [rows[0], row("task-target", "scout", "completed", envelope(report(scoutCriteria))), rows[2]]
+    expect(summary([target, repair], passedTarget)?.nodes[1]).toEqual({ status: "unavailable" })
     const wrongFailureReason = [rows[0], row("task-target", "scout", "failed", envelope(targetReport), { failureReason: "other_failure" }), rows[2]]
     expect(summary([target, repair], wrongFailureReason)?.nodes[1]).toEqual({ status: "unavailable" })
     const wrongReceiptTarget = { ...receipt, targetTaskId: "other-task" }
     const wrongReceipt = [rows[0], rows[1], row("task-repair", "scout", "completed",
       envelope(report(scoutCriteria), { taskGraphRepairReceipt: wrongReceiptTarget }))]
     expect(summary([target, repair], wrongReceipt)?.nodes[1]).toEqual({ status: "unavailable" })
+  })
+
+  it("rejects a passed target report in repair lineage", () => {
+    const target = node("target", "task-target", "scout", scoutCriteria)
+    const repair = { ...node("repair", "task-repair", "scout", scoutCriteria), repairOf: {
+      graphRootTaskId: rootTaskId, nodeKey: "target", taskId: "task-target", criterionIds: ["candidate-count"],
+    } }
+    const receipt = { schemaVersion: "agent-harness.v2.task-graph-repair-receipt.v1", verifierVersion: "agent-harness.v2.task-graph-verifier.v1",
+      graphRootTaskId: rootTaskId, targetNodeKey: "target", targetTaskId: "task-target", repairNodeKey: "repair", repairTaskId: "task-repair",
+      criterionIds: ["candidate-count"], evidenceDigest }
+    const rows = [row(rootTaskId, "orchestrator", "running", null),
+      row("task-target", "scout", "failed", envelope(report(scoutCriteria)), { failureReason: "task_graph_verification_passed" }),
+      row("task-repair", "scout", "completed", envelope(report(scoutCriteria), { taskGraphRepairReceipt: receipt }))]
+
+    expect(summary([target, repair], rows)?.nodes[1]).toEqual({ status: "unavailable" })
+  })
+
+  it.each(["reasonCode", "status"] as const)("fails closed without throwing for malformed criterion %s values", field => {
+    const validReport = report(scoutCriteria, "failed")
+    const malformedCriterion = field === "reasonCode"
+      ? { ...validReport.criteria[0], reasonCode: { toString: null } }
+      : { ...validReport.criteria[0], status: { toString: null } }
+    const input = {
+      rawNode: {},
+      node: { key: "scout", templateId: "scout", goal: "Goal scout", successCriteria: ["Check result"], dependsOn: [], depth: 1, taskId: "task-scout" },
+      row: { status: "failed" },
+      result: envelope(validReport),
+      report: { ...validReport, criteria: [malformedCriterion] },
+      expected: scoutCriteria,
+      actual: [malformedCriterion],
+      graphNodes: [],
+      taskIds: [],
+      rows: new Map(),
+      rootTaskId,
+    }
+
+    expect(() => hasCurrentTaskGraphVerificationLineage(input)).not.toThrow()
+    expect(hasCurrentTaskGraphVerificationLineage(input)).toBe(false)
+  })
+
+  it("preserves other valid nodes when persisted criterion status or reasonCode is malformed", () => {
+    const valid = node("valid", "task-valid", "scout", scoutCriteria)
+    const badReason = node("bad-reason", "task-bad-reason", "scout", scoutCriteria)
+    const badStatus = node("bad-status", "task-bad-status", "scout", scoutCriteria)
+    const failedReport = report(scoutCriteria, "failed")
+    const badReasonResult = { ...envelope(failedReport), taskGraphVerificationReport: { ...failedReport,
+      criteria: [{ ...failedReport.criteria[0], reasonCode: { toString: null } }] } }
+    const badStatusResult = { ...envelope(failedReport), taskGraphVerificationReport: { ...failedReport,
+      criteria: [{ ...failedReport.criteria[0], status: { toString: null } }] } }
+    const nodes = [valid, badReason, badStatus]
+    const rows = [row(rootTaskId, "orchestrator", "running", null),
+      row("task-valid", "scout", "completed", envelope(report(scoutCriteria))),
+      row("task-bad-reason", "scout", "failed", badReasonResult, { failureReason: "task_graph_verification_failed" }),
+      row("task-bad-status", "scout", "failed", badStatusResult, { failureReason: "task_graph_verification_failed" })]
+
+    const value = summary(nodes, rows)
+
+    expect(value).not.toBeNull()
+    expect(value?.nodes.map(item => item && "status" in item ? item.status : item)).toEqual(["passed", "unavailable", "unavailable"])
+    expect(value?.nodes[0]).toMatchObject({ status: "passed", totalCount: 1, passedCount: 1, failedCount: 0, unverifiedCount: 0 })
+    expect(JSON.stringify(value)).not.toContain("[object Object]")
+    expect(JSON.stringify(value)).not.toContain("reasonCode")
   })
 })

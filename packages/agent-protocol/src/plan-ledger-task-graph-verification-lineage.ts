@@ -27,9 +27,11 @@ const INVALID_CRITERION_REASONS = new Set(["criteria_met", "criterion_not_met", 
 
 /** Checks that recorded verification still matches the same owner-scoped graph rows. */
 export function hasCurrentTaskGraphVerificationLineage(input: LineageInput): boolean {
-  return validTaskGraphResultEnvelopeKeys(input.result) && validResultEnvelope(input.result)
-    && coherentReport(input.report, input.expected, input.actual, input.row.status, input.result.status)
-    && validDependencyBindings(input) && validRepairRelation(input)
+  try {
+    return validTaskGraphResultEnvelopeKeys(input.result) && validResultEnvelope(input.result)
+      && coherentReport(input.report, input.expected, input.actual, input.row.status, input.result.status)
+      && validDependencyBindings(input) && validRepairRelation(input)
+  } catch { return false }
 }
 
 function validDependencyBindings(input: LineageInput): boolean {
@@ -134,7 +136,8 @@ function validRepairRelation(input: LineageInput): boolean {
     || target.taskId !== relation.taskId || target.templateId !== input.node.templateId || !targetContract || !targetCriteria || !repairCriteria || !targetRow
     || targetContract.role !== contract.role || targetRow?.role !== targetContract.role || targetRow.status !== "failed"
     || !targetResult || !targetReport || !targetReportCriteria || !validTaskGraphResultEnvelopeKeys(targetResult) || !validResultEnvelope(targetResult)
-    || !["failed", "unverified"].includes(String(targetReport.status)) || targetRow.failureReason !== `task_graph_verification_${targetReport.status}`
+    || (targetReport.status !== "failed" && targetReport.status !== "unverified")
+    || targetRow.failureReason !== `task_graph_verification_${targetReport.status}`
     || !coherentReport(targetReport, targetCriteria, targetReportCriteria, targetRow.status, targetResult.status)
     || !currentBindings(targetReport, targetCriteria, target, input.graphNodes, input.taskIds, input.rows, input.digestCanonicalJson)) return false
   if (new Set(relationIds).size !== relationIds.length || repairCriteria.length !== relationIds.length
@@ -163,12 +166,12 @@ function coherentReport(report: RawNode, expected: readonly (RawNode | null)[], 
   if (!exact(report, "criteria,evidenceDigest,reasonCode,resultDigest,status,verifierVersion")
     && !exact(report, "criteria,dependencyBindings,evidenceDigest,reasonCode,resultDigest,status,verifierVersion")) return false
   if (report.verifierVersion !== VERIFIER_VERSION || typeof report.reasonCode !== "string" || !REASONS.has(report.reasonCode)
-    || !["passed", "failed", "unverified"].includes(String(report.status)) || actual.length !== expected.length || expected.length < 1
-    || actual.some((item, index) => !item || item.criterionId !== expected[index]?.id || !REASONS.has(String(item.reasonCode))
-      || !["passed", "failed", "unverified"].includes(String(item.status)))) return false
+    || !isVerificationStatus(report.status) || actual.length !== expected.length || expected.length < 1
+    || actual.some((item, index) => !item || item.criterionId !== expected[index]?.id || typeof item.reasonCode !== "string"
+      || !REASONS.has(item.reasonCode) || !isVerificationStatus(item.status))) return false
   if (actual.some(item => item!.status === "passed" && item!.reasonCode !== "criteria_met"
-    || item!.status === "failed" && !["criterion_not_met", "reported_score_below_minimum"].includes(String(item!.reasonCode))
-    || item!.status === "unverified" && INVALID_CRITERION_REASONS.has(String(item!.reasonCode)))) return false
+    || item!.status === "failed" && item!.reasonCode !== "criterion_not_met" && item!.reasonCode !== "reported_score_below_minimum"
+    || item!.status === "unverified" && typeof item!.reasonCode === "string" && INVALID_CRITERION_REASONS.has(item!.reasonCode))) return false
   const failed = actual.find(item => item!.status === "failed")
   const unresolved = report.status === "unverified" && report.reasonCode === "repair_target_unresolved" && report.evidenceDigest === null
     && digest(report.resultDigest) && actual.every(item => item!.status === "passed" && item!.reasonCode === "criteria_met")
@@ -182,6 +185,10 @@ function coherentReport(report: RawNode, expected: readonly (RawNode | null)[], 
     : digest(report.evidenceDigest) && digest(report.resultDigest) && actual.every(item => item!.status === "unverified" && item!.reasonCode === report.reasonCode)
   return coherent && (report.status === "passed" ? taskStatus === "completed" && resultStatus === "completed"
     : taskStatus === "failed" && (resultStatus === "completed" || resultStatus === "failed"))
+}
+
+function isVerificationStatus(value: unknown): value is "passed" | "failed" | "unverified" {
+  return value === "passed" || value === "failed" || value === "unverified"
 }
 
 function validResultEnvelope(result: RawNode): boolean {

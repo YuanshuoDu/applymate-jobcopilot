@@ -30,7 +30,7 @@ import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } fro
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
-import { taskGraphFinalSummaryCopiesMatch } from "./finalizer.js"
+import { nativeFinalCandidateMatches, taskGraphFinalSummaryCopiesMatch, type NativeFinalCandidateTerminal } from "./finalizer.js"
 import type { AtomicTurnCompletionInput } from "./turns/turn-engine-types.js"
 
 export type NativeVerificationRuntime = Readonly<{
@@ -178,7 +178,7 @@ export function createCanonicalNativeVerificationRuntime(input: Readonly<{
   recover(): Promise<NativeVerificationRecovery>
   checkCompletion(stepId: string, candidateText: string): Promise<TurnEngineCompletionGateResult | null>
   resetSemanticProgress(): void
-  checkTerminal(client: Pick<PoolClient, "query">, terminal: Readonly<{ stepId?: string; finalContent: unknown; response: unknown }>): Promise<NativeVerificationTerminalCheck>
+  checkTerminal(client: Pick<PoolClient, "query">, terminal: NativeFinalCandidateTerminal): Promise<NativeVerificationTerminalCheck>
   accepted(): boolean
 }> {
   const runtime = input.factory?.(input.pool) ?? {
@@ -233,13 +233,13 @@ export function createCanonicalNativeVerificationRuntime(input: Readonly<{
         nativeVerificationPassed: false,
         denial: { ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "A new steering instruction arrived during verification. Re-read current input and prepare a fresh answer." },
       }
-      const candidateText = persistedFinalCandidate(terminal.finalContent, terminal.response)
-      if (!candidateText || candidateText !== acceptedCandidate) return {
+      const persistedCandidate = persistedFinalCandidate(terminal.finalContent, terminal.response)
+      if (!acceptedCandidate || !nativeFinalCandidateMatches(terminal, persistedCandidate, acceptedCandidate)) return {
         nativeVerificationPassed: false,
         denial: { ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "Current native proof does not match the final content being persisted." },
       }
       const nativeVerificationPassed = await runtime.readTerminalProof(client, {
-        scope: input.coordination.readScope(), candidateText, witness: acceptedWitness, stepId: terminal.stepId,
+        scope: input.coordination.readScope(), candidateText: acceptedCandidate, witness: acceptedWitness, stepId: terminal.stepId,
       })
       return nativeVerificationPassed ? { nativeVerificationPassed: true } : {
         nativeVerificationPassed: false,

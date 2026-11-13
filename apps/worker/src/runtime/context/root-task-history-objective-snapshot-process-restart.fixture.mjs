@@ -5,6 +5,9 @@ import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
 import { createPgTaskGraphCommandPort } from "../subagents/pg-task-graph-command-port.ts"
 import { taskGraphRuntimeOptions } from "../subagents/task-graph-templates.ts"
 import { createProductionChildExecutor } from "../subagents/production-child-runtime.ts"
+import { createPgRootTaskStore } from "../subagents/root-task-store.ts"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.ts"
+import { createPgTurnEngineStore } from "../turns/turn-engine-store.ts"
 import { NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, parseNativeVerificationControl } from "../subagents/native-verification-contract.ts"
 import { parseNativeVerificationPacket } from "../subagents/native-verification-packet.ts"
 import { startProductionAgentRuntime as startProductionAgentRuntimeHelper } from "../../queue/production-bootstrap.ts"
@@ -26,6 +29,82 @@ let workerBReleasePending = true
 const commandWaiters = new Map()
 const queuedCommands = []
 const noOpProjection = { start: async () => undefined, finish: async () => undefined }
+const phaseDiagnosticsEnabled = mode === "worker-b"
+const phaseDiagnostics = {
+  candidateGateChecks: 0, candidateGateReady: 0,
+  candidateGateWait: 0, candidateGateReplan: 0, candidateGateOther: 0, candidateGateLast: "none", candidateGateLastBlocker: "none",
+  terminalGateChecks: 0, terminalGateReady: 0, terminalGateWait: 0, terminalGateReplan: 0, terminalGateOther: 0,
+  terminalGateLast: "none", terminalGateLastBlocker: "none", summaryBindingsCreated: 0, finalRecordAttempts: 0, finalRecordSuccesses: 0,
+  finalRecordBoundAttempts: 0, finalRecordLastResult: "none", finalRecordLastFailure: "none", finalRecordBinding: false,
+}
+const SAFE_GATE_BLOCKERS = new Set(["child_tasks_pending", "task_graph_verification_unverified", "native_verification_pending",
+  "steering_reconciliation_required", "selected_job_draft_review_required", "scheduled_post_gate_plan_required"])
+const SAFE_RECORD_FAILURES = new Set(["persistence_conflict", "business_precondition_failed", "input_changed", "turn_state_refresh_retry",
+  "budget_exhausted", "no_progress", "invalid_output", "lease_lost", "final_unverified"])
+function cappedCount(value) { return Math.min(999, value + 1) }
+function safeEnum(value, allowed) { return typeof value === "string" && allowed.has(value) ? value : "other" }
+function noteGateResult(result, terminal) {
+  const prefix = terminal ? "terminalGate" : "candidateGate"
+  const outcome = !result || typeof result !== "object" ? "other"
+    : result.ok === true ? "ready"
+      : result.waitId ? "wait"
+        : result.ok === false ? "replan" : "other"
+  const countKey = `${prefix}Checks`
+  phaseDiagnostics[countKey] = cappedCount(phaseDiagnostics[countKey])
+  const outcomeKey = `${prefix}${outcome[0].toUpperCase()}${outcome.slice(1)}`
+  if (Object.hasOwn(phaseDiagnostics, outcomeKey)) phaseDiagnostics[outcomeKey] = cappedCount(phaseDiagnostics[outcomeKey])
+  phaseDiagnostics[`${prefix}Last`] = outcome
+  phaseDiagnostics[`${prefix}LastBlocker`] = result && result.ok === false
+    ? safeEnum(result.blocker, SAFE_GATE_BLOCKERS) : "none"
+  if (result && typeof result === "object" && result[TASK_GRAPH_FINAL_SUMMARY_BINDING]) {
+    phaseDiagnostics.summaryBindingsCreated = cappedCount(phaseDiagnostics.summaryBindingsCreated)
+  }
+  emitPhaseDiagnostics()
+}
+function emitPhaseDiagnostics() {
+  if (!phaseDiagnosticsEnabled) return
+  say(`FIXTURE_PHASE_DIAGNOSTICS_B ${Object.entries(phaseDiagnostics).map(([key, value]) => `${key}=${value}`).join(" ")}`)
+}
+function instrumentRootTaskStore(runtimePool, existing) {
+  const base = existing ?? createPgRootTaskStore(runtimePool)
+  if (!phaseDiagnosticsEnabled) return base
+  return new Proxy(base, { get(target, property) {
+    if (property === "checkCompletion" && typeof target.checkCompletion === "function") return async input => {
+      const result = await Reflect.apply(target.checkCompletion, target, [input])
+      noteGateResult(result, Boolean(input.client))
+      return result
+    }
+    const value = Reflect.get(target, property, target)
+    return typeof value === "function" ? value.bind(target) : value
+  } })
+}
+function instrumentTurnEngineStore(runtimePool, terminalGuard, existingFactory) {
+  const base = existingFactory ? existingFactory(runtimePool, terminalGuard) : createPgTurnEngineStore(runtimePool, terminalGuard)
+  if (!phaseDiagnosticsEnabled) return base
+  return new Proxy(base, { get(target, property) {
+    if (property === "recordFinalResponse") return async input => {
+      phaseDiagnostics.finalRecordAttempts = cappedCount(phaseDiagnostics.finalRecordAttempts)
+      phaseDiagnostics.finalRecordBinding = Boolean(input.terminal?.[TASK_GRAPH_FINAL_SUMMARY_BINDING])
+      if (phaseDiagnostics.finalRecordBinding) phaseDiagnostics.finalRecordBoundAttempts = cappedCount(phaseDiagnostics.finalRecordBoundAttempts)
+      try {
+        const result = await Reflect.apply(target.recordFinalResponse, target, [input])
+        if (result?.status === "completed") phaseDiagnostics.finalRecordSuccesses = cappedCount(phaseDiagnostics.finalRecordSuccesses)
+        phaseDiagnostics.finalRecordLastResult = safeEnum(result?.status, new Set(["completed", "no_progress", "input_changed"]))
+        phaseDiagnostics.finalRecordLastFailure = "none"
+        emitPhaseDiagnostics()
+        return result
+      } catch (error) {
+        const code = error && typeof error === "object" ? error.code : undefined
+        phaseDiagnostics.finalRecordLastResult = "threw"
+        phaseDiagnostics.finalRecordLastFailure = safeEnum(code, SAFE_RECORD_FAILURES)
+        emitPhaseDiagnostics()
+        throw error
+      }
+    }
+    const value = Reflect.get(target, property, target)
+    return typeof value === "function" ? value.bind(target) : value
+  } })
+}
 function say(line) { process.stdout.write(`${line}\n`) }
 function waitForCommand(command) {
   const queued = queuedCommands.indexOf(command)
@@ -598,7 +677,14 @@ async function startRuntime(firstWorker) {
     createCanonicalTurnRuntime(runtimePool, productionOptions) {
       const commandPort = productionOptions.productionFlags?.taskGraphPlanningEnabled
         ? createPgTaskGraphCommandPort(runtimePool) : undefined
-      return createCanonicalTurnRuntime(runtimePool, { ...runtimeOptions, ...productionOptions, ...taskGraphRuntimeOptions(commandPort) })
+      const mergedOptions = { ...runtimeOptions, ...productionOptions, ...taskGraphRuntimeOptions(commandPort) }
+      if (!phaseDiagnosticsEnabled) return createCanonicalTurnRuntime(runtimePool, mergedOptions)
+      return createCanonicalTurnRuntime(runtimePool, {
+        ...mergedOptions,
+        rootTaskStore: instrumentRootTaskStore(runtimePool, mergedOptions.rootTaskStore),
+        turnEngineStoreFactory: (storePool, terminalGuard) =>
+          instrumentTurnEngineStore(storePool, terminalGuard, mergedOptions.turnEngineStoreFactory),
+      })
     },
     createWorkerUsageAuthorizer() { return async () => ({ settle() {} }) },
     createCanonicalExecutionProjection() { return noOpProjection }, createCanonicalSessionProjection() { return noOpProjection },

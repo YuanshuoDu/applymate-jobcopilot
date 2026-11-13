@@ -1,6 +1,7 @@
 import type pg from "pg"
 import type { ContextSeedBlock } from "../context/step-context-builder.js"
 import type { TurnResumeState } from "../turns/turn-engine-types.js"
+import type { ChildToolReplayReceipt, ChildWaitReplayReceipt } from "../turns/turn-execution-options.js"
 import type { SubagentLease } from "./types.js"
 import { buildChildResumeObservations, countChildResumeToolCalls, integer, mergeDurableWaitObservation, type DurableWaitResume } from "./child-resume-observations.js"
 import { loadChildConsumedWaitResume } from "./child-resume-consumed-wait.js"
@@ -14,6 +15,8 @@ type Row = Record<string, unknown>
 export type ChildAttemptResume = {
   readonly resume: TurnResumeState
   readonly observations: readonly ContextSeedBlock[]
+  readonly childToolReplayReceipts?: readonly ChildToolReplayReceipt[]
+  readonly childWaitReplayReceipts?: readonly ChildWaitReplayReceipt[]
   readonly durableWait?: DurableWaitResume
   readonly childWaitClaimRecovery?: ChildWaitClaimRecovery
   readonly childWaitOrphanRecovery?: ChildWaitOrphanRecovery
@@ -72,13 +75,13 @@ function waitResumeStepsSql(): string {
 }
 
 function itemsSql(): string {
-  return `SELECT item."id", item."sessionId", item."turnId", item."taskId", item."stepId", item."type", item."status", item."content", step."attempt", step."ordinal", task."rootTaskId" AS "rootTaskId"
+  return `SELECT item."id", item."revision", item."sessionId", item."turnId", item."taskId", item."stepId", item."type", item."status", item."content", step."attempt", step."ordinal", task."rootTaskId" AS "rootTaskId"
     FROM "agent_items" AS item JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId" JOIN "sub_agent_tasks" AS task ON task."id" = item."taskId" AND task."sessionId" = item."sessionId" AND task."turnId" = item."turnId" JOIN "agent_sessions" AS session ON session."id" = item."sessionId" JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
     WHERE item."taskId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5 AND step."attempt" >= 1 AND step."attempt" < $6 ORDER BY step."attempt" ASC, step."ordinal" ASC, item."createdAt" ASC, item."id" ASC LIMIT ${MAX_PRIOR_ITEMS + 1}`
 }
 
 function waitResumeItemsSql(): string {
-  return `SELECT item."id", item."sessionId", item."turnId", item."taskId", item."stepId", item."type", item."status", item."content", step."attempt", step."ordinal", task."rootTaskId" AS "rootTaskId"
+  return `SELECT item."id", item."revision", item."sessionId", item."turnId", item."taskId", item."stepId", item."type", item."status", item."content", step."attempt", step."ordinal", task."rootTaskId" AS "rootTaskId"
     FROM "agent_items" AS item JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId" JOIN "sub_agent_tasks" AS task ON task."id" = item."taskId" AND task."sessionId" = item."sessionId" AND task."turnId" = item."turnId" JOIN "agent_sessions" AS session ON session."id" = item."sessionId" JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
     WHERE item."taskId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5
       AND step."attempt" <= $6
@@ -116,10 +119,12 @@ function summarizePriorAttempts(stepRows: readonly Row[], itemRows: readonly Row
     if (!Number.isSafeInteger(inputTokens) || !Number.isSafeInteger(outputTokens) || !Number.isFinite(estimatedCostUsd)) throw new Error("child_resume_usage_overflow")
   }
   const nextOrdinal = ["completed", "waiting_for_tool", "waiting_for_approval", "waiting_for_user"].includes(lastStatus) ? lastOrdinal + 1 : lastOrdinal
-  const restoredObservations = buildChildResumeObservations(itemRows, lease)
+  const restored = buildChildResumeObservations(itemRows, lease)
   toolCallCount = countChildResumeToolCalls(itemRows, lease)
   return { resume: { nextOrdinal, stepCount: stepRows.length, toolCallCount, inputThroughSequence, consumedInputIds,
-    usage: { inputTokens, outputTokens, estimatedCostUsd } }, observations: restoredObservations }
+    usage: { inputTokens, outputTokens, estimatedCostUsd } }, observations: restored.observations,
+    ...(restored.childToolReplayReceipts.length ? { childToolReplayReceipts: restored.childToolReplayReceipts } : {}),
+    ...(restored.childWaitReplayReceipts.length ? { childWaitReplayReceipts: restored.childWaitReplayReceipts } : {}) }
 }
 
 /** Loads accounting/evidence from prior attempts on this exact task using the caller's transaction. */
@@ -197,7 +202,8 @@ export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLe
       : await client.query<Row>(itemsSql(), [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.rootTaskId, lease.attemptCount])
     if (itemResult.rows.length > MAX_PRIOR_ITEMS) throw new Error("child_resume_item_limit")
     const currentAttemptItemOrdinal = currentAttemptWait ? Math.max(...sameAttempt.rows.map(row => integer(row, "ordinal"))) : undefined
-    let restoredObservations = buildChildResumeObservations(itemResult.rows, lease, currentAttemptItemOrdinal)
+    const restored = buildChildResumeObservations(itemResult.rows, lease, currentAttemptItemOrdinal, waitResume ? [waitResume] : [])
+    let restoredObservations = restored.observations
     if (waitResume) restoredObservations = mergeDurableWaitObservation(restoredObservations, waitResume)
     const waitCallRecovery = currentAttemptWait?.continuationStepId
       ? await loadChildWaitCallRecovery(client, lease, currentAttemptWait) : undefined
@@ -216,6 +222,7 @@ export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLe
       const content = item.content && typeof item.content === "object" && !Array.isArray(item.content) ? item.content as Record<string, unknown> : {}
       return typeof content.toolCallId !== "string" || !hiddenCallIds.has(content.toolCallId)
     })
+    const observationIds = new Set(restoredObservations.map(item => item.id))
     toolCallCount = countChildResumeToolCalls(itemResult.rows, lease, currentAttemptItemOrdinal)
     if (childWaitOrphanCallIds.length) {
       const orphanRows = itemResult.rows.filter(row => row.type === "tool_call" && row.content && typeof row.content === "object"
@@ -229,6 +236,8 @@ export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLe
     return {
       resume: { nextOrdinal, stepCount, toolCallCount, inputThroughSequence, consumedInputIds, usage: { inputTokens, outputTokens, estimatedCostUsd } },
       observations: restoredObservations,
+      ...(restored.childToolReplayReceipts.length ? { childToolReplayReceipts: restored.childToolReplayReceipts.filter(item => observationIds.has(`child-resume:${item.resultItem.id}`)) } : {}),
+      ...(restored.childWaitReplayReceipts.length ? { childWaitReplayReceipts: restored.childWaitReplayReceipts.filter(item => observationIds.has(`child-resume:${item.resultItem.id}`)) } : {}),
       ...(currentAttemptWait ? { durableWait: currentAttemptWait } : {}),
       ...(childWaitClaimRecovery ? { childWaitClaimRecovery } : {}),
       ...(childWaitOrphanRecovery ? { childWaitOrphanRecovery } : {}),

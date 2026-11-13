@@ -69,6 +69,21 @@ describe("agent task query API", () => {
     expect((await response.json()).tasks[0].status).toBe("passed")
   })
 
+  it("rejects unsupported, duplicate, empty, and unscoped summary versions", async () => {
+    const { GET } = await import("./route")
+    for (const path of [
+      "?verificationSummaryVersion=",
+      "?verificationSummaryVersion=3",
+      "?verificationSummaryVersion=1&verificationSummaryVersion=2",
+      "?verificationSummaryVersion=2",
+    ]) {
+      const response = await GET(request(path) as never, params)
+      expect(response.status).toBe(400)
+      expect(await response.json()).toMatchObject({ error: { code: "invalid_verification_summary_version", details: {} } })
+    }
+    expect(mocks.sessionFindFirst).not.toHaveBeenCalled()
+  })
+
   it("uses the authenticated owner guard and supports bounded pagination", async () => {
     const observedTenantIds: Array<string | null> = []
     mocks.sessionFindFirst.mockImplementationOnce(async () => {
@@ -192,6 +207,52 @@ describe("agent task query API", () => {
     for (const privateValue of ["PRIVATE_FINAL_TEXT", "PRIVATE_STRUCTURED", "private-final-id", digest, "criteria_met"]) expect(ledger).not.toContain(privateValue)
     for (const privateValue of ["child_private_id", "scout-private-key", "root_verify", "candidate-count", "PRIVATE_FINAL_TEXT", digest, "criteria_met"]) {
       expect(summary).not.toContain(privateValue)
+    }
+  })
+
+  it("returns mapped v2 reasons only when explicitly requested", async () => {
+    const digest = "a".repeat(64)
+    const verification = { schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "scout", criteria: [
+      { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } },
+    ] }
+    const graph = { schemaVersion: "agent-harness.v2.task-graph", nodes: [
+      { key: "scout-private-key", templateId: "scout", goal: "Private goal", successCriteria: ["Private criterion"], dependsOn: [], depth: 1,
+        taskId: "child_private_id", verification, verificationDisposition: "typed" },
+    ] }
+    const graphRow = { id: "graph_v2", sessionId: "session_1", turnId: "turn_v2", taskId: "root_v2", revision: 3, content: graph }
+    const taskRows = [{
+      id: "root_v2", sessionId: "session_1", turnId: "turn_v2", rootTaskId: "root_v2", parentTaskId: null, path: "root",
+      role: "orchestrator", taskType: "root", status: "running", attemptCount: 1, goal: "Root goal", confidence: null, failureReason: null, result: null,
+      createdAt: new Date("2026-08-31T00:00:00Z"), updatedAt: new Date("2026-08-31T00:01:00Z"),
+    }, {
+      id: "child_private_id", sessionId: "session_1", turnId: "turn_v2", rootTaskId: "root_v2", parentTaskId: "root_v2", path: "0",
+      role: "scout", taskType: "scout", status: "failed", attemptCount: 1, goal: "Private goal", confidence: null, failureReason: "task_graph_verification_failed",
+      result: { status: "failed", stepCount: 2, toolCallCount: 1, finalItemId: null, finalText: "PRIVATE_FINAL_TEXT", structuredResult: { secret: "PRIVATE_RESULT" },
+        taskGraphVerificationReport: { verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "failed", reasonCode: "criterion_not_met",
+          criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }], evidenceDigest: digest, resultDigest: "b".repeat(64) } },
+      createdAt: new Date("2026-08-31T00:00:00Z"), updatedAt: new Date("2026-08-31T00:01:00Z"),
+    }]
+    mocks.graphFindFirst.mockResolvedValueOnce(graphRow).mockResolvedValueOnce(graphRow)
+    mocks.taskFindMany.mockResolvedValueOnce(taskRows).mockResolvedValueOnce(taskRows)
+
+    const { GET } = await import("./route")
+    const query = "?taskId=root_v2&taskId=child_private_id&graphItemId=graph_v2&graphTurnId=turn_v2&rootTaskId=root_v2&graphRevision=3"
+    const v1Response = await GET(request(`${query}&verificationSummaryVersion=1`) as never, params)
+    const v1Body = await v1Response.json()
+    expect(v1Body.planLedger.verificationSummary).toEqual({ schemaVersion: 1, nodes: [{ status: "failed", checks: [
+      { kind: "candidate_count_gte", minimum: 2, status: "failed" },
+    ], totalCount: 1, passedCount: 0, failedCount: 1, unverifiedCount: 0 }] })
+
+    const response = await GET(request(`${query}&verificationSummaryVersion=2`) as never, params)
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(body.planLedger.verificationSummary).toEqual({ schemaVersion: 2, nodes: [{ status: "failed", checks: [
+      { kind: "candidate_count_gte", minimum: 2, status: "failed", displayReason: "criterion_unmet" },
+    ], totalCount: 1, passedCount: 0, failedCount: 1, unverifiedCount: 0 }] })
+    const serialized = JSON.stringify(body.planLedger.verificationSummary)
+    for (const privateValue of ["criterion_not_met", "candidate-count", "child_private_id", "scout-private-key", "root_v2", digest, "PRIVATE_FINAL_TEXT", "PRIVATE_RESULT"]) {
+      expect(serialized).not.toContain(privateValue)
     }
   })
 
