@@ -39,6 +39,16 @@ const SAFE_DIAGNOSTIC_ERROR_CODES = [
   "p1143_root_graph_completion_unverified", "p1143_root_turn_did_not_complete_after_child_join", "p1143_root_turn_failed",
   "p1143_subagent_queue_unavailable",
 ] as const
+const SAFE_WAIT_RESUME_CODES = ["wait_invalid", "wait_scope_error", "wait_conflict", "other"] as const
+const SAFE_WAIT_RESUME_STAGES = [
+  "required_value", "resume_scope", "source_step", "source_call_count", "source_call_input", "source_item_set", "wait_record_shape",
+  "provenance_marker", "source_receipt_missing", "source_marker_without_result", "source_recovered_receipt_mismatch",
+  "source_waiting_content", "source_waiting_output_shape", "source_waiting_identity", "source_waiting_targets",
+  "source_waiting_matched_ids", "source_waiting_tasks", "source_waiting_task_ids", "source_waiting_deadline",
+  "source_initial_call_shape", "source_call_completion_state", "source_result_completion_state", "source_call_completion_content",
+  "source_result_completion_content", "source_waiting_output_missing", "source_event_chain", "reconciliation", "safe_result_shape",
+  "source_start_event", "other",
+] as const
 
 function isSafeFixtureFailure(value: string): boolean {
   const match = value.match(/^P1143_FIXTURE_FAILURE:(p1143_[a-z_]+|redacted)$/)
@@ -57,6 +67,12 @@ function seenMainProgress(output: string[]) {
 async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
   const observedPhases = seenMainProgress(output)
   const fixtureFailure = output.find(isSafeFixtureFailure) ?? null
+  const waitResumeCommitFailures = output.flatMap(value => {
+    const match = value.match(/^P1143_WAIT_RESUME_COMMIT_DIAGNOSTIC:([a-z_]+):([a-z_]+)$/)
+    return match && SAFE_WAIT_RESUME_CODES.includes(match[1] as typeof SAFE_WAIT_RESUME_CODES[number])
+      && SAFE_WAIT_RESUME_STAGES.includes(match[2] as typeof SAFE_WAIT_RESUME_STAGES[number])
+      ? [{ code: match[1], stage: match[2] }] : []
+  })
   try {
     const [turn, graph, steps, tasks, parentSteps, waits, tools] = await Promise.all([
       progressQuery<{ status: string }>(`SELECT CASE WHEN "status" IN ('queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval',
@@ -133,7 +149,7 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
     }))
     const acknowledgement = await readWaitAcknowledgementDiagnostic(ids)
     return {
-      observedPhases, fixtureFailure,
+      observedPhases, fixtureFailure, waitResumeCommitFailures,
       turnStatus: turn.rows[0]?.status ?? "missing",
       graphRecordCount: graph.rows.length,
       graphNodeCount: graph.rows[0]?.nodeCount ?? 0,
@@ -145,7 +161,7 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       waitAcknowledgement: acknowledgement,
     }
   } catch {
-    return { observedPhases, fixtureFailure, databaseDiagnosticAvailable: false }
+    return { observedPhases, fixtureFailure, waitResumeCommitFailures, databaseDiagnosticAvailable: false }
   }
 }
 
@@ -156,7 +172,7 @@ async function readWaitAcknowledgementDiagnostic(ids: FixtureIds) {
     sourceStepCount: number; sourceStepStatus: string; sourceStepScopeOk: boolean; sourceAttemptOk: boolean;
     targetExpectedCount: number; targetBoundCount: number; targetLineageCount: number; targetTerminalCount: number;
     callCount: number; callInputMatches: boolean; resultCount: number; waitingResultShapeOk: boolean;
-    continuationCount: number; firstContinuationReady: boolean;
+    continuationCount: number; firstContinuationAfterSourceReady: boolean;
     sourceEventKeyCount: number; sourceEventHeadersMatch: boolean; sourceEventSequenceOrdered: boolean;
   }
   try {
@@ -290,8 +306,8 @@ async function readWaitAcknowledgementDiagnostic(ids: FixtureIds) {
                 THEN (SELECT "targetTaskIds" FROM selected_wait) ELSE '[]'::jsonb END) ORDER BY 1)
           ELSE false END FROM first_result), false) AS "waitingResultShapeOk",
         (SELECT count(*)::int FROM continuations) AS "continuationCount",
-        COALESCE((SELECT "status" = 'streaming' AND "ordinal" = (SELECT "sourceOrdinal" + 1 FROM source_step)
-          FROM continuations ORDER BY "ordinal", "id" LIMIT 1), false) AS "firstContinuationReady",
+        COALESCE((SELECT "status" = 'streaming' AND "ordinal" > (SELECT "sourceOrdinal" FROM source_step)
+          FROM continuations ORDER BY "ordinal", "id" LIMIT 1), false) AS "firstContinuationAfterSourceReady",
         (SELECT count("id")::int FROM event_rows) AS "sourceEventKeyCount",
         COALESCE((SELECT count("id") = 6 AND bool_and("actor" = 'subagent' AND "type" = "expectedType"
             AND "itemId" = "expectedItemId" AND "correlationId" = "expectedCorrelationId") FROM event_rows), false) AS "sourceEventHeadersMatch",

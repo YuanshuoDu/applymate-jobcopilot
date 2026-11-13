@@ -9,6 +9,9 @@ import type { SubagentLease } from "./types.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import type { TurnEngineStore } from "../turns/turn-engine-types.js"
 import type { PublicToolDefinition } from "../tools/types.js"
+import type { ChildToolRuntime } from "./child-executor.js"
+import type { ChildAttemptResume } from "./child-resume.js"
+import type { DurableWaitResume } from "./child-resume-observations.js"
 import { createJobDiscoveryClient, type JobDiscoveryRequest } from "../tools/job-discovery-client.js"
 import { InMemoryArtifactToolStore } from "../tools/artifact-tools.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
@@ -95,6 +98,29 @@ function store(): TurnEngineStore {
     appendEvent: async ({ id }) => ({ id }),
     recordFinalResponse: async () => undefined,
   }
+}
+
+function productionWaitResumeFixture() {
+  const child: SubagentLease = { ...lease(), role: "scout", taskType: "job_discovery", allowedActions: ["wait_subagents"],
+    context: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER }, leaseExpiresAt: new Date("2099-09-14T11:30:00.000Z") }
+  const input = { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all" as const, timeoutMs: 5_000 }
+  const output = { waitId: "wait-1", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-09-14T11:30:00.000Z",
+    matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: {}, failureReason: null }] }
+  const durableWait: DurableWaitResume = { waitId: "wait-1", stepId: `task:${child.id}:step:4:attempt:${child.attemptCount}`,
+    attempt: child.attemptCount, ordinal: 18, toolCallId: "old-wait-call", sourceItemId: "old-wait-result", input, output }
+  const restored: ChildAttemptResume = {
+    resume: { nextOrdinal: 5, stepCount: 5, toolCallCount: 1, inputThroughSequence: 18n, consumedInputIds: [],
+      usage: { inputTokens: 21, outputTokens: 8, estimatedCostUsd: 0.12 } },
+    observations: [{ id: "child-resume:old-wait-result", content: { toolCallId: "old-wait-call", toolName: "wait_subagents",
+      input, status: "completed", output, errorCode: null } }], durableWait,
+  }
+  const turnStore: TurnEngineStore = { ...store(), startStep: async ({ stepId }) => ({ id: stepId, ordinal: 39 }) }
+  const model: ModelAdapter = { id: "fixture-model", profile, async *stream() {
+    yield { type: "text_delta", text: "continued after durable wait" }
+    yield { type: "completed", finishReason: "stop" }
+  } }
+  const tools: ChildToolRuntime = { definitions: [], router: { execute: async () => { throw new Error("unexpected tool call") } }, validateArguments: () => true }
+  return { child, durableWait, turnStore, model, tools, resumeLoader: async () => restored }
 }
 
 function recordingStore() {
@@ -415,6 +441,32 @@ function policySnapshot(outcome: "allow" | "deny", tools?: string[]) {
 }
 
 describe("production child runtime", () => {
+  it("forwards a supplied durable-wait committer through production child composition", async () => {
+    const fixture = productionWaitResumeFixture(), pool = { connect: vi.fn(), query: vi.fn() }
+    const committer = vi.fn(async () => true)
+    const executor = createProductionChildExecutor({ pool: pool as never, turnStore: fixture.turnStore, treeBudget: budget(),
+      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => fixture.model,
+      toolRuntimeFactory: () => fixture.tools, mailboxReader: emptyMailboxReader, resumeLoader: fixture.resumeLoader,
+      durableWaitResumeCommitter: committer })
+
+    await expect(executor({ lease: fixture.child })).resolves.toMatchObject({
+      status: "completed", result: { finalText: "continued after durable wait" },
+    })
+    expect(committer).toHaveBeenCalledWith(fixture.child, fixture.durableWait, 39)
+    expect(pool.connect).not.toHaveBeenCalled()
+  })
+
+  it("keeps the production PostgreSQL committer when no override is supplied", async () => {
+    const fixture = productionWaitResumeFixture()
+    const pool = { connect: vi.fn(async () => { throw new Error("fixture connection unavailable") }), query: vi.fn() }
+    const executor = createProductionChildExecutor({ pool: pool as never, turnStore: fixture.turnStore, treeBudget: budget(),
+      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => fixture.model,
+      toolRuntimeFactory: () => fixture.tools, mailboxReader: emptyMailboxReader, resumeLoader: fixture.resumeLoader })
+
+    await expect(executor({ lease: fixture.child })).resolves.toMatchObject({ status: "failed" })
+    expect(pool.connect).toHaveBeenCalledOnce()
+  })
+
   it("composes the exact generic-Scout discovery exception without widening internal writes", () => {
     const scout = createProductionChildPolicy({ role: "scout", taskType: "discovery", toolPolicySnapshot: policySnapshot("deny") }, false)
     expect(discoveryDecision(scout)).toMatchObject({ outcome: "allow", reasonCode: "server_scout_job_discovery_write" })

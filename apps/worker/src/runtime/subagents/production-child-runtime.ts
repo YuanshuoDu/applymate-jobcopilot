@@ -49,6 +49,7 @@ export type ProductionChildRuntimeOptions = {
   readonly mailboxReader?: ChildExecutorOptions["mailboxReader"]
   readonly resumeLoader?: ChildExecutorOptions["resumeLoader"]
   readonly sameAttemptContinuationLoader?: ChildExecutorOptions["sameAttemptContinuationLoader"]
+  readonly durableWaitResumeCommitter?: ChildExecutorOptions["durableWaitResumeCommitter"]
   readonly subagentManager?: () => Pick<AgentTreeManager, "spawnFromLease"> | undefined
   readonly jobDiscoveryClient?: JobDiscoveryClient
   readonly applicationFillStageObserver?: Parameters<typeof import("./application-fill-for-review.js").executeApplicationFillForReview>[0]["stageObserver"]
@@ -234,9 +235,9 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
           authorizeUsage, treeBudget, modelRuntimeFactory: options.modelRuntimeFactory,
         }, options.subagentManager)),
         mailboxReader: options.mailboxReader ?? defaultMailboxReader(options.pool), resumeLoader: options.resumeLoader ?? resumeLoaders.resumeLoader,
-        durableWaitResumeCommitter: (lease, wait, nextStepOrdinal) => commitDurableSubagentWaitResume(options.pool, lease, {
+        durableWaitResumeCommitter: options.durableWaitResumeCommitter ?? ((lease, wait, nextStepOrdinal) => commitDurableSubagentWaitResume(options.pool, lease, {
           waitId: wait.waitId, stepId: wait.stepId, nextStepOrdinal,
-        }),
+        })),
         sameAttemptContinuationLoader: options.sameAttemptContinuationLoader ?? resumeLoaders.sameAttemptContinuationLoader,
       })
     }

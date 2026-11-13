@@ -3,6 +3,7 @@ import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
 import { createProductionChildExecutor } from "./production-child-runtime.ts"
+import { commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.ts"
 import { createProductionWorkerBootstrap } from "../../queue/production-bootstrap.ts"
 import { createSubagentQueue } from "../../queue/subagent-queue.ts"
 import { enqueueTurn } from "../turns/turn-queue.ts"
@@ -54,6 +55,33 @@ process.stdin.on("data", chunk => {
   }
 })
 function say(value) { process.stdout.write(value + "\n") }
+const ACK_ERROR_CODES = new Set(["wait_invalid", "wait_scope_error", "wait_conflict"])
+const ACK_LIFECYCLE_STAGES = new Set([
+  "required_value", "resume_scope", "source_step", "source_call_count", "source_call_input", "source_item_set", "wait_record_shape",
+  "provenance_marker", "source_receipt_missing", "source_marker_without_result", "source_recovered_receipt_mismatch",
+  "source_waiting_content", "source_waiting_output_shape", "source_waiting_identity", "source_waiting_targets",
+  "source_waiting_matched_ids", "source_waiting_tasks", "source_waiting_task_ids", "source_waiting_deadline",
+  "source_initial_call_shape", "source_call_completion_state", "source_result_completion_state", "source_call_completion_content",
+  "source_result_completion_content", "source_waiting_output_missing", "source_event_chain", "reconciliation", "safe_result_shape",
+  "source_start_event",
+])
+function waitResumeCommitter() {
+  return async (lease, wait, nextStepOrdinal) => {
+    try {
+      return await commitDurableSubagentWaitResume(pool, lease, {
+        waitId: wait.waitId, stepId: wait.stepId, nextStepOrdinal,
+      })
+    } catch (error) {
+      try {
+        const record = error && typeof error === "object" ? error : {}
+        const code = ACK_ERROR_CODES.has(record.code) ? record.code : "other"
+        const stage = ACK_LIFECYCLE_STAGES.has(record.sourceLifecycleStage) ? record.sourceLifecycleStage : "other"
+        say(`P1143_WAIT_RESUME_COMMIT_DIAGNOSTIC:${code}:${stage}`)
+      } catch {}
+      throw error
+    }
+  }
+}
 const { rootModelRuntime, discoveryClient, childModelRuntime } = createNestedScoutFixtureScripts({ mode, profile, ids, pool, say,
   pauseSubagentClaims, reportParentJoinState })
 function command(name) {
@@ -72,7 +100,7 @@ async function start(mode) {
   const markerState = { closedStepRejected: false, parallelObserved: false }
   const executeChild = createProductionChildExecutor({ pool, subagentManager: () => runtime.manager,
     authorizeUsage: async () => ({ settle: async () => undefined }), jobDiscoveryClient: discoveryClient(),
-    modelRuntimeFactory: input => childModelRuntime({ ...input, runtime, markerState }) })
+    modelRuntimeFactory: input => childModelRuntime({ ...input, runtime, markerState }), durableWaitResumeCommitter: waitResumeCommitter() })
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 100,
     waitResolver: { intervalMs: 20, ownerId: `${ownerId}-wait-resolver` },
     subagents: { intervalMs: 20, execute: executeChild, queueFactory: options => {
