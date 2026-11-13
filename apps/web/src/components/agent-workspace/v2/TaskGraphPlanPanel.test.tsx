@@ -115,6 +115,70 @@ describe('TaskGraphPlanPanel', () => {
     } finally { vi.unstubAllGlobals() }
   })
 
+  it('shows only failed or unverified checks from an indexed target in the current ledger', () => {
+    const graphItems = [item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+      { key: 'failed-target', templateId: 'scout', goal: 'Find candidates', successCriteria: ['Collect evidence'], dependsOn: [], depth: 1, taskId: 'failed-target-task' },
+      { key: 'unverified-target', templateId: 'analyst', goal: 'Assess candidates', successCriteria: ['Assess evidence'], dependsOn: [], depth: 1, taskId: 'unverified-target-task' },
+      { key: 'repair-failed', templateId: 'scout', goal: 'Repair candidate evidence', successCriteria: ['Collect evidence'], dependsOn: [], depth: 1, taskId: 'repair-failed-task' },
+      { key: 'repair-unverified', templateId: 'analyst', goal: 'Repair candidate assessment', successCriteria: ['Assess evidence'], dependsOn: [], depth: 1, taskId: 'repair-unverified-task' },
+    ] })]
+    const ownedTasks: SupervisorTaskSummary[] = [
+      { ...tasks[0]!, goal: 'Root plan' },
+      ...[
+        ['failed-target-task', 'Find candidates', 'scout', 'scout'],
+        ['unverified-target-task', 'Assess candidates', 'analyst', 'analyst'],
+        ['repair-failed-task', 'Repair candidate evidence', 'scout', 'scout'],
+        ['repair-unverified-task', 'Repair candidate assessment', 'analyst', 'analyst'],
+      ].map(([id, goal, role, taskType]) => ({ ...tasks[1]!, id: id!, goal: goal!, role: role!, taskType: taskType! })),
+    ]
+    const baseProjection = projectCurrentTaskGraph(graphItems, ownedTasks, 'session-1')!
+    const projection = { ...baseProjection, nodes: baseProjection.nodes.map(node => node.key === 'repair-failed'
+      ? { ...node, repairTargetGoal: 'Find candidates', repairTargetNodeIndex: 0 }
+      : node.key === 'repair-unverified'
+        ? { ...node, repairTargetGoal: 'Assess candidates', repairTargetNodeIndex: 1 } : node) }
+    const identity = selectedTaskGraphIdentity(graphItems, 'session-1')!
+    const verificationSummary = { schemaVersion: 1, nodes: [
+      { status: 'failed', checks: [
+        { kind: 'candidate_count_gte', minimum: 2, status: 'passed' },
+        { kind: 'evidence_count_gte', minimum: 1, status: 'failed' },
+      ], totalCount: 2, passedCount: 1, failedCount: 1, unverifiedCount: 0 },
+      { status: 'unverified', checks: [
+        { kind: 'finding_count_gte', minimum: 1, status: 'unverified' },
+      ], totalCount: 1, passedCount: 0, failedCount: 0, unverifiedCount: 1 },
+      null, null,
+    ] }
+    const panel = (ledger?: unknown) => renderToStaticMarkup(<TaskGraphPlanPanel
+      sessionId="session-1" items={graphItems} tasks={ownedTasks} ledger={ledger}
+    />)
+    const html = panel({ identity, projection, verificationSummary })
+    const attentionBlocks = [...html.matchAll(/<div data-task-graph-repair-attention="true">([\s\S]*?)<\/div>/g)].map(match => match[1]!)
+
+    expect(attentionBlocks).toHaveLength(2)
+    expect(attentionBlocks[0]).toContain('Related checks needing attention')
+    expect(attentionBlocks[0]).toContain('Verification: Failed')
+    expect(attentionBlocks[0]).toContain('1 failed')
+    expect(attentionBlocks[0]).toContain('At least this many evidence items: 1')
+    expect(attentionBlocks[0]).not.toContain('Passed')
+    expect(attentionBlocks[1]).toContain('Verification: Not verified')
+    expect(attentionBlocks[1]).toContain('1 unverified')
+    expect(attentionBlocks[1]).toContain('At least this many findings: 1')
+    expect(html).not.toMatch(/criterionId|taskId|repairOf|PRIVATE_REVIEW_TEXT/)
+
+    const mismatchedIdentities = [
+      { ...identity, sessionId: 'session-2' }, { ...identity, graphItemId: 'foreign-graph' },
+      { ...identity, turnId: 'older-turn' }, { ...identity, rootTaskId: 'foreign-root' },
+      { ...identity, revision: identity.revision - 1 },
+    ]
+    for (const mismatchedIdentity of mismatchedIdentities) {
+      expect(panel({ identity: mismatchedIdentity, projection, verificationSummary })).not.toContain('data-task-graph-repair-attention')
+    }
+    const mismatchedLink = { ...projection, nodes: projection.nodes.map(node => node.key === 'repair-failed'
+      ? { ...node, repairTargetGoal: 'Wrong goal' } : node) }
+    const invalid = panel({ identity, projection: mismatchedLink, verificationSummary })
+    expect(invalid).not.toContain('data-task-graph-repair-attention')
+    expect(invalid).not.toContain('Related checks needing attention')
+  })
+
   it('renders only a valid identity-matched positional verification sidecar and preserves legacy plans', () => {
     const verification = { schemaVersion: 'agent-harness.v2.task-graph-verification.v1', role: 'scout', criteria: [
       { id: 'candidate-count', check: { kind: 'candidate_count_gte', minimum: 2 } },

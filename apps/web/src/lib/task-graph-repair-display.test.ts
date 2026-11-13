@@ -7,6 +7,7 @@ import {
 import {
   decoratePlanLedgerRepairTargets,
   parsePlanLedgerWithRepairTargets,
+  projectRepairAttentionSummaries,
   redactTaskGraphTimelineContent,
 } from './task-graph-repair-display'
 
@@ -51,13 +52,35 @@ function ledger(rawGraph: unknown = graph()) {
 describe('TaskGraph repair display projection', () => {
   it('adds only the same-root target goal from a strict repair relation', () => {
     const value = graph()
-    const decorated = decoratePlanLedgerRepairTargets(ledger(value), value, rootTaskId)
+    const base = ledger(value)
+    const inputSnapshot = JSON.stringify({ base, value })
+    const decorated = decoratePlanLedgerRepairTargets(base, value, rootTaskId)
     expect(decorated.nodes).toEqual([
       expect.objectContaining({ key: 'target', goal: 'Find target roles' }),
-      expect.objectContaining({ key: 'repair', repairTargetGoal: 'Find target roles' }),
+      expect.objectContaining({ key: 'repair', repairTargetGoal: 'Find target roles', repairTargetNodeIndex: 0 }),
     ])
+    expect(JSON.stringify({ base, value })).toBe(inputSnapshot)
     expect(decorated.nodes[0]).not.toHaveProperty('repairTargetGoal')
+    expect(parsePlanLedgerWithRepairTargets(decorated)).toEqual(decorated)
     expect(JSON.stringify(decorated)).not.toMatch(/repairOf|criterionIds|finding-count/)
+  })
+
+  it('binds duplicate public goal text to the strictly matched target index', () => {
+    const baseGraph = graph()
+    const duplicateGraph = {
+      ...baseGraph,
+      nodes: [
+        baseGraph.nodes[0],
+        { ...baseGraph.nodes[0], key: 'other-target', taskId: 'other-task' },
+        baseGraph.nodes[1],
+      ],
+    }
+    const decorated = decoratePlanLedgerRepairTargets(ledger(duplicateGraph), duplicateGraph, rootTaskId)
+    const repair = decorated.nodes.find(node => node.key === 'repair')
+
+    expect(decorated.nodes.filter(node => node.goal === 'Find target roles')).toHaveLength(2)
+    expect(repair).toMatchObject({ repairTargetGoal: 'Find target roles', repairTargetNodeIndex: 0 })
+    expect(parsePlanLedgerWithRepairTargets(decorated)?.nodes.find(node => node.key === 'repair')).toMatchObject({ repairTargetNodeIndex: 0 })
   })
 
   it('omits labels for missing root, wrong root, wrong target identity, self and legacy relations', () => {
@@ -72,6 +95,7 @@ describe('TaskGraph repair display projection', () => {
     for (const [raw, trustedRoot] of cases) {
       const projected = decoratePlanLedgerRepairTargets(base, raw, trustedRoot)
       expect(projected.nodes.some(node => 'repairTargetGoal' in node)).toBe(false)
+      expect(projected.nodes.some(node => 'repairTargetNodeIndex' in node)).toBe(false)
     }
   })
 
@@ -97,6 +121,62 @@ describe('TaskGraph repair display projection', () => {
     expect(parsePlanLedgerWithRepairTargets({
       ...base, nodes: base.nodes.map(node => node.key === 'repair' ? { ...node, repairTargetGoal: 'Unlisted goal' } : node),
     })).toBeNull()
+    expect(parsePlanLedgerWithRepairTargets({
+      ...base, nodes: base.nodes.map(node => node.key === 'repair' ? { ...node, repairTargetGoal: target.goal, repairTargetNodeIndex: 1 } : node),
+    })).toBeNull()
+    expect(parsePlanLedgerWithRepairTargets({
+      ...base, nodes: base.nodes.map(node => node.key === 'repair' ? { ...node, repairTargetGoal: target.goal, repairTargetNodeIndex: 8 } : node),
+    })).toBeNull()
+    expect(parsePlanLedgerWithRepairTargets({
+      ...base, nodes: base.nodes.map(node => node.key === 'repair' ? { ...node, repairTargetGoal: 'Different goal', repairTargetNodeIndex: 0 } : node),
+    })).toBeNull()
+  })
+
+  it('projects only failed or unverified checks from the indexed target', () => {
+    const projection = decoratePlanLedgerRepairTargets(ledger(), graph(), rootTaskId)
+    const failedSummary = {
+      schemaVersion: 1 as const,
+      nodes: [
+        { status: 'failed' as const, checks: [
+          { kind: 'candidate_count_gte' as const, minimum: 1, status: 'passed' as const },
+          { kind: 'evidence_count_gte' as const, minimum: 2, status: 'failed' as const },
+        ], totalCount: 2, passedCount: 1, failedCount: 1, unverifiedCount: 0 },
+        null,
+      ],
+    }
+    const summarySnapshot = JSON.stringify(failedSummary)
+    const failed = projectRepairAttentionSummaries(projection, failedSummary)
+    expect(failed[1]).toEqual({ status: 'failed', checks: [
+      { kind: 'evidence_count_gte', minimum: 2, status: 'failed' },
+    ], totalCount: 1, passedCount: 0, failedCount: 1, unverifiedCount: 0 })
+    expect(JSON.stringify(failed)).not.toMatch(/criterionIds|finding-count|taskId|rootTaskId/)
+    expect(JSON.stringify(failedSummary)).toBe(summarySnapshot)
+
+    const unverifiedSummary = {
+      schemaVersion: 1 as const,
+      nodes: [
+        { status: 'unverified' as const, checks: [
+          { kind: 'finding_count_gte' as const, minimum: 1, status: 'unverified' as const },
+        ], totalCount: 1, passedCount: 0, failedCount: 0, unverifiedCount: 1 },
+        null,
+      ],
+    }
+    expect(projectRepairAttentionSummaries(projection, unverifiedSummary)[1]).toEqual({
+      status: 'unverified', checks: [{ kind: 'finding_count_gte', minimum: 1, status: 'unverified' }],
+      totalCount: 1, passedCount: 0, failedCount: 0, unverifiedCount: 1,
+    })
+    expect(projectRepairAttentionSummaries(projection, {
+      schemaVersion: 1, nodes: [{ status: 'passed', checks: [{ kind: 'candidate_count_gte', minimum: 1, status: 'passed' }],
+        totalCount: 1, passedCount: 1, failedCount: 0, unverifiedCount: 0 }, null],
+    })[1]).toBeNull()
+    expect(projectRepairAttentionSummaries(projection, { schemaVersion: 1, nodes: [{ status: 'unavailable' }, null] })[1]).toBeNull()
+    expect(projectRepairAttentionSummaries(projection, { schemaVersion: 1, nodes: [null] })[1]).toBeNull()
+    expect(projectRepairAttentionSummaries(projection, null)).toEqual([null, null])
+
+    const legacy = parsePlanLedgerWithRepairTargets({
+      ...ledger(), nodes: ledger().nodes.map(node => node.key === 'repair' ? { ...node, repairTargetGoal: 'Find target roles' } : node),
+    })!
+    expect(projectRepairAttentionSummaries(legacy, failedSummary)[1]).toBeNull()
   })
 
   it('retains strict rejection of unknown display fields', () => {
