@@ -8544,6 +8544,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const verificationRepairOwner = fixture()
   const lateRepairOwner = fixture()
   const locationRepairOwner = fixture()
+  const locationMismatchOwner = fixture()
   const locationConflictOwner = fixture()
   const locationForeignOwner = fixture()
   const leaseRecoveryOwner = fixture()
@@ -8608,6 +8609,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const locationRepairLimits = { ...DISCOVERY_FIXTURE_TURN_LIMITS,
       maxSteps: VERIFICATION_REPAIR_STEP_BUDGET, maxToolCalls: VERIFICATION_REPAIR_TOOL_BUDGET }
     await seed(pool, locationRepairOwner, "waiting_for_user", locationRepairLimits)
+    await seed(pool, locationMismatchOwner, "waiting_for_user", locationRepairLimits)
     await seed(pool, locationConflictOwner, "waiting_for_user", locationRepairLimits)
     await seed(pool, locationForeignOwner, "waiting_for_user")
     await seed(pool, leaseRecoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
@@ -8643,7 +8645,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     const fixtureOwners = [owner, resumeFailureOwner, failureOwner, operationalFailureOwner, operationalDeadlineOwner, operationalAppendOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner,
       discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner,
-      locationRepairOwner, locationConflictOwner, locationForeignOwner, leaseRecoveryOwner,
+      locationRepairOwner, locationMismatchOwner, locationConflictOwner, locationForeignOwner, leaseRecoveryOwner,
       coverageRepairOwner, scoutUnionOwner, emptyAnalystOwner, emptyAnalystOrphanOwner, emptyAnalystCurrentReceiptOwner,
       emptyAnalystMutationOwner, rootRecoveryScanOwner, archivedWaitOwner]
     const allFixtureWorkersExited = [...fixtureProcessChildren].every(processFixtureExited)
@@ -14281,9 +14283,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     ["evidence-bound criterion failure", verificationRepairOwner, false, false],
     ["null-digest hard executor failure", lateRepairOwner, true, false],
     ["location-enabled Scout repair", locationRepairOwner, false, true],
+    ["location-mismatch replacement with a compliant new Job", locationMismatchOwner, false, true, true],
     ["conflicting current-attempt Scout locations", locationConflictOwner, false, true],
-  ] as const)("enforces same-turn Scout repair evidence after %s", async (_scenario, value, hardExecutorFailure, locationEnabled) => {
+  ] as const)("enforces same-turn Scout repair evidence after %s", async (_scenario, value, hardExecutorFailure, locationEnabled, locationMismatch: boolean = false) => {
     const locationConflict = _scenario === "conflicting current-attempt Scout locations"
+    const repairCriterionId = locationMismatch ? "candidate-location" : "candidate-count"
     const [workerQueue, canonical, commandPortModule, subagentQueue] = await Promise.all([
       import("../../queue/production-bootstrap.js"),
       import("../canonical-turn-runtime.js"),
@@ -14297,13 +14301,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await activateFixtureTurn(pool!, value)
     const firstJobId = fixtureJobId(value.suffix)
     const secondJobId = fixtureJobId(value.suffix, 1)
+    const thirdJobId = fixtureJobId(value.suffix, 2)
     await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
       value.turnId, JSON.stringify({ goal: "Find and verify engineering roles" }), value.sessionId, value.userId,
     ])
-    const insertJob = async (jobId: string) => pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
-      VALUES ($1, $2, $3, 'Software Engineer', 'Dublin', 'saved', $4, 'Persisted verification fixture', 'greenhouse', CURRENT_TIMESTAMP)
-      ON CONFLICT ("id") DO NOTHING`, [jobId, value.userId, `Verifier Fixture ${jobId}`, `https://jobs.example.invalid/${jobId}`])
-    await insertJob(firstJobId)
+    const insertJob = async (jobId: string, location = "Dublin") => pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
+      VALUES ($1, $2, $3, 'Software Engineer', $4, 'saved', $5, 'Persisted verification fixture', 'greenhouse', CURRENT_TIMESTAMP)
+      ON CONFLICT ("id") DO NOTHING`, [jobId, value.userId, `Verifier Fixture ${jobId}`, location, `https://jobs.example.invalid/${jobId}`])
+    await insertJob(firstJobId, locationMismatch ? "Berlin" : "Dublin")
+    if (locationMismatch) await insertJob(secondJobId)
 
     const flags: ProductionAgentFlags = {
       taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
@@ -14315,13 +14321,17 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
       supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const,
     }
+    const locationGuard = {
+      id: "candidate-location",
+      check: { kind: "candidate_location_in", locations: locationMismatch ? ["Dublin"] : ["Cork", "Dublin"] },
+    } as const
     const scoutVerification = locationEnabled
       ? {
         schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2,
         role: "scout",
         criteria: [
           { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } },
-          { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Cork", "Dublin"] } },
+          locationGuard,
         ],
       } as const
       : {
@@ -14329,6 +14339,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         role: "scout",
         criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } }],
       } as const
+    const repairVerification = locationMismatch
+      ? { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout", criteria: [locationGuard] } as const
+      : scoutVerification
+    const repairVerificationCriterionIds = locationMismatch
+      ? ["candidate-location"]
+      : ["candidate-count", ...(locationEnabled ? ["candidate-location"] : [])]
     const initialPlanCallId = `p3-verifier-repair-initial-plan:${value.turnId}`
     const initialWaitCallId = `p3-verifier-repair-initial-wait:${value.turnId}`
     const repairPlanCallId = `p3-verifier-repair-plan:${value.turnId}`
@@ -14353,7 +14369,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let repairWaitReaderVisible: boolean | null = null
     let repairWaitResolutionReturned = false
     let repairWaitResolvedOutcomeObserved = false
-    let secondJobSeeded = false
+    let repairJobSeeded = false
     let initialPlanTaskIds: string[] | undefined
     let terminalGateLease: TurnLease | undefined
     let failedReportBeforeRepair: unknown
@@ -14555,7 +14571,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 return
               }
               if (!repairPlanSent) {
-                if (!secondJobSeeded) { await insertJob(secondJobId); secondJobSeeded = true }
+                if (!repairJobSeeded) {
+                  await insertJob(locationMismatch ? thirdJobId : secondJobId)
+                  repairJobSeeded = true
+                }
                 if (locationConflict) {
                   const changedLocation = await pool!.query(`UPDATE "Job" SET "location" = 'Cork', "updatedAt" = CURRENT_TIMESTAMP
                     WHERE "id" = $1 AND "userId" = $2 RETURNING "id"`, [firstJobId, value.userId])
@@ -14572,7 +14591,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 if (hardExecutorFailure) {
                   expectUnverifiedVerificationReport(failedReportBeforeRepair, "candidate-count")
                 } else if (locationEnabled) {
-                  expect(record(failedReportBeforeRepair)).toMatchObject({ status: "failed", reasonCode: "criterion_not_met", criteria: [
+                  expect(record(failedReportBeforeRepair)).toMatchObject({ status: "failed", reasonCode: "criterion_not_met", criteria: locationMismatch ? [
+                    { criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" },
+                    { criterionId: "candidate-location", status: "failed", reasonCode: "criterion_not_met" },
+                  ] : [
                     { criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" },
                     { criterionId: "candidate-location", status: "passed", reasonCode: "criteria_met" },
                   ] })
@@ -14606,13 +14628,22 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                     scope: verificationScope(value.userId, currentAttempt), snapshot, node, structuredResult, includeObservedLocation: true,
                   })
                   expect(currentProof.report.status).toBe("failed")
-                  expect(currentProof.report.criteria).toEqual([
+                  expect(currentProof.report.criteria).toEqual(locationMismatch ? [
+                    { criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" },
+                    { criterionId: "candidate-location", status: "failed", reasonCode: "criterion_not_met" },
+                  ] : [
                     { criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" },
                     { criterionId: "candidate-location", status: "passed", reasonCode: "criteria_met" },
                   ])
                   expect(currentProof.projection).toMatchObject({
                     schemaVersion: "agent-harness.v2.task-graph-verification-evidence.v2",
-                    role: "scout", candidates: [{ jobId: firstJobId, observedLocation: "dublin", locationEvidenceStatus: "verified" }],
+                    role: "scout",
+                    candidates: locationMismatch ? [
+                      { jobId: firstJobId, observedLocation: "berlin", locationEvidenceStatus: "verified" },
+                      { jobId: secondJobId, observedLocation: "dublin", locationEvidenceStatus: "verified" },
+                    ] : [
+                      { jobId: firstJobId, observedLocation: "dublin", locationEvidenceStatus: "verified" },
+                    ],
                   })
                   const foreignProof = await reverifyFailedTaskGraphNodeEvidence(pool!, {
                     scope: verificationScope(locationForeignOwner.userId, currentAttempt), snapshot, node, structuredResult, includeObservedLocation: true,
@@ -14638,11 +14669,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   }
                 }
                 repairPlanSent = true
-                const repairOf = { nodeKey: "scout", taskId: scout.taskId, criterionIds: ["candidate-count"] }
+                const repairOf = { nodeKey: "scout", taskId: scout.taskId, criterionIds: [repairCriterionId] }
                 expect(repairOf).not.toHaveProperty("graphRootTaskId")
                 yield { type: "tool_call_completed", callId: repairPlanCallId, name: "agent.plan", arguments: {
                   expectedRevision: graph.revision,
-                  nodes: [{ key: "scout-repair", templateId: "scout", goal: "Recheck after new owner evidence is available", successCriteria: ["Return two evidence-bound candidates"], dependsOn: [], verification: scoutVerification,
+                  nodes: [{ key: "scout-repair", templateId: "scout", goal: "Recheck after new owner evidence is available", successCriteria: ["Return two evidence-bound candidates"], dependsOn: [], verification: repairVerification,
                     repairOf }],
                 } }
                 yield { type: "completed", finishReason: "tool_calls" }
@@ -14664,10 +14695,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             if (repair?.status === "completed" && dependent?.status === "completed" && allRequiredAnalystsVerified) {
               if (!hardExecutorFailure) expect(repairWaitStatuses.at(-1)).toBe("ready")
-              expectPassedVerificationReport(repair.verificationReport, "candidate-count", ...(locationEnabled ? ["candidate-location"] : []))
+              expectPassedVerificationReport(repair.verificationReport, ...repairVerificationCriterionIds)
               expect(record(repair.repairReceipt)).toMatchObject({
                 graphRootTaskId: expect.any(String), targetNodeKey: "scout", targetTaskId: scout?.taskId,
-                criterionIds: ["candidate-count"], repairNodeKey: "scout-repair", repairTaskId: repair.taskId,
+                criterionIds: [repairCriterionId], repairNodeKey: "scout-repair", repairTaskId: repair.taskId,
               })
               expectPassedVerificationReport(dependent.verificationReport, "finding-count")
               yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "The verified shortlist is ready" }) }
@@ -14727,8 +14758,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           initialScoutReadDiagnostic.taskUserMatchesFixture = task.userId === value.userId
         }
         const jobIds = task.goal === "Find at least two owner jobs"
-          ? [firstJobId]
-          : [firstJobId, secondJobId]
+          ? locationMismatch ? [firstJobId, secondJobId] : [firstJobId]
+          : locationMismatch ? [secondJobId, thirdJobId] : [firstJobId, secondJobId]
         const callIds = jobIds.map((_, index) =>
           "p3-verifier-repair-read:" + value.sessionId + ":" + value.turnId + ":" + task.id + ":" + task.attemptCount + ":" + index)
         if (task.goal === "Find at least two owner jobs") initialScoutReadDiagnostic.expectedLookupCount = jobIds.length
@@ -14878,8 +14909,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             const repair = await pool!.query<{ id: string; status: string; result: unknown }>(`SELECT "id", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "goal" = $3`, [value.turnId, value.sessionId, "Recheck after new owner evidence is available"])
             const repairResult = record(repair.rows[0]?.result)
             expect(repair.rows[0]?.status).toBe("completed")
-            expectPassedVerificationReport(repairResult?.taskGraphVerificationReport, "candidate-count")
-            expect(record(repairResult?.taskGraphRepairReceipt)).toMatchObject({ targetNodeKey: "scout", criterionIds: ["candidate-count"], repairNodeKey: "scout-repair", repairTaskId: repair.rows[0]?.id })
+            expectPassedVerificationReport(repairResult?.taskGraphVerificationReport, ...repairVerificationCriterionIds)
+            expect(record(repairResult?.taskGraphRepairReceipt)).toMatchObject({ targetNodeKey: "scout", criterionIds: [repairCriterionId], repairNodeKey: "scout-repair", repairTaskId: repair.rows[0]?.id })
             const dispatch = await pool!.query<{ id: string }>(`SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`, [value.sessionId, `subagent-dispatch:${lease.id}`])
             expect(dispatch.rows).toHaveLength(1)
           }
@@ -15032,7 +15063,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(repairWaitReadCallIds.length).toBeLessThanOrEqual(VERIFICATION_REPAIR_MAX_REFERENCE_READS)
       expect(repairWaitReferenceObserved).toBe(repairWaitReadCallIds.length > 0)
     }
-    expect(secondJobSeeded).toBe(true)
+    expect(repairJobSeeded).toBe(true)
     const turn = await pool!.query<{ status: string; finalResponse: string | null; rootTaskId: string | null }>(`SELECT "status", "finalResponse", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId])
     expect(turn.rows[0]?.status).toBe("completed")
     const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue
@@ -15042,7 +15073,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await expectGroundedTaskGraphFinalCopies(pool!, value, rootTaskId, finalResponse, "The verified shortlist is ready")
     const rejection = await pool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'final.rejected' AND "payload"->>'blocker' = 'task_graph_verification_unverified'`, [value.turnId, value.sessionId])
     expect(rejection.rowCount).toBeGreaterThan(0)
-    const tasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown }>(`SELECT "id", "goal", "status", "failureReason", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3`, [value.turnId, value.sessionId, rootTaskId])
+    const tasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown; context: unknown }>(`SELECT "id", "goal", "status", "failureReason", "result", "context" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3`, [value.turnId, value.sessionId, rootTaskId])
     const original = tasks.rows.find(task => task.goal === "Find at least two owner jobs")
     const repaired = tasks.rows.find(task => task.goal === "Recheck after new owner evidence is available")
     const analyst = tasks.rows.find(task => task.goal === "Score only after Scout proof")
@@ -15053,23 +15084,60 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     })
     expect(record(record(original?.result)?.taskGraphVerificationReport)).toEqual(failedReportBeforeRepair)
     if (hardExecutorFailure) expectUnverifiedVerificationReport(failedReportBeforeRepair, "candidate-count")
-    else if (locationEnabled) expect(record(failedReportBeforeRepair)).toMatchObject({ status: "failed", reasonCode: "criterion_not_met", criteria: [
+    else if (locationEnabled) expect(record(failedReportBeforeRepair)).toMatchObject({ status: "failed", reasonCode: "criterion_not_met", criteria: locationMismatch ? [
+      { criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" },
+      { criterionId: "candidate-location", status: "failed", reasonCode: "criterion_not_met" },
+    ] : [
       { criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" },
       { criterionId: "candidate-location", status: "passed", reasonCode: "criteria_met" },
     ] })
     else expect(record(failedReportBeforeRepair)).toMatchObject({ status: "failed", reasonCode: "criterion_not_met" })
     expect(repaired).toMatchObject({ status: "completed", failureReason: null })
-    expectPassedVerificationReport(record(repaired?.result)?.taskGraphVerificationReport,
-      "candidate-count", ...(locationEnabled ? ["candidate-location"] : []))
+    expectPassedVerificationReport(record(repaired?.result)?.taskGraphVerificationReport, ...repairVerificationCriterionIds)
     const repairReceipt = record(record(repaired?.result)?.taskGraphRepairReceipt)
     expect(repairReceipt).toMatchObject({
       schemaVersion: "agent-harness.v2.task-graph-repair-receipt.v1", graphRootTaskId: rootTaskId,
-      targetNodeKey: "scout", targetTaskId: original?.id, criterionIds: ["candidate-count"],
+      targetNodeKey: "scout", targetTaskId: original?.id, criterionIds: [repairCriterionId],
       repairNodeKey: "scout-repair", repairTaskId: repaired?.id, verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
     })
     expect(String(repairReceipt?.evidenceDigest)).toMatch(/^[a-f0-9]{64}$/)
     expect(analyst).toMatchObject({ status: "completed", failureReason: null })
     expectPassedVerificationReport(record(analyst?.result)?.taskGraphVerificationReport, "finding-count")
+    if (locationMismatch) {
+      const initialScoutResult = record(record(original?.result)?.structuredResult)
+      const initialScoutCandidateIds = Array.isArray(initialScoutResult?.candidates)
+        ? initialScoutResult.candidates.map(item => record(item)?.jobId).filter((id): id is string => typeof id === "string")
+        : []
+      expect(initialScoutCandidateIds.sort()).toEqual([firstJobId, secondJobId].sort())
+      const repairedScoutResult = record(record(repaired?.result)?.structuredResult)
+      const repairedScoutCandidateIds = Array.isArray(repairedScoutResult?.candidates)
+        ? repairedScoutResult.candidates.map(item => record(item)?.jobId).filter((id): id is string => typeof id === "string")
+        : []
+      expect(repairedScoutCandidateIds.sort()).toEqual([secondJobId, thirdJobId].sort())
+      const replacementJobs = await pool!.query<{ id: string; userId: string; location: string }>(
+        `SELECT "id", "userId", "location" FROM "Job" WHERE "id" IN ($1, $2)`, [secondJobId, thirdJobId],
+      )
+      expect(replacementJobs.rows).toHaveLength(2)
+      expect(replacementJobs.rows).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: secondJobId, userId: value.userId, location: "Dublin" }),
+        expect.objectContaining({ id: thirdJobId, userId: value.userId, location: "Dublin" }),
+      ]))
+      const dependencyContext = record(record(analyst?.context)?.taskGraphDependencyResults)
+      const dependencyItems = Array.isArray(dependencyContext?.items) ? dependencyContext.items.map(record) : []
+      const scoutDependency = dependencyItems.find(item => item?.dependencyKey === "scout")
+      const projectedScout = record(scoutDependency?.result)
+      const projectedCandidateIds = Array.isArray(projectedScout?.candidates)
+        ? projectedScout.candidates.map(item => record(item)?.jobId).filter((id): id is string => typeof id === "string")
+        : []
+      expect(projectedCandidateIds.sort()).toEqual([secondJobId, thirdJobId].sort())
+      expect(projectedCandidateIds).not.toContain(firstJobId)
+      const analystStructuredResult = record(record(analyst?.result)?.structuredResult)
+      const downstreamJobIds = Array.isArray(analystStructuredResult?.findings)
+        ? analystStructuredResult.findings.map(item => record(item)?.jobId).filter((id): id is string => typeof id === "string")
+        : []
+      expect(downstreamJobIds.sort()).toEqual([secondJobId, thirdJobId].sort())
+      expect(downstreamJobIds).not.toContain(firstJobId)
+    }
     expect(supplementalAnalysts).toHaveLength(hardExecutorFailure ? 0 : 5)
     for (const supplemental of supplementalAnalysts) {
       expect(supplemental).toMatchObject({ status: "completed", failureReason: null })

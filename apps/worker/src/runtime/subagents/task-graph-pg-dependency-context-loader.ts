@@ -1,5 +1,7 @@
 import type { TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { normalizeAgentLocation } from "@jobcopilot/shared"
 import { TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, type TaskGraphVerificationEvidenceProjection } from "../planning/task-graph-verification.js"
+import { parseTaskGraphVerificationEvidenceProjection, TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, type TaskGraphVerificationCandidateProjectionV2 } from "../planning/task-graph-verification-cross-node.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus, type TaskGraphRepairReceipt, type TaskGraphVerificationReport } from "./task-graph-command-port.js"
 import { validateRoleResult, type AnalystResult, type ScoutResult, type StructuredRole, type StructuredRoleResult } from "./role-results.js"
 import type { Queryable } from "./pg-store-persistence.js"
@@ -92,7 +94,8 @@ async function composeRepairResult(target: ScopedDependencyResult, targetRow: Ro
     || target.failureReason !== `task_graph_verification_${report?.status}` || !report
     || !taskGraphVerificationReportMatchesStatus(report, "failed")) throw new Error("task_graph_dependency_repair_source_invalid")
   const missing = new Set(report.criteria.filter(item => item.status !== "passed").map(item => item.criterionId))
-  const locationEnabled = node.templateId === "scout" && node.verification?.criteria.some(item => item.check.kind === "candidate_location_in") === true
+  const locationChecks = node.verification?.criteria.flatMap(item => item.check.kind === "candidate_location_in" ? [item.check.locations] : []) ?? []
+  const locationEnabled = node.templateId === "scout" && locationChecks.length > 0
   const coverage = new Map<string, number>(), results: Array<{ result: StructuredRoleResult; criterionIds: readonly string[] }> = [], repairLineage: RepairLineage = [], locationPieces: ReverifiedScoutEvidencePiece[] = []
   const originalResult = parseFailedOriginalResult(original, node, report, target.role as StructuredRole)
   if (locationEnabled) {
@@ -131,18 +134,93 @@ async function composeRepairResult(target: ScopedDependencyResult, targetRow: Ro
     throw new Error("task_graph_dependency_repair_incomplete")
   }
   if (originalResult) results.unshift({ result: originalResult, criterionIds: [] })
-  const merged = mergeRepairedRoleResults(results, node)
+  if (locationEnabled) {
+    const filtered = filterVerifiedLocationMismatches(locationPieces[0], locationPieces.slice(1), locationChecks)
+    if (!filtered || !results.length) throw new Error("task_graph_dependency_repair_original_provenance_unavailable")
+    locationPieces[0] = filtered.piece
+    results[0] = { result: filtered.result, criterionIds: [] }
+  }
+  const merged = mergeRepairedRoleResults(results, node, locationEnabled)
   if (merged.role !== "scout" && merged.role !== "analyst") throw new Error("task_graph_dependency_repair_role_unsupported")
   const roleResult = merged as ScoutResult | AnalystResult
   const legacyProjection = roleResult.role === "scout"
     ? { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: roleResult.role, candidates: roleResult.candidates.map(({ jobId, evidenceIds }) => ({ jobId, evidenceIds })), evidenceIds: canonicalResultEvidenceIds(roleResult) }
     : { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: roleResult.role, findings: roleResult.findings.map(({ jobId, score, evidenceIds }) => ({ jobId, score, evidenceIds })), evidenceIds: canonicalResultEvidenceIds(roleResult) }
   const projection = locationEnabled ? mergeReverifiedScoutLocationEvidence(locationPieces) : legacyProjection
-  if (!projection || !await verifyRepairedTaskGraphFindings(client, scope, { schemaVersion: "agent-harness.v2.task-graph", nodes: graphNodes }, node, projection as TaskGraphVerificationEvidenceProjection)) {
+  if (!projection || locationEnabled && !sameScoutCandidateSet(roleResult, projection)
+    || !await verifyRepairedTaskGraphFindings(client, scope, { schemaVersion: "agent-harness.v2.task-graph", nodes: graphNodes }, node, projection as TaskGraphVerificationEvidenceProjection)) {
     throw new Error("task_graph_dependency_repair_composite_unverified")
   }
   return { report, repairLineage, result: { status: "completed", stepCount: 0, toolCallCount: 0, finalItemId: null,
     finalText: "Verified repair results.", structuredResult: merged } }
+}
+
+function filterVerifiedLocationMismatches(
+  originalPiece: ReverifiedScoutEvidencePiece | undefined,
+  repairPieces: readonly ReverifiedScoutEvidencePiece[],
+  locationChecks: readonly (readonly string[])[],
+): Readonly<{ piece: ReverifiedScoutEvidencePiece; result: ScoutResult }> | undefined {
+  if (!originalPiece || locationChecks.length === 0) return undefined
+  const original = parseReverifiedLocationPiece(originalPiece)
+  const repairs = repairPieces.map(parseReverifiedLocationPiece)
+  if (!original || repairs.some(piece => !piece)) return undefined
+  const repairJobIds = new Set(repairs.flatMap(piece => piece!.candidates.map(item => item.jobId)))
+  const removed = new Set(original.candidates.filter(item => isVerifiedLocationMismatch(item, locationChecks)
+    && !repairJobIds.has(item.jobId)).map(item => item.jobId))
+  const candidates = original.candidates.filter(item => !removed.has(item.jobId))
+  const result = validateRoleResult({ ...original.result, candidates: original.result.candidates.filter(item => !removed.has(item.jobId)) }, "scout") as ScoutResult
+  return {
+    result,
+    piece: {
+      structuredResult: result,
+      projection: { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, role: "scout", candidates, evidenceIds: original.evidenceIds },
+    },
+  }
+}
+
+function isVerifiedLocationMismatch(
+  item: TaskGraphVerificationCandidateProjectionV2, locationChecks: readonly (readonly string[])[],
+): boolean {
+  if (item.locationEvidenceStatus !== "verified" || typeof item.observedLocation !== "string") return false
+  const location = normalizeAgentLocation(item.observedLocation)
+  return location !== null && locationChecks.some(locations => !locations.includes(location))
+}
+
+function parseReverifiedLocationPiece(piece: ReverifiedScoutEvidencePiece): Readonly<{
+  candidates: readonly TaskGraphVerificationCandidateProjectionV2[]; evidenceIds: readonly string[]; result: ScoutResult;
+}> | undefined {
+  const parsed = parseTaskGraphVerificationEvidenceProjection(piece.projection)
+  if (!parsed.ok || parsed.value.schemaVersion !== TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION
+    || parsed.value.role !== "scout" || parsed.value.emptyDiscoveryDigest !== undefined) return undefined
+  let result: StructuredRoleResult
+  try { result = validateRoleResult(piece.structuredResult, "scout") } catch { return undefined }
+  if (result.role !== "scout" || result.status !== "completed" || result.candidates.length !== parsed.value.items.length) return undefined
+  const resultById = new Map(result.candidates.map(item => [item.jobId, item] as const))
+  if (resultById.size !== parsed.value.items.length) return undefined
+  const candidates: TaskGraphVerificationCandidateProjectionV2[] = []
+  for (const item of parsed.value.items) {
+    const status = item.locationEvidenceStatus, observedLocation = item.observedLocation ?? null
+    const bound = resultById.get(item.jobId)
+    if (!bound || !sameStrings(bound.evidenceIds, item.evidenceIds)
+      || (status !== "verified" && status !== "missing" && status !== "conflicting")
+      || (status === "verified" ? typeof observedLocation !== "string" : observedLocation !== null)) return undefined
+    candidates.push({ jobId: item.jobId, evidenceIds: item.evidenceIds, observedLocation, locationEvidenceStatus: status })
+  }
+  return { candidates, evidenceIds: parsed.value.evidenceIds, result }
+}
+
+function sameScoutCandidateSet(result: StructuredRoleResult, projection: TaskGraphVerificationEvidenceProjection): boolean {
+  if (result.role !== "scout" || projection.role !== "scout"
+    || projection.schemaVersion !== TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION) return false
+  const resultById = new Map(result.candidates.map(item => [item.jobId, item] as const))
+  return resultById.size === projection.candidates.length && projection.candidates.every(item => {
+    const candidate = resultById.get(item.jobId)
+    return !!candidate && sameStrings(candidate.evidenceIds, item.evidenceIds)
+  })
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
 function parseResult(value: unknown): unknown { if (typeof value !== "string") return value; try { return JSON.parse(value) as unknown } catch { return null } }

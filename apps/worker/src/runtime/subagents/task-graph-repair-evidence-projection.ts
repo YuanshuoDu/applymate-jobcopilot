@@ -137,16 +137,16 @@ export function parseCompletedRepairResult(value: Record<string, unknown> | null
   return value.structuredResult
 }
 
-export function mergeRepairedRoleResults(pieces: readonly { result: StructuredRoleResult; criterionIds: readonly string[] }[], target: StoredTaskGraphNode): StructuredRoleResult {
+export function mergeRepairedRoleResults(pieces: readonly { result: StructuredRoleResult; criterionIds: readonly string[] }[], target: StoredTaskGraphNode, allowScoutSourceConflict = false): StructuredRoleResult {
   const values = pieces.map(piece => piece.result), first = values[0]!
   if (first.role === "scout") {
-    const evidence = mergeEvidence(values), items = new Map<string, ScoutResult["candidates"][number]>()
+    const evidence = mergeEvidence(values, allowScoutSourceConflict), items = new Map<string, ScoutResult["candidates"][number]>()
     for (const value of values) {
       if (value.role !== "scout" || value.status !== "completed") throw new Error("task_graph_dependency_repair_role_conflict")
       for (const item of value.candidates) {
-        const prior = items.get(item.jobId)
-        if (prior && (prior.source !== item.source || prior.url !== item.url)) throw new Error("task_graph_dependency_repair_item_conflict")
-        items.set(item.jobId, { ...item, evidenceIds: [...new Set([...(prior?.evidenceIds ?? []), ...item.evidenceIds])] })
+        const prior = items.get(item.jobId), sourceConflict = prior?.source !== undefined && prior.source !== item.source
+        if (prior && ((sourceConflict && !allowScoutSourceConflict) || prior.url !== item.url)) throw new Error("task_graph_dependency_repair_item_conflict")
+        items.set(item.jobId, { ...(prior && sourceConflict ? prior : item), evidenceIds: [...new Set([...(prior?.evidenceIds ?? []), ...item.evidenceIds])] })
       }
     }
     return validateRoleResult({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [...items.values()].sort((a, b) => a.jobId.localeCompare(b.jobId)), evidence, summary: "Verified repair results." }, "scout")
@@ -168,14 +168,16 @@ export function mergeRepairedRoleResults(pieces: readonly { result: StructuredRo
   throw new Error("task_graph_dependency_repair_role_unsupported")
 }
 
-function mergeEvidence(values: readonly StructuredRoleResult[]) {
+function mergeEvidence(values: readonly StructuredRoleResult[], allowScoutSourceConflict = false) {
   const evidence = new Map<string, ScoutResult["evidence"][number]>()
   for (const value of values) {
     if ((value.role !== "scout" && value.role !== "analyst") || value.status !== "completed") throw new Error("task_graph_dependency_repair_partial")
     for (const item of value.evidence) {
       const prior = evidence.get(item.id)
-      if (prior && (prior.kind !== item.kind || prior.ref !== item.ref || prior.source !== item.source)) throw new Error("task_graph_dependency_repair_evidence_conflict")
-      evidence.set(item.id, item)
+      const locationConflict = allowScoutSourceConflict && prior?.kind === "job" && item.kind === "job" && prior.ref === item.ref
+        && values.some(value => value.role === "scout" && value.candidates.some(candidate => candidate.jobId === item.ref && candidate.source !== prior.source))
+      if (prior && (prior.kind !== item.kind || prior.ref !== item.ref || prior.source !== item.source) && !locationConflict) throw new Error("task_graph_dependency_repair_evidence_conflict")
+      if (!prior) evidence.set(item.id, item)
     }
   }
   return [...evidence.values()]
@@ -225,7 +227,7 @@ export function mergeReverifiedScoutLocationEvidence(
     }
     for (const id of parsed.value.evidenceIds) evidenceIds.add(id)
   }
-  if (candidates.size === 0 || candidates.size > TASK_GRAPH_VERIFICATION_LIMITS.maxItems
+  if (candidates.size > TASK_GRAPH_VERIFICATION_LIMITS.maxItems || evidenceIds.size === 0
     || evidenceIds.size > TASK_GRAPH_VERIFICATION_LIMITS.maxItems) return undefined
   return {
     schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION,
