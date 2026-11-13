@@ -2,13 +2,70 @@ import { randomUUID } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { Pool } from "pg"
+import { Pool, type QueryConfig, type QueryResult, type QueryResultRow } from "pg"
 
 const DATABASE_NAME = "applymate_nested_delegation_ci"
 const PROCESS_FIXTURE = fileURLToPath(new URL("./nested-scout-delegation-worker.fixture.mjs", import.meta.url))
+const MAIN_PROGRESS_QUERY_TIMEOUT_MS = 2_000
 
 type FixtureIds = Readonly<{ userId: string; sessionId: string; turnId: string; alphaJobId: string; betaJobId: string; foreignJobId: string }>
 type FixtureProcess = { child: ChildProcess; waitForLine(marker: string, timeoutMs: number): Promise<void>; output: string[] }
+const MAIN_PROGRESS_MARKERS = new Set([
+  "P1143_ROOT_MODEL_STREAM_STARTED", "P1143_ROOT_PLAN_REQUESTED", "P1143_PARENT_ADAPTER_STARTED",
+  "P1143_SUBAGENT_CLAIMS_PAUSED", "P1143_PARENT_DISCOVER_REQUESTED", "P1143_SOURCE_ESCALATION_REQUESTED",
+  "P1143_SOURCE_ESCALATION_REJECTED", "P1143_CLOSED_STEP_REPLAY_REJECTED", "P1143_FOREIGN_CALL_STEP_REJECTED",
+  "P1143_PARENT_WAITING", "P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL", "P1143_ROOT_GRAPH_COMPLETED",
+])
+
+function progressQuery<Row extends QueryResultRow>(text: string, values: unknown[] = []): Promise<QueryResult<Row>> {
+  const config: QueryConfig<unknown[]> & { query_timeout: number } = { text, values, query_timeout: MAIN_PROGRESS_QUERY_TIMEOUT_MS }
+  return pool.query<Row, unknown[]>(config)
+}
+
+function seenMainProgress(output: string[]) {
+  return [...new Set(output.filter(value => MAIN_PROGRESS_MARKERS.has(value)))]
+}
+
+async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
+  const observedPhases = seenMainProgress(output)
+  const fixtureFailure = output.find(value => /^P1143_FIXTURE_FAILURE:(?:p1143_[a-z_]+|redacted)$/.test(value)) ?? null
+  try {
+    const [turn, graph, steps, tasks, tools] = await Promise.all([
+      progressQuery<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
+        [ids.turnId, ids.sessionId]),
+      progressQuery<{ nodeCount: number }>(`SELECT CASE WHEN jsonb_typeof("content"->'nodes') = 'array'
+          THEN jsonb_array_length("content"->'nodes') ELSE 0 END AS "nodeCount"
+        FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'task_graph'
+        ORDER BY "revision" DESC LIMIT 1`, [ids.sessionId, ids.turnId]),
+      progressQuery<{ status: string; count: number }>(`SELECT "status", count(*)::int AS "count" FROM "agent_steps"
+        WHERE "sessionId" = $1 AND "turnId" = $2 GROUP BY "status" ORDER BY "status"`, [ids.sessionId, ids.turnId]),
+      progressQuery<{ depth: number; role: string; status: string; count: number }>(`SELECT "depth", "role", "status", count(*)::int AS "count"
+        FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2
+        GROUP BY "depth", "role", "status" ORDER BY "depth", "role", "status"`, [ids.sessionId, ids.turnId]),
+      progressQuery<{ toolName: string; status: string; errorCode: string | null; count: number }>(`SELECT
+          CASE WHEN content->>'toolName' IN ('agent.plan', 'agent.wait', 'jobs.discover', 'scout.delegate', 'scout.results', 'jobs.get', 'wait_subagents')
+            THEN content->>'toolName' ELSE 'other' END AS "toolName",
+          "status",
+          CASE WHEN content->>'errorCode' IS NULL THEN NULL
+            WHEN content->>'errorCode' IN ('nested_scout_source_scope_unavailable', 'task_graph_snapshot_invalid', 'invalid_output', 'child_action_denied')
+              THEN content->>'errorCode' ELSE 'other' END AS "errorCode",
+          count(*)::int AS "count"
+        FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" IN ('tool_call', 'tool_result')
+        GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`, [ids.sessionId, ids.turnId]),
+    ])
+    return {
+      observedPhases, fixtureFailure,
+      turnStatus: turn.rows[0]?.status ?? "missing",
+      graphRecordCount: graph.rows.length,
+      graphNodeCount: graph.rows[0]?.nodeCount ?? 0,
+      stepStatuses: steps.rows,
+      tasksByDepthRoleStatus: tasks.rows,
+      toolOutcomes: tools.rows,
+    }
+  } catch {
+    return { observedPhases, fixtureFailure, databaseDiagnosticAvailable: false }
+  }
+}
 
 function disposableUrl(): string | null {
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
@@ -52,7 +109,8 @@ function launch(mode: "park" | "resume", ids: FixtureIds): FixtureProcess {
   })
   child.stderr?.on("data", (chunk: string) => {
     const text = String(chunk)
-    if (/P1143_FIXTURE_FAILURE/.test(text)) output.push("P1143_FIXTURE_FAILURE")
+    const failure = text.match(/P1143_FIXTURE_FAILURE:(p1143_[a-z_]+|redacted)/)
+    if (failure) output.push(`P1143_FIXTURE_FAILURE:${failure[1]}`)
   })
   return {
     child, output,
@@ -60,6 +118,8 @@ function launch(mode: "park" | "resume", ids: FixtureIds): FixtureProcess {
       const deadline = Date.now() + timeoutMs
       while (Date.now() < deadline) {
         if (output.includes(marker)) return
+        const fixtureFailure = output.find(value => /^P1143_FIXTURE_FAILURE:(?:p1143_[a-z_]+|redacted)$/.test(value))
+        if (fixtureFailure) throw new Error(`Worker fixture failed before ${marker}: ${fixtureFailure}`)
         if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Worker fixture exited before ${marker}`)
         await new Promise(resolve => setTimeout(resolve, 50))
       }
@@ -126,7 +186,13 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
     try {
       await seed(ids)
       first = launch("park", ids)
-      await first.waitForLine("P1143_SOURCE_ESCALATION_REJECTED", 45_000)
+      try {
+        await first.waitForLine("P1143_SOURCE_ESCALATION_REJECTED", 45_000)
+      } catch (error) {
+        const diagnostic = await readMainProgressDiagnostic(ids, first.output)
+        console.info(`P1143_MAIN_PROGRESS_DIAGNOSTIC:${JSON.stringify(diagnostic)}`)
+        throw error
+      }
       await first.waitForLine("P1143_CLOSED_STEP_REPLAY_REJECTED", 45_000)
       await first.waitForLine("P1143_FOREIGN_CALL_STEP_REJECTED", 45_000)
       await first.waitForLine("P1143_PARENT_WAITING", 45_000)

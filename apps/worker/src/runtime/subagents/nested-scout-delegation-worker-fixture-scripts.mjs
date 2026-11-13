@@ -57,9 +57,11 @@ function toolCall(callId, name, args) { return { type: "tool_call_completed", ca
 function completed() { return { type: "completed", finishReason: "tool_calls" } }
 function rootModelRuntime() {
   return { adapter: { id: `p1143-root-${mode}`, profile, async *stream(request) {
+    say("P1143_ROOT_MODEL_STREAM_STARTED")
     const graph = graphFrom(request), nodes = Array.isArray(graph?.nodes) ? graph.nodes : []
     if (nodes.length === 0) {
       if (!request.tools.some(tool => tool.name === "agent.plan")) throw new Error("p1143_root_plan_tool_missing")
+      say("P1143_ROOT_PLAN_REQUESTED")
       yield toolCall("p1143-root-plan", "agent.plan", { expectedRevision: 0, nodes: [{
         key: "scout", templateId: "scout", goal: "Find Dublin software engineering roles",
         successCriteria: ["Return at least one source-backed candidate after reading it"], dependsOn: [],
@@ -169,11 +171,14 @@ function childModelRuntime({ task, runtime, markerState }) {
     }
 
     if (mode === "park" && !markerState.subagentClaimsPaused) {
+      if (task.depth === 1) say("P1143_PARENT_ADAPTER_STARTED")
       await pauseSubagentClaims()
       markerState.subagentClaimsPaused = true
+      say("P1143_SUBAGENT_CLAIMS_PAUSED")
     }
     if (!toolResult(request, discoverCall)) {
       if (!request.tools.some(tool => tool.name === "jobs.discover")) throw new Error("p1143_parent_discovery_tool_missing")
+      if (task.depth === 1) say("P1143_PARENT_DISCOVER_REQUESTED")
       yield toolCall(discoverCall, "jobs.discover", { targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], source: "greenhouse", pageSize: 10 })
       yield completed(); return
     }
@@ -181,6 +186,7 @@ function childModelRuntime({ task, runtime, markerState }) {
     if (!toolFailed(request, deniedSourceCall)) {
       if (toolResult(request, deniedSourceCall)) throw new Error("p1143_source_escalation_was_not_rejected")
       if (!request.tools.some(tool => tool.name === "scout.delegate")) throw new Error("p1143_delegate_tool_missing")
+      say("P1143_SOURCE_ESCALATION_REQUESTED")
       yield toolCall(deniedSourceCall, "scout.delegate", { goal: "Try to escape the discovered source", sourceSlice: ["lever"] })
       yield completed(); return
     }

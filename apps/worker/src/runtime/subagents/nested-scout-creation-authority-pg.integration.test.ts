@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool } from "pg"
-import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { AgentTreeManager } from "./manager.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { createSubagentTask } from "./pg-store-create.js"
@@ -9,7 +8,8 @@ import { transaction } from "./pg-store-persistence.js"
 import { normalizeSubagentPolicy } from "./types.js"
 import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
-import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
+import { writePlanReceipt } from "./task-graph-pg-events.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphState, taskGraphProposalKey } from "./task-graph-snapshot.js"
 
 const DATABASE = "applymate_nested_delegation_ci"
 function disposableUrl(): string | null {
@@ -62,19 +62,17 @@ describePg("nested Scout creation authority: disposable PostgreSQL", () => {
         successCriteria: profileSpec.successCriteria, dependsOn: [] }] }
       const graphContent = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ ...proposal.nodes[0],
         depth: 1, taskId: parent.id }] })
-      const graphItem = taskGraphItemId(ids.root)
-      const graphRevision = 1, now = new Date().toISOString()
-      const item = { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: graphItem, sessionId: ids.session, turnId: ids.turn,
-        stepId: null, taskId: ids.root, type: TASK_GRAPH_ITEM_TYPE, status: "streaming", phase: null, revision: graphRevision,
-        content: graphContent, startedAt: now, completedAt: null, createdAt: now, updatedAt: now }
-      const receipt = { status: "accepted", revision: graphRevision,
-        nodes: [{ key: "scout", taskId: parent.id, status: "queued" }], readyTaskIds: [parent.id] }
-      await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "updatedAt")
-        VALUES ($1, $2, $3, NULL, $4, $5, 'streaming', NULL, $6, $7::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-      [graphItem, ids.session, ids.turn, ids.root, TASK_GRAPH_ITEM_TYPE, graphRevision, JSON.stringify(graphContent)])
-      await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
-        VALUES ($1, $2, $3, $4, $5, 1, 'item.started', 'orchestrator', $3, $6, $7::jsonb)`, [randomUUID(), ids.session, ids.turn, graphItem, ids.root,
-        taskGraphProposalKey(ids.root, 0), JSON.stringify({ kind: "proposal", fingerprint: taskGraphFingerprint(proposal), revision: graphRevision, receipt, item })])
+      const graphRevision = 1
+      const graphState = taskGraphState(graphContent, graphRevision, new Map([[parent.id, { status: "queued" as const, failureReason: null }]]), [])
+      const receipt = { status: "accepted" as const, revision: graphRevision,
+        nodes: [{ key: "scout", taskId: parent.id, status: "queued" as const }], readyTaskIds: [parent.id] }
+      // Use the canonical writer so this proposal shares the Session sequence with task and lifecycle events.
+      await transaction(pool, async client => {
+        await client.query(`SELECT set_config('app.user_id', $1, true)`, [ids.user])
+        await writePlanReceipt(client, { scope: { userId: ids.user, sessionId: ids.session, turnId: ids.turn,
+          rootTaskId: ids.root, parentTaskId: ids.root }, state: graphState, snapshot: graphContent, expectedRevision: 0,
+        now: new Date(), idempotencyKey: taskGraphProposalKey(ids.root, 0), fingerprint: taskGraphFingerprint(proposal), receipt })
+      })
       manager = new AgentTreeManager(new PgSubagentTaskStore(pool), { heartbeatMs: 300_000 })
       const lease = await manager.claim({ taskId: parent.id, sessionId: ids.session, rootTaskId: ids.root, ownerId: "nested-authority-worker" })
       if (!lease) throw Error("Profile Scout fixture could not be claimed")

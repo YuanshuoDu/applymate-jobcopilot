@@ -51,8 +51,11 @@ async function seedGraph(pool: Pool): Promise<Fixture> {
   [turnId, sessionId, userId])
   const turnLease = await claimTurnLease(pool, { turnId, sessionId, ownerId: `turn-owner-${suffix}` })
   const policy = { maxConcurrency: 4, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 }
+  const templates = { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+    analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.search"] } }
+  const rootActions = [...new Set(Object.values(templates).flatMap(template => template.allowedActions))]
   const root = await createPgRootTaskStore(pool).ensure({ lease: turnLease, goal: "Nested Scout deadline",
-    allowedActions: [], budgetSnapshot: { subagentPolicy: policy } })
+    allowedActions: rootActions, budgetSnapshot: { subagentPolicy: policy } })
   const stepId = `nested-root-step-${suffix}`
   await pool.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status",
       "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
@@ -69,8 +72,7 @@ async function seedGraph(pool: Pool): Promise<Fixture> {
         verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
           criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }] } },
     ] },
-    templates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
-      analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.search"] } },
+    templates,
   })
   const parentScoutId = graph.nodes.find(node => node.key === "scout")?.taskId
   const siblingId = graph.nodes.find(node => node.key === "sibling")?.taskId
