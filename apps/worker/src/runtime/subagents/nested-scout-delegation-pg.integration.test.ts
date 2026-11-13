@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
+import { isDeepStrictEqual } from "node:util"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool, type QueryConfig, type QueryResult, type QueryResultRow } from "pg"
+import { projectWaitCallCompletionPayload } from "../turns/turn-execution-wait-event-projection.js"
 
 const DATABASE_NAME = "applymate_nested_delegation_ci"
 const PROCESS_FIXTURE = fileURLToPath(new URL("./nested-scout-delegation-worker.fixture.mjs", import.meta.url))
@@ -148,6 +150,7 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       structuredFailureCategory, executorResultStatus, attemptCountMax, nextAttemptAtPresent, count,
     }))
     const acknowledgement = await readWaitAcknowledgementDiagnostic(ids)
+    const sourceEventChain = await readSourceEventChainDiagnostic(ids)
     return {
       observedPhases, fixtureFailure, waitResumeCommitFailures,
       turnStatus: turn.rows[0]?.status ?? "missing",
@@ -159,6 +162,7 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       waitsByStatusAndSuspended: waits.rows,
       toolOutcomes: tools.rows,
       waitAcknowledgement: acknowledgement,
+      sourceEventChain,
     }
   } catch {
     return { observedPhases, fixtureFailure, waitResumeCommitFailures, databaseDiagnosticAvailable: false }
@@ -319,6 +323,162 @@ async function readWaitAcknowledgementDiagnostic(ids: FixtureIds) {
     return { available: true, ...row }
   } catch {
     return { available: false }
+  }
+}
+
+async function readSourceEventChainDiagnostic(ids: FixtureIds) {
+  type ContextRow = {
+    parentTaskId: string; sourceStepId: string; callItemId: string; callId: string; callContent: unknown;
+    resultItemId: string | null; resultContent: unknown;
+  }
+  type EventRow = {
+    id: string; itemId: string | null; type: string; actor: string; correlationId: string; causationId: string | null;
+    sequence: string | number; idempotencyKey: string; payload: unknown;
+  }
+  const unavailable = { available: false }
+  try {
+    const contextResult = await progressQuery<ContextRow>(`WITH parent AS (
+        SELECT task."id", task."sessionId", task."turnId" FROM "sub_agent_tasks" AS task
+        JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $1
+        WHERE task."sessionId" = $2 AND task."turnId" = $3 AND task."depth" = 1 AND task."role" = 'scout'
+      ), selected_wait AS (
+        SELECT wait."id", wait."parentTaskId", wait."sessionId", wait."turnId", wait."stepId"
+        FROM parent JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = parent."id"
+          AND wait."sessionId" = parent."sessionId" AND wait."turnId" = parent."turnId"
+        WHERE wait."status" IN ('ready', 'timed_out') AND wait."suspendedAt" IS NOT NULL AND wait."consumedAt" IS NULL
+        ORDER BY wait."createdAt" DESC, wait."id" DESC LIMIT 1
+      ), source_call AS (
+        SELECT item."id", item."content", item."sessionId", item."turnId", item."taskId", item."stepId"
+        FROM selected_wait AS wait JOIN "agent_items" AS item ON item."sessionId" = wait."sessionId"
+          AND item."turnId" = wait."turnId" AND item."taskId" = wait."parentTaskId" AND item."stepId" = wait."stepId"
+          AND item."type" = 'tool_call' AND item."content"->>'toolName' = 'wait_subagents'
+        ORDER BY item."createdAt" DESC, item."id" DESC LIMIT 1
+      ), source_result AS (
+        SELECT item."id", item."content" FROM source_call AS call JOIN "agent_items" AS item
+          ON item."sessionId" = call."sessionId" AND item."turnId" = call."turnId" AND item."taskId" = call."taskId"
+          AND item."stepId" = call."stepId" AND item."type" = 'tool_result'
+          AND item."content"->>'toolCallId' = call."content"->>'toolCallId'
+        ORDER BY item."createdAt" DESC, item."id" DESC LIMIT 1
+      )
+      SELECT wait."parentTaskId" AS "parentTaskId", wait."stepId" AS "sourceStepId", call."id" AS "callItemId",
+        call."content"->>'toolCallId' AS "callId", call."content" AS "callContent",
+        outcome."id" AS "resultItemId", outcome."content" AS "resultContent"
+      FROM selected_wait AS wait CROSS JOIN source_call AS call LEFT JOIN source_result AS outcome ON true`,
+      [ids.userId, ids.sessionId, ids.turnId])
+    const context = contextResult.rows[0]
+    if (!context || !context.parentTaskId || !context.sourceStepId || !context.callItemId || !context.callId) {
+      return { available: true, contextFound: false }
+    }
+
+    const keys = [
+      `task:${context.parentTaskId}:event:item-started:${context.callItemId}`,
+      `task:${context.parentTaskId}:event:tool-started:${context.callId}`,
+      `task:${context.parentTaskId}:event:tool-call-completed:${context.callId}:${context.callItemId}:1`,
+      `task:${context.parentTaskId}:event:tool-finished:${context.callId}`,
+      `task:${context.parentTaskId}:event:item-started:${context.resultItemId}`,
+      `task:${context.parentTaskId}:event:tool-result-completed:${context.callId}:${context.resultItemId}:1`,
+    ]
+    const relatedResult = await progressQuery<EventRow>(`SELECT "id", "itemId", "type", "actor", "correlationId", "causationId",
+        "sequence", "idempotencyKey", "payload" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+        AND ("itemId" = $4 OR "correlationId" = $5 OR "itemId" = $6 OR "correlationId" = $6 OR "idempotencyKey" = ANY($7::text[]))
+      ORDER BY "sequence"`, [ids.sessionId, ids.turnId, context.parentTaskId, context.callItemId, context.callId, context.resultItemId, keys])
+    const related = relatedResult.rows
+    const byRank = keys.map(key => related.filter(row => row.idempotencyKey === key))
+    const events = byRank.map(rows => rows.length === 1 ? rows[0] : undefined)
+    const [itemStart, callStart, callComplete, toolComplete, resultStart, resultComplete] = events
+    const callContent = context.callContent
+    const resultContent = context.resultContent
+    const rawCallCompletion = { itemId: context.callItemId, status: "completed", content: callContent }
+    const projectedCallCompletion = projectWaitCallCompletionPayload(rawCallCompletion, context.callItemId)
+    const expectedPayloads = [
+      { itemId: context.callItemId, type: "tool_call", phase: null },
+      { toolCallId: context.callId, toolName: "wait_subagents", taskId: context.parentTaskId },
+      null,
+      { toolCallId: context.callId, toolName: "wait_subagents", status: "completed", errorCode: null, taskId: context.parentTaskId },
+      { itemId: context.resultItemId, type: "tool_result", phase: null },
+      { itemId: context.resultItemId, status: "completed", content: resultContent },
+    ]
+    const expectedHeaders = [
+      { type: "item.started", itemId: context.callItemId, correlationId: context.sourceStepId },
+      { type: "tool_call.started", itemId: context.callItemId, correlationId: context.callId },
+      { type: "item.completed", itemId: context.callItemId, correlationId: context.callItemId },
+      { type: "tool_call.completed", itemId: context.callItemId, correlationId: context.callId },
+      { type: "item.started", itemId: context.resultItemId, correlationId: context.sourceStepId },
+      { type: "item.completed", itemId: context.resultItemId, correlationId: context.resultItemId },
+    ]
+    const eventHeaderMatches = (event: EventRow | undefined, index: number) => !!event && event.actor === "subagent"
+      && event.idempotencyKey === keys[index] && event.type === expectedHeaders[index]!.type
+      && event.itemId === expectedHeaders[index]!.itemId && event.correlationId === expectedHeaders[index]!.correlationId
+    const eventPayloadMatches = (event: EventRow | undefined, index: number) => !!event && (index === 2
+      ? isDeepStrictEqual(event.payload, rawCallCompletion) || isDeepStrictEqual(event.payload, projectedCallCompletion)
+      : isDeepStrictEqual(event.payload, expectedPayloads[index]))
+    const callCompletionRawMatches = !!callComplete && isDeepStrictEqual(callComplete.payload, rawCallCompletion)
+    const callCompletionProjectedMatches = !!callComplete && isDeepStrictEqual(callComplete.payload, projectedCallCompletion)
+    const eventCountsByRank = {
+      callItemStarted: byRank[0]!.length, waitCallStarted: byRank[1]!.length, waitCallCompleted: byRank[2]!.length,
+      waitToolCompleted: byRank[3]!.length, resultItemStarted: byRank[4]!.length, resultItemCompleted: byRank[5]!.length,
+    }
+    const expectedEventIds = events.flatMap(event => event ? [event.id] : [])
+    const firstEvent = itemStart
+    const predecessorDiagnostic = firstEvent ? await progressQuery<{ predecessorExists: boolean; predecessorBeforeItemStart: boolean }>(`SELECT
+        EXISTS (SELECT 1 FROM "agent_events" AS previous WHERE previous."sessionId" = $1 AND previous."turnId" = $2
+          AND previous."taskId" = $3 AND previous."id" = $4 AND previous."actor" = 'subagent'
+          AND (previous."correlationId" = $5 OR EXISTS (SELECT 1 FROM "agent_items" AS source
+            WHERE source."id" = previous."itemId" AND source."sessionId" = $1 AND source."turnId" = $2
+              AND source."taskId" = $3 AND source."stepId" = $5))) AS "predecessorExists",
+        EXISTS (SELECT 1 FROM "agent_events" AS previous WHERE previous."sessionId" = $1 AND previous."turnId" = $2
+          AND previous."taskId" = $3 AND previous."id" = $4 AND previous."actor" = 'subagent'
+          AND (previous."correlationId" = $5 OR EXISTS (SELECT 1 FROM "agent_items" AS source
+            WHERE source."id" = previous."itemId" AND source."sessionId" = $1 AND source."turnId" = $2
+              AND source."taskId" = $3 AND source."stepId" = $5))
+          AND previous."sequence" < (SELECT start_event."sequence" FROM "agent_events" AS start_event
+            WHERE start_event."sessionId" = $1 AND start_event."turnId" = $2 AND start_event."taskId" = $3
+              AND start_event."idempotencyKey" = $6)) AS "predecessorBeforeItemStart"`,
+        [ids.sessionId, ids.turnId, context.parentTaskId, firstEvent.causationId, context.sourceStepId, keys[0]])
+      : { rows: [], rowCount: 0 }
+    const predecessor = predecessorDiagnostic.rows[0]
+    const causationSourceEventIds = events.slice(0, 5).flatMap(event => event ? [event.id] : [])
+    const extraCausalResult = await progressQuery<{ extraCausalEventCount: number }>(`SELECT count(*)::int AS "extraCausalEventCount"
+      FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+        AND "causationId" = ANY($4::text[]) AND "id" <> ALL($5::text[])`,
+      [ids.sessionId, ids.turnId, context.parentTaskId, causationSourceEventIds, expectedEventIds])
+    const duplicateExpectedCount = Object.values(eventCountsByRank).reduce((total, count) => total + Math.max(0, count - 1), 0)
+    const extraRelatedEventCount = related.filter(row => !keys.includes(row.idempotencyKey)).length + duplicateExpectedCount
+    return {
+      available: true,
+      contextFound: true,
+      expectedEventCount: events.filter(Boolean).length,
+      eventIdempotencyKeyCounts: eventCountsByRank,
+      eventHeadersMatch: {
+        callItemStarted: eventHeaderMatches(itemStart, 0), waitCallStarted: eventHeaderMatches(callStart, 1),
+        waitCallCompleted: eventHeaderMatches(callComplete, 2), waitToolCompleted: eventHeaderMatches(toolComplete, 3),
+        resultItemStarted: eventHeaderMatches(resultStart, 4), resultItemCompleted: eventHeaderMatches(resultComplete, 5),
+      },
+      eventCausationMatches: {
+        callItemStartedHasScopedPriorEvent: !!predecessor?.predecessorExists && !!predecessor?.predecessorBeforeItemStart,
+        waitCallStartedFollowsCallItemStarted: !!itemStart && !!callStart && callStart.causationId === itemStart.id,
+        waitCallCompletedFollowsWaitCallStarted: !!callStart && !!callComplete && callComplete.causationId === callStart.id,
+        waitToolCompletedFollowsWaitCallCompleted: !!callComplete && !!toolComplete && toolComplete.causationId === callComplete.id,
+        resultItemStartedFollowsWaitToolCompleted: !!toolComplete && !!resultStart && resultStart.causationId === toolComplete.id,
+        resultItemCompletedFollowsResultItemStarted: !!resultStart && !!resultComplete && resultComplete.causationId === resultStart.id,
+      },
+      predecessorExists: !!predecessor?.predecessorExists,
+      predecessorBeforeItemStart: !!predecessor?.predecessorBeforeItemStart,
+      eventSequenceOrdered: events.length === 6 && events.every(Boolean) && events.slice(1).every((event, index) =>
+        BigInt(String(event!.sequence)) > BigInt(String(events[index]!.sequence))),
+      eventPayloadsMatch: {
+        callItemStarted: eventPayloadMatches(itemStart, 0), waitCallStarted: eventPayloadMatches(callStart, 1),
+        waitCallCompleted: eventPayloadMatches(callComplete, 2), waitToolCompleted: eventPayloadMatches(toolComplete, 3),
+        resultItemStarted: eventPayloadMatches(resultStart, 4), resultItemCompleted: eventPayloadMatches(resultComplete, 5),
+      },
+      callCompletionRawMatches,
+      callCompletionProjectedMatches,
+      extraRelatedEventCount,
+      extraCausalEventCount: extraCausalResult.rows[0]?.extraCausalEventCount ?? 0,
+    }
+  } catch {
+    return unavailable
   }
 }
 
