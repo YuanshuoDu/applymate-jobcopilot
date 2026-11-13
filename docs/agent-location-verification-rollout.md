@@ -25,6 +25,8 @@ The order matters because an older Worker does not reliably recognize version 2.
 - A persisted version 2 Turn requires a Worker that understands version 2 through its completion or explicit operator-directed stop. Keep compatible Workers available for that work; never route an unterminated version 2 Turn to a version 1-only Worker, which may treat its requirement as absent.
 - The upgraded Worker fails closed at planning and child creation for invalid, unsupported, or conflicting persisted requirement copies. It does not repair them by deleting the location requirement.
 
+An older persisted v2 location-repair snapshot that does not contain the inherited location guard is not resumable on the upgraded Worker; validation fails closed. Do not silently add the missing guard to that snapshot or describe its earlier repair report as location-verified. Location verification remains disabled by default. Before first enablement in any environment, upgrade and drain every old Worker as described above.
+
 ## Evidence and outcome semantics
 
 The location verifier uses server-observed successful tool receipts bound to the same user, Session, Turn, root, parent, task, and current attempt. It binds the observed Job ID and source to the Scout candidate. A model-reported location or an unbound query result cannot establish the location.
