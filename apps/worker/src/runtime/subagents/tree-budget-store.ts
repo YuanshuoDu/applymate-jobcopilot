@@ -132,19 +132,25 @@ async function lockSession(client: Client, input: Pick<TreeBudgetRootIdentity, "
 }
 
 async function lockOwnerAndStep(client: Client, input: TreeBudgetReserveInput, active: boolean): Promise<void> {
+  const taskValues = active
+    ? [input.taskId, input.sessionId, input.turnId, input.rootTaskId, input.attempt]
+    : [input.taskId, input.sessionId, input.turnId, input.rootTaskId]
   const tasks = await client.query<{ id: string }>(
     `SELECT "id" FROM "sub_agent_tasks"
      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4
        ${active ? `AND "status" = 'running' AND "interruptRequestedAt" IS NULL AND "attemptCount" = $5
          AND "leaseOwner" IS NOT NULL AND "leaseExpiresAt" > CURRENT_TIMESTAMP` : ""} FOR UPDATE`,
-    [input.taskId, input.sessionId, input.turnId, input.rootTaskId, input.attempt],
+    taskValues,
   ) as QueryResult<{ id: string }>
   if (!tasks.rows[0]) throw new TreeBudgetStoreError("lineage_rejected")
+  const stepValues = active
+    ? [input.stepId, input.sessionId, input.turnId, input.taskId, input.attempt]
+    : [input.stepId, input.sessionId, input.turnId, input.taskId]
   const steps = await client.query<{ id: string }>(
     `SELECT "id" FROM "agent_steps"
      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4
        ${active ? `AND "status" = 'streaming' AND "attempt" = $5` : ""} FOR UPDATE`,
-    [input.stepId, input.sessionId, input.turnId, input.taskId, input.attempt],
+    stepValues,
   ) as QueryResult<{ id: string }>
   if (!steps.rows[0]) throw new TreeBudgetStoreError("lineage_rejected")
 }

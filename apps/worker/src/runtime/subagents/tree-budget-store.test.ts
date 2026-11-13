@@ -15,7 +15,7 @@ function reservation(overrides: Partial<TreeBudgetReservation> = {}): TreeBudget
 function fakePool(results: unknown[], sessionStatus?: string, budgetSnapshot: unknown = {}) {
   let index = 0
   const client = {
-    query: vi.fn(async (query: unknown) => {
+    query: vi.fn(async (query: unknown, _values?: readonly unknown[]) => {
       const text = String(query)
       if (text === "BEGIN" || text === "COMMIT" || text === "ROLLBACK" || text.includes("SELECT set_config")) return { rows: [], rowCount: null }
       if (text.includes('FROM "agent_sessions"')) {
@@ -68,6 +68,8 @@ describe("tree budget reservation store", () => {
     expect(queries[6]).toContain('"attemptCount" = $5')
     expect(queries[7]).toContain('"status" = \'streaming\'')
     expect(queries[8]).toContain("status\" IN ('reserved', 'consumed')")
+    expect(client.query.mock.calls[6]?.[1]).toEqual([input.taskId, input.sessionId, input.turnId, input.rootTaskId, input.attempt])
+    expect(client.query.mock.calls[7]?.[1]).toEqual([input.stepId, input.sessionId, input.turnId, input.taskId, input.attempt])
   })
 
   it("returns an identical reservation without consuming another unit", async () => {
@@ -142,6 +144,24 @@ describe("tree budget reservation store", () => {
     const settle = { ...input, id: stored.id, status: "consumed" as const }
     await expect(createPgTreeBudgetReservationStore(pool as never).settle(settle)).resolves.toEqual(consumed)
     expect(client.query).toHaveBeenCalledTimes(10)
+  })
+
+  it.each(["consumed", "released"] as const)("matches inactive lineage query parameters when settling to %s", async status => {
+    const stored = reservation()
+    const settled = reservation({ status, settledAt: new Date("2026-09-09T09:02:00.000Z") })
+    const { pool, client } = fakePool([{ rows: [stored], rowCount: 1 }, { rows: [settled], rowCount: 1 }])
+    const settle = { ...input, id: stored.id, status }
+
+    await expect(createPgTreeBudgetReservationStore(pool as never).settle(settle)).resolves.toEqual(settled)
+
+    const taskLock = client.query.mock.calls.find(([query]) => String(query).startsWith('SELECT "id" FROM "sub_agent_tasks"'))
+    const stepLock = client.query.mock.calls.find(([query]) => String(query).startsWith('SELECT "id" FROM "agent_steps"'))
+    expect(String(taskLock?.[0])).toContain('"rootTaskId" = $4')
+    expect(String(taskLock?.[0])).not.toContain('"attemptCount" = $5')
+    expect(taskLock?.[1]).toEqual([input.taskId, input.sessionId, input.turnId, input.rootTaskId])
+    expect(String(stepLock?.[0])).toContain('"taskId" = $4')
+    expect(String(stepLock?.[0])).not.toContain('"attempt" = $5')
+    expect(stepLock?.[1]).toEqual([input.stepId, input.sessionId, input.turnId, input.taskId])
   })
 
   it.each(["consumed", "released"] as const)("settles an existing reservation to %s after session closure", async status => {
