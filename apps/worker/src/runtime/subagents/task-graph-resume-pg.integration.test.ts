@@ -14680,7 +14680,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                       scope: verificationScope(value.userId, currentAttempt + 1), snapshot, node, structuredResult, includeObservedLocation: true,
                     })
                     locationPreflightStage = "stale_attempt_assertion"
-                    expect(priorAttemptProof.report).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_missing" })
+                    expect(priorAttemptProof.report).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
                     expect(priorAttemptProof.projection).toBeUndefined()
                   } finally {
                     const restored = await pool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = $2
