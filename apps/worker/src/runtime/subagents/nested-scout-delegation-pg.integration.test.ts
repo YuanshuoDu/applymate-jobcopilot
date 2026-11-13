@@ -16,7 +16,8 @@ const MAIN_PROGRESS_QUERY_TIMEOUT_MS = 2_000
 type FixtureIds = Readonly<{ userId: string; sessionId: string; turnId: string; alphaJobId: string; betaJobId: string; foreignJobId: string }>
 type FixtureProcess = { child: ChildProcess; waitForLine(marker: string, timeoutMs: number): Promise<void>; output: string[] }
 const MAIN_PROGRESS_MARKERS = new Set([
-  "P1143_ROOT_MODEL_STREAM_STARTED", "P1143_ROOT_PLAN_REQUESTED", "P1143_PARENT_ADAPTER_STARTED",
+  "P1143_ROOT_MODEL_STREAM_STARTED", "P1143_ROOT_MODEL_RUNTIME_FACTORY_ENTERED", "P1143_ROOT_MODEL_RUNTIME_FACTORY_CREATED",
+  "P1143_ROOT_USAGE_AUTHORIZER_CALLED", "P1143_ROOT_PLAN_REQUESTED", "P1143_PARENT_ADAPTER_STARTED",
   "P1143_SUBAGENT_CLAIMS_PAUSED", "P1143_PARENT_DISCOVER_REQUESTED", "P1143_SOURCE_ESCALATION_REQUESTED",
   "P1143_SOURCE_ESCALATION_REJECTED", "P1143_CLOSED_STEP_REPLAY_REJECTED", "P1143_FOREIGN_CALL_STEP_REJECTED",
   "P1143_PARENT_WAITING", "P1143_CRASH_CHILD_BEFORE_MODEL_CALL", "P1143_CHILD_WORKER_CLAIMED_RUNNING",
@@ -101,6 +102,11 @@ function progressQuery<Row extends QueryResultRow>(text: string, values: unknown
   return pool.query<Row, unknown[]>(config)
 }
 
+function isSafeRootSetupDiagnostic(value: string): boolean {
+  const match = value.match(/^P1143_ROOT_(MODEL_RUNTIME_FACTORY|USAGE_AUTHORIZER)_ERROR:([A-Za-z0-9_]+)$/)
+  return !!match && SAFE_RECOVERY_ERROR_CODES.includes(match[2] as typeof SAFE_RECOVERY_ERROR_CODES[number])
+}
+
 function isSafeChildResumeLoaderDiagnostic(value: string): boolean {
   const match = value.match(/^P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:([A-Za-z0-9_]+)$/)
   return !!match && SAFE_CHILD_RESUME_LOADER_CODES.includes(match[1] as typeof SAFE_CHILD_RESUME_LOADER_CODES[number])
@@ -108,7 +114,8 @@ function isSafeChildResumeLoaderDiagnostic(value: string): boolean {
 
 function seenMainProgress(output: string[]) {
   return [...new Set(output.filter(value => MAIN_PROGRESS_MARKERS.has(value)
-    || SAFE_RECOVERY_DIAGNOSTIC_MARKERS.has(value) || isSafeChildResumeLoaderDiagnostic(value)))]
+    || SAFE_RECOVERY_DIAGNOSTIC_MARKERS.has(value) || isSafeChildResumeLoaderDiagnostic(value)
+    || isSafeRootSetupDiagnostic(value)))]
 }
 
 async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {

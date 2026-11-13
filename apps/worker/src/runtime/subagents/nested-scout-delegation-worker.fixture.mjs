@@ -141,9 +141,9 @@ async function start(mode) {
   }
   const runtime = await createCanonicalTurnRuntime(pool, {
     workerId: ownerId, productionFlags: flags, taskGraphCommandPort: createPgTaskGraphCommandPort(pool),
-    taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => ({ settle: async () => undefined }),
+    taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => { say("P1143_ROOT_USAGE_AUTHORIZER_CALLED"); try { return { settle: async () => undefined } } catch (error) { say(`P1143_ROOT_USAGE_AUTHORIZER_ERROR:${recoveryErrorClass(error, true)}`); throw error } },
     ...(manager ? { manager } : {}),
-    modelRuntimeFactory: () => rootModelRuntime(),
+    modelRuntimeFactory: () => { say("P1143_ROOT_MODEL_RUNTIME_FACTORY_ENTERED"); try { const model = rootModelRuntime(); say("P1143_ROOT_MODEL_RUNTIME_FACTORY_CREATED"); return model } catch (error) { say(`P1143_ROOT_MODEL_RUNTIME_FACTORY_ERROR:${recoveryErrorClass(error, true)}`); throw error } },
   })
   const markerState = { closedStepRejected: false, parallelObserved: false }
   const productionResumeLoader = createProductionChildResumeLoaders(pool).resumeLoader
