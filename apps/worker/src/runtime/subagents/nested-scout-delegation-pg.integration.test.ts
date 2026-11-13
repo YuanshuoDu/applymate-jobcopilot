@@ -17,7 +17,7 @@ const MAIN_PROGRESS_MARKERS = new Set([
   "P1143_ROOT_MODEL_STREAM_STARTED", "P1143_ROOT_PLAN_REQUESTED", "P1143_PARENT_ADAPTER_STARTED",
   "P1143_SUBAGENT_CLAIMS_PAUSED", "P1143_PARENT_DISCOVER_REQUESTED", "P1143_SOURCE_ESCALATION_REQUESTED",
   "P1143_SOURCE_ESCALATION_REJECTED", "P1143_CLOSED_STEP_REPLAY_REJECTED", "P1143_FOREIGN_CALL_STEP_REJECTED",
-  "P1143_PARENT_WAITING", "P1143_CRASH_CHILD_MODEL_STARTED", "P1143_CHILD_WORKER_CLAIMED_RUNNING",
+  "P1143_PARENT_WAITING", "P1143_CRASH_CHILD_BEFORE_MODEL_CALL", "P1143_CHILD_WORKER_CLAIMED_RUNNING",
   "P1143_RECOVERY_DEPTH2_QUEUED", "P1143_RECOVERY_DEPTH2_NOT_QUEUED", "P1143_RECOVERY_NO_DEPTH2_ROW",
   "P1143_CHILD_SCOUT_RECLAIMED",
   "P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL", "P1143_CHILD_DISCOVERY_RESULT_RECEIVED",
@@ -685,7 +685,7 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
   beforeAll(() => { pool = new Pool({ connectionString: databaseUrl!, max: 8 }) })
   afterAll(async () => { await pool.end() })
 
-  it("reclaims a crashed running Scout child after lease expiry and joins source-bound children across Worker restart", async () => {
+  it("reclaims a claimed Scout child after a pre-model Worker crash and joins source-bound children across Worker restart", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = {
       userId: `nested-scout-user-${suffix}`, sessionId: `nested-scout-session-${suffix}`,
@@ -755,7 +755,7 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       await killAndWait(first.child)
       first = undefined
       crashing = launch("crash-child", ids)
-      await waitForMainMarker(ids, crashing, "P1143_CRASH_CHILD_MODEL_STARTED", 30_000)
+      await waitForMainMarker(ids, crashing, "P1143_CRASH_CHILD_BEFORE_MODEL_CALL", 30_000)
       await waitForMainMarker(ids, crashing, "P1143_CHILD_WORKER_CLAIMED_RUNNING", 30_000)
       const claimedChildren = await pool.query<{ id: string; status: string; leaseOwner: string | null; leaseLive: boolean; attemptCount: number }>(
         `SELECT child."id", child."status", child."leaseOwner", child."leaseExpiresAt" > clock_timestamp() AS "leaseLive", child."attemptCount"
@@ -771,6 +771,11 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
         WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "type" = 'tool_call'`,
       [ids.sessionId, ids.turnId, crashedChild.id])
       expect(callsBeforeCrash.rows[0]?.count).toBe(0)
+      // This crash cut is after the durable claim but before model invocation; it does not prove replay after an unknown provider outcome.
+      const modelStartsBeforeCrash = await pool.query<{ count: number }>(`SELECT count(*)::int AS count FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "type" = 'model.started'`,
+      [ids.sessionId, ids.turnId, crashedChild.id])
+      expect(modelStartsBeforeCrash.rows[0]?.count).toBe(0)
       await killAndWait(crashing.child)
       crashing = undefined
       await waitForExpiredCrashLease(ids, parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!, 30_000)

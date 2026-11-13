@@ -14,6 +14,7 @@ function outputFor(request, name, input, errorCode = "p1143_fixture_tool_result_
   if (result?.isError) throw new Error(errorCode)
   return result?.output ?? null
 }
+
 function graphFrom(request) {
   for (const message of [...(request.messages ?? [])].reverse()) for (const part of [...(message.content ?? [])].reverse()) {
     if (part?.type !== "text" || !part.text.includes('"kind":"task_graph_current"')) continue
@@ -127,7 +128,6 @@ function childModelRuntime({ task, runtime, markerState }) {
   return { id: `p1143-${task.depth}-${task.id}`, profile, async *stream(request) {
     if (task.depth === 2) {
       if (mode === "resume" && task.attemptCount === 2) say("P1143_CHILD_SCOUT_RECLAIMED")
-      if (mode === "crash-child") { say("P1143_CRASH_CHILD_MODEL_STARTED"); await new Promise(() => {}) }
       await waitForTwoRunningChildren(task, markerState)
       const discoverCall = `p1143-child-discover:${task.id}`
       const receipt = findExactToolResult(request, { name: "jobs.discover", input: discoverInput })
@@ -242,4 +242,8 @@ function childModelRuntime({ task, runtime, markerState }) {
 }
 
   return { rootModelRuntime, discoveryClient, childModelRuntime }
+}
+export function createCrashFixtureExecutor(mode, executeChild, say) {
+  return input => mode === "crash-child"
+    ? (say("P1143_CRASH_CHILD_BEFORE_MODEL_CALL"), new Promise(() => {})) : executeChild(input)
 }

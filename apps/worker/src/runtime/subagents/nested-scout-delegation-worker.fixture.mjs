@@ -10,7 +10,7 @@ import { commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.
 import { createProductionWorkerBootstrap } from "../../queue/production-bootstrap.ts"
 import { createSubagentQueue } from "../../queue/subagent-queue.ts"
 import { enqueueTurn } from "../turns/turn-queue.ts"
-import { createNestedScoutFixtureScripts } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
+import { createCrashFixtureExecutor, createNestedScoutFixtureScripts } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 
 const [, , mode, rawIds] = process.argv
 const ids = JSON.parse(rawIds)
@@ -154,9 +154,10 @@ async function start(mode) {
   const executeChild = createProductionChildExecutor({ pool, subagentManager: () => runtime.manager,
     authorizeUsage: async () => ({ settle: async () => undefined }), jobDiscoveryClient: discoveryClient(),
     modelRuntimeFactory: input => childModelRuntime({ ...input, runtime, markerState }), durableWaitResumeCommitter: waitResumeCommitter() })
+  const execute = createCrashFixtureExecutor(mode, executeChild, say)
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 100,
     waitResolver: { intervalMs: 20, ownerId: `${ownerId}-wait-resolver` },
-    subagents: { intervalMs: 20, execute: executeChild, queueFactory: options => {
+    subagents: { intervalMs: 20, execute, queueFactory: options => {
       const consumer = createSubagentQueue(options)
       consumer.worker.concurrency = mode === "park" || mode === "crash-child" ? 1 : 2
       return consumer

@@ -93,7 +93,7 @@ jobs:
           const report = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, 'utf8'))
           const expected = new Map([
             ['/src/runtime/subagents/nested-scout-delegation-pg.integration.test.ts', [
-              'reclaims a crashed running Scout child after lease expiry and joins source-bound children across Worker restart',
+              'reclaims a claimed Scout child after a pre-model Worker crash and joins source-bound children across Worker restart',
             ]],
             ['/src/runtime/subagents/parent-finish-descendants-pg.integration.test.ts', [
               'returns children_pending without persisting success when a direct active child exists',
