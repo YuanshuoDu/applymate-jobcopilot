@@ -5,13 +5,12 @@ import { findExactToolResult, findUniqueWaitInput } from "./nested-scout-fixture
 
 export function createNestedScoutFixtureScripts({ mode, profile, ids, pool, say, pauseSubagentClaims, reportParentJoinState }) {
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null }
-const discoverInput = { targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], source: "greenhouse", pageSize: 10 }
-const deniedSourceInput = { goal: "Try to escape the discovered source", sourceSlice: ["lever"] }
-const delegateAlphaInput = { goal: "Read the Fixture Alpha role", sourceSlice: ["greenhouse"] }
-const delegateBetaInput = { goal: "Read the Fixture Beta role", sourceSlice: ["greenhouse"] }
+const SAFE_PARENT_RESUME_ERROR_CODES = new Set("invalid_output model_execution_failed tool_execution_failed turn_execution_failed persistence_conflict step_limit budget_exhausted no_progress".split(" "))
+function parentResumeErrorClass(error) { try { const code = object(error)?.code; return typeof code === "string" && SAFE_PARENT_RESUME_ERROR_CODES.has(code) ? code : error instanceof Error ? "error" : "non_error" } catch { return "unknown" } }
+const discoverInput = { targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], source: "greenhouse", pageSize: 10 }; const deniedSourceInput = { goal: "Try to escape the discovered source", sourceSlice: ["lever"] }
+const delegateAlphaInput = { goal: "Read the Fixture Alpha role", sourceSlice: ["greenhouse"] }; const delegateBetaInput = { goal: "Read the Fixture Beta role", sourceSlice: ["greenhouse"] }
 function outputFor(request, name, input, errorCode = "p1143_fixture_tool_result_unexpected_error") {
-  const result = findExactToolResult(request, { name, input })
-  if (result?.isError) throw new Error(errorCode)
+  const result = findExactToolResult(request, { name, input }); if (result?.isError) throw new Error(errorCode)
   return result?.output ?? null
 }
 
@@ -121,6 +120,7 @@ function childModelRuntime({ task, runtime, markerState }) {
   const discoverCall = `p1143-discover:${task.id}`, delegateOne = `p1143-delegate-alpha:${task.id}`
   const delegateTwo = `p1143-delegate-beta:${task.id}`, resultsCall = `p1143-results:${task.id}`
   return { id: `p1143-${task.depth}-${task.id}`, profile, async *stream(request) {
+    const isParentResume = task.depth === 1 && mode === "resume"; let parentResumeStage = "model_stream_started"; try {
     if (task.depth === 1) { say("P1143_PARENT_MODEL_STREAM_ENTERED"); if (mode === "resume") say(task.attemptCount > 1 ? "P1143_PARENT_RESUME_MODEL_RETRIED" : "P1143_PARENT_RESUME_MODEL_FIRST_ATTEMPT") }
     if (task.depth === 2) {
       if (mode === "resume" && task.attemptCount === 2) say("P1143_CHILD_SCOUT_RECLAIMED")
@@ -147,14 +147,13 @@ function childModelRuntime({ task, runtime, markerState }) {
       say("P1143_CHILD_ROLE_RESULT_STREAMED")
       yield { type: "completed", finishReason: "stop" }; return
     }
-
     if (mode === "park" && !markerState.subagentClaimsPaused) {
       if (task.depth === 1) say("P1143_PARENT_ADAPTER_STARTED")
       await pauseSubagentClaims()
       markerState.subagentClaimsPaused = true
       say("P1143_SUBAGENT_CLAIMS_PAUSED")
     }
-    const discovery = findExactToolResult(request, { name: "jobs.discover", input: discoverInput })
+    parentResumeStage = "discovery_result"; const discovery = findExactToolResult(request, { name: "jobs.discover", input: discoverInput })
     if (!discovery) {
       if (!request.tools.some(tool => tool.name === "jobs.discover")) throw new Error("p1143_parent_discovery_tool_missing")
       if (task.depth === 1) say("P1143_PARENT_DISCOVER_REQUESTED")
@@ -163,7 +162,7 @@ function childModelRuntime({ task, runtime, markerState }) {
     }
     if (discovery.isError) throw new Error("p1143_parent_discovery_failed")
     const deniedSourceCall = `p1143-delegate-lever:${task.id}`
-    const deniedSource = findExactToolResult(request, { name: "scout.delegate", input: deniedSourceInput })
+    parentResumeStage = "source_scope_result"; const deniedSource = findExactToolResult(request, { name: "scout.delegate", input: deniedSourceInput })
     if (!deniedSource) {
       if (!request.tools.some(tool => tool.name === "scout.delegate")) throw new Error("p1143_delegate_tool_missing")
       say("P1143_SOURCE_ESCALATION_REQUESTED")
@@ -172,14 +171,14 @@ function childModelRuntime({ task, runtime, markerState }) {
     }
     if (!deniedSource.isError) throw new Error("p1143_source_escalation_was_not_rejected")
     say("P1143_SOURCE_ESCALATION_REJECTED")
-    const alphaResult = findExactToolResult(request, { name: "scout.delegate", input: delegateAlphaInput })
+    parentResumeStage = "alpha_delegate_result"; const alphaResult = findExactToolResult(request, { name: "scout.delegate", input: delegateAlphaInput })
     if (!alphaResult) {
       if (!request.tools.some(tool => tool.name === "scout.delegate")) throw new Error("p1143_delegate_tool_missing")
       yield toolCall(delegateOne, "scout.delegate", delegateAlphaInput)
       yield completed(); return
     }
     if (alphaResult.isError) throw new Error("p1143_alpha_delegate_failed")
-    if (!markerState.closedStepRejected) {
+    parentResumeStage = "step_fence_replay"; if (!markerState.closedStepRejected) {
       const old = await pool.query(`SELECT "stepId" FROM "agent_items" WHERE "taskId" = $1 AND "type" = 'tool_call' AND content->>'toolCallId' = $2`, [task.id, delegateOne])
       const current = await pool.query(`SELECT "id" FROM "agent_steps" WHERE "taskId" = $1 AND "status" = 'streaming' ORDER BY "ordinal" DESC LIMIT 1`, [task.id])
       if (!old.rows[0]?.stepId || !current.rows[0]?.id) throw new Error("p1143_step_fence_fixture_missing_steps")
@@ -189,7 +188,7 @@ function childModelRuntime({ task, runtime, markerState }) {
       await rejectStepReplay(task, runtime.manager, delegateOne, String(current.rows[0].id))
       say("P1143_FOREIGN_CALL_STEP_REJECTED")
     }
-    const betaResult = findExactToolResult(request, { name: "scout.delegate", input: delegateBetaInput })
+    parentResumeStage = "beta_delegate_result"; const betaResult = findExactToolResult(request, { name: "scout.delegate", input: delegateBetaInput })
     if (!betaResult) {
       if (!request.tools.some(tool => tool.name === "scout.delegate")) throw new Error("p1143_second_delegate_tool_missing")
       yield toolCall(delegateTwo, "scout.delegate", delegateBetaInput)
@@ -197,22 +196,22 @@ function childModelRuntime({ task, runtime, markerState }) {
     }
     if (betaResult.isError) throw new Error("p1143_beta_delegate_failed")
     const delegateResults = [alphaResult.output, betaResult.output], childIds = delegateResults.map(value => object(value)?.taskId).filter(id => typeof id === "string")
-    const waitInput = findUniqueWaitInput(request, childIds), waitResult = waitInput ? findExactToolResult(request, { name: "wait_subagents", input: waitInput }) : null
+    parentResumeStage = "wait_input_parse"; const waitInput = findUniqueWaitInput(request, childIds); parentResumeStage = "wait_result_lookup"; const waitResult = waitInput ? findExactToolResult(request, { name: "wait_subagents", input: waitInput }) : null
     if (waitResult?.isError) throw new Error("p1143_parent_wait_failed")
-    const waitOutput = object(waitResult?.output), terminalWaitMatch = hasTerminalWaitOutcome(waitOutput, childIds)
+    parentResumeStage = "wait_context_marker"; const waitOutput = object(waitResult?.output), terminalWaitMatch = hasTerminalWaitOutcome(waitOutput, childIds)
     if (task.depth === 1 && mode === "resume") {
       say(waitInput ? "P1143_PARENT_RESUME_WAIT_INPUT_PRESENT" : "P1143_PARENT_RESUME_WAIT_INPUT_MISSING"); say(waitResult ? "P1143_PARENT_RESUME_WAIT_RESULT_PRESENT" : "P1143_PARENT_RESUME_WAIT_RESULT_MISSING")
       const status = ["ready", "timed_out", "waiting", "failed"].includes(waitOutput?.status) ? waitOutput.status : "other"
       say(`P1143_PARENT_RESUME_WAIT_CONTEXT_${status.toUpperCase()}`)
     }
-    const joined = outputFor(request, "scout.results", {}), issueScoutResults = terminalWaitMatch && !joined
-    reportParentJoinState({ delegateResultCount: delegateResults.filter(Boolean).length, childIdCount: childIds.length, waitResultPresent: waitResult !== null, terminalWaitMatch, scoutResultsIssued: issueScoutResults })
+    parentResumeStage = "scout_results_lookup"; const joined = outputFor(request, "scout.results", {}), issueScoutResults = terminalWaitMatch && !joined
+    parentResumeStage = "join_report"; reportParentJoinState({ delegateResultCount: delegateResults.filter(Boolean).length, childIdCount: childIds.length, waitResultPresent: waitResult !== null, terminalWaitMatch, scoutResultsIssued: issueScoutResults })
     if (issueScoutResults) {
       if (!request.tools.some(tool => tool.name === "scout.results")) throw new Error("p1143_scout_results_tool_missing")
       yield toolCall(resultsCall, "scout.results", {})
       yield completed(); return
     }
-    if (!joined) {
+    parentResumeStage = "joined_result_validation"; if (!joined) {
       if (task.depth === 1 && mode === "resume") say("P1143_PARENT_RESUME_FINAL_CANDIDATE")
       yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [], evidence: [], summary: "Premature candidate before child outcomes" }) }
       yield { type: "completed", finishReason: "stop" }; return
@@ -221,7 +220,7 @@ function childModelRuntime({ task, runtime, markerState }) {
     if (object(joined)?.availability !== "available") throw new Error("p1143_scout_results_not_available_after_wait")
     const children = Array.isArray(object(joined)?.children) ? joined.children.map(object) : []
     const candidates = children.flatMap(child => Array.isArray(child?.candidates) ? child.candidates.map(object) : [])
-    for (const candidate of candidates) {
+    parentResumeStage = "parent_job_reads"; for (const candidate of candidates) {
       const callId = `p1143-parent-job-get:${task.id}:${candidate?.jobId}`, input = { jobId: candidate?.jobId }
       if (!findExactToolResult(request, { name: "jobs.get", input })) {
         yield toolCall(callId, "jobs.get", input)
@@ -233,12 +232,13 @@ function childModelRuntime({ task, runtime, markerState }) {
       result: outputFor(request, "jobs.get", { jobId: candidate?.jobId }, "p1143_parent_job_read_failed"),
     }))
     if (jobs.length !== 2 || jobs.some(item => object(object(item.result)?.job)?.id !== item.candidate?.jobId)) throw new Error("p1143_parent_current_reads_missing")
-    const evidence = jobs.map(({ candidate, result }) => ({ id: `model-read:${candidate?.jobId}`, kind: "job", ref: candidate?.jobId, source: object(object(result)?.job)?.source }))
+    parentResumeStage = "parent_role_result"; const evidence = jobs.map(({ candidate, result }) => ({ id: `model-read:${candidate?.jobId}`, kind: "job", ref: candidate?.jobId, source: object(object(result)?.job)?.source }))
     yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
       candidates: jobs.map(({ candidate, result }) => ({ jobId: candidate?.jobId, source: object(object(result)?.job)?.source,
         url: object(object(result)?.job)?.url, evidenceIds: [`model-read:${candidate?.jobId}`] })), evidence, summary: "Joined two bounded read-only Scouts and reread each current job" }) }
     say("P1143_PARENT_ROLE_RESULT_STREAMED")
     yield { type: "completed", finishReason: "stop" }
+    } catch (error) { if (isParentResume) { try { say(`P1143_PARENT_RESUME_ERROR:${parentResumeStage}:${parentResumeErrorClass(error)}`) } catch {} } throw error }
   } }
 }
 
