@@ -67,6 +67,7 @@ type FixtureWebDatabase = Readonly<{ db: {
   $transaction<T>(work: (tx: unknown) => Promise<T>): Promise<T>
   customAgentRole: { findMany(args: unknown): Promise<readonly unknown[]> }
 } }>
+type GateRpcConnectionProbe = { captureNextSessionLockQuery: boolean; sessionLockBackendPid: number | null; sessionLockQueryCount: number }
 type CustomAgentRoleLookup = Readonly<{ userId: string; insertAfter: string; enabled: true }>
 type GateFailureDiagnostics = Readonly<Record<string, unknown>>
 type AuditPreflightState = "not_checked" | "passed" | "rejected" | "threw"
@@ -262,6 +263,191 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     restoreEnv("AZURE_KEY_VAULT_URL", priorAzureKeyVaultUrl)
     restoreEnv("AZURE_KEY_NAME", priorAzureKeyName)
   })
+
+  it("keeps a real Gate RPC and durable root-wait reconciliation in Session-before-wait lock order", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    await seedScheduledAuditAgentConfig(fixture)
+    const command = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool!)
+    let gateRpcBarrierArmed = false
+    const gateRpcConnectionProbe: GateRpcConnectionProbe = { captureNextSessionLockQuery: false,
+      sessionLockBackendPid: null, sessionLockQueryCount: 0 }
+    const gateRpcEntered = testBarrier(), releaseGateRpc = testBarrier()
+    const response = await setupFetcher(fixture, { beforeGateRpc: async () => {
+      if (!gateRpcBarrierArmed) return
+      gateRpcConnectionProbe.captureNextSessionLockQuery = true
+      gateRpcEntered.release()
+      await releaseGateRpc.promise
+    }, gateRpcConnectionProbe })
+
+    const rootStore = createPgRootTaskStore(pool as never)
+    const projection = createCanonicalSessionProjection(pool as never)
+    const projectionIdentity = { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId }
+    await projection.start(projectionIdentity)
+    const rootWait = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort,
+      "waiting_for_dependency", undefined, undefined, fixture.turnLease, undefined, true)
+    expect(rootWait.status).toBe("waiting_for_dependency")
+    if (rootWait.status !== "waiting_for_dependency" || !rootWait.waitId) throw new Error("scheduled Gate root wait missing")
+    await rootStore.finish({ lease: fixture.turnLease, rootTaskId: fixture.ids.rootTaskId, result: rootWait })
+    await projection.finish({ ...projectionIdentity, result: { status: rootWait.status } })
+    await expect(suspendAndReleaseWait(pool as never, { lease: fixture.turnLease, waitId: rootWait.waitId }))
+      .resolves.toMatchObject({ waitId: rootWait.waitId, handoff: "suspended", waitStatus: "waiting" })
+
+    const gateTaskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
+    const trace = await readScheduledAuditRootRecoveryTrace(fixture)
+    expectScheduledAuditRecoveryTrace(trace, fixture, 1, "waiting_for_tool", null)
+    const recoveryStep = trace.steps[0]
+    if (!recoveryStep) throw new Error("scheduled Gate recovery Step missing")
+    expect(recoveryStep.id).not.toBe(fixture.rootQuestionStepId)
+    expect(recoveryStep?.completionEvents[0]?.payload).toMatchObject({ status: "waiting_for_dependency", waitId: rootWait.waitId })
+    expect(recoveryStep?.waits.some(wait => wait.id === rootWait.waitId)).toBe(true)
+    const expectedWaitKey = `scheduled-gate-wait:${createHash("sha256")
+      .update(JSON.stringify([gateTaskId, recoveryStep.id, 0]), "utf8").digest("hex")}`
+    const gateWaitTrace = recoveryStep.waits.find(wait => wait.id === rootWait.waitId)
+    expect(gateWaitTrace).toMatchObject({ id: rootWait.waitId, stepId: recoveryStep.id, idempotencyKey: expectedWaitKey,
+      targetTaskIds: [gateTaskId], mode: "any", status: "waiting" })
+    const gateWaitRequest = debugRecord(debugRecord(gateWaitTrace?.result)?.request)
+    expect(gateWaitRequest).toEqual({ targetTaskIds: [gateTaskId], mode: "any", timeoutMs: 86_400_000,
+      scheduledGate: { gateTaskId, requestAttemptCount: 0 } })
+    const recoveryStepState = (await pool!.query<{ id: string; taskId: string | null; attempt: number; status: string }>(
+      `SELECT "id", "taskId", "attempt", "status" FROM "agent_steps" WHERE "id"=$1`, [recoveryStep.id])).rows[0]
+    expect(recoveryStepState).toMatchObject({ id: recoveryStep.id, attempt: 1, status: "waiting_for_tool" })
+    expect([fixture.ids.rootTaskId, null]).toContain(recoveryStepState?.taskId)
+    const beforeGateRun = await taskState(gateTaskId)
+    expect(beforeGateRun).toMatchObject({ status: "queued", attemptCount: 0, leaseOwner: null })
+
+    type ScopedWaitRow = {
+      id: string; userId: string; sessionId: string; turnId: string; parentTaskId: string; stepId: string;
+      idempotencyKey: string; targetTaskIds: unknown; mode: string; status: string; deadlineAt: Date;
+      matchedTaskIds: unknown; result: unknown; suspendedAt: Date | null; consumedAt: Date | null;
+      resolvedAt: Date | null; createdAt: Date; updatedAt: Date;
+    }
+    const readScopedUnconsumedWaits = async () => (await pool!.query<ScopedWaitRow>(
+      `SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds",
+         "mode", "status", "deadlineAt", "matchedTaskIds", "result", "suspendedAt", "consumedAt", "resolvedAt", "createdAt", "updatedAt"
+       FROM "agent_wait_conditions" WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3
+         AND "status" IN ('waiting', 'ready', 'timed_out') AND "consumedAt" IS NULL
+       ORDER BY "createdAt" ASC, "id" ASC`,
+      [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId])).rows
+    const waitsBeforeResolver = await readScopedUnconsumedWaits()
+    expect(waitsBeforeResolver.length).toBeGreaterThanOrEqual(2)
+    expect(waitsBeforeResolver.map(wait => wait.id)).toContain(fixture.prepareWaitId)
+    expect(waitsBeforeResolver.map(wait => wait.id)).toContain(rootWait.waitId)
+    const prepareWaitBefore = waitsBeforeResolver.find(wait => wait.id === fixture.prepareWaitId)
+    expect(prepareWaitBefore).toMatchObject({ id: fixture.prepareWaitId, userId: fixture.ids.userId,
+      sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId, parentTaskId: fixture.ids.rootTaskId,
+      stepId: fixture.rootQuestionStepId, targetTaskIds: [fixture.ids.prepareTaskId], mode: "all", status: "ready",
+      matchedTaskIds: [fixture.ids.prepareTaskId], suspendedAt: null, consumedAt: null })
+    const gateWaitBefore = waitsBeforeResolver.find(wait => wait.id === rootWait.waitId)
+    expect(gateWaitBefore).toMatchObject({ id: rootWait.waitId, userId: fixture.ids.userId,
+      sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId, parentTaskId: fixture.ids.rootTaskId,
+      stepId: recoveryStep.id, idempotencyKey: expectedWaitKey, status: "waiting", targetTaskIds: [gateTaskId],
+      mode: "any", matchedTaskIds: [], consumedAt: null })
+    expect(gateWaitBefore?.suspendedAt).toBeInstanceOf(Date)
+
+    const rootWaitState = await readRootTurnState(fixture)
+    expect(rootWaitState).toMatchObject({ turnStatus: "waiting_for_dependency", turnLeaseOwnerId: null,
+      sessionStatus: "running", rootStatus: "waiting", rootResult: { status: "waiting_for_dependency", waitId: rootWait.waitId } })
+    const rootAttemptBefore = (await pool!.query<{ attemptCount: number }>(
+      `SELECT "attemptCount" FROM "sub_agent_tasks" WHERE "id"=$1 AND "rootTaskId"=$1`, [fixture.ids.rootTaskId])).rows[0]
+    expect(rootAttemptBefore?.attemptCount).toBe(fixture.owner.rootAttemptCount)
+    const executionFenceBefore = (await pool!.query<{ status: string; attemptCount: number; claimToken: string | null }>(
+      `SELECT "status", "attemptCount", "state" #>> '{scheduledTaskGraphClaim,claimToken}' AS "claimToken"
+         FROM "agent_executions" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`,
+      [fixture.executionOwner.executionId, fixture.ids.userId, fixture.ids.sessionId])).rows[0]
+    expect(executionFenceBefore).toMatchObject({ status: "running", attemptCount: fixture.executionOwner.executionAttemptCount,
+      claimToken: expect.any(String) })
+
+    const resolverBatchSize = waitsBeforeResolver.length
+    expect(resolverBatchSize).toBeGreaterThan(0)
+    await prioritizeAndVerifyScheduledGateResolverTurn(pool!, fixture, resolverBatchSize, waitsBeforeResolver.length)
+
+    const isolatedResolverPool = poolScopedToScheduledGateFixture(pool!, {
+      userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId,
+    })
+    const activeRunner = startRunner(fixture, response.fetcher)
+    gateRpcBarrierArmed = true
+    let gateFinished: Promise<unknown> | undefined
+    let resolverRun: Promise<Awaited<ReturnType<typeof reconcileDurableWaits>>> | undefined
+    const resolverWaitLocked = testBarrier(), releaseResolver = testBarrier()
+    let resolverBackendPid: number | null = null
+    let lockedWaitIds: readonly string[] = []
+    try {
+      expect(await dispatchPendingSubagentOutbox(pool as never, activeRunner.queue, 10, fixture.ids.sessionId)).toBe(1)
+      await waitForBarrier(gateRpcEntered, "Scheduled Gate worker did not reach the RPC barrier")
+      gateFinished = waitForTask(activeRunner.worker, gateTaskId)
+      const runningGate = await taskState(gateTaskId)
+      expect(runningGate).toMatchObject({ status: "running", attemptCount: 1, leaseOwner: expect.any(String) })
+
+      resolverRun = reconcileDurableWaits(poolPausedAfterDurableWaitLock(isolatedResolverPool.pool, rootWait.waitId, {
+        userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId,
+      }, (backendPid, waitIds) => {
+        resolverBackendPid = backendPid
+        lockedWaitIds = waitIds
+        resolverWaitLocked.release()
+      }, releaseResolver.promise) as never, { ownerId: `gate-lock-order-${randomUUID()}`, batchSize: resolverBatchSize })
+      await waitForBarrier(resolverWaitLocked, "Wait resolver did not lock the exact Gate wait row")
+      expect([...lockedWaitIds].sort()).toEqual(waitsBeforeResolver.map(wait => wait.id).sort())
+      releaseGateRpc.release()
+      if (resolverBackendPid === null) throw new Error("Wait resolver lock owner PID was not recorded")
+      const gateRpcBackendPid = await waitForGateRpcConnectionPid(gateRpcConnectionProbe)
+      expect(gateRpcBackendPid).not.toBe(resolverBackendPid)
+      await waitForScheduledGateRpcSessionLock(resolverBackendPid, gateRpcBackendPid)
+      releaseResolver.release()
+
+      if (!resolverRun || !gateFinished) throw new Error("Gate/resolver concurrency operations did not start")
+      const [firstReport, gateOutcome] = await Promise.all([resolverRun, gateFinished])
+      expect(firstReport.scanned).toBe(resolverBatchSize)
+      expect(isolatedResolverPool.scopedRootTurnBatchQueries).toBe(1)
+      expect(isolatedResolverPool.isolatedChildWaitSessionScans).toBe(1)
+      expect(gateOutcome).toMatchObject({ status: "completed" })
+      expect(response.gateCalls()).toBe(1)
+      expect(await taskState(gateTaskId)).toMatchObject({ status: "completed", attemptCount: 1 })
+      const executionFenceAfter = (await pool!.query<{ status: string; attemptCount: number; claimToken: string | null }>(
+        `SELECT "status", "attemptCount", "state" #>> '{scheduledTaskGraphClaim,claimToken}' AS "claimToken"
+           FROM "agent_executions" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`,
+        [fixture.executionOwner.executionId, fixture.ids.userId, fixture.ids.sessionId])).rows[0]
+      expect(executionFenceAfter).toMatchObject({ status: executionFenceBefore?.status,
+        attemptCount: executionFenceBefore?.attemptCount, claimToken: executionFenceBefore?.claimToken })
+      const rootAttemptAfter = (await pool!.query<{ attemptCount: number }>(
+        `SELECT "attemptCount" FROM "sub_agent_tasks" WHERE "id"=$1 AND "rootTaskId"=$1`, [fixture.ids.rootTaskId])).rows[0]
+      expect(rootAttemptAfter?.attemptCount).toBe(fixture.owner.rootAttemptCount)
+
+      const waitsAfterFirstResolver = await readScopedUnconsumedWaits()
+      expect(waitsAfterFirstResolver.map(wait => wait.id).sort()).toEqual(waitsBeforeResolver.map(wait => wait.id).sort())
+      for (const wait of waitsBeforeResolver) {
+        expect(waitsAfterFirstResolver.find(current => current.id === wait.id)).toEqual(wait)
+      }
+      expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "waiting_for_dependency", turnLeaseOwnerId: null,
+        sessionStatus: "running", rootStatus: "waiting", rootResult: { status: "waiting_for_dependency", waitId: rootWait.waitId } })
+
+      const secondResolverBatchSize = waitsAfterFirstResolver.length
+      expect(secondResolverBatchSize).toBe(resolverBatchSize)
+      await prioritizeAndVerifyScheduledGateResolverTurn(pool!, fixture, secondResolverBatchSize, waitsAfterFirstResolver.length)
+      const secondReport = await reconcileDurableWaits(isolatedResolverPool.pool as never,
+        { ownerId: `gate-wake-${randomUUID()}`, batchSize: secondResolverBatchSize })
+      expect(secondReport.scanned).toBe(secondResolverBatchSize)
+      expect(isolatedResolverPool.scopedRootTurnBatchQueries).toBe(2)
+      expect(isolatedResolverPool.isolatedChildWaitSessionScans).toBe(2)
+      const waitsAfterSecondResolver = await readScopedUnconsumedWaits()
+      expect(waitsAfterSecondResolver.map(wait => wait.id).sort()).toEqual(waitsBeforeResolver.map(wait => wait.id).sort())
+      for (const wait of waitsBeforeResolver.filter(wait => wait.id !== rootWait.waitId)) {
+        expect(waitsAfterSecondResolver.find(current => current.id === wait.id)).toEqual(wait)
+      }
+      expect(waitsAfterSecondResolver.find(wait => wait.id === rootWait.waitId)).toMatchObject({
+        id: rootWait.waitId, userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId,
+        parentTaskId: fixture.ids.rootTaskId, stepId: recoveryStep.id, idempotencyKey: expectedWaitKey,
+        status: "ready", targetTaskIds: [gateTaskId], mode: "any", matchedTaskIds: [gateTaskId], consumedAt: null,
+      })
+      expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "queued", turnLeaseOwnerId: null,
+        sessionStatus: "running", rootStatus: "waiting", rootResult: { status: "waiting_for_dependency", waitId: rootWait.waitId } })
+    } finally {
+      releaseGateRpc.release()
+      releaseResolver.release()
+      if (resolverRun) await resolverRun.catch(() => undefined)
+      if (gateFinished) await gateFinished.catch(() => undefined)
+    }
+  }, 120_000)
 
   it("reserves a bounded fake Gate quality call and settles its BYOK usage in PostgreSQL", async () => {
     const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!)
@@ -1405,6 +1591,222 @@ async function waitForAuditRetryDue(taskId: string, timeoutMs = 20_000): Promise
   throw new Error("scheduled Audit retry did not become due according to the PostgreSQL clock")
 }
 
+function testBarrier(): Readonly<{ promise: Promise<void>; release(): void }> {
+  let release!: () => void
+  const promise = new Promise<void>(resolve => { release = resolve })
+  return { promise, release }
+}
+
+async function waitForBarrier(barrier: ReturnType<typeof testBarrier>, label: string, timeoutMs = 15_000): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([barrier.promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(label)), timeoutMs)
+    })])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function prioritizeAndVerifyScheduledGateResolverTurn(pool: Pick<Pool, "query">, fixture: Fixture,
+  batchSize: number, expectedWaitCount: number): Promise<void> {
+  const prioritizedTurn = await pool.query<{ updatedAt: Date }>(`UPDATE "agent_turns" AS target
+    SET "updatedAt" = COALESCE((
+      SELECT MIN(other."updatedAt") - INTERVAL '1 millisecond'
+      FROM "agent_turns" AS other
+      JOIN "agent_sessions" AS session ON session."id" = other."sessionId" AND session."userId" = other."userId"
+      WHERE other."id" <> target."id" AND other."status" IN ('waiting_for_dependency', 'in_progress')
+        AND other."rootTaskId" IS NOT NULL AND session."status" NOT IN ('aborted', 'archived')
+    ), clock_timestamp() - INTERVAL '1 millisecond')
+    FROM "agent_sessions" AS targetSession
+    WHERE target."id" = $1 AND target."sessionId" = $2 AND target."userId" = $3
+      AND target."status" = 'waiting_for_dependency' AND targetSession."id" = target."sessionId"
+      AND targetSession."userId" = target."userId" AND targetSession."status" NOT IN ('aborted', 'archived')
+    RETURNING target."updatedAt"`, [fixture.ids.turnId, fixture.ids.sessionId, fixture.ids.userId])
+  expect(prioritizedTurn.rows).toHaveLength(1)
+
+  const resolverBatchEvidence = await pool.query<{ batchRank: number; activeTurnCount: number;
+    precedingWaitCount: number; fixtureWaitCount: number }>(`WITH resolver_turn_batch AS (
+      SELECT turn."id", turn."userId", turn."sessionId",
+        ROW_NUMBER() OVER (ORDER BY turn."updatedAt" ASC, turn."id" ASC)::int AS "batchRank",
+        COUNT(*) OVER ()::int AS "activeTurnCount"
+      FROM "agent_sessions" AS session
+      JOIN "agent_turns" AS turn ON turn."sessionId" = session."id" AND turn."userId" = session."userId"
+      WHERE turn."status" IN ('waiting_for_dependency', 'in_progress') AND turn."rootTaskId" IS NOT NULL
+        AND session."status" NOT IN ('aborted', 'archived')
+      ORDER BY turn."updatedAt" ASC, turn."id" ASC LIMIT $4
+    ), target_turn AS (
+      SELECT * FROM resolver_turn_batch WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3
+    ), preceding_waits AS (
+      SELECT COUNT(wait."id")::int AS "count"
+      FROM resolver_turn_batch AS prior
+      JOIN target_turn AS target ON prior."batchRank" < target."batchRank"
+      JOIN "agent_wait_conditions" AS wait ON wait."userId" = prior."userId"
+        AND wait."sessionId" = prior."sessionId" AND wait."turnId" = prior."id"
+      WHERE wait."status" IN ('waiting', 'ready', 'timed_out') AND wait."consumedAt" IS NULL
+        AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = wait."sessionId"
+          AND session."status" NOT IN ('aborted', 'archived'))
+    ), fixture_waits AS (
+      SELECT COUNT(wait."id")::int AS "count" FROM "agent_wait_conditions" AS wait
+      WHERE wait."userId" = $2 AND wait."sessionId" = $3 AND wait."turnId" = $5
+        AND wait."status" IN ('waiting', 'ready', 'timed_out') AND wait."consumedAt" IS NULL
+        AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = wait."sessionId"
+          AND session."status" NOT IN ('aborted', 'archived'))
+    )
+    SELECT target."batchRank", target."activeTurnCount",
+      COALESCE((SELECT "count" FROM preceding_waits), 0)::int AS "precedingWaitCount",
+      (SELECT "count" FROM fixture_waits)::int AS "fixtureWaitCount"
+    FROM target_turn AS target`,
+  [fixture.ids.turnId, fixture.ids.userId, fixture.ids.sessionId, batchSize, fixture.ids.turnId])
+  const batchEvidence = resolverBatchEvidence.rows[0]
+  if (!batchEvidence) throw new Error("Scheduled Gate fixture Turn is absent from the resolver's ordered batch")
+  expect(batchEvidence).toMatchObject({ batchRank: 1, precedingWaitCount: 0, fixtureWaitCount: expectedWaitCount })
+  expect(batchEvidence.batchRank).toBeLessThanOrEqual(batchSize)
+  expect(expectedWaitCount).toBeLessThanOrEqual(batchSize - batchEvidence.precedingWaitCount)
+}
+
+// Keep the real root resolver transaction and row locks, but scope its global Turn selection to this fixture.
+// Child-wait reconciliation is outside this case's validation scope; isolate its global scan from other fixtures.
+function poolScopedToScheduledGateFixture(source: Pick<Pool, "connect">,
+  scope: Readonly<{ userId: string; sessionId: string; turnId: string }>) {
+  let scopedRootTurnBatchQueries = 0
+  let isolatedChildWaitSessionScans = 0
+  return {
+    pool: {
+      async connect() {
+        const client = await source.connect()
+        return {
+          async query(...args: Parameters<typeof client.query>) {
+            const statement = args[0]
+            if (typeof statement === "string" && statement.includes('FROM "agent_sessions" AS session')
+              && statement.includes('JOIN "agent_turns" AS turn') && statement.includes('turn."rootTaskId" IS NOT NULL')) {
+              const batchOrder = 'ORDER BY turn."updatedAt" ASC, turn."id" ASC LIMIT $1 FOR UPDATE OF session, turn SKIP LOCKED'
+              const values = args[1]
+              if (!statement.includes(batchOrder) || !Array.isArray(values) || values.length !== 1
+                || typeof values[0] !== "number" || !Number.isSafeInteger(values[0]) || values[0] < 1) {
+                throw new Error("Root wait resolver Turn selection SQL changed; refusing an unscoped fixture scan")
+              }
+              scopedRootTurnBatchQueries += 1
+              const scopedStatement = statement.replace(batchOrder,
+                `AND turn."id" = $2 AND turn."sessionId" = $3 AND turn."userId" = $4\n       ${batchOrder}`)
+              if (scopedStatement === statement) throw new Error("Root wait resolver fixture scope was not applied")
+              return client.query(scopedStatement, [values[0], scope.turnId, scope.sessionId, scope.userId])
+            }
+            if (typeof statement === "string" && statement.includes("CROSS JOIN LATERAL")
+              && statement.includes('FROM "agent_sessions" AS session')
+              && statement.includes('FROM "agent_wait_conditions" AS wait')) {
+              if (!statement.includes('SELECT MIN(COALESCE(wait."nextReconcileAt", wait."suspendedAt")) AS "firstDue"')
+                || !statement.includes("LIMIT $1 FOR UPDATE OF session SKIP LOCKED")) {
+                throw new Error("Child wait resolver session SQL changed; refusing an unscoped global scan")
+              }
+              isolatedChildWaitSessionScans += 1
+              return client.query("SELECT NULL WHERE FALSE")
+            }
+            return client.query(...args)
+          },
+          release: client.release.bind(client),
+        }
+      },
+    },
+    get scopedRootTurnBatchQueries() { return scopedRootTurnBatchQueries },
+    get isolatedChildWaitSessionScans() { return isolatedChildWaitSessionScans },
+  }
+}
+
+function poolPausedAfterDurableWaitLock(source: Pick<Pool, "connect">, gateWaitId: string,
+  scope: Readonly<{ userId: string; sessionId: string; turnId: string }>,
+  waitLocked: (backendPid: number, waitIds: readonly string[]) => void, releaseWaitLock: Promise<void>) {
+  let paused = false
+  return {
+    async connect() {
+      const client = await source.connect()
+      return {
+        async query(...args: Parameters<typeof client.query>) {
+          const result = await client.query(...args)
+          const statement = args[0]
+          const waitIds = result.rows.flatMap(row => {
+            const id = row && typeof row === "object" ? (row as { id?: unknown }).id : undefined
+            return typeof id === "string" ? [id] : []
+          })
+          if (!paused && typeof statement === "string" && statement.includes('FROM "agent_wait_conditions"')
+            && statement.includes('WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3')
+            && statement.includes('"consumedAt" IS NULL')
+            && /AND "status" IN \('waiting', 'ready', 'timed_out'\)/.test(statement)
+            && /LIMIT \$4 FOR UPDATE SKIP LOCKED/i.test(statement)
+            && waitIds.includes(gateWaitId)) {
+            const values = args[1]
+            if (!Array.isArray(values) || values[0] !== scope.userId || values[1] !== scope.sessionId || values[2] !== scope.turnId) {
+              throw new Error("Wait resolver query escaped the fixture Turn scope")
+            }
+            paused = true
+            const backend = await client.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
+            const backendPid = backend.rows[0]?.pid
+            if (typeof backendPid !== "number") throw new Error("Wait resolver PostgreSQL backend PID missing")
+            waitLocked(backendPid, waitIds)
+            await releaseWaitLock
+          }
+          return result
+        },
+        release: client.release.bind(client),
+      }
+    },
+  }
+}
+
+async function captureGateRpcSessionLockConnection(transactionClient: object, queryArgs: readonly unknown[],
+  probe: GateRpcConnectionProbe): Promise<void> {
+  if (!probe.captureNextSessionLockQuery) return
+  const sql = prismaSqlText(queryArgs[0])
+  if (!sql.includes('SELECT "id", "status" FROM "agent_sessions"') || !sql.includes("FOR UPDATE")) return
+  const queryRawUnsafe = Reflect.get(transactionClient, "$queryRawUnsafe", transactionClient)
+  if (typeof queryRawUnsafe !== "function") throw new Error("Gate RPC transaction cannot read its PostgreSQL backend PID")
+  const pidRows = await Reflect.apply(queryRawUnsafe, transactionClient, ["SELECT pg_backend_pid()::int AS pid"])
+  const pid = Array.isArray(pidRows) ? debugRecord(pidRows[0])?.pid : undefined
+  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid < 1) {
+    throw new Error("Gate RPC Session-lock PostgreSQL backend PID is invalid")
+  }
+  probe.sessionLockBackendPid = pid
+  probe.sessionLockQueryCount += 1
+  probe.captureNextSessionLockQuery = false
+}
+
+async function waitForGateRpcConnectionPid(probe: GateRpcConnectionProbe, timeoutMs = 15_000): Promise<number> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (probe.sessionLockBackendPid !== null) {
+      expect(probe.sessionLockQueryCount).toBe(1)
+      return probe.sessionLockBackendPid
+    }
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error("Gate RPC Session-lock connection PID was not captured")
+}
+
+function prismaSqlText(value: unknown): string {
+  if (!value || typeof value !== "object") return ""
+  for (const property of ["sql", "text", "statement"]) {
+    const candidate = Reflect.get(value, property)
+    if (typeof candidate === "string") return candidate
+  }
+  return ""
+}
+
+async function waitForScheduledGateRpcSessionLock(blockerPid: number, waiterPid: number, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const blocked = (await pool!.query<{ blocked: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM pg_stat_activity AS waiter
+         WHERE waiter.datname = current_database() AND waiter.pid = $2 AND waiter.state = 'active'
+           AND waiter.wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(waiter.pid))
+           AND waiter.query ILIKE '%FROM "agent_sessions"%' AND waiter.query ILIKE '%FOR UPDATE%'
+       ) AS blocked`, [blockerPid, waiterPid])).rows[0]?.blocked
+    if (blocked) return
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  throw new Error("Scheduled Gate RPC did not block on the resolver-held Session lock")
+}
+
 function startRunner(fixture: Fixture, fetcher: typeof fetch): Runner {
   const redis = new Redis(redisUrl!, { maxRetriesPerRequest: null, connectTimeout: 2_000, retryStrategy: attempt => attempt > 3 ? null : 100 })
   const queueName = `scheduled-audit-${randomUUID()}`
@@ -1541,7 +1943,8 @@ async function stopRunner(): Promise<void> {
   await active.redis.quit().catch(() => active.redis.disconnect())
 }
 async function setupFetcher(fixture: Fixture, options: { useReservedQualityReview?: boolean; useStoredAiSettings?: boolean;
-  beforeSecondGateReceiptFence?: () => Promise<void> } = {}) {
+  beforeSecondGateReceiptFence?: () => Promise<void>; beforeGateRpc?: () => Promise<void>;
+  gateRpcConnectionProbe?: GateRpcConnectionProbe } = {}) {
   if (options.useReservedQualityReview) vi.doMock(scheduledGateQualityReviewPath, async importOriginal => importOriginal())
   else vi.doMock(scheduledGateQualityReviewPath, () => ({ reviewApplicationQuality: async () => ({ kind: "unavailable" }) }))
   const customRoleLookups: CustomAgentRoleLookup[] = []
@@ -1555,6 +1958,31 @@ async function setupFetcher(fixture: Fixture, options: { useReservedQualityRevie
   const fixtureWebDb = await connectFixtureWebDatabase()
   const databaseWithoutCustomAgents = new Proxy(fixtureWebDb.db, {
     get(target, property, receiver) {
+      if (property === "$transaction" && options.gateRpcConnectionProbe) {
+        const invokeTransaction = Reflect.get(target, property, target)
+        if (typeof invokeTransaction !== "function") return invokeTransaction
+        return (input: unknown, ...transactionOptions: unknown[]) => {
+          if (typeof input !== "function") return Reflect.apply(invokeTransaction, target, [input, ...transactionOptions])
+          const callback = input as (tx: unknown) => unknown
+          const observedCallback = (tx: unknown) => {
+            if (!tx || typeof tx !== "object") return callback(tx)
+            const observedTransaction = new Proxy(tx, {
+              get(transactionTarget, transactionProperty, transactionReceiver) {
+                if (transactionProperty !== "$queryRaw") {
+                  return Reflect.get(transactionTarget, transactionProperty, transactionReceiver)
+                }
+                const queryRaw = Reflect.get(transactionTarget, transactionProperty, transactionTarget)
+                if (typeof queryRaw !== "function") return queryRaw
+                return (...queryArgs: unknown[]) => captureGateRpcSessionLockConnection(
+                  transactionTarget, queryArgs, options.gateRpcConnectionProbe!,
+                ).then(() => Reflect.apply(queryRaw, transactionTarget, queryArgs))
+              },
+            })
+            return callback(observedTransaction)
+          }
+          return Reflect.apply(invokeTransaction, target, [observedCallback, ...transactionOptions])
+        }
+      }
       if (property !== "customAgentRole") return Reflect.get(target, property, receiver)
       const delegate = Reflect.get(target, property, target)
       if (!delegate || typeof delegate !== "object") return delegate
@@ -2061,7 +2489,12 @@ async function setupFetcher(fixture: Fixture, options: { useReservedQualityRevie
         persistedGateDecisions: "not_checked", gateOutput: "not_checked",
         serializedCheckpoint: "not_called", checkpointSave: "not_called" }
     }
-    const response = await route.POST(request)
+    let response: Response
+    if (body.action === "gate") {
+      await options.beforeGateRpc?.()
+      try { response = await route.POST(request) }
+      finally { if (options.gateRpcConnectionProbe) options.gateRpcConnectionProbe.captureNextSessionLockQuery = false }
+    } else response = await route.POST(request)
     if (body.action === "scheduled_audit_execute" && response.status === 409) {
       auditPreflight = { ...auditPreflight, completedReportReplay: await inspectCompletedAuditReplay(body) }
     }
