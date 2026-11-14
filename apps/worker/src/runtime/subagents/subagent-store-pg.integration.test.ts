@@ -16,9 +16,19 @@ import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
 import {
   createWorkerUsageAuthorizer,
+  type WorkerUsageAuthorization,
   type WorkerUsageAuthorizationInput,
   type WorkerUsageSettlementInput,
 } from "../../queue/ai-usage-bridge.js"
+
+function noReservationUsageAuthorization(): WorkerUsageAuthorization {
+  return {
+    outputReservationRequired: false,
+    maxOutputTokens: null,
+    settle: async () => undefined,
+    settleUnknown: async (_settlement: WorkerUsageSettlementInput) => undefined,
+  }
+}
 
 const usageRouteMocks = vi.hoisted(() => ({
   database: null as unknown,
@@ -402,8 +412,101 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
     await adminPool.query(`GRANT UPDATE ("publishedAt", "attemptCount", "lastError", "payload") ON "agent_outbox" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT, INSERT, UPDATE ON "agent_steps", "agent_items", "agent_events", "agent_tree_budget_reservations" TO ${RUNTIME_ROLE}`)
-    await adminPool.query(`GRANT SELECT, INSERT, UPDATE ON ai_usage_events, ai_budgets TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`REVOKE UPDATE, DELETE ON "agent_root_usage_reservations", ai_usage_events, ai_budgets FROM ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT SELECT, INSERT ON "agent_root_usage_reservations" TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT UPDATE ("status", "actualOutputTokens", "outcomeStatus", "errorCode", "updatedAt", "startedAt", "settledAt", "releasedAt")
+      ON "agent_root_usage_reservations" TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT SELECT, INSERT ON ai_usage_events, ai_budgets TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT UPDATE (status, input_tokens, output_tokens, estimated_cost_usd, error_code, provider_started_at)
+      ON ai_usage_events TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT UPDATE (used, "limit", updated_at) ON ai_budgets TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT INSERT ON "agent_outbox" TO ${RUNTIME_ROLE}`)
+
+    const usagePrivileges = await adminPool.query<{
+      reservationReadInsert: boolean
+      reservationTableUpdate: boolean
+      reservationTableDelete: boolean
+      reservationLifecycleUpdate: boolean
+      reservationOwnerUpdate: boolean
+      usageReadInsert: boolean
+      usageTableUpdate: boolean
+      usageTableDelete: boolean
+      usageStartAndSettlementUpdate: boolean
+      usageIdentityUpdate: boolean
+      budgetReadInsert: boolean
+      budgetTableUpdate: boolean
+      budgetTableDelete: boolean
+      budgetLifecycleUpdate: boolean
+      budgetOwnerUpdate: boolean
+      reservationRlsEnabled: boolean
+      reservationTenantPolicy: boolean
+      runtimeRoleNoLogin: boolean
+      runtimeRoleNoSuperuser: boolean
+      runtimeRoleNoBypassRls: boolean
+    }>(`SELECT
+        has_table_privilege($1, 'public.agent_root_usage_reservations', 'SELECT')
+          AND has_table_privilege($1, 'public.agent_root_usage_reservations', 'INSERT') AS "reservationReadInsert",
+        has_table_privilege($1, 'public.agent_root_usage_reservations', 'UPDATE') AS "reservationTableUpdate",
+        has_table_privilege($1, 'public.agent_root_usage_reservations', 'DELETE') AS "reservationTableDelete",
+        has_column_privilege($1, 'public.agent_root_usage_reservations', 'status', 'UPDATE')
+          AND has_column_privilege($1, 'public.agent_root_usage_reservations', 'actualOutputTokens', 'UPDATE')
+          AND has_column_privilege($1, 'public.agent_root_usage_reservations', 'outcomeStatus', 'UPDATE')
+          AND has_column_privilege($1, 'public.agent_root_usage_reservations', 'errorCode', 'UPDATE')
+          AND has_column_privilege($1, 'public.agent_root_usage_reservations', 'updatedAt', 'UPDATE')
+          AND has_column_privilege($1, 'public.agent_root_usage_reservations', 'startedAt', 'UPDATE')
+          AND has_column_privilege($1, 'public.agent_root_usage_reservations', 'settledAt', 'UPDATE')
+          AND has_column_privilege($1, 'public.agent_root_usage_reservations', 'releasedAt', 'UPDATE') AS "reservationLifecycleUpdate",
+        has_column_privilege($1, 'public.agent_root_usage_reservations', 'userId', 'UPDATE') AS "reservationOwnerUpdate",
+        has_table_privilege($1, 'public.ai_usage_events', 'SELECT')
+          AND has_table_privilege($1, 'public.ai_usage_events', 'INSERT') AS "usageReadInsert",
+        has_table_privilege($1, 'public.ai_usage_events', 'UPDATE') AS "usageTableUpdate",
+        has_table_privilege($1, 'public.ai_usage_events', 'DELETE') AS "usageTableDelete",
+        has_column_privilege($1, 'public.ai_usage_events', 'status', 'UPDATE')
+          AND has_column_privilege($1, 'public.ai_usage_events', 'input_tokens', 'UPDATE')
+          AND has_column_privilege($1, 'public.ai_usage_events', 'output_tokens', 'UPDATE')
+          AND has_column_privilege($1, 'public.ai_usage_events', 'estimated_cost_usd', 'UPDATE')
+          AND has_column_privilege($1, 'public.ai_usage_events', 'error_code', 'UPDATE')
+          AND has_column_privilege($1, 'public.ai_usage_events', 'provider_started_at', 'UPDATE') AS "usageStartAndSettlementUpdate",
+        has_column_privilege($1, 'public.ai_usage_events', 'user_id', 'UPDATE') AS "usageIdentityUpdate",
+        has_table_privilege($1, 'public.ai_budgets', 'SELECT')
+          AND has_table_privilege($1, 'public.ai_budgets', 'INSERT') AS "budgetReadInsert",
+        has_table_privilege($1, 'public.ai_budgets', 'UPDATE') AS "budgetTableUpdate",
+        has_table_privilege($1, 'public.ai_budgets', 'DELETE') AS "budgetTableDelete",
+        has_column_privilege($1, 'public.ai_budgets', 'used', 'UPDATE')
+          AND has_column_privilege($1, 'public.ai_budgets', 'limit', 'UPDATE')
+          AND has_column_privilege($1, 'public.ai_budgets', 'updated_at', 'UPDATE') AS "budgetLifecycleUpdate",
+        has_column_privilege($1, 'public.ai_budgets', 'user_id', 'UPDATE') AS "budgetOwnerUpdate",
+        (SELECT c.relrowsecurity FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public' AND c.relname = 'agent_root_usage_reservations') AS "reservationRlsEnabled",
+        EXISTS (SELECT 1 FROM pg_policies AS p WHERE p.schemaname = 'public'
+          AND p.tablename = 'agent_root_usage_reservations' AND p.policyname = 'agent_root_usage_reservations_user_isolation'
+          AND p.qual LIKE '%app.user_id%' AND p.with_check LIKE '%app.user_id%') AS "reservationTenantPolicy",
+        (SELECT NOT rolcanlogin FROM pg_roles WHERE rolname = $1) AS "runtimeRoleNoLogin",
+        (SELECT NOT rolsuper FROM pg_roles WHERE rolname = $1) AS "runtimeRoleNoSuperuser",
+        (SELECT NOT rolbypassrls FROM pg_roles WHERE rolname = $1) AS "runtimeRoleNoBypassRls"`, [RUNTIME_ROLE])
+    expect(usagePrivileges.rows).toEqual([{
+      reservationReadInsert: true,
+      reservationTableUpdate: false,
+      reservationTableDelete: false,
+      reservationLifecycleUpdate: true,
+      reservationOwnerUpdate: false,
+      usageReadInsert: true,
+      usageTableUpdate: false,
+      usageTableDelete: false,
+      usageStartAndSettlementUpdate: true,
+      usageIdentityUpdate: false,
+      budgetReadInsert: true,
+      budgetTableUpdate: false,
+      budgetTableDelete: false,
+      budgetLifecycleUpdate: true,
+      budgetOwnerUpdate: false,
+      reservationRlsEnabled: true,
+      reservationTenantPolicy: true,
+      runtimeRoleNoLogin: true,
+      runtimeRoleNoSuperuser: true,
+      runtimeRoleNoBypassRls: true,
+    }])
+
     await seedFixture(adminPool, userA)
     await seedFixture(adminPool, userB)
 
@@ -703,7 +806,7 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       pool: executionPool as unknown as PgPool,
       turnStore: createPgTurnEngineStore(executionPool as never),
       treeBudget: createPgTreeBudgetReservationStore(executionPool as never),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => noReservationUsageAuthorization(),
       modelRuntimeFactory: ({ task }) => ({
         id: `pg-child-fixture-model-${task.id}`, profile: modelProfile,
         async *stream(request: HarnessModelRequest) {
@@ -864,6 +967,10 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       settlement?: WorkerUsageSettlementInput
     }
     const captured: CapturedUsage[] = []
+    const forwardedAuthorizations: Array<{
+      readonly source: Awaited<ReturnType<typeof bridge>>
+      readonly forwarded: Awaited<ReturnType<typeof bridge>>
+    }> = []
     const inputByTask = new Map<string, WorkerUsageAuthorizationInput>()
     const staleFenceChecks = new Set<string>()
     const authorizeUsage = async (input: WorkerUsageAuthorizationInput) => {
@@ -876,6 +983,14 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       const reservation = await bridge(callerInput)
       const operationId = operationIdByStep.get(input.stepId)
       if (!operationId) throw new Error("The real usage route returned no operation identity")
+      expect(typeof reservation.outputReservationRequired).toBe("boolean")
+      expect(reservation.outputReservationRequired
+        ? Number.isSafeInteger(reservation.maxOutputTokens) && Number(reservation.maxOutputTokens) > 0
+        : reservation.maxOutputTokens === null).toBe(true)
+      expect(typeof reservation.start).toBe("function")
+      expect(typeof reservation.release).toBe("function")
+      expect(typeof reservation.settle).toBe("function")
+      expect(typeof reservation.settleUnknown).toBe("function")
       const reserved = await adminPool!.query<{ status: string; userId: string | null; credentialSource: string; runtime: string }>(
         `SELECT status, user_id AS "userId", credential_source AS "credentialSource", runtime
           FROM ai_usage_events WHERE id = $1`, [operationId],
@@ -889,7 +1004,8 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       expect(snapshot.budgets).toEqual([{ month: usageMonth, used: reservationCount, limit: 10 }])
       const entry: CapturedUsage = { input, operationId, reservation }
       captured.push(entry)
-      return {
+      const forwarded: Awaited<ReturnType<typeof bridge>> = {
+        ...reservation,
         settle: async (settlement: WorkerUsageSettlementInput) => {
           await reservation.settle(settlement)
           entry.settlement = settlement
@@ -903,6 +1019,8 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
           }])
         },
       }
+      forwardedAuthorizations.push({ source: reservation, forwarded })
+      return forwarded
     }
 
     const modelProfile = {
@@ -976,6 +1094,14 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       expect(captured).toHaveLength(4)
       expect(new Set(captured.map(value => value.input.stepId)).size).toBe(4)
       expect(new Set(captured.map(value => value.operationId)).size).toBe(4)
+      expect(forwardedAuthorizations).toHaveLength(captured.length)
+      for (const { source, forwarded } of forwardedAuthorizations) {
+        expect(forwarded.outputReservationRequired).toBe(source.outputReservationRequired)
+        expect(forwarded.maxOutputTokens).toBe(source.maxOutputTokens)
+        expect(forwarded.start).toBe(source.start)
+        expect(forwarded.release).toBe(source.release)
+        expect(forwarded.settleUnknown).toBe(source.settleUnknown)
+      }
       expect(captured.map(value => value.settlement)).toEqual(expect.arrayContaining([
         { status: "success", inputTokens: 21, outputTokens: 4, estimatedCostUsd: 0.002 },
         { status: "success", inputTokens: 22, outputTokens: 5, estimatedCostUsd: 0.003 },
@@ -1006,7 +1132,11 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       ])).toEqual(beforeForeign)
 
       const authorizeRequests = requests.filter(request => request.body.operation === "authorize")
+      const startRequests = requests.filter(request => request.body.operation === "start")
       expect(authorizeRequests.filter(request => request.status === 200)).toHaveLength(4)
+      expect(startRequests).toHaveLength(captured.length)
+      expect(startRequests.map(request => request.body.input?.operationId))
+        .toEqual(expect.arrayContaining(captured.map(value => value.operationId)))
       expect(authorizeRequests.filter(request => request.status === 409).map(request => request.response)).toEqual([
         expect.objectContaining({ code: "usage_fence_rejected" }),
         expect.objectContaining({ code: "usage_fence_rejected" }),

@@ -131,6 +131,20 @@ describe("ObjectiveStartCommandService validation", () => {
     await expect(service.start(unsafeCommand({ content: [{ type: "attachment_ref", attachmentId: "   ", mediaType: "application/pdf" }] })))
       .rejects.toMatchObject({ code: "invalid_command", status: 422 })
     await expect(service.start(command("Find Dublin roles", "automation"))).rejects.toMatchObject({ code: "invalid_command", status: 422 })
+    await expect(service.start(unsafeCommand({ ...command("Find roles"), verificationRequirements: { raw: "unknown" } })))
+      .rejects.toMatchObject({ code: "invalid_command", status: 422 })
+    vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "0")
+    try {
+      await expect(service.start(unsafeCommand({
+        ...command("Find roles"),
+        verificationRequirements: {
+          schemaVersion: "agent-harness.v2.objective-requirements.v2",
+          requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["dublin"] } }],
+        },
+      }))).rejects.toMatchObject({ code: "invalid_command", status: 422 })
+    } finally {
+      vi.unstubAllEnvs()
+    }
     expect(transaction).not.toHaveBeenCalled()
   })
 
@@ -166,8 +180,27 @@ describe("ObjectiveStartCommandService validation", () => {
       expect(createRootTurn.mock.calls[0]?.[5]).toEqual(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
 
       createRootTurn.mockClear()
+      const locationRequirements = {
+        schemaVersion: "agent-harness.v2.objective-requirements.v2",
+        requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: [" Dublin ", "Berlin"] } }],
+      }
+      vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "1")
+      try {
+        await service.start(unsafeCommand({ ...command("Find Dublin roles"), clientMessageId: "start_location", verificationRequirements: locationRequirements }))
+      } finally {
+        vi.unstubAllEnvs()
+      }
+      expect(createRootTurn.mock.calls[0]?.[6]).toEqual({
+        schemaVersion: "agent-harness.v2.objective-requirements.v2",
+        requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["berlin", "dublin"] } }],
+      })
+      expect(createRootTurn.mock.calls[0]?.[5]).toEqual(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
+      createRootTurn.mockClear()
       const malformed = { raw: "must not escape" }
-      await service.start(unsafeCommand({ ...command("Find Dublin roles"), clientMessageId: "start_invalid", verificationRequirements: malformed }))
+      await expect(service.start(unsafeCommand({ ...command("Find Dublin roles"), clientMessageId: "start_invalid", verificationRequirements: malformed })))
+        .rejects.toMatchObject({ code: "invalid_command", status: 422 })
+      expect(createRootTurn).not.toHaveBeenCalled()
+      await service.start(unsafeCommand({ ...command("Find Dublin roles"), clientMessageId: "start_null", verificationRequirements: null }))
       expect(createRootTurn.mock.calls[0]?.[6]).toBeNull()
       expect(createRootTurn.mock.calls[0]?.[5]).toEqual(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
       expect(createRootTurn.mock.calls[0]?.[1]).toMatchObject({ source: "user", verificationRequirements: null })

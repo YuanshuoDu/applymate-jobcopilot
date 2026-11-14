@@ -285,6 +285,8 @@ describe("createPgRootTaskStore", () => {
     const insert = fake.client.query.mock.calls.find(([sql]) => sql.includes("INSERT INTO \"sub_agent_tasks\""))
     expect(insert?.[1]).not.toContain(expect.objectContaining({ apiKey: expect.anything() }))
     expect(insert?.[1]).toContain(JSON.stringify(["jobs.search"]))
+    expect(insert?.[0]).toContain('"budgetSnapshot", "outputTokenReservationVersion"')
+    expect(insert?.[0]).toContain("$9::jsonb, 1, 1, 1, $10")
     expect(fake.calls.findIndex(sql => sql.includes('FROM "agent_sessions"'))).toBeLessThan(fake.calls.findIndex(sql => sql.includes('FROM "agent_turns"')))
   })
 
@@ -301,6 +303,7 @@ describe("createPgRootTaskStore", () => {
     const update = fake.client.query.mock.calls.find(([sql]) => sql.includes("SET \"status\" = 'running'"))
     expect(update?.[1]).toContain("worker-1")
     expect(update?.[1]).toContain(JSON.stringify(["jobs.search", "jobs.get"]))
+    expect(update?.[0]).not.toContain("outputTokenReservationVersion")
   })
 
   it("rejects a secret bearing snapshot", async () => {

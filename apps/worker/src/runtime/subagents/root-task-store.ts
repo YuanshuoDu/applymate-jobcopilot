@@ -124,10 +124,10 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
         await client.query(
           `INSERT INTO "sub_agent_tasks"
            ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
-            "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot",
+           "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "outputTokenReservationVersion",
             "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "startedAt", "updatedAt")
            VALUES ($1, $2, $3, $1, NULL, $4, 0, 'orchestrator', 'root', 'running', $5, '[]'::jsonb, '[]'::jsonb,
-                   $6::jsonb, '{}'::jsonb, '{}'::jsonb, $7::jsonb, $8::jsonb, $9::jsonb, 1, 1, $10, $11, $12, $12)`,
+                   $6::jsonb, '{}'::jsonb, '{}'::jsonb, $7::jsonb, $8::jsonb, $9::jsonb, 1, 1, 1, $10, $11, $12, $12)`,
           [id, lease.sessionId, lease.turnId, `/${id}`, input.goal, json(input.allowedActions, [], "allowed_actions"), json(input.modelProfileSnapshot, {}, "model_profile"), json(input.toolPolicySnapshot, {}, "tool_policy"), json(input.budgetSnapshot, {}, "budget"), lease.ownerId, lease.leaseExpiresAt, now],
         )
         const linked = await client.query(

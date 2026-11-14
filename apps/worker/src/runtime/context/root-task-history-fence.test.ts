@@ -229,6 +229,17 @@ describe("root task history current fence", () => {
     expect(rootTaskHistoryObjectiveDigest(inputFor({ schemaVersion: "bad", requirements: [] }), root)).toBeUndefined()
   })
 
+  it("binds the complete normalized location allowlist into history identity", () => {
+    const root = { goal: "Plan a role", successCriteria: ["Compare roles"] }
+    const inputFor = (locations: readonly string[]) => ({ input: { goal: root.goal, verificationRequirements: {
+      schemaVersion: "agent-harness.v2.objective-requirements.v2",
+      requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations } }],
+    } } })
+    const fullDigest = rootTaskHistoryObjectiveDigest(inputFor(["Dublin", "Berlin"]), root)
+    expect(rootTaskHistoryObjectiveDigest(inputFor(["berlin", "dublin"]), root)).toBe(fullDigest)
+    expect(rootTaskHistoryObjectiveDigest(inputFor(["Berlin"]), root)).not.toBe(fullDigest)
+  })
+
   it("keeps same-session fencing when cross-session origin or start witness is unavailable", async () => {
     const unknownIntent = fixture({ turnInput: { goal: " Plan a role ", intent: { kind: "unknown", version: 1 } } })
     const unknownFence = await readRootTaskHistoryFence(unknownIntent.client, { ...unknownIntent.input, crossSessionRootTaskHistoryEnabled: true })

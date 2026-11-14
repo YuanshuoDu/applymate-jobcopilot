@@ -186,26 +186,36 @@ describe("same-attempt mailbox continuation", () => {
       step(child, { id: "sibling-step", taskId: "sibling-task", ordinal: 1 }),
     ], [
       item(child, { id: "final-1", stepId: "step-1", ordinal: 0, content: { text: "Found one role." } }),
-      item(child, { ordinal: 2, stepId: "step-2", id: "call-1", type: "tool_call", phase: null,
-        content: { toolCallId: "call-a", toolName: "jobs.search", input: { query: "Dublin" } } }),
-      item(child, { ordinal: 2, stepId: "step-2", id: "result-1", type: "tool_result", phase: null,
-        content: { toolCallId: "call-a", output: { jobs: [{ id: "job-1" }] }, errorCode: null } }),
+      item(child, { ordinal: 2, stepId: "step-2", id: "call-1", revision: 1, type: "tool_call", phase: null,
+        content: { toolCallId: "toolcall-current", toolName: "jobs.search", input: { query: "Dublin" } } }),
+      item(child, { ordinal: 2, stepId: "step-2", id: "result-1", revision: 2, type: "tool_result", phase: null,
+        content: { toolCallId: "toolcall-current", output: { jobs: [{ id: "job-1" }] }, errorCode: null } }),
       item(child, { ordinal: 2, stepId: "step-2", id: "final-2", content: { text: "Found two roles." } }),
     ], currentRow(child), [
       step(child, { id: "prior-step", attempt: 1, ordinal: 0, inputThroughSequence: "3", consumedInputIds: ["input-old"], inputTokens: 7, outputTokens: 4, estimatedCostUsd: "0.25" }),
     ], [
-      item(child, { id: "prior-call", attempt: 1, stepId: "prior-step", type: "tool_call", phase: null,
-        content: { toolCallId: "prior-call-id", toolName: "jobs.search", input: { query: "Galway" } } }),
-      item(child, { id: "prior-result", attempt: 1, stepId: "prior-step", type: "tool_result", phase: null,
-        content: { toolCallId: "prior-call-id", output: { jobs: [] }, errorCode: null } }),
+      item(child, { id: "prior-call", revision: 3, attempt: 1, stepId: "prior-step", type: "tool_call", phase: null,
+        content: { toolCallId: "toolcall-prior", toolName: "jobs.search", input: { query: "Galway" } } }),
+      item(child, { id: "prior-result", revision: 4, attempt: 1, stepId: "prior-step", type: "tool_result", phase: null,
+        content: { toolCallId: "toolcall-prior", output: { jobs: [] }, errorCode: null } }),
     ], true)
 
     await expect(loadChildSameAttemptContinuation(db.pool as never, child, now)).resolves.toEqual({
       resume: { nextOrdinal: 3, stepCount: 3, toolCallCount: 2, inputThroughSequence: 8n, consumedInputIds: ["input-old", "input-1", "input-2"],
         usage: { inputTokens: 20, outputTokens: 11, estimatedCostUsd: 1 } },
       observations: [
-        { id: "child-resume:prior-result", content: { toolCallId: "prior-call-id", toolName: "jobs.search", input: { query: "Galway" }, status: "completed", output: { jobs: [] }, errorCode: null } },
-        { id: "child-resume:result-1", content: { toolCallId: "call-a", toolName: "jobs.search", input: { query: "Dublin" }, status: "completed", output: { jobs: [{ id: "job-1" }] }, errorCode: null } },
+        { id: "child-resume:prior-result", content: { toolCallId: "toolcall-prior", toolName: "jobs.search", input: { query: "Galway" }, status: "completed", output: { jobs: [] }, errorCode: null } },
+        { id: "child-resume:result-1", content: { toolCallId: "toolcall-current", toolName: "jobs.search", input: { query: "Dublin" }, status: "completed", output: { jobs: [{ id: "job-1" }] }, errorCode: null } },
+      ],
+      childToolReplayReceipts: [
+        { userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, taskId: child.id,
+          attempt: 1, stepId: "prior-step", toolCallId: "toolcall-prior", toolName: "jobs.search", input: { query: "Galway" },
+          callItem: { id: "prior-call", revision: 3 }, resultItem: { id: "prior-result", revision: 4 },
+          result: { status: "completed", output: { jobs: [] }, errorCode: null } },
+        { userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, taskId: child.id,
+          attempt: 2, stepId: "step-2", toolCallId: "toolcall-current", toolName: "jobs.search", input: { query: "Dublin" },
+          callItem: { id: "call-1", revision: 1 }, resultItem: { id: "result-1", revision: 2 },
+          result: { status: "completed", output: { jobs: [{ id: "job-1" }] }, errorCode: null } },
       ],
       previousFinalText: "Found two roles.", leaseExpiresAt: future,
     })

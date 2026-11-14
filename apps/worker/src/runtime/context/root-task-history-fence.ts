@@ -114,7 +114,9 @@ export function rootTaskHistoryObjectiveDigest(turnInput: unknown, root: Row, _i
   const verificationRequirements = requirements.status === "valid"
     ? [...requirements.requirements]
       .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
-      .map(({ id, kind, minimum }) => ({ id, kind, minimum }))
+      .map(requirement => requirement.kind === "candidate_location_in"
+        ? { id: requirement.id, kind: requirement.kind, locations: [...requirement.locations] }
+        : { id: requirement.id, kind: requirement.kind, minimum: requirement.minimum })
     : null
   return digestNativeVerificationValue({
     goal: resolved.goal, criteria,

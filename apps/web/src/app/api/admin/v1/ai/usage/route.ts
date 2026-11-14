@@ -17,7 +17,7 @@ export async function GET(request: NextRequest) {
         COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
         COALESCE(SUM(estimated_cost_usd), 0)::float AS cost,
         ROUND(AVG(latency_ms))::int AS "avgLatency"
-      FROM ai_usage_events WHERE created_at >= ${since}
+      FROM ai_usage_events WHERE created_at >= ${since} AND status IN ('success', 'error')
       GROUP BY DATE_TRUNC('day', created_at) ORDER BY day ASC
     `,
     db.$queryRaw<ProviderRow[]>`
@@ -25,7 +25,7 @@ export async function GET(request: NextRequest) {
         COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
         COALESCE(SUM(estimated_cost_usd), 0)::float AS cost,
         ROUND(AVG(latency_ms))::int AS "avgLatency"
-      FROM ai_usage_events WHERE created_at >= ${since}
+      FROM ai_usage_events WHERE created_at >= ${since} AND status IN ('success', 'error')
       GROUP BY provider, model ORDER BY cost DESC, calls DESC
     `,
   ])

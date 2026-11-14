@@ -48,6 +48,29 @@ describe('TaskGraphVerificationSummary', () => {
     expect(renderToStaticMarkup(<TaskGraphVerificationSummary node={null} lang="en" />)).toBe('')
   })
 
+  it('renders only fixed localized reason labels and leaves legacy checks status-only', () => {
+    const failed: TaskGraphVerificationDisplayNode = { status: 'failed', checks: [
+      { kind: 'reported_score_gte', minimumScore: 7, minimumFindings: 1, aggregation: 'any', status: 'failed', displayReason: 'score_below_minimum' },
+    ], totalCount: 1, passedCount: 0, failedCount: 1, unverifiedCount: 0 }
+    const failedHtml = renderToStaticMarkup(<TaskGraphVerificationSummary node={failed} lang="en" />)
+    expect(failedHtml).toContain('Reported score below minimum')
+    expect(failedHtml).not.toContain('reported_score_below_minimum')
+    expect(failedHtml).not.toContain('criterionId')
+
+    const unverified: TaskGraphVerificationDisplayNode = { status: 'unverified', checks: [
+      { kind: 'evidence_count_gte', minimum: 1, status: 'unverified', displayReason: 'required_evidence_missing' },
+    ], totalCount: 1, passedCount: 0, failedCount: 0, unverifiedCount: 1 }
+    const unverifiedHtml = renderToStaticMarkup(<TaskGraphVerificationSummary node={unverified} lang="zh" />)
+    expect(unverifiedHtml).toContain('缺少所需的规范证据')
+    expect(unverifiedHtml).not.toContain('canonical_evidence_missing')
+
+    const legacy = renderToStaticMarkup(<TaskGraphVerificationSummary node={{ ...failed, checks: [
+      { kind: 'reported_score_gte', minimumScore: 7, minimumFindings: 1, aggregation: 'any', status: 'failed' },
+    ] }} lang="en" />)
+    expect(legacy).toContain('Failed')
+    expect(legacy).not.toContain('Reported score below minimum')
+  })
+
   it('shows each recorded coverage outcome without inferring verification from task completion', () => {
     const cases = [
       { status: 'passed', passedCount: 1, failedCount: 0, unverifiedCount: 0, label: 'Passed' },

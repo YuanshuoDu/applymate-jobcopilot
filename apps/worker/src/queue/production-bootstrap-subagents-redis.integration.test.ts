@@ -694,7 +694,7 @@ async function deterministicChildRuntime(toolCalls: Array<{ taskId: string; tool
     pool: { async connect() { throw new Error("fixture pool should not be used by the deterministic child runtime") } } as never,
     turnStore,
     treeBudget,
-    authorizeUsage: async () => ({ settle: async () => undefined }),
+    authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     modelRuntimeFactory: () => model,
     toolRuntimeFactory: () => ({
       definitions: [tool],

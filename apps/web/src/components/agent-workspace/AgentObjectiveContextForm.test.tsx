@@ -13,7 +13,7 @@ import {
 const source = readFileSync(new URL('./AgentObjectiveContextForm.tsx', import.meta.url), 'utf8')
 
 const emptyState: AgentObjectiveContextFormState = {
-  objective: '', context: '', open: false, pending: false, accepted: false, error: null,
+  objective: '', context: '', allowedLocationsDraft: '', open: false, pending: false, accepted: false, error: null,
 }
 
 describe('AgentObjectiveContextForm', () => {
@@ -52,6 +52,7 @@ describe('AgentObjectiveContextForm', () => {
     let state = objectiveContextFormReducer(emptyState, { type: 'open' })
     state = objectiveContextFormReducer(state, { type: 'edit-objective', value: '  Find senior roles  ' })
     state = objectiveContextFormReducer(state, { type: 'edit-context', value: '\nReference wording stays exact.\n' })
+    state = objectiveContextFormReducer(state, { type: 'edit-allowed-locations', value: 'Dublin, Ireland\nBerlin' })
     expect(canSubmitObjectiveContext(state)).toBe(true)
     const pending = objectiveContextFormReducer(state, { type: 'pending' })
     expect(canSubmitObjectiveContext(pending)).toBe(false)
@@ -62,6 +63,7 @@ describe('AgentObjectiveContextForm', () => {
       open: true,
       objective: '  Find senior roles  ',
       context: '\nReference wording stays exact.\n',
+      allowedLocationsDraft: 'Dublin, Ireland\nBerlin',
       pending: false,
       error: { message: 'Session changed', conflict: true },
     })
@@ -83,12 +85,15 @@ describe('AgentObjectiveContextForm', () => {
 
   it('keeps the copy and interaction boundary explicit', () => {
     expect(source).toContain('The objective defines what must be complete. Background is reference material for the task.')
+    expect(source).toContain('Allowed job locations (optional)')
+    expect(source).toContain('one location per line')
+    expect(source).toContain('Dublin does not match Dublin, Ireland. Aliases are not inferred.')
     expect(source).toContain('Text is sent unchanged.')
     expect(source).toContain('error.conflict')
     expect(source).toContain('No existing run was changed; edit or retry explicitly.')
     expect(source).toContain('attachedFileCount > 0 || ordinaryComposerDraftPresent')
     expect(source).toContain('that content will not be sent or discarded here.')
-    expect(source.match(/coordinatorRef\.current\?\.draftEdited\(\)/g)).toHaveLength(2)
+    expect(source.match(/coordinatorRef\.current\?\.draftEdited\(\)/g)).toHaveLength(3)
     const acceptedAt = source.indexOf("dispatchAction({ type: 'accepted' })")
     const callbackAt = source.indexOf('onAccepted(result.sessionId, result.objective)')
     expect(acceptedAt).toBeGreaterThanOrEqual(0)

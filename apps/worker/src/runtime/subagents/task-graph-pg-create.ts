@@ -58,6 +58,11 @@ export async function createGraphTasks(
   priorTaskIds: ReadonlyMap<string, string>, provenance?: Pick<LoadedGraph, "sourceInputCheckpointByNodeKey" | "currentInputCheckpoint">,
   operationalFailureReuse?: OperationalFailureCapacityReuse,
 ): Promise<CreatedGraphTasks> {
+  if (input.verificationRequirements?.status === "invalid") {
+    throw Object.assign(new Error("Canonical objective verification requirements are invalid"), {
+      code: "task_graph_objective_requirements_invalid",
+    })
+  }
   const parentTask = { budgetSnapshot: parent.budgetSnapshot } as Pick<SubagentTaskRecord, "budgetSnapshot">
   const policy = policyFromTask(parentTask)
   safeProposalSize(input.proposal)
@@ -120,6 +125,9 @@ export async function createGraphTasks(
   })
   await validateTaskGraphRepairTargets(client, input, current, priorTaskIds)
   const coverage = evaluateTaskGraphObjectiveCoverage(input.verificationRequirements ?? { status: "absent" }, appended.state.nodes, input.templates, input.scope.rootTaskId)
+  if (coverage.status === "invalid") throw Object.assign(new Error("Canonical objective verification requirements are invalid"), {
+    code: "task_graph_objective_requirements_invalid",
+  })
   if (coverage.status === "incomplete") throw Object.assign(new Error("TaskGraph plan does not cover the canonical objective requirements"), {
     code: "task_graph_objective_coverage_incomplete", requirements: coverage.requirements,
   })

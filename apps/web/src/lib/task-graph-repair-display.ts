@@ -3,14 +3,16 @@ import {
   parseTaskGraphSnapshot,
   TASK_GRAPH_SCHEMA_VERSION,
   type PlanLedger,
+  type TaskGraphVerificationDisplayNode,
+  type TaskGraphVerificationSummary,
 } from '@jobcopilot/agent-protocol'
 
 type PlanLedgerNode = PlanLedger['nodes'][number]
 export type PlanLedgerWithRepairTargetGoals = Omit<PlanLedger, 'nodes'> & {
-  nodes: readonly (PlanLedgerNode & { repairTargetGoal?: string })[]
+  nodes: readonly (PlanLedgerNode & { repairTargetGoal?: string; repairTargetNodeIndex?: number })[]
 }
 
-/** Adds only the already-redacted goal for a strictly matched same-root repair target. */
+/** Adds only safe target details from a strictly matched same-root repair relation. */
 export function decoratePlanLedgerRepairTargets(
   projection: PlanLedger,
   rawGraph: unknown,
@@ -18,9 +20,11 @@ export function decoratePlanLedgerRepairTargets(
 ): PlanLedgerWithRepairTargetGoals {
   const graph = parseTaskGraphSnapshot(rawGraph)
   const raw = parseRecord(rawGraph)
-  if (!graph || !raw || !trustedRootTaskId || !Array.isArray(raw.nodes)) return projection
+  if (!graph || !raw || !trustedRootTaskId || !Array.isArray(raw.nodes)
+    || raw.nodes.length !== graph.nodes.length || projection.nodes.length !== graph.nodes.length
+    || graph.nodes.some((node, index) => projection.nodes[index]?.key !== node.key)) return projection
 
-  const repairGoals = new Map<string, string>()
+  const repairTargets = new Map<string, { goal: string; nodeIndex: number }>()
   for (let index = 0; index < graph.nodes.length; index += 1) {
     const source = graph.nodes[index]
     const rawNode = record(raw.nodes[index])
@@ -28,18 +32,22 @@ export function decoratePlanLedgerRepairTargets(
     if (!source || !relation || relation.graphRootTaskId !== trustedRootTaskId
       || typeof relation.nodeKey !== 'string' || typeof relation.taskId !== 'string') continue
     const targets = graph.nodes.filter(node => node.key === relation.nodeKey && node.taskId === relation.taskId)
-    if (targets.length !== 1 || targets[0]?.key === source.key || targets[0]?.taskId === source.taskId) continue
-    const targetGoal = projection.nodes.find(node => node.key === targets[0]?.key)?.goal
+    const target = targets[0]
+    const targetNodeIndex = target ? graph.nodes.indexOf(target) : -1
+    const targetProjection = projection.nodes[targetNodeIndex]
+    if (targets.length !== 1 || !target || targetNodeIndex === index || target.key === source.key || target.taskId === source.taskId
+      || targetProjection?.key !== target.key) continue
+    const targetGoal = targetProjection.goal
     if (typeof targetGoal === 'string' && targetGoal.trim() === targetGoal && targetGoal.length > 0 && targetGoal.length <= 240) {
-      repairGoals.set(source.key, targetGoal)
+      repairTargets.set(source.key, { goal: targetGoal, nodeIndex: targetNodeIndex })
     }
   }
-  if (repairGoals.size === 0) return projection
+  if (repairTargets.size === 0) return projection
   return {
     ...projection,
     nodes: projection.nodes.map(node => {
-      const repairTargetGoal = repairGoals.get(node.key)
-      return repairTargetGoal ? { ...node, repairTargetGoal } : node
+      const target = repairTargets.get(node.key)
+      return target ? { ...node, repairTargetGoal: target.goal, repairTargetNodeIndex: target.nodeIndex } : node
     }),
   }
 }
@@ -49,33 +57,73 @@ export function parsePlanLedgerWithRepairTargets(value: unknown): PlanLedgerWith
   const parsed = parseJson(value)
   const row = record(parsed)
   if (!row || !Array.isArray(row.nodes)) return null
+  const rawNodes = row.nodes
   const goals = new Map<number, string>()
-  const nodes = row.nodes.map((node, index) => {
+  const targetIndices = new Map<number, number>()
+  let malformedDecoration = false
+  const nodes = rawNodes.map((node, index) => {
     const item = record(node)
-    if (!item || !Object.hasOwn(item, 'repairTargetGoal')) return node
+    if (!item || !Object.hasOwn(item, 'repairTargetGoal') && !Object.hasOwn(item, 'repairTargetNodeIndex')) return node
+    const hasGoal = Object.hasOwn(item, 'repairTargetGoal')
     const goal = item.repairTargetGoal
-    if (typeof goal !== 'string') return node
-    goals.set(index, goal)
+    if (hasGoal && typeof goal === 'string') goals.set(index, goal)
+    else if (hasGoal) malformedDecoration = true
+    if (Object.hasOwn(item, 'repairTargetNodeIndex')) {
+      const targetIndex = item.repairTargetNodeIndex
+      if (!hasGoal || typeof goal !== 'string' || !Number.isSafeInteger(targetIndex)
+        || Number(targetIndex) < 0 || Number(targetIndex) >= rawNodes.length || targetIndex === index) malformedDecoration = true
+      else targetIndices.set(index, Number(targetIndex))
+    }
     const baseNode = { ...item }
     delete baseNode.repairTargetGoal
+    delete baseNode.repairTargetNodeIndex
     return baseNode
   })
-  if ([...row.nodes].some((node, index) => Object.hasOwn(record(node) ?? {}, 'repairTargetGoal') && !goals.has(index))) return null
+  if (malformedDecoration) return null
 
   const base = parsePlanLedger({ ...row, nodes })
   if (!base) return null
-  const projectedNodes: Array<PlanLedgerNode & { repairTargetGoal?: string }> = []
+  const projectedNodes: Array<PlanLedgerNode & { repairTargetGoal?: string; repairTargetNodeIndex?: number }> = []
   for (let index = 0; index < base.nodes.length; index += 1) {
     const node = base.nodes[index]!
     const repairTargetGoal = goals.get(index)
     if (repairTargetGoal === undefined) {
       projectedNodes.push(node)
     } else {
-      if (!base.nodes.some(target => target.key !== node.key && target.goal === repairTargetGoal)) return null
-      projectedNodes.push({ ...node, repairTargetGoal })
+      const repairTargetNodeIndex = targetIndices.get(index)
+      if (repairTargetNodeIndex === undefined) {
+        if (!base.nodes.some(target => target.key !== node.key && target.goal === repairTargetGoal)) return null
+        projectedNodes.push({ ...node, repairTargetGoal })
+      } else {
+        const target = base.nodes[repairTargetNodeIndex]
+        if (!target || target.key === node.key || target.goal !== repairTargetGoal) return null
+        projectedNodes.push({ ...node, repairTargetGoal, repairTargetNodeIndex })
+      }
     }
   }
   return { ...base, nodes: projectedNodes }
+}
+
+/** Projects only allowlisted unmet checks from the indexed target in the matched ledger. */
+export function projectRepairAttentionSummaries(
+  projection: PlanLedgerWithRepairTargetGoals,
+  summary: TaskGraphVerificationSummary | null,
+): readonly TaskGraphVerificationDisplayNode[] {
+  if (!summary || summary.nodes.length !== projection.nodes.length) return projection.nodes.map(() => null)
+  return projection.nodes.map((node, index) => {
+    const targetIndex = node.repairTargetNodeIndex
+    if (targetIndex === undefined || !Number.isSafeInteger(targetIndex) || targetIndex < 0
+      || targetIndex >= projection.nodes.length || targetIndex === index || !node.repairTargetGoal) return null
+    const targetPlanNode = projection.nodes[targetIndex]
+    if (!targetPlanNode || targetPlanNode.key === node.key || targetPlanNode.goal !== node.repairTargetGoal) return null
+    const target = summary.nodes[targetIndex]
+    if (!target || target.status === 'unavailable') return null
+    const checks = target.checks.filter(check => check.status !== 'passed')
+    if (checks.length === 0) return null
+    const failedCount = checks.filter(check => check.status === 'failed').length
+    const unverifiedCount = checks.filter(check => check.status === 'unverified').length
+    return { status: failedCount > 0 ? 'failed' : 'unverified', checks, totalCount: checks.length, passedCount: 0, failedCount, unverifiedCount }
+  })
 }
 
 /** Uses the strict public graph projection for task_graph timeline items. */

@@ -137,7 +137,7 @@ export class AgentComposerTaskAttemptRegistry {
     entry.state = 'pending'
     let tracked: Promise<ObjectiveStartResult>
     tracked = Promise.resolve()
-      .then(() => entry.coordinator.start(entry.objective, '', selectedSessionId))
+      .then(() => entry.coordinator.start(entry.objective, '', '', undefined, selectedSessionId))
       .then(result => {
         if (!entry.removed) {
           entry.state = 'accepted'

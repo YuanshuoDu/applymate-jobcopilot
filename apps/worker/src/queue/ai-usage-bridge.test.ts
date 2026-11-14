@@ -4,8 +4,9 @@ import { createWorkerUsageAuthorizer, UsageBridgeError } from "./ai-usage-bridge
 
 const input = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1", leaseOwnerId: "worker-1", leaseVersion: 2,
-  featureKey: "agent", provider: "minimax", model: "MiniMax-M3", attemptId: "provider-attempt-1",
+  featureKey: "agent", provider: "minimax", model: "MiniMax-M3", attemptId: "provider-attempt-1", requestedOutputTokens: 256,
 }
+const protocolInput = { ...input, startProtocolVersion: 1 as const }
 
 function response(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } })
@@ -22,21 +23,25 @@ describe("Worker AI usage bridge", () => {
 
   it("authorizes and settles one provider attempt with the Worker secret", async () => {
     const fetcher = vi.fn()
-      .mockResolvedValueOnce(response({ status: "authorized", operationId: "agent-usage-1" }))
+      .mockResolvedValueOnce(response({ status: "authorized", operationId: "agent-usage-1", startProtocolVersion: 1, outputReservationRequired: true, maxOutputTokens: 128 }))
+      .mockResolvedValueOnce(response({ status: "started", startProtocolVersion: 1, outputReservationRequired: true, maxOutputTokens: 128 }))
       .mockResolvedValueOnce(response({ status: "settled" }))
     const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
     const reservation = await authorizer(input)
+    await expect(reservation.start()).resolves.toBe(128)
+    await expect(reservation.start()).rejects.toMatchObject({ code: "usage_start_replayed" })
     await reservation.settle({ status: "success", inputTokens: 4, outputTokens: 2, estimatedCostUsd: 0.001 })
-    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(fetcher).toHaveBeenCalledTimes(3)
     expect(fetcher.mock.calls[0]?.[0]).toBe("https://applymate.example/api/internal/agent-runtime/usage")
     expect(fetcher.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ headers: expect.objectContaining({ "x-agent-worker-secret": "secret" }) }))
-    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual(expect.objectContaining({ operation: "authorize", input }))
-    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual(expect.objectContaining({ operation: "settle", input: expect.objectContaining({ operationId: "agent-usage-1", userId: "user-1", provider: "minimax", model: "MiniMax-M3" }) }))
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ operation: "authorize", input: protocolInput })
+    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual({ operation: "start", input: { ...protocolInput, operationId: "agent-usage-1" } })
+    expect(JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body))).toEqual(expect.objectContaining({ operation: "settle", input: expect.objectContaining({ operationId: "agent-usage-1", userId: "user-1", provider: "minimax", model: "MiniMax-M3" }) }))
   })
 
   it("releases the identical route identity through an idempotent pre-provider operation", async () => {
     const fetcher = vi.fn()
-      .mockResolvedValueOnce(response({ status: "authorized", operationId: "agent-usage-1" }))
+      .mockResolvedValueOnce(response({ status: "authorized", operationId: "agent-usage-1", startProtocolVersion: 1, outputReservationRequired: false, maxOutputTokens: null }))
       .mockResolvedValueOnce(response({ status: "released" }))
       .mockResolvedValueOnce(response({ status: "released" }))
     const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
@@ -45,7 +50,7 @@ describe("Worker AI usage bridge", () => {
     await reservation.release?.()
     expect(fetcher).toHaveBeenCalledTimes(3)
     for (const call of fetcher.mock.calls.slice(1)) {
-      expect(JSON.parse(String(call[1]?.body))).toEqual({ operation: "release", input })
+      expect(JSON.parse(String(call[1]?.body))).toEqual({ operation: "release", input: protocolInput })
     }
   })
 
@@ -60,7 +65,7 @@ describe("Worker AI usage bridge", () => {
 
     await expect(authorizer(input)).rejects.toMatchObject({ code })
     expect(fetcher).toHaveBeenCalledOnce()
-    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ operation: "authorize", input })
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ operation: "authorize", input: protocolInput })
   })
 
   it("does not retry malformed successful release responses", async () => {
@@ -75,14 +80,14 @@ describe("Worker AI usage bridge", () => {
 
   it("rejects an unexpected successful release status without retrying", async () => {
     const fetcher = vi.fn()
-      .mockResolvedValueOnce(response({ status: "authorized", operationId: "agent-usage-1" }))
+      .mockResolvedValueOnce(response({ status: "authorized", operationId: "agent-usage-1", startProtocolVersion: 1, outputReservationRequired: false, maxOutputTokens: null }))
       .mockResolvedValueOnce(response({ status: "still_reserved" }))
     const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
     const reservation = await authorizer(input)
 
     await expect(reservation.release?.()).rejects.toMatchObject({ code: "usage_broker_unavailable" })
     expect(fetcher).toHaveBeenCalledTimes(2)
-    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual({ operation: "release", input })
+    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual({ operation: "release", input: protocolInput })
   })
 
   it("retries transient compensating releases with the identical operation identity", async () => {
@@ -97,7 +102,7 @@ describe("Worker AI usage bridge", () => {
     expect(fetcher).toHaveBeenCalledTimes(4)
     const operations = fetcher.mock.calls.map(call => JSON.parse(String(call[1]?.body)) as { operation: string; input: unknown })
     expect(operations.map(body => body.operation)).toEqual(["authorize", "release", "release", "release"])
-    for (const body of operations.slice(1)) expect(body).toEqual({ operation: "release", input })
+    for (const body of operations.slice(1)) expect(body).toEqual({ operation: "release", input: protocolInput })
   })
 
   it("preserves the original authorization denial after compensating release retries exhaust", async () => {
@@ -111,7 +116,7 @@ describe("Worker AI usage bridge", () => {
     await expect(authorizer(input)).rejects.toMatchObject({ code: "usage_broker_unavailable" })
     expect(fetcher).toHaveBeenCalledTimes(4)
     expect(fetcher.mock.calls.slice(1).map(call => JSON.parse(String(call[1]?.body)))).toEqual(
-      Array.from({ length: 3 }, () => ({ operation: "release", input })),
+      Array.from({ length: 3 }, () => ({ operation: "release", input: protocolInput })),
     )
   })
 
@@ -133,18 +138,20 @@ describe("Worker AI usage bridge", () => {
 
   it("does not release a provider-started attempt after terminal error settlement", async () => {
     const fetcher = vi.fn()
-      .mockResolvedValueOnce(response({ status: "authorized", operationId: "agent-usage-1" }))
+      .mockResolvedValueOnce(response({ status: "authorized", operationId: "agent-usage-1", startProtocolVersion: 1, outputReservationRequired: false, maxOutputTokens: null }))
+      .mockResolvedValueOnce(response({ status: "started", startProtocolVersion: 1, outputReservationRequired: false, maxOutputTokens: null }))
       .mockResolvedValueOnce(response({ status: "settled" }))
     const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
     const reservation = await authorizer(input)
 
+    await reservation.start()
     await reservation.settle({ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "provider_error" })
-    expect(fetcher).toHaveBeenCalledTimes(2)
-    expect(fetcher.mock.calls.map(call => JSON.parse(String(call[1]?.body)).operation)).toEqual(["authorize", "settle"])
+    expect(fetcher).toHaveBeenCalledTimes(3)
+    expect(fetcher.mock.calls.map(call => JSON.parse(String(call[1]?.body)).operation)).toEqual(["authorize", "start", "settle"])
   })
 
   it("accepts a child Task owner envelope without retaining root lease fields", async () => {
-    const fetcher = vi.fn().mockResolvedValueOnce(response({ status: "authorized", operationId: "child-usage-1" }))
+    const fetcher = vi.fn().mockResolvedValueOnce(response({ status: "authorized", operationId: "child-usage-1", startProtocolVersion: 1, outputReservationRequired: false, maxOutputTokens: null }))
     const { leaseOwnerId: _leaseOwnerId, leaseVersion: _leaseVersion, ...common } = input
     const childInput = {
       ...common,
@@ -152,7 +159,7 @@ describe("Worker AI usage bridge", () => {
     }
     const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
     await authorizer(childInput)
-    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual(expect.objectContaining({ operation: "authorize", input: childInput }))
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ operation: "authorize", input: { ...childInput, startProtocolVersion: 1 } })
   })
 
   it("rejects a mixed legacy and child owner", async () => {
@@ -179,7 +186,7 @@ describe("Worker AI usage bridge", () => {
     }
     expect(fetcher).toHaveBeenCalledTimes(4)
     expect(operations.map(value => (value as { operation: string }).operation)).toEqual(["authorize", "release", "authorize", "release"])
-    expect(operations[1]).toEqual({ operation: "release", input })
-    expect(operations[3]).toEqual({ operation: "release", input })
+    expect(operations[1]).toEqual({ operation: "release", input: protocolInput })
+    expect(operations[3]).toEqual({ operation: "release", input: protocolInput })
   })
 })

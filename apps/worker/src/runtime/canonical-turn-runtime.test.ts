@@ -97,6 +97,7 @@ import type { SteeringReconciliationOperation } from "./subagents/steering-recon
 import { buildTaskGraphPlanningFacts } from "./subagents/task-graph-planning-facts.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
+import { buildGroundedTaskGraphFinalResponse } from "./subagents/task-graph-final-response.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT, type TurnExecutionStore } from "./turns/turn-execution-types.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA } from "./turns/task-graph-terminal-assessment.js"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
@@ -281,7 +282,7 @@ async function runStructuredScoutFailure(finalText: string) {
   const executeChild = createChildExecutor({
     store: childExecutionStore(),
     treeBudget: childBudgetStore(),
-    authorizeUsage: async () => ({ settle: async () => undefined }),
+    authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     modelRuntimeFactory: () => childModel,
     toolRuntimeFactory: () => ({
       definitions: [searchTool],
@@ -505,7 +506,7 @@ function setup(overrides: Record<string, unknown> = {}) {
     workerId: "worker-1", stateLoader: async () => state(), rootTaskStore: roots as never,
     modelRuntimeFactory: async () => ({ adapter: model(() => { calls += 1; return calls === 1 ? [{ type: "tool_call_completed", callId: "call-1", name: "jobs.search", arguments: { location: "Dublin" } }, { type: "completed", finishReason: "tool_calls" }] : [{ type: "text_delta", text: "done" }, { type: "completed", finishReason: "stop" }] }), registry: {} as never, candidates: [] }),
     toolRuntimeFactory: () => tool as never, turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
-    authorizeUsage: async () => ({ settle: vi.fn(async () => undefined) }), ...overrides,
+    authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: vi.fn(async () => undefined) }), ...overrides,
   })
   return { runtime, roots, tool, getModelCalls: () => calls }
 }
@@ -576,7 +577,7 @@ function scheduledPipelineRuntimeFixture(overrides: Partial<CanonicalTurnRuntime
       { type: "text_delta", text: "The scheduled task graph is complete using the reviewed role evidence." },
       { type: "completed", finishReason: "stop" },
     ] }), registry: {} as never, candidates: [] }),
-    authorizeUsage: async () => ({ settle: async () => undefined }), executionProjection, sessionProjection,
+    authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }), executionProjection, sessionProjection,
     scheduledPipelineBridge: bridgeOverride ?? bridge, scheduledPipelineFetch: fetcher,
     scheduledPipelineCandidateStoreFactory: () => candidateStore,
     ...otherOverrides,
@@ -665,7 +666,7 @@ async function rootToolNames(
         yield { type: "completed", finishReason: "stop" }
       },
     }, registry: {} as never, candidates: [] }),
-    authorizeUsage: async () => ({ settle: async () => undefined }),
+    authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
   })
   await runtime.execute({ lease, signal: new AbortController().signal })
   return requests[0]?.tools.flatMap(tool => {
@@ -808,7 +809,7 @@ async function taskGraphRootSurface(
       },
     }, registry: {} as never, candidates: [] }),
     ...(boundaryOptions.modelRuntimeFactory ? { modelRuntimeFactory: boundaryOptions.modelRuntimeFactory } : {}),
-    authorizeUsage: async () => ({ settle: async () => undefined }),
+    authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
   })
   const result = await runtime.execute({ lease, signal: new AbortController().signal })
   const toolNames = requests[0]?.tools.flatMap(tool => {
@@ -840,7 +841,7 @@ async function routeCanonicalRootMutation(toolName: "agent.spawn" | "spawn_subag
     schemaVersion: "agent-harness.v2.objective-requirements.v1",
     requirements: [{ id: "candidate-total", check: { kind: "candidate_count_gte", minimum: 2 } }],
   } } }
-  const authorizeUsage = vi.fn(async () => ({ settle: async () => undefined }))
+  const authorizeUsage = vi.fn(async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }))
   const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
     workerId: "worker-1",
     productionFlags: resolveProductionAgentFlags({
@@ -1048,7 +1049,7 @@ describe("createCanonicalTurnRuntime", () => {
         return await contextBuilder().build(request)
       } }),
       modelRuntimeFactory: async () => ({ adapter, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
       turnBoundaryCompactionRunner: runner,
     })
 
@@ -1195,7 +1196,7 @@ describe("createCanonicalTurnRuntime", () => {
           yield { type: "completed", finishReason: "stop" }
         },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     try {
@@ -1307,7 +1308,7 @@ describe("createCanonicalTurnRuntime", () => {
             yield { type: "completed", finishReason: "stop" }
           },
         }, registry: {} as never, candidates: [] }),
-        authorizeUsage: async () => ({ settle: async () => undefined }),
+        authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
       })
       await runtime.execute({ lease, signal: new AbortController().signal })
       expect(readCurrent).toHaveBeenCalled()
@@ -1432,7 +1433,7 @@ describe("createCanonicalTurnRuntime", () => {
             yield { type: "completed", finishReason: "stop" }
           },
         }, registry: {} as never, candidates: [] }),
-        authorizeUsage: async () => ({ settle: async () => undefined }),
+        authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
       })
       await runtime.execute({ lease, signal: new AbortController().signal })
       return { reads, requests, contexts, taskGraphCommandPort, roots }
@@ -1676,7 +1677,7 @@ describe("createCanonicalTurnRuntime", () => {
           }
         },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     const result = await runtime.execute({ lease, signal: new AbortController().signal })
@@ -1911,7 +1912,7 @@ describe("createCanonicalTurnRuntime", () => {
           yield { type: "completed", finishReason: "tool_calls" }
         },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
     const askResult = await askRuntime.execute({ lease, signal: new AbortController().signal })
     expect(askResult).toMatchObject({ status: "waiting_for_user", waitId: rootQuestionId })
@@ -1944,7 +1945,7 @@ describe("createCanonicalTurnRuntime", () => {
       nativeVerificationFactory: () => verificationRuntime, turnEngineStoreFactory: () => questionStore,
       contextBuilderFactory: () => ({ build: async request => { const context = await resumedBuilder.build(request); contexts.push(context); return context } }),
       modelRuntimeFactory: async () => ({ adapter: modelAdapter, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     const executionResult = await runtime.execute({ lease: restartLease, signal: new AbortController().signal })
@@ -2148,10 +2149,12 @@ describe("createCanonicalTurnRuntime", () => {
     const terminal = persistFinal.mock.calls[0]![0].terminal!
     const terminalContent = terminal.finalContent as { text: string; final: { response: string; summary: string } }
     expect(terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toEqual(finalSummaryBinding)
-    expect(terminalContent).toMatchObject({ text: "I found sourced roles.", final: {
-      response: "I found sourced roles.", summary: formatTaskGraphFinalSummary(finalSummaryBinding.summary),
+    const groundedResponse = buildGroundedTaskGraphFinalResponse(finalSummaryBinding)
+    expect(terminalContent).toMatchObject({ text: groundedResponse, final: {
+      response: groundedResponse, summary: formatTaskGraphFinalSummary(finalSummaryBinding.summary),
     } })
     expect(terminalContent.final.response).toBe(terminalContent.text)
+    expect(terminalContent.text).not.toContain("I found sourced roles.")
     expect(JSON.stringify(terminalContent)).not.toContain("TASK_GRAPH_FINAL_SUMMARY_BINDING")
   })
 
@@ -2198,7 +2201,7 @@ describe("createCanonicalTurnRuntime", () => {
       modelRuntimeFactory: async () => ({ adapter: model(() => ++modelCalls === 1
         ? [{ type: "tool_call_completed", callId: "spawn-call", name: "agent.spawn", arguments: { role: "scout", taskType: "research", goal: "Inspect" } }, { type: "completed", finishReason: "tool_calls" }]
         : [{ type: "text_delta", text: "done" }, { type: "completed", finishReason: "stop" }]), registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     const result = await runtime.execute({ lease, signal: new AbortController().signal })
@@ -2262,7 +2265,7 @@ describe("createCanonicalTurnRuntime", () => {
       modelRuntimeFactory: async () => ({ adapter: model(() => ++modelCalls === 1
         ? [{ type: "tool_call_completed", callId: "spawn-call-default", name: "agent.spawn", arguments: { role: "scout", taskType: "research", goal: "Inspect" } }, { type: "completed", finishReason: "tool_calls" }]
         : [{ type: "text_delta", text: "done" }, { type: "completed", finishReason: "stop" }]), registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     const result = await runtime.execute({ lease, signal: new AbortController().signal })
@@ -2356,7 +2359,7 @@ describe("createCanonicalTurnRuntime", () => {
           yield { type: "completed", finishReason: "stop" }
         },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await runtime.execute({ lease, signal: new AbortController().signal })
@@ -2444,7 +2447,7 @@ describe("createCanonicalTurnRuntime", () => {
           ...model(() => []),
           async *stream(value: HarnessModelRequest) { requests.push(value); yield { type: "text_delta", text: "done" }; yield { type: "completed", finishReason: "stop" } },
         }, registry: {} as never, candidates: [] }),
-        authorizeUsage: async () => ({ settle: async () => undefined }),
+        authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
       })
       await runtime.execute({ lease, signal: new AbortController().signal })
       return requests[0]?.tools.find(tool => tool && typeof tool === "object" && "name" in tool && tool.name === "agent.plan")
@@ -2546,7 +2549,7 @@ describe("createCanonicalTurnRuntime", () => {
         ...model(() => []),
         async *stream(request: HarnessModelRequest) { requests.push(request); yield { type: "text_delta", text: "done" }; yield { type: "completed", finishReason: "stop" } },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await runtime.execute({ lease, signal: new AbortController().signal })
@@ -2724,7 +2727,7 @@ describe("createCanonicalTurnRuntime", () => {
       }),
       nativeVerificationFactory: () => nativeVerificationRuntime(),
       modelRuntimeFactory: async () => ({ adapter: selectedModel, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await runtime.execute({ lease, signal: new AbortController().signal })
@@ -2826,7 +2829,7 @@ describe("createCanonicalTurnRuntime", () => {
         ...model(() => []),
         async *stream(request: HarnessModelRequest) { requests.push(request); yield { type: "text_delta", text: "done" }; yield { type: "completed", finishReason: "stop" } },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: settlement }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: settlement, settle: settlement }),
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "evidence_missing" })
@@ -2855,7 +2858,7 @@ describe("createCanonicalTurnRuntime", () => {
       selectedJobPreparationLoader: async () => undefined,
       stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: rootStore() as never,
       turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(), modelRuntimeFactory: provider,
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).rejects.toMatchObject({ code: "task_graph_read_failed" })
@@ -2875,7 +2878,7 @@ describe("createCanonicalTurnRuntime", () => {
         ...model(() => []),
         async *stream(request: HarnessModelRequest) { requests.push(request); modelCalls += 1; yield { type: "text_delta", text: "done" }; yield { type: "completed", finishReason: "stop" } },
       }, registry: {} as never, candidates: [] }),
-      toolRuntimeFactory: () => tool as never, authorizeUsage: async () => ({ settle: async () => undefined }),
+      toolRuntimeFactory: () => tool as never, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
@@ -2897,7 +2900,7 @@ describe("createCanonicalTurnRuntime", () => {
       rootTaskStore: roots as never, turnEngineStoreFactory: () => store(events),
       modelRuntimeFactory: async () => ({ adapter: { ...model(() => []), async *stream() { modelCalls += 1; yield { type: "text_delta", text: "must not run" }; yield { type: "completed", finishReason: "stop" } } }, registry: {} as never, candidates: [] }),
       toolRuntimeFactory: () => ({ registry: { ...tool.registry, resolve: () => ({ idempotency: "non_repeatable" }) }, router: { execute: executeTool } }) as never,
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "tool_result_replay_uncertain" })
@@ -3522,7 +3525,7 @@ describe("createCanonicalTurnRuntime", () => {
       },
     }
     const executeFreshScout = createChildExecutor({
-      store: childExecutionStore(), treeBudget: childBudgetStore(), authorizeUsage: async () => ({ settle: async () => undefined }),
+      store: childExecutionStore(), treeBudget: childBudgetStore(), authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
       modelRuntimeFactory: () => scoutModel,
       toolRuntimeFactory: () => ({ definitions: [jobsGetTool], router: { execute: async (_context, request) => {
         scoutJobReads.push({ toolName: request.toolName, input: request.input })
@@ -3968,7 +3971,7 @@ describe("createCanonicalTurnRuntime", () => {
           yield { type: "completed", finishReason: "tool_calls" }
         },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
@@ -4443,7 +4446,7 @@ describe("createCanonicalTurnRuntime", () => {
             yield { type: "completed", finishReason: "tool_calls" }
           },
         }, registry: {} as never, candidates: [] }),
-        authorizeUsage: async () => ({ settle: async () => undefined }),
+        authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
       })
       const execution = await runtime.execute({ lease, signal: new AbortController().signal })
       return { candidates, commandPort, events, pageReads, requests, selectedJobId, finalResponse, execution }
@@ -4557,7 +4560,7 @@ describe("createCanonicalTurnRuntime", () => {
           yield { type: "completed", finishReason: "tool_calls" }
         },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     const result = await runtime.execute({ lease, signal: new AbortController().signal })
@@ -4580,7 +4583,7 @@ describe("createCanonicalTurnRuntime", () => {
       modelRuntimeFactory: async () => ({ adapter: model(() => [{ type: "tool_call_completed", callId: "wait-call", name: "jobs.search", arguments: { location: "Dublin" } }, { type: "completed", finishReason: "tool_calls" }]), registry: {} as never, candidates: [] }),
       toolRuntimeFactory: () => tool as never,
       turnEngineStoreFactory: () => ({ ...store(), waitForUser: async () => boundary.setWaiting() }),
-      contextBuilderFactory: () => contextBuilder(), authorizeUsage: async () => ({ settle: async () => undefined }),
+      contextBuilderFactory: () => contextBuilder(), authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "waiting_for_user", summary: "policy_requires_user_input" })
@@ -4614,7 +4617,7 @@ describe("createCanonicalTurnRuntime", () => {
         toolRuntimeFactory: () => tools(productionFlags.coordinationEnabled) as never,
         turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
         now: () => new Date("2026-09-07T00:00:00.000Z"),
-        authorizeUsage: async () => ({ settle: async () => undefined }),
+        authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
       })
       await runtime.execute({ lease, signal: new AbortController().signal })
       return boundary.calls
@@ -4714,7 +4717,7 @@ describe("createCanonicalTurnRuntime", () => {
           yield { type: "completed", finishReason: "stop" }
         },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
@@ -4771,7 +4774,7 @@ describe("createCanonicalTurnRuntime", () => {
           yield { type: "completed", finishReason: "stop" }
         },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
     await expect(legacyRuntime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
     const replayed = legacyRequests[0]?.messages.flatMap(message => message.content)
@@ -4910,7 +4913,7 @@ describe("createCanonicalTurnRuntime", () => {
           yield { type: "completed", finishReason: "stop" }
         },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "no_progress" })
@@ -4976,7 +4979,7 @@ describe("createCanonicalTurnRuntime", () => {
           yield { type: "completed", finishReason: "stop" }
         },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => { authorizations += 1; return { settle: async () => { settlements += 1 } } },
+      authorizeUsage: async () => { authorizations += 1; return { outputReservationRequired: false, maxOutputTokens: null, settle: async () => { settlements += 1 } } },
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "no_progress" })
@@ -5042,7 +5045,7 @@ describe("createCanonicalTurnRuntime", () => {
           yield { type: "completed", finishReason: "stop" }
         },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
@@ -5134,7 +5137,7 @@ describe("createCanonicalTurnRuntime", () => {
           yield { type: "completed", finishReason: "stop" }
         },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status })
@@ -5229,7 +5232,7 @@ describe("createCanonicalTurnRuntime", () => {
         ...model(() => []),
         async *stream() { yield { type: "text_delta", text: "Done." }; yield { type: "completed", finishReason: "stop" } },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed" })
@@ -5251,7 +5254,7 @@ describe("createCanonicalTurnRuntime", () => {
       if (input.status === "success") throw new Error("ledger implementation detail")
     })
     const fixture = setup({
-      authorizeUsage: async () => ({ settle: settlement }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: settlement, settle: settlement }),
       modelRuntimeFactory: async () => ({
         adapter: {
           ...model(() => []),
@@ -5271,7 +5274,7 @@ describe("createCanonicalTurnRuntime", () => {
       if (input.status === "success") throw new Error("settlement failed")
     })
     const successFixture = setup({
-      authorizeUsage: async () => ({ settle: successSettlement }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: successSettlement, settle: successSettlement }),
       modelRuntimeFactory: async () => ({ adapter: model(() => [{ type: "text_delta", text: "done" }, { type: "completed", finishReason: "stop" }]), registry: {} as never, candidates: [] }),
     })
     const successRuntime = await successFixture.runtime
@@ -5305,7 +5308,7 @@ describe("createCanonicalTurnRuntime", () => {
           },
         }, registry: {} as never, candidates: [],
       }),
-      turnEngineStoreFactory: () => store(events), authorizeUsage: async () => ({ settle: async () => undefined }),
+      turnEngineStoreFactory: () => store(events), authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
     const result = await modelRuntime.execute({ lease, signal: new AbortController().signal })
     expect(result).toMatchObject({ status: "completed" })
@@ -5445,7 +5448,7 @@ describe("createCanonicalTurnRuntime", () => {
           yield { type: "completed", finishReason: "stop" }
         },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
@@ -5634,7 +5637,7 @@ describe("createCanonicalTurnRuntime", () => {
         },
         }, registry: {} as never, candidates: [] }
       },
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }),
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "no_progress" })
@@ -6089,7 +6092,7 @@ describe("createCanonicalTurnRuntime", () => {
           yield { type: "completed", finishReason: "stop" }
         },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }), executionProjection, sessionProjection,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: async () => undefined }), executionProjection, sessionProjection,
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "no_progress" })

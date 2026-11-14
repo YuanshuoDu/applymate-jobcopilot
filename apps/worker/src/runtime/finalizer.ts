@@ -2,7 +2,8 @@ import { parseAnswerEvidence, type AnswerEvidence } from "@jobcopilot/agent-prot
 import type { FinalVerification } from "./verifier.js"
 import type { TurnUsage } from "./budget.js"
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
-import { sameTaskGraphFinalSummaryBinding, type TaskGraphFinalSummaryBinding } from "./subagents/task-graph-final-summary-binding.js"
+import { buildGroundedTaskGraphFinalResponse } from "./subagents/task-graph-final-response.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING, sameTaskGraphFinalSummaryBinding, type TaskGraphFinalSummaryBinding } from "./subagents/task-graph-final-summary-binding.js"
 import { buildTaskGraphFinalSourceManifest } from "./subagents/task-graph-final-source-manifest.js"
 
 export type FinalTerminalReason = "goal_satisfied" | "partial_result" | "budget_exhausted" | "no_progress" | "unrecoverable_error" | "final_unverified"
@@ -62,6 +63,20 @@ export function finalizeTurn(input: FinalizeInput): FinalResponse {
 }
 
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
+export type NativeFinalCandidateTerminal = Readonly<{
+  stepId?: string
+  finalContent: unknown
+  response: unknown
+  readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: TaskGraphFinalSummaryBinding
+}>
+export function nativeFinalCandidateMatches(terminal: NativeFinalCandidateTerminal, persistedCandidate: string | null, acceptedCandidate: string | undefined): boolean {
+  if (persistedCandidate === null || typeof acceptedCandidate !== "string") return false
+  if (!Object.hasOwn(terminal, TASK_GRAPH_FINAL_SUMMARY_BINDING)) return persistedCandidate === acceptedCandidate
+  const binding = terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+  if (!binding) return false
+  try { return persistedCandidate === buildGroundedTaskGraphFinalResponse(binding) } catch { return false }
+}
+
 export function taskGraphFinalSummaryCopiesMatch(expected: TaskGraphFinalSummaryBinding | undefined, current: TaskGraphFinalSummaryBinding | undefined,
   finalContent: unknown, response: string, finalItemId: string): boolean {
   const content = record(finalContent)
@@ -70,6 +85,9 @@ export function taskGraphFinalSummaryCopiesMatch(expected: TaskGraphFinalSummary
   if (!sameTaskGraphFinalSummaryBinding(expected, current)) return false
   let saved: unknown
   try { saved = JSON.parse(response) as unknown } catch { return false }
+  let projectedResponse: string
+  try { projectedResponse = buildGroundedTaskGraphFinalResponse(expected) } catch { return false }
+  if (content.text !== projectedResponse || record(content.final).response !== projectedResponse || record(saved).response !== projectedResponse) return false
   let manifest: ReturnType<typeof buildTaskGraphFinalSourceManifest>
   try { manifest = buildTaskGraphFinalSourceManifest(expected, finalItemId) } catch { return false }
   if (hasSerializedSources(response) || hasResponseSourceField(content.final)) return false

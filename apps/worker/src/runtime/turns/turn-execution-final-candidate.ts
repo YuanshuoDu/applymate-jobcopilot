@@ -21,6 +21,7 @@ import { TurnStateRefreshRetryError, isTurnStateRefreshRetryError } from "./turn
 import { isSessionPauseRequestedError } from "../session-gate.js"
 import { signalWasInterrupted } from "../interrupt/registry.js"
 import { completeEmptyAnalystCandidateOnly } from "../subagents/task-graph-empty-analyst-candidate.js"
+import { buildGroundedTaskGraphFinalResponse } from "../subagents/task-graph-final-response.js"
 export type FinalCandidateOutcome =
   | Readonly<{ kind: "replan"; feedback: string; taskGraphDenialCheckpoint?: TaskGraphDenialCheckpoint }>
   | Readonly<{ kind: "wait"; result: TurnEngineResult }>
@@ -176,7 +177,7 @@ export async function completeTurnCandidate(input: Readonly<{
     }
   }
   await finishStep(options, writer, step, output, now, input.onStepClosed)
-  const finalResponse = finalizeTurn({ goal: options.goal, verification, terminalReason: "goal_satisfied", response: input.finalResponseText,
+  const finalResponse = finalizeTurn({ goal: options.goal, verification, terminalReason: "goal_satisfied", response: summaryBinding ? buildGroundedTaskGraphFinalResponse(summaryBinding) : input.finalResponseText,
     answerEvidence: input.answerEvidence,
     ...(summaryBinding ? { summaryOverride: formatTaskGraphFinalSummary(summaryBinding.summary) } : {}),
     usage: totalTurnUsage(options.resume?.usage, input.usage), stepCount: input.stepCount, toolCallCount: input.toolCallCount })

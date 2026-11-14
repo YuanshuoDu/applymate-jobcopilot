@@ -85,7 +85,7 @@ describe('TaskGraph query projection', () => {
     })
     expect(selectCurrentTaskGraphTaskIds(events, 'session-1')).toEqual(['root-task', 'native-child-1', 'native-child-2'])
     expect(buildTaskGraphTaskLookupUrl('session-1', events)).toBe(
-      '/api/agent/sessions/session-1/tasks?taskId=root-task&taskId=native-child-1&taskId=native-child-2&graphItemId=native-graph&graphTurnId=turn-1&rootTaskId=root-task&graphRevision=2',
+      '/api/agent/sessions/session-1/tasks?taskId=root-task&taskId=native-child-1&taskId=native-child-2&graphItemId=native-graph&graphTurnId=turn-1&rootTaskId=root-task&graphRevision=2&verificationSummaryVersion=2',
     )
   })
 
@@ -109,7 +109,7 @@ describe('TaskGraph query projection', () => {
 
     expect(selectCurrentTaskGraphTaskIds([older, latest, foreign], 'session/1')).toEqual(['root-task', 'task-a', 'task-b'])
     expect(buildTaskGraphTaskLookupUrl('session/1', [older, latest, foreign])).toBe(
-      '/api/agent/sessions/session%2F1/tasks?taskId=root-task&taskId=task-a&taskId=task-b&graphItemId=graph-latest&graphTurnId=turn-1&rootTaskId=root-task&graphRevision=1',
+      '/api/agent/sessions/session%2F1/tasks?taskId=root-task&taskId=task-a&taskId=task-b&graphItemId=graph-latest&graphTurnId=turn-1&rootTaskId=root-task&graphRevision=1&verificationSummaryVersion=2',
     )
   })
 
@@ -120,8 +120,8 @@ describe('TaskGraph query projection', () => {
     const firstUrl = buildTaskGraphTaskLookupUrl('session-1', [revisionOne])
     const nextUrl = buildTaskGraphTaskLookupUrl('session-1', [revisionTwo])
 
-    expect(firstUrl).toBe('/api/agent/sessions/session-1/tasks?taskId=root-task&taskId=task-a&graphItemId=graph-latest&graphTurnId=turn-1&rootTaskId=root-task&graphRevision=1')
-    expect(nextUrl).toBe('/api/agent/sessions/session-1/tasks?taskId=root-task&taskId=task-a&graphItemId=graph-latest&graphTurnId=turn-1&rootTaskId=root-task&graphRevision=2')
+    expect(firstUrl).toBe('/api/agent/sessions/session-1/tasks?taskId=root-task&taskId=task-a&graphItemId=graph-latest&graphTurnId=turn-1&rootTaskId=root-task&graphRevision=1&verificationSummaryVersion=2')
+    expect(nextUrl).toBe('/api/agent/sessions/session-1/tasks?taskId=root-task&taskId=task-a&graphItemId=graph-latest&graphTurnId=turn-1&rootTaskId=root-task&graphRevision=2&verificationSummaryVersion=2')
     expect(nextUrl).not.toBe(firstUrl)
   })
 
