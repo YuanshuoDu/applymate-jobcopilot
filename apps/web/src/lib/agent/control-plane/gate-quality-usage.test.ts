@@ -30,7 +30,7 @@ function evidence(status: 'started' | 'released' = 'started', changedInput = fal
 
 function setup(options: { rows?: ReturnType<typeof evidence>[]; currentOwner?: (index: number) => GateQualityValidatedOwner | null;
   serialize?: boolean } = {}) {
-  const rows: PriorEvidence[] = [...(options.rows ?? [])], inserted = new Map<string, PriorEvidence>(), closedSteps: unknown[] = []
+  const rows: PriorEvidence[] = [...(options.rows ?? [])], inserted = new Map<string, PriorEvidence>(), closedSteps: unknown[] = [], closeSql: string[] = []
   let ownerChecks = 0, tail = Promise.resolve()
   const raw = vi.fn(async (query: unknown) => {
     const row = query as { text?: string; values?: unknown[] }, text = row.text ?? ''
@@ -47,6 +47,7 @@ function setup(options: { rows?: ReturnType<typeof evidence>[]; currentOwner?: (
     }
     if (text.includes('UPDATE "agent_steps" SET "status"')) {
       const values = row.values ?? []
+      closeSql.push(text)
       closedSteps.push({ status: values[0], inputTokens: values[1], outputTokens: values[2], estimatedCostUsd: values[3], errorCode: values[4] })
       return [{ id: String(values[6] ?? 'step') }]
     }
@@ -80,7 +81,7 @@ function setup(options: { rows?: ReturnType<typeof evidence>[]; currentOwner?: (
       : { usageStatus: input.status, reservationStatus: 'settled' })
   })
   mocks.prepare.mockReturnValue({ provider: 'minimax', model: 'MiniMax-M3', credentialSource: 'user', chat: mocks.chat })
-  return { db, tx, raw, rows, inserted, closedSteps, lockCurrentOwner: async () => options.currentOwner ? options.currentOwner(ownerChecks++) : owner }
+  return { db, tx, raw, rows, inserted, closedSteps, closeSql, lockCurrentOwner: async () => options.currentOwner ? options.currentOwner(ownerChecks++) : owner }
 }
 
 beforeEach(() => {
@@ -191,6 +192,9 @@ describe('scheduled Gate quality usage', () => {
     expect(mocks.settleInTransaction).toHaveBeenCalledWith(fixture.tx, expect.objectContaining({ status: 'error', estimatedCostUsd: null }))
     expect(fixture.closedSteps).toEqual([{ status: 'failed', inputTokens: 12, outputTokens: null, estimatedCostUsd: null,
       errorCode: 'gate_quality_usage_unknown' }])
+    expect(fixture.closeSql[0]).toContain('COALESCE($2::integer, "inputTokens")')
+    expect(fixture.closeSql[0]).toContain('COALESCE($3::integer, "outputTokens")')
+    expect(fixture.closeSql[0]).toContain('COALESCE($4::decimal, "estimatedCostUsd")')
     expect(mocks.settle).not.toHaveBeenCalled()
   })
 
@@ -225,7 +229,7 @@ describe('scheduled Gate quality usage', () => {
     expect(mocks.settle).not.toHaveBeenCalled()
   })
 
-  it('keeps error usage unknown and writes null Step usage in the same transaction', async () => {
+  it('keeps error usage unknown and preserves Step metrics when usage is unavailable', async () => {
     const fixture = setup()
     mocks.chat.mockRejectedValueOnce(new Error('provider interrupted'))
     const caller = createGateQualityUsageCaller({ db: fixture.db as never, owner, lockCurrentOwner: fixture.lockCurrentOwner })
@@ -235,5 +239,8 @@ describe('scheduled Gate quality usage', () => {
       inputTokens: null, outputTokens: null, estimatedCostUsd: null }))
     expect(fixture.closedSteps).toEqual([{ status: 'failed', inputTokens: null, outputTokens: null, estimatedCostUsd: null,
       errorCode: 'gate_quality_provider_error' }])
+    expect(fixture.closeSql[0]).toContain('COALESCE($2::integer, "inputTokens")')
+    expect(fixture.closeSql[0]).toContain('COALESCE($3::integer, "outputTokens")')
+    expect(fixture.closeSql[0]).toContain('COALESCE($4::decimal, "estimatedCostUsd")')
   })
 })

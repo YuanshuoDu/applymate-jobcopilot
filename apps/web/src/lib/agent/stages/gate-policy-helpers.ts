@@ -18,16 +18,19 @@ export async function assertScheduledGateCurrent(ctx: PipelineCtx, scheduled: bo
   if (ctx.signal?.aborted || ctx.assertExecutionCurrent && !await ctx.assertExecutionCurrent()) throw new AgentExecutionCancelledError()
 }
 
-export function prepareReviewedPackage(pkg: ApplicationPackage, ctx: PipelineCtx) {
+export function prepareReviewedPackage(pkg: ApplicationPackage, ctx: PipelineCtx, scheduled = false) {
   const artifacts = [pkg.tailoredResumeArtifact, pkg.coverLetterArtifact].filter((item): item is NonNullable<typeof item> => Boolean(item))
   if (!artifacts.length) return { reviewedPackage: pkg, artifacts, issues: [] as string[], reviews: [] as ReturnType<typeof reviewArtifact>[] }
   const constraintHash = hashArtifactConstraints(tailoringConstraints(pkg, ctx.agentCfg))
   const issues = artifacts.flatMap(artifact => {
-    const result = preflightArtifact(artifact, constraintHash)
+    // Scheduled Gate input already verified the Worker artifact against its Prepare proof and source digest.
+    const expectedHash = scheduled && ctx.scheduledTaskGraphOwnerFence ? artifact.constraintHash : constraintHash
+    const result = preflightArtifact(artifact, expectedHash)
     return result.ok ? [] : result.issues.map(issue => `${artifact.kind}:${issue}`)
   })
   const reviews = issues.length ? [] : artifacts.map(artifact => reviewArtifact({ artifact, expectedHash: artifact.hash,
-    reviewerId: ctx.userId, decision: 'passed', evidence: [], constraintHash }))
+    reviewerId: ctx.userId, decision: 'passed', evidence: [],
+    constraintHash: scheduled && ctx.scheduledTaskGraphOwnerFence ? artifact.constraintHash : constraintHash }))
   return { reviewedPackage: reviews.length ? { ...pkg, artifactReview: reviews[0], artifactReviews: reviews } : pkg, artifacts, issues, reviews }
 }
 

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { Prisma } from '@prisma/client'
+import { AgentExecutionCancelledError } from './execution-control'
 
 const mocks = vi.hoisted(() => ({
   transaction: vi.fn(), queryRaw: vi.fn(), jobs: vi.fn(), update: vi.fn(), turn: vi.fn(), config: vi.fn(), resume: vi.fn(),
@@ -219,26 +220,45 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     expect(mocks.jobs.mock.calls[0]?.[0]).not.toMatchObject({ where: { id: { in: multiScoutAttestation.candidateUnionJobIds } } })
   })
 
-  it('reloads Gate materials before a short current-owner transaction', async () => {
+  it('rejects a Gate review receipt when prepared material changes after preflight', async () => {
     const events: string[] = []
-    let transactionCallbackActive = false, inputLoads = 0
-    mocks.loadInput.mockImplementation(async () => {
-      expect(transactionCallbackActive).toBe(false)
+    let transactionCallbackActive = false, inputLoads = 0, receiptWrites = 0
+    const changed = { ...loaded, materials: [{ ...materials[0]!, artifactRef: { artifactId: 'artifact-2' } }] }
+    mocks.loadInput.mockImplementation(async (_input: unknown, reader: unknown) => {
       inputLoads += 1
-      if (inputLoads === 2) events.push('fresh_input')
-      return loaded
+      if (inputLoads <= 2) {
+        expect(transactionCallbackActive).toBe(false)
+        if (inputLoads === 2) events.push('preflight')
+        return loaded
+      }
+      expect(transactionCallbackActive).toBe(true)
+      expect(reader).toBe(tx)
+      events.push('receipt_material_recheck')
+      return changed
     })
     mocks.transaction.mockImplementation(async (work: (client: unknown) => unknown) => {
-      if (inputLoads === 2) events.push('owner_recheck')
       transactionCallbackActive = true
       try { return await work(tx) } finally { transactionCallbackActive = false }
+    })
+    mocks.executeGate.mockImplementation(async (input: { context: {
+      scheduledTaskGraphOwnerFence: { assertCurrent(transaction: unknown): Promise<boolean> }
+    } }) => {
+      await mocks.transaction(async (transaction: unknown) => {
+        if (!await input.context.scheduledTaskGraphOwnerFence.assertCurrent(transaction)) {
+          throw new AgentExecutionCancelledError()
+        }
+        receiptWrites += 1
+      })
+      return { status: 'completed' }
     })
 
     const result = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
 
-    expect(result.status).toBe(200)
-    expect(inputLoads).toBe(2)
-    expect(events).toEqual(['fresh_input', 'owner_recheck'])
+    expect(result.status).toBe(409)
+    await expect(result.json()).resolves.toMatchObject({ status: 'blocked', errorCode: 'scheduled_pipeline_turn_stale' })
+    expect(inputLoads).toBe(3)
+    expect(events).toEqual(['preflight', 'receipt_material_recheck'])
+    expect(receiptWrites).toBe(0)
   })
 
   it('projects a safe test-only owner assertion phase without exposing the thrown message', async () => {

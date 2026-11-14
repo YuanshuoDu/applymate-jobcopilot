@@ -179,8 +179,10 @@ async function settleAndCloseStep(db: GateQualityUsageDatabase, settlement: Excl
 }
 async function closeStepInTransaction(tx: Prisma.TransactionClient, step: StepClose): Promise<void> {
   const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`UPDATE "agent_steps" SET "status" = ${step.status},
-    "inputTokens" = ${step.usage.inputTokens}, "outputTokens" = ${step.usage.outputTokens},
-    "estimatedCostUsd" = ${step.usage.estimatedCostUsd}, "errorCode" = ${step.errorCode},
+    "inputTokens" = COALESCE(${step.usage.inputTokens}::integer, "inputTokens"),
+    "outputTokens" = COALESCE(${step.usage.outputTokens}::integer, "outputTokens"),
+    "estimatedCostUsd" = COALESCE(${step.usage.estimatedCostUsd}::decimal, "estimatedCostUsd"),
+    "errorCode" = ${step.errorCode},
     "completedAt" = CURRENT_TIMESTAMP, "durationMs" = ${step.durationMs ?? null}
     WHERE "id" = ${step.stepId} AND "status" = 'streaming' RETURNING "id"`)
   if (!rows[0]) throw new Error('gate_quality_step_close_conflict')

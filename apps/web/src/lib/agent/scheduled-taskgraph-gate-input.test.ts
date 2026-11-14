@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Job, Prisma } from '@prisma/client'
+import { db as fixtureDb } from '@/lib/db'
 import { hashArtifactContent } from './artifacts/hash'
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { scheduledTaskGraphAnalyzeCheckpointDigest } from './scheduled-taskgraph-gate-checkpoint'
@@ -241,6 +242,35 @@ describe('scheduled TaskGraph Gate input reload', () => {
     expect(mocks.gateHistory).toHaveBeenCalledWith(expect.objectContaining({
       auditTask: { id: 'audit-task', status: 'queued', attemptCount: 0 },
     }))
+  })
+
+  it('reloads Gate materials through the supplied transaction reader', async () => {
+    const { input } = setup()
+    const materialReads: string[] = []
+    const tx = { ...fixtureDb,
+      agentSession: { ...fixtureDb.agentSession, findFirst: (...args: Parameters<typeof fixtureDb.agentSession.findFirst>) => {
+        materialReads.push('agentSession'); return mocks.session(...args)
+      } },
+      job: { ...fixtureDb.job, findMany: (...args: Parameters<typeof fixtureDb.job.findMany>) => {
+        materialReads.push('job'); return mocks.jobs(...args)
+      } },
+      resume: { ...fixtureDb.resume, findFirst: (...args: Parameters<typeof fixtureDb.resume.findFirst>) => {
+        materialReads.push('resume'); return mocks.resume(...args)
+      } },
+      personaFact: { ...fixtureDb.personaFact, findMany: (...args: Parameters<typeof fixtureDb.personaFact.findMany>) => {
+        materialReads.push('personaFact'); return mocks.facts(...args)
+      } },
+      agentArtifactVersion: { ...fixtureDb.agentArtifactVersion, findMany: (...args: Parameters<typeof fixtureDb.agentArtifactVersion.findMany>) => {
+        materialReads.push('agentArtifactVersion'); return mocks.versions(...args)
+      } },
+      agentArtifact: { ...fixtureDb.agentArtifact, findMany: (...args: Parameters<typeof fixtureDb.agentArtifact.findMany>) => {
+        materialReads.push('agentArtifact'); return mocks.heads(...args)
+      } },
+    } as unknown as Prisma.TransactionClient
+
+    await expect(loadScheduledTaskGraphGateInput(input, tx)).resolves.toMatchObject({ packages: [{ jobId: jobRow.id }] })
+    expect(materialReads).toEqual(['agentSession', 'job', 'resume', 'personaFact', 'agentArtifactVersion', 'agentArtifact'])
+    expect(mocks.transaction).not.toHaveBeenCalled()
   })
 
   it('locks the exact Post-Gate Execute actor and its current execution attempt before Gate proof evaluation', async () => {

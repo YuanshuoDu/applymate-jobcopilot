@@ -75,7 +75,7 @@ export async function runGatePolicy(packages: readonly ApplicationPackage[], ctx
     let reviewedPackage = pkg
     let artifactCheck: ReturnType<typeof prepareReviewedPackage> | undefined
     if (scheduled) {
-      artifactCheck = prepareReviewedPackage(pkg, ctx)
+      artifactCheck = prepareReviewedPackage(pkg, ctx, scheduled)
       if (artifactCheck.issues.length) {
         if (priorChoice || scheduledChoice?.kind === 'weak_cover_letter' && scheduledChoice.jobIds[0] === pkg.job.id) throw new AgentExecutionCancelledError()
         skipped.push(pkg)

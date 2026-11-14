@@ -230,7 +230,7 @@ async function assertGateActionCurrent(tx: Prisma.TransactionClient, request: Sc
   const checkpoint = scheduledTaskGraphAnalyzeCheckpointForGate(current.state)
   const fresh = checkpoint && await loadScheduledTaskGraphGateInput({ owner: current.owner, snapshot: current.snapshot,
     analyzeCheckpoint: checkpoint, analyzeAttestation: request.attestation, prepareProof: request.prepareProof,
-    gate: { taskId: request.gateTaskId, attemptCount: request.gateAttemptCount, phase: 'running' } })
+    gate: { taskId: request.gateTaskId, attemptCount: request.gateAttemptCount, phase: 'running' } }, tx)
   return Boolean(fresh && sameJson(materialRefs(fresh.materials), materialRefs(expectedMaterials)))
 }
 

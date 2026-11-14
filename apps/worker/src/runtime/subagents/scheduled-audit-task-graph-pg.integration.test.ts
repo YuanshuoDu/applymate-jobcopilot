@@ -12,6 +12,7 @@ import { createCanonicalSessionProjection } from "../canonical-session-projectio
 import type { TurnEngineOptions, TurnEngineResult } from "../turns/turn-engine-types.js"
 import { runTurnJob } from "../turns/turn-queue.js"
 import { dispatchPendingTurnOutbox } from "../turns/recovery-scanner.js"
+import { drainAgentWakeups } from "../wakeup/consumer.js"
 import type { TurnJobPayload, TurnLease } from "../turns/lease.js"
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
 import { suspendAndReleaseWait } from "./durable-wait-handoff.js"
@@ -27,6 +28,7 @@ import { createScheduledAutomationPrepareContinuation } from "./scheduled-automa
 import { createScheduledGateChildExecutor } from "./scheduled-gate-child-runtime.js"
 import { createScheduledAuditChildExecutor } from "./scheduled-audit-child-runtime.js"
 import { createScheduledGatePrepareFixture } from "./scheduled-gate-prepare-pg-runner.fixture.js"
+import { parseScheduledGateTaskEnvelope, scheduledGatePreparedJobIds } from "./scheduled-gate-contract.js"
 import { scheduledGateRootActions } from "./scheduled-gate-prepare-pg-resume.fixture.js"
 import { parseScheduledAuditReport, SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, SCHEDULED_AUDIT_TASK_TYPE,
   SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
@@ -51,10 +53,14 @@ const databaseUrl = dedicatedDisposableUrl()
 const redisUrl = dedicatedDisposableRedisUrl()
 const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 type Fixture = Awaited<ReturnType<typeof createScheduledGatePrepareFixture>>
+type ScheduledAuditRecoveryScope = Fixture["graphScope"] & Readonly<{
+  turnLeaseOwner: string; turnLeaseVersion: number; parentLeaseOwner: string; parentAttemptCount: number
+}>
 type Runner = Readonly<{ worker: Worker<SubagentJobPayload, unknown>; redis: Redis; queue: Queue<SubagentJobPayload> }>
 type ScheduledPipelineRoute = Readonly<{ POST(request: Request): Promise<Response> }>
 type ExecuteHttpResponse = Readonly<{ status: number; body: Record<string, unknown> }>
 type FixtureWebDatabase = Readonly<{ db: {
+  $connect(): Promise<void>
   $disconnect(): Promise<void>
   $transaction<T>(work: (tx: unknown) => Promise<T>): Promise<T>
   customAgentRole: { findMany(args: unknown): Promise<readonly unknown[]> }
@@ -167,7 +173,7 @@ const diagnosticGateErrorCodes = new Set([
 ])
 const diagnosticWorkerErrorCodes = new Set([
   ...diagnosticGateErrorCodes, "scheduled_gate_analyze_proof_invalid", "scheduled_gate_completion_unverified",
-  "scheduled_gate_graph_invalid", "scheduled_gate_handoff_retryable", "scheduled_gate_owner_stale",
+  "scheduled_gate_checkpoint_invalid", "scheduled_gate_graph_invalid", "scheduled_gate_handoff_retryable", "scheduled_gate_owner_stale",
   "scheduled_gate_prepare_proof_invalid", "scheduled_gate_registration_invalid", "scheduled_gate_runtime_failed",
   "scheduled_gate_task_invalid", "scheduled_gate_wait_invalid",
 ])
@@ -196,6 +202,7 @@ const scheduledTaskGraphGateCheckpointPath = "@/lib/agent/scheduled-taskgraph-ga
 const scheduledTaskGraphAuditChildFencePath = "@/lib/agent/scheduled-taskgraph-audit-child-fence"
 const scheduledTaskGraphAuditPrepareSourcePath = "@/lib/agent/scheduled-taskgraph-audit-prepare-source"
 const scheduledGateQualityReviewPath = "@/lib/agent/stages/gate-quality-review"
+const scheduledGateStagePath = "@/lib/agent/stages/gate"
 const scheduledModelRouterPath = "@/lib/model-router"
 const scheduledEntitlementsPath = "@/lib/entitlements"
 const scheduledWebDbPath = "@/lib/db"
@@ -205,6 +212,9 @@ let disconnectWebDatabase: (() => Promise<void>) | undefined
 let priorDatabaseUrl: string | undefined
 let priorAgentWebUrl: string | undefined
 let priorWorkerSecret: string | undefined
+let priorCredentialEncryptionKey: string | undefined
+let priorAzureKeyVaultUrl: string | undefined
+let priorAzureKeyName: string | undefined
 const fixtureUsers: string[] = []
 
 describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis", () => {
@@ -213,13 +223,20 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     priorDatabaseUrl = process.env.DATABASE_URL
     priorAgentWebUrl = process.env.AGENT_WEB_URL
     priorWorkerSecret = process.env.AGENT_WORKER_SECRET
+    priorCredentialEncryptionKey = process.env.CREDENTIAL_ENCRYPTION_KEY
+    priorAzureKeyVaultUrl = process.env.AZURE_KEY_VAULT_URL
+    priorAzureKeyName = process.env.AZURE_KEY_NAME
     process.env.DATABASE_URL = databaseUrl!
     process.env.AGENT_WEB_URL = "http://scheduled-audit-fixture.invalid"
     process.env.AGENT_WORKER_SECRET = "scheduled-audit-fixture-secret"
+    process.env.CREDENTIAL_ENCRYPTION_KEY = Buffer.alloc(32, 0x51).toString("base64")
+    delete process.env.AZURE_KEY_VAULT_URL
+    delete process.env.AZURE_KEY_NAME
   })
   afterEach(async () => {
     await stopRunner()
     vi.doUnmock(scheduledGateQualityReviewPath)
+    vi.doUnmock(scheduledGateStagePath)
     vi.doUnmock(scheduledModelRouterPath)
     vi.doUnmock(scheduledEntitlementsPath)
     vi.doUnmock(scheduledRunServicePath)
@@ -239,16 +256,28 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     restoreEnv("DATABASE_URL", priorDatabaseUrl)
     restoreEnv("AGENT_WEB_URL", priorAgentWebUrl)
     restoreEnv("AGENT_WORKER_SECRET", priorWorkerSecret)
+    restoreEnv("CREDENTIAL_ENCRYPTION_KEY", priorCredentialEncryptionKey)
+    restoreEnv("AZURE_KEY_VAULT_URL", priorAzureKeyVaultUrl)
+    restoreEnv("AZURE_KEY_NAME", priorAzureKeyName)
   })
 
   it("reserves a bounded fake Gate quality call and settles its BYOK usage in PostgreSQL", async () => {
     const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!)
     fixtureUsers.push(fixture.ids.userId)
+    const expectedPreparedIds = [...fixture.selectedJobIds].sort()
+    expect([...fixture.preparedJobIds].sort()).toEqual(expectedPreparedIds)
+    expect(fixture.prepareProof.result.jobs.filter(job => job.status === "prepared").map(job => job.jobId).sort())
+      .toEqual(expectedPreparedIds)
+    expect(fixture.prepareProof.result.materials.length).toBeGreaterThan(0)
+    for (const jobId of expectedPreparedIds) {
+      expect(fixture.prepareProof.result.materials.some(material => material.jobId === jobId && material.kind === "resume")).toBe(true)
+    }
     await seedScheduledAuditAgentConfig(fixture)
+    await seedScheduledAuditByokSettings(fixture)
     await pool!.query(`UPDATE "sub_agent_tasks" SET "budgetSnapshot"=$2::jsonb, "outputTokenReservationVersion"=1 WHERE "id"=$1`,
       [fixture.ids.rootTaskId, JSON.stringify({ limits: { maxOutputTokens: 64 } })])
     const commandPort = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool!)
-    const response = await setupFetcher(fixture, { useReservedQualityReview: true })
+    const response = await setupFetcher(fixture, { useReservedQualityReview: true, useStoredAiSettings: true })
     const continuation = createScheduledAutomationGateContinuation({ pool: pool as never, commandPort, waitPort,
       nativeQuestionWaitEnabled: false, fetcher: response.fetcher })
     const initialGateWait = await continuation({ owner: fixture.owner, executionOwner: fixture.turnExecutionOwner as TurnExecutionOwnerFence,
@@ -259,7 +288,40 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     if (initialGateWait.status !== "waiting_for_dependency") throw new Error("scheduled Gate wait missing")
     const gateTaskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
     runner = startRunner(fixture, response.fetcher)
-    await expect(dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)).resolves.toMatchObject({ status: "completed" })
+    const gateOutcome = await dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)
+    if (debugRecord(gateOutcome)?.status !== "completed") {
+      const rawStatus = debugRecord(gateOutcome)?.status
+      const outcomeStatus = typeof rawStatus === "string" && diagnosticOutcomeStatuses.has(rawStatus) ? rawStatus : "other"
+      const workerErrorCode = diagnosticWorkerErrorCode(debugRecord(gateOutcome)?.reason)
+        ?? diagnosticWorkerErrorCode((await taskState(gateTaskId)).failureReason)
+      const turnState = await readRootTurnState(fixture)
+      const graphState = await loadTaskGraph(pool as never, fixture.graphScope, false)
+      const gateNodeStatus = currentTaskGraph(graphState).nodes.find(node => node.key === "gate")?.status
+      throw new Error(`Scheduled Gate child did not complete: ${JSON.stringify({ outcomeStatus,
+        ...(workerErrorCode ? { workerErrorCode } : {}), gateHttpFailures: response.gateHttpFailures(),
+        gateResponses: response.gateResponses(), gateQualityCalls: response.gateQualityCalls(),
+        gateArtifactIssues: response.gateArtifactIssues(),
+        turnStatus: debugSafeEnum(turnState.turnStatus, ["queued", "in_progress", "waiting_for_dependency",
+          "waiting_for_approval", "waiting_for_user", "completed", "failed"]),
+        rootStatus: debugSafeEnum(turnState.rootStatus, ["running", "waiting", "waiting_for_user", "completed", "failed"]),
+        gateNodeStatus: debugSafeEnum(gateNodeStatus, ["queued", "running", "waiting_for_user", "completed", "failed"]) })}`)
+    }
+    expect(gateOutcome).toMatchObject({ status: "completed" })
+    const preparedIds = scheduledGatePreparedJobIds(fixture.prepareProof)
+    expect(preparedIds).toEqual(fixture.preparedJobIds)
+    if (!preparedIds) throw new Error("scheduled Gate prepared job IDs missing")
+    const gateTask = await taskState(gateTaskId)
+    const gateEnvelope = parseScheduledGateTaskEnvelope(gateTask.result, gateTask.status, preparedIds)
+    expect(gateEnvelope).not.toBeNull()
+    expect(response.gatePolicyPackages()).toEqual(expectedPreparedIds.map(jobId => expect.objectContaining({ jobId,
+      hasDescription: true, hasResumeArtifact: true })))
+    expect(response.gateArtifactIssues()).toEqual([])
+    expect(gateEnvelope?.structuredResult).toMatchObject({ status: "completed", approvedJobIds: [],
+      pendingJobIds: expectedPreparedIds, skippedJobIds: [],
+      counts: { approved: 0, pending: expectedPreparedIds.length, skipped: 0 } })
+    expect(response.gateHttpFailures().map(failure => ({ status: failure.status, errorCode: failure.errorCode,
+      phase: failure.testDiagnostic.phase, safeErrorCode: failure.testDiagnostic.safeErrorCode }))).toEqual([])
+    expect(response.gateQualityCalls()).toEqual([64])
 
     const usage = await pool!.query<{ status: string; featureKey: string; credentialSource: string; provider: string; model: string;
       inputTokens: number; outputTokens: number; providerStartedAt: Date | null; reservationStatus: string;
@@ -290,8 +352,53 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
         AND step."modelProfileSnapshot" #> '{gateQualityReview}' IS NOT NULL`, [fixture.ids.sessionId, gateTaskId])
     expect(gateAggregate.rows[0]).toMatchObject({ steps: 1, inputTokens: "21", outputTokens: "8" })
     expect(Number(gateAggregate.rows[0]?.costUsd)).toBeCloseTo(0.0001, 8)
-    expect(response.gateQualityCalls()).toEqual([64])
     expect(JSON.stringify(usage.rows[0]?.modelProfileSnapshot)).not.toContain("fixture-user-secret")
+  })
+
+  it("rejects a Gate review receipt when its prepared artifact changes after preflight", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    const material = fixture.prepareProof.result.materials[0]
+    if (!material) throw new Error("scheduled Gate fixture has no prepared material")
+    await seedScheduledAuditAgentConfig(fixture)
+    await seedScheduledAuditByokSettings(fixture)
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "budgetSnapshot"=$2::jsonb, "outputTokenReservationVersion"=1 WHERE "id"=$1`,
+      [fixture.ids.rootTaskId, JSON.stringify({ limits: { maxOutputTokens: 64 } })])
+    let materialMutations = 0
+    const response = await setupFetcher(fixture, { useReservedQualityReview: true, useStoredAiSettings: true,
+      beforeSecondGateReceiptFence: async () => {
+        const changedHash = `sha256:${"f".repeat(64)}`
+        const changed = await pool!.query<{ id: string }>(`UPDATE "agent_artifact" SET "hash"=$1
+          WHERE "id"=$2 AND "userId"=$3 RETURNING "id"`, [changedHash, material.artifactRef.artifactId, fixture.ids.userId])
+        if (changed.rows.length !== 1) throw new Error("scheduled Gate race fixture could not change its artifact head")
+        materialMutations += 1
+      } })
+    const commandPort = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool!)
+    const continuation = createScheduledAutomationGateContinuation({ pool: pool as never, commandPort, waitPort,
+      nativeQuestionWaitEnabled: false, fetcher: response.fetcher })
+    const initialGateWait = await continuation({ owner: fixture.owner,
+      executionOwner: fixture.turnExecutionOwner as TurnExecutionOwnerFence, attestation: fixture.attestation,
+      handoff: fixture.handoff, prepareProof: fixture.prepareProof, scheduledWaitId: fixture.prepareChoiceWaitId,
+      finalStepId: fixture.rootQuestionStepId, recoveryStepId: fixture.rootQuestionStepId,
+      signal: new AbortController().signal })
+    expect(initialGateWait.status).toBe("waiting_for_dependency")
+    if (initialGateWait.status !== "waiting_for_dependency") throw new Error("scheduled Gate wait missing")
+    const gateTaskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
+    runner = startRunner(fixture, response.fetcher)
+    const gateOutcome = await dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)
+
+    expect(debugRecord(gateOutcome)?.status).not.toBe("completed")
+    expect(response.gateReceiptFenceAssertions()).toBeGreaterThanOrEqual(2)
+    expect(materialMutations).toBe(1)
+    expect(response.gateHttpFailures()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: 409, errorCode: "scheduled_pipeline_turn_stale" }),
+    ]))
+    const approvals = await pool!.query(`SELECT "id" FROM "agent_approvals" WHERE "userId"=$1 AND "sessionId"=$2
+      AND "turnId"=$3 AND "type"='review_application'`, [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId])
+    const projectedItems = await pool!.query(`SELECT "id" FROM "agent_items" WHERE "sessionId"=$1 AND "turnId"=$2
+      AND "type"='approval_request'`, [fixture.ids.sessionId, fixture.ids.turnId])
+    expect(approvals.rows).toHaveLength(0)
+    expect(projectedItems.rows).toHaveLength(0)
   })
 
   it("serializes concurrent PostgreSQL admissions for the final AI credit", async () => {
@@ -478,7 +585,9 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(cut.rows).toHaveLength(1)
     expect(cut.rows[0]).toMatchObject({ eventStatus: "reserved", inputTokens: 0, outputTokens: 0,
       reservationStatus: "started", actualOutputTokens: null, reservedOutputTokens: 64, stepStatus: "streaming",
-      stepInputTokens: null, stepOutputTokens: null, stepCostUsd: null })
+      stepInputTokens: 0, stepOutputTokens: 0 })
+    // The streaming Step keeps schema defaults; the event and reservation remain authoritative until settlement.
+    expect(Number(cut.rows[0]?.stepCostUsd)).toBe(0)
     expect(cut.rows[0]?.providerStartedAt).toBeInstanceOf(Date)
     expect(Number(cut.rows[0]?.eventCostUsd)).toBe(0)
   })
@@ -543,7 +652,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(rows.rows).toHaveLength(1)
     expect(rows.rows[0]).toMatchObject({ eventStatus: "reserved", inputTokens: 0, outputTokens: 0, reservationStatus: "started",
       actualOutputTokens: null, reservedOutputTokens: 64, stepStatus: "failed", stepInputTokens: 21,
-      stepOutputTokens: null, stepCostUsd: null })
+      stepOutputTokens: 0 })
+    expect(Number(rows.rows[0]?.stepCostUsd)).toBe(0)
     expect(rows.rows[0]?.providerStartedAt).toBeInstanceOf(Date)
     expect(Number(rows.rows[0]?.eventCostUsd)).toBe(0)
   })
@@ -583,7 +693,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(rows.rows[0]).toMatchObject({ provider: "custom", model: "custom", eventStatus: "reserved",
       inputTokens: 0, outputTokens: 0, outputRequired: false, reservationStatus: "started", actualOutputTokens: null,
       reservedOutputTokens: 0, stepStatus: "failed", stepInputTokens: 21, stepOutputTokens: 8,
-      stepCostUsd: null, stepErrorCode: "gate_quality_usage_unknown" })
+      stepErrorCode: "gate_quality_usage_unknown" })
+    expect(Number(rows.rows[0]?.stepCostUsd)).toBe(0)
     expect(rows.rows[0]?.providerStartedAt).toBeInstanceOf(Date)
     expect(Number(rows.rows[0]?.eventCostUsd)).toBe(0)
   })
@@ -642,9 +753,6 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const command = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool!)
     const turnOwner = fixture.turnExecutionOwner as TurnExecutionOwnerFence
     const sourceStepId = fixture.rootQuestionStepId
-    const scopeBase = { ...fixture.graphScope, turnLeaseOwner: fixture.owner.turnLeaseOwnerId,
-      turnLeaseVersion: fixture.owner.turnLeaseVersion, parentLeaseOwner: fixture.owner.turnLeaseOwnerId,
-      parentAttemptCount: fixture.owner.rootAttemptCount }
     const response = await setupFetcher(fixture)
     const continuation = createScheduledAutomationGateContinuation({ pool: pool as never, commandPort: command,
       waitPort, nativeQuestionWaitEnabled: false, fetcher: response.fetcher })
@@ -676,14 +784,15 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(gateResolution?.status).toBe("ready")
     expect(gateResolution?.matchedTaskIds).toEqual([gateTaskId])
 
-    const gateProof = await requireGateProof(fixture)
     const rootStore = createPgRootTaskStore(pool as never)
     const sessionProjection = createCanonicalSessionProjection(pool as never)
     const projectionIdentity = { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId }
     if (options.freshV2Replan) {
       let rootModelStreamCalls = 0
-      const freshRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort,
-        undefined, undefined, undefined, fixture.turnLease, () => { rootModelStreamCalls += 1 })
+      const resumed = await approveAndResumeScheduledAuditRoot(fixture, response, command, waitPort,
+        () => { rootModelStreamCalls += 1 })
+      const gateProof = resumed.gateProof
+      const freshRoot = resumed.root
       expect(freshRoot.status).not.toBe("completed")
       expect(rootModelStreamCalls).toBe(1)
       const replanEvents = await pool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
@@ -703,35 +812,42 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       expect(response.gateCalls()).toBe(1)
       return
     }
-    if (options.persistedLegacyAudit) {
-      await stopRunner()
-      await expect(command.appendScheduledAudit!({ scope: { ...scopeBase, stepId: sourceStepId },
-        executionOwner: fixture.executionOwner, handoff: fixture.handoff, attestation: fixture.attestation,
-        gateProof, scheduledWaitId: fixture.prepareChoiceWaitId })).resolves.toMatchObject({ status: "accepted",
-        auditTaskId: expect.any(String), expectedAttemptCount: 1 })
-    }
+    if (options.persistedLegacyAudit) await stopRunner()
     const auditReplayCaptures: Array<{ mode: "append_audit" | "resume_audit"; recoveryStepId: string; receipt: unknown }> = []
-    const captureAuditAppendReplay = async (recoveryStepId: string, mode: "append_audit" | "resume_audit"): Promise<void> => {
-      const receipt = await command.appendScheduledAudit!({ scope: { ...scopeBase, stepId: recoveryStepId },
+    let gateProof: Awaited<ReturnType<typeof requireGateProof>> | undefined
+    const captureAuditAppendReplay = async (recoveryStepId: string, mode: "append_audit" | "resume_audit",
+      recoveryScope: ScheduledAuditRecoveryScope): Promise<void> => {
+      if (!gateProof) throw new Error("scheduled Gate proof was not checked under the resumed Turn lease")
+      const receipt = await command.appendScheduledAudit!({ scope: { ...recoveryScope, stepId: recoveryStepId },
         executionOwner: fixture.executionOwner, handoff: fixture.handoff, attestation: fixture.attestation,
         gateProof, scheduledWaitId: fixture.prepareChoiceWaitId })
       auditReplayCaptures.push({ mode, recoveryStepId, receipt })
     }
-    const pendingRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort,
-      "waiting_for_dependency", captureAuditAppendReplay)
+    const prepareRootResume = async (_lease: TurnLease, recoveryScope: ScheduledAuditRecoveryScope,
+      proof: Awaited<ReturnType<typeof requireGateProof>>): Promise<void> => {
+      gateProof = proof
+      if (options.persistedLegacyAudit) await expect(command.appendScheduledAudit!({
+        scope: { ...recoveryScope, stepId: sourceStepId }, executionOwner: fixture.executionOwner,
+        handoff: fixture.handoff, attestation: fixture.attestation, gateProof: proof,
+        scheduledWaitId: fixture.prepareChoiceWaitId,
+      })).resolves.toMatchObject({ status: "accepted", auditTaskId: expect.any(String), expectedAttemptCount: 1 })
+    }
+    const resumedRoot = await approveAndResumeScheduledAuditRoot(fixture, response, command, waitPort,
+      undefined, captureAuditAppendReplay, prepareRootResume)
+    gateProof = resumedRoot.gateProof
+    const pendingRoot = resumedRoot.root
     expect(pendingRoot.status).toBe("waiting_for_dependency")
-    if (pendingRoot.status !== "waiting_for_dependency" || !pendingRoot.waitId) throw new Error("scheduled Audit root wait missing")
+    if (pendingRoot.status !== "waiting_for_dependency" || !pendingRoot.waitId) {
+      throw new Error(`scheduled Audit root wait missing: ${JSON.stringify(pendingRoot)}`)
+    }
     const pendingTrace = await readScheduledAuditRootRecoveryTrace(fixture)
     expectScheduledAuditRecoveryTrace(pendingTrace, fixture, 1, "waiting_for_tool", null)
     expect(pendingTrace.steps[0]?.completionEvents[0]?.payload).toMatchObject({ status: "waiting_for_dependency", waitId: pendingRoot.waitId })
     expect(pendingTrace.steps[0]?.waits.some(wait => wait.id === pendingRoot.waitId)).toBe(true)
     const auditWait = { status: "waiting_for_dependency" as const, waitId: pendingRoot.waitId }
     expect(auditWait.waitId).not.toBe(initialGateWait.waitId)
-    expect(await requireGateProof(fixture)).toEqual(gateProof)
-    await rootStore.finish({ lease: fixture.turnLease, rootTaskId: fixture.ids.rootTaskId, result: pendingRoot })
-    await sessionProjection.finish({ ...projectionIdentity, result: { status: "waiting_for_dependency" } })
-    await expect(suspendAndReleaseWait(pool as never, { lease: fixture.turnLease, waitId: auditWait.waitId }))
-      .resolves.toMatchObject({ waitId: auditWait.waitId, handoff: "suspended", waitStatus: "waiting" })
+    // The proof was checked before the real approval wakeup advanced the Turn lease.
+    expect(resumedRoot.turnOutcome).toMatchObject({ status: "waiting_for_dependency" })
     const pendingRootState = await readRootTurnState(fixture)
     expect(pendingRootState.turnStatus).toBe("waiting_for_dependency")
     expect(pendingRootState.sessionStatus).toBe("running")
@@ -881,6 +997,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       staleAttempt: Awaited<ReturnType<NonNullable<typeof command.verifyScheduledAuditCompletion>>> }> = []
     const captureTerminalAuditProof = async (_recoveryStepId: string, mode: "append_audit" | "resume_audit"): Promise<void> => {
       if (mode !== "resume_audit") throw new Error("terminal Audit proof must use the existing Audit resume path")
+      if (!gateProof) throw new Error("scheduled Gate proof missing during terminal Audit verification")
       const proofInput = { scope: { ...fixture.graphScope, turnLeaseOwner: proofLease.ownerId,
         turnLeaseVersion: proofLease.leaseVersion, parentLeaseOwner: proofLease.ownerId,
         parentAttemptCount: fixture.owner.rootAttemptCount }, executionOwner: fixture.executionOwner,
@@ -898,7 +1015,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "queued", turnLeaseOwnerId: null,
       rootStatus: "waiting", sessionStatus: "running" })
     const turnJobs: TurnJobPayload[] = []
-    expect(await dispatchPendingTurnOutbox(pool as never, { add: async (_name, payload) => { turnJobs.push(payload) } })).toBe(1)
+    expect(await dispatchPendingTurnOutbox(pool as never, createUniqueTurnDispatchQueue(turnJobs))).toBeGreaterThanOrEqual(1)
     expect(turnJobs).toHaveLength(1)
     expect(turnJobs.map(job => job.turnId)).toEqual([fixture.ids.turnId])
     let terminalRoot: TurnEngineResult | undefined
@@ -973,7 +1090,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
 async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof fetch,
   commandPort: ReturnType<typeof createPgTaskGraphCommandPort>, waitPort: ReturnType<typeof createPgDurableWaitPort>,
   expectedStatus?: "waiting_for_dependency",
-  afterAuditWait?: (recoveryStepId: string, mode: "append_audit" | "resume_audit") => Promise<void>,
+  afterAuditWait?: (recoveryStepId: string, mode: "append_audit" | "resume_audit", scope: ScheduledAuditRecoveryScope) => Promise<void>,
   afterAuditCompletion?: (recoveryStepId: string, mode: "append_audit" | "resume_audit") => Promise<void>,
   activeLease: TurnLease = fixture.turnLease, onModelStream?: () => void): Promise<TurnEngineResult> {
   const phases: Array<{ phase: string; outcome?: string; errorClass?: string; errorCode?: string }> = []
@@ -1018,6 +1135,8 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
   }
   const run = async (): Promise<TurnEngineResult> => {
     const lease = activeLease, owner = { ...fixture.owner, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
+    const recoveryScope: ScheduledAuditRecoveryScope = { ...fixture.graphScope, turnLeaseOwner: lease.ownerId,
+      turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: fixture.owner.rootAttemptCount }
     const executionOwner: TurnExecutionOwnerFence = { ...fixture.turnExecutionOwner, ownerId: lease.ownerId,
       leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt }
     const store = createPgTurnEngineStore(pool as never), candidateStore = createScheduledPipelineCandidateStore(pool as never, store)
@@ -1054,7 +1173,7 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
         mode === "resume_audit" ? "continue_after_gate.resume_audit" : "continue_after_gate.append_audit",
         () => gateContinuationBase(input))
       if (afterAuditWait && result.status === "waiting_for_dependency") {
-        await afterAuditWait(input.recoveryStepId, mode)
+        await afterAuditWait(input.recoveryStepId, mode, recoveryScope)
       }
       if (afterAuditCompletion && result.status === "completed") {
         await afterAuditCompletion(input.recoveryStepId, mode)
@@ -1271,6 +1390,95 @@ function waitForTask(worker: Worker<SubagentJobPayload, unknown>, taskId: string
     worker.on("completed", complete); worker.on("failed", failed)
   })
 }
+
+async function approveAndResumeScheduledAuditRoot(fixture: Fixture, response: Awaited<ReturnType<typeof setupFetcher>>,
+  commandPort: ReturnType<typeof createPgTaskGraphCommandPort>, waitPort: ReturnType<typeof createPgDurableWaitPort>,
+  onModelStream?: () => void,
+  afterAuditWait?: (recoveryStepId: string, mode: "append_audit" | "resume_audit", scope: ScheduledAuditRecoveryScope) => Promise<void>,
+  beforeRootRun?: (lease: TurnLease, scope: ScheduledAuditRecoveryScope,
+    gateProof: Awaited<ReturnType<typeof requireGateProof>>) => Promise<void>): Promise<{
+    root: TurnEngineResult; turnOutcome: unknown; gateProof: Awaited<ReturnType<typeof requireGateProof>>; lease: TurnLease
+  }> {
+  const pending = await pool!.query<{ id: string; status: string; type: string; impact: unknown; content: unknown }>(`
+    SELECT approval."id", approval."status", approval."type", approval."impact", item."content"
+    FROM "agent_items" AS item JOIN "agent_approvals" AS approval
+      ON approval."id" = item."content"->>'approvalId'
+     AND approval."userId" = $1 AND approval."sessionId" = item."sessionId"
+    WHERE item."sessionId" = $2 AND item."turnId" = $3
+      AND item."type" = 'approval_request' AND item."status" = 'started'
+    ORDER BY item."createdAt" ASC LIMIT 1`, [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId])
+  const approval = pending.rows[0]
+  if (!approval || approval.type !== "review_application" || approval.status !== "pending"
+    || debugRecord(approval.impact)?.externalSubmission !== false
+    || debugRecord(approval.content)?.action !== "review_application") {
+    throw new Error("scheduled Gate did not create the expected non-submission review approval")
+  }
+  const submitRows = await pool!.query(`SELECT "id" FROM "agent_approvals"
+    WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'submit_application'`,
+  [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId])
+  expect(submitRows.rows).toHaveLength(0)
+
+  const broker = await vi.importActual<{ decideApproval(db: unknown, input: unknown): Promise<{ status: string; disposition: string }> }>(
+    "@/lib/agent/broker/store")
+  const turn = (await pool!.query<{ status: string; revision: number }>(`SELECT "status", "revision" FROM "agent_turns"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+  [fixture.ids.turnId, fixture.ids.sessionId, fixture.ids.userId])).rows[0]
+  if (!turn || turn.status !== "waiting_for_approval") throw new Error("scheduled Gate Turn is not waiting for approval")
+  const decision = await broker.decideApproval(response.webDatabase, { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
+    waitId: approval.id, decision: "approved", expectedTurnId: fixture.ids.turnId, expectedRevision: turn.revision,
+    clientMessageId: `scheduled-audit-test-approval-${randomUUID()}` })
+  expect(decision).toMatchObject({ status: "approved", disposition: "resolved", waitId: approval.id })
+  expect(await drainAgentWakeups(pool as never, 10)).toBeGreaterThanOrEqual(1)
+
+  const turnJobs: TurnJobPayload[] = []
+  expect(await dispatchPendingTurnOutbox(pool as never, createUniqueTurnDispatchQueue(turnJobs))).toBeGreaterThanOrEqual(1)
+  expect(turnJobs).toHaveLength(1)
+  expect(turnJobs[0]?.turnId).toBe(fixture.ids.turnId)
+  const rootStore = createPgRootTaskStore(pool as never)
+  const sessionProjection = createCanonicalSessionProjection(pool as never)
+  const identity = { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId }
+  let root: TurnEngineResult | undefined
+  let gateProof: Awaited<ReturnType<typeof requireGateProof>> | undefined
+  let resumedLease: TurnLease | undefined
+  const turnOutcome = await runTurnJob({ data: turnJobs[0]!, attemptsMade: 0 }, { pool: pool as never,
+    requireCanonicalAutomationMode: true, heartbeatMs: 60_000,
+    async execute({ lease }) {
+      resumedLease = lease
+      await rootStore.ensure({ lease, goal: "Finish the scheduled automation only after its current Audit proof",
+        allowedActions: scheduledGateRootActions() })
+      await sessionProjection.start(identity)
+      gateProof = await requireGateProof(fixture, lease)
+      await beforeRootRun?.(lease, { ...fixture.graphScope, turnLeaseOwner: lease.ownerId,
+        turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId,
+        parentAttemptCount: fixture.owner.rootAttemptCount }, gateProof)
+      root = await runAttachedScheduledAuditRoot(fixture, response.fetcher, commandPort, waitPort,
+        undefined, afterAuditWait, undefined, lease, onModelStream)
+      await rootStore.finish({ lease, rootTaskId: fixture.ids.rootTaskId, result: root })
+      await sessionProjection.finish({ ...identity, result: { status: root.status } })
+      return { status: root.status, ...(root.waitId ? { waitId: root.waitId } : {}) }
+    }, waitHandoff: async ({ lease, waitId }) => {
+      await suspendAndReleaseWait(pool as never, { lease, waitId })
+    } })
+  if (!root) throw new Error("approved scheduled Audit Turn did not execute Root")
+  if (!gateProof || !resumedLease) throw new Error("approved scheduled Audit Turn did not verify its Gate proof")
+  return { root, turnOutcome, gateProof, lease: resumedLease }
+}
+
+function createUniqueTurnDispatchQueue(turnJobs: TurnJobPayload[]) {
+  const jobsById = new Map<string, TurnJobPayload>()
+  return { add: async (_name: string, payload: TurnJobPayload, options?: { jobId?: string }) => {
+    const jobId = options?.jobId ?? JSON.stringify(payload)
+    const existing = jobsById.get(jobId)
+    if (existing) {
+      expect(payload).toEqual(existing)
+      return existing
+    }
+    jobsById.set(jobId, payload)
+    turnJobs.push(payload)
+    return payload
+  } }
+}
+
 async function stopRunner(): Promise<void> {
   if (!runner) return
   const active = runner; runner = undefined
@@ -1279,13 +1487,19 @@ async function stopRunner(): Promise<void> {
   await active.queue.close().catch(() => undefined)
   await active.redis.quit().catch(() => active.redis.disconnect())
 }
-async function setupFetcher(fixture: Fixture, options: { useReservedQualityReview?: boolean } = {}) {
+async function setupFetcher(fixture: Fixture, options: { useReservedQualityReview?: boolean; useStoredAiSettings?: boolean;
+  beforeSecondGateReceiptFence?: () => Promise<void> } = {}) {
   if (options.useReservedQualityReview) vi.doMock(scheduledGateQualityReviewPath, async importOriginal => importOriginal())
   else vi.doMock(scheduledGateQualityReviewPath, () => ({ reviewApplicationQuality: async () => ({ kind: "unavailable" }) }))
   const customRoleLookups: CustomAgentRoleLookup[] = []
   const customModelCalls: string[] = []
   const gateQualityCalls: number[] = []
-  const fixtureWebDb = await vi.importActual<FixtureWebDatabase>(scheduledWebDbPath)
+  const gateArtifactIssues: string[] = []
+  const gatePolicyPackages: Array<{ jobId: string; hasDescription: boolean; hasResumeArtifact: boolean;
+    constraintMatch: boolean; artifactConstraintHash: string | null; expectedConstraintHash: string | null;
+    configMinMatchScore: number | null; configTargetRoles: unknown; configTargetLocations: unknown }> = []
+  let gateReceiptFenceAssertions = 0
+  const fixtureWebDb = await connectFixtureWebDatabase()
   const databaseWithoutCustomAgents = new Proxy(fixtureWebDb.db, {
     get(target, property, receiver) {
       if (property !== "customAgentRole") return Reflect.get(target, property, receiver)
@@ -1307,9 +1521,12 @@ async function setupFetcher(fixture: Fixture, options: { useReservedQualityRevie
     },
   })
   vi.doMock(scheduledWebDbPath, () => ({ ...fixtureWebDb, db: databaseWithoutCustomAgents }))
+  const storedModelRouter = options.useStoredAiSettings
+    ? await vi.importActual<{ loadUserAiConfig(userId: string, featureId: string): Promise<unknown> }>(scheduledModelRouterPath)
+    : null
   vi.doMock(scheduledModelRouterPath, () => ({ APPLYMATE_BACKING: { provider: "minimax", model: "MiniMax-M3" },
-    loadUserAiConfig: async () => ({ resolvedKey: "fixture-key", apiKey: "fixture-user-secret", credentialSource: "user",
-      provider: "minimax", model: "MiniMax-M3" }),
+    loadUserAiConfig: storedModelRouter?.loadUserAiConfig ?? (async () => ({ resolvedKey: "fixture-key", apiKey: "fixture-user-secret",
+      credentialSource: "user", provider: "minimax", model: "MiniMax-M3" })),
     resolveConfig: () => ({ resolvedKey: "fixture-key", provider: "minimax", model: "MiniMax-M3" }),
     prepareReservedModelTransport: () => ({ provider: "minimax", model: "MiniMax-M3", credentialSource: "user",
       chat: async (_messages: unknown, maxTokens: number) => {
@@ -1323,6 +1540,49 @@ async function setupFetcher(fixture: Fixture, options: { useReservedQualityRevie
       if (typeof feature === "string" && feature.startsWith("custom_")) customModelCalls.push(feature)
       return { text: "fixture model response" }
     }) }))
+  const constraintFunctions = await vi.importActual<{ tailoringConstraints(job: unknown, config: unknown): unknown }>("@/lib/agent/stages/prepare")
+  const artifactHashes = await vi.importActual<{ hashArtifactConstraints(value: unknown): string }>("@/lib/agent/artifacts/hash")
+  if (options.useReservedQualityReview || options.beforeSecondGateReceiptFence) vi.doMock(scheduledGateStagePath, async importOriginal => {
+    const actual = await importOriginal() as Record<string, unknown>
+    const run = actual.runScheduledGate as (...args: unknown[]) => Promise<unknown>
+    const artifactIssue = /^(resume|cover_letter):(artifact_not_draft|stale_constraints|invalid_artifact_hash|invalid_base_hash|missing_provenance)$/
+    return { ...actual, runScheduledGate: async (...args: unknown[]) => {
+      const context = debugRecord(args[1]), originalEmit = context?.emit
+      if (!context) return run(...args)
+      const config = debugRecord(context.agentCfg)
+      if (Array.isArray(args[0])) for (const value of args[0]) {
+        const pkg = debugRecord(value), job = debugRecord(pkg?.job), resumeArtifact = debugRecord(pkg?.tailoredResumeArtifact)
+        if (typeof job?.id === "string") {
+          const expectedHash = artifactHashes.hashArtifactConstraints(constraintFunctions.tailoringConstraints(value, context.agentCfg))
+          gatePolicyPackages.push({ jobId: job.id,
+            hasDescription: typeof job.description === "string" && job.description.length > 0,
+            hasResumeArtifact: Boolean(pkg?.tailoredResumeArtifact),
+            constraintMatch: resumeArtifact?.constraintHash === expectedHash,
+            artifactConstraintHash: typeof resumeArtifact?.constraintHash === "string" ? resumeArtifact.constraintHash : null,
+            expectedConstraintHash: expectedHash,
+            configMinMatchScore: Number.isSafeInteger(config?.minMatchScore) ? Number(config?.minMatchScore) : null,
+            configTargetRoles: config?.targetRoles ?? null, configTargetLocations: config?.targetLocations ?? null })
+        }
+      }
+      const scheduledOwnerFence = debugRecord(context.scheduledTaskGraphOwnerFence)
+      const originalAssert = scheduledOwnerFence?.assertCurrent
+      const wrappedContext = { ...context,
+        ...(typeof originalAssert === "function" ? { scheduledTaskGraphOwnerFence: { ...scheduledOwnerFence,
+          assertCurrent: async (transaction: unknown) => {
+            gateReceiptFenceAssertions += 1
+            if (gateReceiptFenceAssertions === 2) await options.beforeSecondGateReceiptFence?.()
+            return originalAssert(transaction)
+          } } } : {}),
+        emit: (event: unknown, payload: unknown) => {
+        const row = debugRecord(payload)
+        if (event === "artifact_reviewed" && Array.isArray(row?.issues)) for (const issue of row.issues) {
+          if (typeof issue === "string" && artifactIssue.test(issue)) gateArtifactIssues.push(issue)
+        }
+        return typeof originalEmit === "function" ? originalEmit(event, payload) : undefined
+      } }
+      return run(args[0], wrappedContext, args[2], args[3])
+    } }
+  })
   vi.doMock(scheduledEntitlementsPath, () => ({ getEffectiveEntitlements: async () => ({ limits: { ai_credits: 10 } }),
     isFeatureAllowed: async () => true,
     hasEffectiveEntitlement: async () => true, resolveAiAccess: async () => "available" }))
@@ -1726,6 +1986,7 @@ async function setupFetcher(fixture: Fixture, options: { useReservedQualityRevie
   let loseFirstExecuteResponse = true, gates = 0, executes = 0
   let gateDiagnostics: GateFailureDiagnostics | undefined
   const gateHttpFailures: GateHttpFailure[] = []
+  const gateResponses: Array<Record<string, unknown>> = []
   const executeHttpFailures: ExecuteHttpFailure[] = []
   let firstExecute: ExecuteHttpResponse | undefined
   let replayedExecute: ExecuteHttpResponse | undefined
@@ -1755,6 +2016,17 @@ async function setupFetcher(fixture: Fixture, options: { useReservedQualityRevie
       gates += 1
       const payload = await response.clone().json().catch(() => null)
       const routeBody = debugRecord(payload)
+      const counts = debugRecord(routeBody?.counts)
+      gateResponses.push({ httpStatus: response.status, keys: routeBody ? Object.keys(routeBody).sort() : [],
+        status: debugSafeEnum(routeBody?.status, ["completed", "question_required", "blocked"]),
+        kind: debugSafeEnum(routeBody?.kind, ["borderline_match", "weak_cover_letter"]),
+        nextStage: debugSafeEnum(routeBody?.nextStage, ["execute"]),
+        jobIdsCount: Array.isArray(routeBody?.jobIds) ? routeBody.jobIds.length : null,
+        approvedCount: Array.isArray(routeBody?.approvedJobIds) ? routeBody.approvedJobIds.length : null,
+        pendingCount: Array.isArray(routeBody?.pendingJobIds) ? routeBody.pendingJobIds.length : null,
+        skippedCount: Array.isArray(routeBody?.skippedJobIds) ? routeBody.skippedJobIds.length : null,
+        counts: counts && { approved: debugSafeInteger(counts.approved), pending: debugSafeInteger(counts.pending),
+          skipped: debugSafeInteger(counts.skipped) } })
       if ((response.status < 200 || response.status >= 300) && gateHttpFailures.length < 4) {
         gateHttpFailures.push({ status: response.status, errorCode: diagnosticGateErrorCode(routeBody?.errorCode),
           testDiagnostic: diagnosticGateFailure(routeBody?.testDiagnostic) })
@@ -1811,9 +2083,12 @@ async function setupFetcher(fixture: Fixture, options: { useReservedQualityRevie
   }
   return {
     fetcher,
+    webDatabase: fixtureWebDb.db,
+    gateReceiptFenceAssertions: () => gateReceiptFenceAssertions,
     gateCalls: () => gates,
     gateDiagnostics: () => gateDiagnostics,
     gateHttpFailures: () => [...gateHttpFailures],
+    gateResponses: () => [...gateResponses],
     executeCalls: () => executes,
     executeHttpFailures: () => [...executeHttpFailures],
     firstExecuteRequest: () => firstExecuteRequest,
@@ -1828,6 +2103,8 @@ async function setupFetcher(fixture: Fixture, options: { useReservedQualityRevie
     customRoleLookups: () => [...customRoleLookups],
     customModelCalls: () => [...customModelCalls],
     gateQualityCalls: () => [...gateQualityCalls],
+    gatePolicyPackages: () => [...gatePolicyPackages],
+    gateArtifactIssues: () => [...gateArtifactIssues],
   }
 }
 
@@ -2926,7 +3203,7 @@ function diagnosticGateErrorCode(value: unknown): string | null {
   return typeof value === "string" && diagnosticGateErrorCodes.has(value) ? value : null
 }
 function diagnosticWorkerErrorCode(value: unknown): string | null {
-  return typeof value === "string" && diagnosticWorkerErrorCodes.has(value) ? value : null
+  return typeof value === "string" && (diagnosticWorkerErrorCodes.has(value) || /^scheduled_gate_[a-z0-9_]{1,80}$/.test(value)) ? value : null
 }
 function diagnosticGateFailure(value: unknown): GateHttpFailure["testDiagnostic"] {
   const row = debugRecord(value)
@@ -2951,6 +3228,16 @@ async function seedScheduledAuditAgentConfig(fixture: Fixture): Promise<void> {
       ON CONFLICT ("userId") DO NOTHING`, [`scheduled-audit-agent-config-${fixture.ids.turnId}`, fixture.ids.userId])
 }
 
+async function seedScheduledAuditByokSettings(fixture: Fixture): Promise<void> {
+  const settings = await vi.importActual<{ encryptAiSettings(value: unknown, userId: string): Promise<unknown> }>("@/lib/ai-credential-settings")
+  const aiSettings = await settings.encryptAiSettings({ keys: { minimax: "fixture-user-secret" },
+    features: { autoApply: { provider: "minimax", model: "MiniMax-M3" } } }, fixture.ids.userId)
+  const saved = await pool!.query(`UPDATE "User" SET "preferences" = COALESCE("preferences", '{}'::jsonb)
+      || jsonb_build_object('aiSettings', $2::jsonb) WHERE "id"=$1 RETURNING "id"`,
+  [fixture.ids.userId, JSON.stringify(aiSettings)])
+  if (saved.rowCount !== 1) throw new Error("scheduled Audit BYOK settings owner missing")
+}
+
 async function setRootUsageBudget(fixture: Fixture, strictOutput: boolean): Promise<void> {
   const budgetSnapshot = strictOutput ? { limits: { maxOutputTokens: 64 } } : { limits: {} }
   const result = await pool!.query(`UPDATE "sub_agent_tasks" SET "budgetSnapshot"=$2::jsonb,
@@ -2960,12 +3247,35 @@ async function setRootUsageBudget(fixture: Fixture, strictOutput: boolean): Prom
 }
 
 async function setLiveGateUsageTask(fixture: Fixture, leaseOwnerId: string, attemptCount: number): Promise<string> {
+  await appendScheduledGateChildForUsageFixture(fixture)
   const taskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
   const result = await pool!.query(`UPDATE "sub_agent_tasks" SET "status"='running', "attemptCount"=$2, "leaseOwner"=$3,
-    "leaseExpiresAt"=CURRENT_TIMESTAMP + INTERVAL '10 minutes' WHERE "id"=$1 AND "rootTaskId"=$4`,
-  [taskId, attemptCount, leaseOwnerId, fixture.ids.rootTaskId])
+    "leaseExpiresAt"=CURRENT_TIMESTAMP + INTERVAL '10 minutes' WHERE "id"=$1 AND "rootTaskId"=$4
+      AND "sessionId"=$5 AND "turnId"=$6 AND "taskType"='scheduled_taskgraph_gate' AND "role"='prepare'`,
+  [taskId, attemptCount, leaseOwnerId, fixture.ids.rootTaskId, fixture.ids.sessionId, fixture.ids.turnId])
   if (result.rowCount !== 1) throw new Error("scheduled Gate usage task could not be leased")
   return taskId
+}
+
+async function appendScheduledGateChildForUsageFixture(fixture: Fixture): Promise<void> {
+  const commandPort = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool!)
+  const continuation = createScheduledAutomationGateContinuation({ pool: pool as never, commandPort, waitPort,
+    nativeQuestionWaitEnabled: false })
+  const result = await continuation({ owner: fixture.owner,
+    executionOwner: fixture.turnExecutionOwner as TurnExecutionOwnerFence, attestation: fixture.attestation,
+    handoff: fixture.handoff, prepareProof: fixture.prepareProof, scheduledWaitId: fixture.prepareChoiceWaitId,
+    finalStepId: fixture.rootQuestionStepId, recoveryStepId: fixture.rootQuestionStepId,
+    signal: new AbortController().signal })
+  if (result.status !== "waiting_for_dependency") throw new Error("scheduled Gate child was not durably appended")
+  await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
+  await connectFixtureWebDatabase()
+}
+
+async function connectFixtureWebDatabase(): Promise<FixtureWebDatabase> {
+  const web = await vi.importActual<FixtureWebDatabase>(scheduledWebDbPath)
+  await web.db.$connect()
+  disconnectWebDatabase = () => web.db.$disconnect()
+  return web
 }
 
 async function createGateUsageStep(fixture: Fixture, taskId: string, attempt: number): Promise<string> {
@@ -3069,11 +3379,11 @@ async function readExecutionState(fixture: Fixture): Promise<{ status: string; s
   return result.rows[0]
 }
 
-async function requireGateProof(fixture: Fixture) {
+async function requireGateProof(fixture: Fixture, lease: TurnLease = fixture.turnLease) {
   const command = createPgTaskGraphCommandPort(pool as never)
   const proof = await command.verifyScheduledGateCompletion!({ scope: { ...fixture.graphScope,
-    turnLeaseOwner: fixture.owner.turnLeaseOwnerId, turnLeaseVersion: fixture.owner.turnLeaseVersion,
-    parentLeaseOwner: fixture.owner.turnLeaseOwnerId, parentAttemptCount: fixture.owner.rootAttemptCount },
+    turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
+    parentLeaseOwner: lease.ownerId, parentAttemptCount: fixture.owner.rootAttemptCount },
     executionOwner: fixture.executionOwner, prepareProof: fixture.prepareProof })
   if (!proof) throw new Error("scheduled Audit fixture Gate proof missing")
   return proof
@@ -3138,7 +3448,7 @@ function dedicatedDisposableUrl(): string | null {
     return null
   }
   const url = new URL(value)
-  if (url.protocol !== "postgresql:" || url.hostname !== "127.0.0.1" || url.port !== "5432" || url.username !== "postgres"
+  if (url.protocol !== "postgresql:" || url.hostname !== "127.0.0.1" || url.port !== disposableTestPort("AGENT_RUNTIME_PG_TEST_LOCAL_PORT", "5432") || url.username !== "postgres"
     || url.password !== "postgres" || url.pathname !== "/applymate_agent_brain_ci" || url.search || url.hash) {
     throw new Error("Scheduled Audit PostgreSQL integration requires the dedicated disposable CI service URL")
   }
@@ -3153,7 +3463,16 @@ function dedicatedDisposableRedisUrl(): string | null {
     return null
   }
   const url = new URL(value)
-  if (url.protocol !== "redis:" || url.hostname !== "127.0.0.1" || url.port !== "6379" || url.username || url.password
+  if (url.protocol !== "redis:" || url.hostname !== "127.0.0.1" || url.port !== disposableTestPort("AGENT_TURN_REDIS_TEST_LOCAL_PORT", "6379") || url.username || url.password
     || url.pathname !== "/15" || url.search || url.hash) throw new Error("Scheduled Audit Redis integration requires disposable DB 15")
   return value
+}
+function disposableTestPort(variable: string, defaultPort: string): string {
+  const configured = process.env[variable]
+  if (configured === undefined) return defaultPort
+  const port = Number(configured)
+  if (!/^\d{1,5}$/.test(configured) || !Number.isInteger(port) || port < 1024 || port > 65535) {
+    throw new Error(`${variable} must be an explicit local port from 1024 through 65535`)
+  }
+  return String(port)
 }
