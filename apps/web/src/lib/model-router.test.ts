@@ -1,9 +1,14 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)))
 const recordAiUsage = vi.hoisted(() => vi.fn())
+const anthropicClient = vi.hoisted(() => ({ constructor: vi.fn(), create: vi.fn() }))
 vi.mock('@jobcopilot/shared/pinned-outbound', () => ({ pinnedFetch }))
 vi.mock('@/lib/ai-usage', () => ({ aiUsageErrorCode: () => 'provider_error', recordAiUsage }))
+vi.mock('@anthropic-ai/sdk', () => ({ default: class {
+  messages = { create: anthropicClient.create }
+  constructor(options: unknown) { anthropicClient.constructor(options) }
+} }))
 
 vi.mock('@/lib/db', () => ({ db: {} }))
 
@@ -11,8 +16,10 @@ import {
   APPLYMATE_BACKING,
   DEFAULT_AI_CONFIG,
   MODEL_CATALOGUE,
+  estimateAiCostUsd,
   modelChat,
   modelChatStream,
+  prepareReservedModelTransport,
   resolveConfig,
 } from './model-router'
 
@@ -99,6 +106,22 @@ describe('model catalogue and MiniMax compatibility', () => {
     expect(recordAiUsage).toHaveBeenCalledWith(expect.objectContaining({
       userId: 'owner-1', featureKey: 'scoring', runtime: 'web', provider: 'minimax', model: 'MiniMax-M3',
       status: 'error', inputTokens: 11, outputTokens: undefined, chargeBudget: false,
+    }))
+  })
+
+  it('preserves ordinary custom modelChat zero-cost telemetry outside Gate', async () => {
+    recordAiUsage.mockClear()
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ finish_reason: 'stop', message: { content: 'ok' } }],
+      usage: { prompt_tokens: 11, completion_tokens: 7 },
+    })))
+
+    await expect(modelChat([{ role: 'user', content: 'Ping' }], {
+      provider: 'custom', model: 'custom', apiBase: 'https://api.openai.com/v1', apiKey: 'test-key',
+    }, 100)).resolves.toMatchObject({ text: 'ok', inputTokens: 11, outputTokens: 7, provider: 'custom', model: 'custom' })
+
+    expect(recordAiUsage).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'custom', model: 'custom', inputTokens: 11, outputTokens: 7, estimatedCostUsd: 0, status: 'success',
     }))
   })
 
@@ -265,5 +288,127 @@ describe('model catalogue and MiniMax compatibility', () => {
       provider: 'custom', model: 'llama-3.3', apiBase: 'http://localhost:1234/v1', apiKey: 'test-key',
     })).resolves.toMatchObject({ provider: 'custom', model: 'llama-3.3', text: 'ok' })
     expect(fetchMock.mock.calls[0][0]).toBe('http://localhost:1234/v1/chat/completions')
+  })
+
+  describe('reserved model transport', () => {
+    const messages = [{ role: 'user' as const, content: 'Return a short JSON object.' }]
+
+    beforeEach(() => {
+      recordAiUsage.mockClear()
+      anthropicClient.constructor.mockClear()
+      anthropicClient.create.mockReset()
+    })
+
+    it('preflights credentials and custom endpoints before a usage reservation can start', () => {
+      expect(() => prepareReservedModelTransport({ provider: 'minimax', model: 'MiniMax-M3' })).toThrow(/unavailable|No API key/)
+      expect(prepareReservedModelTransport({ provider: 'openai', model: 'gpt-5.5', apiKey: 'user-key' }))
+        .toMatchObject({ provider: 'openai', model: 'gpt-5.5', credentialSource: 'user' })
+      expect(() => prepareReservedModelTransport({ provider: 'custom', model: 'llama-3.3', apiBase: 'http://example.test/v1', apiKey: 'user-key' }))
+        .toThrow(/endpoint/)
+      expect(vi.spyOn(globalThis, 'fetch')).not.toHaveBeenCalled()
+    })
+
+    it('returns resolved provider metadata without returning the key or endpoint', async () => {
+      const transport = prepareReservedModelTransport({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'user-secret' })
+
+      expect(transport).toMatchObject({ provider: 'minimax', model: 'MiniMax-M3', credentialSource: 'user' })
+      expect(JSON.stringify(transport)).not.toContain('user-secret')
+      expect(JSON.stringify(transport)).not.toContain('api.minimax')
+    })
+
+    it('returns actual usage without writing a legacy usage event', async () => {
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+        choices: [{ message: { content: '{"ok":true}' } }], usage: { prompt_tokens: 9, completion_tokens: 4 },
+      })))
+      const transport = prepareReservedModelTransport({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'user-secret' })
+
+      await expect(transport.chat(messages, 300)).resolves.toMatchObject({ text: '{"ok":true}', inputTokens: 9, outputTokens: 4 })
+      expect(fetchMock).toHaveBeenCalledOnce()
+      expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({ max_completion_tokens: 300 })
+      expect(recordAiUsage).not.toHaveBeenCalled()
+    })
+
+    it('sends the admitted Root output allowance unchanged in the provider request body', async () => {
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+        choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 9, completion_tokens: 4 },
+      })))
+      const transport = prepareReservedModelTransport({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'user-secret' })
+
+      await transport.chat(messages, 64)
+
+      expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({ max_completion_tokens: 64 })
+      expect(recordAiUsage).not.toHaveBeenCalled()
+    })
+
+    it('preserves unknown usage and sends only once when the provider returns a retryable error', async () => {
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('temporarily unavailable', { status: 503 }))
+      const transport = prepareReservedModelTransport({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'user-secret' })
+
+      await expect(transport.chat(messages, 300)).rejects.toThrow('minimax API error 503')
+      expect(fetchMock).toHaveBeenCalledOnce()
+      expect(recordAiUsage).not.toHaveBeenCalled()
+      expect(estimateAiCostUsd('custom', 'llama-3.3', 9, 4)).toBeNull()
+    })
+
+    it('sends once when the network fails before a response is received', async () => {
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('network interrupted'))
+      const transport = prepareReservedModelTransport({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'user-secret' })
+
+      await expect(transport.chat(messages, 300)).rejects.toThrow('network interrupted')
+      expect(fetchMock).toHaveBeenCalledOnce()
+      expect(recordAiUsage).not.toHaveBeenCalled()
+    })
+
+    it('does not record unknown tokens as zero when a successful response omits usage', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] })))
+      const transport = prepareReservedModelTransport({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'user-secret' })
+
+      const result = await transport.chat(messages, 300)
+      expect(result.inputTokens).toBeUndefined()
+      expect(result.outputTokens).toBeUndefined()
+      expect(recordAiUsage).not.toHaveBeenCalled()
+    })
+
+    it('propagates cancellation to the underlying request and stops after one send', async () => {
+      const controller = new AbortController()
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => new Promise((_resolve, reject) => {
+        const signal = (init as RequestInit).signal!
+        signal.addEventListener('abort', () => reject(signal.reason ?? new Error('aborted')), { once: true })
+      }))
+      const transport = prepareReservedModelTransport({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'user-secret' })
+      const pending = transport.chat(messages, 300, controller.signal)
+      controller.abort()
+
+      await expect(pending).rejects.toBeTruthy()
+      expect(fetchMock).toHaveBeenCalledOnce()
+      expect(recordAiUsage).not.toHaveBeenCalled()
+    })
+
+    it('disables Anthropic SDK retries only for reserved calls', async () => {
+      anthropicClient.create.mockResolvedValue({ content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 5, output_tokens: 2 } })
+      const controller = new AbortController()
+      const transport = prepareReservedModelTransport({ provider: 'anthropic', model: 'claude-sonnet-5', apiKey: 'user-secret' })
+
+      await expect(transport.chat(messages, 300, controller.signal)).resolves.toMatchObject({ inputTokens: 5, outputTokens: 2 })
+      expect(anthropicClient.constructor).toHaveBeenCalledWith({ apiKey: 'user-secret', maxRetries: 0 })
+      expect(anthropicClient.create.mock.calls[0]?.[1]).toEqual({ signal: controller.signal })
+      expect(anthropicClient.create.mock.calls[0]?.[0]).toMatchObject({ max_tokens: 300 })
+      expect(anthropicClient.create).toHaveBeenCalledOnce()
+      expect(recordAiUsage).not.toHaveBeenCalled()
+
+      await modelChat(messages, { provider: 'anthropic', model: 'claude-sonnet-5', apiKey: 'user-secret' })
+      expect(anthropicClient.constructor).toHaveBeenLastCalledWith({ apiKey: 'user-secret' })
+      expect(recordAiUsage).toHaveBeenCalledOnce()
+    })
+
+    it('keeps Anthropic reserved failures single-send while preserving legacy retry defaults', async () => {
+      anthropicClient.create.mockRejectedValue(new Error('503 unavailable'))
+      const transport = prepareReservedModelTransport({ provider: 'anthropic', model: 'claude-sonnet-5', apiKey: 'user-secret' })
+
+      await expect(transport.chat(messages, 300)).rejects.toThrow('503 unavailable')
+      expect(anthropicClient.constructor).toHaveBeenCalledWith({ apiKey: 'user-secret', maxRetries: 0 })
+      expect(anthropicClient.create).toHaveBeenCalledOnce()
+      expect(recordAiUsage).not.toHaveBeenCalled()
+    })
   })
 })

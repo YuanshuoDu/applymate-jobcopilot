@@ -42,10 +42,11 @@ function packageWithContent(): ApplicationPackage {
   }
 }
 
-function context(): Pick<PipelineCtx, 'roleConfigs' | 'aiConfig'> {
+function context(scheduledGateQualityModelCall?: PipelineCtx['scheduledGateQualityModelCall']): Pick<PipelineCtx, 'roleConfigs' | 'aiConfig' | 'scheduledGateQualityModelCall'> {
   return {
     roleConfigs: {} as PipelineCtx['roleConfigs'],
     aiConfig: { provider: 'minimax', model: 'MiniMax-M3' },
+    scheduledGateQualityModelCall,
   }
 }
 
@@ -67,6 +68,22 @@ describe('reviewApplicationQuality', () => {
     await expect(reviewApplicationQuality(packageWithContent(), context())).resolves.toEqual({
       kind: 'valid', result: validResult,
     })
+  })
+
+  it('uses only the reserved callback for scheduled review and keeps the 300-token request cap', async () => {
+    const call = vi.fn().mockResolvedValue({ text: JSON.stringify(validResult), provider: 'minimax', model: 'MiniMax-M3' })
+
+    await expect(reviewApplicationQuality(packageWithContent(), context(call), true)).resolves.toEqual({ kind: 'valid', result: validResult })
+
+    expect(call).toHaveBeenCalledOnce()
+    expect(call).toHaveBeenCalledWith(expect.objectContaining({ jobId: 'job_1', maxTokens: 300,
+      messages: [expect.objectContaining({ role: 'user' })] }))
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+  })
+
+  it('fails closed for scheduled review when the reserved callback is absent', async () => {
+    await expect(reviewApplicationQuality(packageWithContent(), context(), true)).resolves.toEqual({ kind: 'unavailable' })
+    expect(mocks.modelChat).not.toHaveBeenCalled()
   })
 
   it.each([0, 10])('accepts score boundary %s and string-length boundaries', async clScore => {

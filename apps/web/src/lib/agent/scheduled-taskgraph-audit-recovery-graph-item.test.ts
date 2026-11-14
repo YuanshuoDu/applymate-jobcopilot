@@ -3,7 +3,7 @@ import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
 import { Prisma } from '@prisma/client'
 import { describe, expect, it, vi } from 'vitest'
 import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
-import { isScheduledTaskGraphAuditRecoveryGraphItem } from './scheduled-taskgraph-audit-recovery-graph-item'
+import { isScheduledTaskGraphAuditRecoveryGraphItem, isScheduledTaskGraphGateRecoveryGraphItem } from './scheduled-taskgraph-audit-recovery-graph-item'
 
 const SCHEDULED_AUDIT_TEMPLATE_ID = 'scheduled_audit'
 const SCHEDULED_AUDIT_NODE_GOAL = 'Return the exact report from the authenticated scheduled Audit continuation after Gate completion.'
@@ -92,12 +92,29 @@ function proposalEvent(options: Readonly<{ proposalStepId?: string; eventId?: st
     causationId: proposalStepId, idempotencyKey: `${itemId}:proposal:${proposalRevision - 1}`, payload,
     ...options.eventOverrides }
 }
+function gateGraphContent(): RecoveryGraphSnapshot { return { schemaVersion: snapshot.schemaVersion, nodes: snapshot.nodes.slice(0, 4) } }
+function gateGraphItem(content = gateGraphContent(), overrides: Record<string, unknown> = {}): GraphRow {
+  return graphItem({ content, ...overrides })
+}
+function gateProposalEvent(options: Readonly<{ proposalStepId?: string; eventId?: string; targetTaskId?: string;
+  nodeKey?: string; content?: RecoveryGraphSnapshot; eventOverrides?: Record<string, unknown> }> = {}): GraphRow {
+  const content = options.content ?? gateGraphContent(), gateTaskId = options.targetTaskId ?? 'gate-child-1'
+  const base = proposalEvent({ proposalStepId: options.proposalStepId, eventId: options.eventId, itemContent: content,
+    auditTaskId: gateTaskId, eventOverrides: options.eventOverrides })
+  const payload = base.payload as Record<string, unknown>, receiptNode = { key: options.nodeKey ?? 'gate', taskId: gateTaskId, status: 'queued' }
+  return { ...base, payload: { ...payload, receipt: { status: 'accepted', revision: payload.revision,
+    nodes: [receiptNode], readyTaskIds: [gateTaskId] } } }
+}
 function reader(events: readonly GraphRow[]) {
   return { agentEvent: { findMany: vi.fn(async () => events) } } as unknown as Prisma.TransactionClient
 }
 function validate(item: GraphRow, events: readonly GraphRow[], currentStepId = stepId) {
   const db = reader(events)
   return { db, result: isScheduledTaskGraphAuditRecoveryGraphItem({ reader: db, owner, stepId: currentStepId, item }) }
+}
+function validateGate(item: GraphRow, events: readonly GraphRow[], currentStepId = stepId, gateTaskId = 'gate-child-1') {
+  const db = reader(events)
+  return { db, result: isScheduledTaskGraphGateRecoveryGraphItem({ reader: db, owner, stepId: currentStepId, gateTaskId, item }) }
 }
 
 describe('scheduled TaskGraph Audit recovery graph item', () => {
@@ -161,5 +178,36 @@ describe('scheduled TaskGraph Audit recovery graph item', () => {
   it('rejects a foreign current item and content changed after the immutable proposal', async () => {
     await expect(validate(graphItem({ turnId: 'foreign-turn' }), [proposalEvent()]).result).resolves.toBe(false)
     await expect(validate(graphItem({ content: { ...snapshot, mutated: true } }), [proposalEvent()]).result).resolves.toBe(false)
+  })
+})
+
+describe('scheduled TaskGraph Gate recovery graph item', () => {
+  it('accepts only the exact Gate-only graph and ready receipt', async () => {
+    const item = gateGraphItem(), event = gateProposalEvent()
+    const { db, result } = validateGate(item, [event])
+    await expect(result).resolves.toBe(true)
+    expect(db.agentEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ sessionId: owner.sessionId, turnId: owner.turnId, taskId: rootId,
+        itemId, type: 'item.delta', actor: 'orchestrator', correlationId: owner.turnId, causationId: stepId }), take: 2,
+    }))
+  })
+
+  it.each([
+    ['missing proposal', [], gateGraphItem()],
+    ['duplicate proposal', [gateProposalEvent(), gateProposalEvent({ eventId: 'duplicate' })], gateGraphItem()],
+    ['foreign proposal owner', [gateProposalEvent({ eventOverrides: { sessionId: 'other-session' } })], gateGraphItem()],
+    ['stale proposal step', [gateProposalEvent({ proposalStepId: 'old-recovery-step' })], gateGraphItem()],
+    ['Audit receipt', [gateProposalEvent({ nodeKey: 'scheduled_audit' })], gateGraphItem()],
+    ['foreign Gate target', [gateProposalEvent({ targetTaskId: 'other-gate' })], gateGraphItem()],
+    ['Gate graph with an Audit suffix', [gateProposalEvent({ content: snapshot })], gateGraphItem(snapshot)],
+  ] as const)('rejects a %s', async (_label, events, item) => {
+    await expect(validateGate(item, events).result).resolves.toBe(false)
+  })
+
+  it('rejects a graph whose Gate node does not depend on Prepare', async () => {
+    const content = gateGraphContent(), nodes = [...content.nodes]
+    nodes[3] = { ...nodes[3]!, dependsOn: ['analyst'] }
+    const changed = { ...content, nodes }
+    await expect(validateGate(gateGraphItem(changed), [gateProposalEvent({ content: changed })]).result).resolves.toBe(false)
   })
 })

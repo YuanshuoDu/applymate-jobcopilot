@@ -5,18 +5,16 @@ import { canonicalTaskGraphJson, taskGraphLifecycleKey } from "./task-graph-snap
 import { scheduledGateCheckpointEvidence, scheduledGatePreparedJobIds, parseScheduledGateTaskEnvelope,
   SCHEDULED_GATE_OUTPUT_SCHEMA, SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE, SCHEDULED_GATE_NODE_GOAL,
   SCHEDULED_GATE_NODE_CRITERIA,
-  type ScheduledGateCompletionProof } from "./scheduled-gate-contract.js"
+  type ScheduledGateCompletionProof, type TaskGraphScheduledGateCompletionInput, type ScheduledGateTaskEnvelope } from "./scheduled-gate-contract.js"
 import { loadPersistedScheduledPrepareProof } from "./scheduled-gate-wait-match.js"
 import { readScheduledGateRegistrationReceipt } from "./scheduled-gate-registration-receipt.js"
-import { scheduledSnapshotMatches } from "./scheduled-taskgraph-continuation-receipt.js"
+import { scheduledSnapshotMatches, scheduledTaskGraphContinuationKeyVersion } from "./scheduled-taskgraph-continuation-receipt.js"
 import { SCHEDULED_PREPARE_COMPLETION_SCHEMA, SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA,
   verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-task-graph-verification.js"
 import { validateScheduledGateTaskFinish } from "./scheduled-gate-task-finish.js"
 import { scheduledGateAttemptLineageMatches } from "./scheduled-gate-attempt-lineage.js"
 import { projectScheduledPipelineGraph } from "./scheduled-pipeline-graph-shape.js"
 import { scheduledGatePreparePrefixMatches } from "./scheduled-gate-prepare-prefix-proof.js"
-import { scheduledTaskGraphContinuationKeyVersion } from "./scheduled-taskgraph-continuation-receipt.js"
-import type { TaskGraphScheduledGateCompletionInput, ScheduledGateTaskEnvelope } from "./scheduled-gate-contract.js"
 import type { PreparedGraphTransition } from "./task-graph-pg-lifecycle.js"
 
 type Row = Record<string, unknown>
@@ -64,7 +62,7 @@ export async function validateScheduledGateTaskGraphFinish(client: Queryable, in
     WHERE "userId" = $1 AND "sessionId" = $2`, [graph.scope.userId, graph.scope.sessionId])
   if (executionRows.rows.length !== 1) return null
   const execution = record(executionRows.rows[0]), evidence = scheduledGateCheckpointEvidence(execution?.state)
-  const turn = evidence && await readGateTurnSnapshot(client, graph.scope, evidence.owner.rootAttemptCount)
+  const turn = evidence && await readGateTurnSnapshot(client, graph.scope, evidence.owner.rootAttemptCount, status)
   if (!execution || execution.status !== "running" || !evidence
     || evidence.owner.executionId !== execution.id || evidence.owner.executionAttemptCount !== Number(execution.attemptCount)
     || !turn || !scheduledSnapshotMatches(turn, evidence.snapshotDigest)) return null
@@ -209,7 +207,10 @@ function latestResumeRequest(events: readonly unknown[]): number {
   }, 0)
 }
 
-async function readGateTurnSnapshot(client: Queryable, scope: GraphIdentityScope, expectedRootAttemptCount: number): Promise<unknown | null> {
+async function readGateTurnSnapshot(client: Queryable, scope: GraphIdentityScope, expectedRootAttemptCount: number,
+  gateFinishStatus: "waiting_for_user" | "completed"): Promise<unknown | null> {
+  const allowedTurnStatuses = gateFinishStatus === "completed"
+    ? ["in_progress", "waiting_for_dependency", "waiting_for_approval"] : ["in_progress", "waiting_for_dependency"]
   const result = await client.query<Row>(`SELECT session."id" AS "sessionId", session."userId" AS "sessionUserId", session."status" AS "sessionStatus",
       turn."id" AS "turnId", turn."sessionId" AS "turnSessionId", turn."userId" AS "turnUserId", turn."rootTaskId" AS "turnRootTaskId",
       turn."status" AS "turnStatus", turn."source", turn."executionMode", turn."input",
@@ -219,15 +220,15 @@ async function readGateTurnSnapshot(client: Queryable, scope: GraphIdentityScope
     JOIN "agent_turns" AS turn ON turn."sessionId" = session."id" AND turn."userId" = session."userId"
     JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId" AND root."turnId" = turn."id"
     WHERE session."id" = $1 AND session."userId" = $2 AND session."status" NOT IN ('aborted', 'archived')
-      AND turn."id" = $3 AND turn."rootTaskId" = $4 AND turn."status" IN ('in_progress', 'waiting_for_dependency')
+      AND turn."id" = $3 AND turn."rootTaskId" = $4 AND turn."status" = ANY($5::text[])
       AND root."id" = $4 AND root."status" IN ('running', 'waiting', 'waiting_for_user')
       AND root."interruptRequestedAt" IS NULL AND root."closedAt" IS NULL`,
-  [scope.sessionId, scope.userId, scope.turnId, scope.rootTaskId])
+  [scope.sessionId, scope.userId, scope.turnId, scope.rootTaskId, allowedTurnStatuses])
   const row = record(result.rows[0])
   if (result.rows.length !== 1 || !row || row.sessionId !== scope.sessionId || row.sessionUserId !== scope.userId
     || row.sessionStatus === "aborted" || row.sessionStatus === "archived" || row.turnId !== scope.turnId
     || row.turnSessionId !== scope.sessionId || row.turnUserId !== scope.userId || row.turnRootTaskId !== scope.rootTaskId
-    || !["in_progress", "waiting_for_dependency"].includes(String(row.turnStatus)) || row.rootId !== scope.rootTaskId
+    || !allowedTurnStatuses.includes(String(row.turnStatus)) || row.rootId !== scope.rootTaskId
     || row.rootSessionId !== scope.sessionId || row.rootTurnId !== scope.turnId
     || !["running", "waiting", "waiting_for_user"].includes(String(row.rootStatus))
     || Number(row.rootAttemptCount) !== expectedRootAttemptCount || !Number.isSafeInteger(row.rootAttemptCount)

@@ -19,7 +19,7 @@ type QualityReviewOutcome =
   | { kind: 'valid'; result: QualityResult }
   | { kind: 'unavailable' }
 
-type ReviewContext = Pick<PipelineCtx, 'roleConfigs' | 'aiConfig'>
+type ReviewContext = Pick<PipelineCtx, 'roleConfigs' | 'aiConfig' | 'scheduledGateQualityModelCall'>
 
 function hasDuplicateObjectKeys(json: string): boolean {
   let index = 0
@@ -125,8 +125,10 @@ function isQualityResult(value: unknown): value is QualityResult {
 export async function reviewApplicationQuality(
   pkg: ApplicationPackage,
   ctx: ReviewContext,
+  scheduled = false,
 ): Promise<QualityReviewOutcome> {
   if (!pkg.coverLetter && !pkg.job.description) return { kind: 'not_applicable' }
+  if (scheduled && !ctx.scheduledGateQualityModelCall) return { kind: 'unavailable' }
 
   try {
     const reviewerCfg = ctx.roleConfigs.reviewer
@@ -150,7 +152,10 @@ Return ONLY valid JSON with exactly these fields. Keep fitGap at or below ${MAX_
   "readyToApply": <true if score≥7 and materials look solid, false otherwise>
 }`
 
-    const response = await modelChat([{ role: 'user', content: prompt }], aiConfig, 300)
+    const messages = [{ role: 'user' as const, content: prompt }]
+    const response = scheduled
+      ? await ctx.scheduledGateQualityModelCall!({ jobId: pkg.job.id, config: aiConfig, messages, maxTokens: 300 })
+      : await modelChat(messages, aiConfig, 300)
     const text = response.text.replace(/```json|```/g, '').trim()
     if (hasDuplicateObjectKeys(text)) return { kind: 'unavailable' }
     const parsed: unknown = JSON.parse(text)
