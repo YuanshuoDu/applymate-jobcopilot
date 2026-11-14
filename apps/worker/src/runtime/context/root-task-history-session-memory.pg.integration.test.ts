@@ -5,6 +5,10 @@ import { Pool, type PoolClient } from "pg"
 import { redactAgentEvent, redactSensitiveText } from "@jobcopilot/shared"
 // @ts-expect-error Worker Vitest supplies the Web alias for this cross-workspace race proof.
 import { setAgentTaskHistoryMemoryConsent } from "@/lib/agent-task-history-memory-consent"
+// @ts-expect-error Worker Vitest supplies the Web alias for the independent search-footprint opt-in.
+import { setAgentSearchFootprintMemoryConsent } from "@/lib/agent-search-footprint-memory-consent"
+// @ts-expect-error Worker Vitest supplies the Web alias for atomic Session consent snapshots.
+import { sessionSnapshotFields, withAgentSearchFootprintSessionSnapshot } from "@/lib/agent-search-footprint-session-snapshot"
 // @ts-expect-error Worker Vitest supplies the Web alias for the real event fact-store writer.
 import { appendAgentEventWithOutboxInTransaction } from "@/lib/agent/session/fact-store"
 import { withRootTaskHistorySessionAuthorization, type AuthorizedRootTaskHistoryWork } from "./root-task-history-session-memory.js"
@@ -111,6 +115,18 @@ async function setConsent(userId: string, enabled: boolean, expectedVersion: num
     prisma as unknown as Parameters<typeof setAgentTaskHistoryMemoryConsent>[2])
   if (result.kind !== "updated") throw new Error(`Consent mutation was ${result.kind}`)
   return result.consent
+}
+
+async function setSearchConsent(userId: string, enabled: boolean, expectedVersion: number) {
+  const result = await setAgentSearchFootprintMemoryConsent(userId, { enabled, expectedVersion },
+    prisma as unknown as Parameters<typeof setAgentSearchFootprintMemoryConsent>[2])
+  if (result.kind !== "updated") throw new Error(`Search footprint consent mutation was ${result.kind}`)
+  return result.consent
+}
+
+async function setSearchSnapshot(userId: string, sessionId: string, enabled: boolean, version: number) {
+  await pool!.query(`UPDATE "agent_sessions" SET "searchFootprintMemoryEnabledAtCreation"=$1,
+    "searchFootprintMemoryConsentVersionAtCreation"=$2 WHERE "id"=$3 AND "userId"=$4`, [enabled, version, sessionId, userId])
 }
 
 async function waitForAdvisoryWait(application: string): Promise<void> {
@@ -512,6 +528,178 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     expect(laterResult).toMatchObject({ historyReadAllowed: false, workResult: "ordinary context",
       authorization: { consentEnabled: false, consentVersion: 2 } })
     expect(await countMarkers(laterSession)).toMatchObject({ events: "1", outboxes: "1", eventSequence: "1" })
+  })
+
+  it("rechecks current search consent on every read and never reauthorizes an old Session", async () => {
+    const userId = await createUser(), sessionId = await createSession(userId), fixture = await createTurn(userId, sessionId)
+    const enabled = await setSearchConsent(userId, true, 0)
+    await setSearchSnapshot(userId, sessionId, true, enabled.version)
+    const previousGate = process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+    process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = "1"
+    try {
+      const read = () => withContextTransaction(fixture, async (_client, _authorization, _historyAllowed, searchAllowed) => searchAllowed)
+      expect((await read()).searchFootprintReadAllowed).toBe(true)
+      const revoked = await setSearchConsent(userId, false, enabled.version)
+      expect((await read()).searchFootprintReadAllowed).toBe(false)
+      const reenabled = await setSearchConsent(userId, true, revoked.version)
+      expect(reenabled).toEqual({ enabled: true, version: revoked.version + 1 })
+      expect((await read()).searchFootprintReadAllowed).toBe(false)
+
+      const newSession = await createSession(userId), newFixture = await createTurn(userId, newSession)
+      await setSearchSnapshot(userId, newSession, true, reenabled.version)
+      const previousGateForOff = process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+      delete process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+      try { expect((await withContextTransaction(newFixture, async () => "ordinary context")).searchFootprintReadAllowed).toBe(false) }
+      finally { process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = previousGateForOff }
+      expect((await withContextTransaction(newFixture, async () => "ordinary context")).searchFootprintReadAllowed).toBe(true)
+
+      const legacySession = await createSession(userId), legacy = await createTurn(userId, legacySession)
+      expect((await withContextTransaction(legacy, async () => "ordinary context")).searchFootprintReadAllowed).toBe(false)
+    } finally {
+      if (previousGate === undefined) delete process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+      else process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = previousGate
+    }
+  })
+
+  it("keeps matching old and new Sessions denied at the exhausted version after terminal opt-out", async () => {
+    const userId = await createUser(), maxVersion = 2_147_483_647
+    await setConsent(userId, true, 0)
+    await pool!.query(`UPDATE "User" SET "agentSearchFootprintMemoryEnabled"=TRUE,
+      "agentSearchFootprintMemoryConsentVersion"=$2 WHERE "id"=$1`, [userId, maxVersion])
+
+    const oldSession = await createSession(userId), oldFixture = await createTurn(userId, oldSession)
+    await setSearchSnapshot(userId, oldSession, true, maxVersion)
+    const newSession = await createSession(userId), newFixture = await createTurn(userId, newSession)
+    await setSearchSnapshot(userId, newSession, true, maxVersion)
+
+    const previousGate = process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+    process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = "1"
+    try {
+      const read = (fixture: Fixture) => withContextTransaction(fixture,
+        async (_client, _authorization, historyAllowed, searchAllowed) => ({ historyAllowed, searchAllowed }))
+      for (const fixture of [oldFixture, newFixture]) {
+        const result = await read(fixture)
+        expect(result.historyReadAllowed).toBe(true)
+        expect(result.searchFootprintReadAllowed).toBe(false)
+        expect(result.workResult).toEqual({ historyAllowed: true, searchAllowed: false })
+      }
+
+      const revoked = await pool!.query<{ enabled: boolean; version: number }>(`UPDATE "User"
+        SET "agentSearchFootprintMemoryEnabled"=FALSE
+        WHERE "id"=$1 AND "agentSearchFootprintMemoryEnabled"=TRUE
+          AND "agentSearchFootprintMemoryConsentVersion"=$2
+        RETURNING "agentSearchFootprintMemoryEnabled" AS "enabled",
+          "agentSearchFootprintMemoryConsentVersion" AS "version"`, [userId, maxVersion])
+      expect(revoked.rows[0]).toEqual({ enabled: false, version: maxVersion })
+
+      for (const fixture of [oldFixture, newFixture]) {
+        const result = await read(fixture)
+        expect(result.historyReadAllowed).toBe(true)
+        expect(result.searchFootprintReadAllowed).toBe(false)
+        expect(result.workResult).toEqual({ historyAllowed: true, searchAllowed: false })
+      }
+    } finally {
+      if (previousGate === undefined) delete process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+      else process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = previousGate
+    }
+  })
+
+  it("serializes a search-footprint read with an in-flight revocation", async () => {
+    const userId = await createUser(), sessionId = await createSession(userId), fixture = await createTurn(userId, sessionId)
+    const enabled = await setSearchConsent(userId, true, 0)
+    await setSearchSnapshot(userId, sessionId, true, enabled.version)
+    const previousGate = process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+    process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = "1"
+    const entered = deferred<void>(), release = deferred<void>()
+    let revocation: Promise<unknown> | undefined
+    const read = withContextTransaction(fixture, async (_client, _authorization, _historyAllowed, searchAllowed) => {
+      expect(searchAllowed).toBe(true)
+      entered.resolve()
+      await release.promise
+      return "authorized before revocation"
+    })
+    try {
+      await entered.promise
+      revocation = setSearchConsent(userId, false, enabled.version)
+      await waitForAdvisoryWait(prismaApplication)
+      release.resolve()
+      const [readResult, revoked] = await Promise.all([read, revocation])
+      expect(readResult.searchFootprintReadAllowed).toBe(true)
+      expect(revoked).toEqual({ enabled: false, version: enabled.version + 1 })
+      expect((await withContextTransaction(fixture, async () => "ordinary context")).searchFootprintReadAllowed).toBe(false)
+    } finally {
+      release.resolve()
+      await Promise.allSettled([read, ...(revocation ? [revocation] : [])])
+      if (previousGate === undefined) delete process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+      else process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = previousGate
+    }
+  })
+
+  it("rejects a lease owned by one user when its Session and eligible snapshot belong to another", async () => {
+    const leaseOwnerId = await createUser(), sessionOwnerId = await createUser()
+    const sessionId = await createSession(sessionOwnerId), fixture = await createTurn(sessionOwnerId, sessionId)
+    await setSearchConsent(leaseOwnerId, true, 0)
+    const sessionConsent = await setSearchConsent(sessionOwnerId, true, 0)
+    await setSearchSnapshot(sessionOwnerId, sessionId, true, sessionConsent.version)
+    const previousGate = process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+    process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = "1"
+    const client = await pool!.connect()
+    let workStarted = false
+    try {
+      await client.query("BEGIN ISOLATION LEVEL READ COMMITTED")
+      const foreignInput = { ...workerInput(fixture), scope: { userId: leaseOwnerId },
+        lease: { ...fixture.lease, userId: leaseOwnerId } }
+      await expect(withRootTaskHistorySessionAuthorization(client, foreignInput, async () => {
+        workStarted = true
+        return "must not read"
+      })).rejects.toMatchObject({ code: "lease_lost" })
+      expect(workStarted).toBe(false)
+    } finally {
+      await client.query("ROLLBACK").catch(() => undefined)
+      client.release()
+      if (previousGate === undefined) delete process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY
+      else process.env.ENABLE_AGENT_SEARCH_FOOTPRINT_MEMORY = previousGate
+    }
+  })
+
+  it("serializes Session snapshot creation with a concurrent consent opt-in", async () => {
+    const userId = await createUser(), sessionId = `history-consent-session-${randomUUID()}`
+    sessions.add(sessionId)
+    const entered = deferred<{ enabled: boolean; version: number }>(), release = deferred<void>()
+    let mutation: Promise<unknown> | undefined
+    const creation = withAgentSearchFootprintSessionSnapshot(prisma!, userId, async (
+      tx: { agentSession: { create(args: { data: Record<string, unknown> }): Promise<unknown> } },
+      snapshot: { enabled: boolean; version: number },
+    ) => {
+      await tx.agentSession.create({ data: {
+        id: sessionId, userId, goal: "Snapshot race integration", status: "running", source: "test",
+        ...sessionSnapshotFields(snapshot),
+      } })
+      entered.resolve(snapshot)
+      await release.promise
+      return snapshot
+    })
+    try {
+      await expect(entered.promise).resolves.toEqual({ enabled: false, version: 0 })
+      mutation = setSearchConsent(userId, true, 0)
+      await waitForAdvisoryWait(prismaApplication)
+      release.resolve()
+      const [snapshot, updated] = await Promise.all([creation, mutation])
+      expect(snapshot).toEqual({ enabled: false, version: 0 })
+      expect(updated).toEqual({ enabled: true, version: 1 })
+      const row = await pool!.query<{ snapshotEnabled: boolean; snapshotVersion: number }>(`SELECT
+        "searchFootprintMemoryEnabledAtCreation" AS "snapshotEnabled",
+        "searchFootprintMemoryConsentVersionAtCreation" AS "snapshotVersion"
+        FROM "agent_sessions" WHERE "id"=$1 AND "userId"=$2`, [sessionId, userId])
+      expect(row.rows[0]).toEqual({ snapshotEnabled: false, snapshotVersion: 0 })
+      const consent = await pool!.query<{ consentEnabled: boolean; consentVersion: number }>(`SELECT
+        "agentSearchFootprintMemoryEnabled" AS "consentEnabled",
+        "agentSearchFootprintMemoryConsentVersion" AS "consentVersion" FROM "User" WHERE "id"=$1`, [userId])
+      expect(consent.rows[0]).toEqual({ consentEnabled: true, consentVersion: 1 })
+    } finally {
+      release.resolve()
+      await Promise.allSettled([creation, ...(mutation ? [mutation] : [])])
+    }
   })
 
   it("binds sanitized accepted-steer identity to its input, item, and allocated sequence", async () => {
