@@ -753,9 +753,10 @@ async function runObjectiveSnapshotWorkerRestart(pool: Pool, corrupt: boolean): 
       try { await waitForTurnStatus(pool, turnId, "completed", 30_000) } catch {
         const childMarkers = workerA!.output.filter(line => line === "FIXTURE_PARENT_SUSPENDED" || line === "FIXTURE_CHILD_EXECUTOR_RETURNING_COMPLETED")
         const markers = workerB.output.filter(line => /^FIXTURE_(WORKER_READY_B|MODEL_STREAM_ENTERED_B|MODEL_CONTEXT_B_OK|CROSS_SESSION_SOURCE_QUERY_COUNT_B|MODEL_RELEASE_RECEIVED_B|MODEL_FINAL_TEXT_EMITTED_B|MODEL_COMPLETION_EVENT_B|NATIVE_VERIFIER_STARTED|NATIVE_VERIFIER_RETURNED)\b/.test(line))
+        const phaseDiagnostics = workerB.output.filter(line => line.startsWith("FIXTURE_PHASE_DIAGNOSTICS_B ")).at(-1) ?? "none"
         const fixtureFailure = workerB.errors.find(line => line.startsWith("OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED")) ?? "none"
         const execution = await workerAExecutionDiagnostic(pool, turnId)
-        throw new Error(`Snapshot restart Turn did not reach completed; childMarkers=${childMarkers.join(",") || "none"}; workerBMarkers=${markers.join(",") || "none"}; fixtureFailure=${fixtureFailure}; execution=${JSON.stringify(execution)}`)
+        throw new Error(`Snapshot restart Turn did not reach completed; childMarkers=${childMarkers.join(",") || "none"}; workerBMarkers=${markers.join(",") || "none"}; phaseDiagnostics=${phaseDiagnostics}; fixtureFailure=${fixtureFailure}; execution=${JSON.stringify(execution)}`)
       }
       await stopFixtureWorker(workerB)
       expect(workerB.exitCode).toBe(0)

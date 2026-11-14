@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   turn: vi.fn(), root: vi.fn(), session: vi.fn(), user: vi.fn(), execution: vi.fn(), claim: vi.fn(), jobs: vi.fn(),
-  question: vi.fn(), runPipeline: vi.fn(), gateAction: vi.fn(), validatePrepareWait: vi.fn(), snapshot: vi.fn(), loadAi: vi.fn(), resolveConfig: vi.fn(), featureAllowed: vi.fn(), entitlement: vi.fn(), aiAccess: vi.fn(),
+  question: vi.fn(), runPipeline: vi.fn(), postGateTask: vi.fn(), gateAction: vi.fn(), validatePrepareWait: vi.fn(), snapshot: vi.fn(), loadAi: vi.fn(), resolveConfig: vi.fn(), featureAllowed: vi.fn(), entitlement: vi.fn(), aiAccess: vi.fn(),
   auditCurrent: vi.fn(), auditClaim: vi.fn(), auditRace: vi.fn(), validateAuditPrepare: vi.fn(),
 }));
 vi.mock("@/lib/db", () => ({ db: {
@@ -12,6 +12,11 @@ vi.mock("@/lib/db", () => ({ db: {
   agentItem: { findFirst: mocks.question },
 } }));
 vi.mock("@/lib/agent/run-service", () => ({ runAgentPipeline: mocks.runPipeline }));
+vi.mock("@/lib/agent/scheduled-taskgraph-post-gate-task", () => ({
+  isScheduledTaskGraphPostGateAction: (value: unknown) => Boolean(value && typeof value === "object"
+    && ["scheduled_post_gate_execute", "scheduled_post_gate_audit"].includes(String((value as { action?: unknown }).action))),
+  runScheduledTaskGraphPostGateTask: mocks.postGateTask,
+}));
 vi.mock("@/lib/agent/scheduled-taskgraph-gate-runtime-rpc", () => ({ runScheduledTaskGraphActionRpc: mocks.gateAction }));
 vi.mock("@/lib/agent/scheduled-taskgraph-audit-action", () => ({
   claimScheduledAuditExecution: mocks.auditClaim, scheduledAuditChildIsCurrent: mocks.auditCurrent,
@@ -171,6 +176,7 @@ describe("scheduled pipeline continuation route", () => {
     mocks.jobs.mockResolvedValue([{ id: "job-1", userId: owner.userId }]);
     mocks.question.mockResolvedValue(null);
     mocks.runPipeline.mockResolvedValue(report);
+    mocks.postGateTask.mockResolvedValue(Response.json({ status: "completed", structuredResult: { queued: [], failed: [] } }));
     mocks.validatePrepareWait.mockResolvedValue(true);
     mocks.loadAi.mockResolvedValue({ resolvedKey: "api-key", provider: "openai", model: "test-model" });
     mocks.resolveConfig.mockReturnValue({ provider: "minimax", model: "MiniMax-M3", apiKey: "platform-key" });
@@ -193,6 +199,18 @@ describe("scheduled pipeline continuation route", () => {
     expect(await response.json()).toEqual({ status: "blocked", errorCode: "scheduled_pipeline_unauthorized" });
     expect(mocks.turn).not.toHaveBeenCalled();
   }, 30_000);
+
+  it.each(["scheduled_post_gate_execute", "scheduled_post_gate_audit"])("routes %s through the fixed post-Gate runner", async action => {
+    const body = { action, owner: fullOwner, handoff: {}, attestation: {}, actor: {} };
+    const { POST } = await import("./route");
+    const response = await POST(new Request("https://local.test", { method: "POST",
+      headers: { "x-agent-worker-secret": "worker-secret", "content-type": "application/json" }, body: JSON.stringify(body) }));
+
+    expect(response.status).toBe(200);
+    expect(mocks.postGateTask).toHaveBeenCalledOnce();
+    expect(mocks.postGateTask.mock.calls[0]?.[0]).toEqual(body);
+    expect(mocks.turn).not.toHaveBeenCalled();
+  });
 
   it("returns only the opaque Analyze proof after one owner-scoped claim", async () => {
     mocks.runPipeline.mockResolvedValueOnce(analyzeProof);

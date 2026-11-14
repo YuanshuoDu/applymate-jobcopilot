@@ -25,7 +25,8 @@ function lease(): SubagentLease {
 function fixture() {
   const calls: { sql: string; params: unknown[] }[] = []
   const state: { existing?: Record<string, unknown>; inserted?: Record<string, unknown>; insertCount: number; leaseExpiresAt?: Date; leaseOwner?: string; attemptCount?: number;
-    recovery?: boolean; recoveryRole?: string; recoveryInput?: Record<string, unknown>; startedAt?: Date | null; targetParentId?: string } = { insertCount: 0 }
+    recovery?: boolean; recoveryRole?: string; recoveryInput?: Record<string, unknown>; recoveryEventKey?: string;
+    recoveryRows?: Record<string, unknown>[]; startedAt?: Date | null; targetParentId?: string } = { insertCount: 0 }
   const targets = targetIds.map((id, index) => ({
     id, parentTaskId: state.targetParentId ?? "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1",
     status: index === 0 ? "completed" : "running", role: `role-${index + 1}`,
@@ -36,13 +37,18 @@ function fixture() {
     async query(sql: string, params: unknown[] = []) {
       calls.push({ sql, params })
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
-      if (sql.includes('started."createdAt"') && sql.includes("FOR UPDATE OF task, step, call")) return state.recovery ? { rows: [{
-        eventId: "start-event-1", createdAt: state.startedAt === undefined ? new Date(now.getTime() - 10_000) : state.startedAt,
-        role: state.recoveryRole ?? "wait-enabled", allowedActions: ["wait_subagents"], stepId: "step-1",
-        content: { toolCallId: "wait-call-1", toolName: "wait_subagents", toolVersion: "1", input: state.recoveryInput ?? {
-          idempotencyKey: "recovered-wait", mode: "any", taskIds: targetIds, timeoutMs: 5_000,
-        } },
-      }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      if (sql.includes('started."createdAt"') && sql.includes("FOR UPDATE OF task, step, call")) {
+        if (!state.recovery) return { rows: [], rowCount: 0 }
+        const rows = state.recoveryRows ?? [{
+          eventId: "start-event-1", eventIdempotencyKey: state.recoveryEventKey ?? "task:parent-1:event:tool-started:wait-call-1",
+          createdAt: state.startedAt === undefined ? new Date(now.getTime() - 10_000) : state.startedAt,
+          role: state.recoveryRole ?? "wait-enabled", allowedActions: ["wait_subagents"], stepId: "step-1",
+          content: { toolCallId: "wait-call-1", toolName: "wait_subagents", toolVersion: "1", input: state.recoveryInput ?? {
+            idempotencyKey: "recovered-wait", mode: "any", taskIds: targetIds, timeoutMs: 5_000,
+          } },
+        }]
+        return { rows, rowCount: rows.length }
+      }
       if (sql.startsWith('SELECT "id", "userId", "status" FROM "agent_sessions"')) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks"') && !sql.includes("ANY($1::text[])")) return { rows: [{
         id: "parent-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "running",
@@ -121,6 +127,7 @@ describe("registerDurableSubagentWait", () => {
     const query = fake.calls.find(call => call.sql.includes('started."createdAt"'))
     expect(query?.sql).toContain('started."type" = \'tool_call.started\'')
     expect(query?.sql).toContain('started."correlationId" = call."content"->>\'toolCallId\'')
+    expect(query?.sql).toContain('started."idempotencyKey" AS "eventIdempotencyKey"')
     expect(query?.sql).toContain('task."leaseExpiresAt" = $8 AND task."leaseExpiresAt" <= $9')
     expect(query?.sql).toContain('step."ordinal" = (SELECT MAX(current."ordinal")')
     expect(query?.params).toEqual([oldLease.id, oldLease.userId, oldLease.sessionId, oldLease.turnId, oldLease.rootTaskId, oldLease.ownerId, oldLease.attemptCount, expiredLease, now])
@@ -136,6 +143,43 @@ describe("registerDurableSubagentWait", () => {
         .resolves.toEqual({ rejectedCallId: "start-event-1" })
       expect(fake.state.insertCount).toBe(0)
     }
+  })
+
+  it("leaves a canonical continuation claim for strict blocker checks without registering or rejecting it", async () => {
+    const fake = fixture(), expiredLease = new Date(now.getTime() - 1_000)
+    fake.state.recovery = true; fake.state.leaseExpiresAt = expiredLease
+    fake.state.recoveryEventKey = `task:${lease().id}:event:child-wait-claim:${lease().attemptCount}:step-1`
+    await expect(recoverExpiredWaitRegistration(fake.client as never, { ...lease(), leaseExpiresAt: expiredLease }, now)).resolves.toBeUndefined()
+    expect(fake.state.insertCount).toBe(0)
+    expect(fake.calls).toHaveLength(1)
+  })
+
+  it("fails closed for noncanonical or forged child-wait claim markers", async () => {
+    const expiredLease = new Date(now.getTime() - 1_000)
+    for (const eventKey of [
+      "task:other-parent:event:child-wait-claim:3:step-1",
+      "task:parent-1:event:child-wait-claim:2:step-1",
+      "task:parent-1:event:child-wait-claim:3:wrong-step",
+      "malformed:event:child-wait-claim:3:step-1",
+    ]) {
+      const fake = fixture()
+      fake.state.recovery = true; fake.state.leaseExpiresAt = expiredLease; fake.state.recoveryEventKey = eventKey
+      await expect(recoverExpiredWaitRegistration(fake.client as never, { ...lease(), leaseExpiresAt: expiredLease }, now)).resolves.toBeUndefined()
+      expect(fake.state.insertCount).toBe(0)
+      expect(fake.calls).toHaveLength(1)
+    }
+  })
+
+  it("fails closed on ambiguous started-wait candidates without registering or rejecting either", async () => {
+    const fake = fixture(), expiredLease = new Date(now.getTime() - 1_000)
+    fake.state.recovery = true; fake.state.leaseExpiresAt = expiredLease
+    fake.state.recoveryRows = [
+      { eventId: "start-event-1", eventIdempotencyKey: "task:parent-1:event:tool-started:wait-call-1" },
+      { eventId: "start-event-2", eventIdempotencyKey: "task:parent-1:event:tool-started:wait-call-2" },
+    ]
+    await expect(recoverExpiredWaitRegistration(fake.client as never, { ...lease(), leaseExpiresAt: expiredLease }, now)).resolves.toBeUndefined()
+    expect(fake.state.insertCount).toBe(0)
+    expect(fake.calls).toHaveLength(1)
   })
 
   it("validates bounded unique direct targets before opening a transaction", async () => {

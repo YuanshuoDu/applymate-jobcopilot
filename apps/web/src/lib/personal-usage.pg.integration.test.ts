@@ -6,7 +6,7 @@ import { PrismaClient } from '@prisma/client'
 import { readPersonalUsage } from './personal-usage'
 
 vi.mock('@/lib/entitlements', () => ({ getEffectiveEntitlements: vi.fn(async () => ({ limits: { ai_credits: null } })) }))
-import { admitAiUsage, settleAiUsage, type UsageAdmissionInput, type UsageBrokerDatabase, type UsageBrokerQuery } from './agent/control-plane/usage-broker'
+import { admitAiUsage, settleAiUsage, startAiUsage, type UsageAdmissionInput, type UsageBrokerDatabase, type UsageBrokerQuery } from './agent/control-plane/usage-broker'
 
 function disposableUrl(): string | null {
   const value = process.env.PERSONAL_USAGE_PG_TEST_URL
@@ -185,10 +185,17 @@ describePg('personal usage with disposable PostgreSQL', () => {
         id text primary key, user_id text, feature_key text not null, provider text not null, model text not null,
         credential_source text not null, runtime text not null, status text not null, error_code text,
         input_tokens integer not null, output_tokens integer not null, estimated_cost_usd double precision not null,
-        latency_ms integer not null, created_at timestamp(3) not null
+        latency_ms integer not null, output_reservation_required boolean not null default false,
+        provider_started_at timestamp(3), usage_start_protocol_version integer not null default 0,
+        created_at timestamp(3) not null,
+        check (usage_start_protocol_version in (0, 1)),
+        check (provider_started_at is null or usage_start_protocol_version = 1)
+      ) ON COMMIT DROP`)
+      await tx.$executeRawUnsafe(`CREATE TEMP TABLE agent_sessions (
+        id text primary key, "userId" text not null, status text not null
       ) ON COMMIT DROP`)
       await tx.$executeRawUnsafe(`CREATE TEMP TABLE agent_turns (
-        id text primary key, "sessionId" text not null, "userId" text not null, status text not null,
+        id text primary key, "sessionId" text not null, "userId" text not null, "rootTaskId" text not null, status text not null,
         "leaseOwnerId" text not null, "leaseVersion" integer not null, "leaseExpiresAt" timestamptz not null
       ) ON COMMIT DROP`)
       await tx.$executeRawUnsafe(`CREATE TEMP TABLE agent_steps (
@@ -197,26 +204,81 @@ describePg('personal usage with disposable PostgreSQL', () => {
       ) ON COMMIT DROP`)
       // SQL planning requires the root-task table even though this root step has taskId NULL.
       await tx.$executeRawUnsafe(`CREATE TEMP TABLE sub_agent_tasks (
-        id text primary key, "sessionId" text, "turnId" text, "rootTaskId" text, status text,
-        "interruptRequestedAt" timestamptz, "attemptCount" integer
+        id text primary key, "sessionId" text not null, "turnId" text not null, "rootTaskId" text not null,
+        "budgetSnapshot" jsonb not null, "outputTokenReservationVersion" integer, status text not null,
+        "interruptRequestedAt" timestamptz, "attemptCount" integer not null, "leaseOwner" text,
+        "leaseExpiresAt" timestamptz
       ) ON COMMIT DROP`)
+      await tx.$executeRawUnsafe(`CREATE TEMP TABLE agent_root_usage_reservations (
+        id text primary key, "userId" text not null, "sessionId" text not null, "turnId" text not null,
+        "rootTaskId" text not null, "taskId" text not null, "stepId" text not null,
+        "executionOwnerKind" text not null, "executionOwnerId" text not null, "executionOwnerVersion" integer not null,
+        attempt integer not null, "attemptId" text not null, provider text not null, model text not null,
+        "outputReservationRequired" boolean not null, "reservedOutputTokens" integer not null,
+        "actualOutputTokens" integer, status text not null default 'reserved', "outcomeStatus" text,
+        "errorCode" text, "idempotencyKey" text not null, "createdAt" timestamp(3) not null default current_timestamp,
+        "updatedAt" timestamp(3) not null default current_timestamp, "startedAt" timestamp(3),
+        "settledAt" timestamp(3), "releasedAt" timestamp(3),
+        unique ("sessionId", "idempotencyKey"),
+        check (("executionOwnerKind" = 'turn' and "executionOwnerVersion" >= 0)
+          or ("executionOwnerKind" = 'task' and "executionOwnerVersion" >= 1)),
+        check (attempt >= 1),
+        check ("reservedOutputTokens" between 0 and 2147483647
+          and "outputReservationRequired" = ("reservedOutputTokens" > 0)
+          and ("actualOutputTokens" is null or "actualOutputTokens" between 0 and 2147483647)),
+        check ((status = 'reserved' and "startedAt" is null and "settledAt" is null and "releasedAt" is null and "actualOutputTokens" is null and "outcomeStatus" is null and "errorCode" is null)
+          or (status = 'started' and "startedAt" is not null and "settledAt" is null and "releasedAt" is null and "actualOutputTokens" is null and ("outcomeStatus" is null or "outcomeStatus" in ('success', 'error')))
+          or (status = 'settled' and "startedAt" is not null and "settledAt" is not null and "releasedAt" is null and "actualOutputTokens" is not null and "outcomeStatus" in ('success', 'error'))
+          or (status = 'released' and "startedAt" is null and "settledAt" is null and "releasedAt" is not null and "actualOutputTokens" is null and "outcomeStatus" is null and "errorCode" is null))
+      ) ON COMMIT DROP`)
+      await tx.$executeRawUnsafe(`INSERT INTO agent_sessions VALUES ('session-1', 'broker-owner', 'active')`)
       await tx.$executeRawUnsafe(`INSERT INTO agent_turns VALUES
-        ('turn-1', 'session-1', 'broker-owner', 'in_progress', 'worker-1', 4, CURRENT_TIMESTAMP + INTERVAL '1 hour')`)
+        ('turn-1', 'session-1', 'broker-owner', 'root-1', 'in_progress', 'worker-1', 4, CURRENT_TIMESTAMP + INTERVAL '1 hour')`)
       await tx.$executeRawUnsafe(`INSERT INTO agent_steps VALUES
         ('step-1', 'turn-1', 'session-1', NULL, 1, 'streaming')`)
+      await tx.$executeRawUnsafe(`INSERT INTO sub_agent_tasks VALUES
+        ('root-1', 'session-1', 'turn-1', 'root-1', '{}'::jsonb, NULL, 'running', NULL, 1, 'worker-1', CURRENT_TIMESTAMP + INTERVAL '1 hour')`)
+
+      await tx.$executeRawUnsafe('ALTER TABLE agent_sessions ENABLE ROW LEVEL SECURITY')
+      await tx.$executeRawUnsafe(`CREATE POLICY broker_session_isolation ON agent_sessions
+        USING ("userId" = current_setting('app.user_id', true))
+        WITH CHECK ("userId" = current_setting('app.user_id', true))`)
+      await tx.$executeRawUnsafe('ALTER TABLE agent_turns ENABLE ROW LEVEL SECURITY')
+      await tx.$executeRawUnsafe(`CREATE POLICY broker_turn_isolation ON agent_turns
+        USING ("userId" = current_setting('app.user_id', true) AND EXISTS (
+          SELECT 1 FROM agent_sessions session WHERE session.id = "sessionId" AND session."userId" = current_setting('app.user_id', true)))
+        WITH CHECK ("userId" = current_setting('app.user_id', true) AND EXISTS (
+          SELECT 1 FROM agent_sessions session WHERE session.id = "sessionId" AND session."userId" = current_setting('app.user_id', true)))`)
+      await tx.$executeRawUnsafe('ALTER TABLE agent_steps ENABLE ROW LEVEL SECURITY')
+      await tx.$executeRawUnsafe(`CREATE POLICY broker_step_isolation ON agent_steps
+        USING (EXISTS (SELECT 1 FROM agent_sessions session WHERE session.id = "sessionId" AND session."userId" = current_setting('app.user_id', true)))
+        WITH CHECK (EXISTS (SELECT 1 FROM agent_sessions session WHERE session.id = "sessionId" AND session."userId" = current_setting('app.user_id', true)))`)
+      await tx.$executeRawUnsafe('ALTER TABLE sub_agent_tasks ENABLE ROW LEVEL SECURITY')
+      await tx.$executeRawUnsafe(`CREATE POLICY broker_task_isolation ON sub_agent_tasks
+        USING (EXISTS (SELECT 1 FROM agent_sessions session WHERE session.id = "sessionId" AND session."userId" = current_setting('app.user_id', true)))
+        WITH CHECK (EXISTS (SELECT 1 FROM agent_sessions session WHERE session.id = "sessionId" AND session."userId" = current_setting('app.user_id', true)))`)
+      await tx.$executeRawUnsafe('ALTER TABLE agent_root_usage_reservations ENABLE ROW LEVEL SECURITY')
+      await tx.$executeRawUnsafe(`CREATE POLICY broker_reservation_isolation ON agent_root_usage_reservations
+        USING ("userId" = NULLIF(current_setting('app.user_id', true), ''))
+        WITH CHECK ("userId" = NULLIF(current_setting('app.user_id', true), ''))`)
 
       const migration = readFileSync(join(process.cwd(), 'prisma/migrations/20261028220000_secure_personal_ai_usage/migration.sql'), 'utf8')
       await tx.$executeRawUnsafe(migration)
-      await tx.$executeRawUnsafe('GRANT SELECT, UPDATE ON agent_turns, agent_steps, sub_agent_tasks TO applymate_candidate')
+      await tx.$executeRawUnsafe('GRANT UPDATE (provider_started_at) ON ai_usage_events TO applymate_candidate')
+      await tx.$executeRawUnsafe('GRANT SELECT, UPDATE ON agent_sessions, agent_turns, agent_steps, sub_agent_tasks TO applymate_candidate')
+      await tx.$executeRawUnsafe('GRANT SELECT, INSERT ON agent_root_usage_reservations TO applymate_candidate')
+      await tx.$executeRawUnsafe('GRANT UPDATE (status, "actualOutputTokens", "outcomeStatus", "errorCode", "updatedAt", "startedAt", "settledAt", "releasedAt") ON agent_root_usage_reservations TO applymate_candidate')
       await tx.$executeRawUnsafe('SET LOCAL ROLE applymate_candidate')
       // Execute broker SQL on the real transaction; this adapter does not claim independent/concurrent transactions.
       const broker: UsageBrokerDatabase = { $transaction: async <T,>(work: (query: UsageBrokerQuery) => Promise<T>) => work(tx) }
       const input: UsageAdmissionInput = {
         userId: 'broker-owner', sessionId: 'session-1', turnId: 'turn-1', stepId: 'step-1',
         leaseOwnerId: 'worker-1', leaseVersion: 4, featureKey: 'agent', provider: 'minimax', model: 'MiniMax-M3',
-        attemptId: 'completed', credentialSource: 'platform',
+        attemptId: 'completed', credentialSource: 'platform', startProtocolVersion: 1,
       }
       const completed = await admitAiUsage(broker, input)
+      await expect(startAiUsage(broker, { ...input, operationId: completed.operationId, startProtocolVersion: 1 }))
+        .resolves.toEqual({ startProtocolVersion: 1, outputReservationRequired: false, maxOutputTokens: null })
       await settleAiUsage(broker, { operationId: completed.operationId, userId: input.userId,
         provider: input.provider, model: input.model, status: 'success', inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0 })
       const released = { ...input, attemptId: 'released' }

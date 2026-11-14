@@ -2,7 +2,7 @@
 import type { CoverLetterDocProps } from '@/components/resume/templates/cover-letter/CoverLetterFrame'
 import type { TemplateOptions } from '@/lib/types'
 import { safeAccentColor } from '@/lib/template-options'
-import { assertPdfTextSupported } from '@/lib/pdf-text-support'
+import { assertApplicationPdfTextSupported, normalizeApplicationPdfText, registerApplicationPdfFonts } from './application-pdf-font'
 
 /**
  * Select the right CL template based on resume templateId
@@ -15,9 +15,8 @@ export async function renderCoverLetterDoc(
   applicant: CoverLetterDocProps['applicant'],
   recipient?: CoverLetterDocProps['recipient'],
 ): Promise<React.ReactElement> {
-  for (const value of [clContent, applicant.name, applicant.email, applicant.phone, applicant.location, applicant.linkedin, recipient?.company, recipient?.role]) {
-    if (value) assertPdfTextSupported(value)
-  }
+  assertApplicationPdfTextSupported([clContent, applicant.name, applicant.email, applicant.phone, applicant.location, applicant.linkedin, recipient?.company, recipient?.role].map(value => value == null ? value : normalizeApplicationPdfText(value)))
+  registerApplicationPdfFonts()
   const variant: CoverLetterDocProps['templateVariant'] =
     resumeTemplateId === 'executive' || resumeTemplateId === 'sidebar'
       ? 'classic'
@@ -41,8 +40,7 @@ export async function renderCoverLetterDoc(
     templateVariant: variant,
   }
 
-  const [{ CoverLetterDoc }, { default: React }] = await Promise.all([
-    import('@/components/resume/templates/cover-letter/CoverLetterFrame'), import('react'),
-  ])
+  const { CoverLetterDoc } = await import('@/components/resume/templates/cover-letter/CoverLetterFrame')
+  const React = (await import('react')).default
   return React.createElement(CoverLetterDoc, props)
 }

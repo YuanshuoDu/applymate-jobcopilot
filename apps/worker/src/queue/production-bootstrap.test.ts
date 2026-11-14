@@ -159,17 +159,17 @@ async function compositionRuntime(): Promise<{ runtime: CanonicalTurnRuntime; to
       } satisfies InputClaimStore
       return new StepContextBuilder(inputStore)
     },
-    authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async (_input: Parameters<UsageAuthorization["settle"]>[0]) => undefined) })),
+    authorizeUsage: vi.fn(async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: vi.fn(async (_input: Parameters<UsageAuthorization["settle"]>[0]) => undefined) })),
   })
   return {
     runtime, tool, lifecycle, requests, manager, validatedArguments, persistedItems, persistedEvents,
   }
 }
 
-async function coordinationRuntime(input: { workerId?: string; manager: AgentTreeManager; store: CoordinationStore; wait: DurableWaitPort; model: ModelAdapter; pool?: Parameters<typeof createCanonicalTurnRuntime>[0]; now?: () => Date; consumeWaitOutcomes?: boolean; stateLoader?: (state: CanonicalTurnState, lease: TurnLease) => CanonicalTurnState | Promise<CanonicalTurnState> }): Promise<{ runtime: CanonicalTurnRuntime; execute: CanonicalTurnRuntime["execute"] }> {
+async function coordinationRuntime(input: { workerId?: string; manager: AgentTreeManager; store: CoordinationStore; wait: DurableWaitPort; model: ModelAdapter; pool?: Parameters<typeof createCanonicalTurnRuntime>[0]; now?: () => Date; consumeWaitOutcomes?: boolean; resolveOwner?: NonNullable<ConstructorParameters<typeof ToolLifecycle>[0]["resolveOwner"]>; stateLoader?: (state: CanonicalTurnState, lease: TurnLease) => CanonicalTurnState | Promise<CanonicalTurnState> }): Promise<{ runtime: CanonicalTurnRuntime; execute: CanonicalTurnRuntime["execute"] }> {
   const read: RuntimeToolDefinition = { schemaVersion, name: "fixture.read", version: "1", description: "Read fixture evidence", capabilities: ["read"], inputSchema: Type.Object({}, { additionalProperties: false }), outputSchema: Type.Object({ jobs: Type.Array(Type.Object({ id: Type.String() }, { additionalProperties: false })) }, { additionalProperties: false }), risk: "read", domain: "jobs", idempotency: "read_only", timeoutMs: 1_000, requiredCapabilities: [], execute: async () => ({ jobs: [{ id: "job-fixture" }] }) }
   const registry = new ToolRegistry([read, ...createCoordinationTools({ manager: input.manager, store: input.store, wait: input.wait })])
-  const router = new ToolRouter(registry, new ToolLifecycle({ sink: new InMemoryToolLifecycleSink(), references: new InMemoryToolResultReferenceStore() }), createCanonicalPolicy(undefined, true))
+  const router = new ToolRouter(registry, new ToolLifecycle({ sink: new InMemoryToolLifecycleSink(), references: new InMemoryToolResultReferenceStore(), resolveOwner: input.resolveOwner }), createCanonicalPolicy(undefined, true))
   const state: CanonicalTurnState = { scope: { userId: "user_fixture" }, goal: "Read fixture state", modelProfileSnapshot: {} as never, toolPolicySnapshot: { role: "orchestrator", capabilities: ["read", "coordination"] }, budgetSnapshot: { limits: { maxSteps: 5 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
   const runtimeOptions: Parameters<typeof createCanonicalTurnRuntime>[1] = {
     workerId: input.workerId ?? "worker_fixture", manager: input.manager, coordinationEnabled: true,
@@ -182,7 +182,7 @@ async function coordinationRuntime(input: { workerId?: string; manager: AgentTre
     rootTaskStore: { ensure: vi.fn(async () => ({ id: "root_fixture", attemptCount: 1 } as never)), finish: vi.fn(async () => undefined) },
     turnEngineStoreFactory: () => compositionStore(),
     contextBuilderFactory: () => new StepContextBuilder({ scope: { userId: "user_fixture" }, withTransaction: async work => work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }), claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined }) } satisfies InputClaimStore),
-    authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })),
+    authorizeUsage: vi.fn(async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: vi.fn(async () => undefined) })),
   }
   const runtime = await createCanonicalTurnRuntime(input.pool ?? ({ connect: vi.fn() } as never), runtimeOptions)
   return { runtime, execute: runtime.execute }
@@ -226,6 +226,8 @@ function durableCompositionPool(input: {
     events: [] as DurableCompositionRow[],
     outbox: [] as DurableCompositionRow[],
     calls: [] as string[],
+    chronologyTransaction: null as { xid8: string; userId: string | null } | null,
+    nextXid8: 41,
   }
   const row = (value: DurableCompositionRow): DurableCompositionRow => ({ ...value })
   const rootRow = (): DurableCompositionRow => ({ id: input.root.id, rootTaskId: input.root.rootTaskId, turnId: input.root.turnId, sessionId: input.root.sessionId, status: input.root.status, userId: input.root.userId, path: input.root.path })
@@ -240,7 +242,26 @@ function durableCompositionPool(input: {
     query: vi.fn(async <T = DurableCompositionRow>(sql: string, params: readonly unknown[] = []) => {
       state.calls.push(sql)
       const statement = sql.trim()
-      if (statement === "BEGIN" || statement === "COMMIT" || statement === "ROLLBACK" || sql.includes("set_config")) return response<T>([], 1)
+      if (statement === "BEGIN") {
+        state.chronologyTransaction = { xid8: String(state.nextXid8++), userId: null }
+        return response<T>([], 1)
+      }
+      if (statement === "COMMIT" || statement === "ROLLBACK") {
+        state.chronologyTransaction = null
+        return response<T>([], 1)
+      }
+      if (sql.includes("set_config")) return response<T>([], 1)
+      if (statement === "SELECT pg_advisory_xact_lock(hashtextextended($1::text || $2::text, 0))") {
+        const transaction = state.chronologyTransaction
+        if (!transaction || params[0] !== "applymate:root-task-history-chronology:" || typeof params[1] !== "string" || !params[1].trim()
+          || (transaction.userId !== null && transaction.userId !== params[1])) throw new Error("Unexpected root chronology advisory lock scope")
+        transaction.userId = params[1]
+        return response<T>([], 1)
+      }
+      if (statement === 'SELECT pg_current_xact_id()::text AS "xid8"') {
+        const transaction = state.chronologyTransaction
+        return response<T>(transaction?.userId ? [{ xid8: transaction.xid8 }] : [], transaction?.userId ? 1 : 0)
+      }
       if (sql.includes('SELECT clock_timestamp() AS "checkedAt"')) return response<T>([{ checkedAt: input.now }], 1)
       if (sql.includes('MIN(COALESCE(wait."nextReconcileAt", wait."suspendedAt"))')) {
         // The durable composition fixture owns a root wait; it has no nested child wait for this scanner.
@@ -887,7 +908,7 @@ describe("production Worker bootstrap", () => {
       pool: { connect: vi.fn() } as never,
       turnStore: childTurnStore,
       treeBudget: childBudget,
-      authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })),
+      authorizeUsage: vi.fn(async () => ({ outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async () => undefined, settle: vi.fn(async () => undefined) })),
       modelRuntimeFactory: childModelRuntimeFactory,
       toolRuntimeFactory: childToolRuntimeFactory,
     })
@@ -933,7 +954,18 @@ describe("production Worker bootstrap", () => {
       },
     }
     const parentPrivateObservation: CanonicalTurnState["snapshot"]["toolObservations"] = [{ id: "root-private", content: "parent-private-marker" }]
-    const fixture = await coordinationRuntime({ manager, store: coordinationStore, wait, model, stateLoader: state => ({ ...state, snapshot: { ...state.snapshot, toolObservations: parentPrivateObservation } }) })
+    const resolveRootWaitOwner: NonNullable<ConstructorParameters<typeof ToolLifecycle>[0]["resolveOwner"]> = ({ taskId }) => {
+      const current = durableFixture.state.turn
+      return {
+        kind: "turn", taskId: taskId ?? "root_fixture",
+        lease: {
+          turnId: current.id, sessionId: current.sessionId, userId: current.userId,
+          ownerId: current.leaseOwnerId ?? "worker_fixture", leaseVersion: current.leaseVersion,
+          leaseStartedAt: current.leaseStartedAt ?? now, leaseExpiresAt: current.leaseExpiresAt ?? new Date(now.getTime() + 60_000),
+        },
+      }
+    }
+    const fixture = await coordinationRuntime({ manager, store: coordinationStore, wait, model, resolveOwner: resolveRootWaitOwner, stateLoader: state => ({ ...state, snapshot: { ...state.snapshot, toolObservations: parentPrivateObservation } }) })
     let execute: CanonicalTurnRuntime["execute"] | undefined
     let waitHandoff: Parameters<typeof createTurnQueue>[0]["waitHandoff"] | undefined
     const childQueueFactory = vi.fn(options => {
@@ -1021,6 +1053,7 @@ describe("production Worker bootstrap", () => {
         pool: durableFixture.pool as never,
         now: () => recoveryNow,
         consumeWaitOutcomes: true,
+        resolveOwner: resolveRootWaitOwner,
       })
       type RecoveredTurnPayload = Parameters<typeof runTurnJob>[0]["data"]
       const recoveredJobs: Array<{ name: string; data: RecoveredTurnPayload; options?: { jobId?: string; attempts?: number } }> = []

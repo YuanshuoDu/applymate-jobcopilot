@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import { TASK_GRAPH_LIMITS, type TaskGraphState, type TaskGraphVerificationDisposition } from "../planning/task-graph.js"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
 import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphSnapshot, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 
@@ -65,6 +65,18 @@ function storedNode(key: string, dependsOn: string[] = []) {
     depth: 1,
     taskId: `task-${key}`,
   }
+}
+
+function scheduledPostGateNodes(executePackageRefs: readonly string[] = ["job-1", "job-2"]) {
+  const scouts = [storedNode("scout-1"), storedNode("scout-2")]
+  const analyst = { ...storedNode("analyst", scouts.map(node => node.key)), templateId: "analyst", depth: 2 }
+  const prepare = { ...storedNode("prepare", ["analyst"]), templateId: "prepare", depth: 3, verificationDisposition: "specialized" }
+  const gate = { ...storedNode("gate", ["prepare"]), templateId: "gate", depth: 4, verificationDisposition: "specialized" }
+  const execute = { ...storedNode("execute-1", ["gate"]), templateId: "scheduled.application.execute", packageRefs: [...executePackageRefs],
+    depth: 5, verificationDisposition: "specialized" }
+  const audit = { ...storedNode("scheduled.post_gate_audit", ["execute-1"]), templateId: "scheduled.post_gate_audit", depth: 6,
+    verificationDisposition: "specialized" }
+  return [...scouts, analyst, prepare, gate, execute, audit]
 }
 
 const analystVerification = {
@@ -194,6 +206,52 @@ describe("parseTaskGraphSnapshot", () => {
       [], ...Array.from({ length: 7 }, (_, index) => [`historical-${index + 1}`]),
     ])
     expect(current.nodes.every(node => node.status === "completed" && node.verificationDisposition === "typed")).toBe(true)
+  })
+
+  it("round-trips a persisted scheduled graph with eleven nodes while rejecting a twelfth", () => {
+    const scouts = Array.from({ length: 4 }, (_, index) => storedNode(`scout-${index + 1}`))
+    const analyst = { ...storedNode("analyst", scouts.map(node => node.key)), templateId: "analyst", depth: 2 }
+    const prepare = { ...storedNode("prepare", ["analyst"]), templateId: "prepare", depth: 3, verificationDisposition: "specialized" }
+    const gate = { ...storedNode("gate", ["prepare"]), templateId: "gate", depth: 4, verificationDisposition: "specialized" }
+    const executes = Array.from({ length: 3 }, (_, index) => ({ ...storedNode(`execute-${index + 1}`, ["gate"]),
+      templateId: "scheduled.application.execute", packageRefs: [`job-${index + 1}`], depth: 5, verificationDisposition: "specialized" }))
+    const audit = { ...storedNode("scheduled.post_gate_audit", executes.map(node => node.key)), templateId: "scheduled.post_gate_audit",
+      depth: 6, verificationDisposition: "specialized" }
+    const nodes = [...scouts, analyst, prepare, gate, ...executes, audit]
+    const parsed = parseTaskGraphSnapshot(snapshotWithNodes(nodes))
+    const current = taskGraphState(parsed, 11, new Map(parsed.nodes.map(node => [node.taskId, {
+      status: "completed" as const, failureReason: null,
+    }])), [])
+    expect(parsed.nodes).toHaveLength(TASK_GRAPH_LIMITS.maxPersistedNodes)
+    expect(parseTaskGraphSnapshot(canonicalTaskGraphJson(parsed))).toEqual(parsed)
+    expect(current.nodes).toHaveLength(TASK_GRAPH_LIMITS.maxPersistedNodes)
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes([...nodes, storedNode("scheduled-overflow")]))).toThrow("task_graph_snapshot_invalid")
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes(Array.from({ length: TASK_GRAPH_LIMITS.maxNodes + 1 }, (_, index) => storedNode(`generic-${index}`)))))
+      .toThrow("task_graph_snapshot_capacity_invalid")
+  })
+
+  it("preserves typed packageRefs only on specialized scheduled Execute nodes", () => {
+    const nodes = scheduledPostGateNodes()
+    const executeNode = nodes[5]!
+    const parsed = parseTaskGraphSnapshot(snapshotWithNodes(nodes))
+    const statuses = new Map(nodes.map(node => [node.taskId, { status: "completed" as const, failureReason: null }]))
+    const taskIds = new Map(nodes.map(node => [node.key, node.taskId]))
+    const state = taskGraphState(parsed, 1, statuses, [])
+    const written = taskGraphSnapshot(state, taskIds)
+    expect(parsed.nodes[5]?.packageRefs).toEqual(["job-1", "job-2"])
+    expect(written.nodes[5]?.packageRefs).toEqual(["job-1", "job-2"])
+    for (const invalid of [
+      { ...executeNode, templateId: "scout" },
+      { ...executeNode, packageRefs: ["job-1", "job-1"] },
+      { ...executeNode, packageRefs: [" job-1"] },
+      { ...executeNode, verificationDisposition: "legacy_unverified" },
+      { ...executeNode, packageRefs: undefined },
+    ]) {
+      expect(() => parseTaskGraphSnapshot(snapshotWithNodes([...nodes.slice(0, 5), invalid, nodes[6]]))).toThrow()
+    }
+    const missingRefs = { ...executeNode }
+    Reflect.deleteProperty(missingRefs, "packageRefs")
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes([...nodes.slice(0, 5), missingRefs, nodes[6]]))).toThrow()
   })
 
   it("strictly round-trips a registered Scout envelope while keeping undeclared legacy snapshots compatible", () => {
@@ -379,6 +437,41 @@ describe("parseTaskGraphSnapshot", () => {
     for (const nodes of invalid) expect(() => parseTaskGraphSnapshot(snapshotWithNodes(nodes))).toThrow()
   })
 
+  it("requires persisted location-aware repairs to preserve the exact inherited target guard", () => {
+    const targetVerification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+      criteria: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } },
+        { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin", "Berlin"] } },
+      ],
+    } as const
+    const relation = { graphRootTaskId: "root-task", nodeKey: "target", taskId: "task-target", criterionIds: ["candidate-count"] }
+    const target = { ...storedNode("target"), verification: targetVerification, verificationDisposition: "typed" }
+    const exactRepair = { ...storedNode("repair"), verification: targetVerification, verificationDisposition: "typed", repairOf: relation }
+    const persisted = parseTaskGraphSnapshot(snapshotWithNodes([target, exactRepair]))
+    expect(parseTaskGraphSnapshot(canonicalTaskGraphJson(persisted))).toEqual(persisted)
+    expect(persisted.nodes[1]?.repairOf?.criterionIds).toEqual(["candidate-count"])
+    expect(persisted.nodes[1]?.verification?.criteria.map(item => item.id)).toEqual(["candidate-count", "candidate-location"])
+    expect(parseTaskGraphSnapshot(snapshotWithNodes([target, { ...exactRepair,
+      verification: { ...targetVerification, criteria: [targetVerification.criteria[1]] },
+      repairOf: { ...relation, criterionIds: ["candidate-location"] },
+    }])).nodes[1]?.repairOf?.criterionIds).toEqual(["candidate-location"])
+    expect(parseTaskGraphSnapshot(snapshotWithNodes([target, { ...exactRepair,
+      repairOf: { ...relation, criterionIds: ["candidate-count", "candidate-location"] },
+    }])).nodes[1]?.repairOf?.criterionIds).toEqual(["candidate-count", "candidate-location"])
+
+    const invalidRepairs = [
+      { ...exactRepair, verification: { ...targetVerification, criteria: [targetVerification.criteria[0]] } },
+      { ...exactRepair, verification: { ...targetVerification, criteria: [targetVerification.criteria[0], {
+        id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin"] },
+      }] } },
+      { ...exactRepair, verification: { ...targetVerification, criteria: [...targetVerification.criteria, {
+        id: "candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 1 },
+      }] } },
+    ]
+    for (const repair of invalidRepairs) expect(() => parseTaskGraphSnapshot(snapshotWithNodes([target, repair]))).toThrow()
+  })
+
   it("rejects sparse arrays and arrays with extra own properties", () => {
     const sparseSuccessCriteria = new Array<string>(1)
     const sparseDependencies = new Array<string>(1)
@@ -422,8 +515,8 @@ describe("parseTaskGraphSnapshot", () => {
     const oversizedCriteria = Array.from({ length: 9 }, () => "criterion")
     const oversizedDependencies = Array.from({ length: 9 }, (_, index) => `node-${index}`)
 
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes(oversizedNodes))).toThrow("task_graph_snapshot_capacity_invalid")
     for (const snapshot of [
-      snapshotWithNodes(oversizedNodes),
       snapshotWithNodes([{ ...base, key: "k".repeat(129) }]),
       snapshotWithNodes([{ ...base, templateId: "t".repeat(129) }]),
       snapshotWithNodes([{ ...base, taskId: "t".repeat(129) }]),

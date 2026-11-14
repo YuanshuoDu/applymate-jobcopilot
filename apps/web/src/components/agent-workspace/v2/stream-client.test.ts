@@ -420,6 +420,67 @@ describe('V2 timeline stream client', () => {
     expect(JSON.stringify(live.state.itemsById[FINAL_ITEM_ID]?.content)).not.toContain('PRIVATE')
   })
 
+  it('restores one final answer after sparse terminal events through the targeted timeline item', async () => {
+    const syntheticDisplayText = 'Final answer restored from the canonical timeline.'
+    const finalContent = { text: syntheticDisplayText }
+    const sparseEvents = [
+      redactedEnvelope({ schemaVersion: 'agent-harness.v2', id: 'final-start', sessionId: 'session-1', turnId: 'turn-1', itemId: FINAL_ITEM_ID,
+        taskId: 'root-task', type: 'item.started', actor: 'orchestrator', sequence: '1',
+        payload: { itemId: FINAL_ITEM_ID, type: 'agent_message', phase: 'final_answer' } }),
+      redactedEnvelope({ schemaVersion: 'agent-harness.v2', id: 'final-completed', sessionId: 'session-1', turnId: 'turn-1', itemId: FINAL_ITEM_ID,
+        taskId: 'root-task', type: 'item.completed', actor: 'orchestrator', sequence: '2',
+        payload: { itemId: FINAL_ITEM_ID, status: 'completed', content: finalContent } }),
+      redactedEnvelope({ schemaVersion: 'agent-harness.v2', id: 'turn-completed', sessionId: 'session-1', turnId: 'turn-1', itemId: FINAL_ITEM_ID,
+        taskId: 'root-task', type: 'turn.completed', actor: 'orchestrator', sequence: '3',
+        payload: { turnId: 'turn-1', taskId: 'root-task', finalItemId: FINAL_ITEM_ID, usage: { inputTokens: 3, outputTokens: 2 } } }),
+    ]
+    const controller = new AbortController()
+    let state: TimelineState = createTimelineState('session-1')
+    let targetedFinalHydrationCompleted = false
+    let disconnectedAfterTargetedHydration = false
+    const diagnostics = {
+      matchesTarget: vi.fn((sessionId: unknown, turnId: unknown) => sessionId === 'session-1' && turnId === 'turn-1'),
+      recordTurnCompleted: vi.fn(), recordFinalItemTarget: vi.fn(), recordFinalItemHydration: vi.fn(),
+    }
+    vi.stubGlobal('window', { __applymateFinalDiagnostics: diagnostics })
+    const dispatch = (action: TimelineAction) => {
+      state = timelineReducer(state, action)
+      if (action.type === 'replay' && action.items.some(value => isRecord(value) && value.id === FINAL_ITEM_ID)) targetedFinalHydrationCompleted = true
+      if (action.type === 'disconnected' && state.events.some(event => event.type === 'turn.completed')) {
+        disconnectedAfterTargetedHydration = targetedFinalHydrationCompleted
+        controller.abort()
+      }
+    }
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [], page: { hasMore: false } })))
+      .mockResolvedValueOnce(new Response(streamFrom(sparseEvents.map(event => sseEvent(event, event.type)).join('')), { headers: { 'Content-Type': 'text/event-stream' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [finalMessageDto({ content: finalContent })] })))
+
+    try { await streamAgentTimeline({ sessionId: 'session-1', dispatch, fetcher, signal: controller.signal, retryDelayMs: 0 }) }
+    finally { vi.unstubAllGlobals() }
+
+    const finalAnswers = selectTimelineItems(state).filter(value =>
+      value.type === 'agent_message' && value.status === 'completed' && value.phase === 'final_answer')
+    expect(disconnectedAfterTargetedHydration).toBe(true)
+    expect(finalAnswers).toHaveLength(1)
+    expect(finalAnswers[0]).toMatchObject({ id: FINAL_ITEM_ID, content: { text: syntheticDisplayText } })
+    expect(diagnostics.recordTurnCompleted).toHaveBeenCalledWith(expect.objectContaining({
+      eventNameMatches: true, rawTypeMatches: true, rawSessionMatches: true, rawTurnMatches: true,
+      rawPayloadRecord: true, rawPayloadTurnMatches: true, rawFinalItemMatchesEventItem: true,
+      normalized: true, normalizedSessionMatches: true, normalizedTurnMatches: true,
+    }))
+    expect(diagnostics.recordFinalItemTarget).toHaveBeenCalledWith(expect.objectContaining({ targetAccepted: true }))
+    expect(diagnostics.recordFinalItemHydration).toHaveBeenCalledWith({
+      requestStarted: true, responseReceived: true, responseCategory: 'ok', jsonParsed: true, itemCountCategory: 'one',
+      itemAccepted: true, projectionAccepted: true, replayDispatched: true,
+    })
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+      '/api/agent/sessions/session-1/timeline?limit=100',
+      '/api/agent/sessions/session-1/events',
+      `/api/agent/sessions/session-1/timeline?itemId=${encodeURIComponent(FINAL_ITEM_ID)}`,
+    ])
+  })
+
   it('accepts safe answer evidence and keeps live completion identical to timeline replay', async () => {
     const text = 'A match. [[source:S1]]'
     const answerEvidence = {

@@ -67,7 +67,7 @@ function coordinationStore(rows: readonly CoordinationTaskView[]): CoordinationS
 function toolResultRepository() {
   const records: ToolResultReferenceRecord[] = []
   const puts = vi.fn(async (_owner: ExecutionOwner, input: { stepId: string; toolCallId: string; value: unknown }) => {
-    const prepared = prepareToolResultJson(input.value, "agent.wait" as CanonicalToolSourceName)
+    const prepared = prepareToolResultJson(input.value, "agent.wait" as CanonicalToolSourceName, undefined, undefined, "turn")
     const record: ToolResultReferenceRecord = {
       id: referenceId, userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: input.stepId,
       taskId: rootId, toolCallId: input.toolCallId, sanitizedJson: prepared.value, sha256: prepared.sha256,

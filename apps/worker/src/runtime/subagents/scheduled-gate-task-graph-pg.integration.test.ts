@@ -289,6 +289,11 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     owner = { ...fixture.owner, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
     attestation = await fixture.reattestCurrentTurn(lease)
     const completionStep = await startStep(fixture, lease, turnStore)
+    const postGateEligibility = await command.readScheduledPostGatePlanningContext?.({ scope: {
+      ...fixture.graphScope, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
+      parentLeaseOwner: lease.ownerId, parentAttemptCount: fixture.owner.rootAttemptCount,
+    } })
+    expect(postGateEligibility).toEqual({ status: "not_applicable" })
     const auditWait = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
       handoff, prepareProof: preparedProof, scheduledWaitId: fixture.prepareChoiceWaitId,
       finalStepId: completionStep, recoveryStepId: completionStep, signal: new AbortController().signal })

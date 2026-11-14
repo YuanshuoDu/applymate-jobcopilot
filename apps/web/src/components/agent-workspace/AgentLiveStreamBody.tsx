@@ -1,6 +1,7 @@
 'use client'
 
 import React from 'react'
+import { useSession } from 'next-auth/react'
 import { AgentNewChatWelcome } from '@/components/agent-workspace/AgentNewChatWelcome'
 import { ApplyJobCard, type ApplyReadyJob } from '@/components/agent-workspace/ApplyJobCard'
 import { LiveLogTranscriptBlock, LiveQuestionTranscriptBlock, LiveTranscriptBlock } from '@/components/agent-workspace/LiveTranscriptBlocks'
@@ -45,7 +46,9 @@ export function AgentLiveStreamBody({
   onFollowStateChange,
 }: AgentLiveStreamBodyProps) {
   const { t } = useI18n()
-  const applyPending = applyQueue.filter((job) => !job.url?.startsWith('_applied'))
+  const { data: authSession, status: authStatus } = useSession()
+  const userId = authStatus === 'authenticated' ? authSession?.user?.id ?? null : null
+  const applyPending = applyQueue.filter(job => !(userId && job.manualRecordStatuses?.[userId] === 'reported'))
   const actedApprovalIds = React.useMemo(() => approvalResponseIds(liveBlocks), [liveBlocks])
   const harnessItems = React.useMemo(() => liveBlocks.map(toHarnessItem).filter((item): item is TimelineItem => item !== null), [liveBlocks])
   const highlightedFinalIds = React.useMemo(() => highlightedFinalItemIds(harnessItems), [harnessItems])
@@ -131,7 +134,7 @@ export function AgentLiveStreamBody({
                 <span style={{ fontSize: 12, fontWeight: 600 }}>{t('agent.applicationQueue')}</span>
                 <span style={{ fontSize: 10, padding: '1px 7px', borderRadius: 999, background: 'var(--primary)', color: '#fff', fontWeight: 600 }}>{applyPending.length}</span>
                 <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 'auto' }}>
-                  {applyQueue.some(job => job.mode === 'queued') ? t('agent.queueUpdated') : t('agent.confirmDelivery')}
+                  {applyQueue.some(job => job.mode === 'queued') ? t('agent.queueUpdated') : t('agent.manualRecordGuidance')}
                 </span>
               </div>
               {applyQueue.map(job => (

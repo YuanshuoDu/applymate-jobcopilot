@@ -1,11 +1,14 @@
 'use client'
 
 import React, { useState, useRef, useCallback, useEffect } from 'react'
+import Link from 'next/link'
+import { useSession } from 'next-auth/react'
 import { CompanyLogo, ScorePill, useToast } from '@/components/ui'
-import { apiMutate } from '@/lib/hooks'
-import type { Job } from '@/lib/types'
 import { extractSearchQuery } from './search-query'
 import { useI18n } from '@/lib/i18n'
+import { userScopedStorageKey } from '@/lib/user-scoped-storage'
+import { saveDiscoveredApplication } from './application-search-save'
+import { createApplicationSaveGuard, readSavedApplications, searchResultKey, writeSavedApplications } from './application-search-state'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -131,33 +134,46 @@ const LS_LAST   = 'applymate_last_search'
 const LS_RECENT = 'applymate_recent_searches'
 
 interface StoredSearch { q: string; filters: Filters; results: JobResult[]; meta: SearchMeta | null }
-function loadLast(): StoredSearch | null { try { const r = localStorage.getItem(LS_LAST); return r ? JSON.parse(r) : null } catch { return null } }
-function saveLast(s: StoredSearch) { try { localStorage.setItem(LS_LAST, JSON.stringify(s)) } catch {} }
-function loadRecent(): string[] { try { const r = localStorage.getItem(LS_RECENT); return r ? JSON.parse(r) : [] } catch { return [] } }
-function addRecent(q: string) { const p = loadRecent().filter(x => x.toLowerCase() !== q.toLowerCase()); try { localStorage.setItem(LS_RECENT, JSON.stringify([q, ...p].slice(0, 8))) } catch {} }
-function clearHistory() { try { localStorage.removeItem(LS_LAST); localStorage.removeItem(LS_RECENT) } catch {} }
-
-async function saveAndScore(r: JobResult, onSaved: (id: string, dbId: string) => void, onScored: (id: string, score: number) => void, onError: (msg: string) => void) {
-  const { data: job, error } = await apiMutate<Job>('/api/jobs', 'POST', {
-    company: r.company, role: r.title, location: r.location,
-    url: r.url, salary: r.salary ?? null, description: r.description,
-    source: r.source, status: 'saved', keySkills: r.keySkills ?? [],
-  })
-  if (error || !job) { onError(error ?? 'Save failed'); return }
-  onSaved(r.id, job.id)
-  if (!r.description) return
-  try {
-    // The default endpoint already falls back to a user's latest resume, so
-    // avoid serially loading the list and then the selected document.
-    const resumeResponse = await fetch('/api/resume/default'); if (!resumeResponse.ok) return
-    const full = await resumeResponse.json(); if (!full?.content) return
-    const sr = await fetch('/api/ai/score', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resumeContent: full.content, jobTitle: r.title, jobDescription: r.description.slice(0, 2000), keySkills: r.keySkills ?? [] }) })
-    if (!sr.ok) return
-    const sd = await sr.json() as { score: number; matchedKeywords: string[]; missingKeywords: string[] }
-    await apiMutate(`/api/jobs/${job.id}`, 'PATCH', { score: sd.score, analysisNote: `Match: ${sd.score}%\nMatched: ${sd.matchedKeywords?.join(', ')||'—'}\nMissing: ${sd.missingKeywords?.join(', ')||'—'}` })
-    onScored(r.id, sd.score)
-  } catch {}
+function cachedRecord(value: unknown): Record<string, unknown> | null { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null }
+function cachedStrings(value: unknown): boolean { return Array.isArray(value) && value.every(item => typeof item === 'string') }
+function optionalString(value: unknown): boolean { return value == null || typeof value === 'string' }
+function validCachedSearch(value: unknown): value is StoredSearch {
+  const data = cachedRecord(value), filters = cachedRecord(data?.filters)
+  if (!data || typeof data.q !== 'string' || !filters || typeof filters.remote !== 'boolean'
+    || !['location', 'jobType', 'datePosted', 'experience', 'salaryMin', 'salaryMax'].every(key => typeof filters[key] === 'string')
+    || !Array.isArray(data.results)) return false
+  for (const item of data.results) {
+    const row = cachedRecord(item)
+    if (!row || !['id', 'source', 'url', 'title', 'company'].every(key => typeof row[key] === 'string')
+      || !['location', 'description', 'salary', 'postedAt', 'jobType', 'logo', 'seniority', 'workArrangement', 'experienceLevel'].every(key => optionalString(row[key]))
+      || (row.keySkills != null && !cachedStrings(row.keySkills))
+      || (row.score != null && (typeof row.score !== 'number' || !Number.isFinite(row.score)))
+      || (row.directApply != null && typeof row.directApply !== 'boolean')) return false
+    if (row.hiringManager != null) {
+      const manager = cachedRecord(row.hiringManager)
+      if (!manager || !['name', 'title', 'email', 'linkedinUrl'].every(key => optionalString(manager[key]))) return false
+    }
+  }
+  if (data.meta != null) {
+    const meta = cachedRecord(data.meta)
+    if (!meta || !cachedStrings(meta.sourcesUsed) || typeof meta.routing !== 'string'
+      || (meta.topSkills != null && !cachedStrings(meta.topSkills))) return false
+    if (meta.salaryContext != null) {
+      const salary = cachedRecord(meta.salaryContext)
+      if (!salary || typeof salary.currency !== 'string' || typeof salary.median !== 'number' || !Number.isFinite(salary.median)) return false
+    }
+    if (meta.apiKeys != null) {
+      const keys = cachedRecord(meta.apiKeys)
+      if (!keys || typeof keys.rapidapi !== 'boolean') return false
+    }
+  }
+  return true
 }
+function loadLast(userId: string | null): StoredSearch | null { try { const key = userScopedStorageKey(LS_LAST, userId); const r = key && localStorage.getItem(key); const value: unknown = r ? JSON.parse(r) : null; return validCachedSearch(value) ? value : null } catch { return null } }
+function saveLast(userId: string | null, s: StoredSearch) { try { const key = userScopedStorageKey(LS_LAST, userId); if (key) localStorage.setItem(key, JSON.stringify(s)) } catch {} }
+function loadRecent(userId: string | null): string[] { try { const key = userScopedStorageKey(LS_RECENT, userId); const r = key && localStorage.getItem(key); const value: unknown = r ? JSON.parse(r) : []; return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string').slice(0, 8) : [] } catch { return [] } }
+function addRecent(userId: string | null, q: string) { const p = loadRecent(userId).filter(x => x.toLowerCase() !== q.toLowerCase()); try { const key = userScopedStorageKey(LS_RECENT, userId); if (key) localStorage.setItem(key, JSON.stringify([q, ...p].slice(0, 8))) } catch {} }
+function clearHistory(userId: string | null) { try { for (const prefix of [LS_LAST, LS_RECENT]) { const key = userScopedStorageKey(prefix, userId); if (key) localStorage.removeItem(key) } } catch {} }
 
 // ── Inline badge ──────────────────────────────────────────────────────────────
 function Badge({ children, color, bg, style }: { children: React.ReactNode; color: string; bg: string; style?: React.CSSProperties }) {
@@ -178,23 +194,57 @@ const glassInput: React.CSSProperties = {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () => void; onOpenSettings?: () => void }) {
+export function SmartSearch({ onJobSaved, onOpenSettings, onOpenApplication }: { onJobSaved?: (jobId: string) => void; onOpenSettings?: () => void; onOpenApplication?: (jobId: string) => void }) {
+  const { data: session, status: sessionStatus } = useSession()
+  const userId = sessionStatus === 'authenticated' ? session?.user?.id || null : null
+  const activeUserRef = useRef(userId)
+  const identityEpoch = useRef(0)
+  if (activeUserRef.current !== userId) identityEpoch.current += 1
+  activeUserRef.current = userId
+  const saveGuard = useRef(createApplicationSaveGuard())
+  const saveOperations = useRef(new Set<AbortController>())
+  const [savedState, setSavedState] = useState<{ owner: string | null; jobs: Record<string, string> }>({ owner: null, jobs: {} })
+  const savedApplications = savedState.owner === userId ? savedState.jobs : {}
+  useEffect(() => {
+    const reload = () => {
+      let jobs: Record<string, string> = {}
+      try { jobs = readSavedApplications(window.sessionStorage, userId) } catch { /* Storage is optional. */ }
+      setSavedState({ owner: userId, jobs })
+    }
+    const invalidate = () => {
+      for (const operation of saveOperations.current) operation.abort()
+      saveOperations.current.clear()
+    }
+    reload()
+    window.addEventListener('applymate:saved-search-changed', reload)
+    window.addEventListener('applymate:jobs-changed', reload)
+    window.addEventListener('applymate:identity-changed', invalidate)
+    return () => {
+      invalidate()
+      window.removeEventListener('applymate:saved-search-changed', reload)
+      window.removeEventListener('applymate:jobs-changed', reload)
+      window.removeEventListener('applymate:identity-changed', invalidate)
+    }
+  }, [userId])
+  useEffect(() => {
+    if (savedState.owner !== userId) return
+    try { writeSavedApplications(window.sessionStorage, userId, savedState.jobs) } catch { /* Storage is optional. */ }
+  }, [savedState, userId])
   const { t } = useI18n()
   const toast = useToast()
   const inputRef = useRef<HTMLInputElement>(null)
-  const lastSearch = useRef(loadLast())
+  const [searchOwner, setSearchOwner] = useState<string | null>(null)
   const searchControllerRef = useRef<AbortController | null>(null)
   const searchRequestRef = useRef(0)
 
-  const [q,           setQ]           = useState(lastSearch.current?.q ?? '')
-  const [filters,     setFilters]     = useState<Filters>(lastSearch.current?.filters ?? DEFAULT_FILTERS)
+  const [q,           setQ]           = useState('')
+  const [filters,     setFilters]     = useState<Filters>(DEFAULT_FILTERS)
   const [showFilters, setShowFilters] = useState(false)
   const [searching,   setSearching]   = useState(false)
-  const [results,     setResults]     = useState<JobResult[]>(lastSearch.current?.results ?? [])
-  const [meta,        setMeta]        = useState<SearchMeta | null>(lastSearch.current?.meta ?? null)
-  const [searched,    setSearched]    = useState(!!lastSearch.current)
+  const [results,     setResults]     = useState<JobResult[]>([])
+  const [meta,        setMeta]        = useState<SearchMeta | null>(null)
+  const [searched,    setSearched]    = useState(false)
   const [savingIds,   setSavingIds]   = useState(new Set<string>())
-  const [savedIds,    setSavedIds]    = useState(new Set<string>())
   const [scoringIds,  setScoringIds]  = useState(new Set<string>())
   const [scores,      setScores]      = useState<Record<string, number>>({})
   const [expandedId,  setExpandedId]  = useState<string | null>(null)
@@ -205,13 +255,50 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
   const [translated,  setTranslated]  = useState<Record<string, { text: string; lang: string }>>({})
   const [tgtLang,     setTgtLang]     = useState('de')
   const [descExp,     setDescExp]     = useState(new Set<string>())
-  const [recent,      setRecent]      = useState(loadRecent)
+  const [recent,      setRecent]      = useState<string[]>([])
   const [searchFocus, setSearchFocus] = useState(false)
 
   // Track what params were used in the last executed search for stale detection
-  const lastSearchedRef = useRef<{ q: string; filters: Filters } | null>(
-    lastSearch.current ? { q: lastSearch.current.q, filters: lastSearch.current.filters } : null
-  )
+  const lastSearchedRef = useRef<{ q: string; filters: Filters } | null>(null)
+
+  // Remember a position only for the same account and the same executed result set.
+  const searchPositionScope = (query: { q: string; filters: Filters }, rows: JobResult[]) =>
+    JSON.stringify([query.q, query.filters, rows.map(searchResultKey)])
+  useEffect(() => {
+    searchRequestRef.current += 1
+    searchControllerRef.current?.abort()
+    const savedSearch = loadLast(userId)
+    lastSearchedRef.current = savedSearch ? { q: savedSearch.q, filters: savedSearch.filters } : null
+    setQ(savedSearch?.q ?? ''); setFilters(savedSearch?.filters ?? DEFAULT_FILTERS)
+    setResults(savedSearch?.results ?? []); setMeta(savedSearch?.meta ?? null); setSearched(Boolean(savedSearch))
+    setRecent(loadRecent(userId)); setSearching(false); setScores({})
+    setTranslated({}); setDescExp(new Set()); setTranslating(new Set()); setSavingIds(new Set()); setScoringIds(new Set())
+    setPage(1); setPageSize(20); setSortDir('desc'); setExpandedId(null)
+    setSearchOwner(userId)
+    const key = userScopedStorageKey('applymate:discover-position', userId)
+    const search = lastSearchedRef.current
+    if (!key || !search) return
+    try {
+      const saved = JSON.parse(window.sessionStorage.getItem(key) ?? 'null') as Record<string, unknown> | null
+      const rows = savedSearch?.results ?? []
+      if (!saved || saved.scope !== searchPositionScope(search, rows)) return
+      const size = saved.pageSize === 50 ? 50 : 20
+      const maxPage = Math.max(1, Math.ceil(rows.length / size))
+      if (!Number.isInteger(saved.page) || Number(saved.page) < 1 || Number(saved.page) > maxPage) return
+      const expanded = typeof saved.expandedId === 'string' && rows.some(result => result.id === saved.expandedId) ? saved.expandedId : null
+      setPageSize(size); setPage(Number(saved.page)); setSortDir(saved.sortDir === 'asc' ? 'asc' : 'desc'); setExpandedId(expanded)
+    } catch { /* Storage is optional; fall back to the first page. */ }
+  }, [userId]) // Restore only on account change, never after a new search.
+
+  function openSavedApplication(jobId: string) {
+    const key = userScopedStorageKey('applymate:discover-position', userId)
+    if (key && lastSearchedRef.current && !searching) {
+      try {
+        window.sessionStorage.setItem(key, JSON.stringify({ scope: searchPositionScope(lastSearchedRef.current, results), page, pageSize, sortDir, expandedId }))
+      } catch { /* Navigation remains available when storage is unavailable. */ }
+    }
+    onOpenApplication?.(jobId)
+  }
 
   const isStale = searched && !!lastSearchedRef.current && (
     q.trim() !== lastSearchedRef.current.q ||
@@ -235,12 +322,15 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
 
   const runSearch = useCallback(async (query: string, f: Filters) => {
     if (!query.trim()) return
+    const positionKey = userScopedStorageKey('applymate:discover-position', userId)
+    if (positionKey) { try { window.sessionStorage.removeItem(positionKey) } catch { /* Storage is optional. */ } }
     const requestId = searchRequestRef.current + 1
+    const ownerEpoch = identityEpoch.current
     searchRequestRef.current = requestId
     searchControllerRef.current?.abort()
     const controller = new AbortController()
     searchControllerRef.current = controller
-    setSearching(true); setSearched(true); setSavedIds(new Set()); setScores({}); setExpandedId(null); setPage(1)
+    setSearching(true); setSearched(true); setScores({}); setTranslated({}); setDescExp(new Set()); setTranslating(new Set()); setExpandedId(null); setPage(1)
     const p = new URLSearchParams({ q: query })
     if (f.location)           p.set('location', f.location)
     if (f.remote)             p.set('remote', '1')
@@ -253,22 +343,22 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
       const res = await fetch(`/api/search/unified?${p}`, { signal: controller.signal })
       const json = await res.json()
       if (!res.ok) throw new Error(json.error ?? 'Search failed')
-      if (requestId !== searchRequestRef.current) return
+      if (controller.signal.aborted || requestId !== searchRequestRef.current || activeUserRef.current !== userId || identityEpoch.current !== ownerEpoch) return
       setResults(json.jobs ?? [])
       setMeta(json.meta ?? null)
       lastSearchedRef.current = { q: query.trim(), filters: f }
-      saveLast({ q: query.trim(), filters: f, results: json.jobs ?? [], meta: json.meta ?? null })
-      addRecent(query.trim())
-      setRecent(loadRecent())
+      saveLast(userId, { q: query.trim(), filters: f, results: json.jobs ?? [], meta: json.meta ?? null })
+      addRecent(userId, query.trim())
+      setRecent(loadRecent(userId))
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') return
-      if (requestId !== searchRequestRef.current) return
+      if (controller.signal.aborted || requestId !== searchRequestRef.current || activeUserRef.current !== userId || identityEpoch.current !== ownerEpoch) return
       toast.error('Search failed', (e as Error).message)
       setResults([])
     } finally {
-      if (requestId === searchRequestRef.current) setSearching(false)
+      if (!controller.signal.aborted && requestId === searchRequestRef.current && activeUserRef.current === userId && identityEpoch.current === ownerEpoch) setSearching(false)
     }
-  }, [toast])
+  }, [toast, userId])
 
   // triggerSearch: stable reference used by pill removal callbacks
   const triggerSearch = useCallback((searchQ: string, f: Filters) => {
@@ -301,21 +391,56 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
   }
 
   async function handleSave(r: JobResult) {
-    setSavingIds(prev => new Set(prev).add(r.id))
-    await saveAndScore(r,
-      (rid) => { setSavingIds(p => { const n = new Set(p); n.delete(rid); return n }); setSavedIds(p => new Set(p).add(rid)); setScoringIds(p => new Set(p).add(rid)); toast.success(t('smartSearch.saved'), `${r.company} — ${t('smartSearch.scoringMatch')}`); onJobSaved?.() },
-      (rid, score) => { setScoringIds(p => { const n = new Set(p); n.delete(rid); return n }); setScores(p => ({ ...p, [rid]: score })) },
-      (msg) => { setSavingIds(p => { const n = new Set(p); n.delete(r.id); return n }); toast.error('Save failed', msg) },
-    )
+    const resultKey = searchResultKey(r)
+    const guardKey = `${userId}:${resultKey}`
+    if (savedApplications[resultKey]) { openSavedApplication(savedApplications[resultKey]); return }
+    if (!userId || !saveGuard.current.acquire(guardKey)) return
+    const operation = new AbortController()
+    const ownerEpoch = identityEpoch.current
+    const searchEpoch = searchRequestRef.current
+    saveOperations.current.add(operation)
+    const isCurrent = () => !operation.signal.aborted && activeUserRef.current === userId && identityEpoch.current === ownerEpoch
+    setSavingIds(prev => new Set(prev).add(resultKey))
+    try {
+      await saveDiscoveredApplication(r, {
+        userId, signal: operation.signal, isCurrent,
+        onSaved: (_rid, dbId) => {
+          if (!isCurrent()) return
+          setSavingIds(p => { const next = new Set(p); next.delete(resultKey); return next })
+          setSavedState(previous => {
+            const jobs = { ...(previous.owner === userId ? previous.jobs : {}), [resultKey]: dbId }
+            return { owner: userId, jobs }
+          })
+          setScoringIds(p => new Set(p).add(resultKey))
+          toast.success(t('smartSearch.saved'), t('application.savedHint'))
+          onJobSaved?.(dbId)
+        },
+        onScored: (_rid, score) => {
+          if (isCurrent() && searchRequestRef.current === searchEpoch) setScores(p => ({ ...p, [resultKey]: score }))
+        },
+        onError: (msg) => { if (isCurrent()) toast.error('Save failed', msg) },
+      })
+    } finally {
+      saveGuard.current.release(guardKey)
+      saveOperations.current.delete(operation)
+      if (isCurrent()) {
+        setSavingIds(p => { const next = new Set(p); next.delete(resultKey); return next })
+        setScoringIds(p => { const next = new Set(p); next.delete(resultKey); return next })
+      }
+    }
   }
 
   async function handleTranslate(r: JobResult) {
     if (!r.description) return
+    const owner = userId
+    const ownerEpoch = identityEpoch.current
+    const searchEpoch = searchRequestRef.current
+    const isCurrent = () => activeUserRef.current === owner && identityEpoch.current === ownerEpoch && searchRequestRef.current === searchEpoch
     setTranslating(prev => new Set(prev).add(r.id))
     try {
       const res = await fetch('/api/ai/translate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: r.description, targetLang: tgtLang }) })
-      if (res.ok) { const j = await res.json(); if (j.translated) setTranslated(p => ({ ...p, [r.id]: { text: j.translated, lang: tgtLang } })) }
-    } catch {} finally { setTranslating(prev => { const n = new Set(prev); n.delete(r.id); return n }) }
+      if (res.ok) { const j = await res.json(); if (isCurrent() && j.translated) setTranslated(p => ({ ...p, [r.id]: { text: j.translated, lang: tgtLang } })) }
+    } catch {} finally { if (isCurrent()) setTranslating(prev => { const n = new Set(prev); n.delete(r.id); return n }) }
   }
 
   const sorted     = [...results].sort((a, b) => sortDir === 'desc' ? b.score - a.score : a.score - b.score)
@@ -324,6 +449,9 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
   const totalPages = Math.max(1, Math.ceil(results.length / pageSize))
 
   // ── Render ────────────────────────────────────────────────────────────────
+
+  if (sessionStatus === 'loading' || (userId && searchOwner !== userId)) return <p role="status">{t('dashboard.momentum.loading')}</p>
+  if (!userId) return <p role="status"><Link href="/login">{t('toast.signInAgain')}</Link></p>
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 0, maxWidth: 1000, margin: '0 auto', width: '100%' }}>
@@ -545,7 +673,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
             </button>
           ))}
           <button
-            onClick={() => { clearHistory(); setRecent([]); setQ(''); setResults([]); setMeta(null); setSearched(false); setFilters(DEFAULT_FILTERS) }}
+            onClick={() => { clearHistory(userId); setRecent([]); setQ(''); setResults([]); setMeta(null); setSearched(false); setFilters(DEFAULT_FILTERS) }}
             style={{ fontSize: 10, color: '#DC2626', background: 'none', border: 'none', cursor: 'pointer', marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 4 }}>
             <Icon.Trash /> Clear
           </button>
@@ -644,6 +772,8 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
               {/* ── Job cards ── */}
               <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {paged.map(r => {
+                  const resultKey = searchResultKey(r)
+                  const savedJobId = savedApplications[resultKey]
                   const src = SOURCE_STYLE[r.source] ?? { label: r.source, color: '#888', bg: 'rgba(100,100,100,0.10)' }
                   const exp = expandedId === r.id
                   const jt  = r.jobType ? JOB_TYPE_COLOR[r.jobType] : null
@@ -811,28 +941,26 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
 
                             {/* Actions */}
                             <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-                              <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '9px 22px', background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', borderRadius: 10, fontSize: 13, fontWeight: 700, textDecoration: 'none', boxShadow: '0 4px 14px rgba(79,70,229,0.40)' }}>
+                              <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '9px 22px', background: 'var(--glass-bg)', color: 'var(--text-muted)', border: '1px solid var(--border)', borderRadius: 10, fontSize: 13, fontWeight: 500, textDecoration: 'none' }}>
                                 <Icon.ExternalLink /> {t('jobs.viewPosting')}
                               </a>
 
-                              {savedIds.has(r.id) ? (
-                                scores[r.id] !== undefined
-                                  ? <ScorePill score={scores[r.id]} />
-                                  : <Badge color="#059669" bg="rgba(5,150,105,0.12)">✓ {t('jobs.savedBadge')}</Badge>
+                              {savedJobId ? (
+                                <button type="button" onClick={e => { e.stopPropagation(); openSavedApplication(savedJobId) }} disabled={!onOpenApplication} style={{ padding: '9px 18px', border: '1px solid var(--primary)', borderRadius: 10, background: 'var(--primary)', color: '#fff', fontSize: 13, fontWeight: 700, cursor: 'pointer' }}>{t('application.viewApplication')}</button>
                               ) : (
                                 <button
                                   onClick={e => { e.stopPropagation(); handleSave(r) }}
-                                  disabled={savingIds.has(r.id)}
-                                  style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '9px 18px', border: '1.5px solid var(--border)', borderRadius: 10, background: 'var(--glass-bg)', color: 'var(--text-muted)', fontSize: 13, fontWeight: 600, cursor: savingIds.has(r.id) ? 'not-allowed' : 'pointer', transition: 'all 0.15s' }}
-                                  onMouseEnter={e => { if (!savingIds.has(r.id)) { e.currentTarget.style.borderColor = 'rgba(79,70,229,0.35)'; e.currentTarget.style.color = 'var(--primary)' } }}
-                                  onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)' }}>
-                                  {savingIds.has(r.id)
+                                  disabled={savingIds.has(resultKey)}
+                                  style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '9px 18px', border: '1.5px solid var(--primary)', borderRadius: 10, background: 'var(--primary)', color: '#fff', fontSize: 13, fontWeight: 600, cursor: savingIds.has(resultKey) ? 'not-allowed' : 'pointer', transition: 'all 0.15s' }}
+                                  onMouseEnter={e => { if (!savingIds.has(resultKey)) e.currentTarget.style.opacity = '0.9' }}
+                                  onMouseLeave={e => { e.currentTarget.style.opacity = '1' }}>
+                                  {savingIds.has(resultKey)
                                     ? <><span style={{ width: 13, height: 13, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />{t('jobs.saving')}</>
                                   : <>{Icon.Bookmark()}{t('jobs.saveToTracker')}</>}
                                 </button>
                               )}
 
-                              {scoringIds.has(r.id) && (
+                              {scoringIds.has(resultKey) && (
                                 <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 5 }}>
                                   <span style={{ width: 12, height: 12, border: '2px solid rgba(79,70,229,0.18)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />
                                   {t('jobs.aiScoring')}
@@ -847,27 +975,25 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                       {!exp && (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flexShrink: 0, alignItems: 'center' }}>
                           {/* Score if available */}
-                          {scores[r.id] !== undefined && <ScorePill score={scores[r.id]} />}
-                          {scoringIds.has(r.id) && <span style={{ width: 10, height: 10, border: '1.5px solid rgba(79,70,229,0.18)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />}
+                          {scores[resultKey] !== undefined && <ScorePill score={scores[resultKey]} />}
+                          {scoringIds.has(resultKey) && <span style={{ width: 10, height: 10, border: '1.5px solid rgba(79,70,229,0.18)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />}
 
                           {/* View button */}
-                          <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} title={t('jobs.viewPosting')} style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', textDecoration: 'none', boxShadow: '0 3px 10px rgba(79,70,229,0.35)', transition: 'all 0.15s' }}>
+                          <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} title={t('jobs.viewPosting')} style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, background: 'var(--glass-bg)', color: 'var(--text-muted)', border: '1px solid var(--border)', textDecoration: 'none', transition: 'all 0.15s' }}>
                             <Icon.ExternalLink />
                           </a>
 
                           {/* Save button */}
-                          {!savedIds.has(r.id) && (
-                            <button onClick={e => { e.stopPropagation(); handleSave(r) }} disabled={savingIds.has(r.id)} title={t('jobs.saveTracker')} style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, border: '1px solid var(--border)', background: 'var(--glass-bg)', color: 'var(--text-muted)', cursor: 'pointer', transition: 'all 0.15s' }}
+                          {!savedJobId && (
+                            <button onClick={e => { e.stopPropagation(); handleSave(r) }} disabled={savingIds.has(resultKey)} title={t('jobs.saveTracker')} style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, border: '1px solid var(--border)', background: 'var(--glass-bg)', color: 'var(--text-muted)', cursor: 'pointer', transition: 'all 0.15s' }}
                               onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(79,70,229,0.35)'; e.currentTarget.style.color = 'var(--primary)' }}
                               onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)' }}>
-                              {savingIds.has(r.id)
+                              {savingIds.has(resultKey)
                                 ? <span style={{ width: 12, height: 12, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />
                                 : Icon.Bookmark()}
                             </button>
                           )}
-                          {savedIds.has(r.id) && scores[r.id] === undefined && !scoringIds.has(r.id) && (
-                            <span title={t('jobs.savedBadge')} style={{ color: '#059669', display: 'flex' }}>✓</span>
-                          )}
+                          {savedJobId && <button type="button" onClick={e => { e.stopPropagation(); openSavedApplication(savedJobId) }} disabled={!onOpenApplication} aria-label={`${t('application.viewApplication')}: ${r.title}`} style={{ padding: '7px 10px', border: '1px solid var(--primary)', borderRadius: 9, background: 'var(--primary)', color: '#fff', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>{t('application.viewApplication')}</button>}
                         </div>
                       )}
                     </div>

@@ -1,7 +1,16 @@
 'use client'
 
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
+import { useSession } from 'next-auth/react'
 import { useI18n } from '@/lib/i18n'
+import {
+  createApplyJobActions,
+  manualRecordLabel,
+  readManualRecordStatus,
+  writeManualRecordStatus,
+  type ManualRecordState,
+  type ManualRecordStatus,
+} from './apply-job-actions'
 
 export interface ApplyReadyJob {
   jobId:           string
@@ -14,6 +23,7 @@ export interface ApplyReadyJob {
   matchedKeywords: string[]
   mode?:           'manual' | 'queued'
   taskId?:         string
+  manualRecordStatuses?: Record<string, ManualRecordStatus>
 }
 
 interface ApplyJobCardProps {
@@ -22,12 +32,59 @@ interface ApplyJobCardProps {
 }
 
 export function ApplyJobCard({ job, onApplied }: ApplyJobCardProps) {
-  const { t } = useI18n()
+  const { t, lang } = useI18n()
+  const { data: authSession, status: authStatus } = useSession()
+  const userId = authStatus === 'authenticated' ? authSession?.user?.id ?? null : null
+  const jobRecordStatus = userId ? job.manualRecordStatuses?.[userId] : undefined
   const [showCL,   setShowCL]   = useState(false)
-  const [applying, setApplying] = useState(false)
   const [workerStatus, setWorkerStatus] = useState<'submitted' | 'manual' | 'failed' | null>(null)
-  const isApplied = job.url?.startsWith('_applied')
+  const [localRecordState, setLocalRecordState] = useState<ManualRecordState>(jobRecordStatus ?? 'idle')
+  const recordScope = userId ? JSON.stringify([userId, job.jobId]) : null
+  const activeRecordScopeRef = useRef(recordScope)
+  activeRecordScopeRef.current = recordScope
+  const [loadedRecordScope, setLoadedRecordScope] = useState<string | null>(
+    jobRecordStatus && recordScope ? recordScope : null,
+  )
+  const recordStateRef = useRef<ManualRecordState>(jobRecordStatus ?? 'idle')
+  const recordState = loadedRecordScope === recordScope ? localRecordState : jobRecordStatus ?? 'idle'
+  const recordStateLoaded = Boolean(recordScope && loadedRecordScope === recordScope)
+  const isReported = recordState === 'reported'
   const isQueued = job.mode === 'queued'
+
+  function setRecordStateForScope(scope: string | null, state: ManualRecordState) {
+    if (activeRecordScopeRef.current !== scope) return
+    recordStateRef.current = state
+    setLocalRecordState(state)
+  }
+
+  useEffect(() => {
+    if (isQueued) {
+      setLoadedRecordScope(null)
+      return
+    }
+    if (!userId || !recordScope) {
+      recordStateRef.current = 'idle'
+      setLocalRecordState('idle')
+      setLoadedRecordScope(null)
+      return
+    }
+    const persisted = readManualRecordStatus(userId, job.jobId)
+    if (!persisted.available) {
+      recordStateRef.current = 'unknown'
+      setLocalRecordState('unknown')
+    } else if (persisted.status) {
+      recordStateRef.current = persisted.status
+      setLocalRecordState(persisted.status)
+    } else if (jobRecordStatus) {
+      recordStateRef.current = jobRecordStatus
+      setLocalRecordState(jobRecordStatus)
+      writeManualRecordStatus(userId, job.jobId, jobRecordStatus)
+    } else {
+      recordStateRef.current = 'idle'
+      setLocalRecordState('idle')
+    }
+    setLoadedRecordScope(recordScope)
+  }, [isQueued, job.jobId, jobRecordStatus, recordScope, userId])
 
   useEffect(() => {
     if (!isQueued || workerStatus) return
@@ -53,22 +110,22 @@ export function ApplyJobCard({ job, onApplied }: ApplyJobCardProps) {
     }
   }, [isQueued, job.jobId, workerStatus])
 
-  async function handleApply() {
-    if (!job.url || isApplied) return
-    setApplying(true)
-    try {
-      window.open(job.url, '_blank', 'noopener')
-      await new Promise(r => setTimeout(r, 800))
-      await onApplied(job.jobId)
-    } finally {
-      setApplying(false)
-    }
-  }
+  const actions = createApplyJobActions({
+    jobId: job.jobId,
+    jobUrl: job.url,
+    onApplied,
+    openWindow: (url, target, features) => window.open(url, target, features),
+    isCurrentScope: () => activeRecordScopeRef.current === recordScope,
+    getRecordState: () => recordStateRef.current,
+    setRecordState: state => setRecordStateForScope(recordScope, state),
+    readPersistedStatus: () => readManualRecordStatus(userId, job.jobId),
+    writePersistedStatus: status => writeManualRecordStatus(userId, job.jobId, status),
+  })
 
   return (
     <div style={{
       padding: '10px 14px', borderBottom: '0.5px solid var(--border)',
-      opacity: isApplied ? 0.55 : 1, transition: 'opacity 0.3s',
+      opacity: isReported ? 0.7 : 1, transition: 'opacity 0.3s',
     }}>
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
@@ -102,21 +159,39 @@ export function ApplyJobCard({ job, onApplied }: ApplyJobCardProps) {
         <div style={{ flexShrink: 0 }}>
           {isQueued ? (
             <WorkerState status={workerStatus} />
-          ) : isApplied ? (
-            <span style={{ fontSize: 11, color: 'var(--c-success)', fontWeight: 600 }}>✓ {t('agent.delivered')}</span>
+          ) : isReported ? (
+            <span style={{ fontSize: 11, color: 'var(--c-success)', fontWeight: 600 }}>✓ {manualRecordLabel(lang, 'reported')}</span>
           ) : (
-            <button
-              onClick={handleApply}
-              disabled={applying || !job.url}
-              style={{
-                padding: '6px 14px', borderRadius: 7, border: 'none',
-                background: applying ? 'var(--border)' : 'var(--primary)',
-                color: '#fff', fontSize: 11, fontWeight: 600, cursor: applying ? 'not-allowed' : 'pointer',
-                fontFamily: 'inherit',
-              }}
-            >
-              {applying ? '…' : `🚀 ${t('agent.applyNow')}`}
-            </button>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 5 }}>
+              <button
+                onClick={actions.openEmployer}
+                disabled={!job.url}
+                style={{
+                  padding: '6px 14px', borderRadius: 7, border: 'none',
+                  background: 'var(--primary)', color: '#fff', fontSize: 11,
+                  fontWeight: 600, cursor: job.url ? 'pointer' : 'not-allowed', fontFamily: 'inherit',
+                }}
+              >
+                🚀 {t('agent.applyNow')}
+              </button>
+              {recordState === 'idle' ? (
+                <button
+                  onClick={() => void actions.recordSubmitted()}
+                  disabled={!recordStateLoaded}
+                  style={{
+                    padding: '5px 8px', borderRadius: 6, border: '1px solid var(--border)',
+                    background: 'var(--bg-secondary)', color: 'var(--text)', fontSize: 10,
+                    cursor: recordStateLoaded ? 'pointer' : 'not-allowed', fontFamily: 'inherit',
+                  }}
+                >
+                  {manualRecordLabel(lang, 'idle')}
+                </button>
+              ) : (
+                <span style={{ maxWidth: 190, textAlign: 'right', fontSize: 10, color: recordState === 'pending' ? 'var(--primary)' : '#b45309', fontWeight: 600 }}>
+                  {manualRecordLabel(lang, recordState)}
+                </span>
+              )}
+            </div>
           )}
         </div>
       </div>

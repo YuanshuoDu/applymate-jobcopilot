@@ -1,4 +1,5 @@
 import type { TSchema } from "@sinclair/typebox"
+import type { NativeQuestionControlReceipt } from "../turns/native-question-attestation.js"
 import {
   schemaVersion,
   type RepositoryJsonValue,
@@ -106,6 +107,8 @@ export interface ToolExecutionResult {
   readonly status: "completed" | "failed" | "cancelled"
   readonly output?: unknown
   readonly errorCode: string | null
+  /** Private in-process evidence from ToolRouter for the exact built-in ask_user tool. */
+  readonly nativeQuestionReceipt?: NativeQuestionControlReceipt
 }
 
 export interface ToolLifecyclePayload {

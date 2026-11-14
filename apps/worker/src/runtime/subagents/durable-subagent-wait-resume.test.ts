@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
+
+const sourceLifecycle = vi.hoisted(() => ({ reconcile: vi.fn() }))
+vi.mock("./child-resume-source-wait-lifecycle.js", () => ({ reconcileChildWaitSourceLifecycle: sourceLifecycle.reconcile }))
 
 import { commitDurableSubagentWaitResume, loadDurableSubagentWaitResume } from "./durable-subagent-wait-resume.js"
 
@@ -24,7 +27,7 @@ function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinal
   const outcome = { waitId: "wait-1", status: waitStatus, taskIds: options.outcomeTaskIds ?? targetTaskIds, deadlineAt: deadlineAt.toISOString(), matchedTaskIds,
     tasks: snapshotTasks }
   const wait = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", stepId: "step-1",
-    idempotencyKey: "wait-key", targetTaskIds, mode: "any", status: waitStatus, deadlineAt, matchedTaskIds,
+    idempotencyKey: "wait-key", targetTaskIds, mode: "any", status: waitStatus, deadlineAt, resolvedAt: now, matchedTaskIds,
     result: { request: { targetTaskIds, mode, timeoutMs: 5_000 }, outcome }, suspendedAt: now, consumedAt: state.consumedAt }
   wait.mode = mode
   const currentTargets = [
@@ -69,12 +72,17 @@ function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinal
 }
 
 describe("durable child wait resume", () => {
+  beforeEach(() => {
+    sourceLifecycle.reconcile.mockResolvedValue({ state: "waiting", toolCallId: "call-1", callItemId: "item-call-1", resultItemId: "item-result-1" })
+  })
   it("loads the exact resolved outcome and original result item without consuming it", async () => {
     const fake = fixture()
     await expect(loadDurableSubagentWaitResume(fake.pool as never, lease, now)).resolves.toMatchObject({
       waitId: "wait-1", stepId: "step-1", attempt: 3, ordinal: 4, toolCallId: "call-1", sourceItemId: "item-result-1",
       output: { status: "ready", taskIds: ["child-1"] },
     })
+    const waitRead = fake.calls.find(call => call.sql.includes('FROM "agent_wait_conditions"') && call.sql.includes('WHERE "id" IN'))
+    expect(waitRead?.sql).toContain('"resolvedAt"')
     expect(fake.state.consumedAt).toBeNull()
     expect(fake.calls.some(call => call.sql.includes('UPDATE "agent_wait_conditions"'))).toBe(false)
   })
@@ -193,6 +201,21 @@ describe("durable child wait resume", () => {
     await expect(loadDurableSubagentWaitResume(arbitraryRecovery.pool as never, lease, now)).rejects.toMatchObject({ code: "wait_scope_error" })
   })
 
+  it("fences acknowledgement by the current owner after a same-attempt reissue", async () => {
+    const reissuedLease = { ...lease, ownerId: "expired-child-wait-worker-2" }
+    const reissued = fixture({ ownerId: reissuedLease.ownerId })
+    await expect(commitDurableSubagentWaitResume(reissued.pool as never, reissuedLease, { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 5, now }))
+      .resolves.toBe(true)
+
+    sourceLifecycle.reconcile.mockClear()
+    const stale = fixture({ ownerId: reissuedLease.ownerId })
+    const oldLease = { ...lease, ownerId: "expired-child-wait-worker-1" }
+    await expect(commitDurableSubagentWaitResume(stale.pool as never, oldLease, { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 5, now }))
+      .rejects.toMatchObject({ code: "wait_scope_error" })
+    expect(sourceLifecycle.reconcile).not.toHaveBeenCalled()
+    expect(stale.state.acknowledgements).toBe(0)
+  })
+
   it("acknowledges only after the same-attempt next step and immutable waiting receipt exist", async () => {
     const missingStep = fixture({ nextStep: false })
     await expect(commitDurableSubagentWaitResume(missingStep.pool as never, lease, { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 5, now }))
@@ -201,10 +224,16 @@ describe("durable child wait resume", () => {
 
     const fake = fixture()
     await expect(commitDurableSubagentWaitResume(fake.pool as never, lease, { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 5, now })).resolves.toBe(true)
+    const acknowledgedWaitRead = fake.calls.find(call => call.sql.includes('FROM "agent_wait_conditions"')
+      && call.sql.includes('WHERE "id" = $1') && call.sql.includes("FOR UPDATE"))
+    expect(acknowledgedWaitRead?.sql).toContain('"resolvedAt"')
+    expect(sourceLifecycle.reconcile).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(),
+      expect.objectContaining({ resolvedAt: now }), "step-1", expect.anything(), now)
     expect(fake.calls.some(call => call.sql.startsWith('SELECT "id", "userId", "status" FROM "agent_sessions" AS session')
       && call.sql.includes(`session."status" NOT IN ('aborted', 'archived')`))).toBe(true)
     expect(fake.state.consumedAt).toEqual(now)
     expect(fake.state.acknowledgements).toBe(1)
+    expect(sourceLifecycle.reconcile).toHaveBeenCalled()
     expect(fake.calls.some(call => call.sql.includes("outputMatches"))).toBe(false)
     await expect(commitDurableSubagentWaitResume(fake.pool as never, lease, { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 5, now })).resolves.toBe(true)
     expect(fake.state.acknowledgements).toBe(1)

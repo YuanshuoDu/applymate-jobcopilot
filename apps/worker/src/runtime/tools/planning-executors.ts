@@ -9,7 +9,7 @@ import {
   parseTaskGraphPlanningReplacementModes,
   type TaskGraphProposalInput,
 } from "./task-graph-planning-input.js"
-import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
 import type { TaskGraphObjectiveCoverageRejection } from "../planning/task-graph-objective-coverage.js"
 import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
 import type {
@@ -42,7 +42,9 @@ const MIN_CONTINUATION_STEPS = 2
 
 const Id = Type.String({ minLength: 1, maxLength: 256 })
 const TaskStatusSchema = Type.Union([
-  Type.Literal("queued"), Type.Literal("waiting"),
+  Type.Literal("queued"), Type.Literal("waiting"), Type.Literal("running"), Type.Literal("retrying"),
+  Type.Literal("waiting_for_user"), Type.Literal("completed"), Type.Literal("failed"),
+  Type.Literal("interrupted"), Type.Literal("cancelled"), Type.Literal("closed"),
 ])
 const ReceiptSchema = Type.Object({
   status: Type.Union([Type.Literal("accepted"), Type.Literal("duplicate")]),
@@ -70,7 +72,11 @@ function safeCoverageRequirements(value: unknown): readonly TaskGraphObjectiveCo
       || !/^[a-z][a-z0-9._-]{0,63}$/.test(row.id) || row.role !== role
       || !Number.isSafeInteger(row.minimum) || typeof row.minimum !== "number" || row.minimum < 1
       || row.minimum > TASK_GRAPH_VERIFICATION_LIMITS.maxItems) return undefined
-    safe.push({ id: row.id, kind: kind as TaskGraphObjectiveCoverageRejection["kind"], role, minimum: row.minimum })
+    const rejection = kind === "candidate_count_gte"
+      ? { id: row.id, kind: "candidate_count_gte" as const, role: "scout" as const, minimum: row.minimum }
+      : kind === "finding_count_gte" ? { id: row.id, kind: "finding_count_gte" as const, role: "analyst" as const, minimum: row.minimum } : undefined
+    if (!rejection) return undefined
+    safe.push(rejection)
   }
   return safe
 }
@@ -101,7 +107,12 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     && templates.some(([id, template]) => id === "cover_letter_reviewer" && template.role === "reviewer")
     ? " Writer and Reviewer nodes use their specialized gates and omit verification and repairOf. For a selected-job cover letter, plan one cover_letter_writer first. If its completed Reviewer dependency reports needs_revision, you may append exactly one cover_letter_writer directly after that Reviewer in a later plan; do not loop or reuse that review for a second successful revision. A fresh review is required after the revision. Root decides whether to plan this follow-up; the Worker does not schedule it automatically."
     : ""
+  const postGateTemplatesAvailable = templates.some(([id]) => id === "scheduled.application.execute")
+    && templates.some(([id]) => id === "scheduled.post_gate_audit")
   const execute: RuntimeToolDefinition["execute"] = async (context, value) => {
+    if (options.verificationRequirements?.status === "invalid") {
+      throw new ToolExecutionError("task_graph_objective_requirements_invalid", "Canonical objective verification requirements are invalid")
+    }
     const remainingSteps = context.remainingTurnSteps
     if (remainingSteps === undefined || !Number.isSafeInteger(remainingSteps) || remainingSteps < MIN_CONTINUATION_STEPS) {
       // Preserve one root step to establish the durable wait and one to evaluate results after wake.
@@ -139,6 +150,24 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
       "The repair target does not belong to the active root task", { code: "task_graph_repair_root_mismatch" })
     const proposal: TaskGraphProposal = { expectedRevision: input.expectedRevision, nodes: normalizedNodes.nodes }
     try {
+      const hasPostGateNode = proposal.nodes.some(node => node.templateId === "scheduled.application.execute" || node.templateId === "scheduled.post_gate_audit")
+      if (postGateTemplatesAvailable) {
+        const readPostGate = options.commandPort.readScheduledPostGatePlanningContext
+        const appendPostGate = options.commandPort.appendScheduledPostGatePlan
+        if (typeof readPostGate !== "function" || typeof appendPostGate !== "function") {
+          throw new ToolExecutionError("scheduled_post_gate_unavailable", "Scheduled post-Gate planning is unavailable")
+        }
+        const postGate = await readPostGate({ scope })
+        if (postGate.status === "invalid") throw new ToolExecutionError("scheduled_post_gate_proof_invalid", "Scheduled post-Gate proof is invalid")
+        if (postGate.status === "awaiting_plan" || postGate.status === "planned") {
+          if (!hasPostGateNode || input.rootSuccessCriteria !== undefined
+            || modes.replaceUnstarted !== undefined || modes.replaceBranch !== undefined || modes.replaceOperationalFailure !== undefined) {
+            throw new ToolExecutionError("scheduled_post_gate_plan_required", "Use the fixed server-owned post-Gate Execute and Audit plan")
+          }
+          return await appendPostGate({ scope, proposal, operation })
+        }
+        if (hasPostGateNode) throw new ToolExecutionError("scheduled_post_gate_not_ready", "The verified scheduled Gate result is not ready for planning")
+      }
       if (typeof options.commandPort.appendAndScheduleWithReconciliation !== "function") {
         throw new ToolExecutionError("steering_reconciliation_unavailable", "TaskGraph revision requires an atomic reconciliation-capable port")
       }
@@ -166,9 +195,9 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     name: "agent.plan",
     version: "1",
     description: `For non-trivial goals, call agent.plan before executing child work. Optional rootSuccessCriteria adds one to four bounded, untrusted acceptance requirements; the server prepends the complete original human objective as a mandatory criterion. Omitting the field preserves current behavior; it grants no proof, permission, or completion authority.
-Scout and Analyst nodes must include verification {schemaVersion:"${TASK_GRAPH_VERIFICATION_SCHEMA_VERSION}",role,criteria:[{id,check}]}; IDs are stable lowercase identifiers. Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte, findings_from_scout_dependency, findings_cover_scout_candidates_gte, findings_from_scout_union, findings_cover_scout_candidate_union_gte, findings_cover_each_scout_candidates_gte. Use only checks allowed for that role.
+Scout and Analyst nodes must include typed verification criteria with stable lowercase IDs. Use ${TASK_GRAPH_VERIFICATION_SCHEMA_VERSION} for existing checks; use ${TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2} only when a canonical candidate_location_in requirement is present. That check is Scout-only and copies its exact locations from the canonical objective. Allowed checks: candidate_count_gte, candidate_location_in (v2 Scout only), finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte, findings_from_scout_dependency, findings_cover_scout_candidates_gte, findings_from_scout_union, findings_cover_scout_candidate_union_gte, findings_cover_each_scout_candidates_gte. Use only checks allowed for that role.
 findings_from_scout_dependency is Analyst-only and names a direct Scout dependency by dependencyNodeKey. findings_cover_scout_candidates_gte is Analyst-only; use it only when the plan explicitly declares a cohort percentage, with a direct Scout dependency and minimumPercent from 1 to 100. Omitting it preserves normal top-N selection; do not infer a percentage or require processing of every candidate. findings_from_scout_union is Analyst-only and selects 2 to 8 unique direct typed Scout keys; it requires nonempty findings and a nonempty deduplicated candidate union, and every finding must belong to that selected group. findings_cover_scout_candidate_union_gte uses its own selected group and requires nonempty findings and a nonempty deduplicated candidate union; minimumPercent is 1 to 100. Each union criterion selects its own group, and coverage is aggregate across unique candidates; it does not guarantee contribution from each source. findings_cover_each_scout_candidates_gte is Analyst-only and optional; it selects 2 to 8 unique direct typed Scouts and applies the declared 1 to 100 integer minimumPercent independently to each source. Use it only when the goal explicitly requires per-source coverage; do not infer or impose source quotas for a general goal. Every selected source must have candidates; a shared candidate counts for each source that returned it, so this measures candidate-ID coverage rather than distinct source provenance; every finding must belong to the selected union. Coverage uses exact integer cross-multiplication without rounding. Neither coverage check proves score correctness. Never use an unselected Scout to satisfy a criterion. For the canonical scheduled flow, use 2 to 4 direct typed Scouts followed by one Analyst; its membership check must list every direct Scout. Reserve four graph slots for Analyst, Prepare, Gate, and Audit. With maxFanOut=4, propose four Scouts first and append the Analyst in a later plan. Keep every Scout's scheduled roles and locations unchanged; source, page-size, and cursor selectors may differ. The full deduplicated source union is proof metadata up to 200 candidates, while only the explicit Analyst-selected set of at most 50 job IDs is used for Analyze and Prepare. An all-empty multi-Scout union is unsupported.
-A repair uses repairOf={nodeKey,taskId,criterionIds} for a prior typed same-template node; omit graphRootTaskId because the server binds the active Root. A matching legacy graphRootTaskId is accepted, but a mismatch is rejected. Repeat exactly those criteria and checks, and must not add the target to dependsOn; this relation does not pass the target or alter its verdict. successCriteria prose is explanatory and never proof. reported_score_gte checks an Analyst-reported number, not its correctness. ${selectedJobWriterGuidance}
+A repair uses repairOf={nodeKey,taskId,criterionIds} for a prior typed same-template node; omit graphRootTaskId because the server binds the active Root. A matching legacy graphRootTaskId is accepted, but a mismatch is rejected. Repeat exactly the failed or unverified target criteria listed in repairOf.criterionIds, and must not add the target to dependsOn; this relation does not pass the target or alter its verdict. For a Scout target with candidate_location_in checks, also repeat every target location check with its exact criterion ID and normalized locations, even when it passed and is only an inherited guard; if a location check failed or is unverified, include its ID in repairOf.criterionIds. Add no other repair checks. successCriteria prose is explanatory and never proof. reported_score_gte checks an Analyst-reported number, not its correctness. ${selectedJobWriterGuidance}
 When new information changes an unstarted Scout/Analyst approach, refresh the owner-scoped current TaskGraph and current Step agenda; use that graph revision as expectedRevision. For a branch of at least two sources, send replaceBranch: { root: { nodeKey, taskId }, sources: [{ nodeKey, taskId, replacementKey }, ...] }.
 For a server-reported resume_state_unavailable failure on a fixed typed read-only Scout or Analyst, use replaceOperationalFailure: { root: { nodeKey, taskId }, sources: [{ nodeKey, taskId, replacementKey }, ...] }. Include the failed root and its complete transitive descendant closure, even for a failed leaf (one source); propose exactly one fresh same-template typed node per mapping. Only pristine unstarted read-only descendants can be replaced. Preserve each source's successCriteria and exact verification IDs/checks; keep successCriteria canonical and each check's IDs, kinds, thresholds, and aggregations unchanged; you may update its goal. In replacement nodes, remap dependsOn edges, scalar dependencyNodeKey selectors, and each mapped key in dependencyNodeKeys arrays. Preserve selector-array order and references outside the source-to-replacement mapping. The server proves the failure and cancels eligible descendants; never supply a failure reason, status, proof, or claim that the old work passed. Replacements inherit no evidence or authorization, and consumed usage is not refunded.
 For a server-reported execution_deadline_exceeded cue for an eligible started typed Scout or Analyst, you may make the same explicit replaceOperationalFailure proposal. The cue is advisory only and grants no authority; the server independently verifies the current owner, attempt, lifecycle, durable receipt, persisted deadline, and budget before accepting it. The cue itself is not proof. Never supply a failure reason, status, or proof.
@@ -179,7 +208,7 @@ A distinct replan uses a fresh model Step with the current graph and agenda revi
 TaskGraph maxNodes is an eight-node limit on the current graph snapshot, including retained terminal nodes, not a lifetime task-creation cap; it is separate from active-child maxFanOut. At most seven Scout nodes plus one Analyst fit before counting any other retained nodes, so leave capacity for the rest of the graph. Read current owner-scoped task_graph_current.nodeCapacity: remaining is current-snapshot space; ordinaryRemaining is the ordinary-addition budget while reserveActive is true. Existing cumulative Root execution usage and reservations remain in force; canceled work never refunds consumed usage.
 Before the first accepted typed repair, preserve one global final current-snapshot slot for a valid failed-target criterion repair. A proposal containing that exact repair may use the reserve in any node order but must fit remaining; the server validates the current failed target and unresolved criteria. An accepted repair consumes the reserve even while queued or if it later fails; it does not pass a criterion or promise another retry. Refresh current state and use remaining honestly; do not spend the reserve with agent.spawn or agent.followup.
 If agent.plan returns task_graph_repair_conflict, inspect or refresh the current owner-scoped graph. If an overlapping repair is active, wait for it to become terminal and retry only if the criterion remains unresolved and capacity permits; if none is active, correct the rejected batch so each target/criterion has only one proposed attempt. An active repair is not evidence of success.
-Wait for children, inspect their evidence, then replan or complete the goal. Registered templates:
+Wait for children, inspect their evidence, then replan or complete the goal. After the verified scheduled Gate returns, inspect its exact approved job IDs with agent.list and call agent.plan once with one to three Execute nodes carrying exact, disjoint packageRefs that cover every approved job, followed by exactly one required post-Gate Audit depending on every Execute. If Gate approved no jobs, create one Execute with packageRefs:[] and the required Audit. Do not use agent.spawn or agent.followup for this continuation; wait for Execute and Audit, then verify their terminal results before completing. Registered templates:
 ${templateCatalog}`,
     capabilities: ["coordination"],
     inputSchema: buildTaskGraphProposalInputSchema(templateIdSchema, templates),

@@ -1,7 +1,7 @@
 import { Type } from "@sinclair/typebox"
 import { Value } from "@sinclair/typebox/value"
 import { describe, expect, it } from "vitest"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification-contract.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification-contract.js"
 import {
   buildTaskGraphProposalInputSchema,
   normalizeTaskGraphPlanningNodes,
@@ -41,6 +41,45 @@ describe("agent.plan proposal schema construction", () => {
     expect(() => buildTaskGraphProposalInputSchema(Type.String(), [
       ["scout", { role: "analyst", taskType: "job_analysis", allowedActions: [] }],
     ])).toThrow("task_graph_verification_template_role_mismatch")
+  })
+
+  it("accepts a v2 Scout location check while keeping the new check out of v1", () => {
+    const templates = [["scout", { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] }]] as const
+    const schema = buildTaskGraphProposalInputSchema(Type.Literal("scout"), templates)
+    const v2Verification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout" as const,
+      criteria: [{ id: "candidate-location", check: { kind: "candidate_location_in" as const, locations: ["Dublin", "Berlin"] } }],
+    }
+    const node: TaskGraphModelNodeProposal = { key: "scout-locations", templateId: "scout", goal: "Find roles in the requested locations",
+      successCriteria: ["Only report roles with verified locations"], dependsOn: [], verification: v2Verification }
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [node] })).toBe(true)
+    expect(normalizeTaskGraphPlanningNodes([node], "root-task").ok).toBe(true)
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [{ ...node, verification: {
+      ...v2Verification, schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+    } }] })).toBe(false)
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [{ ...node, verification: {
+      ...v2Verification, criteria: [{ ...v2Verification.criteria[0], check: { ...v2Verification.criteria[0].check, extra: true } }],
+    } }] })).toBe(false)
+  })
+
+  it("requires bounded unique Gate package refs only on scheduled Execute proposals", () => {
+    const templates = [
+      ["scheduled.application.execute", { role: "executor", taskType: "scheduled_taskgraph_execute", allowedActions: [] }],
+      ["scheduled.post_gate_audit", { role: "auditor", taskType: "scheduled_taskgraph_post_gate_audit", allowedActions: [] }],
+    ] as const
+    const schema = buildTaskGraphProposalInputSchema(Type.Union(templates.map(([id]) => Type.Literal(id))), templates)
+    const execute = { key: "execute-a", templateId: "scheduled.application.execute", goal: "Prepare the approved package set",
+      successCriteria: ["Return the bounded Execute result"], dependsOn: [], packageRefs: ["job-a", "job-b"] }
+    const audit = { key: "audit", templateId: "scheduled.post_gate_audit", goal: "Audit the completed Execute result",
+      successCriteria: ["Return the audit report"], dependsOn: ["execute-a"] }
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [execute, audit] })).toBe(true)
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [{ ...execute, packageRefs: ["job-a", "job-a"] }, audit] })).toBe(false)
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [{ ...execute, packageRefs: ["x".repeat(257)] }, audit] })).toBe(false)
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [{ ...execute, packageRefs: Array.from({ length: 51 }, (_, index) => `job-${index}`) }, audit] })).toBe(false)
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [{ ...execute, packageRefs: undefined }, audit] })).toBe(false)
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [{ ...audit, packageRefs: ["job-a"] }] })).toBe(false)
+    const normalized = normalizeTaskGraphPlanningNodes([execute] as unknown as readonly TaskGraphModelNodeProposal[], "root")
+    expect(normalized).toEqual({ ok: true, nodes: [{ ...execute }] })
   })
 
   it("accepts only bounded unique Analyst union selectors in the native planning schema", () => {

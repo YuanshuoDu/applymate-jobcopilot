@@ -30,6 +30,8 @@ export { AgentSessionControlActionSchema, AgentSessionControlCommandSchema } fro
 export type { AgentSessionControlAction, AgentSessionControlCommand } from './session-control.js'
 export { AgentTurnSchema, TurnSourceSchema, TurnStatusSchema } from './turn.js'
 export type { AgentTurn, TurnSource, TurnStatus } from './turn.js'
+export { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, TurnIntentSchema } from './turn-intent.js'
+export type { TurnIntent } from './turn-intent.js'
 export { AgentStepSchema, AgentStepUsageSchema, StepStatusSchema } from './step.js'
 export type { AgentStep, AgentStepUsage, StepStatus } from './step.js'
 export {
@@ -105,8 +107,8 @@ export {
   projectTaskEvidencePreview,
 } from './plan-ledger.js'
 export type { PlanLedger, PlanLedgerEvidencePreview, PlanLedgerReadiness, PlanLedgerStatus, TaskGraphSnapshot, TaskGraphSnapshotNode } from './plan-ledger.js'
-export { parseTaskGraphVerificationSummary, projectTaskGraphVerificationSummary, TASK_GRAPH_VERIFICATION_DISPLAY_VERSION } from './plan-ledger-task-graph-verification-display.js'
-export type { TaskGraphVerificationDisplayCheck, TaskGraphVerificationDisplayNode, TaskGraphVerificationSummary } from './plan-ledger-task-graph-verification-display.js'
+export { parseTaskGraphVerificationSummary, projectTaskGraphVerificationSummary, TASK_GRAPH_VERIFICATION_DISPLAY_V2_VERSION, TASK_GRAPH_VERIFICATION_DISPLAY_VERSION } from './plan-ledger-task-graph-verification-display.js'
+export type { TaskGraphVerificationDisplayCheck, TaskGraphVerificationDisplayNode, TaskGraphVerificationDisplayReason, TaskGraphVerificationDisplayVersion, TaskGraphVerificationSummary } from './plan-ledger-task-graph-verification-display.js'
 export type {
   ModelCapabilities,
   ModelContentPart,

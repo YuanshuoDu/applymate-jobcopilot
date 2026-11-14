@@ -40,6 +40,23 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
+  if (typeof body === 'object' && Object.prototype.hasOwnProperty.call(body, 'expectedEmptyDescription')) {
+    const keys = Object.keys(body)
+    const expected = body.expectedEmptyDescription
+    const description = body.description
+    if (keys.length !== 2 || !keys.includes('description')
+      || (expected !== null && (typeof expected !== 'string' || expected.trim() !== ''))
+      || typeof description !== 'string' || !description.trim()) {
+      return err('Provide a non-empty description and the original empty description only', 400)
+    }
+    const updated = await db.job.updateMany({
+      where: { id, userId: auth.userId, description: expected },
+      data: { description },
+    })
+    if (updated.count !== 1) return err('The job description changed. Refresh and review it before trying again.', 409)
+    return ok({ id, userId: auth.userId, description })
+  }
+
   const allowedFields = ['status', 'notes', 'followUpAt', 'salary', 'score', 'url', 'description', 'location', 'keywords']
   const data: Record<string, unknown> = {}
   for (const field of allowedFields) {
@@ -50,10 +67,9 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     return err('Invalid job status')
   }
 
-  if (data.status === 'applied' && !existing.appliedAt) {
-    data.appliedAt = new Date()
-  }
-  if (data.status) data.workflowState = data.status === 'saved' ? 'draft' : 'submitted'
+  // Kanban status is tracking only. A manual submission record is created by
+  // the canonical /apply endpoint after the candidate explicitly confirms it.
+  if (data.status && data.status !== 'applied') data.workflowState = data.status === 'saved' ? 'draft' : 'submitted'
 
   const job = await db.job.update({ where: { id }, data })
 

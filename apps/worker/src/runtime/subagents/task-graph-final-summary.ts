@@ -171,7 +171,7 @@ function count(tasks: readonly SummaryTask[], knownCount: number): TaskGraphSumm
 function validateEnvelope(input: unknown): { graphRevision: number; nodes: SummaryNode[] } {
   const row = record(input)
   if (!row || !exactKeys(row, "graphRevision,nodes") || !Number.isSafeInteger(row.graphRevision) || Number(row.graphRevision) < 0
-    || !denseArray(row.nodes) || row.nodes.length > TASK_GRAPH_LIMITS.maxNodes
+    || !denseArray(row.nodes) || row.nodes.length > TASK_GRAPH_LIMITS.maxPersistedNodes
     || row.graphRevision === 0 && row.nodes.length > 0) throw new Error("task_graph_final_summary_envelope_invalid")
   const nodes = row.nodes.map(value => {
     const node = record(value), hasResult = !!node && Object.hasOwn(node, "structuredResult")

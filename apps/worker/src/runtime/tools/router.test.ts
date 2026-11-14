@@ -7,6 +7,8 @@ import { ToolRegistry } from "./registry.js"
 import { InMemoryToolResultReferenceStore } from "./redaction.js"
 import { ToolRouter, type RuntimePolicyDecisionRecorder } from "./router.js"
 import { ToolExecutionError, type RuntimeToolDefinition } from "./types.js"
+import { createAskUserTool } from "./ask-user.js"
+import { readTrustedNativeQuestionAttestation } from "../turns/native-question-attestation.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
 import { durablePolicyDecisionRecorder } from "../turns/canonical-runtime-tool-recovery.js"
@@ -14,6 +16,11 @@ import type { TurnEngineStore } from "../turns/turn-engine-types.js"
 import type { ToolResultReferenceRepository } from "./tool-result-reference-types.js"
 
 const context = { scope: { userId: "user-a" }, sessionId: "session-a", turnId: "turn-a", stepId: "step-a" }
+const nativeQuestionPolicy = new PolicyEngine({ snapshot: { version: "policy.v1", rules: [{
+  id: "native-question-test", roles: ["orchestrator"], tools: ["agent.ask_user"], toolVersions: ["1"],
+  risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["canManageChildren"],
+  outcome: "allow", reasonCode: "native_question_test", reason: "Allow the built-in native question in this test",
+}] } })
 
 function makeRouter(
   execute: RuntimeToolDefinition["execute"] = async () => ({ result: "ok" }),
@@ -47,6 +54,71 @@ function policyForOutcome(outcome: "allow" | "deny" | "require_approval" | "requ
 const request = { id: "call-1", toolName: "test.read", toolVersion: "1", input: { query: "jobs" } }
 
 describe("ToolRouter", () => {
+  it("returns a private server receipt for a schema-valid native question while preserving lifecycle redaction", async () => {
+    const questionTool = createAskUserTool()
+    const sink = new InMemoryToolLifecycleSink()
+    const router = new ToolRouter(new ToolRegistry([questionTool as RuntimeToolDefinition]),
+      new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore() }), nativeQuestionPolicy)
+    const questionInput = { question: "Which city?", choices: [{ label: "Berlin", value: "berlin" }] }
+    const result = await router.execute({ ...context, taskId: "root-a", rootTaskId: "root-a", actorRole: "orchestrator", capabilities: ["canManageChildren"] },
+      { id: "ask-1", toolName: "agent.ask_user", toolVersion: "1", input: questionInput })
+
+    expect(result.status).toBe("completed")
+    expect(JSON.stringify(result.output)).not.toContain(questionInput.question)
+    expect(JSON.stringify(result.output)).not.toContain("berlin")
+    expect(readTrustedNativeQuestionAttestation(result.nativeQuestionReceipt,
+      { userId: "user-a", sessionId: context.sessionId, turnId: context.turnId, stepId: context.stepId, taskId: "root-a" }, "ask-1", questionInput))
+      .toMatchObject({ toolName: "agent.ask_user", toolCallId: "ask-1", taskId: "root-a" })
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_call", input: { question: "[REDACTED]", choices: [] } })
+    expect(sink.events.at(-1)?.item).toMatchObject({ type: "tool_result", output: result.output })
+    expect(JSON.stringify(sink.events)).not.toContain("Berlin")
+  })
+
+  it("redacts persisted ask_user inputs even when the requested tool version is unsupported", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const router = new ToolRouter(new ToolRegistry([createAskUserTool() as RuntimeToolDefinition]),
+      new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore() }))
+    const privateInput = { question: "Which city should remain private?", choices: [{ label: "Secret label", value: "secret-value" }] }
+    const result = await router.execute(context,
+      { id: "ask-wrong-version", toolName: "agent.ask_user", toolVersion: "2", input: privateInput })
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "tool_version_mismatch" })
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_call", input: { question: "[REDACTED]", choices: [] } })
+    expect(JSON.stringify(sink.events)).not.toContain(privateInput.question)
+    expect(JSON.stringify(sink.events)).not.toContain("Secret label")
+    expect(JSON.stringify(sink.events)).not.toContain("secret-value")
+  })
+
+  it("does not attest a copied ask_user definition even when its output matches the request", async () => {
+    const base = createAskUserTool()
+    const tool = { ...base, execute: async () => ({
+      schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question" as const, stage: "user_input" as const,
+      question: "Which city?", options: [],
+    }) }
+    const router = new ToolRouter(new ToolRegistry([tool as RuntimeToolDefinition]), new ToolLifecycle({ sink: new InMemoryToolLifecycleSink(), references: new InMemoryToolResultReferenceStore() }))
+    const result = await router.execute({ ...context, taskId: "root-a", rootTaskId: "root-a", actorRole: "orchestrator", capabilities: ["canManageChildren"] },
+      { id: "ask-mismatch", toolName: "agent.ask_user", toolVersion: "1", input: { question: "Which city?" } })
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "native_question_receipt_invalid" })
+    expect(result.nativeQuestionReceipt).toBeUndefined()
+  })
+
+  it("rejects a same-name and same-version replacement before its executor can run", async () => {
+    const execute = vi.fn(async () => ({
+      schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question" as const, stage: "user_input" as const,
+      question: "Which city?", options: [],
+    }))
+    const replacement = { ...createAskUserTool(), execute }
+    const router = new ToolRouter(new ToolRegistry([replacement as RuntimeToolDefinition]),
+      new ToolLifecycle({ sink: new InMemoryToolLifecycleSink(), references: new InMemoryToolResultReferenceStore() }))
+    const result = await router.execute({ ...context, taskId: "root-a", rootTaskId: "root-a", actorRole: "orchestrator", capabilities: ["canManageChildren"] },
+      { id: "ask-replacement", toolName: "agent.ask_user", toolVersion: "1", input: { question: "Which city?" } })
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "native_question_receipt_invalid" })
+    expect(result.nativeQuestionReceipt).toBeUndefined()
+    expect(execute).not.toHaveBeenCalled()
+  })
+
   it.each([
     { outcome: "allow" as const, status: "completed", errorCode: null },
     { outcome: "deny" as const, status: "failed", errorCode: "policy_denied" },

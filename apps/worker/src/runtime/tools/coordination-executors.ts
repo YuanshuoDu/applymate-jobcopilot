@@ -29,6 +29,26 @@ import type {
   SpawnSubagentInput,
   WaitSubagentsInput,
 } from "./coordination-tools.js"
+import type { TaskGraphReadScope } from "../subagents/task-graph-command-port.js"
+
+async function assertPostGateChildCreationAllowed(context: ToolExecutionContext, options: CoordinationExecutorOptions): Promise<void> {
+  const native = options.nativeCoordination
+  if (!native?.enabled || !context.taskId || context.taskId !== context.rootTaskId || !context.rootTaskId) return
+  const read = native.commandPort?.readScheduledPostGatePlanningContext
+  if (typeof read !== "function") return
+  const attempt = native.parentAttemptCount()
+  if (!Number.isSafeInteger(attempt) || typeof attempt !== "number" || attempt < 1) {
+    throw new CoordinationError("coordination_task_graph_scope_unavailable", "The active Root task fence is unavailable")
+  }
+  const scope: TaskGraphReadScope = { userId: context.scope.userId, sessionId: context.sessionId, turnId: context.turnId,
+    rootTaskId: context.rootTaskId, parentTaskId: context.rootTaskId, turnLeaseOwner: native.turnLeaseOwner,
+    turnLeaseVersion: native.turnLeaseVersion, parentLeaseOwner: native.parentLeaseOwner, parentAttemptCount: attempt }
+  const state = await read({ scope })
+  if (state.status === "awaiting_plan" || state.status === "planned" || state.status === "invalid") {
+    throw new CoordinationError("coordination_scheduled_post_gate_plan_required",
+      "Use the verified scheduled post-Gate agent.plan continuation; direct spawn and follow-up are unavailable")
+  }
+}
 function expectedOutputSchema(value: unknown, role: string): { readonly schemaVersion: typeof ROLE_RESULT_SCHEMA; readonly role: "scout" | "analyst" } | undefined {
   if (value === undefined) return undefined
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new CoordinationError("coordination_invalid_input", "Invalid delegate output schema marker")
@@ -41,6 +61,7 @@ function managerKey(value: string | undefined): string {
   return value
 }
 export async function executeSpawn(context: ToolExecutionContext, input: SpawnSubagentInput, options: CoordinationExecutorOptions) {
+  await assertPostGateChildCreationAllowed(context, options)
   assertRootChildCreationUsesCoveragePlan(context, options.verificationRequirements)
   const policy = typeof input.role === "string" ? getSubagentRolePolicy(input.role) : null
   if (!isHarnessSubagentRole(input.role) || !policy || policy.actorRole !== "subagent" || policy.canManageChildren || policy.externalWritesEnabled) throw new CoordinationError("coordination_invalid_input", "Unsupported subagent role")
@@ -126,13 +147,13 @@ export async function executeSendMessage(context: ToolExecutionContext, input: S
   await activity(context, options, "send_message", target.id, { kind: input.kind, duplicate: result.duplicate }, input.idempotencyKey)
   return { messageId: result.message.id, taskId: target.id, status: result.duplicate ? "duplicate" as const : "queued" as const }
 }
-export function executeFollowup(context: ToolExecutionContext, input: FollowupInput, options: CoordinationExecutorOptions) {
+export async function executeFollowup(context: ToolExecutionContext, input: FollowupInput, options: CoordinationExecutorOptions) {
+  await assertPostGateChildCreationAllowed(context, options)
   assertRootChildCreationUsesCoveragePlan(context, options.verificationRequirements)
   if (!("mode" in input) && !plannerEnabledRoot(context, options.nativeCoordination?.enabled === true)) {
-    return followupSource(context, input.taskId, options).then(source => {
+    const source = await followupSource(context, input.taskId, options)
       if (source.role === APPLICATION_FILLER_ROLE) throw new CoordinationError("coordination_invalid_input", "Application filler follow-up is only allowed through TaskGraph")
-      return runFollowup(context, input, options)
-    })
+    return runFollowup(context, input, options)
   }
   return runFollowup(context, input, options)
 }

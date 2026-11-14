@@ -164,6 +164,10 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
     expires: '2099-01-01T00:00:00.000Z',
   }))
   await page.route('**/api/me', route => json(route, { id: 'agent-supervisor-fixture', email: 'fixture@applymate.local', name: 'Fixture', plan: 'pro', onboardedAt: times.created }))
+  await page.route('**/api/me/agent-search-footprint-memory', route => {
+    if (route.request().method() === 'GET') return json(route, { enabled: false, version: 0 })
+    return json(route, { error: 'method_not_allowed' }, 405)
+  })
   await page.route('**/api/me/agent-task-history-memory', async route => {
     if (route.request().method() === 'GET') return json(route, fixture.historyMemoryConsent)
     if (route.request().method() !== 'POST') return json(route, { error: 'method_not_allowed' }, 405)

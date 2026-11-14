@@ -12,6 +12,10 @@ import type { ResumeContent, Resume, ResumeListItem, Direction } from '@/lib/typ
 interface Props {
   onClose:      () => void
   onSaved:      (resume: Resume) => void
+  onBeginSave?: () => boolean
+  onEndSave?:   (succeeded: boolean) => void
+  saveBlocked?: boolean
+  settleSave?: (operation: Promise<{ data: Resume | null; error: string | null }>) => Promise<{ data: Resume | null; error: string | null }>
   directions:   Direction[]
   initialDirId?: string | null
   initialFile?:  File | null
@@ -22,11 +26,12 @@ type Stage   = 'idle' | 'uploading' | 'extracting' | 'parsing' | 'preview' | 'er
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirections, initialDirId, initialFile }: Props) {
+export function ResumeIntakeDialog({ onClose, onSaved, onBeginSave, onEndSave, saveBlocked = false, settleSave, directions: initialDirections, initialDirId, initialFile }: Props) {
   const { t } = useI18n()
   const toast = useToast()
   const inputRef = useRef<HTMLInputElement>(null)
   const processedInitialFileRef = useRef<File | null>(null)
+  const savingRef = useRef(false)
 
   const [activeTab,      setActiveTab]      = useState<TabId>('upload')
   const [stage,          setStage]          = useState<Stage>('idle')
@@ -212,28 +217,34 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
   // ── Save ───────────────────────────────────────────────────────────────────
 
   async function handleSave() {
-    if (!mergedContent) return
+    if (!mergedContent || (onBeginSave && savingRef.current) || saveBlocked || (onBeginSave && !onBeginSave())) return
+    if (onBeginSave) savingRef.current = true
     setSaving(true)
 
     const resumeName = mergedContent.contact.name
       ? `${mergedContent.contact.name} — ${selectedDirName || 'General'}`
       : 'Imported Resume'
 
-    const { data, error } = await apiMutate<Resume>('/api/resume', 'POST', {
+    const request = apiMutate<Resume>('/api/resume', 'POST', {
       name:        resumeName,
       content:     mergedContent,
       directionId: selectedDirId,
       kind:        'base',
       origin:      activeTab === 'upload' ? 'upload' : 'paste',
     })
+    const { data, error } = await (settleSave ? settleSave(request) : request)
 
-    setSaving(false)
     if (data) {
       onSaved(data)
       onClose()
+    } else if (settleSave) {
+      toast.warning(t('resume.entryWriteUncertainTitle'), t('resume.entryWriteUncertain'))
     } else {
       toast.error('Save failed', error ?? 'Could not save resume')
     }
+    onEndSave?.(Boolean(data))
+    savingRef.current = false
+    setSaving(false)
   }
 
   // ── Reset ──────────────────────────────────────────────────────────────────
@@ -548,10 +559,11 @@ export function ResumeIntakeDialog({ onClose, onSaved, directions: initialDirect
             {/* Footer */}
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center' }}>
               <Btn small variant="ghost" onClick={onClose} disabled={saving}>{t('common.cancel')}</Btn>
-              <Btn small variant="primary" onClick={handleSave} disabled={saving}>
+              <Btn small variant="primary" onClick={handleSave} disabled={saving || saveBlocked}>
                 {saving ? t('common.saving') : t('resume.intake.saveBtn')}
               </Btn>
             </div>
+            {saveBlocked && <p role="status">{t('resume.entryWriteUncertain')}</p>}
           </div>
         )}
       </div>

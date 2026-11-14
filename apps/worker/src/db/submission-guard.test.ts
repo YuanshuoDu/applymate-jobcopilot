@@ -67,6 +67,17 @@ describe("submission guard", () => {
     expect(release).toHaveBeenCalledOnce();
   });
 
+  it("rejects a child-task-bound approval before mutating the application task or Job", async () => {
+    const { pool, query } = poolWith({ rowCount: 0, rows: [] });
+
+    await expect(claimUnattendedSubmission(pool, identity, "bull-1")).resolves.toBe("unavailable");
+    const approvalCall = query.mock.calls.find(([sql]) => String(sql).includes('FROM "agent_approvals"'));
+    expect(String(approvalCall?.[0])).toContain('"taskId" = $5');
+    expect(approvalCall?.[1]?.[4]).toBe(identity.applicationTaskId);
+    expect(query.mock.calls.some(([sql]) => String(sql).includes('UPDATE "application_tasks"'))).toBe(false);
+    expect(query.mock.calls.some(([sql]) => String(sql).includes('UPDATE "Job"'))).toBe(false);
+  });
+
   it("does not reset a duplicate claim or touch the Job after its task is claimed", async () => {
     const { pool, query } = poolWith(
       { rowCount: 1, rows: [{ id: "approval-1" }] },
@@ -191,5 +202,22 @@ describe("submission guard", () => {
 
     expect(query).not.toHaveBeenCalledWith(expect.stringContaining('UPDATE "Job"'), expect.anything());
     expect(appendFencedSubmitAudit).toHaveBeenCalledOnce();
+  });
+
+  it("compares expected Job workflow states as text for the PostgreSQL enum column", async () => {
+    const { pool, query } = poolWith({ rowCount: 1, rows: [] });
+
+    await expect(updateJobForSubmission(
+      pool,
+      identity,
+      { status: "submitted", workflowState: "submitted", applied: true, expectedWorkflowStates: ["submitting", "submitted"] },
+      "late_submit_result",
+    )).resolves.toEqual({ kind: "current", value: true });
+
+    const jobUpdate = query.mock.calls.find(([sql]) => String(sql).includes('UPDATE "Job" SET status'));
+    expect(jobUpdate?.[0]).toContain('"workflowState"::text = ANY($6::text[])');
+    expect(jobUpdate?.[1]).toEqual([
+      "submitted", "submitted", true, "job-1", "user-1", ["submitting", "submitted"],
+    ]);
   });
 });

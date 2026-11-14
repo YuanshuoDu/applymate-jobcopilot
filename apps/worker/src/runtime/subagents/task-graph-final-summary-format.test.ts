@@ -87,6 +87,23 @@ describe("TaskGraph final-summary formatter", () => {
     expect(notRequestedText).not.toContain("prepared=0")
   })
 
+  it("reads Prepare result lists up to the eleven-node persisted graph limit", () => {
+    const prepareResults = Array.from({ length: 11 }, (_, index) => ({
+      taskId: `prepare-${index}`, attemptCount: 1, resultStatus: "completed" as const,
+      snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64), jobs: [],
+    }))
+    const base = summary()
+    const complete: TaskGraphFinalSummary = {
+      ...base, prepareResults,
+      counts: { ...base.counts, prepareJobs: { knownCount: 0, coverage: "complete" } },
+    }
+    expect(formatTaskGraphFinalSummary(complete)).toContain("prepared=0, skipped=0, failed=0.")
+    expect(formatTaskGraphFinalSummary({ ...complete, prepareResults: [...prepareResults, {
+      taskId: "prepare-overflow", attemptCount: 1, resultStatus: "completed",
+      snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64), jobs: [],
+    }] })).toContain("Prepare status breakdown unavailable.")
+  })
+
   it("fails closed for malformed Prepare status rows and inconsistent observed totals", () => {
     const valid = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [
       prepareNode("prepare-valid", [{ jobId: "job-1", status: "prepared" }]),

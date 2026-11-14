@@ -5,11 +5,13 @@ import { isSelectedJobRootTool, loadTaskGraphCurrentObservation, mergeTaskGraphC
 import type { TaskGraphCommandPort } from "./subagents/task-graph-command-port.js"
 import type { TaskGraphCurrentNode, TaskGraphCurrentState, TaskGraphVerificationReport } from "./subagents/task-graph-command-port.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./subagents/task-graph-command-port.js"
+import { taskGraphResultProjectionBytes, taskGraphResultProjectionItems } from "./canonical-turn-task-graph-node-projection.js"
 import { StepContextBuilder, type StepContextSnapshot } from "./context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction } from "./context/input-claim-store.js"
 import { buildModelRequest } from "./turns/turn-engine-messages.js"
 import type { TurnLease } from "./turns/lease.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./subagents/task-graph-pg-verification.js"
+import { TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION } from "./subagents/task-graph-verification-report.js"
 import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "./subagents/task-graph-child-deadline.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "./subagents/task-graph-command-port.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./turns/completion-recovery-context.js"
@@ -835,6 +837,51 @@ describe("TaskGraph turn observation", () => {
       .toThrow("task_graph_current_verification_too_large")
   })
 
+  it("projects only the exact redacted empty-Analyst v2 report as an untrusted current observation", () => {
+    const scoutVerification: TaskGraphVerificationContract = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] }
+    const analystVerification: TaskGraphVerificationContract = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+      { id: "source-coverage", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 100 } },
+      { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+    ] }
+    const scoutReport = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) } as const
+    const publicReport = { verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+      criteria: [
+        { criterionId: "source-coverage", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met" },
+      ], evidenceDigest: "c".repeat(64), resultDigest: "d".repeat(64) } as const
+    const sourceNode = (key: string, taskId: string) => ({
+      ...state.nodes[0]!, key, taskId, templateId: "scout", dependsOn: [], status: "completed" as const, readiness: "terminal" as const,
+      verificationCriterionIds: ["candidate-count"], verification: scoutVerification, verificationReport: scoutReport,
+    })
+    const analystNode = {
+      ...state.nodes[0]!, key: "analysis", taskId: "task-analyst", templateId: "analyst", dependsOn: ["scout-a", "scout-b"],
+      status: "failed" as const, readiness: "terminal" as const,
+      verificationCriterionIds: ["source-coverage", "finding-count"], verification: analystVerification, verificationReport: publicReport,
+    }
+    const current = { revision: 9, nodes: [sourceNode("scout-a", "task-scout-a"), sourceNode("scout-b", "task-scout-b"), analystNode] } as TaskGraphCurrentState
+    const merged = mergeTaskGraphCurrentObservation(snapshot(), current)
+    const observation = merged.toolObservations.find(item => item.id === "task-graph-current")?.content as { nodes: Array<Record<string, unknown>> }
+    const projected = observation.nodes.find(node => node.key === "analysis")!
+    const report = projected.verificationReport as Record<string, unknown>
+    expect(report).toEqual(publicReport)
+    expect(Object.keys(report).sort()).toEqual(["criteria", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion"])
+    expect(JSON.stringify(report)).not.toContain("dependencyBindings")
+    expect(JSON.stringify(report)).not.toContain("task-scout-a")
+    expect(JSON.stringify(report)).not.toContain("task-scout-b")
+
+    const reject = (verificationReport: unknown) => mergeTaskGraphCurrentObservation(snapshot(), {
+      ...current, nodes: [current.nodes[0]!, current.nodes[1]!, { ...analystNode, verificationReport } as never],
+    })
+    expect(() => reject({ ...publicReport, dependencyBindings: [] })).toThrow("task_graph_current_state_invalid:verification")
+    expect(() => reject({ ...publicReport, unexpected: true })).toThrow("task_graph_current_state_invalid:verification")
+    expect(() => reject({ ...publicReport, status: "passed" })).toThrow("task_graph_current_state_invalid:verification")
+    expect(() => reject({ ...publicReport, reasonCode: "reported_score_below_minimum" })).toThrow("task_graph_current_state_invalid:verification")
+    expect(() => mergeTaskGraphCurrentObservation(snapshot(), { ...current,
+      nodes: [current.nodes[0]!, current.nodes[1]!, { ...analystNode, templateId: "scout" } as never],
+    })).toThrow("task_graph_current_state_invalid:verification")
+  })
   it("keeps repair receipts separate and bound to a passing repair report", () => {
     const report = { ...state.nodes[0]!.verificationReport!, status: "passed" as const, reasonCode: "criteria_met" as const, criteria: [{ criterionId: "candidate-count", status: "passed" as const, reasonCode: "criteria_met" as const }], evidenceDigest: "b".repeat(64) }
     const repairOf = { graphRootTaskId: "root-1", nodeKey: "original", taskId: "target-1", criterionIds: ["candidate-count"] }
@@ -1024,23 +1071,19 @@ describe("TaskGraph turn observation", () => {
       artifactReferences: { knownCount: null, coverage: "not_requested" },
       reviewOutcomes: { knownCount: null, coverage: "not_requested" },
     }
-    const nodes = Array.from({ length: 9 }, (_, index) => ({
-      ...state.nodes[0]!,
-      key: "research-" + index,
-      taskId: "child-" + index,
-      resultProjection: {
-        schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA,
-        trust: "untrusted" as const,
-        availability: "available" as const,
-        role: "scout" as const,
-        status: "completed" as const,
-        candidateCount: 3,
-        evidenceCount: 3,
-        candidates: Array.from({ length: 3 }, (_, item) => ({
-          jobId: "job-" + index + "-" + item, source: "greenhouse" as const, evidenceKinds: ["job" as const],
-        })),
-      },
-    } as never))
+    const nodes = Array.from({ length: 9 }, (_, index) => {
+      const ordinary = { ...state.nodes[0]!, key: "research-" + index, taskId: "child-" + index,
+        resultProjection: {
+          schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted" as const, availability: "available" as const,
+          role: "scout" as const, status: "completed" as const, candidateCount: 3, evidenceCount: 3,
+          candidates: Array.from({ length: 3 }, (_, item) => ({
+            jobId: "job-" + index + "-" + item, source: "greenhouse" as const, evidenceKinds: ["job" as const],
+          })),
+        } }
+      delete ordinary.verificationCriterionIds
+      delete ordinary.verificationReport
+      return ordinary
+    })
     const result = mergeTaskGraphCurrentObservation(snapshot(), {
       ...state, nodes, planningFacts: { graphRevision: 3, counts },
     } as unknown as TaskGraphCurrentState)
@@ -1053,5 +1096,82 @@ describe("TaskGraph turn observation", () => {
     expect(observation.nodes.slice(0, 8).every(node => node.resultProjection.availability === "available")).toBe(true)
     expect(observation.nodes[8]?.resultProjection.availability).toBe("unavailable")
     expect(JSON.stringify(observation).length).toBeLessThan(160_000)
+  })
+
+  it.each(["failed", "unverified"] as const)("prioritizes a late %s node's evidence within the unchanged projection budgets", async status => {
+    const successfulPredecessors = Array.from({ length: 8 }, (_, index) => {
+      const ordinary = { ...state.nodes[0]!, key: `success-${index}`, taskId: `success-task-${index}`,
+        status: "completed" as const, readiness: "terminal" as const,
+        resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted" as const,
+          availability: "available" as const, role: "scout" as const, status: "completed" as const,
+          candidateCount: 3, evidenceCount: 3, candidates: Array.from({ length: 3 }, (_, item) => ({
+            jobId: `success-${index}-${item}`, source: "greenhouse" as const, evidenceKinds: ["job" as const],
+          })) } }
+      delete ordinary.verificationCriterionIds
+      delete ordinary.verificationReport
+      return ordinary
+    })
+    const reasonCode = status === "failed" ? "criterion_not_met" as const : "canonical_evidence_missing" as const
+    const failure = { ...state.nodes[0]!, key: "late-failed-node", taskId: "late-failed-task",
+      status: "failed" as const, readiness: "terminal" as const, verification: currentScoutVerification,
+      verificationCriterionIds: currentScoutVerification.criteria.map(criterion => criterion.id),
+      verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status, reasonCode,
+        criteria: currentScoutVerification.criteria.map(criterion => ({ criterionId: criterion.id,
+          status: status === "failed" ? "failed" as const : "unverified" as const, reasonCode })),
+        evidenceDigest: status === "failed" ? "a".repeat(64) : null, resultDigest: status === "failed" ? "b".repeat(64) : null },
+      resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted" as const,
+        availability: "available" as const, role: "scout" as const, status: "partial" as const,
+        candidateCount: 1, evidenceCount: 1,
+        candidates: [{ jobId: "repair-evidence-job", source: "greenhouse" as const, evidenceKinds: ["job" as const] }] } }
+    const input: TaskGraphCurrentState = { revision: 11, nodes: [...successfulPredecessors, failure] as never }
+    const before = JSON.stringify(input)
+    const merged = mergeTaskGraphCurrentObservation(snapshot(), input)
+    const observation = merged.toolObservations.at(-1)?.content as { revision: number; nodes: Array<{
+      key: string; resultProjection: NonNullable<TaskGraphCurrentNode["resultProjection"]>
+    }> }
+    const visible = observation.nodes.filter(item => item.resultProjection.availability === "available")
+    const totalItems = visible.reduce((total, item) => total + taskGraphResultProjectionItems(item.resultProjection), 0)
+    const totalBytes = visible.reduce((total, item) => total + taskGraphResultProjectionBytes(item.resultProjection), 0)
+
+    expect(observation.revision).toBe(input.revision)
+    expect(observation.nodes.map(item => item.key)).toEqual(input.nodes.map(item => item.key))
+    expect(observation.nodes[8]?.resultProjection).toMatchObject({ availability: "available", candidates: [
+      { jobId: "repair-evidence-job", source: "greenhouse", evidenceKinds: ["job"] },
+    ] })
+    expect(observation.nodes.slice(0, 7).every(item => item.resultProjection.availability === "available")).toBe(true)
+    expect(observation.nodes[7]?.resultProjection.availability).toBe("unavailable")
+    expect(totalItems).toBeLessThanOrEqual(24)
+    expect(totalBytes).toBeLessThanOrEqual(16 * 1024)
+    expect(JSON.stringify(input)).toBe(before)
+    const request = await selectedJobModelRequest(merged)
+    expect(request.messages.flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n"))
+      .toContain("repair-evidence-job")
+  })
+
+  it("keeps stable order when validated failed and unverified projections exceed capacity", () => {
+    const nodes = Array.from({ length: 9 }, (_, index) => {
+      const status = index % 2 === 0 ? "failed" as const : "unverified" as const
+      const reasonCode = status === "failed" ? "criterion_not_met" as const : "canonical_evidence_missing" as const
+      return { ...state.nodes[0]!, key: `priority-${index}`, taskId: `priority-task-${index}`,
+        status: "failed" as const, readiness: "terminal" as const, verification: currentScoutVerification,
+        verificationCriterionIds: currentScoutVerification.criteria.map(criterion => criterion.id),
+        verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status, reasonCode,
+          criteria: currentScoutVerification.criteria.map(criterion => ({ criterionId: criterion.id,
+            status: status === "failed" ? "failed" as const : "unverified" as const, reasonCode })),
+          evidenceDigest: status === "failed" ? "c".repeat(64) : null, resultDigest: status === "failed" ? "d".repeat(64) : null },
+        resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted" as const,
+          availability: "available" as const, role: "scout" as const, status: "partial" as const,
+          candidateCount: 3, evidenceCount: 3, candidates: Array.from({ length: 3 }, (_, item) => ({
+            jobId: `priority-${index}-evidence-${item}`, source: "greenhouse" as const, evidenceKinds: ["job" as const],
+          })) } }
+    })
+    const result = mergeTaskGraphCurrentObservation(snapshot(), { revision: 12, nodes: nodes as never })
+    const observation = result.toolObservations.at(-1)?.content as { nodes: Array<{
+      key: string; resultProjection: { availability: string }
+    }> }
+
+    expect(observation.nodes.map(item => item.key)).toEqual(nodes.map(item => item.key))
+    expect(observation.nodes.slice(0, 8).every(item => item.resultProjection.availability === "available")).toBe(true)
+    expect(observation.nodes[8]?.resultProjection.availability).toBe("unavailable")
   })
 })

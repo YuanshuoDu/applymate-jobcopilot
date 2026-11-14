@@ -1,5 +1,6 @@
 import type pg from "pg"
 import type { RuntimePolicyDecision } from "@jobcopilot/agent-policy"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 import type { TurnLease } from "./turns/lease.js"
 import type { TurnEngineStore } from "./turns/turn-engine-types.js"
 import type { TurnExecutionResult } from "./turns/turn-queue.js"
@@ -22,7 +23,7 @@ import type { RootTaskStore } from "./subagents/root-task-store.js"
 import { createWorkerToolRuntime } from "./tools/index.js"
 import { registerTaskGraphPlanningTool } from "./tools/planning-executors.js"
 import { assertCanonicalCoordinationSurface, assertCanonicalQuestionSurface, isNativeQuestionWaitEnabled } from "./turns/canonical-runtime-tool-recovery.js"
-import { failInteractiveDiscoveryUnavailable } from "./interactive-discovery-runtime.js"
+import { failInteractiveDiscoveryUnavailable, failObjectiveTaskGraphUnavailable, objectiveTaskGraphRootToolAllowed } from "./interactive-discovery-runtime.js"
 import { INTERACTIVE_DISCOVERY_TEMPLATES, rootTaskAllowedActions, rootToolSurface } from "./interactive-discovery-contract.js"
 import { isSelectedJobRootTool } from "./canonical-turn-task-graph-context.js"
 import { toolSafeDurableWaitPort } from "./tools/coordination-executor-support.js"
@@ -41,6 +42,7 @@ type RootTask = Awaited<ReturnType<RootTaskStore["ensure"]>>
 export type CanonicalTurnSetup = {
   readonly state: CanonicalTurnState
   readonly interactiveDiscoveryMode: boolean
+  readonly objectiveTaskGraphMode: boolean
   readonly taskGraphPlanningEnabled: boolean
   readonly selectedJobMode: boolean
   readonly scheduledDraftMode: boolean
@@ -102,6 +104,8 @@ export async function prepareCanonicalTurnSetup(input: {
   const durableWaitPort = createPgDurableWaitPort(pool)
   const state = await (options.stateLoader?.(pool, lease, now(), { consumeWaitOutcomes: input.consumeWaitOutcomes, durableWaitControlReader: durableWaitPort })
     ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: input.consumeWaitOutcomes, durableWaitControlReader: durableWaitPort }))
+  const objectiveTaskGraphMode = state.intent?.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind
+    && state.intent.version === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version
   const graph = await taskGraphRuntimeForTurn({
     enabled: options.productionFlags?.taskGraphPlanningEnabled === true && input.coordinationEnabled,
     pool, lease, now, turnSource: state.source, automationRunMode: state.automationRunMode, turnInput: state.turnInput,
@@ -109,6 +113,10 @@ export async function prepareCanonicalTurnSetup(input: {
     applicationFillPreparationLoader: options.applicationFillPreparationLoader,
     taskGraphTemplates: options.taskGraphTemplates,
   })
+  if (objectiveTaskGraphMode && (!graph.enabled || !input.childExecutionEnabled || !input.coordinationEnabled || !input.consumeWaitOutcomes
+    || !options.taskGraphCommandPort || !graph.templates || Object.keys(graph.templates).length === 0 || !rootTasks.checkCompletion) && !signal.aborted) {
+    return { earlyResult: await failObjectiveTaskGraphUnavailable({ lease, state, rootTasks, executionProjection, sessionProjection, now }) }
+  }
   if (state.source === "automation" && state.automationRunMode === "scheduled"
     && (!graph.enabled || !input.childExecutionEnabled || !input.coordinationEnabled || !input.consumeWaitOutcomes) && !signal.aborted) {
     const result = { status: "failed" as const, errorCode: "scheduled_task_graph_unavailable", stepCount: 0, toolCallCount: 0 }
@@ -168,14 +176,16 @@ export async function prepareCanonicalTurnSetup(input: {
   if (input.coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities)
   if (nativeQuestionWaitEnabled) assertCanonicalQuestionSurface(toolRuntime.registry, toolCapabilities)
   const rootTools = rootToolSurface(toolRuntime.registry.list(toolCapabilities), graph.selectedJobMode, interactiveDiscoveryMode, isSelectedJobRootTool)
+    .filter(value => !objectiveTaskGraphMode || objectiveTaskGraphRootToolAllowed(value))
     .filter(value => verificationRequirements.status !== "valid" || !["agent.spawn", "spawn_subagent", "agent.followup"].includes(String(record(value).name ?? "")))
-  const allowedActions = addScheduledPrepareActions(rootTaskAllowedActions(rootTools, turnTaskGraphTemplates, graph.enabled), state, graph.enabled)
+  const allowedActions = objectiveTaskGraphMode ? rootTaskAllowedActions(rootTools, undefined, false)
+    : addScheduledPrepareActions(rootTaskAllowedActions(rootTools, turnTaskGraphTemplates, graph.enabled), state, graph.enabled)
   const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot,
     toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions, now: now() })
   lifecycle.taskGraphParentAttemptCount = root.attemptCount
   turnCoordination.bindRoot(root)
   return {
-    state, interactiveDiscoveryMode, taskGraphPlanningEnabled: graph.enabled, selectedJobMode: graph.selectedJobMode, scheduledDraftMode: graph.scheduledDraftMode,
+    state, interactiveDiscoveryMode, objectiveTaskGraphMode, taskGraphPlanningEnabled: graph.enabled, selectedJobMode: graph.selectedJobMode, scheduledDraftMode: graph.scheduledDraftMode,
     selectedJobPreparation: graph.selectedJobPreparation, taskGraphTemplateRoles, turnCoordination, nativeQuestionWaitEnabled, toolCapabilities,
     durableWaitPort, lifecycle, toolRuntime, rootTools, root,
   }

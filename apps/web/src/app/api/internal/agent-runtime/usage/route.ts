@@ -5,15 +5,18 @@ import { resolveAiAccess } from "@/lib/entitlements"
 import { db } from "@/lib/db"
 import {
   admitAiUsage,
+  startAiUsage,
   settleAiUsage,
   UsageBrokerError,
   type UsageAdmissionInput,
+  type UsageStartInput,
   type UsageSettlementInput,
 } from "@/lib/agent/control-plane/usage-broker"
 import type { UsageExecutionOwner } from "@/lib/agent/control-plane/usage-owner-fence"
 
 type RequestBody =
   | { operation: "authorize"; input: UsageAdmissionInput }
+  | { operation: "start"; input: UsageStartInput }
   | { operation: "release"; input: UsageAdmissionInput }
   | { operation: "settle"; input: UsageSettlementInput }
 
@@ -30,8 +33,8 @@ function text(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= 512
 }
 
-function finite(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
+function nullableUsage(value: unknown, integer: boolean): value is number | null {
+  return value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0 && (!integer || Number.isSafeInteger(value)))
 }
 
 type ParsedOwner =
@@ -64,20 +67,40 @@ function parseOwner(input: Record<string, unknown>): ParsedOwner | null {
 
 function parseInput(value: unknown): RequestBody | null {
   const row = record(value)
-  if (!row || (row.operation !== "authorize" && row.operation !== "settle" && row.operation !== "release")) return null
+  if (!row || (row.operation !== "authorize" && row.operation !== "start" && row.operation !== "settle" && row.operation !== "release")) return null
   const input = record(row.input)
   if (!input || !text(input.userId) || !text(input.provider) || !text(input.model)) return null
+  if (row.operation === "start") {
+    const owner = parseOwner(input)
+    if (!text(input.operationId) || input.startProtocolVersion !== 1 || !text(input.sessionId) || !text(input.turnId) || !text(input.stepId) || !text(input.featureKey) || !owner ||
+        (Object.prototype.hasOwnProperty.call(input, "requestedOutputTokens") &&
+          (!Number.isSafeInteger(input.requestedOutputTokens) || Number(input.requestedOutputTokens) < 1 || Number(input.requestedOutputTokens) > 2_147_483_647))) return null
+    return { operation: "start", input: {
+      operationId: input.operationId, userId: input.userId, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId, ...owner,
+      featureKey: input.featureKey, provider: input.provider, model: input.model,
+      startProtocolVersion: 1,
+      ...(text(input.attemptId) ? { attemptId: input.attemptId } : {}),
+      ...(Object.prototype.hasOwnProperty.call(input, "requestedOutputTokens") ? { requestedOutputTokens: Number(input.requestedOutputTokens) } : {}),
+    } }
+  }
   if (row.operation === "authorize" || row.operation === "release") {
     const owner = parseOwner(input)
-    if (!text(input.sessionId) || !text(input.turnId) || !text(input.stepId) || !text(input.featureKey) || !owner) return null
+    if ((Object.prototype.hasOwnProperty.call(input, "startProtocolVersion") && input.startProtocolVersion !== 1) ||
+        !text(input.sessionId) || !text(input.turnId) || !text(input.stepId) || !text(input.featureKey) || !owner) return null
+    if (Object.prototype.hasOwnProperty.call(input, "requestedOutputTokens") &&
+        (!Number.isSafeInteger(input.requestedOutputTokens) || Number(input.requestedOutputTokens) < 1 || Number(input.requestedOutputTokens) > 2_147_483_647)) return null
     return { operation: row.operation, input: {
       userId: input.userId, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId, ...owner,
       featureKey: input.featureKey,
       provider: input.provider, model: input.model, ...(text(input.attemptId) ? { attemptId: input.attemptId } : {}),
+      ...(input.startProtocolVersion === 1 ? { startProtocolVersion: 1 as const } : {}),
+      ...(Object.prototype.hasOwnProperty.call(input, "requestedOutputTokens") ? { requestedOutputTokens: Number(input.requestedOutputTokens) } : {}),
     } }
   }
   if (!text(input.operationId) || (input.status !== "success" && input.status !== "error") ||
-      !finite(input.inputTokens) || !finite(input.outputTokens) || !finite(input.estimatedCostUsd)) return null
+      !Object.prototype.hasOwnProperty.call(input, "inputTokens") || !nullableUsage(input.inputTokens, true) ||
+      !Object.prototype.hasOwnProperty.call(input, "outputTokens") || !nullableUsage(input.outputTokens, true) ||
+      !Object.prototype.hasOwnProperty.call(input, "estimatedCostUsd") || !nullableUsage(input.estimatedCostUsd, false)) return null
   return { operation: "settle", input: {
     operationId: input.operationId, userId: input.userId, provider: input.provider, model: input.model,
     status: input.status, inputTokens: input.inputTokens, outputTokens: input.outputTokens,
@@ -104,6 +127,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       await settleAiUsage(db, { ...body.input, status: "released" })
       return NextResponse.json({ status: "released" })
     }
+    if (body.operation === "start") {
+      const result = await startAiUsage(db, body.input)
+      return NextResponse.json({ status: "started", ...result })
+    }
     const access = await resolveAiAccess(body.input.userId)
     if (access === "disabled") return NextResponse.json({ error: "ai_credits_disabled", code: "ai_credits_disabled" }, { status: 403 })
     if (access === "exhausted") return NextResponse.json({ error: "ai_credits_exhausted", code: "ai_credits_exhausted" }, { status: 429 })
@@ -117,7 +144,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       // platform credential or a user-owned key; never accept this from the Worker.
       credentialSource: trusted.credentialSource ?? (trusted.apiKey ? "user" : "platform"),
     })
-    return NextResponse.json({ status: "authorized", operationId: result.operationId })
+    return NextResponse.json({ status: "authorized", ...result })
   } catch (error: unknown) {
     return failure(error)
   }

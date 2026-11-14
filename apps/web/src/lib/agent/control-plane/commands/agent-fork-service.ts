@@ -7,6 +7,7 @@ import { createRootTurn, acceptInputFacts, lockOwnedSession, type CommandTransac
 import { forkBoundaryActive, forkBoundaryNotFound, forkIdempotencyConflict, invalidCommand, isUniqueViolation, sessionNotFound } from "./errors"
 import type { ForkCommand, ForkResult } from "./types"
 import { agentForkTurnSelect } from "../store/turn-select"
+import { sessionSnapshotFields, withAgentSearchFootprintSessionSnapshot } from "@/lib/agent-search-footprint-session-snapshot"
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
 const SIDE_EFFECT_TYPES = /receipt|lease|reservation|pending/i
@@ -136,10 +137,11 @@ export class AgentForkService {
       const transformedContent = copiedSnapshot ? snapshotContent(copiedSnapshot.content, id, BigInt(copiedEvents.length)) : null
       const snapshotId = transformedContent ? randomUUID() : null
 
-      await tx.agentSession.create({ data: {
+      await withAgentSearchFootprintSessionSnapshot(tx, command.userId, async (snapshotTx, snapshot, captured) => snapshotTx.agentSession.create({ data: {
         id, userId: command.userId, goal: source.goal, source: source.source, status: "running",
         memorySummary: source.memorySummary, eventSequence: BigInt(copiedEvents.length), currentTaskId: null, completedAt: null,
-      } })
+        ...(captured ? sessionSnapshotFields(snapshot) : {}),
+      } }))
       if (transformedContent && snapshotId) {
         const restored = { schemaVersion: copiedSnapshot?.schemaVersion ?? "agent-harness.context.v1", sessionId: id, throughSequence: BigInt(copiedEvents.length), version: 1, content: transformedContent }
         await tx.agentContextSnapshot.create({ data: {

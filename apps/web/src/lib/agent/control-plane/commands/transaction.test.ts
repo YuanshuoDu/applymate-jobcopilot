@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 
 import { acceptInputFacts, assertExpectedTurn, commandEventKey, createRootTurn, fallbackDisposition, lockOpenSession, type CommandTransaction } from "./transaction"
 import { activeTurnChanged } from "./errors"
@@ -92,6 +93,27 @@ describe("Agent command transaction helpers", () => {
 
     const input = agentTurn.create.mock.calls[0]?.[0]?.data.input
     expect(input).toEqual(expect.objectContaining({ goal: "Discovery goal", intent }))
+  })
+
+  it("persists the objective task-graph intent with the root dispatch", async () => {
+    const agentTurn = { create: vi.fn().mockResolvedValue({ id: "turn_objective" }) }
+    const agentOutbox = { create: vi.fn().mockResolvedValue({}) }
+    const tx = { agentTurn, agentOutbox } as unknown as CommandTransaction
+    const command = { sessionId: "session_1", userId: "user_1", clientMessageId: "client_objective", source: "user" as const }
+
+    await createRootTurn(
+      tx, command, [{ type: "text", text: "Find and assess options" }], "Find and assess options", undefined,
+      OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+    )
+
+    expect(agentTurn.create.mock.calls[0]?.[0]?.data.input).toEqual(expect.objectContaining({
+      goal: "Find and assess options", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+    }))
+    expect(agentOutbox.create.mock.calls[0]?.[0]?.data).toEqual(expect.objectContaining({
+      topic: "agent.turn.dispatch",
+      aggregateId: command.sessionId,
+      idempotencyKey: "turn-dispatch:turn_objective",
+    }))
   })
 
   it("persists valid, invalid-sentinel, and absent objective requirements distinctly", async () => {

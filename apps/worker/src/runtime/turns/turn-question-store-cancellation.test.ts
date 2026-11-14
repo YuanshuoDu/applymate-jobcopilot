@@ -155,6 +155,10 @@ function cancellationDatabase(options: { readonly withCallRow?: boolean; readonl
             inputTokens: state.step.inputTokens, outputTokens: state.step.outputTokens, estimatedCostUsd: state.step.estimatedCostUsd,
             callItemId: state.call.id, callStatus: state.call.status, callContent: state.call.content,
             resultItemId: null, resultStatus: null, resultContent: null, resultCount: 0 }] : [])
+          if (sql.startsWith('SELECT "id", "status", "content",') && sql.includes('FROM "agent_items"')) {
+            const call = state.call ? { ...state.call, userId: owner.userId } : undefined
+            return result(call ? options.duplicateCallRows ? [call, call] : [call] : [])
+          }
           if (sql.startsWith('SELECT "id", "status", "content" FROM "agent_items"')) {
             if (sql.includes('"type" = \'tool_call\'')) return result(state.call ? options.duplicateCallRows ? [state.call, state.call] : [state.call] : [])
             if (sql.includes('"type" = \'tool_result\'')) return result()

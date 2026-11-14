@@ -77,8 +77,15 @@ function safeErrorCode(error: unknown): string {
 }
 async function readFreshArtifact(store: ArtifactToolStore, userId: string, jobId: string, expectedHash: string): Promise<ArtifactToolRecord | null> {
   const candidates = await store.listForUser(userId, jobId)
-  const candidate = candidates.find(item => item.jobId === jobId && item.hash === expectedHash)
+  const candidate = candidates.find(item => item.jobId === jobId && matchesArtifactHash(item.hash, expectedHash))
   return candidate ? store.read(userId, candidate.id) : null
+}
+
+function matchesArtifactHash(artifactHash: string, expectedDigest: string): boolean {
+  const approvalDigest = /^[a-f0-9]{64}$/.exec(expectedDigest)
+  const persistedHash = /^sha256:([a-f0-9]{64})$/.exec(artifactHash)
+  if (!approvalDigest || approvalDigest[0] !== expectedDigest || !persistedHash || persistedHash[0] !== artifactHash) return false
+  return persistedHash[1] === approvalDigest[0]
 }
 
 export function createApplicationSubmitTool(deps: ApplicationSubmitToolDependencies): RuntimeToolDefinition {
@@ -108,7 +115,7 @@ export function createApplicationSubmitTool(deps: ApplicationSubmitToolDependenc
         if (claim.kind === "replay") return matchesAttempt(claim.attempt, value, identity) ? fromAttempt(claim.attempt) : failed("idempotency_conflict")
         reserved = true
         const artifact = await readFreshArtifact(deps.artifacts, identity.userId, identity.jobId, claim.artifactHash).catch(() => null)
-        if (!artifact || artifact.ownerUserId !== identity.userId || artifact.jobId !== identity.jobId || artifact.hash !== claim.artifactHash) {
+        if (!artifact || artifact.ownerUserId !== identity.userId || artifact.jobId !== identity.jobId || !matchesArtifactHash(artifact.hash, claim.artifactHash)) {
           await deps.attempts.markFailed(identity, "stale_artifact")
           return failed("stale_artifact")
         }

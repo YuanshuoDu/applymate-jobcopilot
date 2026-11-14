@@ -1,18 +1,20 @@
 import { describe, expect, it } from "vitest"
 
 import {
+  appendScheduledPostGateTaskGraphProposal,
   appendTaskGraphProposal,
   createInitialTaskGraphState,
   deriveReadyTaskGraphNodes,
   deriveTaskGraphReadModel,
   reduceTaskGraphEvent,
   validateTaskGraphProposal,
+  TASK_GRAPH_LIMITS,
   type TaskGraphNodeProposal,
   type TaskGraphNodeStatus,
   type TaskGraphState,
   type TaskGraphValidationOptions,
 } from "./task-graph.js"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "./task-graph-verification.js"
 import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "../subagents/task-graph-child-deadline.js"
 
 const options: TaskGraphValidationOptions = {
@@ -146,6 +148,44 @@ describe("TaskGraph planning kernel", () => {
       .toMatchObject({ ok: false, error: { code: "repair_invalid" } })
   })
 
+  it("requires location-aware repairs to carry the exact target location invariant", () => {
+    const verification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+      criteria: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } },
+        { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin", "Berlin"] } },
+      ],
+    } as const
+    const target = node("target", { verification })
+    const state: TaskGraphState = {
+      revision: 1, nodes: [{ ...target, depth: 1, status: "failed", taskId: "task-target", verificationDisposition: "typed" }], appliedEvents: [],
+    }
+    const relation = { graphRootTaskId: "root-task", nodeKey: "target", taskId: "task-target", criterionIds: ["candidate-count"] }
+    const makeRepair = (criteria: readonly NonNullable<TaskGraphNodeProposal["verification"]>["criteria"][number][], criterionIds = relation.criterionIds) =>
+      node("repair", { verification: { ...verification, criteria }, repairOf: { ...relation, criterionIds } })
+    const count = verification.criteria[0]
+    const location = verification.criteria[1]
+
+    expect(validateTaskGraphProposal({ expectedRevision: 1, nodes: [makeRepair([count, location])] }, state, options))
+      .toMatchObject({ ok: true, addedNodes: [{ repairOf: relation, verification: { criteria: [count, {
+        id: "candidate-location", check: { kind: "candidate_location_in", locations: ["berlin", "dublin"] },
+      }] } }] })
+    expect(validateTaskGraphProposal({ expectedRevision: 1, nodes: [makeRepair([location], ["candidate-location"])] }, state, options))
+      .toMatchObject({ ok: true })
+    expect(validateTaskGraphProposal({ expectedRevision: 1, nodes: [makeRepair([count, location], ["candidate-count", "candidate-location"])] }, state, options))
+      .toMatchObject({ ok: true })
+
+    const invalid = [
+      makeRepair([count]),
+      makeRepair([count, { ...location, check: { kind: "candidate_location_in", locations: ["Dublin"] } }]),
+      makeRepair([count, location, { id: "extra", check: { kind: "all_candidates_have_evidence", minimumItems: 1 } }]),
+    ]
+    for (const repair of invalid) {
+      expect(validateTaskGraphProposal({ expectedRevision: 1, nodes: [repair] }, state, options))
+        .toMatchObject({ ok: false, error: { code: "repair_invalid" } })
+    }
+  })
+
   it("requires exact non-empty repairOf shape and unique criterion IDs", () => {
     const state = createInitialTaskGraphState()
     for (const repairOf of [
@@ -173,6 +213,25 @@ describe("TaskGraph planning kernel", () => {
     expect(deriveReadyTaskGraphNodes(forward).map(item => item.key)).toEqual(["parent"])
   })
 
+  it("requires unique typed package references only on scheduled Execute proposals", () => {
+    const executeTemplate = "scheduled.application.execute"
+    const execute = { key: "execute-1", templateId: executeTemplate, goal: "Prepare approved jobs",
+      successCriteria: ["Each approved package was prepared"], dependsOn: [], packageRefs: ["job-1"] }
+    const scheduledOptions = { ...options, registeredTemplateIds: new Set([...options.registeredTemplateIds, executeTemplate]) }
+    const valid = validateTaskGraphProposal({ expectedRevision: 0, nodes: [execute] }, createInitialTaskGraphState(), scheduledOptions)
+    expect(valid).toMatchObject({ ok: true, proposal: { nodes: [{ packageRefs: ["job-1"] }] }, addedNodes: [{ packageRefs: ["job-1"] }] })
+    for (const invalid of [
+      { ...execute, packageRefs: ["job-1", "job-1"] },
+      { ...execute, packageRefs: [" job-1"] },
+      { ...execute, packageRefs: Array.from({ length: TASK_GRAPH_LIMITS.maxScheduledPackageRefs + 1 }, (_, index) => `job-${index}`) },
+      { ...execute, packageRefs: undefined },
+      { ...execute, templateId: "writer" },
+    ]) {
+      expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: [invalid] }, createInitialTaskGraphState(), scheduledOptions))
+        .toMatchObject({ ok: false, error: { code: "invalid_shape" } })
+    }
+  })
+
   it("enforces canonical persisted field and graph limits even when caller bounds are looser", () => {
     const state = createInitialTaskGraphState()
     const oversizedTemplateId = "t".repeat(129)
@@ -194,6 +253,58 @@ describe("TaskGraph planning kernel", () => {
       })
     }
     expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: Array.from({ length: 9 }, (_, index) => node(`node-${index}`)) }, state, looseOptions))
+      .toMatchObject({ ok: false, error: { code: "node_limit" } })
+  })
+
+  it("keeps generic append at eight while the scheduled server append adds at most four up to eleven", () => {
+    const seed = append(createInitialTaskGraphState(), Array.from({ length: 7 }, (_, index) =>
+      node(index === 6 ? "gate" : `seed-${index}`, { templateId: "writer" })))
+    const postGateOptions = { ...options, maxNodes: TASK_GRAPH_LIMITS.maxPersistedNodes,
+      registeredTemplateIds: new Set([...options.registeredTemplateIds, "scheduled.application.execute", "scheduled_audit", "scheduled.post_gate_audit"]) }
+    const executeNodes = Array.from({ length: 3 }, (_, index) => ({
+      key: `execute-${index + 1}`, templateId: "scheduled.application.execute", goal: `Prepare ${index + 1}`,
+      successCriteria: ["Prepare only the approved packages"], dependsOn: ["gate"], packageRefs: [`job-${index + 1}`],
+    }))
+    const suffix: TaskGraphNodeProposal[] = [...executeNodes, {
+      key: "scheduled.post_gate_audit", templateId: "scheduled.post_gate_audit", goal: "Return the fixed report",
+      successCriteria: ["Return the report"], dependsOn: executeNodes.map(item => item.key),
+    }]
+    const scheduled = appendScheduledPostGateTaskGraphProposal(seed, { expectedRevision: seed.revision, nodes: suffix }, postGateOptions)
+    expect(scheduled).toMatchObject({ ok: true, state: { nodes: { length: TASK_GRAPH_LIMITS.maxPersistedNodes } } })
+    const emptyExecute = { ...executeNodes[0]!, key: "execute-empty", packageRefs: [] }
+    const emptyPlan = appendScheduledPostGateTaskGraphProposal(seed, { expectedRevision: seed.revision, nodes: [emptyExecute, {
+      key: "scheduled.post_gate_audit", templateId: "scheduled.post_gate_audit", goal: "Return the fixed report",
+      successCriteria: ["Return the report"], dependsOn: ["execute-empty"],
+    }] }, postGateOptions)
+    expect(emptyPlan).toMatchObject({ ok: true })
+    expect(appendScheduledPostGateTaskGraphProposal(seed, { expectedRevision: seed.revision, nodes: [
+      emptyExecute, { ...executeNodes[1]!, key: "execute-nonempty" }, {
+        key: "scheduled.post_gate_audit", templateId: "scheduled.post_gate_audit", goal: "Return the fixed report",
+        successCriteria: ["Return the report"], dependsOn: ["execute-empty", "execute-nonempty"],
+      },
+    ] }, postGateOptions)).toMatchObject({ ok: false, error: { code: "invalid_shape" } })
+    expect(appendScheduledPostGateTaskGraphProposal(seed, { expectedRevision: seed.revision, nodes: [{
+      key: "scheduled_audit", templateId: "scheduled_audit", goal: "Legacy fixed report",
+      successCriteria: ["Return the report"], dependsOn: ["gate"],
+    }] }, postGateOptions)).toMatchObject({ ok: true })
+
+    expect(appendTaskGraphProposal(seed, { expectedRevision: seed.revision, nodes: suffix.slice(0, 2) }, postGateOptions))
+      .toMatchObject({ ok: false, error: { code: "node_limit" } })
+    expect(appendScheduledPostGateTaskGraphProposal(seed, { expectedRevision: seed.revision, nodes: [...suffix, {
+      key: "execute-overflow", templateId: "scheduled.application.execute", goal: "Over capacity",
+      successCriteria: ["No"], dependsOn: ["gate"], packageRefs: ["job-extra"],
+    }] }, postGateOptions))
+      .toMatchObject({ ok: false, error: { code: "node_limit" } })
+    expect(appendScheduledPostGateTaskGraphProposal(seed, { expectedRevision: seed.revision, nodes: suffix.slice(0, 3) }, postGateOptions))
+      .toMatchObject({ ok: false, error: { code: "invalid_shape" } })
+    expect(appendScheduledPostGateTaskGraphProposal(seed, { expectedRevision: seed.revision, nodes: [
+      executeNodes[0]!, { ...executeNodes[1]!, packageRefs: ["job-1"] },
+      { key: "scheduled.post_gate_audit", templateId: "scheduled.post_gate_audit", goal: "Report", successCriteria: ["Report"], dependsOn: ["execute-1", "execute-2"] },
+    ] }, postGateOptions)).toMatchObject({ ok: false, error: { code: "invalid_shape" } })
+    expect(appendScheduledPostGateTaskGraphProposal(scheduled.ok ? scheduled.state : seed,
+      { expectedRevision: scheduled.ok ? scheduled.state.revision : seed.revision, nodes: [{
+        key: "scheduled_audit", templateId: "scheduled_audit", goal: "Report", successCriteria: ["Report"], dependsOn: ["gate"],
+      }] }, postGateOptions))
       .toMatchObject({ ok: false, error: { code: "node_limit" } })
   })
 

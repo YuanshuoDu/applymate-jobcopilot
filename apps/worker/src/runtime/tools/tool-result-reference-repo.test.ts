@@ -40,6 +40,7 @@ function fakePool(options: {
   sourceAttemptCount?: number
   sourceRole?: string
   sourceTaskType?: string
+  sourceOwnerKind?: "turn" | "task"
 } = {}) {
   let stored: StoredRow | undefined = options.historical
   const queries: Array<{ text: string; values: readonly unknown[] }> = []
@@ -50,8 +51,14 @@ function fakePool(options: {
       if (text === "BEGIN" || text === "COMMIT" || text === "ROLLBACK" || text.includes("set_config")) return { rows: [], rowCount: 0 } as { rows: T[]; rowCount: number }
       if (text.includes('FROM "agent_items" AS item')) {
         const scoped = values[0] === "session-1" && values[5] === "user-1"
+        const sourceTaskId = String(values[2])
+        const sourceTask = tasks.get(sourceTaskId)
+        const sourceOwnerKind = sourceTask
+          ? sourceTask.id === sourceTask.rootTaskId ? "turn" : "task"
+          : sourceTaskId.startsWith("root-") ? "turn" : "task"
         const rows = scoped ? (options.sourceToolNames ?? ["test.tool"]).slice(0, 2).map(toolName => ({ toolName,
-          taskAttemptCount: options.sourceAttemptCount ?? 1, role: options.sourceRole ?? "reader", taskType: options.sourceTaskType ?? "read" })) : []
+          taskAttemptCount: options.sourceAttemptCount ?? 1, role: options.sourceRole ?? "reader", taskType: options.sourceTaskType ?? "read",
+          ownerKind: options.sourceOwnerKind ?? sourceOwnerKind })) : []
         return { rows, rowCount: rows.length } as { rows: T[]; rowCount: number }
       }
       if (text.includes('FROM "agent_sessions"')) {
@@ -140,6 +147,14 @@ function largeWaitOutput() {
   }
 }
 
+function largeChildWaitOutput() {
+  const taskId = "subagent-00000000-0000-4000-8000-000000000004"
+  return {
+    waitId: "00000000-0000-4000-8000-000000000003", status: "ready", taskIds: [taskId], deadlineAt: "2099-01-01T00:00:00.000Z",
+    matchedTaskIds: [taskId], tasks: [{ taskId, status: "completed", role: "analyst", result: { details: `private@example.com +353 85 123 4567 ${"x".repeat(9_000)}`, nested: { id: NESTED_ID } }, failureReason: null }],
+  }
+}
+
 describe("tool result reference repository", () => {
   it("redacts and idempotently stores one fenced result per step and call", async () => {
     const fake = fakePool()
@@ -184,6 +199,7 @@ describe("tool result reference repository", () => {
 
   it.each([
     ["agent.wait", largeWaitOutput()],
+    ["wait_subagents", largeWaitOutput()],
     ["jobs.search", largeSearchOutput()],
     ["jobs.get", largeGetOutput()],
   ] as const)("source-sanitizes and reads every %s durable chunk to verified EOF", async (toolName, value) => {
@@ -219,6 +235,50 @@ describe("tool result reference repository", () => {
     if (toolName === "jobs.search" || toolName === "jobs.get") expect(serialized).toContain(JOB_ID)
     if (toolName === "agent.wait") expect(serialized).toContain("subagent-00000000-0000-4000-8000-000000000004")
     expect(serialized).not.toContain(NESTED_ID)
+  })
+
+  it("stores and reads a child wait_subagents result using only the raw canonical UUIDv4 grammar", async () => {
+    const childOwner = { kind: "task" as const, taskId: PREPARE_TASK_ID, lease: prepareLease(1) }
+    const fake = fakePool({ tasks: prepareTasks(), stepTaskId: PREPARE_TASK_ID, stepAttempt: 1,
+      sourceToolNames: ["wait_subagents"], sourceOwnerKind: "task" })
+    const repository = createToolResultReferenceRepository(fake.pool as never)
+    const output = largeChildWaitOutput()
+    const stored = await repository.put(childOwner, { stepId: "step-1", toolCallId: "child-call", value: output, now })
+
+    const chunks: string[] = []
+    let cursor: string | undefined
+    let result: Awaited<ReturnType<typeof repository.read>> = null
+    for (let index = 0; index < 10; index += 1) {
+      result = await repository.read(childOwner, { referenceId: stored.id, ...(cursor === undefined ? {} : { cursor }) }, "child-call")
+      expect(result).not.toBeNull()
+      expect(isVerifiedToolResultChunk(result, childOwner, "child-call")).toBe(true)
+      chunks.push(result!.chunk)
+      if (result!.nextCursor === null) break
+      cursor = result!.nextCursor
+    }
+    expect(result?.nextCursor).toBeNull()
+    const read = JSON.parse(chunks.join("")) as Record<string, unknown>
+    expect(read).toMatchObject({ waitId: output.waitId, taskIds: output.taskIds })
+    expect(canonicalJson(stored.sanitizedJson)).not.toContain("private@example.com")
+    expect(canonicalJson(stored.sanitizedJson)).not.toContain("+353 85 123 4567")
+    expect(fake.queries.some(query => query.text.includes('INSERT INTO "agent_tool_result_references"'))).toBe(true)
+  })
+
+  it("rejects wait result source-owner mismatches and swapped root/child ID formats", async () => {
+    const childOwner = { kind: "task" as const, taskId: PREPARE_TASK_ID, lease: prepareLease(1) }
+    const childSource = createToolResultReferenceRepository(fakePool({ tasks: prepareTasks(), stepTaskId: PREPARE_TASK_ID, stepAttempt: 1,
+      sourceToolNames: ["wait_subagents"], sourceOwnerKind: "task" }).pool as never)
+    const rootSource = createToolResultReferenceRepository(fakePool({ sourceToolNames: ["wait_subagents"], sourceOwnerKind: "task" }).pool as never)
+
+    await expect(rootSource.put(rootOwner, { stepId: "step-1", toolCallId: "task-owned-call", value: largeChildWaitOutput(), now }))
+      .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
+    await expect(childSource.put(childOwner, { stepId: "step-1", toolCallId: "root-form-call", value: largeWaitOutput(), now }))
+      .rejects.toMatchObject({ code: "tool_result_invalid_json" })
+
+    const historical = { ...row("root-raw-child-wait", "root-current", largeChildWaitOutput()), toolCallId: "root-raw-child-wait" }
+    const readMismatch = createToolResultReferenceRepository(fakePool({ historical, sourceToolNames: ["wait_subagents"], sourceOwnerKind: "turn" }).pool as never)
+    await expect(readMismatch.read(rootOwner, { referenceId: "root-raw-child-wait" }))
+      .rejects.toMatchObject({ code: "tool_result_corrupt" })
   })
 
   it.each(["aborted", "archived"])("rejects a %s session before any tool result write", async sessionStatus => {

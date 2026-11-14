@@ -1,6 +1,6 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/lib/i18n'
 import { HarnessTimeline, highlightedFinalItemIds } from './HarnessTimeline'
@@ -20,11 +20,27 @@ describe('HarnessTimeline', () => {
     expect(highlightedFinalItemIds(items)).toEqual(new Set(['final-new']))
     const html = renderToStaticMarkup(<I18nProvider><HarnessTimeline items={items} /></I18nProvider>)
     expect((html.match(/data-agent-final="true"/g) ?? []).length).toBe(1)
+    expect(html).not.toContain('data-agent-completed-final-answer-count')
   })
 
   it('keeps separate Turns in the timeline projection', () => {
     const html = renderToStaticMarkup(<I18nProvider><HarnessTimeline items={[item('one', { phase: 'final_answer' }), item('two', { turnId: 'turn-2', phase: 'final_answer' })]} /></I18nProvider>)
     expect((html.match(/data-agent-turn-id=/g) ?? []).length).toBe(2)
     expect((html.match(/data-agent-final="true"/g) ?? []).length).toBe(2)
+  })
+
+  it('exposes only a bounded completed final-answer count to the opt-in observer', () => {
+    const diagnostics = {
+      matchesTarget: vi.fn(() => false), recordTurnCompleted: vi.fn(), recordFinalItemTarget: vi.fn(), recordFinalItemHydration: vi.fn(),
+    }
+    vi.stubGlobal('window', { __applymateFinalDiagnostics: diagnostics })
+    vi.stubGlobal('localStorage', { getItem: () => null, setItem: () => undefined })
+    let html = ''
+    try {
+      html = renderToStaticMarkup(<I18nProvider><HarnessTimeline items={[
+        item('final', { phase: 'final_answer' }), item('commentary'), item('failed', { phase: 'final_answer', status: 'failed' }),
+      ]} /></I18nProvider>)
+    } finally { vi.unstubAllGlobals() }
+    expect(html).toContain('data-agent-completed-final-answer-count="1"')
   })
 })

@@ -1,3 +1,5 @@
+import type { NativeQuestionControlReceipt } from "./native-question-attestation.js"
+
 export type TurnEngineToolCall = {
   readonly id: string
   readonly name: string
@@ -11,6 +13,7 @@ export type TurnEngineToolResult = {
   readonly status: "completed" | "failed" | "cancelled"
   readonly output?: unknown
   readonly errorCode: string | null
+  readonly nativeQuestionReceipt?: NativeQuestionControlReceipt
 }
 
 export type PersistedToolCallRecovery = {

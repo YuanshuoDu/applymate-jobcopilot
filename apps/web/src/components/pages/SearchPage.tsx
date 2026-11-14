@@ -6,6 +6,7 @@ import { Btn } from '@/components/ui'
 import { SmartSearch } from '@/components/jobs/SmartSearch'
 import { useNav } from '@/lib/nav-context'
 import { useI18n } from '@/lib/i18n'
+import { openApplication } from '@/lib/application-navigation'
 
 export function SearchPage() {
   const { navigate } = useNav()
@@ -30,7 +31,7 @@ export function SearchPage() {
       </TopBar>
 
       <div className="search-page-content" style={{ padding: 20, flex: 1, display: 'flex', flexDirection: 'column' }}>
-        <SmartSearch onOpenSettings={openApiKeySettings} onJobSaved={() => {
+        <SmartSearch onOpenSettings={openApiKeySettings} onOpenApplication={jobId => openApplication(jobId, navigate)} onJobSaved={() => {
           // Notify JobsPage to refresh when user navigates back
           window.postMessage({ type: 'job-saved' }, window.location.origin)
         }} />

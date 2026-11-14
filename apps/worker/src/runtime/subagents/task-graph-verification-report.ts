@@ -1,6 +1,7 @@
 import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 
 export const TASK_GRAPH_VERIFIER_VERSION = "agent-harness.v2.task-graph-verifier.v1" as const
+export const TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION = "agent-harness.v2.task-graph-verifier.v2" as const
 const CRITERION_ID = /^[a-z][a-z0-9._-]{0,63}$/
 const DIGEST = /^[a-f0-9]{64}$/
 const MAX_BINDINGS = 8
@@ -11,13 +12,15 @@ const REPORT_REASONS = new Set<TaskGraphVerificationReasonCode>([
   "result_invalid", "result_ambiguous", "result_evidence_unbound", "repair_target_unresolved",
 ])
 
-export type TaskGraphVerificationReport = Readonly<{
-  verifierVersion: typeof TASK_GRAPH_VERIFIER_VERSION
+type TaskGraphVerificationReportFields = Readonly<{
   status: "passed" | "failed" | "unverified"
   reasonCode: TaskGraphVerificationReasonCode
   criteria: readonly Readonly<{ criterionId: string; status: "passed" | "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode }>[]
   evidenceDigest: string | null
   resultDigest: string | null
+}>
+export type TaskGraphVerificationReport = TaskGraphVerificationReportFields & Readonly<{
+  verifierVersion: typeof TASK_GRAPH_VERIFIER_VERSION | typeof TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION
 }>
 
 export type TaskGraphVerificationDependencyBinding = Readonly<{
@@ -80,6 +83,68 @@ function parseBindings(value: unknown): readonly TaskGraphVerificationDependency
   return output
 }
 
+function publicDataRecord(value: unknown): value is Record<string, unknown> {
+  try {
+    if (!record(value) || Object.getPrototypeOf(value) !== Object.prototype) return false
+    const descriptors = Object.getOwnPropertyDescriptors(value)
+    return Reflect.ownKeys(value).every(key => {
+      const descriptor = descriptors[key as string]
+      return Boolean(descriptor?.enumerable && Object.hasOwn(descriptor, "value"))
+    })
+  } catch { return false }
+}
+
+function publicDense(value: unknown, min: number, max: number): value is unknown[] {
+  try {
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype
+      || value.length < min || value.length > max) return false
+    const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<string, PropertyDescriptor>
+    if (Reflect.ownKeys(value).length !== value.length + 1 || !descriptors.length || descriptors.length.enumerable) return false
+    return Array.from({ length: value.length }, (_, index) => {
+      const descriptor = descriptors[String(index)]
+      return Boolean(descriptor?.enumerable && Object.hasOwn(descriptor, "value"))
+    }).every(Boolean)
+  } catch { return false }
+}
+
+/** Parses the redacted v2 DTO only for current model observation; it grants no verification authority. */
+export function parseCurrentTaskGraphPublicVerificationReport(
+  value: unknown,
+  criterionIds: readonly string[],
+): TaskGraphVerificationReport | undefined {
+  if (!publicDataRecord(value) || !exact(value, "criteria,evidenceDigest,reasonCode,resultDigest,status,verifierVersion")
+    || value.verifierVersion !== TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION || value.status !== "failed"
+    || typeof value.reasonCode !== "string" || !REPORT_REASONS.has(value.reasonCode as TaskGraphVerificationReasonCode)
+    || typeof value.evidenceDigest !== "string" || !DIGEST.test(value.evidenceDigest)
+    || typeof value.resultDigest !== "string" || !DIGEST.test(value.resultDigest)
+    || !publicDense(value.criteria, 1, 8) || value.criteria.length !== criterionIds.length
+    || criterionIds.length < 1 || criterionIds.length > 8
+    || criterionIds.some((id, index) => typeof id !== "string" || !CRITERION_ID.test(id)
+      || index > 0 && criterionIds.indexOf(id) !== index)) return undefined
+
+  const criteria: NonNullable<TaskGraphVerificationReport["criteria"]>[number][] = []
+  for (let index = 0; index < value.criteria.length; index += 1) {
+    const item = value.criteria[index]
+    if (!publicDataRecord(item) || !exact(item, "criterionId,reasonCode,status")
+      || item.criterionId !== criterionIds[index] || typeof item.criterionId !== "string" || !CRITERION_ID.test(item.criterionId)
+      || typeof item.reasonCode !== "string" || !REPORT_REASONS.has(item.reasonCode as TaskGraphVerificationReasonCode)
+      || item.status !== "passed" && item.status !== "failed"
+      || item.status === "passed" && item.reasonCode !== "criteria_met"
+      || item.status === "failed" && item.reasonCode !== "criterion_not_met" && item.reasonCode !== "reported_score_below_minimum") return undefined
+    criteria.push({ criterionId: item.criterionId, status: item.status, reasonCode: item.reasonCode as TaskGraphVerificationReasonCode })
+  }
+  const reasonCode = value.reasonCode as TaskGraphVerificationReasonCode
+  if (!criteria.some(item => item.status === "failed")
+    || criteria.find(item => item.status === "failed")?.reasonCode !== reasonCode) return undefined
+  return {
+    verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION,
+    status: "failed",
+    reasonCode,
+    criteria,
+    evidenceDigest: value.evidenceDigest,
+    resultDigest: value.resultDigest,
+  }
+}
 /** Parses the reserved server-owned report envelope; optional expected keys bind a typed cross-node contract. */
 export function parseStoredTaskGraphVerificationReport(
   value: unknown,
@@ -88,10 +153,13 @@ export function parseStoredTaskGraphVerificationReport(
 ): TaskGraphStoredVerificationReport | undefined {
   if (!record(value)) return undefined
   const hasBindings = Object.hasOwn(value, "dependencyBindings")
+  const version = value.verifierVersion
+  const isEmptyAnalystV2 = version === TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION
   if (!exact(value, hasBindings
     ? "criteria,dependencyBindings,evidenceDigest,reasonCode,resultDigest,status,verifierVersion"
     : "criteria,evidenceDigest,reasonCode,resultDigest,status,verifierVersion")
-    || value.verifierVersion !== TASK_GRAPH_VERIFIER_VERSION
+    || version !== TASK_GRAPH_VERIFIER_VERSION && !isEmptyAnalystV2
+    || isEmptyAnalystV2 && (!hasBindings || value.status !== "failed")
     || !["passed", "failed", "unverified"].includes(String(value.status))
     || typeof value.reasonCode !== "string" || !REPORT_REASONS.has(value.reasonCode as TaskGraphVerificationReasonCode)
     || !(value.status === "unverified"
@@ -119,13 +187,14 @@ export function parseStoredTaskGraphVerificationReport(
   const coherent = repairUnresolved || (status === "passed" ? reasonCode === "criteria_met" && typeof value.resultDigest === "string" && criteria.every(item => item.status === "passed")
     : status === "failed" ? typeof value.resultDigest === "string" && criteria.some(item => item.status === "failed") && reasonCode === criteria.find(item => item.status === "failed")?.reasonCode && criteria.every(item => item.status !== "unverified")
       : criteria.every(item => item.status === "unverified" && item.reasonCode === reasonCode) && (value.evidenceDigest === null ? value.resultDigest === null : typeof value.resultDigest === "string"))
-  if (!coherent) return undefined
+  if (!coherent || isEmptyAnalystV2 && status !== "failed") return undefined
 
   let dependencyBindings: readonly TaskGraphVerificationDependencyBinding[] | undefined
   if (hasBindings) {
     dependencyBindings = parseBindings(value.dependencyBindings)
     if (!dependencyBindings || status === "unverified") return undefined
   }
+  if (isEmptyAnalystV2 && (!dependencyBindings || dependencyBindings.length < 2)) return undefined
   if (expectedDependencyNodeKeys !== undefined) {
     const expected = [...expectedDependencyNodeKeys].sort(compareKeys)
     if (expected.length > MAX_BINDINGS || new Set(expected).size !== expected.length || expected.some(key => !boundedId(key))) return undefined
@@ -135,7 +204,7 @@ export function parseStoredTaskGraphVerificationReport(
     if (status === "unverified" && dependencyBindings) return undefined
   }
   return {
-    verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
+    verifierVersion: version as TaskGraphVerificationReport["verifierVersion"],
     status,
     reasonCode,
     criteria,

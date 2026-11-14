@@ -17,11 +17,11 @@ type ExistingApprovalRow = { id: string; userId: string; sessionId: string; turn
   toolCallId: string | null; payload: unknown; resourceHash: string | null; materialHash: string | null; answersHash: string | null; scopeHash: string | null; nonceHash: string | null; revision: number; expiresAt: Date | string | null }
 type ExistingArtifactRow = { id: string; userId: string; jobId: string; artifactType: string; lifecycle: string; baseId: string | null; baseHash: string | null
   content: unknown; hash: string; constraintHash: string; provenanceRefs: unknown; evidenceRefs: unknown; previousHash: string | null; version: number }
-type FillStatus = { status: "completed" | "waiting" | "stale" | "conflict" | "failed" | "cancelled" }
+type FillStatus = { status: "completed" | "waiting" | "stale" | "conflict" | "failed" | "cancelled" }; export type ApplicationFillCompletionStaleGate = "lease_input_invalid" | "session_scope" | "turn_row_unavailable" | "turn_status_queued" | "turn_status_interrupted" | "turn_status_terminal" | "turn_status_other" | "child_lease_fence" | "application_task_scope"
 type WaitCheckpoint = "fill_outcome_uncertain" | "form_answer_required"
 type WaitDetail = "captcha_required" | "authentication_required" | "mfa_required" | "unknown_sensitive_field" | "required_field" | "stale_review" | "review_required" | "fill_outcome_uncertain" | "unattended_apply_unavailable" | "cancelled" | "browser_fill_failed"
-type Client = Pick<PoolClient, "query">
-
+type Client = Pick<PoolClient, "query">; type StaleGateObserver = (gate: ApplicationFillCompletionStaleGate) => void
+function reportStaleGate(observer: StaleGateObserver | undefined, gate: ApplicationFillCompletionStaleGate): void { if (observer) try { observer(gate) } catch {} }
 const COMPLETION_TITLE = "Final submission authorization"
 const COMPLETION_BODY = "The form was filled without submission. Review the current job, material alignment, required answers, and sensitive declarations before authorizing an external submission."
 const SAFE_WAIT_DETAILS = new Set<WaitDetail>(["captcha_required", "authentication_required", "mfa_required", "unknown_sensitive_field", "required_field", "stale_review", "review_required", "fill_outcome_uncertain", "unattended_apply_unavailable", "cancelled", "browser_fill_failed"])
@@ -33,14 +33,14 @@ function validLease(lease: SubagentLease, now: Date, cancellation = false): bool
     && (cancellation || (lease.interruptRequestedAt === null && !lease.signal.aborted)) && now instanceof Date && Number.isFinite(now.getTime()))
 }
 
-async function lockFillScope(client: Client, lease: SubagentLease, now: Date, cancellation = false): Promise<{ turn: TurnRow; task: ApplicationRow } | null> {
-  if (!validLease(lease, now, cancellation)) return null
+async function lockFillScope(client: Client, lease: SubagentLease, now: Date, cancellation = false, onStaleGate?: StaleGateObserver, allowQueuedCompletion = false): Promise<{ turn: TurnRow; task: ApplicationRow } | null> {
+  if (!validLease(lease, now, cancellation)) { if (onStaleGate) reportStaleGate(onStaleGate, "lease_input_invalid"); return null }
   const sessionStates = cancellation ? "'running', 'waiting_for_user', 'paused', 'aborted'" : "'running', 'waiting_for_user'"
   const session = await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 AND "status" IN (${sessionStates}) FOR UPDATE`, [lease.sessionId, lease.userId])
-  if (!session.rows[0]) return null
+  if (!session.rows[0]) { if (onStaleGate) reportStaleGate(onStaleGate, "session_scope"); return null }
   const turnResult = await client.query<TurnRow>(`SELECT "id", "status", "revision" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`, [lease.turnId, lease.sessionId, lease.userId])
   const turn = turnResult.rows[0]
-  if (!turn || !(cancellation ? ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency", "interrupted"] : ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency"]).includes(turn.status)) return null
+  if (!turn || (!(cancellation ? ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency", "interrupted"] : ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency"]).includes(turn.status) && !(allowQueuedCompletion && turn.status === "queued"))) { if (onStaleGate) reportStaleGate(onStaleGate, !turn ? "turn_row_unavailable" : turn.status === "queued" ? "turn_status_queued" : turn.status === "interrupted" ? "turn_status_interrupted" : ["completed", "failed", "cancelled"].includes(turn.status) ? "turn_status_terminal" : "turn_status_other"); return null }
   const interruptCheck = cancellation ? "IS NOT NULL" : "IS NULL"
   const subtask = await client.query(`SELECT "subtask"."id" FROM "sub_agent_tasks" AS "subtask"
       INNER JOIN "agent_sessions" AS "session" ON "session"."id" = "subtask"."sessionId" AND "session"."userId" = $7
@@ -49,13 +49,13 @@ async function lockFillScope(client: Client, lease: SubagentLease, now: Date, ca
       AND "subtask"."taskType" = 'application_fill_for_review' AND "subtask"."status" = 'running' AND "subtask"."leaseOwner" = $4
       AND "subtask"."attemptCount" = $5 AND "subtask"."leaseExpiresAt" > GREATEST($6::timestamptz, clock_timestamp()) AND "subtask"."interruptRequestedAt" ${interruptCheck} FOR UPDATE OF "subtask"`,
   [lease.id, lease.sessionId, lease.turnId, lease.ownerId, lease.attemptCount, now, lease.userId])
-  if (!subtask.rows[0]) return null
+  if (!subtask.rows[0]) { if (onStaleGate) reportStaleGate(onStaleGate, "child_lease_fence"); return null }
   const taskResult = await client.query<ApplicationRow>(`SELECT "id", "userId", "sessionId", "jobId", "fillTurnId", "fillTurnSessionId", "fillTurnUserId", "status", "checkpoint", "resumeId", "coverLetterId", "confirmedAnswers"
       FROM "application_tasks" WHERE "fillTurnId" = $1 AND "fillTurnSessionId" = $2 AND "fillTurnUserId" = $3 AND "userId" = $3 AND "sessionId" = $2 FOR UPDATE`,
   [lease.turnId, lease.sessionId, lease.userId])
   const task = taskResult.rows[0]
-  return task && task.userId === lease.userId && task.sessionId === lease.sessionId && task.fillTurnId === lease.turnId
-    && task.fillTurnSessionId === lease.sessionId && task.fillTurnUserId === lease.userId ? { turn, task } : null
+  if (!task || task.userId !== lease.userId || task.sessionId !== lease.sessionId || task.fillTurnId !== lease.turnId || task.fillTurnSessionId !== lease.sessionId || task.fillTurnUserId !== lease.userId) { if (onStaleGate) reportStaleGate(onStaleGate, "application_task_scope"); return null }
+  return { turn, task }
 }
 
 const CANCELLED_FILL_BODY = "Application fill cancelled before submission."
@@ -101,6 +101,11 @@ function exactSubmissionPayload(value: unknown, expected: ReturnType<typeof subm
 
 function date(value: Date | string | null): Date | undefined { if (!value) return undefined; const parsed = value instanceof Date ? value : new Date(value); return Number.isFinite(parsed.getTime()) ? parsed : undefined }
 
+function approvalResourceHash(value: string): string | undefined {
+  const match = /^sha256:([a-f0-9]{64})$/.exec(value)
+  return match?.[0] === value ? match[1] : undefined
+}
+
 async function existingCompletion(client: Client, lease: SubagentLease, task: ApplicationRow, turn: TurnRow, approvedOnly = false): Promise<boolean> {
   const payload = submissionPayload(task), turnId = lease.turnId
   if (!turnId) return false
@@ -120,42 +125,46 @@ async function existingCompletion(client: Client, lease: SubagentLease, task: Ap
     || artifact.baseHash !== artifactHash || artifact.hash !== artifactHash || artifact.constraintHash !== hashArtifactContent({ applicationTaskId: task.id, jobId: task.jobId })
     || !refsMatch(artifact.provenanceRefs) || !refsMatch(artifact.evidenceRefs) || artifact.previousHash !== null || artifact.version !== 1
     || contentHash !== artifactHash) return false
+  const resourceHash = approvalResourceHash(artifactHash)
+  if (!resourceHash) return false
   const found = await client.query<ExistingApprovalRow>(`SELECT "id", "userId", "sessionId", "turnId", "jobId", "type", "taskId", "status", "toolCallId", "payload", "resourceHash", "materialHash", "answersHash", "scopeHash", "nonceHash", "revision", "expiresAt" FROM "agent_approvals" WHERE "id" = $1 AND "userId" = $2 AND "status" IN ('pending', 'approved')`, [`application-fill:${task.id}:${turnId}`, lease.userId])
   const approval = found.rows[0], expiresAt = approval && date(approval.expiresAt)
   if (found.rows.length !== 1 || !approval || !expiresAt || !approval.nonceHash || !approval.scopeHash
     || !["pending", "approved"].includes(approval.status) || (approvedOnly && approval.status !== "approved")
     || approval.userId !== lease.userId || approval.sessionId !== lease.sessionId || approval.turnId !== turnId
-    || approval.jobId !== task.jobId || approval.taskId !== lease.id || approval.type !== "submit_application"
-    || approval.toolCallId !== `application-submit:${task.id}` || approval.resourceHash !== artifactHash
+    || approval.jobId !== task.jobId || approval.taskId !== task.id || approval.type !== "submit_application"
+    || approval.toolCallId !== `application-submit:${task.id}` || approval.resourceHash !== resourceHash
     || approval.materialHash !== materialHash || approval.answersHash !== answersHash || !exactSubmissionPayload(approval.payload, payload)
     || !Number.isSafeInteger(approval.revision) || approval.revision + 1 !== turn.revision) return false
   const scope: ApprovalScopeInput = { userId: approval.userId, sessionId: approval.sessionId, turnId, jobId: task.jobId,
-    toolCallId: `application-submit:${task.id}`, action: "submit_application", resourceHash: artifactHash, materialHash, answersHash, revision: approval.revision, expiresAt }
+    toolCallId: `application-submit:${task.id}`, action: "submit_application", resourceHash, materialHash, answersHash, revision: approval.revision, expiresAt }
   return await hashApprovalScope(protocolScope(scope, approval.nonceHash)) === approval.scopeHash
 }
 
 /** Commits the review checkpoint, immutable manifest, approval, Turn wait, and Session projection together. */
-export async function completeApplicationFillForReview(pool: Pool, input: { readonly lease: SubagentLease; readonly now?: Date }): Promise<FillStatus> {
+export async function completeApplicationFillForReview(pool: Pool, input: { readonly lease: SubagentLease; readonly now?: Date; readonly onStaleGate?: StaleGateObserver }): Promise<FillStatus> {
   const { lease } = input, now = input.now ?? new Date()
-  if (!validLease(lease, now) || !lease.turnId) return { status: "stale" }
+  if (!validLease(lease, now) || !lease.turnId) { if (input.onStaleGate) reportStaleGate(input.onStaleGate, "lease_input_invalid"); return { status: "stale" } }
   const turnId = lease.turnId
   return inTransaction(pool, lease.userId, async client => {
-    const locked = await lockFillScope(client, lease, now)
+    const locked = await lockFillScope(client, lease, now, false, input.onStaleGate, true)
     if (!locked) return { status: "stale" }
     const { turn, task } = locked
     const awaitingApproval = task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", authorizedForSubmission = task.status === "filling" && task.checkpoint === "submission_authorized", queueRetry = task.status === "waiting_for_authorization" && task.checkpoint === "queue_retry"
     if (awaitingApproval || authorizedForSubmission || queueRetry) return turn.status === "waiting_for_approval"
       ? { status: await existingCompletion(client, lease, task, turn, authorizedForSubmission || queueRetry) ? "completed" : "conflict" } : { status: "conflict" }
-    if (task.status !== "filling" || task.checkpoint !== "browser_active" || !["in_progress", "waiting_for_dependency"].includes(turn.status)) return { status: "conflict" }
-    const transitioned = await client.query(`UPDATE "application_tasks" SET "status" = 'waiting_for_authorization', "checkpoint" = 'form_filled', "error" = NULL, "updatedAt" = $4 WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "status" = 'filling' AND "checkpoint" = 'browser_active' RETURNING "id"`, [task.id, lease.userId, lease.sessionId, now])
+    if (task.status !== "filling" || task.checkpoint !== "browser_active" || !["in_progress", "waiting_for_dependency", "queued"].includes(turn.status)) return { status: "conflict" }
+    const transitioned = await client.query(`UPDATE "application_tasks" SET "status" = 'waiting_for_authorization', "checkpoint" = 'form_filled', "error" = NULL, "question" = NULL, "updatedAt" = $4 WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "status" = 'filling' AND "checkpoint" = 'browser_active' RETURNING "id"`, [task.id, lease.userId, lease.sessionId, now])
     if (transitioned.rowCount !== 1) return { status: "conflict" }
     await client.query(`INSERT INTO "application_task_events" ("id", "taskId", "type", "actor", "body", "data", "createdAt")
       VALUES ($1, $2, 'form_filled', 'worker', $3, $4::jsonb, $5)`, [randomUUID(), task.id, "Form filled without submission; final user authorization requested.", JSON.stringify({ turnId: lease.turnId }), now])
     const answersHash = await hashAgentReceiptValue("answers", task.confirmedAnswers ?? null)
     const artifact = await ensureSubmissionArtifactWithClient(client, { applicationTaskId: task.id, userId: lease.userId, jobId: task.jobId, resumeId: task.resumeId, coverLetterId: task.coverLetterId, answersHash })
+    const resourceHash = approvalResourceHash(artifact.hash)
+    if (!resourceHash) throw new Error("Application submission artifact hash is invalid")
     const payload = submissionPayload(task)
-    const approvalInput: IssueApprovalReceiptInput = { approvalId: `application-fill:${task.id}:${turnId}`, taskId: lease.id,
-      scope: { userId: lease.userId, sessionId: lease.sessionId, turnId, jobId: task.jobId, toolCallId: `application-submit:${task.id}`, action: "submit_application", resourceHash: artifact.hash,
+    const approvalInput: IssueApprovalReceiptInput = { approvalId: `application-fill:${task.id}:${turnId}`, taskId: task.id,
+      scope: { userId: lease.userId, sessionId: lease.sessionId, turnId, jobId: task.jobId, toolCallId: `application-submit:${task.id}`, action: "submit_application", resourceHash,
         materialHash: await hashAgentReceiptValue("material", payload), answersHash, revision: turn.revision, expiresAt: new Date(now.getTime() + 15 * 60 * 1000) },
       title: COMPLETION_TITLE, body: COMPLETION_BODY, impact: { externalSubmission: true, jobId: task.jobId }, payload, nonce: createApprovalNonce() }
     const receipt = await createPgApprovalStore(pool, { userId: lease.userId }).issueInTransaction(client, approvalInput)

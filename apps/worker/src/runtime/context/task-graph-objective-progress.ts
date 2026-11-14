@@ -6,7 +6,7 @@ import type { TaskGraphCurrentNode, TaskGraphCurrentState } from "../subagents/t
 import type { ContextSeedBlock } from "./step-context-builder.js"
 
 export const TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID = "task-graph-objective-progress"
-const SCHEMA_VERSION = "agent-harness.v2.objective-progress.v1"
+export const TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION = "agent-harness.v2.objective-progress.v1" as const
 const MAX_REQUIREMENTS = 8
 const MAX_NODES = 16
 const MAX_PACKET_BYTES = 4 * 1024
@@ -143,13 +143,14 @@ function statusFor(requirement: Requirement, nodes: readonly ProjectionNode[], r
   if (selected.status === "missing") return nodes.some(node => node.verificationCriterionIds?.includes(requirement.id)) ? "unknown" : "missing"
   if (selected.status !== "selected") return "unknown"
   const node = selected.node
-  const role = requirement.kind === "candidate_count_gte" ? "scout" : "analyst"
+  const role = requirement.kind === "finding_count_gte" ? "analyst" : "scout"
   const check = selected.criterion.check
-  if (node.verification?.role !== role || activeTemplateRole(templateRoles, node.templateId) !== role
-    || check.kind !== requirement.kind) return "unknown"
-  if (check.kind === "candidate_count_gte" || check.kind === "finding_count_gte") {
-    if (check.minimum < requirement.minimum) return "unknown"
-  } else return "unknown"
+  if (node.verification?.role !== role || activeTemplateRole(templateRoles, node.templateId) !== role) return "unknown"
+  if (requirement.kind === "candidate_location_in") {
+    if (check.kind !== requirement.kind || check.locations.length !== requirement.locations.length
+      || !check.locations.every((location, index) => location === requirement.locations[index])) return "unknown"
+  } else if ((check.kind !== "candidate_count_gte" && check.kind !== "finding_count_gte")
+    || check.kind !== requirement.kind || check.minimum < requirement.minimum) return "unknown"
   if (["queued", "running", "retrying", "waiting", "waiting_for_user"].includes(node.status)) return "active"
   const report = node.verificationReport
   const criterion = report?.criteria.find(item => item.criterionId === requirement.id)
@@ -165,9 +166,10 @@ export function taskGraphObjectiveProgressObservation(input: Input): ContextSeed
   if (input.resolution.status !== "valid" || input.resolution.requirements.length > MAX_REQUIREMENTS) return undefined
   const graph = currentGraph(input)
   const content = {
-    schemaVersion: SCHEMA_VERSION, advisory: true, revision: graph?.revision ?? null,
+    schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION, advisory: true, revision: graph?.revision ?? null,
     requirements: input.resolution.requirements.map(requirement => ({
-      id: requirement.id, kind: requirement.kind, minimum: requirement.minimum,
+      id: requirement.id, kind: requirement.kind,
+      ...(requirement.kind === "candidate_location_in" ? { locations: [...requirement.locations] } : { minimum: requirement.minimum }),
       status: graph ? statusFor(requirement, graph.nodes, input.rootTaskId, input.taskGraphTemplateRoles) : "unknown" as const,
     })),
   }

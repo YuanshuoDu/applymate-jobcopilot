@@ -5,6 +5,7 @@ import { loadSelectedJobPreparation, type SelectedJobPreparation } from "../sele
 import { loadApplicationFillPreparation, type ApplicationFillPreparation } from "../application-fill-preparation.js"
 import type { TurnLease } from "../turns/lease.js"
 import { parseScheduledAutomationSnapshot, type ScheduledAutomationCriteria, type ScheduledAutomationSnapshot } from "./scheduled-automation-snapshot.js"
+import { scheduledPostGateTaskTemplates } from "./scheduled-post-gate-task-templates.js"
 
 const APPLICATION_FILL_TEMPLATE_ID = "application_filler"
 const SCHEDULED_PREPARE_TEMPLATE_ID = "prepare"
@@ -43,6 +44,7 @@ function taskGraphTemplatesForAutomationCriteria(
   templates: Readonly<Record<string, TaskGraphTaskTemplate>> | undefined,
   criteria: ScheduledAutomationCriteria,
   includeAnalyst = false,
+  includePostGate = false,
 ): Readonly<Record<string, TaskGraphTaskTemplate>> | undefined {
   const scout = templates?.scout
   const analyst = templates?.analyst
@@ -55,6 +57,7 @@ function taskGraphTemplatesForAutomationCriteria(
   return Object.freeze({
     scout: withCriteria(scout),
     analyst: includeAnalyst ? withCriteria(analyst) : analyst,
+    ...(includePostGate ? scheduledPostGateTaskTemplates() : {}),
   })
 }
 
@@ -216,7 +219,7 @@ export async function taskGraphRuntimeForTurn(input: {
   // Scheduled automation approvals are owned by the pipeline Gate; keep the #873 draft writer/reviewer path out.
   const scheduledDraftMode = false
   const templates = scheduledSnapshot
-    ? taskGraphTemplatesForAutomationCriteria(input.taskGraphTemplates, criteriaForScheduledSnapshot(scheduledSnapshot))
+    ? taskGraphTemplatesForAutomationCriteria(input.taskGraphTemplates, criteriaForScheduledSnapshot(scheduledSnapshot), false, scheduledAutomationRun)
     : preparation ? taskGraphTemplatesForSelectedJob(preparation)
       : manualSnapshot ? taskGraphTemplatesForAutomationCriteria(input.taskGraphTemplates, criteriaForScheduledSnapshot(manualSnapshot), true)
         : input.taskGraphTemplates

@@ -130,7 +130,8 @@ export async function queueAutonomousApplication(input: {
   }
   if (!approval || !taskSnapshot?.sessionId || !taskSnapshot.fillTurnId ||
     (input.sessionId && input.sessionId !== taskSnapshot.sessionId) || approval.sessionId !== taskSnapshot.sessionId ||
-    approval.turnId !== taskSnapshot.fillTurnId || payload.applicationTaskId !== input.applicationTaskId || payload.jobId !== input.jobId ||
+    approval.taskId !== input.applicationTaskId || approval.turnId !== taskSnapshot.fillTurnId ||
+    payload.applicationTaskId !== input.applicationTaskId || payload.jobId !== input.jobId ||
     payload.resumeId !== material.resumeId || payload.coverLetterId !== material.coverLetterId ||
     ("confirmedAnswers" in payload && JSON.stringify(payload.confirmedAnswers ?? null) !== JSON.stringify(taskSnapshot?.confirmedAnswers ?? null)) ||
     approval.materialHash !== snapshotMaterialHash || approval.answersHash !== snapshotAnswersHash ||
@@ -218,7 +219,7 @@ export async function queueAutonomousApplication(input: {
     const lockedApproval = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
       SELECT "id" FROM "agent_approvals"
       WHERE "id" = ${approval.id} AND "userId" = ${input.userId} AND "sessionId" = ${receiptSessionId}
-        AND "taskId" IS NOT DISTINCT FROM ${approval.taskId} AND "turnId" = ${fillTurnId}
+        AND "taskId" = ${input.applicationTaskId} AND "turnId" = ${fillTurnId}
         AND "jobId" = ${input.jobId} AND "toolCallId" = ${approval.toolCallId}
         AND "type" = 'submit_application' AND "status" = 'approved' AND "scopeHash" = ${approval.scopeHash}
         AND "nonceHash" = ${approval.nonceHash} AND "resourceHash" = ${approval.resourceHash}

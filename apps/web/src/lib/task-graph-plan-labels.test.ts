@@ -5,7 +5,7 @@ const taskGraphPlanLabelKeys = Object.keys(TASK_GRAPH_PLAN_LABELS.en) as TaskGra
 
 describe('TaskGraph plan labels', () => {
   it('keeps the English and Chinese label sets aligned', () => {
-    expect(taskGraphPlanLabelKeys).toHaveLength(67)
+    expect(taskGraphPlanLabelKeys).toHaveLength(68)
     expect(Object.keys(TASK_GRAPH_PLAN_LABELS.zh)).toEqual(taskGraphPlanLabelKeys)
   })
 
@@ -29,6 +29,8 @@ describe('TaskGraph plan labels', () => {
   it('labels repair lineage without implying a verdict', () => {
     expect(taskGraphPlanLabel('en', 'agent.taskGraph.repairAttemptFor')).toBe('Repair attempt for')
     expect(taskGraphPlanLabel('zh', 'agent.taskGraph.repairAttemptFor')).toBe('修复尝试：')
+    expect(taskGraphPlanLabel('en', 'agent.taskGraph.repairChecksNeedingAttention')).toBe('Related checks needing attention')
+    expect(taskGraphPlanLabel('zh', 'agent.taskGraph.repairChecksNeedingAttention')).toBe('相关待处理检查')
   })
 
   it('labels related task records as context rather than citations', () => {

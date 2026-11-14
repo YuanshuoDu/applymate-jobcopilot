@@ -39,12 +39,15 @@ export async function loadApplicationFillPreparation(
     if (bound.rows.length === 0) return await commitUnavailable(client, () => { committed = true })
     if (bound.rows.length !== 1) throw new Error("application_fill_binding_invalid")
     const task = bound.rows[0]!
-    if (task.status !== "filling" || task.checkpoint !== "taskgraph_fill_queued") {
-      throw new Error("application_fill_state_invalid")
-    }
     if (task.userId !== lease.userId || task.sessionId !== lease.sessionId
       || task.fillTurnUserId !== lease.userId || task.fillTurnSessionId !== lease.sessionId) {
       throw new Error("application_fill_binding_invalid")
+    }
+    if (task.status === "filling" && task.checkpoint === "browser_active") {
+      return await commitUnavailable(client, () => { committed = true })
+    }
+    if (task.status !== "filling" || task.checkpoint !== "taskgraph_fill_queued") {
+      throw new Error("application_fill_state_invalid")
     }
 
     const materials = await client.query<{ id: string }>(

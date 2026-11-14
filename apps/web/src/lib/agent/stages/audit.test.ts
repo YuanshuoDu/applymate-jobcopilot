@@ -64,6 +64,13 @@ describe('runAudit', () => {
     }))
   })
 
+  it('keeps the scheduled post-Gate audit read-only with respect to Gmail', async () => {
+    const result = await runAudit({ queued: [], failed: [] }, [] as Job[], context(), { syncGmail: false })
+
+    expect(mocks.syncGmailForUser).not.toHaveBeenCalled()
+    expect(result).toMatchObject({ ok: true, data: { warnings: [] } })
+  })
+
   it('verifies that dispatched jobs remain queued, submitting, or confirmed submissions', async () => {
     mocks.findMany.mockResolvedValue([{
       company: 'Example Co',

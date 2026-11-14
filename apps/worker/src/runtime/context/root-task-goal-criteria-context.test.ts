@@ -91,4 +91,16 @@ describe("canonical Root goal-criteria context", () => {
     expect(JSON.stringify(invalid)).not.toContain("PRIVATE_MALFORMED_VALUE")
     expect(rootTaskVerificationRequirementsObservation({ input: { goal } })).toBeUndefined()
   })
+
+  it("projects normalized location requirements only as untrusted planning data", () => {
+    const observation = rootTaskVerificationRequirementsObservation({ input: { verificationRequirements: {
+      schemaVersion: "agent-harness.v2.objective-requirements.v2",
+      requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin", "BERLIN"] } }],
+    } } })
+    expect(observation?.content).toMatchObject({
+      trust: "external_untrusted", status: "valid",
+      requirements: [{ id: "candidate-location", kind: "candidate_location_in", locations: ["berlin", "dublin"] }],
+    })
+    expect(JSON.stringify(observation)).not.toContain("minimum")
+  })
 })

@@ -56,19 +56,41 @@ describe("turn execution child wait recovery", () => {
       idempotencyKey: `task:child-1:event:step-completed:${state.recovery.stepId}` })
   })
 
-  it("does not rewrite stored usage on a completed step while repairing its final receipt", async () => {
+  it("returns the completed claim observation without rewriting its durable lifecycle", async () => {
     const state = fixture("completed")
     const recovery: ChildWaitClaimRecovery = { ...state.recovery, claimEventId: "claim-event",
       resultItem: { id: state.resultItemId, revision: 1, status: "completed" } }
-    await recoverChildWaitClaim(state.options, state.writer, recovery, () => new Date("2026-10-29T10:00:00.000Z"))
+    const result = await recoverChildWaitClaim(state.options, state.writer, recovery, () => new Date("2026-10-29T10:00:00.000Z"))
 
+    expect(result).toEqual({ id: "tool-result:provider-call", content: expect.objectContaining({ toolCallId: "provider-call",
+      toolName: "wait_subagents", input: state.input, status: "completed", output: recovery.output, errorCode: null }) })
     expect(state.updateStep).not.toHaveBeenCalled()
-    expect(state.events.map(event => event.type)).toEqual([
-      "item.completed", "tool_call.completed", "item.started", "item.completed", "step.completed",
-    ])
-    expect(state.events[0]).toMatchObject({ itemId: state.callItemId,
-      idempotencyKey: `task:child-1:event:tool-call-completed:provider-call:${state.callItemId}:1` })
-    expect(state.events.at(-1)?.type).toBe("step.completed")
+    expect(state.events).toEqual([])
+  })
+
+  it.each([
+    ["missing result item", undefined],
+    ["started result item", { id: "result-item", revision: 0, status: "started" as const }],
+    ["wrong result revision", { id: "result-item", revision: 2, status: "completed" as const }],
+  ])("rejects completed recovery with %s without writing", async (_label, resultItem) => {
+    const state = fixture("completed")
+    const recovery: ChildWaitClaimRecovery = { ...state.recovery, claimEventId: "claim-event",
+      ...(resultItem ? { resultItem } : {}) }
+
+    await expect(recoverChildWaitClaim(state.options, state.writer, recovery, () => new Date()))
+      .rejects.toThrow("child_resume_wait_tool_call_conflict")
+    expect(state.events).toEqual([])
+    expect(state.updateStep).not.toHaveBeenCalled()
+  })
+
+  it("keeps the streaming claim recovery lifecycle and closes its step", async () => {
+    const state = fixture()
+    const recovery: ChildWaitClaimRecovery = { ...state.recovery, claimEventId: "claim-event" }
+    const result = await recoverChildWaitClaim(state.options, state.writer, recovery, () => new Date("2026-10-29T10:00:00.000Z"))
+
+    expect(result.content).toMatchObject({ toolCallId: "provider-call", status: "completed", output: recovery.output })
+    expect(state.updateStep).toHaveBeenCalledWith(expect.objectContaining({ stepId: recovery.stepId, status: "completed" }))
+    expect(state.events.map(event => event.type)).toEqual(["item.completed", "tool_call.completed", "item.started", "item.completed", "step.completed"])
   })
 
   it("rejects a stale owner before claiming or updating any state", async () => {

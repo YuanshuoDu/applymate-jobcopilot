@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { AGENT_HARNESS_PROTOCOL_VERSION, AgentSessionControlCommandSchema, AgentSessionSchema, AgentTurnSchema, SessionControlEventPayloadSchema, schemaVersion, validate } from './index.js'
+import {
+  AGENT_HARNESS_PROTOCOL_VERSION,
+  AgentSessionControlCommandSchema,
+  AgentSessionSchema,
+  AgentTurnSchema,
+  OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+  SessionControlEventPayloadSchema,
+  TurnIntentSchema,
+  schemaVersion,
+  validate,
+} from './index.js'
 
 describe('public protocol export surface', () => {
   it('exposes schema and derived runtime validation from the package root', () => {
@@ -9,5 +19,7 @@ describe('public protocol export surface', () => {
     expect(AgentTurnSchema.$id).toBe('agent.turn')
     expect(AgentSessionControlCommandSchema.$id).toBe('agent.session.control.command')
     expect(SessionControlEventPayloadSchema.$id).toBe('agent.session.control.event-payload')
+    expect(TurnIntentSchema.$id).toBe('agent.turn-intent')
+    expect(validate(TurnIntentSchema, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)).toBe(true)
   })
 })

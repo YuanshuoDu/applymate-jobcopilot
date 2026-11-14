@@ -9,6 +9,27 @@ function TranslationProbe() {
 }
 
 describe('AI settings translations', () => {
+  it('localizes manual application recording guidance and statuses in every supported language', () => {
+    const keys = [
+      'agent.applyNow',
+      'agent.manualRecordGuidance',
+      'agent.manualRecordAction',
+      'agent.manualRecordPending',
+      'agent.manualRecordUnknown',
+      'agent.manualRecordReported',
+    ]
+
+    for (const { value: language } of LANGUAGES) {
+      for (const key of keys) {
+        expect(hasTranslation(language, key), `${language}:${key}`).toBe(true)
+        expect(translate(language, key), `${language}:${key}`).not.toBe(key)
+      }
+    }
+    expect(translate('en', 'agent.manualRecordGuidance')).toContain('only opens the employer page')
+    expect(translate('zh', 'agent.manualRecordGuidance')).toContain('只会打开雇主页面')
+    expect(hasTranslation('en', 'agent.confirmDelivery')).toBe(false)
+  })
+
   it('renders a user-facing saved-key placeholder instead of the translation key', () => {
     const html = renderToStaticMarkup(
       <I18nProvider>
@@ -28,6 +49,14 @@ describe('AI settings translations', () => {
     expect(translate('en', 'nav.dashboard')).toBe('Dashboard')
     expect(translate('zh', 'nav.dashboard')).toBe('仪表板')
     expect(translate('en', 'nav.dashboard')).not.toBe(translate('zh', 'nav.dashboard'))
+  })
+
+  it('uses consistent application and discovery navigation labels in English and Chinese', () => {
+    expect(translate('zh', 'nav.jobs')).toBe(translate('zh', 'jobs.title'))
+    expect(translate('zh', 'nav.jobs')).toBe('申请管理')
+    expect(translate('zh', 'nav.search')).toBe('发现职位')
+    expect(translate('en', 'nav.jobs')).toBe('Applications')
+    expect(translate('en', 'nav.search')).toBe('Discover')
   })
 
   it('provides both language values for the primary user surfaces', () => {

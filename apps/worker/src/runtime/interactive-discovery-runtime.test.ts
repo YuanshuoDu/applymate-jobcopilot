@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { createCanonicalRootToolGuards, interactiveDiscoveryCompletionGate, withInteractiveDiscoveryFinalResponse } from "./interactive-discovery-runtime.js"
+import { createCanonicalRootToolGuards, interactiveDiscoveryCompletionGate, objectiveTaskGraphRootToolAllowed, withInteractiveDiscoveryFinalResponse } from "./interactive-discovery-runtime.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
 import { reduceTaskGraphFinalSummary } from "./subagents/task-graph-final-summary.js"
 import type { TurnEngineStore } from "./turns/turn-engine-types.js"
@@ -8,6 +8,33 @@ import type { TurnEngineStore } from "./turns/turn-engine-types.js"
 const shortlist = { schemaVersion: 1 as const, status: "completed" as const, items: [{ jobId: "job-1", score: 8, evidenceIds: ["read:job:job-1"] }], failures: [] }
 
 describe("interactive discovery runtime", () => {
+  it("uses a closed Root objective surface and rejects hidden calls before dispatch", async () => {
+    const visible = ["agent.plan", "agent.ask_user", "agent.wait", "agent.list", "agent.reconcile"]
+      .map(name => ({ name, risk: "internal_write" }))
+    for (const name of visible.map(tool => tool.name)) expect(objectiveTaskGraphRootToolAllowed({ name, risk: "read" })).toBe(true)
+    for (const name of ["jobs.search", "persona.retrieve", "resume.get_base", "application.get", "agent.spawn", "spawn_subagent", "agent.followup", "scheduled.application.prepare", "tool_results.read"]) {
+      expect(objectiveTaskGraphRootToolAllowed({ name, risk: "read", capabilities: ["read"] })).toBe(false)
+    }
+    const routeTool = vi.fn(async (request: { call: { id: string; toolName: string } }) => ({ id: request.call.id, toolName: request.call.toolName, toolVersion: "1", status: "completed" as const, errorCode: null }))
+    const validateArguments = vi.fn(() => true)
+    const guards = createCanonicalRootToolGuards({ objectiveTaskGraphMode: true, objectiveRootTools: visible,
+      interactiveDiscoveryMode: false, selectedJobMode: false, routeTool: routeTool as never, validateArguments })
+    for (const toolName of ["jobs.search", "persona.retrieve", "agent.spawn", "spawn_subagent", "agent.followup", "application.submit"]) {
+      const request = { call: { id: toolName, toolName, toolVersion: "1", input: {} } } as never
+      await expect(guards.executeTool(request)).resolves.toMatchObject({ status: "failed", errorCode: "objective_task_graph_root_tool_disabled" })
+      expect(guards.validateToolArguments(toolName, {})).toBe("objective_task_graph_root_tool_disabled")
+    }
+    expect(routeTool).not.toHaveBeenCalled()
+    expect(validateArguments).not.toHaveBeenCalled()
+    for (const name of ["agent.ask_user", "agent.wait", "agent.list", "agent.reconcile"]) {
+      expect(guards.validateToolArguments(name, {})).toBe(true)
+    }
+    expect(guards.validateToolArguments("agent.plan", {})).toBe(true)
+    await expect(guards.executeTool({ call: { id: "plan", toolName: "agent.plan", toolVersion: "1", input: {} } } as never))
+      .resolves.toMatchObject({ status: "completed" })
+    expect(routeTool).toHaveBeenCalledOnce()
+  })
+
   it("denies tools outside the selected mode before routing or argument validation", async () => {
     const routeTool = vi.fn(async () => ({ id: "call-1", toolName: "jobs.search", toolVersion: "1", status: "completed" as const, errorCode: null }))
     const validateArguments = vi.fn(() => true)

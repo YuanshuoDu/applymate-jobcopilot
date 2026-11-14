@@ -64,26 +64,28 @@ function harness(options: { resourceHash?: string; approvalError?: string; targe
   const approvals: SubmissionApprovalStore = {
     inspectSubmissionInTransaction: vi.fn(async () => {
       if (options.approvalError) throw { code: options.approvalError }
-      return approval(options.resourceHash ?? base.hash, "consumed")
+      return approval(options.resourceHash ?? base.hash.slice("sha256:".length), "consumed")
     }),
     consumeSubmissionInTransaction: vi.fn(async () => {
       if (options.approvalError) throw { code: options.approvalError }
-      return approval(options.resourceHash ?? base.hash, "consumed")
+      return approval(options.resourceHash ?? base.hash.slice("sha256:".length), "consumed")
     }),
   }
   const submit = vi.fn(async (_input: { beforeSubmit: (intent?: SubmissionRequestIntent) => Promise<boolean> }) => ({ confirmationId: "confirmation-1", postSubmitUrl: "https://jobs.example/confirmation" }))
   const tool = createApplicationSubmitTool({
     identity, targets: { findTarget: vi.fn(async () => options.target === undefined ? target() : options.target) }, attempts, approvals, artifacts, submit,
   })
-  return { tool, attempts, approvals, submit, base }
+  return { tool, attempts, approvals, artifacts, submit, base }
 }
 
 describe("application.submit typed tool", () => {
-  it("atomically claims the exact application attempt and consumes its receipt before submission", async () => {
+  it("matches the bare approved digest to the exact persisted artifact hash before submission", async () => {
     const tested = harness()
     await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "submitted", confirmationId: "confirmation-1" })
     expect(tested.approvals.consumeSubmissionInTransaction).toHaveBeenCalledOnce()
-    expect(tested.attempts.rows.get(identity.approvalId)).toMatchObject({ state: "submitted", responseRef: "confirmation-1" })
+    expect(tested.attempts.rows.get(identity.approvalId)).toMatchObject({
+      state: "submitted", responseRef: "confirmation-1", artifactHash: tested.base.hash.slice("sha256:".length),
+    })
     expect(tested.submit).toHaveBeenCalledOnce()
   })
 
@@ -150,6 +152,25 @@ describe("application.submit typed tool", () => {
 
   it("fails closed when the approved artifact hash is stale", async () => {
     const tested = harness({ resourceHash: "f".repeat(64) })
+    await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "failed", errorCode: "stale_artifact", output: null })
+    expect(tested.submit).not.toHaveBeenCalled()
+    expect(tested.attempts.rows.get(identity.approvalId)).toMatchObject({ state: "failed", errorCode: "stale_artifact" })
+  })
+
+  it.each([
+    ["prefixed", `sha256:${"f".repeat(64)}`],
+    ["uppercase", "A".repeat(64)],
+    ["trailing newline", `${"f".repeat(64)}\n`],
+  ])("fails closed for a malformed approved artifact digest (%s)", async (_label, resourceHash) => {
+    const tested = harness({ resourceHash })
+    await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "failed", errorCode: "stale_artifact", output: null })
+    expect(tested.submit).not.toHaveBeenCalled()
+    expect(tested.attempts.rows.get(identity.approvalId)).toMatchObject({ state: "failed", errorCode: "stale_artifact" })
+  })
+
+  it("fails closed when the re-read persisted hash is malformed", async () => {
+    const tested = harness()
+    vi.spyOn(tested.artifacts, "read").mockResolvedValue({ ...tested.base, hash: `${tested.base.hash}\n` })
     await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "failed", errorCode: "stale_artifact", output: null })
     expect(tested.submit).not.toHaveBeenCalled()
     expect(tested.attempts.rows.get(identity.approvalId)).toMatchObject({ state: "failed", errorCode: "stale_artifact" })

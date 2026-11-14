@@ -4,7 +4,7 @@ import type pg from "pg"
 import { Value } from "@sinclair/typebox/value"
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 import { AgentModelError, type HarnessModelRequest, type ModelAdapter, type ModelStreamEvent } from "@jobcopilot/agent-model"
-import type { PolicyEngine } from "@jobcopilot/agent-policy"
+import { PolicyEngine } from "../policy/index.js"
 import { StepContextBuilder, type StepContext } from "../context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction, StepCheckpoint, StoredAgentInput } from "../context/input-claim-store.js"
 import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
@@ -12,6 +12,7 @@ import { nativeVerificationFeedbackText } from "../canonical-turn-native-verific
 import { buildCanonicalTurnResumeState } from "../canonical-turn-wait-resume-accounting.js"
 import type { NativeVerificationFeedback } from "../subagents/native-verification-port.js"
 import type { ChildWaitOrphanRecovery } from "../subagents/child-durable-wait-replay.js"
+import type { ChildToolReplayReceipt } from "./turn-execution-options.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
 import { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { createPgTurnEngineStore } from "./turn-engine-store.js"
@@ -19,11 +20,13 @@ import { createHarnessModelRuntime } from "../harness-model.js"
 import { toRepositoryJson, TurnEngineError, type TurnEngineEvent, type TurnEngineItem, type TurnEngineStore, type TurnEngineToolResult } from "./turn-engine-types.js"
 import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, TASK_GRAPH_DENIAL_CHECKPOINT, type TurnExecutionIdentity, type TurnExecutionOptions, type TurnExecutionStore } from "./turn-execution-types.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
-import { COGNITIVE_AGENDA_EVENT_TYPE } from "./cognitive-agenda-receipt.js"
+import { COGNITIVE_AGENDA_EVENT_TYPE, COGNITIVE_AGENDA_RECEIPT_V2_SCHEMA_VERSION } from "./cognitive-agenda-receipt.js"
+import { TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID, TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION } from "../context/task-graph-objective-progress.js"
 import { BudgetExceededError } from "../budget.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { classifyTurnFailure } from "./dlq.js"
-import { ToolExecutionError, type ToolExecutionContext } from "../tools/types.js"
+import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "../tools/types.js"
+import { createAskUserTool } from "../tools/ask-user.js"
 import { createTaskGraphPlanningTool } from "../tools/planning-executors.js"
 import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphScheduleReceipt } from "../subagents/task-graph-command-port.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
@@ -35,6 +38,7 @@ import { createReadOnlyTools, type ReadToolDataSource } from "../tools/read-tool
 import { InMemoryToolLifecycleSink, ToolLifecycle } from "../tools/lifecycle.js"
 import { ToolRouter } from "../tools/router.js"
 import { ToolRegistry } from "../tools/registry.js"
+import { createToolRouterExecutor } from "./turn-engine-helpers.js"
 import { OrphanPauseUsageRecoveredError } from "./turn-question-store-events.js"
 import { questionConflict } from "./turn-question-store-guards.js"
 import { SCHEDULED_PIPELINE_COMPLETION } from "./turn-execution-types.js"
@@ -61,6 +65,9 @@ const lateSteerText = "Prioritize senior engineering roles in Dublin."
 const taskGraphFeedbackLead = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
 function taskGraphCheckpoint(graphRevision: number, digest = "a"): TaskGraphDenialCheckpoint {
   return { schemaVersion: TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskId: "root-1", graphRevision, verificationDigest: digest.repeat(64) }
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
 }
 function checkpointedTaskGraphDenial(checkpoint: TaskGraphDenialCheckpoint) {
   const denial = { ok: false as const, blocker: "task_graph_verification_unverified", feedback: `${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing` }
@@ -165,7 +172,7 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
       requests.push(request)
       calls += 1
       if (calls === 1) {
-        yield { type: "tool_call_completed", callId: `call:${owner.taskId}`, name: "jobs.search", arguments: { location: "Dublin" } }
+        yield { type: "tool_call_completed", callId: `call:${owner.taskId}`, name: toolResult?.toolName ?? "jobs.search", arguments: { location: "Dublin" } }
         yield { type: "completed", finishReason: "tool_calls" }
       } else {
         yield { type: "text_delta", text: `done:${owner.taskId}` }
@@ -250,6 +257,12 @@ function nativeQuestionFixture(recovery: unknown = { status: "none" }, callId = 
   const stageQuestionUsage = vi.fn(async () => { timeline.push("stage") })
   const cancelPausedQuestion = vi.fn(async () => "cancelled" as const)
   const readPendingQuestion = vi.fn(async () => recovery as never)
+  const questionPolicy = new PolicyEngine({ snapshot: { version: "policy.v1", rules: [{
+    id: "native-question-test", roles: ["orchestrator"], tools: ["agent.ask_user"], toolVersions: ["1"],
+    risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["canManageChildren"],
+    outcome: "allow", reasonCode: "native_question_test", reason: "Allow the built-in native question in this test",
+  }] } })
+  const questionRouter = new ToolRouter(new ToolRegistry([createAskUserTool() as RuntimeToolDefinition]), new ToolLifecycle({ sink: new InMemoryToolLifecycleSink() }), questionPolicy)
   const model: ModelAdapter = { id: "fixture-model", profile, async *stream(request: HarnessModelRequest) {
     root.requests.push(request)
     yield { type: "tool_call_completed", callId, name: "agent.ask_user", arguments: { question: "Which city?" } }
@@ -258,6 +271,7 @@ function nativeQuestionFixture(recovery: unknown = { status: "none" }, callId = 
   } }
   root.options = {
     ...root.options, model, tools: [{ name: "agent.ask_user", version: "1" }],
+    actorRole: "orchestrator", capabilities: ["canManageChildren"],
     store: { ...baseStore,
       appendEvent: async input => {
         const suffix = input.itemId?.includes(":item:tool-result:") ? ":result" : input.itemId?.includes(":item:tool-call:") ? ":call" : ""
@@ -266,7 +280,7 @@ function nativeQuestionFixture(recovery: unknown = { status: "none" }, callId = 
       },
       stageQuestionUsage, cancelPausedQuestion, waitForQuestion: async input => { timeline.push("wait"); return waitForQuestion(input) }, readPendingQuestion,
     },
-    executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed", output: intent, errorCode: null }),
+    executeTool: createToolRouterExecutor(questionRouter),
   }
   return { ...root, timeline, usage, waitForQuestion, stageQuestionUsage, cancelPausedQuestion, readPendingQuestion }
 }
@@ -1452,7 +1466,7 @@ describe("owner-agnostic turn execution loop", () => {
     }
     const authorize = async (input: WorkerUsageAuthorizationInput): Promise<WorkerUsageAuthorization> => {
       authorizations.push(input)
-      return { settle: async settlement => { settlements.push(settlement) } }
+      return { outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async settlement => { settlements.push(settlement) }, settle: async settlement => { settlements.push(settlement) } }
     }
     const model = createUsageAwareModelAdapter(capturedRouter, { owner: root.options.identity, authorize })
     const goal = "Find senior software engineering roles in Dublin while preserving the original candidate constraints."
@@ -1525,7 +1539,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(authorizations).toHaveLength(2)
     expect(settlements).toEqual([
       { status: "success", inputTokens: 41, outputTokens: 13, estimatedCostUsd: 0.037 },
-      { status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "context_estimate_exceeded" },
+      { status: "error", inputTokens: null, outputTokens: null, estimatedCostUsd: null, errorCode: "context_estimate_exceeded" },
     ])
     expect(root.stepStatuses).toEqual(["completed", "failed"])
     expect(root.finalResponses).toHaveLength(1)
@@ -1778,11 +1792,12 @@ describe("owner-agnostic turn execution loop", () => {
 
   it.each(["accepted", "duplicate"] as const)("refreshes TaskGraph evidence after an inline-ready wait and %s plan", async planStatus => {
     const root = fixture(identity("turn", "root-1"))
+    const childWaitTaskId = "subagent-00000000-0000-4000-8000-000000000011"
     const currentGraph: TaskGraphCurrentState = {
       revision: 4,
       nodes: [{
         key: "child", templateId: "scout", goal: "Find roles", successCriteria: ["Return evidence"], dependsOn: [],
-        taskId: "child-1", status: "completed" as const, readiness: "terminal" as const,
+        taskId: childWaitTaskId, status: "completed" as const, readiness: "terminal" as const,
         resultSummary: "One matching role", failureReason: null,
         resultProjection: {
           schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted" as const,
@@ -1832,7 +1847,7 @@ describe("owner-agnostic turn execution loop", () => {
           root.requests.push(request)
           modelCalls += 1
           if (modelCalls === 1) {
-            yield { type: "tool_call_completed", callId: "wait-call", name: "agent.wait", arguments: { taskIds: ["child-1"], mode: "all", timeoutMs: 5000 } }
+            yield { type: "tool_call_completed", callId: "wait-call", name: "agent.wait", arguments: { taskIds: [childWaitTaskId], mode: "all", timeoutMs: 5000 } }
             yield { type: "completed", finishReason: "tool_calls" }
             return
           }
@@ -1855,7 +1870,10 @@ describe("owner-agnostic turn execution loop", () => {
       },
       executeTool: async input => {
         if (input.call.toolName === "agent.wait") {
-          return { id: input.call.id, toolName: input.call.toolName, toolVersion: "1", status: "completed", output: { waitId: "wait-1", status: "ready", matchedTaskIds: ["child-1"] }, errorCode: null }
+          return { id: input.call.id, toolName: input.call.toolName, toolVersion: "1", status: "completed", output: {
+            waitId: "wait-00000000-0000-4000-8000-000000000011", status: "ready", taskIds: [childWaitTaskId], matchedTaskIds: [childWaitTaskId],
+            deadlineAt: "2026-09-09T13:00:00.000Z", tasks: [{ taskId: childWaitTaskId, status: "completed", role: "scout", result: null, failureReason: null }],
+          }, errorCode: null }
         }
         const context: ToolExecutionContext = {
           scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId,
@@ -1905,6 +1923,79 @@ describe("owner-agnostic turn execution loop", () => {
       "turn:turn-1:event:cognitive.agenda:turn:turn-1:step:0",
       "turn:turn-1:event:cognitive.agenda:turn:turn-1:step:1",
     ])
+  })
+
+  it("keeps an in-memory Root progress snapshot and exposes only its bounded delta", async () => {
+    const root = fixture(identity("turn", "root-1")), digest = "d".repeat(64), base = root.options.contextBuilder
+    let buildCount = 0
+    const contextBuilder: TurnExecutionOptions["contextBuilder"] & { objectiveProgressGoalRevision: () => string } = {
+      ...base, objectiveProgressGoalRevision: () => digest, build: async (request: Parameters<typeof base.build>[0]) => {
+        const context = await base.build(request), revision = buildCount + 1
+        buildCount += 1
+        const status: "active" | "reported_passed" = revision === 1 ? "active" : "reported_passed"
+        const progress: { schemaVersion: typeof TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION; advisory: true; revision: number;
+          requirements: Array<{ id: string; kind: "candidate_count_gte"; minimum: number; status: "active" | "reported_passed" }> } = {
+          schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION, advisory: true, revision,
+          requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 3, status }],
+        }
+        const observation: StepContext["blocks"][number] = { id: TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID,
+          layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent", content: progress }
+        return { ...context, taskGraphRevision: revision, blocks: [...context.blocks, observation] }
+      } }
+    root.options = { ...root.options, contextBuilder }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const receipts = root.events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE && event.payload).map(event => event.payload as Record<string, unknown>)
+    const frame = root.requests[1]?.messages.find(message => message.content.some(part => part.type === "text"
+      && part.text.startsWith("[harness request context trust=UNTRUSTED_DATA source=cognitive_action_agenda]")))
+    const frameText = frame?.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 2 })
+    expect(receipts).toHaveLength(2)
+    expect(receipts[0]).toMatchObject({ schemaVersion: COGNITIVE_AGENDA_RECEIPT_V2_SCHEMA_VERSION, goalRevision: digest,
+      progressDelta: { availability: "unavailable", requirements: [{ beforeStatus: "unknown", afterStatus: "active" }] } })
+    expect(receipts[1]).toMatchObject({ progressDelta: { availability: "available", previousPlanRevision: 1, currentPlanRevision: 2,
+      requirements: [{ beforeStatus: "active", afterStatus: "reported_passed" }] } })
+    expect(frameText).toContain('"availability":"available"')
+    expect(frameText).toContain('"afterStatus":"reported_passed"')
+    expect(frameText).not.toContain(digest)
+    expect(frameText).not.toContain("objectiveProgressSnapshot")
+  })
+
+  it("does not treat a reported-passed progress delta as independent completion proof", async () => {
+    const root = fixture(identity("turn", "root-1")), digest = "e".repeat(64), base = root.options.contextBuilder
+    let buildCount = 0
+    const contextBuilder: TurnExecutionOptions["contextBuilder"] & { objectiveProgressGoalRevision: () => string } = {
+      ...base, objectiveProgressGoalRevision: () => digest, build: async (request: Parameters<typeof base.build>[0]) => {
+        const context = await base.build(request), revision = buildCount + 1
+        buildCount += 1
+        const progress: { schemaVersion: typeof TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION; advisory: true; revision: number;
+          requirements: Array<{ id: string; kind: "candidate_count_gte"; minimum: number; status: "active" | "reported_passed" }> } = {
+          schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION, advisory: true, revision,
+          requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 1, status: revision === 1 ? "active" : "reported_passed" }],
+        }
+        const observation: StepContext["blocks"][number] = { id: TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID,
+          layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent", content: progress }
+        return { ...context, taskGraphRevision: revision, blocks: [...context.blocks, observation] }
+      } }
+    const completionGate = vi.fn(async () => ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "Independent verification still requires proof." }))
+    root.options = { ...root.options, contextBuilder, completionGate, budget: { maxSteps: 2 } }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const frame = root.requests[1]?.messages.find(message => message.content.some(part => part.type === "text"
+      && part.text.startsWith("[harness request context trust=UNTRUSTED_DATA source=cognitive_action_agenda]")))
+    const frameText = frame?.content.flatMap(part => part.type === "text" ? [part.text] : [])
+      .find(text => text.startsWith("[harness request context trust=UNTRUSTED_DATA source=cognitive_action_agenda]")) ?? ""
+    const parsedProjection: unknown = JSON.parse(frameText.slice(frameText.indexOf("\n") + 1))
+    const projection = isRecord(parsedProjection) ? parsedProjection : undefined
+    const parsedProgressDelta = projection?.progressDelta
+    const progressDelta = isRecord(parsedProgressDelta) ? parsedProgressDelta : undefined
+
+    expect(progressDelta).toMatchObject({ availability: "available", requirements: [{ afterStatus: "reported_passed" }] })
+    expect(completionGate).toHaveBeenCalledOnce()
+    expect(completionGate).toHaveBeenCalledWith(expect.objectContaining({ candidateText: "done:root-1" }))
+    expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted", stepCount: 2 })
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
   })
 
   it.each([
@@ -2078,14 +2169,18 @@ describe("owner-agnostic turn execution loop", () => {
   })
 
   it("projects restored unsafe child call IDs as paired aliases and normalizes exact replay before dispatch", async () => {
-    const rawCallId = "+353 87 123 4567", input = { location: "Dublin" }
+    const rawCallId = "+353 87 123 4567", input = { location: "Dublin" }, output = { job: "persisted" }
     const observation = { id: `tool-result:${rawCallId}`, content: {
-      toolCallId: rawCallId, toolName: "jobs.search", input, status: "completed", output: { job: "persisted" }, errorCode: null,
+      toolCallId: rawCallId, toolName: "jobs.search", input, status: "completed", output, errorCode: null,
     } }
     const child = fixture(identity("task", "child-1"), undefined, [observation])
+    const receipt: ChildToolReplayReceipt = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+      taskId: "child-1", attempt: 1, stepId: "prior-step", toolCallId: rawCallId, toolName: "jobs.search", input,
+      callItem: { id: "call-item-1", revision: 2 }, resultItem: { id: "result-item-1", revision: 3 },
+      result: { status: "completed", output, errorCode: null } }
     const executeTool = vi.fn(child.options.executeTool), model = child.options.model, aliases: string[] = []
     let modelCalls = 0
-    child.options = { ...child.options, executeTool, model: { ...model, async *stream(request: HarnessModelRequest) {
+    child.options = { ...child.options, executeTool, childToolReplayReceipts: [receipt], model: { ...model, async *stream(request: HarnessModelRequest) {
       child.requests.push(request)
       const parts = request.messages.flatMap(message => message.content)
       const use = parts.find(part => part.type === "tool_use")
@@ -2114,6 +2209,177 @@ describe("owner-agnostic turn execution loop", () => {
     expect(JSON.stringify(child.requests.map(request => request.messages))).not.toContain(rawCallId)
     expect(executeTool).not.toHaveBeenCalled()
     expect(child.options.snapshot.toolObservations).toEqual([observation])
+  })
+
+  it("replays a reserved historical child ID only with its complete typed item receipt", async () => {
+    const rawCallId = "toolcall-historical-1", input = { query: "Dublin" }, output = { jobs: [] }
+    const observation = { id: "child-resume:result-item-1", content: {
+      toolCallId: rawCallId, toolName: "jobs.search", input, status: "completed", output, errorCode: null,
+    } }
+    const child = fixture(identity("task", "child-1", 2), undefined, [observation])
+    const receipt: ChildToolReplayReceipt = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+      taskId: "child-1", attempt: 1, stepId: "prior-step", toolCallId: rawCallId, toolName: "jobs.search", input,
+      callItem: { id: "call-item-1", revision: 2 }, resultItem: { id: "result-item-1", revision: 3 },
+      result: { status: "completed", output, errorCode: null } }
+    const executeTool = vi.fn(child.options.executeTool), model = child.options.model
+    child.options = { ...child.options, executeTool, childToolReplayReceipts: [receipt], model: { ...model, async *stream(request: HarnessModelRequest) {
+      child.requests.push(request)
+      if (child.requests.length === 1) {
+        const use = request.messages.flatMap(message => message.content).find(part => part.type === "tool_use")
+        if (!use || use.type !== "tool_use") throw new Error("reserved_alias_missing")
+        yield { type: "tool_call_completed", callId: use.id, name: "jobs.search", arguments: input }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } else {
+        yield { type: "text_delta", text: "replayed safely" }
+        yield { type: "completed", finishReason: "stop" }
+      }
+    } } }
+
+    const result = await runTurnExecutionLoop(child.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1, finalText: "replayed safely" })
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(child.events.filter(event => event.type === "tool_call.started" && event.payload !== undefined)).toHaveLength(1)
+    expect(JSON.stringify(child.requests.map(request => request.messages))).not.toContain(rawCallId)
+  })
+
+  it("rejects absent or unmapped reserved child IDs before call/result writes and tool execution", async () => {
+    for (const mode of ["missing-observation-receipt", "unmapped-model-call"] as const) {
+      const reserved = "toolcall-untrusted", child = fixture(identity("task", "child-1"), undefined,
+        mode === "missing-observation-receipt" ? [{ id: "child-resume:result-1", content: {
+          toolCallId: reserved, toolName: "jobs.search", input: { query: "Dublin" }, status: "completed", output: { jobs: [] }, errorCode: null,
+        } }] : [])
+      const executeTool = vi.fn(child.options.executeTool), model = child.options.model
+      let modelCalls = 0
+      child.options = { ...child.options, executeTool, model: { ...model, async *stream(request: HarnessModelRequest) {
+        child.requests.push(request); modelCalls += 1
+        if (mode === "unmapped-model-call") yield { type: "tool_call_completed", callId: reserved, name: "jobs.search", arguments: { query: "Dublin" } }
+        else yield { type: "text_delta", text: "must not reach provider" }
+        yield { type: "completed", finishReason: mode === "unmapped-model-call" ? "tool_calls" : "stop" }
+      } } }
+
+      const result = await runTurnExecutionLoop(child.options)
+      expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+      expect(modelCalls).toBe(mode === "unmapped-model-call" ? 1 : 0)
+      expect(executeTool).not.toHaveBeenCalled()
+      expect(child.events.some(event => event.type === "tool_call.started" && event.payload !== undefined)).toBe(false)
+      expect(child.events.some(event => event.type === "item.started" && event.payload !== undefined && ["tool_call", "tool_result"].includes(String((event.payload as { type?: unknown })?.type)))).toBe(false)
+    }
+  })
+
+  it.each(["truncated", "mutated"] as const)("rejects a %s current child alias before any call/result write or tool execution", async mode => {
+    const rawCallId = "toolcall-historical-1", input = { query: "Dublin" }, output = { jobs: [] }
+    const observation = { id: "child-resume:result-item-1", content: {
+      toolCallId: rawCallId, toolName: "jobs.search", input, status: "completed", output, errorCode: null,
+    } }
+    const child = fixture(identity("task", "child-1", 2), undefined, [observation])
+    const receipt: ChildToolReplayReceipt = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+      taskId: "child-1", attempt: 1, stepId: "prior-step", toolCallId: rawCallId, toolName: "jobs.search", input,
+      callItem: { id: "call-item-1", revision: 2 }, resultItem: { id: "result-item-1", revision: 3 },
+      result: { status: "completed", output, errorCode: null } }
+    const executeTool = vi.fn(child.options.executeTool), model = child.options.model
+    let projectedAlias = "", modelCalls = 0
+    child.options = { ...child.options, executeTool, childToolReplayReceipts: [receipt], model: { ...model, async *stream(request: HarnessModelRequest) {
+      child.requests.push(request); modelCalls += 1
+      const use = request.messages.flatMap(message => message.content).find(part => part.type === "tool_use" && part.name === "jobs.search")
+      if (!use || use.type !== "tool_use") throw new Error("reserved_alias_missing")
+      projectedAlias = use.id
+      const malformed = mode === "truncated" ? use.id.slice(0, -1)
+        : `${use.id.slice(0, 8)}${use.id[8] === "a" ? "b" : "a"}${use.id.slice(9)}`
+      yield { type: "tool_call_completed", callId: malformed, name: "jobs.search", arguments: input }
+      yield { type: "completed", finishReason: "tool_calls" }
+    } } }
+
+    const result = await runTurnExecutionLoop(child.options)
+    expect(projectedAlias).toMatch(/^toolcall[a-p]{64}[a-z]+$/)
+    expect(modelCalls).toBe(1)
+    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(child.events.some(event => event.type === "tool_call.started" && event.payload !== undefined)).toBe(false)
+    expect(child.events.some(event => event.type === "item.started" && event.payload !== undefined
+      && ["tool_call", "tool_result"].includes(String((event.payload as { type?: unknown })?.type)))).toBe(false)
+  })
+
+  it("rejects the raw canonical ID for an unsafe observation when its replay receipt is missing", async () => {
+    const rawCallId = "+353 87 123 4567", input = { location: "Dublin" }, output = { job: "unproved" }
+    const observation = { id: `tool-result:${rawCallId}`, content: {
+      toolCallId: rawCallId, toolName: "jobs.search", input, status: "completed", output, errorCode: null,
+    } }
+    const child = fixture(identity("task", "child-1"), undefined, [observation])
+    const executeTool = vi.fn(child.options.executeTool), model = child.options.model
+    let modelCalls = 0
+    child.options = { ...child.options, executeTool, model: { ...model, async *stream(request: HarnessModelRequest) {
+      child.requests.push(request); modelCalls += 1
+      yield { type: "tool_call_completed", callId: rawCallId, name: "jobs.search", arguments: input }
+      yield { type: "completed", finishReason: "tool_calls" }
+    } } }
+
+    const result = await runTurnExecutionLoop(child.options)
+    expect(modelCalls).toBe(1)
+    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(child.events.some(event => event.type === "tool_call.started" && event.payload !== undefined)).toBe(false)
+    expect(child.events.some(event => event.type === "item.started" && event.payload !== undefined
+      && ["tool_call", "tool_result"].includes(String((event.payload as { type?: unknown })?.type)))).toBe(false)
+  })
+
+  it("fails closed before replay persistence for redacted history and recovered wait-only evidence", async () => {
+    const cases = [
+      { id: "child-resume:result-item-1", toolCallId: "+353 87 123 4567", toolName: "jobs.search",
+        input: { query: "Dublin" }, output: { jobs: [] } },
+      { id: "child-resume:recovered-wait-result:wait-1", toolCallId: "wait-call", toolName: "wait_subagents",
+        input: { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 },
+        output: { waitId: "wait-1", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-01-01T00:00:00.000Z",
+          matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: null, failureReason: null }] } },
+    ] as const
+    for (const source of cases) {
+      const child = fixture(identity("task", "child-1", 2), undefined, [{ id: source.id, content: {
+        toolCallId: source.toolCallId, toolName: source.toolName, input: source.input, status: "completed", output: source.output, errorCode: null,
+      } }])
+      const executeTool = vi.fn(child.options.executeTool), model = child.options.model
+      child.options = { ...child.options, tools: [{ name: source.toolName, version: "1" }], executeTool, model: { ...model, async *stream(request: HarnessModelRequest) {
+        child.requests.push(request)
+        const use = request.messages.flatMap(message => message.content).find(part => part.type === "tool_use")
+        if (!use || use.type !== "tool_use") throw new Error("historical_alias_missing")
+        yield { type: "tool_call_completed", callId: use.id, name: source.toolName, arguments: source.input }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } } }
+
+      const result = await runTurnExecutionLoop(child.options)
+      expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+      expect(executeTool).not.toHaveBeenCalled()
+      expect(child.events.some(event => event.type === "tool_call.started" && event.payload !== undefined)).toBe(false)
+      expect(child.events.some(event => event.type === "item.started" && event.payload !== undefined
+        && ["tool_call", "tool_result"].includes(String((event.payload as { type?: unknown })?.type)))).toBe(false)
+    }
+  })
+
+  it("uses current-loop persisted handles to authorize exact unsafe replay without a second dispatch", async () => {
+    const rawCallId = "+353 87 123 4567", input = { location: "Dublin" }, child = fixture(identity("task", "child-1"))
+    const executeTool = vi.fn(async ({ call }: Parameters<TurnExecutionOptions["executeTool"]>[0]) => ({
+      id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: { jobs: [] }, errorCode: null,
+    }))
+    const model = child.options.model
+    child.options = { ...child.options, executeTool, model: { ...model, async *stream(request: HarnessModelRequest) {
+      child.requests.push(request)
+      if (child.requests.length === 1) {
+        yield { type: "tool_call_completed", callId: rawCallId, name: "jobs.search", arguments: input }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } else if (child.requests.length === 2) {
+        const use = request.messages.flatMap(message => message.content).find(part => part.type === "tool_use" && part.name === "jobs.search")
+        if (!use || use.type !== "tool_use") throw new Error("persisted_alias_missing")
+        yield { type: "tool_call_completed", callId: use.id, name: "jobs.search", arguments: input }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } else {
+        yield { type: "text_delta", text: "completed after exact replay" }
+        yield { type: "completed", finishReason: "stop" }
+      }
+    } } }
+
+    const result = await runTurnExecutionLoop(child.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 3, toolCallCount: 1, finalText: "completed after exact replay" })
+    expect(executeTool).toHaveBeenCalledOnce()
+    expect(child.events.filter(event => event.type === "tool_call.started" && event.payload !== undefined)).toHaveLength(1)
+    expect(JSON.stringify(child.requests.map(request => request.messages))).not.toContain(rawCallId)
   })
 
   it("projects a fresh unsafe child call observation on the following model step", async () => {
@@ -2148,7 +2414,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(child.options.snapshot.toolObservations).toEqual([])
   })
 
-  it("keeps duplicate child-call rejection private after an unsafe ID is aliased on the next step", async () => {
+  it("suppresses an exact replay collision after an unsafe ID is aliased on the next step", async () => {
     const rawCallId = "+353 87 123 4567", input = { location: "Dublin" }
     const child = fixture(identity("task", "child-1")), executeTool = vi.fn(child.options.executeTool), model = child.options.model
     let modelCalls = 0, replayAlias = ""
@@ -2170,7 +2436,7 @@ describe("owner-agnostic turn execution loop", () => {
     const terminalEvents = child.events.filter(event => event.payload !== undefined && (event.type === "task.failed"
       || (event.type === "item.completed" && event.itemId === failedEvent?.itemId)))
     const persistedCalls = child.events.filter(event => event.type === "tool_call.started" && event.payload !== undefined)
-    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress" })
     expect(executeTool).toHaveBeenCalledOnce()
     expect(executeTool.mock.calls[0]?.[0].call.id).toBe(rawCallId)
     expect(replayAlias).not.toBe(rawCallId)
@@ -3111,9 +3377,11 @@ describe("owner-agnostic turn execution loop", () => {
     const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = vi.fn(async () => checkpointedTaskGraphDenial(checkpoint))
     Object.defineProperty(completionGate, READ_TASK_GRAPH_DENIAL_CHECKPOINT, { value: read })
     const baseModel = root.options.model
+    const childWaitTaskId = "subagent-00000000-0000-4000-8000-000000000012"
     const waitOutput = {
-      waitId: "wait-ready-between-denials", status: "ready", deadlineAt: "2026-09-09T13:00:00.000Z",
-      matchedTaskIds: ["child-1"], taskIds: ["child-1"],
+      waitId: "wait-00000000-0000-4000-8000-000000000012", status: "ready", deadlineAt: "2026-09-09T13:00:00.000Z",
+      matchedTaskIds: [childWaitTaskId], taskIds: [childWaitTaskId],
+      tasks: [{ taskId: childWaitTaskId, status: "completed", role: "scout", result: null, failureReason: null }],
     }
     let callCount = 0
     root.options = {
@@ -3131,7 +3399,7 @@ describe("owner-agnostic turn execution loop", () => {
         root.requests.push(request)
         callCount += 1
         if (callCount === 2) {
-          yield { type: "tool_call_completed", callId: "intervening-ready-wait", name: "agent.wait", arguments: { taskIds: ["child-1"], mode: "all", timeoutMs: 5_000 } }
+          yield { type: "tool_call_completed", callId: "intervening-ready-wait", name: "agent.wait", arguments: { taskIds: [childWaitTaskId], mode: "all", timeoutMs: 5_000 } }
           yield { type: "completed", finishReason: "tool_calls" }
           return
         }
@@ -3147,7 +3415,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.requests).toHaveLength(4)
     expect(completionGate).toHaveBeenCalledTimes(3)
     expect(read).toHaveBeenCalled()
-    expect(thirdRequest).toContain("wait-ready-between-denials")
+    expect(thirdRequest).toContain("wait-00000000-0000-4000-8000-000000000012")
     expect(thirdRequest).toContain('"status":"ready"')
     expect(new Set(root.events.filter(event => event.type === "agent.plan.denial_checkpoint").map(event => event.id)).size).toBe(3)
     expect(new Set(root.events.filter(event => event.type === "tool_call.completed").map(event => event.id)).size).toBe(1)
@@ -3850,12 +4118,14 @@ describe("owner-agnostic turn execution loop", () => {
   })
 
   it("persists a waiting tool result before returning a dependency wait", async () => {
+    const childTaskId = "subagent-00000000-0000-4000-8000-000000000004"
     const child = fixture(identity("task", "child-wait", 2), {
       id: "wait-call", toolName: "wait_subagents", toolVersion: "1", status: "completed",
-      output: { waitId: "wait-12345678-1234-4234-9234-123456789012", status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: ["child-a"] }, errorCode: null,
+      output: { waitId: "12345678-1234-4234-9234-123456789012", status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z",
+        matchedTaskIds: [], taskIds: [childTaskId], tasks: [{ taskId: childTaskId, status: "waiting", role: "scout", result: null, failureReason: null }] }, errorCode: null,
     })
     const result = await runTurnExecutionLoop(child.options)
-    expect(result).toMatchObject({ status: "waiting_for_dependency", waitId: "wait-12345678-1234-4234-9234-123456789012", stepCount: 1, toolCallCount: 1 })
+    expect(result).toMatchObject({ status: "waiting_for_dependency", waitId: "12345678-1234-4234-9234-123456789012", stepCount: 1, toolCallCount: 1 })
     expect(result.finalText).toBeUndefined()
     expect(child.requests).toHaveLength(1)
     expect(child.stepStatuses).toContain("waiting_for_tool")
@@ -3864,8 +4134,30 @@ describe("owner-agnostic turn execution loop", () => {
     expect(child.events.some(event => event.type === "turn.completed" || event.type === "turn.failed")).toBe(false)
   })
 
+  it("accepts the root wait_subagents alias only with the root-prefixed receipt ID", async () => {
+    const waitId = "wait-12345678-1234-4234-9234-123456789012"
+    const childTaskId = "subagent-00000000-0000-4000-8000-000000000004"
+    const root = fixture(identity("turn", "root-1"), {
+      id: "root-wait-alias", toolName: "wait_subagents", toolVersion: "1", status: "completed",
+      output: { waitId, status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: [childTaskId],
+        tasks: [{ taskId: childTaskId, status: "waiting", role: "scout", result: null, failureReason: null }] }, errorCode: null,
+    })
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "waiting_for_dependency", waitId })
+  })
+
+  it("rejects a child-only agent.wait alias even when its receipt uses the root ID shape", async () => {
+    const child = fixture(identity("task", "child-wait", 2), {
+      id: "child-agent-wait", toolName: "agent.wait", toolVersion: "1", status: "completed",
+      output: { waitId: "wait-12345678-1234-4234-9234-123456789012", status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [] }, errorCode: null,
+    })
+    await expect(runTurnExecutionLoop(child.options)).resolves.toMatchObject({ status: "failed", errorCode: "invalid_output" })
+  })
+
   it("continues to the next model step for ready wait output", async () => {
-    const output = { waitId: "wait-ready", status: "ready", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: ["child-a"] }
+    const childTaskId = "subagent-00000000-0000-4000-8000-000000000004"
+    const output = { waitId: "wait-12345678-1234-4234-9234-123456789012", status: "ready", deadlineAt: "2026-09-09T13:00:00.000Z",
+      taskIds: [childTaskId], matchedTaskIds: [childTaskId],
+      tasks: [{ taskId: childTaskId, status: "completed", role: "scout", result: null, failureReason: null }] }
     const root = fixture(identity("turn", "root-1"), { id: "wait-call", toolName: "wait_subagents", toolVersion: "1", status: "completed", output, errorCode: null })
     const result = await runTurnExecutionLoop(root.options)
     expect(result.status).toBe("completed")
@@ -3875,6 +4167,7 @@ describe("owner-agnostic turn execution loop", () => {
 
   it.each([
     { label: "malformed ID", output: { waitId: "wait-invalid", status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: ["child-a"] } },
+    { label: "child ID on root alias", output: { waitId: "12345678-1234-4234-9234-123456789012", status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: ["child-a"] } },
     { label: "missing ID", output: { status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: ["child-a"] } },
   ])("fails the Turn visibly for a waiting receipt with a $label", async ({ output }) => {
     const root = fixture(identity("turn", "root-1"), { id: "wait-call", toolName: "wait_subagents", toolVersion: "1", status: "completed", output, errorCode: null })

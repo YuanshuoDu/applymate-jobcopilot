@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool, type PoolClient } from "pg"
-import { redactAgentEvent } from "@jobcopilot/shared"
+import { redactAgentEvent, redactSensitiveText } from "@jobcopilot/shared"
 import { executionKey } from "../turns/turn-execution-types.js"
 import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
@@ -36,7 +36,9 @@ function disposableUrl(): string | null {
 }
 
 const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : describe.skip
-const suffix = randomUUID(), ids = {
+const suffix = randomUUID()
+const redactionCanaryInputId = `12345678-1234-4234-9234-${suffix.replaceAll("-", "").slice(0, 12)}`
+const ids = {
   user: `steering-reconcile-user-${suffix}`, session: `steering-reconcile-session-${suffix}`,
   turn: `steering-reconcile-turn-${suffix}`, root: `steering-reconcile-root-${suffix}`,
   graphChild: `steering-reconcile-graph-child-${suffix}`,
@@ -567,12 +569,29 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
   })
 
   it("hydrates a first-time accepted steer into its StepContext and rolls back a failed claim with its checkpoint", async () => {
-    const steerId = `steering-context-steer-${suffix}`, stepId = `steering-context-step-${suffix}`
+    const steerId = redactionCanaryInputId, stepId = `steering-context-step-${suffix}`
+    const redactedSteerId = redactSensitiveText(steerId)
+    expect(redactedSteerId !== steerId).toBe(true)
+    const prefixedCanaryId = `steering-context-steer-${steerId}`
+    const prefixedPayload = acceptedEventPayload({ inputId: prefixedCanaryId, itemId: randomUUID(),
+      clientMessageId: `${prefixedCanaryId}-message`, delivery: "steer", disposition: "steered" })
+    const inputIdFromPayload = (value: unknown) => value && typeof value === "object" && !Array.isArray(value) && "inputId" in value
+      ? value.inputId : undefined
+    const prefixedProjectedId = inputIdFromPayload(prefixedPayload)
+    expect(prefixedProjectedId !== prefixedCanaryId).toBe(true)
+    expect(prefixedProjectedId === redactSensitiveText(prefixedCanaryId)).toBe(true)
     const priorCursor = Number((await adminPool!.query<{ eventSequence: string }>(
       `SELECT "eventSequence"::text AS "eventSequence" FROM "agent_sessions" WHERE "id" = $1`, [ids.session])).rows[0]?.eventSequence)
     await seedStep(stepId, 9, "streaming", priorCursor, [])
-    const { sequence: acceptedSequence } = await acceptanceTransaction({ id: steerId, messageId: `${steerId}-message`, text: "Prioritize remote roles in Ireland" })
+    const { sequence: acceptedSequence, eventId: acceptedEventId } = await acceptanceTransaction({ id: steerId, messageId: `${steerId}-message`, text: "Prioritize remote roles in Ireland" })
     expect(acceptedSequence).toBeGreaterThan(priorCursor)
+    const acceptedEvent = await adminPool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
+      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "sequence" = $4 AND "type" = 'input.accepted' LIMIT 2`,
+    [acceptedEventId, ids.session, ids.turn, acceptedSequence])
+    expect(acceptedEvent.rows).toHaveLength(1)
+    const persistedInputId = inputIdFromPayload(acceptedEvent.rows[0]?.payload)
+    expect(persistedInputId === steerId).toBe(true)
+    expect(persistedInputId === redactedSteerId).toBe(false)
 
     const builder = new StepContextBuilder(createPgInputClaimStore(restrictedCommandPool(runtimePool!), { userId: ids.user }), undefined, () => new Date(), hydrationScope)
     const stepContext = await builder.build({ scope: { userId: ids.user }, sessionId: ids.session, turnId: ids.turn, taskId: ids.root, stepId,
@@ -587,7 +606,7 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
        WHERE input."id" = $1 AND step."sessionId" = input."sessionId" AND step."turnId" = input."targetTurnId"`, [steerId, stepId])
     expect(durableClaim.rows[0]).toEqual({ status: "consumed", consumedByStepId: stepId,
       cursor: String(acceptedSequence), ids: [steerId] })
-    const failedSteerId = `steering-context-invalid-steer-${suffix}`, failedStepId = `steering-context-invalid-step-${suffix}`
+    const failedSteerId = randomUUID(), failedStepId = `steering-context-invalid-step-${suffix}`
     const failedPriorCursor = acceptedSequence
     await seedStep(failedStepId, 10, "streaming", failedPriorCursor, [])
     const { sequence: failedSequence, eventId: failedEventId } = await acceptanceTransaction({ id: failedSteerId, messageId: `${failedSteerId}-message`, text: "This input must roll back" })
@@ -619,7 +638,7 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
   })
 
   it("rolls back an observed steering marker and outbox row when checkpoint hydration rejects its provenance", async () => {
-    const steerId = `steering-marker-invalid-steer-${suffix}`, stepId = `steering-marker-invalid-step-${suffix}`
+    const steerId = randomUUID(), stepId = `steering-marker-invalid-step-${suffix}`
     const priorCursor = Number((await adminPool!.query<{ eventSequence: string }>(
       `SELECT "eventSequence"::text AS "eventSequence" FROM "agent_sessions" WHERE "id" = $1`, [ids.session])).rows[0]?.eventSequence)
     await seedStep(stepId, 11, "streaming", priorCursor, [])

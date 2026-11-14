@@ -38,6 +38,9 @@ export async function validateTaskGraphRepairTargets(
       || row.failureReason !== `task_graph_verification_${report.status}`) throw new Error("task_graph_repair_target_unresolved")
     const statuses = new Map(report.criteria.map(item => [item.criterionId, item.status] as const))
     if (!relation.criterionIds.every(id => statuses.get(id) === "failed" || statuses.get(id) === "unverified")) throw new Error("task_graph_repair_criteria_resolved")
+    const relationIds = new Set(relation.criterionIds)
+    const inheritedGuards = (proposal.verification?.criteria ?? []).filter(item => !relationIds.has(item.id))
+    if (inheritedGuards.some(item => statuses.get(item.id) !== "passed")) throw new Error("task_graph_repair_target_unresolved")
     const priorRepairs = snapshot.nodes.filter(node => node.repairOf?.graphRootTaskId === relation.graphRootTaskId
       && node.repairOf.nodeKey === relation.nodeKey && node.repairOf.taskId === relation.taskId)
     if (priorRepairs.length && await hasResolvingRepairReceipt(client, scope, priorRepairs, relation.criterionIds)) {

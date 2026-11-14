@@ -27,8 +27,8 @@ export class TreeBudgetStoreError extends Error {
   }
 }
 
-const ACTIVE_ROOT = "'queued', 'running', 'retrying', 'waiting', 'waiting_for_user'"
-const ACTIVE_TURN = "'queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval', 'waiting_for_user'"
+const ACTIVE_ROOT = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user"])
+const ACTIVE_TURN = new Set(["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
 const OPEN_SESSION = `"status" NOT IN ('aborted', 'archived')`
 
 function text(value: unknown, name: string): string {
@@ -101,55 +101,69 @@ async function transaction<T>(pool: Pool, userId: string, work: (client: Client)
   } finally { client.release() }
 }
 
-async function lockRoot(client: Client, input: TreeBudgetRootIdentity): Promise<RootRow> {
+async function lockRoot(client: Client, input: TreeBudgetRootIdentity, active = false): Promise<RootRow> {
   const result = await client.query<RootRow>(`SELECT root_task."id" AS "id", root_task."sessionId" AS "sessionId", root_task."turnId" AS "turnId", root_task."rootTaskId" AS "rootTaskId", root_task."budgetSnapshot" AS "budgetSnapshot", root_task."status" AS "status", root_task."interruptRequestedAt" AS "interruptRequestedAt"
     FROM "sub_agent_tasks" AS root_task JOIN "agent_sessions" AS session ON session."id" = root_task."sessionId"
     WHERE root_task."id" = $1 AND root_task."sessionId" = $2 AND root_task."turnId" = $3
       AND root_task."rootTaskId" = $1 AND session."userId" = $4 FOR UPDATE OF root_task`,
   [input.rootTaskId, input.sessionId, input.turnId, input.userId]) as QueryResult<RootRow>
   if (!result.rows[0]) throw new TreeBudgetStoreError("root_not_found")
+  if (active && (!ACTIVE_ROOT.has(result.rows[0].status) || result.rows[0].interruptRequestedAt !== null)) throw new TreeBudgetStoreError("lineage_rejected")
   return result.rows[0]
 }
 
-async function lockSession(client: Client, input: Pick<TreeBudgetRootIdentity, "userId" | "sessionId">): Promise<void> {
+async function lockTurn(client: Client, input: TreeBudgetRootIdentity, active: boolean): Promise<void> {
+  const result = await client.query<{ id: string; rootTaskId: string | null; status: string }>(
+    `SELECT "id", "rootTaskId", "status" FROM "agent_turns"
+     WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`,
+    [input.turnId, input.sessionId, input.userId],
+  ) as QueryResult<{ id: string; rootTaskId: string | null; status: string }>
+  const turn = result.rows[0]
+  if (!turn || turn.rootTaskId !== input.rootTaskId || (active && !ACTIVE_TURN.has(turn.status))) throw new TreeBudgetStoreError("lineage_rejected")
+}
+
+async function lockSession(client: Client, input: Pick<TreeBudgetRootIdentity, "userId" | "sessionId">, active = true): Promise<void> {
   const result = await client.query<{ id: string; userId: string; status: string }>(
     `SELECT "id", "userId", "status" FROM "agent_sessions"
-     WHERE "id" = $1 AND "userId" = $2 AND ${OPEN_SESSION} FOR UPDATE`,
+     WHERE "id" = $1 AND "userId" = $2 ${active ? `AND ${OPEN_SESSION}` : ""} FOR UPDATE`,
     [input.sessionId, input.userId],
   ) as QueryResult<{ id: string; userId: string; status: string }>
   if (!result.rows[0]) throw new TreeBudgetStoreError("root_not_found")
 }
 
+async function lockOwnerAndStep(client: Client, input: TreeBudgetReserveInput, active: boolean): Promise<void> {
+  const taskValues = active
+    ? [input.taskId, input.sessionId, input.turnId, input.rootTaskId, input.attempt]
+    : [input.taskId, input.sessionId, input.turnId, input.rootTaskId]
+  const tasks = await client.query<{ id: string }>(
+    `SELECT "id" FROM "sub_agent_tasks"
+     WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4
+       ${active ? `AND "status" = 'running' AND "interruptRequestedAt" IS NULL AND "attemptCount" = $5
+         AND "leaseOwner" IS NOT NULL AND "leaseExpiresAt" > CURRENT_TIMESTAMP` : ""} FOR UPDATE`,
+    taskValues,
+  ) as QueryResult<{ id: string }>
+  if (!tasks.rows[0]) throw new TreeBudgetStoreError("lineage_rejected")
+  const stepValues = active
+    ? [input.stepId, input.sessionId, input.turnId, input.taskId, input.attempt]
+    : [input.stepId, input.sessionId, input.turnId, input.taskId]
+  const steps = await client.query<{ id: string }>(
+    `SELECT "id" FROM "agent_steps"
+     WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4
+       ${active ? `AND "status" = 'streaming' AND "attempt" = $5` : ""} FOR UPDATE`,
+    stepValues,
+  ) as QueryResult<{ id: string }>
+  if (!steps.rows[0]) throw new TreeBudgetStoreError("lineage_rejected")
+}
+
 async function findExisting(client: Client, input: TreeBudgetReserveInput): Promise<TreeBudgetReservation | null> {
   const result = await client.query<Row>(`SELECT * FROM "agent_tree_budget_reservations"
     WHERE ("rootTaskId" = $1 AND "taskId" = $2 AND "stepId" = $3 AND "attempt" = $4)
-       OR ("sessionId" = $5 AND "idempotencyKey" = $6) FOR UPDATE`, [input.rootTaskId, input.taskId, input.stepId, input.attempt, input.sessionId, input.idempotencyKey]) as QueryResult<Row>
+       OR ("sessionId" = $5 AND "idempotencyKey" = $6)`, [input.rootTaskId, input.taskId, input.stepId, input.attempt, input.sessionId, input.idempotencyKey]) as QueryResult<Row>
   if (!result.rows[0]) return null
   const found = reservation(result.rows[0])
   if (result.rows.some(row => !identityMatches(found, reservation(row))) || !identityMatches(found, input)) throw new TreeBudgetStoreError("reservation_conflict")
   if (found.status === "released") throw new TreeBudgetStoreError("reservation_conflict")
   return found
-}
-
-async function assertLineage(client: Client, input: TreeBudgetReserveInput): Promise<void> {
-  const result = await client.query<{ id: string }>(`SELECT task."id"
-    FROM "sub_agent_tasks" AS task
-    JOIN "sub_agent_tasks" AS root_task ON root_task."id" = task."rootTaskId" AND root_task."sessionId" = task."sessionId"
-      AND root_task."rootTaskId" = root_task."id" AND root_task."turnId" = task."turnId"
-    JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
-    JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
-      AND turn."rootTaskId" = root_task."id"
-    JOIN "agent_steps" AS step ON step."id" = $6 AND step."turnId" = task."turnId" AND step."sessionId" = task."sessionId"
-      AND step."taskId" = task."id"
-    WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
-      AND session."userId" = $5 AND turn."userId" = $5
-      AND task."status" = 'running' AND task."interruptRequestedAt" IS NULL
-      AND task."attemptCount" = $7
-      AND task."leaseOwner" IS NOT NULL AND task."leaseExpiresAt" > CURRENT_TIMESTAMP
-      AND root_task."status" IN (${ACTIVE_ROOT}) AND root_task."interruptRequestedAt" IS NULL
-      AND turn."status" IN (${ACTIVE_TURN}) AND step."attempt" = $7 AND step."status" = 'streaming'
-    FOR UPDATE OF task, turn, step`, [input.taskId, input.sessionId, input.turnId, input.rootTaskId, input.userId, input.stepId, input.attempt]) as QueryResult<{ id: string }>
-  if (!result.rows[0]) throw new TreeBudgetStoreError("lineage_rejected")
 }
 
 async function countActive(client: Client, input: TreeBudgetReserveInput): Promise<number> {
@@ -172,6 +186,7 @@ export function createPgTreeBudgetReservationStore(pool: Pool): TreeBudgetReserv
       }
       return transaction(pool, input.userId, async client => {
         await lockSession(client, input)
+        await lockTurn(client, input, false)
         const root = await lockRoot(client, input)
         return executionLimits(root.budgetSnapshot)
       })
@@ -181,10 +196,11 @@ export function createPgTreeBudgetReservationStore(pool: Pool): TreeBudgetReserv
       const timestamp = now(input.now)
       return transaction(pool, input.userId, async client => {
         await lockSession(client, input)
-        const root = await lockRoot(client, input)
+        await lockTurn(client, input, true)
+        const root = await lockRoot(client, input, true)
         const existing = await findExisting(client, input)
         if (existing) return existing
-        await assertLineage(client, input)
+        await lockOwnerAndStep(client, input, true)
         const used = await countActive(client, input)
         if (used + 1 > maxSteps(root.budgetSnapshot)) throw new TreeBudgetStoreError("tree_step_budget_exhausted")
         try {
@@ -205,6 +221,10 @@ export function createPgTreeBudgetReservationStore(pool: Pool): TreeBudgetReserv
       const input = { ...raw, userId: text(raw.userId, "userId"), sessionId: text(raw.sessionId, "sessionId"), turnId: text(raw.turnId, "turnId"), rootTaskId: text(raw.rootTaskId, "rootTaskId"), taskId: text(raw.taskId, "taskId"), stepId: text(raw.stepId, "stepId"), attempt: positiveInt(raw.attempt, "attempt"), id: text(raw.id, "id"), idempotencyKey: text(raw.idempotencyKey, "idempotencyKey") }
       const timestamp = now(input.now)
       return transaction(pool, input.userId, async client => {
+        await lockSession(client, input, false)
+        await lockTurn(client, input, false)
+        await lockRoot(client, input, false)
+        await lockOwnerAndStep(client, input, false)
         const result = await client.query<Row>(`SELECT * FROM "agent_tree_budget_reservations" WHERE "id" = $1 FOR UPDATE`, [input.id]) as QueryResult<Row>
         if (!result.rows[0]) throw new TreeBudgetStoreError("reservation_missing")
         const current = reservation(result.rows[0])

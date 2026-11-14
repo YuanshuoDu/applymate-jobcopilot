@@ -6,6 +6,7 @@ import { parseTaskGraphNativeDelegation, TASK_GRAPH_NATIVE_TEMPLATE_ID } from ".
 import { parseRegisteredScoutEnvelope, taskGraphNodeKeysMatch, type RegisteredScoutEnvelope } from "./task-graph-command-port.js"
 import { APPLICATION_FILLER_TEMPLATE_ID } from "./role-policy.js"
 import { readPinnedRootCriteria } from "./root-plan-criteria.js"
+import { parseTaskGraphSnapshotPackageRefs, taskGraphSnapshotCapacityValid, taskGraphSnapshotStringList as stringList } from "./task-graph-snapshot-capacity.js"
 
 export const TASK_GRAPH_ITEM_TYPE = "task_graph"
 export const TASK_GRAPH_SNAPSHOT_VERSION = "agent-harness.v2.task-graph"
@@ -24,7 +25,7 @@ export type TaskGraphSnapshot = Readonly<{
   rootSuccessCriteria?: readonly string[]
 }>
 
-const MAX_NODES = TASK_GRAPH_LIMITS.maxNodes, MAX_SNAPSHOT_BYTES = TASK_GRAPH_LIMITS.maxSnapshotBytes
+const MAX_NODES = TASK_GRAPH_LIMITS.maxPersistedNodes, MAX_SNAPSHOT_BYTES = TASK_GRAPH_LIMITS.maxSnapshotBytes
 const MAX_DEPTH = TASK_GRAPH_LIMITS.maxDepth, MAX_KEY_LENGTH = TASK_GRAPH_LIMITS.maxKeyLength
 const MAX_TEMPLATE_ID_LENGTH = TASK_GRAPH_LIMITS.maxTemplateIdLength, MAX_GOAL_LENGTH = TASK_GRAPH_LIMITS.maxGoalLength
 const MAX_CRITERIA = TASK_GRAPH_LIMITS.maxSuccessCriteria, MAX_CRITERION_LENGTH = TASK_GRAPH_LIMITS.maxCriterionLength
@@ -34,7 +35,7 @@ const NODE_KEYS_WITH_DISPOSITION = `${LEGACY_NODE_KEYS},verificationDisposition`
 const NODE_KEYS_WITH_VERIFICATION = `${LEGACY_NODE_KEYS},verification,verificationDisposition`
 const NODE_KEYS_WITH_REPAIR = "dependsOn,depth,goal,key,repairOf,successCriteria,taskId,templateId,verification,verificationDisposition"
 const NATIVE_NODE_KEYS = "dependsOn,depth,goal,key,nativeDelegation,successCriteria,taskId,templateId,verificationDisposition"
-const SPECIALIZED_TEMPLATE_IDS = new Set(["cover_letter_writer", "cover_letter_reviewer", APPLICATION_FILLER_TEMPLATE_ID, "prepare", "gate", "scheduled_audit"])
+const SPECIALIZED_TEMPLATE_IDS = new Set(["cover_letter_writer", "cover_letter_reviewer", APPLICATION_FILLER_TEMPLATE_ID, "prepare", "gate", "scheduled_audit", "scheduled.application.execute", "scheduled.post_gate_audit"])
 
 const TASK_STATUSES = new Set<SubagentTaskStatus>([
   "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",
@@ -54,18 +55,6 @@ function exactKeys(value: Record<string, unknown>, expected: string): boolean {
 }
 function text(value: unknown, maxLength = Number.MAX_SAFE_INTEGER): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength
-}
-function stringList(value: unknown, maxItems: number, maxLength: number, allowEmpty: boolean): value is string[] {
-  if (!Array.isArray(value) || value.length > maxItems || (!allowEmpty && value.length === 0)) return false
-  const keys = Reflect.ownKeys(value)
-  if (keys.length !== value.length + 1) return false
-  for (const key of keys) {
-    if (key === "length") continue
-    if (typeof key !== "string") return false
-    const index = Number(key)
-    if (!Number.isSafeInteger(index) || index < 0 || index >= value.length || String(index) !== key || !text(value[index], maxLength)) return false
-  }
-  return true
 }
 function parsedRepairOf(value: unknown): TaskGraphRepairOf | undefined {
   const row = object(value)
@@ -90,17 +79,20 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
     const dispositionShape = node !== null && taskGraphNodeKeysMatch(node, NODE_KEYS_WITH_DISPOSITION)
     const verificationShape = node !== null && taskGraphNodeKeysMatch(node, NODE_KEYS_WITH_VERIFICATION)
     const repairShape = node !== null && taskGraphNodeKeysMatch(node, NODE_KEYS_WITH_REPAIR)
+    const packageRefs = node ? parseTaskGraphSnapshotPackageRefs(node) : { valid: false, shape: false, packageRefs: undefined }
+    const packageRefsShape = packageRefs.shape
     const nativeShape = node !== null && exactKeys(node, NATIVE_NODE_KEYS)
-    if (!node || (!oldShape && !dispositionShape && !verificationShape && !repairShape && !nativeShape)
+    if (!node || (!oldShape && !dispositionShape && !verificationShape && !repairShape && !packageRefsShape && !nativeShape)
       || !text(node.key, MAX_KEY_LENGTH) || !text(node.templateId, MAX_TEMPLATE_ID_LENGTH)
       || !text(node.goal, nativeShape ? 4_000 : MAX_GOAL_LENGTH) || !text(node.taskId, MAX_TASK_ID_LENGTH)
       || !stringList(node.successCriteria, nativeShape ? 32 : MAX_CRITERIA, nativeShape ? 1_000 : MAX_CRITERION_LENGTH, nativeShape)
       || !stringList(node.dependsOn, MAX_DEPENDENCIES, MAX_KEY_LENGTH, true)
+      || !packageRefs.valid
       || !Number.isSafeInteger(node.depth) || Number(node.depth) < 1 || Number(node.depth) > MAX_DEPTH) throw new Error("task_graph_snapshot_invalid")
     const hasVerification = Object.hasOwn(node, "verification")
     const hasRepair = Object.hasOwn(node, "repairOf")
     const hasRegisteredScoutEnvelope = Object.hasOwn(node, "registeredScoutEnvelope")
-    const hasDisposition = dispositionShape || verificationShape || repairShape || nativeShape
+    const hasDisposition = dispositionShape || verificationShape || repairShape || packageRefsShape || nativeShape
     const declaredDisposition = hasDisposition ? node.verificationDisposition : undefined
     const verificationDisposition = hasDisposition ? declaredDisposition : (hasVerification ? "typed" : "legacy_unverified")
     if (verificationDisposition !== "typed" && verificationDisposition !== "legacy_unverified" && verificationDisposition !== "specialized") {
@@ -129,6 +121,7 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
       dependsOn: node.dependsOn, depth: Number(node.depth), taskId: node.taskId, verificationDisposition,
       ...(verification ? { verification } : {}),
       ...(repairOf ? { repairOf } : {}),
+      ...(packageRefs.packageRefs ? { packageRefs: packageRefs.packageRefs } : {}),
       ...(nativeDelegation ? { nativeDelegation } : {}),
       ...(registeredScoutEnvelope ? { registeredScoutEnvelope } : {}),
     })
@@ -162,6 +155,7 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
     }
   }
   if (visited !== nodes.length) throw new Error("task_graph_snapshot_cycle_invalid")
+  if (!taskGraphSnapshotCapacityValid(nodes)) throw new Error("task_graph_snapshot_capacity_invalid")
   const snapshot: TaskGraphSnapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes, ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}) }
   assertTaskGraphSnapshotSize(snapshot)
   return snapshot

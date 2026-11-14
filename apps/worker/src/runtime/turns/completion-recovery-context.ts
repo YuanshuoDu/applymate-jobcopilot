@@ -53,7 +53,7 @@ const REPAIR_FEEDBACK_STATES = {
 const TASK_GRAPH_DETAIL = new RegExp(`^ nodeOrdinal=([1-9][0-9]*)(?: criterionOrdinal=([1-9][0-9]*))? status=(failed|unverified) reasonCode=(${Object.keys(TASK_GRAPH_REASON_CODES).join("|")})(?: repair=(${Object.keys(REPAIR_FEEDBACK_STATES).join("|")}))?(?= |$)`)
 const TASK_GRAPH_ISSUE = new RegExp(`^ issue=(${Object.keys(GATE_FEEDBACK_CODES).join("|")})`)
 const TASK_GRAPH_OMISSION = /^ \(([1-9][0-9]*) feedback items omitted; inspect TaskGraph before retrying\.\)$/
-const MAX_TASK_GRAPH_FEEDBACK_ITEMS = TASK_GRAPH_LIMITS.maxNodes * TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria * 2 + 1
+const MAX_TASK_GRAPH_FEEDBACK_ITEMS = TASK_GRAPH_LIMITS.maxPersistedNodes * TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria * 2 + 1
 
 function validRevision(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
@@ -72,7 +72,7 @@ function validTaskGraphFeedback(feedback: string): boolean {
   for (;;) {
     const detail = TASK_GRAPH_DETAIL.exec(rest)
     if (!detail) break
-    if (!validTaskGraphOrdinal(detail[1]!, TASK_GRAPH_LIMITS.maxNodes)
+    if (!validTaskGraphOrdinal(detail[1]!, TASK_GRAPH_LIMITS.maxPersistedNodes)
       || (detail[2] !== undefined && !validTaskGraphOrdinal(detail[2], TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria))) return false
     detailCount += 1
     rest = rest.slice(detail[0].length)

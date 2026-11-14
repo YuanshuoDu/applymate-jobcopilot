@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest"
 
 import { childWaitRecoveryEventKey, childWaitLogicalResumeCursor, childWaitRecoveryLogicalStepOrdinal,
-  childWaitResumeCursorIsValid, parseChildWaitModelUsageReceipt } from "./child-resume-wait-call-contract.js"
+  childWaitRecoveryNextLogicalStepId, childWaitRecoveryValidNextStepStarted, childWaitResumeCursorIsValid,
+  parseChildWaitModelUsageReceipt } from "./child-resume-wait-call-contract.js"
 import type { DurableWaitResume } from "./child-resume-observations.js"
 import type { SubagentLease } from "./types.js"
 
@@ -14,7 +15,7 @@ function step(logical: number, persisted: number, status: string) {
   return { id: `task:child-1:step:${logical}:attempt:2`, ordinal: persisted, status }
 }
 
-function receiptEvents(stepId: string) {
+function receiptEvents(stepId: string, toolCallCount = 1) {
   const startId = `start:${stepId}`, completeId = `complete:${stepId}`, usageId = `usage:${stepId}`
   return [
     { id: startId, sequence: "1", sessionId: lease.sessionId, turnId: lease.turnId, taskId: lease.id, itemId: null, actor: "subagent",
@@ -22,7 +23,7 @@ function receiptEvents(stepId: string) {
       payload: { taskId: lease.id, provider: "fixture", model: "model-a" } },
     { id: completeId, sequence: "2", sessionId: lease.sessionId, turnId: lease.turnId, taskId: lease.id, itemId: null, actor: "subagent",
       type: "model.completed", correlationId: stepId, causationId: startId, idempotencyKey: childWaitRecoveryEventKey(lease, `model-completed:${stepId}`),
-      payload: { taskId: lease.id, provider: "fixture", model: "model-a", toolCallCount: 1 } },
+      payload: { taskId: lease.id, provider: "fixture", model: "model-a", toolCallCount } },
     { id: usageId, sequence: "3", sessionId: lease.sessionId, turnId: lease.turnId, taskId: lease.id, itemId: null, actor: "subagent",
       type: "model.usage", correlationId: stepId, causationId: completeId, idempotencyKey: childWaitRecoveryEventKey(lease, `model-usage:${stepId}`),
       payload: { taskId: lease.id, provider: "fixture", model: "model-a", usage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: 0.0042 } } },
@@ -32,6 +33,7 @@ function receiptEvents(stepId: string) {
 describe("child resume wait-call contract", () => {
   it("uses the canonical logical step suffix rather than Turn-global database ordinals", () => {
     expect(childWaitRecoveryLogicalStepOrdinal(wait.continuationStepId!, lease)).toBe(5)
+    expect(childWaitRecoveryNextLogicalStepId(wait.continuationStepId!, lease)).toBe("task:child-1:step:6:attempt:2")
     expect(childWaitLogicalResumeCursor([step(4, 18, "waiting_for_tool"), step(5, 39, "streaming")], lease, wait)).toBe(5)
     expect(childWaitLogicalResumeCursor([step(4, 18, "waiting_for_tool"), step(5, 39, "queued")], lease, wait)).toBe(5)
     expect(childWaitLogicalResumeCursor([step(4, 18, "waiting_for_tool"), step(5, 39, "streaming")], lease, wait, 5)).toBe(6)
@@ -42,6 +44,24 @@ describe("child resume wait-call contract", () => {
     expect(() => childWaitLogicalResumeCursor([step(4, 18, "waiting_for_tool"), step(6, 53, "completed")], lease, wait)).toThrow("child_resume_wait_step_lineage")
     expect(() => childWaitLogicalResumeCursor([step(4, 18, "waiting_for_tool"), step(5, 39, "completed"), step(6, 53, "streaming")], lease, wait)).toThrow("child_resume_wait_step_lineage")
     expect(childWaitRecoveryLogicalStepOrdinal("other:step:5:attempt:2", lease)).toBeUndefined()
+  })
+
+  it("validates next-step receipts against the Turn-global persisted ordinal", () => {
+    const terminal = { id: "terminal", sequence: "40", type: "step.completed", actor: "subagent", itemId: null,
+      correlationId: wait.continuationStepId, causationId: "prior", idempotencyKey: childWaitRecoveryEventKey(lease, `step-completed:${wait.continuationStepId}`) }
+    const nextStep = { id: "task:child-1:step:6:attempt:2", sessionId: lease.sessionId, turnId: lease.turnId, taskId: lease.id,
+      attempt: lease.attemptCount, ordinal: 53, status: "streaming" }
+    const sourceStep = { id: wait.continuationStepId, attempt: lease.attemptCount, ordinal: 39, status: "completed" }
+    const started = { id: "next-started", sequence: "41", sessionId: lease.sessionId, turnId: lease.turnId, taskId: lease.id,
+      itemId: null, type: "step.started", actor: "subagent", correlationId: nextStep.id, causationId: terminal.id,
+      idempotencyKey: childWaitRecoveryEventKey(lease, `step-started:${nextStep.id}`), payload: { stepId: nextStep.id, ordinal: 53, taskId: lease.id } }
+    expect(childWaitRecoveryValidNextStepStarted(started, lease, terminal, wait.continuationStepId!, sourceStep, nextStep)).toBe(true)
+    expect(childWaitRecoveryValidNextStepStarted({ ...started, sequence: "40" }, lease, terminal, wait.continuationStepId!, sourceStep, nextStep)).toBe(false)
+    expect(childWaitRecoveryValidNextStepStarted({ ...started, causationId: "unrelated" }, lease, terminal, wait.continuationStepId!, sourceStep, nextStep)).toBe(false)
+    expect(childWaitRecoveryValidNextStepStarted({ ...started, payload: { ...started.payload, ordinal: 6 } }, lease, terminal,
+      wait.continuationStepId!, sourceStep, nextStep)).toBe(false)
+    expect(childWaitRecoveryValidNextStepStarted(started, lease, terminal, wait.continuationStepId!, sourceStep, { ...nextStep, attempt: 1 })).toBe(false)
+    expect(childWaitRecoveryValidNextStepStarted(started, lease, terminal, wait.continuationStepId!, sourceStep, { ...nextStep, status: "queued" })).toBe(false)
   })
 
   it("accepts only the source logical successor when no continuation exists", () => {
@@ -70,6 +90,19 @@ describe("child resume wait-call contract", () => {
       eventId: `usage:${wait.continuationStepId}`, usage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: 0.0042 },
     })
     expect(() => parseChildWaitModelUsageReceipt([...events, { ...events[0], id: "failed", type: "model.failed" }], lease, wait.continuationStepId!))
+      .toThrow("child_resume_wait_tool_call_conflict")
+  })
+
+  it("binds a completed multi-tool model request count to the caller's proven call count", () => {
+    const events = receiptEvents(wait.continuationStepId!, 2)
+    expect(parseChildWaitModelUsageReceipt(events, lease, wait.continuationStepId!, 2)).toMatchObject({
+      usage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: 0.0042 },
+    })
+    expect(() => parseChildWaitModelUsageReceipt(events, lease, wait.continuationStepId!))
+      .toThrow("child_resume_wait_tool_call_conflict")
+    expect(() => parseChildWaitModelUsageReceipt(receiptEvents(wait.continuationStepId!, 3), lease, wait.continuationStepId!, 2))
+      .toThrow("child_resume_wait_tool_call_conflict")
+    expect(() => parseChildWaitModelUsageReceipt(events, lease, wait.continuationStepId!, 33))
       .toThrow("child_resume_wait_tool_call_conflict")
   })
 })

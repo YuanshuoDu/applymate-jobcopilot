@@ -104,7 +104,7 @@ describe("completion recovery context", () => {
       tagTaskGraphRepairRecovery(`${feedback} status=failed`, 9),
       tagTaskGraphRepairRecovery(`${feedbackLead} nodeOrdinal=1 status=failed reasonCode=criterion_not_met issue=verification_report`, 9),
       tagTaskGraphRepairRecovery(`${feedbackLead} (0 feedback items omitted; inspect TaskGraph before retrying.)`, 9),
-      tagTaskGraphRepairRecovery(`${feedbackLead} issue=verification_report nodeOrdinal=1 status=failed reasonCode=criterion_not_met (129 feedback items omitted; inspect TaskGraph before retrying.)`, 9),
+      tagTaskGraphRepairRecovery(`${feedbackLead} issue=verification_report nodeOrdinal=1 status=failed reasonCode=criterion_not_met (177 feedback items omitted; inspect TaskGraph before retrying.)`, 9),
     ]
     for (const value of cases) {
       const result = applyCompletionRecovery(base, "step-1", value)
@@ -133,6 +133,10 @@ describe("completion recovery context", () => {
       const detail = `${feedbackLead} nodeOrdinal=8 criterionOrdinal=8 status=failed reasonCode=${reason}`
       expect(accept(detail)).toContain(`status=failed reasonCode=${reason}`)
     }
+    expect(accept(`${feedbackLead} nodeOrdinal=11 status=failed reasonCode=criterion_not_met`)).toContain("nodeOrdinal=11")
+    expect(applyCompletionRecovery(base, "step-1", tagTaskGraphRepairRecovery(
+      `${feedbackLead} nodeOrdinal=12 status=failed reasonCode=criterion_not_met`, 6,
+    )).system[0]?.content).toContain("no validated graph revision is available")
     const truncated = `${feedbackLead} issue=verification_report nodeOrdinal=8 criterionOrdinal=8 status=unverified reasonCode=canonical_evidence_ambiguous repair=invalid_report (7 feedback items omitted; inspect TaskGraph before retrying.)`
     expect(truncated.length).toBeLessThanOrEqual(512)
     expect(accept(truncated)).toContain("(7 feedback items omitted; inspect TaskGraph before retrying.)")

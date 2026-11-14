@@ -24,6 +24,9 @@ import { appendScheduledAudit as appendScheduledAuditCommand,
   readScheduledAuditInvocationProof as readScheduledAuditInvocationProofCommand,
   verifyScheduledGateCompletionWithAuditReplay as verifyScheduledGateCompletionCommand } from "./pg-scheduled-task-graph-audit-command.js"
 import { readScheduledAuditResumeContext as readScheduledAuditResumeContextCommand } from "./scheduled-audit-resume.js"
+import { appendScheduledPostGatePlan as appendScheduledPostGatePlanCommand,
+  readScheduledPostGatePlanningContext as readScheduledPostGatePlanningContextCommand,
+  verifyScheduledPostGateCompletion as verifyScheduledPostGateCompletionCommand } from "./pg-scheduled-post-gate-plan.js"
 import { hasPersistedPlanReceipt, scheduleTaskGraph } from "./pg-task-graph-command-port-schedule.js"
 type Row = Record<string, unknown>
 type LoadedCurrentGraph = Awaited<ReturnType<typeof loadTaskGraph>> & Readonly<{ rootSuccessCriteria?: readonly string[] }>
@@ -56,6 +59,15 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     },
     async readScheduledAuditResumeContext(input) {
       return transaction(pool, client => readScheduledAuditResumeContextCommand(client, input))
+    },
+    async appendScheduledPostGatePlan(input) {
+      return transaction(pool, client => appendScheduledPostGatePlanCommand(client, input))
+    },
+    async readScheduledPostGatePlanningContext(input) {
+      return transaction(pool, client => readScheduledPostGatePlanningContextCommand(client, input))
+    },
+    async verifyScheduledPostGateCompletion(input) {
+      return transaction(pool, client => verifyScheduledPostGateCompletionCommand(client, input))
     },
     async appendAndScheduleWithReconciliation(input, operation) {
       return transaction(pool, client => scheduleTaskGraph(client, input, operation))

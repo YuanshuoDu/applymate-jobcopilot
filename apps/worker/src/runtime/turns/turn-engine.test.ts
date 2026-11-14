@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
+import { TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID, TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION } from "../context/task-graph-objective-progress.js"
 import { RootAbortController } from "../interrupt/registry.js"
 import { TurnLeaseError } from "./lease.js"
 import { createToolRouterExecutor, TurnEngine } from "./turn-engine.js"
@@ -24,7 +25,7 @@ function profile() {
 }
 
 function fakeStore() {
-  const events: Array<{ id: string; type: string; causationId: string | null; itemId: string | null }> = []
+  const events: Array<{ id: string; type: string; causationId: string | null; itemId: string | null; payload: unknown }> = []
   const batches: string[][] = []
   const items: Array<{ id: string; type: string; phase: string | null; status: string; revision: number }> = []
   const steps: Array<{ id: string; status: string; errorCode: string | null }> = []
@@ -33,8 +34,8 @@ function fakeStore() {
     updateStep: async ({ stepId, status, errorCode }) => { const step = steps.find((entry) => entry.id === stepId)!; step.status = status; step.errorCode = errorCode },
     createItem: async ({ itemId, type, phase, status }) => { items.push({ id: itemId, type, phase, status, revision: 0 }); return { id: itemId, revision: 0 } },
     updateItem: async ({ itemId, expectedRevision, status }) => { const item = items.find((entry) => entry.id === itemId)!; expect(item.revision).toBe(expectedRevision); item.revision += 1; item.status = status; return { id: itemId, revision: item.revision } },
-    appendEvent: async ({ id, type, causationId, itemId }) => { events.push({ id, type, causationId, itemId }); return { id } },
-    appendEvents: async inputs => { batches.push(inputs.map(input => input.id)); for (const input of inputs) events.push({ id: input.id, type: input.type, causationId: input.causationId, itemId: input.itemId }); return inputs.map(input => ({ id: input.id })) },
+    appendEvent: async ({ id, type, causationId, itemId, payload }) => { events.push({ id, type, causationId, itemId, payload }); return { id } },
+    appendEvents: async inputs => { batches.push(inputs.map(input => input.id)); for (const input of inputs) events.push({ id: input.id, type: input.type, causationId: input.causationId, itemId: input.itemId, payload: input.payload }); return inputs.map(input => ({ id: input.id })) },
     recordFinalResponse: vi.fn(async input => {
       if (!input.terminal) return
       items.push({ id: input.terminal.finalItemId, type: "agent_message", phase: "final_answer", status: "completed", revision: 1 })
@@ -44,7 +45,7 @@ function fakeStore() {
         { id: "final-completed", type: "item.completed", itemId: input.terminal.finalItemId, correlationId: input.terminal.finalItemId, causationId: "final-started", payload: {} },
         { id: "turn-completed", type: "turn.completed", itemId: input.terminal.finalItemId, correlationId: "step", causationId: "final-completed", payload: {} },
       ]
-      events.push(...finalEvents.map(event => ({ id: event.id, type: event.type, causationId: event.causationId, itemId: event.itemId })))
+      events.push(...finalEvents.map(event => ({ id: event.id, type: event.type, causationId: event.causationId, itemId: event.itemId, payload: event.payload })))
       return { status: "completed" as const, finalItemId: input.terminal.finalItemId, events: finalEvents }
     }),
   }
@@ -125,6 +126,65 @@ describe("TurnEngine", () => {
     }
     await expect(new TurnEngine(options).run()).resolves.toMatchObject({ status: "completed" })
     expect(seen[0]).toBe("root-1")
+  })
+
+  it("forwards the objective revision callback through the bound context builder", async () => {
+    const fixture = baseOptions()
+    const objectiveProgressGoalRevision = vi.fn(() => "a".repeat(64))
+    const options: TurnEngineOptions = {
+      ...fixture.options,
+      contextBuilder: { ...fixture.options.contextBuilder, objectiveProgressGoalRevision },
+    }
+
+    await expect(new TurnEngine(options).run()).resolves.toMatchObject({ status: "completed" })
+
+    expect(objectiveProgressGoalRevision).toHaveBeenCalled()
+    expect(fixture.fake.events.find(event => event.type === "cognitive.agenda")?.payload).toMatchObject({
+      schemaVersion: "agent-harness.cognitive-agenda-receipt.v2", goalRevision: "a".repeat(64),
+    })
+  })
+
+  it("does not expose or grant an external-write tool capability from a reported-passed delta", async () => {
+    const fixture = baseOptions(), digest = "b".repeat(64), baseBuilder = fixture.options.contextBuilder
+    const model = fixture.options.model
+    const requestedToolNames: string[][] = []
+    const executeTool = vi.fn(fixture.options.executeTool)
+    let buildCount = 0
+    const contextBuilder: TurnEngineOptions["contextBuilder"] & { objectiveProgressGoalRevision: () => string } = {
+      ...baseBuilder, objectiveProgressGoalRevision: () => digest,
+      build: async (request: Parameters<NonNullable<TurnEngineOptions["contextBuilder"]["build"]>>[0]) => {
+        const context = await baseBuilder.build(request), revision = ++buildCount
+        const progress: { schemaVersion: typeof TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION; advisory: true; revision: number;
+          requirements: Array<{ id: string; kind: "candidate_count_gte"; minimum: number; status: "active" | "reported_passed" }> } = {
+          schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION, advisory: true, revision,
+          requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 1, status: revision === 1 ? "active" : "reported_passed" }],
+        }
+        const observation: StepContext["blocks"][number] = { id: TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID,
+          layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent", content: progress }
+        return { ...context, taskGraphRevision: revision, blocks: [...context.blocks, observation] }
+      },
+    }
+    const options: TurnEngineOptions = {
+      ...fixture.options, contextBuilder, executeTool,
+      model: { ...model, async *stream(request) {
+        requestedToolNames.push(request.tools.flatMap(tool => isRecord(tool) && typeof tool.name === "string" ? [tool.name] : []))
+        yield* model.stream(request)
+      } },
+    }
+
+    await expect(new TurnEngine(options).run()).resolves.toMatchObject({ status: "completed" })
+
+    const frameText = fixture.requests[1]?.messages
+      .flatMap(message => message.content.flatMap(part => isRecord(part) && typeof part.text === "string" ? [part.text] : []))
+      .find(text => text.startsWith("[harness request context trust=UNTRUSTED_DATA source=cognitive_action_agenda]")) ?? ""
+    const parsedProjection: unknown = JSON.parse(frameText.slice(frameText.indexOf("\n") + 1))
+    const projection = isRecord(parsedProjection) ? parsedProjection : undefined
+    const parsedProgressDelta = projection?.progressDelta
+    const progressDelta = isRecord(parsedProgressDelta) ? parsedProgressDelta : undefined
+    expect(progressDelta).toMatchObject({ availability: "available", requirements: [{ afterStatus: "reported_passed" }] })
+    expect(requestedToolNames.flat()).not.toContain("applications.submit")
+    expect(executeTool.mock.calls.map(([input]) => input.call.toolName)).toEqual(["jobs.search", "jobs.get"])
+    expect(fixture.fake.events.some(event => /approval|authorization/i.test(event.type))).toBe(false)
   })
 
   it("keeps claim identity at ordinal zero and forwards a separate root context identity on every Step", async () => {

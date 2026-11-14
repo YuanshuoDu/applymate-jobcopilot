@@ -5,15 +5,22 @@ import { signalWasInterrupted } from "../interrupt/registry.js"
 import type { FinalResponse } from "../finalizer.js"
 import { toRepositoryJson, type TurnEngineItemPhase, type TurnEngineItemStatus, type TurnEngineItemType } from "./turn-engine-types.js"
 import { executionId, executionKey, type ExecutionItemHandle, type TurnExecutionOptions } from "./turn-execution-types.js"
-import type { TurnEngineStep, TurnEngineToolCall, TurnEngineToolResult, ToolCallRecovery } from "./turn-engine-types.js"
+import type { TurnEngineStep, TurnEngineToolCall, TurnEngineToolResult } from "./turn-engine-types.js"
 import type { ChildWaitClaimRecovery } from "../subagents/child-durable-wait-replay.js"
 import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
+import { projectWaitCallCompletionPayload } from "./turn-execution-wait-event-projection.js"
 
 type BatchAppendEntryBase = { correlationId: string; itemId: string | null; payload: unknown; key: string }
 export type BatchAppendEntry =
   | (BatchAppendEntryBase & { type: typeof STEERING_MARKER_EVENT_TYPE; actor?: "system" })
   | (BatchAppendEntryBase & { type: string; actor?: never })
+
+export type PersistedToolExecutionReceipt = Readonly<{
+  toolCallId: string; toolName: string; input: RepositoryJsonValue
+  callItem: Readonly<{ id: string; revision: number }>; resultItem: Readonly<{ id: string; revision: number }>
+  result: Readonly<{ status: TurnEngineToolResult["status"]; output: RepositoryJsonValue; errorCode: string | null }>
+}>
 
 export class TurnExecutionEventWriter {
   private causationId: string | null = null
@@ -29,12 +36,12 @@ export class TurnExecutionEventWriter {
     const id = this.id(`event:${key}`)
     const causationId = this.causationId
     const mappedType = this.options.lifecycle?.mapEventType?.(type) ?? ownerEventType(this.options.identity.kind, type)
-    const event = await this.options.store.appendEvent({
-      identity: this.options.identity, id, itemId, type: mappedType, correlationId, causationId,
-      idempotencyKey: `${this.key}:event:${key}`, payload: toRepositoryJson(payload),
+    const safePayload = type === "item.completed" ? projectWaitCallCompletionPayload(payload, itemId) : toRepositoryJson(payload)
+    const event = await this.options.store.appendEvent({ identity: this.options.identity, id, itemId, type: mappedType, correlationId, causationId,
+      idempotencyKey: `${this.key}:event:${key}`, payload: safePayload,
     })
     this.causationId = event.id
-    await this.notify({ id: event.id, type: mappedType, itemId, correlationId, causationId, payload: toRepositoryJson(payload) })
+    await this.notify({ id: event.id, type: mappedType, itemId, correlationId, causationId, payload: safePayload })
     return event.id
   }
 
@@ -47,7 +54,7 @@ export class TurnExecutionEventWriter {
       if (entry.actor !== undefined && (entry.actor !== "system" || entry.type !== STEERING_MARKER_EVENT_TYPE)) throw new Error("system_actor_requires_steering_marker")
       const id = this.id(`event:${entry.key}`)
       const mappedType = entry.type === STEERING_MARKER_EVENT_TYPE ? STEERING_MARKER_EVENT_TYPE : this.options.lifecycle?.mapEventType?.(entry.type) ?? ownerEventType(this.options.identity.kind, entry.type)
-      const payload = toRepositoryJson(entry.payload)
+      const payload = entry.type === "item.completed" ? projectWaitCallCompletionPayload(entry.payload, entry.itemId) : toRepositoryJson(entry.payload)
       const event = { identity: this.options.identity, id, itemId: entry.itemId, type: mappedType, correlationId: entry.correlationId, causationId, idempotencyKey: `${this.key}:event:${entry.key}`, payload, ...(entry.actor ? { actor: entry.actor } : {}) }
       causationId = id
       return { ...entry, id, mappedType, payload, event, causationId: event.causationId }
@@ -69,17 +76,17 @@ export class TurnExecutionEventWriter {
     return { id: item.id, type: input.type, phase: input.phase, revision: item.revision }
   }
 
-  async updateItem(handle: ExecutionItemHandle, status: TurnEngineItemStatus, content: unknown, now: Date, key: string): Promise<void> {
+  async updateItem(handle: ExecutionItemHandle, status: TurnEngineItemStatus, content: unknown, now: Date, key: string, eventContent: unknown = content): Promise<void> {
     const item = await this.options.store.updateItem({
       identity: this.options.identity, itemId: handle.id, expectedRevision: handle.revision, status, phase: handle.phase,
       content: toRepositoryJson(content), startedAt: now, completedAt: status === "completed" || status === "failed" || status === "interrupted" ? now : null, now,
     })
     handle.revision = item.revision
-    await this.append(status === "completed" ? "item.completed" : "item.delta", handle.id, handle.id, { itemId: handle.id, status, content: toRepositoryJson(content) }, `${key}:${handle.id}:${handle.revision}`)
+    await this.append(status === "completed" ? "item.completed" : "item.delta", handle.id, handle.id, { itemId: handle.id, status, content: toRepositoryJson(eventContent) }, `${key}:${handle.id}:${handle.revision}`)
   }
 
-  async completeItem(handle: ExecutionItemHandle, content: unknown, now: Date, key: string): Promise<void> {
-    await this.updateItem(handle, "completed", content, now, key)
+  async completeItem(handle: ExecutionItemHandle, content: unknown, now: Date, key: string, eventContent: unknown = content): Promise<void> {
+    await this.updateItem(handle, "completed", content, now, key, eventContent)
   }
 
   async failItem(handle: ExecutionItemHandle, errorCode: string, now: Date, key: string): Promise<void> {
@@ -106,10 +113,12 @@ export async function executeToolWithItems(
   call: TurnEngineToolCall,
   now: () => Date,
   onCallItemPersisted?: () => void,
+  onResultItemPersisted?: (receipt: PersistedToolExecutionReceipt) => void,
 ): Promise<TurnEngineToolResult> {
+  const input = toRepositoryJson(call.arguments)
   const callItem = await writer.startItem({
     id: itemId(options, `item:tool-call:${call.id}`), stepId: step.id, type: "tool_call", phase: null,
-    content: { toolCallId: call.id, toolName: call.name, toolVersion: "1", input: toRepositoryJson(call.arguments) }, now: now(),
+    content: { toolCallId: call.id, toolName: call.name, toolVersion: "1", input }, now: now(),
   })
   onCallItemPersisted?.()
   const startKey = options.childWaitCallStartKey?.(step.id, call) ?? `tool-started:${call.id}`
@@ -139,7 +148,7 @@ export async function executeToolWithItems(
   }
   await writer.completeItem(callItem, {
     toolCallId: call.id, toolName: call.name, toolVersion: result.toolVersion,
-    status: result.status, errorCode: result.errorCode, input: toRepositoryJson(call.arguments),
+    status: result.status, errorCode: result.errorCode, input,
   }, now(), `tool-call-completed:${call.id}`)
   await writer.append(
     result.status === "completed" ? "tool_call.completed" : "tool_call.failed", call.id, callItem.id,
@@ -150,33 +159,13 @@ export async function executeToolWithItems(
     id: itemId(options, `item:tool-result:${call.id}`), stepId: step.id, type: "tool_result", phase: null,
     content: { toolCallId: call.id, output: toRepositoryJson(result.output ?? null), errorCode: result.errorCode }, now: now(),
   })
-  await writer.completeItem(resultItem, { toolCallId: call.id, output: toRepositoryJson(result.output ?? null), errorCode: result.errorCode }, now(), `tool-result-completed:${call.id}`)
+  const output = toRepositoryJson(result.output ?? null)
+  await writer.completeItem(resultItem, { toolCallId: call.id, output, errorCode: result.errorCode }, now(), `tool-result-completed:${call.id}`)
+  onResultItemPersisted?.({ toolCallId: call.id, toolName: call.name, input,
+    callItem: { id: callItem.id, revision: callItem.revision }, resultItem: { id: resultItem.id, revision: resultItem.revision },
+    result: { status: result.status, output, errorCode: result.errorCode } })
   if (pauseError) throw pauseError
   return result
-}
-
-export async function persistRecoveredToolCall(
-  options: TurnExecutionOptions,
-  writer: TurnExecutionEventWriter,
-  recovery: ToolCallRecovery,
-  result: TurnEngineToolResult,
-  now: () => Date,
-): Promise<void> {
-  const callItem: ExecutionItemHandle = { id: recovery.callItem.id, type: "tool_call", phase: null, revision: recovery.callItem.revision }
-  const callContent = {
-    toolCallId: recovery.call.id, toolName: recovery.call.name, toolVersion: recovery.toolVersion,
-    status: result.status, errorCode: result.errorCode, input: toRepositoryJson(recovery.call.arguments),
-  }
-  await writer.completeItem(callItem, callContent, now(), `tool-call-recovered:${recovery.call.id}`)
-  await writer.append(result.status === "completed" ? "tool_call.completed" : "tool_call.failed", recovery.call.id, callItem.id, {
-    toolCallId: recovery.call.id, toolName: recovery.call.name, toolVersion: result.toolVersion, status: result.status,
-    errorCode: result.errorCode, taskId: options.identity.taskId,
-  }, `tool-recovered:${recovery.call.id}`)
-  const resultContent = { toolCallId: recovery.call.id, output: toRepositoryJson(result.output ?? null), errorCode: result.errorCode }
-  const resultItem: ExecutionItemHandle = recovery.resultItem
-    ? { id: recovery.resultItem.id, type: "tool_result", phase: null, revision: recovery.resultItem.revision }
-    : await writer.startItem({ id: itemId(options, `item:tool-result:${recovery.call.id}`), stepId: recovery.stepId, type: "tool_result", phase: null, content: resultContent, now: now() })
-  await writer.completeItem(resultItem, resultContent, now(), `tool-result-recovered:${recovery.call.id}`)
 }
 
 /** Reconciles a claimed child wait using its validated stored receipt, never the wait dispatcher. */

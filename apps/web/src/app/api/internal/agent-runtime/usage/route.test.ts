@@ -1,19 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
-  admitAiUsage: vi.fn(), settleAiUsage: vi.fn(), resolveAiAccess: vi.fn(), loadWorkerAiConfig: vi.fn(),
+  admitAiUsage: vi.fn(), startAiUsage: vi.fn(), settleAiUsage: vi.fn(), resolveAiAccess: vi.fn(), loadWorkerAiConfig: vi.fn(),
 }))
 
 vi.mock("@/lib/db", () => ({ db: {} }))
 vi.mock("@/lib/entitlements", () => ({ resolveAiAccess: mocks.resolveAiAccess }))
 vi.mock("@/lib/agent/control-plane/usage-broker", () => ({
-  admitAiUsage: mocks.admitAiUsage, settleAiUsage: mocks.settleAiUsage, UsageBrokerError: class UsageBrokerError extends Error {},
+  admitAiUsage: mocks.admitAiUsage, startAiUsage: mocks.startAiUsage, settleAiUsage: mocks.settleAiUsage, UsageBrokerError: class UsageBrokerError extends Error {},
 }))
 vi.mock("@jobcopilot/shared/llm", () => ({ loadWorkerAiConfig: mocks.loadWorkerAiConfig }))
 
 const admission = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1", leaseOwnerId: "worker-1", leaseVersion: 3,
-  featureKey: "agent", provider: "minimax", model: "MiniMax-M3", attemptId: "attempt-1",
+  featureKey: "agent", provider: "minimax", model: "MiniMax-M3", attemptId: "attempt-1", startProtocolVersion: 1,
 }
 
 describe("internal agent runtime usage route", () => {
@@ -23,7 +23,8 @@ describe("internal agent runtime usage route", () => {
     vi.stubEnv("AGENT_WORKER_SECRET", "secret")
     mocks.resolveAiAccess.mockResolvedValue("allowed")
     mocks.loadWorkerAiConfig.mockResolvedValue({ provider: "minimax", model: "MiniMax-M3" })
-    mocks.admitAiUsage.mockResolvedValue({ operationId: "agent-usage-1" })
+    mocks.admitAiUsage.mockResolvedValue({ operationId: "agent-usage-1", startProtocolVersion: 1, outputReservationRequired: true, maxOutputTokens: 128 })
+    mocks.startAiUsage.mockResolvedValue({ startProtocolVersion: 1, outputReservationRequired: true, maxOutputTokens: 128 })
   })
 
   it("authenticates the Worker, checks the trusted model, and returns the ledger identity", async () => {
@@ -33,7 +34,7 @@ describe("internal agent runtime usage route", () => {
       body: JSON.stringify({ operation: "authorize", input: admission }),
     }) as never)
     expect(response.status).toBe(200)
-    await expect(response.json()).resolves.toEqual({ status: "authorized", operationId: "agent-usage-1" })
+    await expect(response.json()).resolves.toEqual({ status: "authorized", operationId: "agent-usage-1", startProtocolVersion: 1, outputReservationRequired: true, maxOutputTokens: 128 })
     expect(mocks.admitAiUsage).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ ...admission, credentialSource: "platform" }))
   })
 
@@ -73,6 +74,40 @@ describe("internal agent runtime usage route", () => {
     expect(response.status).toBe(200)
     expect(mocks.settleAiUsage).toHaveBeenCalledOnce()
     expect(mocks.loadWorkerAiConfig).not.toHaveBeenCalled()
+  })
+
+  it("preserves unknown usage dimensions as null instead of coercing them to zero", async () => {
+    const { POST } = await import("./route")
+    const input = { operationId: "agent-usage-1", userId: "user-1", provider: "minimax", model: "MiniMax-M3", status: "error", inputTokens: null, outputTokens: null, estimatedCostUsd: null }
+    const response = await POST(new Request("http://localhost", {
+      method: "POST", headers: { "x-agent-worker-secret": "secret", "content-type": "application/json" },
+      body: JSON.stringify({ operation: "settle", input }),
+    }) as never)
+    expect(response.status).toBe(200)
+    expect(mocks.settleAiUsage).toHaveBeenCalledWith(expect.anything(), input)
+  })
+
+  it("claims provider start with the same worker secret and returns the admitted cap", async () => {
+    const { POST } = await import("./route")
+    const startInput = { ...admission, operationId: "agent-usage-1" }
+    const response = await POST(new Request("http://localhost", {
+      method: "POST", headers: { "x-agent-worker-secret": "secret", "content-type": "application/json" },
+      body: JSON.stringify({ operation: "start", input: startInput }),
+    }) as never)
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({ status: "started", startProtocolVersion: 1, outputReservationRequired: true, maxOutputTokens: 128 })
+    expect(mocks.startAiUsage).toHaveBeenCalledWith(expect.anything(), startInput)
+    expect(mocks.loadWorkerAiConfig).not.toHaveBeenCalled()
+  })
+
+  it("rejects a start request without the original owner fence", async () => {
+    const { POST } = await import("./route")
+    const response = await POST(new Request("http://localhost", {
+      method: "POST", headers: { "x-agent-worker-secret": "secret", "content-type": "application/json" },
+      body: JSON.stringify({ operation: "start", input: { operationId: "agent-usage-1", userId: admission.userId, provider: admission.provider, model: admission.model, startProtocolVersion: 1 } }),
+    }) as never)
+    expect(response.status).toBe(400)
+    expect(mocks.startAiUsage).not.toHaveBeenCalled()
   })
 
   it("releases a deterministic pre-provider route reservation through the authenticated endpoint", async () => {

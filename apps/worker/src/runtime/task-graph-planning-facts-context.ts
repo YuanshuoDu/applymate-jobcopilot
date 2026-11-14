@@ -57,7 +57,7 @@ export function projectTaskGraphPlanningScoutOverlap(
     if (!facts || facts.graphRevision !== currentRevision || !Object.hasOwn(facts, "scoutOverlap")) return null
     const overlap = exactDataRecord(facts.scoutOverlap, ["coverage", "scouts"])
     if (!overlap || !isCoverage(overlap.coverage) || !isDenseArray(overlap.scouts)
-      || overlap.scouts.length > TASK_GRAPH_LIMITS.maxNodes || nodes.length > TASK_GRAPH_LIMITS.maxNodes) return null
+      || overlap.scouts.length > TASK_GRAPH_LIMITS.maxNodes || nodes.length > TASK_GRAPH_LIMITS.maxPersistedNodes) return null
     const currentScouts = nodes.filter(node => node.templateId === "scout")
     if (new Set(currentScouts.map(node => node.key)).size !== currentScouts.length
       || currentScouts.some(node => !validNodeKey(node.key))) return null

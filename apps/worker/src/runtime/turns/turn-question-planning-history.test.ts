@@ -24,7 +24,7 @@ function event(wait: typeof first, overrides: Record<string, unknown> = {}): Rec
       inputCheckpoint: { throughSequence: "8", consumedInputIds: ["original"] } }, ...overrides }
 }
 
-function client(events: readonly Record<string, unknown>[], answered = true) {
+function client(events: readonly Record<string, unknown>[], answered = true, questionContent: Record<string, unknown> = {}) {
   const queries: string[] = [], parameters: (readonly unknown[] | undefined)[] = []
   const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
     queries.push(sql)
@@ -53,6 +53,7 @@ function client(events: readonly Record<string, unknown>[], answered = true) {
         waitKind: "question", questionId: values?.[0] === first.questionItemId ? first.waitId : second.waitId,
         toolCallId: values?.[0] === first.questionItemId ? first.toolCallId : second.toolCallId, stage: "user_input",
         question: intent.question, options: intent.options, answer: answered ? "A" : null, answerAvailable: answered,
+        ...questionContent,
       } }], rowCount: 1 }
     }
     if (sql.includes('FROM "agent_steps"')) {
@@ -103,6 +104,24 @@ describe("turn question planning clarification history", () => {
     const missing = client([])
     await expect(readTurnQuestionPlanningWait(missing, owner, first)).resolves.toBeNull()
     expect(missing.queries.some(sql => sql.includes("INSERT INTO"))).toBe(false)
+  })
+
+  it("accepts a canonical broker timestamp on an answered question item", async () => {
+    const answeredAt = "2026-10-21T10:00:00.000Z"
+    await expect(readTurnQuestionPlanningHistory(client([event(first)], true, { answeredAt }), owner, [first])).resolves.toHaveLength(1)
+  })
+
+  it.each([
+    ["malformed answeredAt", { answeredAt: "2026-10-21T10:00:00Z" }],
+    ["unknown answer field", { answeredAt: "2026-10-21T10:00:00.000Z", unexpected: true }],
+  ])("rejects %s on an answered question item", async (_name, questionContent) => {
+    await expect(readTurnQuestionPlanningHistory(client([event(first)], true, questionContent), owner, [first]))
+      .rejects.toMatchObject({ code: "question_conflict" })
+  })
+
+  it("rejects an answeredAt timestamp on an unanswered question item", async () => {
+    await expect(readTurnQuestionPlanningWait(client([event(first)], false, { answeredAt: "2026-10-21T10:00:00.000Z" }), owner, first))
+      .rejects.toMatchObject({ code: "question_conflict" })
   })
 
   it("omits a legacy answered identity with no saved receipt but rejects a present noncanonical linked record", async () => {

@@ -10,6 +10,7 @@ import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } fro
 import { ROLE_RESULT_SCHEMA, validateRoleResult } from "../subagents/role-results.js"
 import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "../subagents/child-discovery-attempt.js"
 import { createDiscoveryQueryFootprint } from "../subagents/child-discovery-query-footprint.js"
+import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "../subagents/task-graph-child-deadline.js"
 
 const ROOT = "private-root-id"
 const CRITERIA = [
@@ -245,11 +246,12 @@ describe("root history ordinal lessons", () => {
     }
   })
 
-  it("projects only the three exact ordinary execution categories from aligned failed task rows", () => {
+  it("projects only the four exact ordinary execution categories from aligned failed task rows", () => {
     const cases = [
       ["child_turn_missing", "execution_setup_unavailable"],
       ["child_resume_unavailable", "resume_state_unavailable"],
       ["invalid_structured_result", "structured_output_invalid"],
+      [TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON, "execution_deadline_exceeded"],
     ] as const
     for (const [reason, category] of cases) {
       const { loaded } = executionFailureFixture(reason)
@@ -273,9 +275,9 @@ describe("root history ordinal lessons", () => {
 
     const typed = fixture({ repairCount: 0 }), typedNode = typed.loaded.snapshot!.nodes[0]!
     const typedTask = typed.loaded.tasks.get(typedNode.taskId)!
-    const typedTasks = new Map(typed.loaded.tasks).set(typedNode.taskId, { ...typedTask, failureReason: "child_turn_missing" })
+    const typedTasks = new Map(typed.loaded.tasks).set(typedNode.taskId, { ...typedTask, failureReason: TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON })
     const typedState = taskGraphState(typed.loaded.snapshot!, 7,
-      new Map([[typedNode.taskId, { status: "failed", failureReason: "child_turn_missing" }]]), [])
+      new Map([[typedNode.taskId, { status: "failed", failureReason: TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON }]]), [])
     const reportBacked = { ...typed.loaded, tasks: typedTasks, state: typedState }
     const reportLessons = deriveRootTaskHistoryLessonFacts(reportBacked, currentTaskGraph(reportBacked))
     expect(reportLessons[0]?.executionFailureCategory).toBeUndefined()
@@ -386,7 +388,7 @@ describe("root history ordinal lessons", () => {
       .toEqual(projectLoadedRootTaskHistoryGraph(reported)?.nodeLessons?.[0]?.passedCriteria)
     expect(projectLoadedRootTaskHistoryGraph(reported, true)?.reportedOutputs).toBeUndefined()
 
-    const categorized = executionFailureFixture("child_turn_missing")
+    const categorized = executionFailureFixture(TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON)
     expect(projectLoadedRootTaskHistoryGraph(categorized.loaded, true)?.nodeLessons).toBeUndefined()
   })
 
@@ -426,7 +428,7 @@ describe("root history ordinal lessons", () => {
       { ...lesson.criterionFailures[0]!, untrusted: "forged" },
     ] })).toBeUndefined()
     expect(sanitizeRootTaskHistoryNodeLessonForCrossSession({ ordinalScope: "source_graph_local", advisoryOnly: true,
-      notCurrentEvidence: true, nodeOrdinal: 1, criterionFailures: [], executionFailureCategory: "execution_setup_unavailable" })).toBeUndefined()
+      notCurrentEvidence: true, nodeOrdinal: 1, criterionFailures: [], executionFailureCategory: "execution_deadline_exceeded" })).toBeUndefined()
   })
 
   it("reconstructs only closed passed criteria for cross-session history", () => {

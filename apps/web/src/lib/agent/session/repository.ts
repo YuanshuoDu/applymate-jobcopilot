@@ -8,6 +8,7 @@ import type {
 } from "./types"
 import { toDurableSubAgentTaskStatus } from "./types"
 import { redactAgentEvent } from "@jobcopilot/shared"
+import { sessionSnapshotFields, withAgentSearchFootprintSessionSnapshot } from "@/lib/agent-search-footprint-session-snapshot"
 
 type JsonValue = unknown
 
@@ -108,15 +109,16 @@ export interface UpdateAgentSessionInput {
 }
 
 export async function createAgentSession(db: AgentSessionDb, input: CreateAgentSessionInput) {
-  return db.agentSession.create({
+  return withAgentSearchFootprintSessionSnapshot(db, input.userId, async (tx, snapshot, captured) => tx.agentSession.create({
     data: {
       userId: input.userId,
       goal: input.goal,
       source: input.source,
       status: input.status ?? "running",
       memorySummary: input.memorySummary ?? "",
+      ...(captured ? sessionSnapshotFields(snapshot) : {}),
     },
-  })
+  }))
 }
 
 export async function appendTranscriptEvent(db: AgentSessionDb, input: AppendTranscriptEventInput) {

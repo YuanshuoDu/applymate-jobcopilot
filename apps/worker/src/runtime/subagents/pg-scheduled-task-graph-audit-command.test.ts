@@ -20,7 +20,7 @@ const writes = vi.hoisted(() => ({ lock: vi.fn(), load: vi.fn(), current: vi.fn(
 
 vi.mock("../planning/task-graph.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../planning/task-graph.js")>()
-  return { ...actual, appendTaskGraphProposal: writes.appendGraph }
+  return { ...actual, appendScheduledPostGateTaskGraphProposal: writes.appendGraph }
 })
 vi.mock("./task-graph-pg-state.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./task-graph-pg-state.js")>()

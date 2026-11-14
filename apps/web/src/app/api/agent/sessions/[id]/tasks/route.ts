@@ -16,9 +16,11 @@ import {
 import { taskDto, type TaskQueryRow } from "../../query-dto"
 import { projectInteractiveDiscoveryShortlist } from "./interactive-discovery-shortlist"
 
-const MAX_REFERENCED_TASK_IDS = 9
+const MAX_TASK_GRAPH_NODES = 11
+const MAX_REFERENCED_TASK_IDS = MAX_TASK_GRAPH_NODES + 1
 const MAX_TASK_ID_LENGTH = 128
 const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
+type VerificationSummaryVersion = 1 | 2
 
 const TASK_SELECT = {
   id: true, sessionId: true, turnId: true, rootTaskId: true, parentTaskId: true, path: true,
@@ -34,6 +36,18 @@ function parseTaskIdLookup(request: Request): string[] | Response | null {
     return Response.json({ error: { code: "invalid_task_ids", message: "taskId values must be unique and bounded", details: {} } }, { status: 400 })
   }
   return ids
+}
+
+function invalidVerificationSummaryVersion(): Response {
+  return Response.json({ error: { code: "invalid_verification_summary_version",
+    message: "verificationSummaryVersion must be 1 or 2 and requires a TaskGraph lookup", details: {} } }, { status: 400 })
+}
+
+function parseVerificationSummaryVersion(request: Request): VerificationSummaryVersion | null | Response {
+  const values = new URL(request.url).searchParams.getAll("verificationSummaryVersion")
+  if (values.length === 0) return null
+  if (values.length !== 1 || values[0] !== "1" && values[0] !== "2") return invalidVerificationSummaryVersion()
+  return Number(values[0]) as VerificationSummaryVersion
 }
 
 interface TaskGraphLookupIdentity {
@@ -95,7 +109,7 @@ function sameIds(left: readonly string[], right: readonly string[]): boolean {
 
 function persistedGraphTaskIds(graph: PersistedTaskGraph): string[] | null {
   const snapshot = parseTaskGraphSnapshot(graph.content)
-  if (!snapshot || snapshot.nodes.length === 0 || !graph.taskId || !graph.turnId
+  if (!snapshot || snapshot.nodes.length === 0 || snapshot.nodes.length > MAX_TASK_GRAPH_NODES || !graph.taskId || !graph.turnId
     || graph.id.length < 1 || graph.id.length > MAX_TASK_ID_LENGTH || graph.id.trim() !== graph.id
     || graph.turnId.length > MAX_TASK_ID_LENGTH || graph.turnId.trim() !== graph.turnId
     || graph.taskId.length > MAX_TASK_ID_LENGTH || graph.taskId.trim() !== graph.taskId) return null
@@ -125,6 +139,9 @@ async function getTaskList(request: NextRequest, context: RouteContext, userId: 
   if (taskIds instanceof Response) return taskIds
   const graphLookup = parseTaskGraphLookup(request)
   if (graphLookup instanceof Response) return graphLookup
+  const requestedSummaryVersion = parseVerificationSummaryVersion(request)
+  if (requestedSummaryVersion instanceof Response) return requestedSummaryVersion
+  if (requestedSummaryVersion !== null && !graphLookup) return invalidVerificationSummaryVersion()
   if (graphLookup && !taskIds) {
     return Response.json({ error: { code: "task_graph_ids_required", message: "TaskGraph lookup requires referenced task IDs", details: {} } }, { status: 400 })
   }
@@ -178,7 +195,8 @@ async function getTaskList(request: NextRequest, context: RouteContext, userId: 
       const identity = { sessionId, graphItemId: graph.id, turnId: graph.turnId, rootTaskId: graph.taskId, revision: graph.revision }
       const verificationSummary = projection ? projectTaskGraphVerificationSummary({ sessionId, turnId: graph.turnId, rootTaskId: graph.taskId,
         revision: graph.revision, graph: graph.content, tasks: scopedRows,
-        digestCanonicalJson: (canonicalJson) => createHash("sha256").update(canonicalJson).digest("hex") }, projection) : null
+        digestCanonicalJson: (canonicalJson) => createHash("sha256").update(canonicalJson).digest("hex") }, projection,
+      { displayVersion: requestedSummaryVersion ?? 1 }) : null
       const displayProjection = projection ? decoratePlanLedgerRepairTargets(projection, graph.content, graph.taskId) : null
       const planLedger = displayProjection ? {
         identity,

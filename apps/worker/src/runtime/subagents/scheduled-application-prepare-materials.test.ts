@@ -75,7 +75,7 @@ describe("scheduled Prepare material persistence", () => {
       taskId: "prepare-task-a", stepId: value.stepId, attempt: 3, units: 1 as const, status: "reserved" as const, idempotencyKey: "key",
       createdAt: new Date(), updatedAt: new Date(), settledAt: null }))
     const options = { pool: {} as pg.Pool, owner: input.invocation.owner as never, resolveModel: async () => adapter as never,
-      authorize: async () => ({ settle: async () => undefined, release: async () => undefined }) as never,
+      authorize: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined, release: async () => undefined }) as never,
       treeBudget: ({ reserve, settle: async () => undefined } as never),
       persistMaterial: async (_job: ScheduledPrepareJobInput, kind: "resume" | "cover_letter", _content: unknown,
         _sources: ScheduledPrepareMaterialSources, refs: readonly string[]) => { writtenRefs[kind] = refs; return { artifactId: kind } } }
@@ -123,7 +123,7 @@ describe("scheduled Prepare material persistence", () => {
     const input = { invocation: { owner, taskFence: baseFence }, job: { jobId: "job-a", score: 80, sourceDigest, evidenceRefs },
       resumeTailoringChoice: "keep_resume", artifactBinding: () => binding } as unknown as ScheduledPrepareJobInput
     const options = { pool: {} as pg.Pool, owner: owner as never, resolveModel: async () => adapter as never,
-      authorize: async () => ({ settle: async () => undefined, release: async () => undefined }) as never,
+      authorize: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined, release: async () => undefined }) as never,
       treeBudget: ({ reserve: async (value: { stepId: string }) => ({ id: "reservation", userId: "user-a", sessionId: "session-a", turnId: "turn-a",
         rootTaskId: "root-a", taskId: "prepare-task-a", stepId: value.stepId, attempt: 3, units: 1 as const, status: "reserved" as const,
         idempotencyKey: "key", createdAt: new Date(), updatedAt: new Date(), settledAt: null }), settle: async () => undefined } as never),
@@ -161,7 +161,7 @@ describe("scheduled Prepare material persistence", () => {
       resumeTailoringChoice: "keep_resume", artifactBinding: () => binding } as unknown as ScheduledPrepareJobInput
     const persistMaterial = vi.fn(async () => ({ artifactId: "should-not-persist" }))
     const options = { pool: {} as pg.Pool, owner: owner as never, resolveModel: async () => adapter as never,
-      authorize: async () => ({ settle: async () => undefined, release: async () => undefined }) as never,
+      authorize: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined, release: async () => undefined }) as never,
       treeBudget: ({ reserve: async (value: { stepId: string }) => ({ id: "reservation", userId: "user-a", sessionId: "session-a", turnId: "turn-a",
         rootTaskId: "root-a", taskId: "prepare-task-a", stepId: value.stepId, attempt: 3, units: 1 as const, status: "reserved" as const,
         idempotencyKey: "key", createdAt: new Date(), updatedAt: new Date(), settledAt: null }), settle: async () => undefined } as never), persistMaterial }
@@ -198,7 +198,7 @@ describe("scheduled Prepare material persistence", () => {
       resumeTailoringChoice: "keep_resume", artifactBinding: () => binding } as unknown as ScheduledPrepareJobInput
     const persistMaterial = vi.fn()
     const options = { pool: {} as pg.Pool, owner: owner as never, resolveModel: async () => adapter as never,
-      authorize: async () => ({ settle: async () => undefined, release: async () => undefined }) as never,
+      authorize: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined, release: async () => undefined }) as never,
       treeBudget: ({ reserve: async (value: { stepId: string }) => ({ id: "reservation", userId: "user-a", sessionId: "session-a", turnId: "turn-a",
         rootTaskId: "root-a", taskId: "prepare-task-a", stepId: value.stepId, attempt: 3, units: 1 as const, status: "reserved" as const,
         idempotencyKey: "key", createdAt: new Date(), updatedAt: new Date(), settledAt: null }), settle: async () => undefined } as never), persistMaterial }

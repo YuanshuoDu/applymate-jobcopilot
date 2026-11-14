@@ -15,6 +15,7 @@ import { deleteGraphDispatch, persistGraphTransition, prepareGraphTransition, re
 import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { validateScheduledGateTaskGraphFinish } from "./pg-scheduled-task-graph-gate-verification.js"
 import { SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE, SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
+import { prepareScheduledPostGateFinish } from "./pg-scheduled-post-gate-lifecycle.js"
 import { plainObject, stripNonterminalDiscoveryRecovery, stripTaskGraphMetadata, taskGraphVerificationResult, unverifiedFailureReport } from "./pg-store-lifecycle-result.js"
 type Selector = Readonly<{ sessionId: string; userId?: string; turnId?: string; rootTaskId?: string; targetPath?: string }>
 type Candidate = Record<string, unknown> & Readonly<{ id: string; status: string; attemptCount: number; sessionId: string; userId: string; rootTaskId?: string; turnId?: string | null }>
@@ -31,6 +32,8 @@ export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { tas
       type: "task.failed", attemptCount: input.attemptCount, failureReason })
     return { graph: failedGraph, status: "failed", failureReason, result: finalizedResult(safeInputResult, "failed") }
   }
+  const postGateFinish = await prepareScheduledPostGateFinish(client, graph, node, input, safeInputResult, finalizedResult)
+  if (postGateFinish) return postGateFinish
   if (!graph || "blocked" in graph) {
     if (gateCandidate && (input.status === "completed" || input.status === "waiting_for_user" || input.status === "waiting")) return rejectGate()
     return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeInputResult, input.status) }
@@ -127,14 +130,16 @@ export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { tas
   }
   const evidence = node.verificationDisposition === "typed" && node.verification
     ? await verifyTaskGraphNodeEvidence(client, { scope: { ...graph.scope, taskId: input.taskId, attemptCount: input.attemptCount }, snapshot: graph.snapshot, node, structuredResult,
-      ...(dependencyKeys.length && dependencyProof ? { dependencies: dependencyProof.projections } : {}) })
+      ...(dependencyKeys.length && dependencyProof ? { dependencies: dependencyProof.projections, dependencyBindings: dependencyProof.bindings } : {}),
+      graphRevision: graph.expectedRevision })
     : { verified: false, report: unverifiedFailureReport(node) }
   const typedPass = node.verificationDisposition === "typed" && evidence.verified && evidence.report.status === "passed"
   const repairReceipt = typedPass && node.repairOf ? await validateRepairTarget(client, graph, node, input.taskId, evidence.report) : null
   const repairRejected = typedPass && Boolean(node.repairOf) && !repairReceipt
   const report = repairRejected ? { ...evidence.report, status: "unverified" as const, reasonCode: "repair_target_unresolved", evidenceDigest: null } : evidence.report
   const boundResult = "structuredResult" in evidence ? evidence.structuredResult : undefined
-  const reportWithDependencies = typedPass && !repairRejected && dependencyKeys.length && dependencyProof
+  const persistDependencyBindings = "persistDependencyBindings" in evidence && evidence.persistDependencyBindings === true
+  const reportWithDependencies = (typedPass || persistDependencyBindings) && !repairRejected && dependencyKeys.length && dependencyProof
     ? { ...report, dependencyBindings: dependencyProof.bindings } : report
   const safeResult = taskGraphVerificationResult(safeInputResult, reportWithDependencies, boundResult, repairReceipt)
   if (typedPass && !repairRejected) return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeResult, input.status), reconcileDependents: true }

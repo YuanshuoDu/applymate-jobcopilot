@@ -198,6 +198,17 @@ describe("projectTaskGraphPlanningScoutOverlap", () => {
     expect(projectTaskGraphPlanningScoutOverlap({ ...facts, scoutOverlap: notRequested }, 7, [])).toEqual(notRequested)
   })
 
+  it("accepts an overlap bound to a Scout in an eleven-node persisted graph", () => {
+    const nodes = [scoutNode("scout-current"), ...Array.from({ length: 10 }, (_, index) => ({
+      ...scoutNode(`execute-${index}`), templateId: "execute",
+    }))]
+    const overlap = { coverage: "complete", scouts: [scoutRow("scout-current")] }
+    expect(projectTaskGraphPlanningScoutOverlap({ ...facts, scoutOverlap: overlap }, 7, nodes)).toMatchObject({
+      coverage: "complete", scouts: [{ key: "scout-current" }],
+    })
+    expect(projectTaskGraphPlanningScoutOverlap({ ...facts, scoutOverlap: overlap }, 7, [...nodes, scoutNode("overflow")])).toBeNull()
+  })
+
   it("marks nonterminal results unavailable and requires lifecycle and result coverage to agree", () => {
     const unavailable = { coverage: "unavailable", scouts: [scoutRow("running", {
       taskStatus: "running", resultStatus: null, resultCoverage: "unavailable", reportedCount: null, sharedCount: null,

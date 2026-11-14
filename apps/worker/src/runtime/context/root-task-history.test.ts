@@ -138,7 +138,7 @@ describe("root task history projection", () => {
       criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
         check: { role: "scout", kind: "candidate_count_gte", minimum: 2 } }] } as const
     const categoryLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
-      nodeOrdinal: 3, criterionFailures: [], executionFailureCategory: "execution_setup_unavailable" } as const
+      nodeOrdinal: 3, criterionFailures: [], executionFailureCategory: "execution_deadline_exceeded" } as const
     const source = outcome("cross-session-private", 18n, [repair, target, category])
     const resultProjection = { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted",
       availability: "available", role: "scout", status: "partial", candidateCount: 1, evidenceCount: 1,
@@ -149,12 +149,13 @@ describe("root task history projection", () => {
     const currentTurn = projectRootTaskHistory([facts])
     expect(currentTurn?.content).not.toHaveProperty("historical")
     expect(currentTurn?.content).toMatchObject({ turns: [{ nodes: [
-      { taskKind: "analyst", lesson: { executionFailureCategory: "execution_setup_unavailable" } },
+      { taskKind: "analyst", lesson: { executionFailureCategory: "execution_deadline_exceeded" } },
       { taskKind: "scout", reportedOutput: { candidateCount: 1 }, lesson: { successfulRepairs: [{ targetNodeOrdinal: 1 }] } },
       { taskKind: "scout", lesson: { criterionFailures: [{ check: { kind: "candidate_count_gte", minimum: 2 } }] } },
     ] }] })
 
     const foreign = { ...facts, sourceSessionDiffers: true }
+    delete (foreign as { reportedOutputs?: typeof facts.reportedOutputs }).reportedOutputs
     const sameSession = { ...facts, sourceTurnId: "turn-same-session", sourceRootTaskId: "root-same-session",
       sourceSessionDiffers: false }
     const historical = projectRootTaskHistory([foreign, sameSession], true)
@@ -163,7 +164,7 @@ describe("root task history projection", () => {
     const historicalTurns = (historical?.content as { turns?: Array<{ nodes: Array<Record<string, unknown>> }> } | undefined)?.turns
     expect(historicalTurns).toHaveLength(2)
     expect(historicalTurns?.[0]?.nodes).toEqual(expect.arrayContaining([
-      expect.objectContaining({ taskKind: "analyst", lesson: expect.objectContaining({ executionFailureCategory: "execution_setup_unavailable" }) }),
+      expect.objectContaining({ taskKind: "analyst", lesson: expect.objectContaining({ executionFailureCategory: "execution_deadline_exceeded" }) }),
       expect.objectContaining({ taskKind: "scout", status: "completed", reportedOutput: { role: "scout", candidateCount: 1, resultStatus: "partial" },
         lesson: expect.objectContaining({ successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" }] }) }),
     ]))
@@ -181,15 +182,117 @@ describe("root task history projection", () => {
     const foreignOutput = historicalTurns?.[1]?.nodes.find(item => item.taskKind === "scout" && item.status === "completed")
     const foreignFailure = historicalTurns?.[1]?.nodes.find(item => item.taskKind === "scout" && item.status === "failed")
     expect(foreignAnalyst?.lesson).toBeUndefined()
-    expect(foreignOutput?.reportedOutput).toBeUndefined()
+    expect(foreignOutput?.reportedOutput).toEqual({ role: "scout", candidateCount: 1, resultStatus: "partial" })
     expect(foreignOutput?.lesson).not.toHaveProperty("executionFailureCategory")
     expect(foreignOutput?.lesson).not.toHaveProperty("criterionFailures.0.check")
     expect(foreignFailure?.lesson).not.toHaveProperty("criterionFailures.0.check")
     const serialized = JSON.stringify(historical)
     expect(serialized).not.toContain("sourceSessionDiffers")
+    for (const forbidden of ["safe-job", "candidates", "evidenceCount", "resultProjection"]) expect(serialized).not.toContain(forbidden)
     const unknownLocality = { ...facts, sourceTurnId: "turn-unknown-session", sourceRootTaskId: "root-unknown-session" }
-    expect(projectRootTaskHistory([unknownLocality], true)?.content)
-      .toEqual(projectRootTaskHistory([foreign], true)?.content)
+    const unknownHistory = projectRootTaskHistory([unknownLocality], true)
+    const unknownOutput = (unknownHistory?.content as { turns: Array<{ nodes: Array<Record<string, unknown>> }> })
+      .turns[0]?.nodes.find(item => item.taskKind === "scout" && item.status === "completed")
+    expect(unknownOutput?.reportedOutput).toBeUndefined()
+    expect(JSON.stringify(unknownHistory)).not.toContain("safe-job")
+  })
+
+  it("omits foreign counts when the supplied fact does not match the source graph", () => {
+    const resultProjection = { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted",
+      availability: "available", role: "scout", status: "completed", candidateCount: 2, evidenceCount: 1,
+      candidates: [{ jobId: "source-job", source: "other", evidenceKinds: ["job"] }] } satisfies TaskGraphResultProjection
+    const completed = node({ status: "completed", resultProjection })
+    const source = outcome("mismatched-count-fact", 21n, [completed])
+    const mismatched = { ...source, sourceSessionDiffers: true,
+      reportedOutputs: [{ role: "scout", candidateCount: 3, resultStatus: "completed" }] as const }
+    const projected = projectRootTaskHistory([mismatched], true)
+    const nodeOutput = (projected?.content as { turns: Array<{ nodes: Array<Record<string, unknown>> }> })
+      .turns[0]?.nodes[0]
+    expect(nodeOutput?.reportedOutput).toBeUndefined()
+    expect(JSON.stringify(projected)).not.toContain("source-job")
+  })
+
+  it("preserves an eligible foreign zero without inventing counts for malformed output", () => {
+    const zeroProjection = { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted",
+      availability: "available", role: "scout", status: "completed", candidateCount: 0, evidenceCount: 0, candidates: [] } satisfies TaskGraphResultProjection
+    const zeroSource = { ...outcome("foreign-zero", 22n, [node({ status: "completed", resultProjection: zeroProjection })]),
+      sourceSessionDiffers: true }
+    const zeroHistory = projectRootTaskHistory([zeroSource], true)
+    const zeroNode = (zeroHistory?.content as { turns: Array<{ nodes: Array<Record<string, unknown>> }> }).turns[0]?.nodes[0]
+    expect(zeroNode?.reportedOutput).toEqual({ role: "scout", candidateCount: 0, resultStatus: "completed" })
+
+    const malformedProjection = { ...zeroProjection, candidateCount: -1 }
+    const malformed = { ...zeroSource, sourceTurnId: "turn-foreign-malformed", sourceRootTaskId: "root-foreign-malformed",
+      taskGraph: graph([node({ status: "completed", resultProjection: malformedProjection as TaskGraphResultProjection })]) }
+    const malformedHistory = projectRootTaskHistory([malformed], true)
+    const malformedNode = (malformedHistory?.content as { turns: Array<{ nodes: Array<Record<string, unknown>> }> }).turns[0]?.nodes[0]
+    expect(malformedNode?.reportedOutput).toBeUndefined()
+  })
+
+  it("derives foreign counts and drops them first at the byte cap while preserving history", () => {
+    const maximumBytes = 8 * 1024
+    const criterionIds = Array.from({ length: 8 }, (_, index) => "criterion-" + (index + 1))
+    const passedReport = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed" as const, reasonCode: "criteria_met" as const,
+      criteria: criterionIds.map(criterionId => ({ criterionId, status: "passed" as const, reasonCode: "criteria_met" as const })),
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) }
+    const resultProjection = { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted",
+      availability: "available", role: "analyst", status: "partial", findingCount: Number.MAX_SAFE_INTEGER, evidenceCount: 3,
+      findings: Array.from({ length: 3 }, () => ({ jobId: "bounded-job", score: 8, evidenceKinds: ["job"] })) } satisfies TaskGraphResultProjection
+    const nodes = Array.from({ length: 8 }, (_, index) => node({ key: "budget-" + (index + 1), taskId: "budget-task-" + (index + 1),
+      templateId: "analyst", status: "completed", verificationCriterionIds: criterionIds, verificationReport: passedReport, resultProjection }))
+    const baseNodes = nodes.map(item => {
+      const base = { ...item }
+      delete base.resultProjection
+      return base
+    })
+    const ordinals = nodes.map((_, index) => index + 1)
+    let witness: { baseline: unknown; actual: unknown; lessonCount: number } | undefined
+    const eligiblePositive = projectRootTaskHistory([{ ...outcome("foreign-count-positive", 29n, [nodes[0]!]),
+      sourceSessionDiffers: true }], true)
+    const positiveNode = (eligiblePositive?.content as { turns: Array<{ nodes: Array<Record<string, unknown>> }> })
+      .turns[0]?.nodes[0]
+    expect(positiveNode?.reportedOutput).toEqual({
+      role: "analyst", findingCount: Number.MAX_SAFE_INTEGER, resultStatus: "partial",
+    })
+    for (const forbidden of ["bounded-job", "findings", "resultProjection", "evidenceCount"]) {
+      expect(JSON.stringify(eligiblePositive)).not.toContain(forbidden)
+    }
+
+    for (let lessonCount = 1; lessonCount <= 8 && !witness; lessonCount++) {
+      const baselineSource = outcome("count-byte-" + lessonCount, 30n, baseNodes)
+      const countedSource = outcome("count-byte-" + lessonCount, 30n, nodes)
+      const nodeLessons = nodes.map((_, index) => ({ ordinalScope: "source_graph_local" as const, advisoryOnly: true as const,
+        notCurrentEvidence: true as const, nodeOrdinal: index + 1, criterionFailures: [],
+        passedCriteria: criterionIds.slice(0, lessonCount).map((__, criterionIndex) => ({ criterionOrdinal: criterionIndex + 1,
+          status: "passed" as const, check: { role: "analyst" as const, kind: "reported_score_gte" as const,
+            minimumScore: 10, minimumFindings: 8, aggregation: "all" as const } })) }))
+      const baseline = projectRootTaskHistory([{ ...baselineSource, sourceSessionDiffers: true, sourceNodeOrdinals: ordinals, nodeLessons }], true)
+      const baselineTurn = (baseline?.content as { turns?: Array<{ nodes: Array<Record<string, unknown>> }> } | undefined)?.turns?.[0]
+      if (!baseline || baselineTurn?.nodes.length !== 8 || baselineTurn.nodes.some(item =>
+        (item.lesson as { passedCriteria?: unknown[] } | undefined)?.passedCriteria?.length !== lessonCount)) continue
+      const baselineBytes = Buffer.byteLength(JSON.stringify(baseline), "utf8")
+      if (baselineBytes > maximumBytes) continue
+
+      const hypothetical = JSON.parse(JSON.stringify(baseline)) as { content: { turns: Array<{ nodes: Array<Record<string, unknown>> }> } }
+      hypothetical.content.turns[0]!.nodes.forEach(item => {
+        item.reportedOutput = { role: "analyst", findingCount: Number.MAX_SAFE_INTEGER, resultStatus: "partial" }
+      })
+      if (Buffer.byteLength(JSON.stringify(hypothetical), "utf8") <= maximumBytes) continue
+      const actual = projectRootTaskHistory([{ ...countedSource, sourceSessionDiffers: true, sourceNodeOrdinals: ordinals, nodeLessons }], true)
+      witness = { baseline, actual, lessonCount }
+    }
+
+    expect(witness).toBeDefined()
+    expect(witness?.actual).toEqual(witness?.baseline)
+    const actualTurn = (witness?.actual as { content: { turns: Array<{ nodes: Array<Record<string, unknown>> }> } })
+      .content.turns[0]!
+    expect(actualTurn.nodes).toHaveLength(8)
+    expect(actualTurn.nodes.every(item => (item.lesson as { passedCriteria: unknown[] }).passedCriteria.length === witness?.lessonCount)).toBe(true)
+    expect(actualTurn.nodes.every(item => !Object.hasOwn(item, "reportedOutput"))).toBe(true)
+    expect(Buffer.byteLength(JSON.stringify(witness?.actual), "utf8")).toBeLessThanOrEqual(maximumBytes)
+    for (const forbidden of ["bounded-job", "findings", "resultProjection", "evidenceCount"]) {
+      expect(JSON.stringify(witness?.actual)).not.toContain(forbidden)
+    }
   })
 
   it("keeps only ordinal failed-repair lineage across sessions and prunes it when target evidence is absent", () => {

@@ -18,6 +18,7 @@ import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskGraphDenialCheckpointFromDecis
 import type { TurnEngineTerminalGuard } from "./turns/turn-engine-terminal-commit.js"
 import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletionGate, createCanonicalTurnTerminalGuard, type NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
+import { buildGroundedTaskGraphFinalResponse } from "./subagents/task-graph-final-response.js"
 import { reduceTaskGraphFinalSummary } from "./subagents/task-graph-final-summary.js"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
@@ -62,13 +63,13 @@ type FinalSummaryTerminal = Readonly<{
   response: string
   readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]: ReturnType<typeof graphSummaryBinding>
 }>
-function finalSummaryTerminal(binding: ReturnType<typeof graphSummaryBinding>): FinalSummaryTerminal {
+function finalSummaryTerminal(binding: ReturnType<typeof graphSummaryBinding>, response = candidate): FinalSummaryTerminal {
   const summary = formatTaskGraphFinalSummary(binding.summary)
-  const final = { schemaVersion: "agent-harness.v2.final", response: candidate, summary }
+  const final = { schemaVersion: "agent-harness.v2.final", response, summary }
   const finalItemId = "final-item"
   const taskGraphSources = buildTaskGraphFinalSourceManifest(binding, finalItemId)
   if (!taskGraphSources) throw new Error("Expected a public source manifest")
-  return { stepId: "step-1", finalItemId, finalContent: { text: candidate, final, taskGraphSources }, response: JSON.stringify(final),
+  return { stepId: "step-1", finalItemId, finalContent: { text: response, final, taskGraphSources }, response: JSON.stringify(final),
     [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding }
 }
 
@@ -227,6 +228,80 @@ describe("canonical native verification runtime composition", () => {
     expect(query).toHaveBeenCalledWith(expect.stringContaining('"targetTurnId" = $3'), ["session-1", "user-1", "turn-1"])
     expect(query.mock.invocationCallOrder[0]).toBeLessThan(readTerminalProof.mock.invocationCallOrder[0]!)
     expect(readTerminalProof).toHaveBeenCalledWith(client, { scope: readScope, candidateText: candidate, witness, stepId: "step-terminal" })
+  })
+
+  it("proves the raw model candidate while accepting its exact bound TaskGraph rendering", async () => {
+    const binding = graphSummaryBinding(1, "job-1")
+    const groundedResponse = buildGroundedTaskGraphFinalResponse(binding)
+    expect(groundedResponse).not.toBe(candidate)
+    const terminal = finalSummaryTerminal(binding, groundedResponse)
+    const readTerminalProof = vi.fn(async () => true)
+    const { factory } = runtimeFactory(readTerminalProof)
+    const runtime = createCanonicalNativeVerificationRuntime({
+      pool: steeringLedgerPool(), factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
+    })
+    await expect(runtime.checkCompletion("step-1", candidate)).resolves.toBeNull()
+    const client = { query: vi.fn(async () => ({ rows: [{ hasPendingSteer: false }] })) } as unknown as PoolClient
+    const checkRootGraph = vi.fn(async () => ({ ok: true as const, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding }))
+    const guard = createCanonicalTurnTerminalGuard({ enabled: true, nativeVerification: runtime, checkRootGraph })
+    if (!guard) throw new Error("terminal guard was not enabled")
+
+    await expect(guard(client, terminal as unknown as Parameters<TurnEngineTerminalGuard>[1])).resolves.toEqual({ ok: true })
+    expect(readTerminalProof).toHaveBeenCalledWith(client, { scope: readScope, candidateText: candidate, witness, stepId: "step-1" })
+    expect(checkRootGraph).toHaveBeenCalledOnce()
+  })
+
+  it("rejects a consistently changed bound rendering before native proof or current-graph acceptance", async () => {
+    const binding = graphSummaryBinding(1, "job-1")
+    const groundedResponse = buildGroundedTaskGraphFinalResponse(binding)
+    const canonical = finalSummaryTerminal(binding, groundedResponse)
+    const changedResponse = `U${groundedResponse.slice(1)}`
+    const finalContent = {
+      ...canonical.finalContent,
+      text: changedResponse,
+      final: { ...canonical.finalContent.final, response: changedResponse },
+    }
+    const terminal = { ...canonical, finalContent, response: JSON.stringify({ ...canonical.finalContent.final, response: changedResponse }) }
+    const readTerminalProof = vi.fn(async () => true)
+    const { factory } = runtimeFactory(readTerminalProof)
+    const runtime = createCanonicalNativeVerificationRuntime({
+      pool: steeringLedgerPool(), factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
+    })
+    await expect(runtime.checkCompletion("step-1", candidate)).resolves.toBeNull()
+    const client = { query: vi.fn(async () => ({ rows: [{ hasPendingSteer: false }] })) } as unknown as PoolClient
+    const checkRootGraph = vi.fn(async () => ({ ok: true as const, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding }))
+    const guard = createCanonicalTurnTerminalGuard({ enabled: true, nativeVerification: runtime, checkRootGraph })
+    if (!guard) throw new Error("terminal guard was not enabled")
+
+    await expect(guard(client, terminal as unknown as Parameters<TurnEngineTerminalGuard>[1])).resolves.toMatchObject({
+      ok: false, blocker: "task_graph_verification_unverified",
+    })
+    expect(readTerminalProof).not.toHaveBeenCalled()
+    expect(checkRootGraph).not.toHaveBeenCalled()
+  })
+
+  it("keeps a bound raw-candidate proof denied when the current graph binding is stale", async () => {
+    const submittedBinding = graphSummaryBinding(1, "job-1")
+    const currentBinding = graphSummaryBinding(2, "job-1")
+    const terminal = finalSummaryTerminal(submittedBinding, buildGroundedTaskGraphFinalResponse(submittedBinding))
+    const readTerminalProof = vi.fn(async () => true)
+    const { factory } = runtimeFactory(readTerminalProof)
+    const runtime = createCanonicalNativeVerificationRuntime({
+      pool: steeringLedgerPool(), factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
+    })
+    await expect(runtime.checkCompletion("step-1", candidate)).resolves.toBeNull()
+    const client = { query: vi.fn(async () => ({ rows: [{ hasPendingSteer: false }] })) } as unknown as PoolClient
+    const checkRootGraph = vi.fn(async () => ({ ok: true as const, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: currentBinding }))
+    const finalizeSelectedJob = vi.fn(async () => ({ ok: true as const }))
+    const guard = createCanonicalTurnTerminalGuard({ enabled: true, nativeVerification: runtime, checkRootGraph, finalizeSelectedJob })
+    if (!guard) throw new Error("terminal guard was not enabled")
+
+    await expect(guard(client, terminal as unknown as Parameters<TurnEngineTerminalGuard>[1])).resolves.toMatchObject({
+      ok: false, blocker: "task_graph_verification_unverified",
+    })
+    expect(readTerminalProof).toHaveBeenCalledWith(client, { scope: readScope, candidateText: candidate, witness, stepId: "step-1" })
+    expect(checkRootGraph).toHaveBeenCalledOnce()
+    expect(finalizeSelectedJob).not.toHaveBeenCalled()
   })
 
   it("keeps legacy terminal calls on exact-no-step selection instead of guessing the latest Step", async () => {
@@ -750,7 +825,7 @@ describe("canonical native verification runtime composition", () => {
     const sameCountChangedFacts = graphSummaryBinding(1, "job-2")
     const changedRevision = graphSummaryBinding(2, "job-1")
     expect(sameCountChangedFacts.summary.counts).toEqual(expected.summary.counts)
-    const terminal = finalSummaryTerminal(expected)
+    const terminal = finalSummaryTerminal(expected, buildGroundedTaskGraphFinalResponse(expected))
 
     const staleBindings: ReadonlyArray<{
       terminal: unknown

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { canonicalJson, redactSensitiveText, redactSensitiveValue } from "@jobcopilot/shared"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
-import { redactDurableWaitOutput } from "./durable-wait-output-redaction.js"
+import { redactDurableWaitOutput, type DurableWaitOwnerKind, type DurableWaitToolName } from "./durable-wait-output-redaction.js"
 import { nativeCoordinationLifecycleOutput } from "./task-graph-coordination-bridge.js"
 import { projectScheduledPrepareLifecycleOutput } from "./tool-result-reference-types.js"
 export const DEFAULT_MAX_LIFECYCLE_BYTES = 8 * 1024
@@ -163,8 +163,8 @@ export function prepareSubagentSpawnReceipt(
 }
 
 /** Validates and redacts a durable wait result before computing its canonical receipt. */
-export function prepareDurableWaitOutput(value: unknown): PreparedLifecycleValue {
-  return prepareSafeValue(redactDurableWaitOutput(value))
+export function prepareDurableWaitOutput(value: unknown, toolName: DurableWaitToolName, ownerKind: DurableWaitOwnerKind): PreparedLifecycleValue {
+  return prepareSafeValue(redactDurableWaitOutput(value, toolName, ownerKind))
 }
 
 export function sanitizeLifecyclePreview(value: unknown, maxBytes = DEFAULT_MAX_LIFECYCLE_BYTES): RepositoryJsonValue {

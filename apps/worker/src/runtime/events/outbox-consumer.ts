@@ -2,6 +2,7 @@ import type pg from "pg"
 
 import { publishAgentEvent, type StreamPublisherRedis } from "../../stream/event-publisher.js"
 import { matchesCanonicalAgentEvent, parseAgentEventOutboxPayload, toCanonicalAgentEvent, type AgentEventRow } from "./outbox-contract.js"
+import { projectPendingWaitCompletionEvent } from "../turns/turn-execution-wait-event-projection.js"
 
 export const AGENT_EVENT_OUTBOX_TOPIC = "agent.session.event"
 export const LEGACY_AGENT_EVENT_OUTBOX_TOPIC = "agent.events"
@@ -83,8 +84,13 @@ async function processRow(pool: PoolLike, publisher: AgentEventOutboxPublisher, 
         await markPublished(client, current.id, current.topic, TERMINAL_ERRORS[2])
         return "processed"
       }
+      const publishEvent = projectPendingWaitCompletionEvent(canonical)
+      if (!publishEvent) {
+        await markPublished(client, current.id, current.topic, TERMINAL_ERRORS[2])
+        return "processed"
+      }
       publishStarted = true
-      await publishAgentEvent(publisher, canonical)
+      await publishAgentEvent(publisher, publishEvent)
       await markPublished(client, current.id, current.topic, null)
       return "processed"
     })

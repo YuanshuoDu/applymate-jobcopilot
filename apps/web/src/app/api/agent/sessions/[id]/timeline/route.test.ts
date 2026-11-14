@@ -1,7 +1,9 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
+import { redactAgentEvent } from "@jobcopilot/shared"
+import { waitItemId } from "@/lib/agent/broker/item-ids"
 import { publicAgentEventId, publicToolCallId, publicToolItemId } from "@/lib/agent/session/public-tool-identity"
 
-const mocks = vi.hoisted(() => ({ requireAuth: vi.fn(), sessionFindFirst: vi.fn(), itemFindFirst: vi.fn(), itemFindMany: vi.fn(), agendaFindMany: vi.fn() }))
+const mocks = vi.hoisted(() => ({ requireAuth: vi.fn(), sessionFindFirst: vi.fn(), itemFindFirst: vi.fn(), itemFindMany: vi.fn(), agendaFindMany: vi.fn(), approvalFindMany: vi.fn() }))
 
 vi.mock("@/lib/api-helpers", () => ({
   requireAuth: mocks.requireAuth,
@@ -13,6 +15,7 @@ vi.mock("@/lib/db", () => ({ db: {
   agentSession: { findFirst: mocks.sessionFindFirst },
   agentItem: { findFirst: mocks.itemFindFirst, findMany: mocks.itemFindMany },
   agentEvent: { findMany: mocks.agendaFindMany },
+  agentApproval: { findMany: mocks.approvalFindMany },
 } }))
 
 const params = { params: Promise.resolve({ id: "session_1" }) }
@@ -89,6 +92,25 @@ function brokerApprovalRow(sequence: bigint, status: "approved" | "rejected" = "
   }, { itemId: "wait-item-1" })
 }
 
+function legacyBrokerApprovalRow(sequence: bigint, id: string, payloadOverrides: Record<string, unknown> = {}, rowOverrides: Record<string, unknown> = {}) {
+  const itemId = waitItemId("approval", id)
+  return approvalRow(sequence, "approval.resolved", {
+    waitKind: "approval", waitId: id, itemId, turnId: "turn_1", toolCallId: "tool-call-1",
+    status: "approved", nextTurnRevision: 4, answerAvailable: "[REDACTED]", ...payloadOverrides,
+  }, { id: "legacy-" + sequence.toString(), itemId, correlationId: id, causationId: itemId, ...rowOverrides })
+}
+
+function approvalDecision(overrides: Record<string, unknown> = {}) {
+  return { id: "approval-1", userId: "user_1", sessionId: "session_1", turnId: "turn_1", taskId: null, toolCallId: "tool-call-1",
+    type: "submit_application", scopeHash: "sha256:" + "a".repeat(64), revision: 2, status: "approved", ...overrides }
+}
+
+function consumedApprovalRow(sequence: bigint, id: string, payloadApprovalId = id, payloadOverrides: Record<string, unknown> = {}, rowOverrides: Record<string, unknown> = {}) {
+  return approvalRow(sequence, "approval.consumed", {
+    approvalId: payloadApprovalId, action: "submit_application", scopeHash: "sha256:" + "a".repeat(64), revision: 2, ...payloadOverrides,
+  }, { id: "consumed-" + sequence.toString(), correlationId: id, idempotencyKey: "approval:" + id + ":consumed", ...rowOverrides })
+}
+
 describe("agent timeline query API", () => {
   beforeAll(async () => {
     await import("./route")
@@ -100,6 +122,8 @@ describe("agent timeline query API", () => {
     mocks.itemFindFirst.mockReset()
     mocks.itemFindMany.mockReset()
     mocks.agendaFindMany.mockReset()
+    mocks.approvalFindMany.mockReset()
+    mocks.approvalFindMany.mockResolvedValue([])
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
     mocks.itemFindFirst.mockResolvedValue(null)
@@ -328,6 +352,185 @@ describe("agent timeline query API", () => {
     const next = await GET(request("?limit=1&cursor=eyJjb2xsZWN0aW9uIjoidGltZWxpbmUiLCJjcmVhdGVkQXQiOiIyMDI2LTA4LTMxVDAwOjAwOjAwLjAwMFoiLCJpZCI6Iml0ZW1fMSIsInNlc3Npb25JZCI6InNlc3Npb25fMSJ9") as never, params)
     expect((await next.json()).agenda).toBeUndefined()
     expect(mocks.agendaFindMany).not.toHaveBeenCalled()
+  })
+
+  it("restores a legacy redacted approval answer only from its exact authoritative decision", async () => {
+    const row = legacyBrokerApprovalRow(BigInt(3), "approval-1")
+    mocks.agendaFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([row])
+    mocks.approvalFindMany.mockResolvedValueOnce([approvalDecision()])
+    const { GET } = await import("./route")
+
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+
+    expect(body.approvalEvents).toHaveLength(1)
+    expect(body.approvalEvents[0].payload.answerAvailable).toBe(false)
+    expect(body.approvalEvents[0].payload.status).toBe("approved")
+    expect(JSON.stringify(body.approvalEvents)).not.toContain("[REDACTED]")
+    expect(JSON.stringify(body.approvalEvents)).not.toContain("tool-call-1")
+    expect(mocks.approvalFindMany).toHaveBeenCalledWith({
+      where: { id: { in: ["approval-1"] }, userId: "user_1", sessionId: "session_1" },
+      select: { id: true, userId: true, sessionId: true, turnId: true, taskId: true, toolCallId: true, type: true, scopeHash: true, revision: true, status: true },
+    })
+  })
+
+  it("restores a legacy redacted rejected answer only from its exact rejected authority", async () => {
+    const row = legacyBrokerApprovalRow(BigInt(3), "approval-1", { status: "rejected" })
+    mocks.agendaFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([row])
+    mocks.approvalFindMany.mockResolvedValueOnce([approvalDecision({ status: "rejected" })])
+    const { GET } = await import("./route")
+
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+
+    expect(body.approvalEvents).toHaveLength(1)
+    expect(body.approvalEvents[0]).toMatchObject({
+      type: "approval.resolved",
+      payload: { waitId: "approval-1", status: "rejected", answerAvailable: false },
+    })
+  })
+
+  it("preserves consumed audit action, hash, and revision through fact-store redaction", () => {
+    const payload = { approvalId: "approval-1", action: "submit_application", scopeHash: "sha256:" + "a".repeat(64), revision: 2 }
+    const redacted = redactAgentEvent({
+      type: "approval.consumed", body: "", data: payload,
+      routing: { sessionId: "session_1", turnId: "turn_1", itemId: null, taskId: null, actor: "system",
+        correlationId: "approval-1", causationId: null, outboxTopic: "agent.session.event" },
+    })
+    expect(redacted.data).toEqual({ approvalId: "[REDACTED]", action: payload.action, scopeHash: payload.scopeHash, revision: payload.revision })
+  })
+
+  it.each(["[REDACTED]", "approval-1"])("restores a consumed approval decision from the canonical audit when stored ID is %s", async storedId => {
+    const resolved = legacyBrokerApprovalRow(BigInt(3), "approval-1")
+    const consumed = consumedApprovalRow(BigInt(4), "approval-1", storedId)
+    mocks.agendaFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([consumed, resolved])
+    mocks.approvalFindMany.mockResolvedValueOnce([approvalDecision({ status: "consumed" })])
+    const { GET } = await import("./route")
+
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+    const event = body.approvalEvents.find((entry: { type: string }) => entry.type === "approval.resolved")
+
+    expect(event.payload.answerAvailable).toBe(false)
+    expect(event.payload.status).toBe("approved")
+    expect(JSON.stringify(body.approvalEvents)).not.toContain("tool-call-1")
+    expect(mocks.agendaFindMany).toHaveBeenNthCalledWith(3, expect.objectContaining({
+      where: { sessionId: "session_1", type: { in: ["approval.requested", "approval.resolved", "approval.consumed", "approval.expired"] } },
+      orderBy: { sequence: "desc" }, take: 256, select: expect.objectContaining({ idempotencyKey: true, sequence: true }),
+    }))
+  })
+
+  it("restores a consumed approval only when its non-null task scope matches every record", async () => {
+    const resolved = legacyBrokerApprovalRow(BigInt(3), "approval-1", {}, { taskId: "task_1" })
+    const consumed = consumedApprovalRow(BigInt(4), "approval-1", "[REDACTED]", {}, { taskId: "task_1" })
+    mocks.agendaFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([consumed, resolved])
+    mocks.approvalFindMany.mockResolvedValueOnce([approvalDecision({ taskId: "task_1", status: "consumed" })])
+    const { GET } = await import("./route")
+
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+    const event = body.approvalEvents.find((entry: { type: string }) => entry.type === "approval.resolved")
+
+    expect(event).toMatchObject({
+      taskId: "task_1",
+      payload: { waitId: "approval-1", status: "approved", answerAvailable: false },
+    })
+    expect(body.approvalEvents.find((entry: { type: string }) => entry.type === "approval.consumed")).toMatchObject({ taskId: "task_1" })
+  })
+
+  it("fails closed when consumed approval audit evidence is absent, ambiguous, or mismatched", async () => {
+    const resolved = (sequence: number, id: string, status = "approved") =>
+      legacyBrokerApprovalRow(BigInt(sequence), id, { status })
+    const resolvedRows = [
+      resolved(10, "consumed-missing"), resolved(20, "consumed-duplicate"), resolved(30, "consumed-before"),
+      resolved(40, "consumed-wrong-route"), resolved(50, "consumed-wrong-scope"), resolved(60, "consumed-wrong-revision"),
+      resolved(70, "consumed-wrong-action"), resolved(80, "consumed-wrong-id"), resolved(90, "consumed-rejected", "rejected"),
+      resolved(100, "consumed-wrong-correlation"), resolved(110, "consumed-wrong-key"), resolved(120, "consumed-wrong-turn"),
+      resolved(130, "consumed-wrong-task"), resolved(140, "consumed-wrong-item"), resolved(150, "consumed-wrong-actor"),
+      resolved(160, "consumed-wrong-session"),
+    ]
+    const consumedRows = [
+      consumedApprovalRow(BigInt(21), "consumed-duplicate"), consumedApprovalRow(BigInt(22), "consumed-duplicate"),
+      consumedApprovalRow(BigInt(29), "consumed-before"),
+      consumedApprovalRow(BigInt(41), "consumed-wrong-route", "consumed-wrong-route", {}, { causationId: "wrong-cause" }),
+      consumedApprovalRow(BigInt(51), "consumed-wrong-scope", "consumed-wrong-scope", { scopeHash: "sha256:" + "b".repeat(64) }),
+      consumedApprovalRow(BigInt(61), "consumed-wrong-revision", "consumed-wrong-revision", { revision: 3 }),
+      consumedApprovalRow(BigInt(71), "consumed-wrong-action", "consumed-wrong-action", { action: "review_application" }),
+      consumedApprovalRow(BigInt(81), "consumed-wrong-id", "other-approval"),
+      consumedApprovalRow(BigInt(91), "consumed-rejected"),
+      consumedApprovalRow(BigInt(101), "consumed-wrong-correlation", "consumed-wrong-correlation", {}, { correlationId: "other-approval" }),
+      consumedApprovalRow(BigInt(111), "consumed-wrong-key", "consumed-wrong-key", {}, { idempotencyKey: "approval:other-approval:consumed" }),
+      consumedApprovalRow(BigInt(121), "consumed-wrong-turn", "consumed-wrong-turn", {}, { turnId: "turn_2" }),
+      consumedApprovalRow(BigInt(131), "consumed-wrong-task", "consumed-wrong-task", {}, { taskId: "other-task" }),
+      consumedApprovalRow(BigInt(141), "consumed-wrong-item", "consumed-wrong-item", {}, { itemId: "other-item" }),
+      consumedApprovalRow(BigInt(151), "consumed-wrong-actor", "consumed-wrong-actor", {}, { actor: "user" }),
+      consumedApprovalRow(BigInt(161), "consumed-wrong-session", "consumed-wrong-session", {}, { sessionId: "session_2" }),
+    ]
+    const authority = ["consumed-missing", "consumed-duplicate", "consumed-before", "consumed-wrong-route", "consumed-wrong-scope",
+      "consumed-wrong-revision", "consumed-wrong-action", "consumed-wrong-id", "consumed-rejected", "consumed-wrong-correlation",
+      "consumed-wrong-key", "consumed-wrong-turn", "consumed-wrong-task", "consumed-wrong-item", "consumed-wrong-actor", "consumed-wrong-session"]
+      .map(id => approvalDecision({ id, status: "consumed" }))
+    mocks.agendaFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([...consumedRows, ...resolvedRows])
+    mocks.approvalFindMany.mockResolvedValueOnce(authority)
+    const { GET } = await import("./route")
+
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+
+    expect((body.approvalEvents ?? []).filter((event: { type: string }) => event.type === "approval.resolved")).toEqual([])
+  })
+
+  it("fails closed for legacy approval sentinels with missing, ambiguous, or mismatched authority", async () => {
+    const rows = [
+      legacyBrokerApprovalRow(BigInt(1), "missing"),
+      legacyBrokerApprovalRow(BigInt(2), "ambiguous"),
+      legacyBrokerApprovalRow(BigInt(3), "foreign-user"),
+      legacyBrokerApprovalRow(BigInt(4), "foreign-session"),
+      legacyBrokerApprovalRow(BigInt(5), "foreign-event-session", {}, { sessionId: "session-2" }),
+      legacyBrokerApprovalRow(BigInt(6), "wrong-turn", {}, { turnId: "turn_2" }),
+      legacyBrokerApprovalRow(BigInt(7), "wrong-task", {}, { taskId: "task_event" }),
+      legacyBrokerApprovalRow(BigInt(8), "wrong-wait", { waitId: "other-wait" }),
+      legacyBrokerApprovalRow(BigInt(9), "wrong-row-item", {}, { itemId: "other-item" }),
+      legacyBrokerApprovalRow(BigInt(10), "wrong-payload-item", { itemId: "other-item" }),
+      legacyBrokerApprovalRow(BigInt(20), "wrong-noncanonical-item", { itemId: "legal-other-item" }, { itemId: "legal-other-item", causationId: "legal-other-item" }),
+      legacyBrokerApprovalRow(BigInt(11), "wrong-correlation", {}, { correlationId: "other-wait" }),
+      legacyBrokerApprovalRow(BigInt(12), "wrong-causation", {}, { causationId: "other-item" }),
+      legacyBrokerApprovalRow(BigInt(13), "wrong-payload-turn", { turnId: "turn_2" }),
+      legacyBrokerApprovalRow(BigInt(14), "wrong-authority-turn"),
+      legacyBrokerApprovalRow(BigInt(15), "wrong-authority-task"),
+      legacyBrokerApprovalRow(BigInt(16), "wrong-authority-tool-call"),
+      legacyBrokerApprovalRow(BigInt(17), "wrong-payload-tool-call", { toolCallId: "other-tool-call" }),
+      legacyBrokerApprovalRow(BigInt(18), "wrong-authority-status"),
+      legacyBrokerApprovalRow(BigInt(19), "tampered-payload-status", { status: "rejected" }),
+    ]
+    mocks.agendaFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce(rows)
+    mocks.approvalFindMany.mockResolvedValueOnce([
+      approvalDecision({ id: "ambiguous" }), approvalDecision({ id: "ambiguous" }),
+      approvalDecision({ id: "foreign-user", userId: "user_2" }),
+      approvalDecision({ id: "foreign-session", sessionId: "session_2" }),
+      approvalDecision({ id: "foreign-event-session" }),
+      approvalDecision({ id: "wrong-turn" }),
+      approvalDecision({ id: "wrong-task" }),
+      approvalDecision({ id: "wrong-row-item" }),
+      approvalDecision({ id: "wrong-payload-item" }),
+      approvalDecision({ id: "wrong-noncanonical-item" }),
+      approvalDecision({ id: "wrong-correlation" }),
+      approvalDecision({ id: "wrong-causation" }),
+      approvalDecision({ id: "wrong-payload-turn" }),
+      approvalDecision({ id: "wrong-authority-turn", turnId: "turn_2" }),
+      approvalDecision({ id: "wrong-authority-task", taskId: "task_authority" }),
+      approvalDecision({ id: "wrong-authority-tool-call", toolCallId: "other-tool-call" }),
+      approvalDecision({ id: "wrong-payload-tool-call" }),
+      approvalDecision({ id: "wrong-authority-status", status: "rejected" }),
+      approvalDecision({ id: "tampered-payload-status" }),
+    ])
+    const { GET } = await import("./route")
+
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+
+    expect(body.approvalEvents ?? []).toEqual([])
+    expect(JSON.stringify(body)).not.toContain("[REDACTED]")
   })
 
   it("restores legal approval facts in sequence order without returning receipt material", async () => {

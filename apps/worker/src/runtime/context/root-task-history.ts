@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer"
 import type { TaskGraphCurrentState } from "../subagents/task-graph-command-port.js"
 import type { ContextSeedBlock } from "./step-context-builder.js"
 import { filterRootTaskHistoryLessonsForEmittedNodes, sanitizeRootTaskHistoryNodeLessonForCrossSession, type RootTaskHistoryNodeLesson } from "./root-task-history-lesson-projection.js"
-import type { RootTaskHistoryReportedOutput } from "./root-task-history-result-counts.js"
+import { parseRootTaskHistoryReportedOutputsFromGraph, type RootTaskHistoryReportedOutput } from "./root-task-history-result-counts.js"
 import * as rootTaskHistoryPlanShape from "./root-task-history-plan-shape.js"
 import { isDenseRootTaskHistoryArray, parseRootTaskHistoryCandidate, type RootTaskHistoryCandidate, type RootTaskHistoryCandidateNode, type RootTaskHistorySafeNode } from "./root-task-history-candidate-codec.js"
 export type ValidatedRootTaskHistoryOutcome = Readonly<{
@@ -20,6 +20,37 @@ const MAX_TURNS = 2
 const MAX_NODES = 8
 const MAX_CONTENT_BYTES = 8 * 1024
 function compare(left: string, right: string): number { return left < right ? -1 : left > right ? 1 : 0 }
+function copyOutcome(value: object, outputs?: readonly (RootTaskHistoryReportedOutput | undefined)[]): unknown {
+  try {
+    const prototype = Object.getPrototypeOf(value), keys = Reflect.ownKeys(value)
+    if ((prototype !== Object.prototype && prototype !== null) || keys.some(key => typeof key !== "string")) return null
+    const descriptors = Object.getOwnPropertyDescriptors(value), copy: Record<string, unknown> = Object.create(null) as Record<string, unknown>
+    for (const key of keys as string[]) {
+      if (key === "reportedOutputs") continue
+      const descriptor = descriptors[key]
+      if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return null
+      copy[key] = descriptor.value
+    }
+    if (outputs) copy.reportedOutputs = outputs
+    return copy
+  } catch { return null }
+}
+function prepareCrossSessionOutcome(value: unknown, crossSession: boolean): unknown {
+  if (!crossSession || !value || typeof value !== "object" || Array.isArray(value)) return value
+  try {
+    const locality = Object.getOwnPropertyDescriptor(value, "sourceSessionDiffers")
+    const supplied = Object.getOwnPropertyDescriptor(value, "reportedOutputs")
+    if (supplied && (!supplied.enumerable || !("value" in supplied))) return copyOutcome(value)
+    if (!locality) return supplied ? copyOutcome(value) : value
+    if (!("value" in locality)) return null
+    if (!locality.enumerable) return supplied ? copyOutcome(value) : value
+    if (locality.value === false || locality.value !== true || supplied) return value
+    const graph = Object.getOwnPropertyDescriptor(value, "taskGraph")
+    if (!graph || !graph.enumerable || !("value" in graph)) return null
+    const outputs = parseRootTaskHistoryReportedOutputsFromGraph(graph.value)
+    return outputs?.some(Boolean) ? copyOutcome(value, outputs) : value
+  } catch { return null }
+}
 function content(turns: readonly Readonly<{ label: string; nodes: readonly RootTaskHistorySafeNode[]; planShape?: rootTaskHistoryPlanShape.RootTaskHistoryPlanShape }>[], crossSession = false) {
   return {
     kind: "root_task_history",
@@ -38,7 +69,7 @@ function emittedNodes(turn: SelectedTurn, withLessons: boolean, withReportedOutp
   return turn.nodes.map(node => {
     const lesson = byOrdinal.get(node.nodeOrdinal), publicLesson = lesson && turn.candidate.sourceSessionDiffers ? sanitizeRootTaskHistoryNodeLessonForCrossSession(lesson) : lesson,
       priorScoutQueryFootprint = !turn.candidate.sourceSessionDiffers && turn.footprintOrdinals.has(node.nodeOrdinal) ? node.priorScoutQueryFootprint : undefined
-    const reportedOutput = withReportedOutputs && !turn.candidate.sourceSessionDiffers && turn.reportedOutputOrdinals.has(node.nodeOrdinal) ? node.reportedOutput : undefined
+    const reportedOutput = withReportedOutputs && turn.reportedOutputOrdinals.has(node.nodeOrdinal) ? node.reportedOutput : undefined
     return { ...node.projection, ...(reportedOutput ? { reportedOutput } : {}), ...(priorScoutQueryFootprint ? { priorScoutQueryFootprint } : {}), ...(publicLesson ? { lesson: publicLesson } : {}) }
   })
 }
@@ -82,6 +113,9 @@ function projectCandidates(values: readonly RootTaskHistoryCandidate[], crossSes
     if (entry.nodes.length) turns.push(entry)
   }
   if (!turns.length) return undefined
+  if (!withinContentLimit(turns, true, true, crossSession) && withinContentLimit(turns, true, false, crossSession)) {
+    for (const turn of turns) turn.reportedOutputOrdinals.clear()
+  }
   for (const turn of [...turns].reverse()) for (const node of [...turn.nodes].reverse()) if (!withinContentLimit(turns, true, true, crossSession)) turn.footprintOrdinals.delete(node.nodeOrdinal)
   rootTaskHistoryPlanShape.dropRootTaskHistoryPlanShapesUntilFits(turns, selectedTurns => withinContentLimit(selectedTurns, true, true, crossSession))
   if (!withinContentLimit(turns, true, true, crossSession)) {
@@ -107,7 +141,7 @@ export function projectRootTaskHistory(
   crossSession = false,
 ): ContextSeedBlock | undefined {
   if (!Array.isArray(outcomes) || outcomes.length === 0 || outcomes.length > MAX_CANDIDATES || !isDenseRootTaskHistoryArray(outcomes)) return undefined
-  const candidates = outcomes.map(value => parseRootTaskHistoryCandidate(value, crossSession))
+  const candidates = outcomes.map(value => parseRootTaskHistoryCandidate(prepareCrossSessionOutcome(value, crossSession), crossSession))
   if (candidates.some(value => value === null)) return undefined
   return projectCandidates(candidates as RootTaskHistoryCandidate[], crossSession)
 }

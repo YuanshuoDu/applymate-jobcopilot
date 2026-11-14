@@ -162,7 +162,7 @@ function preserveFields(safe: unknown, raw: JsonRecord, fields: readonly string[
   const output = record(safe)
   if (!output) return safe as RepositoryJsonValue
   const result = { ...output } as Record<string, RepositoryJsonValue>
-  for (const field of fields) { const value = raw[field]; if (value === null || opaqueId(value)) result[field] = value }
+  for (const field of fields) { const value = raw[field]; if (value === null || opaqueId(value) || (field === "answerAvailable" && value === false)) result[field] = value }
   return result
 }
 function redactWaitRouting(type: string, raw: unknown, safe: RepositoryJsonValue, route: RoutingTuple): RepositoryJsonValue {

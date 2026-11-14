@@ -3,10 +3,9 @@ import type { Queryable } from "./pg-store-persistence.js"
 import { hasPersistedTaskGraphMembership, loadTaskGraph, type GraphIdentityScope } from "./task-graph-pg-state.js"
 import { sanitizeTaskGraphLifecycleEvent, writeTaskLifecycleReceipt } from "./task-graph-pg-events.js"
 import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
-import { isTaskGraphDependencyContextError, materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
-import { loadScopedTaskGraphDependencyContext } from "./task-graph-pg-dependency-context-loader.js"
+import { isTaskGraphDependencyContextError } from "./task-graph-dependency-context.js"
+import { readyTaskDependencyContext } from "./task-graph-pg-post-gate-audit-ready.js"
 import { enqueueReadyGraphTask } from "./task-graph-pg-dispatch.js"
-import { sourceIntentForTaskGraphNode } from "./task-graph-source-intent-context.js"
 import { deleteGraphDispatch, hasCompletedLegacyAncestor, isActiveGraphStatus } from "./task-graph-pg-reconcile-helpers.js"
 export { deleteGraphDispatch }
 
@@ -178,17 +177,7 @@ export async function reconcileGraphDependents(
       if ("blocked" in transition) continue
       let dependencyContext: unknown
       try {
-        const contextRows = await loadScopedTaskGraphDependencyContext(client, scope, row.id, node.dependsOn, loaded.snapshot.nodes)
-        const dependencies = row.role === "analyst" ? contextRows.dependencies.map(dependency => {
-          const sourceNode = nodesByKey.get(dependency.key)
-          if (!sourceNode || !node.dependsOn.includes(sourceNode.key) || sourceNode.taskId !== dependency.taskId) return dependency
-          const sourceIntent = sourceIntentForTaskGraphNode(sourceNode,
-            loaded.sourceInputCheckpointByNodeKey?.get(sourceNode.key), loaded.currentInputCheckpoint)
-          return sourceIntent ? { ...dependency, sourceIntent } : dependency
-        }) : contextRows.dependencies
-        dependencyContext = materializeTaskGraphDependencyContext(
-          contextRows.childContext, scope, node.dependsOn, dependencies,
-        )
+        dependencyContext = await readyTaskDependencyContext(client, scope, loaded, node, row)
       } catch (error) {
         if (!isTaskGraphDependencyContextError(error)) throw error
         // A malformed/oversized predecessor must not roll back its completion

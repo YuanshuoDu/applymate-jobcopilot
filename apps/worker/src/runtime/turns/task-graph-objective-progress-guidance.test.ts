@@ -17,6 +17,7 @@ function scopedBlock(id: string, content: unknown) {
 
 function objectiveContext(statuses: readonly string[] = ["missing"], options: Readonly<{
   graphRevision?: number
+  currentNodeCount?: number
   progressRevision?: number | null
   progressId?: string
   progressTrust?: string
@@ -26,7 +27,8 @@ function objectiveContext(statuses: readonly string[] = ["missing"], options: Re
   duplicateGraph?: boolean
 }> = {}): StepContext {
   const requirements = statuses.map((_, index) => ({ ...requirement, id: index === 0 ? requirement.id : `${requirement.id}-${index}` }))
-  const graph = scopedBlock(graphId, { kind: "task_graph_current", revision: options.graphRevision ?? revision, nodes: [] })
+  const graph = scopedBlock(graphId, { kind: "task_graph_current", revision: options.graphRevision ?? revision,
+    nodes: Array.from({ length: options.currentNodeCount ?? 0 }, (_, index) => `node-${index}`) })
   const canonical = scopedBlock(requirementId, {
     kind: "canonical_objective_verification_requirements", trust: "external_untrusted", source: "canonical_turn_objective",
     status: "valid", requirements,
@@ -66,6 +68,13 @@ describe("missing TaskGraph objective progress guidance", () => {
     expect(text).toContain("not evidence, PASS, permission, or authority")
     expect(text).not.toContain(requirement.id)
     expect(text.length).toBeLessThan(1_024)
+  })
+
+  it("accepts guidance backed by the full persisted scheduled graph capacity", () => {
+    expect(buildTaskGraphObjectiveProgressInstruction(objectiveContext(["missing"], { currentNodeCount: 11 }),
+      [{ name: "agent.plan" }], true)).not.toBeNull()
+    expect(buildTaskGraphObjectiveProgressInstruction(objectiveContext(["missing"], { currentNodeCount: 12 }),
+      [{ name: "agent.plan" }], true)).toBeNull()
   })
 
   it("handles mixed status rows while limiting the action to missing requirements", () => {

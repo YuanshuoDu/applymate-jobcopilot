@@ -279,6 +279,20 @@ describe("root history planning guidance", () => {
     expect(categoryWithHiddenTools).not.toContain("agent.list")
     expect(categoryWithHiddenTools).not.toContain("agent.plan")
 
+    const deadlineLesson = { ...categoryLesson, executionFailureCategory: "execution_deadline_exceeded" }
+    const deadlineContent = { ...categoryContent, turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "scout", status: "failed", lesson: deadlineLesson },
+    ] }] }
+    const deadlineText = textOf(buildRootHistoryPlanningInstruction(
+      context([historyBlock(deadlineContent)]), [{ name: "agent.list" }, { name: "agent.plan" }],
+    ))
+    const deadlineAdvice = "For deadline cues, inspect the current blocker and evidence. They do not prove a child started or authorize replacement. Only the server can admit an explicit replacement for eligible started typed Scout or Analyst work; a new child still needs ordinary independent verification."
+    expect(deadlineText).toContain("Historical execution-category lessons identify earlier prerequisites worth inspecting")
+    expect(deadlineText).toContain(deadlineAdvice)
+    expect(deadlineText).not.toContain("execution_deadline_exceeded")
+    expect(deadlineText).not.toContain("task_graph_child_deadline_exceeded")
+    expect(deadlineText).not.toContain("privateId")
+
     const completedContent = { ...categoryContent, turns: [{ label: "earlier terminal attempt", nodes: [
       { taskKind: "scout", status: "completed", lesson: categoryLesson },
     ] }] }
@@ -300,6 +314,10 @@ describe("root history planning guidance", () => {
     ] }] }
     expect(buildRootHistoryPlanningInstruction(context([historyBlock(unknownContent)]), [{ name: "agent.plan" }])).toBeNull()
     expect(buildRootHistoryPlanningInstruction(context([historyBlock(mixedContent)]), [{ name: "agent.plan" }])).toBeNull()
+    const rawDeadlineReasonContent = { ...deadlineContent, turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "scout", status: "failed", lesson: { ...deadlineLesson, executionFailureCategory: "task_graph_child_deadline_exceeded" } },
+    ] }] }
+    expect(buildRootHistoryPlanningInstruction(context([historyBlock(rawDeadlineReasonContent)]), [{ name: "agent.plan" }])).toBeNull()
   })
 
   it("rejects accessor-backed and inherited category history without reading or trusting it", () => {
@@ -341,10 +359,12 @@ describe("root history planning guidance", () => {
         categoryNode("scout", 1, "structured_output_invalid"),
         categoryNode("analyst", 2, "execution_setup_unavailable"),
         categoryNode("writer", 3, "resume_state_unavailable"),
+        categoryNode("scout", 4, "execution_deadline_exceeded"),
       ] },
       { label: "earlier terminal attempt", nodes: [
         categoryNode("scout", 1, "resume_state_unavailable"),
         categoryNode("analyst", 2, "execution_setup_unavailable"),
+        categoryNode("writer", 3, "execution_deadline_exceeded"),
       ] },
     ]
     const categoryContent: HistoryContent = { ...defaultHistoryContent(), turns }
@@ -358,12 +378,14 @@ describe("root history planning guidance", () => {
     const setup = "For execution-setup cues, inspect the existing execution prerequisites for the child."
     const resume = "For resume-state cues, inspect the current resume state and available evidence."
     const structured = "For structured-output cues, inspect the existing typed output contract and current available result evidence."
+    const deadline = "For deadline cues, inspect the current blocker and evidence. They do not prove a child started or authorize replacement. Only the server can admit an explicit replacement for eligible started typed Scout or Analyst work; a new child still needs ordinary independent verification."
     expect(text.indexOf(setup)).toBeGreaterThanOrEqual(0)
     expect(text.indexOf(setup)).toBeLessThan(text.indexOf(resume))
     expect(text.indexOf(resume)).toBeLessThan(text.indexOf(structured))
-    for (const advice of [setup, resume, structured]) expect(text.split(advice).length - 1).toBe(1)
+    expect(text.indexOf(structured)).toBeLessThan(text.indexOf(deadline))
+    for (const advice of [setup, resume, structured, deadline]) expect(text.split(advice).length - 1).toBe(1)
     expect(text).toContain("Historical execution-category lessons identify earlier prerequisites worth inspecting")
-    for (const category of ["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid"]) {
+    for (const category of ["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid", "execution_deadline_exceeded"]) {
       expect(text).not.toContain(category)
     }
   })

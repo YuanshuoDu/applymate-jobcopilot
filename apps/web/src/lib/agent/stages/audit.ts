@@ -17,10 +17,11 @@ export async function runAudit(
   executeOutput: ExecuteOutput,
   originalJobs: Job[],
   ctx: PipelineCtx,
+  options: Readonly<{ syncGmail?: boolean }> = {},
 ): Promise<StageResult<AuditOutput>> {
   const startedAt = Date.now()
   const warnings = await verifyDispatchedJobs(executeOutput.queued, ctx)
-  await syncGmailTracking(ctx, warnings)
+  if (options.syncGmail !== false) await syncGmailTracking(ctx, warnings)
 
   const processed = originalJobs.length
   const queued = executeOutput.queued.length

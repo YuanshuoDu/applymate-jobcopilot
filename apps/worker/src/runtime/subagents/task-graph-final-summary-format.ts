@@ -47,7 +47,7 @@ function appendPrepareBreakdown(base: string, breakdown: string): string {
 function prepareOutcomeBreakdown(results: unknown, countValue: unknown): string | null {
   const count = asRecord(countValue)
   if (!count) return "Prepare status breakdown unavailable."
-  const resultsAreEmpty = isDenseArray(results, TASK_GRAPH_LIMITS.maxNodes) && results.length === 0
+  const resultsAreEmpty = isDenseArray(results, TASK_GRAPH_LIMITS.maxPersistedNodes) && results.length === 0
   if ((count.coverage === "not_requested" || count.coverage === "unavailable") && count.knownCount === null) {
     return resultsAreEmpty ? null : "Prepare status breakdown unavailable."
   }
@@ -64,7 +64,7 @@ function prepareOutcomeBreakdown(results: unknown, countValue: unknown): string 
 }
 
 function summarizePrepareResults(value: unknown): Readonly<{ prepared: number; skipped: number; failed: number; total: number; hasPartialResult: boolean }> | null {
-  if (!isDenseArray(value, TASK_GRAPH_LIMITS.maxNodes) || value.length === 0) return null
+  if (!isDenseArray(value, TASK_GRAPH_LIMITS.maxPersistedNodes) || value.length === 0) return null
   const seenTaskIds = new Set<string>()
   const counts = { prepared: 0, skipped: 0, failed: 0, total: 0, hasPartialResult: false }
   for (const candidate of value) {

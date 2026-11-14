@@ -206,7 +206,7 @@ describe("tool lifecycle redaction", () => {
     const output = durableWaitOutput()
 
     expect(prepareLifecycleValue(output).safe).not.toEqual(output)
-    expect(prepareDurableWaitOutput(output).safe).toEqual({
+    expect(prepareDurableWaitOutput(output, "agent.wait", "turn").safe).toEqual({
       waitId: durableWaitId,
       status: "ready",
       taskIds: [durableWaitTaskId],
@@ -225,6 +225,12 @@ describe("tool lifecycle redaction", () => {
     })
   })
 
+  it("validates child wait receipts in their raw UUID namespace", () => {
+    const output = { ...durableWaitOutput(), waitId: "12345678-1234-4234-9234-123456789012" }
+    expect(prepareDurableWaitOutput(output, "wait_subagents", "task").safe).toMatchObject({ waitId: output.waitId })
+    expect(() => prepareDurableWaitOutput(durableWaitOutput(), "wait_subagents", "task")).toThrow("durable_wait_receipt_invalid")
+  })
+
   it("applies the native feedback projection in prepareDurableWaitOutput", () => {
     const output = durableWaitOutput()
     Object.assign(output.tasks[0]!.result, { nativeVerificationReport: {
@@ -238,7 +244,7 @@ describe("tool lifecycle redaction", () => {
       criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: ["target-ref"] }],
     } })
 
-    const safe = prepareDurableWaitOutput(output).safe as Record<string, unknown>
+    const safe = prepareDurableWaitOutput(output, "agent.wait", "turn").safe as Record<string, unknown>
     const tasks = safe.tasks as Array<Record<string, unknown>>
     expect(tasks[0]?.result).toMatchObject({
       nativeVerificationFeedback: {
@@ -254,19 +260,19 @@ describe("tool lifecycle redaction", () => {
     expect(() => prepareDurableWaitOutput({
       ...durableWaitOutput(),
       waitId: "wait-123",
-    })).toThrow("durable_wait_receipt_invalid")
-    expect(() => prepareDurableWaitOutput({ waitId: durableWaitId, status: "ready" })).toThrow("durable_wait_receipt_invalid")
+    }, "agent.wait", "turn")).toThrow("durable_wait_receipt_invalid")
+    expect(() => prepareDurableWaitOutput({ waitId: durableWaitId, status: "ready" }, "agent.wait", "turn")).toThrow("durable_wait_receipt_invalid")
     expect(() => prepareDurableWaitOutput({
       ...durableWaitOutput(),
       injected: "candidate@example.com",
-    })).toThrow("durable_wait_receipt_invalid")
+    }, "agent.wait", "turn")).toThrow("durable_wait_receipt_invalid")
 
     const accessorReceipt = durableWaitOutput()
     Object.defineProperty(accessorReceipt, "waitId", {
       enumerable: true,
       get: () => durableWaitId,
     })
-    expect(() => prepareDurableWaitOutput(accessorReceipt)).toThrow("durable_wait_receipt_invalid")
+    expect(() => prepareDurableWaitOutput(accessorReceipt, "agent.wait", "turn")).toThrow("durable_wait_receipt_invalid")
   })
 
   it("preserves generated spawn lineage after generic redaction would alter a phone-like UUID", () => {

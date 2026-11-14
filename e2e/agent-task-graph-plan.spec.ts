@@ -4,15 +4,28 @@ import { readFileSync } from 'node:fs'
 import { parsePlanLedger, parseTaskGraphSnapshot, projectPlanLedger, type PlanLedger } from '@jobcopilot/agent-protocol'
 import { redactStreamEventPayload } from '../apps/web/src/lib/agent/session/stream-redaction'
 import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '../apps/web/src/lib/task-graph-plan-labels'
+import { buildGroundedTaskGraphFinalResponse } from '../apps/worker/src/runtime/subagents/task-graph-final-response.js'
+import { reduceTaskGraphFinalSummary } from '../apps/worker/src/runtime/subagents/task-graph-final-summary.js'
+import type { TaskGraphFinalSummaryBinding } from '../apps/worker/src/runtime/subagents/task-graph-final-summary-binding.js'
 
 const SCHEMA = 'agent-harness.v2'
 const GRAPH_SCHEMA = 'agent-harness.v2.task-graph'
 const TRACE_SCHEMA = 'agent-harness.v2.plan-ledger-trace'
 const DISCOVERY_TRACE_SCHEMA = 'agent-harness.v2.interactive-discovery-trace'
-const DISCOVERY_FINAL_CANDIDATE_TEXT = JSON.stringify({
+const DISCOVERY_RAW_MODEL_SENTINEL = 'p3-process-restart-discovery-shortlist-ready'
+const DISCOVERY_RAW_CANDIDATE_ENVELOPE = JSON.stringify({
   schemaVersion: 'agent-harness.v2.final',
-  response: 'p3-process-restart-discovery-shortlist-ready',
+  response: DISCOVERY_RAW_MODEL_SENTINEL,
 })
+const DISCOVERY_FINAL_LIMITATION = 'These are structured task reports, not independent verification. Prepared materials do not confirm that an application was submitted or received by an employer.'
+const DISCOVERY_FINAL_SECTION_LABELS = [
+  'Search results:', 'Analysis results:', 'Preparation outcomes:', 'Artifact references:', 'Reviewer outcomes:',
+] as const
+const DISCOVERY_FINAL_DISPLAY_BINDING: TaskGraphFinalSummaryBinding = {
+  graphRevision: 0,
+  summary: reduceTaskGraphFinalSummary({ graphRevision: 0, nodes: [] }),
+}
+const DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT = buildGroundedTaskGraphFinalResponse(DISCOVERY_FINAL_DISPLAY_BINDING)
 const SESSION_B = 'task-graph-session-b'
 const TURN_B = 'task-graph-turn-b'
 const GOAL_B = 'Compare engineering teams in Amsterdam'
@@ -145,17 +158,24 @@ function record(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
 
-function isExactPersistedDiscoveryCandidate(value: unknown): value is string {
-  if (typeof value !== 'string' || value !== DISCOVERY_FINAL_CANDIDATE_TEXT) return false
-  try {
-    const candidate = record(JSON.parse(value) as unknown)
-    return !!candidate && Object.keys(candidate).sort().join(',') === 'response,schemaVersion'
-      && candidate.schemaVersion === 'agent-harness.v2.final'
-      && candidate.response === 'p3-process-restart-discovery-shortlist-ready'
-      && JSON.stringify(candidate) === value
-  } catch {
-    return false
+function isBoundedTaskGraphFinalDisplayText(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length === 0 || value !== value.trim()
+    || new TextEncoder().encode(value).byteLength > 4_096
+    || !value.startsWith('Task-reported results:\n') || value.includes('\r') || value.includes('\0')
+    || value.includes(DISCOVERY_RAW_MODEL_SENTINEL) || value === DISCOVERY_RAW_CANDIDATE_ENVELOPE) return false
+  const lines = value.split('\n')
+  const taskStatesMatches = lines.flatMap((line, index) => line.startsWith('Task states:') ? [index] : [])
+  const taskStatesIndex = taskStatesMatches[0] ?? -1
+  const blankLineIndexes = lines.flatMap((line, index) => line.length === 0 ? [index] : [])
+  if (lines.at(-1) !== DISCOVERY_FINAL_LIMITATION || taskStatesMatches.length !== 1
+    || blankLineIndexes.length > 1 || blankLineIndexes.some(index => index !== taskStatesIndex - 1)) return false
+  let previousIndex = 0
+  for (const label of DISCOVERY_FINAL_SECTION_LABELS) {
+    const matches = lines.flatMap((line, index) => line.startsWith(label) ? [index] : [])
+    if (matches.length !== 1 || matches[0]! <= previousIndex) return false
+    previousIndex = matches[0]!
   }
+  return true
 }
 
 function planLedgerEnumLabel(locale: 'en' | 'zh', group: 'readiness' | 'status', value: string): string {
@@ -310,10 +330,11 @@ function parsePersistedDiscoveryTrace(value: unknown): PersistedPlanLedgerTrace 
   const shortlist = parsePersistedDiscoveryShortlist(envelope?.interactiveDiscoveryShortlist)
   const rawTasks = Array.isArray(envelope?.tasks) ? envelope.tasks.map(record) : null
   const outcome = record(envelope?.finalOutcome)
+  // The Worker producer verifies the owner-scoped current binding and saved final copies before writing this trace; this consumer checks the bounded display wire format and persisted identities.
   if (envelope?.schemaVersion !== DISCOVERY_TRACE_SCHEMA || typeof sessionId !== 'string' || typeof turnId !== 'string'
     || typeof rootTaskId !== 'string' || typeof graphItemId !== 'string' || !Number.isSafeInteger(graphRevision)
     || !graphSnapshot || !ledger || !shortlist || !rawTasks || outcome?.turnStatus !== 'completed'
-    || Object.keys(outcome).sort().join(',') !== 'response,turnStatus' || !isExactPersistedDiscoveryCandidate(outcome.response)
+    || Object.keys(outcome).sort().join(',') !== 'response,turnStatus' || !isBoundedTaskGraphFinalDisplayText(outcome.response)
     || ledger.sessionId !== sessionId || ledger.revision !== graphRevision || graphSnapshot.nodes.length !== ledger.nodes.length) return null
 
   const graphContent = { schemaVersion: GRAPH_SCHEMA, nodes: graphSnapshot.nodes }
@@ -377,27 +398,38 @@ function parsePersistedDiscoveryTrace(value: unknown): PersistedPlanLedgerTrace 
   }
 }
 
-test('accepts only the exact persisted v2 discovery candidate envelope', () => {
-  expect(isExactPersistedDiscoveryCandidate(DISCOVERY_FINAL_CANDIDATE_TEXT)).toBe(true)
-  expect(JSON.parse(DISCOVERY_FINAL_CANDIDATE_TEXT)).toEqual({
-    schemaVersion: 'agent-harness.v2.final',
-    response: 'p3-process-restart-discovery-shortlist-ready',
-  })
-
-  expect(isExactPersistedDiscoveryCandidate(JSON.stringify({
-    schemaVersion: 1, status: 'completed', items: [{ jobId: 'job-1', score: 9, evidenceIds: ['evidence-1'] }], failures: [],
-  }))).toBe(false)
-  expect(isExactPersistedDiscoveryCandidate(JSON.stringify({
-    schemaVersion: 'agent-harness.v2.final', response: 'p3-process-restart-discovery-shortlist-ready', extra: true,
-  }))).toBe(false)
-  expect(isExactPersistedDiscoveryCandidate(JSON.stringify({
-    schemaVersion: 'agent-harness.v2.final', response: 'changed candidate',
-  }))).toBe(false)
-  expect(isExactPersistedDiscoveryCandidate(JSON.stringify({
-    response: 'p3-process-restart-discovery-shortlist-ready', schemaVersion: 'agent-harness.v2.final',
-  }))).toBe(false)
-  expect(isExactPersistedDiscoveryCandidate(` ${DISCOVERY_FINAL_CANDIDATE_TEXT}`)).toBe(false)
-  expect(isExactPersistedDiscoveryCandidate('{invalid-json')).toBe(false)
+test('accepts bounded TaskGraph final display text and rejects raw or incomplete output', () => {
+  expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT)).toBe(true)
+  expect(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.split('\n').filter(line => line.length === 0)).toHaveLength(1)
+  expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_RAW_CANDIDATE_ENVELOPE)).toBe(false)
+  expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_RAW_MODEL_SENTINEL)).toBe(false)
+  expect(isBoundedTaskGraphFinalDisplayText('')).toBe(false)
+  expect(isBoundedTaskGraphFinalDisplayText(' ')).toBe(false)
+  expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace(
+    'Task-reported results:', 'Task results:',
+  ))).toBe(false)
+  expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace(
+    'Reviewer outcomes: not requested.\n', '',
+  ))).toBe(false)
+  expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace(
+    `${DISCOVERY_FINAL_LIMITATION}`, 'Prepared materials do not confirm submission.',
+  ))).toBe(false)
+  expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace(
+    'Task-reported results:\n', 'Task-reported results:\n\n',
+  ))).toBe(false)
+  expect(isBoundedTaskGraphFinalDisplayText(DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace(
+    'Task states: no business tasks recorded.', 'Task states: no business tasks recorded.\n',
+  ))).toBe(false)
+  const oversized = DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace(
+    DISCOVERY_FINAL_LIMITATION, `${'x'.repeat(4_097)}\n${DISCOVERY_FINAL_LIMITATION}`,
+  )
+  expect(isBoundedTaskGraphFinalDisplayText(oversized)).toBe(false)
+  const oversizedUtf8 = DISCOVERY_TASK_GRAPH_FINAL_DISPLAY_TEXT.replace(
+    'Task states:', `Task states: ${'é'.repeat(2_000)}`,
+  )
+  expect(oversizedUtf8.length).toBeLessThan(4_096)
+  expect(new TextEncoder().encode(oversizedUtf8).byteLength).toBeGreaterThan(4_096)
+  expect(isBoundedTaskGraphFinalDisplayText(oversizedUtf8)).toBe(false)
 })
 
 // CI wraps the public ledger with persisted TaskGraph/task identities for this browser-only handoff.

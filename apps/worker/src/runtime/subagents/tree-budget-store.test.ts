@@ -12,16 +12,22 @@ function reservation(overrides: Partial<TreeBudgetReservation> = {}): TreeBudget
   return { ...input, id: "tree-step-1", units: 1, status: "reserved", createdAt: now, updatedAt: now, settledAt: null, ...overrides }
 }
 
-function fakePool(results: unknown[], sessionStatus?: string) {
+function fakePool(results: unknown[], sessionStatus?: string, budgetSnapshot: unknown = {}) {
   let index = 0
   const client = {
-    query: vi.fn(async (query: unknown) => {
+    query: vi.fn(async (query: unknown, _values?: readonly unknown[]) => {
       const text = String(query)
-      if (sessionStatus !== undefined && text.includes('FROM "agent_sessions"') && text.includes('"status" NOT IN') && text.includes("FOR UPDATE")) {
-        return ["aborted", "archived"].includes(sessionStatus)
+      if (text === "BEGIN" || text === "COMMIT" || text === "ROLLBACK" || text.includes("SELECT set_config")) return { rows: [], rowCount: null }
+      if (text.includes('FROM "agent_sessions"')) {
+        return ["aborted", "archived"].includes(sessionStatus ?? "") && text.includes('"status" NOT IN')
           ? { rows: [], rowCount: 0 }
-          : { rows: [{ id: "session-1", userId: input.userId, status: sessionStatus }], rowCount: 1 }
+          : { rows: [{ id: "session-1", userId: input.userId, status: sessionStatus ?? "running" }], rowCount: 1 }
       }
+      if (text.includes('FROM "agent_turns"')) return { rows: [{ id: input.turnId, rootTaskId: input.rootTaskId, status: "in_progress" }], rowCount: 1 }
+      if (text.includes('FROM "sub_agent_tasks" AS root_task')) return { rows: [{ id: input.rootTaskId, sessionId: input.sessionId, turnId: input.turnId,
+        rootTaskId: input.rootTaskId, budgetSnapshot, status: "running", interruptRequestedAt: null }], rowCount: 1 }
+      if (text.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: input.taskId }], rowCount: 1 }
+      if (text.includes('FROM "agent_steps"')) return { rows: [{ id: input.stepId }], rowCount: 1 }
       return results[index++] ?? { rows: [], rowCount: null }
     }),
     release: vi.fn(),
@@ -31,12 +37,7 @@ function fakePool(results: unknown[], sessionStatus?: string) {
 
 describe("tree budget reservation store", () => {
   it("loads only root step and tool-call ceilings under the user-scoped root fence", async () => {
-    const { pool, client } = fakePool([
-      { rows: [], rowCount: null }, { rows: [], rowCount: null },
-      { rows: [{ id: "session-1", userId: input.userId, status: "running" }], rowCount: 1 },
-      { rows: [{ id: input.rootTaskId, sessionId: input.sessionId, turnId: input.turnId, rootTaskId: input.rootTaskId, budgetSnapshot: { limits: { maxSteps: 7, maxToolCalls: 3, maxCostUsd: 0.01 } }, status: "running", interruptRequestedAt: null }], rowCount: 1 },
-      { rows: [], rowCount: null },
-    ])
+    const { pool, client } = fakePool([], undefined, { limits: { maxSteps: 7, maxToolCalls: 3, maxCostUsd: 0.01 } })
 
     const readRootLimits = createPgTreeBudgetReservationStore(pool as never).readRootLimits
     if (!readRootLimits) throw new Error("root limit reader is unavailable")
@@ -45,84 +46,61 @@ describe("tree budget reservation store", () => {
     })).resolves.toEqual({ maxSteps: 7, maxToolCalls: 3 })
     const queries = client.query.mock.calls.map(call => String(call[0]))
     expect(queries[2]).toContain('"userId" = $2')
-    expect(queries[3]).toContain('session."userId" = $4')
-    expect(queries[3]).toContain('root_task."rootTaskId" = $1')
+    expect(queries[3]).toContain('FROM "agent_turns"')
+    expect(queries[4]).toContain('session."userId" = $4')
+    expect(queries[4]).toContain('root_task."rootTaskId" = $1')
   })
 
   it("locks the root, validates lineage, counts active units, and reserves one step", async () => {
     const stored = reservation()
     const { pool, client } = fakePool([
-      { rows: [], rowCount: null }, { rows: [], rowCount: null },
-      { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 },
-      { rows: [{ id: "root-1", budgetSnapshot: { limits: { maxSteps: 2 } } }], rowCount: 1 },
-      { rows: [], rowCount: 0 }, { rows: [{ id: "task-1" }], rowCount: 1 }, { rows: [{ units: 1 }], rowCount: 1 },
-      { rows: [stored], rowCount: 1 }, { rows: [], rowCount: null },
-    ])
+      { rows: [], rowCount: 0 }, { rows: [{ units: 1 }], rowCount: 1 }, { rows: [stored], rowCount: 1 },
+    ], undefined, { limits: { maxSteps: 2 } })
     const result = await createPgTreeBudgetReservationStore(pool as never).reserve(input)
     expect(result).toEqual(stored)
-    expect(client.query).toHaveBeenCalledTimes(9)
+    expect(client.query).toHaveBeenCalledTimes(11)
     const queries = client.query.mock.calls.map(call => String(call[0]))
     expect(queries[2]).toContain('"id", "userId", "status"')
     expect(queries[2]).toContain('status\" NOT IN (\'aborted\', \'archived\')')
     expect(queries[2]).toContain('FOR UPDATE')
-    expect(queries[3]).toContain('FOR UPDATE')
-    expect(queries[5]).toContain("step.\"status\" = 'streaming'")
-    expect(queries[5]).toContain('task.\"attemptCount\" = $7')
-    expect(queries[6]).toContain("status\" IN ('reserved', 'consumed')")
+    expect(queries[3]).toContain('FROM "agent_turns"')
+    expect(queries[4]).toContain('FOR UPDATE')
+    expect(queries[6]).toContain('"attemptCount" = $5')
+    expect(queries[7]).toContain('"status" = \'streaming\'')
+    expect(queries[8]).toContain("status\" IN ('reserved', 'consumed')")
+    expect(client.query.mock.calls[6]?.[1]).toEqual([input.taskId, input.sessionId, input.turnId, input.rootTaskId, input.attempt])
+    expect(client.query.mock.calls[7]?.[1]).toEqual([input.stepId, input.sessionId, input.turnId, input.taskId, input.attempt])
   })
 
   it("returns an identical reservation without consuming another unit", async () => {
     const stored = reservation({ status: "consumed", settledAt: new Date("2026-09-09T09:01:00.000Z") })
-    const { pool, client } = fakePool([
-      { rows: [], rowCount: null }, { rows: [], rowCount: null },
-      { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 },
-      { rows: [{ id: "root-1", budgetSnapshot: {} }], rowCount: 1 }, { rows: [stored], rowCount: 1 },
-      { rows: [], rowCount: null },
-    ])
+    const { pool, client } = fakePool([{ rows: [stored], rowCount: 1 }])
     await expect(createPgTreeBudgetReservationStore(pool as never).reserve(input)).resolves.toEqual(stored)
-    expect(client.query).toHaveBeenCalledTimes(6)
+    expect(client.query).toHaveBeenCalledTimes(7)
   })
 
   it("rejects a released reservation instead of reopening its identity", async () => {
     const released = reservation({ status: "released", settledAt: new Date("2026-09-09T09:01:00.000Z") })
-    const { pool, client } = fakePool([
-      { rows: [], rowCount: null }, { rows: [], rowCount: null },
-      { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 },
-      { rows: [{ id: "root-1", budgetSnapshot: {} }], rowCount: 1 }, { rows: [released], rowCount: 1 }, { rows: [], rowCount: null },
-    ])
+    const { pool, client } = fakePool([{ rows: [released], rowCount: 1 }])
     await expect(createPgTreeBudgetReservationStore(pool as never).reserve(input)).rejects.toMatchObject({ code: "reservation_conflict" })
-    expect(client.query).toHaveBeenCalledTimes(6)
+    expect(client.query).toHaveBeenCalledTimes(7)
   })
 
   it("fails closed when the shared step budget is exhausted", async () => {
     const { pool, client } = fakePool([
-      { rows: [], rowCount: null }, { rows: [], rowCount: null },
-      { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 },
-      { rows: [{ id: "root-1", budgetSnapshot: { limits: { maxSteps: 1 } } }], rowCount: 1 },
-      { rows: [], rowCount: 0 }, { rows: [{ id: "task-1" }], rowCount: 1 }, { rows: [{ units: 1 }], rowCount: 1 },
-      { rows: [], rowCount: null },
-    ])
+      { rows: [], rowCount: 0 }, { rows: [{ units: 1 }], rowCount: 1 },
+    ], undefined, { limits: { maxSteps: 1 } })
     await expect(createPgTreeBudgetReservationStore(pool as never).reserve(input)).rejects.toMatchObject({ code: "tree_step_budget_exhausted" })
-    expect(client.query).toHaveBeenCalledTimes(8)
+    expect(client.query).toHaveBeenCalledTimes(10)
   })
 
   it("uses the root runtime's 32-step default when maxSteps is omitted", async () => {
     const belowLimit = fakePool([
-      { rows: [], rowCount: null }, { rows: [], rowCount: null },
-      { rows: [{ id: "session-1", userId: input.userId, status: "running" }], rowCount: 1 },
-      { rows: [{ id: "root-1", budgetSnapshot: {} }], rowCount: 1 },
-      { rows: [], rowCount: 0 }, { rows: [{ id: "task-1" }], rowCount: 1 }, { rows: [{ units: 31 }], rowCount: 1 },
-      { rows: [reservation()], rowCount: 1 }, { rows: [], rowCount: null },
+      { rows: [], rowCount: 0 }, { rows: [{ units: 31 }], rowCount: 1 }, { rows: [reservation()], rowCount: 1 },
     ])
     await expect(createPgTreeBudgetReservationStore(belowLimit.pool as never).reserve(input)).resolves.toEqual(reservation())
 
-    const atLimit = fakePool([
-      { rows: [], rowCount: null }, { rows: [], rowCount: null },
-      { rows: [{ id: "session-1", userId: input.userId, status: "running" }], rowCount: 1 },
-      { rows: [{ id: "root-1", budgetSnapshot: {} }], rowCount: 1 },
-      { rows: [], rowCount: 0 }, { rows: [{ id: "task-1" }], rowCount: 1 }, { rows: [{ units: 32 }], rowCount: 1 },
-      { rows: [], rowCount: null },
-    ])
+    const atLimit = fakePool([{ rows: [], rowCount: 0 }, { rows: [{ units: 32 }], rowCount: 1 }])
     await expect(createPgTreeBudgetReservationStore(atLimit.pool as never).reserve(input))
       .rejects.toMatchObject({ code: "tree_step_budget_exhausted" })
     expect(atLimit.client.query.mock.calls.some(([query]) => String(query).includes('INSERT INTO "agent_tree_budget_reservations"'))).toBe(false)
@@ -147,11 +125,8 @@ describe("tree budget reservation store", () => {
   it.each(["running", "paused", "waiting_for_user"] as const)("keeps reservation admission compatible with a %s session", async sessionStatus => {
     const stored = reservation()
     const { pool, client } = fakePool([
-      { rows: [], rowCount: null }, { rows: [], rowCount: null },
-      { rows: [{ id: "root-1", budgetSnapshot: { limits: { maxSteps: 2 } } }], rowCount: 1 },
-      { rows: [], rowCount: 0 }, { rows: [{ id: "task-1" }], rowCount: 1 }, { rows: [{ units: 0 }], rowCount: 1 },
-      { rows: [stored], rowCount: 1 }, { rows: [], rowCount: null },
-    ], sessionStatus)
+      { rows: [], rowCount: 0 }, { rows: [{ units: 0 }], rowCount: 1 }, { rows: [stored], rowCount: 1 },
+    ], sessionStatus, { limits: { maxSteps: 2 } })
     const result = await createPgTreeBudgetReservationStore(pool as never).reserve(input)
 
     expect(result).toEqual(stored)
@@ -164,48 +139,61 @@ describe("tree budget reservation store", () => {
     const stored = reservation()
     const consumed = reservation({ status: "consumed", settledAt: new Date("2026-09-09T09:02:00.000Z") })
     const { pool, client } = fakePool([
-      { rows: [], rowCount: null }, { rows: [], rowCount: null }, { rows: [stored], rowCount: 1 }, { rows: [consumed], rowCount: 1 }, { rows: [], rowCount: null },
+      { rows: [stored], rowCount: 1 }, { rows: [consumed], rowCount: 1 },
     ])
     const settle = { ...input, id: stored.id, status: "consumed" as const }
     await expect(createPgTreeBudgetReservationStore(pool as never).settle(settle)).resolves.toEqual(consumed)
-    expect(client.query).toHaveBeenCalledTimes(5)
+    expect(client.query).toHaveBeenCalledTimes(10)
+  })
+
+  it.each(["consumed", "released"] as const)("matches inactive lineage query parameters when settling to %s", async status => {
+    const stored = reservation()
+    const settled = reservation({ status, settledAt: new Date("2026-09-09T09:02:00.000Z") })
+    const { pool, client } = fakePool([{ rows: [stored], rowCount: 1 }, { rows: [settled], rowCount: 1 }])
+    const settle = { ...input, id: stored.id, status }
+
+    await expect(createPgTreeBudgetReservationStore(pool as never).settle(settle)).resolves.toEqual(settled)
+
+    const taskLock = client.query.mock.calls.find(([query]) => String(query).startsWith('SELECT "id" FROM "sub_agent_tasks"'))
+    const stepLock = client.query.mock.calls.find(([query]) => String(query).startsWith('SELECT "id" FROM "agent_steps"'))
+    expect(String(taskLock?.[0])).toContain('"rootTaskId" = $4')
+    expect(String(taskLock?.[0])).not.toContain('"attemptCount" = $5')
+    expect(taskLock?.[1]).toEqual([input.taskId, input.sessionId, input.turnId, input.rootTaskId])
+    expect(String(stepLock?.[0])).toContain('"taskId" = $4')
+    expect(String(stepLock?.[0])).not.toContain('"attempt" = $5')
+    expect(stepLock?.[1]).toEqual([input.stepId, input.sessionId, input.turnId, input.taskId])
   })
 
   it.each(["consumed", "released"] as const)("settles an existing reservation to %s after session closure", async status => {
     const stored = reservation()
     const settled = reservation({ status, settledAt: new Date("2026-09-09T09:02:00.000Z") })
-    const { pool, client } = fakePool([
-      { rows: [], rowCount: null }, { rows: [], rowCount: null }, { rows: [stored], rowCount: 1 }, { rows: [settled], rowCount: 1 }, { rows: [], rowCount: null },
-    ])
+    const { pool, client } = fakePool([{ rows: [stored], rowCount: 1 }, { rows: [settled], rowCount: 1 }])
     const settle = { ...input, id: stored.id, status }
 
     await expect(createPgTreeBudgetReservationStore(pool as never).settle(settle)).resolves.toEqual(settled)
-    expect(client.query.mock.calls.some(call => String(call[0]).includes('FROM "agent_sessions"'))).toBe(false)
+    const sessionQuery = client.query.mock.calls.find(call => String(call[0]).includes('FROM "agent_sessions"'))?.[0] as string
+    expect(sessionQuery).not.toContain('"status" NOT IN')
   })
 
   it("rejects settlement for a missing reservation", async () => {
-    const { pool } = fakePool([
-      { rows: [], rowCount: null }, { rows: [], rowCount: null }, { rows: [], rowCount: 0 }, { rows: [], rowCount: null },
-    ])
+    const { pool, client } = fakePool([{ rows: [], rowCount: 0 }])
     await expect(createPgTreeBudgetReservationStore(pool as never).settle({ ...input, id: "missing", status: "released" as const }))
       .rejects.toMatchObject({ code: "reservation_missing" })
+    expect(client.query).toHaveBeenCalledTimes(9)
   })
 
   it("rejects settlement for a foreign reservation identity", async () => {
     const stored = reservation()
-    const { pool } = fakePool([
-      { rows: [], rowCount: null }, { rows: [], rowCount: null }, { rows: [stored], rowCount: 1 }, { rows: [], rowCount: null },
-    ])
+    const { pool } = fakePool([{ rows: [stored], rowCount: 1 }])
     await expect(createPgTreeBudgetReservationStore(pool as never).settle({ ...input, userId: "user-2", id: stored.id, status: "released" as const }))
       .rejects.toMatchObject({ code: "reservation_conflict" })
   })
 
   it("rejects a conflicting terminal transition", async () => {
     const stored = reservation({ status: "consumed" })
-    const { pool } = fakePool([
-      { rows: [], rowCount: null }, { rows: [], rowCount: null }, { rows: [stored], rowCount: 1 }, { rows: [], rowCount: null },
-    ])
+    const { pool, client } = fakePool([{ rows: [stored], rowCount: 1 }])
     await expect(createPgTreeBudgetReservationStore(pool as never).settle({ ...input, id: stored.id, status: "released" as const })).rejects.toMatchObject({ code: "settlement_conflict" })
+    expect(client.query).toHaveBeenCalledTimes(9)
     expect(new TreeBudgetStoreError("settlement_conflict")).toBeInstanceOf(Error)
   })
 })

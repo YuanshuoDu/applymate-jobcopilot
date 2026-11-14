@@ -78,6 +78,13 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
     }
     if (sql.includes('FROM "agent_items" AS question')) return { rows: rows.priorQuestions ?? [], rowCount: rows.priorQuestions?.length ?? 0 }
     if (sql.includes('FROM "agent_items" AS call')) return { rows: rows.priorCalls ?? [], rowCount: rows.priorCalls?.length ?? 0 }
+    if (sql.startsWith('SELECT "id", "status", "content",') && sql.includes('FROM "agent_items"') && sql.includes('"type" = \'tool_call\'')) {
+      const exactAttempt = rows.steps?.some(step => step.id === values?.[2] && Number(step.attempt) === 1)
+      const result = exactAttempt ? (rows.items ?? []).filter(item => item.type === "tool_call" && item.stepId === values?.[2]
+        && item.taskId === values?.[3] && (item.content as Record<string, unknown> | undefined)?.toolCallId === values?.[4])
+        : []
+      return { rows: result, rowCount: result.length }
+    }
     if (sql.includes('FROM "agent_steps" AS step') && sql.includes('WHERE step."id" = $1')) {
       const result = (rows.steps ?? []).filter(step => step.id === values?.[0])
       return { rows: result, rowCount: result.length }
@@ -458,15 +465,21 @@ describe("loadCanonicalTurnState", () => {
     }
   })
 
-  it("restores only the exact server-owned interactive-discovery intent", async () => {
+  it("restores exact supported intents and preserves absence", async () => {
     const exact = pool({ turn: { input: { goal: "Find jobs", intent: { kind: "interactive_discovery_shortlist", version: 1 } }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
     await expect(loadCanonicalTurnState(exact, lease)).resolves.toMatchObject({
       intent: { kind: "interactive_discovery_shortlist", version: 1 },
     })
+    const objective = pool({ turn: { input: { goal: "Find jobs", intent: { kind: "objective_task_graph_execution", version: 1 } }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
+    await expect(loadCanonicalTurnState(objective, lease)).resolves.toMatchObject({
+      intent: { kind: "objective_task_graph_execution", version: 1 },
+    })
 
-    for (const intent of [undefined, { kind: "interactive_discovery_shortlist", version: 2 }, { kind: "interactive_discovery_shortlist", version: 1, userControlled: true }, { kind: "other", version: 1 }]) {
-      const value = pool({ turn: { input: { goal: "Find jobs", ...(intent ? { intent } : {}) }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
-      await expect(loadCanonicalTurnState(value, lease)).resolves.not.toHaveProperty("intent")
+    const absent = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
+    await expect(loadCanonicalTurnState(absent, lease)).resolves.not.toHaveProperty("intent")
+    for (const intent of [undefined, null, { kind: "interactive_discovery_shortlist", version: 2 }, { kind: "interactive_discovery_shortlist", version: 1, userControlled: true }, { kind: "other", version: 1 }]) {
+      const value = pool({ turn: { input: { goal: "Find jobs", intent }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
+      await expect(loadCanonicalTurnState(value, lease)).rejects.toThrow("turn_intent_invalid")
     }
   })
 
@@ -757,6 +770,25 @@ describe("loadCanonicalTurnState", () => {
     expect(value.snapshot.toolObservations).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: COGNITIVE_AGENDA_EVENT_TYPE })]))
     const eventQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_events"'))?.[0]
     expect(eventQuery).toContain(`'${COGNITIVE_AGENDA_EVENT_TYPE}'`)
+  })
+
+  it("carries the latest validated v2 agenda receipt into private resume state", async () => {
+    const step = { id: "step-1", ordinal: 0, taskId: "root-1", inputThroughSequence: "4", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
+    const agenda = buildCognitiveActionAgenda({ schemaVersion: "agent-harness.v2", sessionId: "session-1", turnId: "turn-1", stepId: step.id,
+      inputThroughSequence: 4n, consumedInputIds: [], canonicalJson: "{}", blocks: [], taskGraphRevision: 2 })
+    const snapshot = { schemaVersion: "agent-harness.v2.objective-progress.v1", advisory: true, revision: 2,
+      requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 2, status: "active" }] } as const
+    const receipt = buildCognitiveAgendaReceipt({ sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: step.id,
+      agenda, objectiveProgress: { goalRevision: "c".repeat(64), objectiveProgressSnapshot: snapshot,
+        progressDelta: { schemaVersion: "agent-harness.v2.objective-progress-delta.v1", availability: "unavailable",
+          previousPlanRevision: null, currentPlanRevision: 2, requirements: [{ id: "candidate-count", kind: "candidate_count_gte",
+            minimum: 2, beforeStatus: "unknown", afterStatus: "active" }] } } })
+    if (!receipt) throw new Error("v2 agenda fixture should be valid")
+    const event = { ...agendaEvent("20"), payload: receipt }
+    const value = await loadCanonicalTurnState(pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null,
+      modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, steps: [step], events: [event] }), lease)
+
+    expect(value.resume?.cognitiveAgendaReceipt).toEqual(receipt)
   })
 
   it.each([

@@ -2,6 +2,10 @@ import { describe, expect, it, vi } from "vitest"
 import type { PrismaClient } from "@prisma/client"
 
 import { answerQuestion, createQuestionWait, decideApproval } from "./store"
+import { redactSensitiveValue } from "@jobcopilot/shared"
+import { projectApprovalLedgerRow } from "@/components/agent-workspace/v2/approval-ledger-parser"
+import { createApprovalLedgerState, reduceApprovalLedger, selectApprovalLedgerProjection } from "@/components/agent-workspace/v2/approval-ledger-view"
+import { normalizeTimelineEvent } from "@/components/agent-workspace/v2/timeline-event-normalizer"
 
 type Row = Record<string, any> // Test fixture rows mirror Prisma JSON records.
 
@@ -137,5 +141,34 @@ describe("Agent wait broker", () => {
       expect.objectContaining({ topic: "agent.session.event", payload: expect.objectContaining({ type: "approval.resolved", taskId }) }),
       expect.objectContaining({ topic: "agent.turn.wakeup", payload: expect.objectContaining({ type: "turn.wakeup", taskId: null }) }),
     ]))
+
+    const persisted = fake.events.find((event) => event.type === "approval.resolved")
+    expect(persisted?.payload).toMatchObject({ status: decision, answerAvailable: false })
+    const persistedOutbox = fake.outbox.find((event) => event.topic === "agent.session.event" && event.payload.type === "approval.resolved")
+    expect(persistedOutbox?.payload.payload).toMatchObject({ status: decision, answerAvailable: false })
+    const timelineRow = persisted && {
+      id: persisted.id,
+      sessionId: persisted.sessionId,
+      turnId: persisted.turnId,
+      itemId: persisted.itemId,
+      taskId: persisted.taskId,
+      sequence: persisted.sequence,
+      type: persisted.type,
+      actor: persisted.actor,
+      payload: persisted.payload,
+    }
+    const timeline = timelineRow && projectApprovalLedgerRow(timelineRow, "session_1", value => redactSensitiveValue(value, null, 0, 6))
+    expect(timeline?.payload).toMatchObject({ status: decision, answerAvailable: false })
+    const requested = normalizeTimelineEvent({
+      schemaVersion: "agent-harness.v2", id: "request_1", sessionId: "session_1", turnId: "turn_1", itemId: null, taskId,
+      type: "approval.requested", actor: "orchestrator", sequence: "9",
+      payload: { approvalId: "approval_1", action: "submit_application", revision: 4, scopeHash: `sha256:${"a".repeat(64)}` },
+    })
+    const resolved = timeline && normalizeTimelineEvent(timeline)
+    expect(requested).not.toBeNull()
+    expect(resolved).not.toBeNull()
+    let state = reduceApprovalLedger(createApprovalLedgerState("session_1"), requested)
+    state = reduceApprovalLedger(state, resolved)
+    expect(selectApprovalLedgerProjection(state)).toMatchObject({ pendingCount: 0, approvals: [{ status: decision }] })
   })
 })

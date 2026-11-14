@@ -4,8 +4,17 @@ import { describe, expect, it, vi } from "vitest"
 import { executeTools, recoverPersistedToolCalls } from "./turn-execution-tools.js"
 import { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
+import type { ChildToolReplayReceipt } from "./turn-execution-options.js"
 import type { ToolCallRecovery } from "./turn-engine-types.js"
 import type { ChildWaitClaimRecovery } from "../subagents/child-durable-wait-replay.js"
+import { createAskUserTool } from "../tools/ask-user.js"
+import { InMemoryToolLifecycleSink, ToolLifecycle } from "../tools/lifecycle.js"
+import { InMemoryToolResultReferenceStore } from "../tools/redaction.js"
+import { ToolRegistry } from "../tools/registry.js"
+import { ToolRouter } from "../tools/router.js"
+import type { RuntimeToolDefinition } from "../tools/types.js"
+import { PolicyEngine } from "../policy/index.js"
+import { createToolRouterExecutor } from "./turn-engine-helpers.js"
 
 function execution(recovery: ToolCallRecovery, executeTool: TurnExecutionOptions["executeTool"], validateToolArguments?: TurnExecutionOptions["validateToolArguments"], additionalRecovery: readonly ToolCallRecovery[] = []) {
   const updates: Array<{ itemId: string; status: string; content: unknown }> = []
@@ -152,12 +161,78 @@ describe("recoverPersistedToolCalls", () => {
     expect(fixture.updates).toEqual([])
     expect(fixture.events).toEqual([])
   })
+
+  it.each([
+    ["unrecorded result", "replay", undefined, undefined],
+    ["redacted lifecycle result", "reconcile", { question: "[REDACTED]", choices: [] }, { id: "ask-result", revision: 0 }],
+    ["missing lifecycle output", "reconcile", undefined, undefined],
+  ] as const)("replays a trusted ask_user after the %s crash cut and persists only private attestation", async (_label, action, durableOutput, resultItem) => {
+    const callInput = { question: "Where should the search focus?", choices: [{ label: "Dublin", value: "dublin" }] }
+    const intent = { schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input",
+      question: callInput.question, options: callInput.choices }
+    const ask: ToolCallRecovery = {
+      action, stepId: "step-1", toolVersion: "1", call: { id: "ask-1", name: "agent.ask_user", arguments: callInput },
+      callItem: { id: "ask-item", revision: 0 }, ...(resultItem ? { resultItem } : {}),
+      ...(action === "reconcile" ? { durableResult: { id: "ask-1", toolName: "agent.ask_user", toolVersion: "1", status: "completed",
+        ...(durableOutput === undefined ? {} : { output: durableOutput }), errorCode: null } } : {}),
+    } as ToolCallRecovery
+    const fixture = execution(ask, vi.fn() as never)
+    const lifecycleSink = new InMemoryToolLifecycleSink()
+    const policy = new PolicyEngine({ snapshot: { version: "policy.v1", rules: [{
+      id: "native-question-recovery-test", roles: ["orchestrator"], tools: ["agent.ask_user"], toolVersions: ["1"],
+      risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["canManageChildren"],
+      outcome: "allow", reasonCode: "test_allow", reason: "Allow the trusted root question in this test",
+    }] } })
+    const router = new ToolRouter(new ToolRegistry([createAskUserTool() as RuntimeToolDefinition]), new ToolLifecycle({
+      sink: lifecycleSink, references: new InMemoryToolResultReferenceStore(),
+    }), policy)
+    const execute = vi.fn(createToolRouterExecutor(router))
+    Object.assign(fixture.options, {
+      scope: { userId: "user-1" }, actorRole: "orchestrator", capabilities: ["canManageChildren"], executeTool: execute,
+      store: { ...fixture.options.store, readPendingQuestion: async () => ({ status: "replayable", stepId: "step-1", toolCallId: "ask-1",
+        callItemId: "ask-item", intent }) },
+    })
+
+    const observations = await recoverPersistedToolCalls(fixture.options, fixture.writer, () => new Date("2026-11-05T12:00:00Z"))
+
+    expect(execute).toHaveBeenCalledOnce()
+    expect(observations).toEqual([{ id: "tool-result:ask-1", content: expect.objectContaining({ output: { question: "[REDACTED]", choices: [] } }) }])
+    const persisted = JSON.stringify(fixture.updates)
+    expect(persisted).toContain("nativeQuestionAttestation")
+    expect(persisted).toContain("Where should the search focus?")
+    expect(persisted).not.toContain('"output":{"question":"Where should the search focus?"')
+    const projected = JSON.stringify({ events: fixture.events, lifecycle: lifecycleSink.events })
+    expect(projected).not.toContain("Where should the search focus?")
+    expect(projected).not.toContain("Dublin")
+    expect(projected).not.toContain("dublin")
+    expect(projected).not.toContain("nativeQuestionAttestation")
+    expect(JSON.stringify(observations)).not.toContain("nativeQuestionAttestation")
+  })
+
+  it("fails closed when replay lacks the unforgeable built-in question receipt", async () => {
+    const callInput = { question: "Which city?", choices: [{ label: "Berlin", value: "berlin" }] }
+    const ask: ToolCallRecovery = { action: "reconcile", stepId: "step-1", toolVersion: "1", call: { id: "ask-1", name: "agent.ask_user", arguments: callInput },
+      callItem: { id: "ask-item", revision: 0 }, durableResult: { id: "ask-1", toolName: "agent.ask_user", toolVersion: "1", status: "completed",
+        output: { question: "[REDACTED]", choices: [] }, errorCode: null } }
+    const execute = vi.fn(async () => ({ id: "ask-1", toolName: "agent.ask_user", toolVersion: "1", status: "completed" as const,
+      output: { question: "[REDACTED]", choices: [] }, errorCode: null }))
+    const fixture = execution(ask, execute as never)
+    Object.assign(fixture.options, { store: { ...fixture.options.store, readPendingQuestion: async () => ({ status: "replayable", stepId: "step-1",
+      toolCallId: "ask-1", callItemId: "ask-item", intent: { schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question",
+        stage: "user_input", question: callInput.question, options: callInput.choices } }) } })
+
+    await expect(recoverPersistedToolCalls(fixture.options, fixture.writer, () => new Date())).rejects.toMatchObject({ code: "invalid_output" })
+    expect(fixture.updates).toEqual([])
+    expect(JSON.stringify(fixture.events)).not.toContain("nativeQuestionAttestation")
+  })
 })
 
 describe("executeTools persisted replay", () => {
   const durableWaitId = "wait-12345678-1234-4234-9234-123456789012"
+  const waitTaskId = "subagent-00000000-0000-4000-8000-000000000001"
   const call = { id: "wait-call", name: "agent.wait", arguments: { idempotencyKey: "wait-1", taskIds: ["child-1"], mode: "all", timeoutMs: 30_000 } }
-  const waitReceipt = { waitId: durableWaitId, status: "waiting", deadlineAt: "2026-09-10T00:00:00.000Z", matchedTaskIds: ["child-1"] }
+  const waitReceipt = { waitId: durableWaitId, status: "waiting", taskIds: [waitTaskId], deadlineAt: "2026-09-10T00:00:00.000Z", matchedTaskIds: [waitTaskId],
+    tasks: [{ taskId: waitTaskId, status: "waiting", role: "scout", result: null, failureReason: null }] }
   const resolvedInput = { taskIds: ["child-1"], mode: "all" }
   const resolvedOutput = { waitId: durableWaitId, status: "ready", matchedTaskIds: ["child-1"], targetTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed" }] }
   const nativeOutput = {
@@ -167,14 +242,17 @@ describe("executeTools persisted replay", () => {
       child: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child-1", depth: 1, role: "scout", taskType: "research", status: "queued" } },
   }
 
-  function projection(output: unknown, input: unknown = resolvedInput, includeInput = true) {
-    return { id: `wait-result:${durableWaitId}`, content: { toolCallId: `wait:${durableWaitId}`, toolName: "agent.wait", ...(includeInput ? { input } : {}), status: "completed", output } }
+  function projection(output: unknown, input: unknown = resolvedInput, includeInput = true, toolName = "agent.wait") {
+    return { id: `wait-result:${durableWaitId}`, content: { toolCallId: `wait:${durableWaitId}`, toolName, ...(includeInput ? { input } : {}), status: "completed", output } }
   }
 
-  function replayFixture(output: unknown, persistedCall: { id: string; name: string; arguments: Record<string, unknown> } = call, additionalToolObservations: readonly { id: string; content: unknown }[] = []) {
+  function replayFixture(output: unknown, persistedCall: { id: string; name: string; arguments: Record<string, unknown> } = call,
+    additionalToolObservations: readonly { id: string; content: unknown }[] = [], ownerKind: "turn" | "task" = "turn") {
     const executeTool = vi.fn()
     const options = {
-      identity: { kind: "turn", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1", ownerId: "worker-2", leaseVersion: 2, leaseExpiresAt: new Date("2026-09-10T00:00:00.000Z") },
+      identity: ownerKind === "turn"
+        ? { kind: "turn", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1", ownerId: "worker-2", leaseVersion: 2, leaseExpiresAt: new Date("2026-09-10T00:00:00.000Z") }
+        : { kind: "task", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "subagent-00000000-0000-4000-8000-000000000009", rootTaskId: "root-1", ownerId: "worker-2", attemptCount: 1, leaseExpiresAt: new Date("2026-09-10T00:00:00.000Z") },
       scope: { userId: "user-1" },
       snapshot: {
         system: [], profile: [], steerHistory: [], businessRefs: [],
@@ -193,21 +271,28 @@ describe("executeTools persisted replay", () => {
   const resumedCall = { id: "model-call-9", name: "jobs.search", arguments: { query: "Dublin" } }
   const resumedOutput = { jobs: [{ id: "job-1" }] }
 
-  function childResumeReplayFixture(overrides: { id?: string; content?: Record<string, unknown>; attemptCount?: number } = {}) {
+  function childResumeReplayFixture(overrides: { id?: string; content?: Record<string, unknown>; attemptCount?: number; withoutReceipt?: boolean } = {}) {
     const executeTool = vi.fn()
     const createdItems: Array<Record<string, unknown>> = []
     const updates: Array<Record<string, unknown>> = []
     const events: Array<{ type: string; payload: unknown }> = []
+    const content = { toolCallId: resumedCall.id, toolName: resumedCall.name, input: resumedCall.arguments, status: "completed", output: resumedOutput, errorCode: null,
+      ...overrides.content }
+    const receipt: ChildToolReplayReceipt = {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", taskId: "child-1",
+      attempt: 2, stepId: "source-step-2", toolCallId: resumedCall.id, toolName: resumedCall.name, input: resumedCall.arguments,
+      callItem: { id: "source-call-1", revision: 1 }, resultItem: { id: "source-result-1", revision: 2 },
+      result: { status: content.status === "failed" ? "failed" : "completed", output: content.output,
+        errorCode: typeof content.errorCode === "string" ? content.errorCode : null },
+    }
     const options = {
       identity: { kind: "task", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "child-1", rootTaskId: "root-1", ownerId: "worker-2", attemptCount: overrides.attemptCount ?? 3, leaseExpiresAt: new Date("2026-09-10T00:00:00.000Z") },
       scope: { userId: "user-1" },
       snapshot: {
         system: [], profile: [], steerHistory: [], businessRefs: [],
-        toolObservations: [{ id: overrides.id ?? "child-resume:source-result-1", content: {
-          toolCallId: resumedCall.id, toolName: resumedCall.name, input: resumedCall.arguments, status: "completed", output: resumedOutput, errorCode: null,
-          ...overrides.content,
-        } }],
+        toolObservations: [{ id: overrides.id ?? "child-resume:source-result-1", content }],
       },
+      ...(overrides.withoutReceipt ? {} : { childToolReplayReceipts: [receipt] }),
       executeTool,
       idFactory: (prefix: string) => `${prefix}:attempt:${overrides.attemptCount ?? 3}`,
       signal: new AbortController().signal,
@@ -251,6 +336,42 @@ describe("executeTools persisted replay", () => {
 
     expect(result.wait).toEqual({ status: "waiting_for_dependency", waitId: durableWaitId, stepCount: 0, toolCallCount: 0 })
     expect(result.snapshot).toBe(fixture.options.snapshot)
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it("uses the raw UUID namespace for wait_subagents replay receipts", async () => {
+    const childCall = { ...call, name: "wait_subagents" }
+    const childReceipt = { ...waitReceipt, waitId: "12345678-1234-4234-9234-123456789012" }
+    const fixture = replayFixture(childReceipt, childCall, [], "task")
+    const result = await replay(fixture, childCall)
+
+    expect(result.wait).toEqual({ status: "waiting_for_dependency", waitId: childReceipt.waitId, stepCount: 0, toolCallCount: 0 })
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it("rejects a root-prefixed wait ID on wait_subagents replay", async () => {
+    const childCall = { ...call, name: "wait_subagents" }
+    const fixture = replayFixture(waitReceipt, childCall, [], "task")
+
+    await expect(replay(fixture, childCall)).rejects.toMatchObject({ code: "invalid_output" })
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it("accepts the root wait_subagents alias with its root-owned wait ID", async () => {
+    const rootCall = { ...call, name: "wait_subagents" }
+    const fixture = replayFixture(waitReceipt, rootCall)
+
+    await expect(replay(fixture, rootCall)).resolves.toMatchObject({ wait: { status: "waiting_for_dependency", waitId: durableWaitId } })
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it("does not interpret another tool's waiting-shaped output as a durable wait", async () => {
+    const otherCall = { ...call, name: "jobs.search" }
+    const fixture = replayFixture({ status: "waiting", waitId: "not-a-wait-id", deadlineAt: "later", matchedTaskIds: [] }, otherCall)
+
+    const result = await replay(fixture, otherCall)
+
+    expect(result.wait).toBeNull()
     expect(fixture.executeTool).not.toHaveBeenCalled()
   })
 
@@ -321,7 +442,7 @@ describe("executeTools persisted replay", () => {
   it.each(["agent.wait", "wait_subagents"] as const)("fails closed when %s replay has only an archived result reference", async toolName => {
     const reference = { $ref: "tool-result-00000000-0000-4000-8000-000000000002", sizeBytes: 9_000, sha256: "a".repeat(64) }
     const persistedCall = { ...call, name: toolName }
-    const fixture = replayFixture(reference, persistedCall, [projection(resolvedOutput)])
+    const fixture = replayFixture(reference, persistedCall, [projection(resolvedOutput, resolvedInput, true, toolName)])
 
     await expect(replay(fixture, persistedCall)).rejects.toMatchObject({ code: "persistence_conflict" })
     expect(fixture.executeTool).not.toHaveBeenCalled()
@@ -375,7 +496,7 @@ describe("executeTools persisted replay", () => {
       output: { waitId: durableWaitId, status: "timed_out", matchedTaskIds: [], targetTaskIds: ["child-a", "child-b"], tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-b", status: "running" }] },
     },
   ])("accepts a valid $label projection", async ({ modelCall, input, output }) => {
-    const fixture = replayFixture({ ...waitReceipt, matchedTaskIds: output.matchedTaskIds }, modelCall, [projection(output, input)])
+    const fixture = replayFixture(waitReceipt, modelCall, [projection(output, input, true, modelCall.name)])
 
     const result = await replay(fixture, modelCall)
 
@@ -402,7 +523,7 @@ describe("executeTools persisted replay", () => {
     { label: "ready all partial match", mode: "all" as const, input: { taskIds: ["child-a", "child-b"], mode: "all" }, output: { ...multiResolvedOutput, matchedTaskIds: ["child-a"] } },
   ])("keeps the durable handoff for a $label projection", async ({ mode, input, includeInput, output }) => {
     const modelCall = { ...call, arguments: { ...call.arguments, taskIds: ["child-b", "child-a"], mode } }
-    const fixture = replayFixture(waitReceipt, modelCall, [projection(output, input, includeInput)])
+    const fixture = replayFixture(waitReceipt, modelCall, [projection(output, input, includeInput, modelCall.name)])
 
     const result = await replay(fixture, modelCall)
 
@@ -411,9 +532,10 @@ describe("executeTools persisted replay", () => {
   })
 
   it("continues unchanged for an ordinary completed tool replay", async () => {
-    const fixture = replayFixture({ jobs: ["one"] })
+    const ordinaryCall = { ...call, name: "jobs.search", arguments: { query: "Berlin" } }
+    const fixture = replayFixture({ jobs: ["one"] }, ordinaryCall)
 
-    const result = await replay(fixture)
+    const result = await replay(fixture, ordinaryCall)
 
     expect(result.wait).toBeNull()
     expect(result.snapshot).toBe(fixture.options.snapshot)
@@ -474,6 +596,16 @@ describe("executeTools persisted replay", () => {
     expect(fixture.executeTool).not.toHaveBeenCalled()
     expect(onCallPersisted).toHaveBeenCalledTimes(1)
     expect(result.wait).toBeNull()
+  })
+
+  it("rejects a child-resume replay without a typed item receipt before persistence", async () => {
+    const fixture = childResumeReplayFixture({ withoutReceipt: true })
+
+    await expect(replayChildResume(fixture)).rejects.toMatchObject({ code: "invalid_output" })
+
+    expect(fixture.createdItems).toHaveLength(0)
+    expect(fixture.events).toHaveLength(0)
+    expect(fixture.executeTool).not.toHaveBeenCalled()
   })
 
   it("persists the exact failed result code without exception prose", async () => {

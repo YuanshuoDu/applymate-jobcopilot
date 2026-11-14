@@ -1,12 +1,14 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 const graphMocks = vi.hoisted(() => ({ prepare: vi.fn(), persist: vi.fn(), reconcile: vi.fn() }))
+const completedWaitMocks = vi.hoisted(() => ({ prove: vi.fn() }))
 vi.mock("./task-graph-pg-lifecycle.js", async importOriginal => ({
   ...await importOriginal<typeof import("./task-graph-pg-lifecycle.js")>(),
   prepareGraphTransition: graphMocks.prepare,
   persistGraphTransition: graphMocks.persist,
   reconcileGraphDependents: graphMocks.reconcile,
 }))
+vi.mock("./pg-store-expiry-recovery-completed-wait.js", () => ({ hasProvenCompletedConsumedWait: completedWaitMocks.prove }))
 import { recoverExpired } from "./pg-store-expiry-recovery.js"
 import type { PgSubagentPool } from "./types.js"
 import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
@@ -114,10 +116,11 @@ function fixture(options: FixtureOptions = {}) {
     if (sql.includes('FROM "agent_wait_conditions" AS wait JOIN "agent_steps" AS step') && sql.includes('wait."status" = \'waiting\'')) return options.registeredWait
       ? { rows: [{ ...wait, attempt: task.attemptCount, ordinal: 4, latestOrdinal: 4, stepStatus: options.waitStepStatus ?? "waiting_for_tool" }], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('started."createdAt"') && sql.includes("FOR UPDATE OF task, step, call")) return options.preinsertWaitCall ? { rows: [{
-      eventId: "start-event", createdAt: new Date(checkedAt.getTime() - 5_000), role: task.role, allowedActions: ["wait_subagents"], stepId: "step-1",
+      eventId: "start-event", eventIdempotencyKey: `task:${task.id}:event:tool-started:wait-call-1`,
+      createdAt: new Date(checkedAt.getTime() - 5_000), role: task.role, allowedActions: ["wait_subagents"], stepId: "step-1",
       content: { toolCallId: "wait-call-1", toolName: "wait_subagents", toolVersion: "1", input: { idempotencyKey: "wait-key-1", mode: "any", taskIds: ["target-1"], timeoutMs: 10_000 } },
     }], rowCount: 1 } : { rows: [], rowCount: 0 }
-    if (sql.includes('FROM "agent_items" AS call')) return { rows: [{ status: "started", content: {
+    if (sql.startsWith('SELECT call."status", call."content" FROM "agent_items" AS call')) return { rows: [{ status: "started", content: {
       toolCallId: "wait-call-1", toolName: "wait_subagents", toolVersion: "1",
       input: { idempotencyKey: options.callMatches === false ? "other-key" : wait.idempotencyKey, mode: wait.mode,
         taskIds: wait.targetTaskIds, timeoutMs: 10_000 },
@@ -615,6 +618,20 @@ describe("expired subagent recovery fence", () => {
     expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox" SET "payload"'))).toBe(false)
   })
 
+  it("does not repair a proven completed consumed wait or bypass a separate unmatched tool call", async () => {
+    completedWaitMocks.prove.mockReset()
+    completedWaitMocks.prove.mockResolvedValueOnce(true)
+    const fake = fixture({ child: true, childWaitResumable: true, pendingToolStart: true })
+    await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toEqual([])
+    expect(completedWaitMocks.prove).toHaveBeenCalledOnce()
+    expect(fake.calls.some(sql => sql.startsWith('SELECT wait.*, task."status" AS "repairTaskStatus"'))).toBe(false)
+    expect(fake.calls.some(sql => sql.includes('FROM "agent_events" AS started'))).toBe(true)
+    const blocker = fake.client.query.mock.calls.find(([sql]) => sql.includes('FROM "agent_events" AS started'))
+    expect(blocker?.[1]?.[9]).toBeNull()
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(false)
+  })
+
   it("does not grant attempt-neutral replay to a prior-attempt consumed wait", async () => {
     const fake = fixture({ child: true, childWaitResumable: false, continuationWait: true, attemptCount: 3, maxAttempts: 3 })
     await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toMatchObject([
@@ -634,10 +651,10 @@ describe("expired subagent recovery fence", () => {
     expect(fake.task).toMatchObject({ status: "waiting", attemptCount: 3 })
     expect(fake.wait).toMatchObject({ status: "waiting", suspendedAt: checkedAt, consumedAt: null })
     expect(fake.wait.result).toMatchObject({ request: { targetTaskIds: ["target-1"], mode: "any", timeoutMs: 10_000 }, outcome: { waitId: "wait-1", status: "waiting" } })
-    const persistedCallRead = fake.client.query.mock.calls.find(([sql]) => sql.includes('FROM "agent_items" AS call'))
+    const persistedCallRead = fake.client.query.mock.calls.find(([sql]) => sql.startsWith('SELECT call."status", call."content" FROM "agent_items" AS call'))
     expect(persistedCallRead?.[0]).toContain('call."type" = \'tool_call\'')
     expect(persistedCallRead?.[0]).toContain('call."stepId" = $4')
-    expect(fake.client.query.mock.calls.filter(([sql]) => sql.includes('FROM "agent_items" AS call'))).toHaveLength(1)
+    expect(fake.client.query.mock.calls.filter(([sql]) => sql.startsWith('SELECT call."status", call."content" FROM "agent_items" AS call'))).toHaveLength(1)
     const external = fake.calls.find(sql => sql.includes('FROM "agent_events" AS started')) ?? ""
     expect(external).toContain('wait."consumedAt" IS NULL')
     expect(external).toContain('source."status" IN (\'streaming\', \'waiting_for_tool\')')

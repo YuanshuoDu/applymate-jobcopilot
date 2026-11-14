@@ -11,6 +11,7 @@ import { recoverExpiredDurableSubagentWaitWithGraph } from "./durable-subagent-w
 import { recoverExpiredWaitRegistration } from "./durable-subagent-wait-store.js"
 import { repairStaleWaitProjection, type WaitProjectionRejectionStage } from "./pg-store-expiry-recovery-wait-projection.js"
 import { CHILD_WAIT_CONSUMED_SQL, CHILD_WAIT_RESUMABLE_SQL, hasBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
+import { hasProvenCompletedConsumedWait } from "./pg-store-expiry-recovery-completed-wait.js"
 import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 
 type RecoveryCursor = Readonly<{ sessionId: string; rootIsNull: boolean; rootKey: string; taskId: string }>
@@ -140,7 +141,9 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
     const registration = await recoverExpiredWaitRegistration(client, lease, checkedAt)
     if (trace) { trace.waitRegistrationFound = Boolean(registration); trace.waitRegistrationRejected = Boolean(registration && "rejectedCallId" in registration) }
     if (registration && "rejectedCallId" in registration) rejectedWaitCallId = registration.rejectedCallId
-    const projectionRepair = waitContinuation && !childWaitConsumed && !rejectedWaitCallId
+    const completedConsumedWait = waitContinuation && !childWaitConsumed && !rejectedWaitCallId
+      ? await hasProvenCompletedConsumedWait(client, row, checkedAt) : false
+    const projectionRepair = waitContinuation && !childWaitConsumed && !completedConsumedWait && !rejectedWaitCallId
       ? await repairStaleWaitProjection(client, lease, checkedAt) : undefined
     const projectionRejected = projectionRepair?.status === "rejected"
     if (trace) {

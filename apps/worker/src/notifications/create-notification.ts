@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { getPool } from "../db/apply-results.js";
 
 export type ApplyNotificationType =
@@ -47,9 +48,10 @@ export async function createNotification(
 ): Promise<void> {
   if (!(await notificationsEnabled(userId, params.type))) return;
   await getPool().query(
-    `INSERT INTO notifications (user_id, type, title, body, job_id)
-     VALUES ($1, $2, $3, $4, $5)`,
+    `INSERT INTO notifications (id, user_id, type, title, body, job_id)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
     [
+      randomUUID(),
       userId,
       params.type,
       params.title,

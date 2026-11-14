@@ -7,13 +7,13 @@ export interface FormReviewNeeds {
   sensitive: FormReviewField[];
 }
 
-const SENSITIVE = /salary|compensation|pay|visa|sponsor|work.?authori[sz]|citizen|nationality|legal|criminal|disability|gender|race|ethnic|signature|e-?sign/i;
 type RawField = { id: string | null; name: string | null; label: string; tagName: string; type: string; multiple: boolean };
 
 /** Inspect the filled DOM; the model does not get to waive required or sensitive fields. */
 export async function inspectFormReviewNeeds(page: Page): Promise<FormReviewNeeds> {
   try {
     const raw = await page.evaluate(() => {
+      const SENSITIVE = /salary|compensation|pay|visa|sponsor|work.?authori[sz]|citizen|nationality|legal|criminal|disability|gender|race|ethnic|signature|e-?sign/i;
       const controls = Array.from(document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>("input, textarea, select"));
       const missing: RawField[] = [];
       const sensitive: RawField[] = [];

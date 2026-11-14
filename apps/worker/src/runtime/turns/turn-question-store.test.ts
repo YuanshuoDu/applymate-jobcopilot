@@ -9,6 +9,7 @@ import { questionId, questionItemId, type TurnQuestionPool } from "./turn-questi
 import { appendTurnQuestionPlanningObservation, prepareTurnQuestionPlanningObservation } from "./turn-question-planning-store.js"
 import { readTurnQuestionPlanningWait } from "./turn-question-planning-history.js"
 import type { TurnQuestionPlanningReceipt } from "./turn-question-planning-contract.js"
+import { issueNativeQuestionControlReceipt } from "./native-question-attestation.js"
 
 vi.mock("./turn-question-planning-store.js", () => ({ prepareTurnQuestionPlanningObservation: vi.fn(), appendTurnQuestionPlanningObservation: vi.fn() }))
 vi.mock("./turn-question-planning-history.js", () => ({ readTurnQuestionPlanningWait: vi.fn() }))
@@ -151,7 +152,7 @@ function fixture(options: FixtureOptions = {}): Fixture {
           content: options.itemContent ?? { waitKind: "question", questionId: id, toolCallId, stage: "user_input", question: intent.question, options: intent.options, answer: null, answerAvailable: false } }], rowCount: 1 }
       }
       if (sql.includes('FROM "agent_items"') && sql.includes("'tool_call'")) return values?.[4] === toolCallId
-        ? { rows: [{ id: "call-item-1", status: options.callRowStatus ?? "completed", content: persistedCallContent }], rowCount: 1 }
+        ? { rows: [{ id: "call-item-1", status: options.callRowStatus ?? "completed", userId: owner.userId, content: persistedCallContent }], rowCount: 1 }
         : { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_items"') && sql.includes("'tool_result'")) return options.hasResult === false
         ? { rows: [], rowCount: 0 }
@@ -316,6 +317,38 @@ describe("PostgreSQL native question store", () => {
     await expect(malformed.store.readPendingQuestion({ owner, now })).rejects.toMatchObject({ code: "question_receipt_malformed" })
     const interrupted = fixture({ itemStatus: "interrupted", itemContent: { waitKind: "question", questionId: "foreign", toolCallId, stage: "user_input", question: intent.question, options: intent.options, answer: null, answerAvailable: false } })
     await expect(interrupted.store.waitForQuestion({ owner, stepId, toolCallId, now })).rejects.toMatchObject({ code: "question_conflict" })
+  })
+
+  it("uses a verified stored-call attestation to recover a redacted result and still writes the visible question", async () => {
+    const callInput = { question: intent.question, choices: intent.options }
+    const receipt = issueNativeQuestionControlReceipt({
+      identity: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, stepId, taskId: owner.taskId, rootTaskId: owner.rootTaskId },
+      actorRole: "orchestrator", capabilities: ["canManageChildren"], toolCallId, toolName: "agent.ask_user", toolVersion: "1",
+      requestInput: callInput, effectiveInput: callInput, toolOutput: intent,
+    })!
+    const f = fixture({ resultOutput: { question: "[REDACTED]", choices: [] }, resultContentPatch: { nativeQuestionAttestation: receipt.attestation } })
+
+    await expect(f.store.readPendingQuestion({ owner, now })).resolves.toMatchObject({ status: "prepared", stepId, toolCallId })
+    const waiting = fixture({ resultOutput: { question: "[REDACTED]", choices: [] }, resultContentPatch: { nativeQuestionAttestation: receipt.attestation } })
+    await expect(waiting.store.waitForQuestion({ owner, stepId, toolCallId, now })).resolves.toMatchObject({ status: "waiting_for_user" })
+    const insert = waiting.calls.find(call => call.sql.includes('INSERT INTO "agent_items"') && call.sql.includes("'question'"))
+    const visibleQuestion = JSON.parse(String(insert?.values?.[5])) as Record<string, unknown>
+    expect(visibleQuestion).toMatchObject({ question: intent.question, options: intent.options, answer: null, answerAvailable: false })
+  })
+
+  it("rejects a stale attestation before recovering or creating a visible question", async () => {
+    const callInput = { question: intent.question, choices: intent.options }
+    const receipt = issueNativeQuestionControlReceipt({
+      identity: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, stepId, taskId: owner.taskId, rootTaskId: owner.rootTaskId },
+      actorRole: "orchestrator", capabilities: ["canManageChildren"], toolCallId, toolName: "agent.ask_user", toolVersion: "1",
+      requestInput: callInput, effectiveInput: callInput, toolOutput: intent,
+    })!
+    const f = fixture({ resultOutput: { question: "[REDACTED]", choices: [] }, resultContentPatch: {
+      nativeQuestionAttestation: { ...receipt.attestation, turnId: "other-turn" },
+    } })
+    await expect(f.store.readPendingQuestion({ owner, now })).rejects.toMatchObject({ code: "question_conflict" })
+    await expect(f.store.waitForQuestion({ owner, stepId, toolCallId, now })).rejects.toMatchObject({ code: "question_conflict" })
+    expect(f.calls.some(call => call.sql.includes("'question'"))).toBe(false)
   })
 
   it.each(["wait", "recovery"] as const)("binds the completed result to original arguments on %s", async operation => {

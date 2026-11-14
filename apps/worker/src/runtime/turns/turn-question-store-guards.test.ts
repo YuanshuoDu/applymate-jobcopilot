@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from "vitest"
 
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { assertQuestionOwner, assertQuestionUsage, completedQuestionResult, questionId, questionItemId,
-  questionConflict, recoverIncompleteQuestionCall, type TurnQuestionQueryClient, type TurnQuestionReadIdentity } from "./turn-question-store-guards.js"
+  questionConflict, type TurnQuestionQueryClient, type TurnQuestionReadIdentity } from "./turn-question-store-guards.js"
 import { TurnQuestionStoreError, type TurnQuestionUsageInput } from "./turn-question-contract.js"
+import { issueNativeQuestionControlReceipt } from "./native-question-attestation.js"
+import { recoverIncompleteQuestionCall } from "./turn-question-store-recovery.js"
 
 const owner: TurnExecutionOwnerFence = {
   kind: "turn", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1",
@@ -66,6 +68,47 @@ describe("native question persistence guards", () => {
     await expect(completedQuestionResult(client, readIdentity, "step-1", "call-1"))
       .resolves.toMatchObject({ callItemId: "call-item", resultItemId: "result-item", intent })
     expect(query).toHaveBeenCalledTimes(2)
+  })
+
+  it("recovers from a redacted result only with a server attestation bound to the stored call and owner", async () => {
+    const readIdentity: TurnQuestionReadIdentity = { sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId }
+    const callInput = { question: "Where should the search focus?", choices: [{ label: "Dublin", value: "dublin" }] }
+    const intent = { schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input",
+      question: callInput.question, options: callInput.choices }
+    const receipt = issueNativeQuestionControlReceipt({
+      identity: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, stepId: "step-1", taskId: owner.taskId, rootTaskId: owner.rootTaskId },
+      actorRole: "orchestrator", capabilities: ["canManageChildren"], toolCallId: "call-1", toolName: "agent.ask_user", toolVersion: "1",
+      requestInput: callInput, effectiveInput: callInput, toolOutput: intent,
+    })!
+    const resultContent = { toolCallId: "call-1", output: { question: "[REDACTED]", choices: [] }, errorCode: null, nativeQuestionAttestation: receipt.attestation }
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rows: [{ id: "call-item", status: "completed", userId: owner.userId, content: {
+        toolCallId: "call-1", toolName: "agent.ask_user", toolVersion: "1", status: "completed", errorCode: null, input: callInput,
+      } }] })
+      .mockResolvedValueOnce({ rows: [{ id: "result-item", status: "completed", content: resultContent }] })
+    const client = { query } as unknown as TurnQuestionQueryClient
+
+    await expect(completedQuestionResult(client, readIdentity, "step-1", "call-1")).resolves.toMatchObject({ intent })
+
+    const stale = vi.fn()
+      .mockResolvedValueOnce({ rows: [{ id: "call-item", status: "completed", userId: owner.userId, content: {
+        toolCallId: "call-1", toolName: "agent.ask_user", toolVersion: "1", status: "completed", errorCode: null, input: callInput,
+      } }] })
+      .mockResolvedValueOnce({ rows: [{ id: "result-item", status: "completed", content: {
+        ...resultContent, nativeQuestionAttestation: { ...receipt.attestation, sessionId: "other-session" },
+      } }] })
+    await expect(completedQuestionResult({ query: stale } as unknown as TurnQuestionQueryClient, readIdentity, "step-1", "call-1"))
+      .rejects.toMatchObject({ code: "question_conflict" })
+
+    const leaked = vi.fn()
+      .mockResolvedValueOnce({ rows: [{ id: "call-item", status: "completed", userId: owner.userId, content: {
+        toolCallId: "call-1", toolName: "agent.ask_user", toolVersion: "1", status: "completed", errorCode: null, input: callInput,
+      } }] })
+      .mockResolvedValueOnce({ rows: [{ id: "result-item", status: "completed", content: {
+        ...resultContent, output: { schemaVersion: intent.schemaVersion, kind: intent.kind, stage: intent.stage, question: callInput.question, options: callInput.choices },
+      } }] })
+    await expect(completedQuestionResult({ query: leaked } as unknown as TurnQuestionQueryClient, readIdentity, "step-1", "call-1"))
+      .rejects.toMatchObject({ code: "question_receipt_malformed" })
   })
 
   it("rejects child, unrooted, malformed, and unavailable usage instead of silently defaulting", () => {

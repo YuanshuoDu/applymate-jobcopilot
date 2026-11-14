@@ -1,6 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from '@jobcopilot/agent-protocol'
 
 import { isRetryableTurnStatus, parsePersistedRetryContent } from './retry-input'
+import { OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION } from './types'
+
+afterEach(() => vi.unstubAllEnvs())
 
 describe('persisted retry input', () => {
   it('preserves bounded text and attachment parts from retryable turns', () => {
@@ -53,6 +57,77 @@ describe('persisted retry input', () => {
     })
   })
 
+  it('preserves the objective intent and valid verification requirements on retry', () => {
+    const verificationRequirements = {
+      schemaVersion: 'agent-harness.v2.objective-requirements.v1',
+      requirements: [{ id: 'candidate-count', check: { kind: 'candidate_count_gte', minimum: 3 } }],
+    } as const
+    const result = parsePersistedRetryContent('turn-objective', {
+      goal: 'Plan and execute the objective',
+      content: [{ type: 'text', text: 'Plan and execute the objective' }],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      verificationRequirements,
+    })
+
+    expect(result).toEqual({
+      goal: 'Plan and execute the objective',
+      content: [{ type: 'text', text: 'Plan and execute the objective' }],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      verificationRequirements,
+    })
+  })
+
+  it('rejects location verification requirements when the capability gate is off', () => {
+    vi.stubEnv('AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED', '0')
+    const verificationRequirements = {
+      schemaVersion: OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+      requirements: [{ id: 'candidate-location', check: { kind: 'candidate_location_in', locations: ['dublin'] } }],
+    } as const
+
+    expect(() => parsePersistedRetryContent('turn-location-disabled', {
+      goal: 'Retry the location-aware objective',
+      content: [{ type: 'text', text: 'Retry the location-aware objective' }],
+      verificationRequirements,
+    })).toThrow()
+  })
+
+  it('preserves valid location verification requirements when the capability gate is on', () => {
+    vi.stubEnv('AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED', '1')
+    const verificationRequirements = {
+      schemaVersion: OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+      requirements: [{ id: 'candidate-location', check: { kind: 'candidate_location_in', locations: ['dublin'] } }],
+    } as const
+
+    expect(parsePersistedRetryContent('turn-location-enabled', {
+      goal: 'Retry the location-aware objective',
+      content: [{ type: 'text', text: 'Retry the location-aware objective' }],
+      verificationRequirements,
+    })).toMatchObject({ verificationRequirements })
+  })
+
+  it('preserves count-only v1 requirements when the location capability gate is off', () => {
+    vi.stubEnv('AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED', '0')
+    const verificationRequirements = {
+      schemaVersion: 'agent-harness.v2.objective-requirements.v1',
+      requirements: [{ id: 'candidate-count', check: { kind: 'candidate_count_gte', minimum: 3 } }],
+    } as const
+
+    expect(parsePersistedRetryContent('turn-count-only-disabled', {
+      goal: 'Retry the count-only objective',
+      content: [{ type: 'text', text: 'Retry the count-only objective' }],
+      verificationRequirements,
+    })).toMatchObject({ verificationRequirements })
+  })
+
+  it('preserves the null verification-requirements sentinel and rejects malformed persisted requirements', () => {
+    const base = { goal: 'Retry objective', content: [{ type: 'text', text: 'Retry objective' }] }
+    expect(parsePersistedRetryContent('turn-null', { ...base, verificationRequirements: null }))
+      .toMatchObject({ verificationRequirements: null })
+    expect(() => parsePersistedRetryContent('turn-invalid', {
+      ...base, verificationRequirements: { schemaVersion: 'unsupported', requirements: [] },
+    })).toThrow()
+  })
+
   it('rejects unknown persisted keys, empty text, and unsupported content parts', () => {
     expect(() => parsePersistedRetryContent('turn-1', {
       goal: 'Retry', content: [{ type: 'text', text: 'Retry' }], unexpected: true,
@@ -74,6 +149,8 @@ describe('persisted retry input', () => {
       { kind: 'interactive_discovery_shortlist', version: 1, extra: true },
       { kind: 'other', version: 1 },
       { kind: 'interactive_discovery_shortlist', version: 2 },
+      { kind: 'objective_task_graph_execution', version: 1, extra: true },
+      { kind: 'objective_task_graph_execution', version: 2 },
     ]) {
       expect(() => parsePersistedRetryContent('turn-4', { ...base, intent })).toThrow()
     }

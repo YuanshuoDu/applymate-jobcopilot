@@ -1,16 +1,30 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { createHash } from 'node:crypto'
 import { auditActivityText as unsignedAuditActivityText, parseStoredApplicationAudit } from '@/lib/application-audit'
-import { signedAuditActivityText } from '@/lib/application-audit-receipt'
+import { signedAuditActivityText, verifyApplicationAuditReceipt } from '@/lib/application-audit-receipt'
+import { AUDIT_ACTIVITY_PREFIX } from '@/lib/application-audit'
+import { auditJobBasisHash, auditMaterialBasisHash } from '@/lib/application-audit-operation'
 import type { ApplicationAudit } from '@/lib/types'
 import { UnsupportedPdfTextError } from '@/lib/pdf-text-support'
+import { ApplicationPdfUnsupportedCharactersError } from '@/lib/application-pdf-errors'
 
 const mocks = vi.hoisted(() => ({
-  auth: vi.fn(), job: vi.fn(), resume: vi.fn(), coverLetter: vi.fn(), activity: vi.fn(), render: vi.fn(),
+  auth: vi.fn(), job: vi.fn(), resume: vi.fn(), coverLetter: vi.fn(), activity: vi.fn(), render: vi.fn(), operation: vi.fn(),
 }))
 vi.mock('@/lib/db', () => ({ db: {
   job: { findFirst: mocks.job }, resume: { findFirst: mocks.resume },
   coverLetter: { findFirst: mocks.coverLetter }, activity: { findFirst: mocks.activity },
 } }))
+vi.mock('@/lib/application-audit-transaction', async importOriginal => ({
+  ...await importOriginal<typeof import('@/lib/application-audit-transaction')>(),
+  withApplicationAuditLock: async (_scope: unknown, run: (tx: unknown) => unknown) => run({
+    job: { findFirst: mocks.job }, resume: { findFirst: mocks.resume }, coverLetter: { findFirst: mocks.coverLetter },
+  }),
+  lockApplicationAuditMaterials: async () => true,
+}))
+vi.mock('@/lib/application-audit-operation', async importOriginal => ({
+  ...await importOriginal<typeof import('@/lib/application-audit-operation')>(), readAuditOperation: mocks.operation,
+}))
 vi.mock('@/lib/api-helpers', () => ({
   requireAuth: mocks.auth, isErrorResponse: (value: unknown) => value instanceof Response,
   err: (error: string, status = 400) => Response.json({ error }, { status }),
@@ -24,9 +38,11 @@ vi.mock('@/lib/auth-secret', () => ({ getAuthJwtSecret: () => new TextEncoder().
 const auditActivityText = (...args: Parameters<typeof unsignedAuditActivityText>) => signedAuditActivityText({ userId: 'user_1', jobId: 'job_1' }, ...args)
 
 const revision = '2026-11-02T09:00:00.000Z'
-const job = { id: 'job_1', company: 'Acme', role: 'Engineer', url: 'https://example.test/jobs/1', finalResumeId: 'resume_1', finalCoverLetterId: 'letter_1' }
-const resume = { id: 'resume_1', updatedAt: new Date(revision), content: { contact: { name: 'Sample Candidate' } } }
-const coverLetter = { id: 'letter_1', updatedAt: new Date(revision), content: 'Dear Acme' }
+const job = { id: 'job_1', company: 'Acme', role: 'Engineer', description: 'Synthetic role', url: 'https://example.test/jobs/1', finalResumeId: 'resume_1', finalCoverLetterId: 'letter_1' }
+const resume = { id: 'resume_1', name: 'Synthetic resume', templateId: null, templateOptions: null, updatedAt: new Date(revision), content: { contact: { name: 'Sample Candidate' } } }
+const coverLetter = { id: 'letter_1', tone: 'professional', templateId: null, templateOptions: null, updatedAt: new Date(revision), content: 'Dear Acme' }
+let auditedResume = resume
+let auditedLetter = coverLetter
 const audit: ApplicationAudit = {
   verdict: 'pass', matchScore: 90, summary: 'Supported.', source: 'parent_resume', auditedAt: revision,
   findings: ['resume', 'cover_letter'].map(area => ({ area: area as 'resume' | 'cover_letter', severity: 'pass', title: 'Supported', evidence: 'Source resume', action: 'None' })),
@@ -42,12 +58,67 @@ function invokePrint() {
 describe('authenticated application ZIP download', () => {
   beforeEach(() => {
     vi.resetAllMocks()
+    auditedResume = resume
+    auditedLetter = coverLetter
     mocks.auth.mockResolvedValue({ userId: 'user_1' })
     mocks.job.mockResolvedValue(job)
     mocks.resume.mockResolvedValue(resume)
     mocks.coverLetter.mockResolvedValue(coverLetter)
     mocks.activity.mockResolvedValue({ text: auditActivityText('resume_1', 'letter_1', audit, { resumeUpdatedAt: revision, coverLetterUpdatedAt: revision }) })
+    mocks.operation.mockImplementation(async (_tx: unknown, scope: { userId: string; jobId: string }) => {
+      const activity = await mocks.activity({ where: { ...scope, text: { startsWith: AUDIT_ACTIVITY_PREFIX } }, orderBy: { createdAt: 'desc' }, select: { text: true } })
+      const stored = parseStoredApplicationAudit(activity?.text ?? '')
+      return verifyApplicationAuditReceipt(scope, stored) ? { kind: 'completed', audit: stored, jobBasisHash: auditJobBasisHash(job), materialBasisHash: auditMaterialBasisHash(auditedResume, stored.coverLetterId ? auditedLetter : null) } : { kind: 'invalid', source: 'legacy' }
+    })
     mocks.render.mockResolvedValue({ bytes: new Uint8Array([80, 75, 3, 4]), filename: 'Acme_Engineer_application-pack.zip' })
+  })
+
+  it.each(['resume', 'coverLetter'] as const)('blocks ZIP and print for oversized %s even with a signed passing audit', async area => {
+    if (area === 'resume') {
+      auditedResume = { ...resume, content: { contact: { name: 'x'.repeat(12_000) } } }
+      mocks.resume.mockResolvedValue(auditedResume)
+    } else {
+      auditedLetter = { ...coverLetter, content: 'x'.repeat(8_001) }
+      mocks.coverLetter.mockResolvedValue(auditedLetter)
+    }
+    expect((await invoke()).status).toBe(409)
+    expect((await invokePrint()).status).toBe(409)
+    expect(mocks.render).not.toHaveBeenCalled()
+  })
+
+  it('blocks ZIP and print for an earlier receipt that could have used truncated evidence', async () => {
+    const oldPayload = ['applymate.audit-material-basis', 1,
+      [resume.id, resume.name, resume.content, resume.templateId, resume.templateOptions],
+      [coverLetter.id, coverLetter.content, coverLetter.tone, coverLetter.templateId, coverLetter.templateOptions]]
+    const oldHash = createHash('sha256').update(JSON.stringify(oldPayload)).digest('hex')
+    const activity = parseStoredApplicationAudit(auditActivityText('resume_1', 'letter_1', audit, { resumeUpdatedAt: revision, coverLetterUpdatedAt: revision }))
+    mocks.operation.mockResolvedValue({ kind: 'completed', audit: activity, jobBasisHash: auditJobBasisHash(job), materialBasisHash: oldHash })
+    expect((await invoke()).status).toBe(409)
+    expect((await invokePrint()).status).toBe(409)
+    expect(mocks.render).not.toHaveBeenCalled()
+  })
+
+  it('passes the audited fallback header name to ZIP and displays it in print', async () => {
+    auditedResume = { ...resume, name: 'Fallback Candidate', content: { contact: { name: '' } } }
+    mocks.resume.mockResolvedValue(auditedResume)
+    expect((await invoke()).status).toBe(200)
+    expect(mocks.render).toHaveBeenCalledWith(job, auditedResume, coverLetter, expect.anything())
+    const print = await invokePrint()
+    expect(print.status).toBe(200)
+    expect(await print.text()).toContain('<h1>Fallback Candidate</h1>')
+  })
+
+  it.each(['pending', 'failed', 'invalid'] as const)('blocks ZIP and print while audit state is %s', async kind => {
+    mocks.operation.mockResolvedValue({ kind })
+    expect((await invoke()).status).toBe(409)
+    expect((await invokePrint()).status).toBe(409)
+    expect(mocks.render).not.toHaveBeenCalled()
+  })
+
+  it('requires a new review for a legacy audit without a job basis', async () => {
+    mocks.operation.mockResolvedValue({ kind: 'legacy', audit: {} })
+    expect((await invoke()).status).toBe(409)
+    expect((await invokePrint()).status).toBe(409)
   })
 
   it('returns a private ZIP attachment for the exact audited, owner-scoped documents', async () => {
@@ -103,6 +174,14 @@ describe('authenticated application ZIP download', () => {
     expect(mocks.render).not.toHaveBeenCalled()
   })
 
+  it.each(['resume', 'coverLetter'] as const)('rejects changed %s content even if its timestamp is unchanged', async key => {
+    if (key === 'resume') mocks.resume.mockResolvedValue({ ...resume, content: { contact: { name: 'Different candidate' } } })
+    else mocks.coverLetter.mockResolvedValue({ ...coverLetter, content: 'Different cover letter' })
+    expect((await invoke()).status).toBe(409)
+    expect((await invokePrint()).status).toBe(409)
+    expect(mocks.render).not.toHaveBeenCalled()
+  })
+
   it('rejects an audit for different final document IDs', async () => {
     mocks.activity.mockResolvedValue({ text: auditActivityText('older_resume', 'letter_1', audit, { resumeUpdatedAt: revision, coverLetterUpdatedAt: revision }) })
     expect((await invoke()).status).toBe(409)
@@ -154,17 +233,25 @@ describe('authenticated application ZIP download', () => {
     log.mockRestore()
   })
 
-  it('fails clearly instead of exporting corrupted glyphs', async () => {
-    mocks.render.mockRejectedValue(new UnsupportedPdfTextError())
+  it.each([
+    ['legacy renderer', new UnsupportedPdfTextError()],
+    ['application renderer', new ApplicationPdfUnsupportedCharactersError()],
+  ])('fails safely instead of exporting corrupted glyphs for %s', async (_renderer, error) => {
+    error.message = 'internal details must not appear'
+    mocks.render.mockRejectedValue(error)
     const response = await invoke()
     expect(response.status).toBe(422)
     expect(response.headers.get('Content-Type')).not.toBe('application/zip')
-    expect((await response.json()).error).toContain('Print view / Save as PDF')
+    const body = await response.json()
+    expect(body.error).toContain('Print view / Save as PDF')
+    expect(body.error).not.toContain('internal details')
   })
 
   it('serves the same audited snapshot in a private script-free Unicode print view', async () => {
-    mocks.resume.mockResolvedValue({ ...resume, content: { contact: { name: '张伟' } } })
-    mocks.coverLetter.mockResolvedValue({ ...coverLetter, content: 'Олена — <script>malicious()</script>' })
+    auditedResume = { ...resume, content: { contact: { name: '张伟' } } }
+    auditedLetter = { ...coverLetter, content: 'Олена — <script>malicious()</script>' }
+    mocks.resume.mockResolvedValue(auditedResume)
+    mocks.coverLetter.mockResolvedValue(auditedLetter)
     const response = await invokePrint()
     expect(response.status).toBe(200)
     expect(response.headers.get('Cache-Control')).toBe('no-store, private')

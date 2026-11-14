@@ -127,7 +127,7 @@ function canonicalRequirements(blocks: unknown): Requirement[] | null {
 function hasCurrentGraphRevision(blocks: unknown, revision: number): boolean {
   const content = observationContent(uniqueBlock(blocks, CURRENT_GRAPH_BLOCK_ID), CURRENT_GRAPH_BLOCK_ID)
   if (!content || field(content, "kind") !== "task_graph_current" || field(content, "revision") !== revision) return false
-  return denseArray(field(content, "nodes"), TASK_GRAPH_LIMITS.maxNodes) !== null
+  return denseArray(field(content, "nodes"), TASK_GRAPH_LIMITS.maxPersistedNodes) !== null
 }
 
 function hasMissingRequirement(blocks: unknown, revision: number, canonical: readonly Requirement[]): boolean {

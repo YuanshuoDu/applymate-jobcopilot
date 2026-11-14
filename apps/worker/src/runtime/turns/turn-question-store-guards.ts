@@ -4,8 +4,9 @@ import type { TurnUsage } from "../budget.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { assertSessionWorkAdmission, OPEN_SESSION } from "../session-gate.js"
 import { ownerFenceSql } from "./turn-engine-owner-sql.js"
-import { parseTurnQuestionArguments, parseTurnQuestionIntentEnvelope, TurnQuestionStoreError, type TurnQuestionIntentEnvelope, type TurnQuestionRecovery, type TurnQuestionUsageInput, type TurnQuestionWaitInput } from "./turn-question-contract.js"
+import { parseTurnQuestionArguments, parseTurnQuestionIntentEnvelope, TurnQuestionStoreError, type TurnQuestionIntentEnvelope, type TurnQuestionUsageInput, type TurnQuestionWaitInput } from "./turn-question-contract.js"
 import { parseModelCompletedReceipt } from "./model-completed-receipt.js"
+import { verifyNativeQuestionAttestation } from "./native-question-attestation.js"
 
 export type TurnQuestionPool = Pick<pg.Pool, "connect">
 export type TurnQuestionClient = Pick<pg.PoolClient, "query" | "release">
@@ -24,7 +25,6 @@ export function questionConflict(resource: string): TurnQuestionStoreError {
     .find(prefix => resource.startsWith(prefix))?.trim().replace(/ /g, "_") ?? "state"
   return new TurnQuestionStoreError("question_conflict", `Question persistence conflict: ${category}`)
 }
-
 export function assertQuestionOwner(owner: TurnExecutionOwnerFence): void {
   if (owner.kind !== "turn" || owner.taskId !== owner.rootTaskId || !owner.userId.trim() || !owner.sessionId.trim()
     || !owner.turnId.trim() || !owner.taskId.trim() || !owner.ownerId.trim() || !Number.isSafeInteger(owner.leaseVersion)
@@ -58,9 +58,12 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boo
 
 /** Shared strict readback for the completed ask_user call/result pair. */
 export async function completedQuestionResult(client: TurnQuestionQueryClient, owner: TurnQuestionReadIdentity, stepId: string, toolCallId: string, expectedArguments?: unknown): Promise<CompletedQuestionResult> {
-  const calls = await client.query<Record<string, unknown>>(`SELECT "id", "status", "content" FROM "agent_items"
+  const calls = await client.query<Record<string, unknown>>(`SELECT "id", "status", "content",
+      (SELECT session."userId" FROM "agent_sessions" AS session WHERE session."id" = "agent_items"."sessionId") AS "userId" FROM "agent_items"
     WHERE "sessionId" = $1 AND "turnId" = $2 AND "stepId" = $3 AND "taskId" = $4 AND "type" = 'tool_call'
-      AND "content"->>'toolCallId' = $5`, [owner.sessionId, owner.turnId, stepId, owner.taskId, toolCallId])
+      AND "content"->>'toolCallId' = $5 AND EXISTS (SELECT 1 FROM "agent_steps" AS step WHERE step."id" = "agent_items"."stepId"
+        AND step."sessionId" = "agent_items"."sessionId" AND step."turnId" = "agent_items"."turnId"
+        AND step."taskId" = "agent_items"."taskId" AND step."attempt" = 1)`, [owner.sessionId, owner.turnId, stepId, owner.taskId, toolCallId])
   const call = calls.rows[0], content = call && record(call.content)
   if (!call || calls.rows.length !== 1 || typeof call.id !== "string" || !call.id || !content || content.toolCallId !== toolCallId
     || !exactKeys(content, ["toolCallId", "toolName", "toolVersion", "status", "errorCode", "input"])
@@ -78,13 +81,51 @@ export async function completedQuestionResult(client: TurnQuestionQueryClient, o
       AND "content"->>'toolCallId' = $5`, [owner.sessionId, owner.turnId, stepId, owner.taskId, toolCallId])
   const result = results.rows[0], receipt = result && record(result.content)
   if (!result || results.rows.length !== 1 || typeof result.id !== "string" || !result.id || result.status !== "completed"
-    || !receipt || !exactKeys(receipt, ["toolCallId", "output", "errorCode"]) || receipt.toolCallId !== toolCallId || receipt.errorCode !== null) {
+    || !receipt || !(exactKeys(receipt, ["toolCallId", "output", "errorCode"])
+      || exactKeys(receipt, ["toolCallId", "output", "errorCode", "nativeQuestionAttestation"]))
+    || receipt.toolCallId !== toolCallId || receipt.errorCode !== null) {
     throw new TurnQuestionStoreError("question_receipt_missing", "Completed owned ask_user result receipt is required")
   }
-  const intent = parseTurnQuestionIntentEnvelope(receipt.output)
-  if (!intent) throw new TurnQuestionStoreError("question_receipt_malformed", "Owned ask_user result receipt is malformed")
+  const intent = questionResultIntent(owner, typeof call.userId === "string" ? call.userId : "", stepId, toolCallId, content.input, receipt)
   if (JSON.stringify(intent) !== JSON.stringify(requested)) throw questionConflict(`tool call ${toolCallId} intent/result identity`)
   return { callItemId: call.id, resultItemId: result.id, intent }
+}
+
+/** Read either a server-attested redacted result or an exact provable legacy envelope. */
+export function questionResultIntent(
+  owner: TurnQuestionReadIdentity,
+  userId: string,
+  stepId: string,
+  toolCallId: string,
+  callInput: unknown,
+  resultContent: unknown,
+): TurnQuestionIntentEnvelope {
+  const requested = parseTurnQuestionArguments(callInput), content = record(resultContent)
+  if (!requested || !content || content.toolCallId !== toolCallId || content.errorCode !== null) {
+    throw new TurnQuestionStoreError("question_receipt_malformed", "Owned ask_user result receipt is malformed")
+  }
+  if (exactKeys(content, ["toolCallId", "output", "errorCode", "nativeQuestionAttestation"])) {
+    if (!isRedactedNativeQuestionOutput(content.output)) {
+      throw new TurnQuestionStoreError("question_receipt_malformed", "Owned ask_user result receipt is malformed")
+    }
+    const attestation = verifyNativeQuestionAttestation(content.nativeQuestionAttestation,
+      { userId, sessionId: owner.sessionId, turnId: owner.turnId, stepId, taskId: owner.taskId }, toolCallId, callInput)
+    if (!attestation) throw questionConflict(`tool call ${toolCallId} attestation identity`)
+    return requested
+  }
+  if (!exactKeys(content, ["toolCallId", "output", "errorCode"])) {
+    throw new TurnQuestionStoreError("question_receipt_malformed", "Owned ask_user result receipt is malformed")
+  }
+  const legacy = parseTurnQuestionIntentEnvelope(content.output)
+  if (!legacy) throw new TurnQuestionStoreError("question_receipt_malformed", "Owned ask_user result receipt is malformed")
+  if (JSON.stringify(legacy) !== JSON.stringify(requested)) throw questionConflict(`tool call ${toolCallId} intent/result identity`)
+  return legacy
+}
+
+function isRedactedNativeQuestionOutput(value: unknown): boolean {
+  const output = record(value)
+  return !!output && exactKeys(output, ["question", "choices"])
+    && output.question === "[REDACTED]" && Array.isArray(output.choices) && output.choices.length === 0
 }
 
 export async function withQuestionTransaction<T>(
@@ -150,7 +191,7 @@ function eventSequence(value: unknown): bigint | null {
   try { return BigInt(text) } catch { return null }
 }
 
-async function questionModelUsage(client: TurnQuestionQueryClient, owner: TurnExecutionOwnerFence, stepId: string): Promise<{
+export async function questionModelUsage(client: TurnQuestionQueryClient, owner: TurnExecutionOwnerFence, stepId: string): Promise<{
   readonly usage: TurnUsage; readonly startedSequence: bigint
 }> {
   const types = ["model.started", "model.completed", "model.usage"] as const
@@ -187,64 +228,4 @@ async function questionModelUsage(client: TurnQuestionQueryClient, owner: TurnEx
     throw new TurnQuestionStoreError("question_usage_unavailable", "Persisted ask_user model usage is malformed")
   }
   return { usage: { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, estimatedCostUsd: usage.estimatedCostUsd }, startedSequence: started.sequence }
-}
-
-/** Restore only the exact owned in-progress call needed for idempotent ask_user replay. */
-export async function recoverIncompleteQuestionCall(pool: TurnQuestionPool, owner: TurnExecutionOwnerFence, now: Date): Promise<TurnQuestionRecovery | null> {
-  assertQuestionOwner(owner)
-  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new TurnQuestionStoreError("question_not_current", "Question recovery time is invalid")
-  return withQuestionTransaction(pool, owner, async (client, turn) => {
-    if (turn.status !== "in_progress") return null
-    const found = await client.query<Row>(`SELECT callItem."id" AS "callItemId", callItem."stepId", callItem."status" AS "callStatus", callItem."content" AS "callContent",
-        step."status" AS "stepStatus", step."errorCode" AS "stepErrorCode", step."finishReason", step."inputTokens", step."outputTokens", step."estimatedCostUsd",
-        resultItem."id" AS "resultItemId", resultItem."status" AS "resultStatus", resultItem."content" AS "resultContent",
-        COUNT(resultItem."id") OVER (PARTITION BY callItem."id") AS "resultCount"
-      FROM "agent_items" AS callItem JOIN "agent_steps" AS step ON step."id" = callItem."stepId" AND step."sessionId" = callItem."sessionId"
-        AND step."turnId" = callItem."turnId" AND step."taskId" = callItem."taskId" AND step."attempt" = 1
-      LEFT JOIN "agent_items" AS resultItem ON resultItem."sessionId" = callItem."sessionId" AND resultItem."turnId" = callItem."turnId"
-        AND resultItem."stepId" = callItem."stepId" AND resultItem."taskId" = callItem."taskId" AND resultItem."type" = 'tool_result'
-        AND resultItem."content"->>'toolCallId' = callItem."content"->>'toolCallId'
-      WHERE callItem."sessionId" = $1 AND callItem."turnId" = $2 AND callItem."taskId" = $3 AND callItem."type" = 'tool_call'
-        AND callItem."content"->>'toolName' = 'agent.ask_user' ORDER BY step."ordinal" DESC, callItem."startedAt" DESC, callItem."id" DESC LIMIT 65`,
-    [owner.sessionId, owner.turnId, owner.taskId])
-    if (found.rows.length >= 65) throw questionConflict("question recovery scan bound")
-    const partial = found.rows.filter(row => (row.callStatus === "started" || row.callStatus === "completed")
-      && (Number(row.resultCount) === 0 || Number(row.resultCount) === 1 && row.resultStatus === "started"))
-    if (partial.length > 1) throw questionConflict("multiple incomplete ask_user calls")
-    const row = partial[0]
-    if (!row || typeof row.callItemId !== "string" || !row.callItemId || typeof row.stepId !== "string") return null
-    const call = record(row.callContent), callId = call?.toolCallId, requested = parseTurnQuestionArguments(call?.input)
-    if (!call || typeof callId !== "string" || !callId || !requested || call.toolName !== "agent.ask_user" || call.toolVersion !== "1"
-      || !(row.callStatus === "started" && exactKeys(call, ["toolCallId", "toolName", "toolVersion", "input"]) && call.status === undefined
-        || row.callStatus === "completed" && exactKeys(call, ["toolCallId", "toolName", "toolVersion", "status", "errorCode", "input"]) && call.status === "completed" && call.errorCode === null)
-      || row.callStatus === "started" && Number(row.resultCount) !== 0) return null
-    if (Number(row.resultCount) === 1) {
-      const result = record(row.resultContent), intent = result && parseTurnQuestionIntentEnvelope(result.output)
-      if (!result || row.resultStatus !== "started" || typeof row.resultItemId !== "string" || !exactKeys(result, ["toolCallId", "output", "errorCode"])
-        || result.toolCallId !== callId || result.errorCode !== null || !intent || JSON.stringify(intent) !== JSON.stringify(requested)) return null
-    }
-    const step = await lockQuestionStep(client, owner, row.stepId)
-    if (row.stepStatus !== "streaming" || step.status !== "streaming" || step.errorCode !== null && step.errorCode !== undefined) return null
-    const durable = await questionModelUsage(client, owner, row.stepId)
-    const pause = await client.query<Row>(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'session.pause_requested'
-      AND "sequence" > $3 ORDER BY "sequence" LIMIT 1 FOR SHARE`, [owner.sessionId, owner.turnId, durable.startedSequence.toString()])
-    if (pause.rows.length) return null
-    const current = [Number(step.inputTokens), Number(step.outputTokens), Number(step.estimatedCostUsd)]
-    const expected = [durable.usage.inputTokens, durable.usage.outputTokens, durable.usage.estimatedCostUsd]
-    if (step.finishReason === null ? current.some(value => value !== 0) : step.finishReason !== "tool_calls" || current.some((value, index) => value !== expected[index])) {
-      throw questionConflict(`step ${row.stepId} model usage`)
-    }
-    const id = questionId(owner, row.stepId, callId)
-    const question = await client.query<Row>(`SELECT "id" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`,
-      [questionItemId(id), owner.sessionId, owner.turnId])
-    if (question.rows.length) throw questionConflict(`question item ${questionItemId(id)} exists for incomplete call`)
-    await admitQuestionWork(client, owner)
-    if (step.finishReason === null) {
-      const updated = await client.query(`UPDATE "agent_steps" SET "finishReason" = 'tool_calls', "inputTokens" = $1, "outputTokens" = $2, "estimatedCostUsd" = $3
-        WHERE "id" = $4 AND "sessionId" = $5 AND "turnId" = $6 AND "taskId" = $7 AND "attempt" = 1 AND "status" = 'streaming'`,
-      [durable.usage.inputTokens, durable.usage.outputTokens, durable.usage.estimatedCostUsd, row.stepId, owner.sessionId, owner.turnId, owner.taskId])
-      if (updated.rowCount !== 1) throw questionConflict(`step ${row.stepId} usage recovery`)
-    }
-    return { status: "replayable", stepId: row.stepId, toolCallId: callId, callItemId: row.callItemId, intent: requested }
-  })
 }
