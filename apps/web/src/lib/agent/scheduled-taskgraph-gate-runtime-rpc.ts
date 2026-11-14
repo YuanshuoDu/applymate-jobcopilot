@@ -88,7 +88,7 @@ async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?:
     defaultResume: { id: resume.id, name: resume.name, templateId: resume.templateId ?? null, templateOptions: resume.templateOptions,
       directionId: resume.directionId ?? null, basicsDetached: resume.basicsDetached ?? false },
     aiConfig, executionAttempt: { id: locked.owner.executionId, attemptCount: locked.owner.executionAttemptCount },
-    scheduledTaskGraphOwnerFence: { owner: locked.owner, key: locked.key, claimToken: locked.claimToken, assertCurrent: assertFenceCurrent }, scheduledGateQualityModelCall,
+    scheduledTaskGraphOwnerFence: { owner: locked.owner, key: locked.key, claimToken: locked.claimToken, gateTaskId: request.gateTaskId, assertCurrent: assertFenceCurrent }, scheduledGateQualityModelCall,
     assertExecutionCurrent: assertFreshCurrent,
     autonomous: snapshot.autoApply, emit: () => undefined, signal,
   }

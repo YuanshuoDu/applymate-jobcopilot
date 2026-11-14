@@ -76,9 +76,11 @@ function lockedGateWait(stepId: string, id = 'root-gate-wait', attempt = 0, over
     result: { request: { targetTaskIds: ['gate-1'], mode: 'any', timeoutMs: 86_400_000,
       scheduledGate: { gateTaskId: 'gate-1', requestAttemptCount: attempt } } }, suspendedAt: new Date(), consumedAt: null, ...overrides }
 }
-function gateRootWaitWitness(stepId: string, waitId = 'root-gate-wait', attempt = 0): ScheduledGateRootWait {
-  return { waitId, stepId, gateTaskId: 'gate-1', requestAttemptCount: attempt, owner,
-    turn: { id: owner.turnId, status: 'waiting_for_dependency', leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: null },
+function gateRootWaitWitness(stepId: string, waitId = 'root-gate-wait', attempt = 0,
+  turnStatus: 'waiting_for_dependency' | 'waiting_for_approval' | 'waiting_for_user' = 'waiting_for_dependency',
+  approvalIds: readonly string[] = []): ScheduledGateRootWait {
+  return { waitId, stepId, gateTaskId: 'gate-1', approvalIds, requestAttemptCount: attempt, owner,
+    turn: { id: owner.turnId, status: turnStatus, leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: null },
     root: { id: owner.rootTaskId, status: 'waiting', attemptCount: owner.rootAttemptCount, waitId } }
 }
 function gateBinding(continuationKey = `scheduled-taskgraph:sha256:${'a'.repeat(64)}`) { return { schemaVersion: 'agent-harness.v2.scheduled-gate-choice-wait.v1', owner: {
@@ -200,6 +202,14 @@ describe('scheduled TaskGraph Audit recovery evidence', () => {
       waits: [gate, prepare], tasks: [gateTask(), { ...gateTask(), id: 'prepare-1', role: 'prepare', taskType: 'scheduled_application_prepare' }] })
     await expect(validate(f.reader, { gateWait: witness })).resolves.toBe(true)
     expect(mocks.gateAttempt).toHaveBeenCalledWith(f.reader, owner, 'gate-1', 0)
+    const approvalWitness = gateRootWaitWitness(step.id, gate.id, 0, 'waiting_for_approval', ['approval-1', 'approval-2'])
+    await expect(validate(f.reader, { gateWait: approvalWitness })).resolves.toBe(true)
+    for (const invalid of [
+      gateRootWaitWitness(step.id, gate.id, 0, 'waiting_for_approval'),
+      gateRootWaitWitness(step.id, gate.id, 0, 'waiting_for_approval', ['approval-2', 'approval-1']),
+      gateRootWaitWitness(step.id, gate.id, 0, 'waiting_for_approval', ['approval-1', 'approval-1']),
+      gateRootWaitWitness(step.id, gate.id, 0, 'waiting_for_user', ['approval-1']),
+    ]) await expect(validate(f.reader, { gateWait: invalid })).resolves.toBe(false)
     mocks.gateAttempt.mockResolvedValueOnce(false)
     await expect(validate(f.reader, { gateWait: witness })).resolves.toBe(false)
 

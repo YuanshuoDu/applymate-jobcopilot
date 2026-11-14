@@ -83,7 +83,7 @@ describe('Audit-only historical Prepare source validation', () => {
   it('forwards the same-transaction locked Gate wait witness into historical recovery validation', async () => {
     const reader = { agentEvent: { findMany: mocks.events }, agentStep: { findFirst: mocks.sourceStep },
       agentItem: { findFirst: mocks.choice } } as unknown as Prisma.TransactionClient
-    const gateWait = { waitId: 'root-gate-wait', stepId: 'recovery-tail', gateTaskId: 'gate-child', requestAttemptCount: 2, owner,
+    const gateWait = { waitId: 'root-gate-wait', stepId: 'recovery-tail', gateTaskId: 'gate-child', approvalIds: [], requestAttemptCount: 2, owner,
       turn: { id: owner.turnId, status: 'waiting_for_dependency', leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: null },
       root: { id: owner.rootTaskId, status: 'waiting' as const, attemptCount: owner.rootAttemptCount, waitId: 'root-gate-wait' } }
     await expect(validateScheduledTaskGraphAuditPrepareSource({ ...request, reader, gateWait })).resolves.toBe(true)

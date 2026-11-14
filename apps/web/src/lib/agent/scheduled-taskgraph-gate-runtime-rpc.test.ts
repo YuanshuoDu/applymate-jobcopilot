@@ -316,8 +316,9 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
       try { return await work(tx) } finally { transactionCallbackActive = false }
     })
     mocks.executeGate.mockImplementation(async (input: { context: {
-      scheduledTaskGraphOwnerFence: { assertCurrent(transaction: unknown): Promise<boolean> }
+      scheduledTaskGraphOwnerFence: { gateTaskId: string; assertCurrent(transaction: unknown): Promise<boolean> }
     } }) => {
+      expect(input.context.scheduledTaskGraphOwnerFence.gateTaskId).toBe('gate-1')
       await mocks.transaction(async (transaction: unknown) => {
         if (!await input.context.scheduledTaskGraphOwnerFence.assertCurrent(transaction)) {
           throw new AgentExecutionCancelledError()

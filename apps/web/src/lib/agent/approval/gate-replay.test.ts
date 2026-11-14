@@ -3,7 +3,7 @@ import type { Prisma } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
 
 import { ApprovalStoreError, protocolScope, type ApprovalScopeInput } from "./types"
-import { recoverGateReviewReplay, type ReplayReceiptExpectation } from "./gate-replay"
+import { recoverGateReviewReplay, SCHEDULED_GATE_REVIEW_MARKER_SCHEMA, type ReplayReceiptExpectation } from "./gate-replay"
 
 const nonce = "a".repeat(64)
 const originalScope: ApprovalScopeInput = {
@@ -36,7 +36,8 @@ async function pendingReceipt(): Promise<Prisma.AgentApprovalGetPayload<{}>> {
     title: "Review application",
     body: "Review materials",
     impact: { externalSubmission: false },
-    payload: { jobId: originalScope.jobId, applicationTaskId: "application_task_1" },
+    payload: { jobId: originalScope.jobId, applicationTaskId: "application_task_1",
+      scheduledGateReview: { schemaVersion: SCHEDULED_GATE_REVIEW_MARKER_SCHEMA, gateTaskId: "gate_task_1" } },
     resourceHash: originalScope.resourceHash,
     materialHash: originalScope.materialHash,
     answersHash: originalScope.answersHash,
@@ -50,7 +51,8 @@ async function pendingReceipt(): Promise<Prisma.AgentApprovalGetPayload<{}>> {
   }
 }
 
-async function expectation(scope = { ...originalScope, revision: 9, expiresAt: new Date("2026-10-02T00:00:00.000Z") }): Promise<ReplayReceiptExpectation> {
+async function expectation(scope = { ...originalScope, revision: 9, expiresAt: new Date("2026-10-02T00:00:00.000Z") },
+  gateTaskId = "gate_task_1"): Promise<ReplayReceiptExpectation> {
   return {
     approvalId: "approval_1",
     nonce,
@@ -61,7 +63,8 @@ async function expectation(scope = { ...originalScope, revision: 9, expiresAt: n
     title: "Review application",
     body: "Review materials",
     impact: { externalSubmission: false },
-    payload: { jobId: originalScope.jobId },
+    payload: { jobId: originalScope.jobId,
+      scheduledGateReview: { schemaVersion: SCHEDULED_GATE_REVIEW_MARKER_SCHEMA, gateTaskId } },
   }
 }
 
@@ -76,7 +79,26 @@ describe("Gate receipt replay recovery", () => {
       id: row.id,
       status: "pending",
       scope: { revision: originalScope.revision, expiresAt: originalScope.expiresAt.toISOString() },
+      payload: { jobId: originalScope.jobId, applicationTaskId: "application_task_1" },
     })
+    expect(recovered.approval.payload).not.toHaveProperty("scheduledGateReview")
+  })
+
+  it.each(["pending", "approved"])("fails closed on an upgrade-era %s v2 receipt without a Gate marker", async status => {
+    const row = await pendingReceipt()
+    const legacy = { ...row, payload: { jobId: originalScope.jobId, applicationTaskId: "application_task_1" },
+      status, decidedAt: status === "approved" ? new Date("2026-09-30T23:00:00.000Z") : null }
+
+    await expect(recoverGateReviewReplay(legacy, await expectation(), new Date("2026-09-30T23:30:00.000Z")))
+      .rejects.toMatchObject({ code: "approval_scope_mismatch" } satisfies Partial<ApprovalStoreError>)
+  })
+
+  it("rejects a replay whose Gate marker points at another Gate task", async () => {
+    const row = await pendingReceipt()
+
+    await expect(recoverGateReviewReplay(row, await expectation(undefined, "other-gate"),
+      new Date("2026-09-30T23:30:00.000Z")))
+      .rejects.toMatchObject({ code: "approval_scope_mismatch" } satisfies Partial<ApprovalStoreError>)
   })
 
   it("rejects a replay whose reviewed material digest changed", async () => {

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { Prisma } from '@prisma/client'
 import type { ScheduledTaskGraphGateRequestOwner } from './scheduled-taskgraph-gate-rpc'
 import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
+import { scheduledTaskGraphGateApprovalWaitIds } from './scheduled-taskgraph-gate-approval-wait'
 
 const WAIT_TIMEOUT_MS = 86_400_000
 type Row = Record<string, unknown>
@@ -10,7 +11,7 @@ type RootTurn = Readonly<{ id: string; status: string; leaseOwnerId: string | nu
 type RootTask = Readonly<{ id: string; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string | null;
   status: string; attemptCount: number; interruptRequestedAt: Date | null; closedAt: Date | null; result: unknown }>
 type LockedGateWait = Readonly<{ waitId: string; stepId: string; requestAttemptCount: number }>
-export type ScheduledGateRootWaitLock = LockedGateWait & Readonly<{ gateTaskId: string; owner: ScheduledTaskGraphGateRequestOwner;
+export type ScheduledGateRootWaitLock = LockedGateWait & Readonly<{ approvalIds: readonly string[]; gateTaskId: string; owner: ScheduledTaskGraphGateRequestOwner;
   turn: RootTurn; root: Readonly<{ id: string; status: 'waiting'; attemptCount: number; waitId: string }> }>
 export type ScheduledGateRootWait = Omit<ScheduledGateRootWaitLock, 'owner'> & Readonly<{ owner: ScheduledTaskGraphPipelineOwner }>
 export type ScheduledTaskGraphRootActionLock = Readonly<{ root: RootTask; gateWait?: ScheduledGateRootWaitLock }>
@@ -28,8 +29,10 @@ export async function lockScheduledTaskGraphRootAction(tx: Prisma.TransactionCli
         AND "rootTaskId" = ${input.owner.rootTaskId} AND "parentTaskId" IS NULL
     `)
     if (preview.length !== 1 || !['running', 'waiting'].includes(preview[0]!.status)) return null
+    if (preview[0]!.status === 'running' && input.turn.status === 'waiting_for_approval') return null
     if (preview[0]!.status === 'waiting') {
-      if (input.turn.id !== input.owner.turnId || input.turn.status !== 'waiting_for_dependency'
+      if (input.turn.id !== input.owner.turnId
+        || !['waiting_for_dependency', 'waiting_for_approval'].includes(input.turn.status)
         || input.turn.leaseOwnerId !== null || input.turn.leaseExpiresAt !== null
         || input.turn.leaseVersion !== input.owner.turnLeaseVersion) return null
       gateWait = await lockCurrentGateWait(tx, input.owner, input.gateTaskId)
@@ -54,7 +57,12 @@ export async function lockScheduledTaskGraphRootAction(tx: Prisma.TransactionCli
   if (input.action === 'gate' && (root.status === 'waiting'
     ? !gateWait || !rootWaitResultMatches(root.result, gateWait.waitId)
     : gateWait !== null)) return null
-  const witness = gateWait ? { ...gateWait, gateTaskId: input.gateTaskId!, owner: input.owner, turn: {
+  let approvalIds: readonly string[] = []
+  if (input.action === 'gate' && root.status === 'waiting' && input.turn.status === 'waiting_for_approval') {
+    approvalIds = await scheduledTaskGraphGateApprovalWaitIds(tx, input.owner, input.gateTaskId!)
+    if (approvalIds.length === 0) return null
+  }
+  const witness = gateWait ? { ...gateWait, approvalIds, gateTaskId: input.gateTaskId!, owner: input.owner, turn: {
     id: input.turn.id, status: input.turn.status, leaseOwnerId: input.turn.leaseOwnerId,
     leaseVersion: input.turn.leaseVersion, leaseExpiresAt: input.turn.leaseExpiresAt,
   },
@@ -66,7 +74,7 @@ export async function lockScheduledTaskGraphRootAction(tx: Prisma.TransactionCli
 export function scheduledGateRootWaitWitnessMatches(input: Readonly<{ owner: ScheduledTaskGraphPipelineOwner; gateTaskId: string;
   root: Readonly<{ id: unknown; status: unknown; attemptCount: unknown; result: unknown }>; witness?: ScheduledGateRootWait }>): boolean {
   const { owner, gateTaskId, root, witness } = input
-  return !!witness && exactKeys(witness as unknown as Row, ['waitId', 'stepId', 'requestAttemptCount', 'gateTaskId', 'owner', 'turn', 'root'])
+  return !!witness && exactKeys(witness as unknown as Row, ['waitId', 'stepId', 'requestAttemptCount', 'approvalIds', 'gateTaskId', 'owner', 'turn', 'root'])
     && exactKeys(witness.owner as unknown as Row, ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount',
       'turnLeaseOwnerId', 'turnLeaseVersion', 'executionId', 'executionAttemptCount'])
     && exactKeys(witness.turn as unknown as Row, ['id', 'status', 'leaseOwnerId', 'leaseVersion', 'leaseExpiresAt'])
@@ -74,7 +82,9 @@ export function scheduledGateRootWaitWitnessMatches(input: Readonly<{ owner: Sch
     && validId(gateTaskId) && validId(witness.waitId) && validId(witness.stepId)
     && nonNegative(witness.requestAttemptCount) && witness.requestAttemptCount < Number.MAX_SAFE_INTEGER
     && witness.gateTaskId === gateTaskId && sameOwner(witness.owner, owner)
-    && witness.turn.id === owner.turnId && witness.turn.status === 'waiting_for_dependency'
+    && witness.turn.id === owner.turnId
+    && (witness.turn.status === 'waiting_for_dependency' ? validApprovalIds(witness.approvalIds, false)
+      : witness.turn.status === 'waiting_for_approval' && validApprovalIds(witness.approvalIds, true))
     && witness.turn.leaseOwnerId === null && witness.turn.leaseExpiresAt === null
     && witness.turn.leaseVersion === owner.turnLeaseVersion
     && witness.root.id === owner.rootTaskId && witness.root.status === 'waiting'
@@ -179,3 +189,8 @@ function validId(value: unknown): value is string {
   return typeof value === 'string' && value.trim() === value && value.length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value)
 }
 function nonNegative(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
+function validApprovalIds(value: unknown, required: boolean): value is readonly string[] {
+  if (!Array.isArray(value) || value.length > 50 || (required ? value.length === 0 : value.length !== 0)
+    || !value.every(validId) || new Set(value).size !== value.length) return false
+  return value.every((id, index) => index === 0 || value[index - 1]! < id)
+}

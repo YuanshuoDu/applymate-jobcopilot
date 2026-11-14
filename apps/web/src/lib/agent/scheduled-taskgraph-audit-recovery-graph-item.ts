@@ -53,7 +53,7 @@ export function scheduledTaskGraphAuditGateWaitWitnessMatches(input: Readonly<{ 
   witness: ScheduledGateRootWait; stepId: string; waits: readonly unknown[] }>): boolean {
   const { owner, witness, stepId, waits } = input, matches = waits.map(row).filter(wait => wait?.id === witness.waitId)
   const wait = matches[0], result = row(parse(wait?.result)), request = row(result?.request), marker = row(request?.scheduledGate)
-  return exactKeys(witness as unknown as Row, ['waitId', 'stepId', 'requestAttemptCount', 'gateTaskId', 'owner', 'turn', 'root'])
+  return exactKeys(witness as unknown as Row, ['waitId', 'stepId', 'requestAttemptCount', 'approvalIds', 'gateTaskId', 'owner', 'turn', 'root'])
     && exactKeys(witness.owner as unknown as Row, ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount',
       'turnLeaseOwnerId', 'turnLeaseVersion', 'executionId', 'executionAttemptCount'])
     && exactKeys(witness.turn as unknown as Row, ['id', 'status', 'leaseOwnerId', 'leaseVersion', 'leaseExpiresAt'])
@@ -66,7 +66,9 @@ export function scheduledTaskGraphAuditGateWaitWitnessMatches(input: Readonly<{ 
     && witness.owner.rootAttemptCount === owner.rootAttemptCount && witness.owner.turnLeaseOwnerId === owner.turnLeaseOwnerId
     && witness.owner.turnLeaseVersion === owner.turnLeaseVersion && witness.owner.executionId === owner.executionId
     && witness.owner.executionAttemptCount === owner.executionAttemptCount && witness.turn.id === owner.turnId
-    && witness.turn.status === 'waiting_for_dependency' && witness.turn.leaseOwnerId === null
+    && (witness.turn.status === 'waiting_for_dependency' ? Array.isArray(witness.approvalIds) && witness.approvalIds.length === 0
+      : witness.turn.status === 'waiting_for_approval' && validApprovalIds(witness.approvalIds))
+    && witness.turn.leaseOwnerId === null
     && witness.turn.leaseVersion === owner.turnLeaseVersion && witness.turn.leaseExpiresAt === null
     && witness.root.id === owner.rootTaskId && witness.root.status === 'waiting'
     && witness.root.attemptCount === owner.rootAttemptCount && witness.root.waitId === witness.waitId
@@ -228,6 +230,11 @@ function same(left: unknown, right: unknown): boolean {
   if (!a || !b) return false
   const keys = Object.keys(a).sort(), other = Object.keys(b).sort()
   return keys.length === other.length && keys.every((key, index) => key === other[index] && same(a[key], b[key]))
+}
+function validApprovalIds(value: unknown): boolean {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 50 || !value.every(validId)) return false
+  const ids = value as string[]
+  return new Set(ids).size === ids.length && ids.every((id, index) => index === 0 || ids[index - 1]! < id)
 }
 function validId(value: unknown): value is string { return typeof value === 'string' && value.trim() === value && value.length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value) }
 function validNodeKey(value: unknown): value is string { return typeof value === 'string' && value.trim().length > 0 && value.length <= 128 }

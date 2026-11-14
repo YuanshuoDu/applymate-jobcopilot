@@ -4,6 +4,7 @@ import { redactAgentEvent } from "@jobcopilot/shared"
 import { db } from "@/lib/db"
 
 import { AgentExecutionCancelledError } from "../execution-control"
+import { SCHEDULED_GATE_REVIEW_MARKER_SCHEMA } from "../approval/gate-replay"
 import { clientReceipt, findScheduledGateReviewReceiptReplay, hashLegacyValue, issueLegacyReceipt } from "../approval/legacy-receipt"
 import type { LegacyReceiptInput } from "../approval/legacy-receipt"
 import type { ApplicationPackage, PipelineCtx } from "../types"
@@ -35,6 +36,8 @@ async function buildGateReviewReceiptInput(ctx: PipelineCtx, pkg: ApplicationPac
   const { sessionId, turnId } = ctx
   if (!sessionId || !turnId || !ctx.executionAttempt || ctx.signal?.aborted) throw new AgentExecutionCancelledError()
   if (scheduledGate && !ctx.scheduledTaskGraphOwnerFence) throw new AgentExecutionCancelledError()
+  const gateTaskId = scheduledGate ? ctx.scheduledTaskGraphOwnerFence?.gateTaskId : undefined
+  if (scheduledGate && (!gateTaskId || !gateTaskId.trim() || gateTaskId.length > 256)) throw new AgentExecutionCancelledError()
   const currentTurn = await db.agentTurn.findFirst({
     where: { id: turnId, sessionId, userId: ctx.userId },
     select: { revision: true, status: true },
@@ -52,6 +55,7 @@ async function buildGateReviewReceiptInput(ctx: PipelineCtx, pkg: ApplicationPac
   }))
   const basePayload = {
     jobId: pkg.job.id,
+    ...(gateTaskId ? { scheduledGateReview: { schemaVersion: SCHEDULED_GATE_REVIEW_MARKER_SCHEMA, gateTaskId } } : {}),
     ...(artifactBindings.length ? { artifactBindings } : {}),
   }
   const reviewedMaterial = {
