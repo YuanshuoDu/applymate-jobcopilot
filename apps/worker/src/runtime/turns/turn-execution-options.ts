@@ -13,6 +13,22 @@ import type { TurnExecutionIdentity, TurnExecutionContextBuilder, TurnExecutionS
 import type { ChildWaitClaimRecovery, ChildWaitOrphanRecovery } from "../subagents/child-durable-wait-replay.js"
 import type { EmptyAnalystCandidateAuthorizer } from "../subagents/task-graph-empty-analyst-candidate.js"
 
+export type ChildToolReplayReceipt = Readonly<{
+  userId: string; sessionId: string; turnId: string; rootTaskId: string; taskId: string; attempt: number; stepId: string
+  toolCallId: string; toolName: string; input: unknown
+  callItem: Readonly<{ id: string; revision: number }>; resultItem: Readonly<{ id: string; revision: number }>
+  result: Readonly<{ status: "completed" | "failed"; output: unknown; errorCode: string | null }>
+}>
+export type ChildWaitReplayReceipt = ChildToolReplayReceipt & Readonly<{
+  waitId: string
+  source: Readonly<{
+    attempt: number; stepId: string; ordinal: number; toolCallId: string; sourceItemId: string
+    callItem: Readonly<{ id: string; revision: number }>; resultItem: Readonly<{ id: string; revision: number }>
+    input: unknown; persistedResult: Readonly<{ status: "completed"; output: unknown; errorCode: null }>
+    continuationStepId?: string; continuationOrdinal?: number
+  }>
+}>
+
 export type TurnExecutionOptions = {
   readonly identity: TurnExecutionIdentity
   readonly scope: TenantScope
@@ -43,6 +59,10 @@ export type TurnExecutionOptions = {
   readonly noProgressRepeatLimit?: number
   readonly resume?: TurnResumeState
   readonly toolCallRecovery?: readonly ToolCallRecovery[]
+  /** Private, item-backed replay evidence for a child Task; never model context. */
+  readonly childToolReplayReceipts?: readonly ChildToolReplayReceipt[]
+  /** Separate loader-validated durable-wait proof, never a generic tool receipt. */
+  readonly childWaitReplayReceipts?: readonly ChildWaitReplayReceipt[]
   readonly childWaitCallStartKey?: (stepId: string, call: TurnEngineToolCall) => string | undefined
   readonly childWaitCallStarted?: (stepId: string, call: TurnEngineToolCall, eventId: string) => void
   readonly childWaitClaimRecovery?: ChildWaitClaimRecovery

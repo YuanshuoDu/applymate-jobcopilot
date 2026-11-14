@@ -1,3 +1,8 @@
+import {
+  unknownApplicationSubmissionEvidence,
+  type ApplicationSubmissionEvidence,
+} from "@/lib/agent/application-submission-evidence"
+
 export interface ApplicationTaskView {
   id: string
   jobId: string
@@ -7,6 +12,7 @@ export interface ApplicationTaskView {
   company: string
   role: string
   updatedAt: string
+  submissionEvidence?: ApplicationSubmissionEvidence
 }
 
 export type ApplicationTaskKind = 'preparing' | 'filling' | 'needsInput' | 'needsMaterialsReview' | 'needsHandoff' | 'needsUserAction' | 'fillUncertain' | 'needsApproval' | 'submitting' | 'submitted' | 'unknown' | 'failed' | 'cancelled' | 'skipped' | 'unavailable'
@@ -31,6 +37,41 @@ function displayText(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= 500
 }
 
+const SUBMISSION_CHECKPOINTS = new Set([
+  'submission_request_started', 'submission_authorized', 'submission_uncertain', 'submission_verified', 'submission_blocked',
+  'execution_interrupted', 'receipt_rejected', 'queue_retry',
+])
+
+function submissionRelevant(status: string, checkpoint: string | null): boolean {
+  return status === 'submitted' || status === 'unknown' || SUBMISSION_CHECKPOINTS.has(checkpoint ?? '')
+}
+
+function submissionEvidence(value: unknown, status: string, checkpoint: string | null): ApplicationSubmissionEvidence {
+  const input = record(value)
+  const relevant = submissionRelevant(status, checkpoint) || input?.visible === true
+  const availability = input?.availability === 'available' || input?.availability === 'unavailable' || input?.availability === 'unknown'
+    ? input.availability : 'unknown'
+  const keys = ['visible', 'availability', 'workerReport', 'localRecord', 'employerReceipt']
+  const valid = input !== null && Object.keys(input).length === keys.length
+    && keys.every(key => Object.prototype.hasOwnProperty.call(input, key))
+    && typeof input.visible === 'boolean'
+    && (input.workerReport === 'submitted' || input.workerReport === 'unknown')
+    && (input.localRecord === 'recorded' || input.localRecord === 'unknown')
+    && input.employerReceipt === 'unverified'
+    && (availability === 'available' || (input.workerReport === 'unknown' && input.localRecord === 'unknown'))
+    && (input.localRecord !== 'recorded' || input.workerReport === 'submitted')
+    && (input.availability === 'available' || input.availability === 'unavailable' || input.availability === 'unknown')
+  if (!valid) return unknownApplicationSubmissionEvidence(relevant, availability === 'unavailable' ? 'unavailable' : 'unknown')
+  if (!input.visible) return unknownApplicationSubmissionEvidence(relevant, availability === 'unavailable' ? 'unavailable' : 'unknown')
+  return {
+    visible: true,
+    availability,
+    workerReport: availability === 'available' && input.workerReport === 'submitted' ? 'submitted' : 'unknown',
+    localRecord: availability === 'available' && input.workerReport === 'submitted' && input.localRecord === 'recorded' ? 'recorded' : 'unknown',
+    employerReceipt: 'unverified',
+  }
+}
+
 /** Consume only display fields; never retain questions, answers, receipts or raw events. */
 export function parseApplicationTasks(value: unknown, userId: string): { tasks: ApplicationTaskView[]; limited: boolean } | null {
   const payload = record(value)
@@ -46,10 +87,9 @@ export function parseApplicationTasks(value: unknown, userId: string): { tasks: 
       id: row.id, jobId: row.jobId, sessionId: identifier(row.sessionId) ? row.sessionId : null,
       status: row.status, checkpoint: typeof row.checkpoint === 'string' ? row.checkpoint : null,
       company: job.company, role: job.role, updatedAt: row.updatedAt,
+      submissionEvidence: submissionEvidence(row.submissionEvidence, row.status, typeof row.checkpoint === 'string' ? row.checkpoint : null),
     }
     const previous = byJobId.get(task.jobId)
-    // The canonical model enforces one record per user/job. An inconsistent
-    // response must not hide a conflicting pending or uncertain execution.
     if (previous) return null
     byJobId.set(task.jobId, task)
   }

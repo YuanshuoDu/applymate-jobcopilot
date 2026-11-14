@@ -14,7 +14,7 @@ import {
   type TaskGraphState,
   type TaskGraphValidationOptions,
 } from "./task-graph.js"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "./task-graph-verification.js"
 import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "../subagents/task-graph-child-deadline.js"
 
 const options: TaskGraphValidationOptions = {
@@ -146,6 +146,44 @@ describe("TaskGraph planning kernel", () => {
       .toMatchObject({ ok: false, error: { code: "repair_invalid" } })
     expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: [target, repair] }, createInitialTaskGraphState(), options))
       .toMatchObject({ ok: false, error: { code: "repair_invalid" } })
+  })
+
+  it("requires location-aware repairs to carry the exact target location invariant", () => {
+    const verification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+      criteria: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } },
+        { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin", "Berlin"] } },
+      ],
+    } as const
+    const target = node("target", { verification })
+    const state: TaskGraphState = {
+      revision: 1, nodes: [{ ...target, depth: 1, status: "failed", taskId: "task-target", verificationDisposition: "typed" }], appliedEvents: [],
+    }
+    const relation = { graphRootTaskId: "root-task", nodeKey: "target", taskId: "task-target", criterionIds: ["candidate-count"] }
+    const makeRepair = (criteria: readonly NonNullable<TaskGraphNodeProposal["verification"]>["criteria"][number][], criterionIds = relation.criterionIds) =>
+      node("repair", { verification: { ...verification, criteria }, repairOf: { ...relation, criterionIds } })
+    const count = verification.criteria[0]
+    const location = verification.criteria[1]
+
+    expect(validateTaskGraphProposal({ expectedRevision: 1, nodes: [makeRepair([count, location])] }, state, options))
+      .toMatchObject({ ok: true, addedNodes: [{ repairOf: relation, verification: { criteria: [count, {
+        id: "candidate-location", check: { kind: "candidate_location_in", locations: ["berlin", "dublin"] },
+      }] } }] })
+    expect(validateTaskGraphProposal({ expectedRevision: 1, nodes: [makeRepair([location], ["candidate-location"])] }, state, options))
+      .toMatchObject({ ok: true })
+    expect(validateTaskGraphProposal({ expectedRevision: 1, nodes: [makeRepair([count, location], ["candidate-count", "candidate-location"])] }, state, options))
+      .toMatchObject({ ok: true })
+
+    const invalid = [
+      makeRepair([count]),
+      makeRepair([count, { ...location, check: { kind: "candidate_location_in", locations: ["Dublin"] } }]),
+      makeRepair([count, location, { id: "extra", check: { kind: "all_candidates_have_evidence", minimumItems: 1 } }]),
+    ]
+    for (const repair of invalid) {
+      expect(validateTaskGraphProposal({ expectedRevision: 1, nodes: [repair] }, state, options))
+        .toMatchObject({ ok: false, error: { code: "repair_invalid" } })
+    }
   })
 
   it("requires exact non-empty repairOf shape and unique criterion IDs", () => {

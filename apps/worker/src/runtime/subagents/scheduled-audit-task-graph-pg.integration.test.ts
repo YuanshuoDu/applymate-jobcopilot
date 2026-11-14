@@ -33,6 +33,8 @@ import { parseScheduledAuditReport, SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUD
 import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK } from "./scheduled-post-gate-contract.js"
 import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
+import { buildTaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
+import { buildGroundedTaskGraphFinalResponse } from "./task-graph-final-response.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGraphProposalKey,
   TASK_GRAPH_ITEM_TYPE } from "./task-graph-snapshot.js"
 import { verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-task-graph-verification.js"
@@ -568,7 +570,9 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       } })
     expect(resumedJob).toMatchObject({ status: "completed" })
     expect(resumedLease?.leaseVersion).toBe(fixture.turnLease.leaseVersion + 1)
-    expect(terminalRoot).toMatchObject({ status: "completed", finalText: "Scheduled Gate integration candidate." })
+    const groundedFinalText = await currentGroundedTaskGraphResponse(fixture)
+    expect(groundedFinalText).not.toContain("Scheduled Gate integration candidate.")
+    expect(terminalRoot).toMatchObject({ status: "completed", finalText: groundedFinalText })
     expect(terminalAuditProofCaptures.length).toBeGreaterThan(0)
     const terminalAuditProof = terminalAuditProofCaptures.at(-1)
     expect(terminalAuditProof?.current).toMatchObject({ owner: expect.objectContaining({ executionId: fixture.executionOwner.executionId }),
@@ -2617,6 +2621,19 @@ async function graphCount(fixture: Fixture): Promise<{ totalNodes: number; scout
       && scouts.every(node => analyst.dependsOn.includes(node.key))),
     suffixIsChained: Boolean(prepare && gate && audit && prepare.dependsOn.length === 1 && prepare.dependsOn[0] === analyst?.key
       && gate.dependsOn.length === 1 && gate.dependsOn[0] === prepare.key && audit.dependsOn.length === 1 && audit.dependsOn[0] === gate.key) }
+}
+async function currentGroundedTaskGraphResponse(fixture: Fixture): Promise<string> {
+  const client = await pool!.connect()
+  try {
+    await client.query("BEGIN READ ONLY")
+    await client.query("SELECT set_config('app.user_id', $1, true)", [fixture.ids.userId])
+    const binding = buildTaskGraphFinalSummaryBinding(await loadTaskGraph(client, fixture.graphScope, false))
+    if (!binding) throw new Error("Current scheduled Audit TaskGraph did not produce its final-summary binding")
+    return buildGroundedTaskGraphFinalResponse(binding)
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined)
+    client.release()
+  }
 }
 async function cleanupFixtureUsers(): Promise<void> {
   if (!pool || fixtureUsers.length === 0) return

@@ -5,20 +5,25 @@ import {
   evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst,
   evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery,
   TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
+  TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION,
   TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2,
   validateScheduledPrepareDependencyEvidence,
   validateTaskGraphVerificationContract,
   type TaskGraphVerificationDependencyEvidence,
   type TaskGraphVerificationContract,
   type TaskGraphVerificationEvidenceProjection,
+  type TaskGraphVerificationSchemaVersion,
 } from "./task-graph-verification.js"
 
-function contract(role: "scout" | "analyst", criteria: unknown[] = [{ id: "minimum-results", check: { kind: role === "scout" ? "candidate_count_gte" : "finding_count_gte", minimum: 1 } }]) {
-  return { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role, criteria }
+function contract(role: "scout" | "analyst", criteria: unknown[] = [{ id: "minimum-results", check: { kind: role === "scout" ? "candidate_count_gte" : "finding_count_gte", minimum: 1 } }],
+  schemaVersion: TaskGraphVerificationSchemaVersion = TASK_GRAPH_VERIFICATION_SCHEMA_VERSION) {
+  return { schemaVersion, role, criteria }
 }
 
-function validatedContract(role: "scout" | "analyst", criteria: unknown[]): TaskGraphVerificationContract {
-  const result = validateTaskGraphVerificationContract(contract(role, criteria), role)
+function validatedContract(role: "scout" | "analyst", criteria: unknown[],
+  schemaVersion: TaskGraphVerificationSchemaVersion = TASK_GRAPH_VERIFICATION_SCHEMA_VERSION): TaskGraphVerificationContract {
+  const result = validateTaskGraphVerificationContract(contract(role, criteria, schemaVersion), role)
   if (!result.ok) throw new Error("test_contract_invalid")
   return result.contract
 }
@@ -208,7 +213,52 @@ function projectionForAnalyst(jobIds: readonly string[]): TaskGraphVerificationE
   }
 }
 
+function locationProjection(candidates: readonly Readonly<{ jobId: string; status: "verified" | "missing" | "conflicting"; location: string | null }>[], empty = false): TaskGraphVerificationEvidenceProjection {
+  const evidenceIds = candidates.map(({ jobId }) => canonicalEvidence("job", jobId))
+  const digest = "a".repeat(64)
+  return {
+    schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, role: "scout",
+    candidates: candidates.map(({ jobId, status, location }, index) => ({
+      jobId, evidenceIds: [evidenceIds[index]!], observedLocation: location, locationEvidenceStatus: status,
+    })),
+    evidenceIds: empty ? [`read:source:jobs.discover:${digest}`] : evidenceIds,
+    ...(empty ? { emptyDiscoveryReceipt: { digest } } : {}),
+  }
+}
+
 describe("TaskGraph durable evidence verification", () => {
+  it("requires v2 observed locations, fails explicit nonmatches and never passes an empty set", () => {
+    const typed = validatedContract("scout", [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["berlin", "dublin"] } }], TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2)
+    expect(evaluateTaskGraphVerification(typed, locationProjection([
+      { jobId: "job-1", status: "verified", location: "dublin" },
+      { jobId: "job-2", status: "verified", location: "berlin" },
+    ]))).toEqual({ status: "passed", reasonCode: "criteria_met", criteria: [
+      { criterionId: "candidate-location", status: "passed", reasonCode: "criteria_met" },
+    ] })
+    expect(evaluateTaskGraphVerification(typed, locationProjection([
+      { jobId: "job-1", status: "verified", location: "dublin" },
+      { jobId: "job-2", status: "verified", location: "paris" },
+    ]))).toMatchObject({ status: "failed", reasonCode: "criterion_not_met" })
+    expect(evaluateTaskGraphVerification(typed, locationProjection([], true)))
+      .toMatchObject({ status: "failed", reasonCode: "criterion_not_met" })
+  })
+
+  it("leaves missing or conflicting observations unverified and does not infer location from v1", () => {
+    const typed = validatedContract("scout", [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["dublin"] } }], TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2)
+    expect(evaluateTaskGraphVerification(typed, locationProjection([
+      { jobId: "job-1", status: "missing", location: null },
+    ]))).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_missing" })
+    expect(evaluateTaskGraphVerification(typed, locationProjection([
+      { jobId: "job-1", status: "conflicting", location: null },
+    ]))).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_ambiguous" })
+    expect(evaluateTaskGraphVerification(typed, projectionForScout(["job-1"])))
+      .toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_missing" })
+    const invalidV1 = { ...contract("scout", [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["dublin"] } }]),
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } as unknown as TaskGraphVerificationContract
+    expect(evaluateTaskGraphVerification(invalidV1, locationProjection([{ jobId: "job-1", status: "verified", location: "dublin" }])))
+      .toMatchObject({ status: "unverified", reasonCode: "contract_invalid" })
+  })
+
   it("evaluates Scout counts only after candidate evidence IDs bind to canonical persisted evidence", () => {
     const scout = scoutProjection()
     const typed = validatedContract("scout", [
@@ -432,6 +482,15 @@ describe("TaskGraph durable evidence verification", () => {
     }, dependencies)).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
     expect(evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst(typed, {
       ...emptyAnalyst, evidenceIds: ["read:source:jobs.discover:" + "a".repeat(64)],
+    }, dependencies)).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
+
+    const emptyAnalystV2: TaskGraphVerificationEvidenceProjection = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, role: "analyst", findings: [], evidenceIds: [],
+    }
+    expect(evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst(typed, emptyAnalystV2, dependencies))
+      .toMatchObject({ status: "failed", reasonCode: "criterion_not_met" })
+    expect(evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst(typed, {
+      ...emptyAnalystV2, emptyDiscoveryReceipt: { digest: "a".repeat(64) },
     }, dependencies)).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
   })
   it("keeps empty membership vacuous and leaves minimum counts as independent checks", () => {

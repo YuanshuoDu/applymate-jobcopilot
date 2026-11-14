@@ -218,23 +218,43 @@ describe("coordination executors", () => {
     }
   })
 
-  it("keeps root spawn behavior unchanged when requirements are absent or invalid", async () => {
+  it("keeps root spawn behavior available when requirements are absent", async () => {
     const rootContext = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
-    for (const requirements of [
-      { status: "absent" },
-      { status: "invalid" },
-    ] satisfies readonly RootTaskVerificationRequirementsResolution[]) {
-      const runtime = makeRuntime()
-      const result = await executeSpawn(rootContext, {
-        idempotencyKey: `prose-only-${requirements.status}`, role: "scout", taskType: "inspect", goal: "Inspect",
-      }, { ...runtime.options, verificationRequirements: requirements })
+    const runtime = makeRuntime()
+    const result = await executeSpawn(rootContext, {
+      idempotencyKey: "requirements-absent", role: "scout", taskType: "inspect", goal: "Inspect",
+    }, { ...runtime.options, verificationRequirements: { status: "absent" } })
 
-      expect(result).toMatchObject({ taskId: "child-1", parentTaskId: "root-1", replay: false })
-      expect(runtime.manager.spawn).toHaveBeenCalledOnce()
-    }
+    expect(result).toMatchObject({ taskId: "child-1", parentTaskId: "root-1", replay: false })
+    expect(runtime.manager.spawn).toHaveBeenCalledOnce()
   })
 
-  it("preserves native and legacy follow-up routes for invalid canonical requirements", async () => {
+  it("fails closed before root spawn side effects when canonical requirements are invalid", async () => {
+    const invalidRequirements = resolveRootTaskVerificationRequirements({ input: {
+      verificationRequirements: { schemaVersion: "unsupported", privateMalformedValue: "must-not-be-used" },
+    } })
+    expect(invalidRequirements).toEqual({ status: "invalid" })
+
+    const runtime = makeRuntime()
+    const rootContext = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
+    const getSpawnReplay = vi.spyOn(runtime.store, "getSpawnReplay")
+    const recordSpawn = vi.spyOn(runtime.store, "recordSpawn")
+    const appendActivity = vi.spyOn(runtime.store, "appendActivity")
+
+    await expect(executeSpawn(rootContext, {
+      idempotencyKey: "invalid-root-spawn", role: "scout", taskType: "inspect", goal: "Inspect",
+    }, { ...runtime.options, verificationRequirements: invalidRequirements }))
+      .rejects.toMatchObject({ code: "coordination_objective_requirements_invalid" })
+
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(getSpawnReplay).not.toHaveBeenCalled()
+    expect(recordSpawn).not.toHaveBeenCalled()
+    expect(appendActivity).not.toHaveBeenCalled()
+    expect(runtime.store.spawnOperations.size).toBe(0)
+    expect(runtime.store.activities).toHaveLength(0)
+  })
+
+  it("fails closed before legacy and native follow-up side effects for invalid requirements", async () => {
     const invalidRequirements = resolveRootTaskVerificationRequirements({ input: {
       verificationRequirements: { schemaVersion: "unsupported", privateMalformedValue: "must-not-be-used" },
     } })
@@ -247,11 +267,19 @@ describe("coordination executors", () => {
     })
     const legacy = makeRuntime()
     legacy.store.tasks.set(source.id, source)
-    const legacyResult = await executeFollowup(rootContext, {
+    const legacyLookup = vi.spyOn(legacy.store, "getTask")
+    await expect(executeFollowup(rootContext, {
       idempotencyKey: "invalid-legacy-followup", taskId: source.id, goal: "Continue the investigation",
-    }, { ...legacy.options, verificationRequirements: invalidRequirements })
-    expect(legacyResult).toMatchObject({ sourceTaskId: source.id, parentTaskId: "root-1", replay: false })
-    expect(legacy.manager.spawn).toHaveBeenCalledOnce()
+    }, { ...legacy.options, verificationRequirements: invalidRequirements }))
+      .rejects.toMatchObject({ code: "coordination_objective_requirements_invalid" })
+    await expect(executeFollowup(rootContext, {
+      idempotencyKey: "invalid-legacy-replacement", taskId: "queued-source", goal: "Replace the unstarted task",
+      mode: "replace_unstarted", expectedRevision: 1,
+    }, { ...legacy.options, verificationRequirements: invalidRequirements }))
+      .rejects.toMatchObject({ code: "coordination_objective_requirements_invalid" })
+    expect(legacy.manager.spawn).not.toHaveBeenCalled()
+    expect(legacyLookup).not.toHaveBeenCalled()
+    expect(legacy.store.activities).toHaveLength(0)
 
     const nativeReceipt: TaskGraphNativeCommandReceipt = {
       status: "accepted", replay: false, operationId: "invalid-followup-operation", requestFingerprint: "e".repeat(64),
@@ -274,29 +302,17 @@ describe("coordination executors", () => {
         parentLeaseOwner: "worker-1", parentAttemptCount: () => 2,
       },
     }
-    const nativeResult = await executeFollowup(rootContext, {
+    await expect(executeFollowup(rootContext, {
       idempotencyKey: "invalid-native-followup", taskId: source.id, goal: "Continue natively",
-    }, nativeOptions)
-    const replacementResult = await executeFollowup(rootContext, {
+    }, nativeOptions)).rejects.toMatchObject({ code: "coordination_objective_requirements_invalid" })
+    await expect(executeFollowup(rootContext, {
       idempotencyKey: "invalid-native-replacement", taskId: "queued-source", goal: "Replace the unstarted task",
       mode: "replace_unstarted", expectedRevision: 1,
-    }, nativeOptions)
-    expect(nativeResult).toMatchObject({ taskId: "native-followup-child", sourceTaskId: source.id, replay: false })
-    expect(replacementResult).toMatchObject({ taskId: "native-followup-child", sourceTaskId: "queued-source", replay: false })
-    expect(nativeRequests.map(request => request.request.kind)).toEqual(["followup", "followup"])
-    expect(nativeRequests[1]?.request).toMatchObject({ mode: "replace_unstarted", expectedRevision: 1 })
-    expect(commandPort.appendNativeCoordination).toHaveBeenCalledTimes(2)
+    }, nativeOptions)).rejects.toMatchObject({ code: "coordination_objective_requirements_invalid" })
+    expect(nativeRequests).toHaveLength(0)
+    expect(commandPort.appendNativeCoordination).not.toHaveBeenCalled()
     expect(native.manager.spawn).not.toHaveBeenCalled()
-
-    const legacyReplacement = makeRuntime()
-    const legacyReplacementLookup = vi.spyOn(legacyReplacement.store, "getTask")
-    await expect(executeFollowup(rootContext, {
-      idempotencyKey: "invalid-legacy-replacement", taskId: "queued-source", goal: "Replace the unstarted task",
-      mode: "replace_unstarted", expectedRevision: 1,
-    }, { ...legacyReplacement.options, verificationRequirements: invalidRequirements }))
-      .rejects.toMatchObject({ code: "coordination_native_replacement_unavailable" })
-    expect(legacyReplacement.manager.spawn).not.toHaveBeenCalled()
-    expect(legacyReplacementLookup).not.toHaveBeenCalled()
+    expect(native.store.activities).toHaveLength(0)
   })
 
   it("spawns through the manager, records durable dispatch, and replays by key", async () => {

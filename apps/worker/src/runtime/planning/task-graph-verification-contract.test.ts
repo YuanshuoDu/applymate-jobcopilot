@@ -1,19 +1,45 @@
 import { describe, expect, it } from "vitest"
 import {
   TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2,
   validateTaskGraphVerificationContract,
   type TaskGraphVerificationCheck,
+  type TaskGraphVerificationSchemaVersion,
 } from "./task-graph-verification-contract.js"
 
-function contract(role: "scout" | "analyst", checks: readonly TaskGraphVerificationCheck[] | readonly unknown[]) {
+function contract(role: "scout" | "analyst", checks: readonly TaskGraphVerificationCheck[] | readonly unknown[],
+  schemaVersion: TaskGraphVerificationSchemaVersion = TASK_GRAPH_VERIFICATION_SCHEMA_VERSION) {
   return {
-    schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+    schemaVersion,
     role,
     criteria: checks.map((check, index) => ({ id: `check-${index + 1}`, check })),
   }
 }
 
 describe("TaskGraph verification contract", () => {
+  it("keeps v1 count checks unchanged and permits observed-location checks only in v2 Scout contracts", () => {
+    const check = { kind: "candidate_location_in", locations: ["Dublin", "BERLIN", "dublin"] }
+    expect(validateTaskGraphVerificationContract(contract("scout", [check]), "scout"))
+      .toMatchObject({ ok: false, error: { code: "unknown_check" } })
+    expect(validateTaskGraphVerificationContract(contract("scout", [check], TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2), "scout"))
+      .toEqual({ ok: true, contract: {
+        schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+        criteria: [{ id: "check-1", check: { kind: "candidate_location_in", locations: ["berlin", "dublin"] } }],
+      } })
+    expect(validateTaskGraphVerificationContract(contract("analyst", [check], TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2), "analyst"))
+      .toMatchObject({ ok: false, error: { code: "unknown_check" } })
+  })
+
+  it.each([
+    ["empty", []], ["too many", Array.from({ length: 9 }, (_, index) => `place-${index}`)],
+    ["invalid entry", ["Dublin", 3]], ["unknown field", { 0: "Dublin", extra: true, length: 1 }],
+  ])("rejects malformed v2 location allowlists: %s", (_label, locations) => {
+    expect(validateTaskGraphVerificationContract(contract("scout", [
+      { kind: "candidate_location_in", locations },
+    ], TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2), "scout"))
+      .toMatchObject({ ok: false, error: { code: "invalid_shape" } })
+  })
+
   it("keeps existing scalar check shapes compatible", () => {
     const parsed = validateTaskGraphVerificationContract(contract("analyst", [
       { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-a" },

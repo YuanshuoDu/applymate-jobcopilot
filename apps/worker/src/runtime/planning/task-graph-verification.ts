@@ -1,4 +1,5 @@
 import {
+  TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION,
   TASK_GRAPH_VERIFICATION_LIMITS,
   evaluateFindingsCoverScoutCandidates,
   evaluateFindingsFromScoutDependency,
@@ -7,15 +8,16 @@ import {
   taskGraphVerificationDependencyNodeKeys,
 } from "./task-graph-verification-cross-node.js"
 import type { TaskGraphVerificationDependencyEvidence, TaskGraphVerificationEvidenceProjection, TaskGraphVerificationParsedProjection } from "./task-graph-verification-cross-node.js"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./task-graph-verification-contract.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "./task-graph-verification-contract.js"
 import { TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION } from "./task-graph-verification-cross-node.js"
 import type { TaskGraphVerificationCheck, TaskGraphVerificationContract, TaskGraphVerificationEvaluation, TaskGraphVerificationReasonCode } from "./task-graph-verification-contract.js"
+import { normalizeAgentLocation } from "@jobcopilot/shared"
 import { evaluateFindingsCoverEachScoutCandidates, evaluateFindingsCoverScoutCandidateUnion, evaluateFindingsFromScoutUnion } from "./task-graph-verification-scout-union.js"
 
-export { TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_LIMITS, taskGraphVerificationDependencyNodeKeys, validateTaskGraphVerificationDependencySelectors } from "./task-graph-verification-cross-node.js"
-export type { TaskGraphVerificationCandidateProjection, TaskGraphEmptyDiscoveryReceiptProjection, TaskGraphVerificationDependencyEvidence, TaskGraphVerificationDependencyGraphNode, TaskGraphVerificationEvidenceProjection, TaskGraphVerificationFindingProjection } from "./task-graph-verification-cross-node.js"
-export { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, taskGraphVerificationRole, validateTaskGraphVerificationContract } from "./task-graph-verification-contract.js"
-export type { TaskGraphVerificationCheck, TaskGraphVerificationContract, TaskGraphVerificationCriterion, TaskGraphVerificationCriterionResult, TaskGraphVerificationEvaluation, TaskGraphVerificationReasonCode, TaskGraphVerificationRole, TaskGraphVerificationValidation, TaskGraphVerificationValidationError } from "./task-graph-verification-contract.js"
+export { TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_LIMITS, taskGraphVerificationDependencyNodeKeys, validateTaskGraphVerificationDependencySelectors } from "./task-graph-verification-cross-node.js"
+export type { TaskGraphVerificationCandidateProjection, TaskGraphVerificationCandidateProjectionV2, TaskGraphEmptyDiscoveryReceiptProjection, TaskGraphVerificationDependencyEvidence, TaskGraphVerificationDependencyGraphNode, TaskGraphVerificationEvidenceProjection, TaskGraphVerificationFindingProjection } from "./task-graph-verification-cross-node.js"
+export { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, taskGraphVerificationRole, validateTaskGraphVerificationContract } from "./task-graph-verification-contract.js"
+export type { TaskGraphVerificationCheck, TaskGraphVerificationContract, TaskGraphVerificationCriterion, TaskGraphVerificationCriterionResult, TaskGraphVerificationEvaluation, TaskGraphVerificationReasonCode, TaskGraphVerificationRole, TaskGraphVerificationSchemaVersion, TaskGraphVerificationValidation, TaskGraphVerificationValidationError } from "./task-graph-verification-contract.js"
 export { remapTaskGraphVerificationCheckDependencies, taskGraphVerificationCheckDependencyNodeKeys } from "./task-graph-verification-scout-union.js"
 
 function exactRecord(value: unknown, keys: string): Record<string, unknown> | undefined {
@@ -65,8 +67,24 @@ export function validateScheduledPrepareDependencyEvidence(value: unknown): bool
 function unverifiedEvaluation(contract: TaskGraphVerificationContract, reasonCode: TaskGraphVerificationReasonCode): TaskGraphVerificationEvaluation {
   return { status: "unverified", reasonCode, criteria: contract.criteria.map(c => ({ criterionId: c.id, status: "unverified", reasonCode })) }
 }
-type CheckEvaluation = "passed" | "criterion_not_met" | "reported_score_below_minimum"
+type CheckEvaluation = "passed" | "criterion_not_met" | "reported_score_below_minimum" | "canonical_evidence_missing" | "canonical_evidence_ambiguous"
 function evaluateCheck(check: TaskGraphVerificationCheck, p: TaskGraphVerificationParsedProjection, verifiedEmptyDiscovery: boolean): CheckEvaluation {
+  if (check.kind === "candidate_location_in") {
+    if (p.role !== "scout") return "criterion_not_met"
+    if (p.schemaVersion !== TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION) return "canonical_evidence_missing"
+    if (p.items.length === 0) return "criterion_not_met"
+    let unverified: "canonical_evidence_missing" | "canonical_evidence_ambiguous" | undefined
+    for (const item of p.items) {
+      if (item.locationEvidenceStatus === "conflicting") unverified = "canonical_evidence_ambiguous"
+      else if (item.locationEvidenceStatus !== "verified" || typeof item.observedLocation !== "string") unverified ??= "canonical_evidence_missing"
+      else {
+        const location = normalizeAgentLocation(item.observedLocation)
+        if (!location) unverified ??= "canonical_evidence_missing"
+        else if (!check.locations.includes(location)) return "criterion_not_met"
+      }
+    }
+    return unverified ?? "passed"
+  }
   if (check.kind === "findings_from_scout_dependency" || check.kind === "findings_cover_scout_candidates_gte"
     || check.kind === "findings_from_scout_union" || check.kind === "findings_cover_scout_candidate_union_gte"
     || check.kind === "findings_cover_each_scout_candidates_gte") return "criterion_not_met"
@@ -104,7 +122,11 @@ export function evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst(
 
 function evaluateTaskGraphVerificationInternal(contract: TaskGraphVerificationContract, projectionValue: TaskGraphVerificationEvidenceProjection, dependencyEvidence?: TaskGraphVerificationDependencyEvidence, verifiedEmptyDiscoveryDigest?: string, allowExactEmptyAnalyst = false): TaskGraphVerificationEvaluation {
   try {
-    if (contract.schemaVersion !== TASK_GRAPH_VERIFICATION_SCHEMA_VERSION || (contract.role !== "scout" && contract.role !== "analyst") || !Array.isArray(contract.criteria) || contract.criteria.length < 1 || contract.criteria.length > TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria) return { status: "unverified", reasonCode: "contract_invalid", criteria: [] }
+    if ((contract.schemaVersion !== TASK_GRAPH_VERIFICATION_SCHEMA_VERSION && contract.schemaVersion !== TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2)
+      || (contract.role !== "scout" && contract.role !== "analyst") || !Array.isArray(contract.criteria)
+      || contract.criteria.length < 1 || contract.criteria.length > TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria) return { status: "unverified", reasonCode: "contract_invalid", criteria: [] }
+    if (contract.schemaVersion === TASK_GRAPH_VERIFICATION_SCHEMA_VERSION
+      && contract.criteria.some(item => item.check.kind === "candidate_location_in")) return { status: "unverified", reasonCode: "contract_invalid", criteria: [] }
     const parsed = allowExactEmptyAnalyst
       ? parseExactEmptyAnalystProjection(projectionValue)
       : parseTaskGraphVerificationEvidenceProjection(projectionValue)
@@ -131,10 +153,17 @@ function evaluateTaskGraphVerificationInternal(contract: TaskGraphVerificationCo
               : check.kind === "findings_cover_each_scout_candidates_gte"
                 ? evaluateFindingsCoverEachScoutCandidates(check.dependencyNodeKeys, findingJobIds, dependencies, check.minimumPercent)
               : evaluateCheck(check, parsed.value, verifiedEmptyDiscovery)
-      return result === "passed" ? { criterionId: c.id, status: "passed" as const, reasonCode: "criteria_met" as const } : { criterionId: c.id, status: "failed" as const, reasonCode: result }
+      if (result === "passed") return { criterionId: c.id, status: "passed" as const, reasonCode: "criteria_met" as const }
+      if (result === "canonical_evidence_missing" || result === "canonical_evidence_ambiguous") {
+        return { criterionId: c.id, status: "unverified" as const, reasonCode: result }
+      }
+      return { criterionId: c.id, status: "failed" as const, reasonCode: result }
     })
     const failed = criteria.find(c => c.status === "failed")
-    return failed ? { status: "failed", reasonCode: failed.reasonCode, criteria } : { status: "passed", reasonCode: "criteria_met", criteria }
+    if (failed) return { status: "failed", reasonCode: failed.reasonCode, criteria }
+    const unverified = criteria.find(c => c.status === "unverified")
+    return unverified ? { status: "unverified", reasonCode: unverified.reasonCode, criteria }
+      : { status: "passed", reasonCode: "criteria_met", criteria }
   } catch { return { status: "unverified", reasonCode: "contract_invalid", criteria: [] } }
 }
 
@@ -146,10 +175,14 @@ function parseExactEmptyAnalystProjection(value: unknown): ReturnType<typeof par
   const row = exactPlainRecord(value, "evidenceIds,findings,role,schemaVersion")
   const evidenceIds = row && exactEmptyArray(row.evidenceIds) ? row.evidenceIds : undefined
   const findings = row && exactEmptyArray(row.findings) ? row.findings : undefined
-  if (!row || row.schemaVersion !== TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION || row.role !== "analyst" || !evidenceIds || !findings) {
+  const schemaVersion = row?.schemaVersion === TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION
+    ? TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION
+    : row?.schemaVersion === TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION
+      ? TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION : undefined
+  if (!row || !schemaVersion || row.role !== "analyst" || !evidenceIds || !findings) {
     return { ok: false, reasonCode: "canonical_evidence_invalid" }
   }
-  return { ok: true, value: { role: "analyst", items: [], evidenceIds: [] } }
+  return { ok: true, value: { schemaVersion, role: "analyst", items: [], evidenceIds: [] } }
 }
 
 function exactPlainRecord(value: unknown, keys: string): Record<string, unknown> | undefined {

@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto"
 import type pg from "pg"
 import { describe, expect, it, vi } from "vitest"
-import { TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationEvidenceProjection } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, type TaskGraphVerificationEvidenceProjection } from "../planning/task-graph-verification.js"
 import { SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION } from "./scheduled-automation-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { parseTaskGraphSnapshot, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION } from "./task-graph-verification-report.js"
-import { TASK_GRAPH_VERIFIER_VERSION, verifyCompletedTaskGraphNodeEvidence, verifyTaskGraphNodeEvidence, type TaskGraphVerificationScope } from "./task-graph-pg-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION, reverifyFailedTaskGraphNodeEvidence, verifyCompletedTaskGraphNodeEvidence, verifyTaskGraphNodeEvidence, type TaskGraphVerificationScope } from "./task-graph-pg-verification.js"
 
 const scope: TaskGraphVerificationScope = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
@@ -26,6 +26,13 @@ const snapshot = parseTaskGraphSnapshot({ schemaVersion: "agent-harness.v2.task-
   taskId: scope.taskId, verificationDisposition: "typed", verification,
 }] })
 const node = snapshot.nodes[0] as StoredTaskGraphNode
+function locationGraph(locations: readonly string[]) {
+  const graph = parseTaskGraphSnapshot({ schemaVersion: snapshot.schemaVersion, nodes: [{ ...node, verification: {
+    schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout" as const,
+    criteria: [...verification.criteria, { id: "candidate-location", check: { kind: "candidate_location_in" as const, locations } }],
+  } }] })
+  return { snapshot: graph, node: graph.nodes[0] as StoredTaskGraphNode }
+}
 const emptyScoutResult = {
   schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
   candidates: [], evidence: [], summary: "No matching jobs",
@@ -327,7 +334,7 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
     const createClient = (options: { persistedResult?: unknown; analystItems?: Record<string, unknown>[]; analystEvents?: Record<string, unknown>[] } = {}) => {
       const analystTask = { ...scoutTask, id: analystScope.taskId, status: "completed", role: "analyst", result: Object.hasOwn(options, "persistedResult") ? options.persistedResult : { status: "completed", structuredResult: emptyAnalystResult } }
       const query = vi.fn(async (sql: string, values?: unknown[]) => {
-      if (sql.includes('task."failureReason"')) return { rows: [scoutTask], rowCount: 1 }
+      if (sql.includes('task."failureReason"')) return { rows: [values?.[0] === scope.taskId ? scoutTask : analystTask], rowCount: 1 }
       if (sql.includes('SELECT task."id"')) return { rows: [values?.[0] === scope.taskId ? scoutTask : analystTask], rowCount: 1 }
       if (sql.includes('SELECT item."id"')) return values?.[0] === scope.taskId
         ? scoutData.query(sql, values) : { rows: options.analystItems ?? [], rowCount: options.analystItems?.length ?? 0 }
@@ -538,7 +545,8 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
     ]
     const task = { id: analystScope.taskId, sessionId: analystScope.sessionId, turnId: analystScope.turnId,
       rootTaskId: analystScope.rootTaskId, turnRootTaskId: analystScope.rootTaskId, parentTaskId: analystScope.parentTaskId,
-      attemptCount: 1, status: "completed", role: "analyst", userId: analystScope.userId }
+      attemptCount: 1, status: "completed", role: "analyst", userId: analystScope.userId,
+      result: { status: "completed", structuredResult: analystResult } }
     const query = vi.fn(async (sql: string) => {
       if (sql.includes('SELECT task."id"')) return { rows: [task], rowCount: 1 }
       if (sql.includes('SELECT item."id"')) return { rows: items, rowCount: items.length }
@@ -577,6 +585,7 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
       { criterionId: "bound-candidate", status: "passed", reasonCode: "criteria_met" },
     ])
     expect(result.projection).toMatchObject({ evidenceIds: ["read:job:job-1"], candidates: [{ jobId: "job-1", evidenceIds: ["read:job:job-1"] }] })
+    expect(result.projection?.schemaVersion).toBe(TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION)
     expect(JSON.stringify(result.report)).not.toContain("job-1")
     expect(data.query.mock.calls[0]?.[1]).toEqual([scope.taskId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId])
   })
@@ -588,6 +597,70 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
     expect(result).toMatchObject({ verified: true, report: { status: "passed" } })
     expect(result.projection).toMatchObject({ candidates: [{ jobId: "job-1", evidenceIds: ["read:job:job-1"] }] })
     expect(data.items.filter(item => item.type === "tool_call").map(item => (item.content as Record<string, unknown>).toolName)).toEqual(["jobs.get"])
+  })
+
+  it("projects the observed location from a successful current-attempt Job receipt, never from the Scout result", async () => {
+    const location = locationGraph(["dublin, ireland"])
+    const data = durableRows({ output: { jobs: [{ id: "job-1", source: "greenhouse", location: "  Dublin,   Ireland  " }] } })
+    const result = await verifyTaskGraphNodeEvidence(data.client, { scope, snapshot: location.snapshot, node: location.node, structuredResult })
+
+    expect(result.verified).toBe(true)
+    expect(result.projection).toMatchObject({
+      schemaVersion: "agent-harness.v2.task-graph-verification-evidence.v2",
+      candidates: [{ jobId: "job-1", observedLocation: "dublin, ireland", locationEvidenceStatus: "verified" }],
+    })
+
+    const claimed = { ...structuredResult, candidates: [{ ...structuredResult.candidates[0], observedLocation: "Dublin" }] }
+    const forged = await verifyTaskGraphNodeEvidence(data.client, { scope, snapshot: location.snapshot, node: location.node, structuredResult: claimed })
+    expect(forged).toMatchObject({ verified: false, report: { status: "unverified", reasonCode: "result_invalid" } })
+  })
+
+  it("fails a verified location predicate for a trusted nonmatch and leaves missing location unverified", async () => {
+    const cork = locationGraph(["cork"])
+    const matchingReceipt = durableRows({ output: { jobs: [{ id: "job-1", source: "greenhouse", location: "Dublin" }] } })
+    const mismatch = await verifyTaskGraphNodeEvidence(matchingReceipt.client, { scope, snapshot: cork.snapshot, node: cork.node, structuredResult })
+    expect(mismatch).toMatchObject({ verified: false, report: { status: "failed", reasonCode: "criterion_not_met" } })
+
+    const missingReceipt = durableRows({ output: { jobs: [{ id: "job-1", source: "greenhouse" }] } })
+    const missing = await verifyTaskGraphNodeEvidence(missingReceipt.client, { scope, snapshot: cork.snapshot, node: cork.node, structuredResult })
+    expect(missing).toMatchObject({ verified: false, report: { status: "unverified", reasonCode: "canonical_evidence_missing" } })
+  })
+
+  it("does not reverify a failed partial if the persisted current-attempt role result changed", async () => {
+    const location = locationGraph(["dublin"]), persisted = { ...structuredResult, summary: "different persisted result" }
+    const data = durableRows({ task: {
+      id: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+      turnRootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, attemptCount: scope.attemptCount,
+      status: "failed", role: "scout", failureReason: "task_graph_verification_failed", userId: scope.userId,
+      result: { status: "completed", structuredResult: persisted },
+    } })
+    const proof = await reverifyFailedTaskGraphNodeEvidence(data.client, {
+      scope, snapshot: location.snapshot, node: location.node, structuredResult,
+    })
+    expect(proof).toMatchObject({ verified: false, report: { status: "unverified", reasonCode: "result_invalid" } })
+    expect(data.query).toHaveBeenCalledOnce()
+  })
+
+  it("projects conflicting current location observations as unverified evidence", async () => {
+    const location = locationGraph(["dublin", "cork"])
+    const data = durableRows({ toolName: "jobs.get", output: { job: { id: "job-1", source: "greenhouse", location: "Dublin" } } })
+    const firstCall = data.items[0]!, firstResult = data.items[1]!
+    const secondCall = { ...firstCall, id: "call-item-2", stepId: "step-2", joinedStepId: "step-2", ordinal: 1,
+      content: { ...(firstCall.content as Record<string, unknown>), toolCallId: "call-2" } }
+    const secondResult = { ...firstResult, id: "result-item-2", stepId: "step-2", joinedStepId: "step-2", ordinal: 1,
+      content: { toolCallId: "call-2", output: { job: { id: "job-1", source: "greenhouse", location: "Cork" } }, errorCode: null } }
+    data.items.push(secondCall, secondResult)
+    const started = data.events[0]!, completed = data.events[1]!
+    data.events.push(
+      { ...started, id: "started-2", itemId: secondCall.id, correlationId: "call-2", sequence: 3,
+        payload: { ...(started.payload as Record<string, unknown>), toolCallId: "call-2" } },
+      { ...completed, id: "completed-2", itemId: secondCall.id, correlationId: "call-2", sequence: 4,
+        payload: { ...(completed.payload as Record<string, unknown>), toolCallId: "call-2" } },
+    )
+
+    const result = await verifyTaskGraphNodeEvidence(data.client, { scope, snapshot: location.snapshot, node: location.node, structuredResult })
+    expect(result).toMatchObject({ verified: false, report: { status: "unverified", reasonCode: "canonical_evidence_ambiguous" } })
+    expect(result.projection).toMatchObject({ candidates: [{ jobId: "job-1", observedLocation: null, locationEvidenceStatus: "conflicting" }] })
   })
 
   it("does not verify a Scout candidate from historical job receipts without current-attempt reads", async () => {

@@ -204,6 +204,7 @@ export function buildTaskGraphTaskLookupUrl(sessionId: string | null, items: rea
   query.set('graphTurnId', identity.turnId)
   query.set('rootTaskId', identity.rootTaskId)
   query.set('graphRevision', String(identity.revision))
+  query.set('verificationSummaryVersion', '2')
   return `/api/agent/sessions/${encodeURIComponent(sessionId)}/tasks?${query.toString()}`
 }
 

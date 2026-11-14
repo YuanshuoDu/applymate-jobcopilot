@@ -1,10 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { Prisma } from '@prisma/client'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({ requireAdmin: vi.fn(), queryRaw: vi.fn(), quotaFindMany: vi.fn(), jobAggregate: vi.fn(), aiAggregate: vi.fn() }))
 vi.mock('@/lib/admin/authorization', () => ({ requireAdmin: mocks.requireAdmin, isAdminResponse: (value: unknown) => value instanceof NextResponse }))
 vi.mock('@/lib/db', () => ({ db: { $queryRaw: mocks.queryRaw, apiQuota: { findMany: mocks.quotaFindMany }, jobApiUsageEvent: { aggregate: mocks.jobAggregate }, aiUsageEvent: { aggregate: mocks.aiAggregate } } }))
 import { GET } from './route'
+
+function capturedSql(call: readonly unknown[]) {
+  const [template, ...values] = call
+  if (!Array.isArray(template) || !('raw' in template)) throw new Error('Expected a Prisma tagged query')
+  const query = Prisma.sql(template as TemplateStringsArray, ...(values as never[]))
+  return { text: query.text, values: query.values }
+}
 
 describe('GET /api/admin/v1/api-usage', () => {
   beforeEach(() => {
@@ -50,6 +58,45 @@ describe('GET /api/admin/v1/api-usage', () => {
     const response = await GET(new NextRequest('http://localhost/api/admin/v1/api-usage'))
     const payload = await response.json()
     expect(Object.fromEntries(payload.quotas.map((quota: { metric: string; used: number }) => [quota.metric, quota.used]))).toEqual({ input_tokens: 111, output_tokens: 22, cost_usd: 0.75 })
+  })
+
+  it('excludes pending AI reservations from completed summaries and quota totals', async () => {
+    mocks.queryRaw.mockReset()
+    mocks.queryRaw
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ provider: 'minimax', model: 'MiniMax-M3', credentialSource: 'platform', calls: 2, inputTokens: 50, outputTokens: 15, cost: 0.03, errors: 1, avgLatency: 80, lastEventAt: new Date('2026-11-12T11:00:00Z') }])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ day: new Date('2026-11-12T00:00:00Z'), category: 'ai', calls: 2, errors: 1, units: 65, cost: 0.03 }])
+      .mockResolvedValueOnce([{ userId: 'user-1', category: 'ai', calls: 2, jobs: 0, tokens: 65, bytes: 0, cost: 0.03, errors: 1, avgLatency: 80, lastEventAt: new Date('2026-11-12T11:00:00Z') }])
+      .mockResolvedValueOnce([{ userId: 'user-1', category: 'ai', provider: 'minimax', operationModel: 'MiniMax-M3', featureKey: 'agent', runtime: 'worker', credentialSource: 'platform', calls: 2, jobs: 0, tokens: 65, bytes: 0, cost: 0.03, errors: 1, avgLatency: 80, lastEventAt: new Date('2026-11-12T11:00:00Z') }])
+      .mockResolvedValueOnce([])
+    mocks.quotaFindMany.mockResolvedValue([{ id: 'out', category: 'ai', provider: 'minimax', operation: '*', metric: 'output_tokens', planName: 'Platform', period: 'month', limit: 1000, resetDay: 1 }])
+    mocks.aiAggregate.mockResolvedValue({ _sum: { inputTokens: 50, outputTokens: 15, estimatedCostUsd: 0.03 }, _count: 2 })
+
+    const response = await GET(new NextRequest('http://localhost/api/admin/v1/api-usage?days=7&provider=minimax&userId=user-1'))
+    const payload = await response.json()
+
+    expect(payload.ai.summary).toMatchObject({ calls: 2, tokens: 65, costUsd: 0.03, errors: 1 })
+    expect(payload.trend).toContainEqual(expect.objectContaining({ category: 'ai', calls: 2, units: 65, cost: 0.03 }))
+    expect(payload.users).toContainEqual(expect.objectContaining({ userId: 'user-1', category: 'ai', calls: 2, tokens: 65 }))
+    expect(payload.userDetails).toContainEqual(expect.objectContaining({ userId: 'user-1', provider: 'minimax', calls: 2, tokens: 65 }))
+    expect(payload.quotas).toContainEqual(expect.objectContaining({ metric: 'output_tokens', used: 15 }))
+
+    const statements = mocks.queryRaw.mock.calls.map(capturedSql)
+    const aiStatements = statements.filter(statement => statement.text.includes('ai_usage_events'))
+    expect(aiStatements).toHaveLength(4)
+    for (const statement of aiStatements) {
+      expect(statement.text).toContain("status IN ('success', 'error')")
+      expect(statement.text).toMatch(/created_at >= \$\d+/)
+      expect(statement.values.some(value => value instanceof Date)).toBe(true)
+      expect(statement.values).toContain('minimax')
+    }
+    const userDetail = aiStatements.find(statement => statement.text.includes('WHERE user_id ='))
+    expect(userDetail?.text).toMatch(/user_id = \$\d+/)
+    expect(userDetail?.values).toContain('user-1')
+    expect(mocks.aiAggregate).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ provider: 'minimax', credentialSource: 'platform', status: { in: ['success', 'error'] }, createdAt: expect.objectContaining({ gte: expect.any(Date), lt: expect.any(Date) }) }),
+    }))
   })
 
   it('rejects malformed provider filters before querying usage', async () => {

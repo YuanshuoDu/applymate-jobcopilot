@@ -5,7 +5,7 @@ import React, { useMemo } from 'react'
 import { parseTaskGraphVerificationSummary, type TaskGraphVerificationSummary as TaskGraphVerificationSummaryDto } from '@jobcopilot/agent-protocol'
 import { useI18n, type Lang } from '@/lib/i18n'
 import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '@/lib/task-graph-plan-labels'
-import { parsePlanLedgerWithRepairTargets, type PlanLedgerWithRepairTargetGoals } from '@/lib/task-graph-repair-display'
+import { parsePlanLedgerWithRepairTargets, projectRepairAttentionSummaries, type PlanLedgerWithRepairTargetGoals } from '@/lib/task-graph-repair-display'
 
 import { projectCurrentTaskGraph, type TaskGraphEvidencePreview, type TaskGraphPlanReadiness, type TaskGraphPlanStatus } from './task-graph-plan'
 import { selectedTaskGraphIdentity, type TaskGraphIdentity } from './task-graph-plan-query'
@@ -147,6 +147,7 @@ function TaskGraphPlanSection({ plan, verificationSummary, sessionId, lang, t }:
   readonly lang: Lang
   readonly t: (key: string) => string
 }) {
+  const repairAttention = projectRepairAttentionSummaries(plan, verificationSummary)
   return (
     <section
       aria-label={taskGraphPlanLabel(lang, 'agent.taskGraph.currentPlan')}
@@ -163,6 +164,7 @@ function TaskGraphPlanSection({ plan, verificationSummary, sessionId, lang, t }:
           <li key={node.key} style={nodeStyle}>
             <strong style={goalStyle}>{node.goal}</strong>
             {node.repairTargetGoal && <div data-task-graph-repair-target="true">{taskGraphPlanLabel(lang, 'agent.taskGraph.repairAttemptFor')} {node.repairTargetGoal}</div>}
+            {repairAttention[index] && <div data-task-graph-repair-attention="true"><strong>{taskGraphPlanLabel(lang, 'agent.taskGraph.repairChecksNeedingAttention')}</strong><TaskGraphVerificationSummary node={repairAttention[index]} lang={lang} /></div>}
             {verificationSummary && <TaskGraphVerificationSummary node={verificationSummary.nodes[index]} lang={lang} />}
             <div>{t('agent.status')}: {node.status ? taskGraphPlanLabel(lang, STATUS_LABELS[node.status]) : taskGraphPlanLabel(lang, 'agent.taskGraph.statusUnavailable')}</div>
             {node.evidencePreview

@@ -177,6 +177,10 @@ export function assertRootChildCreationUsesCoveragePlan(
   context: ToolExecutionContext,
   requirements: RootTaskVerificationRequirementsResolution | undefined,
 ): void {
+  if (requirements?.status === "invalid") throw new CoordinationError(
+    "coordination_objective_requirements_invalid",
+    "Child work is unavailable because the canonical objective requirements are invalid",
+  )
   if (requirements?.status !== "valid" || context.actorRole === "subagent") return
   const currentTaskId = context.taskId
   const currentRootTaskId = context.rootTaskId

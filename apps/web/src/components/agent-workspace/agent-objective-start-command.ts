@@ -1,4 +1,6 @@
 import { schemaVersion } from "@jobcopilot/agent-protocol"
+import { normalizeAgentLocationAllowlist } from "@jobcopilot/shared/agent-location-normalization"
+import type { ObjectiveVerificationRequirements } from "@/lib/agent/control-plane/commands/types"
 
 export interface ObjectiveContextDraft {
   readonly objective: string
@@ -17,6 +19,9 @@ export interface ObjectiveStartResult {
 interface ObjectiveStartAttempt extends ObjectiveContextDraft {
   readonly objectiveDraft: string
   readonly contextDraft: string
+  readonly allowedLocationsDraft: string
+  readonly requirementsDraftKey: string
+  readonly verificationRequirements?: ObjectiveVerificationRequirements
   readonly clientMessageId: string
 }
 
@@ -37,6 +42,9 @@ export class ObjectiveStartCommandError extends Error {
 const MAX_OBJECTIVE_BYTES = 2_000
 const MAX_CONTEXT_CHARACTERS = 20_000
 const MAX_IDENTIFIER_LENGTH = 256
+const MAX_LOCATION_DRAFT_BYTES = 2_000
+const LOCATION_REQUIREMENTS_SCHEMA_VERSION = "agent-harness.v2.objective-requirements.v2" as const
+const LOCATION_REQUIREMENT_ID = "candidate-location"
 
 export function validateObjectiveContextDraft(draft: ObjectiveContextDraft): ObjectiveContextDraft {
   const objective = typeof draft.objective === "string" ? draft.objective.trim() : ""
@@ -48,6 +56,17 @@ export function validateObjectiveContextDraft(draft: ObjectiveContextDraft): Obj
     throw invalidInput("Background context must be 20,000 characters or fewer")
   }
   return { objective, context }
+}
+
+export function normalizeAllowedLocationDraft(value: string): readonly string[] | undefined {
+  if (typeof value !== "string" || new TextEncoder().encode(value).byteLength > MAX_LOCATION_DRAFT_BYTES) {
+    throw invalidInput("Allowed locations must be 2,000 UTF-8 bytes or fewer")
+  }
+  if (value.trim() === "") return undefined
+  const entries = value.split(/\r?\n/).filter(entry => entry.trim() !== "")
+  const locations = normalizeAgentLocationAllowlist(entries)
+  if (!locations) throw invalidInput("Enter 1 to 8 allowed locations, each 128 UTF-8 bytes or fewer")
+  return locations
 }
 
 /** Coordinates explicit retries without creating a second Session or root. */
@@ -62,7 +81,12 @@ export class AgentObjectiveStartCoordinator {
     private readonly makeClientMessageId: () => string = newClientMessageId,
   ) {}
 
-  start(objectiveDraft: string, contextDraft: string): Promise<ObjectiveStartResult> {
+  start(
+    objectiveDraft: string,
+    contextDraft: string,
+    allowedLocationsDraft = "",
+    existingRequirements?: ObjectiveVerificationRequirements,
+  ): Promise<ObjectiveStartResult> {
     if (this.inFlight) return this.inFlight
     if (this.accepted) return Promise.resolve(this.accepted)
 
@@ -73,8 +97,40 @@ export class AgentObjectiveStartCoordinator {
       return Promise.reject(error)
     }
 
-    if (!this.attempt || this.attempt.objectiveDraft !== objectiveDraft || this.attempt.contextDraft !== contextDraft) {
-      this.attempt = { ...draft, objectiveDraft, contextDraft, clientMessageId: this.makeClientMessageId() }
+    let verificationRequirements: ObjectiveVerificationRequirements | undefined
+    let requirementsDraftKey: string
+    try {
+      requirementsDraftKey = JSON.stringify(existingRequirements ?? null) ?? ""
+      if (new TextEncoder().encode(requirementsDraftKey).byteLength > MAX_LOCATION_DRAFT_BYTES) {
+        throw invalidInput("Objective verification requirements exceed the command limit")
+      }
+      const locations = normalizeAllowedLocationDraft(allowedLocationsDraft)
+      if (locations) {
+        const existing = existingRequirements?.requirements ?? []
+        if (existing.some(requirement => requirement.id === LOCATION_REQUIREMENT_ID)) {
+          throw invalidInput("The candidate-location criterion ID is already in use")
+        }
+        verificationRequirements = {
+          schemaVersion: LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+          requirements: [
+            ...existing,
+            { id: LOCATION_REQUIREMENT_ID, check: { kind: "candidate_location_in", locations } },
+          ],
+        }
+      } else {
+        verificationRequirements = existingRequirements
+      }
+    } catch (error) {
+      return Promise.reject(error)
+    }
+
+    if (!this.attempt || this.attempt.objectiveDraft !== objectiveDraft || this.attempt.contextDraft !== contextDraft ||
+        this.attempt.allowedLocationsDraft !== allowedLocationsDraft || this.attempt.requirementsDraftKey !== requirementsDraftKey) {
+      this.attempt = {
+        ...draft, objectiveDraft, contextDraft, allowedLocationsDraft, requirementsDraftKey,
+        ...(verificationRequirements ? { verificationRequirements } : {}),
+        clientMessageId: this.makeClientMessageId(),
+      }
     }
     const attempt = this.attempt
     const operation = this.admit(attempt)
@@ -141,6 +197,7 @@ async function startAgentObjective(
       clientMessageId: attempt.clientMessageId,
       objective: attempt.objective,
       content: [{ type: "text", text: contentText }],
+      ...(attempt.verificationRequirements ? { verificationRequirements: attempt.verificationRequirements } : {}),
     }),
   })
   const body: unknown = await response.json().catch(() => null)

@@ -1,6 +1,8 @@
-import type { HarnessModelRequest, ModelAdapter, ModelResponse, ModelStreamEvent } from "@jobcopilot/agent-model"
+import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
+import { hasSharedAiPrice } from "@jobcopilot/shared"
 
 import type { WorkerUsageAuthorizationInput, WorkerUsageAuthorization, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
+import { resolveStartedOutput, settleWorkerUsage } from "../../queue/ai-usage-bridge.js"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { TreeBudgetReservation, TreeBudgetReservationStore } from "../subagents/tree-budget-types.js"
 import { ContextEstimateExceededError } from "./model-request-admission.js"
@@ -14,11 +16,13 @@ export type UsageAwareModelOptions = {
   readonly featureKey?: string
 }
 
-function authInput(owner: ExecutionOwnerFence, stepId: string, adapter: HarnessPreProviderRoute, featureKey: string): WorkerUsageAuthorizationInput {
+function authInput(owner: ExecutionOwnerFence, stepId: string, adapter: HarnessPreProviderRoute, featureKey: string, explicitOutputTokens?: number): WorkerUsageAuthorizationInput {
+  const requestedOutputTokens = explicitOutputTokens ?? adapter.defaultMaxOutputTokens
   const common = {
     userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, stepId,
     featureKey, provider: adapter.provider, model: adapter.model,
-    attemptId: owner.kind === "task" ? `${owner.taskId}:${owner.attemptCount}` : `${owner.turnId}:1`,
+    attemptId: "route-1",
+    ...(requestedOutputTokens == null ? {} : { requestedOutputTokens }),
   }
   return owner.kind === "task"
     ? { ...common, executionOwner: { kind: "task", taskId: owner.taskId, rootTaskId: owner.rootTaskId, ownerId: owner.ownerId, attemptCount: owner.attemptCount } }
@@ -38,10 +42,18 @@ function settlement(reservation: TreeBudgetReservation, status: "consumed" | "re
   return { ...reservation, status }
 }
 
-function usage(value: ModelResponse["usage"] | null | undefined): WorkerUsageSettlementInput {
+type ObservedUsage = { inputTokens: number; outputTokens: number; estimatedCostUsd?: number }
+
+function knownCost(value: ObservedUsage | null | undefined, provider: string, model: string): number | null {
+  const cost = value?.estimatedCostUsd ?? null
+  const observedTokens = (value?.inputTokens ?? 0) + (value?.outputTokens ?? 0)
+  return cost === 0 && observedTokens > 0 && !hasSharedAiPrice(provider, model) ? null : cost
+}
+
+function usage(value: ObservedUsage | null | undefined, provider: string, model: string): WorkerUsageSettlementInput {
   return {
-    status: "success", inputTokens: value?.inputTokens ?? 0, outputTokens: value?.outputTokens ?? 0,
-    estimatedCostUsd: value?.estimatedCostUsd ?? 0,
+    status: "success", inputTokens: value?.inputTokens ?? null, outputTokens: value?.outputTokens ?? null,
+    estimatedCostUsd: knownCost(value, provider, model),
   }
 }
 
@@ -53,7 +65,7 @@ async function runAuthorized<T>(
   options: UsageAwareModelOptions,
   request: HarnessModelRequest,
   adapter: ModelAdapter,
-  run: (request: HarnessModelRequest, markProviderAttempted: () => void, settleUsage: (value: ModelResponse["usage"]) => Promise<void>) => Promise<T>,
+  run: (request: HarnessModelRequest, markProviderAttempted: () => void, settleUsage: (value: ObservedUsage | null) => Promise<void>) => Promise<T>,
   deferAuthorization = false,
 ): Promise<T> {
   const input = reservationInput(options.owner, request.metadata.stepId)
@@ -65,12 +77,17 @@ async function runAuthorized<T>(
     await options.treeBudget.settle(settlement(reservation, status))
   }
   type Attempt = {
+    requestedOutputTokens?: number
+    provider: string
+    model: string
     authorization?: WorkerUsageAuthorization
     authorizationPromise?: Promise<WorkerUsageAuthorization>
+    admittedOutputTokens: number | null
     providerAttempted: boolean
-    inputTokens: number
-    outputTokens: number
-    estimatedCostUsd: number
+    startClaimed: boolean
+    inputTokens: number | null
+    outputTokens: number | null
+    estimatedCostUsd: number | null
     accountSettlementStarted: boolean
     accountSettlementUnknown: boolean
     releaseStarted: boolean
@@ -84,11 +101,11 @@ async function runAuthorized<T>(
     if (attempt.accountSettlementStarted || !attempt.authorization) return
     attempt.accountSettlementStarted = true
     try {
-      await attempt.authorization.settle({ status: "error", inputTokens: attempt.inputTokens, outputTokens: attempt.outputTokens, estimatedCostUsd: attempt.estimatedCostUsd, errorCode: errorCode(error) })
+      await settleWorkerUsage(attempt.authorization, { status: "error", inputTokens: attempt.inputTokens, outputTokens: attempt.outputTokens, estimatedCostUsd: attempt.estimatedCostUsd, errorCode: errorCode(error) })
     } catch { attempt.accountSettlementUnknown = true }
   }
   const releaseAttempt = async (attempt: Attempt): Promise<void> => {
-    if (attempt.accountSettlementStarted || attempt.releaseStarted || attempt.providerAttempted || !attempt.authorization) return
+    if (attempt.accountSettlementStarted || attempt.releaseStarted || attempt.startClaimed || attempt.providerAttempted || !attempt.authorization) return
     attempt.releaseStarted = true
     if (!attempt.authorization.release) { attempt.accountSettlementUnknown = true; return }
     try { await attempt.authorization.release() } catch { attempt.accountSettlementUnknown = true }
@@ -97,7 +114,7 @@ async function runAuthorized<T>(
     if (attempt.accountSettlementStarted || !attempt.authorization) return
     attempt.accountSettlementStarted = true
     try {
-      await attempt.authorization.settle({ status: "error", inputTokens: attempt.inputTokens, outputTokens: attempt.outputTokens, estimatedCostUsd: attempt.estimatedCostUsd, errorCode: code })
+      await settleWorkerUsage(attempt.authorization, { status: "error", inputTokens: attempt.inputTokens, outputTokens: attempt.outputTokens, estimatedCostUsd: attempt.estimatedCostUsd, errorCode: code })
     } catch { attempt.accountSettlementUnknown = true; throw new Error("usage_settlement_unknown") }
   }
   const authorizeRoute = async (route: HarnessPreProviderRoute): Promise<WorkerUsageAuthorization> => {
@@ -105,19 +122,33 @@ async function runAuthorized<T>(
     const key = routeKey(route)
     let attempt = attempts.get(key)
     if (!attempt) {
-      attempt = { providerAttempted: false, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, accountSettlementStarted: false, accountSettlementUnknown: false, releaseStarted: false }
+      attempt = { requestedOutputTokens: request.maxOutputTokens ?? route.defaultMaxOutputTokens ?? undefined, provider: route.provider, model: route.model, admittedOutputTokens: null, providerAttempted: false, startClaimed: false, inputTokens: null, outputTokens: null, estimatedCostUsd: null, accountSettlementStarted: false, accountSettlementUnknown: false, releaseStarted: false }
       attempts.set(key, attempt)
     }
-    if (active && active !== attempt && active.providerAttempted && !active.accountSettlementStarted) {
+    const current = attempt!
+    if (active && active !== current && active.providerAttempted && !active.accountSettlementStarted) {
       await settleRouteError(active, "provider_rerouted")
     }
-    active = attempt
-    attempt.authorizationPromise ??= Promise.resolve().then(() => options.authorize(
-      authInput(options.owner, request.metadata.stepId, route, options.featureKey ?? "autoApply"),
-    )).then(value => { attempt!.authorization = value; return value })
-    const value = await attempt.authorizationPromise
+    active = current
+    current.authorizationPromise ??= Promise.resolve().then(() => options.authorize(
+      authInput(options.owner, request.metadata.stepId, route, options.featureKey ?? "autoApply", request.maxOutputTokens),
+    )).then(value => { current.authorization = value; return value })
+    const value = await current.authorizationPromise
     if (request.signal.aborted) throw interrupted()
     return value
+  }
+  const startRoute = async (attempt: Attempt): Promise<number | null> => {
+    if (!attempt.authorization || attempt.startClaimed) throw new Error("usage_start_replayed")
+    if (request.signal.aborted) throw interrupted()
+    const authorization = attempt.authorization
+    if (!authorization.start) {
+      attempt.admittedOutputTokens = resolveStartedOutput(authorization, undefined, attempt.requestedOutputTokens)
+      attempt.startClaimed = true
+      return attempt.admittedOutputTokens
+    }
+    attempt.startClaimed = true
+    attempt.admittedOutputTokens = resolveStartedOutput(authorization, await authorization.start(), attempt.requestedOutputTokens)
+    return attempt.admittedOutputTokens
   }
   const hasUnknownAccountSettlement = () => [...attempts.values()].some(attempt => attempt.accountSettlementUnknown)
   const finishAttempts = async (error: unknown): Promise<void> => {
@@ -130,33 +161,44 @@ async function runAuthorized<T>(
     providerAttempted = true
     if (active) active.providerAttempted = true
   }
-  const settleUsage = async (value: ModelResponse["usage"]): Promise<void> => {
+  const settleUsage = async (value: ObservedUsage | null): Promise<void> => {
     if (!active || active.accountSettlementStarted) return
     if (!active.authorization) throw new Error("usage_authorization_unavailable")
-    active.inputTokens = value?.inputTokens ?? 0
-    active.outputTokens = value?.outputTokens ?? 0
-    active.estimatedCostUsd = value?.estimatedCostUsd ?? 0
+    active.inputTokens = value?.inputTokens ?? null
+    active.outputTokens = value?.outputTokens ?? null
+    active.estimatedCostUsd = knownCost(value, active.provider, active.model)
     active.accountSettlementStarted = true
-    try { await active.authorization.settle({ ...usage(value), status: "success" }) }
+    try { await settleWorkerUsage(active.authorization, usage(value, active.provider, active.model)) }
     catch (error: unknown) { active.accountSettlementUnknown = true; throw error }
   }
   const authorizedRequest = deferAuthorization
     ? withHarnessPreProviderHooks(request as HarnessModelRequest, {
-      beforeProviderInvocation: route => authorizeRoute(route).then(() => undefined),
+      beforeProviderInvocation: async route => {
+        await authorizeRoute(route)
+        const attempt = attempts.get(routeKey(route))
+        if (!attempt) throw new Error("usage_authorization_unavailable")
+        return startRoute(attempt)
+      },
       providerInvocationStarted: markProviderAttempted,
       providerUsageObserved: (route, value) => {
         const attempt = attempts.get(routeKey(route))
         if (!attempt) return
         attempt.inputTokens = value.inputTokens
         attempt.outputTokens = value.outputTokens
-        attempt.estimatedCostUsd = value.estimatedCostUsd ?? 0
+        attempt.estimatedCostUsd = knownCost(value, route.provider, route.model)
       },
     })
     : request as HarnessModelRequest
   try {
-    if (!deferAuthorization) await authorizeRoute(adapter.profile)
+    let providerRequest = request as HarnessModelRequest
+    if (!deferAuthorization) {
+      await authorizeRoute(adapter.profile)
+      if (request.signal.aborted) throw interrupted()
+      const admitted = await startRoute(active!)
+      providerRequest = { ...request, ...(admitted === null ? {} : { maxOutputTokens: admitted }) }
+    }
     if (request.signal.aborted) throw interrupted()
-    const result = await run(authorizedRequest, markProviderAttempted, settleUsage)
+    const result = await run(deferAuthorization ? authorizedRequest : providerRequest, markProviderAttempted, settleUsage)
     await settleTree("consumed")
     return result
   } catch (error: unknown) {
@@ -177,13 +219,13 @@ export function createUsageAwareModelAdapter(adapter: ModelAdapter, options: Usa
   return {
     ...adapter,
     async *stream(request) {
-      let latestUsage: ModelResponse["usage"] = null
+      let latestUsage: ObservedUsage | null = null
       const deferAuthorization = isHarnessRoutedAdapter(adapter)
       const events = await runAuthorized(options, request, adapter, async (streamRequest, markProviderAttempted, settleUsage) => {
         async function* source(): AsyncGenerator<ModelStreamEvent> {
           if (!deferAuthorization) markProviderAttempted()
           for await (const event of adapter.stream(streamRequest)) {
-            if (event.type === "usage") latestUsage = { inputTokens: event.inputTokens, outputTokens: event.outputTokens, estimatedCostUsd: event.estimatedCostUsd ?? 0 }
+            if (event.type === "usage") latestUsage = { inputTokens: event.inputTokens, outputTokens: event.outputTokens, ...(event.estimatedCostUsd === undefined ? {} : { estimatedCostUsd: event.estimatedCostUsd }) }
             yield event
           }
         }

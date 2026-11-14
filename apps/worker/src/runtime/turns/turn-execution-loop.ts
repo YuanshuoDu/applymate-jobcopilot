@@ -5,7 +5,7 @@ import { createProgressDetector, progressCheckpointFromStepContext } from "../pr
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { runAdmittedModelStep } from "./admitted-model-step.js"
 import { settleAndPersistModelUsage } from "./turn-execution-budget-overrun.js"
-import { normalizeProjectedToolCallIds, projectChildToolCallIdsForModelContext } from "./turn-tool-call-id-projection.js"
+import { normalizeProjectedToolCallIds, projectChildToolCallIdsForModelContext, scopeChildExecutionReceipts } from "./turn-tool-call-id-projection.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
 import { publishCommentary, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
@@ -39,7 +39,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
   let consumedInputIds: readonly string[] = options.resume?.consumedInputIds ?? []
   let steps = options.resume?.stepCount ?? 0
   let toolCalls = options.resume?.toolCallCount ?? 0
-  let continuation: ModelContinuation | undefined
+  let continuation: ModelContinuation | undefined, childToolReplayReceipts = options.childToolReplayReceipts ?? [], childWaitReplayReceipts = options.childWaitReplayReceipts ?? []
   let recoveredCandidate = options.recoveredFinalCandidate
   let recoveredScheduledCandidate: ReturnType<typeof takeRecoveredScheduledPipelineCandidate> = undefined
   if (options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId && recoveredCandidate !== undefined) {
@@ -124,7 +124,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         }
         await writer.append("step.started", step.id, null, { stepId: step.id, ordinal: step.ordinal, taskId: options.identity.taskId }, `step-started:${step.id}`)
         if (options.identity.kind === "turn" && options.refreshTaskGraphBeforeStep) snapshot = await options.refreshTaskGraphBeforeStep(snapshot)
-        const toolCallProjection = options.identity.kind === "task" && options.identity.taskId !== options.identity.rootTaskId ? projectChildToolCallIdsForModelContext(snapshot, options.identity, step.id) : undefined
+        const toolCallProjection = options.identity.kind === "task" && options.identity.taskId !== options.identity.rootTaskId ? projectChildToolCallIdsForModelContext(snapshot, options.identity, step.id, childToolReplayReceipts, childWaitReplayReceipts) : undefined
         const context = await options.contextBuilder.build({
           scope: options.scope, identity: options.identity, stepId: step.id, snapshot: toolCallProjection?.snapshot ?? snapshot,
           rootInputId: ordinal === 0 ? options.rootInputId : undefined, now: now(),
@@ -179,7 +179,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           output = await runAdmittedModelStep({ writer, stepId: step.id, taskId: options.identity.taskId, provider: request.provider, model: request.model, invoke: () => runModelStep(options.model, request, options.validateToolArguments), onStartDenied: () => reservation.settle({ inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }) })
           await settleAndPersistModelUsage({ reservation, output, stepId: step.id, taskId: options.identity.taskId, writer, onUsageAccepted: () => { stepOutput = output } })
         }
-        output = toolCallProjection ? { ...output, toolCalls: normalizeProjectedToolCallIds(output.toolCalls, toolCallProjection.aliasToCanonical) } : output; stepOutput = output; continuation = output.continuation ?? undefined
+        output = toolCallProjection ? { ...output, toolCalls: normalizeProjectedToolCallIds(output.toolCalls, toolCallProjection) } : output; stepOutput = output; continuation = output.continuation ?? undefined
         await publishReasoningSummary(writer, options, step, resolveTurnFinalAnswerMarkers(output.reasoningSummary, null).text, now)
         if (output.toolCalls.length > 0) {
           const questionCallId = nativeQuestionCallId(output, options.identity)
@@ -188,15 +188,15 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           denialProgress.clear(); progress.observe({ snapshot, toolCalls: output.toolCalls }, progressCheckpointFromStepContext(context))
           budget.reserveToolCalls(output.toolCalls.length)
           if (output.text) await publishCommentary(writer, options, step, resolveTurnFinalAnswerMarkers(output.text, null).text, now)
-          let outcome: { wait: TurnEngineResult | null; snapshot: typeof options.snapshot; steeringMarkerState: typeof steeringMarkerState }
+          let outcome: Awaited<ReturnType<typeof executeTools>>
           let persistedToolCallCount = 0
           try {
-            outcome = await executeTools(executionOptions, writer, step, output, snapshot, seenCallIds, signal, now, steeringMarkerState, () => { persistedToolCallCount += 1 })
+            outcome = await executeTools(executionOptions, writer, step, output, snapshot, seenCallIds, signal, now, steeringMarkerState, () => { persistedToolCallCount += 1 }, new Set(toolCallProjection ? [...toolCallProjection.aliasToReceipt.values()].map(receipt => receipt.toolCallId) : []))
           } finally {
             budget.accountToolCalls(output.toolCalls.length)
             toolCalls += persistedToolCallCount
           }
-          snapshot = outcome.snapshot
+          if (toolCallProjection && options.identity.kind === "task") [childToolReplayReceipts, childWaitReplayReceipts] = scopeChildExecutionReceipts(childToolReplayReceipts, childWaitReplayReceipts, outcome.receipts, options.identity, step.id); snapshot = outcome.snapshot
           steeringMarkerState = outcome.steeringMarkerState
           if (questionIntentCallId && outcome.wait?.status === "waiting_for_user") {
             closedSteps.add(step.id)
