@@ -163,6 +163,43 @@ function queryRecords(rows: readonly unknown[] | undefined): Array<Record<string
   return records
 }
 
+type SafeExplainNode = Readonly<{
+  depth: number; nodeType: string; relation?: string; index?: string; joinType?: string; planRows?: number; totalCost?: number
+}>
+
+function safeExplainNodes(value: unknown): SafeExplainNode[] {
+  if (!Array.isArray(value)) return []
+  const root = value[0] && typeof value[0] === "object" && !Array.isArray(value[0])
+    ? (value[0] as Record<string, unknown>).Plan : undefined
+  const pending: Array<Readonly<{ node: unknown; depth: number }>> = [{ node: root, depth: 0 }]
+  const result: SafeExplainNode[] = []
+  while (pending.length > 0 && result.length < 128) {
+    const current = pending.pop()!
+    if (!current.node || typeof current.node !== "object" || Array.isArray(current.node)) continue
+    const node = current.node as Record<string, unknown>
+    if (typeof node["Node Type"] !== "string") continue
+    const safeText = (key: string): string | undefined => {
+      const candidate = node[key]
+      return typeof candidate === "string" && candidate.length <= 128 ? candidate : undefined
+    }
+    const safeNumber = (key: string): number | undefined => {
+      const candidate = node[key]
+      return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : undefined
+    }
+    result.push({ depth: current.depth, nodeType: node["Node Type"],
+      ...(safeText("Relation Name") ? { relation: safeText("Relation Name") } : {}),
+      ...(safeText("Index Name") ? { index: safeText("Index Name") } : {}),
+      ...(safeText("Join Type") ? { joinType: safeText("Join Type") } : {}),
+      ...(safeNumber("Plan Rows") !== undefined ? { planRows: safeNumber("Plan Rows") } : {}),
+      ...(safeNumber("Total Cost") !== undefined ? { totalCost: safeNumber("Total Cost") } : {}),
+    })
+    if (Array.isArray(node.Plans)) {
+      for (const child of [...node.Plans].reverse()) pending.push({ node: child, depth: current.depth + 1 })
+    }
+  }
+  return result
+}
+
 type SameSessionPageObservation = Readonly<{
   rawRowCount: number
   cursor: Readonly<{ sequence: unknown; turnId: unknown; terminalEventId: unknown }>
@@ -934,6 +971,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       | "tenant_config_started" | "tenant_config_completed"
       | "fence_read_started" | "fence_read_completed"
       | "base_witness_read_started" | "base_witness_read_completed"
+      | "first_page_explain_started" | "first_page_explain_completed"
       | "first_page_query_started" | "first_page_query_completed"
       | "second_page_query_started" | "second_page_query_completed"
       | "empty_page_query_started" | "empty_page_query_completed"
@@ -992,9 +1030,17 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       ) => {
         phase(pagePhases[kind][0])
         const query = buildRootTaskHistoryCrossSessionWindow({ ...window, ...(afterCursor ? { afterCursor } : {}) })
+        const querySql = queryLevelDuplicateWitnessSql(query.sql, query.values.length + 1, query.values.length + 2)
+        const queryValues = [...query.values, baseWitnessId, duplicateWitnessFixtureManifest()]
+        if (kind === "first") {
+          phase("first_page_explain_started")
+          const explain = await client.query<{ "QUERY PLAN": unknown }>(
+            `EXPLAIN (FORMAT JSON, COSTS TRUE) ${querySql}`, queryValues)
+          phase("first_page_explain_completed")
+          console.info(`[root-history-keyset-pg-explain] ${JSON.stringify(safeExplainNodes(explain.rows[0]?.["QUERY PLAN"]))}`)
+        }
         const result = await client.query<Record<string, unknown>>(
-          queryLevelDuplicateWitnessSql(query.sql, query.values.length + 1, query.values.length + 2),
-          [...query.values, baseWitnessId, duplicateWitnessFixtureManifest()])
+          querySql, queryValues)
         phase(pagePhases[kind][1])
         const pageRows = result.rows.filter(row => row.isPageWatermark !== true)
         const watermarks = result.rows.filter(row => row.isPageWatermark === true)
