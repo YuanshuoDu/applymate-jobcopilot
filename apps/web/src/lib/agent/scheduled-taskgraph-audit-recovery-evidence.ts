@@ -1,22 +1,20 @@
 import { Prisma } from '@prisma/client'
-import { scheduledTaskGraphAuditGateQuestionId, scheduledTaskGraphAuditGateWaitKey, scheduledTaskGraphAuditRecoveryEventIsActivity,
-  scheduledTaskGraphAuditRecoveryItems, scheduledTaskGraphAuditWaitKey } from './scheduled-taskgraph-audit-recovery-graph-item'
+import { scheduledTaskGraphAuditGateQuestionId, scheduledTaskGraphAuditGateWaitKey, scheduledTaskGraphAuditGateWaitWitnessMatches, scheduledTaskGraphAuditRecoveryEventIsActivity, scheduledTaskGraphAuditRecoveryItems, scheduledTaskGraphAuditWaitKey } from './scheduled-taskgraph-audit-recovery-graph-item'
+import { scheduledGateWaitAttemptMatchesCurrentHistory, type ScheduledGateRootWait } from './scheduled-taskgraph-gate-root-wait'
 import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { parseScheduledGateChoiceBinding, scheduledGateChoiceState,
   type ScheduledTaskGraphGateChoiceBinding as GateBinding } from './scheduled-taskgraph-gate-choice-evidence'
 
-const MARKER_SCHEMA = 'agent-harness.v2.scheduled-pipeline-recovery-step.v1'
-const MARKER_KEY = 'scheduledPipelineRecoveryStep'
+const MARKER_SCHEMA = 'agent-harness.v2.scheduled-pipeline-recovery-step.v1', MARKER_KEY = 'scheduledPipelineRecoveryStep'
 const MAX_STEPS = 128
 const MAX_ROWS = 512
 const WAIT_TIMEOUT_MS = 86_400_000
 type Row = Record<string, unknown>
 type OwnerIdentity = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string }>
 type Source = Readonly<{ sourceEventId: string; stepId: string; ordinal: number }>
-type RecoveryMarker = Readonly<{ schemaVersion: typeof MARKER_SCHEMA; kind: 'scheduled_pipeline_recovery'; owner: OwnerIdentity; rootAttemptCount: number; sourceEventId: string; sourceStepId: string;
-  sourceStepOrdinal: number; sourceInputThroughSequence: string; recoveryStepId: string; recoveryCursor: number;
+type RecoveryMarker = Readonly<{ schemaVersion: typeof MARKER_SCHEMA; kind: 'scheduled_pipeline_recovery'; owner: OwnerIdentity; rootAttemptCount: number;
+  sourceEventId: string; sourceStepId: string; sourceStepOrdinal: number; sourceInputThroughSequence: string; recoveryStepId: string; recoveryCursor: number;
   predecessorStepId: string; inputThroughSequence: string }>
-
 /** Validates the operational recovery tail against the exact persisted Worker receipts. */
 export async function validateScheduledTaskGraphAuditRecoveryEvidence(input: Readonly<{
   reader: Prisma.TransactionClient
@@ -24,18 +22,20 @@ export async function validateScheduledTaskGraphAuditRecoveryEvidence(input: Rea
   source: Source
   sourceInputThroughSequence: string
   rootAttemptCount: number
+  gateWait?: ScheduledGateRootWait
 }>): Promise<boolean> {
   const { reader, owner, source, sourceInputThroughSequence, rootAttemptCount } = input
   if (!validOwner(owner) || !positive(rootAttemptCount) || owner.rootAttemptCount !== rootAttemptCount
     || !validId(source.sourceEventId) || !validId(source.stepId) || !nonNegative(source.ordinal)
     || !validCursor(sourceInputThroughSequence)) return false
   try {
+    if (input.gateWait && !await scheduledGateWaitAttemptMatchesCurrentHistory(reader, owner, input.gateWait.gateTaskId, input.gateWait.requestAttemptCount)) return false
     const steps = await reader.agentStep.findMany({ where: { sessionId: owner.sessionId, turnId: owner.turnId,
       taskId: owner.rootTaskId, ordinal: { gt: source.ordinal } }, orderBy: { ordinal: 'asc' }, take: MAX_STEPS + 1,
     select: { id: true, taskId: true, ordinal: true, attempt: true, status: true, errorCode: true,
       inputThroughSequence: true, consumedInputIds: true, modelProfileSnapshot: true, inputTokens: true,
       outputTokens: true, estimatedCostUsd: true } })
-    if (steps.length > MAX_STEPS) return false
+    if (steps.length > MAX_STEPS || input.gateWait && (steps.length === 0 || steps[steps.length - 1]?.id !== input.gateWait.stepId)) return false
     if (!steps.length) return true
     const ids = steps.map(step => step.id)
     if (ids.some(id => !validId(id)) || new Set(ids).size !== ids.length) return false
@@ -50,7 +50,8 @@ export async function validateScheduledTaskGraphAuditRecoveryEvidence(input: Rea
       reader.agentWaitCondition.findMany({ where: { sessionId: owner.sessionId, turnId: owner.turnId,
         parentTaskId: owner.rootTaskId, stepId: { in: ids } }, take: MAX_ROWS + 1,
       select: { id: true, userId: true, sessionId: true, turnId: true, parentTaskId: true, stepId: true,
-        idempotencyKey: true, targetTaskIds: true, mode: true, status: true, matchedTaskIds: true, result: true } }),
+        idempotencyKey: true, targetTaskIds: true, mode: true, status: true, matchedTaskIds: true, result: true,
+        suspendedAt: true, consumedAt: true } }),
     ])
     if (events.length > MAX_ROWS || items.length > MAX_ROWS || waits.length > MAX_ROWS) return false
     const targetIds = new Set<string>()
@@ -61,7 +62,7 @@ export async function validateScheduledTaskGraphAuditRecoveryEvidence(input: Rea
     }
     const tasks = targetIds.size ? await reader.subAgentTask.findMany({ where: { id: { in: [...targetIds] },
       sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId },
-    select: { id: true, parentTaskId: true, rootTaskId: true, sessionId: true, turnId: true, depth: true,
+    select: { id: true, parentTaskId: true, rootTaskId: true, sessionId: true, turnId: true, depth: true, status: true, attemptCount: true,
       role: true, taskType: true, maxAttempts: true, session: { select: { userId: true } } } }) : []
     if (tasks.length !== targetIds.size) return false
     const taskById = new Map<string, Row>()
@@ -77,7 +78,8 @@ export async function validateScheduledTaskGraphAuditRecoveryEvidence(input: Rea
       if (!step || !await validateStep(reader, step, ownerIdentity, owner, source, rootAttemptCount, sourceInputThroughSequence,
         previousId, previousOrdinal, previousCursor, cursor,
         events.filter(event => event.correlationId === step.id), items.filter(item => item.stepId === step.id),
-        waits.filter(wait => wait.stepId === step.id), taskById)) return false
+        waits.filter(wait => wait.stepId === step.id), taskById, input.gateWait?.gateTaskId,
+        step.id === input.gateWait?.stepId ? input.gateWait : undefined)) return false
       const marker = parseMarker(record(parse(step.modelProfileSnapshot))?.[MARKER_KEY])
       if (!marker) return false
       previousId = String(step.id); previousOrdinal = Number(step.ordinal)
@@ -86,11 +88,10 @@ export async function validateScheduledTaskGraphAuditRecoveryEvidence(input: Rea
     return true
   } catch { return false }
 }
-
 async function validateStep(reader: Prisma.TransactionClient, step: Row, owner: OwnerIdentity, pipelineOwner: ScheduledTaskGraphPipelineOwner, source: Source, attempt: number, sourceCursor: string, previousId: string,
-  previousOrdinal: number, previousCursor: bigint, previousRecoveryCursor: number, events: Row[], items: Row[], waits: Row[],
-  tasks: Map<string, Row>): Promise<boolean> {
-  items = await scheduledTaskGraphAuditRecoveryItems({ reader, owner: pipelineOwner, stepId: String(step.id), items })
+  previousOrdinal: number, previousCursor: bigint, previousRecoveryCursor: number, events: Row[], items: Row[], waits: Row[], tasks: Map<string, Row>, gateTaskId?: string, gateWait?: ScheduledGateRootWait): Promise<boolean> {
+  items = await scheduledTaskGraphAuditRecoveryItems({ reader, owner: pipelineOwner, stepId: String(step.id),
+    ...(gateTaskId ? { gateTaskId } : {}), items })
   const marker = parseMarker(record(parse(step.modelProfileSnapshot))?.[MARKER_KEY]), inputCursor = cursorValue(step.inputThroughSequence)
   const consumed = parse(step.consumedInputIds), starts = events.filter(event => event.type === 'step.started')
   const completes = events.filter(event => event.type === 'step.completed')
@@ -102,10 +103,13 @@ async function validateStep(reader: Prisma.TransactionClient, step: Row, owner: 
     || marker.inputThroughSequence !== inputCursor || !inputCursor || BigInt(inputCursor) < previousCursor
     || step.taskId !== owner.rootTaskId || !positive(ordinal) || ordinal <= previousOrdinal || rowAttempt !== 1
     || !['streaming', 'interrupted', 'waiting_for_tool', 'waiting_for_user', 'completed'].includes(String(status))
+    || gateWait && status !== 'waiting_for_tool'
     || !Array.isArray(consumed) || consumed.length !== 0 || !zero(step.inputTokens) || !zero(step.outputTokens)
     || !zeroCost(step.estimatedCostUsd) || events.some(event => scheduledTaskGraphAuditRecoveryEventIsActivity(event.type) || event.type === 'final.rejected')
     || items.some(item => item.taskId !== owner.rootTaskId || item.stepId !== step.id)
-    || !awaitsValid(waits, owner, String(step.id), tasks)) return false
+    || gateTaskId !== undefined && !gateRecoveryEventsScoped(events, items, String(step.id))
+    || !awaitsValid(waits, owner, String(step.id), tasks)
+    || gateWait && !scheduledTaskGraphAuditGateWaitWitnessMatches({ owner: pipelineOwner, witness: gateWait, stepId: String(step.id), waits })) return false
   const startGood = starts.length <= 1 && starts.every(event => startMatches(event, step, marker, owner.rootTaskId, owner.turnId))
   if (!startGood) return false
   if (status === 'streaming' || status === 'interrupted') return items.length === 0 && completes.length === 0
@@ -120,11 +124,10 @@ async function validateStep(reader: Prisma.TransactionClient, step: Row, owner: 
     && waits.every(wait => wait.status === 'ready')
     && completionState(starts, completes, step, owner.rootTaskId, owner.turnId, 'blocker')
   const completion = record(parse(completes[0]?.payload)), waitId = completion?.waitId
-  return step.errorCode === null && items.length === 0 && validId(waitId)
+  return step.errorCode === null && items.length === 0 && validId(waitId) && (!gateWait || waitId === gateWait.waitId)
     && waits.filter(wait => wait.id === waitId).length === 1
     && completionState(starts, completes, step, owner.rootTaskId, owner.turnId, 'waiting_for_dependency')
 }
-
 function completionState(starts: Row[], completes: Row[], step: Row, rootTaskId: string, turnId: string, mode: string): boolean {
   if (mode === 'open') return starts.length <= 1
   const payload = record(parse(completes[0]?.payload)), status = step.status === 'waiting_for_tool'
@@ -138,7 +141,6 @@ function completionState(starts: Row[], completes: Row[], step: Row, rootTaskId:
     && (blocker ? payload.errorCode === step.errorCode && step.errorCode === 'scheduled_audit_completion_unverified' : step.errorCode === null)
     && (!waiting || validId(payload.waitId))
 }
-
 function startMatches(eventValue: unknown, step: Row, marker: Row, rootTaskId: string, turnId: string): boolean {
   const event = record(eventValue), payload = record(parse(event?.payload))
   return !!event && !!payload && exactKeys(payload, ['stepId', 'ordinal', 'taskId', MARKER_KEY])
@@ -146,7 +148,6 @@ function startMatches(eventValue: unknown, step: Row, marker: Row, rootTaskId: s
     && event.correlationId === step.id && event.idempotencyKey === `turn:${turnId}:event:step-started:${step.id}`
     && payload.stepId === step.id && payload.ordinal === step.ordinal && payload.taskId === rootTaskId && same(parse(payload[MARKER_KEY]), marker)
 }
-
 function gateChoiceItem(items: Row[], step: Row, owner: OwnerIdentity, pipelineOwner: ScheduledTaskGraphPipelineOwner,
   attempt: number, tasks: Map<string, Row>): boolean {
   if (items.length !== 1) return false
@@ -156,9 +157,17 @@ function gateChoiceItem(items: Row[], step: Row, owner: OwnerIdentity, pipelineO
   const task = binding && tasks.get(binding.gateTaskId)
   return !!state && item.id === `agent-wait:question:${waitId}` && item.type === 'question'
     && item.stepId === step.id && item.taskId === owner.rootTaskId && sameOwner(binding.owner, pipelineOwner, attempt)
-    && !!task && taskMatches(task, owner, binding.gateTaskId, 'gate')
+    && !!task && taskMatches(task, owner, binding.gateTaskId, 'gate') && gateChoiceAttemptMatches(task, binding, content)
 }
-
+function gateChoiceAttemptMatches(task: Row, binding: GateBinding, content: Row): boolean {
+  const current = task.attemptCount, resumed = Object.hasOwn(content, 'scheduledGateChoiceResumeAcknowledgement')
+  if (!positive(current) || current < binding.gateAttempt) return false
+  return current === binding.gateAttempt ? resumed ? ['queued', 'running'].includes(String(task.status)) : task.status === 'waiting_for_user' : resumed
+}
+function gateRecoveryEventsScoped(events: Row[], items: Row[], stepId: string): boolean {
+  const itemIds = new Set(items.map(item => item.id))
+  return events.every(event => ['step.started', 'step.completed'].includes(String(event.type)) || event.type === 'item.started' && event.actor === 'orchestrator' && event.correlationId === stepId && validId(event.itemId) && itemIds.has(event.itemId))
+}
 function awaitsValid(waits: Row[], owner: OwnerIdentity, stepId: string, tasks: Map<string, Row>): boolean {
   return waits.every(wait => {
     const ids = idsFrom(wait.targetTaskIds), result = record(parse(wait.result)), request = record(result?.request)
@@ -189,14 +198,12 @@ function waitMatches(wait: Row, owner: OwnerIdentity, stepId: string, target: st
     && wait.mode === mode && same(ids, [target]) && (outer === 'request' || outer === 'outcome,request')
     && !!request && exactKeys(request, keys) && request.mode === mode && request.timeoutMs === WAIT_TIMEOUT_MS && same(request.targetTaskIds, [target])
 }
-
 function taskMatches(task: Row, owner: OwnerIdentity, id: string, kind: 'audit' | 'gate' | 'prepare'): boolean {
-  const session = record(task.session), expected = kind === 'audit' ? ['auditor', 'scheduled_taskgraph_audit']
-    : kind === 'gate' ? ['prepare', 'scheduled_taskgraph_gate'] : ['prepare', 'scheduled_application_prepare']
+  const session = record(task.session), expected = kind === 'audit' ? ['auditor', 'scheduled_taskgraph_audit'] : kind === 'gate'
+    ? ['prepare', 'scheduled_taskgraph_gate'] : ['prepare', 'scheduled_application_prepare']
   return task.id === id && task.parentTaskId === owner.rootTaskId && task.rootTaskId === owner.rootTaskId && task.sessionId === owner.sessionId
     && task.turnId === owner.turnId && session?.userId === owner.userId && task.depth === 1 && task.role === expected[0] && task.taskType === expected[1]
 }
-
 function parseMarker(value: unknown): RecoveryMarker | null {
   const row = record(parse(value)), owner = record(row?.owner)
   if (!row || !owner || !exactKeys(row, ['schemaVersion', 'kind', 'owner', 'rootAttemptCount', 'sourceEventId', 'sourceStepId',
@@ -207,21 +214,18 @@ function parseMarker(value: unknown): RecoveryMarker | null {
     || !validCursor(row.sourceInputThroughSequence) || !validId(row.recoveryStepId) || !positive(row.recoveryCursor)
     || !validId(row.predecessorStepId) || !validCursor(row.inputThroughSequence)
     || BigInt(row.inputThroughSequence) < BigInt(row.sourceInputThroughSequence)) return null
-  return { schemaVersion: MARKER_SCHEMA, kind: 'scheduled_pipeline_recovery', owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId },
+  return { schemaVersion: MARKER_SCHEMA, kind: 'scheduled_pipeline_recovery',
+    owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId },
     rootAttemptCount: row.rootAttemptCount, sourceEventId: row.sourceEventId, sourceStepId: row.sourceStepId,
-    sourceStepOrdinal: row.sourceStepOrdinal, sourceInputThroughSequence: row.sourceInputThroughSequence,
-    recoveryStepId: row.recoveryStepId, recoveryCursor: row.recoveryCursor, predecessorStepId: row.predecessorStepId,
-    inputThroughSequence: row.inputThroughSequence }
+    sourceStepOrdinal: row.sourceStepOrdinal, sourceInputThroughSequence: row.sourceInputThroughSequence, recoveryStepId: row.recoveryStepId,
+    recoveryCursor: row.recoveryCursor, predecessorStepId: row.predecessorStepId, inputThroughSequence: row.inputThroughSequence }
 }
-
 function sameOwner(left: Row, right: ScheduledTaskGraphPipelineOwner, attempt: number): boolean {
   return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
-    && left.rootTaskId === right.rootTaskId && left.rootAttemptCount === attempt && left.rootAttemptCount === right.rootAttemptCount
-    && left.executionId === right.executionId && left.executionAttemptCount === right.executionAttemptCount
+    && left.rootTaskId === right.rootTaskId && left.rootAttemptCount === attempt && left.rootAttemptCount === right.rootAttemptCount && left.executionId === right.executionId && left.executionAttemptCount === right.executionAttemptCount
 }
 function validOwner(owner: ScheduledTaskGraphPipelineOwner): boolean {
-  return [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.executionId, owner.turnLeaseOwnerId].every(validId)
-    && positive(owner.rootAttemptCount) && nonNegative(owner.turnLeaseVersion) && nonNegative(owner.executionAttemptCount)
+  return [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.executionId, owner.turnLeaseOwnerId].every(validId) && positive(owner.rootAttemptCount) && nonNegative(owner.turnLeaseVersion) && nonNegative(owner.executionAttemptCount)
 }
 function validOwnerRecord(value: Row): value is Row & OwnerIdentity { return [value.userId, value.sessionId, value.turnId, value.rootTaskId].every(validId) }
 function record(value: unknown): Row | null { value = parse(value); if (!value || typeof value !== 'object' || Array.isArray(value)) return null

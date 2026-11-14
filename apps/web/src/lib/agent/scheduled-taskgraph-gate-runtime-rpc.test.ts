@@ -229,6 +229,37 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
   it('accepts a Gate child only after the exact Root dependency wait is fully persisted', async () => {
     const waitId = 'root-gate-wait', stepId = 'root-gate-step', requestAttemptCount = 0
     const digest = createHash('sha256').update(JSON.stringify([gateTask.id, stepId, requestAttemptCount]), 'utf8').digest('hex')
+    const approvalSnapshot = { ...snapshot, requireApproval: true }, waitingTurn = databaseTurn('waiting_for_dependency')
+    waitingTurn.input = { automationRunMode: 'scheduled', scheduledAutomationSnapshot: approvalSnapshot }
+    mocks.turn.mockResolvedValue({ input: waitingTurn.input })
+    const waitingRoot = { ...rootTask, status: 'waiting', result: { status: 'waiting_for_dependency',
+      stepCount: 4, toolCallCount: 2, finalItemId: null, waitId } }
+    configureGateLock({ turn: waitingTurn, root: waitingRoot,
+      waits: [{ id: waitId, userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+        parentTaskId: owner.rootTaskId, stepId, idempotencyKey: `scheduled-gate-wait:${digest}`,
+        targetTaskIds: [gateTask.id], mode: 'any', status: 'waiting', matchedTaskIds: [],
+        result: { request: { targetTaskIds: [gateTask.id], mode: 'any', timeoutMs: 86_400_000,
+          scheduledGate: { gateTaskId: gateTask.id, requestAttemptCount } } }, suspendedAt: new Date(), consumedAt: null }],
+      steps: [{ id: stepId, taskId: owner.rootTaskId, attempt: 1, status: 'waiting_for_tool' }] })
+
+    const request = { ...gateRequest(), scheduledWaitId: `agent-question:${owner.turnId}:canonical:${'a'.repeat(64)}` }
+    const result = await runScheduledTaskGraphActionRpc(request) as Response
+
+    expect(result.status).toBe(200)
+    expect(mocks.executeGate).toHaveBeenCalledOnce()
+    expect(mocks.isProof).toHaveBeenCalledWith(expect.objectContaining({ gateRootWait: expect.objectContaining({
+      waitId, stepId, gateTaskId: gateTask.id, requestAttemptCount, owner,
+      turn: expect.objectContaining({ id: owner.turnId, status: 'waiting_for_dependency', leaseVersion: owner.turnLeaseVersion }),
+      root: { id: owner.rootTaskId, status: 'waiting', attemptCount: owner.rootAttemptCount, waitId },
+    }) }), tx)
+    expect(mocks.auditPrepareSource).toHaveBeenCalledWith(expect.objectContaining({ reader: tx,
+      gateWait: expect.objectContaining({ waitId, stepId, gateTaskId: gateTask.id, owner: expect.objectContaining(owner) }) }))
+    expect(mocks.validateWait).not.toHaveBeenCalled()
+  })
+
+  it('keeps the ordinary latest-Step validator for a no-approval Gate wait', async () => {
+    const waitId = 'root-gate-wait', stepId = 'root-gate-step', requestAttemptCount = 0
+    const digest = createHash('sha256').update(JSON.stringify([gateTask.id, stepId, requestAttemptCount]), 'utf8').digest('hex')
     const waitingRoot = { ...rootTask, status: 'waiting', result: { status: 'waiting_for_dependency',
       stepCount: 4, toolCallCount: 2, finalItemId: null, waitId } }
     configureGateLock({ turn: databaseTurn('waiting_for_dependency'), root: waitingRoot,
@@ -238,11 +269,13 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
         result: { request: { targetTaskIds: [gateTask.id], mode: 'any', timeoutMs: 86_400_000,
           scheduledGate: { gateTaskId: gateTask.id, requestAttemptCount } } }, suspendedAt: new Date(), consumedAt: null }],
       steps: [{ id: stepId, taskId: owner.rootTaskId, attempt: 1, status: 'waiting_for_tool' }] })
+    mocks.validateWait.mockResolvedValue(false)
 
     const result = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
 
-    expect(result.status).toBe(200)
-    expect(mocks.executeGate).toHaveBeenCalledOnce()
+    expect(result.status).toBe(409)
+    expect(mocks.validateWait).toHaveBeenCalledOnce()
+    expect(mocks.auditPrepareSource).not.toHaveBeenCalled()
   })
 
   it('fails closed when Root is waiting but the Turn lease handoff is partial', async () => {
@@ -272,15 +305,11 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     const changed = { ...loaded, materials: [{ ...materials[0]!, artifactRef: { artifactId: 'artifact-2' } }] }
     mocks.loadInput.mockImplementation(async (_input: unknown, reader: unknown) => {
       inputLoads += 1
-      if (inputLoads <= 2) {
-        expect(transactionCallbackActive).toBe(false)
-        if (inputLoads === 2) events.push('preflight')
-        return loaded
-      }
       expect(transactionCallbackActive).toBe(true)
       expect(reader).toBe(tx)
-      events.push('receipt_material_recheck')
-      return changed
+      if (inputLoads === 1) events.push('preflight')
+      if (inputLoads === 3) events.push('receipt_material_recheck')
+      return inputLoads === 3 ? changed : loaded
     })
     mocks.transaction.mockImplementation(async (work: (client: unknown) => unknown) => {
       transactionCallbackActive = true

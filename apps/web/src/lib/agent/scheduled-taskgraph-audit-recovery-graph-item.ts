@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
 import type { Prisma } from '@prisma/client'
 import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
+import type { ScheduledGateRootWait } from './scheduled-taskgraph-gate-root-wait'
 
 type Row = Record<string, unknown>
 type GraphItem = Readonly<{ id: string; sessionId: string; turnId: string; stepId: string; taskId: string;
@@ -18,21 +19,15 @@ export async function isScheduledTaskGraphAuditRecoveryGraphItem(input: Readonly
   stepId: string
   item: unknown
 }>): Promise<boolean> {
-  const { reader, owner, stepId } = input
-  try {
-    const item = row(input.item)
-    if (!item || !validId(stepId) || !validOwner(owner) || !validItem(item, owner, stepId)) return false
-    const events = await reader.agentEvent.findMany({
-      where: { sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId,
-        itemId: item.id, type: 'item.delta', actor: 'orchestrator', correlationId: owner.turnId,
-        causationId: stepId, idempotencyKey: { startsWith: `${item.id}:proposal:` } },
-      take: 2,
-      select: { id: true, sessionId: true, turnId: true, taskId: true, itemId: true, type: true,
-        actor: true, correlationId: true, causationId: true, idempotencyKey: true, payload: true },
-    })
-    if (events.length !== 1) return false
-    return proposalMatches(row(events[0]), item, owner, stepId)
-  } catch { return false }
+  return recoveryGraphItemProposalMatches(input)
+}
+
+/** Recognizes only a Gate-only proposal owned by this recovery Step and its scheduled Gate task. */
+export async function isScheduledTaskGraphGateRecoveryGraphItem(input: Readonly<{
+  reader: Prisma.TransactionClient; owner: ScheduledTaskGraphPipelineOwner; stepId: string; gateTaskId: string; item: unknown
+}>): Promise<boolean> {
+  if (!validId(input.gateTaskId)) return false
+  return recoveryGraphItemProposalMatches(input, input.gateTaskId)
 }
 
 /** Removes no more than one item, and only after its own persisted proposal receipt validates. */
@@ -40,13 +35,50 @@ export async function scheduledTaskGraphAuditRecoveryItems<T extends Row>(input:
   reader: Prisma.TransactionClient
   owner: ScheduledTaskGraphPipelineOwner
   stepId: string
+  gateTaskId?: string
   items: readonly T[]
 }>): Promise<T[]> {
   const graphItems = input.items.filter(item => item.type === 'task_graph')
-  if (graphItems.length !== 1 || !await isScheduledTaskGraphAuditRecoveryGraphItem({
-    reader: input.reader, owner: input.owner, stepId: input.stepId, item: graphItems[0],
-  })) return [...input.items]
+  const graphItem = graphItems[0]
+  if (graphItems.length !== 1 || !(input.gateTaskId
+    ? await isScheduledTaskGraphGateRecoveryGraphItem({ reader: input.reader, owner: input.owner, stepId: input.stepId,
+      gateTaskId: input.gateTaskId, item: graphItem })
+    : await isScheduledTaskGraphAuditRecoveryGraphItem({ reader: input.reader, owner: input.owner, stepId: input.stepId, item: graphItem }))) return [...input.items]
   return input.items.filter(item => item !== graphItems[0])
+}
+
+/** Requires the same exact Gate wait that was locked with the Root/Turn witness. */
+export function scheduledTaskGraphAuditGateWaitWitnessMatches(input: Readonly<{ owner: ScheduledTaskGraphPipelineOwner;
+  witness: ScheduledGateRootWait; stepId: string; waits: readonly unknown[] }>): boolean {
+  const { owner, witness, stepId, waits } = input, matches = waits.map(row).filter(wait => wait?.id === witness.waitId)
+  const wait = matches[0], result = row(parse(wait?.result)), request = row(result?.request), marker = row(request?.scheduledGate)
+  return exactKeys(witness as unknown as Row, ['waitId', 'stepId', 'requestAttemptCount', 'gateTaskId', 'owner', 'turn', 'root'])
+    && exactKeys(witness.owner as unknown as Row, ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount',
+      'turnLeaseOwnerId', 'turnLeaseVersion', 'executionId', 'executionAttemptCount'])
+    && exactKeys(witness.turn as unknown as Row, ['id', 'status', 'leaseOwnerId', 'leaseVersion', 'leaseExpiresAt'])
+    && exactKeys(witness.root as unknown as Row, ['id', 'status', 'attemptCount', 'waitId'])
+    && validOwner(owner) && validId(stepId) && matches.length === 1 && witness.stepId === stepId
+    && validId(witness.waitId) && validId(witness.gateTaskId) && nonNegative(witness.requestAttemptCount)
+    && witness.requestAttemptCount < Number.MAX_SAFE_INTEGER
+    && witness.owner.userId === owner.userId && witness.owner.sessionId === owner.sessionId
+    && witness.owner.turnId === owner.turnId && witness.owner.rootTaskId === owner.rootTaskId
+    && witness.owner.rootAttemptCount === owner.rootAttemptCount && witness.owner.turnLeaseOwnerId === owner.turnLeaseOwnerId
+    && witness.owner.turnLeaseVersion === owner.turnLeaseVersion && witness.owner.executionId === owner.executionId
+    && witness.owner.executionAttemptCount === owner.executionAttemptCount && witness.turn.id === owner.turnId
+    && witness.turn.status === 'waiting_for_dependency' && witness.turn.leaseOwnerId === null
+    && witness.turn.leaseVersion === owner.turnLeaseVersion && witness.turn.leaseExpiresAt === null
+    && witness.root.id === owner.rootTaskId && witness.root.status === 'waiting'
+    && witness.root.attemptCount === owner.rootAttemptCount && witness.root.waitId === witness.waitId
+    && wait?.userId === owner.userId && wait.sessionId === owner.sessionId && wait.turnId === owner.turnId
+    && wait.parentTaskId === owner.rootTaskId && wait.stepId === stepId && wait.status === 'waiting'
+    && wait.suspendedAt != null && wait.consumedAt === null && wait.mode === 'any'
+    && same(parse(wait.targetTaskIds), [witness.gateTaskId]) && same(parse(wait.matchedTaskIds), [])
+    && wait.idempotencyKey === scheduledTaskGraphAuditGateWaitKey(witness.gateTaskId, stepId, witness.requestAttemptCount)
+    && !!result && exactKeys(result, ['request']) && !!request
+    && exactKeys(request, ['targetTaskIds', 'mode', 'timeoutMs', 'scheduledGate'])
+    && same(request.targetTaskIds, [witness.gateTaskId]) && request.mode === 'any' && request.timeoutMs === WAIT_TIMEOUT_MS
+    && !!marker && exactKeys(marker, ['gateTaskId', 'requestAttemptCount'])
+    && marker.gateTaskId === witness.gateTaskId && marker.requestAttemptCount === witness.requestAttemptCount
 }
 
 /** Stable Gate question identifiers are part of the same recovery-item contract. */
@@ -66,6 +98,21 @@ export function scheduledTaskGraphAuditRecoveryEventIsActivity(type: unknown): b
   return typeof type === 'string' && (type.startsWith('model.') || type.startsWith('tool_call.'))
 }
 
+async function recoveryGraphItemProposalMatches(input: Readonly<{ reader: Prisma.TransactionClient; owner: ScheduledTaskGraphPipelineOwner;
+  stepId: string; item: unknown }>, gateTaskId?: string): Promise<boolean> {
+  const { reader, owner, stepId } = input
+  try {
+    const item = row(input.item)
+    if (!item || !validId(stepId) || !validOwner(owner) || !validItem(item, owner, stepId)) return false
+    const events = await reader.agentEvent.findMany({ where: { sessionId: owner.sessionId, turnId: owner.turnId,
+      taskId: owner.rootTaskId, itemId: item.id, type: 'item.delta', actor: 'orchestrator', correlationId: owner.turnId,
+      causationId: stepId, idempotencyKey: { startsWith: `${item.id}:proposal:` } }, take: 2,
+    select: { id: true, sessionId: true, turnId: true, taskId: true, itemId: true, type: true, actor: true,
+      correlationId: true, causationId: true, idempotencyKey: true, payload: true } })
+    return events.length === 1 && proposalMatches(row(events[0]), item, owner, stepId, gateTaskId)
+  } catch { return false }
+}
+
 function validItem(item: Row, owner: ScheduledTaskGraphPipelineOwner, stepId: string): item is Row & GraphItem {
   return exactKeys(item, ['id', 'sessionId', 'turnId', 'stepId', 'taskId', 'type', 'status', 'phase', 'revision', 'content'])
     && item.id === graphItemId(owner.rootTaskId) && item.sessionId === owner.sessionId && item.turnId === owner.turnId
@@ -73,7 +120,7 @@ function validItem(item: Row, owner: ScheduledTaskGraphPipelineOwner, stepId: st
     && item.status === 'streaming' && item.phase === null && positive(item.revision)
 }
 
-function proposalMatches(event: Row | null, item: GraphItem, owner: ScheduledTaskGraphPipelineOwner, stepId: string): boolean {
+function proposalMatches(event: Row | null, item: GraphItem, owner: ScheduledTaskGraphPipelineOwner, stepId: string, gateTaskId?: string): boolean {
   const payload = row(event?.payload), dto = row(payload?.item), receipt = row(payload?.receipt)
   const revision = payload?.revision, content = row(payload?.content)
   if (!event || !payload || !dto || !receipt || !content
@@ -84,9 +131,33 @@ function proposalMatches(event: Row | null, item: GraphItem, owner: ScheduledTas
     || !positive(revision) || item.revision < revision || payload.kind !== 'proposal'
     || !hex(payload.fingerprint) || !exactKeys(payload, ['kind', 'fingerprint', 'receipt', 'revision', 'item', 'content'])
     || event.idempotencyKey !== `${item.id}:proposal:${revision - 1}`
-    || !receiptMatches(receipt, revision, content, owner.rootTaskId)
     || !dtoMatches(dto, item, revision, content) || !same(item.content, content)) return false
-  return true
+  return gateTaskId ? gateReceiptMatches(receipt, revision, content, owner.rootTaskId, gateTaskId)
+    : receiptMatches(receipt, revision, content, owner.rootTaskId)
+}
+
+function gateReceiptMatches(receipt: Row, revision: number, value: Row, rootTaskId: string, gateTaskId: string): boolean {
+  const receiptNodes = Array.isArray(receipt.nodes) ? receipt.nodes.map(row) : [], ready = Array.isArray(receipt.readyTaskIds) ? receipt.readyTaskIds : []
+  const contentKeys = Object.hasOwn(value, 'rootSuccessCriteria') ? ['nodes', 'rootSuccessCriteria', 'schemaVersion'] : ['nodes', 'schemaVersion']
+  const nodes = Array.isArray(value.nodes) ? value.nodes.map(row) : [], scoutCount = nodes.length - 3
+  const keys = nodes.map(node => node?.key), taskIds = nodes.map(node => node?.taskId), templates = nodes.map(node => node?.templateId)
+  const depths = nodes.map(node => node?.depth), scouts = nodes.slice(0, scoutCount), analyst = nodes[scoutCount]
+  const prepare = nodes[scoutCount + 1], gate = nodes[scoutCount + 2]
+  if (!exactKeys(receipt, ['status', 'revision', 'nodes', 'readyTaskIds']) || receipt.status !== 'accepted' || receipt.revision !== revision
+    || receiptNodes.length !== 1 || !receiptNodes[0] || !exactKeys(receiptNodes[0], ['key', 'taskId', 'status'])
+    || receiptNodes[0].key !== 'gate' || receiptNodes[0].taskId !== gateTaskId || receiptNodes[0].status !== 'queued'
+    || !same(ready, [gateTaskId]) || value.schemaVersion !== 'agent-harness.v2.task-graph' || !exactKeys(value, contentKeys)
+    || scoutCount < 1 || scoutCount > 4 || nodes.some(node => !node) || keys.some(key => !validNodeKey(key))
+    || new Set(keys).size !== nodes.length || taskIds.some(id => !validId(id) || id === rootTaskId)
+    || new Set(taskIds).size !== nodes.length || !same(templates, [...Array(scoutCount).fill('scout'), 'analyst', 'prepare', 'gate'])
+    || !same(depths, [...Array(scoutCount).fill(1), 2, 3, 4])) return false
+  const sourceKeys = keys.slice(0, scoutCount)
+  return scouts.every(node => node?.verificationDisposition === 'typed' && same(node.dependsOn, []))
+    && !!analyst && analyst.verificationDisposition === 'typed' && sameSet(analyst.dependsOn, sourceKeys)
+    && !!prepare && prepare.verificationDisposition === 'specialized' && same(prepare.dependsOn, [analyst.key])
+    && !!gate && exactKeys(gate, ['key', 'templateId', 'goal', 'successCriteria', 'dependsOn', 'depth', 'taskId', 'verificationDisposition'])
+    && gate.key === 'gate' && gate.templateId === 'gate' && gate.taskId === gateTaskId
+    && gate.verificationDisposition === 'specialized' && same(gate.dependsOn, ['prepare'])
 }
 
 function dtoMatches(dto: Row, item: GraphItem, revision: number, content: Row): boolean {

@@ -5,6 +5,7 @@ import { db as fixtureDb } from '@/lib/db'
 import { hashArtifactContent } from './artifacts/hash'
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { scheduledTaskGraphAnalyzeCheckpointDigest } from './scheduled-taskgraph-gate-checkpoint'
+import type { ScheduledGateRootWait } from './scheduled-taskgraph-gate-root-wait'
 import type { ScheduledTaskGraphPostGateActor } from './scheduled-taskgraph-audit-child-fence'
 
 const mocks = vi.hoisted(() => ({ session: vi.fn(), jobs: vi.fn(), resume: vi.fn(), facts: vi.fn(), versions: vi.fn(), heads: vi.fn(), graph: vi.fn(), tasks: vi.fn(), task: vi.fn(), events: vi.fn(), queryRaw: vi.fn(), transaction: vi.fn(), gateHistory: vi.fn(), completedAuditFence: vi.fn() }))
@@ -93,6 +94,11 @@ function taskRows(proof: ReturnType<typeof makeProof>, attestation: Record<strin
     attemptCount: 1, failureReason: null, result: { status: 'completed', structuredResult: proof.result,
       taskGraphScheduledPrepareProofFacts: { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-prepare-proof-facts.v1',
         receipt: proof.receipt, completion, result: proof.result } } }]
+}
+function rootGateWaitWitness(gateTaskId: string, waitId: string): ScheduledGateRootWait {
+  return { waitId, stepId: 'root-recovery-step', gateTaskId, requestAttemptCount: 0, owner,
+    turn: { id: owner.turnId, status: 'waiting_for_dependency', leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: null },
+    root: { id: owner.rootTaskId, status: 'waiting', attemptCount: owner.rootAttemptCount, waitId } }
 }
 function recordForTest(value: unknown): Record<string, unknown> { return value as Record<string, unknown> }
 let gateBindingRows: Record<string, unknown>[] = []
@@ -405,6 +411,30 @@ describe('scheduled TaskGraph Gate input reload', () => {
     await expect(isScheduledTaskGraphAuditCompletedReportGateProofCurrent({ ...request, auditActor }, tx)).resolves.toBe(true)
     expect(mocks.completedAuditFence).toHaveBeenCalledWith(tx, { owner, auditActor })
     expect(mocks.queryRaw).toHaveBeenCalledTimes(5)
+  })
+
+  it('admits a parked Root Gate proof only with the exact locked Root-wait witness', async () => {
+    const { input, proof, graph, analyzeAttestation } = setup()
+    const gateInput = attachGate(input, proof, graph, analyzeAttestation)
+    const rows = taskRows(proof, analyzeAttestation)
+    const waitId = 'root-gate-wait'
+    rows[0] = { ...rows[0]!, status: 'waiting', result: { status: 'waiting_for_dependency', stepCount: 4,
+      toolCallCount: 2, finalItemId: null, waitId } }
+    mocks.tasks.mockResolvedValue(rows)
+    mocks.gateHistory.mockResolvedValue(true)
+    const transaction = () => {
+      mocks.queryRaw.mockReset().mockResolvedValueOnce([gateBindingRows[0]]).mockResolvedValueOnce([gateBindingRows[1]])
+        .mockResolvedValueOnce([{ id: graph.id }]).mockResolvedValueOnce(rows.map(row => ({ id: row.id })))
+        .mockResolvedValueOnce([{ id: 'prepare-binding' }])
+      return { $queryRaw: mocks.queryRaw, agentItem: { findFirst: mocks.graph },
+        subAgentTask: { findMany: mocks.tasks }, agentEvent: { findMany: mocks.events } } as unknown as Prisma.TransactionClient
+    }
+    await expect(isScheduledTaskGraphGateProofCurrent(gateInput, transaction())).resolves.toBe(false)
+    const gateRootWait = rootGateWaitWitness(gateInput.gate!.taskId, waitId)
+    await expect(isScheduledTaskGraphGateProofCurrent({ ...gateInput, gateRootWait }, transaction())).resolves.toBe(true)
+    await expect(isScheduledTaskGraphGateProofCurrent({ ...gateInput, gateRootWait: { ...gateRootWait, waitId: 'stale-wait' } }, transaction()))
+      .resolves.toBe(false)
+    expect(mocks.gateHistory).toHaveBeenCalled()
   })
 
   it('rejects a changed Audit suffix and any sixth node', async () => {

@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import type { Prisma } from '@prisma/client'
-import { lockScheduledTaskGraphRootAction, scheduledGateWaitAttemptMatchesCurrentHistory } from './scheduled-taskgraph-gate-root-wait'
+import { lockScheduledTaskGraphRootAction, scheduledGateRootWaitWitnessMatches, scheduledGateWaitAttemptMatchesCurrentHistory } from './scheduled-taskgraph-gate-root-wait'
 
 const owner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1',
   rootAttemptCount: 2, turnLeaseOwnerId: 'old-root-lease', turnLeaseVersion: 4 }
+const pipelineOwner = { ...owner, executionId: 'execution-1', executionAttemptCount: 0 }
 const gateTaskId = 'gate-1', waitId = 'wait-1', stepId = 'step-1'
 const rootResult = { status: 'waiting_for_dependency', stepCount: 8, toolCallCount: 4, finalItemId: null, waitId }
 function waitRow(overrides: Record<string, unknown> = {}) {
@@ -26,7 +27,8 @@ function transaction(responses: unknown[]) {
   return { client: { $queryRaw: queryRaw } as unknown as Prisma.TransactionClient, queryRaw }
 }
 function suspendedTurn(overrides: Record<string, unknown> = {}) {
-  return { status: 'waiting_for_dependency', leaseOwnerId: null, leaseExpiresAt: null, ...overrides }
+  return { id: owner.turnId, status: 'waiting_for_dependency', leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion,
+    leaseExpiresAt: null, ...overrides }
 }
 function gateInput(overrides: Record<string, unknown> = {}) {
   return { owner, action: 'gate' as const, gateTaskId, turn: suspendedTurn(), ...overrides }
@@ -36,7 +38,8 @@ describe('Scheduled Gate Root dependency wait fence', () => {
   it('locks the exact fully suspended Gate wait before locking Root', async () => {
     const test = transaction([[{ status: 'waiting' }], [waitRow()], [{ id: stepId, taskId: owner.rootTaskId, attempt: 1, status: 'waiting_for_tool' }], [rootRow()]])
     await expect(lockScheduledTaskGraphRootAction(test.client, gateInput())).resolves.toEqual({
-      root: rootRow(), gateWait: { waitId, requestAttemptCount: 0 },
+      root: rootRow(), gateWait: { waitId, stepId, gateTaskId, requestAttemptCount: 0, owner, turn: suspendedTurn(),
+        root: { id: owner.rootTaskId, status: 'waiting', attemptCount: owner.rootAttemptCount, waitId } },
     })
     expect(test.queryRaw).toHaveBeenCalledTimes(4)
   })
@@ -70,6 +73,7 @@ describe('Scheduled Gate Root dependency wait fence', () => {
 
   it.each([
     ['partial turn handoff', suspendedTurn({ status: 'in_progress', leaseOwnerId: 'live-root-lease', leaseExpiresAt: new Date() })],
+    ['stale Turn lease version', suspendedTurn({ leaseVersion: owner.turnLeaseVersion + 1 })],
     ['user wait', suspendedTurn({ status: 'waiting_for_user' })],
     ['tool wait', suspendedTurn({ status: 'waiting_for_tool' })],
   ])('rejects a %s even when a wait row exists', async (_label, turn) => {
@@ -93,7 +97,7 @@ describe('Scheduled Gate Root dependency wait fence', () => {
     const runningRoot = rootRow({ status: 'running', result: null })
     const gate = transaction([[{ status: 'running' }], [runningRoot]])
     await expect(lockScheduledTaskGraphRootAction(gate.client,
-      gateInput({ turn: { status: 'in_progress', leaseOwnerId: 'root-lease', leaseExpiresAt: new Date() } })))
+      gateInput({ turn: { ...suspendedTurn(), status: 'in_progress', leaseOwnerId: 'root-lease', leaseExpiresAt: new Date() } })))
       .resolves.toEqual({ root: runningRoot })
     const execute = transaction([[runningRoot]])
     await expect(lockScheduledTaskGraphRootAction(execute.client,
@@ -101,6 +105,16 @@ describe('Scheduled Gate Root dependency wait fence', () => {
     const audit = transaction([[rootRow()]])
     await expect(lockScheduledTaskGraphRootAction(audit.client,
       { owner, action: 'scheduled_audit_execute', turn: suspendedTurn() })).resolves.toEqual({ root: rootRow() })
+  })
+
+  it('binds the waiting proof to the exact pipeline owner, Gate target, released Turn lease, and Root wait result', () => {
+    const root = rootRow(), witness = { waitId, stepId, gateTaskId, requestAttemptCount: 0, owner: pipelineOwner,
+      turn: suspendedTurn(), root: { id: owner.rootTaskId, status: 'waiting' as const, attemptCount: owner.rootAttemptCount, waitId } }
+    expect(scheduledGateRootWaitWitnessMatches({ owner: pipelineOwner, gateTaskId, root, witness })).toBe(true)
+    expect(scheduledGateRootWaitWitnessMatches({ owner: { ...pipelineOwner, executionId: 'other-execution' }, gateTaskId, root, witness })).toBe(false)
+    expect(scheduledGateRootWaitWitnessMatches({ owner: { ...pipelineOwner, turnLeaseVersion: owner.turnLeaseVersion + 1 }, gateTaskId, root, witness })).toBe(false)
+    expect(scheduledGateRootWaitWitnessMatches({ owner: pipelineOwner, gateTaskId: 'other-gate', root, witness })).toBe(false)
+    expect(scheduledGateRootWaitWitnessMatches({ owner: pipelineOwner, gateTaskId, root: rootRow({ status: 'running' }), witness })).toBe(false)
   })
 })
 

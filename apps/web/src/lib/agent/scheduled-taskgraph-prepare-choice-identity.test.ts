@@ -59,6 +59,13 @@ describe("scheduled prepare choice identity source scope", () => {
     await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot, proof })).resolves.toBe(false)
   })
 
+  it("keeps the ordinary latest-Prepare-Step fence without a locked recovery witness", async () => {
+    configureCandidate(scopedCandidate(owner.userId))
+    mocks.steps.mockImplementation((query: { where: { id?: string } }) => Promise.resolve(query.where.id
+      ? { id: finalStepId, status: "streaming" } : { id: "newer-recovery-step" }))
+    await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot, proof })).resolves.toBe(false)
+  })
+
   it("accepts only canonical choice IDs for the current Turn", () => {
     const id = `agent-question:${owner.turnId}:canonical:${"f".repeat(64)}`
     expect(isScheduledPrepareChoiceWaitId(owner.turnId, id)).toBe(true)

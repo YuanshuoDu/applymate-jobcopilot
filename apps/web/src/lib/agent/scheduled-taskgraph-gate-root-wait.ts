@@ -1,21 +1,25 @@
 import { createHash } from 'node:crypto'
 import { Prisma } from '@prisma/client'
 import type { ScheduledTaskGraphGateRequestOwner } from './scheduled-taskgraph-gate-rpc'
+import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 
 const WAIT_TIMEOUT_MS = 86_400_000
 type Row = Record<string, unknown>
 type RootAction = 'gate' | 'execute' | 'scheduled_audit_execute'
-type RootTurn = Readonly<{ status: string; leaseOwnerId: string | null; leaseExpiresAt: Date | null }>
+type RootTurn = Readonly<{ id: string; status: string; leaseOwnerId: string | null; leaseVersion: number; leaseExpiresAt: Date | null }>
 type RootTask = Readonly<{ id: string; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string | null;
   status: string; attemptCount: number; interruptRequestedAt: Date | null; closedAt: Date | null; result: unknown }>
-export type ScheduledGateRootWait = Readonly<{ waitId: string; requestAttemptCount: number }>
-export type ScheduledTaskGraphRootActionLock = Readonly<{ root: RootTask; gateWait?: ScheduledGateRootWait }>
+type LockedGateWait = Readonly<{ waitId: string; stepId: string; requestAttemptCount: number }>
+export type ScheduledGateRootWaitLock = LockedGateWait & Readonly<{ gateTaskId: string; owner: ScheduledTaskGraphGateRequestOwner;
+  turn: RootTurn; root: Readonly<{ id: string; status: 'waiting'; attemptCount: number; waitId: string }> }>
+export type ScheduledGateRootWait = Omit<ScheduledGateRootWaitLock, 'owner'> & Readonly<{ owner: ScheduledTaskGraphPipelineOwner }>
+export type ScheduledTaskGraphRootActionLock = Readonly<{ root: RootTask; gateWait?: ScheduledGateRootWaitLock }>
 
 /** Locks a scoped Root and, only for a Gate waiting Root, its exact durable dependency handoff. */
 export async function lockScheduledTaskGraphRootAction(tx: Prisma.TransactionClient, input: {
   owner: ScheduledTaskGraphGateRequestOwner; action: RootAction; turn: RootTurn; gateTaskId?: string
 }): Promise<ScheduledTaskGraphRootActionLock | null> {
-  let gateWait: ScheduledGateRootWait | null = null
+  let gateWait: LockedGateWait | null = null
   if (input.action === 'gate') {
     if (!validId(input.gateTaskId)) return null
     const preview = await tx.$queryRaw<Array<{ status: string }>>(Prisma.sql`
@@ -25,7 +29,9 @@ export async function lockScheduledTaskGraphRootAction(tx: Prisma.TransactionCli
     `)
     if (preview.length !== 1 || !['running', 'waiting'].includes(preview[0]!.status)) return null
     if (preview[0]!.status === 'waiting') {
-      if (input.turn.status !== 'waiting_for_dependency' || input.turn.leaseOwnerId !== null || input.turn.leaseExpiresAt !== null) return null
+      if (input.turn.id !== input.owner.turnId || input.turn.status !== 'waiting_for_dependency'
+        || input.turn.leaseOwnerId !== null || input.turn.leaseExpiresAt !== null
+        || input.turn.leaseVersion !== input.owner.turnLeaseVersion) return null
       gateWait = await lockCurrentGateWait(tx, input.owner, input.gateTaskId)
       if (!gateWait) return null
     }
@@ -48,7 +54,33 @@ export async function lockScheduledTaskGraphRootAction(tx: Prisma.TransactionCli
   if (input.action === 'gate' && (root.status === 'waiting'
     ? !gateWait || !rootWaitResultMatches(root.result, gateWait.waitId)
     : gateWait !== null)) return null
-  return { root, ...(gateWait ? { gateWait } : {}) }
+  const witness = gateWait ? { ...gateWait, gateTaskId: input.gateTaskId!, owner: input.owner, turn: {
+    id: input.turn.id, status: input.turn.status, leaseOwnerId: input.turn.leaseOwnerId,
+    leaseVersion: input.turn.leaseVersion, leaseExpiresAt: input.turn.leaseExpiresAt,
+  },
+    root: { id: root.id, status: 'waiting' as const, attemptCount: root.attemptCount, waitId: gateWait.waitId } } : undefined
+  return { root, ...(witness ? { gateWait: witness } : {}) }
+}
+
+/** Binds a parked Root proof to the exact owner, released Turn, Root result, and locked Gate wait. */
+export function scheduledGateRootWaitWitnessMatches(input: Readonly<{ owner: ScheduledTaskGraphPipelineOwner; gateTaskId: string;
+  root: Readonly<{ id: unknown; status: unknown; attemptCount: unknown; result: unknown }>; witness?: ScheduledGateRootWait }>): boolean {
+  const { owner, gateTaskId, root, witness } = input
+  return !!witness && exactKeys(witness as unknown as Row, ['waitId', 'stepId', 'requestAttemptCount', 'gateTaskId', 'owner', 'turn', 'root'])
+    && exactKeys(witness.owner as unknown as Row, ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount',
+      'turnLeaseOwnerId', 'turnLeaseVersion', 'executionId', 'executionAttemptCount'])
+    && exactKeys(witness.turn as unknown as Row, ['id', 'status', 'leaseOwnerId', 'leaseVersion', 'leaseExpiresAt'])
+    && exactKeys(witness.root as unknown as Row, ['id', 'status', 'attemptCount', 'waitId'])
+    && validId(gateTaskId) && validId(witness.waitId) && validId(witness.stepId)
+    && nonNegative(witness.requestAttemptCount) && witness.requestAttemptCount < Number.MAX_SAFE_INTEGER
+    && witness.gateTaskId === gateTaskId && sameOwner(witness.owner, owner)
+    && witness.turn.id === owner.turnId && witness.turn.status === 'waiting_for_dependency'
+    && witness.turn.leaseOwnerId === null && witness.turn.leaseExpiresAt === null
+    && witness.turn.leaseVersion === owner.turnLeaseVersion
+    && witness.root.id === owner.rootTaskId && witness.root.status === 'waiting'
+    && witness.root.attemptCount === owner.rootAttemptCount && witness.root.waitId === witness.waitId
+    && root.id === witness.root.id && root.status === 'waiting' && root.attemptCount === witness.root.attemptCount
+    && rootWaitResultMatches(root.result, witness.waitId)
 }
 
 /** Call only after the current canonical Gate history proof has passed in this transaction. */
@@ -75,7 +107,7 @@ export async function scheduledGateWaitAttemptMatchesCurrentHistory(tx: Prisma.T
 }
 
 async function lockCurrentGateWait(tx: Prisma.TransactionClient, owner: ScheduledTaskGraphGateRequestOwner,
-  gateTaskId: string): Promise<ScheduledGateRootWait | null> {
+  gateTaskId: string): Promise<LockedGateWait | null> {
   const rows = await tx.$queryRaw<Row[]>(Prisma.sql`
     SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds",
       "mode", "status", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
@@ -106,7 +138,7 @@ async function lockCurrentGateWait(tx: Prisma.TransactionClient, owner: Schedule
   const step = steps[0]
   if (steps.length !== 1 || !step || step.id !== stepId || step.status !== 'waiting_for_tool' || step.attempt !== 1
     || step.taskId !== owner.rootTaskId && step.taskId !== null) return null
-  return { waitId, requestAttemptCount: Number(marker.requestAttemptCount) }
+  return { waitId, stepId, requestAttemptCount: Number(marker.requestAttemptCount) }
 }
 
 function rootWaitResultMatches(value: unknown, waitId: string): boolean {
@@ -136,6 +168,12 @@ function record(value: unknown): Row | null {
   return prototype === Object.prototype || prototype === null ? parsed as Row : null
 }
 function exactKeys(value: Row, keys: readonly string[]): boolean { return Object.keys(value).sort().join(',') === [...keys].sort().join(',') }
+function sameOwner(left: ScheduledTaskGraphPipelineOwner, right: ScheduledTaskGraphPipelineOwner): boolean {
+  return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
+    && left.rootTaskId === right.rootTaskId && left.rootAttemptCount === right.rootAttemptCount
+    && left.turnLeaseOwnerId === right.turnLeaseOwnerId && left.turnLeaseVersion === right.turnLeaseVersion
+    && left.executionId === right.executionId && left.executionAttemptCount === right.executionAttemptCount
+}
 function sameJson(left: unknown, right: unknown): boolean { try { return JSON.stringify(left) === JSON.stringify(right) } catch { return false } }
 function validId(value: unknown): value is string {
   return typeof value === 'string' && value.trim() === value && value.length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value)
