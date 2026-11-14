@@ -54,6 +54,7 @@ import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 const databaseUrl = dedicatedDisposableUrl()
 const redisUrl = dedicatedDisposableRedisUrl()
 const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
+const scheduledGateReviewMarkerSchema = "agent-harness.v2.scheduled-gate-review-marker.v1"
 type Fixture = Awaited<ReturnType<typeof createScheduledGatePrepareFixture>>
 type ScheduledAuditRecoveryScope = Fixture["graphScope"] & Readonly<{
   turnLeaseOwner: string; turnLeaseVersion: number; parentLeaseOwner: string; parentAttemptCount: number
@@ -418,28 +419,30 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       for (const wait of waitsBeforeResolver) {
         expect(waitsAfterFirstResolver.find(current => current.id === wait.id)).toEqual(wait)
       }
-      expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "waiting_for_dependency", turnLeaseOwnerId: null,
+      const witnessedApprovalIds = await assertPersistedGateApprovalWitnesses(pool!, fixture, gateTaskId)
+      expect(witnessedApprovalIds.length).toBeGreaterThan(0)
+      expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "waiting_for_approval", turnLeaseOwnerId: null,
         sessionStatus: "running", rootStatus: "waiting", rootResult: { status: "waiting_for_dependency", waitId: rootWait.waitId } })
 
       const secondResolverBatchSize = waitsAfterFirstResolver.length
       expect(secondResolverBatchSize).toBe(resolverBatchSize)
-      await prioritizeAndVerifyScheduledGateResolverTurn(pool!, fixture, secondResolverBatchSize, waitsAfterFirstResolver.length)
       const secondReport = await reconcileDurableWaits(isolatedResolverPool.pool as never,
         { ownerId: `gate-wake-${randomUUID()}`, batchSize: secondResolverBatchSize })
-      expect(secondReport.scanned).toBe(secondResolverBatchSize)
+      expect(secondReport).toMatchObject({ scanned: 0, resolved: 0, woken: 0 })
       expect(isolatedResolverPool.scopedRootTurnBatchQueries).toBe(2)
       expect(isolatedResolverPool.isolatedChildWaitSessionScans).toBe(2)
       const waitsAfterSecondResolver = await readScopedUnconsumedWaits()
       expect(waitsAfterSecondResolver.map(wait => wait.id).sort()).toEqual(waitsBeforeResolver.map(wait => wait.id).sort())
-      for (const wait of waitsBeforeResolver.filter(wait => wait.id !== rootWait.waitId)) {
+      for (const wait of waitsBeforeResolver) {
         expect(waitsAfterSecondResolver.find(current => current.id === wait.id)).toEqual(wait)
       }
+      expect(await assertPersistedGateApprovalWitnesses(pool!, fixture, gateTaskId)).toEqual(witnessedApprovalIds)
       expect(waitsAfterSecondResolver.find(wait => wait.id === rootWait.waitId)).toMatchObject({
         id: rootWait.waitId, userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId,
         parentTaskId: fixture.ids.rootTaskId, stepId: recoveryStep.id, idempotencyKey: expectedWaitKey,
-        status: "ready", targetTaskIds: [gateTaskId], mode: "any", matchedTaskIds: [gateTaskId], consumedAt: null,
+        status: "waiting", targetTaskIds: [gateTaskId], mode: "any", matchedTaskIds: [], consumedAt: null, resolvedAt: null,
       })
-      expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "queued", turnLeaseOwnerId: null,
+      expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "waiting_for_approval", turnLeaseOwnerId: null,
         sessionStatus: "running", rootStatus: "waiting", rootResult: { status: "waiting_for_dependency", waitId: rootWait.waitId } })
     } finally {
       releaseGateRpc.release()
@@ -2886,6 +2889,86 @@ function debugRecord(value: unknown): Record<string, unknown> | null {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
 }
+
+async function assertPersistedGateApprovalWitnesses(pool: Pool, fixture: Fixture, gateTaskId: string): Promise<string[]> {
+  type ApprovalRow = { id: string; userId: string; sessionId: string; turnId: string; taskId: string; jobId: string;
+    toolCallId: string; type: string; status: string; title: string; body: string; impact: unknown; payload: unknown;
+    scopeHash: string; revision: number; expiresAt: Date; decidedAt: Date | null; consumedAt: Date | null;
+    applicationTaskId: string; applicationUserId: string; applicationSessionId: string; applicationJobId: string }
+  type ItemRow = { id: string; sessionId: string; turnId: string; stepId: string | null; taskId: string | null;
+    type: string; status: string; revision: number; content: unknown; startedAt: Date | null; completedAt: Date | null }
+  type EventRow = { sessionId: string; turnId: string; itemId: string | null; taskId: string | null; type: string;
+    actor: string; correlationId: string; idempotencyKey: string | null; payload: unknown }
+  const approvals = await pool.query<ApprovalRow>(`SELECT approval."id", approval."userId", approval."sessionId", approval."turnId",
+      approval."taskId", approval."jobId", approval."toolCallId", approval."type", approval."status", approval."title",
+      approval."body", approval."impact", approval."payload", approval."scopeHash", approval."revision", approval."expiresAt",
+      approval."decidedAt", approval."consumedAt", application."id" AS "applicationTaskId",
+      application."userId" AS "applicationUserId", application."sessionId" AS "applicationSessionId",
+      application."jobId" AS "applicationJobId"
+    FROM "agent_approvals" AS approval
+    JOIN "application_tasks" AS application ON application."id" = approval."taskId"
+      AND application."userId" = approval."userId" AND application."sessionId" = approval."sessionId"
+      AND application."jobId" = approval."jobId"
+    WHERE approval."userId" = $1 AND approval."sessionId" = $2 AND approval."turnId" = $3
+      AND approval."jobId" = ANY($4::text[]) AND approval."type" = 'review_application' AND approval."status" = 'pending'
+      AND approval."decidedAt" IS NULL AND approval."consumedAt" IS NULL AND approval."expiresAt" > clock_timestamp()
+      AND approval."payload"->'scheduledGateReview'->>'gateTaskId' = $5 ORDER BY approval."id" ASC`,
+  [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId, fixture.preparedJobIds, gateTaskId])
+  expect(approvals.rows.length).toBeGreaterThan(0)
+  const ids = approvals.rows.map(row => row.id)
+  expect(new Set(ids).size).toBe(ids.length)
+  const itemIds = ids.map(id => `agent-wait:approval:${id}`)
+  const [items, events] = await Promise.all([
+    pool.query<ItemRow>(`SELECT "id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "revision", "content", "startedAt", "completedAt"
+      FROM "agent_items" WHERE "id" = ANY($1::text[]) AND "sessionId" = $2 AND "turnId" = $3`,
+    [itemIds, fixture.ids.sessionId, fixture.ids.turnId]),
+    pool.query<EventRow>(`SELECT "sessionId", "turnId", "itemId", "taskId", "type", "actor", "correlationId", "idempotencyKey", "payload"
+      FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'approval.requested'
+        AND "correlationId" = ANY($3::text[])`, [fixture.ids.sessionId, fixture.ids.turnId, ids]),
+  ])
+  for (const approval of approvals.rows) {
+    expect(approval).toMatchObject({ userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId,
+      type: "review_application", status: "pending", decidedAt: null, consumedAt: null,
+      applicationTaskId: approval.taskId, applicationUserId: fixture.ids.userId,
+      applicationSessionId: fixture.ids.sessionId, applicationJobId: approval.jobId })
+    expect(fixture.preparedJobIds).toContain(approval.jobId)
+    expect(approval.expiresAt).toBeInstanceOf(Date)
+    expect(approval.expiresAt.getTime()).toBeGreaterThan(Date.now())
+    const payload = debugRecord(approval.payload), marker = debugRecord(payload?.scheduledGateReview)
+    expect(payload).not.toBeNull()
+    expect(Object.keys(payload ?? {}).every(key => ["jobId", "applicationTaskId", "artifactBindings", "scheduledGateReview"].includes(key))).toBe(true)
+    expect(payload).toMatchObject({ jobId: approval.jobId, applicationTaskId: approval.taskId })
+    expect(exactDiagnosticKeys(marker ?? {}, ["schemaVersion", "gateTaskId"])).toBe(true)
+    expect(marker).toEqual({ schemaVersion: scheduledGateReviewMarkerSchema, gateTaskId })
+    const impact = debugRecord(approval.impact)
+    expect(exactDiagnosticKeys(impact ?? {}, ["externalSubmission", "jobId"])).toBe(true)
+    expect(impact).toEqual({ externalSubmission: false, jobId: approval.jobId })
+
+    const matchingItems = items.rows.filter(item => item.id === `agent-wait:approval:${approval.id}`)
+    const matchingEvents = events.rows.filter(event => event.correlationId === approval.id)
+    expect(matchingItems).toHaveLength(1)
+    expect(matchingEvents).toHaveLength(1)
+    const item = matchingItems[0]!, event = matchingEvents[0]!, content = debugRecord(item.content)
+    expect(item).toMatchObject({ sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId, stepId: null, taskId: null,
+      type: "approval_request", status: "started", revision: 0, completedAt: null })
+    expect(item.startedAt).toBeInstanceOf(Date)
+    expect(exactDiagnosticKeys(content ?? {}, ["waitKind", "approvalId", "toolCallId", "action", "title", "body",
+      "impact", "scopeHash", "receiptRevision", "expiresAt", "decision"])).toBe(true)
+    expect(content).toMatchObject({ waitKind: "approval", approvalId: approval.id, toolCallId: approval.toolCallId,
+      action: "review_application", title: approval.title, body: approval.body, scopeHash: approval.scopeHash,
+      receiptRevision: approval.revision, expiresAt: approval.expiresAt.toISOString(), decision: null })
+    expect(debugRecord(content?.impact)).toEqual(impact)
+    expect(event).toMatchObject({ sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId, itemId: null,
+      taskId: approval.taskId, type: "approval.requested", actor: "orchestrator", correlationId: approval.id,
+      idempotencyKey: `approval:${approval.id}:requested` })
+    const eventPayload = debugRecord(event.payload)
+    expect(exactDiagnosticKeys(eventPayload ?? {}, ["approvalId", "action", "scopeHash", "revision"])).toBe(true)
+    expect(eventPayload).toEqual({ approvalId: approval.id, action: "review_application", scopeHash: approval.scopeHash,
+      revision: approval.revision })
+  }
+  return ids
+}
+
 type PrepareSourceDbReader = {
   agentEvent: { findMany(args: unknown): Promise<readonly unknown[]> }
   agentStep: { findFirst(args: unknown): Promise<unknown>; findMany(args: unknown): Promise<readonly unknown[]> }

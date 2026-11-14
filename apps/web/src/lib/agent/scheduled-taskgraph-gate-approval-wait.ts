@@ -30,7 +30,16 @@ export async function scheduledTaskGraphGateApprovalWaitIds(
   if (approvals.length > MAX_APPROVALS) return []
   const ids = approvals.flatMap(row => validId(row.id) ? [row.id] : [])
   if (ids.length === 0) return []
-  const [items, events] = await Promise.all([
+  const taskScopes = approvals.flatMap(row => validId(row.taskId) && validId(row.jobId)
+    ? [{ taskId: row.taskId, jobId: row.jobId }] : [])
+  if (taskScopes.length === 0) return []
+  const [applicationTasks, items, events] = await Promise.all([
+    tx.applicationTask.findMany({
+      where: { OR: taskScopes.map(({ taskId, jobId }) => ({
+        id: taskId, userId: owner.userId, sessionId: owner.sessionId, jobId,
+      })) },
+      select: { id: true, userId: true, sessionId: true, jobId: true },
+    }),
     tx.agentItem.findMany({
       where: { id: { in: ids.map(id => "agent-wait:approval:" + id) }, sessionId: owner.sessionId, turnId: owner.turnId },
       select: { id: true, sessionId: true, turnId: true, stepId: true, taskId: true, type: true, status: true,
@@ -49,7 +58,9 @@ export async function scheduledTaskGraphGateApprovalWaitIds(
     const itemId = "agent-wait:approval:" + approvalId
     const matchingItems = items.filter(item => item.id === itemId)
     const matchingEvents = events.filter(event => event.correlationId === approvalId)
-    if (matchingItems.length !== 1 || matchingEvents.length !== 1) continue
+    const matchingTasks = applicationTasks.filter(task => task.id === approval.taskId && task.userId === owner.userId
+      && task.sessionId === owner.sessionId && task.jobId === approval.jobId)
+    if (matchingTasks.length !== 1 || matchingItems.length !== 1 || matchingEvents.length !== 1) continue
     if (validApprovalWitness(approval as unknown as Row, matchingItems[0] as unknown as Row,
       matchingEvents[0] as unknown as Row, owner, gateTaskId, now)) valid.push(approvalId)
   }

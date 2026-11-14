@@ -22,6 +22,7 @@ type EventFixture = {
   id: string; sessionId: string; turnId: string; itemId: string | null; taskId: string | null
   type: string; actor: string; correlationId: string; idempotencyKey: string; payload: Record<string, unknown>
 }
+type ApplicationTaskFixture = { id: string; userId: string; sessionId: string | null; jobId: string }
 
 function approval(id = "approval-1", overrides: Partial<ApprovalFixture> = {}): ApprovalFixture {
   const jobId = "job-" + id, taskId = "application-task-" + id
@@ -54,14 +55,19 @@ function event(row = approval(), overrides: Partial<EventFixture> = {}): EventFi
     ...overrides,
   }
 }
-function transaction(rows: ApprovalFixture[] = [approval()], itemRows: unknown[] = [item()], eventRows: unknown[] = [event()]) {
+function applicationTask(row: ApprovalFixture): ApplicationTaskFixture {
+  return { id: row.taskId, userId: row.userId, sessionId: row.sessionId, jobId: row.jobId }
+}
+function transaction(rows: ApprovalFixture[] = [approval()], itemRows: unknown[] = [item()], eventRows: unknown[] = [event()],
+  applicationTaskRows: unknown[] = rows.map(applicationTask)) {
   const approvalFindMany = vi.fn(async () => rows)
   const itemFindMany = vi.fn(async () => itemRows)
   const eventFindMany = vi.fn(async () => eventRows)
+  const applicationTaskFindMany = vi.fn(async () => applicationTaskRows)
   return {
-    client: { agentApproval: { findMany: approvalFindMany }, agentItem: { findMany: itemFindMany },
-      agentEvent: { findMany: eventFindMany } } as unknown as Prisma.TransactionClient,
-    approvalFindMany, itemFindMany, eventFindMany,
+    client: { agentApproval: { findMany: approvalFindMany }, applicationTask: { findMany: applicationTaskFindMany },
+      agentItem: { findMany: itemFindMany }, agentEvent: { findMany: eventFindMany } } as unknown as Prisma.TransactionClient,
+    approvalFindMany, applicationTaskFindMany, itemFindMany, eventFindMany,
   }
 }
 
@@ -83,6 +89,24 @@ describe("Scheduled Gate approval wait witness", () => {
     }))
     expect(test.itemFindMany).toHaveBeenCalledOnce()
     expect(test.eventFindMany).toHaveBeenCalledOnce()
+    expect(test.applicationTaskFindMany).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ["missing", []],
+    ["owned by another user", [{ ...applicationTask(approval()), userId: "other-user" }]],
+    ["bound to another session", [{ ...applicationTask(approval()), sessionId: "other-session" }]],
+    ["without a session binding", [{ ...applicationTask(approval()), sessionId: null }]],
+    ["bound to another job", [{ ...applicationTask(approval()), jobId: "other-job" }]],
+  ])("rejects approval when its ApplicationTask is %s", async (_label, applicationTasks) => {
+    const row = approval()
+    const test = transaction([row], [item(row)], [event(row)], applicationTasks)
+
+    await expect(scheduledTaskGraphGateApprovalWaitIds(test.client, owner, gateTaskId, now)).resolves.toEqual([])
+    expect(test.applicationTaskFindMany).toHaveBeenCalledWith({
+      where: { OR: [{ id: row.taskId, userId: owner.userId, sessionId: owner.sessionId, jobId: row.jobId }] },
+      select: { id: true, userId: true, sessionId: true, jobId: true },
+    })
   })
 
   it.each([
@@ -125,6 +149,7 @@ describe("Scheduled Gate approval wait witness", () => {
     const rows = Array.from({ length: 51 }, (_, index) => approval("approval-" + index))
     const test = transaction(rows)
     await expect(scheduledTaskGraphGateApprovalWaitIds(test.client, owner, gateTaskId, now)).resolves.toEqual([])
+    expect(test.applicationTaskFindMany).not.toHaveBeenCalled()
     expect(test.itemFindMany).not.toHaveBeenCalled()
     expect(test.eventFindMany).not.toHaveBeenCalled()
   })
