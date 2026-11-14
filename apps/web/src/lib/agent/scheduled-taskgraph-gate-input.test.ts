@@ -96,7 +96,7 @@ function taskRows(proof: ReturnType<typeof makeProof>, attestation: Record<strin
         receipt: proof.receipt, completion, result: proof.result } } }]
 }
 function rootGateWaitWitness(gateTaskId: string, waitId: string): ScheduledGateRootWait {
-  return { waitId, stepId: 'root-recovery-step', gateTaskId, requestAttemptCount: 0, owner,
+  return { waitId, stepId: 'root-recovery-step', gateTaskId, approvalIds: [], requestAttemptCount: 0, owner,
     turn: { id: owner.turnId, status: 'waiting_for_dependency', leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: null },
     root: { id: owner.rootTaskId, status: 'waiting', attemptCount: owner.rootAttemptCount, waitId } }
 }
@@ -416,7 +416,7 @@ describe('scheduled TaskGraph Gate input reload', () => {
   it('admits a parked Root Gate proof only with the exact locked Root-wait witness', async () => {
     const { input, proof, graph, analyzeAttestation } = setup()
     const gateInput = attachGate(input, proof, graph, analyzeAttestation)
-    const rows = taskRows(proof, analyzeAttestation)
+    const rows = await mocks.tasks() as Array<Record<string, unknown>>
     const waitId = 'root-gate-wait'
     rows[0] = { ...rows[0]!, status: 'waiting', result: { status: 'waiting_for_dependency', stepCount: 4,
       toolCallCount: 2, finalItemId: null, waitId } }
