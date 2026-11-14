@@ -102,15 +102,15 @@ function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 function recoveryErrorClass(error, includeMessage = false) {
   try {
     const code = error && typeof error === "object" ? error.code ?? (includeMessage ? error.message : null) : null
-    if (typeof code === "string") return SAFE_RECOVERY_ERROR_CODES.has(code) ? code : "other"
+    if (typeof code === "string") return code === "task_graph_transition_rejected:idempotency_conflict" ? "idempotency_conflict"
+      : code === "task_graph_transition_rejected:revision_mismatch" ? "revision_mismatch" : SAFE_RECOVERY_ERROR_CODES.has(code) ? code : "other"
     return error instanceof Error ? "error" : "unknown"
   } catch { return "unknown" }
 }
+function withWaitingFinishDiagnostics(store) { const finish = store.finish.bind(store); store.finish = input => finish(input).catch(error => { if (input.status === "waiting") { const code = recoveryErrorClass(error, true); say(`P1143_WAITING_FINISH_DIAGNOSTIC:${code === "idempotency_conflict" || code === "revision_mismatch" ? code : "other"}`) } throw error }); return store }
 async function start(mode) {
   const ownerId = `p1143-worker-${process.pid}`
-  const manager = mode === "park" ? undefined : new AgentTreeManager(
-    new PgSubagentTaskStore(pool, CRASH_TEST_LEASE_MS), { heartbeatMs: CRASH_TEST_HEARTBEAT_MS },
-  )
+  const manager = mode === "park" ? undefined : new AgentTreeManager(withWaitingFinishDiagnostics(new PgSubagentTaskStore(pool, CRASH_TEST_LEASE_MS)), { heartbeatMs: CRASH_TEST_HEARTBEAT_MS })
   let recoveryStage = "manager_recover"
   if (mode === "resume" && manager) {
     const recoveryMarkers = new Set()

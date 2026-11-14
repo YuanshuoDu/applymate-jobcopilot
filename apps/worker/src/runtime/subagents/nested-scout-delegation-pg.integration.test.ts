@@ -138,6 +138,10 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       && SAFE_WAIT_RESUME_STAGES.includes(match[2] as typeof SAFE_WAIT_RESUME_STAGES[number])
       ? [{ code: match[1], stage: match[2] }] : []
   })
+  const waitingFinishFailures = output.flatMap(value => {
+    const match = value.match(/^P1143_WAITING_FINISH_DIAGNOSTIC:(idempotency_conflict|revision_mismatch|other)$/)
+    return match ? [match[1]] : []
+  })
   try {
     const [turn, graph, steps, tasks, parentSteps, waits, tools] = await Promise.all([
       progressQuery<{ status: string }>(`SELECT CASE WHEN "status" IN ('queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval',
@@ -216,7 +220,7 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       readWaitAcknowledgementDiagnostic(ids), readSourceEventChainDiagnostic(ids), readParentResumeProgressDiagnostic(ids),
     ])
     return {
-      observedPhases, fixtureFailure, waitResumeCommitFailures,
+      observedPhases, fixtureFailure, waitResumeCommitFailures, waitingFinishFailures,
       turnStatus: turn.rows[0]?.status ?? "missing",
       graphRecordCount: graph.rows.length,
       graphNodeCount: graph.rows[0]?.nodeCount ?? 0,
@@ -230,7 +234,7 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       parentResumeProgress,
     }
   } catch {
-    return { observedPhases, fixtureFailure, waitResumeCommitFailures, databaseDiagnosticAvailable: false }
+    return { observedPhases, fixtureFailure, waitResumeCommitFailures, waitingFinishFailures, databaseDiagnosticAvailable: false }
   }
 }
 
