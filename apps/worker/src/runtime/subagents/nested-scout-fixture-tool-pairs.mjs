@@ -24,9 +24,9 @@ function matchingToolUses(request, name, inputMatches) {
 export function findUniqueWaitInput(request, taskIds) {
   const expected = [...taskIds].sort((left, right) => left.localeCompare(right))
   const uses = matchingToolUses(request, "wait_subagents", () => true)
-  if (uses.length > 1) throw new Error("p1143_fixture_tool_pair_call_ambiguous")
   if (uses.length === 0) return null
-  const input = record(uses[0].input), keys = input ? Object.keys(input).sort().join(",") : ""
+  const latest = uses.at(-1)
+  const input = record(latest.input), keys = input ? Object.keys(input).sort().join(",") : ""
   if (keys !== "idempotencyKey,mode,taskIds,timeoutMs" || typeof input.idempotencyKey !== "string"
     || !/^final-dependency-wait:[a-f0-9]{64}$/.test(input.idempotencyKey) || input.mode !== "all"
     || input.timeoutMs !== 30_000 || !Array.isArray(input.taskIds) || !isDeepStrictEqual(input.taskIds, expected)) {
@@ -42,9 +42,10 @@ export function findExactToolResult(request, expected) {
     throw new Error("p1143_fixture_tool_pair_request_invalid")
   }
   const uses = matchingToolUses(request, name, candidate => isDeepStrictEqual(candidate, input))
-  if (uses.length > 1) throw new Error("p1143_fixture_tool_pair_call_ambiguous")
   if (uses.length === 0) return null
-  const use = uses[0]
+  if (uses.length > 1 && name !== "wait_subagents") throw new Error("p1143_fixture_tool_pair_call_ambiguous")
+  // Repeated waits may have identical arguments; select the latest exact call and pair by its ID.
+  const use = uses.at(-1)
   const results = []
   for (let index = use.messageIndex + 1; index < messages.length; index += 1) {
     const message = record(messages[index])
@@ -55,7 +56,10 @@ export function findExactToolResult(request, expected) {
     }
   }
   if (results.length > 1) throw new Error("p1143_fixture_tool_pair_result_ambiguous")
-  if (results.length === 0) return null
+  if (results.length === 0) {
+    if (name === "wait_subagents") throw new Error("p1143_fixture_tool_pair_result_invalid")
+    return null
+  }
   const result = results[0]
   if (typeof result.content !== "string" || Object.hasOwn(result, "isError") && typeof result.isError !== "boolean") {
     throw new Error("p1143_fixture_tool_pair_result_invalid")

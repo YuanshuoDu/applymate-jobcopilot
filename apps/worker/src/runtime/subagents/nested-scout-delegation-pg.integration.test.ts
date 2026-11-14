@@ -258,9 +258,9 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       tier: depth === 1 ? "parent_scout" : depth === 2 ? "depth_two_scout" : "other_scout", status, failureCode,
       structuredFailureCategory, executorResultStatus, attemptCountMax, nextAttemptAtPresent, count,
     }))
-    const [acknowledgement, sourceEventChain, parentResumeProgress, pendingChildWait] = await Promise.all([
+    const [acknowledgement, sourceEventChain, parentResumeProgress, pendingChildWait, waitCallLineage] = await Promise.all([
       readWaitAcknowledgementDiagnostic(ids), readSourceEventChainDiagnostic(ids), readParentResumeProgressDiagnostic(ids),
-      readPendingChildWaitDiagnostic(ids),
+      readPendingChildWaitDiagnostic(ids), readWaitCallLineageDiagnostic(ids),
     ])
     return {
       observedPhases, fixtureFailure, waitResumeCommitFailures, waitingFinishFailures, waitResolverErrorCodes,
@@ -276,9 +276,119 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       sourceEventChain,
       parentResumeProgress,
       pendingChildWait,
+      waitCallLineage,
     }
   } catch {
     return { observedPhases, fixtureFailure, waitResumeCommitFailures, waitingFinishFailures, databaseDiagnosticAvailable: false }
+  }
+}
+
+async function readWaitCallLineageDiagnostic(ids: FixtureIds) {
+  type CardinalityRow = {
+    selectedWaitPresent: boolean; sourceWaitCallCount: number;
+    sourceWaitCallsMatchingWaitInput: number; sourceWaitCallsWithOneResult: number;
+    continuationStepCount: number; continuationToolCallCount: number; continuationWaitCallCount: number;
+    continuationToolCallsWithOneResult: number; continuationWaitCallsWithOneResult: number;
+  }
+  try {
+    const result = await progressQuery<CardinalityRow>(`WITH parent AS (
+        SELECT task."id", task."attemptCount", task."sessionId", task."turnId"
+        FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session
+          ON session."id" = task."sessionId" AND session."userId" = $1
+        WHERE task."sessionId" = $2 AND task."turnId" = $3 AND task."depth" = 1 AND task."role" = 'scout'
+      ), candidate_waits AS (
+        SELECT wait.*, source."attempt" AS "sourceAttempt", source."ordinal" AS "sourceOrdinal"
+        FROM parent JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = parent."id"
+          AND wait."sessionId" = parent."sessionId" AND wait."turnId" = parent."turnId"
+        JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId"
+          AND source."turnId" = wait."turnId" AND source."taskId" = wait."parentTaskId"
+        WHERE source."attempt" <= parent."attemptCount" AND wait."status" IN ('ready', 'timed_out')
+          AND wait."suspendedAt" IS NOT NULL AND wait."consumedAt" IS NOT NULL
+          AND EXISTS (SELECT 1 FROM "agent_steps" AS next WHERE next."sessionId" = source."sessionId"
+            AND next."turnId" = source."turnId" AND next."taskId" = source."taskId" AND next."attempt" = source."attempt"
+            AND next."ordinal" = (SELECT MIN(later."ordinal") FROM "agent_steps" AS later
+              WHERE later."sessionId" = source."sessionId" AND later."turnId" = source."turnId"
+                AND later."taskId" = source."taskId" AND later."attempt" = source."attempt" AND later."ordinal" > source."ordinal"))
+        ORDER BY source."attempt" DESC, source."ordinal" DESC, wait."createdAt" DESC, wait."id" DESC LIMIT 1
+      ), source_step AS (
+        SELECT step."id", step."sessionId", step."turnId", step."taskId", step."attempt", step."ordinal"
+        FROM candidate_waits AS wait JOIN "agent_steps" AS step ON step."id" = wait."stepId"
+          AND step."sessionId" = wait."sessionId" AND step."turnId" = wait."turnId" AND step."taskId" = wait."parentTaskId"
+      ), source_wait_calls AS (
+        SELECT item."id", item."content", item."sessionId", item."turnId", item."taskId", item."stepId"
+        FROM source_step AS source JOIN "agent_items" AS item ON item."sessionId" = source."sessionId"
+          AND item."turnId" = source."turnId" AND item."taskId" = source."taskId" AND item."stepId" = source."id"
+          AND item."type" = 'tool_call' AND item."content"->>'toolName' = 'wait_subagents'
+      ), source_call_matches AS (
+        SELECT call."id", CASE WHEN jsonb_typeof(call."content"->'input') = 'object' THEN
+            (SELECT count(*) = 4 FROM jsonb_object_keys(call."content"->'input'))
+            AND jsonb_typeof(call."content"->'input'->'idempotencyKey') = 'string'
+            AND call."content"->'input'->'idempotencyKey' = to_jsonb(wait."idempotencyKey")
+            AND jsonb_typeof(call."content"->'input'->'mode') = 'string'
+            AND call."content"->'input'->'mode' = to_jsonb(wait."mode")
+            AND jsonb_typeof(call."content"->'input'->'timeoutMs') = 'number'
+            AND jsonb_typeof(wait."result"->'request') = 'object'
+            AND jsonb_typeof(wait."result"->'request'->'timeoutMs') = 'number'
+            AND call."content"->'input'->'timeoutMs' = wait."result"->'request'->'timeoutMs'
+            AND call."content"->'input'->>'idempotencyKey' ~ '^final-dependency-wait:[a-f0-9]{64}$'
+            AND jsonb_typeof(call."content"->'input'->'taskIds') = 'array'
+            AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(CASE
+              WHEN jsonb_typeof(call."content"->'input'->'taskIds') = 'array'
+                THEN call."content"->'input'->'taskIds' ELSE '[]'::jsonb END) AS input_task(value)
+              WHERE jsonb_typeof(input_task.value) <> 'string')
+            AND jsonb_typeof(wait."targetTaskIds") = 'array'
+            AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(CASE
+              WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) AS target_task(value)
+              WHERE jsonb_typeof(target_task.value) <> 'string')
+            AND ARRAY(SELECT jsonb_array_elements_text(CASE WHEN jsonb_typeof(call."content"->'input'->'taskIds') = 'array'
+              THEN call."content"->'input'->'taskIds' ELSE '[]'::jsonb END) ORDER BY 1)
+              = ARRAY(SELECT jsonb_array_elements_text(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array'
+                THEN wait."targetTaskIds" ELSE '[]'::jsonb END) ORDER BY 1)
+          ELSE false END AS "matchesWaitInput"
+        FROM source_wait_calls AS call CROSS JOIN candidate_waits AS wait
+      ), source_call_results AS (
+        SELECT call."id", count(result."id")::int AS "resultCount"
+        FROM source_wait_calls AS call LEFT JOIN "agent_items" AS result ON result."sessionId" = call."sessionId"
+          AND result."turnId" = call."turnId" AND result."taskId" = call."taskId" AND result."stepId" = call."stepId"
+          AND result."type" = 'tool_result' AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
+        GROUP BY call."id"
+      ), continuation_steps AS (
+        SELECT next."id", next."sessionId", next."turnId", next."taskId", next."attempt", next."ordinal"
+        FROM source_step AS source CROSS JOIN LATERAL (
+          SELECT step."id", step."sessionId", step."turnId", step."taskId", step."attempt", step."ordinal"
+          FROM "agent_steps" AS step WHERE step."sessionId" = source."sessionId" AND step."turnId" = source."turnId"
+            AND step."taskId" = source."taskId" AND step."attempt" = source."attempt"
+            AND step."ordinal" = (SELECT MIN(later."ordinal") FROM "agent_steps" AS later
+              WHERE later."sessionId" = source."sessionId" AND later."turnId" = source."turnId"
+                AND later."taskId" = source."taskId" AND later."attempt" = source."attempt" AND later."ordinal" > source."ordinal")
+          ORDER BY step."id" LIMIT 2
+        ) AS next
+      ), continuation_calls AS (
+        SELECT item."id", item."content", item."sessionId", item."turnId", item."taskId", item."stepId"
+        FROM continuation_steps AS step JOIN "agent_items" AS item ON item."sessionId" = step."sessionId"
+          AND item."turnId" = step."turnId" AND item."taskId" = step."taskId" AND item."stepId" = step."id"
+          AND item."type" = 'tool_call'
+      ), continuation_call_results AS (
+        SELECT call."id", call."content"->>'toolName' AS "toolName", count(result."id")::int AS "resultCount"
+        FROM continuation_calls AS call LEFT JOIN "agent_items" AS result ON result."sessionId" = call."sessionId"
+          AND result."turnId" = call."turnId" AND result."taskId" = call."taskId" AND result."stepId" = call."stepId"
+          AND result."type" = 'tool_result' AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
+        GROUP BY call."id", call."content"->>'toolName'
+      )
+      SELECT EXISTS (SELECT 1 FROM candidate_waits) AS "selectedWaitPresent",
+        LEAST((SELECT count(*)::int FROM source_wait_calls), 32) AS "sourceWaitCallCount",
+        LEAST((SELECT count(*)::int FROM source_call_matches WHERE "matchesWaitInput"), 32) AS "sourceWaitCallsMatchingWaitInput",
+        LEAST((SELECT count(*)::int FROM source_call_results WHERE "resultCount" = 1), 32) AS "sourceWaitCallsWithOneResult",
+        LEAST((SELECT count(*)::int FROM continuation_steps), 2) AS "continuationStepCount",
+        LEAST((SELECT count(*)::int FROM continuation_calls), 32) AS "continuationToolCallCount",
+        LEAST((SELECT count(*)::int FROM continuation_calls WHERE "content"->>'toolName' = 'wait_subagents'), 32) AS "continuationWaitCallCount",
+        LEAST((SELECT count(*)::int FROM continuation_call_results WHERE "resultCount" = 1), 32) AS "continuationToolCallsWithOneResult",
+        LEAST((SELECT count(*)::int FROM continuation_call_results WHERE "toolName" = 'wait_subagents' AND "resultCount" = 1), 32) AS "continuationWaitCallsWithOneResult"`,
+      [ids.userId, ids.sessionId, ids.turnId])
+    const row = result.rows[0]
+    return row ? { available: true, ...row } : { available: false }
+  } catch {
+    return { available: false }
   }
 }
 

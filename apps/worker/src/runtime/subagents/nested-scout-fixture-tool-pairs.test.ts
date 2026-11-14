@@ -86,10 +86,58 @@ describe("nested Scout fixture tool/result pairing", () => {
     expect(find.findExactToolResult(waitRequest, { name: "wait_subagents", input: resolvedWaitInput })?.output).toEqual({ status: "ready" })
     expect(() => find.findUniqueWaitInput(waitRequest, ["child-a"]))
       .toThrow("p1143_fixture_wait_input_invalid")
-    const duplicateWait = { messages: [
-      waitRequest.messages[0], { role: "assistant", content: [{ type: "tool_use", id: "second-wait", name: "wait_subagents", input }] },
+  })
+
+  it("selects the last persisted wait and pairs its result by that call ID when inputs repeat", async () => {
+    const find = await resolver()
+    const input = { idempotencyKey: `final-dependency-wait:${"a".repeat(64)}`, taskIds: ["child-a", "child-b"], mode: "all", timeoutMs: 30_000 }
+    const history = { messages: [
+      { role: "assistant", content: [{ type: "tool_use", id: "older-wait", name: "wait_subagents", input }] },
+      { role: "tool", content: [{ type: "tool_result", toolUseId: "older-wait", content: JSON.stringify({ status: "waiting", turn: 1 }) }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "latest-wait", name: "wait_subagents", input }] },
+      { role: "tool", content: [{ type: "tool_result", toolUseId: "latest-wait", content: JSON.stringify({ status: "ready", turn: 2 }) }] },
     ] }
-    expect(() => find.findUniqueWaitInput(duplicateWait, ["child-a", "child-b"]))
-      .toThrow("p1143_fixture_tool_pair_call_ambiguous")
+
+    expect(find.findUniqueWaitInput(history, ["child-a", "child-b"])).toBe(input)
+    expect(find.findExactToolResult(history, { name: "wait_subagents", input }))
+      .toEqual({ callId: "latest-wait", output: { status: "ready", turn: 2 }, isError: false })
+  })
+
+  it("selects and validates the last wait input without falling back to an earlier valid wait", async () => {
+    const find = await resolver()
+    const valid = { idempotencyKey: `final-dependency-wait:${"a".repeat(64)}`, taskIds: ["child-a", "child-b"], mode: "all", timeoutMs: 30_000 }
+    const invalidLatest = { ...valid, timeoutMs: 29_999 }
+    const history = { messages: [
+      { role: "assistant", content: [{ type: "tool_use", id: "older-wait", name: "wait_subagents", input: valid }] },
+      { role: "tool", content: [{ type: "tool_result", toolUseId: "older-wait", content: "{}" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "latest-wait", name: "wait_subagents", input: invalidLatest }] },
+      { role: "tool", content: [{ type: "tool_result", toolUseId: "latest-wait", content: "{}" }] },
+    ] }
+
+    expect(() => find.findUniqueWaitInput(history, ["child-a", "child-b"]))
+      .toThrow("p1143_fixture_wait_input_invalid")
+  })
+
+  it("rejects a missing or duplicate result for the latest wait instead of reusing an older result", async () => {
+    const find = await resolver()
+    const input = { idempotencyKey: `final-dependency-wait:${"a".repeat(64)}`, taskIds: ["child-a", "child-b"], mode: "all", timeoutMs: 30_000 }
+    const missingLatest = { messages: [
+      { role: "assistant", content: [{ type: "tool_use", id: "older-wait", name: "wait_subagents", input }] },
+      { role: "tool", content: [{ type: "tool_result", toolUseId: "older-wait", content: JSON.stringify({ status: "ready" }) }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "latest-wait", name: "wait_subagents", input }] },
+    ] }
+    const duplicateLatest = { messages: [
+      { role: "assistant", content: [{ type: "tool_use", id: "latest-wait", name: "wait_subagents", input }] },
+      { role: "tool", content: [
+        { type: "tool_result", toolUseId: "latest-wait", content: JSON.stringify({ status: "ready" }) },
+        { type: "tool_result", toolUseId: "latest-wait", content: JSON.stringify({ status: "timed_out" }) },
+      ] },
+    ] }
+
+    const latestInput = find.findUniqueWaitInput(missingLatest, ["child-a", "child-b"])
+    expect(() => find.findExactToolResult(missingLatest, { name: "wait_subagents", input: latestInput }))
+      .toThrow("p1143_fixture_tool_pair_result_invalid")
+    expect(() => find.findExactToolResult(duplicateLatest, { name: "wait_subagents", input }))
+      .toThrow("p1143_fixture_tool_pair_result_ambiguous")
   })
 })
