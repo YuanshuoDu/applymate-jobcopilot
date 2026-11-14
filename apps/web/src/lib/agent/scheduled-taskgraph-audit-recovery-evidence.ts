@@ -157,7 +157,7 @@ function gateChoiceItem(items: Row[], step: Row, owner: OwnerIdentity, pipelineO
   const task = binding && tasks.get(binding.gateTaskId)
   return !!state && item.id === `agent-wait:question:${waitId}` && item.type === 'question'
     && item.stepId === step.id && item.taskId === owner.rootTaskId && sameOwner(binding.owner, pipelineOwner, attempt)
-    && !!task && taskMatches(task, owner, binding.gateTaskId, 'gate') && gateChoiceAttemptMatches(task, binding, content)
+    && !!content && !!task && taskMatches(task, owner, binding.gateTaskId, 'gate') && gateChoiceAttemptMatches(task, binding, content)
 }
 function gateChoiceAttemptMatches(task: Row, binding: GateBinding, content: Row): boolean {
   const current = task.attemptCount, resumed = Object.hasOwn(content, 'scheduledGateChoiceResumeAcknowledgement')

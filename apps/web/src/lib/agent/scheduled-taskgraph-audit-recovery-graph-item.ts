@@ -11,6 +11,7 @@ const AUDIT_GOAL = 'Return the exact report from the authenticated scheduled Aud
 const AUDIT_CRITERIA = ['Continue the exact scheduled execution only after its canonical Gate proof is verified.',
   'Return only the fixed seven-field report without adding actions or interpreting historical counts.',
   'Never submit applications or invoke model or tool runtimes.']
+const WAIT_TIMEOUT_MS = 86_400_000
 
 /** Recognizes only the exact server-written TaskGraph proposal owned by this recovery Step. */
 export async function isScheduledTaskGraphAuditRecoveryGraphItem(input: Readonly<{
