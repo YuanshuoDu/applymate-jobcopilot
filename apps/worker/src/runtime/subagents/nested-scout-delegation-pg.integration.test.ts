@@ -8,6 +8,7 @@ import { projectWaitCallCompletionPayload } from "../turns/turn-execution-wait-e
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import { taskGraphItemId, taskGraphLifecycleKey, taskGraphWaitLifecycleKey } from "./task-graph-snapshot.js"
 import { loadChildAttemptResume } from "./child-resume.js"
+import { waitResolverErrorCodesFromOutput } from "./nested-scout-wait-resolver-diagnostic.js"
 import type { SubagentLease } from "./types.js"
 
 const DATABASE_NAME = "applymate_nested_delegation_ci"
@@ -63,13 +64,6 @@ const SAFE_DIAGNOSTIC_ERROR_CODES = [
   "subagent_role_unknown",
 ] as const
 const SAFE_WAIT_RESUME_CODES = ["wait_invalid", "wait_scope_error", "wait_conflict", "other"] as const
-const SAFE_WAIT_RESOLVER_CODES = [
-  "idempotency_conflict", "revision_mismatch", "wait_invalid", "wait_scope_error", "wait_conflict",
-  "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01", "ECONNRESET", "ETIMEDOUT", "error", "unknown", "other",
-  "child_wait_configuration", "child_wait_deadline_revalidation", "child_wait_parent_deadline_scope", "child_wait_schedule_fence",
-  "child_wait_session_scope", "task_graph_prepare_or_load", "task_graph_transition_rejected", "task_graph_persist_revision_conflict",
-  "task_graph_persist_outbox_conflict", "task_graph_persist_sequence_unavailable",
-] as const
 const SAFE_RECOVERY_STAGES = ["manager_recover", "dispatch"] as const
 const SAFE_RECOVERY_ERROR_CODES = [
   "subagent_dispatch_delivery_uncertain", "lost", "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01",
@@ -151,24 +145,6 @@ function seenMainProgress(output: string[]) {
     || SAFE_RECOVERY_DIAGNOSTIC_MARKERS.has(value) || isSafeChildResumeLoaderDiagnostic(value)
     || isSafeRootSetupDiagnostic(value) || isSafeParentResumeDiagnostic(value)))]
 }
-
-function waitResolverErrorCodesFromOutput(output: readonly string[]): string[] {
-  return [...new Set(output.flatMap(value => {
-    const match = value.match(/^P1143_WAIT_RESOLVER_ERROR:([A-Za-z0-9_]+)$/)
-    return match && SAFE_WAIT_RESOLVER_CODES.includes(match[1] as typeof SAFE_WAIT_RESOLVER_CODES[number]) ? [match[1]] : []
-  }))]
-}
-
-describe("nested Scout wait-resolver diagnostic allowlist", () => {
-  it("filters unknown values before adding the diagnostic snapshot", () => {
-    expect(waitResolverErrorCodesFromOutput([
-      "P1143_WAIT_RESOLVER_ERROR:task_graph_prepare_or_load",
-      "P1143_WAIT_RESOLVER_ERROR:error",
-      "P1143_WAIT_RESOLVER_ERROR:raw_exception_message_with_identifier",
-      "P1143_WAIT_RESOLVER_ERROR:task_graph_prepare_or_load:extra",
-    ])).toEqual(["task_graph_prepare_or_load", "error"])
-  })
-})
 
 async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
   const observedPhases = seenMainProgress(output)

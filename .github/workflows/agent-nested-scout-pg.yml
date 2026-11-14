@@ -71,6 +71,8 @@ jobs:
         run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
       - name: Build Worker dependencies
         run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Run wait-resolver diagnostic unit test
+        run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/nested-scout-wait-resolver-diagnostic.test.ts
       - name: Run nested Scout PostgreSQL acceptance cases
         env:
           REPORT_PATH: ${{ runner.temp }}/nested-scout-runtime-pg.json
