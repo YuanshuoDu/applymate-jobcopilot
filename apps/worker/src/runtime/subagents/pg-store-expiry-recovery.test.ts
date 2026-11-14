@@ -447,17 +447,20 @@ describe("expired subagent recovery fence", () => {
     expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
   })
 
-  it("rolls back speculative wait-step promotion when the graph rejects recovery", async () => {
+  it("leaves expiry recovery writes untouched when the graph rejects a registered wait", async () => {
     graphMocks.prepare.mockReturnValueOnce({ blocked: true })
     const fake = fixture({ child: true, registeredWait: true, pendingCall: true, exactWaitCall: true, waitStepStatus: "streaming" })
     await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toEqual([])
-    expect(fake.calls.some(sql => sql.startsWith('UPDATE "agent_steps" SET "status" = \'waiting_for_tool\''))).toBe(true)
-    expect(fake.calls.some(sql => sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
-    expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(false)
+    expect(graphMocks.prepare).toHaveBeenLastCalledWith(fake.client, {
+      taskId: "child-1", sessionId: "session-1", type: "task.waiting", attemptCount: 1, waitRowId: "wait-1",
+    })
+    expect(fake.client.query.mock.calls.filter(([sql]) => /^(?:UPDATE|INSERT|DELETE)\s+"(?:agent_steps|agent_wait_conditions|sub_agent_tasks|agent_outbox)"/.test(sql))).toEqual([])
     expect(fake.calls.filter(sql => sql.includes("SAVEPOINT"))).toEqual([
       "SAVEPOINT subagent_expiry_recovery_candidate", "ROLLBACK TO SAVEPOINT subagent_expiry_recovery_candidate",
       "RELEASE SAVEPOINT subagent_expiry_recovery_candidate",
     ])
+    expect(fake.calls.filter(sql => ["BEGIN", "COMMIT", "ROLLBACK"].includes(sql))).toEqual(["BEGIN", "COMMIT"])
+    expect(fake.calls.at(-1)).toBe("COMMIT")
   })
 
   it("terminally closes an inadmissible pre-insert wait without retry and still blocks other pending calls", async () => {

@@ -4,12 +4,14 @@ import { taskGraphCreateCapacityAllowed, type OperationalFailureCapacityReuse } 
 import { hasOverlappingTaskGraphRepair } from "./task-graph-repair-conflicts.js"
 import { APPLICATION_FILLER_TEMPLATE_ID, isApplicationFillerTemplate, isHarnessSubagentRole } from "./role-policy.js"
 import { createSubagentTask } from "./pg-store-create.js"
+import { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
+import { templatesForInteractiveScoutDelegation } from "./nested-scout-profile.js"
 import { json, type Queryable } from "./pg-store-persistence.js"
 import { inheritSubagentPolicy, type SubagentTaskRecord } from "./types.js"
 import { policyFromTask } from "./manager-task-scope.js"
 import type { TaskGraphScheduleInput, TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import type { GraphParent, LoadedGraph } from "./task-graph-pg-state.js"
-import { taskGraphSnapshot, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, taskGraphSnapshot, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { materializeTaskGraphDependencyContext, type ScopedDependencyResult } from "./task-graph-dependency-context.js"
 import { validateTaskGraphRepairTargets } from "./task-graph-pg-create-repair-validation.js"
 import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-context-loader.js"
@@ -19,6 +21,7 @@ import { sourceIntentForTaskGraphNode } from "./task-graph-source-intent-context
 import { scheduledScoutPlanCapacityAllowed } from "./scheduled-taskgraph-plan-capacity.js"
 
 const EXTERNAL_ACTION = /(?:^|[._-])(submit|send|publish|delete|mutate|execute)(?:$|[._-])/i
+const REGISTERED_NESTED_SCOUT = templatesForInteractiveScoutDelegation(TASK_GRAPH_TEMPLATES, TASK_GRAPH_TEMPLATES)?.scout
 
 export type CreatedGraphTasks = Readonly<{
   state: TaskGraphState
@@ -178,6 +181,8 @@ export async function createGraphTasks(
     const context = status === "queued" && node.dependsOn.length > 0
       ? materializeTaskGraphDependencyContext(candidateContext, input.scope, node.dependsOn, contextDependencies)
       : candidateContext
+    const nestedScoutAuthority = node.templateId === "scout" && REGISTERED_NESTED_SCOUT
+      && canonicalTaskGraphJson(template) === canonicalTaskGraphJson(REGISTERED_NESTED_SCOUT) ? "parent_template" as const : undefined
     const child = await createSubagentTask(client, {
       userId: input.scope.userId, sessionId: input.scope.sessionId, turnId: input.scope.turnId,
       parentTaskId: input.scope.parentTaskId, role: template.role, taskType: template.taskType,
@@ -187,6 +192,7 @@ export async function createGraphTasks(
     }, true, {
       preserveEmptyAllowedActions: isApplicationFillerTemplate(node.templateId, template.role, template.taskType),
       taskGraphChildDeadline: true,
+      ...(nestedScoutAuthority ? { nestedScoutAuthority } : {}),
     })
     if (status === "waiting") {
       const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = 'waiting', "updatedAt" = CURRENT_TIMESTAMP

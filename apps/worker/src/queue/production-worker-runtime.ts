@@ -49,17 +49,19 @@ export async function startProductionWorkerRuntime(
   return dependencies.startProductionAgentRuntime({
     pool,
     createRuntime: async () => {
-      childExecutor = dependencies.createOptionalProductionChildExecutor({
-        enabled: productionFlags.childExecutionEnabled,
-        pool,
-      })
-      return dependencies.createCanonicalTurnRuntime(pool, {
+      const runtime = await dependencies.createCanonicalTurnRuntime(pool, {
         workerId: input.workerId,
         authorizeUsage: dependencies.createWorkerUsageAuthorizer(),
         productionFlags,
         executionProjection: dependencies.createCanonicalExecutionProjection(pool),
         sessionProjection: dependencies.createCanonicalSessionProjection(pool),
       })
+      childExecutor = dependencies.createOptionalProductionChildExecutor({
+        enabled: productionFlags.childExecutionEnabled,
+        pool,
+        subagentManager: () => runtime.manager,
+      })
+      return runtime
     },
     bootstrapOptions: () => ({
       ...(childExecutor ? { subagents: { execute: childExecutor } } : {}),

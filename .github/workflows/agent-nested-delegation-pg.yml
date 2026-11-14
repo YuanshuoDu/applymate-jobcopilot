@@ -1,0 +1,123 @@
+name: Agent nested delegation PostgreSQL primitive
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  parent-execution-fence-postgres:
+    name: Parent execution fence on disposable PostgreSQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: applymate_nested_delegation_ci
+          POSTGRES_USER: nested_fixture
+          POSTGRES_PASSWORD: nested_fixture_only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nested_fixture -d applymate_nested_delegation_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      CI: 'true'
+      DATABASE_URL: postgresql://nested_fixture:nested_fixture_only@127.0.0.1:5432/applymate_nested_delegation_ci
+      AGENT_RUNTIME_PG_TEST_URL: postgresql://nested_fixture:nested_fixture_only@127.0.0.1:5432/applymate_nested_delegation_ci
+      AGENT_RUNTIME_PG_TEST_DISPOSABLE: 'true'
+      AGENT_RUNTIME_PG_TEST_REQUIRED: 'true'
+      RUN_AGENT_TURN_REDIS_INTEGRATION: '1'
+      AGENT_TURN_REDIS_TEST_DISPOSABLE: 'true'
+      AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+      REDIS_URL: redis://127.0.0.1:6379/15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Guard disposable loopback services
+        shell: bash
+        run: |
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "postgresql://nested_fixture:nested_fixture_only@127.0.0.1:5432/applymate_nested_delegation_ci"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "$DATABASE_URL"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          test "$RUN_AGENT_TURN_REDIS_INTEGRATION" = "1"
+          test "$AGENT_TURN_REDIS_TEST_DISPOSABLE" = "true"
+          test "$AGENT_TURN_REDIS_TEST_URL" = "redis://127.0.0.1:6379/15"
+          test "$REDIS_URL" = "$AGENT_TURN_REDIS_TEST_URL"
+      - name: Apply existing migrations
+        run: pnpm --filter @jobcopilot/web exec prisma migrate deploy --schema prisma/schema.prisma
+      - name: Generate Prisma client
+        run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
+      - name: Build Worker dependencies
+        run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Run eight PostgreSQL primitive cases
+        env:
+          REPORT_PATH: ${{ runner.temp }}/nested-delegation-pg.json
+        run: |
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
+            src/runtime/subagents/parent-execution-fence-pg.integration.test.ts \
+            --reporter=default --reporter=json --outputFile.json="$REPORT_PATH"
+      - name: Require the exact passing case set
+        if: always()
+        shell: bash
+        env:
+          REPORT_PATH: ${{ runner.temp }}/nested-delegation-pg.json
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs')
+          const report = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, 'utf8'))
+          const expected = [
+            'creates a depth-two child and dispatch under the current parent lease',
+            'replays an exact idempotent spawn once for the current parent lease',
+            'rejects reclaimed owners and attempts before create or idempotent return',
+            'rejects expired interrupted and terminal parent executions',
+            'rejects foreign user session turn root and parent identities',
+            'enforces inherited depth and fan-out limits without partial dispatch',
+            'fences an owner change while atomic creation waits for the session lock',
+            'rejects aborted execution without changing the current parent or dispatch',
+          ]
+          if (!report.success || report.numTotalTests !== 8 || report.numPassedTests !== 8 ||
+              report.numFailedTests !== 0 || report.numPendingTests !== 0 || report.numTodoTests !== 0) {
+            throw new Error('Expected eight passing tests and no failed, skipped, pending or todo tests')
+          }
+          if (!Array.isArray(report.testResults) || report.testResults.length !== 1 ||
+              !report.testResults[0].name.replaceAll('\\', '/').endsWith('/src/runtime/subagents/parent-execution-fence-pg.integration.test.ts')) {
+            throw new Error('Report must contain the single intended test file')
+          }
+          const cases = report.testResults[0].assertionResults
+          if (!Array.isArray(cases) || cases.length !== 8 || cases.some(test => test.status !== 'passed') ||
+              JSON.stringify(cases.map(test => test.title).sort()) !== JSON.stringify(expected.sort())) {
+            throw new Error('The exact eight named primitive cases must all pass')
+          }
+          NODE
+      - name: Preserve PostgreSQL primitive report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-nested-delegation-pg-report
+          path: ${{ runner.temp }}/nested-delegation-pg.json
+          if-no-files-found: warn
+          retention-days: 1

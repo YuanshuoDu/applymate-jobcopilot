@@ -5,6 +5,7 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 import { ToolRegistry } from "../tools/registry.js"
+import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 
 const control = vi.hoisted(() => ({ canManageChildren: false }))
 
@@ -67,7 +68,7 @@ const lease = {
   budgetSnapshot: {}, toolPolicySnapshot: {}, ownerId: "worker-1", signal: new AbortController().signal,
 } as SubagentLease
 
-function task(allowedActions: unknown): Pick<SubagentTaskRecord, "role" | "allowedActions"> {
+function task(allowedActions: unknown): Pick<SubagentTaskRecord, "role" | "allowedActions"> & Partial<Pick<SubagentTaskRecord, "taskType" | "depth" | "parentTaskId" | "rootTaskId" | "context">> {
   return { role: "scout", allowedActions }
 }
 
@@ -85,6 +86,16 @@ describe("registerProductionChildWaitTool", () => {
     })).toBe(true)
     expect(enabled.list().map(definition => definition.name)).toEqual(["wait_subagents"])
     expect(enabled.resolve("wait_subagents", "1")).toMatchObject({ risk: "internal_write", domain: "coordination", idempotency: "requires_key" })
+  })
+
+  it("registers the wait tool for an exact server-profile Scout without a global child-management role flag", () => {
+    control.canManageChildren = false
+    const nestedScout = new ToolRegistry([])
+    expect(registerProductionChildWaitTool({ pool: {} as never, task: {
+      ...task(["wait_subagents"]), taskType: "job_discovery", depth: 1, parentTaskId: "root-1", rootTaskId: "root-1",
+      context: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER },
+    }, lease, registry: nestedScout })).toBe(true)
+    expect(nestedScout.list().map(definition => definition.name)).toEqual(["wait_subagents"])
   })
 
   it("rejects aliases, malformed action values, and unknown roles", () => {

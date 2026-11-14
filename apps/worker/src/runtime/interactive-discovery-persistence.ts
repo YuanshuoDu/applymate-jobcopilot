@@ -13,6 +13,12 @@ type LatestDiscoveryTasks =
   | Readonly<{ ok: true; scout: GraphTaskRow; analyst: GraphTaskRow }>
   | Readonly<{ ok: false; failures: readonly DiscoveryShortlistFailureCode[] }>
 const ROLE_TASK_TERMINAL_FAILURES = new Set(["failed", "interrupted", "cancelled", "closed"])
+const NON_EVIDENCE_COORDINATION_TOOLS = new Set(["scout.delegate", "scout.results", "wait_subagents"])
+
+function evidenceObservations(observations: readonly { readonly id: string; readonly content: Record<string, unknown> }[]) {
+  return observations.filter(observation => typeof observation.content.toolName !== "string"
+    || !NON_EVIDENCE_COORDINATION_TOOLS.has(observation.content.toolName))
+}
 
 /** Rebuilds the shortlist from this owner's exact Scout/Analyst TaskGraph results and read receipts. */
 export async function loadInteractiveDiscoveryShortlist(input: {
@@ -149,8 +155,8 @@ export function buildInteractiveDiscoveryShortlist(input: {
   readonly analystObservations: readonly { readonly id: string; readonly content: Record<string, unknown> }[]
 }): DiscoveryShortlistResult {
   const observedEvidence = createObservedEvidenceIndex()
-  hydrateObservedEvidence(observedEvidence, input.scoutObservations)
-  hydrateObservedEvidence(observedEvidence, input.analystObservations)
+  hydrateObservedEvidence(observedEvidence, evidenceObservations(input.scoutObservations))
+  hydrateObservedEvidence(observedEvidence, evidenceObservations(input.analystObservations))
   return buildDiscoveryShortlist({ ...input, observedEvidence })
 }
 

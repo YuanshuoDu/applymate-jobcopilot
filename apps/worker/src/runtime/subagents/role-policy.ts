@@ -50,6 +50,7 @@ const READ_DOMAINS: readonly PolicyDomain[] = ["jobs", "persona", "resume", "app
 const COORDINATION_TOOL_NAMES: ReadonlySet<string> = new Set([
   "spawn_subagent", "agent.spawn", "agent.followup",
   "send_message", "agent.send", "wait_subagents", "agent.wait",
+  "scout.delegate", "scout.results",
   "list_subagents", "agent.list", "interrupt_subagent", "agent.interrupt",
   "close_subagent", "agent.close",
 ])

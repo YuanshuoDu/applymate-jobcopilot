@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest"
 
 import { TASK_GRAPH_LIMITS, type TaskGraphState, type TaskGraphVerificationDisposition } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
-import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphSnapshot, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphLifecycleKey, taskGraphSnapshot,
+  taskGraphState, taskGraphWaitLifecycleKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 
 const queuedEvent = {
@@ -33,6 +34,19 @@ describe("parseTaskGraphEvent", () => {
     expect(parseTaskGraphEvent({ ...queuedEvent, expectedRevision: -1 })).toBeNull()
     expect(parseTaskGraphEvent({ ...queuedEvent, extra: "unexpected" })).toBeNull()
     expect(parseTaskGraphEvent({ ...queuedEvent, type: "task.failed" })).toBeNull()
+  })
+})
+
+describe("taskGraphWaitLifecycleKey", () => {
+  it("reuses one persisted wait identity and separates distinct waits in the same attempt", () => {
+    const first = taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a")
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a")).toBe(first)
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-b")).not.toBe(first)
+    expect(taskGraphWaitLifecycleKey("root-1", "other-node", 3, "wait-row-a")).not.toBe(first)
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 4, "wait-row-a")).not.toBe(first)
+    expect(taskGraphWaitLifecycleKey("other-root", "scout-node", 3, "wait-row-a")).not.toBe(first)
+    expect(first).not.toContain("wait-row-a")
+    expect(first).not.toBe(taskGraphLifecycleKey("root-1", "scout-node", 3, "task.waiting"))
   })
 })
 

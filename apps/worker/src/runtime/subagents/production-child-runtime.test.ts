@@ -9,6 +9,9 @@ import type { SubagentLease } from "./types.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import type { TurnEngineStore } from "../turns/turn-engine-types.js"
 import type { PublicToolDefinition } from "../tools/types.js"
+import type { ChildToolRuntime } from "./child-executor.js"
+import type { ChildAttemptResume } from "./child-resume.js"
+import type { DurableWaitResume } from "./child-resume-observations.js"
 import { createJobDiscoveryClient, type JobDiscoveryRequest } from "../tools/job-discovery-client.js"
 import { InMemoryArtifactToolStore } from "../tools/artifact-tools.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
@@ -24,6 +27,7 @@ import type { PolicyEvaluationContext } from "@jobcopilot/agent-policy"
 import { SCHEDULED_AUDIT_OUTPUT_SCHEMA, SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE } from "./scheduled-audit-contract.js"
 import { SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_AUDIT_ROLE, SCHEDULED_POST_GATE_AUDIT_TASK_TYPE,
   SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_EXECUTE_ROLE, SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE } from "./scheduled-post-gate-contract.js"
+import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 
 const artifactStoreMock = vi.hoisted(() => ({ current: null as unknown, sourceDigestReader: null as unknown }))
 const applicationFillExecutorMock = vi.hoisted(() => ({
@@ -94,6 +98,29 @@ function store(): TurnEngineStore {
     appendEvent: async ({ id }) => ({ id }),
     recordFinalResponse: async () => undefined,
   }
+}
+
+function productionWaitResumeFixture() {
+  const child: SubagentLease = { ...lease(), role: "scout", taskType: "job_discovery", allowedActions: ["wait_subagents"],
+    context: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER }, leaseExpiresAt: new Date("2099-09-14T11:30:00.000Z") }
+  const input = { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all" as const, timeoutMs: 5_000 }
+  const output = { waitId: "wait-1", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-09-14T11:30:00.000Z",
+    matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: {}, failureReason: null }] }
+  const durableWait: DurableWaitResume = { waitId: "wait-1", stepId: `task:${child.id}:step:4:attempt:${child.attemptCount}`,
+    attempt: child.attemptCount, ordinal: 18, toolCallId: "old-wait-call", sourceItemId: "old-wait-result", input, output }
+  const restored: ChildAttemptResume = {
+    resume: { nextOrdinal: 5, stepCount: 5, toolCallCount: 1, inputThroughSequence: 18n, consumedInputIds: [],
+      usage: { inputTokens: 21, outputTokens: 8, estimatedCostUsd: 0.12 } },
+    observations: [{ id: "child-resume:old-wait-result", content: { toolCallId: "old-wait-call", toolName: "wait_subagents",
+      input, status: "completed", output, errorCode: null } }], durableWait,
+  }
+  const turnStore: TurnEngineStore = { ...store(), startStep: async ({ stepId }) => ({ id: stepId, ordinal: 39 }) }
+  const model: ModelAdapter = { id: "fixture-model", profile, async *stream() {
+    yield { type: "text_delta", text: "continued after durable wait" }
+    yield { type: "completed", finishReason: "stop" }
+  } }
+  const tools: ChildToolRuntime = { definitions: [], router: { execute: async () => { throw new Error("unexpected tool call") } }, validateArguments: () => true }
+  return { child, durableWait, turnStore, model, tools, resumeLoader: async () => restored }
 }
 
 function recordingStore() {
@@ -414,6 +441,33 @@ function policySnapshot(outcome: "allow" | "deny", tools?: string[]) {
 }
 
 describe("production child runtime", () => {
+  it("forwards a supplied durable-wait committer through production child composition", async () => {
+    const fixture = productionWaitResumeFixture(), pool = { connect: vi.fn(), query: vi.fn() }
+    const committer = vi.fn(async () => true)
+    const executor = createProductionChildExecutor({ pool: pool as never, turnStore: fixture.turnStore, treeBudget: budget(),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
+        settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => fixture.model,
+      toolRuntimeFactory: () => fixture.tools, mailboxReader: emptyMailboxReader, resumeLoader: fixture.resumeLoader,
+      durableWaitResumeCommitter: committer })
+
+    await expect(executor({ lease: fixture.child })).resolves.toMatchObject({
+      status: "completed", result: { finalText: "continued after durable wait" },
+    })
+    expect(committer).toHaveBeenCalledWith(fixture.child, fixture.durableWait, 39)
+    expect(pool.connect).not.toHaveBeenCalled()
+  })
+
+  it("keeps the production PostgreSQL committer when no override is supplied", async () => {
+    const fixture = productionWaitResumeFixture()
+    const pool = { connect: vi.fn(async () => { throw new Error("fixture connection unavailable") }), query: vi.fn() }
+    const executor = createProductionChildExecutor({ pool: pool as never, turnStore: fixture.turnStore, treeBudget: budget(),
+      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => fixture.model,
+      toolRuntimeFactory: () => fixture.tools, mailboxReader: emptyMailboxReader, resumeLoader: fixture.resumeLoader })
+
+    await expect(executor({ lease: fixture.child })).resolves.toMatchObject({ status: "failed" })
+    expect(pool.connect).toHaveBeenCalledOnce()
+  })
+
   it("composes the exact generic-Scout discovery exception without widening internal writes", () => {
     const scout = createProductionChildPolicy({ role: "scout", taskType: "discovery", toolPolicySnapshot: policySnapshot("deny") }, false)
     expect(discoveryDecision(scout)).toMatchObject({ outcome: "allow", reasonCode: "server_scout_job_discovery_write" })
@@ -442,7 +496,7 @@ describe("production child runtime", () => {
     expect(discoveryDecision(policy)).toMatchObject({ outcome: "deny", reasonCode: "configured_internal_write_deny" })
   })
 
-  it("completes the same-Turn provider discovery to Analyst read and owner shortlist path", async () => {
+  it("composes a server-authorized Scout delegation through the default production tool runtime", async () => {
     const ownerUserId = "user-1"
     const providerUrl = "https://jobs.example/1"
     const scheduledAutomationSnapshot = {
@@ -548,6 +602,7 @@ describe("production child runtime", () => {
     const ownerGateCalls: unknown[][] = []
     const provenanceQueries: string[] = []
     const provenanceParameters: Array<readonly unknown[] | undefined> = []
+    const nestedWaitQueries: string[] = []
     const provenanceConnection = {
       query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
         provenanceQueries.push(sql)
@@ -558,6 +613,28 @@ describe("production child runtime", () => {
       }),
       release: vi.fn(),
     }
+    const nestedWaitConnection = {
+      query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+        nestedWaitQueries.push(sql)
+        if (sql === "BEGIN READ ONLY" || sql === "COMMIT" || sql === "ROLLBACK" || sql === "SELECT set_config('app.user_id', $1, true)") return { rows: [] }
+        if (sql.includes('FROM "agent_steps" step')) {
+          const [stepId, stepOrdinal, taskId, sessionId, turnId, attempt, userId, rootTaskId, ownerId] = values ?? []
+          return { rows: [{
+            stepId, stepOrdinal, stepStatus: "streaming", stepTaskId: taskId, stepSessionId: sessionId, stepTurnId: turnId,
+            stepAttempt: attempt, sessionId, sessionUserId: userId, sessionStatus: "running", turnId,
+            turnSessionId: sessionId, turnRootTaskId: rootTaskId, parentId: taskId, parentUserId: userId,
+            parentSessionId: sessionId, parentTurnId: turnId, parentRootTaskId: rootTaskId, parentTaskId: rootTaskId,
+            parentDepth: 1, parentPath: `/${String(rootTaskId)}/${String(taskId)}`, parentRole: "scout",
+            parentTaskType: "job_discovery", parentContext: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER },
+            parentStatus: "running", parentLeaseOwner: ownerId, parentAttemptCount: attempt, parentInterruptRequestedAt: null,
+          }] }
+        }
+        if (sql.includes('FROM "sub_agent_tasks" child')) return { rows: [] }
+        throw new Error(`unexpected nested wait query: ${sql}`)
+      }),
+      release: vi.fn(),
+    }
+    let poolConnections = 0
     const poolFixture = {
       query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
         if (sql.includes('FROM "Job" WHERE "id" = $1 AND "userId" = $2')) {
@@ -577,7 +654,7 @@ describe("production child runtime", () => {
         }
         throw new Error(`unexpected composed discovery fixture query: ${sql}`)
       }),
-      connect: vi.fn(async () => provenanceConnection),
+      connect: vi.fn(async () => poolConnections++ === 0 ? provenanceConnection : nestedWaitConnection),
     }
     const scoutRequests: HarnessModelRequest[] = []
     const scoutModel: ModelAdapter = {
@@ -586,6 +663,11 @@ describe("production child runtime", () => {
         scoutRequests.push(request)
         if (scoutRequests.length === 1) {
           yield { type: "tool_call_completed", callId: "scout-discover-call", name: "jobs.discover", arguments: { targetRoles: ["Engineer"], targetLocations: ["Dublin"], pageSize: 2 } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        if (scoutRequests.length === 2) {
+          yield { type: "tool_call_completed", callId: "scout-delegate-call", name: "scout.delegate", arguments: { goal: "Find another role source", sourceSlice: ["greenhouse"] } }
           yield { type: "completed", finishReason: "tool_calls" }
           return
         }
@@ -610,19 +692,34 @@ describe("production child runtime", () => {
     }
     const scoutLease: SubagentLease = {
       ...lease(), id: "scout-task", userId: ownerUserId, role: "scout", taskType: "job_discovery",
-      allowedActions: ["jobs.search", "jobs.get", "jobs.discover"],
+      allowedActions: ["jobs.search", "jobs.get", "jobs.discover", "wait_subagents", "scout.delegate", "scout.results"],
+      context: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER },
       expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, leaseExpiresAt: new Date(Date.now() + 60_000),
     }
+    const nestedChild = { ...scoutLease, id: "grandchild-scout", parentTaskId: scoutLease.id, rootTaskId: scoutLease.rootTaskId, depth: 2 }
+    const manager = { spawnFromLease: vi.fn(async () => ({ task: nestedChild, duplicate: false, atomic: true as const })) }
+    const managerProvider = vi.fn(() => manager)
     const turnPersistence = recordingStore()
     const scoutExecutor = createOptionalProductionChildExecutor({
       enabled: true, pool: poolFixture as never, turnStore: turnPersistence.engineStore, treeBudget: budget(),
       authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => scoutModel,
       jobDiscoveryClient: discoveryClient, mailboxReader: emptyMailboxReader, resumeLoader: async () => undefined,
+      subagentManager: managerProvider,
     })
     if (!scoutExecutor) throw new Error("generic Scout child executor was not created")
 
     const scoutExecution = await scoutExecutor({ lease: scoutLease })
     expect(scoutExecution).toMatchObject({ status: "completed" })
+    expect(managerProvider).toHaveBeenCalledOnce()
+    expect(manager.spawnFromLease).toHaveBeenCalledOnce()
+    expect(manager.spawnFromLease).toHaveBeenCalledWith(expect.objectContaining({
+      userId: ownerUserId, sessionId: scoutLease.sessionId, turnId: scoutLease.turnId,
+      parentTaskId: scoutLease.id, role: "scout", taskType: "job_discovery",
+      context: expect.objectContaining({ nestedScoutSourceSlice: ["greenhouse"] }),
+      policy: expect.objectContaining({ maxDepth: 2, maxFanOut: 2 }),
+    }), expect.stringMatching(/^scout-delegate:/), scoutLease, expect.objectContaining({
+      stepId: expect.any(String), toolCallId: "scout-delegate-call",
+    }))
     const scoutChildResult = completedResult(scoutExecution.result)
     expect(scoutChildResult).toMatchObject({ discoveryAttempt: {
       attemptCount: scoutLease.attemptCount,
@@ -642,6 +739,8 @@ describe("production child runtime", () => {
     ])
     expect(provenanceParameters[1]).toEqual(["app.user_id", ownerUserId])
     expect(provenanceConnection.release).toHaveBeenCalledOnce()
+    expect(nestedWaitQueries).toEqual(["BEGIN READ ONLY", "SELECT set_config('app.user_id', $1, true)", expect.stringContaining('FROM "agent_steps" step'), expect.stringContaining('FROM "sub_agent_tasks" child'), "COMMIT"])
+    expect(nestedWaitConnection.release).toHaveBeenCalledOnce()
     expect(JSON.stringify(scoutChildResult.discoveryAttempt)).not.toMatch(/provider-private|ledgerKey|toolCallId|sessionId|turnId|stepId|estimatedCost|providerUrl|jobId/i)
     const scoutResult = completedResult(scoutChildResult.structuredResult)
     const savedScoutJob = [...savedJobs.values()].find(row => row.userId === ownerUserId && row.url === providerUrl)
@@ -653,6 +752,7 @@ describe("production child runtime", () => {
     expect(advertisedTools(scoutRequests[0]!).find(tool => tool.name === "jobs.discover")).toMatchObject({
       risk: "internal_write", domain: "jobs", capabilities: ["read", "write"], requiredCapabilities: ["read"],
     })
+    expect(advertisedTools(scoutRequests[0]!).map(tool => tool.name)).toEqual(expect.arrayContaining(["scout.delegate", "scout.results", "wait_subagents"]))
     expect(discoveryRequests[0]).toMatchObject({
       userId: ownerUserId, sessionId: "session-1", turnId: "turn-1", taskId: scoutLease.id, rootTaskId: scoutLease.rootTaskId,
       role: "scout", leaseOwner: "worker-1", attemptCount: scoutLease.attemptCount,
@@ -1054,16 +1154,45 @@ describe("production child runtime", () => {
     const client = {
       query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
         if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
-        if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return values[0] === child.sessionId && values[1] === child.userId
+        if (sql.startsWith('SELECT "id" FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return values[0] === child.sessionId && values[1] === child.userId
           ? { rows: [{ id: child.sessionId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.startsWith('SELECT "id" FROM "agent_sessions"') && sql.includes("FOR SHARE")) return values[0] === child.sessionId && values[1] === child.userId
+          ? { rows: [{ id: child.sessionId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('FROM "agent_turns"') && sql.includes("FOR SHARE")) return values[0] === child.turnId
+          && values[1] === child.sessionId && values[2] === child.userId
+          ? { rows: [{ id: child.turnId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.startsWith('SELECT "id" FROM "sub_agent_tasks"') && sql.includes("FOR SHARE")) {
+          const rootLock = values.length === 3 && values[0] === child.rootTaskId && values[1] === child.sessionId && values[2] === child.turnId
+          const childLock = values.length === 4 && values[0] === child.id && values[1] === child.sessionId
+            && values[2] === child.turnId && values[3] === child.rootTaskId
+          return rootLock || childLock ? { rows: [{ id: values[0] }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        }
+        if (sql.includes('SELECT task."id"') && values.length === 5) {
+          const repairScope = sql.includes("FOR UPDATE OF task") && values[0] === child.id && values[1] === child.sessionId
+            && values[2] === child.turnId && values[3] === child.rootTaskId && values[4] === child.userId
+          const waitScope = sql.includes("FOR SHARE OF task") && values[0] === child.id && values[1] === child.userId
+            && values[2] === child.sessionId && values[3] === child.turnId && values[4] === child.rootTaskId
+          return repairScope || waitScope ? {
+            rows: [{ id: child.id, userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, parentTaskId: child.parentTaskId, status: "running", leaseOwner: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: child.leaseExpiresAt, interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1,
+          } : { rows: [], rowCount: 0 }
+        }
         if (sql.includes('SELECT task."id"')) return values[0] === child.id && values[1] === child.sessionId && values[2] === child.turnId
-          && values[3] === child.rootTaskId && values[4] === child.userId ? {
+          && values[3] === child.rootTaskId && values[4] === child.userId && values[5] === child.ownerId && values[6] === child.attemptCount ? {
           rows: [{ id: child.id, userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, parentTaskId: child.parentTaskId, status: "running", leaseOwner: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: child.leaseExpiresAt, interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1,
         } : { rows: [], rowCount: 0 }
-        if (sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"')) return { rows: [], rowCount: 0 }
-        if (sql.includes('SELECT "id" FROM "sub_agent_tasks"') && sql.includes("FOR UPDATE")) return values[0] === child.id && values[1] === child.sessionId
-          && values[2] === child.turnId && values[3] === child.rootTaskId && values[4] === child.ownerId && values[5] === child.attemptCount
+        if (sql.startsWith('SELECT "id" FROM "sub_agent_tasks"') && sql.includes("FOR UPDATE")) return values[0] === child.id
+          && values[1] === child.sessionId && values[2] === child.turnId && values[3] === child.rootTaskId
+          && values[4] === child.ownerId && values[5] === child.attemptCount
           ? { rows: [{ id: child.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('FROM "agent_wait_conditions" AS candidateWait')) {
+          if (values[0] !== child.userId || values[1] !== child.sessionId || values[2] !== child.turnId || values[3] !== child.id
+            || values[4] !== child.rootTaskId || values[5] !== child.attemptCount) throw new Error("unexpected resume query")
+          return { rows: [], rowCount: 0 }
+        }
+        if (sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"')) {
+          if (values[0] !== child.id || values[1] !== 257) throw new Error("unexpected resume query")
+          return { rows: [], rowCount: 0 }
+        }
         if (sql.includes('FROM "agent_steps"')) return { rows: [], rowCount: 0 }
         throw new Error(`unexpected resume query: ${sql}`)
       }),
@@ -1080,30 +1209,68 @@ describe("production child runtime", () => {
           yield { type: "tool_call_completed", callId: "resume-call", name: "jobs.search", arguments: {} }
           yield { type: "completed", finishReason: "tool_calls" }
         } else {
-          yield { type: "text_delta", text: "resumed" }
+          yield { type: "text_delta", text: JSON.stringify({
+            schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "partial", findings: [], evidence: [],
+            summary: "Resumed; no source-backed findings were available.",
+          }) }
           yield { type: "completed", finishReason: "stop" }
         }
       },
     }
     const executor = createOptionalProductionChildExecutor({
-      enabled: true, pool, turnStore: store(), treeBudget: budget(), authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
+      enabled: true, pool, turnStore: store(), treeBudget: budget(), authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
+        settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => model, toolRuntimeFactory: () => ({ definitions: [publicTool("jobs.search")], router: { execute: async (_context: unknown, request: { id: string; toolName: string; toolVersion: string }) => ({ ...request, status: "completed" as const, errorCode: null }) }, validateArguments: validateFixtureToolArguments }),
       mailboxReader: { listPendingMessages: async () => [] },
     })
     if (!executor) throw new Error("child executor was not created")
-    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed" })
+    const outcome = await executor({ lease: child })
+    expect(outcome).toMatchObject({ status: "completed" })
+    expect(modelCalls).toBe(2)
     expect(poolWithConnect.connect).toHaveBeenCalledTimes(3)
     expect(client.query.mock.calls.map(([sql]) => sql)).toContain("SELECT set_config($1, $2, true)")
-    const queries = client.query.mock.calls.map(([sql]) => sql)
-    const sessionLock = queries.findIndex(sql => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
-    const taskLock = queries.findIndex(sql => sql.includes('SELECT task."id"') && sql.includes('task."parentTaskId"'))
-    const consumedWaitScan = queries.findIndex(sql => sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"'))
+    const queries = client.query.mock.calls
+    const repairSessionLock = queries.findIndex(([sql]) => sql.startsWith('SELECT "id" FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
+    const repairTaskLock = queries.findIndex(([sql, values]) => sql.includes('SELECT task."id"') && values?.length === 5 && sql.includes("FOR UPDATE OF task"))
+    const consumedRepairScan = queries.findIndex(([sql]) => sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"'))
+    const repairLeaseFence = queries.findIndex(([sql, values]) => sql.startsWith('SELECT "id" FROM "sub_agent_tasks"')
+      && values?.length === 6 && sql.includes("FOR UPDATE"))
+    const durableWaitTask = queries.findIndex(([sql, values]) => sql.includes('SELECT task."id"')
+      && values?.length === 5 && sql.includes("FOR SHARE OF task"))
+    const durableWaitScan = queries.findIndex(([sql]) => sql.includes('FROM "agent_steps" AS step')
+      && sql.includes('JOIN "agent_wait_conditions" AS wait'))
+    const sessionLock = queries.findIndex(([sql]) => sql.startsWith('SELECT "id" FROM "agent_sessions"') && sql.includes("FOR SHARE"))
+    const turnLock = queries.findIndex(([sql]) => sql.startsWith('SELECT "id" FROM "agent_turns"') && sql.includes("FOR SHARE"))
+    const rootLock = queries.findIndex(([sql, values]) => sql.startsWith('SELECT "id" FROM "sub_agent_tasks"')
+      && sql.includes("FOR SHARE") && values?.length === 3)
+    const childLock = queries.findIndex(([sql, values]) => sql.startsWith('SELECT "id" FROM "sub_agent_tasks"')
+      && sql.includes("FOR SHARE") && values?.length === 4)
+    const taskValidation = queries.findIndex(([sql, values]) => sql.includes('SELECT task."id"') && values?.length === 7)
+    const consumedWaitScan = queries.findIndex(([sql]) => sql.includes('FROM "agent_wait_conditions" AS candidateWait'))
+    expect(repairTaskLock).toBeGreaterThan(repairSessionLock)
+    expect(consumedRepairScan).toBeGreaterThan(repairTaskLock)
+    expect(repairLeaseFence).toBeGreaterThan(consumedRepairScan)
+    expect(durableWaitTask).toBeGreaterThan(repairLeaseFence)
+    expect(durableWaitScan).toBeGreaterThan(durableWaitTask)
     expect(sessionLock).toBeGreaterThan(-1)
-    expect(taskLock).toBeGreaterThan(sessionLock)
-    expect(consumedWaitScan).toBeGreaterThan(taskLock)
-    expect(client.query.mock.calls[sessionLock]?.[1]).toEqual([child.sessionId, child.userId])
-    expect(client.query.mock.calls[taskLock]?.[1]).toEqual([child.id, child.sessionId, child.turnId, child.rootTaskId, child.userId])
-    expect(client.query.mock.calls[consumedWaitScan]?.[1]).toEqual([child.id, 257])
+    expect(sessionLock).toBeGreaterThan(durableWaitScan)
+    expect(turnLock).toBeGreaterThan(sessionLock)
+    expect(rootLock).toBeGreaterThan(turnLock)
+    expect(childLock).toBeGreaterThan(rootLock)
+    expect(taskValidation).toBeGreaterThan(childLock)
+    expect(consumedWaitScan).toBeGreaterThan(taskValidation)
+    expect(queries[repairSessionLock]?.[1]).toEqual([child.sessionId, child.userId])
+    expect(queries[repairTaskLock]?.[1]).toEqual([child.id, child.sessionId, child.turnId, child.rootTaskId, child.userId])
+    expect(queries[consumedRepairScan]?.[1]).toEqual([child.id, 257])
+    expect(queries[repairLeaseFence]?.[1]).toEqual([child.id, child.sessionId, child.turnId, child.rootTaskId, child.ownerId, child.attemptCount])
+    expect(queries[durableWaitTask]?.[1]).toEqual([child.id, child.userId, child.sessionId, child.turnId, child.rootTaskId])
+    expect(queries[durableWaitScan]?.[1]).toEqual([child.userId, child.sessionId, child.turnId, child.id, child.attemptCount])
+    expect(queries[sessionLock]?.[1]).toEqual([child.sessionId, child.userId])
+    expect(queries[turnLock]?.[1]).toEqual([child.turnId, child.sessionId, child.userId])
+    expect(queries[rootLock]?.[1]).toEqual([child.rootTaskId, child.sessionId, child.turnId])
+    expect(queries[childLock]?.[1]).toEqual([child.id, child.sessionId, child.turnId, child.rootTaskId])
+    expect(queries[taskValidation]?.[1]).toEqual([child.id, child.sessionId, child.turnId, child.rootTaskId, child.userId, child.ownerId, child.attemptCount])
+    expect(queries[consumedWaitScan]?.[1]).toEqual([child.userId, child.sessionId, child.turnId, child.id, child.rootTaskId, child.attemptCount])
   })
 
   it("uses the server-owned same-attempt loader and forwards mailbox continuation in production", async () => {

@@ -195,6 +195,7 @@ function fakeInterruptedTurnPool(options: { missingGraphItem?: boolean } = {}) {
     const taskId = String(params?.[0] ?? "child-1")
     if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
     if (sql.includes('SELECT task."interruptRequestedAt"')) return { rows: [{ interruptRequestedAt: now, turnStatus: "interrupted" }], rowCount: 1 }
+    if (sql.includes('SELECT task."id", task."status", task."attemptCount", task."turnId" FROM "sub_agent_tasks" AS task')) return { rows: [], rowCount: 0 }
     if (sql.startsWith("UPDATE \"sub_agent_tasks\"") && sql.includes('SET "leaseExpiresAt" = LEAST')) return { rowCount: 0 }
     if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: taskId === "child-1" ? 1 : 0, userId: "user-1" }], rowCount: 1 }
     if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
@@ -1483,7 +1484,7 @@ describe("PgSubagentTaskStore", () => {
     expect(sessionIndex).toBeGreaterThan(-1)
     expect(sessionIndex).toBeLessThan(updateIndex)
     expect(select).toContain('"rootTaskId" = $2')
-    expect(select).toContain('(task."path" = $3 OR task."path" LIKE $3 || \'/%\')')
+    expect(select).toContain('(task."path" = $3 OR left(task."path", char_length($3) + 1) = $3 || \'/\')')
     expect(fake.calls.map(([sql]) => sql)).toContain("BEGIN")
     expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
   })

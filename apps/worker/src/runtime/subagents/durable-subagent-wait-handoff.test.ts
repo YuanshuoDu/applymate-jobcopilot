@@ -14,7 +14,7 @@ const lease = {
   ownerId: "worker-1", attemptCount: 3, leaseExpiresAt: new Date(now.getTime() + 60_000),
 }
 
-function fixture(options: { wait?: boolean; waitStatus?: string; stepStatus?: string; targetStatus?: string; taskStatus?: string; suspended?: boolean; expireAtTaskUpdate?: boolean; callMatches?: boolean; targetId?: string; waitTargetTaskIds?: unknown } = {}) {
+function fixture(options: { wait?: boolean; waitStatus?: string; stepStatus?: string; targetStatus?: string; taskStatus?: string; suspended?: boolean; expireAtTaskUpdate?: boolean; callMatches?: boolean; targetId?: string; waitId?: string; waitIdempotencyKey?: string; waitTargetTaskIds?: unknown } = {}) {
   const targetId = options.targetId ?? "child-1"
   const calls: { sql: string; params: unknown[] }[] = []
   const state = { taskStatus: options.taskStatus ?? "running", waitStatus: options.waitStatus ?? "waiting", outboxWrites: 0, waitWrites: 0, taskWrites: 0, taskUpdateAttempts: 0 }
@@ -34,14 +34,14 @@ function fixture(options: { wait?: boolean; waitStatus?: string; stepStatus?: st
         userId: "user-1", turnStatus: "in_progress", rootStatus: "running",
       }], rowCount: 1 }
       if (sql.includes('FROM "agent_wait_conditions" AS wait')) return options.wait === false ? { rows: [], rowCount: 0 } : { rows: [{
-        id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", stepId: "step-1", idempotencyKey: "wait-key-1",
+        id: options.waitId ?? "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", stepId: "step-1", idempotencyKey: options.waitIdempotencyKey ?? "wait-key-1",
         targetTaskIds: options.waitTargetTaskIds ?? [targetId], mode: "any", status: state.waitStatus, deadlineAt: new Date(now.getTime() + 10_000),
         matchedTaskIds: [], result: { request: { targetTaskIds: [targetId], mode: "any", timeoutMs: 10_000 }, note: "Call +353 87 123 4567 or email private@example.test." }, suspendedAt: options.suspended ? now : null, consumedAt: null, attempt: 3, ordinal: 4, latestOrdinal: 4,
         stepStatus: options.stepStatus ?? "waiting_for_tool",
       }], rowCount: 1 }
       if (sql.includes('FROM "agent_items" AS call')) return { rows: [{ status: "started", content: {
         toolCallId: "wait-call-1", toolName: "wait_subagents", toolVersion: "1",
-        input: { idempotencyKey: options.callMatches === false ? "wrong-key" : "wait-key-1", mode: "any", taskIds: [targetId], timeoutMs: 10_000 },
+        input: { idempotencyKey: options.callMatches === false ? "wrong-key" : options.waitIdempotencyKey ?? "wait-key-1", mode: "any", taskIds: [targetId], timeoutMs: 10_000 },
       } }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("ANY($1::text[])")) return { rows: [{
         id: targetId, parentTaskId: "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1",
@@ -151,16 +151,17 @@ describe("handoffDurableSubagentWait", () => {
   })
 
   it("promotes the exact latest streaming step before recovering its committed wait", async () => {
-    const fake = fixture({ stepStatus: "streaming" })
+    const fake = fixture({ stepStatus: "streaming", waitId: "persisted-wait-row" })
     const expiredLease = { ...lease, leaseExpiresAt: new Date(now.getTime() - 1) }
     await expect(recoverExpiredDurableSubagentWaitWithGraph(fake.client as never, { lease: expiredLease, now }))
-      .resolves.toMatchObject({ waitId: "wait-1", handoff: "suspended", waitStatus: "waiting" })
+      .resolves.toMatchObject({ waitId: "persisted-wait-row", handoff: "suspended", waitStatus: "waiting" })
     const promote = fake.calls.find(call => call.sql.includes('UPDATE "agent_steps"'))
     expect(promote?.sql).toContain('"status" = \'streaming\'')
     expect(promote?.sql).toContain('"attempt" = $6')
     expect(promote?.sql).toContain('"leaseOwner" = $9')
     expect(promote?.sql).toContain('"leaseExpiresAt" = $10')
     expect(promote?.params).toEqual([now, "step-1", lease.sessionId, lease.turnId, lease.id, lease.attemptCount, 4, lease.rootTaskId, lease.ownerId, expiredLease.leaseExpiresAt])
+    expect(graphMocks.prepare).toHaveBeenCalledWith(fake.client, expect.objectContaining({ type: "task.waiting", waitRowId: "persisted-wait-row" }))
   })
 
   it("preserves only the validated target ID through expired-wait recovery sanitization", async () => {
@@ -230,13 +231,37 @@ describe("handoffDurableSubagentWait", () => {
     expect(fake.state).toMatchObject({ waitWrites: 0, taskWrites: 0, outboxWrites: 0 })
   })
 
+  it("returns an already suspended graph handoff before preparing another lifecycle receipt", async () => {
+    const fake = fixture({ taskStatus: "waiting", suspended: true })
+    await expect(handoffDurableSubagentWaitWithGraph(fake.client as never, { lease, now })).resolves.toMatchObject({
+      waitId: "wait-1", handoff: "suspended", waitStatus: "waiting", idempotent: true,
+    })
+    expect(graphMocks.prepare).not.toHaveBeenCalled()
+    expect(graphMocks.persist).not.toHaveBeenCalled()
+    expect(fake.state).toMatchObject({ waitWrites: 0, taskWrites: 0, outboxWrites: 0 })
+  })
+
+  it("binds same-attempt wait lifecycle preparations to distinct persisted wait rows", async () => {
+    const first = fixture({ targetStatus: "running", waitId: "wait-row-a", waitIdempotencyKey: "caller-key-a" })
+    const second = fixture({ targetStatus: "running", waitId: "wait-row-b", waitIdempotencyKey: "caller-key-b" })
+    await handoffDurableSubagentWaitWithGraph(first.client as never, { lease, now })
+    await handoffDurableSubagentWaitWithGraph(second.client as never, { lease, now })
+
+    const waitPreparations = graphMocks.prepare.mock.calls.map(([, input]) => input as Record<string, unknown>)
+      .filter(input => input.type === "task.waiting")
+    expect(waitPreparations).toHaveLength(2)
+    expect(waitPreparations.map(input => input.waitRowId)).toEqual(["wait-row-a", "wait-row-b"])
+    expect(waitPreparations.map(input => input.attemptCount)).toEqual([lease.attemptCount, lease.attemptCount])
+    expect(waitPreparations.some(input => input.waitRowId === "caller-key-a" || input.waitRowId === "caller-key-b")).toBe(false)
+  })
+
   it("persists waiting and queued TaskGraph transitions with a resolved durable wait", async () => {
     const waiting = { event: { type: "task.waiting" } }
     const queued = { event: { type: "task.queued" } }
     graphMocks.prepare.mockResolvedValueOnce(waiting).mockResolvedValueOnce(queued)
     const fake = fixture({ targetStatus: "completed" })
     await expect(handoffDurableSubagentWaitWithGraph(fake.client as never, { lease, now })).resolves.toMatchObject({ handoff: "queued" })
-    expect(graphMocks.prepare).toHaveBeenNthCalledWith(1, fake.client, { taskId: "parent-1", sessionId: "session-1", type: "task.waiting", attemptCount: 3 })
+    expect(graphMocks.prepare).toHaveBeenNthCalledWith(1, fake.client, { taskId: "parent-1", sessionId: "session-1", type: "task.waiting", attemptCount: 3, waitRowId: "wait-1" })
     expect(graphMocks.prepare).toHaveBeenNthCalledWith(2, fake.client, { taskId: "parent-1", sessionId: "session-1", type: "task.queued", attemptCount: 3 })
     expect(graphMocks.persist).toHaveBeenNthCalledWith(1, fake.client, waiting, now)
     expect(graphMocks.persist).toHaveBeenNthCalledWith(2, fake.client, queued, now)
@@ -246,7 +271,8 @@ describe("handoffDurableSubagentWait", () => {
     graphMocks.prepare.mockResolvedValueOnce({ blocked: true })
     const blocked = fixture()
     await expect(handoffDurableSubagentWaitWithGraph(blocked.client as never, { lease, now })).resolves.toEqual({ blocked: true })
-    expect(blocked.calls).toHaveLength(0)
+    expect(blocked.calls.every(call => !/^(UPDATE|INSERT)/.test(call.sql))).toBe(true)
+    expect(blocked.state).toMatchObject({ waitWrites: 0, taskWrites: 0, outboxWrites: 0 })
 
     const absent = fixture({ wait: false })
     graphMocks.prepare.mockResolvedValueOnce({ event: { type: "task.waiting" } })

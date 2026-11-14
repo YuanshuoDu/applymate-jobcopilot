@@ -3,6 +3,7 @@ import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "./task-graph-child-dea
 import { json, rowToTask, SELECT_TASK } from "./pg-store-persistence.js"
 import { deleteGraphDispatch, persistGraphTransition, prepareGraphTransition, reconcileGraphDependents } from "./task-graph-pg-lifecycle.js"
 import { taskGraphVerificationResult, unverifiedFailureReport } from "./pg-store-lifecycle-result.js"
+import { settleExpiredNestedScoutDescendants } from "./nested-scout-deadline-terminal.js"
 import type { StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import type { SubagentTaskRecord } from "./types.js"
 
@@ -67,6 +68,10 @@ export async function expireTaskGraphChild(client: pg.PoolClient, candidate: Dea
   await deleteGraphDispatch(client, candidate.sessionId, candidate.id)
   await persistGraphTransition(client, prepared, completedAt)
   await reconcileGraphDependents(client, prepared.scope, completedAt)
+  if (row.role === "scout" && row.taskType === "job_discovery") {
+    await settleExpiredNestedScoutDescendants(client, { userId: candidate.userId, sessionId: candidate.sessionId,
+      turnId: candidate.turnId, rootTaskId: candidate.rootTaskId, parentScoutId: candidate.id })
+  }
   const refreshed = await client.query(SELECT_TASK, [candidate.id, candidate.sessionId])
   if (!refreshed.rows[0]) throw new Error("task_graph_deadline_child_disappeared")
   return rowToTask(refreshed.rows[0] as Record<string, unknown>)

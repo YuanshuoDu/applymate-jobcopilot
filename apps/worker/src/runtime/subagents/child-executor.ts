@@ -1,5 +1,6 @@
 import type { ModelAdapter } from "@jobcopilot/agent-model"
-import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
+import { loadWorkerAiConfig } from "@jobcopilot/shared/llm"
+import { applyChildModelProfileSnapshot } from "./child-model-config-snapshot.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { getSubagentRolePolicy } from "./role-policy.js"
@@ -20,9 +21,9 @@ import type { ChildAttemptResume, ChildResumeLoader, ChildSameAttemptResume, Chi
 import { projectChildFinalText } from "./child-mailbox-continuation.js"
 import type { DiscoveryAttemptSidecar } from "./child-discovery-attempt.js"
 import type { DiscoveryRecoverySnapshot } from "./task-graph-discovery-recovery-contract.js"
-import { SubagentLeaseError, type SubagentExecutionResult, type SubagentLease, type SubagentMailboxContinuation, type SubagentTaskRecord } from "./types.js"
+import { SubagentLeaseError, type SubagentContinuation, type SubagentExecutionResult, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
-import { childWaitReplayExecutionOptions, childWaitResumeCursorIsValid, createChildDurableWaitReplay } from "./child-durable-wait-replay.js"
+import { childWaitReplayExecutionOptions, childWaitResumeCursorIsValid, createChildDurableWaitReplay, isServerGeneratedFinalDependencyWait } from "./child-durable-wait-replay.js"
 import type { TurnResumeState } from "../turns/turn-engine-types.js"
 import { createToolRouterExecutor } from "../turns/turn-engine-helpers.js"
 import { runTurnExecutionLoop } from "../turns/turn-execution-loop.js"
@@ -30,7 +31,7 @@ import { createUsageAwareModelAdapter, type UsageAwareModelOptions } from "../tu
 import type { SelectedJobArtifactContextBundle } from "./selected-job-artifact-context.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import type { RuntimeToolDefinition, ToolRouterContext, ToolExecutionResult, ToolCallRequest } from "../tools/types.js"
-import { canManageChildrenWithWaitAction, visibleChildDefinitions, isOrdinaryScout, childResultStatus as resultStatus, isDeterministicChildResumeError, acknowledgeDurableWaitAtContinuationStart, type ChildPublicDefinition, type ChildToolRuntime } from "./child-executor-admission.js"
+import { canResumeChildWait, visibleChildDefinitions, isOrdinaryScout, childResultStatus as resultStatus, isDeterministicChildResumeError, acknowledgeDurableWaitAtContinuationStart, type ChildPublicDefinition, type ChildToolRuntime } from "./child-executor-admission.js"
 import type { DurableWaitResume } from "./child-resume-observations.js"
 export type { ChildPublicDefinition, ChildToolRuntime } from "./child-executor-admission.js"
 
@@ -53,32 +54,21 @@ export type ChildExecutorOptions = {
 }
 
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
-function configWithSnapshot(config: AiConfig, snapshot: unknown): AiConfig {
-  const value = record(snapshot)
-  const provider = value.provider
-  const model = value.model
-  return {
-    ...config,
-    ...(typeof provider === "string" ? { provider: provider as AiConfig["provider"] } : {}),
-    ...(typeof model === "string" && model.trim() ? { model } : {}),
-  }
-}
-
 async function defaultModel(task: SubagentTaskRecord): Promise<ModelAdapter> {
-  const config = configWithSnapshot(await loadWorkerAiConfig(task.userId), task.modelProfileSnapshot)
+  const config = applyChildModelProfileSnapshot(await loadWorkerAiConfig(task.userId), task.modelProfileSnapshot)
   return (await createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false })).adapter
 }
 
-export function createChildExecutor(options: ChildExecutorOptions): (input: { lease: SubagentLease; continuation?: SubagentMailboxContinuation }) => Promise<SubagentExecutionResult> {
+export function createChildExecutor(options: ChildExecutorOptions): (input: { lease: SubagentLease; continuation?: SubagentContinuation }) => Promise<SubagentExecutionResult> {
   if (!options.treeBudget) throw new TypeError("treeBudget is required for child execution")
   return async ({ lease, continuation }) => {
     if (!lease.turnId) return { status: "failed", failureReason: "child_turn_missing" }
-    if (continuation && lease.role === "auditor" && lease.taskType === "native_verification") return { status: "failed", failureReason: "child_mailbox_continuation_unsupported", retryDisposition: "terminal" }
+    if (continuation?.kind === "mailbox_input_pending" && lease.role === "auditor" && lease.taskType === "native_verification") return { status: "failed", failureReason: "child_mailbox_continuation_unsupported", retryDisposition: "terminal" }
     let executionLease = lease, sameAttemptRestored: ChildSameAttemptResume | undefined
     if (continuation) {
-      if (!options.sameAttemptContinuationLoader || continuation.kind !== "mailbox_input_pending"
-        || continuation.missingMessageIds.length < 1 || continuation.missingMessageIds.length > 20
-        || continuation.missingMessageIds.some(id => typeof id !== "string" || !id.trim())) return { status: "failed", failureReason: "child_mailbox_continuation_unavailable", retryDisposition: "terminal" }
+      const mailbox = continuation.kind === "mailbox_input_pending" ? continuation : undefined
+      if (!options.sameAttemptContinuationLoader || mailbox && (mailbox.missingMessageIds.length < 1 || mailbox.missingMessageIds.length > 20
+        || mailbox.missingMessageIds.some(id => typeof id !== "string" || !id.trim()))) return { status: "failed", failureReason: mailbox ? "child_mailbox_continuation_unavailable" : "child_children_pending_continuation_unavailable", retryDisposition: "terminal" }
       try {
         sameAttemptRestored = await options.sameAttemptContinuationLoader(lease) ?? undefined
         if (!sameAttemptRestored || !sameAttemptRestored.previousFinalText.trim()
@@ -117,10 +107,10 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     let snapshot = childContextSnapshot(lease, runtime.serverContext), resume: TurnResumeState | undefined
     let durableWaitResume: DurableWaitResume | undefined
     const observedEvidence = createObservedEvidenceIndex()
-    const durableWaitResumeEligible = canManageChildrenWithWaitAction(policy, lease.allowedActions)
+    const durableWaitResumeEligible = canResumeChildWait(lease, policy)
     let restored: ChildAttemptResume | undefined = sameAttemptRestored
     if (continuation) {
-      snapshot = { ...snapshot, profile: [...snapshot.profile, { id: `child-mailbox-continuation:${lease.id}:${lease.attemptCount}`, content: { previousFinalText: projectChildFinalText(sameAttemptRestored!.previousFinalText) } }], toolObservations: [...sameAttemptRestored!.observations] }
+      snapshot = { ...snapshot, profile: [...snapshot.profile, { id: `child-same-attempt-continuation:${lease.id}:${lease.attemptCount}`, content: { previousFinalText: projectChildFinalText(sameAttemptRestored!.previousFinalText) } }], toolObservations: [...sameAttemptRestored!.observations] }
       resume = sameAttemptRestored!.resume
     }
     if (!continuation && options.resumeLoader && (lease.attemptCount > 1 || durableWaitResumeEligible)) {
@@ -135,7 +125,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       if (!selectedEvidenceTask) {
         try {
           const prepare = await resolveScheduledPrepareResumeEvidence(restored.observations, runtime.resolveScheduledPrepareReference, lease.id, lease.attemptCount)
-          const evidence = restored.observations.filter(item => !["scheduled.application.prepare", "wait_subagents"].includes(String(record(item.content).toolName)))
+          const evidence = restored.observations.filter(item => !["scheduled.application.prepare", "wait_subagents", "scout.delegate", "scout.results"].includes(String(record(item.content).toolName)))
           hydrateObservedEvidence(observedEvidence, evidence, { taskId: lease.id, attemptCount: lease.attemptCount })
           for (const item of prepare) recordReadToolOutput(observedEvidence, "scheduled.application.prepare", item.result, undefined,
             { toolCallId: item.toolCallId, taskId: lease.id, attemptCount: lease.attemptCount, ...(item.reference ? { reference: item.reference } : {}) })
@@ -175,7 +165,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       observedEvidence, privateCallIds,
     })
     const executeTool: typeof routedTool = async input => {
-      const replayedWait = durableWaitReplay?.execute(input)
+      const replayedWait = isServerGeneratedFinalDependencyWait(input) ? undefined : durableWaitReplay?.execute(input)
       if (replayedWait) return replayedWait
       if (selectedJobPreparation && isSelectedJobReadTool(input.call.toolName)) privateCallIds.add(input.call.id)
       const toolResult = await dispatchTool(input)
@@ -196,7 +186,8 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     }
     const contextBuilder = createChildContextBuilder(lease, snapshot, options.mailboxReader,
       lease.role === "writer" || lease.role === "reviewer" ? runtime.selectedJobArtifactContext?.transientSources : undefined,
-      lease.role === "writer" ? runtime.writerReviewRevision?.feedback : undefined, continuation?.missingMessageIds ?? [])
+      lease.role === "writer" ? runtime.writerReviewRevision?.feedback : undefined,
+      continuation?.kind === "mailbox_input_pending" ? continuation.missingMessageIds : [])
     const result = await runTurnExecutionLoop({
       identity: owner, scope: { userId: lease.userId }, goal: lease.goal, snapshot,
       contextBuilder, store: acknowledgeDurableWaitAtContinuationStart(safeStore, lease, durableWaitResume, options.durableWaitResumeCommitter, step => durableWaitReplay?.acknowledgeContinuation(step)), model, tools: definitions,
@@ -211,6 +202,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       signalError: () => new Error("subagent_lease_lost"),
       ...(adapter.profile.nativeTools && adapter.profile.structuredOutput && structuredRole ? { outputSchema: structuredResultOutputSchema(structuredRole) } : {}),
       ...(structuredRole === "analyst" && options.authorizeEmptyAnalystCandidate ? { authorizeEmptyAnalystCandidate: input => options.authorizeEmptyAnalystCandidate!({ lease: executionLease, ...input }) } : {}),
+      ...(runtime.prepareFinalDependencyWait ? { prepareFinalDependencyWait: runtime.prepareFinalDependencyWait } : {}),
     })
     const childResult = {
       status: result.status,

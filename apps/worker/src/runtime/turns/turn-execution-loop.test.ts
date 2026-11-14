@@ -14,6 +14,7 @@ import type { NativeVerificationFeedback } from "../subagents/native-verificatio
 import type { ChildWaitOrphanRecovery } from "../subagents/child-durable-wait-replay.js"
 import type { ChildToolReplayReceipt } from "./turn-execution-options.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
+import type { PrepareFinalDependencyWaitInput } from "./turn-execution-options.js"
 import { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { createPgTurnEngineStore } from "./turn-engine-store.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
@@ -4530,4 +4531,89 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "tool_call.started" && event.id.includes("useful-search"))).toBe(true)
   })
 
+})
+
+describe("private final dependency wait admission", () => {
+  const childId = "subagent-11111111-1111-4111-8111-111111111111"
+
+  function singleFinalModel(root: Fixture, text: string): ModelAdapter {
+    return {
+      ...root.options.model,
+      async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        yield { type: "text_delta", text }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+  }
+
+  it("waits through the registered tool path before verifying or persisting the live candidate", async () => {
+    const root = fixture(identity("task", "parent-1")), callbackInputs: PrepareFinalDependencyWaitInput[] = []
+    const callback = vi.fn((input: PrepareFinalDependencyWaitInput) => {
+      callbackInputs.push(input)
+      return { taskIds: [childId] }
+    })
+    const waitOutput = {
+      waitId: "22222222-2222-4222-8222-222222222222", status: "waiting", taskIds: [childId],
+      deadlineAt: "2026-11-13T12:00:30.000Z", matchedTaskIds: [],
+      tasks: [{ taskId: childId, status: "running", role: "scout", result: null, failureReason: null }],
+    }
+    const execute = vi.fn(async ({ call }: Parameters<TurnExecutionOptions["executeTool"]>[0]) => ({
+      id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, errorCode: null, output: waitOutput,
+    }))
+    const completionGate = vi.fn(async () => ({ ok: true as const }))
+    root.options = {
+      ...root.options, model: singleFinalModel(root, "A tentative answer before the child result."),
+      tools: [{ name: "wait_subagents", version: "1" }], executeTool: execute,
+      validateToolArguments: (name, value) => name === "wait_subagents" && isRecord(value) ? true : "unexpected tool",
+      prepareFinalDependencyWait: callback, completionGate,
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const input = callbackInputs[0]
+    const waitCall = execute.mock.calls[0]?.[0].call
+
+    expect(result).toMatchObject({ status: "waiting_for_dependency", stepCount: 1, toolCallCount: 1 })
+    expect(callback).toHaveBeenCalledTimes(1)
+    expect(input?.identity).toBe(root.options.identity)
+    expect(input?.step).toMatchObject({ id: input.context.stepId, ordinal: 0 })
+    expect(input?.snapshot).toBe(root.options.snapshot)
+    expect(input?.context.schemaVersion).toBe("agent-harness.v2")
+    expect(input?.signal.aborted).toBe(false)
+    expect(execute).toHaveBeenCalledTimes(1)
+    expect(waitCall).toMatchObject({ toolName: "wait_subagents", input: {
+      taskIds: [childId], mode: "all", timeoutMs: 30_000,
+    } })
+    expect(execute.mock.calls[0]?.[0].serverGeneratedFinalDependencyWait).toEqual({
+      stepId: input.step.id, toolCallId: waitCall?.id,
+    })
+    expect(waitCall?.input).not.toHaveProperty("serverGeneratedFinalDependencyWait")
+    expect(root.stepStatuses).toEqual(["waiting_for_tool"])
+    expect(new Set(root.events.filter(event => event.type === "step.completed").map(event => event.id)).size).toBe(1)
+    expect(root.events.some(event => event.type === "turn.completed" || event.type === "turn.failed")).toBe(false)
+    expect(root.events.some(event => event.type === "item.started" && isRecord(event.payload) && event.payload.type === "agent_message")).toBe(false)
+    expect(root.finalResponses).toHaveLength(0)
+    expect(completionGate).not.toHaveBeenCalled()
+  })
+
+  it("keeps the normal path when the callback returns null and only invokes it after model tool calls", async () => {
+    const child = fixture(identity("task", "child-1")), callbackInputs: PrepareFinalDependencyWaitInput[] = []
+    child.options = {
+      ...child.options,
+      prepareFinalDependencyWait: vi.fn((input: PrepareFinalDependencyWaitInput) => {
+        callbackInputs.push(input)
+        return null
+      }),
+    }
+
+    const result = await runTurnExecutionLoop(child.options)
+
+    expect(result.status).toBe("completed")
+    expect(callbackInputs).toHaveLength(1)
+    expect(callbackInputs[0]?.step.ordinal).toBe(1)
+    expect(callbackInputs[0]?.snapshot.toolObservations).toHaveLength(1)
+    expect(callbackInputs[0]?.context.blocks.some(block => block.layer === "tool_observation")).toBe(true)
+    expect(child.requests).toHaveLength(2)
+    expect(child.events.some(event => event.type === "tool_call.started" && event.payload && isRecord(event.payload) && event.payload.toolName === "wait_subagents")).toBe(false)
+  })
 })

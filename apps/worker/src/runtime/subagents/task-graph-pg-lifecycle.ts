@@ -2,7 +2,7 @@ import { deriveTaskGraphReadModel, reduceTaskGraphEvent, type TaskGraphEvent, ty
 import type { Queryable } from "./pg-store-persistence.js"
 import { hasPersistedTaskGraphMembership, loadTaskGraph, type GraphIdentityScope } from "./task-graph-pg-state.js"
 import { sanitizeTaskGraphLifecycleEvent, writeTaskLifecycleReceipt } from "./task-graph-pg-events.js"
-import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { taskGraphLifecycleKey, taskGraphWaitLifecycleKey } from "./task-graph-snapshot.js"
 import { isTaskGraphDependencyContextError } from "./task-graph-dependency-context.js"
 import { readyTaskDependencyContext } from "./task-graph-pg-post-gate-audit-ready.js"
 import { enqueueReadyGraphTask } from "./task-graph-pg-dispatch.js"
@@ -55,8 +55,12 @@ export async function prepareGraphTransition(client: Queryable, input: {
   type: TaskGraphEventType
   attemptCount?: number
   failureReason?: string
+  waitRowId?: string
   gateChoiceResume?: Readonly<{ gateTaskId: string; requestAttemptCount: number; resumedAttemptCount: number }>
 }): Promise<GraphTransitionPreparation> {
+  if (input.waitRowId !== undefined && (input.type !== "task.waiting" || typeof input.waitRowId !== "string" || !input.waitRowId.trim() || input.waitRowId.trim() !== input.waitRowId)) {
+    throw new Error("task_graph_wait_identity_invalid")
+  }
   const identity = await client.query(`SELECT task."turnId", task."rootTaskId", task."parentTaskId", task."attemptCount", session."userId"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
     WHERE task."id" = $1 AND task."sessionId" = $2`, [input.taskId, input.sessionId])
@@ -218,10 +222,12 @@ export async function reconcileGraphDependents(
   throw new Error("task_graph_dependency_reconciliation_limit")
 }
 
-function makeEvent(input: { type: TaskGraphEventType; attemptCount: number; failureReason?: string; taskId: string;
+function makeEvent(input: { type: TaskGraphEventType; attemptCount: number; failureReason?: string; taskId: string; waitRowId?: string;
   gateChoiceResume?: Readonly<{ gateTaskId: string; requestAttemptCount: number; resumedAttemptCount: number }> },
   taskId: string, nodeKey: string, expectedRevision: number, parentTaskId: string): TaskGraphEvent {
-  const idempotencyKey = taskGraphLifecycleKey(parentTaskId, nodeKey, input.attemptCount, input.type)
+  const idempotencyKey = input.waitRowId === undefined
+    ? taskGraphLifecycleKey(parentTaskId, nodeKey, input.attemptCount, input.type)
+    : taskGraphWaitLifecycleKey(parentTaskId, nodeKey, input.attemptCount, input.waitRowId)
   if (input.type === "task.failed") return {
     idempotencyKey, expectedRevision, nodeKey, type: input.type,
     failureReason: input.failureReason || "Child task failed.",

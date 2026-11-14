@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const batch = vi.hoisted(() => ({ events: [] as Record<string, unknown>[], calls: 0 }))
@@ -21,6 +22,8 @@ vi.mock("../turns/turn-engine-event-batch.js", () => ({
 }))
 
 import { inspectChildWaitSourceLifecycle, reconcileChildWaitSourceLifecycle } from "./child-resume-source-wait-lifecycle.js"
+import { prepareOwnerScopedWaitLifecycleOutput } from "../tools/lifecycle-receipt-output.js"
+import { sanitizeLifecyclePreview } from "../tools/redaction.js"
 import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
 
 const now = new Date("2026-10-30T10:00:00.123Z")
@@ -128,24 +131,68 @@ function waitingFixture(eventProjection: "legacy" | "safe" | "malformed") {
     const input = { ...(content.input as Record<string, unknown>), timeoutMs: 2_000 }
     content.input = input
   }
-  const callComplete = { id: "event-call-completed", itemId: callItemId, type: "item.completed", actor: "subagent",
+  const callComplete = { id: "event-call-completed", sessionId: lease.sessionId, turnId: lease.turnId, taskId: lease.id,
+    itemId: callItemId, type: "item.completed", actor: "subagent",
     correlationId: callItemId, causationId: callStart.id, sequence: 6,
     idempotencyKey: `task:${lease.id}:event:tool-call-completed:${callId}:${callItemId}:1`,
     payload: { itemId: callItemId, status: "completed", content } }
-  const toolComplete = { id: "event-tool-finished", itemId: callItemId, type: "tool_call.completed", actor: "subagent",
+  const toolComplete = { id: "event-tool-finished", sessionId: lease.sessionId, turnId: lease.turnId, taskId: lease.id,
+    itemId: callItemId, type: "tool_call.completed", actor: "subagent",
     correlationId: callId, causationId: callComplete.id, sequence: 7,
     idempotencyKey: `task:${lease.id}:event:tool-finished:${callId}`,
     payload: { toolCallId: callId, toolName: "wait_subagents", status: "completed", errorCode: null, taskId: lease.id } }
-  const resultStart = { id: "event-result-start", itemId: resultId, type: "item.started", actor: "subagent",
+  const resultStart = { id: "event-result-start", sessionId: lease.sessionId, turnId: lease.turnId, taskId: lease.id,
+    itemId: resultId, type: "item.started", actor: "subagent",
     correlationId: "step-1", causationId: toolComplete.id, sequence: 8,
     idempotencyKey: `task:${lease.id}:event:item-started:${resultId}`,
     payload: { itemId: resultId, type: "tool_result", phase: null } }
-  const resultComplete = { id: "event-result-completed", itemId: resultId, type: "item.completed", actor: "subagent",
+  const resultComplete = { id: "event-result-completed", sessionId: lease.sessionId, turnId: lease.turnId, taskId: lease.id,
+    itemId: resultId, type: "item.completed", actor: "subagent",
     correlationId: resultId, causationId: resultStart.id, sequence: 9,
     idempotencyKey: `task:${lease.id}:event:tool-result-completed:${callId}:${resultId}:1`,
     payload: { itemId: resultId, status: "completed", content: resultContent } }
   batch.events.push(callComplete, toolComplete, resultStart, resultComplete)
   return fake
+}
+function addWaitingLifecycleEvents(fake: ReturnType<typeof fixture>) {
+  const call = fake.items.find(item => item.id === callItemId)!.content as Record<string, unknown>
+  const digest = "a1b2c3d4e5f60718293a4b5c"
+  const lifecycleRow = (phase: "started" | "completed", payload: Record<string, unknown>, sequence: number) => ({
+    id: `tool-lifecycle:task:${lease.id}:${callId}:${phase}:${digest}`, sessionId: lease.sessionId, turnId: lease.turnId,
+    taskId: lease.id, itemId: null, type: `tool_call.${phase}`, actor: "subagent", correlationId: callId, causationId: null,
+    sequence, idempotencyKey: `task:${lease.id}:tool-lifecycle:${callId}:${phase}:${digest}`, payload,
+  })
+  const policyDigest = createHash("sha256").update(JSON.stringify([
+    lease.userId, lease.sessionId, lease.turnId, "task", lease.id, lease.attemptCount, "step-1", callId,
+  ])).digest("hex")
+  batch.events.push(lifecycleRow("started", { toolCallId: callId, toolName: "wait_subagents", toolVersion: "1", status: "started",
+    input: sanitizeLifecyclePreview(call.input) as unknown as Record<string, unknown> }, 6))
+  batch.events.push({ id: `agent-policy-${policyDigest}`, sessionId: lease.sessionId, turnId: lease.turnId, taskId: lease.id, itemId: null,
+    type: "policy.decision", actor: "subagent", correlationId: callId, causationId: null, sequence: 7,
+    idempotencyKey: `policy-decision:${policyDigest}`, payload: { schemaVersion: "agent-harness.v2", policyVersion: "policy.v1",
+      hook: "before_tool_use", outcome: "allow", reasonCode: "wait_allowed", reason: "Durable child wait is allowed",
+      scope: { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "step-1", toolCallId: callId,
+        toolName: "wait_subagents", toolVersion: "1", role: "subagent", domain: "coordination", risk: "internal_write" } } })
+  const waitingOutput = { ...fake.result, status: "waiting", matchedTaskIds: [] }
+  const safeOutput = prepareOwnerScopedWaitLifecycleOutput(waitingOutput, "wait_subagents", "task").safe
+  batch.events.push(lifecycleRow("completed", { toolCallId: callId, toolName: "wait_subagents", toolVersion: "1", status: "completed",
+    output: safeOutput as Record<string, unknown>, errorCode: null }, 8))
+}
+function useGeneratedTaskId(fake: ReturnType<typeof fixture>, id: string) {
+  const call = fake.items.find(item => item.id === callItemId)!.content as Record<string, unknown>
+  const callInput = call.input as Record<string, unknown>
+  callInput.taskIds = [id]
+  fake.wait.targetTaskIds = [id]
+  fake.wait.matchedTaskIds = [id]
+  const output = fake.result as Record<string, unknown>
+  output.taskIds = [id]
+  output.matchedTaskIds = [id]
+  ;(output.tasks as Record<string, unknown>[])[0]!.taskId = id
+  const saved = fake.wait.result as Record<string, unknown>
+  ;(saved.request as Record<string, unknown>).targetTaskIds = [id]
+  ;(saved.outcome as Record<string, unknown>).taskIds = [id]
+  ;(saved.outcome as Record<string, unknown>).matchedTaskIds = [id]
+  ;(((saved.outcome as Record<string, unknown>).tasks as Record<string, unknown>[])[0]!).taskId = id
 }
 
 describe("child source wait lifecycle recovery", () => {
@@ -182,6 +229,30 @@ describe("child source wait lifecycle recovery", () => {
     expect(fake.items.filter(item => item.type === "tool_result")).toHaveLength(1)
     expect(batch.events).toHaveLength(eventCount)
     expect(batch.calls).toBe(2)
+  })
+
+  it("recovers a persisted waiting lifecycle to ready, accepts repeated recovery, and rejects a tampered prior receipt", async () => {
+    const fake = fixture()
+    const generatedTaskId = "subagent-00000000-0000-4000-8000-000000000002"
+    useGeneratedTaskId(fake, generatedTaskId)
+    addWaitingLifecycleEvents(fake)
+    await expect(reconcileChildWaitSourceLifecycle(fake.pool as never, fake.client as never, lease, fake.wait, "step-1", fake.result as never, now))
+      .resolves.toMatchObject({ state: "recovered", toolCallId: callId })
+    const lifecycleCompletion = batch.events.find(event => String(event.id).startsWith("tool-lifecycle:") && event.type === "tool_call.completed")!
+    const canonicalResult = fake.items.find(item => item.type === "tool_result")!.content as Record<string, unknown>
+    expect((lifecycleCompletion.payload as Record<string, unknown>).output).toMatchObject({ status: "waiting", matchedTaskIds: [] })
+    expect(canonicalResult.output).toMatchObject({ status: "ready", matchedTaskIds: [generatedTaskId] })
+
+    fake.wait.consumedAt = now
+    const eventCount = batch.events.length
+    await expect(reconcileChildWaitSourceLifecycle(fake.pool as never, fake.client as never, lease, fake.wait, "step-1", fake.result as never, now))
+      .resolves.toMatchObject({ state: "recovered", toolCallId: callId })
+    expect(batch.events).toHaveLength(eventCount)
+
+    const payload = lifecycleCompletion.payload as Record<string, unknown>
+    payload.output = { ...(payload.output as Record<string, unknown>), matchedTaskIds: ["foreign-target"] }
+    await expect(inspectChildWaitSourceLifecycle(fake.client as never, lease, fake.wait, "step-1", fake.result as never))
+      .rejects.toMatchObject({ code: "wait_scope_error", sourceLifecycleStage: "source_event_chain" })
   })
 
   it.each(["legacy", "safe"] as const)("accepts the exact %s waiting completion event", async projection => {

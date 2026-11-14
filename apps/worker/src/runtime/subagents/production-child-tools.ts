@@ -5,6 +5,7 @@ import type { ArtifactToolExecutionContext, ArtifactToolRevisionContext } from "
 import type { ToolCallRequest, ToolExecutionResult } from "../tools/types.js"
 import { getSubagentRolePolicy } from "./role-policy.js"
 import { canManageChildrenWithWaitAction } from "./child-executor-admission.js"
+import { nestedScoutProfileForTask } from "./nested-scout-profile.js"
 import { createDurableSubagentWaitTool } from "./durable-subagent-wait-tool.js"
 import type { PrivateArtifactToolContext } from "./child-private-artifact.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
@@ -12,11 +13,14 @@ import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 export function registerProductionChildWaitTool(input: {
   readonly pool: Pick<pg.Pool, "connect">
   readonly task: Pick<SubagentTaskRecord, "role" | "allowedActions">
+    & Partial<Pick<SubagentTaskRecord, "taskType" | "depth" | "parentTaskId" | "rootTaskId" | "context">>
   readonly lease: SubagentLease
   readonly registry: Pick<ToolRegistry, "register">
 }): boolean {
   const policy = getSubagentRolePolicy(input.task.role)
-  if (!canManageChildrenWithWaitAction(policy, input.task.allowedActions)) return false
+  const nestedScout = nestedScoutProfileForTask(input.task) !== null
+  const hasWaitAction = Array.isArray(input.task.allowedActions) && input.task.allowedActions.includes("wait_subagents")
+  if (!hasWaitAction || (!nestedScout && !canManageChildrenWithWaitAction(policy, input.task.allowedActions))) return false
   input.registry.register(createDurableSubagentWaitTool(input.pool, input.lease))
   return true
 }

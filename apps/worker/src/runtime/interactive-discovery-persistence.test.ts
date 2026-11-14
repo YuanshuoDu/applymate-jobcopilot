@@ -78,6 +78,23 @@ describe("interactive discovery persistence", () => {
       .toMatchObject({ status: "failed", items: [], failures: ["evidence_unverified"] })
   })
 
+  it("ignores known coordination observations without trusting them as job evidence", () => {
+    const coordination = (toolName: string, output: unknown) => ({ id: `tool-result:${toolName}`, content: {
+      toolCallId: `${toolName}-call`, toolName, input: {}, status: "completed", output, errorCode: null,
+    } })
+    const coordinationOnly = coordination("scout.results", { children: [{ candidates: [{ jobId: "job-1" }] }] })
+    expect(buildInteractiveDiscoveryShortlist({ ownerUserId, scoutResult: scout, analystResult: analyst,
+      scoutObservations: [coordinationOnly], analystObservations: [] }))
+      .toMatchObject({ status: "failed", items: [], failures: ["evidence_unverified"] })
+    expect(buildInteractiveDiscoveryShortlist({ ownerUserId, scoutResult: scout, analystResult: analyst,
+      scoutObservations: [observation, coordination("scout.delegate", { taskId: "child-1" }), coordination("wait_subagents", { status: "ready" })],
+      analystObservations: [observation, coordination("scout.results", { candidates: [{ jobId: "job-1" }] })] }))
+      .toMatchObject({ status: "completed", items: [{ jobId: "job-1" }] })
+    expect(() => buildInteractiveDiscoveryShortlist({ ownerUserId, scoutResult: scout, analystResult: analyst,
+      scoutObservations: [observation, coordination("unknown.coordination", { jobId: "job-1" })], analystObservations: [observation] }))
+      .toThrow("child_resume_evidence_invalid")
+  })
+
   it("rechecks candidate IDs against current rows owned by the lease user", async () => {
     const query = vi.fn(async (_sql: string, values?: readonly unknown[]) => ({
       rows: values?.[0] === ownerUserId ? [{ id: "job-1" }] : [], rowCount: values?.[0] === ownerUserId ? 1 : 0,

@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest"
 import type { ContextSeedBlock } from "../context/step-context-builder.js"
 import type { TurnEngineToolExecutor } from "../turns/turn-engine-types.js"
 import type { DurableWaitResume } from "./child-resume-observations.js"
-import { childWaitReplayExecutionOptions, createChildDurableWaitReplay } from "./child-durable-wait-replay.js"
+import { childWaitReplayExecutionOptions, createChildDurableWaitReplay, isServerGeneratedFinalDependencyWait } from "./child-durable-wait-replay.js"
 import type { SubagentLease } from "./types.js"
 
 const now = new Date("2026-10-29T10:00:00.000Z")
@@ -74,6 +74,15 @@ function call(overrides: {
 }
 
 describe("child durable wait reissue", () => {
+  it("accepts only exact out-of-band server provenance, never a model argument lookalike", () => {
+    const origin = { stepId: "continuation-step", toolCallId: "fresh-provider-call" }
+    const originWithExtraKey = { ...origin, extra: true }
+    expect(isServerGeneratedFinalDependencyWait({ ...call(), serverGeneratedFinalDependencyWait: origin })).toBe(true)
+    expect(isServerGeneratedFinalDependencyWait(call({ input: { ...input, serverGeneratedFinalDependencyWait: origin } }))).toBe(false)
+    expect(isServerGeneratedFinalDependencyWait({ ...call(), serverGeneratedFinalDependencyWait: { ...origin, stepId: "other-step" } })).toBe(false)
+    expect(isServerGeneratedFinalDependencyWait({ ...call(), serverGeneratedFinalDependencyWait: originWithExtraKey })).toBe(false)
+  })
+
   it("adapts replay callbacks and an optional durable claim into loop options", () => {
     const replayState = replay()
     const options = childWaitReplayExecutionOptions(replayState, undefined)
@@ -126,6 +135,7 @@ describe("child durable wait reissue", () => {
     ["mode", { ...input, mode: "any" }],
     ["timeout", { ...input, timeoutMs: 4_000 }],
     ["extra field", { ...input, extra: true }],
+    ["server-origin lookalike", { ...input, serverGeneratedFinalDependencyWait: { stepId: "continuation-step", toolCallId: "fresh-provider-call" } }],
   ])("does not reuse a changed %s", (_name, changedInput) => {
     expect(execute(replay(), { input: changedInput })).toMatchObject({ status: "failed", errorCode: "wait_conflict" })
   })
