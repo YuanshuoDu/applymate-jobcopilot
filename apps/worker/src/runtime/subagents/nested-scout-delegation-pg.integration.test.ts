@@ -765,18 +765,6 @@ async function waitForExpiredCrashLease(ids: FixtureIds, parentTaskId: string, c
   throw new Error("Nested Scout child lease did not expire while its durable wait remained suspended")
 }
 
-async function expireSuspendedWait(ids: FixtureIds, parentTaskId: string): Promise<void> {
-  const expired = await progressQuery<{ id: string }>(`UPDATE "agent_wait_conditions" SET "deadlineAt" = clock_timestamp() - interval '1 millisecond',
-      "updatedAt" = clock_timestamp()
-    WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3 AND "status" = 'waiting'
-      AND "suspendedAt" IS NOT NULL AND "consumedAt" IS NULL RETURNING "id"`, [ids.sessionId, ids.turnId, parentTaskId])
-  if (expired.rowCount === 1) return
-  const existing = await progressQuery<{ status: string; consumedAt: Date | null }>(`SELECT "status", "consumedAt" FROM "agent_wait_conditions"
-    WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3 AND "suspendedAt" IS NOT NULL
-    ORDER BY "createdAt" DESC LIMIT 1`, [ids.sessionId, ids.turnId, parentTaskId])
-  if (existing.rows[0]?.status !== "timed_out" || existing.rows[0]?.consumedAt !== null) throw new Error("Expected one suspended wait to expire")
-}
-
 async function waitForTimedOutParentWait(ids: FixtureIds, parentTaskId: string, waitId: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -1050,8 +1038,7 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
         WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "type" = 'model.started'`,
       [ids.sessionId, ids.turnId, crashedChild.id])
       expect(modelStartsBeforeCrash.rows[0]?.count).toBe(0)
-      await expireSuspendedWait(ids, parent.rows[0]!.id)
-      await waitForTimedOutParentWait(ids, parent.rows[0]!.id, initialWaitId, 30_000)
+      await waitForTimedOutParentWait(ids, parent.rows[0]!.id, initialWaitId, 60_000)
       await killAndWait(crashing.child)
       crashing = undefined
       await waitForExpiredCrashLease(ids, parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!, 30_000)
@@ -1148,5 +1135,5 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       if (restarted) await stop(restarted.child)
       await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId])
     }
-  }, 300_000)
+  }, 360_000)
 })
