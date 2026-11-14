@@ -1294,6 +1294,30 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
         : taskGraphWaitLifecycleKey(parent.rows[0]!.rootTaskId, graphNode!.key, row.stepAttempt, row.id))
       expect(new Set(persistedEventKeys)).toEqual(new Set(expectedEventKeys))
       expect(persistedEventKeys).toContain(legacyWaitKey)
+      const queuedLifecycle = await pool.query<{ idempotencyKey: string }>(
+        `SELECT "idempotencyKey" FROM "agent_events"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "taskId" = $4
+           AND "type" IN ('item.delta', 'task_graph.lifecycle') AND "payload"->'event'->>'type' = 'task.queued'
+           AND "payload"->'event'->>'nodeKey' = $5 ORDER BY "sequence"`,
+        [ids.sessionId, ids.turnId, taskGraphItemId(parent.rows[0]!.rootTaskId), parent.rows[0]!.id, graphNode!.key])
+      expect(new Set(queuedLifecycle.rows.map(row => row.idempotencyKey))).toEqual(new Set(waitHistory.rows.map(row =>
+        taskGraphWaitLifecycleKey(parent.rows[0]!.rootTaskId, graphNode!.key, row.stepAttempt, row.id, "task.queued"))))
+
+      const startedLifecycle = await pool.query<{ idempotencyKey: string }>(
+        `SELECT "idempotencyKey" FROM "agent_events"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "taskId" = $4
+           AND "type" IN ('item.delta', 'task_graph.lifecycle') AND "payload"->'event'->>'type' = 'task.started'
+           AND "payload"->'event'->>'nodeKey' = $5 ORDER BY "sequence"`,
+        [ids.sessionId, ids.turnId, taskGraphItemId(parent.rows[0]!.rootTaskId), parent.rows[0]!.id, graphNode!.key])
+      const scopedStartedKeys = startedLifecycle.rows.map(row => row.idempotencyKey).filter(key => key.includes(":wait:"))
+      expect(scopedStartedKeys).toHaveLength(2)
+      const parentDispatch = await pool.query<{ attemptCount: number }>(
+        `SELECT "attemptCount" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch'
+          AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${parent.rows[0]!.id}`])
+      expect(parentDispatch.rows).toHaveLength(1)
+      const latestWait = waitHistory.rows.at(-1)!
+      expect(scopedStartedKeys).toContain(taskGraphWaitLifecycleKey(parent.rows[0]!.rootTaskId, graphNode!.key,
+        latestWait.stepAttempt + 1, latestWait.id, "task.started", parentDispatch.rows[0]!.attemptCount - 1))
       const reclaimedDispatch = await pool.query<{ ownerId: string | null; attemptCount: number; publishedAt: Date | null }>(
         `SELECT "payload"->>'ownerId' AS "ownerId", "attemptCount", "publishedAt" FROM "agent_outbox"
          WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,

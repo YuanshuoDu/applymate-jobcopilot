@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import type pg from "pg"
+import { reduceTaskGraphEvent } from "../planning/task-graph.js"
 import { prepareGraphTransition, reconcileGraphDependents } from "./task-graph-pg-lifecycle.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey,
   taskGraphWaitLifecycleKey } from "./task-graph-snapshot.js"
@@ -114,6 +115,74 @@ describe("prepareGraphTransition", () => {
     })
     expect(transition.event.idempotencyKey).not.toBe(oldWaiting.idempotencyKey)
     expect(transition.state.appliedEvents.map(event => event.idempotencyKey)).toContain(oldWaiting.idempotencyKey)
+    expect(transition.state.appliedEvents.map(event => event.idempotencyKey)).toContain(resumed.idempotencyKey)
+    expect(transition.state.appliedEvents.map(event => event.idempotencyKey)).toContain(restarted.idempotencyKey)
+  })
+
+  it("scopes queued and started receipts to the persisted wait and validated dispatch generation", async () => {
+    const queuedA = await prepareGraphTransition(fakeGraphClient("waiting") as unknown as Pick<pg.PoolClient, "query">, {
+      taskId: "child-1", sessionId: "session-1", type: "task.queued", attemptCount: 3, waitRowId: "wait-row-a",
+    })
+    const queuedB = await prepareGraphTransition(fakeGraphClient("waiting") as unknown as Pick<pg.PoolClient, "query">, {
+      taskId: "child-1", sessionId: "session-1", type: "task.queued", attemptCount: 3, waitRowId: "wait-row-b",
+    })
+    const started = await prepareGraphTransition(fakeGraphClient("queued") as unknown as Pick<pg.PoolClient, "query">, {
+      taskId: "child-1", sessionId: "session-1", type: "task.started", attemptCount: 4,
+      waitRowId: "wait-row-a", waitDispatchGeneration: 7,
+    })
+
+    if (!queuedA || "blocked" in queuedA || !queuedB || "blocked" in queuedB || !started || "blocked" in started) {
+      throw new Error("expected wait-scoped lifecycle transitions")
+    }
+    expect(queuedA.event.idempotencyKey).toBe(taskGraphWaitLifecycleKey("root-1", "child", 3, "wait-row-a", "task.queued"))
+    expect(queuedB.event.idempotencyKey).toBe(taskGraphWaitLifecycleKey("root-1", "child", 3, "wait-row-b", "task.queued"))
+    expect(queuedA.event.idempotencyKey).not.toBe(queuedB.event.idempotencyKey)
+    expect(started.event.idempotencyKey).toBe(taskGraphWaitLifecycleKey("root-1", "child", 4, "wait-row-a", "task.started", 7))
+  })
+
+  it("treats a same-wait same-generation started replay as a duplicate and gives a newer generation a distinct receipt", async () => {
+    const rowId = "wait-row-a", dispatchGeneration = 7
+    const first = await prepareGraphTransition(fakeGraphClient("queued") as unknown as Pick<pg.PoolClient, "query">, {
+      taskId: "child-1", sessionId: "session-1", type: "task.started", attemptCount: 4,
+      waitRowId: rowId, waitDispatchGeneration: dispatchGeneration,
+    })
+    if (!first || "blocked" in first) throw new Error("expected first prepared started transition")
+    const replay = reduceTaskGraphEvent(first.state, first.event)
+    expect(replay).toMatchObject({ ok: true, duplicate: true, state: { revision: first.state.revision } })
+    expect(first.event.idempotencyKey).toBe(taskGraphWaitLifecycleKey("root-1", "child", 4, rowId, "task.started", dispatchGeneration))
+
+    const oldReceipt = first.event
+    const newerClient = fakeGraphClient("queued", { revision: first.state.revision,
+      lifecycleEvents: [lifecycleEventRow(oldReceipt as unknown as Record<string, unknown>, first.state.revision, first.snapshot)] })
+    const newer = await prepareGraphTransition(newerClient as unknown as Pick<pg.PoolClient, "query">, {
+      taskId: "child-1", sessionId: "session-1", type: "task.started", attemptCount: 4,
+      waitRowId: rowId, waitDispatchGeneration: dispatchGeneration + 1,
+    })
+    if (!newer || "blocked" in newer) throw new Error("expected a distinct started generation")
+    expect(newer.duplicate).toBe(false)
+    expect(newer.event.idempotencyKey).not.toBe(first.event.idempotencyKey)
+    expect(newer.state).toMatchObject({ revision: first.state.revision + 1, nodes: [{ key: "child", status: "running" }] })
+  })
+
+  it("keeps generic lifecycle keys compatible and rejects incomplete or misplaced wait scope", async () => {
+    const generic = await prepareGraphTransition(fakeGraphClient("queued") as unknown as Pick<pg.PoolClient, "query">, {
+      taskId: "child-1", sessionId: "session-1", type: "task.started", attemptCount: 4,
+    })
+    if (!generic || "blocked" in generic) throw new Error("expected generic started transition")
+    expect(generic.event.idempotencyKey).toBe(taskGraphLifecycleKey("root-1", "child", 4, "task.started"))
+
+    for (const invalid of [
+      { type: "task.started" as const, waitRowId: "wait-row-a" },
+      { type: "task.queued" as const, waitRowId: "wait-row-a", waitDispatchGeneration: 7 },
+      { type: "task.waiting" as const, waitRowId: "wait-row-a", waitDispatchGeneration: 7 },
+      { type: "task.completed" as const, waitRowId: "wait-row-a" },
+      { type: "task.started" as const, waitRowId: "wait-row-a", waitDispatchGeneration: -1 },
+      { type: "task.started" as const, waitRowId: "wait-row-a", waitDispatchGeneration: 1.5 },
+    ]) {
+      await expect(prepareGraphTransition(fakeGraphClient("queued") as unknown as Pick<pg.PoolClient, "query">, {
+        taskId: "child-1", sessionId: "session-1", attemptCount: 4, ...invalid,
+      })).rejects.toThrow("task_graph_wait_identity_invalid")
+    }
   })
 
   it("sanitizes failure details before the reducer receipt is prepared", async () => {

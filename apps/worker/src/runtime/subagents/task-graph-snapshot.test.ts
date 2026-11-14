@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { createHash } from "node:crypto"
 
 import { TASK_GRAPH_LIMITS, type TaskGraphState, type TaskGraphVerificationDisposition } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
@@ -38,7 +39,7 @@ describe("parseTaskGraphEvent", () => {
 })
 
 describe("taskGraphWaitLifecycleKey", () => {
-  it("reuses one persisted wait identity and separates distinct waits in the same attempt", () => {
+  it("reuses one wait and lifecycle identity while separating distinct waits in the same attempt", () => {
     const first = taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a")
     expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a")).toBe(first)
     expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-b")).not.toBe(first)
@@ -47,6 +48,31 @@ describe("taskGraphWaitLifecycleKey", () => {
     expect(taskGraphWaitLifecycleKey("other-root", "scout-node", 3, "wait-row-a")).not.toBe(first)
     expect(first).not.toContain("wait-row-a")
     expect(first).not.toBe(taskGraphLifecycleKey("root-1", "scout-node", 3, "task.waiting"))
+    expect(first.slice(first.lastIndexOf(":wait:"))).toBe(`:wait:${createHash("sha256").update("wait-row-a").digest("hex")}`)
+
+    const queued = taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.queued")
+    const started = taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.started", 4)
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.queued")).toBe(queued)
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-b", "task.queued")).not.toBe(queued)
+    expect(queued).not.toBe(first)
+    expect(started).not.toBe(queued)
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.started", 4)).toBe(started)
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.started", 5)).not.toBe(started)
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.started", 0)).not.toBe(started)
+  })
+
+  it("rejects lifecycle types, wait IDs, and dispatch generations outside their exact scope", () => {
+    expect(() => taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.failed" as never)).toThrow("task_graph_wait_identity_invalid")
+    expect(() => taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.waiting", 4)).toThrow("task_graph_wait_identity_invalid")
+    expect(() => taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.queued", 4)).toThrow("task_graph_wait_identity_invalid")
+    expect(() => taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.started")).toThrow("task_graph_wait_identity_invalid")
+    for (const generation of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.started", generation))
+        .toThrow("task_graph_wait_identity_invalid")
+    }
+    for (const waitId of ["", " ", " wait-row-a", "wait-row-a "]) {
+      expect(() => taskGraphWaitLifecycleKey("root-1", "scout-node", 3, waitId)).toThrow("task_graph_wait_identity_invalid")
+    }
   })
 })
 

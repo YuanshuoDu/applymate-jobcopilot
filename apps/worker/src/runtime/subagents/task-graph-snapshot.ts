@@ -192,14 +192,15 @@ export function taskGraphItemId(parentTaskId: string): string {
 export function taskGraphProposalKey(parentTaskId: string, expectedRevision: number): string {
   return `${taskGraphItemId(parentTaskId)}:proposal:${expectedRevision}`
 }
-
 export function taskGraphLifecycleKey(parentTaskId: string, nodeKey: string, attempt: number, type: string): string {
   const node = createHash("sha256").update(nodeKey).digest("hex").slice(0, 20)
   return `${taskGraphItemId(parentTaskId)}:node:${node}:${attempt}:${type}`
 }
-export function taskGraphWaitLifecycleKey(parentTaskId: string, nodeKey: string, attempt: number, waitRowId: string): string {
-  if (!waitRowId.trim() || waitRowId.trim() !== waitRowId || waitRowId.length > MAX_TASK_ID_LENGTH) throw new Error("task_graph_wait_identity_invalid")
-  return `${taskGraphLifecycleKey(parentTaskId, nodeKey, attempt, "task.waiting")}:wait:${createHash("sha256").update(waitRowId).digest("hex")}`
+export function taskGraphWaitLifecycleKey(parentTaskId: string, nodeKey: string, attempt: number, waitRowId: string, type: "task.waiting" | "task.queued" | "task.started" = "task.waiting", dispatchGeneration?: number): string {
+  if (typeof waitRowId !== "string" || !waitRowId.trim() || waitRowId.trim() !== waitRowId || waitRowId.length > MAX_TASK_ID_LENGTH
+    || type !== "task.waiting" && type !== "task.queued" && type !== "task.started"
+    || (type === "task.started" ? typeof dispatchGeneration !== "number" || !Number.isSafeInteger(dispatchGeneration) || dispatchGeneration < 0 : dispatchGeneration !== undefined)) throw new Error("task_graph_wait_identity_invalid")
+  return `${taskGraphLifecycleKey(parentTaskId, nodeKey, attempt, type)}:wait:${createHash("sha256").update(dispatchGeneration === undefined ? waitRowId : JSON.stringify([waitRowId, dispatchGeneration])).digest("hex")}`
 }
 export function taskGraphState(
   snapshot: TaskGraphSnapshot,
@@ -231,7 +232,6 @@ export function canonicalTaskGraphJson(value: unknown): string {
 export function taskGraphFingerprint(value: unknown): string {
   return createHash("sha256").update(canonicalTaskGraphJson(value)).digest("hex")
 }
-
 export function parseTaskGraphEvent(value: unknown): TaskGraphEvent | null {
   const row = object(value)
   if (!row || !text(row.type) || !text(row.idempotencyKey) || !text(row.nodeKey)

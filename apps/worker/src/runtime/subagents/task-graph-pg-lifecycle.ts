@@ -56,9 +56,13 @@ export async function prepareGraphTransition(client: Queryable, input: {
   attemptCount?: number
   failureReason?: string
   waitRowId?: string
+  waitDispatchGeneration?: number
   gateChoiceResume?: Readonly<{ gateTaskId: string; requestAttemptCount: number; resumedAttemptCount: number }>
 }): Promise<GraphTransitionPreparation> {
-  if (input.waitRowId !== undefined && (input.type !== "task.waiting" || typeof input.waitRowId !== "string" || !input.waitRowId.trim() || input.waitRowId.trim() !== input.waitRowId)) {
+  if ((input.waitRowId !== undefined || input.waitDispatchGeneration !== undefined)
+    && (typeof input.waitRowId !== "string" || !input.waitRowId.trim() || input.waitRowId.trim() !== input.waitRowId
+      || input.type !== "task.waiting" && input.type !== "task.queued" && input.type !== "task.started"
+      || (input.type === "task.started" ? typeof input.waitDispatchGeneration !== "number" || !Number.isSafeInteger(input.waitDispatchGeneration) || input.waitDispatchGeneration < 0 : input.waitDispatchGeneration !== undefined))) {
     throw new Error("task_graph_wait_identity_invalid")
   }
   const identity = await client.query(`SELECT task."turnId", task."rootTaskId", task."parentTaskId", task."attemptCount", session."userId"
@@ -222,12 +226,12 @@ export async function reconcileGraphDependents(
   throw new Error("task_graph_dependency_reconciliation_limit")
 }
 
-function makeEvent(input: { type: TaskGraphEventType; attemptCount: number; failureReason?: string; taskId: string; waitRowId?: string;
+function makeEvent(input: { type: TaskGraphEventType; attemptCount: number; failureReason?: string; taskId: string; waitRowId?: string; waitDispatchGeneration?: number;
   gateChoiceResume?: Readonly<{ gateTaskId: string; requestAttemptCount: number; resumedAttemptCount: number }> },
   taskId: string, nodeKey: string, expectedRevision: number, parentTaskId: string): TaskGraphEvent {
   const idempotencyKey = input.waitRowId === undefined
     ? taskGraphLifecycleKey(parentTaskId, nodeKey, input.attemptCount, input.type)
-    : taskGraphWaitLifecycleKey(parentTaskId, nodeKey, input.attemptCount, input.waitRowId)
+    : taskGraphWaitLifecycleKey(parentTaskId, nodeKey, input.attemptCount, input.waitRowId, input.type as "task.waiting" | "task.queued" | "task.started", input.waitDispatchGeneration)
   if (input.type === "task.failed") return {
     idempotencyKey, expectedRevision, nodeKey, type: input.type,
     failureReason: input.failureReason || "Child task failed.",

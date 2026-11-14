@@ -212,7 +212,7 @@ export async function recoverExpiredDurableSubagentWaitWithGraph(client: pg.Pool
   if (taskStatus === "queued") await dispatch(client, task, lease.ownerId)
   if (graphWaiting) await persistGraphTransition(client, graphWaiting, now)
   if (taskStatus === "queued" && graphWaiting) {
-    const graphQueued = await prepareGraphTransition(client, { taskId: lease.id, sessionId: lease.sessionId, type: "task.queued", attemptCount: lease.attemptCount })
+    const graphQueued = await prepareGraphTransition(client, { taskId: lease.id, sessionId: lease.sessionId, type: "task.queued", attemptCount: lease.attemptCount, waitRowId: String(wait.id) })
     if (!graphQueued || "blocked" in graphQueued) throw new Error("child_wait_graph_resume_blocked")
     await persistGraphTransition(client, graphQueued, now)
   }
@@ -226,7 +226,7 @@ export async function handoffDurableSubagentWaitWithGraph(client: pg.PoolClient,
   const { result: handoff, graphWaiting } = outcome
   if (graphWaiting) await persistGraphTransition(client, graphWaiting, input.now)
   if (handoff.handoff === "queued" && graphWaiting) {
-    const graphQueued = await prepareGraphTransition(client, { taskId: input.lease.id, sessionId: input.lease.sessionId, type: "task.queued", attemptCount: input.lease.attemptCount })
+    const graphQueued = await prepareGraphTransition(client, { taskId: input.lease.id, sessionId: input.lease.sessionId, type: "task.queued", attemptCount: input.lease.attemptCount, waitRowId: handoff.waitId })
     if (!graphQueued || "blocked" in graphQueued) throw new Error("child_wait_graph_resume_blocked")
     await persistGraphTransition(client, graphQueued, input.now)
   }
