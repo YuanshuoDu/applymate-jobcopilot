@@ -15540,10 +15540,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForPersistedTaskWait(pool!, value.turnId, repairWaitKey, 20_000, undefined, undefined, repairWaitDiagnostic)
     } catch (error) {
       if (!(error instanceof Error) || error.message !== "Follow-up parent wait was not durably suspended") throw error
+      const waitBoundary: RecordValue | null = repairWaitDiagnosticState.lastHelperExit
+        ? Object.fromEntries(Object.entries(repairWaitDiagnosticState.lastHelperExit).filter(([key]) => key !== "leaseScope"))
+        : null
       const diagnosis = JSON.stringify({
         rootExecution: diagnosticBoundedCount(rootExecution), failedCoverageObserved, repairAccepted, repairWaitCallPrepared,
         helperExits: diagnosticBoundedCount(repairWaitDiagnosticState.helperExits),
-        waitBoundary: repairWaitDiagnosticState.lastHelperExit,
+        waitBoundary,
       })
       throw new Error(`${error.message}; repairWaitDiagnostic=${diagnosis}`)
     }
