@@ -19,7 +19,7 @@ function session(id: string, options: { status?: string } = {}) {
 
 describe("resolveAutomationSession", () => {
   it("reuses the session already linked to an automation", async () => {
-    const existing = session("session_1")
+    const existing = { ...session("session_1"), searchFootprintMemoryEnabledAtCreation: true, searchFootprintMemoryConsentVersionAtCreation: 6 }
     const db = {
       agentSession: { findFirst: vi.fn().mockResolvedValue(existing), create: vi.fn(), deleteMany: vi.fn() },
       agentAutomation: { updateMany: vi.fn(), findFirst: vi.fn() },
@@ -29,6 +29,7 @@ describe("resolveAutomationSession", () => {
       automationId: "automation_1", userId: "user_1", sessionId: "session_1", name: "Weekday Scout",
     })).resolves.toEqual({ session: existing, created: false })
     expect(db.agentSession.create).not.toHaveBeenCalled()
+    expect(existing).toMatchObject({ searchFootprintMemoryEnabledAtCreation: true, searchFootprintMemoryConsentVersionAtCreation: 6 })
   })
 
   it("reuses an existing runtime-paused session", async () => {
@@ -57,6 +58,25 @@ describe("resolveAutomationSession", () => {
       where: { id: "automation_1", userId: "user_1", sessionId: null },
       data: { sessionId: "session_1" },
     })
+  })
+
+  it("snapshots the latest user choice when creating a new automation Session", async () => {
+    const created = session("session_snapshot")
+    const agentSession = { findFirst: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue(created), deleteMany: vi.fn() }
+    const tx = {
+      agentSession,
+      agentAutomation: { updateMany: vi.fn().mockResolvedValue({ count: 1 }), findFirst: vi.fn() },
+      $queryRaw: vi.fn(async () => []),
+      user: { findUnique: vi.fn().mockResolvedValue({ agentSearchFootprintMemoryEnabled: true, agentSearchFootprintMemoryConsentVersion: 9 }) },
+    }
+    const db = { ...tx, $transaction: vi.fn(async (work: (value: never) => unknown) => work(tx as never)) }
+
+    await resolveAutomationSession(db, { automationId: "automation_2", userId: "user_2", name: "Weekday Scout" })
+
+    expect(tx.$queryRaw).toHaveBeenCalledOnce()
+    expect(agentSession.create).toHaveBeenCalledWith({ data: expect.objectContaining({
+      searchFootprintMemoryEnabledAtCreation: true, searchFootprintMemoryConsentVersionAtCreation: 9,
+    }) })
   })
 })
 

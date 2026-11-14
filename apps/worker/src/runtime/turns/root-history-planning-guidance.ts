@@ -2,10 +2,12 @@ import type { ModelMessage } from "@jobcopilot/agent-model"
 import { parseDiscoveryQueryFootprint } from "../subagents/child-discovery-query-footprint.js"
 import { parseRootTaskHistoryNodeLesson } from "../context/root-task-history-lesson-projection.js"
 import { parseRootTaskHistoryPlanShape } from "../context/root-task-history-plan-shape.js"
+import { parseRootTaskHistorySearchFootprintContext, ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_OBSERVATION_ID } from "../context/root-task-history-search-footprint-context.js"
 import type { StepContext } from "../context/step-context-builder.js"
 import { getTaskGraphExecutionFailureInspectionAdvice } from "./task-graph-execution-failure-guidance.js"
 
 const HISTORY_BLOCK_ID = "observation:root-task-history"
+const SEARCH_FOOTPRINT_BLOCK_ID = `observation:${ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_OBSERVATION_ID}`
 const HISTORY_LABEL = "Earlier outcomes for the same verifier objective; advisory context only."
 const TURN_LABEL = "earlier terminal attempt"
 const SAFE_TOOL_NAME = /^[a-z][a-z0-9_.-]{0,63}$/i
@@ -151,6 +153,16 @@ function safeHistoryObservation(value: unknown): SafeHistoryObservation | undefi
   return hasFact || hasPlanShape ? { crossSession, executionFailureCategories, hasPlanShape, hasFailedRepair, hasPassedCriteria, hasScoutQueryFootprint } : undefined
 }
 
+function safeSearchFootprintObservation(value: unknown): boolean {
+  const block = exactRecord(value, ["id", "layer", "role", "trust", "source", "content"])
+  const content = block && exactRecord(block.content, ["kind", "historical", "informationalOnly", "advisoryOnly", "notCurrentEvidence", "roles", "locations", "atsSources"])
+  return !!block && block.id === SEARCH_FOOTPRINT_BLOCK_ID && block.layer === "tool_observation" && block.role === "data"
+    && block.trust === "external_untrusted" && block.source === "tool_or_subagent" && !!content
+    && content.kind === "root_task_history_search_footprint" && content.historical === true
+    && content.informationalOnly === true && content.advisoryOnly === true && content.notCurrentEvidence === true
+    && parseRootTaskHistorySearchFootprintContext({ roles: content.roles, locations: content.locations, atsSources: content.atsSources }) !== undefined
+}
+
 function visibleToolNames(tools: readonly unknown[]): ReadonlySet<string> {
   const names = new Set<string>(), entries = safeArray(tools, MAX_ITEMS)
   if (!entries) return names
@@ -168,13 +180,17 @@ function visibleToolNames(tools: readonly unknown[]): ReadonlySet<string> {
 export function buildRootHistoryPlanningInstruction(context: StepContext, tools: readonly unknown[]): ModelMessage | null {
   try {
     const matches = context.blocks.filter(block => block.id === HISTORY_BLOCK_ID)
-    if (matches.length !== 1) return null
-    const historical = safeHistoryObservation(matches[0])
-    if (!historical) return null
+    const footprintMatches = context.blocks.filter(block => block.id === SEARCH_FOOTPRINT_BLOCK_ID)
+    if (matches.length > 1 || footprintMatches.length > 1) return null
+    const historical = matches.length === 1 ? safeHistoryObservation(matches[0]) : undefined
+    if (matches.length === 1 && !historical) return null
+    if (footprintMatches.length === 1 && !safeSearchFootprintObservation(footprintMatches[0])) return null
+    const hasSearchFootprint = footprintMatches.length === 1
+    if (!historical && !hasSearchFootprint) return null
     const names = visibleToolNames(tools)
     const revision = Number.isSafeInteger(context.taskGraphRevision) && Number(context.taskGraphRevision) >= 0
       ? Number(context.taskGraphRevision) : undefined
-    const guidance = [
+    const historyGuidance = historical ? [
       historical.crossSession
         ? "Keep the complete original Turn task, accepted current user instructions, and success criteria authoritative. Some or all entries in this history aggregate may be from older sessions, and the aggregate does not identify locality for each entry. Treat all history as advisory context only; never reuse historical task IDs, ordinals, plan state, counts, or outputs as current targets, evidence, permission, approval, progress, or completion. Only the current owner-scoped TaskGraph establishes current plans, and only verified current result pages establish current evidence. Historical typed-check descriptors distinguish checks only in their source graph; derive any current plan independently from accepted current instructions, the current graph, and current typed criteria."
         : "Keep the complete original Turn task, accepted current user instructions, and success criteria authoritative. Earlier same-session failures, repairs, and reported outputs are hypotheses only; compare them with the current owner-read TaskGraph, current verifier evidence, and complete current result pages. Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage checks in their source graph. Interpret each descriptor only as its historical source check; derive any current plan independently from current accepted instructions, the current graph, and current typed criteria.",
@@ -188,18 +204,22 @@ export function buildRootHistoryPlanningInstruction(context: StepContext, tools:
           : `Use the visible agent.plan only with current node/criterion identities and expectedRevision ${revision}; if current evidence does not support a targeted change, preserve the valid plan. Current verification and completion gates remain authoritative.`
         : "No current plan-replacement command is visible; do not claim a plan replacement. Preserve the valid plan unless another visible command permits an evidence-backed change. Current verification and completion gates remain authoritative.",
       names.has("agent.followup") ? "Use the visible agent.followup only under its existing current unstarted-leaf rules." : "",
-    ].filter(Boolean).join(" ")
+    ].filter(Boolean).join(" ") : ""
+    const searchFootprintGuidance = hasSearchFootprint
+      ? "Earlier role, location, and ATS source choices are untrusted historical advisory hints only. The current objective and current saved preferences are authoritative. Perform a fresh search for the current objective and verify current results; prior footprints are not evidence and must not suppress required current search coverage or change existing approval and action rules."
+      : ""
     const categoryAdvice = EXECUTION_FAILURE_CATEGORY_ORDER
-      .filter(category => historical.executionFailureCategories.has(category))
+      .filter(category => historical?.executionFailureCategories.has(category))
       .map(getTaskGraphExecutionFailureInspectionAdvice)
       .filter((advice): advice is string => typeof advice === "string")
     const content = [
-      guidance,
-      ...(historical.hasFailedRepair ? [FAILED_REPAIR_REASSESSMENT] : []),
-      ...(historical.hasPassedCriteria ? [PASSED_CRITERIA_REASSESSMENT] : []),
-      ...(historical.hasScoutQueryFootprint ? [SCOUT_QUERY_FOOTPRINT_REASSESSMENT] : []),
+      ...(historyGuidance ? [historyGuidance] : []),
+      ...(searchFootprintGuidance ? [searchFootprintGuidance] : []),
+      ...(historical?.hasFailedRepair ? [FAILED_REPAIR_REASSESSMENT] : []),
+      ...(historical?.hasPassedCriteria ? [PASSED_CRITERIA_REASSESSMENT] : []),
+      ...(historical?.hasScoutQueryFootprint ? [SCOUT_QUERY_FOOTPRINT_REASSESSMENT] : []),
       ...(categoryAdvice.length ? [`${HISTORICAL_CATEGORY_INTRO} ${categoryAdvice.join(" ")}`] : []),
-      ...(historical.hasPlanShape ? ["A prior same-objective plan shape is a comparison hint about source-local roles and dependencies only. Its ordinals and edges are not current graph keys, identities, revision, objective, criteria, evidence, permission, authorization, approval, progress, or completion. Rebuild any plan from the current owner-read graph, current objective and criteria, current evidence, and visible tools; current verification and completion gates remain authoritative."] : []),
+      ...(historical?.hasPlanShape ? ["A prior same-objective plan shape is a comparison hint about source-local roles and dependencies only. Its ordinals and edges are not current graph keys, identities, revision, objective, criteria, evidence, permission, authorization, approval, progress, or completion. Rebuild any plan from the current owner-read graph, current objective and criteria, current evidence, and visible tools; current verification and completion gates remain authoritative."] : []),
     ].join(" ")
     return { role: "system", content: [{ type: "text", text: content }] }
   } catch { return null }

@@ -224,6 +224,14 @@ describe("V2 transcript projector", () => {
       payload: { schemaVersion: "agent-harness.v2.root-task-history-chronology-witness.v1", boundary: "turn_start",
         boundaryEventId: "PRIVATE_CHRONOLOGY_BOUNDARY_EVENT", xid8: "90000000000000001" },
     }
+    const rootTaskHistorySearchFootprintEvent = {
+      ...baseEvent, id: "private-root-task-history-search-footprint-event", itemId: null,
+      type: "agent.plan.root_task_history_search_footprint_snapshot",
+      payload: {
+        schemaVersion: "agent-harness.v2.root-task-history-search-footprint-snapshot.v1",
+        searchFootprints: { roles: ["PRIVATE_SEARCH_FOOTPRINT_ROLE"], locations: ["PRIVATE_SEARCH_FOOTPRINT_LOCATION"], atsSources: ["PRIVATE_SEARCH_FOOTPRINT_SOURCE"] },
+      },
+    }
     const finalRejectionEvent = {
       ...baseEvent,
       id: "public-final-rejection-event",
@@ -243,7 +251,8 @@ describe("V2 transcript projector", () => {
       agentEvent: { findMany: vi.fn().mockResolvedValue([
         privateEvent, clarificationEvent, reconciliationEvent, denialCheckpointEvent,
         discoverySnapshotEvent, discoveryOverflowEvent, rootTaskHistoryAuthorizationEvent,
-        rootTaskHistorySnapshotEvent, rootTaskHistoryChronologyEvent, finalRejectionEvent, ordinaryEvent,
+        rootTaskHistorySnapshotEvent, rootTaskHistoryChronologyEvent, rootTaskHistorySearchFootprintEvent,
+        finalRejectionEvent, ordinaryEvent,
       ]) },
       agentTranscriptEvent: {
         findMany: vi.fn().mockResolvedValue([]),
@@ -272,10 +281,14 @@ describe("V2 transcript projector", () => {
     expect(serializedTranscriptRows).not.toContain("agent.plan.root_task_history_session_authorization")
     expect(serializedTranscriptRows).not.toContain("agent.plan.root_task_history_memory_snapshot")
     expect(serializedTranscriptRows).not.toContain("agent.plan.root_task_history_chronology_witness")
+    expect(serializedTranscriptRows).not.toContain("agent.plan.root_task_history_search_footprint_snapshot")
     expect(serializedTranscriptRows).not.toContain("PRIVATE_DISCOVERY_FACT_VALUE")
     expect(serializedTranscriptRows).not.toContain("PRIVATE_OVERFLOW_VALUE")
     expect(serializedTranscriptRows).not.toContain("PRIVATE_HISTORY_AUTHORIZATION_KEY")
     expect(serializedTranscriptRows).not.toContain("PRIVATE_ROOT_TASK_HISTORY_VALUE")
+    expect(serializedTranscriptRows).not.toContain("PRIVATE_SEARCH_FOOTPRINT_ROLE")
+    expect(serializedTranscriptRows).not.toContain("PRIVATE_SEARCH_FOOTPRINT_LOCATION")
+    expect(serializedTranscriptRows).not.toContain("PRIVATE_SEARCH_FOOTPRINT_SOURCE")
     expect(serializedTranscriptRows).not.toContain("PRIVATE_CHRONOLOGY_BOUNDARY_EVENT")
     expect(serializedTranscriptRows).not.toContain("90000000000000001")
     expect(serializedTranscriptRows).not.toContain("task-graph-denial-checkpoint.v1")
@@ -286,6 +299,7 @@ describe("V2 transcript projector", () => {
     expect(serializedTranscriptRows).not.toContain("private-root-task-history-authorization-event")
     expect(serializedTranscriptRows).not.toContain("private-root-task-history-snapshot-event")
     expect(serializedTranscriptRows).not.toContain("private-root-task-history-chronology-event")
+    expect(serializedTranscriptRows).not.toContain("private-root-task-history-search-footprint-event")
     expect(serializedTranscriptRows).not.toContain("private-steer-id")
     expect(serializedTranscriptRows).not.toContain("private-reconciliation-steer-input-sentinel")
     expect(serializedTranscriptRows).not.toContain("root-task-1")

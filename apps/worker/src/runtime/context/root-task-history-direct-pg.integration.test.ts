@@ -4,7 +4,13 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
-import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
+import { createDiscoveryQueryFootprint } from "../subagents/child-discovery-query-footprint.js"
+import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "../subagents/child-discovery-attempt.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
+import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput,
+  type DirectRootTaskHistorySearchFootprintLoadInput } from "./root-task-history-direct-store.js"
 import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, updateRootObjectiveHistoryProjection } from "./objective-history-projection.js"
 import { projectRootTaskHistory, type ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
 import { acquireRootTaskHistoryChronologyLock, appendRootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.js"
@@ -164,7 +170,8 @@ type Source = Readonly<{
     key: string; templateId: string; role: string; taskType: string; goal: string; successCriteria: readonly string[]; result?: unknown
   }>[]
   failureChildren?: readonly Readonly<{ key: string; templateId: string; role: string; taskType: string; failureReason: string }>[]
-  turnSource?: string; terminalCreatedAt?: Date
+  turnSource?: string; turnExecutionMode?: "canonical_task_graph"; terminalCreatedAt?: Date
+  searchFootprint?: Readonly<{ role: string; location: string; atsSource: "greenhouse" | "lever" | "workday" | "smartrecruiters" | "personio" }>
 }>
 
 const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : describe.skip, suffix = randomUUID()
@@ -175,6 +182,10 @@ const foreignSessionId = `root-history-foreign-session-${suffix}`
 const archivedSessionId = `root-history-archived-session-${suffix}`
 const currentTurnId = `root-history-current-turn-${suffix}`, currentRootTaskId = `root-history-current-root-${suffix}`
 const currentStepId = `root-history-current-step-${suffix}`, workerId = `worker-${suffix}`
+const footprintCurrentSessionId = `root-history-footprint-current-session-${suffix}`
+const footprintCurrentTurnId = `root-history-footprint-current-turn-${suffix}`
+const footprintCurrentRootTaskId = `root-history-footprint-current-root-${suffix}`
+const footprintCurrentStepId = `root-history-footprint-current-step-${suffix}`
 const scheduledCurrentTurnId = `root-history-scheduled-current-turn-${suffix}`
 const scheduledCurrentRootTaskId = `root-history-scheduled-current-root-${suffix}`
 const scheduledCurrentStepId = `root-history-scheduled-current-step-${suffix}`
@@ -190,11 +201,27 @@ const scheduledSnapshot = (targetRoles: readonly string[], overrides: Record<str
 function scheduledTurnInput(snapshot: unknown) {
   return { goal: objective, successCriteria: criteria, automationRunMode: "scheduled", scheduledAutomationSnapshot: snapshot }
 }
+function objectiveIntentInput(goal = objective) {
+  return { goal, successCriteria: criteria, intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT }
+}
 function reportedScoutResult(finalItemId: string) {
   return { finalItemId, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
     structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "partial", summary: "private summary",
       evidence: [{ id: "e1", kind: "job", ref: "job-1", source: "greenhouse" }],
       candidates: [{ jobId: "job-1", source: "greenhouse", url: "https://private.example/1", evidenceIds: ["e1"] }] } }
+}
+function searchFootprintScoutResult(search: NonNullable<Source["searchFootprint"]>) {
+  return {
+    taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "scout-count", status: "passed", reasonCode: "criteria_met" }],
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) },
+    discoveryAttempt: { attemptCount: 1, health: { schemaVersion: DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION,
+      attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0, candidateCount: 7,
+      providerFailures: 1, materializationFailures: 2, hasMore: true },
+      queryFootprint: createDiscoveryQueryFootprint([{ criteria: { targetRoles: [search.role], targetLocations: [search.location],
+        source: search.atsSource, pageSize: 20, hasCursor: true }, outcome: "completed", requestCount: 2,
+        observedCandidateCount: 7, providerFailures: 1, materializationFailures: 2, hasMore: true }]) },
+  }
 }
 const matching: Source[] = [
   { turnId: `root-history-source-a-${suffix}`, rootTaskId: `root-history-root-a-${suffix}`, childId: `root-history-child-a-${suffix}`,
@@ -275,6 +302,55 @@ const otherUser: Source = { turnId: `root-history-other-user-turn-${suffix}`, ro
   childId: `root-history-other-user-child-${suffix}`, finalItemId: `root-history-other-user-final-${suffix}`,
   sessionId: foreignSessionId, userId: otherUserId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1,
   failureChildren: [{ key: "foreign-user", templateId: "analyst", role: "analyst", taskType: "job_analysis", failureReason: "child_resume_unavailable" }] }
+const searchFootprintMatch: Source = { turnId: `root-history-footprint-match-${suffix}`, rootTaskId: `root-history-footprint-match-root-${suffix}`,
+  childId: `root-history-footprint-match-child-${suffix}`, finalItemId: `root-history-footprint-match-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria, input: objectiveIntentInput(), startSequence: 500,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-01T00:00:00.000Z"),
+  searchFootprint: { role: "Backend Engineer", location: "Dublin", atsSource: "lever" } }
+const searchFootprintWrongObjective: Source = { turnId: `root-history-footprint-objective-${suffix}`, rootTaskId: `root-history-footprint-objective-root-${suffix}`,
+  childId: `root-history-footprint-objective-child-${suffix}`, finalItemId: `root-history-footprint-objective-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: "Search for a different role", criteria, input: objectiveIntentInput("Search for a different role"),
+  startSequence: 600, turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-02T00:00:00.000Z"),
+  searchFootprint: { role: "Foreign Objective Role", location: "Berlin", atsSource: "workday" } }
+const searchFootprintForeignTenant: Source = { turnId: `root-history-footprint-tenant-${suffix}`, rootTaskId: `root-history-footprint-tenant-root-${suffix}`,
+  childId: `root-history-footprint-tenant-child-${suffix}`, finalItemId: `root-history-footprint-tenant-final-${suffix}`,
+  sessionId: foreignSessionId, userId: otherUserId, goal: objective, criteria, input: objectiveIntentInput(), startSequence: 3,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-03T00:00:00.000Z"),
+  searchFootprint: { role: "Foreign Tenant Role", location: "Cork", atsSource: "personio" } }
+const searchFootprintFuture: Source = { turnId: `root-history-footprint-future-${suffix}`, rootTaskId: `root-history-footprint-future-root-${suffix}`,
+  childId: `root-history-footprint-future-child-${suffix}`, finalItemId: `root-history-footprint-future-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria, input: objectiveIntentInput(), startSequence: 800,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2031-01-01T00:00:00.000Z"),
+  searchFootprint: { role: "Future Role", location: "Oslo", atsSource: "greenhouse" } }
+const searchFootprintWrongVersion: Source = { turnId: `root-history-footprint-version-${suffix}`, rootTaskId: `root-history-footprint-version-root-${suffix}`,
+  childId: `root-history-footprint-version-child-${suffix}`, finalItemId: `root-history-footprint-version-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria,
+  input: { ...objectiveIntentInput(), intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, version: 2 } }, startSequence: 700,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-04T00:00:00.000Z"),
+  searchFootprint: { role: "Wrong Version Role", location: "Prague", atsSource: "personio" } }
+const searchFootprintExtraIntent: Source = { turnId: `root-history-footprint-extra-${suffix}`, rootTaskId: `root-history-footprint-extra-root-${suffix}`,
+  childId: `root-history-footprint-extra-child-${suffix}`, finalItemId: `root-history-footprint-extra-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria,
+  input: { ...objectiveIntentInput(), intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, extra: true } }, startSequence: 710,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-05T00:00:00.000Z"),
+  searchFootprint: { role: "Extra Intent Role", location: "Paris", atsSource: "workday" } }
+const searchFootprintWrongSource: Source = { turnId: `root-history-footprint-source-${suffix}`, rootTaskId: `root-history-footprint-source-root-${suffix}`,
+  childId: `root-history-footprint-source-child-${suffix}`, finalItemId: `root-history-footprint-source-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria, input: objectiveIntentInput(), startSequence: 720,
+  turnSource: "automation", turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-06T00:00:00.000Z"),
+  searchFootprint: { role: "Wrong Source Role", location: "London", atsSource: "greenhouse" } }
+const searchFootprintScalarTopIntent: Source = { turnId: `root-history-footprint-scalar-top-${suffix}`, rootTaskId: `root-history-footprint-scalar-top-root-${suffix}`,
+  childId: `root-history-footprint-scalar-top-child-${suffix}`, finalItemId: `root-history-footprint-scalar-top-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria,
+  input: { ...objectiveIntentInput(), intent: "malformed" }, startSequence: 730,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-07T00:00:00.000Z"),
+  searchFootprint: { role: "Scalar Top Intent Role", location: "Rome", atsSource: "lever" } }
+const searchFootprintScalarNestedIntent: Source = { turnId: `root-history-footprint-scalar-nested-${suffix}`, rootTaskId: `root-history-footprint-scalar-nested-root-${suffix}`,
+  childId: `root-history-footprint-scalar-nested-child-${suffix}`, finalItemId: `root-history-footprint-scalar-nested-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria,
+  input: { ...objectiveIntentInput(), input: { goal: objective, successCriteria: criteria, intent: "malformed" } }, startSequence: 740,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-08T00:00:00.000Z"),
+  searchFootprint: { role: "Scalar Nested Intent Role", location: "Madrid", atsSource: "workday" } }
 const future: Source = { turnId: `root-history-future-turn-${suffix}`, rootTaskId: `root-history-future-root-${suffix}`,
   childId: `root-history-future-child-${suffix}`, finalItemId: `root-history-future-final-${suffix}`,
   sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 2101,
@@ -371,6 +447,29 @@ async function insertCurrentStartBoundary(input: Readonly<{
   } finally { client.release() }
 }
 
+async function insertFootprintCurrentTurn(): Promise<TurnLease> {
+  const leaseExpiresAt = new Date(Date.now() + 5 * 60_000), input = objectiveIntentInput()
+  await insertSession(footprintCurrentSessionId, userId, FIXTURE_EVENT_SEQUENCE)
+  await pool!.query(`INSERT INTO "agent_turns" ("id","sessionId","userId","status","source","input","modelProfileSnapshot",
+    "toolPolicySnapshot","budgetSnapshot","rootTaskId","leaseOwnerId","leaseExpiresAt","leaseStartedAt","leaseVersion","updatedAt")
+    VALUES ($1,$2,$3,'in_progress','user',$4::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,$5,$6,$7,CURRENT_TIMESTAMP,1,CURRENT_TIMESTAMP)`,
+  [footprintCurrentTurnId, footprintCurrentSessionId, userId, JSON.stringify(input), footprintCurrentRootTaskId, workerId, leaseExpiresAt])
+  await pool!.query(`INSERT INTO "sub_agent_tasks" ("id","sessionId","turnId","rootTaskId","parentTaskId","path","depth","role","taskType","status","goal",
+    "constraints","successCriteria","allowedActions","context","expectedOutputSchema","modelProfileSnapshot","toolPolicySnapshot","budgetSnapshot",
+    "attemptCount","maxAttempts","leaseOwner","leaseExpiresAt","completedAt","updatedAt")
+    VALUES ($1,$2,$3,$1,NULL,'/footprint-current',0,'orchestrator','root','running',$4,'[]'::jsonb,$5::jsonb,'[]'::jsonb,
+      '{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,2,3,$6,$7,NULL,CURRENT_TIMESTAMP)`,
+  [footprintCurrentRootTaskId, footprintCurrentSessionId, footprintCurrentTurnId, objective, JSON.stringify(criteria), workerId, leaseExpiresAt])
+  await pool!.query(`INSERT INTO "agent_steps" ("id","sessionId","turnId","taskId","ordinal","attempt","status","inputThroughSequence","consumedInputIds","modelProfileSnapshot")
+    VALUES ($1,$2,$3,$4,1,1,'streaming',0,'[]'::jsonb,'{}'::jsonb)`,
+  [footprintCurrentStepId, footprintCurrentSessionId, footprintCurrentTurnId, footprintCurrentRootTaskId])
+  await insertCurrentStartBoundary({ userId, sessionId: footprintCurrentSessionId, turnId: footprintCurrentTurnId,
+    rootTaskId: footprintCurrentRootTaskId, eventId: `root-history-footprint-current-start-${suffix}`,
+    goal: objective, sequence: CURRENT_START_SEQUENCE, createdAt: currentStartCreatedAt })
+  return { turnId: footprintCurrentTurnId, sessionId: footprintCurrentSessionId, userId, ownerId: workerId,
+    leaseVersion: 1, leaseStartedAt: new Date(), leaseExpiresAt }
+}
+
 async function insertScheduledCurrentTurn(input: unknown): Promise<TurnLease> {
   const leaseExpiresAt = new Date(Date.now() + 5 * 60_000)
   await pool!.query(`INSERT INTO "agent_turns" ("id","sessionId","userId","status","source","input","modelProfileSnapshot",
@@ -435,29 +534,38 @@ async function insertSource(source: Source): Promise<void> {
   const rootStatus = source.rootStatus ?? status
   const terminalCreatedAt = source.terminalCreatedAt ?? new Date("2026-01-01T00:00:00.000Z")
   const startCreatedAt = new Date(terminalCreatedAt.getTime() - 1)
+  const scoutEnvelope = source.searchFootprint ? { role: "scout" as const, taskType: "job_discovery",
+    expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" as const }, allowedActions: ["jobs.discover"] } : undefined
+  const scoutVerification = source.searchFootprint ? { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+    criteria: [{ id: "scout-count", check: { kind: "candidate_count_gte", minimum: 1 } }] } : undefined
   const children = [
-    { id: source.childId, key: "scout", templateId: "scout", role: "scout", taskType: "scout", status: "completed" as const,
-      failureReason: null, goal: "Find matching roles", successCriteria: ["Find one role"], result: source.scoutResult ?? null },
+    { id: source.childId, key: "scout", templateId: "scout", role: "scout", taskType: scoutEnvelope?.taskType ?? "scout", status: "completed" as const,
+      failureReason: null, goal: "Find matching roles", successCriteria: ["Find one role"], result: source.scoutResult
+        ?? (source.searchFootprint ? searchFootprintScoutResult(source.searchFootprint) : null),
+      allowedActions: scoutEnvelope?.allowedActions ?? [], expectedOutputSchema: scoutEnvelope?.expectedOutputSchema ?? {} },
     ...(source.completedChildren ?? []).map(child => ({
       id: `${source.childId}-${child.key}`, key: child.key, templateId: child.templateId, role: child.role,
       taskType: child.taskType, status: "completed" as const, failureReason: null, goal: child.goal,
-      successCriteria: child.successCriteria, result: child.result ?? null,
+      successCriteria: child.successCriteria, result: child.result ?? null, allowedActions: [], expectedOutputSchema: {},
     })),
     ...(source.failureChildren ?? []).map(failure => ({
       id: `${source.childId}-${failure.key}`, key: `failure-${failure.key}`, templateId: failure.templateId,
       role: failure.role, taskType: failure.taskType, status: "failed" as const, failureReason: failure.failureReason,
       goal: `Inspect ${failure.key} prerequisites`, successCriteria: [`Complete ${failure.key} work`],
-      result: { finalText: `PRIVATE_${failure.key.toUpperCase()}_RESULT` },
+      result: { finalText: `PRIVATE_${failure.key.toUpperCase()}_RESULT` }, allowedActions: [], expectedOutputSchema: {},
     })),
   ]
   const graph = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: children.map(child => ({
     key: child.key, templateId: child.templateId, goal: child.goal, successCriteria: child.successCriteria,
     dependsOn: [], depth: 1, taskId: child.id,
+    ...(child.key === "scout" && scoutEnvelope && scoutVerification ? { verificationDisposition: "typed",
+      verification: scoutVerification, registeredScoutEnvelope: scoutEnvelope } : {}),
   })) })
   await pool!.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
-    "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
-    VALUES ($1, $2, $3, $4, $5, $6::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $7, NULL, NULL, NULL, 1, CURRENT_TIMESTAMP)`,
-  [source.turnId, source.sessionId, source.userId, status, source.turnSource ?? "user", JSON.stringify(source.input), source.rootTaskId])
+    "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "executionMode", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $7, $8, NULL, NULL, NULL, 1, CURRENT_TIMESTAMP)`,
+  [source.turnId, source.sessionId, source.userId, status, source.turnSource ?? "user", JSON.stringify(source.input), source.rootTaskId,
+    source.turnExecutionMode ?? null])
   await pool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
     "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "completedAt", "updatedAt")
     VALUES ($1, $2, $3, $1, NULL, '/source', 0, 'orchestrator', 'root', $4, $5, '[]'::jsonb, $6::jsonb, '[]'::jsonb,
@@ -467,10 +575,11 @@ async function insertSource(source: Source): Promise<void> {
     await pool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
       "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "result", "failureReason",
       "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "completedAt", "updatedAt")
-      VALUES ($1, $2, $3, $4, $4, $5, 1, $6, $7, $8, $9, '[]'::jsonb, $10::jsonb, '[]'::jsonb,
-        '{}'::jsonb, '{}'::jsonb, $11::jsonb, $12, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      VALUES ($1, $2, $3, $4, $4, $5, 1, $6, $7, $8, $9, '[]'::jsonb, $10::jsonb, $11::jsonb,
+        '{}'::jsonb, $12::jsonb, $13::jsonb, $14, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
     [child.id, source.sessionId, source.turnId, source.rootTaskId, `/source/${child.key}`, child.role, child.taskType, child.status,
-      child.goal, JSON.stringify(child.successCriteria), child.result === null ? null : JSON.stringify(child.result), child.failureReason])
+      child.goal, JSON.stringify(child.successCriteria), JSON.stringify(child.allowedActions), JSON.stringify(child.expectedOutputSchema),
+      child.result === null ? null : JSON.stringify(child.result), child.failureReason])
   }
   await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "completedAt", "updatedAt")
     VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
@@ -540,6 +649,7 @@ async function projectSources(sources: readonly Source[]): Promise<void> {
   try {
     await client.query("BEGIN")
     for (const source of sources) {
+      await client.query("SELECT set_config($1,$2,true)", ["app.user_id", source.userId])
       const identity = { userId: source.userId, sessionId: source.sessionId, turnId: source.turnId, rootTaskId: source.rootTaskId }
       const objectiveProjected = await updateRootObjectiveHistoryProjection(client, identity)
       if (!objectiveProjected) throw new Error(`Objective-history projection failed for ${source.turnId}`)
@@ -556,20 +666,27 @@ async function projectSources(sources: readonly Source[]): Promise<void> {
   }
 }
 
-async function deleteSourceFixtures(sources: readonly Source[]): Promise<void> {
+async function deleteSourceFixtures(sources: readonly Pick<Source, "sessionId" | "turnId">[]): Promise<void> {
   if (!sources.length) return
-  const client = await pool!.connect(), turnIds = sources.map(source => source.turnId)
+  const client = await pool!.connect(), turnIdsBySession = new Map<string, string[]>()
+  for (const source of sources) {
+    const turnIds = turnIdsBySession.get(source.sessionId) ?? []
+    turnIds.push(source.turnId)
+    turnIdsBySession.set(source.sessionId, turnIds)
+  }
   try {
     await client.query("BEGIN")
-    await client.query(`DELETE FROM "agent_outbox" WHERE "aggregateId"=$1 AND "payload"->>'turnId'=ANY($2::text[])`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
-      AND "parentTaskId" IS NOT NULL`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
-      AND "parentTaskId" IS NULL`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "agent_turns" WHERE "sessionId" = $1 AND "id" = ANY($2::text[])`, [sessionId, turnIds])
+    for (const [fixtureSessionId, turnIds] of turnIdsBySession) {
+      await client.query(`DELETE FROM "agent_outbox" WHERE "aggregateId"=$1 AND "payload"->>'turnId'=ANY($2::text[])`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
+        AND "parentTaskId" IS NOT NULL`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
+        AND "parentTaskId" IS NULL`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "agent_turns" WHERE "sessionId" = $1 AND "id" = ANY($2::text[])`, [fixtureSessionId, turnIds])
+    }
     await client.query("COMMIT")
   } catch (error: unknown) {
     await client.query("ROLLBACK").catch(() => undefined)
@@ -632,6 +749,8 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await insertSource(equalCutoff)
     await insertSource(foreignScopeCorrelation)
     await insertSource(otherUser)
+    await insertSource(searchFootprintWrongObjective)
+    await insertSource(searchFootprintForeignTenant)
     await insertSource(inconsistentTerminal)
     await insertSource(streamingTerminalStep)
     await insertSource(failedTerminalStep)
@@ -656,18 +775,75 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await insertCurrentStartBoundary()
     await insertSource(future)
     await projectSources([...matching, otherSession, crossEqualTimeHigherTurnId, crossWrongOrigin, equalCutoff, future,
-      ...crossSessionWrongOriginFillers])
+      ...crossSessionWrongOriginFillers, searchFootprintWrongObjective,
+      searchFootprintForeignTenant])
   })
 
   afterAll(async () => {
     if (pool) {
       await setObjectiveHistoryIndexReady(false).catch(() => undefined)
       await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`,
-        [[sessionId, otherSessionId, scheduledSessionId, foreignSessionId, archivedSessionId]]).catch(() => undefined)
+        [[sessionId, otherSessionId, scheduledSessionId, foreignSessionId, archivedSessionId, footprintCurrentSessionId]]).catch(() => undefined)
       await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [[userId, otherUserId]]).catch(() => undefined)
       await pool.end()
     }
   })
+
+  it("projects only bounded prior same-tenant objective Scout criteria through PostgreSQL", async () => {
+    const currentFixture = { sessionId: footprintCurrentSessionId, turnId: footprintCurrentTurnId }
+    const extraSources = [searchFootprintWrongVersion, searchFootprintExtraIntent, searchFootprintWrongSource,
+      searchFootprintScalarTopIntent, searchFootprintScalarNestedIntent]
+    let targetCreated = false
+    try {
+      const historicalSources = [searchFootprintMatch, ...extraSources]
+      for (const source of historicalSources) await insertSource(source)
+      await projectSources(historicalSources)
+      const footprintLease = await insertFootprintCurrentTurn()
+      targetCreated = true
+      // Give the future fixture a real post-boundary XID; timestamps alone do not make it future.
+      await insertSource(searchFootprintFuture)
+      await projectSources([searchFootprintFuture])
+      const input: DirectRootTaskHistorySearchFootprintLoadInput = { lease: footprintLease, rootTaskId: footprintCurrentRootTaskId,
+        rootAttemptCount: 2, stepId: footprintCurrentStepId, now: new Date(), searchFootprintReadAllowed: true }
+      const consentOff = await createPgDirectRootTaskHistoryStore(pool!).loadSearchFootprints({ ...input, searchFootprintReadAllowed: false })
+      expect(consentOff).toEqual({ roles: [], locations: [], atsSources: [] })
+
+      await updateTurnInputJson(footprintCurrentTurnId, JSON.stringify({ ...objectiveIntentInput(),
+        intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, version: 2 } }))
+      const invalidTargetQueries: string[] = []
+      const invalidTargetStore = createPgDirectRootTaskHistoryStore(observeQueries(pool!, async sql => { invalidTargetQueries.push(sql) }))
+      await expect(invalidTargetStore.loadSearchFootprints(input)).resolves.toEqual({ roles: [], locations: [], atsSources: [] })
+      expect(invalidTargetQueries.some(sql => sql.includes("WITH terminal_window AS MATERIALIZED"))).toBe(false)
+      await updateTurnInputJson(footprintCurrentTurnId, JSON.stringify(objectiveIntentInput()))
+
+      const sourceQueries: string[] = []
+      const store = createPgDirectRootTaskHistoryStore(observeQueries(pool!, async sql => { sourceQueries.push(sql) }))
+      const footprint = await store.loadSearchFootprints(input)
+      expect(footprint).toEqual({ roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] })
+      expect(JSON.stringify(footprint)).not.toMatch(/root-history-footprint|Foreign Objective Role|Foreign Tenant Role|Future Role|Wrong Version Role|Extra Intent Role|Wrong Source Role|Scalar Top Intent Role|Scalar Nested Intent Role|Berlin|Cork|Oslo|Prague|Paris|London|Rome|Madrid|pageSize|hasCursor|candidateCount|providerFailures|materializationFailures/)
+      const sourceWindow = sourceQueries.find(sql => sql.includes("WITH terminal_window AS MATERIALIZED")) ?? ""
+      expect(sourceWindow).toContain("'objective_task_graph_execution'")
+      expect(sourceWindow).toContain('turn."source" IS DISTINCT FROM \'user\'')
+      expect(sourceWindow).not.toContain("'interactive_discovery_shortlist'")
+
+      const client = await pool!.connect()
+      try {
+        await client.query("BEGIN")
+        await client.query("SELECT set_config($1,$2,true)", ["app.user_id", otherUserId])
+        await expect(store.loadSearchFootprintsWithClient(client, input)).rejects.toThrow("root_task_history_scope_mismatch")
+      } finally {
+        await client.query("ROLLBACK").catch(() => undefined)
+        client.release()
+      }
+    } finally {
+      try {
+        if (targetCreated) await updateTurnInputJson(footprintCurrentTurnId, JSON.stringify(objectiveIntentInput())).catch(() => undefined)
+        await deleteSourceFixtures([searchFootprintMatch, ...extraSources, searchFootprintFuture, currentFixture])
+      } finally {
+        await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2`, [footprintCurrentSessionId, userId])
+      }
+    }
+  }, 60_000)
 
   it("returns same-user/session Roots with the exact canonical objective and a distinct source Root ID", async () => {
     const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,

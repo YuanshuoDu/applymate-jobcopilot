@@ -6,6 +6,9 @@ const mocks = vi.hoisted(() => ({
   featureEnabled: vi.fn(),
   sessionFindFirst: vi.fn(),
   sessionCreate: vi.fn(),
+  sessionSnapshotLock: vi.fn(),
+  sessionSnapshotUser: vi.fn(),
+  sessionSnapshotTransaction: vi.fn(),
   agentConfigFindUnique: vi.fn(),
   turnFindFirst: vi.fn(),
   inputFindFirst: vi.fn(),
@@ -24,6 +27,7 @@ vi.mock("@/lib/runtime-feature-flags", () => ({
 }))
 vi.mock("@/lib/db", () => ({
   db: {
+    $transaction: mocks.sessionSnapshotTransaction,
     agentSession: { findFirst: mocks.sessionFindFirst, create: mocks.sessionCreate },
     agentConfig: { findUnique: mocks.agentConfigFindUnique },
     agentTurn: { findFirst: mocks.turnFindFirst },
@@ -53,6 +57,13 @@ describe("POST /api/agent/discovery/start", () => {
     mocks.featureEnabled.mockResolvedValue(false)
     mocks.sessionFindFirst.mockResolvedValue(null)
     mocks.sessionCreate.mockResolvedValue({ id: "discovery_session" })
+    mocks.sessionSnapshotLock.mockResolvedValue([])
+    mocks.sessionSnapshotUser.mockResolvedValue({ agentSearchFootprintMemoryEnabled: false, agentSearchFootprintMemoryConsentVersion: 0 })
+    mocks.sessionSnapshotTransaction.mockImplementation(async (work: (tx: never) => unknown) => work({
+      $queryRaw: mocks.sessionSnapshotLock,
+      user: { findUnique: mocks.sessionSnapshotUser },
+      agentSession: { create: mocks.sessionCreate },
+    } as never))
     mocks.agentConfigFindUnique.mockResolvedValue({ targetRoles: ["Platform Engineer"], targetLocations: ["Dublin"] })
     mocks.turnFindFirst.mockResolvedValue(null)
     mocks.inputFindFirst.mockResolvedValue(null)
@@ -96,9 +107,11 @@ describe("POST /api/agent/discovery/start", () => {
       sequence: "1",
     })
     expect(mocks.sessionCreate).toHaveBeenCalledWith({
-      data: expect.objectContaining({ userId: "user_1", goal: expect.any(String), source: "chat", status: "running" }),
+      data: expect.objectContaining({ userId: "user_1", goal: expect.any(String), source: "chat", status: "running",
+        searchFootprintMemoryEnabledAtCreation: false, searchFootprintMemoryConsentVersionAtCreation: 0 }),
       select: { id: true },
     })
+    expect(mocks.sessionSnapshotLock).toHaveBeenCalledOnce()
     expect(mocks.start).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: "discovery_session",
       userId: "user_1",

@@ -9,7 +9,12 @@ import {
 } from "./repository"
 
 function mockDb() {
-  return {
+  const db = {
+    $queryRaw: vi.fn(async () => []),
+    user: { findUnique: vi.fn(async () => ({
+      agentSearchFootprintMemoryEnabled: false, agentSearchFootprintMemoryConsentVersion: 0,
+    })) },
+    $transaction: vi.fn(),
     agentSession: {
       create: vi.fn(async ({ data }) => ({
         id: "session_1",
@@ -54,6 +59,8 @@ function mockDb() {
       updateMany: vi.fn(),
     },
   }
+  db.$transaction.mockImplementation(async (work: (tx: never) => unknown) => work(db as never))
+  return db
 }
 
 describe("agent session repository", () => {
@@ -80,8 +87,14 @@ describe("agent session repository", () => {
         source: "chat",
         status: "running",
         memorySummary: "",
+        searchFootprintMemoryEnabledAtCreation: false,
+        searchFootprintMemoryConsentVersionAtCreation: 0,
       },
     })
+    expect(db.$queryRaw).toHaveBeenCalledOnce()
+    expect(db.user.findUnique).toHaveBeenCalledWith({ where: { id: "user_1" }, select: {
+      agentSearchFootprintMemoryEnabled: true, agentSearchFootprintMemoryConsentVersion: true,
+    } })
   })
 
   it("appends transcript events with nullable task metadata", async () => {
