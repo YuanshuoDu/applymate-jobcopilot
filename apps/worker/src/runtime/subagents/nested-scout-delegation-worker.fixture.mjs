@@ -16,13 +16,13 @@ import { createCrashFixtureExecutor, createNestedScoutFixtureScripts } from "./n
 const [, , mode, rawIds] = process.argv
 const ids = JSON.parse(rawIds)
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 10 })
-const CRASH_TEST_LEASE_MS = 3_000
-const CRASH_TEST_HEARTBEAT_MS = 500
+const CRASH_TEST_LEASE_MS = 3_000, CRASH_TEST_HEARTBEAT_MS = 500
 const SAFE_RECOVERY_ERROR_CODES = new Set([
   "subagent_dispatch_delivery_uncertain", "lost", "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01",
-  "ECONNRESET", "ETIMEDOUT", "child_resume_owner_mismatch", "child_resume_lease_expired",
-  "child_resume_wait_tool_call_conflict", "child_resume_wait_step_lineage", "child_resume_wait_lineage", "child_resume_invalid_wait_result",
-  "child_resume_step_lineage", "child_resume_item_lineage", "child_resume_step_limit", "child_resume_item_limit", "child_resume_usage_overflow",
+  "ECONNRESET", "ETIMEDOUT", "wait_invalid", "wait_scope_error", "wait_conflict",
+  ...`owner_mismatch lease_expired wait_tool_call_conflict wait_step_lineage wait_lineage invalid_wait_result step_lineage item_lineage step_limit item_limit usage_overflow
+    observation_limit invalid_tool_call invalid_wait_input tool_item_conflict invalid_item_status tool_call_conflict tool_result_conflict invalid_errorCode
+    invalid_id invalid_sessionId invalid_turnId invalid_taskId invalid_rootTaskId invalid_stepId invalid_ordinal invalid_attempt invalid_inputThroughSequence invalid_inputTokens invalid_outputTokens invalid_estimatedCostUsd invalid_consumedInputIds`.split(/\s+/).map(code => `child_resume_${code}`),
 ])
 let bootstrap
 async function pauseSubagentClaims() {
@@ -146,14 +146,17 @@ async function start(mode) {
     modelRuntimeFactory: () => { say("P1143_ROOT_MODEL_RUNTIME_FACTORY_ENTERED"); try { const model = rootModelRuntime(); say("P1143_ROOT_MODEL_RUNTIME_FACTORY_CREATED"); return model } catch (error) { say(`P1143_ROOT_MODEL_RUNTIME_FACTORY_ERROR:${recoveryErrorClass(error, true)}`); throw error } },
   })
   const markerState = { closedStepRejected: false, parallelObserved: false }
-  const productionResumeLoader = createProductionChildResumeLoaders(pool).resumeLoader
-  if (typeof productionResumeLoader !== "function") throw new Error("p1143_resume_loader_unavailable")
   const executeChild = createProductionChildExecutor({ pool, subagentManager: () => runtime.manager,
     authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
       settle: async () => undefined, settleUnknown: async () => undefined }), jobDiscoveryClient: discoveryClient(),
     resumeLoader: async lease => {
-      try { return await productionResumeLoader(lease) }
-      catch (error) { say(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${recoveryErrorClass(error, true)}`); throw error }
+      let stage = "repair_consumed_waits", connection = 0
+      const loader = createProductionChildResumeLoaders({ connect: async () => {
+        stage = ["repair_consumed_waits", "durable_wait_resume", "child_attempt_resume"][connection++] ?? "other"
+        return pool.connect()
+      } }).resumeLoader
+      try { return await loader(lease) }
+      catch (error) { say(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${stage}:${recoveryErrorClass(error, true)}`); throw error }
     }, modelRuntimeFactory: input => childModelRuntime({ ...input, runtime, markerState }), durableWaitResumeCommitter: waitResumeCommitter() })
   const execute = createCrashFixtureExecutor(mode, executeChild, say)
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 100,
@@ -169,7 +172,6 @@ async function start(mode) {
   }
   return { runtime }
 }
-
 async function parentWaiting() {
   const deadline = Date.now() + 40_000
   while (Date.now() < deadline) {
@@ -199,7 +201,6 @@ async function crashChildClaimed() {
   }
   throw new Error("p1143_crash_child_did_not_claim")
 }
-
 async function rootCompleted() {
   const deadline = Date.now() + 250_000
   while (Date.now() < deadline) {
@@ -228,7 +229,6 @@ async function rootCompleted() {
   }
   throw new Error("p1143_root_turn_did_not_complete_after_child_join")
 }
-
 try {
   if (process.env.CI !== "true" || process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true"
     || process.env.AGENT_RUNTIME_PG_TEST_REQUIRED !== "true" || !process.env.AGENT_RUNTIME_PG_TEST_URL

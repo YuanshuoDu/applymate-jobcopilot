@@ -70,9 +70,10 @@ const SAFE_RECOVERY_ERROR_CODES = [
 const SAFE_RECOVERY_DIAGNOSTIC_MARKERS = new Set(SAFE_RECOVERY_STAGES.flatMap(stage =>
   SAFE_RECOVERY_ERROR_CODES.map(code => `P1143_RECOVERY_ERROR:${stage}:${code}`)))
 const SAFE_CHILD_RESUME_LOADER_CODES = [
-  ...SAFE_RECOVERY_ERROR_CODES, "child_resume_owner_mismatch", "child_resume_lease_expired", "child_resume_wait_tool_call_conflict",
-  "child_resume_wait_step_lineage", "child_resume_wait_lineage", "child_resume_invalid_wait_result", "child_resume_step_lineage",
-  "child_resume_item_lineage", "child_resume_step_limit", "child_resume_item_limit", "child_resume_usage_overflow",
+  ...SAFE_RECOVERY_ERROR_CODES, "wait_invalid", "wait_scope_error", "wait_conflict",
+  ...`owner_mismatch lease_expired wait_tool_call_conflict wait_step_lineage wait_lineage invalid_wait_result step_lineage item_lineage step_limit item_limit usage_overflow
+    observation_limit invalid_tool_call invalid_wait_input tool_item_conflict invalid_item_status tool_call_conflict tool_result_conflict invalid_errorCode
+    invalid_id invalid_sessionId invalid_turnId invalid_taskId invalid_rootTaskId invalid_stepId invalid_ordinal invalid_attempt invalid_inputThroughSequence invalid_inputTokens invalid_outputTokens invalid_estimatedCostUsd invalid_consumedInputIds`.split(/\s+/).map(code => `child_resume_${code}`),
 ] as const
 const SAFE_WAIT_RESUME_STAGES = [
   "required_value", "resume_scope", "source_step", "source_call_count", "source_call_input", "source_item_set", "wait_record_shape",
@@ -108,8 +109,8 @@ function isSafeRootSetupDiagnostic(value: string): boolean {
 }
 
 function isSafeChildResumeLoaderDiagnostic(value: string): boolean {
-  const match = value.match(/^P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:([A-Za-z0-9_]+)$/)
-  return !!match && SAFE_CHILD_RESUME_LOADER_CODES.includes(match[1] as typeof SAFE_CHILD_RESUME_LOADER_CODES[number])
+  const match = value.match(/^P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:(repair_consumed_waits|durable_wait_resume|child_attempt_resume):([A-Za-z0-9_]+)$/)
+  return !!match && SAFE_CHILD_RESUME_LOADER_CODES.includes(match[2] as typeof SAFE_CHILD_RESUME_LOADER_CODES[number])
 }
 
 function seenMainProgress(output: string[]) {
