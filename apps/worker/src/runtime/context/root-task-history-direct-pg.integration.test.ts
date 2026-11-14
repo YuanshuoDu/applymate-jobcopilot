@@ -70,16 +70,31 @@ function observeQueries(pool: PgPool, afterQuery: (sql: string, values?: readonl
 function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number, fixtureScopeParameter: number): string {
   const witnessId = `$${witnessIdParameter}`
   const fixtureScope = `$${fixtureScopeParameter}`
-  return `WITH "fixture_scope" AS MATERIALIZED (
-      SELECT DISTINCT scope."sessionId", scope."turnId"
-      FROM jsonb_to_recordset(${fixtureScope}::jsonb) AS scope("sessionId" text, "turnId" text)
+  return `WITH "fixture_manifest" AS MATERIALIZED (
+      SELECT ${fixtureScope}::jsonb AS manifest
+    ), "fixture_sessions" AS MATERIALIZED (
+      SELECT source_session.* FROM "fixture_manifest" AS manifest
+      CROSS JOIN LATERAL jsonb_array_elements_text(manifest.manifest->'sessions') AS fixture("id")
+      JOIN public."agent_sessions" AS source_session ON source_session."id" = fixture."id"
+    ), "agent_sessions" AS NOT MATERIALIZED (
+      SELECT * FROM "fixture_sessions"
+    ), "fixture_turns" AS MATERIALIZED (
+      SELECT source_turn.* FROM "fixture_manifest" AS manifest
+      CROSS JOIN LATERAL jsonb_array_elements_text(manifest.manifest->'turns') AS fixture("id")
+      JOIN public."agent_turns" AS source_turn ON source_turn."id" = fixture."id"
+    ), "agent_turns" AS NOT MATERIALIZED (
+      SELECT * FROM "fixture_turns"
+    ), "fixture_tasks" AS MATERIALIZED (
+      SELECT source_task.* FROM "fixture_manifest" AS manifest
+      CROSS JOIN LATERAL jsonb_array_elements_text(manifest.manifest->'rootTasks') AS fixture("id")
+      JOIN public."sub_agent_tasks" AS source_task ON source_task."id" = fixture."id"
+    ), "sub_agent_tasks" AS NOT MATERIALIZED (
+      SELECT * FROM "fixture_tasks"
     ), "fixture_events" AS MATERIALIZED (
       SELECT source_event.*
-      FROM "fixture_scope" AS scope
-      CROSS JOIN LATERAL (
-        SELECT event.* FROM public."agent_events" AS event
-        WHERE event."sessionId" = scope."sessionId" AND event."turnId" = scope."turnId"
-      ) AS source_event
+      FROM "fixture_manifest" AS manifest
+      CROSS JOIN LATERAL jsonb_array_elements_text(manifest.manifest->'events') AS fixture("id")
+      JOIN public."agent_events" AS source_event ON source_event."id" = fixture."id"
     ), "agent_events" AS NOT MATERIALIZED (
       SELECT * FROM "fixture_events"
       UNION ALL
@@ -328,7 +343,13 @@ const duplicateWitnessFixtureScope = [
   ...initialRootHistorySources.map(source => ({ sessionId: source.sessionId, turnId: source.turnId })),
   { sessionId: future.sessionId, turnId: future.turnId },
 ]
-const duplicateWitnessFixtureScopeJson = JSON.stringify(duplicateWitnessFixtureScope)
+const duplicateWitnessFixtureTurnIds = [...new Set(duplicateWitnessFixtureScope.map(scope => scope.turnId))]
+let duplicateWitnessFixtureManifestJson: string | undefined
+let capturedFixtureEventIds: string[] | undefined
+function duplicateWitnessFixtureManifest(): string {
+  if (!duplicateWitnessFixtureManifestJson) throw new Error("Root history fixture manifest is unavailable")
+  return duplicateWitnessFixtureManifestJson
+}
 let pool: PgPool | undefined
 let lease: TurnLease
 
@@ -369,6 +390,7 @@ async function insertBoundaryEvent(client: PoolClient, event: EventReceipt, crea
   [event.id, event.sessionId, event.turnId, event.itemId, event.taskId, event.sequence, event.type, event.correlationId,
     event.causationId, event.idempotencyKey, JSON.stringify(event.payload), createdAt])
   await insertEventOutbox(client, event)
+  capturedFixtureEventIds?.push(event.id)
 }
 
 async function insertCurrentStartBoundary(input: Readonly<{
@@ -389,8 +411,10 @@ async function insertCurrentStartBoundary(input: Readonly<{
     [event.id, input.sessionId, input.turnId, input.rootTaskId, event.sequence, event.type, event.correlationId,
       event.idempotencyKey, JSON.stringify(event.payload), input.createdAt])
     await insertEventOutbox(client, event)
-    await appendRootTaskHistoryChronologyWitness(client, { userId: input.userId, sessionId: input.sessionId,
+    capturedFixtureEventIds?.push(event.id)
+    const witness = await appendRootTaskHistoryChronologyWitness(client, { userId: input.userId, sessionId: input.sessionId,
       turnId: input.turnId, rootTaskId: input.rootTaskId, boundary: "turn_start", boundaryEventId: event.id }, lock)
+    capturedFixtureEventIds?.push(witness.eventId)
     await client.query("COMMIT")
   } catch (error: unknown) {
     await client.query("ROLLBACK").catch(() => undefined)
@@ -445,11 +469,15 @@ async function insertSourceBoundaryEvents(input: Readonly<{
     for (const receipt of input.stepReceipts) await insertBoundaryEvent(client, receipt, input.startCreatedAt)
     for (const receipt of input.completedReceipts) await insertBoundaryEvent(client, receipt, input.terminalCreatedAt)
     await insertBoundaryEvent(client, terminal, input.terminalCreatedAt)
-    await appendRootTaskHistoryChronologyWitness(client, { userId: source.userId, sessionId: source.sessionId,
+    const startWitness = await appendRootTaskHistoryChronologyWitness(client, { userId: source.userId, sessionId: source.sessionId,
       turnId: source.turnId, rootTaskId: source.rootTaskId, boundary: "turn_start", boundaryEventId: start.id }, lock)
-    if (input.writeTerminalWitness) await appendRootTaskHistoryChronologyWitness(client, { userId: source.userId,
-      sessionId: source.sessionId, turnId: source.turnId, rootTaskId: source.rootTaskId,
-      boundary: "root_terminal", boundaryEventId: terminal.id }, lock)
+    capturedFixtureEventIds?.push(startWitness.eventId)
+    if (input.writeTerminalWitness) {
+      const terminalWitness = await appendRootTaskHistoryChronologyWitness(client, { userId: source.userId,
+        sessionId: source.sessionId, turnId: source.turnId, rootTaskId: source.rootTaskId,
+        boundary: "root_terminal", boundaryEventId: terminal.id }, lock)
+      capturedFixtureEventIds?.push(terminalWitness.eventId)
+    }
     await client.query("COMMIT")
   } catch (error: unknown) {
     await client.query("ROLLBACK").catch(() => undefined)
@@ -647,25 +675,43 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await insertSession(foreignSessionId, otherUserId, FIXTURE_EVENT_SEQUENCE)
     await insertSession(archivedSessionId, userId, FIXTURE_EVENT_SEQUENCE)
     await pool.query(`UPDATE "agent_sessions" SET "status" = 'archived' WHERE "id" = $1`, [archivedSessionId])
-    for (const source of initialRootHistorySources) await insertSource(source)
-    const input = { goal: objective, successCriteria: criteria }
-    await pool.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
-      "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
-      VALUES ($1, $2, $3, 'in_progress', 'user', $4::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $5, $6,
-        CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`,
-    [currentTurnId, sessionId, userId, JSON.stringify(input), currentRootTaskId, workerId])
-    await pool.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
-      "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "completedAt", "updatedAt")
-      VALUES ($1, $2, $3, $1, NULL, '/current', 0, 'orchestrator', 'root', 'running', $4, '[]'::jsonb, $5::jsonb,
-        '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 2, 3, $6, CURRENT_TIMESTAMP + INTERVAL '5 minutes', NULL, CURRENT_TIMESTAMP)`,
-    [currentRootTaskId, sessionId, currentTurnId, objective, JSON.stringify(criteria), workerId])
-    await pool.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
-      VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
-    [currentStepId, sessionId, currentTurnId, currentRootTaskId])
-    await insertCurrentStartBoundary()
-    await insertSource(future)
-    await projectSources([...matching, otherSession, crossEqualTimeHigherTurnId, crossWrongOrigin, equalCutoff, future,
-      ...crossSessionWrongOriginFillers])
+    const fixtureEventIds: string[] = []
+    capturedFixtureEventIds = fixtureEventIds
+    try {
+      for (const source of initialRootHistorySources) await insertSource(source)
+      const input = { goal: objective, successCriteria: criteria }
+      await pool.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
+        "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
+        VALUES ($1, $2, $3, 'in_progress', 'user', $4::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $5, $6,
+          CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`,
+      [currentTurnId, sessionId, userId, JSON.stringify(input), currentRootTaskId, workerId])
+      await pool.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+        "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "completedAt", "updatedAt")
+        VALUES ($1, $2, $3, $1, NULL, '/current', 0, 'orchestrator', 'root', 'running', $4, '[]'::jsonb, $5::jsonb,
+          '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 2, 3, $6, CURRENT_TIMESTAMP + INTERVAL '5 minutes', NULL, CURRENT_TIMESTAMP)`,
+      [currentRootTaskId, sessionId, currentTurnId, objective, JSON.stringify(criteria), workerId])
+      await pool.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+        VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+      [currentStepId, sessionId, currentTurnId, currentRootTaskId])
+      await insertCurrentStartBoundary()
+      await insertSource(future)
+      await projectSources([...matching, otherSession, crossEqualTimeHigherTurnId, crossWrongOrigin, equalCutoff, future,
+        ...crossSessionWrongOriginFillers])
+    } finally { capturedFixtureEventIds = undefined }
+    const fixtureEvents = await pool.query<{ id: string }>(
+      `SELECT "id" FROM public."agent_events" WHERE "id" = ANY($1::text[])`, [fixtureEventIds])
+    expect(fixtureEventIds.length).toBeGreaterThan(0)
+    expect(new Set(fixtureEventIds).size).toBe(fixtureEventIds.length)
+    expect(fixtureEvents.rows).toHaveLength(fixtureEventIds.length)
+    expect(new Set(fixtureEvents.rows.map(event => event.id))).toEqual(new Set(fixtureEventIds))
+    duplicateWitnessFixtureManifestJson = JSON.stringify({
+      sessions: [...new Set(duplicateWitnessFixtureScope.map(scope => scope.sessionId))],
+      turns: duplicateWitnessFixtureTurnIds,
+      rootTasks: [
+        ...new Set([currentRootTaskId, ...initialRootHistorySources.map(source => source.rootTaskId), future.rootTaskId]),
+      ],
+      events: fixtureEventIds,
+    })
   })
 
   afterAll(async () => {
@@ -948,7 +994,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
         const query = buildRootTaskHistoryCrossSessionWindow({ ...window, ...(afterCursor ? { afterCursor } : {}) })
         const result = await client.query<Record<string, unknown>>(
           queryLevelDuplicateWitnessSql(query.sql, query.values.length + 1, query.values.length + 2),
-          [...query.values, baseWitnessId, duplicateWitnessFixtureScopeJson])
+          [...query.values, baseWitnessId, duplicateWitnessFixtureManifest()])
         phase(pagePhases[kind][1])
         const pageRows = result.rows.filter(row => row.isPageWatermark !== true)
         const watermarks = result.rows.filter(row => row.isPageWatermark === true)
@@ -1007,7 +1053,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
 
     phase("post_transaction_history_load_started")
     const historyWithShadowWitness = await createPgDirectRootTaskHistoryStore(
-      queryLevelDuplicateWitnessPool(pool!, baseWitnessId!, duplicateWitnessFixtureScopeJson)).load(input)
+      queryLevelDuplicateWitnessPool(pool!, baseWitnessId!, duplicateWitnessFixtureManifest())).load(input)
     phase("post_transaction_history_load_completed")
     expect(historyWithShadowWitness.some(item => item.sourceTurnId === equalCutoff.turnId)).toBe(false)
     expect(historyWithShadowWitness.map(item => item.sourceTurnId)).toContain(otherSession.turnId)
