@@ -694,15 +694,17 @@ function disposableUrl(): string | null {
     return null
   }
   const url = new URL(value)
+  const redis = new URL(process.env.AGENT_TURN_REDIS_TEST_URL ?? "")
+  const ciPortPair = url.port === "5432" && redis.port === "6379"
+  const localDisposablePortPair = url.port === "15432" && redis.port === "16379"
   if (process.env.CI !== "true" || process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true"
     || process.env.AGENT_RUNTIME_PG_TEST_REQUIRED !== "true" || url.protocol !== "postgresql:"
-    || url.hostname !== "127.0.0.1" || url.port !== "5432" || url.username !== "nested_fixture"
+    || url.hostname !== "127.0.0.1" || (!ciPortPair && !localDisposablePortPair) || url.username !== "nested_fixture"
     || url.password !== "nested_fixture_only" || url.pathname !== `/${DATABASE_NAME}` || url.search || url.hash) {
     throw new Error("Nested Scout delegation requires the dedicated disposable PostgreSQL service")
   }
-  const redis = new URL(process.env.AGENT_TURN_REDIS_TEST_URL ?? "")
   if (process.env.AGENT_TURN_REDIS_TEST_DISPOSABLE !== "true" || redis.protocol !== "redis:"
-    || redis.hostname !== "127.0.0.1" || redis.port !== "6379" || redis.pathname !== "/15"
+    || redis.hostname !== "127.0.0.1" || redis.pathname !== "/15"
     || redis.username || redis.password || redis.search || redis.hash || process.env.REDIS_URL !== redis.href) {
     throw new Error("Nested Scout delegation requires the dedicated disposable Redis service")
   }
@@ -715,7 +717,7 @@ let pool: Pool
 
 function launch(mode: "park" | "crash-child" | "resume", ids: FixtureIds): FixtureProcess {
   const child = spawn(process.execPath, ["--import", "tsx", PROCESS_FIXTURE, mode, JSON.stringify(ids)], {
-    cwd: process.cwd(), env: { ...process.env, BULLMQ_STALLED_INTERVAL_MS: "30000" }, stdio: ["pipe", "pipe", "pipe"],
+    cwd: process.cwd(), env: fixtureWorkerEnv(process.env, databaseUrl!), stdio: ["pipe", "pipe", "pipe"],
   })
   const output: string[] = []
   let buffer = ""
@@ -746,6 +748,10 @@ function launch(mode: "park" | "crash-child" | "resume", ids: FixtureIds): Fixtu
       throw new Error(`Worker fixture did not reach ${marker}`)
     },
   }
+}
+
+function fixtureWorkerEnv(inherited: NodeJS.ProcessEnv, validatedDatabaseUrl: string): NodeJS.ProcessEnv {
+  return { ...inherited, DATABASE_URL: validatedDatabaseUrl, BULLMQ_STALLED_INTERVAL_MS: "30000" }
 }
 
 async function waitForExpiredCrashLease(ids: FixtureIds, parentTaskId: string, childTaskId: string, ownerId: string, timeoutMs: number): Promise<void> {
@@ -950,6 +956,8 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
 
 
   it("reclaims a claimed Scout child after a pre-model Worker crash and joins source-bound children across Worker restart", async () => {
+    const inheritedWorkerEnv = fixtureWorkerEnv({ DATABASE_URL: "postgresql://production.invalid/production" }, databaseUrl!)
+    expect(inheritedWorkerEnv.DATABASE_URL).toBe(databaseUrl)
     const suffix = randomUUID()
     const ids: FixtureIds = {
       userId: `nested-scout-user-${suffix}`, sessionId: `nested-scout-session-${suffix}`,
