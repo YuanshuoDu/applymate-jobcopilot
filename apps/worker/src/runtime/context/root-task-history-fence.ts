@@ -11,7 +11,6 @@ import { rootTaskHistoryFootprintOrigin } from "./root-task-history-footprint-or
 
 type Client = pg.PoolClient
 type Row = Record<string, unknown>
-
 export type RootTaskHistoryFenceInput = Readonly<{
   lease: TurnLease
   rootTaskId: string
@@ -36,7 +35,6 @@ export type RootTaskHistoryFence = Readonly<{
 }>
 
 type Queryable = Pick<pg.PoolClient, "query">
-
 function text(value: unknown): value is string {
   return typeof value === "string" && !!value.trim() && value.trim() === value
 }
