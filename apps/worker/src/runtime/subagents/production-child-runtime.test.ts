@@ -353,7 +353,7 @@ function selectedJobExecutor(input: {
   const pool = input.pool ?? selectedJobPool()
   const executor = createOptionalProductionChildExecutor({
     enabled: true, pool: pool as never, turnStore: input.persistence.engineStore, treeBudget: budget(),
-    authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => input.model,
+    authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => input.model,
     resumeLoader: async () => undefined,
     ...(input.mailboxReader ? { mailboxReader: input.mailboxReader } : {}),
   })
@@ -702,7 +702,7 @@ describe("production child runtime", () => {
     const turnPersistence = recordingStore()
     const scoutExecutor = createOptionalProductionChildExecutor({
       enabled: true, pool: poolFixture as never, turnStore: turnPersistence.engineStore, treeBudget: budget(),
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => scoutModel,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => scoutModel,
       jobDiscoveryClient: discoveryClient, mailboxReader: emptyMailboxReader, resumeLoader: async () => undefined,
       subagentManager: managerProvider,
     })
@@ -812,7 +812,7 @@ describe("production child runtime", () => {
     }
     const analystExecutor = createOptionalProductionChildExecutor({
       enabled: true, pool: poolFixture as never, turnStore: turnPersistence.engineStore, treeBudget: budget(),
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => analystModel,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => analystModel,
       mailboxReader: emptyMailboxReader, resumeLoader: async () => undefined,
     })
     if (!analystExecutor) throw new Error("Analyst child executor was not created")
@@ -1104,7 +1104,7 @@ describe("production child runtime", () => {
     })
     const executor = createOptionalProductionChildExecutor({
       enabled: true, pool: {} as never, turnStore: store(), treeBudget: budget(),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => model, toolRuntimeFactory: toolFactory,
     })
 
@@ -1136,7 +1136,7 @@ describe("production child runtime", () => {
     }
     const executor = createOptionalProductionChildExecutor({
       enabled: true, pool: {} as never, turnStore: store(), treeBudget: budget(),
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => model,
       mailboxReader: emptyMailboxReader, resumeLoader: async () => undefined,
     })
     if (!executor) throw new Error("scheduled Prepare executor was not created")
@@ -1326,7 +1326,7 @@ describe("production child runtime", () => {
     }))
     const runtimeLeases: SubagentLease[] = []
     const executor = createOptionalProductionChildExecutor({
-      enabled: true, pool, turnStore: engineStore, treeBudget: budget(), authorizeUsage: async () => ({ settle: async () => undefined }),
+      enabled: true, pool, turnStore: engineStore, treeBudget: budget(), authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => model, mailboxReader: { listPendingMessages: async () => [mailbox] },
       toolRuntimeFactory: ({ lease: runtimeLease }) => {
         runtimeLeases.push(runtimeLease)

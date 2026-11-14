@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 
 import { parseObjectiveStartBody } from "./objective-start-route-helpers"
@@ -54,7 +54,7 @@ describe("parseObjectiveStartBody", () => {
     expect(parsed).toMatchObject({ content: [{ type: "text", text }] })
   })
 
-  it("keeps requirements tri-state: absent is omitted, valid is parsed, and invalid is a null sentinel", () => {
+  it("keeps absent requirements omitted, parses valid values, and rejects malformed blocks", () => {
     const absent = parseObjectiveStartBody(baseBody, request(), sessionId)
     expect(Object.hasOwn(absent as object, "verificationRequirements")).toBe(false)
 
@@ -65,8 +65,28 @@ describe("parseObjectiveStartBody", () => {
       id: "candidate-count", check: { kind: "evidence_count_gte", minimum: 3 },
     }] }
     const invalid = parseObjectiveStartBody({ ...baseBody, verificationRequirements: malformed }, request(), sessionId)
-    expect(invalid).toMatchObject({ objective: "Find senior backend roles in Dublin", verificationRequirements: null })
-    expect(invalid).not.toMatchObject({ verificationRequirements: malformed })
+    expect(invalid).toMatchObject({ status: 422 })
+  })
+
+  it("accepts and canonicalizes the versioned exact-location requirement only when enabled", () => {
+    const locationRequirements = {
+      schemaVersion: "agent-harness.v2.objective-requirements.v2",
+      requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin, Ireland", " Berlin ", "dublin"] } }],
+    }
+    const disabled = parseObjectiveStartBody({ ...baseBody, verificationRequirements: locationRequirements }, request(), sessionId)
+    expect(disabled).toMatchObject({ status: 422 })
+    vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "1")
+    try {
+      const enabled = parseObjectiveStartBody({ ...baseBody, verificationRequirements: locationRequirements }, request(), sessionId)
+      expect(enabled).toMatchObject({
+        verificationRequirements: {
+          schemaVersion: "agent-harness.v2.objective-requirements.v2",
+          requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["berlin", "dublin", "dublin, ireland"] } }],
+        },
+      })
+    } finally {
+      vi.unstubAllEnvs()
+    }
   })
 
   it("rejects authority fields and malformed or over-bound context without trimming text", () => {

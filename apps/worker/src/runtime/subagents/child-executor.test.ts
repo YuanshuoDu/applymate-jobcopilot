@@ -209,7 +209,7 @@ function restoredRead(id: string, toolName: string, output: unknown, overrides: 
 
 function finalTextExecutor(model: ModelAdapter, outputs: Readonly<Record<string, unknown>> = {}) {
   return createChildExecutor({
-    store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+    store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
     modelRuntimeFactory: () => model,
     toolRuntimeFactory: () => childToolRuntime(
       [tool("jobs.search", "jobs"), tool("jobs.get", "jobs"), tool("persona.retrieve", "persona"), tool("resume.get_base", "resume")],
@@ -262,7 +262,7 @@ describe("child executor composition", () => {
     } }
     const committer = vi.fn(async (_lease: SubagentLease, _wait: DurableWaitResume, physicalOrdinal: number) => physicalOrdinal === 39)
     const executor = createChildExecutor({
-      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => textOnlyModel("continued after resolved wait", request => requests.push(request)),
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]), resumeLoader, durableWaitResumeCommitter: committer,
     })
@@ -279,7 +279,7 @@ describe("child executor composition", () => {
     const modelRuntimeFactory = vi.fn(() => textOnlyModel("must not run"))
     const executor = createChildExecutor({
       store: executionStore([], []), treeBudget: budgetStore().store,
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory,
       toolRuntimeFactory: () => childToolRuntime([tool("cover_letter.draft", "resume")]),
     })
     await expect(executor({ lease: child })).resolves.toMatchObject({ status: "failed", failureReason: "selected_job_sources_unavailable", retryDisposition: "terminal" })
@@ -311,7 +311,7 @@ describe("child executor composition", () => {
     const requests: HarnessModelRequest[] = []
     const executor = createChildExecutor({
       store: executionStore([], []), treeBudget: budgetStore().store,
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => textOnlyModel("invalid structured result", request => requests.push(request)),
       toolRuntimeFactory: () => ({
         ...childToolRuntime(definitions),
@@ -381,7 +381,7 @@ describe("child executor composition", () => {
       appendEvent: async input => { durableWrites.push({ kind: "appendEvent", value: input.payload }); return backingStore.appendEvent(input) },
     }
     const executor = createChildExecutor({
-      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => ({
         ...childToolRuntime(definitions, async (_context, request) => {
@@ -464,7 +464,7 @@ describe("child executor composition", () => {
       "persona.retrieve": { facts: [{ id: "fact-1", source: "persona.database" }] },
     }
     const executor = createChildExecutor({
-      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => ({
         ...childToolRuntime(
@@ -518,7 +518,7 @@ describe("child executor composition", () => {
     const budget = budgetStore(false, { maxSteps: 0 })
     const executor = createChildExecutor({
       store: { ...executionStore([], []), startStep }, treeBudget: budget.store,
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
     })
 
@@ -539,7 +539,7 @@ describe("child executor composition", () => {
     }
     const executor = createChildExecutor({
       store: executionStore([], []), treeBudget: budgetStore(false, { maxToolCalls: 0 }).store,
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")], async (_context, request) => {
         routed()
         return { ...request, status: "completed", errorCode: null }
@@ -574,7 +574,7 @@ describe("child executor composition", () => {
       },
     }
     const executor = createChildExecutor({
-      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")], async (_context, request) => ({ ...request, status: "completed", output: { jobs: [{ id: "job-1", source: "greenhouse" }] }, errorCode: null })),
       mailboxReader: { listPendingMessages, hydrateMessages },
@@ -619,7 +619,7 @@ describe("child executor composition", () => {
         }
         const created = { id: stepId, ordinal }; createdSteps.set(stepId, created); deliveryOrder.push("step-created"); return created
       } },
-      treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")], async (_context, request) => {
         routedCalls.push(request.toolName); return { ...request, status: "completed", errorCode: null }
       }),
@@ -717,7 +717,7 @@ describe("child executor composition", () => {
     const waitTool = createDurableSubagentWaitTool({ connect: async () => { throw new Error("dispatcher_must_not_connect") } } as never, child)
     try {
       const executor = createChildExecutor({
-        store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+        store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => model,
         toolRuntimeFactory: () => childToolRuntime([waitTool], async (_context, request) => {
           dispatch(request)
           return { ...request, status: "completed", output: waitOutput, errorCode: null }
@@ -840,7 +840,7 @@ describe("child executor composition", () => {
     const waitTool = createDurableSubagentWaitTool({ connect: async () => { throw new Error("denied_wait_must_not_connect") } } as never, child)
     const executor = createChildExecutor({
       store: executionStore(events, requests, eventPayloads), treeBudget: budgetStore().store,
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([waitTool], async (_context, request) => {
         dispatch(request)
         return { ...request, status: "completed", output: { unexpected: true }, errorCode: null }
@@ -891,7 +891,7 @@ describe("child executor composition", () => {
         if (existing) { expect(existing.ordinal).toBe(ordinal); deliveryOrder.push("step-reused"); return existing }
         const created = { id: stepId, ordinal }; persistedSteps.set(stepId, created); deliveryOrder.push("step-persisted"); return created
       } },
-      treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")], async (_context, request) => {
         routedCalls.push(request.toolName); return { ...request, status: "completed", errorCode: null }
       }),
@@ -965,7 +965,7 @@ describe("child executor composition", () => {
         if (existing) { expect(existing.ordinal).toBe(ordinal); deliveryOrder.push("continuation-reused"); return existing }
         const created = { id: stepId, ordinal }; persistedSteps.set(stepId, created); deliveryOrder.push("continuation-created"); return created
       } },
-      treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")], async (_context, request) => {
         routedCalls.push(request.toolName); return { ...request, status: "completed", errorCode: null }
       }),
@@ -1014,7 +1014,7 @@ describe("child executor composition", () => {
         matchedTaskIds: [], tasks: [{ taskId: "grandchild-1", status: "running", role: "scout", result: null, failureReason: null }] },
     } as const
     const executor = createChildExecutor({
-      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => finalTextModel("completed output"), toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
       resumeLoader: async () => ({
         resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
@@ -1058,7 +1058,7 @@ describe("child executor composition", () => {
     const durableWaitResumeCommitter = vi.fn(async () => true)
     let runtimeLease: SubagentLease | undefined
     const executor = createChildExecutor({
-      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => { factoryOrder.push("model"); return model },
       toolRuntimeFactory: input => { factoryOrder.push("tool"); runtimeLease = input.lease; return childToolRuntime([tool("jobs.search", "jobs")], router) },
       mailboxReader: { listPendingMessages: vi.fn(async () => []), hydrateMessages }, resumeLoader, sameAttemptContinuationLoader, durableWaitResumeCommitter,
@@ -1151,7 +1151,7 @@ describe("child executor composition", () => {
     }))
     const model = textOnlyModel(resultText, request => requests.push(request))
     const executor = createChildExecutor({
-      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs"), tool("persona.retrieve", "persona"), tool("resume.get_base", "resume")]),
       resumeLoader,
@@ -1181,7 +1181,7 @@ describe("child executor composition", () => {
     }), request => requests.push(request))
     const executor = createChildExecutor({
       store: executionStore([], requests), treeBudget: budgetStore().store,
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([]),
     })
 
@@ -1214,7 +1214,7 @@ describe("child executor composition", () => {
       },
     }
     const executor = createChildExecutor({
-      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => ({
         ...childToolRuntime([scheduledPrepareTool()], async (_context, request) => ({ ...request, status: "completed", errorCode: null, output: reference })),
@@ -1248,7 +1248,7 @@ describe("child executor composition", () => {
       },
     }
     const executor = createChildExecutor({
-      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => ({
         ...childToolRuntime([scheduledPrepareTool()], async (_context, request) => ({ ...request, status: "completed", errorCode: null, output: currentReference })),
@@ -1281,7 +1281,7 @@ describe("child executor composition", () => {
     }
     const executor = createChildExecutor({
       store: executionStore([], []), treeBudget: budgetStore().store,
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => readSequenceModel(JSON.stringify(malformedPrepare), ["scheduled.application.prepare"]),
       toolRuntimeFactory: () => childToolRuntime([{
         ...tool("scheduled.application.prepare", "resume"),
@@ -1315,7 +1315,7 @@ describe("child executor composition", () => {
     const requests: HarnessModelRequest[] = []
     const model = textOnlyModel(_label === "marker mismatch" ? "done" : JSON.stringify(validAnalystResult()), request => requests.push(request))
     const executor = createChildExecutor({
-      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => ({ ...model, profile: overrides.profile }),
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
     })
@@ -1328,7 +1328,7 @@ describe("child executor composition", () => {
   it("fails closed before the provider when restored evidence is malformed", async () => {
     const child = structuredLease("scout"); const modelRuntimeFactory = vi.fn(() => textOnlyModel("unreachable"))
     const executor = createChildExecutor({
-      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
       resumeLoader: async () => ({
         resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 1n, consumedInputIds: [], usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 } },
@@ -1366,7 +1366,7 @@ describe("child executor composition", () => {
     }
     const router = vi.fn(async (_context, request) => ({ ...request, status: "completed" as const, output, errorCode: null }))
     const executor = createChildExecutor({
-      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => model, toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")], router),
       resumeLoader: async () => ({
         resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
@@ -1385,7 +1385,7 @@ describe("child executor composition", () => {
   it("returns a terminal disposition for deterministic recovered history conflicts", async () => {
     const child = lease(); const modelRuntimeFactory = vi.fn(() => textOnlyModel("unreachable"))
     const executor = createChildExecutor({
-      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
       resumeLoader: async () => { throw new Error("child_resume_tool_call_conflict") },
     })
@@ -1400,7 +1400,7 @@ describe("child executor composition", () => {
   ] as const)("keeps %s retryable", async failureCode => {
     const child = lease(); const modelRuntimeFactory = vi.fn(() => textOnlyModel("unreachable"))
     const executor = createChildExecutor({
-      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
       resumeLoader: async () => { throw new Error(failureCode) },
     })
@@ -1414,7 +1414,7 @@ describe("child executor composition", () => {
   it("keeps an unknown resume loader error retryable", async () => {
     const child = lease(); const modelRuntimeFactory = vi.fn(() => textOnlyModel("unreachable"))
     const executor = createChildExecutor({
-      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
       resumeLoader: async () => { throw new Error("resume database connection failed") },
     })
@@ -1428,7 +1428,7 @@ describe("child executor composition", () => {
   it("keeps a non-Error resume loader rejection retryable", async () => {
     const child = lease(); const modelRuntimeFactory = vi.fn(() => textOnlyModel("unreachable"))
     const executor = createChildExecutor({
-      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
       resumeLoader: async () => { throw { code: "resume_database_error" } },
     })
@@ -1443,7 +1443,7 @@ describe("child executor composition", () => {
     const child = { ...lease(), attemptCount: 1 }; const resumeLoader = vi.fn(async () => undefined); const modelRuntimeFactory = vi.fn(() => finalTextModel("completed output"))
     const executor = createChildExecutor({
       store: { ...executionStore([], []), startStep: async ({ ordinal, stepId }) => ({ id: stepId, ordinal }) },
-      treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
+      treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]), resumeLoader,
     })
 
@@ -1482,7 +1482,7 @@ describe("child executor composition", () => {
         store: { ...executionStore([], requests), startStep: async ({ ordinal, stepId, attempt }) => {
           expect(attempt).toBe(1); deliveryOrder.push("step"); return { id: stepId, ordinal }
         } },
-        treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+        treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
         modelRuntimeFactory: () => textOnlyModel("continued after wait", request => requests.push(request)),
         toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
         resumeLoader,
@@ -1518,7 +1518,8 @@ describe("child executor composition", () => {
         }
       },
     }
-    const authorize = vi.fn(async input => ({ settle: vi.fn(async () => undefined), input }))
+    const authorize = vi.fn(async input => ({ outputReservationRequired: false, maxOutputTokens: null,
+      settle: vi.fn(async () => undefined), settleUnknown: vi.fn(async () => undefined), input }))
     const executor = createChildExecutor({
       store: executionStore(events, requests), treeBudget: budget.store, authorizeUsage: authorize,
       modelRuntimeFactory: () => model,
@@ -1567,7 +1568,7 @@ describe("child executor composition", () => {
     }
     const executor = createChildExecutor({
       store: executionStore(events, requests), treeBudget: budgetStore().store,
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([{ ...tool(toolName, domain), version: definitionVersion }], async (_context, request) => {
         routedCalls.push(request.toolName)
         return { ...request, status: "completed", output: { unexpected: true }, errorCode: null }
@@ -1605,7 +1606,7 @@ describe("child executor composition", () => {
       },
     }
     const executor = createChildExecutor({
-      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
     })
@@ -1743,7 +1744,7 @@ describe("child executor composition", () => {
       ...request, status: "completed", output: discoveredOutput, errorCode: null,
     }))
     const executor = createChildExecutor({
-      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => readSequenceModel("not-json", ["jobs.discover"]),
       toolRuntimeFactory: () => ({ ...runtime, discoveryAttemptSidecar: () => sidecar, discoveryRecoverySidecar: () => recovery }),
     })
@@ -1771,7 +1772,7 @@ describe("child executor composition", () => {
       evidence: [{ id: "evidence-1", kind: "job", ref: discoveredJob.id, source: "greenhouse" }], summary: "One observed role",
     })
     const successfulExecutor = createChildExecutor({
-      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => readSequenceModel(completedText, ["jobs.discover"]),
       toolRuntimeFactory: () => ({ ...runtime, discoveryAttemptSidecar: () => sidecar, discoveryRecoverySidecar: () => recovery }),
     })
@@ -1827,7 +1828,7 @@ describe("child executor composition", () => {
       },
     }
     const executor = createChildExecutor({
-      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")], async (_context, request) => ({
         ...request, status: "completed", output: { status: "waiting", waitId, deadlineAt: "2026-09-12T12:00:00.000Z", matchedTaskIds: [] }, errorCode: null,
@@ -1860,7 +1861,7 @@ describe("child executor composition", () => {
       async *stream(request) { requests.push(request); yield { type: "text_delta", text: "summary" }; yield { type: "completed", finishReason: "stop" } },
     }
     const executor = createChildExecutor({
-      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([tool("tool_results.read", "coordination"), tool("spawn_subagent", "coordination"), tool("wait_subagents", "coordination")]),
     })
@@ -1873,7 +1874,7 @@ describe("child executor composition", () => {
     const budget = budgetStore(true)
     const model: ModelAdapter = { id: "fixture-model", profile, async *stream() { yield { type: "completed", finishReason: "stop" } } }
     const executor = createChildExecutor({
-      store: executionStore([], []), treeBudget: budget.store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      store: executionStore([], []), treeBudget: budget.store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
     })
     await expect(executor({ lease: lease() })).resolves.toMatchObject({ status: "failed" })
@@ -1889,7 +1890,7 @@ describe("child executor composition", () => {
     const settlements: WorkerUsageSettlementInput[] = []
     const authorizeUsage = vi.fn(async (input: WorkerUsageAuthorizationInput) => {
       authorized.push(input)
-      return { settle: async (settlement: WorkerUsageSettlementInput) => { settlements.push(settlement) } }
+      return { outputReservationRequired: false, maxOutputTokens: null, settle: async (settlement: WorkerUsageSettlementInput) => { settlements.push(settlement) } }
     })
     const budget = budgetStore(false, { maxSteps: 4, maxToolCalls: 3 })
     const model: ModelAdapter = {
@@ -1932,9 +1933,11 @@ describe("child executor composition", () => {
     expect(authorizeUsage).toHaveBeenCalledTimes(1)
     expect(authorized[0]).toMatchObject({
       userId: native.lease.userId, sessionId: native.lease.sessionId, turnId: native.lease.turnId,
-      featureKey: "autoApply", provider: "fixture", model: "fixture-model", attemptId: `${native.lease.id}:${native.lease.attemptCount}`,
+      featureKey: "autoApply", provider: "fixture", model: "fixture-model", attemptId: "route-1",
       executionOwner: { kind: "task", taskId: native.lease.id, rootTaskId: native.lease.rootTaskId, ownerId: native.lease.ownerId, attemptCount: native.lease.attemptCount },
     })
+    expect(authorized[0]?.stepId).toBe(requests[0]?.metadata.stepId)
+    expect(authorized[0]?.stepId).toContain(`:attempt:${native.lease.attemptCount}`)
     expect(settlements).toEqual([{ status: "success", inputTokens: 12, outputTokens: 8, estimatedCostUsd: 0.004 }])
     expect(budget.store.readRootLimits).toHaveBeenCalledWith({ userId: native.lease.userId, sessionId: native.lease.sessionId, turnId: native.lease.turnId, rootTaskId: native.lease.rootTaskId })
     expect(budget.store.reserve).toHaveBeenCalledTimes(1)
@@ -1956,7 +1959,7 @@ describe("child executor composition", () => {
     const budget = budgetStore()
     const executor = createChildExecutor({
       store: executionStore(events, [], eventPayloads), treeBudget: budget.store,
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
     })
 
@@ -1974,7 +1977,7 @@ describe("child executor composition", () => {
     const budget = budgetStore()
     const executor = createChildExecutor({
       store: executionStore([], []), treeBudget: budget.store,
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory, toolRuntimeFactory,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory, toolRuntimeFactory,
       mailboxReader: { listPendingMessages: vi.fn(async () => [mailboxMessage(native.lease)]) },
       resumeLoader: vi.fn(async () => undefined),
     })
@@ -1996,7 +1999,7 @@ describe("child executor composition", () => {
     const budget = budgetStore()
     const executor = createChildExecutor({
       store: executionStore([], []), treeBudget: budget.store,
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory, toolRuntimeFactory, sameAttemptContinuationLoader,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory, toolRuntimeFactory, sameAttemptContinuationLoader,
     })
 
     await expect(executor({ lease: native.lease, continuation: {
@@ -2016,7 +2019,7 @@ describe("child executor composition", () => {
     abort.stop()
     const modelCall = vi.fn()
     const model: ModelAdapter = { id: "fixture-model", profile, async *stream() { modelCall(); yield { type: "completed", finishReason: "stop" } } }
-    const authorizeUsage = vi.fn(async () => ({ settle: async () => undefined }))
+    const authorizeUsage = vi.fn(async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }))
     const budget = budgetStore()
     const executor = createChildExecutor({
       store: executionStore([], []), treeBudget: budget.store, authorizeUsage, modelRuntimeFactory: () => model,
@@ -2037,7 +2040,7 @@ describe("child executor composition", () => {
     const modelCall = vi.fn()
     const model: ModelAdapter = { id: "fixture-model", profile, async *stream() { modelCall(); yield { type: "completed", finishReason: "stop" } } }
     const budget = budgetStore()
-    const authorizeUsage = vi.fn(async () => ({ settle: async () => undefined }))
+    const authorizeUsage = vi.fn(async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }))
     const store = executionStore([], [])
     const appendEvent = vi.fn(async (input: Parameters<TurnExecutionStore["appendEvent"]>[0]) => {
       if (input.type === "task.started") throw new SessionPauseRequestedError()
@@ -2060,7 +2063,7 @@ describe("child executor composition", () => {
     const model: ModelAdapter = { id: "fixture-model", profile, async *stream() { modelCall(); yield { type: "completed", finishReason: "stop" } } }
     const budget = budgetStore()
     budget.store.reserve = vi.fn(async () => { throw Object.assign(new Error("tree budget denied"), { code: "tree_budget_denied" }) })
-    const authorizeUsage = vi.fn(async () => ({ settle: async () => undefined }))
+    const authorizeUsage = vi.fn(async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }))
     const executor = createChildExecutor({
       store: executionStore([], []), treeBudget: budget.store, authorizeUsage, modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([]),
@@ -2099,12 +2102,17 @@ describe("child executor composition", () => {
     const native = nativeVerifierTask()
     const providerCall = vi.fn()
     const settlement: WorkerUsageSettlementInput[] = []
+    const unknownSettlement: WorkerUsageSettlementInput[] = []
     const model: ModelAdapter = {
       id: "fixture-model", profile,
       async *stream() { providerCall(); throw Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }); yield { type: "completed", finishReason: "stop" } },
     }
     const budget = budgetStore()
-    const authorizeUsage = vi.fn(async (_input: WorkerUsageAuthorizationInput) => ({ settle: async (value: WorkerUsageSettlementInput) => { settlement.push(value) } }))
+    const authorizeUsage = vi.fn(async (_input: WorkerUsageAuthorizationInput) => ({
+      outputReservationRequired: false, maxOutputTokens: null,
+      settle: async (value: WorkerUsageSettlementInput) => { settlement.push(value) },
+      settleUnknown: async (value: WorkerUsageSettlementInput) => { unknownSettlement.push(value) },
+    }))
     const executor = createChildExecutor({
       store: executionStore([], []), treeBudget: budget.store, authorizeUsage, modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([]),
@@ -2115,7 +2123,8 @@ describe("child executor composition", () => {
     expect(result.retryDisposition).toBeUndefined()
     expect(result.result).not.toHaveProperty("nativeVerificationReport")
     expect(providerCall).toHaveBeenCalledTimes(1)
-    expect(settlement).toEqual([{ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "provider_unavailable" }])
+    expect(settlement).toEqual([])
+    expect(unknownSettlement).toEqual([{ status: "error", inputTokens: null, outputTokens: null, estimatedCostUsd: null, errorCode: "provider_unavailable" }])
     expect(budget.statuses).toEqual(["consumed"])
   })
 
@@ -2142,7 +2151,7 @@ describe("child executor composition", () => {
     })))
     const executor = createChildExecutor({
       store: executionStore([], requests), treeBudget: budgetStore().store,
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => model,
       toolRuntimeFactory, mailboxReader: { listPendingMessages: async () => [mailboxMessage(child)] },
     })
 

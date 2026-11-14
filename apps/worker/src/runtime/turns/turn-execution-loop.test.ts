@@ -1467,7 +1467,7 @@ describe("owner-agnostic turn execution loop", () => {
     }
     const authorize = async (input: WorkerUsageAuthorizationInput): Promise<WorkerUsageAuthorization> => {
       authorizations.push(input)
-      return { settle: async settlement => { settlements.push(settlement) } }
+      return { outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async settlement => { settlements.push(settlement) }, settle: async settlement => { settlements.push(settlement) } }
     }
     const model = createUsageAwareModelAdapter(capturedRouter, { owner: root.options.identity, authorize })
     const goal = "Find senior software engineering roles in Dublin while preserving the original candidate constraints."
@@ -1540,7 +1540,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(authorizations).toHaveLength(2)
     expect(settlements).toEqual([
       { status: "success", inputTokens: 41, outputTokens: 13, estimatedCostUsd: 0.037 },
-      { status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "context_estimate_exceeded" },
+      { status: "error", inputTokens: null, outputTokens: null, estimatedCostUsd: null, errorCode: "context_estimate_exceeded" },
     ])
     expect(root.stepStatuses).toEqual(["completed", "failed"])
     expect(root.finalResponses).toHaveLength(1)

@@ -41,13 +41,20 @@ describe("MiniMax request profile", () => {
   it("replaces deprecated max_tokens and adds M3 reasoning controls", () => {
     const options = miniMaxRequestOptions({ thinking: "disabled", reasoningSplit: true, maxCompletionTokens: 2_048 }, "MiniMax-M3")
     const body = JSON.parse(buildMiniMaxRequestBody(JSON.stringify({
-      model: "wrong-model", max_tokens: 2_048, stream: true, stream_options: { include_usage: true },
+      model: "wrong-model", max_tokens: 512, stream: true, stream_options: { include_usage: true },
     }), options)) as Record<string, unknown>
     expect(body).toMatchObject({
-      model: "MiniMax-M3", max_completion_tokens: 2_048, reasoning_split: true,
+      model: "MiniMax-M3", max_completion_tokens: 512, reasoning_split: true,
       thinking: { type: "disabled" }, stream: true,
     })
     expect(body).not.toHaveProperty("max_tokens")
+  })
+
+  it("rejects an invalid explicit output cap before returning a provider body", () => {
+    const options = miniMaxRequestOptions({}, "MiniMax-M3")
+    for (const maxTokens of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => buildMiniMaxRequestBody(JSON.stringify({ max_tokens: maxTokens }), options)).toThrowError(AgentModelError)
+    }
   })
 
   it("rejects invalid request limits with a typed error", () => {

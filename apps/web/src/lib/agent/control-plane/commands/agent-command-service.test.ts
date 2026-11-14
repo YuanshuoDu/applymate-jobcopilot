@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 
@@ -12,6 +12,9 @@ vi.mock("./application-fill-command", () => ({
 
 import { AgentCommandService } from "./agent-command-service"
 import { ObjectiveStartCommandService } from "./objective-start"
+import { OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION } from "./types"
+
+afterEach(() => vi.unstubAllEnvs())
 
 type Row = Record<string, unknown>
 
@@ -1135,6 +1138,7 @@ describe("AgentCommandService", () => {
   })
 
   it("preserves objective intent and verification requirements on the retry successor", async () => {
+    vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "0")
     const verificationRequirements = {
       schemaVersion: "agent-harness.v2.objective-requirements.v1",
       requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }],
@@ -1155,6 +1159,72 @@ describe("AgentCommandService", () => {
       intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
       verificationRequirements,
     })
+  })
+
+  it("retries location verification requirements when the capability gate is enabled", async () => {
+    vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "1")
+    const verificationRequirements = {
+      schemaVersion: OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+      requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["dublin"] } }],
+    } as const
+    const input = {
+      goal: "Find candidates in Dublin",
+      content: [...content],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      verificationRequirements,
+    }
+    const fake = makeDb({ retryTarget: retryTarget("failed", input) })
+
+    await new AgentCommandService(fake.db).retry(retryCommand("retry_location_enabled"))
+
+    expect(fake.state.active?.input).toMatchObject({ verificationRequirements })
+    expect(fake.state.outbox.filter(entry => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+  })
+
+  it("rejects disabled location requirements before creating a retry Turn or outbox entry", async () => {
+    vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "0")
+    const input = {
+      goal: "Retry the location-aware objective",
+      content: [...content],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      verificationRequirements: {
+        schemaVersion: OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+        requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin"] } }],
+      },
+    }
+    const fake = makeDb({ retryTarget: retryTarget("failed", input) })
+
+    await expect(new AgentCommandService(fake.db).retry(retryCommand("retry_location_disabled")))
+      .rejects.toMatchObject({ code: "retry_input_invalid", status: 409 })
+    expect(fake.tx.agentTurn.create).not.toHaveBeenCalled()
+    expect(fake.state.active).toBeNull()
+    expect(fake.state.inputs).toHaveLength(0)
+    expect(fake.state.items).toHaveLength(0)
+    expect(fake.state.events).toHaveLength(0)
+    expect(fake.state.outbox).toHaveLength(0)
+  })
+
+  it("rejects malformed location requirements before creating a retry Turn or outbox entry", async () => {
+    vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "1")
+    const input = {
+      goal: "Retry the location-aware objective",
+      content: [...content],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      verificationRequirements: {
+        schemaVersion: OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+        requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: [" "] } }],
+      },
+    }
+    const fake = makeDb({ retryTarget: retryTarget("failed", input) })
+
+    await expect(new AgentCommandService(fake.db).retry(retryCommand("retry_location_invalid")))
+      .rejects.toMatchObject({ code: "retry_input_invalid", status: 409 })
+    expect(fake.tx.agentTurn.create).not.toHaveBeenCalled()
+    expect(fake.state.active).toBeNull()
+    expect(fake.state.inputs).toHaveLength(0)
+    expect(fake.state.items).toHaveLength(0)
+    expect(fake.state.events).toHaveLength(0)
+    expect(fake.state.outbox).toHaveLength(0)
   })
 
   it("preserves the explicit null verification-requirements sentinel on the retry successor", async () => {

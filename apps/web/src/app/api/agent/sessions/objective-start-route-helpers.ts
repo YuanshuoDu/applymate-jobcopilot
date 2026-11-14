@@ -2,7 +2,12 @@ import { AgentInputCommandSchema, assertValid, schemaVersion, type InputContentP
 import { NextResponse } from "next/server"
 
 import { MAX_ATTACHMENT_REFS, MAX_CONTENT_PARTS, MAX_TEXT_PART_LENGTH } from "./command-route-helpers"
-import { parseObjectiveVerificationRequirements, type ObjectiveVerificationRequirements } from "@/lib/agent/control-plane/commands/types"
+import {
+  OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+  objectiveLocationVerificationEnabled,
+  parseObjectiveVerificationRequirements,
+  type ObjectiveVerificationRequirements,
+} from "@/lib/agent/control-plane/commands/types"
 
 export type ParsedObjectiveStartCommand = {
   clientMessageId: string
@@ -36,8 +41,8 @@ function trimmedString(value: unknown, maxLength = 256): string | null {
   return normalized.length > 0 && normalized.length <= maxLength ? normalized : null
 }
 
-function invalid(message: string): NextResponse {
-  return NextResponse.json({ error: { code: "invalid_command", message, details: {} } }, { status: 422 })
+function invalid(message: string, code = "invalid_command"): NextResponse {
+  return NextResponse.json({ error: { code, message, details: {} } }, { status: 422 })
 }
 
 function parseContent(value: unknown): InputContentPart[] | null {
@@ -92,10 +97,23 @@ export function parseObjectiveStartBody(
     return invalid("Invalid objective start command payload")
   }
   const hasRequirements = Object.hasOwn(body, "verificationRequirements")
+  let verificationRequirements: ObjectiveVerificationRequirements | null | undefined
+  if (hasRequirements) {
+    if (body.verificationRequirements === null) {
+      verificationRequirements = null
+    } else {
+      verificationRequirements = parseObjectiveVerificationRequirements(body.verificationRequirements) ?? undefined
+      if (!verificationRequirements) return invalid("Objective verification requirements are invalid or unsupported")
+      if (verificationRequirements.schemaVersion === OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION &&
+          !objectiveLocationVerificationEnabled()) {
+        return invalid("Explicit location verification is not enabled yet", "objective_location_verification_unavailable")
+      }
+    }
+  }
   return {
     clientMessageId,
     objective,
     content,
-    ...(hasRequirements ? { verificationRequirements: parseObjectiveVerificationRequirements(body.verificationRequirements) } : {}),
+    ...(hasRequirements ? { verificationRequirements } : {}),
   }
 }

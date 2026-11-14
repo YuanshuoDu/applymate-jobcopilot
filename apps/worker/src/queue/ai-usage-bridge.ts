@@ -11,6 +11,8 @@ type WorkerUsageCommon = {
   model: string
   sessionId: string
   attemptId?: string
+  requestedOutputTokens?: number
+  startProtocolVersion?: 1
 }
 
 type WorkerLegacyTurnOwner = { executionOwner?: never; leaseOwnerId: string; leaseVersion: number }
@@ -19,15 +21,22 @@ export type WorkerUsageAuthorizationInput = WorkerUsageCommon & (WorkerLegacyTur
 
 export type WorkerUsageSettlementInput = {
   status: "success" | "error"
-  inputTokens: number
-  outputTokens: number
-  estimatedCostUsd: number
+  inputTokens: number | null
+  outputTokens: number | null
+  estimatedCostUsd: number | null
   errorCode?: string
 }
 
-export type WorkerUsageAuthorization = {
-  settle(input: WorkerUsageSettlementInput): Promise<void>
-  release?(): Promise<void>
+export type WorkerKnownUsageSettlementInput = Omit<WorkerUsageSettlementInput, "inputTokens" | "outputTokens" | "estimatedCostUsd"> & {
+  inputTokens: number; outputTokens: number; estimatedCostUsd: number
+}
+export interface WorkerUsageAuthorization {
+  outputReservationRequired?: boolean
+  maxOutputTokens?: number | null
+  start?(): Promise<number | null> | number | null
+  release?(): Promise<void> | void
+  settle(input: WorkerKnownUsageSettlementInput): Promise<void> | void
+  settleUnknown?(input: WorkerUsageSettlementInput): Promise<void> | void
 }
 
 type UsageBridgeFetch = typeof fetch
@@ -44,6 +53,36 @@ export class UsageBridgeError extends Error {
     super(message)
     this.name = "UsageBridgeError"
   }
+}
+
+export async function settleWorkerUsage(authorization: WorkerUsageAuthorization, input: WorkerUsageSettlementInput): Promise<void> {
+  if (input.inputTokens === null || input.outputTokens === null || input.estimatedCostUsd === null) {
+    if (authorization.settleUnknown) return authorization.settleUnknown(input)
+    throw new UsageBridgeError("usage_settlement_unknown")
+  }
+  await authorization.settle({ ...input, inputTokens: input.inputTokens, outputTokens: input.outputTokens, estimatedCostUsd: input.estimatedCostUsd })
+}
+
+export function resolveStartedOutput(
+  authorization: Pick<WorkerUsageAuthorization, "outputReservationRequired" | "maxOutputTokens">,
+  started: unknown,
+  requestedOutputTokens?: number | null,
+): number | null {
+  if (authorization.outputReservationRequired !== true && authorization.outputReservationRequired !== false) {
+    throw new UsageBridgeError("usage_start_unavailable")
+  }
+  const cap = authorization.maxOutputTokens
+  if (authorization.outputReservationRequired === false) {
+    if (cap != null || (started !== undefined && started !== null)) throw new UsageBridgeError("usage_start_conflict")
+    return null
+  }
+  if (!Number.isSafeInteger(started) || Number(started) < 1 ||
+      (typeof requestedOutputTokens === "number" && Number(started) > requestedOutputTokens) ||
+      (typeof cap === "number" && Number(started) > cap) ||
+      (authorization.outputReservationRequired === true && (typeof cap !== "number" || Number(started) !== cap))) {
+    throw new UsageBridgeError(started === undefined ? "usage_start_unavailable" : started === null ? "output_reservation_unknown" : "usage_start_conflict")
+  }
+  return Number(started)
 }
 
 const USAGE_PATH = "/api/internal/agent-runtime/usage"
@@ -123,9 +162,10 @@ export function createWorkerUsageAuthorizer(options: WorkerUsageBridgeOptions = 
   const release = async (input: WorkerUsageAuthorizationInput): Promise<void> => {
     requiredContext(input)
     if (!endpoint || !secret || typeof fetcher !== "function") throw new UsageBridgeError("usage_authorization_unavailable")
+    const protocolInput = { ...input, startProtocolVersion: 1 as const }
     for (let attempt = 0; ; attempt++) {
       try {
-        const response = await post(endpoint, secret, { operation: "release", input }, fetcher, timeoutMs)
+        const response = await post(endpoint, secret, { operation: "release", input: protocolInput }, fetcher, timeoutMs)
         if (response.status !== "released") throw new UsageBridgeError("usage_broker_unavailable")
         return
       } catch (error: unknown) {
@@ -135,12 +175,13 @@ export function createWorkerUsageAuthorizer(options: WorkerUsageBridgeOptions = 
       }
     }
   }
-  return async (input: WorkerUsageAuthorizationInput): Promise<WorkerUsageAuthorization> => {
+  return async (input: WorkerUsageAuthorizationInput) => {
     requiredContext(input)
     if (!endpoint || !secret || typeof fetcher !== "function") throw new UsageBridgeError("usage_authorization_unavailable")
+    const protocolInput = { ...input, startProtocolVersion: 1 as const }
     let response: Record<string, unknown>
     try {
-      response = await post(endpoint, secret, { operation: "authorize", input }, fetcher, timeoutMs)
+      response = await post(endpoint, secret, { operation: "authorize", input: protocolInput }, fetcher, timeoutMs)
     } catch (error: unknown) {
       if (error instanceof UsageBridgeError && error.code === "usage_broker_unavailable") await release(input).catch(() => undefined)
       throw error
@@ -150,12 +191,38 @@ export function createWorkerUsageAuthorizer(options: WorkerUsageBridgeOptions = 
       await release(input).catch(() => undefined)
       throw new UsageBridgeError("usage_broker_unavailable")
     }
+    if (typeof response.outputReservationRequired !== "boolean" ||
+        response.startProtocolVersion !== 1 ||
+        !(response.maxOutputTokens === null || (Number.isSafeInteger(response.maxOutputTokens) && Number(response.maxOutputTokens) > 0)) ||
+        (response.outputReservationRequired && response.maxOutputTokens === null) ||
+        (!response.outputReservationRequired && response.maxOutputTokens !== null)) {
+      await release(input).catch(() => undefined)
+      throw new UsageBridgeError("usage_broker_unavailable")
+    }
+    const outputReservationRequired = response.outputReservationRequired
+    const maxOutputTokens = response.maxOutputTokens === null ? null : Number(response.maxOutputTokens)
+    let startCalled = false
+    const settle = async (settlement: WorkerUsageSettlementInput): Promise<void> => {
+      await post(endpoint, secret, {
+        operation: "settle",
+        input: { operationId, userId: input.userId, provider: input.provider, model: input.model, ...settlement },
+      }, fetcher, timeoutMs)
+    }
     return {
-      settle: async (settlement) => {
-        await post(endpoint, secret, {
-          operation: "settle",
-          input: { operationId, userId: input.userId, provider: input.provider, model: input.model, ...settlement },
+      outputReservationRequired,
+      maxOutputTokens,
+      settle,
+      settleUnknown: settle,
+      start: async () => {
+        if (startCalled) throw new UsageBridgeError("usage_start_replayed")
+        startCalled = true
+        const started = await post(endpoint, secret, {
+          operation: "start", input: { ...protocolInput, operationId },
         }, fetcher, timeoutMs)
+        if (started.status !== "started" || started.startProtocolVersion !== 1 || started.outputReservationRequired !== outputReservationRequired ||
+            started.maxOutputTokens !== maxOutputTokens) throw new UsageBridgeError("usage_start_conflict")
+        if (outputReservationRequired && maxOutputTokens === null) throw new UsageBridgeError("output_reservation_unknown")
+        return maxOutputTokens
       },
       release: () => release(input),
     }

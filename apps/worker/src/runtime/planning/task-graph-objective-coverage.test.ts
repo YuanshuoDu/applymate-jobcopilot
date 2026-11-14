@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { resolveRootTaskVerificationRequirements } from "../context/root-task-objective.js"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationContract } from "./task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, type TaskGraphVerificationContract } from "./task-graph-verification.js"
 import type { TaskGraphNodeProposal } from "./task-graph.js"
 import type { TaskGraphTaskTemplate } from "../subagents/task-graph-command-port.js"
 import { evaluateTaskGraphObjectiveCoverage } from "./task-graph-objective-coverage.js"
@@ -14,8 +14,8 @@ const scoutVerification = (minimum = 3): TaskGraphVerificationContract => ({
   criteria: [{ id: "roles", check: { kind: "candidate_count_gte", minimum } }],
 })
 const candidateRequirement = { id: "roles", check: { kind: "candidate_count_gte", minimum: 2 } }
-const turnInput = (requirements: unknown) => ({ input: { verificationRequirements: {
-  schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements,
+const turnInput = (requirements: unknown, schemaVersion = "agent-harness.v2.objective-requirements.v1") => ({ input: { verificationRequirements: {
+  schemaVersion, requirements,
 } } })
 const resolution = resolveRootTaskVerificationRequirements(turnInput([candidateRequirement]))
 const scoutNode = (key: string, taskId: string, verification = scoutVerification(), repairOf?: TaskGraphNodeProposal["repairOf"]) => ({
@@ -24,6 +24,7 @@ const scoutNode = (key: string, taskId: string, verification = scoutVerification
   ...(repairOf ? { repairOf } : {}),
 })
 const relation = (nodeKey: string, taskId: string) => ({ graphRootTaskId: "root-task", nodeKey, taskId, criterionIds: ["roles"] })
+const locationRelation = (nodeKey: string, taskId: string) => ({ graphRootTaskId: "root-task", nodeKey, taskId, criterionIds: ["candidate-location"] })
 
 describe("TaskGraph objective coverage", () => {
   it("accepts exact or stronger coverage and keeps absent distinct from invalid", () => {
@@ -113,5 +114,46 @@ describe("TaskGraph objective coverage", () => {
     const unrelated = scoutNode("unrelated", "task-unrelated")
     expect(evaluateTaskGraphObjectiveCoverage(resolution, [target, repair, unrelated], templates, "root-task"))
       .toMatchObject({ status: "incomplete" })
+  })
+
+  it("requires every candidate-producing Scout and location repair to cover the exact v2 criterion", () => {
+    const requiredLocations = ["berlin", "dublin"]
+    const locationResolution = resolveRootTaskVerificationRequirements(turnInput([
+      { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin", "Berlin"] } },
+    ], "agent-harness.v2.objective-requirements.v2"))
+    const locationVerification = (locations: readonly string[]): TaskGraphVerificationContract => ({
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+      criteria: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations } }],
+    })
+    if (locationResolution.status !== "valid") throw new Error("fixture_location_requirements_invalid")
+    expect(locationResolution.requirements).toEqual([{ id: "candidate-location", kind: "candidate_location_in", locations: requiredLocations }])
+    expect(evaluateTaskGraphObjectiveCoverage(locationResolution, [
+      scoutNode("research", "task-1", locationVerification(requiredLocations)),
+    ], templates, "root-task")).toEqual({ status: "covered" })
+
+    expect(evaluateTaskGraphObjectiveCoverage(locationResolution, [
+      scoutNode("research", "task-1", locationVerification(requiredLocations)),
+      scoutNode("research-2", "task-2", locationVerification(requiredLocations)),
+    ], templates, "root-task")).toEqual({ status: "covered" })
+
+    const target = scoutNode("target", "task-target", locationVerification(requiredLocations))
+    const repaired = scoutNode("repair", "task-repair", locationVerification(requiredLocations), locationRelation("target", "task-target"))
+    expect(evaluateTaskGraphObjectiveCoverage(locationResolution, [target, repaired], templates, "root-task"))
+      .toEqual({ status: "covered" })
+
+    const mixedVersion = [scoutNode("verified", "task-1", locationVerification(requiredLocations)), scoutNode("legacy", "task-2", scoutVerification())]
+    const missingRepair = scoutNode("repair", "task-repair", scoutVerification(), locationRelation("target", "task-target"))
+    const incompleteGraphs = [
+      [scoutNode("research", "task-1", locationVerification(["berlin"]))],
+      [scoutNode("research", "task-1", locationVerification(["berlin", "dublin", "paris"]))],
+      [scoutNode("research", "task-1", scoutVerification())],
+      mixedVersion,
+      [target, missingRepair],
+      [],
+    ]
+    for (const nodes of incompleteGraphs) {
+      expect(evaluateTaskGraphObjectiveCoverage(locationResolution, nodes, templates, "root-task"))
+        .toMatchObject({ status: "incomplete" })
+    }
   })
 })

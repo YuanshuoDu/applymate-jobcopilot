@@ -6,6 +6,14 @@ import { createDurableDiscoveryAssembly, invalidateDurableDiscoveryAssembly, isP
 import type { ContextSeedBlock } from "../context/step-context-builder.js"
 import { redactJobReadOutput } from "../tools/job-read-output-redaction.js"
 import type { ScheduledPrepareReference } from "./child-scheduled-prepare-reference.js"
+import {
+  createObservedJobFacts,
+  invalidateObservedJobFact,
+  observedEvidenceKey,
+  recordDiscoveryEvidenceAtomically,
+  recordReadEvidence,
+  type ObservedJobFacts,
+} from "./child-observed-job-facts.js"
 
 const MAX_EVIDENCE_ENTRIES = 50
 // Accommodates 50 canonical IDs and 80-character sources after JSON escaping.
@@ -15,7 +23,6 @@ const MAX_RESTORED_OBSERVATIONS = 256
 const MAX_LIVE_DISCOVERY_BYTES = MAX_DURABLE_DISCOVERY_BYTES
 const RESTORED_TOOL_KEYS = ["toolCallId", "toolName", "input", "status", "output", "errorCode"] as const
 const RESTORED_READ_TOOLS = new Set(["jobs.search", "jobs.get", "jobs.discover", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read", "cover_letter.draft", "artifact.version.read", "artifact.review", "scheduled.application.prepare"])
-type ObservedEvidenceKind = "job" | "persona" | "resume"
 type RestoredObservation = { readonly toolCallId: string; readonly toolName: string; readonly input: unknown; readonly output: unknown; readonly failed: boolean }
 export type ScheduledPrepareToolBinding = Readonly<{ toolCallId: string; taskId: string; attemptCount: number; reference?: ScheduledPrepareReference }>
 type ScheduledPrepareReceipt = Readonly<{ toolCallId: string; result: PrepareResult; reference?: ScheduledPrepareReference }>
@@ -24,6 +31,7 @@ export type ObservedEvidenceIndex = {
   readonly entries: Map<string, RoleEvidence>
   readonly discoveryEntries: Set<string>
   readonly conflicts: Set<string>
+  readonly jobFacts: ObservedJobFacts
   readonly artifactResults: Map<string, StructuredRoleResult>
   readonly scheduledPrepareResults: Map<string, ScheduledPrepareReceipt>
   readonly scheduledPrepareResultConflicts: Set<string>
@@ -47,9 +55,7 @@ function boundedText(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 && value.length <= MAX_EVIDENCE_FIELD_LENGTH ? value : undefined
 }
 
-function evidenceKey(kind: string, ref: string): string { return `${kind}\u0000${ref}` }
-
-export function createObservedEvidenceIndex(): ObservedEvidenceIndex { return { entries: new Map(), discoveryEntries: new Set(), conflicts: new Set(), artifactResults: new Map(), scheduledPrepareResults: new Map(), scheduledPrepareResultConflicts: new Set(), artifactReads: new Set(), durableDiscoveries: new Map(), durableDiscoveryJobRefs: new Map(), durableDiscoveryBytes: 0 } }
+export function createObservedEvidenceIndex(): ObservedEvidenceIndex { return { entries: new Map(), discoveryEntries: new Set(), conflicts: new Set(), jobFacts: createObservedJobFacts(), artifactResults: new Map(), scheduledPrepareResults: new Map(), scheduledPrepareResultConflicts: new Set(), artifactReads: new Set(), durableDiscoveries: new Map(), durableDiscoveryJobRefs: new Map(), durableDiscoveryBytes: 0 } }
 
 function restoredObservation(value: ContextSeedBlock): RestoredObservation {
   if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.id !== "string" || value.id.trim() !== value.id || value.id.length === 0 || value.id.length > MAX_EVIDENCE_FIELD_LENGTH) throw new Error("child_resume_evidence_invalid")
@@ -69,8 +75,9 @@ function validateDiscoveryOutput(output: unknown): unknown { const safe = redact
 
 function invalidateDiscoveryEvidence(index: ObservedEvidenceIndex, reference: string): void {
   for (const id of index.durableDiscoveryJobRefs.get(reference) ?? []) {
-    const key = evidenceKey("job", id)
+    const key = observedEvidenceKey("job", id)
     index.entries.delete(key); index.discoveryEntries.delete(key); index.conflicts.add(key)
+    invalidateObservedJobFact(index.jobFacts, id)
   }
   index.durableDiscoveryJobRefs.delete(reference)
 }
@@ -118,42 +125,6 @@ export function hydrateObservedEvidence(index: ObservedEvidenceIndex, observatio
   }
 }
 
-function addObservedEvidence(index: ObservedEvidenceIndex, kind: ObservedEvidenceKind, ref: string, source: string, discovery = false): void {
-  const key = evidenceKey(kind, ref)
-  if (index.conflicts.has(key)) return
-  const existing = index.entries.get(key)
-  if (existing) {
-    if (existing.source !== source) { index.entries.delete(key); index.discoveryEntries.delete(key); index.conflicts.add(key) }
-    return
-  }
-  const current = [...index.entries].filter(([entryKey]) => index.discoveryEntries.has(entryKey) === discovery).map(([, entry]) => entry)
-  if (current.length >= MAX_EVIDENCE_ENTRIES) { if (!discovery) return; throw new Error("child_discovery_evidence_limit") }
-  const entry: RoleEvidence = { id: `read:${kind}:${ref}`, kind, ref, source }
-  const serialized = JSON.stringify([...current, entry])
-  const maxBytes = discovery ? MAX_DISCOVERY_EVIDENCE_BYTES : MAX_EVIDENCE_BYTES
-  if (serialized === undefined || Buffer.byteLength(serialized, "utf8") > maxBytes) { if (!discovery) return; throw new Error("child_discovery_evidence_limit") }
-  index.entries.set(key, entry)
-  if (discovery) index.discoveryEntries.add(key)
-}
-
-function recordDiscoveryEvidenceAtomically(index: ObservedEvidenceIndex, jobs: readonly unknown[]): void {
-  const staged: ObservedEvidenceIndex = { ...index, entries: new Map(index.entries), discoveryEntries: new Set(index.discoveryEntries), conflicts: new Set(index.conflicts) }
-  for (const item of jobs) {
-    const job = plainRecord(item)
-    const ref = boundedText(job?.id)
-    if (ref) addObservedEvidence(staged, "job", ref, boundedText(job?.source) ?? "jobs.read", true)
-  }
-  index.entries.clear(); staged.entries.forEach((value, key) => index.entries.set(key, value))
-  index.discoveryEntries.clear(); staged.discoveryEntries.forEach(key => index.discoveryEntries.add(key))
-  index.conflicts.clear(); staged.conflicts.forEach(key => index.conflicts.add(key))
-}
-
-function recordReadEvidence(index: ObservedEvidenceIndex, item: unknown, kind: ObservedEvidenceKind, fallback: string, useItemSource = true): void {
-  const evidence = plainRecord(item)
-  const ref = boundedText(evidence?.id)
-  if (ref) addObservedEvidence(index, kind, ref, useItemSource ? boundedText(evidence?.source) ?? fallback : fallback)
-}
-
 export function recordReadToolOutput(index: ObservedEvidenceIndex, toolName: string, output: unknown, request?: unknown, prepareBinding?: ScheduledPrepareToolBinding): void {
   try {
     const value = plainRecord(output)
@@ -193,7 +164,7 @@ export function recordReadToolOutput(index: ObservedEvidenceIndex, toolName: str
       }
       const jobsOutput = plainRecord(validateDiscoveryOutput(output))
       if (!jobsOutput || !Array.isArray(jobsOutput.jobs)) return
-      recordDiscoveryEvidenceAtomically(index, jobsOutput.jobs)
+      recordDiscoveryEvidenceAtomically(index, jobsOutput.jobs, MAX_EVIDENCE_ENTRIES, MAX_DISCOVERY_EVIDENCE_BYTES)
       return
     }
     if (toolName === "tool_results.read") {
@@ -213,22 +184,22 @@ export function recordReadToolOutput(index: ObservedEvidenceIndex, toolName: str
           safe = plainRecord(validateDiscoveryOutput(reduction.value))
           if (!safe || !Array.isArray(safe.jobs)) throw new Error("child_resume_evidence_invalid")
         } catch { invalidateDurableDiscovery(index, assembly); return }
-        recordDiscoveryEvidenceAtomically(index, safe.jobs)
+        recordDiscoveryEvidenceAtomically(index, safe.jobs, MAX_EVIDENCE_ENTRIES, MAX_DISCOVERY_EVIDENCE_BYTES)
         index.durableDiscoveryJobRefs.set(assembly.reference.ref, safe.jobs.map(item => boundedText(plainRecord(item)?.id)).filter((id): id is string => Boolean(id)))
       }
       return
     }
     if (toolName === "jobs.search") {
       if (!Array.isArray(value.jobs)) return
-      for (const item of value.jobs) recordReadEvidence(index, item, "job", "jobs.read")
+      for (const item of value.jobs) recordReadEvidence(index, item, "job", "jobs.read", MAX_EVIDENCE_ENTRIES, MAX_EVIDENCE_BYTES)
       return
     }
-    if (toolName === "jobs.get") return recordReadEvidence(index, value.job, "job", "jobs.read")
+    if (toolName === "jobs.get") return recordReadEvidence(index, value.job, "job", "jobs.read", MAX_EVIDENCE_ENTRIES, MAX_EVIDENCE_BYTES)
     if (toolName === "persona.retrieve") {
-      if (Array.isArray(value.facts)) for (const item of value.facts) recordReadEvidence(index, item, "persona", "persona.retrieve")
+      if (Array.isArray(value.facts)) for (const item of value.facts) recordReadEvidence(index, item, "persona", "persona.retrieve", MAX_EVIDENCE_ENTRIES, MAX_EVIDENCE_BYTES)
       return
     }
-    if (toolName === "resume.get_base") return recordReadEvidence(index, value.resume, "resume", "resume.get_base", false)
+    if (toolName === "resume.get_base") return recordReadEvidence(index, value.resume, "resume", "resume.get_base", MAX_EVIDENCE_ENTRIES, MAX_EVIDENCE_BYTES, false)
   } catch (error) {
     if (toolName === "jobs.discover" && error instanceof Error && error.message === "child_discovery_evidence_limit") throw error
   }

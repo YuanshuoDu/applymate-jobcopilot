@@ -238,7 +238,12 @@ async function executePrepareChild(pool: Pool, redisUrl: string, seed: Scheduled
       if (!text) throw new Error("scheduled Prepare fixture received an unexpected material prompt")
       yield { type: "text_delta", text }; yield { type: "completed", finishReason: "stop" }
     } })
-  const authorizeUsage = async (_input: WorkerUsageAuthorizationInput) => ({ settle: async (_value: WorkerUsageSettlementInput) => undefined })
+  const authorizeUsage = async (_input: WorkerUsageAuthorizationInput) => ({
+    outputReservationRequired: false,
+    maxOutputTokens: null,
+    settle: async (_value: WorkerUsageSettlementInput) => undefined,
+    settleUnknown: async (_value: WorkerUsageSettlementInput) => undefined,
+  })
   const executor = runtime.createProductionChildExecutor({ pool: pool as never, authorizeUsage, modelRuntimeFactory })
   const manager = new managerModule.AgentTreeManager(new store.PgSubagentTaskStore(pool as never))
   const redis = new Redis(redisUrl, { maxRetriesPerRequest: null, connectTimeout: 2_000, retryStrategy: attempt => attempt > 3 ? null : 100 })
@@ -282,6 +287,9 @@ const SAFE_FAILURE_CODES = new Set([
   "task_graph_verification_failed", "task_graph_verification_unverified", "task_graph_other",
   "execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid", "lease_lost",
   "scheduled_gate_role_task_type_mismatch",
+  "usage_authorization_unavailable", "usage_broker_unavailable", "usage_context_unavailable", "usage_denied",
+  "usage_settlement_unknown", "usage_start_unavailable", "usage_start_conflict", "usage_start_replayed",
+  "output_reservation_unknown",
 ])
 
 function ownData(value: object, key: string): unknown {
