@@ -95,13 +95,13 @@ function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number, 
       FROM "fixture_manifest" AS manifest
       CROSS JOIN LATERAL jsonb_array_elements_text(manifest.manifest->'events') AS fixture("id")
       JOIN public."agent_events" AS source_event ON source_event."id" = fixture."id"
-    ), "agent_events" AS NOT MATERIALIZED (
+    ), "agent_events" AS MATERIALIZED (
       SELECT * FROM "fixture_events"
       UNION ALL
       SELECT (jsonb_populate_record(NULL::public.agent_events,
         to_jsonb(source_witness) || jsonb_build_object('id', source_witness."id" || ':query-duplicate'))).*
       FROM "fixture_events" AS source_witness WHERE source_witness."id" = ${witnessId}
-    ), "agent_outbox" AS NOT MATERIALIZED (
+    ), "agent_outbox" AS MATERIALIZED (
       SELECT source_dispatch.*
       FROM "fixture_events" AS event
       JOIN public."agent_outbox" AS source_dispatch ON source_dispatch."id" = 'agent-outbox-' || event."id"
