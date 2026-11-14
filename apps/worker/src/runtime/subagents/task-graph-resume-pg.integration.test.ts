@@ -15328,6 +15328,18 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let initialTaskIds: string[] = []
     let targetTaskId = "", downstreamTaskId = "", repairTaskId = ""
     let failedCoverageObserved = false, repairAccepted = false, repairPassed = false, downstreamCompleted = false
+    let repairWaitCallPrepared = false
+    const repairWaitDiagnosticState: AnalystWaitDiagState = {
+      leaseArrivals: 0, leaseObservations: [], leaseObservationOverflow: false, expectedRootTaskId: null,
+      helperExits: 0, rootTurnStateReads: 0, lastHelperExit: null,
+    }
+    const repairWaitDiagnostic: AnalystWaitDiagContext = {
+      state: repairWaitDiagnosticState, sessionId: value.sessionId, userId: value.userId,
+      leaseScope: {
+        userMatchesFixture: true, sessionMatchesFixture: true, turnMatchesFixture: true,
+        rootMatchKnown: false, rootMatchesFixture: null, roleMatchKnown: false, roleMatchesExpected: false,
+      },
+    }
     const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
@@ -15394,6 +15406,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(analysis).toMatchObject({ taskId: targetTaskId, status: "failed" })
               expect(downstream).toMatchObject({ taskId: downstreamTaskId, status: "waiting" })
               repairAccepted = true
+              repairWaitCallPrepared = true
               yield { type: "tool_call_completed", callId: repairWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: repairWaitKey, taskIds: [repairTaskId, downstreamTaskId], mode: "all", timeoutMs: 30_000,
               } }
@@ -15523,7 +15536,17 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     await executeChild(initialTaskIds[0]!, `p3-cohort-scout-${value.suffix}`)
     await executeChild(targetTaskId, `p3-cohort-analyst-${value.suffix}`, "failed")
-    await waitForPersistedTaskWait(pool!, value.turnId, repairWaitKey)
+    try {
+      await waitForPersistedTaskWait(pool!, value.turnId, repairWaitKey, 20_000, undefined, undefined, repairWaitDiagnostic)
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "Follow-up parent wait was not durably suspended") throw error
+      const diagnosis = JSON.stringify({
+        rootExecution: diagnosticBoundedCount(rootExecution), failedCoverageObserved, repairAccepted, repairWaitCallPrepared,
+        helperExits: diagnosticBoundedCount(repairWaitDiagnosticState.helperExits),
+        waitBoundary: repairWaitDiagnosticState.lastHelperExit,
+      })
+      throw new Error(`${error.message}; repairWaitDiagnostic=${diagnosis}`)
+    }
     expect(failedCoverageObserved).toBe(true)
     expect(repairAccepted).toBe(true)
     const repairPlan = await pool!.query<{ result: unknown; status: string }>(
