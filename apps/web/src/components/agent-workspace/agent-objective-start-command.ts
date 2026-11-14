@@ -1,4 +1,6 @@
 import { schemaVersion } from "@jobcopilot/agent-protocol"
+import { normalizeAgentLocationAllowlist } from "@jobcopilot/shared/agent-location-normalization"
+import type { ObjectiveVerificationRequirements } from "@/lib/agent/control-plane/commands/types"
 
 export interface ObjectiveContextDraft {
   readonly objective: string
@@ -15,6 +17,7 @@ export interface ObjectiveStartResult {
 }
 
 interface ObjectiveStartAttempt extends ObjectiveContextDraft {
+  readonly verificationRequirements?: ObjectiveVerificationRequirements
   readonly clientMessageId: string
 }
 
@@ -35,6 +38,9 @@ export class ObjectiveStartCommandError extends Error {
 const MAX_OBJECTIVE_BYTES = 2_000
 const MAX_CONTEXT_CHARACTERS = 20_000
 const MAX_IDENTIFIER_LENGTH = 256
+const MAX_LOCATION_DRAFT_BYTES = 2_000
+const LOCATION_REQUIREMENTS_SCHEMA_VERSION = "agent-harness.v2.objective-requirements.v2" as const
+const LOCATION_REQUIREMENT_ID = "candidate-location"
 
 export function validateObjectiveContextDraft(draft: ObjectiveContextDraft): ObjectiveContextDraft {
   const objective = typeof draft.objective === "string" ? draft.objective.trim() : ""
@@ -48,7 +54,18 @@ export function validateObjectiveContextDraft(draft: ObjectiveContextDraft): Obj
   return { objective, context }
 }
 
-/** Reuses the known Session and request identity for explicit in-memory retries. */
+export function normalizeAllowedLocationDraft(value: string): readonly string[] | undefined {
+  if (typeof value !== "string" || new TextEncoder().encode(value).byteLength > MAX_LOCATION_DRAFT_BYTES) {
+    throw invalidInput("Allowed locations must be 2,000 UTF-8 bytes or fewer")
+  }
+  if (value.trim() === "") return undefined
+  const entries = value.split(/\r?\n/).filter(entry => entry.trim() !== "")
+  const locations = normalizeAgentLocationAllowlist(entries)
+  if (!locations) throw invalidInput("Enter 1 to 8 allowed locations, each 128 UTF-8 bytes or fewer")
+  return locations
+}
+
+/** Coordinates explicit retries without creating a second Session or root. */
 export class AgentObjectiveStartCoordinator {
   private sessionId: string | null = null
   private targetKey: string | null = null
@@ -63,7 +80,13 @@ export class AgentObjectiveStartCoordinator {
     private readonly makeClientMessageId: () => string = newClientMessageId,
   ) {}
 
-  start(objectiveDraft: string, contextDraft: string, selectedSessionId?: string): Promise<ObjectiveStartResult> {
+  start(
+    objectiveDraft: string,
+    contextDraft: string,
+    allowedLocationsDraft = "",
+    existingRequirements?: ObjectiveVerificationRequirements,
+    selectedSessionId?: string,
+  ): Promise<ObjectiveStartResult> {
     if (selectedSessionId !== undefined && !isIdentifier(selectedSessionId)) {
       return Promise.reject(invalidInput("Selected Session ID is invalid"))
     }
@@ -74,9 +97,31 @@ export class AgentObjectiveStartCoordinator {
       return Promise.reject(error)
     }
 
+    let verificationRequirements: ObjectiveVerificationRequirements | undefined
+    let requirementsDraftKey: string
+    try {
+      requirementsDraftKey = JSON.stringify(existingRequirements ?? null) ?? ""
+      if (new TextEncoder().encode(requirementsDraftKey).byteLength > MAX_LOCATION_DRAFT_BYTES) {
+        throw invalidInput("Objective verification requirements exceed the command limit")
+      }
+      const locations = normalizeAllowedLocationDraft(allowedLocationsDraft)
+      if (locations) {
+        const existing = existingRequirements?.requirements ?? []
+        if (existing.some(requirement => requirement.id === LOCATION_REQUIREMENT_ID)) {
+          throw invalidInput("The candidate-location criterion ID is already in use")
+        }
+        verificationRequirements = { schemaVersion: LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+          requirements: [...existing, { id: LOCATION_REQUIREMENT_ID, check: { kind: "candidate_location_in", locations } }] }
+      } else {
+        verificationRequirements = existingRequirements
+      }
+    } catch (error) {
+      return Promise.reject(error)
+    }
+
     const targetKey = selectedSessionId === undefined || (this.targetKey === "new-session" && selectedSessionId === this.sessionId)
       ? "new-session" : `session:${selectedSessionId}`
-    const identityKey = objectiveStartIdentity(targetKey, draft)
+    const identityKey = objectiveStartIdentity(targetKey, draft, verificationRequirements)
     if (this.inFlight) {
       if (this.inFlightIdentityKey === identityKey) return this.inFlight
       return Promise.reject(new ObjectiveStartCommandError(
@@ -94,27 +139,20 @@ export class AgentObjectiveStartCoordinator {
     this.accepted = null
 
     if (!this.attempt || this.attemptIdentityKey !== identityKey) {
-      this.attempt = { ...draft, clientMessageId: this.makeClientMessageId() }
+      this.attempt = { ...draft, ...(verificationRequirements ? { verificationRequirements } : {}), clientMessageId: this.makeClientMessageId() }
       this.attemptIdentityKey = identityKey
     }
     const attempt = this.attempt
     const operation = this.admit(attempt, identityKey)
     this.inFlight = operation
     this.inFlightIdentityKey = identityKey
-    void operation.then(
-      () => {
-        if (this.inFlight === operation) {
-          this.inFlight = null
-          this.inFlightIdentityKey = null
-        }
-      },
-      () => {
-        if (this.inFlight === operation) {
-          this.inFlight = null
-          this.inFlightIdentityKey = null
-        }
-      },
-    )
+    const clearInFlight = () => {
+      if (this.inFlight === operation) {
+        this.inFlight = null
+        this.inFlightIdentityKey = null
+      }
+    }
+    void operation.then(clearInFlight, clearInFlight)
     return operation
   }
 
@@ -143,10 +181,9 @@ export class AgentObjectiveStartCoordinator {
   }
 }
 
-function objectiveStartIdentity(targetKey: string, draft: ObjectiveContextDraft): string {
-  return JSON.stringify([targetKey, draft.objective, draft.context])
+function objectiveStartIdentity(targetKey: string, draft: ObjectiveContextDraft, requirements?: ObjectiveVerificationRequirements): string {
+  return JSON.stringify([targetKey, draft.objective, draft.context, requirements ?? null])
 }
-
 async function createObjectiveSession(attempt: ObjectiveStartAttempt, fetcher: typeof fetch): Promise<string> {
   const response = await fetcher("/api/agent/sessions", {
     method: "POST",
@@ -164,12 +201,8 @@ async function createObjectiveSession(attempt: ObjectiveStartAttempt, fetcher: t
   }
   return sessionId
 }
-
-async function startAgentObjective(
-  sessionId: string,
-  attempt: ObjectiveStartAttempt,
-  fetcher: typeof fetch,
-): Promise<Omit<ObjectiveStartResult, "sessionId" | "objective">> {
+async function startAgentObjective(sessionId: string, attempt: ObjectiveStartAttempt,
+  fetcher: typeof fetch): Promise<Omit<ObjectiveStartResult, "sessionId" | "objective">> {
   const contentText = attempt.context === "" ? attempt.objective : attempt.context
   const response = await fetcher(`/api/agent/sessions/${encodeURIComponent(sessionId)}/start-objective`, {
     method: "POST",
@@ -180,6 +213,7 @@ async function startAgentObjective(
       clientMessageId: attempt.clientMessageId,
       objective: attempt.objective,
       content: [{ type: "text", text: contentText }],
+      ...(attempt.verificationRequirements ? { verificationRequirements: attempt.verificationRequirements } : {}),
     }),
   })
   const body: unknown = await response.json().catch(() => null)
@@ -195,7 +229,6 @@ async function startAgentObjective(
     sequence: body.sequence,
   }
 }
-
 function responseError(status: number, value: unknown, fallback: string): ObjectiveStartCommandError {
   const root = record(value) ? value : {}
   const error = record(root.error) ? root.error : {}
@@ -206,24 +239,12 @@ function responseError(status: number, value: unknown, fallback: string): Object
     record(error.details) ? error.details : {},
   )
 }
-
-function invalidInput(message: string): ObjectiveStartCommandError {
-  return new ObjectiveStartCommandError(422, "invalid_command", message)
-}
-
+function invalidInput(message: string): ObjectiveStartCommandError { return new ObjectiveStartCommandError(422, "invalid_command", message) }
 function newClientMessageId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return `objective-start-${crypto.randomUUID()}`
   return `objective-start-${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
+function isIdentifier(value: unknown): value is string { return isNonemptyString(value) && value.length <= MAX_IDENTIFIER_LENGTH && value.trim() === value }
+function isNonemptyString(value: unknown): value is string { return typeof value === "string" && value.length > 0 }
 
-function isIdentifier(value: unknown): value is string {
-  return isNonemptyString(value) && value.length <= MAX_IDENTIFIER_LENGTH && value.trim() === value
-}
-
-function isNonemptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0
-}
-
-function record(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-}
+function record(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value) }

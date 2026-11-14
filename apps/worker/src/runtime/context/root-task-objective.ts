@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer"
 import { Value } from "@sinclair/typebox/value"
 import { InputContentPartSchema } from "@jobcopilot/agent-protocol"
+import { normalizeAgentLocationAllowlist } from "@jobcopilot/shared"
 import { TASK_GRAPH_VERIFICATION_LIMITS } from "../planning/task-graph-verification.js"
 import { digestNativeVerificationValue } from "../subagents/native-verification-contract.js"
 
@@ -18,11 +19,8 @@ export type RootTaskVerifierObjective = Readonly<{
 /** The opt-in is only for native-verifier derivation before its Root row exists; history stays strict. */
 export type RootTaskObjectiveOptions = Readonly<{ allowNativeFreshRootFallback?: true }>
 
-export type RootTaskVerificationRequirement = Readonly<{
-  id: string
-  kind: "candidate_count_gte" | "finding_count_gte"
-  minimum: number
-}>
+export type RootTaskVerificationRequirement = Readonly<{ id: string; kind: "candidate_count_gte" | "finding_count_gte"; minimum: number }>
+  | Readonly<{ id: string; kind: "candidate_location_in"; locations: readonly string[] }>
 export type RootTaskVerificationRequirementsResolution =
   | Readonly<{ status: "absent" }>
   | Readonly<{ status: "valid"; requirements: readonly RootTaskVerificationRequirement[] }>
@@ -32,7 +30,8 @@ type Row = Record<string, unknown>
 const MAX_GOAL_BYTES = 4 * 1024
 const MAX_CRITERIA = 32
 const MAX_CRITERION_BYTES = 2_000
-const OBJECTIVE_REQUIREMENTS_SCHEMA_VERSION = "agent-harness.v2.objective-requirements.v1"
+const OBJECTIVE_REQUIREMENTS_SCHEMA_V1 = "agent-harness.v2.objective-requirements.v1"
+const OBJECTIVE_REQUIREMENTS_SCHEMA_V2 = "agent-harness.v2.objective-requirements.v2"
 const OBJECTIVE_REQUIREMENT_ID = /^[a-z][a-z0-9._-]{0,63}$/
 
 function record(value: unknown): Row | null {
@@ -138,7 +137,8 @@ function denseRequirementList(value: unknown): unknown[] | null {
 
 function parseObjectiveRequirements(value: unknown): readonly RootTaskVerificationRequirement[] | null {
   const block = exactRequirementRecord(value, ["schemaVersion", "requirements"])
-  if (!block || block.schemaVersion !== OBJECTIVE_REQUIREMENTS_SCHEMA_VERSION) return null
+  const version = block?.schemaVersion
+  if (!block || (version !== OBJECTIVE_REQUIREMENTS_SCHEMA_V1 && version !== OBJECTIVE_REQUIREMENTS_SCHEMA_V2)) return null
   const rows = denseRequirementList(block.requirements)
   if (!rows) return null
   const ids = new Set<string>()
@@ -147,8 +147,20 @@ function parseObjectiveRequirements(value: unknown): readonly RootTaskVerificati
     const entry = exactRequirementRecord(row, ["id", "check"])
     if (!entry || typeof entry.id !== "string" || entry.id.length > TASK_GRAPH_VERIFICATION_LIMITS.maxCriterionIdLength
       || !OBJECTIVE_REQUIREMENT_ID.test(entry.id) || ids.has(entry.id)) return null
-    const check = exactRequirementRecord(entry.check, ["kind", "minimum"])
-    if (!check || (check.kind !== "candidate_count_gte" && check.kind !== "finding_count_gte")
+    const checkKind = ownDataField(entry.check, "kind")
+    const check = checkKind.status === "present" && checkKind.value === "candidate_location_in"
+      ? exactRequirementRecord(entry.check, ["kind", "locations"])
+      : exactRequirementRecord(entry.check, ["kind", "minimum"])
+    if (!check) return null
+    if (check.kind === "candidate_location_in") {
+      if (version !== OBJECTIVE_REQUIREMENTS_SCHEMA_V2) return null
+      const locations = normalizeAgentLocationAllowlist(check.locations)
+      if (!locations) return null
+      result.push({ id: entry.id, kind: "candidate_location_in", locations })
+      ids.add(entry.id)
+      continue
+    }
+    if ((check.kind !== "candidate_count_gte" && check.kind !== "finding_count_gte")
       || !Number.isSafeInteger(check.minimum) || Number(check.minimum) < 1
       || Number(check.minimum) > TASK_GRAPH_VERIFICATION_LIMITS.maxItems) return null
     ids.add(entry.id)
@@ -163,7 +175,11 @@ function requirementsEqual(left: readonly RootTaskVerificationRequirement[], rig
   const canonicalLeft = [...left].sort(byId), canonicalRight = [...right].sort(byId)
   return canonicalLeft.length === canonicalRight.length && canonicalLeft.every((requirement, index) => {
     const other = canonicalRight[index]
-    return requirement.id === other?.id && requirement.kind === other.kind && requirement.minimum === other.minimum
+    if (!other || requirement.id !== other.id || requirement.kind !== other.kind) return false
+    return requirement.kind === "candidate_location_in"
+      ? other.kind === "candidate_location_in" && requirement.locations.length === other.locations.length
+        && requirement.locations.every((location, itemIndex) => location === other.locations[itemIndex])
+      : other.kind !== "candidate_location_in" && requirement.minimum === other.minimum
   })
 }
 

@@ -12,6 +12,8 @@ import {
   type CommandTransaction,
 } from "./transaction"
 import {
+  OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+  objectiveLocationVerificationEnabled,
   parseObjectiveVerificationRequirements,
   type ObjectiveStartCommand,
   type ObjectiveStartResult,
@@ -84,19 +86,28 @@ export class ObjectiveStartCommandService {
 
   async start(command: ObjectiveStartCommand): Promise<ObjectiveStartResult> {
     if (command.source !== "user") throw invalidCommand("Only a user can start an objective")
-    let hasRequirements = false
-    let requirements: ObjectiveVerificationRequirements | null | undefined
+    let descriptor: PropertyDescriptor | undefined
     try {
-      const descriptor = Object.getOwnPropertyDescriptor(command, "verificationRequirements")
-      hasRequirements = descriptor !== undefined
-      requirements = descriptor
-        ? "value" in descriptor && descriptor.enumerable
-          ? parseObjectiveVerificationRequirements(descriptor.value)
-          : null
-        : undefined
+      descriptor = Object.getOwnPropertyDescriptor(command, "verificationRequirements")
     } catch {
-      hasRequirements = true
-      requirements = null
+      throw invalidCommand("Objective verification requirements are invalid")
+    }
+    const hasRequirements = descriptor !== undefined
+    let requirements: ObjectiveVerificationRequirements | null | undefined
+    if (descriptor) {
+      if (!("value" in descriptor) || !descriptor.enumerable) {
+        throw invalidCommand("Objective verification requirements are invalid")
+      }
+      if (descriptor.value === null) {
+        requirements = null
+      } else {
+        requirements = parseObjectiveVerificationRequirements(descriptor.value) ?? undefined
+        if (!requirements) throw invalidCommand("Objective verification requirements are invalid or unsupported")
+        if (requirements.schemaVersion === OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION &&
+            !objectiveLocationVerificationEnabled()) {
+          throw invalidCommand("Explicit location verification is not enabled yet")
+        }
+      }
     }
     const normalized: ObjectiveStartCommand = {
       sessionId: command.sessionId,

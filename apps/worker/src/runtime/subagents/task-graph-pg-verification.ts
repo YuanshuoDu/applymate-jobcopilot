@@ -1,8 +1,9 @@
 import type pg from "pg"
 import { createHash } from "node:crypto"
-import { evaluateTaskGraphVerification, evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst, evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery, taskGraphVerificationDependencyNodeKeys, taskGraphVerificationRole, TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, type TaskGraphVerificationContract, type TaskGraphVerificationEvaluation, type TaskGraphVerificationEvidenceProjection, type TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
+import { evaluateTaskGraphVerification, evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst, evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery, taskGraphVerificationDependencyNodeKeys, taskGraphVerificationRole, TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, type TaskGraphVerificationContract, type TaskGraphVerificationEvaluation, type TaskGraphVerificationEvidenceProjection, type TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import { parseTaskGraphSnapshot, canonicalTaskGraphJson, type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { createObservedEvidenceIndex, hydrateObservedEvidence, parseAndBindStructuredResult } from "./child-evidence.js"
+import { observedJobLocationProjection } from "./child-observed-job-facts.js"
 import { loadTaskGraphVerificationReceipts } from "./task-graph-pg-verification-receipts.js"
 import { taskGraphEvidenceDigest, type TaskGraphVerificationScope } from "./task-graph-pg-verification-receipt-validation.js"
 import { TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, TASK_GRAPH_VERIFIER_VERSION, type TaskGraphVerificationDependencyBinding, type TaskGraphVerificationReport } from "./task-graph-verification-report.js"
@@ -13,9 +14,7 @@ export type { TaskGraphVerificationScope } from "./task-graph-pg-verification-re
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 const MAX_ROLE_RESULT_BYTES = 8 * 1024
-export type TaskGraphPgVerificationResult = Readonly<{ verified: boolean; report: TaskGraphVerificationReport; evaluation: TaskGraphVerificationEvaluation; projection?: TaskGraphVerificationEvidenceProjection; structuredResult?: unknown; persistDependencyBindings?: boolean }>
-/** Load canonical call/result receipts in one caller-owned transaction and evaluate the immutable node contract. */
-export async function verifyTaskGraphNodeEvidence(client: Queryable, input: Readonly<{
+type VerifyTaskGraphInput = Readonly<{
   scope: TaskGraphVerificationScope
   snapshot: TaskGraphSnapshot
   node: StoredTaskGraphNode
@@ -23,30 +22,22 @@ export async function verifyTaskGraphNodeEvidence(client: Queryable, input: Read
   dependencies?: ReadonlyMap<string, TaskGraphVerificationEvidenceProjection>
   dependencyBindings?: readonly TaskGraphVerificationDependencyBinding[]
   graphRevision?: number
-}>): Promise<TaskGraphPgVerificationResult> {
+  includeObservedLocation?: boolean
+}>
+export type TaskGraphPgVerificationResult = Readonly<{ verified: boolean; report: TaskGraphVerificationReport; evaluation: TaskGraphVerificationEvaluation; projection?: TaskGraphVerificationEvidenceProjection; structuredResult?: unknown; persistDependencyBindings?: boolean }>
+/** Load canonical call/result receipts in one caller-owned transaction and evaluate the immutable node contract. */
+export async function verifyTaskGraphNodeEvidence(client: Queryable, input: VerifyTaskGraphInput): Promise<TaskGraphPgVerificationResult> {
   return verifyTaskGraphEvidenceForStatus(client, input, "running")
 }
 /** Server-only completed-source path; ordinary child verification remains running-only. */
-export async function verifyCompletedTaskGraphNodeEvidence(client: Queryable, input: Readonly<{
-  scope: TaskGraphVerificationScope
-  snapshot: TaskGraphSnapshot
-  node: StoredTaskGraphNode
-  structuredResult: unknown
-  dependencies?: ReadonlyMap<string, TaskGraphVerificationEvidenceProjection>
-  dependencyBindings?: readonly TaskGraphVerificationDependencyBinding[]
-  graphRevision?: number
-}>): Promise<TaskGraphPgVerificationResult> {
+export async function verifyCompletedTaskGraphNodeEvidence(client: Queryable, input: VerifyTaskGraphInput): Promise<TaskGraphPgVerificationResult> {
   return verifyTaskGraphEvidenceForStatus(client, input, "completed")
 }
-async function verifyTaskGraphEvidenceForStatus(client: Queryable, input: Readonly<{
-  scope: TaskGraphVerificationScope
-  snapshot: TaskGraphSnapshot
-  node: StoredTaskGraphNode
-  structuredResult: unknown
-  dependencies?: ReadonlyMap<string, TaskGraphVerificationEvidenceProjection>
-  dependencyBindings?: readonly TaskGraphVerificationDependencyBinding[]
-  graphRevision?: number
-}>, expectedStatus: "running" | "completed"): Promise<TaskGraphPgVerificationResult> {
+/** Rebuilds provenance for a failed typed task; callers must match its persisted failure report before using the projection. */
+export async function reverifyFailedTaskGraphNodeEvidence(client: Queryable, input: VerifyTaskGraphInput): Promise<TaskGraphPgVerificationResult> {
+  return verifyTaskGraphEvidenceForStatus(client, input, "failed")
+}
+async function verifyTaskGraphEvidenceForStatus(client: Queryable, input: VerifyTaskGraphInput, expectedStatus: "running" | "completed" | "failed"): Promise<TaskGraphPgVerificationResult> {
   let parsedSnapshot: TaskGraphSnapshot
   try { parsedSnapshot = parseTaskGraphSnapshot(input.snapshot) } catch { return unavailable(undefined, "contract_invalid") }
   const storedNode = parsedSnapshot.nodes.find(node => node.taskId === input.scope.taskId)
@@ -54,11 +45,14 @@ async function verifyTaskGraphEvidenceForStatus(client: Queryable, input: Readon
   const contract = storedNode.verification
   const role = taskGraphVerificationRole(storedNode.templateId)
   if (storedNode.verificationDisposition !== "typed" || !contract || !role || contract.role !== role) return unavailable(contract, "contract_invalid")
+  const requiresObservedLocation = role === "scout" && (input.includeObservedLocation === true || contract.criteria.some(item => item.check.kind === "candidate_location_in"))
   if (!validScope(input.scope)) return unavailable(contract, "canonical_evidence_invalid")
-  const taskRows = await client.query(`SELECT task."id", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId", turn."rootTaskId" AS "turnRootTaskId", task."attemptCount", task."status", task."role", task."result", session."userId" AS "userId", turn."source" AS "turnSource", turn."executionMode" AS "turnExecutionMode", turn."input" AS "turnInput" FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId" WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 AND turn."rootTaskId" = $4 AND task."parentTaskId" = $5 AND session."userId" = $6 AND turn."userId" = $6`,
+  const taskRows = await client.query(`SELECT task."id", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId", turn."rootTaskId" AS "turnRootTaskId", task."attemptCount", task."status", task."role", task."failureReason", task."result", session."userId" AS "userId", turn."source" AS "turnSource", turn."executionMode" AS "turnExecutionMode", turn."input" AS "turnInput" FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId" WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 AND turn."rootTaskId" = $4 AND task."parentTaskId" = $5 AND session."userId" = $6 AND turn."userId" = $6`,
   [input.scope.taskId, input.scope.sessionId, input.scope.turnId, input.scope.rootTaskId, input.scope.parentTaskId, input.scope.userId])
   const task = taskRows.rows[0] as Row | undefined
-  if (!task || task.status !== expectedStatus || task.role !== role || task.turnRootTaskId !== input.scope.rootTaskId || Number(task.attemptCount) !== input.scope.attemptCount) return unavailable(contract, "canonical_evidence_invalid")
+  if (!task || task.status !== expectedStatus || task.role !== role || task.turnRootTaskId !== input.scope.rootTaskId || Number(task.attemptCount) !== input.scope.attemptCount
+    || expectedStatus === "failed" && task.failureReason !== "task_graph_verification_failed" && task.failureReason !== "task_graph_verification_unverified") return unavailable(contract, "canonical_evidence_invalid")
+  if (expectedStatus !== "running" && !persistedStructuredResultMatches(task.result, input.structuredResult)) return unavailable(contract, "result_invalid")
   try {
     if (expectedStatus === "running" && role === "analyst" && contract.criteria.some(item => item.check.kind === "findings_cover_each_scout_candidates_gte")) {
       const emptyAnalyst = validateRoleResult(input.structuredResult, "analyst")
@@ -103,23 +97,23 @@ async function verifyTaskGraphEvidenceForStatus(client: Queryable, input: Readon
       if (!persistedScout) return unavailable(contract, "canonical_evidence_missing")
       verifiedEmptyDiscoveryDigest = await completedZeroDiscoveryDigest(client, input.scope, receipts, task)
       if (!verifiedEmptyDiscoveryDigest) return unavailable(contract, "canonical_evidence_missing")
-      projection = {
-        schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role,
-        candidates: [], evidenceIds: [`read:source:jobs.discover:${verifiedEmptyDiscoveryDigest}`],
-        emptyDiscoveryReceipt: { digest: verifiedEmptyDiscoveryDigest },
-      }
+      projection = requiresObservedLocation
+        ? { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, role: "scout", candidates: [],
+          evidenceIds: [`read:source:jobs.discover:${verifiedEmptyDiscoveryDigest}`], emptyDiscoveryReceipt: { digest: verifiedEmptyDiscoveryDigest } }
+        : { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout", candidates: [],
+          evidenceIds: [`read:source:jobs.discover:${verifiedEmptyDiscoveryDigest}`], emptyDiscoveryReceipt: { digest: verifiedEmptyDiscoveryDigest } }
     } else if (index.entries.size === 0 && role === "analyst" && bound.role === "analyst" && bound.findings.length === 0) {
       verifiedEmptyDiscoveryDigest = await verifiedEmptyScoutDependencyDigest(client, input.scope, parsedSnapshot, storedNode, input.dependencies)
       if (!verifiedEmptyDiscoveryDigest) return unavailable(contract, "canonical_evidence_missing")
-      projection = {
-        schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role,
-        findings: [], evidenceIds: [], emptyDiscoveryReceipt: { digest: verifiedEmptyDiscoveryDigest },
-      }
+      projection = { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "analyst",
+        findings: [], evidenceIds: [], emptyDiscoveryReceipt: { digest: verifiedEmptyDiscoveryDigest } }
     } else {
       if (index.entries.size === 0) return unavailable(contract, "canonical_evidence_missing")
       projection = role === "scout"
-        ? { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role, candidates: bound.role === "scout" ? bound.candidates.map(({ jobId, evidenceIds }) => ({ jobId, evidenceIds })) : [], evidenceIds: [...index.entries.values()].map(item => item.id) }
-        : { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role, findings: bound.role === "analyst" ? bound.findings.map(({ jobId, score, evidenceIds }) => ({ jobId, score, evidenceIds })) : [], evidenceIds: [...index.entries.values()].map(item => item.id) }
+        ? requiresObservedLocation
+          ? { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, role: "scout", candidates: bound.role === "scout" ? bound.candidates.map(({ jobId, evidenceIds }) => ({ jobId, evidenceIds, ...observedJobLocationProjection(index.jobFacts, jobId) })) : [], evidenceIds: [...index.entries.values()].map(item => item.id) }
+          : { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout", candidates: bound.role === "scout" ? bound.candidates.map(({ jobId, evidenceIds }) => ({ jobId, evidenceIds })) : [], evidenceIds: [...index.entries.values()].map(item => item.id) }
+        : { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "analyst", findings: bound.role === "analyst" ? bound.findings.map(({ jobId, score, evidenceIds }) => ({ jobId, score, evidenceIds })) : [], evidenceIds: [...index.entries.values()].map(item => item.id) }
     }
     const evaluation = verifiedEmptyDiscoveryDigest
       ? evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery(contract, projection, input.dependencies, verifiedEmptyDiscoveryDigest)
@@ -137,6 +131,11 @@ async function verifyTaskGraphEvidenceForStatus(client: Queryable, input: Readon
 
 function persistedEmptyScoutResult(envelopeValue: unknown, resultValue: unknown): unknown | undefined {
   try { const envelope = record(envelopeValue), parsed = validateRoleResult(resultValue, "scout"); return envelope?.status === "completed" && canonicalJson(envelope.structuredResult) === canonicalJson(resultValue) && parsed.status === "completed" && parsed.candidates.length === 0 && parsed.evidence.length === 0 ? parsed : undefined } catch { return undefined }
+}
+function persistedStructuredResultMatches(envelopeValue: unknown, resultValue: unknown): boolean {
+  const envelope = record(envelopeValue)
+  if (!envelope || envelope.status !== "completed" || !Object.hasOwn(envelope, "structuredResult")) return false
+  try { return canonicalJson(envelope.structuredResult) === canonicalJson(resultValue) } catch { return false }
 }
 function persistedEmptyAnalystResult(envelopeValue: unknown, resultValue: unknown): AnalystResult | undefined {
   try { const envelope = record(envelopeValue), parsed = validateRoleResult(resultValue, "analyst"); return envelope?.status === "completed" && canonicalJson(envelope.structuredResult) === canonicalJson(resultValue) && parsed.status === "completed" && parsed.findings.length === 0 && parsed.evidence.length === 0 ? parsed as AnalystResult : undefined } catch { return undefined }

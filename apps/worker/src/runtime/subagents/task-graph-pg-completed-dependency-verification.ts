@@ -44,7 +44,7 @@ export async function verifyCompletedScoutDependencies(
     if (!task || task.id !== source.taskId || task.sessionId !== scope.sessionId || task.turnId !== scope.turnId
       || task.rootTaskId !== scope.rootTaskId || task.parentTaskId !== scope.parentTaskId || task.turnRootTaskId !== scope.rootTaskId
       || task.userId !== scope.userId || task.status !== "completed" || task.failureReason !== null || task.role !== "scout"
-      || !validAttempt(task.attemptCount) || !validScoutEnvelope(source, task.taskType, task.expectedOutputSchema, task.allowedActions)) return null
+      || !validAttempt(task.attemptCount) || !isValidScoutTaskEnvelope(source, task.taskType, task.expectedOutputSchema, task.allowedActions)) return null
     const envelope = parseObject(task.result)
     if (!envelope || envelope.status !== "completed" || !Object.hasOwn(envelope, "structuredResult")) return null
     const criterionIds = source.verification.criteria.map(criterion => criterion.id)
@@ -75,7 +75,7 @@ export async function verifyRepairedTaskGraphFindings(
   return Boolean(proof && node.verification && evaluateTaskGraphVerification(node.verification, projection, proof.projections).status === "passed")
 }
 
-function validScoutEnvelope(source: StoredTaskGraphNode, taskType: unknown, schema: unknown, actions: unknown): boolean {
+export function isValidScoutTaskEnvelope(source: StoredTaskGraphNode, taskType: unknown, schema: unknown, actions: unknown): boolean {
   const marker = parseObject(schema)
   if (!marker || !Reflect.ownKeys(marker).every(key => typeof key === "string")
     || Reflect.ownKeys(marker).sort().join(",") !== "role,schemaVersion"

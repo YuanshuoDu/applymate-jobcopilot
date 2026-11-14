@@ -33,7 +33,9 @@ export function rootTaskVerificationRequirementsObservation(turnInput: unknown):
       trust: "external_untrusted",
       source: "canonical_turn_objective",
       status: "valid",
-      requirements: resolution.requirements.map(({ id, kind, minimum }) => ({ id, kind, minimum })),
+      requirements: resolution.requirements.map(requirement => requirement.kind === "candidate_location_in"
+        ? { id: requirement.id, kind: requirement.kind, locations: [...requirement.locations] }
+        : { id: requirement.id, kind: requirement.kind, minimum: requirement.minimum }),
     }
     : {
       kind: "canonical_objective_verification_requirements",

@@ -128,6 +128,7 @@ describe("single-pass structured result outcomes", () => {
   it.each([
     ["invalid shape", emptyScoutResult({ extra: "private" })],
     ["missing identifier", emptyScoutResult({ candidates: [{ jobId: "", source: "greenhouse", url: null, evidenceIds: ["e"] }] })],
+    ["model-claimed observed location", { ...scoutWithEvidence(), candidates: [{ ...scoutWithEvidence().candidates[0], observedLocation: "Dublin" }] }],
     ["invalid score", { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId: "job-1", score: 11, evidenceIds: ["e"] }], evidence: [{ id: "e", kind: "job", ref: "job-1", source: "model" }], summary: "bad score" }],
   ] as const)("classifies known %s validation failures as result shape", (_name, value) => {
     expect(parseAndBindStructuredResultOutcome(JSON.stringify(value), value.role === "analyst" ? "analyst" : "scout", createObservedEvidenceIndex()))

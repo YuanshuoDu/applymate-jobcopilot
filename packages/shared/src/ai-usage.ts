@@ -60,6 +60,11 @@ export function estimateSharedAiCost(input: SharedAiUsageInput): number {
   return Number((((input.inputTokens ?? 0) * price.input + (input.outputTokens ?? 0) * price.output) / 1_000_000).toFixed(8));
 }
 
+/** Distinguishes a free catalogue entry from a model with no known price. */
+export function hasSharedAiPrice(provider: string, model: string): boolean {
+  return Object.prototype.hasOwnProperty.call(prices, `${provider}:${model}`);
+}
+
 export async function recordSharedAiUsage(db: Queryable, input: SharedAiUsageInput): Promise<void> {
   try {
     await db.query(

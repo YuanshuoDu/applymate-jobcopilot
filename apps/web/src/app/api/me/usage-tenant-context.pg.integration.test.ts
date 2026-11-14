@@ -60,7 +60,10 @@ pgDescribe('cover letter auth and usage on disposable PostgreSQL', () => {
       id text PRIMARY KEY, user_id text, feature_key text NOT NULL, provider text NOT NULL, model text NOT NULL,
       input_tokens integer NOT NULL, output_tokens integer NOT NULL, estimated_cost_usd double precision NOT NULL,
       latency_ms integer NOT NULL, status text NOT NULL, error_code text, credential_source text NOT NULL,
-      runtime text NOT NULL, created_at timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      runtime text NOT NULL, output_reservation_required boolean NOT NULL DEFAULT false, provider_started_at timestamp(3),
+      usage_start_protocol_version integer NOT NULL DEFAULT 0 CHECK (usage_start_protocol_version IN (0, 1)),
+      created_at timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CHECK (provider_started_at IS NULL OR usage_start_protocol_version = 1),
       observed_role text, observed_user text
     )`)
     await admin.$executeRawUnsafe(`CREATE FUNCTION "${schema}".observe_usage() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.observed_role := current_user; NEW.observed_user := current_setting('app.user_id', true); RETURN NEW; END $$`)

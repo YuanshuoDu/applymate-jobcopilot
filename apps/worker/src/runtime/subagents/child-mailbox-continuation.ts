@@ -5,7 +5,6 @@ import { redactSensitiveText } from "@jobcopilot/shared"
 import { loadChildConsumedWaitResume, loadChildPriorAttemptResume, type ChildSameAttemptResume } from "./child-resume.js"
 import { buildChildResumeObservations, countChildResumeToolCalls, mergeDurableWaitObservation, type DurableWaitResume } from "./child-resume-observations.js"
 import type { SubagentLease } from "./types.js"
-
 type Row = Record<string, unknown>
 type ResumeClient = Pick<pg.PoolClient, "query" | "release">
 type ResumePool = Pick<pg.Pool, "connect">
@@ -71,7 +70,7 @@ function stepsSql(): string {
     WHERE step."taskId" = $1 AND step."sessionId" = $2 AND step."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5 AND step."attempt" = $6 ORDER BY step."ordinal" ASC, step."id" ASC LIMIT ${MAX_STEPS + 1}`
 }
 function itemsSql(): string {
-  return `SELECT item."id", item."sessionId", item."turnId", item."taskId", item."stepId", item."type", item."status", item."phase", item."content", item."createdAt", step."attempt", step."ordinal", task."rootTaskId" AS "rootTaskId"
+  return `SELECT item."id", item."revision", item."sessionId", item."turnId", item."taskId", item."stepId", item."type", item."status", item."phase", item."content", item."createdAt", step."attempt", step."ordinal", task."rootTaskId" AS "rootTaskId"
     FROM "agent_items" AS item JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId" JOIN "sub_agent_tasks" AS task ON task."id" = item."taskId" AND task."sessionId" = item."sessionId" AND task."turnId" = item."turnId" JOIN "agent_sessions" AS session ON session."id" = item."sessionId" JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
     WHERE item."taskId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5 AND step."attempt" = $6 ORDER BY step."ordinal" ASC, item."createdAt" ASC, item."id" ASC LIMIT ${MAX_ITEMS + 1}`
 }
@@ -211,11 +210,16 @@ export async function loadChildSameAttemptContinuation(
     const previousFinalText = validateItems(itemResult.rows, stepMap, lastOrdinal, lease, durableWaits)
     if (!previousFinalText) throw UNAVAILABLE
     const currentUsage = { inputTokens, outputTokens, estimatedCostUsd }
-    const observations = buildChildResumeObservations(itemResult.rows, lease, lastOrdinal)
-      .filter(block => record(block.content)?.status === "completed")
+    const restored = buildChildResumeObservations(itemResult.rows, lease, lastOrdinal, durableWaits)
+    const observations = restored.observations.filter(block => record(block.content)?.status === "completed")
     const prior = await loadChildPriorAttemptResume(client, lease)
     let allObservations = [...(prior?.observations ?? []).filter(block => record(block.content)?.status === "completed"), ...observations]
     for (const wait of durableWaits) allObservations = [...mergeDurableWaitObservation(allObservations, wait)]
+    const observationIds = new Set(allObservations.map(item => item.id))
+    const childToolReplayReceipts = [...(prior?.childToolReplayReceipts ?? []), ...restored.childToolReplayReceipts]
+      .filter(item => observationIds.has(`child-resume:${item.resultItem.id}`))
+    const childWaitReplayReceipts = [...(prior?.childWaitReplayReceipts ?? []), ...restored.childWaitReplayReceipts]
+      .filter(item => observationIds.has(`child-resume:${item.resultItem.id}`))
     if (allObservations.length > 256 || Buffer.byteLength(JSON.stringify(allObservations), "utf8") > 256 * 1024) throw UNAVAILABLE
     const stepCount = (prior?.resume.stepCount ?? 0) + stepResult.rows.length
     const toolCallCount = (prior?.resume.toolCallCount ?? 0) + countChildResumeToolCalls(itemResult.rows, lease, lastOrdinal)
@@ -233,7 +237,8 @@ export async function loadChildSameAttemptContinuation(
           ? prior.resume.inputThroughSequence : inputThroughSequence,
         consumedInputIds: allConsumedInputIds, usage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens, estimatedCostUsd: totalEstimatedCostUsd },
       },
-      observations: allObservations, previousFinalText: projectChildFinalText(previousFinalText), leaseExpiresAt,
+      observations: allObservations, ...(childToolReplayReceipts.length ? { childToolReplayReceipts } : {}),
+      ...(childWaitReplayReceipts.length ? { childWaitReplayReceipts } : {}), previousFinalText: projectChildFinalText(previousFinalText), leaseExpiresAt,
     }
     await client.query("COMMIT"); closed = true
     return result

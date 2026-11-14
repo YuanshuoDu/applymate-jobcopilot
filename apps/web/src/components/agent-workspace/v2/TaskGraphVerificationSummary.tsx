@@ -4,6 +4,7 @@ import React from 'react'
 
 import type { TaskGraphVerificationDisplayCheck, TaskGraphVerificationDisplayNode } from '@jobcopilot/agent-protocol'
 import type { Lang } from '@/lib/i18n'
+import { taskGraphVerificationReasonLabel } from '@/lib/task-graph-verification-reason-labels'
 import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '@/lib/task-graph-plan-labels'
 
 export function TaskGraphVerificationSummary({ node, lang }: {
@@ -26,6 +27,7 @@ export function TaskGraphVerificationSummary({ node, lang }: {
       <span>{label(`agent.taskGraph.verification.${check.kind}` as TaskGraphPlanLabelKey)}{checkDetail(check, label)}</span>
       <span>{label(check.status === 'passed' ? 'agent.taskGraph.verification.passed'
         : check.status === 'failed' ? 'agent.taskGraph.verification.failed' : 'agent.taskGraph.verification.unverified')}</span>
+      {check.displayReason && <span>{taskGraphVerificationReasonLabel(lang, check.displayReason)}</span>}
     </li>)}</ul>
   </section>
 }

@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto'
+import { validate } from '@jobcopilot/agent-protocol'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DiscoveredJob } from './discover'
+import { JobsSearchOutputSchema } from './discovery-tool-types'
 import {
   createToolUsage,
   decodeProviderDiscoveryCursor,
@@ -128,6 +130,27 @@ describe('provider discovery cursor', () => {
     })
 
     expect(usage).not.toHaveProperty('providerFailures')
+  })
+
+  it('accepts the full composite ledger key bound while keeping each scope ID at 256 characters', () => {
+    const boundedScope = {
+      ...scope,
+      userId: 'u'.repeat(256), sessionId: 's'.repeat(256), turnId: 't'.repeat(256),
+      stepId: 'p'.repeat(256), toolCallId: 'c'.repeat(256),
+    }
+    const usage = createToolUsage(boundedScope, 'jobs.search', Date.now(), {
+      requests: 0, jobsProcessed: 0, jobsSucceeded: 0, jobsFailed: 0, aiCalls: 0, providers: [], estimatedCostUsd: 0,
+    })
+    const output = { jobs: [], evidence: [], nextCursor: null, usage }
+
+    expect(usage.ledgerKey).toHaveLength(1_284)
+    expect(validate(JobsSearchOutputSchema as never, output)).toBe(true)
+    expect(validate(JobsSearchOutputSchema as never, {
+      ...output, usage: { ...usage, ledgerKey: `${usage.ledgerKey}x` },
+    })).toBe(false)
+    expect(validate(JobsSearchOutputSchema as never, {
+      ...output, usage: { ...usage, toolCallId: 'c'.repeat(257) },
+    })).toBe(false)
   })
 })
 

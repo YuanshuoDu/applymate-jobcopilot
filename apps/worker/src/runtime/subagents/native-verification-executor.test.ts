@@ -38,7 +38,7 @@ function fixture() {
   const input = {
     lease: { ...lease, expectedOutputSchema: control }, owner: executionOwnerFence({ kind: "task", lease }),
     store: {} as TurnExecutionStore, treeBudget: { readRootLimits } as unknown as TreeBudgetReservationStore,
-    authorizeUsage: async () => ({ settle: async () => undefined }), resolveModel,
+    authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), resolveModel,
   }
   return { lease, control, input, readRootLimits, resolveModel }
 }
@@ -67,7 +67,7 @@ async function capturedRequest(base: ReturnType<typeof fixture>, packet: NativeV
   }
   const lease = { ...base.lease, context: createNativeVerificationContext(packet), expectedOutputSchema: control }
   const result = await dispatchNativeVerificationTask({ ...base.input, lease, store, treeBudget,
-    authorizeUsage: async () => ({ settle: async () => undefined }), resolveModel: () => adapter })
+    authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), resolveModel: () => adapter })
   return { result, request: requests[0] }
 }
 
@@ -173,7 +173,7 @@ describe("native verification dispatch classification", () => {
       appendEvent: async input => { persistedEvents.push(input); return { id: input.id } },
       recordFinalResponse: async input => { persistedResponses.push(input.response) },
     }
-    const authorizeUsage = vi.fn(async () => ({ settle: async () => undefined }))
+    const authorizeUsage = vi.fn(async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }))
     const result = await dispatchNativeVerificationTask({
       ...base.input,
       lease: { ...base.lease, context: createNativeVerificationContext(packet), expectedOutputSchema: control },

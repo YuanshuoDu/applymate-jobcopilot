@@ -1,7 +1,12 @@
 import { TurnIntentSchema, validate, type InputContentPart, type TurnIntent } from '@jobcopilot/agent-protocol'
 
 import { retryInputInvalid } from './errors'
-import { parseObjectiveVerificationRequirements, type ObjectiveVerificationRequirements } from './types'
+import {
+  OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+  objectiveLocationVerificationEnabled,
+  parseObjectiveVerificationRequirements,
+  type ObjectiveVerificationRequirements,
+} from './types'
 
 const RETRYABLE_STATUSES = new Set(['failed', 'interrupted', 'cancelled'])
 const MAX_RETRY_PARTS = 32
@@ -52,6 +57,8 @@ export function parsePersistedRetryContent(turnId: string, value: unknown): {
     else {
       verificationRequirements = parseObjectiveVerificationRequirements(value.verificationRequirements) ?? undefined
       if (!verificationRequirements) throw retryInputInvalid(turnId)
+      if (verificationRequirements.schemaVersion === OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION &&
+        !objectiveLocationVerificationEnabled()) throw retryInputInvalid(turnId)
     }
   }
   return {

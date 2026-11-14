@@ -175,7 +175,12 @@ async function startWorker() {
     coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false }
   const taskGraphCommandPort = flags.taskGraphPlanningEnabled
     ? taskGraphCommandPortModule.createPgTaskGraphCommandPort(pool) : undefined
-  const authorizeUsage = async () => ({ settle: async () => undefined })
+  const authorizeUsage = async () => ({
+    outputReservationRequired: false,
+    maxOutputTokens: null,
+    settle: async () => undefined,
+    settleUnknown: async () => undefined,
+  })
   let bootstrap
   await withCloakContext(userId, async page => {
     const response = await page.goto("https://boards.greenhouse.io/example/jobs/1")
