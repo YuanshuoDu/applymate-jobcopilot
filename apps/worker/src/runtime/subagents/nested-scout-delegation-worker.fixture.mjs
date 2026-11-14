@@ -13,8 +13,7 @@ import { createSubagentQueue } from "../../queue/subagent-queue.ts"
 import { enqueueTurn } from "../turns/turn-queue.ts"
 import { createCrashFixtureExecutor, createNestedScoutFixtureScripts } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 
-const [, , mode, rawIds] = process.argv
-const ids = JSON.parse(rawIds)
+const [, , mode, rawIds] = process.argv, ids = JSON.parse(rawIds)
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 10 })
 const CRASH_TEST_LEASE_MS = 3_000, CRASH_TEST_HEARTBEAT_MS = 500
 const SAFE_RECOVERY_ERROR_CODES = new Set([
@@ -24,6 +23,7 @@ const SAFE_RECOVERY_ERROR_CODES = new Set([
     observation_limit invalid_tool_call invalid_wait_input tool_item_conflict invalid_item_status tool_call_conflict tool_result_conflict invalid_errorCode
     invalid_id invalid_sessionId invalid_turnId invalid_taskId invalid_rootTaskId invalid_stepId invalid_ordinal invalid_attempt invalid_inputThroughSequence invalid_inputTokens invalid_outputTokens invalid_estimatedCostUsd invalid_consumedInputIds`.split(/\s+/).map(code => `child_resume_${code}`),
 ])
+const SAFE_SOURCE_WAIT_LIFECYCLE_STAGES = new Set(`required_value resume_scope source_step source_call_count source_call_input source_item_set wait_record_shape provenance_marker source_receipt_missing source_marker_without_result source_recovered_receipt_mismatch source_waiting_content source_waiting_output_shape source_waiting_identity source_waiting_targets source_waiting_matched_ids source_waiting_tasks source_waiting_task_ids source_waiting_deadline source_initial_call_shape source_call_completion_state source_result_completion_state source_call_completion_content source_result_completion_content source_waiting_output_missing source_event_chain reconciliation safe_result_shape source_start_event other`.split(" "))
 let bootstrap
 async function pauseSubagentClaims() {
   if (!bootstrap?.subagents) throw new Error("p1143_subagent_queue_unavailable")
@@ -156,7 +156,7 @@ async function start(mode) {
         return pool.connect()
       } }).resumeLoader
       try { return await loader(lease) }
-      catch (error) { say(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${stage}:${recoveryErrorClass(error, true)}`); throw error }
+      catch (error) { const lifecycleStage = error && typeof error === "object" && SAFE_SOURCE_WAIT_LIFECYCLE_STAGES.has(error.sourceLifecycleStage) ? error.sourceLifecycleStage : "other"; say(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${stage}:${recoveryErrorClass(error, true)}:${lifecycleStage}`); throw error }
     }, modelRuntimeFactory: input => childModelRuntime({ ...input, runtime, markerState }), durableWaitResumeCommitter: waitResumeCommitter() })
   const execute = createCrashFixtureExecutor(mode, executeChild, say)
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 100,
