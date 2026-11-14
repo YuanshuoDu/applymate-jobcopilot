@@ -63,6 +63,10 @@ const SAFE_DIAGNOSTIC_ERROR_CODES = [
   "subagent_role_unknown",
 ] as const
 const SAFE_WAIT_RESUME_CODES = ["wait_invalid", "wait_scope_error", "wait_conflict", "other"] as const
+const SAFE_WAIT_RESOLVER_CODES = [
+  "idempotency_conflict", "revision_mismatch", "wait_invalid", "wait_scope_error", "wait_conflict",
+  "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01", "ECONNRESET", "ETIMEDOUT", "error", "unknown", "other",
+] as const
 const SAFE_RECOVERY_STAGES = ["manager_recover", "dispatch"] as const
 const SAFE_RECOVERY_ERROR_CODES = [
   "subagent_dispatch_delivery_uncertain", "lost", "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01",
@@ -158,6 +162,10 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
     const match = value.match(/^P1143_WAITING_FINISH_DIAGNOSTIC:(idempotency_conflict|revision_mismatch|other)$/)
     return match ? [match[1]] : []
   })
+  const waitResolverErrorCodes = [...new Set(output.flatMap(value => {
+    const match = value.match(/^P1143_WAIT_RESOLVER_ERROR:([A-Za-z0-9_]+)$/)
+    return match && SAFE_WAIT_RESOLVER_CODES.includes(match[1] as typeof SAFE_WAIT_RESOLVER_CODES[number]) ? [match[1]] : []
+  }))]
   try {
     const [turn, graph, steps, tasks, parentSteps, waits, tools] = await Promise.all([
       progressQuery<{ status: string }>(`SELECT CASE WHEN "status" IN ('queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval',
@@ -232,11 +240,12 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       tier: depth === 1 ? "parent_scout" : depth === 2 ? "depth_two_scout" : "other_scout", status, failureCode,
       structuredFailureCategory, executorResultStatus, attemptCountMax, nextAttemptAtPresent, count,
     }))
-    const [acknowledgement, sourceEventChain, parentResumeProgress] = await Promise.all([
+    const [acknowledgement, sourceEventChain, parentResumeProgress, pendingChildWait] = await Promise.all([
       readWaitAcknowledgementDiagnostic(ids), readSourceEventChainDiagnostic(ids), readParentResumeProgressDiagnostic(ids),
+      readPendingChildWaitDiagnostic(ids),
     ])
     return {
-      observedPhases, fixtureFailure, waitResumeCommitFailures, waitingFinishFailures,
+      observedPhases, fixtureFailure, waitResumeCommitFailures, waitingFinishFailures, waitResolverErrorCodes,
       turnStatus: turn.rows[0]?.status ?? "missing",
       graphRecordCount: graph.rows.length,
       graphNodeCount: graph.rows[0]?.nodeCount ?? 0,
@@ -248,6 +257,7 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       waitAcknowledgement: acknowledgement,
       sourceEventChain,
       parentResumeProgress,
+      pendingChildWait,
     }
   } catch {
     return { observedPhases, fixtureFailure, waitResumeCommitFailures, waitingFinishFailures, databaseDiagnosticAvailable: false }
@@ -333,6 +343,131 @@ async function readParentResumeProgressDiagnostic(ids: FixtureIds) {
           CASE WHEN EXISTS (SELECT 1 FROM parent) THEN 'wait_missing' ELSE 'parent_missing' END) AS "resumeStage"`,
     [ids.userId, ids.sessionId, ids.turnId, SAFE_DIAGNOSTIC_ERROR_CODES])
     return result.rows[0] ?? { available: false }
+  } catch {
+    return { available: false }
+  }
+}
+
+async function readPendingChildWaitDiagnostic(ids: FixtureIds) {
+  type PendingWaitRow = {
+    pendingWaitCount: number; pendingWaitPresent: boolean; pendingWaitDue: boolean;
+    targetIdsValid: boolean; targetExpectedCount: number; targetBoundCount: number; targetDirectChildCount: number;
+    targetScopeExact: boolean; terminalTargetCount: number;
+    parentIsChildTask: boolean; parentLeaseOwnerAbsent: boolean; parentLeaseExpiresAbsent: boolean;
+    parentInterruptAbsent: boolean; parentDeadlineLive: boolean; parentLeaseGate: boolean;
+    sourceStepPresent: boolean; sourceStepScopeMatches: boolean; sourceStepAttemptMatches: boolean;
+    sourceStepWaitingForTool: boolean; sourceStepIsLatest: boolean; sourceStepGate: boolean; activeSessionTurnRoot: boolean;
+  }
+  try {
+    const result = await progressQuery<PendingWaitRow>(`WITH parent AS (
+        SELECT task."id", task."parentTaskId", task."rootTaskId", task."attemptCount", task."status", task."leaseOwner",
+          task."leaseExpiresAt", task."interruptRequestedAt", task."absoluteDeadlineAt", task."sessionId", task."turnId"
+        FROM "sub_agent_tasks" AS task
+        JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $1
+        WHERE task."sessionId" = $2 AND task."turnId" = $3 AND task."depth" = 1 AND task."role" = 'scout'
+        ORDER BY task."id" LIMIT 1
+      ), pending_waits AS (
+        SELECT wait.*, parent."id" AS "expectedParentTaskId", parent."rootTaskId" AS "expectedRootTaskId",
+          parent."attemptCount" AS "parentAttempt", parent."parentTaskId" AS "expectedParentOfParentTaskId",
+          parent."status" AS "parentStatus", parent."leaseOwner" AS "parentLeaseOwner",
+          parent."leaseExpiresAt" AS "parentLeaseExpiresAt", parent."interruptRequestedAt" AS "parentInterruptRequestedAt",
+          parent."absoluteDeadlineAt" AS "parentAbsoluteDeadlineAt"
+        FROM parent JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = parent."id"
+          AND wait."sessionId" = parent."sessionId" AND wait."turnId" = parent."turnId"
+        WHERE wait."status" = 'waiting' AND wait."suspendedAt" IS NOT NULL AND wait."consumedAt" IS NULL
+      ), selected_wait AS (
+        SELECT * FROM pending_waits ORDER BY "createdAt" DESC, "id" DESC LIMIT 1
+      ), target_ids AS (
+        SELECT wait."id" AS "waitId", wait."parentTaskId", wait."expectedRootTaskId", wait."sessionId", wait."turnId",
+          wait."userId", target."targetId"
+        FROM selected_wait AS wait CROSS JOIN LATERAL jsonb_array_elements_text(
+          CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END
+        ) AS target("targetId")
+      ), target_rows AS (
+        SELECT expected."targetId", task."id" AS "actualId", task."parentTaskId", task."rootTaskId", task."sessionId",
+          task."turnId", task."status", session."userId" AS "actualUserId", expected."parentTaskId" AS "expectedParentTaskId",
+          expected."expectedRootTaskId", expected."sessionId" AS "expectedSessionId", expected."turnId" AS "expectedTurnId",
+          expected."userId" AS "expectedUserId"
+        FROM target_ids AS expected LEFT JOIN "sub_agent_tasks" AS task ON task."id" = expected."targetId"
+        LEFT JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+      ), source_step AS (
+        SELECT wait."id" AS "waitId", wait."parentTaskId", wait."sessionId", wait."turnId", wait."stepId",
+          wait."parentAttempt", step."id" AS "actualStepId", step."taskId", step."attempt", step."ordinal", step."status"
+        FROM selected_wait AS wait LEFT JOIN "agent_steps" AS step ON step."id" = wait."stepId"
+      )
+      SELECT
+        (SELECT count(*)::int FROM pending_waits) AS "pendingWaitCount",
+        EXISTS (SELECT 1 FROM selected_wait) AS "pendingWaitPresent",
+        COALESCE((SELECT COALESCE(wait."nextReconcileAt", wait."suspendedAt") <= timezone('UTC', clock_timestamp())
+          FROM selected_wait AS wait), false) AS "pendingWaitDue",
+        COALESCE((SELECT CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN
+            jsonb_array_length(wait."targetTaskIds") BETWEEN 1 AND 8
+            AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(wait."targetTaskIds") AS target(value)
+              WHERE jsonb_typeof(target.value) <> 'string' OR length(target.value #>> '{}') NOT BETWEEN 1 AND 256
+                OR btrim(target.value #>> '{}') <> target.value #>> '{}')
+            AND (SELECT count(DISTINCT target.value) = jsonb_array_length(wait."targetTaskIds")
+              FROM jsonb_array_elements(wait."targetTaskIds") AS target(value))
+          ELSE false END FROM selected_wait AS wait), false) AS "targetIdsValid",
+        COALESCE((SELECT CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN jsonb_array_length(wait."targetTaskIds") ELSE 0 END
+          FROM selected_wait AS wait), 0) AS "targetExpectedCount",
+        (SELECT count("actualId")::int FROM target_rows) AS "targetBoundCount",
+        (SELECT count(*)::int FROM target_rows AS target WHERE target."actualId" IS NOT NULL
+          AND target."parentTaskId" = target."expectedParentTaskId" AND target."rootTaskId" = target."expectedRootTaskId"
+          AND target."sessionId" = target."expectedSessionId" AND target."turnId" = target."expectedTurnId"
+          AND target."actualUserId" = target."expectedUserId") AS "targetDirectChildCount",
+        COALESCE((SELECT CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array'
+            AND jsonb_array_length(wait."targetTaskIds") BETWEEN 1 AND 8
+            AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(wait."targetTaskIds") AS target(value)
+              WHERE jsonb_typeof(target.value) <> 'string' OR length(target.value #>> '{}') NOT BETWEEN 1 AND 256
+                OR btrim(target.value #>> '{}') <> target.value #>> '{}')
+            AND (SELECT count(DISTINCT target.value) = jsonb_array_length(wait."targetTaskIds")
+              FROM jsonb_array_elements(wait."targetTaskIds") AS target(value))
+            THEN (SELECT count("actualId") = jsonb_array_length(wait."targetTaskIds") FROM target_rows)
+              AND (SELECT count(*) = jsonb_array_length(wait."targetTaskIds") FROM target_rows AS target
+                WHERE target."actualId" IS NOT NULL AND target."parentTaskId" = target."expectedParentTaskId"
+                  AND target."rootTaskId" = target."expectedRootTaskId" AND target."sessionId" = target."expectedSessionId"
+                  AND target."turnId" = target."expectedTurnId" AND target."actualUserId" = target."expectedUserId")
+            ELSE false END FROM selected_wait AS wait), false) AS "targetScopeExact",
+        (SELECT count(*)::int FROM target_rows AS target WHERE target."actualId" IS NOT NULL
+          AND target."parentTaskId" = target."expectedParentTaskId" AND target."rootTaskId" = target."expectedRootTaskId"
+          AND target."sessionId" = target."expectedSessionId" AND target."turnId" = target."expectedTurnId"
+          AND target."actualUserId" = target."expectedUserId"
+          AND target."status" IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed', 'passed', 'skipped')) AS "terminalTargetCount",
+        COALESCE((SELECT wait."expectedParentOfParentTaskId" IS NOT NULL FROM selected_wait AS wait), false) AS "parentIsChildTask",
+        COALESCE((SELECT wait."parentLeaseOwner" IS NULL FROM selected_wait AS wait), false) AS "parentLeaseOwnerAbsent",
+        COALESCE((SELECT wait."parentLeaseExpiresAt" IS NULL FROM selected_wait AS wait), false) AS "parentLeaseExpiresAbsent",
+        COALESCE((SELECT wait."parentInterruptRequestedAt" IS NULL FROM selected_wait AS wait), false) AS "parentInterruptAbsent",
+        COALESCE((SELECT wait."parentAbsoluteDeadlineAt" IS NULL OR wait."parentAbsoluteDeadlineAt" > clock_timestamp()
+          FROM selected_wait AS wait), false) AS "parentDeadlineLive",
+        COALESCE((SELECT wait."parentStatus" = 'waiting' AND wait."parentLeaseOwner" IS NULL
+            AND wait."parentLeaseExpiresAt" IS NULL AND wait."parentInterruptRequestedAt" IS NULL
+            AND (wait."parentAbsoluteDeadlineAt" IS NULL OR wait."parentAbsoluteDeadlineAt" > clock_timestamp())
+          FROM selected_wait AS wait), false) AS "parentLeaseGate",
+        EXISTS (SELECT 1 FROM source_step WHERE "actualStepId" IS NOT NULL) AS "sourceStepPresent",
+        COALESCE((SELECT source."actualStepId" = source."stepId" AND source."taskId" = source."parentTaskId"
+            AND source."sessionId" = wait."sessionId" AND source."turnId" = wait."turnId"
+          FROM source_step AS source JOIN selected_wait AS wait ON wait."id" = source."waitId"), false) AS "sourceStepScopeMatches",
+        COALESCE((SELECT source."attempt" = source."parentAttempt" FROM source_step AS source), false) AS "sourceStepAttemptMatches",
+        COALESCE((SELECT source."status" = 'waiting_for_tool' FROM source_step AS source), false) AS "sourceStepWaitingForTool",
+        COALESCE((SELECT source."ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current
+            WHERE current."sessionId" = source."sessionId" AND current."turnId" = source."turnId"
+              AND current."taskId" = source."parentTaskId" AND current."attempt" = source."attempt")
+          FROM source_step AS source), false) AS "sourceStepIsLatest",
+        COALESCE((SELECT source."actualStepId" = source."stepId" AND source."taskId" = source."parentTaskId"
+            AND source."sessionId" = wait."sessionId" AND source."turnId" = wait."turnId"
+            AND source."attempt" = source."parentAttempt" AND source."status" = 'waiting_for_tool'
+            AND source."ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current
+              WHERE current."sessionId" = source."sessionId" AND current."turnId" = source."turnId"
+                AND current."taskId" = source."parentTaskId" AND current."attempt" = source."attempt")
+          FROM source_step AS source JOIN selected_wait AS wait ON wait."id" = source."waitId"), false) AS "sourceStepGate",
+        EXISTS (SELECT 1 FROM selected_wait AS wait JOIN "agent_sessions" AS session ON session."id" = wait."sessionId"
+            AND session."userId" = wait."userId" AND session."status" NOT IN ('aborted', 'archived')
+          JOIN "agent_turns" AS turn ON turn."id" = wait."turnId" AND turn."sessionId" = wait."sessionId"
+            AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
+          JOIN "sub_agent_tasks" AS root ON root."id" = wait."expectedRootTaskId" AND root."sessionId" = wait."sessionId"
+            AND root."turnId" = wait."turnId" AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed'))
+          AS "activeSessionTurnRoot"`, [ids.userId, ids.sessionId, ids.turnId])
+    return result.rows[0] ? { available: true, ...result.rows[0] } : { available: false }
   } catch {
     return { available: false }
   }

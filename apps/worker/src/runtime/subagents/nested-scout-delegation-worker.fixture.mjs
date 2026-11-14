@@ -77,6 +77,12 @@ const ACK_LIFECYCLE_STAGES = new Set([
   "source_result_completion_content", "source_waiting_output_missing", "source_event_chain", "reconciliation", "safe_result_shape",
   "source_start_event",
 ])
+const SAFE_WAIT_RESOLVER_ERROR_CODES = new Set([
+  "idempotency_conflict", "revision_mismatch", "wait_invalid", "wait_scope_error", "wait_conflict",
+  "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01", "ECONNRESET", "ETIMEDOUT",
+  "error", "unknown", "other",
+])
+const reportedWaitResolverErrorCodes = new Set()
 function waitResumeCommitter() {
   return async (lease, wait, nextStepOrdinal) => {
     try {
@@ -108,7 +114,27 @@ function recoveryErrorClass(error, includeMessage = false) {
   } catch { return "unknown" }
 }
 function withWaitingFinishDiagnostics(store) { const finish = store.finish.bind(store); store.finish = input => finish(input).catch(error => { if (input.status === "waiting") { const code = recoveryErrorClass(error, true); say(`P1143_WAITING_FINISH_DIAGNOSTIC:${code === "idempotency_conflict" || code === "revision_mismatch" ? code : "other"}`) } throw error }); return store }
+function safeWaitResolverErrorCode(error) {
+  const code = error && typeof error === "object" ? error.code : null
+  if (code === "task_graph_transition_rejected:idempotency_conflict") return "idempotency_conflict"
+  if (code === "task_graph_transition_rejected:revision_mismatch") return "revision_mismatch"
+  return typeof code === "string" && SAFE_WAIT_RESOLVER_ERROR_CODES.has(code) ? code : error instanceof Error ? "error" : "unknown"
+}
+function installWaitResolverDiagnostics() {
+  const originalConsoleError = console.error.bind(console)
+  console.error = (...args) => {
+    if (args[0] === "[wait-resolver] scan failed:") {
+      const code = safeWaitResolverErrorCode(args[1])
+      if (reportedWaitResolverErrorCodes.has(code)) return
+      reportedWaitResolverErrorCodes.add(code)
+      say(`P1143_WAIT_RESOLVER_ERROR:${code}`)
+      return
+    }
+    originalConsoleError(...args)
+  }
+}
 async function start(mode) {
+  installWaitResolverDiagnostics()
   const ownerId = `p1143-worker-${process.pid}`
   const manager = mode === "park" ? undefined : new AgentTreeManager(withWaitingFinishDiagnostics(new PgSubagentTaskStore(pool, CRASH_TEST_LEASE_MS)), { heartbeatMs: CRASH_TEST_HEARTBEAT_MS })
   let recoveryStage = "manager_recover"
