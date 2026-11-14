@@ -152,6 +152,17 @@ describe("AI usage broker", () => {
     await expect(settleAiUsage(db, { ...start, status: "released" })).rejects.toMatchObject({ code: "usage_attempt_started", status: 409 })
   })
 
+  it("uses the persisted BYOK authorization when the Worker start contract omits credential source", async () => {
+    const authorized = startInput()
+    const workerStart = { ...authorized }
+    delete workerStart.credentialSource
+    const { db } = startDatabase(authorized)
+
+    await expect(startAiUsage(db, workerStart)).resolves.toEqual({
+      startProtocolVersion: 1, outputReservationRequired: false, maxOutputTokens: null,
+    })
+  })
+
   it("fails closed when the credential source changes between admission and start", async () => {
     const start = startInput()
     const { db, tx } = startDatabase(start)

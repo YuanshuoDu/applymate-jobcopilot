@@ -2,7 +2,6 @@ import { createHash, randomUUID } from "node:crypto"
 import { Prisma } from "@prisma/client"
 
 import { getEffectiveEntitlements } from "@/lib/entitlements"
-
 import { normalizeUsageOwner, UsageOwnerFenceError, type UsageAdmissionOwnerInput, type UsageExecutionOwner } from "./usage-owner-fence"
 import { reconcileAbandonedAgentUsage } from "./agent-usage-reconciliation"
 import {
@@ -35,7 +34,6 @@ export type UsageSettlementInput = UsageReleaseInput | {
 export type UsageStartInput = UsageAdmissionInput & { operationId: string; startProtocolVersion: 1 }
 export type UsageStartResult = { startProtocolVersion: 1; outputReservationRequired: boolean; maxOutputTokens: number | null }
 export type UsageAdmissionResult = { operationId: string; startProtocolVersion: 0 | 1; outputReservationRequired: boolean; maxOutputTokens: number | null }
-
 export class UsageBrokerError extends Error {
   constructor(readonly code: string, readonly status: number, message = code) { super(message); this.name = "UsageBrokerError" }
 }
@@ -112,7 +110,6 @@ export async function admitAiUsageInTransaction(tx: UsageBrokerQuery, input: Usa
     return { operationId: id, startProtocolVersion, outputReservationRequired: output.required, maxOutputTokens: output.maxOutputTokens }
   } catch (error: unknown) { rootError(error) }
 }
-
 export async function admitAiUsage(db: UsageBrokerDatabase, input: UsageAdmissionInput, now = new Date()): Promise<UsageAdmissionResult> {
   return db.$transaction(tx => admitAiUsageInTransaction(tx, input, now))
 }
@@ -130,7 +127,11 @@ export async function startAiUsageInTransaction(tx: UsageBrokerQuery, input: Usa
       WHERE id = ${input.operationId} AND user_id = ${input.userId} AND provider = ${input.provider} AND model = ${input.model}`))[0]
     const required = event?.outputReservationRequired
     if (!row || !event || event.startProtocolVersion !== 1 || required !== row.outputReservationRequired) throw new UsageBrokerError("usage_attempt_missing", 409)
-    if (event.credentialSource !== (input.credentialSource ?? "platform")) throw new UsageBrokerError("usage_attempt_conflict", 409)
+    const authorizedCredentialSource = event.credentialSource
+    if ((authorizedCredentialSource !== "platform" && authorizedCredentialSource !== "user") ||
+        (input.credentialSource !== undefined && input.credentialSource !== authorizedCredentialSource)) {
+      throw new UsageBrokerError("usage_attempt_conflict", 409)
+    }
     if (event.status !== "reserved" || event.providerStartedAt !== null || row.status !== "reserved") throw new UsageBrokerError("usage_start_replayed", 409)
     await lockRootUsageAdmissionScope(tx, input, owner, row ?? undefined)
     const reservedOutputTokens = await startRootOutputReservation(tx, row)
@@ -139,13 +140,12 @@ export async function startAiUsageInTransaction(tx: UsageBrokerQuery, input: Usa
       UPDATE ai_usage_events SET provider_started_at = CURRENT_TIMESTAMP
       WHERE id = ${input.operationId} AND user_id = ${input.userId} AND provider = ${input.provider} AND model = ${input.model}
         AND status = 'reserved' AND provider_started_at IS NULL AND usage_start_protocol_version = 1
-        AND output_reservation_required = ${required}
+        AND output_reservation_required = ${required} AND credential_source = ${authorizedCredentialSource}
       RETURNING id`)
     if (!started[0]) throw new UsageBrokerError("usage_start_replayed", 409)
     return { startProtocolVersion: 1, outputReservationRequired: required, maxOutputTokens }
   } catch (error: unknown) { rootError(error) }
 }
-
 export async function startAiUsage(db: UsageBrokerDatabase, input: UsageStartInput): Promise<UsageStartResult> {
   return db.$transaction(tx => startAiUsageInTransaction(tx, input))
 }
