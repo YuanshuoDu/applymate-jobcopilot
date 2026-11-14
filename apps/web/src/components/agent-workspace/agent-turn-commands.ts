@@ -2,7 +2,7 @@
 
 import { createContext, createElement, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
 import { schemaVersion, type InputContentPart } from '@jobcopilot/agent-protocol'
-import type { ActiveTurnDto } from './agent-session-state'
+import type { ActiveTurnDto, AgentTurnStateReadiness } from './agent-session-state'
 import type { AgentSessionControlStatus } from './v2/AgentSessionPauseResumeControl'
 
 export type ComposerDelivery = 'steer' | 'follow_up'
@@ -57,6 +57,7 @@ export class AgentTurnCommandError extends Error implements AgentCommandErrorDto
 export interface TurnComposerController {
   sessionId: string
   activeTurn: ActiveTurnDto | null
+  turnStateReadiness?: AgentTurnStateReadiness
   sessionStatus?: AgentSessionControlStatus | null
   refresh?: () => unknown
   delivery: ComposerDelivery
@@ -161,6 +162,7 @@ export function useAgentTurnComposer(
   activeTurn: ActiveTurnDto | null,
   refetch: () => void,
   sessionStatus: AgentSessionControlStatus | null = null,
+  turnStateReadiness: AgentTurnStateReadiness = 'loading',
 ): TurnComposerController | null {
   const [delivery, setDelivery] = useState<ComposerDelivery>('steer')
   const [chatInput, setChatInput] = useState('')
@@ -234,5 +236,5 @@ export function useAgentTurnComposer(
   }, [activeTurn, interrupting, refetch, sessionId])
 
   if (!sessionId) return null
-  return { sessionId, activeTurn, sessionStatus, refresh: refetch, delivery, setDelivery, chatInput, setChatInput, sending, messages, commandError, send, interrupt, interrupting }
+  return { sessionId, activeTurn, turnStateReadiness, sessionStatus, refresh: refetch, delivery, setDelivery, chatInput, setChatInput, sending, messages, commandError, send, interrupt, interrupting }
 }

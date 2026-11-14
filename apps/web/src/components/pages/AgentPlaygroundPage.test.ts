@@ -51,7 +51,8 @@ describe('Agent workspace responsive layout', () => {
   it('uses the URL session as the single page identity and provides the active Turn composer', () => {
     expect(source).toContain('useAgentSessionUrl')
     expect(source).toContain('useAgentSessionState(sessionId)')
-    expect(source).toContain('useAgentTurnComposer(sessionId, activeTurn, refetchTurnState, controlStatus)')
+    expect(source).toContain('useAgentTurnComposer(sessionId, activeTurn, refetchTurnState, controlStatus, turnStateReadiness)')
+    expect(source).toContain('selectedSessionControlStatusValue(selectedSessionId, controlSessionData?.session)')
     expect(source).toContain('<AgentTurnComposerProvider value={turnComposer}>')
     expect(source).toContain('resumeSessionId={sessionId}')
     expect(source).not.toContain('liveSessionId')

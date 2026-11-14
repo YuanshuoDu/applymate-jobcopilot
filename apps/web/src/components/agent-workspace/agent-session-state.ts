@@ -33,6 +33,8 @@ export interface AgentSessionState {
   queuedInputCount: number
 }
 
+export type AgentTurnStateReadiness = 'loading' | 'ready' | 'error'
+
 const ACTIVE_TURN_STATUSES = new Set<ActiveTurnStatus>([
   'queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval', 'waiting_for_user',
 ])
@@ -74,6 +76,38 @@ export function parseAgentTurnsResponse(value: unknown): AgentSessionState {
       ? Math.floor(projection.queuedInputCount)
       : 0,
   }
+}
+
+export function hasAuthoritativeAgentTurnState(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const response = value as Record<string, unknown>
+  if (!Array.isArray(response.turns) || !response.projection || typeof response.projection !== 'object' || Array.isArray(response.projection)) return false
+  const projection = response.projection as Record<string, unknown>
+  const activeTurnId = nonEmptyString(projection.activeTurnId)
+  if (projection.activeTurnId === null) {
+    return projection.activeTurn === null && response.turns.every((turn) => parseActiveTurn(turn) === null)
+  }
+  if (!activeTurnId) return false
+  const projectedTurn = parseActiveTurn(projection.activeTurn)
+  if (projectedTurn?.id === activeTurnId) return true
+  return response.turns.some((turn) => parseActiveTurn(turn)?.id === activeTurnId)
+}
+
+export function resolveAgentTurnStateReadiness(
+  sessionId: string | null,
+  stateSessionId: string | null,
+  loading: boolean,
+  error: string | null,
+): AgentTurnStateReadiness {
+  if (sessionId !== stateSessionId || loading) return 'loading'
+  return error ? 'error' : 'ready'
+}
+
+export function selectedSessionControlStatusValue(
+  selectedSessionId: string | null,
+  session: { id?: string; status?: unknown } | null | undefined,
+): unknown | null {
+  return selectedSessionId && session?.id === selectedSessionId ? session.status ?? null : null
 }
 
 export function readAgentSessionId(href: string): string | null {
@@ -145,6 +179,7 @@ export function useAgentSessionState(sessionId: string | null) {
       .then(async (response) => {
         const body = await response.json().catch(() => ({})) as unknown
         if (!response.ok) throw new Error(`Turn state failed (${response.status})`)
+        if (!hasAuthoritativeAgentTurnState(body)) throw new Error('Turn state response did not confirm whether a Turn is active')
         if (!controller.signal.aborted) setState(parseAgentTurnsResponse(body))
       })
       .catch((reason: unknown) => {
@@ -157,5 +192,6 @@ export function useAgentSessionState(sessionId: string | null) {
   }, [sessionId, refreshVersion])
 
   const visibleState = stateSessionId === sessionId ? state : { activeTurn: null, queuedInputCount: 0 }
-  return { ...visibleState, loading, error, refetch }
+  const turnStateReadiness = resolveAgentTurnStateReadiness(sessionId, stateSessionId, loading, error)
+  return { ...visibleState, loading, error, turnStateReadiness, refetch }
 }
