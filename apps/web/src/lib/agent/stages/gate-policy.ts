@@ -239,4 +239,3 @@ export async function runGatePolicy(packages: readonly ApplicationPackage[], ctx
   const total = Date.now() - t0
   return { status: 'stage_completed', result: stageOk('gate', { approved, pending, skipped }, approved.length + pending.length + skipped.length, total) }
 }
-
