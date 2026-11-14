@@ -66,6 +66,9 @@ const SAFE_WAIT_RESUME_CODES = ["wait_invalid", "wait_scope_error", "wait_confli
 const SAFE_WAIT_RESOLVER_CODES = [
   "idempotency_conflict", "revision_mismatch", "wait_invalid", "wait_scope_error", "wait_conflict",
   "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01", "ECONNRESET", "ETIMEDOUT", "error", "unknown", "other",
+  "child_wait_configuration", "child_wait_deadline_revalidation", "child_wait_parent_deadline_scope", "child_wait_schedule_fence",
+  "child_wait_session_scope", "task_graph_prepare_or_load", "task_graph_transition_rejected", "task_graph_persist_revision_conflict",
+  "task_graph_persist_outbox_conflict", "task_graph_persist_sequence_unavailable",
 ] as const
 const SAFE_RECOVERY_STAGES = ["manager_recover", "dispatch"] as const
 const SAFE_RECOVERY_ERROR_CODES = [
@@ -149,6 +152,24 @@ function seenMainProgress(output: string[]) {
     || isSafeRootSetupDiagnostic(value) || isSafeParentResumeDiagnostic(value)))]
 }
 
+function waitResolverErrorCodesFromOutput(output: readonly string[]): string[] {
+  return [...new Set(output.flatMap(value => {
+    const match = value.match(/^P1143_WAIT_RESOLVER_ERROR:([A-Za-z0-9_]+)$/)
+    return match && SAFE_WAIT_RESOLVER_CODES.includes(match[1] as typeof SAFE_WAIT_RESOLVER_CODES[number]) ? [match[1]] : []
+  }))]
+}
+
+describe("nested Scout wait-resolver diagnostic allowlist", () => {
+  it("filters unknown values before adding the diagnostic snapshot", () => {
+    expect(waitResolverErrorCodesFromOutput([
+      "P1143_WAIT_RESOLVER_ERROR:task_graph_prepare_or_load",
+      "P1143_WAIT_RESOLVER_ERROR:error",
+      "P1143_WAIT_RESOLVER_ERROR:raw_exception_message_with_identifier",
+      "P1143_WAIT_RESOLVER_ERROR:task_graph_prepare_or_load:extra",
+    ])).toEqual(["task_graph_prepare_or_load", "error"])
+  })
+})
+
 async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
   const observedPhases = seenMainProgress(output)
   const fixtureFailure = output.find(isSafeFixtureFailure) ?? null
@@ -162,10 +183,7 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
     const match = value.match(/^P1143_WAITING_FINISH_DIAGNOSTIC:(idempotency_conflict|revision_mismatch|other)$/)
     return match ? [match[1]] : []
   })
-  const waitResolverErrorCodes = [...new Set(output.flatMap(value => {
-    const match = value.match(/^P1143_WAIT_RESOLVER_ERROR:([A-Za-z0-9_]+)$/)
-    return match && SAFE_WAIT_RESOLVER_CODES.includes(match[1] as typeof SAFE_WAIT_RESOLVER_CODES[number]) ? [match[1]] : []
-  }))]
+  const waitResolverErrorCodes = waitResolverErrorCodesFromOutput(output)
   try {
     const [turn, graph, steps, tasks, parentSteps, waits, tools] = await Promise.all([
       progressQuery<{ status: string }>(`SELECT CASE WHEN "status" IN ('queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval',
