@@ -770,6 +770,14 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     await initialSessionProjection.finish({ ...initialProjectionIdentity, result: { status: initialRootWait.status } })
     await suspendAndReleaseWait(pool as never, { lease: fixture.turnLease, waitId: initialGateWait.waitId })
     const gateTaskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
+    const gateRecoveryTrace = await readScheduledAuditRootRecoveryTrace(fixture)
+    expectScheduledAuditRecoveryTrace(gateRecoveryTrace, fixture, 1, "waiting_for_tool", null)
+    const gateRecoveryStep = gateRecoveryTrace.steps[0]
+    if (!gateRecoveryStep) throw new Error("scheduled Gate root recovery Step missing")
+    expect(gateRecoveryStep.id).not.toBe(sourceStepId)
+    expect(gateRecoveryStep.completionEvents[0]?.payload).toMatchObject({ status: "waiting_for_dependency" })
+    expect(gateRecoveryStep.waits.some(wait => wait.id === initialGateWait.waitId)).toBe(true)
+    const gateRecoveryStepId = gateRecoveryStep.id
     const [rootHandoff, turnHandoff, waitHandoff, stepHandoff] = await Promise.all([
       pool!.query<{ status: string; result: unknown; attemptCount: number }>(`SELECT "status", "result", "attemptCount"
         FROM "sub_agent_tasks" WHERE "id"=$1`, [fixture.ids.rootTaskId]),
@@ -781,9 +789,10 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
           "idempotencyKey", "targetTaskIds", "mode", "status", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
         FROM "agent_wait_conditions" WHERE "id"=$1`, [initialGateWait.waitId]),
       pool!.query<{ id: string; taskId: string | null; attempt: number; status: string }>(`SELECT "id", "taskId", "attempt", "status"
-        FROM "agent_steps" WHERE "id"=$1`, [sourceStepId]),
+        FROM "agent_steps" WHERE "id"=$1`, [gateRecoveryStepId]),
     ])
-    const waitKey = `scheduled-gate-wait:${createHash("sha256").update(JSON.stringify([gateTaskId, sourceStepId, 0]), "utf8").digest("hex")}`
+    const waitKey = `scheduled-gate-wait:${createHash("sha256")
+      .update(JSON.stringify([gateTaskId, gateRecoveryStepId, 0]), "utf8").digest("hex")}`
     const rootState = rootHandoff.rows[0], turnState = turnHandoff.rows[0]
     const waitState = waitHandoff.rows[0], stepState = stepHandoff.rows[0]
     const waitResult = debugRecord(waitState?.result), waitRequest = debugRecord(waitResult?.request)
@@ -791,14 +800,14 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(debugRecord(rootState?.result)).toMatchObject({ status: "waiting_for_dependency", waitId: initialGateWait.waitId })
     expect(turnState).toEqual({ status: "waiting_for_dependency", leaseOwnerId: null, leaseExpiresAt: null })
     expect(waitState).toMatchObject({ id: initialGateWait.waitId, userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
-      turnId: fixture.ids.turnId, parentTaskId: fixture.ids.rootTaskId, stepId: sourceStepId,
+      turnId: fixture.ids.turnId, parentTaskId: fixture.ids.rootTaskId, stepId: gateRecoveryStepId,
       idempotencyKey: waitKey, mode: "any", status: "waiting", suspendedAt: expect.any(Date), consumedAt: null })
     expect(waitState?.targetTaskIds).toEqual([gateTaskId])
     expect(waitState?.matchedTaskIds).toEqual([])
     expect(waitRequest).toEqual({ targetTaskIds: [gateTaskId], mode: "any", timeoutMs: 86_400_000,
       scheduledGate: { gateTaskId, requestAttemptCount: 0 } })
-    expect(stepState).toMatchObject({ id: sourceStepId, attempt: 1, status: "waiting_for_tool" })
-    expect([fixture.ids.rootTaskId, null]).toContain(stepState?.taskId)
+    expect(stepState).toMatchObject({ id: gateRecoveryStepId, attempt: 1, status: "waiting_for_tool" })
+    expect(stepState?.taskId).toBe(fixture.ids.rootTaskId)
     runner = startRunner(fixture, response.fetcher)
     const gateOutcome = await dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)
     if (!gateOutcome || typeof gateOutcome !== "object" || !("status" in gateOutcome) || gateOutcome.status !== "completed") {
