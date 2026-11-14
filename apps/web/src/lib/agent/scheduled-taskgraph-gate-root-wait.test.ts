@@ -23,14 +23,17 @@ function rootRow(overrides: Record<string, unknown> = {}) {
     parentTaskId: null, status: 'waiting', attemptCount: owner.rootAttemptCount, interruptRequestedAt: null,
     closedAt: null, result: rootResult, ...overrides }
 }
-function transaction(responses: unknown[], approvals: unknown[] = [], items: unknown[] = [], events: unknown[] = []) {
+function transaction(responses: unknown[], approvals: unknown[] = [], items: unknown[] = [], events: unknown[] = [],
+  applicationTasks: unknown[] = []) {
   const queryRaw = vi.fn(async () => responses.shift() ?? [])
   const approvalFindMany = vi.fn(async () => approvals)
+  const applicationTaskFindMany = vi.fn(async () => applicationTasks)
   const itemFindMany = vi.fn(async () => items)
   const eventFindMany = vi.fn(async () => events)
   return { client: { $queryRaw: queryRaw, agentApproval: { findMany: approvalFindMany },
+    applicationTask: { findMany: applicationTaskFindMany },
     agentItem: { findMany: itemFindMany }, agentEvent: { findMany: eventFindMany } } as unknown as Prisma.TransactionClient,
-    queryRaw, approvalFindMany, itemFindMany, eventFindMany }
+    queryRaw, approvalFindMany, applicationTaskFindMany, itemFindMany, eventFindMany }
 }
 function approvalWitness() {
   const expiresAt = new Date(Date.now() + 60_000)
@@ -49,7 +52,8 @@ function approvalWitness() {
     taskId: row.taskId, type: 'approval.requested', actor: 'orchestrator', correlationId: row.id,
     idempotencyKey: 'approval:approval-1:requested',
     payload: { approvalId: row.id, action: row.type, scopeHash: row.scopeHash, revision: row.revision } }
-  return { row, item, event }
+  const applicationTask = { id: row.taskId, userId: row.userId, sessionId: row.sessionId, jobId: row.jobId }
+  return { row, item, event, applicationTask }
 }
 function suspendedTurn(overrides: Record<string, unknown> = {}) {
   return { id: owner.turnId, status: 'waiting_for_dependency', leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion,
@@ -111,7 +115,7 @@ describe('Scheduled Gate Root dependency wait fence', () => {
     const approval = approvalWitness()
     const test = transaction([[{ status: 'waiting' }], [waitRow()],
       [{ id: stepId, taskId: owner.rootTaskId, attempt: 1, status: 'waiting_for_tool' }], [rootRow()]],
-    [approval.row], [approval.item], [approval.event])
+    [approval.row], [approval.item], [approval.event], [approval.applicationTask])
     await expect(lockScheduledTaskGraphRootAction(test.client,
       gateInput({ turn: suspendedTurn({ status: 'waiting_for_approval' }) }))).resolves.toEqual({
       root: rootRow(), gateWait: { waitId, stepId, gateTaskId, approvalIds: ['approval-1'], requestAttemptCount: 0, owner,
@@ -119,6 +123,10 @@ describe('Scheduled Gate Root dependency wait fence', () => {
         root: { id: owner.rootTaskId, status: 'waiting', attemptCount: owner.rootAttemptCount, waitId } },
     })
     expect(test.approvalFindMany).toHaveBeenCalledOnce()
+    expect(test.applicationTaskFindMany).toHaveBeenCalledWith({
+      where: { OR: [{ id: 'application-task-1', userId: owner.userId, sessionId: owner.sessionId, jobId: 'job-1' }] },
+      select: { id: true, userId: true, sessionId: true, jobId: true },
+    })
     expect(test.queryRaw).toHaveBeenCalledTimes(4)
   })
 
