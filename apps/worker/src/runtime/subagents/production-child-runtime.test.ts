@@ -445,7 +445,8 @@ describe("production child runtime", () => {
     const fixture = productionWaitResumeFixture(), pool = { connect: vi.fn(), query: vi.fn() }
     const committer = vi.fn(async () => true)
     const executor = createProductionChildExecutor({ pool: pool as never, turnStore: fixture.turnStore, treeBudget: budget(),
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => fixture.model,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
+        settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => fixture.model,
       toolRuntimeFactory: () => fixture.tools, mailboxReader: emptyMailboxReader, resumeLoader: fixture.resumeLoader,
       durableWaitResumeCommitter: committer })
 
@@ -1153,16 +1154,45 @@ describe("production child runtime", () => {
     const client = {
       query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
         if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
-        if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return values[0] === child.sessionId && values[1] === child.userId
+        if (sql.startsWith('SELECT "id" FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return values[0] === child.sessionId && values[1] === child.userId
           ? { rows: [{ id: child.sessionId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.startsWith('SELECT "id" FROM "agent_sessions"') && sql.includes("FOR SHARE")) return values[0] === child.sessionId && values[1] === child.userId
+          ? { rows: [{ id: child.sessionId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('FROM "agent_turns"') && sql.includes("FOR SHARE")) return values[0] === child.turnId
+          && values[1] === child.sessionId && values[2] === child.userId
+          ? { rows: [{ id: child.turnId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.startsWith('SELECT "id" FROM "sub_agent_tasks"') && sql.includes("FOR SHARE")) {
+          const rootLock = values.length === 3 && values[0] === child.rootTaskId && values[1] === child.sessionId && values[2] === child.turnId
+          const childLock = values.length === 4 && values[0] === child.id && values[1] === child.sessionId
+            && values[2] === child.turnId && values[3] === child.rootTaskId
+          return rootLock || childLock ? { rows: [{ id: values[0] }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        }
+        if (sql.includes('SELECT task."id"') && values.length === 5) {
+          const repairScope = sql.includes("FOR UPDATE OF task") && values[0] === child.id && values[1] === child.sessionId
+            && values[2] === child.turnId && values[3] === child.rootTaskId && values[4] === child.userId
+          const waitScope = sql.includes("FOR SHARE OF task") && values[0] === child.id && values[1] === child.userId
+            && values[2] === child.sessionId && values[3] === child.turnId && values[4] === child.rootTaskId
+          return repairScope || waitScope ? {
+            rows: [{ id: child.id, userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, parentTaskId: child.parentTaskId, status: "running", leaseOwner: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: child.leaseExpiresAt, interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1,
+          } : { rows: [], rowCount: 0 }
+        }
         if (sql.includes('SELECT task."id"')) return values[0] === child.id && values[1] === child.sessionId && values[2] === child.turnId
-          && values[3] === child.rootTaskId && values[4] === child.userId ? {
+          && values[3] === child.rootTaskId && values[4] === child.userId && values[5] === child.ownerId && values[6] === child.attemptCount ? {
           rows: [{ id: child.id, userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, parentTaskId: child.parentTaskId, status: "running", leaseOwner: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: child.leaseExpiresAt, interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1,
         } : { rows: [], rowCount: 0 }
-        if (sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"')) return { rows: [], rowCount: 0 }
-        if (sql.includes('SELECT "id" FROM "sub_agent_tasks"') && sql.includes("FOR UPDATE")) return values[0] === child.id && values[1] === child.sessionId
-          && values[2] === child.turnId && values[3] === child.rootTaskId && values[4] === child.ownerId && values[5] === child.attemptCount
+        if (sql.startsWith('SELECT "id" FROM "sub_agent_tasks"') && sql.includes("FOR UPDATE")) return values[0] === child.id
+          && values[1] === child.sessionId && values[2] === child.turnId && values[3] === child.rootTaskId
+          && values[4] === child.ownerId && values[5] === child.attemptCount
           ? { rows: [{ id: child.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('FROM "agent_wait_conditions" AS candidateWait')) {
+          if (values[0] !== child.userId || values[1] !== child.sessionId || values[2] !== child.turnId || values[3] !== child.id
+            || values[4] !== child.rootTaskId || values[5] !== child.attemptCount) throw new Error("unexpected resume query")
+          return { rows: [], rowCount: 0 }
+        }
+        if (sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"')) {
+          if (values[0] !== child.id || values[1] !== 257) throw new Error("unexpected resume query")
+          return { rows: [], rowCount: 0 }
+        }
         if (sql.includes('FROM "agent_steps"')) return { rows: [], rowCount: 0 }
         throw new Error(`unexpected resume query: ${sql}`)
       }),
@@ -1179,30 +1209,68 @@ describe("production child runtime", () => {
           yield { type: "tool_call_completed", callId: "resume-call", name: "jobs.search", arguments: {} }
           yield { type: "completed", finishReason: "tool_calls" }
         } else {
-          yield { type: "text_delta", text: "resumed" }
+          yield { type: "text_delta", text: JSON.stringify({
+            schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "partial", findings: [], evidence: [],
+            summary: "Resumed; no source-backed findings were available.",
+          }) }
           yield { type: "completed", finishReason: "stop" }
         }
       },
     }
     const executor = createOptionalProductionChildExecutor({
-      enabled: true, pool, turnStore: store(), treeBudget: budget(), authorizeUsage: async () => ({ settle: async () => undefined }),
+      enabled: true, pool, turnStore: store(), treeBudget: budget(), authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
+        settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => model, toolRuntimeFactory: () => ({ definitions: [publicTool("jobs.search")], router: { execute: async (_context: unknown, request: { id: string; toolName: string; toolVersion: string }) => ({ ...request, status: "completed" as const, errorCode: null }) }, validateArguments: validateFixtureToolArguments }),
       mailboxReader: { listPendingMessages: async () => [] },
     })
     if (!executor) throw new Error("child executor was not created")
-    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed" })
+    const outcome = await executor({ lease: child })
+    expect(outcome).toMatchObject({ status: "completed" })
+    expect(modelCalls).toBe(2)
     expect(poolWithConnect.connect).toHaveBeenCalledTimes(3)
     expect(client.query.mock.calls.map(([sql]) => sql)).toContain("SELECT set_config($1, $2, true)")
-    const queries = client.query.mock.calls.map(([sql]) => sql)
-    const sessionLock = queries.findIndex(sql => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
-    const taskLock = queries.findIndex(sql => sql.includes('SELECT task."id"') && sql.includes('task."parentTaskId"'))
-    const consumedWaitScan = queries.findIndex(sql => sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"'))
+    const queries = client.query.mock.calls
+    const repairSessionLock = queries.findIndex(([sql]) => sql.startsWith('SELECT "id" FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
+    const repairTaskLock = queries.findIndex(([sql, values]) => sql.includes('SELECT task."id"') && values.length === 5 && sql.includes("FOR UPDATE OF task"))
+    const consumedRepairScan = queries.findIndex(([sql]) => sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"'))
+    const repairLeaseFence = queries.findIndex(([sql, values]) => sql.startsWith('SELECT "id" FROM "sub_agent_tasks"')
+      && values.length === 6 && sql.includes("FOR UPDATE"))
+    const durableWaitTask = queries.findIndex(([sql, values]) => sql.includes('SELECT task."id"')
+      && values.length === 5 && sql.includes("FOR SHARE OF task"))
+    const durableWaitScan = queries.findIndex(([sql]) => sql.includes('FROM "agent_steps" AS step')
+      && sql.includes('JOIN "agent_wait_conditions" AS wait'))
+    const sessionLock = queries.findIndex(([sql]) => sql.startsWith('SELECT "id" FROM "agent_sessions"') && sql.includes("FOR SHARE"))
+    const turnLock = queries.findIndex(([sql]) => sql.startsWith('SELECT "id" FROM "agent_turns"') && sql.includes("FOR SHARE"))
+    const rootLock = queries.findIndex(([sql, values]) => sql.startsWith('SELECT "id" FROM "sub_agent_tasks"')
+      && sql.includes("FOR SHARE") && values.length === 3)
+    const childLock = queries.findIndex(([sql, values]) => sql.startsWith('SELECT "id" FROM "sub_agent_tasks"')
+      && sql.includes("FOR SHARE") && values.length === 4)
+    const taskValidation = queries.findIndex(([sql, values]) => sql.includes('SELECT task."id"') && values.length === 7)
+    const consumedWaitScan = queries.findIndex(([sql]) => sql.includes('FROM "agent_wait_conditions" AS candidateWait'))
+    expect(repairTaskLock).toBeGreaterThan(repairSessionLock)
+    expect(consumedRepairScan).toBeGreaterThan(repairTaskLock)
+    expect(repairLeaseFence).toBeGreaterThan(consumedRepairScan)
+    expect(durableWaitTask).toBeGreaterThan(repairLeaseFence)
+    expect(durableWaitScan).toBeGreaterThan(durableWaitTask)
     expect(sessionLock).toBeGreaterThan(-1)
-    expect(taskLock).toBeGreaterThan(sessionLock)
-    expect(consumedWaitScan).toBeGreaterThan(taskLock)
-    expect(client.query.mock.calls[sessionLock]?.[1]).toEqual([child.sessionId, child.userId])
-    expect(client.query.mock.calls[taskLock]?.[1]).toEqual([child.id, child.sessionId, child.turnId, child.rootTaskId, child.userId])
-    expect(client.query.mock.calls[consumedWaitScan]?.[1]).toEqual([child.id, 257])
+    expect(sessionLock).toBeGreaterThan(durableWaitScan)
+    expect(turnLock).toBeGreaterThan(sessionLock)
+    expect(rootLock).toBeGreaterThan(turnLock)
+    expect(childLock).toBeGreaterThan(rootLock)
+    expect(taskValidation).toBeGreaterThan(childLock)
+    expect(consumedWaitScan).toBeGreaterThan(taskValidation)
+    expect(queries[repairSessionLock]?.[1]).toEqual([child.sessionId, child.userId])
+    expect(queries[repairTaskLock]?.[1]).toEqual([child.id, child.sessionId, child.turnId, child.rootTaskId, child.userId])
+    expect(queries[consumedRepairScan]?.[1]).toEqual([child.id, 257])
+    expect(queries[repairLeaseFence]?.[1]).toEqual([child.id, child.sessionId, child.turnId, child.rootTaskId, child.ownerId, child.attemptCount])
+    expect(queries[durableWaitTask]?.[1]).toEqual([child.id, child.userId, child.sessionId, child.turnId, child.rootTaskId])
+    expect(queries[durableWaitScan]?.[1]).toEqual([child.userId, child.sessionId, child.turnId, child.id, child.attemptCount])
+    expect(queries[sessionLock]?.[1]).toEqual([child.sessionId, child.userId])
+    expect(queries[turnLock]?.[1]).toEqual([child.turnId, child.sessionId, child.userId])
+    expect(queries[rootLock]?.[1]).toEqual([child.rootTaskId, child.sessionId, child.turnId])
+    expect(queries[childLock]?.[1]).toEqual([child.id, child.sessionId, child.turnId, child.rootTaskId])
+    expect(queries[taskValidation]?.[1]).toEqual([child.id, child.sessionId, child.turnId, child.rootTaskId, child.userId, child.ownerId, child.attemptCount])
+    expect(queries[consumedWaitScan]?.[1]).toEqual([child.userId, child.sessionId, child.turnId, child.id, child.rootTaskId, child.attemptCount])
   })
 
   it("uses the server-owned same-attempt loader and forwards mailbox continuation in production", async () => {

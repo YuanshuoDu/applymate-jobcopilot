@@ -141,7 +141,7 @@ async function start(mode) {
   }
   const runtime = await createCanonicalTurnRuntime(pool, {
     workerId: ownerId, productionFlags: flags, taskGraphCommandPort: createPgTaskGraphCommandPort(pool),
-    taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => { say("P1143_ROOT_USAGE_AUTHORIZER_CALLED"); try { return { settle: async () => undefined } } catch (error) { say(`P1143_ROOT_USAGE_AUTHORIZER_ERROR:${recoveryErrorClass(error, true)}`); throw error } },
+    taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => { say("P1143_ROOT_USAGE_AUTHORIZER_CALLED"); try { return { outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined } } catch (error) { say(`P1143_ROOT_USAGE_AUTHORIZER_ERROR:${recoveryErrorClass(error, true)}`); throw error } },
     ...(manager ? { manager } : {}),
     modelRuntimeFactory: () => { say("P1143_ROOT_MODEL_RUNTIME_FACTORY_ENTERED"); try { const model = rootModelRuntime(); say("P1143_ROOT_MODEL_RUNTIME_FACTORY_CREATED"); return model } catch (error) { say(`P1143_ROOT_MODEL_RUNTIME_FACTORY_ERROR:${recoveryErrorClass(error, true)}`); throw error } },
   })
@@ -149,7 +149,8 @@ async function start(mode) {
   const productionResumeLoader = createProductionChildResumeLoaders(pool).resumeLoader
   if (typeof productionResumeLoader !== "function") throw new Error("p1143_resume_loader_unavailable")
   const executeChild = createProductionChildExecutor({ pool, subagentManager: () => runtime.manager,
-    authorizeUsage: async () => ({ settle: async () => undefined }), jobDiscoveryClient: discoveryClient(),
+    authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
+      settle: async () => undefined, settleUnknown: async () => undefined }), jobDiscoveryClient: discoveryClient(),
     resumeLoader: async lease => {
       try { return await productionResumeLoader(lease) }
       catch (error) { say(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${recoveryErrorClass(error, true)}`); throw error }

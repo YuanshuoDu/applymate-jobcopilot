@@ -792,7 +792,8 @@ describe("child executor composition", () => {
     })
     const executor = createChildExecutor({
       store, treeBudget: budgetStore().store,
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
+        settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => ({ ...runtime, prepareFinalDependencyWait: callback }),
       resumeLoader, durableWaitResumeCommitter: async () => true, now: () => new Date("2026-09-09T11:00:00.000Z"),
     })
@@ -1117,7 +1118,8 @@ describe("child executor composition", () => {
     } }
     const resumeLoader = vi.fn(async () => undefined)
     const executor = createChildExecutor({
-      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
+        settle: async () => undefined, settleUnknown: async () => undefined }),
       modelRuntimeFactory: () => textOnlyModel(JSON.stringify(validScoutResult()), request => requests.push(request)),
       toolRuntimeFactory: () => childToolRuntime([]), resumeLoader, sameAttemptContinuationLoader,
     })
