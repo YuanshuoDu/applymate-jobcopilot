@@ -162,7 +162,7 @@ beforeEach(() => {
 })
 
 describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
-  it('checks current account, feature, AI budget, and effective entitlement before renewal or model work', async () => {
+  it('keeps account and entitlement checks while allowing exhausted quality calls to degrade per package', async () => {
     mocks.active.mockResolvedValue(false)
     const denied = await runScheduledTaskGraphActionRpc(gateRequest())
     expect(denied).toBeInstanceOf(Response)
@@ -174,7 +174,14 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     mocks.active.mockResolvedValue(true)
     mocks.access.mockResolvedValue('exhausted')
     const exhausted = await runScheduledTaskGraphActionRpc(gateRequest())
-    expect((exhausted as Response).status).toBe(429)
+    expect((exhausted as Response).status).toBe(200)
+    expect(mocks.executeGate).toHaveBeenCalledOnce()
+    expect(typeof mocks.executeGate.mock.calls[0]?.[0]?.context?.scheduledGateQualityModelCall).toBe('function')
+
+    mocks.access.mockResolvedValue('disabled')
+    mocks.transaction.mockClear()
+    const disabled = await runScheduledTaskGraphActionRpc(gateRequest())
+    expect((disabled as Response).status).toBe(403)
     expect(mocks.transaction).not.toHaveBeenCalled()
 
     mocks.access.mockResolvedValue('enabled')

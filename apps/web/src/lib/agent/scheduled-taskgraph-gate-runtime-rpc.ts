@@ -20,6 +20,7 @@ import { replayCompletedScheduledTaskGraphAuditReport, replayCompletedScheduledT
 import { blocked, gateFailureDiagnostic, matchingTurnSnapshot, scheduledTaskGraphClaimIsValid, scheduledTaskGraphLineageOwnerIsSame, scheduledTaskGraphRootLeaseIsLive } from './scheduled-taskgraph-pipeline-request'
 import { sameScheduledTaskGraphJson as sameJson } from './scheduled-taskgraph-canonical-prefix'
 import { runScheduledGate } from './stages/gate'
+import { createGateQualityUsageCaller } from './control-plane/gate-quality-usage'
 import { executeScheduledTaskGraphGate } from './scheduled-taskgraph-gate-service'
 import { scheduledTaskGraphAuditExecutionOwner, scheduledTaskGraphExecuteGateCompletionProof, scheduledTaskGraphGateTaskLeaseIsCurrent, scheduledTaskGraphGateTurnIsCurrent, type ScheduledTaskGraphAuditExecuteRpcRequest, type ScheduledTaskGraphExecuteRpcRequest, type ScheduledTaskGraphGateRpcRequest } from './scheduled-taskgraph-gate-rpc'
 import { validateScheduledPrepareWaitIdentity } from './scheduled-taskgraph-run-service'
@@ -63,31 +64,33 @@ async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?:
   const assertFreshCurrent = async () => {
     if (signal?.aborted) return false
     const fresh = await loadScheduledTaskGraphGateInput({ owner: locked.owner, snapshot, analyzeCheckpoint: checkpoint,
-      analyzeAttestation: request.attestation, prepareProof: request.prepareProof,
-      gate: { taskId: request.gateTaskId, attemptCount: request.gateAttemptCount, phase: 'running' } })
-    return Boolean(fresh && sameJson(materialRefs(fresh.materials), materialRefs(loaded.materials))
-      && !signal?.aborted && await db.$transaction(assertCurrent))
+      analyzeAttestation: request.attestation, prepareProof: request.prepareProof, gate: { taskId: request.gateTaskId, attemptCount: request.gateAttemptCount, phase: 'running' } })
+    return Boolean(fresh && sameJson(materialRefs(fresh.materials), materialRefs(loaded.materials)) && !signal?.aborted && await db.$transaction(assertCurrent))
   }
   const configured = await loadUserAiConfig(locked.owner.userId, 'autoApply')
-  const aiConfig = configured.resolvedKey
-    ? { ...configured, usageUserId: locked.owner.userId, usageFeatureKey: 'autoApply', usageRuntime: 'worker' as const }
-    : { ...resolveConfig(APPLYMATE_BACKING), usageUserId: locked.owner.userId, usageFeatureKey: 'autoApply', usageRuntime: 'worker' as const }
+  const baseAiConfig = configured.resolvedKey ? configured : resolveConfig(APPLYMATE_BACKING)
+  const aiConfig = { ...baseAiConfig, usageUserId: locked.owner.userId, usageFeatureKey: 'autoApply', usageRuntime: 'worker' as const }
   const agentConfig = await db.agentConfig.findUnique({ where: { userId: locked.owner.userId } })
   if (!agentConfig) return blocked(409, 'scheduled_pipeline_agent_unavailable')
-  const resume = await db.resume.findFirst({ where: { userId: locked.owner.userId, isDefault: true } })
-    ?? await db.resume.findFirst({ where: { userId: locked.owner.userId }, orderBy: { createdAt: 'desc' } })
+  const resume = await db.resume.findFirst({ where: { userId: locked.owner.userId, isDefault: true } }) ?? await db.resume.findFirst({ where: { userId: locked.owner.userId }, orderBy: { createdAt: 'desc' } })
   if (!resume) return blocked(409, 'scheduled_pipeline_resume_unavailable')
   const overrides = automationRunOverrides({ automation: snapshot })
   const roleConfigs = toRoleConfigMap(await loadRoleConfigs(locked.owner.userId))
+  const qualityOwner = { ...locked.owner, gateTaskId: request.gateTaskId, gateLeaseOwnerId: request.gateLeaseOwnerId,
+    gateAttemptCount: request.gateAttemptCount, continuationKey: locked.key, claimToken: locked.claimToken }
+  const scheduledGateQualityModelCall = createGateQualityUsageCaller({ owner: qualityOwner, signal, lockCurrentOwner: async tx => {
+    const current = await lockOwner(tx, request, signal)
+    return current && current.owner.executionId === locked.owner.executionId && current.owner.executionAttemptCount === locked.owner.executionAttemptCount
+      && current.key === locked.key && current.claimToken === locked.claimToken ? qualityOwner : null } })
   const context: PipelineCtx = {
     userId: locked.owner.userId, sessionId: locked.owner.sessionId, turnId: locked.owner.turnId,
     questionProjectionMode: 'canonical', agentCfg: withAutomationOverrides(pipelineAgentConfigFrom(agentConfig), overrides),
     roleConfigs, resumeText: resumeToText(resume.content as unknown as ResumeContent).slice(0, 2500),
     resumeContent: resume.content as unknown as ResumeContent,
-    defaultResume: { id: resume.id, name: resume.name, templateId: resume.templateId ?? null,
-      templateOptions: resume.templateOptions, directionId: resume.directionId ?? null, basicsDetached: resume.basicsDetached ?? false },
+    defaultResume: { id: resume.id, name: resume.name, templateId: resume.templateId ?? null, templateOptions: resume.templateOptions,
+      directionId: resume.directionId ?? null, basicsDetached: resume.basicsDetached ?? false },
     aiConfig, executionAttempt: { id: locked.owner.executionId, attemptCount: locked.owner.executionAttemptCount },
-    scheduledTaskGraphOwnerFence: { owner: locked.owner, key: locked.key, claimToken: locked.claimToken, assertCurrent: assertFenceCurrent },
+    scheduledTaskGraphOwnerFence: { owner: locked.owner, key: locked.key, claimToken: locked.claimToken, assertCurrent: assertFenceCurrent }, scheduledGateQualityModelCall,
     assertExecutionCurrent: assertFreshCurrent,
     autonomous: snapshot.autoApply, emit: () => undefined, signal,
   }
@@ -95,14 +98,12 @@ async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?:
   try {
     if (!await context.assertExecutionCurrent?.()) throw new AgentExecutionCancelledError()
     failurePhase = 'gate_execution'
-    const result = await executeScheduledTaskGraphGate({ handoff, context,
-      ...(request.validatedChoice !== undefined ? { validatedChoice: request.validatedChoice } : {}),
+    const result = await executeScheduledTaskGraphGate({ handoff, context, ...(request.validatedChoice !== undefined ? { validatedChoice: request.validatedChoice } : {}),
       priorChoices: request.priorChoices ?? [] }, runScheduledGate)
     return Response.json(result)
   } catch (error) {
     return blocked(error instanceof AgentExecutionCancelledError ? 409 : 500,
-      error instanceof AgentExecutionCancelledError ? 'scheduled_pipeline_turn_stale' : 'scheduled_pipeline_execution_failed',
-      gateFailureDiagnostic(failurePhase, error))
+      error instanceof AgentExecutionCancelledError ? 'scheduled_pipeline_turn_stale' : 'scheduled_pipeline_execution_failed', gateFailureDiagnostic(failurePhase, error))
   }
 }
 
@@ -238,7 +239,6 @@ async function admission(userId: string, snapshot: ReturnType<typeof parseSchedu
   if (!await isFeatureAllowed(userId, 'auto_apply')) return blocked(403, 'scheduled_pipeline_entitlement_required')
   const access = await resolveAiAccess(userId)
   if (access === 'disabled') return blocked(403, 'scheduled_pipeline_ai_unavailable')
-  if (access === 'exhausted') return blocked(429, 'scheduled_pipeline_ai_budget_exhausted')
   if (snapshot.autoApply && !await hasEffectiveEntitlement(userId, 'auto_apply')) return blocked(403, 'scheduled_pipeline_entitlement_required')
   return null
 }

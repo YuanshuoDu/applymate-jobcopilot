@@ -75,6 +75,20 @@ type ReadTraceCount = { reached: boolean; rowCount: number | null }
 type PrismaDecimalInstance = Readonly<{ isZero(): boolean; toString(): string }>
 type PrismaDecimalClass = (new (...args: unknown[]) => PrismaDecimalInstance) & { isDecimal?: (value: unknown) => boolean }
 type WebPrismaRuntime = Readonly<{ Prisma: Readonly<{ Decimal: PrismaDecimalClass }> }>
+type GateUsageOwner = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string; gateTaskId: string;
+  gateLeaseOwnerId: string; gateAttemptCount: number; executionId: string; executionAttemptCount: number;
+  continuationKey: string; claimToken: string }>
+type GateUsageAdmission = Readonly<{ userId: string; sessionId: string; turnId: string; stepId: string;
+  executionOwner: Readonly<{ kind: "task"; taskId: string; rootTaskId: string; ownerId: string; attemptCount: number }>;
+  featureKey: "autoApply"; provider: "minimax"; model: "MiniMax-M3"; attemptId: "gate-quality-review";
+  requestedOutputTokens: number; startProtocolVersion: 1; credentialSource: "user" }>
+type UsageBrokerProbe = Readonly<{
+  admitAiUsage(db: never, input: never): Promise<Readonly<{ operationId: string; startProtocolVersion: 0 | 1;
+    outputReservationRequired: boolean; maxOutputTokens: number | null }>>
+  startAiUsage(db: never, input: never): Promise<Readonly<{ startProtocolVersion: 1; outputReservationRequired: boolean;
+    maxOutputTokens: number | null }>>
+}>
+type GateQualityCallerProbe = Readonly<{ createGateQualityUsageCaller(input: never): (call: never) => Promise<unknown> }>
 const requireFromWeb = createRequire(new URL("../../../../web/package.json", import.meta.url))
 type PrepareSourceReadTrace = {
   receiptEvents: ReadTraceCount
@@ -225,6 +239,263 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     restoreEnv("DATABASE_URL", priorDatabaseUrl)
     restoreEnv("AGENT_WEB_URL", priorAgentWebUrl)
     restoreEnv("AGENT_WORKER_SECRET", priorWorkerSecret)
+  })
+
+  it("reserves a bounded fake Gate quality call and settles its BYOK usage in PostgreSQL", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!)
+    fixtureUsers.push(fixture.ids.userId)
+    await seedScheduledAuditAgentConfig(fixture)
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "budgetSnapshot"=$2::jsonb, "outputTokenReservationVersion"=1 WHERE "id"=$1`,
+      [fixture.ids.rootTaskId, JSON.stringify({ limits: { maxOutputTokens: 64 } })])
+    const commandPort = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool!)
+    const response = await setupFetcher(fixture, { useReservedQualityReview: true })
+    const continuation = createScheduledAutomationGateContinuation({ pool: pool as never, commandPort, waitPort,
+      nativeQuestionWaitEnabled: false, fetcher: response.fetcher })
+    const initialGateWait = await continuation({ owner: fixture.owner, executionOwner: fixture.turnExecutionOwner as TurnExecutionOwnerFence,
+      attestation: fixture.attestation, handoff: fixture.handoff, prepareProof: fixture.prepareProof,
+      scheduledWaitId: fixture.prepareChoiceWaitId, finalStepId: fixture.rootQuestionStepId,
+      recoveryStepId: fixture.rootQuestionStepId, signal: new AbortController().signal })
+    expect(initialGateWait.status).toBe("waiting_for_dependency")
+    if (initialGateWait.status !== "waiting_for_dependency") throw new Error("scheduled Gate wait missing")
+    const gateTaskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
+    runner = startRunner(fixture, response.fetcher)
+    await expect(dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)).resolves.toMatchObject({ status: "completed" })
+
+    const usage = await pool!.query<{ status: string; featureKey: string; credentialSource: string; provider: string; model: string;
+      inputTokens: number; outputTokens: number; providerStartedAt: Date | null; reservationStatus: string;
+      outputRequired: boolean; reservedOutputTokens: number; actualOutputTokens: number | null; stepStatus: string;
+      stepInputTokens: number | null; stepOutputTokens: number | null; stepCostUsd: string | number | null; modelProfileSnapshot: unknown }>(
+      `SELECT event.status, event.feature_key AS "featureKey", event.credential_source AS "credentialSource", event.provider,
+        event.model, event.input_tokens AS "inputTokens", event.output_tokens AS "outputTokens", event.provider_started_at AS "providerStartedAt",
+        reservation."status" AS "reservationStatus", reservation."outputReservationRequired" AS "outputRequired",
+        reservation."reservedOutputTokens" AS "reservedOutputTokens", reservation."actualOutputTokens" AS "actualOutputTokens",
+        step."status" AS "stepStatus", step."inputTokens" AS "stepInputTokens", step."outputTokens" AS "stepOutputTokens",
+        step."estimatedCostUsd" AS "stepCostUsd", step."modelProfileSnapshot"
+       FROM ai_usage_events event JOIN "agent_root_usage_reservations" reservation ON reservation."id"=event.id
+       JOIN "agent_steps" step ON step."id"=reservation."stepId"
+       WHERE reservation."sessionId"=$1 AND reservation."taskId"=$2 AND reservation."attemptId"='gate-quality-review'`,
+      [fixture.ids.sessionId, gateTaskId])
+    expect(usage.rows).toHaveLength(1)
+    expect(usage.rows[0]).toMatchObject({ status: "success", featureKey: "autoApply", credentialSource: "user",
+      provider: "minimax", model: "MiniMax-M3", inputTokens: 21, outputTokens: 8, reservationStatus: "settled",
+      outputRequired: true, reservedOutputTokens: 64, actualOutputTokens: 8, stepStatus: "completed",
+      stepInputTokens: 21, stepOutputTokens: 8 })
+    expect(Number(usage.rows[0]?.stepCostUsd)).toBeCloseTo(0.0001, 8)
+    expect(usage.rows[0]?.providerStartedAt).toBeInstanceOf(Date)
+    const gateAggregate = await pool!.query<{ steps: number; inputTokens: string; outputTokens: string; costUsd: string }>(
+      `SELECT COUNT(*)::int AS "steps", COALESCE(SUM(step."inputTokens"),0)::text AS "inputTokens",
+        COALESCE(SUM(step."outputTokens"),0)::text AS "outputTokens",
+        COALESCE(SUM(step."estimatedCostUsd"),0)::text AS "costUsd"
+       FROM "agent_steps" step WHERE step."sessionId"=$1 AND step."taskId"=$2
+        AND step."modelProfileSnapshot" #> '{gateQualityReview}' IS NOT NULL`, [fixture.ids.sessionId, gateTaskId])
+    expect(gateAggregate.rows[0]).toMatchObject({ steps: 1, inputTokens: "21", outputTokens: "8" })
+    expect(Number(gateAggregate.rows[0]?.costUsd)).toBeCloseTo(0.0001, 8)
+    expect(response.gateQualityCalls()).toEqual([64])
+    expect(JSON.stringify(usage.rows[0]?.modelProfileSnapshot)).not.toContain("fixture-user-secret")
+  })
+
+  it("serializes concurrent PostgreSQL admissions for the final AI credit", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!)
+    fixtureUsers.push(fixture.ids.userId)
+    await setRootUsageBudget(fixture, false)
+    const gateTaskId = await setLiveGateUsageTask(fixture, "gate-credit-race-owner", 1)
+    const stepIds = [await createGateUsageStep(fixture, gateTaskId, 1), await createGateUsageStep(fixture, gateTaskId, 1)]
+    mockGateUsageModules(1)
+    const web = await vi.importActual<FixtureWebDatabase>(scheduledWebDbPath)
+    const broker = await vi.importActual<UsageBrokerProbe>("@/lib/agent/control-plane/usage-broker")
+    const owner = await gateUsageOwner(fixture, gateTaskId, "gate-credit-race-owner", 1)
+    const results = await Promise.allSettled(stepIds.map(stepId => broker.admitAiUsage(web.db as never,
+      gateUsageAdmission(owner, stepId) as never)))
+    expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1)
+    const rejected = results.find(result => result.status === "rejected")
+    expect(rejected?.status === "rejected" ? rejected.reason : null).toMatchObject({ code: "ai_credits_exhausted" })
+    const persisted = await pool!.query<{ count: number; status: string }>(
+      `SELECT COUNT(*)::int AS "count", MIN(event.status) AS "status" FROM ai_usage_events event
+       JOIN "agent_root_usage_reservations" reservation ON reservation."id"=event.id
+       WHERE reservation."stepId" = ANY($1::text[])`, [stepIds])
+    expect(persisted.rows[0]).toEqual({ count: 1, status: "reserved" })
+    const budget = await pool!.query<{ used: number; limit: number }>(
+      `SELECT used, "limit" FROM ai_budgets WHERE user_id=$1 AND month=$2`,
+      [fixture.ids.userId, new Date().toISOString().slice(0, 7)])
+    expect(budget.rows).toEqual([{ used: 1, limit: 1 }])
+  })
+
+  it("rejects an admitted Gate call when its task lease is replaced before provider start", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!)
+    fixtureUsers.push(fixture.ids.userId)
+    await setRootUsageBudget(fixture, false)
+    const gateTaskId = await setLiveGateUsageTask(fixture, "gate-old-lease-owner", 1)
+    const oldStepId = await createGateUsageStep(fixture, gateTaskId, 1)
+    const web = await vi.importActual<FixtureWebDatabase>(scheduledWebDbPath)
+    const broker = await vi.importActual<UsageBrokerProbe>("@/lib/agent/control-plane/usage-broker")
+    const oldOwner = await gateUsageOwner(fixture, gateTaskId, "gate-old-lease-owner", 1)
+    const oldAdmission = gateUsageAdmission(oldOwner, oldStepId)
+    const admitted = await broker.admitAiUsage(web.db as never, oldAdmission as never)
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount"=2, "leaseOwner"=$2,
+      "leaseExpiresAt"=CURRENT_TIMESTAMP + INTERVAL '10 minutes' WHERE "id"=$1`, [gateTaskId, "gate-new-lease-owner"])
+    await expect(broker.startAiUsage(web.db as never, { ...oldAdmission, operationId: admitted.operationId,
+      startProtocolVersion: 1 } as never)).rejects.toMatchObject({ code: "usage_fence_rejected" })
+    const beforeReplacementStart = await pool!.query<{ eventStatus: string; providerStartedAt: Date | null; reservationStatus: string }>(
+      `SELECT event.status AS "eventStatus", event.provider_started_at AS "providerStartedAt", reservation."status" AS "reservationStatus"
+       FROM ai_usage_events event JOIN "agent_root_usage_reservations" reservation ON reservation."id"=event.id
+       WHERE reservation."stepId"=$1`, [oldStepId])
+    expect(beforeReplacementStart.rows).toEqual([{ eventStatus: "reserved", providerStartedAt: null, reservationStatus: "reserved" }])
+
+    const newStepId = await createGateUsageStep(fixture, gateTaskId, 2)
+    const newOwner = await gateUsageOwner(fixture, gateTaskId, "gate-new-lease-owner", 2)
+    const newAdmission = gateUsageAdmission(newOwner, newStepId)
+    const replacement = await broker.admitAiUsage(web.db as never, newAdmission as never)
+    await expect(broker.startAiUsage(web.db as never, { ...newAdmission, operationId: replacement.operationId,
+      startProtocolVersion: 1 } as never)).resolves.toMatchObject({ outputReservationRequired: false, maxOutputTokens: null })
+    const afterReplacementStart = await pool!.query<{ taskAttempt: number; eventStatus: string; providerStartedAt: Date | null; reservationStatus: string }>(
+      `SELECT step."attempt" AS "taskAttempt", event.status AS "eventStatus", event.provider_started_at AS "providerStartedAt",
+        reservation."status" AS "reservationStatus" FROM ai_usage_events event
+       JOIN "agent_root_usage_reservations" reservation ON reservation."id"=event.id
+       JOIN "agent_steps" step ON step."id"=reservation."stepId" WHERE reservation."stepId"=ANY($1::text[])
+       ORDER BY step."attempt"`, [ [oldStepId, newStepId] ])
+    expect(afterReplacementStart.rows.map(row => ({ attempt: row.taskAttempt, status: row.eventStatus,
+      started: row.providerStartedAt instanceof Date, reservation: row.reservationStatus }))).toEqual([
+      { attempt: 1, status: "released", started: false, reservation: "released" },
+      { attempt: 2, status: "reserved", started: true, reservation: "started" },
+    ])
+  })
+
+  it("refuses to replay a persisted Gate quality review across execution attempts", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!)
+    fixtureUsers.push(fixture.ids.userId)
+    await setRootUsageBudget(fixture, false)
+    const gateTaskId = await setLiveGateUsageTask(fixture, "gate-replay-owner", 1)
+    mockGateUsageModules(10)
+    const web = await vi.importActual<FixtureWebDatabase>(scheduledWebDbPath)
+    const usage = await vi.importActual<GateQualityCallerProbe>("@/lib/agent/control-plane/gate-quality-usage")
+    const firstOwner = await gateUsageOwner(fixture, gateTaskId, "gate-replay-owner", 1)
+    const input = { jobId: fixture.jobIds[0]!, config: { provider: "minimax", model: "MiniMax-M3", apiKey: "fixture-key" },
+      messages: [{ role: "user", content: "stable Gate quality review input" }], maxTokens: 64 }
+    const firstCall = usage.createGateQualityUsageCaller({ db: web.db, owner: firstOwner,
+      lockCurrentOwner: async () => currentGateUsageOwner(fixture, firstOwner) } as never)
+    await firstCall(input as never)
+    const replacedClaim = `gate-replay-replacement-${randomUUID()}`
+    await replaceExecutionClaim(fixture, 2, replacedClaim)
+    const secondOwner: GateUsageOwner = { ...firstOwner, executionAttemptCount: 2, claimToken: replacedClaim }
+    const replayCall = usage.createGateQualityUsageCaller({ db: web.db, owner: secondOwner,
+      lockCurrentOwner: async () => currentGateUsageOwner(fixture, secondOwner) } as never)
+    await expect(replayCall(input as never)).rejects.toThrow("gate_quality_review_already_attempted")
+    const persisted = await pool!.query<{ stepCount: number; eventCount: number; status: string; reservationStatus: string }>(
+      `SELECT COUNT(DISTINCT step."id")::int AS "stepCount", COUNT(DISTINCT event.id)::int AS "eventCount",
+        MIN(event.status) AS "status", MIN(reservation."status") AS "reservationStatus"
+       FROM "agent_steps" step LEFT JOIN "agent_root_usage_reservations" reservation ON reservation."stepId"=step."id"
+       LEFT JOIN ai_usage_events event ON event.id=reservation."id"
+       WHERE step."sessionId"=$1 AND step."turnId"=$2 AND step."taskId"=$3
+        AND step."modelProfileSnapshot" #>> '{gateQualityReview,logicalReviewKey}' IS NOT NULL`,
+      [fixture.ids.sessionId, fixture.ids.turnId, gateTaskId])
+    expect(persisted.rows).toEqual([{ stepCount: 1, eventCount: 1, status: "success", reservationStatus: "settled" }])
+  })
+
+  it("keeps the output reservation at the provider-start crash cut", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!)
+    fixtureUsers.push(fixture.ids.userId)
+    await setRootUsageBudget(fixture, true)
+    const gateTaskId = await setLiveGateUsageTask(fixture, "gate-crash-cut-owner", 1)
+    const stepId = await createGateUsageStep(fixture, gateTaskId, 1)
+    const web = await vi.importActual<FixtureWebDatabase>(scheduledWebDbPath)
+    const broker = await vi.importActual<UsageBrokerProbe>("@/lib/agent/control-plane/usage-broker")
+    const owner = await gateUsageOwner(fixture, gateTaskId, "gate-crash-cut-owner", 1)
+    const admissionInput = gateUsageAdmission(owner, stepId)
+    const admitted = await broker.admitAiUsage(web.db as never, admissionInput as never)
+    await expect(broker.startAiUsage(web.db as never, { ...admissionInput, operationId: admitted.operationId,
+      startProtocolVersion: 1 } as never)).resolves.toMatchObject({ outputReservationRequired: true, maxOutputTokens: 64 })
+    const cut = await pool!.query<{ eventStatus: string; providerStartedAt: Date | null; inputTokens: number;
+      outputTokens: number; eventCostUsd: string | number; reservationStatus: string; actualOutputTokens: number | null;
+      reservedOutputTokens: number; stepStatus: string; stepInputTokens: number | null; stepOutputTokens: number | null;
+      stepCostUsd: string | number | null }>(
+      `SELECT event.status AS "eventStatus", event.provider_started_at AS "providerStartedAt", event.input_tokens AS "inputTokens",
+        event.output_tokens AS "outputTokens", event.estimated_cost_usd AS "eventCostUsd", reservation."status" AS "reservationStatus",
+        reservation."actualOutputTokens" AS "actualOutputTokens", reservation."reservedOutputTokens" AS "reservedOutputTokens",
+        step."status" AS "stepStatus", step."inputTokens" AS "stepInputTokens", step."outputTokens" AS "stepOutputTokens",
+        step."estimatedCostUsd" AS "stepCostUsd" FROM ai_usage_events event
+       JOIN "agent_root_usage_reservations" reservation ON reservation."id"=event.id
+       JOIN "agent_steps" step ON step."id"=reservation."stepId" WHERE step."id"=$1`, [stepId])
+    expect(cut.rows).toHaveLength(1)
+    expect(cut.rows[0]).toMatchObject({ eventStatus: "reserved", inputTokens: 0, outputTokens: 0,
+      reservationStatus: "started", actualOutputTokens: null, reservedOutputTokens: 64, stepStatus: "streaming",
+      stepInputTokens: null, stepOutputTokens: null, stepCostUsd: null })
+    expect(cut.rows[0]?.providerStartedAt).toBeInstanceOf(Date)
+    expect(Number(cut.rows[0]?.eventCostUsd)).toBe(0)
+  })
+
+  it("stores partial Gate usage as null dimensions and retains the started output hold", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!)
+    fixtureUsers.push(fixture.ids.userId)
+    await setRootUsageBudget(fixture, true)
+    const gateTaskId = await setLiveGateUsageTask(fixture, "gate-unknown-usage-owner", 1)
+    const owner = await gateUsageOwner(fixture, gateTaskId, "gate-unknown-usage-owner", 1)
+    mockGateUsageModules(10, async () => ({ text: "{}", inputTokens: 21, provider: "minimax", model: "MiniMax-M3" }))
+    const web = await vi.importActual<FixtureWebDatabase>(scheduledWebDbPath)
+    const usage = await vi.importActual<GateQualityCallerProbe>("@/lib/agent/control-plane/gate-quality-usage")
+    const call = usage.createGateQualityUsageCaller({ db: web.db, owner,
+      lockCurrentOwner: async () => currentGateUsageOwner(fixture, owner) } as never)
+    await expect(call({ jobId: fixture.jobIds[0]!, config: { provider: "minimax", model: "MiniMax-M3", apiKey: "fixture-key" },
+      messages: [{ role: "user", content: "unknown provider usage" }], maxTokens: 64 } as never))
+      .rejects.toThrow("gate_quality_usage_unknown")
+    const rows = await pool!.query<{ eventStatus: string; inputTokens: number; outputTokens: number; eventCostUsd: string | number;
+      providerStartedAt: Date | null; reservationStatus: string; actualOutputTokens: number | null; reservedOutputTokens: number;
+      stepStatus: string; stepInputTokens: number | null; stepOutputTokens: number | null; stepCostUsd: string | number | null }>(
+      `SELECT event.status AS "eventStatus", event.input_tokens AS "inputTokens", event.output_tokens AS "outputTokens",
+        event.estimated_cost_usd AS "eventCostUsd", event.provider_started_at AS "providerStartedAt",
+        reservation."status" AS "reservationStatus", reservation."actualOutputTokens" AS "actualOutputTokens",
+        reservation."reservedOutputTokens" AS "reservedOutputTokens", step."status" AS "stepStatus",
+        step."inputTokens" AS "stepInputTokens", step."outputTokens" AS "stepOutputTokens",
+        step."estimatedCostUsd" AS "stepCostUsd" FROM ai_usage_events event
+       JOIN "agent_root_usage_reservations" reservation ON reservation."id"=event.id
+       JOIN "agent_steps" step ON step."id"=reservation."stepId"
+       WHERE reservation."sessionId"=$1 AND reservation."taskId"=$2 AND reservation."attemptId"='gate-quality-review'`,
+      [fixture.ids.sessionId, gateTaskId])
+    expect(rows.rows).toHaveLength(1)
+    expect(rows.rows[0]).toMatchObject({ eventStatus: "reserved", inputTokens: 0, outputTokens: 0, reservationStatus: "started",
+      actualOutputTokens: null, reservedOutputTokens: 64, stepStatus: "failed", stepInputTokens: 21,
+      stepOutputTokens: null, stepCostUsd: null })
+    expect(rows.rows[0]?.providerStartedAt).toBeInstanceOf(Date)
+    expect(Number(rows.rows[0]?.eventCostUsd)).toBe(0)
+  })
+
+  it("persists custom-provider pricing as unknown and retains the usage hold", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!)
+    fixtureUsers.push(fixture.ids.userId)
+    await setRootUsageBudget(fixture, false)
+    const gateTaskId = await setLiveGateUsageTask(fixture, "gate-custom-price-owner", 1)
+    const owner = await gateUsageOwner(fixture, gateTaskId, "gate-custom-price-owner", 1)
+    mockGateUsageModules(10, async () => ({ text: "{}", inputTokens: 21, outputTokens: 8,
+      provider: "custom", model: "custom" }), { provider: "custom", model: "custom" })
+    const web = await vi.importActual<FixtureWebDatabase>(scheduledWebDbPath)
+    const usage = await vi.importActual<GateQualityCallerProbe>("@/lib/agent/control-plane/gate-quality-usage")
+    const call = usage.createGateQualityUsageCaller({ db: web.db, owner,
+      lockCurrentOwner: async () => currentGateUsageOwner(fixture, owner) } as never)
+    await expect(call({ jobId: fixture.jobIds[0]!, config: { provider: "custom", model: "custom",
+      apiBase: "https://api.example/v1", apiKey: "fixture-key" },
+    messages: [{ role: "user", content: "known tokens, unknown custom-provider price" }], maxTokens: 64 } as never))
+      .rejects.toThrow("gate_quality_usage_unknown")
+    const rows = await pool!.query<{ provider: string; model: string; eventStatus: string; inputTokens: number; outputTokens: number;
+      eventCostUsd: string | number; providerStartedAt: Date | null; outputRequired: boolean; reservationStatus: string;
+      actualOutputTokens: number | null; reservedOutputTokens: number; stepStatus: string; stepInputTokens: number | null;
+      stepOutputTokens: number | null; stepCostUsd: string | number | null; stepErrorCode: string | null }>(
+      `SELECT event.provider, event.model, event.status AS "eventStatus", event.input_tokens AS "inputTokens",
+        event.output_tokens AS "outputTokens", event.estimated_cost_usd AS "eventCostUsd",
+        event.provider_started_at AS "providerStartedAt", reservation."outputReservationRequired" AS "outputRequired",
+        reservation."status" AS "reservationStatus", reservation."actualOutputTokens" AS "actualOutputTokens",
+        reservation."reservedOutputTokens" AS "reservedOutputTokens", step."status" AS "stepStatus",
+        step."inputTokens" AS "stepInputTokens", step."outputTokens" AS "stepOutputTokens",
+        step."estimatedCostUsd" AS "stepCostUsd", step."errorCode" AS "stepErrorCode"
+       FROM ai_usage_events event JOIN "agent_root_usage_reservations" reservation ON reservation."id"=event.id
+       JOIN "agent_steps" step ON step."id"=reservation."stepId"
+       WHERE reservation."sessionId"=$1 AND reservation."taskId"=$2 AND reservation."attemptId"='gate-quality-review'`,
+      [fixture.ids.sessionId, gateTaskId])
+    expect(rows.rows).toHaveLength(1)
+    expect(rows.rows[0]).toMatchObject({ provider: "custom", model: "custom", eventStatus: "reserved",
+      inputTokens: 0, outputTokens: 0, outputRequired: false, reservationStatus: "started", actualOutputTokens: null,
+      reservedOutputTokens: 0, stepStatus: "failed", stepInputTokens: 21, stepOutputTokens: 8,
+      stepCostUsd: null, stepErrorCode: "gate_quality_usage_unknown" })
+    expect(rows.rows[0]?.providerStartedAt).toBeInstanceOf(Date)
+    expect(Number(rows.rows[0]?.eventCostUsd)).toBe(0)
   })
 
   it.each([
@@ -918,10 +1189,12 @@ async function stopRunner(): Promise<void> {
   await active.queue.close().catch(() => undefined)
   await active.redis.quit().catch(() => active.redis.disconnect())
 }
-async function setupFetcher(fixture: Fixture) {
-  vi.doMock(scheduledGateQualityReviewPath, () => ({ reviewApplicationQuality: async () => ({ kind: "unavailable" }) }))
+async function setupFetcher(fixture: Fixture, options: { useReservedQualityReview?: boolean } = {}) {
+  if (options.useReservedQualityReview) vi.doMock(scheduledGateQualityReviewPath, async importOriginal => importOriginal())
+  else vi.doMock(scheduledGateQualityReviewPath, () => ({ reviewApplicationQuality: async () => ({ kind: "unavailable" }) }))
   const customRoleLookups: CustomAgentRoleLookup[] = []
   const customModelCalls: string[] = []
+  const gateQualityCalls: number[] = []
   const fixtureWebDb = await vi.importActual<FixtureWebDatabase>(scheduledWebDbPath)
   const databaseWithoutCustomAgents = new Proxy(fixtureWebDb.db, {
     get(target, property, receiver) {
@@ -944,15 +1217,24 @@ async function setupFetcher(fixture: Fixture) {
     },
   })
   vi.doMock(scheduledWebDbPath, () => ({ ...fixtureWebDb, db: databaseWithoutCustomAgents }))
-  vi.doMock(scheduledModelRouterPath, () => ({ APPLYMATE_BACKING: "fixture",
-    loadUserAiConfig: async () => ({ resolvedKey: "fixture-key", provider: "fixture", model: "scheduled-audit-route" }),
-    resolveConfig: () => ({ resolvedKey: "fixture-key", provider: "fixture", model: "scheduled-audit-route" }),
+  vi.doMock(scheduledModelRouterPath, () => ({ APPLYMATE_BACKING: { provider: "minimax", model: "MiniMax-M3" },
+    loadUserAiConfig: async () => ({ resolvedKey: "fixture-key", apiKey: "fixture-user-secret", credentialSource: "user",
+      provider: "minimax", model: "MiniMax-M3" }),
+    resolveConfig: () => ({ resolvedKey: "fixture-key", provider: "minimax", model: "MiniMax-M3" }),
+    prepareReservedModelTransport: () => ({ provider: "minimax", model: "MiniMax-M3", credentialSource: "user",
+      chat: async (_messages: unknown, maxTokens: number) => {
+        gateQualityCalls.push(maxTokens)
+        return { text: JSON.stringify({ clScore: 9, fitGap: "No critical gap.", recommendation: "Keep the focused evidence.", readyToApply: true }),
+          inputTokens: 21, outputTokens: 8, provider: "minimax", model: "MiniMax-M3" }
+      } }),
+    estimateAiCostUsd: () => 0.0001,
     modelChat: vi.fn(async (_messages: unknown, config: unknown) => {
       const feature = debugRecord(config)?.usageFeatureKey
       if (typeof feature === "string" && feature.startsWith("custom_")) customModelCalls.push(feature)
       return { text: "fixture model response" }
     }) }))
-  vi.doMock(scheduledEntitlementsPath, () => ({ isFeatureAllowed: async () => true,
+  vi.doMock(scheduledEntitlementsPath, () => ({ getEffectiveEntitlements: async () => ({ limits: { ai_credits: 10 } }),
+    isFeatureAllowed: async () => true,
     hasEffectiveEntitlement: async () => true, resolveAiAccess: async () => "available" }))
   let pipelineOutcome = "not_called"
   let continuation = { gateResume: "not_called", analyzeCheckpoint: "not_checked", continuationKey: "not_checked",
@@ -1455,6 +1737,7 @@ async function setupFetcher(fixture: Fixture) {
     },
     customRoleLookups: () => [...customRoleLookups],
     customModelCalls: () => [...customModelCalls],
+    gateQualityCalls: () => [...gateQualityCalls],
   }
 }
 
@@ -2576,6 +2859,103 @@ async function seedScheduledAuditAgentConfig(fixture: Fixture): Promise<void> {
   await pool!.query(`INSERT INTO "AgentConfig" ("id", "userId", "targetLocations", "targetRoles", "excludeCompanies", "priorityCompanies", "updatedAt")
       VALUES ($1, $2, ARRAY['Dublin']::text[], ARRAY['Software Engineer']::text[], ARRAY[]::text[], ARRAY[]::text[], CURRENT_TIMESTAMP)
       ON CONFLICT ("userId") DO NOTHING`, [`scheduled-audit-agent-config-${fixture.ids.turnId}`, fixture.ids.userId])
+}
+
+async function setRootUsageBudget(fixture: Fixture, strictOutput: boolean): Promise<void> {
+  const budgetSnapshot = strictOutput ? { limits: { maxOutputTokens: 64 } } : { limits: {} }
+  const result = await pool!.query(`UPDATE "sub_agent_tasks" SET "budgetSnapshot"=$2::jsonb,
+    "outputTokenReservationVersion"=$3 WHERE "id"=$1 AND "rootTaskId"=$1`,
+  [fixture.ids.rootTaskId, JSON.stringify(budgetSnapshot), strictOutput ? 1 : null])
+  if (result.rowCount !== 1) throw new Error("scheduled Gate usage root budget missing")
+}
+
+async function setLiveGateUsageTask(fixture: Fixture, leaseOwnerId: string, attemptCount: number): Promise<string> {
+  const taskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
+  const result = await pool!.query(`UPDATE "sub_agent_tasks" SET "status"='running', "attemptCount"=$2, "leaseOwner"=$3,
+    "leaseExpiresAt"=CURRENT_TIMESTAMP + INTERVAL '10 minutes' WHERE "id"=$1 AND "rootTaskId"=$4`,
+  [taskId, attemptCount, leaseOwnerId, fixture.ids.rootTaskId])
+  if (result.rowCount !== 1) throw new Error("scheduled Gate usage task could not be leased")
+  return taskId
+}
+
+async function createGateUsageStep(fixture: Fixture, taskId: string, attempt: number): Promise<string> {
+  const rows = await pool!.query<{ ordinal: number | string }>(`SELECT COALESCE(MAX("ordinal"),-1)+1 AS "ordinal"
+    FROM "agent_steps" WHERE "turnId"=$1 AND "sessionId"=$2`, [fixture.ids.turnId, fixture.ids.sessionId])
+  const ordinal = Number(rows.rows[0]?.ordinal)
+  if (!Number.isSafeInteger(ordinal) || ordinal < 0) throw new Error("scheduled Gate usage step ordinal invalid")
+  const stepId = `scheduled-gate-usage-${randomUUID()}`
+  await pool!.query(`INSERT INTO "agent_steps"
+    ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence",
+     "consumedInputIds", "modelProfileSnapshot", "startedAt")
+    VALUES ($1,$2,$3,$4,$5,$6,'streaming',0,'[]'::jsonb,'{}'::jsonb,CURRENT_TIMESTAMP)`,
+  [stepId, fixture.ids.sessionId, fixture.ids.turnId, taskId, ordinal, attempt])
+  return stepId
+}
+
+async function gateUsageOwner(fixture: Fixture, gateTaskId: string, gateLeaseOwnerId: string,
+  gateAttemptCount: number): Promise<GateUsageOwner> {
+  const execution = await readExecutionState(fixture)
+  const claim = debugRecord(execution.state.scheduledTaskGraphClaim)
+  if (typeof claim?.claimToken !== "string") throw new Error("scheduled Gate usage claim token missing")
+  return { ...fixture.owner, gateTaskId, gateLeaseOwnerId, gateAttemptCount,
+    executionId: fixture.executionOwner.executionId,
+    executionAttemptCount: fixture.executionOwner.executionAttemptCount,
+    continuationKey: fixture.continuationKey, claimToken: claim.claimToken }
+}
+
+async function currentGateUsageOwner(fixture: Fixture, owner: GateUsageOwner): Promise<GateUsageOwner | null> {
+  const [execution, task] = await Promise.all([
+    pool!.query<{ attemptCount: number; state: unknown }>(`SELECT "attemptCount", "state" FROM "agent_executions"
+      WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`, [owner.executionId, owner.userId, owner.sessionId]),
+    pool!.query<{ status: string; leaseOwner: string | null; attemptCount: number; leaseExpiresAt: Date | null }>(
+      `SELECT "status", "leaseOwner", "attemptCount", "leaseExpiresAt" FROM "sub_agent_tasks"
+       WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3 AND "rootTaskId"=$4`,
+      [owner.gateTaskId, owner.sessionId, owner.turnId, owner.rootTaskId]),
+  ])
+  const executionRow = execution.rows[0], taskRow = task.rows[0]
+  const state = debugRecord(executionRow?.state), claim = debugRecord(state?.scheduledTaskGraphClaim)
+  const claimOwner = debugRecord(claim?.owner)
+  const expiresAt = taskRow?.leaseExpiresAt instanceof Date ? taskRow.leaseExpiresAt : new Date(String(taskRow?.leaseExpiresAt ?? ""))
+  if (!executionRow || !taskRow || !claim || !claimOwner || Number(executionRow.attemptCount) !== owner.executionAttemptCount
+    || claim.claimToken !== owner.claimToken || claim.key !== owner.continuationKey
+    || claimOwner.executionId !== owner.executionId || Number(claimOwner.executionAttemptCount) !== owner.executionAttemptCount
+    || taskRow.status !== "running" || taskRow.leaseOwner !== owner.gateLeaseOwnerId
+    || Number(taskRow.attemptCount) !== owner.gateAttemptCount || expiresAt.getTime() <= Date.now()) return null
+  return owner
+}
+
+function gateUsageAdmission(owner: GateUsageOwner, stepId: string): GateUsageAdmission {
+  return { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, stepId,
+    executionOwner: { kind: "task", taskId: owner.gateTaskId, rootTaskId: owner.rootTaskId,
+      ownerId: owner.gateLeaseOwnerId, attemptCount: owner.gateAttemptCount },
+    featureKey: "autoApply", provider: "minimax", model: "MiniMax-M3", attemptId: "gate-quality-review",
+    requestedOutputTokens: 64, startProtocolVersion: 1, credentialSource: "user" }
+}
+
+function mockGateUsageModules(aiCredits: number, chat: () => Promise<unknown> = async () => ({ text: "{}", inputTokens: 21,
+  outputTokens: 8, provider: "minimax", model: "MiniMax-M3" }), transport: Readonly<{ provider: string; model: string }> =
+  { provider: "minimax", model: "MiniMax-M3" }): void {
+  vi.doMock(scheduledEntitlementsPath, () => ({ getEffectiveEntitlements: async () => ({ limits: { ai_credits: aiCredits } }) }))
+  vi.doMock(scheduledModelRouterPath, () => ({ estimateAiCostUsd: (provider: string, model: string) =>
+    provider === "custom" && model === "custom" ? 0 : 0.0001,
+  prepareReservedModelTransport: () => ({ ...transport, credentialSource: "user", chat }) }))
+}
+
+async function replaceExecutionClaim(fixture: Fixture, attemptCount: number, claimToken: string): Promise<void> {
+  const execution = await pool!.query<{ state: unknown }>(`SELECT "state" FROM "agent_executions" WHERE "id"=$1
+    AND "userId"=$2 AND "sessionId"=$3`, [fixture.executionOwner.executionId, fixture.ids.userId, fixture.ids.sessionId])
+  const state = debugRecord(execution.rows[0]?.state), claim = debugRecord(state?.scheduledTaskGraphClaim)
+  const claimOwner = debugRecord(claim?.owner), continuation = debugRecord(state?.scheduledTaskGraphContinuation)
+  const continuationOwner = debugRecord(continuation?.owner)
+  if (!state || !claim || !claimOwner) throw new Error("scheduled Gate usage execution claim missing")
+  const nextState = { ...state,
+    scheduledTaskGraphClaim: { ...claim, claimToken, owner: { ...claimOwner, executionAttemptCount: attemptCount } },
+    ...(continuation && continuationOwner ? { scheduledTaskGraphContinuation: { ...continuation,
+      owner: { ...continuationOwner, executionAttemptCount: attemptCount } } } : {}) }
+  const updated = await pool!.query(`UPDATE "agent_executions" SET "attemptCount"=$4, "state"=$5::jsonb, "updatedAt"=CURRENT_TIMESTAMP
+    WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`,
+  [fixture.executionOwner.executionId, fixture.ids.userId, fixture.ids.sessionId, attemptCount, JSON.stringify(nextState)])
+  if (updated.rowCount !== 1) throw new Error("scheduled Gate usage execution claim was not replaced")
 }
 
 async function readExecutionState(fixture: Fixture): Promise<{ status: string; state: Record<string, unknown> }> {

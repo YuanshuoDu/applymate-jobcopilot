@@ -4,7 +4,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const mocked = vi.hoisted(() => ({ getEffectiveEntitlements: vi.fn() }))
 vi.mock("@/lib/entitlements", () => ({ getEffectiveEntitlements: mocked.getEffectiveEntitlements }))
 
-import { admitAiUsage, settleAiUsage, startAiUsage, type UsageAdmissionInput, type UsageBrokerDatabase, type UsageBrokerQuery, type UsageStartInput } from "./usage-broker"
+import { admitAiUsage, admitAiUsageInTransaction, settleAiUsage, settleAiUsageInTransaction, startAiUsage, startAiUsageInTransaction,
+  type UsageAdmissionInput, type UsageBrokerDatabase, type UsageBrokerQuery, type UsageStartInput } from "./usage-broker"
 import { normalizeUsageOwner } from "./usage-owner-fence"
 
 const input: UsageAdmissionInput = {
@@ -58,7 +59,7 @@ function database(
       try { return await work(typedTx) } finally { unlock() }
     },
   }
-  return { tx, db }
+  return { tx, db, typedTx }
 }
 
 function startInput(admission: UsageAdmissionInput = input): UsageStartInput {
@@ -117,7 +118,8 @@ function startDatabase(start: UsageStartInput, required = false, fence: StartFen
     }]
     if (text.includes('FROM "agent_root_usage_reservations"')) return includeReservation ? [{ ...reservation, status: reservationStatus }] : []
     if (text.includes("SELECT output_reservation_required")) return [{ outputReservationRequired: required,
-      startProtocolVersion: 1, status: "reserved", providerStartedAt: eventStarted ? new Date("2026-11-13T00:00:00.000Z") : null }]
+      startProtocolVersion: 1, status: "reserved", credentialSource: start.credentialSource ?? "platform",
+      providerStartedAt: eventStarted ? new Date("2026-11-13T00:00:00.000Z") : null }]
     if (text.includes('UPDATE "agent_root_usage_reservations"')) {
       if (reservationStatus !== "reserved") return []
       reservationStatus = "started"
@@ -143,10 +145,45 @@ describe("AI usage broker", () => {
 
   it("claims a non-output-reserved provider start once and refuses release after that claim", async () => {
     const start = startInput()
-    const { db } = startDatabase(start)
-    await expect(startAiUsage(db, start)).resolves.toEqual({ startProtocolVersion: 1, outputReservationRequired: false, maxOutputTokens: null })
+    const { db, tx } = startDatabase(start)
+    await expect(startAiUsageInTransaction(tx as unknown as UsageBrokerQuery, start))
+      .resolves.toEqual({ startProtocolVersion: 1, outputReservationRequired: false, maxOutputTokens: null })
     await expect(startAiUsage(db, start)).rejects.toMatchObject({ code: "usage_start_replayed", status: 409 })
     await expect(settleAiUsage(db, { ...start, status: "released" })).rejects.toMatchObject({ code: "usage_attempt_started", status: 409 })
+  })
+
+  it("fails closed when the credential source changes between admission and start", async () => {
+    const start = startInput()
+    const { db, tx } = startDatabase(start)
+
+    await expect(startAiUsage(db, { ...start, credentialSource: "platform" }))
+      .rejects.toMatchObject({ code: "usage_attempt_conflict", status: 409 })
+    expect(tx.$queryRaw.mock.calls.some(([raw]) => sqlText(raw).includes('UPDATE "agent_root_usage_reservations"'))).toBe(false)
+    expect(tx.$queryRaw.mock.calls.some(([raw]) => sqlText(raw).includes("UPDATE ai_usage_events SET provider_started_at"))).toBe(false)
+  })
+
+  it("keeps the started Root output hold when any usage dimension is unknown", async () => {
+    const start = startInput()
+    const { db, tx } = startDatabase(start, true)
+    await startAiUsage(db, start)
+
+    await expect(settleAiUsage(db, { ...start, status: "success", inputTokens: 8, outputTokens: 4,
+      estimatedCostUsd: null })).resolves.toBeUndefined()
+
+    expect(tx.$queryRaw.mock.calls.some(([raw]) => sqlText(raw).includes(`SET "status" = 'settled'`))).toBe(false)
+    expect(tx.$queryRaw.mock.calls.some(([raw]) => sqlText(raw).includes("UPDATE ai_usage_events SET status"))).toBe(false)
+  })
+
+  it("settles known usage through the caller-owned transaction", async () => {
+    const start = startInput()
+    const { db, tx } = startDatabase(start, true)
+    await startAiUsage(db, start)
+
+    await expect(settleAiUsageInTransaction(tx as unknown as UsageBrokerQuery, { ...start, status: "success",
+      inputTokens: 8, outputTokens: 4, estimatedCostUsd: 0.01 })).resolves.toBeUndefined()
+
+    expect(tx.$queryRaw.mock.calls.some(([raw]) => sqlText(raw).includes(`SET "status" = 'settled'`))).toBe(true)
+    expect(tx.$queryRaw.mock.calls.some(([raw]) => sqlText(raw).includes("UPDATE ai_usage_events SET status"))).toBe(true)
   })
 
   it("fails closed when the usage event requires an output hold but its hold is missing", async () => {
@@ -212,6 +249,24 @@ describe("AI usage broker", () => {
     expect(inserted.text).toContain("usage_start_protocol_version")
     expect(inserted.values).toContain(0)
     expect(inserted.values).toEqual(expect.arrayContaining([input.userId, input.featureKey, input.provider, input.model]))
+  })
+
+  it("admits inside a caller-owned transaction without opening a nested transaction", async () => {
+    mocked.getEffectiveEntitlements.mockResolvedValue({ limits: { ai_credits: 2 } })
+    let step = 0
+    const { tx, typedTx } = database(async () => {
+      step += 1
+      if (step === 2) return [{ id: input.stepId }]
+      if (step === 4) return [{ id: "agent-usage-inserted" }]
+      if (step === 6) return [{ used: 1 }]
+      return []
+    })
+    const scopedTx: UsageBrokerQuery = typedTx
+
+    const result = await admitAiUsageInTransaction(scopedTx, input, new Date("2026-09-07T12:00:00.000Z"))
+
+    expect(result.operationId).toMatch(/^agent-usage-[a-f0-9]{64}$/)
+    expect(tx.$queryRaw.mock.calls.some(([raw]) => sqlText(raw).includes("INSERT INTO ai_usage_events"))).toBe(true)
   })
 
   it("returns the serialized Root output allowance and persists that admitted ceiling", async () => {
