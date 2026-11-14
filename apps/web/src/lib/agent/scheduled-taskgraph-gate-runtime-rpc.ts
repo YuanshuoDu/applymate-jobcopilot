@@ -23,6 +23,7 @@ import { runScheduledGate } from './stages/gate'
 import { createGateQualityUsageCaller } from './control-plane/gate-quality-usage'
 import { executeScheduledTaskGraphGate } from './scheduled-taskgraph-gate-service'
 import { scheduledTaskGraphAuditExecutionOwner, scheduledTaskGraphExecuteGateCompletionProof, scheduledTaskGraphGateTaskLeaseIsCurrent, scheduledTaskGraphGateTurnIsCurrent, type ScheduledTaskGraphAuditExecuteRpcRequest, type ScheduledTaskGraphExecuteRpcRequest, type ScheduledTaskGraphGateRpcRequest } from './scheduled-taskgraph-gate-rpc'
+import { lockScheduledTaskGraphRootAction, scheduledGateWaitAttemptMatchesCurrentHistory } from './scheduled-taskgraph-gate-root-wait'
 import { validateScheduledPrepareWaitIdentity } from './scheduled-taskgraph-run-service'
 import { authorizeScheduledAuditContinuation, resolveScheduledTaskGraphAuditClaimOwner, scheduledTaskGraphPrepareWaitId, validateScheduledTaskGraphAuditPrepareSource } from './scheduled-taskgraph-audit-action'
 import type { PipelineCtx } from './pipeline-context'
@@ -145,15 +146,9 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
       && !scheduledTaskGraphGateTurnIsCurrent(turn, { owner: request.owner, mode: request.action === 'gate' ? 'gate_child' : 'root_execute' })) return null
   const snapshot = matchingTurnSnapshot(turn.input)
   if (!snapshot) return null
-  const roots = await tx.$queryRaw<Array<{ id: string; sessionId: string; turnId: string; rootTaskId: string;
-    parentTaskId: string | null; status: string; attemptCount: number; interruptRequestedAt: Date | null; closedAt: Date | null }>>(Prisma.sql`
-    SELECT "id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "status", "attemptCount", "interruptRequestedAt", "closedAt"
-    FROM "sub_agent_tasks" WHERE "id" = ${request.owner.rootTaskId} AND "sessionId" = ${request.owner.sessionId}
-      AND "turnId" = ${request.owner.turnId} AND "rootTaskId" = ${request.owner.rootTaskId} AND "parentTaskId" IS NULL FOR UPDATE
-  `)
-  const root = roots[0]
-  if (!root || (request.action === 'scheduled_audit_execute' ? !['running', 'waiting'].includes(root.status) : root.status !== 'running')
-    || root.attemptCount !== request.owner.rootAttemptCount || root.interruptRequestedAt || root.closedAt) return null
+  const rootLock = await lockScheduledTaskGraphRootAction(tx, { owner: request.owner, action: request.action, turn,
+    ...(request.action === 'gate' ? { gateTaskId: request.gateTaskId } : {}) })
+  if (!rootLock) return null
   const taskId = request.action === 'gate' ? request.gateTaskId : gateCompletion!.taskId
   const attemptCount = request.action === 'gate' ? request.gateAttemptCount : gateCompletion!.attemptCount
   const gateRows = await tx.$queryRaw<Array<Record<string, unknown>>>(Prisma.sql`
@@ -203,6 +198,8 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
     ? validateScheduledTaskGraphAuditPrepareSource : validateScheduledPrepareWaitIdentity
   const prepareIsCurrent = await validatePrepare({ owner, snapshot, proof: request.prepareProof, ...(waitId ? { scheduledWaitId: waitId } : {}) }).catch(() => false)
   if (!proofCurrent || !prepareIsCurrent) return null
+  if (request.action === 'gate' && rootLock.gateWait
+    && !await scheduledGateWaitAttemptMatchesCurrentHistory(tx, request.owner, request.gateTaskId, rootLock.gateWait.requestAttemptCount)) return null
   const parsedAttestation = parseScheduledTaskGraphAttestation(request.attestation)
   const ids = parsedAttestation ? [...scheduledTaskGraphAttestationCandidates(parsedAttestation).selectedJobIds] : null
   if (!ids) return null

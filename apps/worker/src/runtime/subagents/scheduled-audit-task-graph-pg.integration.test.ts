@@ -10,6 +10,7 @@ import { TurnEngine } from "../turns/turn-engine.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { createCanonicalSessionProjection } from "../canonical-session-projection.js"
 import type { TurnEngineOptions, TurnEngineResult } from "../turns/turn-engine-types.js"
+import { SCHEDULED_PIPELINE_COMPLETION } from "../turns/turn-execution-types.js"
 import { runTurnJob } from "../turns/turn-queue.js"
 import { dispatchPendingTurnOutbox } from "../turns/recovery-scanner.js"
 import { drainAgentWakeups } from "../wakeup/consumer.js"
@@ -23,6 +24,7 @@ import { createScheduledPipelineCandidateStore, SCHEDULED_PIPELINE_CANDIDATE_EVE
 import { readScheduledPipelineRecoveryStepProfile, SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY } from "./scheduled-pipeline-recovery-step.js"
 import { classifyScheduledPipelineRecoveryGraphItem } from "./scheduled-pipeline-recovery-graph-item.js"
 import { attachScheduledPipelineCompletion } from "./scheduled-pipeline-completion.js"
+import { mapScheduledGateContinuationResult } from "./scheduled-pipeline-post-gate-completion.js"
 import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
 import { createScheduledAutomationPrepareContinuation } from "./scheduled-automation-prepare-bridge.js"
 import { createScheduledGateChildExecutor } from "./scheduled-gate-child-runtime.js"
@@ -751,18 +753,52 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     await expect(fixture.reattestCurrentTurn(fixture.turnLease)).resolves.toEqual(fixture.attestation)
     await seedScheduledAuditAgentConfig(fixture)
     const command = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool!)
-    const turnOwner = fixture.turnExecutionOwner as TurnExecutionOwnerFence
     const sourceStepId = fixture.rootQuestionStepId
     const response = await setupFetcher(fixture)
-    const continuation = createScheduledAutomationGateContinuation({ pool: pool as never, commandPort: command,
-      waitPort, nativeQuestionWaitEnabled: false, fetcher: response.fetcher })
-    const input = { owner: fixture.owner, executionOwner: turnOwner, attestation: fixture.attestation,
-      handoff: fixture.handoff, prepareProof: fixture.prepareProof, scheduledWaitId: fixture.prepareChoiceWaitId,
-      finalStepId: sourceStepId, recoveryStepId: sourceStepId, signal: new AbortController().signal }
-    const initialGateWait = await continuation(input)
-    expect(initialGateWait.status).toBe("waiting_for_dependency")
-    if (initialGateWait.status !== "waiting_for_dependency") throw new Error("scheduled Audit Gate wait missing")
+    const initialRootStore = createPgRootTaskStore(pool as never)
+    const initialSessionProjection = createCanonicalSessionProjection(pool as never)
+    const initialProjectionIdentity = { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId }
+    await initialSessionProjection.start(initialProjectionIdentity)
+    const initialRootWait = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort,
+      "waiting_for_dependency", undefined, undefined, fixture.turnLease, undefined, true)
+    expect(initialRootWait.status).toBe("waiting_for_dependency")
+    if (initialRootWait.status !== "waiting_for_dependency" || !initialRootWait.waitId) {
+      throw new Error(`scheduled Audit Gate root wait missing: ${JSON.stringify(initialRootWait)}`)
+    }
+    const initialGateWait = { status: "waiting_for_dependency" as const, waitId: initialRootWait.waitId }
+    await initialRootStore.finish({ lease: fixture.turnLease, rootTaskId: fixture.ids.rootTaskId, result: initialRootWait })
+    await initialSessionProjection.finish({ ...initialProjectionIdentity, result: { status: initialRootWait.status } })
+    await suspendAndReleaseWait(pool as never, { lease: fixture.turnLease, waitId: initialGateWait.waitId })
     const gateTaskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
+    const [rootHandoff, turnHandoff, waitHandoff, stepHandoff] = await Promise.all([
+      pool!.query<{ status: string; result: unknown; attemptCount: number }>(`SELECT "status", "result", "attemptCount"
+        FROM "sub_agent_tasks" WHERE "id"=$1`, [fixture.ids.rootTaskId]),
+      pool!.query<{ status: string; leaseOwnerId: string | null; leaseExpiresAt: Date | null }>(`SELECT "status", "leaseOwnerId", "leaseExpiresAt"
+        FROM "agent_turns" WHERE "id"=$1`, [fixture.ids.turnId]),
+      pool!.query<{ id: string; userId: string; sessionId: string; turnId: string; parentTaskId: string; stepId: string;
+        idempotencyKey: string; targetTaskIds: unknown; mode: string; status: string; matchedTaskIds: unknown; result: unknown;
+        suspendedAt: Date | null; consumedAt: Date | null }>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId",
+          "idempotencyKey", "targetTaskIds", "mode", "status", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
+        FROM "agent_wait_conditions" WHERE "id"=$1`, [initialGateWait.waitId]),
+      pool!.query<{ id: string; taskId: string | null; attempt: number; status: string }>(`SELECT "id", "taskId", "attempt", "status"
+        FROM "agent_steps" WHERE "id"=$1`, [sourceStepId]),
+    ])
+    const waitKey = `scheduled-gate-wait:${createHash("sha256").update(JSON.stringify([gateTaskId, sourceStepId, 0]), "utf8").digest("hex")}`
+    const rootState = rootHandoff.rows[0], turnState = turnHandoff.rows[0]
+    const waitState = waitHandoff.rows[0], stepState = stepHandoff.rows[0]
+    const waitResult = debugRecord(waitState?.result), waitRequest = debugRecord(waitResult?.request)
+    expect(rootState).toMatchObject({ status: "waiting", attemptCount: fixture.owner.rootAttemptCount })
+    expect(debugRecord(rootState?.result)).toMatchObject({ status: "waiting_for_dependency", waitId: initialGateWait.waitId })
+    expect(turnState).toEqual({ status: "waiting_for_dependency", leaseOwnerId: null, leaseExpiresAt: null })
+    expect(waitState).toMatchObject({ id: initialGateWait.waitId, userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
+      turnId: fixture.ids.turnId, parentTaskId: fixture.ids.rootTaskId, stepId: sourceStepId,
+      idempotencyKey: waitKey, mode: "any", status: "waiting", suspendedAt: expect.any(Date), consumedAt: null })
+    expect(waitState?.targetTaskIds).toEqual([gateTaskId])
+    expect(waitState?.matchedTaskIds).toEqual([])
+    expect(waitRequest).toEqual({ targetTaskIds: [gateTaskId], mode: "any", timeoutMs: 86_400_000,
+      scheduledGate: { gateTaskId, requestAttemptCount: 0 } })
+    expect(stepState).toMatchObject({ id: sourceStepId, attempt: 1, status: "waiting_for_tool" })
+    expect([fixture.ids.rootTaskId, null]).toContain(stepState?.taskId)
     runner = startRunner(fixture, response.fetcher)
     const gateOutcome = await dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)
     if (!gateOutcome || typeof gateOutcome !== "object" || !("status" in gateOutcome) || gateOutcome.status !== "completed") {
@@ -1092,7 +1128,7 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
   expectedStatus?: "waiting_for_dependency",
   afterAuditWait?: (recoveryStepId: string, mode: "append_audit" | "resume_audit", scope: ScheduledAuditRecoveryScope) => Promise<void>,
   afterAuditCompletion?: (recoveryStepId: string, mode: "append_audit" | "resume_audit") => Promise<void>,
-  activeLease: TurnLease = fixture.turnLease, onModelStream?: () => void): Promise<TurnEngineResult> {
+  activeLease: TurnLease = fixture.turnLease, onModelStream?: () => void, useDirectGateWaitContinuation = false): Promise<TurnEngineResult> {
   const phases: Array<{ phase: string; outcome?: string; errorClass?: string; errorCode?: string }> = []
   const safeStatuses = new Set(["ready", "blocked", "not_registered", "completed", "waiting_for_dependency", "waiting_for_choice",
     "waiting_for_external_user", "waiting_for_user", "invalid", "failed", "interrupted"])
@@ -1185,15 +1221,23 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
     const baseCompletionGate: NonNullable<TurnEngineOptions["completionGate"]> = async () => observe("root.completion_verifier",
       () => checkRootCompletion.call(rootStore, { lease, rootTaskId: fixture.ids.rootTaskId, taskGraphVerification: true }),
       result => result.ok ? "allowed" : "blocked")
-    const completionGate = attachScheduledPipelineCompletion({ gate: baseCompletionGate, owner,
-      async bridge() {
-        const attestation = await observe("pipeline.bridge", () => fixture.reattestCurrentTurn(lease), () => "reattested")
-        return { status: "ready" as const, attestation }
-      },
-      continueAfterAnalyze: prepareContinuation, continueAfterGate: gateContinuation, fetcher: tracedFetcher,
-      stageCandidate: input => observe("candidate.stage", () => candidateStore.stage(input), () => "staged"),
-      onWebAccepted() { phases.push({ phase: "web.accepted", outcome: "called" }) },
-      rootAttemptCount: owner.rootAttemptCount, recoveredCandidate })
+    const completionGate = useDirectGateWaitContinuation
+      ? Object.assign(baseCompletionGate, { [SCHEDULED_PIPELINE_COMPLETION]: async (input: Parameters<NonNullable<NonNullable<TurnEngineOptions["completionGate"]>[typeof SCHEDULED_PIPELINE_COMPLETION]>>[0]) => {
+        const result = await observe("continue_after_gate.initial_wait", () => gateContinuation({ owner,
+          executionOwner, attestation: fixture.attestation, handoff: fixture.handoff, prepareProof: fixture.prepareProof,
+          scheduledWaitId: fixture.prepareChoiceWaitId, finalStepId: fixture.rootQuestionStepId,
+          recoveryStepId: input.stepId, signal: input.signal }))
+        return mapScheduledGateContinuationResult(result, input.candidateText)
+      } })
+      : attachScheduledPipelineCompletion({ gate: baseCompletionGate, owner,
+        async bridge() {
+          const attestation = await observe("pipeline.bridge", () => fixture.reattestCurrentTurn(lease), () => "reattested")
+          return { status: "ready" as const, attestation }
+        },
+        continueAfterAnalyze: prepareContinuation, continueAfterGate: gateContinuation, fetcher: tracedFetcher,
+        stageCandidate: input => observe("candidate.stage", () => candidateStore.stage(input), () => "staged"),
+        onWebAccepted() { phases.push({ phase: "web.accepted", outcome: "called" }) },
+        rootAttemptCount: owner.rootAttemptCount, recoveredCandidate })
     const profile: ModelAdapter["profile"] = { provider: "fixture", model: "scheduled-audit-root", nativeTools: true,
       structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false,
       supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false,
