@@ -10,7 +10,7 @@ const lease = {
   id: "parent-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
   ownerId: "worker-1", attemptCount: 3, leaseExpiresAt: new Date(now.getTime() + 60_000),
 }
-function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinals?: number[]; sourceOrdinal?: number; ownerId?: string; receiptWaitId?: string; missingResult?: boolean; callStatus?: string; callIdempotencyKey?: string; lateTerminal?: boolean; waitStatus?: "ready" | "timed_out"; mode?: string; targetId?: string; taskResultNote?: string; waitTargetTaskIds?: unknown; inputTaskIds?: unknown; outcomeTaskIds?: unknown; outcomeTaskId?: unknown; receiptTaskIds?: unknown; receiptTaskId?: unknown; misboundTarget?: boolean } = {}) {
+function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinals?: number[]; sourceOrdinal?: number; ownerId?: string; receiptWaitId?: string; missingResult?: boolean; callStatus?: string; callIdempotencyKey?: string; lateTerminal?: boolean; waitStatus?: "ready" | "timed_out"; mode?: string; targetId?: string; taskResultNote?: string; waitTargetTaskIds?: unknown; inputTaskIds?: unknown; outcomeTaskIds?: unknown; outcomeTaskId?: unknown; receiptTaskIds?: unknown; receiptTaskId?: unknown; misboundTarget?: boolean; waitMatchedTaskIds?: string[] } = {}) {
   const calls: { sql: string; params: unknown[] }[] = []
   const state = { consumedAt: options.consumed ? now : null, acknowledgements: 0 }
   const waitStatus = options.waitStatus ?? "ready"
@@ -18,7 +18,7 @@ function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinal
   const targetId = options.targetId ?? "child-1"
   const targetTaskIds: unknown = options.waitTargetTaskIds ?? (options.lateTerminal ? [targetId, "child-2"] : [targetId])
   const deadlineAt = new Date(now.getTime() + (waitStatus === "timed_out" ? -5_000 : 5_000))
-  const matchedTaskIds = [targetId]
+  const matchedTaskIds = [targetId], waitMatchedTaskIds = options.waitMatchedTaskIds ?? matchedTaskIds
   const taskResult = options.taskResultNote ? { answer: 42, note: options.taskResultNote } : { answer: 42 }
   const snapshotTasks = [
     { taskId: options.outcomeTaskId ?? targetId, status: "completed", role: "writer", result: taskResult, failureReason: null },
@@ -27,7 +27,7 @@ function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinal
   const outcome = { waitId: "wait-1", status: waitStatus, taskIds: options.outcomeTaskIds ?? targetTaskIds, deadlineAt: deadlineAt.toISOString(), matchedTaskIds,
     tasks: snapshotTasks }
   const wait = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", stepId: "step-1",
-    idempotencyKey: "wait-key", targetTaskIds, mode: "any", status: waitStatus, deadlineAt, resolvedAt: now, matchedTaskIds,
+    idempotencyKey: "wait-key", targetTaskIds, mode: "any", status: waitStatus, deadlineAt, resolvedAt: now, matchedTaskIds: waitMatchedTaskIds,
     result: { request: { targetTaskIds, mode, timeoutMs: 5_000 }, outcome }, suspendedAt: now, consumedAt: state.consumedAt }
   wait.mode = mode
   const currentTargets = [
@@ -199,6 +199,33 @@ describe("durable child wait resume", () => {
     await expect(loadDurableSubagentWaitResume(foreignReceipt.pool as never, lease, now)).rejects.toMatchObject({ code: "wait_scope_error" })
     const arbitraryRecovery = fixture({ missingResult: true, callStatus: "started", callIdempotencyKey: "other-wait-key" })
     await expect(loadDurableSubagentWaitResume(arbitraryRecovery.pool as never, lease, now)).rejects.toMatchObject({ code: "wait_scope_error" })
+  })
+
+  it("reports fixed validation stages while preserving wait-scope failures", async () => {
+    const stale = fixture({ ownerId: "other-worker" })
+    await expect(loadDurableSubagentWaitResume(stale.pool as never, lease, now)).rejects.toMatchObject({
+      code: "wait_scope_error", resumeValidationStage: "lease_fence",
+    })
+    const invalidTargets = fixture({ waitTargetTaskIds: ["foreign-child"] })
+    await expect(loadDurableSubagentWaitResume(invalidTargets.pool as never, lease, now)).rejects.toMatchObject({
+      code: "wait_scope_error", resumeValidationStage: "wait_result_shape",
+    })
+    const foreignTarget = fixture({ misboundTarget: true })
+    await expect(loadDurableSubagentWaitResume(foreignTarget.pool as never, lease, now)).rejects.toMatchObject({
+      code: "wait_scope_error", resumeValidationStage: "target_scope",
+    })
+    const inconsistentMatch = fixture({ waitMatchedTaskIds: [] })
+    await expect(loadDurableSubagentWaitResume(inconsistentMatch.pool as never, lease, now)).rejects.toMatchObject({
+      code: "wait_scope_error", resumeValidationStage: "resolved_outcome",
+    })
+    const unavailableCall = fixture({ callStatus: "failed" })
+    await expect(loadDurableSubagentWaitResume(unavailableCall.pool as never, lease, now)).rejects.toMatchObject({
+      code: "wait_scope_error", resumeValidationStage: "tool_call",
+    })
+    const foreignReceipt = fixture({ receiptWaitId: "wait-other" })
+    await expect(loadDurableSubagentWaitResume(foreignReceipt.pool as never, lease, now)).rejects.toMatchObject({
+      code: "wait_scope_error", resumeValidationStage: "tool_receipt",
+    })
   })
 
   it("fences acknowledgement by the current owner after a same-attempt reissue", async () => {

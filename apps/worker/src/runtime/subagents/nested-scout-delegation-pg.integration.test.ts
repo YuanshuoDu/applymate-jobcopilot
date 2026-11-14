@@ -84,12 +84,13 @@ const SAFE_WAIT_RESUME_STAGES = [
   "source_result_completion_content", "source_waiting_output_missing", "source_event_chain", "reconciliation", "safe_result_shape",
   "source_start_event", "other",
 ] as const
-const SAFE_CHILD_RESUME_SOURCE_LIFECYCLE_STAGES = [
+const SAFE_CHILD_RESUME_VALIDATION_STAGES = [
   "required_value", "resume_scope", "source_step", "source_call_count", "source_call_input", "source_item_set", "wait_record_shape", "provenance_marker",
   "source_receipt_missing", "source_marker_without_result", "source_recovered_receipt_mismatch", "source_waiting_content", "source_waiting_output_shape",
   "source_waiting_identity", "source_waiting_targets", "source_waiting_matched_ids", "source_waiting_tasks", "source_waiting_task_ids", "source_waiting_deadline",
   "source_initial_call_shape", "source_call_completion_state", "source_result_completion_state", "source_call_completion_content", "source_result_completion_content",
-  "source_waiting_output_missing", "source_event_chain", "reconciliation", "safe_result_shape", "source_start_event", "other",
+  "source_waiting_output_missing", "source_event_chain", "reconciliation", "safe_result_shape", "source_start_event", "lease_fence", "source_ordinal",
+  "wait_state", "wait_result_shape", "target_scope", "resolved_outcome", "tool_call", "tool_receipt", "input_target_ids", "output_target_ids", "other",
 ] as const
 const SAFE_RELATED_EVENT_TYPES = new Set([
   "item.started", "item.delta", "item.completed", "item.failed", "item.interrupted",
@@ -118,7 +119,7 @@ function isSafeRootSetupDiagnostic(value: string): boolean {
 function isSafeChildResumeLoaderDiagnostic(value: string): boolean {
   const match = value.match(/^P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:(repair_consumed_waits|durable_wait_resume|child_attempt_resume):([A-Za-z0-9_]+):([A-Za-z0-9_]+)$/)
   return !!match && SAFE_CHILD_RESUME_LOADER_CODES.includes(match[2] as typeof SAFE_CHILD_RESUME_LOADER_CODES[number])
-    && SAFE_CHILD_RESUME_SOURCE_LIFECYCLE_STAGES.includes(match[3] as typeof SAFE_CHILD_RESUME_SOURCE_LIFECYCLE_STAGES[number])
+    && SAFE_CHILD_RESUME_VALIDATION_STAGES.includes(match[3] as typeof SAFE_CHILD_RESUME_VALIDATION_STAGES[number])
 }
 
 function seenMainProgress(output: string[]) {
