@@ -9,7 +9,7 @@ type Queryable = TurnEngineQueryClient
 type Pool = TurnEnginePool
 type Row = Record<string, unknown>
 type ResumeLease = Pick<SubagentLease, "id" | "userId" | "sessionId" | "turnId" | "rootTaskId" | "ownerId" | "attemptCount" | "leaseExpiresAt">
-type ResumeValidationStage = "lease_fence" | "source_ordinal" | "wait_state" | "wait_result_shape" | "target_scope" | "resolved_outcome" | "tool_call" | "tool_receipt" | "input_target_ids" | "output_target_ids"
+type ResumeValidationStage = "lease_fence" | "source_ordinal" | "wait_state" | "wait_result_shape" | "target_scope" | "resolved_outcome" | "tool_call" | "call_binding" | "receipt_pair" | "receipt_identity" | "receipt_ids" | "receipt_deadline" | "input_target_ids" | "output_target_ids"
 class DurableWaitResumeScopeError extends DurableSubagentWaitError {
   constructor(readonly resumeValidationStage: ResumeValidationStage, message: string) { super("wait_scope_error", message) }
 }
@@ -58,15 +58,16 @@ function markValidatedInputIds(input: Record<string, unknown>, ids: readonly str
   const inputIds = strictIds(input.taskIds), outcome = inputIds && { taskIds: inputIds, matchedTaskIds: [], tasks: inputIds.map(taskId => ({ taskId })) }
   if (!inputIds || !outcome || !sameIds(inputIds, ids) || !markCanonicalSubagentWaitTargetIds({ targetTaskIds: inputIds }, outcome, inputIds)) resumeScopeError("input_target_ids", "Child wait input target IDs changed scope")
 }
-function validReceipt(content: unknown, wait: Row, ids: readonly string[], toolCallId: string): boolean {
+function receiptFailureStage(content: unknown, wait: Row, ids: readonly string[], toolCallId: string): ResumeValidationStage | undefined {
   const result = object(content), receipt = object(result.output), taskIds = strictIds(receipt.taskIds), matched = strictIds(receipt.matchedTaskIds, 0)
   const tasks = Array.isArray(receipt.tasks) ? receipt.tasks : [], listed = tasks.map(task => object(task).taskId)
   if (!receipt || result.toolCallId !== toolCallId || result.errorCode !== null && result.errorCode !== undefined
-    || receipt.waitId !== wait.id || receipt.status !== "waiting" || !taskIds || !matched
+    || receipt.waitId !== wait.id || receipt.status !== "waiting") return "receipt_identity"
+  if (!taskIds || !matched
     || !sameIds(taskIds, ids) || matched.length !== 0 || tasks.length !== ids.length
-    || !listed.every((id): id is string => typeof id === "string") || !sameIds(listed as string[], ids)) return false
-  try { return dateValue(receipt.deadlineAt, "receipt.deadlineAt").getTime() === dateValue(wait.deadlineAt, "deadlineAt").getTime() }
-  catch { return false }
+    || !listed.every((id): id is string => typeof id === "string") || !sameIds(listed as string[], ids)) return "receipt_ids"
+  try { return dateValue(receipt.deadlineAt, "receipt.deadlineAt").getTime() === dateValue(wait.deadlineAt, "deadlineAt").getTime() ? undefined : "receipt_deadline" }
+  catch { return "receipt_deadline" }
 }
 
 function matchingWaitCall(value: unknown, wait: Row, ids: readonly string[]): string | undefined {
@@ -156,10 +157,12 @@ export async function loadDurableSubagentWaitResume(pool: Pool, lease: ResumeLea
     const resultRows = toolCallId ? (await client.query<Row>(`SELECT "id", "content", "status" FROM "agent_items"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $5
       ORDER BY "createdAt" DESC, "id" DESC LIMIT 2 FOR SHARE`, [lease.sessionId, lease.turnId, lease.id, step.id, toolCallId])).rows : []
-    if (!toolCallId || resultRows.length > 1 || resultRows.length === 1 && (callRows[0].callStatus !== "completed"
-      || resultRows[0].status !== "completed" || !validReceipt(resultRows[0].content, wait, ids, toolCallId))) {
-      resumeScopeError("tool_receipt", "Child wait tool call does not match the durable wait")
-    }
+    if (!toolCallId) resumeScopeError("call_binding", "Child wait tool call does not match the durable wait")
+    const invalidReceiptPair = resultRows.length > 1 || resultRows.length === 1
+      && (callRows[0].callStatus !== "completed" || resultRows[0].status !== "completed")
+    const receiptStage = invalidReceiptPair ? "receipt_pair"
+      : resultRows.length === 1 ? receiptFailureStage(resultRows[0].content, wait, ids, toolCallId) : undefined
+    if (receiptStage) resumeScopeError(receiptStage, "Child wait tool call does not match the durable wait")
     markValidatedInputIds(input, ids)
     const outputIds = strictIds(outcome.taskIds)
     if (!outputIds || !markCanonicalSubagentWaitTargetIds({ targetTaskIds: outputIds }, outcome, outputIds)) {

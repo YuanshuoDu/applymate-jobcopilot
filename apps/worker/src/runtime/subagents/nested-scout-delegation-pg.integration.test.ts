@@ -90,7 +90,8 @@ const SAFE_CHILD_RESUME_VALIDATION_STAGES = [
   "source_waiting_identity", "source_waiting_targets", "source_waiting_matched_ids", "source_waiting_tasks", "source_waiting_task_ids", "source_waiting_deadline",
   "source_initial_call_shape", "source_call_completion_state", "source_result_completion_state", "source_call_completion_content", "source_result_completion_content",
   "source_waiting_output_missing", "source_event_chain", "reconciliation", "safe_result_shape", "source_start_event", "lease_fence", "source_ordinal",
-  "wait_state", "wait_result_shape", "target_scope", "resolved_outcome", "tool_call", "tool_receipt", "input_target_ids", "output_target_ids", "other",
+  "wait_state", "wait_result_shape", "target_scope", "resolved_outcome", "tool_call", "call_binding", "receipt_pair",
+  "receipt_identity", "receipt_ids", "receipt_deadline", "input_target_ids", "output_target_ids", "other",
 ] as const
 const SAFE_RELATED_EVENT_TYPES = new Set([
   "item.started", "item.delta", "item.completed", "item.failed", "item.interrupted",
@@ -323,7 +324,9 @@ async function readWaitAcknowledgementDiagnostic(ids: FixtureIds) {
     waitScopeOk: boolean; waitResultShapeOk: boolean;
     sourceStepCount: number; sourceStepStatus: string; sourceStepScopeOk: boolean; sourceAttemptOk: boolean;
     targetExpectedCount: number; targetBoundCount: number; targetLineageCount: number; targetTerminalCount: number;
-    callCount: number; callInputMatches: boolean; resultCount: number; waitingResultShapeOk: boolean;
+    callCount: number; callInputMatches: boolean; requestTargetsMatch: boolean; requestModeMatches: boolean; callIdPresent: boolean;
+    receiptDeadlineValue: string | null; waitDeadlineValue: Date | string | null;
+    resultCount: number; waitingResultShapeOk: boolean;
     continuationCount: number; firstContinuationAfterSourceReady: boolean;
     sourceEventKeyCount: number; sourceEventHeadersMatch: boolean; sourceEventSequenceOrdered: boolean;
   }
@@ -439,6 +442,17 @@ async function readWaitAcknowledgementDiagnostic(ids: FixtureIds) {
               = ARRAY(SELECT jsonb_array_elements_text(CASE WHEN jsonb_typeof((SELECT "targetTaskIds" FROM selected_wait)) = 'array'
                 THEN (SELECT "targetTaskIds" FROM selected_wait) ELSE '[]'::jsonb END) ORDER BY 1)
           ELSE false END FROM first_call), false) AS "callInputMatches",
+        COALESCE((SELECT jsonb_typeof("result"->'request'->'targetTaskIds') = 'array' AND jsonb_typeof("targetTaskIds") = 'array'
+            AND ARRAY(SELECT jsonb_array_elements_text(CASE WHEN jsonb_typeof("result"->'request'->'targetTaskIds') = 'array'
+              THEN "result"->'request'->'targetTaskIds' ELSE '[]'::jsonb END) ORDER BY 1)
+              = ARRAY(SELECT jsonb_array_elements_text(CASE WHEN jsonb_typeof("targetTaskIds") = 'array'
+                THEN "targetTaskIds" ELSE '[]'::jsonb END) ORDER BY 1)
+          FROM selected_wait), false) AS "requestTargetsMatch",
+        COALESCE((SELECT "result"->'request'->>'mode' = "mode" FROM selected_wait), false) AS "requestModeMatches",
+        COALESCE((SELECT jsonb_typeof("content"->'toolCallId') = 'string' AND "content"->>'toolCallId' <> ''
+          FROM first_call), false) AS "callIdPresent",
+        (SELECT "content"->'output'->>'deadlineAt' FROM first_result) AS "receiptDeadlineValue",
+        (SELECT "deadlineAt" FROM selected_wait) AS "waitDeadlineValue",
         (SELECT count(*)::int FROM results) AS "resultCount",
         COALESCE((SELECT CASE WHEN jsonb_typeof("content") = 'object' THEN (SELECT count(*) = 3 FROM jsonb_object_keys("content"))
             AND "status" = 'completed' AND "revision" = 1 AND "phase" IS NULL
@@ -468,7 +482,12 @@ async function readWaitAcknowledgementDiagnostic(ids: FixtureIds) {
       [ids.userId, ids.sessionId, ids.turnId])
     const row = result.rows[0]
     if (!row) return { available: false }
-    return { available: true, ...row }
+    const { receiptDeadlineValue, waitDeadlineValue, ...safeRow } = row
+    const receiptDeadlineMs = typeof receiptDeadlineValue === "string" ? Date.parse(receiptDeadlineValue) : Number.NaN
+    const waitDeadlineMs = waitDeadlineValue instanceof Date ? waitDeadlineValue.getTime()
+      : typeof waitDeadlineValue === "string" ? Date.parse(waitDeadlineValue) : Number.NaN
+    return { available: true, ...safeRow, receiptDeadlineMatches: Number.isFinite(receiptDeadlineMs)
+      && Number.isFinite(waitDeadlineMs) && receiptDeadlineMs === waitDeadlineMs }
   } catch {
     return { available: false }
   }
