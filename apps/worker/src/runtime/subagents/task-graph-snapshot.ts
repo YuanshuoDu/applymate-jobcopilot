@@ -189,7 +189,6 @@ export function taskGraphItemId(parentTaskId: string): string {
   const hash = createHash("sha256").update(parentTaskId).digest("hex")
   return `task-graph-${hash}`
 }
-
 export function taskGraphProposalKey(parentTaskId: string, expectedRevision: number): string {
   return `${taskGraphItemId(parentTaskId)}:proposal:${expectedRevision}`
 }
@@ -198,7 +197,10 @@ export function taskGraphLifecycleKey(parentTaskId: string, nodeKey: string, att
   const node = createHash("sha256").update(nodeKey).digest("hex").slice(0, 20)
   return `${taskGraphItemId(parentTaskId)}:node:${node}:${attempt}:${type}`
 }
-
+export function taskGraphWaitLifecycleKey(parentTaskId: string, nodeKey: string, attempt: number, waitRowId: string): string {
+  if (!waitRowId.trim() || waitRowId.trim() !== waitRowId || waitRowId.length > MAX_TASK_ID_LENGTH) throw new Error("task_graph_wait_identity_invalid")
+  return `${taskGraphLifecycleKey(parentTaskId, nodeKey, attempt, "task.waiting")}:wait:${createHash("sha256").update(waitRowId).digest("hex")}`
+}
 export function taskGraphState(
   snapshot: TaskGraphSnapshot,
   revision: number,

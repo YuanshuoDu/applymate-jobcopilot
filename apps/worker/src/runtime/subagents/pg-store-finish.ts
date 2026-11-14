@@ -55,14 +55,14 @@ export async function finishSubagentTask(pool: PgSubagentPool, input: FinishSuba
       let status = interrupted ? "interrupted" : retry ? "queued" : input.status
       let result = input.result
       let failureReason = input.failureReason
-      const finish = await prepareTaskGraphFinish(client, {
+      const durableWaitFinish = input.status === "waiting" && row.parentTaskId !== null && row.parentTaskId !== undefined
+      let finish: Awaited<ReturnType<typeof prepareTaskGraphFinish>> | undefined
+      if (!durableWaitFinish) finish = await prepareTaskGraphFinish(client, {
         taskId: input.taskId, sessionId: input.sessionId, attemptCount: input.attemptCount,
         status, retry, failureReason, result, ownerId: input.ownerId, taskRole: String(row.role), taskType: String(row.taskType),
       })
-      status = finish.status; result = finish.result; failureReason = finish.failureReason
-      const graph = finish.graph
-      if (graph && "blocked" in graph) return null
-      const terminal = isTerminalSubagentStatus(status)
+      if (finish) { status = finish.status; result = finish.result; failureReason = finish.failureReason }
+      if (finish?.graph && "blocked" in finish.graph) return null
       const lockedTask = await client.query(`${taskSql} FOR UPDATE OF task`, [input.taskId, input.sessionId, input.ownerId, input.attemptCount])
       const lockedRow = lockedTask.rows[0] as Record<string, unknown> | undefined
       if (!lockedRow || lockedRow.status !== "running" || lockedRow.leaseOwner !== input.ownerId
@@ -73,10 +73,7 @@ export async function finishSubagentTask(pool: PgSubagentPool, input: FinishSuba
       const absoluteDeadlineAt = dateValue(lockedRow.absoluteDeadlineAt)
       if (!lockedExpiry || !finishAt || lockedExpiry <= finishAt
         || absoluteDeadlineAt && absoluteDeadlineAt <= finishAt) return null
-      if (status === "completed" && !interrupted && await hasActiveSubagentDescendants(client, {
-        taskId: input.taskId, sessionId: input.sessionId, turnId: String(lockedRow.turnId), rootTaskId: String(lockedRow.rootTaskId),
-      })) return { status: "children_pending" }
-      if (input.status === "waiting" && row.parentTaskId !== null && row.parentTaskId !== undefined) {
+      if (durableWaitFinish) {
         const handoff = await handoffDurableSubagentWaitWithGraph(client, { lease: { id: input.taskId, userId: sessionRow.userId, sessionId: input.sessionId, turnId: String(row.turnId), rootTaskId: String(row.rootTaskId), ownerId: input.ownerId, attemptCount: input.attemptCount, leaseExpiresAt: lockedExpiry }, now: finishAt })
         if (handoff) {
           if ("blocked" in handoff) return null
@@ -89,6 +86,20 @@ export async function finishSubagentTask(pool: PgSubagentPool, input: FinishSuba
           return "waiting"
         }
       }
+      if (!finish) {
+        finish = await prepareTaskGraphFinish(client, {
+          taskId: input.taskId, sessionId: input.sessionId, attemptCount: input.attemptCount,
+          status, retry, failureReason, result, ownerId: input.ownerId, taskRole: String(row.role), taskType: String(row.taskType),
+        })
+        status = finish.status; result = finish.result; failureReason = finish.failureReason
+      }
+      const graphResult = finish.graph
+      if (graphResult && "blocked" in graphResult) return null
+      const graph = graphResult
+      const terminal = isTerminalSubagentStatus(status)
+      if (status === "completed" && !interrupted && await hasActiveSubagentDescendants(client, {
+        taskId: input.taskId, sessionId: input.sessionId, turnId: String(lockedRow.turnId), rootTaskId: String(lockedRow.rootTaskId),
+      })) return { status: "children_pending" }
       if (input.status === "completed" && !interrupted) {
         const missingMessageIds = await findUnobservedMailboxMessageIds(client, {
           sessionId: input.sessionId, taskId: input.taskId, attemptCount: input.attemptCount, observedMessageIds: mailboxMessageIds,

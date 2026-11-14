@@ -9,9 +9,11 @@ const mocks = vi.hoisted(() => ({
   interruptMatchingInSession: vi.fn(),
   taskGraphDeadlineLive: vi.fn(),
   lockScheduledGateFinish: vi.fn(),
+  durableWaitHandoff: vi.fn(),
 }))
 
 vi.mock("./pg-store-lifecycle.js", () => ({ prepareTaskGraphFinish: mocks.prepareTaskGraphFinish }))
+vi.mock("./durable-subagent-wait-handoff.js", () => ({ handoffDurableSubagentWaitWithGraph: mocks.durableWaitHandoff }))
 vi.mock("./pg-store-descendant-completion.js", () => ({ hasActiveSubagentDescendants: mocks.hasActiveSubagentDescendants }))
 vi.mock("./pg-store-subtree-interrupt.js", () => ({ interruptMatchingInSession: mocks.interruptMatchingInSession }))
 vi.mock("./pg-store-claim.js", () => ({ taskGraphDeadlineLive: mocks.taskGraphDeadlineLive }))
@@ -59,6 +61,7 @@ beforeEach(() => {
   mocks.interruptMatchingInSession.mockResolvedValue(0)
   mocks.taskGraphDeadlineLive.mockResolvedValue(true)
   mocks.lockScheduledGateFinish.mockResolvedValue(true)
+  mocks.durableWaitHandoff.mockResolvedValue(undefined)
 })
 
 describe("parent finish with descendants", () => {
@@ -90,6 +93,32 @@ describe("parent finish with descendants", () => {
 
     await expect(finishSubagentTask(db.pool, input())).resolves.toBeNull()
     expect(mocks.hasActiveSubagentDescendants).not.toHaveBeenCalled()
+  })
+
+  it("uses a registered durable wait before the generic TaskGraph finish receipt", async () => {
+    const db = fakePool()
+    mocks.durableWaitHandoff.mockResolvedValue({ waitId: "wait-row-1", handoff: "suspended", waitStatus: "waiting", idempotent: false })
+
+    await expect(finishSubagentTask(db.pool, input({ status: "waiting" }))).resolves.toBe("waiting")
+
+    expect(mocks.durableWaitHandoff).toHaveBeenCalledOnce()
+    expect(mocks.prepareTaskGraphFinish).not.toHaveBeenCalled()
+    expect(db.calls.some(([sql]) => sql.includes("leaseSegmentStartedAt"))).toBe(true)
+  })
+
+  it("uses the generic finish path only when a durable wait is absent", async () => {
+    const db = fakePool()
+    const order: string[] = []
+    mocks.durableWaitHandoff.mockImplementation(async () => { order.push("durable-wait"); return undefined })
+    mocks.prepareTaskGraphFinish.mockImplementation(async (_client: pg.PoolClient, value: { status: string; result: unknown }) => {
+      order.push("generic-finish")
+      return { graph: null, status: value.status, result: value.result }
+    })
+
+    await expect(finishSubagentTask(db.pool, input({ status: "waiting" }))).resolves.toBe("waiting")
+
+    expect(order).toEqual(["durable-wait", "generic-finish"])
+    expect(mocks.prepareTaskGraphFinish).toHaveBeenCalledOnce()
   })
 
   it("interrupts descendants in the same transaction after a terminal failure", async () => {

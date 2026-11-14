@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool, type PoolClient, type QueryConfig, type QueryResult, type QueryResultRow } from "pg"
 import { projectWaitCallCompletionPayload } from "../turns/turn-execution-wait-event-projection.js"
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
+import { taskGraphItemId, taskGraphLifecycleKey, taskGraphWaitLifecycleKey } from "./task-graph-snapshot.js"
 import { loadChildAttemptResume } from "./child-resume.js"
 import type { SubagentLease } from "./types.js"
 
@@ -989,8 +990,8 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       await waitForMainMarker(ids, first, "P1143_FOREIGN_CALL_STEP_REJECTED", 45_000)
       await waitForMainMarker(ids, first, "P1143_PARENT_WAITING", 45_000)
 
-      const parent = await pool.query<{ id: string; rootTaskId: string; status: string; leaseOwner: string | null }>(
-        `SELECT "id", "rootTaskId", "status", "leaseOwner" FROM "sub_agent_tasks"
+      const parent = await pool.query<{ id: string; rootTaskId: string; status: string; leaseOwner: string | null; attemptCount: number }>(
+        `SELECT "id", "rootTaskId", "status", "leaseOwner", "attemptCount" FROM "sub_agent_tasks"
          WHERE "sessionId" = $1 AND "parentTaskId" = "rootTaskId" AND "depth" = 1 AND "role" = 'scout'`, [ids.sessionId])
       expect(parent.rows).toHaveLength(1)
       expect(parent.rows[0]).toMatchObject({ status: "waiting", leaseOwner: null })
@@ -1037,6 +1038,25 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       const targets = Array.isArray(wait.rows[0]?.targetTaskIds) ? wait.rows[0]!.targetTaskIds as string[] : []
       expect([...targets].sort()).toEqual(nested.rows.map(row => row.id).sort())
       const initialWaitId = wait.rows[0]!.id
+      const graphBeforeRestart = await loadTaskGraph(pool, {
+        userId: ids.userId, sessionId: ids.sessionId, turnId: ids.turnId,
+        rootTaskId: parent.rows[0]!.rootTaskId, parentTaskId: parent.rows[0]!.rootTaskId,
+      }, false)
+      const graphNode = currentTaskGraph(graphBeforeRestart).nodes.find(node => node.taskId === parent.rows[0]!.id)
+      expect(graphNode).toBeDefined()
+      const firstWaitReceipt = await pool.query<{ id: string; idempotencyKey: string }>(
+        `SELECT "id", "idempotencyKey" FROM "agent_events"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "taskId" = $4
+           AND "type" IN ('item.delta', 'task_graph.lifecycle') AND "payload"->'event'->>'type' = 'task.waiting'
+           AND "payload"->'event'->>'nodeKey' = $5 ORDER BY "sequence" DESC LIMIT 1`,
+        [ids.sessionId, ids.turnId, taskGraphItemId(parent.rows[0]!.rootTaskId), parent.rows[0]!.id, graphNode!.key])
+      expect(firstWaitReceipt.rows).toHaveLength(1)
+      const legacyWaitKey = taskGraphLifecycleKey(parent.rows[0]!.rootTaskId, graphNode!.key, parent.rows[0]!.attemptCount, "task.waiting")
+      const legacyReceipt = await pool.query(`UPDATE "agent_events" SET "idempotencyKey" = $1,
+          "payload" = jsonb_set("payload", '{event,idempotencyKey}', to_jsonb($1::text), false)
+        WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "idempotencyKey" = $5
+        RETURNING "idempotencyKey"`, [legacyWaitKey, firstWaitReceipt.rows[0]!.id, ids.sessionId, ids.turnId, firstWaitReceipt.rows[0]!.idempotencyKey])
+      expect(legacyReceipt.rows).toHaveLength(1)
       const premature = await pool.query(`SELECT 1 FROM "agent_events" WHERE "sessionId" = $1 AND "taskId" = $2 AND "type" = 'task.completed'`,
         [ids.sessionId, parent.rows[0]!.id])
       expect(premature.rowCount).toBe(0)
@@ -1089,9 +1109,12 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       expect(finalChildren.rows.every(row => row.status === "completed")).toBe(true)
       expect(finalChildren.rows.every(row => row.attemptCount > initialAttempts.get(row.id)!)).toBe(true)
       expect(finalChildren.rows.find(row => row.id === crashedChild.id)?.attemptCount).toBe(2)
-      const waitHistory = await pool.query<{ id: string; status: string; stepId: string; idempotencyKey: string;
-        targetTaskIds: unknown; suspendedAt: Date | null; consumedAt: Date | null }>(`SELECT "id", "status", "stepId", "idempotencyKey", "targetTaskIds", "suspendedAt", "consumedAt"
-        FROM "agent_wait_conditions" WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3 ORDER BY "createdAt", "id"`,
+      const waitHistory = await pool.query<{ id: string; status: string; stepId: string; stepAttempt: number; idempotencyKey: string;
+        targetTaskIds: unknown; suspendedAt: Date | null; consumedAt: Date | null }>(`SELECT wait."id", wait."status", wait."stepId", wait."idempotencyKey", wait."targetTaskIds",
+        wait."suspendedAt", wait."consumedAt", step."attempt" AS "stepAttempt" FROM "agent_wait_conditions" AS wait
+        JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."sessionId" = wait."sessionId"
+          AND step."turnId" = wait."turnId" AND step."taskId" = wait."parentTaskId"
+        WHERE wait."sessionId" = $1 AND wait."turnId" = $2 AND wait."parentTaskId" = $3 ORDER BY wait."createdAt", wait."id"`,
       [ids.sessionId, ids.turnId, parent.rows[0]!.id])
       expect(resumedWaits).toHaveLength(2)
       expect(waitHistory.rows).toHaveLength(2)
@@ -1101,6 +1124,23 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       expect(new Set(waitHistory.rows.map(row => row.idempotencyKey)).size).toBe(2)
       expect(waitHistory.rows.map(row => row.targetTaskIds).map(value => Array.isArray(value) ? [...value].sort() : []))
         .toEqual([targets.sort(), targets.sort()])
+      const waitLifecycleRows = await pool.query<{ idempotencyKey: string; payload: unknown }>(
+        `SELECT "idempotencyKey", "payload" FROM "agent_events"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "taskId" = $4
+           AND "type" IN ('item.delta', 'task_graph.lifecycle') AND "payload"->'event'->>'type' = 'task.waiting'
+           AND "payload"->'event'->>'nodeKey' = $5 ORDER BY "sequence"`,
+        [ids.sessionId, ids.turnId, taskGraphItemId(parent.rows[0]!.rootTaskId), parent.rows[0]!.id, graphNode!.key])
+      expect(waitLifecycleRows.rows).toHaveLength(2)
+      const persistedEventKeys = waitLifecycleRows.rows.map(row => {
+        const payload = row.payload as { event?: { idempotencyKey?: unknown; type?: unknown } }
+        expect(payload.event).toMatchObject({ type: "task.waiting", idempotencyKey: row.idempotencyKey })
+        return row.idempotencyKey
+      })
+      const expectedEventKeys = waitHistory.rows.map(row => row.id === initialWaitId
+        ? legacyWaitKey
+        : taskGraphWaitLifecycleKey(parent.rows[0]!.rootTaskId, graphNode!.key, row.stepAttempt, row.id))
+      expect(new Set(persistedEventKeys)).toEqual(new Set(expectedEventKeys))
+      expect(persistedEventKeys).toContain(legacyWaitKey)
       const reclaimedDispatch = await pool.query<{ ownerId: string | null; attemptCount: number; publishedAt: Date | null }>(
         `SELECT "payload"->>'ownerId' AS "ownerId", "attemptCount", "publishedAt" FROM "agent_outbox"
          WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,

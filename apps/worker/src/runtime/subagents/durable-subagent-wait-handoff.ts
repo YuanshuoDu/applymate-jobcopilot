@@ -2,9 +2,8 @@ import { randomUUID } from "node:crypto"
 import type pg from "pg"
 import type { SubagentLease } from "./types.js"
 import { assertLease, dateValue, DurableSubagentWaitError, object, parseIds, projectDurableSubagentWait, type DurableSubagentWaitStatus } from "./durable-subagent-wait-store.js"
-import { persistGraphTransition, prepareGraphTransition } from "./task-graph-pg-lifecycle.js"
+import { persistGraphTransition, prepareGraphTransition, type GraphTransitionPreparation, type PreparedGraphTransition } from "./task-graph-pg-lifecycle.js"
 import { safeHandoffWaitResult, strictWaitTargetIds } from "./durable-subagent-wait-handoff-projection.js"
-
 type Client = Pick<pg.PoolClient, "query">; type Row = Record<string, unknown>
 const OPEN_SESSION = `session."status" NOT IN ('aborted', 'archived')`
 const TERMINAL = new Set(["completed", "failed", "interrupted", "cancelled", "closed", "passed", "skipped"])
@@ -12,7 +11,6 @@ export type DurableSubagentWaitHandoffLease = Pick<SubagentLease, "id" | "userId
 export type DurableSubagentWaitHandoffInput = Readonly<{ lease: DurableSubagentWaitHandoffLease; now: Date }>
 export type DurableSubagentWaitHandoffResult = Readonly<{ waitId: string; handoff: "suspended" | "queued"; waitStatus: DurableSubagentWaitStatus; idempotent: boolean }>
 export type DurableSubagentWaitGraphHandoffResult = DurableSubagentWaitHandoffResult | Readonly<{ blocked: true }> | undefined
-
 function row(value: Row | undefined, message: string): Row {
   if (!value) throw new DurableSubagentWaitError("wait_scope_error", message)
   return value
@@ -53,9 +51,8 @@ async function dispatch(client: Client, task: Row, ownerId?: string): Promise<vo
     RETURNING "idempotencyKey"`, [randomUUID(), sessionId, `subagent-dispatch:${taskId}`, JSON.stringify(payload)])
   if (result.rowCount !== 1) throw new DurableSubagentWaitError("wait_scope_error", "Child dispatch could not be fenced")
 }
-
 /** Atomically persists the wait handoff and releases or queues its exact child task. */
-export async function handoffDurableSubagentWait(client: Client, input: DurableSubagentWaitHandoffInput): Promise<DurableSubagentWaitHandoffResult | undefined> {
+async function handoffDurableSubagentWaitInternal(client: Client, input: DurableSubagentWaitHandoffInput, prepareWaiting?: (waitRowId: string) => Promise<GraphTransitionPreparation>): Promise<Readonly<{ result: DurableSubagentWaitHandoffResult; graphWaiting?: PreparedGraphTransition }> | Readonly<{ blocked: true }> | undefined> {
   const lease = input.lease; const now = input.now
   if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new DurableSubagentWaitError("wait_invalid", "Handoff clock is invalid")
   const session = row((await client.query<Row>(`SELECT "id", "userId", "status" FROM "agent_sessions"
@@ -100,11 +97,11 @@ export async function handoffDurableSubagentWait(client: Client, input: DurableS
   const isReady = wait.mode === "any" ? matched.length > 0 : matched.length === targetIds.length
   const suspended = wait.suspendedAt !== null && wait.suspendedAt !== undefined
   if (suspended && task.status === "waiting" && wait.status === "waiting") {
-    return { waitId: String(wait.id), handoff: "suspended", waitStatus: "waiting", idempotent: true }
+    return { result: { waitId: String(wait.id), handoff: "suspended", waitStatus: "waiting", idempotent: true } }
   }
   if (suspended && task.status === "queued" && (wait.status === "ready" && isReady || wait.status === "timed_out" && now >= deadline)
     && JSON.stringify([...parseIds(wait.matchedTaskIds)].sort()) === JSON.stringify(matched)) {
-    return { waitId: String(wait.id), handoff: "queued", waitStatus: wait.status, idempotent: true }
+    return { result: { waitId: String(wait.id), handoff: "queued", waitStatus: wait.status, idempotent: true } }
   }
   if (task.status !== "running" || suspended) throw new DurableSubagentWaitError("wait_scope_error", "Child wait handoff is not owned")
   const priorStatus = String(wait.status)
@@ -115,6 +112,8 @@ export async function handoffDurableSubagentWait(client: Client, input: DurableS
   const result = object(wait.result)
   const current = projectDurableSubagentWait({ ...wait, targetTaskIds: targetIds, deadlineAt: deadline }, targets, status, matched)
   const persistedResult = safeHandoffWaitResult(result, current, targetIds)
+  const graphWaiting = await prepareWaiting?.(String(wait.id))
+  if (graphWaiting && "blocked" in graphWaiting) return { blocked: true }
   const waitUpdated = await client.query(`UPDATE "agent_wait_conditions" SET "status" = $1, "matchedTaskIds" = $2::jsonb, "result" = $3::jsonb,
     "suspendedAt" = COALESCE("suspendedAt", $4), "resolvedAt" = CASE WHEN $1 = 'waiting' THEN "resolvedAt" ELSE COALESCE("resolvedAt", $4) END, "updatedAt" = $4
     WHERE "id" = $5 AND "parentTaskId" = $6 AND "stepId" = $7 AND "consumedAt" IS NULL AND "status" IN ('waiting', 'ready', 'timed_out')
@@ -131,9 +130,12 @@ export async function handoffDurableSubagentWait(client: Client, input: DurableS
   [taskStatus, now, lease.id, lease.sessionId, lease.turnId, lease.rootTaskId, lease.ownerId, lease.attemptCount, lease.leaseExpiresAt])
   if (updated.rowCount !== 1) throw new DurableSubagentWaitError("wait_scope_error", "Child task lease was fenced during handoff")
   if (status !== "waiting") await dispatch(client, task, input.lease.ownerId)
-  return { waitId: String(wait.id), handoff: status === "waiting" ? "suspended" : "queued", waitStatus: status, idempotent: false }
+  return { result: { waitId: String(wait.id), handoff: status === "waiting" ? "suspended" : "queued", waitStatus: status, idempotent: false }, ...(graphWaiting && !("blocked" in graphWaiting) ? { graphWaiting } : {}) }
 }
-
+export async function handoffDurableSubagentWait(client: Client, input: DurableSubagentWaitHandoffInput): Promise<DurableSubagentWaitHandoffResult | undefined> {
+  const outcome = await handoffDurableSubagentWaitInternal(client, input)
+  return outcome && !("blocked" in outcome) ? outcome.result : undefined
+}
 /** Repairs only the registered wait left between tool execution and the ordinary finish handoff. */
 export async function recoverExpiredDurableSubagentWaitWithGraph(client: pg.PoolClient, input: DurableSubagentWaitHandoffInput): Promise<DurableSubagentWaitGraphHandoffResult> {
   const lease = input.lease, now = input.now
@@ -181,6 +183,8 @@ export async function recoverExpiredDurableSubagentWaitWithGraph(client: pg.Pool
   const status: DurableSubagentWaitStatus = now >= deadline ? "timed_out" : ready ? "ready" : "waiting"
   const result = object(wait.result), outcome = projectDurableSubagentWait({ ...wait, targetTaskIds: ids, deadlineAt: deadline }, targets, status, matched)
   const persisted = safeHandoffWaitResult(result, outcome, ids)
+  const graphWaiting = await prepareGraphTransition(client, { taskId: lease.id, sessionId: lease.sessionId, type: "task.waiting", attemptCount: lease.attemptCount, waitRowId: String(wait.id) })
+  if (graphWaiting && "blocked" in graphWaiting) return { blocked: true }
   if (wait.stepStatus === "streaming") {
     // This crash precedes durable tool/model completion; step.completed would invent output the writer never committed.
     const promoted = await client.query(`UPDATE "agent_steps" SET "status" = 'waiting_for_tool', "finishReason" = 'tool_calls', "errorCode" = NULL, "completedAt" = $1
@@ -191,8 +195,6 @@ export async function recoverExpiredDurableSubagentWaitWithGraph(client: pg.Pool
     [now, wait.stepId, lease.sessionId, lease.turnId, lease.id, lease.attemptCount, wait.ordinal, lease.rootTaskId, lease.ownerId, lease.leaseExpiresAt])
     if (promoted.rowCount !== 1) throw new DurableSubagentWaitError("wait_scope_error", "Expired wait source step changed during recovery")
   }
-  const graphWaiting = await prepareGraphTransition(client, { taskId: lease.id, sessionId: lease.sessionId, type: "task.waiting", attemptCount: lease.attemptCount })
-  if (graphWaiting && "blocked" in graphWaiting) return { blocked: true }
   const updatedWait = await client.query(`UPDATE "agent_wait_conditions" SET "status" = $1, "matchedTaskIds" = $2::jsonb, "result" = $3::jsonb,
       "suspendedAt" = $4, "resolvedAt" = CASE WHEN $1 = 'waiting' THEN "resolvedAt" ELSE COALESCE("resolvedAt", $4) END, "updatedAt" = $4
     WHERE "id" = $5 AND "userId" = $6 AND "sessionId" = $7 AND "turnId" = $8 AND "parentTaskId" = $9 AND "stepId" = $10
@@ -216,13 +218,12 @@ export async function recoverExpiredDurableSubagentWaitWithGraph(client: pg.Pool
   }
   return { waitId: String(wait.id), handoff: taskStatus === "waiting" ? "suspended" : "queued", waitStatus: status, idempotent: false }
 }
-
 /** Couples the wait handoff with its TaskGraph transitions inside the caller's transaction. */
 export async function handoffDurableSubagentWaitWithGraph(client: pg.PoolClient, input: DurableSubagentWaitHandoffInput): Promise<DurableSubagentWaitGraphHandoffResult> {
-  const graphWaiting = await prepareGraphTransition(client, { taskId: input.lease.id, sessionId: input.lease.sessionId, type: "task.waiting", attemptCount: input.lease.attemptCount })
-  if (graphWaiting && "blocked" in graphWaiting) return { blocked: true }
-  const handoff = await handoffDurableSubagentWait(client, input)
-  if (!handoff) return undefined
+  const outcome = await handoffDurableSubagentWaitInternal(client, input, waitRowId => prepareGraphTransition(client, { taskId: input.lease.id, sessionId: input.lease.sessionId, type: "task.waiting", attemptCount: input.lease.attemptCount, waitRowId }))
+  if (!outcome) return undefined
+  if ("blocked" in outcome) return { blocked: true }
+  const { result: handoff, graphWaiting } = outcome
   if (graphWaiting) await persistGraphTransition(client, graphWaiting, input.now)
   if (handoff.handoff === "queued" && graphWaiting) {
     const graphQueued = await prepareGraphTransition(client, { taskId: input.lease.id, sessionId: input.lease.sessionId, type: "task.queued", attemptCount: input.lease.attemptCount })
@@ -231,7 +232,6 @@ export async function handoffDurableSubagentWaitWithGraph(client: pg.PoolClient,
   }
   return handoff
 }
-
 /** Preserves a live lease for an unconsumed child wait; only completed tool handoffs are released. */
 export async function releaseDurableSubagentWaitWithGraph(client: pg.PoolClient, input: Pick<DurableSubagentWaitHandoffLease, "id" | "userId" | "sessionId" | "ownerId" | "attemptCount"> & { now: Date }): Promise<boolean | undefined> {
   const rows = (await client.query<Row>(`SELECT task."turnId", task."rootTaskId", task."leaseExpiresAt", step."status" AS "stepStatus"
