@@ -1667,6 +1667,12 @@ async function prioritizeAndVerifyScheduledGateResolverTurn(pool: Pick<Pool, "qu
 
 // Keep the real root resolver transaction and row locks, but scope its global Turn selection to this fixture.
 // Child-wait reconciliation is outside this case's validation scope; isolate its global scan from other fixtures.
+type ResolverFixtureClient = {
+  query<Row extends Record<string, unknown> = Record<string, unknown>>(queryText: string, values?: unknown[]): Promise<{ rows: Row[] }>
+  release(): void
+}
+type ResolverFixturePool = { connect(): Promise<ResolverFixtureClient> }
+
 function poolScopedToScheduledGateFixture(source: Pick<Pool, "connect">,
   scope: Readonly<{ userId: string; sessionId: string; turnId: string }>) {
   let scopedRootTurnBatchQueries = 0
@@ -1676,12 +1682,10 @@ function poolScopedToScheduledGateFixture(source: Pick<Pool, "connect">,
       async connect() {
         const client = await source.connect()
         return {
-          async query(...args: Parameters<typeof client.query>) {
-            const statement = args[0]
-            if (typeof statement === "string" && statement.includes('FROM "agent_sessions" AS session')
+          async query<Row extends Record<string, unknown> = Record<string, unknown>>(statement: string, values?: unknown[]) {
+            if (statement.includes('FROM "agent_sessions" AS session')
               && statement.includes('JOIN "agent_turns" AS turn') && statement.includes('turn."rootTaskId" IS NOT NULL')) {
               const batchOrder = 'ORDER BY turn."updatedAt" ASC, turn."id" ASC LIMIT $1 FOR UPDATE OF session, turn SKIP LOCKED'
-              const values = args[1]
               if (!statement.includes(batchOrder) || !Array.isArray(values) || values.length !== 1
                 || typeof values[0] !== "number" || !Number.isSafeInteger(values[0]) || values[0] < 1) {
                 throw new Error("Root wait resolver Turn selection SQL changed; refusing an unscoped fixture scan")
@@ -1690,9 +1694,9 @@ function poolScopedToScheduledGateFixture(source: Pick<Pool, "connect">,
               const scopedStatement = statement.replace(batchOrder,
                 `AND turn."id" = $2 AND turn."sessionId" = $3 AND turn."userId" = $4\n       ${batchOrder}`)
               if (scopedStatement === statement) throw new Error("Root wait resolver fixture scope was not applied")
-              return client.query(scopedStatement, [values[0], scope.turnId, scope.sessionId, scope.userId])
+              return client.query<Row>(scopedStatement, [values[0], scope.turnId, scope.sessionId, scope.userId])
             }
-            if (typeof statement === "string" && statement.includes("CROSS JOIN LATERAL")
+            if (statement.includes("CROSS JOIN LATERAL")
               && statement.includes('FROM "agent_sessions" AS session')
               && statement.includes('FROM "agent_wait_conditions" AS wait')) {
               if (!statement.includes('SELECT MIN(COALESCE(wait."nextReconcileAt", wait."suspendedAt")) AS "firstDue"')
@@ -1700,9 +1704,9 @@ function poolScopedToScheduledGateFixture(source: Pick<Pool, "connect">,
                 throw new Error("Child wait resolver session SQL changed; refusing an unscoped global scan")
               }
               isolatedChildWaitSessionScans += 1
-              return client.query("SELECT NULL WHERE FALSE")
+              return client.query<Row>("SELECT NULL WHERE FALSE")
             }
-            return client.query(...args)
+            return values === undefined ? client.query<Row>(statement) : client.query<Row>(statement, values)
           },
           release: client.release.bind(client),
         }
@@ -1713,7 +1717,7 @@ function poolScopedToScheduledGateFixture(source: Pick<Pool, "connect">,
   }
 }
 
-function poolPausedAfterDurableWaitLock(source: Pick<Pool, "connect">, gateWaitId: string,
+function poolPausedAfterDurableWaitLock(source: ResolverFixturePool, gateWaitId: string,
   scope: Readonly<{ userId: string; sessionId: string; turnId: string }>,
   waitLocked: (backendPid: number, waitIds: readonly string[]) => void, releaseWaitLock: Promise<void>) {
   let paused = false
@@ -1721,9 +1725,8 @@ function poolPausedAfterDurableWaitLock(source: Pick<Pool, "connect">, gateWaitI
     async connect() {
       const client = await source.connect()
       return {
-        async query(...args: Parameters<typeof client.query>) {
-          const result = await client.query(...args)
-          const statement = args[0]
+        async query<Row extends Record<string, unknown> = Record<string, unknown>>(statement: string, values?: unknown[]) {
+          const result = await client.query<Row>(statement, values)
           const waitIds = result.rows.flatMap(row => {
             const id = row && typeof row === "object" ? (row as { id?: unknown }).id : undefined
             return typeof id === "string" ? [id] : []
@@ -1734,7 +1737,6 @@ function poolPausedAfterDurableWaitLock(source: Pick<Pool, "connect">, gateWaitI
             && /AND "status" IN \('waiting', 'ready', 'timed_out'\)/.test(statement)
             && /LIMIT \$4 FOR UPDATE SKIP LOCKED/i.test(statement)
             && waitIds.includes(gateWaitId)) {
-            const values = args[1]
             if (!Array.isArray(values) || values[0] !== scope.userId || values[1] !== scope.sessionId || values[2] !== scope.turnId) {
               throw new Error("Wait resolver query escaped the fixture Turn scope")
             }
@@ -2719,7 +2721,7 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
       scheduledTaskGraphAnalyzeCheckpointDigest(value: unknown): string | null
       parseScheduledTaskGraphPrepareProof(value: unknown): null | {
         graphRevision: number
-        nodes: [{ attemptCount: number }, { attemptCount: number }, { taskId: string; attemptCount: number }]
+        nodes: readonly { taskId: string; attemptCount: number; role: "scout" | "analyst" | "prepare" }[]
         result: { snapshotDigest: string; checkpointDigest: string; jobs: Array<{ jobId: string; status: string }> }
       }
     }>("@/lib/agent/scheduled-taskgraph-gate-checkpoint")
@@ -2770,8 +2772,9 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
       if (gateBindingCurrent && parsedProof) {
         const reader = tx as GateProofDebugReader
         const graphId = `task-graph-${createHash("sha256").update(rootTaskId).digest("hex")}`
+        const prepareNode = parsedProof.nodes[parsedProof.nodes.length - 1]!
         const prepareNodeHash = createHash("sha256").update("prepare").digest("hex").slice(0, 20)
-        const prepareEventKey = `${graphId}:node:${prepareNodeHash}:${parsedProof.nodes[2].attemptCount}:task.completed`
+        const prepareEventKey = `${graphId}:node:${prepareNodeHash}:${prepareNode.attemptCount}:task.completed`
         const [graph, historyGateTask, prepareEvents] = await Promise.all([
           reader.agentItem.findFirst({ where: { id: graphId, sessionId: owner.sessionId, turnId: owner.turnId,
             taskId: owner.rootTaskId, type: "task_graph", session: { is: { userId: owner.userId } },
@@ -2791,9 +2794,9 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
           : []
         const historyEvents = [...prepareEvents, ...laterEvents]
         gateHistoryEventSummary = summarizeGateHistoryEvents({ rows: historyEvents, graphId, rootTaskId,
-          prepareTaskId: parsedProof.nodes[2].taskId,
+          prepareTaskId: prepareNode.taskId,
           sessionId: ownerSessionId, turnId: ownerTurnId, graphContent: graph?.content,
-          prepareGraphRevision: parsedProof.graphRevision, prepareAttemptCount: parsedProof.nodes[2].attemptCount,
+          prepareGraphRevision: parsedProof.graphRevision, prepareAttemptCount: prepareNode.attemptCount,
           gateTaskId, gateAttemptCount: gate.attemptCount, gateTaskStatus: historyGateTask?.status ?? null,
           gateTaskAttemptCount: historyGateTask?.attemptCount ?? null, gateMaxAttempts: historyGateTask?.maxAttempts ?? null,
           graphRevision: graph?.revision ?? null })
@@ -2802,7 +2805,7 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
           try {
             gateHistoryCurrent = await gateHistory.scheduledTaskGraphGateHistoryIsCurrent({
               reader: tx, owner: ownerForLock, prepareGraphRevision: parsedProof.graphRevision,
-              prepareTaskId: parsedProof.nodes[2].taskId, prepareAttemptCount: parsedProof.nodes[2].attemptCount,
+              prepareTaskId: prepareNode.taskId, prepareAttemptCount: prepareNode.attemptCount,
               graphRevision: graph.revision, graphContent: graph.content,
               gateTask: historyGateTask, gate, expectedJobIds: parsedProof.result.jobs
                 .filter(job => job.status === "prepared").map(job => job.jobId),
