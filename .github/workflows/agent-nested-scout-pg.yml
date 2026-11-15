@@ -70,6 +70,8 @@ jobs:
       - name: Generate Prisma client
         run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
       - name: Build Worker dependencies
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: pnpm turbo build --filter=@jobcopilot/worker
       - name: Run wait-resolver diagnostic unit test
         run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/nested-scout-wait-resolver-diagnostic.test.ts
