@@ -8,6 +8,7 @@ import { appendComposerText, useAgentTurnComposerContext } from './agent-turn-co
 import { attachmentComposerContext, jobComposerContext, resumeComposerContext } from './AgentUnifiedStream.helpers'
 import { AgentComposerActiveTurn } from './AgentComposerActiveTurn'
 import { AgentComposerTools } from './AgentComposerTools'
+import { routeComposerSubmission, type AgentComposerMode } from './agent-composer-task-mode'
 
 export interface ComposerJob {
   id:       string
@@ -39,7 +40,6 @@ interface PromptChip {
   prompt: string
   onClick?: () => void
 }
-
 interface AgentComposerProps {
   waitingForAnswer: boolean
   chips: PromptChip[]
@@ -59,6 +59,12 @@ interface AgentComposerProps {
   onAddJobContext: (job: ComposerJob) => void
   onAddResumeContext: (resume: ComposerResume) => void
   onAppendComposerContext: (text: string) => void
+  composerMode?: AgentComposerMode
+  taskModeAvailable?: boolean
+  taskModeUnavailableMessage?: string
+  taskStartBusy?: boolean
+  onComposerModeChange?: (mode: AgentComposerMode) => void
+  onStartTask?: (text: string) => void
 }
 
 export function AgentComposer({
@@ -80,6 +86,12 @@ export function AgentComposer({
   onAddJobContext,
   onAddResumeContext,
   onAppendComposerContext,
+  composerMode = 'chat',
+  taskModeAvailable = false,
+  taskModeUnavailableMessage = 'Task mode is unavailable for this workspace.',
+  taskStartBusy = false,
+  onComposerModeChange = () => undefined,
+  onStartTask = () => undefined,
 }: AgentComposerProps) {
   const { t } = useI18n()
   const turnComposer = useAgentTurnComposerContext()
@@ -87,8 +99,13 @@ export function AgentComposer({
   const composerLoading = turnComposer?.sending ?? chatLoading
   const handleInputChange = turnComposer?.setChatInput ?? onChatInputChange
   const handleSend = (text: string) => {
+    if (composerMode === 'task') {
+      if (!canSend) return
+      routeComposerSubmission('task', text, { startTask: onStartTask, sendChat: onSendChat })
+      return
+    }
     if (!turnComposer) {
-      onSendChat(text)
+      routeComposerSubmission('chat', text, { startTask: onStartTask, sendChat: onSendChat })
       return
     }
     const outgoing = [text.trim(), attachmentComposerContext(attachedFiles)].filter(Boolean).join('\n\n')
@@ -96,6 +113,7 @@ export function AgentComposer({
     for (const file of attachedFiles) onRemoveAttachedFile(file.id)
   }
   const appendContext = (text: string) => {
+    if (taskStartBusy) return
     if (!turnComposer) {
       onAppendComposerContext(text)
       return
@@ -112,7 +130,9 @@ export function AgentComposer({
     if (turnComposer) appendContext(resumeComposerContext(resume))
     else onAddResumeContext(resume)
   }
-  const canSend = composerInput.trim().length > 0 && !composerLoading
+  const canSend = composerMode === 'task'
+    ? composerInput.trim().length > 0 && taskModeAvailable && !taskStartBusy && attachedFiles.length === 0
+    : composerInput.trim().length > 0 && !composerLoading
   return (
     <div className="agent-composer" style={{ borderTop: '1px solid rgba(79,70,229,0.08)', padding: '12px 14px max(14px, env(safe-area-inset-bottom))', background: 'linear-gradient(180deg, rgba(248,250,252,0.72), var(--bg-secondary))', flexShrink: 0 }}>
       {waitingForAnswer && (
@@ -121,6 +141,20 @@ export function AgentComposer({
         </div>
       )}
       {turnComposer && <AgentComposerActiveTurn controller={turnComposer} />}
+      <div role="group" aria-label="Composer mode" data-testid="composer-mode" style={{ display: 'flex', gap: 5, margin: '0 0 9px', padding: 3, width: 'fit-content', borderRadius: 9, border: '1px solid var(--border)', background: 'var(--bg-secondary)' }}>
+        <button type="button" aria-pressed={composerMode === 'chat'} aria-controls="agent-composer-input" data-testid="composer-mode-chat"
+          disabled={taskStartBusy} onClick={() => onComposerModeChange('chat')}
+          style={{ minHeight: 30, padding: '0 12px', border: 0, borderRadius: 7, background: composerMode === 'chat' ? 'var(--bg)' : 'transparent', color: 'var(--text)', cursor: taskStartBusy ? 'wait' : 'pointer', font: 'inherit', fontWeight: composerMode === 'chat' ? 700 : 500 }}>Chat</button>
+        <button type="button" aria-pressed={composerMode === 'task'} aria-controls="agent-composer-input" aria-describedby="composer-task-mode-help" data-testid="composer-mode-task"
+          disabled={!taskModeAvailable || taskStartBusy} title={taskModeAvailable ? undefined : taskModeUnavailableMessage}
+          onClick={() => onComposerModeChange('task')}
+          style={{ minHeight: 30, padding: '0 12px', border: 0, borderRadius: 7, background: composerMode === 'task' ? 'var(--bg)' : 'transparent', color: 'var(--text)', cursor: !taskModeAvailable || taskStartBusy ? 'not-allowed' : 'pointer', font: 'inherit', fontWeight: composerMode === 'task' ? 700 : 500 }}>Task</button>
+      </div>
+      <p id="composer-task-mode-help" role="status" style={{ margin: '0 0 8px', color: 'var(--text-muted)', fontSize: 11 }}>
+        {composerMode === 'task' && attachedFiles.length > 0
+          ? 'Task start supports text only. Remove attached files to start; they will remain attached until then.'
+          : !taskModeAvailable ? taskModeUnavailableMessage : composerMode === 'task' ? 'This text starts a plan-first task.' : 'Chat is the default. Choose Task to start a plan-first task.'}
+      </p>
       <div style={{ display: 'flex', gap: 7, marginBottom: 10, overflowX: 'auto', scrollbarWidth: 'none', padding: '1px 1px 3px' }}>
         {chips.map(chip => (
           <button className="agent-composer-chip" key={chip.label} onClick={() => chip.onClick ? chip.onClick() : handleSend(chip.prompt)} style={{
@@ -182,11 +216,13 @@ export function AgentComposer({
           </div>
         )}
         <textarea
+          id="agent-composer-input"
           ref={inputRef}
           value={composerInput}
+          disabled={taskStartBusy}
           onChange={e => handleInputChange(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(composerInput) } }}
-          placeholder={waitingForAnswer ? t('agent.messageAnswer') : t('agent.message')}
+          placeholder={composerMode === 'task' ? 'Describe the task to complete' : waitingForAnswer ? t('agent.messageAnswer') : t('agent.message')}
           rows={2}
           style={{ width: '100%', boxSizing: 'border-box', minHeight: 66, padding: '13px 14px 7px', fontSize: 14, border: 'none', background: 'transparent', color: 'var(--text)', outline: 'none', resize: 'none', fontFamily: 'inherit', lineHeight: 1.5 }}
         />
@@ -202,12 +238,11 @@ export function AgentComposer({
             onAddResumeContext={handleAddResumeContext}
             onAppendComposerContext={appendContext}
           />
-          <button onClick={() => handleSend(composerInput)} disabled={!canSend}
-            title={t('agent.sendMessage')}
-            aria-label={t('agent.sendMessage')}
+          <button data-testid="composer-mode-send" onClick={() => handleSend(composerInput)} disabled={!canSend}
+            title={composerMode === 'task' ? 'Start task' : t('agent.sendMessage')}
+            aria-label={composerMode === 'task' ? 'Start task' : t('agent.sendMessage')}
             style={{ width: 38, height: 38, display: 'grid', placeItems: 'center', borderRadius: 14, border: 'none', background: !canSend ? 'rgba(148,163,184,0.35)' : 'var(--brand-gradient)', color: '#fff', cursor: !canSend ? 'not-allowed' : 'pointer', boxShadow: canSend ? '0 8px 16px rgba(79,70,229,0.28)' : 'none', transition: 'transform 160ms ease, box-shadow 160ms ease' }}>
-            {composerLoading ? '…' : <ArrowUp size={19} strokeWidth={2.7} aria-hidden="true" />}
-          </button>
+            {taskStartBusy ? '…' : composerLoading ? '…' : <ArrowUp size={19} strokeWidth={2.7} aria-hidden="true" />}</button>
         </div>
       </div>
     </div>

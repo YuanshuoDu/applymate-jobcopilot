@@ -225,6 +225,12 @@ async function install(page: Page, options: { stale?: boolean; taskCheckpoint?: 
       const method = request.method()
       const body: unknown = method === 'POST' ? request.postDataJSON() : undefined
       state.agentRequests.push({ path: pathname, method, body })
+      if (pathname === '/api/agent/objective-start-attempts' && method === 'GET') {
+        const accountScope = createHash('sha256').update(`applymate:task-start-recovery:${state.activeUserId}`).digest('hex')
+        return route.fulfill({ status: 200, contentType: 'application/json',
+          headers: { 'Cache-Control': 'private, no-store', 'X-Account-Scope': accountScope },
+          body: JSON.stringify({ accountScope, attempts: [] }) })
+      }
       if (pathname === '/api/agent/roles' || pathname === '/api/agent/roles/custom') return json(route, [])
       if (pathname === '/api/agent/automations') return json(route, { automations: [] })
       if (pathname === '/api/agent/health') return json(route, { successRate: 100, captchaRate: 0, avgDurationMs: 1000, patternCacheRate: 100, last24hRuns: 1 })
@@ -6457,6 +6463,7 @@ test('opening the related Agent session does not read a stale session from the U
   await page.getByRole('button', { name: /^Tasks & results/ }).click()
   await expect(page.locator('[data-agent-approval-ledger="true"]')).toBeVisible()
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  expect(state.requestOwners).toContainEqual({ path: '/api/me/agent-search-footprint-memory', method: 'GET', userId: 'fixture-user' })
   expect(state.agentRequests.some(item => item.path.startsWith('/api/agent/sessions/stale-session'))).toBe(false)
   expect(state.agentRequests.filter(item => item.method === 'POST')).toEqual([])
   expect(state.writes).toEqual([])
@@ -6941,6 +6948,8 @@ test('application follows original Agent question, review and an unverified outc
   await page.locator('#desktop-sidebar').getByRole('button', { name: 'Agent', exact: true }).click()
   await expect(page).toHaveURL(/sessionId=original-session/)
   await expect(page.locator('.agent-context-bar')).toContainText('Fixture application task')
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  expect(state.requestOwners).toContainEqual({ path: '/api/me/agent-search-footprint-memory', method: 'GET', userId: 'fixture-user' })
   // Outcome is deliberately unknown; the fixture never performs an external submission.
   state.agentStage = 'unknown'
   await page.reload()
