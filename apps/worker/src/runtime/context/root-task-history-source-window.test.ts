@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { buildRootTaskHistoryCrossSessionWindow } from "./root-task-history-source-window.js"
+import { buildRootTaskHistoryCrossSessionWindow, buildRootTaskHistoryFootprintCrossSessionWindow } from "./root-task-history-source-window.js"
 
 const baseInput = {
   currentSessionId: "current-session", userId: "owner", currentTurnId: "current-turn", currentStartXid8: "90",
@@ -56,6 +56,50 @@ describe("root task history cross-session source window", () => {
     expect(sql).toContain('"terminalWitnessEventId" COLLATE "C" DESC NULLS LAST')
     expect(result.values).toEqual(["current-session", "owner", "current-turn", "90", null,
       "objective-digest", 2, '["user","none"]', 64, "87", "turn-7", "event-7", "witness-7"])
+  })
+
+  it("builds a separate user objective-v1 footprint origin predicate without broadening Task History", () => {
+    const result = buildRootTaskHistoryFootprintCrossSessionWindow({
+      ...baseInput, canonicalOrigin: '["user","objective_task_graph_execution",1]',
+    })
+    const sql = result.sql
+    const limit = sql.indexOf("LIMIT $9")
+
+    for (const predicate of [
+      'turn."source" IS DISTINCT FROM \'user\'',
+      "jsonb_typeof(turn.\"input\") IS DISTINCT FROM 'object'",
+      "(turn.\"input\"->'intent')->>'kind' = 'objective_task_graph_execution'",
+      "(turn.\"input\"->'intent')->'version' = '1'::jsonb",
+      "jsonb_build_array(turn.\"source\", 'objective_task_graph_execution', 1) = $8::jsonb",
+      'source_session."userId" = $2', '(witness.payload->>\'xid8\')::numeric < $4::numeric',
+      'turn."objectiveDigest" = $6', 'turn."objectiveIndexSemanticsVersion" = $7',
+    ]) {
+      expect(sql).toContain(predicate)
+      expect(sql.indexOf(predicate)).toBeLessThan(limit)
+    }
+    expect(sql).toContain("ARRAY['kind','version']")
+    expect(sql).toContain("ELSE FALSE")
+    expect(result.values).toEqual(["current-session", "owner", "current-turn", "90", null,
+      "objective-digest", 2, '["user","objective_task_graph_execution",1]', 64])
+
+    const history = buildRootTaskHistoryCrossSessionWindow(baseInput)
+    expect(history.sql).toContain("jsonb_build_array(turn.\"source\", 'none') = $8::jsonb")
+    expect(history.sql).not.toContain("'objective_task_graph_execution'")
+  })
+
+  it("guards outer and nested scalar intent values before object-only JSONB operations", () => {
+    const result = buildRootTaskHistoryFootprintCrossSessionWindow({
+      ...baseInput, canonicalOrigin: '["user","objective_task_graph_execution",1]',
+    })
+    const outerIntent = `(turn."input"->'intent')`
+    const nestedIntent = `((turn."input"->'input')->'intent')`
+
+    for (const intent of [outerIntent, nestedIntent]) {
+      const guard = `(CASE\n    WHEN jsonb_typeof(${intent}) = 'object' THEN (${intent} ?& ARRAY['kind','version']`
+      expect(result.sql).toContain(guard)
+      expect(result.sql).toContain(`ELSE FALSE\n  END)`) // scalar and null intents fail closed
+      expect(result.sql.indexOf(guard)).toBeLessThan(result.sql.indexOf(`${intent} - 'kind' - 'version'`))
+    }
   })
 
   it("caps raw rows at 64 and emits a separate watermark sentinel, including for an empty page", () => {

@@ -17,6 +17,7 @@ const NON_INHERITABLE_PRIVATE_EVENTS = new Set([
   "agent.plan.root_task_history_session_authorization",
   "agent.plan.root_task_history_memory_snapshot",
   "agent.plan.root_task_history_chronology_witness",
+  "agent.plan.root_task_history_search_footprint_snapshot",
 ])
 
 function json(value: unknown): Prisma.InputJsonValue {
@@ -56,7 +57,8 @@ function snapshotContent(value: unknown, sessionId: string, throughSequence: big
     if (Array.isArray(observations)) seeds.toolObservations = observations.filter((item) => {
       if (!item || typeof item !== "object" || Array.isArray(item)) return true
       const observation = item as { id?: unknown; status?: unknown }
-      return observation.id !== "root-task-history" && observation.status !== "pending" && observation.status !== "in_progress"
+      return observation.id !== "root-task-history" && observation.id !== "root-task-history-search-footprint"
+        && observation.status !== "pending" && observation.status !== "in_progress"
     })
     content.context = seeds
   }

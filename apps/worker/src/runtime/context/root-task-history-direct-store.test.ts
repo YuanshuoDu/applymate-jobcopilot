@@ -4,8 +4,12 @@ import { describe, expect, it, vi } from "vitest"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
+import { createDiscoveryQueryFootprint } from "../subagents/child-discovery-query-footprint.js"
+import * as taskGraphState from "../subagents/task-graph-pg-state.js"
 import { resolveRootTaskObjective } from "./root-task-objective.js"
+import * as historyProjection from "./root-task-history-lesson-projection.js"
 import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
 
 const { readWitness } = vi.hoisted(() => ({ readWitness: vi.fn(async (_client: unknown, input: { boundary: string; boundaryEventId: string; turnId: string }) => {
@@ -74,6 +78,10 @@ function candidate(index: number, terminalSequence = String(index * 2 + 2), stat
     terminalPayload: status === "failed" ? { turnId, taskId: rootTaskId, errorCode, finalItemId: null }
       : { turnId, taskId: rootTaskId, errorCode }, terminalEventCount: 1,
   }
+}
+
+function objectiveIntentInput(goal = "Explore roles") {
+  return { goal, successCriteria: ["Respect location"], intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT }
 }
 
 function currentStart(sequence = "1000"): Row {
@@ -277,6 +285,74 @@ describe("direct Root-task history PostgreSQL store", () => {
     const outcomes = await test.store.loadWithClient(test.client, test.input)
     expect(outcomes).toHaveLength(1)
     expect(outcomes[0]).not.toHaveProperty("terminalAt")
+  })
+
+  it("does no footprint source read without the independent authorization boolean", async () => {
+    const test = fixture()
+    const searchFootprints = await test.store.loadSearchFootprintsWithClient(test.client,
+      { ...test.input, searchFootprintReadAllowed: false })
+    expect(searchFootprints).toEqual({ roles: [], locations: [], atsSources: [] })
+    expect(test.queries).toEqual([])
+  })
+
+  it("rejects a footprint read outside the current tenant scope before source selection", async () => {
+    const test = fixture({ tenantScope: "another-user" })
+    await expect(test.store.loadSearchFootprintsWithClient(test.client,
+      { ...test.input, searchFootprintReadAllowed: true })).rejects.toThrow("root_task_history_scope_mismatch")
+    expect(test.queries.some(query => query.sql.includes("WITH terminal_window AS MATERIALIZED"))).toBe(false)
+    expect(test.queries.some(query => query.sql.includes("set_config"))).toBe(false)
+  })
+
+  it("does not load a source graph when its durable Root objective differs", async () => {
+    const mismatch = { ...candidate(11), sessionId: "prior-session", sourceSessionUserId: "user-1", goal: "Another objective",
+      input: objectiveIntentInput("Another objective") }
+    const test = fixture({ candidates: [mismatch], currentInput: objectiveIntentInput() })
+    await expect(test.store.loadSearchFootprintsWithClient(test.client,
+      { ...test.input, searchFootprintReadAllowed: true })).resolves.toEqual({ roles: [], locations: [], atsSources: [] })
+    expect(test.queries.some(query => query.sql.includes('FROM "agent_items" AS item'))).toBe(false)
+  })
+
+  it("loads only a bounded footprint from tenant-fenced, validated prior TaskGraphs", async () => {
+    const prior: Row = { ...candidate(3), sessionId: "prior-session", sourceSessionUserId: "user-1",
+      terminalStepSessionId: "prior-session", terminalStepEventSessionId: "prior-session", input: objectiveIntentInput() }
+    const test = fixture({ candidates: [prior], currentInput: objectiveIntentInput() })
+    const footprint = createDiscoveryQueryFootprint([{ criteria: { targetRoles: ["Backend Engineer"], targetLocations: ["Dublin"],
+      source: "lever", pageSize: 20, hasCursor: true }, outcome: "completed", requestCount: 2, observedCandidateCount: 7,
+      providerFailures: 0, materializationFailures: 0, hasMore: false }])
+    const graph = { revision: 9, discoveryTurnEligibility: "ordinary", nodes: [{ templateId: "scout", status: "completed",
+      verification: { schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "scout",
+        criteria: [{ id: "scout-count", check: { kind: "candidate_count_gte", minimum: 1 } }] }, discoveryQueryFootprint: footprint }] }
+    const loaded = { item: {}, snapshot: {}, state: {}, tasks: new Map() }
+    const load = vi.spyOn(taskGraphState, "loadTaskGraph").mockResolvedValue(loaded as never)
+    const current = vi.spyOn(taskGraphState, "currentTaskGraph").mockReturnValue(graph as never)
+    const validate = vi.spyOn(historyProjection, "projectLoadedRootTaskHistoryGraph").mockReturnValue({ taskGraph: { revision: 1, nodes: [{}] } } as never)
+    try {
+      const searchFootprints = await test.store.loadSearchFootprintsWithClient(test.client,
+        { ...test.input, searchFootprintReadAllowed: true })
+      expect(searchFootprints).toEqual({ roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] })
+      expect(load).toHaveBeenCalledWith(test.client, { userId: "user-1", sessionId: "prior-session", turnId: prior.turnId,
+        rootTaskId: prior.rootTaskId, parentTaskId: prior.rootTaskId }, false)
+      expect(current).toHaveBeenCalledWith(loaded)
+      expect(validate).toHaveBeenCalledWith(loaded, true)
+      expect(test.queries.some(query => query.sql.includes("current_setting('app.user_id'"))).toBe(true)
+      expect(JSON.stringify(searchFootprints)).not.toMatch(/pageSize|hasCursor|requestCount|observedCandidateCount|providerFailures|materializationFailures|hasMore|turn-source-3|root-source-3/)
+    } finally {
+      load.mockRestore(); current.mockRestore(); validate.mockRestore()
+    }
+  })
+
+  it("does not query footprint history for a missing or malformed current objective intent", async () => {
+    for (const currentInput of [
+      { goal: "Explore roles", successCriteria: ["Respect location"] },
+      { ...objectiveIntentInput(), intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, version: 2 } },
+      { ...objectiveIntentInput(), intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, extra: true } },
+      { ...objectiveIntentInput(), input: { intent: { kind: "interactive_discovery_shortlist", version: 1 } } },
+    ]) {
+      const test = fixture({ currentInput })
+      await expect(test.store.loadSearchFootprintsWithClient(test.client,
+        { ...test.input, searchFootprintReadAllowed: true })).resolves.toEqual({ roles: [], locations: [], atsSources: [] })
+      expect(test.queries.some(query => query.sql.includes("WITH terminal_window AS MATERIALIZED"))).toBe(false)
+    }
   })
 
   it("binds exact canonical objectives across distinct source Root IDs and reloads only their scoped graphs", async () => {
