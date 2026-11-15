@@ -309,7 +309,24 @@ describe("reconcileDurableSubagentWaits", () => {
     expect(fake.state.resolvedAt?.getTime()).toBeGreaterThanOrEqual(deadlineAt.getTime())
     expect(fake.state.waitUpdatedAt).toEqual(fake.state.resolvedAt)
     expect(fake.state.parentUpdatedAt).toEqual(fake.state.resolvedAt)
+    expect(graphMocks.prepare).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      taskId: "parent-1", sessionId: "session-1", type: "task.queued", attemptCount: 3, waitRowId: "wait-1",
+    }))
     expect(graphMocks.persist).toHaveBeenCalledWith(expect.anything(), transition, fake.state.resolvedAt)
+  })
+
+  it("scopes a directly expired wait's queued lifecycle receipt to that persisted wait row", async () => {
+    const transition = { event: { type: "task.queued" } }
+    graphMocks.prepare.mockResolvedValueOnce(transition)
+    const fake = fixture({ deadline: new Date(now.getTime() - 1) })
+
+    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 1 })
+
+    expect(fake.state).toMatchObject({ waitStatus: "timed_out", parentStatus: "queued", outbox: 1 })
+    expect(graphMocks.prepare).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      taskId: "parent-1", sessionId: "session-1", type: "task.queued", attemptCount: 3, waitRowId: "wait-1",
+    }))
+    expect(graphMocks.persist).toHaveBeenCalledWith(expect.anything(), transition, now)
   })
 
   it("times out exactly once and fails closed when a target is no longer a direct child", async () => {
@@ -329,7 +346,7 @@ describe("reconcileDurableSubagentWaits", () => {
     const fake = fixture()
     await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 1 })
     expect(graphMocks.prepare).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      taskId: "parent-1", sessionId: "session-1", type: "task.queued", attemptCount: 3,
+      taskId: "parent-1", sessionId: "session-1", type: "task.queued", attemptCount: 3, waitRowId: "wait-1",
     }))
     expect(graphMocks.persist).toHaveBeenCalledWith(expect.anything(), transition, now)
     expect(fake.state).toMatchObject({ waitStatus: "ready", parentStatus: "queued", outbox: 1 })

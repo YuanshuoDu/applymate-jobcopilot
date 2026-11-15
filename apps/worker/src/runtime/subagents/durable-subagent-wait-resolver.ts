@@ -136,7 +136,7 @@ async function reconcileOne(client: Queryable, wait: Row, ownerId: string): Prom
   if (!requestIds || !sameIdsInOrder(requestIds, ids)) return "ignored"
   const safeRequest = { ...request, targetTaskIds: requestIds }
   const graphQueued = await prepareGraphTransition(client, {
-    taskId: parentTaskId, sessionId: String(wait.sessionId), type: "task.queued", attemptCount: Number(wait.parentAttempt),
+    taskId: parentTaskId, sessionId: String(wait.sessionId), type: "task.queued", attemptCount: Number(wait.parentAttempt), waitRowId: String(wait.id),
   })
   let changed = false
   for (let attempt = 0; attempt < 2; attempt++) {

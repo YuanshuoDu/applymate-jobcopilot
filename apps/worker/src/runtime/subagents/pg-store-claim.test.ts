@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { claimSubagentTask, matchesPublishedSubagentDispatch } from "./pg-store-claim.js"
@@ -7,7 +7,12 @@ import { parseSubagentDispatchJobId, SUBAGENT_DISPATCH_IDENTITY_MISMATCH, subage
 import { hasScheduledGateResumeAcknowledgement } from "./scheduled-gate-resume-admission.js"
 import { SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE } from "./scheduled-audit-contract.js"
 
+const graphMocks = vi.hoisted(() => ({ prepare: vi.fn(), persist: vi.fn() }))
 vi.mock("./scheduled-gate-resume-admission.js", () => ({ hasScheduledGateResumeAcknowledgement: vi.fn() }))
+vi.mock("./task-graph-pg-lifecycle.js", () => ({
+  prepareGraphTransition: graphMocks.prepare,
+  persistGraphTransition: graphMocks.persist,
+}))
 
 const input = {
   taskId: "child-1", sessionId: "session-1", ownerId: "worker-1", rootTaskId: "root-1",
@@ -15,7 +20,7 @@ const input = {
 }
 
 type DeferredFence = { lastError: string | null; payload?: unknown; publishedAt?: unknown; attemptCount?: unknown }
-function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turnUnavailable?: boolean; childWaitResumable?: boolean; gateResumeStep?: boolean; taskAttemptCount?: number; maxAttempts?: number; role?: string; taskType?: string; failureReason?: string | null; outbox?: DeferredFence; graphDeadlineAt?: Date | null; expiredGraphChild?: boolean } = {}) {
+function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turnUnavailable?: boolean; childWaitResumable?: boolean; currentWaitId?: string; historicalWaitIds?: readonly string[]; resumableWaitRows?: readonly string[]; gateResumeStep?: boolean; taskAttemptCount?: number; maxAttempts?: number; role?: string; taskType?: string; failureReason?: string | null; outbox?: DeferredFence; graphDeadlineAt?: Date | null; expiredGraphChild?: boolean } = {}) {
   const calls: string[] = []
   const parameters: Array<unknown[] | undefined> = []
   const outbox = options.outbox ? { id: "dispatch-1", ...options.outbox, payload: options.outbox.payload ?? { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" } } : null
@@ -48,6 +53,14 @@ function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turn
         attemptCount: options.taskAttemptCount ?? 1, maxAttempts: options.maxAttempts ?? 3 }], rowCount: 1 }
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return options.pause ? { rows: [], rowCount: 0 } : { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("FOR UPDATE")) return outbox ? { rows: [outbox], rowCount: 1 } : { rows: [], rowCount: 0 }
+      if (sql.startsWith('SELECT wait."id"') && sql.includes('FROM "sub_agent_tasks" AS task JOIN "agent_wait_conditions" AS wait')) {
+        if (!options.childWaitResumable) return { rows: [], rowCount: 0 }
+        const latestWaitPredicateCount = sql.split('wait."id" = (SELECT currentWait."id"').length - 1
+        const rows = options.resumableWaitRows ?? (latestWaitPredicateCount >= 2
+          ? [options.currentWaitId ?? "current-wait-row"]
+          : options.historicalWaitIds ?? [options.currentWaitId ?? "current-wait-row"])
+        return { rows: rows.map(id => ({ id })), rowCount: rows.length }
+      }
       if (sql.includes("COUNT(*)::int")) return { rows: [{ count: 0 }], rowCount: 1 }
       if (sql.includes('SELECT DISTINCT item."stepId"')) return options.gateResumeStep ? { rows: [{ stepId: "root-step-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes('SELECT task."turnId", task."rootTaskId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: null, attemptCount: 0, userId: "user-1" }], rowCount: 1 }
@@ -71,6 +84,11 @@ function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turn
   }
   return { pool: { connect: vi.fn().mockResolvedValue(client) } as unknown as Pick<pg.Pool, "connect">, calls, parameters, client, outbox }
 }
+
+beforeEach(() => {
+  graphMocks.prepare.mockReset().mockResolvedValue(null)
+  graphMocks.persist.mockReset().mockResolvedValue(undefined)
+})
 
 describe("atomic child claim pause fence", () => {
   it("locks Session and Turn, checks fresh admission, then locks root and child before incrementing attempt", async () => {
@@ -182,6 +200,72 @@ describe("atomic child claim pause fence", () => {
     expect(update).toContain('AND (NOT ((SELECT COUNT(*) = 1')
     expect(fake.parameters[fake.calls.indexOf(update)]).toEqual(["child-1", "session-1", "worker-1", 60_000, "turn-1", "root-1", "user-1", true, false, false])
     expect(fake.outbox).toMatchObject({ attemptCount: 4 })
+  })
+
+  it.each([
+    ["unconsumed latest wait step", "ready-wait-row"],
+    ["consumed wait with its latest continuation step", "consumed-wait-row"],
+  ])("binds a resumed claim to the exact %s and validated dispatch generation", async (_label, currentWaitId) => {
+    const identity = parseSubagentDispatchJobId(subagentDispatchJobId(input.taskId, 3), input.taskId)
+    if (!identity) throw new Error("Fixture dispatch ID did not parse")
+    const graph = { event: { type: "task.started" } }
+    graphMocks.prepare.mockResolvedValueOnce(graph)
+    const fake = poolFixture({ childWaitResumable: true, currentWaitId, taskAttemptCount: 3, maxAttempts: 3,
+      outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 4 } })
+
+    await expect(claimSubagentTask(fake.pool, { ...input, dispatchIdentity: identity }, 60_000))
+      .resolves.toMatchObject({ id: "child-1", attemptCount: 3 })
+
+    const waitReadIndex = fake.calls.findIndex(sql => sql.startsWith('SELECT wait."id"'))
+    const waitRead = fake.calls[waitReadIndex]
+    const waitReadSql = waitRead ?? ""
+    expect(waitReadIndex).toBeGreaterThan(-1)
+    expect(waitReadSql).toContain('wait."id" = (SELECT currentWait."id"')
+    expect(waitReadSql).toContain('ORDER BY currentWaitStep."ordinal" DESC, currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1')
+    expect(waitReadSql).toContain('wait."consumedAt" IS NULL AND step."status" = \'waiting_for_tool\'')
+    expect(waitReadSql).toContain('continuation."ordinal" = (SELECT MIN(later."ordinal")')
+    expect(fake.parameters[waitReadIndex]).toEqual(["child-1", "session-1", "user-1"])
+    expect(graphMocks.prepare).toHaveBeenCalledWith(expect.anything(), {
+      taskId: "child-1", sessionId: "session-1", type: "task.started", attemptCount: 4,
+      waitRowId: currentWaitId, waitDispatchGeneration: 3,
+    })
+    expect(graphMocks.persist).toHaveBeenCalledWith(expect.anything(), graph, input.now)
+  })
+
+  it("selects the latest resumable wait identity when older wait rows remain in history", async () => {
+    const identity = parseSubagentDispatchJobId(subagentDispatchJobId(input.taskId, 3), input.taskId)
+    if (!identity) throw new Error("Fixture dispatch ID did not parse")
+    const graph = { event: { type: "task.started" } }
+    graphMocks.prepare.mockResolvedValueOnce(graph)
+    const fake = poolFixture({ childWaitResumable: true, currentWaitId: "latest-wait-row",
+      historicalWaitIds: ["older-wait-row", "latest-wait-row"], taskAttemptCount: 3, maxAttempts: 3,
+      outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 4 } })
+
+    await expect(claimSubagentTask(fake.pool, { ...input, dispatchIdentity: identity }, 60_000))
+      .resolves.toMatchObject({ id: "child-1", attemptCount: 3 })
+
+    const waitReadIndex = fake.calls.findIndex(sql => sql.startsWith('SELECT wait."id"'))
+    const waitRead = fake.calls[waitReadIndex] ?? ""
+    expect(waitRead.split('wait."id" = (SELECT currentWait."id"').length - 1).toBe(2)
+    expect(waitRead).toContain('ORDER BY currentWaitStep."ordinal" DESC, currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1')
+    expect(graphMocks.prepare).toHaveBeenCalledWith(expect.anything(), {
+      taskId: "child-1", sessionId: "session-1", type: "task.started", attemptCount: 4,
+      waitRowId: "latest-wait-row", waitDispatchGeneration: 3,
+    })
+  })
+
+  it("fails closed if the resumable wait identity query returns multiple candidates", async () => {
+    const identity = parseSubagentDispatchJobId(subagentDispatchJobId(input.taskId, 3), input.taskId)
+    if (!identity) throw new Error("Fixture dispatch ID did not parse")
+    const fake = poolFixture({ childWaitResumable: true, resumableWaitRows: ["wait-a", "wait-b"],
+      taskAttemptCount: 3, maxAttempts: 3,
+      outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 4 } })
+
+    await expect(claimSubagentTask(fake.pool, { ...input, dispatchIdentity: identity }, 60_000))
+      .rejects.toThrow("child_wait_resume_identity_ambiguous")
+    expect(graphMocks.prepare).not.toHaveBeenCalled()
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.at(-1)).toBe("ROLLBACK")
   })
 
   it("does not let a direct claim resume a persisted wait without the current published dispatch identity", async () => {

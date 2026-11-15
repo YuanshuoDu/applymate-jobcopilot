@@ -137,6 +137,12 @@ function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], consume
     query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
       calls.push({ sql, values })
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.startsWith('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: child.sessionId }], rowCount: 1 }
+      if (sql.startsWith('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: child.turnId }], rowCount: 1 }
+      if (sql.startsWith('SELECT "id" FROM "sub_agent_tasks"')) {
+        const childLock = sql.includes('"rootTaskId" = $4')
+        return { rows: [{ id: childLock ? child.id : child.rootTaskId }], rowCount: 1 }
+      }
       if (sql.includes('WHERE task."id" = $1 AND task."sessionId"')) return { rows: [currentRow(child)], rowCount: 1 }
       if (sql.includes('FROM "agent_wait_conditions" AS wait')) return { rows: consumedWait ? [consumedWait] : [], rowCount: consumedWait ? 1 : 0 }
       if (sql.includes('WHERE task."id" = ANY($1::text[])')) return { rows: targets, rowCount: targets.length }
@@ -153,6 +159,16 @@ function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], consume
         && sql.includes('"content"->>\'toolCallId\' = $4')) {
         const rows = persistedItems.filter(row => (row.content as Row).toolCallId === values[3])
         return { rows, rowCount: rows.length }
+      }
+      if (sql.startsWith('SELECT "id", "sessionId", "turnId", "taskId", "itemId", "type", "actor", "correlationId", "causationId", "sequence", "idempotencyKey", "payload" FROM "agent_events" WHERE')) {
+        const keys = Array.isArray(values[6]) ? values[6] as string[] : []
+        const lifeIdPrefix = String(values[7] ?? ""), lifeKeyPrefix = String(values[8] ?? "")
+        const policyId = String(values[9] ?? ""), policyKey = String(values[10] ?? "")
+        const visible = persistedEvents.filter(row => row.sessionId === values[0] && row.turnId === values[1] && row.taskId === values[2]
+          && (row.itemId === values[3] || row.correlationId === values[4] || row.itemId === values[5] || row.correlationId === values[5]
+            || keys.includes(String(row.idempotencyKey)) || String(row.id).startsWith(lifeIdPrefix)
+            || String(row.idempotencyKey).startsWith(lifeKeyPrefix) || row.id === policyId || row.idempotencyKey === policyKey))
+        return { rows: visible, rowCount: visible.length }
       }
       if (sql.startsWith('SELECT "id", "itemId", "type", "actor", "correlationId", "causationId", "sequence",') && sql.includes('FROM "agent_events" WHERE')) {
         const keys = Array.isArray(values[6]) ? values[6] as string[] : []
@@ -250,7 +266,7 @@ describe("child attempt durable resume", () => {
       resume: { nextOrdinal: 1, stepCount: 1 },
     })
     expect(db.calls.find(call => call.sql.includes('WHERE task."id" = $1 AND task."sessionId"'))?.sql)
-      .toContain('task."leaseExpiresAt" > CURRENT_TIMESTAMP')
+      .toContain('task."leaseExpiresAt" > clock_timestamp()')
   })
 
   it("checks first attempts for an acknowledged durable wait before returning no resume", async () => {
@@ -532,6 +548,12 @@ describe("child attempt durable resume", () => {
     mismatch.client.query.mockImplementation(async (sql: string, values: readonly unknown[] = []) => {
       mismatch.calls.push({ sql, values })
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.startsWith('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: child.sessionId }], rowCount: 1 }
+      if (sql.startsWith('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: child.turnId }], rowCount: 1 }
+      if (sql.startsWith('SELECT "id" FROM "sub_agent_tasks"')) {
+        const childLock = sql.includes('"rootTaskId" = $4')
+        return { rows: [{ id: childLock ? child.id : child.rootTaskId }], rowCount: 1 }
+      }
       if (sql.includes('SELECT task."id"')) return { rows: [{ ...currentRow(child), leaseOwner: "other-worker" }], rowCount: 1 }
       if (sql.includes('FROM "agent_steps"')) return { rows: [step(child, { taskId: "other-task" })], rowCount: 1 }
       return { rows: [], rowCount: 0 }

@@ -8,14 +8,17 @@ import type { DiscoveryRecoverySnapshot } from "./task-graph-discovery-recovery-
 import type { ScheduledPrepareReferenceResolver } from "./child-scheduled-prepare-reference.js"
 import type { DurableWaitResume } from "./child-resume-observations.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
+import type { PrepareFinalDependencyWait } from "../turns/turn-execution-options.js"
 import { getSubagentRolePolicy, visibleToolPolicy } from "./role-policy.js"
 import { selectedJobToolAllowed } from "./selected-job-artifact-context.js"
 import type { SubagentRolePolicy } from "./role-policy.js"
 import type { SubagentExecutionResult, SubagentTaskRecord, SubagentLease } from "./types.js"
 import { childWaitRecoveryLogicalStepOrdinal } from "./child-resume-wait-call-contract.js"
+import { nestedScoutProfileForTask } from "./nested-scout-profile.js"
 
 export type ChildPublicDefinition = Omit<RuntimeToolDefinition, "execute">
 export type ChildRolePolicyTask = Pick<SubagentTaskRecord, "role" | "allowedActions">
+  & Partial<Pick<SubagentTaskRecord, "taskType" | "depth" | "parentTaskId" | "rootTaskId" | "context">>
 export type ChildToolRuntime = {
   readonly definitions: readonly ChildPublicDefinition[]
   readonly router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> }
@@ -25,12 +28,18 @@ export type ChildToolRuntime = {
   readonly discoveryAttemptSidecar?: () => DiscoveryAttemptSidecar | undefined
   readonly discoveryRecoverySidecar?: () => DiscoveryRecoverySnapshot | undefined
   readonly resolveScheduledPrepareReference?: ScheduledPrepareReferenceResolver
+  readonly prepareFinalDependencyWait?: PrepareFinalDependencyWait
   readonly executePrivateTool?: (context: PrivateArtifactToolContext, request: ToolCallRequest) => Promise<ToolExecutionResult>
   readonly validateArguments?: (name: string, input: unknown, version?: string) => true | string
 }
 
 export function canManageChildrenWithWaitAction(policy: Pick<SubagentRolePolicy, "canManageChildren"> | null, actions: unknown): boolean {
   return policy?.canManageChildren === true && Array.isArray(actions) && actions.some(action => action === "wait_subagents")
+}
+
+export function canResumeChildWait(task: ChildRolePolicyTask, policy: Pick<SubagentRolePolicy, "canManageChildren"> | null): boolean {
+  return canManageChildrenWithWaitAction(policy, task.allowedActions)
+    || nestedScoutProfileForTask(task) !== null && Array.isArray(task.allowedActions) && task.allowedActions.includes("wait_subagents")
 }
 
 function exactCapabilities(actual: readonly string[], expected: readonly string[]): boolean {
@@ -44,6 +53,15 @@ function isExactDurableWaitDefinition(definition: ChildPublicDefinition): boolea
     && definition.requiredCapabilities.length === 0
 }
 
+function exactNamedCoordinationDefinition(definition: ChildPublicDefinition, name: "scout.delegate" | "scout.results"): boolean {
+  if (definition.name !== name || definition.version !== "1" || definition.domain !== "coordination"
+    || definition.requiredCapabilities.length !== 1 || definition.requiredCapabilities[0] !== "read") return false
+  if (name === "scout.delegate") return definition.risk === "internal_write" && definition.idempotency === "requires_key"
+    && exactCapabilities(definition.capabilities, ["coordination"])
+  return definition.risk === "read" && definition.idempotency === "read_only"
+    && exactCapabilities(definition.capabilities, ["read"])
+}
+
 export function visibleChildDefinitions(
   task: ChildRolePolicyTask,
   definitions: readonly ChildPublicDefinition[],
@@ -52,10 +70,14 @@ export function visibleChildDefinitions(
 ): ChildPublicDefinition[] {
   const policy = getSubagentRolePolicy(task.role)
   if (!policy) throw new Error("subagent_role_unknown")
+  const nestedScout = nestedScoutProfileForTask(task) !== null
   const actions = new Set(Array.isArray(task.allowedActions) ? task.allowedActions.filter((action): action is string => typeof action === "string") : [])
   return definitions.filter(definition => {
     if (!actions.has(definition.name) || (selectedJob && !selectedJobToolAllowed(task.role, definition.name, writerRevision))) return false
-    if (definition.name === "wait_subagents") return isExactDurableWaitDefinition(definition) && canManageChildrenWithWaitAction(policy, task.allowedActions)
+    if (definition.name === "wait_subagents") return isExactDurableWaitDefinition(definition)
+      && (canManageChildrenWithWaitAction(policy, task.allowedActions) || nestedScout)
+    if (definition.name === "scout.delegate" || definition.name === "scout.results") return nestedScout
+      && exactNamedCoordinationDefinition(definition, definition.name)
     if (definition.name === "tool_results.read") {
       return definition.risk === "read" && definition.idempotency === "read_only"
         && definition.capabilities.includes("read") && policy.allowedRisks.includes("read")

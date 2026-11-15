@@ -331,6 +331,17 @@ describe("TaskGraph planning kernel", () => {
     expect(reduceTaskGraphEvent(state, { type: "task.completed", nodeKey: "a", idempotencyKey: "event-2", expectedRevision: 1 })).toMatchObject({ ok: false, error: { code: "revision_mismatch" } })
   })
 
+  it("keeps a prior waiting receipt exact while allowing a later wait with a fresh identity", () => {
+    let state = append(createInitialTaskGraphState(), [node("a")])
+    state = transition(state, "task.started", "a", "start-first")
+    state = transition(state, "task.waiting", "a", "legacy-wait-key")
+    state = transition(state, "task.queued", "a", "resume-first")
+    state = transition(state, "task.started", "a", "start-second")
+
+    expect(event(state, "task.waiting", "a", "legacy-wait-key")).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } })
+    expect(event(state, "task.waiting", "a", "wait-row-second")).toMatchObject({ ok: true, duplicate: false, state: { revision: state.revision + 1 } })
+  })
+
   it("resumes only the exact scheduled Gate node after an answered private choice", () => {
     const state: TaskGraphState = { revision: 12, appliedEvents: [], nodes: [
       { ...node("prepare", { templateId: "prepare" }), depth: 3, status: "completed", taskId: "prepare-task", verificationDisposition: "specialized" },
