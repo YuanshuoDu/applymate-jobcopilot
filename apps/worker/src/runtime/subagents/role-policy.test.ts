@@ -74,6 +74,16 @@ describe("subagent role policy", () => {
     expect(visibleToolPolicy("scout", discoverTool({ name: "jobs.search" })).visible).toBe(false)
   })
 
+  it("keeps Scout delegation and result coordination closed by default", () => {
+    const delegate = { ...tool("scout.delegate", "internal_write", "coordination"), capabilities: ["coordination"] as const }
+    const results = tool("scout.results", "read", "coordination")
+    expect(getSubagentRolePolicy("scout")).toMatchObject({ canManageChildren: false, externalWritesEnabled: false })
+    for (const candidate of [delegate, results]) {
+      expect(visibleToolPolicy("scout", candidate).visible).toBe(false)
+    }
+    expect(visibleSubagentTools("scout", [delegate, results])).toEqual([])
+  })
+
   it("registers Application Filler as a server-owned role with no model-visible tools", () => {
     expect(getSubagentRolePolicy(APPLICATION_FILLER_ROLE)).toMatchObject({
       role: APPLICATION_FILLER_ROLE, actorRole: "subagent", capabilities: [], allowedRisks: [], allowedDomains: [],

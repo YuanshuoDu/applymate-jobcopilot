@@ -5,6 +5,8 @@ import { actionList, asObject, INSERT_TASK, json, rowToTask, SELECT_TASK, type Q
 import { assertSessionWorkAdmission } from "../session-gate.js"
 import { assertNoUnresolvedSteering } from "./steering-reconciliation-ledger.js"
 import type { SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
+import { filterNestedScoutProtectedActions, hasNestedScoutPrivateContext, hasNestedScoutProtectedActions,
+  isNestedScoutCreationAuthorityValid, type NestedScoutCreationAuthority } from "./nested-scout-creation-authority.js"
 
 export async function readSubagentTask(client: Queryable, taskId: string, sessionId: string): Promise<SubagentTaskRecord> {
   const result = await client.query(SELECT_TASK, [taskId, sessionId])
@@ -47,8 +49,18 @@ export async function createSubagentTask(
   client: Queryable,
   input: SubagentTaskSpec & { policy: SubagentPolicy },
   sessionLocked = false,
-  options: { preserveEmptyAllowedActions?: boolean; taskGraphChildDeadline?: boolean } = {},
+  options: { preserveEmptyAllowedActions?: boolean; taskGraphChildDeadline?: boolean; nestedScoutAuthority?: NestedScoutCreationAuthority } = {},
 ): Promise<SubagentTaskRecord> {
+  if (options.nestedScoutAuthority !== undefined && options.nestedScoutAuthority !== "parent_template" && options.nestedScoutAuthority !== "child_execution") {
+    throw new Error("nested_scout_creation_authority_invalid")
+  }
+  if (options.nestedScoutAuthority === undefined && hasNestedScoutPrivateContext(input.context)) {
+    throw new Error("nested_scout_creation_authority_unavailable")
+  }
+  if (options.nestedScoutAuthority === undefined && input.parentTaskId
+    && hasNestedScoutProtectedActions(input.allowedActions)) {
+    throw new Error("nested_scout_creation_authority_unavailable")
+  }
   if (!sessionLocked) await lockSubagentSession(client, input)
   if (input.turnId) await lockSubagentTurnForWork(client, { sessionId: input.sessionId, userId: input.userId, turnId: input.turnId })
   else if (input.parentTaskId) throw new Error("Subagent child requires an owning Turn")
@@ -66,7 +78,8 @@ export async function createSubagentTask(
       || isTerminalSubagentStatus(String(rootRow.status))) throw new Error("Root task is unavailable")
   }
   const parent = input.parentTaskId
-    ? await client.query(`SELECT "id", "rootTaskId", "path", "depth", "status", "allowedActions", "modelProfileSnapshot", "budgetSnapshot", "toolPolicySnapshot"
+    ? await client.query(`SELECT "id", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "allowedActions",
+        "context", "expectedOutputSchema", "modelProfileSnapshot", "budgetSnapshot", "toolPolicySnapshot"
          FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 FOR UPDATE`, [input.parentTaskId, input.sessionId])
     : { rows: [] }
   if (input.parentTaskId && (!parent.rows[0] || parent.rows[0].rootTaskId !== boundParent?.rootTaskId)) throw new Error("Parent task changed during child spawn")
@@ -92,7 +105,30 @@ export async function createSubagentTask(
   const parentActions = parentRow ? actionList(parentRow.allowedActions) : []
   const requestedActions = actionList(input.allowedActions)
   if (parentRow && requestedActions.some(action => !parentActions.includes(action))) throw new Error("Child allowed actions exceed parent policy")
-  const allowedActions = parentRow && requestedActions.length === 0 && !options.preserveEmptyAllowedActions ? parentActions : requestedActions
+  const allowedActions = parentRow && requestedActions.length === 0 && !options.preserveEmptyAllowedActions
+    ? filterNestedScoutProtectedActions(parentActions) : requestedActions
+  if (options.nestedScoutAuthority !== undefined) {
+    const validRoot = Boolean(parentRow && parentRow.id === rootTaskId && parentRow.parentTaskId == null
+      && Number(parentRow.depth) === 0 && parentRow.role === "orchestrator" && parentRow.taskType === "root")
+    const validParent = options.nestedScoutAuthority === "parent_template" ? validRoot : Boolean(parentRow && isNestedScoutCreationAuthorityValid("parent_template", {
+      role: parentRow.role, taskType: parentRow.taskType, depth: Number(parentRow.depth), parentTaskId: parentRow.parentTaskId,
+      rootTaskId: parentRow.rootTaskId, expectedOutputSchema: parentRow.expectedOutputSchema,
+      context: parentRow.context, allowedActions: parentRow.allowedActions,
+    }))
+    if (!validParent || !isNestedScoutCreationAuthorityValid(options.nestedScoutAuthority, {
+      role: input.role, taskType: input.taskType, depth, parentTaskId: input.parentTaskId ?? null,
+      rootTaskId, expectedOutputSchema: input.expectedOutputSchema, context: input.context, allowedActions,
+    })) throw new Error("nested_scout_creation_authority_invalid")
+  }
+  if (options.nestedScoutAuthority === "child_execution") {
+    const lifetime = await client.query<{ count: unknown }>(`SELECT COUNT(*)::int AS "count" FROM "sub_agent_tasks"
+      WHERE "sessionId" = $1 AND "parentTaskId" = $2`, [input.sessionId, input.parentTaskId])
+    const total = Number(lifetime.rows[0]?.count)
+    const limit = Math.min(2, input.policy.maxFanOut)
+    if (!Number.isSafeInteger(total) || total < 0 || !Number.isSafeInteger(limit) || limit < 1 || total >= limit) {
+      throw new SubagentLimitError("fan_out", "Nested Scout child limit reached")
+    }
+  }
   const result = await client.query(`${INSERT_TASK} RETURNING "id"`, [
     id, input.sessionId, input.turnId ?? null, rootTaskId, input.parentTaskId ?? null, path, depth,
     input.role, input.taskType, input.goal, json(input.constraints, []), json(input.successCriteria, []),

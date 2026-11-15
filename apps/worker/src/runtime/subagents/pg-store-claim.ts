@@ -26,6 +26,13 @@ export async function taskGraphDeadlineLive(client: Queryable, taskId: string, s
   return result.rowCount === 1
 }
 
+const CHILD_WAIT_CURRENT_ROW_SQL = `(SELECT currentWait."id" FROM "agent_wait_conditions" AS currentWait
+  JOIN "agent_steps" AS currentWaitStep ON currentWaitStep."id" = currentWait."stepId"
+    AND currentWaitStep."sessionId" = currentWait."sessionId" AND currentWaitStep."turnId" = currentWait."turnId"
+    AND currentWaitStep."taskId" = task."id" AND currentWaitStep."attempt" = task."attemptCount"
+  WHERE currentWait."parentTaskId" = task."id" AND currentWait."sessionId" = task."sessionId"
+    AND currentWait."turnId" = task."turnId"
+  ORDER BY currentWaitStep."ordinal" DESC, currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1)`
 const CHILD_WAIT_RESUMABLE_SQL = `(SELECT COUNT(*) = 1
   FROM "agent_wait_conditions" AS wait
   JOIN "agent_turns" AS waitTurn ON waitTurn."id" = wait."turnId" AND waitTurn."sessionId" = wait."sessionId"
@@ -49,13 +56,7 @@ const CHILD_WAIT_RESUMABLE_SQL = `(SELECT COUNT(*) = 1
             WHERE currentStep."taskId" = task."id" AND currentStep."sessionId" = task."sessionId"
               AND currentStep."turnId" = task."turnId" AND currentStep."attempt" = task."attemptCount"))))
     AND wait."status" IN ('ready', 'timed_out') AND wait."suspendedAt" IS NOT NULL
-    AND wait."id" = (SELECT currentWait."id" FROM "agent_wait_conditions" AS currentWait
-      JOIN "agent_steps" AS currentWaitStep ON currentWaitStep."id" = currentWait."stepId"
-        AND currentWaitStep."sessionId" = currentWait."sessionId" AND currentWaitStep."turnId" = currentWait."turnId"
-        AND currentWaitStep."taskId" = task."id" AND currentWaitStep."attempt" = task."attemptCount"
-      WHERE currentWait."parentTaskId" = task."id" AND currentWait."sessionId" = task."sessionId"
-        AND currentWait."turnId" = task."turnId"
-      ORDER BY currentWaitStep."ordinal" DESC, currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1)
+    AND wait."id" = ${CHILD_WAIT_CURRENT_ROW_SQL}
     AND wait."mode" IN ('any', 'all') AND jsonb_typeof(wait."targetTaskIds") = 'array'
     AND jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) > 0
     AND jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) <= 8
@@ -67,7 +68,7 @@ const CHILD_WAIT_RESUMABLE_SQL = `(SELECT COUNT(*) = 1
       WHERE child."id" = target."value" #>> '{}' AND child."id" <> task."id"
         AND child."parentTaskId" = task."id" AND child."sessionId" = task."sessionId"
         AND child."turnId" = task."turnId" AND child."rootTaskId" = task."rootTaskId"))) = true`
-
+const CHILD_WAIT_RESUMABLE_IDENTITY_SQL = CHILD_WAIT_RESUMABLE_SQL.replaceAll("$7", "$3")
 /** Read-only identity check used only to classify local concurrency denial. */
 export async function matchesPublishedSubagentDispatch(pool: PgSubagentPool, input: { payload: SubagentJobPayload; dispatchIdentity: SubagentDispatchIdentity }): Promise<boolean> {
   const identity = parseSubagentDispatchIdentity(input.dispatchIdentity, input.payload.taskId)
@@ -196,7 +197,29 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
     const running = await client.query(`SELECT COUNT(*)::int AS "count" FROM "sub_agent_tasks"
       WHERE "sessionId" = $1 AND "status" = 'running' AND "leaseExpiresAt" > clock_timestamp()`, [input.sessionId])
     if (Number(running.rows[0]?.count ?? 0) >= input.policy.maxConcurrency) return null
-    const graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.started" })
+    const resumableWaitRows = currentDispatchIdentity ? await client.query<{ id: unknown }>(`SELECT wait."id"
+      FROM "sub_agent_tasks" AS task JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = task."id"
+        AND wait."sessionId" = task."sessionId" AND wait."turnId" = task."turnId"
+      WHERE task."id" = $1 AND task."sessionId" = $2 AND ${CHILD_WAIT_RESUMABLE_IDENTITY_SQL}
+        AND wait."id" = ${CHILD_WAIT_CURRENT_ROW_SQL}
+      `,
+    [input.taskId, input.sessionId, userId]) : undefined
+    if (resumableWaitRows && resumableWaitRows.rows.length > 1) throw new Error("child_wait_resume_identity_ambiguous")
+    const waitRowId = resumableWaitRows?.rows[0]?.id
+    const waitDispatchGeneration = typeof waitRowId === "string" ? input.dispatchIdentity?.generation : undefined
+    if (waitRowId !== undefined && (typeof waitRowId !== "string" || !waitRowId.trim() || waitRowId.trim() !== waitRowId
+      || typeof waitDispatchGeneration !== "number" || !Number.isSafeInteger(waitDispatchGeneration) || waitDispatchGeneration < 0)) {
+      throw new Error("child_wait_resume_identity_invalid")
+    }
+    const graphTransitionInput: Parameters<typeof prepareGraphTransition>[1] = {
+      taskId: input.taskId, sessionId: input.sessionId, type: "task.started",
+    }
+    if (typeof waitRowId === "string" && typeof waitDispatchGeneration === "number") {
+      graphTransitionInput.attemptCount = taskAttemptCount + 1
+      graphTransitionInput.waitRowId = waitRowId
+      graphTransitionInput.waitDispatchGeneration = waitDispatchGeneration
+    }
+    const graph = await prepareGraphTransition(client, graphTransitionInput)
     if (graph && "blocked" in graph) return null
     const updated = await client.query(`UPDATE "sub_agent_tasks" AS task
       SET "status" = 'running', "leaseOwner" = $3,
