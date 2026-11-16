@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server'
 import { pinnedFetch } from '@jobcopilot/shared'
 import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { acquireSourceMaterialFence } from '@/lib/agent/source-material-fence'
 import type { ResumeContent } from '@/lib/types'
 
 const MAX_JOBS_PER_RUN = 50
@@ -44,9 +45,50 @@ export async function POST(req: NextRequest) {
     if (!scoreResponse.ok) throw new Error('AI scoring request failed')
 
     const result = await scoreResponse.json() as { score?: number; keywords?: string }
-    await db.job.update({
-      where: { id: job.id },
-      data: { score: Number(result.score) || 0, keywords: result.keywords ?? '' },
+    return db.$transaction(async tx => {
+      await acquireSourceMaterialFence(tx, [auth.userId])
+
+      const currentJob = await tx.job.findFirst({
+        where: { id: job.id, userId: auth.userId },
+        select: {
+          userId: true,
+          role: true,
+          company: true,
+          description: true,
+          keywords: true,
+          score: true,
+        },
+      })
+      if (
+        !currentJob ||
+        currentJob.userId !== auth.userId ||
+        currentJob.role !== job.role ||
+        currentJob.company !== job.company ||
+        currentJob.description !== job.description ||
+        currentJob.keywords !== job.keywords ||
+        currentJob.score !== null
+      ) return false
+
+      const currentResume = await tx.resume.findFirst({
+        where: { userId: auth.userId },
+        orderBy: { isDefault: 'desc' },
+        select: { content: true },
+      })
+      if (!currentResume || JSON.stringify(currentResume.content) !== JSON.stringify(resume.content)) return false
+
+      const update = await tx.job.updateMany({
+        where: {
+          id: job.id,
+          userId: auth.userId,
+          role: job.role,
+          company: job.company,
+          description: job.description,
+          keywords: job.keywords,
+          score: null,
+        },
+        data: { score: Number(result.score) || 0, keywords: result.keywords ?? '' },
+      })
+      return update.count === 1
     })
   })
 
@@ -56,7 +98,7 @@ export async function POST(req: NextRequest) {
   return ok({ scored, failed, remaining })
 }
 
-async function runWithConcurrency<T>(items: T[], concurrency: number, work: (item: T) => Promise<void>) {
+async function runWithConcurrency<T>(items: T[], concurrency: number, work: (item: T) => Promise<boolean>) {
   const results: Array<{ ok: boolean }> = []
   let nextIndex = 0
 
@@ -64,8 +106,7 @@ async function runWithConcurrency<T>(items: T[], concurrency: number, work: (ite
     while (nextIndex < items.length) {
       const item = items[nextIndex++]
       try {
-        await work(item)
-        results.push({ ok: true })
+        results.push({ ok: await work(item) })
       } catch {
         results.push({ ok: false })
       }
