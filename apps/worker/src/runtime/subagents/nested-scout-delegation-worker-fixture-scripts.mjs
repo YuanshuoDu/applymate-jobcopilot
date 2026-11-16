@@ -3,10 +3,17 @@ import { ROLE_RESULT_SCHEMA } from "./role-results.ts"
 import { PgSubagentTaskStore } from "./pg-store.ts"
 import { findExactToolResult, findUniqueWaitInput } from "./nested-scout-fixture-tool-pairs.mjs"
 
-export function createNestedScoutFixtureScripts({ mode, profile, ids, pool, say, pauseSubagentClaims, reportParentJoinState }) {
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null }
 const SAFE_PARENT_RESUME_ERROR_CODES = new Set("invalid_output model_execution_failed tool_execution_failed turn_execution_failed persistence_conflict step_limit budget_exhausted no_progress".split(" "))
-function parentResumeErrorClass(error) { try { const code = object(error)?.code; return typeof code === "string" && SAFE_PARENT_RESUME_ERROR_CODES.has(code) ? code : error instanceof Error ? "error" : "non_error" } catch { return "unknown" } }
+export function parentResumeFixtureErrorClass(error) { try {
+  const code = object(error)?.code
+  if (typeof code === "string" && SAFE_PARENT_RESUME_ERROR_CODES.has(code)) return code
+  if (error instanceof Error) return error.message === "p1143_parent_job_read_failed" ? "parent_job_read_failed"
+    : error.message === "p1143_parent_current_reads_missing" ? "parent_current_reads_missing" : "error"
+  return "non_error"
+} catch { return "unknown" } }
+
+export function createNestedScoutFixtureScripts({ mode, profile, ids, pool, say, pauseSubagentClaims, reportParentJoinState }) {
 const discoverInput = { targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], source: "greenhouse", pageSize: 10 }; const deniedSourceInput = { goal: "Try to escape the discovered source", sourceSlice: ["lever"] }
 const delegateAlphaInput = { goal: "Read the Fixture Alpha role", sourceSlice: ["greenhouse"] }; const delegateBetaInput = { goal: "Read the Fixture Beta role", sourceSlice: ["greenhouse"] }
 function outputFor(request, name, input, errorCode = "p1143_fixture_tool_result_unexpected_error") {
@@ -238,7 +245,7 @@ function childModelRuntime({ task, runtime, markerState }) {
         url: object(object(result)?.job)?.url, evidenceIds: [`model-read:${candidate?.jobId}`] })), evidence, summary: "Joined two bounded read-only Scouts and reread each current job" }) }
     say("P1143_PARENT_ROLE_RESULT_STREAMED")
     yield { type: "completed", finishReason: "stop" }
-    } catch (error) { if (isParentResume) { try { say(`P1143_PARENT_RESUME_ERROR:${parentResumeStage}:${parentResumeErrorClass(error)}`) } catch {} } throw error }
+    } catch (error) { if (isParentResume) { try { say(`P1143_PARENT_RESUME_ERROR:${parentResumeStage}:${parentResumeFixtureErrorClass(error)}`) } catch {} } throw error }
   } }
 }
 

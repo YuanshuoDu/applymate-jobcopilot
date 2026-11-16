@@ -8,6 +8,7 @@ import { projectWaitCallCompletionPayload } from "../turns/turn-execution-wait-e
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import { taskGraphItemId, taskGraphLifecycleKey, taskGraphWaitLifecycleKey } from "./task-graph-snapshot.js"
 import { loadChildAttemptResume } from "./child-resume.js"
+import { parentResumeFixtureErrorClass } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 import { waitResolverErrorCodesFromOutput } from "./nested-scout-wait-resolver-diagnostic.js"
 import type { SubagentLease } from "./types.js"
 
@@ -78,7 +79,7 @@ const SAFE_PARENT_RESUME_STAGES = [
 ] as const
 const SAFE_PARENT_RESUME_ERROR_CLASSES = [
   "invalid_output", "model_execution_failed", "tool_execution_failed", "turn_execution_failed", "persistence_conflict",
-  "step_limit", "budget_exhausted", "no_progress", "error", "non_error", "unknown",
+  "step_limit", "budget_exhausted", "no_progress", "parent_job_read_failed", "parent_current_reads_missing", "error", "non_error", "unknown",
 ] as const
 const SAFE_CHILD_RESUME_LOADER_CODES = [
   ...SAFE_RECOVERY_ERROR_CODES, "wait_invalid", "wait_scope_error", "wait_conflict",
@@ -969,6 +970,27 @@ function disposableUrl(): string | null {
 const databaseUrl = disposableUrl()
 const describePg = databaseUrl ? describe : describe.skip
 let pool: Pool
+
+describe("nested Scout parent resume diagnostics", () => {
+  it("maps only the fixed fixture sentinels and keeps safe code precedence", () => {
+    expect(parentResumeFixtureErrorClass(new Error("p1143_parent_job_read_failed"))).toBe("parent_job_read_failed")
+    expect(parentResumeFixtureErrorClass(new Error("p1143_parent_current_reads_missing"))).toBe("parent_current_reads_missing")
+    expect(parentResumeFixtureErrorClass(Object.assign(new Error("p1143_parent_job_read_failed"), { code: "turn_execution_failed" })))
+      .toBe("turn_execution_failed")
+    expect(parentResumeFixtureErrorClass(new Error("private failure details"))).toBe("error")
+  })
+
+  it("accepts the fixed parent job-read error classes", () => {
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:parent_job_read_failed")).toBe(true)
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:parent_current_reads_missing")).toBe(true)
+  })
+
+  it("rejects unlisted classes and raw fixture sentinels", () => {
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:other_error")).toBe(false)
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:p1143_parent_job_read_failed")).toBe(false)
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:p1143_parent_current_reads_missing")).toBe(false)
+  })
+})
 
 function launch(mode: "park" | "crash-child" | "resume", ids: FixtureIds): FixtureProcess {
   const child = spawn(process.execPath, ["--import", "tsx", PROCESS_FIXTURE, mode, JSON.stringify(ids)], {
