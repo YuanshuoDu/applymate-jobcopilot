@@ -7,10 +7,16 @@ import type { AnalystResult } from "./role-results.js"
 import type { ScheduledPrepareMaterialSources } from "./scheduled-application-prepare-materials.js"
 import { persistScheduledPrepareMaterial, prepareScheduledJobMaterials, scheduledPrepareArtifactIdentity, scheduledPrepareCitedRefs } from "./scheduled-application-prepare-materials.js"
 
-const { createArtifactRepository, createTurnEngineStore, loadSelectedJobArtifactContext } = vi.hoisted(() => ({
+const { createArtifactRepository, createTurnEngineStore, loadSelectedJobArtifactContext, withFencedArtifactWriteTransaction } = vi.hoisted(() => ({
   createArtifactRepository: vi.fn(), createTurnEngineStore: vi.fn(), loadSelectedJobArtifactContext: vi.fn(),
+  withFencedArtifactWriteTransaction: vi.fn(async <T>(pool: pg.Pool, _userId: string, _jobId: string,
+    work: (client: pg.PoolClient) => Promise<T>) => {
+    const client = await pool.connect()
+    try { return await work(client) } finally { client.release() }
+  }),
 }))
 vi.mock("../../db/agent-artifact-repo.js", () => ({ createAgentArtifactRepository: createArtifactRepository }))
+vi.mock("../../db/agent-artifact-write-transaction.js", () => ({ withFencedArtifactWriteTransaction }))
 vi.mock("./selected-job-artifact-context.js", () => ({ loadSelectedJobArtifactContext }))
 vi.mock("../turns/turn-engine-store.js", () => ({ createPgTurnEngineStore: createTurnEngineStore }))
 
@@ -266,7 +272,8 @@ describe("scheduled Prepare material persistence", () => {
     expect(baseFences[0]).toBe(draftWrites[0]?.taskFence)
     expect(baseClients[0]).toBe(client)
     expect(draftClients[0]).toBe(client)
-    expect(client.query.mock.calls.map(([sql]) => sql)).toEqual(["BEGIN", "SELECT set_config($1, $2, true)", "COMMIT"])
+    expect(withFencedArtifactWriteTransaction).toHaveBeenCalledWith(pool, "user-a", "job-a", expect.any(Function))
+    expect(loadSelectedJobArtifactContext).toHaveBeenCalledWith(client, "user-a", "job-a")
     expect(baseFences[0]).toMatchObject({ taskFenceMode: "scheduled_prepare", turnLeaseOwnerId: "turn-owner-current", turnLeaseVersion: 12 })
     expect(repository.insertBaseWithClient).toHaveBeenCalledWith(client, expect.objectContaining({ id: expect.stringMatching(/^scheduled-base:/) }), baseFences[0])
     expect(repository.saveDraft).toHaveBeenCalledWith(expect.objectContaining({ taskFence: baseFences[0] }), client)

@@ -9,7 +9,7 @@ import type { ApplyReadyJob } from '@/components/agent-workspace/ApplyJobCard'
 // and the network boundary are fixtures. This does not prove database locking.
 const mocks = vi.hoisted(() => ({
   findFirst: vi.fn(), count: vi.fn(), updateMany: vi.fn(), activity: vi.fn(),
-  transaction: vi.fn(), entitlement: vi.fn(), purge: vi.fn(),
+  transaction: vi.fn(), fenceQuery: vi.fn(), entitlement: vi.fn(), purge: vi.fn(),
 }))
 vi.mock('@/lib/i18n', () => ({ useI18n: () => ({ t: (key: string) => key, lang: 'en' }), translate: (_lang: string, key: string) => key }))
 vi.mock('@/lib/api-helpers', () => ({
@@ -61,7 +61,12 @@ describe('manual-record compatibility with the Agent playground', () => {
     mocks.entitlement.mockResolvedValue({ allowed: true })
     mocks.activity.mockResolvedValue({})
     mocks.purge.mockResolvedValue(undefined)
-    mocks.transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => fn({ job: { updateMany: mocks.updateMany }, activity: { create: mocks.activity } }))
+    mocks.fenceQuery.mockResolvedValue([{ transaction_id: '100' }])
+    mocks.transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => fn({
+      $queryRaw: mocks.fenceQuery,
+      job: { updateMany: mocks.updateMany },
+      activity: { create: mocks.activity },
+    }))
     vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
       expect(url).toBe('/api/jobs/job-1/apply')
       const req = new NextRequest(`http://localhost${url}`, { ...init, signal: init.signal ?? undefined })

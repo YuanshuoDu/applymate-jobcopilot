@@ -7,6 +7,7 @@ import { Pool, type PoolClient } from "pg"
 // @ts-expect-error The Worker TypeScript project does not compile Web path aliases.
 import { acquireSourceMaterialFence as acquireWebSourceMaterialFence } from "@/lib/agent/source-material-fence"
 import { acquireSourceMaterialFence as acquireWorkerSourceMaterialFence } from "./source-material-fence.js"
+import { createAgentArtifactRepository, type AgentArtifactBaseInsert } from "./agent-artifact-repo.js"
 
 type PrismaRawClient = {
   $queryRaw<T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T>
@@ -122,6 +123,134 @@ async function rollbackAndReleaseWorkerClient(client: PoolClient, transactionOpe
     }
   }
   client.release()
+}
+
+type ArtifactWriterGate = {
+  readonly writerPid: ReturnType<typeof deferred<number>>
+  readonly artifactInsertReached: ReturnType<typeof deferred<void>>
+  readonly commitReached: ReturnType<typeof deferred<void>>
+  readonly releaseCommit: ReturnType<typeof deferred<void>>
+  readonly rollbackReached: ReturnType<typeof deferred<void>>
+  readonly releaseRollback: ReturnType<typeof deferred<void>>
+  readonly failCommit: boolean
+  readonly holdRollback: boolean
+  forceReleaseWriterClient?: (error: Error) => void
+}
+
+function createArtifactWriterGate(options: { failCommit: boolean; holdRollback: boolean }): ArtifactWriterGate {
+  return {
+    writerPid: deferred<number>(),
+    artifactInsertReached: deferred<void>(),
+    commitReached: deferred<void>(),
+    releaseCommit: deferred<void>(),
+    rollbackReached: deferred<void>(),
+    releaseRollback: deferred<void>(),
+    failCommit: options.failCommit,
+    holdRollback: options.holdRollback,
+  }
+}
+
+/** Pauses the real repository transaction at terminal SQL; rollback mode fails COMMIT only after the real INSERT. */
+function withArtifactWriterGate(basePool: Pool, gate: ArtifactWriterGate): Pool {
+  return {
+    async connect() {
+      const client = await basePool.connect()
+      const query = client.query.bind(client) as unknown as (...args: unknown[]) => Promise<unknown>
+      let released = false
+      const release = (error?: Error): void => {
+        if (released) return
+        released = true
+        if (error) client.release(error)
+        else client.release()
+      }
+      gate.forceReleaseWriterClient = release
+
+      const gatedClient = {
+        async query(...args: unknown[]): Promise<unknown> {
+          const sql = typeof args[0] === "string" ? args[0].trim().toUpperCase() : ""
+          if (sql === "BEGIN") {
+            const result = await query(...args)
+            const pidResult = await query("SELECT pg_backend_pid()::int AS pid") as { rows: Array<{ pid: unknown }> }
+            const pid = pidResult.rows[0]?.pid
+            if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid < 1) {
+              throw new Error("Could not read the artifact writer backend PID")
+            }
+            gate.writerPid.resolve(pid)
+            return result
+          }
+          if (sql === "COMMIT") {
+            gate.commitReached.resolve(undefined)
+            await gate.releaseCommit.promise
+            if (gate.failCommit) throw new Error("Injected disposable artifact commit failure")
+          }
+          if (sql === "ROLLBACK" && gate.holdRollback) {
+            gate.rollbackReached.resolve(undefined)
+            await gate.releaseRollback.promise
+          }
+          const result = await query(...args)
+          if (sql.startsWith('INSERT INTO "AGENT_ARTIFACT"')) gate.artifactInsertReached.resolve(undefined)
+          return result
+        },
+        release,
+      }
+      return gatedClient as unknown as PoolClient
+    },
+  } as unknown as Pool
+}
+
+function sourceArtifactBase(userId: string, jobId: string, artifactId: string): AgentArtifactBaseInsert {
+  return {
+    id: artifactId,
+    userId,
+    jobId,
+    artifactType: "resume",
+    content: { source: "disposable-source-material-fence" },
+    hash: `sha256:${"a".repeat(64)}`,
+    constraintHash: `sha256:${"b".repeat(64)}`,
+    provenanceRefs: [],
+    evidenceRefs: [],
+  }
+}
+
+function startWebFenceWaiter(userId: string) {
+  const backendPid = deferred<number>()
+  const acquired = deferred<void>()
+  let settled = false
+  const transaction = runWebTransaction(async tx => {
+    backendPid.resolve(await prismaBackendPid(tx))
+    await acquireWebFence(tx, [userId])
+    acquired.resolve(undefined)
+  })
+  void transaction.then(() => { settled = true }, () => { settled = true })
+  return { backendPid: backendPid.promise, acquired: acquired.promise, transaction, isSettled: () => settled }
+}
+
+async function cleanArtifactRow(artifactId: string, userId: string): Promise<void> {
+  const deleted = await completesWithin(
+    pool!.query('DELETE FROM "agent_artifact" WHERE "id" = $1 AND "userId" = $2', [artifactId, userId]),
+    "Disposable artifact cleanup timed out",
+  )
+  if (!deleted) throw new Error("Disposable artifact cleanup did not finish")
+}
+
+async function cleanupArtifactWriterCase(
+  gate: ArtifactWriterGate,
+  writerOperation: Promise<unknown> | undefined,
+  webTransaction: Promise<void> | undefined,
+  artifactId: string,
+  userId: string,
+): Promise<void> {
+  gate.releaseCommit.resolve(undefined)
+  gate.releaseRollback.resolve(undefined)
+  const settled = await settleOperations(writerOperation, webTransaction)
+  if (!settled) {
+    gate.forceReleaseWriterClient?.(new Error("Source material fence writer cleanup timed out"))
+    const pending: Promise<boolean>[] = []
+    if (writerOperation) pending.push(completesWithin(writerOperation, "Artifact writer cleanup timed out"))
+    if (webTransaction) pending.push(completesWithin(webTransaction, "Web fence cleanup timed out"))
+    await Promise.all(pending)
+  }
+  await cleanArtifactRow(artifactId, userId)
 }
 
 async function prismaBackendPid(client: PrismaRawClient): Promise<number> {
@@ -310,6 +439,92 @@ describeWithPostgres("Web Prisma and Worker pg source material fence", () => {
         if (workerAcquisition) await completesWithin(workerAcquisition, "Worker acquisition cleanup timed out")
       }
       if (workerClient) await rollbackAndReleaseWorkerClient(workerClient, workerTransactionOpen)
+    }
+  }, TEST_TIMEOUT_MS)
+
+  it("holds the Web user fence until the canonical source artifact writer commits", async () => {
+    const userId = `source-fence-artifact-user-${randomUUID()}`
+    const jobId = `source-fence-artifact-job-${randomUUID()}`
+    const artifactId = `source-fence-artifact-${randomUUID()}`
+    const gate = createArtifactWriterGate({ failCommit: false, holdRollback: false })
+    const repository = createAgentArtifactRepository(withArtifactWriterGate(pool!, gate))
+    const input = sourceArtifactBase(userId, jobId, artifactId)
+    let writerOperation: Promise<unknown> | undefined
+    let webWaiter: ReturnType<typeof startWebFenceWaiter> | undefined
+
+    try {
+      writerOperation = repository.insertBase(input)
+      const writerPid = await withTimeout(gate.writerPid.promise, "Artifact writer did not begin its transaction")
+      await withTimeout(gate.artifactInsertReached.promise, "Artifact writer did not issue its source row insert")
+      await withTimeout(gate.commitReached.promise, "Artifact writer did not reach commit")
+
+      webWaiter = startWebFenceWaiter(userId)
+      const webPid = await withTimeout(webWaiter.backendPid, "Web transaction did not start")
+      await waitForBlocker(webPid, writerPid)
+      expect(webWaiter.isSettled()).toBe(false)
+
+      gate.releaseCommit.resolve(undefined)
+      const written = await withTimeout(writerOperation, "Artifact writer did not commit", CLEANUP_TIMEOUT_MS)
+      expect(written).toMatchObject({ id: artifactId, userId, jobId, artifactType: "resume", lifecycle: "base" })
+      await withTimeout(webWaiter.acquired, "Web fence did not acquire after artifact commit", CLEANUP_TIMEOUT_MS)
+      await withTimeout(webWaiter.transaction, "Web transaction did not commit", CLEANUP_TIMEOUT_MS)
+
+      const persisted = await withTimeout(
+        pool!.query<{ id: string }>('SELECT "id" FROM "agent_artifact" WHERE "id" = $1 AND "userId" = $2', [artifactId, userId]),
+        "Committed artifact readback timed out",
+      )
+      expect(persisted.rows).toEqual([{ id: artifactId }])
+    } finally {
+      await cleanupArtifactWriterCase(gate, writerOperation, webWaiter?.transaction, artifactId, userId)
+    }
+  }, TEST_TIMEOUT_MS)
+
+  it("holds the Web user fence until the canonical source artifact writer rolls back", async () => {
+    const userId = `source-fence-artifact-user-${randomUUID()}`
+    const jobId = `source-fence-artifact-job-${randomUUID()}`
+    const artifactId = `source-fence-artifact-${randomUUID()}`
+    const gate = createArtifactWriterGate({ failCommit: true, holdRollback: true })
+    const repository = createAgentArtifactRepository(withArtifactWriterGate(pool!, gate))
+    const input = sourceArtifactBase(userId, jobId, artifactId)
+    let writerOperation: Promise<unknown> | undefined
+    let webWaiter: ReturnType<typeof startWebFenceWaiter> | undefined
+
+    try {
+      writerOperation = repository.insertBase(input)
+      const writerPid = await withTimeout(gate.writerPid.promise, "Artifact writer did not begin its transaction")
+      await withTimeout(gate.artifactInsertReached.promise, "Artifact writer did not issue its source row insert")
+      await withTimeout(gate.commitReached.promise, "Artifact writer did not reach commit")
+
+      webWaiter = startWebFenceWaiter(userId)
+      const webPid = await withTimeout(webWaiter.backendPid, "Web transaction did not start")
+      await waitForBlocker(webPid, writerPid)
+      expect(webWaiter.isSettled()).toBe(false)
+
+      gate.releaseCommit.resolve(undefined)
+      await withTimeout(gate.rollbackReached.promise, "Artifact writer did not enter rollback")
+      expect(await blockingPids(webPid)).toContain(writerPid)
+      expect(webWaiter.isSettled()).toBe(false)
+
+      gate.releaseRollback.resolve(undefined)
+      const outcome = await withTimeout(writerOperation.then(
+        () => ({ kind: "committed" as const }),
+        (error: unknown) => ({ kind: "rolled_back" as const, error }),
+      ), "Artifact writer did not finish rollback", CLEANUP_TIMEOUT_MS)
+      expect(outcome.kind).toBe("rolled_back")
+      if (outcome.kind !== "rolled_back" || !(outcome.error instanceof Error)) {
+        throw new Error("Expected the artifact repository transaction to roll back")
+      }
+      expect(outcome.error.message).toBe("Injected disposable artifact commit failure")
+      await withTimeout(webWaiter.acquired, "Web fence did not acquire after artifact rollback", CLEANUP_TIMEOUT_MS)
+      await withTimeout(webWaiter.transaction, "Web transaction did not commit", CLEANUP_TIMEOUT_MS)
+
+      const persisted = await withTimeout(
+        pool!.query<{ id: string }>('SELECT "id" FROM "agent_artifact" WHERE "id" = $1 AND "userId" = $2', [artifactId, userId]),
+        "Rolled-back artifact readback timed out",
+      )
+      expect(persisted.rows).toEqual([])
+    } finally {
+      await cleanupArtifactWriterCase(gate, writerOperation, webWaiter?.transaction, artifactId, userId)
     }
   }, TEST_TIMEOUT_MS)
 
