@@ -3,8 +3,11 @@
  * POST /api/jobs  — create a new job
  */
 import { NextRequest } from 'next/server'
+import type { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { acquireSourceMaterialFence } from '@/lib/agent/source-material-fence'
+import { repairLinkedInDismissRoles, saveCanonicalJob } from '@/lib/agent/jobs-source-write'
 import { JOB_STATUSES, type JobStatus, type JobStatusCounts } from '@/lib/types'
 
 const MIN_EXTENSION_DESCRIPTION_LENGTH = 80
@@ -66,11 +69,7 @@ export async function GET(req: NextRequest) {
     if (isJobStatus(group.status)) statusCounts[group.status] = group._count._all
   }
 
-  const repairedJobs = await Promise.all(jobs.map(async job => {
-    const repairedRole = repairLinkedInDismissRole(job.role, job.source)
-    if (!repairedRole) return job
-    return db.job.update({ where: { id: job.id }, data: { role: repairedRole } })
-  }))
+  const repairedJobs = await repairLinkedInDismissRoles(auth.userId, jobs)
 
   return ok({ jobs: repairedJobs, total, page, pageSize, statusCounts })
 }
@@ -95,53 +94,29 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  if (canonicalUrl) {
-    const existing = await db.job.findFirst({ where: { userId: auth.userId, url: canonicalUrl } })
-    if (existing) {
-      const job = await db.job.update({
-        where: { id: existing.id },
-      data: {
-          ...(shouldRepairCompany(existing.company, role, company) ? { company } : {}),
-          ...(shouldRepairRole(existing.role, company, role) ? { role } : {}),
-          ...(description ? { description } : {}),
-          ...(shouldUpdateLocation(existing.location, location) ? { location } : {}),
-          ...(salary ? { salary } : {}),
-          ...(score != null ? { score } : {}),
-        },
-      })
-      return ok(job)
-    }
+  const createData: Prisma.JobUncheckedCreateInput = {
+    userId: auth.userId, company, role, location: location ?? null,
+    url: canonicalUrl, description: description ?? null, salary: salary ?? null,
+    source: source ?? 'manual', score: score ?? null, status: status ?? 'saved',
+    workflowState: status && status !== 'saved' ? 'submitted' : 'draft',
+    logo: logo ?? company.slice(0, 2).toUpperCase(),
   }
+  const saved = canonicalUrl ? await saveCanonicalJob(auth.userId, canonicalUrl, createData, existing => ({
+    ...(shouldRepairCompany(existing.company, role, company) ? { company } : {}),
+    ...(shouldRepairRole(existing.role, company, role) ? { role } : {}),
+    ...(description ? { description } : {}),
+    ...(shouldUpdateLocation(existing.location, location) ? { location } : {}),
+    ...(salary ? { salary } : {}),
+    ...(score != null ? { score } : {}),
+  })) : null
+  const job = saved?.job ?? await db.job.create({ data: createData })
+  const created = saved?.created ?? true
 
-  const job = await db.job.create({
-    data: {
-      userId:      auth.userId,
-      company,
-      role,
-      location:    location    ?? null,
-      url:         canonicalUrl ?? null,
-      description: description ?? null,
-      salary:      salary      ?? null,
-      source:      source      ?? 'manual',
-      score:       score       ?? null,
-      status:      status      ?? 'saved',
-      workflowState: status && status !== 'saved' ? 'submitted' : 'draft',
-      logo:        logo ?? company.slice(0, 2).toUpperCase(),
-    },
+  if (created) await db.activity.create({
+    data: { userId: auth.userId, jobId: job.id, type: 'note_added', text: `Saved ${company} · ${role}`, color: '#185FA5' },
   })
 
-  // Log activity
-  await db.activity.create({
-    data: {
-      userId: auth.userId,
-      jobId:  job.id,
-      type:   'note_added',
-      text:   `Saved ${company} · ${role}`,
-      color:  '#185FA5',
-    },
-  })
-
-  return ok(job, 201)
+  return ok(job, created ? 201 : 200)
 }
 
 // ── DELETE ───────────────────────────────────────────────────────────────────
@@ -157,7 +132,10 @@ export async function DELETE(req: NextRequest) {
   if (!ids.length) return err('At least one job id is required')
   if (ids.length > 100) return err('A maximum of 100 jobs can be deleted at once')
 
-  const result = await db.job.deleteMany({ where: { userId: auth.userId, id: { in: ids } } })
+  const result = await db.$transaction(async tx => {
+    await acquireSourceMaterialFence(tx, [auth.userId])
+    return tx.job.deleteMany({ where: { userId: auth.userId, id: { in: ids } } })
+  })
   return ok({ deleted: result.count })
 }
 
@@ -234,10 +212,4 @@ function isMeaningfulLocation(value: unknown): value is string {
   return typeof value === 'string'
     && Boolean(value.trim())
     && !/^(unknown|n\/?a|not specified|unspecified)$/i.test(value.trim())
-}
-
-function repairLinkedInDismissRole(role: string, source: string | null): string | null {
-  if (source !== 'linkedin') return null
-  const match = role.trim().match(/^dismiss\s+(.+?)\s+job$/i)
-  return match?.[1]?.trim() || null
 }
