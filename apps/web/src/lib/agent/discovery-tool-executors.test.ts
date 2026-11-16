@@ -16,7 +16,7 @@ type FixtureJobDelegate = {
 }
 type FixtureTransaction = {
   job: FixtureJobDelegate
-  $queryRaw<T>(query: { sql: string }): Promise<T>
+  $queryRaw<T>(query: TemplateStringsArray | { sql: string }): Promise<T>
   $executeRaw: (...args: unknown[]) => Promise<number>
   $executeRawUnsafe: (query: string) => Promise<number>
 }
@@ -78,8 +78,9 @@ function materializerFixture() {
       },
         $executeRaw: async () => 1,
         $executeRawUnsafe: async () => 1,
-        $queryRaw: async <T>(query: { sql: string }): Promise<T> => {
-          const sql = query.sql
+        $queryRaw: async <T>(query: TemplateStringsArray | { sql: string }): Promise<T> => {
+          const sql = Array.isArray(query) ? query.join('?') : query.sql
+          if (sql.includes('pg_current_xact_id()::text AS transaction_id')) return [{ transaction_id: '17' }] as T
           if (sql.includes('FROM "agent_sessions"')) return [{ id: executionFence.sessionId, status: 'running' }] as T
           if (sql.includes('FROM "agent_turns"')) return [{ id: executionFence.turnId, rootTaskId: executionFence.rootTaskId, status: 'in_progress' }] as T
           if (sql.includes('FROM "agent_steps"')) return [{ id: executionFence.stepId }] as T

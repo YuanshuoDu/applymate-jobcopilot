@@ -21,6 +21,22 @@ const payload = {
 }
 const canonicalId = 'c123456789012345678901234'
 type SearchTargetField = 'targetRoles' | 'targetLocations'
+type RawQueryInput = TemplateStringsArray | { sql: string; values?: readonly unknown[] }
+
+function rawQueryParts(query: RawQueryInput, templateValues: readonly unknown[]): { sql: string; values: readonly unknown[] } {
+  return 'sql' in query
+    ? { sql: query.sql, values: query.values ?? [] }
+    : { sql: query.join('?'), values: templateValues }
+}
+
+function boundFieldValue(sql: string, values: readonly unknown[], field: string): unknown {
+  const match = new RegExp(`(?:\\b\\w+\\.)?"${field}"\\s*=\\s*(\\$\\d+|\\?)`).exec(sql)
+  if (!match) return undefined
+  if (match[1]?.startsWith('$')) return values[Number(match[1].slice(1)) - 1]
+  const placeholderOffset = match.index + match[0].lastIndexOf('?')
+  const precedingPlaceholders = sql.slice(0, placeholderOffset).split('?').length - 1
+  return values[precedingPlaceholders]
+}
 
 function schemaRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
@@ -316,6 +332,7 @@ describe('internal provider discovery route', () => {
     const providerStarted = new Promise<void>(resolve => { markProviderStarted = resolve })
     const providerGate = new Promise<void>(resolve => { resumeProvider = resolve })
     const writes: Record<string, unknown>[] = []
+    const staleLeaseQueries: Array<{ sql: string; leaseOwner: unknown; attemptCount: unknown }> = []
     const job = { findMany: vi.fn(async () => []), create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
       writes.push(data)
       return { id: String(data.id) }
@@ -327,14 +344,24 @@ describe('internal provider discovery route', () => {
           job,
           $executeRaw: vi.fn(async () => 1),
           $executeRawUnsafe: vi.fn(async () => 1),
-          $queryRaw: vi.fn(async <T>(query: { sql: string }): Promise<T> => {
-            const sql = query.sql
+          $queryRaw: vi.fn(async <T>(query: RawQueryInput, ...templateValues: unknown[]): Promise<T> => {
+            const { sql, values } = rawQueryParts(query, templateValues)
+            if (sql.includes('pg_current_xact_id()::text AS transaction_id')) return [{ transaction_id: '17' }] as T
             if (sql.includes('FROM "agent_sessions"')) return [{ id: 'session-1', status: 'running' }] as T
             if (sql.includes('FROM "agent_turns"')) return [{ id: 'turn-1', rootTaskId: 'root-1', status: 'in_progress' }] as T
             if (sql.includes('FROM "agent_steps"')) return [{ id: 'step-1' }] as T
             if (sql.includes('clock_timestamp()')) return [{ status: 'running', interruptRequestedAt: null, closedAt: null,
               leaseOwner: 'worker-2', attemptCount: 5, live: true }] as T
-            if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("'scout'")) return [] as T
+            if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("'scout'")) {
+              const leaseOwner = boundFieldValue(sql, values, 'leaseOwner')
+              const attemptCount = boundFieldValue(sql, values, 'attemptCount')
+              staleLeaseQueries.push({ sql, leaseOwner, attemptCount })
+              if (leaseOwner === 'worker-1' && attemptCount === 4) return [] as T
+              return [{ id: 'scout-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1',
+                parentTaskId: 'root-1', role: 'scout', taskType: 'job_discovery', status: 'running',
+                interruptRequestedAt: null, closedAt: null, leaseOwner: 'worker-2', attemptCount: 5,
+                allowedActions: ['jobs.discover'] }] as T
+            }
             if (sql.includes('FROM "sub_agent_tasks"')) return [{ id: 'root-1' }] as T
             throw new Error(`Unexpected scope SQL: ${sql}`)
           }),
@@ -365,5 +392,11 @@ describe('internal provider discovery route', () => {
 
     expect(response.status).toBe(404)
     expect(writes).toHaveLength(0)
+    expect(staleLeaseQueries).toHaveLength(1)
+    expect(staleLeaseQueries[0]?.leaseOwner).toBe('worker-1')
+    expect(staleLeaseQueries[0]?.attemptCount).toBe(4)
+    const childWhere = staleLeaseQueries[0]?.sql.split(/\bWHERE\b/i)[1]?.split(/\bFOR UPDATE\b/i)[0] ?? ''
+    expect(childWhere).toMatch(/(?:\b\w+\.)?"leaseOwner"\s*=\s*(?:\$\d+|\?)/)
+    expect(childWhere).toMatch(/(?:\b\w+\.)?"attemptCount"\s*=\s*(?:\$\d+|\?)/)
   })
 })
