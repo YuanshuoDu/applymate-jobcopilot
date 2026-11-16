@@ -496,7 +496,7 @@ test('accepts renderer-grounded TaskGraph display with optional bounded advice a
   expect(threeAdviceLines).toEqual([
     'Inspect the reported Analysis task outcome.',
     'Inspect the reported Preparation task outcome.',
-    'Inspect the reported Search task outcome.',
+    'View the reported Search results.',
   ])
   const threeAdviceLinesText = threeAdvice.split('\n')
   const taskStatesIndex = threeAdviceLinesText.findIndex(line => line.startsWith('Task states:'))

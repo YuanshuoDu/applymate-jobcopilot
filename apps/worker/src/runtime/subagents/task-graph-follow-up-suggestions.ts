@@ -62,18 +62,29 @@ export function reduceTaskGraphFollowUpSuggestions(binding: TaskGraphFinalSummar
     return uniqueVisibleSuggestions(suggestions)
   } catch { return [] }
 }
-
 function uniqueVisibleSuggestions(suggestions: readonly TaskGraphFollowUpSuggestion[]): readonly TaskGraphFollowUpSuggestion[] {
-  const seen = new Set<string>(), selected: TaskGraphFollowUpSuggestion[] = []
+  const seen = new Set<string>(), distinct: TaskGraphFollowUpSuggestion[] = []
   for (const suggestion of [...suggestions].sort(compareSuggestions)) {
-    const identity = suggestion.kind === "inspect_task_result" ? suggestion.kind + ":" + suggestion.role
-      : suggestion.kind === "inspect_material_review" ? suggestion.kind + ":" + suggestion.reviewStatus
-        : suggestion.kind + ":" + suggestion.resultKind
+    const identity = visibleActionKey(suggestion)
     if (seen.has(identity)) continue
-    seen.add(identity); selected.push(suggestion)
-    if (selected.length === 3) break
+    seen.add(identity); distinct.push(suggestion)
   }
-  return selected
+  const selected: TaskGraphFollowUpSuggestion[] = []
+  for (const kind of ["inspect_task_result", "inspect_material_review", "view_reported_results"] as const) {
+    const suggestion = distinct.find(item => item.kind === kind)
+    if (suggestion) selected.push(suggestion)
+  }
+  for (const suggestion of distinct) {
+    if (selected.length === 3) break
+    if (!selected.includes(suggestion)) selected.push(suggestion)
+  }
+  return selected.sort(compareSuggestions)
+}
+
+function visibleActionKey(suggestion: TaskGraphFollowUpSuggestion): string {
+  return suggestion.kind === "inspect_task_result" ? suggestion.kind + ":" + suggestion.role
+    : suggestion.kind === "inspect_material_review" ? suggestion.kind + ":" + suggestion.reviewStatus
+      : suggestion.kind + ":" + suggestion.resultKind
 }
 
 function artifactKey(ref: ArtifactVersionReference): string { return JSON.stringify([ref.artifactId, ref.version, ref.contentHash, ref.sourceDigest]) }
@@ -86,4 +97,3 @@ function compareSuggestions(a: TaskGraphFollowUpSuggestion, b: TaskGraphFollowUp
   const bKey = b.kind === "inspect_task_result" ? b.taskId : b.kind === "inspect_material_review" ? artifactKey(b.artifactRef) : b.resultKind + ":" + b.taskId
   return rank[a.kind] - rank[b.kind] || compareText(aKey, bKey) || compareText(key(a), key(b))
 }
-

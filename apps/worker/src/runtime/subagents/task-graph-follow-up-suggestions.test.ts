@@ -35,7 +35,7 @@ function prepare(taskId: string, status: "completed" | "partial", jobs: readonly
 }
 
 describe("TaskGraph follow-up suggestion reducer", () => {
-  it("emits stable optional inspection suggestions for incomplete, missing, and partial reports", () => {
+  it("emits stable bounded suggestions for incomplete, missing, and partial reports", () => {
     const current = binding([
       { taskId: "task-z", role: "scout", taskStatus: "completed", structuredResult: scout("job-z", "partial") },
       { taskId: "task-a", role: "analyst", taskStatus: "failed" },
@@ -46,7 +46,7 @@ describe("TaskGraph follow-up suggestion reducer", () => {
     expect(suggestions).toEqual([
       { kind: "inspect_task_result", taskId: "task-a", role: "analyst", taskStatus: "failed", resultState: "missing" },
       { kind: "inspect_task_result", taskId: "task-m", role: "reviewer", taskStatus: "waiting", resultState: "not_terminal" },
-      { kind: "inspect_task_result", taskId: "task-z", role: "scout", taskStatus: "completed", resultState: "valid" },
+      { kind: "view_reported_results", taskId: "task-z", resultKind: "search", jobIds: ["job-z"], artifactRefs: [] },
     ])
     expect(reduceTaskGraphFollowUpSuggestions(current)).toEqual(suggestions)
     expect(suggestions).toHaveLength(3)
@@ -114,12 +114,40 @@ describe("TaskGraph follow-up suggestion reducer", () => {
     expect(suggestions.some(item => item.kind === "view_reported_results" && item.resultKind === "materials")).toBe(true)
   })
 
-  it("does not infer action from zero or not-requested counts", () => {
+  it("preserves distinct advice kinds before filling the three-suggestion limit", () => {
+    const material = artifact("material-needing-review")
+    const prepared = artifact("prepared-material")
+    const suggestions = reduceTaskGraphFollowUpSuggestions(binding([
+      { taskId: "analyst-failed", role: "analyst", taskStatus: "failed" },
+      { taskId: "prepare-partial", role: "prepare", taskStatus: "completed", structuredResult: prepare("prepare-partial", "partial",
+        [{ jobId: "job-ready", status: "prepared" }, { jobId: "job-failed", status: "failed" }], [{ jobId: "job-ready", kind: "resume", artifactRef: prepared }]) },
+      { taskId: "scout-partial", role: "scout", taskStatus: "completed", structuredResult: scout("job-scout", "partial") },
+      { taskId: "writer-1", role: "writer", taskStatus: "completed", structuredResult: writer(material) },
+      { taskId: "reviewer-1", role: "reviewer", taskStatus: "completed", structuredResult: reviewer(material, "needs_revision") },
+    ]))
+
+    expect(suggestions).toHaveLength(3)
+    expect(new Set(suggestions.map(item => item.kind))).toEqual(new Set([
+      "inspect_task_result", "inspect_material_review", "view_reported_results",
+    ]))
+    expect(suggestions).toContainEqual({ kind: "inspect_material_review", taskIds: ["reviewer-1"], artifactRef: material, reviewStatus: "needs_revision" })
+    expect(suggestions.some(item => item.kind === "view_reported_results" && item.resultKind === "materials")).toBe(true)
+  })
+
+  it("keeps zero, unavailable, and not-requested facts distinct", () => {
     const notRequested = binding([])
     const zero = binding([{ taskId: "scout-zero", role: "scout", taskStatus: "completed", structuredResult: {
       schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [], evidence: [], summary: "" } }])
+    const unknown = binding([{ taskId: "scout-unavailable", role: "scout", taskStatus: "failed" }])
+
+    expect(notRequested.summary.counts.discoveredJobs).toEqual({ coverage: "not_requested", knownCount: null })
+    expect(zero.summary.counts.discoveredJobs).toEqual({ coverage: "complete", knownCount: 0 })
+    expect(unknown.summary.counts.discoveredJobs).toEqual({ coverage: "unavailable", knownCount: null })
     expect(reduceTaskGraphFollowUpSuggestions(notRequested)).toEqual([])
     expect(reduceTaskGraphFollowUpSuggestions(zero)).toEqual([])
+    expect(reduceTaskGraphFollowUpSuggestions(unknown)).toEqual([
+      { kind: "inspect_task_result", taskId: "scout-unavailable", role: "scout", taskStatus: "failed", resultState: "missing" },
+    ])
   })
 
   it("fails closed for legacy, mismatched, or conflicting-reference bindings", () => {
