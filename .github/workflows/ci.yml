@@ -599,6 +599,8 @@ jobs:
             src/lib/agent/control-plane/agent-usage-reconciliation.pg.integration.test.ts \
             src/lib/agent/control-plane/agent-root-usage-reservations.pg.integration.test.ts
       - name: Build Worker workspace before focused test
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: pnpm turbo build --filter=@jobcopilot/worker
       - name: Verify Web and Worker source material fences on disposable PostgreSQL
         env:
