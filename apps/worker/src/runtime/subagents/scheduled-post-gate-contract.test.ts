@@ -3,6 +3,7 @@ import { SCHEDULED_GATE_COMPLETION_PROOF_SCHEMA } from "./scheduled-gate-contrac
 import {
   parseScheduledPostGateExecuteTaskEnvelope, parseScheduledPostGateHandoff, scheduledPostGateDigest,
   scheduledPostGateHandoffKey, scheduledPostGateScopeMatchesOwner, SCHEDULED_POST_GATE_HANDOFF_SCHEMA,
+  SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY_ID,
 } from "./scheduled-post-gate-contract.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 
@@ -33,6 +34,16 @@ function executeEnvelope(queued: unknown, failed: unknown) {
 }
 
 describe("scheduled post-Gate contract parsing", () => {
+  it("defines a fixed bounded recovery instruction without package or approval details", () => {
+    expect(SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY_ID).toBe("completion-recovery:scheduled-post-gate-plan-required")
+    expect(SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION).toContain("owner-scoped agent.list")
+    expect(SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION).toContain("agent.plan once")
+    expect(SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION).toContain("required Audit depending on every Execute")
+    expect(SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION).toContain("server remains authoritative")
+    expect(SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION).not.toContain("package-a")
+    expect(SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION).not.toContain("approval-1")
+  })
+
   it("accepts a frozen handoff whose Execute partitions exactly cover the Gate refs", () => {
     const parsed = parseScheduledPostGateHandoff(handoff())
     expect(parsed).not.toBeNull()

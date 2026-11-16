@@ -11,7 +11,7 @@ import { publishFinalResponse } from "./turn-execution-events.js"
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import { nativeSemanticNoProgressError } from "../native-semantic-progress.js"
 import { STEERING_RECONCILIATION_BLOCKER } from "../subagents/steering-reconciliation-contract.js"
-import { FINAL_EVIDENCE_RECOVERY_FEEDBACK, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import { FINAL_EVIDENCE_RECOVERY_FEEDBACK, tagTaskGraphRepairRecovery, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY } from "./completion-recovery-context.js"
 import { canRecoverMissingEvidence } from "./final-evidence-recovery-eligibility.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
@@ -23,7 +23,7 @@ import { signalWasInterrupted } from "../interrupt/registry.js"
 import { completeEmptyAnalystCandidateOnly } from "../subagents/task-graph-empty-analyst-candidate.js"
 import { buildGroundedTaskGraphFinalResponse } from "../subagents/task-graph-final-response.js"
 export type FinalCandidateOutcome =
-  | Readonly<{ kind: "replan"; feedback: string; taskGraphDenialCheckpoint?: TaskGraphDenialCheckpoint }>
+  | Readonly<{ kind: "replan"; feedback: string; taskGraphDenialCheckpoint?: TaskGraphDenialCheckpoint; readonly [SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY]?: typeof SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY }>
   | Readonly<{ kind: "wait"; result: TurnEngineResult }>
   | Readonly<{ kind: "completed"; result: TurnEngineResult }>
 
@@ -158,7 +158,7 @@ export async function completeTurnCandidate(input: Readonly<{
     if (distinctStepCount === 3) throw nativeSemanticNoProgressError()
     if (gate[NATIVE_SEMANTIC_NO_PROGRESS] === true) throw nativeSemanticNoProgressError()
     const checkpoint = gate[TASK_GRAPH_DENIAL_CHECKPOINT]
-    return { kind: "replan", feedback: gate.feedback, ...(checkpoint ? { taskGraphDenialCheckpoint: checkpoint } : {}) }
+    return { kind: "replan", feedback: gate.feedback, ...(gate[SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY] === SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY ? { [SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY]: SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY } : {}), ...(checkpoint ? { taskGraphDenialCheckpoint: checkpoint } : {}) }
   }
   const summaryBinding = gate as TaskGraphFinalSummaryBinding | undefined
   if (summaryBinding && (!canPersistFinalResponse(options) || !options.store.recordFinalResponse)) {

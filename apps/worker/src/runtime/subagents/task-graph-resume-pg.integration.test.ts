@@ -15607,9 +15607,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const waitBoundary: RecordValue | null = repairWaitDiagnosticState.lastHelperExit
         ? Object.fromEntries(Object.entries(repairWaitDiagnosticState.lastHelperExit).filter(([key]) => key !== "leaseScope"))
         : null
+      let rootFailure: RecordValue = { available: false }
+      try {
+        rootFailure = await rootFailureDiagnostic(pool!, value.turnId)
+      } catch {
+        // Diagnostic failures must not replace the original wait timeout.
+      }
       const diagnosis = JSON.stringify({
         rootExecution: diagnosticBoundedCount(rootExecution), failedCoverageObserved, repairAccepted, repairWaitCallPrepared,
         helperExits: diagnosticBoundedCount(repairWaitDiagnosticState.helperExits),
+        rootFailure,
         waitBoundary,
       })
       throw new Error(`${error.message}; repairWaitDiagnostic=${diagnosis}`)
