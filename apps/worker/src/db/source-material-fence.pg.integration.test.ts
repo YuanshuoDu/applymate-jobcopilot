@@ -8,6 +8,7 @@ import { Pool, type PoolClient } from "pg"
 import { acquireSourceMaterialFence as acquireWebSourceMaterialFence } from "@/lib/agent/source-material-fence"
 import { acquireSourceMaterialFence as acquireWorkerSourceMaterialFence } from "./source-material-fence.js"
 import { createAgentArtifactRepository, type AgentArtifactBaseInsert } from "./agent-artifact-repo.js"
+import { persistLegacyApplicationTaskOutcome, writeLegacyFillErrorOutcome } from "./legacy-application-task-outcome.js"
 
 type PrismaRawClient = {
   $queryRaw<T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T>
@@ -439,6 +440,87 @@ describeWithPostgres("Web Prisma and Worker pg source material fence", () => {
         if (workerAcquisition) await completesWithin(workerAcquisition, "Worker acquisition cleanup timed out")
       }
       if (workerClient) await rollbackAndReleaseWorkerClient(workerClient, workerTransactionOpen)
+    }
+  }, TEST_TIMEOUT_MS)
+
+  it("blocks the canonical legacy Job outcome writer behind the Web user fence until commit", async () => {
+    const suffix = randomUUID()
+    const userId = `source-fence-legacy-user-${suffix}`
+    const jobId = `source-fence-legacy-job-${suffix}`
+    const taskId = `source-fence-legacy-task-${suffix}`
+    const scope = { applicationTaskId: taskId, userId, jobId }
+    const webReady = deferred<number>()
+    const releaseWeb = deferred<void>()
+    let webTransaction: Promise<void> | undefined
+    let workerOperation: Promise<{ insertedResult: boolean; taskFinalized: boolean }> | undefined
+    let workerClient: PoolClient | undefined
+    let workerTransactionOpen = false
+    let writerCalled = false
+
+    try {
+      await pool!.query(`INSERT INTO "User" ("id") VALUES ($1)`, [userId])
+      await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "status")
+        VALUES ($1, $2, 'Fence Fixture Co', 'Engineer', 'applied')`, [jobId, userId])
+      await pool!.query(`INSERT INTO application_tasks ("id", "userId", "jobId", "status", "checkpoint", "updatedAt")
+        VALUES ($1, $2, $3, 'filling', 'browser_active', CURRENT_TIMESTAMP)`, [taskId, userId, jobId])
+
+      webTransaction = runWebTransaction(async tx => {
+        await acquireWebFence(tx, [userId])
+        webReady.resolve(await prismaBackendPid(tx))
+        await releaseWeb.promise
+      })
+      const webPid = await withTimeout(webReady.promise, "Web transaction did not acquire its source material lock")
+
+      workerClient = await pool!.connect()
+      workerTransactionOpen = true
+      await withTimeout(workerClient.query("BEGIN"), "Worker transaction begin timed out")
+      await withTimeout(workerClient.query("SELECT set_config($1, $2, true)", ["app.user_id", userId]), "Worker user scope setup timed out")
+      const workerPid = await workerBackendPid(workerClient)
+      workerOperation = (async () => {
+        const outcome = await persistLegacyApplicationTaskOutcome(workerClient!, scope, client => {
+          writerCalled = true
+          return writeLegacyFillErrorOutcome(client, scope, {
+            result: { userId, jobId, status: "failed", error: "Fixture outcome", durationMs: 0 },
+            shouldInsertResult: false,
+            browserAttemptStarted: false,
+            applicationTaskFinalized: true,
+          })
+        })
+        if (outcome.status !== "persisted") throw new Error(`Legacy fixture outcome was ${outcome.status}`)
+        await withTimeout(workerClient!.query("COMMIT"), "Worker transaction commit timed out")
+        workerTransactionOpen = false
+        return outcome.value
+      })()
+
+      await waitForBlocker(workerPid, webPid)
+      expect(writerCalled).toBe(false)
+
+      releaseWeb.resolve(undefined)
+      await withTimeout(webTransaction, "Web source fence transaction did not commit", CLEANUP_TIMEOUT_MS)
+      await expect(withTimeout(workerOperation, "Worker legacy outcome did not finish", CLEANUP_TIMEOUT_MS))
+        .resolves.toEqual({ insertedResult: false, taskFinalized: false })
+      expect(writerCalled).toBe(true)
+
+      const persisted = await withTimeout(
+        pool!.query<{ status: string }>(`SELECT "status" FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [jobId, userId]),
+        "Legacy Job status readback timed out",
+      )
+      expect(persisted.rows).toEqual([{ status: "saved" }])
+    } finally {
+      releaseWeb.resolve(undefined)
+      const settled = await settleOperations(workerOperation, webTransaction)
+      if (!settled && workerClient) {
+        workerClient.release(new Error("Source material fence test cleanup timed out"))
+        workerClient = undefined
+      }
+      if (!settled) {
+        if (workerOperation) await completesWithin(workerOperation, "Legacy writer cleanup timed out")
+        if (webTransaction) await completesWithin(webTransaction, "Web transaction cleanup timed out")
+      }
+      if (workerClient) await rollbackAndReleaseWorkerClient(workerClient, workerTransactionOpen)
+      await pool!.query(`DELETE FROM application_tasks WHERE "id" = $1 AND "userId" = $2`, [taskId, userId])
+      await pool!.query(`DELETE FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [jobId, userId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [userId])
     }
   }, TEST_TIMEOUT_MS)
 
