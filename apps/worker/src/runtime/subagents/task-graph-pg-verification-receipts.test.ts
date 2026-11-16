@@ -26,7 +26,7 @@ describe("loadTaskGraphVerificationReceipts", () => {
   it("reconstructs the exact current-attempt read receipt and canonical observations", async () => {
     const fake = client(), receipt = await loadTaskGraphVerificationReceipts(fake.client, scope)
     expect(receipt.items).toHaveLength(2)
-    expect(receipt.evidenceObservations).toEqual([{ id: "tool-result:call-1", content: expect.objectContaining({ toolName: "jobs.search", output: { jobs: [{ id: "job-1", source: "greenhouse" }] } }) }])
+    expect(receipt.evidenceObservations).toEqual([{ id: "tool-result:call-1", content: expect.objectContaining({ toolName: "jobs.search", output: { jobs: [{ id: "job-1", source: "greenhouse", observedSource: "greenhouse", location: null }] } }) }])
     expect(fake.query).toHaveBeenCalledTimes(2)
   })
 

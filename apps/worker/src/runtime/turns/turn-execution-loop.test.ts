@@ -12,7 +12,9 @@ import { nativeVerificationFeedbackText } from "../canonical-turn-native-verific
 import { buildCanonicalTurnResumeState } from "../canonical-turn-wait-resume-accounting.js"
 import type { NativeVerificationFeedback } from "../subagents/native-verification-port.js"
 import type { ChildWaitOrphanRecovery } from "../subagents/child-durable-wait-replay.js"
+import type { ChildToolReplayReceipt } from "./turn-execution-options.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
+import type { PrepareFinalDependencyWaitInput } from "./turn-execution-options.js"
 import { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { createPgTurnEngineStore } from "./turn-engine-store.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
@@ -1465,7 +1467,7 @@ describe("owner-agnostic turn execution loop", () => {
     }
     const authorize = async (input: WorkerUsageAuthorizationInput): Promise<WorkerUsageAuthorization> => {
       authorizations.push(input)
-      return { settle: async settlement => { settlements.push(settlement) } }
+      return { outputReservationRequired: false, maxOutputTokens: null, settleUnknown: async settlement => { settlements.push(settlement) }, settle: async settlement => { settlements.push(settlement) } }
     }
     const model = createUsageAwareModelAdapter(capturedRouter, { owner: root.options.identity, authorize })
     const goal = "Find senior software engineering roles in Dublin while preserving the original candidate constraints."
@@ -1538,7 +1540,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(authorizations).toHaveLength(2)
     expect(settlements).toEqual([
       { status: "success", inputTokens: 41, outputTokens: 13, estimatedCostUsd: 0.037 },
-      { status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "context_estimate_exceeded" },
+      { status: "error", inputTokens: null, outputTokens: null, estimatedCostUsd: null, errorCode: "context_estimate_exceeded" },
     ])
     expect(root.stepStatuses).toEqual(["completed", "failed"])
     expect(root.finalResponses).toHaveLength(1)
@@ -2168,14 +2170,18 @@ describe("owner-agnostic turn execution loop", () => {
   })
 
   it("projects restored unsafe child call IDs as paired aliases and normalizes exact replay before dispatch", async () => {
-    const rawCallId = "+353 87 123 4567", input = { location: "Dublin" }
+    const rawCallId = "+353 87 123 4567", input = { location: "Dublin" }, output = { job: "persisted" }
     const observation = { id: `tool-result:${rawCallId}`, content: {
-      toolCallId: rawCallId, toolName: "jobs.search", input, status: "completed", output: { job: "persisted" }, errorCode: null,
+      toolCallId: rawCallId, toolName: "jobs.search", input, status: "completed", output, errorCode: null,
     } }
     const child = fixture(identity("task", "child-1"), undefined, [observation])
+    const receipt: ChildToolReplayReceipt = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+      taskId: "child-1", attempt: 1, stepId: "prior-step", toolCallId: rawCallId, toolName: "jobs.search", input,
+      callItem: { id: "call-item-1", revision: 2 }, resultItem: { id: "result-item-1", revision: 3 },
+      result: { status: "completed", output, errorCode: null } }
     const executeTool = vi.fn(child.options.executeTool), model = child.options.model, aliases: string[] = []
     let modelCalls = 0
-    child.options = { ...child.options, executeTool, model: { ...model, async *stream(request: HarnessModelRequest) {
+    child.options = { ...child.options, executeTool, childToolReplayReceipts: [receipt], model: { ...model, async *stream(request: HarnessModelRequest) {
       child.requests.push(request)
       const parts = request.messages.flatMap(message => message.content)
       const use = parts.find(part => part.type === "tool_use")
@@ -2204,6 +2210,177 @@ describe("owner-agnostic turn execution loop", () => {
     expect(JSON.stringify(child.requests.map(request => request.messages))).not.toContain(rawCallId)
     expect(executeTool).not.toHaveBeenCalled()
     expect(child.options.snapshot.toolObservations).toEqual([observation])
+  })
+
+  it("replays a reserved historical child ID only with its complete typed item receipt", async () => {
+    const rawCallId = "toolcall-historical-1", input = { query: "Dublin" }, output = { jobs: [] }
+    const observation = { id: "child-resume:result-item-1", content: {
+      toolCallId: rawCallId, toolName: "jobs.search", input, status: "completed", output, errorCode: null,
+    } }
+    const child = fixture(identity("task", "child-1", 2), undefined, [observation])
+    const receipt: ChildToolReplayReceipt = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+      taskId: "child-1", attempt: 1, stepId: "prior-step", toolCallId: rawCallId, toolName: "jobs.search", input,
+      callItem: { id: "call-item-1", revision: 2 }, resultItem: { id: "result-item-1", revision: 3 },
+      result: { status: "completed", output, errorCode: null } }
+    const executeTool = vi.fn(child.options.executeTool), model = child.options.model
+    child.options = { ...child.options, executeTool, childToolReplayReceipts: [receipt], model: { ...model, async *stream(request: HarnessModelRequest) {
+      child.requests.push(request)
+      if (child.requests.length === 1) {
+        const use = request.messages.flatMap(message => message.content).find(part => part.type === "tool_use")
+        if (!use || use.type !== "tool_use") throw new Error("reserved_alias_missing")
+        yield { type: "tool_call_completed", callId: use.id, name: "jobs.search", arguments: input }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } else {
+        yield { type: "text_delta", text: "replayed safely" }
+        yield { type: "completed", finishReason: "stop" }
+      }
+    } } }
+
+    const result = await runTurnExecutionLoop(child.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1, finalText: "replayed safely" })
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(child.events.filter(event => event.type === "tool_call.started" && event.payload !== undefined)).toHaveLength(1)
+    expect(JSON.stringify(child.requests.map(request => request.messages))).not.toContain(rawCallId)
+  })
+
+  it("rejects absent or unmapped reserved child IDs before call/result writes and tool execution", async () => {
+    for (const mode of ["missing-observation-receipt", "unmapped-model-call"] as const) {
+      const reserved = "toolcall-untrusted", child = fixture(identity("task", "child-1"), undefined,
+        mode === "missing-observation-receipt" ? [{ id: "child-resume:result-1", content: {
+          toolCallId: reserved, toolName: "jobs.search", input: { query: "Dublin" }, status: "completed", output: { jobs: [] }, errorCode: null,
+        } }] : [])
+      const executeTool = vi.fn(child.options.executeTool), model = child.options.model
+      let modelCalls = 0
+      child.options = { ...child.options, executeTool, model: { ...model, async *stream(request: HarnessModelRequest) {
+        child.requests.push(request); modelCalls += 1
+        if (mode === "unmapped-model-call") yield { type: "tool_call_completed", callId: reserved, name: "jobs.search", arguments: { query: "Dublin" } }
+        else yield { type: "text_delta", text: "must not reach provider" }
+        yield { type: "completed", finishReason: mode === "unmapped-model-call" ? "tool_calls" : "stop" }
+      } } }
+
+      const result = await runTurnExecutionLoop(child.options)
+      expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+      expect(modelCalls).toBe(mode === "unmapped-model-call" ? 1 : 0)
+      expect(executeTool).not.toHaveBeenCalled()
+      expect(child.events.some(event => event.type === "tool_call.started" && event.payload !== undefined)).toBe(false)
+      expect(child.events.some(event => event.type === "item.started" && event.payload !== undefined && ["tool_call", "tool_result"].includes(String((event.payload as { type?: unknown })?.type)))).toBe(false)
+    }
+  })
+
+  it.each(["truncated", "mutated"] as const)("rejects a %s current child alias before any call/result write or tool execution", async mode => {
+    const rawCallId = "toolcall-historical-1", input = { query: "Dublin" }, output = { jobs: [] }
+    const observation = { id: "child-resume:result-item-1", content: {
+      toolCallId: rawCallId, toolName: "jobs.search", input, status: "completed", output, errorCode: null,
+    } }
+    const child = fixture(identity("task", "child-1", 2), undefined, [observation])
+    const receipt: ChildToolReplayReceipt = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+      taskId: "child-1", attempt: 1, stepId: "prior-step", toolCallId: rawCallId, toolName: "jobs.search", input,
+      callItem: { id: "call-item-1", revision: 2 }, resultItem: { id: "result-item-1", revision: 3 },
+      result: { status: "completed", output, errorCode: null } }
+    const executeTool = vi.fn(child.options.executeTool), model = child.options.model
+    let projectedAlias = "", modelCalls = 0
+    child.options = { ...child.options, executeTool, childToolReplayReceipts: [receipt], model: { ...model, async *stream(request: HarnessModelRequest) {
+      child.requests.push(request); modelCalls += 1
+      const use = request.messages.flatMap(message => message.content).find(part => part.type === "tool_use" && part.name === "jobs.search")
+      if (!use || use.type !== "tool_use") throw new Error("reserved_alias_missing")
+      projectedAlias = use.id
+      const malformed = mode === "truncated" ? use.id.slice(0, -1)
+        : `${use.id.slice(0, 8)}${use.id[8] === "a" ? "b" : "a"}${use.id.slice(9)}`
+      yield { type: "tool_call_completed", callId: malformed, name: "jobs.search", arguments: input }
+      yield { type: "completed", finishReason: "tool_calls" }
+    } } }
+
+    const result = await runTurnExecutionLoop(child.options)
+    expect(projectedAlias).toMatch(/^toolcall[a-p]{64}[a-z]+$/)
+    expect(modelCalls).toBe(1)
+    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(child.events.some(event => event.type === "tool_call.started" && event.payload !== undefined)).toBe(false)
+    expect(child.events.some(event => event.type === "item.started" && event.payload !== undefined
+      && ["tool_call", "tool_result"].includes(String((event.payload as { type?: unknown })?.type)))).toBe(false)
+  })
+
+  it("rejects the raw canonical ID for an unsafe observation when its replay receipt is missing", async () => {
+    const rawCallId = "+353 87 123 4567", input = { location: "Dublin" }, output = { job: "unproved" }
+    const observation = { id: `tool-result:${rawCallId}`, content: {
+      toolCallId: rawCallId, toolName: "jobs.search", input, status: "completed", output, errorCode: null,
+    } }
+    const child = fixture(identity("task", "child-1"), undefined, [observation])
+    const executeTool = vi.fn(child.options.executeTool), model = child.options.model
+    let modelCalls = 0
+    child.options = { ...child.options, executeTool, model: { ...model, async *stream(request: HarnessModelRequest) {
+      child.requests.push(request); modelCalls += 1
+      yield { type: "tool_call_completed", callId: rawCallId, name: "jobs.search", arguments: input }
+      yield { type: "completed", finishReason: "tool_calls" }
+    } } }
+
+    const result = await runTurnExecutionLoop(child.options)
+    expect(modelCalls).toBe(1)
+    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(child.events.some(event => event.type === "tool_call.started" && event.payload !== undefined)).toBe(false)
+    expect(child.events.some(event => event.type === "item.started" && event.payload !== undefined
+      && ["tool_call", "tool_result"].includes(String((event.payload as { type?: unknown })?.type)))).toBe(false)
+  })
+
+  it("fails closed before replay persistence for redacted history and recovered wait-only evidence", async () => {
+    const cases = [
+      { id: "child-resume:result-item-1", toolCallId: "+353 87 123 4567", toolName: "jobs.search",
+        input: { query: "Dublin" }, output: { jobs: [] } },
+      { id: "child-resume:recovered-wait-result:wait-1", toolCallId: "wait-call", toolName: "wait_subagents",
+        input: { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 },
+        output: { waitId: "wait-1", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-01-01T00:00:00.000Z",
+          matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: null, failureReason: null }] } },
+    ] as const
+    for (const source of cases) {
+      const child = fixture(identity("task", "child-1", 2), undefined, [{ id: source.id, content: {
+        toolCallId: source.toolCallId, toolName: source.toolName, input: source.input, status: "completed", output: source.output, errorCode: null,
+      } }])
+      const executeTool = vi.fn(child.options.executeTool), model = child.options.model
+      child.options = { ...child.options, tools: [{ name: source.toolName, version: "1" }], executeTool, model: { ...model, async *stream(request: HarnessModelRequest) {
+        child.requests.push(request)
+        const use = request.messages.flatMap(message => message.content).find(part => part.type === "tool_use")
+        if (!use || use.type !== "tool_use") throw new Error("historical_alias_missing")
+        yield { type: "tool_call_completed", callId: use.id, name: source.toolName, arguments: source.input }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } } }
+
+      const result = await runTurnExecutionLoop(child.options)
+      expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+      expect(executeTool).not.toHaveBeenCalled()
+      expect(child.events.some(event => event.type === "tool_call.started" && event.payload !== undefined)).toBe(false)
+      expect(child.events.some(event => event.type === "item.started" && event.payload !== undefined
+        && ["tool_call", "tool_result"].includes(String((event.payload as { type?: unknown })?.type)))).toBe(false)
+    }
+  })
+
+  it("uses current-loop persisted handles to authorize exact unsafe replay without a second dispatch", async () => {
+    const rawCallId = "+353 87 123 4567", input = { location: "Dublin" }, child = fixture(identity("task", "child-1"))
+    const executeTool = vi.fn(async ({ call }: Parameters<TurnExecutionOptions["executeTool"]>[0]) => ({
+      id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: { jobs: [] }, errorCode: null,
+    }))
+    const model = child.options.model
+    child.options = { ...child.options, executeTool, model: { ...model, async *stream(request: HarnessModelRequest) {
+      child.requests.push(request)
+      if (child.requests.length === 1) {
+        yield { type: "tool_call_completed", callId: rawCallId, name: "jobs.search", arguments: input }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } else if (child.requests.length === 2) {
+        const use = request.messages.flatMap(message => message.content).find(part => part.type === "tool_use" && part.name === "jobs.search")
+        if (!use || use.type !== "tool_use") throw new Error("persisted_alias_missing")
+        yield { type: "tool_call_completed", callId: use.id, name: "jobs.search", arguments: input }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } else {
+        yield { type: "text_delta", text: "completed after exact replay" }
+        yield { type: "completed", finishReason: "stop" }
+      }
+    } } }
+
+    const result = await runTurnExecutionLoop(child.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 3, toolCallCount: 1, finalText: "completed after exact replay" })
+    expect(executeTool).toHaveBeenCalledOnce()
+    expect(child.events.filter(event => event.type === "tool_call.started" && event.payload !== undefined)).toHaveLength(1)
+    expect(JSON.stringify(child.requests.map(request => request.messages))).not.toContain(rawCallId)
   })
 
   it("projects a fresh unsafe child call observation on the following model step", async () => {
@@ -2238,7 +2415,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(child.options.snapshot.toolObservations).toEqual([])
   })
 
-  it("keeps duplicate child-call rejection private after an unsafe ID is aliased on the next step", async () => {
+  it("suppresses an exact replay collision after an unsafe ID is aliased on the next step", async () => {
     const rawCallId = "+353 87 123 4567", input = { location: "Dublin" }
     const child = fixture(identity("task", "child-1")), executeTool = vi.fn(child.options.executeTool), model = child.options.model
     let modelCalls = 0, replayAlias = ""
@@ -2260,7 +2437,7 @@ describe("owner-agnostic turn execution loop", () => {
     const terminalEvents = child.events.filter(event => event.payload !== undefined && (event.type === "task.failed"
       || (event.type === "item.completed" && event.itemId === failedEvent?.itemId)))
     const persistedCalls = child.events.filter(event => event.type === "tool_call.started" && event.payload !== undefined)
-    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress" })
     expect(executeTool).toHaveBeenCalledOnce()
     expect(executeTool.mock.calls[0]?.[0].call.id).toBe(rawCallId)
     expect(replayAlias).not.toBe(rawCallId)
@@ -4354,4 +4531,89 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "tool_call.started" && event.id.includes("useful-search"))).toBe(true)
   })
 
+})
+
+describe("private final dependency wait admission", () => {
+  const childId = "subagent-11111111-1111-4111-8111-111111111111"
+
+  function singleFinalModel(root: Fixture, text: string): ModelAdapter {
+    return {
+      ...root.options.model,
+      async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        yield { type: "text_delta", text }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+  }
+
+  it("waits through the registered tool path before verifying or persisting the live candidate", async () => {
+    const root = fixture(identity("task", "parent-1")), callbackInputs: PrepareFinalDependencyWaitInput[] = []
+    const callback = vi.fn((input: PrepareFinalDependencyWaitInput) => {
+      callbackInputs.push(input)
+      return { taskIds: [childId] }
+    })
+    const waitOutput = {
+      waitId: "22222222-2222-4222-8222-222222222222", status: "waiting", taskIds: [childId],
+      deadlineAt: "2026-11-13T12:00:30.000Z", matchedTaskIds: [],
+      tasks: [{ taskId: childId, status: "running", role: "scout", result: null, failureReason: null }],
+    }
+    const execute = vi.fn(async ({ call }: Parameters<TurnExecutionOptions["executeTool"]>[0]) => ({
+      id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, errorCode: null, output: waitOutput,
+    }))
+    const completionGate = vi.fn(async () => ({ ok: true as const }))
+    root.options = {
+      ...root.options, model: singleFinalModel(root, "A tentative answer before the child result."),
+      tools: [{ name: "wait_subagents", version: "1" }], executeTool: execute,
+      validateToolArguments: (name, value) => name === "wait_subagents" && isRecord(value) ? true : "unexpected tool",
+      prepareFinalDependencyWait: callback, completionGate,
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const input = callbackInputs[0]
+    const waitCall = execute.mock.calls[0]?.[0].call
+
+    expect(result).toMatchObject({ status: "waiting_for_dependency", stepCount: 1, toolCallCount: 1 })
+    expect(callback).toHaveBeenCalledTimes(1)
+    expect(input?.identity).toBe(root.options.identity)
+    expect(input?.step).toMatchObject({ id: input.context.stepId, ordinal: 0 })
+    expect(input?.snapshot).toBe(root.options.snapshot)
+    expect(input?.context.schemaVersion).toBe("agent-harness.v2")
+    expect(input?.signal.aborted).toBe(false)
+    expect(execute).toHaveBeenCalledTimes(1)
+    expect(waitCall).toMatchObject({ toolName: "wait_subagents", input: {
+      taskIds: [childId], mode: "all", timeoutMs: 30_000,
+    } })
+    expect(execute.mock.calls[0]?.[0].serverGeneratedFinalDependencyWait).toEqual({
+      stepId: input.step.id, toolCallId: waitCall?.id,
+    })
+    expect(waitCall?.input).not.toHaveProperty("serverGeneratedFinalDependencyWait")
+    expect(root.stepStatuses).toEqual(["waiting_for_tool"])
+    expect(new Set(root.events.filter(event => event.type === "step.completed").map(event => event.id)).size).toBe(1)
+    expect(root.events.some(event => event.type === "turn.completed" || event.type === "turn.failed")).toBe(false)
+    expect(root.events.some(event => event.type === "item.started" && isRecord(event.payload) && event.payload.type === "agent_message")).toBe(false)
+    expect(root.finalResponses).toHaveLength(0)
+    expect(completionGate).not.toHaveBeenCalled()
+  })
+
+  it("keeps the normal path when the callback returns null and only invokes it after model tool calls", async () => {
+    const child = fixture(identity("task", "child-1")), callbackInputs: PrepareFinalDependencyWaitInput[] = []
+    child.options = {
+      ...child.options,
+      prepareFinalDependencyWait: vi.fn((input: PrepareFinalDependencyWaitInput) => {
+        callbackInputs.push(input)
+        return null
+      }),
+    }
+
+    const result = await runTurnExecutionLoop(child.options)
+
+    expect(result.status).toBe("completed")
+    expect(callbackInputs).toHaveLength(1)
+    expect(callbackInputs[0]?.step.ordinal).toBe(1)
+    expect(callbackInputs[0]?.snapshot.toolObservations).toHaveLength(1)
+    expect(callbackInputs[0]?.context.blocks.some(block => block.layer === "tool_observation")).toBe(true)
+    expect(child.requests).toHaveLength(2)
+    expect(child.events.some(event => event.type === "tool_call.started" && event.payload && isRecord(event.payload) && event.payload.toolName === "wait_subagents")).toBe(false)
+  })
 })

@@ -6,6 +6,9 @@ import { loadApplicationFillPreparation, type ApplicationFillPreparation } from 
 import type { TurnLease } from "../turns/lease.js"
 import { parseScheduledAutomationSnapshot, type ScheduledAutomationCriteria, type ScheduledAutomationSnapshot } from "./scheduled-automation-snapshot.js"
 import { scheduledPostGateTaskTemplates } from "./scheduled-post-gate-task-templates.js"
+import { templatesForInteractiveScoutDelegation } from "./nested-scout-profile.js"
+import { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
+export { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
 
 const APPLICATION_FILL_TEMPLATE_ID = "application_filler"
 const SCHEDULED_PREPARE_TEMPLATE_ID = "prepare"
@@ -75,37 +78,6 @@ function criteriaForScheduledSnapshot(snapshot: ScheduledAutomationSnapshot): Sc
     minScore: snapshot.minScore,
   })
 }
-
-/** Registered task types are server-owned; a plan may select only these IDs. */
-export const TASK_GRAPH_TEMPLATES = Object.freeze({
-  scout: Object.freeze({
-    role: "scout",
-    taskType: "job_discovery",
-    allowedActions: Object.freeze(["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"]),
-    constraints: Object.freeze(["Use approved job discovery and read tools only; do not submit applications or message employers."]),
-    expectedOutputSchema: Object.freeze({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }),
-  }),
-  analyst: Object.freeze({
-    role: "analyst",
-    taskType: "job_analysis",
-    allowedActions: Object.freeze(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"]),
-    constraints: Object.freeze(["Analyze permitted job, persona, and resume evidence only; do not write, submit, send, or message employers."]),
-    expectedOutputSchema: Object.freeze({ schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }),
-  }),
-  prepare: Object.freeze({
-    role: "prepare",
-    taskType: "scheduled_application_prepare",
-    allowedActions: Object.freeze(["scheduled.application.prepare"]),
-    constraints: Object.freeze([
-      "This is a specialized scheduled continuation; never select Prepare in the initial Scout/Analyst plan.",
-      "Prepare only the jobs, 0–100 scores, and schedule settings bound by the server-owned persisted Analyze checkpoint and schedule snapshot.",
-      "Treat job IDs and digests from tool results as correlation data; the server must rebind them to persisted owner, task, attempt, checkpoint, and snapshot evidence.",
-      "Return only per-job status and immutable artifact references; never include scores, resume or letter bodies, user identity, or schedule configuration.",
-      "Do not submit applications or message employers.",
-    ]),
-    expectedOutputSchema: Object.freeze({ schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" }),
-  }),
-} satisfies Readonly<Record<string, TaskGraphTaskTemplate>>)
 
 /** Add job-draft capabilities only for a server-validated selected-job Turn. */
 export function taskGraphTemplatesForSelectedJob(
@@ -228,7 +200,12 @@ export async function taskGraphRuntimeForTurn(input: {
   }
   return {
     enabled: true, selectedJobMode: Boolean(preparation), selectedJobPreparation: preparation, scheduledDraftMode,
-    templates: taskGraphTemplatesForApplicationFill(templates, scheduledAutomationRun ? undefined : applicationFill),
+    templates: taskGraphTemplatesForApplicationFill(
+      input.turnSource === "user" && !scheduledSnapshot && !manualSnapshot && !preparation && !applicationFill
+        && input.automationRunMode === undefined
+        ? templatesForInteractiveScoutDelegation(templates, TASK_GRAPH_TEMPLATES) : templates,
+      scheduledAutomationRun ? undefined : applicationFill,
+    ),
   }
 }
 

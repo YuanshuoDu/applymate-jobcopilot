@@ -10,7 +10,7 @@ const lease = {
   id: "parent-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
   ownerId: "worker-1", attemptCount: 3, leaseExpiresAt: new Date(now.getTime() + 60_000),
 }
-function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinals?: number[]; sourceOrdinal?: number; ownerId?: string; receiptWaitId?: string; missingResult?: boolean; callStatus?: string; callIdempotencyKey?: string; lateTerminal?: boolean; waitStatus?: "ready" | "timed_out"; mode?: string; targetId?: string; taskResultNote?: string; waitTargetTaskIds?: unknown; inputTaskIds?: unknown; outcomeTaskIds?: unknown; outcomeTaskId?: unknown; receiptTaskIds?: unknown; receiptTaskId?: unknown; misboundTarget?: boolean } = {}) {
+function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinals?: number[]; sourceOrdinal?: number; ownerId?: string; receiptWaitId?: string; missingResult?: boolean; callStatus?: string; resultStatus?: string; callToolCallId?: string; callIdempotencyKey?: string; lateTerminal?: boolean; waitStatus?: "ready" | "timed_out"; mode?: string; requestMode?: string; targetId?: string; taskResultNote?: string; waitTargetTaskIds?: unknown; requestTaskIds?: unknown; inputTaskIds?: unknown; outcomeTaskIds?: unknown; outcomeTaskId?: unknown; receiptTaskIds?: unknown; receiptTaskId?: unknown; receiptDeadlineAt?: string; misboundTarget?: boolean; waitMatchedTaskIds?: string[] } = {}) {
   const calls: { sql: string; params: unknown[] }[] = []
   const state = { consumedAt: options.consumed ? now : null, acknowledgements: 0 }
   const waitStatus = options.waitStatus ?? "ready"
@@ -18,7 +18,7 @@ function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinal
   const targetId = options.targetId ?? "child-1"
   const targetTaskIds: unknown = options.waitTargetTaskIds ?? (options.lateTerminal ? [targetId, "child-2"] : [targetId])
   const deadlineAt = new Date(now.getTime() + (waitStatus === "timed_out" ? -5_000 : 5_000))
-  const matchedTaskIds = [targetId]
+  const matchedTaskIds = [targetId], waitMatchedTaskIds = options.waitMatchedTaskIds ?? matchedTaskIds
   const taskResult = options.taskResultNote ? { answer: 42, note: options.taskResultNote } : { answer: 42 }
   const snapshotTasks = [
     { taskId: options.outcomeTaskId ?? targetId, status: "completed", role: "writer", result: taskResult, failureReason: null },
@@ -27,15 +27,15 @@ function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinal
   const outcome = { waitId: "wait-1", status: waitStatus, taskIds: options.outcomeTaskIds ?? targetTaskIds, deadlineAt: deadlineAt.toISOString(), matchedTaskIds,
     tasks: snapshotTasks }
   const wait = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", stepId: "step-1",
-    idempotencyKey: "wait-key", targetTaskIds, mode: "any", status: waitStatus, deadlineAt, resolvedAt: now, matchedTaskIds,
-    result: { request: { targetTaskIds, mode, timeoutMs: 5_000 }, outcome }, suspendedAt: now, consumedAt: state.consumedAt }
+    idempotencyKey: "wait-key", targetTaskIds, mode: "any", status: waitStatus, deadlineAt, resolvedAt: now, matchedTaskIds: waitMatchedTaskIds,
+    result: { request: { targetTaskIds: options.requestTaskIds ?? targetTaskIds, mode: options.requestMode ?? mode, timeoutMs: 5_000 }, outcome }, suspendedAt: now, consumedAt: state.consumedAt }
   wait.mode = mode
   const currentTargets = [
     { id: targetId, parentTaskId: options.misboundTarget ? "other-parent" : "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", status: "completed", role: "writer", result: taskResult, failureReason: null },
     ...(options.lateTerminal ? [{ id: "child-2", parentTaskId: "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", status: "completed", role: "analyst", result: { answer: 7 }, failureReason: null }] : []),
   ]
-  const callContent = { toolCallId: "call-1", toolName: "wait_subagents", input: { idempotencyKey: options.callIdempotencyKey ?? "wait-key", taskIds: options.inputTaskIds ?? targetTaskIds, mode, timeoutMs: 5_000 } }
-  const resultContent = { toolCallId: "call-1", output: { ...outcome, taskIds: options.receiptTaskIds ?? outcome.taskIds,
+  const callContent = { toolCallId: options.callToolCallId ?? "call-1", toolName: "wait_subagents", input: { idempotencyKey: options.callIdempotencyKey ?? "wait-key", taskIds: options.inputTaskIds ?? targetTaskIds, mode, timeoutMs: 5_000 } }
+  const resultContent = { toolCallId: "call-1", output: { ...outcome, deadlineAt: options.receiptDeadlineAt ?? outcome.deadlineAt, taskIds: options.receiptTaskIds ?? outcome.taskIds,
     tasks: options.receiptTaskId === undefined ? outcome.tasks : [{ ...snapshotTasks[0], taskId: options.receiptTaskId }],
     status: "waiting", waitId: options.receiptWaitId ?? "wait-1", matchedTaskIds: [] }, errorCode: null }
   const client = {
@@ -62,7 +62,7 @@ function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinal
       }], rowCount: 1 }
       if (sql.includes('SELECT "id", "content", "status" FROM "agent_items"')) return options.missingResult
         ? { rows: [], rowCount: 0 }
-        : { rows: [{ id: "item-result-1", content: resultContent, status: "completed" }], rowCount: 1 }
+        : { rows: [{ id: "item-result-1", content: resultContent, status: options.resultStatus ?? "completed" }], rowCount: 1 }
       if (sql.includes('UPDATE "agent_wait_conditions"')) { state.consumedAt = now; wait.consumedAt = now; state.acknowledgements += 1; return { rows: [], rowCount: 1 } }
       return { rows: [], rowCount: 1 }
     },
@@ -199,6 +199,51 @@ describe("durable child wait resume", () => {
     await expect(loadDurableSubagentWaitResume(foreignReceipt.pool as never, lease, now)).rejects.toMatchObject({ code: "wait_scope_error" })
     const arbitraryRecovery = fixture({ missingResult: true, callStatus: "started", callIdempotencyKey: "other-wait-key" })
     await expect(loadDurableSubagentWaitResume(arbitraryRecovery.pool as never, lease, now)).rejects.toMatchObject({ code: "wait_scope_error" })
+  })
+
+  it("reports fixed validation stages while preserving wait-scope failures", async () => {
+    const stale = fixture({ ownerId: "other-worker" })
+    await expect(loadDurableSubagentWaitResume(stale.pool as never, lease, now)).rejects.toMatchObject({
+      code: "wait_scope_error", resumeValidationStage: "lease_fence",
+    })
+    const invalidTargets = fixture({ waitTargetTaskIds: ["foreign-child"] })
+    await expect(loadDurableSubagentWaitResume(invalidTargets.pool as never, lease, now)).rejects.toMatchObject({
+      code: "wait_scope_error", resumeValidationStage: "wait_result_shape",
+    })
+    const foreignTarget = fixture({ misboundTarget: true })
+    await expect(loadDurableSubagentWaitResume(foreignTarget.pool as never, lease, now)).rejects.toMatchObject({
+      code: "wait_scope_error", resumeValidationStage: "target_scope",
+    })
+    const inconsistentMatch = fixture({ waitMatchedTaskIds: [] })
+    await expect(loadDurableSubagentWaitResume(inconsistentMatch.pool as never, lease, now)).rejects.toMatchObject({
+      code: "wait_scope_error", resumeValidationStage: "resolved_outcome",
+    })
+    const unavailableCall = fixture({ callStatus: "failed" })
+    await expect(loadDurableSubagentWaitResume(unavailableCall.pool as never, lease, now)).rejects.toMatchObject({
+      code: "wait_scope_error", resumeValidationStage: "tool_call",
+    })
+    const foreignReceipt = fixture({ receiptWaitId: "wait-other" })
+    await expect(loadDurableSubagentWaitResume(foreignReceipt.pool as never, lease, now)).rejects.toMatchObject({
+      code: "wait_scope_error", resumeValidationStage: "receipt_identity",
+    })
+  })
+
+  it.each([
+    ["call_binding", { callToolCallId: "" }],
+    ["call_binding", { requestTaskIds: ["foreign-child"] }],
+    ["call_binding", { requestMode: "all" }],
+    ["receipt_pair", { callStatus: "started" }],
+    ["receipt_pair", { resultStatus: "failed" }],
+    ["receipt_identity", { receiptWaitId: "wait-other" }],
+    ["receipt_ids", { receiptTaskIds: ["foreign-child"] }],
+    ["receipt_deadline", { receiptDeadlineAt: "2026-10-22T10:00:05.001Z" }],
+    ["receipt_deadline", { receiptDeadlineAt: "invalid" }],
+  ] as const)("reports the %s tool receipt substage without changing the failure", async (resumeValidationStage, options) => {
+    const fake = fixture(options)
+    await expect(loadDurableSubagentWaitResume(fake.pool as never, lease, now)).rejects.toMatchObject({
+      code: "wait_scope_error", resumeValidationStage,
+    })
+    expect(fake.state.acknowledgements).toBe(0)
   })
 
   it("fences acknowledgement by the current owner after a same-attempt reissue", async () => {

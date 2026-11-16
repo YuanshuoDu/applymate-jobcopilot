@@ -718,7 +718,7 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     await expect(interruptSubtree(subtree.pool, { sessionId: "session-1", rootTaskId: "root-1", targetPath: "/root-1/child", now: new Date() })).resolves.toBe(3)
     const subtreeSelect = subtree.calls.find(([sql]) => sql.includes('SELECT task."id", task."status", task."attemptCount"'))?.[0] ?? ""
     expect(subtreeSelect).toContain('task."rootTaskId" = $2')
-    expect(subtreeSelect).toContain('task."path" LIKE $3 || \'/%\'')
+    expect(subtreeSelect).toContain('left(task."path", char_length($3) + 1) = $3 || \'/\'')
     const lockIndex = subtree.calls.findIndex(([sql]) => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
     const updateIndex = subtree.calls.findIndex(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))
     expect(lockIndex).toBeGreaterThan(-1)

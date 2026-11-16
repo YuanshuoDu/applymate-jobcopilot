@@ -2,6 +2,7 @@ import type pg from "pg"
 import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
 import { describe, expect, it, vi } from "vitest"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 import { readRootTaskHistoryFence, rootTaskHistoryIndexKeys, rootTaskHistoryObjectiveDigest, rootTaskHistoryOrigin, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
 
 const { readWitness } = vi.hoisted(() => ({ readWitness: vi.fn(async () => ({ eventId: "start-marker", xid8: "50" })) }))
@@ -185,6 +186,42 @@ describe("root task history current fence", () => {
     expect(rootTaskHistoryOrigin("user", { intent: supported, input: { goal: "x", intent: { kind: "unknown", version: 1 } } })).toBeUndefined()
   })
 
+  it("derives a separate footprint target origin only for explicit user objective intent v1", async () => {
+    const input = { goal: " Plan a role ", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT }
+    const test = fixture({ turnInput: input })
+    const fence = await readRootTaskHistoryFence(test.client, {
+      ...test.input, crossSessionRootTaskHistoryEnabled: true, searchFootprintReadAllowed: true,
+    })
+    expect(fence).toMatchObject({
+      currentStartSequence: 20n,
+      searchFootprintOrigin: '["user","objective_task_graph_execution",1]',
+      searchFootprintStartWitness: { eventId: "start-marker", xid8: "50" },
+      objectiveDigest: expect.any(String),
+    })
+    expect(fence).not.toHaveProperty("currentOrigin")
+    expect(fence).not.toHaveProperty("currentStartWitness")
+    expect(rootTaskHistoryOrigin("user", input)).toBeUndefined()
+
+    const noConsent = await readRootTaskHistoryFence(test.client, { ...test.input, crossSessionRootTaskHistoryEnabled: true })
+    expect(noConsent).not.toHaveProperty("searchFootprintOrigin")
+    expect(noConsent).not.toHaveProperty("searchFootprintStartWitness")
+  })
+
+  it.each([
+    ["automation source", "automation", { goal: "Plan a role", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT }],
+    ["wrong version", "user", { goal: "Plan a role", intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, version: 2 } }],
+    ["extra intent field", "user", { goal: "Plan a role", intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, extra: true } }],
+    ["mismatched nested copy", "user", { goal: "Plan a role", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      input: { goal: "Plan a role", intent: { kind: "interactive_discovery_shortlist", version: 1 } } }],
+  ])("does not create a footprint target for %s", async (_label, turnSource, turnInput) => {
+    const test = fixture({ turnSource, turnInput })
+    const fence = await readRootTaskHistoryFence(test.client, {
+      ...test.input, crossSessionRootTaskHistoryEnabled: true, searchFootprintReadAllowed: true,
+    })
+    expect(fence).not.toHaveProperty("searchFootprintOrigin")
+    expect(fence).not.toHaveProperty("searchFootprintStartWitness")
+  })
+
   it("uses one canonical typed-aware identity for history fences and projection lookup keys", async () => {
     const turnInput = {
       goal: " Plan a role ", intent: { kind: "interactive_discovery_shortlist", version: 1 },
@@ -227,6 +264,17 @@ describe("root task history current fence", () => {
     expect(rootTaskHistoryObjectiveDigest(inputFor({ ...full, requirements: [full.requirements[0]] }), root)).not.toBe(fullDigest)
     expect(rootTaskHistoryObjectiveDigest({ input: { goal: root.goal } }, root)).not.toBe(fullDigest)
     expect(rootTaskHistoryObjectiveDigest(inputFor({ schemaVersion: "bad", requirements: [] }), root)).toBeUndefined()
+  })
+
+  it("binds the complete normalized location allowlist into history identity", () => {
+    const root = { goal: "Plan a role", successCriteria: ["Compare roles"] }
+    const inputFor = (locations: readonly string[]) => ({ input: { goal: root.goal, verificationRequirements: {
+      schemaVersion: "agent-harness.v2.objective-requirements.v2",
+      requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations } }],
+    } } })
+    const fullDigest = rootTaskHistoryObjectiveDigest(inputFor(["Dublin", "Berlin"]), root)
+    expect(rootTaskHistoryObjectiveDigest(inputFor(["berlin", "dublin"]), root)).toBe(fullDigest)
+    expect(rootTaskHistoryObjectiveDigest(inputFor(["Berlin"]), root)).not.toBe(fullDigest)
   })
 
   it("keeps same-session fencing when cross-session origin or start witness is unavailable", async () => {

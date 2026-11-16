@@ -93,7 +93,7 @@ describe("native verification durable request replay identity", () => {
         if (sql.startsWith('SELECT "id" FROM "agent_turns"') && sql.includes("FOR UPDATE")) return queryResult([{ id: ids.turnId }])
         if (sql.includes('SELECT "rootTaskId", "turnId" FROM "sub_agent_tasks"')) return queryResult([{ rootTaskId: ids.rootTaskId, turnId: ids.turnId }])
         if (sql.includes('SELECT root."id", root."turnId", root."status"')) return queryResult([{ id: ids.rootTaskId, turnId: ids.turnId, status: "running", interruptRequestedAt: null }])
-        if (sql.includes('SELECT "id", "rootTaskId", "path", "depth", "status", "allowedActions"')
+        if (sql.includes('SELECT "id", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType"')
           && sql.includes('FROM "sub_agent_tasks"') && sql.includes("FOR UPDATE")) return queryResult([parent])
         if (sql.startsWith('SELECT COUNT(*)::int AS "count" FROM "sub_agent_tasks"')) return queryResult([{ count: 0 }])
         if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) {

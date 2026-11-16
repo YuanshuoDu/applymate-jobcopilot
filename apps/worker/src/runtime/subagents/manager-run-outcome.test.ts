@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { finishInterrupted, runClaimedSubagent } from "./manager-run-outcome.js"
-import { SubagentLeaseError, type SubagentExecutionResult, type SubagentJobPayload, type SubagentLease, type SubagentStore } from "./types.js"
+import { SubagentLeaseError, type SubagentContinuation, type SubagentExecutionResult, type SubagentJobPayload, type SubagentLease, type SubagentStore } from "./types.js"
 
 const payload: SubagentJobPayload = { taskId: "task-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" }
 const lease = { id: "task-1", attemptCount: 2 } as SubagentLease
@@ -95,8 +95,9 @@ describe("runClaimedSubagent", () => {
       .mockResolvedValueOnce({ status: "input_pending", messageIds: ["message-2"] })
       .mockResolvedValueOnce({ status: "input_pending", messageIds: ["message-3"] })
       .mockResolvedValueOnce("completed")
-    const execute = vi.fn(async ({ continuation }: { lease: SubagentLease; continuation?: { kind: "mailbox_input_pending"; missingMessageIds: readonly string[]; observedMessageIds: readonly string[] } }) => {
+    const execute = vi.fn(async ({ continuation }: { lease: SubagentLease; continuation?: SubagentContinuation }) => {
       if (!continuation) return { status: "completed", mailboxMessageIds: ["message-1"] } satisfies SubagentExecutionResult
+      if (continuation.kind !== "mailbox_input_pending") throw new Error("unexpected continuation kind")
       return { status: "completed", mailboxMessageIds: continuation.missingMessageIds } satisfies SubagentExecutionResult
     })
     const dispose = vi.fn()
@@ -133,8 +134,9 @@ describe("runClaimedSubagent", () => {
       .mockResolvedValueOnce({ status: "input_pending", messageIds: ["message-3"] })
       .mockResolvedValueOnce({ status: "input_pending", messageIds: ["message-4"] })
       .mockResolvedValueOnce("failed")
-    const execute = vi.fn(async ({ continuation }: { continuation?: { missingMessageIds: readonly string[] } }) => ({
-      status: "completed" as const, mailboxMessageIds: continuation?.missingMessageIds ?? [],
+    const execute = vi.fn(async ({ continuation }: { continuation?: SubagentContinuation }) => ({
+      status: "completed" as const,
+      mailboxMessageIds: continuation?.kind === "mailbox_input_pending" ? continuation.missingMessageIds : [],
     }))
 
     await expect(runClaimedSubagent({ finish }, payload, runLease, { lost: new Promise(() => undefined), interrupted: false }, execute, () => runNow, vi.fn()))
@@ -148,8 +150,9 @@ describe("runClaimedSubagent", () => {
     let signalLeaseLoss!: (error: SubagentLeaseError) => void
     const lost = new Promise<SubagentLeaseError>(resolve => { signalLeaseLoss = resolve })
     const finish = vi.fn().mockResolvedValue({ status: "input_pending", messageIds: ["message-2"] })
-    const execute = vi.fn(async ({ continuation }: { continuation?: { kind: "mailbox_input_pending" } }) => {
+    const execute = vi.fn(async ({ continuation }: { continuation?: SubagentContinuation }) => {
       if (!continuation) return { status: "completed", mailboxMessageIds: ["message-1"] } satisfies SubagentExecutionResult
+      if (continuation.kind !== "mailbox_input_pending") throw new Error("unexpected continuation kind")
       signalLeaseLoss(new SubagentLeaseError("lost", "lease expired"))
       return await new Promise<SubagentExecutionResult>(() => undefined)
     })
@@ -171,6 +174,72 @@ describe("runClaimedSubagent", () => {
       return { status: "input_pending" as const, messageIds: ["message-2"] }
     })
     const execute = vi.fn(async (): Promise<SubagentExecutionResult> => ({ status: "completed", mailboxMessageIds: ["message-1"] }))
+
+    await expect(runClaimedSubagent({ finish }, payload, ownedLease, { lost, interrupted: false }, execute, () => runNow, vi.fn()))
+      .resolves.toEqual({ taskId: "task-1", status: "lease_lost", reason: "Subagent lease was lost" })
+
+    expect(execute).toHaveBeenCalledOnce()
+    expect(finish).toHaveBeenCalledOnce()
+  })
+
+  it("uses a separate bounded continuation for children pending without mailbox IDs", async () => {
+    const finish = vi.fn().mockResolvedValueOnce({ status: "children_pending" }).mockResolvedValueOnce("completed")
+    const execute = vi.fn(async ({ continuation }: { lease: SubagentLease; continuation?: SubagentContinuation }) => {
+      return { status: "completed", result: { continuation: continuation?.kind ?? "initial" } } satisfies SubagentExecutionResult
+    })
+
+    await expect(runClaimedSubagent({ finish }, payload, runLease, { lost: new Promise(() => undefined), interrupted: false }, execute, () => runNow, vi.fn()))
+      .resolves.toEqual({ taskId: "task-1", status: "completed" })
+
+    expect(execute).toHaveBeenCalledTimes(2)
+    expect(execute.mock.calls.map(([input]) => input.continuation)).toEqual([undefined, { kind: "children_pending" }])
+    expect(finish).toHaveBeenCalledTimes(2)
+    expect(finish.mock.calls[1]?.[0].mailboxMessageIds).toEqual([])
+  })
+
+  it("terminally fails instead of hot-looping on a repeated children-pending result", async () => {
+    const finish = vi.fn().mockResolvedValueOnce({ status: "children_pending" })
+      .mockResolvedValueOnce({ status: "children_pending" }).mockResolvedValueOnce("failed")
+    const execute = vi.fn(async (): Promise<SubagentExecutionResult> => ({ status: "completed" }))
+
+    await expect(runClaimedSubagent({ finish }, payload, runLease, { lost: new Promise(() => undefined), interrupted: false }, execute, () => runNow, vi.fn()))
+      .resolves.toEqual({ taskId: "task-1", status: "failed", reason: "subagent_children_pending_continuation_limit" })
+
+    expect(execute).toHaveBeenCalledTimes(2)
+    expect(finish).toHaveBeenCalledTimes(3)
+    expect(finish.mock.calls[2]?.[0]).toMatchObject({ status: "failed", failureReason: "subagent_children_pending_continuation_limit", retryDisposition: "terminal" })
+    expect(finish.mock.calls[2]?.[0].mailboxMessageIds).toBeUndefined()
+  })
+
+  it("races the children-pending continuation against active lease loss", async () => {
+    let signalLeaseLoss!: (error: SubagentLeaseError) => void
+    const lost = new Promise<SubagentLeaseError>(resolve => { signalLeaseLoss = resolve })
+    const finish = vi.fn().mockResolvedValueOnce({ status: "children_pending" })
+    const execute = vi.fn(async ({ continuation }: { lease: SubagentLease; continuation?: SubagentContinuation }) => {
+      if (continuation?.kind === "children_pending") {
+        signalLeaseLoss(new SubagentLeaseError("lost", "lease expired during children wait"))
+        return await new Promise<SubagentExecutionResult>(() => undefined)
+      }
+      return { status: "completed" } satisfies SubagentExecutionResult
+    })
+
+    await expect(runClaimedSubagent({ finish }, payload, runLease, { lost, interrupted: false }, execute, () => runNow, vi.fn()))
+      .resolves.toEqual({ taskId: "task-1", status: "lease_lost", reason: "lease expired during children wait" })
+    expect(execute).toHaveBeenCalledTimes(2)
+    expect(finish).toHaveBeenCalledOnce()
+  })
+
+  it("does not start children-pending continuation after lease loss during finish", async () => {
+    let signalLeaseLoss!: (error: SubagentLeaseError) => void
+    const lost = new Promise<SubagentLeaseError>(resolve => { signalLeaseLoss = resolve })
+    const controller = new AbortController()
+    const ownedLease = { ...runLease, signal: controller.signal }
+    const finish = vi.fn(async () => {
+      controller.abort()
+      signalLeaseLoss(new SubagentLeaseError("lost", "lease expired during finish"))
+      return { status: "children_pending" as const }
+    })
+    const execute = vi.fn(async (): Promise<SubagentExecutionResult> => ({ status: "completed" }))
 
     await expect(runClaimedSubagent({ finish }, payload, ownedLease, { lost, interrupted: false }, execute, () => runNow, vi.fn()))
       .resolves.toEqual({ taskId: "task-1", status: "lease_lost", reason: "Subagent lease was lost" })

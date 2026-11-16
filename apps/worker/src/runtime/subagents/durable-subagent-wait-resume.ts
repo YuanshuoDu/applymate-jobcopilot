@@ -9,6 +9,17 @@ type Queryable = TurnEngineQueryClient
 type Pool = TurnEnginePool
 type Row = Record<string, unknown>
 type ResumeLease = Pick<SubagentLease, "id" | "userId" | "sessionId" | "turnId" | "rootTaskId" | "ownerId" | "attemptCount" | "leaseExpiresAt">
+type ResumeValidationStage = "lease_fence" | "source_ordinal" | "wait_state" | "wait_result_shape" | "target_scope" | "resolved_outcome" | "tool_call" | "call_binding" | "receipt_pair" | "receipt_identity" | "receipt_ids" | "receipt_deadline" | "input_target_ids" | "output_target_ids"
+class DurableWaitResumeScopeError extends DurableSubagentWaitError {
+  constructor(readonly resumeValidationStage: ResumeValidationStage, message: string) { super("wait_scope_error", message) }
+}
+function resumeScopeError(stage: ResumeValidationStage, message: string): never { throw new DurableWaitResumeScopeError(stage, message) }
+function atResumeStage<T>(stage: ResumeValidationStage, work: () => T): T {
+  try { return work() } catch (error) {
+    if (error instanceof DurableSubagentWaitError && error.code === "wait_scope_error") throw new DurableWaitResumeScopeError(stage, error.message)
+    throw error
+  }
+}
 const OPEN_SESSION = `session."status" NOT IN ('aborted', 'archived')`
 const TERMINAL = new Set(["completed", "failed", "interrupted", "cancelled", "closed", "passed", "skipped"])
 
@@ -45,17 +56,18 @@ function validOutcomeTargets(value: unknown, ids: readonly string[]): boolean {
 }
 function markValidatedInputIds(input: Record<string, unknown>, ids: readonly string[]): void {
   const inputIds = strictIds(input.taskIds), outcome = inputIds && { taskIds: inputIds, matchedTaskIds: [], tasks: inputIds.map(taskId => ({ taskId })) }
-  if (!inputIds || !outcome || !sameIds(inputIds, ids) || !markCanonicalSubagentWaitTargetIds({ targetTaskIds: inputIds }, outcome, inputIds)) throw new DurableSubagentWaitError("wait_scope_error", "Child wait input target IDs changed scope")
+  if (!inputIds || !outcome || !sameIds(inputIds, ids) || !markCanonicalSubagentWaitTargetIds({ targetTaskIds: inputIds }, outcome, inputIds)) resumeScopeError("input_target_ids", "Child wait input target IDs changed scope")
 }
-function validReceipt(content: unknown, wait: Row, ids: readonly string[], toolCallId: string): boolean {
+function receiptFailureStage(content: unknown, wait: Row, ids: readonly string[], toolCallId: string): ResumeValidationStage | undefined {
   const result = object(content), receipt = object(result.output), taskIds = strictIds(receipt.taskIds), matched = strictIds(receipt.matchedTaskIds, 0)
   const tasks = Array.isArray(receipt.tasks) ? receipt.tasks : [], listed = tasks.map(task => object(task).taskId)
   if (!receipt || result.toolCallId !== toolCallId || result.errorCode !== null && result.errorCode !== undefined
-    || receipt.waitId !== wait.id || receipt.status !== "waiting" || !taskIds || !matched
+    || receipt.waitId !== wait.id || receipt.status !== "waiting") return "receipt_identity"
+  if (!taskIds || !matched
     || !sameIds(taskIds, ids) || matched.length !== 0 || tasks.length !== ids.length
-    || !listed.every((id): id is string => typeof id === "string") || !sameIds(listed as string[], ids)) return false
-  try { return dateValue(receipt.deadlineAt, "receipt.deadlineAt").getTime() === dateValue(wait.deadlineAt, "deadlineAt").getTime() }
-  catch { return false }
+    || !listed.every((id): id is string => typeof id === "string") || !sameIds(listed as string[], ids)) return "receipt_ids"
+  try { return dateValue(receipt.deadlineAt, "receipt.deadlineAt").getTime() === dateValue(wait.deadlineAt, "deadlineAt").getTime() ? undefined : "receipt_deadline" }
+  catch { return "receipt_deadline" }
 }
 
 function matchingWaitCall(value: unknown, wait: Row, ids: readonly string[]): string | undefined {
@@ -79,7 +91,7 @@ export async function loadDurableSubagentWaitResume(pool: Pool, lease: ResumeLea
       WHERE task."id" = $1 AND task."sessionId" = $3 AND task."turnId" = $4 AND task."rootTaskId" = $5 AND ${OPEN_SESSION} FOR SHARE OF task`,
     [lease.id, lease.userId, lease.sessionId, lease.turnId, lease.rootTaskId])).rows[0]
     if (!task) return undefined
-    assertLease(task, lease, now)
+    atResumeStage("lease_fence", () => assertLease(task, lease, now))
     if (task.parentTaskId === null || task.parentTaskId === undefined
       || ["completed", "failed", "interrupted", "cancelled", "closed"].includes(String(task.turnStatus))
       || ["completed", "failed", "interrupted", "cancelled", "closed"].includes(String(task.rootStatus))) return undefined
@@ -95,7 +107,7 @@ export async function loadDurableSubagentWaitResume(pool: Pool, lease: ResumeLea
     if (candidates.length !== 1) throw new DurableSubagentWaitError("wait_conflict", "Multiple resolved waits match the current child attempt")
     const step = candidates[0]
     const sourceOrdinal = Number(step.ordinal)
-    if (!Number.isSafeInteger(sourceOrdinal) || sourceOrdinal < 0) throw new DurableSubagentWaitError("wait_scope_error", "Child wait step ordinal is invalid")
+    if (!Number.isSafeInteger(sourceOrdinal) || sourceOrdinal < 0) resumeScopeError("source_ordinal", "Child wait step ordinal is invalid")
     const laterSteps = (await client.query<Row>(`SELECT "id", "ordinal", "status" FROM "agent_steps"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "attempt" = $4 AND "ordinal" > $5
       ORDER BY "ordinal" ASC, "id" ASC LIMIT 2 FOR SHARE`,
@@ -120,42 +132,44 @@ export async function loadDurableSubagentWaitResume(pool: Pool, lease: ResumeLea
     const wait = waits[0]
     if (wait.consumedAt !== null && wait.consumedAt !== undefined) return undefined
     if (!(wait.mode === "any" || wait.mode === "all") || !["ready", "timed_out"].includes(String(wait.status))) {
-      throw new DurableSubagentWaitError("wait_scope_error", "Child wait is unresolved or invalid")
+      resumeScopeError("wait_state", "Child wait is unresolved or invalid")
     }
     const ids = strictIds(wait.targetTaskIds)
-    if (!ids || !validOutcomeTargets(object(object(wait.result).outcome), ids)) throw new DurableSubagentWaitError("wait_scope_error", "Child wait result target IDs changed scope")
+    if (!ids || !validOutcomeTargets(object(object(wait.result).outcome), ids)) resumeScopeError("wait_result_shape", "Child wait result target IDs changed scope")
     const targets = (await client.query<Row>(`SELECT task."id", task."parentTaskId", task."rootTaskId", task."turnId", task."sessionId", task."status", task."role", task."result", task."failureReason"
       FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
       WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
         AND session."userId" = $5 AND task."parentTaskId" = $6 AND ${OPEN_SESSION} FOR SHARE OF task`,
     [ids, lease.sessionId, lease.turnId, lease.rootTaskId, lease.userId, lease.id])).rows
-    if (!exactTargets(ids, targets, lease)) throw new DurableSubagentWaitError("wait_scope_error", "Child wait targets changed scope")
+    if (!exactTargets(ids, targets, lease)) resumeScopeError("target_scope", "Child wait targets changed scope")
     const currentMatched = targets.filter(target => TERMINAL.has(String(target.status))).map(target => String(target.id))
-    const outcome = resolveDurableWaitOutcome(wait, ids, currentMatched, now)
+    const outcome = atResumeStage("resolved_outcome", () => resolveDurableWaitOutcome(wait, ids, currentMatched, now))
     const callRows = (await client.query<Row>(`SELECT "id" AS "callItemId", "content" AS "callContent", "status" AS "callStatus" FROM "agent_items"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4
         AND "type" = 'tool_call' AND "content"->>'toolName' = 'wait_subagents'
       ORDER BY "createdAt" DESC, "id" DESC LIMIT 2 FOR SHARE`,
     [lease.sessionId, lease.turnId, lease.id, step.id])).rows
     if (callRows.length !== 1 || !["started", "streaming", "completed"].includes(String(callRows[0].callStatus))) {
-      throw new DurableSubagentWaitError("wait_scope_error", "Child wait tool call is unavailable")
+      resumeScopeError("tool_call", "Child wait tool call is unavailable")
     }
     const call = object(callRows[0].callContent); const input = object(call.input)
     const toolCallId = matchingWaitCall(call, wait, ids)
     const resultRows = toolCallId ? (await client.query<Row>(`SELECT "id", "content", "status" FROM "agent_items"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $5
       ORDER BY "createdAt" DESC, "id" DESC LIMIT 2 FOR SHARE`, [lease.sessionId, lease.turnId, lease.id, step.id, toolCallId])).rows : []
-    if (!toolCallId || resultRows.length > 1 || resultRows.length === 1 && (callRows[0].callStatus !== "completed"
-      || resultRows[0].status !== "completed" || !validReceipt(resultRows[0].content, wait, ids, toolCallId))) {
-      throw new DurableSubagentWaitError("wait_scope_error", "Child wait tool call does not match the durable wait")
-    }
+    if (!toolCallId) resumeScopeError("call_binding", "Child wait tool call does not match the durable wait")
+    const invalidReceiptPair = resultRows.length > 1 || resultRows.length === 1
+      && (callRows[0].callStatus !== "completed" || resultRows[0].status !== "completed")
+    const receiptStage = invalidReceiptPair ? "receipt_pair"
+      : resultRows.length === 1 ? receiptFailureStage(resultRows[0].content, wait, ids, toolCallId) : undefined
+    if (receiptStage) resumeScopeError(receiptStage, "Child wait tool call does not match the durable wait")
     markValidatedInputIds(input, ids)
     const outputIds = strictIds(outcome.taskIds)
     if (!outputIds || !markCanonicalSubagentWaitTargetIds({ targetTaskIds: outputIds }, outcome, outputIds)) {
-      throw new DurableSubagentWaitError("wait_scope_error", "Child wait result target IDs changed scope")
+      resumeScopeError("output_target_ids", "Child wait result target IDs changed scope")
     }
     const ordinal = Number(step.ordinal)
-    if (!Number.isSafeInteger(ordinal) || ordinal < 0) throw new DurableSubagentWaitError("wait_scope_error", "Child wait step ordinal is invalid")
+    if (!Number.isSafeInteger(ordinal) || ordinal < 0) resumeScopeError("source_ordinal", "Child wait step ordinal is invalid")
     return { waitId: String(wait.id), stepId: String(step.id), attempt: lease.attemptCount, ordinal, toolCallId,
       sourceItemId: String(resultRows[0]?.id ?? `recovered-wait-result:${String(wait.id)}`),
       input: safeSubagentWaitJson(input, 16_384), output: safeSubagentWaitJson(outcome, 16_384) as DurableSubagentWaitResult,

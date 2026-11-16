@@ -2,7 +2,8 @@ import { NextRequest } from "next/server"
 
 import { ObjectiveStartCommandService } from "@/lib/agent/control-plane/commands"
 import { db } from "@/lib/db"
-import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
+import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
+import { taskRecoveryAccountScope } from "@/lib/agent/control-plane/commands/objective-start-attempt-read-model"
 
 import {
   commandErrorResponse,
@@ -16,17 +17,30 @@ interface RouteContext {
   params: Promise<{ id: string }>
 }
 
+function scopedResponse(response: Response, accountScope: string): Response {
+  response.headers.set("Cache-Control", "private, no-store")
+  response.headers.set("X-Account-Scope", accountScope)
+  return response
+}
+
 export async function POST(request: NextRequest, context: RouteContext) {
   const auth = await requireAuth(request)
   if (isErrorResponse(auth)) return auth
 
+  const expectedScope = request.headers.get("x-expected-account-scope")
+  const accountScope = taskRecoveryAccountScope(auth.userId)
+  const respond = (response: Response) => expectedScope === null ? response : scopedResponse(response, accountScope)
+  if (expectedScope !== null && expectedScope !== accountScope) {
+    return scopedResponse(err("Task recovery account scope changed", 409), accountScope)
+  }
+
   const { id: sessionId } = await context.params
   const body = await readJsonBody(request)
-  if (isResponse(body)) return body
+  if (isResponse(body)) return respond(body)
   const command = parseObjectiveStartBody(body, request, sessionId)
-  if (isResponse(command)) return command
+  if (isResponse(command)) return respond(command)
   const attachmentError = await verifyAttachmentOwnership(db, auth.userId, command.content)
-  if (attachmentError) return attachmentError
+  if (attachmentError) return respond(attachmentError)
 
   try {
     const result = await new ObjectiveStartCommandService(db).start({
@@ -40,8 +54,8 @@ export async function POST(request: NextRequest, context: RouteContext) {
         ? { verificationRequirements: command.verificationRequirements }
         : {}),
     })
-    return ok(result, 202)
+    return respond(ok(result, 202))
   } catch (error: unknown) {
-    return commandErrorResponse(error)
+    return respond(commandErrorResponse(error))
   }
 }

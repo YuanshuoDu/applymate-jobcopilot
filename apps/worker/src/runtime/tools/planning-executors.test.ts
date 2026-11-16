@@ -129,12 +129,12 @@ describe("agent.plan tool executor", () => {
     })
   })
 
-  it("keeps invalid optional requirements distinct while allowing prose-only planning", async () => {
+  it("fails closed for invalid canonical requirements before scheduling planning work", async () => {
     const invalid = resolveRootTaskVerificationRequirements({ input: { verificationRequirements: { malformed: true } } })
     expect(invalid).toEqual({ status: "invalid" })
     const { tool, commandPort } = setup(undefined, invalid)
-    await expect(tool.execute(context(), proposal)).resolves.toEqual(receipt)
-    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+    await expect(tool.execute(context(), proposal)).rejects.toMatchObject({ code: "task_graph_objective_requirements_invalid" })
+    expect(commandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
   })
 
   it("rejects malformed model proposals before the scheduler port runs", () => {
@@ -211,7 +211,8 @@ describe("agent.plan tool executor", () => {
     expect(tool.description).toContain("reported_score_gte checks an Analyst-reported number, not its correctness")
     expect(tool.description).toContain("findings_from_scout_dependency")
     expect(tool.description).toContain("findings_cover_scout_candidates_gte is Analyst-only")
-    expect(tool.description).toContain("Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte, findings_from_scout_dependency, findings_cover_scout_candidates_gte, findings_from_scout_union, findings_cover_scout_candidate_union_gte, findings_cover_each_scout_candidates_gte")
+    expect(tool.description).toContain("Allowed checks: candidate_count_gte, candidate_location_in (v2 Scout only), finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte, findings_from_scout_dependency, findings_cover_scout_candidates_gte, findings_from_scout_union, findings_cover_scout_candidate_union_gte, findings_cover_each_scout_candidates_gte")
+    expect(tool.description).toContain("use agent-harness.v2.task-graph-verification.v2 only when a canonical candidate_location_in requirement is present")
     expect(tool.description).toContain("findings_from_scout_union is Analyst-only and selects 2 to 8 unique direct typed Scout keys")
     expect(tool.description).toContain("it requires nonempty findings and a nonempty deduplicated candidate union, and every finding must belong to that selected group")
     expect(tool.description).toContain("findings_cover_scout_candidate_union_gte uses its own selected group")
@@ -241,6 +242,8 @@ describe("agent.plan tool executor", () => {
     expect(tool.description).toContain("atomically cancels eligible descendants as part of this plan")
     expect(tool.description).toContain("failure alone does not cancel them")
     expect(tool.description).toContain("Use repairOf for an ordinary criterion retry when the strategy remains sound")
+    expect(tool.description).toContain("also repeat every target location check with its exact criterion ID and normalized locations, even when it passed and is only an inherited guard")
+    expect(tool.description).toContain("if a location check failed or is unverified, include its ID in repairOf.criterionIds")
     expect(tool.description).toContain("Every ancestor outside the closure must be an ordinary typed node completed and verified before the Scout failure; repairOf ancestors are unsupported")
     expect(tool.description).toContain("Do not use this for intentional/user cancellation, Root-failure cleanup, ordinary criterion repair, or ambiguous provenance")
     expect(tool.description).toContain("the server derives eligibility from persisted task/event history, not a model-supplied failure label")
@@ -291,7 +294,7 @@ describe("agent.plan tool executor", () => {
     await expect(nonRepairTool.execute(context(), proposal)).resolves.toEqual(receipt)
     expect(getNonRepair()?.proposal).toEqual(proposal)
     const { tool: descriptionTool } = setup(templates)
-    expect(descriptionTool.description).toContain("Repeat exactly those criteria and checks")
+    expect(descriptionTool.description).toContain("Repeat exactly the failed or unverified target criteria listed in repairOf.criterionIds")
     expect(descriptionTool.description).toContain("omit graphRootTaskId because the server binds the active Root")
     expect(descriptionTool.description).toContain("must not add the target to dependsOn")
     expect(descriptionTool.description).toContain("eight-node limit on the current graph snapshot, including retained terminal nodes")

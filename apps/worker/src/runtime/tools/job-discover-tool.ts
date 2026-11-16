@@ -4,8 +4,10 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { JobDiscoveryClientError, type JobDiscoveryClient, type JobDiscoveryCriteria, type JobDiscoveryRequest } from "./job-discovery-client.js"
 import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "./types.js"
 import { captureDiscoveryQueryCriteria, type DiscoveryQueryCapture } from "../subagents/child-discovery-query-footprint.js"
+import { nestedScoutQueryAllowed, type NestedScoutTaskScope } from "../subagents/nested-scout-tools.js"
 
 const id = Type.String({ minLength: 1, maxLength: 256 })
+const usageLedgerKey = Type.String({ minLength: 1, maxLength: 1_284 })
 const nonEmptyText = (maxLength: number) => Type.String({ minLength: 1, maxLength })
 const JobDiscoverInputSchema = Type.Object({
   targetRoles: Type.Array(nonEmptyText(160), { minItems: 1, maxItems: 8 }),
@@ -26,7 +28,7 @@ const EvidenceSchema = Type.Object({
   source: nonEmptyText(80), url: nonEmptyText(4096), summary: nonEmptyText(1000),
 }, { additionalProperties: false })
 const UsageSchema = Type.Object({
-  ledgerKey: id, toolName: id, toolVersion: id, toolCallId: id, sessionId: id, turnId: id, stepId: id,
+  ledgerKey: usageLedgerKey, toolName: id, toolVersion: id, toolCallId: id, sessionId: id, turnId: id, stepId: id,
   requests: Type.Integer({ minimum: 0 }), jobsProcessed: Type.Integer({ minimum: 0 }), jobsSucceeded: Type.Integer({ minimum: 0 }),
   jobsFailed: Type.Integer({ minimum: 0 }), providerFailures: Type.Optional(Type.Integer({ minimum: 0 })), aiCalls: Type.Integer({ minimum: 0 }),
   providers: Type.Array(nonEmptyText(80), { maxItems: 32 }), estimatedCostUsd: Type.Number({ minimum: 0 }), durationMs: Type.Integer({ minimum: 0 }),
@@ -39,6 +41,8 @@ const JobDiscoverOutputSchema = Type.Object({
 export type JobDiscoveryExecutionFence = Readonly<{
   userId: string; sessionId: string; turnId: string; taskId: string; rootTaskId: string
   role: "scout"; leaseOwner: string; attemptCount: number
+  /** Present only for nested Scouts; null means a nested scope was present but invalid. */
+  nestedScoutScope?: NestedScoutTaskScope | null
 }>
 export type JobDiscoverToolOptions = Readonly<{
   client: JobDiscoveryClient
@@ -76,6 +80,10 @@ export function createJobsDiscoverTool(options: JobDiscoverToolOptions): Runtime
         targetRoles: input.targetRoles, targetLocations: input.targetLocations,
         ...(input.source === undefined ? {} : { source: input.source }), ...(input.pageSize === undefined ? {} : { pageSize: input.pageSize }),
         ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+      }
+      if (Object.hasOwn(options.fence, "nestedScoutScope")
+        && (!options.fence.nestedScoutScope || !nestedScoutQueryAllowed(options.fence.nestedScoutScope, criteria))) {
+        throw new ToolExecutionError("nested_scout_scope_denied", "The nested Scout query exceeds its inherited search scope")
       }
       try { options.onEffectiveCriteria?.(context, captureDiscoveryQueryCriteria(criteria)) } catch { /* Footprint capture cannot change discovery. */ }
       try {

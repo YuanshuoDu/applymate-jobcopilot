@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { buildScheduledAutomationSnapshot, getAutomationRunMode, type ScheduledAutomationSnapshotInput } from "./scheduled-automation-snapshot"
+import { sessionSnapshotFields, withAgentSearchFootprintSessionSnapshot } from "@/lib/agent-search-footprint-session-snapshot"
 
 export interface AutomationSessionRow {
   id: string
@@ -106,15 +107,16 @@ export async function resolveAutomationSession(
     if (existing) return { session: existing, created: false }
   }
 
-  const created = await store.agentSession.create({
+  const created = await withAgentSearchFootprintSessionSnapshot(db, input.userId, async (tx, snapshot, captured) => tx.agentSession.create({
     data: {
       userId: input.userId,
       goal: `Run automation: ${input.name}`,
       source: "automation",
       status: "running",
       memorySummary: input.memorySummary ?? "Automation queued for execution.",
+      ...(captured ? sessionSnapshotFields(snapshot) : {}),
     },
-  })
+  }))
   const linked = await store.agentAutomation.updateMany({
     where: { id: input.automationId, userId: input.userId, sessionId: null },
     data: { sessionId: created.id },

@@ -3,13 +3,20 @@ import { parsePersistedTaskGraphNode } from "./plan-ledger-task-graph-metadata.j
 import { hasCurrentTaskGraphVerificationLineage } from "./plan-ledger-task-graph-verification-lineage.js"
 
 export const TASK_GRAPH_VERIFICATION_DISPLAY_VERSION = 1 as const
+export const TASK_GRAPH_VERIFICATION_DISPLAY_V2_VERSION = 2 as const
+export type TaskGraphVerificationDisplayVersion = typeof TASK_GRAPH_VERIFICATION_DISPLAY_VERSION | typeof TASK_GRAPH_VERIFICATION_DISPLAY_V2_VERSION
+type DisplayVersion = TaskGraphVerificationDisplayVersion
 type VerificationStatus = "passed" | "failed" | "unverified"
 type CheckStatus = VerificationStatus
-type CountCheck = Readonly<{ kind: "candidate_count_gte" | "finding_count_gte" | "evidence_count_gte"; minimum: number; status: CheckStatus }>
-type EvidenceCheck = Readonly<{ kind: "all_candidates_have_evidence" | "all_findings_have_evidence"; minimumItems: number; status: CheckStatus }>
-type ScoreCheck = Readonly<{ kind: "reported_score_gte"; minimumScore: number; minimumFindings: number; aggregation: "any" | "all"; status: CheckStatus }>
-type DependencyCheck = Readonly<{ kind: "findings_from_scout_dependency"; status: CheckStatus }>
-type CoverageCheck = Readonly<{ kind: "findings_cover_scout_candidates_gte"; minimumPercent: number; status: CheckStatus }>
+export type TaskGraphVerificationDisplayReason = "criterion_unmet" | "score_below_minimum" | "verification_contract_invalid"
+  | "evidence_projection_invalid" | "verification_role_mismatch" | "required_evidence_missing" | "evidence_invalid"
+  | "evidence_ambiguous" | "task_result_invalid" | "task_result_ambiguous" | "result_not_evidence_bound"
+type DisplayReasonCheck = Readonly<{ displayReason?: TaskGraphVerificationDisplayReason }>
+type CountCheck = Readonly<{ kind: "candidate_count_gte" | "finding_count_gte" | "evidence_count_gte"; minimum: number; status: CheckStatus }> & DisplayReasonCheck
+type EvidenceCheck = Readonly<{ kind: "all_candidates_have_evidence" | "all_findings_have_evidence"; minimumItems: number; status: CheckStatus }> & DisplayReasonCheck
+type ScoreCheck = Readonly<{ kind: "reported_score_gte"; minimumScore: number; minimumFindings: number; aggregation: "any" | "all"; status: CheckStatus }> & DisplayReasonCheck
+type DependencyCheck = Readonly<{ kind: "findings_from_scout_dependency"; status: CheckStatus }> & DisplayReasonCheck
+type CoverageCheck = Readonly<{ kind: "findings_cover_scout_candidates_gte"; minimumPercent: number; status: CheckStatus }> & DisplayReasonCheck
 export type TaskGraphVerificationDisplayCheck = CountCheck | EvidenceCheck | ScoreCheck | DependencyCheck | CoverageCheck
 export type TaskGraphVerificationDisplayNode = null | Readonly<{ status: "unavailable" }> | Readonly<{
   status: VerificationStatus
@@ -20,7 +27,7 @@ export type TaskGraphVerificationDisplayNode = null | Readonly<{ status: "unavai
   unverifiedCount: number
 }>
 export type TaskGraphVerificationSummary = Readonly<{
-  schemaVersion: typeof TASK_GRAPH_VERIFICATION_DISPLAY_VERSION
+  schemaVersion: TaskGraphVerificationDisplayVersion
   nodes: readonly TaskGraphVerificationDisplayNode[]
 }>
 
@@ -29,8 +36,10 @@ type Scope = Readonly<{ sessionId: string; turnId: string; rootTaskId: string; r
   digestCanonicalJson?: (canonicalJson: string) => string | null }>
 
 /** Projects current owner-scoped rows into a display-only, identifier-free positional summary. */
-export function projectTaskGraphVerificationSummary(input: Scope, projection: PlanLedger): TaskGraphVerificationSummary | null {
+export function projectTaskGraphVerificationSummary(input: Scope, projection: PlanLedger,
+  options: Readonly<{ displayVersion?: TaskGraphVerificationDisplayVersion }> = {}): TaskGraphVerificationSummary | null {
   try {
+    const displayVersion = options.displayVersion ?? TASK_GRAPH_VERIFICATION_DISPLAY_VERSION
     if (!id(input.sessionId) || !id(input.turnId) || !id(input.rootTaskId) || !Number.isSafeInteger(input.revision) || input.revision < 1) return null
     const plan = parsePlanLedger(projection)
     const graph = record(parseJsonValue(input.graph))
@@ -47,9 +56,10 @@ export function projectTaskGraphVerificationSummary(input: Scope, projection: Pl
       if (!rawNode || !hasTypedContract(rawNode)) return null
       const node = parsePersistedTaskGraphNode(rawNode)
       const row = node ? rows.get(node.taskId) : undefined
-      return node && row ? projectNode(rawNode, node, row, rawNodes, snapshot.nodes.map(item => item.taskId), rows, input.rootTaskId, input.digestCanonicalJson) : { status: "unavailable" } as const
+      return node && row ? projectNode(rawNode, node, row, rawNodes, snapshot.nodes.map(item => item.taskId), rows, input.rootTaskId,
+        input.digestCanonicalJson, displayVersion) : { status: "unavailable" } as const
     })
-    return parseTaskGraphVerificationSummary({ schemaVersion: 1, nodes }, plan.nodes.length)
+    return parseTaskGraphVerificationSummary({ schemaVersion: displayVersion, nodes }, plan.nodes.length)
   } catch { return null }
 }
 
@@ -57,9 +67,11 @@ export function projectTaskGraphVerificationSummary(input: Scope, projection: Pl
 export function parseTaskGraphVerificationSummary(value: unknown, expectedNodeCount: number): TaskGraphVerificationSummary | null {
   try {
     const summary = record(value)
-    if (!summary || !exact(summary, "nodes,schemaVersion") || summary.schemaVersion !== 1
+    if (!summary || !exact(summary, "nodes,schemaVersion")
+      || summary.schemaVersion !== TASK_GRAPH_VERIFICATION_DISPLAY_VERSION && summary.schemaVersion !== TASK_GRAPH_VERIFICATION_DISPLAY_V2_VERSION
       || !Number.isSafeInteger(expectedNodeCount) || expectedNodeCount < 1 || expectedNodeCount > 8
       || !dense(summary.nodes, expectedNodeCount, expectedNodeCount)) return null
+    const displayVersion = summary.schemaVersion as DisplayVersion
     const nodes: TaskGraphVerificationDisplayNode[] = []
     for (const raw of summary.nodes) {
       if (raw === null) { nodes.push(null); continue }
@@ -71,7 +83,7 @@ export function parseTaskGraphVerificationSummary(value: unknown, expectedNodeCo
         || !dense(node.checks, 1, 8) || ![node.totalCount, node.passedCount, node.failedCount, node.unverifiedCount].every(value => integer(value, 8))) return null
       const checks: TaskGraphVerificationDisplayCheck[] = []
       for (const rawCheck of node.checks) {
-        const check = parseDisplayCheck(rawCheck)
+        const check = parseDisplayCheck(rawCheck, displayVersion)
         if (!check) return null
         checks.push(check)
       }
@@ -82,13 +94,13 @@ export function parseTaskGraphVerificationSummary(value: unknown, expectedNodeCo
         || node.status === "unverified" && !(counts.passedCount === checks.length || counts.unverifiedCount === checks.length)) return null
       nodes.push({ status: node.status, checks, totalCount: checks.length, ...counts })
     }
-    return { schemaVersion: 1, nodes }
+    return { schemaVersion: displayVersion, nodes }
   } catch { return null }
 }
 
 function projectNode(raw: RawNode, node: NonNullable<ReturnType<typeof parsePersistedTaskGraphNode>>, row: RawNode,
   graphNodes: readonly (RawNode | null)[], taskIds: readonly string[], rows: Map<string, RawNode>, rootTaskId: string,
-  digestCanonicalJson?: (canonicalJson: string) => string | null): TaskGraphVerificationDisplayNode {
+  digestCanonicalJson: ((canonicalJson: string) => string | null) | undefined, displayVersion: DisplayVersion): TaskGraphVerificationDisplayNode {
   const contract = record(raw.verification)
   if (!contract || row.role !== contract.role) return { status: "unavailable" }
   const result = parseJsonRecord(row.result)
@@ -97,43 +109,97 @@ function projectNode(raw: RawNode, node: NonNullable<ReturnType<typeof parsePers
   const expected = criteriaRecords(contract.criteria), reportCriteria = report && criteriaRecords(report.criteria)
   if (!report || !expected || !reportCriteria || !hasCurrentTaskGraphVerificationLineage({ rawNode: raw, node, row, result, report, expected, actual: reportCriteria,
     graphNodes, taskIds, rows, rootTaskId, digestCanonicalJson })) return { status: "unavailable" }
-  const checks = expected.map((criterion, index) => displayCheck(record(criterion.check), reportCriteria[index]?.status))
+  const checks = expected.map((criterion, index) => {
+    const reported = reportCriteria[index]
+    const reason = displayVersion === TASK_GRAPH_VERIFICATION_DISPLAY_V2_VERSION
+      ? projectDisplayReason(reported?.status, reported?.reasonCode) : undefined
+    return displayCheck(record(criterion.check), reported?.status, reason)
+  })
   if (checks.some(check => !check)) return { status: "unavailable" }
   const normalized = checks as TaskGraphVerificationDisplayCheck[]
   return { status: report.status as VerificationStatus, checks: normalized, totalCount: normalized.length, ...countStatuses(normalized) }
 }
 
-function displayCheck(check: RawNode | null, status: unknown): TaskGraphVerificationDisplayCheck | null {
+function displayCheck(check: RawNode | null, status: unknown, reason?: TaskGraphVerificationDisplayReason): TaskGraphVerificationDisplayCheck | null {
   if (!check || !(status === "passed" || status === "failed" || status === "unverified") || typeof check.kind !== "string") return null
   if (["candidate_count_gte", "finding_count_gte", "evidence_count_gte"].includes(check.kind))
-    return exact(check, "kind,minimum") && integer(check.minimum, 50, 1) ? { kind: check.kind as CountCheck["kind"], minimum: check.minimum as number, status } : null
+    return exact(check, "kind,minimum") && integer(check.minimum, 50, 1) ? withDisplayReason({ kind: check.kind as CountCheck["kind"], minimum: check.minimum as number, status }, reason) : null
   if (["all_candidates_have_evidence", "all_findings_have_evidence"].includes(check.kind))
-    return exact(check, "kind,minimumItems") && integer(check.minimumItems, 50, 1) ? { kind: check.kind as EvidenceCheck["kind"], minimumItems: check.minimumItems as number, status } : null
+    return exact(check, "kind,minimumItems") && integer(check.minimumItems, 50, 1) ? withDisplayReason({ kind: check.kind as EvidenceCheck["kind"], minimumItems: check.minimumItems as number, status }, reason) : null
   if (check.kind === "reported_score_gte" && exact(check, "aggregation,kind,minimumFindings,minimumScore")
     && integer(check.minimumFindings, 50, 1) && typeof check.minimumScore === "number" && Number.isFinite(check.minimumScore)
     && check.minimumScore >= 0 && check.minimumScore <= 10 && (check.aggregation === "any" || check.aggregation === "all")) {
-    return { kind: "reported_score_gte", minimumScore: check.minimumScore, minimumFindings: check.minimumFindings as number, aggregation: check.aggregation, status }
+    return withDisplayReason({ kind: "reported_score_gte", minimumScore: check.minimumScore, minimumFindings: check.minimumFindings as number, aggregation: check.aggregation, status }, reason)
   }
   if (check.kind === "findings_cover_scout_candidates_gte" && exact(check, "dependencyNodeKey,kind,minimumPercent")
     && id(check.dependencyNodeKey) && integer(check.minimumPercent, 100, 1)) {
-    return { kind: "findings_cover_scout_candidates_gte", minimumPercent: check.minimumPercent, status }
+    return withDisplayReason({ kind: "findings_cover_scout_candidates_gte", minimumPercent: check.minimumPercent, status }, reason)
   }
   return check.kind === "findings_from_scout_dependency" && exact(check, "dependencyNodeKey,kind")
-    && id(check.dependencyNodeKey) ? { kind: "findings_from_scout_dependency", status } : null
+    && id(check.dependencyNodeKey) ? withDisplayReason({ kind: "findings_from_scout_dependency", status }, reason) : null
 }
 
-function parseDisplayCheck(value: unknown): TaskGraphVerificationDisplayCheck | null {
+function parseDisplayCheck(value: unknown, displayVersion: DisplayVersion): TaskGraphVerificationDisplayCheck | null {
   const check = record(value)
   if (!check || typeof check.status !== "string") return null
-  if (check.kind === "findings_from_scout_dependency" && exact(check, "kind,status")
-    && ["passed", "failed", "unverified"].includes(check.status)) return { kind: check.kind, status: check.status as CheckStatus }
-  if (check.kind === "findings_cover_scout_candidates_gte") {
-    if (!exact(check, "kind,minimumPercent,status") || !["passed", "failed", "unverified"].includes(check.status)
-      || !integer(check.minimumPercent, 100, 1)) return null
-    return { kind: check.kind, minimumPercent: check.minimumPercent, status: check.status as CheckStatus }
+  const hasDisplayReason = Object.hasOwn(check, "displayReason")
+  if (displayVersion === TASK_GRAPH_VERIFICATION_DISPLAY_VERSION && hasDisplayReason) return null
+  const { status, displayReason: rawReason, ...descriptor } = check
+  if (!["passed", "failed", "unverified"].includes(status)) return null
+  let parsed: TaskGraphVerificationDisplayCheck | null
+  if (descriptor.kind === "findings_from_scout_dependency") {
+    parsed = exact(descriptor, "kind") ? { kind: descriptor.kind, status: status as CheckStatus } : null
+  } else if (descriptor.kind === "findings_cover_scout_candidates_gte") {
+    parsed = exact(descriptor, "kind,minimumPercent") && integer(descriptor.minimumPercent, 100, 1)
+      ? { kind: descriptor.kind, minimumPercent: descriptor.minimumPercent, status: status as CheckStatus } : null
+  } else {
+    parsed = displayCheck(descriptor, status)
   }
-  const { status, ...descriptor } = check
-  return displayCheck(descriptor, status)
+  if (!parsed || !hasDisplayReason || displayVersion !== TASK_GRAPH_VERIFICATION_DISPLAY_V2_VERSION) return parsed
+  const reason = parseDisplayReason(rawReason, status)
+  return reason ? { ...parsed, displayReason: reason } : parsed
+}
+
+function projectDisplayReason(status: unknown, reasonCode: unknown): TaskGraphVerificationDisplayReason | undefined {
+  if (status === "failed") {
+    if (reasonCode === "criterion_not_met") return "criterion_unmet"
+    if (reasonCode === "reported_score_below_minimum") return "score_below_minimum"
+    return undefined
+  }
+  if (status !== "unverified") return undefined
+  if (reasonCode === "contract_invalid") return "verification_contract_invalid"
+  if (reasonCode === "projection_invalid") return "evidence_projection_invalid"
+  if (reasonCode === "role_mismatch") return "verification_role_mismatch"
+  if (reasonCode === "canonical_evidence_missing") return "required_evidence_missing"
+  if (reasonCode === "canonical_evidence_invalid") return "evidence_invalid"
+  if (reasonCode === "canonical_evidence_ambiguous") return "evidence_ambiguous"
+  if (reasonCode === "result_invalid") return "task_result_invalid"
+  if (reasonCode === "result_ambiguous") return "task_result_ambiguous"
+  if (reasonCode === "result_evidence_unbound") return "result_not_evidence_bound"
+  return undefined
+}
+
+function parseDisplayReason(value: unknown, status: string): TaskGraphVerificationDisplayReason | undefined {
+  if (status === "failed" && (value === "criterion_unmet" || value === "score_below_minimum")) return value
+  if (status === "unverified" && typeof value === "string") {
+    switch (value) {
+      case "verification_contract_invalid":
+      case "evidence_projection_invalid":
+      case "verification_role_mismatch":
+      case "required_evidence_missing":
+      case "evidence_invalid":
+      case "evidence_ambiguous":
+      case "task_result_invalid":
+      case "task_result_ambiguous":
+      case "result_not_evidence_bound":
+        return value
+    }
+  }
+  return undefined
+}
+
+function withDisplayReason<T extends TaskGraphVerificationDisplayCheck>(check: T, reason?: TaskGraphVerificationDisplayReason): TaskGraphVerificationDisplayCheck {
+  return reason ? { ...check, displayReason: reason } : check
 }
 
 function taskRows(values: readonly unknown[], scope: Scope, taskIds: readonly string[]): Map<string, RawNode> | null {

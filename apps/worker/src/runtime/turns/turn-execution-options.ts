@@ -1,17 +1,44 @@
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { PolicyRole, RepositoryJsonValue, TenantScope } from "@jobcopilot/agent-protocol"
 
-import type { StepContextSnapshot } from "../context/step-context-builder.js"
+import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 import type { TurnBudgetLimits } from "../budget.js"
 import type { BusinessCheck } from "../verifier.js"
 import type { DurableWaitControlReader } from "../tools/coordination-types.js"
 import type { RecoveredArchivedWaitControl } from "./turn-execution-wait.js"
-import type { ToolCallRecovery, TurnEngineToolCall, TurnEngineToolExecutor, TurnResumeState } from "./turn-engine-types.js"
+import type { ToolCallRecovery, TurnEngineToolCall, TurnEngineToolExecutor, TurnEngineStep, TurnResumeState } from "./turn-engine-types.js"
 import type { NativeSemanticProgressMode } from "./native-semantic-rejection-ledger.js"
 import type { TurnExecutionIdentity, TurnExecutionContextBuilder, TurnExecutionStore, TurnExecutionLifecycle, TurnEngineCompletionGate } from "./turn-execution-types.js"
 import type { ChildWaitClaimRecovery, ChildWaitOrphanRecovery } from "../subagents/child-durable-wait-replay.js"
 import type { EmptyAnalystCandidateAuthorizer } from "../subagents/task-graph-empty-analyst-candidate.js"
+
+export type ChildToolReplayReceipt = Readonly<{
+  userId: string; sessionId: string; turnId: string; rootTaskId: string; taskId: string; attempt: number; stepId: string
+  toolCallId: string; toolName: string; input: unknown
+  callItem: Readonly<{ id: string; revision: number }>; resultItem: Readonly<{ id: string; revision: number }>
+  result: Readonly<{ status: "completed" | "failed"; output: unknown; errorCode: string | null }>
+}>
+export type ChildWaitReplayReceipt = ChildToolReplayReceipt & Readonly<{
+  waitId: string
+  source: Readonly<{
+    attempt: number; stepId: string; ordinal: number; toolCallId: string; sourceItemId: string
+    callItem: Readonly<{ id: string; revision: number }>; resultItem: Readonly<{ id: string; revision: number }>
+    input: unknown; persistedResult: Readonly<{ status: "completed"; output: unknown; errorCode: null }>
+    continuationStepId?: string; continuationOrdinal?: number
+  }>
+}>
+
+export type PrepareFinalDependencyWaitInput = Readonly<{
+  identity: TurnExecutionIdentity
+  step: TurnEngineStep
+  context: StepContext
+  snapshot: StepContextSnapshot
+  signal: AbortSignal
+}>
+export type PrepareFinalDependencyWait = (input: PrepareFinalDependencyWaitInput) =>
+  | null | Readonly<{ taskIds: readonly string[] }>
+  | Promise<null | Readonly<{ taskIds: readonly string[] }>>
 
 export type TurnExecutionOptions = {
   readonly identity: TurnExecutionIdentity
@@ -43,6 +70,10 @@ export type TurnExecutionOptions = {
   readonly noProgressRepeatLimit?: number
   readonly resume?: TurnResumeState
   readonly toolCallRecovery?: readonly ToolCallRecovery[]
+  /** Private, item-backed replay evidence for a child Task; never model context. */
+  readonly childToolReplayReceipts?: readonly ChildToolReplayReceipt[]
+  /** Separate loader-validated durable-wait proof, never a generic tool receipt. */
+  readonly childWaitReplayReceipts?: readonly ChildWaitReplayReceipt[]
   readonly childWaitCallStartKey?: (stepId: string, call: TurnEngineToolCall) => string | undefined
   readonly childWaitCallStarted?: (stepId: string, call: TurnEngineToolCall, eventId: string) => void
   readonly childWaitClaimRecovery?: ChildWaitClaimRecovery
@@ -65,6 +96,8 @@ export type TurnExecutionOptions = {
   readonly refreshTaskGraphAfterReadyWait?: (snapshot: StepContextSnapshot) => Promise<StepContextSnapshot>
   /** Re-read durable TaskGraph state after an accepted agent.plan receipt. */
   readonly refreshTaskGraphAfterPlan?: (snapshot: StepContextSnapshot) => Promise<StepContextSnapshot>
+  /** Private, server-authorized child wait targets for a live final candidate. */
+  readonly prepareFinalDependencyWait?: PrepareFinalDependencyWait
   readonly durableWaitControlReader?: DurableWaitControlReader
   readonly recoveredWaitControl?: RecoveredArchivedWaitControl
 }

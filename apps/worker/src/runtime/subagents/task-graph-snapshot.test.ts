@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest"
+import { createHash } from "node:crypto"
 
 import { TASK_GRAPH_LIMITS, type TaskGraphState, type TaskGraphVerificationDisposition } from "../planning/task-graph.js"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
-import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphSnapshot, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
+import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphLifecycleKey, taskGraphSnapshot,
+  taskGraphState, taskGraphWaitLifecycleKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 
 const queuedEvent = {
@@ -33,6 +35,44 @@ describe("parseTaskGraphEvent", () => {
     expect(parseTaskGraphEvent({ ...queuedEvent, expectedRevision: -1 })).toBeNull()
     expect(parseTaskGraphEvent({ ...queuedEvent, extra: "unexpected" })).toBeNull()
     expect(parseTaskGraphEvent({ ...queuedEvent, type: "task.failed" })).toBeNull()
+  })
+})
+
+describe("taskGraphWaitLifecycleKey", () => {
+  it("reuses one wait and lifecycle identity while separating distinct waits in the same attempt", () => {
+    const first = taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a")
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a")).toBe(first)
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-b")).not.toBe(first)
+    expect(taskGraphWaitLifecycleKey("root-1", "other-node", 3, "wait-row-a")).not.toBe(first)
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 4, "wait-row-a")).not.toBe(first)
+    expect(taskGraphWaitLifecycleKey("other-root", "scout-node", 3, "wait-row-a")).not.toBe(first)
+    expect(first).not.toContain("wait-row-a")
+    expect(first).not.toBe(taskGraphLifecycleKey("root-1", "scout-node", 3, "task.waiting"))
+    expect(first.slice(first.lastIndexOf(":wait:"))).toBe(`:wait:${createHash("sha256").update("wait-row-a").digest("hex")}`)
+
+    const queued = taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.queued")
+    const started = taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.started", 4)
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.queued")).toBe(queued)
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-b", "task.queued")).not.toBe(queued)
+    expect(queued).not.toBe(first)
+    expect(started).not.toBe(queued)
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.started", 4)).toBe(started)
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.started", 5)).not.toBe(started)
+    expect(taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.started", 0)).not.toBe(started)
+  })
+
+  it("rejects lifecycle types, wait IDs, and dispatch generations outside their exact scope", () => {
+    expect(() => taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.failed" as never)).toThrow("task_graph_wait_identity_invalid")
+    expect(() => taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.waiting", 4)).toThrow("task_graph_wait_identity_invalid")
+    expect(() => taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.queued", 4)).toThrow("task_graph_wait_identity_invalid")
+    expect(() => taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.started")).toThrow("task_graph_wait_identity_invalid")
+    for (const generation of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => taskGraphWaitLifecycleKey("root-1", "scout-node", 3, "wait-row-a", "task.started", generation))
+        .toThrow("task_graph_wait_identity_invalid")
+    }
+    for (const waitId of ["", " ", " wait-row-a", "wait-row-a "]) {
+      expect(() => taskGraphWaitLifecycleKey("root-1", "scout-node", 3, waitId)).toThrow("task_graph_wait_identity_invalid")
+    }
   })
 })
 
@@ -435,6 +475,41 @@ describe("parseTaskGraphSnapshot", () => {
       [target, { ...repair, repairOf: { ...relation, graphRootTaskId: " " } }],
     ]
     for (const nodes of invalid) expect(() => parseTaskGraphSnapshot(snapshotWithNodes(nodes))).toThrow()
+  })
+
+  it("requires persisted location-aware repairs to preserve the exact inherited target guard", () => {
+    const targetVerification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+      criteria: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } },
+        { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin", "Berlin"] } },
+      ],
+    } as const
+    const relation = { graphRootTaskId: "root-task", nodeKey: "target", taskId: "task-target", criterionIds: ["candidate-count"] }
+    const target = { ...storedNode("target"), verification: targetVerification, verificationDisposition: "typed" }
+    const exactRepair = { ...storedNode("repair"), verification: targetVerification, verificationDisposition: "typed", repairOf: relation }
+    const persisted = parseTaskGraphSnapshot(snapshotWithNodes([target, exactRepair]))
+    expect(parseTaskGraphSnapshot(canonicalTaskGraphJson(persisted))).toEqual(persisted)
+    expect(persisted.nodes[1]?.repairOf?.criterionIds).toEqual(["candidate-count"])
+    expect(persisted.nodes[1]?.verification?.criteria.map(item => item.id)).toEqual(["candidate-count", "candidate-location"])
+    expect(parseTaskGraphSnapshot(snapshotWithNodes([target, { ...exactRepair,
+      verification: { ...targetVerification, criteria: [targetVerification.criteria[1]] },
+      repairOf: { ...relation, criterionIds: ["candidate-location"] },
+    }])).nodes[1]?.repairOf?.criterionIds).toEqual(["candidate-location"])
+    expect(parseTaskGraphSnapshot(snapshotWithNodes([target, { ...exactRepair,
+      repairOf: { ...relation, criterionIds: ["candidate-count", "candidate-location"] },
+    }])).nodes[1]?.repairOf?.criterionIds).toEqual(["candidate-count", "candidate-location"])
+
+    const invalidRepairs = [
+      { ...exactRepair, verification: { ...targetVerification, criteria: [targetVerification.criteria[0]] } },
+      { ...exactRepair, verification: { ...targetVerification, criteria: [targetVerification.criteria[0], {
+        id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin"] },
+      }] } },
+      { ...exactRepair, verification: { ...targetVerification, criteria: [...targetVerification.criteria, {
+        id: "candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 1 },
+      }] } },
+    ]
+    for (const repair of invalidRepairs) expect(() => parseTaskGraphSnapshot(snapshotWithNodes([target, repair]))).toThrow()
   })
 
   it("rejects sparse arrays and arrays with extra own properties", () => {

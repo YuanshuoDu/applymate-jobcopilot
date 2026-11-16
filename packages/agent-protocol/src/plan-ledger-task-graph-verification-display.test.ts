@@ -23,7 +23,7 @@ const analystCriteria = [
   { id: "scout-coverage", check: { kind: "findings_cover_scout_candidates_gte", dependencyNodeKey: "scout", minimumPercent: 75 } },
 ]
 
-function typedNode(key: string, taskId: string, role: "scout" | "analyst", criteria: typeof scoutCriteria, dependsOn: string[] = []) {
+function typedNode<T extends readonly { id: string; check: unknown }[]>(key: string, taskId: string, role: "scout" | "analyst", criteria: T, dependsOn: string[] = []) {
   return { key, templateId: role, goal: `Private goal ${key}`, successCriteria: [`Private criterion ${key}`], dependsOn, depth: dependsOn.length + 1, taskId,
     verificationDisposition: "typed", verification: { schemaVersion: "agent-harness.v2.task-graph-verification.v1", role, criteria } }
 }
@@ -49,9 +49,9 @@ function projection(nodes: readonly unknown[], rows: readonly unknown[], revisio
   if (!plan) throw new Error("fixture_plan_projection_invalid")
   return plan
 }
-function summary(nodes: readonly unknown[], rows: readonly unknown[], revision = 3, selected = projection(nodes, rows, revision)) {
+function summary(nodes: readonly unknown[], rows: readonly unknown[], revision = 3, selected = projection(nodes, rows, revision), displayVersion: 1 | 2 = 1) {
   return projectTaskGraphVerificationSummary({ sessionId, turnId, rootTaskId, revision, graph: graph(nodes), tasks: rows,
-    digestCanonicalJson: (canonicalJson) => createHash("sha256").update(canonicalJson).digest("hex") }, selected)
+    digestCanonicalJson: (canonicalJson) => createHash("sha256").update(canonicalJson).digest("hex") }, selected, { displayVersion })
 }
 function workerDigest(value: unknown): string { return createHash("sha256").update(workerCanonicalJson(value)).digest("hex") }
 function workerCanonicalJson(value: unknown): string {
@@ -202,11 +202,113 @@ describe("TaskGraph verification display projection", () => {
     expect(summary([target, foreignRepair], rows)?.nodes[1]).toEqual({ status: "unavailable" })
   })
 
+  it("does not attach a report-level unresolved-repair reason to passed criteria", () => {
+    const criteria = [scoutCriteria[0]]
+    const target = typedNode("target", "task-target", "scout", criteria)
+    const repair = { ...typedNode("repair", "task-repair", "scout", criteria), repairOf: {
+      graphRootTaskId: rootTaskId, nodeKey: "target", taskId: "task-target", criterionIds: ["candidate-count"],
+    } }
+    const failedTargetReport = report(criteria, "failed")
+    const targetRow = { ...row("task-target", "scout", "failed", result(failedTargetReport)), failureReason: "task_graph_verification_failed" }
+    const unresolvedRepairReport = { verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "unverified", reasonCode: "repair_target_unresolved",
+      criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: null, resultDigest: "c".repeat(64) }
+    const repairRow = { ...row("task-repair", "scout", "failed", result(unresolvedRepairReport)), failureReason: "task_graph_verification_unverified" }
+    const rows = [row(rootTaskId, "orchestrator", "running"), targetRow, repairRow]
+    const value = summary([target, repair], rows, 3, projection([target, repair], rows), 2)
+    const repairDisplay = value?.nodes[1]
+
+    expect(repairDisplay && "checks" in repairDisplay ? repairDisplay.status : undefined).toBe("unverified")
+    expect(repairDisplay && "checks" in repairDisplay ? repairDisplay.checks[0] : undefined).toEqual({
+      kind: "candidate_count_gte", minimum: 1, status: "passed",
+    })
+    expect(JSON.stringify(value)).not.toContain("repair_target_unresolved")
+    expect(JSON.stringify(value)).not.toContain("candidate-count")
+  })
+
+  it("maps only the closed current Worker reason set into v2 display reasons", () => {
+    const cases = [
+      { status: "failed", reasonCode: "criterion_not_met", displayReason: "criterion_unmet" },
+      { status: "failed", reasonCode: "reported_score_below_minimum", displayReason: "score_below_minimum" },
+      { status: "unverified", reasonCode: "contract_invalid", displayReason: "verification_contract_invalid" },
+      { status: "unverified", reasonCode: "projection_invalid", displayReason: "evidence_projection_invalid" },
+      { status: "unverified", reasonCode: "role_mismatch", displayReason: "verification_role_mismatch" },
+      { status: "unverified", reasonCode: "canonical_evidence_missing", displayReason: "required_evidence_missing" },
+      { status: "unverified", reasonCode: "canonical_evidence_invalid", displayReason: "evidence_invalid" },
+      { status: "unverified", reasonCode: "canonical_evidence_ambiguous", displayReason: "evidence_ambiguous" },
+      { status: "unverified", reasonCode: "result_invalid", displayReason: "task_result_invalid" },
+      { status: "unverified", reasonCode: "result_ambiguous", displayReason: "task_result_ambiguous" },
+      { status: "unverified", reasonCode: "result_evidence_unbound", displayReason: "result_not_evidence_bound" },
+    ] as const
+    for (const item of cases) {
+      const role = item.reasonCode === "reported_score_below_minimum" ? "analyst" : "scout"
+      const criteria = [{ id: "candidate-count", check: item.reasonCode === "reported_score_below_minimum"
+        ? { kind: "reported_score_gte", minimumScore: 7, minimumFindings: 1, aggregation: "any" as const }
+        : { kind: "candidate_count_gte", minimum: 2 } }]
+      const node = typedNode("check", "task-check", role, criteria)
+      const baseReport = report(criteria, item.status)
+      const reasonReport = { ...baseReport, reasonCode: item.reasonCode,
+        criteria: criteria.map(criterion => ({ criterionId: criterion.id, status: item.status, reasonCode: item.reasonCode })) }
+      const rows = [row(rootTaskId, "orchestrator", "running"),
+        { ...row("task-check", role, "failed", result(reasonReport)), failureReason: `task_graph_verification_${item.status}` }]
+      const value = summary([node], rows, 3, projection([node], rows), 2)
+      const displayNode = value?.nodes[0]
+      expect(value?.schemaVersion).toBe(2)
+      expect(displayNode && "checks" in displayNode ? displayNode.checks[0]?.displayReason : undefined).toBe(item.displayReason)
+      expect(JSON.stringify(value)).not.toContain('"reasonCode"')
+      expect(JSON.stringify(value)).not.toContain(`"${item.reasonCode}"`)
+      expect(JSON.stringify(value)).not.toContain("candidate-count")
+    }
+
+    const criteria = [scoutCriteria[0]]
+    const node = typedNode("unknown", "task-unknown", "scout", criteria)
+    const unknownReport = { ...report(criteria, "unverified"), reasonCode: "future_worker_reason",
+      criteria: criteria.map(criterion => ({ criterionId: criterion.id, status: "unverified", reasonCode: "future_worker_reason" })) }
+    const rows = [row(rootTaskId, "orchestrator", "running"),
+      { ...row("task-unknown", "scout", "failed", result(unknownReport)), failureReason: "task_graph_verification_unverified" }]
+    const invalid = summary([node], rows, 3, projection([node], rows), 2)
+    expect(invalid?.nodes[0]).toEqual({ status: "unavailable" })
+  })
+
   it("rejects malformed or internally inconsistent untrusted sidecars", () => {
     const valid: TaskGraphVerificationSummary = { schemaVersion: 1, nodes: [{ status: "failed", checks: [
       { kind: "candidate_count_gte", minimum: 2, status: "failed" },
     ], totalCount: 1, passedCount: 0, failedCount: 1, unverifiedCount: 0 }] }
     expect(parseTaskGraphVerificationSummary(valid, 1)).toEqual(valid)
+    expect(parseTaskGraphVerificationSummary({ ...valid, nodes: [{ ...valid.nodes[0]!, checks: [
+      { kind: "candidate_count_gte", minimum: 2, status: "failed", displayReason: "criterion_unmet" },
+    ] }] }, 1)).toBeNull()
+    const v2 = { ...valid, schemaVersion: 2, nodes: [{ ...valid.nodes[0]!, checks: [
+      { kind: "candidate_count_gte", minimum: 2, status: "failed", displayReason: "criterion_unmet" },
+    ] }] }
+    expect(parseTaskGraphVerificationSummary(v2, 1)).toEqual(v2)
+    const v2WithoutReason = { ...v2, nodes: [{ ...v2.nodes[0]!, checks: [
+      { kind: "candidate_count_gte", minimum: 2, status: "failed" },
+    ] }] }
+    expect(parseTaskGraphVerificationSummary(v2WithoutReason, 1)).toEqual(v2WithoutReason)
+    const v2UnverifiedWithoutReason = { ...v2, nodes: [{ ...v2.nodes[0]!, status: "unverified", checks: [
+      { kind: "candidate_count_gte", minimum: 2, status: "unverified" },
+    ], passedCount: 0, failedCount: 0, unverifiedCount: 1 }] }
+    expect(parseTaskGraphVerificationSummary(v2UnverifiedWithoutReason, 1)).toEqual(v2UnverifiedWithoutReason)
+    for (const unsafeReason of [{ toString: null }, ["unknown"]]) {
+      const malformedReason = { ...v2UnverifiedWithoutReason, nodes: [{ ...v2UnverifiedWithoutReason.nodes[0]!, checks: [
+        { kind: "candidate_count_gte", minimum: 2, status: "unverified", displayReason: unsafeReason },
+      ] }] }
+      expect(parseTaskGraphVerificationSummary(malformedReason, 1)).toEqual(v2UnverifiedWithoutReason)
+    }
+    const unknownReason = { ...v2, nodes: [{ ...v2.nodes[0]!, checks: [
+      { kind: "candidate_count_gte", minimum: 2, status: "failed", displayReason: "criterion_not_met" },
+    ] }] }
+    expect(parseTaskGraphVerificationSummary(unknownReason, 1)?.nodes[0]).toEqual({
+      status: "failed", checks: [{ kind: "candidate_count_gte", minimum: 2, status: "failed" }],
+      totalCount: 1, passedCount: 0, failedCount: 1, unverifiedCount: 0,
+    })
+    const statusMismatch = { ...v2, nodes: [{ ...v2.nodes[0]!, checks: [
+      { kind: "candidate_count_gte", minimum: 2, status: "failed", displayReason: "required_evidence_missing" },
+    ] }] }
+    expect(parseTaskGraphVerificationSummary(statusMismatch, 1)?.nodes[0]).toEqual({
+      status: "failed", checks: [{ kind: "candidate_count_gte", minimum: 2, status: "failed" }],
+      totalCount: 1, passedCount: 0, failedCount: 1, unverifiedCount: 0,
+    })
     const coverage = { schemaVersion: 1, nodes: [{ status: "failed", checks: [
       { kind: "findings_cover_scout_candidates_gte", minimumPercent: 75, status: "failed" },
     ], totalCount: 1, passedCount: 0, failedCount: 1, unverifiedCount: 0 }] }

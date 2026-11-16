@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import type { PolicyEvaluationContext } from "@jobcopilot/agent-policy"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { createProductionChildPolicy, expectedStructuredRole } from "./production-child-policy.js"
+import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 
 const structuredRoles = ["scout", "analyst", "writer", "reviewer", "prepare"] as const
 const inheritedMarker = Object.setPrototypeOf(
@@ -111,7 +112,7 @@ describe("createProductionChildPolicy durable child wait permission", () => {
   it("keeps the wait-only exception closed while every current child role is not authorized to manage children", () => {
     for (const role of ["scout", "analyst", "prepare", "writer", "reviewer", "auditor", "executor"]) {
       const policy = createProductionChildPolicy({ role, taskType: "research", allowedActions: ["wait_subagents"], toolPolicySnapshot: undefined }, false)
-      expect(durableWaitDecision(policy)).toMatchObject({ outcome: "deny", reasonCode: "server_subagent_internal_write_denied" })
+      expect(durableWaitDecision(policy)).toMatchObject({ outcome: "deny", reasonCode: "server_nested_scout_profile_required" })
       expect(durableWaitDecision(policy, { ...durableWaitTool, name: "agent.wait" }).outcome).toBe("deny")
       expect(durableWaitDecision(policy, { ...durableWaitTool, version: "2" }).outcome).toBe("deny")
       expect(durableWaitDecision(policy, { ...durableWaitTool, domain: "jobs" }).outcome).toBe("deny")
@@ -120,7 +121,7 @@ describe("createProductionChildPolicy durable child wait permission", () => {
 
   it("does not grant wait from an alias in persisted allowedActions", () => {
     const policy = createProductionChildPolicy({ role: "scout", taskType: "research", allowedActions: ["agent.wait"], toolPolicySnapshot: undefined }, false)
-    expect(durableWaitDecision(policy)).toMatchObject({ outcome: "deny", reasonCode: "server_subagent_internal_write_denied" })
+    expect(durableWaitDecision(policy)).toMatchObject({ outcome: "deny", reasonCode: "server_nested_scout_profile_required" })
   })
 
   it("keeps a configured wait denial ahead of a future server-owned exact wait exception", () => {
@@ -131,6 +132,40 @@ describe("createProductionChildPolicy durable child wait permission", () => {
       },
     }, false)
     expect(durableWaitDecision(policy)).toMatchObject({ outcome: "deny", reasonCode: "configured_wait_deny" })
+  })
+
+  it("allows nested coordination only for a marked direct-child Scout discovery task", () => {
+    const delegateTool: PolicyEvaluationContext["tool"] = {
+      name: "scout.delegate", version: "1", risk: "internal_write", domain: "coordination",
+      capabilities: ["coordination"], requiredCapabilities: ["read"],
+    }
+    const resultsTool: PolicyEvaluationContext["tool"] = {
+      name: "scout.results", version: "1", risk: "read", domain: "coordination",
+      capabilities: ["read"], requiredCapabilities: ["read"],
+    }
+    const marked = createProductionChildPolicy({
+      role: "scout", taskType: "job_discovery", depth: 1, parentTaskId: "root-1", rootTaskId: "root-1",
+      context: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER },
+      allowedActions: ["scout.delegate", "scout.results", "wait_subagents"], toolPolicySnapshot: undefined,
+    }, false)
+    const ordinary = createProductionChildPolicy({
+      role: "scout", taskType: "job_discovery", depth: 1, parentTaskId: "root-1", rootTaskId: "root-1",
+      context: {}, allowedActions: ["scout.delegate", "scout.results", "wait_subagents"], toolPolicySnapshot: {
+        version: "policy.v1", rules: [{ id: "configured-broad-subagent-allow", roles: ["subagent"], outcome: "allow",
+          reasonCode: "configured_broad_allow", reason: "Configured broad allow" }],
+      },
+    }, false)
+    const decision = (policy: ReturnType<typeof createProductionChildPolicy>, tool: PolicyEvaluationContext["tool"]) => policy.evaluate({
+      scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", toolCallId: "call-1",
+      actorRole: "subagent", capabilities: ["read"], tool, input: {},
+    })
+
+    expect(decision(marked, delegateTool).outcome).toBe("allow")
+    expect(decision(marked, resultsTool).outcome).toBe("allow")
+    expect(durableWaitDecision(marked).outcome).toBe("allow")
+    expect(decision(ordinary, delegateTool).outcome).toBe("deny")
+    expect(decision(ordinary, resultsTool).outcome).toBe("deny")
+    expect(durableWaitDecision(ordinary).outcome).toBe("deny")
   })
 })
 

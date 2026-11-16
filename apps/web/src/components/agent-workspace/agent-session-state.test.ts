@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
   agentSessionUrl,
+  hasAuthoritativeAgentTurnState,
   parseActiveTurn,
   parseAgentTurnsResponse,
   readAgentSessionId,
+  resolveAgentTurnStateReadiness,
+  selectedSessionControlStatusValue,
 } from './agent-session-state'
 
 describe('agent session URL and active Turn DTO', () => {
@@ -33,6 +36,29 @@ describe('agent session URL and active Turn DTO', () => {
       activeTurn: { id: 'turn_1', status: 'in_progress', revision: 3, goal: 'Current objective' },
       queuedInputCount: 2,
     })
+  })
+
+  it('treats only a complete active-Turn projection as authoritative', () => {
+    expect(hasAuthoritativeAgentTurnState({ turns: [], projection: { activeTurnId: null, activeTurn: null } })).toBe(true)
+    expect(hasAuthoritativeAgentTurnState({ turns: [], projection: { activeTurnId: 'turn_1', activeTurn: { id: 'turn_1', status: 'in_progress', revision: 1 } } })).toBe(true)
+    expect(hasAuthoritativeAgentTurnState({ turns: [{ id: 'turn_1', status: 'in_progress', revision: 1 }], projection: { activeTurnId: null, activeTurn: null } })).toBe(false)
+    expect(hasAuthoritativeAgentTurnState({ turns: [], projection: { activeTurnId: null } })).toBe(false)
+    expect(hasAuthoritativeAgentTurnState({ turns: [], projection: {} })).toBe(false)
+    expect(hasAuthoritativeAgentTurnState({})).toBe(false)
+  })
+
+  it('keeps loading, ready, and error scoped to the selected Session', () => {
+    expect(resolveAgentTurnStateReadiness('session-b', 'session-a', false, null)).toBe('loading')
+    expect(resolveAgentTurnStateReadiness('session-b', 'session-b', true, null)).toBe('loading')
+    expect(resolveAgentTurnStateReadiness('session-b', 'session-b', false, 'request failed')).toBe('error')
+    expect(resolveAgentTurnStateReadiness('session-b', 'session-b', false, null)).toBe('ready')
+  })
+
+  it('never reuses another Session control status during selection changes', () => {
+    expect(selectedSessionControlStatusValue('session-b', { id: 'session-a', status: 'running' })).toBeNull()
+    expect(selectedSessionControlStatusValue('session-b', { id: 'session-b', status: 'paused' })).toBe('paused')
+    expect(selectedSessionControlStatusValue('session-b', { id: 'session-b', status: 'unknown' })).toBe('unknown')
+    expect(selectedSessionControlStatusValue('session-b', undefined)).toBeNull()
   })
 
   it('keeps active controls for older projections without a goal', () => {

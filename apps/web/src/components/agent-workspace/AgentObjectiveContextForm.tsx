@@ -8,6 +8,7 @@ import {
 } from './agent-objective-start-command'
 
 export interface AgentObjectiveContextFormState extends ObjectiveContextDraft {
+  allowedLocationsDraft?: string
   open: boolean
   pending: boolean
   accepted: boolean
@@ -18,6 +19,7 @@ type FormAction =
   | { type: 'open' }
   | { type: 'edit-objective'; value: string }
   | { type: 'edit-context'; value: string }
+  | { type: 'edit-allowed-locations'; value: string }
   | { type: 'pending' }
   | { type: 'failed'; error: { message: string; conflict: boolean } }
   | { type: 'accepted' }
@@ -25,7 +27,7 @@ type FormAction =
   | { type: 'discard' }
 
 const initialFormState: AgentObjectiveContextFormState = {
-  objective: '', context: '', open: false, pending: false, accepted: false, error: null,
+  objective: '', context: '', allowedLocationsDraft: '', open: false, pending: false, accepted: false, error: null,
 }
 
 export function objectiveContextFormReducer(
@@ -35,6 +37,7 @@ export function objectiveContextFormReducer(
   if (action.type === 'open') return { ...initialFormState, open: true }
   if (action.type === 'edit-objective') return { ...state, objective: action.value, error: null }
   if (action.type === 'edit-context') return { ...state, context: action.value, error: null }
+  if (action.type === 'edit-allowed-locations') return { ...state, allowedLocationsDraft: action.value, error: null }
   if (action.type === 'pending') return { ...state, pending: true, error: null }
   if (action.type === 'failed') return { ...state, pending: false, error: action.error }
   if (action.type === 'accepted') return { ...initialFormState, accepted: true }
@@ -107,7 +110,7 @@ export function AgentObjectiveContextForm({ startLockRef, attachedFileCount = 0,
     startLockRef.current = true
     onBusyChange?.(true)
     dispatchAction({ type: 'pending' })
-    void coordinatorRef.current!.start(state.objective, state.context).then(result => {
+    void coordinatorRef.current!.start(state.objective, state.context, state.allowedLocationsDraft).then(result => {
       dispatchAction({ type: 'accepted' })
       try {
         onAccepted(result.sessionId, result.objective)
@@ -162,6 +165,22 @@ export function AgentObjectiveContextForm({ startLockRef, attachedFileCount = 0,
             onChange={event => {
               coordinatorRef.current?.draftEdited()
               dispatchAction({ type: 'edit-objective', value: event.target.value })
+            }}
+            style={{ width: '100%', boxSizing: 'border-box', resize: 'vertical', border: '1px solid var(--border)', borderRadius: 7, padding: 8, color: 'var(--text)', background: 'var(--bg)', font: 'inherit' }}
+          />
+          <label htmlFor="agent-task-allowed-locations">Allowed job locations (optional)</label>
+          <p style={{ margin: 0 }}>Enter one location per line. A result must match the whole observed location after text, case, and spacing normalization; Dublin does not match Dublin, Ireland. Aliases are not inferred.</p>
+          <textarea
+            id="agent-task-allowed-locations"
+            data-testid="objective-context-allowed-locations"
+            aria-label="Allowed job locations"
+            rows={2}
+            maxLength={2_000}
+            value={state.allowedLocationsDraft}
+            disabled={state.pending || disabled}
+            onChange={event => {
+              coordinatorRef.current?.draftEdited()
+              dispatchAction({ type: 'edit-allowed-locations', value: event.target.value })
             }}
             style={{ width: '100%', boxSizing: 'border-box', resize: 'vertical', border: '1px solid var(--border)', borderRadius: 7, padding: 8, color: 'var(--text)', background: 'var(--bg)', font: 'inherit' }}
           />

@@ -5,20 +5,22 @@ import { createProgressDetector, progressCheckpointFromStepContext } from "../pr
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { runAdmittedModelStep } from "./admitted-model-step.js"
 import { settleAndPersistModelUsage } from "./turn-execution-budget-overrun.js"
-import { normalizeProjectedToolCallIds, projectChildToolCallIdsForModelContext } from "./turn-tool-call-id-projection.js"
+import { normalizeProjectedToolCallIds, projectChildToolCallIdsForModelContext, scopeChildExecutionReceipts } from "./turn-tool-call-id-projection.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
 import { publishCommentary, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionOptions } from "./turn-execution-types.js"
-import { assertExecutionAlive, assertModelAllowance, makeExecutionId, resumedBudgetLimits, updateExecutionStep, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
+import { assertExecutionAlive, assertModelAllowance, makeExecutionId, resumedBudgetLimits, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
 import { buildCognitiveActionAgenda, excludeUnconsumedRootReferenceFromAgenda } from "./cognitive-action-agenda.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
 import { buildCognitiveAgendaStepReceipt } from "./cognitive-agenda-progress-delta.js"
-import { executeTools, hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
+import { hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers, withServerGeneratedFinalDependencyWait } from "./turn-execution-tools.js"
 import { stopForRepeatedTaskGraphDenial } from "./turn-execution-final-candidate.js"
 import { nativeQuestionCallId, recoverPendingNativeQuestion } from "./turn-execution-question.js"
 import { hasNewlyAcceptedInput } from "../context/step-context-support.js"
 import { handoffRecoveredArchivedWait } from "./turn-execution-wait.js"
+import { assertFinalDependencyWaitAvailable, prepareFinalDependencyWaitCall } from "./turn-execution-final-dependency-wait.js"
+import { executeTurnToolStep } from "./turn-execution-tool-step.js"
 import { createTaskGraphDenialProgressTracker } from "./task-graph-denial-progress.js"
 import { takeRecoveredScheduledPipelineCandidate } from "../subagents/scheduled-pipeline-candidate-store.js"
 import { prepareTurnFinalAnswerEvidenceRequest, resolveTurnFinalAnswerMarkers } from "./turn-execution-evidence.js"
@@ -39,7 +41,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
   let consumedInputIds: readonly string[] = options.resume?.consumedInputIds ?? []
   let steps = options.resume?.stepCount ?? 0
   let toolCalls = options.resume?.toolCallCount ?? 0
-  let continuation: ModelContinuation | undefined
+  let continuation: ModelContinuation | undefined, childToolReplayReceipts = options.childToolReplayReceipts ?? [], childWaitReplayReceipts = options.childWaitReplayReceipts ?? []
   let recoveredCandidate = options.recoveredFinalCandidate
   let recoveredScheduledCandidate: ReturnType<typeof takeRecoveredScheduledPipelineCandidate> = undefined
   if (options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId && recoveredCandidate !== undefined) {
@@ -124,7 +126,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         }
         await writer.append("step.started", step.id, null, { stepId: step.id, ordinal: step.ordinal, taskId: options.identity.taskId }, `step-started:${step.id}`)
         if (options.identity.kind === "turn" && options.refreshTaskGraphBeforeStep) snapshot = await options.refreshTaskGraphBeforeStep(snapshot)
-        const toolCallProjection = options.identity.kind === "task" && options.identity.taskId !== options.identity.rootTaskId ? projectChildToolCallIdsForModelContext(snapshot, options.identity, step.id) : undefined
+        const toolCallProjection = options.identity.kind === "task" && options.identity.taskId !== options.identity.rootTaskId ? projectChildToolCallIdsForModelContext(snapshot, options.identity, step.id, childToolReplayReceipts, childWaitReplayReceipts) : undefined
         const context = await options.contextBuilder.build({
           scope: options.scope, identity: options.identity, stepId: step.id, snapshot: toolCallProjection?.snapshot ?? snapshot,
           rootInputId: ordinal === 0 ? options.rootInputId : undefined, now: now(),
@@ -179,51 +181,46 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           output = await runAdmittedModelStep({ writer, stepId: step.id, taskId: options.identity.taskId, provider: request.provider, model: request.model, invoke: () => runModelStep(options.model, request, options.validateToolArguments), onStartDenied: () => reservation.settle({ inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }) })
           await settleAndPersistModelUsage({ reservation, output, stepId: step.id, taskId: options.identity.taskId, writer, onUsageAccepted: () => { stepOutput = output } })
         }
-        output = toolCallProjection ? { ...output, toolCalls: normalizeProjectedToolCallIds(output.toolCalls, toolCallProjection.aliasToCanonical) } : output; stepOutput = output; continuation = output.continuation ?? undefined
+        output = toolCallProjection ? { ...output, toolCalls: normalizeProjectedToolCallIds(output.toolCalls, toolCallProjection) } : output; stepOutput = output; continuation = output.continuation ?? undefined
         await publishReasoningSummary(writer, options, step, resolveTurnFinalAnswerMarkers(output.reasoningSummary, null).text, now)
-        if (output.toolCalls.length > 0) {
-          const questionCallId = nativeQuestionCallId(output, options.identity)
+        let actionableOutput = output
+        let generatedDependencyWait = false
+        if (output.toolCalls.length === 0 && output.finishReason === "stop" && output.provider !== "recovered" && options.identity.kind === "task" && options.prepareFinalDependencyWait) {
+          assertExecutionAlive(options, signal)
+          const waitRequest = await options.prepareFinalDependencyWait({ identity: options.identity, step, context, snapshot, signal })
+          assertExecutionAlive(options, signal)
+          const waitCall = prepareFinalDependencyWaitCall(options.identity, step, waitRequest)
+          if (waitCall) {
+            assertFinalDependencyWaitAvailable(options, waitCall)
+            actionableOutput = { ...output, toolCalls: [waitCall] }
+            generatedDependencyWait = true
+          }
+        }
+        if (actionableOutput.toolCalls.length > 0) {
+          const questionCallId = nativeQuestionCallId(actionableOutput, options.identity)
           if (questionCallId && (!executionOptions.store.stageQuestionUsage || !executionOptions.store.cancelPausedQuestion)) throw new TurnEngineError("invalid_output", "Native question store is unavailable")
           questionIntentCallId = questionCallId
-          denialProgress.clear(); progress.observe({ snapshot, toolCalls: output.toolCalls }, progressCheckpointFromStepContext(context))
-          budget.reserveToolCalls(output.toolCalls.length)
-          if (output.text) await publishCommentary(writer, options, step, resolveTurnFinalAnswerMarkers(output.text, null).text, now)
-          let outcome: { wait: TurnEngineResult | null; snapshot: typeof options.snapshot; steeringMarkerState: typeof steeringMarkerState }
-          let persistedToolCallCount = 0
-          try {
-            outcome = await executeTools(executionOptions, writer, step, output, snapshot, seenCallIds, signal, now, steeringMarkerState, () => { persistedToolCallCount += 1 })
-          } finally {
-            budget.accountToolCalls(output.toolCalls.length)
-            toolCalls += persistedToolCallCount
-          }
-          snapshot = outcome.snapshot
-          steeringMarkerState = outcome.steeringMarkerState
-          if (questionIntentCallId && outcome.wait?.status === "waiting_for_user") {
-            closedSteps.add(step.id)
-            return { ...outcome.wait, stepCount: steps, toolCallCount: toolCalls }
-          }
-          // Tool results are server-owned context; do not reuse a provider cursor across this boundary.
-          continuation = undefined
-          assertExecutionAlive(options, signal)
-          const wait = outcome.wait
-          const stepStatus = wait?.status === "waiting_for_dependency"
-            ? "waiting_for_tool"
-            : wait?.status === "waiting_for_approval" || wait?.status === "waiting_for_user" ? wait.status : "completed"
-          await updateExecutionStep(options, {
-            stepId: step.id, status: stepStatus, finishReason: output.finishReason, errorCode: wait?.errorCode ?? null,
-            inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
-            estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now(),
+          denialProgress.clear(); progress.observe({ snapshot, toolCalls: actionableOutput.toolCalls }, progressCheckpointFromStepContext(context))
+          budget.reserveToolCalls(actionableOutput.toolCalls.length)
+          if (!generatedDependencyWait && output.text) await publishCommentary(writer, options, step, resolveTurnFinalAnswerMarkers(output.text, null).text, now)
+          const toolStep = await executeTurnToolStep({
+            options, executeOptions: generatedDependencyWait ? withServerGeneratedFinalDependencyWait(executionOptions, step.id, actionableOutput.toolCalls[0]!.id) : executionOptions,
+            writer, step, output: actionableOutput, snapshot, seenCallIds, signal, now, steeringMarkerState,
+            questionIntentCallId, closedSteps, resetContinuation: () => { continuation = undefined },
+            excludedToolCallIds: new Set(toolCallProjection ? [...toolCallProjection.aliasToReceipt.values()].map(receipt => receipt.toolCallId) : []),
+            onToolCallsSettled: persisted => { budget.accountToolCalls(actionableOutput.toolCalls.length); toolCalls += persisted },
+            onOutcome: outcome => {
+              if (toolCallProjection && options.identity.kind === "task") {
+                [childToolReplayReceipts, childWaitReplayReceipts] = scopeChildExecutionReceipts(
+                  childToolReplayReceipts, childWaitReplayReceipts, outcome.receipts, options.identity, step.id,
+                )
+              }
+              snapshot = outcome.snapshot
+              steeringMarkerState = outcome.steeringMarkerState
+            },
           })
-          await writer.append(
-            "step.completed", step.id, null,
-            { stepId: step.id, status: wait?.status ?? "completed", toolCallCount: output.toolCalls.length, taskId: options.identity.taskId },
-            `step-completed:${step.id}`,
-          )
-          closedSteps.add(step.id)
-          if (wait) {
-            if (wait.status === "waiting_for_user") await options.store.waitForUser?.({ identity: options.identity, now: now() })
-            return { ...wait, stepCount: steps, toolCallCount: toolCalls }
-          }
+          if (toolStep.kind === "question_wait") return { ...toolStep.wait, stepCount: steps, toolCallCount: toolCalls }
+          if (toolStep.wait) return { ...toolStep.wait, stepCount: steps, toolCallCount: toolCalls }
           continue
         }
         const outcome = await completeTurnExecutionFinalAnswer({ options, writer, step, output, bindingMap: answerEvidenceBindingMap,

@@ -8,10 +8,11 @@ import {
   taskGraphVerificationCheckDependencyNodeKeys,
 } from "./task-graph-verification-scout-union.js"
 import type { TaskGraphVerificationCheck } from "./task-graph-verification-contract.js"
-import type { TaskGraphVerificationParsedProjection } from "./task-graph-verification-cross-node.js"
+import { TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, type TaskGraphVerificationParsedProjection } from "./task-graph-verification-cross-node.js"
 
 function scout(...jobIds: string[]) {
-  return { role: "scout" as const, items: jobIds.map(jobId => ({ jobId, evidenceIds: [] })), evidenceIds: [] }
+  return { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout" as const,
+    items: jobIds.map(jobId => ({ jobId, evidenceIds: [] })), evidenceIds: [] }
 }
 
 function dependencies(entries: Record<string, ReturnType<typeof scout>>) {

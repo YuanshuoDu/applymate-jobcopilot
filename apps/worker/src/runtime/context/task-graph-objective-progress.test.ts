@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer"
 import { describe, expect, it } from "vitest"
 import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION, TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCurrentState } from "../subagents/task-graph-command-port.js"
 import { resolveRootTaskVerificationRequirements } from "./root-task-objective.js"
 import { taskGraphObjectiveProgressObservation, TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID } from "./task-graph-objective-progress.js"
@@ -9,18 +9,20 @@ import { taskGraphObjectiveProgressObservation, TASK_GRAPH_OBJECTIVE_PROGRESS_OB
 const rootTaskId = "root-task"
 const requirementId = "candidate-total"
 const requirement = { id: requirementId, kind: "candidate_count_gte" as const, minimum: 2 }
+const locationRequirementId = "candidate-location"
+const locationRequirement = { id: locationRequirementId, kind: "candidate_location_in" as const, locations: ["berlin", "dublin"] }
 const resolution = resolveRootTaskVerificationRequirements({ input: { verificationRequirements: {
   schemaVersion: "agent-harness.v2.objective-requirements.v1",
   requirements: [{ id: requirement.id, check: { kind: requirement.kind, minimum: requirement.minimum } }],
 } } })
 const activeTemplateRoles = { scout: "scout", analyst: "analyst" }
 
-function report(status: "failed" | "passed" | "unverified") {
+function report(status: "failed" | "passed" | "unverified", criterionId = requirementId) {
   const criterionStatus = status === "failed" ? "failed" : status === "passed" ? "passed" : "unverified"
   const reasonCode = status === "failed" ? "criterion_not_met" : status === "passed" ? "criteria_met" : "canonical_evidence_missing"
   return {
     verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status, reasonCode,
-    criteria: [{ criterionId: requirementId, status: criterionStatus, reasonCode }],
+    criteria: [{ criterionId, status: criterionStatus, reasonCode }],
     evidenceDigest: status === "unverified" ? null : "a".repeat(64),
     resultDigest: status === "unverified" ? null : "b".repeat(64),
   }
@@ -46,6 +48,31 @@ function node(input: Readonly<{ key?: string; taskId?: string; status?: "queued"
   }
 }
 
+function locationResolution(locations = locationRequirement.locations) {
+  return resolveRootTaskVerificationRequirements({ input: { verificationRequirements: {
+    schemaVersion: "agent-harness.v2.objective-requirements.v2",
+    requirements: [{ id: locationRequirementId, check: { kind: "candidate_location_in", locations } }],
+  } } })
+}
+
+function locationNode(input: Readonly<{ status?: "failed" | "completed"; observedLocation?: string | null;
+  locationEvidenceStatus?: "verified" | "missing" | "conflicting"; report?: "failed" | "passed" | "unverified" }>) {
+  const status = input.status ?? "completed"
+  return {
+    ...node({ status, role: "scout" }),
+    verification: {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+      criteria: [{ id: locationRequirementId, check: { kind: "candidate_location_in", locations: locationRequirement.locations } }],
+    },
+    verificationCriterionIds: [locationRequirementId],
+    resultProjection: { schemaVersion: "agent-harness.v2.task-graph-verification-evidence.v2",
+      trust: "untrusted", availability: "available", role: "scout", items: [{ jobId: "job-1", evidenceIds: ["source:job-1"],
+        observedLocation: input.observedLocation === undefined ? "Berlin" : input.observedLocation,
+        locationEvidenceStatus: input.locationEvidenceStatus ?? "verified" }], evidenceIds: ["source:job-1"] },
+    ...(input.report ? { verificationReport: report(input.report, locationRequirementId) } : {}),
+  }
+}
+
 function current(nodes: readonly Record<string, unknown>[], revision = 7) {
   return mergeTaskGraphCurrentObservation({ system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }, {
     revision, nodes: nodes as unknown as TaskGraphCurrentState["nodes"],
@@ -60,6 +87,13 @@ function project(snapshot: ReturnType<typeof current>, overrides: Record<string,
   } as Parameters<typeof taskGraphObjectiveProgressObservation>[0])
 }
 
+function projectLocation(snapshot: ReturnType<typeof current>, resolutionOverride = locationResolution()) {
+  return taskGraphObjectiveProgressObservation({
+    resolution: resolutionOverride, observations: snapshot.toolObservations,
+    taskGraphRevision: snapshot.taskGraphRevision, rootTaskId, taskGraphTemplateRoles: activeTemplateRoles,
+  } as Parameters<typeof taskGraphObjectiveProgressObservation>[0])
+}
+
 describe("TaskGraph objective progress observation", () => {
   it("projects missing, active, failed, unverified, and reported-passed states from exact current reports", () => {
     expect(project(current([]))?.content).toMatchObject({ revision: 7, requirements: [{ ...requirement, status: "missing" }] })
@@ -71,6 +105,21 @@ describe("TaskGraph objective progress observation", () => {
       .toMatchObject({ requirements: [{ id: requirementId, status: "unverified" }] })
     expect(project(current([node({ status: "completed", report: "passed" })]))?.content)
       .toMatchObject({ requirements: [{ id: requirementId, status: "reported_passed" }] })
+  })
+
+  it("reports location progress only from an exact v2 typed check and current verifier report", () => {
+    expect(projectLocation(current([locationNode({ report: "passed" })]))?.content).toMatchObject({
+      requirements: [{ ...locationRequirement, status: "reported_passed" }],
+    })
+    expect(projectLocation(current([locationNode({ status: "failed", observedLocation: "Paris", report: "failed" })]))?.content)
+      .toMatchObject({ requirements: [{ id: locationRequirementId, status: "failed" }] })
+    expect(projectLocation(current([locationNode({ report: "unverified" })]))?.content)
+      .toMatchObject({ requirements: [{ id: locationRequirementId, status: "unverified" }] })
+    expect(projectLocation(current([locationNode({ report: "passed" })]), locationResolution(["paris"]))?.content)
+      .toMatchObject({ requirements: [{ id: locationRequirementId, status: "unknown" }] })
+    const encoded = JSON.stringify(projectLocation(current([locationNode({ report: "passed" })]))?.content)
+    expect(encoded).not.toContain("candidate_locations")
+    expect(encoded).not.toContain("query")
   })
 
   it("uses the latest valid repair-lineage member and does not trust a passed old target", () => {

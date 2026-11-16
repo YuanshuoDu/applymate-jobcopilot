@@ -12,11 +12,14 @@ import {
 function dependencies() {
   const pool = {} as pg.Pool
   const childExecutor = vi.fn()
-  const runtime = {} as CanonicalTurnRuntime
+  const manager = { spawnFromLease: vi.fn() }
+  const runtime = { manager } as unknown as CanonicalTurnRuntime
   const bootstrap = { close: vi.fn(async () => undefined) } as never
   const authorization = vi.fn() as unknown as NonNullable<CanonicalTurnRuntimeOptions["authorizeUsage"]>
   const executionProjection = {} as NonNullable<CanonicalTurnRuntimeOptions["executionProjection"]>
   const sessionProjection = {} as NonNullable<CanonicalTurnRuntimeOptions["sessionProjection"]>
+  const createOptionalProductionChildExecutor = vi.fn((options: Parameters<ProductionWorkerRuntimeDependencies["createOptionalProductionChildExecutor"]>[0]) =>
+    options.enabled ? childExecutor : undefined)
   let registeredOptions: unknown
   const startProductionAgentRuntime = vi.fn(async (options: Parameters<ProductionWorkerRuntimeDependencies["startProductionAgentRuntime"]>[0]) => {
     const createdRuntime = await options.createRuntime()
@@ -27,7 +30,7 @@ function dependencies() {
   })
 
   const resolvedDependencies: ProductionWorkerRuntimeDependencies = {
-    createOptionalProductionChildExecutor: vi.fn(({ enabled }) => enabled ? childExecutor : undefined),
+    createOptionalProductionChildExecutor,
     createCanonicalTurnRuntime: vi.fn(async () => runtime),
     createWorkerUsageAuthorizer: vi.fn(() => authorization),
     createCanonicalExecutionProjection: vi.fn(() => executionProjection),
@@ -37,11 +40,14 @@ function dependencies() {
 
   return {
     pool,
+    manager,
+    runtime,
     childExecutor,
     bootstrap,
     authorization,
     executionProjection,
     sessionProjection,
+    createOptionalProductionChildExecutor,
     resolvedDependencies,
     startProductionAgentRuntime,
     get registeredOptions() { return registeredOptions },
@@ -71,10 +77,11 @@ describe("production Worker runtime composition", () => {
       startAgentRunWorker,
     }, fixture.resolvedDependencies)).resolves.toBe(fixture.bootstrap)
 
-    expect(fixture.resolvedDependencies.createOptionalProductionChildExecutor).toHaveBeenCalledWith({
-      enabled: true,
-      pool: fixture.pool,
-    })
+    expect(fixture.createOptionalProductionChildExecutor).toHaveBeenCalledWith(expect.objectContaining({
+      enabled: true, pool: fixture.pool, subagentManager: expect.any(Function),
+    }))
+    const childOptions = fixture.createOptionalProductionChildExecutor.mock.calls[0]?.[0]
+    expect(childOptions?.subagentManager?.()).toBe(fixture.manager)
     expect(fixture.resolvedDependencies.createWorkerUsageAuthorizer).toHaveBeenCalledOnce()
     expect(fixture.resolvedDependencies.createCanonicalExecutionProjection).toHaveBeenCalledWith(fixture.pool)
     expect(fixture.resolvedDependencies.createCanonicalSessionProjection).toHaveBeenCalledWith(fixture.pool)

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
+import { taskRecoveryAccountScope } from "@/lib/agent/control-plane/commands/objective-start-attempt-read-model"
 
 const mocks = vi.hoisted(() => {
   class MockAgentCommandError extends Error {
@@ -11,6 +12,7 @@ const mocks = vi.hoisted(() => {
 })
 
 vi.mock("@/lib/api-helpers", () => ({
+  err: (message: string, status = 400) => Response.json({ error: message }, { status }),
   requireAuth: mocks.requireAuth,
   isErrorResponse: (value: unknown) => value instanceof Response,
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
@@ -34,9 +36,11 @@ function body(overrides: Record<string, unknown> = {}) {
   return { schemaVersion, clientMessageId: "start_1", objective: "  Find Dublin roles  ", content: context, ...overrides }
 }
 
-function request(value: unknown, key = "start_1") {
+function request(value: unknown, key = "start_1", expectedScope?: string) {
+  const headers: Record<string, string> = { "content-type": "application/json", "idempotency-key": key }
+  if (expectedScope !== undefined) headers["X-Expected-Account-Scope"] = expectedScope
   return new Request("http://localhost/api/agent/sessions/session_1/start-objective", {
-    method: "POST", headers: { "content-type": "application/json", "idempotency-key": key }, body: JSON.stringify(value),
+    method: "POST", headers, body: JSON.stringify(value),
   })
 }
 
@@ -62,6 +66,7 @@ describe("start-objective command API", () => {
     const response = await POST(request(body()) as never, params)
 
     expect(response.status).toBe(202)
+    expect(response.headers.get("X-Account-Scope")).toBeNull()
     await expect(response.json()).resolves.toMatchObject({ turnId: "turn_1", disposition: "started" })
     expect(mocks.start).toHaveBeenCalledWith({
       sessionId: "session_1", userId: "user_1", clientMessageId: "start_1", source: "user",
@@ -69,7 +74,27 @@ describe("start-objective command API", () => {
     })
   })
 
-  it("forwards valid requirements and reduces present-invalid values to the null sentinel", async () => {
+  it("accepts the authenticated scope on a recoverable start and rejects a mismatched account before admission", async () => {
+    const { POST } = await import("./route")
+    const scope = taskRecoveryAccountScope("user_1")
+    const accepted = await POST(request(body(), "start_1", scope) as never, params)
+
+    expect(accepted.status).toBe(202)
+    expect(accepted.headers.get("X-Account-Scope")).toBe(scope)
+    expect(accepted.headers.get("Cache-Control")).toBe("private, no-store")
+    expect(mocks.start).toHaveBeenCalledOnce()
+
+    mocks.start.mockClear()
+    mocks.resumeFindMany.mockClear()
+    const mismatch = await POST(request(body(), "start_2", "b".repeat(64)) as never, params)
+    expect(mismatch.status).toBe(409)
+    expect(mismatch.headers.get("X-Account-Scope")).toBe(scope)
+    await expect(mismatch.json()).resolves.toEqual({ error: "Task recovery account scope changed" })
+    expect(mocks.start).not.toHaveBeenCalled()
+    expect(mocks.resumeFindMany).not.toHaveBeenCalled()
+  })
+
+  it("forwards valid v1 requirements and rejects malformed requirement blocks before service dispatch", async () => {
     const { POST } = await import("./route")
     const valid = await POST(request(body({ verificationRequirements: validRequirements })) as never, params)
     expect(valid.status).toBe(202)
@@ -83,9 +108,52 @@ describe("start-objective command API", () => {
       requirements: [{ id: "candidate-count", check: { kind: "evidence_count_gte", minimum: 3 } }],
     }
     const invalid = await POST(request(body({ verificationRequirements: malformed })) as never, params)
-    expect(invalid.status).toBe(202)
+    expect(invalid.status).toBe(422)
+    expect(mocks.start).not.toHaveBeenCalled()
+
+    const unknownV2 = await POST(request(body({ verificationRequirements: {
+      schemaVersion: "agent-harness.v2.objective-requirements.v2",
+      requirements: [{ id: "candidate-location", check: { kind: "candidate_location_aliases", locations: ["Dublin"] } }],
+    } })) as never, params)
+    expect(unknownV2.status).toBe(422)
+    expect(mocks.start).not.toHaveBeenCalled()
+  })
+
+  it("preserves an explicitly present null requirements sentinel", async () => {
+    const { POST } = await import("./route")
+    const response = await POST(request(body({ verificationRequirements: null })) as never, params)
+    expect(response.status).toBe(202)
     expect(mocks.start).toHaveBeenCalledWith(expect.objectContaining({ source: "user", verificationRequirements: null }))
     expect(mocks.start.mock.calls[0]?.[0]).not.toHaveProperty("verificationRequirements.requirements")
+  })
+
+  it("rejects location requirements while gated off and forwards canonical v2 after enablement", async () => {
+    const locationRequirements = {
+      schemaVersion: "agent-harness.v2.objective-requirements.v2",
+      requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin", " Berlin ", "dublin"] } }],
+    }
+    vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "0")
+    try {
+      const { POST } = await import("./route")
+      const disabled = await POST(request(body({ verificationRequirements: locationRequirements })) as never, params)
+      expect(disabled.status).toBe(422)
+      await expect(disabled.json()).resolves.toMatchObject({
+        error: { code: "objective_location_verification_unavailable" },
+      })
+      expect(mocks.start).not.toHaveBeenCalled()
+
+      vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "1")
+      const enabled = await POST(request(body({ verificationRequirements: locationRequirements })) as never, params)
+      expect(enabled.status).toBe(202)
+      expect(mocks.start).toHaveBeenCalledWith(expect.objectContaining({
+        verificationRequirements: {
+          schemaVersion: "agent-harness.v2.objective-requirements.v2",
+          requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["berlin", "dublin"] } }],
+        },
+      }))
+    } finally {
+      vi.unstubAllEnvs()
+    }
   })
 
   it("does not admit malformed request bytes to the command or model context", async () => {

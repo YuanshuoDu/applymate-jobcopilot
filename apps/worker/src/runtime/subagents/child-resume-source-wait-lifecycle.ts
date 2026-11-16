@@ -12,6 +12,7 @@ import { toRepositoryJson } from "../turns/turn-engine-types.js"
 import { isCanonicalChildWaitOutcome } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 import { DurableSubagentWaitError, safeSubagentWaitJson, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
 import { markCanonicalSubagentWaitId, markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
+import { validateChildWaitSourceEvents } from "./child-resume-source-wait-event-validation.js"
 import type { SubagentLease } from "./types.js"
 type QueryClient = Pick<pg.PoolClient, "query">
 type Client = TurnEngineQueryClient
@@ -82,12 +83,6 @@ function event(ownerFence: ExecutionOwnerFence, key: string, itemId: string, cor
   return { owner: ownerFence, id: "event:" + randomUUID(), itemId, correlationId, causationId: null, type,
     idempotencyKey: "task:" + ownerFence.taskId + ":event:" + key, payload: toRepositoryJson(payload) }
 }
-function sequence(row: Row): bigint | undefined { try { const value = BigInt(String(row.sequence)); return value > 0n ? value : undefined } catch { return undefined } }
-function eventMatches(row: Row, e: { type: string; itemId: string; correlationId: string; cause: string | null; key: string; payload: unknown }): boolean {
-  return row.type === e.type && row.itemId === e.itemId && row.correlationId === e.correlationId && row.causationId === e.cause
-    && row.actor === "subagent" && row.idempotencyKey === e.key && sameJson(row.payload, e.payload)
-}
-
 /** Read-only exact validation used by both pre-ack and already-consumed resume paths. */
 export async function inspectChildWaitSourceLifecycle(client: QueryClient, lease: Lease, wait: Row, stepId: string, output: DurableSubagentWaitResult): Promise<Lifecycle> {
   const waitId = required(wait.id), ids = strictIds(wait.targetTaskIds)
@@ -125,56 +120,11 @@ export async function inspectChildWaitSourceLifecycle(client: QueryClient, lease
   if (!initial && (!exact(obj(result?.content), ["toolCallId", "output", "errorCode"]) || obj(result?.content).toolCallId !== callInfo.id || obj(result?.content).errorCode !== null)) return reject("source_result_completion_content")
   if (!initial && waiting && (markerExists || obj(result?.content).output === undefined)) return reject("source_waiting_output_missing")
   if (!initial && recovered && !validMarker(savedMarker, expectedMarker)) return reject("provenance_marker")
-  const expectedEvents = await validateEvents(client, lease, stepId, callItem, result, callInfo.id, resultItemId, output, initial, waiting)
+  const expectedEvents = await validateChildWaitSourceEvents({ client, lease: { ...lease, turnId: required(lease.turnId) }, wait, stepId,
+    call: callItem, result, callId: callInfo.id, callItemId, resultId: resultItemId, sourceAttempt, output, initial, waiting,
+    historicalWaitingAllowed: initial || recovered })
   if (!expectedEvents) return reject("source_event_chain")
   return { state: initial ? "unreconciled" : waiting ? "waiting" : "recovered", toolCallId: callInfo.id, callItemId, sourceAttempt, ...(result ? { resultItemId } : {}) }
-}
-
-async function validateEvents(client: QueryClient, lease: Lease, stepId: string, call: Row, result: Row | undefined, callId: string, resultIdValue: string,
-  output: DurableSubagentWaitResult, initial: boolean, waiting: boolean): Promise<boolean> {
-  const callItemId = String(call.id), prefix = "task:" + lease.id + ":event:"
-  const keys = [prefix + "item-started:" + callItemId, prefix + "tool-started:" + callId,
-    prefix + "tool-call-completed:" + callId + ":" + callItemId + ":1", prefix + "tool-finished:" + callId,
-    prefix + "item-started:" + resultIdValue, prefix + "tool-result-completed:" + callId + ":" + resultIdValue + ":1"]
-  const rows = (await client.query<Row>("SELECT \"id\", \"itemId\", \"type\", \"actor\", \"correlationId\", \"causationId\", \"sequence\", \"idempotencyKey\", \"payload\" FROM \"agent_events\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"taskId\" = $3 AND (\"itemId\" = $4 OR \"correlationId\" = $5 OR \"itemId\" = $6 OR \"correlationId\" = $6 OR \"idempotencyKey\" = ANY($7::text[])) ORDER BY \"sequence\" FOR SHARE", [lease.sessionId, lease.turnId, lease.id, callItemId, callId, resultIdValue, keys])).rows
-  const itemStart = rows.find(row => row.idempotencyKey === keys[0]), callStart = rows.find(row => row.idempotencyKey === keys[1])
-  if (!itemStart || !callStart || !eventMatches(itemStart, { type: "item.started", itemId: callItemId, correlationId: stepId,
-    cause: itemStart.causationId as string | null, key: keys[0]!, payload: { itemId: callItemId, type: "tool_call", phase: null } })
-    || !eventMatches(callStart, { type: "tool_call.started", itemId: callItemId, correlationId: callId, cause: String(itemStart.id),
-      key: keys[1]!, payload: { toolCallId: callId, toolName: "wait_subagents", taskId: lease.id } })) return false
-  const seqStart = sequence(itemStart), seqCall = sequence(callStart)
-  if (!seqStart || !seqCall || seqStart >= seqCall) return false
-  const causeId = required(itemStart.causationId)
-  const previous = (await client.query<Row>("SELECT event.\"id\", event.\"sequence\" FROM \"agent_events\" AS event WHERE event.\"sessionId\" = $1 AND event.\"turnId\" = $2 AND event.\"taskId\" = $3 AND event.\"id\" = $4 AND event.\"actor\" = 'subagent' AND (event.\"correlationId\" = $5 OR EXISTS (SELECT 1 FROM \"agent_items\" AS source WHERE source.\"id\" = event.\"itemId\" AND source.\"sessionId\" = $1 AND source.\"turnId\" = $2 AND source.\"taskId\" = $3 AND source.\"stepId\" = $5)) FOR SHARE", [lease.sessionId, lease.turnId, lease.id, causeId, stepId])).rows[0]
-  const priorSequence = previous && sequence(previous)
-  if (!previous || previous.id !== causeId || !priorSequence || priorSequence >= seqStart) return false
-  if (rows.length !== (initial ? 2 : 6)) return false
-  if (initial) {
-    const causal = (await client.query<Row>("SELECT \"id\" FROM \"agent_events\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"taskId\" = $3 AND \"causationId\" = ANY($4::text[]) FOR SHARE", [lease.sessionId, lease.turnId, lease.id, [itemStart.id, callStart.id]])).rows
-    return causal.length === 1 && causal[0]!.id === callStart.id
-  }
-  const callComplete = rows.find(row => row.idempotencyKey === keys[2]), toolComplete = rows.find(row => row.idempotencyKey === keys[3])
-  const resultStart = rows.find(row => row.idempotencyKey === keys[4]), resultComplete = rows.find(row => row.idempotencyKey === keys[5])
-  const callContent = obj(call.content)
-  const inputIds = strictIds(obj(callContent.input).taskIds)
-  if (!inputIds) return false
-  const projectedCallContent = projectWaitCallEventContent(callContent)
-  const completionMatches = (content: unknown) => eventMatches(callComplete!, { type: "item.completed", itemId: callItemId,
-    correlationId: callItemId, cause: String(callStart.id), key: keys[2]!, payload: { itemId: callItemId, status: "completed", content } })
-  const resultPayload = result ? obj(result.content) : {}
-  if (!callComplete || !toolComplete || !resultStart || !resultComplete
-    || !(completionMatches(projectedCallContent) || waiting && completionMatches(callContent))
-    || !eventMatches(toolComplete, { type: "tool_call.completed", itemId: callItemId, correlationId: callId, cause: String(callComplete.id), key: keys[3]!,
-      payload: { toolCallId: callId, toolName: "wait_subagents", status: "completed", errorCode: null, taskId: lease.id } })
-    || !eventMatches(resultStart, { type: "item.started", itemId: resultIdValue, correlationId: stepId, cause: String(toolComplete.id), key: keys[4]!,
-      payload: { itemId: resultIdValue, type: "tool_result", phase: null } })
-    || !eventMatches(resultComplete, { type: "item.completed", itemId: resultIdValue, correlationId: resultIdValue, cause: String(resultStart.id), key: keys[5]!,
-      payload: { itemId: resultIdValue, status: "completed", content: resultPayload } })) return false
-  const ordered = [itemStart, callStart, callComplete, toolComplete, resultStart, resultComplete].map(sequence)
-  if (ordered.some(value => !value) || ordered.some((value, index) => index > 0 && value! <= ordered[index - 1]!)) return false
-  const causes = [itemStart.id, callStart.id, callComplete.id, toolComplete.id, resultStart.id]
-  const extra = (await client.query<Row>("SELECT \"id\" FROM \"agent_events\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"taskId\" = $3 AND \"causationId\" = ANY($4::text[]) FOR SHARE", [lease.sessionId, lease.turnId, lease.id, causes])).rows
-  return new Set([...rows, ...extra].map(row => row.id)).size === 6
 }
 
 /** Reconciles source items, event/outbox and private provenance within the existing acknowledgement transaction. */

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import {
   COMMAND_DISPOSITIONS,
+  OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
   OBJECTIVE_VERIFICATION_REQUIREMENTS_SCHEMA_VERSION,
   parseObjectiveVerificationRequirements,
 } from "./types"
@@ -43,8 +44,28 @@ describe("Agent command contracts", () => {
     })
     expect(parsed?.requirements).toHaveLength(8)
     expect(parsed?.requirements[0]?.id).toHaveLength(64)
-    expect(parsed?.requirements[0]?.check.minimum).toBe(1)
-    expect(parsed?.requirements[7]?.check.minimum).toBe(50)
+    if (parsed?.schemaVersion !== OBJECTIVE_VERIFICATION_REQUIREMENTS_SCHEMA_VERSION) throw new Error("expected v1 requirements")
+    expect(parsed.requirements[0]?.check.minimum).toBe(1)
+    expect(parsed.requirements[7]?.check.minimum).toBe(50)
+  })
+
+  it("parses the versioned location requirement with canonical, sorted, deduplicated values", () => {
+    const parsed = parseObjectiveVerificationRequirements({
+      schemaVersion: OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+      requirements: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } },
+        { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin, Ireland", " Berlin ", "dublin"] } },
+      ],
+    })
+
+    expect(parsed).toEqual({
+      schemaVersion: OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+      requirements: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } },
+        { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["berlin", "dublin", "dublin, ireland"] } },
+      ],
+    })
+    expect(parseObjectiveVerificationRequirements(validRequirements)).toEqual(validRequirements)
   })
 
   it("rejects unsupported versions, kinds, bounds, malformed IDs, and duplicate IDs", () => {
@@ -61,6 +82,33 @@ describe("Agent command contracts", () => {
       { ...validRequirements, requirements: Array.from({ length: 9 }, (_, index) => ({
         id: `count-${index}`, check: { kind: "candidate_count_gte", minimum: 1 },
       })) },
+      {
+        schemaVersion: OBJECTIVE_VERIFICATION_REQUIREMENTS_SCHEMA_VERSION,
+        requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin"] } }],
+      },
+      {
+        schemaVersion: OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+        requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+      },
+      {
+        schemaVersion: OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+        requirements: [{ id: "not-the-location-id", check: { kind: "candidate_location_in", locations: ["Dublin"] } }],
+      },
+      {
+        schemaVersion: OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+        requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: [] } }],
+      },
+      {
+        schemaVersion: OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+        requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["x".repeat(129)] } }],
+      },
+      {
+        schemaVersion: OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION,
+        requirements: Array.from({ length: 9 }, (_, index) => ({
+          id: index === 0 ? "candidate-location" : `location-${index}`,
+          check: { kind: "candidate_location_in", locations: [`City ${index}`] },
+        })),
+      },
     ]
     for (const value of invalid) expect(parseObjectiveVerificationRequirements(value)).toBeNull()
   })

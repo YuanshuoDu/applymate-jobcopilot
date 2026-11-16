@@ -137,6 +137,12 @@ function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], consume
     query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
       calls.push({ sql, values })
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.startsWith('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: child.sessionId }], rowCount: 1 }
+      if (sql.startsWith('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: child.turnId }], rowCount: 1 }
+      if (sql.startsWith('SELECT "id" FROM "sub_agent_tasks"')) {
+        const childLock = sql.includes('"rootTaskId" = $4')
+        return { rows: [{ id: childLock ? child.id : child.rootTaskId }], rowCount: 1 }
+      }
       if (sql.includes('WHERE task."id" = $1 AND task."sessionId"')) return { rows: [currentRow(child)], rowCount: 1 }
       if (sql.includes('FROM "agent_wait_conditions" AS wait')) return { rows: consumedWait ? [consumedWait] : [], rowCount: consumedWait ? 1 : 0 }
       if (sql.includes('WHERE task."id" = ANY($1::text[])')) return { rows: targets, rowCount: targets.length }
@@ -153,6 +159,16 @@ function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], consume
         && sql.includes('"content"->>\'toolCallId\' = $4')) {
         const rows = persistedItems.filter(row => (row.content as Row).toolCallId === values[3])
         return { rows, rowCount: rows.length }
+      }
+      if (sql.startsWith('SELECT "id", "sessionId", "turnId", "taskId", "itemId", "type", "actor", "correlationId", "causationId", "sequence", "idempotencyKey", "payload" FROM "agent_events" WHERE')) {
+        const keys = Array.isArray(values[6]) ? values[6] as string[] : []
+        const lifeIdPrefix = String(values[7] ?? ""), lifeKeyPrefix = String(values[8] ?? "")
+        const policyId = String(values[9] ?? ""), policyKey = String(values[10] ?? "")
+        const visible = persistedEvents.filter(row => row.sessionId === values[0] && row.turnId === values[1] && row.taskId === values[2]
+          && (row.itemId === values[3] || row.correlationId === values[4] || row.itemId === values[5] || row.correlationId === values[5]
+            || keys.includes(String(row.idempotencyKey)) || String(row.id).startsWith(lifeIdPrefix)
+            || String(row.idempotencyKey).startsWith(lifeKeyPrefix) || row.id === policyId || row.idempotencyKey === policyKey))
+        return { rows: visible, rowCount: visible.length }
       }
       if (sql.startsWith('SELECT "id", "itemId", "type", "actor", "correlationId", "causationId", "sequence",') && sql.includes('FROM "agent_events" WHERE')) {
         const keys = Array.isArray(values[6]) ? values[6] as string[] : []
@@ -221,6 +237,26 @@ describe("child attempt durable resume", () => {
     expect(db.client.query.mock.calls.map(([sql]) => sql)).toContain("SELECT set_config($1, $2, true)")
   })
 
+  it("returns historical reserved-ID replay authority only with selected persisted revisions", async () => {
+    const child = lease(), input = { query: "Dublin" }, output = { jobs: [] }
+    const db = fakePool(child, [step(child)], [
+      item(child, { id: "call-item", revision: 2, content: { toolCallId: "toolcall-resume-1", toolName: "jobs.search", input } }),
+      item(child, { id: "result-item", revision: 3, type: "tool_result", content: { toolCallId: "toolcall-resume-1", output, errorCode: null } }),
+    ])
+
+    const restored = await loadChildAttemptResume(db.pool as never, child)
+    expect(restored?.observations).toEqual([{ id: "child-resume:result-item", content: {
+      toolCallId: "toolcall-resume-1", toolName: "jobs.search", input, status: "completed", output, errorCode: null,
+    } }])
+    expect(restored?.childToolReplayReceipts).toEqual([{
+      userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, taskId: child.id,
+      attempt: 1, stepId: "step-1", toolCallId: "toolcall-resume-1", toolName: "jobs.search", input,
+      callItem: { id: "call-item", revision: 2 }, resultItem: { id: "result-item", revision: 3 },
+      result: { status: "completed", output, errorCode: null },
+    }])
+    expect(restored?.childWaitReplayReceipts).toBeUndefined()
+  })
+
   it("trusts the live database lease after heartbeat extends beyond the lease snapshot expiry", async () => {
     const now = new Date("2026-10-29T16:00:00.000Z")
     const staleLease = lease({ leaseExpiresAt: new Date("2026-10-29T15:59:00.000Z") })
@@ -230,7 +266,7 @@ describe("child attempt durable resume", () => {
       resume: { nextOrdinal: 1, stepCount: 1 },
     })
     expect(db.calls.find(call => call.sql.includes('WHERE task."id" = $1 AND task."sessionId"'))?.sql)
-      .toContain('task."leaseExpiresAt" > CURRENT_TIMESTAMP')
+      .toContain('task."leaseExpiresAt" > clock_timestamp()')
   })
 
   it("checks first attempts for an acknowledged durable wait before returning no resume", async () => {
@@ -512,6 +548,12 @@ describe("child attempt durable resume", () => {
     mismatch.client.query.mockImplementation(async (sql: string, values: readonly unknown[] = []) => {
       mismatch.calls.push({ sql, values })
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.startsWith('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: child.sessionId }], rowCount: 1 }
+      if (sql.startsWith('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: child.turnId }], rowCount: 1 }
+      if (sql.startsWith('SELECT "id" FROM "sub_agent_tasks"')) {
+        const childLock = sql.includes('"rootTaskId" = $4')
+        return { rows: [{ id: childLock ? child.id : child.rootTaskId }], rowCount: 1 }
+      }
       if (sql.includes('SELECT task."id"')) return { rows: [{ ...currentRow(child), leaseOwner: "other-worker" }], rowCount: 1 }
       if (sql.includes('FROM "agent_steps"')) return { rows: [step(child, { taskId: "other-task" })], rowCount: 1 }
       return { rows: [], rowCount: 0 }

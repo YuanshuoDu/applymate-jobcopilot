@@ -83,6 +83,14 @@ function onStdinData(chunk) {
 }
 process.stdin.on("data", onStdinData)
 function say(value) { process.stdout.write(value + "\n") }
+function noReservationUsageAuthorization() {
+  return {
+    outputReservationRequired: false,
+    maxOutputTokens: null,
+    settle: async () => undefined,
+    settleUnknown: async (_settlement) => undefined,
+  }
+}
 const ARCHIVED_WAIT_PROGRESS_PHASES = new Set([
   "model_stream_entered", "tools_validated", "root_identity_validated", "child_create_started", "child_create_failed",
   "child_created", "child_claim_started", "child_claim_failed", "child_claimed", "child_finish_started",
@@ -324,9 +332,16 @@ const SOURCE_PROJECTION_ROLES = new Set(["scout", "analyst"])
 const SOURCE_PROJECTION_STATUSES = new Set(["completed", "partial"])
 const DIAGNOSTIC_COUNT_LIMIT = 99
 const CHILD_RUNTIME_SCOPE_DIAGNOSTIC_LIMIT = 12
+const CHILD_LEASE_SCOPE_DIAGNOSTIC_LIMIT = 12
+const CHILD_LEASE_SCOPE_PHASES = new Set([
+  "dispatch_context", "source_wait_state", "source_dispatch_state", "source_lookup", "source_verification",
+  "source_completion", "dependent_dispatch", "dependency_context", "follow_up_context", "child_outcome", "child_exception",
+  "diagnostic_limit_reached",
+])
 const RESTART_JOB_SOURCE_ENUMS = new Set(["greenhouse", "lever", "workday", "smartrecruiters", "personio", "jobs.read"])
 const RESTART_RESULT_STATUSES = new Set(["completed", "partial", "failed"])
 let childRuntimeScopeDiagnosticCount = 0
+let childLeaseScopeDiagnosticCount = 0
 function diagnosticEnum(value, allowlist) {
   if (value === null || value === undefined) return "missing"
   return typeof value === "string" && allowlist.has(value) ? value : "other"
@@ -336,6 +351,21 @@ function diagnosticCount(value) {
 }
 function fixtureScopeMatch(value, expected) {
   return typeof value === "string" && typeof expected === "string" ? value === expected : null
+}
+function childLeaseScopeDiagnostic(lease, phase) {
+  if (childLeaseScopeDiagnosticCount >= CHILD_LEASE_SCOPE_DIAGNOSTIC_LIMIT) return {
+    phase: "diagnostic_limit_reached",
+    leaseUserMatchesFixture: null,
+    leaseSessionMatchesFixture: null,
+    leaseTurnMatchesFixture: null,
+  }
+  childLeaseScopeDiagnosticCount++
+  return {
+    phase: CHILD_LEASE_SCOPE_PHASES.has(phase) ? phase : "other",
+    leaseUserMatchesFixture: fixtureScopeMatch(lease?.userId, ids.userId),
+    leaseSessionMatchesFixture: fixtureScopeMatch(lease?.sessionId, ids.sessionId),
+    leaseTurnMatchesFixture: fixtureScopeMatch(lease?.turnId, ids.turnId),
+  }
 }
 function emitChildRuntimeScopeDiagnostic(input) {
   if (childRuntimeScopeDiagnosticCount >= CHILD_RUNTIME_SCOPE_DIAGNOSTIC_LIMIT) return
@@ -1030,7 +1060,7 @@ async function startSelectedJobQueueWorker(runtime) {
       }
       const executor = createProductionChildExecutor({
         pool,
-        authorizeUsage: async () => ({ settle: async () => undefined }),
+        authorizeUsage: async () => noReservationUsageAuthorization(),
         modelRuntimeFactory: ({ task }) => {
           if (task.role === "writer") return selectedJobDraftModel(selected, task, observations)
           if (task.role === "reviewer") return selectedJobReviewerModel(selected, task, observations)
@@ -1348,7 +1378,7 @@ function waitArgs(key, taskIds) { return { idempotencyKey: key + ":" + ids.turnI
 async function startRuntime(workerOwnerId, resume) {
   return createCanonicalTurnRuntime(pool, {
     workerId: workerOwnerId, productionFlags: flags(), taskGraphCommandPort: createPgTaskGraphCommandPort(pool),
-    taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => ({ settle: async () => undefined }),
+    taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => noReservationUsageAuthorization(),
     modelRuntimeFactory() {
       let modelRounds = 0
       return { adapter: {
@@ -1426,7 +1456,7 @@ async function startDiscoveryRuntime(workerOwnerId, resume) {
     : undefined
   return createCanonicalTurnRuntime(pool, {
     workerId: workerOwnerId, productionFlags: flags(), taskGraphCommandPort: createPgTaskGraphCommandPort(pool),
-    taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => ({ settle: async () => undefined }),
+    taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => noReservationUsageAuthorization(),
     ...(stateLoader ? { stateLoader } : {}),
     modelRuntimeFactory() {
       let modelRounds = 0
@@ -1569,7 +1599,7 @@ async function startArchivedWaitRuntime(workerOwnerId, resume) {
   return createCanonicalTurnRuntime(pool, {
     workerId: workerOwnerId,
     productionFlags: { ...flags(), taskGraphPlanningEnabled: false },
-    authorizeUsage: async () => ({ settle: async () => undefined }),
+    authorizeUsage: async () => noReservationUsageAuthorization(),
     turnEngineStoreFactory(database, terminalGuard) {
       const base = createPgTurnEngineStore(database, terminalGuard)
       return new Proxy(base, { get(target, property, receiver) {
@@ -1742,7 +1772,7 @@ async function runSecondWorker() {
   const ownerId = "p3-process-restart-worker-" + process.pid, runtime = await startRuntime(ownerId, true)
   const { createProductionChildExecutor } = await import("./production-child-runtime.ts")
   const executeChild = createProductionChildExecutor({
-    pool, authorizeUsage: async () => ({ settle: async () => undefined }),
+    pool, authorizeUsage: async () => noReservationUsageAuthorization(),
     modelRuntimeFactory({ task }) {
       emitChildRuntimeScopeDiagnostic({ phase: "model", sessionId: task.sessionId, turnId: task.turnId,
         userId: task.userId, taskUserId: task.userId, leaseTaskId: task.id })
@@ -1788,6 +1818,7 @@ async function runSecondWorker() {
         catch { say("P3_RESTART_VERIFIER_EVIDENCE_DIAGNOSTIC " + JSON.stringify({ role, diagnosticUnavailable: true })) }
       }
       say("P3_CHILD_OUTCOME " + JSON.stringify({
+        ...childLeaseScopeDiagnostic(lease, "child_outcome"),
         role, status: outcome.status === "completed" || outcome.status === "failed" ? outcome.status : "other",
         failureCode: typeof rawFailure === "string" && CHILD_FAILURE_DIAGNOSTIC_CODES.has(rawFailure) ? rawFailure : rawFailure ? "other" : "none",
         hasResult: outcome.result !== undefined && outcome.result !== null,
@@ -1801,7 +1832,10 @@ async function runSecondWorker() {
         : rawCode === "40P01" ? "database_deadlock" : rawCode === "40001" ? "database_serialization"
           : rawCode.startsWith("p3_") ? "fixture_error" : "other"
       const errorName = error instanceof Error && CHILD_EXCEPTION_DIAGNOSTIC_NAMES.has(error.name) ? error.name : "other"
-      say("P3_CHILD_EXCEPTION " + JSON.stringify({ role, stage: "execute_child", errorName, failureCode }))
+      say("P3_CHILD_EXCEPTION " + JSON.stringify({
+        ...childLeaseScopeDiagnostic(lease, "child_exception"),
+        role, stage: "execute_child", errorName, failureCode,
+      }))
       throw error
     }
   }
@@ -1871,7 +1905,10 @@ async function runSecondWorker() {
           : rawCode === "40P01" ? "database_deadlock" : rawCode === "40001" ? "database_serialization"
           : rawCode.startsWith("p3_") ? "fixture_error" : "other"
         const errorName = error instanceof Error && CHILD_EXCEPTION_DIAGNOSTIC_NAMES.has(error.name) ? error.name : "other"
-        say("P3_CHILD_EXCEPTION " + JSON.stringify({ role, stage, errorName, failureCode }))
+        say("P3_CHILD_EXCEPTION " + JSON.stringify({
+          ...childLeaseScopeDiagnostic(lease, stage),
+          role, stage, errorName, failureCode,
+        }))
         throw error
       }
       return executeRestartChild(lease)
@@ -1904,7 +1941,7 @@ async function runDiscoverySecondWorker() {
   const runtime = await startDiscoveryRuntime(ownerId, true)
   const { createProductionChildExecutor } = await import("./production-child-runtime.ts")
   const executeChild = createProductionChildExecutor({
-    pool, authorizeUsage: async () => ({ settle: async () => undefined }),
+    pool, authorizeUsage: async () => noReservationUsageAuthorization(),
     modelRuntimeFactory({ task }) {
       let rounds = 0
       const callId = `p3-process-restart-discovery-read:${task.id}:${task.attemptCount}:415-555-0134`

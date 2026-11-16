@@ -38,6 +38,20 @@ function discoveryPolicy() {
 }
 
 describe("jobs.discover tool", () => {
+  it("accepts only the full composite ledger-key bound while keeping scope IDs capped", () => {
+    const tool = createJobsDiscoverTool({ client: { discover: vi.fn(async () => output) }, fence })
+    const registry = new ToolRegistry([tool as RuntimeToolDefinition])
+    const boundedOutput = { ...output, usage: { ...output.usage, ledgerKey: "l".repeat(1_284) } }
+
+    expect(() => registry.validators.validate(tool.outputSchema, boundedOutput, "jobs.discover output")).not.toThrow()
+    expect(() => registry.validators.validate(tool.outputSchema, {
+      ...boundedOutput, usage: { ...boundedOutput.usage, ledgerKey: `${boundedOutput.usage.ledgerKey}x` },
+    }, "jobs.discover output")).toThrow("jobs.discover output failed schema validation")
+    expect(() => registry.validators.validate(tool.outputSchema, {
+      ...boundedOutput, usage: { ...boundedOutput.usage, stepId: "s".repeat(257) },
+    }, "jobs.discover output")).toThrow("jobs.discover output failed schema validation")
+  })
+
   it("exposes only criteria as model input and keeps saved Job evidence in its output", async () => {
     const client: JobDiscoveryClient = { discover: vi.fn(async (_request: JobDiscoveryRequest) => output) }
     const tool = createJobsDiscoverTool({ client, fence })
@@ -79,6 +93,34 @@ describe("jobs.discover tool", () => {
     await expect(tool.execute(context({ actorRole: "orchestrator" }), input)).rejects.toMatchObject({ code: "job_discovery_context_unavailable" })
     expect(client.discover).not.toHaveBeenCalled()
     expect(onEffectiveCriteria).not.toHaveBeenCalled()
+  })
+
+  it("enforces the persisted nested Scout scope before discovery or footprint capture", async () => {
+    const client: JobDiscoveryClient = { discover: vi.fn(async () => output) }
+    const onEffectiveCriteria = vi.fn()
+    const nestedFence: JobDiscoveryExecutionFence = {
+      ...fence,
+      nestedScoutScope: { sourceSlice: ["greenhouse"], queries: [{
+        source: "greenhouse", targetRoles: ["Engineer"], targetLocations: ["Dublin"], maxPageSize: 5,
+      }] },
+    }
+    const tool = createJobsDiscoverTool({ client, fence: nestedFence, onEffectiveCriteria })
+
+    await expect(tool.execute(context(), { ...input, source: "lever" })).rejects.toMatchObject({ code: "nested_scout_scope_denied" })
+    await expect(tool.execute(context(), { ...input, targetRoles: ["Engineer", "Designer"] })).rejects.toMatchObject({ code: "nested_scout_scope_denied" })
+    await expect(tool.execute(context(), { ...input, pageSize: undefined })).rejects.toMatchObject({ code: "nested_scout_scope_denied" })
+    expect(client.discover).not.toHaveBeenCalled()
+    expect(onEffectiveCriteria).not.toHaveBeenCalled()
+
+    await expect(tool.execute(context(), { ...input, source: "greenhouse", pageSize: 5 })).resolves.toEqual(output)
+    expect(client.discover).toHaveBeenCalledOnce()
+  })
+
+  it("fails closed when a nested scope marker is present but malformed", async () => {
+    const client: JobDiscoveryClient = { discover: vi.fn(async () => output) }
+    const tool = createJobsDiscoverTool({ client, fence: { ...fence, nestedScoutScope: null } })
+    await expect(tool.execute(context(), input)).rejects.toMatchObject({ code: "nested_scout_scope_denied" })
+    expect(client.discover).not.toHaveBeenCalled()
   })
 
   it("captures only effective post-policy criteria while leaving the client cursor intact", async () => {

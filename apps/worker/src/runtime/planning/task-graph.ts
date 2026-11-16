@@ -1,9 +1,11 @@
 import type { SubagentTaskStatus } from "../subagents/types.js"
 import type { TaskGraphNativeDelegationMetadata } from "../subagents/task-graph-native-state.js"
 import { taskGraphVerificationRole, validateTaskGraphVerificationContract, type TaskGraphVerificationContract } from "./task-graph-verification.js"
+import { isValidTaskGraphRepairRelation } from "./task-graph-repair-relation.js"
 import { isTaskGraphBlocking, isTaskGraphEventType, isTaskGraphTerminal, sameTaskGraphEvent, taskGraphEventAllowed, taskGraphNextStatus } from "./task-graph-transition-rules.js"
 import { createScheduledPostGateTaskGraphAppender, hasScheduledTaskGraphPackageRefsShape, parseScheduledTaskGraphPackageRefs,
   parseTaskGraphProposalRepairOf, taskGraphProposalTextArray as textArray } from "./scheduled-post-gate-task-graph-append.js"
+export { isValidTaskGraphRepairRelation } from "./task-graph-repair-relation.js"
 export type TaskGraphNodeStatus = SubagentTaskStatus
 export type TaskGraphVerificationDisposition = "typed" | "legacy_unverified" | "specialized"
 export type TaskGraphRepairOf = Readonly<{ graphRootTaskId: string; nodeKey: string; taskId: string; criterionIds: string[] }>
@@ -88,17 +90,6 @@ function parseNode(value: unknown, index: number): TaskGraphNodeProposal | TaskG
     repairOf = parsed
   }
   return { key, templateId, goal, successCriteria: [...successCriteria], dependsOn: [...dependsOn], ...(Object.hasOwn(node, "verification") ? { verification: node.verification as TaskGraphVerificationContract } : {}), ...(repairOf ? { repairOf } : {}), ...(packageRefs.packageRefs ? { packageRefs: packageRefs.packageRefs } : {}) }
-}
-export function isValidTaskGraphRepairRelation(node: TaskGraphNodeProposal, target: TaskGraphNodeProposal & Readonly<{ taskId?: string; verificationDisposition?: TaskGraphVerificationDisposition }>): boolean {
-  const relation = node.repairOf, role = taskGraphVerificationRole(node.templateId)
-  const targetContract = validateTaskGraphVerificationContract(target.verification, target.templateId)
-  const repairContract = validateTaskGraphVerificationContract(node.verification, node.templateId)
-  if (!relation || !role || node.templateId !== target.templateId || relation.nodeKey !== target.key || relation.taskId !== target.taskId
-    || !relation.graphRootTaskId.trim() || target.verificationDisposition === "legacy_unverified" || target.verificationDisposition === "specialized"
-    || node.dependsOn.includes(target.key) || !targetContract.ok || !repairContract.ok
-    || new Set(relation.criterionIds).size !== relation.criterionIds.length || repairContract.contract.criteria.length !== relation.criterionIds.length) return false
-  const criteria = new Map(targetContract.contract.criteria.map(item => [item.id, item.check] as const))
-  return relation.criterionIds.every(id => criteria.has(id)) && repairContract.contract.criteria.every(item => relation.criterionIds.includes(item.id) && JSON.stringify(item.check) === JSON.stringify(criteria.get(item.id)))
 }
 function validateNodeVerification(node: TaskGraphNodeProposal, index: number, state: TaskGraphState): TaskGraphNodeProposal | TaskGraphFailure {
   const supported = taskGraphVerificationRole(node.templateId) !== undefined

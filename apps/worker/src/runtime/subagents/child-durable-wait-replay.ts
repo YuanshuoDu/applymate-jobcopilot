@@ -122,6 +122,12 @@ function failedConflict(call: { id: string; toolName: string }): ToolExecutionRe
   return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "failed", errorCode: "wait_conflict" }
 }
 
+export function isServerGeneratedFinalDependencyWait(input: Parameters<TurnEngineToolExecutor>[0]): boolean {
+  const origin = object(input.serverGeneratedFinalDependencyWait)
+  return !!origin && exactKeys(origin, ["stepId", "toolCallId"]) && origin.stepId === input.stepId
+    && origin.toolCallId === input.call.id && input.call.toolName === "wait_subagents" && input.call.toolVersion === "1"
+}
+
 /** Child-only single-use replay of a loader-validated wait after continuation acknowledgement. */
 export function createChildDurableWaitReplay(
   lease: SubagentLease, wait: DurableWaitResume, observations: readonly ContextSeedBlock[], claim?: ChildWaitClaimRecovery,
