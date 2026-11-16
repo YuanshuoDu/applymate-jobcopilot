@@ -79,7 +79,7 @@ function materializerFixture() {
         $executeRaw: async () => 1,
         $executeRawUnsafe: async () => 1,
         $queryRaw: async <T>(query: TemplateStringsArray | { sql: string }): Promise<T> => {
-          const sql = Array.isArray(query) ? query.join('?') : query.sql
+          const sql = 'sql' in query ? query.sql : query.join('?')
           if (sql.includes('pg_current_xact_id()::text AS transaction_id')) return [{ transaction_id: '17' }] as T
           if (sql.includes('FROM "agent_sessions"')) return [{ id: executionFence.sessionId, status: 'running' }] as T
           if (sql.includes('FROM "agent_turns"')) return [{ id: executionFence.turnId, rootTaskId: executionFence.rootTaskId, status: 'in_progress' }] as T
