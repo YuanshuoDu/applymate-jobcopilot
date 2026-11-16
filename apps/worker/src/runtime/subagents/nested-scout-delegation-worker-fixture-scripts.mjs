@@ -253,11 +253,22 @@ function childModelRuntime({ task, runtime, markerState }) {
         yield completed(); return
       }
     }
-    const jobs = candidates.map(candidate => ({
-      candidate,
-      result: outputFor(request, "jobs.get", { jobId: candidate?.jobId }, "p1143_parent_job_read_failed"),
-    }))
-    if (jobs.length !== 2 || jobs.some(item => object(object(item.result)?.job)?.id !== item.candidate?.jobId)) throw new Error("p1143_parent_current_reads_missing")
+    const jobs = candidates.map(candidate => {
+      const receipt = findExactToolResult(request, { name: "jobs.get", input: { jobId: candidate?.jobId } })
+      if (receipt?.isError) throw new Error("p1143_parent_job_read_failed")
+      return { candidate, receipt, result: receipt?.output ?? null }
+    })
+    if (jobs.length !== 2 || jobs.some(item => object(object(item.result)?.job)?.id !== item.candidate?.jobId)) {
+      const flag = value => value ? "yes" : "no"
+      const count = jobs.length > 2 ? "3_plus" : String(jobs.length)
+      const readStates = jobs.slice(0, 2).map(({ candidate, receipt, result }) => {
+        const job = object(object(result)?.job), hasCandidateId = typeof candidate?.jobId === "string" && candidate.jobId.length > 0
+        const hasResultId = typeof job?.id === "string" && job.id.length > 0
+        return `candidate_id=${flag(hasCandidateId)},result=${flag(!!receipt)},error=${flag(receipt?.isError === true)},job=${flag(!!job)},result_id=${flag(hasResultId)},id_match=${flag(hasCandidateId && hasResultId && job.id === candidate.jobId)}`
+      })
+      say(`P1143_PARENT_CURRENT_READS_DIAGNOSTIC:count=${count}:read1=${readStates[0] ?? "absent"}:read2=${readStates[1] ?? "absent"}`)
+      throw new Error("p1143_parent_current_reads_missing")
+    }
     parentResumeStage = "parent_role_result"; const evidence = jobs.map(({ candidate, result }) => ({ id: `model-read:${candidate?.jobId}`, kind: "job", ref: candidate?.jobId, source: object(object(result)?.job)?.source }))
     yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
       candidates: jobs.map(({ candidate, result }) => ({ jobId: candidate?.jobId, source: object(object(result)?.job)?.source,
