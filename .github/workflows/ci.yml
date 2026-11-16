@@ -600,6 +600,21 @@ jobs:
             src/lib/agent/control-plane/agent-root-usage-reservations.pg.integration.test.ts
       - name: Build Worker workspace before focused test
         run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Verify Web and Worker source material fences on disposable PostgreSQL
+        env:
+          CI: "true"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "$DATABASE_URL"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
+            src/db/source-material-fence.pg.integration.test.ts
       - name: Verify fair child-wait reconciliation on disposable PostgreSQL
         env:
           CI: "true"

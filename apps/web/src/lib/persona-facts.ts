@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { acquireSourceMaterialFence } from '@/lib/agent/source-material-fence'
 import { Prisma } from '@prisma/client'
 import type { PersonaField } from '@/lib/persona'
 
@@ -90,6 +91,7 @@ export async function listDiscoveryPersonaFacts(userId: string, client: typeof d
 
 export async function confirmPersonaFacts(userId: string, fields: PersonaField[], client: typeof db = db): Promise<PersonaField[]> {
   await client.$transaction(async tx => {
+    await acquireSourceMaterialFence(tx, [userId])
     await lockPersonaFacts(tx, userId)
     for (const field of fields) {
       const normalizedValue = normalized(field.value)
@@ -137,6 +139,7 @@ export async function setDiscoveryPersonaFactConsent(
   client: typeof db = db,
 ): Promise<DiscoveryPersonaFactConsentResult> {
   return client.$transaction(async tx => {
+    await acquireSourceMaterialFence(tx, [userId])
     await lockPersonaFacts(tx, userId)
     const row = await tx.personaFact.findFirst({
       where: { id: input.factId, userId },
@@ -174,6 +177,7 @@ export async function setDiscoveryPersonaFactConsent(
 
 export async function revokePersonaFact(userId: string, key: string, client: typeof db = db) {
   await client.$transaction(async tx => {
+    await acquireSourceMaterialFence(tx, [userId])
     await lockPersonaFacts(tx, userId)
     const now = new Date()
     const rows = await tx.personaFact.findMany({

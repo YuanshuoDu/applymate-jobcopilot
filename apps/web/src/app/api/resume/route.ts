@@ -5,6 +5,7 @@
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { acquireSourceMaterialFence } from '@/lib/agent/source-material-fence'
 
 export async function GET() {
   const auth = await requireAuth()
@@ -35,31 +36,35 @@ export async function POST(req: NextRequest) {
   const { name, content, templateId, isDefault, directionId, kind, origin } = body
   if (!name || !content) return err('name and content are required')
 
-  if (directionId) {
-    const dir = await db.direction.findFirst({ where: { id: directionId, userId: auth.userId } })
-    if (!dir) return err('Invalid directionId', 400)
-  }
+  return db.$transaction(async tx => {
+    await acquireSourceMaterialFence(tx, [auth.userId])
 
-  // If setting as default, unset others
-  if (isDefault) {
-    await db.resume.updateMany({
-      where: { userId: auth.userId },
-      data:  { isDefault: false },
+    if (directionId) {
+      const dir = await tx.direction.findFirst({ where: { id: directionId, userId: auth.userId } })
+      if (!dir) return err('Invalid directionId', 400)
+    }
+
+    // If setting as default, unset others
+    if (isDefault) {
+      await tx.resume.updateMany({
+        where: { userId: auth.userId },
+        data:  { isDefault: false },
+      })
+    }
+
+    const resume = await tx.resume.create({
+      data: {
+        userId:      auth.userId,
+        name,
+        content,
+        templateId:  templateId  ?? null,
+        isDefault:   isDefault   ?? false,
+        directionId: directionId ?? null,
+        kind:        kind        ?? 'base',
+        origin:      origin      ?? 'manual',
+      },
     })
-  }
 
-  const resume = await db.resume.create({
-    data: {
-      userId:      auth.userId,
-      name,
-      content,
-      templateId:  templateId  ?? null,
-      isDefault:   isDefault   ?? false,
-      directionId: directionId ?? null,
-      kind:        kind        ?? 'base',
-      origin:      origin      ?? 'manual',
-    },
+    return ok(resume, 201)
   })
-
-  return ok(resume, 201)
 }
