@@ -9,7 +9,7 @@ import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import { taskGraphItemId, taskGraphLifecycleKey, taskGraphWaitLifecycleKey } from "./task-graph-snapshot.js"
 import { loadChildAttemptResume } from "./child-resume.js"
 // @ts-expect-error The fixture-only JavaScript module has no declaration; Worker Vitest resolves this import at runtime.
-import { parentResumeFixtureErrorClass } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
+import { isSafeParentResumeDiagnostic, parentResumeFixtureErrorClass } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 import { waitResolverErrorCodesFromOutput } from "./nested-scout-wait-resolver-diagnostic.js"
 import type { SubagentLease } from "./types.js"
 
@@ -73,16 +73,6 @@ const SAFE_RECOVERY_ERROR_CODES = [
 ] as const
 const SAFE_RECOVERY_DIAGNOSTIC_MARKERS = new Set(SAFE_RECOVERY_STAGES.flatMap(stage =>
   SAFE_RECOVERY_ERROR_CODES.map(code => `P1143_RECOVERY_ERROR:${stage}:${code}`)))
-const SAFE_PARENT_RESUME_STAGES = [
-  "model_stream_started", "discovery_result", "source_scope_result", "alpha_delegate_result", "step_fence_replay",
-  "beta_delegate_result", "wait_input_parse", "wait_result_lookup", "wait_context_marker", "scout_results_lookup",
-  "join_report", "joined_result_validation", "parent_job_reads", "parent_role_result",
-] as const
-const SAFE_PARENT_RESUME_ERROR_CLASSES = [
-  "invalid_output", "model_execution_failed", "tool_execution_failed", "turn_execution_failed", "persistence_conflict",
-  "step_limit", "budget_exhausted", "no_progress", "parent_job_read_failed", "parent_current_reads_missing",
-  "tool_pair_request_invalid", "tool_pair_call_invalid", "wait_input_invalid", "error", "non_error", "unknown",
-] as const
 const SAFE_CHILD_RESUME_LOADER_CODES = [
   ...SAFE_RECOVERY_ERROR_CODES, "wait_invalid", "wait_scope_error", "wait_conflict",
   ...`owner_mismatch lease_expired wait_tool_call_conflict wait_step_lineage wait_lineage invalid_wait_result step_lineage item_lineage step_limit item_limit usage_overflow
@@ -129,12 +119,6 @@ function progressQuery<Row extends QueryResultRow>(text: string, values: unknown
 function isSafeRootSetupDiagnostic(value: string): boolean {
   const match = value.match(/^P1143_ROOT_(MODEL_RUNTIME_FACTORY|USAGE_AUTHORIZER)_ERROR:([A-Za-z0-9_]+)$/)
   return !!match && SAFE_RECOVERY_ERROR_CODES.includes(match[2] as typeof SAFE_RECOVERY_ERROR_CODES[number])
-}
-
-function isSafeParentResumeDiagnostic(value: string): boolean {
-  const match = value.match(/^P1143_PARENT_RESUME_ERROR:([a-z_]+):([a-z_]+)$/)
-  return !!match && SAFE_PARENT_RESUME_STAGES.includes(match[1] as typeof SAFE_PARENT_RESUME_STAGES[number])
-    && SAFE_PARENT_RESUME_ERROR_CLASSES.includes(match[2] as typeof SAFE_PARENT_RESUME_ERROR_CLASSES[number])
 }
 
 function isSafeChildResumeLoaderDiagnostic(value: string): boolean {
@@ -972,36 +956,6 @@ function disposableUrl(): string | null {
 const databaseUrl = disposableUrl()
 const describePg = databaseUrl ? describe : describe.skip
 let pool: Pool
-
-describe("nested Scout parent resume diagnostics", () => {
-  it("maps only the fixed fixture sentinels and keeps safe code precedence", () => {
-    expect(parentResumeFixtureErrorClass(new Error("p1143_parent_job_read_failed"))).toBe("parent_job_read_failed")
-    expect(parentResumeFixtureErrorClass(new Error("p1143_parent_current_reads_missing"))).toBe("parent_current_reads_missing")
-    expect(parentResumeFixtureErrorClass(new Error("p1143_fixture_tool_pair_request_invalid"))).toBe("tool_pair_request_invalid")
-    expect(parentResumeFixtureErrorClass(new Error("p1143_fixture_tool_pair_call_invalid"))).toBe("tool_pair_call_invalid")
-    expect(parentResumeFixtureErrorClass(new Error("p1143_fixture_wait_input_invalid"))).toBe("wait_input_invalid")
-    expect(parentResumeFixtureErrorClass(Object.assign(new Error("p1143_parent_job_read_failed"), { code: "turn_execution_failed" })))
-      .toBe("turn_execution_failed")
-    expect(parentResumeFixtureErrorClass(new Error("private failure details"))).toBe("error")
-  })
-
-  it("accepts the fixed parent job-read error classes", () => {
-    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:parent_job_read_failed")).toBe(true)
-    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:parent_current_reads_missing")).toBe(true)
-    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:tool_pair_request_invalid")).toBe(true)
-    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:tool_pair_call_invalid")).toBe(true)
-    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:wait_input_invalid")).toBe(true)
-  })
-
-  it("rejects unlisted classes and raw fixture sentinels", () => {
-    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:other_error")).toBe(false)
-    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:p1143_parent_job_read_failed")).toBe(false)
-    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:p1143_parent_current_reads_missing")).toBe(false)
-    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:p1143_fixture_tool_pair_request_invalid")).toBe(false)
-    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:p1143_fixture_tool_pair_call_invalid")).toBe(false)
-    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:p1143_fixture_wait_input_invalid")).toBe(false)
-  })
-})
 
 function launch(mode: "park" | "crash-child" | "resume", ids: FixtureIds): FixtureProcess {
   const child = spawn(process.execPath, ["--import", "tsx", PROCESS_FIXTURE, mode, JSON.stringify(ids)], {
