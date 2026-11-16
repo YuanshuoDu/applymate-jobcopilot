@@ -8,6 +8,8 @@ import { projectWaitCallCompletionPayload } from "../turns/turn-execution-wait-e
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import { taskGraphItemId, taskGraphLifecycleKey, taskGraphWaitLifecycleKey } from "./task-graph-snapshot.js"
 import { loadChildAttemptResume } from "./child-resume.js"
+// @ts-expect-error The fixture-only JavaScript module has no declaration; Worker Vitest resolves this import at runtime.
+import { isSafeParentResumeDiagnostic, parentResumeFixtureErrorClass } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 import { waitResolverErrorCodesFromOutput } from "./nested-scout-wait-resolver-diagnostic.js"
 import type { SubagentLease } from "./types.js"
 
@@ -71,15 +73,6 @@ const SAFE_RECOVERY_ERROR_CODES = [
 ] as const
 const SAFE_RECOVERY_DIAGNOSTIC_MARKERS = new Set(SAFE_RECOVERY_STAGES.flatMap(stage =>
   SAFE_RECOVERY_ERROR_CODES.map(code => `P1143_RECOVERY_ERROR:${stage}:${code}`)))
-const SAFE_PARENT_RESUME_STAGES = [
-  "model_stream_started", "discovery_result", "source_scope_result", "alpha_delegate_result", "step_fence_replay",
-  "beta_delegate_result", "wait_input_parse", "wait_result_lookup", "wait_context_marker", "scout_results_lookup",
-  "join_report", "joined_result_validation", "parent_job_reads", "parent_role_result",
-] as const
-const SAFE_PARENT_RESUME_ERROR_CLASSES = [
-  "invalid_output", "model_execution_failed", "tool_execution_failed", "turn_execution_failed", "persistence_conflict",
-  "step_limit", "budget_exhausted", "no_progress", "error", "non_error", "unknown",
-] as const
 const SAFE_CHILD_RESUME_LOADER_CODES = [
   ...SAFE_RECOVERY_ERROR_CODES, "wait_invalid", "wait_scope_error", "wait_conflict",
   ...`owner_mismatch lease_expired wait_tool_call_conflict wait_step_lineage wait_lineage invalid_wait_result step_lineage item_lineage step_limit item_limit usage_overflow
@@ -126,12 +119,6 @@ function progressQuery<Row extends QueryResultRow>(text: string, values: unknown
 function isSafeRootSetupDiagnostic(value: string): boolean {
   const match = value.match(/^P1143_ROOT_(MODEL_RUNTIME_FACTORY|USAGE_AUTHORIZER)_ERROR:([A-Za-z0-9_]+)$/)
   return !!match && SAFE_RECOVERY_ERROR_CODES.includes(match[2] as typeof SAFE_RECOVERY_ERROR_CODES[number])
-}
-
-function isSafeParentResumeDiagnostic(value: string): boolean {
-  const match = value.match(/^P1143_PARENT_RESUME_ERROR:([a-z_]+):([a-z_]+)$/)
-  return !!match && SAFE_PARENT_RESUME_STAGES.includes(match[1] as typeof SAFE_PARENT_RESUME_STAGES[number])
-    && SAFE_PARENT_RESUME_ERROR_CLASSES.includes(match[2] as typeof SAFE_PARENT_RESUME_ERROR_CLASSES[number])
 }
 
 function isSafeChildResumeLoaderDiagnostic(value: string): boolean {
