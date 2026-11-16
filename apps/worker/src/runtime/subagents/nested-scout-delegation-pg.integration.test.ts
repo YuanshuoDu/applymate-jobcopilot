@@ -8,6 +8,7 @@ import { projectWaitCallCompletionPayload } from "../turns/turn-execution-wait-e
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import { taskGraphItemId, taskGraphLifecycleKey, taskGraphWaitLifecycleKey } from "./task-graph-snapshot.js"
 import { loadChildAttemptResume } from "./child-resume.js"
+// @ts-expect-error The fixture-only JavaScript module has no declaration; Worker Vitest resolves this import at runtime.
 import { parentResumeFixtureErrorClass } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 import { waitResolverErrorCodesFromOutput } from "./nested-scout-wait-resolver-diagnostic.js"
 import type { SubagentLease } from "./types.js"
