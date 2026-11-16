@@ -9,7 +9,9 @@ import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import { taskGraphItemId, taskGraphLifecycleKey, taskGraphWaitLifecycleKey } from "./task-graph-snapshot.js"
 import { loadChildAttemptResume } from "./child-resume.js"
 // @ts-expect-error The fixture-only JavaScript module has no declaration; Worker Vitest resolves this import at runtime.
-import { isSafeParentResumeDiagnostic, parentResumeFixtureErrorClass } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
+import {
+  isSafeParentCurrentReadsDiagnostic, isSafeParentResumeDiagnostic, parentResumeFixtureErrorClass,
+} from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 import { waitResolverErrorCodesFromOutput } from "./nested-scout-wait-resolver-diagnostic.js"
 import type { SubagentLease } from "./types.js"
 
@@ -130,7 +132,7 @@ function isSafeChildResumeLoaderDiagnostic(value: string): boolean {
 function seenMainProgress(output: string[]) {
   return [...new Set(output.filter(value => MAIN_PROGRESS_MARKERS.has(value)
     || SAFE_RECOVERY_DIAGNOSTIC_MARKERS.has(value) || isSafeChildResumeLoaderDiagnostic(value)
-    || isSafeRootSetupDiagnostic(value) || isSafeParentResumeDiagnostic(value)))]
+    || isSafeRootSetupDiagnostic(value) || isSafeParentResumeDiagnostic(value) || isSafeParentCurrentReadsDiagnostic(value)))]
 }
 
 async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {

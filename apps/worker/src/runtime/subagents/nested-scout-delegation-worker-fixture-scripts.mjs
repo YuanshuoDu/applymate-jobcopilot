@@ -31,6 +31,11 @@ export function isSafeParentResumeDiagnostic(value) {
   return !!match && SAFE_PARENT_RESUME_STAGES.includes(match[1])
     && SAFE_PARENT_RESUME_ERROR_CLASSES.includes(match[2])
 }
+export function isSafeParentCurrentReadsDiagnostic(value) {
+  const match = value.match(/^P1143_PARENT_CURRENT_READS_DIAGNOSTIC:count=(0|1|2|3_plus):read1=([a-z0-9_,=]+):read2=([a-z0-9_,=]+)$/)
+  const readState = /^(?:candidate_id=(?:yes|no),result=(?:yes|no),error=(?:yes|no),job=(?:yes|no),result_id=(?:yes|no),id_match=(?:yes|no)|absent)$/
+  return !!match && readState.test(match[2]) && readState.test(match[3])
+}
 
 export function createNestedScoutFixtureScripts({ mode, profile, ids, pool, say, pauseSubagentClaims, reportParentJoinState }) {
 const discoverInput = { targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], source: "greenhouse", pageSize: 10 }; const deniedSourceInput = { goal: "Try to escape the discovered source", sourceSlice: ["lever"] }
