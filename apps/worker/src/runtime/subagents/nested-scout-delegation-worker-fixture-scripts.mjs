@@ -5,11 +5,15 @@ import { findExactToolResult, findUniqueWaitInput } from "./nested-scout-fixture
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null }
 const SAFE_PARENT_RESUME_ERROR_CODES = new Set("invalid_output model_execution_failed tool_execution_failed turn_execution_failed persistence_conflict step_limit budget_exhausted no_progress".split(" "))
+const SAFE_PARENT_RESUME_FIXTURE_ERROR_CLASSES = new Map([
+  ["p1143_parent_job_read_failed", "parent_job_read_failed"], ["p1143_parent_current_reads_missing", "parent_current_reads_missing"],
+  ["p1143_fixture_tool_pair_request_invalid", "tool_pair_request_invalid"], ["p1143_fixture_tool_pair_call_invalid", "tool_pair_call_invalid"],
+  ["p1143_fixture_wait_input_invalid", "wait_input_invalid"],
+])
 export function parentResumeFixtureErrorClass(error) { try {
   const code = object(error)?.code
   if (typeof code === "string" && SAFE_PARENT_RESUME_ERROR_CODES.has(code)) return code
-  if (error instanceof Error) return error.message === "p1143_parent_job_read_failed" ? "parent_job_read_failed"
-    : error.message === "p1143_parent_current_reads_missing" ? "parent_current_reads_missing" : "error"
+  if (error instanceof Error) return SAFE_PARENT_RESUME_FIXTURE_ERROR_CLASSES.get(error.message) ?? "error"
   return "non_error"
 } catch { return "unknown" } }
 
