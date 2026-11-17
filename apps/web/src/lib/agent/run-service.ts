@@ -1,6 +1,5 @@
 import { db } from "@/lib/db";
-import { PipelineInterruptedError, runPipeline } from "@/lib/agent/pipeline";
-import { AgentPauseError } from "@/lib/agent/orchestrator";
+import { runPipeline } from "@/lib/agent/pipeline";
 import { createRunSessionRecorder } from "@/lib/agent/session/run-recorder";
 import { isRuntimeAgentHarnessFeatureEnabled } from "@/lib/runtime-feature-flags";
 import { resumeToText, type RunReport } from "@/lib/agent/types";
@@ -8,26 +7,22 @@ import { loadRoleConfigs, toRoleConfigMap } from "@/lib/agent/role-config";
 import { pipelineAgentConfigFrom } from "@/app/api/agent/run/run-helpers";
 import { automationRunOverrides, withAutomationOverrides } from "@/lib/agent/automation-overrides";
 import { AgentExecutionCancelledError, claimAgentExecution, ensureAgentExecution, saveExecutionCheckpoint } from "@/lib/agent/execution-control";
-import { checkpointState, createDurableEventWriter, createRunAttemptOwnership, isActiveAccount, saveHistory } from "@/lib/agent/run-service-helpers";
+import { checkpointState, createDurableEventWriter, createRunAttemptOwnership, handleAgentPipelineFailure, isActiveAccount, saveHistory, type RunHistoryEvent } from "@/lib/agent/run-service-helpers";
 import type { AiConfig } from "@/lib/model-router";
 import type { ResumeContent } from "@/lib/types";
 import type { V2TurnSource } from "@/lib/agent/session/v2-turn";
 import { parseScheduledAutomationSnapshot } from "@/lib/agent/scheduled-automation-snapshot";
 import { scheduledTaskGraphContinuationKey } from "@/lib/agent/scheduled-taskgraph-pipeline-checkpoint";
 import { finishScheduledTaskGraphExecution, persistScheduledTaskGraphWaitMarker, saveScheduledTaskGraphCheckpoint, scheduledTaskGraphClaimMatches } from "@/lib/agent/scheduled-taskgraph-pipeline-fence";
-import { scheduledTaskGraphRecorderLifecycleOptions, scheduledTaskGraphRunCheckpointIsCurrent, scheduledTaskGraphRunContext, scheduledTaskGraphRunOwnerFence, type ScheduledTaskGraphRunInput } from "@/lib/agent/scheduled-taskgraph-audit-action";
+import { scheduledTaskGraphRecorderLifecycleOptions, scheduledTaskGraphRunContext, scheduledTaskGraphRunOwnerFence, type ScheduledTaskGraphRunInput } from "@/lib/agent/scheduled-taskgraph-audit-action";
 import type { PipelineCtx } from "@/lib/agent/pipeline-context";
-import { buildScheduledTaskGraphGateResumeState, runScheduledTaskGraphAnalyzeOnly, serializeScheduledTaskGraphCheckpoint, type ScheduledTaskGraphAnalyzeCheckpointProof } from "@/lib/agent/scheduled-taskgraph-run-service";
-import { scheduledTaskGraphExecuteGateCompletionProof } from "@/lib/agent/scheduled-taskgraph-gate-rpc";
-type HistoryEvent = { event: string; at: string; data: unknown };
+import { assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent, prepareRunResumeState, runScheduledTaskGraphAnalyzeOnly, serializeScheduledTaskGraphCheckpoint, type ScheduledTaskGraphAnalyzeCheckpointProof } from "@/lib/agent/scheduled-taskgraph-run-service";
 export type ScheduledTaskGraphWaitResult = { status: "waiting_for_user"; waitId: string; stage: string };
 export interface AgentPipelineRunInput {
   userId: string;
   aiConfig: AiConfig;
-  sessionId?: string;
-  executionId?: string;
-  turnId?: string;
-  legacyTurnId?: string;
+  sessionId?: string; executionId?: string;
+  turnId?: string; legacyTurnId?: string;
   questionId?: string;
   workerTaskId?: string;
   expectedAttemptCount?: number;
@@ -38,7 +33,7 @@ export interface AgentPipelineRunInput {
   scheduledTaskGraph?: ScheduledTaskGraphRunInput;
 }
 export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<RunReport | ScheduledTaskGraphWaitResult | ScheduledTaskGraphAnalyzeCheckpointProof | { status: "gate_checkpointed" } | null> {
-  const startedAt = Date.now(), events: HistoryEvent[] = [];
+  const startedAt = Date.now(), events: RunHistoryEvent[] = [];
   const dualWrite = await isRuntimeAgentHarnessFeatureEnabled(
     "AGENT_PROTOCOL_V2_DUAL_WRITE",
     input.userId,
@@ -82,7 +77,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
           : {}),
       })
   if (attemptCount === null) return null
-  const { isCurrentAttempt, finishAttempt, canPublishAttemptResult, recorderOwner } = createRunAttemptOwnership({
+  const { isCurrentAttempt, finishAttempt, canPublishAttemptResult, recorderOwner, cleanupAnalyzeSourceChanged } = createRunAttemptOwnership({
     id: execution.id, userId: input.userId, sessionId: recorder.sessionId, attemptCount,
     turnId: recorder.getTurnId, signal: input.signal,
   })
@@ -214,33 +209,14 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
         if (scheduled) scheduledState = persistedCheckpoint;
       },
     };
-    let resumeState = checkpointState(execution.state)
     if (scheduled && scheduled.prepareProof === undefined) {
       const checkpointProof = await runScheduledTaskGraphAnalyzeOnly({ ...scheduled, context: pipelineInput,
         state: scheduledState, onStateChange: state => { scheduledState = state; } });
       await eventWriter.drain();
       return checkpointProof;
     }
-    if (scheduled) {
-      const gateProof = scheduledTaskGraphExecuteGateCompletionProof(scheduled.gateCompletionProof)
-      const gate = gateProof?.gate as { taskId: string; attemptCount: number } | undefined
-      const gateProofInput = { owner: scheduled.owner, snapshot: scheduled.snapshot, analyzeCheckpoint: scheduledState,
-        analyzeAttestation: scheduled.attestation, prepareProof: scheduled.prepareProof,
-        ...(gate ? { gate: { ...gate, phase: "completed" as const, completionProof: scheduled.gateCompletionProof } } : {}) };
-      const gateResumeState = await buildScheduledTaskGraphGateResumeState({ owner: scheduled.owner, snapshot: scheduled.snapshot,
-        attestation: scheduled.attestation, continuationKey: scheduled.continuationKey, claimToken: scheduled.claimToken,
-        ownedJobs: scheduled.ownedJobs, persistedCheckpoint: scheduledState, prepareProof: scheduled.prepareProof,
-        ...(scheduled.action === "scheduled_audit_execute" ? { auditActor: scheduled.auditActor } : {}),
-        ...(scheduled.gateCompletionProof !== undefined ? { gateCompletionProof: scheduled.gateCompletionProof } : {}),
-        ...(scheduled.scheduledWaitId ? { scheduledWaitId: scheduled.scheduledWaitId } : {}) })
-      const safeCheckpoint = serializeScheduledTaskGraphCheckpoint(gateResumeState)
-      if (!safeCheckpoint || !await saveScheduledTaskGraphCheckpoint({ expectedState: scheduledState, state: safeCheckpoint,
-        owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken,
-        assertOwnerCurrent: tx => scheduledTaskGraphRunCheckpointIsCurrent({ scheduled, proofInput: gateProofInput,
-          tx, assertOwnerCurrent: assertScheduledOwnerCurrent }) })) throw new AgentExecutionCancelledError()
-      scheduledState = safeCheckpoint
-      resumeState = gateResumeState
-    }
+    const preparedResume = await prepareRunResumeState({ executionState: execution.state, scheduledState, scheduled, assertScheduledOwnerCurrent, assertScheduledAnalyzeSourcesCurrent: tx => assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent(tx, pipelineInput, scheduledState) }); scheduledState = preparedResume.scheduledState
+    const resumeState = preparedResume.resumeState
     if (scheduled?.prepareProof !== undefined && scheduled.gateCompletionProof === undefined) { await eventWriter.drain(); return { status: "gate_checkpointed" } }
     const report = await runPipeline(scheduledTaskGraphRunContext(pipelineInput, resumeState, scheduled));
     const finished = await finishOwnedAttempt("completed")
@@ -259,42 +235,16 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
     await saveHistory(input.userId, events, startedAt, report);
     return report;
   } catch (error) {
-    if (error instanceof AgentExecutionCancelledError) {
-      await eventWriter.drain(); return null
-    }
-    if (error instanceof AgentPauseError) {
-      await eventWriter.drain()
-      if (scheduled && scheduledQuestionPersistenceFailed) return null;
-      if (!await isCurrentAttempt()) return null
-      if (scheduled && !await scheduledOwnerIsCurrent()) return null;
-      const owner = recorderOwner("running", "waiting_for_user")
-      if (!owner) return null
-      const saved = await recorder.pause(
-        `Waiting for your answer at ${error.stage}.`,
-        error.stage as "scout" | "analyst" | "writer" | "reviewer" | "executor" | "auditor",
-        owner,
-      )
-      if (!saved) return null
-      if (scheduled) return { status: "waiting_for_user", waitId: error.questionId, stage: error.stage };
-      return null
-    }
-    if (error instanceof PipelineInterruptedError) {
-      await eventWriter.drain(); return null
-    }
-    const message = error instanceof Error ? error.message : "Agent run failed"
-    if (!await isCurrentAttempt()) {
-      await eventWriter.drain()
-      return null
-    }
-    const failed = await finishOwnedAttempt("failed", message)
-    if (!failed || !await canPublishAttemptResult("failed")) {
-      await eventWriter.drain()
-      return null
-    }
-    emit("error", { message });
-    await eventWriter.drain()
-    if (!await finalize("failed", null)) return null
-    await saveHistory(input.userId, events, startedAt, null, true);
-    return null;
+    const outcome = await handleAgentPipelineFailure({
+      error, scheduled: Boolean(scheduled), signal: input.signal, scheduledQuestionPersistenceFailed,
+      cleanupAnalyzeSourceChanged,
+      drainEvents: eventWriter.drain, isCurrentAttempt, scheduledOwnerIsCurrent,
+      recorderOwner, pause: (message, stage, owner) => recorder.pause(message,
+        stage as "scout" | "analyst" | "writer" | "reviewer" | "executor" | "auditor", owner),
+      finishAttempt: finishOwnedAttempt, canPublish: canPublishAttemptResult, emit, finalize,
+      saveFailedHistory: () => saveHistory(input.userId, events, startedAt, null, true),
+    })
+    if (outcome.kind === "throw") throw outcome.error
+    return outcome.result
   }
 }

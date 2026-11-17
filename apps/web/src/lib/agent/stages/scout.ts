@@ -6,6 +6,7 @@ import { resolveLocations, buildLocationWhere, locationSummary } from '@/lib/age
 import type { PipelineCtx, ScoutOutput, StageResult, AcceptResult } from '../types'
 import { stageOk, stageFail } from '../types'
 import { AgentExecutionCancelledError, refreshAgentExecutionAttempt } from '../execution-control'
+import { findAnalyzeSourceChangedJobIds } from './analyze-ownership'
 
 function assertSignalActive(ctx: PipelineCtx): void {
   if (ctx.signal?.aborted) throw new AgentExecutionCancelledError()
@@ -141,8 +142,6 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
     }
 
     // ── Phase B: Load saved jobs with DB-level location filter ────────────────
-    // Uses resolved location terms — "Ireland" expands to Dublin/Cork/Galway/etc.
-    // Filter is applied at Prisma WHERE level, not post-JS-filter.
 
     const excludeSet  = new Set(agentCfg.excludeCompanies.map(c => c.toLowerCase().trim()))
     const prioritySet = new Set(agentCfg.priorityCompanies.map(c => c.toLowerCase().trim()))
@@ -180,6 +179,8 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
     })
     assertSignalActive(ctx)
 
+    const sourceChangedJobIds = await findAnalyzeSourceChangedJobIds(userId, allSaved.map(job => job.id))
+
     const todayStart = new Date()
     todayStart.setUTCHours(0, 0, 0, 0)
 
@@ -187,7 +188,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
       // Priority companies always pass
       if (prioritySet.has(job.company.toLowerCase().trim())) return true
       // Skip already scored today (dedup)
-      if (job.score !== null && job.updatedAt >= todayStart) return false
+      if (job.score !== null && job.updatedAt >= todayStart && !sourceChangedJobIds.has(job.id)) return false
       return true
     })
 
