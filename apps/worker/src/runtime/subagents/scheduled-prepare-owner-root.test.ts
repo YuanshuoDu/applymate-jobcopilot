@@ -1,11 +1,18 @@
+import { createHash } from "node:crypto"
 import { describe, expect, it, vi } from "vitest"
 import { scheduledPrepareReceiptOwnerRootMatches } from "./scheduled-prepare-owner-root.js"
 import { SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE } from "./scheduled-audit-contract.js"
+import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 
 const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1" }
 const owner = { ...scope, rootAttemptCount: 3 }
 const audit = { id: "audit-1", role: SCHEDULED_AUDIT_ROLE, taskType: SCHEDULED_AUDIT_TASK_TYPE,
   status: "running", attemptCount: 1, failureReason: null }
+const gate = { id: "gate-1", role: SCHEDULED_GATE_ROLE, taskType: SCHEDULED_GATE_TASK_TYPE,
+  status: "running", attemptCount: 2, maxAttempts: 4, failureReason: null, leaseOwner: "gate-owner",
+  leaseValid: true, deadlineValid: true, interruptRequestedAt: null }
+const gateWitness = { gateTaskId: gate.id, gateAttemptCount: gate.attemptCount, leaseOwnerId: "gate-owner",
+  requestAttemptCount: 1, preparedJobIds: ["job-1"] }
 
 function rootRow(overrides: Record<string, unknown> = {}) {
   return { id: scope.rootTaskId, userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
@@ -30,10 +37,24 @@ function waitRow(overrides: Record<string, unknown> = {}) {
     targetTurnId: scope.turnId, targetRole: audit.role, targetTaskType: audit.taskType, targetStatus: audit.status,
     targetAttemptCount: audit.attemptCount, targetFailureReason: null, ...overrides }
 }
-function db(root = rootRow(), wait: Record<string, unknown> | null = null) {
-  const query = vi.fn(async (sql: string, _values?: unknown[]) => ({ rows: sql.includes('FROM "sub_agent_tasks" AS task') ? [root]
-    : sql.includes('FROM "agent_wait_conditions" AS wait') && wait ? [wait] : [] }))
+function db(root = rootRow(), wait: Record<string, unknown> | null = null, gateRows: Record<string, unknown>[] = []) {
+  const query = vi.fn(async (sql: string, _values?: unknown[]) => ({ rows: sql.includes('task."taskType" = \'root\'') ? [root]
+    : sql.includes('FROM "sub_agent_tasks" AS task') ? gateRows
+      : sql.includes('FROM "agent_wait_conditions" AS wait') && wait ? [wait] : [] }))
   return { query }
+}
+function gateWaitRow(overrides: Record<string, unknown> = {}) {
+  const stepId = "gate-recovery-step", waitId = "gate-root-wait"
+  const key = `scheduled-gate-wait:${createHash("sha256").update(JSON.stringify([gate.id, stepId, gateWitness.requestAttemptCount]), "utf8").digest("hex")}`
+  return { id: waitId, userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
+    parentTaskId: scope.rootTaskId, stepId, idempotencyKey: key, targetTaskIds: [gate.id], mode: "any", status: "waiting",
+    matchedTaskIds: [], result: { request: { targetTaskIds: [gate.id], mode: "any", timeoutMs: 86_400_000,
+      scheduledGate: { gateTaskId: gate.id, requestAttemptCount: gateWitness.requestAttemptCount } } },
+    suspendedAt: new Date("2026-10-27T00:00:00.000Z"), resolvedAt: null, consumedAt: null,
+    parentStatus: "waiting", parentAttemptCount: owner.rootAttemptCount,
+    parentResult: { status: "waiting_for_dependency", stepCount: 4, toolCallCount: 2, finalItemId: null, waitId },
+    parentFailureReason: null, turnStatus: "waiting_for_dependency", turnLeaseOwnerId: null, turnLeaseExpiresAt: null,
+    stepTaskId: scope.rootTaskId, stepAttempt: 1, stepStatus: "waiting_for_tool", activeGateWaitCount: 1, ...overrides }
 }
 
 describe("scheduled Prepare receipt root owner", () => {
@@ -54,6 +75,29 @@ describe("scheduled Prepare receipt root owner", () => {
       audit.id, SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE, audit.attemptCount, owner.rootAttemptCount])
     const placeholders = Array.from(String(sql).matchAll(/\$(\d+)/g), match => Number(match[1]))
     expect(Math.max(...placeholders)).toBe(values?.length)
+  })
+
+  it("accepts a Gate wait only with the current explicit Gate lease and attempt witness", async () => {
+    const waiting = parkedRoot(), gateWait = gateWaitRow({ id: "audit-wait", parentResult: { status: "waiting_for_dependency",
+      stepCount: 4, toolCallCount: 2, finalItemId: null, waitId: "audit-wait" } })
+    const client = db(waiting, gateWait, [gate])
+    await expect(scheduledPrepareReceiptOwnerRootMatches(client as never, scope, owner, "persisted_gate",
+      new Map([[gate.id, gate]]), gateWitness)).resolves.toMatchObject({ id: scope.rootTaskId, status: "waiting" })
+    expect(client.query).toHaveBeenCalledTimes(3)
+    const leaseQuery = client.query.mock.calls[1]!
+    expect(leaseQuery[1]).toContain(gateWitness.leaseOwnerId)
+    expect(leaseQuery[0]).toContain('task."leaseOwner" = $8')
+    const waitQuery = client.query.mock.calls[2]!
+    expect(waitQuery[1]).toContain(gate.id)
+    expect(waitQuery[0]).toContain('turn."status" = $7')
+  })
+
+  it("does not accept approval Turn state without a validated active same-Gate approval witness", async () => {
+    const running = rootRow({ turnStatus: "waiting_for_approval", turnLeaseOwnerId: null, turnLeaseExpiresAt: null })
+    await expect(scheduledPrepareReceiptOwnerRootMatches(db(running) as never, scope, owner, "persisted_gate",
+      new Map([[gate.id, gate]]))).resolves.toBeNull()
+    await expect(scheduledPrepareReceiptOwnerRootMatches(db(running, null, [gate]) as never, scope, owner, "persisted_gate",
+      new Map([[gate.id, gate]]), gateWitness)).resolves.toBeNull()
   })
 
   it("rejects waiting roots during initial Prepare verification and for wrong root owner or attempt", async () => {

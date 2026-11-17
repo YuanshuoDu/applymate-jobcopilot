@@ -5,6 +5,7 @@ import { buildGroundedTaskGraphFinalResponse } from "./subagents/task-graph-fina
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "./subagents/task-graph-final-summary-binding.js"
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
 import { buildTaskGraphFinalSourceManifest } from "./subagents/task-graph-final-source-manifest.js"
+import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
 import { taskGraphItemId } from "./subagents/task-graph-snapshot.js"
 import type { GraphTaskRow, LoadedGraph } from "./subagents/task-graph-pg-state.js"
 
@@ -17,6 +18,34 @@ function graphBinding(taskId = "task-1", graphRevision = 1): TaskGraphFinalSumma
   } as unknown as LoadedGraph
   const binding = buildTaskGraphFinalSummaryBinding(loaded)
   if (!binding) throw new Error("Expected a current TaskGraph final-summary binding")
+  return binding
+}
+
+function followUpGraphBinding(): TaskGraphFinalSummaryBinding {
+  const rootTaskId = "root-follow-up"
+  const scoutTaskId = "task-scout-failed"
+  const reviewerTaskId = "task-review-needs-revision"
+  const artifactRef = { artifactId: "private-review-artifact", version: 3, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` }
+  const loaded = {
+    rootTaskId,
+    item: { id: taskGraphItemId(rootTaskId), revision: 5, content: {}, createdAt: new Date(0) },
+    snapshot: { nodes: [
+      { taskId: scoutTaskId, key: "search", templateId: "scout" },
+      { taskId: reviewerTaskId, key: "review", templateId: "reviewer" },
+    ] },
+    state: { revision: 5 },
+    tasks: new Map<string, GraphTaskRow>([
+      [scoutTaskId, { id: scoutTaskId, role: "scout", taskType: "research", status: "failed", failureReason: "task_graph_verification_failed",
+        result: { structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "partial",
+          candidates: [{ jobId: "job-follow-up", source: "fixture", url: "https://private.invalid/job-follow-up", evidenceIds: ["read:job:job-follow-up"] }],
+          evidence: [{ id: "read:job:job-follow-up", kind: "job", ref: "job-follow-up", source: "fixture" }], summary: "PRIVATE_SCOUT_MODEL_PROSE" } } }],
+      [reviewerTaskId, { id: reviewerTaskId, role: "reviewer", taskType: "review", status: "completed", failureReason: null,
+        result: { structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef,
+          reviewStatus: "needs_revision", reviewHash: `sha256:${"c".repeat(64)}` } } }],
+    ]),
+  } as unknown as LoadedGraph
+  const binding = buildTaskGraphFinalSummaryBinding(loaded)
+  if (!binding) throw new Error("Expected a current TaskGraph follow-up binding")
   return binding
 }
 
@@ -71,6 +100,29 @@ describe("deterministic finalizer", () => {
     expect(nativeFinalCandidateMatches(terminal, groundedResponse, rawModelCandidate)).toBe(true)
     expect(nativeFinalCandidateMatches(terminal, rawModelCandidate, rawModelCandidate)).toBe(false)
     expect(taskGraphFinalSummaryCopiesMatch(binding, graphBinding(), terminal.finalContent, terminal.response, terminal.finalItemId)).toBe(true)
+    expect(terminal.finalContent.text).toBe(groundedResponse)
+    expect(terminal.finalContent.final.response).toBe(groundedResponse)
+    expect(saved.response).toBe(groundedResponse)
+    expect(saved.summary).toBe(formatTaskGraphFinalSummary(binding.summary))
+  })
+
+  it("accepts binding-derived optional follow-ups while retaining raw-candidate proof identity", () => {
+    const binding = followUpGraphBinding()
+    const rawModelCandidate = "PRIVATE_RAW_ADVICE: every application was submitted and received."
+    const groundedResponse = buildGroundedTaskGraphFinalResponse(binding)
+    const terminal = boundTerminal(binding, groundedResponse)
+    const saved = JSON.parse(terminal.response) as { response: string; summary: string }
+
+    expect(groundedResponse).toContain("Suggested next steps (optional):")
+    expect(groundedResponse).toContain("Inspect the reported Search task outcome.")
+    expect(groundedResponse).toContain("Inspect the recorded material review marked needs revision.")
+    expect(groundedResponse).toContain("View the reported material results.")
+    for (const privateValue of ["PRIVATE_RAW_ADVICE", "PRIVATE_SCOUT_MODEL_PROSE", "private-review-artifact", "private.invalid", "task-scout-failed"]) {
+      expect(groundedResponse).not.toContain(privateValue)
+    }
+    expect(nativeFinalCandidateMatches(terminal, groundedResponse, rawModelCandidate)).toBe(true)
+    expect(nativeFinalCandidateMatches(terminal, rawModelCandidate, rawModelCandidate)).toBe(false)
+    expect(taskGraphFinalSummaryCopiesMatch(binding, followUpGraphBinding(), terminal.finalContent, terminal.response, terminal.finalItemId)).toBe(true)
     expect(terminal.finalContent.text).toBe(groundedResponse)
     expect(terminal.finalContent.final.response).toBe(groundedResponse)
     expect(saved.response).toBe(groundedResponse)

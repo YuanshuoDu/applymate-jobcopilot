@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { Prisma, PrismaClient } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
 import { protocolScope } from "./types"
+import { SCHEDULED_GATE_REVIEW_MARKER_SCHEMA } from "./gate-replay"
 import type { LegacyReceiptInput } from "./legacy-receipt"
 
 const mocks = vi.hoisted(() => ({
@@ -177,6 +178,18 @@ describe("issueLegacyReceipt transaction preparation", () => {
 })
 
 describe("Gate receipt replay identity", () => {
+  it("keeps the internal Gate identity marker out of client receipt payloads", async () => {
+    const { clientReceipt } = await import("./legacy-receipt")
+    const result = {
+      approval: { id: "approval_1", type: "review_application", title: "Review", body: "Materials",
+        payload: { jobId: "job_1", applicationTaskId: "task_1",
+          scheduledGateReview: { schemaVersion: SCHEDULED_GATE_REVIEW_MARKER_SCHEMA, gateTaskId: "gate_task_1" } },
+        status: "pending", scopeHash: "scope" },
+      nonce: "nonce",
+    } as unknown as Parameters<typeof clientReceipt>[0]
+
+    expect(clientReceipt(result).payload).toEqual({ jobId: "job_1", applicationTaskId: "task_1" })
+  })
   beforeEach(() => {
     vi.resetModules()
     Object.values(mocks).forEach((mock) => mock.mockReset())
@@ -194,6 +207,7 @@ describe("Gate receipt replay identity", () => {
       },
       key: "continuation_key_1",
       claimToken: "claim_token_1",
+      gateTaskId: "gate_task_1",
       assertCurrent: async () => true,
     }
     return {
@@ -205,7 +219,8 @@ describe("Gate receipt replay identity", () => {
       action: "review_application" as const,
       title: "Review application",
       body: "Review materials",
-      payload: { jobId },
+      payload: { jobId, ...(overrides.replayMode === "scheduled-taskgraph-gate-review"
+        ? { scheduledGateReview: { schemaVersion: SCHEDULED_GATE_REVIEW_MARKER_SCHEMA, gateTaskId: scheduledOwnerFence.gateTaskId } } : {}) },
       resource: { jobId },
       material: { resumeHash: "resume-v1", coverLetter: "Dear Acme" },
       answers: null,
@@ -283,16 +298,21 @@ describe("Gate receipt replay identity", () => {
       ...owner, claimToken: "claim_token_2", owner: { ...owner.owner, turnLeaseOwnerId: "lease_owner_2", turnLeaseVersion: 6 },
     } })
     const changed = gateInput({ replayMode: "scheduled-taskgraph-gate-review", scheduledOwnerFence: { ...owner, key: "continuation_key_2" } })
+    const otherGate = gateInput({ replayMode: "scheduled-taskgraph-gate-review",
+      scheduledOwnerFence: { ...owner, gateTaskId: "gate_task_2" } })
 
     await issueLegacyReceipt({} as PrismaClient, first)
     await issueLegacyReceipt({} as PrismaClient, same)
     await issueLegacyReceipt({} as PrismaClient, changed)
+    await issueLegacyReceipt({} as PrismaClient, otherGate)
 
-    const issued = mocks.issueApprovalReceipt.mock.calls.map(call => call[1] as { approvalId: string; nonce: string })
+    const issued = mocks.issueApprovalReceipt.mock.calls.map(call => call[1] as { approvalId: string; nonce: string; payload: unknown })
     expect(issued[1]?.approvalId).toBe(issued[0]?.approvalId)
     expect(issued[1]?.nonce).toBe(issued[0]?.nonce)
     expect(issued[2]?.approvalId).not.toBe(issued[0]?.approvalId)
     expect(issued[2]?.nonce).not.toBe(issued[0]?.nonce)
+    expect(issued[3]?.approvalId).toBe(issued[0]?.approvalId)
+    expect(issued[3]?.payload).not.toEqual(issued[0]?.payload)
   })
 
   it("probes a scheduled Gate receipt without preparation or writes when absent", async () => {
@@ -334,7 +354,8 @@ describe("Gate receipt replay identity", () => {
     const row = {
       id: issued.approvalId, userId: "user_1", sessionId: "session_1", turnId: "turn_1", taskId: "application_task_1",
       toolCallId: issued.scope.toolCallId, jobId: "job_1", type: "review_application", status: "pending",
-      title: issued.title, body: issued.body, impact: null, payload: { jobId: "job_1", applicationTaskId: "application_task_1" },
+      title: issued.title, body: issued.body, impact: null, payload: { jobId: "job_1", applicationTaskId: "application_task_1",
+        scheduledGateReview: { schemaVersion: SCHEDULED_GATE_REVIEW_MARKER_SCHEMA, gateTaskId: "gate_task_1" } },
       resourceHash: issued.scope.resourceHash, materialHash: issued.scope.materialHash, answersHash: issued.scope.answersHash,
       scopeHash, nonceHash, revision: issued.scope.revision, expiresAt: issued.scope.expiresAt, decidedAt: null, consumedAt: null,
       createdAt: new Date(),

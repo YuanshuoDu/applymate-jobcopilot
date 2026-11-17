@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { Prisma } from '@prisma/client'
+import { AgentExecutionCancelledError } from './execution-control'
 
 const mocks = vi.hoisted(() => ({
   transaction: vi.fn(), queryRaw: vi.fn(), jobs: vi.fn(), update: vi.fn(), turn: vi.fn(), config: vi.fn(), resume: vi.fn(),
@@ -106,6 +108,33 @@ function configureAuditLock(auditState: unknown) {
   })
 }
 
+function configureGateLock(options: {
+  turn?: ReturnType<typeof databaseTurn>
+  root?: Record<string, unknown>
+  gate?: Record<string, unknown>
+  execution?: Record<string, unknown>
+  waits?: unknown[]
+  steps?: unknown[]
+  resumeEvents?: unknown[]
+  throwAfter?: number
+  throwMessage?: string
+} = {}) {
+  const root = options.root ?? rootTask
+  const responses: unknown[][] = [[{ id: owner.sessionId, status: 'active' }], [options.turn ?? databaseTurn('waiting_for_tool')],
+    [{ status: root.status }]]
+  if (root.status === 'waiting') responses.push(options.waits ?? [], options.steps ?? [])
+  responses.push([root], [options.gate ?? gateTask], [options.execution ?? {
+    id: owner.executionId, status: 'running', attemptCount: owner.executionAttemptCount, checkpoint: 'gate', state }])
+  if (root.status === 'waiting') responses.push(options.resumeEvents ?? [])
+  queryIndex = 0
+  mocks.queryRaw.mockImplementation(async () => {
+    if (options.throwAfter !== undefined && queryIndex >= options.throwAfter) {
+      throw new Error(options.throwMessage ?? 'private database detail')
+    }
+    return responses[queryIndex++ % responses.length]
+  })
+}
+
 function gateRequest() {
   return { action: 'gate' as const, owner: requestOwner, attestation, prepareProof: proof, gateTaskId: gateTask.id,
     gateLeaseOwnerId: 'gate-lease', gateAttemptCount: 2 }
@@ -150,19 +179,12 @@ beforeEach(() => {
     candidateSetDigest: `sha256:${'b'.repeat(64)}`, allowedChoiceIds: ['continue', 'review', 'skip'] })
   mocks.jobs.mockResolvedValue([job])
   mocks.update.mockResolvedValue({ count: 1 })
-  mocks.queryRaw.mockImplementation(async () => {
-    const position = queryIndex++ % 5
-    if (position === 0) return [{ id: owner.sessionId, status: 'active' }]
-    if (position === 1) return [databaseTurn('waiting_for_tool')]
-    if (position === 2) return [rootTask]
-    if (position === 3) return [gateTask]
-    return [{ id: owner.executionId, status: 'running', attemptCount: owner.executionAttemptCount, checkpoint: 'gate', state }]
-  })
+  configureGateLock()
   mocks.transaction.mockImplementation(async (work: (client: unknown) => unknown) => await work(tx))
 })
 
 describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
-  it('checks current account, feature, AI budget, and effective entitlement before renewal or model work', async () => {
+  it('keeps account and entitlement checks while allowing exhausted quality calls to degrade per package', async () => {
     mocks.active.mockResolvedValue(false)
     const denied = await runScheduledTaskGraphActionRpc(gateRequest())
     expect(denied).toBeInstanceOf(Response)
@@ -174,7 +196,14 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     mocks.active.mockResolvedValue(true)
     mocks.access.mockResolvedValue('exhausted')
     const exhausted = await runScheduledTaskGraphActionRpc(gateRequest())
-    expect((exhausted as Response).status).toBe(429)
+    expect((exhausted as Response).status).toBe(200)
+    expect(mocks.executeGate).toHaveBeenCalledOnce()
+    expect(typeof mocks.executeGate.mock.calls[0]?.[0]?.context?.scheduledGateQualityModelCall).toBe('function')
+
+    mocks.access.mockResolvedValue('disabled')
+    mocks.transaction.mockClear()
+    const disabled = await runScheduledTaskGraphActionRpc(gateRequest())
+    expect((disabled as Response).status).toBe(403)
     expect(mocks.transaction).not.toHaveBeenCalled()
 
     mocks.access.mockResolvedValue('enabled')
@@ -185,14 +214,7 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
   })
 
   it('runs the bounded Gate against an exact child lease while the Root Turn is suspended under a newer lease version', async () => {
-    mocks.queryRaw.mockImplementation(async () => {
-      const position = queryIndex++ % 5
-      if (position === 0) return [{ id: owner.sessionId, status: 'active' }]
-      if (position === 1) return [databaseTurn('waiting_for_tool', requestOwner.turnLeaseVersion + 1)]
-      if (position === 2) return [rootTask]
-      if (position === 3) return [gateTask]
-      return [{ id: owner.executionId, status: 'running', attemptCount: owner.executionAttemptCount, checkpoint: 'gate', state }]
-    })
+    configureGateLock({ turn: databaseTurn('waiting_for_tool', requestOwner.turnLeaseVersion + 1) })
     const result = await runScheduledTaskGraphActionRpc(gateRequest())
     expect(result).toBeInstanceOf(Response)
     expect((result as Response).status).toBe(200)
@@ -204,6 +226,71 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     expect(JSON.stringify(responseBody)).not.toContain('private-claim')
   })
 
+  it('accepts a Gate child only after the exact Root dependency wait is fully persisted', async () => {
+    const waitId = 'root-gate-wait', stepId = 'root-gate-step', requestAttemptCount = 0
+    const digest = createHash('sha256').update(JSON.stringify([gateTask.id, stepId, requestAttemptCount]), 'utf8').digest('hex')
+    const approvalSnapshot = { ...snapshot, requireApproval: true }, waitingTurn = databaseTurn('waiting_for_dependency')
+    waitingTurn.input = { automationRunMode: 'scheduled', scheduledAutomationSnapshot: approvalSnapshot }
+    mocks.turn.mockResolvedValue({ input: waitingTurn.input })
+    const waitingRoot = { ...rootTask, status: 'waiting', result: { status: 'waiting_for_dependency',
+      stepCount: 4, toolCallCount: 2, finalItemId: null, waitId } }
+    configureGateLock({ turn: waitingTurn, root: waitingRoot,
+      waits: [{ id: waitId, userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+        parentTaskId: owner.rootTaskId, stepId, idempotencyKey: `scheduled-gate-wait:${digest}`,
+        targetTaskIds: [gateTask.id], mode: 'any', status: 'waiting', matchedTaskIds: [],
+        result: { request: { targetTaskIds: [gateTask.id], mode: 'any', timeoutMs: 86_400_000,
+          scheduledGate: { gateTaskId: gateTask.id, requestAttemptCount } } }, suspendedAt: new Date(), consumedAt: null }],
+      steps: [{ id: stepId, taskId: owner.rootTaskId, attempt: 1, status: 'waiting_for_tool' }] })
+
+    const request = { ...gateRequest(), scheduledWaitId: `agent-question:${owner.turnId}:canonical:${'a'.repeat(64)}` }
+    const result = await runScheduledTaskGraphActionRpc(request) as Response
+
+    expect(result.status).toBe(200)
+    expect(mocks.executeGate).toHaveBeenCalledOnce()
+    expect(mocks.isProof).toHaveBeenCalledWith(expect.objectContaining({ gateRootWait: expect.objectContaining({
+      waitId, stepId, gateTaskId: gateTask.id, requestAttemptCount, owner,
+      turn: expect.objectContaining({ id: owner.turnId, status: 'waiting_for_dependency', leaseVersion: owner.turnLeaseVersion }),
+      root: { id: owner.rootTaskId, status: 'waiting', attemptCount: owner.rootAttemptCount, waitId },
+    }) }), tx)
+    expect(mocks.auditPrepareSource).toHaveBeenCalledWith(expect.objectContaining({ reader: tx,
+      gateWait: expect.objectContaining({ waitId, stepId, gateTaskId: gateTask.id, owner: expect.objectContaining(owner) }) }))
+    expect(mocks.validateWait).not.toHaveBeenCalled()
+  })
+
+  it('keeps the ordinary latest-Step validator for a no-approval Gate wait', async () => {
+    const waitId = 'root-gate-wait', stepId = 'root-gate-step', requestAttemptCount = 0
+    const digest = createHash('sha256').update(JSON.stringify([gateTask.id, stepId, requestAttemptCount]), 'utf8').digest('hex')
+    const waitingRoot = { ...rootTask, status: 'waiting', result: { status: 'waiting_for_dependency',
+      stepCount: 4, toolCallCount: 2, finalItemId: null, waitId } }
+    configureGateLock({ turn: databaseTurn('waiting_for_dependency'), root: waitingRoot,
+      waits: [{ id: waitId, userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+        parentTaskId: owner.rootTaskId, stepId, idempotencyKey: `scheduled-gate-wait:${digest}`,
+        targetTaskIds: [gateTask.id], mode: 'any', status: 'waiting', matchedTaskIds: [],
+        result: { request: { targetTaskIds: [gateTask.id], mode: 'any', timeoutMs: 86_400_000,
+          scheduledGate: { gateTaskId: gateTask.id, requestAttemptCount } } }, suspendedAt: new Date(), consumedAt: null }],
+      steps: [{ id: stepId, taskId: owner.rootTaskId, attempt: 1, status: 'waiting_for_tool' }] })
+    mocks.validateWait.mockResolvedValue(false)
+
+    const result = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+
+    expect(result.status).toBe(409)
+    expect(mocks.validateWait).toHaveBeenCalledOnce()
+    expect(mocks.auditPrepareSource).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when Root is waiting but the Turn lease handoff is partial', async () => {
+    const waitingRoot = { ...rootTask, status: 'waiting', result: { status: 'waiting_for_dependency',
+      stepCount: 4, toolCallCount: 2, finalItemId: null, waitId: 'root-gate-wait' } }
+    configureGateLock({ turn: databaseTurn('in_progress', requestOwner.turnLeaseVersion + 1, 'live-root-lease'),
+      root: waitingRoot })
+
+    const result = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+
+    expect(result.status).toBe(409)
+    expect(mocks.executeGate).not.toHaveBeenCalled()
+    expect(mocks.aiConfig).not.toHaveBeenCalled()
+  })
+
   it('loads only the verified Analyst selection from a multi-Scout union', async () => {
     expect(parseScheduledTaskGraphAttestation(multiScoutAttestation)).not.toBeNull()
     const result = await runScheduledTaskGraphActionRpc({ ...gateRequest(), attestation: multiScoutAttestation }) as Response
@@ -212,41 +299,49 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     expect(mocks.jobs.mock.calls[0]?.[0]).not.toMatchObject({ where: { id: { in: multiScoutAttestation.candidateUnionJobIds } } })
   })
 
-  it('reloads Gate materials before a short current-owner transaction', async () => {
+  it('rejects a Gate review receipt when prepared material changes after preflight', async () => {
     const events: string[] = []
-    let transactionCallbackActive = false, inputLoads = 0
-    mocks.loadInput.mockImplementation(async () => {
-      expect(transactionCallbackActive).toBe(false)
+    let transactionCallbackActive = false, inputLoads = 0, receiptWrites = 0
+    const changed = { ...loaded, materials: [{ ...materials[0]!, artifactRef: { artifactId: 'artifact-2' } }] }
+    mocks.loadInput.mockImplementation(async (_input: unknown, reader: unknown) => {
       inputLoads += 1
-      if (inputLoads === 2) events.push('fresh_input')
-      return loaded
+      expect(transactionCallbackActive).toBe(true)
+      expect(reader).toBe(tx)
+      if (inputLoads === 1) events.push('preflight')
+      if (inputLoads === 3) events.push('receipt_material_recheck')
+      return inputLoads === 3 ? changed : loaded
     })
     mocks.transaction.mockImplementation(async (work: (client: unknown) => unknown) => {
-      if (inputLoads === 2) events.push('owner_recheck')
       transactionCallbackActive = true
       try { return await work(tx) } finally { transactionCallbackActive = false }
+    })
+    mocks.executeGate.mockImplementation(async (input: { context: {
+      scheduledTaskGraphOwnerFence: { gateTaskId: string; assertCurrent(transaction: unknown): Promise<boolean> }
+    } }) => {
+      expect(input.context.scheduledTaskGraphOwnerFence.gateTaskId).toBe('gate-1')
+      await mocks.transaction(async (transaction: unknown) => {
+        if (!await input.context.scheduledTaskGraphOwnerFence.assertCurrent(transaction)) {
+          throw new AgentExecutionCancelledError()
+        }
+        receiptWrites += 1
+      })
+      return { status: 'completed' }
     })
 
     const result = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
 
-    expect(result.status).toBe(200)
-    expect(inputLoads).toBe(2)
-    expect(events).toEqual(['fresh_input', 'owner_recheck'])
+    expect(result.status).toBe(409)
+    await expect(result.json()).resolves.toMatchObject({ status: 'blocked', errorCode: 'scheduled_pipeline_turn_stale' })
+    expect(inputLoads).toBe(3)
+    expect(events).toEqual(['preflight', 'receipt_material_recheck'])
+    expect(receiptWrites).toBe(0)
   })
 
   it('projects a safe test-only owner assertion phase without exposing the thrown message', async () => {
     const secretMessage = 'private database detail and fixture identity'
     vi.stubEnv('NODE_ENV', 'test')
     try {
-      mocks.queryRaw.mockImplementation(async () => {
-        if (queryIndex >= 5) throw new Error(secretMessage)
-        const position = queryIndex++ % 5
-        if (position === 0) return [{ id: owner.sessionId, status: 'active' }]
-        if (position === 1) return [databaseTurn('waiting_for_tool')]
-        if (position === 2) return [rootTask]
-        if (position === 3) return [gateTask]
-        return [{ id: owner.executionId, status: 'running', attemptCount: owner.executionAttemptCount, checkpoint: 'gate', state }]
-      })
+      configureGateLock({ throwAfter: 6, throwMessage: secretMessage })
       const result = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
       const body = await result.json()
       expect(result.status).toBe(500)
@@ -305,14 +400,7 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
   })
 
   it('accepts the exact live child while a newer Root lease is active, without borrowing that lease', async () => {
-    mocks.queryRaw.mockImplementation(async () => {
-      const position = queryIndex++ % 5
-      if (position === 0) return [{ id: owner.sessionId, status: 'active' }]
-      if (position === 1) return [databaseTurn('in_progress', requestOwner.turnLeaseVersion + 1, 'root-lease-v2')]
-      if (position === 2) return [rootTask]
-      if (position === 3) return [gateTask]
-      return [{ id: owner.executionId, status: 'running', attemptCount: owner.executionAttemptCount, checkpoint: 'gate', state }]
-    })
+    configureGateLock({ turn: databaseTurn('in_progress', requestOwner.turnLeaseVersion + 1, 'root-lease-v2') })
     const result = await runScheduledTaskGraphActionRpc(gateRequest())
     expect(result).toBeInstanceOf(Response)
     expect((result as Response).status).toBe(200)
@@ -324,16 +412,8 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
       { storedWait: null, suppliedWait: undefined },
       { storedWait: 'stored-prepare-wait', suppliedWait: 'different-prepare-wait' },
     ]) {
-      queryIndex = 0
-      mocks.queryRaw.mockImplementation(async () => {
-        const position = queryIndex++ % 5
-        if (position === 0) return [{ id: owner.sessionId, status: 'active' }]
-        if (position === 1) return [databaseTurn('waiting_for_tool')]
-        if (position === 2) return [rootTask]
-        if (position === 3) return [gateTask]
-        return [{ id: owner.executionId, status: 'running', attemptCount: owner.executionAttemptCount, checkpoint: 'gate',
-          state: { ...state, scheduledTaskGraphScheduledWaitId: fixture.storedWait } }]
-      })
+      configureGateLock({ execution: { id: owner.executionId, status: 'running', attemptCount: owner.executionAttemptCount,
+        checkpoint: 'gate', state: { ...state, scheduledTaskGraphScheduledWaitId: fixture.storedWait } } })
       const request = { ...gateRequest(), ...(fixture.suppliedWait ? { scheduledWaitId: fixture.suppliedWait } : {}) }
       const rejected = await runScheduledTaskGraphActionRpc(request)
       expect(rejected).toBeInstanceOf(Response)

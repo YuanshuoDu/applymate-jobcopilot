@@ -1,9 +1,10 @@
-import type { Job } from '@prisma/client'
+import type { Job, Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { hashArtifactContent } from './artifacts/hash'
 import type { ArtifactKind, ArtifactProvenance, ArtifactSummary } from './artifacts/types'
 import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import type { ScheduledTaskGraphArtifactReference, ScheduledTaskGraphPreparedMaterialRow, ScheduledTaskGraphPreparedPackageRow } from './scheduled-taskgraph-gate-checkpoint'
+import { loadScheduledTaskGraphGateMaterialSources, type ScheduledTaskGraphGateSourceDigestBundle as SourceDigestBundle } from './scheduled-taskgraph-gate-material-sources'
 import type { ApplicationPackage, ScoredJob } from './types'
 
 const VERSION_SELECT = { id: true, artifactId: true, version: true, userId: true, sessionId: true, jobId: true, artifactType: true,
@@ -16,9 +17,8 @@ const DIGEST = /^sha256:[a-f0-9]{64}$/
 
 type PreparedJob = { jobId: string; status: string }
 type PreparedMaterial = { jobId: string; kind: ArtifactKind; artifactRef: ScheduledTaskGraphArtifactReference }
-type SourceDigestBundle = { digest: string; refs: string[]; hashes: Map<string, string> }
-type SourceBundle = { jobs: Map<string, Job>; byJob: Map<string, SourceDigestBundle> }
 type ScheduledArtifactSummary = ArtifactSummary & { readonly sourceDigest: string }
+type GateMaterialsReader = Pick<Prisma.TransactionClient, 'agentSession' | 'job' | 'resume' | 'personaFact' | 'agentArtifactVersion' | 'agentArtifact'>
 
 export type ScheduledTaskGraphGateMaterials = Readonly<{
   packages: readonly ScheduledTaskGraphPreparedPackageRow[]
@@ -34,8 +34,10 @@ export async function loadScheduledTaskGraphGateMaterials(input: Readonly<{
   taskId: string
   jobs: readonly PreparedJob[]
   materials: readonly PreparedMaterial[]
+  reader?: GateMaterialsReader
 }>): Promise<ScheduledTaskGraphGateMaterials | null> {
   try {
+    const reader = input.reader ?? db
     const scores = parseScores(input.scoredJobs, input.owner.userId)
     if (!scores) return null
     const eligible = scores.filter(item => item.score >= input.minScore).slice(0, input.dailyCap)
@@ -44,16 +46,16 @@ export async function loadScheduledTaskGraphGateMaterials(input: Readonly<{
     if (!validateMaterials(input.materials, input.jobs, preparedIds)) return null
     if (input.materials.length === 0) return { packages: [], materials: [] }
 
-    const sources = await loadCurrentSources(input.owner, [...preparedIds])
+    const sources = await loadScheduledTaskGraphGateMaterialSources(reader, input.owner, [...preparedIds])
     if (!sources) return null
     const refs = input.materials.map(item => ({ ...item, ref: item.artifactRef }))
     const [versions, heads] = await Promise.all([
-      db.agentArtifactVersion.findMany({
+      reader.agentArtifactVersion.findMany({
         where: { userId: input.owner.userId, sessionId: input.owner.sessionId, OR: refs.map(item => ({ jobId: item.jobId,
           artifactId: item.ref.artifactId, version: item.ref.version, artifactType: item.kind })) },
         select: VERSION_SELECT,
       }),
-      db.agentArtifact.findMany({
+      reader.agentArtifact.findMany({
         where: { userId: input.owner.userId, OR: refs.map(item => ({ jobId: item.jobId, id: item.ref.artifactId, artifactType: item.kind })) },
         select: HEAD_SELECT,
       }),
@@ -132,38 +134,6 @@ function parseScores(value: unknown, userId: string): ScoredJob[] | null {
   return result
 }
 
-async function loadCurrentSources(owner: ScheduledTaskGraphPipelineOwner, jobIds: readonly string[]): Promise<SourceBundle | null> {
-  if (jobIds.length === 0) return { jobs: new Map(), byJob: new Map() }
-  const session = await db.agentSession.findFirst({ where: { id: owner.sessionId, userId: owner.userId }, select: { id: true } })
-  if (!session) return null
-  const [jobs, resume, facts] = await Promise.all([
-    db.job.findMany({ where: { userId: owner.userId, id: { in: [...jobIds] } } }),
-    db.resume.findFirst({ where: { userId: owner.userId, kind: 'base' }, orderBy: [{ isDefault: 'desc' }, { updatedAt: 'desc' }, { id: 'desc' }],
-      select: { id: true, name: true, kind: true, origin: true, isDefault: true, content: true, createdAt: true, updatedAt: true } }),
-    db.personaFact.findMany({ where: { userId: owner.userId, status: 'confirmed', OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }], allowedUses: { has: 'cover_letter' } },
-      orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }], take: 50,
-      select: { id: true, key: true, category: true, value: true, source: true, sourceRef: true, confidence: true, allowedUses: true } }),
-  ])
-  if (!resume || !validResume(resume) || jobs.length !== jobIds.length || facts.some(fact => !validPersonaFact(fact))) return null
-  const jobMap = uniqueMap(jobs, job => job.id)
-  if (!jobMap || jobIds.some(id => !jobMap.has(id) || jobMap.get(id)?.userId !== owner.userId)) return null
-  const normalizedFacts = facts.map(fact => ({ ...fact, confidence: Number(fact.confidence), allowedUses: [...fact.allowedUses] }))
-  const byJob = new Map<string, SourceDigestBundle>()
-  for (const id of jobIds) {
-    const job = jobMap.get(id)!, jobSource = workerJob(job)
-    const resumeSource = { id: resume.id, name: resume.name, kind: resume.kind, origin: resume.origin, isDefault: resume.isDefault,
-      content: resume.content, createdAt: toIso(resume.createdAt), updatedAt: toIso(resume.updatedAt) }
-    const sources = [
-      { sourceRef: `job:${id}`, content: jobSource }, { sourceRef: `resume:${resume.id}`, content: resumeSource },
-      ...normalizedFacts.map((fact, index) => ({ sourceRef: `persona:${fact.id}`, content: { ...fact, rank: index + 1 } })),
-    ].map(item => ({ sourceRef: item.sourceRef, contentHash: hashArtifactContent(item.content) })).sort((a, b) => a.sourceRef.localeCompare(b.sourceRef))
-    if (new Set(sources.map(item => item.sourceRef)).size !== sources.length) return null
-    byJob.set(id, { digest: hashArtifactContent({ jobId: id, sources }), refs: sources.map(item => item.sourceRef),
-      hashes: new Map(sources.map(item => [item.sourceRef, item.contentHash])) })
-  }
-  return { jobs: jobMap, byJob }
-}
-
 function verifyArtifact(versionValue: unknown, headValue: unknown, owner: ScheduledTaskGraphPipelineOwner,
   jobId: string, kind: ArtifactKind, taskId: string, ref: ScheduledTaskGraphArtifactReference, source: SourceDigestBundle): boolean {
   const version = record(versionValue), head = record(headValue)
@@ -220,25 +190,6 @@ function artifactSummary(value: unknown, kind: ArtifactKind, source: SourceDiges
     constraintHash: version.constraintHash as string, provenance }
 }
 
-function workerJob(job: Job): Record<string, unknown> {
-  return { id: job.id, company: job.company, role: job.role, location: job.location ?? null, status: job.status,
-    score: job.score ?? null, url: job.url ?? null, source: job.source ?? null, salary: job.salary ?? null,
-    description: job.description ?? null, keywords: job.keywords ?? null }
-}
-function validResume(value: unknown): boolean {
-  const row = record(value)
-  return Boolean(row && validId(row.id) && typeof row.name === 'string' && row.kind === 'base' && typeof row.origin === 'string'
-    && typeof row.isDefault === 'boolean' && validDate(row.createdAt) && validDate(row.updatedAt))
-}
-function validPersonaFact(value: unknown): boolean {
-  const row = record(value)
-  return Boolean(row && [row.id, row.key, row.category, row.value, row.source].every(item => typeof item === 'string')
-    && validId(row.id) && (row.sourceRef === null || typeof row.sourceRef === 'string')
-    && typeof row.confidence === 'number' && Number.isFinite(row.confidence)
-    && Array.isArray(row.allowedUses) && row.allowedUses.every(item => typeof item === 'string'))
-}
-function toIso(value: Date | string): string { return (value instanceof Date ? value : new Date(value)).toISOString() }
-function validDate(value: unknown): value is Date | string { return value instanceof Date && Number.isFinite(value.getTime()) || typeof value === 'string' && Number.isFinite(Date.parse(value)) }
 function denseArray(value: unknown): unknown[] | null {
   if (!Array.isArray(value) || Reflect.ownKeys(value).length !== value.length + 1) return null
   return value

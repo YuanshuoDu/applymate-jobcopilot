@@ -3,6 +3,9 @@ import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
 import { Prisma } from '@prisma/client'
 import { describe, expect, it, vi } from 'vitest'
 import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
+import type { ScheduledGateRootWait } from './scheduled-taskgraph-gate-root-wait'
+const mocks = vi.hoisted(() => ({ gateAttempt: vi.fn() }))
+vi.mock('./scheduled-taskgraph-gate-root-wait', () => ({ scheduledGateWaitAttemptMatchesCurrentHistory: mocks.gateAttempt }))
 import { validateScheduledTaskGraphAuditRecoveryEvidence } from './scheduled-taskgraph-audit-recovery-evidence'
 
 const SCHEDULED_AUDIT_TEMPLATE_ID = 'scheduled_audit'
@@ -52,9 +55,9 @@ function completedPayload(step: ReturnType<typeof recoveryStep>, status: string,
 function auditTask(attemptCount = 2) { return { id: 'audit-1', parentTaskId: owner.rootTaskId, rootTaskId: owner.rootTaskId,
   sessionId: owner.sessionId, turnId: owner.turnId, depth: 1, role: 'auditor', taskType: 'scheduled_taskgraph_audit',
   maxAttempts: 3, attemptCount, session: { userId: owner.userId } } }
-function gateTask() { return { id: 'gate-1', parentTaskId: owner.rootTaskId, rootTaskId: owner.rootTaskId,
+function gateTask(attemptCount = 1, status = 'waiting_for_user') { return { id: 'gate-1', parentTaskId: owner.rootTaskId, rootTaskId: owner.rootTaskId,
   sessionId: owner.sessionId, turnId: owner.turnId, depth: 1, role: 'prepare', taskType: 'scheduled_taskgraph_gate',
-  maxAttempts: 3, session: { userId: owner.userId } } }
+  status, attemptCount, maxAttempts: 3, session: { userId: owner.userId } } }
 function auditWait(stepId: string, id = 'audit-wait-1') { return { id, userId: owner.userId, sessionId: owner.sessionId,
   turnId: owner.turnId, parentTaskId: owner.rootTaskId, stepId, idempotencyKey: auditWaitKey('audit-1', stepId, 1),
   targetTaskIds: ['audit-1'], mode: 'all', status: 'waiting', matchedTaskIds: [],
@@ -65,6 +68,20 @@ function gateWait(stepId: string) { const digest = createHash('sha256').update(J
     parentTaskId: owner.rootTaskId, stepId, idempotencyKey: `scheduled-gate-wait:${digest}`, targetTaskIds: ['gate-1'],
     mode: 'any', status: 'ready', matchedTaskIds: ['gate-1'], result: { request: { targetTaskIds: ['gate-1'], mode: 'any',
       timeoutMs: 86_400_000, scheduledGate: { gateTaskId: 'gate-1', requestAttemptCount: 1 } } } }
+}
+function lockedGateWait(stepId: string, id = 'root-gate-wait', attempt = 0, overrides: Record<string, unknown> = {}) {
+  const digest = createHash('sha256').update(JSON.stringify(['gate-1', stepId, attempt]), 'utf8').digest('hex')
+  return { id, userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, parentTaskId: owner.rootTaskId, stepId,
+    idempotencyKey: `scheduled-gate-wait:${digest}`, targetTaskIds: ['gate-1'], mode: 'any', status: 'waiting', matchedTaskIds: [],
+    result: { request: { targetTaskIds: ['gate-1'], mode: 'any', timeoutMs: 86_400_000,
+      scheduledGate: { gateTaskId: 'gate-1', requestAttemptCount: attempt } } }, suspendedAt: new Date(), consumedAt: null, ...overrides }
+}
+function gateRootWaitWitness(stepId: string, waitId = 'root-gate-wait', attempt = 0,
+  turnStatus: 'waiting_for_dependency' | 'waiting_for_approval' | 'waiting_for_user' = 'waiting_for_dependency',
+  approvalIds: readonly string[] = []): ScheduledGateRootWait {
+  return { waitId, stepId, gateTaskId: 'gate-1', approvalIds, requestAttemptCount: attempt, owner,
+    turn: { id: owner.turnId, status: turnStatus, leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: null },
+    root: { id: owner.rootTaskId, status: 'waiting', attemptCount: owner.rootAttemptCount, waitId } }
 }
 function gateBinding(continuationKey = `scheduled-taskgraph:sha256:${'a'.repeat(64)}`) { return { schemaVersion: 'agent-harness.v2.scheduled-gate-choice-wait.v1', owner: {
     userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
@@ -95,6 +112,7 @@ function auditGraphContent(scoutKey = 'scout', analystKey = 'analyst') { return 
     successCriteria: SCHEDULED_AUDIT_NODE_CRITERIA, dependsOn: ['gate'], depth: 5,
     taskId: 'audit-1', verificationDisposition: 'specialized' },
 ] } }
+function gateGraphContent() { return { ...auditGraphContent(), nodes: auditGraphContent().nodes.slice(0, 4) } }
 function taskGraphId() { return `task-graph-${createHash('sha256').update(owner.rootTaskId).digest('hex')}` }
 function auditGraphItem(stepId: string, revision = 7, content = auditGraphContent()) {
   return { id: taskGraphId(), sessionId: owner.sessionId, turnId: owner.turnId, stepId, taskId: owner.rootTaskId,
@@ -112,11 +130,17 @@ function auditGraphProposal(stepId: string, revision = 6, content = auditGraphCo
     itemId: id, type: 'item.delta', actor: 'orchestrator', correlationId: owner.turnId, causationId: stepId,
     idempotencyKey: `${id}:proposal:${revision - 1}`, payload }
 }
+function gateGraphProposal(stepId: string, revision = 6, content = gateGraphContent()) {
+  const event = auditGraphProposal(stepId, revision, content), payload = event.payload as Record<string, unknown>
+  return { ...event, payload: { ...payload, receipt: { status: 'accepted', revision,
+    nodes: [{ key: 'gate', taskId: 'gate-1', status: 'queued' }], readyTaskIds: ['gate-1'] } } }
+}
 function auditWaitKey(taskId: string, stepId: string, attempt: number) { const digest = createHash('sha256')
   .update(JSON.stringify([taskId, stepId, attempt]), 'utf8').digest('hex'); return `scheduled-audit-wait:${digest}` }
 function fixture(options: Readonly<{ steps?: readonly Record<string, unknown>[]; events?: readonly Record<string, unknown>[];
   items?: readonly Record<string, unknown>[]; waits?: readonly Record<string, unknown>[]; tasks?: readonly Record<string, unknown>[] }> = {}) {
   const steps = options.steps ?? [], events = options.events ?? [], items = options.items ?? [], waits = options.waits ?? [], tasks = options.tasks ?? []
+  mocks.gateAttempt.mockReset().mockResolvedValue(true)
   const reader = { agentStep: { findMany: vi.fn(async () => steps) }, agentEvent: { findMany: vi.fn(async (args?: unknown) => filterEvents(events, args)) },
     agentItem: { findMany: vi.fn(async () => items) }, agentWaitCondition: { findMany: vi.fn(async () => waits) },
     subAgentTask: { findMany: vi.fn(async () => tasks) } } as unknown as Prisma.TransactionClient
@@ -134,9 +158,10 @@ function filterEvents(events: readonly Record<string, unknown>[], args: unknown)
     return event[key] === filter
   }))
 }
-function validate(reader: Prisma.TransactionClient, fields: Partial<{ owner: ScheduledTaskGraphPipelineOwner; rootAttemptCount: number }> = {}) {
+function validate(reader: Prisma.TransactionClient, fields: Partial<{ owner: ScheduledTaskGraphPipelineOwner; rootAttemptCount: number; gateWait: ScheduledGateRootWait }> = {}) {
   return validateScheduledTaskGraphAuditRecoveryEvidence({ reader, owner: fields.owner ?? owner, source,
-    sourceInputThroughSequence: sourceCursor, rootAttemptCount: fields.rootAttemptCount ?? owner.rootAttemptCount })
+    sourceInputThroughSequence: sourceCursor, rootAttemptCount: fields.rootAttemptCount ?? owner.rootAttemptCount,
+    ...(fields.gateWait ? { gateWait: fields.gateWait } : {}) })
 }
 
 describe('scheduled TaskGraph Audit recovery evidence', () => {
@@ -164,6 +189,49 @@ describe('scheduled TaskGraph Audit recovery evidence', () => {
     const reversed = fixture({ steps: [step], events: lifecycle(step, completedPayload(step, 'waiting_for_dependency', { waitId: audit.id })),
       waits: [audit, gate], tasks: [gateTask(), auditTask()] })
     await expect(validate(reversed.reader)).resolves.toBe(true)
+  })
+
+  it('binds Gate recovery to the locked final wait while retaining a distinct ready Prepare wait', async () => {
+    const step = recoveryStep('waiting_for_tool'), gate = lockedGateWait(step.id), witness = gateRootWaitWitness(step.id, gate.id)
+    const prepare = { id: 'prepare-ready', userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+      parentTaskId: owner.rootTaskId, stepId: step.id, idempotencyKey: `scheduled-prepare-dependency:${'a'.repeat(64)}`,
+      targetTaskIds: ['prepare-1'], mode: 'all', status: 'ready', matchedTaskIds: ['prepare-1'],
+      result: { outcome: { status: 'ready' }, request: { targetTaskIds: ['prepare-1'], mode: 'all', timeoutMs: 86_400_000 } },
+      suspendedAt: new Date(), consumedAt: null }
+    const f = fixture({ steps: [step], events: lifecycle(step, completedPayload(step, 'waiting_for_dependency', { waitId: gate.id })),
+      waits: [gate, prepare], tasks: [gateTask(), { ...gateTask(), id: 'prepare-1', role: 'prepare', taskType: 'scheduled_application_prepare' }] })
+    await expect(validate(f.reader, { gateWait: witness })).resolves.toBe(true)
+    expect(mocks.gateAttempt).toHaveBeenCalledWith(f.reader, owner, 'gate-1', 0)
+    const approvalWitness = gateRootWaitWitness(step.id, gate.id, 0, 'waiting_for_approval', ['approval-1', 'approval-2'])
+    await expect(validate(f.reader, { gateWait: approvalWitness })).resolves.toBe(true)
+    for (const invalid of [
+      gateRootWaitWitness(step.id, gate.id, 0, 'waiting_for_approval'),
+      gateRootWaitWitness(step.id, gate.id, 0, 'waiting_for_approval', ['approval-2', 'approval-1']),
+      gateRootWaitWitness(step.id, gate.id, 0, 'waiting_for_approval', ['approval-1', 'approval-1']),
+      gateRootWaitWitness(step.id, gate.id, 0, 'waiting_for_user', ['approval-1']),
+    ]) await expect(validate(f.reader, { gateWait: invalid })).resolves.toBe(false)
+    mocks.gateAttempt.mockResolvedValueOnce(false)
+    await expect(validate(f.reader, { gateWait: witness })).resolves.toBe(false)
+
+    const unrelated = auditWait(step.id)
+    const mismatchedCompletion = fixture({ steps: [step], events: lifecycle(step,
+      completedPayload(step, 'waiting_for_dependency', { waitId: unrelated.id })), waits: [gate, unrelated], tasks: [gateTask(), auditTask()] })
+    await expect(validate(mismatchedCompletion.reader, { gateWait: witness })).resolves.toBe(false)
+
+    await expect(validate(f.reader, { gateWait: { ...witness, stepId: 'stale-step' } })).resolves.toBe(false)
+    await expect(validate(f.reader, { gateWait: { ...witness, requestAttemptCount: 1 } })).resolves.toBe(false)
+    await expect(validate(f.reader, { gateWait: { ...witness, owner: { ...owner, executionId: 'foreign-execution' } } })).resolves.toBe(false)
+    await expect(validate(f.reader, { gateWait: { ...witness, waitId: 'stale-wait' } })).resolves.toBe(false)
+
+    const changedTarget = fixture({ steps: [step], events: lifecycle(step, completedPayload(step, 'waiting_for_dependency', { waitId: gate.id })),
+      waits: [{ ...gate, targetTaskIds: ['foreign-gate'] }, prepare], tasks: [gateTask(), { ...gateTask(), id: 'prepare-1', taskType: 'scheduled_application_prepare' }] })
+    await expect(validate(changedTarget.reader, { gateWait: witness })).resolves.toBe(false)
+    const consumed = fixture({ steps: [step], events: lifecycle(step, completedPayload(step, 'waiting_for_dependency', { waitId: gate.id })),
+      waits: [{ ...gate, consumedAt: new Date() }, prepare], tasks: [gateTask(), { ...gateTask(), id: 'prepare-1', taskType: 'scheduled_application_prepare' }] })
+    await expect(validate(consumed.reader, { gateWait: witness })).resolves.toBe(false)
+    const duplicate = fixture({ steps: [step], events: lifecycle(step, completedPayload(step, 'waiting_for_dependency', { waitId: gate.id })),
+      waits: [gate, { ...gate }, prepare], tasks: [gateTask(), { ...gateTask(), id: 'prepare-1', taskType: 'scheduled_application_prepare' }] })
+    await expect(validate(duplicate.reader, { gateWait: witness })).resolves.toBe(false)
   })
 
   it('validates a chained Gate/Audit wait followed by the exact no-wait blocker receipt', async () => {
@@ -211,6 +279,20 @@ describe('scheduled TaskGraph Audit recovery evidence', () => {
     const f = fixture({ steps: [step], events: lifecycle(step, completedPayload(step, 'waiting_for_user')),
       items: [item], tasks: [gateTask()] })
     await expect(validate(f.reader)).resolves.toBe(true)
+  })
+
+  it('rejects an unacknowledged Gate answer from an older attempt but retains acknowledged history', async () => {
+    const step = recoveryStep('waiting_for_user'), oldAnswer = choiceItem('completed')
+    const stale = fixture({ steps: [step], events: lifecycle(step, completedPayload(step, 'waiting_for_user')),
+      items: [oldAnswer], tasks: [gateTask(2, 'running')] })
+    await expect(validate(stale.reader)).resolves.toBe(false)
+
+    const content = { ...oldAnswer.content, scheduledGateChoiceResumeAcknowledgement: {
+      gateTaskId: 'gate-1', requestAttemptCount: 1, waitId: oldAnswer.content.questionId, itemId: oldAnswer.id, resumedAttemptCount: 2,
+    } }
+    const historical = fixture({ steps: [step], events: lifecycle(step, completedPayload(step, 'waiting_for_user')),
+      items: [{ ...oldAnswer, content }], tasks: [gateTask(2, 'running')] })
+    await expect(validate(historical.reader)).resolves.toBe(true)
   })
 
   it('accepts v2 Gate bindings and rejects trailing continuation key data', async () => {
@@ -265,6 +347,43 @@ describe('scheduled TaskGraph Audit recovery evidence', () => {
     const f = fixture({ steps: [step], events: [...lifecycle(step), auditGraphProposal(step.id, 6, content)],
       items: [auditGraphItem(step.id, 7, content)] })
     await expect(validate(f.reader)).resolves.toBe(true)
+  })
+
+  it('strips only a Gate-only recovery proposal with its exact receipt and current Step event', async () => {
+    const step = recoveryStep('waiting_for_tool'), wait = lockedGateWait(step.id), witness = gateRootWaitWitness(step.id, wait.id)
+    const content = gateGraphContent(), proposal = gateGraphProposal(step.id), graph = auditGraphItem(step.id, 7, content)
+    const valid = fixture({ steps: [step], events: [...lifecycle(step, completedPayload(step, 'waiting_for_dependency', { waitId: wait.id })), proposal],
+      items: [graph], waits: [wait], tasks: [gateTask()] })
+    await expect(validate(valid.reader, { gateWait: witness })).resolves.toBe(true)
+
+    const proposedEvent = gateGraphProposal(step.id)
+    const auditReceipt = { ...proposedEvent, payload: { ...(proposedEvent.payload as Record<string, unknown>), receipt: {
+      status: 'accepted', revision: 6, nodes: [{ key: 'scheduled_audit', taskId: 'audit-1', status: 'queued' }], readyTaskIds: ['audit-1'] } } }
+    const wrongProposal = fixture({ steps: [step], events: [...lifecycle(step, completedPayload(step, 'waiting_for_dependency', { waitId: wait.id })), auditReceipt],
+      items: [graph], waits: [wait], tasks: [gateTask()] })
+    await expect(validate(wrongProposal.reader, { gateWait: witness })).resolves.toBe(false)
+
+    const extraNode = { ...content, nodes: [...content.nodes, auditGraphContent().nodes[4]] }
+    const widened = fixture({ steps: [step], events: [...lifecycle(step, completedPayload(step, 'waiting_for_dependency', { waitId: wait.id })),
+      gateGraphProposal(step.id, 6, extraNode)], items: [auditGraphItem(step.id, 7, extraNode)], waits: [wait], tasks: [gateTask()] })
+    await expect(validate(widened.reader, { gateWait: witness })).resolves.toBe(false)
+  })
+
+  it('rejects unrelated step-correlated events only on the Gate recovery path', async () => {
+    const step = recoveryStep('waiting_for_tool'), gate = lockedGateWait(step.id), witness = gateRootWaitWitness(step.id, gate.id)
+    const extra = { id: 'candidate-update', sessionId: owner.sessionId, turnId: owner.turnId,
+      taskId: owner.rootTaskId, itemId: null, type: 'native_verification.scheduled_candidate_staged', actor: 'orchestrator',
+      correlationId: step.id, idempotencyKey: `scheduled-candidate:${owner.rootTaskId}:${owner.rootAttemptCount}:${step.id}`,
+      payload: { schemaVersion: 'agent-harness.v2.scheduled-pipeline-candidate.v3', sessionId: owner.sessionId, turnId: owner.turnId,
+        rootTaskId: owner.rootTaskId, rootAttemptCount: owner.rootAttemptCount, finalStepId: step.id, finalStepOrdinal: step.ordinal,
+        candidateText: 'A later candidate', stepAttempt: 1, finishReason: 'completed', usage: null, sourceReceipt: null } }
+    const events = [...lifecycle(step, completedPayload(step, 'waiting_for_dependency', { waitId: gate.id })), extra]
+    const gatePath = fixture({ steps: [step], events,
+      waits: [gate], tasks: [gateTask()] })
+    await expect(validate(gatePath.reader, { gateWait: witness })).resolves.toBe(false)
+
+    const auditPath = fixture({ steps: [step], events, waits: [gate], tasks: [gateTask()] })
+    await expect(validate(auditPath.reader)).resolves.toBe(true)
   })
 
   it('accepts production scheduled Scout and Analyst keys in recovery evidence', async () => {
