@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   resumeUpdate: vi.fn(),
   resumeUpdateMany: vi.fn(),
   resumeVersionCreate: vi.fn(),
+  withAuditLock: vi.fn(),
   transaction: vi.fn(),
   activityCreate: vi.fn(),
   hasEffectiveEntitlement: vi.fn(),
@@ -67,7 +68,7 @@ vi.mock('@/lib/application-audit-operation', () => ({
   auditMaterialBasisHash: () => 'material-hash',
 }))
 vi.mock('@/lib/application-audit-transaction', () => ({
-  withApplicationAuditLock: async (_scope: unknown, callback: (tx: unknown) => Promise<unknown>) => mocks.transaction(callback),
+  withApplicationAuditLock: mocks.withAuditLock,
   lockApplicationAuditMaterials: mocks.lockMaterials,
   AuditMaterialBusyError: class AuditMaterialBusyError extends Error {},
 }))
@@ -75,7 +76,7 @@ vi.mock('@/lib/application-audit-transaction', () => ({
 function fixtureTx() {
   return {
     job: { findFirst: async () => fixtureJob },
-    resume: { findFirst: async () => ({ ...fixtureResume, ...fixtureExisting }), updateMany: mocks.resumeUpdateMany },
+    resume: { create: mocks.resumeCreate, findFirst: async () => ({ ...fixtureResume, ...fixtureExisting }), updateMany: mocks.resumeUpdateMany },
     coverLetter: { findFirst: vi.fn() },
     resumeVersion: { create: mocks.resumeVersionCreate },
   }
@@ -94,6 +95,7 @@ describe('tailor resume API', () => {
     mocks.resumeUpdate.mockReset()
     mocks.resumeUpdateMany.mockReset()
     mocks.resumeVersionCreate.mockReset()
+    mocks.withAuditLock.mockReset()
     mocks.transaction.mockReset()
     mocks.activityCreate.mockReset()
     mocks.hasEffectiveEntitlement.mockReset()
@@ -120,6 +122,7 @@ describe('tailor resume API', () => {
     mocks.failAudit.mockResolvedValue(true)
     mocks.lockMaterials.mockResolvedValue(true)
     mocks.transaction.mockImplementation(callback => callback(fixtureTx()))
+    mocks.withAuditLock.mockImplementation((_scope, callback) => mocks.transaction(callback))
   })
 
   it('reuses the tailored resume already linked to the job without calling the AI', async () => {
@@ -164,9 +167,32 @@ describe('tailor resume API', () => {
     expect(response.status).toBe(200)
     expect(mocks.modelChat).toHaveBeenCalledWith(expect.arrayContaining([expect.objectContaining({ content: expect.stringContaining('CONFIRMED PERSONA') })]), expect.any(Object), 2000)
     expect(mocks.resumeCreate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ parentResumeId: 'resume_base', content: { summary: 'Backend engineer building TypeScript systems' } }) }))
+    expect(mocks.withAuditLock).toHaveBeenLastCalledWith({ userId: 'user_1', jobId: 'job_1' }, expect.any(Function), { sourceMaterialFence: true })
+    expect(mocks.modelChat.mock.invocationCallOrder[0]).toBeLessThan(mocks.withAuditLock.mock.invocationCallOrder.at(-1)!)
     expect(mocks.resumeUpdate).not.toHaveBeenCalled()
     expect(mocks.readAudit).not.toHaveBeenCalled()
-    expect(mocks.transaction).not.toHaveBeenCalled()
+    expect(mocks.transaction).toHaveBeenCalledTimes(1)
+  })
+
+  it('fails closed when the source fence cannot be acquired after model work', async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_base', content: { summary: 'Backend engineer' }, templateId: null, templateOptions: null, directionId: null, basicsDetached: false })
+      .mockResolvedValueOnce(null)
+    mocks.jobFindFirst.mockResolvedValueOnce({ id: 'job_1', company: 'N26', role: 'Backend Engineer', description: 'Build reliable TypeScript systems.', keywords: 'TypeScript' })
+    mocks.modelChat.mockResolvedValue({ text: '{"after":"Backend engineer building TypeScript systems"}' })
+    mocks.parseAiJson.mockReturnValue({ after: 'Backend engineer building TypeScript systems' })
+    mocks.withAuditLock.mockRejectedValueOnce(new Error('source fence failed'))
+    const { POST } = await import('./route')
+
+    await expect(POST(new NextRequest('http://localhost/api/jobs/job_1/tailor-resume', {
+      method: 'POST', body: JSON.stringify({ resumeId: 'resume_base' }), headers: { 'Content-Type': 'application/json' },
+    }) as never, { params: Promise.resolve({ id: 'job_1' }) })).rejects.toThrow('source fence failed')
+
+    expect(mocks.withAuditLock).toHaveBeenCalledWith({ userId: 'user_1', jobId: 'job_1' }, expect.any(Function), { sourceMaterialFence: true })
+    expect(mocks.modelChat.mock.invocationCallOrder[0]).toBeLessThan(mocks.withAuditLock.mock.invocationCallOrder[0])
+    expect(mocks.resumeCreate).not.toHaveBeenCalled()
+    expect(mocks.resumeUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
   })
 
   it.each([undefined, '', 'not-a-signature'])('rejects forced correction without a valid receipt signature: %s', async signature => {
@@ -303,6 +329,8 @@ describe('tailor resume API', () => {
     expect(mocks.modelChat.mock.calls[0][0][0].content).toContain(`ORIGINAL RESUME EVIDENCE:\n${JSON.stringify(source, null, 2)}`)
     expect(mocks.resumeVersionCreate).toHaveBeenCalledWith({ data: { resumeId: 'resume_tailored', userId: 'user_1', content: current, name: 'Tailored' } })
     expect(mocks.resumeUpdateMany).toHaveBeenCalledWith({ where: { id: 'resume_tailored', userId: 'user_1', targetJobId: 'job_1', kind: 'adapted', origin: 'ai-adapted', parentResumeId: 'resume_base', updatedAt: new Date('2026-01-01T00:00:00Z'), content: { equals: current } }, data: { content: { ...current, experience: [{ role: 'Developer' }, { role: 'Supported second role' }] } } })
+    expect(mocks.withAuditLock).toHaveBeenLastCalledWith({ userId: 'user_1', jobId: 'job_1' }, expect.any(Function), { sourceMaterialFence: true })
+    expect(mocks.modelChat.mock.invocationCallOrder[0]).toBeLessThan(mocks.withAuditLock.mock.invocationCallOrder.at(-1)!)
     expect(mocks.resumeCreate).not.toHaveBeenCalled()
   })
 
