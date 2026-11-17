@@ -1,5 +1,6 @@
 import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
+import { acquireSourceMaterialFence } from '../source-material-fence'
 import { AgentExecutionCancelledError, refreshAgentExecutionAttempt } from '../execution-control'
 import type { PipelineCtx, ScoredJob } from '../types'
 
@@ -159,11 +160,15 @@ export async function withPrepareOwnership<T>(
   sj: ScoredJob,
   ctx: PipelineCtx,
   write: (tx: Prisma.TransactionClient) => Promise<T>,
+  options: { sourceMaterialFence?: boolean } = {},
 ): Promise<T> {
   assertPrepareNotAborted(ctx)
   if (!analysisFenceDate(sj) && !canReenterTokenlessPrepare(sj, ctx)) throw new PrepareOwnershipLostError()
   const result = await db.$transaction(async tx => {
     assertPrepareNotAborted(ctx)
+    if (options.sourceMaterialFence) {
+      await acquireSourceMaterialFence(tx, [ctx.userId])
+    }
     const attemptCurrent = await refreshExecutionAttempt(tx, ctx)
     assertPrepareNotAborted(ctx)
     if (!attemptCurrent) throw new PrepareOwnershipLostError()

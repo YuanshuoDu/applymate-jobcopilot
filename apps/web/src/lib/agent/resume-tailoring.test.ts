@@ -1,18 +1,23 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
+  transaction: vi.fn(), sourceFence: vi.fn(),
   resumeFindFirst: vi.fn(), jobFindFirst: vi.fn(), resumeCreate: vi.fn(), activityCreate: vi.fn(),
   modelChat: vi.fn(), parseAiJson: vi.fn(),
   buildPersona: vi.fn(),
 }))
 
+const tx = { resume: { create: mocks.resumeCreate } }
+
 vi.mock('@/lib/db', () => ({
   db: {
-    resume: { findFirst: mocks.resumeFindFirst, create: mocks.resumeCreate },
+    $transaction: mocks.transaction,
+    resume: { findFirst: mocks.resumeFindFirst },
     job: { findFirst: mocks.jobFindFirst },
     activity: { create: mocks.activityCreate },
   },
 }))
+vi.mock('./source-material-fence', () => ({ acquireSourceMaterialFence: mocks.sourceFence }))
 vi.mock('@/lib/model-router', () => ({ modelChat: mocks.modelChat, parseAiJson: mocks.parseAiJson }))
 vi.mock('@/lib/persona', () => ({ buildPersona: mocks.buildPersona }))
 
@@ -21,6 +26,8 @@ import { tailorResumeForAgent } from './resume-tailoring'
 describe('tailorResumeForAgent', () => {
   beforeEach(() => {
     Object.values(mocks).forEach(mock => mock.mockReset())
+    mocks.transaction.mockImplementation(async (work: (client: unknown) => Promise<unknown>) => work(tx))
+    mocks.sourceFence.mockResolvedValue(undefined)
     mocks.resumeFindFirst.mockImplementation((args: { where: Record<string, unknown> }) => {
       if ('parentResumeId' in args.where) return null
       return { id: 'resume_1', name: 'Base CV', content: { summary: 'Backend engineer', skills: ['TypeScript'] }, templateId: 'modern', templateOptions: { accentColor: 'blue' }, directionId: null, basicsDetached: false }
@@ -41,6 +48,20 @@ describe('tailorResumeForAgent', () => {
       userId: 'user_1', parentResumeId: 'resume_1', targetJobId: 'job_1', templateId: 'modern', kind: 'adapted', origin: 'ai-adapted',
     }) })
     expect(mocks.modelChat).toHaveBeenCalledWith(expect.arrayContaining([expect.objectContaining({ content: expect.stringContaining('CONFIRMED PERSONA') })]), expect.any(Object), 2400)
+    expect(mocks.modelChat.mock.invocationCallOrder[0]).toBeLessThan(mocks.transaction.mock.invocationCallOrder[0])
+    expect(mocks.transaction.mock.invocationCallOrder[0]).toBeLessThan(mocks.sourceFence.mock.invocationCallOrder[0])
+    expect(mocks.sourceFence.mock.invocationCallOrder[0]).toBeLessThan(mocks.resumeCreate.mock.invocationCallOrder[0])
+    expect(mocks.sourceFence).toHaveBeenCalledWith(tx, ['user_1'])
+  })
+
+  it('fails closed when the source fence cannot be acquired', async () => {
+    mocks.sourceFence.mockRejectedValueOnce(new Error('fence unavailable'))
+
+    await expect(tailorResumeForAgent({ userId: 'user_1', resumeId: 'resume_1', jobId: 'job_1', aiConfig: { provider: 'openai', model: 'test' } }))
+      .rejects.toThrow('fence unavailable')
+
+    expect(mocks.resumeCreate).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
   })
 
   it('reuses an existing candidate artifact rather than creating a duplicate', async () => {
@@ -52,6 +73,7 @@ describe('tailorResumeForAgent', () => {
     await expect(tailorResumeForAgent({ userId: 'user_1', resumeId: 'resume_1', jobId: 'job_1', aiConfig: { provider: 'openai', model: 'test' } }))
       .resolves.toEqual(expect.objectContaining({ id: 'resume_existing', reused: true }))
     expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.transaction).not.toHaveBeenCalled()
     expect(mocks.resumeCreate).not.toHaveBeenCalled()
   })
 })
