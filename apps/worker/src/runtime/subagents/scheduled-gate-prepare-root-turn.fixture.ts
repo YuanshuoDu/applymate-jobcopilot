@@ -22,6 +22,8 @@ import { graphScope, scheduledGateRootActions, turnExecutionOwner } from "./sche
 
 export const SCHEDULED_GATE_ROOT_CANDIDATE = "Scheduled Gate integration candidate."
 const CANDIDATE_USAGE = { inputTokens: 37, outputTokens: 9, estimatedCostUsd: 0.018 }
+const FIXTURE_WEB_URL = "http://scheduled-gate-prepare-root.invalid"
+const FIXTURE_WORKER_SECRET = "scheduled-gate-prepare-root-fixture-secret"
 
 export type ScheduledGatePrepareRootQuestion = Readonly<{
   stepId: string
@@ -94,7 +96,11 @@ export async function runScheduledGatePrepareRootQuestion(input: Readonly<{
     return result
   }
   const fetcher: typeof fetch = async (_request, init) => {
-    if (init?.method !== "POST" || typeof init.body !== "string") throw new Error("scheduled_gate_prepare_handoff_request_invalid")
+    if (String(_request) !== `${FIXTURE_WEB_URL}/api/internal/agent-runtime/scheduled-pipeline`
+      || init?.method !== "POST" || typeof init.body !== "string"
+      || new Headers(init.headers).get("x-agent-worker-secret") !== FIXTURE_WORKER_SECRET) {
+      throw new Error("scheduled_gate_prepare_handoff_request_invalid")
+    }
     const body = record(JSON.parse(init.body))
     if (!body || body.action !== undefined || Object.hasOwn(body, "prepareProof")
       || !sameOwner(body.owner, owner) || !sameAttestation(body.attestation, attestation)) {
@@ -117,7 +123,12 @@ export async function runScheduledGatePrepareRootQuestion(input: Readonly<{
     yield { type: "text_delta", text: SCHEDULED_GATE_ROOT_CANDIDATE }
     yield { type: "completed", finishReason: "stop" }
   } }
-  const result: TurnEngineResult = await new TurnEngine({ lease, rootTaskId: seed.ids.rootTaskId, taskId: seed.ids.rootTaskId,
+  const priorWebUrl = process.env.AGENT_WEB_URL, priorWorkerSecret = process.env.AGENT_WORKER_SECRET
+  process.env.AGENT_WEB_URL = FIXTURE_WEB_URL
+  process.env.AGENT_WORKER_SECRET = FIXTURE_WORKER_SECRET
+  let result: TurnEngineResult
+  try {
+    result = await new TurnEngine({ lease, rootTaskId: seed.ids.rootTaskId, taskId: seed.ids.rootTaskId,
     scope: { userId: seed.ids.userId }, goal: "Prepare the verified scheduled Analyze checkpoint",
     snapshot: { system: [], profile: [], steerHistory: [], toolObservations: [],
       businessRefs: seed.selectedJobIds.map(id => ({ id, kind: "job" as const, ownerId: seed.ids.userId })) },
@@ -126,6 +137,10 @@ export async function runScheduledGatePrepareRootQuestion(input: Readonly<{
     store: createPgTurnEngineStore(pool as never), model, tools: [], executeTool: async ({ call }) => ({ id: call.id,
       toolName: call.toolName, toolVersion: call.toolVersion, status: "completed", errorCode: null }), completionGate,
   }).run()
+  } finally {
+    restoreEnv("AGENT_WEB_URL", priorWebUrl)
+    restoreEnv("AGENT_WORKER_SECRET", priorWorkerSecret)
+  }
   if (result.status !== "waiting_for_user" || result.waitId !== expectedWaitId || !finalStep) {
     throw new Error("scheduled_gate_prepare_root_question_not_persisted")
   }
@@ -146,6 +161,10 @@ export async function runScheduledGatePrepareRootQuestion(input: Readonly<{
 
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+function restoreEnv(key: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[key]
+  else process.env[key] = value
 }
 function sameOwner(value: unknown, expected: ScheduledAutomationPipelineBridgeScope): boolean {
   const owner = record(value)
