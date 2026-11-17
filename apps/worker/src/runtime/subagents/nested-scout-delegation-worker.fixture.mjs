@@ -107,11 +107,59 @@ function recoveryErrorClass(error, includeMessage = false) {
     return error instanceof Error ? "error" : "unknown"
   } catch { return "unknown" }
 }
+const SAFE_TASK_ALIASES = new Set(["parent_scout", "depth_two_scout_alpha", "depth_two_scout_beta", "other_scout", "other", "unavailable"])
+const MAX_LEASE_DIAGNOSTICS = 12
+function fixtureTaskAlias(task) {
+  if (task?.role !== "scout" || task?.taskType !== "job_discovery") return "other"
+  if (task.depth === 1) return "parent_scout"
+  if (task.depth === 2 && typeof task.goal === "string") {
+    if (task.goal.includes("Alpha")) return "depth_two_scout_alpha"
+    if (task.goal.includes("Beta")) return "depth_two_scout_beta"
+    return "other_scout"
+  }
+  return "other"
+}
+function boundedAttempt(value) { return Number.isInteger(value) && value >= 0 && value <= 3 ? value : "other" }
+function safeLeaseDiagnostic(task, taskAlias = fixtureTaskAlias(task)) {
+  const attempt = boundedAttempt(task?.attemptCount)
+  return {
+    task: SAFE_TASK_ALIASES.has(taskAlias) ? taskAlias : "unavailable",
+    attempt,
+    leaseVersion: attempt,
+    leaseVersionSource: "attemptCount",
+    status: "unavailable",
+    leaseState: "unavailable",
+    ownerFence: "unavailable",
+    attemptFence: "unavailable",
+    expiryBucket: "unavailable",
+  }
+}
 function withWaitingFinishDiagnostics(store) { const finish = store.finish.bind(store); store.finish = input => finish(input).catch(error => { if (input.status === "waiting") { const code = recoveryErrorClass(error, true); say(`P1143_WAITING_FINISH_DIAGNOSTIC:${code === "idempotency_conflict" || code === "revision_mismatch" ? code : "other"}`) } throw error }); return store }
+function installHeartbeatDiagnostics(store) {
+  const heartbeat = store.heartbeat.bind(store)
+  let emitted = 0
+  const report = (input, outcome) => {
+    if (emitted >= MAX_LEASE_DIAGNOSTICS) return
+    emitted += 1
+    try { say(`P1143_HEARTBEAT_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseDiagnostic(input, "unavailable"), outcome })}`) } catch {}
+  }
+  store.heartbeat = async input => {
+    try {
+      const outcome = await heartbeat(input)
+      if (outcome !== "renewed") report(input, outcome === "interrupted" ? "interrupted" : "lost")
+      return outcome
+    } catch (error) {
+      report(input, "storage_error")
+      throw error
+    }
+  }
+}
 async function start(mode) {
   installWaitResolverDiagnostics(say)
   const ownerId = `p1143-worker-${process.pid}`
-  const manager = mode === "park" ? undefined : new AgentTreeManager(withWaitingFinishDiagnostics(new PgSubagentTaskStore(pool, CRASH_TEST_LEASE_MS)), { heartbeatMs: CRASH_TEST_HEARTBEAT_MS })
+  const taskStore = mode === "park" ? undefined : withWaitingFinishDiagnostics(new PgSubagentTaskStore(pool, CRASH_TEST_LEASE_MS))
+  if (taskStore) installHeartbeatDiagnostics(taskStore)
+  const manager = taskStore ? new AgentTreeManager(taskStore, { heartbeatMs: CRASH_TEST_HEARTBEAT_MS }) : undefined
   let recoveryStage = "manager_recover"
   if (mode === "resume" && manager) {
     const recoveryMarkers = new Set()
@@ -147,6 +195,7 @@ async function start(mode) {
     modelRuntimeFactory: () => { say("P1143_ROOT_MODEL_RUNTIME_FACTORY_ENTERED"); try { const model = rootModelRuntime(); say("P1143_ROOT_MODEL_RUNTIME_FACTORY_CREATED"); return model } catch (error) { say(`P1143_ROOT_MODEL_RUNTIME_FACTORY_ERROR:${recoveryErrorClass(error, true)}`); throw error } },
   })
   const markerState = { closedStepRejected: false, parallelObserved: false }
+  let resumeLoaderDiagnosticCount = 0
   const executeChild = createProductionChildExecutor({ pool, subagentManager: () => runtime.manager,
     authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
       settle: async () => undefined, settleUnknown: async () => undefined }), jobDiscoveryClient: discoveryClient(),
@@ -157,7 +206,14 @@ async function start(mode) {
         return pool.connect()
       } }).resumeLoader
       try { return await loader(lease) }
-      catch (error) { const validationStage = error && typeof error === "object" && SAFE_WAIT_RESUME_DIAGNOSTIC_STAGES.has(error.sourceLifecycleStage) ? error.sourceLifecycleStage : error && typeof error === "object" && SAFE_WAIT_RESUME_DIAGNOSTIC_STAGES.has(error.resumeValidationStage) ? error.resumeValidationStage : "other"; say(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${stage}:${recoveryErrorClass(error, true)}:${validationStage}`); throw error }
+      catch (error) {
+        if (resumeLoaderDiagnosticCount < MAX_LEASE_DIAGNOSTICS) {
+          resumeLoaderDiagnosticCount += 1
+          const validationStage = error && typeof error === "object" && SAFE_WAIT_RESUME_DIAGNOSTIC_STAGES.has(error.sourceLifecycleStage) ? error.sourceLifecycleStage : error && typeof error === "object" && SAFE_WAIT_RESUME_DIAGNOSTIC_STAGES.has(error.resumeValidationStage) ? error.resumeValidationStage : "other"
+          try { say(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseDiagnostic(lease), stage, errorCode: recoveryErrorClass(error, true), validationStage })}`) } catch {}
+        }
+        throw error
+      }
     }, modelRuntimeFactory: input => childModelRuntime({ ...input, runtime, markerState }), durableWaitResumeCommitter: waitResumeCommitter() })
   const execute = createCrashFixtureExecutor(mode, executeChild, say)
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 100,

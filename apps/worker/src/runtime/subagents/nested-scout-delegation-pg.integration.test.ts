@@ -18,6 +18,7 @@ const PROCESS_FIXTURE = fileURLToPath(new URL("./nested-scout-delegation-worker.
 const MAIN_PROGRESS_QUERY_TIMEOUT_MS = 2_000
 
 type FixtureIds = Readonly<{ userId: string; sessionId: string; turnId: string; alphaJobId: string; betaJobId: string; foreignJobId: string }>
+type FixtureTaskAlias = "parent_scout" | "depth_two_scout_alpha" | "depth_two_scout_beta" | "other_scout"
 type FixtureProcess = { child: ChildProcess; waitForLine(marker: string, timeoutMs: number): Promise<void>; output: string[] }
 const MAIN_PROGRESS_MARKERS = new Set([
   "P1143_ROOT_MODEL_STREAM_STARTED", "P1143_ROOT_MODEL_RUNTIME_FACTORY_ENTERED", "P1143_ROOT_MODEL_RUNTIME_FACTORY_CREATED",
@@ -97,6 +98,14 @@ const SAFE_CHILD_RESUME_VALIDATION_STAGES = [
   "wait_state", "wait_result_shape", "target_scope", "resolved_outcome", "tool_call", "call_binding", "receipt_pair",
   "receipt_identity", "receipt_ids", "receipt_deadline", "input_target_ids", "output_target_ids", "other",
 ] as const
+const SAFE_FIXTURE_TASK_ALIASES = ["parent_scout", "depth_two_scout_alpha", "depth_two_scout_beta", "other_scout", "other", "unavailable"] as const
+const SAFE_FIXTURE_TASK_STATUSES = ["queued", "running", "retrying", "waiting", "completed", "failed", "interrupted", "cancelled", "closed", "missing", "unavailable", "other"] as const
+const SAFE_FIXTURE_LEASE_STATES = ["owner_absent", "expiry_absent", "expired", "live", "missing", "unavailable"] as const
+const SAFE_FIXTURE_OWNER_FENCES = ["match", "mismatch", "absent", "unavailable"] as const
+const SAFE_FIXTURE_ATTEMPT_FENCES = ["match", "mismatch", "unavailable"] as const
+const SAFE_FIXTURE_EXPIRY_BUCKETS = ["absent", "expired", "lt_1s", "1_to_5s", "gt_5s", "unavailable"] as const
+const SAFE_FIXTURE_HEARTBEAT_OUTCOMES = ["lost", "interrupted", "storage_error"] as const
+const SAFE_CHILD_RESUME_LOADER_STAGES = ["repair_consumed_waits", "durable_wait_resume", "child_attempt_resume", "other"] as const
 const SAFE_RELATED_EVENT_TYPES = new Set([
   "item.started", "item.delta", "item.completed", "item.failed", "item.interrupted",
   "tool_call.started", "tool_call.completed", "tool_call.failed", "tool_call.interrupted",
@@ -116,20 +125,153 @@ function progressQuery<Row extends QueryResultRow>(text: string, values: unknown
   return pool.query<Row, unknown[]>(config)
 }
 
+const NESTED_SCOUT_RECOVERY_CHECKPOINTS = [
+  "parent_wait_suspended", "planned_wait_timeout_observed", "crash_worker_stopped", "child_lease_expired",
+  "recovery_requeued_depth_two", "depth_two_reclaim_marker_seen", "depth_two_child_reclaimed",
+  "parent_wait_consumed_continuation_seen", "root_completed",
+] as const
+type NestedScoutRecoveryCheckpoint = typeof NESTED_SCOUT_RECOVERY_CHECKPOINTS[number]
+let nestedScoutRecoveryDiagnosticSequence = 0
+
+async function readNestedScoutRecoveryDiagnostic(ids: FixtureIds) {
+  type TaskRow = {
+    tier: string; status: string; attempt: number; leaseVersion: number; leaseState: string; leaseRemainingBucket: string; count: number
+  }
+  type WaitRow = {
+    status: string; deadlineBucket: string; suspended: boolean; consumed: boolean; targetCount: string;
+    parentAttempt: number; sourceAttempt: number; sourceOrdinal: number | null; continuationOrdinal: number | null
+  }
+  try {
+    const [tasks, waits] = await Promise.all([
+      progressQuery<TaskRow>(`WITH scoped AS (
+          SELECT CASE WHEN "depth" = 1 THEN 'parent_scout' ELSE 'depth_two_scout' END AS "tier",
+            CASE WHEN "status" IN ('queued', 'running', 'retrying', 'waiting', 'completed', 'failed', 'interrupted', 'cancelled', 'closed')
+              THEN "status" ELSE 'other' END AS "status",
+            CASE WHEN "attemptCount" BETWEEN 0 AND 3 THEN "attemptCount" ELSE -1 END::int AS "attempt",
+            CASE WHEN "attemptCount" BETWEEN 0 AND 3 THEN "attemptCount" ELSE -1 END::int AS "leaseVersion",
+            CASE WHEN "leaseOwner" IS NULL THEN 'owner_absent' WHEN "leaseExpiresAt" IS NULL THEN 'expiry_absent'
+              WHEN "leaseExpiresAt" <= clock_timestamp() THEN 'expired' ELSE 'live' END AS "leaseState",
+            CASE WHEN "leaseOwner" IS NULL OR "leaseExpiresAt" IS NULL THEN 'absent'
+              WHEN "leaseExpiresAt" <= clock_timestamp() THEN 'expired'
+              WHEN "leaseExpiresAt" <= clock_timestamp() + interval '1 second' THEN 'lt_1s'
+              WHEN "leaseExpiresAt" <= clock_timestamp() + interval '5 seconds' THEN '1_to_5s' ELSE 'gt_5s' END AS "leaseRemainingBucket"
+          FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 AND "role" = 'scout' AND "depth" IN (1, 2)
+        )
+        SELECT "tier", "status", "attempt", "leaseVersion", "leaseState", "leaseRemainingBucket",
+          CASE WHEN count(*) BETWEEN 1 AND 3 THEN count(*)::int ELSE 4 END AS "count"
+        FROM scoped GROUP BY "tier", "status", "attempt", "leaseVersion", "leaseState", "leaseRemainingBucket"
+        ORDER BY "tier", "status", "attempt", "leaseState", "leaseRemainingBucket" LIMIT 8`, [ids.sessionId, ids.turnId]),
+      progressQuery<WaitRow>(`WITH parent AS (
+          SELECT "id", "sessionId", "turnId", CASE WHEN "attemptCount" BETWEEN 0 AND 3 THEN "attemptCount" ELSE -1 END::int AS "parentAttempt"
+          FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 AND "depth" = 1 AND "role" = 'scout'
+        )
+        SELECT CASE WHEN wait."status" IN ('waiting', 'ready', 'timed_out', 'failed', 'interrupted', 'closed')
+            THEN wait."status" ELSE 'other' END AS "status",
+          CASE WHEN wait."deadlineAt" <= clock_timestamp() THEN 'elapsed'
+            WHEN wait."deadlineAt" <= clock_timestamp() + interval '1 second' THEN 'lt_1s'
+            WHEN wait."deadlineAt" <= clock_timestamp() + interval '5 seconds' THEN '1_to_5s' ELSE 'gt_5s' END AS "deadlineBucket",
+          wait."suspendedAt" IS NOT NULL AS "suspended", wait."consumedAt" IS NOT NULL AS "consumed",
+          CASE WHEN jsonb_typeof(wait."targetTaskIds") <> 'array' THEN 'invalid'
+            WHEN jsonb_array_length(wait."targetTaskIds") = 0 THEN 'zero'
+            WHEN jsonb_array_length(wait."targetTaskIds") = 1 THEN 'one'
+            WHEN jsonb_array_length(wait."targetTaskIds") = 2 THEN 'two' ELSE 'other' END AS "targetCount",
+          parent."parentAttempt", CASE WHEN source."attempt" BETWEEN 0 AND 3 THEN source."attempt" ELSE -1 END::int AS "sourceAttempt",
+          CASE WHEN source."ordinal" BETWEEN 0 AND 16 THEN source."ordinal" ELSE -1 END::int AS "sourceOrdinal",
+          CASE WHEN continuation."ordinal" BETWEEN 0 AND 16 THEN continuation."ordinal"
+            WHEN continuation."ordinal" IS NULL THEN NULL ELSE -1 END::int AS "continuationOrdinal"
+        FROM parent JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = parent."id"
+          AND wait."sessionId" = parent."sessionId" AND wait."turnId" = parent."turnId"
+        LEFT JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId"
+          AND source."turnId" = wait."turnId" AND source."taskId" = wait."parentTaskId"
+        LEFT JOIN LATERAL (
+          SELECT next."ordinal" FROM "agent_steps" AS next WHERE next."sessionId" = source."sessionId"
+            AND next."turnId" = source."turnId" AND next."taskId" = source."taskId"
+            AND next."attempt" = source."attempt" AND next."ordinal" > source."ordinal"
+          ORDER BY next."ordinal", next."id" LIMIT 1
+        ) AS continuation ON true
+        WHERE wait."idempotencyKey" ~ '^final-dependency-wait:[a-f0-9]{64}$'
+        ORDER BY wait."createdAt", wait."id" LIMIT 4`, [ids.sessionId, ids.turnId]),
+    ])
+    return {
+      available: true,
+      leaseVersionSource: "sub_agent_tasks.attemptCount",
+      taskLeasesByRoleAndAttempt: tasks.rows,
+      finalWaitAndContinuationOrder: waits.rows,
+    }
+  } catch {
+    return {
+      available: false,
+      leaseVersionSource: "sub_agent_tasks.attemptCount",
+      taskLeasesByRoleAndAttempt: [],
+      finalWaitAndContinuationOrder: [],
+    }
+  }
+}
+
+async function emitNestedScoutRecoveryDiagnostic(
+  ids: FixtureIds,
+  checkpoint: NestedScoutRecoveryCheckpoint,
+  additionalFixtureIdentifiers: readonly string[] = [],
+): Promise<void> {
+  if (!NESTED_SCOUT_RECOVERY_CHECKPOINTS.includes(checkpoint)) throw new Error("Nested Scout diagnostic checkpoint is not allowlisted")
+  const snapshot = await readNestedScoutRecoveryDiagnostic(ids)
+  const serialized = JSON.stringify(snapshot)
+  if (serialized.length > 8_192) throw new Error("Nested Scout recovery diagnostic exceeded its size bound")
+  if ([...Object.values(ids), ...additionalFixtureIdentifiers].some(value => value && serialized.includes(value))) {
+    throw new Error("Nested Scout recovery diagnostic contained a fixture identifier")
+  }
+  nestedScoutRecoveryDiagnosticSequence += 1
+  console.info(`P1143_NESTED_SCOUT_RECOVERY_DIAGNOSTIC:${JSON.stringify({ sequence: nestedScoutRecoveryDiagnosticSequence, checkpoint, ...snapshot })}`)
+}
+
 function isSafeRootSetupDiagnostic(value: string): boolean {
   const match = value.match(/^P1143_ROOT_(MODEL_RUNTIME_FACTORY|USAGE_AUTHORIZER)_ERROR:([A-Za-z0-9_]+)$/)
   return !!match && SAFE_RECOVERY_ERROR_CODES.includes(match[2] as typeof SAFE_RECOVERY_ERROR_CODES[number])
 }
 
+function safeDiagnosticPayload(value: string, prefix: string): Record<string, unknown> | null {
+  if (!value.startsWith(prefix)) return null
+  try {
+    const parsed: unknown = JSON.parse(value.slice(prefix.length))
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
+  } catch { return null }
+}
+
+function safeFixtureLeaseFields(payload: Record<string, unknown>): boolean {
+  const exactKeys = ["task", "attempt", "leaseVersion", "leaseVersionSource", "status", "leaseState", "ownerFence", "attemptFence", "expiryBucket"]
+  const attemptOk = payload.attempt === "other" || (typeof payload.attempt === "number" && Number.isInteger(payload.attempt) && payload.attempt >= 0 && payload.attempt <= 3)
+  const versionOk = payload.leaseVersion === "other" || (typeof payload.leaseVersion === "number" && Number.isInteger(payload.leaseVersion) && payload.leaseVersion >= -1 && payload.leaseVersion <= 3)
+  return exactKeys.every(key => Object.prototype.hasOwnProperty.call(payload, key))
+    && SAFE_FIXTURE_TASK_ALIASES.includes(payload.task as typeof SAFE_FIXTURE_TASK_ALIASES[number])
+    && attemptOk && versionOk && payload.leaseVersionSource === "attemptCount"
+    && SAFE_FIXTURE_TASK_STATUSES.includes(payload.status as typeof SAFE_FIXTURE_TASK_STATUSES[number])
+    && SAFE_FIXTURE_LEASE_STATES.includes(payload.leaseState as typeof SAFE_FIXTURE_LEASE_STATES[number])
+    && SAFE_FIXTURE_OWNER_FENCES.includes(payload.ownerFence as typeof SAFE_FIXTURE_OWNER_FENCES[number])
+    && SAFE_FIXTURE_ATTEMPT_FENCES.includes(payload.attemptFence as typeof SAFE_FIXTURE_ATTEMPT_FENCES[number])
+    && SAFE_FIXTURE_EXPIRY_BUCKETS.includes(payload.expiryBucket as typeof SAFE_FIXTURE_EXPIRY_BUCKETS[number])
+}
+
 function isSafeChildResumeLoaderDiagnostic(value: string): boolean {
-  const match = value.match(/^P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:(repair_consumed_waits|durable_wait_resume|child_attempt_resume):([A-Za-z0-9_]+):([A-Za-z0-9_]+)$/)
-  return !!match && SAFE_CHILD_RESUME_LOADER_CODES.includes(match[2] as typeof SAFE_CHILD_RESUME_LOADER_CODES[number])
-    && SAFE_CHILD_RESUME_VALIDATION_STAGES.includes(match[3] as typeof SAFE_CHILD_RESUME_VALIDATION_STAGES[number])
+  const payload = safeDiagnosticPayload(value, "P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:")
+  if (!payload || !safeFixtureLeaseFields(payload)) return false
+  const exactKeys = ["task", "attempt", "leaseVersion", "leaseVersionSource", "status", "leaseState", "ownerFence", "attemptFence", "expiryBucket", "stage", "errorCode", "validationStage"]
+  return Object.keys(payload).sort().join("|") === exactKeys.sort().join("|")
+    && SAFE_CHILD_RESUME_LOADER_STAGES.includes(payload.stage as typeof SAFE_CHILD_RESUME_LOADER_STAGES[number])
+    && SAFE_CHILD_RESUME_LOADER_CODES.includes(payload.errorCode as typeof SAFE_CHILD_RESUME_LOADER_CODES[number])
+    && SAFE_CHILD_RESUME_VALIDATION_STAGES.includes(payload.validationStage as typeof SAFE_CHILD_RESUME_VALIDATION_STAGES[number])
+}
+
+function isSafeHeartbeatDiagnostic(value: string): boolean {
+  const payload = safeDiagnosticPayload(value, "P1143_HEARTBEAT_DIAGNOSTIC:")
+  if (!payload || !safeFixtureLeaseFields(payload)) return false
+  const exactKeys = ["task", "attempt", "leaseVersion", "leaseVersionSource", "status", "leaseState", "ownerFence", "attemptFence", "expiryBucket", "outcome"]
+  return Object.keys(payload).sort().join("|") === exactKeys.sort().join("|")
+    && SAFE_FIXTURE_HEARTBEAT_OUTCOMES.includes(payload.outcome as typeof SAFE_FIXTURE_HEARTBEAT_OUTCOMES[number])
 }
 
 function seenMainProgress(output: string[]) {
   return [...new Set(output.filter(value => MAIN_PROGRESS_MARKERS.has(value)
-    || SAFE_RECOVERY_DIAGNOSTIC_MARKERS.has(value) || isSafeChildResumeLoaderDiagnostic(value)
+    || SAFE_RECOVERY_DIAGNOSTIC_MARKERS.has(value) || isSafeChildResumeLoaderDiagnostic(value) || isSafeHeartbeatDiagnostic(value)
     || isSafeRootSetupDiagnostic(value) || isSafeParentResumeDiagnostic(value) || isSafeParentCurrentReadsDiagnostic(value)))]
 }
 
@@ -225,6 +367,7 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       readWaitAcknowledgementDiagnostic(ids), readSourceEventChainDiagnostic(ids), readParentResumeProgressDiagnostic(ids),
       readPendingChildWaitDiagnostic(ids), readWaitCallLineageDiagnostic(ids),
     ])
+    const recoveryOrdering = await readNestedScoutRecoveryDiagnostic(ids)
     return {
       observedPhases, fixtureFailure, waitResumeCommitFailures, waitingFinishFailures, waitResolverErrorCodes,
       turnStatus: turn.rows[0]?.status ?? "missing",
@@ -240,6 +383,7 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       parentResumeProgress,
       pendingChildWait,
       waitCallLineage,
+      recoveryOrdering,
     }
   } catch {
     return { observedPhases, fixtureFailure, waitResumeCommitFailures, waitingFinishFailures, databaseDiagnosticAvailable: false }
@@ -919,12 +1063,18 @@ async function readSourceEventChainDiagnostic(ids: FixtureIds) {
   }
 }
 
-async function waitForMainMarker(ids: FixtureIds, worker: FixtureProcess, marker: string, timeoutMs: number): Promise<void> {
+async function waitForMainMarker(
+  ids: FixtureIds,
+  worker: FixtureProcess,
+  marker: string,
+  timeoutMs: number,
+  expectedTaskAlias?: FixtureTaskAlias,
+): Promise<void> {
   try {
     await worker.waitForLine(marker, timeoutMs)
   } catch (error) {
     const diagnostic = await readMainProgressDiagnostic(ids, worker.output)
-    console.info(`P1143_MAIN_PROGRESS_DIAGNOSTIC:${JSON.stringify({ waitingFor: marker, ...diagnostic })}`)
+    console.info(`P1143_MAIN_PROGRESS_DIAGNOSTIC:${JSON.stringify({ waitingFor: marker, ...(expectedTaskAlias ? { expectedTaskAlias } : {}), ...diagnostic })}`)
     throw error
   }
 }
@@ -1049,7 +1199,14 @@ async function waitForFinalWaitAfterTimeout(ids: FixtureIds, parentTaskId: strin
   throw new Error("Resumed parent did not register a second suspended final wait")
 }
 
-async function waitForReclaimedCrashChild(ids: FixtureIds, childTaskId: string, previousOwnerId: string, timeoutMs: number): Promise<string> {
+async function waitForReclaimedCrashChild(
+  ids: FixtureIds,
+  childTaskId: string,
+  previousOwnerId: string,
+  timeoutMs: number,
+  worker: FixtureProcess,
+  expectedTaskAlias: FixtureTaskAlias,
+): Promise<string> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const result = await progressQuery<{ status: string; attemptCount: number; leaseOwner: string | null; dispatchOwner: string;
@@ -1067,6 +1224,8 @@ async function waitForReclaimedCrashChild(ids: FixtureIds, childTaskId: string, 
       && (row.status === "completed" ? row.leaseOwner === null : row.leaseOwner === row.dispatchOwner)) return row.dispatchOwner
     await new Promise(resolve => setTimeout(resolve, 50))
   }
+  const diagnostic = await readMainProgressDiagnostic(ids, worker.output)
+  console.info(`P1143_RECLAIMED_CHILD_PROGRESS_DIAGNOSTIC:${JSON.stringify({ expectedTaskAlias, ...diagnostic })}`)
   throw new Error("Nested Scout child was not safely reclaimed under a new owner")
 }
 
@@ -1198,6 +1357,14 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
 
 
   it("reclaims a claimed Scout child after a pre-model Worker crash and joins source-bound children across Worker restart", async () => {
+    const safeLeaseFields = { task: "depth_two_scout_alpha", attempt: 2, leaseVersion: 2, leaseVersionSource: "attemptCount",
+      status: "running", leaseState: "expired", ownerFence: "match", attemptFence: "match", expiryBucket: "expired" }
+    expect(isSafeChildResumeLoaderDiagnostic(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseFields,
+      stage: "child_attempt_resume", errorCode: "child_resume_owner_mismatch", validationStage: "lease_fence" })}`)).toBe(true)
+    expect(isSafeHeartbeatDiagnostic(`P1143_HEARTBEAT_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseFields, outcome: "lost" })}`)).toBe(true)
+    expect(isSafeChildResumeLoaderDiagnostic(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseFields, taskId: "fixture-id-sentinel",
+      stage: "child_attempt_resume", errorCode: "child_resume_owner_mismatch", validationStage: "lease_fence" })}`)).toBe(false)
+    expect(isSafeHeartbeatDiagnostic(`P1143_HEARTBEAT_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseFields, ownerId: "fixture-owner-sentinel", outcome: "lost" })}`)).toBe(false)
     const inheritedWorkerEnv = fixtureWorkerEnv({ DATABASE_URL: "postgresql://production.invalid/production" }, databaseUrl!)
     expect(inheritedWorkerEnv.DATABASE_URL).toBe(databaseUrl)
     const suffix = randomUUID()
@@ -1215,6 +1382,7 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       await waitForMainMarker(ids, first, "P1143_CLOSED_STEP_REPLAY_REJECTED", 45_000)
       await waitForMainMarker(ids, first, "P1143_FOREIGN_CALL_STEP_REJECTED", 45_000)
       await waitForMainMarker(ids, first, "P1143_PARENT_WAITING", 45_000)
+      await emitNestedScoutRecoveryDiagnostic(ids, "parent_wait_suspended")
 
       const parent = await pool.query<{ id: string; rootTaskId: string; status: string; leaseOwner: string | null; attemptCount: number }>(
         `SELECT "id", "rootTaskId", "status", "leaseOwner", "attemptCount" FROM "sub_agent_tasks"
@@ -1292,8 +1460,10 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       crashing = launch("crash-child", ids)
       await waitForMainMarker(ids, crashing, "P1143_CRASH_CHILD_BEFORE_MODEL_CALL", 30_000)
       await waitForMainMarker(ids, crashing, "P1143_CHILD_WORKER_CLAIMED_RUNNING", 30_000)
-      const claimedChildren = await pool.query<{ id: string; status: string; leaseOwner: string | null; leaseLive: boolean; attemptCount: number }>(
-        `SELECT child."id", child."status", child."leaseOwner", child."leaseExpiresAt" > clock_timestamp() AS "leaseLive", child."attemptCount"
+      const claimedChildren = await pool.query<{ id: string; status: string; leaseOwner: string | null; leaseLive: boolean; attemptCount: number; fixtureAlias: FixtureTaskAlias }>(
+        `SELECT child."id", child."status", child."leaseOwner", child."leaseExpiresAt" > clock_timestamp() AS "leaseLive", child."attemptCount",
+            CASE WHEN child."goal" = 'Read the Fixture Alpha role' THEN 'depth_two_scout_alpha'
+              WHEN child."goal" = 'Read the Fixture Beta role' THEN 'depth_two_scout_beta' ELSE 'other_scout' END AS "fixtureAlias"
          FROM "sub_agent_tasks" AS child WHERE child."sessionId" = $1 AND child."parentTaskId" = $2 AND child."depth" = 2
          ORDER BY child."id"`, [ids.sessionId, parent.rows[0]!.id])
       expect(claimedChildren.rows).toHaveLength(2)
@@ -1312,16 +1482,24 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       [ids.sessionId, ids.turnId, crashedChild.id])
       expect(modelStartsBeforeCrash.rows[0]?.count).toBe(0)
       await waitForTimedOutParentWait(ids, parent.rows[0]!.id, initialWaitId, 60_000)
+      await emitNestedScoutRecoveryDiagnostic(ids, "planned_wait_timeout_observed", [parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!])
       await killAndWait(crashing.child)
       crashing = undefined
+      await emitNestedScoutRecoveryDiagnostic(ids, "crash_worker_stopped", [parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!])
       await waitForExpiredCrashLease(ids, parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!, 30_000)
+      await emitNestedScoutRecoveryDiagnostic(ids, "child_lease_expired", [parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!])
       restarted = launch("resume", ids)
       await waitForMainMarker(ids, restarted, "P1143_RECOVERY_DEPTH2_QUEUED", 30_000)
-      await waitForMainMarker(ids, restarted, "P1143_CHILD_SCOUT_RECLAIMED", 30_000)
-      const reclaimedOwner = await waitForReclaimedCrashChild(ids, crashedChild.id, crashedChild.leaseOwner!, 30_000)
+      await emitNestedScoutRecoveryDiagnostic(ids, "recovery_requeued_depth_two", [parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!])
+      await waitForMainMarker(ids, restarted, "P1143_CHILD_SCOUT_RECLAIMED", 30_000, crashedChild.fixtureAlias)
+      await emitNestedScoutRecoveryDiagnostic(ids, "depth_two_reclaim_marker_seen", [parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!])
+      const reclaimedOwner = await waitForReclaimedCrashChild(ids, crashedChild.id, crashedChild.leaseOwner!, 30_000, restarted, crashedChild.fixtureAlias)
+      await emitNestedScoutRecoveryDiagnostic(ids, "depth_two_child_reclaimed", [parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!, reclaimedOwner])
       const resumedWaits = await waitForFinalWaitAfterTimeout(ids, parent.rows[0]!.id, initialWaitId, 60_000, restarted)
+      await emitNestedScoutRecoveryDiagnostic(ids, "parent_wait_consumed_continuation_seen", [parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!, reclaimedOwner])
       await waitForMainMarker(ids, restarted, "P1143_TWO_CHILDREN_RUNNING_IN_PARALLEL", 240_000)
       await waitForMainMarker(ids, restarted, "P1143_ROOT_GRAPH_COMPLETED", 240_000)
+      await emitNestedScoutRecoveryDiagnostic(ids, "root_completed", [parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!, reclaimedOwner])
 
       const turn = await pool.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [ids.turnId, ids.sessionId])
       expect(turn.rows[0]?.status).toBe("completed")
