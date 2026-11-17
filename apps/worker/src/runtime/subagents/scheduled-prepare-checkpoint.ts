@@ -1,9 +1,9 @@
-import { createHash } from "node:crypto"
 import type pg from "pg"
 import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 import type { ScheduledAutomationSnapshot } from "./scheduled-automation-snapshot.js"
 import { parseScheduledAuditReport } from "./scheduled-audit-contract.js"
 import type { ScheduledTaskGraphContinuationReceipt } from "./scheduled-taskgraph-continuation-receipt.js"
+import { isCanonicalAnalyzeCheckpointTimestamp, scheduledAnalyzeCheckpointDigest } from "../turns/turn-question-scheduled-source-fingerprint.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -53,15 +53,15 @@ function analyzeCheckpointDigest(state: Row, receipt: ScheduledTaskGraphContinua
       || !Number.isSafeInteger(row.score) || Number(row.score) < 0 || Number(row.score) > 100 || !stringArray(row.matchedKeywords)
       || !stringArray(row.missingKeywords) || typeof row.recommendation !== "string" || row.recommendation.length > 8192) return null
     const hasFence = Object.hasOwn(row, "analysisFenceAt")
-    if (hasFence && (typeof row.analysisFenceAt !== "string" || !Number.isFinite(Date.parse(row.analysisFenceAt)))) return null
+    if (hasFence && !isCanonicalAnalyzeCheckpointTimestamp(row.analysisFenceAt)) return null
     if (Reflect.ownKeys(row).some(key => typeof key !== "string" || !["job", "score", "matchedKeywords", "missingKeywords", "recommendation", "analysisFenceAt"].includes(key))
       || ["job", "score", "matchedKeywords", "missingKeywords", "recommendation", ...(hasFence ? ["analysisFenceAt"] : [])].some(key => !Object.hasOwn(row, key))) return null
     seen.add(job.id)
     scoredRows.push({ jobId: job.id, score: row.score, matchedKeywords: [...row.matchedKeywords], missingKeywords: [...row.missingKeywords], recommendation: row.recommendation, ...(hasFence ? { analysisFenceAt: row.analysisFenceAt } : {}) })
   }
-  const projection = { owner: stableOwner, snapshotDigest: receipt.snapshotDigest, evidenceDigest: receipt.evidenceDigest,
-    analyzeGraphRevision: receipt.analyzeGraphRevision, analysisFailed: state.analysisFailed, scoredJobs: scoredRows }
-  return createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex")
+  return scheduledAnalyzeCheckpointDigest({ state, owner: stableOwner, snapshotDigest: receipt.snapshotDigest,
+    evidenceDigest: receipt.evidenceDigest, analyzeGraphRevision: receipt.analyzeGraphRevision,
+    analysisFailed: Number(state.analysisFailed), scoredJobs: scoredRows })
 }
 
 function sameStableOwner(value: unknown, owner: ScheduledTaskGraphContinuationReceipt["owner"]): boolean {

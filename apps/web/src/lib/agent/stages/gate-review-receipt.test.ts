@@ -2,14 +2,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { Prisma } from "@prisma/client"
 import { SCHEDULED_GATE_REVIEW_MARKER_SCHEMA } from "../approval/gate-replay"
 
-const mocks = vi.hoisted(() => ({ turnFindFirst: vi.fn(), issueLegacyReceipt: vi.fn(), findScheduledGateReviewReceiptReplay: vi.fn(), clientReceipt: vi.fn(), hashLegacyValue: vi.fn() }))
+const mocks = vi.hoisted(() => ({ turnFindFirst: vi.fn(), issueLegacyReceipt: vi.fn(), findScheduledGateReviewReceiptReplay: vi.fn(), clientReceipt: vi.fn(), hashLegacyValue: vi.fn(), skipApplicationForGate: vi.fn() }))
 vi.mock("@/lib/db", () => ({ db: { agentTurn: { findFirst: mocks.turnFindFirst } } }))
+vi.mock("../application-control", () => ({ skipApplicationForGate: mocks.skipApplicationForGate }))
 vi.mock("../approval/legacy-receipt", () => ({ issueLegacyReceipt: mocks.issueLegacyReceipt,
   findScheduledGateReviewReceiptReplay: mocks.findScheduledGateReviewReceiptReplay,
   clientReceipt: mocks.clientReceipt, hashLegacyValue: mocks.hashLegacyValue }))
 
 import type { ApplicationPackage, PipelineCtx } from "../types"
-import { createGateReviewReceipt, findGateReviewReceiptReplay } from "./gate-review-receipt"
+import { createGateReviewReceipt, findGateReviewReceiptReplay, skipGateApplication } from "./gate-review-receipt"
 
 function ctx(overrides: Partial<PipelineCtx> = {}): PipelineCtx {
   return {
@@ -65,6 +66,7 @@ beforeEach(() => {
   mocks.findScheduledGateReviewReceiptReplay.mockResolvedValue(null)
   mocks.clientReceipt.mockReturnValue({ id: "receipt_1" })
   mocks.hashLegacyValue.mockImplementation(async (_label, value) => `sha256:${JSON.stringify(value) ?? "undefined"}`)
+  mocks.skipApplicationForGate.mockResolvedValue(true)
 })
 
 describe("Gate review receipt ownership", () => {
@@ -166,6 +168,7 @@ describe("Gate review receipt ownership", () => {
       claimToken: "claim_token_1",
       gateTaskId: "gate_task_1",
       assertCurrent: vi.fn(async () => true),
+      sourceHooks: { acquireFence: vi.fn(async () => {}), validateSource: vi.fn(async () => {}) },
     }
     const pipeline = ctx({
       executionAttempt: { id: "execution_1", attemptCount: 0 },
@@ -189,6 +192,7 @@ describe("Gate review receipt ownership", () => {
         turnLeaseOwnerId: "lease_owner_1", turnLeaseVersion: 5, executionId: "execution_1", executionAttemptCount: 4 },
       key: "continuation_key_1", claimToken: "claim_token_1",
       gateTaskId: "gate_task_1", assertCurrent: vi.fn(async () => true),
+      sourceHooks: { acquireFence: vi.fn(async () => {}), validateSource: vi.fn(async () => {}) },
     }
 
     await expect(findGateReviewReceiptReplay(ctx({ scheduledTaskGraphOwnerFence: ownerFence }), pkg)).resolves.toBeNull()
@@ -229,6 +233,37 @@ describe("Gate review receipt ownership", () => {
     expect(receiptInput).not.toHaveProperty("replayMode")
     expect(receiptInput).not.toHaveProperty("scheduledOwnerFence")
     expect(receiptInput.toolCallId).toMatch(/^application-review:[0-9a-f-]{36}$/i)
+  })
+
+  it("fails closed when scheduled Gate receipt provenance hooks are absent", async () => {
+    const ownerFence = {
+      owner: { userId: "user_1", sessionId: "session_1", turnId: "turn_1", rootTaskId: "root_task_1", rootAttemptCount: 2,
+        turnLeaseOwnerId: "lease_owner_1", turnLeaseVersion: 5, executionId: "execution_1", executionAttemptCount: 4 },
+      key: "continuation_key_1", claimToken: "claim_token_1", gateTaskId: "gate_task_1", assertCurrent: vi.fn(async () => true),
+    }
+    await expect(createGateReviewReceipt(ctx({ scheduledTaskGraphOwnerFence: ownerFence }), pkg, false, true))
+      .rejects.toMatchObject({ name: "AgentExecutionCancelledError" })
+    expect(mocks.turnFindFirst).not.toHaveBeenCalled()
+    expect(mocks.issueLegacyReceipt).not.toHaveBeenCalled()
+  })
+
+  it("binds scheduled skip hooks to the current user and reviewed job", async () => {
+    const acquireFence = vi.fn(async () => {})
+    const validateSource = vi.fn(async () => {})
+    const ownerFence = {
+      owner: { userId: "user_1", sessionId: "session_1", turnId: "turn_1", rootTaskId: "root_task_1", rootAttemptCount: 2,
+        turnLeaseOwnerId: "lease_owner_1", turnLeaseVersion: 5, executionId: "execution_1", executionAttemptCount: 4 },
+      key: "continuation_key_1", claimToken: "claim_token_1", gateTaskId: "gate_task_1", assertCurrent: vi.fn(async () => true),
+      sourceHooks: { acquireFence, validateSource },
+    }
+    await skipGateApplication(ctx({ scheduledTaskGraphOwnerFence: ownerFence }), pkg, "below_match_threshold", true, { turnId: "turn_1" })
+
+    const input = mocks.skipApplicationForGate.mock.calls[0]?.[0]
+    const tx = {} as Prisma.TransactionClient
+    await input.sourceHooks.acquireFence(tx)
+    await input.sourceHooks.validateSource(tx)
+    expect(acquireFence).toHaveBeenCalledWith(tx, "user_1")
+    expect(validateSource).toHaveBeenCalledWith(tx, "job_1")
   })
 
   it("does not create a replacement Turn when the pipeline has no exact Turn", async () => {

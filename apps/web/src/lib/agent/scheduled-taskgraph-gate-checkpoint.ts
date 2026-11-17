@@ -4,6 +4,7 @@ import type { ApplicationPackage, PipelineCheckpointState, ScoredJob } from './t
 import { hashArtifactContent } from './artifacts/hash'
 import { buildScheduledTaskGraphPrepareCheckpoint, type ScheduledTaskGraphPipelineCheckpoint, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { parseScheduledAutomationSnapshot } from './scheduled-automation-snapshot'
+import { scheduledTaskGraphGateSourceFingerprintProjection } from './scheduled-taskgraph-gate-source'
 import { parseScheduledTaskGraphPrepareProof, scheduledTaskGraphPrepareResultDigest,
   scheduledTaskGraphPrepareProofMatchesAttestation, scheduledTaskGraphPrepareReceiptKey, type ParsedScheduledTaskGraphPrepareProof,
   type ScheduledTaskGraphArtifactReference } from './scheduled-taskgraph-prepare-proof'
@@ -47,6 +48,8 @@ function analyzeCheckpointDigest(value: unknown): string | null {
     scoutedIds.add(job.id)
   }
   if (Number(state.analysisFailed) + scoredJobs.length !== scoutedIds.size) return null
+  const sourceFingerprints = scheduledTaskGraphGateSourceFingerprintProjection(state)
+  if (!sourceFingerprints) return null
   const scoredIds = new Set<string>()
   const scoredRows: Array<Record<string, unknown>> = []
   for (const raw of scoredJobs) {
@@ -60,7 +63,7 @@ function analyzeCheckpointDigest(value: unknown): string | null {
     scoredIds.add(job.id)
     scoredRows.push({ jobId: job.id, score: row.score, matchedKeywords: [...row.matchedKeywords as string[]], missingKeywords: [...row.missingKeywords as string[]], recommendation: row.recommendation, ...(hasFence ? { analysisFenceAt: row.analysisFenceAt } : {}) })
   }
-  const projection = { owner: stableOwnerValues(owner), snapshotDigest: marker.snapshotDigest, evidenceDigest: marker.evidenceDigest, analyzeGraphRevision: marker.graphRevision, analysisFailed: state.analysisFailed, scoredJobs: scoredRows }
+  const projection = { owner: stableOwnerValues(owner), snapshotDigest: marker.snapshotDigest, evidenceDigest: marker.evidenceDigest, analyzeGraphRevision: marker.graphRevision, analysisFailed: state.analysisFailed, scoredJobs: scoredRows, sourceFingerprints }
   try { return createHash('sha256').update(JSON.stringify(projection), 'utf8').digest('hex') }
   catch { return null }
 }

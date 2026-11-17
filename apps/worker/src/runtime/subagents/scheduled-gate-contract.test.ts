@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { describe, expect, it } from "vitest"
 import {
   SCHEDULED_GATE_OUTPUT_SCHEMA,
@@ -167,6 +168,8 @@ describe("scheduled Gate public contract", () => {
       scoutedJobs: [{ id: "job-a", userId: "user-1" }],
       scoredJobs: [{ job: { id: "job-a", userId: "user-1" }, score: 80, matchedKeywords: ["TypeScript"],
         missingKeywords: [], recommendation: "Apply after tailoring.", analysisFenceAt: "2026-10-06T10:00:00.000Z" }],
+      scheduledTaskGraphAnalyzeSourceFingerprints: { "job-a": { version: "agent-harness.v2.analyze-source-input.v1",
+        digest: createHash("sha256").update("job-a/current-source", "utf8").digest("hex") } },
       analysisFailed: 0,
       scheduledTaskGraphContinuation: {
         schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",

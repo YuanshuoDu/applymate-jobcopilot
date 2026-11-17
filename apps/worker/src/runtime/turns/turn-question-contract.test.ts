@@ -73,9 +73,12 @@ describe("native user question contract", () => {
   })
 
   it("reconstructs a stable wait binding from persisted Analyze evidence without a Prepare receipt", () => {
+    const sourceFingerprint = { version: "agent-harness.v2.analyze-source-input.v1",
+      digest: createHash("sha256").update("job-1/current-source", "utf8").digest("hex") }
     const state = { nextStage: "prepare", scoutedJobs: [{ id: "job-1", userId: "user-1" }],
       scoredJobs: [{ job: { id: "job-1", userId: "user-1" }, score: 80, matchedKeywords: ["TypeScript"], missingKeywords: [],
         recommendation: "Apply after tailoring.", analysisFenceAt: "2026-10-06T10:00:00.000Z" }], analysisFailed: 0,
+      scheduledTaskGraphAnalyzeSourceFingerprints: { "job-1": sourceFingerprint },
       scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
         key: scheduledReceipt.continuationKey, owner: scheduledReceipt.owner, snapshotDigest: scheduledReceipt.snapshotDigest,
         graphRevision: scheduledReceipt.analyzeGraphRevision, evidenceDigest: scheduledReceipt.evidenceDigest } }
@@ -96,7 +99,8 @@ describe("native user question contract", () => {
     const projection = { owner: ["user-1", "session-1", "turn-1", "root-1", 2, "execution-1", 3],
       snapshotDigest: scheduledReceipt.snapshotDigest, evidenceDigest: scheduledReceipt.evidenceDigest, analyzeGraphRevision: 7,
       analysisFailed: 0, scoredJobs: [{ jobId: "job-1", score: 80, matchedKeywords: ["TypeScript"], missingKeywords: [],
-        recommendation: "Apply after tailoring.", analysisFenceAt: "2026-10-06T10:00:00.000Z" }] }
+        recommendation: "Apply after tailoring.", analysisFenceAt: "2026-10-06T10:00:00.000Z" }],
+      sourceFingerprints: [["job-1", sourceFingerprint.version, sourceFingerprint.digest]] }
     expect(evidence.checkpointDigest).toBe(createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex"))
     expect(rotatedEvidence.checkpointDigest).toBe(evidence.checkpointDigest)
     expect(turnScheduledPrepareChoiceWaitId(rotatedBinding)).toBe(turnScheduledPrepareChoiceWaitId(binding))

@@ -32,6 +32,7 @@ import { createScheduledGateChildExecutor } from "./scheduled-gate-child-runtime
 import { createScheduledAuditChildExecutor } from "./scheduled-audit-child-runtime.js"
 import { createScheduledGatePrepareFixture } from "./scheduled-gate-prepare-pg-runner.fixture.js"
 import { parseScheduledGateTaskEnvelope, scheduledGatePreparedJobIds } from "./scheduled-gate-contract.js"
+import type { ScheduledGateChoiceHistory } from "./pg-scheduled-task-graph-gate-choices.js"
 import { scheduledGateRootActions } from "./scheduled-gate-prepare-pg-resume.fixture.js"
 import { parseScheduledAuditReport, SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, SCHEDULED_AUDIT_TASK_TYPE,
   SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
@@ -66,6 +67,29 @@ const databaseUrl = dedicatedDisposableUrl()
 const redisUrl = dedicatedDisposableRedisUrl()
 const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 const scheduledGateReviewMarkerSchema = "agent-harness.v2.scheduled-gate-review-marker.v1"
+
+it("attaches the scheduled Gate source hook wrapper to the owner fence object", async () => {
+  const acquisitionOrder: string[] = [], observedBackendPids: number[] = []
+  const ownerFence = { assertCurrent: async () => { acquisitionOrder.push("owner"); return true },
+    sourceHooks: { acquireFence: async () => { acquisitionOrder.push("source") }, validateSource: async () => undefined } }
+  const instrumented = instrumentScheduledGateOwnerFence(ownerFence, {
+    beforeSecondGateSourceFence: async backendPid => { observedBackendPids.push(backendPid) },
+  }, async () => undefined, async () => 4321)
+  const hooks = debugRecord(instrumented.ownerFence.sourceHooks)
+  const acquireFence = hooks?.acquireFence
+  const assertCurrent = instrumented.ownerFence.assertCurrent
+  if (typeof acquireFence !== "function" || typeof assertCurrent !== "function") {
+    throw new Error("scheduled Gate source hook wrapper was not attached to the owner fence")
+  }
+  const transaction = {}
+  await Reflect.apply(acquireFence, hooks, [transaction, "fixture-user"])
+  await Reflect.apply(acquireFence, hooks, [transaction, "fixture-user"])
+  await Reflect.apply(assertCurrent, instrumented.ownerFence, [transaction])
+  expect(instrumented.sourceFenceAcquisitions()).toBe(2)
+  expect(observedBackendPids).toEqual([4321])
+  expect(acquisitionOrder).toEqual(["source", "source", "owner"])
+})
+
 type Fixture = Awaited<ReturnType<typeof createScheduledGatePrepareFixture>>
 type ScheduledAuditRecoveryScope = Fixture["graphScope"] & Readonly<{
   turnLeaseOwner: string; turnLeaseVersion: number; parentLeaseOwner: string; parentAttemptCount: number
@@ -79,7 +103,23 @@ type FixtureWebDatabase = Readonly<{ db: {
   $transaction<T>(work: (tx: unknown) => Promise<T>): Promise<T>
   customAgentRole: { findMany(args: unknown): Promise<readonly unknown[]> }
 } }>
+type SourceWriterRaceProbe = {
+  jobId: string
+  updateApplied: ReturnType<typeof testBarrier>
+  releaseWriter: ReturnType<typeof testBarrier>
+  rollbackAfterRelease: boolean
+  backendPid: number | null
+}
 type GateRpcConnectionProbe = { captureNextSessionLockQuery: boolean; sessionLockBackendPid: number | null; sessionLockQueryCount: number }
+type ScheduledGateTestOptions = {
+  useReservedQualityReview?: boolean
+  useStoredAiSettings?: boolean
+  beforeSecondGateReceiptFence?: () => Promise<void>
+  beforeGateRpc?: () => Promise<void>
+  beforeSecondGateSourceFence?: (backendPid: number) => Promise<void>
+  sourceWriterRaceProbe?: SourceWriterRaceProbe
+  gateRpcConnectionProbe?: GateRpcConnectionProbe
+}
 type CustomAgentRoleLookup = Readonly<{ userId: string; insertAfter: string; enabled: true }>
 type GateFailureDiagnostics = Readonly<Record<string, unknown>>
 type AuditPreflightState = "not_checked" | "passed" | "rejected" | "threw"
@@ -184,7 +224,7 @@ const diagnosticGateErrorCodes = new Set([
   "scheduled_pipeline_audit_child_fenced", "scheduled_pipeline_audit_gate_proof_invalid",
   "scheduled_pipeline_jobs_mismatch", "scheduled_pipeline_mode_mismatch", "scheduled_pipeline_owner_mismatch",
   "scheduled_pipeline_request_invalid", "scheduled_pipeline_resume_unavailable", "scheduled_pipeline_snapshot_mismatch",
-  "scheduled_pipeline_turn_stale", "scheduled_pipeline_unauthorized",
+  "scheduled_pipeline_source_changed", "scheduled_pipeline_turn_stale", "scheduled_pipeline_unauthorized",
 ])
 const diagnosticWorkerErrorCodes = new Set([
   ...diagnosticGateErrorCodes, "scheduled_gate_analyze_proof_invalid", "scheduled_gate_completion_unverified",
@@ -622,6 +662,93 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(approvals.rows).toHaveLength(0)
     expect(projectedItems.rows).toHaveLength(0)
   })
+
+  it("waits on the production Job source fence and rejects a Gate receipt after the source writer commits", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    const race = await runScheduledGateSourceWriterRace(fixture, {
+      update: existing => ({ description: `${requiredString(existing.description, "fixture Job description")} changed after Analyze` }),
+    })
+
+    expect(race.writerOutcome.status).toBe("fulfilled")
+    expect(race.writerPid).not.toBe(race.gatePid)
+    expect(race.blockingObservation).toMatchObject({ blocked: true, sourceFenceQuery: true, writerFenceHeld: true })
+    expect(race.gateOutcome.status === "fulfilled" ? debugRecord(race.gateOutcome.value)?.status : null).not.toBe("completed")
+    expectScheduledGateSourceChangedRejection(race.response)
+    expect(race.after).toEqual(race.before)
+    const job = await pool!.query<{ description: string | null }>(`SELECT "description" FROM "Job" WHERE "id"=$1 AND "userId"=$2`,
+      [fixture.jobRecords[0]!.id, fixture.ids.userId])
+    expect(job.rows[0]?.description).toBe(`${fixture.jobRecords[0]!.description} changed after Analyze`)
+  }, 120_000)
+
+  it("issues a Gate receipt after the source writer rolls back its fenced Job update", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    const race = await runScheduledGateSourceWriterRace(fixture, {
+      rollbackAfterUpdate: true,
+      update: existing => ({ description: `${requiredString(existing.description, "fixture Job description")} rolled back` }),
+    })
+
+    expect(race.writerOutcome.status).toBe("rejected")
+    if (race.writerOutcome.status === "rejected") expect(race.writerOutcome.reason).toMatchObject({ message: "scheduled_gate_source_writer_fixture_rollback" })
+    expect(race.blockingObservation).toMatchObject({ blocked: true, sourceFenceQuery: true, writerFenceHeld: true })
+    expect(race.gateOutcome).toMatchObject({ status: "fulfilled" })
+    if (race.gateOutcome.status === "fulfilled") expect(debugRecord(race.gateOutcome.value)?.status).toBe("completed")
+    expect(race.before.approvals).toBe(0)
+    expect(race.after).toMatchObject({ approvals: 1, approvalItems: 1, approvalEvents: 1, approvalOutbox: 1,
+      applicationTaskEvents: 1, turnStatus: "waiting_for_approval" })
+    expect(race.after.applicationTasks).toHaveLength(1)
+    expect(race.after.applicationTasks[0]).toMatchObject({ status: "waiting_for_user", checkpoint: "materials_ready" })
+    expect(await assertPersistedGateApprovalWitnesses(pool!, fixture, race.gateTaskId)).toHaveLength(1)
+    const job = await pool!.query<{ description: string | null }>(`SELECT "description" FROM "Job" WHERE "id"=$1 AND "userId"=$2`,
+      [fixture.jobRecords[0]!.id, fixture.ids.userId])
+    expect(job.rows[0]?.description).toBe(fixture.jobRecords[0]!.description)
+  }, 120_000)
+
+  it("issues a Gate receipt after a fenced Job metadata write that leaves Analyze source unchanged", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    const race = await runScheduledGateSourceWriterRace(fixture, {
+      update: () => ({ analysisNote: "Non-source metadata changed while the Gate receipt waited." }),
+    })
+
+    expect(race.writerOutcome.status).toBe("fulfilled")
+    expect(race.blockingObservation).toMatchObject({ blocked: true, sourceFenceQuery: true, writerFenceHeld: true })
+    expect(race.gateOutcome).toMatchObject({ status: "fulfilled" })
+    if (race.gateOutcome.status === "fulfilled") expect(debugRecord(race.gateOutcome.value)?.status).toBe("completed")
+    expect(race.before.approvals).toBe(0)
+    expect(race.after).toMatchObject({ approvals: 1, approvalItems: 1, approvalEvents: 1, approvalOutbox: 1,
+      applicationTaskEvents: 1, turnStatus: "waiting_for_approval" })
+    expect(race.after.applicationTasks).toHaveLength(1)
+    expect(race.after.applicationTasks[0]).toMatchObject({ status: "waiting_for_user", checkpoint: "materials_ready" })
+    await expect(assertPersistedGateApprovalWitnesses(pool!, fixture, race.gateTaskId)).resolves.toHaveLength(1)
+    const job = await pool!.query<{ description: string | null; analysisNote: string | null }>(
+      `SELECT "description", "analysisNote" FROM "Job" WHERE "id"=$1 AND "userId"=$2`, [fixture.jobRecords[0]!.id, fixture.ids.userId])
+    expect(job.rows[0]).toEqual({ description: fixture.jobRecords[0]!.description,
+      analysisNote: "Non-source metadata changed while the Gate receipt waited." })
+  }, 120_000)
+
+  it("rejects a Gate skip after the source writer commits and preserves the application task", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    const job = fixture.jobRecords[0]
+    if (!job) throw new Error("scheduled Gate source-race fixture has no Job")
+    await pool!.query(`INSERT INTO "application_tasks" ("id", "userId", "jobId", "sessionId", "status", "checkpoint", "updatedAt")
+      VALUES ($1,$2,$3,$4,'generating_materials','material_generation_in_progress',CURRENT_TIMESTAMP)`,
+    [`scheduled-gate-source-race-task-${randomUUID()}`, fixture.ids.userId, job.id, fixture.ids.sessionId])
+    const race = await runScheduledGateSourceWriterRace(fixture, {
+      priorChoices: [{ kind: "weak_cover_letter", jobIds: [job.id], choiceId: "skip" }],
+      update: existing => ({ description: `${requiredString(existing.description, "fixture Job description")} changed before skip` }),
+    })
+
+    expect(race.writerOutcome.status).toBe("fulfilled")
+    expect(race.blockingObservation).toMatchObject({ blocked: true, sourceFenceQuery: true, writerFenceHeld: true })
+    expectScheduledGateSourceChangedRejection(race.response)
+    expect(race.after).toEqual(race.before)
+    const application = await pool!.query<{ status: string; checkpoint: string | null }>(
+      `SELECT "status", "checkpoint" FROM "application_tasks" WHERE "userId"=$1 AND "jobId"=$2`, [fixture.ids.userId, job.id])
+    expect(application.rows).toEqual([{ status: "generating_materials", checkpoint: "material_generation_in_progress" }])
+  }, 120_000)
 
   it("serializes concurrent PostgreSQL admissions for the final AI credit", async () => {
     const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!)
@@ -2072,6 +2199,173 @@ async function waitForBarrier(barrier: ReturnType<typeof testBarrier>, label: st
   }
 }
 
+type GateSourceRaceSnapshot = Readonly<{
+  approvals: number; approvalItems: number; approvalEvents: number; approvalOutbox: number
+  applicationTasks: readonly Readonly<{ id: string; status: string; checkpoint: string | null; updatedAt: Date }>[]
+  applicationTaskEvents: number; durableWaits: number; turnStatus: string | null
+}>
+type SourceFenceBlockingObservation = Readonly<{
+  blocked: boolean; sourceFenceQuery: boolean; writerFenceHeld: boolean; waitEventType: string | null
+}>
+type CanonicalJobWriter = {
+  saveCanonicalJob(userId: string, url: string, createData: object,
+    updateData: (existing: Record<string, unknown>) => Record<string, unknown>): Promise<unknown>
+}
+
+async function runScheduledGateSourceWriterRace(fixture: Fixture, options: {
+  update(existing: Record<string, unknown>): Record<string, unknown>
+  rollbackAfterUpdate?: boolean
+  priorChoices?: ScheduledGateChoiceHistory["priorChoices"]
+}) {
+  await seedScheduledAuditAgentConfig(fixture)
+  const job = fixture.jobRecords[0]
+  if (!job) throw new Error("scheduled Gate source-race fixture has no Job")
+  const probe: SourceWriterRaceProbe = { jobId: job.id, updateApplied: testBarrier(), releaseWriter: testBarrier(),
+    rollbackAfterRelease: options.rollbackAfterUpdate === true, backendPid: null }
+  let writer: CanonicalJobWriter | undefined
+  let writerPromise: Promise<unknown> | undefined
+  let gatePid: number | null = null
+  const response = await setupFetcher(fixture, { sourceWriterRaceProbe: probe,
+    beforeSecondGateSourceFence: async backendPid => {
+      gatePid = backendPid
+      if (!writer) throw new Error("production saveCanonicalJob writer was not loaded before the Gate race")
+      if (writerPromise) throw new Error("scheduled Gate source-race started more than one Job writer")
+      writerPromise = writer.saveCanonicalJob(fixture.ids.userId, job.url, {}, options.update)
+      void writerPromise.catch(() => undefined)
+      await Promise.race([
+        probe.updateApplied.promise,
+        writerPromise.then(() => { throw new Error("saveCanonicalJob returned without the expected fenced Job update") }, error => { throw error }),
+      ])
+    } })
+  const sourceWriterModule = await vi.importActual<CanonicalJobWriter>("@/lib/agent/jobs-source-write")
+  writer = sourceWriterModule
+  const commandPort = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool!)
+  const continuation = createScheduledAutomationGateContinuation({ pool: pool as never, commandPort, waitPort,
+    nativeQuestionWaitEnabled: false, fetcher: response.fetcher })
+  const initialGateWait = await continuation({ owner: fixture.owner,
+    executionOwner: fixture.turnExecutionOwner as TurnExecutionOwnerFence, attestation: fixture.attestation,
+    handoff: fixture.handoff, prepareProof: fixture.prepareProof, scheduledWaitId: fixture.prepareChoiceWaitId,
+    finalStepId: fixture.rootQuestionStepId, recoveryStepId: fixture.rootQuestionStepId,
+    signal: new AbortController().signal })
+  expect(initialGateWait.status).toBe("waiting_for_dependency")
+  if (initialGateWait.status !== "waiting_for_dependency") throw new Error("scheduled Gate source-race wait missing")
+  const gateTaskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
+  const before = await readGateSourceRaceSnapshot(fixture)
+  const gatePromise = dispatchAndWait(startRunner(fixture, response.fetcher,
+    { validatedChoice: null, priorChoices: options.priorChoices ?? [] }), gateTaskId, fixture.ids.sessionId)
+  try {
+    await waitForBarrier(probe.updateApplied, "Production saveCanonicalJob did not pause after its PostgreSQL Job update")
+    if (probe.backendPid === null || gatePid === null || probe.backendPid === gatePid) {
+      throw new Error("Source writer and Gate did not use distinct PostgreSQL transaction backends")
+    }
+    const blockingObservation = await waitForSourceFenceBlocking(probe.backendPid, gatePid)
+    probe.releaseWriter.release()
+    if (!writerPromise) throw new Error("Production saveCanonicalJob transaction was not started")
+    const [writerOutcome, gateOutcome] = await Promise.all([Promise.resolve(writerPromise).then<PromiseSettledResult<unknown>, PromiseSettledResult<unknown>>(
+      value => ({ status: "fulfilled", value }), reason => ({ status: "rejected", reason })),
+    gatePromise.then<PromiseSettledResult<unknown>, PromiseSettledResult<unknown>>(value => ({ status: "fulfilled", value }), reason => ({ status: "rejected", reason }))])
+    const after = await readGateSourceRaceSnapshot(fixture)
+    return { response, gateTaskId, writerOutcome, gateOutcome, writerPid: probe.backendPid, gatePid,
+      blockingObservation, before, after }
+  } finally {
+    probe.releaseWriter.release()
+    if (writerPromise) await writerPromise.catch(() => undefined)
+    await gatePromise.catch(() => undefined)
+  }
+}
+
+async function readGateSourceRaceSnapshot(fixture: Fixture): Promise<GateSourceRaceSnapshot> {
+  const [approvals, approvalItems, approvalEvents, approvalOutbox, applicationTasks, applicationTaskEvents, durableWaits, turn] = await Promise.all([
+    pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "agent_approvals" WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3
+      AND "type"='review_application'`, [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId]),
+    pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "agent_items" WHERE "sessionId"=$1 AND "turnId"=$2
+      AND "type"='approval_request'`, [fixture.ids.sessionId, fixture.ids.turnId]),
+    pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "agent_events" WHERE "sessionId"=$1 AND "turnId"=$2
+      AND "type"='approval.requested'`, [fixture.ids.sessionId, fixture.ids.turnId]),
+    pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "agent_outbox" WHERE "aggregateId"=$1
+      AND "payload"->>'type'='approval.requested'`, [fixture.ids.sessionId]),
+    pool!.query<GateSourceRaceSnapshot["applicationTasks"][number]>(`SELECT "id", "status", "checkpoint", "updatedAt"
+      FROM "application_tasks" WHERE "userId"=$1 AND "jobId"=ANY($2::text[]) ORDER BY "id"`,
+    [fixture.ids.userId, fixture.preparedJobIds]),
+    pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "application_task_events" event
+      JOIN "application_tasks" task ON task."id"=event."taskId" WHERE task."userId"=$1 AND task."jobId"=ANY($2::text[])`,
+    [fixture.ids.userId, fixture.preparedJobIds]),
+    pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "agent_wait_conditions" WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3`,
+    [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId]),
+    pool!.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id"=$1 AND "sessionId"=$2 AND "userId"=$3`,
+    [fixture.ids.turnId, fixture.ids.sessionId, fixture.ids.userId]),
+  ])
+  return { approvals: approvals.rows[0]?.count ?? 0, approvalItems: approvalItems.rows[0]?.count ?? 0,
+    approvalEvents: approvalEvents.rows[0]?.count ?? 0, approvalOutbox: approvalOutbox.rows[0]?.count ?? 0,
+    applicationTasks: applicationTasks.rows, applicationTaskEvents: applicationTaskEvents.rows[0]?.count ?? 0,
+    durableWaits: durableWaits.rows[0]?.count ?? 0, turnStatus: turn.rows[0]?.status ?? null }
+}
+
+async function waitForSourceFenceBlocking(writerPid: number, gatePid: number, timeoutMs = 15_000): Promise<SourceFenceBlockingObservation> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const blocked = (await pool!.query<SourceFenceBlockingObservation>(`SELECT
+        $1 = ANY(pg_blocking_pids(waiter.pid)) AS blocked,
+        waiter.query ILIKE '%pg_advisory_xact_lock%' AS "sourceFenceQuery",
+        EXISTS (SELECT 1 FROM pg_locks held WHERE held.pid=$1 AND held.locktype='advisory' AND held.granted) AS "writerFenceHeld",
+        waiter.wait_event_type AS "waitEventType"
+      FROM pg_stat_activity waiter WHERE waiter.datname=current_database() AND waiter.pid=$2 AND waiter.state='active'`,
+    [writerPid, gatePid])).rows[0]
+    if (blocked?.blocked && blocked.sourceFenceQuery && blocked.writerFenceHeld) return blocked
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  throw new Error("Gate source-fence transaction did not block on the production Job writer advisory lock")
+}
+
+function requiredString(value: unknown, label: string): string {
+  if (typeof value !== "string") throw new Error(`${label} missing`)
+  return value
+}
+
+function expectScheduledGateSourceChangedRejection(response: Awaited<ReturnType<typeof setupFetcher>>): void {
+  expect(response.gateCalls()).toBe(1)
+  expect(response.gateResponses()).toEqual(expect.arrayContaining([
+    expect.objectContaining({ httpStatus: 409, status: "blocked" }),
+  ]))
+  expect(response.gateHttpFailures()).toEqual(expect.arrayContaining([
+    expect.objectContaining({ status: 409, errorCode: "scheduled_pipeline_source_changed" }),
+  ]))
+}
+
+function instrumentScheduledGateOwnerFence(scheduledOwnerFence: Record<string, unknown>, options: ScheduledGateTestOptions,
+  beforeAssertCurrent: () => Promise<void>, readBackendPid = postgresTransactionBackendPid) {
+  const originalAssert = scheduledOwnerFence.assertCurrent
+  const sourceHooks = debugRecord(scheduledOwnerFence.sourceHooks)
+  const originalAcquireSourceFence = sourceHooks?.acquireFence
+  let sourceFenceAcquisitions = 0
+  const wrappedSourceHooks = sourceHooks && typeof originalAcquireSourceFence === "function" ? { ...sourceHooks,
+    acquireFence: async (transaction: unknown, userId: unknown) => {
+      sourceFenceAcquisitions += 1
+      if (sourceFenceAcquisitions === 2 && options.beforeSecondGateSourceFence) {
+        await options.beforeSecondGateSourceFence(await readBackendPid(transaction))
+      }
+      return Reflect.apply(originalAcquireSourceFence, sourceHooks, [transaction, userId])
+    } } : sourceHooks
+  const wrappedOwnerFence = { ...scheduledOwnerFence,
+    ...(typeof originalAssert === "function" ? { assertCurrent: async (transaction: unknown) => {
+      await beforeAssertCurrent()
+      return Reflect.apply(originalAssert, scheduledOwnerFence, [transaction])
+    } } : {}),
+    ...(wrappedSourceHooks ? { sourceHooks: wrappedSourceHooks } : {}) }
+  return { ownerFence: wrappedOwnerFence, sourceFenceAcquisitions: () => sourceFenceAcquisitions }
+}
+
+async function postgresTransactionBackendPid(transaction: unknown): Promise<number> {
+  if (!transaction || typeof transaction !== "object") throw new Error("Prisma transaction client is unavailable for backend PID observation")
+  const query = Reflect.get(transaction, "$queryRawUnsafe")
+  if (typeof query !== "function") throw new Error("Prisma transaction client cannot report its PostgreSQL backend PID")
+  const result: unknown = await Reflect.apply(query, transaction, ["SELECT pg_backend_pid()::int AS pid"])
+  const row = Array.isArray(result) ? debugRecord(result[0]) : null
+  const pid = Number(row?.pid)
+  if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("Prisma transaction returned an invalid PostgreSQL backend PID")
+  return pid
+}
+
 async function prioritizeAndVerifyScheduledGateResolverTurn(pool: Pick<Pool, "query">, fixture: Fixture,
   batchSize: number, expectedWaitCount: number): Promise<void> {
   const prioritizedTurn = await pool.query<{ updatedAt: Date }>(`UPDATE "agent_turns" AS target
@@ -2273,14 +2567,16 @@ async function waitForScheduledGateRpcSessionLock(blockerPid: number, waiterPid:
   throw new Error("Scheduled Gate RPC did not block on the resolver-held Session lock")
 }
 
-function startRunner(fixture: Fixture, fetcher: typeof fetch): Runner {
+function startRunner(fixture: Fixture, fetcher: typeof fetch, gateChoices: ScheduledGateChoiceHistory = {
+  validatedChoice: null, priorChoices: [],
+}): Runner {
   const redis = new Redis(redisUrl!, { maxRetriesPerRequest: null, connectTimeout: 2_000, retryStrategy: attempt => attempt > 3 ? null : 100 })
   const queueName = `scheduled-audit-${randomUUID()}`
   const queue = new Queue<SubagentJobPayload>(queueName, { connection: redis.duplicate(), skipVersionCheck: true })
   const manager = new AgentTreeManager(new PgSubagentTaskStore(pool as never))
   const gate = createScheduledGateChildExecutor({ pool: pool as never, fetcher,
     loadInvocation: async () => ({ owner: fixture.owner, attestation: fixture.attestation, prepareProof: fixture.prepareProof,
-      scheduledWaitId: fixture.prepareChoiceWaitId }), loadChoices: async () => ({ validatedChoice: null, priorChoices: [] }) })
+      scheduledWaitId: fixture.prepareChoiceWaitId }), loadChoices: async () => gateChoices })
   const audit = createScheduledAuditChildExecutor({ pool: pool as never, fetcher })
   const execute: SubagentExecutor = async input => {
     if (input.lease.taskType !== SCHEDULED_AUDIT_TASK_TYPE) return gate({ lease: input.lease })
@@ -2412,9 +2708,7 @@ async function stopRunner(): Promise<void> {
   await active.queue.close().catch(() => undefined)
   await active.redis.quit().catch(() => active.redis.disconnect())
 }
-async function setupFetcher(fixture: Fixture, options: { useReservedQualityReview?: boolean; useStoredAiSettings?: boolean;
-  beforeSecondGateReceiptFence?: () => Promise<void>; beforeGateRpc?: () => Promise<void>;
-  gateRpcConnectionProbe?: GateRpcConnectionProbe } = {}) {
+async function setupFetcher(fixture: Fixture, options: ScheduledGateTestOptions = {}) {
   if (options.useReservedQualityReview) vi.doMock(scheduledGateQualityReviewPath, async importOriginal => importOriginal())
   else vi.doMock(scheduledGateQualityReviewPath, () => ({ reviewApplicationQuality: async () => ({ kind: "unavailable" }) }))
   const customRoleLookups: CustomAgentRoleLookup[] = []
@@ -2426,9 +2720,10 @@ async function setupFetcher(fixture: Fixture, options: { useReservedQualityRevie
     configMinMatchScore: number | null; configTargetRoles: unknown; configTargetLocations: unknown }> = []
   let gateReceiptFenceAssertions = 0
   const fixtureWebDb = await connectFixtureWebDatabase()
+  let sourceWriterTransactionMatches = 0
   const databaseWithoutCustomAgents = new Proxy(fixtureWebDb.db, {
     get(target, property, receiver) {
-      if (property === "$transaction" && options.gateRpcConnectionProbe) {
+      if (property === "$transaction" && (options.gateRpcConnectionProbe || options.sourceWriterRaceProbe)) {
         const invokeTransaction = Reflect.get(target, property, target)
         if (typeof invokeTransaction !== "function") return invokeTransaction
         return (input: unknown, ...transactionOptions: unknown[]) => {
@@ -2438,14 +2733,50 @@ async function setupFetcher(fixture: Fixture, options: { useReservedQualityRevie
             if (!tx || typeof tx !== "object") return callback(tx)
             const observedTransaction = new Proxy(tx, {
               get(transactionTarget, transactionProperty, transactionReceiver) {
-                if (transactionProperty !== "$queryRaw") {
-                  return Reflect.get(transactionTarget, transactionProperty, transactionReceiver)
+                if (transactionProperty === "job" && options.sourceWriterRaceProbe) {
+                  const jobDelegate = Reflect.get(transactionTarget, transactionProperty, transactionTarget)
+                  if (!jobDelegate || typeof jobDelegate !== "object") return jobDelegate
+                  return new Proxy(jobDelegate, {
+                    get(delegateTarget, operation, delegateReceiver) {
+                      if (operation !== "updateMany") return Reflect.get(delegateTarget, operation, delegateReceiver)
+                      const updateMany = Reflect.get(delegateTarget, operation, delegateTarget)
+                      if (typeof updateMany !== "function") return updateMany
+                      return async (args: unknown) => {
+                        const row = debugRecord(args), where = debugRecord(row?.where), data = debugRecord(row?.data)
+                        if (where?.id !== options.sourceWriterRaceProbe!.jobId || !data) {
+                          return Reflect.apply(updateMany, delegateTarget, [args])
+                        }
+                        const backendPid = await postgresTransactionBackendPid(transactionTarget)
+                        const result = await Reflect.apply(updateMany, delegateTarget, [args])
+                        if (debugRecord(result)?.count === 1) {
+                          sourceWriterTransactionMatches += 1
+                          if (sourceWriterTransactionMatches !== 1) throw new Error("scheduled Gate fixture observed multiple canonical Job source writes")
+                          options.sourceWriterRaceProbe!.backendPid = backendPid
+                          options.sourceWriterRaceProbe!.updateApplied.release()
+                          await options.sourceWriterRaceProbe!.releaseWriter.promise
+                          if (options.sourceWriterRaceProbe!.rollbackAfterRelease) {
+                            throw new Error("scheduled_gate_source_writer_fixture_rollback")
+                          }
+                        }
+                        return result
+                      }
+                    },
+                  })
                 }
+                if (transactionProperty === "$queryRawUnsafe") {
+                  const queryRawUnsafe = Reflect.get(transactionTarget, transactionProperty, transactionTarget)
+                  if (typeof queryRawUnsafe !== "function") return queryRawUnsafe
+                  return (...queryArgs: unknown[]) => Reflect.apply(queryRawUnsafe, transactionTarget, queryArgs)
+                }
+                if (transactionProperty !== "$queryRaw") return Reflect.get(transactionTarget, transactionProperty, transactionReceiver)
                 const queryRaw = Reflect.get(transactionTarget, transactionProperty, transactionTarget)
                 if (typeof queryRaw !== "function") return queryRaw
-                return (...queryArgs: unknown[]) => captureGateRpcSessionLockConnection(
-                  transactionTarget, queryArgs, options.gateRpcConnectionProbe!,
-                ).then(() => Reflect.apply(queryRaw, transactionTarget, queryArgs))
+                return (...queryArgs: unknown[]) => {
+                  const captured = options.gateRpcConnectionProbe
+                    ? captureGateRpcSessionLockConnection(transactionTarget, queryArgs, options.gateRpcConnectionProbe)
+                    : Promise.resolve()
+                  return captured.then(() => Reflect.apply(queryRaw, transactionTarget, queryArgs))
+                }
               },
             })
             return callback(observedTransaction)
@@ -2493,7 +2824,7 @@ async function setupFetcher(fixture: Fixture, options: { useReservedQualityRevie
     }) }))
   const constraintFunctions = await vi.importActual<{ tailoringConstraints(job: unknown, config: unknown): unknown }>("@/lib/agent/stages/prepare")
   const artifactHashes = await vi.importActual<{ hashArtifactConstraints(value: unknown): string }>("@/lib/agent/artifacts/hash")
-  if (options.useReservedQualityReview || options.beforeSecondGateReceiptFence) vi.doMock(scheduledGateStagePath, async importOriginal => {
+  if (options.useReservedQualityReview || options.beforeSecondGateReceiptFence || options.beforeSecondGateSourceFence) vi.doMock(scheduledGateStagePath, async importOriginal => {
     const actual = await importOriginal() as Record<string, unknown>
     const run = actual.runScheduledGate as (...args: unknown[]) => Promise<unknown>
     const artifactIssue = /^(resume|cover_letter):(artifact_not_draft|stale_constraints|invalid_artifact_hash|invalid_base_hash|missing_provenance)$/
@@ -2516,14 +2847,13 @@ async function setupFetcher(fixture: Fixture, options: { useReservedQualityRevie
         }
       }
       const scheduledOwnerFence = debugRecord(context.scheduledTaskGraphOwnerFence)
-      const originalAssert = scheduledOwnerFence?.assertCurrent
+      const ownerFenceInstrumentation = scheduledOwnerFence ? instrumentScheduledGateOwnerFence(scheduledOwnerFence, options,
+        async () => {
+          gateReceiptFenceAssertions += 1
+          if (gateReceiptFenceAssertions === 2) await options.beforeSecondGateReceiptFence?.()
+        }) : null
       const wrappedContext = { ...context,
-        ...(typeof originalAssert === "function" ? { scheduledTaskGraphOwnerFence: { ...scheduledOwnerFence,
-          assertCurrent: async (transaction: unknown) => {
-            gateReceiptFenceAssertions += 1
-            if (gateReceiptFenceAssertions === 2) await options.beforeSecondGateReceiptFence?.()
-            return originalAssert(transaction)
-          } } } : {}),
+        ...(ownerFenceInstrumentation ? { scheduledTaskGraphOwnerFence: ownerFenceInstrumentation.ownerFence } : {}),
         emit: (event: unknown, payload: unknown) => {
         const row = debugRecord(payload)
         if (event === "artifact_reviewed" && Array.isArray(row?.issues)) for (const issue of row.issues) {

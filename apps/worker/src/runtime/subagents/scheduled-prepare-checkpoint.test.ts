@@ -12,19 +12,22 @@ const snapshotDigest = "sha256:" + "b".repeat(64), evidenceDigest = "c".repeat(6
 const report = { processed: 1, applied: 0, queued: 0, pending: 0, skipped: 1, failed: 0, durationMs: 9 }
 
 function fixture() {
+  const sourceFingerprint = { version: "agent-harness.v2.analyze-source-input.v1", digest: "e".repeat(64) }
+  const sourceFingerprints = [["job-1", sourceFingerprint.version, sourceFingerprint.digest]]
   const scoredJobs = [{ job: { id: "job-1", userId: owner.userId }, score: 80, matchedKeywords: ["TypeScript"],
-    missingKeywords: [], recommendation: "Review" }]
+    missingKeywords: [], recommendation: "Review", analysisFenceAt: "2026-10-06T10:00:00.000Z" }]
   const projection = { owner: [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount,
     owner.executionId, owner.executionAttemptCount], snapshotDigest, evidenceDigest, analyzeGraphRevision: 12,
     analysisFailed: 0, scoredJobs: [{ jobId: "job-1", score: 80, matchedKeywords: ["TypeScript"],
-      missingKeywords: [], recommendation: "Review" }] }
+      missingKeywords: [], recommendation: "Review", analysisFenceAt: "2026-10-06T10:00:00.000Z" }], sourceFingerprints }
   const checkpointDigest = createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex")
   const binding = { owner, continuationKey: "scheduled-taskgraph:sha256:" + "a".repeat(64), snapshotDigest,
     evidenceDigest, checkpointDigest, analyzeGraphRevision: 12, prepareScheduleRevision: 13 }
   const continuationKey = scheduledTaskGraphStableContinuationKey(binding)!
   const receipt = buildScheduledTaskGraphContinuationReceipt({ ...binding, continuationKey })!
   const state = { nextStage: "completed", report, analysisFailed: 0, scoutedJobs: [{ id: "job-1", userId: owner.userId }],
-    scoredJobs, scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
+    scoredJobs, scheduledTaskGraphAnalyzeSourceFingerprints: { "job-1": sourceFingerprint },
+    scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
       key: handoffKey, owner: { ...owner, turnLeaseOwnerId: "completed-root-turn", turnLeaseVersion: 10 },
       snapshotDigest, graphRevision: 12, evidenceDigest } }
   const execution = { id: owner.executionId, status: "completed", attemptCount: owner.executionAttemptCount,
@@ -79,5 +82,21 @@ describe("scheduled Prepare checkpoint reader", () => {
     const changed = await read(value, "audit_completed_report")
     expect(changed).toMatchObject({ eligibleJobIds: ["job-1"] })
     expect(changed?.checkpointDigest).not.toBe(value.checkpointDigest)
+  })
+
+  it("fails closed when source fingerprints are missing or malformed for scored jobs", async () => {
+    for (const fingerprints of [undefined, {}, { "job-1": { version: "legacy", digest: "e".repeat(64) } },
+      { "job-1": { version: "agent-harness.v2.analyze-source-input.v1", digest: "bad" } },
+      { "job-1": { version: "agent-harness.v2.analyze-source-input.v1", digest: "e".repeat(64) }, "job-2": { version: "agent-harness.v2.analyze-source-input.v1", digest: "f".repeat(64) } }]) {
+      const value = fixture()
+      ;(value.state as Record<string, unknown>).scheduledTaskGraphAnalyzeSourceFingerprints = fingerprints
+      await expect(read(value, "audit_completed_report")).resolves.toBeNull()
+    }
+  })
+
+  it("rejects non-canonical but parseable Analyze fence timestamps", async () => {
+    const value = fixture(), first = value.state.scoredJobs[0]!
+    ;(value.state as Record<string, unknown>).scoredJobs = [{ ...first, analysisFenceAt: "2026-10-06" }]
+    await expect(read(value, "audit_completed_report")).resolves.toBeNull()
   })
 })

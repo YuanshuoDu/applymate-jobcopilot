@@ -107,8 +107,8 @@ export async function issueApprovalReceipt(
   try {
     const row = await db.$transaction(async (tx) => {
       await acquireFence(tx)
+      if (input.scheduledSourceHooks || input.replayExisting) await assertGateReplayOwnerInTransaction(tx, input as ReplayOwnerInput)
       if (input.replayExisting) {
-        await assertGateReplayOwnerInTransaction(tx, input as ReplayOwnerInput)
         const existing = await tx.agentApproval.findFirst({ where: { id: approvalId, userId: input.scope.userId } })
         if (existing) {
           await assertGateReplayTaskBinding(tx, existing, replayExpectation)

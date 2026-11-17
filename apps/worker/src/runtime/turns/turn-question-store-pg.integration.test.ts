@@ -80,6 +80,8 @@ const scheduledContinuationKey = `scheduled-taskgraph:sha256:${"a".repeat(64)}`
 const scheduledAnalyzeCheckpoint = { nextStage: "prepare", scoutedJobs: [{ id: "scheduled-job-1", userId: ids.user }],
   scoredJobs: [{ job: { id: "scheduled-job-1", userId: ids.user }, score: 80, matchedKeywords: ["TypeScript"], missingKeywords: [],
     recommendation: "Apply after tailoring." }], analysisFailed: 0,
+  scheduledTaskGraphAnalyzeSourceFingerprints: { "scheduled-job-1": { version: "agent-harness.v2.analyze-source-input.v1",
+    digest: createHash("sha256").update("scheduled-job-1/current-source", "utf8").digest("hex") } },
   scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key: scheduledContinuationKey,
     owner: scheduledContinuationOwner, snapshotDigest: scheduledSnapshotDigest, graphRevision: 3, evidenceDigest: "b".repeat(64) } }
 const scheduledAnalyzeEvidence = scheduledAnalyzeCheckpointEvidence(scheduledAnalyzeCheckpoint)!

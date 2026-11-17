@@ -118,6 +118,14 @@ function terminalStateFor(value: unknown, owner: ScheduledTaskGraphPipelineOwner
   return state;
 }
 
+/** Builds the #1175-compatible terminal checkpoint after a caller has revalidated its owner. */
+export function buildScheduledTaskGraphSourceChangeTerminalState(input: {
+  owner: ScheduledTaskGraphPipelineOwner; attestationSnapshotDigest: string; expectedState: unknown;
+}): Record<string, unknown> | null {
+  if (!validDigest(input.attestationSnapshotDigest)) return null;
+  return terminalStateFor(input.expectedState, input.owner, input.attestationSnapshotDigest);
+}
+
 export async function terminalizeScheduledTaskGraphSourceChange(input: TerminalizeInput): Promise<TerminalizeResult> {
   const expectedState = objectRow(input.expectedState);
   if (!expectedState || !validId(input.key) || !validDigest(input.attestationSnapshotDigest)

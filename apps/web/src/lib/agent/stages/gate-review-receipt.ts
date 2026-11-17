@@ -4,6 +4,7 @@ import { redactAgentEvent } from "@jobcopilot/shared"
 import { db } from "@/lib/db"
 
 import { AgentExecutionCancelledError } from "../execution-control"
+import { skipApplicationForGate } from "../application-control"
 import { SCHEDULED_GATE_REVIEW_MARKER_SCHEMA } from "../approval/gate-replay"
 import { clientReceipt, findScheduledGateReviewReceiptReplay, hashLegacyValue, issueLegacyReceipt } from "../approval/legacy-receipt"
 import type { LegacyReceiptInput } from "../approval/legacy-receipt"
@@ -25,17 +26,34 @@ export async function createGateReviewReceipt(
 
 /** Reads a same-owner, same-checkpoint Gate receipt without preparing or writing anything when absent. */
 export async function findGateReviewReceiptReplay(ctx: PipelineCtx, pkg: ApplicationPackage) {
-  if (!ctx.scheduledTaskGraphOwnerFence) throw new AgentExecutionCancelledError()
+  if (!ctx.scheduledTaskGraphOwnerFence?.sourceHooks) throw new AgentExecutionCancelledError()
   const prepared = await buildGateReviewReceiptInput(ctx, pkg, false, true)
   if (prepared.input.replayMode !== "scheduled-taskgraph-gate-review") return null
   const result = await findScheduledGateReviewReceiptReplay(db, { ...prepared.input, replayMode: "scheduled-taskgraph-gate-review" })
   return result ? clientReceipt(result, { externalSubmission: false, jobId: pkg.job.id }) : null
 }
 
+export async function skipGateApplication(ctx: PipelineCtx, pkg: ApplicationPackage,
+  checkpoint: "review_quality_declined" | "below_match_threshold", scheduled: boolean,
+  owner?: Parameters<typeof skipApplicationForGate>[0]["owner"]) {
+  const hooks = scheduled ? scheduledGateSkipHooks(ctx, pkg.job.id) : undefined
+  return skipApplicationForGate({ userId: ctx.userId, jobId: pkg.job.id, sessionId: ctx.sessionId, checkpoint, owner,
+    ...(hooks ? { sourceHooks: hooks } : {}) })
+}
+
+function scheduledGateSkipHooks(ctx: PipelineCtx, jobId: string) {
+  const hooks = ctx.scheduledTaskGraphOwnerFence?.sourceHooks
+  if (!hooks) throw new AgentExecutionCancelledError()
+  return {
+    acquireFence: (tx: Prisma.TransactionClient) => hooks.acquireFence(tx, ctx.userId),
+    validateSource: (tx: Prisma.TransactionClient) => hooks.validateSource(tx, jobId),
+  }
+}
+
 async function buildGateReviewReceiptInput(ctx: PipelineCtx, pkg: ApplicationPackage, projectedWaitAlreadyIssued: boolean, scheduledGate: boolean) {
   const { sessionId, turnId } = ctx
   if (!sessionId || !turnId || !ctx.executionAttempt || ctx.signal?.aborted) throw new AgentExecutionCancelledError()
-  if (scheduledGate && !ctx.scheduledTaskGraphOwnerFence) throw new AgentExecutionCancelledError()
+  if (scheduledGate && !ctx.scheduledTaskGraphOwnerFence?.sourceHooks) throw new AgentExecutionCancelledError()
   const gateTaskId = scheduledGate ? ctx.scheduledTaskGraphOwnerFence?.gateTaskId : undefined
   if (scheduledGate && (!gateTaskId || !gateTaskId.trim() || gateTaskId.length > 256)) throw new AgentExecutionCancelledError()
   const currentTurn = await db.agentTurn.findFirst({
