@@ -279,7 +279,44 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
     expect(isAnalyzeSourceChangedError(observed)).toBe(true)
     expect(readAnalyzeSourceChangedClaims(observed)).toEqual([{ jobId: job.id, analysisFenceAt: score.analysisFenceAt }])
     expect(mocks.validateSources).not.toHaveBeenCalled()
-    expect(mocks.save).toHaveBeenCalledTimes(1)
+    expect(mocks.save).not.toHaveBeenCalled()
+  }, 30_000)
+
+  it("does not expose source-change claims when the persisted execution claim is foreign", async () => {
+    const checkpoint = buildAnalyzeCheckpoint({ owner, snapshot, attestation: baseAttestation,
+      ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: initialState }).checkpoint
+    const { scheduledTaskGraphAnalyzeSourceFingerprints: _discarded, ...legacy } = checkpoint
+    const foreignClaim = { ...legacy.scheduledTaskGraphClaim, claimToken: "foreign-claim-token" }
+    const state = { ...legacy, scheduledTaskGraphClaim: foreignClaim }
+
+    let observed: unknown
+    try {
+      await runScheduledTaskGraphAnalyzeOnly({ owner, snapshot, attestation: baseAttestation, continuationKey: key,
+        claimToken, ownedJobs: [job], context: context(), state, onStateChange: vi.fn() })
+    } catch (error) { observed = error }
+
+    expect(observed).toBeInstanceOf(Error)
+    expect(isAnalyzeSourceChangedError(observed)).toBe(false)
+    expect(readAnalyzeSourceChangedClaims(observed)).toBeNull()
+    expect(mocks.save).not.toHaveBeenCalled()
+  }, 30_000)
+
+  it("does not expose source-change claims when the attested candidate set is foreign", async () => {
+    const checkpoint = buildAnalyzeCheckpoint({ owner, snapshot, attestation: baseAttestation,
+      ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: initialState }).checkpoint
+    const { scheduledTaskGraphAnalyzeSourceFingerprints: _discarded, ...legacy } = checkpoint
+    const foreignJob = { ...job, id: "foreign_job" }
+
+    let observed: unknown
+    try {
+      await runScheduledTaskGraphAnalyzeOnly({ owner, snapshot, attestation: baseAttestation, continuationKey: key,
+        claimToken, ownedJobs: [foreignJob], context: context(), state: legacy, onStateChange: vi.fn() })
+    } catch (error) { observed = error }
+
+    expect(observed).toBeInstanceOf(Error)
+    expect(isAnalyzeSourceChangedError(observed)).toBe(false)
+    expect(readAnalyzeSourceChangedClaims(observed)).toBeNull()
+    expect(mocks.save).not.toHaveBeenCalled()
   }, 30_000)
 
   it("source-fences the current Resume for a valid zero-score checkpoint without requiring an empty map", async () => {
