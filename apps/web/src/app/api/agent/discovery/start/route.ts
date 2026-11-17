@@ -8,6 +8,7 @@ import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { isFeatureAllowed } from "@/lib/entitlements"
 import { isRuntimeAgentHarnessFeatureEnabled } from "@/lib/runtime-feature-flags"
 import { commandErrorResponse, readJsonBody } from "../../sessions/command-route-helpers"
+import { sessionSnapshotFields, withAgentSearchFootprintSessionSnapshot } from "@/lib/agent-search-footprint-session-snapshot"
 
 const FEATURE = "AGENT_INTERACTIVE_DISCOVERY_TASK_GRAPH"
 const INTENT = { kind: "interactive_discovery_shortlist", version: 1 } as const
@@ -68,10 +69,11 @@ async function getOrCreateSession(userId: string, clientMessageId: string) {
 
   const id = sessionIdFor(userId, clientMessageId)
   try {
-    return await db.agentSession.create({
-      data: { id, userId, goal: DISCOVERY_GOAL, source: "chat", status: "running", memorySummary: "" },
+    return await withAgentSearchFootprintSessionSnapshot(db, userId, async (tx, snapshot, captured) => tx.agentSession.create({
+      data: { id, userId, goal: DISCOVERY_GOAL, source: "chat", status: "running", memorySummary: "",
+        ...(captured ? sessionSnapshotFields(snapshot) : {}) },
       select: { id: true },
-    })
+    }))
   } catch (error: unknown) {
     if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "P2002") throw error
     const existing = await db.agentSession.findFirst({ where: { id, userId }, select: { id: true } })

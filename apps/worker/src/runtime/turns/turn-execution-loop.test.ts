@@ -14,6 +14,7 @@ import type { NativeVerificationFeedback } from "../subagents/native-verificatio
 import type { ChildWaitOrphanRecovery } from "../subagents/child-durable-wait-replay.js"
 import type { ChildToolReplayReceipt } from "./turn-execution-options.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
+import type { PrepareFinalDependencyWaitInput } from "./turn-execution-options.js"
 import { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { createPgTurnEngineStore } from "./turn-engine-store.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
@@ -53,6 +54,7 @@ import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
 import { TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "./turn-question-gate-choice-contract.js"
 import { SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY, scheduledPipelineRecoveryStepMarker,
   withScheduledPipelineRecoveryStepProfile } from "../subagents/scheduled-pipeline-recovery-step.js"
+import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION } from "../subagents/scheduled-post-gate-contract.js"
 import { buildFinalAnswerEvidenceBindingMap } from "./final-answer-evidence.js"
 import { stableAnswerEvidenceJson } from "./final-answer-evidence-json.js"
 
@@ -200,6 +202,60 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     ...(completionGate ? { completionGate } : {}),
   }
   return { options, events, notifications, items, finalResponses, stepTasks, stepAttempts, stepStatuses, stepUpdates, stepInputs, requests }
+}
+
+type ScheduledPostGateCallbackInput = Parameters<NonNullable<NonNullable<TurnExecutionOptions["completionGate"]>[typeof SCHEDULED_PIPELINE_COMPLETION]>>[0]
+
+function verifiedScheduledReplanGate(replanRounds: number) {
+  let checks = 0
+  const scheduled = vi.fn(async (input: ScheduledPostGateCallbackInput) => {
+    checks += 1
+    return checks <= replanRounds
+      ? { status: "replan" as const, candidateText: input.candidateText, feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK }
+      : { status: "completed" as const, candidateText: input.candidateText }
+  })
+  const completionGate = Object.assign(vi.fn(async () => ({ ok: true as const })), { [SCHEDULED_PIPELINE_COMPLETION]: scheduled })
+  return { completionGate, scheduled }
+}
+
+function distinctFinalCandidateModel(root: Fixture, toolCalls: readonly Readonly<{ call: number; name: string }>[] = []): ModelAdapter {
+  let calls = 0
+  return {
+    ...root.options.model,
+    async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+      root.requests.push(request)
+      calls += 1
+      const tool = toolCalls.find(item => item.call === calls)
+      if (tool) {
+        yield { type: "tool_call_completed", callId: `post-gate-${tool.name}-${calls}`, name: tool.name,
+          arguments: tool.name === "agent.plan" ? { expectedRevision: 4, nodes: [] } : {} }
+        yield { type: "completed", finishReason: "tool_calls" }
+        return
+      }
+      yield { type: "text_delta", text: `Distinct scheduled candidate ${calls} for the verified Dublin package.` }
+      yield { type: "completed", finishReason: "stop" }
+    },
+  }
+}
+
+function scheduledPostGateRootInput(text: string): StoredAgentInput {
+  return {
+    id: "post-gate-root-input", sessionId: "session-1", targetTurnId: "turn-1", userId: "user-1", clientMessageId: "post-gate-root-client",
+    delivery: "follow_up", status: "accepted", content: [{ type: "text", text }], acceptedSequence: 4n,
+    consumedByStepId: null, consumedAt: null, createdAt: new Date("2026-11-14T12:00:00.000Z"),
+  }
+}
+
+function requestTextForRole(request: HarnessModelRequest, role: "system" | "user"): string {
+  return request.messages.filter(message => message.role === role)
+    .flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : []))
+    .join("\n")
+}
+
+function instructionOccurrences(request: HarnessModelRequest, instruction: string): number {
+  return request.messages.filter(message => message.role === "system")
+    .flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : []))
+    .reduce((total, text) => total + text.split(instruction).length - 1, 0)
 }
 
 function scheduledCandidateReadFixture(input: Readonly<{
@@ -2991,6 +3047,202 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
   })
 
+  it("keeps one server-validated Post-Gate instruction through list and refresh, then retires it after an accepted plan", async () => {
+    const objective = "Find senior engineering roles in Dublin from the approved scheduled packages."
+    const input = scheduledPostGateRootInput("Original request: use the approved scheduled package partition for senior roles in Dublin.")
+    const inputStore = new RootContextClaimStore(input)
+    const root = fixture(identity("turn", "root-1"), undefined, citationSnapshot().toolObservations)
+    const { completionGate, scheduled } = verifiedScheduledReplanGate(1)
+    let graphRevision = 4
+    const dispatched: string[] = []
+    const refreshTaskGraphAfterPlan = vi.fn(async (snapshot: TurnExecutionOptions["snapshot"]) => {
+      graphRevision = 5
+      return mergeTaskGraphCurrentObservation(snapshot, { revision: graphRevision, nodes: [] })
+    })
+    root.options = {
+      ...root.options, goal: objective, snapshot: { ...root.options.snapshot, taskGraphRevision: graphRevision },
+      tools: [{ name: "agent.list", version: "1" }, { name: "agent.plan", version: "1" }], completionGate,
+      refreshTaskGraphBeforeStep: async snapshot => mergeTaskGraphCurrentObservation(snapshot, { revision: graphRevision, nodes: [] }),
+      refreshTaskGraphAfterPlan,
+      executeTool: async ({ call }) => {
+        dispatched.push(call.toolName)
+        return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed",
+          output: call.toolName === "agent.plan" ? { status: "accepted", revision: graphRevision + 1 } : { nodes: [] }, errorCode: null }
+      },
+    }
+    attachRootContextBuilder(root, inputStore, input.id)
+    const baseBuilder = root.options.contextBuilder
+    const contextBuilder = Object.assign({}, baseBuilder, { objectiveProgressGoalRevision: () => "c".repeat(64) })
+    root.options = {
+      ...root.options,
+      contextBuilder,
+      model: distinctFinalCandidateModel(root, [{ call: 2, name: "agent.list" }, { call: 3, name: "agent.plan" }]),
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 4, toolCallCount: 2 })
+    expect(root.requests).toHaveLength(4)
+    expect(scheduled).toHaveBeenCalledTimes(2)
+    expect(scheduled).toHaveBeenNthCalledWith(1, expect.objectContaining({ identity: root.options.identity,
+      candidateText: "Distinct scheduled candidate 1 for the verified Dublin package." }))
+    expect(instructionOccurrences(root.requests[0]!, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)).toBe(0)
+    expect(instructionOccurrences(root.requests[1]!, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)).toBe(1)
+    expect(instructionOccurrences(root.requests[2]!, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)).toBe(1)
+    expect(instructionOccurrences(root.requests[3]!, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)).toBe(0)
+    expect(root.requests[1]?.tools).toContainEqual(expect.objectContaining({ name: "agent.list" }))
+    expect(root.requests[1]?.tools).toContainEqual(expect.objectContaining({ name: "agent.plan" }))
+    expect(root.requests[2]?.tools).toContainEqual(expect.objectContaining({ name: "agent.list" }))
+    expect(root.requests[2]?.tools).toContainEqual(expect.objectContaining({ name: "agent.plan" }))
+    expect(requestTextForRole(root.requests[1]!, "system")).not.toContain("Durable TaskGraph verification was denied")
+    expect(requestTextForRole(root.requests[2]!, "system")).not.toContain("Durable TaskGraph verification was denied")
+    expect(dispatched).toEqual(["agent.list", "agent.plan"])
+    expect(refreshTaskGraphAfterPlan).toHaveBeenCalledOnce()
+    expect(graphRevision).toBe(5)
+    expect(root.events.some(event => event.type === "final.rejected" && (event.payload as { code?: string } | undefined)?.code === "scheduled_post_gate_plan_required")).toBe(true)
+  })
+
+  it("retires the fixed Post-Gate instruction when the objective goal revision changes after a tool round-trip", async () => {
+    const input = scheduledPostGateRootInput("Original scheduled request: use Dublin and the approved package set.")
+    const inputStore = new RootContextClaimStore(input)
+    const root = fixture(identity("turn", "root-1"), undefined, citationSnapshot().toolObservations)
+    const { completionGate, scheduled } = verifiedScheduledReplanGate(1)
+    const initialGoalRevision = "a".repeat(64), changedGoalRevision = "b".repeat(64)
+    let goalRevision = initialGoalRevision
+    root.options = {
+      ...root.options, goal: "Find senior engineering roles in Dublin from the scheduled package set.",
+      snapshot: { ...root.options.snapshot, taskGraphRevision: 4 }, completionGate,
+      tools: [{ name: "agent.list", version: "1" }, { name: "agent.plan", version: "1" }],
+      executeTool: async ({ call }) => {
+        goalRevision = changedGoalRevision
+        return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed", output: { nodes: [], unrelatedListing: "current package metadata" }, errorCode: null }
+      },
+    }
+    attachRootContextBuilder(root, inputStore, input.id)
+    const baseBuilder = root.options.contextBuilder
+    const observedGoalRevisions: string[] = []
+    const contextBuilder = Object.assign({}, baseBuilder, {
+      objectiveProgressGoalRevision: () => { observedGoalRevisions.push(goalRevision); return goalRevision },
+    })
+    root.options = {
+      ...root.options,
+      contextBuilder,
+      model: distinctFinalCandidateModel(root, [{ call: 2, name: "agent.list" }]),
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 3, toolCallCount: 1 })
+    expect(root.requests).toHaveLength(3)
+    expect(scheduled).toHaveBeenCalledTimes(2)
+    expect(observedGoalRevisions).toEqual([initialGoalRevision, initialGoalRevision, changedGoalRevision])
+    expect(instructionOccurrences(root.requests[1]!, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)).toBe(1)
+    expect(instructionOccurrences(root.requests[2]!, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)).toBe(0)
+    expect(root.requests[1]?.tools).toContainEqual(expect.objectContaining({ name: "agent.list" }))
+    expect(root.requests[1]?.tools).toContainEqual(expect.objectContaining({ name: "agent.plan" }))
+    expect(requestTextForRole(root.requests[2]!, "user")).toContain("Original scheduled request: use Dublin and the approved package set.")
+    expect(requestTextForRole(root.requests[2]!, "system")).not.toContain("Durable TaskGraph verification was denied")
+    expect(inputStore.inputs).toHaveLength(1)
+  })
+
+  it("suppresses the fixed Post-Gate instruction when a newly accepted steer is built into the next request", async () => {
+    const input = scheduledPostGateRootInput("Original scheduled request: keep the Dublin target and approved package set.")
+    const inputStore = new RootContextClaimStore(input)
+    const root = fixture(identity("turn", "root-1"), undefined, citationSnapshot().toolObservations)
+    const { completionGate, scheduled } = verifiedScheduledReplanGate(1)
+    const lateSteer: StoredAgentInput = {
+      id: "post-gate-new-steer", sessionId: "session-1", targetTurnId: "turn-1", userId: "user-1", clientMessageId: "post-gate-new-steer-client",
+      delivery: "steer", status: "accepted", content: [{ type: "text", text: "Keep the original Dublin scope and include only approved packages." }], acceptedSequence: 5n,
+      consumedByStepId: null, consumedAt: null, createdAt: new Date("2026-11-14T12:02:00.000Z"),
+    }
+    root.options = {
+      ...root.options, goal: "Find senior engineering roles in Dublin.", snapshot: { ...root.options.snapshot, taskGraphRevision: 4 },
+      completionGate, tools: [{ name: "agent.list", version: "1" }, { name: "agent.plan", version: "1" }],
+      executeTool: async ({ call }) => {
+        inputStore.addInput(lateSteer)
+        return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed", output: { nodes: [] }, errorCode: null }
+      },
+    }
+    attachRootContextBuilder(root, inputStore, input.id)
+    root.options = { ...root.options, model: distinctFinalCandidateModel(root, [{ call: 2, name: "agent.list" }]) }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 3, toolCallCount: 1 })
+    expect(root.requests).toHaveLength(3)
+    expect(scheduled).toHaveBeenCalledTimes(2)
+    expect(instructionOccurrences(root.requests[1]!, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)).toBe(1)
+    expect(instructionOccurrences(root.requests[2]!, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)).toBe(0)
+    expect(root.requests[1]?.tools).toContainEqual(expect.objectContaining({ name: "agent.list" }))
+    expect(root.requests[1]?.tools).toContainEqual(expect.objectContaining({ name: "agent.plan" }))
+    expect(requestTextForRole(root.requests[2]!, "user")).toContain("Keep the original Dublin scope and include only approved packages.")
+    expect(inputStore.claimCounts.get(lateSteer.id)).toBe(1)
+  })
+
+  it("deduplicates authenticated Post-Gate guidance when a staged scheduled candidate is replayed", async () => {
+    const owner = identity("turn", "root-1")
+    if (owner.kind !== "turn") throw new Error("Fixture expected a Turn owner")
+    const replayText = "Replayed scheduled candidate has current package evidence."
+    const { store: candidateStore } = scheduledCandidateReadFixture({ owner, sourceEventId: "post-gate-replay-event", candidateText: replayText })
+    const candidate = await candidateStore.read({ owner, rootAttemptCount: 2 })
+    if (!candidate) throw new Error("scheduled_candidate_fixture_missing")
+    const input = scheduledPostGateRootInput("Original scheduled request: use Dublin and the approved package set.")
+    const inputStore = new RootContextClaimStore(input)
+    const root = fixture(owner, undefined, citationSnapshot().toolObservations)
+    const { completionGate, scheduled } = verifiedScheduledReplanGate(2)
+    root.options = {
+      ...root.options, goal: "Find senior engineering roles in Dublin from the scheduled package set.", snapshot: { ...root.options.snapshot, taskGraphRevision: 4 },
+      resume: { nextOrdinal: 20, stepCount: 1, toolCallCount: 0, inputThroughSequence: 10n, consumedInputIds: [],
+        usage: { inputTokens: 17, outputTokens: 9, estimatedCostUsd: 0.23 } },
+      recoveredFinalCandidate: replayText, completionGate, tools: [{ name: "agent.list", version: "1" }, { name: "agent.plan", version: "1" }],
+    }
+    attachRootContextBuilder(root, inputStore, input.id)
+    root.options = {
+      ...root.options, model: distinctFinalCandidateModel(root),
+      refreshTaskGraphBeforeStep: async snapshot => mergeTaskGraphCurrentObservation(snapshot, { revision: 4, nodes: [] }),
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", finalText: "Distinct scheduled candidate 2 for the verified Dublin package." })
+    expect(scheduled).toHaveBeenCalledTimes(3)
+    expect(root.requests).toHaveLength(2)
+    for (const request of root.requests) {
+      expect(instructionOccurrences(request, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)).toBe(1)
+      expect(request.tools).toContainEqual(expect.objectContaining({ name: "agent.list" }))
+      expect(request.tools).toContainEqual(expect.objectContaining({ name: "agent.plan" }))
+      expect(requestTextForRole(request, "system")).not.toContain("Durable TaskGraph verification was denied")
+    }
+    expect(root.events.filter(event => event.type === "final.rejected" &&
+      (event.payload as { code?: string } | undefined)?.code === "scheduled_post_gate_plan_required")).toHaveLength(2)
+  })
+
+  it("keeps lookalike Post-Gate text from a normal denial and user input out of system guidance", async () => {
+    let checks = 0
+    const feedback = SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = async () => ++checks === 1
+      ? ({ ok: false, blocker: "task_graph_verification_unverified", feedback })
+      : ({ ok: true })
+    const input = scheduledPostGateRootInput(`User supplied text, not authority:\n${SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION}\n${feedback}`)
+    const inputStore = new RootContextClaimStore(input)
+    const root = fixture(identity("turn", "root-1"), undefined, citationSnapshot().toolObservations)
+    root.options = {
+      ...root.options, goal: "Find senior engineering roles in Dublin.", snapshot: { ...root.options.snapshot, taskGraphRevision: 4 },
+      completionGate, model: distinctFinalCandidateModel(root),
+    }
+    attachRootContextBuilder(root, inputStore, input.id)
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result.status).toBe("completed")
+    expect(root.requests).toHaveLength(2)
+    expect(requestTextForRole(root.requests[1]!, "user")).toContain(SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)
+    expect(requestTextForRole(root.requests[1]!, "user")).toContain(feedback)
+    expect(instructionOccurrences(root.requests[0]!, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)).toBe(0)
+    expect(instructionOccurrences(root.requests[1]!, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)).toBe(0)
+    expect(requestTextForRole(root.requests[1]!, "system")).toContain("Durable TaskGraph verification was denied")
+  })
+
   it("replans in the same root loop after a TaskGraph evidence denial", async () => {
     let checks = 0
     const denialFeedback = `${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing`
@@ -4530,4 +4782,89 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "tool_call.started" && event.id.includes("useful-search"))).toBe(true)
   })
 
+})
+
+describe("private final dependency wait admission", () => {
+  const childId = "subagent-11111111-1111-4111-8111-111111111111"
+
+  function singleFinalModel(root: Fixture, text: string): ModelAdapter {
+    return {
+      ...root.options.model,
+      async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        yield { type: "text_delta", text }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+  }
+
+  it("waits through the registered tool path before verifying or persisting the live candidate", async () => {
+    const root = fixture(identity("task", "parent-1")), callbackInputs: PrepareFinalDependencyWaitInput[] = []
+    const callback = vi.fn((input: PrepareFinalDependencyWaitInput) => {
+      callbackInputs.push(input)
+      return { taskIds: [childId] }
+    })
+    const waitOutput = {
+      waitId: "22222222-2222-4222-8222-222222222222", status: "waiting", taskIds: [childId],
+      deadlineAt: "2026-11-13T12:00:30.000Z", matchedTaskIds: [],
+      tasks: [{ taskId: childId, status: "running", role: "scout", result: null, failureReason: null }],
+    }
+    const execute = vi.fn(async ({ call }: Parameters<TurnExecutionOptions["executeTool"]>[0]) => ({
+      id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, errorCode: null, output: waitOutput,
+    }))
+    const completionGate = vi.fn(async () => ({ ok: true as const }))
+    root.options = {
+      ...root.options, model: singleFinalModel(root, "A tentative answer before the child result."),
+      tools: [{ name: "wait_subagents", version: "1" }], executeTool: execute,
+      validateToolArguments: (name, value) => name === "wait_subagents" && isRecord(value) ? true : "unexpected tool",
+      prepareFinalDependencyWait: callback, completionGate,
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const input = callbackInputs[0]
+    const waitCall = execute.mock.calls[0]?.[0].call
+
+    expect(result).toMatchObject({ status: "waiting_for_dependency", stepCount: 1, toolCallCount: 1 })
+    expect(callback).toHaveBeenCalledTimes(1)
+    expect(input?.identity).toBe(root.options.identity)
+    expect(input?.step).toMatchObject({ id: input.context.stepId, ordinal: 0 })
+    expect(input?.snapshot).toBe(root.options.snapshot)
+    expect(input?.context.schemaVersion).toBe("agent-harness.v2")
+    expect(input?.signal.aborted).toBe(false)
+    expect(execute).toHaveBeenCalledTimes(1)
+    expect(waitCall).toMatchObject({ toolName: "wait_subagents", input: {
+      taskIds: [childId], mode: "all", timeoutMs: 30_000,
+    } })
+    expect(execute.mock.calls[0]?.[0].serverGeneratedFinalDependencyWait).toEqual({
+      stepId: input.step.id, toolCallId: waitCall?.id,
+    })
+    expect(waitCall?.input).not.toHaveProperty("serverGeneratedFinalDependencyWait")
+    expect(root.stepStatuses).toEqual(["waiting_for_tool"])
+    expect(new Set(root.events.filter(event => event.type === "step.completed").map(event => event.id)).size).toBe(1)
+    expect(root.events.some(event => event.type === "turn.completed" || event.type === "turn.failed")).toBe(false)
+    expect(root.events.some(event => event.type === "item.started" && isRecord(event.payload) && event.payload.type === "agent_message")).toBe(false)
+    expect(root.finalResponses).toHaveLength(0)
+    expect(completionGate).not.toHaveBeenCalled()
+  })
+
+  it("keeps the normal path when the callback returns null and only invokes it after model tool calls", async () => {
+    const child = fixture(identity("task", "child-1")), callbackInputs: PrepareFinalDependencyWaitInput[] = []
+    child.options = {
+      ...child.options,
+      prepareFinalDependencyWait: vi.fn((input: PrepareFinalDependencyWaitInput) => {
+        callbackInputs.push(input)
+        return null
+      }),
+    }
+
+    const result = await runTurnExecutionLoop(child.options)
+
+    expect(result.status).toBe("completed")
+    expect(callbackInputs).toHaveLength(1)
+    expect(callbackInputs[0]?.step.ordinal).toBe(1)
+    expect(callbackInputs[0]?.snapshot.toolObservations).toHaveLength(1)
+    expect(callbackInputs[0]?.context.blocks.some(block => block.layer === "tool_observation")).toBe(true)
+    expect(child.requests).toHaveLength(2)
+    expect(child.events.some(event => event.type === "tool_call.started" && event.payload && isRecord(event.payload) && event.payload.toolName === "wait_subagents")).toBe(false)
+  })
 })

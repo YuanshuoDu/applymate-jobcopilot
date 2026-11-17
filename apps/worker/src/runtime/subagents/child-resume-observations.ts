@@ -1,12 +1,14 @@
 import { Buffer } from "node:buffer"
-import { redactSensitiveText } from "@jobcopilot/shared"
+import { canonicalJson, redactSensitiveText } from "@jobcopilot/shared"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { ContextSeedBlock } from "../context/step-context-builder.js"
 import type { ChildToolReplayReceipt, ChildWaitReplayReceipt } from "../turns/turn-execution-options.js"
 import type { SubagentLease } from "./types.js"
 import { dateValue, DurableSubagentWaitError, object as waitObject, safeSubagentWaitJson, waitResult, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
 import { markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
-import { buildChildResumeReplayReceipts } from "./child-resume-replay-receipts.js"
+import { buildChildResumeReplayReceipts, type ChildResumeReplayPair } from "./child-resume-replay-receipts.js"
+import { redactJobReadOutput } from "../tools/job-read-output-redaction.js"
+import { createDurableDiscoveryAssembly, parseDurableDiscoveryReference, reduceDurableDiscoveryChunk, type DurableDiscoveryAssembly } from "./child-durable-discovery.js"
 
 type Row = Record<string, unknown>
 const MAX_TOOL_OUTPUT_BYTES = 6 * 1024
@@ -74,8 +76,7 @@ function utf8Prefix(value: string, maxBytes: number): string {
   }
   return prefix
 }
-function boundedJson(value: unknown, maxBytes: number): RepositoryJsonValue {
-  const normalized = safeJson(value)
+function boundedNormalizedJson(normalized: RepositoryJsonValue, maxBytes: number): RepositoryJsonValue {
   const encoded = JSON.stringify(normalized)
   if (Buffer.byteLength(encoded, "utf8") <= maxBytes) return normalized
   const marker: { truncated: boolean; byteLength: number; preview: string } = { truncated: true, byteLength: Buffer.byteLength(encoded, "utf8"), preview: "" }
@@ -87,12 +88,48 @@ function boundedJson(value: unknown, maxBytes: number): RepositoryJsonValue {
   }
   return { truncated: true, byteLength: marker.byteLength, preview: "" }
 }
+function boundedJson(value: unknown, maxBytes: number): RepositoryJsonValue { return boundedNormalizedJson(safeJson(value), maxBytes) }
+function boundedDiscoveryJson(value: unknown, maxBytes: number): RepositoryJsonValue {
+  const reference = parseDurableDiscoveryReference(value)
+  const normalized = reference
+    ? { $ref: reference.ref, sizeBytes: reference.byteCount, sha256: reference.sha256 }
+    : redactJobReadOutput("jobs.discover", value)
+  return boundedNormalizedJson(normalized, maxBytes)
+}
+function verifiedDiscoveryReadPairs(pairs: readonly ChildResumeReplayPair[]): Set<number> {
+  const assemblies = new Map<string, { assembly: DurableDiscoveryAssembly; positions: number[] }>(), verified = new Set<number>()
+  for (const [index, pair] of pairs.entries()) {
+    if (pair.toolName === "jobs.discover" && pair.status === "completed") {
+      const reference = parseDurableDiscoveryReference(pair.output)
+      if (reference) {
+        const previous = assemblies.get(reference.ref); if (previous && (previous.assembly.reference.byteCount !== reference.byteCount || previous.assembly.reference.sha256 !== reference.sha256)) throw new Error("child_resume_evidence_invalid")
+        if (!previous) assemblies.set(reference.ref, { assembly: createDurableDiscoveryAssembly(reference), positions: [] })
+      }
+      continue
+    }
+    if (pair.toolName !== "tool_results.read" || pair.status !== "completed") continue
+    const input = object(pair.input), output = object(pair.output), inputRef = input?.referenceId, outputRef = output?.ref
+    const ref = typeof inputRef === "string" && assemblies.has(inputRef) ? inputRef : typeof outputRef === "string" && assemblies.has(outputRef) ? outputRef : undefined
+    const state = ref ? assemblies.get(ref) : undefined
+    if (!state) continue
+    const reduction = reduceDurableDiscoveryChunk(state.assembly, pair.output, pair.input); if (reduction.kind === "invalid") throw new Error("child_resume_evidence_invalid")
+    state.positions.push(index)
+    if (reduction.kind === "complete") {
+      const safe = redactJobReadOutput("jobs.discover", reduction.value); if (canonicalJson(safe) !== canonicalJson(reduction.value)) throw new Error("child_resume_evidence_invalid")
+      state.positions.forEach(position => verified.add(position))
+    } else if (state.assembly.complete) verified.add(index)
+  }
+  return verified
+}
 export function buildChildResumeObservations(rows: readonly Row[], lease: SubagentLease, currentAttemptOrdinal?: number, durableWaits: readonly DurableWaitResume[] = []): ChildResumeObservationSet {
   const replay = buildChildResumeReplayReceipts(rows, lease, currentAttemptOrdinal, durableWaits)
   if (replay.pairs.length > MAX_RESTORED_OBSERVATIONS) throw new Error("child_resume_observation_limit")
-  const restored = replay.pairs.map(item => ({ id: `child-resume:${item.resultItemId}`, content: { toolCallId: item.toolCallId, toolName: item.toolName,
+  const verifiedReads = verifiedDiscoveryReadPairs(replay.pairs)
+  const restored = replay.pairs.map((item, index) => ({ id: `child-resume:${item.resultItemId}`, content: { toolCallId: item.toolCallId, toolName: item.toolName,
     input: boundedJson(item.input, MAX_TOOL_INPUT_BYTES), status: item.status,
-    output: boundedJson(item.output, MAX_TOOL_OUTPUT_BYTES), errorCode: item.status === "completed" ? null : "tool_execution_failed" } }))
+    output: item.toolName === "jobs.discover" ? boundedDiscoveryJson(item.output, MAX_TOOL_OUTPUT_BYTES)
+      : item.toolName === "tool_results.read" && verifiedReads.has(index) ? boundedNormalizedJson(item.output as RepositoryJsonValue, MAX_TOOL_OUTPUT_BYTES) : boundedJson(item.output, MAX_TOOL_OUTPUT_BYTES),
+    errorCode: item.status === "completed" ? null : "tool_execution_failed" } }))
   if (Buffer.byteLength(JSON.stringify(restored), "utf8") > MAX_RESTORED_OBSERVATION_BYTES) throw new Error("child_resume_observation_limit")
   return { observations: restored, childToolReplayReceipts: replay.childToolReplayReceipts, childWaitReplayReceipts: replay.childWaitReplayReceipts }
 }

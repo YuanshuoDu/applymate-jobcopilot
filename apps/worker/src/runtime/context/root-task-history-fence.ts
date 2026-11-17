@@ -7,10 +7,10 @@ import { digestNativeVerificationValue } from "../subagents/native-verification-
 import { isScheduledAutomationTurn, scheduledAutomationCriteria, type ScheduledAutomationCriteria } from "../subagents/scheduled-automation-snapshot.js"
 import { resolveRootTaskObjective, resolveRootTaskVerificationRequirements } from "./root-task-objective.js"
 import { readRootTaskHistoryChronologyWitness, type RootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.js"
+import { rootTaskHistoryFootprintOrigin } from "./root-task-history-footprint-origin.js"
 
 type Client = pg.PoolClient
 type Row = Record<string, unknown>
-
 export type RootTaskHistoryFenceInput = Readonly<{
   lease: TurnLease
   rootTaskId: string
@@ -19,6 +19,7 @@ export type RootTaskHistoryFenceInput = Readonly<{
   now: Date
   crossSessionRootTaskHistoryEnabled?: boolean
   objectiveHistoryIndexEnabled?: boolean
+  searchFootprintReadAllowed?: boolean
 }>
 
 export type RootTaskHistoryFence = Readonly<{
@@ -29,10 +30,11 @@ export type RootTaskHistoryFence = Readonly<{
   objectiveHistoryIndexObjectiveDigest?: string
   objectiveHistoryIndexCanonicalOriginDigest?: string
   currentOrigin?: string
+  searchFootprintOrigin?: string
+  searchFootprintStartWitness?: RootTaskHistoryChronologyWitness
 }>
 
 type Queryable = Pick<pg.PoolClient, "query">
-
 function text(value: unknown): value is string {
   return typeof value === "string" && !!value.trim() && value.trim() === value
 }
@@ -87,6 +89,7 @@ export function validateRootTaskHistoryFenceInput(input: RootTaskHistoryFenceInp
     || !Number.isSafeInteger(input.rootAttemptCount) || input.rootAttemptCount < 1 || !text(input.stepId)
     || (input.crossSessionRootTaskHistoryEnabled !== undefined && typeof input.crossSessionRootTaskHistoryEnabled !== "boolean")
     || (input.objectiveHistoryIndexEnabled !== undefined && typeof input.objectiveHistoryIndexEnabled !== "boolean")
+    || (input.searchFootprintReadAllowed !== undefined && typeof input.searchFootprintReadAllowed !== "boolean")
     || !(input.now instanceof Date) || !Number.isFinite(input.now.getTime())) {
     throw new Error("root_task_history_input_invalid")
   }
@@ -199,6 +202,8 @@ export async function readRootTaskHistoryFence(
   const scheduledCriteria = scheduledTurn ? scheduledAutomationCriteria(currentTurn.input) : undefined
   if (scheduledTurn && !scheduledCriteria) return undefined
   const currentOrigin = input.crossSessionRootTaskHistoryEnabled ? rootTaskHistoryOrigin(currentTurn.source, currentTurn.input) : undefined
+  const searchFootprintOrigin = input.crossSessionRootTaskHistoryEnabled === true && input.searchFootprintReadAllowed === true
+    ? rootTaskHistoryFootprintOrigin(currentTurn.source, currentTurn.input) : undefined
   const objectiveDigest = rootTaskHistoryObjectiveDigest(currentTurn.input, root)
   if (!objectiveDigest) return undefined
   const indexKeys = input.objectiveHistoryIndexEnabled === true
@@ -208,17 +213,19 @@ export async function readRootTaskHistoryFence(
   if (input.objectiveHistoryIndexEnabled === true && !indexKeys) return undefined
   const start = await currentStart(client, input)
   if (!start) return undefined
-  const currentStartWitness = input.crossSessionRootTaskHistoryEnabled === true && currentOrigin
+  const startWitness = input.crossSessionRootTaskHistoryEnabled === true && (currentOrigin || searchFootprintOrigin)
     ? await readRootTaskHistoryChronologyWitness(client, { boundaryEventId: start.eventId, boundary: "turn_start",
       userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: input.rootTaskId })
     : undefined
   return {
     currentStartSequence: start.sequence, objectiveDigest,
-    ...(currentStartWitness ? { currentStartWitness } : {}),
+    ...(currentOrigin && startWitness ? { currentStartWitness: startWitness } : {}),
+    ...(searchFootprintOrigin && startWitness ? { searchFootprintStartWitness: startWitness } : {}),
     ...(scheduledCriteria ? { scheduledAutomationCriteria: scheduledCriteria } : {}),
     ...(indexKeys ? { objectiveHistoryIndexObjectiveDigest: indexKeys.objectiveDigest,
       ...(indexKeys.canonicalOriginDigest ? { objectiveHistoryIndexCanonicalOriginDigest: indexKeys.canonicalOriginDigest } : {}) } : {}),
     ...(currentOrigin ? { currentOrigin } : {}),
+    ...(searchFootprintOrigin ? { searchFootprintOrigin } : {}),
   }
 }
 

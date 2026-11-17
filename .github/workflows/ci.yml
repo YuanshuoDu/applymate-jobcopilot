@@ -184,6 +184,8 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
         run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
       - name: Build the Worker fixture dependencies
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: pnpm turbo build --filter=@jobcopilot/worker
       - name: Install browser and isolation prerequisites before egress lockdown
         run: |
@@ -622,6 +624,8 @@ jobs:
             src/lib/agent/control-plane/agent-usage-reconciliation.pg.integration.test.ts \
             src/lib/agent/control-plane/agent-root-usage-reservations.pg.integration.test.ts
       - name: Build Worker workspace before focused test
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: pnpm turbo build --filter=@jobcopilot/worker
       - name: Verify fair child-wait reconciliation on disposable PostgreSQL
         env:
@@ -1382,6 +1386,8 @@ jobs:
           test "$CUSTOM_AGENT_ROLE_PG_TEST_DISPOSABLE" = "true"
           test "$CUSTOM_AGENT_ROLE_PG_TEST_REQUIRED" = "true"
           pnpm --filter @jobcopilot/web exec prisma migrate deploy --schema prisma/schema.prisma
+      - name: Generate Prisma Client for the current schema
+        run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
       - name: Verify CustomAgentRole migration and candidate RLS on disposable PostgreSQL
         run: |
           test "$CI" = "true"
@@ -1389,6 +1395,26 @@ jobs:
           test "$CUSTOM_AGENT_ROLE_PG_TEST_DISPOSABLE" = "true"
           test "$CUSTOM_AGENT_ROLE_PG_TEST_REQUIRED" = "true"
           pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism src/__tests__/custom-agent-role-migration.pg.integration.test.ts
+      - name: Verify AgentSession idempotency races on disposable PostgreSQL
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_custom_agent_role_ci
+        run: |
+          test "$CI" = "true"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_custom_agent_role_ci"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_DISPOSABLE" = "true"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/shared... build
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism src/lib/agent/session/repository.pg.integration.test.ts
+      - name: Verify objective start recovery fences on disposable PostgreSQL
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_custom_agent_role_ci
+        run: |
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_custom_agent_role_ci"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_URL" = "$DATABASE_URL"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_DISPOSABLE" = "true"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism src/lib/agent/control-plane/commands/objective-start-attempt-ledger.pg.integration.test.ts
   lockfile:
     name: Lockfile
     runs-on: ubuntu-latest

@@ -4,7 +4,13 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
-import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
+import { createDiscoveryQueryFootprint } from "../subagents/child-discovery-query-footprint.js"
+import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "../subagents/child-discovery-attempt.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
+import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput,
+  type DirectRootTaskHistorySearchFootprintLoadInput } from "./root-task-history-direct-store.js"
 import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, updateRootObjectiveHistoryProjection } from "./objective-history-projection.js"
 import { projectRootTaskHistory, type ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
 import { acquireRootTaskHistoryChronologyLock, appendRootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.js"
@@ -17,6 +23,47 @@ const SOURCE_SEQUENCE_STRIDE = 6
 const CURRENT_START_SEQUENCE = 10_000
 const FIXTURE_EVENT_SEQUENCE = 20_000
 const SCHEDULED_FIXTURE_EVENT_SEQUENCE = 30_000
+type RootHistoryDiagnosticStage =
+  | "manual_pool_connect"
+  | "manual_begin"
+  | "manual_limits"
+  | "manual_user_scope"
+  | "manual_fence"
+  | "manual_witness_lookup"
+  | "manual_page_first"
+  | "manual_page_second"
+  | "manual_page_empty"
+  | "manual_witness_count"
+  | "manual_rollback"
+  | "manual_release"
+  | "wrapped_store_load"
+  | "diagnostic_pool_close"
+  | "wrapped_pool_connect"
+  | "wrapped_begin"
+  | "wrapped_limits"
+  | "wrapped_fence"
+  | "wrapped_index_readiness"
+  | "wrapped_cross_session_page"
+  | "wrapped_graph_load"
+  | "wrapped_other_query"
+type RootHistoryDiagnosticFailure = "lock_timeout" | "statement_cancelled" | "client_query_timeout" | "pool_close_timeout" | "other"
+type RootHistoryDiagnosticLeaseReporter = (cancel: (() => void) | undefined) => void
+const ROOT_HISTORY_DIAGNOSTIC_ABORT = new Error("root_history_diagnostic_client_discarded")
+const MAX_ROOT_HISTORY_DIAGNOSTIC_EVENTS = 64
+let rootHistoryDiagnosticEventCount = 0
+
+function writeRootHistoryDiagnostic(
+  event: "start" | "pass" | "near_timeout" | "failure",
+  stage: RootHistoryDiagnosticStage,
+  failure?: RootHistoryDiagnosticFailure,
+): void {
+  if (rootHistoryDiagnosticEventCount >= MAX_ROOT_HISTORY_DIAGNOSTIC_EVENTS
+    && event !== "near_timeout" && event !== "failure") return
+  if (rootHistoryDiagnosticEventCount < MAX_ROOT_HISTORY_DIAGNOSTIC_EVENTS) rootHistoryDiagnosticEventCount += 1
+  const kind = failure ? ` kind=${failure}` : ""
+  process.stderr.write(`[root-history-pg] ${event} stage=${stage}${kind}\n`)
+}
+
 function disposableUrl(): string | null {
   const required = process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true", value = process.env.AGENT_RUNTIME_PG_TEST_URL
   if (process.env.CI !== "true" && !required) return null
@@ -67,16 +114,44 @@ function observeQueries(pool: PgPool, afterQuery: (sql: string, values?: readonl
   }
 }
 
-function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number): string {
+function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number, fixtureScopeParameter: number): string {
   const witnessId = `$${witnessIdParameter}`
-  return `WITH "agent_events" AS NOT MATERIALIZED (
-      SELECT * FROM public."agent_events"
+  const fixtureScope = `$${fixtureScopeParameter}`
+  return `WITH "fixture_manifest" AS MATERIALIZED (
+      SELECT ${fixtureScope}::jsonb AS manifest
+    ), "fixture_sessions" AS MATERIALIZED (
+      SELECT source_session.* FROM "fixture_manifest" AS manifest
+      CROSS JOIN LATERAL jsonb_array_elements_text(manifest.manifest->'sessions') AS fixture("id")
+      JOIN public."agent_sessions" AS source_session ON source_session."id" = fixture."id"
+    ), "agent_sessions" AS NOT MATERIALIZED (
+      SELECT * FROM "fixture_sessions"
+    ), "fixture_turns" AS MATERIALIZED (
+      SELECT source_turn.* FROM "fixture_manifest" AS manifest
+      CROSS JOIN LATERAL jsonb_array_elements_text(manifest.manifest->'turns') AS fixture("id")
+      JOIN public."agent_turns" AS source_turn ON source_turn."id" = fixture."id"
+    ), "agent_turns" AS NOT MATERIALIZED (
+      SELECT * FROM "fixture_turns"
+    ), "fixture_tasks" AS MATERIALIZED (
+      SELECT source_task.* FROM "fixture_manifest" AS manifest
+      CROSS JOIN LATERAL jsonb_array_elements_text(manifest.manifest->'rootTasks') AS fixture("id")
+      JOIN public."sub_agent_tasks" AS source_task ON source_task."id" = fixture."id"
+    ), "sub_agent_tasks" AS NOT MATERIALIZED (
+      SELECT * FROM "fixture_tasks"
+    ), "fixture_events" AS MATERIALIZED (
+      SELECT source_event.*
+      FROM "fixture_manifest" AS manifest
+      CROSS JOIN LATERAL jsonb_array_elements_text(manifest.manifest->'events') AS fixture("id")
+      JOIN public."agent_events" AS source_event ON source_event."id" = fixture."id"
+    ), "agent_events" AS MATERIALIZED (
+      SELECT * FROM "fixture_events"
       UNION ALL
       SELECT (jsonb_populate_record(NULL::public.agent_events,
         to_jsonb(source_witness) || jsonb_build_object('id', source_witness."id" || ':query-duplicate'))).*
-      FROM public."agent_events" AS source_witness WHERE source_witness."id" = ${witnessId}
-    ), "agent_outbox" AS NOT MATERIALIZED (
-      SELECT * FROM public."agent_outbox"
+      FROM "fixture_events" AS source_witness WHERE source_witness."id" = ${witnessId}
+    ), "agent_outbox" AS MATERIALIZED (
+      SELECT source_dispatch.*
+      FROM "fixture_events" AS event
+      JOIN public."agent_outbox" AS source_dispatch ON source_dispatch."id" = 'agent-outbox-' || event."id"
       UNION ALL
       SELECT (jsonb_populate_record(NULL::public.agent_outbox,
         to_jsonb(source_dispatch) || jsonb_build_object(
@@ -88,7 +163,7 @@ function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number):
             'correlationId', shadow_witness."correlationId", 'causationId', shadow_witness."causationId",
             'idempotencyKey', shadow_witness."idempotencyKey", 'payload', shadow_witness.payload)))).*
       FROM "agent_events" AS shadow_witness
-      JOIN public."agent_events" AS source_witness
+      JOIN "fixture_events" AS source_witness
         ON shadow_witness."id" = source_witness."id" || ':query-duplicate'
       JOIN public."agent_outbox" AS source_dispatch ON source_dispatch."id" = 'agent-outbox-' || source_witness."id"
     )
@@ -97,22 +172,60 @@ function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number):
     CROSS JOIN (SELECT $3::text) AS "root_task_history_parameter_type_anchor"`
 }
 
-function queryLevelDuplicateWitnessPool(pool: PgPool, witnessId: string): Pick<PgPool, "connect"> {
+function queryLevelDuplicateWitnessPool(
+  pool: PgPool,
+  witnessId: string,
+  fixtureScope: string,
+  onStage: (stage: RootHistoryDiagnosticStage) => void,
+  onLease: RootHistoryDiagnosticLeaseReporter,
+): Pick<PgPool, "connect"> {
   return {
     connect: async () => {
+      onStage("wrapped_pool_connect")
       const client = await pool.connect()
       const originalQuery = client.query.bind(client)
+      const originalRelease = client.release.bind(client)
+      let released = false
+      let queryFailed = false
+      const release = (error?: Error | boolean) => {
+        if (released) return
+        released = true
+        onLease(undefined)
+        originalRelease(error ?? (queryFailed ? ROOT_HISTORY_DIAGNOSTIC_ABORT : undefined))
+      }
+      const forceRelease = () => release(ROOT_HISTORY_DIAGNOSTIC_ABORT)
+      onLease(forceRelease)
       const query = async (sql: string, values?: readonly unknown[]) => {
-        if (!sql.includes("WITH terminal_window AS MATERIALIZED (") || !sql.includes('event."sessionId" <> $1')) {
-          return originalQuery(sql, values ? [...values] : undefined)
+        try {
+          if (sql === "BEGIN") {
+            onStage("wrapped_begin")
+            const result = await originalQuery(sql)
+            onStage("wrapped_limits")
+            await originalQuery("SET LOCAL lock_timeout = '2000ms'")
+            await originalQuery("SET LOCAL statement_timeout = '10s'")
+            await originalQuery("SET LOCAL max_parallel_workers_per_gather = 0")
+            return result
+          }
+          if (sql.includes("FOR UPDATE")) onStage("wrapped_fence")
+          else if (sql.includes('FROM "agent_objective_history_index_readiness"')) onStage("wrapped_index_readiness")
+          else if (sql.includes("WITH terminal_window AS MATERIALIZED (") && sql.includes('event."sessionId" <> $1')) {
+            onStage("wrapped_cross_session_page")
+          } else if (sql.includes('FROM "agent_items" AS item')) onStage("wrapped_graph_load")
+          else onStage("wrapped_other_query")
+          const result = !sql.includes("WITH terminal_window AS MATERIALIZED (") || !sql.includes('event."sessionId" <> $1')
+            ? await originalQuery(sql, values ? [...values] : undefined)
+            : await originalQuery(queryLevelDuplicateWitnessSql(sql, (values?.length ?? 0) + 1, (values?.length ?? 0) + 2),
+              [...(values ?? []), witnessId, fixtureScope])
+          return result
+        } catch (error: unknown) {
+          queryFailed = true
+          throw error
         }
-        const witnessIdParameter = (values?.length ?? 0) + 1
-        await originalQuery("SET LOCAL max_parallel_workers_per_gather = 0")
-        return originalQuery(queryLevelDuplicateWitnessSql(sql, witnessIdParameter), [...(values ?? []), witnessId])
       }
       return new Proxy(client, {
         get(target, property) {
           if (property === "query") return query
+          if (property === "release") return release
           const value = Reflect.get(target, property, target)
           return typeof value === "function" ? value.bind(target) : value
         },
@@ -125,12 +238,57 @@ function errorCode(error: unknown): string | undefined {
   return error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : undefined
 }
 
+function rootHistoryDiagnosticFailure(error: unknown): RootHistoryDiagnosticFailure {
+  const code = errorCode(error)
+  if (error && typeof error === "object" && "message" in error && error.message === "Query read timeout") {
+    return "client_query_timeout"
+  }
+  return code === "55P03" ? "lock_timeout" : code === "57014" ? "statement_cancelled" : "other"
+}
+
 function queryRecords(rows: readonly unknown[] | undefined): Array<Record<string, unknown>> {
   const records: Array<Record<string, unknown>> = []
   for (const row of rows ?? []) {
     if (row && typeof row === "object" && !Array.isArray(row)) records.push(row as Record<string, unknown>)
   }
   return records
+}
+
+type SafeExplainNode = Readonly<{
+  depth: number; nodeType: string; relation?: string; index?: string; joinType?: string; planRows?: number; totalCost?: number
+}>
+
+function safeExplainNodes(value: unknown): SafeExplainNode[] {
+  if (!Array.isArray(value)) return []
+  const root = value[0] && typeof value[0] === "object" && !Array.isArray(value[0])
+    ? (value[0] as Record<string, unknown>).Plan : undefined
+  const pending: Array<Readonly<{ node: unknown; depth: number }>> = [{ node: root, depth: 0 }]
+  const result: SafeExplainNode[] = []
+  while (pending.length > 0 && result.length < 128) {
+    const current = pending.pop()!
+    if (!current.node || typeof current.node !== "object" || Array.isArray(current.node)) continue
+    const node = current.node as Record<string, unknown>
+    if (typeof node["Node Type"] !== "string") continue
+    const safeText = (key: string): string | undefined => {
+      const candidate = node[key]
+      return typeof candidate === "string" && candidate.length <= 128 ? candidate : undefined
+    }
+    const safeNumber = (key: string): number | undefined => {
+      const candidate = node[key]
+      return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : undefined
+    }
+    result.push({ depth: current.depth, nodeType: node["Node Type"],
+      ...(safeText("Relation Name") ? { relation: safeText("Relation Name") } : {}),
+      ...(safeText("Index Name") ? { index: safeText("Index Name") } : {}),
+      ...(safeText("Join Type") ? { joinType: safeText("Join Type") } : {}),
+      ...(safeNumber("Plan Rows") !== undefined ? { planRows: safeNumber("Plan Rows") } : {}),
+      ...(safeNumber("Total Cost") !== undefined ? { totalCost: safeNumber("Total Cost") } : {}),
+    })
+    if (Array.isArray(node.Plans)) {
+      for (const child of [...node.Plans].reverse()) pending.push({ node: child, depth: current.depth + 1 })
+    }
+  }
+  return result
 }
 
 type SameSessionPageObservation = Readonly<{
@@ -164,7 +322,8 @@ type Source = Readonly<{
     key: string; templateId: string; role: string; taskType: string; goal: string; successCriteria: readonly string[]; result?: unknown
   }>[]
   failureChildren?: readonly Readonly<{ key: string; templateId: string; role: string; taskType: string; failureReason: string }>[]
-  turnSource?: string; terminalCreatedAt?: Date
+  turnSource?: string; turnExecutionMode?: "canonical_task_graph"; terminalCreatedAt?: Date
+  searchFootprint?: Readonly<{ role: string; location: string; atsSource: "greenhouse" | "lever" | "workday" | "smartrecruiters" | "personio" }>
 }>
 
 const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : describe.skip, suffix = randomUUID()
@@ -175,6 +334,10 @@ const foreignSessionId = `root-history-foreign-session-${suffix}`
 const archivedSessionId = `root-history-archived-session-${suffix}`
 const currentTurnId = `root-history-current-turn-${suffix}`, currentRootTaskId = `root-history-current-root-${suffix}`
 const currentStepId = `root-history-current-step-${suffix}`, workerId = `worker-${suffix}`
+const footprintCurrentSessionId = `root-history-footprint-current-session-${suffix}`
+const footprintCurrentTurnId = `root-history-footprint-current-turn-${suffix}`
+const footprintCurrentRootTaskId = `root-history-footprint-current-root-${suffix}`
+const footprintCurrentStepId = `root-history-footprint-current-step-${suffix}`
 const scheduledCurrentTurnId = `root-history-scheduled-current-turn-${suffix}`
 const scheduledCurrentRootTaskId = `root-history-scheduled-current-root-${suffix}`
 const scheduledCurrentStepId = `root-history-scheduled-current-step-${suffix}`
@@ -190,11 +353,27 @@ const scheduledSnapshot = (targetRoles: readonly string[], overrides: Record<str
 function scheduledTurnInput(snapshot: unknown) {
   return { goal: objective, successCriteria: criteria, automationRunMode: "scheduled", scheduledAutomationSnapshot: snapshot }
 }
+function objectiveIntentInput(goal = objective) {
+  return { goal, successCriteria: criteria, intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT }
+}
 function reportedScoutResult(finalItemId: string) {
   return { finalItemId, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
     structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "partial", summary: "private summary",
       evidence: [{ id: "e1", kind: "job", ref: "job-1", source: "greenhouse" }],
       candidates: [{ jobId: "job-1", source: "greenhouse", url: "https://private.example/1", evidenceIds: ["e1"] }] } }
+}
+function searchFootprintScoutResult(search: NonNullable<Source["searchFootprint"]>) {
+  return {
+    taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "scout-count", status: "passed", reasonCode: "criteria_met" }],
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) },
+    discoveryAttempt: { attemptCount: 1, health: { schemaVersion: DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION,
+      attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0, candidateCount: 7,
+      providerFailures: 1, materializationFailures: 2, hasMore: true },
+      queryFootprint: createDiscoveryQueryFootprint([{ criteria: { targetRoles: [search.role], targetLocations: [search.location],
+        source: search.atsSource, pageSize: 20, hasCursor: true }, outcome: "completed", requestCount: 2,
+        observedCandidateCount: 7, providerFailures: 1, materializationFailures: 2, hasMore: true }]) },
+  }
 }
 const matching: Source[] = [
   { turnId: `root-history-source-a-${suffix}`, rootTaskId: `root-history-root-a-${suffix}`, childId: `root-history-child-a-${suffix}`,
@@ -275,6 +454,55 @@ const otherUser: Source = { turnId: `root-history-other-user-turn-${suffix}`, ro
   childId: `root-history-other-user-child-${suffix}`, finalItemId: `root-history-other-user-final-${suffix}`,
   sessionId: foreignSessionId, userId: otherUserId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1,
   failureChildren: [{ key: "foreign-user", templateId: "analyst", role: "analyst", taskType: "job_analysis", failureReason: "child_resume_unavailable" }] }
+const searchFootprintMatch: Source = { turnId: `root-history-footprint-match-${suffix}`, rootTaskId: `root-history-footprint-match-root-${suffix}`,
+  childId: `root-history-footprint-match-child-${suffix}`, finalItemId: `root-history-footprint-match-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria, input: objectiveIntentInput(), startSequence: 500,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-01T00:00:00.000Z"),
+  searchFootprint: { role: "Backend Engineer", location: "Dublin", atsSource: "lever" } }
+const searchFootprintWrongObjective: Source = { turnId: `root-history-footprint-objective-${suffix}`, rootTaskId: `root-history-footprint-objective-root-${suffix}`,
+  childId: `root-history-footprint-objective-child-${suffix}`, finalItemId: `root-history-footprint-objective-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: "Search for a different role", criteria, input: objectiveIntentInput("Search for a different role"),
+  startSequence: 600, turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-02T00:00:00.000Z"),
+  searchFootprint: { role: "Foreign Objective Role", location: "Berlin", atsSource: "workday" } }
+const searchFootprintForeignTenant: Source = { turnId: `root-history-footprint-tenant-${suffix}`, rootTaskId: `root-history-footprint-tenant-root-${suffix}`,
+  childId: `root-history-footprint-tenant-child-${suffix}`, finalItemId: `root-history-footprint-tenant-final-${suffix}`,
+  sessionId: foreignSessionId, userId: otherUserId, goal: objective, criteria, input: objectiveIntentInput(), startSequence: 3,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-03T00:00:00.000Z"),
+  searchFootprint: { role: "Foreign Tenant Role", location: "Cork", atsSource: "personio" } }
+const searchFootprintFuture: Source = { turnId: `root-history-footprint-future-${suffix}`, rootTaskId: `root-history-footprint-future-root-${suffix}`,
+  childId: `root-history-footprint-future-child-${suffix}`, finalItemId: `root-history-footprint-future-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria, input: objectiveIntentInput(), startSequence: 800,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2031-01-01T00:00:00.000Z"),
+  searchFootprint: { role: "Future Role", location: "Oslo", atsSource: "greenhouse" } }
+const searchFootprintWrongVersion: Source = { turnId: `root-history-footprint-version-${suffix}`, rootTaskId: `root-history-footprint-version-root-${suffix}`,
+  childId: `root-history-footprint-version-child-${suffix}`, finalItemId: `root-history-footprint-version-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria,
+  input: { ...objectiveIntentInput(), intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, version: 2 } }, startSequence: 700,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-04T00:00:00.000Z"),
+  searchFootprint: { role: "Wrong Version Role", location: "Prague", atsSource: "personio" } }
+const searchFootprintExtraIntent: Source = { turnId: `root-history-footprint-extra-${suffix}`, rootTaskId: `root-history-footprint-extra-root-${suffix}`,
+  childId: `root-history-footprint-extra-child-${suffix}`, finalItemId: `root-history-footprint-extra-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria,
+  input: { ...objectiveIntentInput(), intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, extra: true } }, startSequence: 710,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-05T00:00:00.000Z"),
+  searchFootprint: { role: "Extra Intent Role", location: "Paris", atsSource: "workday" } }
+const searchFootprintWrongSource: Source = { turnId: `root-history-footprint-source-${suffix}`, rootTaskId: `root-history-footprint-source-root-${suffix}`,
+  childId: `root-history-footprint-source-child-${suffix}`, finalItemId: `root-history-footprint-source-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria, input: objectiveIntentInput(), startSequence: 720,
+  turnSource: "automation", turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-06T00:00:00.000Z"),
+  searchFootprint: { role: "Wrong Source Role", location: "London", atsSource: "greenhouse" } }
+const searchFootprintScalarTopIntent: Source = { turnId: `root-history-footprint-scalar-top-${suffix}`, rootTaskId: `root-history-footprint-scalar-top-root-${suffix}`,
+  childId: `root-history-footprint-scalar-top-child-${suffix}`, finalItemId: `root-history-footprint-scalar-top-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria,
+  input: { ...objectiveIntentInput(), intent: "malformed" }, startSequence: 730,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-07T00:00:00.000Z"),
+  searchFootprint: { role: "Scalar Top Intent Role", location: "Rome", atsSource: "lever" } }
+const searchFootprintScalarNestedIntent: Source = { turnId: `root-history-footprint-scalar-nested-${suffix}`, rootTaskId: `root-history-footprint-scalar-nested-root-${suffix}`,
+  childId: `root-history-footprint-scalar-nested-child-${suffix}`, finalItemId: `root-history-footprint-scalar-nested-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria,
+  input: { ...objectiveIntentInput(), input: { goal: objective, successCriteria: criteria, intent: "malformed" } }, startSequence: 740,
+  turnExecutionMode: "canonical_task_graph", terminalCreatedAt: new Date("2026-01-08T00:00:00.000Z"),
+  searchFootprint: { role: "Scalar Nested Intent Role", location: "Madrid", atsSource: "workday" } }
 const future: Source = { turnId: `root-history-future-turn-${suffix}`, rootTaskId: `root-history-future-root-${suffix}`,
   childId: `root-history-future-child-${suffix}`, finalItemId: `root-history-future-final-${suffix}`,
   sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 2101,
@@ -302,6 +530,25 @@ const mismatchedStepReceipt: Source = { turnId: `root-history-mismatched-step-ev
 const duplicateStepReceipt: Source = { turnId: `root-history-duplicate-step-event-turn-${suffix}`, rootTaskId: `root-history-duplicate-step-event-root-${suffix}`,
   childId: `root-history-duplicate-step-event-child-${suffix}`, finalItemId: `root-history-duplicate-step-event-final-${suffix}`, sessionId, userId,
   goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 44, stepReceipt: "duplicate" }
+const initialRootHistorySources: readonly Source[] = [
+  ...matching, mismatched, changedCriteria, selectedJob, otherSession, crossEqualTimeHigherTurnId,
+  crossWrongSource, crossWrongOrigin, archivedSource, equalCutoff, foreignScopeCorrelation, otherUser,
+  searchFootprintWrongObjective, searchFootprintForeignTenant,
+  inconsistentTerminal, streamingTerminalStep, failedTerminalStep, missingStepReceipt, mismatchedStepReceipt,
+  duplicateStepReceipt, ...crossSessionWrongOriginFillers,
+]
+const duplicateWitnessFixtureScope = [
+  { sessionId, turnId: currentTurnId },
+  ...initialRootHistorySources.map(source => ({ sessionId: source.sessionId, turnId: source.turnId })),
+  { sessionId: future.sessionId, turnId: future.turnId },
+]
+const duplicateWitnessFixtureTurnIds = [...new Set(duplicateWitnessFixtureScope.map(scope => scope.turnId))]
+let duplicateWitnessFixtureManifestJson: string | undefined
+let capturedFixtureEventIds: string[] | undefined
+function duplicateWitnessFixtureManifest(): string {
+  if (!duplicateWitnessFixtureManifestJson) throw new Error("Root history fixture manifest is unavailable")
+  return duplicateWitnessFixtureManifestJson
+}
 let pool: PgPool | undefined
 let lease: TurnLease
 
@@ -342,6 +589,7 @@ async function insertBoundaryEvent(client: PoolClient, event: EventReceipt, crea
   [event.id, event.sessionId, event.turnId, event.itemId, event.taskId, event.sequence, event.type, event.correlationId,
     event.causationId, event.idempotencyKey, JSON.stringify(event.payload), createdAt])
   await insertEventOutbox(client, event)
+  capturedFixtureEventIds?.push(event.id)
 }
 
 async function insertCurrentStartBoundary(input: Readonly<{
@@ -362,13 +610,38 @@ async function insertCurrentStartBoundary(input: Readonly<{
     [event.id, input.sessionId, input.turnId, input.rootTaskId, event.sequence, event.type, event.correlationId,
       event.idempotencyKey, JSON.stringify(event.payload), input.createdAt])
     await insertEventOutbox(client, event)
-    await appendRootTaskHistoryChronologyWitness(client, { userId: input.userId, sessionId: input.sessionId,
+    capturedFixtureEventIds?.push(event.id)
+    const witness = await appendRootTaskHistoryChronologyWitness(client, { userId: input.userId, sessionId: input.sessionId,
       turnId: input.turnId, rootTaskId: input.rootTaskId, boundary: "turn_start", boundaryEventId: event.id }, lock)
+    capturedFixtureEventIds?.push(witness.eventId)
     await client.query("COMMIT")
   } catch (error: unknown) {
     await client.query("ROLLBACK").catch(() => undefined)
     throw error
   } finally { client.release() }
+}
+
+async function insertFootprintCurrentTurn(): Promise<TurnLease> {
+  const leaseExpiresAt = new Date(Date.now() + 5 * 60_000), input = objectiveIntentInput()
+  await insertSession(footprintCurrentSessionId, userId, FIXTURE_EVENT_SEQUENCE)
+  await pool!.query(`INSERT INTO "agent_turns" ("id","sessionId","userId","status","source","input","modelProfileSnapshot",
+    "toolPolicySnapshot","budgetSnapshot","rootTaskId","leaseOwnerId","leaseExpiresAt","leaseStartedAt","leaseVersion","updatedAt")
+    VALUES ($1,$2,$3,'in_progress','user',$4::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,$5,$6,$7,CURRENT_TIMESTAMP,1,CURRENT_TIMESTAMP)`,
+  [footprintCurrentTurnId, footprintCurrentSessionId, userId, JSON.stringify(input), footprintCurrentRootTaskId, workerId, leaseExpiresAt])
+  await pool!.query(`INSERT INTO "sub_agent_tasks" ("id","sessionId","turnId","rootTaskId","parentTaskId","path","depth","role","taskType","status","goal",
+    "constraints","successCriteria","allowedActions","context","expectedOutputSchema","modelProfileSnapshot","toolPolicySnapshot","budgetSnapshot",
+    "attemptCount","maxAttempts","leaseOwner","leaseExpiresAt","completedAt","updatedAt")
+    VALUES ($1,$2,$3,$1,NULL,'/footprint-current',0,'orchestrator','root','running',$4,'[]'::jsonb,$5::jsonb,'[]'::jsonb,
+      '{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,2,3,$6,$7,NULL,CURRENT_TIMESTAMP)`,
+  [footprintCurrentRootTaskId, footprintCurrentSessionId, footprintCurrentTurnId, objective, JSON.stringify(criteria), workerId, leaseExpiresAt])
+  await pool!.query(`INSERT INTO "agent_steps" ("id","sessionId","turnId","taskId","ordinal","attempt","status","inputThroughSequence","consumedInputIds","modelProfileSnapshot")
+    VALUES ($1,$2,$3,$4,1,1,'streaming',0,'[]'::jsonb,'{}'::jsonb)`,
+  [footprintCurrentStepId, footprintCurrentSessionId, footprintCurrentTurnId, footprintCurrentRootTaskId])
+  await insertCurrentStartBoundary({ userId, sessionId: footprintCurrentSessionId, turnId: footprintCurrentTurnId,
+    rootTaskId: footprintCurrentRootTaskId, eventId: `root-history-footprint-current-start-${suffix}`,
+    goal: objective, sequence: CURRENT_START_SEQUENCE, createdAt: currentStartCreatedAt })
+  return { turnId: footprintCurrentTurnId, sessionId: footprintCurrentSessionId, userId, ownerId: workerId,
+    leaseVersion: 1, leaseStartedAt: new Date(), leaseExpiresAt }
 }
 
 async function insertScheduledCurrentTurn(input: unknown): Promise<TurnLease> {
@@ -418,11 +691,15 @@ async function insertSourceBoundaryEvents(input: Readonly<{
     for (const receipt of input.stepReceipts) await insertBoundaryEvent(client, receipt, input.startCreatedAt)
     for (const receipt of input.completedReceipts) await insertBoundaryEvent(client, receipt, input.terminalCreatedAt)
     await insertBoundaryEvent(client, terminal, input.terminalCreatedAt)
-    await appendRootTaskHistoryChronologyWitness(client, { userId: source.userId, sessionId: source.sessionId,
+    const startWitness = await appendRootTaskHistoryChronologyWitness(client, { userId: source.userId, sessionId: source.sessionId,
       turnId: source.turnId, rootTaskId: source.rootTaskId, boundary: "turn_start", boundaryEventId: start.id }, lock)
-    if (input.writeTerminalWitness) await appendRootTaskHistoryChronologyWitness(client, { userId: source.userId,
-      sessionId: source.sessionId, turnId: source.turnId, rootTaskId: source.rootTaskId,
-      boundary: "root_terminal", boundaryEventId: terminal.id }, lock)
+    capturedFixtureEventIds?.push(startWitness.eventId)
+    if (input.writeTerminalWitness) {
+      const terminalWitness = await appendRootTaskHistoryChronologyWitness(client, { userId: source.userId,
+        sessionId: source.sessionId, turnId: source.turnId, rootTaskId: source.rootTaskId,
+        boundary: "root_terminal", boundaryEventId: terminal.id }, lock)
+      capturedFixtureEventIds?.push(terminalWitness.eventId)
+    }
     await client.query("COMMIT")
   } catch (error: unknown) {
     await client.query("ROLLBACK").catch(() => undefined)
@@ -435,29 +712,38 @@ async function insertSource(source: Source): Promise<void> {
   const rootStatus = source.rootStatus ?? status
   const terminalCreatedAt = source.terminalCreatedAt ?? new Date("2026-01-01T00:00:00.000Z")
   const startCreatedAt = new Date(terminalCreatedAt.getTime() - 1)
+  const scoutEnvelope = source.searchFootprint ? { role: "scout" as const, taskType: "job_discovery",
+    expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" as const }, allowedActions: ["jobs.discover"] } : undefined
+  const scoutVerification = source.searchFootprint ? { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+    criteria: [{ id: "scout-count", check: { kind: "candidate_count_gte", minimum: 1 } }] } : undefined
   const children = [
-    { id: source.childId, key: "scout", templateId: "scout", role: "scout", taskType: "scout", status: "completed" as const,
-      failureReason: null, goal: "Find matching roles", successCriteria: ["Find one role"], result: source.scoutResult ?? null },
+    { id: source.childId, key: "scout", templateId: "scout", role: "scout", taskType: scoutEnvelope?.taskType ?? "scout", status: "completed" as const,
+      failureReason: null, goal: "Find matching roles", successCriteria: ["Find one role"], result: source.scoutResult
+        ?? (source.searchFootprint ? searchFootprintScoutResult(source.searchFootprint) : null),
+      allowedActions: scoutEnvelope?.allowedActions ?? [], expectedOutputSchema: scoutEnvelope?.expectedOutputSchema ?? {} },
     ...(source.completedChildren ?? []).map(child => ({
       id: `${source.childId}-${child.key}`, key: child.key, templateId: child.templateId, role: child.role,
       taskType: child.taskType, status: "completed" as const, failureReason: null, goal: child.goal,
-      successCriteria: child.successCriteria, result: child.result ?? null,
+      successCriteria: child.successCriteria, result: child.result ?? null, allowedActions: [], expectedOutputSchema: {},
     })),
     ...(source.failureChildren ?? []).map(failure => ({
       id: `${source.childId}-${failure.key}`, key: `failure-${failure.key}`, templateId: failure.templateId,
       role: failure.role, taskType: failure.taskType, status: "failed" as const, failureReason: failure.failureReason,
       goal: `Inspect ${failure.key} prerequisites`, successCriteria: [`Complete ${failure.key} work`],
-      result: { finalText: `PRIVATE_${failure.key.toUpperCase()}_RESULT` },
+      result: { finalText: `PRIVATE_${failure.key.toUpperCase()}_RESULT` }, allowedActions: [], expectedOutputSchema: {},
     })),
   ]
   const graph = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: children.map(child => ({
     key: child.key, templateId: child.templateId, goal: child.goal, successCriteria: child.successCriteria,
     dependsOn: [], depth: 1, taskId: child.id,
+    ...(child.key === "scout" && scoutEnvelope && scoutVerification ? { verificationDisposition: "typed",
+      verification: scoutVerification, registeredScoutEnvelope: scoutEnvelope } : {}),
   })) })
   await pool!.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
-    "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
-    VALUES ($1, $2, $3, $4, $5, $6::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $7, NULL, NULL, NULL, 1, CURRENT_TIMESTAMP)`,
-  [source.turnId, source.sessionId, source.userId, status, source.turnSource ?? "user", JSON.stringify(source.input), source.rootTaskId])
+    "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "executionMode", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $7, $8, NULL, NULL, NULL, 1, CURRENT_TIMESTAMP)`,
+  [source.turnId, source.sessionId, source.userId, status, source.turnSource ?? "user", JSON.stringify(source.input), source.rootTaskId,
+    source.turnExecutionMode ?? null])
   await pool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
     "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "completedAt", "updatedAt")
     VALUES ($1, $2, $3, $1, NULL, '/source', 0, 'orchestrator', 'root', $4, $5, '[]'::jsonb, $6::jsonb, '[]'::jsonb,
@@ -467,10 +753,11 @@ async function insertSource(source: Source): Promise<void> {
     await pool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
       "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "result", "failureReason",
       "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "completedAt", "updatedAt")
-      VALUES ($1, $2, $3, $4, $4, $5, 1, $6, $7, $8, $9, '[]'::jsonb, $10::jsonb, '[]'::jsonb,
-        '{}'::jsonb, '{}'::jsonb, $11::jsonb, $12, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      VALUES ($1, $2, $3, $4, $4, $5, 1, $6, $7, $8, $9, '[]'::jsonb, $10::jsonb, $11::jsonb,
+        '{}'::jsonb, $12::jsonb, $13::jsonb, $14, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
     [child.id, source.sessionId, source.turnId, source.rootTaskId, `/source/${child.key}`, child.role, child.taskType, child.status,
-      child.goal, JSON.stringify(child.successCriteria), child.result === null ? null : JSON.stringify(child.result), child.failureReason])
+      child.goal, JSON.stringify(child.successCriteria), JSON.stringify(child.allowedActions), JSON.stringify(child.expectedOutputSchema),
+      child.result === null ? null : JSON.stringify(child.result), child.failureReason])
   }
   await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "completedAt", "updatedAt")
     VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
@@ -540,6 +827,7 @@ async function projectSources(sources: readonly Source[]): Promise<void> {
   try {
     await client.query("BEGIN")
     for (const source of sources) {
+      await client.query("SELECT set_config($1,$2,true)", ["app.user_id", source.userId])
       const identity = { userId: source.userId, sessionId: source.sessionId, turnId: source.turnId, rootTaskId: source.rootTaskId }
       const objectiveProjected = await updateRootObjectiveHistoryProjection(client, identity)
       if (!objectiveProjected) throw new Error(`Objective-history projection failed for ${source.turnId}`)
@@ -556,20 +844,27 @@ async function projectSources(sources: readonly Source[]): Promise<void> {
   }
 }
 
-async function deleteSourceFixtures(sources: readonly Source[]): Promise<void> {
+async function deleteSourceFixtures(sources: readonly Pick<Source, "sessionId" | "turnId">[]): Promise<void> {
   if (!sources.length) return
-  const client = await pool!.connect(), turnIds = sources.map(source => source.turnId)
+  const client = await pool!.connect(), turnIdsBySession = new Map<string, string[]>()
+  for (const source of sources) {
+    const turnIds = turnIdsBySession.get(source.sessionId) ?? []
+    turnIds.push(source.turnId)
+    turnIdsBySession.set(source.sessionId, turnIds)
+  }
   try {
     await client.query("BEGIN")
-    await client.query(`DELETE FROM "agent_outbox" WHERE "aggregateId"=$1 AND "payload"->>'turnId'=ANY($2::text[])`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
-      AND "parentTaskId" IS NOT NULL`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
-      AND "parentTaskId" IS NULL`, [sessionId, turnIds])
-    await client.query(`DELETE FROM "agent_turns" WHERE "sessionId" = $1 AND "id" = ANY($2::text[])`, [sessionId, turnIds])
+    for (const [fixtureSessionId, turnIds] of turnIdsBySession) {
+      await client.query(`DELETE FROM "agent_outbox" WHERE "aggregateId"=$1 AND "payload"->>'turnId'=ANY($2::text[])`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
+        AND "parentTaskId" IS NOT NULL`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
+        AND "parentTaskId" IS NULL`, [fixtureSessionId, turnIds])
+      await client.query(`DELETE FROM "agent_turns" WHERE "sessionId" = $1 AND "id" = ANY($2::text[])`, [fixtureSessionId, turnIds])
+    }
     await client.query("COMMIT")
   } catch (error: unknown) {
     await client.query("ROLLBACK").catch(() => undefined)
@@ -620,54 +915,110 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await insertSession(foreignSessionId, otherUserId, FIXTURE_EVENT_SEQUENCE)
     await insertSession(archivedSessionId, userId, FIXTURE_EVENT_SEQUENCE)
     await pool.query(`UPDATE "agent_sessions" SET "status" = 'archived' WHERE "id" = $1`, [archivedSessionId])
-    for (const source of matching) await insertSource(source)
-    await insertSource(mismatched)
-    await insertSource(changedCriteria)
-    await insertSource(selectedJob)
-    await insertSource(otherSession)
-    await insertSource(crossEqualTimeHigherTurnId)
-    await insertSource(crossWrongSource)
-    await insertSource(crossWrongOrigin)
-    await insertSource(archivedSource)
-    await insertSource(equalCutoff)
-    await insertSource(foreignScopeCorrelation)
-    await insertSource(otherUser)
-    await insertSource(inconsistentTerminal)
-    await insertSource(streamingTerminalStep)
-    await insertSource(failedTerminalStep)
-    await insertSource(missingStepReceipt)
-    await insertSource(mismatchedStepReceipt)
-    await insertSource(duplicateStepReceipt)
-    for (const source of crossSessionWrongOriginFillers) await insertSource(source)
-    const input = { goal: objective, successCriteria: criteria }
-    await pool.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
-      "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
-      VALUES ($1, $2, $3, 'in_progress', 'user', $4::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $5, $6,
-        CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`,
-    [currentTurnId, sessionId, userId, JSON.stringify(input), currentRootTaskId, workerId])
-    await pool.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
-      "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "completedAt", "updatedAt")
-      VALUES ($1, $2, $3, $1, NULL, '/current', 0, 'orchestrator', 'root', 'running', $4, '[]'::jsonb, $5::jsonb,
-        '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 2, 3, $6, CURRENT_TIMESTAMP + INTERVAL '5 minutes', NULL, CURRENT_TIMESTAMP)`,
-    [currentRootTaskId, sessionId, currentTurnId, objective, JSON.stringify(criteria), workerId])
-    await pool.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
-      VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
-    [currentStepId, sessionId, currentTurnId, currentRootTaskId])
-    await insertCurrentStartBoundary()
-    await insertSource(future)
-    await projectSources([...matching, otherSession, crossEqualTimeHigherTurnId, crossWrongOrigin, equalCutoff, future,
-      ...crossSessionWrongOriginFillers])
+    const fixtureEventIds: string[] = []
+    capturedFixtureEventIds = fixtureEventIds
+    try {
+      for (const source of initialRootHistorySources) await insertSource(source)
+      const input = { goal: objective, successCriteria: criteria }
+      await pool.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
+        "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
+        VALUES ($1, $2, $3, 'in_progress', 'user', $4::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $5, $6,
+          CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`,
+      [currentTurnId, sessionId, userId, JSON.stringify(input), currentRootTaskId, workerId])
+      await pool.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+        "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "completedAt", "updatedAt")
+        VALUES ($1, $2, $3, $1, NULL, '/current', 0, 'orchestrator', 'root', 'running', $4, '[]'::jsonb, $5::jsonb,
+          '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 2, 3, $6, CURRENT_TIMESTAMP + INTERVAL '5 minutes', NULL, CURRENT_TIMESTAMP)`,
+      [currentRootTaskId, sessionId, currentTurnId, objective, JSON.stringify(criteria), workerId])
+      await pool.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+        VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+      [currentStepId, sessionId, currentTurnId, currentRootTaskId])
+      await insertCurrentStartBoundary()
+      await insertSource(future)
+      await projectSources([...matching, otherSession, crossEqualTimeHigherTurnId, crossWrongOrigin, equalCutoff, future,
+        ...crossSessionWrongOriginFillers, searchFootprintWrongObjective, searchFootprintForeignTenant])
+    } finally { capturedFixtureEventIds = undefined }
+    const fixtureEvents = await pool.query<{ id: string }>(
+      `SELECT "id" FROM public."agent_events" WHERE "id" = ANY($1::text[])`, [fixtureEventIds])
+    expect(fixtureEventIds.length).toBeGreaterThan(0)
+    expect(new Set(fixtureEventIds).size).toBe(fixtureEventIds.length)
+    expect(fixtureEvents.rows).toHaveLength(fixtureEventIds.length)
+    expect(new Set(fixtureEvents.rows.map(event => event.id))).toEqual(new Set(fixtureEventIds))
+    duplicateWitnessFixtureManifestJson = JSON.stringify({
+      sessions: [...new Set(duplicateWitnessFixtureScope.map(scope => scope.sessionId))],
+      turns: duplicateWitnessFixtureTurnIds,
+      rootTasks: [
+        ...new Set([currentRootTaskId, ...initialRootHistorySources.map(source => source.rootTaskId), future.rootTaskId]),
+      ],
+      events: fixtureEventIds,
+    })
   })
 
   afterAll(async () => {
     if (pool) {
       await setObjectiveHistoryIndexReady(false).catch(() => undefined)
       await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`,
-        [[sessionId, otherSessionId, scheduledSessionId, foreignSessionId, archivedSessionId]]).catch(() => undefined)
+        [[sessionId, otherSessionId, scheduledSessionId, foreignSessionId, archivedSessionId, footprintCurrentSessionId]]).catch(() => undefined)
       await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [[userId, otherUserId]]).catch(() => undefined)
       await pool.end()
     }
   })
+
+  it("projects only bounded prior same-tenant objective Scout criteria through PostgreSQL", async () => {
+    const currentFixture = { sessionId: footprintCurrentSessionId, turnId: footprintCurrentTurnId }
+    const extraSources = [searchFootprintWrongVersion, searchFootprintExtraIntent, searchFootprintWrongSource,
+      searchFootprintScalarTopIntent, searchFootprintScalarNestedIntent]
+    let targetCreated = false
+    try {
+      const historicalSources = [searchFootprintMatch, ...extraSources]
+      for (const source of historicalSources) await insertSource(source)
+      await projectSources(historicalSources)
+      const footprintLease = await insertFootprintCurrentTurn()
+      targetCreated = true
+      // Give the future fixture a real post-boundary XID; timestamps alone do not make it future.
+      await insertSource(searchFootprintFuture)
+      await projectSources([searchFootprintFuture])
+      const input: DirectRootTaskHistorySearchFootprintLoadInput = { lease: footprintLease, rootTaskId: footprintCurrentRootTaskId,
+        rootAttemptCount: 2, stepId: footprintCurrentStepId, now: new Date(), searchFootprintReadAllowed: true }
+      const consentOff = await createPgDirectRootTaskHistoryStore(pool!).loadSearchFootprints({ ...input, searchFootprintReadAllowed: false })
+      expect(consentOff).toEqual({ roles: [], locations: [], atsSources: [] })
+
+      await updateTurnInputJson(footprintCurrentTurnId, JSON.stringify({ ...objectiveIntentInput(),
+        intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, version: 2 } }))
+      const invalidTargetQueries: string[] = []
+      const invalidTargetStore = createPgDirectRootTaskHistoryStore(observeQueries(pool!, async sql => { invalidTargetQueries.push(sql) }))
+      await expect(invalidTargetStore.loadSearchFootprints(input)).resolves.toEqual({ roles: [], locations: [], atsSources: [] })
+      expect(invalidTargetQueries.some(sql => sql.includes("WITH terminal_window AS MATERIALIZED"))).toBe(false)
+      await updateTurnInputJson(footprintCurrentTurnId, JSON.stringify(objectiveIntentInput()))
+
+      const sourceQueries: string[] = []
+      const store = createPgDirectRootTaskHistoryStore(observeQueries(pool!, async sql => { sourceQueries.push(sql) }))
+      const footprint = await store.loadSearchFootprints(input)
+      expect(footprint).toEqual({ roles: ["Backend Engineer"], locations: ["Dublin"], atsSources: ["lever"] })
+      expect(JSON.stringify(footprint)).not.toMatch(/root-history-footprint|Foreign Objective Role|Foreign Tenant Role|Future Role|Wrong Version Role|Extra Intent Role|Wrong Source Role|Scalar Top Intent Role|Scalar Nested Intent Role|Berlin|Cork|Oslo|Prague|Paris|London|Rome|Madrid|pageSize|hasCursor|candidateCount|providerFailures|materializationFailures/)
+      const sourceWindow = sourceQueries.find(sql => sql.includes("WITH terminal_window AS MATERIALIZED")) ?? ""
+      expect(sourceWindow).toContain("'objective_task_graph_execution'")
+      expect(sourceWindow).toContain('turn."source" IS DISTINCT FROM \'user\'')
+      expect(sourceWindow).not.toContain("'interactive_discovery_shortlist'")
+
+      const client = await pool!.connect()
+      try {
+        await client.query("BEGIN")
+        await client.query("SELECT set_config($1,$2,true)", ["app.user_id", otherUserId])
+        await expect(store.loadSearchFootprintsWithClient(client, input)).rejects.toThrow("root_task_history_scope_mismatch")
+      } finally {
+        await client.query("ROLLBACK").catch(() => undefined)
+        client.release()
+      }
+    } finally {
+      try {
+        if (targetCreated) await updateTurnInputJson(footprintCurrentTurnId, JSON.stringify(objectiveIntentInput())).catch(() => undefined)
+        await deleteSourceFixtures([searchFootprintMatch, ...extraSources, searchFootprintFuture, currentFixture])
+      } finally {
+        await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2`, [footprintCurrentSessionId, userId])
+      }
+    }
+  }, 60_000)
 
   it("returns same-user/session Roots with the exact canonical objective and a distinct source Root ID", async () => {
     const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
@@ -851,135 +1202,226 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
   it("keeps full cross-session witness multiplicity across keyset pages without weakening table constraints", async () => {
     const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
       rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true }
-    type KeysetPhase =
-      | "pool_checkout_started" | "pool_checkout_acquired"
-      | "transaction_begin_started" | "transaction_begin_completed"
-      | "statement_timeout_started" | "statement_timeout_set"
-      | "tenant_config_started" | "tenant_config_completed"
-      | "fence_read_started" | "fence_read_completed"
-      | "base_witness_read_started" | "base_witness_read_completed"
-      | "first_page_query_started" | "first_page_query_completed"
-      | "second_page_query_started" | "second_page_query_completed"
-      | "empty_page_query_started" | "empty_page_query_completed"
-      | "persisted_count_read_started" | "persisted_count_read_completed"
-      | "rollback_started" | "rollback_succeeded" | "rollback_failed"
-      | "client_release_started" | "client_released"
-      | "post_transaction_history_load_started" | "post_transaction_history_load_completed"
-    const phase = (value: KeysetPhase) => console.info(`[root-history-keyset-pg-phase] ${value}`)
-    phase("pool_checkout_started")
-    const client = await pool!.connect()
-    phase("pool_checkout_acquired")
+    expect(duplicateWitnessFixtureScope).toEqual([
+      { sessionId, turnId: currentTurnId },
+      ...initialRootHistorySources.map(source => ({ sessionId: source.sessionId, turnId: source.turnId })),
+      { sessionId: future.sessionId, turnId: future.turnId },
+    ])
+    expect(duplicateWitnessFixtureScope).toHaveLength(initialRootHistorySources.length + 2)
+    expect([...new Set(duplicateWitnessFixtureScope.map(scope => scope.sessionId))].sort()).toEqual(
+      [archivedSessionId, foreignSessionId, otherSessionId, sessionId].sort())
+    expect(duplicateWitnessFixtureScope).toEqual(expect.arrayContaining([
+      { sessionId: otherSessionId, turnId: equalCutoff.turnId },
+      { sessionId: otherSessionId, turnId: otherSession.turnId },
+      { sessionId: otherSessionId, turnId: crossEqualTimeHigherTurnId.turnId },
+      { sessionId: otherSessionId, turnId: crossWrongOrigin.turnId },
+      { sessionId: otherSessionId, turnId: crossWrongSource.turnId },
+      { sessionId: archivedSessionId, turnId: archivedSource.turnId },
+      { sessionId: foreignSessionId, turnId: otherUser.turnId },
+      { sessionId, turnId: foreignScopeCorrelation.turnId },
+      ...crossSessionWrongOriginFillers.map(source => ({ sessionId: source.sessionId, turnId: source.turnId })),
+    ]))
+    expect(duplicateWitnessFixtureScope).not.toContainEqual({ sessionId: scheduledSessionId, turnId: scheduledCurrentTurnId })
+
+    let diagnosticPool: PgPool | undefined
+    let activeClientCancel: (() => void) | undefined
     let baseWitnessId: string | undefined
-    try {
-      phase("transaction_begin_started")
-      await client.query("BEGIN")
-      phase("transaction_begin_completed")
-      await client.query("SET LOCAL max_parallel_workers_per_gather = 0")
-      phase("statement_timeout_started")
-      await client.query("SET LOCAL statement_timeout = '10s'")
-      phase("statement_timeout_set")
-      phase("tenant_config_started")
-      await client.query("SELECT set_config($1,$2,true)", ["app.user_id", userId])
-      phase("tenant_config_completed")
-      phase("fence_read_started")
-      const fence = await readRootTaskHistoryFence(client, input)
-      phase("fence_read_completed")
-      expect(fence?.currentStartWitness?.xid8).toBeTruthy()
-      expect(fence?.currentOrigin).toBeTruthy()
-      if (!fence?.currentStartWitness || !fence.currentOrigin) throw new Error("Cross-session fence is unavailable")
-      phase("base_witness_read_started")
-      const witness = await client.query<{ id: string }>(`SELECT "id" FROM "agent_events"
-        WHERE "sessionId" = $1 AND "turnId" = $2 AND "causationId" = $3
-          AND "type" = 'agent.plan.root_task_history_chronology_witness'`,
-      [otherSessionId, equalCutoff.turnId, terminalEventKey(equalCutoff)])
-      phase("base_witness_read_completed")
-      expect(witness.rows).toHaveLength(1)
-      baseWitnessId = witness.rows[0]?.id
-      expect(baseWitnessId).toBeTruthy()
-      if (!baseWitnessId) throw new Error("Cross-session terminal witness is unavailable")
-
-      const window: RootTaskHistoryCrossSessionWindowInput = {
-        currentSessionId: input.lease.sessionId, userId: input.lease.userId, currentTurnId: input.lease.turnId,
-        currentStartXid8: fence.currentStartWitness.xid8,
-        scheduledCriteria: fence.scheduledAutomationCriteria ? JSON.stringify(fence.scheduledAutomationCriteria) : null,
-        objectiveDigest: fence.objectiveDigest, semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION,
-        canonicalOrigin: fence.currentOrigin, limit: 1,
-      }
-      const pagePhases = {
-        first: ["first_page_query_started", "first_page_query_completed"],
-        second: ["second_page_query_started", "second_page_query_completed"],
-        empty: ["empty_page_query_started", "empty_page_query_completed"],
-      } as const satisfies Record<"first" | "second" | "empty", readonly [KeysetPhase, KeysetPhase]>
-      const readPage = async (
-        kind: keyof typeof pagePhases,
-        afterCursor?: RootTaskHistoryCrossSessionWindowInput["afterCursor"],
-      ) => {
-        phase(pagePhases[kind][0])
-        const query = buildRootTaskHistoryCrossSessionWindow({ ...window, ...(afterCursor ? { afterCursor } : {}) })
-        const result = await client.query<Record<string, unknown>>(
-          queryLevelDuplicateWitnessSql(query.sql, query.values.length + 1), [...query.values, baseWitnessId])
-        phase(pagePhases[kind][1])
-        const pageRows = result.rows.filter(row => row.isPageWatermark !== true)
-        const watermarks = result.rows.filter(row => row.isPageWatermark === true)
-        expect(watermarks).toHaveLength(1)
-        return { pageRows, watermark: watermarks[0] }
-      }
-
-      const first = await readPage("first")
-      expect(first.pageRows).toHaveLength(1)
-      expect(first.pageRows[0]?.terminalEventId).toBe(terminalEventKey(equalCutoff))
-      expect(Number(first.pageRows[0]?.terminalWitnessCount)).toBe(2)
-      expect(first.pageRows[0]?.terminalWitnessEventId).toBe(`${baseWitnessId}:query-duplicate`)
-      expect(first.watermark?.pageRawRowCount).toBe(1)
-      expect(first.watermark?.pageCursorXid8).toBe(first.pageRows[0]?.terminalWitnessXid8)
-      expect(first.watermark?.pageCursorTurnId).toBe(first.pageRows[0]?.turnId)
-      expect(first.watermark?.pageCursorTerminalEventId).toBe(first.pageRows[0]?.terminalEventId)
-      expect(first.watermark?.pageCursorWitnessEventId).toBe(first.pageRows[0]?.terminalWitnessEventId)
-      const cursor = {
-        xid8: String(first.watermark?.pageCursorXid8), turnId: String(first.watermark?.pageCursorTurnId),
-        terminalEventId: String(first.watermark?.pageCursorTerminalEventId),
-        witnessEventId: String(first.watermark?.pageCursorWitnessEventId),
-      }
-      const second = await readPage("second", cursor)
-      expect(second.pageRows).toHaveLength(1)
-      expect(second.pageRows[0]?.terminalEventId).toBe(terminalEventKey(equalCutoff))
-      expect(second.pageRows[0]?.terminalWitnessEventId).toBe(baseWitnessId)
-      expect(Number(second.pageRows[0]?.terminalWitnessCount)).toBe(2)
-      expect(second.watermark?.pageRawRowCount).toBe(1)
-
-      const empty = await readPage("empty", { xid8: "1", turnId: "", terminalEventId: "", witnessEventId: "" })
-      expect(empty.pageRows).toHaveLength(0)
-      expect(empty.watermark?.pageRawRowCount).toBe(0)
-      expect(empty.watermark?.pageCursorXid8).toBeNull()
-      expect(empty.watermark?.pageCursorTurnId).toBeNull()
-      expect(empty.watermark?.pageCursorTerminalEventId).toBeNull()
-      expect(empty.watermark?.pageCursorWitnessEventId).toBeNull()
-      phase("persisted_count_read_started")
-      const persistedWitnesses = await client.query<{ count: string }>(`SELECT COUNT(*)::text AS "count" FROM "agent_events"
-        WHERE "sessionId" = $1 AND "turnId" = $2 AND "causationId" = $3
-          AND "type" = 'agent.plan.root_task_history_chronology_witness'`,
-      [otherSessionId, equalCutoff.turnId, terminalEventKey(equalCutoff)])
-      phase("persisted_count_read_completed")
-      expect(persistedWitnesses.rows[0]?.count).toBe("1")
-    } finally {
-      phase("rollback_started")
+    let activeStage: RootHistoryDiagnosticStage = "manual_pool_connect"
+    let failureStage: RootHistoryDiagnosticStage | undefined
+    let failureKind: RootHistoryDiagnosticFailure | undefined
+    const timeoutDiagnostic = setTimeout(() => {
+      writeRootHistoryDiagnostic("near_timeout", activeStage)
+      activeClientCancel?.()
+    }, 50_000)
+    const runStage = async <T>(stage: RootHistoryDiagnosticStage, run: () => Promise<T>): Promise<T> => {
+      activeStage = stage
+      writeRootHistoryDiagnostic("start", stage)
       try {
-        await client.query("ROLLBACK")
-        phase("rollback_succeeded")
-      } catch {
-        phase("rollback_failed")
+        const result = await run()
+        writeRootHistoryDiagnostic("pass", stage)
+        return result
+      } catch (error: unknown) {
+        failureStage ??= activeStage
+        failureKind ??= rootHistoryDiagnosticFailure(error)
+        throw error
       }
-      phase("client_release_started")
-      client.release()
-      phase("client_released")
     }
+    try {
+      diagnosticPool = new PgPool({ connectionString: databaseUrl!, max: 1, connectionTimeoutMillis: 5_000,
+        query_timeout: 10_000, statement_timeout: 10_000, options: "-c lock_timeout=2000ms", allowExitOnIdle: true })
+      const manualClient = await runStage("manual_pool_connect", () => diagnosticPool!.connect())
+      let manualClientReleased = false
+      let manualQueryFailed = false
+      const releaseManualClient = (error?: Error) => {
+        if (manualClientReleased) return
+        manualClientReleased = true
+        if (activeClientCancel === forceReleaseManualClient) activeClientCancel = undefined
+        manualClient.release(error ?? (manualQueryFailed ? ROOT_HISTORY_DIAGNOSTIC_ABORT : undefined))
+      }
+      const forceReleaseManualClient = () => releaseManualClient(ROOT_HISTORY_DIAGNOSTIC_ABORT)
+      activeClientCancel = forceReleaseManualClient
+      const runManualStage = async <T>(stage: RootHistoryDiagnosticStage, run: () => Promise<T>): Promise<T> => {
+        try {
+          return await runStage(stage, run)
+        } catch (error: unknown) {
+          manualQueryFailed = true
+          throw error
+        }
+      }
+      let manualBodyFailed = false
+      let manualRollbackFailed = false
+      try {
+        await runManualStage("manual_begin", () => manualClient.query("BEGIN"))
+        await runManualStage("manual_limits", async () => {
+          await manualClient.query("SET LOCAL lock_timeout = '2000ms'")
+          await manualClient.query("SET LOCAL statement_timeout = '10s'")
+          await manualClient.query("SET LOCAL max_parallel_workers_per_gather = 0")
+        })
+        await runManualStage("manual_user_scope", () => manualClient.query("SELECT set_config($1,$2,true)", ["app.user_id", userId]))
+        const fence = await runManualStage("manual_fence", () => readRootTaskHistoryFence(manualClient, input))
+        expect(fence?.currentStartWitness?.xid8).toBeTruthy()
+        expect(fence?.currentOrigin).toBeTruthy()
+        if (!fence?.currentStartWitness || !fence.currentOrigin) throw new Error("Cross-session fence is unavailable")
+        const witness = await runManualStage("manual_witness_lookup", () => manualClient.query<{ id: string }>(`SELECT "id" FROM "agent_events"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "causationId" = $3
+            AND "type" = 'agent.plan.root_task_history_chronology_witness'`,
+        [otherSessionId, equalCutoff.turnId, terminalEventKey(equalCutoff)]))
+        expect(witness.rows).toHaveLength(1)
+        baseWitnessId = witness.rows[0]?.id
+        expect(baseWitnessId).toBeTruthy()
+        if (!baseWitnessId) throw new Error("Cross-session terminal witness is unavailable")
 
-    phase("post_transaction_history_load_started")
-    const historyWithShadowWitness = await createPgDirectRootTaskHistoryStore(
-      queryLevelDuplicateWitnessPool(pool!, baseWitnessId!)).load(input)
-    phase("post_transaction_history_load_completed")
-    expect(historyWithShadowWitness.some(item => item.sourceTurnId === equalCutoff.turnId)).toBe(false)
-    expect(historyWithShadowWitness.map(item => item.sourceTurnId)).toContain(otherSession.turnId)
+        const window: RootTaskHistoryCrossSessionWindowInput = {
+          currentSessionId: input.lease.sessionId, userId: input.lease.userId, currentTurnId: input.lease.turnId,
+          currentStartXid8: fence.currentStartWitness.xid8,
+          scheduledCriteria: fence.scheduledAutomationCriteria ? JSON.stringify(fence.scheduledAutomationCriteria) : null,
+          objectiveDigest: fence.objectiveDigest, semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION,
+          canonicalOrigin: fence.currentOrigin, limit: 1,
+        }
+        const readPage = async (
+          stage: RootHistoryDiagnosticStage,
+          afterCursor?: RootTaskHistoryCrossSessionWindowInput["afterCursor"],
+        ) => runManualStage(stage, async () => {
+          const query = buildRootTaskHistoryCrossSessionWindow({ ...window, ...(afterCursor ? { afterCursor } : {}) })
+          const querySql = queryLevelDuplicateWitnessSql(query.sql, query.values.length + 1, query.values.length + 2)
+          const queryValues = [...query.values, baseWitnessId, duplicateWitnessFixtureManifest()]
+          if (stage === "manual_page_first") {
+            const explain = await manualClient.query<{ "QUERY PLAN": unknown }>(
+              `EXPLAIN (FORMAT JSON, COSTS TRUE) ${querySql}`, queryValues)
+            console.info(`[root-history-keyset-pg-explain] ${JSON.stringify(safeExplainNodes(explain.rows[0]?.["QUERY PLAN"]))}`)
+          }
+          const result = await manualClient.query<Record<string, unknown>>(
+            querySql, queryValues)
+          const pageRows = result.rows.filter(row => row.isPageWatermark !== true)
+          const watermarks = result.rows.filter(row => row.isPageWatermark === true)
+          expect(watermarks).toHaveLength(1)
+          return { pageRows, watermark: watermarks[0] }
+        })
+
+        const first = await readPage("manual_page_first")
+        expect(first.pageRows).toHaveLength(1)
+        expect(first.pageRows[0]?.terminalEventId).toBe(terminalEventKey(equalCutoff))
+        expect(Number(first.pageRows[0]?.terminalWitnessCount)).toBe(2)
+        expect(first.pageRows[0]?.terminalWitnessEventId).toBe(`${baseWitnessId}:query-duplicate`)
+        expect(first.watermark?.pageRawRowCount).toBe(1)
+        expect(first.watermark?.pageCursorXid8).toBe(first.pageRows[0]?.terminalWitnessXid8)
+        expect(first.watermark?.pageCursorTurnId).toBe(first.pageRows[0]?.turnId)
+        expect(first.watermark?.pageCursorTerminalEventId).toBe(first.pageRows[0]?.terminalEventId)
+        expect(first.watermark?.pageCursorWitnessEventId).toBe(first.pageRows[0]?.terminalWitnessEventId)
+        const cursor = {
+          xid8: String(first.watermark?.pageCursorXid8), turnId: String(first.watermark?.pageCursorTurnId),
+          terminalEventId: String(first.watermark?.pageCursorTerminalEventId),
+          witnessEventId: String(first.watermark?.pageCursorWitnessEventId),
+        }
+        const second = await readPage("manual_page_second", cursor)
+        expect(second.pageRows).toHaveLength(1)
+        expect(second.pageRows[0]?.terminalEventId).toBe(terminalEventKey(equalCutoff))
+        expect(second.pageRows[0]?.terminalWitnessEventId).toBe(baseWitnessId)
+        expect(Number(second.pageRows[0]?.terminalWitnessCount)).toBe(2)
+        expect(second.watermark?.pageRawRowCount).toBe(1)
+
+        const empty = await readPage("manual_page_empty", { xid8: "1", turnId: "", terminalEventId: "", witnessEventId: "" })
+        expect(empty.pageRows).toHaveLength(0)
+        expect(empty.watermark?.pageRawRowCount).toBe(0)
+        expect(empty.watermark?.pageCursorXid8).toBeNull()
+        expect(empty.watermark?.pageCursorTurnId).toBeNull()
+        expect(empty.watermark?.pageCursorTerminalEventId).toBeNull()
+        expect(empty.watermark?.pageCursorWitnessEventId).toBeNull()
+        const persistedWitnesses = await runManualStage("manual_witness_count", () => manualClient.query<{ count: string }>(`SELECT COUNT(*)::text AS "count" FROM "agent_events"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "causationId" = $3
+            AND "type" = 'agent.plan.root_task_history_chronology_witness'`,
+        [otherSessionId, equalCutoff.turnId, terminalEventKey(equalCutoff)]))
+        expect(persistedWitnesses.rows[0]?.count).toBe("1")
+      } catch (error: unknown) {
+        manualBodyFailed = true
+        failureStage ??= activeStage
+        failureKind ??= rootHistoryDiagnosticFailure(error)
+        throw error
+      } finally {
+        if (!manualClientReleased) {
+          activeStage = "manual_rollback"
+          writeRootHistoryDiagnostic("start", "manual_rollback")
+          try {
+            await manualClient.query("ROLLBACK")
+            writeRootHistoryDiagnostic("pass", "manual_rollback")
+          } catch (error: unknown) {
+            manualQueryFailed = true
+            manualRollbackFailed = true
+            writeRootHistoryDiagnostic("failure", "manual_rollback", rootHistoryDiagnosticFailure(error))
+            if (!manualBodyFailed) {
+              failureStage ??= "manual_rollback"
+              failureKind ??= rootHistoryDiagnosticFailure(error)
+            }
+          }
+          activeStage = "manual_release"
+          writeRootHistoryDiagnostic("start", activeStage)
+          releaseManualClient()
+          writeRootHistoryDiagnostic("pass", activeStage)
+        }
+      }
+      if (manualRollbackFailed && !manualBodyFailed) throw new Error("root_history_manual_rollback_failed")
+
+      let wrappedStage: RootHistoryDiagnosticStage | undefined
+      const historyWithShadowWitness = await runStage("wrapped_store_load", async () => {
+        const store = createPgDirectRootTaskHistoryStore(queryLevelDuplicateWitnessPool(diagnosticPool!, baseWitnessId!, duplicateWitnessFixtureManifest(), stage => {
+          if (wrappedStage) writeRootHistoryDiagnostic("pass", wrappedStage)
+          wrappedStage = stage
+          activeStage = stage
+          writeRootHistoryDiagnostic("start", stage)
+        }, cancel => { activeClientCancel = cancel }))
+        const result = await store.load(input)
+        if (wrappedStage) writeRootHistoryDiagnostic("pass", wrappedStage)
+        return result
+      })
+      expect(historyWithShadowWitness.some(item => item.sourceTurnId === equalCutoff.turnId)).toBe(false)
+      expect(historyWithShadowWitness.map(item => item.sourceTurnId)).toContain(otherSession.turnId)
+    } catch (error: unknown) {
+      failureStage ??= activeStage
+      failureKind ??= rootHistoryDiagnosticFailure(error)
+      writeRootHistoryDiagnostic("failure", failureStage ?? activeStage, failureKind ?? rootHistoryDiagnosticFailure(error))
+      throw error
+    } finally {
+      clearTimeout(timeoutDiagnostic)
+      activeClientCancel?.()
+      if (diagnosticPool) {
+        activeStage = "diagnostic_pool_close"
+        writeRootHistoryDiagnostic("start", activeStage)
+        let closeTimer: ReturnType<typeof setTimeout> | undefined
+        const closeResult = await Promise.race([
+          diagnosticPool.end().then(() => "closed" as const, () => "failed" as const),
+          new Promise<"timeout">(resolve => { closeTimer = setTimeout(() => resolve("timeout"), 5_000) }),
+        ])
+        if (closeTimer) clearTimeout(closeTimer)
+        if (closeResult === "closed") writeRootHistoryDiagnostic("pass", activeStage)
+        else {
+          const failure = closeResult === "timeout" ? "pool_close_timeout" : "other"
+          failureStage ??= "diagnostic_pool_close"
+          failureKind ??= failure
+          writeRootHistoryDiagnostic("failure", "diagnostic_pool_close", failure)
+          if (failureStage === "diagnostic_pool_close") throw new Error("root_history_diagnostic_pool_close_failed")
+        }
+      }
+    }
   }, 60_000)
 
   it("reloads owner-scoped history and merges only witnessed terminal-before-start outcomes by xid8", async () => {

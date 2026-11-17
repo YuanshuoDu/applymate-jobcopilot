@@ -5,15 +5,17 @@ import type { TurnBudgetLimits, TurnUsage } from "../budget.js"
 import type { BusinessCheck } from "../verifier.js"
 import type { ExecutionOwnerFence, TaskExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "./lease.js"
-import type { TaskGraphDenialProgress, TurnEngineCompletionGate, TurnExecutionOptions, TurnExecutionStepBudget } from "./turn-execution-types.js"
+import type { TaskGraphDenialProgress, TurnEngineCompletionGate, TurnExecutionOptions } from "./turn-execution-types.js"
 import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
-import type { ToolCallRecovery, TurnEngineToolResult } from "./turn-engine-tool-types.js"
+import type { ToolCallRecovery } from "./turn-engine-tool-types.js"
 import type { TurnQuestionStore } from "./turn-question-contract.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 import type { TurnEngineQueryClient } from "./turn-engine-owner-sql.js"
 import type { CognitiveAgendaReceipt } from "./cognitive-agenda-receipt.js"
+import type { TurnEngineToolExecutor } from "./turn-engine-tool-executor.js"
+export type { TurnEngineToolExecutor } from "./turn-engine-tool-executor.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "question" | "error"
 export type TurnEngineItemPhase = "commentary" | "final_answer" | null
@@ -138,22 +140,6 @@ export type TurnEngineStore = {
     noProgress?: AtomicTurnNoProgressInput
   }): Promise<void | AtomicTurnCompletionResult | AtomicTurnNoProgressResult>
 } & import("./native-semantic-rejection-ledger.js").NativeSemanticProgressStore & Partial<TurnQuestionStore>
-
-export type TurnEngineToolExecutor = (input: {
-  scope: TenantScope
-  sessionId: string
-  turnId: string
-  stepId: string
-  /** Runtime-owned current task; never accepted from model tool arguments. */
-  taskId?: string
-  /** Runtime-owned root task; never accepted from model tool arguments. */
-  rootTaskId?: string
-  /** Runtime-owned actor role used by the policy engine. */
-  actorRole?: PolicyRole
-  signal: AbortSignal
-  capabilities?: readonly string[]
-  call: { id: string; toolName: string; toolVersion: string; input: unknown }
-} & TurnExecutionStepBudget) => Promise<TurnEngineToolResult>
 
 export type TurnEngineEventSubscriber = (event: TurnEngineEvent) => void | Promise<void>
 

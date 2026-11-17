@@ -4,8 +4,9 @@ import { type RootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./roo
 import { parseRootTaskHistoryChronologyXid8, readRootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.js"
 import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION } from "./objective-history-projection.js"
 import { scheduledAutomationHistoryCompatibilitySql } from "../subagents/scheduled-automation-snapshot.js"
-import { buildRootTaskHistoryCrossSessionWindow, type RootTaskHistoryCrossSessionCursor } from "./root-task-history-source-window.js"
-import { parseRootTaskHistoryPage, scanRootTaskHistoryPages, validateRootTaskHistoryCandidate,
+import { buildRootTaskHistoryCrossSessionWindow, buildRootTaskHistoryFootprintCrossSessionWindow,
+  type RootTaskHistoryCrossSessionCursor } from "./root-task-history-source-window.js"
+import { parseRootTaskHistoryPage, scanRootTaskHistoryPages, validateRootTaskHistoryCandidate, validateRootTaskHistoryFootprintCandidate,
   buildRootTaskHistorySameSessionPageWindow,
   type RootTaskHistoryCandidate, type RootTaskHistoryPage, type RootTaskHistorySourceCursor } from "./root-task-history-source-page.js"
 
@@ -25,18 +26,21 @@ async function objectiveHistoryIndexReady(client: Client): Promise<boolean> {
 }
 
 async function readCandidateWindowPage(client: Client, input: RootTaskHistoryFenceInput, fence: RootTaskHistoryFence,
-  indexed: boolean, cursor: RootTaskHistorySourceCursor | undefined, limit: number): Promise<RootTaskHistoryPage> {
+  indexed: boolean, cursor: RootTaskHistorySourceCursor | undefined, limit: number, footprint = false): Promise<RootTaskHistoryPage> {
   const crossSession = input.crossSessionRootTaskHistoryEnabled === true
   const compatibilityParameter = indexed ? "$7" : "$5"
   const compatibility = scheduledAutomationHistoryCompatibilitySql(compatibilityParameter)
   const crossCursor = crossSession ? cursor as RootTaskHistoryCrossSessionCursor | undefined : undefined
-  const crossWindow = crossSession ? buildRootTaskHistoryCrossSessionWindow({
-    currentSessionId: input.lease.sessionId, userId: input.lease.userId, currentTurnId: input.lease.turnId,
-    currentStartXid8: fence.currentStartWitness!.xid8,
-    scheduledCriteria: fence.scheduledAutomationCriteria ? JSON.stringify(fence.scheduledAutomationCriteria) : null,
-    objectiveDigest: fence.objectiveDigest, semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION,
-    canonicalOrigin: fence.currentOrigin!, limit, ...(crossCursor ? { afterCursor: crossCursor } : {}),
-  }) : undefined
+  const startWitness = footprint ? fence.searchFootprintStartWitness : fence.currentStartWitness
+  const canonicalOrigin = footprint ? fence.searchFootprintOrigin : fence.currentOrigin
+  const crossWindow = crossSession && startWitness && canonicalOrigin
+    ? (footprint ? buildRootTaskHistoryFootprintCrossSessionWindow : buildRootTaskHistoryCrossSessionWindow)({
+      currentSessionId: input.lease.sessionId, userId: input.lease.userId, currentTurnId: input.lease.turnId,
+      currentStartXid8: startWitness.xid8,
+      scheduledCriteria: fence.scheduledAutomationCriteria ? JSON.stringify(fence.scheduledAutomationCriteria) : null,
+      objectiveDigest: fence.objectiveDigest, semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION,
+      canonicalOrigin, limit, ...(crossCursor ? { afterCursor: crossCursor } : {}),
+    }) : undefined
   const legacyWindow = `SELECT event."id" AS "terminalEventId", event."sessionId", event."turnId", event."taskId", event."sequence",
       NULL::timestamptz AS "createdAt",
       NULL::text AS "terminalWitnessEventId", NULL::text AS "terminalWitnessXid8", 0::bigint AS "terminalWitnessCount"
@@ -170,16 +174,17 @@ async function readCandidateWindowPage(client: Client, input: RootTaskHistoryFen
 }
 
 async function readCandidateWindow(client: Client, input: RootTaskHistoryFenceInput,
-  fence: RootTaskHistoryFence): Promise<RootTaskHistoryCandidate[]> {
+  fence: RootTaskHistoryFence, footprint = false): Promise<RootTaskHistoryCandidate[]> {
   const crossSession = input.crossSessionRootTaskHistoryEnabled === true
   const canUseIndex = !crossSession && input.objectiveHistoryIndexEnabled === true
     && !!fence.objectiveHistoryIndexObjectiveDigest
   const indexed = canUseIndex && await objectiveHistoryIndexReady(client)
   return scanRootTaskHistoryPages({
     crossSession,
-    readPage: (cursor, limit) => readCandidateWindowPage(client, input, fence, indexed, cursor, limit),
+    readPage: (cursor, limit) => readCandidateWindowPage(client, input, fence, indexed, cursor, limit, footprint),
     validate: async row => {
-      const value = validateRootTaskHistoryCandidate(row, input, fence, indexed)
+      const value = footprint ? validateRootTaskHistoryFootprintCandidate(row, input, fence)
+        : validateRootTaskHistoryCandidate(row, input, fence, indexed)
       if (!value || !crossSession) return value
       const witness = await readRootTaskHistoryChronologyWitness(client, { boundaryEventId: value.terminalEventId,
         boundary: "root_terminal", userId: input.lease.userId, sessionId: value.sessionId,
@@ -218,4 +223,11 @@ export async function readRootTaskHistoryCandidates(client: Client, input: RootT
     if (eventOrder !== 0) return eventOrder
     return Buffer.compare(Buffer.from(right.terminalWitnessEventId ?? "", "utf8"), Buffer.from(left.terminalWitnessEventId ?? "", "utf8"))
   })
+}
+
+/** Reads only prior cross-Session candidates through the independently fenced footprint origin. */
+export async function readRootTaskHistoryFootprintCandidates(client: Client, input: RootTaskHistoryFenceInput,
+  fence: RootTaskHistoryFence): Promise<RootTaskHistoryCandidate[]> {
+  if (input.crossSessionRootTaskHistoryEnabled !== true || !fence.searchFootprintOrigin || !fence.searchFootprintStartWitness) return []
+  return readCandidateWindow(client, input, fence, true)
 }

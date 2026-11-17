@@ -9,6 +9,7 @@ describe("AgentForkService Turn projection", () => {
     const completedAt = new Date("2026-10-01T00:00:00.000Z")
     const source = {
       id: "source-session", userId: "owner", goal: "Goal", source: "user", memorySummary: null,
+      searchFootprintMemoryEnabledAtCreation: false, searchFootprintMemoryConsentVersionAtCreation: 1,
       turns: [{ id: "turn-1", source: "user", status: "completed", input: { goal: "Goal" }, finalResponse: "Done",
         error: null, modelProfileSnapshot: {}, inputTokens: 1, outputTokens: 2, estimatedCostUsd: 0,
         durationMs: 10, startedAt: completedAt, completedAt, createdAt: completedAt }],
@@ -17,6 +18,7 @@ describe("AgentForkService Turn projection", () => {
     const findFirst = vi.fn(async (args: { where: { id: string } }) => args.where.id === source.id ? source : null)
     const tx = {
       $queryRaw: vi.fn(async () => [{ id: source.id }]),
+      user: { findUnique: vi.fn(async () => ({ agentSearchFootprintMemoryEnabled: true, agentSearchFootprintMemoryConsentVersion: 8 })) },
       agentSession: { findFirst, create: vi.fn(async () => ({})), update: vi.fn(async () => ({})) },
       agentEvent: { findFirst: vi.fn(async () => null), create: vi.fn(async () => ({})) },
       agentTurn: { createMany: vi.fn(async () => ({ count: 1 })) },
@@ -29,12 +31,15 @@ describe("AgentForkService Turn projection", () => {
     })
 
     expect(result.disposition).toBe("forked")
+    expect(tx.agentSession.create).toHaveBeenCalledWith({ data: expect.objectContaining({
+      searchFootprintMemoryEnabledAtCreation: true, searchFootprintMemoryConsentVersionAtCreation: 8,
+    }) })
     const sourceRead = findFirst.mock.calls[1]?.[0] as unknown as { select: { turns: { select: unknown } } }
     expect(sourceRead.select.turns.select).toEqual(agentForkTurnSelect)
     expect(Object.keys(agentForkTurnSelect)).not.toContain("nativeSemanticProgressMode")
   })
 
-  it("excludes private memory events and root-task-history observations while keeping visible history", async () => {
+  it("excludes private memory events and root-history observations while keeping visible history", async () => {
     const at = new Date("2026-10-01T00:00:00.000Z")
     const source = {
       id: "source-session", userId: "owner", goal: "Goal", source: "user", memorySummary: null,
@@ -60,14 +65,20 @@ describe("AgentForkService Turn projection", () => {
           type: "agent.plan.root_task_history_memory_snapshot", actor: "worker", correlationId: "turn-1", causationId: null,
           idempotencyKey: "root-task-history-snapshot:source-session:v1",
           payload: { id: "root-task-history", value: "PRIVATE_ROOT_TASK_HISTORY_EVENT" } },
-        { id: "turn-start-event", sessionId: "source-session", turnId: "turn-1", itemId: null, taskId: "root-1", sequence: BigInt(5),
+        { id: "search-footprint-snapshot-event", sessionId: "source-session", turnId: "turn-1", itemId: null, taskId: "root-1", sequence: BigInt(5),
+          type: "agent.plan.root_task_history_search_footprint_snapshot", actor: "worker", correlationId: "turn-1", causationId: null,
+          idempotencyKey: "root-task-history-search-footprint-snapshot:source-session:v1",
+          payload: { schemaVersion: "agent-harness.v2.root-task-history-search-footprint-snapshot.v1", searchFootprints: {
+            roles: ["PRIVATE_SEARCH_FOOTPRINT_EVENT_ROLE"], locations: ["PRIVATE_SEARCH_FOOTPRINT_EVENT_LOCATION"], atsSources: ["PRIVATE_SEARCH_FOOTPRINT_EVENT_SOURCE"],
+          } } },
+        { id: "turn-start-event", sessionId: "source-session", turnId: "turn-1", itemId: null, taskId: "root-1", sequence: BigInt(6),
           type: "turn.started", actor: "orchestrator", correlationId: "turn-1", causationId: null,
           idempotencyKey: "turn:turn-1:event:turn-started", payload: { taskId: "root-1", rootTaskId: "root-1" } },
-        { id: "history-chronology-event", sessionId: "source-session", turnId: "turn-1", itemId: null, taskId: "root-1", sequence: BigInt(6),
+        { id: "history-chronology-event", sessionId: "source-session", turnId: "turn-1", itemId: null, taskId: "root-1", sequence: BigInt(7),
           type: "agent.plan.root_task_history_chronology_witness", actor: "orchestrator", correlationId: "root-1", causationId: "turn-start-event",
           idempotencyKey: "root-task-history-chronology-witness:turn_start:turn-start-event:v1",
           payload: { schemaVersion: "agent-harness.v2.root-task-history-chronology-witness.v1", boundary: "turn_start", boundaryEventId: "turn-start-event", xid8: "90000000000000001" } },
-        { id: "visible-event", sessionId: "source-session", turnId: "turn-1", itemId: "visible-item", taskId: null, sequence: BigInt(7),
+        { id: "visible-event", sessionId: "source-session", turnId: "turn-1", itemId: "visible-item", taskId: null, sequence: BigInt(8),
           type: "item.completed", actor: "worker", correlationId: "turn-1", causationId: null,
           idempotencyKey: "visible-item:completed", payload: { status: "completed" } },
       ],
@@ -75,6 +86,12 @@ describe("AgentForkService Turn projection", () => {
         id: "history-context-snapshot", throughSequence: BigInt(5), schemaVersion: "agent-harness.context.v1",
         content: { context: { toolObservations: [
           { id: "root-task-history", content: { kind: "root_task_history", value: "PRIVATE_ROOT_TASK_HISTORY_SNAPSHOT" } },
+          { id: "root-task-history-search-footprint", content: {
+            kind: "root_task_history_search_footprint", historical: true, informationalOnly: true,
+            advisoryOnly: true, notCurrentEvidence: true,
+            roles: ["PRIVATE_SEARCH_FOOTPRINT_SNAPSHOT_ROLE"], locations: ["PRIVATE_SEARCH_FOOTPRINT_SNAPSHOT_LOCATION"],
+            atsSources: ["PRIVATE_SEARCH_FOOTPRINT_SNAPSHOT_SOURCE"],
+          } },
           { id: "same-session-observation", content: { value: "Visible same-session observation" } },
         ] } },
         summary: "Visible fork summary", inputTokens: 4, outputTokens: 2, estimatedCostUsd: 0, tokenAccounting: {},
@@ -108,6 +125,10 @@ describe("AgentForkService Turn projection", () => {
     expect(serialized).not.toContain("PRIVATE_OVERFLOW_VALUE")
     expect(serialized).not.toContain("PRIVATE_HISTORY_AUTHORIZATION_KEY")
     expect(serialized).not.toContain("PRIVATE_ROOT_TASK_HISTORY_EVENT")
+    expect(serialized).not.toContain("PRIVATE_SEARCH_FOOTPRINT_EVENT_ROLE")
+    expect(serialized).not.toContain("PRIVATE_SEARCH_FOOTPRINT_EVENT_LOCATION")
+    expect(serialized).not.toContain("PRIVATE_SEARCH_FOOTPRINT_EVENT_SOURCE")
+    expect(serialized).not.toContain("agent.plan.root_task_history_search_footprint_snapshot")
     expect(serialized).not.toContain("agent.plan.root_task_history_session_authorization")
     expect(serialized).not.toContain("agent.plan.root_task_history_memory_snapshot")
     expect(serialized).not.toContain("agent.plan.root_task_history_chronology_witness")
@@ -119,6 +140,9 @@ describe("AgentForkService Turn projection", () => {
     const snapshotText = JSON.stringify(snapshotContent)
     expect(snapshotText).not.toContain("root-task-history")
     expect(snapshotText).not.toContain("PRIVATE_ROOT_TASK_HISTORY_SNAPSHOT")
+    expect(snapshotText).not.toContain("PRIVATE_SEARCH_FOOTPRINT_SNAPSHOT_ROLE")
+    expect(snapshotText).not.toContain("PRIVATE_SEARCH_FOOTPRINT_SNAPSHOT_LOCATION")
+    expect(snapshotText).not.toContain("PRIVATE_SEARCH_FOOTPRINT_SNAPSHOT_SOURCE")
     expect(snapshotText).toContain("Visible same-session observation")
   })
 })

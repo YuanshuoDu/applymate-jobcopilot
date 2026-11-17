@@ -32,6 +32,8 @@ describe('AgentSessionConsole focus', () => {
     expect(html).not.toContain('0 agent.runningSessions')
     expect(html).not.toContain('0 agent.needsAttention')
     expect(html).toContain('Conversation done')
+    expect(html).toContain('Search criteria memory')
+    expect(html).toContain('Each objective still requires a fresh search')
     expect(html).toContain('aria-pressed="true"')
     expect(html).toContain('aria-label="agent.delete Conversation done"')
     expect(html).not.toContain('quality pending')

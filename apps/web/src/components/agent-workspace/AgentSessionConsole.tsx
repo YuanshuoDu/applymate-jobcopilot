@@ -8,6 +8,7 @@ import { AgentSessionTools } from './AgentSessionTools'
 import { SessionFocusPanel } from './SessionFocusPanel'
 import { useI18n } from '@/lib/i18n'
 import { AgentTaskHistoryMemoryConsent } from './AgentTaskHistoryMemoryConsent'
+import { AgentSearchFootprintMemoryConsent } from './AgentSearchFootprintMemoryConsent'
 import { EmptyText } from './AgentSessionConsoleParts'
 
 function statusColor(status: string): string {
@@ -139,6 +140,7 @@ export function AgentSessionConsole({
           </button>
         </div>
         <AgentTaskHistoryMemoryConsent />
+        <AgentSearchFootprintMemoryConsent />
 
         <div style={{ padding: '0 10px 12px', display: 'flex', flexDirection: 'column', gap: 7 }}>
           {loading && <EmptyText>{t('agent.loadingSessions')}</EmptyText>}

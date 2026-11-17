@@ -11,6 +11,7 @@ import {
   validateHistoryTerminalReceipt as validTerminal,
 } from "./root-task-history-terminal-receipts.js"
 import type { RootTaskHistoryCrossSessionCursor } from "./root-task-history-source-window.js"
+import { rootTaskHistoryFootprintOrigin } from "./root-task-history-footprint-origin.js"
 
 export type RootTaskHistorySourceRow = Record<string, unknown>
 type SameCursor = Readonly<{ sequence: string; turnId: string; terminalEventId: string }>
@@ -112,8 +113,8 @@ function stripRootTaskHistoryPageMetadata(row: RootTaskHistorySourceRow): RootTa
   return candidate
 }
 
-export function validateRootTaskHistoryCandidate(row: RootTaskHistorySourceRow, input: RootTaskHistoryFenceInput,
-  fence: RootTaskHistoryFence, indexed = false): RootTaskHistoryCandidate | undefined {
+function validateCandidate(row: RootTaskHistorySourceRow, input: RootTaskHistoryFenceInput,
+  fence: RootTaskHistoryFence, indexed: boolean, footprint: boolean): RootTaskHistoryCandidate | undefined {
   const turnId = row.turnId, rootTaskId = row.taskRootTaskId
   const crossSession = input.crossSessionRootTaskHistoryEnabled === true
   const terminalEventId = text(row.terminalEventId) ? row.terminalEventId : undefined
@@ -129,15 +130,18 @@ export function validateRootTaskHistoryCandidate(row: RootTaskHistorySourceRow, 
   if (fence.scheduledAutomationCriteria
     ? !scheduledTurn || !scheduledCriteria || !sameScheduledAutomationCriteria(scheduledCriteria, fence.scheduledAutomationCriteria)
     : scheduledTurn) return undefined
+  const expectedOrigin = footprint ? fence.searchFootprintOrigin : fence.currentOrigin
+  const sourceOrigin = footprint ? rootTaskHistoryFootprintOrigin(row.turnSource, row.input) : rootTaskHistoryOrigin(row.turnSource, row.input)
   if (crossSession && (row.sourceSessionUserId !== input.lease.userId || ["aborted", "archived"].includes(String(row.sourceSessionStatus))
-    || rootTaskHistoryOrigin(row.turnSource, row.input) !== fence.currentOrigin)) return undefined
+    || sourceOrigin !== expectedOrigin || footprint && !expectedOrigin)) return undefined
   const start = validStart(row, turnId, rootTaskId)
   const terminal = start === undefined ? undefined : validTerminal(row, turnId, rootTaskId, String(row.turnStatus), start)
   const terminalAt = row.terminalCreatedAt instanceof Date && Number.isFinite(row.terminalCreatedAt.getTime()) ? row.terminalCreatedAt : undefined
   const terminalXid8 = crossSession ? row.terminalWitnessXid8 : undefined
   const terminalWitnessEventId = crossSession ? row.terminalWitnessEventId : undefined
   const terminalOrder = crossSession ? parseRootTaskHistoryChronologyXid8(terminalXid8) : undefined
-  const startOrder = crossSession && fence.currentStartWitness ? parseRootTaskHistoryChronologyXid8(fence.currentStartWitness.xid8) : undefined
+  const targetWitness = footprint ? fence.searchFootprintStartWitness : fence.currentStartWitness
+  const startOrder = crossSession && targetWitness ? parseRootTaskHistoryChronologyXid8(targetWitness.xid8) : undefined
   if (start === undefined || terminal === undefined || start >= terminal
     || (!crossSession && terminal >= fence.currentStartSequence)
     || (crossSession && (!startOrder || !terminalOrder || terminalOrder >= startOrder
@@ -156,6 +160,16 @@ export function validateRootTaskHistoryCandidate(row: RootTaskHistorySourceRow, 
   }
   return { sessionId: row.sessionId, turnId, rootTaskId, terminalEventId, terminalSequence: terminal,
     ...(crossSession && terminalOrder ? { terminalXid8: terminalOrder.toString(), terminalWitnessEventId: terminalWitnessEventId as string } : {}) }
+}
+
+export function validateRootTaskHistoryCandidate(row: RootTaskHistorySourceRow, input: RootTaskHistoryFenceInput,
+  fence: RootTaskHistoryFence, indexed = false): RootTaskHistoryCandidate | undefined {
+  return validateCandidate(row, input, fence, indexed, false)
+}
+
+export function validateRootTaskHistoryFootprintCandidate(row: RootTaskHistorySourceRow, input: RootTaskHistoryFenceInput,
+  fence: RootTaskHistoryFence): RootTaskHistoryCandidate | undefined {
+  return validateCandidate(row, input, fence, false, true)
 }
 
 function textOrder(left: string, right: string): number {

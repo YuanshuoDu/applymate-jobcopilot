@@ -1,52 +1,77 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import type pg from "pg"
+import type { PgSubagentPool } from "./types.js"
 
-const lifecycle = vi.hoisted(() => ({ prepare: vi.fn(), persist: vi.fn(), reconcile: vi.fn() }))
+const mocks = vi.hoisted(() => ({
+  interruptMatchingInSession: vi.fn(),
+  persistGraphTransition: vi.fn(),
+  prepareGraphTransition: vi.fn(),
+  reconcileGraphDependents: vi.fn(),
+}))
+
+vi.mock("./pg-store-subtree-interrupt.js", () => ({ interruptMatchingInSession: mocks.interruptMatchingInSession }))
 vi.mock("./task-graph-pg-lifecycle.js", () => ({
-  prepareGraphTransition: lifecycle.prepare,
-  persistGraphTransition: lifecycle.persist,
-  reconcileGraphDependents: lifecycle.reconcile,
+  persistGraphTransition: mocks.persistGraphTransition,
+  prepareGraphTransition: mocks.prepareGraphTransition,
+  reconcileGraphDependents: mocks.reconcileGraphDependents,
 }))
 
 import { closeSubagentTask } from "./pg-store-close.js"
 
-function database(options: { taskFound?: boolean; updateCount?: number } = {}) {
-  const calls: Array<{ sql: string; params?: unknown[] }> = []
-  const client = {
-    query: vi.fn(async (sql: string, params?: unknown[]) => {
-      calls.push({ sql, params })
-      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 1 }
-      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ userId: "user-1" }], rowCount: 1 }
-      if (sql.includes("set_config")) return { rows: [], rowCount: 1 }
-      if (sql.includes('SELECT task."attemptCount"')) return options.taskFound === false
-        ? { rows: [], rowCount: 0 } : { rows: [{ attemptCount: 2 }], rowCount: 1 }
-      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rows: [], rowCount: options.updateCount ?? 1 }
+const now = new Date("2026-11-13T10:00:00.000Z")
+
+function closeFixture(options: { taskExists?: boolean } = {}) {
+  const timeline: string[] = []
+  const query = vi.fn(async (sql: string) => {
+    if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) {
+      return { rows: [{ userId: "user-1" }], rowCount: 1 }
+    }
+    if (sql.includes("set_config('app.user_id'")) return { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "sub_agent_tasks" AS task')) {
+      return options.taskExists === false ? { rows: [], rowCount: 0 } : {
+        rows: [{ attemptCount: 3, rootTaskId: "root-1", path: "/root-1/parent-1" }], rowCount: 1,
+      }
+    }
+    if (sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = \'closed\'')) {
+      timeline.push("parent_closed")
       return { rows: [], rowCount: 1 }
-    }),
-    release: vi.fn(),
-  }
-  return { pool: { connect: vi.fn().mockResolvedValue(client) }, calls, client }
+    }
+    return { rows: [], rowCount: 0 }
+  })
+  const client = { query, release: vi.fn() } as unknown as pg.PoolClient
+  const pool = { connect: vi.fn().mockResolvedValue(client) } as unknown as PgSubagentPool
+  return { client, pool, query, timeline }
 }
 
-describe("closeSubagentTask", () => {
-  beforeEach(() => {
-    lifecycle.prepare.mockReset().mockResolvedValue(null)
-    lifecycle.persist.mockReset().mockResolvedValue(undefined)
-    lifecycle.reconcile.mockReset().mockResolvedValue(undefined)
+beforeEach(() => vi.resetAllMocks())
+
+describe("closing a subagent task", () => {
+  it("closes the parent before interrupting its subtree in the same session transaction", async () => {
+    const fixture = closeFixture()
+    mocks.prepareGraphTransition.mockResolvedValue(null)
+    mocks.interruptMatchingInSession.mockImplementation(async () => {
+      fixture.timeline.push("subtree_interrupted")
+      return 2
+    })
+
+    await expect(closeSubagentTask(fixture.pool, { taskId: "parent-1", sessionId: "session-1", now })).resolves.toBe(true)
+
+    expect(fixture.timeline).toEqual(["parent_closed", "subtree_interrupted"])
+    expect(mocks.interruptMatchingInSession).toHaveBeenCalledWith(fixture.client, {
+      sessionId: "session-1", rootTaskId: "root-1", targetPath: "/root-1/parent-1",
+    }, "user-1", now)
+    expect(fixture.client.release).toHaveBeenCalledOnce()
   })
 
-  it("closes the task and clears its running segment while preserving its immutable deadline", async () => {
-    const fake = database()
-    await expect(closeSubagentTask(fake.pool as never, { taskId: "child-1", sessionId: "session-1", now: new Date() })).resolves.toBe(true)
-    const update = fake.calls.find(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))?.sql ?? ""
-    expect(update).toContain('"leaseSegmentStartedAt" = CASE WHEN "absoluteDeadlineAt" IS NOT NULL THEN NULL ELSE "leaseSegmentStartedAt" END')
-    expect(update).not.toContain('"absoluteDeadlineAt" =')
-    expect(update).toContain(`"status" = 'closed'`)
-  })
+  it("does not start subtree interruption when the task cannot be closed", async () => {
+    const fixture = closeFixture({ taskExists: false })
+    mocks.prepareGraphTransition.mockResolvedValue(null)
 
-  it("does not update a task that is missing or already terminal", async () => {
-    const fake = database({ taskFound: false })
-    await expect(closeSubagentTask(fake.pool as never, { taskId: "child-1", sessionId: "session-1", now: new Date() })).resolves.toBe(false)
-    expect(fake.calls.some(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
-    expect(fake.calls.at(-1)?.sql).toBe("COMMIT")
+    await expect(closeSubagentTask(fixture.pool, { taskId: "missing-parent", sessionId: "session-1", now })).resolves.toBe(false)
+
+    expect(mocks.interruptMatchingInSession).not.toHaveBeenCalled()
+    expect(fixture.timeline).toEqual([])
+    expect(fixture.client.release).toHaveBeenCalledOnce()
   })
 })
