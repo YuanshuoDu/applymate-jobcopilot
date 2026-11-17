@@ -59,9 +59,15 @@ const archivedWaitCallId = "p3-process-archived-wait-call", archivedWaitFinalMar
 const archivedWaitFreshListCallId = "p3-process-archived-wait-fresh-list"
 const SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS = Object.freeze({
   commandReceived: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_COMMAND_RECEIVED",
+  managerRunInvoked: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_MANAGER_RUN_INVOKED",
+  fixtureLeaseAccepted: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_FIXTURE_LEASE_ACCEPTED",
+  childExecutorInvoked: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_CHILD_EXECUTOR_INVOKED",
+  childExecutorRejected: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_CHILD_EXECUTOR_REJECTED",
+  childExecutorSettled: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_CHILD_EXECUTOR_SETTLED",
   round1Entered: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_ROUND_1_ENTERED",
   artifactVersionReadYieldReached: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_ARTIFACT_VERSION_READ_YIELD_REACHED",
   round2Entered: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_ROUND_2_ENTERED",
+  artifactVersionReadResultVerified: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_ARTIFACT_VERSION_READ_RESULT_VERIFIED",
   readyEmissionReached: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_READY_EMISSION_REACHED",
 })
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 5 })
@@ -988,6 +994,7 @@ function selectedJobReviewerModel(selected, task, observations) {
           && readResult?.content === privateBodyCanary
           && hashArtifactContent(readResult.content) === selected.expectedBodyHash
         if (!observations.sawBody) throw new Error("p3_selected_job_reviewer_did_not_receive_artifact_body")
+        if (stopBeforeReview) say(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.artifactVersionReadResultVerified)
         if (stopBeforeReview) {
           say(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.readyEmissionReached)
           say("P3_SELECTED_JOB_STOP_REVIEW_READY " + task.id)
@@ -1043,7 +1050,7 @@ async function startSelectedJobQueueWorker(runtime) {
     let leaseIdentity = null
     let childResult = null
     const observations = {}
-    const outcome = await runtime.manager.run(payload, async ({ lease }) => {
+    const managerRunPromise = runtime.manager.run(payload, async ({ lease }) => {
       if (lease.turnId !== selected.turnId || lease.rootTaskId !== selected.rootTaskId
         || lease.parentTaskId !== selected.rootTaskId || lease.userId !== selected.userId) {
         throw new Error("p3_selected_job_child_lease_scope_invalid")
@@ -1054,6 +1061,8 @@ async function startSelectedJobQueueWorker(runtime) {
       if (taskSelection?.jobId !== selected.jobId || !selectedTaskIds.includes(lease.id)) {
         throw new Error("p3_selected_job_task_lineage_invalid")
       }
+      const isStopReviewerLease = payload.taskId === selected.stopReviewerTaskId && lease.id === selected.stopReviewerTaskId
+      if (isStopReviewerLease) say(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.fixtureLeaseAccepted)
       leaseIdentity = {
         role: lease.role, ownerId: lease.ownerId, attemptCount: lease.attemptCount,
         taskId: lease.id, path: lease.path,
@@ -1067,9 +1076,19 @@ async function startSelectedJobQueueWorker(runtime) {
           throw new Error("p3_unexpected_selected_job_child_role")
         },
       })
-      childResult = await executor({ lease })
+      try {
+        const executorPromise = executor({ lease })
+        if (isStopReviewerLease) say(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.childExecutorInvoked)
+        childResult = await executorPromise
+      } catch (failure) {
+        if (isStopReviewerLease) say(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.childExecutorRejected)
+        throw failure
+      }
+      if (isStopReviewerLease) say(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.childExecutorSettled)
       return childResult
     })
+    if (payload.taskId === selected.stopReviewerTaskId) say(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.managerRunInvoked)
+    const outcome = await managerRunPromise
     const structured = record(record(childResult?.result)?.structuredResult)
     say("P3_SELECTED_JOB_CHILD_SETTLED " + payload.taskId + " " + JSON.stringify({
       ...leaseIdentity,
