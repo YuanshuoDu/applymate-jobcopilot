@@ -2,8 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
-  userFindUnique: vi.fn(),
-  userDelete: vi.fn(),
+  db: {},
+  deleteAccount: vi.fn(),
 }))
 
 vi.mock('@/lib/api-helpers', () => ({
@@ -12,14 +12,16 @@ vi.mock('@/lib/api-helpers', () => ({
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
   err: (message: string, status = 400) => Response.json({ error: message }, { status }),
 }))
-vi.mock('@/lib/db', () => ({ db: { user: { findUnique: mocks.userFindUnique, delete: mocks.userDelete } } }))
+vi.mock('@/lib/db', () => ({ db: mocks.db }))
+vi.mock('@/lib/agent/account-delete-source-write', () => ({ deleteAccountWithSourceFence: mocks.deleteAccount }))
 
 describe('DELETE /api/me/delete', () => {
   beforeEach(() => {
     vi.resetModules()
-    Object.values(mocks).forEach(mock => mock.mockReset())
+    mocks.requireAuth.mockReset()
+    mocks.deleteAccount.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: 'user_1' })
-    mocks.userFindUnique.mockResolvedValue({ email: 'member@example.com' })
+    mocks.deleteAccount.mockResolvedValue('deleted')
   })
 
   it('deletes only after a case-insensitive email confirmation', async () => {
@@ -33,6 +35,27 @@ describe('DELETE /api/me/delete', () => {
     const response = await DELETE(request as never)
 
     expect(response.status).toBe(200)
-    expect(mocks.userDelete).toHaveBeenCalledWith({ where: { id: 'user_1' } })
+    expect(mocks.deleteAccount).toHaveBeenCalledWith(mocks.db, 'user_1', ' MEMBER@EXAMPLE.COM ')
+  })
+
+  it('preserves not-found and confirmation errors from the fenced transaction', async () => {
+    const { DELETE } = await import('./route')
+    mocks.deleteAccount.mockResolvedValueOnce('not_found')
+    const notFound = await DELETE(new Request('http://localhost/api/me/delete', { method: 'DELETE' }) as never)
+    expect(notFound.status).toBe(404)
+
+    mocks.deleteAccount.mockResolvedValueOnce('confirmation_required')
+    const invalid = await DELETE(new Request('http://localhost/api/me/delete', { method: 'DELETE' }) as never)
+    expect(invalid.status).toBe(400)
+  })
+
+  it('does not invoke deletion when authentication fails', async () => {
+    mocks.requireAuth.mockResolvedValueOnce(Response.json({ error: 'Unauthorized' }, { status: 401 }))
+    const { DELETE } = await import('./route')
+
+    const response = await DELETE(new Request('http://localhost/api/me/delete', { method: 'DELETE' }) as never)
+
+    expect(response.status).toBe(401)
+    expect(mocks.deleteAccount).not.toHaveBeenCalled()
   })
 })
