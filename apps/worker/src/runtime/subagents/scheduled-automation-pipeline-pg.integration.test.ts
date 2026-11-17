@@ -832,6 +832,29 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     await pool!.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "createdAt", "updatedAt")
       VALUES ($1, $2, 'Fixture Base Resume', $3::jsonb, 'base', 'manual', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
     [baseResumeId, value.userId, JSON.stringify(baseResumeContent)])
+    const analyzeJobResult = await pool!.query<{
+      id: string; userId: string; company: string; role: string; location: string | null;
+      description: string | null; source: string | null; url: string | null;
+    }>(`SELECT "id", "userId", "company", "role", "location", "description", "source", "url"
+      FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [value.jobId, value.userId])
+    const analyzeJob = analyzeJobResult.rows[0]
+    if (!analyzeJob) throw new Error("Scheduled Prepare fixture could not load its Job source.")
+    const analyzeResumeResult = await pool!.query<{ id: string; content: unknown }>(`SELECT "id", "content" FROM "Resume"
+      WHERE "id" = $1 AND "userId" = $2 AND "isDefault" = true`, [baseResumeId, value.userId])
+    const analyzeResume = analyzeResumeResult.rows[0]
+    if (!analyzeResume) throw new Error("Scheduled Prepare fixture could not load its default Resume source.")
+    const analyzeSourceModulePath = "@/lib/agent/stages/analyze-model-input"
+    const analyzeSourceModule = await import(analyzeSourceModulePath) as unknown as {
+      createAnalyzeSourceFingerprint: (input: { userId: string; jobId: string;
+        job: { company: string; role: string; location: string | null; description: string | null; source: string | null; url: string | null };
+        resumeId: string; resumeText: string }) => { version: string; digest: string }
+    }
+    const resumeTypesModulePath = "@/lib/agent/types"
+    const resumeTypesModule = await import(resumeTypesModulePath) as unknown as { resumeToText: (content: unknown) => string }
+    const analyzeSourceFingerprint = analyzeSourceModule.createAnalyzeSourceFingerprint({
+      userId: analyzeJob.userId, jobId: analyzeJob.id, job: analyzeJob, resumeId: analyzeResume.id,
+      resumeText: resumeTypesModule.resumeToText(analyzeResume.content),
+    })
     await persistToolReceipt(pool!, value, value.scoutTaskId, "scout-step", "jobs.discover", "discover-call", {
       query: "Software Engineer Dublin",
     }, discoveryOutput(value), 1)
@@ -1006,6 +1029,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
           owner: claimOwner, snapshotDigest: result.attestation.snapshotDigest, graphRevision: result.attestation.graphRevision,
           evidenceDigest: result.attestation.evidenceDigest },
         scoutedJobs: [jobRecord],
+        scheduledTaskGraphAnalyzeSourceFingerprints: { [analyzeJob.id]: analyzeSourceFingerprint },
         scoredJobs: [{ job: { ...jobRecord, coverLetter: null }, score: 82, matchedKeywords: ["TypeScript"],
           missingKeywords: ["PostgreSQL"], recommendation: "Apply after tailoring.", analysisFenceAt: new Date().toISOString() }],
         analysisFailed: 0,
@@ -1189,7 +1213,11 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         if (priorWorkerSecret === undefined) delete process.env.AGENT_WORKER_SECRET
         else process.env.AGENT_WORKER_SECRET = priorWorkerSecret
       }
-      expect(reboundHandoff.status).toBe("analyze_checkpointed")
+      const handoffDiagnostic = reboundHandoff.status === "blocked"
+        ? `blocked:${reboundHandoff.errorCode}` : `status:${reboundHandoff.status}`
+      expect(reboundHandoff.status,
+        `Scheduled route handoff ${handoffDiagnostic}; routePipelineCalls=${routePipelineCalls.length}`)
+        .toBe("analyze_checkpointed")
       if (reboundHandoff.status !== "analyze_checkpointed") throw new Error("Scheduled route did not return a rebound Analyze proof")
       expect(routePipelineCalls).toHaveLength(1)
       expect(routePipelineCalls[0]).toMatchObject({ owner: resumedOwner, continuationKey })
