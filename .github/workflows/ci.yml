@@ -85,6 +85,8 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
         run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
       - name: Build Worker workspace before focused test
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: pnpm turbo build --filter=@jobcopilot/worker
       - name: Verify scheduled Audit usage fencing on disposable PostgreSQL and Redis
         env:
