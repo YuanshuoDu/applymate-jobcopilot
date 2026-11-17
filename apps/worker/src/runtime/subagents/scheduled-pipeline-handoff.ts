@@ -55,7 +55,7 @@ export type ScheduledPipelineGateInput = Readonly<{
 export type ScheduledPipelineGateResponse = ScheduledGateResult | Readonly<{ status: "blocked"; errorCode: string }>
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 
-function isKnownBlockedResponse(status: number, errorCode: unknown): errorCode is string {
+function isKnownBlockedResponse(status: number, errorCode: unknown): boolean {
   if (typeof errorCode !== "string" || !blockedErrors.has(errorCode)) return false
   return errorCode === SOURCE_CHANGED_ERROR ? status === 409 : status >= 400 && status < 500
 }
@@ -98,7 +98,7 @@ export async function postScheduledPipelineContinuation(input: HandoffInput, sig
       : { status: "waiting_for_user", waitId: payload.waitId, waitKind: "external" }
   }
   const errorCode = payload.errorCode
-  if (payload.status === "blocked" && isKnownBlockedResponse(response.status, errorCode)) return { status: "blocked", errorCode }
+  if (payload.status === "blocked" && typeof errorCode === "string" && isKnownBlockedResponse(response.status, errorCode)) return { status: "blocked", errorCode }
   throw new Error(response.status === 202 ? "scheduled_pipeline_handoff_in_progress" : "scheduled_pipeline_handoff_retryable")
 }
 
