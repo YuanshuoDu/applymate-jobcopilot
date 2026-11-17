@@ -1,14 +1,7 @@
-import { createHash, randomUUID } from "node:crypto"
-import { Queue, Worker } from "bullmq"
-import Redis from "ioredis"
+import { randomUUID } from "node:crypto"
 import type { Pool } from "pg"
-import type { ModelAdapter } from "@jobcopilot/agent-model"
-import type { TurnExecutionOwnerFence } from "../execution-owner.js"
-import type { WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { type TurnLease } from "../turns/lease.js"
-import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
-import { createPgTurnQuestionStore } from "../turns/turn-question-store.js"
-import { scheduledPrepareChoiceWaitId } from "../turns/turn-question-contract.js"
+import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { drainAgentWakeups } from "../wakeup/consumer.js"
 import { AGENT_TURN_WAKEUP_TOPIC } from "../wakeup/types.js"
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
@@ -17,25 +10,17 @@ import { createScheduledAutomationPrepareContinuation } from "./scheduled-automa
 import { verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-task-graph-verification.js"
 import { createScheduledAutomationPipelineBridge, type ScheduledAutomationPipelineAttestation,
   type ScheduledAutomationPipelineBridgeState, type ScheduledAutomationPipelineOwner } from "./scheduled-automation-pipeline-bridge.js"
-import { postScheduledPipelineContinuation, scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
+import { postScheduledPipelineContinuation, scheduledTaskGraphContinuationKey, type ScheduledPipelineAnalyzeCheckpointProof } from "./scheduled-pipeline-handoff.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
-import { runSubagentQueueJob } from "../../queue/subagent-pause-dispatch.js"
-import { parseSubagentDispatchJobId } from "./dispatch-identity.js"
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
-import type { PgSubagentPool, SubagentJobPayload } from "./types.js"
-import type { TaskGraphScheduledPrepareInput } from "./task-graph-command-port.js"
-import { createScheduledPipelineCandidateStore, withScheduledPipelineCandidateModelOutput } from "./scheduled-pipeline-candidate-store.js"
-import { createScheduledTaskGraphContinuationContract } from "./scheduled-taskgraph-continuation-receipt.js"
 import { scheduledGatePreparedJobIds } from "./scheduled-gate-contract.js"
-import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import type { ScheduledPrepareTaskGraphProof } from "./scheduled-prepare-task-graph-verification.js"
-import type { ScheduledPipelineAnalyzeCheckpointProof } from "./scheduled-pipeline-handoff.js"
 import { seedScheduledGatePrepareFixture, type ScheduledGatePrepareSeedFixture } from "./scheduled-gate-prepare-pg.fixture.js"
-import { digestScheduledAnalyzeCheckpoint, graphScope, resumePrepareChoice, scheduledGateRootActions, turnExecutionOwner,
+import { digestScheduledAnalyzeCheckpoint, graphScope, resumePrepareChoice, scheduledGateRootActions,
   SCHEDULED_GATE_BASE_RESUME, type ScheduledGatePrepareOwner } from "./scheduled-gate-prepare-pg-resume.fixture.js"
+import { executeScheduledGatePrepareChild } from "./scheduled-gate-prepare-child-runner.fixture.js"
+import { runScheduledGatePrepareRootQuestion } from "./scheduled-gate-prepare-root-turn.fixture.js"
 
-const WAIT_MS = 30_000
-const LETTER = "Fixture cover letter prepared for the scheduled Gate integration test."
 const DB_PATH = "@/lib/db"
 const GATE_SERVICE_PATH = "@/lib/agent/scheduled-taskgraph-run-service"
 
@@ -83,22 +68,8 @@ export async function createScheduledGatePrepareFixture(pool: Pool, redisUrl: st
   await pool.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "createdAt", "updatedAt")
     VALUES ($1, $2, 'Fixture Base Resume', $3::jsonb, 'base', 'manual', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
   [`scheduled-gate-resume-${seed.ids.turnId}`, seed.ids.userId, JSON.stringify(SCHEDULED_GATE_BASE_RESUME)])
-  const stepOrdinal = Number((await pool.query<{ ordinal: number | string }>(`SELECT COALESCE(MAX("ordinal"), -1) + 1 AS "ordinal" FROM "agent_steps" WHERE "turnId"=$1 AND "sessionId"=$2`, [seed.ids.turnId, seed.ids.sessionId])).rows[0]?.ordinal)
-  if (!Number.isSafeInteger(stepOrdinal) || stepOrdinal < 0) throw new Error("scheduled_gate_prepare_step_ordinal_invalid")
-  const stepId = `scheduled-gate-prepare-step-${seed.ids.turnId}`
-  const candidateText = "Scheduled Gate integration candidate."
-  const usage = { inputTokens: 37, outputTokens: 9, estimatedCostUsd: 0.018 }
-  await pool.query(`INSERT INTO "agent_steps"
-    ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "startedAt")
-    VALUES ($1, $2, $3, $4, $5, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
-  [stepId, seed.ids.sessionId, seed.ids.turnId, seed.ids.rootTaskId, stepOrdinal])
-  const initialTurnExecutionOwner = turnExecutionOwner(seed, seed.turnLeaseV1)
-  const candidateStore = createScheduledPipelineCandidateStore(pool as never, createPgTurnEngineStore(pool as never))
-  await withScheduledPipelineCandidateModelOutput({ owner: initialTurnExecutionOwner, finalStepId: stepId, finalStepOrdinal: stepOrdinal,
-    candidateText, finishReason: "stop", usage }, () => candidateStore.stage({ owner: initialTurnExecutionOwner,
-    rootAttemptCount: seed.ownerV1.rootAttemptCount, finalStepId: stepId, finalStepOrdinal: stepOrdinal, candidateText }))
-  const prepare = await waitForPrepareChoice(pool, seed, attestationV1, initialContinuationKey, claimToken, checkpointDigest,
-    stepId, stepOrdinal, candidateText, usage, initialTurnExecutionOwner)
+  const prepare = await runScheduledGatePrepareRootQuestion({ pool, seed, owner: seed.ownerV1, attestation: attestationV1,
+    continuationKey: initialContinuationKey, checkpointDigest, claimToken, bridge })
   const resumed = await resumePrepareChoice(pool, seed, { owner: seed.ownerV1 as ScheduledGatePrepareOwner,
     attestation: attestationV1, executionOwner, continuationKey: initialContinuationKey, choiceWaitId: prepare.choiceWaitId,
     nextTurnRevision: prepare.nextTurnRevision, answer: "keep_resume", allowedActions: scheduledGateRootActions() })
@@ -107,7 +78,7 @@ export async function createScheduledGatePrepareFixture(pool: Pool, redisUrl: st
   const analyzeAgain = await bridge(currentOwner)
   if (analyzeAgain.status !== "ready") throw new Error(`scheduled_gate_prepare_rebind_${analyzeAgain.reasonCode}`)
   const ready = await runPrepare(pool, redisUrl, seed, currentOwner, resumed.turnExecutionOwner,
-    analyzeAgain.attestation, resumed.handoff, stepId, stepOrdinal, candidateText)
+    analyzeAgain.attestation, resumed.handoff, prepare.stepId, prepare.stepOrdinal, prepare.candidateText)
   const gate = await buildAndPersistGateCheckpoint(pool, seed, currentOwner, analyzeAgain.attestation, continuationKey,
     resumed.handoff, resumed.claimToken, ready.prepareProof, prepare.choiceWaitId)
   const preparedIds = scheduledGatePreparedJobIds(ready.prepareProof)
@@ -117,7 +88,7 @@ export async function createScheduledGatePrepareFixture(pool: Pool, redisUrl: st
     snapshot: seed.snapshot, scheduleSnapshot: seed.scheduleSnapshot, graphScope: currentScope, owner: currentOwner,
     turnLease: resumed.turnLease, turnExecutionOwner: resumed.turnExecutionOwner, executionOwner,
     attestation: analyzeAgain.attestation, prepareProof: ready.prepareProof, prepareWaitId: ready.prepareWaitId,
-    continuationKey, handoff: resumed.handoff, rootQuestionStepId: stepId, rootQuestionWaitId: prepare.choiceWaitId,
+    continuationKey, handoff: resumed.handoff, rootQuestionStepId: prepare.stepId, rootQuestionWaitId: prepare.choiceWaitId,
     prepareChoiceWaitId: prepare.choiceWaitId,
     preparedJobIds: preparedIds, checkpointStage: gate === "gate" ? "gate" : fail("scheduled_gate_checkpoint_missing"),
     async reattestCurrentTurn(lease) {
@@ -155,35 +126,6 @@ function analyzeCheckpoint(seed: ScheduledGatePrepareSeedFixture, owner: Schedul
       owner, snapshotDigest: attestation.snapshotDigest, graphRevision: attestation.graphRevision, evidenceDigest: attestation.evidenceDigest },
     scoutedJobs: selectedJobRecords, scoredJobs: seed.scoredJobs, analysisFailed: 0 }
 }
-async function waitForPrepareChoice(pool: Pool, seed: ScheduledGatePrepareSeedFixture,
-  attestation: ScheduledAutomationPipelineAttestation, continuationKey: string, claimToken: string, checkpointDigest: string,
-  stepId: string, stepOrdinal: number, candidateText: string, usage: Readonly<{ inputTokens: number; outputTokens: number; estimatedCostUsd: number }>,
-  turnOwner: TurnExecutionOwnerFence): Promise<{ choiceWaitId: string; nextTurnRevision: number }> {
-  const proof: ScheduledPipelineAnalyzeCheckpointProof = { status: "analyze_checkpointed", continuationKey, checkpointDigest,
-    claimTokenDigest: `sha256:${createHash("sha256").update(claimToken, "utf8").digest("hex")}`,
-    executionId: seed.executionOwner.executionId, executionAttemptCount: seed.executionOwner.executionAttemptCount }
-  const scope = { ...graphScope(seed, seed.ownerV1), stepId }
-  const input: TaskGraphScheduledPrepareInput = { scope, executionOwner: seed.executionOwner, handoff: proof, attestation,
-    proposal: { expectedRevision: attestation.graphRevision, nodes: [{ key: "prepare", templateId: "prepare",
-      goal: "Prepare application materials using the persisted scheduled Analyze checkpoint.", successCriteria: [
-        "Prepare only jobs and 0-100 scores from the verified scheduled Analyze checkpoint.",
-        "Persist immutable owner-fenced material references and return no resume or letter bodies.",
-      ], dependsOn: ["scheduled-analyst"] }] } }
-  const contract = createScheduledTaskGraphContinuationContract(input)
-  if (!contract) throw new Error("scheduled_gate_prepare_choice_contract_invalid")
-  const waitId = scheduledPrepareChoiceWaitId({ receipt: contract.receipt, finalStepId: stepId, finalStepOrdinal: stepOrdinal })
-  if (!waitId) throw new Error("scheduled_gate_prepare_choice_wait_id_invalid")
-  const command = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool as never)
-  const continuation = createScheduledAutomationPrepareContinuation({ commandPort: command, waitPort })
-  const waiting = await continuation({ owner: seed.ownerV1, executionOwner: turnOwner, attestation, proof,
-    candidateText, finalStepId: stepId, finalStepOrdinal: stepOrdinal, recoveryStepId: stepId, signal: new AbortController().signal })
-  if (waiting.status !== "waiting_for_choice" || waiting.waitId !== waitId) throw new Error("scheduled_gate_prepare_choice_not_waiting")
-  const question = await createPgTurnQuestionStore(pool as never).waitForQuestion({ owner: turnOwner, stepId,
-    toolCallId: null, expectedWaitId: waitId, finishReason: "stop", usage, now: new Date() })
-  if (question.status !== "waiting_for_user" || question.waitId !== waitId) throw new Error("scheduled_gate_prepare_question_not_persisted")
-  return { choiceWaitId: waitId, nextTurnRevision: question.nextTurnRevision }
-}
-
 async function runPrepare(pool: Pool, redisUrl: string, seed: ScheduledGatePrepareSeedFixture,
   owner: ScheduledAutomationPipelineOwner, turnOwner: TurnExecutionOwnerFence,
   attestation: ScheduledAutomationPipelineAttestation, proof: ScheduledPipelineAnalyzeCheckpointProof,
@@ -205,124 +147,12 @@ async function runPrepare(pool: Pool, redisUrl: string, seed: ScheduledGatePrepa
   if (waiting.status !== "waiting_for_dependency") throw new Error("scheduled_gate_prepare_dependency_not_waiting")
   const graph = await command.readCurrent(scope), prepare = graph.nodes.find(node => node.key === "prepare")
   if (!prepare?.taskId) throw new Error("scheduled_gate_prepare_task_missing")
-  await executePrepareChild(pool, redisUrl, seed, prepare.taskId)
+  await executeScheduledGatePrepareChild(pool, redisUrl, seed, prepare.taskId)
   const resolution = await waitPort.resolve({ userId: seed.ids.userId, sessionId: seed.ids.sessionId, waitId: waiting.waitId })
   if (!resolution || resolution.status !== "ready" || !resolution.matchedTaskIds.includes(prepare.taskId)) throw new Error("scheduled_gate_prepare_wait_unresolved")
   const ready = await continuation(input)
   if (ready.status !== "ready" || ready.prepareProof.completion.wait.waitId !== waiting.waitId) throw new Error("scheduled_gate_prepare_proof_missing")
   return { prepareTaskId: prepare.taskId, prepareWaitId: waiting.waitId, prepareProof: ready.prepareProof }
-}
-
-async function executePrepareChild(pool: Pool, redisUrl: string, seed: ScheduledGatePrepareSeedFixture, taskId: string): Promise<void> {
-  const { dispatchPendingSubagentOutbox, subagentJobId } = await import("../../queue/subagent-queue.js")
-  const [runtime, store, managerModule] = await Promise.all([import("./production-child-runtime.js"), import("./pg-store.js"), import("./manager.js")])
-  const profile: ModelAdapter["profile"] = { provider: "fixture", model: "scheduled-gate-prepare", nativeTools: true,
-    structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false,
-    supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false,
-    supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null,
-    maxOutputTokens: 2200, costClass: "low" }
-  const modelRuntimeFactory = (): ModelAdapter => ({ id: "scheduled-gate-prepare-fixture", profile,
-    async *stream(request) {
-      const parts = request.messages.flatMap(message => message.content), result = parts.find(part => part.type === "tool_result")
-      if (request.tools.some(tool => (tool as { name?: unknown }).name === "scheduled.application.prepare")) {
-        if (!result || result.type !== "tool_result") {
-          yield { type: "tool_call_completed", callId: `scheduled-prepare-tool-${taskId}`, name: "scheduled.application.prepare", arguments: {} }
-          yield { type: "completed", finishReason: "tool_calls" }; return
-        }
-        if (result.isError) throw new Error("scheduled Prepare tool returned an error")
-        yield { type: "text_delta", text: result.content }; yield { type: "completed", finishReason: "stop" }; return
-      }
-      const prompt = parts.filter(part => part.type === "text").map(part => part.text).join("\n")
-      const text = prompt.includes("Tailor this resume") ? JSON.stringify(SCHEDULED_GATE_BASE_RESUME)
-        : prompt.includes("Write a concise, professional European application cover letter") ? LETTER : null
-      if (!text) throw new Error("scheduled Prepare fixture received an unexpected material prompt")
-      yield { type: "text_delta", text }; yield { type: "completed", finishReason: "stop" }
-    } })
-  const authorizeUsage = async (_input: WorkerUsageAuthorizationInput) => ({
-    outputReservationRequired: false,
-    maxOutputTokens: null,
-    settle: async (_value: WorkerUsageSettlementInput) => undefined,
-    settleUnknown: async (_value: WorkerUsageSettlementInput) => undefined,
-  })
-  const executor = runtime.createProductionChildExecutor({ pool: pool as never, authorizeUsage, modelRuntimeFactory })
-  const manager = new managerModule.AgentTreeManager(new store.PgSubagentTaskStore(pool as never))
-  const redis = new Redis(redisUrl, { maxRetriesPerRequest: null, connectTimeout: 2_000, retryStrategy: attempt => attempt > 3 ? null : 100 })
-  const connection = redis.duplicate(), queueName = `scheduled-gate-prepare-${randomUUID()}`
-  const queue = new Queue<SubagentJobPayload>(queueName, { connection, skipVersionCheck: true })
-  let worker: Worker<SubagentJobPayload, unknown> | undefined
-  try {
-    await redis.ping(); await queue.waitUntilReady()
-    await dispatchPendingSubagentOutbox(pool as never, queue, 10, seed.ids.sessionId)
-    worker = new Worker<SubagentJobPayload, unknown>(queueName, async job => {
-      const identity = parseSubagentDispatchJobId(job.id, job.data.taskId)
-      if (!identity) throw new Error("scheduled Prepare dispatch identity invalid")
-      return runSubagentQueueJob(pool as never, manager, executor, job.data, identity)
-    }, { connection: redis.duplicate(), skipVersionCheck: true, concurrency: 1 })
-    const completed = waitForChild(worker, subagentJobId(taskId))
-    await worker.waitUntilReady()
-    const outcome = await completed
-    const outcomeStatus = outcome && typeof outcome === "object" ? ownData(outcome, "status") : undefined
-    if (!outcome || typeof outcome !== "object" || outcomeStatus !== "completed") {
-      const returnedStatus = safeStatus(outcomeStatus)
-      const returnedFailure = safeFailureCode(outcome && typeof outcome === "object"
-        ? ownData(outcome, "failureReason") ?? ownData(outcome, "errorCode") : undefined)
-      const persisted = await readPrepareFailure(pool, seed, taskId)
-      throw new Error(`scheduled Prepare child did not complete: returnedStatus=${returnedStatus}; returnedFailure=${returnedFailure}; persistedStatus=${persisted.status}; persistedFailure=${persisted.failure}`)
-    }
-  } finally {
-    await worker?.close().catch(() => undefined)
-    const job = await queue.getJob(subagentJobId(taskId)).catch(() => undefined)
-    await job?.remove().catch(() => undefined)
-    await queue.close().catch(() => undefined)
-    await connection.quit().catch(() => connection.disconnect())
-    await redis.quit().catch(() => redis.disconnect())
-  }
-}
-
-const SAFE_TASK_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
-const SAFE_FAILURE_CODES = new Set([
-  "child_turn_missing", "subagent_role_unknown", "selected_job_context_unavailable", "writer_dependency_unavailable",
-  "selected_job_sources_unavailable", "selected_job_output_contract_unavailable", "child_resume_evidence_unavailable",
-  "child_resume_unavailable", "invalid_structured_result", "task_graph_child_deadline_exceeded",
-  "task_graph_verification_failed", "task_graph_verification_unverified", "task_graph_other",
-  "execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid", "lease_lost",
-  "scheduled_gate_role_task_type_mismatch",
-  "usage_authorization_unavailable", "usage_broker_unavailable", "usage_context_unavailable", "usage_denied",
-  "usage_settlement_unknown", "usage_start_unavailable", "usage_start_conflict", "usage_start_replayed",
-  "output_reservation_unknown",
-])
-
-function ownData(value: object, key: string): unknown {
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key)
-    return descriptor?.enumerable && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined
-  } catch { return undefined }
-}
-function safeStatus(value: unknown): string {
-  return typeof value === "string" && SAFE_TASK_STATUSES.has(value) ? value : value === undefined ? "missing" : "other"
-}
-function safeFailureCode(value: unknown): string {
-  return value === null ? "none" : typeof value === "string" && SAFE_FAILURE_CODES.has(value)
-    ? value : value === undefined ? "missing" : "other"
-}
-async function readPrepareFailure(pool: Pool, seed: ScheduledGatePrepareSeedFixture, taskId: string): Promise<{ status: string; failure: string }> {
-  try {
-    const row = (await pool.query<{ status: string; failureReason: string | null }>(
-      `SELECT "status", "failureReason" FROM "sub_agent_tasks"
-        WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3 AND "rootTaskId"=$4 AND "parentTaskId"=$4 AND "role"=$5 AND "taskType"=$6`,
-      [taskId, seed.ids.sessionId, seed.ids.turnId, seed.ids.rootTaskId, TASK_GRAPH_TEMPLATES.prepare.role,
-        TASK_GRAPH_TEMPLATES.prepare.taskType])).rows[0]
-    return row ? { status: safeStatus(row.status), failure: safeFailureCode(row.failureReason) }
-      : { status: "missing", failure: "missing" }
-  } catch { return { status: "read_failed", failure: "read_failed" } }
-}
-
-function waitForChild(worker: Worker<SubagentJobPayload, unknown>, jobId: string): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`scheduled Prepare child timed out: ${jobId}`)), WAIT_MS)
-    worker.on("completed", job => { if (job.id === jobId) { clearTimeout(timer); resolve(job.returnvalue) } })
-    worker.on("failed", (job, error) => { if (job?.id === jobId) { clearTimeout(timer); reject(error) } })
-  })
 }
 
 async function buildAndPersistGateCheckpoint(pool: Pool, seed: ScheduledGatePrepareSeedFixture,

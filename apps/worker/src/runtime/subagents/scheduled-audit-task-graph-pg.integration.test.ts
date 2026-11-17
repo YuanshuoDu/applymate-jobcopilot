@@ -4,8 +4,9 @@ import { Queue, Worker, type Job } from "bullmq"
 import Redis from "ioredis"
 import { Pool } from "pg"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
-import type { ModelAdapter } from "@jobcopilot/agent-model"
+import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
+import { Value } from "@sinclair/typebox/value"
 import { TurnEngine } from "../turns/turn-engine.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { createCanonicalSessionProjection } from "../canonical-session-projection.js"
@@ -34,16 +35,26 @@ import { parseScheduledGateTaskEnvelope, scheduledGatePreparedJobIds } from "./s
 import { scheduledGateRootActions } from "./scheduled-gate-prepare-pg-resume.fixture.js"
 import { parseScheduledAuditReport, SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, SCHEDULED_AUDIT_TASK_TYPE,
   SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
-import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK } from "./scheduled-post-gate-contract.js"
+import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION } from "./scheduled-post-gate-contract.js"
 import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import { buildTaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
 import { buildGroundedTaskGraphFinalResponse } from "./task-graph-final-response.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGraphProposalKey,
   TASK_GRAPH_ITEM_TYPE } from "./task-graph-snapshot.js"
-import { verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-task-graph-verification.js"
+import { buildScheduledPrepareTaskGraphProof, verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-task-graph-verification.js"
+import { loadPersistedScheduledPrepareProof } from "./scheduled-gate-wait-match.js"
 import { AgentTreeManager } from "./manager.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
+import { PgCoordinationStore } from "../mailbox/store.js"
+import { createCoordinationTools } from "../tools/coordination-tools.js"
+import { createTaskGraphPlanningTool } from "../tools/planning-executors.js"
+import type { ToolExecutionContext } from "../tools/types.js"
+import { SCHEDULED_POST_GATE_AUDIT_CRITERIA, SCHEDULED_POST_GATE_AUDIT_GOAL,
+  SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID, SCHEDULED_POST_GATE_EXECUTE_CRITERIA,
+  SCHEDULED_POST_GATE_EXECUTE_GOAL, SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID,
+  parseScheduledPostGateHandoff, SCHEDULED_POST_GATE_HANDOFF_EVENT } from "./scheduled-post-gate-contract.js"
+import { scheduledPostGateTaskTemplates } from "./scheduled-post-gate-task-templates.js"
 import { parseSubagentDispatchJobId } from "./dispatch-identity.js"
 import { dispatchPendingSubagentOutbox } from "../../queue/subagent-queue.js"
 import type { SubagentJobPayload } from "./types.js"
@@ -488,10 +499,30 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       const turnState = await readRootTurnState(fixture)
       const graphState = await loadTaskGraph(pool as never, fixture.graphScope, false)
       const gateNodeStatus = currentTaskGraph(graphState).nodes.find(node => node.key === "gate")?.status
+      const approvalState = (await pool!.query<{ approvalCount: number; activeCount: number; applicationCount: number;
+        startedItemCount: number; requestedEventCount: number }>(`SELECT COUNT(DISTINCT approval."id")::int AS "approvalCount",
+          COUNT(DISTINCT approval."id") FILTER (WHERE approval."status"='pending' AND approval."decidedAt" IS NULL
+            AND approval."consumedAt" IS NULL AND approval."expiresAt">clock_timestamp())::int AS "activeCount",
+          COUNT(DISTINCT application."id")::int AS "applicationCount", COUNT(DISTINCT item."id")::int AS "startedItemCount",
+          COUNT(DISTINCT event."id")::int AS "requestedEventCount"
+        FROM "agent_approvals" AS approval
+        LEFT JOIN "application_tasks" AS application ON application."id"=approval."taskId"
+          AND application."userId"=approval."userId" AND application."sessionId"=approval."sessionId"
+          AND application."jobId"=approval."jobId"
+        LEFT JOIN "agent_items" AS item ON item."id"='agent-wait:approval:' || approval."id"
+          AND item."sessionId"=approval."sessionId" AND item."turnId"=approval."turnId" AND item."status"='started'
+        LEFT JOIN "agent_events" AS event ON event."sessionId"=approval."sessionId" AND event."turnId"=approval."turnId"
+          AND event."correlationId"=approval."id" AND event."type"='approval.requested'
+        WHERE approval."userId"=$1 AND approval."sessionId"=$2 AND approval."turnId"=$3
+          AND approval."jobId"=ANY($4::text[]) AND approval."type"='review_application'
+          AND approval."payload"->'scheduledGateReview'->>'gateTaskId'=$5`,
+      [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId, fixture.preparedJobIds, gateTaskId])).rows[0]
+      const exactApprovalWitnessIds = await assertPersistedGateApprovalWitnesses(pool!, fixture, gateTaskId)
       throw new Error(`Scheduled Gate child did not complete: ${JSON.stringify({ outcomeStatus,
         ...(workerErrorCode ? { workerErrorCode } : {}), gateHttpFailures: response.gateHttpFailures(),
         gateResponses: response.gateResponses(), gateQualityCalls: response.gateQualityCalls(),
         gateArtifactIssues: response.gateArtifactIssues(),
+        approvalState, exactApprovalWitnessCount: exactApprovalWitnessIds.length,
         turnStatus: debugSafeEnum(turnState.turnStatus, ["queued", "in_progress", "waiting_for_dependency",
           "waiting_for_approval", "waiting_for_user", "completed", "failed"]),
         rootStatus: debugSafeEnum(turnState.rootStatus, ["running", "waiting", "waiting_for_user", "completed", "failed"]),
@@ -892,12 +923,12 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
 
   it.each([
     { label: "legacy V1", jobCount: 1, scoutCount: 1, selectedJobCount: 1,
-      freshV2Replan: false, persistedLegacyAudit: false },
-    { label: "fresh four-Scout V2", jobCount: 4, scoutCount: 4, selectedJobCount: 2,
-      freshV2Replan: true, persistedLegacyAudit: false },
+      freshV2Replan: false, persistedLegacyAudit: false, recoveryStepCount: 2 },
+    { label: "fresh four-Scout V2 post-Gate plan", jobCount: 4, scoutCount: 4, selectedJobCount: 2,
+      freshV2Replan: true, persistedLegacyAudit: false, recoveryStepCount: 1 },
     { label: "four-Scout V2 with persisted legacy Audit", jobCount: 4, scoutCount: 4, selectedJobCount: 2,
-      freshV2Replan: false, persistedLegacyAudit: true },
-  ])("preserves the scheduled Root behavior for $label", async options => {
+      freshV2Replan: false, persistedLegacyAudit: true, recoveryStepCount: 2 },
+  ])("preserves the Worker Gate continuation for $label with persisted Prepare proof (Web Analyze handoff stubbed)", async options => {
     const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, options)
     fixtureUsers.push(fixture.ids.userId)
     if (options.scoutCount === 1) {
@@ -949,7 +980,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const initialProjectionIdentity = { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId }
     await initialSessionProjection.start(initialProjectionIdentity)
     const initialRootWait = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort,
-      "waiting_for_dependency", undefined, undefined, fixture.turnLease, undefined, true)
+      "waiting_for_dependency", undefined, undefined, fixture.turnLease, undefined, false, true)
     expect(initialRootWait.status).toBe("waiting_for_dependency")
     if (initialRootWait.status !== "waiting_for_dependency" || !initialRootWait.waitId) {
       throw new Error(`scheduled Audit Gate root wait missing: ${JSON.stringify(initialRootWait)}`)
@@ -1023,12 +1054,15 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const projectionIdentity = { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId }
     if (options.freshV2Replan) {
       let rootModelStreamCalls = 0
+      const modelToolCalls: string[] = []
       const resumed = await approveAndResumeScheduledAuditRoot(fixture, response, command, waitPort,
-        () => { rootModelStreamCalls += 1 })
+        () => { rootModelStreamCalls += 1 }, undefined, undefined, true,
+        toolName => { modelToolCalls.push(toolName) })
       const gateProof = resumed.gateProof
       const freshRoot = resumed.root
-      expect(freshRoot.status).not.toBe("completed")
-      expect(rootModelStreamCalls).toBe(1)
+      expect(freshRoot).toMatchObject({ status: "waiting_for_dependency", waitId: expect.any(String) })
+      expect(rootModelStreamCalls).toBe(4)
+      expect(modelToolCalls).toEqual(["agent.list", "agent.plan", "agent.wait"])
       const replanEvents = await pool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
         WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId"=$3 AND "type"='final.rejected'
           AND "payload"->>'code'='scheduled_post_gate_plan_required'`,
@@ -1038,16 +1072,46 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
         blocker: "scheduled_post_gate_plan_required", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK,
         taskId: fixture.ids.rootTaskId })
       const graphAfterReplan = await loadTaskGraph(pool as never, fixture.graphScope, false)
-      expect(graphAfterReplan.state?.revision).toBe(gateProof.graphRevision)
-      expect(graphAfterReplan.snapshot?.nodes).toHaveLength(options.scoutCount + 3)
-      expect(graphAfterReplan.snapshot?.nodes.some(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID
-        || node.templateId === "scheduled.application.execute")).toBe(false)
+      const postGateEvents = await pool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
+        WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId" IS NULL AND "type"=$3 ORDER BY "sequence" DESC LIMIT 2`,
+      [fixture.ids.sessionId, fixture.ids.turnId, SCHEDULED_POST_GATE_HANDOFF_EVENT])
+      expect(postGateEvents.rows).toHaveLength(1)
+      const postGateReceipt = parseScheduledPostGateHandoff(postGateEvents.rows[0]?.payload)
+      expect(postGateReceipt).not.toBeNull()
+      if (!postGateReceipt) throw new Error("scheduled post-Gate plan receipt was not persisted")
+      const gateTask = await taskState(gateTaskId), preparedIds = scheduledGatePreparedJobIds(fixture.prepareProof)
+      const gateEnvelope = preparedIds ? parseScheduledGateTaskEnvelope(gateTask.result, gateTask.status, preparedIds) : null
+      const gateDecisions = debugParseGateDecisions(gateEnvelope?.structuredResult)
+      expect(gateDecisions).not.toBeNull()
+      expect(postGateReceipt.packageRefs).toEqual(gateDecisions?.approvedJobIds)
+      expect(postGateReceipt.executeNodes).toHaveLength(1)
+      expect(postGateReceipt.executeNodes[0]?.packageRefs).toEqual(postGateReceipt.packageRefs)
+      expect(postGateReceipt.auditTaskId).toBeTruthy()
+      expect(graphAfterReplan.state?.revision).toBe(gateProof.graphRevision + 1)
+      expect(graphAfterReplan.snapshot?.nodes).toHaveLength(options.scoutCount + 5)
+      const executeNodes = graphAfterReplan.snapshot?.nodes.filter(node => node.templateId === SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID) ?? []
+      const auditNodes = graphAfterReplan.snapshot?.nodes.filter(node => node.templateId === SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID) ?? []
+      expect(executeNodes).toHaveLength(1)
+      expect(auditNodes).toHaveLength(1)
       expect((await graphCount(fixture)).auditNodes).toBe(0)
+      const plannedTaskIds = [...postGateReceipt.executeNodes.map(node => node.taskId), postGateReceipt.auditTaskId].sort()
+      const durableWait = await pool!.query<{ userId: string; sessionId: string; turnId: string; parentTaskId: string;
+        targetTaskIds: unknown; matchedTaskIds: unknown; status: string; suspendedAt: Date | null; consumedAt: Date | null }>(
+        `SELECT "userId", "sessionId", "turnId", "parentTaskId", "targetTaskIds", "matchedTaskIds", "status", "suspendedAt", "consumedAt"
+          FROM "agent_wait_conditions" WHERE "id"=$1`, [freshRoot.waitId])
+      expect(durableWait.rows[0]).toMatchObject({ userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
+        turnId: fixture.ids.turnId, parentTaskId: fixture.ids.rootTaskId, targetTaskIds: plannedTaskIds,
+        matchedTaskIds: [], status: "waiting", suspendedAt: expect.any(Date), consumedAt: null })
+      const pendingTurn = await pool!.query<{ status: string; leaseOwnerId: string | null }>(
+        `SELECT "status", "leaseOwnerId" FROM "agent_turns" WHERE "id"=$1 AND "sessionId"=$2`,
+        [fixture.ids.turnId, fixture.ids.sessionId])
+      expect(pendingTurn.rows[0]).toEqual({ status: "waiting_for_dependency", leaseOwnerId: null })
       expect(response.gateCalls()).toBe(1)
       return
     }
     if (options.persistedLegacyAudit) await stopRunner()
     const auditReplayCaptures: Array<{ mode: "append_audit" | "resume_audit"; recoveryStepId: string; receipt: unknown }> = []
+    let rootFallbackModelCalls = 0
     let gateProof: Awaited<ReturnType<typeof requireGateProof>> | undefined
     const captureAuditAppendReplay = async (recoveryStepId: string, mode: "append_audit" | "resume_audit",
       recoveryScope: ScheduledAuditRecoveryScope, lease: TurnLease): Promise<void> => {
@@ -1071,15 +1135,18 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       }
     }
     const resumedRoot = await approveAndResumeScheduledAuditRoot(fixture, response, command, waitPort,
-      undefined, captureAuditAppendReplay, prepareRootResume)
+      () => { rootFallbackModelCalls += 1 }, captureAuditAppendReplay, prepareRootResume, true)
     gateProof = resumedRoot.gateProof
     const pendingRoot = resumedRoot.root
+    // Only the persisted Audit fixture resumes without the model fallback; the V1 fixture exercises it.
+    expect(rootFallbackModelCalls).toBe(options.persistedLegacyAudit ? 0 : 1)
     expect(pendingRoot.status).toBe("waiting_for_dependency")
     if (pendingRoot.status !== "waiting_for_dependency" || !pendingRoot.waitId) {
       throw new Error(`scheduled Audit root wait missing: ${JSON.stringify(pendingRoot)}`)
     }
     const pendingTrace = await readScheduledAuditRootRecoveryTrace(fixture)
-    expectScheduledAuditRecoveryTrace(pendingTrace, fixture, options.persistedLegacyAudit ? 2 : 1, "waiting_for_tool", null)
+    expectScheduledAuditRecoveryTrace(pendingTrace, fixture, options.recoveryStepCount, "waiting_for_tool", null,
+      options.scoutCount === 1 ? [1] : [])
     expect(pendingTrace.steps[0]?.id).toBe(gateRecoveryStepId)
     expect(pendingTrace.steps[0]?.completionEvents[0]?.payload).toMatchObject({
       status: "waiting_for_dependency", waitId: initialGateWait.waitId,
@@ -1087,12 +1154,13 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(pendingTrace.steps[0]?.waits.some(wait => wait.id === initialGateWait.waitId)).toBe(true)
     const currentRecoveryStep = pendingTrace.steps.at(-1)
     if (!currentRecoveryStep) throw new Error("scheduled Audit current recovery Step missing")
-    expect(currentRecoveryStep.completionEvents[0]?.payload).toMatchObject({
-      status: "waiting_for_dependency", waitId: pendingRoot.waitId,
-    })
+    expect(currentRecoveryStep.completionEvents[0]?.payload).toMatchObject(options.scoutCount === 1
+      ? { status: "waiting_for_dependency" } : { status: "waiting_for_dependency", waitId: pendingRoot.waitId })
     expect(currentRecoveryStep.waits.some(wait => wait.id === pendingRoot.waitId)).toBe(true)
     const auditWait = { status: "waiting_for_dependency" as const, waitId: pendingRoot.waitId }
     expect(auditWait.waitId).not.toBe(initialGateWait.waitId)
+    const pendingAuditWait = currentRecoveryStep.waits.find(wait => wait.id === auditWait.waitId)
+    if (!pendingAuditWait) throw new Error("scheduled Audit durable wait missing from its current recovery Step")
     // The proof was checked before the real approval wakeup advanced the Turn lease.
     expect(resumedRoot.turnOutcome).toMatchObject({ status: "waiting_for_dependency" })
     const pendingRootState = await readRootTurnState(fixture)
@@ -1126,6 +1194,22 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(firstTaskOutcome).toMatchObject({ status: "retrying" })
     expect(response.executeCalls()).toBe(1)
     const firstHttpResponse = response.firstExecuteResponse()
+    if (options.scoutCount === 1) {
+      const failures = response.executeHttpFailures()
+      expect(firstHttpResponse).toBeUndefined()
+      expect(failures).toHaveLength(1)
+      expect(failures[0]).toMatchObject({ status: 409, errorCode: "scheduled_pipeline_audit_gate_proof_invalid",
+        auditPreflight: { prepareSource: "rejected", gateProofCurrent: "passed",
+          prepareSourceTrace: { candidateEvents: { reached: true, rowCount: 2 },
+            recoverySteps: [expect.objectContaining({ markerValid: true }), expect.objectContaining({ markerValid: false })] } } })
+      expect(response.gateQualityCalls()).toEqual([])
+      expect(response.customRoleLookups()).toEqual([])
+      expect(response.customModelCalls()).toEqual([])
+      await stopRunner()
+      expect(await taskState(auditTaskId)).toMatchObject({ status: "queued", attemptCount: 1, result: null })
+      expect(await readExecutionState(fixture)).toMatchObject({ status: "running", state: { nextStage: "gate" } })
+      return
+    }
     if (!firstHttpResponse) throw new Error(`Scheduled Audit execute response missing: ${JSON.stringify(response.executeHttpFailures())}`)
     expect(firstHttpResponse).toBeDefined()
     expect(firstHttpResponse?.status).toBe(200)
@@ -1263,11 +1347,13 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       rootStatus: "waiting", sessionStatus: "running" })
     const turnJobs: TurnJobPayload[] = []
     expect(await dispatchPendingTurnOutbox(pool as never, createUniqueTurnDispatchQueue(turnJobs))).toBeGreaterThanOrEqual(1)
-    expect(turnJobs).toHaveLength(1)
-    expect(turnJobs.map(job => job.turnId)).toEqual([fixture.ids.turnId])
+    expect(turnJobs.length).toBeGreaterThanOrEqual(1)
+    expect(turnJobs.every(job => job.turnId === fixture.ids.turnId)).toBe(true)
+    const resumeJob = turnJobs.at(-1)
+    if (!resumeJob) throw new Error("scheduled Audit Turn dispatch missing")
     let terminalRoot: TurnEngineResult | undefined
     let resumedLease: TurnLease | undefined
-    const resumedJob = await runTurnJob({ data: turnJobs[0]!, attemptsMade: 0 }, { pool: pool as never,
+    const resumedJob = await runTurnJob({ data: resumeJob, attemptsMade: 0 }, { pool: pool as never,
       requireCanonicalAutomationMode: true, heartbeatMs: 60_000,
       async execute({ lease }) {
         resumedLease = lease
@@ -1281,15 +1367,14 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
           verifyAudit({ ...proof, attemptCount: 1 }))
         let staleRoot: TurnEngineResult
         try { staleRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort,
-          undefined, undefined, undefined, lease) }
+          undefined, undefined, undefined, lease, undefined, false, true) }
         finally { staleAuditProof.mockRestore() }
-        expect(staleRoot).toMatchObject({ status: "waiting_for_dependency", waitId: auditWait.waitId,
-          errorCode: "scheduled_audit_completion_unverified" })
+        expect(staleRoot).toMatchObject({ status: "waiting_for_dependency", errorCode: "scheduled_audit_completion_unverified" })
         expect(staleRoot).not.toMatchObject({ status: "completed" })
         expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "in_progress",
           turnLeaseOwnerId: lease.ownerId, rootStatus: "running", sessionStatus: "running" })
         terminalRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort,
-          undefined, undefined, captureTerminalAuditProof, lease)
+          undefined, undefined, captureTerminalAuditProof, lease, undefined, false, true)
         await rootStore.finish({ lease, rootTaskId: fixture.ids.rootTaskId, result: terminalRoot })
         await sessionProjection.finish({ ...projectionIdentity, result: { status: terminalRoot.status } })
         return terminalRoot
@@ -1306,16 +1391,19 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(terminalAuditProof?.current?.report).toEqual(response.report())
     expect(terminalAuditProof?.staleAttempt).toBeNull()
     const terminalTrace = await readScheduledAuditRootRecoveryTrace(fixture)
-    expectScheduledAuditRecoveryTrace(terminalTrace, fixture, 4, "completed", null)
+    expectScheduledAuditRecoveryTrace(terminalTrace, fixture, 4, "completed", null, options.scoutCount === 1 ? [1] : [])
     expect(terminalTrace.candidateEvent.id).toBe(pendingTrace.candidateEvent.id)
     expect(terminalTrace.candidatePayload).toEqual(pendingTrace.candidatePayload)
     expect(terminalTrace.sourceStep).toEqual(pendingTrace.sourceStep)
     expect(terminalTrace.steps.slice(0, 2).map(step => step.id)).toEqual(pendingTrace.steps.map(step => step.id))
     expect(terminalTrace.steps[2]).toMatchObject({ status: "waiting_for_tool",
       errorCode: "scheduled_audit_completion_unverified", marker: { recoveryCursor: 3 } })
-    expect(terminalTrace.steps[2]?.completionEvents[0]?.payload).toMatchObject({ status: "waiting_for_dependency",
-      waitId: auditWait.waitId })
-    expect(terminalTrace.steps[2]?.waits.some(wait => wait.id === auditWait.waitId)).toBe(true)
+    expect(terminalTrace.steps[2]?.completionEvents[0]?.payload).toMatchObject({ status: "waiting_for_dependency" })
+    expect(terminalTrace.steps[1]?.waits.find(wait => wait.id === auditWait.waitId)).toMatchObject({
+      id: pendingAuditWait.id, stepId: pendingAuditWait.stepId, status: "ready", mode: pendingAuditWait.mode,
+      targetTaskIds: pendingAuditWait.targetTaskIds, idempotencyKey: pendingAuditWait.idempotencyKey,
+    })
+    expect(terminalTrace.steps[2]?.waits.some(wait => wait.id === auditWait.waitId)).toBe(false)
     expect(terminalTrace.steps[3]).toMatchObject({ status: "completed", errorCode: null, marker: { recoveryCursor: 4 } })
     expect(terminalTrace.steps[3]?.completionEvents[0]?.payload).toEqual({ stepId: terminalTrace.steps[3]?.id,
       status: "completed", taskId: fixture.ids.rootTaskId })
@@ -1345,8 +1433,11 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
   afterAuditWait?: (recoveryStepId: string, mode: "append_audit" | "resume_audit", scope: ScheduledAuditRecoveryScope,
     lease: TurnLease) => Promise<void>,
   afterAuditCompletion?: (recoveryStepId: string, mode: "append_audit" | "resume_audit") => Promise<void>,
-  activeLease: TurnLease = fixture.turnLease, onModelStream?: () => void, useDirectGateWaitContinuation = false): Promise<TurnEngineResult> {
+  activeLease: TurnLease = fixture.turnLease, onModelStream?: () => void, useDirectGateWaitContinuation = false,
+  useWorkerContinuationContractStub = false, onModelToolCall?: (toolName: string) => void): Promise<TurnEngineResult> {
   const phases: Array<{ phase: string; outcome?: string; errorClass?: string; errorCode?: string }> = []
+  const continuationContractStages: string[] = []
+  let verifiedPrepareProof: unknown
   const safeStatuses = new Set(["ready", "blocked", "not_registered", "completed", "waiting_for_dependency", "waiting_for_choice",
     "waiting_for_external_user", "waiting_for_user", "invalid", "failed", "interrupted"])
   const safeErrorCodes = new Set([...diagnosticAuditFailureReasons, ...diagnosticGateErrorCodes,
@@ -1359,13 +1450,19 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
     "task_graph_scope_invalid", "task_graph_session_fenced", "task_graph_turn_fenced", "task_graph_parent_fenced",
     "task_graph_step_fenced", "task_graph_revision_invalid", "task_graph_task_scope_invalid",
     "task_graph_verification_report_invalid", "task_graph_receipt_invalid", "scheduled_audit_resume_cancelled"])
+  for (const code of ["scheduled_prepare_owner_invalid", "scheduled_prepare_analyze_revision_changed", "scheduled_prepare_analyst_missing",
+    "scheduled_prepare_command_unavailable", "scheduled_prepare_choice_wait_invalid", "scheduled_prepare_choice_invalid",
+    "scheduled_prepare_schedule_invalid", "scheduled_prepare_wait_invalid", "scheduled_prepare_completion_unverified"]) safeErrorCodes.add(code)
+  for (const code of ["question_invalid_owner", "question_not_current", "question_receipt_missing", "question_receipt_malformed",
+    "question_usage_unavailable", "question_conflict"]) safeErrorCodes.add(code)
   const errorDiagnostic = (error: unknown): Pick<typeof phases[number], "errorClass" | "errorCode"> => {
     const name = error instanceof Error ? error.constructor.name : "NonError"
-    const errorClass = new Set(["AbortError", "DatabaseError", "Error", "RangeError", "TaskGraphCommandError",
-      "TurnStateRefreshRetryError", "TypeError"]).has(name) ? name : error instanceof Error ? "OtherError" : "NonError"
+    const errorClass = new Set(["AbortError", "AssertionError", "DatabaseError", "Error", "RangeError", "TaskGraphCommandError",
+      "TurnStateRefreshRetryError", "TypeError"]).has(name) ? name
+      : /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(name) ? name : error instanceof Error ? "OtherError" : "NonError"
     const row = debugRecord(error), candidates = [row?.code, error instanceof Error ? error.message : undefined]
     const code = candidates.find((value): value is string => typeof value === "string"
-      && (safeErrorCodes.has(value) || /^[0-9A-Z]{5}$/.test(value)))
+      && (safeErrorCodes.has(value) || /^(scheduled|task_graph|agent|root)_[a-z0-9_]+$/.test(value) || /^[0-9A-Z]{5}$/.test(value)))
     return { errorClass, ...(code ? { errorCode: /^[0-9A-Z]{5}$/.test(code) ? `pg_sqlstate_${code}` : code } : {}) }
   }
   const outcome = (value: unknown): string => {
@@ -1392,22 +1489,78 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
       turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: fixture.owner.rootAttemptCount }
     const executionOwner: TurnExecutionOwnerFence = { ...fixture.turnExecutionOwner, ownerId: lease.ownerId,
       leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt }
-    const store = createPgTurnEngineStore(pool as never), candidateStore = createScheduledPipelineCandidateStore(pool as never, store)
+    const baseStore = createPgTurnEngineStore(pool as never)
+    const store = { ...baseStore,
+      async startStep(input: Parameters<typeof baseStore.startStep>[0]) {
+        phases.push({ phase: "root.step.start", outcome: "called" })
+        try { return await baseStore.startStep(input) }
+        catch (error: unknown) { phases.push({ phase: "root.step.start.error", ...errorDiagnostic(error) }); throw error }
+      },
+      async readPendingQuestion(input: Parameters<NonNullable<typeof baseStore.readPendingQuestion>>[0]) {
+        try {
+          const result = await baseStore.readPendingQuestion!(input)
+          phases.push({ phase: "root.question.recovery", outcome: result.status })
+          return result
+        } catch (error: unknown) { phases.push({ phase: "root.question.recovery.error", ...errorDiagnostic(error) }); throw error }
+      },
+      async waitForQuestion(input: Parameters<NonNullable<typeof baseStore.waitForQuestion>>[0]) {
+        try {
+          const result = await baseStore.waitForQuestion!(input)
+          phases.push({ phase: "root.question.wait", outcome: result.status })
+          return result
+        } catch (error: unknown) { phases.push({ phase: "root.question.wait.error", ...errorDiagnostic(error) }); throw error }
+      },
+      async appendEvent(input: Parameters<typeof baseStore.appendEvent>[0]) {
+        try { return await baseStore.appendEvent(input) }
+        catch (error: unknown) { phases.push({ phase: "root.event.append.error", outcome: input.type, ...errorDiagnostic(error) }); throw error }
+      },
+    }
+    const candidateStore = createScheduledPipelineCandidateStore(pool as never, baseStore)
     const rootStore = createPgRootTaskStore(pool as never)
-    await observe("root.ensure", () => rootStore.ensure({ lease, goal: "Finish the scheduled automation only after its current Audit proof",
+    await observe("root.ensure", () => rootStore.ensure({ lease, goal: "Prepare the verified scheduled Analyze checkpoint",
       allowedActions: scheduledGateRootActions() }), () => "ensured")
     const recoveredCandidate = await observe("candidate.read", () => candidateStore.read({ owner: executionOwner,
-      rootAttemptCount: owner.rootAttemptCount }), value => value ? "present" : "absent")
-    if (!recoveredCandidate) throw new Error("scheduled Audit root candidate missing")
-    const resumeOrdinal = recoveredCandidate.recoveryTail?.ordinal ?? recoveredCandidate.finalStepOrdinal
+      rootAttemptCount: owner.rootAttemptCount }), value => value === undefined ? "missing" : value === null ? "invalidated" : "present")
+    if (!recoveredCandidate && !onModelStream) throw new Error("scheduled Audit root candidate missing")
+    let resumeOrdinal = recoveredCandidate?.recoveryTail?.ordinal ?? recoveredCandidate?.finalStepOrdinal
+    let resumeStepCount = (resumeOrdinal ?? -1) + 1, resumeToolCallCount = 0
+    let resumeInputThroughSequence = 0n, resumeConsumedInputIds: string[] = []
+    if (!recoveredCandidate) {
+      const [latestStep, rootRow] = await Promise.all([
+        pool!.query<{ ordinal: number | string; inputThroughSequence: string | number; consumedInputIds: unknown }>(
+          `SELECT "ordinal", "inputThroughSequence", "consumedInputIds" FROM "agent_steps"
+           WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId"=$3 ORDER BY "ordinal" DESC LIMIT 1`,
+          [fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId]),
+        pool!.query<{ result: unknown }>(`SELECT "result" FROM "sub_agent_tasks"
+          WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3`, [fixture.ids.rootTaskId, fixture.ids.sessionId, fixture.ids.turnId]),
+      ])
+      const last = latestStep.rows[0], rootResult = debugRecord(rootRow.rows[0]?.result)
+      const inputCursor = String(last?.inputThroughSequence ?? "")
+      const consumed = typeof last?.consumedInputIds === "string"
+        ? (() => { try { return JSON.parse(last.consumedInputIds) as unknown } catch { return null } })()
+        : last?.consumedInputIds
+      if (!last || !rootResult || !Number.isSafeInteger(Number(last.ordinal)) || !/^(0|[1-9]\d{0,18})$/.test(inputCursor)
+        || BigInt(inputCursor) > 9_223_372_036_854_775_807n || !Array.isArray(consumed)
+        || !consumed.every((value): value is string => typeof value === "string") || !Number.isSafeInteger(rootResult?.stepCount)
+        || !Number.isSafeInteger(rootResult?.toolCallCount)) {
+        throw new Error("scheduled_root_fresh_model_resume_state_invalid")
+      }
+      resumeOrdinal = Number(last.ordinal)
+      resumeStepCount = Number(rootResult.stepCount)
+      resumeToolCallCount = Number(rootResult.toolCallCount)
+      resumeInputThroughSequence = BigInt(inputCursor)
+      resumeConsumedInputIds = consumed
+    }
+    if (resumeOrdinal === undefined || !Number.isSafeInteger(resumeOrdinal) || resumeOrdinal < 0) {
+      throw new Error("scheduled_root_resume_ordinal_invalid")
+    }
     phases.push({ phase: "owner_attempt_binding", outcome: owner.rootAttemptCount === fixture.owner.rootAttemptCount
       && owner.turnLeaseOwnerId === lease.ownerId && owner.turnLeaseVersion === lease.leaseVersion
       && executionOwner.userId === owner.userId && executionOwner.sessionId === owner.sessionId
       && executionOwner.turnId === owner.turnId && executionOwner.taskId === owner.rootTaskId
       && executionOwner.ownerId === lease.ownerId && executionOwner.leaseVersion === lease.leaseVersion ? "matched" : "mismatch" })
-    phases.push({ phase: "candidate_step_binding", outcome: recoveredCandidate.finalStepId === fixture.rootQuestionStepId
-      && Number.isSafeInteger(recoveredCandidate.finalStepOrdinal) ? "matched_historical_step" : "other_step" })
-    const tracedFetcher: typeof fetch = (...args) => observe("web.fetch", () => fetcher(...args), response => response.ok ? "http_ok" : "http_non_ok")
+    phases.push({ phase: "candidate_step_binding", outcome: recoveredCandidate?.finalStepId === fixture.rootQuestionStepId
+      && Number.isSafeInteger(recoveredCandidate?.finalStepOrdinal) ? "matched_historical_step" : "fresh_model_fallback" })
     const prepareContinuationBase = createScheduledAutomationPrepareContinuation({ commandPort, waitPort,
       async verifyReadyPrepare({ scope, prepareTaskId }) {
         const graph = await loadTaskGraph(pool as never, scope, false), current = currentTaskGraph(graph), task = graph.tasks.get(prepareTaskId)
@@ -1416,8 +1569,117 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
           snapshot: graph.snapshot, current, tasks: graph.tasks, structuredResult: debugRecord(task.result)?.structuredResult,
           completionGraphRevision: current.revision, referenceVerificationMode: { phase: "persisted_gate" } })
       } })
-    const prepareContinuation: typeof prepareContinuationBase = input => observe("continue_after_analyze",
-      () => prepareContinuationBase(input))
+    const prepareContinuation: typeof prepareContinuationBase = async input => {
+      const result = await observe("continue_after_analyze", async () => {
+        if (!useWorkerContinuationContractStub) return prepareContinuationBase(input)
+        expect(input.owner).toMatchObject({ userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
+          turnId: fixture.ids.turnId, rootTaskId: fixture.ids.rootTaskId, rootAttemptCount: fixture.owner.rootAttemptCount })
+        expect(input.attestation).toEqual(fixture.attestation)
+        expect(input.proof).toEqual(fixture.handoff)
+        const graph = await loadTaskGraph(pool as never, fixture.graphScope, false)
+        const task = graph.tasks.get(fixture.ids.prepareTaskId)
+        if (!graph.snapshot || !task || !Number.isSafeInteger(task.attemptCount)) {
+          throw new Error("scheduled_prepare_persisted_task_missing")
+        }
+        const verification = await verifyScheduledPrepareTaskGraphEvidence(pool as never, {
+          scope: { ...fixture.graphScope, taskId: task.id, attemptCount: task.attemptCount! }, snapshot: graph.snapshot,
+          current: currentTaskGraph(graph), tasks: graph.tasks, structuredResult: debugRecord(task.result)?.structuredResult,
+          completionGraphRevision: currentTaskGraph(graph).revision, referenceVerificationMode: { phase: "persisted_gate" },
+          checkpointStage: "gate",
+        })
+        if (!verification.verified) throw new Error(verification.reasonCode)
+        const persisted = await loadPersistedScheduledPrepareProof(pool as never, fixture.graphScope, task.id, task.result,
+          input.proof.continuationKey, fixture.prepareProof.completion.wait.waitId)
+        if (!persisted) throw new Error("scheduled_prepare_persisted_wait_missing")
+        const prepareProof = buildScheduledPrepareTaskGraphProof(verification.facts, persisted.completion.wait)
+        if (!prepareProof || canonicalTaskGraphJson(prepareProof) !== canonicalTaskGraphJson(fixture.prepareProof)) {
+          throw new Error("scheduled_prepare_persisted_proof_mismatch")
+        }
+        return { status: "ready" as const, prepareProof,
+          choice: { required: true as const, status: "answered" as const, scheduledWaitId: fixture.prepareChoiceWaitId } }
+      })
+      if (result.status === "ready") {
+        verifiedPrepareProof = result.prepareProof
+        if (useWorkerContinuationContractStub) continuationContractStages.push("prepare_verified")
+      }
+      return result
+    }
+    const continuationFetcher: typeof fetch = async (input, init) => {
+      if (!useWorkerContinuationContractStub) return fetcher(input, init)
+      try {
+        const request = new Request(input, init), payload = debugRecord(await request.clone().json().catch(() => null))
+        if (!payload || payload.action !== undefined) return fetcher(request)
+        const requestOwner = debugRecord(payload.owner), attestation = debugRecord(payload.attestation)
+        const attestationOwner = debugRecord(attestation?.owner)
+        expect(requestOwner).toMatchObject({ userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
+          turnId: fixture.ids.turnId, rootTaskId: fixture.ids.rootTaskId, rootAttemptCount: fixture.owner.rootAttemptCount })
+        expect(attestationOwner).toEqual(requestOwner)
+        expect(attestation).toMatchObject({ snapshotDigest: fixture.attestation.snapshotDigest,
+          evidenceDigest: fixture.attestation.evidenceDigest, graphRevision: fixture.attestation.graphRevision })
+        expect(fixture.handoff).toMatchObject({ status: "analyze_checkpointed", continuationKey: fixture.continuationKey,
+          executionId: fixture.executionOwner.executionId, executionAttemptCount: fixture.executionOwner.executionAttemptCount })
+        phases.push({ phase: "worker.continuation.owner_attestation", outcome: "matched" })
+        if (!Object.hasOwn(payload, "prepareProof")) {
+          expect(continuationContractStages).toEqual([])
+          continuationContractStages.push("analyze_proof")
+          return new Response(JSON.stringify(fixture.handoff), { status: 200, headers: { "content-type": "application/json" } })
+        }
+        expect(continuationContractStages).toEqual(["analyze_proof", "prepare_verified"])
+        phases.push({ phase: "worker.continuation.stage_binding", outcome: "matched" })
+        expect(payload.prepareProof).toEqual(verifiedPrepareProof)
+        phases.push({ phase: "worker.continuation.proof_object", outcome: "matched" })
+        expect(payload.scheduledWaitId).toBe(fixture.prepareChoiceWaitId)
+        phases.push({ phase: "worker.continuation.choice_wait", outcome: "matched" })
+        const proof = debugRecord(payload.prepareProof), receipt = debugRecord(proof?.receipt)
+        expect(debugRecord(proof?.result)).toEqual(fixture.prepareProof.result)
+        phases.push({ phase: "worker.continuation.result_binding", outcome: "matched" })
+        const receiptOwner = debugRecord(receipt?.owner), receiptChecks = [
+          ["continuation_key", receipt?.continuationKey === fixture.prepareProof.receipt.continuationKey],
+          ["checkpoint_digest", receipt?.checkpointDigest === fixture.prepareProof.receipt.checkpointDigest],
+          ["snapshot_digest", receipt?.snapshotDigest === fixture.attestation.snapshotDigest],
+          ["evidence_digest", receipt?.evidenceDigest === fixture.attestation.evidenceDigest],
+          ["owner_user", receiptOwner?.userId === fixture.ids.userId],
+          ["owner_session", receiptOwner?.sessionId === fixture.ids.sessionId],
+          ["owner_turn", receiptOwner?.turnId === fixture.ids.turnId],
+          ["owner_root", receiptOwner?.rootTaskId === fixture.ids.rootTaskId],
+          ["owner_execution", receiptOwner?.executionId === fixture.executionOwner.executionId],
+          ["owner_execution_attempt", receiptOwner?.executionAttemptCount === fixture.executionOwner.executionAttemptCount],
+        ] as const
+        const receiptMismatches = receiptChecks.filter(([, matches]) => !matches).map(([name]) => name)
+        phases.push({ phase: "worker.continuation.receipt_binding", outcome: receiptMismatches.length ? receiptMismatches.join(",") : "matched" })
+        if (receiptMismatches.length) throw new Error("scheduled_pipeline_handoff_receipt_invalid")
+        phases.push({ phase: "worker.continuation.proof_binding", outcome: "matched" })
+        const stored = await pool!.query<{ checkpoint: string; state: unknown }>(
+          `SELECT "checkpoint", "state" FROM "agent_executions" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`,
+          [fixture.executionOwner.executionId, fixture.ids.userId, fixture.ids.sessionId])
+        const state = debugRecord(stored.rows[0]?.state)
+        expect(stored.rows).toHaveLength(1)
+        expect(stored.rows[0]?.checkpoint).toBe("gate")
+        expect(state).toMatchObject({ nextStage: "gate", scheduledTaskGraphScheduledWaitId: fixture.prepareChoiceWaitId,
+          scheduledTaskGraphContinuation: { key: fixture.continuationKey } })
+        expect(Array.isArray(state?.scheduledTaskGraphPreparedArtifacts)).toBe(true)
+        phases.push({ phase: "worker.continuation.persisted_checkpoint", outcome: "matched" })
+        continuationContractStages.push("gate_checkpoint")
+        return new Response(JSON.stringify({ status: "gate_checkpointed" }), { status: 200, headers: { "content-type": "application/json" } })
+      } catch (error: unknown) {
+        phases.push({ phase: "worker.continuation.fetch.error", ...errorDiagnostic(error) })
+        throw error
+      }
+    }
+    const tracedFetcher: typeof fetch = async (...args) => {
+      const response = await continuationFetcher(...args)
+      const payload = debugRecord(await response.clone().json().catch(() => null))
+      const responseStatus = typeof payload?.status === "string"
+        && new Set(["completed", "waiting_for_user", "analyze_checkpointed", "gate_checkpointed", "blocked", "accepted"]).has(payload.status)
+        ? payload.status : "unknown"
+      const responseError = typeof payload?.errorCode === "string" && diagnosticGateErrorCodes.has(payload.errorCode)
+        ? payload.errorCode : undefined
+      const duplicate = payload?.duplicate === true ? ":duplicate" : ""
+      const responseKeys = payload ? Object.keys(payload).filter(key => ["status", "duplicate", "errorCode", "waitId", "stage"].includes(key)).sort().join(",") : "none"
+      phases.push({ phase: useWorkerContinuationContractStub ? "worker.continuation.fetch" : "web.fetch",
+        outcome: `${response.status}:${responseStatus}${duplicate}${responseError ? `:${responseError}` : ""}:${responseKeys}` })
+      return response
+    }
     const gateContinuationBase = createScheduledAutomationGateContinuation({ pool: pool as never, commandPort, waitPort,
       nativeQuestionWaitEnabled: false, fetcher: tracedFetcher })
     const gateContinuation: typeof gateContinuationBase = async input => {
@@ -1454,25 +1716,172 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
         continueAfterAnalyze: prepareContinuation, continueAfterGate: gateContinuation, fetcher: tracedFetcher,
         stageCandidate: input => observe("candidate.stage", () => candidateStore.stage(input), () => "staged"),
         onWebAccepted() { phases.push({ phase: "web.accepted", outcome: "called" }) },
-        rootAttemptCount: owner.rootAttemptCount, recoveredCandidate })
+        rootAttemptCount: owner.rootAttemptCount, recoveredCandidate: recoveredCandidate ?? undefined })
+    const scheduledCompletion = completionGate?.[SCHEDULED_PIPELINE_COMPLETION]
+    if (completionGate && scheduledCompletion) completionGate[SCHEDULED_PIPELINE_COMPLETION] = async input => {
+      try {
+        const result = await scheduledCompletion(input), row = debugRecord(result)
+        const status = typeof row?.status === "string"
+          && new Set(["completed", "replan", "waiting_for_dependency", "waiting_for_user", "waiting_for_scheduled_gate_choice",
+            "waiting_for_external_user", "blocked"]).has(row.status) ? row.status : "unknown"
+        const errorCode = typeof row?.errorCode === "string" && safeErrorCodes.has(row.errorCode) ? row.errorCode : undefined
+        phases.push({ phase: "scheduled.completion", outcome: `${status}${errorCode ? `:${errorCode}` : ""}` })
+        return result
+      } catch (error: unknown) { phases.push({ phase: "scheduled.completion.error", ...errorDiagnostic(error) }); throw error }
+    }
     const profile: ModelAdapter["profile"] = { provider: "fixture", model: "scheduled-audit-root", nativeTools: true,
       structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false,
       supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false,
       supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null,
       maxOutputTokens: 128, costClass: "low" }
+    const coordinationTools = createCoordinationTools({ manager: new AgentTreeManager(new PgSubagentTaskStore(pool as never)),
+      store: new PgCoordinationStore(pool as never), wait: waitPort,
+      nativeCoordination: { enabled: true, commandPort, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
+        parentLeaseOwner: lease.ownerId, parentAttemptCount: () => owner.rootAttemptCount } })
+      .filter(tool => tool.name === "agent.list" || tool.name === "agent.wait")
+    const appendPostGatePlan = commandPort.appendScheduledPostGatePlan
+    const planningCommandPort = { ...commandPort,
+      async appendScheduledPostGatePlan(input: Parameters<NonNullable<typeof commandPort.appendScheduledPostGatePlan>>[0]) {
+        if (!appendPostGatePlan) throw new Error("scheduled_post_gate_unavailable")
+        try { return await appendPostGatePlan(input) }
+        catch (error: unknown) {
+          phases.push({ phase: "root.post_gate.command_error", ...errorDiagnostic(error),
+            outcome: error instanceof Error ? error.message.slice(0, 160) : "non-error" })
+          throw error
+        }
+      } }
+    const planTool = createTaskGraphPlanningTool({ commandPort: planningCommandPort, templates: scheduledPostGateTaskTemplates(),
+      turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId,
+      parentAttemptCount: () => owner.rootAttemptCount })
+    const tools = [...coordinationTools, planTool]
+    const toolsByName = new Map(tools.map(tool => [tool.name, tool]))
+    let modelStreamCallCount = 0
     const model: ModelAdapter = { id: "scheduled-audit-root", profile,
-      async *stream() { onModelStream?.(); throw new Error("scheduled Audit root candidate replay unexpectedly called the model") } }
+      async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        const callNumber = ++modelStreamCallCount
+        onModelStream?.()
+        phases.push({ phase: "root.model.stream", outcome: recoveredCandidate ? "unexpected_candidate_replay" : "fresh_fallback" })
+        if (recoveredCandidate) throw new Error("scheduled Audit root candidate replay unexpectedly called the model")
+        if (callNumber === 1) {
+          yield { type: "text_delta", text: "The scheduled Gate review is ready for the next step." }
+          yield { type: "completed", finishReason: "stop" }
+          return
+        }
+        if (callNumber === 2) {
+          if (!JSON.stringify(request.messages).includes(SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)) {
+            throw new Error("scheduled_post_gate_instruction_missing_before_list")
+          }
+          phases.push({ phase: "root.model.tool_call", outcome: "agent.list" })
+          onModelToolCall?.("agent.list")
+          yield { type: "tool_call_completed", callId: "scheduled-post-gate-list", name: "agent.list",
+            arguments: { includeTerminal: true } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        if (callNumber === 3) {
+          const listed = JSON.stringify(request.messages)
+          const gateTaskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
+          const gateTask = await taskState(gateTaskId), preparedIds = scheduledGatePreparedJobIds(fixture.prepareProof)
+          const gateEnvelope = preparedIds ? parseScheduledGateTaskEnvelope(gateTask.result, gateTask.status, preparedIds) : null
+          const decisions = debugParseGateDecisions(gateEnvelope?.structuredResult)
+          const planning = await commandPort.readScheduledPostGatePlanningContext?.({ scope: recoveryScope })
+          const listBinding = [planning?.status ?? "missing", decisions ? "decisions" : "no_decisions",
+            listed.includes(gateTaskId) ? "gate_listed" : "gate_missing",
+            listed.includes("approvedJobIds") ? "approvals_listed" : "approvals_missing",
+            decisions?.approvedJobIds.every(id => listed.includes(id)) ? "packages_listed" : "packages_missing"].join(",")
+          phases.push({ phase: "root.post_gate.list_binding", outcome: listBinding })
+          if (!planning || planning.status !== "awaiting_plan" || !decisions || !listed.includes(gateTaskId)
+            || !listed.includes("approvedJobIds") || decisions.approvedJobIds.some(id => !listed.includes(id))) {
+            throw new Error("scheduled_post_gate_list_result_missing")
+          }
+          if (!debugSameJson(planning.packageRefs, decisions.approvedJobIds) || planning.packageRefs.length > 50) {
+            throw new Error("scheduled_post_gate_approved_package_binding_invalid")
+          }
+          phases.push({ phase: "root.model.tool_call", outcome: "agent.plan" })
+          const proposal = { expectedRevision: planning.graphRevision, nodes: [
+            { key: "scheduled-execute-1", templateId: SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID,
+              goal: SCHEDULED_POST_GATE_EXECUTE_GOAL, successCriteria: [...SCHEDULED_POST_GATE_EXECUTE_CRITERIA],
+              dependsOn: ["gate"], packageRefs: [...planning.packageRefs] },
+            { key: SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID,
+              goal: SCHEDULED_POST_GATE_AUDIT_GOAL, successCriteria: [...SCHEDULED_POST_GATE_AUDIT_CRITERIA],
+              dependsOn: ["scheduled-execute-1"] },
+          ] }
+          onModelToolCall?.("agent.plan")
+          yield { type: "tool_call_completed", callId: "scheduled-post-gate-plan", name: "agent.plan", arguments: proposal }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        if (callNumber === 4) {
+          const planning = await commandPort.readScheduledPostGatePlanningContext?.({ scope: recoveryScope })
+          phases.push({ phase: "root.post_gate.plan_binding", outcome: `${planning?.status ?? "missing"}:execute-${planning?.status === "planned" ? planning.receipt.executeNodes.length : 0}:packages-${planning?.status === "planned" ? planning.receipt.packageRefs.length : 0}` })
+          if (!planning || planning.status !== "planned" || planning.receipt.executeNodes.length !== 1) {
+            throw new Error("scheduled_post_gate_plan_receipt_missing")
+          }
+          const taskIds = [...planning.receipt.executeNodes.map(node => node.taskId), planning.receipt.auditTaskId]
+          if (new Set(taskIds).size !== 2 || planning.receipt.packageRefs.length > 50) {
+            throw new Error("scheduled_post_gate_wait_targets_invalid")
+          }
+          phases.push({ phase: "root.model.tool_call", outcome: "agent.wait" })
+          onModelToolCall?.("agent.wait")
+          yield { type: "tool_call_completed", callId: "scheduled-post-gate-wait", name: "agent.wait",
+            arguments: { idempotencyKey: `scheduled-post-gate-wait:${fixture.ids.rootTaskId}`, taskIds,
+              mode: "all", timeoutMs: 30_000 } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        throw new Error("scheduled_post_gate_fixture_model_step_limit")
+      } }
     const options: TurnEngineOptions = { lease, rootTaskId: fixture.ids.rootTaskId, taskId: fixture.ids.rootTaskId,
-      scope: { userId: fixture.ids.userId }, goal: "Complete the verified scheduled automation",
+      scope: { userId: fixture.ids.userId }, actorRole: "orchestrator", capabilities: ["coordination", "canManageChildren", "read"],
+      goal: "Prepare the verified scheduled Analyze checkpoint",
       snapshot: { system: [], profile: [], steerHistory: [], toolObservations: [],
         businessRefs: fixture.preparedJobIds.map(id => ({ id, kind: "job" as const, ownerId: fixture.ids.userId })) },
-      contextBuilder: { async build(request) { return { schemaVersion: "agent-harness.v2", sessionId: request.sessionId,
-        turnId: request.turnId, stepId: request.stepId, inputThroughSequence: 0n, consumedInputIds: [], blocks: [], canonicalJson: "{}" } } },
-      store, model, tools: [], executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName,
-        toolVersion: call.toolVersion, status: "completed", errorCode: null }), completionGate,
-      recoveredFinalCandidate: recoveredCandidate.candidateText,
-      resume: { nextOrdinal: resumeOrdinal + 1, stepCount: resumeOrdinal + 1,
-        toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [],
+      contextBuilder: { async build(request) {
+        const asText = (value: unknown) => typeof value === "string" ? value : JSON.stringify(value) ?? "null"
+        const postGateContext = await commandPort.readScheduledPostGatePlanningContext?.({ scope: recoveryScope })
+        const taskGraphRevision = postGateContext?.status === "awaiting_plan" || postGateContext?.status === "planned"
+          ? postGateContext.graphRevision : request.snapshot.taskGraphRevision
+        const blocks = [
+          ...request.snapshot.system.map(seed => ({ id: `system:${seed.id}`, layer: "system" as const,
+            role: "instruction" as const, trust: "system" as const, source: "harness", content: asText(seed.content) })),
+          ...request.snapshot.toolObservations.map(observation => ({ id: `observation:${observation.id}`,
+            layer: "tool_observation" as const, role: "data" as const, trust: "external_untrusted" as const,
+            source: observation.id.startsWith("snapshot-working-state:") ? "context_snapshot_working_state" : "tool_or_subagent",
+            content: asText(observation.content) })),
+        ]
+        return { schemaVersion: "agent-harness.v2", sessionId: request.sessionId,
+          turnId: request.turnId, stepId: request.stepId, inputThroughSequence: 0n, consumedInputIds: [],
+          blocks, canonicalJson: JSON.stringify(blocks), ...(taskGraphRevision === undefined ? {} : { taskGraphRevision }) }
+      } },
+      store, model, tools, validateToolArguments: (toolName, value) => {
+        const tool = toolsByName.get(toolName)
+        return tool ? Value.Check(tool.inputSchema, value) : false
+      }, executeTool: async input => {
+        const tool = toolsByName.get(input.call.toolName)
+        if (!tool) throw new Error("scheduled_post_gate_fixture_tool_unavailable")
+        const context: ToolExecutionContext = { scope: input.scope, sessionId: input.sessionId, turnId: input.turnId,
+          stepId: input.stepId, toolCallId: input.call.id, taskId: input.taskId, rootTaskId: input.rootTaskId,
+          actorRole: input.actorRole, remainingTurnSteps: input.remainingTurnSteps, signal: input.signal,
+          capabilities: input.capabilities ?? [], reportProgress: async () => undefined }
+        try {
+          const output = await tool.execute(context, input.call.input)
+          phases.push({ phase: "root.tool.execute", outcome: `${input.call.toolName}:completed` })
+          return { id: input.call.id, toolName: input.call.toolName, toolVersion: input.call.toolVersion,
+            status: "completed" as const, output, errorCode: null }
+        } catch (error: unknown) {
+          const row = error && typeof error === "object" ? error as Record<string, unknown> : null
+          const code = typeof row?.code === "string" ? row.code : "scheduled_post_gate_fixture_tool_failed"
+          const diagnostic = errorDiagnostic(error)
+          phases.push({ phase: "root.tool.execute", outcome: `${input.call.toolName}:failed:${code}`,
+            ...(diagnostic.errorClass ? { errorClass: diagnostic.errorClass } : {}),
+            ...(diagnostic.errorCode ? { errorCode: diagnostic.errorCode } : {}) })
+          return { id: input.call.id, toolName: input.call.toolName, toolVersion: input.call.toolVersion,
+            status: "failed" as const, errorCode: code }
+        }
+      }, completionGate,
+      recoveredFinalCandidate: recoveredCandidate?.candidateText,
+      resume: { nextOrdinal: resumeOrdinal + 1, stepCount: resumeStepCount,
+        toolCallCount: resumeToolCallCount, inputThroughSequence: resumeInputThroughSequence, consumedInputIds: resumeConsumedInputIds,
         usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } } }
     return new TurnEngine(options).run()
   }
@@ -1481,10 +1890,42 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
   catch (error: unknown) {
     throw new Error(`Scheduled Audit root failed with redacted diagnostics: ${JSON.stringify({ ...errorDiagnostic(error), phases })}`)
   }
+  if (useWorkerContinuationContractStub && continuationContractStages.length > 0
+    && continuationContractStages.join(",") !== "analyze_proof,prepare_verified,gate_checkpoint") {
+    throw new Error(`Scheduled Worker continuation contract order invalid: ${continuationContractStages.join(",")}`)
+  }
   if (expectedStatus && result.status !== expectedStatus) {
     const row = debugRecord(result), status = typeof result.status === "string" && safeStatuses.has(result.status) ? result.status : "unknown"
     const errorCode = typeof row?.errorCode === "string" && safeErrorCodes.has(row.errorCode) ? row.errorCode : "unknown"
-    throw new Error(`Scheduled Audit root returned an unexpected outcome: ${JSON.stringify({ status, errorCode, phases })}`)
+    const timeline = await pool!.query<{ ordinal: number | string; status: string; errorCode: string | null;
+      finalRejectCode: string | null; events: string[] }>(`SELECT step."ordinal", step."status", step."errorCode",
+        MAX(event."payload"->>'code') FILTER (WHERE event."type"='final.rejected') AS "finalRejectCode",
+        ARRAY_AGG(DISTINCT event."type") FILTER (WHERE event."type" IN ('final.rejected', 'step.completed')) AS "events"
+      FROM "agent_steps" AS step LEFT JOIN "agent_events" AS event ON event."sessionId"=step."sessionId"
+        AND event."turnId"=step."turnId" AND event."taskId"=step."taskId" AND event."correlationId"=step."id"
+      WHERE step."sessionId"=$1 AND step."turnId"=$2 AND step."taskId"=$3 AND step."ordinal">(
+        SELECT source."ordinal" FROM "agent_steps" AS source WHERE source."id"=$4 AND source."sessionId"=$1
+          AND source."turnId"=$2 AND source."taskId"=$3)
+      GROUP BY step."id", step."ordinal", step."status", step."errorCode" ORDER BY step."ordinal"`,
+    [fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId, fixture.rootQuestionStepId])
+    const terminal = await pool!.query<{ type: string; errorCode: string | null; blocker: string | null }>(
+      `SELECT "type", "payload"->>'errorCode' AS "errorCode", "payload"->'final'->>'blocker' AS "blocker"
+       FROM "agent_events" WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId"=$3
+         AND "type" IN ('turn.started', 'turn.failed', 'turn.interrupted') ORDER BY "sequence" DESC LIMIT 3`,
+      [fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId])
+    const safeBlockers = new Set(["Scheduled candidate recovery does not match the next durable step",
+      "Scheduled recovery marker is unavailable", "Scheduled candidate finish reason is invalid", "Scheduled candidate owner is invalid",
+      "Scheduled Audit resume failed closed", "Scheduled pipeline completion failed closed",
+      "A persisted tool call has an ambiguous external result and cannot be replayed",
+      "Native question is no longer current", "Cognitive agenda receipt could not be built", "Cognitive agenda receipt could not be persisted"])
+    const terminalEvents = terminal.rows.map(event => ({ type: event.type,
+      errorCode: event.errorCode && safeErrorCodes.has(event.errorCode) ? event.errorCode : null,
+      blocker: event.blocker && safeBlockers.has(event.blocker) ? event.blocker : null }))
+    const rootSteps = timeline.rows.map(step => ({ ordinal: Number(step.ordinal), status: safeStatuses.has(step.status) ? step.status : "unknown",
+      errorCode: step.errorCode && safeErrorCodes.has(step.errorCode) ? step.errorCode : null,
+      finalRejectCode: step.finalRejectCode && safeErrorCodes.has(step.finalRejectCode) ? step.finalRejectCode : null,
+      events: Array.isArray(step.events) ? step.events.filter(event => event === "final.rejected" || event === "step.completed") : [] }))
+    throw new Error(`Scheduled Audit root returned an unexpected outcome: ${JSON.stringify({ status, errorCode, phases, rootSteps, terminalEvents })}`)
   }
   return result
 }
@@ -1555,7 +1996,7 @@ function numericValue(value: unknown): number | null {
 }
 
 function expectScheduledAuditRecoveryTrace(trace: Awaited<ReturnType<typeof readScheduledAuditRootRecoveryTrace>>,
-  fixture: Fixture, stepCount: number, status: string, errorCode: string | null): void {
+  fixture: Fixture, stepCount: number, status: string, errorCode: string | null, unmarkedStepIndexes: readonly number[] = []): void {
   expect(trace.sourceStep.id).toBe(fixture.rootQuestionStepId)
   expect(trace.candidateEventCount).toBe(1)
   expect(trace.sourceStep).toMatchObject({ inputTokens: 37, outputTokens: 9, estimatedCostUsd: 0.018, consumedInputIds: [] })
@@ -1567,15 +2008,16 @@ function expectScheduledAuditRecoveryTrace(trace: Awaited<ReturnType<typeof read
     const previousStepId = index === 0 ? fixture.rootQuestionStepId : trace.steps[index - 1]!.id
     expect(step).toMatchObject({ attempt: 1, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, consumedInputIds: [] })
     expect(step.id).not.toBe(fixture.rootQuestionStepId)
-    expect(step.marker).toMatchObject({ kind: "scheduled_pipeline_recovery", recoveryStepId: step.id,
-      recoveryCursor: index + 1, predecessorStepId: previousStepId, sourceStepId: fixture.rootQuestionStepId,
-      sourceStepOrdinal: Number(trace.sourceStep.ordinal), sourceEventId: trace.candidateEvent.id,
-      rootAttemptCount: fixture.owner.rootAttemptCount, owner: { userId: fixture.ids.userId,
-        sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId, rootTaskId: fixture.ids.rootTaskId } })
+    if (unmarkedStepIndexes.includes(index)) expect(step.marker).toBeNull()
+    else expect(step.marker).toMatchObject({ kind: "scheduled_pipeline_recovery", recoveryStepId: step.id,
+        recoveryCursor: index + 1, predecessorStepId: previousStepId, sourceStepId: fixture.rootQuestionStepId,
+        sourceStepOrdinal: Number(trace.sourceStep.ordinal), sourceEventId: trace.candidateEvent.id,
+        rootAttemptCount: fixture.owner.rootAttemptCount, owner: { userId: fixture.ids.userId,
+          sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId, rootTaskId: fixture.ids.rootTaskId } })
     expect(step.startEvents).toHaveLength(1)
-    expect(debugRecord(step.startEvents[0]?.payload)?.[SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY]).toMatchObject({
-      recoveryStepId: step.id, sourceEventId: trace.candidateEvent.id,
-    })
+    const recoveryProfile = debugRecord(step.startEvents[0]?.payload)?.[SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY]
+    if (unmarkedStepIndexes.includes(index)) expect(recoveryProfile).toBeUndefined()
+    else expect(recoveryProfile).toMatchObject({ recoveryStepId: step.id, sourceEventId: trace.candidateEvent.id })
     expect(step.completionEvents).toHaveLength(1)
   }
   expect(trace.steps.at(-1)).toMatchObject({ status, errorCode })
@@ -1876,7 +2318,8 @@ async function approveAndResumeScheduledAuditRoot(fixture: Fixture, response: Aw
   afterAuditWait?: (recoveryStepId: string, mode: "append_audit" | "resume_audit", scope: ScheduledAuditRecoveryScope,
     lease: TurnLease) => Promise<void>,
   beforeRootRun?: (lease: TurnLease, scope: ScheduledAuditRecoveryScope,
-    gateProof: Awaited<ReturnType<typeof requireGateProof>>) => Promise<void>): Promise<{
+    gateProof: Awaited<ReturnType<typeof requireGateProof>>) => Promise<void>,
+  useWorkerContinuationContractStub = false, onModelToolCall?: (toolName: string) => void): Promise<{
     root: TurnEngineResult; turnOutcome: unknown; gateProof: Awaited<ReturnType<typeof requireGateProof>>; lease: TurnLease
   }> {
   const pending = await pool!.query<{ id: string; status: string; type: string; impact: unknown; content: unknown }>(`
@@ -1912,15 +2355,17 @@ async function approveAndResumeScheduledAuditRoot(fixture: Fixture, response: Aw
 
   const turnJobs: TurnJobPayload[] = []
   expect(await dispatchPendingTurnOutbox(pool as never, createUniqueTurnDispatchQueue(turnJobs))).toBeGreaterThanOrEqual(1)
-  expect(turnJobs).toHaveLength(1)
-  expect(turnJobs[0]?.turnId).toBe(fixture.ids.turnId)
+  expect(turnJobs.length).toBeGreaterThanOrEqual(1)
+  expect(turnJobs.every(job => job.turnId === fixture.ids.turnId)).toBe(true)
+  const resumeJob = turnJobs.at(-1)
+  if (!resumeJob) throw new Error("approved scheduled Audit Turn dispatch missing")
   const rootStore = createPgRootTaskStore(pool as never)
   const sessionProjection = createCanonicalSessionProjection(pool as never)
   const identity = { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId }
   let root: TurnEngineResult | undefined
   let gateProof: Awaited<ReturnType<typeof requireGateProof>> | undefined
   let resumedLease: TurnLease | undefined
-  const turnOutcome = await runTurnJob({ data: turnJobs[0]!, attemptsMade: 0 }, { pool: pool as never,
+  const turnOutcome = await runTurnJob({ data: resumeJob, attemptsMade: 0 }, { pool: pool as never,
     requireCanonicalAutomationMode: true, heartbeatMs: 60_000,
     async execute({ lease }) {
       resumedLease = lease
@@ -1932,7 +2377,7 @@ async function approveAndResumeScheduledAuditRoot(fixture: Fixture, response: Aw
         turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId,
         parentAttemptCount: fixture.owner.rootAttemptCount }, gateProof)
       root = await runAttachedScheduledAuditRoot(fixture, response.fetcher, commandPort, waitPort,
-        undefined, afterAuditWait, undefined, lease, onModelStream)
+        "waiting_for_dependency", afterAuditWait, undefined, lease, onModelStream, false, useWorkerContinuationContractStub, onModelToolCall)
       await rootStore.finish({ lease, rootTaskId: fixture.ids.rootTaskId, result: root })
       await sessionProjection.finish({ ...identity, result: { status: root.status } })
       return { status: root.status, ...(root.waitId ? { waitId: root.waitId } : {}) }
@@ -3566,10 +4011,20 @@ function debugParseGateDecisions(value: unknown): {
   approvedJobIds: string[]; pendingJobIds: string[]; skippedJobIds: string[]
 } | null {
   const row = debugRecord(value), keys = ["approvedJobIds", "pendingJobIds", "skippedJobIds"]
-  if (!row || Object.keys(row).length !== keys.length || keys.some(key => !Object.hasOwn(row, key))) return null
+  if (!row || keys.some(key => !Object.hasOwn(row, key))) return null
+  const rowKeys = Object.keys(row)
+  const decisionOnly = rowKeys.length === keys.length
+  const completedEnvelope = rowKeys.length === 6 && row.status === "completed" && row.nextStage === "execute"
+    && Object.hasOwn(row, "counts")
+  if (!decisionOnly && !completedEnvelope) return null
   const lists = keys.map(key => row[key])
   if (lists.some(list => !Array.isArray(list) || !list.every(id => typeof id === "string" && id.length > 0 && id.trim() === id)
     || new Set(list as string[]).size !== (list as string[]).length)) return null
+  if (completedEnvelope) {
+    const counts = debugRecord(row.counts)
+    if (!counts || Object.keys(counts).length !== keys.length || counts.approved !== (lists[0] as string[]).length
+      || counts.pending !== (lists[1] as string[]).length || counts.skipped !== (lists[2] as string[]).length) return null
+  }
   return { approvedJobIds: [...lists[0] as string[]], pendingJobIds: [...lists[1] as string[]],
     skippedJobIds: [...lists[2] as string[]] }
 }

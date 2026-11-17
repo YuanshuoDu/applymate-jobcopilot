@@ -6,7 +6,7 @@ import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { SCHEDULED_PREPARE_COMPLETION_SCHEMA, SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA } from "./scheduled-prepare-task-graph-verification.js"
 
 const mocks = vi.hoisted(() => ({ lock: vi.fn(), load: vi.fn(), current: vi.fn(), evidence: vi.fn(), jobIds: vi.fn(),
-  envelope: vi.fn(), persistedProof: vi.fn(), registration: vi.fn(), snapshot: vi.fn(), verifyPrepare: vi.fn() }))
+  envelope: vi.fn(), persistedProof: vi.fn(), registration: vi.fn(), snapshot: vi.fn(), verifyPrepare: vi.fn(), approvalWitnessIds: vi.fn() }))
 
 vi.mock("./task-graph-pg-state.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./task-graph-pg-state.js")>()
@@ -32,6 +32,10 @@ vi.mock("./scheduled-taskgraph-continuation-receipt.js", async importOriginal =>
 vi.mock("./scheduled-prepare-task-graph-verification.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./scheduled-prepare-task-graph-verification.js")>()
   return { ...actual, verifyScheduledPrepareTaskGraphEvidence: mocks.verifyPrepare }
+})
+vi.mock("./scheduled-prepare-gate-wait-witness.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./scheduled-prepare-gate-wait-witness.js")>()
+  return { ...actual, scheduledPrepareGateApprovalWitnessIds: mocks.approvalWitnessIds }
 })
 
 const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
@@ -99,7 +103,8 @@ const finishGraph = { duplicate: false, taskId: "gate-task", itemId: "graph", sc
     { nodeKey: "gate", type: "task.completed", idempotencyKey: taskGraphLifecycleKey(owner.rootTaskId, "gate", 1, "task.completed"), expectedRevision: 10 }] } }
 const suspendedOwner = { sessionId: owner.sessionId, sessionUserId: owner.userId, sessionStatus: "running", turnId: owner.turnId,
   turnSessionId: owner.sessionId, turnUserId: owner.userId, turnRootTaskId: owner.rootTaskId, turnStatus: "waiting_for_dependency",
-  turnLeaseOwnerId: null, turnLeaseVersion: 6, source: "automation", executionMode: "canonical_task_graph", input: {},
+  turnLeaseOwnerId: null, turnLeaseExpiresAt: null, turnLeaseVersion: scope.turnLeaseVersion, turnLeaseValid: false,
+  source: "automation", executionMode: "canonical_task_graph", input: {},
   rootId: owner.rootTaskId, rootSessionId: owner.sessionId, rootTurnId: owner.turnId, rootStatus: "running",
   rootAttemptCount: owner.rootAttemptCount, rootInterruptRequestedAt: null, rootClosedAt: null }
 
@@ -153,6 +158,7 @@ describe("persisted scheduled Gate completion proof", () => {
     mocks.registration.mockResolvedValue(registration)
     mocks.snapshot.mockReturnValue(true)
     mocks.verifyPrepare.mockResolvedValue({ verified: true, facts: proofFacts })
+    mocks.approvalWitnessIds.mockResolvedValue(["approval-1"])
   })
 
   it.each([
@@ -215,18 +221,52 @@ describe("persisted scheduled Gate completion proof", () => {
 
   it.each(["in_progress", "waiting_for_dependency", "waiting_for_approval"] as const)(
     "admits the exact completed Gate lease while its Root Turn is %s", async turnStatus => {
+      const hasLiveTurnLease = turnStatus !== "waiting_for_dependency"
       const db = finishDatabase({ ...suspendedOwner, turnStatus,
-        turnLeaseOwnerId: turnStatus === "in_progress" ? "turn-owner" : null })
+        turnLeaseOwnerId: hasLiveTurnLease ? scope.turnLeaseOwner : null,
+        turnLeaseExpiresAt: hasLiveTurnLease ? new Date("2026-11-14T12:05:00Z") : null,
+        turnLeaseVersion: scope.turnLeaseVersion, turnLeaseValid: hasLiveTurnLease })
       const result = await validateScheduledGateTaskGraphFinish(db.client as never, { graph: finishGraph as never,
         taskId: "gate-task", ownerId: "gate-owner", attemptCount: 1, status: "completed", result: gateResult })
       expect(result).toEqual({ structuredResult: questionResult })
-      expect(db.query.mock.calls.some(([sql]) => String(sql).includes('"turn"."leaseOwnerId"'))).toBe(false)
+      expect(db.query.mock.calls.some(([sql]) => String(sql).includes('turn."leaseOwnerId"'))).toBe(true)
       const turnRead = db.query.mock.calls.find(([sql]) => String(sql).includes('FROM "agent_sessions" AS session'))
       expect(turnRead?.[0]).toContain('turn."status" = ANY($5::text[])')
       expect(turnRead?.[1]?.[4]).toEqual(["in_progress", "waiting_for_dependency", "waiting_for_approval"])
+      if (turnStatus === "waiting_for_approval") {
+        expect(mocks.approvalWitnessIds).toHaveBeenCalledWith(db.client, expect.objectContaining({
+          userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+          parentTaskId: owner.rootTaskId, turnLeaseOwner: scope.turnLeaseOwner, turnLeaseVersion: scope.turnLeaseVersion }),
+        expect.objectContaining({ gateTaskId: "gate-task", gateAttemptCount: 1, leaseOwnerId: "gate-owner",
+          requestAttemptCount: 0, preparedJobIds: ["job-1"] }))
+      } else expect(mocks.approvalWitnessIds).not.toHaveBeenCalled()
       expect(mocks.persistedProof).toHaveBeenCalledWith(db.client, expect.anything(), "prepare-task",
         expect.anything(), prepareWaitContinuationKey, "prepare-wait")
     })
+
+  it("rejects an approval-wait Turn without an active same-Gate witness", async () => {
+    const db = finishDatabase({ ...suspendedOwner, turnStatus: "waiting_for_approval",
+      turnLeaseOwnerId: scope.turnLeaseOwner, turnLeaseExpiresAt: new Date("2026-11-14T12:05:00Z"),
+      turnLeaseVersion: scope.turnLeaseVersion, turnLeaseValid: true })
+    mocks.approvalWitnessIds.mockResolvedValue([])
+    await expect(validateScheduledGateTaskGraphFinish(db.client as never, { graph: finishGraph as never,
+      taskId: "gate-task", ownerId: "gate-owner", attemptCount: 1, status: "completed", result: gateResult })).resolves.toBeNull()
+    expect(mocks.approvalWitnessIds).toHaveBeenCalledOnce()
+    expect(mocks.verifyPrepare).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ["lease owner", { turnLeaseOwnerId: null, turnLeaseVersion: scope.turnLeaseVersion, turnLeaseValid: true }],
+    ["lease version", { turnLeaseOwnerId: scope.turnLeaseOwner, turnLeaseVersion: 0, turnLeaseValid: true }],
+    ["lease expiry", { turnLeaseOwnerId: scope.turnLeaseOwner, turnLeaseVersion: scope.turnLeaseVersion, turnLeaseValid: false }],
+  ] as const)("rejects an approval-wait Turn with an invalid %s", async (_field, lease) => {
+    const db = finishDatabase({ ...suspendedOwner, turnStatus: "waiting_for_approval",
+      turnLeaseExpiresAt: new Date("2026-11-14T12:05:00Z"), ...lease })
+    await expect(validateScheduledGateTaskGraphFinish(db.client as never, { graph: finishGraph as never,
+      taskId: "gate-task", ownerId: "gate-owner", attemptCount: 1, status: "completed", result: gateResult })).resolves.toBeNull()
+    expect(mocks.approvalWitnessIds).not.toHaveBeenCalled()
+    expect(mocks.verifyPrepare).not.toHaveBeenCalled()
+  })
 
   it("keeps approval-wait Turn status unavailable to question-required Gate finishes", async () => {
     const db = finishDatabase({ ...suspendedOwner, turnStatus: "waiting_for_approval" })
@@ -241,7 +281,17 @@ describe("persisted scheduled Gate completion proof", () => {
       result: { ...gateResult, status: "waiting_for_user", structuredResult: { status: "question_required" } } })).resolves.toBeNull()
     const turnRead = db.query.mock.calls.find(([sql]) => String(sql).includes('FROM "agent_sessions" AS session'))
     expect(turnRead?.[1]?.[4]).toEqual(["in_progress", "waiting_for_dependency"])
-    expect(mocks.registration).not.toHaveBeenCalled()
+    expect(mocks.approvalWitnessIds).not.toHaveBeenCalled()
+    expect(mocks.verifyPrepare).not.toHaveBeenCalled()
+  })
+
+  it("accepts a parked Root approval wait only with no Turn lease and an active same-Gate witness", async () => {
+    const db = finishDatabase({ ...suspendedOwner, rootStatus: "waiting", turnStatus: "waiting_for_approval",
+      turnLeaseOwnerId: null, turnLeaseExpiresAt: null, turnLeaseValid: false })
+    await expect(validateScheduledGateTaskGraphFinish(db.client as never, { graph: finishGraph as never,
+      taskId: "gate-task", ownerId: "gate-owner", attemptCount: 1, status: "completed", result: gateResult }))
+      .resolves.toEqual({ structuredResult: questionResult })
+    expect(mocks.approvalWitnessIds).toHaveBeenCalledOnce()
   })
 
   it.each(["queued", "interrupted", "waiting_for_user", "waiting_for_tool", "unknown"])(
@@ -249,7 +299,7 @@ describe("persisted scheduled Gate completion proof", () => {
       const db = finishDatabase({ ...suspendedOwner, turnStatus })
       await expect(validateScheduledGateTaskGraphFinish(db.client as never, { graph: finishGraph as never,
         taskId: "gate-task", ownerId: "gate-owner", attemptCount: 1, status: "completed", result: gateResult })).resolves.toBeNull()
-      expect(mocks.registration).not.toHaveBeenCalled()
+      expect(mocks.verifyPrepare).not.toHaveBeenCalled()
     })
 
   it.each([
@@ -260,14 +310,14 @@ describe("persisted scheduled Gate completion proof", () => {
     const db = finishDatabase(row)
     await expect(validateScheduledGateTaskGraphFinish(db.client as never, { graph: finishGraph as never,
       taskId: "gate-task", ownerId: "gate-owner", attemptCount: 1, status: "completed", result: gateResult })).resolves.toBeNull()
-    expect(mocks.registration).not.toHaveBeenCalled()
+    expect(mocks.verifyPrepare).not.toHaveBeenCalled()
   })
 
   it("rejects a Gate finish if the locked Root attempt advanced after Prepare", async () => {
     const db = finishDatabase({ ...suspendedOwner, rootAttemptCount: owner.rootAttemptCount + 1 })
     await expect(validateScheduledGateTaskGraphFinish(db.client as never, { graph: finishGraph as never,
       taskId: "gate-task", ownerId: "gate-owner", attemptCount: 1, status: "completed", result: gateResult })).resolves.toBeNull()
-    expect(mocks.registration).not.toHaveBeenCalled()
+    expect(mocks.verifyPrepare).not.toHaveBeenCalled()
   })
 
   it.each([
@@ -278,6 +328,6 @@ describe("persisted scheduled Gate completion proof", () => {
     const db = finishDatabase(rootAndTurn)
     await expect(validateScheduledGateTaskGraphFinish(db.client as never, { graph: finishGraph as never,
       taskId: "gate-task", ownerId: "gate-owner", attemptCount: 1, status: "completed", result: gateResult })).resolves.toBeNull()
-    expect(mocks.registration).not.toHaveBeenCalled()
+    expect(mocks.verifyPrepare).not.toHaveBeenCalled()
   })
 })

@@ -16,7 +16,8 @@ type Fixtures = { gates: Row[]; waits: Row[]; approvals: Row[]; applications: Ro
 function gateRow(overrides: Row = {}): Row {
   return { id: witness.gateTaskId, role: SCHEDULED_GATE_ROLE, taskType: SCHEDULED_GATE_TASK_TYPE, status: "running",
     attemptCount: witness.gateAttemptCount, maxAttempts: 4, failureReason: null, leaseOwner: witness.leaseOwnerId,
-    leaseValid: true, deadlineValid: true, interruptRequestedAt: null, ...overrides }
+    leaseValid: true, deadlineValid: true, interruptRequestedAt: null, turnLeaseOwnerId: "turn-worker-1",
+    turnLeaseVersion: 4, turnLeaseValid: true, ...overrides }
 }
 function gateWaitRow(overrides: Row = {}): Row {
   const stepId = "root-step-2", waitId = "gate-wait-1"
@@ -73,7 +74,8 @@ function client(options: Partial<Fixtures> = {}) {
 }
 function gateInput(overrides: Partial<Parameters<typeof scheduledPrepareGateRootWitnessMatches>[1]> = {}) {
   return { scope, rootStatus: "waiting" as const, rootAttemptCount: 3, turnStatus: "waiting_for_dependency",
-    turnLeaseOwnerId: null, turnLeaseExpiresAt: null, waitId: "gate-wait-1", witness, now, ...overrides }
+    turnLeaseOwnerId: null, turnLeaseExpiresAt: null, turnLeaseVersion: null, turnLeaseValid: false,
+    waitId: "gate-wait-1", witness, now, ...overrides }
 }
 function waitKey(taskId: string, stepId: string, attempt: number): string {
   return `scheduled-gate-wait:${createHash("sha256").update(JSON.stringify([taskId, stepId, attempt]), "utf8").digest("hex")}`
@@ -105,6 +107,27 @@ describe("scheduled Prepare Gate root wait witness", () => {
     expect(approvalQuery[0]).toContain('application."jobId" = approval."jobId"')
     await expect(scheduledPrepareGateRootWitnessMatches(db as never, gateInput({ turnStatus: "waiting_for_approval" })) )
       .resolves.toBe(true)
+  })
+
+  it("accepts an active approval while the Root runs only under its current Turn lease", async () => {
+    const approval = approvalRow("approval-1", "job-1")
+    const db = client({ approvals: [approval], items: [itemFor(approval)], events: [eventFor(approval)] })
+    await expect(scheduledPrepareGateRootWitnessMatches(db as never, gateInput({ rootStatus: "running",
+      turnStatus: "waiting_for_approval", turnLeaseOwnerId: "turn-worker-1", turnLeaseVersion: 4, turnLeaseValid: true,
+      turnLeaseExpiresAt: new Date("2026-11-14T12:05:00.000Z"), waitId: null }))).resolves.toBe(true)
+  })
+
+  it.each([
+    ["missing Turn lease", { turnLeaseOwnerId: null, turnLeaseExpiresAt: null }, {}],
+    ["different Turn owner", { turnLeaseOwnerId: "other-turn-worker" }, {}],
+    ["different Turn version", { turnLeaseVersion: 5 }, { turnLeaseVersion: 4 }],
+    ["expired Turn lease", { turnLeaseValid: false }, { turnLeaseValid: false }],
+  ] as const)("rejects a running Root approval wait with a %s", async (_label, inputOverrides, rowOverrides) => {
+    const approval = approvalRow("approval-1", "job-1")
+    const db = client({ gates: [gateRow(rowOverrides)], approvals: [approval], items: [itemFor(approval)], events: [eventFor(approval)] })
+    await expect(scheduledPrepareGateRootWitnessMatches(db as never, gateInput({ rootStatus: "running",
+      turnStatus: "waiting_for_approval", turnLeaseOwnerId: "turn-worker-1", turnLeaseVersion: 4, turnLeaseValid: true,
+      turnLeaseExpiresAt: new Date("2026-11-14T12:05:00.000Z"), waitId: null, ...inputOverrides }))).resolves.toBe(false)
   })
 
   it.each([

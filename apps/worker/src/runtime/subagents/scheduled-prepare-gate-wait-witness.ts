@@ -18,7 +18,7 @@ export type ScheduledPrepareGateWaitWitness = Readonly<{
 /** Revalidates a live Gate lease and only the exact suspended Gate wait or its active approval witness. */
 export async function scheduledPrepareGateRootWitnessMatches(client: Pick<pg.PoolClient, "query">, input: Readonly<{
   scope: Scope; rootStatus: "running" | "waiting"; rootAttemptCount: number; turnStatus: string
-  turnLeaseOwnerId: unknown; turnLeaseExpiresAt: unknown; waitId: string | null
+  turnLeaseOwnerId: unknown; turnLeaseExpiresAt: unknown; turnLeaseVersion?: unknown; turnLeaseValid?: unknown; waitId: string | null
   witness: ScheduledPrepareGateWaitWitness; now?: Date
 }>): Promise<boolean> {
   const { scope, witness } = input, now = input.now ?? new Date()
@@ -32,7 +32,9 @@ export async function scheduledPrepareGateRootWitnessMatches(client: Pick<pg.Poo
   const gateRows = await client.query<Row>(`SELECT task."id", task."role", task."taskType", task."status", task."attemptCount",
       task."maxAttempts", task."failureReason", task."leaseOwner", task."interruptRequestedAt",
       task."leaseExpiresAt" > clock_timestamp() AS "leaseValid",
-      (task."absoluteDeadlineAt" IS NULL OR task."absoluteDeadlineAt" > clock_timestamp()) AS "deadlineValid"
+      (task."absoluteDeadlineAt" IS NULL OR task."absoluteDeadlineAt" > clock_timestamp()) AS "deadlineValid",
+      turn."leaseOwnerId" AS "turnLeaseOwnerId", turn."leaseVersion" AS "turnLeaseVersion",
+      turn."leaseExpiresAt" > clock_timestamp() AS "turnLeaseValid"
     FROM "sub_agent_tasks" AS task
     JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $9
     JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
@@ -51,8 +53,13 @@ export async function scheduledPrepareGateRootWitnessMatches(client: Pick<pg.Poo
     || gate.failureReason !== null || gate.leaseOwner !== witness.leaseOwnerId || gate.leaseValid !== true
     || gate.deadlineValid !== true || gate.interruptRequestedAt != null) return false
   if (input.turnStatus === "waiting_for_approval") {
-    if (input.turnLeaseOwnerId !== null || input.turnLeaseExpiresAt !== null
-      || (await scheduledPrepareGateApprovalWitnessIds(client, scope, witness, now)).length === 0) return false
+    if (!(await scheduledPrepareGateApprovalWitnessIds(client, scope, witness, now)).length) return false
+    const expiry = asDate(input.turnLeaseExpiresAt)
+    if (input.rootStatus === "running" && (!validId(gate.turnLeaseOwnerId)
+      || !Number.isSafeInteger(gate.turnLeaseVersion) || Number(gate.turnLeaseVersion) < 1
+      || gate.turnLeaseValid !== true || input.turnLeaseOwnerId !== gate.turnLeaseOwnerId
+      || Number(input.turnLeaseVersion) !== Number(gate.turnLeaseVersion) || input.turnLeaseValid !== true || !expiry || expiry <= now)) return false
+    if (input.rootStatus === "waiting" && (input.turnLeaseOwnerId !== null || input.turnLeaseExpiresAt !== null)) return false
   } else if (!["in_progress", "waiting_for_dependency"].includes(input.turnStatus)) return false
   if (input.rootStatus === "running") return true
   if (input.rootStatus !== "waiting" || input.turnStatus !== "waiting_for_dependency" && input.turnStatus !== "waiting_for_approval"

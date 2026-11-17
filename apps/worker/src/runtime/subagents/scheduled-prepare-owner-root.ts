@@ -18,7 +18,9 @@ export async function scheduledPrepareReceiptOwnerRootMatches(client: Client, sc
   mode: Mode, tasks: ReadonlyMap<string, Task>, gateWaitWitness?: ScheduledPrepareGateWaitWitness): Promise<ScheduledAutomationPersistedRoot | null> {
   if (owner.userId !== scope.userId || owner.sessionId !== scope.sessionId || owner.turnId !== scope.turnId || owner.rootTaskId !== scope.rootTaskId) return null
   const rows = await client.query<Row>(`SELECT task."id", session."userId" AS "userId", task."sessionId", task."turnId", task."status", task."attemptCount",
-      task."result", task."failureReason", turn."status" AS "turnStatus", turn."leaseOwnerId" AS "turnLeaseOwnerId", turn."leaseExpiresAt" AS "turnLeaseExpiresAt"
+      task."result", task."failureReason", turn."status" AS "turnStatus", turn."leaseOwnerId" AS "turnLeaseOwnerId",
+      turn."leaseVersion" AS "turnLeaseVersion", turn."leaseExpiresAt" AS "turnLeaseExpiresAt",
+      turn."leaseExpiresAt" > clock_timestamp() AS "turnLeaseValid"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
     JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
     WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $1 AND task."parentTaskId" IS NULL
@@ -32,7 +34,8 @@ export async function scheduledPrepareReceiptOwnerRootMatches(client: Client, sc
       if (mode !== "persisted_gate" || !gateWaitWitness || !currentGateTaskMatches(tasks, gateWaitWitness)
         || !await scheduledPrepareGateRootWitnessMatches(client, { scope, rootStatus: "running",
           rootAttemptCount: owner.rootAttemptCount, turnStatus: String(row.turnStatus), turnLeaseOwnerId: row.turnLeaseOwnerId,
-          turnLeaseExpiresAt: row.turnLeaseExpiresAt, waitId: null, witness: gateWaitWitness })) return null
+          turnLeaseExpiresAt: row.turnLeaseExpiresAt, turnLeaseVersion: row.turnLeaseVersion, turnLeaseValid: row.turnLeaseValid,
+          waitId: null, witness: gateWaitWitness })) return null
     }
     return root(owner, scope, "running")
   }
@@ -48,6 +51,7 @@ export async function scheduledPrepareReceiptOwnerRootMatches(client: Client, sc
     if (!currentGateTaskMatches(tasks, gateWaitWitness) || !await scheduledPrepareGateRootWitnessMatches(client, { scope,
       rootStatus: "waiting", rootAttemptCount: owner.rootAttemptCount, turnStatus: String(row.turnStatus),
       turnLeaseOwnerId: row.turnLeaseOwnerId, turnLeaseExpiresAt: row.turnLeaseExpiresAt,
+      turnLeaseVersion: row.turnLeaseVersion, turnLeaseValid: row.turnLeaseValid,
       waitId: parsed.result.waitId, witness: gateWaitWitness })) return null
     return root(owner, scope, "waiting")
   }

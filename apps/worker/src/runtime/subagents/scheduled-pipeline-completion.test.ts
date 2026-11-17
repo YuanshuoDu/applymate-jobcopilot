@@ -278,6 +278,7 @@ describe("scheduled pipeline pre-terminal completion", () => {
     const currentOwner = { ...owner, turnLeaseOwnerId: "worker-reclaimed", turnLeaseVersion: owner.turnLeaseVersion + 1 }
     const currentExecutionOwner: TurnExecutionOwnerFence = { ...executionOwner, ownerId: currentOwner.turnLeaseOwnerId,
       leaseVersion: currentOwner.turnLeaseVersion }
+    const currentAttestation: ScheduledAutomationPipelineAttestation = { ...analyzeAttestation, owner: currentOwner }
     const handoff = analyzeProof(), prepared = readyPrepare(), calls: string[] = []
     const continueAfterGate = vi.fn(async input => {
       if ("mode" in input && input.mode === "resume_post_gate") { calls.push("post-gate"); return { status: "not_registered" as const } }
@@ -291,11 +292,35 @@ describe("scheduled pipeline pre-terminal completion", () => {
 
     await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner: currentOwner, executionOwner: currentExecutionOwner,
       recoveredCandidate: recoveredCandidate(), candidateText: "Final candidate",
-      bridge: async () => ({ status: "ready" as const, attestation: analyzeAttestation }),
+      bridge: async () => ({ status: "ready" as const, attestation: currentAttestation }),
       continueAfterGate, fetcher: vi.fn<typeof fetch>(), signal: new AbortController().signal }))
       .resolves.toEqual({ status: "replan", candidateText: "Final candidate", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK })
     expect(calls).toEqual(["post-gate", "rehydrate", "continue"])
     expect(continueAfterGate).toHaveBeenCalledTimes(3)
+    expect(continueAfterGate).toHaveBeenNthCalledWith(3, expect.objectContaining({ owner: currentOwner,
+      executionOwner: currentExecutionOwner, attestation: currentAttestation }))
+  })
+
+  it("rejects a recovered Gate proof when reattestation still uses the replaced Turn lease", async () => {
+    const currentOwner = { ...owner, turnLeaseOwnerId: "worker-reclaimed", turnLeaseVersion: owner.turnLeaseVersion + 1 }
+    const currentExecutionOwner: TurnExecutionOwnerFence = { ...executionOwner, ownerId: currentOwner.turnLeaseOwnerId,
+      leaseVersion: currentOwner.turnLeaseVersion }
+    const handoff = analyzeProof(), prepared = readyPrepare(), stageCandidate = vi.fn(async () => undefined)
+    const continueAfterGate = vi.fn(async input => {
+      if ("mode" in input && input.mode === "resume_post_gate") return { status: "not_registered" as const }
+      if ("mode" in input && input.mode === "resume_audit") {
+        return { status: "gate_continuation" as const, handoff, prepareProof: prepared.prepareProof }
+      }
+      return { status: "replan" as const, feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK }
+    })
+
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner: currentOwner, executionOwner: currentExecutionOwner,
+      stageCandidate, recoveredCandidate: recoveredCandidate(), candidateText: "Final candidate",
+      bridge: async () => ({ status: "ready" as const, attestation: analyzeAttestation }),
+      continueAfterGate, fetcher: vi.fn<typeof fetch>(), signal: new AbortController().signal }))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_gate_recovery_invalid" })
+    expect(continueAfterGate).toHaveBeenCalledTimes(2)
+    expect(stageCandidate).not.toHaveBeenCalled()
   })
 
   it("does not call the bridge or Web when Audit resume finds an orphan registration", async () => {
