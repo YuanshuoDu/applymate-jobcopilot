@@ -6,10 +6,15 @@ import {
   type TaskGraphVerificationDisplayNode,
   type TaskGraphVerificationSummary,
 } from '@jobcopilot/agent-protocol'
+import { projectRepairTargetCheckIndexes } from './task-graph-repair-criteria'
 
 type PlanLedgerNode = PlanLedger['nodes'][number]
 export type PlanLedgerWithRepairTargetGoals = Omit<PlanLedger, 'nodes'> & {
-  nodes: readonly (PlanLedgerNode & { repairTargetGoal?: string; repairTargetNodeIndex?: number })[]
+  nodes: readonly (PlanLedgerNode & {
+    repairTargetGoal?: string
+    repairTargetNodeIndex?: number
+    repairTargetCheckIndexes?: readonly number[]
+  })[]
 }
 
 /** Adds only safe target details from a strictly matched same-root repair relation. */
@@ -24,7 +29,7 @@ export function decoratePlanLedgerRepairTargets(
     || raw.nodes.length !== graph.nodes.length || projection.nodes.length !== graph.nodes.length
     || graph.nodes.some((node, index) => projection.nodes[index]?.key !== node.key)) return projection
 
-  const repairTargets = new Map<string, { goal: string; nodeIndex: number }>()
+  const repairTargets = new Map<string, { goal: string; nodeIndex: number; checkIndexes?: readonly number[] }>()
   for (let index = 0; index < graph.nodes.length; index += 1) {
     const source = graph.nodes[index]
     const rawNode = record(raw.nodes[index])
@@ -39,7 +44,13 @@ export function decoratePlanLedgerRepairTargets(
       || targetProjection?.key !== target.key) continue
     const targetGoal = targetProjection.goal
     if (typeof targetGoal === 'string' && targetGoal.trim() === targetGoal && targetGoal.length > 0 && targetGoal.length <= 240) {
-      repairTargets.set(source.key, { goal: targetGoal, nodeIndex: targetNodeIndex })
+      const targetRawNode = record(raw.nodes[targetNodeIndex])
+      const checkIndexes = targetRawNode ? projectRepairTargetCheckIndexes(rawNode, targetRawNode, relation) : null
+      repairTargets.set(source.key, {
+        goal: targetGoal,
+        nodeIndex: targetNodeIndex,
+        ...(checkIndexes ? { checkIndexes } : {}),
+      })
     }
   }
   if (repairTargets.size === 0) return projection
@@ -47,7 +58,12 @@ export function decoratePlanLedgerRepairTargets(
     ...projection,
     nodes: projection.nodes.map(node => {
       const target = repairTargets.get(node.key)
-      return target ? { ...node, repairTargetGoal: target.goal, repairTargetNodeIndex: target.nodeIndex } : node
+      return target ? {
+        ...node,
+        repairTargetGoal: target.goal,
+        repairTargetNodeIndex: target.nodeIndex,
+        ...(target.checkIndexes ? { repairTargetCheckIndexes: target.checkIndexes } : {}),
+      } : node
     }),
   }
 }
@@ -60,10 +76,12 @@ export function parsePlanLedgerWithRepairTargets(value: unknown): PlanLedgerWith
   const rawNodes = row.nodes
   const goals = new Map<number, string>()
   const targetIndices = new Map<number, number>()
+  const checkIndexes = new Map<number, readonly number[]>()
   let malformedDecoration = false
   const nodes = rawNodes.map((node, index) => {
     const item = record(node)
-    if (!item || !Object.hasOwn(item, 'repairTargetGoal') && !Object.hasOwn(item, 'repairTargetNodeIndex')) return node
+    if (!item || !Object.hasOwn(item, 'repairTargetGoal') && !Object.hasOwn(item, 'repairTargetNodeIndex')
+      && !Object.hasOwn(item, 'repairTargetCheckIndexes')) return node
     const hasGoal = Object.hasOwn(item, 'repairTargetGoal')
     const goal = item.repairTargetGoal
     if (hasGoal && typeof goal === 'string') goals.set(index, goal)
@@ -74,16 +92,30 @@ export function parsePlanLedgerWithRepairTargets(value: unknown): PlanLedgerWith
         || Number(targetIndex) < 0 || Number(targetIndex) >= rawNodes.length || targetIndex === index) malformedDecoration = true
       else targetIndices.set(index, Number(targetIndex))
     }
+    if (Object.hasOwn(item, 'repairTargetCheckIndexes')) {
+      const rawIndexes = item.repairTargetCheckIndexes
+      if (!hasGoal || !Object.hasOwn(item, 'repairTargetNodeIndex') || !Array.isArray(rawIndexes)
+        || !denseArray(rawIndexes, 1, 8) || rawIndexes.some(value => typeof value !== 'number'
+          || !Number.isSafeInteger(value) || value < 0 || value > 7)
+        || rawIndexes.some((value, index) => index > 0 && Number(rawIndexes[index - 1]) >= Number(value))
+        || new Set(rawIndexes).size !== rawIndexes.length) malformedDecoration = true
+      else checkIndexes.set(index, [...rawIndexes] as number[])
+    }
     const baseNode = { ...item }
     delete baseNode.repairTargetGoal
     delete baseNode.repairTargetNodeIndex
+    delete baseNode.repairTargetCheckIndexes
     return baseNode
   })
   if (malformedDecoration) return null
 
   const base = parsePlanLedger({ ...row, nodes })
   if (!base) return null
-  const projectedNodes: Array<PlanLedgerNode & { repairTargetGoal?: string; repairTargetNodeIndex?: number }> = []
+  const projectedNodes: Array<PlanLedgerNode & {
+    repairTargetGoal?: string
+    repairTargetNodeIndex?: number
+    repairTargetCheckIndexes?: readonly number[]
+  }> = []
   for (let index = 0; index < base.nodes.length; index += 1) {
     const node = base.nodes[index]!
     const repairTargetGoal = goals.get(index)
@@ -97,7 +129,13 @@ export function parsePlanLedgerWithRepairTargets(value: unknown): PlanLedgerWith
       } else {
         const target = base.nodes[repairTargetNodeIndex]
         if (!target || target.key === node.key || target.goal !== repairTargetGoal) return null
-        projectedNodes.push({ ...node, repairTargetGoal, repairTargetNodeIndex })
+        const selectedCheckIndexes = checkIndexes.get(index)
+        projectedNodes.push({
+          ...node,
+          repairTargetGoal,
+          repairTargetNodeIndex,
+          ...(selectedCheckIndexes ? { repairTargetCheckIndexes: selectedCheckIndexes } : {}),
+        })
       }
     }
   }
@@ -117,8 +155,16 @@ export function projectRepairAttentionSummaries(
     const targetPlanNode = projection.nodes[targetIndex]
     if (!targetPlanNode || targetPlanNode.key === node.key || targetPlanNode.goal !== node.repairTargetGoal) return null
     const target = summary.nodes[targetIndex]
-    if (!target || target.status === 'unavailable') return null
-    const checks = target.checks.filter(check => check.status !== 'passed')
+    const rawIndexes: unknown = node.repairTargetCheckIndexes
+    if (!target || target.status === 'unavailable' || !denseArray(rawIndexes, 1, 8)
+      || rawIndexes.some(index => typeof index !== 'number' || !Number.isSafeInteger(index) || index < 0
+        || index >= target.checks.length)
+      || rawIndexes.some((index, position) => position > 0 && Number(rawIndexes[position - 1]) >= Number(index))
+      || new Set(rawIndexes).size !== rawIndexes.length) return null
+    const selectedIndexes = rawIndexes as number[]
+    const selectedChecks = selectedIndexes.map(checkIndex => target.checks[checkIndex])
+    if (selectedChecks.some(check => !check)) return null
+    const checks = selectedChecks.filter(check => check.status !== 'passed')
     if (checks.length === 0) return null
     const failedCount = checks.filter(check => check.status === 'failed').length
     const unverifiedCount = checks.filter(check => check.status === 'unverified').length
@@ -173,4 +219,10 @@ function record(value: unknown): Record<string, unknown> | null {
       || keys.some(key => typeof key !== 'string' || !Object.prototype.propertyIsEnumerable.call(value, key))) return null
     return value as Record<string, unknown>
   } catch { return null }
+}
+
+function denseArray(value: unknown, minimum: number, maximum: number): value is unknown[] {
+  return Array.isArray(value) && value.length >= minimum && value.length <= maximum
+    && Reflect.ownKeys(value).length === value.length + 1
+    && Array.from({ length: value.length }, (_, index) => String(index)).every(key => Object.hasOwn(value, key))
 }

@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/lib/i18n'
+import { decoratePlanLedgerRepairTargets } from '@/lib/task-graph-repair-display'
 import { TaskGraphPlanPanel } from './TaskGraphPlanPanel'
 import { projectCurrentTaskGraph } from './task-graph-plan'
 import { selectedTaskGraphIdentity } from './task-graph-plan-query'
@@ -116,11 +117,21 @@ describe('TaskGraphPlanPanel', () => {
   })
 
   it('shows only failed or unverified checks from an indexed target in the current ledger', () => {
+    const failedVerification = { schemaVersion: 'agent-harness.v2.task-graph-verification.v1', role: 'scout', criteria: [
+      { id: 'candidate-count', check: { kind: 'candidate_count_gte', minimum: 2 } },
+      { id: 'evidence-count', check: { kind: 'evidence_count_gte', minimum: 7 } },
+    ] }
+    const repairFailedVerification = { ...failedVerification, criteria: [failedVerification.criteria[0]] }
+    const unverifiedVerification = { schemaVersion: 'agent-harness.v2.task-graph-verification.v1', role: 'analyst', criteria: [
+      { id: 'finding-count', check: { kind: 'finding_count_gte', minimum: 1 } },
+      { id: 'evidence-count', check: { kind: 'evidence_count_gte', minimum: 8 } },
+    ] }
+    const repairUnverifiedVerification = { ...unverifiedVerification, criteria: [unverifiedVerification.criteria[1]] }
     const graphItems = [item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
-      { key: 'failed-target', templateId: 'scout', goal: 'Find candidates', successCriteria: ['Collect evidence'], dependsOn: [], depth: 1, taskId: 'failed-target-task' },
-      { key: 'unverified-target', templateId: 'analyst', goal: 'Assess candidates', successCriteria: ['Assess evidence'], dependsOn: [], depth: 1, taskId: 'unverified-target-task' },
-      { key: 'repair-failed', templateId: 'scout', goal: 'Repair candidate evidence', successCriteria: ['Collect evidence'], dependsOn: [], depth: 1, taskId: 'repair-failed-task' },
-      { key: 'repair-unverified', templateId: 'analyst', goal: 'Repair candidate assessment', successCriteria: ['Assess evidence'], dependsOn: [], depth: 1, taskId: 'repair-unverified-task' },
+      { key: 'failed-target', templateId: 'scout', goal: 'Find candidates', successCriteria: ['Collect evidence'], dependsOn: [], depth: 1, taskId: 'failed-target-task', verification: failedVerification, verificationDisposition: 'typed' },
+      { key: 'unverified-target', templateId: 'analyst', goal: 'Assess candidates', successCriteria: ['Assess evidence'], dependsOn: [], depth: 1, taskId: 'unverified-target-task', verification: unverifiedVerification, verificationDisposition: 'typed' },
+      { key: 'repair-failed', templateId: 'scout', goal: 'Repair candidate evidence', successCriteria: ['Collect evidence'], dependsOn: [], depth: 1, taskId: 'repair-failed-task', verification: repairFailedVerification, verificationDisposition: 'typed', repairOf: { graphRootTaskId: 'root-task', nodeKey: 'failed-target', taskId: 'failed-target-task', criterionIds: ['candidate-count'] } },
+      { key: 'repair-unverified', templateId: 'analyst', goal: 'Repair candidate assessment', successCriteria: ['Assess evidence'], dependsOn: [], depth: 1, taskId: 'repair-unverified-task', verification: repairUnverifiedVerification, verificationDisposition: 'typed', repairOf: { graphRootTaskId: 'root-task', nodeKey: 'unverified-target', taskId: 'unverified-target-task', criterionIds: ['evidence-count'] } },
     ] })]
     const ownedTasks: SupervisorTaskSummary[] = [
       { ...tasks[0]!, goal: 'Root plan' },
@@ -132,19 +143,17 @@ describe('TaskGraphPlanPanel', () => {
       ].map(([id, goal, role, taskType]) => ({ ...tasks[1]!, id: id!, goal: goal!, role: role!, taskType: taskType! })),
     ]
     const baseProjection = projectCurrentTaskGraph(graphItems, ownedTasks, 'session-1')!
-    const projection = { ...baseProjection, nodes: baseProjection.nodes.map(node => node.key === 'repair-failed'
-      ? { ...node, repairTargetGoal: 'Find candidates', repairTargetNodeIndex: 0 }
-      : node.key === 'repair-unverified'
-        ? { ...node, repairTargetGoal: 'Assess candidates', repairTargetNodeIndex: 1 } : node) }
+    const projection = decoratePlanLedgerRepairTargets(baseProjection, graphItems[0]!.content, 'root-task')
     const identity = selectedTaskGraphIdentity(graphItems, 'session-1')!
     const verificationSummary = { schemaVersion: 1, nodes: [
       { status: 'failed', checks: [
-        { kind: 'candidate_count_gte', minimum: 2, status: 'passed' },
-        { kind: 'evidence_count_gte', minimum: 1, status: 'failed' },
-      ], totalCount: 2, passedCount: 1, failedCount: 1, unverifiedCount: 0 },
+        { kind: 'candidate_count_gte', minimum: 2, status: 'failed' },
+        { kind: 'evidence_count_gte', minimum: 7, status: 'failed' },
+      ], totalCount: 2, passedCount: 0, failedCount: 2, unverifiedCount: 0 },
       { status: 'unverified', checks: [
         { kind: 'finding_count_gte', minimum: 1, status: 'unverified' },
-      ], totalCount: 1, passedCount: 0, failedCount: 0, unverifiedCount: 1 },
+        { kind: 'evidence_count_gte', minimum: 8, status: 'unverified' },
+      ], totalCount: 2, passedCount: 0, failedCount: 0, unverifiedCount: 2 },
       null, null,
     ] }
     const panel = (ledger?: unknown) => renderToStaticMarkup(<TaskGraphPlanPanel
@@ -157,11 +166,14 @@ describe('TaskGraphPlanPanel', () => {
     expect(attentionBlocks[0]).toContain('Related checks needing attention')
     expect(attentionBlocks[0]).toContain('Verification: Failed')
     expect(attentionBlocks[0]).toContain('1 failed')
-    expect(attentionBlocks[0]).toContain('At least this many evidence items: 1')
+    expect(attentionBlocks[0]).toContain('At least this many candidates: 2')
+    expect(attentionBlocks[0]).not.toContain('evidence items: 7')
     expect(attentionBlocks[0]).not.toContain('Passed')
     expect(attentionBlocks[1]).toContain('Verification: Not verified')
     expect(attentionBlocks[1]).toContain('1 unverified')
-    expect(attentionBlocks[1]).toContain('At least this many findings: 1')
+    expect(attentionBlocks[1]).toContain('At least this many evidence items: 8')
+    expect(attentionBlocks[1]).not.toContain('findings: 1')
+    expect(html).toContain('At least this many evidence items: 7')
     expect(html).not.toMatch(/criterionId|taskId|repairOf|PRIVATE_REVIEW_TEXT/)
 
     const mismatchedIdentities = [
