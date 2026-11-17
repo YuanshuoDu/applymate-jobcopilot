@@ -10,7 +10,7 @@ import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } fro
 import { assertCompletionAllowed, checkTaskGraphTerminalVerification, completionRecoverySnapshot, repairReportState, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-completion-gate.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js"
-import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import { applyCompletionRecovery, tagTaskGraphRepairRecovery, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY } from "./completion-recovery-context.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA } from "./task-graph-terminal-assessment.js"
 import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
@@ -52,7 +52,8 @@ describe("assertCompletionAllowed", () => {
     const writer = gateWriter()
 
     await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
-      .resolves.toEqual({ feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK })
+      .resolves.toEqual({ feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK,
+        [SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY]: SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY })
     expect(writer.append).toHaveBeenCalledWith("final.rejected", step.id, null, expect.objectContaining({
       code: "scheduled_post_gate_plan_required", blocker: "scheduled_post_gate_plan_required",
       feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK, taskId: identity.taskId,
@@ -66,7 +67,8 @@ describe("assertCompletionAllowed", () => {
     const writer = gateWriter()
 
     await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
-      .resolves.toEqual({ feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK })
+      .resolves.toEqual({ feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK,
+        [SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY]: SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY })
     expect(writer.append).toHaveBeenCalledWith("final.rejected", step.id, null, expect.objectContaining({
       code: "scheduled_post_gate_plan_required", feedback: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK,
     }), `final-rejected:${step.id}:scheduled-post-gate-plan-required`)

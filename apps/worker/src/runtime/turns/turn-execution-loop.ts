@@ -22,6 +22,7 @@ import { handoffRecoveredArchivedWait } from "./turn-execution-wait.js"
 import { assertFinalDependencyWaitAvailable, prepareFinalDependencyWaitCall } from "./turn-execution-final-dependency-wait.js"
 import { executeTurnToolStep } from "./turn-execution-tool-step.js"
 import { createTaskGraphDenialProgressTracker } from "./task-graph-denial-progress.js"
+import { applyVerifiedScheduledPostGateRecovery, isScheduledPostGateRecoveryBlock, retireScheduledPostGateRecovery, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY } from "./completion-recovery-context.js"
 import { takeRecoveredScheduledPipelineCandidate } from "../subagents/scheduled-pipeline-candidate-store.js"
 import { prepareTurnFinalAnswerEvidenceRequest, resolveTurnFinalAnswerMarkers } from "./turn-execution-evidence.js"
 import { completeTurnExecutionFinalAnswer, replayScheduledFinalAnswer } from "./turn-execution-final-answer.js"
@@ -30,32 +31,19 @@ import { handleTurnExecutionStepError, matchedTaskGraphDenialCheckpoint, termina
 const DEFAULT_MAX_STEPS = 32
 type ObjectiveProgressContextBuilder = TurnExecutionOptions["contextBuilder"] & { readonly objectiveProgressGoalRevision?: () => string | undefined }
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
-  const signal = options.signal ?? new AbortController().signal, now = options.now ?? (() => new Date())
-  const writer = new TurnExecutionEventWriter({ ...options, signal, now })
-  const baseBudget: TurnBudgetLimits = { ...options.budget, maxSteps: options.budget?.maxSteps ?? options.maxSteps ?? DEFAULT_MAX_STEPS }
-  const budget = createTurnBudgetLedger(resumedBudgetLimits(baseBudget, options.resume) ?? {})
-  const executionOptions = withRemainingTurnStepBudget(options, budget)
-  const progress = createProgressDetector(options.noProgressRepeatLimit ?? 2), denialProgress = createTaskGraphDenialProgressTracker(options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId ? options.resume?.taskGraphDenialProgress : undefined)
-  let snapshot = options.snapshot
-  let inputThroughSequence = options.resume?.inputThroughSequence ?? 0n
-  let consumedInputIds: readonly string[] = options.resume?.consumedInputIds ?? []
-  let steps = options.resume?.stepCount ?? 0
-  let toolCalls = options.resume?.toolCallCount ?? 0
+  const signal = options.signal ?? new AbortController().signal, now = options.now ?? (() => new Date()), writer = new TurnExecutionEventWriter({ ...options, signal, now })
+  const baseBudget: TurnBudgetLimits = { ...options.budget, maxSteps: options.budget?.maxSteps ?? options.maxSteps ?? DEFAULT_MAX_STEPS }, budget = createTurnBudgetLedger(resumedBudgetLimits(baseBudget, options.resume) ?? {})
+  const executionOptions = withRemainingTurnStepBudget(options, budget), progress = createProgressDetector(options.noProgressRepeatLimit ?? 2), denialProgress = createTaskGraphDenialProgressTracker(options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId ? options.resume?.taskGraphDenialProgress : undefined)
+  let snapshot = options.snapshot, inputThroughSequence = options.resume?.inputThroughSequence ?? 0n, consumedInputIds: readonly string[] = options.resume?.consumedInputIds ?? []
+  let steps = options.resume?.stepCount ?? 0, toolCalls = options.resume?.toolCallCount ?? 0
   let continuation: ModelContinuation | undefined, childToolReplayReceipts = options.childToolReplayReceipts ?? [], childWaitReplayReceipts = options.childWaitReplayReceipts ?? []
-  let recoveredCandidate = options.recoveredFinalCandidate
-  let recoveredScheduledCandidate: ReturnType<typeof takeRecoveredScheduledPipelineCandidate> = undefined
-  if (options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId && recoveredCandidate !== undefined) {
-    recoveredScheduledCandidate = takeRecoveredScheduledPipelineCandidate({ owner: options.identity, candidateText: recoveredCandidate })
-  }
-  let steeringMarkerState = options.steeringMarkerState, priorAgendaReceipt = options.resume?.cognitiveAgendaReceipt
-  const seenCallIds = new Set<string>()
+  let recoveredCandidate = options.recoveredFinalCandidate, recoveredScheduledCandidate: ReturnType<typeof takeRecoveredScheduledPipelineCandidate> = undefined
+  if (options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId && recoveredCandidate !== undefined) recoveredScheduledCandidate = takeRecoveredScheduledPipelineCandidate({ owner: options.identity, candidateText: recoveredCandidate })
+  let steeringMarkerState = options.steeringMarkerState, priorAgendaReceipt = options.resume?.cognitiveAgendaReceipt; const seenCallIds = new Set<string>()
   let lastStep: TurnEngineStep | null = null, closedSteps = new Set<string>(), receiptClosedSteps = new Set<string>()
   try {
-    await writer.append(
-      "turn.started", options.identity.turnId, null,
-      { goal: options.goal, taskId: options.identity.taskId, rootTaskId: options.identity.rootTaskId },
-      "turn-started",
-    )
+    await writer.append("turn.started", options.identity.turnId, null,
+      { goal: options.goal, taskId: options.identity.taskId, rootTaskId: options.identity.rootTaskId }, "turn-started")
     if (options.recoveredWaitControl) {
       const recoveredWait = await handoffRecoveredArchivedWait(options, writer, options.recoveredWaitControl, { stepCount: steps, toolCallCount: toolCalls }, now)
       if (recoveredWait) return recoveredWait
@@ -120,9 +108,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
             } })
           const { outcome, replayContext } = replay
           if (outcome.kind === "wait" || outcome.kind === "completed") return outcome.result
-          snapshot = denialProgress.replan(snapshot, step.id, outcome.feedback, outcome.taskGraphDenialCheckpoint, replayContext)
-          continuation = undefined
-          continue
+          snapshot = applyVerifiedScheduledPostGateRecovery(denialProgress.replan(snapshot, step.id, outcome.feedback, outcome.taskGraphDenialCheckpoint, replayContext), outcome.feedback, outcome[SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY]); continuation = undefined; continue
         }
         await writer.append("step.started", step.id, null, { stepId: step.id, ordinal: step.ordinal, taskId: options.identity.taskId }, `step-started:${step.id}`)
         if (options.identity.kind === "turn" && options.refreshTaskGraphBeforeStep) snapshot = await options.refreshTaskGraphBeforeStep(snapshot)
@@ -134,8 +120,8 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           taskId: options.identity.taskId,
           steeringMarkerState,
         })
-        const freshSteering = hasFreshSteering(context, consumedInputIds)
-        if (hasNewlyAcceptedInput(context, consumedInputIds)) { options.completionGate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.(); denialProgress.clear() }
+        const freshSteering = hasFreshSteering(context, consumedInputIds), acceptedInput = hasNewlyAcceptedInput(context, consumedInputIds)
+        if (acceptedInput) { options.completionGate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.(); denialProgress.clear(); snapshot = retireScheduledPostGateRecovery(snapshot) }
         const newlyObservedMarkers = context.steeringMarkerControl?.newlyObservedMarkers ?? []
         if (newlyObservedMarkers.length > 0) steeringMarkerState = rememberSteeringMarkers(steeringMarkerState, newlyObservedMarkers)
         inputThroughSequence = context.inputThroughSequence
@@ -148,7 +134,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           const terminal = await stopForRepeatedTaskGraphDenial({ options: withTaskGraphDenialCheckpoint(options, checkpoint, readCheckpoint), writer, step, context, stepCount: steps, toolCallCount: toolCalls, usage: budget.usage(), now })
           closedSteps.add(step.id); return terminal
         }
-        const receipt = buildCognitiveAgendaStepReceipt({ scope: { sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, stepId: step.id }, rootTaskId: options.identity.rootTaskId,
+        const previousGoalRevision = priorAgendaReceipt?.goalRevision, receipt = buildCognitiveAgendaStepReceipt({ scope: { sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, stepId: step.id }, rootTaskId: options.identity.rootTaskId,
           context: agendaContext, agenda: buildCognitiveActionAgenda(agendaContext, { freshSteering }), previousReceipt: priorAgendaReceipt,
           objectiveProgressGoalRevision: (options.contextBuilder as ObjectiveProgressContextBuilder).objectiveProgressGoalRevision, inputThroughSequence, consumedInputIds })
         const receiptKey = cognitiveAgendaReceiptIdempotencyKey(step.id)
@@ -159,8 +145,10 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         } catch {
           throw new TurnEngineError("persistence_conflict", "Cognitive agenda receipt could not be persisted")
         }
+        const goalChanged = previousGoalRevision !== undefined && previousGoalRevision !== receipt.goalRevision; if (goalChanged) snapshot = retireScheduledPostGateRecovery(snapshot)
+        const requestContext = acceptedInput || goalChanged ? { ...context, blocks: context.blocks.filter(block => !isScheduledPostGateRecoveryBlock(block)) } : context
         let request = buildModelRequest({
-          context, model: options.model, tools: options.tools,
+          context: requestContext, model: options.model, tools: options.tools,
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
           taskId: options.identity.taskId, userId: options.identity.userId, signal, continuation,
           freshSteering: options.identity.kind === "turn" && freshSteering,
@@ -216,6 +204,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
                 )
               }
               snapshot = outcome.snapshot
+              if (hasAcceptedAgentPlan(actionableOutput, snapshot)) snapshot = retireScheduledPostGateRecovery(snapshot)
               steeringMarkerState = outcome.steeringMarkerState
             },
           })
@@ -229,7 +218,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
             if (kind === "native_semantic_receipt") receiptClosedSteps.add(step.id)
           } })
         if (outcome.kind === "wait" || outcome.kind === "completed") return outcome.result
-        snapshot = denialProgress.replan(snapshot, step.id, outcome.feedback, outcome.taskGraphDenialCheckpoint, context); continuation = undefined; continue
+        snapshot = applyVerifiedScheduledPostGateRecovery(denialProgress.replan(snapshot, step.id, outcome.feedback, outcome.taskGraphDenialCheckpoint, context), outcome.feedback, outcome[SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY]); continuation = undefined; continue
       } catch (error: unknown) {
         await handleTurnExecutionStepError({ error, options, writer, step, stepOutput, questionIntentCallId, executionOptions, signal, now, closedSteps, receiptClosedSteps })
       }
@@ -244,4 +233,14 @@ function discoveryReplayOverflowStepIds(error: unknown): readonly string[] {
   if (!error || typeof error !== "object" || Array.isArray(error)) return []
   const stepIds = (error as { discoveryReplayStepIds?: unknown }).discoveryReplayStepIds
   return Array.isArray(stepIds) && stepIds.every(stepId => typeof stepId === "string" && stepId.length > 0) ? stepIds : []
+}
+
+function hasAcceptedAgentPlan(output: ModelStepResult, snapshot: TurnExecutionOptions["snapshot"]): boolean {
+  return output.toolCalls.some(call => {
+    const value = snapshot.toolObservations.find(item => item.id === `tool-result:${call.id}`)?.content
+    if (call.name !== "agent.plan" || !value || typeof value !== "object" || Array.isArray(value)) return false
+    const result = value as Record<string, unknown>, plan = result.output
+    if (result.toolCallId !== call.id || result.toolName !== call.name || result.status !== "completed" || result.errorCode !== null || !plan || typeof plan !== "object" || Array.isArray(plan)) return false
+    const status = (plan as Record<string, unknown>).status; return status === "accepted" || status === "duplicate"
+  })
 }

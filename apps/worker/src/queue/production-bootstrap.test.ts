@@ -287,6 +287,10 @@ function durableCompositionPool(input: {
         const admitted = owned && (admission ? state.session.status === "running" && !paused : !["aborted", "archived"].includes(state.session.status))
         return response<T>(admitted ? [{ id: state.session.id }] : [], admitted ? 1 : 0)
       }
+      if (sql.includes('SELECT "id" FROM "agent_sessions"') && sql.includes("FOR SHARE")) {
+        const owned = String(params[0]) === state.session.id && String(params[1]) === state.session.userId
+        return response<T>(owned ? [{ id: state.session.id }] : [], owned ? 1 : 0)
+      }
       if (sql.includes('SELECT "id", "sessionId", "userId", "source", "status", "leaseOwnerId"') && sql.includes('FROM "agent_turns" WHERE "id" = $1') && sql.includes("FOR UPDATE")) {
         const queryNow = params[5] instanceof Date ? params[5] : new Date(String(params[5]))
         const owned = String(params[0]) === state.turn.id && String(params[1]) === state.turn.sessionId && String(params[2]) === state.turn.userId &&

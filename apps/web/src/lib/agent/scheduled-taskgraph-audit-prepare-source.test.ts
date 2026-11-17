@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import type { Prisma } from '@prisma/client'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 
@@ -79,6 +80,17 @@ describe('Audit-only historical Prepare source validation', () => {
     }, sourceInputThroughSequence: '9', rootAttemptCount: owner.rootAttemptCount }))
   })
 
+  it('forwards the same-transaction locked Gate wait witness into historical recovery validation', async () => {
+    const reader = { agentEvent: { findMany: mocks.events }, agentStep: { findFirst: mocks.sourceStep },
+      agentItem: { findFirst: mocks.choice } } as unknown as Prisma.TransactionClient
+    const gateWait = { waitId: 'root-gate-wait', stepId: 'recovery-tail', gateTaskId: 'gate-child', approvalIds: [], requestAttemptCount: 2, owner,
+      turn: { id: owner.turnId, status: 'waiting_for_dependency', leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: null },
+      root: { id: owner.rootTaskId, status: 'waiting' as const, attemptCount: owner.rootAttemptCount, waitId: 'root-gate-wait' } }
+    await expect(validateScheduledTaskGraphAuditPrepareSource({ ...request, reader, gateWait })).resolves.toBe(true)
+    expect(mocks.recoveryEvidence).toHaveBeenCalledWith(expect.objectContaining({ reader, gateWait, owner,
+      source: { sourceEventId: candidateEvent.id, stepId: sourceStepId, ordinal: sourceStepOrdinal } }))
+  })
+
   it('accepts legacy v2 and receipt-bearing v3 candidates while rejecting malformed or widened payloads', async () => {
     const withPayload = (payload: unknown) => mocks.events.mockImplementation((query: { where: Record<string, unknown> }) => {
       if (query.where.type === 'agent.plan.scheduled_prepare_binding') return Promise.resolve([{ payload: receipt }])
@@ -148,5 +160,15 @@ describe('Audit-only historical Prepare source validation', () => {
     await expect(validateScheduledTaskGraphAuditPrepareSource({ ...request,
       owner: { ...owner, rootAttemptCount: owner.rootAttemptCount + 1 } })).resolves.toBe(false)
     await expect(validateScheduledTaskGraphAuditPrepareSource({ ...request, scheduledWaitId: 'other-wait' })).resolves.toBe(false)
+  })
+
+  it('rejects a historical Prepare question or answer that no longer matches its source receipt', async () => {
+    mocks.choice.mockResolvedValue({ ...choiceItem, content: { ...choiceItem.content, question: 'A different question' } })
+    await expect(validateScheduledTaskGraphAuditPrepareSource(request)).resolves.toBe(false)
+    expect(mocks.recoveryEvidence).not.toHaveBeenCalled()
+    setup()
+    mocks.choice.mockResolvedValue({ ...choiceItem, content: { ...choiceItem.content, answer: 'unexpected_choice' } })
+    await expect(validateScheduledTaskGraphAuditPrepareSource(request)).resolves.toBe(false)
+    expect(mocks.recoveryEvidence).not.toHaveBeenCalled()
   })
 })

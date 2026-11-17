@@ -16,6 +16,7 @@ import { parseScheduledTaskGraphContinuationReceipt, scheduledSnapshotMatches, S
   scheduledTaskGraphContinuationKeyVersion, scheduledTaskGraphStableContinuationKey, type ScheduledTaskGraphContinuationReceipt } from "./scheduled-taskgraph-continuation-receipt.js"
 import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
 import { scheduledPrepareReceiptOwnerRootMatches } from "./scheduled-prepare-owner-root.js"
+import type { ScheduledPrepareGateWaitWitness } from "./scheduled-prepare-gate-wait-witness.js"
 import { validateRoleResult, type PrepareResult } from "./role-results.js"
 import { TASK_GRAPH_TEMPLATES as TEMPLATES } from "./task-graph-templates.js"
 import { verifyScheduledPrepareToolResultReference, type ScheduledPrepareToolResultVerificationMode } from "./scheduled-prepare-tool-result-verification.js"
@@ -29,7 +30,7 @@ export type ScheduledPrepareDependencyWait = Readonly<{ waitId: string; status: 
 export type ScheduledPrepareTaskGraphProof = Readonly<{ receipt: ScheduledTaskGraphContinuationReceipt; completion: ScheduledPrepareCompletionFacts & Readonly<{ wait: ScheduledPrepareDependencyWait }>; result: PrepareResult }>
 export type ScheduledPrepareVerification = Readonly<{ verified: true; facts: ScheduledPrepareTaskGraphProofFacts }> | Readonly<{ verified: false; reasonCode: string }>
 /** Verifies Prepare against its exact registered call, Analyze lineage, checkpoint, and immutable material rows. */
-export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable, input: Readonly<{ scope: ScheduledPrepareVerificationScope; snapshot: TaskGraphSnapshot; current: TaskGraphCurrentState; tasks: ReadonlyMap<string, GraphTaskRow>; structuredResult: unknown; completionGraphRevision: number; referenceVerificationMode: ScheduledPrepareToolResultVerificationMode; checkpointStage?: ScheduledPrepareCheckpointStage }>): Promise<ScheduledPrepareVerification> {
+export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable, input: Readonly<{ scope: ScheduledPrepareVerificationScope; snapshot: TaskGraphSnapshot; current: TaskGraphCurrentState; tasks: ReadonlyMap<string, GraphTaskRow>; structuredResult: unknown; completionGraphRevision: number; referenceVerificationMode: ScheduledPrepareToolResultVerificationMode; checkpointStage?: ScheduledPrepareCheckpointStage; gateWaitWitness?: ScheduledPrepareGateWaitWitness }>): Promise<ScheduledPrepareVerification> {
   try { const scope = input.scope, result = validateRoleResult(input.structuredResult, "prepare")
     if (result.status !== "completed" || result.taskId !== scope.taskId || result.attemptCount !== scope.attemptCount)
       return rejected("scheduled_prepare_result_invalid")
@@ -46,7 +47,7 @@ export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable,
       || !prepareGraphMatches(snapshot, current, scope, prepareTask, input.completionGraphRevision, prepare)) return rejected("scheduled_prepare_graph_invalid")
     const receipt = await readPrivateReceipt(client, scope)
     const root = receipt && await scheduledPrepareReceiptOwnerRootMatches(client, scope, receipt.owner,
-      input.referenceVerificationMode.phase, input.tasks)
+      input.referenceVerificationMode.phase, input.tasks, input.gateWaitWitness)
     if (!receipt || !root) return rejected("scheduled_prepare_receipt_invalid")
     const version = scheduledTaskGraphContinuationKeyVersion(receipt.continuationKey)
     if (!version || version !== graphVersion) return rejected("scheduled_prepare_receipt_invalid")

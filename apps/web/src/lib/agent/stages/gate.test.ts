@@ -29,6 +29,8 @@ function context(overrides: Partial<PipelineCtx['agentCfg']> = {}): PipelineCtx 
     resumeText: 'Security analyst', resumeContent: {} as PipelineCtx['resumeContent'],
     defaultResume: { id: 'resume_1', name: 'Base', templateId: null, templateOptions: null, directionId: null, basicsDetached: false },
     aiConfig: { provider: 'minimax', model: 'MiniMax-M3' }, autonomous: true, emit: vi.fn(),
+    scheduledGateQualityModelCall: async input => ({ ...await mocks.modelChat(input.messages, input.config, input.maxTokens),
+      provider: 'minimax', model: 'MiniMax-M3', inputTokens: 20, outputTokens: 12 }),
   }
 }
 
@@ -130,6 +132,24 @@ describe('runGate', () => {
     expect(ctx.askUser).toHaveBeenCalledWith('reviewer', expect.stringContaining('quality is low(4/10)'), expect.any(Array))
     expect(result.data?.pending).toHaveLength(1)
     expect(result.data?.skipped).toHaveLength(0)
+  })
+
+  it('fences a scheduled quality result if the Gate claim is replaced during the provider call', async () => {
+    const ctx = context()
+    let currentChecks = 0
+    ctx.scheduledTaskGraphOwnerFence = { owner: {} as never, key: 'claim-key', claimToken: 'claim-token', assertCurrent: vi.fn() }
+    ctx.assertExecutionCurrent = vi.fn(async () => ++currentChecks < 4)
+    ctx.scheduledGateQualityModelCall = vi.fn().mockResolvedValue({
+      text: JSON.stringify({ clScore: 8, fitGap: 'gap', recommendation: 'improve', readyToApply: true }),
+      provider: 'minimax', model: 'MiniMax-M3', inputTokens: 20, outputTokens: 18,
+    })
+    const pkg = { ...packageFor(75), coverLetter: 'Draft.', job: { ...packageFor(75).job, description: 'Role details.' } }
+
+    await expect(runScheduledGate([pkg], ctx)).rejects.toThrow('Agent execution was cancelled')
+
+    expect(ctx.scheduledGateQualityModelCall).toHaveBeenCalledOnce()
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.createGateReviewReceipt).not.toHaveBeenCalled()
   })
 
   it('marks a below-threshold package as skipped by default', async () => {

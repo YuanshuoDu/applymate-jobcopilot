@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { Prisma } from "@prisma/client"
+import { SCHEDULED_GATE_REVIEW_MARKER_SCHEMA } from "../approval/gate-replay"
 
 const mocks = vi.hoisted(() => ({ turnFindFirst: vi.fn(), issueLegacyReceipt: vi.fn(), findScheduledGateReviewReceiptReplay: vi.fn(), clientReceipt: vi.fn(), hashLegacyValue: vi.fn() }))
 vi.mock("@/lib/db", () => ({ db: { agentTurn: { findFirst: mocks.turnFindFirst } } }))
@@ -163,6 +164,7 @@ describe("Gate review receipt ownership", () => {
       },
       key: "continuation_key_1",
       claimToken: "claim_token_1",
+      gateTaskId: "gate_task_1",
       assertCurrent: vi.fn(async () => true),
     }
     const pipeline = ctx({
@@ -174,7 +176,10 @@ describe("Gate review receipt ownership", () => {
 
     expect(mocks.issueLegacyReceipt.mock.calls[0]?.[1]).toMatchObject({
       replayMode: "scheduled-taskgraph-gate-review",
-      scheduledOwnerFence: { owner: { rootTaskId: "root_task_1", rootAttemptCount: 2, executionAttemptCount: 0 } },
+      scheduledOwnerFence: { owner: { rootTaskId: "root_task_1", rootAttemptCount: 2, executionAttemptCount: 0 },
+        gateTaskId: "gate_task_1" },
+      payload: { jobId: "job_1", scheduledGateReview: {
+        schemaVersion: SCHEDULED_GATE_REVIEW_MARKER_SCHEMA, gateTaskId: "gate_task_1" } },
     })
   })
 
@@ -182,7 +187,8 @@ describe("Gate review receipt ownership", () => {
     const ownerFence = {
       owner: { userId: "user_1", sessionId: "session_1", turnId: "turn_1", rootTaskId: "root_task_1", rootAttemptCount: 2,
         turnLeaseOwnerId: "lease_owner_1", turnLeaseVersion: 5, executionId: "execution_1", executionAttemptCount: 4 },
-      key: "continuation_key_1", claimToken: "claim_token_1", assertCurrent: vi.fn(async () => true),
+      key: "continuation_key_1", claimToken: "claim_token_1",
+      gateTaskId: "gate_task_1", assertCurrent: vi.fn(async () => true),
     }
 
     await expect(findGateReviewReceiptReplay(ctx({ scheduledTaskGraphOwnerFence: ownerFence }), pkg)).resolves.toBeNull()
@@ -190,7 +196,9 @@ describe("Gate review receipt ownership", () => {
     expect(mocks.findScheduledGateReviewReceiptReplay).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       replayMode: "scheduled-taskgraph-gate-review",
       scheduledOwnerFence: ownerFence,
-      payload: expect.objectContaining({ jobId: "job_1", artifactBindings: [{ artifactId: "artifact_resume_1", artifactHash: "resume-hash", constraintHash: "constraints", status: "passed" }] }),
+      payload: expect.objectContaining({ jobId: "job_1",
+        scheduledGateReview: { schemaVersion: SCHEDULED_GATE_REVIEW_MARKER_SCHEMA, gateTaskId: "gate_task_1" },
+        artifactBindings: [{ artifactId: "artifact_resume_1", artifactHash: "resume-hash", constraintHash: "constraints", status: "passed" }] }),
     }))
     expect(mocks.issueLegacyReceipt).not.toHaveBeenCalled()
   })
@@ -212,7 +220,8 @@ describe("Gate review receipt ownership", () => {
     const ownerFence = {
       owner: { userId: "user_1", sessionId: "session_1", turnId: "turn_1", rootTaskId: "root_task_1", rootAttemptCount: 2,
         turnLeaseOwnerId: "lease_owner_1", turnLeaseVersion: 5, executionId: "execution_1", executionAttemptCount: 4 },
-      key: "continuation_key_1", claimToken: "claim_token_1", assertCurrent: vi.fn(async () => true),
+      key: "continuation_key_1", claimToken: "claim_token_1",
+      gateTaskId: "gate_task_1", assertCurrent: vi.fn(async () => true),
     }
     await createGateReviewReceipt(ctx({ scheduledTaskGraphOwnerFence: ownerFence }), pkg, false)
 

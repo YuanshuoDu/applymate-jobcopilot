@@ -13,7 +13,7 @@ import type { TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final
 import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 import { parseTaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
-import { tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
+import { tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY } from "./completion-recovery-context.js"
 import { isTurnStateRefreshRetryError } from "./turn-execution-question.js"
 
 export const TASK_GRAPH_VERIFICATION_BLOCKER = "task_graph_verification_unverified"
@@ -23,7 +23,7 @@ export const TASK_GRAPH_FEEDBACK = "TaskGraph required evidence is missing, inva
 type CompletionGateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate" | "isOwnershipLost">
 type CompletionGateWriter = Pick<TurnExecutionEventWriter, "append">
 type CompletionDecision = Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>
-type CompletionResult = TaskGraphFinalSummaryBinding | { feedback: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true;
+type CompletionResult = TaskGraphFinalSummaryBinding | { feedback: string; readonly [SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY]?: typeof SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true;
   readonly [NATIVE_SEMANTIC_REJECTION]?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity;
   readonly [TASK_GRAPH_DENIAL_CHECKPOINT]?: TaskGraphDenialCheckpoint } | { waitId: string }
   | { scheduledWaitId: string; candidateText: string }
@@ -53,7 +53,7 @@ export async function assertCompletionAllowed(options: CompletionGateOptions, wr
       if (disposition.status === "replan") {
         await writer.append("final.rejected", step.id, null, { code: "scheduled_post_gate_plan_required", blocker: "scheduled_post_gate_plan_required",
           feedback: disposition.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}:scheduled-post-gate-plan-required`)
-        return { feedback: disposition.feedback }
+        return { feedback: disposition.feedback, [SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY]: SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY }
       }
       if (disposition.status === "waiting_for_dependency") return { waitId: disposition.waitId }
       if (disposition.status === "completed") {
@@ -82,7 +82,7 @@ export async function assertCompletionAllowed(options: CompletionGateOptions, wr
         if (parsed.feedback !== SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK) throw new TurnEngineError("invalid_output", "Scheduled post-Gate plan feedback is invalid")
         await writer.append("final.rejected", step.id, null, { code: "scheduled_post_gate_plan_required", blocker: "scheduled_post_gate_plan_required",
           feedback: parsed.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}:scheduled-post-gate-plan-required`)
-        return { feedback: parsed.feedback }
+        return { feedback: parsed.feedback, [SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY]: SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY }
       }
       if (parsed.status === "waiting_for_dependency") return { waitId: parsed.waitId }
       if (parsed.status === "waiting_for_user") return { scheduledWaitId: parsed.waitId, candidateText: parsed.candidateText }
