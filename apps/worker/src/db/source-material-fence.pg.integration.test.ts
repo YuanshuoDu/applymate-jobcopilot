@@ -554,8 +554,8 @@ describeWithPostgres("Web Prisma and Worker pg source material fence", () => {
         VALUES ($1, $2, 'Fence Fixture Co', 'Engineer', 'saved', CURRENT_TIMESTAMP)`, [jobId, userId])
       await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
         VALUES ($1, $2, 'Source fence submission test', 'running', 'test', CURRENT_TIMESTAMP)`, [sessionId, userId])
-      await pool!.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot")
-        VALUES ($1, $2, $3, 'test', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb)`, [turnId, sessionId, userId])
+      await pool!.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
+        VALUES ($1, $2, $3, 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`, [turnId, sessionId, userId])
       await pool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "role", "taskType", "status", "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema")
         VALUES ($1, $2, $3, 'application_filler', 'application_fill_for_review', 'completed', 'Source fence test', '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb)`,
       [fillerTaskId, sessionId, turnId])
