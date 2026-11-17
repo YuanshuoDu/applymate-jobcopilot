@@ -446,6 +446,7 @@ describeWithPostgres("Web Prisma and Worker pg source material fence", () => {
   it("blocks the canonical legacy Job outcome writer behind the Web user fence until commit", async () => {
     const suffix = randomUUID()
     const userId = `source-fence-legacy-user-${suffix}`
+    const userEmail = `${userId}@example.invalid`
     const jobId = `source-fence-legacy-job-${suffix}`
     const taskId = `source-fence-legacy-task-${suffix}`
     const scope = { applicationTaskId: taskId, userId, jobId }
@@ -458,9 +459,9 @@ describeWithPostgres("Web Prisma and Worker pg source material fence", () => {
     let writerCalled = false
 
     try {
-      await pool!.query(`INSERT INTO "User" ("id") VALUES ($1)`, [userId])
-      await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "status")
-        VALUES ($1, $2, 'Fence Fixture Co', 'Engineer', 'applied')`, [jobId, userId])
+      await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [userId, userEmail])
+      await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "status", "updatedAt")
+        VALUES ($1, $2, 'Fence Fixture Co', 'Engineer', 'applied', CURRENT_TIMESTAMP)`, [jobId, userId])
       await pool!.query(`INSERT INTO application_tasks ("id", "userId", "jobId", "status", "checkpoint", "updatedAt")
         VALUES ($1, $2, $3, 'filling', 'browser_active', CURRENT_TIMESTAMP)`, [taskId, userId, jobId])
 
