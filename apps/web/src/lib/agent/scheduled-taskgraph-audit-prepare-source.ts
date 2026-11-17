@@ -4,6 +4,7 @@ import { db } from '@/lib/db'
 import { parseScheduledAutomationSnapshot } from './scheduled-automation-snapshot'
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { validateScheduledTaskGraphAuditRecoveryEvidence } from './scheduled-taskgraph-audit-recovery-evidence'
+import type { ScheduledGateRootWait } from './scheduled-taskgraph-gate-root-wait'
 import { isScheduledPrepareChoiceWaitId, parseScheduledPrepareChoiceReceipt, scheduledPrepareChoiceBinding, scheduledPrepareChoiceId } from './scheduled-taskgraph-run-receipt'
 
 const RECEIPT_EVENT = 'agent.plan.scheduled_prepare_binding'
@@ -15,15 +16,16 @@ const MAX_ROWS = 65
 type Row = Record<string, unknown>
 type CandidateSource = Readonly<{ sourceEventId: string; stepId: string; ordinal: number }>
 
-/** Validates historical Prepare choice/source identity while allowing only server-marked recovery Steps afterward. */
+/** Validates a historical Prepare source only after its exact approved choice and recovery tail are proven. */
 export async function validateScheduledTaskGraphAuditPrepareSource(input: Readonly<{
-  owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; proof: unknown; scheduledWaitId?: string; reader?: Prisma.TransactionClient
+  owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; proof: unknown; scheduledWaitId?: string; reader?: Prisma.TransactionClient;
+  gateWait?: ScheduledGateRootWait
 }>): Promise<boolean> {
   try {
     const reader = input.reader ?? db
     const snapshot = parseScheduledAutomationSnapshot(input.snapshot), receipt = exactRecord(input.proof, ['receipt', 'completion', 'result'])?.receipt
     const parsedReceipt = parseScheduledPrepareChoiceReceipt(receipt, input.owner, scheduledAutomationSnapshotDigest(snapshot))
-    if (!parsedReceipt || (snapshot.requireApproval ? !isScheduledPrepareChoiceWaitId(input.owner.turnId, input.scheduledWaitId)
+    if (!parsedReceipt || input.gateWait && !snapshot.requireApproval || (snapshot.requireApproval ? !isScheduledPrepareChoiceWaitId(input.owner.turnId, input.scheduledWaitId)
       : input.scheduledWaitId !== undefined)) return false
     const [receipts, candidates] = await Promise.all([
       reader.agentEvent.findMany({ where: { sessionId: input.owner.sessionId, turnId: input.owner.turnId, type: RECEIPT_EVENT,
@@ -40,14 +42,14 @@ export async function validateScheduledTaskGraphAuditPrepareSource(input: Readon
       if (!candidate) continue
       const waitId = scheduledPrepareChoiceId(parsedReceipt, candidate.stepId, candidate.ordinal)
       if (snapshot.requireApproval && waitId !== input.scheduledWaitId) continue
-      if (await candidateSourceCurrent(reader, input.owner, parsedReceipt, candidate, waitId, snapshot.requireApproval)) valid.push(candidate)
+      if (await candidateSourceCurrent(reader, input.owner, parsedReceipt, candidate, waitId, snapshot.requireApproval, input.gateWait)) valid.push(candidate)
     }
     return valid.length === 1
   } catch { return false }
 }
 
 async function candidateSourceCurrent(reader: Prisma.TransactionClient, owner: ScheduledTaskGraphPipelineOwner, receipt: Row, candidate: CandidateSource,
-  waitId: string, requireChoice: boolean): Promise<boolean> {
+  waitId: string, requireChoice: boolean, gateWait?: ScheduledGateRootWait): Promise<boolean> {
   const source = await reader.agentStep.findFirst({ where: { id: candidate.stepId, sessionId: owner.sessionId,
     turnId: owner.turnId, taskId: owner.rootTaskId, attempt: 1, ordinal: candidate.ordinal },
   select: { id: true, ordinal: true, attempt: true, status: true, inputThroughSequence: true } })
@@ -60,7 +62,7 @@ async function candidateSourceCurrent(reader: Prisma.TransactionClient, owner: S
     select: { id: true, stepId: true, taskId: true, type: true, status: true, content: true } })
   if (requireChoice ? !validChoiceItem(item, owner, candidate, receipt, waitId, binding) : item !== null) return false
   return validateScheduledTaskGraphAuditRecoveryEvidence({ reader, owner, source: candidate,
-    sourceInputThroughSequence: sourceCursor, rootAttemptCount: owner.rootAttemptCount })
+    sourceInputThroughSequence: sourceCursor, rootAttemptCount: owner.rootAttemptCount, ...(gateWait ? { gateWait } : {}) })
 }
 
 async function rejectedStepEvent(reader: Prisma.TransactionClient, owner: ScheduledTaskGraphPipelineOwner, stepId: string): Promise<boolean> {

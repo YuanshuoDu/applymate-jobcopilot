@@ -1,6 +1,8 @@
 import type pg from "pg"
 import { parseTerminalRootResult } from "./root-task-terminal-result.js"
 import { SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE } from "./scheduled-audit-contract.js"
+import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
+import { scheduledPrepareGateRootWitnessMatches, type ScheduledPrepareGateWaitWitness } from "./scheduled-prepare-gate-wait-witness.js"
 import type { ScheduledTaskGraphContinuationReceipt } from "./scheduled-taskgraph-continuation-receipt.js"
 import type { ScheduledAutomationPersistedRoot } from "./scheduled-automation-pipeline-bridge.js"
 
@@ -13,10 +15,12 @@ type Mode = "finish" | "persisted_gate"
 
 /** Preserves live registration checks and accepts only a root parked on this graph's running Audit child. */
 export async function scheduledPrepareReceiptOwnerRootMatches(client: Client, scope: Scope, owner: Owner,
-  mode: Mode, tasks: ReadonlyMap<string, Task>): Promise<ScheduledAutomationPersistedRoot | null> {
+  mode: Mode, tasks: ReadonlyMap<string, Task>, gateWaitWitness?: ScheduledPrepareGateWaitWitness): Promise<ScheduledAutomationPersistedRoot | null> {
   if (owner.userId !== scope.userId || owner.sessionId !== scope.sessionId || owner.turnId !== scope.turnId || owner.rootTaskId !== scope.rootTaskId) return null
   const rows = await client.query<Row>(`SELECT task."id", session."userId" AS "userId", task."sessionId", task."turnId", task."status", task."attemptCount",
-      task."result", task."failureReason", turn."status" AS "turnStatus", turn."leaseOwnerId" AS "turnLeaseOwnerId", turn."leaseExpiresAt" AS "turnLeaseExpiresAt"
+      task."result", task."failureReason", turn."status" AS "turnStatus", turn."leaseOwnerId" AS "turnLeaseOwnerId",
+      turn."leaseVersion" AS "turnLeaseVersion", turn."leaseExpiresAt" AS "turnLeaseExpiresAt",
+      turn."leaseExpiresAt" > clock_timestamp() AS "turnLeaseValid"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
     JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
     WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $1 AND task."parentTaskId" IS NULL
@@ -25,19 +29,45 @@ export async function scheduledPrepareReceiptOwnerRootMatches(client: Client, sc
   const row = asRecord(rows.rows[0])
   if (rows.rows.length !== 1 || !row || row.id !== owner.rootTaskId || row.userId !== scope.userId || row.sessionId !== scope.sessionId
     || row.turnId !== scope.turnId || Number(row.attemptCount) !== owner.rootAttemptCount) return null
-  if (row.status === "running") return root(owner, scope, "running")
+  if (row.status === "running") {
+    if (row.turnStatus === "waiting_for_approval") {
+      if (mode !== "persisted_gate" || !gateWaitWitness || !currentGateTaskMatches(tasks, gateWaitWitness)
+        || !await scheduledPrepareGateRootWitnessMatches(client, { scope, rootStatus: "running",
+          rootAttemptCount: owner.rootAttemptCount, turnStatus: String(row.turnStatus), turnLeaseOwnerId: row.turnLeaseOwnerId,
+          turnLeaseExpiresAt: row.turnLeaseExpiresAt, turnLeaseVersion: row.turnLeaseVersion, turnLeaseValid: row.turnLeaseValid,
+          waitId: null, witness: gateWaitWitness })) return null
+    }
+    return root(owner, scope, "running")
+  }
   if (mode !== "persisted_gate" || row.status !== "waiting" || row.failureReason !== null
-    || row.turnStatus !== "waiting_for_dependency" || row.turnLeaseOwnerId !== null || row.turnLeaseExpiresAt !== null) return null
+    || !["waiting_for_dependency", "waiting_for_approval"].includes(String(row.turnStatus))
+    || row.turnLeaseOwnerId !== null || row.turnLeaseExpiresAt !== null) return null
   const result = asRecord(row.result)
   if (!result || !exact(result, ["status", "stepCount", "toolCallCount", "finalItemId", "waitId"]) || result.finalItemId !== null) return null
   let parsed: ReturnType<typeof parseTerminalRootResult>
   try { parsed = parseTerminalRootResult({ id: row.id, status: row.status, result: row.result, failureReason: row.failureReason }) } catch { return null }
   if (parsed.result.status !== "waiting_for_dependency" || !parsed.result.waitId) return null
+  if (gateWaitWitness) {
+    if (!currentGateTaskMatches(tasks, gateWaitWitness) || !await scheduledPrepareGateRootWitnessMatches(client, { scope,
+      rootStatus: "waiting", rootAttemptCount: owner.rootAttemptCount, turnStatus: String(row.turnStatus),
+      turnLeaseOwnerId: row.turnLeaseOwnerId, turnLeaseExpiresAt: row.turnLeaseExpiresAt,
+      turnLeaseVersion: row.turnLeaseVersion, turnLeaseValid: row.turnLeaseValid,
+      waitId: parsed.result.waitId, witness: gateWaitWitness })) return null
+    return root(owner, scope, "waiting")
+  }
+  if (row.turnStatus !== "waiting_for_dependency") return null
   const audits = [...tasks.values()].filter(task => task.role === SCHEDULED_AUDIT_ROLE && task.taskType === SCHEDULED_AUDIT_TASK_TYPE
     && task.status === "running" && task.failureReason === null && Number.isSafeInteger(task.attemptCount) && Number(task.attemptCount) > 0)
   if (audits.length !== 1 || !validId(audits[0]!.id)) return null
   return await parkedAuditWaitMatches(client, scope, owner.rootTaskId, owner.rootAttemptCount, parsed.result.waitId, audits[0]!)
     ? root(owner, scope, "waiting") : null
+}
+
+function currentGateTaskMatches(tasks: ReadonlyMap<string, Task>, witness: ScheduledPrepareGateWaitWitness): boolean {
+  const gates = [...tasks.values()].filter(task => task.role === SCHEDULED_GATE_ROLE && task.taskType === SCHEDULED_GATE_TASK_TYPE)
+  const gate = gates[0]
+  return gates.length === 1 && gate?.id === witness.gateTaskId && gate.status === "running"
+    && gate.failureReason === null && gate.attemptCount === witness.gateAttemptCount
 }
 
 async function parkedAuditWaitMatches(client: Client, scope: Scope, rootTaskId: string, rootAttemptCount: number,

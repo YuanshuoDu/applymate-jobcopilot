@@ -22,10 +22,13 @@ import {
 
 type ApprovalRow = Prisma.AgentApprovalGetPayload<{}>
 
+export const SCHEDULED_GATE_REVIEW_MARKER_SCHEMA = "agent-harness.v2.scheduled-gate-review-marker.v1"
+
 export type ScheduledGateReplayOwnerFence = {
   owner: ScheduledTaskGraphPipelineOwner
   key: string
   claimToken: string
+  gateTaskId?: string
   assertCurrent: (tx: Prisma.TransactionClient) => Promise<boolean>
 }
 
@@ -91,11 +94,18 @@ export function mapReplayApproval(row: ApprovalRow, scope: ApprovalScope): Agent
     body: row.body,
     scope,
     scopeHash: row.scopeHash as string,
-    payload: row.payload,
+    payload: replaySafePayload(row.payload),
     decidedAt: row.decidedAt?.toISOString() ?? null,
     consumedAt: row.consumedAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),
   }
+}
+
+function replaySafePayload(payload: unknown): unknown {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload
+  const safe = { ...(payload as Record<string, unknown>) }
+  delete safe.scheduledGateReview
+  return safe
 }
 
 export async function recoverGateReviewReplay(

@@ -101,6 +101,29 @@ describe('scheduled TaskGraph Gate materials', () => {
       .resolves.toMatchObject({ materials: [{ jobId: 'job-1', kind: 'resume' }], packages: [{ jobId: 'job-1' }] })
   })
 
+  it('loads sources, artifact versions, and artifact heads through the supplied transaction reader', async () => {
+    const refs = ['job:job-1', 'resume:resume-1']
+    const { artifactRef } = installGateRows(refs)
+    const reader = {
+      agentSession: { findFirst: vi.fn((args: unknown) => mocks.session(args)) },
+      job: { findMany: vi.fn((args: unknown) => mocks.jobs(args)) },
+      resume: { findFirst: vi.fn((args: unknown) => mocks.resume(args)) },
+      personaFact: { findMany: vi.fn((args: unknown) => mocks.facts(args)) },
+      agentArtifactVersion: { findMany: vi.fn((args: unknown) => mocks.versions(args)) },
+      agentArtifact: { findMany: vi.fn((args: unknown) => mocks.heads(args)) },
+    }
+
+    await expect(loadScheduledTaskGraphGateMaterials({ owner, scoredJobs, minScore: 70, dailyCap: 5, taskId: 'prepare-1',
+      jobs: [{ jobId: 'job-1', status: 'prepared' }], materials: [{ jobId: 'job-1', kind: 'resume', artifactRef }],
+      reader: reader as never })).resolves.toMatchObject({ packages: [{ jobId: 'job-1' }] })
+    expect(reader.agentSession.findFirst).toHaveBeenCalledOnce()
+    expect(reader.job.findMany).toHaveBeenCalledOnce()
+    expect(reader.resume.findFirst).toHaveBeenCalledOnce()
+    expect(reader.personaFact.findMany).toHaveBeenCalledOnce()
+    expect(reader.agentArtifactVersion.findMany).toHaveBeenCalledOnce()
+    expect(reader.agentArtifact.findMany).toHaveBeenCalledOnce()
+  })
+
   it('accepts a cited Persona subset from the complete source bundle', async () => {
     const refs = ['job:job-1', 'persona:fact-a', 'resume:resume-1']
     const { artifactRef } = installGateRows(refs)
