@@ -14,6 +14,7 @@ const OWNER_KEYS = ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptC
   "turnLeaseVersion", "executionId", "executionAttemptCount"] as const;
 const STABLE_OWNER_KEYS = ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "executionId",
   "executionAttemptCount"] as const;
+type ScheduledTaskGraphSourceChangeTerminalOwner = Pick<ScheduledTaskGraphPipelineOwner, typeof STABLE_OWNER_KEYS[number]>;
 
 type TerminalizeResult = "terminalized" | "owner_changed" | "snapshot_changed" | "state_changed" | "not_confirmed";
 
@@ -72,7 +73,7 @@ function validJournal(value: unknown, claim: NonNullable<ReturnType<typeof parse
     && objectRow(row.attemptsByJob) && Array.isArray(row.failedJobIds)
     && (!v2 || objectRow(row.sourceFingerprintsByJob)));
 }
-function terminalMarkerMatches(value: unknown, owner: ScheduledTaskGraphPipelineOwner): boolean {
+function terminalMarkerMatches(value: unknown, owner: ScheduledTaskGraphSourceChangeTerminalOwner): boolean {
   const row = objectRow(value), markerOwner = objectRow(row?.owner);
   return Boolean(row && Object.keys(row).sort().join(",") === ["schemaVersion", "owner"].sort().join(",")
     && row.schemaVersion === TERMINAL_SCHEMA && markerOwner
@@ -81,7 +82,7 @@ function terminalMarkerMatches(value: unknown, owner: ScheduledTaskGraphPipeline
 }
 
 export function isScheduledTaskGraphSourceChangeTerminal(input: {
-  owner: ScheduledTaskGraphPipelineOwner; status: string; error: unknown; state: unknown;
+  owner: ScheduledTaskGraphSourceChangeTerminalOwner; status: string; error: unknown; state: unknown;
 }): boolean {
   const state = objectRow(input.state);
   return input.status === "failed" && input.error === TERMINAL_ERROR

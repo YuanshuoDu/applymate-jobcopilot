@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { isDurableTurnRunning } from './AgentPlaygroundPage'
+import { isDurableTurnRunning, shouldRefetchTurnStateAfterAutomationRun } from './AgentPlaygroundPage'
 
 const source = readFileSync(new URL('./AgentPlaygroundPage.tsx', import.meta.url), 'utf8').replace(/\r\n/g, '\n')
 const streamSource = readFileSync(new URL('../agent-workspace/AgentUnifiedStream.tsx', import.meta.url), 'utf8')
@@ -64,6 +64,12 @@ describe('Agent workspace responsive layout', () => {
     expect(source).not.toContain('conversationTitle={activeTurn?.goal')
   })
 
+  it('keeps source-change recovery guidance in the session workspace after the active Turn stops', () => {
+    expect(source).toContain('ScheduledSourceChangeRecoveryNotice')
+    expect(source).toContain('scheduledPipelineRecoveryReason')
+    expect(source).toContain('<ScheduledSourceChangeRecoveryNotice reason={scheduledPipelineRecoveryReason} turnStatus={activeTurn?.status} />')
+  })
+
   it('mounts the discovery trigger on the live Agent page without wiring it to legacy execution', () => {
     expect(appShellSource).toMatch(/agent:\s*AgentPlaygroundPage/)
     expect(source).toContain('<AgentDiscoveryLauncher')
@@ -115,11 +121,20 @@ describe('Agent workspace responsive layout', () => {
 })
 
 describe('canonical automation runs', () => {
+  it.each([
+    ['same session', 'session_1', 'session_1', true],
+    ['different session', 'session_1', 'session_2', false],
+    ['no current session', null, 'session_2', false],
+  ] as const)('refreshes the Turn projection only for a same-session Run Now (%s)', (_label, selectedSessionId, runSessionId, expected) => {
+    expect(shouldRefetchTurnStateAfterAutomationRun(selectedSessionId, runSessionId)).toBe(expected)
+  })
+
   it('selects the already-enqueued session without opening the legacy SSE run', () => {
     const onRunSessionBody = source.match(/onRunSession: \(id, policy\) => \{([\s\S]*?)\n\s*\},/)?.[1]
 
     expect(onRunSessionBody).toBeTruthy()
     expect(onRunSessionBody).toContain('selectAutomationSession(id, policy)')
+    expect(onRunSessionBody).toContain('if (shouldRefetchTurnStateAfterAutomationRun(selectedSessionId, id)) refetchTurnState()')
     expect(onRunSessionBody).not.toContain('startRun(')
     expect(source).toContain('setActiveRunPolicy(policy)')
   })

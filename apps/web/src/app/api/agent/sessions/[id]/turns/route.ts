@@ -5,6 +5,7 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 
 import { db } from "@/lib/db"
 import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
+import { isScheduledTaskGraphSourceChangeTerminal } from "@/lib/agent/scheduled-taskgraph-source-change-terminal"
 
 import {
   afterCursor,
@@ -19,6 +20,7 @@ interface RouteContext {
 }
 
 const ACTIVE_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] as const
+const SOURCE_CHANGE_RECOVERY_REASON = "scheduled_pipeline_source_changed" as const
 
 const TURN_SELECT = {
   id: true, sessionId: true, source: true, status: true, revision: true, input: true,
@@ -48,6 +50,57 @@ function activeTurnProjection(row: TurnQueryRow | null) {
   }
 }
 
+function objectRow(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+async function sourceChangeRecoveryReason(input: {
+  userId: string; sessionId: string; activeTurn: Promise<{ id: string } | null>
+}): Promise<typeof SOURCE_CHANGE_RECOVERY_REASON | null> {
+  const [execution, activeTurn] = await Promise.all([
+    db.agentExecution.findFirst({
+      where: { userId: input.userId, sessionId: input.sessionId },
+      select: { id: true, status: true, error: true, state: true, attemptCount: true },
+    }),
+    input.activeTurn,
+  ])
+  if (!execution || execution.status !== "failed" || execution.error !== SOURCE_CHANGE_RECOVERY_REASON) return null
+
+  const marker = objectRow(objectRow(execution.state)?.scheduledTaskGraphSourceChangeTerminal)
+  const markerOwner = objectRow(marker?.owner)
+  const turnId = typeof markerOwner?.turnId === "string" ? markerOwner.turnId : null
+  if (!turnId) return null
+
+  const turn = await db.agentTurn.findFirst({
+    where: { id: turnId, userId: input.userId, sessionId: input.sessionId },
+    select: { id: true, source: true, status: true, executionMode: true, rootTaskId: true, input: true },
+  })
+  if (!turn || !turn.rootTaskId || turn.source !== "automation" || turn.executionMode !== "canonical_task_graph"
+    || !["waiting_for_dependency", "interrupted"].includes(turn.status)
+    || objectRow(turn.input)?.automationRunMode !== "scheduled") return null
+
+  const [root, newestTurn] = await Promise.all([
+    db.subAgentTask.findFirst({
+      where: { id: turn.rootTaskId, sessionId: input.sessionId, turnId: turn.id, rootTaskId: turn.rootTaskId,
+        parentTaskId: null, role: "orchestrator", taskType: "root" },
+      select: { id: true, attemptCount: true },
+    }),
+    db.agentTurn.findFirst({
+      where: { userId: input.userId, sessionId: input.sessionId },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }], select: { id: true },
+    }),
+  ])
+  if (!root || newestTurn?.id !== turn.id || activeTurn && activeTurn.id !== turn.id) return null
+
+  const owner = {
+    userId: input.userId, sessionId: input.sessionId, turnId: turn.id, rootTaskId: root.id,
+    rootAttemptCount: root.attemptCount, executionId: execution.id, executionAttemptCount: execution.attemptCount,
+  }
+  return isScheduledTaskGraphSourceChangeTerminal({ owner, status: execution.status, error: execution.error, state: execution.state })
+    ? SOURCE_CHANGE_RECOVERY_REASON
+    : null
+}
+
 export async function GET(request: NextRequest, context: RouteContext) {
   const auth = await requireAuth(request)
   if (isErrorResponse(auth)) return auth
@@ -58,18 +111,20 @@ export async function GET(request: NextRequest, context: RouteContext) {
   const session = await db.agentSession.findFirst({ where: { id: sessionId, userId: auth.userId }, select: { id: true } })
   if (!session) return sessionNotFound()
 
-  const [rows, activeTurn, queuedInputCount] = await Promise.all([
+  const activeTurnQuery = db.agentTurn.findFirst({
+    where: { sessionId, userId: auth.userId, status: { in: [...ACTIVE_STATUSES] } },
+    orderBy: { createdAt: "asc" }, select: TURN_SELECT,
+  })
+  const [rows, activeTurn, queuedInputCount, scheduledPipelineRecoveryReason] = await Promise.all([
     db.agentTurn.findMany({
       where: { sessionId, userId: auth.userId, ...afterCursor(page.cursor) },
       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
       take: page.limit + 1,
       select: TURN_SELECT,
     }),
-    db.agentTurn.findFirst({
-      where: { sessionId, userId: auth.userId, status: { in: [...ACTIVE_STATUSES] } },
-      orderBy: { createdAt: "asc" }, select: TURN_SELECT,
-    }),
+    activeTurnQuery,
     db.agentInput.count({ where: { sessionId, userId: auth.userId, status: "accepted", delivery: "follow_up" } }),
+    sourceChangeRecoveryReason({ userId: auth.userId, sessionId, activeTurn: activeTurnQuery }),
   ])
   const result = pageResult(rows as TurnQueryRow[], page, "turns", sessionId)
   const activeProjection = activeTurnProjection(activeTurn as TurnQueryRow | null)
@@ -81,6 +136,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
       activeTurnId: activeProjection?.id ?? null,
       activeTurn: activeProjection,
       queuedInputCount,
+      scheduledPipelineRecoveryReason,
     },
   })
 }
