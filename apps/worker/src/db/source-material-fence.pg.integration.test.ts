@@ -7,6 +7,8 @@ import { Pool, type PoolClient } from "pg"
 // @ts-expect-error The Worker TypeScript project does not compile Web path aliases.
 import { acquireSourceMaterialFence as acquireWebSourceMaterialFence } from "@/lib/agent/source-material-fence"
 import { acquireSourceMaterialFence as acquireWorkerSourceMaterialFence } from "./source-material-fence.js"
+import { updateJobForSubmission } from "./submission-guard.js"
+import type { ApplicationSubmitIdentity } from "../queue/application-submit-fence.js"
 import { createAgentArtifactRepository, type AgentArtifactBaseInsert } from "./agent-artifact-repo.js"
 import { persistLegacyApplicationTaskOutcome, writeLegacyFillErrorOutcome } from "./legacy-application-task-outcome.js"
 
@@ -520,6 +522,119 @@ describeWithPostgres("Web Prisma and Worker pg source material fence", () => {
       }
       if (workerClient) await rollbackAndReleaseWorkerClient(workerClient, workerTransactionOpen)
       await pool!.query(`DELETE FROM application_tasks WHERE "id" = $1 AND "userId" = $2`, [taskId, userId])
+      await pool!.query(`DELETE FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [jobId, userId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [userId])
+    }
+  }, TEST_TIMEOUT_MS)
+
+  it("blocks the submission Job status writer behind the Web user fence until commit", async () => {
+    const suffix = randomUUID()
+    const userId = `source-fence-submit-user-${suffix}`
+    const userEmail = `${userId}@example.invalid`
+    const jobId = `source-fence-submit-job-${suffix}`
+    const sessionId = `source-fence-submit-session-${suffix}`
+    const turnId = `source-fence-submit-turn-${suffix}`
+    const fillerTaskId = `source-fence-submit-filler-${suffix}`
+    const applicationTaskId = `source-fence-submit-task-${suffix}`
+    const identity: ApplicationSubmitIdentity = {
+      userId, jobId, sessionId, fillTurnId: turnId, applicationTaskId,
+      approvalId: `source-fence-submit-approval-${suffix}`, constraintHash: "d".repeat(64),
+    }
+    const webReady = deferred<number>()
+    const releaseWeb = deferred<void>()
+    const workerPidReady = deferred<number>()
+    let webTransaction: Promise<void> | undefined
+    let workerOperation: Promise<unknown> | undefined
+    let forceReleaseWorkerClient: ((error: Error) => void) | undefined
+    let writerSettled = false
+
+    try {
+      await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [userId, userEmail])
+      await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "status", "updatedAt")
+        VALUES ($1, $2, 'Fence Fixture Co', 'Engineer', 'saved', CURRENT_TIMESTAMP)`, [jobId, userId])
+      await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+        VALUES ($1, $2, 'Source fence submission test', 'running', 'test', CURRENT_TIMESTAMP)`, [sessionId, userId])
+      await pool!.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot")
+        VALUES ($1, $2, $3, 'test', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb)`, [turnId, sessionId, userId])
+      await pool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "role", "taskType", "status", "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema")
+        VALUES ($1, $2, $3, 'application_filler', 'application_fill_for_review', 'completed', 'Source fence test', '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb)`,
+      [fillerTaskId, sessionId, turnId])
+      await pool!.query(`INSERT INTO application_tasks ("id", "userId", "jobId", "sessionId", "fillTurnId", "fillTurnSessionId", "fillTurnUserId", "status", "checkpoint", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, $4, $2, 'filling', 'submission_request_started', CURRENT_TIMESTAMP)`,
+      [applicationTaskId, userId, jobId, sessionId, turnId])
+
+      webTransaction = runWebTransaction(async tx => {
+        await acquireWebFence(tx, [userId])
+        webReady.resolve(await prismaBackendPid(tx))
+        await releaseWeb.promise
+      })
+      const webPid = await withTimeout(webReady.promise, "Web transaction did not acquire the submission source fence")
+
+      const workerPool = {
+        async connect() {
+          const client = await pool!.connect()
+          const query = client.query.bind(client) as unknown as (...args: unknown[]) => Promise<unknown>
+          let released = false
+          const release = (error?: Error) => {
+            if (released) return
+            released = true
+            if (error) client.release(error)
+            else client.release()
+          }
+          forceReleaseWorkerClient = release
+          return {
+            async query(...args: unknown[]) {
+              const sql = typeof args[0] === "string" ? args[0].trim().toUpperCase() : ""
+              const result = await query(...args)
+              if (sql === "BEGIN") {
+                const pidResult = await query("SELECT pg_backend_pid()::int AS pid") as { rows: Array<{ pid: unknown }> }
+                const pid = pidResult.rows[0]?.pid
+                if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid < 1) {
+                  throw new Error("Could not read the submission writer backend PID")
+                }
+                workerPidReady.resolve(pid)
+              }
+              return result
+            },
+            release,
+          } as unknown as PoolClient
+        },
+      } as unknown as Pool
+
+      workerOperation = updateJobForSubmission(
+        workerPool, identity, { status: "applied", workflowState: "submitted", applied: true }, "finish_apply_job_state",
+      )
+      void workerOperation.then(() => { writerSettled = true }, () => { writerSettled = true })
+      const workerPid = await withTimeout(workerPidReady.promise, "Worker submission transaction did not begin")
+      await waitForBlocker(workerPid, webPid)
+      expect(writerSettled).toBe(false)
+
+      const blockedRead = await withTimeout(
+        pool!.query<{ status: string }>(`SELECT "status" FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [jobId, userId]),
+        "Blocked submission Job status readback timed out",
+      )
+      expect(blockedRead.rows).toEqual([{ status: "saved" }])
+
+      releaseWeb.resolve(undefined)
+      await withTimeout(webTransaction, "Web source fence transaction did not commit", CLEANUP_TIMEOUT_MS)
+      await expect(withTimeout(workerOperation, "Submission Job writer did not finish", CLEANUP_TIMEOUT_MS))
+        .resolves.toEqual({ kind: "current", value: true })
+      const persisted = await withTimeout(
+        pool!.query<{ status: string }>(`SELECT "status" FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [jobId, userId]),
+        "Submission Job status readback timed out",
+      )
+      expect(persisted.rows).toEqual([{ status: "applied" }])
+    } finally {
+      releaseWeb.resolve(undefined)
+      const settled = await settleOperations(workerOperation, webTransaction)
+      if (!settled) {
+        forceReleaseWorkerClient?.(new Error("Submission source-fence writer cleanup timed out"))
+        await settleOperations(workerOperation, webTransaction)
+      }
+      await pool!.query(`DELETE FROM application_tasks WHERE "id" = $1 AND "userId" = $2`, [applicationTaskId, userId])
+      await pool!.query(`DELETE FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`, [fillerTaskId, sessionId])
+      await pool!.query(`DELETE FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [turnId, sessionId, userId])
+      await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2`, [sessionId, userId])
       await pool!.query(`DELETE FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [jobId, userId])
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [userId])
     }
