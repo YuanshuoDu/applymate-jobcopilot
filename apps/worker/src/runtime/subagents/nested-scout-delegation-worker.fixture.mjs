@@ -109,6 +109,9 @@ function recoveryErrorClass(error, includeMessage = false) {
 }
 const SAFE_TASK_ALIASES = new Set(["parent_scout", "depth_two_scout_alpha", "depth_two_scout_beta", "other_scout", "other", "unavailable"])
 const MAX_LEASE_DIAGNOSTICS = 12
+const MAX_TASK_ALIAS_REFERENCES = 32
+const MAX_DIAGNOSTIC_DURATION_MS = 120_000
+const SAFE_TASK_STATUSES = new Set(["queued", "running", "retrying", "waiting", "completed", "failed", "interrupted", "cancelled", "closed"])
 function fixtureTaskAlias(task) {
   if (task?.role !== "scout" || task?.taskType !== "job_discovery") return "other"
   if (task.depth === 1) return "parent_scout"
@@ -120,6 +123,19 @@ function fixtureTaskAlias(task) {
   return "other"
 }
 function boundedAttempt(value) { return Number.isInteger(value) && value >= 0 && value <= 3 ? value : "other" }
+function boundedDurationMs(start, end = performance.now()) {
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null
+  return Math.max(0, Math.min(MAX_DIAGNOSTIC_DURATION_MS, Math.round(end - start)))
+}
+function boundedExpiryBucket(value, observedAt = Date.now()) {
+  const expiry = value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : Number.NaN
+  if (!Number.isFinite(expiry)) return "unavailable"
+  const remaining = expiry - observedAt
+  if (remaining <= 0) return "expired"
+  if (remaining < 1_000) return "lt_1s"
+  if (remaining <= 5_000) return "1_to_5s"
+  return "gt_5s"
+}
 function safeLeaseDiagnostic(task, taskAlias = fixtureTaskAlias(task)) {
   const attempt = boundedAttempt(task?.attemptCount)
   return {
@@ -134,31 +150,99 @@ function safeLeaseDiagnostic(task, taskAlias = fixtureTaskAlias(task)) {
     expiryBucket: "unavailable",
   }
 }
+function rememberTaskAlias(taskAliases, taskId, task) {
+  if (typeof taskId !== "string" || !taskId || !Number.isSafeInteger(task?.attemptCount)) return
+  let attempts = taskAliases.get(taskId)
+  if (!attempts) {
+    if (taskAliases.size >= MAX_TASK_ALIAS_REFERENCES) return
+    attempts = new Map()
+    taskAliases.set(taskId, attempts)
+  }
+  if (attempts.size < 4 || attempts.has(task.attemptCount)) attempts.set(task.attemptCount, fixtureTaskAlias(task))
+}
+function installClaimDiagnostics(store, taskAliases) {
+  const claim = store.claim.bind(store)
+  let emitted = 0
+  store.claim = async input => {
+    const claimStartedAt = performance.now()
+    const task = await claim(input)
+    if (!task) return task
+    rememberTaskAlias(taskAliases, input.taskId, task)
+    if (emitted < MAX_LEASE_DIAGNOSTICS) {
+      emitted += 1
+      const attempt = boundedAttempt(task.attemptCount)
+      const ownerFence = typeof task.leaseOwner !== "string" ? "absent" : task.leaseOwner === input.ownerId ? "match" : "mismatch"
+      const expiryBucket = boundedExpiryBucket(task.leaseExpiresAt)
+      const leaseState = ownerFence === "absent" ? "owner_absent"
+        : expiryBucket === "unavailable" ? "expiry_absent" : expiryBucket === "expired" ? "expired" : "live"
+      const payload = {
+        ...safeLeaseDiagnostic(task),
+        status: SAFE_TASK_STATUSES.has(task.status) ? task.status : "other",
+        leaseState, ownerFence, attemptFence: "unavailable", expiryBucket, outcome: "claimed",
+        elapsedMs: boundedDurationMs(claimStartedAt),
+      }
+      try { say(`P1143_TASK_CLAIM_DIAGNOSTIC:${JSON.stringify(payload)}`) } catch {}
+    }
+    return task
+  }
+}
 function withWaitingFinishDiagnostics(store) { const finish = store.finish.bind(store); store.finish = input => finish(input).catch(error => { if (input.status === "waiting") { const code = recoveryErrorClass(error, true); say(`P1143_WAITING_FINISH_DIAGNOSTIC:${code === "idempotency_conflict" || code === "revision_mismatch" ? code : "other"}`) } throw error }); return store }
-function installHeartbeatDiagnostics(store) {
+function installHeartbeatDiagnostics(store, taskAliases) {
   const heartbeat = store.heartbeat.bind(store)
   let emitted = 0
-  const report = (input, outcome) => {
+  const report = (input, outcome, elapsedMs) => {
     if (emitted >= MAX_LEASE_DIAGNOSTICS) return
     emitted += 1
-    try { say(`P1143_HEARTBEAT_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseDiagnostic(input, "unavailable"), outcome })}`) } catch {}
+    const alias = taskAliases.get(input.taskId)?.get(input.attemptCount) ?? "unavailable"
+    try { say(`P1143_HEARTBEAT_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseDiagnostic(input, alias), outcome, elapsedMs })}`) } catch {}
   }
   store.heartbeat = async input => {
+    const heartbeatStartedAt = performance.now()
     try {
       const outcome = await heartbeat(input)
-      if (outcome !== "renewed") report(input, outcome === "interrupted" ? "interrupted" : "lost")
+      if (outcome !== "renewed") report(input, outcome === "interrupted" ? "interrupted" : "lost", boundedDurationMs(heartbeatStartedAt))
       return outcome
     } catch (error) {
-      report(input, "storage_error")
+      report(input, "storage_error", boundedDurationMs(heartbeatStartedAt))
       throw error
     }
+  }
+}
+function createRepairTimingSnapshot() {
+  return {
+    poolConnectMs: null, beginMs: null, userConfigMs: null, sessionLockQueryMs: null, taskRowQueryMs: null,
+    consumedWaitScanMs: null, repairSourceQueryCount: 0, repairSourceQueryTotalMs: 0, repairSourceQueryMaxMs: 0,
+    finalLeaseFenceQueryMs: null, commitMs: null, queryCount: 0, totalQueryMs: 0, elapsedMs: null,
+  }
+}
+function recordRepairQueryTiming(snapshot, statement, elapsedMs) {
+  snapshot.queryCount = Math.min(4096, snapshot.queryCount + 1)
+  snapshot.totalQueryMs = Math.min(MAX_DIAGNOSTIC_DURATION_MS, snapshot.totalQueryMs + (elapsedMs ?? 0))
+  const sql = statement.trim().toUpperCase()
+  if (sql === "BEGIN") snapshot.beginMs = elapsedMs
+  else if (statement.includes("SELECT set_config('app.user_id'")) snapshot.userConfigMs = elapsedMs
+  else if (statement.includes('FROM "agent_sessions"') && statement.includes("FOR UPDATE")) snapshot.sessionLockQueryMs = elapsedMs
+  else if (statement.includes('FROM "sub_agent_tasks" AS task') && statement.includes("FOR UPDATE OF task")) snapshot.taskRowQueryMs = elapsedMs
+  else if (statement.includes('FROM "agent_wait_conditions"') && statement.includes('"consumedAt" IS NOT NULL')) snapshot.consumedWaitScanMs = elapsedMs
+  else if (statement.includes('"leaseExpiresAt" > clock_timestamp() FOR UPDATE')) snapshot.finalLeaseFenceQueryMs = elapsedMs
+  else if (sql === "COMMIT") snapshot.commitMs = elapsedMs
+  const isWaitSourceQuery = ["agent_wait_conditions", "agent_steps", "agent_items", "agent_events"]
+    .some(table => statement.includes(`FROM "${table}"`))
+  if (isWaitSourceQuery && !statement.includes('"consumedAt" IS NOT NULL') && !statement.includes('"leaseExpiresAt" > clock_timestamp() FOR UPDATE')) {
+    snapshot.repairSourceQueryCount = Math.min(4096, snapshot.repairSourceQueryCount + 1)
+    snapshot.repairSourceQueryTotalMs = Math.min(MAX_DIAGNOSTIC_DURATION_MS, snapshot.repairSourceQueryTotalMs + (elapsedMs ?? 0))
+    snapshot.repairSourceQueryMaxMs = Math.max(snapshot.repairSourceQueryMaxMs, elapsedMs ?? 0)
   }
 }
 async function start(mode) {
   installWaitResolverDiagnostics(say)
   const ownerId = `p1143-worker-${process.pid}`
   const taskStore = mode === "park" ? undefined : withWaitingFinishDiagnostics(new PgSubagentTaskStore(pool, CRASH_TEST_LEASE_MS))
-  if (taskStore) installHeartbeatDiagnostics(taskStore)
+  const taskAliases = new Map()
+  if (taskStore) {
+    installClaimDiagnostics(taskStore, taskAliases)
+    installHeartbeatDiagnostics(taskStore, taskAliases)
+  }
   const manager = taskStore ? new AgentTreeManager(taskStore, { heartbeatMs: CRASH_TEST_HEARTBEAT_MS }) : undefined
   let recoveryStage = "manager_recover"
   if (mode === "resume" && manager) {
@@ -201,16 +285,90 @@ async function start(mode) {
       settle: async () => undefined, settleUnknown: async () => undefined }), jobDiscoveryClient: discoveryClient(),
     resumeLoader: async lease => {
       let stage = "repair_consumed_waits", connection = 0
+      const repairStartedAt = Date.now()
+      const repairStartedAtMonotonic = performance.now()
+      const repairTimings = createRepairTimingSnapshot()
+      let repairTaskSnapshot = null
       const loader = createProductionChildResumeLoaders({ connect: async () => {
-        stage = ["repair_consumed_waits", "durable_wait_resume", "child_attempt_resume"][connection++] ?? "other"
-        return pool.connect()
+        const connectionStage = ["repair_consumed_waits", "durable_wait_resume", "child_attempt_resume"][connection++] ?? "other"
+        stage = connectionStage
+        const connectStartedAt = performance.now()
+        const client = await pool.connect()
+        if (connectionStage === "repair_consumed_waits") {
+          repairTimings.poolConnectMs = boundedDurationMs(connectStartedAt)
+          const originalQuery = client.query
+          const query = originalQuery.bind(client)
+          const originalRelease = client.release
+          client.query = (...args) => {
+            const statement = typeof args[0] === "string" ? args[0] : args[0]?.text
+            const queryStartedAt = performance.now()
+            const result = query(...args)
+            if (typeof statement !== "string" || !result || typeof result.then !== "function") return result
+            return result.then(response => {
+              const queryElapsedMs = boundedDurationMs(queryStartedAt)
+              recordRepairQueryTiming(repairTimings, statement, queryElapsedMs)
+              if (!statement.includes('FROM "sub_agent_tasks" AS task') || !statement.includes("FOR UPDATE OF task")) return response
+              const row = response.rows?.[0]
+              const observedAt = Date.now()
+              if (!row) {
+                repairTaskSnapshot = { present: false, status: "missing", rowAttempt: "other", leaseState: "missing",
+                  ownerFence: "unavailable", attemptFence: "unavailable", scopeFence: "unavailable",
+                  expiryAtRepairStart: "unavailable", expiryAtRowRead: "unavailable", interruptRequested: "unavailable" }
+                return response
+              }
+              const rowAttempt = Number(row.attemptCount)
+              const status = SAFE_TASK_STATUSES.has(row.status) ? row.status : "other"
+              const expiryAtRepairStart = boundedExpiryBucket(row.leaseExpiresAt, repairStartedAt)
+              const expiryAtRowRead = boundedExpiryBucket(row.leaseExpiresAt, observedAt)
+              const ownerFence = typeof row.leaseOwner !== "string" ? "absent" : row.leaseOwner === lease.ownerId ? "match" : "mismatch"
+              repairTaskSnapshot = {
+                present: true, status,
+                rowAttempt: boundedAttempt(rowAttempt),
+                leaseState: ownerFence === "absent" ? "owner_absent" : expiryAtRowRead === "unavailable" ? "expiry_absent"
+                  : expiryAtRowRead === "expired" ? "expired" : "live",
+                ownerFence,
+                attemptFence: Number.isSafeInteger(rowAttempt) && rowAttempt === lease.attemptCount ? "match" : "mismatch",
+                scopeFence: row.id === lease.id && row.userId === lease.userId && row.sessionId === lease.sessionId
+                  && row.turnId === lease.turnId && row.rootTaskId === lease.rootTaskId ? "match" : "mismatch",
+                expiryAtRepairStart, expiryAtRowRead,
+                interruptRequested: row.interruptRequestedAt == null ? "absent" : "present",
+              }
+              return response
+            })
+          }
+          client.release = (...args) => {
+            client.query = originalQuery
+            client.release = originalRelease
+            return originalRelease.apply(client, args)
+          }
+        }
+        return client
       } }).resumeLoader
       try { return await loader(lease) }
       catch (error) {
         if (resumeLoaderDiagnosticCount < MAX_LEASE_DIAGNOSTICS) {
           resumeLoaderDiagnosticCount += 1
           const validationStage = error && typeof error === "object" && SAFE_WAIT_RESUME_DIAGNOSTIC_STAGES.has(error.sourceLifecycleStage) ? error.sourceLifecycleStage : error && typeof error === "object" && SAFE_WAIT_RESUME_DIAGNOSTIC_STAGES.has(error.resumeValidationStage) ? error.resumeValidationStage : "other"
-          try { say(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseDiagnostic(lease), stage, errorCode: recoveryErrorClass(error, true), validationStage })}`) } catch {}
+          try {
+            say(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseDiagnostic(lease), stage, errorCode: recoveryErrorClass(error, true), validationStage })}`)
+            if (stage === "repair_consumed_waits") say(`P1143_REPAIR_LEASE_ROW_DIAGNOSTIC:${JSON.stringify({
+              task: fixtureTaskAlias(lease), attempt: boundedAttempt(lease.attemptCount),
+              leaseVersion: boundedAttempt(lease.attemptCount), leaseVersionSource: "attemptCount",
+              guard: error?.message === "Child task lease is stale" ? "row_lease_stale"
+                : error?.message === "Current child lease expired during consumed wait repair" ? "post_query_lease_lost"
+                  : error?.message === "Current child lease is unavailable for consumed wait repair" ? "lease_input_unavailable" : "other",
+              ...(repairTaskSnapshot ?? { present: false, status: "unavailable", rowAttempt: "other", leaseState: "unavailable",
+                ownerFence: "unavailable", attemptFence: "unavailable", scopeFence: "unavailable",
+                expiryAtRepairStart: "unavailable", expiryAtRowRead: "unavailable", interruptRequested: "unavailable" }),
+            })}`)
+            if (stage === "repair_consumed_waits") {
+              repairTimings.elapsedMs = boundedDurationMs(repairStartedAtMonotonic)
+              say(`P1143_REPAIR_TIMING_DIAGNOSTIC:${JSON.stringify({
+                task: fixtureTaskAlias(lease), attempt: boundedAttempt(lease.attemptCount),
+                leaseVersion: boundedAttempt(lease.attemptCount), leaseVersionSource: "attemptCount", ...repairTimings,
+              })}`)
+            }
+          } catch {}
         }
         throw error
       }

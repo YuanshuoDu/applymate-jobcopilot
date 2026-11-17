@@ -105,6 +105,9 @@ const SAFE_FIXTURE_OWNER_FENCES = ["match", "mismatch", "absent", "unavailable"]
 const SAFE_FIXTURE_ATTEMPT_FENCES = ["match", "mismatch", "unavailable"] as const
 const SAFE_FIXTURE_EXPIRY_BUCKETS = ["absent", "expired", "lt_1s", "1_to_5s", "gt_5s", "unavailable"] as const
 const SAFE_FIXTURE_HEARTBEAT_OUTCOMES = ["lost", "interrupted", "storage_error"] as const
+const SAFE_FIXTURE_CLAIM_OUTCOMES = ["claimed"] as const
+const SAFE_FIXTURE_REPAIR_GUARDS = ["row_lease_stale", "post_query_lease_lost", "lease_input_unavailable", "other"] as const
+const SAFE_FIXTURE_INTERRUPT_STATES = ["absent", "present", "unavailable"] as const
 const SAFE_CHILD_RESUME_LOADER_STAGES = ["repair_consumed_waits", "durable_wait_resume", "child_attempt_resume", "other"] as const
 const SAFE_RELATED_EVENT_TYPES = new Set([
   "item.started", "item.delta", "item.completed", "item.failed", "item.interrupted",
@@ -135,7 +138,7 @@ let nestedScoutRecoveryDiagnosticSequence = 0
 
 async function readNestedScoutRecoveryDiagnostic(ids: FixtureIds) {
   type TaskRow = {
-    tier: string; status: string; attempt: number; leaseVersion: number; leaseState: string; leaseRemainingBucket: string; count: number
+    task: string; status: string; attempt: number; leaseVersion: number; leaseState: string; leaseRemainingBucket: string; count: number
   }
   type WaitRow = {
     status: string; deadlineBucket: string; suspended: boolean; consumed: boolean; targetCount: string;
@@ -144,7 +147,9 @@ async function readNestedScoutRecoveryDiagnostic(ids: FixtureIds) {
   try {
     const [tasks, waits] = await Promise.all([
       progressQuery<TaskRow>(`WITH scoped AS (
-          SELECT CASE WHEN "depth" = 1 THEN 'parent_scout' ELSE 'depth_two_scout' END AS "tier",
+          SELECT CASE WHEN "depth" = 1 THEN 'parent_scout'
+            WHEN "goal" = 'Read the Fixture Alpha role' THEN 'depth_two_scout_alpha'
+            WHEN "goal" = 'Read the Fixture Beta role' THEN 'depth_two_scout_beta' ELSE 'other_scout' END AS "task",
             CASE WHEN "status" IN ('queued', 'running', 'retrying', 'waiting', 'completed', 'failed', 'interrupted', 'cancelled', 'closed')
               THEN "status" ELSE 'other' END AS "status",
             CASE WHEN "attemptCount" BETWEEN 0 AND 3 THEN "attemptCount" ELSE -1 END::int AS "attempt",
@@ -155,12 +160,13 @@ async function readNestedScoutRecoveryDiagnostic(ids: FixtureIds) {
               WHEN "leaseExpiresAt" <= clock_timestamp() THEN 'expired'
               WHEN "leaseExpiresAt" <= clock_timestamp() + interval '1 second' THEN 'lt_1s'
               WHEN "leaseExpiresAt" <= clock_timestamp() + interval '5 seconds' THEN '1_to_5s' ELSE 'gt_5s' END AS "leaseRemainingBucket"
-          FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 AND "role" = 'scout' AND "depth" IN (1, 2)
+          FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 AND "role" = 'scout'
+            AND "taskType" = 'job_discovery' AND "depth" IN (1, 2)
         )
-        SELECT "tier", "status", "attempt", "leaseVersion", "leaseState", "leaseRemainingBucket",
+        SELECT "task", "status", "attempt", "leaseVersion", "leaseState", "leaseRemainingBucket",
           CASE WHEN count(*) BETWEEN 1 AND 3 THEN count(*)::int ELSE 4 END AS "count"
-        FROM scoped GROUP BY "tier", "status", "attempt", "leaseVersion", "leaseState", "leaseRemainingBucket"
-        ORDER BY "tier", "status", "attempt", "leaseState", "leaseRemainingBucket" LIMIT 8`, [ids.sessionId, ids.turnId]),
+        FROM scoped GROUP BY "task", "status", "attempt", "leaseVersion", "leaseState", "leaseRemainingBucket"
+        ORDER BY "task", "status", "attempt", "leaseState", "leaseRemainingBucket" LIMIT 8`, [ids.sessionId, ids.turnId]),
       progressQuery<WaitRow>(`WITH parent AS (
           SELECT "id", "sessionId", "turnId", CASE WHEN "attemptCount" BETWEEN 0 AND 3 THEN "attemptCount" ELSE -1 END::int AS "parentAttempt"
           FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 AND "depth" = 1 AND "role" = 'scout'
@@ -264,14 +270,66 @@ function isSafeChildResumeLoaderDiagnostic(value: string): boolean {
 function isSafeHeartbeatDiagnostic(value: string): boolean {
   const payload = safeDiagnosticPayload(value, "P1143_HEARTBEAT_DIAGNOSTIC:")
   if (!payload || !safeFixtureLeaseFields(payload)) return false
-  const exactKeys = ["task", "attempt", "leaseVersion", "leaseVersionSource", "status", "leaseState", "ownerFence", "attemptFence", "expiryBucket", "outcome"]
+  const exactKeys = ["task", "attempt", "leaseVersion", "leaseVersionSource", "status", "leaseState", "ownerFence", "attemptFence", "expiryBucket", "outcome", "elapsedMs"]
   return Object.keys(payload).sort().join("|") === exactKeys.sort().join("|")
     && SAFE_FIXTURE_HEARTBEAT_OUTCOMES.includes(payload.outcome as typeof SAFE_FIXTURE_HEARTBEAT_OUTCOMES[number])
+    && (payload.elapsedMs === null || typeof payload.elapsedMs === "number" && Number.isInteger(payload.elapsedMs) && payload.elapsedMs >= 0 && payload.elapsedMs <= 120_000)
+}
+
+function isSafeTaskClaimDiagnostic(value: string): boolean {
+  const payload = safeDiagnosticPayload(value, "P1143_TASK_CLAIM_DIAGNOSTIC:")
+  if (!payload || !safeFixtureLeaseFields(payload)) return false
+  const exactKeys = ["task", "attempt", "leaseVersion", "leaseVersionSource", "status", "leaseState", "ownerFence", "attemptFence", "expiryBucket", "outcome", "elapsedMs"]
+  return Object.keys(payload).sort().join("|") === exactKeys.sort().join("|")
+    && SAFE_FIXTURE_CLAIM_OUTCOMES.includes(payload.outcome as typeof SAFE_FIXTURE_CLAIM_OUTCOMES[number])
+    && (payload.elapsedMs === null || typeof payload.elapsedMs === "number" && Number.isInteger(payload.elapsedMs) && payload.elapsedMs >= 0 && payload.elapsedMs <= 120_000)
+}
+
+function isSafeRepairLeaseRowDiagnostic(value: string): boolean {
+  const payload = safeDiagnosticPayload(value, "P1143_REPAIR_LEASE_ROW_DIAGNOSTIC:")
+  if (!payload) return false
+  const exactKeys = ["task", "attempt", "leaseVersion", "leaseVersionSource", "guard", "present", "status", "rowAttempt", "leaseState",
+    "ownerFence", "attemptFence", "scopeFence", "expiryAtRepairStart", "expiryAtRowRead", "interruptRequested"]
+  const attemptOk = (entry: unknown) => entry === "other" || (typeof entry === "number" && Number.isInteger(entry) && entry >= 0 && entry <= 3)
+  return Object.keys(payload).sort().join("|") === exactKeys.sort().join("|")
+    && SAFE_FIXTURE_TASK_ALIASES.includes(payload.task as typeof SAFE_FIXTURE_TASK_ALIASES[number])
+    && attemptOk(payload.attempt) && attemptOk(payload.leaseVersion) && attemptOk(payload.rowAttempt)
+    && payload.leaseVersionSource === "attemptCount"
+    && SAFE_FIXTURE_REPAIR_GUARDS.includes(payload.guard as typeof SAFE_FIXTURE_REPAIR_GUARDS[number])
+    && typeof payload.present === "boolean"
+    && SAFE_FIXTURE_TASK_STATUSES.includes(payload.status as typeof SAFE_FIXTURE_TASK_STATUSES[number])
+    && SAFE_FIXTURE_LEASE_STATES.includes(payload.leaseState as typeof SAFE_FIXTURE_LEASE_STATES[number])
+    && SAFE_FIXTURE_OWNER_FENCES.includes(payload.ownerFence as typeof SAFE_FIXTURE_OWNER_FENCES[number])
+    && SAFE_FIXTURE_ATTEMPT_FENCES.includes(payload.attemptFence as typeof SAFE_FIXTURE_ATTEMPT_FENCES[number])
+    && SAFE_FIXTURE_OWNER_FENCES.includes(payload.scopeFence as typeof SAFE_FIXTURE_OWNER_FENCES[number])
+    && SAFE_FIXTURE_EXPIRY_BUCKETS.includes(payload.expiryAtRepairStart as typeof SAFE_FIXTURE_EXPIRY_BUCKETS[number])
+    && SAFE_FIXTURE_EXPIRY_BUCKETS.includes(payload.expiryAtRowRead as typeof SAFE_FIXTURE_EXPIRY_BUCKETS[number])
+    && SAFE_FIXTURE_INTERRUPT_STATES.includes(payload.interruptRequested as typeof SAFE_FIXTURE_INTERRUPT_STATES[number])
+}
+
+function isSafeRepairTimingDiagnostic(value: string): boolean {
+  const payload = safeDiagnosticPayload(value, "P1143_REPAIR_TIMING_DIAGNOSTIC:")
+  if (!payload) return false
+  const exactKeys = ["task", "attempt", "leaseVersion", "leaseVersionSource", "poolConnectMs", "beginMs", "userConfigMs", "sessionLockQueryMs",
+    "taskRowQueryMs", "consumedWaitScanMs", "repairSourceQueryCount", "repairSourceQueryTotalMs", "repairSourceQueryMaxMs",
+    "finalLeaseFenceQueryMs", "commitMs", "queryCount", "totalQueryMs", "elapsedMs"]
+  const durationOk = (entry: unknown) => entry === null || typeof entry === "number" && Number.isInteger(entry) && entry >= 0 && entry <= 120_000
+  const countOk = (entry: unknown) => typeof entry === "number" && Number.isInteger(entry) && entry >= 0 && entry <= 4_096
+  return Object.keys(payload).sort().join("|") === exactKeys.sort().join("|")
+    && SAFE_FIXTURE_TASK_ALIASES.includes(payload.task as typeof SAFE_FIXTURE_TASK_ALIASES[number])
+    && (payload.attempt === "other" || typeof payload.attempt === "number" && Number.isInteger(payload.attempt) && payload.attempt >= 0 && payload.attempt <= 3)
+    && (payload.leaseVersion === "other" || typeof payload.leaseVersion === "number" && Number.isInteger(payload.leaseVersion) && payload.leaseVersion >= 0 && payload.leaseVersion <= 3)
+    && payload.leaseVersionSource === "attemptCount"
+    && [payload.poolConnectMs, payload.beginMs, payload.userConfigMs, payload.sessionLockQueryMs, payload.taskRowQueryMs,
+      payload.consumedWaitScanMs, payload.repairSourceQueryTotalMs, payload.repairSourceQueryMaxMs,
+      payload.finalLeaseFenceQueryMs, payload.commitMs, payload.totalQueryMs, payload.elapsedMs].every(durationOk)
+    && countOk(payload.repairSourceQueryCount) && countOk(payload.queryCount)
 }
 
 function seenMainProgress(output: string[]) {
   return [...new Set(output.filter(value => MAIN_PROGRESS_MARKERS.has(value)
     || SAFE_RECOVERY_DIAGNOSTIC_MARKERS.has(value) || isSafeChildResumeLoaderDiagnostic(value) || isSafeHeartbeatDiagnostic(value)
+    || isSafeTaskClaimDiagnostic(value) || isSafeRepairLeaseRowDiagnostic(value) || isSafeRepairTimingDiagnostic(value)
     || isSafeRootSetupDiagnostic(value) || isSafeParentResumeDiagnostic(value) || isSafeParentCurrentReadsDiagnostic(value)))]
 }
 
@@ -1361,7 +1419,19 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       status: "running", leaseState: "expired", ownerFence: "match", attemptFence: "match", expiryBucket: "expired" }
     expect(isSafeChildResumeLoaderDiagnostic(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseFields,
       stage: "child_attempt_resume", errorCode: "child_resume_owner_mismatch", validationStage: "lease_fence" })}`)).toBe(true)
-    expect(isSafeHeartbeatDiagnostic(`P1143_HEARTBEAT_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseFields, outcome: "lost" })}`)).toBe(true)
+    expect(isSafeHeartbeatDiagnostic(`P1143_HEARTBEAT_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseFields, outcome: "lost", elapsedMs: 50 })}`)).toBe(true)
+    expect(isSafeTaskClaimDiagnostic(`P1143_TASK_CLAIM_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseFields, outcome: "claimed", elapsedMs: 50 })}`)).toBe(true)
+    expect(isSafeRepairLeaseRowDiagnostic(`P1143_REPAIR_LEASE_ROW_DIAGNOSTIC:${JSON.stringify({
+      task: "depth_two_scout_alpha", attempt: 2, leaseVersion: 2, leaseVersionSource: "attemptCount", guard: "row_lease_stale",
+      present: true, status: "running", rowAttempt: 2, leaseState: "expired", ownerFence: "match", attemptFence: "match",
+      scopeFence: "match", expiryAtRepairStart: "expired", expiryAtRowRead: "expired", interruptRequested: "absent",
+    })}`)).toBe(true)
+    expect(isSafeRepairTimingDiagnostic(`P1143_REPAIR_TIMING_DIAGNOSTIC:${JSON.stringify({
+      task: "depth_two_scout_alpha", attempt: 2, leaseVersion: 2, leaseVersionSource: "attemptCount",
+      poolConnectMs: 1, beginMs: 1, userConfigMs: 1, sessionLockQueryMs: 2_500, taskRowQueryMs: 1,
+      consumedWaitScanMs: 1, repairSourceQueryCount: 8, repairSourceQueryTotalMs: 20, repairSourceQueryMaxMs: 8,
+      finalLeaseFenceQueryMs: 1, commitMs: null, queryCount: 16, totalQueryMs: 2_600, elapsedMs: 2_700,
+    })}`)).toBe(true)
     expect(isSafeChildResumeLoaderDiagnostic(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseFields, taskId: "fixture-id-sentinel",
       stage: "child_attempt_resume", errorCode: "child_resume_owner_mismatch", validationStage: "lease_fence" })}`)).toBe(false)
     expect(isSafeHeartbeatDiagnostic(`P1143_HEARTBEAT_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseFields, ownerId: "fixture-owner-sentinel", outcome: "lost" })}`)).toBe(false)
