@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { DurableSubagentWaitError } from "./durable-subagent-wait-store.js"
 
 const lifecycle = vi.hoisted(() => ({
   states: new Map<string, "unreconciled" | "waiting" | "recovered">(),
@@ -37,8 +38,11 @@ function resolvedWait(id: string, stepId: string, sourceAttempt: number) {
   }
 }
 
-function fixture(options: { readonly waits?: ReturnType<typeof resolvedWait>[]; readonly badTarget?: boolean; readonly futureAttempt?: boolean; readonly lostLeaseAtCommit?: boolean } = {}) {
+function fixture(options: { readonly waits?: ReturnType<typeof resolvedWait>[]; readonly badTarget?: boolean; readonly futureAttempt?: boolean;
+  readonly lostLeaseAtCommit?: boolean; readonly staleTaskLease?: boolean; readonly duplicateContinuationOrdinal?: boolean;
+  readonly malformedOutcome?: boolean } = {}) {
   const waits = options.waits ?? [resolvedWait("wait-1", "source-1", 1)]
+  if (options.malformedOutcome && waits[0]) Object.assign(waits[0].result.outcome, { unexpected: true })
   const queryLog: string[] = []
   const client = {
     query: async (sql: string, params: unknown[] = []) => {
@@ -48,7 +52,8 @@ function fixture(options: { readonly waits?: ReturnType<typeof resolvedWait>[]; 
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: lease.sessionId }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE OF task")) return { rows: [{
         id: lease.id, userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: lease.rootTaskId,
-        parentTaskId: "root-1", status: "running", attemptCount: lease.attemptCount, leaseOwner: lease.ownerId,
+        parentTaskId: "root-1", status: "running", attemptCount: lease.attemptCount,
+        leaseOwner: options.staleTaskLease ? "stale-owner" : lease.ownerId,
         leaseExpiresAt: lease.leaseExpiresAt, interruptRequestedAt: null, turnStatus: "active", rootStatus: "running",
       }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks"') && sql.includes('"leaseExpiresAt" > clock_timestamp()')) {
@@ -64,7 +69,8 @@ function fixture(options: { readonly waits?: ReturnType<typeof resolvedWait>[]; 
           : { rows: [], rowCount: 0 }
       }
       if (sql.includes('FROM "agent_steps"') && sql.includes('"ordinal" > $5')) {
-        return { rows: [{ id: `next:${params[3]}`, ordinal: 1 }, { id: `later:${params[3]}`, ordinal: 2 }], rowCount: 2 }
+        return { rows: [{ id: `next:${params[3]}`, ordinal: 1 },
+          { id: `later:${params[3]}`, ordinal: options.duplicateContinuationOrdinal ? 1 : 2 }], rowCount: 2 }
       }
       if (sql.includes('FROM "agent_wait_conditions"') && sql.includes('WHERE "id" = $1 FOR UPDATE')) {
         const wait = waits.find(item => item.id === params[0])
@@ -112,9 +118,24 @@ describe("consumed child wait source repair", () => {
     const overflow = fixture({ waits: Array.from({ length: 257 }, (_, index) => resolvedWait(`wait-${index}`, `step-${index}`, 1)) })
     await expect(repairConsumedChildWaitSources(overflow.pool as never, lease, now)).rejects.toThrow("repair limit")
     const future = fixture({ futureAttempt: true })
-    await expect(repairConsumedChildWaitSources(future.pool as never, lease, now)).rejects.toThrow("source step")
+    const futureError = await repairConsumedChildWaitSources(future.pool as never, lease, now).catch((failure: unknown) => failure)
+    expect(futureError).toBeInstanceOf(DurableSubagentWaitError)
+    expect(futureError).toMatchObject({ code: "wait_scope_error", message: "Consumed child wait source step is invalid", resumeValidationStage: "source_step" })
+    expect(Object.keys(futureError as object)).not.toContain("resumeValidationStage")
+    const ambiguousContinuation = fixture({ duplicateContinuationOrdinal: true })
+    const continuationError = await repairConsumedChildWaitSources(ambiguousContinuation.pool as never, lease, now)
+      .catch((failure: unknown) => failure)
+    expect(continuationError).toMatchObject({ code: "wait_scope_error", message: "Consumed child wait continuation is missing or ambiguous",
+      resumeValidationStage: "source_ordinal" })
+    const malformedOutcome = fixture({ malformedOutcome: true })
+    const outcomeError = await repairConsumedChildWaitSources(malformedOutcome.pool as never, lease, now).catch((failure: unknown) => failure)
+    expect(outcomeError).toMatchObject({ message: "child_resume_invalid_wait_result", resumeValidationStage: "resolved_outcome" })
+    expect(Object.keys(outcomeError as object)).not.toContain("resumeValidationStage")
     const target = fixture({ badTarget: true })
-    await expect(repairConsumedChildWaitSources(target.pool as never, lease, now)).rejects.toThrow("targets changed scope")
+    const targetError = await repairConsumedChildWaitSources(target.pool as never, lease, now).catch((failure: unknown) => failure)
+    expect(targetError).toBeInstanceOf(DurableSubagentWaitError)
+    expect(targetError).toMatchObject({ code: "wait_scope_error", message: "Consumed child wait targets changed scope", resumeValidationStage: "target_scope" })
+    expect(Object.keys(targetError as object)).not.toContain("resumeValidationStage")
     const lost = fixture({ lostLeaseAtCommit: true })
     await expect(repairConsumedChildWaitSources(lost.pool as never, lease, now)).rejects.toThrow("lease expired")
     expect(lost.queryLog).toContain("ROLLBACK")
@@ -126,5 +147,14 @@ describe("consumed child wait source repair", () => {
     await expect(repairConsumedChildWaitSources(fake.pool as never, { ...lease, ownerId: "old-owner" }, now)).rejects.toThrow("Current child lease")
     await expect(repairConsumedChildWaitSources(fake.pool as never, { ...lease, interruptRequestedAt: now }, now)).rejects.toThrow("Current child lease")
     expect(fake.pool.connect).not.toHaveBeenCalled()
+  })
+
+  it("marks the exact lease guard error with a non-enumerable stage while preserving its code and message", async () => {
+    const stale = fixture({ staleTaskLease: true })
+    const error = await repairConsumedChildWaitSources(stale.pool as never, lease, now).catch((failure: unknown) => failure)
+    expect(error).toBeInstanceOf(DurableSubagentWaitError)
+    expect(error).toMatchObject({ code: "wait_scope_error", message: "Child task lease is stale", resumeValidationStage: "lease_fence" })
+    expect(Object.keys(error as object)).not.toContain("resumeValidationStage")
+    expect(stale.queryLog).toContain("ROLLBACK")
   })
 })

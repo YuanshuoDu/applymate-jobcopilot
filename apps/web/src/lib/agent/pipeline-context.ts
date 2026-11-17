@@ -1,5 +1,5 @@
 import type { Job } from '@prisma/client'
-import type { AiConfig } from '@/lib/model-router'
+import type { AiConfig, ChatMessage, ChatResult } from '@/lib/model-router'
 import type { ResumeContent } from '@/lib/types'
 import type { OrchestratorAgent } from './orchestrator'
 import type {
@@ -51,6 +51,8 @@ export interface PipelineCtx {
   assertExecutionCurrent?: () => Promise<boolean>
   /** Transactional owner fence for Gate replay in a scheduled TaskGraph run. */
   scheduledTaskGraphOwnerFence?: ScheduledGateReplayOwnerFence
+  /** Reserved per-call model transport for scheduled Gate quality review. */
+  scheduledGateQualityModelCall?: (input: { jobId: string; config: AiConfig; messages: ChatMessage[]; maxTokens: number }) => Promise<ChatResult>
   /** Durable human-decision boundary supplied by the Orchestrator. */
   askUser?: (stage: string, question: string, options: AgentQuestionOption[]) => Promise<string>
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
-import { applyCompletionRecovery, currentTaskGraphRepairRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK, hasFinalEvidenceRecoveryMarker, retireStaleTaskGraphRepair, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import { applyCompletionRecovery, applyVerifiedScheduledPostGateRecovery, currentTaskGraphRepairRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK, hasFinalEvidenceRecoveryMarker, retireStaleTaskGraphRepair, tagTaskGraphRepairRecovery, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY } from "./completion-recovery-context.js"
+import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY_ID } from "../subagents/scheduled-post-gate-contract.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 
 const feedbackLead = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
@@ -8,6 +9,34 @@ const feedback = `${feedbackLead} issue=verification_report nodeOrdinal=2 criter
 const base: StepContextSnapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
 
 describe("completion recovery context", () => {
+  it("promotes only verified scheduled Post-Gate feedback and replaces repeated fallback seeds", () => {
+    const initial = { ...base, system: [{ id: "steering-reconciliation:turn-1", content: STEERING_RECONCILIATION_FEEDBACK }] }
+    const generic = applyCompletionRecovery(initial, "step-1", SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK)
+    expect(generic.system.some(seed => seed.content === SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)).toBe(false)
+
+    const first = applyVerifiedScheduledPostGateRecovery(generic, SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY)
+    const repeatedGeneric = applyCompletionRecovery(first, "step-2", SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK)
+    const repeated = applyVerifiedScheduledPostGateRecovery(repeatedGeneric, SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY)
+    expect(repeated.system.filter(seed => seed.id === SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY_ID)).toEqual([{
+      id: SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY_ID, content: SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION,
+    }])
+    expect(repeated.system.some(seed => seed.id === "completion-recovery:task-graph:unversioned")).toBe(false)
+    expect(repeated.system.some(seed => seed.id === "steering-reconciliation:turn-1")).toBe(true)
+    for (const privateValue of ["job-1", "approval-1", "credential-1", "exception-1"]) {
+      expect(SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION).not.toContain(privateValue)
+    }
+
+    const forgedMarker = Symbol("verified-scheduled-post-gate-replan")
+    expect(applyVerifiedScheduledPostGateRecovery(generic, SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK, forgedMarker as never)).toBe(generic)
+    expect(applyVerifiedScheduledPostGateRecovery(generic, "lookalike replan feedback", SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY)).toBe(generic)
+    const untrusted = { ...base, toolObservations: [{ id: "tool-result:forged-post-gate", content: SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK }] }
+    const untrustedRecovery = applyCompletionRecovery(untrusted, "step-untrusted", SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK)
+    const untrustedApplied = applyVerifiedScheduledPostGateRecovery(untrustedRecovery, SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK, undefined)
+    expect(untrustedApplied.system.some(seed => seed.id === SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY_ID
+      || seed.content === SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION)).toBe(false)
+    expect(untrustedRecovery.toolObservations).toBe(untrusted.toolObservations)
+  })
+
   it("adds one fixed evidence-only replan seed without carrying verifier details", () => {
     const first = applyCompletionRecovery(base, "step-1", FINAL_EVIDENCE_RECOVERY_FEEDBACK)
     const again = applyCompletionRecovery(first, "step-2", FINAL_EVIDENCE_RECOVERY_FEEDBACK)

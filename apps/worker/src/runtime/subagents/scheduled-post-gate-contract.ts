@@ -31,6 +31,8 @@ export const SCHEDULED_POST_GATE_AUDIT_CRITERIA = Object.freeze([
   "Do not submit applications, send Gmail, contact employers, or invoke model or tool runtimes.",
 ])
 export const SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK = "The existing Gate proof is verified. Call agent.plan once to append the bounded post-Gate TaskGraph: partition every approved package ref across 1–3 Execute tasks (or one empty Execute if none were approved), then add the required Audit depending on every Execute. Do not create work through spawn or follow-up tools." as const
+export const SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY_ID = "completion-recovery:scheduled-post-gate-plan-required" as const
+export const SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION = "The scheduled Post-Gate disposition and Gate proof were validated by the server. First inspect the current owner-scoped agent.list result, then call agent.plan once to append the bounded Post-Gate TaskGraph: partition only the server-approved package refs across 1–3 Execute tasks (or one empty Execute if none were approved), then add the required Audit depending on every Execute. Do not create work through spawn or follow-up tools. The server remains authoritative for package refs, approval, and all action permissions." as const
 
 export type ScheduledPostGateOwner = Readonly<{
   userId: string; sessionId: string; turnId: string; rootTaskId: string; rootAttemptCount: number

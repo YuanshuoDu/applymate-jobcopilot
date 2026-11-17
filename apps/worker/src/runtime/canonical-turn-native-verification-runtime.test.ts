@@ -17,7 +17,7 @@ import {
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskGraphDenialCheckpointFromDecision, type TaskGraphDenialCheckpoint } from "./turns/task-graph-terminal-assessment.js"
 import type { TurnEngineTerminalGuard } from "./turns/turn-engine-terminal-commit.js"
 import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletionGate, createCanonicalTurnTerminalGuard, type NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
-import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "./subagents/task-graph-final-summary-binding.js"
 import { buildGroundedTaskGraphFinalResponse } from "./subagents/task-graph-final-response.js"
 import { reduceTaskGraphFinalSummary } from "./subagents/task-graph-final-summary.js"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
@@ -41,7 +41,7 @@ const witness: NativeVerificationRootGoalWitness = {
 const waitPort: DurableWaitPort = { wait: vi.fn(async () => { throw new Error("unexpected wait") }) }
 const terminalInput = { stepId: "step-1", finalContent: { text: candidate }, response: candidate } as unknown as Parameters<TurnEngineTerminalGuard>[1]
 
-function graphSummaryBinding(graphRevision: number, jobId: string) {
+function graphSummaryBinding(graphRevision: number, jobId: string): TaskGraphFinalSummaryBinding {
   return {
     rootTaskId: "root-1",
     graphItemId: taskGraphItemId("root-1"),
@@ -53,6 +53,28 @@ function graphSummaryBinding(graphRevision: number, jobId: string) {
         candidates: [{ jobId, source: "fixture", url: null, evidenceIds: [`read:job:${jobId}`] }],
         evidence: [{ id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "fixture" }], summary: "Found one role" },
     }] }),
+  }
+}
+
+function graphFollowUpSummaryBinding(graphRevision: number): TaskGraphFinalSummaryBinding {
+  const scoutTaskId = "task-scout-failed"
+  const reviewerTaskId = "task-review-needs-revision"
+  const artifactRef = { artifactId: "private-review-artifact", version: 3, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` }
+  const scoutResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "partial",
+    candidates: [{ jobId: "job-follow-up", source: "fixture", url: "https://private.invalid/job-follow-up", evidenceIds: ["read:job:job-follow-up"] }],
+    evidence: [{ id: "read:job:job-follow-up", kind: "job", ref: "job-follow-up", source: "fixture" }], summary: "PRIVATE_SCOUT_MODEL_PROSE" }
+  const reviewerResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef,
+    reviewStatus: "needs_revision", reviewHash: `sha256:${"c".repeat(64)}` }
+  return {
+    rootTaskId: "root-1", graphItemId: taskGraphItemId("root-1"), graphRevision,
+    members: [
+      { nodeIndex: 0, nodeKey: "scout-node", templateId: "research", taskId: scoutTaskId, role: "scout", taskType: "research", taskStatus: "failed", kind: "business" },
+      { nodeIndex: 1, nodeKey: "review-node", templateId: "reviewer", taskId: reviewerTaskId, role: "reviewer", taskType: "review", taskStatus: "completed", kind: "business" },
+    ],
+    summary: reduceTaskGraphFinalSummary({ graphRevision, nodes: [
+      { kind: "business", taskId: scoutTaskId, role: "scout", taskStatus: "failed", structuredResult: scoutResult },
+      { kind: "business", taskId: reviewerTaskId, role: "reviewer", taskStatus: "completed", structuredResult: reviewerResult },
+    ] }),
   }
 }
 
@@ -231,9 +253,11 @@ describe("canonical native verification runtime composition", () => {
   })
 
   it("proves the raw model candidate while accepting its exact bound TaskGraph rendering", async () => {
-    const binding = graphSummaryBinding(1, "job-1")
+    const binding = graphFollowUpSummaryBinding(1)
     const groundedResponse = buildGroundedTaskGraphFinalResponse(binding)
     expect(groundedResponse).not.toBe(candidate)
+    expect(groundedResponse).toContain("Suggested next steps (optional):")
+    expect(groundedResponse).toContain("Inspect the recorded material review marked needs revision.")
     const terminal = finalSummaryTerminal(binding, groundedResponse)
     const readTerminalProof = vi.fn(async () => true)
     const { factory } = runtimeFactory(readTerminalProof)
@@ -252,16 +276,23 @@ describe("canonical native verification runtime composition", () => {
   })
 
   it("rejects a consistently changed bound rendering before native proof or current-graph acceptance", async () => {
-    const binding = graphSummaryBinding(1, "job-1")
+    const binding = graphFollowUpSummaryBinding(1)
     const groundedResponse = buildGroundedTaskGraphFinalResponse(binding)
     const canonical = finalSummaryTerminal(binding, groundedResponse)
-    const changedResponse = `U${groundedResponse.slice(1)}`
+    const changedResponse = groundedResponse.replace(
+      "Inspect the recorded material review marked needs revision.",
+      "Inspect the recorded material review marked passed.",
+    )
+    expect(changedResponse).not.toBe(groundedResponse)
     const finalContent = {
       ...canonical.finalContent,
       text: changedResponse,
       final: { ...canonical.finalContent.final, response: changedResponse },
     }
     const terminal = { ...canonical, finalContent, response: JSON.stringify({ ...canonical.finalContent.final, response: changedResponse }) }
+    expect(finalContent.text).toBe(changedResponse)
+    expect(finalContent.final.response).toBe(changedResponse)
+    expect((JSON.parse(terminal.response) as { response: string }).response).toBe(changedResponse)
     const readTerminalProof = vi.fn(async () => true)
     const { factory } = runtimeFactory(readTerminalProof)
     const runtime = createCanonicalNativeVerificationRuntime({

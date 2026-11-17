@@ -1,6 +1,7 @@
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import type { TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
 import type { TaskGraphFinalSummary, TaskGraphSummaryCount } from "./task-graph-final-summary.js"
+import { reduceTaskGraphFollowUpSuggestions, type TaskGraphFollowUpSuggestion } from "./task-graph-follow-up-suggestions.js"
 
 const MAX_RESPONSE_BYTES = 4_096
 const MAX_ARTIFACT_ROWS = TASK_GRAPH_LIMITS.maxPersistedNodes * 102
@@ -40,7 +41,7 @@ export function buildGroundedTaskGraphFinalResponse(binding: TaskGraphFinalSumma
   lines.push(artifactDetail(summary.counts?.artifactReferences, artifacts))
   lines.push(...taskOutcomeLines(summary.taskOutcomes))
   lines.push(LIMITATION)
-  return boundLines(lines)
+  return appendTaskGraphFollowUpSuggestions(boundLines(lines), reduceTaskGraphFollowUpSuggestions(binding))
 }
 
 function countLine(label: string, value: unknown, observed: number | null, units: readonly [string, string]): string {
@@ -213,4 +214,34 @@ function boundLines(lines: readonly string[]): string {
     selected.push(line)
   }
   return [...selected, "Additional task details omitted to keep this response within limits.", footer].join("\n")
+}
+
+const SUGGESTION_HEADER = "Suggested next steps (optional):"
+const SUGGESTION_ROLE_LABELS = { analyst: "Analysis", prepare: "Preparation", reviewer: "Review", scout: "Search", writer: "Draft writing", unsupported: "Other" } as const
+const SUGGESTION_RESULT_LABELS = { search: "Search", analysis: "Analysis", preparation: "Preparation", materials: "material" } as const
+const SUGGESTION_REVIEW_LABELS = { needs_revision: "needs revision", rejected: "rejected", stale: "stale" } as const
+
+export function appendTaskGraphFollowUpSuggestions(factualResponse: string, suggestions: readonly TaskGraphFollowUpSuggestion[]): string {
+  if (!suggestions.length) return factualResponse
+  const hasFooter = factualResponse.endsWith(LIMITATION)
+  const prefix = hasFooter ? factualResponse.slice(0, -LIMITATION.length - 1) : factualResponse
+  const suffix = hasFooter ? `\n${LIMITATION}` : ""
+  const lines: string[] = []
+  let response = factualResponse
+  for (const suggestion of suggestions.slice(0, 3)) {
+    const line = renderSuggestion(suggestion)
+    if (!line) continue
+    const candidate = `${prefix}\n\n${SUGGESTION_HEADER}\n${[...lines, line].join("\n")}${suffix}`
+    if (new TextEncoder().encode(candidate).byteLength > MAX_RESPONSE_BYTES) break
+    lines.push(line); response = candidate
+  }
+  return lines.length ? response : factualResponse
+}
+
+function renderSuggestion(value: TaskGraphFollowUpSuggestion): string | null {
+  if (!value || typeof value !== "object") return null
+  if (value.kind === "inspect_task_result" && Object.hasOwn(SUGGESTION_ROLE_LABELS, value.role)) return `Inspect the reported ${SUGGESTION_ROLE_LABELS[value.role]} task outcome.`
+  if (value.kind === "inspect_material_review" && Object.hasOwn(SUGGESTION_REVIEW_LABELS, value.reviewStatus)) return `Inspect the recorded material review marked ${SUGGESTION_REVIEW_LABELS[value.reviewStatus]}.`
+  if (value.kind === "view_reported_results" && Object.hasOwn(SUGGESTION_RESULT_LABELS, value.resultKind)) return `View the reported ${SUGGESTION_RESULT_LABELS[value.resultKind]} results.`
+  return null
 }

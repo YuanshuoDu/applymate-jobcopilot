@@ -25,6 +25,7 @@ import { createArtifactToolStore } from "../tools/artifact-tools.js"
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
 import { consumeDurableWaitOutcomes } from "./durable-wait-consumer.js"
 import { reconcileDurableWaits } from "./durable-wait-resolver.js"
+import { recoverExpired as recoverExpiredSubagentTasks } from "./pg-store-expiry-recovery.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
@@ -388,6 +389,72 @@ async function waitForSessionTupleBlock(pool: Pool, blockerPid: number, blockedP
     await new Promise(resolve => setTimeout(resolve, 25))
   }
   throw new Error(`Backend ${blockedPid} did not wait on the session row held by backend ${blockerPid}`)
+}
+
+function sessionShareAttemptPool(pool: Pool) {
+  const connected = deferredSignal<number>()
+  const sessionShareAttempted = deferredSignal<number>()
+  const lockOrder: string[] = []
+  return {
+    pool: {
+      connect: async () => {
+        const client = await pool.connect()
+        let backendPid: number
+        try {
+          const result = await client.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
+          backendPid = Number(result.rows[0]?.pid)
+          if (!Number.isSafeInteger(backendPid)) throw new Error("Disposable PostgreSQL backend PID is unavailable")
+          connected.resolve(backendPid)
+        } catch (error) {
+          client.release()
+          throw error
+        }
+
+        const query = client.query.bind(client) as unknown as (...args: unknown[]) => Promise<unknown>
+        return new Proxy(client, {
+          get(target, property, receiver) {
+            if (property === "query") {
+              return async (...args: unknown[]) => {
+                const queryInput = args[0]
+                const sql = typeof queryInput === "string" ? queryInput : String(record(queryInput)?.text ?? "")
+                const sessionShare = sql.includes('FROM "agent_sessions"') && sql.includes("FOR SHARE")
+                const turnUpdate = sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")
+                if (sessionShare) {
+                  lockOrder.push("session-share-request")
+                  sessionShareAttempted.resolve(backendPid)
+                }
+                if (turnUpdate) lockOrder.push("turn-update-request")
+                const result = await query(...args)
+                if (sessionShare) lockOrder.push("session-share-acquired")
+                if (turnUpdate) lockOrder.push("turn-update-acquired")
+                return result
+              }
+            }
+            if (property === "release") return target.release.bind(target)
+            return Reflect.get(target, property, receiver)
+          },
+        })
+      },
+    } as unknown as Pick<Pool, "connect">,
+    connected: connected.promise,
+    sessionShareAttempted: sessionShareAttempted.promise,
+    lockOrder,
+  }
+}
+
+async function waitForSessionShareTupleBlock(pool: Pool, blockerPid: number, blockedPid: number): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const activity = await pool.query<{ waiting: boolean }>(`SELECT EXISTS (
+      SELECT 1 FROM pg_stat_activity AS waiter
+      WHERE waiter.pid = $2 AND waiter.state = 'active' AND waiter.wait_event_type = 'Lock'
+        AND $1::int = ANY(pg_blocking_pids(waiter.pid))
+        AND waiter.query LIKE '%agent_sessions%' AND waiter.query LIKE '%FOR SHARE%'
+    ) AS "waiting"`, [blockerPid, blockedPid])
+    if (activity.rows[0]?.waiting === true) return
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  throw new Error(`Backend ${blockedPid} did not wait for a Session FOR SHARE lock held by backend ${blockerPid}`)
 }
 
 function diagnosticValueType(value: unknown): string {
@@ -2147,7 +2214,9 @@ async function seedRootFollowup(pool: Pick<Pool, "connect">, value: Fixture, lea
     throw error
   } finally { client.release() }
 }
-async function prepareSuspendedSteerWait(pool: Pool, value: Fixture) {
+async function prepareSuspendedSteerWait(pool: Pool, value: Fixture, options: {
+  readyTargetOwnerId?: string; expiredSiblingOwnerId?: string
+} = {}) {
   await seed(pool, value, "waiting_for_user")
   const tasks = new PgSubagentTaskStore(pool, 300_000)
   const root = await tasks.create({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
@@ -2186,8 +2255,45 @@ async function prepareSuspendedSteerWait(pool: Pool, value: Fixture) {
   const wait = await waitStore.wait({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
     stepId, taskId: root.id, rootTaskId: root.id, targetTaskIds: [child.id], mode: "all", timeoutMs: 60_000,
     idempotencyKey: `p3-steer-wait:${value.suffix}` })
+  const targetLease = options.readyTargetOwnerId ? await tasks.claim({ taskId: child.id, sessionId: value.sessionId,
+    ownerId: options.readyTargetOwnerId, policy: defaultSubagentPolicy(), now: new Date() }) : undefined
+  if (options.readyTargetOwnerId && !targetLease) throw new Error("Steer-wait fixture target did not acquire a live lease")
+  const expiredSibling = options.expiredSiblingOwnerId ? await tasks.create({ userId: value.userId, sessionId: value.sessionId,
+    turnId: value.turnId, parentTaskId: root.id, role: "scout", taskType: "research",
+    goal: "Remain a sibling while the root consumes its wait", allowedActions: [], expectedOutputSchema: {},
+    policy: defaultSubagentPolicy() }) : undefined
+  const expiredSiblingLease = expiredSibling ? await tasks.claim({ taskId: expiredSibling.id, sessionId: value.sessionId,
+    ownerId: options.expiredSiblingOwnerId!, policy: defaultSubagentPolicy(), now: new Date() }) : undefined
+  if (options.expiredSiblingOwnerId && !expiredSiblingLease) throw new Error("Steer-wait fixture sibling did not acquire a live lease")
+  if (targetLease && options.readyTargetOwnerId) {
+    const finished = await tasks.finish({ taskId: child.id, sessionId: value.sessionId, ownerId: options.readyTargetOwnerId,
+      attemptCount: targetLease.attemptCount, status: "completed",
+      result: { summary: "The real wait target completed before its parent was resumed" }, now: new Date() })
+    if (finished !== "completed") throw new Error("Steer-wait fixture target did not complete")
+  }
   await waitStore.suspendAndRelease({ lease, waitId: wait.waitId, now: new Date() })
-  return { root, child, lease, rootInput, stepId, wait }
+  return { root, child, targetLease, expiredSibling, expiredSiblingLease, lease, rootInput, stepId, wait }
+}
+
+async function readySuspendedSteerWait(
+  pool: Pool, value: Fixture, waitId: string, targetTaskId: string, ownerSuffix: string,
+): Promise<TurnLease> {
+  await reconcileDurableWaits(pool, { ownerId: `p3-${ownerSuffix}-resolver-${value.suffix}`, now: new Date() })
+  const ready = await pool.query<{
+    status: string; matchedTaskIds: string[]; suspendedAt: Date | null; consumedAt: Date | null; turnStatus: string
+  }>(
+    `SELECT wait."status", wait."matchedTaskIds", wait."suspendedAt", wait."consumedAt", turn."status" AS "turnStatus"
+     FROM "agent_wait_conditions" AS wait JOIN "agent_turns" AS turn
+       ON turn."id" = wait."turnId" AND turn."sessionId" = wait."sessionId" AND turn."userId" = wait."userId"
+     WHERE wait."id" = $1 AND wait."userId" = $2 AND wait."sessionId" = $3 AND wait."turnId" = $4`,
+    [waitId, value.userId, value.sessionId, value.turnId],
+  )
+  const row = ready.rows[0]
+  if (row?.status !== "ready" || row.matchedTaskIds.length !== 1 || row.matchedTaskIds[0] !== targetTaskId
+    || row.suspendedAt == null || row.consumedAt != null || row.turnStatus !== "queued") {
+    throw new Error("Steer-wait fixture did not resolve its target and queue the owning Turn")
+  }
+  return claimTurnLease(pool, { turnId: value.turnId, sessionId: value.sessionId, ownerId: `p3-${ownerSuffix}-turn-${value.suffix}` })
 }
 
 async function seedAcceptedSteer(pool: Pick<Pool, "connect">, value: Fixture, text: string): Promise<{ id: string; sequence: string }> {
@@ -15607,9 +15713,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const waitBoundary: RecordValue | null = repairWaitDiagnosticState.lastHelperExit
         ? Object.fromEntries(Object.entries(repairWaitDiagnosticState.lastHelperExit).filter(([key]) => key !== "leaseScope"))
         : null
+      let rootFailure: RecordValue = { available: false }
+      try {
+        rootFailure = await rootFailureDiagnostic(pool!, value.turnId)
+      } catch {
+        // Diagnostic failures must not replace the original wait timeout.
+      }
       const diagnosis = JSON.stringify({
         rootExecution: diagnosticBoundedCount(rootExecution), failedCoverageObserved, repairAccepted, repairWaitCallPrepared,
         helperExits: diagnosticBoundedCount(repairWaitDiagnosticState.helperExits),
+        rootFailure,
         waitBoundary,
       })
       throw new Error(`${error.message}; repairWaitDiagnostic=${diagnosis}`)
@@ -17913,6 +18026,122 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     } finally {
       await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+    }
+  }, 45_000)
+
+  it("acquires Session before Turn while consuming a ready wait and recovering an expired sibling", async () => {
+    const value = fixture(), recoveryBarrier = sessionLockBarrierPool(pool!), consumer = sessionShareAttemptPool(pool!)
+    let recovery: Promise<SubagentTaskRecord[]> | undefined
+    let consumption: ReturnType<typeof loadCanonicalTurnState> | undefined
+    try {
+      const targetOwnerId = `p3-ready-wait-target-${value.suffix}`
+      const siblingOwnerId = `p3-expired-wait-sibling-${value.suffix}`
+      const prepared = await prepareSuspendedSteerWait(pool!, value, {
+        readyTargetOwnerId: targetOwnerId, expiredSiblingOwnerId: siblingOwnerId,
+      })
+      const expiredSibling = prepared.expiredSibling
+      if (!expiredSibling) throw new Error("Steer-wait fixture expired sibling is missing")
+      expect(prepared.targetLease).toMatchObject({ status: "running", leaseOwner: targetOwnerId })
+      expect(prepared.expiredSiblingLease).toMatchObject({ status: "running", leaseOwner: siblingOwnerId })
+      const expiredSiblingExpired = await pool!.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = clock_timestamp() - INTERVAL '1 second'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "leaseOwner" = $4 AND "status" = 'running' RETURNING "id"`,
+      [expiredSibling.id, value.sessionId, value.turnId, siblingOwnerId])
+      expect(expiredSiblingExpired.rowCount).toBe(1)
+
+      const lease = await readySuspendedSteerWait(pool!, value, prepared.wait.waitId, prepared.child.id, "expired-wait-lock-order")
+      const readyWait = await pool!.query<{ status: string; matchedTaskIds: string[]; suspendedAt: Date | null; consumedAt: Date | null }>(
+        `SELECT "status", "matchedTaskIds", "suspendedAt", "consumedAt" FROM "agent_wait_conditions"
+         WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4`,
+        [prepared.wait.waitId, value.userId, value.sessionId, value.turnId],
+      )
+      expect(readyWait.rows[0]).toMatchObject({ status: "ready", matchedTaskIds: [prepared.child.id],
+        suspendedAt: expect.any(Date), consumedAt: null })
+      const expiredState = await pool!.query<{ status: string; leaseExpiresAt: Date | null }>(
+        `SELECT "status", "leaseExpiresAt" FROM "sub_agent_tasks"
+         WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [expiredSibling.id, value.sessionId, value.turnId],
+      )
+      expect(expiredState.rows[0]?.status).toBe("running")
+      expect(expiredState.rows[0]?.leaseExpiresAt?.getTime()).toBeLessThan(Date.now())
+
+      recovery = recoverExpiredSubagentTasks(recoveryBarrier.pool, {
+        now: new Date(), limit: 1, sessionId: value.sessionId, turnId: value.turnId,
+      })
+      void recovery.catch(() => undefined)
+      const recoveryPid = await withinIntegrationDeadline(recoveryBarrier.connected, "Expiry recovery did not connect for the lock-order race")
+      expect(await withinIntegrationDeadline(recoveryBarrier.sessionLockReturned, "Expiry recovery did not lock the Session before the Turn"))
+        .toBe(recoveryPid)
+
+      consumption = loadCanonicalTurnState(consumer.pool, lease, new Date(), { consumeWaitOutcomes: true })
+      void consumption.catch(() => undefined)
+      const consumerPid = await withinIntegrationDeadline(consumer.connected, "Canonical wait consumer did not connect")
+      expect(await withinIntegrationDeadline(consumer.sessionShareAttempted, "Canonical wait consumer did not request the Session FOR SHARE lock"))
+        .toBe(consumerPid)
+      await waitForSessionShareTupleBlock(pool!, recoveryPid, consumerPid)
+      expect(consumer.lockOrder).toEqual(["session-share-request"])
+
+      recoveryBarrier.release()
+      const recovered = await withinIntegrationDeadline(recovery, "Expired sibling recovery did not finish", 10_000)
+      expect(recovered.filter(task => task.id === expiredSibling.id)).toHaveLength(1)
+      const state = await withinIntegrationDeadline(consumption, "Canonical wait consumption did not finish", 10_000)
+      expect(consumer.lockOrder.slice(0, 4)).toEqual([
+        "session-share-request", "session-share-acquired", "turn-update-request", "turn-update-acquired",
+      ])
+      const observationId = `wait-result:${prepared.wait.waitId}`
+      const observation = state.snapshot.toolObservations.filter(item => item.id === observationId)
+      expect(observation).toHaveLength(1)
+      expect(observation[0]?.content).toMatchObject({
+        toolCallId: `wait:${prepared.wait.waitId}`, toolName: "agent.wait", status: "completed",
+        output: { status: "ready", matchedTaskIds: [prepared.child.id], tasks: [{ taskId: prepared.child.id, status: "completed" }] },
+      })
+
+      const consumed = await pool!.query<{ status: string; consumedAt: Date | null; result: unknown }>(
+        `SELECT "status", "consumedAt", "result" FROM "agent_wait_conditions" WHERE "id" = $1`, [prepared.wait.waitId],
+      )
+      expect(consumed.rows[0]).toMatchObject({ status: "ready", consumedAt: expect.any(Date) })
+      const replay = await loadCanonicalTurnState(pool!, lease, new Date(), { consumeWaitOutcomes: true })
+      expect(replay.snapshot.toolObservations.filter(item => item.id === observationId)).toHaveLength(1)
+      const replayed = await pool!.query<{ status: string; consumedAt: Date | null; result: unknown }>(
+        `SELECT "status", "consumedAt", "result" FROM "agent_wait_conditions" WHERE "id" = $1`, [prepared.wait.waitId],
+      )
+      expect(replayed.rows).toEqual(consumed.rows)
+    } finally {
+      recoveryBarrier.release()
+      await Promise.allSettled([...(recovery ? [recovery] : []), ...(consumption ? [consumption] : [])])
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+    }
+  }, 45_000)
+
+  it("keeps ready wait consumption fenced for aborted and archived Sessions", async () => {
+    for (const sessionStatus of ["aborted", "archived"] as const) {
+      const value = fixture()
+      try {
+        const targetOwnerId = `p3-inactive-wait-target-${sessionStatus}-${value.suffix}`
+        const prepared = await prepareSuspendedSteerWait(pool!, value, { readyTargetOwnerId: targetOwnerId })
+        const lease = await readySuspendedSteerWait(pool!, value, prepared.wait.waitId, prepared.child.id, `inactive-${sessionStatus}`)
+        const before = await pool!.query<{ status: string; matchedTaskIds: string[]; suspendedAt: Date | null; consumedAt: Date | null; result: unknown }>(
+          `SELECT "status", "matchedTaskIds", "suspendedAt", "consumedAt", "result" FROM "agent_wait_conditions"
+           WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4`,
+          [prepared.wait.waitId, value.userId, value.sessionId, value.turnId],
+        )
+        expect(before.rows[0]).toMatchObject({ status: "ready", matchedTaskIds: [prepared.child.id],
+          suspendedAt: expect.any(Date), consumedAt: null })
+        await pool!.query(`UPDATE "agent_sessions" SET "status" = $2 WHERE "id" = $1 AND "userId" = $3`,
+          [value.sessionId, sessionStatus, value.userId])
+
+        const state = await loadCanonicalTurnState(pool!, lease, new Date(), { consumeWaitOutcomes: true })
+        const observationId = `wait-result:${prepared.wait.waitId}`
+        expect(state.snapshot.toolObservations.some(item => item.id === observationId)).toBe(false)
+        const after = await pool!.query<{ status: string; matchedTaskIds: string[]; suspendedAt: Date | null; consumedAt: Date | null; result: unknown }>(
+          `SELECT "status", "matchedTaskIds", "suspendedAt", "consumedAt", "result" FROM "agent_wait_conditions"
+           WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4`,
+          [prepared.wait.waitId, value.userId, value.sessionId, value.turnId],
+        )
+        expect(after.rows).toEqual(before.rows)
+      } finally {
+        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+      }
     }
   }, 45_000)
 

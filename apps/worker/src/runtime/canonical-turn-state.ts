@@ -117,6 +117,11 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     await client.query("BEGIN")
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", lease.userId])
     const scope = { userId: lease.userId } satisfies TenantScope
+    if (options.consumeWaitOutcomes) {
+      // Expiry recovery locks Session before Turn; preserve that order during wait consumption.
+      // Leave a missing Session row to the existing Turn ownership check below.
+      await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR SHARE`, [lease.sessionId, lease.userId])
+    }
     const turnResult = await client.query<Row>(
       `SELECT "id", "sessionId", "userId", "source", "status", "leaseOwnerId", "leaseVersion", "leaseExpiresAt", "createdAt",
               "input", "rootTaskId", "contextSnapshotId", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot"

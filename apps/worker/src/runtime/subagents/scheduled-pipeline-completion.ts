@@ -150,15 +150,15 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
 }
 function recoveredGateMatches(owner: ScheduledAutomationPipelineBridgeScope, attestation: ScheduledAutomationPipelineAttestation, recovery: Extract<ScheduledPipelineGateContinuationResult, { status: "gate_continuation" }>): boolean {
   const { handoff, prepareProof } = recovery, receipt = prepareProof.receipt, bound = receipt.owner
-  const proofOwner: ScheduledAutomationPipelineBridgeScope = { userId: bound.userId, sessionId: bound.sessionId,
+  const historicalProofOwner: ScheduledAutomationPipelineBridgeScope = { userId: bound.userId, sessionId: bound.sessionId,
     turnId: bound.turnId, rootTaskId: bound.rootTaskId, rootAttemptCount: bound.rootAttemptCount,
     turnLeaseOwnerId: bound.turnLeaseOwnerId, turnLeaseVersion: bound.turnLeaseVersion }
   return attestation.owner.userId === owner.userId && attestation.owner.sessionId === owner.sessionId
     && attestation.owner.turnId === owner.turnId && attestation.owner.rootTaskId === owner.rootTaskId
     && attestation.owner.rootAttemptCount === owner.rootAttemptCount
-    && attestation.owner.turnLeaseOwnerId === proofOwner.turnLeaseOwnerId && attestation.owner.turnLeaseVersion === proofOwner.turnLeaseVersion
+    && attestation.owner.turnLeaseOwnerId === owner.turnLeaseOwnerId && attestation.owner.turnLeaseVersion === owner.turnLeaseVersion
     && handoff.status === "analyze_checkpointed" && /^sha256:[a-f0-9]{64}$/.test(handoff.claimTokenDigest)
-    && handoff.continuationKey === scheduledTaskGraphContinuationKey(proofOwner, attestation, handoff.executionId, handoff.executionAttemptCount)
+    && handoff.continuationKey === scheduledTaskGraphContinuationKey(historicalProofOwner, attestation, handoff.executionId, handoff.executionAttemptCount)
     && bound.userId === owner.userId && bound.sessionId === owner.sessionId && bound.turnId === owner.turnId
     && bound.rootTaskId === owner.rootTaskId && bound.rootAttemptCount === owner.rootAttemptCount
     && bound.executionId === handoff.executionId && bound.executionAttemptCount === handoff.executionAttemptCount

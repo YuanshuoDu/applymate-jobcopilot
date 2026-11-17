@@ -1,7 +1,8 @@
-import type { StepContextSnapshot } from "../context/step-context-builder.js"
+import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_LIMITS, type TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import { STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
+import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY_ID } from "../subagents/scheduled-post-gate-contract.js"
 
 type TaskGraphRepairRecovery = Readonly<{ feedback: string; graphRevision: number | null }>
 export const TASK_GRAPH_RECOVERY_REVISION: unique symbol = Symbol("task-graph-recovery-revision")
@@ -13,6 +14,7 @@ const VERSIONED_TEXT_PREFIX = "Durable TaskGraph verification blocked completion
 const TASK_GRAPH_FEEDBACK = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
 const GENERIC_FEEDBACK = "Durable TaskGraph verification was denied, but no validated graph revision is available. Inspect the refreshed current TaskGraph; no node or criterion ordinal from this denial is actionable."
 export const FINAL_EVIDENCE_RECOVERY_FEEDBACK = "final_evidence_missing_recovery_once"
+export const SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY: unique symbol = Symbol("verified-scheduled-post-gate-replan")
 const FINAL_EVIDENCE_RECOVERY_SEED_ID = "completion-recovery:final-evidence-once"
 const FINAL_EVIDENCE_RECOVERY_INSTRUCTION = "The previous final response was rejected with evidence_missing because no verified evidence was attached. Review any current evidence already visible in context; if it does not support the goal, use a currently visible read-only evidence tool to gather current owned evidence, then provide a new final response supported by that evidence. Do not repeat a final response without evidence. If no relevant evidence is available, state uncertainty."
 const NATIVE_STATUS = /^Independent native verification is (failed|uncertain|pending|unavailable)\./
@@ -31,8 +33,7 @@ const NATIVE_FIXED = new Set([
   "Current native verification proof is stale or unavailable.",
 ])
 const GENERIC_NATIVE_REPAIR = "Revise the candidate or obtain new current owned evidence before retrying."
-const MAX_FEEDBACK = 512
-const MAX_ENVELOPE = 2_048
+const MAX_FEEDBACK = 512, MAX_ENVELOPE = 2_048
 export type TaskGraphRecoveryIssue = "legacy_unverified" | "verification_report" | "repair_receipt" | "repair_criterion"
 export type TaskGraphRecoveryRepairState = "missing" | "pending" | "terminal" | "unavailable" | "missing_receipt" | "rejected" | "invalid_receipt" | "invalid_report"
 export type TaskGraphRecoveryDetail = Readonly<{ nodeOrdinal: number; criterionOrdinal?: number; status: "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode; repairState?: TaskGraphRecoveryRepairState }>
@@ -158,6 +159,14 @@ export function applyCompletionRecovery(snapshot: StepContextSnapshot, stepId: s
     system: [...snapshot.system.filter(seed => !taskGraphSeed(seed)), { id: `${SEED_PREFIX}${suffix}`, content }],
   }
 }
+
+export function applyVerifiedScheduledPostGateRecovery(snapshot: StepContextSnapshot, feedback: string, marker: typeof SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY | undefined): StepContextSnapshot {
+  if (marker !== SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY || feedback !== SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK) return snapshot
+  const system = snapshot.system.filter(seed => seed.id !== SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY_ID && !(seed.id === `${SEED_PREFIX}unversioned` && seed.content === GENERIC_FEEDBACK))
+  return { ...snapshot, system: [...system, { id: SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY_ID, content: SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION }] }
+}
+export function isScheduledPostGateRecoveryBlock(block: StepContext["blocks"][number]): boolean { return block.id === `system:${SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY_ID}` && block.layer === "system" && block.role === "instruction" && block.trust === "system" && block.source === "harness" }
+export function retireScheduledPostGateRecovery(snapshot: StepContextSnapshot): StepContextSnapshot { const system = snapshot.system.filter(seed => seed.id !== SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY_ID); return system.length === snapshot.system.length ? snapshot : { ...snapshot, system } }
 
 export function hasFinalEvidenceRecoveryMarker(snapshot: StepContextSnapshot): boolean {
   return snapshot.system.some(seed => seed.id === FINAL_EVIDENCE_RECOVERY_SEED_ID)

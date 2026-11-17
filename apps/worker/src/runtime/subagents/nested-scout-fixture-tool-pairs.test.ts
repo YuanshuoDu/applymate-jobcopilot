@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest"
+// @ts-expect-error Fixture-only JavaScript module has no declaration; Vitest resolves the import at runtime.
+import { isSafeParentResumeDiagnostic, parentResumeFixtureErrorClass } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 
 type ToolPair = Readonly<{ callId: string; output: unknown; isError: boolean }>
 type PairApi = Readonly<{
   findExactToolResult: (request: unknown, expected: Readonly<{ name: string; input: unknown }>) => ToolPair | null
   findUniqueWaitInput: (request: unknown, taskIds: readonly string[]) => unknown | null
 }>
-
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
@@ -139,5 +140,35 @@ describe("nested Scout fixture tool/result pairing", () => {
       .toThrow("p1143_fixture_tool_pair_result_invalid")
     expect(() => find.findExactToolResult(duplicateLatest, { name: "wait_subagents", input }))
       .toThrow("p1143_fixture_tool_pair_result_ambiguous")
+  })
+})
+
+describe("nested Scout parent resume diagnostics", () => {
+  it("maps only fixed fixture sentinels and preserves safe code precedence", () => {
+    expect(parentResumeFixtureErrorClass(new Error("p1143_parent_job_read_failed"))).toBe("parent_job_read_failed")
+    expect(parentResumeFixtureErrorClass(new Error("p1143_parent_current_reads_missing"))).toBe("parent_current_reads_missing")
+    expect(parentResumeFixtureErrorClass(new Error("p1143_fixture_tool_pair_request_invalid"))).toBe("tool_pair_request_invalid")
+    expect(parentResumeFixtureErrorClass(new Error("p1143_fixture_tool_pair_call_invalid"))).toBe("tool_pair_call_invalid")
+    expect(parentResumeFixtureErrorClass(new Error("p1143_fixture_wait_input_invalid"))).toBe("wait_input_invalid")
+    expect(parentResumeFixtureErrorClass(Object.assign(new Error("p1143_parent_job_read_failed"), { code: "turn_execution_failed" })))
+      .toBe("turn_execution_failed")
+    expect(parentResumeFixtureErrorClass(new Error("private failure details"))).toBe("error")
+  })
+
+  it("accepts only safe parent resume diagnostic classes", () => {
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:parent_job_read_failed")).toBe(true)
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:parent_current_reads_missing")).toBe(true)
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:tool_pair_request_invalid")).toBe(true)
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:tool_pair_call_invalid")).toBe(true)
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:wait_input_invalid")).toBe(true)
+  })
+
+  it("rejects unknown classes and raw fixture sentinels", () => {
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:other_error")).toBe(false)
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:p1143_parent_job_read_failed")).toBe(false)
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:parent_job_reads:p1143_parent_current_reads_missing")).toBe(false)
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:p1143_fixture_tool_pair_request_invalid")).toBe(false)
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:p1143_fixture_tool_pair_call_invalid")).toBe(false)
+    expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:p1143_fixture_wait_input_invalid")).toBe(false)
   })
 })

@@ -1,10 +1,10 @@
 import type { Prisma, PrismaClient } from "@prisma/client"
-import { hashApprovalNonce, type ApprovalType } from "@jobcopilot/agent-protocol"
+import type { ApprovalType } from "@jobcopilot/agent-protocol"
 import { hashAgentReceiptValue } from "@jobcopilot/shared"
-import { createHmac } from "node:crypto"
 
 import { consumeApprovalAndReserve, issueApprovalReceipt, validatePendingApprovalReceipt } from "./store"
-import { assertGateReplayTaskBinding, recoverGateReviewReplay, type ReplayReceiptExpectation, type ScheduledGateReplayOwnerFence } from "./gate-replay"
+import { assertGateReplayTaskBinding, recoverGateReviewReplay, type ScheduledGateReplayOwnerFence } from "./gate-replay"
+import { buildGateReplayExpectation, gateReviewReplayCoordinates } from "./gate-review-replay"
 import type { PreparedApprovalReceipt } from "./receipt-issue-owner"
 import { reissueApprovalNonce } from "./receipt-rotation"
 import { decideApproval } from "../broker/store"
@@ -119,7 +119,7 @@ export async function findScheduledGateReviewReceiptReplay(
     effectiveInput.scheduledOwnerFence, "scheduled-taskgraph-gate-review")
   effectiveInput.toolCallId = replayCoordinates.toolCallId
   const scope = { ...initialScope, toolCallId: replayCoordinates.toolCallId }
-  const expectation = await replayExpectation(effectiveInput, scope, replayCoordinates)
+  const expectation = await buildGateReplayExpectation(effectiveInput, scope, replayCoordinates)
 
   return db.$transaction(async tx => {
     await assertScheduledGateReplayOwnerReadOnly(tx, effectiveInput)
@@ -145,73 +145,6 @@ async function assertScheduledGateReplayOwnerReadOnly(
     select: { id: true },
   })
   if (!current || input.signal?.aborted) throw new AgentExecutionCancelledError()
-}
-
-type GateReplayAttempt = { id: string; attemptCount: number } | undefined
-type GateReplayOwnerFence = ScheduledGateReplayOwnerFence
-
-type GateReplayMode = NonNullable<LegacyReceiptInput["replayMode"]>
-
-function gateReviewReplayCoordinates(scope: ApprovalScopeInput, attempt: GateReplayAttempt, ownerFence: GateReplayOwnerFence | undefined, mode: GateReplayMode) {
-  if (scope.action !== "review_application" || !attempt || !attempt.id.trim()
-    || !Number.isSafeInteger(attempt.attemptCount) || attempt.attemptCount < 0) {
-    throw new Error("Gate receipt replay requires an exact execution attempt")
-  }
-  const owner = ownerFence?.owner
-  if (!ownerFence || !owner
-    || owner.userId !== scope.userId || owner.sessionId !== scope.sessionId || owner.turnId !== scope.turnId
-    || !owner.rootTaskId.trim() || !Number.isSafeInteger(owner.rootAttemptCount) || owner.rootAttemptCount < 1
-    || !owner.turnLeaseOwnerId.trim() || !Number.isSafeInteger(owner.turnLeaseVersion) || owner.turnLeaseVersion < 1
-    || owner.executionId !== attempt.id || owner.executionAttemptCount !== attempt.attemptCount
-    || !ownerFence.key.trim() || !ownerFence.claimToken.trim() || typeof ownerFence.assertCurrent !== "function") {
-    throw new Error("Gate receipt replay requires an exact scheduled owner fence")
-  }
-  const secret = process.env.AGENT_WORKER_SECRET?.trim()
-  if (!secret) throw new Error("Gate receipt replay signing key is unavailable")
-
-  const identity = JSON.stringify([
-    1,
-    scope.userId,
-    scope.sessionId,
-    scope.turnId,
-    attempt.id,
-    attempt.attemptCount,
-    [owner.rootTaskId, owner.rootAttemptCount, owner.executionId, owner.executionAttemptCount],
-    scope.jobId,
-    scope.action,
-    scope.resourceHash,
-    scope.materialHash,
-    scope.answersHash,
-    ...(mode === "scheduled-taskgraph-gate-review" ? [ownerFence.key] : []),
-  ])
-  const derive = (label: "approval-id" | "receipt-nonce" | "tool-call-id") => createHmac("sha256", secret)
-    .update(`${mode === "scheduled-taskgraph-gate-review" ? "applymate.scheduled-gate-review-replay.v2" : "applymate.gate-review-replay.v1"}:${label}\0${identity}`)
-    .digest("hex")
-
-  return {
-    approvalId: `gate_review_${derive("approval-id")}`,
-    nonce: derive("receipt-nonce"),
-    toolCallId: `application-review:${derive("tool-call-id")}`,
-  }
-}
-
-async function replayExpectation(
-  input: LegacyReceiptInput,
-  scope: ApprovalScopeInput,
-  replayCoordinates: ReturnType<typeof gateReviewReplayCoordinates>,
-): Promise<ReplayReceiptExpectation> {
-  return {
-    approvalId: replayCoordinates.approvalId,
-    nonce: replayCoordinates.nonce,
-    nonceHash: await hashApprovalNonce(replayCoordinates.nonce),
-    scope,
-    taskId: null,
-    taskPayloadField: "applicationTaskId",
-    title: input.title,
-    body: input.body,
-    impact: input.impact ?? null,
-    payload: input.payload,
-  }
 }
 
 export async function consumeLegacyReceipt(db: PrismaClient, input: LegacyReceiptConsumeInput) {
@@ -290,11 +223,18 @@ export function clientReceipt(result: ApprovalReceiptResult, impact?: unknown) {
     title: approval.title,
     body: approval.body,
     impact: impact ?? null,
-    payload: approval.payload,
+    payload: clientPayload(approval.payload),
     status: approval.status,
     receiptNonce: result.nonce,
     scopeHash: approval.scopeHash,
   }
+}
+
+function clientPayload(payload: unknown): unknown {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload
+  const safe = { ...(payload as Record<string, unknown>) }
+  delete safe.scheduledGateReview
+  return safe
 }
 
 export { reissueApprovalNonce }
