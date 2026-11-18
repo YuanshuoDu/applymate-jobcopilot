@@ -7,6 +7,7 @@ import {
   readAgentSessionId,
   resolveAgentTurnStateReadiness,
   selectedSessionControlStatusValue,
+  stateForSelectedAgentSession,
 } from './agent-session-state'
 
 describe('agent session URL and active Turn DTO', () => {
@@ -35,7 +36,27 @@ describe('agent session URL and active Turn DTO', () => {
     })).toEqual({
       activeTurn: { id: 'turn_1', status: 'in_progress', revision: 3, goal: 'Current objective' },
       queuedInputCount: 2,
+      scheduledPipelineRecoveryReason: null,
     })
+  })
+
+  it('accepts only the fixed scheduled source-change recovery reason', () => {
+    expect(parseAgentTurnsResponse({ projection: { scheduledPipelineRecoveryReason: 'scheduled_pipeline_source_changed' } })
+      .scheduledPipelineRecoveryReason).toBe('scheduled_pipeline_source_changed')
+    for (const value of ['other_error', 'private error text', { code: 'scheduled_pipeline_source_changed' }, null]) {
+      expect(parseAgentTurnsResponse({ projection: { scheduledPipelineRecoveryReason: value } })
+        .scheduledPipelineRecoveryReason).toBeNull()
+    }
+    expect(parseAgentTurnsResponse(null).scheduledPipelineRecoveryReason).toBeNull()
+  })
+
+  it('does not carry recovery guidance into a different selected Session', () => {
+    const priorSession = parseAgentTurnsResponse({
+      projection: { scheduledPipelineRecoveryReason: 'scheduled_pipeline_source_changed' },
+    })
+    expect(stateForSelectedAgentSession('session-b', 'session-a', priorSession).scheduledPipelineRecoveryReason).toBeNull()
+    expect(stateForSelectedAgentSession('session-a', 'session-a', priorSession).scheduledPipelineRecoveryReason)
+      .toBe('scheduled_pipeline_source_changed')
   })
 
   it('treats only a complete active-Turn projection as authoritative', () => {
@@ -64,7 +85,7 @@ describe('agent session URL and active Turn DTO', () => {
   it('keeps active controls for older projections without a goal', () => {
     expect(parseAgentTurnsResponse({
       projection: { activeTurnId: 'turn_1', activeTurn: { id: 'turn_1', status: 'in_progress', revision: 4 } },
-    })).toEqual({ activeTurn: { id: 'turn_1', status: 'in_progress', revision: 4 }, queuedInputCount: 0 })
+    })).toEqual({ activeTurn: { id: 'turn_1', status: 'in_progress', revision: 4 }, queuedInputCount: 0, scheduledPipelineRecoveryReason: null })
     expect(parseActiveTurn({ id: 'turn_1', status: 'in_progress', revision: 4, goal: { private: 'not text' } }))
       .toEqual({ id: 'turn_1', status: 'in_progress', revision: 4 })
   })

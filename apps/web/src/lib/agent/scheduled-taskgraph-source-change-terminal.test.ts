@@ -277,6 +277,11 @@ describe("scheduled TaskGraph source-change terminalization", () => {
     } };
     const base = { owner, status: "failed", error: "scheduled_pipeline_source_changed", state };
     expect(isScheduledTaskGraphSourceChangeTerminal(base)).toBe(true);
+    const stableOwner = {
+      userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+      rootAttemptCount: owner.rootAttemptCount, executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount,
+    }
+    expect(isScheduledTaskGraphSourceChangeTerminal({ ...base, owner: stableOwner })).toBe(true)
     expect(isScheduledTaskGraphSourceChangeTerminal({ ...base, owner: { ...owner, rootAttemptCount: 4 } })).toBe(false);
     expect(isScheduledTaskGraphSourceChangeTerminal({ ...base, owner: { ...owner, executionAttemptCount: 6 } })).toBe(false);
     expect(isScheduledTaskGraphSourceChangeTerminal({ ...base, error: "other_error" })).toBe(false);
