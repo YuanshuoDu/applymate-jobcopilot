@@ -73,6 +73,29 @@ describe('TaskGraph repair display projection', () => {
     expect(JSON.stringify(decorated)).not.toMatch(/repairOf|criterionIds|finding-count/)
   })
 
+  it('keeps legacy target text but suppresses check causality for a forward repair relation', () => {
+    const baseGraph = graph()
+    const forwardGraph = { ...baseGraph, nodes: [baseGraph.nodes[1]!, baseGraph.nodes[0]!] }
+    const base = ledger(forwardGraph)
+    const decorated = decoratePlanLedgerRepairTargets(base, forwardGraph, rootTaskId)
+    expect(decorated.nodes[0]).toMatchObject({ repairTargetGoal: 'Find target roles', repairTargetNodeIndex: 1 })
+    expect(decorated.nodes[0]).not.toHaveProperty('repairTargetCheckIndexes')
+    expect(parsePlanLedgerWithRepairTargets(decorated)).toEqual(decorated)
+
+    const invalid = {
+      ...decorated,
+      nodes: decorated.nodes.map((node, index) => index === 0
+        ? { ...node, repairTargetCheckIndexes: [1] } : node),
+    }
+    expect(parsePlanLedgerWithRepairTargets(invalid)).toBeNull()
+    expect(projectRepairAttentionSummaries(invalid, {
+      schemaVersion: 1,
+      nodes: [null, { status: 'failed', checks: [
+        { kind: 'evidence_count_gte', minimum: 2, status: 'failed' },
+      ], totalCount: 1, passedCount: 0, failedCount: 1, unverifiedCount: 0 }],
+    })).toEqual([null, null])
+  })
+
   it('binds duplicate public goal text to the strictly matched target index', () => {
     const baseGraph = graph()
     const duplicateGraph = {

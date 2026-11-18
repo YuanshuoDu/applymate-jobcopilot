@@ -45,7 +45,8 @@ export function decoratePlanLedgerRepairTargets(
     const targetGoal = targetProjection.goal
     if (typeof targetGoal === 'string' && targetGoal.trim() === targetGoal && targetGoal.length > 0 && targetGoal.length <= 240) {
       const targetRawNode = record(raw.nodes[targetNodeIndex])
-      const checkIndexes = targetRawNode ? projectRepairTargetCheckIndexes(rawNode, targetRawNode, relation) : null
+      const checkIndexes = targetNodeIndex < index && targetRawNode
+        ? projectRepairTargetCheckIndexes(rawNode, targetRawNode, relation) : null
       repairTargets.set(source.key, {
         goal: targetGoal,
         nodeIndex: targetNodeIndex,
@@ -94,7 +95,8 @@ export function parsePlanLedgerWithRepairTargets(value: unknown): PlanLedgerWith
     }
     if (Object.hasOwn(item, 'repairTargetCheckIndexes')) {
       const rawIndexes = item.repairTargetCheckIndexes
-      if (!hasGoal || !Object.hasOwn(item, 'repairTargetNodeIndex') || !Array.isArray(rawIndexes)
+      const targetIndex = targetIndices.get(index)
+      if (!hasGoal || targetIndex === undefined || targetIndex >= index || !Array.isArray(rawIndexes)
         || !denseArray(rawIndexes, 1, 8) || rawIndexes.some(value => typeof value !== 'number'
           || !Number.isSafeInteger(value) || value < 0 || value > 7)
         || rawIndexes.some((value, index) => index > 0 && Number(rawIndexes[index - 1]) >= Number(value))
@@ -151,7 +153,7 @@ export function projectRepairAttentionSummaries(
   return projection.nodes.map((node, index) => {
     const targetIndex = node.repairTargetNodeIndex
     if (targetIndex === undefined || !Number.isSafeInteger(targetIndex) || targetIndex < 0
-      || targetIndex >= projection.nodes.length || targetIndex === index || !node.repairTargetGoal) return null
+      || targetIndex >= index || !node.repairTargetGoal) return null
     const targetPlanNode = projection.nodes[targetIndex]
     if (!targetPlanNode || targetPlanNode.key === node.key || targetPlanNode.goal !== node.repairTargetGoal) return null
     const target = summary.nodes[targetIndex]
