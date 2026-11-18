@@ -9,7 +9,8 @@ import type { ScheduledPrepareTaskGraphProof } from "./scheduled-prepare-task-gr
 
 const path = "/api/internal/agent-runtime/scheduled-pipeline"
 const SOURCE_CHANGED_ERROR = "scheduled_pipeline_source_changed"
-const blockedErrors = new Set(["scheduled_pipeline_owner_mismatch", "scheduled_pipeline_turn_stale", "scheduled_pipeline_mode_mismatch", "scheduled_pipeline_root_mismatch", "scheduled_pipeline_execution_mismatch", "scheduled_pipeline_attestation_invalid", "scheduled_pipeline_snapshot_mismatch", "scheduled_pipeline_discovery_incomplete", "scheduled_pipeline_jobs_mismatch", "scheduled_pipeline_claim_conflict", "scheduled_pipeline_analysis_interrupted", "scheduled_pipeline_request_invalid", "scheduled_pipeline_unauthorized", "scheduled_pipeline_account_unavailable", "scheduled_pipeline_entitlement_required", "scheduled_pipeline_ai_unavailable", "scheduled_pipeline_ai_budget_exhausted", SOURCE_CHANGED_ERROR])
+const MATERIAL_DRIFT_ERROR = "scheduled_prepare_material_source_changed"
+const blockedErrors = new Set(["scheduled_pipeline_owner_mismatch", "scheduled_pipeline_turn_stale", "scheduled_pipeline_mode_mismatch", "scheduled_pipeline_root_mismatch", "scheduled_pipeline_execution_mismatch", "scheduled_pipeline_attestation_invalid", "scheduled_pipeline_snapshot_mismatch", "scheduled_pipeline_discovery_incomplete", "scheduled_pipeline_jobs_mismatch", "scheduled_pipeline_claim_conflict", "scheduled_pipeline_analysis_interrupted", "scheduled_pipeline_request_invalid", "scheduled_pipeline_unauthorized", "scheduled_pipeline_account_unavailable", "scheduled_pipeline_entitlement_required", "scheduled_pipeline_ai_unavailable", "scheduled_pipeline_ai_budget_exhausted", SOURCE_CHANGED_ERROR, MATERIAL_DRIFT_ERROR])
 
 export type ScheduledPipelineAnalyzeCheckpointProof = Readonly<{
   status: "analyze_checkpointed"
@@ -57,7 +58,8 @@ function record(value: unknown): Record<string, unknown> { return value && typeo
 
 function isKnownBlockedResponse(status: number, errorCode: unknown): boolean {
   if (typeof errorCode !== "string" || !blockedErrors.has(errorCode)) return false
-  return errorCode === SOURCE_CHANGED_ERROR ? status === 409 : status >= 400 && status < 500
+  return errorCode === SOURCE_CHANGED_ERROR || errorCode === MATERIAL_DRIFT_ERROR
+    ? status === 409 : status >= 400 && status < 500
 }
 
 /** Authenticated server-to-server continuation; secrets remain in the header and are never serialized. */

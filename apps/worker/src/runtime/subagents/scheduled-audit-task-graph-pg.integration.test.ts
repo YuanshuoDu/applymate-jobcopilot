@@ -224,7 +224,7 @@ const diagnosticGateErrorCodes = new Set([
   "scheduled_pipeline_audit_child_fenced", "scheduled_pipeline_audit_gate_proof_invalid",
   "scheduled_pipeline_jobs_mismatch", "scheduled_pipeline_mode_mismatch", "scheduled_pipeline_owner_mismatch",
   "scheduled_pipeline_request_invalid", "scheduled_pipeline_resume_unavailable", "scheduled_pipeline_snapshot_mismatch",
-  "scheduled_pipeline_source_changed", "scheduled_pipeline_turn_stale", "scheduled_pipeline_unauthorized",
+  "scheduled_pipeline_source_changed", "scheduled_prepare_material_source_changed", "scheduled_pipeline_turn_stale", "scheduled_pipeline_unauthorized",
 ])
 const diagnosticWorkerErrorCodes = new Set([
   ...diagnosticGateErrorCodes, "scheduled_gate_analyze_proof_invalid", "scheduled_gate_completion_unverified",
@@ -679,6 +679,64 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const job = await pool!.query<{ description: string | null }>(`SELECT "description" FROM "Job" WHERE "id"=$1 AND "userId"=$2`,
       [fixture.jobRecords[0]!.id, fixture.ids.userId])
     expect(job.rows[0]?.description).toBe(`${fixture.jobRecords[0]!.description} changed after Analyze`)
+  }, 120_000)
+
+  it("terminalizes material-only drift after a production Job writer races the Gate receipt", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    const race = await runScheduledGateSourceWriterRace(fixture, {
+      update: () => ({ salary: "€100k+" }),
+    })
+
+    expect(race.writerOutcome.status).toBe("fulfilled")
+    expect(race.writerPid).not.toBe(race.gatePid)
+    expect(race.blockingObservation).toMatchObject({ blocked: true, sourceFenceQuery: true, writerFenceHeld: true })
+    expect(race.gateOutcome.status).toBe("fulfilled")
+    if (race.gateOutcome.status === "fulfilled") expect(debugRecord(race.gateOutcome.value))
+      .toMatchObject({ status: "failed", reason: "scheduled_prepare_material_source_changed" })
+    expectScheduledGateMaterialDriftRejection(race.response)
+    expect(race.after).toEqual(race.before)
+    const execution = await pool!.query<{ status: string; error: string | null; state: unknown }>(
+      `SELECT "status", "error", "state" FROM "agent_executions" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`,
+      [fixture.executionOwner.executionId, fixture.ids.userId, fixture.ids.sessionId])
+    expect(execution.rows).toHaveLength(1)
+    expect(execution.rows[0]).toMatchObject({ status: "failed", error: "scheduled_prepare_material_source_changed" })
+    const marker = debugRecord(debugRecord(execution.rows[0]?.state)?.scheduledTaskGraphMaterialDriftTerminal)
+    expect(marker).toMatchObject({ reason: "scheduled_prepare_material_source_changed",
+      owner: expect.objectContaining({ userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
+        turnId: fixture.ids.turnId, rootTaskId: fixture.ids.rootTaskId, executionId: fixture.executionOwner.executionId,
+        executionAttemptCount: fixture.executionOwner.executionAttemptCount }),
+      gate: expect.objectContaining({ taskId: race.gateTaskId }),
+      artifactDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      currentMaterialDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      proofDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) })
+    const approvals = await pool!.query(`SELECT "id" FROM "agent_approvals" WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3
+      AND "type"='review_application'`, [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId])
+    expect(approvals.rows).toHaveLength(0)
+  }, 120_000)
+
+  it("does not commit a Gate skip when material-only drift wins the fenced recheck", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    const job = fixture.jobRecords[0]
+    if (!job) throw new Error("scheduled Gate material-drift fixture has no Job")
+    await pool!.query(`INSERT INTO "application_tasks" ("id", "userId", "jobId", "sessionId", "status", "checkpoint", "updatedAt")
+      VALUES ($1,$2,$3,$4,'generating_materials','material_generation_in_progress',CURRENT_TIMESTAMP)`,
+    [`scheduled-gate-material-drift-task-${randomUUID()}`, fixture.ids.userId, job.id, fixture.ids.sessionId])
+    const race = await runScheduledGateSourceWriterRace(fixture, {
+      priorChoices: [{ kind: "weak_cover_letter", jobIds: [job.id], choiceId: "skip" }],
+      update: () => ({ salary: "€100k+" }),
+    })
+
+    expect(race.writerOutcome.status).toBe("fulfilled")
+    expect(race.blockingObservation).toMatchObject({ blocked: true, sourceFenceQuery: true, writerFenceHeld: true })
+    expect(race.gateOutcome.status).toBe("fulfilled")
+    if (race.gateOutcome.status === "fulfilled") expect(debugRecord(race.gateOutcome.value))
+      .toMatchObject({ status: "failed", reason: "scheduled_prepare_material_source_changed" })
+    expectScheduledGateMaterialDriftRejection(race.response)
+    expect(race.after).toEqual(race.before)
+    expect(race.after.applicationTasks).toHaveLength(1)
+    expect(race.after.applicationTasks[0]).toMatchObject({ status: "generating_materials", checkpoint: "material_generation_in_progress" })
   }, 120_000)
 
   it("issues a Gate receipt after the source writer rolls back its fenced Job update", async () => {
@@ -2329,6 +2387,16 @@ function expectScheduledGateSourceChangedRejection(response: Awaited<ReturnType<
   ]))
   expect(response.gateHttpFailures()).toEqual(expect.arrayContaining([
     expect.objectContaining({ status: 409, errorCode: "scheduled_pipeline_source_changed" }),
+  ]))
+}
+
+function expectScheduledGateMaterialDriftRejection(response: Awaited<ReturnType<typeof setupFetcher>>): void {
+  expect(response.gateCalls()).toBe(1)
+  expect(response.gateResponses()).toEqual(expect.arrayContaining([
+    expect.objectContaining({ httpStatus: 409, status: "blocked" }),
+  ]))
+  expect(response.gateHttpFailures()).toEqual(expect.arrayContaining([
+    expect.objectContaining({ status: 409, errorCode: "scheduled_prepare_material_source_changed" }),
   ]))
 }
 

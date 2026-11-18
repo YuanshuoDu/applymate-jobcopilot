@@ -4,6 +4,7 @@ import { Prisma } from '@prisma/client'
 import { AgentExecutionCancelledError } from './execution-control'
 import { createAnalyzeSourceChangedErrorWithClaims } from './stages/analyze-model-input'
 import { isScheduledTaskGraphGateSourceChangedError, isScheduledTaskGraphGateSourceProofInvalidError } from './scheduled-taskgraph-gate-source'
+import { readScheduledTaskGraphGateMaterialDriftProof } from './scheduled-taskgraph-gate-material-drift'
 import { gateFailureDiagnostic } from './scheduled-taskgraph-pipeline-request'
 
 const mocks = vi.hoisted(() => ({
@@ -46,7 +47,10 @@ vi.mock('./scheduled-taskgraph-gate-source-terminal', async importOriginal => ({
 }))
 vi.mock('./scheduled-taskgraph-gate-input', () => ({ isScheduledTaskGraphGateProofCurrent: mocks.isProof,
   isScheduledTaskGraphAuditChildGateProofCurrent: mocks.auditProof,
-  loadScheduledTaskGraphGateInput: mocks.loadInput, scheduledTaskGraphAnalyzeCheckpointForGate: (value: unknown) => value }))
+  loadScheduledTaskGraphGateInput: mocks.loadInput, inspectScheduledTaskGraphGateInput: async (...args: unknown[]) => {
+    const loaded = await mocks.loadInput(...args)
+    return loaded && typeof loaded === 'object' && 'kind' in loaded ? loaded : loaded ? { kind: 'valid', input: loaded } : { kind: 'invalid' }
+  }, scheduledTaskGraphAnalyzeCheckpointForGate: (value: unknown) => value }))
 vi.mock('./scheduled-taskgraph-audit-child-fence', async importOriginal => ({
   ...await importOriginal<typeof import('./scheduled-taskgraph-audit-child-fence')>(),
   lockScheduledTaskGraphAuditChildFence: mocks.childFence,
@@ -284,6 +288,47 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     expect(committedRenewals).toBe(0)
     expect(mocks.sourceTerminal).toHaveBeenCalledOnce()
     expect(mocks.loadInput).not.toHaveBeenCalled()
+    expect(mocks.executeGate).not.toHaveBeenCalled()
+  })
+
+  it('brands material-only drift inside the preflight transaction and reports only after rollback', async () => {
+    const fingerprint = { version: 'agent-harness.v2.analyze-source-input.v1', digest: 'd'.repeat(64) }
+    const driftState = { ...state, scoredJobs: [{ job: { id: 'job-1', userId: owner.userId }, score: 80 }],
+      scheduledTaskGraphAnalyzeSourceFingerprints: { 'job-1': fingerprint } }
+    configureGateLock({ execution: { id: owner.executionId, status: 'running', attemptCount: owner.executionAttemptCount,
+      checkpoint: 'gate', state: driftState } })
+    const evidence = { artifactDigest: `sha256:${'e'.repeat(64)}`, currentMaterialDigest: `sha256:${'f'.repeat(64)}` }
+    mocks.loadInput.mockResolvedValue({ kind: 'material_source_drift', evidence })
+    let transactionActive = false, committedRenewals = 0
+    mocks.transaction.mockImplementation(async (work: (client: unknown) => unknown) => {
+      let stagedRenewals = 0
+      const transactional = { ...tx, agentExecution: { updateMany: async (...args: unknown[]) => {
+        const result = await mocks.update(...args) as { count: number }
+        if (result.count === 1) stagedRenewals += 1
+        return result
+      } } }
+      transactionActive = true
+      try {
+        const result = await work(transactional)
+        committedRenewals += stagedRenewals
+        return result
+      } finally { transactionActive = false }
+    })
+    mocks.sourceTerminal.mockImplementation(async (input: { error: unknown }) => {
+      expect(transactionActive).toBe(false)
+      expect((input.error as Error).message).toBe('scheduled_prepare_material_source_changed')
+      expect(readScheduledTaskGraphGateMaterialDriftProof(input.error)).toMatchObject({ owner,
+        gate: { taskId: gateTask.id, leaseOwnerId: 'gate-lease', attemptCount: 2 }, ...evidence })
+      return Response.json({ status: 'blocked', errorCode: 'scheduled_prepare_material_source_changed' }, { status: 409 })
+    })
+
+    const result = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+
+    expect(result.status).toBe(409)
+    await expect(result.json()).resolves.toEqual({ status: 'blocked', errorCode: 'scheduled_prepare_material_source_changed' })
+    expect(mocks.sourceTerminal).toHaveBeenCalledOnce()
+    expect(mocks.update).toHaveBeenCalledOnce()
+    expect(committedRenewals).toBe(0)
     expect(mocks.executeGate).not.toHaveBeenCalled()
   })
 

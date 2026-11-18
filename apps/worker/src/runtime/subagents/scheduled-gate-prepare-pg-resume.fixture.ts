@@ -23,6 +23,7 @@ const SCHEDULED_PREPARE_DIAGNOSTIC_ERROR_CODES = [
   "scheduled_pipeline_claim_conflict", "scheduled_pipeline_analysis_interrupted", "scheduled_pipeline_request_invalid",
   "scheduled_pipeline_unauthorized", "scheduled_pipeline_account_unavailable", "scheduled_pipeline_entitlement_required",
   "scheduled_pipeline_ai_unavailable", "scheduled_pipeline_ai_budget_exhausted", "scheduled_pipeline_source_changed",
+  "scheduled_prepare_material_source_changed",
   "scheduled_pipeline_gate_checkpoint_missing", "scheduled_pipeline_wait_identity_mismatch",
   "scheduled_pipeline_analyze_checkpoint_invalid",
 ] as const
