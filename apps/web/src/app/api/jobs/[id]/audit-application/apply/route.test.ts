@@ -185,6 +185,8 @@ describe('POST /api/jobs/[id]/audit-application/apply', () => {
     expect(body.audit.findings[0]).toMatchObject({ applied: true, target: 'summary', proposedValue: 'Supported summary.' })
     expect(mocks.resumeVersionCreate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ resumeId: 'resume_final', content: resumeContent }) }))
     expect(mocks.resumeUpdate).toHaveBeenCalledWith(expect.objectContaining({ data: { content: { ...resumeContent, summary: 'Supported summary.' } } }))
+    expect(mocks.withLock.mock.calls[1]?.[0]).toEqual(scope)
+    expect(mocks.withLock.mock.calls[1]?.[2]).toEqual({ sourceMaterialFence: true })
     const stored = await readAuditOperation({ activity: { findFirst: mocks.activityFindFirst, findUnique: mocks.activityFindUnique } } as never, scope)
     expect(stored.kind).toBe('completed')
     if (stored.kind !== 'completed') throw new Error('Expected completed correction')
@@ -213,6 +215,7 @@ describe('POST /api/jobs/[id]/audit-application/apply', () => {
     expect(body.audit.findings[0].applied).toBe(true)
     expect(mocks.coverLetterUpdate).toHaveBeenCalledWith(expect.objectContaining({ data: { content: 'Dear Acme, I bring supported delivery experience.' } }))
     expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+    expect(mocks.withLock.mock.calls[1]?.[2]).toBeUndefined()
   })
 
   it('rejects an audit finding when the audited resume has changed', async () => {
@@ -320,6 +323,8 @@ describe('POST /api/jobs/[id]/audit-application/apply', () => {
     expect(body.appliedContent).toBe('Generated supported summary.')
     expect(mocks.modelChat).toHaveBeenCalled()
     expect(mocks.buildPersona).toHaveBeenCalledWith('user_1', 'tailor')
+    expect(mocks.modelChat.mock.invocationCallOrder[0]).toBeLessThan(mocks.withLock.mock.invocationCallOrder[1])
+    expect(mocks.withLock.mock.calls[1]?.[2]).toEqual({ sourceMaterialFence: true })
   })
 
   it('does not write a generated replacement that would be truncated', async () => {
@@ -381,6 +386,23 @@ describe('POST /api/jobs/[id]/audit-application/apply', () => {
     expect(response.status).toBe(503)
     expect(await response.json()).not.toHaveProperty('audit')
     expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+    expect(mocks.activityUpdate).not.toHaveBeenCalled()
+  })
+
+  it('fails closed before any correction write when the source fence transaction fails', async () => {
+    await seedCurrentAudit(audit())
+    const normalLock = mocks.withLock.getMockImplementation()!
+    mocks.withLock.mockImplementationOnce(normalLock).mockRejectedValueOnce(new Error('source fence failed'))
+    const { POST } = await import('./route')
+
+    const response = (await POST(request({ resumeId: 'resume_final', findingIndex: 0 }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+
+    expect(response.status).toBe(503)
+    expect(mocks.withLock).toHaveBeenCalledTimes(2)
+    expect(mocks.withLock.mock.calls[1]?.[2]).toEqual({ sourceMaterialFence: true })
+    expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
+    expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+    expect(mocks.activityUpsert).not.toHaveBeenCalled()
     expect(mocks.activityUpdate).not.toHaveBeenCalled()
   })
 

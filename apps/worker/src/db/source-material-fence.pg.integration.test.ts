@@ -2,10 +2,13 @@ import { randomUUID } from "node:crypto"
 import { createRequire } from "node:module"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import { Pool, type PoolClient } from "pg"
+import { buildAgentSourceMaterialFenceKey } from "@jobcopilot/shared"
 
-// Worker Vitest aliases this test-only Web import to apps/web/src.
+// Worker Vitest aliases these test-only Web imports to apps/web/src.
 // @ts-expect-error The Worker TypeScript project does not compile Web path aliases.
 import { acquireSourceMaterialFence as acquireWebSourceMaterialFence } from "@/lib/agent/source-material-fence"
+// @ts-expect-error The Worker TypeScript project does not compile Web path aliases.
+import { withApplicationAuditLock as withWebApplicationAuditLock } from "@/lib/application-audit-transaction"
 import { acquireSourceMaterialFence as acquireWorkerSourceMaterialFence } from "./source-material-fence.js"
 import { updateJobForSubmission } from "./submission-guard.js"
 import type { ApplicationSubmitIdentity } from "../queue/application-submit-fence.js"
@@ -24,12 +27,18 @@ type WebPrismaClient = PrismaRawClient & {
   ): Promise<T>
 }
 type WebSourceMaterialFence = (transaction: unknown, userIds: readonly string[]) => Promise<void>
+type WebApplicationAuditLock = (
+  scope: { userId: string; jobId: string },
+  run: (transaction: PrismaRawClient) => Promise<unknown>,
+  options?: { sourceMaterialFence?: true },
+) => Promise<unknown>
 
 const webRequire = createRequire(new URL("../../../web/package.json", import.meta.url))
 const PrismaClient = (webRequire("@prisma/client") as {
   PrismaClient: new (options: { datasources: { db: { url: string } } }) => WebPrismaClient
 }).PrismaClient
 const acquireWebFence = acquireWebSourceMaterialFence as unknown as WebSourceMaterialFence
+const withWebAuditLock = withWebApplicationAuditLock as unknown as WebApplicationAuditLock
 
 const EXPECTED_DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
 const WAIT_TIMEOUT_MS = 8_000
@@ -295,6 +304,30 @@ async function waitForBlocker(waiterPid: number, blockerPid: number): Promise<vo
   throw new Error("Timed out waiting for the source material advisory lock")
 }
 
+async function waitForJobRowWait(blockerPid: number): Promise<number> {
+  const deadline = Date.now() + WAIT_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    const result = await withTimeout(
+      pool!.query<{ pid: number }>(
+        `SELECT activity.pid::int AS pid
+         FROM pg_stat_activity AS activity
+         WHERE activity.datname = current_database()
+           AND activity.wait_event_type = 'Lock'
+           AND activity.query ILIKE '%FROM "Job"%'
+           AND activity.query ILIKE '%FOR UPDATE%'
+           AND $1::int = ANY(pg_blocking_pids(activity.pid))
+         LIMIT 1`,
+        [blockerPid],
+      ),
+      "Job lock waiter probe timed out",
+    )
+    const pid = result.rows[0]?.pid
+    if (Number.isSafeInteger(pid) && pid > 0) return pid
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error("Timed out waiting for the audit transaction's Job row lock")
+}
+
 describeWithPostgres("Web Prisma and Worker pg source material fence", () => {
   beforeAll(async () => {
     prisma = new PrismaClient({ datasources: { db: { url: databaseUrl! } } })
@@ -319,6 +352,112 @@ describeWithPostgres("Web Prisma and Worker pg source material fence", () => {
   }, CLEANUP_TIMEOUT_MS + 1_000)
 
   afterEach(() => vi.restoreAllMocks())
+
+  it("acquires the source fence before waiting for the audit transaction's Job row", async () => {
+    const suffix = randomUUID()
+    const userId = `source-fence-audit-user-${suffix}`
+    const userEmail = `${userId}@example.invalid`
+    const jobId = `source-fence-audit-job-${suffix}`
+    let blockerClient: PoolClient | undefined
+    let blockerTransactionOpen = false
+    let auditTransaction: Promise<unknown> | undefined
+
+    try {
+      await pool!.query(
+        `INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`,
+        [userId, userEmail],
+      )
+      await pool!.query(
+        `INSERT INTO "Job" ("id", "userId", "company", "role", "status", "updatedAt")
+         VALUES ($1, $2, 'Acme', 'Engineer', 'saved', CURRENT_TIMESTAMP)`,
+        [jobId, userId],
+      )
+      blockerClient = await pool!.connect()
+      blockerTransactionOpen = true
+      await withTimeout(blockerClient.query("BEGIN"), "Job blocker transaction begin timed out")
+      await withTimeout(
+        blockerClient.query(`SELECT "id" FROM "Job" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`, [jobId, userId]),
+        "Job blocker row lock timed out",
+      )
+      const blockerPid = await workerBackendPid(blockerClient)
+
+      auditTransaction = withWebAuditLock({ userId, jobId }, async () => "completed", { sourceMaterialFence: true })
+      const waiterPid = await waitForJobRowWait(blockerPid)
+      expect(await blockingPids(waiterPid)).toContain(blockerPid)
+      const probe = await withTimeout(
+        pool!.query<{ acquired: boolean }>(
+          "SELECT pg_try_advisory_xact_lock(hashtextextended($1::text, 0)) AS acquired",
+          [buildAgentSourceMaterialFenceKey(userId)],
+        ),
+        "Source fence lock probe timed out",
+      )
+      expect(probe.rows[0]?.acquired).toBe(false)
+
+      await withTimeout(blockerClient.query("COMMIT"), "Job blocker commit timed out")
+      blockerTransactionOpen = false
+      await expect(withTimeout(auditTransaction, "Fenced audit transaction did not finish")).resolves.toBe("completed")
+    } finally {
+      if (blockerClient) await rollbackAndReleaseWorkerClient(blockerClient, blockerTransactionOpen)
+      if (auditTransaction && !(await completesWithin(auditTransaction, "Audit transaction cleanup timed out"))) {
+        throw new Error("Fenced audit transaction cleanup timed out")
+      }
+      await pool!.query(`DELETE FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [jobId, userId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [userId])
+    }
+  }, TEST_TIMEOUT_MS)
+
+  it("rolls back ResumeVersion and Resume writes if the fenced correction transaction fails", async () => {
+    const suffix = randomUUID()
+    const userId = `source-fence-audit-rollback-user-${suffix}`
+    const userEmail = `${userId}@example.invalid`
+    const jobId = `source-fence-audit-rollback-job-${suffix}`
+    const resumeId = `source-fence-audit-rollback-resume-${suffix}`
+    const versionId = `source-fence-audit-version-${suffix}`
+    const originalContent = { summary: "Original" }
+    const updatedContent = { summary: "Corrected" }
+
+    try {
+      await pool!.query(
+        `INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`,
+        [userId, userEmail],
+      )
+      await pool!.query(
+        `INSERT INTO "Job" ("id", "userId", "company", "role", "status", "updatedAt")
+         VALUES ($1, $2, 'Acme', 'Engineer', 'saved', CURRENT_TIMESTAMP)`,
+        [jobId, userId],
+      )
+      await pool!.query(
+        `INSERT INTO "Resume" ("id", "userId", "name", "content", "updatedAt")
+         VALUES ($1, $2, 'Final', $3::jsonb, CURRENT_TIMESTAMP)`,
+        [resumeId, userId, JSON.stringify(originalContent)],
+      )
+
+      await expect(withWebAuditLock({ userId, jobId }, async tx => {
+        await tx.$queryRaw`INSERT INTO "ResumeVersion" ("id", "resumeId", "userId", "content", "name")
+          VALUES (${versionId}, ${resumeId}, ${userId}, ${JSON.stringify(originalContent)}::jsonb, 'Final')
+          RETURNING "id"`
+        await tx.$queryRaw`UPDATE "Resume" SET "content" = NULL, "updatedAt" = CURRENT_TIMESTAMP
+          WHERE "id" = ${resumeId} AND "userId" = ${userId} RETURNING "id"`
+        return updatedContent
+      }, { sourceMaterialFence: true })).rejects.toThrow()
+
+      const versions = await pool!.query<{ id: string }>(
+        `SELECT "id" FROM "ResumeVersion" WHERE "resumeId" = $1 AND "userId" = $2`,
+        [resumeId, userId],
+      )
+      const resumes = await pool!.query<{ content: unknown }>(
+        `SELECT "content" FROM "Resume" WHERE "id" = $1 AND "userId" = $2`,
+        [resumeId, userId],
+      )
+      expect(versions.rows).toEqual([])
+      expect(resumes.rows).toEqual([{ content: originalContent }])
+    } finally {
+      await pool!.query(`DELETE FROM "ResumeVersion" WHERE "resumeId" = $1 AND "userId" = $2`, [resumeId, userId])
+      await pool!.query(`DELETE FROM "Resume" WHERE "id" = $1 AND "userId" = $2`, [resumeId, userId])
+      await pool!.query(`DELETE FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [jobId, userId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [userId])
+    }
+  }, TEST_TIMEOUT_MS)
 
   it("holds a Web lock against Worker acquisition until Web commit", async () => {
     const userId = `source-fence-${randomUUID()}`
