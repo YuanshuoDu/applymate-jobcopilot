@@ -1,12 +1,28 @@
 import { describe, expect, it, vi } from "vitest"
+import { buildAgentSourceMaterialFenceKey } from "@jobcopilot/shared"
 import { createRunRecorderWriteContext, withRunRecorderTerminalOwnership, withRunRecorderWriteOwnership } from "./run-recorder-ownership"
 
-function fakeDb(turnStatus = "in_progress", executionCount = 1) {
+function fakeDb(turnStatus = "in_progress", executionCount = 1, fenceTransactionIds: readonly [string, string] = ["17", "17"]) {
   const order: string[] = []
+  const sourceFenceKeys: unknown[] = []
+  let sourceFenceQueryCount = 0
   const tx = {
-    $queryRaw: vi.fn(async (query: unknown) => {
-      const strings = (query as { strings?: readonly string[] }).strings ?? []
+    $queryRaw: vi.fn(async (query: unknown, ...templateValues: unknown[]) => {
+      const strings = Array.isArray(query)
+        ? query as unknown as readonly string[]
+        : (query as { strings?: readonly string[] }).strings ?? []
       const sql = strings.join(" ")
+      if (sql.includes("pg_advisory_xact_lock")) {
+        order.push("source-fence")
+        sourceFenceKeys.push(templateValues[0])
+        const transactionId = fenceTransactionIds[sourceFenceQueryCount++]
+        return [{ transaction_id: transactionId, lock_acquired: "" }]
+      }
+      if (sql.includes("pg_current_xact_id()::text AS transaction_id")) {
+        order.push("source-fence-verification")
+        const transactionId = fenceTransactionIds[sourceFenceQueryCount++]
+        return [{ transaction_id: transactionId }]
+      }
       order.push(sql.includes('FROM "agent_sessions"') ? "session-lock" : "turn-lock")
       return sql.includes('FROM "agent_sessions"') ? [{ id: "session_1" }] : [{ id: "turn_1", status: turnStatus }]
     }),
@@ -17,7 +33,7 @@ function fakeDb(turnStatus = "in_progress", executionCount = 1) {
     agentTurn: { updateMany: vi.fn(async () => { order.push("turn-terminal"); return { count: 1 } }) },
   }
   const db = { $transaction: vi.fn(async (work: (tx: unknown) => Promise<unknown>) => work(tx)) }
-  return { db, tx, order }
+  return { db, tx, order, sourceFenceKeys }
 }
 
 const owner = {
@@ -71,6 +87,53 @@ describe("run recorder ownership transactions", () => {
 
     expect(tx.agentExecution.updateMany).not.toHaveBeenCalled()
     expect(write).not.toHaveBeenCalled()
+  })
+
+  it("takes the exact user's source fence before any owner lock when explicitly opted in", async () => {
+    const { db, tx, order, sourceFenceKeys } = fakeDb()
+    const authenticatedUserId = "authenticated-user"
+    const write = vi.fn(async () => { order.push("protected-write") })
+
+    await expect(withRunRecorderWriteOwnership(db as never, {
+      sessionId: "session_1", userId: authenticatedUserId,
+      owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 3 } },
+      requireSourceMaterialFence: true,
+    }, write)).resolves.toEqual({ owned: true, value: undefined })
+
+    expect(sourceFenceKeys).toEqual([buildAgentSourceMaterialFenceKey(authenticatedUserId)])
+    expect(order).toEqual(["source-fence", "source-fence-verification", "session-lock", "turn-lock", "execution-lock", "protected-write"])
+  })
+
+  it("fails closed before owner locks or writes when the opted-in source fence fails", async () => {
+    const { db, tx, order } = fakeDb("in_progress", 1, ["17", "18"])
+    const write = vi.fn()
+
+    let caught: unknown
+    try {
+      await withRunRecorderWriteOwnership(db as never, {
+        sessionId: "session_1", userId: "user_1",
+        owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 3 } },
+        requireSourceMaterialFence: true,
+      }, write)
+    } catch (error) {
+      caught = error
+    }
+    if (!(caught instanceof Error)) throw new Error("Expected source fence verification to fail")
+    expect(caught.message).toBe("source material fence transaction verification failed")
+
+    expect(order).toEqual(["source-fence", "source-fence-verification"])
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(2)
+    expect(tx.agentExecution.updateMany).not.toHaveBeenCalled()
+    expect(write).not.toHaveBeenCalled()
+  })
+
+  it("does not acquire the source fence for existing non-opted-in writes", async () => {
+    const { db, order } = fakeDb()
+    await withRunRecorderWriteOwnership(db as never, {
+      sessionId: "session_1", userId: "user_1",
+      owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 3 } },
+    }, async () => undefined)
+    expect(order).toEqual(["session-lock", "turn-lock", "execution-lock"])
   })
 
   it("can require a still-running attempt for pipeline side effects", async () => {

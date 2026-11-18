@@ -1,6 +1,7 @@
 import { Prisma } from "@prisma/client"
 import type { AgentSessionDb } from "./repository"
 import { lockOpenSession } from "./v2-turn"
+import { acquireSourceMaterialFence } from "../source-material-fence"
 import { AgentExecutionCancelledError, refreshAgentExecutionAttempt } from "../execution-control"
 
 const ACTIVE_TURN_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] as const
@@ -119,10 +120,11 @@ type ExecutionOwnershipDb = OwnershipDb & { agentExecution: Prisma.TransactionCl
 
 export async function withRunRecorderWriteOwnership<T>(
   db: AgentSessionDb,
-  input: { sessionId: string; userId: string; owner: RunRecorderWriteOwner },
+  input: { sessionId: string; userId: string; owner: RunRecorderWriteOwner; requireSourceMaterialFence?: true },
   write: (tx: AgentSessionDb) => Promise<T>,
 ): Promise<{ owned: false } | { owned: true; value: T }> {
   return (db as ExecutionOwnershipDb).$transaction(async tx => {
+    if (input.requireSourceMaterialFence) await acquireSourceMaterialFence(tx, [input.userId])
     await lockOpenSession(tx, input)
     if (input.owner.turnId) {
       const turns = await tx.$queryRaw<Array<{ id: string; status: string }>>(Prisma.sql`
