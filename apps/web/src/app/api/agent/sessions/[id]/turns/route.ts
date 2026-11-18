@@ -6,6 +6,7 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { db } from "@/lib/db"
 import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { isScheduledTaskGraphSourceChangeTerminal } from "@/lib/agent/scheduled-taskgraph-source-change-terminal"
+import { scheduledMaterialDriftGateTaskId, scheduledMaterialDriftRecoveryReason } from "@/lib/agent/scheduled-taskgraph-gate-material-drift-projection"
 
 import {
   afterCursor,
@@ -21,6 +22,7 @@ interface RouteContext {
 
 const ACTIVE_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] as const
 const SOURCE_CHANGE_RECOVERY_REASON = "scheduled_pipeline_source_changed" as const
+const MATERIAL_DRIFT_GATE_TERMINAL_STATUSES = ["failed", "interrupted"] as const
 
 const TURN_SELECT = {
   id: true, sessionId: true, source: true, status: true, revision: true, input: true,
@@ -101,6 +103,46 @@ async function sourceChangeRecoveryReason(input: {
     : null
 }
 
+async function materialDriftRecoveryReason(input: {
+  userId: string; sessionId: string; activeTurn: Promise<{ id: string } | null>
+}) {
+  const [execution, activeTurn, newestTurn] = await Promise.all([
+    db.agentExecution.findFirst({
+      where: { userId: input.userId, sessionId: input.sessionId },
+      select: { id: true, userId: true, sessionId: true, status: true, error: true, state: true, attemptCount: true },
+    }),
+    input.activeTurn,
+    db.agentTurn.findFirst({
+      where: { userId: input.userId, sessionId: input.sessionId },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      select: { id: true, userId: true, sessionId: true, status: true, source: true, executionMode: true,
+        rootTaskId: true, input: true, leaseVersion: true },
+    }),
+  ])
+  const gateTaskId = execution && scheduledMaterialDriftGateTaskId(execution.state)
+  if (!execution || !newestTurn?.rootTaskId || !gateTaskId) return null
+
+  const taskSelect = { id: true, sessionId: true, turnId: true, rootTaskId: true, parentTaskId: true,
+    depth: true, role: true, taskType: true, status: true, attemptCount: true } satisfies Prisma.SubAgentTaskSelect
+  const [root, gate] = await Promise.all([
+    db.subAgentTask.findFirst({
+      where: { id: newestTurn.rootTaskId, sessionId: input.sessionId, turnId: newestTurn.id,
+        rootTaskId: newestTurn.rootTaskId, parentTaskId: null, depth: 0, role: "orchestrator", taskType: "root",
+        session: { userId: input.userId } },
+      select: taskSelect,
+    }),
+    db.subAgentTask.findFirst({
+      where: { id: gateTaskId, sessionId: input.sessionId, turnId: newestTurn.id,
+        rootTaskId: newestTurn.rootTaskId, parentTaskId: newestTurn.rootTaskId, depth: 1,
+        role: "prepare", taskType: "scheduled_taskgraph_gate", status: { in: [...MATERIAL_DRIFT_GATE_TERMINAL_STATUSES] },
+        session: { userId: input.userId } },
+      select: taskSelect,
+    }),
+  ])
+  return scheduledMaterialDriftRecoveryReason({ userId: input.userId, sessionId: input.sessionId,
+    activeTurnId: activeTurn?.id ?? null, newestTurnId: newestTurn.id, turn: newestTurn, root, gate, execution })
+}
+
 export async function GET(request: NextRequest, context: RouteContext) {
   const auth = await requireAuth(request)
   if (isErrorResponse(auth)) return auth
@@ -115,7 +157,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
     where: { sessionId, userId: auth.userId, status: { in: [...ACTIVE_STATUSES] } },
     orderBy: { createdAt: "asc" }, select: TURN_SELECT,
   })
-  const [rows, activeTurn, queuedInputCount, scheduledPipelineRecoveryReason] = await Promise.all([
+  const [rows, activeTurn, queuedInputCount, sourceChangeReason, materialDriftReason] = await Promise.all([
     db.agentTurn.findMany({
       where: { sessionId, userId: auth.userId, ...afterCursor(page.cursor) },
       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
@@ -125,9 +167,12 @@ export async function GET(request: NextRequest, context: RouteContext) {
     activeTurnQuery,
     db.agentInput.count({ where: { sessionId, userId: auth.userId, status: "accepted", delivery: "follow_up" } }),
     sourceChangeRecoveryReason({ userId: auth.userId, sessionId, activeTurn: activeTurnQuery }),
+    materialDriftRecoveryReason({ userId: auth.userId, sessionId, activeTurn: activeTurnQuery }),
   ])
   const result = pageResult(rows as TurnQueryRow[], page, "turns", sessionId)
   const activeProjection = activeTurnProjection(activeTurn as TurnQueryRow | null)
+  const scheduledPipelineRecoveryReason = sourceChangeReason && materialDriftReason ? null
+    : sourceChangeReason ?? materialDriftReason
   return ok({
     schemaVersion,
     turns: result.rows.map(turnDto),
