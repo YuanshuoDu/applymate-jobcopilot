@@ -28,6 +28,7 @@ const mocks = vi.hoisted(() => ({
   resumeFindFirst: vi.fn(),
   jobFindFirst: vi.fn(),
   jobUpdate: vi.fn(),
+  confirmTailoredResumeSourceWrite: vi.fn(),
   applicationTaskUpdateMany: vi.fn(),
   applicationTaskFindFirst: vi.fn(),
   applicationTaskEventCreate: vi.fn(),
@@ -98,6 +99,9 @@ vi.mock("@/lib/agent/approval/store", () => ({
 }))
 vi.mock("@/lib/agent/session/v2-turn", () => ({ ensureV2Turn: mocks.ensureV2Turn }))
 vi.mock("@/lib/agent/policy/legacy", () => ({ requireLegacyPolicy: vi.fn() }))
+vi.mock("@/lib/agent/session-actions/confirm-tailored-resume", () => ({
+  confirmTailoredResumeSourceWrite: mocks.confirmTailoredResumeSourceWrite,
+}))
 
 function postRequest(body: unknown) {
   return new Request("http://localhost/api/agent/sessions/session_1/actions", {
@@ -176,6 +180,11 @@ describe("agent session actions API", () => {
     mocks.resumeFindFirst.mockReset()
     mocks.jobFindFirst.mockReset()
     mocks.jobUpdate.mockReset()
+    mocks.confirmTailoredResumeSourceWrite.mockReset().mockResolvedValue({
+      kind: "saved",
+      job: { id: "job_1", company: "N26", role: "Backend Engineer", url: "https://jobs.example/apply", status: "saved" },
+      resume: { id: "resume_tailored", name: "Tailored for N26" },
+    })
     mocks.applicationTaskUpdateMany.mockReset()
     mocks.applicationTaskFindFirst.mockReset().mockResolvedValue(null)
     mocks.applicationTaskEventCreate.mockReset()
@@ -982,9 +991,15 @@ describe("agent session actions API", () => {
     expect(res.status).toBe(200)
     await expect(res.json()).resolves.toMatchObject({ event: { type: 'resume_finalized', title: 'Application pack ready' } })
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled()
-    expect(mocks.jobUpdate).toHaveBeenCalledWith({ where: { id: 'job_1' }, data: expect.objectContaining({
-      finalResumeId: 'resume_tailored', status: 'saved', workflowState: 'ready_to_apply', analysisNote: expect.stringContaining('extension'),
-    }) })
+    expect(mocks.confirmTailoredResumeSourceWrite).toHaveBeenCalledWith(expect.anything(), 'user_1', {
+      resumeId: 'resume_tailored', jobId: 'job_1',
+    })
+    expect(mocks.resolveLegacyApproval).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      approval: expect.objectContaining({ type: 'confirm_tailored_resume' }),
+      decision: 'approved', userId: 'user_1', sessionId: 'session_1',
+    }), expect.anything())
+    expect(mocks.consumeLegacyReceipt).toHaveBeenCalled()
+    expect(mocks.jobUpdate).not.toHaveBeenCalled()
   })
 
   it("rejects unsupported action types", async () => {

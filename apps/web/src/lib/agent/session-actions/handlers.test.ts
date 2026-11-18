@@ -17,17 +17,25 @@ const mocks = vi.hoisted(() => ({
   applicationTaskFindFirst: vi.fn(),
   jobFindFirst: vi.fn(),
   approvalFindFirst: vi.fn(),
+  transaction: vi.fn(),
+  transcriptCreate: vi.fn(),
+  updateAgentSession: vi.fn(),
+  confirmTailoredResumeSourceWrite: vi.fn(),
   queueApplicationFill: vi.fn(),
   confirmSubmissionNotReceived: vi.fn(),
 }))
 
 vi.mock("@/lib/db", () => ({
   db: {
+    $transaction: mocks.transaction,
     applicationTask: { findFirst: mocks.applicationTaskFindFirst },
     job: { findFirst: mocks.jobFindFirst },
     agentApproval: { findFirst: mocks.approvalFindFirst },
+    agentTranscriptEvent: { create: mocks.transcriptCreate },
   },
 }))
+vi.mock("@/lib/agent/session/repository", () => ({ updateAgentSession: mocks.updateAgentSession }))
+vi.mock("./confirm-tailored-resume", () => ({ confirmTailoredResumeSourceWrite: mocks.confirmTailoredResumeSourceWrite }))
 
 vi.mock("@/lib/auto-apply", () => ({
   applicationFillTaskGraphEnabled: mocks.applicationFillTaskGraphEnabled,
@@ -43,7 +51,10 @@ vi.mock("../control-plane/commands/application-submission-recovery-command", () 
   confirmSubmissionNotReceived: mocks.confirmSubmissionNotReceived,
 }))
 
-import { handleConfirmSubmissionNotReceivedAction, handleRetryApplicationFillAction, validateReceiptForApproval } from "./handlers"
+import {
+  handleConfirmSubmissionNotReceivedAction, handleConfirmedTailoredResume, handleRetryApplicationFillAction,
+  validateReceiptForApproval,
+} from "./handlers"
 
 describe("session action handlers", () => {
   beforeEach(() => {
@@ -54,6 +65,13 @@ describe("session action handlers", () => {
     mocks.assertJobPreflight.mockReset().mockResolvedValue(undefined)
     mocks.applicationTaskFindFirst.mockReset()
     mocks.jobFindFirst.mockReset()
+    mocks.transaction.mockReset().mockImplementation(async (run: (tx: unknown) => Promise<unknown>) => run({}))
+    mocks.transcriptCreate.mockReset().mockResolvedValue({
+      id: "event_ready", sessionId: "session_1", taskId: null, type: "resume_finalized", speaker: "Reviewer",
+      title: "Application pack ready", body: "Ready", data: {}, durationMs: null, createdAt: new Date("2026-06-18T10:03:00Z"),
+    })
+    mocks.updateAgentSession.mockReset().mockResolvedValue(undefined)
+    mocks.confirmTailoredResumeSourceWrite.mockReset()
     mocks.queueApplicationFill.mockReset()
     mocks.confirmSubmissionNotReceived.mockReset()
     mocks.approvalFindFirst.mockReset()
@@ -148,6 +166,46 @@ describe("session action handlers", () => {
 
     expect(response.status).toBe(409)
     await expect(response.json()).resolves.toEqual({ error: "The prior submit job or Redis lock is not safely terminal" })
+  })
+
+  it("does not emit completion side effects when the fenced confirmation write fails", async () => {
+    mocks.confirmTailoredResumeSourceWrite.mockRejectedValueOnce(new Error("source fence unavailable"))
+
+    await expect(handleConfirmedTailoredResume("session_1", "user_1", {
+      id: "approval_1", type: "confirm_tailored_resume", payload: { resumeId: "resume_1", jobId: "job_1" },
+    } as never)).rejects.toThrow("source fence unavailable")
+
+    expect(mocks.confirmTailoredResumeSourceWrite).toHaveBeenCalledWith(expect.anything(), "user_1", {
+      resumeId: "resume_1", jobId: "job_1",
+    })
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+    expect(mocks.updateAgentSession).not.toHaveBeenCalled()
+  })
+
+  it("preserves the missing-material response from the fenced confirmation", async () => {
+    mocks.confirmTailoredResumeSourceWrite.mockResolvedValueOnce({ kind: "missing" })
+
+    const response = await handleConfirmedTailoredResume("session_1", "user_1", {
+      id: "approval_1", type: "confirm_tailored_resume", payload: { resumeId: "resume_1", jobId: "job_1" },
+    } as never)
+
+    expect(response.status).toBe(404)
+    await expect(response.json()).resolves.toEqual({ error: "The tailored resume or job is no longer available." })
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+    expect(mocks.updateAgentSession).not.toHaveBeenCalled()
+  })
+
+  it("preserves the already-submitted conflict from the fenced confirmation", async () => {
+    mocks.confirmTailoredResumeSourceWrite.mockResolvedValueOnce({ kind: "already_submitted" })
+
+    const response = await handleConfirmedTailoredResume("session_1", "user_1", {
+      id: "approval_1", type: "confirm_tailored_resume", payload: { resumeId: "resume_1", jobId: "job_1" },
+    } as never)
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: "This job has already been submitted." })
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+    expect(mocks.updateAgentSession).not.toHaveBeenCalled()
   })
 
   it("keeps submission recovery unavailable when TaskGraph fill is disabled", async () => {
