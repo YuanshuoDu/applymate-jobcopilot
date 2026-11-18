@@ -1140,11 +1140,11 @@ async function seed(ids: FixtureIds): Promise<void> {
 
 async function persistUserTurnStop(ids: FixtureIds, rootTaskId: string, commands: UserStopCommandService): Promise<void> {
   const turn = await pool.query<{ revision: number; rootTaskId: string }>(`SELECT "revision", "rootTaskId" FROM "agent_turns"
-    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "status" = 'in_progress'`,
+    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
+      AND "status" IN ('queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval', 'waiting_for_user')`,
   [ids.turnId, ids.sessionId, ids.userId])
-  if (turn.rowCount !== 1 || turn.rows[0]?.rootTaskId !== rootTaskId) {
-    throw new Error("User Stop fixture could not read the exact active Turn revision")
-  }
+  if (turn.rowCount !== 1) throw new Error("User Stop fixture could not read exactly one active Turn revision")
+  if (turn.rows[0]?.rootTaskId !== rootTaskId) throw new Error("User Stop fixture active Turn root did not match the nested Scout tree")
   const result = await commands.interrupt({
     sessionId: ids.sessionId, userId: ids.userId, clientMessageId: `nested-stop-${ids.turnId}`,
     source: "user", expectedTurnId: ids.turnId, expectedRevision: Number(turn.rows[0].revision),
