@@ -75,22 +75,22 @@ function withTimeout<T>(promise: Promise<T>, message: string, timeoutMs = LOCK_W
   })
 }
 
-async function waitForAdvisoryWait(): Promise<void> {
+async function waitForSourceFenceBlocker(blockerPid: number): Promise<void> {
   const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS
   while (Date.now() < deadline) {
-    const rows = await db.$queryRaw<Array<{ waiting: number }>>`
-      SELECT count(*)::int AS waiting
+    const rows = await db.$queryRaw<Array<{ pid: number }>>`
+      SELECT pid::int AS pid
       FROM pg_stat_activity
       WHERE datname = current_database()
         AND pid <> pg_backend_pid()
         AND wait_event_type = 'Lock'
-        AND wait_event = 'Advisory'
-        AND query LIKE '%pg_advisory_xact_lock%'
+        AND query ILIKE '%pg_advisory_xact_lock%'
+        AND ${blockerPid}::int = ANY(pg_blocking_pids(pid))
     `
-    if ((rows[0]?.waiting ?? 0) > 0) return
+    if (rows.length > 0) return
     await new Promise<void>(resolve => setTimeout(resolve, 25))
   }
-  throw new Error('Gmail status projection did not wait for the held source-material fence')
+  throw new Error('Gmail status projection did not block on the held source-material fence transaction')
 }
 
 async function waitForJobUpdateWait(): Promise<void> {
@@ -132,6 +132,7 @@ async function createJobFixture() {
 
 function startFencedMaterialRead(userId: string, jobId: string, rollbackError?: Error) {
   const observedStatus = deferred<JobStatus | null>()
+  const backendPid = deferred<number>()
   const release = deferred<void>()
   const transaction = db.$transaction(async tx => {
     await acquireSourceMaterialFence(tx, [userId])
@@ -140,6 +141,10 @@ function startFencedMaterialRead(userId: string, jobId: string, rollbackError?: 
       select: { status: true },
     })
     observedStatus.resolve(job?.status ?? null)
+    const backendRows = await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid()::int AS pid`
+    const pid = backendRows[0]?.pid
+    if (!Number.isSafeInteger(pid) || pid < 1) throw new Error('Could not read the fenced material-read backend PID')
+    backendPid.resolve(pid)
     await release.promise
     if (rollbackError) throw rollbackError
     return job?.status ?? null
@@ -148,7 +153,7 @@ function startFencedMaterialRead(userId: string, jobId: string, rollbackError?: 
     value => ({ state: 'committed' as const, value }),
     error => ({ state: 'rolled-back' as const, error }),
   )
-  return { observedStatus: observedStatus.promise, release, finished }
+  return { observedStatus: observedStatus.promise, backendPid: backendPid.promise, release, finished }
 }
 
 function startCompetingJobUpdate(userId: string, jobId: string) {
@@ -215,11 +220,12 @@ describeWithPostgres('Gmail status projection source-material fence', () => {
     let observedBlockingWriter = false
     try {
       await expect(withTimeout(reader.observedStatus, 'fenced material read timed out')).resolves.toBe('saved')
+      const blockerPid = await withTimeout(reader.backendPid, 'fenced material-read PID was not recorded')
       writer = trackAndProjectLinkedStatusMessage(
         fixture.userId, fixture.job, new Date('2026-11-18T09:00:00Z'), 'interview_invitation',
         notificationPreferences, message,
       )
-      await waitForAdvisoryWait()
+      await waitForSourceFenceBlocker(blockerPid)
       observedBlockingWriter = true
     } finally {
       reader.release.resolve()
@@ -241,11 +247,12 @@ describeWithPostgres('Gmail status projection source-material fence', () => {
     let observedBlockingWriter = false
     try {
       await expect(withTimeout(reader.observedStatus, 'fenced material read timed out')).resolves.toBe('saved')
+      const blockerPid = await withTimeout(reader.backendPid, 'fenced material-read PID was not recorded')
       writer = trackAndProjectLinkedStatusMessage(
         fixture.userId, fixture.job, new Date('2026-11-18T09:00:00Z'), 'interview_invitation',
         notificationPreferences, message,
       )
-      await waitForAdvisoryWait()
+      await waitForSourceFenceBlocker(blockerPid)
       observedBlockingWriter = true
     } finally {
       reader.release.resolve()
