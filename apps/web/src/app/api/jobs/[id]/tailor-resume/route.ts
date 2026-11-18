@@ -5,7 +5,6 @@
  */
 import { NextRequest } from 'next/server'
 import { randomUUID } from 'node:crypto'
-import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { prepareAiRoute, ok, err } from '@/lib/api-helpers'
 import { modelChat, parseAiJson } from '@/lib/model-router'
@@ -14,8 +13,9 @@ import { personaEvidenceContext } from '@/lib/persona-evidence'
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import type { ApplicationAuditFinding } from '@/lib/types'
 import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
-import { auditJobBasisHash, auditMaterialBasisHash, readAuditOperation, registerAuditOperation, staleAuditOperation } from '@/lib/application-audit-operation'
-import { AuditMaterialBusyError, lockApplicationAuditMaterials, withApplicationAuditLock } from '@/lib/application-audit-transaction'
+import { auditJobBasisHash } from '@/lib/application-audit-operation'
+import { AuditMaterialBusyError, withApplicationAuditLock } from '@/lib/application-audit-transaction'
+import { guardedRepairBasis, persistAdaptedResume } from './persist-adapted-resume'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -30,28 +30,6 @@ type ChangeDetail = {
 type TailoredSection = {
   after?: unknown
   reason?: string
-}
-
-// Caller holds the scoped Job lock. Material rows are locked after it, in the
-// same order as audit generation and individual correction.
-async function guardedRepairBasis(tx: Prisma.TransactionClient, scope: { userId: string; jobId: string }, resumeId: string, signature: string, operationId: string) {
-  const operation = await readAuditOperation(tx, scope)
-  if (operation.kind !== 'completed' || operation.operationId !== operationId || operation.audit.receipt?.signature !== signature || operation.audit.resumeId !== resumeId) return null
-  if (!await lockApplicationAuditMaterials(tx, scope, resumeId, operation.audit.coverLetterId)) return null
-  const [job, resume, letter] = await Promise.all([
-    tx.job.findFirst({ where: { id: scope.jobId, userId: scope.userId } }),
-    tx.resume.findFirst({ where: { id: resumeId, userId: scope.userId } }),
-    operation.audit.coverLetterId ? tx.coverLetter.findFirst({ where: { id: operation.audit.coverLetterId, jobId: scope.jobId, userId: scope.userId } }) : null,
-  ])
-  const iso = (value: Date | undefined) => value instanceof Date && Number.isFinite(value.getTime()) ? value.toISOString() : null
-  if (!job || !resume || (operation.audit.coverLetterId && !letter)
-    || (job.finalResumeId && job.finalResumeId !== resumeId)
-    || (job.finalCoverLetterId ?? null) !== operation.audit.coverLetterId
-    || !operation.audit.resumeUpdatedAt || iso(resume.updatedAt) !== operation.audit.resumeUpdatedAt
-    || (letter ? !operation.audit.coverLetterUpdatedAt || iso(letter.updatedAt) !== operation.audit.coverLetterUpdatedAt : Boolean(operation.audit.coverLetterUpdatedAt))
-    || operation.jobBasisHash !== auditJobBasisHash(job)
-    || operation.materialBasisHash !== auditMaterialBasisHash(resume, letter)) return null
-  return { operation, job, resume, letter }
 }
 
 const SECTIONS = ['summary', 'skills', 'experience', 'education', 'projects', 'certifications'] as const
@@ -235,57 +213,31 @@ export async function POST(req: NextRequest, { params }: Params) {
 
   if (changes.length === 0) return err('No resume sections could be tailored', 502)
 
-  let adapted: { id: string; name: string }
-  if (existing && forceRetailor) {
-    if (!(existing.updatedAt instanceof Date) || !Number.isFinite(existing.updatedAt.getTime())) return err('The selected resume version is unavailable. Refresh before correcting it.', 409)
-    try {
-      const updated = await withApplicationAuditLock(scope, async tx => {
-        const current = await guardedRepairBasis(tx, scope, existing.id, auditReceiptSignature!, auditOperationId!)
-        if (!current || !repairBasis || current.operation.operationId !== repairBasis.operation.operationId
-          || current.job.keywords !== job.keywords || current.job.finalResumeId !== repairBasis.job.finalResumeId) return false
-        const result = await tx.resume.updateMany({
-          where: { id: existing.id, userId: prep.userId, targetJobId: jobId, kind: 'adapted', origin: 'ai-adapted', parentResumeId: existing.parentResumeId, updatedAt: existing.updatedAt, content: { equals: existing.content as Prisma.InputJsonValue } },
-          data: { content: adaptedContent as Prisma.InputJsonValue },
-        })
-        if (result.count !== 1) return false
-        await tx.resumeVersion.create({ data: { resumeId: existing.id, userId: prep.userId, content: existing.content as Prisma.InputJsonValue, name: existing.name } })
-        const invalidation = await registerAuditOperation(tx, scope)
-        if (!await staleAuditOperation(tx, scope, invalidation)) throw new Error('Could not invalidate the previous audit')
-        return true
-      })
-      if (!updated) return err('The resume changed during correction. Refresh and review the latest version.', 409)
-      adapted = existing
-    } catch {
-      return err('The correction could not be confirmed. Refresh and review the latest resume.', 503)
-    }
-  } else {
-    adapted = await db.resume.create({
-      data: {
-      userId:          prep.userId,
-      name:            `Tailored for ${job.company} - ${job.role}`,
-      content:         adaptedContent as Prisma.InputJsonValue,
-      templateId:      sourceResume.templateId ?? null,
-      templateOptions: sourceResume.templateOptions ?? undefined,
-      isDefault:       false,
-      directionId:     sourceResume.directionId ?? null,
-      kind:            'adapted',
-      parentResumeId:  sourceResume.id,
-      targetJobId:     job.id,
-      origin:          'ai-adapted',
-      basicsDetached:  sourceResume.basicsDetached ?? false,
-    },
-    })
-  }
+  if (existing && forceRetailor && (!(existing.updatedAt instanceof Date) || !Number.isFinite(existing.updatedAt.getTime()))) return err('The selected resume version is unavailable. Refresh before correcting it.', 409)
 
-  await db.activity.create({
-    data: {
-      userId: prep.userId,
-      jobId:  job.id,
-      type:   'resume_tailored',
-      text:   `${forceRetailor ? 'Revised' : 'Created'} tailored resume "${adapted.name}"`,
-      color:  '#3B6D11',
-    },
-  }).catch(() => null)
+  let persisted: Awaited<ReturnType<typeof persistAdaptedResume>>
+  try {
+    persisted = await persistAdaptedResume({
+      scope,
+      job,
+      sourceResume,
+      existing,
+      forceRetailor,
+      repairBasis,
+      auditReceiptSignature,
+      auditOperationId,
+      adaptedContent,
+    })
+  } catch (error) {
+    if (error instanceof AuditMaterialBusyError && !forceRetailor) return err('The application materials are being changed. Refresh before tailoring.', 409)
+    if (!forceRetailor) throw error
+    return err('The correction could not be confirmed. Refresh and review the latest resume.', 503)
+  }
+  if (persisted.kind === 'job-missing') return err('Job not found', 404)
+  if (persisted.kind === 'conflict') return forceRetailor
+    ? err('The resume changed during correction. Refresh and review the latest version.', 409)
+    : err('The job or source resume changed while tailoring. Run tailoring again.', 409)
+  const { adapted } = persisted
 
   return ok({ adaptedResumeId: adapted.id, changes, revised: Boolean(existing && forceRetailor) })
 }
