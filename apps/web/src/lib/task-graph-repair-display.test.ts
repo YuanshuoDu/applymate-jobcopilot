@@ -91,8 +91,9 @@ describe('TaskGraph repair display projection', () => {
     expect(projectRepairAttentionSummaries(invalid, {
       schemaVersion: 1,
       nodes: [null, { status: 'failed', checks: [
+        { kind: 'finding_count_gte', minimum: 1, status: 'passed' },
         { kind: 'evidence_count_gte', minimum: 2, status: 'failed' },
-      ], totalCount: 1, passedCount: 0, failedCount: 1, unverifiedCount: 0 }],
+      ], totalCount: 2, passedCount: 1, failedCount: 1, unverifiedCount: 0 }],
     })).toEqual([null, null])
   })
 
