@@ -2,13 +2,13 @@ import type { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { hashArtifactContent } from './artifacts/hash'
 import type { ScheduledTaskGraphArtifactReference } from './scheduled-taskgraph-gate-checkpoint'
+import { isScheduledTaskGraphGateMaterialDriftMarker, SCHEDULED_TASKGRAPH_GATE_MATERIAL_DRIFT_ERROR_CODE as ERROR_CODE,
+  SCHEDULED_TASKGRAPH_GATE_MATERIAL_DRIFT_MARKER_REASON as MARKER_REASON,
+  SCHEDULED_TASKGRAPH_GATE_MATERIAL_DRIFT_MARKER_SCHEMA as MARKER_SCHEMA } from './scheduled-taskgraph-gate-material-drift-marker'
 import { scheduledTaskGraphGateSourceFingerprintProjection } from './scheduled-taskgraph-gate-source'
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 
-const ERROR_CODE = 'scheduled_prepare_material_source_changed'
 const PROOF_SCHEMA = 'agent-harness.v2.scheduled-prepare-material-drift-proof.v1'
-const MARKER_SCHEMA = 'agent-harness.v2.scheduled-prepare-material-drift-terminal.v1'
-const MARKER_REASON = 'scheduled_prepare_material_source_changed'
 const OWNER_KEYS = ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'turnLeaseOwnerId', 'turnLeaseVersion', 'executionId', 'executionAttemptCount'] as const
 const GATE_KEYS = ['taskId', 'leaseOwnerId', 'attemptCount'] as const
 const DRIFT_PROOF_BY_ERROR = new WeakMap<object, ScheduledTaskGraphGateMaterialDriftProof>()
@@ -148,16 +148,10 @@ export function isScheduledTaskGraphGateMaterialDriftTerminal(input: Readonly<{
   error: unknown
   state: unknown
 }>): boolean {
-  const owner = parseOwner(input.owner), gate = parseGate(input.gate), state = record(input.state)
-  const marker = record(state?.scheduledTaskGraphMaterialDriftTerminal)
-  const markerOwner = parseOwner(marker?.owner), markerGate = parseGate(marker?.gate)
-  const markerKeys = ['schemaVersion', 'reason', 'owner', 'gate', 'analyzeFingerprintDigest', 'prepareProofDigest', 'artifactDigest', 'currentMaterialDigest', 'proofDigest']
-  return Boolean(owner && gate && state && marker && exactKeys(marker, markerKeys)
-    && input.status === 'failed' && input.error === ERROR_CODE && state.scheduledTaskGraphSourceChangeTerminal === undefined
-    && marker.schemaVersion === MARKER_SCHEMA && marker.reason === MARKER_REASON && markerOwner && sameOwner(owner, markerOwner)
-    && markerGate && sameGate(gate, markerGate) && isDigest(marker.artifactDigest)
-    && isDigest(marker.analyzeFingerprintDigest) && isDigest(marker.prepareProofDigest)
-    && isDigest(marker.currentMaterialDigest) && isDigest(marker.proofDigest))
+  const state = record(input.state)
+  return Boolean(state && input.status === 'failed' && input.error === ERROR_CODE
+    && state.scheduledTaskGraphSourceChangeTerminal === undefined
+    && isScheduledTaskGraphGateMaterialDriftMarker({ owner: input.owner, gate: input.gate, state }))
 }
 
 export async function scheduledTaskGraphGateMaterialDriftTerminalForRequest(input: Readonly<{ owner: Pick<ScheduledTaskGraphPipelineOwner, 'userId' | 'sessionId' | 'turnId' | 'rootTaskId' | 'rootAttemptCount' | 'turnLeaseOwnerId' | 'turnLeaseVersion'>; gateTaskId: string; gateLeaseOwnerId: string; gateAttemptCount: number }>): Promise<boolean> {

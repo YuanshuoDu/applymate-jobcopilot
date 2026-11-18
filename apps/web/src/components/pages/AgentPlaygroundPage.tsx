@@ -6,6 +6,7 @@ import { useApi }   from '@/lib/hooks'
 import type { AgentConfig } from '@/lib/types'
 import { AgentUnifiedStream } from '@/components/agent-workspace/AgentUnifiedStream'
 import { AgentCurrentObjective } from '@/components/agent-workspace/AgentCurrentObjective'
+import { ScheduledSourceChangeRecoveryNotice } from '@/components/agent-workspace/ScheduledSourceChangeRecoveryNotice'
 import type { ApplyReadyJob } from '@/components/agent-workspace/ApplyJobCard'
 import { AgentSessionConsole } from '@/components/agent-workspace/AgentSessionConsole'
 import { AgentPlaygroundWorkspace } from './AgentPlaygroundWorkspace'
@@ -27,6 +28,10 @@ import { AgentWorkspacePanels } from './AgentWorkspacePanels'
 
 export function isDurableTurnRunning(status: ActiveTurnStatus | undefined): boolean {
   return status === 'queued' || status === 'in_progress'
+}
+
+export function shouldRefetchTurnStateAfterAutomationRun(selectedSessionId: string | null, runSessionId: string): boolean {
+  return selectedSessionId === runSessionId
 }
 
 const previewApplicationReviewJob: ApplyReadyJob = {
@@ -52,7 +57,7 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
   const { sessionId, setSessionId } = useAgentSessionUrl()
   const selectedSessionId = sessionId
   const timeline = useAgentTimeline(selectedSessionId)
-  const { activeTurn, turnStateReadiness, refetch: refetchTurnState } = useAgentSessionState(sessionId)
+  const { activeTurn, scheduledPipelineRecoveryReason, turnStateReadiness, refetch: refetchTurnState } = useAgentSessionState(sessionId)
   const { data: controlSessionData, refetch: refetchControlSession } = useApi<{ session?: { id?: string; status?: unknown } }>(selectedSessionId ? `/api/agent/sessions/${encodeURIComponent(selectedSessionId)}` : '', { cache: false, enabled: Boolean(selectedSessionId) })
   const controlStatus = parseAgentSessionControlStatus(selectedSessionControlStatusValue(selectedSessionId, controlSessionData?.session))
   useAgentSessionControlRefresh(selectedSessionId, controlStatus, refetchControlSession, refetchTurnState)
@@ -174,6 +179,7 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
     },
     onRunSession: (id, policy) => {
       selectAutomationSession(id, policy)
+      if (shouldRefetchTurnStateAfterAutomationRun(selectedSessionId, id)) refetchTurnState()
       setMobileSessionDrawerOpen(false)
     },
     onNewChat: () => {
@@ -203,6 +209,7 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
           t={t}
         />}>
         <div className="agent-chat-column" style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          <ScheduledSourceChangeRecoveryNotice reason={scheduledPipelineRecoveryReason} turnStatus={activeTurn?.status} />
           <div className="agent-context-bar">
           <AgentCurrentObjective goal={activeTurn?.goal} />
           <AgentSessionPauseResumeControl sessionId={selectedSessionId ?? ''} sessionStatus={controlStatus} activeTurn={activeTurn} onPause={command => sendSessionControl('pause', command)} onResume={command => sendSessionControl('resume', command)} />

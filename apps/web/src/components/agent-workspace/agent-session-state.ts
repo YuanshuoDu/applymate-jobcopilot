@@ -11,6 +11,10 @@ export type ActiveTurnStatus =
   | 'waiting_for_approval'
   | 'waiting_for_user'
 
+export type ScheduledPipelineRecoveryReason =
+  | 'scheduled_pipeline_source_changed'
+  | 'scheduled_prepare_material_source_changed'
+
 export interface ActiveTurnDto {
   id: string
   status: ActiveTurnStatus
@@ -25,12 +29,26 @@ export interface AgentTurnsResponse {
     activeTurnId?: string | null
     activeTurn?: unknown
     queuedInputCount?: number
+    scheduledPipelineRecoveryReason?: unknown
   }
 }
 
 export interface AgentSessionState {
   activeTurn: ActiveTurnDto | null
   queuedInputCount: number
+  scheduledPipelineRecoveryReason: ScheduledPipelineRecoveryReason | null
+}
+
+const EMPTY_AGENT_SESSION_STATE: AgentSessionState = {
+  activeTurn: null, queuedInputCount: 0, scheduledPipelineRecoveryReason: null,
+}
+
+export function stateForSelectedAgentSession(
+  sessionId: string | null,
+  stateSessionId: string | null,
+  state: AgentSessionState,
+): AgentSessionState {
+  return sessionId === stateSessionId ? state : EMPTY_AGENT_SESSION_STATE
 }
 
 export type AgentTurnStateReadiness = 'loading' | 'ready' | 'error'
@@ -56,7 +74,7 @@ export function parseActiveTurn(value: unknown): ActiveTurnDto | null {
 }
 
 export function parseAgentTurnsResponse(value: unknown): AgentSessionState {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return { activeTurn: null, queuedInputCount: 0 }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { activeTurn: null, queuedInputCount: 0, scheduledPipelineRecoveryReason: null }
   const response = value as AgentTurnsResponse
   const projection = response.projection
   const activeTurnId = nonEmptyString(projection?.activeTurnId)
@@ -75,6 +93,10 @@ export function parseAgentTurnsResponse(value: unknown): AgentSessionState {
     queuedInputCount: typeof projection?.queuedInputCount === 'number' && Number.isSafeInteger(projection.queuedInputCount) && projection.queuedInputCount >= 0
       ? Math.floor(projection.queuedInputCount)
       : 0,
+    scheduledPipelineRecoveryReason: projection?.scheduledPipelineRecoveryReason === 'scheduled_pipeline_source_changed'
+      || projection?.scheduledPipelineRecoveryReason === 'scheduled_prepare_material_source_changed'
+      ? projection.scheduledPipelineRecoveryReason
+      : null,
   }
 }
 
@@ -154,7 +176,7 @@ export function useAgentSessionUrl() {
 }
 
 export function useAgentSessionState(sessionId: string | null) {
-  const [state, setState] = useState<AgentSessionState>({ activeTurn: null, queuedInputCount: 0 })
+  const [state, setState] = useState<AgentSessionState>({ activeTurn: null, queuedInputCount: 0, scheduledPipelineRecoveryReason: null })
   const [stateSessionId, setStateSessionId] = useState<string | null>(sessionId)
   const [loading, setLoading] = useState(Boolean(sessionId))
   const [error, setError] = useState<string | null>(null)
@@ -165,14 +187,14 @@ export function useAgentSessionState(sessionId: string | null) {
   useEffect(() => {
     if (!sessionId) {
       setStateSessionId(null)
-      setState({ activeTurn: null, queuedInputCount: 0 })
+      setState({ activeTurn: null, queuedInputCount: 0, scheduledPipelineRecoveryReason: null })
       setLoading(false)
       setError(null)
       return
     }
     const controller = new AbortController()
     setStateSessionId(sessionId)
-    setState({ activeTurn: null, queuedInputCount: 0 })
+    setState({ activeTurn: null, queuedInputCount: 0, scheduledPipelineRecoveryReason: null })
     setLoading(true)
     setError(null)
     void fetch(`/api/agent/sessions/${encodeURIComponent(sessionId)}/turns?limit=1`, { signal: controller.signal })
@@ -191,7 +213,7 @@ export function useAgentSessionState(sessionId: string | null) {
     return () => controller.abort()
   }, [sessionId, refreshVersion])
 
-  const visibleState = stateSessionId === sessionId ? state : { activeTurn: null, queuedInputCount: 0 }
+  const visibleState = stateForSelectedAgentSession(sessionId, stateSessionId, state)
   const turnStateReadiness = resolveAgentTurnStateReadiness(sessionId, stateSessionId, loading, error)
   return { ...visibleState, loading, error, turnStateReadiness, refetch }
 }
