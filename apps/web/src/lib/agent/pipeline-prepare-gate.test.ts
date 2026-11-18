@@ -131,7 +131,7 @@ describe('runPrepareGateStages', () => {
     expect(withRunRecorderWriteOwnership).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
-        sessionId: 'session-1', userId: 'user-1',
+        sessionId: 'session-1', userId: 'user-1', requireSourceMaterialFence: true,
         owner: { executionAttempt: { id: 'execution-1', attemptCount: 3 }, turnId: 'turn-1', signal: undefined, requireRunning: true },
       }),
       expect.any(Function),
