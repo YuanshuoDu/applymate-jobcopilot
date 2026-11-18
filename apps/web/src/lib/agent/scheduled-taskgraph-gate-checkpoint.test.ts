@@ -57,6 +57,9 @@ function prepared(overrides: Partial<typeof snapshot> = {}, liveOwner: Scheduled
   const jobs = ids.map(id => job(id))
   const prior = buildScheduledTaskGraphPrepareCheckpoint({ owner: liveOwner, snapshot: policySnapshot, attestation: policyAttestation, ownedJobs: jobs, analyzeResult: analyzeResult(jobs) })
   const persisted = JSON.parse(JSON.stringify(prior.checkpoint)) as Record<string, unknown>
+  persisted.scheduledTaskGraphAnalyzeSourceFingerprints = Object.fromEntries(ids.map(id => [id, {
+    version: 'agent-harness.v2.analyze-source-input.v1', digest: 'e'.repeat(64),
+  }]))
   const claim = { schemaVersion: 'agent-harness.v2.scheduled-pipeline-claim.v1', key: prior.continuationKey, claimToken: 'claim-secret', owner: { ...liveOwner },
     claimedAt: '2026-10-19T12:00:00.123Z', leaseExpiresAt: '2099-10-19T12:10:00.123Z' }
   persisted.scheduledTaskGraphClaim = claim
@@ -123,8 +126,34 @@ function retainPreparedJobs(value: ReturnType<typeof prepared>, selected: readon
 }
 
 describe('scheduled TaskGraph Prepare to Gate checkpoint', () => {
-  it('pins the historical v1 stable Prepare receipt key', () => {
-    expect(prepared().proof.receipt.continuationKey).toBe('scheduled-taskgraph:sha256:f9a20f940e39838c1453450b8f745fe3d14100575443add46cffdfd156963a39')
+  it('matches the Worker source-bound Analyze checkpoint digest fixed vector', () => {
+    const vectorOwner: ScheduledTaskGraphPipelineOwner = {
+      userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1', rootAttemptCount: 2,
+      turnLeaseOwnerId: 'lease-owner', turnLeaseVersion: 4, executionId: 'execution-1', executionAttemptCount: 3,
+    }
+    const value = {
+      nextStage: 'prepare',
+      scheduledTaskGraphContinuation: {
+        schemaVersion: 'agent-harness.v2.scheduled-pipeline-continuation.v1', key: `scheduled-taskgraph:sha256:${'1'.repeat(64)}`,
+        owner: vectorOwner, snapshotDigest: `sha256:${'c'.repeat(64)}`, graphRevision: 7, evidenceDigest: 'd'.repeat(64),
+      },
+      scoutedJobs: [{ id: 'job-b', userId: 'user-1' }, { id: 'job-a', userId: 'user-1' }],
+      analysisFailed: 0,
+      scoredJobs: [
+        { job: { id: 'job-b', userId: 'user-1' }, score: 72, matchedKeywords: ['Rust'], missingKeywords: [], recommendation: 'Review' },
+        { job: { id: 'job-a', userId: 'user-1' }, score: 84, matchedKeywords: ['TypeScript'], missingKeywords: ['AWS'], recommendation: 'Apply' },
+      ],
+      scheduledTaskGraphAnalyzeSourceFingerprints: {
+        'job-a': { version: 'agent-harness.v2.analyze-source-input.v1', digest: 'a'.repeat(64) },
+        'job-b': { version: 'agent-harness.v2.analyze-source-input.v1', digest: 'b'.repeat(64) },
+      },
+    }
+
+    expect(scheduledTaskGraphAnalyzeCheckpointDigest(value)).toBe('3ba58cad1cfc3b3d7d4e4171957b391fe02c13e8a83c57b87f7b2989d8ee8148')
+  })
+
+  it('pins the source-bound v1 stable Prepare receipt key', () => {
+    expect(prepared().proof.receipt.continuationKey).toBe('scheduled-taskgraph:sha256:a4ef5510732bf44e3094836d1954ab5a7167b618bce31955b5795950a3d3c9aa')
   })
 
   it('rejects a v2 Prepare receipt key when its Analyze continuation remains v1', () => {
@@ -150,6 +179,12 @@ describe('scheduled TaskGraph Prepare to Gate checkpoint', () => {
     expect(gate?.checkpoint.scheduledTaskGraphContinuation).toEqual(value.prior.checkpoint.scheduledTaskGraphContinuation)
     const changedJobBody = { ...value.persisted, scoutedJobs: (value.persisted.scoutedJobs as Job[]).map(row => ({ ...row, title: 'Changed body' })) }
     expect(scheduledTaskGraphAnalyzeCheckpointDigest(changedJobBody)).toBe(digest)
+    const sourceMap = value.persisted.scheduledTaskGraphAnalyzeSourceFingerprints as Record<string, { version: string; digest: string }>
+    const changedSource = { ...value.persisted, scheduledTaskGraphAnalyzeSourceFingerprints: { ...sourceMap, [ids[0]!]: { ...sourceMap[ids[0]!]!, digest: '0'.repeat(64) } } }
+    expect(scheduledTaskGraphAnalyzeCheckpointDigest(changedSource)).not.toBe(digest)
+    const missingSource = { ...value.persisted }
+    delete missingSource.scheduledTaskGraphAnalyzeSourceFingerprints
+    expect(scheduledTaskGraphAnalyzeCheckpointDigest(missingSource)).toBeNull()
   })
 
   it('keeps material bodies out of the serializable checkpoint and returns packages separately', () => {
@@ -224,6 +259,9 @@ describe('scheduled TaskGraph Prepare to Gate checkpoint', () => {
     const value = prepared()
     value.persisted.analysisFailed = 1
     value.persisted.scoredJobs = (value.persisted.scoredJobs as object[]).slice(0, 1)
+    const fingerprints = value.persisted.scheduledTaskGraphAnalyzeSourceFingerprints as Record<string, unknown>
+    const scoredIds = new Set((value.persisted.scoredJobs as Array<{ job: { id: string } }>).map(row => row.job.id))
+    for (const jobId of Object.keys(fingerprints)) if (!scoredIds.has(jobId)) delete fingerprints[jobId]
     expect(scheduledTaskGraphAnalyzeCheckpointDigest(value.persisted)).toMatch(/^[a-f0-9]{64}$/)
   })
 

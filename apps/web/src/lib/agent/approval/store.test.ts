@@ -391,6 +391,7 @@ describe("Web approval receipt store", () => {
   it("acquires the source fence before owner locks and rolls back when final validation fails", async () => {
     const row = await approvalRow()
     const { db, tx } = mockDb(row)
+    const scheduledOwnerFence = gateReplayInput(scopeInput).scheduledOwnerFence
     const validationError = Object.assign(new Error("source validation failed"), { code: "P2002" })
     let rollbackCount = 0
     let pendingPreparationWrites = 0
@@ -440,8 +441,10 @@ describe("Web approval receipt store", () => {
       body: "Review",
       payload: { jobId: scopeInput.jobId },
       prepareInTransaction,
-      projectWait: false,
+      executionAttempt: { id: "execution_1", attemptCount: 4 },
+      scheduledOwnerFence,
       scheduledSourceHooks,
+      projectWait: false,
     })).rejects.toBe(validationError)
 
     expect(rollbackCount).toBe(1)

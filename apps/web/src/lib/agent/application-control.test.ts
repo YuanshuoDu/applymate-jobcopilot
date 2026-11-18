@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { holdForApplicationReview, requestUserTakeover, skipApplicationForGate } from "./application-control"
+import { createAnalyzeSourceChangedErrorWithClaims } from "./stages/analyze-model-input"
 
 const mocks = vi.hoisted(() => ({
   taskUpsert: vi.fn(),
@@ -156,6 +157,34 @@ describe("application control plane", () => {
     expect(sourceHooks.acquireFence).toHaveBeenCalledOnce()
     expect(sourceHooks.validateSource).toHaveBeenCalledOnce()
     expect(assertScheduledGateCurrent).toHaveBeenCalledOnce()
+    expect(mocks.taskUpdateMany).not.toHaveBeenCalled()
+  })
+
+  it("surfaces Analyze source drift before any material proof failure or skip mutation", async () => {
+    const outcome = trackTransactionOutcome()
+    const order: string[] = []
+    const sourceError = createAnalyzeSourceChangedErrorWithClaims([{ jobId: "job_1", analysisFenceAt: "2026-09-01T00:00:00.000Z" }])
+    const materialProofLoader = vi.fn(async () => { order.push("material-proof-loader") })
+    mocks.queryRaw.mockImplementationOnce(async () => { order.push("session-lock"); return [{ id: "session_1" }] })
+      .mockImplementationOnce(async () => { order.push("turn-lock"); return [{ id: "turn_1", status: "waiting_for_user" }] })
+    const sourceHooks = { acquireFence: vi.fn(async () => { order.push("source-fence") }),
+      validateSource: vi.fn(async () => { order.push("job-source-validation") }) }
+    const assertScheduledGateCurrent = vi.fn(async () => {
+      order.push("analyze-source-validation")
+      if (order.length > 0) throw sourceError
+      await materialProofLoader()
+      return true
+    })
+
+    await expect(skipApplicationForGate({ userId: "user_1", jobId: "job_1", sessionId: "session_1",
+      checkpoint: "below_match_threshold", sourceHooks,
+      owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 2 }, assertScheduledGateCurrent } }))
+      .rejects.toBe(sourceError)
+
+    expect(outcome).toEqual({ committed: false, rolledBack: true })
+    expect(order).toEqual(["source-fence", "session-lock", "turn-lock", "analyze-source-validation"])
+    expect(materialProofLoader).not.toHaveBeenCalled()
+    expect(sourceHooks.validateSource).not.toHaveBeenCalled()
     expect(mocks.taskUpdateMany).not.toHaveBeenCalled()
   })
 

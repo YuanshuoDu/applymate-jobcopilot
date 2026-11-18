@@ -40,6 +40,8 @@ const scheduledContinuation = { schemaVersion: "agent-harness.v2.scheduled-pipel
 const scheduledCheckpointState = { nextStage: "prepare", scoutedJobs: [{ id: "job-1", userId: owner.userId }],
   scoredJobs: [{ job: { id: "job-1", userId: owner.userId }, score: 82, matchedKeywords: ["TypeScript"], missingKeywords: ["PostgreSQL"],
     recommendation: "Apply after tailoring.", analysisFenceAt: "2026-10-06T10:00:00.000Z" }], analysisFailed: 0,
+  scheduledTaskGraphAnalyzeSourceFingerprints: { "job-1": { version: "agent-harness.v2.analyze-source-input.v1",
+    digest: createHash("sha256").update("job-1/current-source", "utf8").digest("hex") } },
   scheduledTaskGraphContinuation: scheduledContinuation }
 const scheduledCheckpointEvidence = scheduledAnalyzeCheckpointEvidence(scheduledCheckpointState)!
 const scheduledReceipt = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-continuation-receipt.v1", owner: scheduledOwner,

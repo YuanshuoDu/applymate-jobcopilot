@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint";
-import { isScheduledTaskGraphSourceChangeTerminal, respondToScheduledTaskGraphAnalyzeSourceChange, terminalizeScheduledTaskGraphSourceChange } from "./scheduled-taskgraph-source-change-terminal";
+import { buildScheduledTaskGraphSourceChangeTerminalState, isScheduledTaskGraphSourceChangeTerminal,
+  respondToScheduledTaskGraphAnalyzeSourceChange, terminalizeScheduledTaskGraphSourceChange } from "./scheduled-taskgraph-source-change-terminal";
 import { createAnalyzeSourceChangedErrorWithClaims } from "./stages/analyze-model-input";
 import { scheduledAnalyzeSourceChangedErrorForUntrustedState } from "./scheduled-taskgraph-source-change-task-cleanup";
 
@@ -279,5 +280,21 @@ describe("scheduled TaskGraph source-change terminalization", () => {
     expect(isScheduledTaskGraphSourceChangeTerminal({ ...base, owner: { ...owner, rootAttemptCount: 4 } })).toBe(false);
     expect(isScheduledTaskGraphSourceChangeTerminal({ ...base, owner: { ...owner, executionAttemptCount: 6 } })).toBe(false);
     expect(isScheduledTaskGraphSourceChangeTerminal({ ...base, error: "other_error" })).toBe(false);
+  });
+
+  it("builds the same stable-owner marker without retaining stale Analyze checkpoint data", () => {
+    const state = stateFor();
+    const terminal = buildScheduledTaskGraphSourceChangeTerminalState({ owner, expectedState: state, attestationSnapshotDigest: oldDigest });
+
+    expect(terminal).not.toBeNull();
+    expect(terminal?.scheduledTaskGraphSourceChangeTerminal).toEqual({
+      schemaVersion: "agent-harness.v2.scheduled-pipeline-source-change-terminal.v1",
+      owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+        rootAttemptCount: owner.rootAttemptCount, executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount },
+    });
+    for (const keyToClear of ["scoutedJobs", "scoredJobs", "scheduledTaskGraphAnalyzeJournal", "scheduledTaskGraphContinuation",
+      "scheduledTaskGraphClaim", "scheduledTaskGraphAnalyzeSourceFingerprints"]) expect(terminal).not.toHaveProperty(keyToClear);
+    expect(isScheduledTaskGraphSourceChangeTerminal({ owner, status: "failed", error: "scheduled_pipeline_source_changed", state: terminal })).toBe(true);
+    expect(buildScheduledTaskGraphSourceChangeTerminalState({ owner, expectedState: state, attestationSnapshotDigest: "invalid" })).toBeNull();
   });
 });

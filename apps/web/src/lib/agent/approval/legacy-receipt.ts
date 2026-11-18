@@ -5,7 +5,7 @@ import { hashAgentReceiptValue } from "@jobcopilot/shared"
 import { consumeApprovalAndReserve, issueApprovalReceipt, validatePendingApprovalReceipt } from "./store"
 import { assertGateReplayTaskBinding, recoverGateReviewReplay, type ScheduledGateReplayOwnerFence } from "./gate-replay"
 import { buildGateReplayExpectation, gateReviewReplayCoordinates } from "./gate-review-replay"
-import type { PreparedApprovalReceipt } from "./receipt-issue-owner"
+import type { PreparedApprovalReceipt, ScheduledReceiptSourceHooks } from "./receipt-issue-owner"
 import { reissueApprovalNonce } from "./receipt-rotation"
 import { decideApproval } from "../broker/store"
 import { waitItemId } from "../broker/item-ids"
@@ -72,6 +72,11 @@ export type LegacyApprovalResolution =
 export { ApprovalWaitActiveError }
 export async function issueLegacyReceipt(db: PrismaClient, input: LegacyReceiptInput): Promise<ApprovalReceiptResult> {
   const effectiveInput = { ...input, expiresAt: input.expiresAt ?? new Date(Date.now() + 15 * 60 * 1000) }
+  const sourceHooks = effectiveInput.scheduledOwnerFence?.sourceHooks
+  if (effectiveInput.replayMode === "scheduled-taskgraph-gate-review" && !sourceHooks) throw new AgentExecutionCancelledError()
+  const scheduledSourceHooks: ScheduledReceiptSourceHooks | undefined = effectiveInput.replayMode === "scheduled-taskgraph-gate-review" && sourceHooks
+    ? { acquireFence: sourceHooks.acquireFence, validateFinalSource: (tx, scope) => sourceHooks.validateSource(tx, scope.jobId) }
+    : undefined
   const initialScope = await legacyScope(effectiveInput)
   const replayCoordinates = effectiveInput.replayMode
     ? gateReviewReplayCoordinates(initialScope, effectiveInput.executionAttempt, effectiveInput.scheduledOwnerFence, effectiveInput.replayMode)
@@ -103,6 +108,7 @@ export async function issueLegacyReceipt(db: PrismaClient, input: LegacyReceiptI
     payload: effectiveInput.payload as never,
     projectWait: effectiveInput.projectWait,
     executionAttempt: effectiveInput.executionAttempt,
+    scheduledSourceHooks,
     signal: effectiveInput.signal,
     prepareInTransaction,
   })
@@ -114,6 +120,8 @@ export async function findScheduledGateReviewReceiptReplay(
   input: LegacyReceiptInput & { replayMode: "scheduled-taskgraph-gate-review" },
 ): Promise<ApprovalReceiptResult | null> {
   const effectiveInput = { ...input, expiresAt: input.expiresAt ?? new Date(Date.now() + 15 * 60 * 1000) }
+  const sourceHooks = effectiveInput.scheduledOwnerFence?.sourceHooks
+  if (!sourceHooks) throw new AgentExecutionCancelledError()
   const initialScope = await legacyScope(effectiveInput)
   const replayCoordinates = gateReviewReplayCoordinates(initialScope, effectiveInput.executionAttempt,
     effectiveInput.scheduledOwnerFence, "scheduled-taskgraph-gate-review")
@@ -122,7 +130,9 @@ export async function findScheduledGateReviewReceiptReplay(
   const expectation = await buildGateReplayExpectation(effectiveInput, scope, replayCoordinates)
 
   return db.$transaction(async tx => {
+    await sourceHooks.acquireFence(tx, scope.userId)
     await assertScheduledGateReplayOwnerReadOnly(tx, effectiveInput)
+    await sourceHooks.validateSource(tx, scope.jobId)
     const existing = await tx.agentApproval.findFirst({
       where: { id: replayCoordinates.approvalId, userId: scope.userId },
     })

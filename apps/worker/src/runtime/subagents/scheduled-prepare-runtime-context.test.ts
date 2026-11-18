@@ -21,21 +21,29 @@ describe("scheduled Prepare runtime context", () => {
     const prefix = scheduledPrepareAnalyzeSnapshot(graph(count))
     expect(prefix.nodes.map(node => node.templateId)).toEqual([...Array(count).fill("scout"), "analyst"])
   })
-  it("recomputes checkpoint identity from the existing owner and selected rows", () => {
+  it("recomputes checkpoint identity from the existing owner, selected rows, and source fingerprints", () => {
     const owner = { userId: "u", sessionId: "s", turnId: "t", rootTaskId: "r", rootAttemptCount: 1,
       turnLeaseOwnerId: "lease", turnLeaseVersion: 1, executionId: "e", executionAttemptCount: 1 }
     const receipt = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-continuation-receipt.v1", owner,
       continuationKey: `scheduled-taskgraph:sha256:${"a".repeat(64)}`, snapshotDigest: "b".repeat(64),
       evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64), analyzeGraphRevision: 2, prepareScheduleRevision: 3 } as ScheduledTaskGraphContinuationReceipt
     const marker = { owner, key: receipt.continuationKey, snapshotDigest: receipt.snapshotDigest, graphRevision: 2, evidenceDigest: receipt.evidenceDigest }
+    const sourceFingerprint = { version: "agent-harness.v2.analyze-source-input.v1", digest: "e".repeat(64) }
     const state = { nextStage: "prepare", scheduledTaskGraphContinuation: marker, analysisFailed: 0,
       scoutedJobs: [{ id: "j1", userId: "u" }], scoredJobs: [{ job: { id: "j1", userId: "u" }, score: 80,
-        matchedKeywords: [], missingKeywords: [], recommendation: "" }] }
+        matchedKeywords: [], missingKeywords: [], recommendation: "", analysisFenceAt: "2026-10-06T10:00:00.000Z" }],
+      scheduledTaskGraphAnalyzeSourceFingerprints: { j1: sourceFingerprint } }
     expect(scheduledPrepareCheckpointDigest(state, receipt, receipt.continuationKey, ["j1"])).toMatch(/^[a-f0-9]{64}$/)
     expect(scheduledPrepareCheckpointDigest(state, receipt, "other", ["j1"])).toBeNull()
     expect(scheduledPrepareCheckpointDigest({ ...state, scoutedJobs: [...state.scoutedJobs, { id: "j2", userId: "u" }], analysisFailed: 1 },
       receipt, receipt.continuationKey, ["j1"])).toBeNull()
     expect(scheduledPrepareCheckpointDigest({ ...state, scoredJobs: [{ ...state.scoredJobs[0]!, job: { id: "j2", userId: "u" } }] },
+      receipt, receipt.continuationKey, ["j1"])).toBeNull()
+    expect(scheduledPrepareCheckpointDigest({ ...state, scheduledTaskGraphAnalyzeSourceFingerprints: {} },
+      receipt, receipt.continuationKey, ["j1"])).toBeNull()
+    expect(scheduledPrepareCheckpointDigest({ ...state, scheduledTaskGraphAnalyzeSourceFingerprints: { j1: { ...sourceFingerprint, version: "legacy" } } },
+      receipt, receipt.continuationKey, ["j1"])).toBeNull()
+    expect(scheduledPrepareCheckpointDigest({ ...state, scoredJobs: [{ ...state.scoredJobs[0]!, analysisFenceAt: "2026-10-06" }] },
       receipt, receipt.continuationKey, ["j1"])).toBeNull()
   })
   it("keeps v1's Scout cohort and uses only selected Analyst IDs for v2", () => {

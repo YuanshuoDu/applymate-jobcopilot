@@ -8,7 +8,9 @@ vi.mock('../execution-control', () => ({ AgentExecutionCancelledError: class Age
   constructor() { super('Agent execution was cancelled'); this.name = 'AgentExecutionCancelledError' }
 } }))
 vi.mock('../application-control', () => ({ skipApplicationForGate: mocks.skipApplicationForGate }))
-vi.mock('./gate-review-receipt', () => ({ createGateReviewReceipt: mocks.createGateReviewReceipt, findGateReviewReceiptReplay: mocks.findGateReviewReceiptReplay }))
+vi.mock('./gate-review-receipt', () => ({ createGateReviewReceipt: mocks.createGateReviewReceipt, findGateReviewReceiptReplay: mocks.findGateReviewReceiptReplay,
+  skipGateApplication: (ctx: PipelineCtx, pkg: ApplicationPackage, checkpoint: string, _scheduled: boolean, owner: unknown) =>
+    mocks.skipApplicationForGate({ userId: ctx.userId, jobId: pkg.job.id, sessionId: ctx.sessionId, checkpoint, owner }) }))
 vi.mock('./prepare', () => ({ tailoringConstraints: vi.fn(() => ({})) }))
 
 import { runGate, runScheduledGate } from './gate'

@@ -139,8 +139,11 @@ function setup() {
     nextStage: 'prepare', scoutedJobs: [{ ...jobRow, coverLetter: null }], analysisFailed: 0,
     scoredJobs: [{ job: { ...jobRow, coverLetter: null }, score: 87, matchedKeywords: ['TypeScript'], missingKeywords: ['Kubernetes'],
       recommendation: 'Tailor the resume.', analysisFenceAt: '2026-10-19T12:00:00.123Z' }],
+    scheduledTaskGraphAnalyzeSourceFingerprints: { [jobRow.id]: { version: 'agent-harness.v2.analyze-source-input.v1', digest: 'e'.repeat(64) } },
     scheduledTaskGraphContinuation: { schemaVersion: 'agent-harness.v2.scheduled-pipeline-continuation.v1', key: `scheduled-taskgraph:sha256:${'f'.repeat(64)}`,
       owner, snapshotDigest: scheduledAutomationSnapshotDigest(snapshot), graphRevision: 9, evidenceDigest: 'd'.repeat(64) },
+    scheduledTaskGraphClaim: { schemaVersion: 'agent-harness.v2.scheduled-pipeline-claim.v1', key: `scheduled-taskgraph:sha256:${'f'.repeat(64)}`,
+      claimToken: 'claim-token', owner, claimedAt: '2026-10-19T12:00:00.000Z', leaseExpiresAt: '2099-10-19T12:10:00.000Z' },
   }
   const resumeArtifact = artifactRows('resume'), letterArtifact = artifactRows('cover_letter')
   const result = { schemaVersion: 'agent-harness.v2.subagent.result', role: 'prepare', status: 'completed', taskId: 'prepare-task', attemptCount: 1,
@@ -621,7 +624,8 @@ describe('scheduled TaskGraph Gate input reload', () => {
 
   it('accepts a verified zero-eligible result without loading materials', async () => {
     const { input, result, analyzeAttestation } = setup()
-    const emptyCheckpoint = { ...(input.analyzeCheckpoint as Record<string, unknown>), scoutedJobs: [], scoredJobs: [], analysisFailed: 0 }
+    const emptyCheckpoint = { ...(input.analyzeCheckpoint as Record<string, unknown>), scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
+      scheduledTaskGraphAnalyzeSourceFingerprints: {} }
     const emptyResult = { ...result, jobs: [], materials: [], checkpointDigest: scheduledTaskGraphAnalyzeCheckpointDigest(emptyCheckpoint)! }
     const proof = makeProof(emptyResult, analyzeAttestation.evidenceDigest)
     mocks.tasks.mockResolvedValue(taskRows(proof, analyzeAttestation))
