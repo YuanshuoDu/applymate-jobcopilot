@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 import { describe, expect, it } from "vitest"
 
-import { projectPlanLedger, type PlanLedger } from "./plan-ledger.js"
+import { PLAN_LEDGER_MAX_PERSISTED_NODES, projectPlanLedger, type PlanLedger } from "./plan-ledger.js"
 import {
   parseTaskGraphVerificationSummary,
   projectTaskGraphVerificationSummary,
@@ -75,8 +75,8 @@ function publicReport(value: ReturnType<typeof report>) {
     evidenceDigest: value.evidenceDigest, resultDigest: value.resultDigest }
 }
 function passedResult(criteria: readonly { id: string }[], extra: Record<string, unknown> = {}) { return result(report(criteria), extra) }
-function scoutResult() {
-  const candidates = Array.from({ length: 4 }, (_, index) => ({ jobId: `job-${index + 1}`, source: "greenhouse",
+function scoutResult(candidateCount = 4) {
+  const candidates = Array.from({ length: candidateCount }, (_, index) => ({ jobId: `job-${index + 1}`, source: "greenhouse",
     url: `https://jobs.example/${index + 1}`, evidenceIds: [`evidence-${index + 1}`] }))
   return { schemaVersion: "agent-harness.v2.subagent.result", role: "scout", status: "completed", summary: "Scout result",
     candidates, evidence: candidates.map(candidate => ({ id: candidate.evidenceIds[0], kind: "job", ref: candidate.jobId, source: candidate.source })) }
@@ -105,6 +105,37 @@ describe("TaskGraph verification display projection", () => {
       "criteria_met", "dependencyBindings", "dependencyNodeKey", "Private goal"]) expect(serialized).not.toContain(privateValue)
     expect(value?.nodes[1] && "checks" in value.nodes[1] ? value.nodes[1].checks.at(-1) : null).toEqual({
       kind: "findings_cover_scout_candidates_gte", minimumPercent: 75, status: "passed" })
+  })
+
+  it("projects aligned verification through the persisted graph capacity and rejects an extra node", () => {
+    const nodes = Array.from({ length: PLAN_LEDGER_MAX_PERSISTED_NODES }, (_, index) => {
+      const criteria = [{ id: `candidate-count-${index + 1}`, check: { kind: "candidate_count_gte", minimum: index + 1 } }]
+      return typedNode(`scout-${index + 1}`, `task-${index + 1}`, "scout", criteria)
+    })
+    const rows = [row(rootTaskId, "orchestrator", "running"), ...nodes.map((node, index) =>
+      row(node.taskId, "scout", "completed", passedResult(node.verification.criteria, { structuredResult: scoutResult(index + 1) })))]
+    const projected = summary(nodes, rows)
+    if (!projected) throw new Error("capacity_projection_unavailable")
+
+    expect(projected.nodes).toHaveLength(PLAN_LEDGER_MAX_PERSISTED_NODES)
+    const projectedMinimums = projected.nodes.map(node => {
+      if (!node || !("checks" in node)) return null
+      const check = node.checks[0]
+      return check?.kind === "candidate_count_gte" ? check.minimum : null
+    })
+    expect(projectedMinimums)
+      .toEqual(Array.from({ length: PLAN_LEDGER_MAX_PERSISTED_NODES }, (_, index) => index + 1))
+    expect(parseTaskGraphVerificationSummary(projected, PLAN_LEDGER_MAX_PERSISTED_NODES)).toEqual(projected)
+    const extraSidecar = { ...projected, nodes: [...projected.nodes, { status: "unavailable" } as const] }
+    expect(parseTaskGraphVerificationSummary(extraSidecar, PLAN_LEDGER_MAX_PERSISTED_NODES + 1)).toBeNull()
+
+    const nineChecks = Array.from({ length: 9 }, () => ({ kind: "candidate_count_gte", minimum: 1, status: "passed" }))
+    expect(parseTaskGraphVerificationSummary({ schemaVersion: 1, nodes: [{ status: "passed", checks: nineChecks,
+      totalCount: 9, passedCount: 9, failedCount: 0, unverifiedCount: 0 }] }, 1)).toBeNull()
+
+    const extraNode = typedNode("overflow", "task-overflow", "scout", scoutCriteria.slice(0, 1))
+    const scope = { sessionId, turnId, rootTaskId, revision: 3, graph: graph([...nodes, extraNode]), tasks: rows }
+    expect(projectTaskGraphVerificationSummary(scope, projection(nodes, rows))).toBeNull()
   })
 
   it("keeps declared coverage failure visible beside a current receipt-backed repair", () => {
