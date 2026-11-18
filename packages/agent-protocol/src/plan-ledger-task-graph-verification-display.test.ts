@@ -118,7 +118,12 @@ describe("TaskGraph verification display projection", () => {
     if (!projected) throw new Error("capacity_projection_unavailable")
 
     expect(projected.nodes).toHaveLength(PLAN_LEDGER_MAX_PERSISTED_NODES)
-    expect(projected.nodes.map(node => node && "checks" in node ? node.checks[0]?.minimum : null))
+    const projectedMinimums = projected.nodes.map(node => {
+      if (!node || !("checks" in node)) return null
+      const check = node.checks[0]
+      return check?.kind === "candidate_count_gte" ? check.minimum : null
+    })
+    expect(projectedMinimums)
       .toEqual(Array.from({ length: PLAN_LEDGER_MAX_PERSISTED_NODES }, (_, index) => index + 1))
     expect(parseTaskGraphVerificationSummary(projected, PLAN_LEDGER_MAX_PERSISTED_NODES)).toEqual(projected)
     const extraSidecar = { ...projected, nodes: [...projected.nodes, { status: "unavailable" } as const] }
