@@ -1,4 +1,4 @@
-import { parsePlanLedger, parseTaskGraphSnapshot, type PlanLedger } from "./plan-ledger.js"
+import { parsePlanLedger, parseTaskGraphSnapshot, PLAN_LEDGER_MAX_PERSISTED_NODES, type PlanLedger } from "./plan-ledger.js"
 import { parsePersistedTaskGraphNode } from "./plan-ledger-task-graph-metadata.js"
 import { hasCurrentTaskGraphVerificationLineage } from "./plan-ledger-task-graph-verification-lineage.js"
 
@@ -44,7 +44,7 @@ export function projectTaskGraphVerificationSummary(input: Scope, projection: Pl
     const plan = parsePlanLedger(projection)
     const graph = record(parseJsonValue(input.graph))
     if (!plan || plan.sessionId !== input.sessionId || plan.revision !== input.revision || !graph || !exact(graph, "nodes,schemaVersion")
-      || graph.schemaVersion !== "agent-harness.v2.task-graph" || !dense(graph.nodes, 1, 8)) return null
+      || graph.schemaVersion !== "agent-harness.v2.task-graph" || !dense(graph.nodes, 1, PLAN_LEDGER_MAX_PERSISTED_NODES)) return null
     const snapshot = parseTaskGraphSnapshot(graph)
     if (!snapshot || snapshot.nodes.length !== plan.nodes.length || snapshot.nodes.some((node, index) => node.key !== plan.nodes[index]?.key)) return null
     const rawNodes = graph.nodes.map(record)
@@ -69,7 +69,7 @@ export function parseTaskGraphVerificationSummary(value: unknown, expectedNodeCo
     const summary = record(value)
     if (!summary || !exact(summary, "nodes,schemaVersion")
       || summary.schemaVersion !== TASK_GRAPH_VERIFICATION_DISPLAY_VERSION && summary.schemaVersion !== TASK_GRAPH_VERIFICATION_DISPLAY_V2_VERSION
-      || !Number.isSafeInteger(expectedNodeCount) || expectedNodeCount < 1 || expectedNodeCount > 8
+      || !Number.isSafeInteger(expectedNodeCount) || expectedNodeCount < 1 || expectedNodeCount > PLAN_LEDGER_MAX_PERSISTED_NODES
       || !dense(summary.nodes, expectedNodeCount, expectedNodeCount)) return null
     const displayVersion = summary.schemaVersion as DisplayVersion
     const nodes: TaskGraphVerificationDisplayNode[] = []
@@ -203,7 +203,7 @@ function withDisplayReason<T extends TaskGraphVerificationDisplayCheck>(check: T
 }
 
 function taskRows(values: readonly unknown[], scope: Scope, taskIds: readonly string[]): Map<string, RawNode> | null {
-  if (!Array.isArray(values) || !dense(values, 0, 9)) return null
+  if (!Array.isArray(values) || !dense(values, 0, PLAN_LEDGER_MAX_PERSISTED_NODES + 1)) return null
   const rows = new Map<string, RawNode>(), allowed = new Set([scope.rootTaskId, ...taskIds])
   for (const value of values) {
     const row = record(value)

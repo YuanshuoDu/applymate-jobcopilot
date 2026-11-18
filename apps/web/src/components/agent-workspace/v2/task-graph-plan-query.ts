@@ -1,10 +1,11 @@
+import { PLAN_LEDGER_MAX_PERSISTED_NODES } from '@jobcopilot/agent-protocol'
 import type { TimelineItem } from './timeline-reducer'
 import { parseTaskGraphSnapshot, TASK_GRAPH_MAX_IDENTIFIER_LENGTH } from './task-graph-plan-snapshot'
 import { SELECTED_JOB_PREPARATION_MESSAGE_TEXT } from './selected-job-preparation-action'
 import type { SupervisorTaskSummary, SupervisorTurnSummary } from './task-tree-projection'
 import type { TaskTreeNode } from './types'
 
-const MAX_REFERENCED_TASK_IDS = 9
+const MAX_REFERENCED_TASK_IDS = PLAN_LEDGER_MAX_PERSISTED_NODES + 1
 
 export interface TaskGraphIdentity {
   readonly sessionId: string
