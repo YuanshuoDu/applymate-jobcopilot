@@ -16,6 +16,7 @@ import type { SubagentLease } from "./types.js"
 const DATABASE_NAME = "applymate_nested_delegation_ci"
 const PROCESS_FIXTURE = fileURLToPath(new URL("./nested-scout-delegation-worker.fixture.mjs", import.meta.url))
 const MAIN_PROGRESS_QUERY_TIMEOUT_MS = 2_000
+const CRASH_TEST_LEASE_EXPIRY_TIMEOUT_MS = 40_000 // 30s fixture lease plus a bounded 10s margin.
 
 type FixtureIds = Readonly<{ userId: string; sessionId: string; turnId: string; alphaJobId: string; betaJobId: string; foreignJobId: string }>
 type FixtureTaskAlias = "parent_scout" | "depth_two_scout_alpha" | "depth_two_scout_beta" | "other_scout"
@@ -1212,7 +1213,7 @@ async function waitForExpiredCrashLease(ids: FixtureIds, parentTaskId: string, c
         child."leaseExpiresAt" <= clock_timestamp() AS "expired", parent."status" AS "parentStatus",
         EXISTS (SELECT 1 FROM "agent_wait_conditions" AS wait WHERE wait."parentTaskId" = parent."id"
           AND wait."sessionId" = child."sessionId" AND wait."turnId" = child."turnId"
-          AND wait."status" IN ('waiting', 'timed_out') AND wait."suspendedAt" IS NOT NULL) AS "suspendedWaitPresent"
+          AND wait."status" = 'timed_out' AND wait."suspendedAt" IS NOT NULL) AS "suspendedWaitPresent"
       FROM "sub_agent_tasks" AS child JOIN "sub_agent_tasks" AS parent ON parent."id" = child."parentTaskId"
         AND parent."sessionId" = child."sessionId" AND parent."turnId" = child."turnId"
       WHERE child."id" = $1 AND child."sessionId" = $2 AND parent."id" = $3 AND child."depth" = 2
@@ -1220,7 +1221,7 @@ async function waitForExpiredCrashLease(ids: FixtureIds, parentTaskId: string, c
     const row = result.rows[0]
     if (row?.status === "running" && row.leaseOwner === ownerId && row.attemptCount === 1
       && row.expired && ["waiting", "queued"].includes(row.parentStatus) && row.suspendedWaitPresent) return
-    await new Promise(resolve => setTimeout(resolve, 50))
+    await new Promise(resolve => setTimeout(resolve, 250))
   }
   throw new Error("Nested Scout child lease did not expire while its durable wait remained suspended")
 }
@@ -1553,10 +1554,25 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       expect(modelStartsBeforeCrash.rows[0]?.count).toBe(0)
       await waitForTimedOutParentWait(ids, parent.rows[0]!.id, initialWaitId, 60_000)
       await emitNestedScoutRecoveryDiagnostic(ids, "planned_wait_timeout_observed", [parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!])
+      const crashCut = await progressQuery<{ status: string; leaseOwner: string | null; attemptCount: number; leaseLive: boolean; modelStarts: number }>(
+        `SELECT child."status", child."leaseOwner", child."attemptCount", child."leaseExpiresAt" > clock_timestamp() AS "leaseLive",
+          (SELECT count(*)::int FROM "agent_events" event WHERE event."sessionId" = child."sessionId"
+            AND event."turnId" = child."turnId" AND event."taskId" = child."id" AND event."type" = 'model.started') AS "modelStarts"
+        FROM "sub_agent_tasks" child WHERE child."id" = $1 AND child."sessionId" = $2 AND child."parentTaskId" = $3
+          AND child."depth" = 2 AND child."role" = 'scout' AND child."taskType" = 'job_discovery'`,
+        [crashedChild.id, ids.sessionId, parent.rows[0]!.id])
+      expect(crashCut.rows).toHaveLength(1)
+      const crashCutRow = crashCut.rows[0]
+      const ownerMatches = crashCutRow?.leaseOwner === crashedChild.leaseOwner
+      expect(ownerMatches).toBe(true)
+      expect(crashCutRow?.status).toBe("running")
+      expect(crashCutRow?.attemptCount).toBe(1)
+      expect(crashCutRow?.leaseLive).toBe(true)
+      expect(crashCutRow?.modelStarts).toBe(0)
       await killAndWait(crashing.child)
       crashing = undefined
       await emitNestedScoutRecoveryDiagnostic(ids, "crash_worker_stopped", [parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!])
-      await waitForExpiredCrashLease(ids, parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!, 30_000)
+      await waitForExpiredCrashLease(ids, parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!, CRASH_TEST_LEASE_EXPIRY_TIMEOUT_MS)
       await emitNestedScoutRecoveryDiagnostic(ids, "child_lease_expired", [parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!])
       restarted = launch("resume", ids)
       await waitForMainMarker(ids, restarted, "P1143_RECOVERY_DEPTH2_QUEUED", 30_000)

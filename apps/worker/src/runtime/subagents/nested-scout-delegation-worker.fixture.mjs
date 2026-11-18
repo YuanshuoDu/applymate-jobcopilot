@@ -15,7 +15,7 @@ import { createCrashFixtureExecutor, createNestedScoutFixtureScripts } from "./n
 import { installWaitResolverDiagnostics } from "./nested-scout-wait-resolver-logging.mjs"
 const [, , mode, rawIds] = process.argv, ids = JSON.parse(rawIds)
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 10 })
-const CRASH_TEST_LEASE_MS = 3_000, CRASH_TEST_HEARTBEAT_MS = 500
+const CRASH_TEST_LEASE_MS = 30_000, CRASH_TEST_HEARTBEAT_MS = 10_000
 const SAFE_RECOVERY_ERROR_CODES = new Set([
   "subagent_dispatch_delivery_uncertain", "lost", "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01",
   "ECONNRESET", "ETIMEDOUT", "wait_invalid", "wait_scope_error", "wait_conflict",
