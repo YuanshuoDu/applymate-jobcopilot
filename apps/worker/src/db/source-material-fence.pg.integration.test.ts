@@ -9,6 +9,7 @@ import { buildAgentSourceMaterialFenceKey } from "@jobcopilot/shared"
 import { acquireSourceMaterialFence as acquireWebSourceMaterialFence } from "@/lib/agent/source-material-fence"
 // @ts-expect-error The Worker TypeScript project does not compile Web path aliases.
 import { withApplicationAuditLock as withWebApplicationAuditLock } from "@/lib/application-audit-transaction"
+// @ts-expect-error The Worker TypeScript project does not compile Web path aliases.
 import { deleteAccountWithSourceFence, type AccountDeleteClient } from "@/lib/agent/account-delete-source-write"
 import { acquireSourceMaterialFence as acquireWorkerSourceMaterialFence } from "./source-material-fence.js"
 import { updateJobForSubmission } from "./submission-guard.js"
