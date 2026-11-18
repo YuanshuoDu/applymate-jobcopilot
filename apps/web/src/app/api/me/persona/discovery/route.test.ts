@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const mocks = vi.hoisted(() => ({ requireAuth: vi.fn(), list: vi.fn(), set: vi.fn() }))
+const mocks = vi.hoisted(() => ({ requireAuth: vi.fn(), list: vi.fn(), set: vi.fn(), estimate: vi.fn() }))
 vi.mock('@/lib/api-helpers', () => ({
   requireAuth: mocks.requireAuth,
   isErrorResponse: (value: unknown) => value instanceof Response,
@@ -11,6 +11,7 @@ vi.mock('@/lib/persona-facts', () => ({
   listDiscoveryPersonaFacts: mocks.list,
   setDiscoveryPersonaFactConsent: mocks.set,
 }))
+vi.mock('@/lib/persona-discovery-capacity', () => ({ estimatePersonaDiscoveryCapacity: mocks.estimate }))
 
 const consent = {
   factId: 'fact-1', key: 'notice_period', expectedValue: 'One month',
@@ -23,17 +24,23 @@ describe('/api/me/persona/discovery', () => {
     mocks.requireAuth.mockReset().mockResolvedValue({ userId: 'owner-1' })
     mocks.list.mockReset().mockResolvedValue([])
     mocks.set.mockReset().mockResolvedValue({ kind: 'updated', fact: { id: 'fact-1', allowedUses: ['discovery'] } })
+    mocks.estimate.mockReset().mockReturnValue({
+      status: 'available', factCount: 1, factLimit: 32, canonicalUtf8Bytes: 128, byteLimit: 8192,
+    })
   })
 
-  it('returns only the dedicated consent projection with private cache headers', async () => {
+  it('preserves the dedicated consent projection and adds a bounded estimate with private cache headers', async () => {
     const facts = [{ id: 'fact-1', key: 'notice_period', allowedUses: [] }]
     mocks.list.mockResolvedValue(facts)
     const { GET } = await import('./route')
     const response = await GET(new Request('http://localhost/api/me/persona/discovery') as never)
 
     expect(response.status).toBe(200)
-    await expect(response.json()).resolves.toEqual({ facts })
+    await expect(response.json()).resolves.toEqual({
+      facts, capacity: { status: 'available', factCount: 1, factLimit: 32, canonicalUtf8Bytes: 128, byteLimit: 8192 },
+    })
     expect(mocks.list).toHaveBeenCalledWith('owner-1')
+    expect(mocks.estimate).toHaveBeenCalledWith(facts)
     expect(response.headers.get('Cache-Control')).toBe('private, no-store')
   })
 
