@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
+import { createRequire } from "node:module"
 import { fileURLToPath } from "node:url"
 import { isDeepStrictEqual } from "node:util"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
@@ -8,6 +9,9 @@ import { projectWaitCallCompletionPayload } from "../turns/turn-execution-wait-e
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import { taskGraphItemId, taskGraphLifecycleKey, taskGraphWaitLifecycleKey } from "./task-graph-snapshot.js"
 import { loadChildAttemptResume } from "./child-resume.js"
+import { reconcileDurableSubagentWaits } from "./durable-subagent-wait-resolver.js"
+import { PgSubagentTaskStore } from "./pg-store.js"
+import { startTaskGraphStopOutboxConsumer, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
 // @ts-expect-error The fixture-only JavaScript module has no declaration; Worker Vitest resolves this import at runtime.
 import { isSafeParentCurrentReadsDiagnostic, isSafeParentResumeDiagnostic, parentResumeFixtureErrorClass } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 import { waitResolverErrorCodesFromOutput } from "./nested-scout-wait-resolver-diagnostic.js"
@@ -19,6 +23,11 @@ const MAIN_PROGRESS_QUERY_TIMEOUT_MS = 2_000
 
 type FixtureIds = Readonly<{ userId: string; sessionId: string; turnId: string; alphaJobId: string; betaJobId: string; foreignJobId: string }>
 type FixtureProcess = { child: ChildProcess; waitForLine(marker: string, timeoutMs: number): Promise<void>; output: string[] }
+type CommandPrismaClient = { $disconnect(): Promise<void> }
+type UserStopCommandService = Readonly<{ interrupt(command: {
+  sessionId: string; userId: string; clientMessageId: string; source: "user"; expectedTurnId: string; expectedRevision: number
+}): Promise<{ disposition: string; turnId: string }> }>
+const webRequire = createRequire(new URL("../../../../web/package.json", import.meta.url))
 const MAIN_PROGRESS_MARKERS = new Set([
   "P1143_ROOT_MODEL_STREAM_STARTED", "P1143_ROOT_MODEL_RUNTIME_FACTORY_ENTERED", "P1143_ROOT_MODEL_RUNTIME_FACTORY_CREATED",
   "P1143_ROOT_USAGE_AUTHORIZER_CALLED", "P1143_ROOT_PLAN_REQUESTED", "P1143_PARENT_ADAPTER_STARTED",
@@ -65,6 +74,22 @@ const SAFE_DIAGNOSTIC_ERROR_CODES = [
   "writer_dependency_unavailable", "selected_job_sources_unavailable", "selected_job_output_contract_unavailable",
   "subagent_role_unknown",
 ] as const
+
+async function createDisposableWebStopService(): Promise<{ prisma: CommandPrismaClient; commands: UserStopCommandService }> {
+  const loaded: unknown = webRequire("@prisma/client")
+  const prismaConstructor = loaded && typeof loaded === "object" ? (loaded as { PrismaClient?: unknown }).PrismaClient : undefined
+  if (typeof prismaConstructor !== "function") throw new Error("Web Prisma client constructor is unavailable")
+  const prisma = new (prismaConstructor as new (options: { datasourceUrl: string }) => unknown)({ datasourceUrl: databaseUrl! }) as CommandPrismaClient
+  const commandsModule = "@/lib/agent/control-plane/commands/agent-command-service"
+  const imported: unknown = await import(commandsModule)
+  const serviceConstructor = imported && typeof imported === "object" ? (imported as { AgentCommandService?: unknown }).AgentCommandService : undefined
+  if (typeof serviceConstructor !== "function") {
+    await prisma.$disconnect()
+    throw new Error("Production User Stop command service is unavailable")
+  }
+  const commands = new (serviceConstructor as new (db: CommandPrismaClient) => UserStopCommandService)(prisma)
+  return { prisma, commands }
+}
 const SAFE_WAIT_RESUME_CODES = ["wait_invalid", "wait_scope_error", "wait_conflict", "other"] as const
 const SAFE_RECOVERY_STAGES = ["manager_recover", "dispatch"] as const
 const SAFE_RECOVERY_ERROR_CODES = [
@@ -1113,6 +1138,49 @@ async function seed(ids: FixtureIds): Promise<void> {
   }
 }
 
+async function persistUserTurnStop(ids: FixtureIds, rootTaskId: string, commands: UserStopCommandService): Promise<void> {
+  const turn = await pool.query<{ revision: number; rootTaskId: string }>(`SELECT "revision", "rootTaskId" FROM "agent_turns"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "status" = 'in_progress'`,
+  [ids.turnId, ids.sessionId, ids.userId])
+  if (turn.rowCount !== 1 || turn.rows[0]?.rootTaskId !== rootTaskId) {
+    throw new Error("User Stop fixture could not read the exact active Turn revision")
+  }
+  const result = await commands.interrupt({
+    sessionId: ids.sessionId, userId: ids.userId, clientMessageId: `nested-stop-${ids.turnId}`,
+    source: "user", expectedTurnId: ids.turnId, expectedRevision: Number(turn.rows[0].revision),
+  })
+  if (result.disposition !== "interrupted" || result.turnId !== ids.turnId) {
+    throw new Error("Production User Stop command did not interrupt the expected Turn")
+  }
+}
+
+async function waitForUserStopConvergence(ids: FixtureIds, rootTaskId: string, parentTaskId: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const state = await pool.query<{ turnStatus: string; parentStatus: string; activeDescendants: number; published: boolean; interruptedReceipts: number }>(
+      `SELECT turn."status" AS "turnStatus", parent."status" AS "parentStatus",
+        (SELECT count(*)::int FROM "sub_agent_tasks" AS descendant WHERE descendant."sessionId" = turn."sessionId"
+          AND descendant."turnId" = turn."id" AND descendant."depth" > 0
+          AND descendant."status" IN ('queued', 'running', 'retrying', 'waiting', 'waiting_for_user')) AS "activeDescendants",
+        EXISTS (SELECT 1 FROM "agent_outbox" AS stop WHERE stop."topic" = $5 AND stop."aggregateId" = turn."sessionId"
+          AND stop."idempotencyKey" = $6 AND stop."publishedAt" IS NOT NULL) AS "published",
+        (SELECT count(*)::int FROM "agent_events" AS event WHERE event."sessionId" = turn."sessionId"
+          AND event."turnId" = turn."id" AND event."itemId" = $7 AND event."taskId" = parent."id"
+          AND event."type" IN ('item.delta', 'task_graph.lifecycle') AND event."payload"->'event'->>'type' = 'task.interrupted') AS "interruptedReceipts"
+      FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS parent ON parent."turnId" = turn."id"
+        AND parent."sessionId" = turn."sessionId" AND parent."rootTaskId" = $4
+      WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+        AND parent."id" = $8 AND parent."depth" = 1`,
+      [ids.turnId, ids.sessionId, ids.userId, rootTaskId, TASK_GRAPH_STOP_OUTBOX_TOPIC,
+        `agent-task-graph-stop:${ids.sessionId}:${ids.turnId}`, taskGraphItemId(rootTaskId), parentTaskId])
+    const row = state.rows[0]
+    if (row?.turnStatus === "interrupted" && row.parentStatus === "interrupted" && row.activeDescendants === 0
+      && row.published && row.interruptedReceipts === 1) return
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  throw new Error("User Stop did not interrupt the nested Scout tree and project its TaskGraph receipt")
+}
+
 async function seedResumeLockRows(ids: FixtureIds, rootId: string, childId: string, ownerId: string): Promise<void> {
   await seed(ids)
   await pool.query(`UPDATE "agent_turns" SET "status" = 'in_progress' WHERE "id" = $1 AND "sessionId" = $2`, [ids.turnId, ids.sessionId])
@@ -1453,4 +1521,105 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId])
     }
   }, 360_000)
+
+  it("persists user Stop through a waiting nested Scout tree without leaving active descendants", async () => {
+    const suffix = randomUUID()
+    const ids: FixtureIds = {
+      userId: `nested-stop-user-${suffix}`, sessionId: `nested-stop-session-${suffix}`,
+      turnId: `nested-stop-turn-${suffix}`, alphaJobId: randomUUID(), betaJobId: randomUUID(), foreignJobId: randomUUID(),
+    }
+    let first: FixtureProcess | undefined, childWorker: FixtureProcess | undefined
+    let stopConsumer: ReturnType<typeof startTaskGraphStopOutboxConsumer> | undefined
+    let prisma: CommandPrismaClient | undefined
+    try {
+      const productionStop = await createDisposableWebStopService()
+      prisma = productionStop.prisma
+      await seed(ids)
+      first = launch("park", ids)
+      await waitForMainMarker(ids, first, "P1143_PARENT_WAITING", 45_000)
+
+      const parent = await pool.query<{ id: string; rootTaskId: string; status: string; attemptCount: number }>(
+        `SELECT "id", "rootTaskId", "status", "attemptCount" FROM "sub_agent_tasks"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = "rootTaskId" AND "depth" = 1 AND "role" = 'scout'`,
+        [ids.sessionId, ids.turnId])
+      expect(parent.rows).toHaveLength(1)
+      expect(parent.rows[0]).toMatchObject({ status: "waiting" })
+      const parentTaskId = parent.rows[0]!.id
+      const rootTaskId = parent.rows[0]!.rootTaskId
+
+      const initialChildren = await pool.query<{ id: string; status: string }>(`SELECT "id", "status" FROM "sub_agent_tasks"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3 AND "depth" = 2 AND "role" = 'scout'
+          AND "taskType" = 'job_discovery' ORDER BY "id"`, [ids.sessionId, ids.turnId, parentTaskId])
+      expect(initialChildren.rows).toHaveLength(2)
+      expect(initialChildren.rows.every(row => row.status === "queued")).toBe(true)
+      const waiting = await pool.query<{ id: string; status: string; suspendedAt: Date | null; targetTaskIds: unknown }>(
+        `SELECT "id", "status", "suspendedAt", "targetTaskIds" FROM "agent_wait_conditions"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3`, [ids.sessionId, ids.turnId, parentTaskId])
+      expect(waiting.rows).toHaveLength(1)
+      expect(waiting.rows[0]).toMatchObject({ status: "waiting" })
+      expect(waiting.rows[0]?.suspendedAt).toBeInstanceOf(Date)
+      const waitTargets = Array.isArray(waiting.rows[0]?.targetTaskIds) ? waiting.rows[0]!.targetTaskIds as string[] : []
+      expect([...waitTargets].sort()).toEqual(initialChildren.rows.map(row => row.id).sort())
+
+      childWorker = launch("crash-child", ids)
+      await waitForMainMarker(ids, childWorker, "P1143_CRASH_CHILD_BEFORE_MODEL_CALL", 30_000)
+      await waitForMainMarker(ids, childWorker, "P1143_CHILD_WORKER_CLAIMED_RUNNING", 30_000)
+      const childrenBeforeStop = await pool.query<{ id: string; status: string; leaseOwner: string | null; attemptCount: number }>(
+        `SELECT "id", "status", "leaseOwner", "attemptCount" FROM "sub_agent_tasks"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3 AND "depth" = 2 ORDER BY "id"`,
+        [ids.sessionId, ids.turnId, parentTaskId])
+      expect(childrenBeforeStop.rows).toHaveLength(2)
+      const activeChild = childrenBeforeStop.rows.find(row => row.status === "running")
+      expect(activeChild?.leaseOwner).toEqual(expect.any(String))
+      expect(childrenBeforeStop.rows.filter(row => row.status === "queued")).toHaveLength(1)
+
+      stopConsumer = startTaskGraphStopOutboxConsumer(pool, { pollMs: 250 })
+      await persistUserTurnStop(ids, rootTaskId, productionStop.commands)
+      await waitForUserStopConvergence(ids, rootTaskId, parentTaskId, 30_000)
+
+      const tree = await pool.query<{ id: string; status: string; interruptRequestedAt: Date | null; attemptCount: number }>(
+        `SELECT "id", "status", "interruptRequestedAt", "attemptCount" FROM "sub_agent_tasks"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND "depth" > 0 ORDER BY "depth", "id"`, [ids.sessionId, ids.turnId])
+      expect(tree.rows).toHaveLength(3)
+      expect(tree.rows.every(row => row.status === "interrupted" && row.interruptRequestedAt instanceof Date)).toBe(true)
+
+      const noResume = await reconcileDurableSubagentWaits(pool, { ownerId: `stop-resolver-${suffix}` })
+      expect(noResume.woken).toBe(0)
+      const waitAfterStop = await pool.query<{ status: string; consumedAt: Date | null }>(
+        `SELECT "status", "consumedAt" FROM "agent_wait_conditions" WHERE "id" = $1 AND "parentTaskId" = $2
+          AND "sessionId" = $3 AND "turnId" = $4`, [waiting.rows[0]!.id, parentTaskId, ids.sessionId, ids.turnId])
+      expect(waitAfterStop.rows).toEqual([{ status: "waiting", consumedAt: null }])
+
+      const store = new PgSubagentTaskStore(pool)
+      for (const task of [parent.rows[0]!, ...tree.rows.filter(row => row.id !== parentTaskId)]) {
+        await expect(store.finish({ taskId: task.id, sessionId: ids.sessionId,
+          ownerId: task.id === activeChild?.id ? activeChild.leaseOwner! : `late-finish-${task.id}`,
+          attemptCount: task.attemptCount, status: "completed", result: { status: "completed" }, now: new Date(),
+        })).resolves.toBeNull()
+      }
+
+      const receipts = await pool.query<{ count: number }>(`SELECT count(*)::int AS "count" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "taskId" = $4
+          AND "type" IN ('item.delta', 'task_graph.lifecycle') AND "payload"->'event'->>'type' = 'task.interrupted'`,
+      [ids.sessionId, ids.turnId, taskGraphItemId(rootTaskId), parentTaskId])
+      const parentCompleted = await pool.query<{ count: number }>(`SELECT count(*)::int AS "count" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "taskId" = $4
+          AND "type" IN ('item.delta', 'task_graph.lifecycle') AND "payload"->'event'->>'type' = 'task.completed'`,
+      [ids.sessionId, ids.turnId, taskGraphItemId(rootTaskId), parentTaskId])
+      const finalItems = await pool.query<{ count: number }>(`SELECT count(*)::int AS "count" FROM "agent_items"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'agent_message' AND "phase" = 'final_answer'`, [ids.sessionId, ids.turnId])
+      const completedTurns = await pool.query<{ count: number }>(`SELECT count(*)::int AS "count" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.completed'`, [ids.sessionId, ids.turnId])
+      expect(receipts.rows[0]?.count).toBe(1)
+      expect(parentCompleted.rows[0]?.count).toBe(0)
+      expect(finalItems.rows[0]?.count).toBe(0)
+      expect(completedTurns.rows[0]?.count).toBe(0)
+    } finally {
+      await stopConsumer?.close()
+      if (first) await stop(first.child)
+      if (childWorker) await stop(childWorker.child)
+      await prisma?.$disconnect()
+      await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId])
+    }
+  }, 150_000)
 })
