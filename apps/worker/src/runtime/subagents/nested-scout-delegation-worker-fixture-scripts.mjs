@@ -63,6 +63,68 @@ function hasTerminalWaitOutcome(waitOutput, expectedTaskIds) {
   return sameIds(taskIds) && tasks.length === expectedTaskIds.length
     && sameIds(tasks.map(task => task?.taskId)) && tasks.every(task => terminal.has(task?.status))
 }
+function boundedWaitCount(value) { return value === 0 ? "zero" : value === 1 ? "one" : value === 2 ? "two" : "three_plus" }
+function boundedMultipleCount(value) { return value === 0 ? "zero" : value === 1 ? "one" : "two_plus" }
+function waitInputPredicateDiagnostic(request, expectedTaskIds) {
+  try {
+    const messages = object(request)?.messages
+    if (!Array.isArray(messages) || messages.length > 2_048 || !Array.isArray(expectedTaskIds) || expectedTaskIds.length > 8) {
+      return { available: "no", reason: "bounded_input_unavailable" }
+    }
+    const uses = []
+    for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+      const message = object(messages[messageIndex])
+      if (message?.role !== "assistant" || !Array.isArray(message.content)) continue
+      for (const value of message.content) {
+        const part = object(value)
+        if (part?.type === "tool_use" && part.name === "wait_subagents") uses.push({ part, messageIndex })
+      }
+    }
+    const expected = [...expectedTaskIds].sort((left, right) => left.localeCompare(right))
+    const idsMatch = input => Array.isArray(input?.taskIds) && input.taskIds.length === expected.length
+      && input.taskIds.every((id, index) => typeof id === "string" && id === expected[index])
+    const exactInput = input => {
+      const value = object(input)
+      return !!value && Object.keys(value).sort().join(",") === "idempotencyKey,mode,taskIds,timeoutMs"
+        && typeof value.idempotencyKey === "string" && /^final-dependency-wait:[a-f0-9]{64}$/.test(value.idempotencyKey)
+        && value.mode === "all" && value.timeoutMs === 30_000 && idsMatch(value)
+    }
+    const latestEntry = uses.at(-1)
+    if (!latestEntry) return {
+      available: "yes", waitCallCount: "zero", expectedTaskCount: boundedWaitCount(expected.length),
+      latestKeysMatch: false, latestKeyShape: false, latestMode: "absent", latestTimeout: "invalid",
+      latestTaskIdsArray: false, latestTaskCount: "invalid", latestTaskIdsMatch: false,
+      priorExactWaitCount: "zero", latestResultCount: "zero",
+    }
+    const input = object(latestEntry.part.input)
+    const timeout = input?.timeoutMs
+    const latestTimeout = !Number.isInteger(timeout) ? "invalid" : timeout === 0 ? "zero"
+      : timeout < 30_000 ? "under_30s" : timeout === 30_000 ? "exact_30s" : "over_30s"
+    const taskIds = input?.taskIds
+    const taskCount = Array.isArray(taskIds) ? boundedWaitCount(taskIds.length) : "invalid"
+    let latestResultCount = 0
+    for (let index = latestEntry.messageIndex + 1; index < messages.length; index += 1) {
+      const message = object(messages[index])
+      if (message?.role !== "tool" || !Array.isArray(message.content)) continue
+      for (const value of message.content) {
+        const result = object(value)
+        if (result?.type === "tool_result" && result.toolUseId === latestEntry.part.id) latestResultCount += 1
+      }
+    }
+    return {
+      available: "yes", waitCallCount: boundedMultipleCount(uses.length), expectedTaskCount: boundedWaitCount(expected.length),
+      latestKeysMatch: !!input && Object.keys(input).sort().join(",") === "idempotencyKey,mode,taskIds,timeoutMs",
+      latestKeyShape: typeof input?.idempotencyKey === "string" && /^final-dependency-wait:[a-f0-9]{64}$/.test(input.idempotencyKey),
+      latestMode: input?.mode === "all" ? "all" : typeof input?.mode === "string" ? "other" : "absent",
+      latestTimeout, latestTaskIdsArray: Array.isArray(taskIds), latestTaskCount: taskCount,
+      latestTaskIdsMatch: idsMatch(input),
+      priorExactWaitCount: boundedMultipleCount(uses.slice(0, -1).filter(entry => exactInput(entry.part.input)).length),
+      latestResultCount: boundedMultipleCount(latestResultCount),
+    }
+  } catch {
+    return { available: "no", reason: "bounded_input_unavailable" }
+  }
+}
 function toolCall(callId, name, args) { return { type: "tool_call_completed", callId, name, arguments: args } }
 function completed() { return { type: "completed", finishReason: "tool_calls" } }
 function rootModelRuntime() {
@@ -227,7 +289,15 @@ function childModelRuntime({ task, runtime, markerState }) {
     }
     if (betaResult.isError) throw new Error("p1143_beta_delegate_failed")
     const delegateResults = [alphaResult.output, betaResult.output], childIds = delegateResults.map(value => object(value)?.taskId).filter(id => typeof id === "string")
-    parentResumeStage = "wait_input_parse"; const waitInput = findUniqueWaitInput(request, childIds); parentResumeStage = "wait_result_lookup"; const waitResult = waitInput ? findExactToolResult(request, { name: "wait_subagents", input: waitInput }) : null
+    parentResumeStage = "wait_input_parse"; let waitInput
+    try { waitInput = findUniqueWaitInput(request, childIds) }
+    catch (error) {
+      if (task.depth === 1 && mode === "resume" && parentResumeFixtureErrorClass(error) === "wait_input_invalid") {
+        try { say(`P1143_WAIT_INPUT_PREDICATE_DIAGNOSTIC:${JSON.stringify(waitInputPredicateDiagnostic(request, childIds))}`) } catch {}
+      }
+      throw error
+    }
+    parentResumeStage = "wait_result_lookup"; const waitResult = waitInput ? findExactToolResult(request, { name: "wait_subagents", input: waitInput }) : null
     if (waitResult?.isError) throw new Error("p1143_parent_wait_failed")
     parentResumeStage = "wait_context_marker"; const waitOutput = object(waitResult?.output), terminalWaitMatch = hasTerminalWaitOutcome(waitOutput, childIds)
     if (task.depth === 1 && mode === "resume") {

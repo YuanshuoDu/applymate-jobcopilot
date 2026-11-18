@@ -244,6 +244,30 @@ function safeDiagnosticPayload(value: string, prefix: string): Record<string, un
   } catch { return null }
 }
 
+function readWaitInputPredicateDiagnostic(output: readonly string[]) {
+  const line = output.find(value => value.startsWith("P1143_WAIT_INPUT_PREDICATE_DIAGNOSTIC:"))
+  if (!line) return { available: false }
+  const payload = safeDiagnosticPayload(line, "P1143_WAIT_INPUT_PREDICATE_DIAGNOSTIC:")
+  if (!payload) return { available: false }
+  if (payload.available === "no" && Object.keys(payload).sort().join("|") === "available|reason"
+    && payload.reason === "bounded_input_unavailable") return { available: false }
+  const expectedKeys = ["available", "expectedTaskCount", "latestKeyShape", "latestKeysMatch", "latestMode", "latestResultCount",
+    "latestTaskCount", "latestTaskIdsArray", "latestTaskIdsMatch", "latestTimeout", "priorExactWaitCount", "waitCallCount"]
+  const boolKeys = ["latestKeyShape", "latestKeysMatch", "latestTaskIdsArray", "latestTaskIdsMatch"]
+  const safeCount = (value: unknown) => ["zero", "one", "two", "two_plus", "three_plus"].includes(String(value))
+  if (payload.available !== "yes" || Object.keys(payload).sort().join("|") !== expectedKeys.sort().join("|")
+    || boolKeys.some(key => typeof payload[key] !== "boolean")
+    || !safeCount(payload.expectedTaskCount) || !["one", "two_plus"].includes(String(payload.waitCallCount))
+    || !["zero", "one", "two_plus"].includes(String(payload.priorExactWaitCount))
+    || !["zero", "one", "two_plus"].includes(String(payload.latestResultCount))
+    || !["invalid", "zero", "one", "two", "three_plus"].includes(String(payload.latestTaskCount))
+    || !["all", "other", "absent"].includes(String(payload.latestMode))
+    || !["invalid", "zero", "under_30s", "exact_30s", "over_30s"].includes(String(payload.latestTimeout))) {
+    return { available: false }
+  }
+  return { available: true, ...payload }
+}
+
 function safeFixtureLeaseFields(payload: Record<string, unknown>): boolean {
   const exactKeys = ["task", "attempt", "leaseVersion", "leaseVersionSource", "status", "leaseState", "ownerFence", "attemptFence", "expiryBucket"]
   const attemptOk = payload.attempt === "other" || (typeof payload.attempt === "number" && Number.isInteger(payload.attempt) && payload.attempt >= 0 && payload.attempt <= 3)
@@ -337,6 +361,7 @@ function seenMainProgress(output: string[]) {
 async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
   const observedPhases = seenMainProgress(output)
   const fixtureFailure = output.find(isSafeFixtureFailure) ?? null
+  const waitInputPredicates = readWaitInputPredicateDiagnostic(output)
   const waitResumeCommitFailures = output.flatMap(value => {
     const match = value.match(/^P1143_WAIT_RESUME_COMMIT_DIAGNOSTIC:([a-z_]+):([a-z_]+)$/)
     return match && SAFE_WAIT_RESUME_CODES.includes(match[1] as typeof SAFE_WAIT_RESUME_CODES[number])
@@ -422,9 +447,9 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       tier: depth === 1 ? "parent_scout" : depth === 2 ? "depth_two_scout" : "other_scout", status, failureCode,
       structuredFailureCategory, executorResultStatus, attemptCountMax, nextAttemptAtPresent, count,
     }))
-    const [acknowledgement, sourceEventChain, parentResumeProgress, pendingChildWait, waitCallLineage] = await Promise.all([
+    const [acknowledgement, sourceEventChain, parentResumeProgress, pendingChildWait, waitCallLineage, consumedWaitPredicateMatrix] = await Promise.all([
       readWaitAcknowledgementDiagnostic(ids), readSourceEventChainDiagnostic(ids), readParentResumeProgressDiagnostic(ids),
-      readPendingChildWaitDiagnostic(ids), readWaitCallLineageDiagnostic(ids),
+      readPendingChildWaitDiagnostic(ids), readWaitCallLineageDiagnostic(ids), readConsumedWaitPredicateMatrix(ids),
     ])
     const recoveryOrdering = await readNestedScoutRecoveryDiagnostic(ids)
     return {
@@ -439,9 +464,11 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       toolOutcomes: tools.rows,
       waitAcknowledgement: acknowledgement,
       sourceEventChain,
+      waitInputPredicates,
       parentResumeProgress,
       pendingChildWait,
       waitCallLineage,
+      consumedWaitPredicateMatrix,
       recoveryOrdering,
     }
   } catch {
@@ -556,6 +583,236 @@ async function readWaitCallLineageDiagnostic(ids: FixtureIds) {
   } catch {
     return { available: false }
   }
+}
+
+async function readConsumedWaitPredicateMatrix(ids: FixtureIds) {
+  type MatrixRow = {
+    taskAlias: string; attemptClass: string; candidateWaitCount: number; waitStatus: string;
+    waitSuspended: boolean; waitConsumed: boolean; sourceStepStatus: string; sourceAttemptMatches: boolean;
+    immediateContinuationPresent: boolean; loaderJoinRowCount: number; sourceWaitCallCount: number;
+    sourceResultCount: number; callStatusesValid: boolean; resultPairingValid: boolean;
+    callContentShapeMatches: boolean; callInputMatches: boolean; sourceReceiptCompatible: boolean; sourceItemSetMatches: boolean;
+  }
+  try {
+    const result = await progressQuery<MatrixRow>(`WITH fixture_tasks AS (
+        SELECT task."id", task."parentTaskId", task."rootTaskId", task."attemptCount", task."sessionId", task."turnId",
+          session."userId", CASE WHEN task."depth" = 1 THEN 'parent_scout'
+            WHEN task."depth" = 2 AND task."goal" LIKE '%Alpha%' THEN 'depth_two_scout_alpha'
+            WHEN task."depth" = 2 AND task."goal" LIKE '%Beta%' THEN 'depth_two_scout_beta'
+            ELSE 'other_scout' END AS "taskAlias"
+        FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $1
+        WHERE task."sessionId" = $2 AND task."turnId" = $3 AND task."role" = 'scout' AND task."taskType" = 'job_discovery'
+          AND task."depth" IN (1, 2)
+      ), wait_candidates AS (
+        SELECT task.*, wait."id" AS "waitId", wait."userId" AS "waitUserId", wait."sessionId" AS "waitSessionId",
+          wait."turnId" AS "waitTurnId", wait."parentTaskId" AS "waitParentTaskId", wait."stepId" AS "waitStepId",
+          wait."idempotencyKey", wait."targetTaskIds", wait."mode", wait."status" AS "waitStatus", wait."deadlineAt",
+          wait."matchedTaskIds", wait."consumedAt", wait."suspendedAt", wait."result" AS "waitResult",
+          source."attempt" AS "sourceAttempt", source."ordinal" AS "sourceOrdinal", source."status" AS "sourceStepStatus",
+          row_number() OVER (PARTITION BY task."id" ORDER BY source."attempt" DESC, source."ordinal" DESC,
+            wait."createdAt" DESC, wait."id" DESC) AS "waitRank",
+          LEAST(count(*) OVER (PARTITION BY task."id")::int, 3) AS "candidateWaitCount"
+        FROM fixture_tasks AS task JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = task."id"
+          AND wait."sessionId" = task."sessionId" AND wait."turnId" = task."turnId" AND wait."userId" = task."userId"
+        JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId"
+          AND source."turnId" = wait."turnId" AND source."taskId" = wait."parentTaskId"
+        WHERE source."attempt" <= task."attemptCount" AND wait."status" IN ('ready', 'timed_out')
+          AND wait."suspendedAt" IS NOT NULL AND wait."consumedAt" IS NOT NULL
+          AND EXISTS (SELECT 1 FROM "agent_steps" AS next WHERE next."sessionId" = source."sessionId"
+            AND next."turnId" = source."turnId" AND next."taskId" = source."taskId" AND next."attempt" = source."attempt"
+            AND next."ordinal" = (SELECT MIN(later."ordinal") FROM "agent_steps" AS later
+              WHERE later."sessionId" = source."sessionId" AND later."turnId" = source."turnId"
+                AND later."taskId" = source."taskId" AND later."attempt" = source."attempt"
+                AND later."ordinal" > source."ordinal"))
+      ), selected_wait AS (
+        SELECT * FROM wait_candidates WHERE "waitRank" = 1
+      ), loader_rows AS (
+        SELECT selected."id" AS "parentTaskId", selected."sessionId", selected."turnId", selected."waitStepId" AS "sourceStepId",
+          selected."attemptCount", selected."taskAlias", selected."waitId", selected."targetTaskIds", selected."idempotencyKey",
+          selected."mode", selected."deadlineAt", selected."waitStatus", selected."waitResult", selected."sourceAttempt",
+          selected."sourceOrdinal", selected."sourceStepStatus", call."id" AS "callItemId", call."content" AS "callContent",
+          call."status" AS "callStatus", call."revision" AS "callRevision", call."phase" AS "callPhase",
+          result."id" AS "resultItemId", result."content" AS "resultContent", result."status" AS "resultStatus",
+          result."revision" AS "resultRevision", result."phase" AS "resultPhase"
+        FROM selected_wait AS selected
+        JOIN "agent_sessions" AS session ON session."id" = selected."sessionId" AND session."userId" = selected."waitUserId"
+        JOIN "agent_turns" AS turn ON turn."id" = selected."turnId" AND turn."sessionId" = selected."sessionId"
+          AND turn."userId" = session."userId"
+        JOIN "sub_agent_tasks" AS root ON root."id" = selected."rootTaskId" AND root."sessionId" = selected."sessionId"
+          AND root."turnId" = selected."turnId"
+        JOIN "agent_steps" AS source ON source."id" = selected."waitStepId" AND source."sessionId" = selected."sessionId"
+          AND source."turnId" = selected."turnId" AND source."taskId" = selected."id"
+          AND source."status" IN ('waiting_for_tool', 'completed')
+        JOIN "agent_steps" AS next ON next."sessionId" = source."sessionId" AND next."turnId" = source."turnId"
+          AND next."taskId" = source."taskId" AND next."attempt" = source."attempt"
+          AND next."ordinal" = (SELECT MIN(later."ordinal") FROM "agent_steps" AS later
+            WHERE later."sessionId" = source."sessionId" AND later."turnId" = source."turnId"
+              AND later."taskId" = source."taskId" AND later."attempt" = source."attempt"
+              AND later."ordinal" > source."ordinal")
+        JOIN "agent_items" AS call ON call."sessionId" = source."sessionId" AND call."turnId" = source."turnId"
+          AND call."taskId" = source."taskId" AND call."stepId" = source."id" AND call."type" = 'tool_call'
+          AND call."content"->>'toolName' = 'wait_subagents'
+        LEFT JOIN "agent_items" AS result ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
+          AND result."taskId" = call."taskId" AND result."stepId" = call."stepId" AND result."type" = 'tool_result'
+          AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
+        WHERE selected."waitUserId" = $1 AND selected."waitSessionId" = $2 AND selected."waitTurnId" = $3
+          AND selected."waitParentTaskId" = selected."id" AND selected."waitStatus" IN ('ready', 'timed_out')
+          AND selected."suspendedAt" IS NOT NULL AND selected."consumedAt" IS NOT NULL
+      ), source_call_checks AS (
+        SELECT source.*, CASE WHEN jsonb_typeof(source."callContent") = 'object' THEN
+            source."callContent"->>'toolName' = 'wait_subagents' AND source."callContent"->>'toolVersion' = '1'
+            AND ((source."callStatus" = 'started' AND source."callRevision" = 0 AND source."callPhase" IS NULL
+                AND (SELECT count(*) = 4 FROM jsonb_object_keys(source."callContent"))
+                AND source."callContent" ?& ARRAY['toolCallId', 'toolName', 'toolVersion', 'input'])
+              OR (source."callStatus" = 'completed' AND source."callRevision" = 1 AND source."callPhase" IS NULL
+                AND source."callContent"->>'status' = 'completed' AND source."callContent"->'errorCode' = 'null'::jsonb
+                AND (SELECT count(*) = 6 FROM jsonb_object_keys(source."callContent"))
+                AND source."callContent" ?& ARRAY['toolCallId', 'toolName', 'toolVersion', 'status', 'errorCode', 'input']))
+          ELSE false END AS "callContentShapeMatches",
+          CASE WHEN jsonb_typeof(source."callContent"->'input') = 'object' THEN
+            (SELECT count(*) = 4 FROM jsonb_object_keys(source."callContent"->'input'))
+            AND source."callContent"->'input' ?& ARRAY['idempotencyKey', 'taskIds', 'mode', 'timeoutMs']
+            AND jsonb_typeof(source."callContent"->'input'->'idempotencyKey') = 'string'
+            AND length(source."callContent"->'input'->>'idempotencyKey') BETWEEN 1 AND 256
+            AND btrim(source."callContent"->'input'->>'idempotencyKey') = source."callContent"->'input'->>'idempotencyKey'
+            AND source."callContent"->'input'->>'idempotencyKey' = source."idempotencyKey"
+            AND source."callContent"->'input'->>'mode' = source."mode"
+            AND CASE WHEN jsonb_typeof(source."callContent"->'input'->'timeoutMs') = 'number'
+              AND length(source."callContent"->'input'->>'timeoutMs') <= 32
+              AND source."callContent"->'input'->>'timeoutMs' ~ '^-?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]{1,5})?$' THEN
+              (source."callContent"->'input'->>'timeoutMs')::numeric BETWEEN 1 AND 30000
+              AND trunc((source."callContent"->'input'->>'timeoutMs')::numeric)
+                = (source."callContent"->'input'->>'timeoutMs')::numeric
+            ELSE false END
+            AND CASE WHEN jsonb_typeof(source."waitResult") = 'object'
+              AND jsonb_typeof(source."waitResult"->'request') = 'object' THEN
+              (SELECT count(*) = 3 FROM jsonb_object_keys(source."waitResult"->'request'))
+              AND source."waitResult"->'request' ?& ARRAY['targetTaskIds', 'mode', 'timeoutMs']
+              AND source."waitResult"->'request'->>'mode' = source."mode"
+              AND source."waitResult"->'request'->'timeoutMs' = source."callContent"->'input'->'timeoutMs'
+              AND CASE WHEN jsonb_typeof(source."targetTaskIds") = 'array'
+                AND jsonb_typeof(source."callContent"->'input'->'taskIds') = 'array'
+                AND jsonb_typeof(source."waitResult"->'request'->'targetTaskIds') = 'array' THEN
+                jsonb_array_length(source."targetTaskIds") BETWEEN 1 AND 8
+                AND jsonb_array_length(source."callContent"->'input'->'taskIds') = jsonb_array_length(source."targetTaskIds")
+                AND jsonb_array_length(source."waitResult"->'request'->'targetTaskIds') = jsonb_array_length(source."targetTaskIds")
+                AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(source."targetTaskIds") AS item(value)
+                  WHERE jsonb_typeof(item.value) <> 'string' OR btrim(item.value #>> '{}') = ''
+                    OR item.value #>> '{}' <> btrim(item.value #>> '{}') OR length(item.value #>> '{}') > 256)
+                AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(source."callContent"->'input'->'taskIds') AS item(value)
+                  WHERE jsonb_typeof(item.value) <> 'string' OR btrim(item.value #>> '{}') = ''
+                    OR item.value #>> '{}' <> btrim(item.value #>> '{}') OR length(item.value #>> '{}') > 256)
+                AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(source."waitResult"->'request'->'targetTaskIds') AS item(value)
+                  WHERE jsonb_typeof(item.value) <> 'string' OR btrim(item.value #>> '{}') = ''
+                    OR item.value #>> '{}' <> btrim(item.value #>> '{}') OR length(item.value #>> '{}') > 256)
+                AND (SELECT count(DISTINCT item.value #>> '{}') = jsonb_array_length(source."targetTaskIds")
+                  FROM jsonb_array_elements(source."targetTaskIds") AS item(value))
+                AND ARRAY(SELECT jsonb_array_elements_text(source."targetTaskIds") ORDER BY 1)
+                  = ARRAY(SELECT jsonb_array_elements_text(source."callContent"->'input'->'taskIds') ORDER BY 1)
+                AND ARRAY(SELECT jsonb_array_elements_text(source."targetTaskIds") ORDER BY 1)
+                  = ARRAY(SELECT jsonb_array_elements_text(source."waitResult"->'request'->'targetTaskIds') ORDER BY 1)
+              ELSE false END
+            ELSE false END
+          ELSE false END AS "callInputMatches",
+          CASE WHEN source."resultItemId" IS NULL THEN true
+            WHEN jsonb_typeof(source."waitResult") = 'object'
+              AND source."waitResult" ? 'sourceLifecycleRecovery' THEN true
+            ELSE CASE WHEN jsonb_typeof(source."resultContent") = 'object' THEN
+              CASE WHEN (SELECT count(*) = 3 FROM jsonb_object_keys(source."resultContent"))
+                AND source."resultContent" ?& ARRAY['toolCallId', 'output', 'errorCode'] THEN
+                CASE WHEN source."resultContent"->>'toolCallId' = source."callContent"->>'toolCallId'
+                  AND source."resultContent"->'errorCode' = 'null'::jsonb
+                  AND jsonb_typeof(source."resultContent"->'output') = 'object' THEN
+                  CASE WHEN (SELECT count(*) = 6 FROM jsonb_object_keys(source."resultContent"->'output'))
+                    AND source."resultContent"->'output' ?& ARRAY['waitId', 'status', 'taskIds', 'deadlineAt', 'matchedTaskIds', 'tasks']
+                    THEN source."resultContent"->'output'->>'waitId' = source."waitId"
+                      AND source."resultContent"->'output'->>'status' = 'waiting'
+                      AND CASE WHEN pg_input_is_valid(source."resultContent"->'output'->>'deadlineAt', 'timestamp with time zone')
+                        THEN (source."resultContent"->'output'->>'deadlineAt')::timestamptz = source."deadlineAt"
+                        ELSE false END
+                    ELSE false END
+                  ELSE false END
+                ELSE false END
+              ELSE false END
+          END AS "sourceReceiptCompatible"
+        FROM loader_rows AS source
+      ), call_stats AS (
+        SELECT checks."parentTaskId", LEAST(count(*)::int, 3) AS "loaderJoinRowCount",
+          LEAST(count(DISTINCT checks."callItemId")::int, 3) AS "sourceWaitCallCount",
+          LEAST(count(checks."resultItemId")::int, 3) AS "sourceResultCount",
+          bool_and(checks."callStatus" IN ('started', 'streaming', 'completed')) AS "callStatusesValid",
+          bool_and(checks."resultItemId" IS NULL OR (checks."callStatus" = 'completed' AND checks."resultStatus" = 'completed')) AS "resultPairingValid",
+          bool_and(checks."callContentShapeMatches") AS "callContentShapeMatches",
+          bool_and(checks."callInputMatches") AS "callInputMatches",
+          bool_and(checks."sourceReceiptCompatible") AS "sourceReceiptCompatible"
+        FROM source_call_checks AS checks GROUP BY checks."parentTaskId"
+      ), source_call_ids AS (
+        SELECT DISTINCT ON (checks."parentTaskId", checks."callItemId") checks."parentTaskId", checks."sessionId", checks."turnId",
+          checks."sourceStepId", checks."callItemId", checks."callContent"->>'toolCallId' AS "callId"
+        FROM source_call_checks AS checks ORDER BY checks."parentTaskId", checks."callItemId"
+      ), source_item_stats AS (
+        SELECT calls."parentTaskId", bool_and(items."callItemCount" = 1 AND items."itemCount" = 1 + items."resultCount"
+          AND items."resultCount" <= 1 AND items."itemSetScoped") AS "sourceItemSetMatches"
+        FROM source_call_ids AS calls
+        CROSS JOIN LATERAL (
+          SELECT count(*)::int AS "itemCount",
+            count(*) FILTER (WHERE item."id" = calls."callItemId" AND item."type" = 'tool_call')::int AS "callItemCount",
+            count(*) FILTER (WHERE item."type" = 'tool_result')::int AS "resultCount",
+            bool_and(item."stepId" = calls."sourceStepId" AND item."taskId" = calls."parentTaskId"
+              AND item."type" IN ('tool_call', 'tool_result')) AS "itemSetScoped"
+          FROM (SELECT "id", "type", "stepId", "taskId" FROM "agent_items"
+            WHERE "sessionId" = calls."sessionId" AND "turnId" = calls."turnId" AND "taskId" = calls."parentTaskId"
+              AND "content"->>'toolCallId' = calls."callId"
+            ORDER BY "createdAt" DESC, "id" DESC LIMIT 3) AS item
+        ) AS items GROUP BY calls."parentTaskId"
+      )
+      SELECT task."taskAlias", CASE WHEN task."attemptCount" BETWEEN 0 AND 3 THEN task."attemptCount"::text ELSE 'other' END AS "attemptClass",
+        COALESCE(selected."candidateWaitCount", 0) AS "candidateWaitCount",
+        COALESCE(CASE WHEN selected."waitStatus" IN ('ready', 'timed_out') THEN selected."waitStatus" ELSE 'other' END, 'missing') AS "waitStatus",
+        COALESCE(selected."suspendedAt" IS NOT NULL, false) AS "waitSuspended",
+        COALESCE(selected."consumedAt" IS NOT NULL, false) AS "waitConsumed",
+        COALESCE(CASE WHEN selected."sourceStepStatus" IN ('waiting_for_tool', 'completed', 'streaming', 'failed')
+          THEN selected."sourceStepStatus" ELSE 'other' END, 'missing') AS "sourceStepStatus",
+        COALESCE(selected."sourceAttempt" <= selected."attemptCount", false) AS "sourceAttemptMatches",
+        COALESCE(selected."waitId" IS NOT NULL AND EXISTS (SELECT 1 FROM "agent_steps" AS next
+          WHERE next."sessionId" = selected."sessionId" AND next."turnId" = selected."turnId"
+            AND next."taskId" = selected."id" AND next."attempt" = selected."sourceAttempt"
+            AND next."ordinal" = (SELECT MIN(later."ordinal") FROM "agent_steps" AS later
+              WHERE later."sessionId" = selected."sessionId" AND later."turnId" = selected."turnId"
+                AND later."taskId" = selected."id" AND later."attempt" = selected."sourceAttempt"
+                AND later."ordinal" > selected."sourceOrdinal")), false) AS "immediateContinuationPresent",
+        COALESCE(stats."loaderJoinRowCount", 0) AS "loaderJoinRowCount",
+        COALESCE(stats."sourceWaitCallCount", 0) AS "sourceWaitCallCount",
+        COALESCE(stats."sourceResultCount", 0) AS "sourceResultCount",
+        COALESCE(stats."callStatusesValid", false) AS "callStatusesValid",
+        COALESCE(stats."resultPairingValid", false) AS "resultPairingValid",
+        COALESCE(stats."callContentShapeMatches", false) AS "callContentShapeMatches",
+        COALESCE(stats."callInputMatches", false) AS "callInputMatches",
+        COALESCE(stats."sourceReceiptCompatible", false) AS "sourceReceiptCompatible",
+        COALESCE(items."sourceItemSetMatches", false) AS "sourceItemSetMatches"
+      FROM fixture_tasks AS task LEFT JOIN selected_wait AS selected ON selected."id" = task."id"
+      LEFT JOIN call_stats AS stats ON stats."parentTaskId" = task."id"
+      LEFT JOIN source_item_stats AS items ON items."parentTaskId" = task."id"
+      ORDER BY task."taskAlias" LIMIT 4`, [ids.userId, ids.sessionId, ids.turnId])
+    const count = (value: number) => value === 0 ? "zero" : value === 1 ? "one" : value === 2 ? "two" : "three_plus"
+    const aliases = new Set(["parent_scout", "depth_two_scout_alpha", "depth_two_scout_beta", "other_scout"])
+    const statuses = new Set(["ready", "timed_out", "waiting_for_tool", "completed", "streaming", "failed", "other", "missing"])
+    return { available: true, rows: result.rows.slice(0, 4).map(row => ({
+      taskAlias: aliases.has(row.taskAlias) ? row.taskAlias : "other_scout",
+      attemptClass: ["0", "1", "2", "3"].includes(row.attemptClass) ? row.attemptClass : "other",
+      candidateWaitCount: count(row.candidateWaitCount),
+      waitStatus: statuses.has(row.waitStatus) ? row.waitStatus : "other",
+      waitSuspended: row.waitSuspended === true, waitConsumed: row.waitConsumed === true,
+      sourceStepStatus: statuses.has(row.sourceStepStatus) ? row.sourceStepStatus : "other",
+      sourceAttemptMatches: row.sourceAttemptMatches === true,
+      immediateContinuationPresent: row.immediateContinuationPresent === true,
+      loaderJoinRowCount: count(row.loaderJoinRowCount), sourceWaitCallCount: count(row.sourceWaitCallCount),
+      sourceResultCount: count(row.sourceResultCount), callStatusesValid: row.callStatusesValid === true,
+      resultPairingValid: row.resultPairingValid === true, callContentShapeMatches: row.callContentShapeMatches === true,
+      callInputMatches: row.callInputMatches === true, sourceReceiptCompatible: row.sourceReceiptCompatible === true,
+      sourceItemSetMatches: row.sourceItemSetMatches === true,
+    })) }
+  } catch { return { available: false } }
 }
 
 async function readParentResumeProgressDiagnostic(ids: FixtureIds) {
