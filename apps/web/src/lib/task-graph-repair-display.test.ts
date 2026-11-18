@@ -13,24 +13,32 @@ import {
 
 const sessionId = 'session-1'
 const rootTaskId = 'root-1'
-const verification = {
+const targetVerification = {
   schemaVersion: 'agent-harness.v2.task-graph-verification.v1',
   role: 'analyst',
-  criteria: [{ id: 'finding-count', check: { kind: 'finding_count_gte', minimum: 1 } }],
+  criteria: [
+    { id: 'finding-count', check: { kind: 'finding_count_gte', minimum: 1 } },
+    { id: 'evidence-count', check: { kind: 'evidence_count_gte', minimum: 2 } },
+  ],
+}
+const repairVerification = {
+  schemaVersion: targetVerification.schemaVersion,
+  role: targetVerification.role,
+  criteria: [targetVerification.criteria[1]],
 }
 
 function graph(repairOf?: unknown) {
   const relation = repairOf === undefined
-    ? { graphRootTaskId: rootTaskId, nodeKey: 'target', taskId: 'target-task', criterionIds: ['finding-count'] }
+    ? { graphRootTaskId: rootTaskId, nodeKey: 'target', taskId: 'target-task', criterionIds: ['evidence-count'] }
     : repairOf
   const repair = {
     key: 'repair', templateId: 'analyst', goal: 'Repair the finding count', successCriteria: ['Return one finding'],
-    dependsOn: [], depth: 1, taskId: 'repair-task', verification, verificationDisposition: 'typed',
+    dependsOn: [], depth: 1, taskId: 'repair-task', verification: repairVerification, verificationDisposition: 'typed',
   }
   return {
     schemaVersion: TASK_GRAPH_SCHEMA_VERSION,
     nodes: [
-      { key: 'target', templateId: 'analyst', goal: 'Find target roles', successCriteria: ['Return findings'], dependsOn: [], depth: 1, taskId: 'target-task', verification, verificationDisposition: 'typed' },
+      { key: 'target', templateId: 'analyst', goal: 'Find target roles', successCriteria: ['Return findings'], dependsOn: [], depth: 1, taskId: 'target-task', verification: targetVerification, verificationDisposition: 'typed' },
       ...(relation === null ? [repair] : [{ ...repair, repairOf: relation }]),
     ],
   }
@@ -50,19 +58,43 @@ function ledger(rawGraph: unknown = graph()) {
 }
 
 describe('TaskGraph repair display projection', () => {
-  it('adds only the same-root target goal from a strict repair relation', () => {
+  it('adds only the same-root target goal and selected check positions from a strict repair relation', () => {
     const value = graph()
     const base = ledger(value)
     const inputSnapshot = JSON.stringify({ base, value })
     const decorated = decoratePlanLedgerRepairTargets(base, value, rootTaskId)
     expect(decorated.nodes).toEqual([
       expect.objectContaining({ key: 'target', goal: 'Find target roles' }),
-      expect.objectContaining({ key: 'repair', repairTargetGoal: 'Find target roles', repairTargetNodeIndex: 0 }),
+      expect.objectContaining({ key: 'repair', repairTargetGoal: 'Find target roles', repairTargetNodeIndex: 0, repairTargetCheckIndexes: [1] }),
     ])
     expect(JSON.stringify({ base, value })).toBe(inputSnapshot)
     expect(decorated.nodes[0]).not.toHaveProperty('repairTargetGoal')
     expect(parsePlanLedgerWithRepairTargets(decorated)).toEqual(decorated)
     expect(JSON.stringify(decorated)).not.toMatch(/repairOf|criterionIds|finding-count/)
+  })
+
+  it('keeps legacy target text but suppresses check causality for a forward repair relation', () => {
+    const baseGraph = graph()
+    const forwardGraph = { ...baseGraph, nodes: [baseGraph.nodes[1]!, baseGraph.nodes[0]!] }
+    const base = ledger(forwardGraph)
+    const decorated = decoratePlanLedgerRepairTargets(base, forwardGraph, rootTaskId)
+    expect(decorated.nodes[0]).toMatchObject({ repairTargetGoal: 'Find target roles', repairTargetNodeIndex: 1 })
+    expect(decorated.nodes[0]).not.toHaveProperty('repairTargetCheckIndexes')
+    expect(parsePlanLedgerWithRepairTargets(decorated)).toEqual(decorated)
+
+    const invalid = {
+      ...decorated,
+      nodes: decorated.nodes.map((node, index) => index === 0
+        ? { ...node, repairTargetCheckIndexes: [1] } : node),
+    }
+    expect(parsePlanLedgerWithRepairTargets(invalid)).toBeNull()
+    expect(projectRepairAttentionSummaries(invalid, {
+      schemaVersion: 1,
+      nodes: [null, { status: 'failed', checks: [
+        { kind: 'finding_count_gte', minimum: 1, status: 'passed' },
+        { kind: 'evidence_count_gte', minimum: 2, status: 'failed' },
+      ], totalCount: 2, passedCount: 1, failedCount: 1, unverifiedCount: 0 }],
+    })).toEqual([null, null])
   })
 
   it('binds duplicate public goal text to the strictly matched target index', () => {
@@ -79,7 +111,7 @@ describe('TaskGraph repair display projection', () => {
     const repair = decorated.nodes.find(node => node.key === 'repair')
 
     expect(decorated.nodes.filter(node => node.goal === 'Find target roles')).toHaveLength(2)
-    expect(repair).toMatchObject({ repairTargetGoal: 'Find target roles', repairTargetNodeIndex: 0 })
+    expect(repair).toMatchObject({ repairTargetGoal: 'Find target roles', repairTargetNodeIndex: 0, repairTargetCheckIndexes: [1] })
     expect(parsePlanLedgerWithRepairTargets(decorated)?.nodes.find(node => node.key === 'repair')).toMatchObject({ repairTargetNodeIndex: 0 })
   })
 
@@ -113,8 +145,15 @@ describe('TaskGraph repair display projection', () => {
       ...base,
       nodes: base.nodes.map(node => node.key === 'repair' ? { ...node, repairTargetGoal: target.goal } : node),
     }
+    const indexed = {
+      ...base,
+      nodes: base.nodes.map(node => node.key === 'repair' ? {
+        ...node, repairTargetGoal: target.goal, repairTargetNodeIndex: 0, repairTargetCheckIndexes: [1],
+      } : node),
+    }
     expect(parsePlanLedgerWithRepairTargets(base)).toEqual(base)
     expect(parsePlanLedgerWithRepairTargets(JSON.stringify(extended))).toEqual(extended)
+    expect(parsePlanLedgerWithRepairTargets(indexed)).toEqual(indexed)
     expect(parsePlanLedgerWithRepairTargets({
       ...base, nodes: base.nodes.map(node => node.key === 'repair' ? { ...node, repairTargetGoal: repair.goal } : node),
     })).toBeNull()
@@ -130,6 +169,13 @@ describe('TaskGraph repair display projection', () => {
     expect(parsePlanLedgerWithRepairTargets({
       ...base, nodes: base.nodes.map(node => node.key === 'repair' ? { ...node, repairTargetGoal: 'Different goal', repairTargetNodeIndex: 0 } : node),
     })).toBeNull()
+    for (const invalidIndexes of [[], [1, 1], [1, 0], [8], ['1'], [null]]) {
+      expect(parsePlanLedgerWithRepairTargets({
+        ...base, nodes: base.nodes.map(node => node.key === 'repair' ? {
+          ...node, repairTargetGoal: target.goal, repairTargetNodeIndex: 0, repairTargetCheckIndexes: invalidIndexes,
+        } : node),
+      })).toBeNull()
+    }
   })
 
   it('projects only failed or unverified checks from the indexed target', () => {
@@ -138,9 +184,9 @@ describe('TaskGraph repair display projection', () => {
       schemaVersion: 1 as const,
       nodes: [
         { status: 'failed' as const, checks: [
-          { kind: 'candidate_count_gte' as const, minimum: 1, status: 'passed' as const },
+          { kind: 'finding_count_gte' as const, minimum: 1, status: 'failed' as const },
           { kind: 'evidence_count_gte' as const, minimum: 2, status: 'failed' as const },
-        ], totalCount: 2, passedCount: 1, failedCount: 1, unverifiedCount: 0 },
+        ], totalCount: 2, passedCount: 0, failedCount: 2, unverifiedCount: 0 },
         null,
       ],
     }
@@ -157,17 +203,31 @@ describe('TaskGraph repair display projection', () => {
       nodes: [
         { status: 'unverified' as const, checks: [
           { kind: 'finding_count_gte' as const, minimum: 1, status: 'unverified' as const },
-        ], totalCount: 1, passedCount: 0, failedCount: 0, unverifiedCount: 1 },
+          { kind: 'evidence_count_gte' as const, minimum: 2, status: 'unverified' as const },
+        ], totalCount: 2, passedCount: 0, failedCount: 0, unverifiedCount: 2 },
         null,
       ],
     }
     expect(projectRepairAttentionSummaries(projection, unverifiedSummary)[1]).toEqual({
-      status: 'unverified', checks: [{ kind: 'finding_count_gte', minimum: 1, status: 'unverified' }],
+      status: 'unverified', checks: [{ kind: 'evidence_count_gte', minimum: 2, status: 'unverified' }],
       totalCount: 1, passedCount: 0, failedCount: 0, unverifiedCount: 1,
     })
     expect(projectRepairAttentionSummaries(projection, {
-      schemaVersion: 1, nodes: [{ status: 'passed', checks: [{ kind: 'candidate_count_gte', minimum: 1, status: 'passed' }],
-        totalCount: 1, passedCount: 1, failedCount: 0, unverifiedCount: 0 }, null],
+      schemaVersion: 1, nodes: [{ status: 'passed', checks: [
+        { kind: 'finding_count_gte', minimum: 1, status: 'passed' },
+        { kind: 'evidence_count_gte', minimum: 2, status: 'passed' },
+      ], totalCount: 2, passedCount: 2, failedCount: 0, unverifiedCount: 0 }, null],
+    })[1]).toBeNull()
+    expect(projectRepairAttentionSummaries(projection, {
+      schemaVersion: 1, nodes: [{ status: 'failed', checks: [
+        { kind: 'finding_count_gte', minimum: 1, status: 'failed' },
+        { kind: 'evidence_count_gte', minimum: 2, status: 'passed' },
+      ], totalCount: 2, passedCount: 1, failedCount: 1, unverifiedCount: 0 }, null],
+    })[1]).toBeNull()
+    expect(projectRepairAttentionSummaries(projection, {
+      schemaVersion: 1, nodes: [{ status: 'failed', checks: [
+        { kind: 'evidence_count_gte', minimum: 2, status: 'failed' },
+      ], totalCount: 1, passedCount: 0, failedCount: 1, unverifiedCount: 0 }, null],
     })[1]).toBeNull()
     expect(projectRepairAttentionSummaries(projection, { schemaVersion: 1, nodes: [{ status: 'unavailable' }, null] })[1]).toBeNull()
     expect(projectRepairAttentionSummaries(projection, { schemaVersion: 1, nodes: [null] })[1]).toBeNull()

@@ -98,6 +98,7 @@ jobs:
           const expected = new Map([
             ['/src/runtime/subagents/nested-scout-delegation-pg.integration.test.ts', [
               'reclaims a claimed Scout child after a pre-model Worker crash and joins source-bound children across Worker restart',
+              'persists user Stop through a waiting nested Scout tree without leaving active descendants',
             ]],
             ['/src/runtime/subagents/parent-finish-descendants-pg.integration.test.ts', [
               'returns children_pending without persisting success when a direct active child exists',
@@ -119,11 +120,11 @@ jobs:
           ])
           const files = report.testResults
           const cases = files?.flatMap(file => file.assertionResults ?? []) ?? []
-          if (!report.success || report.numTotalTests !== 12 || report.numPassedTests !== 12 ||
+          if (!report.success || report.numTotalTests !== 13 || report.numPassedTests !== 13 ||
               report.numFailedTests !== 0 || report.numPendingTests !== 0 || report.numTodoTests !== 0 ||
-              files?.length !== expected.size || cases.length !== 12 ||
+              files?.length !== expected.size || cases.length !== 13 ||
               cases.some(test => test.status !== 'passed')) {
-            throw new Error('Expected all twelve PostgreSQL cases to pass with no failed, skipped, pending or todo tests')
+            throw new Error('Expected all thirteen PostgreSQL cases to pass with no failed, skipped, pending or todo tests')
           }
           for (const result of files) {
             const name = result.name.replaceAll('\\', '/')

@@ -32,6 +32,19 @@ function graph(turnId: string, rootTaskId: string, childTaskId: string, graphIte
   }
 }
 
+function graphWithChildren(turnId: string, rootTaskId: string, childTaskIds: readonly string[], graphItemId: string, revision: number): TimelineItem {
+  const now = '2026-10-01T12:00:00.000Z'
+  return {
+    schemaVersion: 'agent-harness.v2', id: graphItemId, sessionId: 'session-1', turnId, stepId: null, taskId: rootTaskId,
+    type: 'task_graph', status: 'streaming', phase: 'commentary', revision,
+    content: { schemaVersion: 'agent-harness.v2.task-graph', nodes: childTaskIds.map((childTaskId, index) => ({
+      key: `scout-${index + 1}`, templateId: 'scout', goal: `Find ${turnId}`, successCriteria: ['Find candidates'],
+      dependsOn: [], depth: 1, taskId: childTaskId,
+    })) },
+    startedAt: null, completedAt: null, createdAt: now, updatedAt: now, source: 'replay', sequence: null,
+  }
+}
+
 function turn(id: string): SupervisorTurnSummary {
   return { id, sessionId: 'session-1', source: 'message', goal: `Goal ${id}`, status: 'failed', revision: 3, activeStepId: null,
     finalItemId: null, createdAt: '2026-10-01T12:00:00.000Z', updatedAt: '2026-10-01T12:00:00.000Z', completedAt: null }
@@ -65,9 +78,10 @@ const oldLedger = ledger('turn-old', 'graph-old', 'root-old', 4, 'HISTORICAL_PLA
 const currentLedger = ledger('turn-current', 'graph-current', 'root-current', 2, 'CURRENT_PLAN_MARKER', 'completed')
 const oldTurnNode: TaskTreeNode = { id: 'turn:turn-old', kind: 'turn', label: 'Goal turn-old', status: 'failed' }
 
-function view(selectedNodeId?: string, selectedNode?: TaskTreeNode) {
-  return <AgentSupervisorPlanView sessionId="session-1" items={items} turns={turns} tasks={tasks} selectedNodeId={selectedNodeId}
-    selectedNode={selectedNode} currentGraphTasks={tasks.filter(row => row.turnId === 'turn-current')} currentLedger={currentLedger}
+function view(selectedNodeId?: string, selectedNode?: TaskTreeNode, visibleItems: TimelineItem[] = items,
+  visibleTasks: SupervisorTaskSummary[] = tasks) {
+  return <AgentSupervisorPlanView sessionId="session-1" items={visibleItems} turns={turns} tasks={visibleTasks} selectedNodeId={selectedNodeId}
+    selectedNode={selectedNode} currentGraphTasks={visibleTasks.filter(row => row.turnId === 'turn-current')} currentLedger={currentLedger}
     currentPreparationTurnId="turn-current" lifecycleRevision={7} onReturnToCurrent={() => undefined} />
 }
 
@@ -87,6 +101,20 @@ describe('AgentSupervisorPlanView', () => {
     expect(html).toContain('Verification: Failed')
     expect(html).toContain('Return to current plan')
     expect(html).not.toContain('CURRENT_PLAN_MARKER')
+    expect(api.calls).toContainEqual({ url, enabled: true })
+  })
+
+  it('keeps the selected-plan query available for the maximum persisted graph', () => {
+    const childTaskIds = Array.from({ length: 11 }, (_, index) => `old-scout-${index + 1}`)
+    const oldGraph = graphWithChildren('turn-old', 'root-old', childTaskIds, 'graph-old', 4)
+    const visibleItems = [oldGraph, currentGraph]
+    const visibleTasks = [...tasks, ...childTaskIds.map(id => task(id, 'turn-old', 'root-old', 'completed', `Old result ${id}`))]
+    const url = buildTaskGraphTaskLookupUrl('session-1', visibleItems, 'turn-old')!
+    const html = renderToStaticMarkup(view(oldTurnNode.id, oldTurnNode, visibleItems, visibleTasks))
+
+    expect(new URLSearchParams(url.split('?')[1]).getAll('taskId')).toEqual(['root-old', ...childTaskIds])
+    expect(html).toContain('Loading selected plan…')
+    expect(html).not.toContain('This selected plan is unavailable.')
     expect(api.calls).toContainEqual({ url, enabled: true })
   })
 
