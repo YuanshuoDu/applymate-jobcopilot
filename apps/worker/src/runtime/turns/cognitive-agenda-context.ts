@@ -6,32 +6,55 @@ import { COGNITIVE_AGENDA_RECEIPT_V2_SCHEMA_VERSION, parseCognitiveAgendaReceipt
 import type { ObjectiveProgressDelta, ObjectiveProgressSnapshot } from "../context/task-graph-objective-progress-delta.js"
 
 const MAX_PROJECTED_COUNT = 999
+const MAX_PROJECTED_REQUIREMENTS = 8
 const MAX_CONTEXT_BYTES = 4 * 1024
 
-function projectProgressDelta(delta: ObjectiveProgressDelta, snapshot: ObjectiveProgressSnapshot | null): ObjectiveProgressDelta | null {
-  const locationRows = delta.requirements.filter(row => row.kind === "candidate_location_in")
-  if (locationRows.length && !snapshot) return null
+type ProjectedObjectiveProgressRequirement = ObjectiveProgressDelta["requirements"][number] & {
+  readonly objectiveRequirementPosition?: number
+}
+type ProjectedObjectiveProgressDelta = Omit<ObjectiveProgressDelta, "requirements"> & {
+  readonly requirements: readonly ProjectedObjectiveProgressRequirement[]
+}
+
+function snapshotMatchesDelta(delta: ObjectiveProgressDelta, snapshot: ObjectiveProgressSnapshot): boolean {
+  return delta.requirements.length === snapshot.requirements.length && delta.requirements.every((row, index) => {
+    const current = snapshot.requirements[index]
+    if (!current || row.id !== current.id || row.kind !== current.kind || row.afterStatus !== current.status) return false
+    return row.kind === "candidate_location_in" ? current.kind === "candidate_location_in"
+      : current.kind !== "candidate_location_in" && row.minimum === current.minimum
+  })
+}
+
+function projectProgressDelta(delta: ObjectiveProgressDelta, snapshot: ObjectiveProgressSnapshot | null): ProjectedObjectiveProgressDelta | null {
   const snapshotById = new Map(snapshot?.requirements.map(row => [row.id, row]) ?? [])
   const locations = new Set(snapshot?.requirements.flatMap(row => row.kind === "candidate_location_in" ? row.locations : []) ?? [])
-  const forbidden = new Set([...delta.requirements.map(row => row.id), ...locations])
+  const hasAnonymousRows = delta.requirements.some(row => row.kind === "candidate_location_in" || locations.has(row.id))
+  if (hasAnonymousRows && (!snapshot || !snapshotMatchesDelta(delta, snapshot))) return null
+  const forbidden = new Set([...delta.requirements.map(row => row.id), ...(snapshot?.requirements.map(row => row.id) ?? []), ...locations])
   let nextLocationId = 1
-  const requirements = delta.requirements.map(row => {
+  const requirements: ProjectedObjectiveProgressRequirement[] = []
+  for (const [index, row] of delta.requirements.entries()) {
     if (row.kind === "candidate_location_in") {
       const current = snapshotById.get(row.id)
       if (!current || current.kind !== "candidate_location_in" || current.status !== row.afterStatus) return null
     }
-    if (row.kind !== "candidate_location_in" && !locations.has(row.id)) return row
-    let id: string | undefined
-    for (let attempt = 0; attempt <= forbidden.size + delta.requirements.length; attempt += 1) {
-      const candidate = "location_requirement_" + nextLocationId++
-      if (!forbidden.has(candidate)) { id = candidate; break }
+    let id = row.id
+    if (row.kind === "candidate_location_in" || locations.has(row.id)) {
+      let anonymousId: string | undefined
+      for (let attempt = 0; attempt <= forbidden.size + delta.requirements.length; attempt += 1) {
+        const candidate = "location_requirement_" + nextLocationId++
+        if (!forbidden.has(candidate)) { anonymousId = candidate; break }
+      }
+      if (!anonymousId) return null
+      forbidden.add(anonymousId)
+      id = anonymousId
     }
-    if (!id) return null
-    forbidden.add(id)
-    return { ...row, id }
-  })
-  if (requirements.some(row => row === null)) return null
-  return { ...delta, requirements: requirements as ObjectiveProgressDelta["requirements"] }
+    const projected = { ...row, id }
+    const position = index + 1
+    if (hasAnonymousRows && position > MAX_PROJECTED_REQUIREMENTS) return null
+    requirements.push(hasAnonymousRows ? { ...projected, objectiveRequirementPosition: position } : projected)
+  }
+  return { ...delta, requirements }
 }
 
 export type CognitiveAgendaContext = {
@@ -49,7 +72,7 @@ export type CognitiveAgendaContext = {
     readonly newlyObservedSteering: number
   }
   readonly steering: { readonly present: boolean; readonly fresh: boolean }
-  readonly progressDelta?: ObjectiveProgressDelta
+  readonly progressDelta?: ProjectedObjectiveProgressDelta
 }
 
 /** Revalidates the durable receipt for one exact request scope and drops all IDs and text. */

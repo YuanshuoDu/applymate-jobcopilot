@@ -13,7 +13,7 @@ import { taskGraphObjectiveProgressDelta, type ObjectiveProgressSnapshot } from 
 import { projectCognitiveAgendaContext } from "./cognitive-agenda-context.js"
 
 const scope: CognitiveAgendaReceiptScope = { sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: "turn:turn-1:step:3" }
-const collidingLocationTarget = normalizeAgentLocationAllowlist([" Berlin ", "location_requirement_2", "location_requirement_1"])
+const collidingLocationTarget = normalizeAgentLocationAllowlist([" Berlin ", "location_requirement_3", "location_requirement_2", "location_requirement_1"])
 if (!collidingLocationTarget) throw new Error("fixture collision location list should be valid")
 type SignalName = "pendingInputs" | "approvals" | "activeWaits" | "unresolved" | "completionVerification" | "activeSteering" | "newlyObservedSteering"
 type Scenario = {
@@ -132,24 +132,28 @@ describe("Cognitive agenda request projection", () => {
     const serialized = JSON.stringify(projected)
 
     expect(projected?.progressDelta).toMatchObject({ availability: "unavailable", requirements: [
-      { id: "count-criteria", kind: "candidate_count_gte", minimum: 3, beforeStatus: "unknown", afterStatus: "active" },
-      { kind: "candidate_count_gte", minimum: 4, beforeStatus: "unknown", afterStatus: "active" },
-      { kind: "candidate_location_in", beforeStatus: "unknown", afterStatus: "reported_passed" },
+      { id: "count-criteria", kind: "candidate_count_gte", minimum: 3, beforeStatus: "unknown", afterStatus: "active", objectiveRequirementPosition: 1 },
+      { kind: "candidate_count_gte", minimum: 4, beforeStatus: "unknown", afterStatus: "active", objectiveRequirementPosition: 2 },
+      { kind: "candidate_location_in", beforeStatus: "unknown", afterStatus: "reported_passed", objectiveRequirementPosition: 3 },
     ] })
     const projectedIds = projected?.progressDelta?.requirements.map(row => row.id) ?? []
     expect(projectedIds).toHaveLength(3)
     expect(new Set(projectedIds).size).toBe(projectedIds.length)
     expect(projectedIds[0]).toBe("count-criteria")
-    expect(projectedIds[2]).toMatch(/^location_requirement_\d+$/)
+    expect(projectedIds).toEqual(["count-criteria", "location_requirement_4", "location_requirement_5"])
+    expect(projected?.progressDelta?.requirements.map(row => row.objectiveRequirementPosition)).toEqual([1, 2, 3])
     expect(projectedIds).not.toContain("location_requirement_1")
     expect(projectedIds).not.toContain("location_requirement_2")
+    expect(projectedIds).not.toContain("location_requirement_3")
     expect(delta.requirements.map(row => row.id)).toEqual(["count-criteria", "location_requirement_2", "location_requirement_1"])
     expect(serialized).not.toContain("berlin")
     expect(serialized).not.toContain("location_requirement_1")
     expect(serialized).not.toContain("location_requirement_2")
+    expect(serialized).not.toContain("location_requirement_3")
     expect(serialized).not.toContain("locationHash")
     expect(serialized).not.toMatch(/[a-f0-9]{64}/)
     expect(projectCognitiveAgendaContext({ ...receipt, objectiveProgressSnapshot: null }, scope)).toBeNull()
+    expect(projectCognitiveAgendaContext({ ...receipt, progressDelta: { ...delta, requirements: [...delta.requirements].reverse() } }, scope)).toBeNull()
   })
 
   it.each(["sessionId", "turnId", "taskId", "stepId"] as const)("rejects a receipt with mismatched %s scope", field => {
