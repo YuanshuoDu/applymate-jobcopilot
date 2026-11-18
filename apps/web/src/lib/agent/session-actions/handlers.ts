@@ -14,6 +14,7 @@ import { requireLegacyPolicy } from "@/lib/agent/policy/legacy"
 import { resumeLegacyApprovalTurnInTransaction } from "@/lib/agent/approval/legacy-approval-fence"
 import { AgentCommandError } from "../control-plane/commands/errors"
 import { confirmSubmissionNotReceived } from "../control-plane/commands/application-submission-recovery-command"
+import { confirmTailoredResumeSourceWrite } from "./confirm-tailored-resume"
 import {
   applicationPayload, canonicalApprovalResponse, legacyApprovalErrorResponse, resumeTailoringPayload,
   safeEventFields, serializeEvent, type ApprovalAction, type ConfirmSubmissionNotReceivedAction, type CreateAutomationAction, type RetryApplicationFillAction,
@@ -172,16 +173,10 @@ export async function handleApprovedResumeTailoring(sessionId: string, userId: s
 export async function handleConfirmedTailoredResume(sessionId: string, userId: string, approval: ScopedApproval) {
   const payload = resumeTailoringPayload(approval.payload)
   if (!payload) return err("Final resume approval is missing its job or resume.", 400)
-  const resume = await db.resume.findFirst({ where: { id: payload.resumeId, userId, targetJobId: payload.jobId }, select: { id: true, name: true } })
-  const job = await db.job.findFirst({ where: { id: payload.jobId, userId }, select: { id: true, company: true, role: true, url: true, status: true } })
-  if (!resume || !job) return err("The tailored resume or job is no longer available.", 404)
-  if (job.status === "applied") return err("This job has already been submitted.", 409)
-  await db.job.update({ where: { id: job.id }, data: {
-    finalResumeId: resume.id, status: "saved", workflowState: "ready_to_apply",
-    analysisNote: job.url
-      ? "[Application ready] Open the employer form, use the ApplyMate extension to fill it, then review and submit it yourself."
-      : "[Application ready] Missing application URL.",
-  } })
+  const result = await db.$transaction(tx => confirmTailoredResumeSourceWrite(tx, userId, payload))
+  if (result.kind === "missing") return err("The tailored resume or job is no longer available.", 404)
+  if (result.kind === "already_submitted") return err("This job has already been submitted.", 409)
+  const { job, resume } = result
   const event = await db.agentTranscriptEvent.create({
     data: {
       sessionId, taskId: null, type: "resume_finalized", speaker: "Reviewer", title: "Application pack ready", durationMs: null,

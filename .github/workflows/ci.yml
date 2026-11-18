@@ -1375,6 +1375,48 @@ jobs:
         env:
           AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
         run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/turns/recovery-scanner-lock-order-pg.integration.test.ts
+  confirm-tailored-resume-postgres:
+    name: Confirmed tailored-resume source fence PostgreSQL integration
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: applymate_confirm_tailored_resume_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d applymate_confirm_tailored_resume_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      CI: "true"
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_confirm_tailored_resume_ci
+      CONFIRM_TAILORED_RESUME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_confirm_tailored_resume_ci
+      CONFIRM_TAILORED_RESUME_PG_TEST_DISPOSABLE: "true"
+      CONFIRM_TAILORED_RESUME_PG_TEST_REQUIRED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - name: Build shared workspace packages for the source-fence helper
+        run: pnpm --filter @jobcopilot/shared... build
+      - name: Guard the dedicated fresh disposable PostgreSQL database
+        run: |
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_confirm_tailored_resume_ci"
+          test "$CONFIRM_TAILORED_RESUME_PG_TEST_URL" = "$DATABASE_URL"
+          test "$CONFIRM_TAILORED_RESUME_PG_TEST_DISPOSABLE" = "true"
+          test "$CONFIRM_TAILORED_RESUME_PG_TEST_REQUIRED" = "true"
+      - name: Generate Prisma Client for the current schema
+        run: pnpm --filter @jobcopilot/web exec prisma generate
+      - name: Verify confirmation fence commit and rollback ordering on disposable PostgreSQL
+        run: pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism src/lib/agent/session-actions/confirm-tailored-resume.pg.integration.test.ts
   custom-agent-role-migration-postgres:
     name: CustomAgentRole migration PostgreSQL integration
     runs-on: ubuntu-latest
