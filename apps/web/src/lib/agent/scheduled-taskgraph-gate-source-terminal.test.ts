@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint"
 import { createAnalyzeSourceChangedErrorWithClaims, AnalyzeSourceChangedError } from "./stages/analyze-model-input"
 import { isScheduledTaskGraphSourceChangeTerminal } from "./scheduled-taskgraph-source-change-terminal"
+import { createScheduledTaskGraphGateMaterialDriftError } from "./scheduled-taskgraph-gate-material-drift"
 import { AgentExecutionCancelledError } from "./execution-control"
 import { respondToScheduledTaskGraphGateActionFailure, respondToScheduledTaskGraphGateSourceChange, respondToScheduledTaskGraphGateSourceFailure,
   terminalizeScheduledTaskGraphGateSourceChange } from "./scheduled-taskgraph-gate-source-terminal"
@@ -10,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   transaction: vi.fn(), queryRaw: vi.fn(), updateExecution: vi.fn(), updateTasks: vi.fn(), acquireFence: vi.fn(),
   assertSources: vi.fn(), turnCurrent: vi.fn(), rootAction: vi.fn(), rootWaitMatches: vi.fn(), gateLeaseCurrent: vi.fn(),
   gateProofCurrent: vi.fn(), prepareWaitId: vi.fn(), validateAuditPrepare: vi.fn(), validatePrepare: vi.fn(), gateHistory: vi.fn(),
+  inspectGateInput: vi.fn(), persistMaterial: vi.fn(),
   sameOwner: (left: unknown, right: Record<string, unknown>) => Boolean(left && typeof left === "object"
     && ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "turnLeaseOwnerId", "turnLeaseVersion", "executionId", "executionAttemptCount"]
       .every(key => (left as Record<string, unknown>)[key] === right[key])),
@@ -33,7 +35,35 @@ vi.mock("./scheduled-taskgraph-pipeline-checkpoint", () => ({
   scheduledTaskGraphContinuationKey: () => `scheduled-taskgraph:v2:sha256:${"a".repeat(64)}`,
 }))
 vi.mock("./scheduled-automation-snapshot", () => ({ parseScheduledAutomationSnapshot: (value: unknown) => value }))
-vi.mock("./scheduled-taskgraph-gate-input", () => ({ isScheduledTaskGraphGateProofCurrent: (...args: unknown[]) => mocks.gateProofCurrent(...args) }))
+vi.mock("./scheduled-taskgraph-gate-input", () => ({ isScheduledTaskGraphGateProofCurrent: (...args: unknown[]) => mocks.gateProofCurrent(...args),
+  inspectScheduledTaskGraphGateInput: (...args: unknown[]) => mocks.inspectGateInput(...args) }))
+vi.mock("./scheduled-taskgraph-gate-material-drift", () => ({
+  createScheduledTaskGraphGateMaterialDriftError: (input: Record<string, unknown>) => {
+    const evidence = input.evidence as Record<string, unknown>
+    const error = new Error("scheduled_prepare_material_source_changed") as Error & { proof?: Record<string, unknown> }
+    error.name = "ScheduledPrepareMaterialDriftError"
+    error.proof = { owner: input.owner, gate: input.gate, snapshotDigest: input.snapshotDigest,
+      artifactDigest: evidence.artifactDigest, currentMaterialDigest: evidence.currentMaterialDigest,
+      proofDigest: `${evidence.artifactDigest}:${evidence.currentMaterialDigest}` }
+    return error
+  },
+  readScheduledTaskGraphGateMaterialDriftProof: (error: unknown) => error instanceof Error
+    ? (error as Error & { proof?: Record<string, unknown> }).proof ?? null : null,
+  scheduledTaskGraphGateMaterialDriftProofMatches: (expected: Record<string, unknown>, current: Record<string, unknown>) =>
+    expected.proofDigest === current.proofDigest && JSON.stringify(expected.owner) === JSON.stringify(current.owner)
+      && JSON.stringify(expected.gate) === JSON.stringify(current.gate),
+  isScheduledTaskGraphGateMaterialDriftTerminal: () => false,
+  persistScheduledTaskGraphGateMaterialDriftTerminal: async (input: Record<string, unknown>) => {
+    mocks.persistMaterial(input)
+    const owner = input.owner as Record<string, unknown>, state = input.expectedState as Record<string, unknown>
+    const saved = await mocks.updateExecution({ where: { id: input.executionId, userId: owner.userId, sessionId: owner.sessionId,
+      status: "running", attemptCount: input.executionAttemptCount, state: { equals: state } },
+      data: { status: "failed", error: "scheduled_prepare_material_source_changed", state: { ...state,
+        scheduledTaskGraphMaterialDriftTerminal: { reason: "scheduled_prepare_material_source_changed", gate: input.gate,
+          owner, artifactDigest: (input.proof as Record<string, unknown>).artifactDigest } } } })
+    return saved.count === 1 ? "terminalized" : "state_changed"
+  },
+}))
 vi.mock("./scheduled-taskgraph-audit-action", () => ({
   scheduledTaskGraphPrepareWaitId: (...args: unknown[]) => mocks.prepareWaitId(...args),
   validateScheduledTaskGraphAuditPrepareSource: (...args: unknown[]) => mocks.validateAuditPrepare(...args),
@@ -139,7 +169,8 @@ describe("scheduled TaskGraph Gate source-change terminalization", () => {
   beforeEach(() => {
     [mocks.transaction, mocks.queryRaw, mocks.updateExecution, mocks.updateTasks, mocks.acquireFence, mocks.assertSources,
       mocks.turnCurrent, mocks.rootAction, mocks.rootWaitMatches, mocks.gateLeaseCurrent, mocks.gateProofCurrent,
-      mocks.prepareWaitId, mocks.validateAuditPrepare, mocks.validatePrepare, mocks.gateHistory].forEach(mock => mock.mockReset())
+      mocks.prepareWaitId, mocks.validateAuditPrepare, mocks.validatePrepare, mocks.gateHistory, mocks.inspectGateInput,
+      mocks.persistMaterial].forEach(mock => mock.mockReset())
     setup()
   })
 
@@ -175,6 +206,21 @@ describe("scheduled TaskGraph Gate source-change terminalization", () => {
     mocks.rootWaitMatches.mockReturnValue(false)
     await expect(terminalizeScheduledTaskGraphGateSourceChange(request())).resolves.toBe("owner_changed")
     expect(mocks.updateExecution).not.toHaveBeenCalled()
+
+    const evidence = { artifactDigest: `sha256:${"e".repeat(64)}`, currentMaterialDigest: `sha256:${"f".repeat(64)}` }
+    const materialError = createScheduledTaskGraphGateMaterialDriftError({ owner, gate: request().gate,
+      snapshotDigest: digest, analyzeCheckpoint: checkpoint(), prepareProof: request().prepareProof, evidence })
+    setup()
+    mocks.gateLeaseCurrent.mockReturnValue(false)
+    await expect(terminalizeScheduledTaskGraphGateSourceChange(request({ sourceChangeError: materialError })))
+      .resolves.toBe("gate_task_changed")
+    expect(mocks.persistMaterial).not.toHaveBeenCalled()
+
+    setup()
+    mocks.rootWaitMatches.mockReturnValue(false)
+    await expect(terminalizeScheduledTaskGraphGateSourceChange(request({ sourceChangeError: materialError })))
+      .resolves.toBe("owner_changed")
+    expect(mocks.persistMaterial).not.toHaveBeenCalled()
   })
 
   it("refuses missing server-only claims and returns retryable when sources are current again", async () => {
@@ -196,6 +242,72 @@ describe("scheduled TaskGraph Gate source-change terminalization", () => {
     setup()
     mocks.updateExecution.mockResolvedValue({ count: 0 })
     await expect(terminalizeScheduledTaskGraphGateSourceChange(request())).resolves.toBe("state_changed")
+    expect(mocks.updateTasks).not.toHaveBeenCalled()
+  })
+
+  it("terminalizes only a re-confirmed material-only drift after Analyze remains current", async () => {
+    const state = checkpoint(), gate = { taskId: "gate-1", leaseOwnerId: "gate-worker", attemptCount: 2 }
+    const evidence = { artifactDigest: `sha256:${"e".repeat(64)}`, currentMaterialDigest: `sha256:${"f".repeat(64)}` }
+    const error = new Error("scheduled_prepare_material_source_changed") as Error & { proof?: Record<string, unknown> }
+    error.name = "ScheduledPrepareMaterialDriftError"
+    error.proof = { owner, gate, snapshotDigest: digest, ...evidence, proofDigest: `${evidence.artifactDigest}:${evidence.currentMaterialDigest}` }
+    setup(state)
+    mocks.assertSources.mockResolvedValue(undefined)
+    mocks.inspectGateInput.mockImplementation(async () => { mocks.order.push("material_recheck"); return { kind: "material_source_drift", evidence } })
+    await expect(terminalizeScheduledTaskGraphGateSourceChange(request({ sourceChangeError: error }))).resolves.toBe("terminalized")
+    expect(mocks.order).toEqual(["source_fence", "agent_sessions", "agent_turns", "root_wait", "sub_agent_tasks", "agent_executions", "source_check", "material_recheck"])
+    expect(mocks.inspectGateInput).toHaveBeenCalledWith(expect.objectContaining({ owner, gate: expect.objectContaining({ taskId: gate.taskId }) }), expect.anything())
+    expect(mocks.persistMaterial).toHaveBeenCalledOnce()
+    expect(mocks.updateTasks).not.toHaveBeenCalled()
+
+    setup(state)
+    mocks.inspectGateInput.mockClear()
+    mocks.persistMaterial.mockClear()
+    mocks.assertSources.mockRejectedValue(new AnalyzeSourceChangedError())
+    await expect(terminalizeScheduledTaskGraphGateSourceChange(request({ sourceChangeError: error }))).resolves.toBe("source_current")
+    expect(mocks.inspectGateInput).not.toHaveBeenCalled()
+    expect(mocks.persistMaterial).not.toHaveBeenCalled()
+  })
+
+  it("does not terminalize material drift if the source was restored or the material proof changed", async () => {
+    const state = checkpoint(), evidence = { artifactDigest: `sha256:${"e".repeat(64)}`, currentMaterialDigest: `sha256:${"f".repeat(64)}` }
+    const error = new Error("scheduled_prepare_material_source_changed") as Error & { proof?: Record<string, unknown> }
+    error.name = "ScheduledPrepareMaterialDriftError"
+    error.proof = { owner, gate: request().gate, snapshotDigest: digest, ...evidence, proofDigest: `${evidence.artifactDigest}:${evidence.currentMaterialDigest}` }
+    setup(state)
+    mocks.assertSources.mockResolvedValue(undefined)
+    mocks.inspectGateInput.mockResolvedValue({ kind: "valid", input: {} })
+    await expect(terminalizeScheduledTaskGraphGateSourceChange(request({ sourceChangeError: error }))).resolves.toBe("source_current")
+    expect(mocks.updateExecution).not.toHaveBeenCalled()
+
+    setup(state)
+    mocks.assertSources.mockResolvedValue(undefined)
+    mocks.inspectGateInput.mockResolvedValue({ kind: "material_source_drift", evidence: { ...evidence,
+      currentMaterialDigest: `sha256:${"9".repeat(64)}` } })
+    await expect(terminalizeScheduledTaskGraphGateSourceChange(request({ sourceChangeError: error }))).resolves.toBe("not_confirmed")
+    expect(mocks.updateExecution).not.toHaveBeenCalled()
+  })
+
+  it("does not accept a caller-created material error without the opaque server proof", async () => {
+    const unbranded = new Error("scheduled_prepare_material_source_changed")
+    await expect(terminalizeScheduledTaskGraphGateSourceChange(request({ sourceChangeError: unbranded })))
+      .resolves.toBe("not_confirmed")
+    expect(mocks.transaction).not.toHaveBeenCalled()
+  })
+
+  it("maps a committed material drift to the fixed public reason without exposing proof details", async () => {
+    const state = checkpoint(), evidence = { artifactDigest: `sha256:${"e".repeat(64)}`, currentMaterialDigest: `sha256:${"f".repeat(64)}` }
+    const error = createScheduledTaskGraphGateMaterialDriftError({ owner, gate: request().gate, snapshotDigest: digest,
+      analyzeCheckpoint: state, prepareProof: request().prepareProof, evidence })
+    setup(state)
+    mocks.assertSources.mockResolvedValue(undefined)
+    mocks.inspectGateInput.mockResolvedValue({ kind: "material_source_drift", evidence })
+    const response = await respondToScheduledTaskGraphGateActionFailure({ error, request: { attestation: {}, prepareProof: {},
+      gateTaskId: "gate-1", gateLeaseOwnerId: "gate-worker", gateAttemptCount: 2 },
+      locked: { owner, key, claimToken, snapshot: {} }, phase: "owner_assertion" })
+    expect(response.status).toBe(409)
+    expect(await response.json()).toEqual({ status: "blocked", errorCode: "scheduled_prepare_material_source_changed" })
+    expect(mocks.persistMaterial).toHaveBeenCalledOnce()
     expect(mocks.updateTasks).not.toHaveBeenCalled()
   })
 

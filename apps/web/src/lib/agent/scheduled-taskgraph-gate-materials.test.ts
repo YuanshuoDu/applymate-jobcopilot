@@ -8,7 +8,7 @@ vi.mock('@/lib/db', () => ({ db: {
   personaFact: { findMany: mocks.facts }, agentArtifactVersion: { findMany: mocks.versions }, agentArtifact: { findMany: mocks.heads },
 } }))
 
-import { loadScheduledTaskGraphGateMaterials } from './scheduled-taskgraph-gate-materials'
+import { inspectScheduledTaskGraphGateMaterials, loadScheduledTaskGraphGateMaterials } from './scheduled-taskgraph-gate-materials'
 
 const owner: ScheduledTaskGraphPipelineOwner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1',
   rootAttemptCount: 1, turnLeaseOwnerId: 'lease-1', turnLeaseVersion: 1, executionId: 'execution-1', executionAttemptCount: 0 }
@@ -76,7 +76,7 @@ function installCoverLetterRows(markerOverrides: Record<string, unknown> = {}) {
 }
 
 describe('scheduled TaskGraph Gate materials', () => {
-  beforeEach(() => { for (const mock of Object.values(mocks)) mock.mockReset() })
+beforeEach(() => { for (const mock of Object.values(mocks)) mock.mockReset(); resume.name = 'Base resume' })
 
   it('returns an empty package set without querying material sources when no jobs qualify', async () => {
     await expect(loadScheduledTaskGraphGateMaterials({ owner, scoredJobs, minScore: 90, dailyCap: 5,
@@ -178,5 +178,32 @@ describe('scheduled TaskGraph Gate materials', () => {
     await expect(loadScheduledTaskGraphGateMaterials({ owner, scoredJobs, minScore: 70, dailyCap: 5, taskId: 'prepare-1',
       jobs: [{ jobId: 'job-1', status: 'prepared' }], materials: [{ jobId: 'job-1', kind: 'resume', artifactRef }] }))
       .resolves.toBeNull()
+  })
+
+  it('classifies metadata-only material drift after exact artifact, version, head and reference checks', async () => {
+    const refs = ['job:job-1', 'resume:resume-1']
+    const { artifactRef } = installGateRows(refs)
+    resume.name = 'Updated base resume metadata'
+
+    const result = await inspectScheduledTaskGraphGateMaterials({ owner, scoredJobs, minScore: 70, dailyCap: 5,
+      taskId: 'prepare-1', jobs: [{ jobId: 'job-1', status: 'prepared' }],
+      materials: [{ jobId: 'job-1', kind: 'resume', artifactRef }] })
+
+    expect(result).toMatchObject({ kind: 'material_source_drift', evidence: {
+      artifactDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      currentMaterialDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+    } })
+    expect(JSON.stringify(result)).not.toContain('Updated base resume metadata')
+  })
+
+  it('keeps malformed artifact evidence generic when current material also changed', async () => {
+    const refs = ['job:job-1', 'resume:resume-1']
+    const { artifactRef, head } = installGateRows(refs)
+    resume.name = 'Updated base resume metadata'
+    head.hash = `sha256:${'f'.repeat(64)}`
+
+    await expect(inspectScheduledTaskGraphGateMaterials({ owner, scoredJobs, minScore: 70, dailyCap: 5,
+      taskId: 'prepare-1', jobs: [{ jobId: 'job-1', status: 'prepared' }],
+      materials: [{ jobId: 'job-1', kind: 'resume', artifactRef }] })).resolves.toBeNull()
   })
 })
