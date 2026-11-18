@@ -9,7 +9,7 @@ import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import { taskGraphItemId, taskGraphLifecycleKey, taskGraphWaitLifecycleKey } from "./task-graph-snapshot.js"
 import { loadChildAttemptResume } from "./child-resume.js"
 // @ts-expect-error The fixture-only JavaScript module has no declaration; Worker Vitest resolves this import at runtime.
-import { isSafeParentCurrentReadsDiagnostic, isSafeParentResumeDiagnostic, parentResumeFixtureErrorClass } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
+import { classifyWaitTaskAliases, isSafeParentCurrentReadsDiagnostic, isSafeParentResumeDiagnostic, parentResumeFixtureErrorClass } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 import { waitResolverErrorCodesFromOutput } from "./nested-scout-wait-resolver-diagnostic.js"
 import type { SubagentLease } from "./types.js"
 
@@ -252,8 +252,10 @@ function readWaitInputPredicateDiagnostic(output: readonly string[]) {
   if (payload.available === "no" && Object.keys(payload).sort().join("|") === "available|reason"
     && payload.reason === "bounded_input_unavailable") return { available: false }
   const expectedKeys = ["available", "expectedTaskCount", "latestKeyShape", "latestKeysMatch", "latestMode", "latestResultCount",
-    "latestTaskCount", "latestTaskIdsArray", "latestTaskIdsMatch", "latestTimeout", "priorExactWaitCount", "waitCallCount"]
-  const boolKeys = ["latestKeyShape", "latestKeysMatch", "latestTaskIdsArray", "latestTaskIdsMatch"]
+    "latestTaskCount", "latestTaskIdsArray", "latestTaskIdsMatch", "latestTaskIdsSetMatches", "latestTaskIdsContainsExpectedAlpha",
+    "latestTaskIdsContainsExpectedBeta", "latestTimeout", "priorExactWaitCount", "waitCallCount"]
+  const boolKeys = ["latestKeyShape", "latestKeysMatch", "latestTaskIdsArray", "latestTaskIdsMatch", "latestTaskIdsSetMatches",
+    "latestTaskIdsContainsExpectedAlpha", "latestTaskIdsContainsExpectedBeta"]
   const safeCount = (value: unknown) => ["zero", "one", "two", "two_plus", "three_plus"].includes(String(value))
   if (payload.available !== "yes" || Object.keys(payload).sort().join("|") !== expectedKeys.sort().join("|")
     || boolKeys.some(key => typeof payload[key] !== "boolean")
@@ -447,9 +449,11 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       tier: depth === 1 ? "parent_scout" : depth === 2 ? "depth_two_scout" : "other_scout", status, failureCode,
       structuredFailureCategory, executorResultStatus, attemptCountMax, nextAttemptAtPresent, count,
     }))
-    const [acknowledgement, sourceEventChain, parentResumeProgress, pendingChildWait, waitCallLineage, consumedWaitPredicateMatrix] = await Promise.all([
+    const [acknowledgement, sourceEventChain, parentResumeProgress, pendingChildWait, waitCallLineage, consumedWaitPredicateMatrix,
+      waitTaskAliasDiagnostic] = await Promise.all([
       readWaitAcknowledgementDiagnostic(ids), readSourceEventChainDiagnostic(ids), readParentResumeProgressDiagnostic(ids),
       readPendingChildWaitDiagnostic(ids), readWaitCallLineageDiagnostic(ids), readConsumedWaitPredicateMatrix(ids),
+      readWaitTaskAliasDiagnostic(ids),
     ])
     const recoveryOrdering = await readNestedScoutRecoveryDiagnostic(ids)
     return {
@@ -469,6 +473,7 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       pendingChildWait,
       waitCallLineage,
       consumedWaitPredicateMatrix,
+      waitTaskAliasDiagnostic,
       recoveryOrdering,
     }
   } catch {
@@ -1196,6 +1201,80 @@ async function readWaitAcknowledgementDiagnostic(ids: FixtureIds) {
       && Number.isFinite(waitDeadlineMs) && receiptDeadlineMs === waitDeadlineMs }
   } catch {
     return { available: false }
+  }
+}
+
+async function readWaitTaskAliasDiagnostic(ids: FixtureIds) {
+  const unavailable = { available: false }
+  const countBucket = (value: number) => value === 0 ? "zero" : value === 1 ? "one" : value === 2 ? "two" : "three_plus"
+  const taskIds = (value: unknown): string[] | null => Array.isArray(value) && value.length <= 8
+    && value.every(id => typeof id === "string" && id.length > 0 && id.length <= 256)
+    && new Set(value).size === value.length ? value as string[] : null
+  try {
+    const parents = await progressQuery<{ id: string; rootTaskId: string; attemptCount: number }>(`SELECT task."id", task."rootTaskId", task."attemptCount"
+      FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $1
+      WHERE task."sessionId" = $2 AND task."turnId" = $3 AND task."depth" = 1 AND task."role" = 'scout'
+        AND task."taskType" = 'job_discovery' AND task."parentTaskId" = task."rootTaskId"
+      ORDER BY task."createdAt", task."id" LIMIT 2`, [ids.userId, ids.sessionId, ids.turnId])
+    if (parents.rows.length !== 1) return unavailable
+    const parent = parents.rows[0]!
+    const waits = await progressQuery<{ sourceAttempt: number; targetTaskIds: unknown }>(`SELECT source."attempt" AS "sourceAttempt", wait."targetTaskIds"
+      FROM "agent_wait_conditions" AS wait JOIN "agent_steps" AS source ON source."id" = wait."stepId"
+        AND source."sessionId" = wait."sessionId" AND source."turnId" = wait."turnId" AND source."taskId" = wait."parentTaskId"
+      WHERE wait."parentTaskId" = $1 AND wait."sessionId" = $2 AND wait."turnId" = $3 AND wait."userId" = $4
+        AND wait."status" IN ('ready', 'timed_out') AND wait."suspendedAt" IS NOT NULL AND wait."consumedAt" IS NOT NULL
+        AND source."attempt" <= $5
+      ORDER BY source."attempt" DESC, source."ordinal" DESC, wait."createdAt" DESC, wait."id" DESC LIMIT 1`,
+    [parent.id, ids.sessionId, ids.turnId, ids.userId, parent.attemptCount])
+    const wait = waits.rows[0]
+    const observedTaskIds = taskIds(wait?.targetTaskIds)
+    if (!wait || !observedTaskIds || !Number.isSafeInteger(wait.sourceAttempt) || wait.sourceAttempt < 1) return unavailable
+    const [children, receipts] = await Promise.all([
+      progressQuery<{ taskId: string; taskAlias: string }>(`SELECT child."id" AS "taskId",
+          CASE WHEN child."goal" LIKE '%Alpha%' THEN 'alpha' WHEN child."goal" LIKE '%Beta%' THEN 'beta' ELSE 'other' END AS "taskAlias"
+        FROM "sub_agent_tasks" AS child JOIN "agent_sessions" AS session ON session."id" = child."sessionId" AND session."userId" = $1
+        WHERE child."parentTaskId" = $2 AND child."sessionId" = $3 AND child."turnId" = $4 AND child."rootTaskId" = $5
+          AND child."depth" = 2 AND child."role" = 'scout' AND child."taskType" = 'job_discovery'
+        ORDER BY child."createdAt", child."id" LIMIT 4`, [ids.userId, parent.id, ids.sessionId, ids.turnId, parent.rootTaskId]),
+      progressQuery<{ delegateAlias: string; taskId: string }>(`SELECT CASE call."content"->'input'->>'goal'
+            WHEN 'Read the Fixture Alpha role' THEN 'alpha' ELSE 'beta' END AS "delegateAlias",
+          result."content"->'output'->>'taskId' AS "taskId"
+        FROM "agent_items" AS call JOIN "agent_steps" AS step ON step."id" = call."stepId"
+          AND step."sessionId" = call."sessionId" AND step."turnId" = call."turnId" AND step."taskId" = call."taskId"
+        JOIN "agent_items" AS result ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
+          AND result."taskId" = call."taskId" AND result."stepId" = call."stepId" AND result."type" = 'tool_result'
+          AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
+        WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3 AND step."attempt" = $4
+          AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'scout.delegate'
+          AND call."content"->'input'->>'goal' IN ('Read the Fixture Alpha role', 'Read the Fixture Beta role')
+          AND call."status" = 'completed' AND result."status" = 'completed'
+          AND jsonb_typeof(result."content"->'output') = 'object'
+          AND jsonb_typeof(result."content"->'output'->'taskId') = 'string'
+        ORDER BY "delegateAlias", step."ordinal" DESC, call."createdAt" DESC, call."id" DESC LIMIT 6`,
+      [ids.sessionId, ids.turnId, parent.id, wait.sourceAttempt]),
+    ])
+    if (children.rows.length > 3 || receipts.rows.length > 5) return unavailable
+    const currentChildren = children.rows.map(row => ({ taskId: row.taskId, alias: row.taskAlias }))
+    const alphaReceipts = receipts.rows.filter(row => row.delegateAlias === "alpha")
+    const betaReceipts = receipts.rows.filter(row => row.delegateAlias === "beta")
+    const classification = classifyWaitTaskAliases({
+      alpha: alphaReceipts.length === 1 ? alphaReceipts[0]!.taskId : undefined,
+      beta: betaReceipts.length === 1 ? betaReceipts[0]!.taskId : undefined,
+    }, observedTaskIds, currentChildren)
+    if (!classification.available) return unavailable
+    const sourceAttemptClass = wait.sourceAttempt === 1 ? "first" : wait.sourceAttempt === 2 ? "second" : "other"
+    return {
+      available: true, sourceAttemptClass,
+      alphaDelegateReceiptCount: countBucket(alphaReceipts.length), betaDelegateReceiptCount: countBucket(betaReceipts.length),
+      expectedAlphaCurrentChildAlias: alphaReceipts.length > 1 ? "ambiguous" : classification.expectedAlphaCurrentChildAlias,
+      expectedBetaCurrentChildAlias: betaReceipts.length > 1 ? "ambiguous" : classification.expectedBetaCurrentChildAlias,
+      observedTargetAliases: classification.observedTargetAliases,
+      observedTargetsContainCurrentAlpha: classification.observedTargetsContainCurrentAlpha,
+      observedTargetsContainCurrentBeta: classification.observedTargetsContainCurrentBeta,
+      unmatchedObservedCount: classification.unmatchedObservedCount,
+    }
+  } catch {
+    return unavailable
   }
 }
 

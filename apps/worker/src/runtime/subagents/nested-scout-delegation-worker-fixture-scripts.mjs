@@ -4,6 +4,57 @@ import { PgSubagentTaskStore } from "./pg-store.ts"
 import { findExactToolResult, findUniqueWaitInput } from "./nested-scout-fixture-tool-pairs.mjs"
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null }
+const MAX_DIAGNOSTIC_TASK_IDS = 8
+const MAX_DIAGNOSTIC_TASK_ID_LENGTH = 256
+export function compareWaitTaskIds(expectedTaskIds, actualTaskIds, expectedByAlias) {
+  const boundedStrings = value => Array.isArray(value) && value.length <= MAX_DIAGNOSTIC_TASK_IDS
+    && value.every(id => typeof id === "string" && id.length > 0 && id.length <= MAX_DIAGNOSTIC_TASK_ID_LENGTH)
+  const validSet = value => boundedStrings(value) && new Set(value).size === value.length
+  const roleIds = object(expectedByAlias)
+  const actualContains = id => boundedStrings(actualTaskIds) && typeof id === "string"
+    && id.length > 0 && id.length <= MAX_DIAGNOSTIC_TASK_ID_LENGTH && actualTaskIds.includes(id)
+  if (!validSet(expectedTaskIds) || !validSet(actualTaskIds) || expectedTaskIds.length !== actualTaskIds.length) {
+    return { orderedMatch: false, setMatches: false,
+      containsExpectedAlpha: actualContains(roleIds?.alpha), containsExpectedBeta: actualContains(roleIds?.beta) }
+  }
+  const expectedSet = new Set(expectedTaskIds)
+  return {
+    orderedMatch: expectedTaskIds.every((id, index) => id === actualTaskIds[index]),
+    setMatches: actualTaskIds.every(id => expectedSet.has(id)),
+    containsExpectedAlpha: actualContains(roleIds?.alpha),
+    containsExpectedBeta: actualContains(roleIds?.beta),
+  }
+}
+export function classifyWaitTaskAliases(expectedByAlias, observedTaskIds, currentChildren) {
+  const countBucket = value => value === 0 ? "zero" : value === 1 ? "one" : value === 2 ? "two" : "three_plus"
+  const roles = object(expectedByAlias), validTaskId = value => typeof value === "string"
+    && value.length > 0 && value.length <= MAX_DIAGNOSTIC_TASK_ID_LENGTH
+  const validObserved = Array.isArray(observedTaskIds) && observedTaskIds.length <= MAX_DIAGNOSTIC_TASK_IDS
+    && observedTaskIds.every(validTaskId) && new Set(observedTaskIds).size === observedTaskIds.length
+  const validChildren = Array.isArray(currentChildren) && currentChildren.length <= 3
+    && currentChildren.every(child => object(child) && validTaskId(child.taskId) && ["alpha", "beta", "other"].includes(child.alias))
+    && new Set(currentChildren.map(child => child.taskId)).size === currentChildren.length
+  if (!validObserved || !validChildren) return { available: false }
+  const classify = taskId => {
+    if (!validTaskId(taskId)) return "unavailable"
+    const matches = currentChildren.filter(child => child.taskId === taskId)
+    if (matches.length === 0) return "unmatched"
+    if (matches.length > 1) return "ambiguous"
+    return matches[0].alias
+  }
+  const observedAliases = observedTaskIds.map(classify)
+  return {
+    available: true,
+    expectedAlphaCurrentChildAlias: classify(roles?.alpha),
+    expectedBetaCurrentChildAlias: classify(roles?.beta),
+    observedContainsExpectedAlpha: validTaskId(roles?.alpha) && observedTaskIds.includes(roles.alpha),
+    observedContainsExpectedBeta: validTaskId(roles?.beta) && observedTaskIds.includes(roles.beta),
+    observedTargetAliases: observedAliases,
+    observedTargetsContainCurrentAlpha: observedAliases.includes("alpha"),
+    observedTargetsContainCurrentBeta: observedAliases.includes("beta"),
+    unmatchedObservedCount: countBucket(observedAliases.filter(alias => alias === "unmatched").length),
+  }
+}
 const SAFE_PARENT_RESUME_ERROR_CODES = new Set("invalid_output model_execution_failed tool_execution_failed turn_execution_failed persistence_conflict step_limit budget_exhausted no_progress".split(" "))
 const SAFE_PARENT_RESUME_FIXTURE_ERROR_CLASSES = new Map([
   ["p1143_parent_job_read_failed", "parent_job_read_failed"], ["p1143_parent_current_reads_missing", "parent_current_reads_missing"],
@@ -65,10 +116,13 @@ function hasTerminalWaitOutcome(waitOutput, expectedTaskIds) {
 }
 function boundedWaitCount(value) { return value === 0 ? "zero" : value === 1 ? "one" : value === 2 ? "two" : "three_plus" }
 function boundedMultipleCount(value) { return value === 0 ? "zero" : value === 1 ? "one" : "two_plus" }
-function waitInputPredicateDiagnostic(request, expectedTaskIds) {
+function waitInputPredicateDiagnostic(request, expectedTaskIds, expectedByAlias) {
   try {
     const messages = object(request)?.messages
-    if (!Array.isArray(messages) || messages.length > 2_048 || !Array.isArray(expectedTaskIds) || expectedTaskIds.length > 8) {
+    if (!Array.isArray(messages) || messages.length > 2_048
+      || !Array.isArray(expectedTaskIds) || expectedTaskIds.length > MAX_DIAGNOSTIC_TASK_IDS
+      || !expectedTaskIds.every(id => typeof id === "string" && id.length > 0 && id.length <= MAX_DIAGNOSTIC_TASK_ID_LENGTH)
+      || new Set(expectedTaskIds).size !== expectedTaskIds.length) {
       return { available: "no", reason: "bounded_input_unavailable" }
     }
     const uses = []
@@ -93,14 +147,16 @@ function waitInputPredicateDiagnostic(request, expectedTaskIds) {
     if (!latestEntry) return {
       available: "yes", waitCallCount: "zero", expectedTaskCount: boundedWaitCount(expected.length),
       latestKeysMatch: false, latestKeyShape: false, latestMode: "absent", latestTimeout: "invalid",
-      latestTaskIdsArray: false, latestTaskCount: "invalid", latestTaskIdsMatch: false,
+      latestTaskIdsArray: false, latestTaskCount: "invalid", latestTaskIdsMatch: false, latestTaskIdsSetMatches: false,
+      latestTaskIdsContainsExpectedAlpha: false, latestTaskIdsContainsExpectedBeta: false,
       priorExactWaitCount: "zero", latestResultCount: "zero",
     }
     const input = object(latestEntry.part.input)
     const timeout = input?.timeoutMs
     const latestTimeout = !Number.isInteger(timeout) ? "invalid" : timeout === 0 ? "zero"
       : timeout < 30_000 ? "under_30s" : timeout === 30_000 ? "exact_30s" : "over_30s"
-    const taskIds = input?.taskIds
+    const taskIds = input?.taskIds, roleIds = object(expectedByAlias)
+    const idComparisons = compareWaitTaskIds(expected, taskIds, roleIds)
     const taskCount = Array.isArray(taskIds) ? boundedWaitCount(taskIds.length) : "invalid"
     let latestResultCount = 0
     for (let index = latestEntry.messageIndex + 1; index < messages.length; index += 1) {
@@ -118,6 +174,9 @@ function waitInputPredicateDiagnostic(request, expectedTaskIds) {
       latestMode: input?.mode === "all" ? "all" : typeof input?.mode === "string" ? "other" : "absent",
       latestTimeout, latestTaskIdsArray: Array.isArray(taskIds), latestTaskCount: taskCount,
       latestTaskIdsMatch: idsMatch(input),
+      latestTaskIdsSetMatches: idComparisons.setMatches,
+      latestTaskIdsContainsExpectedAlpha: idComparisons.containsExpectedAlpha,
+      latestTaskIdsContainsExpectedBeta: idComparisons.containsExpectedBeta,
       priorExactWaitCount: boundedMultipleCount(uses.slice(0, -1).filter(entry => exactInput(entry.part.input)).length),
       latestResultCount: boundedMultipleCount(latestResultCount),
     }
@@ -288,12 +347,14 @@ function childModelRuntime({ task, runtime, markerState }) {
       yield completed(); return
     }
     if (betaResult.isError) throw new Error("p1143_beta_delegate_failed")
-    const delegateResults = [alphaResult.output, betaResult.output], childIds = delegateResults.map(value => object(value)?.taskId).filter(id => typeof id === "string")
+    const delegateResults = [alphaResult.output, betaResult.output]
+    const expectedByAlias = { alpha: object(alphaResult.output)?.taskId, beta: object(betaResult.output)?.taskId }
+    const childIds = delegateResults.map(value => object(value)?.taskId).filter(id => typeof id === "string")
     parentResumeStage = "wait_input_parse"; let waitInput
     try { waitInput = findUniqueWaitInput(request, childIds) }
     catch (error) {
       if (task.depth === 1 && mode === "resume" && parentResumeFixtureErrorClass(error) === "wait_input_invalid") {
-        try { say(`P1143_WAIT_INPUT_PREDICATE_DIAGNOSTIC:${JSON.stringify(waitInputPredicateDiagnostic(request, childIds))}`) } catch {}
+        try { say(`P1143_WAIT_INPUT_PREDICATE_DIAGNOSTIC:${JSON.stringify(waitInputPredicateDiagnostic(request, childIds, expectedByAlias))}`) } catch {}
       }
       throw error
     }

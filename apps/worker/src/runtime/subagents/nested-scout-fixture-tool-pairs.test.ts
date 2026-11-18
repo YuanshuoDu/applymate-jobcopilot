@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 // @ts-expect-error Fixture-only JavaScript module has no declaration; Vitest resolves the import at runtime.
-import { isSafeParentResumeDiagnostic, parentResumeFixtureErrorClass } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
+import { classifyWaitTaskAliases, compareWaitTaskIds, isSafeParentResumeDiagnostic, parentResumeFixtureErrorClass } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 
 type ToolPair = Readonly<{ callId: string; output: unknown; isError: boolean }>
 type PairApi = Readonly<{
@@ -170,5 +170,49 @@ describe("nested Scout parent resume diagnostics", () => {
     expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:p1143_fixture_tool_pair_request_invalid")).toBe(false)
     expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:p1143_fixture_tool_pair_call_invalid")).toBe(false)
     expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:p1143_fixture_wait_input_invalid")).toBe(false)
+  })
+})
+
+describe("nested Scout wait task ID diagnostic", () => {
+  it("distinguishes ordered, reordered, and different bounded task ID sets without returning IDs", () => {
+    const expectedByAlias = { alpha: "task-a", beta: "task-b" }
+    expect(compareWaitTaskIds(["task-a", "task-b"], ["task-a", "task-b"], expectedByAlias))
+      .toEqual({ orderedMatch: true, setMatches: true, containsExpectedAlpha: true, containsExpectedBeta: true })
+    expect(compareWaitTaskIds(["task-a", "task-b"], ["task-b", "task-a"], expectedByAlias))
+      .toEqual({ orderedMatch: false, setMatches: true, containsExpectedAlpha: true, containsExpectedBeta: true })
+    expect(compareWaitTaskIds(["task-a", "task-b"], ["task-a", "task-c"], expectedByAlias))
+      .toEqual({ orderedMatch: false, setMatches: false, containsExpectedAlpha: true, containsExpectedBeta: false })
+  })
+
+  it("fails closed for duplicate, non-string, oversized, or overlong diagnostic inputs", () => {
+    expect(compareWaitTaskIds(["task-a", "task-b"], ["task-a", "task-a"]))
+      .toEqual({ orderedMatch: false, setMatches: false, containsExpectedAlpha: false, containsExpectedBeta: false })
+    expect(compareWaitTaskIds(["task-a", "task-b"], ["task-a", 2]))
+      .toEqual({ orderedMatch: false, setMatches: false, containsExpectedAlpha: false, containsExpectedBeta: false })
+    expect(compareWaitTaskIds(Array.from({ length: 9 }, (_, index) => `task-${index}`), Array.from({ length: 9 }, (_, index) => `task-${index}`)))
+      .toEqual({ orderedMatch: false, setMatches: false, containsExpectedAlpha: false, containsExpectedBeta: false })
+    expect(compareWaitTaskIds(["task-a"], ["x".repeat(257)]))
+      .toEqual({ orderedMatch: false, setMatches: false, containsExpectedAlpha: false, containsExpectedBeta: false })
+  })
+
+  it("maps expected receipts and observed targets to only fixed current-child aliases", () => {
+    expect(classifyWaitTaskAliases({ alpha: "task-a", beta: "task-b" }, ["task-b", "task-a"], [
+      { taskId: "task-a", alias: "alpha" }, { taskId: "task-b", alias: "beta" },
+    ])).toEqual({ available: true, expectedAlphaCurrentChildAlias: "alpha", expectedBetaCurrentChildAlias: "beta",
+      observedContainsExpectedAlpha: true, observedContainsExpectedBeta: true, observedTargetAliases: ["beta", "alpha"],
+      observedTargetsContainCurrentAlpha: true, observedTargetsContainCurrentBeta: true, unmatchedObservedCount: "zero" })
+  })
+
+  it("distinguishes old delegate receipts from current observed child aliases without exposing identifiers", () => {
+    expect(classifyWaitTaskAliases({ alpha: "old-alpha", beta: "old-beta" }, ["current-alpha", "current-beta"], [
+      { taskId: "current-alpha", alias: "alpha" }, { taskId: "current-beta", alias: "beta" },
+    ])).toEqual({ available: true, expectedAlphaCurrentChildAlias: "unmatched", expectedBetaCurrentChildAlias: "unmatched",
+      observedContainsExpectedAlpha: false, observedContainsExpectedBeta: false, observedTargetAliases: ["alpha", "beta"],
+      observedTargetsContainCurrentAlpha: true, observedTargetsContainCurrentBeta: true, unmatchedObservedCount: "zero" })
+
+    expect(classifyWaitTaskAliases({ alpha: "task-a", beta: "task-b" }, ["foreign-a", "foreign-b"], [
+      { taskId: "task-a", alias: "alpha" }, { taskId: "task-b", alias: "beta" },
+    ])).toMatchObject({ observedTargetAliases: ["unmatched", "unmatched"], unmatchedObservedCount: "two",
+      expectedAlphaCurrentChildAlias: "alpha", expectedBetaCurrentChildAlias: "beta" })
   })
 })
