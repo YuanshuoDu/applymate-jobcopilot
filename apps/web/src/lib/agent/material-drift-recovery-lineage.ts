@@ -10,6 +10,7 @@ const LINEAGE_KEYS = ["userId", "sessionId", "automationId", "previousTurnId", "
   "previousGateAttemptCount", "previousRootTaskId", "previousRootAttemptCount", "previousTurnLeaseVersion",
   "previousExecutionAttemptCount", "sourceMarker"] as const
 const RECOVERY_TERMINAL = new Set(["interrupted", "failed", "cancelled"])
+const ACTIVE_RECOVERY = new Set(["in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
 const SOURCE_ROOT_TERMINAL = new Set(["running", "waiting", "waiting_for_user", "failed", "interrupted"])
 const SOURCE_GATE_TERMINAL = new Set(["failed", "interrupted"])
 const MAX_ATTEMPT = 2_147_483_647
@@ -124,6 +125,32 @@ export function validateMaterialDriftRecoveryChain(
     || sourceTurn.leaseVersion !== childIntent.previousTurnLeaseVersion
     || !strictlyEarlier(sourceTurn.createdAt, childTurn.createdAt)) return null
   return { sourceTurn, initialIntent: childIntent, latestIntent }
+}
+
+/** Validates one active current recovery Turn over only terminal predecessors; Run Now keeps the terminal-only validator above. */
+export function validateActiveMaterialDriftRecoveryChain(
+  currentTurn: RecoveryLineageTurn, terminalPredecessors: readonly RecoveryLineageTurn[], sourceTurn: RecoveryLineageTurn,
+  scope: { userId: string; sessionId: string; automationId: string },
+): ValidatedRecoveryChain | null {
+  if (!ACTIVE_RECOVERY.has(currentTurn.status)) return null
+  const currentIntent = parseMaterialDriftRecoveryIntent(record(currentTurn.input)?.materialDriftRecovery, currentTurn, scope)
+  if (!currentIntent) return null
+  if (currentIntent.previousRecoveryTurnId === null) {
+    if (terminalPredecessors.length !== 0 || currentIntent.reservedExecutionAttemptCount !== currentIntent.previousExecutionAttemptCount + 1
+      || sourceTurn.id !== currentIntent.previousTurnId || sourceTurn.userId !== scope.userId || sourceTurn.sessionId !== scope.sessionId
+      || sourceTurn.source !== "automation" || sourceTurn.executionMode !== "canonical_task_graph"
+      || record(sourceTurn.input)?.automationRunMode !== "scheduled" || sourceTurn.status !== "interrupted"
+      || sourceTurn.rootTaskId !== currentIntent.previousRootTaskId || sourceTurn.leaseVersion !== currentIntent.previousTurnLeaseVersion
+      || !strictlyEarlier(sourceTurn.createdAt, currentTurn.createdAt)) return null
+    return { sourceTurn, initialIntent: currentIntent, latestIntent: currentIntent }
+  }
+  const previous = terminalPredecessors[0]
+  const chain = validateMaterialDriftRecoveryChain([...terminalPredecessors, sourceTurn], scope)
+  if (!previous || previous.id !== currentIntent.previousRecoveryTurnId || !chain
+    || !sameLineage(currentIntent, chain.latestIntent)
+    || currentIntent.reservedExecutionAttemptCount !== chain.latestIntent.reservedExecutionAttemptCount + 1
+    || !strictlyEarlier(previous.createdAt, currentTurn.createdAt)) return null
+  return { sourceTurn, initialIntent: chain.initialIntent, latestIntent: currentIntent }
 }
 
 function sameLineage(a: MaterialDriftRecoveryIntent, b: MaterialDriftRecoveryIntent): boolean {

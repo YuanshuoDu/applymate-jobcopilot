@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
-import { parseMaterialDriftRecoveryIntent, validateMaterialDriftRecoveryChain, validateMaterialDriftSourceMarker, type RecoveryLineageTurn } from "./material-drift-recovery-lineage"
+import { parseMaterialDriftRecoveryIntent, validateActiveMaterialDriftRecoveryChain, validateMaterialDriftRecoveryChain,
+  validateMaterialDriftSourceMarker, type RecoveryLineageTurn } from "./material-drift-recovery-lineage"
 import { scheduledAutomationSnapshotDigest } from "./scheduled-taskgraph-pipeline-checkpoint"
 
 const scope = { userId: "user_1", sessionId: "session_1", automationId: "automation_1" }
@@ -46,6 +47,28 @@ describe("material drift recovery lineage", () => {
 
   it("allows each fresh recovery to bind a different current snapshot digest", () => {
     expect(validateMaterialDriftRecoveryChain(validThirdAttempt(), scope)).not.toBeNull()
+  })
+
+  it("validates an active current Turn only over its terminal predecessors", () => {
+    const turns = validThirdAttempt(), active = { ...turns[0]!, status: "in_progress" }
+    expect(validateActiveMaterialDriftRecoveryChain(active, turns.slice(1, 3), turns[3]!, scope))
+      .toMatchObject({ sourceTurn: turns[3], initialIntent: { turnId: "recovery_1" }, latestIntent: { turnId: "recovery_3" } })
+  })
+
+  it("rejects ordinary manual Turns and active recovery markers that diverge from the verified predecessor", () => {
+    const turns = validThirdAttempt(), current = turns[0]!, active = { ...current, status: "waiting_for_dependency" }
+    expect(validateActiveMaterialDriftRecoveryChain({ ...active, input: { automationRunMode: "manual" } }, turns.slice(1, 3), turns[3]!, scope)).toBeNull()
+    const input = active.input as { materialDriftRecovery: Record<string, unknown> }
+    const forged = { ...active, input: { ...active.input as object, materialDriftRecovery: { ...input.materialDriftRecovery,
+      sourceMarker: { ...input.materialDriftRecovery.sourceMarker as object, proofDigest: `sha256:${"f".repeat(64)}` } } } }
+    expect(validateActiveMaterialDriftRecoveryChain(forged, turns.slice(1, 3), turns[3]!, scope)).toBeNull()
+  })
+
+  it("rejects an active recovery whose predecessor is not terminal", () => {
+    const turns = validThirdAttempt(), active = { ...turns[0]!, status: "in_progress" }
+    const nonterminal = { ...turns[1]!, status: "waiting_for_user" }
+    expect(validateActiveMaterialDriftRecoveryChain(active, [nonterminal, turns[2]!], turns[3]!, scope)).toBeNull()
+    expect(validateActiveMaterialDriftRecoveryChain({ ...active, status: "completed" }, turns.slice(1, 3), turns[3]!, scope)).toBeNull()
   })
 
   it("revalidates the immutable source marker against original rows and the latest reserved attempt", () => {
