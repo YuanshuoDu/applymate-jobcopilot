@@ -659,6 +659,21 @@ jobs:
           test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
           pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism \
             src/lib/agent/session/run-recorder-source-material-fence.pg.integration.test.ts
+      - name: Verify Gmail status projection fence on disposable PostgreSQL
+        env:
+          CI: "true"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "$DATABASE_URL"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism \
+            src/lib/gmail-tracking/gmail-status-projection.pg.integration.test.ts
       - name: Verify fair child-wait reconciliation on disposable PostgreSQL
         env:
           CI: "true"
