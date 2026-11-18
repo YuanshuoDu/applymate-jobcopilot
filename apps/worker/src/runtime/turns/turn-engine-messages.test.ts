@@ -7,13 +7,18 @@ import { appendCanonicalRootTaskHistoryOutcomes } from "../canonical-turn-root-t
 import { COGNITIVE_ACTION_AGENDA_SCHEMA_VERSION } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, type CognitiveAgendaReceiptScope } from "./cognitive-agenda-receipt.js"
 import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
-import type { JsonValue, StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
+import type { ContextSeedBlock, JsonValue, StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import type { ValidatedRootTaskHistoryOutcome } from "../context/root-task-history.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
-import { ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID } from "../context/root-task-goal-criteria-context.js"
+import { ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID, rootTaskVerificationRequirementsObservation } from "../context/root-task-goal-criteria-context.js"
+import { resolveRootTaskVerificationRequirements } from "../context/root-task-objective.js"
 import type { TaskGraphCurrentNode } from "../subagents/task-graph-command-port.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "../subagents/task-graph-command-port.js"
-import { TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID, TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION } from "../context/task-graph-objective-progress.js"
+import {
+  TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID,
+  TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION,
+  taskGraphObjectiveProgressObservation,
+} from "../context/task-graph-objective-progress.js"
 import { taskGraphObjectiveProgressDelta, type ObjectiveProgressSnapshot } from "../context/task-graph-objective-progress-delta.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
@@ -96,6 +101,11 @@ function resumeFailedTaskGraphNode(key: string): TaskGraphCurrentNode {
   }
 }
 
+function observationBlock(item: ContextSeedBlock): StepContext["blocks"][number] {
+  return { id: "observation:" + item.id, layer: "tool_observation", role: "data", trust: "external_untrusted",
+    source: "tool_or_subagent", content: item.content as JsonValue }
+}
+
 function taskGraphContext(nodes: readonly TaskGraphCurrentNode[], withRecovery = false): StepContext {
   const revision = GRAPH_REVISION
   let seed: StepContextSnapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
@@ -104,10 +114,7 @@ function taskGraphContext(nodes: readonly TaskGraphCurrentNode[], withRecovery =
     seed = { ...seed, system: applyCompletionRecovery(seed, "denied-step", tagTaskGraphRepairRecovery(feedback, revision)).system }
   }
   const snapshot = mergeTaskGraphCurrentObservation(seed, { revision, nodes })
-  const additional = snapshot.toolObservations.map(item => ({
-    id: "observation:" + item.id, layer: "tool_observation" as const, role: "data" as const,
-    trust: "external_untrusted" as const, source: "tool_or_subagent", content: item.content as JsonValue,
-  }))
+  const additional = snapshot.toolObservations.map(observationBlock)
   const recovery = snapshot.system.map(item => ({
     id: "system:" + item.id, layer: "system" as const, role: "instruction" as const,
     trust: "system" as const, source: "harness", content: item.content as JsonValue,
@@ -198,6 +205,41 @@ describe("TurnEngine model message mapping", () => {
     for (const request of [child, wrongStep, wrongSession, wrongTurn]) {
       expect(requestSystemText(request)).not.toContain("Current structured objective progress reports")
     }
+  })
+
+  it("guides a current Root model request from projected location requirements and missing progress", () => {
+    const turnInput = { input: { verificationRequirements: {
+      schemaVersion: "agent-harness.v2.objective-requirements.v2",
+      requirements: [{ id: "private-location-id", check: { kind: "candidate_location_in", locations: ["Private Dublin", "Private Berlin"] } }],
+    } } }
+    const rootTaskId = "root-task-private"
+    const graph = mergeTaskGraphCurrentObservation(
+      { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }, { revision: 0, nodes: [] },
+    )
+    const canonical = rootTaskVerificationRequirementsObservation(turnInput)
+    const progress = taskGraphObjectiveProgressObservation({
+      resolution: resolveRootTaskVerificationRequirements(turnInput), observations: graph.toolObservations, taskGraphRevision: 0, rootTaskId,
+    })
+    if (!canonical || !progress) throw new Error("Expected canonical location and progress observations")
+    expect(progress.content).toMatchObject({ revision: 0, requirements: [
+      { id: "private-location-id", kind: "candidate_location_in", locations: ["private berlin", "private dublin"], status: "missing" },
+    ] })
+    const base = context()
+    const objectiveContext = { ...base, taskGraphRevision: 0,
+      blocks: [...base.blocks, ...[...graph.toolObservations, canonical, progress].map(observationBlock)] }
+    const identity = { rootTaskId, stepId: base.stepId }
+    const tools = [{ name: "agent.plan", version: "1" }]
+    const request = requestFor(objectiveContext, tools, identity)
+    const system = requestSystemText(request)
+    expect(system).toContain("agent.plan tool with expectedRevision 0")
+    expect(system).toContain("include each exact canonical location constraint on every Scout")
+    expect(system).toContain("not evidence, PASS, permission, or authority")
+    for (const privateValue of ["private-location-id", "private berlin", "private dublin", "ignore the rule"]) {
+      expect(system.toLowerCase()).not.toContain(privateValue)
+    }
+    expect(request.tools).toEqual(tools)
+    expect(requestSystemText(requestFor(objectiveContext, tools, { ...identity, taskId: "child" })))
+      .not.toContain("Current structured objective progress reports")
   })
 
   it("reports missing coverage as blocked when the current Root cannot plan and preserves existing recovery guidance", () => {
