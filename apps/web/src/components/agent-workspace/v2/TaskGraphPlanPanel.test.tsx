@@ -174,7 +174,10 @@ describe('TaskGraphPlanPanel', () => {
     expect(attentionBlocks[1]).toContain('At least this many evidence items: 8')
     expect(attentionBlocks[1]).not.toContain('findings: 1')
     expect(html).toContain('At least this many evidence items: 7')
-    expect(html).not.toMatch(/criterionId|taskId|repairOf|PRIVATE_REVIEW_TEXT/)
+    expect(html).not.toMatch(/criterionId|taskId|repairOf/)
+    for (const privateValue of ['candidate-count', 'evidence-count', 'failed-target-task', 'root-task', 'PRIVATE_RAW_RESULT_PAYLOAD']) {
+      expect(html).not.toContain(privateValue)
+    }
 
     const mismatchedIdentities = [
       { ...identity, sessionId: 'session-2' }, { ...identity, graphItemId: 'foreign-graph' },
