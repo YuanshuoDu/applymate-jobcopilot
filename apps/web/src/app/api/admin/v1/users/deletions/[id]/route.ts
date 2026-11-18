@@ -4,6 +4,7 @@ import { isAdminResponse, requireAdmin } from '@/lib/admin/authorization'
 import { validateAdminWrite } from '@/lib/admin/csrf'
 import { AdminMutationConflict, runAdminMutation } from '@/lib/admin/write-transaction'
 import { db } from '@/lib/db'
+import { acquireSourceMaterialFence } from '@/lib/agent/source-material-fence'
 
 const transitions: Record<string, string[]> = { requested: ['processing', 'cancelled'], processing: ['completed', 'cancelled'] }
 
@@ -30,22 +31,53 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
   const processed = erasesData || status === 'cancelled'
   let result
   try {
-    result = await runAdminMutation({ actorUserId: actor.userId, action: 'users.deletion_request_updated', idempotencyKey: key, targetId: id, audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'user', targetId: targetUserId, tenantUserId: targetUserId, reason, outcome: 'success', before: { status: current.status, version: current.version }, after: { status, version: current.version + 1, dataErased: erasesData } }, mutate: async (tx) => {
-      const updated = await tx.adminDataDeletionRequest.updateMany({ where: { id, version: current.version, status: current.status, userId: targetUserId }, data: { status, note, processedAt: processed ? new Date() : null, processedById: processed ? actor.userId : null, version: { increment: 1 } } })
-      if (updated.count !== 1) throw new AdminMutationConflict('Deletion request changed during update')
-      if (erasesData) {
-        const user = await tx.user.findUnique({ where: { id: targetUserId }, select: { id: true } })
-        if (!user) throw new AdminMutationConflict('User has already been deleted')
-        const adminMembership = await tx.adminMembership.findUnique({ where: { userId: targetUserId }, select: { id: true } })
-        if (adminMembership) throw new AdminMutationConflict('Revoke the administrator membership before deleting this user')
-        await tx.user.delete({ where: { id: targetUserId } })
-      } else {
-        const user = await tx.user.findUnique({ where: { id: targetUserId }, select: { preferences: true } })
-        const preferences = user?.preferences && typeof user.preferences === 'object' && !Array.isArray(user.preferences) ? { ...(user.preferences as Record<string, unknown>), dataDeletionRequestStatus: status } : { dataDeletionRequestStatus: status }
-        await tx.user.update({ where: { id: targetUserId }, data: { preferences: preferences as Prisma.InputJsonValue } })
-      }
-      return tx.adminDataDeletionRequest.findUniqueOrThrow({ where: { id } })
-    } })
+    result = await runAdminMutation({
+      actorUserId: actor.userId,
+      action: 'users.deletion_request_updated',
+      idempotencyKey: key,
+      targetId: id,
+      audit: {
+        requestId: actor.requestId,
+        actorRoleKey: actor.roleKey,
+        targetType: 'user',
+        targetId: targetUserId,
+        tenantUserId: targetUserId,
+        reason,
+        outcome: 'success',
+        before: { status: current.status, version: current.version },
+        after: { status, version: current.version + 1, dataErased: erasesData },
+      },
+      ...(erasesData
+        ? { beforeIdempotencyClaim: (tx: Prisma.TransactionClient) => acquireSourceMaterialFence(tx, [targetUserId]) }
+        : {}),
+      mutate: async (tx) => {
+        const updated = await tx.adminDataDeletionRequest.updateMany({
+          where: { id, version: current.version, status: current.status, userId: targetUserId },
+          data: {
+            status,
+            note,
+            processedAt: processed ? new Date() : null,
+            processedById: processed ? actor.userId : null,
+            version: { increment: 1 },
+          },
+        })
+        if (updated.count !== 1) throw new AdminMutationConflict('Deletion request changed during update')
+        if (erasesData) {
+          const user = await tx.user.findUnique({ where: { id: targetUserId }, select: { id: true } })
+          if (!user) throw new AdminMutationConflict('User has already been deleted')
+          const adminMembership = await tx.adminMembership.findUnique({ where: { userId: targetUserId }, select: { id: true } })
+          if (adminMembership) throw new AdminMutationConflict('Revoke the administrator membership before deleting this user')
+          await tx.user.delete({ where: { id: targetUserId } })
+        } else {
+          const user = await tx.user.findUnique({ where: { id: targetUserId }, select: { preferences: true } })
+          const preferences = user?.preferences && typeof user.preferences === 'object' && !Array.isArray(user.preferences)
+            ? { ...(user.preferences as Record<string, unknown>), dataDeletionRequestStatus: status }
+            : { dataDeletionRequestStatus: status }
+          await tx.user.update({ where: { id: targetUserId }, data: { preferences: preferences as Prisma.InputJsonValue } })
+        }
+        return tx.adminDataDeletionRequest.findUniqueOrThrow({ where: { id } })
+      },
+    })
   } catch (error) {
     if (error instanceof AdminMutationConflict) return NextResponse.json({ error: error.message }, { status: 409 })
     throw error

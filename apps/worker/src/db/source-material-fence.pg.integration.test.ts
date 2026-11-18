@@ -9,6 +9,7 @@ import { buildAgentSourceMaterialFenceKey } from "@jobcopilot/shared"
 import { acquireSourceMaterialFence as acquireWebSourceMaterialFence } from "@/lib/agent/source-material-fence"
 // @ts-expect-error The Worker TypeScript project does not compile Web path aliases.
 import { withApplicationAuditLock as withWebApplicationAuditLock } from "@/lib/application-audit-transaction"
+import { deleteAccountWithSourceFence, type AccountDeleteClient } from "@/lib/agent/account-delete-source-write"
 import { acquireSourceMaterialFence as acquireWorkerSourceMaterialFence } from "./source-material-fence.js"
 import { updateJobForSubmission } from "./submission-guard.js"
 import type { ApplicationSubmitIdentity } from "../queue/application-submit-fence.js"
@@ -275,6 +276,50 @@ async function prismaBackendPid(client: PrismaRawClient): Promise<number> {
   return pid
 }
 
+type PrismaBackendIdentity = { pid: number; backendStart: string; applicationName: string }
+
+async function identifyPrismaBackend(
+  client: PrismaRawClient,
+  applicationName: string,
+): Promise<PrismaBackendIdentity> {
+  const rows = await withTimeout(
+    client.$queryRaw<Array<{ pid: number; backend_start: string; application_name: string }>>`
+      SELECT pg_backend_pid()::int AS pid,
+        backend_start::text AS backend_start,
+        set_config('application_name', ${applicationName}::text, true) AS application_name
+      FROM pg_stat_activity
+      WHERE pid = pg_backend_pid()::int
+    `,
+    "Could not identify disposable Prisma backend",
+  )
+  const identity = rows[0]
+  if (!identity
+    || !Number.isSafeInteger(identity.pid)
+    || identity.pid < 1
+    || typeof identity.backend_start !== 'string'
+    || identity.backend_start.length === 0
+    || identity.application_name !== applicationName) {
+    throw new Error("Could not identify disposable Prisma backend")
+  }
+  return { pid: identity.pid, backendStart: identity.backend_start, applicationName }
+}
+
+async function terminateDisposableBackend(identity: PrismaBackendIdentity): Promise<void> {
+  await withTimeout(
+    pool!.query(
+      `SELECT pg_terminate_backend(pid) AS terminated
+       FROM pg_stat_activity
+       WHERE pid = $1::int
+         AND backend_start = $2::timestamptz
+         AND application_name = $3::text
+         AND datname = current_database()
+         AND usename = current_user`,
+      [identity.pid, identity.backendStart, identity.applicationName],
+    ),
+    "Disposable Prisma backend termination timed out",
+  )
+}
+
 async function workerBackendPid(client: PoolClient): Promise<number> {
   const result = await withTimeout(
     client.query<{ pid: number }>("SELECT pg_backend_pid()::int AS pid"),
@@ -503,6 +548,133 @@ describeWithPostgres("Web Prisma and Worker pg source material fence", () => {
         if (workerAcquisition) await completesWithin(workerAcquisition, "Worker acquisition cleanup timed out")
       }
       if (workerClient) await rollbackAndReleaseWorkerClient(workerClient, workerTransactionOpen)
+    }
+  }, TEST_TIMEOUT_MS)
+
+  it("fences the real self-account deletion before cascading source rows", async () => {
+    const suffix = randomUUID()
+    const userId = `source-fence-delete-${suffix}`
+    const jobId = `source-fence-delete-job-${suffix}`
+    const resumeId = `source-fence-delete-resume-${suffix}`
+    const factId = `source-fence-delete-fact-${suffix}`
+    const blockerApplicationName = `am-delete-b-${suffix}`
+    const deletionApplicationName = `am-delete-d-${suffix}`
+    const blockerPidReady = deferred<number>()
+    const blockerAcquired = deferred<void>()
+    const releaseBlocker = deferred<void>()
+    const deletePidReady = deferred<number>()
+    let blockerTransaction: Promise<void> | undefined
+    let deleteOperation: Promise<unknown> | undefined
+    let blockerIdentity: PrismaBackendIdentity | undefined
+    let deletionIdentity: PrismaBackendIdentity | undefined
+    let blockerSettled = false
+    let deleteSettled = false
+    let blockerPid: number | undefined
+    let deletePid: number | undefined
+    let primaryFailure = false
+
+    try {
+      await pool!.query(
+        'INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, NOW())',
+        [userId, `${suffix}@example.test`],
+      )
+      await pool!.query(
+        'INSERT INTO "Job" ("id", "userId", "company", "role", "updatedAt") VALUES ($1, $2, $3, $4, NOW())',
+        [jobId, userId, "Disposable source fence", "Integration test"],
+      )
+      await pool!.query(
+        'INSERT INTO "Resume" ("id", "userId", "name", "content", "updatedAt") VALUES ($1, $2, $3, $4::jsonb, NOW())',
+        [resumeId, userId, "Disposable source fence", "{}"],
+      )
+      await pool!.query(
+        'INSERT INTO "persona_facts" ("id", "userId", "key", "category", "value", "normalized_value", "source", "updated_at") VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())',
+        [factId, userId, "integration", "profile", "disposable", "disposable", "manual"],
+      )
+
+      blockerTransaction = runWebTransaction(async tx => {
+        blockerIdentity = await identifyPrismaBackend(tx, blockerApplicationName)
+        blockerPidReady.resolve(blockerIdentity.pid)
+        await acquireWebFence(tx, [userId])
+        blockerAcquired.resolve(undefined)
+        await releaseBlocker.promise
+      })
+      void blockerTransaction.then(() => { blockerSettled = true }, () => { blockerSettled = true })
+      blockerPid = await withTimeout(blockerPidReady.promise, "Deletion blocker transaction did not start")
+      await withTimeout(blockerAcquired.promise, "Deletion blocker did not acquire the source fence")
+
+      const deletionClient = {
+        $transaction<T>(callback: (transaction: PrismaRawClient) => Promise<T>, options?: { maxWait?: number; timeout?: number }) {
+          return prisma!.$transaction(async tx => {
+            deletionIdentity = await identifyPrismaBackend(tx, deletionApplicationName)
+            deletePidReady.resolve(deletionIdentity.pid)
+            return callback(tx)
+          }, options)
+        },
+      } as unknown as AccountDeleteClient
+      const deletion = deleteAccountWithSourceFence(deletionClient, userId, `${suffix}@example.test`)
+      deleteOperation = deletion
+      void deletion.then(() => { deleteSettled = true }, () => { deleteSettled = true })
+
+      deletePid = await withTimeout(deletePidReady.promise, "Account deletion transaction did not start")
+      await waitForBlocker(deletePid, blockerPid)
+      expect(deleteSettled).toBe(false)
+      const beforeRelease = await pool!.query<{ users: string; jobs: string; resumes: string; facts: string }>(
+        `SELECT
+          (SELECT count(*) FROM "User" WHERE "id" = $1)::text AS users,
+          (SELECT count(*) FROM "Job" WHERE "id" = $2)::text AS jobs,
+          (SELECT count(*) FROM "Resume" WHERE "id" = $3)::text AS resumes,
+          (SELECT count(*) FROM "persona_facts" WHERE "id" = $4)::text AS facts`,
+        [userId, jobId, resumeId, factId],
+      )
+      expect(beforeRelease.rows[0]).toEqual({ users: "1", jobs: "1", resumes: "1", facts: "1" })
+
+      releaseBlocker.resolve(undefined)
+      await withTimeout(blockerTransaction, "Source fence blocker did not commit", CLEANUP_TIMEOUT_MS)
+      await expect(withTimeout(deletion, "Account deletion did not proceed after source fence release")).resolves.toBe("deleted")
+
+      const afterDelete = await pool!.query<{ users: string; jobs: string; resumes: string; facts: string }>(
+        `SELECT
+          (SELECT count(*) FROM "User" WHERE "id" = $1)::text AS users,
+          (SELECT count(*) FROM "Job" WHERE "id" = $2)::text AS jobs,
+          (SELECT count(*) FROM "Resume" WHERE "id" = $3)::text AS resumes,
+          (SELECT count(*) FROM "persona_facts" WHERE "id" = $4)::text AS facts`,
+        [userId, jobId, resumeId, factId],
+      )
+      expect(afterDelete.rows[0]).toEqual({ users: "0", jobs: "0", resumes: "0", facts: "0" })
+    } catch (error) {
+      primaryFailure = true
+      throw error
+    } finally {
+      releaseBlocker.resolve(undefined)
+      let settled = await settleOperations(blockerTransaction, deleteOperation)
+      if (!settled) {
+        const pendingBackends = [
+          ...(blockerTransaction && !blockerSettled && blockerIdentity ? [blockerIdentity] : []),
+          ...(deleteOperation && !deleteSettled && deletionIdentity ? [deletionIdentity] : []),
+        ]
+        await Promise.all(pendingBackends.map(async identity => {
+          try {
+            await terminateDisposableBackend(identity)
+          } catch {
+            // A terminated or already-closed disposable backend needs no further action here.
+          }
+        }))
+        settled = await settleOperations(blockerTransaction, deleteOperation)
+      }
+      if (!settled) {
+        console.error("Account-delete source-fence PG fixture operations remained pending; row cleanup skipped.")
+        if (!primaryFailure) throw new Error("Account-delete source-fence PG fixture operations did not settle")
+      } else {
+        try {
+          await pool!.query('DELETE FROM "Job" WHERE "id" = $1', [jobId])
+          await pool!.query('DELETE FROM "Resume" WHERE "id" = $1', [resumeId])
+          await pool!.query('DELETE FROM "persona_facts" WHERE "id" = $1', [factId])
+          await pool!.query('DELETE FROM "User" WHERE "id" = $1', [userId])
+        } catch {
+          console.error("Account-delete source-fence PG fixture row cleanup failed.")
+          if (!primaryFailure) throw new Error("Account-delete source-fence PG fixture row cleanup failed")
+        }
+      }
     }
   }, TEST_TIMEOUT_MS)
 

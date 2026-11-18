@@ -6,6 +6,7 @@
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { deleteAccountWithSourceFence } from '@/lib/agent/account-delete-source-write'
 
 export async function DELETE(req: NextRequest) {
   const auth = await requireAuth(req)
@@ -14,21 +15,9 @@ export async function DELETE(req: NextRequest) {
   const body = await req.json().catch(() => null)
   const confirmation = typeof body?.confirmation === 'string' ? body.confirmation : ''
 
-  // Fetch user to verify
-  const user = await db.user.findUnique({
-    where: { id: auth.userId },
-    select: { email: true },
-  })
-
-  if (!user) return err('User not found', 404)
-
-  // Require email confirmation
-  if (!confirmation.trim() || confirmation.trim().toLowerCase() !== user.email.trim().toLowerCase()) {
-    return err('Must provide your email as confirmation', 400)
-  }
-
-  // Delete the user — cascade takes care of Account, Session, Job, Resume, Activity, AgentConfig
-  await db.user.delete({ where: { id: auth.userId } })
+  const result = await deleteAccountWithSourceFence(db, auth.userId, confirmation)
+  if (result === 'not_found') return err('User not found', 404)
+  if (result === 'confirmation_required') return err('Must provide your email as confirmation', 400)
 
   return ok({ message: 'Account permanently deleted' })
 }

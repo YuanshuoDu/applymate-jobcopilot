@@ -16,9 +16,12 @@ export async function runAdminMutation<T>(input: {
   idempotencyKey: string
   targetId?: string
   audit: Omit<AuditInput, 'actorUserId' | 'action'> | ((value: T) => Omit<AuditInput, 'actorUserId' | 'action'>)
+  beforeIdempotencyClaim?: (tx: PrismaTypes.TransactionClient) => Promise<void>
   mutate: (tx: PrismaTypes.TransactionClient) => Promise<T>
 }) {
   return db.$transaction(async (tx) => {
+    await input.beforeIdempotencyClaim?.(tx)
+
     try {
       await tx.adminIdempotencyKey.create({
         data: {
