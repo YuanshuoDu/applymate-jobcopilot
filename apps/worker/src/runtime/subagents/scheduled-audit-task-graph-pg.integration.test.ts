@@ -261,6 +261,10 @@ const scheduledGateStagePath = "@/lib/agent/stages/gate"
 const scheduledModelRouterPath = "@/lib/model-router"
 const scheduledEntitlementsPath = "@/lib/entitlements"
 const scheduledWebDbPath = "@/lib/db"
+const scheduledApiHelpersPath = "@/lib/api-helpers"
+const recoveryAuthModulePath = "@/lib/auth"
+const recoveryInterruptRoutePath = "@/app/api/agent/sessions/[id]/turns/[turnId]/interrupt/route"
+const recoveryRunNowRoutePath = "@/app/api/agent/automations/[id]/run/route"
 let pool: Pool | undefined
 let runner: Runner | undefined
 let disconnectWebDatabase: (() => Promise<void>) | undefined
@@ -294,6 +298,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     vi.doUnmock(scheduledGateStagePath)
     vi.doUnmock(scheduledModelRouterPath)
     vi.doUnmock(scheduledEntitlementsPath)
+    vi.doUnmock(scheduledApiHelpersPath)
+    vi.doUnmock(recoveryAuthModulePath)
     vi.doUnmock(scheduledRunServicePath)
     vi.doUnmock(scheduledTaskGraphRunServicePath)
     vi.doUnmock(scheduledTaskGraphFencePath)
@@ -718,6 +724,213 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const approvals = await pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "agent_approvals" WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3
       AND "type"='review_application'`, [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId])
     expect(approvals.rows[0]?.count ?? 0).toBe(0)
+  }, 120_000)
+
+  it("routes a stopped drift Turn through Run Now, outbox dispatch, and canonical recovery validation", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    const race = await runScheduledGateSourceWriterRace(fixture, { update: () => ({ salary: "€100k+" }) })
+    expect(race.gateOutcome.status).toBe("fulfilled")
+    expect(race.gateOutcome.status === "fulfilled" && debugRecord(race.gateOutcome.value)?.status).toBe("failed")
+    const sourceExecutionBeforeRecovery = await pool!.query<{ state: unknown }>(`SELECT "state" FROM "agent_executions"
+      WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`, [fixture.executionOwner.executionId, fixture.ids.userId, fixture.ids.sessionId])
+    const originalSourceMarker = debugRecord(debugRecord(sourceExecutionBeforeRecovery.rows[0]?.state)?.scheduledTaskGraphMaterialDriftTerminal)
+    expect(originalSourceMarker).not.toBeNull()
+    const sourceMarkerOwner = debugRecord(originalSourceMarker?.owner)
+    const sourceMarkerGate = debugRecord(originalSourceMarker?.gate)
+    // Limit leak checks to recovery control data, leaving objective and current-material context untouched.
+    const privateMarkerValues = [originalSourceMarker?.schemaVersion, originalSourceMarker?.analyzeFingerprintDigest, originalSourceMarker?.prepareProofDigest,
+      originalSourceMarker?.artifactDigest, originalSourceMarker?.currentMaterialDigest, originalSourceMarker?.proofDigest,
+      sourceMarkerOwner?.turnId, sourceMarkerOwner?.rootTaskId, sourceMarkerOwner?.turnLeaseOwnerId,
+      sourceMarkerGate?.taskId, sourceMarkerGate?.leaseOwnerId].filter((value): value is string => typeof value === "string")
+    const privateModelMarkerValues = [...privateMarkerValues, sourceMarkerOwner?.executionId]
+      .filter((value): value is string => typeof value === "string")
+    // Run Now returns the active execution ID; the model request must hide its historical source value.
+    expect(privateMarkerValues).toHaveLength(11)
+    expect(privateModelMarkerValues).toHaveLength(12)
+    await stopRunner()
+
+    const automationId = `scheduled-recovery-automation-${randomUUID()}`
+    await pool!.query(`INSERT INTO "agent_automations"
+      ("id", "userId", "name", "enabled", "triggerType", "cron", "timezone", "targetRoles", "targetLocations",
+       "minScore", "dailyCap", "requireApproval", "autoApply", "sessionId", "createdAt", "updatedAt")
+      VALUES ($1,$2,'Recovery integration',TRUE,'weekdays','0 9 * * 1-5','Europe/Dublin',$3::text[],$4::text[],$5,$6,$7,$8,$9,
+        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`, [automationId, fixture.ids.userId, fixture.scheduleSnapshot.targetRoles,
+      fixture.scheduleSnapshot.targetLocations, fixture.scheduleSnapshot.minScore, fixture.scheduleSnapshot.dailyCap,
+      fixture.scheduleSnapshot.requireApproval, fixture.scheduleSnapshot.autoApply, fixture.ids.sessionId])
+
+    vi.doMock(recoveryAuthModulePath, () => ({ auth: async () => null }))
+    const actualApiHelpers = await vi.importActual<Record<string, unknown>>(scheduledApiHelpersPath)
+    vi.doMock(scheduledApiHelpersPath, () => ({ ...actualApiHelpers,
+      requireAuth: async () => ({ userId: fixture.ids.userId }) }))
+    const interruptRoute = await vi.importActual<{
+      POST(request: Request, context: { params: Promise<{ id: string; turnId: string }> }): Promise<Response>
+    }>(recoveryInterruptRoutePath)
+    const runNowRoute = await vi.importActual<{
+      POST(request: Request, context: { params: Promise<{ id: string }> }): Promise<Response>
+    }>(recoveryRunNowRoutePath)
+    const postInterrupt = (turnId: string, clientMessageId: string) => interruptRoute.POST(new Request(
+      `http://fixture.invalid/api/agent/sessions/${fixture.ids.sessionId}/turns/${turnId}/interrupt`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ clientMessageId, expectedRevision: null }),
+      }) as never, { params: Promise.resolve({ id: fixture.ids.sessionId, turnId }) })
+
+    const oldStop = await postInterrupt(fixture.ids.turnId, `interrupt_${randomUUID().replaceAll("-", "")}`)
+    expect(oldStop.status).toBe(202)
+    expect((await pool!.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id"=$1`, [fixture.ids.turnId]))
+      .rows[0]?.status).toBe("interrupted")
+
+    const runNow = await runNowRoute.POST(new Request(`http://fixture.invalid/api/agent/automations/${automationId}/run`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ materialDriftRecovery: { schemaVersion: "forged", turnId: "client-selected" } }),
+    }) as never, { params: Promise.resolve({ id: automationId }) })
+    expect(runNow.status).toBe(202)
+    const runNowBody = debugRecord(await runNow.json())
+    const runNowJson = JSON.stringify(runNowBody)
+    for (const privateField of ["materialDriftRecovery", "sourceMarker", "currentSnapshotDigest", "scheduledTaskGraphMaterialDriftTerminal",
+      "analyzeFingerprintDigest", "prepareProofDigest", "artifactDigest", "currentMaterialDigest", "proofDigest"]) {
+      expect(runNowJson).not.toContain(JSON.stringify(privateField))
+    }
+    for (const privateValue of privateMarkerValues) expect(runNowJson).not.toContain(privateValue)
+    const recoveryTurnId = typeof runNowBody?.turnId === "string" ? runNowBody.turnId : ""
+    expect(recoveryTurnId).not.toBe("")
+    const [sourceExecution, recoveryTurn, dispatch] = await Promise.all([
+      pool!.query<{ attemptCount: number }>(`SELECT "attemptCount" FROM "agent_executions"
+        WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`, [fixture.executionOwner.executionId, fixture.ids.userId, fixture.ids.sessionId]),
+      pool!.query<{ status: string; source: string; executionMode: string; input: unknown }>(`SELECT "status", "source", "executionMode", "input"
+        FROM "agent_turns" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`,
+      [recoveryTurnId, fixture.ids.userId, fixture.ids.sessionId]),
+      pool!.query<{ id: string; publishedAt: Date | null; payload: unknown }>(`SELECT "id", "publishedAt", "payload" FROM "agent_outbox"
+        WHERE "topic"='agent.turn.dispatch' AND "idempotencyKey"=$1 AND "aggregateId"=$2`,
+      [`turn-dispatch:${recoveryTurnId}`, fixture.ids.sessionId]),
+    ])
+    const recoveryInput = debugRecord(recoveryTurn.rows[0]?.input)
+    const recoveryIntent = debugRecord(recoveryInput?.materialDriftRecovery)
+    const privateRecoveryValues = [recoveryIntent?.schemaVersion, recoveryIntent?.currentSnapshotDigest]
+      .filter((value): value is string => typeof value === "string")
+    expect(privateRecoveryValues).toHaveLength(2)
+    for (const privateValue of privateRecoveryValues) expect(runNowJson).not.toContain(privateValue)
+    expect(recoveryTurn.rows[0]).toMatchObject({ status: "queued", source: "automation", executionMode: "canonical_task_graph" })
+    expect(recoveryIntent).toMatchObject({ schemaVersion: "agent-harness.v2.material-drift-recovery.v2",
+      turnId: recoveryTurnId, userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, automationId,
+      previousTurnId: fixture.ids.turnId, previousExecutionId: fixture.executionOwner.executionId,
+      previousRecoveryTurnId: null, reservedExecutionAttemptCount: sourceExecution.rows[0]!.attemptCount,
+      sourceMarker: originalSourceMarker })
+    expect(typeof recoveryIntent?.currentSnapshotDigest).toBe("string")
+    expect(dispatch.rows).toHaveLength(1)
+    expect(dispatch.rows[0]).toMatchObject({ payload: { turnId: recoveryTurnId, sessionId: fixture.ids.sessionId,
+      ownerId: `web:${recoveryTurnId}` } })
+
+    let runtime: Awaited<ReturnType<(typeof import("../canonical-turn-runtime.js"))["createCanonicalTurnRuntime"]>> | undefined
+    let turnQueue: Queue | undefined
+    let redis: Redis | undefined
+    let runJob: Promise<unknown> | undefined
+    const modelStarted = testBarrier(), releaseModel = testBarrier()
+    let modelFactoryCalls = 0
+    let modelStateJson = ""
+    let modelRequestJson = ""
+    let modelToolNames: string[] = []
+    try {
+      const [canonical, commandPort, templates, turnQueueModule, recoveryScanner, interruptProbe] = await Promise.all([
+        import("../canonical-turn-runtime.js"), import("./pg-task-graph-command-port.js"), import("./task-graph-templates.js"),
+        import("../turns/turn-queue.js"), import("../turns/recovery-scanner.js"), import("../turns/turn-interrupt-probe.js"),
+      ])
+      const profile: ModelAdapter["profile"] = { provider: "fixture", model: "material-drift-recovery", nativeTools: true,
+        structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false,
+        supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false,
+        supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null,
+        maxOutputTokens: 64, costClass: "low" }
+      runtime = await canonical.createCanonicalTurnRuntime(pool!, {
+        workerId: `material-drift-recovery-worker-${randomUUID()}`,
+        productionFlags: { taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
+          consumeWaitOutcomes: true, canonicalAutomationEnabled: true, turnBoundaryCompactionEnabled: false },
+        taskGraphCommandPort: commandPort.createPgTaskGraphCommandPort(pool as never),
+        taskGraphTemplates: templates.TASK_GRAPH_TEMPLATES,
+        authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
+          settle: async () => undefined, settleUnknown: async () => undefined }),
+        modelRuntimeFactory: ({ state }) => {
+          modelFactoryCalls += 1
+          modelStateJson = JSON.stringify(state)
+          const adapter: ModelAdapter = { id: "material-drift-recovery-worker-fixture", profile,
+            async *stream(request) {
+              modelRequestJson = JSON.stringify(request)
+              modelToolNames = request.tools.map(tool => debugRecord(tool)?.name).filter((name): name is string => typeof name === "string")
+              if (!request.signal) throw new Error("canonical recovery model request omitted its cancellation signal")
+              modelStarted.release()
+              await Promise.race([releaseModel.promise, new Promise<void>(resolve => {
+                const signal = request.signal!
+                if (signal.aborted) resolve()
+                else signal.addEventListener("abort", () => resolve(), { once: true })
+              })])
+              yield { type: "completed", finishReason: "stop" }
+            } }
+          return { adapter, registry: {} as never, candidates: [] }
+        },
+      })
+      redis = new Redis(redisUrl!, { maxRetriesPerRequest: null, connectTimeout: 2_000,
+        retryStrategy: attempt => attempt > 3 ? null : 100 })
+      turnQueue = new Queue(turnQueueModule.TURN_QUEUE_NAME, { connection: redis.duplicate(), skipVersionCheck: true })
+      await turnQueue.waitUntilReady()
+      expect(await dispatchPendingTurnOutbox(pool as never, turnQueue, 10)).toBeGreaterThanOrEqual(1)
+      const dispatchedRow = await pool!.query<{ publishedAt: Date | null }>(`SELECT "publishedAt" FROM "agent_outbox" WHERE "id"=$1`,
+        [dispatch.rows[0]!.id])
+      expect(dispatchedRow.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      const job = await turnQueue.getJob(recoveryScanner.turnJobId(recoveryTurnId))
+      if (!job) throw new Error("Run Now recovery dispatch was not present in the real BullMQ queue")
+      runJob = turnQueueModule.runTurnJob(job, { pool: pool!, execute: runtime.execute,
+        requireCanonicalAutomationMode: true, heartbeatMs: 1_000, interruptPollMs: 25,
+        isInterrupted: lease => interruptProbe.safePersistedInterrupt(pool!, lease) })
+      await waitForBarrier(modelStarted, "Canonical Worker did not reach the recovery Turn model after validating its intent", 30_000)
+
+      const root = await pool!.query<{ rootTaskId: string | null; status: string; source: string; automationRunMode: string | null }>(
+        `SELECT turn."rootTaskId", turn."status", turn."source", turn."input"->>'automationRunMode' AS "automationRunMode"
+         FROM "agent_turns" AS turn WHERE turn."id"=$1 AND turn."userId"=$2 AND turn."sessionId"=$3`,
+      [recoveryTurnId, fixture.ids.userId, fixture.ids.sessionId])
+      const rootTaskId = root.rows[0]?.rootTaskId
+      expect(root.rows[0]).toMatchObject({ status: "in_progress", source: "automation", automationRunMode: "manual" })
+      expect(rootTaskId).toBeTruthy()
+      const rootTask = await pool!.query<{ role: string; taskType: string; status: string; turnId: string; allowedActions: unknown }>(
+        `SELECT "role", "taskType", "status", "turnId", "allowedActions" FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`,
+        [rootTaskId, fixture.ids.sessionId])
+      expect(rootTask.rows).toHaveLength(1)
+      expect(rootTask.rows[0]).toMatchObject({ role: "orchestrator", taskType: "root", status: "running", turnId: recoveryTurnId })
+      expect(rootTask.rows[0]?.allowedActions).toEqual(expect.arrayContaining([...templates.TASK_GRAPH_TEMPLATES.prepare.allowedActions]))
+      expect(modelFactoryCalls).toBe(1)
+      expect(modelToolNames).toContain("agent.plan")
+      expect(modelStateJson).not.toContain(String(originalSourceMarker?.proofDigest))
+      expect(modelStateJson).not.toContain(JSON.stringify(originalSourceMarker))
+      expect(modelRequestJson).not.toBe("")
+      for (const privateField of ["materialDriftRecovery", "sourceMarker", "currentSnapshotDigest", "scheduledTaskGraphMaterialDriftTerminal",
+        "analyzeFingerprintDigest", "prepareProofDigest", "artifactDigest", "currentMaterialDigest", "proofDigest"]) {
+        expect(modelRequestJson).not.toContain(JSON.stringify(privateField))
+      }
+      for (const privateValue of privateModelMarkerValues) expect(modelRequestJson).not.toContain(privateValue)
+      for (const privateValue of privateRecoveryValues) expect(modelRequestJson).not.toContain(privateValue)
+
+      const newStop = await postInterrupt(recoveryTurnId, `interrupt_${randomUUID().replaceAll("-", "")}`)
+      expect(newStop.status).toBe(202)
+      const workerResult = await runJob
+      expect(debugRecord(workerResult)?.status).toBe("interrupted")
+      const untouched = await pool!.query<{ taskCount: number; prepareBindings: number; approvals: number }>(
+        `SELECT (SELECT COUNT(*)::int FROM "sub_agent_tasks" WHERE "turnId"=$1 AND "sessionId"=$2
+           AND "id" <> COALESCE((SELECT "rootTaskId" FROM "agent_turns" WHERE "id"=$1),'')) AS "taskCount",
+          (SELECT COUNT(*)::int FROM "agent_events" WHERE "turnId"=$1 AND "sessionId"=$2
+            AND "type"='agent.plan.scheduled_prepare_binding') AS "prepareBindings",
+          (SELECT COUNT(*)::int FROM "agent_approvals" WHERE "turnId"=$1 AND "sessionId"=$2) AS "approvals"`,
+      [recoveryTurnId, fixture.ids.sessionId])
+      expect(untouched.rows[0]).toEqual({ taskCount: 0, prepareBindings: 0, approvals: 0 })
+    } finally {
+      releaseModel.release()
+      if (runJob) await runJob.catch(() => undefined)
+      await runtime?.close().catch(() => undefined)
+      if (turnQueue) {
+        const queuedJobId = (await import("../turns/recovery-scanner.js")).turnJobId(recoveryTurnId)
+        const queuedJob = await turnQueue.getJob(queuedJobId).catch(() => null)
+        await queuedJob?.remove().catch(() => undefined)
+        await turnQueue.close().catch(() => undefined)
+      }
+      await redis?.quit().catch(() => undefined)
+    }
   }, 120_000)
 
   it("does not commit a Gate skip when material-only drift wins the fenced recheck", async () => {

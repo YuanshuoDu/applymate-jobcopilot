@@ -74,7 +74,14 @@ function recoveryAutomation() {
 function recoverySession() {
   return { id: "session_1", goal: "Run automation: Weekday Berlin SWE Scout", status: "running", source: "automation",
     memorySummary: "Automation queued for execution.", qualityScore: null, currentTaskId: null,
-    createdAt: new Date("2026-06-18T08:00:00Z"), updatedAt: new Date("2026-06-18T08:00:00Z"), completedAt: null }
+    createdAt: new Date("2026-06-18T08:00:00Z"), updatedAt: new Date("2026-06-18T08:00:00Z"), completedAt: null,
+    eventSequence: 1n, userId: "user_1", internalAccessToken: "server-only" }
+}
+
+function expectedSessionResponse() {
+  return { id: "session_1", goal: "Run automation: Weekday Berlin SWE Scout", status: "running", source: "automation",
+    memorySummary: "Automation queued for execution.", qualityScore: null, currentTaskId: null,
+    createdAt: "2026-06-18T08:00:00.000Z", updatedAt: "2026-06-18T08:00:00.000Z", completedAt: null }
 }
 
 function createdRecovery(session = recoverySession()) {
@@ -121,6 +128,9 @@ describe("agent automation run API", () => {
       createdAt: new Date("2026-06-18T08:00:00Z"),
       updatedAt: new Date("2026-06-18T08:00:00Z"),
       completedAt: null,
+      eventSequence: 1n,
+      userId: "user_1",
+      internalAccessToken: "server-only",
     })
     mocks.sessionFindFirst.mockResolvedValue(null)
     mocks.sessionDeleteMany.mockResolvedValue({ count: 1 })
@@ -161,10 +171,15 @@ describe("agent automation run API", () => {
     }) as never, ctx())
 
     expect(res.status).toBe(201)
-    await expect(res.json()).resolves.toMatchObject({
+    const body = await res.json()
+    expect(body).toMatchObject({
       session: { id: "session_1", source: "automation" },
       event: { id: "event_1", type: "automation_started" },
     })
+    expect(body.session).toEqual(expectedSessionResponse())
+    expect(body.session).not.toHaveProperty("userId")
+    expect(body.session).not.toHaveProperty("eventSequence")
+    expect(body.session).not.toHaveProperty("internalAccessToken")
     expect(mocks.automationFindFirst).toHaveBeenCalledWith({
       where: { id: "automation_1", userId: "user_1" },
     })
@@ -325,11 +340,7 @@ describe("agent automation run API", () => {
   })
 
   it("uses the transaction-created recovery Turn without resetting or redispatching it", async () => {
-    const existing = {
-      id: "session_1", goal: "Run automation: Weekday Berlin SWE Scout", status: "running", source: "automation",
-      memorySummary: "Automation queued for execution.", qualityScore: null, currentTaskId: null,
-      createdAt: new Date("2026-06-18T08:00:00Z"), updatedAt: new Date("2026-06-18T08:00:00Z"), completedAt: null,
-    }
+    const existing = recoverySession()
     mocks.automationFindFirst.mockResolvedValueOnce({
       id: "automation_1", name: "Weekday Berlin SWE Scout", enabled: true, cron: "0 9 * * 1-5",
       timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: ["SWE"], targetLocations: ["Berlin"],
@@ -349,8 +360,13 @@ describe("agent automation run API", () => {
     const res = await POST(postRequest({ materialDriftRecovery: { turnId: "forged" } }) as never, ctx())
 
     expect(res.status).toBe(202)
-    await expect(res.json()).resolves.toMatchObject({ executionId: "execution_1", turnId: "turn_recovery",
-      dispatchId: "dispatch_1", turnStatus: "queued", session: { id: "session_1" } })
+    const body = await res.json()
+    expect(body).toMatchObject({ executionId: "execution_1", turnId: "turn_recovery",
+      dispatchId: "dispatch_1", turnStatus: "queued" })
+    expect(body.session).toEqual(expectedSessionResponse())
+    expect(body.session).not.toHaveProperty("userId")
+    expect(body.session).not.toHaveProperty("eventSequence")
+    expect(body.session).not.toHaveProperty("internalAccessToken")
     expect(mocks.startRecovery).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       automationId: "automation_1", userId: "user_1", sessionId: "session_1", now: expect.any(Date),
     }))
@@ -372,9 +388,17 @@ describe("agent automation run API", () => {
     const second = await POST(postRequest() as never, ctx())
 
     expect(first.status).toBe(202)
-    await expect(first.json()).resolves.toMatchObject({ turnId: "turn_recovery", dispatchId: "dispatch_1", turnStatus: "queued", event: null })
+    const firstBody = await first.json()
+    expect(firstBody).toMatchObject({ turnId: "turn_recovery", dispatchId: "dispatch_1", turnStatus: "queued", event: null })
+    expect(firstBody.session).toEqual(expectedSessionResponse())
+    expect(firstBody.session).not.toHaveProperty("userId")
+    expect(firstBody.session).not.toHaveProperty("eventSequence")
     expect(second.status).toBe(202)
-    await expect(second.json()).resolves.toMatchObject({ turnId: "turn_recovery", dispatchId: "dispatch_1", turnStatus: "in_progress" })
+    const secondBody = await second.json()
+    expect(secondBody).toMatchObject({ turnId: "turn_recovery", dispatchId: "dispatch_1", turnStatus: "in_progress" })
+    expect(secondBody.session).toEqual(expectedSessionResponse())
+    expect(secondBody.session).not.toHaveProperty("userId")
+    expect(secondBody.session).not.toHaveProperty("eventSequence")
     expect(mocks.startRecovery).toHaveBeenCalledTimes(2)
     expect(mocks.transcriptCreate).toHaveBeenCalledOnce()
     expect(mocks.ensureExecution).not.toHaveBeenCalled()

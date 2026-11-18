@@ -47,9 +47,9 @@ type SessionRow = {
 
 function serializeSession(session: SessionRow) {
   return {
-    ...session,
-    createdAt: session.createdAt.toISOString(),
-    updatedAt: session.updatedAt.toISOString(),
+    id: session.id, goal: session.goal, status: session.status, source: session.source,
+    memorySummary: session.memorySummary, qualityScore: session.qualityScore, currentTaskId: session.currentTaskId,
+    createdAt: session.createdAt.toISOString(), updatedAt: session.updatedAt.toISOString(),
     completedAt: session.completedAt?.toISOString() ?? null,
   }
 }
