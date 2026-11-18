@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   transaction: vi.fn(),
   taskUpdateMany: vi.fn(),
+  sourceFence: vi.fn(),
   refreshExecutionAttempt: vi.fn(),
   coverLetterFindFirst: vi.fn(),
   coverLetterUpdate: vi.fn(),
@@ -10,6 +11,7 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock('@/lib/db', () => ({ db: { $transaction: mocks.transaction } }))
+vi.mock('../source-material-fence', () => ({ acquireSourceMaterialFence: mocks.sourceFence }))
 vi.mock('../execution-control', () => ({
   refreshAgentExecutionAttempt: mocks.refreshExecutionAttempt,
   AgentExecutionCancelledError: class extends Error {
@@ -53,6 +55,7 @@ describe('Prepare task ownership', () => {
   beforeEach(() => {
     Object.values(mocks).forEach(mock => mock.mockReset())
     mocks.transaction.mockImplementation(async (work: (client: unknown) => Promise<unknown>) => work(tx))
+    mocks.sourceFence.mockResolvedValue(undefined)
     mocks.taskUpdateMany.mockResolvedValue({ count: 1 })
     mocks.refreshExecutionAttempt.mockResolvedValue(true)
     mocks.coverLetterFindFirst.mockResolvedValue(null)
@@ -168,6 +171,32 @@ describe('Prepare task ownership', () => {
       data: { status: 'generating_materials', checkpoint: 'tailoring_and_cover_letter' },
     })
     expect(write).toHaveBeenCalledWith(tx)
+    expect(mocks.sourceFence).not.toHaveBeenCalled()
+  })
+
+  it('takes the opt-in source fence before execution and task owner locks', async () => {
+    const write = vi.fn(async () => 'saved')
+
+    await expect(withPrepareOwnership(scoredJob(), context(true), write as never, { sourceMaterialFence: true }))
+      .resolves.toBe('saved')
+
+    expect(mocks.sourceFence).toHaveBeenCalledWith(tx, ['user_1'])
+    expect(mocks.sourceFence.mock.invocationCallOrder[0]).toBeLessThan(mocks.refreshExecutionAttempt.mock.invocationCallOrder[0])
+    expect(mocks.refreshExecutionAttempt.mock.invocationCallOrder[0]).toBeLessThan(mocks.taskUpdateMany.mock.invocationCallOrder[0])
+    expect(mocks.taskUpdateMany.mock.invocationCallOrder[0]).toBeLessThan(write.mock.invocationCallOrder[0])
+    expect(write).toHaveBeenCalledWith(tx)
+  })
+
+  it('fails closed before owner checks and writes when the source fence fails', async () => {
+    const write = vi.fn(async () => 'saved')
+    mocks.sourceFence.mockRejectedValueOnce(new Error('fence unavailable'))
+
+    await expect(withPrepareOwnership(scoredJob(), context(true), write as never, { sourceMaterialFence: true }))
+      .rejects.toThrow('fence unavailable')
+
+    expect(mocks.refreshExecutionAttempt).not.toHaveBeenCalled()
+    expect(mocks.taskUpdateMany).not.toHaveBeenCalled()
+    expect(write).not.toHaveBeenCalled()
   })
 
   it('aborts a guarded transaction when the signal fires during a pending write', async () => {

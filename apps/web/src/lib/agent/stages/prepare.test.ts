@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   transaction: vi.fn(),
   taskUpdateMany: vi.fn(),
+  sourceFence: vi.fn(),
   refreshExecutionAttempt: vi.fn(),
   resumeCreate: vi.fn(),
   coverLetterFindFirst: vi.fn(),
@@ -16,6 +17,7 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock('@/lib/db', () => ({ db: { $transaction: mocks.transaction } }))
+vi.mock('../source-material-fence', () => ({ acquireSourceMaterialFence: mocks.sourceFence }))
 vi.mock('../execution-control', () => ({
   refreshAgentExecutionAttempt: mocks.refreshExecutionAttempt,
   AgentExecutionCancelledError: class extends Error {
@@ -105,6 +107,7 @@ describe('runPrepare ownership fences', () => {
   beforeEach(() => {
     Object.values(mocks).forEach(mock => mock.mockReset())
     mocks.transaction.mockImplementation(async (work: (client: unknown) => Promise<unknown>) => work(tx))
+    mocks.sourceFence.mockResolvedValue(undefined)
     mocks.taskUpdateMany.mockResolvedValue({ count: 1 })
     mocks.refreshExecutionAttempt.mockResolvedValue(true)
     mocks.resumeCreate.mockResolvedValue({ id: 'resume_tailored', name: 'Tailored CV' })
@@ -165,6 +168,22 @@ describe('runPrepare ownership fences', () => {
     expect(mocks.modelChat).toHaveBeenCalledOnce()
     expect(mocks.resumeCreate).not.toHaveBeenCalled()
     expect(result.data?.packages).toEqual([])
+  })
+
+  it('waits for resume generation to finish before opening the fenced write transaction', async () => {
+    let finishWriter!: (value: { text: string }) => void
+    mocks.modelChat.mockImplementationOnce(() => new Promise(resolve => { finishWriter = resolve }))
+    const preparing = runPrepare([scoredJob()], context(true))
+    await vi.waitFor(() => expect(mocks.modelChat).toHaveBeenCalledOnce())
+
+    expect(mocks.sourceFence).not.toHaveBeenCalled()
+    expect(mocks.resumeCreate).not.toHaveBeenCalled()
+    finishWriter({ text: '{"summary":"Engineer"}' })
+    await preparing
+
+    expect(mocks.sourceFence).toHaveBeenCalledWith(tx, ['user_1'])
+    expect(mocks.modelChat.mock.invocationCallOrder[0]).toBeLessThan(mocks.sourceFence.mock.invocationCallOrder[0])
+    expect(mocks.sourceFence.mock.invocationCallOrder[0]).toBeLessThan(mocks.resumeCreate.mock.invocationCallOrder[0])
   })
 
   it('does not persist a cover letter after the ApplicationTask leaves Prepare', async () => {
