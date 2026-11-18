@@ -692,7 +692,9 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(race.writerPid).not.toBe(race.gatePid)
     expect(race.blockingObservation).toMatchObject({ blocked: true, sourceFenceQuery: true, writerFenceHeld: true })
     expect(race.gateOutcome.status).toBe("fulfilled")
-    if (race.gateOutcome.status === "fulfilled") expect(debugRecord(race.gateOutcome.value)).toMatchObject({ status: "failed" })
+    expect(race.gateOutcome.status === "fulfilled" && debugRecord(race.gateOutcome.value)?.status === "failed").toBe(true)
+    // The material-drift terminal marker and failed-child witness are asserted separately from Gate transaction rollback.
+    expect(race.after.durableWaits).toEqual(race.before.durableWaits)
     const terminalGate = await pool!.query<{ status: string; failureReason: string | null }>(`SELECT "status", "failureReason"
       FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`, [race.gateTaskId, fixture.ids.sessionId])
     expect(terminalGate.rows).toEqual([{ status: "failed", failureReason: "scheduled_prepare_material_source_changed" }])
@@ -701,20 +703,21 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const execution = await pool!.query<{ status: string; error: string | null; state: unknown }>(
       `SELECT "status", "error", "state" FROM "agent_executions" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`,
       [fixture.executionOwner.executionId, fixture.ids.userId, fixture.ids.sessionId])
-    expect(execution.rows).toHaveLength(1)
-    expect(execution.rows[0]).toMatchObject({ status: "failed", error: "scheduled_prepare_material_source_changed" })
-    const marker = debugRecord(debugRecord(execution.rows[0]?.state)?.scheduledTaskGraphMaterialDriftTerminal)
-    expect(marker).toMatchObject({ reason: "scheduled_prepare_material_source_changed",
-      owner: expect.objectContaining({ userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
-        turnId: fixture.ids.turnId, rootTaskId: fixture.ids.rootTaskId, executionId: fixture.executionOwner.executionId,
-        executionAttemptCount: fixture.executionOwner.executionAttemptCount }),
-      gate: expect.objectContaining({ taskId: race.gateTaskId }),
-      artifactDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-      currentMaterialDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-      proofDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) })
-    const approvals = await pool!.query(`SELECT "id" FROM "agent_approvals" WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3
+    const executionRow = execution.rows[0]
+    const marker = debugRecord(debugRecord(executionRow?.state)?.scheduledTaskGraphMaterialDriftTerminal)
+    const markerOwner = debugRecord(marker?.owner), markerGate = debugRecord(marker?.gate)
+    const materialDigest = (value: unknown): boolean => typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value)
+    expect(executionRow?.status === "failed" && executionRow.error === "scheduled_prepare_material_source_changed"
+      && marker?.reason === "scheduled_prepare_material_source_changed"
+      && markerOwner?.userId === fixture.ids.userId && markerOwner.sessionId === fixture.ids.sessionId
+      && markerOwner.turnId === fixture.ids.turnId && markerOwner.rootTaskId === fixture.ids.rootTaskId
+      && markerOwner.executionId === fixture.executionOwner.executionId
+      && markerOwner.executionAttemptCount === fixture.executionOwner.executionAttemptCount
+      && markerGate?.taskId === race.gateTaskId && materialDigest(marker.artifactDigest)
+      && materialDigest(marker.currentMaterialDigest) && materialDigest(marker.proofDigest)).toBe(true)
+    const approvals = await pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "agent_approvals" WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3
       AND "type"='review_application'`, [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId])
-    expect(approvals.rows).toHaveLength(0)
+    expect(approvals.rows[0]?.count ?? 0).toBe(0)
   }, 120_000)
 
   it("does not commit a Gate skip when material-only drift wins the fenced recheck", async () => {
@@ -733,14 +736,31 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(race.writerOutcome.status).toBe("fulfilled")
     expect(race.blockingObservation).toMatchObject({ blocked: true, sourceFenceQuery: true, writerFenceHeld: true })
     expect(race.gateOutcome.status).toBe("fulfilled")
-    if (race.gateOutcome.status === "fulfilled") expect(debugRecord(race.gateOutcome.value)).toMatchObject({ status: "failed" })
+    expect(race.gateOutcome.status === "fulfilled" && debugRecord(race.gateOutcome.value)?.status === "failed").toBe(true)
+    expect(race.after.durableWaits).toEqual(race.before.durableWaits)
     const terminalGate = await pool!.query<{ status: string; failureReason: string | null }>(`SELECT "status", "failureReason"
       FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`, [race.gateTaskId, fixture.ids.sessionId])
     expect(terminalGate.rows).toEqual([{ status: "failed", failureReason: "scheduled_prepare_material_source_changed" }])
     expectScheduledGateMaterialDriftRejection(race.response)
     expect(race.after).toEqual(race.before)
-    expect(race.after.applicationTasks).toHaveLength(1)
-    expect(race.after.applicationTasks[0]).toMatchObject({ status: "generating_materials", checkpoint: "material_generation_in_progress" })
+    expect(race.after.applicationTasks.count).toBe(1)
+    expect(race.after.applicationTasks.states[0]).toEqual({ status: "generating_materials", checkpoint: "material_generation_in_progress" })
+  }, 120_000)
+
+  it("detects a result-only durable-wait mutation in its bounded PostgreSQL snapshot", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    const before = await readGateSourceRaceSnapshot(fixture)
+    expect(before.durableWaits.count).toBeGreaterThan(0)
+    const mutated = await pool!.query(`WITH target AS (SELECT "id" FROM "agent_wait_conditions"
+        WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3 ORDER BY "id" LIMIT 1)
+      UPDATE "agent_wait_conditions" AS wait SET "result" = jsonb_build_object('snapshotTest', 'result-only-change')
+      FROM target WHERE wait."id"=target."id" RETURNING 1`,
+    [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId])
+    expect(mutated.rowCount).toBe(1)
+    const after = await readGateSourceRaceSnapshot(fixture)
+    expect(after.durableWaits.count).toBe(before.durableWaits.count)
+    expect(after.durableWaits.digest).not.toBe(before.durableWaits.digest)
   }, 120_000)
 
   it("issues a Gate receipt after the source writer rolls back its fenced Job update", async () => {
@@ -759,8 +779,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(race.before.approvals).toBe(0)
     expect(race.after).toMatchObject({ approvals: 1, approvalItems: 1, approvalEvents: 1, approvalOutbox: 1,
       applicationTaskEvents: 1, turnStatus: "waiting_for_approval" })
-    expect(race.after.applicationTasks).toHaveLength(1)
-    expect(race.after.applicationTasks[0]).toMatchObject({ status: "waiting_for_user", checkpoint: "materials_ready" })
+    expect(race.after.applicationTasks.count).toBe(1)
+    expect(race.after.applicationTasks.states[0]).toEqual({ status: "waiting_for_user", checkpoint: "materials_ready" })
     expect(await assertPersistedGateApprovalWitnesses(pool!, fixture, race.gateTaskId)).toHaveLength(1)
     const job = await pool!.query<{ description: string | null }>(`SELECT "description" FROM "Job" WHERE "id"=$1 AND "userId"=$2`,
       [fixture.jobRecords[0]!.id, fixture.ids.userId])
@@ -781,8 +801,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(race.before.approvals).toBe(0)
     expect(race.after).toMatchObject({ approvals: 1, approvalItems: 1, approvalEvents: 1, approvalOutbox: 1,
       applicationTaskEvents: 1, turnStatus: "waiting_for_approval" })
-    expect(race.after.applicationTasks).toHaveLength(1)
-    expect(race.after.applicationTasks[0]).toMatchObject({ status: "waiting_for_user", checkpoint: "materials_ready" })
+    expect(race.after.applicationTasks.count).toBe(1)
+    expect(race.after.applicationTasks.states[0]).toEqual({ status: "waiting_for_user", checkpoint: "materials_ready" })
     await expect(assertPersistedGateApprovalWitnesses(pool!, fixture, race.gateTaskId)).resolves.toHaveLength(1)
     const job = await pool!.query<{ description: string | null; analysisNote: string | null }>(
       `SELECT "description", "analysisNote" FROM "Job" WHERE "id"=$1 AND "userId"=$2`, [fixture.jobRecords[0]!.id, fixture.ids.userId])
@@ -2263,8 +2283,8 @@ async function waitForBarrier(barrier: ReturnType<typeof testBarrier>, label: st
 
 type GateSourceRaceSnapshot = Readonly<{
   approvals: number; approvalItems: number; approvalEvents: number; approvalOutbox: number
-  applicationTasks: readonly Readonly<{ id: string; status: string; checkpoint: string | null; updatedAt: Date }>[]
-  applicationTaskEvents: number; durableWaits: number; turnStatus: string | null
+  applicationTasks: Readonly<{ count: number; digest: string; states: readonly Readonly<{ status: string; checkpoint: string | null }>[] }>
+  applicationTaskEvents: number; durableWaits: Readonly<{ count: number; digest: string }>; turnStatus: string | null
 }>
 type SourceFenceBlockingObservation = Readonly<{
   blocked: boolean; sourceFenceQuery: boolean; writerFenceHeld: boolean; waitEventType: string | null
@@ -2346,21 +2366,30 @@ async function readGateSourceRaceSnapshot(fixture: Fixture): Promise<GateSourceR
       AND "type"='approval.requested'`, [fixture.ids.sessionId, fixture.ids.turnId]),
     pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "agent_outbox" WHERE "aggregateId"=$1
       AND "payload"->>'type'='approval.requested'`, [fixture.ids.sessionId]),
-    pool!.query<GateSourceRaceSnapshot["applicationTasks"][number]>(`SELECT "id", "status", "checkpoint", "updatedAt"
-      FROM "application_tasks" WHERE "userId"=$1 AND "jobId"=ANY($2::text[]) ORDER BY "id"`,
+    pool!.query<GateSourceRaceSnapshot["applicationTasks"]>(`SELECT COUNT(*)::int AS "count",
+        md5(COALESCE(jsonb_agg(jsonb_build_array("id", "userId", "sessionId", "jobId", "status", "checkpoint", "updatedAt")
+          ORDER BY "id")::text, '[]')) AS "digest",
+        COALESCE(jsonb_agg(jsonb_build_object('status', "status", 'checkpoint', "checkpoint") ORDER BY "id"), '[]'::jsonb) AS "states"
+      FROM "application_tasks" WHERE "userId"=$1 AND "jobId"=ANY($2::text[])`,
     [fixture.ids.userId, fixture.preparedJobIds]),
     pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "application_task_events" event
       JOIN "application_tasks" task ON task."id"=event."taskId" WHERE task."userId"=$1 AND task."jobId"=ANY($2::text[])`,
     [fixture.ids.userId, fixture.preparedJobIds]),
-    pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "agent_wait_conditions" WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3`,
+    // Fingerprint identity, lifecycle and result inside PostgreSQL; no wait IDs or stored material reach assertion output.
+    pool!.query<GateSourceRaceSnapshot["durableWaits"]>(`SELECT COUNT(*)::int AS "count",
+        md5(COALESCE(jsonb_agg(jsonb_build_array("id", "userId", "sessionId", "turnId", "parentTaskId", "stepId",
+          "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "createdAt", "updatedAt",
+          "resolvedAt", "suspendedAt", "nextReconcileAt", "consumedAt", "result") ORDER BY "id")::text, '[]')) AS "digest"
+      FROM "agent_wait_conditions" WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3`,
     [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId]),
     pool!.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id"=$1 AND "sessionId"=$2 AND "userId"=$3`,
     [fixture.ids.turnId, fixture.ids.sessionId, fixture.ids.userId]),
   ])
   return { approvals: approvals.rows[0]?.count ?? 0, approvalItems: approvalItems.rows[0]?.count ?? 0,
     approvalEvents: approvalEvents.rows[0]?.count ?? 0, approvalOutbox: approvalOutbox.rows[0]?.count ?? 0,
-    applicationTasks: applicationTasks.rows, applicationTaskEvents: applicationTaskEvents.rows[0]?.count ?? 0,
-    durableWaits: durableWaits.rows[0]?.count ?? 0, turnStatus: turn.rows[0]?.status ?? null }
+    applicationTasks: applicationTasks.rows[0] ?? { count: 0, digest: "", states: [] },
+    applicationTaskEvents: applicationTaskEvents.rows[0]?.count ?? 0,
+    durableWaits: durableWaits.rows[0] ?? { count: 0, digest: "" }, turnStatus: turn.rows[0]?.status ?? null }
 }
 
 async function waitForSourceFenceBlocking(writerPid: number, gatePid: number, timeoutMs = 15_000): Promise<SourceFenceBlockingObservation> {
