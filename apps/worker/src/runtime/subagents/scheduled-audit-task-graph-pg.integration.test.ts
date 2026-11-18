@@ -692,8 +692,10 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(race.writerPid).not.toBe(race.gatePid)
     expect(race.blockingObservation).toMatchObject({ blocked: true, sourceFenceQuery: true, writerFenceHeld: true })
     expect(race.gateOutcome.status).toBe("fulfilled")
-    if (race.gateOutcome.status === "fulfilled") expect(debugRecord(race.gateOutcome.value))
-      .toMatchObject({ status: "failed", reason: "scheduled_prepare_material_source_changed" })
+    if (race.gateOutcome.status === "fulfilled") expect(debugRecord(race.gateOutcome.value)).toMatchObject({ status: "failed" })
+    const terminalGate = await pool!.query<{ status: string; failureReason: string | null }>(`SELECT "status", "failureReason"
+      FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`, [race.gateTaskId, fixture.ids.sessionId])
+    expect(terminalGate.rows).toEqual([{ status: "failed", failureReason: "scheduled_prepare_material_source_changed" }])
     expectScheduledGateMaterialDriftRejection(race.response)
     expect(race.after).toEqual(race.before)
     const execution = await pool!.query<{ status: string; error: string | null; state: unknown }>(
@@ -731,8 +733,10 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(race.writerOutcome.status).toBe("fulfilled")
     expect(race.blockingObservation).toMatchObject({ blocked: true, sourceFenceQuery: true, writerFenceHeld: true })
     expect(race.gateOutcome.status).toBe("fulfilled")
-    if (race.gateOutcome.status === "fulfilled") expect(debugRecord(race.gateOutcome.value))
-      .toMatchObject({ status: "failed", reason: "scheduled_prepare_material_source_changed" })
+    if (race.gateOutcome.status === "fulfilled") expect(debugRecord(race.gateOutcome.value)).toMatchObject({ status: "failed" })
+    const terminalGate = await pool!.query<{ status: string; failureReason: string | null }>(`SELECT "status", "failureReason"
+      FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`, [race.gateTaskId, fixture.ids.sessionId])
+    expect(terminalGate.rows).toEqual([{ status: "failed", failureReason: "scheduled_prepare_material_source_changed" }])
     expectScheduledGateMaterialDriftRejection(race.response)
     expect(race.after).toEqual(race.before)
     expect(race.after.applicationTasks).toHaveLength(1)
