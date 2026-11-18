@@ -14,8 +14,9 @@ import { loadDurableScheduledTaskGraphWait, loadScheduledTaskGraphWaitQuestion, 
 import { hasEffectiveEntitlement, isFeatureAllowed, resolveAiAccess } from "@/lib/entitlements";
 import { isAnalyzeSourceChangedError, isScheduledTaskGraphAnalyzeProofUntrusted, isScheduledTaskGraphSourceChangeTerminal, renewExpiredScheduledAnalyzeClaim, respondToScheduledTaskGraphAnalyzeSourceChange } from "@/lib/agent/scheduled-taskgraph-source-change-terminal";
 import { scheduledTaskGraphGateMaterialDriftTerminalForRequest } from "@/lib/agent/scheduled-taskgraph-gate-material-drift";
+import { scheduledTaskGraphRecoverySnapshot } from "@/lib/agent/scheduled-taskgraph-recovery-callsite";
 import { parseScheduledTaskGraphAttestation, scheduledTaskGraphAttestationCandidates } from "@/lib/agent/scheduled-taskgraph-attestation-candidates";
-import { blocked, claimLeaseIsActive, claimLeaseIsValidAndExpired, completedResponse, hasMarkerlessScoutState, hasPrepareCheckpoint, isWaitResult, json, mapCheckpointError, matchingTurnSnapshot, parseScheduledTaskGraphPipelineRequest, record, reportLeaseIsCurrent, safeCount, validId, type ScheduledTaskGraphPipelineBody, type ScheduledTaskGraphStoredExecution } from "@/lib/agent/scheduled-taskgraph-pipeline-request";
+import { blocked, claimLeaseIsActive, claimLeaseIsValidAndExpired, completedResponse, hasMarkerlessScoutState, hasPrepareCheckpoint, isWaitResult, json, mapCheckpointError, parseScheduledTaskGraphPipelineRequest, record, reportLeaseIsCurrent, safeCount, validId, type ScheduledTaskGraphPipelineBody, type ScheduledTaskGraphStoredExecution } from "@/lib/agent/scheduled-taskgraph-pipeline-request";
 export const maxDuration = 300;
 const CLAIM_SCHEMA = "agent-harness.v2.scheduled-pipeline-claim.v1";
 function candidates(value: unknown): string[] | null {
@@ -51,12 +52,11 @@ export async function POST(request: Request): Promise<Response> {
   let body: ScheduledTaskGraphPipelineBody;
   if (parsed.action === "legacy") body = parsed;
   else {
-    const result = await runScheduledTaskGraphActionRpc(parsed, request.signal);
+    const result = await runScheduledTaskGraphActionRpc(parsed, request.signal, request);
     if (result instanceof Response) return result;
     body = result.request;
   }
-  const auditAction = body.action === "scheduled_audit_execute" ? body : null;
-  const { owner, attestation } = body;
+  const auditAction = body.action === "scheduled_audit_execute" ? body : null; const { owner, attestation } = body;
   const [turn, root, session, user] = await Promise.all([
     db.agentTurn.findFirst({ where: { id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId },
       select: { id: true, userId: true, sessionId: true, status: true, source: true, executionMode: true, input: true,
@@ -69,15 +69,13 @@ export async function POST(request: Request): Promise<Response> {
     db.user.findUnique({ where: { id: owner.userId }, select: { accountStatus: true } }),
   ]);
   if (!turn || !session || turn.userId !== owner.userId || turn.sessionId !== owner.sessionId || turn.rootTaskId !== owner.rootTaskId) return blocked(409, "scheduled_pipeline_owner_mismatch");
-  const snapshot = matchingTurnSnapshot(turn.input);
-  if (turn.source !== "automation" || turn.executionMode !== "canonical_task_graph" || !snapshot) {
-    return blocked(409, "scheduled_pipeline_mode_mismatch");
-  }
+  if (turn.source !== "automation" || turn.executionMode !== "canonical_task_graph") return blocked(409, "scheduled_pipeline_mode_mismatch");
   if (!root || !scheduledRootIdentityMatches(root, owner)) return blocked(409, "scheduled_pipeline_owner_mismatch");
-  const execution = await loadExecution(owner);
-  if (!execution || !safeCount(execution.attemptCount)) return blocked(409, "scheduled_pipeline_execution_mismatch");
+  const execution = await loadExecution(owner); if (!execution || !safeCount(execution.attemptCount)) return blocked(409, "scheduled_pipeline_execution_mismatch");
   const executionOwner: ScheduledTaskGraphPipelineOwner = { ...owner, executionId: execution.id, executionAttemptCount: execution.attemptCount };
-  if (isScheduledTaskGraphSourceChangeTerminal({ owner: executionOwner, status: execution.status, error: execution.error, state: execution.state })) return blocked(409, "scheduled_pipeline_source_changed");
+  const snapshot = await scheduledTaskGraphRecoverySnapshot({ client: db, request, owner: executionOwner, turnInput: turn.input,
+    caller: parsed.action === "legacy" && ["scout", "analyze", "prepare"].includes(String(record(execution.state)?.nextStage)) ? "analyze_prepare" : "execute" });
+  if (!snapshot) return blocked(409, "scheduled_pipeline_mode_mismatch"); if (isScheduledTaskGraphSourceChangeTerminal({ owner: executionOwner, status: execution.status, error: execution.error, state: execution.state })) return blocked(409, "scheduled_pipeline_source_changed");
   const auditCurrent = auditAction ? await scheduledAuditChildIsCurrent(executionOwner, auditAction.auditActor) : false;
   if (auditAction ? !auditCurrent : !scheduledRootIsCurrent(root, owner)) return blocked(409, auditAction ? "scheduled_pipeline_audit_child_fenced" : "scheduled_pipeline_turn_stale");
   let key: string, liveSnapshotDigest: string; try { liveSnapshotDigest = scheduledAutomationSnapshotDigest(snapshot);

@@ -5,7 +5,7 @@ const mocks = vi.hoisted(() => ({
   question: vi.fn(), runPipeline: vi.fn(), postGateTask: vi.fn(), gateAction: vi.fn(), validatePrepareWait: vi.fn(), snapshot: vi.fn(), loadAi: vi.fn(), resolveConfig: vi.fn(), featureAllowed: vi.fn(), entitlement: vi.fn(), aiAccess: vi.fn(),
   auditCurrent: vi.fn(), auditClaim: vi.fn(), auditRace: vi.fn(), validateAuditPrepare: vi.fn(),
   sourceTerminal: vi.fn(), sourceUntrusted: vi.fn(), sourceAnalyzeResponse: vi.fn(), sourceAnalyzeError: vi.fn(), renew: vi.fn(), snapshotDigest: vi.fn(),
-  materialTerminal: vi.fn(),
+  materialTerminal: vi.fn(), recoverySnapshot: vi.fn(),
 }));
 vi.mock("@/lib/db", () => ({ db: {
   agentTurn: { findFirst: mocks.turn }, subAgentTask: { findFirst: mocks.root },
@@ -28,6 +28,7 @@ vi.mock("@/lib/agent/scheduled-taskgraph-source-change-terminal", () => ({
 vi.mock("@/lib/agent/scheduled-taskgraph-gate-material-drift", () => ({
   scheduledTaskGraphGateMaterialDriftTerminalForRequest: mocks.materialTerminal,
 }));
+vi.mock("@/lib/agent/scheduled-taskgraph-recovery-callsite", () => ({ scheduledTaskGraphRecoverySnapshot: mocks.recoverySnapshot }));
 vi.mock("@/lib/agent/scheduled-taskgraph-audit-action", () => ({
   claimScheduledAuditExecution: mocks.auditClaim, scheduledAuditChildIsCurrent: mocks.auditCurrent,
   scheduledAuditClaimRaceResponse: mocks.auditRace,
@@ -194,6 +195,10 @@ describe("scheduled pipeline continuation route", () => {
     mocks.sourceAnalyzeError.mockReturnValue(false);
     mocks.sourceAnalyzeResponse.mockResolvedValue(Response.json({ status: "blocked", errorCode: "scheduled_pipeline_claim_conflict" }, { status: 409 }));
     mocks.materialTerminal.mockReturnValue(false);
+    mocks.recoverySnapshot.mockImplementation(({ turnInput }: { turnInput: unknown }) => {
+      const input = turnInput && typeof turnInput === "object" ? turnInput as Record<string, unknown> : null;
+      return input?.automationRunMode === "scheduled" ? mocks.snapshot(input.scheduledAutomationSnapshot) : null;
+    });
     mocks.renew.mockImplementation((input: { state: Record<string, unknown>; claimToken: string }) => {
       const oldClaim = input.state.scheduledTaskGraphClaim as Record<string, unknown>;
       const now = new Date();
@@ -244,6 +249,38 @@ describe("scheduled pipeline continuation route", () => {
     expect(mocks.sourceAnalyzeResponse).not.toHaveBeenCalled();
     expect(mocks.jobs).not.toHaveBeenCalled();
     expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("admits a validated manual recovery only for a fresh Analyze/Prepare route", async () => {
+    const turnInput = { automationRunMode: "manual", materialDriftRecovery: { schemaVersion: "server-owned" } };
+    mocks.turn.mockResolvedValueOnce({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId,
+      status: "in_progress", source: "automation", executionMode: "canonical_task_graph", input: turnInput,
+      rootTaskId: owner.rootTaskId, leaseOwnerId: owner.turnLeaseOwnerId, leaseVersion: owner.turnLeaseVersion,
+      leaseExpiresAt: new Date(Date.now() + 60_000) });
+    mocks.recoverySnapshot.mockResolvedValueOnce(scheduledSnapshot);
+    const { POST } = await import("./route");
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(200);
+    expect(mocks.recoverySnapshot).toHaveBeenCalledWith(expect.objectContaining({ request: expect.any(Request),
+      owner: fullOwner, turnInput, caller: "analyze_prepare" }));
+    expect(mocks.runPipeline).toHaveBeenCalledOnce();
+  });
+
+  it("keeps ordinary manual Turns rejected when no persisted recovery admission exists", async () => {
+    mocks.turn.mockResolvedValueOnce({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId,
+      status: "in_progress", source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "manual" }, rootTaskId: owner.rootTaskId,
+      leaseOwnerId: owner.turnLeaseOwnerId, leaseVersion: owner.turnLeaseVersion,
+      leaseExpiresAt: new Date(Date.now() + 60_000) });
+    const { POST } = await import("./route");
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ status: "blocked", errorCode: "scheduled_pipeline_mode_mismatch" });
     expect(mocks.runPipeline).not.toHaveBeenCalled();
   });
 
