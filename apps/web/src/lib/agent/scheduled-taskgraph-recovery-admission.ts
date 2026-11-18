@@ -9,12 +9,14 @@ import { parseScheduledAutomationSnapshot, type ScheduledAutomationSnapshot } fr
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint"
 
 const MAX_RECOVERY_TURNS = 64
-const CURRENT_TURN_STATUSES = new Set(["in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
 const CURRENT_ROOT_STATUSES = new Set(["running", "waiting"])
+const GATE_WAITING_TURN_STATUSES = new Set(["waiting_for_dependency", "waiting_for_approval", "waiting_for_user", "waiting_for_tool"])
+
+export type ScheduledTaskGraphRecoveryAdmissionCaller = "analyze_prepare" | "gate"
 
 type AdmissionClient = Pick<Prisma.TransactionClient, "$queryRaw">
 type SessionRow = { id: string; userId: string; source: string; status: string }
-type TurnRow = RecoveryLineageTurn & { leaseOwnerId: string | null }
+type TurnRow = RecoveryLineageTurn & { leaseOwnerId: string | null; leaseExpiresAt: Date | string | null }
 type TaskRow = { id: string; userId: string; sessionId: string; turnId: string | null; rootTaskId: string | null;
   parentTaskId: string | null; depth: number; role: string; taskType: string; status: string; attemptCount: number;
   interruptRequestedAt: Date | null; closedAt: Date | null }
@@ -37,9 +39,10 @@ export async function resolveScheduledTaskGraphRecoveryAdmission(input: {
   client: AdmissionClient
   request: Request
   owner: ScheduledTaskGraphPipelineOwner
+  caller: ScheduledTaskGraphRecoveryAdmissionCaller
 }): Promise<ScheduledTaskGraphRecoveryAdmission | null> {
-  const { client, request, owner } = input
-  if (!hasWorkerSecret(request) || !validOwner(owner)) return null
+  const { client, request, owner, caller } = input
+  if (!hasWorkerSecret(request) || !validOwner(owner) || !validCaller(caller)) return null
 
   try {
     const sessions = await client.$queryRaw<SessionRow[]>`
@@ -51,14 +54,13 @@ export async function resolveScheduledTaskGraphRecoveryAdmission(input: {
 
     const turns = await client.$queryRaw<TurnRow[]>`
       SELECT turn."id", turn."userId", turn."sessionId", turn."status", turn."source", turn."executionMode", turn."input",
-        turn."rootTaskId", turn."leaseVersion", turn."leaseOwnerId", turn."createdAt"
+        turn."rootTaskId", turn."leaseVersion", turn."leaseOwnerId", turn."leaseExpiresAt", turn."createdAt"
       FROM "agent_turns" AS turn WHERE turn."id" = ${owner.turnId} AND turn."userId" = ${owner.userId}
         AND turn."sessionId" = ${owner.sessionId}
     `
     const turn = turns[0]
     if (!turn || turn.source !== "automation" || turn.executionMode !== "canonical_task_graph"
-      || !CURRENT_TURN_STATUSES.has(turn.status) || turn.rootTaskId !== owner.rootTaskId
-      || turn.leaseVersion !== owner.turnLeaseVersion || turn.leaseOwnerId !== owner.turnLeaseOwnerId) return null
+      || !turnLeaseIsAdmissible(turn, owner, caller) || turn.rootTaskId !== owner.rootTaskId) return null
 
     const rootRows = await client.$queryRaw<TaskRow[]>`
       SELECT task."id", session."userId", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId",
@@ -161,6 +163,23 @@ async function loadRecoveryHistory(client: AdmissionClient, currentIntent: NonNu
 function hasWorkerSecret(request: Request): boolean {
   const expected = process.env.AGENT_WORKER_SECRET
   return Boolean(expected && request.headers.get("x-agent-worker-secret") === expected)
+}
+function validCaller(value: unknown): value is ScheduledTaskGraphRecoveryAdmissionCaller {
+  return value === "analyze_prepare" || value === "gate"
+}
+function turnLeaseIsAdmissible(turn: TurnRow, owner: ScheduledTaskGraphPipelineOwner,
+  caller: ScheduledTaskGraphRecoveryAdmissionCaller): boolean {
+  if (caller === "analyze_prepare") return turn.status === "in_progress" && turn.leaseOwnerId === owner.turnLeaseOwnerId
+    && turn.leaseVersion === owner.turnLeaseVersion && leaseIsUnexpired(turn.leaseExpiresAt)
+  if (turn.status === "in_progress") {
+    return turn.leaseOwnerId === owner.turnLeaseOwnerId && turn.leaseVersion === owner.turnLeaseVersion
+      && validId(turn.leaseOwnerId) && positive(turn.leaseVersion) && leaseIsUnexpired(turn.leaseExpiresAt)
+  }
+  return GATE_WAITING_TURN_STATUSES.has(turn.status) && turn.leaseOwnerId === null && turn.leaseExpiresAt === null
+}
+function leaseIsUnexpired(value: Date | string | null): boolean {
+  const expiresAt = value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : Number.NaN
+  return Number.isFinite(expiresAt) && expiresAt > Date.now()
 }
 function validOwner(owner: ScheduledTaskGraphPipelineOwner): boolean {
   return Boolean(owner && [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.turnLeaseOwnerId, owner.executionId]

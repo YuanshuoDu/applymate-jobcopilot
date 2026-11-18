@@ -10,7 +10,7 @@ const LINEAGE_KEYS = ["userId", "sessionId", "automationId", "previousTurnId", "
   "previousGateAttemptCount", "previousRootTaskId", "previousRootAttemptCount", "previousTurnLeaseVersion",
   "previousExecutionAttemptCount", "sourceMarker"] as const
 const RECOVERY_TERMINAL = new Set(["interrupted", "failed", "cancelled"])
-const ACTIVE_RECOVERY = new Set(["in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
+const ACTIVE_RECOVERY = new Set(["in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user", "waiting_for_tool"])
 const SOURCE_ROOT_TERMINAL = new Set(["running", "waiting", "waiting_for_user", "failed", "interrupted"])
 const SOURCE_GATE_TERMINAL = new Set(["failed", "interrupted"])
 const MAX_ATTEMPT = 2_147_483_647

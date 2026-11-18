@@ -3,6 +3,7 @@ import { resolveScheduledTaskGraphRecoveryAdmission } from "./scheduled-taskgrap
 import type { MaterialDriftRecoveryIntent, RecoveryLineageTurn } from "./material-drift-recovery-lineage"
 import type { ScheduledAutomationSnapshot } from "./scheduled-automation-snapshot"
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint"
+import { scheduledTaskGraphGateTaskLeaseIsCurrent } from "./scheduled-taskgraph-gate-rpc"
 
 const owner: ScheduledTaskGraphPipelineOwner = { userId: "user_1", sessionId: "session_1", turnId: "recovery_1", rootTaskId: "new_root",
   rootAttemptCount: 1, turnLeaseOwnerId: "current_lease", turnLeaseVersion: 1, executionId: "execution_1", executionAttemptCount: 5 }
@@ -17,7 +18,7 @@ const sourceMarker = { schemaVersion: "agent-harness.v2.scheduled-prepare-materi
   analyzeFingerprintDigest: digest("a"), prepareProofDigest: digest("b"), artifactDigest: digest("c"),
   currentMaterialDigest: digest("d"), proofDigest: digest("e") }
 
-type StoredTurn = RecoveryLineageTurn & { leaseOwnerId?: string | null }
+type StoredTurn = RecoveryLineageTurn & { leaseOwnerId?: string | null; leaseExpiresAt?: Date | string | null }
 type TaskRow = { id: string; userId: string; sessionId: string; turnId: string | null; rootTaskId: string | null;
   parentTaskId: string | null; depth: number; role: string; taskType: string; status: string; attemptCount: number;
   interruptRequestedAt: Date | null; closedAt: Date | null }
@@ -41,7 +42,7 @@ function fixture(): FixtureRows {
   const current: StoredTurn = { id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId, status: "in_progress",
     source: "automation", executionMode: "canonical_task_graph", input: { automationRunMode: "manual", scheduledAutomationSnapshot: snapshot,
       materialDriftRecovery: intent }, rootTaskId: owner.rootTaskId, leaseVersion: owner.turnLeaseVersion,
-    leaseOwnerId: owner.turnLeaseOwnerId, createdAt: new Date(2_000) }
+    leaseOwnerId: owner.turnLeaseOwnerId, leaseExpiresAt: new Date(Date.now() + 60_000), createdAt: new Date(2_000) }
   return { session: { id: owner.sessionId, userId: owner.userId, source: "automation", status: "running" },
     turns: [current, sourceTurn()],
     tasks: [
@@ -84,7 +85,7 @@ afterEach(() => vi.unstubAllEnvs())
 describe("scheduled TaskGraph recovery admission", () => {
   it("admits a current private manual recovery without changing mode or exposing historical marker data", async () => {
     const rows = fixture()
-    const result = await resolveScheduledTaskGraphRecoveryAdmission({ client: admissionClient(rows), request: privateRequest(), owner })
+    const result = await resolveScheduledTaskGraphRecoveryAdmission({ client: admissionClient(rows), request: privateRequest(), owner, caller: "analyze_prepare" })
 
     expect(result).toEqual({ snapshot, automationId: scope.automationId, owner })
     expect((rows.turns[0]!.input as { automationRunMode: string }).automationRunMode).toBe("manual")
@@ -92,9 +93,49 @@ describe("scheduled TaskGraph recovery admission", () => {
     expect(JSON.stringify(result)).not.toContain("sourceMarker")
   })
 
+  it.each(["waiting_for_dependency", "waiting_for_approval", "waiting_for_user", "waiting_for_tool"] as const)(
+    "admits Gate recovery while the Turn lease is released in %s, leaving Gate child lease checks to the caller",
+    async status => {
+      const rows = fixture()
+      rows.turns[0] = { ...rows.turns[0]!, status, leaseOwnerId: null, leaseExpiresAt: null }
+      const admission = await resolveScheduledTaskGraphRecoveryAdmission({ client: admissionClient(rows), request: privateRequest(), owner, caller: "gate" })
+      expect(admission).toMatchObject({ automationId: scope.automationId, owner })
+
+      const staleGate = { id: "old_gate", sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+        parentTaskId: owner.rootTaskId, depth: 1, role: "prepare", taskType: "scheduled_taskgraph_gate", status: "running",
+        attemptCount: 5, leaseOwner: "stale_gate_lease", leaseExpiresAt: new Date(Date.now() + 60_000), interruptRequestedAt: null,
+        closedAt: null, expectedOutputSchema: { schemaVersion: "agent-harness.v2.subagent.result", role: "prepare",
+          taskType: "scheduled_taskgraph_gate" }, allowedActions: [] }
+      expect(scheduledTaskGraphGateTaskLeaseIsCurrent(staleGate, { owner, taskId: "old_gate", leaseOwnerId: "new_gate_lease", attemptCount: 5 }))
+        .toBe(false)
+    },
+  )
+
+  it("requires an exact unexpired Turn lease for an active Gate caller", async () => {
+    const rows = fixture()
+    expect(await resolveScheduledTaskGraphRecoveryAdmission({ client: admissionClient(rows), request: privateRequest(), owner, caller: "gate" }))
+      .not.toBeNull()
+    rows.turns[0] = { ...rows.turns[0]!, leaseOwnerId: "replaced_lease" }
+    expect(await resolveScheduledTaskGraphRecoveryAdmission({ client: admissionClient(rows), request: privateRequest(), owner, caller: "gate" }))
+      .toBeNull()
+    rows.turns[0] = { ...rows.turns[0]!, leaseOwnerId: owner.turnLeaseOwnerId, leaseVersion: owner.turnLeaseVersion + 1 }
+    expect(await resolveScheduledTaskGraphRecoveryAdmission({ client: admissionClient(rows), request: privateRequest(), owner, caller: "gate" }))
+      .toBeNull()
+    rows.turns[0] = { ...rows.turns[0]!, leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: new Date(Date.now() - 1) }
+    expect(await resolveScheduledTaskGraphRecoveryAdmission({ client: admissionClient(rows), request: privateRequest(), owner, caller: "gate" }))
+      .toBeNull()
+  })
+
   it("requires the worker secret before reading persisted state", async () => {
     const client = admissionClient(fixture())
-    expect(await resolveScheduledTaskGraphRecoveryAdmission({ client, request: privateRequest("wrong"), owner })).toBeNull()
+    expect(await resolveScheduledTaskGraphRecoveryAdmission({ client, request: privateRequest("wrong"), owner, caller: "analyze_prepare" })).toBeNull()
+    expect(vi.mocked(client.$queryRaw)).not.toHaveBeenCalled()
+  })
+
+  it("fails closed for an unsupported caller before reading persisted state", async () => {
+    const client = admissionClient(fixture())
+    const invalidInput = { client, request: privateRequest(), owner, caller: "unknown" } as unknown as Parameters<typeof resolveScheduledTaskGraphRecoveryAdmission>[0]
+    expect(await resolveScheduledTaskGraphRecoveryAdmission(invalidInput)).toBeNull()
     expect(vi.mocked(client.$queryRaw)).not.toHaveBeenCalled()
   })
 
@@ -102,7 +143,7 @@ describe("scheduled TaskGraph recovery admission", () => {
     const rows = fixture(), current = rows.turns[0]!
     rows.turns[0] = { ...current, input: { automationRunMode: "manual", scheduledAutomationSnapshot: snapshot } }
     const result = await resolveScheduledTaskGraphRecoveryAdmission({ client: admissionClient(rows), request: privateRequest("worker-secret",
-      { automationRunMode: "scheduled", materialDriftRecovery: (current.input as { materialDriftRecovery: unknown }).materialDriftRecovery }), owner })
+      { automationRunMode: "scheduled", materialDriftRecovery: (current.input as { materialDriftRecovery: unknown }).materialDriftRecovery }), owner, caller: "analyze_prepare" })
     expect(result).toBeNull()
   })
 
@@ -110,8 +151,10 @@ describe("scheduled TaskGraph recovery admission", () => {
     ["current turn lease version", (rows: FixtureRows) => { rows.turns[0] = { ...rows.turns[0]!, leaseVersion: 2 } }],
     ["current turn lease owner", (rows: FixtureRows) => { rows.turns[0] = { ...rows.turns[0]!, leaseOwnerId: "replaced_lease" } }],
     ["missing current turn lease owner", (rows: FixtureRows) => { rows.turns[0] = { ...rows.turns[0]!, leaseOwnerId: null } }],
+    ["expired current turn lease", (rows: FixtureRows) => { rows.turns[0] = { ...rows.turns[0]!, leaseExpiresAt: new Date(Date.now() - 1) } }],
     ["queued current Turn", (rows: FixtureRows) => { rows.turns[0] = { ...rows.turns[0]!, status: "queued" } }],
     ["completed current Turn", (rows: FixtureRows) => { rows.turns[0] = { ...rows.turns[0]!, status: "completed" } }],
+    ["waiting current Turn", (rows: FixtureRows) => { rows.turns[0] = { ...rows.turns[0]!, status: "waiting_for_approval" } }],
     ["current root attempt", (rows: FixtureRows) => { rows.tasks[0] = { ...rows.tasks[0]!, attemptCount: 2 } }],
     ["inactive current root", (rows: FixtureRows) => { rows.tasks[0] = { ...rows.tasks[0]!, status: "completed" } }],
     ["current execution attempt", (rows: FixtureRows) => { rows.execution = { ...rows.execution, attemptCount: 6 } }],
@@ -123,7 +166,7 @@ describe("scheduled TaskGraph recovery admission", () => {
   ] as const)("fails closed on %s mismatch", async (_label, corrupt) => {
     const rows = fixture()
     corrupt(rows)
-    expect(await resolveScheduledTaskGraphRecoveryAdmission({ client: admissionClient(rows), request: privateRequest(), owner })).toBeNull()
+    expect(await resolveScheduledTaskGraphRecoveryAdmission({ client: admissionClient(rows), request: privateRequest(), owner, caller: "analyze_prepare" })).toBeNull()
   })
 
   it("validates a fresh Turn against every persisted recovery predecessor", async () => {
@@ -140,7 +183,7 @@ describe("scheduled TaskGraph recovery admission", () => {
       attemptCount: nextOwner.rootAttemptCount }
     rows.execution = { ...rows.execution, attemptCount: nextOwner.executionAttemptCount }
 
-    expect(await resolveScheduledTaskGraphRecoveryAdmission({ client: admissionClient(rows), request: privateRequest(), owner: nextOwner }))
+    expect(await resolveScheduledTaskGraphRecoveryAdmission({ client: admissionClient(rows), request: privateRequest(), owner: nextOwner, caller: "analyze_prepare" }))
       .toEqual({ snapshot, automationId: scope.automationId, owner: nextOwner })
   })
 })
