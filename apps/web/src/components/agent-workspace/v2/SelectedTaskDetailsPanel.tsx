@@ -7,6 +7,7 @@ import { useI18n } from '@/lib/i18n'
 import { AgentTurnRetryControl } from './AgentTurnRetryControl'
 import { ChildWorkerAttachView, type ChildWorkerTask } from './ChildWorkerAttachView'
 import { AgentTaskWaitDetailsCard } from './AgentTaskWaitDetailsCard'
+import { SelectedWorkerDraftArtifact, selectedWorkerDraftDisclosureKey, selectedWorkerDraftForSelection } from './SelectedWorkerDraftArtifact'
 import { EvidenceSummary, statusLabel } from './agent-supervisor-evidence'
 import { taskInterruptEventVersion, TaskInterruptControl, flattenTaskTree } from './TaskTreePanel'
 import { projectSelectedTaskInterrupt, type SupervisorTurnSummary } from './task-tree-projection'
@@ -39,6 +40,7 @@ export function SelectedTaskDetailsPanel(props: SelectedTaskDetailsPanelProps) {
   const interrupt = projectSelectedTaskInterrupt(props.tasks, props.turns, selectedNode, props.items)
   const interruptVersion = interrupt ? taskInterruptEventVersion(props.items, interrupt.task.id) : null
   const selectedTaskId = selectedNode.kind === 'task' ? selectedNode.id.slice('task:'.length) : undefined
+  const writerDraft = selectedWorkerDraftForSelection(props.sessionId, selectedNode, selectedWorker, props.tasks)
   const selectTarget = (taskId: string) => selectAuthorizedWaitTarget(taskId, taskNodeIds, props.onSelectNode)
 
   return (
@@ -53,6 +55,10 @@ export function SelectedTaskDetailsPanel(props: SelectedTaskDetailsPanelProps) {
         key={`${props.sessionId}:${selectedWorker.id}`} sessionId={props.sessionId} parent={selectedWorker}
         lifecycleRevision={props.lifecycleRevision} selectedTaskId={selectedTaskId} taskNodeIds={taskNodeIds}
         onSelectTarget={selectTarget}
+      />}
+      {writerDraft && <SelectedWorkerDraftArtifact
+        key={selectedWorkerDraftDisclosureKey(props.sessionId, writerDraft)}
+        sessionId={props.sessionId} artifactRef={writerDraft.artifactRef}
       />}
       {selectedWorker?.parentTaskId && selectedWorker.id !== selectedWorker.rootTaskId
         ? <ChildWorkerAttachView key={`attach:${selectedWorker.id}`} sessionId={props.sessionId} task={selectedWorker} items={props.items} onClose={props.onReturnToCurrent} onConflict={props.onConflict} />
