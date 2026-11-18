@@ -75,7 +75,7 @@ function recoverySession() {
   return { id: "session_1", goal: "Run automation: Weekday Berlin SWE Scout", status: "running", source: "automation",
     memorySummary: "Automation queued for execution.", qualityScore: null, currentTaskId: null,
     createdAt: new Date("2026-06-18T08:00:00Z"), updatedAt: new Date("2026-06-18T08:00:00Z"), completedAt: null,
-    eventSequence: 1n, userId: "user_1", internalAccessToken: "server-only" }
+    eventSequence: BigInt(1), userId: "user_1", internalAccessToken: "server-only" }
 }
 
 function expectedSessionResponse() {
@@ -128,7 +128,7 @@ describe("agent automation run API", () => {
       createdAt: new Date("2026-06-18T08:00:00Z"),
       updatedAt: new Date("2026-06-18T08:00:00Z"),
       completedAt: null,
-      eventSequence: 1n,
+      eventSequence: BigInt(1),
       userId: "user_1",
       internalAccessToken: "server-only",
     })
