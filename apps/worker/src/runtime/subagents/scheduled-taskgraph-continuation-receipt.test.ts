@@ -267,5 +267,22 @@ describe("scheduled TaskGraph continuation receipt", () => {
       status: "in_progress", leaseOwnerId: "worker-1", leaseVersion: 4, leaseExpiresAt: new Date() }, digest)).toBe(true)
     expect(scheduledSnapshotMatches({ source: "interactive", executionMode: "canonical_task_graph",
       input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: snapshot }, status: "in_progress" }, digest)).toBe(false)
+    const sourceMarker = { schemaVersion: "agent-harness.v2.scheduled-prepare-material-drift-terminal.v1",
+      reason: "scheduled_prepare_material_source_changed", owner: { userId: "user-1", sessionId: "session-1", turnId: "old-turn",
+        rootTaskId: "old-root", rootAttemptCount: 1, turnLeaseOwnerId: "old-worker", turnLeaseVersion: 1,
+        executionId: "execution-1", executionAttemptCount: 3 }, gate: { taskId: "old-gate", leaseOwnerId: "gate-worker", attemptCount: 1 },
+      analyzeFingerprintDigest: `sha256:${"1".repeat(64)}`, prepareProofDigest: `sha256:${"2".repeat(64)}`,
+      artifactDigest: `sha256:${"3".repeat(64)}`, currentMaterialDigest: `sha256:${"4".repeat(64)}`, proofDigest: `sha256:${"5".repeat(64)}` }
+    const recoveryIntent = { schemaVersion: "agent-harness.v2.material-drift-recovery.v2", turnId: "turn-1", userId: "user-1",
+      sessionId: "session-1", automationId: "automation-1", previousTurnId: "old-turn", previousExecutionId: "execution-1",
+      previousRecoveryTurnId: null, previousGateTaskId: "old-gate", previousGateAttemptCount: 1, previousRootTaskId: "old-root", previousRootAttemptCount: 1,
+      previousTurnLeaseVersion: 1, previousExecutionAttemptCount: 3, reservedExecutionAttemptCount: 4,
+      currentSnapshotDigest: digest, sourceMarker }
+    const recoveryTurn = { id: "turn-1", userId: "user-1", sessionId: "session-1", source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "manual", scheduledAutomationSnapshot: snapshot, materialDriftRecovery: recoveryIntent } }
+    expect(scheduledSnapshotMatches(recoveryTurn, digest)).toBe(true)
+    expect(scheduledSnapshotMatches({ ...recoveryTurn, id: "forked-turn" }, digest)).toBe(false)
+    expect(scheduledSnapshotMatches({ ...recoveryTurn, input: { ...recoveryTurn.input,
+      scheduledAutomationSnapshot: { ...snapshot, targetLocations: ["Paris"] } } }, digest)).toBe(false)
   })
 })

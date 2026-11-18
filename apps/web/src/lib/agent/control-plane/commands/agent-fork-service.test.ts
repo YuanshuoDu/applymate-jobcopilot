@@ -10,7 +10,9 @@ describe("AgentForkService Turn projection", () => {
     const source = {
       id: "source-session", userId: "owner", goal: "Goal", source: "user", memorySummary: null,
       searchFootprintMemoryEnabledAtCreation: false, searchFootprintMemoryConsentVersionAtCreation: 1,
-      turns: [{ id: "turn-1", source: "user", status: "completed", input: { goal: "Goal" }, finalResponse: "Done",
+      turns: [{ id: "turn-1", source: "user", status: "completed", input: {
+        goal: "Goal", materialDriftRecovery: { schemaVersion: "agent-harness.v2.material-drift-recovery.v1", sourceMarker: "PRIVATE_RECOVERY_MARKER" },
+      }, finalResponse: "Done",
         error: null, modelProfileSnapshot: {}, inputTokens: 1, outputTokens: 2, estimatedCostUsd: 0,
         durationMs: 10, startedAt: completedAt, completedAt, createdAt: completedAt }],
       items: [], events: [], contextSnapshots: [],
@@ -21,7 +23,7 @@ describe("AgentForkService Turn projection", () => {
       user: { findUnique: vi.fn(async () => ({ agentSearchFootprintMemoryEnabled: true, agentSearchFootprintMemoryConsentVersion: 8 })) },
       agentSession: { findFirst, create: vi.fn(async () => ({})), update: vi.fn(async () => ({})) },
       agentEvent: { findFirst: vi.fn(async () => null), create: vi.fn(async () => ({})) },
-      agentTurn: { createMany: vi.fn(async () => ({ count: 1 })) },
+      agentTurn: { createMany: vi.fn(async (_input: { data: Array<{ input: unknown }> }) => ({ count: 1 })) },
       agentItem: { createMany: vi.fn(async () => ({ count: 0 })) },
     }
     const db = { $transaction: vi.fn(async (work: (value: typeof tx) => Promise<unknown>) => work(tx)) } as unknown as PrismaClient
@@ -34,6 +36,9 @@ describe("AgentForkService Turn projection", () => {
     expect(tx.agentSession.create).toHaveBeenCalledWith({ data: expect.objectContaining({
       searchFootprintMemoryEnabledAtCreation: true, searchFootprintMemoryConsentVersionAtCreation: 8,
     }) })
+    const copiedTurns = tx.agentTurn.createMany.mock.calls[0]?.[0] as unknown as { data: Array<{ input: unknown }> }
+    expect(copiedTurns.data[0]?.input).toEqual({ goal: "Goal" })
+    expect(JSON.stringify(copiedTurns.data[0]?.input)).not.toContain("PRIVATE_RECOVERY_MARKER")
     const sourceRead = findFirst.mock.calls[1]?.[0] as unknown as { select: { turns: { select: unknown } } }
     expect(sourceRead.select.turns.select).toEqual(agentForkTurnSelect)
     expect(Object.keys(agentForkTurnSelect)).not.toContain("nativeSemanticProgressMode")

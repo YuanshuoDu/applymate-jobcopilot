@@ -8,6 +8,7 @@ import type { TaskGraphVerificationEvidenceProjection } from '../planning/task-g
 import { readScheduledPipelineNodeEvidence, isScheduledScoutNode, isScheduledAnalystNode } from './scheduled-pipeline-node-evidence.js'
 import { projectScheduledAnalyzePrefix } from './scheduled-analyze-prefix.js'
 import { buildScheduledPipelineAttestationEvidence } from './scheduled-pipeline-attestation-evidence.js'
+import { readMaterialDriftRecoveryIntent, scheduledAutomationSnapshotDigest, verifyMaterialDriftRecoveryLineage } from './canonical-turn-scheduled-pipeline-context.js'
 
 export const SCHEDULED_PIPELINE_ATTESTATION_SCHEMA = SCHEDULED_PIPELINE_ATTESTATION_V1_SCHEMA
 export type ScheduledAutomationPipelineOwner = ScheduledPipelineAttestationOwner
@@ -36,7 +37,7 @@ export type ScheduledAutomationPersistedTask = Readonly<{
 }>
 export type ScheduledAutomationPipelineBridgeState = Readonly<{
   turn: ScheduledAutomationPersistedTurn; root: ScheduledAutomationPersistedRoot; snapshot: unknown
-  current: TaskGraphCurrentState; tasks: readonly ScheduledAutomationPersistedTask[]
+  current: TaskGraphCurrentState; tasks: readonly ScheduledAutomationPersistedTask[]; materialDriftRecoveryVerified?: boolean
 }>
 export type ScheduledAutomationPipelineBridgeDependencies = Readonly<{
   /** Must read the persisted Turn, pinned mode, current root, graph item/read model, and task rows under owner scope. */
@@ -53,7 +54,7 @@ export function createScheduledAutomationPipelineBridge(dependencies: ScheduledA
       if (!validOwner(scope)) return blocked('root_lineage_invalid')
       const state = await dependencies.load(scope)
       if (!persistedRootMatches(scope, state)) return blocked('root_lineage_invalid')
-      const schedule = scheduledTurnSnapshot(state.turn)
+      const schedule = scheduledTurnSnapshot(state.turn, state.materialDriftRecoveryVerified === true)
       if (!schedule) return blocked('scheduled_canonical_turn_required')
       return buildScheduledAutomationPipelineCurrentAttestation({ scope, schedule, snapshot: state.snapshot,
         current: state.current, tasks: state.tasks, dependencies })
@@ -93,10 +94,15 @@ export async function buildScheduledAutomationPipelineCurrentAttestation(input: 
   } catch { return blocked('canonical_evidence_unavailable') }
 }
 
-function scheduledTurnSnapshot(turn: ScheduledAutomationPersistedTurn): ScheduledAutomationSnapshot | undefined {
+function scheduledTurnSnapshot(turn: ScheduledAutomationPersistedTurn, recoveryVerified: boolean): ScheduledAutomationSnapshot | undefined {
   const input = row(turn.input)
-  return turn.source === 'automation' && turn.executionMode === 'canonical_task_graph' && input?.automationRunMode === 'scheduled'
-    ? parseScheduledAutomationSnapshot(input.scheduledAutomationSnapshot) : undefined
+  const recovery = readMaterialDriftRecoveryIntent({ ...turn, id: turn.turnId })
+  const snapshot = turn.source === 'automation' && turn.executionMode === 'canonical_task_graph'
+    ? parseScheduledAutomationSnapshot(input?.scheduledAutomationSnapshot) : undefined
+  if (!snapshot || !input) return undefined
+  if (input.automationRunMode === 'scheduled' && recovery.status === 'absent') return snapshot
+  return input.automationRunMode === 'manual' && recoveryVerified && recovery.status === 'valid'
+    && recovery.intent.currentSnapshotDigest === scheduledAutomationSnapshotDigest(snapshot) ? snapshot : undefined
 }
 function persistedRootMatches(scope: ScheduledAutomationPipelineScope, state: ScheduledAutomationPipelineBridgeState): boolean {
   const { turn, root } = state

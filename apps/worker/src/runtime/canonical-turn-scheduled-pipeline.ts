@@ -32,7 +32,7 @@ import { loadPersistedScheduledPrepareProof } from "./subagents/scheduled-gate-w
 import { readScheduledGateRegistrationReceipt } from "./subagents/scheduled-gate-registration-receipt.js"
 import { scheduledGateCheckpointEvidence } from "./subagents/scheduled-gate-contract.js"
 import { parseScheduledTaskGraphContinuationReceipt, scheduledSnapshotMatches } from "./subagents/scheduled-taskgraph-continuation-receipt.js"
-import { scheduledPrepareGateVerifierStage } from "./subagents/canonical-turn-scheduled-pipeline-context.js"
+import { readMaterialDriftRecoveryIntent, scheduledPrepareGateVerifierStage, verifyMaterialDriftRecoveryLineage } from "./subagents/canonical-turn-scheduled-pipeline-context.js"
 
 type ScheduledPipelineBridge = (scope: ScheduledAutomationPipelineBridgeScope) => Promise<ScheduledAutomationPipelineBridgeResult>
 type ScheduledPipelineStoreFactory = (input: {
@@ -60,11 +60,11 @@ export function createCanonicalTurnScheduledPipeline(pool: pg.Pool, options: Can
     },
     owner(input: Readonly<{
       taskGraphPlanningEnabled: boolean
-      state: Pick<CanonicalTurnState, "source" | "automationRunMode">
+      state: Pick<CanonicalTurnState, "source" | "automationRunMode">; materialDriftRecovery: boolean
       lease: TurnLease
       root: Pick<SubagentTaskRecord, "id" | "attemptCount">
     }>): ScheduledAutomationPipelineBridgeScope | undefined {
-      if (!input.taskGraphPlanningEnabled || input.state.source !== "automation" || input.state.automationRunMode !== "scheduled") return undefined
+      if (!input.taskGraphPlanningEnabled || input.state.source !== "automation" || (input.state.automationRunMode !== "scheduled" && !(input.materialDriftRecovery && input.state.automationRunMode === "manual"))) return undefined
       return {
         userId: input.lease.userId,
         sessionId: input.lease.sessionId,
@@ -215,22 +215,22 @@ function parseJsonRecord(value: unknown): Record<string, unknown> | null {
   const prototype = Object.getPrototypeOf(parsed)
   return prototype === Object.prototype || prototype === null ? parsed as Record<string, unknown> : null
 }
-
 function createPersistedScheduledPipelineBridge(pool: pg.Pool) {
   return createScheduledAutomationPipelineBridge({
     load: scope => withScheduledPipelineRead(pool, scope.userId, async client => {
       const turn = (await client.query<ScheduledAutomationPersistedTurn>(`SELECT "userId", "sessionId", "id" AS "turnId", "rootTaskId", "source", "executionMode", "input", "status", "leaseOwnerId", "leaseVersion", "leaseExpiresAt" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [scope.turnId, scope.sessionId, scope.userId])).rows[0]
       const root = (await client.query<ScheduledAutomationPersistedRoot>(`SELECT task."id", session."userId" AS "userId", task."sessionId", task."turnId", task."status", task."attemptCount" FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId" WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $1 AND task."parentTaskId" IS NULL AND session."userId" = $4`, [scope.rootTaskId, scope.sessionId, scope.turnId, scope.userId])).rows[0]
       if (!turn || !root) throw new Error("scheduled_pipeline_lineage_missing")
+      const recoveryTurn = { ...turn, id: turn.turnId }, recovery = readMaterialDriftRecoveryIntent(recoveryTurn)
+      const materialDriftRecoveryVerified = recovery.status === "valid" && await verifyMaterialDriftRecoveryLineage(client, recoveryTurn, recovery.intent)
       const graph = await loadTaskGraph(client, { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.rootTaskId }, false)
       if (!graph.snapshot || !graph.state) throw new Error("scheduled_pipeline_graph_missing")
       const tasks = (await client.query<ScheduledAutomationPersistedTask>(`SELECT task."id", session."userId" AS "userId", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId", task."role", task."taskType", task."status", task."attemptCount", task."failureReason", task."expectedOutputSchema", task."allowedActions", task."result" FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId" WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 AND session."userId" = $5`, [graph.snapshot.nodes.map(node => node.taskId), scope.sessionId, scope.turnId, scope.rootTaskId, scope.userId])).rows
-      return { turn, root, snapshot: graph.snapshot, current: currentTaskGraph(graph), tasks }
+      return { turn, root, snapshot: graph.snapshot, current: currentTaskGraph(graph), tasks, materialDriftRecoveryVerified }
     }),
     verifyCompletedNode: input => withScheduledPipelineRead(pool, input.scope.userId, client => verifyCompletedTaskGraphNodeEvidence(client, input)),
   })
 }
-
 async function withScheduledPipelineRead<T>(pool: Pick<pg.Pool, "connect">, userId: string, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect()
   let committed = false
