@@ -40,9 +40,11 @@ describe('agent session URL and active Turn DTO', () => {
     })
   })
 
-  it('accepts only the fixed scheduled source-change recovery reason', () => {
+  it('accepts only the fixed scheduled recovery reasons', () => {
     expect(parseAgentTurnsResponse({ projection: { scheduledPipelineRecoveryReason: 'scheduled_pipeline_source_changed' } })
       .scheduledPipelineRecoveryReason).toBe('scheduled_pipeline_source_changed')
+    expect(parseAgentTurnsResponse({ projection: { scheduledPipelineRecoveryReason: 'scheduled_prepare_material_source_changed' } })
+      .scheduledPipelineRecoveryReason).toBe('scheduled_prepare_material_source_changed')
     for (const value of ['other_error', 'private error text', { code: 'scheduled_pipeline_source_changed' }, null]) {
       expect(parseAgentTurnsResponse({ projection: { scheduledPipelineRecoveryReason: value } })
         .scheduledPipelineRecoveryReason).toBeNull()
@@ -52,11 +54,11 @@ describe('agent session URL and active Turn DTO', () => {
 
   it('does not carry recovery guidance into a different selected Session', () => {
     const priorSession = parseAgentTurnsResponse({
-      projection: { scheduledPipelineRecoveryReason: 'scheduled_pipeline_source_changed' },
+      projection: { scheduledPipelineRecoveryReason: 'scheduled_prepare_material_source_changed' },
     })
     expect(stateForSelectedAgentSession('session-b', 'session-a', priorSession).scheduledPipelineRecoveryReason).toBeNull()
     expect(stateForSelectedAgentSession('session-a', 'session-a', priorSession).scheduledPipelineRecoveryReason)
-      .toBe('scheduled_pipeline_source_changed')
+      .toBe('scheduled_prepare_material_source_changed')
   })
 
   it('treats only a complete active-Turn projection as authoritative', () => {

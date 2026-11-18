@@ -11,7 +11,9 @@ export type ActiveTurnStatus =
   | 'waiting_for_approval'
   | 'waiting_for_user'
 
-export type ScheduledPipelineRecoveryReason = 'scheduled_pipeline_source_changed'
+export type ScheduledPipelineRecoveryReason =
+  | 'scheduled_pipeline_source_changed'
+  | 'scheduled_prepare_material_source_changed'
 
 export interface ActiveTurnDto {
   id: string
@@ -92,6 +94,7 @@ export function parseAgentTurnsResponse(value: unknown): AgentSessionState {
       ? Math.floor(projection.queuedInputCount)
       : 0,
     scheduledPipelineRecoveryReason: projection?.scheduledPipelineRecoveryReason === 'scheduled_pipeline_source_changed'
+      || projection?.scheduledPipelineRecoveryReason === 'scheduled_prepare_material_source_changed'
       ? projection.scheduledPipelineRecoveryReason
       : null,
   }

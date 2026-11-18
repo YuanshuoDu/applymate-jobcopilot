@@ -49,6 +49,66 @@ function sourceChangeState(owner: Record<string, unknown> = recoveryOwner, marke
   }
 }
 
+const materialDriftOwner = { ...recoveryOwner, turnLeaseOwnerId: "historical_turn_lease", turnLeaseVersion: 4 }
+const materialDriftGate = { taskId: "gate_1", leaseOwnerId: "historical_gate_lease", attemptCount: 2 }
+function materialDriftState(markerExtras: Record<string, unknown> = {}) {
+  return {
+    privateExecutionState: "PRIVATE_EXECUTION_STATE",
+    scheduledTaskGraphMaterialDriftTerminal: {
+      schemaVersion: "agent-harness.v2.scheduled-prepare-material-drift-terminal.v1",
+      reason: "scheduled_prepare_material_source_changed",
+      owner: materialDriftOwner,
+      gate: materialDriftGate,
+      analyzeFingerprintDigest: `sha256:${"a".repeat(64)}`,
+      prepareProofDigest: `sha256:${"b".repeat(64)}`,
+      artifactDigest: `sha256:${"c".repeat(64)}`,
+      currentMaterialDigest: `sha256:${"d".repeat(64)}`,
+      proofDigest: `sha256:${"e".repeat(64)}`,
+      ...markerExtras,
+    },
+  }
+}
+
+function configureMaterialDriftRecovery(options: {
+  turnStatus?: string; gateStatus?: string; activeTurn?: unknown | null; latestTurnId?: string
+  executionStatus?: string; error?: string; state?: unknown; rootAttemptCount?: number; gateAttemptCount?: number
+  turnOverrides?: Record<string, unknown>; gateOverrides?: Record<string, unknown>; rootOverrides?: Record<string, unknown>
+} = {}) {
+  const status = options.turnStatus ?? "waiting_for_dependency"
+  const currentTurn = {
+    ...turn("blocked_turn", 3, status), userId: "user_1", sessionId: "session_1", source: "automation",
+    executionMode: "canonical_task_graph", rootTaskId: "root_1", input: { automationRunMode: "scheduled" },
+    leaseVersion: 4, ...options.turnOverrides,
+  }
+  const activeTurn = "activeTurn" in options
+    ? options.activeTurn
+    : status === "waiting_for_dependency" ? currentTurn : null
+  mocks.executionFindFirst.mockResolvedValue({
+    id: "execution_1", userId: "user_1", sessionId: "session_1", status: options.executionStatus ?? "failed",
+    error: options.error ?? "scheduled_prepare_material_source_changed", attemptCount: 5,
+    state: options.state ?? materialDriftState(),
+  })
+  mocks.turnFindFirst.mockImplementation(async ({ where, orderBy }: { where: Record<string, unknown>; orderBy?: unknown }) => {
+    if ("status" in where) return activeTurn
+    if (orderBy) return { ...currentTurn, id: options.latestTurnId ?? "blocked_turn" }
+    if ("id" in where) return currentTurn
+    return null
+  })
+  mocks.rootFindFirst.mockImplementation(async ({ where }: { where: Record<string, unknown> }) => {
+    if (where.id === "root_1") return {
+      id: "root_1", sessionId: "session_1", turnId: "blocked_turn", rootTaskId: "root_1", parentTaskId: null,
+      depth: 0, role: "orchestrator", taskType: "root", status: "waiting", attemptCount: options.rootAttemptCount ?? 3,
+      ...options.rootOverrides,
+    }
+    if (where.id === "gate_1") return {
+      id: "gate_1", sessionId: "session_1", turnId: "blocked_turn", rootTaskId: "root_1", parentTaskId: "root_1",
+      depth: 1, role: "prepare", taskType: "scheduled_taskgraph_gate", status: options.gateStatus ?? "failed",
+      attemptCount: options.gateAttemptCount ?? 2, ...options.gateOverrides,
+    }
+    return null
+  })
+}
+
 function configureSourceChangeRecovery(options: {
   turnStatus?: string
   latestTurnId?: string
@@ -212,6 +272,59 @@ describe("agent turns query API", () => {
       mocks.turnFindMany.mockResolvedValue([turn("turn_1", 1)])
       mocks.inputCount.mockResolvedValue(2)
       configureSourceChangeRecovery(options)
+      const { GET } = await import("./route")
+      const response = await GET(request() as never, params)
+      expect((await response.json()).projection.scheduledPipelineRecoveryReason).toBeNull()
+    }
+  })
+
+  it.each([
+    ["waiting_for_dependency", "failed"],
+    ["interrupted", "interrupted"],
+  ])("projects only the fixed material-drift reason for verified %s/%s lineage", async (turnStatus, gateStatus) => {
+    configureMaterialDriftRecovery({ turnStatus, gateStatus })
+    const { GET } = await import("./route")
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+
+    expect(body.projection.scheduledPipelineRecoveryReason).toBe("scheduled_prepare_material_source_changed")
+    expect(JSON.stringify(body)).not.toContain("PRIVATE_EXECUTION_STATE")
+    expect(JSON.stringify(body)).not.toContain("scheduled-prepare-material-drift-terminal.v1")
+    expect(JSON.stringify(body)).not.toContain("execution_1")
+    expect(JSON.stringify(body)).not.toContain("gate_1")
+    expect(JSON.stringify(body)).not.toContain("historical_turn_lease")
+    expect(JSON.stringify(body)).not.toContain("historical_gate_lease")
+    expect(JSON.stringify(body)).not.toContain(`sha256:${"c".repeat(64)}`)
+    expect(mocks.rootFindFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: "root_1", sessionId: "session_1", turnId: "blocked_turn",
+        parentTaskId: null, depth: 0, role: "orchestrator", taskType: "root", session: { userId: "user_1" } }),
+    }))
+    expect(mocks.rootFindFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: "gate_1", sessionId: "session_1", turnId: "blocked_turn",
+        rootTaskId: "root_1", parentTaskId: "root_1", depth: 1, role: "prepare", taskType: "scheduled_taskgraph_gate",
+        status: { in: ["failed", "interrupted"] }, session: { userId: "user_1" } }),
+    }))
+  })
+
+  it("hides material markers when persisted lineage or current attempts do not match", async () => {
+    const cases = [
+      { latestTurnId: "new_turn" },
+      { executionStatus: "running" },
+      { error: "private_error_text" },
+      { rootAttemptCount: 4 },
+      { gateAttemptCount: 3 },
+      { gateStatus: "running" },
+      { gateOverrides: { taskType: "other" } },
+      { turnOverrides: { leaseVersion: 5 } },
+      { turnOverrides: { source: "user" } },
+      { turnOverrides: { input: { automationRunMode: "manual" } } },
+      { state: materialDriftState({ privateExtra: true }) },
+    ]
+    for (const options of cases) {
+      vi.resetModules()
+      mocks.turnFindMany.mockResolvedValue([turn("turn_1", 1)])
+      mocks.inputCount.mockResolvedValue(2)
+      configureMaterialDriftRecovery(options)
       const { GET } = await import("./route")
       const response = await GET(request() as never, params)
       expect((await response.json()).projection.scheduledPipelineRecoveryReason).toBeNull()
