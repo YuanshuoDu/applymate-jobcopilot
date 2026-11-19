@@ -10,6 +10,7 @@ import { Redis } from "ioredis"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
+import { formatObjectiveLocationSteerMessage } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import {
   PLAN_LEDGER_SCHEMA_VERSION,
@@ -70,6 +71,7 @@ import { hasNoCurrentAttemptTaskGraphToolReceipts } from "./task-graph-empty-ana
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 import type { WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
+import { readTaskGraphConfirmedLocationSteer } from "./task-graph-confirmed-location-steer.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const authorizeUnreservedUsage = async () => ({
@@ -127,6 +129,20 @@ const SCOUT_VERIFICATION = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
   role: "scout",
   criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+} as const
+const BROAD_LOCATION_SCOUT_VERIFICATION = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+  criteria: [
+    { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+    { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["dublin", "seattle"] } },
+  ],
+} as const
+const DUBLIN_LOCATION_SCOUT_VERIFICATION = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+  criteria: [
+    { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+    { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["dublin"] } },
+  ],
 } as const
 const ANALYST_VERIFICATION = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
@@ -296,6 +312,63 @@ type UserSteerCommandService = Readonly<{ steer(command: {
   content: { type: "text"; text: string }[]
 }): Promise<{ inputId: string; turnId: string; disposition: string; sequence: string }> }>
 const webRequire = createRequire(new URL("../../../../web/package.json", import.meta.url))
+
+type ObjectiveStartFixtureCommand = Readonly<{
+  sessionId: string; userId: string; clientMessageId: string; source: "user"; objective: string
+  content: readonly { type: "text"; text: string }[]
+  verificationRequirements: Readonly<{ schemaVersion: "agent-harness.v2.objective-requirements.v2"; requirements: readonly {
+    id: "candidate-count" | "candidate-location"; check: Readonly<{ kind: "candidate_count_gte"; minimum: 1 } | { kind: "candidate_location_in"; locations: readonly string[] }>
+  }[] }>
+}>
+type ObjectiveStartFixtureResult = Readonly<{ inputId: string; turnId: string; sequence: string; disposition: string }>
+type ObjectiveStartFixtureService = Readonly<{ start(command: ObjectiveStartFixtureCommand): Promise<ObjectiveStartFixtureResult> }>
+
+async function createDisposableWebObjectiveStartService(connectionString: string): Promise<{
+  prisma: DisposableWebPrismaClient; commands: ObjectiveStartFixtureService
+}> {
+  const loaded: unknown = webRequire("@prisma/client")
+  const prismaConstructor = loaded && typeof loaded === "object" ? (loaded as { PrismaClient?: unknown }).PrismaClient : undefined
+  if (typeof prismaConstructor !== "function") throw new Error("Web Prisma client constructor is unavailable")
+  const prisma = new (prismaConstructor as new (options: { datasourceUrl: string }) => unknown)({ datasourceUrl: connectionString }) as DisposableWebPrismaClient
+  try {
+    const moduleName = "@/lib/agent/control-plane/commands/objective-start"
+    const imported: unknown = await import(moduleName)
+    const constructor = imported && typeof imported === "object" ? (imported as { ObjectiveStartCommandService?: unknown }).ObjectiveStartCommandService : undefined
+    if (typeof constructor !== "function") throw new Error("Production ObjectiveStart command service is unavailable")
+    const service = new (constructor as new (db: unknown) => ObjectiveStartFixtureService)(prisma)
+    return { prisma, commands: service }
+  } catch (error: unknown) {
+    await prisma.$disconnect()
+    throw error
+  }
+}
+
+type ObjectiveLocationSteerFixtureCommand = Readonly<{
+  schemaVersion: "agent-harness.v2.objective-location-steer.v1"; clientMessageId: string; expectedTurnId: string
+  expectedRevision: number; locations: readonly string[]; userId: string; sessionId: string
+}>
+type ObjectiveLocationSteerFixtureResult = Readonly<{ inputId: string; turnId: string; disposition: string; sequence: string }>
+type ObjectiveLocationSteerFixtureService = (db: unknown, command: ObjectiveLocationSteerFixtureCommand) => Promise<ObjectiveLocationSteerFixtureResult>
+
+async function createDisposableWebObjectiveLocationSteerService(connectionString: string): Promise<{
+  prisma: DisposableWebPrismaClient; accept(command: ObjectiveLocationSteerFixtureCommand): Promise<ObjectiveLocationSteerFixtureResult>
+}> {
+  const loaded: unknown = webRequire("@prisma/client")
+  const prismaConstructor = loaded && typeof loaded === "object" ? (loaded as { PrismaClient?: unknown }).PrismaClient : undefined
+  if (typeof prismaConstructor !== "function") throw new Error("Web Prisma client constructor is unavailable")
+  const prisma = new (prismaConstructor as new (options: { datasourceUrl: string }) => unknown)({ datasourceUrl: connectionString }) as DisposableWebPrismaClient
+  try {
+    const moduleName = "@/lib/agent/control-plane/commands/objective-location-steer"
+    const imported: unknown = await import(moduleName)
+    const accept = imported && typeof imported === "object" ? (imported as { acceptObjectiveLocationSteer?: unknown }).acceptObjectiveLocationSteer : undefined
+    if (typeof accept !== "function") throw new Error("Production ObjectiveLocationSteer service is unavailable")
+    const invoke = accept as ObjectiveLocationSteerFixtureService
+    return { prisma, accept: command => invoke(prisma, command) }
+  } catch (error: unknown) {
+    await prisma.$disconnect()
+    throw error
+  }
+}
 
 async function createDisposableWebSteerService(connectionString: string): Promise<{
   prisma: DisposableWebPrismaClient; commands: UserSteerCommandService
@@ -3880,6 +3953,23 @@ function planTaskIds(request: HarnessModelRequest, callId = PLAN_CALL_ID, expect
   })
   if (ids.length !== expectedCount) throw new Error(`Expected ${expectedCount} planned task ID(s); received ${ids.length}`)
   return ids
+}
+
+function planTaskIdsByKey(request: HarnessModelRequest, callId: string, expectedKeys: readonly string[]): Map<string, string> {
+  const output = record(latestToolResult(request, callId))
+  if (!output || (output.status !== "accepted" && output.status !== "duplicate") || !Array.isArray(output.nodes)) {
+    throw new Error("TaskGraph plan receipt missing from the next root model request")
+  }
+  const idsByKey = new Map<string, string>()
+  for (const value of output.nodes) {
+    const node = record(value)
+    if (!node || typeof node.key !== "string" || typeof node.taskId !== "string" || idsByKey.has(node.key)) continue
+    idsByKey.set(node.key, node.taskId)
+  }
+  if (idsByKey.size !== expectedKeys.length || expectedKeys.some(key => !idsByKey.has(key))) {
+    throw new Error("TaskGraph plan receipt did not bind the expected node keys")
+  }
+  return idsByKey
 }
 
 function completedGraphStatusFailureProjection(graph: unknown): RecordValue {
@@ -8783,6 +8873,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const verificationRepairOwner = fixture()
   const lateRepairOwner = fixture()
   const replanApplicabilityOwner = fixture()
+  const typedReplanApplicabilityOwner = fixture()
   const locationRepairOwner = fixture()
   const locationMismatchOwner = fixture()
   const locationConflictOwner = fixture()
@@ -8846,7 +8937,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       maxToolCalls: VERIFICATION_REPAIR_TOOL_BUDGET,
     })
     await seed(pool, lateRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxToolCalls: 10 })
-    await seed(pool, replanApplicabilityOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     const locationRepairLimits = { ...DISCOVERY_FIXTURE_TURN_LIMITS,
       maxSteps: VERIFICATION_REPAIR_STEP_BUDGET, maxToolCalls: VERIFICATION_REPAIR_TOOL_BUDGET }
     await seed(pool, locationRepairOwner, "waiting_for_user", locationRepairLimits)
@@ -8861,6 +8951,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, emptyAnalystCurrentReceiptOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, emptyAnalystMutationOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, archivedWaitOwner, "waiting_for_user", { maxSteps: 4, maxToolCalls: 3 })
+    await seed(pool, replanApplicabilityOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, rootRecoveryScanOwner, "waiting_for_user")
   }, 15_000)
 
@@ -8886,7 +8977,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     const fixtureOwners = [owner, resumeFailureOwner, failureOwner, operationalFailureOwner, operationalDeadlineOwner, operationalAppendOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner,
       discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner,
-      locationRepairOwner, locationMismatchOwner, locationConflictOwner, locationForeignOwner, replanApplicabilityOwner, leaseRecoveryOwner,
+      locationRepairOwner, locationMismatchOwner, locationConflictOwner, locationForeignOwner, replanApplicabilityOwner, typedReplanApplicabilityOwner, leaseRecoveryOwner,
       coverageRepairOwner, scoutUnionOwner, emptyAnalystOwner, emptyAnalystOrphanOwner, emptyAnalystCurrentReceiptOwner,
       emptyAnalystMutationOwner, rootRecoveryScanOwner, archivedWaitOwner]
     const allFixtureWorkersExited = [...fixtureProcessChildren].every(processFixtureExited)
@@ -13948,6 +14039,499 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         structuredSummaryReportsOneCurrentResult: true,
       })
   }, 90_000)
+
+  it("uses an accepted typed location steer for current coverage while retaining only compatible Dublin evidence", async () => {
+    const value = typedReplanApplicabilityOwner
+    const [workerQueue, canonical, commandPortModule, subagentQueue] = await Promise.all([
+      import("../../queue/production-bootstrap.js"), import("../canonical-turn-runtime.js"),
+      import("./pg-task-graph-command-port.js"), import("../../queue/subagent-queue.js"),
+    ])
+    const { createProductionChildExecutor } = await import("./production-child-runtime.js")
+    const { createTurnQueue, TURN_QUEUE_NAME } = await import("../turns/turn-queue.js")
+    turnQueueName = TURN_QUEUE_NAME
+    childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
+
+    await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`,
+      [value.userId, `${value.userId}@example.invalid`])
+    await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Typed location replan fixture', 'running', 'test', CURRENT_TIMESTAMP)`, [value.sessionId, value.userId])
+    const broadRequirements = {
+      schemaVersion: "agent-harness.v2.objective-requirements.v2" as const,
+      requirements: [
+        { id: "candidate-location" as const, check: { kind: "candidate_location_in" as const, locations: ["Dublin", "Seattle"] } },
+      ],
+    }
+    const startService = await createDisposableWebObjectiveStartService(databaseUrl!)
+    const oldLocationFlag = process.env.AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED
+    let started: ObjectiveStartFixtureResult | undefined
+    try {
+      process.env.AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED = "1"
+      started = await startService.commands.start({
+        sessionId: value.sessionId, userId: value.userId, clientMessageId: `p3-1219-typed-start:${value.suffix}`,
+        source: "user", objective: "Find software engineering roles in Dublin and Seattle",
+        content: [{ type: "text", text: "Find software engineering roles in Dublin and Seattle" }],
+        verificationRequirements: broadRequirements,
+      })
+    } finally {
+      if (oldLocationFlag === undefined) delete process.env.AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED
+      else process.env.AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED = oldLocationFlag
+      await startService.prisma.$disconnect()
+    }
+    if (!started) throw new Error("Canonical objective start did not return a Turn")
+    expect(started.disposition).toBe("started")
+    value.turnId = started.turnId
+
+    const dublinJobId = fixtureJobId(value.suffix, 1)
+    const seattleJobId = fixtureJobId(value.suffix)
+    await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
+      VALUES ($1, $2, 'Dublin Fixture Labs', 'Software Engineer', 'Dublin', 'saved', $3, 'Typed replan fixture role', 'greenhouse', CURRENT_TIMESTAMP),
+        ($4, $2, 'Seattle Fixture Labs', 'Software Engineer', 'Seattle', 'saved', $5, 'Typed replan fixture role', 'greenhouse', CURRENT_TIMESTAMP)`,
+    [dublinJobId, value.userId, `https://jobs.example.invalid/${dublinJobId}`, seattleJobId, `https://jobs.example.invalid/${seattleJobId}`])
+
+    const flags: ProductionAgentFlags = {
+      taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
+      consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
+    }
+    const profile = {
+      provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
+      continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+      supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const,
+    }
+    const initialPlanCallId = `p3-1219-typed-plan:${value.turnId}`
+    const initialWaitCallId = `p3-1219-typed-wait:${value.turnId}`
+    const freshPlanCallId = `p3-1219-typed-fresh-plan:${value.turnId}`
+    const freshWaitCallId = `p3-1219-typed-fresh-wait:${value.turnId}`
+    const initialWaitKey = `p3-1219-typed-initial:${value.turnId}`
+    const freshWaitKey = `p3-1219-typed-fresh:${value.turnId}`
+    const steerText = formatObjectiveLocationSteerMessage(["dublin"])
+    const confirmationCue = steerText.slice(0, steerText.indexOf("[")).trimEnd().toLowerCase()
+    const expectedLocationToken = "dublin"
+    let initialTaskIds: string[] = []
+    let initialTaskIdsByKey = new Map<string, string>()
+    let freshTaskId: string | undefined
+    let confirmedSteer: Awaited<ReturnType<typeof readTaskGraphConfirmedLocationSteer>> | undefined
+    let resumedWithTypedReceipt = false
+    let typedRequestObservation: { confirmationCueVisible: boolean; dublinTokenVisible: boolean; nodeCount: number; hasFreshNode: boolean; stepReceipt: string } | null = null
+    const finalCandidate = "The confirmed Dublin search is complete."
+    const readConfirmedAtActiveRootStep = async () => {
+      const client = await pool!.connect()
+      try {
+        await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        const active = await client.query<{ rootTaskId: string | null; inputThroughSequence: string | bigint }>(
+          `SELECT turn."rootTaskId", step."inputThroughSequence" FROM "agent_turns" AS turn
+           JOIN "agent_steps" AS step ON step."sessionId" = turn."sessionId" AND step."turnId" = turn."id"
+             AND step."taskId" = turn."rootTaskId"
+           WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+           ORDER BY step."ordinal" DESC LIMIT 1`, [value.turnId, value.sessionId, value.userId],
+        )
+        const row = active.rows[0]
+        if (!row?.rootTaskId) throw new Error("Typed location proof has no exact current root Step")
+        const proof = await readTaskGraphConfirmedLocationSteer(client,
+          { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId: row.rootTaskId },
+          BigInt(row.inputThroughSequence))
+        await client.query("COMMIT")
+        return proof
+      } finally {
+        await client.query("ROLLBACK").catch(() => undefined)
+        client.release()
+      }
+    }
+    const rootRuntime = await canonical.createCanonicalTurnRuntime(pool!, {
+      workerId: value.ownerId, productionFlags: flags,
+      taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
+      taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES }, authorizeUsage: authorizeUnreservedUsage,
+      modelRuntimeFactory: () => {
+        const adapter: ModelAdapter = {
+          id: "p3-1219-typed-location-root-fixture", profile,
+          async *stream(request) {
+            const graph = currentGraphFromRequest(request)
+            const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+            const dublin = nodes.find(node => node?.key === "scout-dublin")
+            const seattle = nodes.find(node => node?.key === "scout-seattle")
+            const fresh = nodes.find(node => node?.key === "scout-dublin-fresh")
+            const requestMessages = JSON.stringify(request.messages).toLowerCase()
+            const confirmationCueVisible = requestMessages.includes(confirmationCue)
+            const dublinTokenVisible = requestMessages.includes(expectedLocationToken)
+            const stepReceipt = nodes.length === 2 && !fresh ? await readConfirmedAtActiveRootStep() : undefined
+            if (stepReceipt) {
+              confirmedSteer = stepReceipt
+              typedRequestObservation = { confirmationCueVisible, dublinTokenVisible, nodeCount: nodes.length,
+                hasFreshNode: Boolean(fresh), stepReceipt: stepReceipt.kind }
+            }
+
+            if (!nodes.length) {
+              expect(graph?.revision ?? 0).toBe(0)
+              yield { type: "tool_call_completed", callId: initialPlanCallId, name: "agent.plan", arguments: {
+                expectedRevision: 0,
+                nodes: [
+                  { key: "scout-dublin", templateId: "scout", goal: "Find software engineering roles in Dublin",
+                    successCriteria: ["Return one evidence-bound Dublin role"], dependsOn: [], verification: BROAD_LOCATION_SCOUT_VERIFICATION },
+                  { key: "scout-seattle", templateId: "scout", goal: "Find software engineering roles in Seattle",
+                    successCriteria: ["Return one evidence-bound Seattle role"], dependsOn: [], verification: BROAD_LOCATION_SCOUT_VERIFICATION },
+                ],
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+
+            if (nodes.length === 2 && !fresh && confirmationCueVisible && dublinTokenVisible && stepReceipt?.kind === "confirmed") {
+              if (stepReceipt.locations.length !== 1 || stepReceipt.locations[0] !== "dublin") {
+                throw new Error("Typed location receipt was not confirmed at the active root Step cutoff")
+              }
+              resumedWithTypedReceipt = true
+              const revision = graph?.revision
+              if (typeof revision !== "number") throw new Error("Typed location replan omitted its graph revision")
+              yield { type: "tool_call_completed", callId: freshPlanCallId, name: "agent.plan", arguments: {
+                expectedRevision: revision,
+                nodes: [{ key: "scout-dublin-fresh", templateId: "scout", goal: "Find a fresh software engineering role in Dublin",
+                  successCriteria: ["Return one fresh evidence-bound Dublin role"], dependsOn: [], verification: DUBLIN_LOCATION_SCOUT_VERIFICATION }],
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+
+            if (nodes.length === 2 && !fresh) {
+              initialTaskIdsByKey = planTaskIdsByKey(request, initialPlanCallId, ["scout-dublin", "scout-seattle"])
+              initialTaskIds = [initialTaskIdsByKey.get("scout-dublin")!, initialTaskIdsByKey.get("scout-seattle")!]
+              yield { type: "tool_call_completed", callId: initialWaitCallId, name: "agent.wait", arguments: {
+                idempotencyKey: initialWaitKey, taskIds: initialTaskIds, mode: "all", timeoutMs: 30_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+
+            if (nodes.length === 3 && fresh && fresh.status !== "completed") {
+              freshTaskId = planTaskIds(request, freshPlanCallId, 1)[0]
+              yield { type: "tool_call_completed", callId: freshWaitCallId, name: "agent.wait", arguments: {
+                idempotencyKey: freshWaitKey, taskIds: [freshTaskId], mode: "all", timeoutMs: 30_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+
+            if (nodes.length === 3 && fresh?.status === "completed") {
+              expect(dublin?.status).toBe("completed")
+              expect(seattle?.status).toBe("completed")
+              expectPassedVerificationReport(dublin?.verificationReport, "candidate-count", "candidate-location")
+              expectPassedVerificationReport(seattle?.verificationReport, "candidate-count", "candidate-location")
+              expectPassedVerificationReport(fresh.verificationReport, "candidate-count", "candidate-location")
+              yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: finalCandidate }) }
+              yield { type: "completed", finishReason: "stop" }
+              return
+            }
+            throw new Error("Typed location fixture reached an unexpected graph state")
+          },
+        }
+        return { adapter, registry: {} as never, candidates: [] }
+      },
+    })
+    const childExecutor = createProductionChildExecutor({
+      pool: pool!, authorizeUsage: authorizeUnreservedUsage,
+      modelRuntimeFactory: ({ task }) => {
+        if (task.role !== "scout") throw new Error("Typed location fixture expected Scout children only")
+        const location = task.goal.includes("Dublin") ? "Dublin" : "Seattle"
+        const jobId = location === "Dublin" ? dublinJobId : seattleJobId
+        const waitKey = task.goal.includes("fresh") ? freshWaitKey : initialWaitKey
+        let round = 0
+        return {
+          id: `p3-1219-typed-${task.id}-child-fixture`, profile,
+          async *stream(request) {
+            round += 1
+            if (round === 1) {
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
+              yield { type: "tool_call_completed", callId: `p3-1219-typed-search:${task.id}`, name: "jobs.search",
+                arguments: { target: "Software Engineer", location, limit: 10 } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
+            const evidence = { id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "greenhouse" }
+            const result = { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+              candidates: [{ jobId, source: evidence.source, url: null, evidenceIds: [evidence.id] }], evidence: [evidence],
+              summary: `Found the fixture role in ${location}` }
+            yield { type: "text_delta", text: JSON.stringify(result) }
+            yield { type: "completed", finishReason: "stop" }
+          },
+        }
+      },
+    })
+    bootstrap = await workerQueue.createProductionWorkerBootstrap({
+      pool: pool!, runtime: rootRuntime, ownerId: value.ownerId, turnQueueFactory: createTurnQueue,
+      turnRecoveryIntervalMs: 100, waitResolverFactory: () => ({ async close() {} }),
+      waitResolver: { intervalMs: 3_600_000, batchSize: 10, ownerId: `p3-1219-typed-wait-resolver-${value.suffix}` },
+      subagents: { execute: childExecutor, intervalMs: 10 },
+    })
+    // ObjectiveStart atomically persisted its production dispatch outbox; bootstrap recovery publishes that exact owner-bound job.
+
+    const waitForCompletedTask = async (taskId: string) => {
+      const deadline = Date.now() + 45_000
+      while (Date.now() < deadline) {
+        const result = await pool!.query<{ status: string; result: unknown; resultJson: string; failureReason: string | null }>(
+          `SELECT "status", "result", "result"::text AS "resultJson", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+          [taskId, value.sessionId, value.turnId])
+        const row = result.rows[0]
+        if (row?.status === "completed") return row
+        if (row && ["failed", "interrupted", "cancelled", "closed"].includes(row.status)) {
+          throw new Error(`Typed location Scout ended as ${row.status}`)
+        }
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      throw new Error("Typed location Scout did not complete before the deadline")
+    }
+    const digestResult = (result: unknown) => {
+      const serialized = JSON.stringify(result)
+      if (serialized === undefined) throw new Error("Completed Scout result could not be serialized")
+      return createHash("sha256").update(serialized).digest("hex")
+    }
+
+    try {
+      await waitForPersistedTaskWait(pool!, value.turnId, initialWaitKey, 20_000, initialWaitCallId)
+    } catch {
+      const failedPlan = await pool!.query<{ code: string | null }>(
+        `SELECT item."content"->'output'->>'code' AS "code" FROM "agent_items" AS item
+         JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+         WHERE item."sessionId" = $1 AND item."turnId" = $2 AND session."userId" = $3 AND turn."userId" = $3
+           AND item."type" = 'tool_result' ORDER BY item."createdAt" DESC LIMIT 1`,
+        [value.sessionId, value.turnId, value.userId])
+      const code = failedPlan.rows[0]?.code
+      throw new Error(`Typed initial plan did not suspend its wait${code ? ` (${code})` : ""}`)
+    }
+    expect(initialTaskIds).toHaveLength(2)
+    await Promise.all(initialTaskIds.map(waitForCompletedTask))
+    const waitingTurn = await pool!.query<{ status: string; revision: number; rootTaskId: string | null; leaseOwnerId: string | null }>(
+      `SELECT "status", "revision", "rootTaskId", "leaseOwnerId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [value.turnId, value.sessionId, value.userId])
+    expect(waitingTurn.rows[0]).toMatchObject({ status: "waiting_for_dependency", leaseOwnerId: null })
+    const initialRootTaskId = waitingTurn.rows[0]?.rootTaskId
+    if (!initialRootTaskId) throw new Error("Typed location initial Turn omitted its persisted Root identity")
+    const initialGraphTaskIdsByKey = new Map<string, string>()
+    const initialPersistedResultJsonByKey = new Map<string, string>()
+    const initialSnapshotClient = await pool!.connect()
+    try {
+      await initialSnapshotClient.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+      await initialSnapshotClient.query("SELECT set_config('app.user_id', $1, true)", [value.userId])
+      const initialGraph = await loadTaskGraph(initialSnapshotClient,
+        { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+          rootTaskId: initialRootTaskId, parentTaskId: initialRootTaskId }, false, { includeSourceProvenance: true })
+      for (const node of initialGraph.snapshot?.nodes ?? []) {
+        if ((node.key === "scout-dublin" || node.key === "scout-seattle") && typeof node.taskId === "string") {
+          initialGraphTaskIdsByKey.set(node.key, node.taskId)
+        }
+      }
+      const initialGraphTaskIds = [initialGraphTaskIdsByKey.get("scout-dublin"), initialGraphTaskIdsByKey.get("scout-seattle")]
+      if (initialGraphTaskIds.some(taskId => !taskId)) throw new Error("Typed location initial graph omitted a node task identity")
+      const initialRows = await initialSnapshotClient.query<{ id: string; resultJson: string }>(
+        `SELECT task."id", task."result"::text AS "resultJson" FROM "sub_agent_tasks" AS task
+         JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+         WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3
+           AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 AND turn."rootTaskId" = $4
+           AND session."userId" = $5 AND turn."userId" = $5`,
+        [initialGraphTaskIds, value.sessionId, value.turnId, initialRootTaskId, value.userId])
+      const resultById = new Map(initialRows.rows.map(row => [row.id, row.resultJson]))
+      if (initialRows.rows.length !== 2) throw new Error("Typed location initial graph results were not owner/Root bound")
+      for (const key of ["scout-dublin", "scout-seattle"] as const) {
+        const taskId = initialGraphTaskIdsByKey.get(key)!
+        const resultJson = resultById.get(taskId)
+        if (resultJson === undefined) throw new Error("Typed location initial graph omitted a persisted result")
+        initialPersistedResultJsonByKey.set(key, resultJson)
+      }
+      await initialSnapshotClient.query("COMMIT")
+    } finally {
+      await initialSnapshotClient.query("ROLLBACK").catch(() => undefined)
+      initialSnapshotClient.release()
+    }
+    const dublinReceiptMatchesInitialGraph = initialTaskIdsByKey.get("scout-dublin") === initialGraphTaskIdsByKey.get("scout-dublin")
+    const seattleReceiptMatchesInitialGraph = initialTaskIdsByKey.get("scout-seattle") === initialGraphTaskIdsByKey.get("scout-seattle")
+    const initialDigests = ["scout-dublin", "scout-seattle"].map(key =>
+      digestResult(JSON.parse(initialPersistedResultJsonByKey.get(key)!)))
+
+    const steerService = await createDisposableWebObjectiveLocationSteerService(databaseUrl!)
+    let accepted: ObjectiveLocationSteerFixtureResult
+    try {
+      accepted = await steerService.accept({ schemaVersion: "agent-harness.v2.objective-location-steer.v1",
+        clientMessageId: `p3-1219-typed-steer:${value.suffix}`, expectedTurnId: value.turnId,
+        expectedRevision: Number(waitingTurn.rows[0]?.revision), locations: ["Dublin"],
+        userId: value.userId, sessionId: value.sessionId })
+    } finally { await steerService.prisma.$disconnect() }
+    expect(accepted.disposition).toBe("steered")
+    expect(accepted.turnId).toBe(value.turnId)
+    const acceptedBeforeResume = await pool!.query<{ status: string; acceptedSequence: string }>(
+      `SELECT "status", "acceptedSequence" FROM "agent_inputs" WHERE "id" = $1 AND "sessionId" = $2 AND "targetTurnId" = $3 AND "userId" = $4`,
+      [accepted.inputId, value.sessionId, value.turnId, value.userId])
+    expect(acceptedBeforeResume.rows[0]?.status).toBe("accepted")
+    expect(String(acceptedBeforeResume.rows[0]?.acceptedSequence)).toBe(accepted.sequence)
+    expect((await reconcileDurableWaits(pool!, { ownerId: `p3-1219-typed-steer-resolver-${value.suffix}` })).woken).toBeGreaterThan(0)
+    try { await waitForPersistedTaskWait(pool!, value.turnId, freshWaitKey, 30_000, freshWaitCallId) }
+    catch {
+      const rootId = waitingTurn.rows[0]?.rootTaskId ?? ""
+      const plan = await pool!.query<{ type: string; status: string; errorCode: string | null; outputCode: string | null }>(
+        `SELECT item."type", item."status", item."content"->>'errorCode' AS "errorCode",
+           item."content"->'output'->>'code' AS "outputCode"
+         FROM "agent_items" AS item JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+         WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND turn."userId" = $4
+           AND turn."rootTaskId" = $3 AND item."type" IN ('tool_call', 'tool_result') AND item."content"->>'toolCallId' = $5
+         ORDER BY item."createdAt" DESC LIMIT 2`, [value.sessionId, value.turnId, rootId, value.userId, freshPlanCallId])
+      const stepProof = await readConfirmedAtActiveRootStep()
+      throw new Error(`Typed fresh plan boundary: ${JSON.stringify({ request: typedRequestObservation,
+        plan: plan.rows.map(row => ({ type: row.type, status: row.status, errorCode: row.errorCode, outputCode: row.outputCode })),
+        resumedReceipt: stepProof.kind })}`)
+    }
+    if (!freshTaskId) throw new Error("Typed Dublin plan did not yield a fresh task identity")
+    const freshResult = await waitForCompletedTask(freshTaskId)
+    const freshDigest = digestResult(freshResult.result)
+    const freshResultJson = freshResult.resultJson
+    expect((await reconcileDurableWaits(pool!, { ownerId: `p3-1219-typed-result-resolver-${value.suffix}` })).woken).toBeGreaterThan(0)
+    try { await waitForTurnStatus(pool!, value.turnId, "completed", 45_000, freshWaitCallId, [initialPlanCallId, freshPlanCallId]) }
+    catch {
+      const rootId = waitingTurn.rows[0]?.rootTaskId ?? ""
+      const plan = await pool!.query<{ type: string; status: string; errorCode: string | null; outputStatus: string | null; outputCode: string | null }>(
+        `SELECT item."type", item."status", item."content"->>'errorCode' AS "errorCode",
+           item."content"->'output'->>'status' AS "outputStatus", item."content"->'output'->>'code' AS "outputCode"
+         FROM "agent_items" AS item JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+         WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND turn."userId" = $4
+           AND turn."rootTaskId" = $3 AND item."type" IN ('tool_call', 'tool_result') AND item."content"->>'toolCallId' = $5
+         ORDER BY item."createdAt" DESC LIMIT 2`, [value.sessionId, value.turnId, rootId, value.userId, freshPlanCallId])
+      const stepProof = await readConfirmedAtActiveRootStep()
+      throw new Error(`Typed terminal boundary: ${JSON.stringify({ request: typedRequestObservation,
+        plan: plan.rows.map(row => ({ type: row.type, status: row.status, errorCode: row.errorCode,
+          outputStatus: row.outputStatus, outputCode: row.outputCode })), resumedReceipt: stepProof.kind })}`)
+    }
+
+    const consumed = await pool!.query<{ status: string; acceptedSequence: string; consumedByStepId: string | null }>(
+      `SELECT "status", "acceptedSequence", "consumedByStepId" FROM "agent_inputs" WHERE "id" = $1 AND "sessionId" = $2 AND "targetTurnId" = $3 AND "userId" = $4`,
+      [accepted.inputId, value.sessionId, value.turnId, value.userId])
+    expect(consumed.rows[0]).toMatchObject({ status: "consumed", acceptedSequence: accepted.sequence })
+    expect(consumed.rows[0]?.consumedByStepId).toBeTruthy()
+    const receipt = await pool!.query<{ payload: unknown; actor: string; correlationId: string; causationId: string | null; taskId: string | null; itemId: string | null }>(
+      `SELECT event."payload", event."actor", event."correlationId", event."causationId", event."taskId", event."itemId"
+       FROM "agent_events" AS event JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+       JOIN "agent_sessions" AS session ON session."id" = event."sessionId" AND session."userId" = turn."userId"
+       WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'agent.objective.locations_accepted'
+         AND turn."userId" = $3 AND session."userId" = $3 AND turn."rootTaskId" = event."taskId"`,
+      [value.sessionId, value.turnId, value.userId])
+    expect(receipt.rows).toHaveLength(1)
+    expect(receipt.rows[0]).toMatchObject({ actor: "user", correlationId: value.turnId, taskId: waitingTurn.rows[0]?.rootTaskId, itemId: null })
+    expect(receipt.rows[0]?.causationId).toBeTruthy()
+    expect(record(receipt.rows[0]?.payload)).toEqual({
+      schemaVersion: "agent-harness.v2.objective-location-steer.v1",
+      acceptedInputSequence: Number(accepted.sequence), locations: ["dublin"],
+    })
+    expect(resumedWithTypedReceipt).toBe(true)
+    expect(confirmedSteer).toMatchObject({ kind: "confirmed", locations: ["dublin"] })
+
+    const turnResult = await pool!.query<{ rootTaskId: string | null; finalResponse: string | null }>(
+      `SELECT "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [value.turnId, value.sessionId, value.userId])
+    const rootTaskId = turnResult.rows[0]?.rootTaskId
+    if (!rootTaskId) throw new Error("Typed location final Turn omitted its root identity")
+    const client = await pool!.connect()
+    let loadedGraph: Awaited<ReturnType<typeof loadTaskGraph>>
+    let finalItemContent: RecordValue | null = null
+    let finalTaskResultJson = new Map<string, string>()
+    try {
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+      await client.query("SELECT set_config('app.user_id', $1, true)", [value.userId])
+      loadedGraph = await loadTaskGraph(client, { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+        rootTaskId, parentTaskId: rootTaskId }, false, { includeSourceProvenance: true })
+      const persistedResults = await client.query<{ id: string; resultJson: string }>(
+        `SELECT task."id", task."result"::text AS "resultJson" FROM "sub_agent_tasks" AS task
+         JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+         WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3
+           AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 AND session."userId" = $5 AND turn."userId" = $5`,
+       [[...new Set([...initialTaskIds, ...initialGraphTaskIdsByKey.values(), freshTaskId!])],
+         value.sessionId, value.turnId, rootTaskId, value.userId])
+      finalTaskResultJson = new Map(persistedResults.rows.map(row => [row.id, row.resultJson]))
+      const items = await client.query<{ content: unknown }>(
+        `SELECT item."content" FROM "agent_items" AS item
+         JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+         WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND session."userId" = $4
+           AND turn."userId" = $4 AND turn."rootTaskId" = $3 AND item."type" = 'agent_message'
+           AND item."phase" = 'final_answer' AND item."status" = 'completed' ORDER BY item."createdAt" DESC LIMIT 1`,
+        [value.sessionId, value.turnId, rootTaskId, value.userId])
+      expect(items.rows).toHaveLength(1)
+      finalItemContent = record(items.rows[0]?.content)
+      await client.query("COMMIT")
+    } finally {
+      await client.query("ROLLBACK").catch(() => undefined)
+      client.release()
+    }
+    const nodes = loadedGraph.snapshot?.nodes ?? []
+    const dublinIndex = nodes.findIndex(node => node.key === "scout-dublin")
+    const seattleIndex = nodes.findIndex(node => node.key === "scout-seattle")
+    const freshIndex = nodes.findIndex(node => node.key === "scout-dublin-fresh")
+    const byKey = new Map(nodes.map(node => [node.key, node] as const))
+    const finalDublin = byKey.get("scout-dublin"), finalSeattle = byKey.get("scout-seattle"), finalFresh = byKey.get("scout-dublin-fresh")
+    const dublinFinalMatchesInitialGraph = finalDublin?.taskId === initialGraphTaskIdsByKey.get("scout-dublin")
+    const seattleFinalMatchesInitialGraph = finalSeattle?.taskId === initialGraphTaskIdsByKey.get("scout-seattle")
+    const dublinInitialResult = initialPersistedResultJsonByKey.get("scout-dublin")
+    const seattleInitialResult = initialPersistedResultJsonByKey.get("scout-seattle")
+    const dublinOldRowPresentUnderOwnerRoot = finalTaskResultJson.has(initialGraphTaskIdsByKey.get("scout-dublin")!)
+    const seattleOldRowPresentUnderOwnerRoot = finalTaskResultJson.has(initialGraphTaskIdsByKey.get("scout-seattle")!)
+    const dublinRawResultUnchanged = finalTaskResultJson.get(initialGraphTaskIdsByKey.get("scout-dublin")!) === dublinInitialResult
+    const seattleRawResultUnchanged = finalTaskResultJson.get(initialGraphTaskIdsByKey.get("scout-seattle")!) === seattleInitialResult
+    const originalTaskIdsUnchanged = Boolean(dublinFinalMatchesInitialGraph && seattleFinalMatchesInitialGraph && finalFresh
+      && finalFresh.taskId === freshTaskId)
+    const changedResultCategories = (key: "scout-dublin" | "scout-seattle", finalTaskIdMatches: boolean): string[] => {
+      if (!finalTaskIdMatches) return []
+      const beforeJson = initialPersistedResultJsonByKey.get(key)
+      const afterJson = finalTaskResultJson.get(initialGraphTaskIdsByKey.get(key)!)
+      if (beforeJson === undefined || afterJson === undefined) return ["row_missing"]
+      let before: RecordValue | null = null, after: RecordValue | null = null
+      try { before = record(JSON.parse(beforeJson)); after = record(JSON.parse(afterJson)) } catch { return ["result_shape"] }
+      if (!before || !after) return ["result_shape"]
+      return ["status", "finalText", "structuredResult", "taskGraphVerificationReport", "stepCount", "toolCallCount", "finalItemId"]
+        .filter(field => JSON.stringify(before?.[field]) !== JSON.stringify(after?.[field]))
+    }
+    const dublinRawResultChangedCategories = changedResultCategories("scout-dublin", dublinFinalMatchesInitialGraph)
+    const seattleRawResultChangedCategories = changedResultCategories("scout-seattle", seattleFinalMatchesInitialGraph)
+    const freshRawResultUnchanged = finalTaskResultJson.get(freshTaskId!) === freshResultJson
+    const finalManifest = record(finalItemContent?.taskGraphSources)
+    const sources = Array.isArray(finalManifest?.sources) ? finalManifest.sources.map(record) : []
+    const historical = Array.isArray(finalManifest?.historicalNodeIndices) ? finalManifest.historicalNodeIndices : []
+    const final = record(finalItemContent?.final)
+    const responseText = typeof turnResult.rows[0]?.finalResponse === "string"
+      ? record(JSON.parse(turnResult.rows[0].finalResponse)) : null
+    const text = typeof responseText?.response === "string" ? responseText.response : ""
+    const summary = typeof responseText?.summary === "string" ? responseText.summary : ""
+    const manifestIndexes = sources.map(source => source?.nodeIndex).sort((left, right) => Number(left) - Number(right))
+    const manifestJson = JSON.stringify(finalManifest ?? null)
+    const manifestLeaksInternalProof = manifestJson.includes(initialGraphTaskIdsByKey.get("scout-dublin")!)
+      || manifestJson.includes(initialGraphTaskIdsByKey.get("scout-seattle")!) || manifestJson.includes(freshTaskId!)
+      || manifestJson.includes(initialDigests[0]!) || manifestJson.includes(initialDigests[1]!)
+      || manifestJson.includes(freshDigest)
+    expect({
+      graphHasExpectedOrdinals: nodes.length === 3 && dublinIndex === 0 && seattleIndex === 1 && freshIndex === 2,
+      dublinReceiptMatchesInitialGraph, seattleReceiptMatchesInitialGraph,
+      dublinFinalMatchesInitialGraph, seattleFinalMatchesInitialGraph,
+      dublinOldRowPresentUnderOwnerRoot, seattleOldRowPresentUnderOwnerRoot,
+      dublinRawResultChangedCategories, seattleRawResultChangedCategories,
+      originalTaskIdsUnchanged, dublinRawResultUnchanged, seattleRawResultUnchanged, freshRawResultUnchanged,
+      manifestV2: finalManifest?.schemaVersion === "agent-harness.v2.task-graph-sources.v2",
+      currentSourceOrdinals: manifestIndexes,
+      historicalOrdinals: historical,
+      onlyExpectedScoutSources: sources.length === 2 && sources.every(source => source?.role === "scout"),
+      manifestLeaksInternalProof,
+      finalCountOne: text.includes("Search results: 1 unique job reported (complete coverage)."),
+      finalSummaryCountOne: summary.includes("discovered jobs: 1 (complete)"),
+      finalItemMatchesJson: finalItemContent?.text === text && final?.response === text && final?.summary === summary,
+      finalOmitsCandidateSentinel: !text.includes(finalCandidate),
+    }).toEqual({
+      graphHasExpectedOrdinals: true, dublinReceiptMatchesInitialGraph: true, seattleReceiptMatchesInitialGraph: true,
+      dublinFinalMatchesInitialGraph: true, seattleFinalMatchesInitialGraph: true,
+      dublinOldRowPresentUnderOwnerRoot: true, seattleOldRowPresentUnderOwnerRoot: true,
+      dublinRawResultChangedCategories: [], seattleRawResultChangedCategories: [],
+      originalTaskIdsUnchanged: true, dublinRawResultUnchanged: true,
+      seattleRawResultUnchanged: true, freshRawResultUnchanged: true, manifestV2: true,
+      currentSourceOrdinals: [0, 2], historicalOrdinals: [1], onlyExpectedScoutSources: true,
+      manifestLeaksInternalProof: false, finalCountOne: true, finalSummaryCountOne: true,
+      finalItemMatchesJson: true, finalOmitsCandidateSentinel: true,
+    })
+  }, 120_000)
 
   it("replans a canonical discovery Turn from durable child evidence and persists the owner-scoped shortlist", async () => {
     const [workerQueue, canonical, commandPortModule, subagentQueue] = await Promise.all([
