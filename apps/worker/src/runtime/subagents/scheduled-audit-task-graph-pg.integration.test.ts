@@ -224,7 +224,7 @@ const diagnosticGateErrorCodes = new Set([
   "scheduled_pipeline_audit_child_fenced", "scheduled_pipeline_audit_gate_proof_invalid",
   "scheduled_pipeline_jobs_mismatch", "scheduled_pipeline_mode_mismatch", "scheduled_pipeline_owner_mismatch",
   "scheduled_pipeline_request_invalid", "scheduled_pipeline_resume_unavailable", "scheduled_pipeline_snapshot_mismatch",
-  "scheduled_pipeline_source_changed", "scheduled_pipeline_turn_stale", "scheduled_pipeline_unauthorized",
+  "scheduled_pipeline_source_changed", "scheduled_prepare_material_source_changed", "scheduled_pipeline_turn_stale", "scheduled_pipeline_unauthorized",
 ])
 const diagnosticWorkerErrorCodes = new Set([
   ...diagnosticGateErrorCodes, "scheduled_gate_analyze_proof_invalid", "scheduled_gate_completion_unverified",
@@ -681,6 +681,88 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(job.rows[0]?.description).toBe(`${fixture.jobRecords[0]!.description} changed after Analyze`)
   }, 120_000)
 
+  it("terminalizes material-only drift after a production Job writer races the Gate receipt", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    const race = await runScheduledGateSourceWriterRace(fixture, {
+      update: () => ({ salary: "€100k+" }),
+    })
+
+    expect(race.writerOutcome.status).toBe("fulfilled")
+    expect(race.writerPid).not.toBe(race.gatePid)
+    expect(race.blockingObservation).toMatchObject({ blocked: true, sourceFenceQuery: true, writerFenceHeld: true })
+    expect(race.gateOutcome.status).toBe("fulfilled")
+    expect(race.gateOutcome.status === "fulfilled" && debugRecord(race.gateOutcome.value)?.status === "failed").toBe(true)
+    // The material-drift terminal marker and failed-child witness are asserted separately from Gate transaction rollback.
+    expect(race.after.durableWaits).toEqual(race.before.durableWaits)
+    const terminalGate = await pool!.query<{ status: string; failureReason: string | null }>(`SELECT "status", "failureReason"
+      FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`, [race.gateTaskId, fixture.ids.sessionId])
+    expect(terminalGate.rows).toEqual([{ status: "failed", failureReason: "scheduled_prepare_material_source_changed" }])
+    expectScheduledGateMaterialDriftRejection(race.response)
+    expect(race.after).toEqual(race.before)
+    const execution = await pool!.query<{ status: string; error: string | null; state: unknown }>(
+      `SELECT "status", "error", "state" FROM "agent_executions" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`,
+      [fixture.executionOwner.executionId, fixture.ids.userId, fixture.ids.sessionId])
+    const executionRow = execution.rows[0]
+    const marker = debugRecord(debugRecord(executionRow?.state)?.scheduledTaskGraphMaterialDriftTerminal)
+    const markerOwner = debugRecord(marker?.owner), markerGate = debugRecord(marker?.gate)
+    const materialDigest = (value: unknown): boolean => typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value)
+    expect(executionRow?.status === "failed" && executionRow.error === "scheduled_prepare_material_source_changed"
+      && marker?.reason === "scheduled_prepare_material_source_changed"
+      && markerOwner?.userId === fixture.ids.userId && markerOwner.sessionId === fixture.ids.sessionId
+      && markerOwner.turnId === fixture.ids.turnId && markerOwner.rootTaskId === fixture.ids.rootTaskId
+      && markerOwner.executionId === fixture.executionOwner.executionId
+      && markerOwner.executionAttemptCount === fixture.executionOwner.executionAttemptCount
+      && markerGate?.taskId === race.gateTaskId && materialDigest(marker.artifactDigest)
+      && materialDigest(marker.currentMaterialDigest) && materialDigest(marker.proofDigest)).toBe(true)
+    const approvals = await pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "agent_approvals" WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3
+      AND "type"='review_application'`, [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId])
+    expect(approvals.rows[0]?.count ?? 0).toBe(0)
+  }, 120_000)
+
+  it("does not commit a Gate skip when material-only drift wins the fenced recheck", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    const job = fixture.jobRecords[0]
+    if (!job) throw new Error("scheduled Gate material-drift fixture has no Job")
+    await pool!.query(`INSERT INTO "application_tasks" ("id", "userId", "jobId", "sessionId", "status", "checkpoint", "updatedAt")
+      VALUES ($1,$2,$3,$4,'generating_materials','material_generation_in_progress',CURRENT_TIMESTAMP)`,
+    [`scheduled-gate-material-drift-task-${randomUUID()}`, fixture.ids.userId, job.id, fixture.ids.sessionId])
+    const race = await runScheduledGateSourceWriterRace(fixture, {
+      priorChoices: [{ kind: "weak_cover_letter", jobIds: [job.id], choiceId: "skip" }],
+      update: () => ({ salary: "€100k+" }),
+    })
+
+    expect(race.writerOutcome.status).toBe("fulfilled")
+    expect(race.blockingObservation).toMatchObject({ blocked: true, sourceFenceQuery: true, writerFenceHeld: true })
+    expect(race.gateOutcome.status).toBe("fulfilled")
+    expect(race.gateOutcome.status === "fulfilled" && debugRecord(race.gateOutcome.value)?.status === "failed").toBe(true)
+    expect(race.after.durableWaits).toEqual(race.before.durableWaits)
+    const terminalGate = await pool!.query<{ status: string; failureReason: string | null }>(`SELECT "status", "failureReason"
+      FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`, [race.gateTaskId, fixture.ids.sessionId])
+    expect(terminalGate.rows).toEqual([{ status: "failed", failureReason: "scheduled_prepare_material_source_changed" }])
+    expectScheduledGateMaterialDriftRejection(race.response)
+    expect(race.after).toEqual(race.before)
+    expect(race.after.applicationTasks.count).toBe(1)
+    expect(race.after.applicationTasks.states[0]).toEqual({ status: "generating_materials", checkpoint: "material_generation_in_progress" })
+  }, 120_000)
+
+  it("detects a result-only durable-wait mutation in its bounded PostgreSQL snapshot", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    const before = await readGateSourceRaceSnapshot(fixture)
+    expect(before.durableWaits.count).toBeGreaterThan(0)
+    const mutated = await pool!.query(`WITH target AS (SELECT "id" FROM "agent_wait_conditions"
+        WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3 ORDER BY "id" LIMIT 1)
+      UPDATE "agent_wait_conditions" AS wait SET "result" = jsonb_build_object('snapshotTest', 'result-only-change')
+      FROM target WHERE wait."id"=target."id" RETURNING 1`,
+    [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId])
+    expect(mutated.rowCount).toBe(1)
+    const after = await readGateSourceRaceSnapshot(fixture)
+    expect(after.durableWaits.count).toBe(before.durableWaits.count)
+    expect(after.durableWaits.digest).not.toBe(before.durableWaits.digest)
+  }, 120_000)
+
   it("issues a Gate receipt after the source writer rolls back its fenced Job update", async () => {
     const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
     fixtureUsers.push(fixture.ids.userId)
@@ -697,8 +779,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(race.before.approvals).toBe(0)
     expect(race.after).toMatchObject({ approvals: 1, approvalItems: 1, approvalEvents: 1, approvalOutbox: 1,
       applicationTaskEvents: 1, turnStatus: "waiting_for_approval" })
-    expect(race.after.applicationTasks).toHaveLength(1)
-    expect(race.after.applicationTasks[0]).toMatchObject({ status: "waiting_for_user", checkpoint: "materials_ready" })
+    expect(race.after.applicationTasks.count).toBe(1)
+    expect(race.after.applicationTasks.states[0]).toEqual({ status: "waiting_for_user", checkpoint: "materials_ready" })
     expect(await assertPersistedGateApprovalWitnesses(pool!, fixture, race.gateTaskId)).toHaveLength(1)
     const job = await pool!.query<{ description: string | null }>(`SELECT "description" FROM "Job" WHERE "id"=$1 AND "userId"=$2`,
       [fixture.jobRecords[0]!.id, fixture.ids.userId])
@@ -719,8 +801,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(race.before.approvals).toBe(0)
     expect(race.after).toMatchObject({ approvals: 1, approvalItems: 1, approvalEvents: 1, approvalOutbox: 1,
       applicationTaskEvents: 1, turnStatus: "waiting_for_approval" })
-    expect(race.after.applicationTasks).toHaveLength(1)
-    expect(race.after.applicationTasks[0]).toMatchObject({ status: "waiting_for_user", checkpoint: "materials_ready" })
+    expect(race.after.applicationTasks.count).toBe(1)
+    expect(race.after.applicationTasks.states[0]).toEqual({ status: "waiting_for_user", checkpoint: "materials_ready" })
     await expect(assertPersistedGateApprovalWitnesses(pool!, fixture, race.gateTaskId)).resolves.toHaveLength(1)
     const job = await pool!.query<{ description: string | null; analysisNote: string | null }>(
       `SELECT "description", "analysisNote" FROM "Job" WHERE "id"=$1 AND "userId"=$2`, [fixture.jobRecords[0]!.id, fixture.ids.userId])
@@ -2201,8 +2283,8 @@ async function waitForBarrier(barrier: ReturnType<typeof testBarrier>, label: st
 
 type GateSourceRaceSnapshot = Readonly<{
   approvals: number; approvalItems: number; approvalEvents: number; approvalOutbox: number
-  applicationTasks: readonly Readonly<{ id: string; status: string; checkpoint: string | null; updatedAt: Date }>[]
-  applicationTaskEvents: number; durableWaits: number; turnStatus: string | null
+  applicationTasks: Readonly<{ count: number; digest: string; states: readonly Readonly<{ status: string; checkpoint: string | null }>[] }>
+  applicationTaskEvents: number; durableWaits: Readonly<{ count: number; digest: string }>; turnStatus: string | null
 }>
 type SourceFenceBlockingObservation = Readonly<{
   blocked: boolean; sourceFenceQuery: boolean; writerFenceHeld: boolean; waitEventType: string | null
@@ -2284,21 +2366,30 @@ async function readGateSourceRaceSnapshot(fixture: Fixture): Promise<GateSourceR
       AND "type"='approval.requested'`, [fixture.ids.sessionId, fixture.ids.turnId]),
     pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "agent_outbox" WHERE "aggregateId"=$1
       AND "payload"->>'type'='approval.requested'`, [fixture.ids.sessionId]),
-    pool!.query<GateSourceRaceSnapshot["applicationTasks"][number]>(`SELECT "id", "status", "checkpoint", "updatedAt"
-      FROM "application_tasks" WHERE "userId"=$1 AND "jobId"=ANY($2::text[]) ORDER BY "id"`,
+    pool!.query<GateSourceRaceSnapshot["applicationTasks"]>(`SELECT COUNT(*)::int AS "count",
+        md5(COALESCE(jsonb_agg(jsonb_build_array("id", "userId", "sessionId", "jobId", "status", "checkpoint", "updatedAt")
+          ORDER BY "id")::text, '[]')) AS "digest",
+        COALESCE(jsonb_agg(jsonb_build_object('status', "status", 'checkpoint', "checkpoint") ORDER BY "id"), '[]'::jsonb) AS "states"
+      FROM "application_tasks" WHERE "userId"=$1 AND "jobId"=ANY($2::text[])`,
     [fixture.ids.userId, fixture.preparedJobIds]),
     pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "application_task_events" event
       JOIN "application_tasks" task ON task."id"=event."taskId" WHERE task."userId"=$1 AND task."jobId"=ANY($2::text[])`,
     [fixture.ids.userId, fixture.preparedJobIds]),
-    pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "agent_wait_conditions" WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3`,
+    // Fingerprint identity, lifecycle and result inside PostgreSQL; no wait IDs or stored material reach assertion output.
+    pool!.query<GateSourceRaceSnapshot["durableWaits"]>(`SELECT COUNT(*)::int AS "count",
+        md5(COALESCE(jsonb_agg(jsonb_build_array("id", "userId", "sessionId", "turnId", "parentTaskId", "stepId",
+          "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "createdAt", "updatedAt",
+          "resolvedAt", "suspendedAt", "nextReconcileAt", "consumedAt", "result") ORDER BY "id")::text, '[]')) AS "digest"
+      FROM "agent_wait_conditions" WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3`,
     [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId]),
     pool!.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id"=$1 AND "sessionId"=$2 AND "userId"=$3`,
     [fixture.ids.turnId, fixture.ids.sessionId, fixture.ids.userId]),
   ])
   return { approvals: approvals.rows[0]?.count ?? 0, approvalItems: approvalItems.rows[0]?.count ?? 0,
     approvalEvents: approvalEvents.rows[0]?.count ?? 0, approvalOutbox: approvalOutbox.rows[0]?.count ?? 0,
-    applicationTasks: applicationTasks.rows, applicationTaskEvents: applicationTaskEvents.rows[0]?.count ?? 0,
-    durableWaits: durableWaits.rows[0]?.count ?? 0, turnStatus: turn.rows[0]?.status ?? null }
+    applicationTasks: applicationTasks.rows[0] ?? { count: 0, digest: "", states: [] },
+    applicationTaskEvents: applicationTaskEvents.rows[0]?.count ?? 0,
+    durableWaits: durableWaits.rows[0] ?? { count: 0, digest: "" }, turnStatus: turn.rows[0]?.status ?? null }
 }
 
 async function waitForSourceFenceBlocking(writerPid: number, gatePid: number, timeoutMs = 15_000): Promise<SourceFenceBlockingObservation> {
@@ -2329,6 +2420,16 @@ function expectScheduledGateSourceChangedRejection(response: Awaited<ReturnType<
   ]))
   expect(response.gateHttpFailures()).toEqual(expect.arrayContaining([
     expect.objectContaining({ status: 409, errorCode: "scheduled_pipeline_source_changed" }),
+  ]))
+}
+
+function expectScheduledGateMaterialDriftRejection(response: Awaited<ReturnType<typeof setupFetcher>>): void {
+  expect(response.gateCalls()).toBe(1)
+  expect(response.gateResponses()).toEqual(expect.arrayContaining([
+    expect.objectContaining({ httpStatus: 409, status: "blocked" }),
+  ]))
+  expect(response.gateHttpFailures()).toEqual(expect.arrayContaining([
+    expect.objectContaining({ status: 409, errorCode: "scheduled_prepare_material_source_changed" }),
   ]))
 }
 
