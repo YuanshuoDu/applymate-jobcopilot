@@ -20,6 +20,7 @@ import type { SubagentLease } from "./types.js"
 const DATABASE_NAME = "applymate_nested_delegation_ci"
 const PROCESS_FIXTURE = fileURLToPath(new URL("./nested-scout-delegation-worker.fixture.mjs", import.meta.url))
 const MAIN_PROGRESS_QUERY_TIMEOUT_MS = 2_000
+const CRASH_TEST_LEASE_EXPIRY_TIMEOUT_MS = 40_000 // 30s fixture lease plus a bounded 10s margin.
 
 type FixtureIds = Readonly<{ userId: string; sessionId: string; turnId: string; alphaJobId: string; betaJobId: string; foreignJobId: string }>
 type FixtureProcess = { child: ChildProcess; waitForLine(marker: string, timeoutMs: number): Promise<void>; output: string[] }
@@ -167,9 +168,12 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       && SAFE_WAIT_RESUME_STAGES.includes(match[2] as typeof SAFE_WAIT_RESUME_STAGES[number])
       ? [{ code: match[1], stage: match[2] }] : []
   })
+  const safeWaitingFinishCodes = ["idempotency_conflict", "revision_mismatch", "graph_invalid_transition", "graph_state_missing",
+    "graph_child_missing", "graph_attempt_invalid", "graph_wait_identity_invalid", "graph_revision_mismatch", "graph_resume_blocked",
+    "wait_invalid", "wait_scope_error", "wait_conflict", "pg_40001", "pg_40p01", "pg_55p03", "pg_57014", "pg_08000", "pg_08003", "pg_08006", "pg_57p01", "other"] as const
   const waitingFinishFailures = output.flatMap(value => {
-    const match = value.match(/^P1143_WAITING_FINISH_DIAGNOSTIC:(idempotency_conflict|revision_mismatch|other)$/)
-    return match ? [match[1]] : []
+    const match = value.match(/^P1143_WAITING_FINISH_DIAGNOSTIC:([a-z0-9_]+)$/)
+    return match && safeWaitingFinishCodes.includes(match[1] as typeof safeWaitingFinishCodes[number]) ? [match[1]] : []
   })
   const waitResolverErrorCodes = waitResolverErrorCodesFromOutput(output)
   try {
@@ -982,8 +986,10 @@ const databaseUrl = disposableUrl()
 const describePg = databaseUrl ? describe : describe.skip
 let pool: Pool
 
-function launch(mode: "park" | "crash-child" | "resume", ids: FixtureIds): FixtureProcess {
-  const child = spawn(process.execPath, ["--import", "tsx", PROCESS_FIXTURE, mode, JSON.stringify(ids)], {
+function launch(mode: "park" | "crash-child" | "resume", ids: FixtureIds, leaseProfile?: "restart-recovery"): FixtureProcess {
+  const args = ["--import", "tsx", PROCESS_FIXTURE, mode, JSON.stringify(ids)]
+  if (leaseProfile) args.push(leaseProfile)
+  const child = spawn(process.execPath, args, {
     cwd: process.cwd(), env: fixtureWorkerEnv(process.env, databaseUrl!), stdio: ["pipe", "pipe", "pipe"],
   })
   const output: string[] = []
@@ -1357,7 +1363,7 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
 
       await killAndWait(first.child)
       first = undefined
-      crashing = launch("crash-child", ids)
+      crashing = launch("crash-child", ids, "restart-recovery")
       await waitForMainMarker(ids, crashing, "P1143_CRASH_CHILD_BEFORE_MODEL_CALL", 30_000)
       await waitForMainMarker(ids, crashing, "P1143_CHILD_WORKER_CLAIMED_RUNNING", 30_000)
       const claimedChildren = await pool.query<{ id: string; status: string; leaseOwner: string | null; leaseLive: boolean; attemptCount: number }>(
@@ -1382,8 +1388,8 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       await waitForTimedOutParentWait(ids, parent.rows[0]!.id, initialWaitId, 60_000)
       await killAndWait(crashing.child)
       crashing = undefined
-      await waitForExpiredCrashLease(ids, parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!, 30_000)
-      restarted = launch("resume", ids)
+      await waitForExpiredCrashLease(ids, parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!, CRASH_TEST_LEASE_EXPIRY_TIMEOUT_MS)
+      restarted = launch("resume", ids, "restart-recovery")
       await waitForMainMarker(ids, restarted, "P1143_RECOVERY_DEPTH2_QUEUED", 30_000)
       await waitForMainMarker(ids, restarted, "P1143_CHILD_SCOUT_RECLAIMED", 30_000)
       const reclaimedOwner = await waitForReclaimedCrashChild(ids, crashedChild.id, crashedChild.leaseOwner!, 30_000)
