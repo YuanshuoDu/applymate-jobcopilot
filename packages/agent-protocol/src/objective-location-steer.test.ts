@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  formatObjectiveLocationSteerMessage,
   OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE,
   OBJECTIVE_LOCATION_STEER_SCHEMA_VERSION,
   ObjectiveLocationSteerReceiptSchema,
@@ -22,6 +23,14 @@ const receipt = {
 }
 
 describe('objective location steer protocol', () => {
+  it('formats distinct normalized location arrays without comma ambiguity', () => {
+    const combined = formatObjectiveLocationSteerMessage(['a, b'])
+    const separate = formatObjectiveLocationSteerMessage(['a', 'b'])
+    expect(combined).toBe('The user explicitly confirmed these allowed job locations: ["a, b"].')
+    expect(separate).toBe('The user explicitly confirmed these allowed job locations: ["a","b"].')
+    expect(combined).not.toBe(separate)
+  })
+
   it('exports an opt-in request and separate server-authored receipt shape', () => {
     expect(OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE).toBe('agent.objective.locations_accepted')
     expect(validate(ObjectiveLocationSteerRequestSchema, request)).toBe(true)

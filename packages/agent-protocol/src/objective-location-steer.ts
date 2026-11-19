@@ -4,6 +4,11 @@ import { IdSchema } from './common.js'
 export const OBJECTIVE_LOCATION_STEER_SCHEMA_VERSION = 'agent-harness.v2.objective-location-steer.v1' as const
 export const OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE = 'agent.objective.locations_accepted' as const
 
+/** Produces the exact accepted user message bound to a normalized location list. */
+export function formatObjectiveLocationSteerMessage(locations: readonly string[]): string {
+  return `The user explicitly confirmed these allowed job locations: ${JSON.stringify(locations)}.`
+}
+
 const OBJECTIVE_LOCATION_STEER_MAX_LOCATIONS = 8
 const OBJECTIVE_LOCATION_STEER_MAX_LOCATION_LENGTH = 128
 

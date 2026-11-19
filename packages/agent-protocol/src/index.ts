@@ -29,6 +29,7 @@ export type { AgentSession, SessionSource, SessionStatus } from './session.js'
 export { AgentSessionControlActionSchema, AgentSessionControlCommandSchema } from './session-control.js'
 export type { AgentSessionControlAction, AgentSessionControlCommand } from './session-control.js'
 export {
+  formatObjectiveLocationSteerMessage,
   OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE,
   OBJECTIVE_LOCATION_STEER_SCHEMA_VERSION,
   ObjectiveLocationSteerReceiptSchema,
