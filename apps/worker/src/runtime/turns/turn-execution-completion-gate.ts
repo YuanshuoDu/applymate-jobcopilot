@@ -16,6 +16,7 @@ import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } f
 import { readTaskGraphConfirmedLocationSteer } from "../subagents/task-graph-confirmed-location-steer.js"
 import { resolveTaskGraphConfirmedLocationCompletion } from "./task-graph-confirmed-location-completion.js"
 import { taskGraphCompletionApplicability } from "./task-graph-completion-applicability.js"
+import { readTaskGraphRetiredScouts } from "./task-graph-retirement-completion.js"
 import { assertCompletionAllowed, TASK_GRAPH_FEEDBACK, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-terminal-decision.js"
 export { assertCompletionAllowed, TASK_GRAPH_VERIFICATION_BLOCKER }
 
@@ -145,7 +146,10 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
     graphRevision = loaded.item && Number.isSafeInteger(loaded.item.revision) && loaded.item.revision >= 1 ? loaded.item.revision : null
     denialCheckpoint = buildTaskGraphDenialCheckpoint(loaded, rootTaskId)
     const { nodes } = loaded.snapshot, reports = new Map<string, GateReport>()
+    const retiredScouts = latestUserRevision ? await readTaskGraphRetiredScouts(client, scope, loaded, reconciliationState!) : new Map()
+    const retiredNodeKeys = new Set(retiredScouts.keys())
     for (const node of nodes) {
+      if (retiredNodeKeys.has(node.key)) continue
       if (node.verificationDisposition === "legacy_unverified" && !(nativeVerificationPassed && node.nativeDelegation)) return deny("legacy_unverified")
       if (node.verificationDisposition !== "typed") continue
       const task = loaded.tasks.get(node.taskId), report = gateReport(node, task?.result, task?.role ?? "")
@@ -162,6 +166,7 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
         : task.status !== "failed" || task.failureReason !== "task_graph_verification_" + report.status) return deny("verification_report", reportFeedback(node, report, nodes))
     }
     for (const target of nodes.filter(node => node.verificationDisposition === "typed" && !node.repairOf)) {
+      if (retiredNodeKeys.has(target.key)) continue
       const original = reports.get(target.taskId)!
       if (original.status === "passed") continue
       const counts = new Map<string, number>(), repairDetails: GateFeedbackDetail[] = []
@@ -201,18 +206,20 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
       if (!persisted.found) return deny("result_applicability")
       const locationCompletion = await resolveTaskGraphConfirmedLocationCompletion({
         client, loaded, scope, reconciliation: reconciliationState!, confirmed: confirmedLocation,
-        persistedTurnInput: persisted.input, verifiedCompletedTaskIds,
+        persistedTurnInput: persisted.input, verifiedCompletedTaskIds, retiredNodeKeys,
       })
       if (locationCompletion.kind === "pending") return { ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK }
       if (locationCompletion.kind !== "applicable") return deny("result_applicability")
       historicalNodeIndices = locationCompletion.historicalNodeIndices
     }
     if (latestUserRevision && confirmedLocation?.kind !== "confirmed") {
-      const applicability = taskGraphCompletionApplicability(loaded, latestUserRevision, reconciliationState!.currentRevision, verifiedCompletedTaskIds)
+      const applicability = taskGraphCompletionApplicability(loaded, latestUserRevision, reconciliationState!.currentRevision,
+        verifiedCompletedTaskIds, undefined, retiredNodeKeys)
       if (applicability.kind === "replan") return deny("result_applicability")
       historicalNodeIndices = applicability.historicalNodeIndices
     }
-    const binding = buildTaskGraphFinalSummaryBinding(loaded, historicalNodeIndices)
+    const binding = buildTaskGraphFinalSummaryBinding(loaded, historicalNodeIndices, retiredScouts)
+    if (!binding && retiredScouts.size > 0) return deny("result_applicability")
     return binding ? { ok: true, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding } : { ok: true }
   } catch { graphRevision = null; denialCheckpoint = null; return deny() }
 }
