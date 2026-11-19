@@ -6,8 +6,9 @@ import type { ChildToolReplayReceipt, ChildWaitReplayReceipt } from "../turns/tu
 import type { SubagentLease } from "./types.js"
 import { dateValue, DurableSubagentWaitError, object as waitObject, safeSubagentWaitJson, waitResult, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
 import { markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
-import { buildChildResumeReplayReceipts, type ChildResumeReplayPair } from "./child-resume-replay-receipts.js"
+import { buildChildResumeReplayReceipts, type ChildResumeReplayPair, type ChildResumeReplayReceiptSet } from "./child-resume-replay-receipts.js"
 import { redactJobReadOutput } from "../tools/job-read-output-redaction.js"
+import { isSubagentTaskId } from "../tools/redaction.js"
 import { createDurableDiscoveryAssembly, parseDurableDiscoveryReference, reduceDurableDiscoveryChunk, type DurableDiscoveryAssembly } from "./child-durable-discovery.js"
 
 type Row = Record<string, unknown>
@@ -25,19 +26,9 @@ export type ChildResumeObservationSet = Readonly<{
   observations: readonly ContextSeedBlock[]; childToolReplayReceipts: readonly ChildToolReplayReceipt[]; childWaitReplayReceipts: readonly ChildWaitReplayReceipt[]
 }>
 
-function text(row: Row, key: string): string {
-  const value = row[key]
-  if (typeof value !== "string" || value.trim().length === 0) throw new Error(`child_resume_invalid_${key}`)
-  return value
-}
-export function integer(row: Row, key: string, minimum = 0): number {
-  const value = typeof row[key] === "number" ? row[key] : Number(row[key])
-  if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`child_resume_invalid_${key}`)
-  return value
-}
-function object(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
-}
+function text(row: Row, key: string): string { const value = row[key]; if (typeof value !== "string" || value.trim().length === 0) throw new Error(`child_resume_invalid_${key}`); return value }
+export function integer(row: Row, key: string, minimum = 0): number { const value = typeof row[key] === "number" ? row[key] : Number(row[key]); if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`child_resume_invalid_${key}`); return value }
+function object(value: unknown): Record<string, unknown> | null { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null }
 function waitTask(value: Row | null): value is Row & { readonly taskId: string } {
   return !!value && typeof value.taskId === "string"
 }
@@ -121,15 +112,24 @@ function verifiedDiscoveryReadPairs(pairs: readonly ChildResumeReplayPair[]): Se
   }
   return verified
 }
+type RestoredScoutDelegate = Readonly<{ taskId: string; status: "queued" | "duplicate" }>
 export function buildChildResumeObservations(rows: readonly Row[], lease: SubagentLease, currentAttemptOrdinal?: number, durableWaits: readonly DurableWaitResume[] = []): ChildResumeObservationSet {
-  const replay = buildChildResumeReplayReceipts(rows, lease, currentAttemptOrdinal, durableWaits)
+  return projectChildResumeObservations(buildChildResumeReplayReceipts(rows, lease, currentAttemptOrdinal, durableWaits))
+}
+export function projectChildResumeObservations(replay: ChildResumeReplayReceiptSet,
+  delegateResults?: ReadonlyMap<string, RestoredScoutDelegate>): ChildResumeObservationSet {
   if (replay.pairs.length > MAX_RESTORED_OBSERVATIONS) throw new Error("child_resume_observation_limit")
   const verifiedReads = verifiedDiscoveryReadPairs(replay.pairs)
-  const restored = replay.pairs.map((item, index) => ({ id: `child-resume:${item.resultItemId}`, content: { toolCallId: item.toolCallId, toolName: item.toolName,
-    input: boundedJson(item.input, MAX_TOOL_INPUT_BYTES), status: item.status,
-    output: item.toolName === "jobs.discover" ? boundedDiscoveryJson(item.output, MAX_TOOL_OUTPUT_BYTES)
-      : item.toolName === "tool_results.read" && verifiedReads.has(index) ? boundedNormalizedJson(item.output as RepositoryJsonValue, MAX_TOOL_OUTPUT_BYTES) : boundedJson(item.output, MAX_TOOL_OUTPUT_BYTES),
-    errorCode: item.status === "completed" ? null : "tool_execution_failed" } }))
+  const restored = replay.pairs.map((item, index) => {
+    const delegate = item.toolName === "scout.delegate" && item.status === "completed" ? delegateResults?.get(item.resultItemId) : undefined
+    if (delegate && (!isSubagentTaskId(delegate.taskId) || delegate.status !== "queued" && delegate.status !== "duplicate")) throw new Error("child_resume_delegate_receipt_unavailable")
+    return { id: `child-resume:${item.resultItemId}`, content: { toolCallId: item.toolCallId, toolName: item.toolName,
+      input: boundedJson(item.input, MAX_TOOL_INPUT_BYTES), status: item.status,
+      output: delegate ? boundedNormalizedJson({ taskId: delegate.taskId, status: delegate.status }, MAX_TOOL_OUTPUT_BYTES)
+        : item.toolName === "jobs.discover" ? boundedDiscoveryJson(item.output, MAX_TOOL_OUTPUT_BYTES)
+          : item.toolName === "tool_results.read" && verifiedReads.has(index) ? boundedNormalizedJson(item.output as RepositoryJsonValue, MAX_TOOL_OUTPUT_BYTES) : boundedJson(item.output, MAX_TOOL_OUTPUT_BYTES),
+      errorCode: item.status === "completed" ? null : "tool_execution_failed" } }
+  })
   if (Buffer.byteLength(JSON.stringify(restored), "utf8") > MAX_RESTORED_OBSERVATION_BYTES) throw new Error("child_resume_observation_limit")
   return { observations: restored, childToolReplayReceipts: replay.childToolReplayReceipts, childWaitReplayReceipts: replay.childWaitReplayReceipts }
 }
