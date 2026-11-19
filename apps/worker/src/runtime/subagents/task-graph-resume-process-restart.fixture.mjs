@@ -1900,7 +1900,6 @@ function startSuccessiveReplanRuntime(ownerId, resume, calls) {
               yield { type: "completed", finishReason: "tool_calls" }; return
             }
             if (!dublinPlanIssued && !dublin) {
-              await waitForCommand("accept-dublin-steer")
               if (!/dublin/i.test(facts.text) || !seattle || !request.tools.some(tool => record(tool)?.name === "agent.plan")
                 || typeof graph?.revision !== "number") throw new Error("p3_successive_replan_dublin_scope_missing")
               dublinPlanIssued = true
@@ -1934,7 +1933,6 @@ function startSuccessiveReplanRuntime(ownerId, resume, calls) {
               yield { type: "completed", finishReason: "tool_calls" }; return
             }
             if (firstRetirementWaitIssued && !berlinInspectionIssued) {
-              await waitForCommand("accept-berlin-steer")
               if (!facts.privateCuePresent || !facts.berlinScopePresent || !request.tools.some(tool => record(tool)?.name === "agent.list")) {
                 throw new Error("p3_successive_replan_berlin_inspection_context_missing")
               }

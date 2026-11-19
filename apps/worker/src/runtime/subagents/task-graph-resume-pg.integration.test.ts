@@ -16307,7 +16307,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       if ((await reconcileDurableWaits(pool!, { ownerId: `p3-1248-wake-dublin-${value.suffix}` })).woken < 1) {
         throw new Error("Dublin steer did not wake the durable Root wait")
       }
-      firstWorker.stdin?.write("accept-dublin-steer\n")
       let interruptRequested: string
       try {
         interruptRequested = await waitForProcessLine(firstWorker, "P3_SUCCESSIVE_REPLAN_SEATTLE_INTERRUPT_REQUESTED ", 60_000)
@@ -16344,7 +16343,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       if ((await reconcileDurableWaits(pool!, { ownerId: `p3-1248-wake-berlin-${value.suffix}` })).woken < 1) {
         throw new Error("Berlin steer did not wake the durable Root wait")
       }
-      firstWorker.stdin?.write("accept-berlin-steer\n")
       const crashCut = await waitForProcessLine(firstWorker, "P3_SUCCESSIVE_REPLAN_CRASH_CUT ", 60_000)
       assertMarker(crashCut, "P3_SUCCESSIVE_REPLAN_CRASH_CUT ", { inspectResultValid: true, steerConsumed: true,
         privateCuePresent: true, berlinScopePresent: true, priorRetirementPresent: true, acceptedBerlinPlanCount: 0,
