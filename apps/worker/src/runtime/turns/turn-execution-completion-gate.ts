@@ -6,17 +6,20 @@ import { taskGraphItemId, type StoredTaskGraphNode } from "../subagents/task-gra
 import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import { buildTaskGraphDenialCheckpoint, gateReport, repairIds,
   type GateReport, type TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
-import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
+import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_EVENT_TYPE, STEERING_RECONCILIATION_FEEDBACK,
+  type SteeringReconciliationState } from "../subagents/steering-reconciliation-contract.js"
+import { readSteeringReconciliationState } from "../subagents/steering-reconciliation-read.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { applyCompletionRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
+import { taskGraphCompletionApplicability } from "./task-graph-completion-applicability.js"
 import { assertCompletionAllowed, TASK_GRAPH_FEEDBACK, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-terminal-decision.js"
 export { assertCompletionAllowed, TASK_GRAPH_VERIFICATION_BLOCKER }
 
 export function completionRecoverySnapshot(snapshot: StepContextSnapshot, stepId: string, feedback: string): StepContextSnapshot {
   return applyCompletionRecovery(snapshot, stepId, feedback)
 }
-type GateFeedbackCode = "legacy_unverified" | "verification_report" | "repair_receipt" | "repair_criterion"
+type GateFeedbackCode = "legacy_unverified" | "verification_report" | "repair_receipt" | "repair_criterion" | "result_applicability"
 type RepairFeedbackState = "missing" | "pending" | "terminal" | "unavailable" | "missing_receipt" | "rejected" | "invalid_receipt" | "invalid_report"
 type GateFeedbackDetail = Readonly<{ nodeOrdinal: number; criterionOrdinal?: number; status: "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode; repairState?: RepairFeedbackState }>
 const ACTIVE_REPAIR_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user"])
@@ -68,6 +71,16 @@ function row(value: unknown): Record<string, unknown> {
   if (typeof parsed === "string") { try { parsed = JSON.parse(parsed) as unknown } catch { return {} } }
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
 }
+async function hasReconciliationEventHint(client: pg.PoolClient, lease: TurnLease, rootTaskId: string): Promise<boolean> {
+  const result = await client.query(`SELECT 1 FROM "agent_events" AS event
+    JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+    JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+    WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3 AND event."type" = $4
+      AND turn."rootTaskId" = $3 AND turn."leaseOwnerId" = $5 AND turn."leaseVersion" = $6
+      AND session."userId" = $7 AND turn."userId" = $7 AND to_jsonb(turn)->>'source' = 'user' LIMIT 1`,
+  [lease.sessionId, lease.turnId, rootTaskId, STEERING_RECONCILIATION_EVENT_TYPE, lease.ownerId, lease.leaseVersion, lease.userId])
+  return result.rows.length > 0
+}
 /** Rechecks durable reports against the current immutable graph inside the caller's transaction. */
 export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, lease: TurnLease, rootTaskId: string, nativeVerificationPassed = false, requireTaskGraph = false): Promise<Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>> {
   let graphRevision: number | null = null
@@ -80,11 +93,20 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
   }
   const scope: GraphIdentityScope = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId, parentTaskId: rootTaskId }
   try {
-    const loaded = await loadTaskGraph(client, scope, true)
+    let reconciliationState: SteeringReconciliationState | null = null
+    if (await hasReconciliationEventHint(client, lease, rootTaskId)) {
+      reconciliationState = await readSteeringReconciliationState(client, { ...scope, turnLeaseOwner: lease.ownerId,
+        turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1 })
+      if (reconciliationState.unresolvedInputs.length) return { ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK }
+    }
+    const latestUserRevision = reconciliationState?.latestUserRevision
+    const loaded = await loadTaskGraph(client, scope, true, latestUserRevision ? { includeSourceProvenance: true } : {})
     if (!loaded.snapshot) {
+      if (latestUserRevision) return deny("result_applicability")
       const plans = await client.query(`SELECT 1 FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId" JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId" WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3 AND event."taskId" = $4 AND event."payload"->>'kind' IN ('proposal', 'native_command') AND session."userId" = $5 AND turn."userId" = $5 LIMIT 1`, [lease.sessionId, lease.turnId, taskGraphItemId(rootTaskId), rootTaskId, lease.userId])
       return plans.rows.length || requireTaskGraph ? deny() : { ok: true }
     }
+    if (latestUserRevision && (!loaded.item || reconciliationState?.currentRevision !== loaded.item.revision)) return deny("result_applicability")
     if (requireTaskGraph && loaded.snapshot.nodes.length === 0) return deny()
     graphRevision = loaded.item && Number.isSafeInteger(loaded.item.revision) && loaded.item.revision >= 1 ? loaded.item.revision : null
     denialCheckpoint = buildTaskGraphDenialCheckpoint(loaded, rootTaskId)
@@ -135,7 +157,17 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
         return deny("repair_receipt", [...(targetReport ? reportFeedback(target, targetReport, nodes, "invalid_receipt") : []), ...reportFeedback(repair, report, nodes)])
       }
     }
-    const binding = buildTaskGraphFinalSummaryBinding(loaded)
+    let historicalNodeIndices: ReadonlySet<number> = new Set()
+    if (latestUserRevision) {
+      const verifiedCompletedTaskIds = new Set([...reports].flatMap(([taskId, report]) => {
+        const task = loaded.tasks.get(taskId)
+        return report.status === "passed" && task?.status === "completed" && task.failureReason === null ? [taskId] : []
+      }))
+      const applicability = taskGraphCompletionApplicability(loaded, latestUserRevision, reconciliationState!.currentRevision, verifiedCompletedTaskIds)
+      if (applicability.kind === "replan") return deny("result_applicability")
+      historicalNodeIndices = applicability.historicalNodeIndices
+    }
+    const binding = buildTaskGraphFinalSummaryBinding(loaded, historicalNodeIndices)
     return binding ? { ok: true, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding } : { ok: true }
   } catch { graphRevision = null; denialCheckpoint = null; return deny() }
 }
