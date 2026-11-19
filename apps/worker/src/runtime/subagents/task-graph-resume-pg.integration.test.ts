@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
-import { createRequire } from "node:module"
 import { rm, writeFile } from "node:fs/promises"
+import { createRequire } from "node:module"
 import { spawn, type ChildProcess } from "node:child_process"
 import { isDeepStrictEqual } from "node:util"
 import { fileURLToPath } from "node:url"
@@ -10,9 +10,9 @@ import { Redis } from "ioredis"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
+import { formatObjectiveLocationSteerMessage } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import {
-  OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
   PLAN_LEDGER_SCHEMA_VERSION,
   parsePlanLedger,
   projectPlanLedger,
@@ -71,6 +71,7 @@ import { hasNoCurrentAttemptTaskGraphToolReceipts } from "./task-graph-empty-ana
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 import type { WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
+import { readTaskGraphConfirmedLocationSteer } from "./task-graph-confirmed-location-steer.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const authorizeUnreservedUsage = async () => ({
@@ -128,6 +129,27 @@ const SCOUT_VERIFICATION = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
   role: "scout",
   criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+} as const
+const BROAD_LOCATION_SCOUT_VERIFICATION = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+  criteria: [
+    { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+    { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["dublin", "seattle"] } },
+  ],
+} as const
+const SEATTLE_LOCATION_SCOUT_VERIFICATION = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+  criteria: [
+    { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+    { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["seattle"] } },
+  ],
+} as const
+const DUBLIN_LOCATION_SCOUT_VERIFICATION = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+  criteria: [
+    { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+    { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["dublin"] } },
+  ],
 } as const
 const ANALYST_VERIFICATION = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
@@ -292,16 +314,21 @@ assertRequiredIntegrationServices(process.env.AGENT_RUNTIME_PG_TEST_REQUIRED ===
 const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 
 type DisposableWebPrismaClient = { $disconnect(): Promise<void> }
+type UserSteerCommandService = Readonly<{ steer(command: {
+  sessionId: string; userId: string; clientMessageId: string; source: "user"; expectedTurnId: string | null; expectedRevision?: number | null
+  content: { type: "text"; text: string }[]
+}): Promise<{ inputId: string; turnId: string; disposition: string; sequence: string }> }>
+const webRequire = createRequire(new URL("../../../../web/package.json", import.meta.url))
+
 type ObjectiveStartFixtureCommand = Readonly<{
   sessionId: string; userId: string; clientMessageId: string; source: "user"; objective: string
   content: readonly { type: "text"; text: string }[]
-  verificationRequirements: Readonly<{ schemaVersion: "agent-harness.v2.objective-requirements.v1"; requirements: readonly {
-    id: "candidate-count"; check: Readonly<{ kind: "candidate_count_gte"; minimum: 1 }>
+  verificationRequirements: Readonly<{ schemaVersion: "agent-harness.v2.objective-requirements.v2"; requirements: readonly {
+    id: "candidate-count" | "candidate-location"; check: Readonly<{ kind: "candidate_count_gte"; minimum: 1 } | { kind: "candidate_location_in"; locations: readonly string[] }>
   }[] }>
 }>
 type ObjectiveStartFixtureResult = Readonly<{ inputId: string; turnId: string; sequence: string; disposition: string }>
 type ObjectiveStartFixtureService = Readonly<{ start(command: ObjectiveStartFixtureCommand): Promise<ObjectiveStartFixtureResult> }>
-const webRequire = createRequire(new URL("../../../../web/package.json", import.meta.url))
 
 async function createDisposableWebObjectiveStartService(connectionString: string): Promise<{
   prisma: DisposableWebPrismaClient; commands: ObjectiveStartFixtureService
@@ -311,23 +338,44 @@ async function createDisposableWebObjectiveStartService(connectionString: string
   if (typeof prismaConstructor !== "function") throw new Error("Web Prisma client constructor is unavailable")
   const prisma = new (prismaConstructor as new (options: { datasourceUrl: string }) => unknown)({ datasourceUrl: connectionString }) as DisposableWebPrismaClient
   try {
-    // @ts-expect-error Worker TypeScript has no Web alias; Vitest resolves this test-only bridge.
-    const imported: unknown = await import("@/lib/agent/control-plane/commands/objective-start")
-    const constructor = imported && typeof imported === "object"
-      ? (imported as { ObjectiveStartCommandService?: unknown }).ObjectiveStartCommandService : undefined
+    const moduleName = "@/lib/agent/control-plane/commands/objective-start"
+    const imported: unknown = await import(moduleName)
+    const constructor = imported && typeof imported === "object" ? (imported as { ObjectiveStartCommandService?: unknown }).ObjectiveStartCommandService : undefined
     if (typeof constructor !== "function") throw new Error("Production ObjectiveStart command service is unavailable")
-    const commands = new (constructor as new (db: unknown) => ObjectiveStartFixtureService)(prisma)
-    return { prisma, commands }
+    const service = new (constructor as new (db: unknown) => ObjectiveStartFixtureService)(prisma)
+    return { prisma, commands: service }
   } catch (error: unknown) {
     await prisma.$disconnect()
     throw error
   }
 }
 
-type UserSteerCommandService = Readonly<{ steer(command: {
-  sessionId: string; userId: string; clientMessageId: string; source: "user"; expectedTurnId: string | null; expectedRevision?: number | null
-  content: { type: "text"; text: string }[]
-}): Promise<{ inputId: string; turnId: string; disposition: string; sequence: string }> }>
+type ObjectiveLocationSteerFixtureCommand = Readonly<{
+  schemaVersion: "agent-harness.v2.objective-location-steer.v1"; clientMessageId: string; expectedTurnId: string
+  expectedRevision: number; locations: readonly string[]; userId: string; sessionId: string
+}>
+type ObjectiveLocationSteerFixtureResult = Readonly<{ inputId: string; turnId: string; disposition: string; sequence: string }>
+type ObjectiveLocationSteerFixtureService = (db: unknown, command: ObjectiveLocationSteerFixtureCommand) => Promise<ObjectiveLocationSteerFixtureResult>
+
+async function createDisposableWebObjectiveLocationSteerService(connectionString: string): Promise<{
+  prisma: DisposableWebPrismaClient; accept(command: ObjectiveLocationSteerFixtureCommand): Promise<ObjectiveLocationSteerFixtureResult>
+}> {
+  const loaded: unknown = webRequire("@prisma/client")
+  const prismaConstructor = loaded && typeof loaded === "object" ? (loaded as { PrismaClient?: unknown }).PrismaClient : undefined
+  if (typeof prismaConstructor !== "function") throw new Error("Web Prisma client constructor is unavailable")
+  const prisma = new (prismaConstructor as new (options: { datasourceUrl: string }) => unknown)({ datasourceUrl: connectionString }) as DisposableWebPrismaClient
+  try {
+    const moduleName = "@/lib/agent/control-plane/commands/objective-location-steer"
+    const imported: unknown = await import(moduleName)
+    const accept = imported && typeof imported === "object" ? (imported as { acceptObjectiveLocationSteer?: unknown }).acceptObjectiveLocationSteer : undefined
+    if (typeof accept !== "function") throw new Error("Production ObjectiveLocationSteer service is unavailable")
+    const invoke = accept as ObjectiveLocationSteerFixtureService
+    return { prisma, accept: command => invoke(prisma, command) }
+  } catch (error: unknown) {
+    await prisma.$disconnect()
+    throw error
+  }
+}
 
 async function createDisposableWebSteerService(connectionString: string): Promise<{
   prisma: DisposableWebPrismaClient; commands: UserSteerCommandService
@@ -766,7 +814,6 @@ const DISCOVERY_SCHEDULE_ERROR_CODES = new Set([
   "task_graph_task_scope_invalid", "task_graph_scope_unavailable", "task_graph_verification_unverified", "revision_limit",
   "child_allowed_actions_exceed_parent_policy", "subagent_depth_limit", "subagent_fan_out_limit", "session_unavailable",
   "parent_task_unavailable", "parent_task_terminal", "subagent_task_disappeared", "subagent_task_insert_failed",
-  "nested_scout_creation_authority_invalid",
 ])
 const WAIT_HANDOFF_GATE_LABELS = new Map([
   ["waitId is required", "wait_id_required"],
@@ -1148,19 +1195,10 @@ async function repairCycleVerificationDiagnostic(pool: Pool, turnId: string): Pr
   }
 }
 
-function discoveryScheduleFailureDiagnostic(error: unknown): {
-  errorName: string; errorCode: string; sqlState: string | null; repositoryFrame: string | null
-} {
+function discoveryScheduleFailureDiagnostic(error: unknown): { errorName: string; errorCode: string } {
   const row = record(error)
   const errorName = diagnosticEnum(error instanceof Error ? error.name : row?.name, DISCOVERY_SCHEDULE_ERROR_NAMES) ?? "other"
   const rawCode = typeof row?.code === "string" ? row.code : error instanceof Error ? error.message : null
-  const sqlState = typeof row?.code === "string" && /^[A-Z0-9]{5}$/.test(row.code) ? row.code : null
-  const stack = error instanceof Error ? error.stack : typeof row?.stack === "string" ? row.stack : null
-  let repositoryFrame: string | null = null
-  for (const line of stack?.split(/\r?\n/) ?? []) {
-    const match = /\b((?:apps|packages)[\\/][\w./\\-]+\.ts):(\d+):\d+/.exec(line)
-    if (match?.[1] && match[2]) { repositoryFrame = `${match[1].replace(/\\/g, "/")}:${match[2]}`; break }
-  }
   const taskGraphCode = typeof rawCode === "string" && /^task_graph_[a-z0-9_]{1,80}$/.test(rawCode) ? rawCode : null
   const code = rawCode === "Child allowed actions exceed parent policy" ? "child_allowed_actions_exceed_parent_policy"
     : rawCode === "Subagent depth limit reached" ? "subagent_depth_limit"
@@ -1170,7 +1208,7 @@ function discoveryScheduleFailureDiagnostic(error: unknown): {
             : rawCode === "Parent task is terminal" ? "parent_task_terminal"
               : rawCode === "Subagent task disappeared" ? "subagent_task_disappeared"
                 : rawCode === "Subagent task insert failed" ? "subagent_task_insert_failed" : rawCode
-  return { errorName, errorCode: taskGraphCode ?? diagnosticEnum(code, DISCOVERY_SCHEDULE_ERROR_CODES) ?? "other", sqlState, repositoryFrame }
+  return { errorName, errorCode: taskGraphCode ?? diagnosticEnum(code, DISCOVERY_SCHEDULE_ERROR_CODES) ?? "other" }
 }
 
 function diagnosticDiscoveryTasks(values: readonly unknown[]): RecordValue[] {
@@ -3922,6 +3960,23 @@ function planTaskIds(request: HarnessModelRequest, callId = PLAN_CALL_ID, expect
   })
   if (ids.length !== expectedCount) throw new Error(`Expected ${expectedCount} planned task ID(s); received ${ids.length}`)
   return ids
+}
+
+function planTaskIdsByKey(request: HarnessModelRequest, callId: string, expectedKeys: readonly string[]): Map<string, string> {
+  const output = record(latestToolResult(request, callId))
+  if (!output || (output.status !== "accepted" && output.status !== "duplicate") || !Array.isArray(output.nodes)) {
+    throw new Error("TaskGraph plan receipt missing from the next root model request")
+  }
+  const idsByKey = new Map<string, string>()
+  for (const value of output.nodes) {
+    const node = record(value)
+    if (!node || typeof node.key !== "string" || typeof node.taskId !== "string" || idsByKey.has(node.key)) continue
+    idsByKey.set(node.key, node.taskId)
+  }
+  if (idsByKey.size !== expectedKeys.length || expectedKeys.some(key => !idsByKey.has(key))) {
+    throw new Error("TaskGraph plan receipt did not bind the expected node keys")
+  }
+  return idsByKey
 }
 
 function completedGraphStatusFailureProjection(graph: unknown): RecordValue {
@@ -8890,7 +8945,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       maxToolCalls: VERIFICATION_REPAIR_TOOL_BUDGET,
     })
     await seed(pool, lateRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxToolCalls: 10 })
-    await seed(pool, replanApplicabilityOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     const locationRepairLimits = { ...DISCOVERY_FIXTURE_TURN_LIMITS,
       maxSteps: VERIFICATION_REPAIR_STEP_BUDGET, maxToolCalls: VERIFICATION_REPAIR_TOOL_BUDGET }
     await seed(pool, locationRepairOwner, "waiting_for_user", locationRepairLimits)
@@ -8905,6 +8959,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, emptyAnalystCurrentReceiptOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, emptyAnalystMutationOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, archivedWaitOwner, "waiting_for_user", { maxSteps: 4, maxToolCalls: 3 })
+    await seed(pool, replanApplicabilityOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, rootRecoveryScanOwner, "waiting_for_user")
   }, 15_000)
 
@@ -13993,7 +14048,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       })
   }, 90_000)
 
-  it("reproduces a confirmed location revise beside a live read-only Scout lease", async () => {
+  it("keeps a live Scout while accepting an independent confirmed-location replacement", async () => {
     const value = supersededReadOnlyScoutOwner
     const [workerQueue, canonical, commandPortModule, subagentQueue] = await Promise.all([
       import("../../queue/production-bootstrap.js"), import("../canonical-turn-runtime.js"),
@@ -14007,9 +14062,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       [value.userId, `${value.userId}@example.invalid`])
     await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
       VALUES ($1, $2, 'Live Scout supersession fixture', 'running', 'test', CURRENT_TIMESTAMP)`, [value.sessionId, value.userId])
-    const broadRequirements = { schemaVersion: "agent-harness.v2.objective-requirements.v2" as const,
+    const seattleRequirements = { schemaVersion: "agent-harness.v2.objective-requirements.v2" as const,
       requirements: [{ id: "candidate-location" as const,
-        check: { kind: "candidate_location_in" as const, locations: ["Dublin", "Seattle"] } }] }
+        check: { kind: "candidate_location_in" as const, locations: ["Seattle"] } }] }
     const startService = await createDisposableWebObjectiveStartService(databaseUrl!)
     const priorFlag = process.env.AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED
     let started: ObjectiveStartFixtureResult | undefined
@@ -14017,9 +14072,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       process.env.AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED = "1"
       started = await startService.commands.start({ sessionId: value.sessionId, userId: value.userId,
         clientMessageId: `p3-1240-start:${value.suffix}`, source: "user",
-        objective: "Find software engineering roles in Dublin and Seattle",
-        content: [{ type: "text", text: "Find software engineering roles in Dublin and Seattle" }],
-        verificationRequirements: broadRequirements })
+        objective: "Find software engineering roles in Seattle",
+        content: [{ type: "text", text: "Find software engineering roles in Seattle" }],
+        verificationRequirements: seattleRequirements })
     } finally {
       if (priorFlag === undefined) delete process.env.AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED
       else process.env.AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED = priorFlag
@@ -14053,7 +14108,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const confirmationCue = "the user explicitly confirmed these allowed job locations:"
     let seattleTaskId = "", initialWaitIssued = false, reviseAttempted = false
     let postReviseWaitIssued = false, receiptObserved = false, confirmationVisible = false, dublinVisible = false
-    let rootToolsAtRevise: string[] = [], initialGraphRevision: number | undefined
+    let rootToolsAtRevise: string[] = [], initialGraphRevision: number | undefined, reviseExpectedRevision: number | undefined
     let scoutSearchCalls = 0, seattleHeld = false
     let adapterStage = "not_started", proofKind = "not_read", requestHasConfirmation = false, requestHasDublin = false
     let releaseSeattle!: () => void
@@ -14117,7 +14172,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
               expectedRevision: 0, nodes: [{ key: "scout-seattle", templateId: "scout",
                 goal: "Find software engineering roles in Seattle", successCriteria: ["Return one Seattle role"],
-                dependsOn: [], verification: BROAD_LOCATION_SCOUT_VERIFICATION }],
+                dependsOn: [], verification: SEATTLE_LOCATION_SCOUT_VERIFICATION }],
             } }
             yield { type: "completed", finishReason: "tool_calls" }
             return
@@ -14148,6 +14203,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             rootToolsAtRevise = request.tools.map(tool => record(tool)?.name).filter((name): name is string => typeof name === "string")
             const revision = graph?.revision
             if (typeof revision !== "number") throw new Error("Typed location replan omitted its graph revision")
+            reviseExpectedRevision = revision
             reviseAttempted = true
             yield { type: "tool_call_completed", callId: reviseCallId, name: "agent.plan", arguments: {
               expectedRevision: revision, nodes: [{ key: "scout-dublin-replacement", templateId: "scout",
@@ -14247,6 +14303,29 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         [value.turnId, value.sessionId, value.userId])
       const rootTaskId = waitingTurn.rows[0]?.rootTaskId
       if (!rootTaskId) throw new Error("Typed live-Scout Turn omitted its Root identity")
+      const seattleLeaseAtAcceptance = await pool!.query<{ id: string; status: string; role: string; attemptCount: number;
+        leaseOwner: string | null; leaseExpiresAt: Date | null; leaseSegmentStartedAt: Date | null; interruptRequestedAt: Date | null }>(
+        `SELECT task."id", task."status", task."role", task."attemptCount", task."leaseOwner", task."leaseExpiresAt",
+           task."leaseSegmentStartedAt", task."interruptRequestedAt" FROM "sub_agent_tasks" AS task
+         JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+         WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
+           AND task."parentTaskId" = $4 AND turn."rootTaskId" = $4 AND session."userId" = $5 AND turn."userId" = $5`,
+        [seattleTaskId, value.sessionId, value.turnId, rootTaskId, value.userId])
+      const originalSeattleLease = seattleLeaseAtAcceptance.rows[0]
+      expect(originalSeattleLease).toMatchObject({ id: seattleTaskId, status: "running", role: "scout",
+        attemptCount: expect.any(Number), leaseOwner: expect.any(String), leaseSegmentStartedAt: expect.any(Date), interruptRequestedAt: null })
+      expect(originalSeattleLease?.leaseExpiresAt?.getTime()).toBeGreaterThan(Date.now())
+      const rootPermissionsAtAcceptance = await pool!.query<{ allowedActions: unknown }>(
+        `SELECT root."allowedActions" FROM "sub_agent_tasks" AS root
+         JOIN "agent_sessions" AS session ON session."id" = root."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = root."turnId" AND turn."sessionId" = root."sessionId"
+         WHERE root."id" = $1 AND root."sessionId" = $2 AND root."turnId" = $3 AND root."rootTaskId" = $1
+           AND root."parentTaskId" IS NULL AND turn."rootTaskId" = $1 AND session."userId" = $4 AND turn."userId" = $4`,
+        [rootTaskId, value.sessionId, value.turnId, value.userId])
+      const allowedActionsBeforeSteer = rootPermissionsAtAcceptance.rows[0]?.allowedActions
+      if (!Array.isArray(allowedActionsBeforeSteer)) throw new Error("Typed Root omitted its persisted action policy")
+      expect(allowedActionsBeforeSteer).not.toContain("agent.interrupt")
       const steerService = await createDisposableWebObjectiveLocationSteerService(databaseUrl!)
       let accepted: ObjectiveLocationSteerFixtureResult
       try {
@@ -14265,15 +14344,19 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         await checkpoint.query("SELECT set_config('app.user_id', $1, true)", [value.userId])
         const loaded = await loadTaskGraph(checkpoint, { userId: value.userId, sessionId: value.sessionId,
           turnId: value.turnId, rootTaskId, parentTaskId: rootTaskId }, false, { includeSourceProvenance: true })
+        const replacementNode = loaded.snapshot?.nodes.find(node => node.key === "scout-dublin-replacement")
         const oldTask = await checkpoint.query<{ status: string; role: string; leaseOwner: string | null;
-          leaseExpiresAt: Date | null; interruptRequestedAt: Date | null; rootTaskId: string | null; parentTaskId: string | null }>(
-          `SELECT task."status", task."role", task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt",
+          id: string; attemptCount: number; leaseSegmentStartedAt: Date | null; leaseExpiresAt: Date | null;
+          interruptRequestedAt: Date | null; rootTaskId: string | null; parentTaskId: string | null }>(
+          `SELECT task."id", task."status", task."role", task."attemptCount", task."leaseSegmentStartedAt",
+             task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt",
              task."rootTaskId", task."parentTaskId" FROM "sub_agent_tasks" AS task
            JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
            JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
            WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
              AND task."parentTaskId" = $4 AND turn."rootTaskId" = $4 AND session."userId" = $5 AND turn."userId" = $5`,
           [seattleTaskId, value.sessionId, value.turnId, rootTaskId, value.userId])
+        const currentSeattleLease = oldTask.rows[0]
         const rootRow = await checkpoint.query<{ allowedActions: unknown }>(
           `SELECT root."allowedActions" FROM "sub_agent_tasks" AS root
            JOIN "agent_sessions" AS session ON session."id" = root."sessionId"
@@ -14290,15 +14373,52 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
            WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."type" = 'tool_call'
              AND task."rootTaskId" = $3 AND turn."rootTaskId" = $3 AND session."userId" = $4 AND turn."userId" = $4`,
           [value.sessionId, value.turnId, rootTaskId, value.userId])
-        const reviseResult = await checkpoint.query<{ outputCode: string | null; errorCode: string | null }>(
-          `SELECT item."content"->'output'->>'code' AS "outputCode", item."content"->>'errorCode' AS "errorCode"
+        const reviseResult = await checkpoint.query<{ outputStatus: string | null; outputRevision: string | null;
+          outputCode: string | null; errorCode: string | null }>(
+          `SELECT item."content"->'output'->>'status' AS "outputStatus",
+             item."content"->'output'->>'revision' AS "outputRevision",
+             item."content"->'output'->>'code' AS "outputCode", item."content"->>'errorCode' AS "errorCode"
            FROM "agent_items" AS item JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
            JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
            WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND item."type" = 'tool_result'
              AND item."content"->>'toolCallId' = $4 AND turn."rootTaskId" = $3
              AND session."userId" = $5 AND turn."userId" = $5 ORDER BY item."createdAt" DESC LIMIT 1`,
           [value.sessionId, value.turnId, rootTaskId, reviseCallId, value.userId])
+        const expectedRevision = (reviseExpectedRevision ?? 0) + 1
+        const persistedRevise = reviseResult.rows[0]
+        const acceptedRevision = typeof persistedRevise?.outputRevision === "string"
+          && /^[1-9]\d{0,11}$/.test(persistedRevise.outputRevision) ? Number(persistedRevise.outputRevision) : null
+        const loadedRevisionIncludesAcceptedPlan = typeof loaded.item?.revision === "number"
+          && acceptedRevision !== null && loaded.item.revision >= acceptedRevision
+        expect(persistedRevise?.outputStatus).toBe("accepted")
+        expect(acceptedRevision).toBe(expectedRevision)
+        expect(loadedRevisionIncludesAcceptedPlan).toBe(true)
+        expect(replacementNode?.taskId).toEqual(expect.any(String))
+        const replacementTask = await checkpoint.query<{ id: string; status: string; role: string; goal: string;
+          rootTaskId: string | null; parentTaskId: string | null }>(
+          `SELECT task."id", task."status", task."role", task."goal", task."rootTaskId", task."parentTaskId"
+           FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+           JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+           WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
+             AND task."parentTaskId" = $4 AND turn."rootTaskId" = $4 AND session."userId" = $5 AND turn."userId" = $5`,
+          [replacementNode.taskId, value.sessionId, value.turnId, rootTaskId, value.userId])
+        const replacementDispatch = await checkpoint.query<{ payload: unknown }>(
+          `SELECT dispatch."payload" FROM "agent_outbox" AS dispatch
+           JOIN "sub_agent_tasks" AS task ON task."sessionId" = dispatch."aggregateId"
+             AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
+           JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+           JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+           WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
+             AND task."parentTaskId" = $4 AND turn."rootTaskId" = $4 AND dispatch."topic" = 'agent.subagent.dispatch'
+             AND session."userId" = $5 AND turn."userId" = $5`,
+          [replacementNode.taskId, value.sessionId, value.turnId, rootTaskId, value.userId])
         const allowedActions = Array.isArray(rootRow.rows[0]?.allowedActions) ? rootRow.rows[0]!.allowedActions as unknown[] : []
+        const seattleLeaseUnchanged = !!currentSeattleLease && !!originalSeattleLease
+          && currentSeattleLease.id === originalSeattleLease.id
+          && currentSeattleLease.leaseOwner === originalSeattleLease.leaseOwner
+          && currentSeattleLease.attemptCount === originalSeattleLease.attemptCount
+          && currentSeattleLease.leaseSegmentStartedAt?.getTime() === originalSeattleLease.leaseSegmentStartedAt?.getTime()
+        const replacementPayload = record(replacementDispatch.rows[0]?.payload)
         const acceptedInput = await checkpoint.query<{ status: string; acceptedSequence: string;
           consumedByStepId: string | null; consumedByTaskId: string | null }>(
           `SELECT input."status", input."acceptedSequence", input."consumedByStepId", step."taskId" AS "consumedByTaskId"
@@ -14310,19 +14430,35 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           [accepted.inputId, value.sessionId, value.turnId, value.userId, rootTaskId])
         expect({ receiptObserved, confirmationVisible, dublinVisible,
           rootCannotSeeInterrupt: !rootToolsAtRevise.includes("agent.interrupt") && !allowedActions.includes("agent.interrupt"),
+          rootAllowedActionsUnchanged: JSON.stringify(allowedActions) === JSON.stringify(allowedActionsBeforeSteer),
           graphRevision: loaded.item?.revision, graphKeys: loaded.snapshot?.nodes.map(node => node.key),
+          replacementDependencies: replacementNode.dependsOn, replacementTask: replacementTask.rows[0],
+          replacementDispatchCount: replacementDispatch.rows.length,
+          replacementDispatch: replacementPayload,
           noExternalActionCalls: toolCalls.rows.every(row => ["agent.plan", "agent.wait", "jobs.search"].includes(row.name ?? "")),
           oldTask: oldTask.rows[0], oldLeaseLive: !!oldTask.rows[0]?.leaseExpiresAt
             && oldTask.rows[0].leaseExpiresAt.getTime() > Date.now(),
-          reviseResult: reviseResult.rows[0]?.outputCode ?? reviseResult.rows[0]?.errorCode,
+          seattleLeaseUnchanged,
+          reviseResult: reviseResult.rows[0],
           acceptedInput: acceptedInput.rows[0], scoutSearchObserved: scoutSearchCalls > 0,
         }).toMatchObject({ receiptObserved: true, confirmationVisible: true, dublinVisible: true,
-          rootCannotSeeInterrupt: true, graphRevision: initialGraphRevision, graphKeys: ["scout-seattle"], noExternalActionCalls: true,
-          oldTask: { status: "running", role: "scout", leaseOwner: expect.any(String),
+          rootCannotSeeInterrupt: true, rootAllowedActionsUnchanged: true,
+          graphRevision: expect.any(Number), graphKeys: ["scout-seattle", "scout-dublin-replacement"],
+          replacementDependencies: [], replacementTask: { id: replacementNode.taskId, role: "scout",
+            goal: "Find a fresh software engineering role in Dublin", rootTaskId, parentTaskId: rootTaskId },
+          replacementDispatchCount: 1,
+          replacementDispatch: { taskId: replacementNode.taskId, sessionId: value.sessionId,
+            rootTaskId, ownerId: expect.any(String) },
+          noExternalActionCalls: true,
+          oldTask: { id: seattleTaskId, status: "running", role: "scout", leaseOwner: originalSeattleLease?.leaseOwner,
+            attemptCount: originalSeattleLease?.attemptCount, leaseSegmentStartedAt: originalSeattleLease?.leaseSegmentStartedAt,
             interruptRequestedAt: null, rootTaskId, parentTaskId: rootTaskId }, oldLeaseLive: true,
-          reviseResult: "task_graph_current_location_evidence_unavailable",
+          seattleLeaseUnchanged: true,
+          reviseResult: { outputStatus: "accepted", outputRevision: String(expectedRevision),
+            outputCode: null, errorCode: null },
           acceptedInput: { status: "consumed", acceptedSequence: accepted.sequence, consumedByStepId: expect.any(String), consumedByTaskId: rootTaskId },
           scoutSearchObserved: true })
+        expect(loaded.item?.revision).toBeGreaterThanOrEqual(acceptedRevision!)
         await checkpoint.query("COMMIT")
       } finally { await checkpoint.query("ROLLBACK").catch(() => undefined); checkpoint.release() }
     } finally {
@@ -19537,7 +19673,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       if (workerTwo && !processFixtureExited(workerTwo)) await killProcessFixture(workerTwo)
     }
   }, 150_000)
-
   it("admits one registered Scout from a real ObjectiveStart without widening Root authority", async () => {
     const value = objectiveScoutAuthorityOwner
     const [workerQueue, canonical, commandPortModule, subagentQueue] = await Promise.all([

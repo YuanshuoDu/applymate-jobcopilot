@@ -20,10 +20,10 @@ import { isScheduledDraftTemplate, scheduledDraftPair, scheduledDraftTaskContext
 import { sourceIntentForTaskGraphNode } from "./task-graph-source-intent-context.js"
 import { scheduledScoutPlanCapacityAllowed } from "./scheduled-taskgraph-plan-capacity.js"
 import { isRegisteredObjectiveScoutTemplate } from "./objective-task-graph-scout-authority.js"
+import type { PreparedSteeringReconciliation } from "./steering-reconciliation-contract.js"
 
 const EXTERNAL_ACTION = /(?:^|[._-])(submit|send|publish|delete|mutate|execute)(?:$|[._-])/i
 const REGISTERED_NESTED_SCOUT = templatesForInteractiveScoutDelegation(TASK_GRAPH_TEMPLATES, TASK_GRAPH_TEMPLATES)?.scout
-
 export type CreatedGraphTasks = Readonly<{
   state: TaskGraphState
   snapshot: TaskGraphSnapshot
@@ -61,6 +61,7 @@ export async function createGraphTasks(
   client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent, current: TaskGraphState,
   priorTaskIds: ReadonlyMap<string, string>, provenance?: Pick<LoadedGraph, "sourceInputCheckpointByNodeKey" | "currentInputCheckpoint">,
   operationalFailureReuse?: OperationalFailureCapacityReuse, objectiveTaskGraphScoutAuthority = false,
+  preparedReconciliation?: PreparedSteeringReconciliation,
 ): Promise<CreatedGraphTasks> {
   if (input.verificationRequirements?.status === "invalid") {
     throw Object.assign(new Error("Canonical objective verification requirements are invalid"), {
@@ -117,8 +118,7 @@ export async function createGraphTasks(
   if (input.proposal.nodes.some(node => unverifiedAncestors.has(node.key))) {
     throw new Error("task_graph_dependency_unverified")
   }
-  const statuses = new Map(current.nodes.map(node => [node.key, node.status] as const))
-  const logicalStatuses = new Map(statuses)
+  const statuses = new Map(current.nodes.map(node => [node.key, node.status] as const)), logicalStatuses = new Map(statuses)
   for (const key of current.repairSatisfiedNodeKeys ?? []) logicalStatuses.set(key, "completed")
   const dependencies = new Map([...current.nodes, ...input.proposal.nodes].map(node => [node.key, node] as const))
   const preflightStatuses = new Map(statuses)
@@ -127,7 +127,7 @@ export async function createGraphTasks(
     preflightStatuses.set(node.key, status); logicalStatuses.set(node.key, status)
   })
   await validateTaskGraphRepairTargets(client, input, current, priorTaskIds)
-  const coverage = await evaluateTaskGraphPlanObjectiveCoverage({ client, input, nodes: appended.state.nodes, provenance })
+  const coverage = await evaluateTaskGraphPlanObjectiveCoverage({ client, input, nodes: appended.state.nodes, provenance, prepared: preparedReconciliation })
   if (coverage.status === "invalid") throw Object.assign(new Error("Canonical objective verification requirements are invalid"), {
     code: "task_graph_objective_requirements_invalid",
   })

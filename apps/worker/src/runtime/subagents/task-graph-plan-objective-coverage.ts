@@ -9,6 +9,8 @@ import { resolveTaskGraphCurrentLocationEvidence, type TaskGraphCurrentLocationE
 import type { TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import { readSteeringReconciliationState } from "./steering-reconciliation-read.js"
 import type { SteeringReconciliationState } from "./steering-reconciliation-contract.js"
+import type { PreparedSteeringReconciliation } from "./steering-reconciliation-contract.js"
+import { classifyPendingSupersededScouts } from "./task-graph-pending-scout-scope.js"
 
 type Client = Pick<pg.PoolClient, "query">
 export type TaskGraphAvailableLocationEvidence = Extract<TaskGraphCurrentLocationEvidenceResult, { status: "available" }>
@@ -17,6 +19,7 @@ type CoverageInput = Readonly<{
   input: TaskGraphScheduleInput
   nodes: readonly TaskGraphObjectiveLineageNode[]
   provenance?: Pick<LoadedGraph, "sourceInputCheckpointByNodeKey" | "currentInputCheckpoint">
+  prepared?: PreparedSteeringReconciliation
 }>
 
 /** Applies confirmed current-location authority before evaluating a proposed plan's objective coverage. */
@@ -44,15 +47,23 @@ export async function evaluateTaskGraphPlanObjectiveCoverage(input: CoverageInpu
     includeSourceProvenance: true, currentStepId: input.input.scope.stepId,
     currentStepAttempt: 1,
   })
+  const pending = input.prepared
+    ? classifyPendingSupersededScouts({ loaded, scope: input.input.scope, reconciliation, prepared: input.prepared,
+      confirmed: steer, expectedRevision: input.input.proposal.expectedRevision, nodes: input.nodes })
+    : { status: "available" as const, pendingNodeKeys: new Set<string>() }
+  const pendingNodeKeys = pending.status === "available" ? pending.pendingNodeKeys : new Set<string>()
   const evidence = await resolveTaskGraphCurrentLocationEvidence({
     client: input.client, loaded, scope: input.input.scope, initialRequirements: requirements,
     verifiedCurrentLocations: steer.locations, acceptedInputSequence: steer.acceptedInputSequence,
     retainCompatiblePriorScouts: canRetainCompatiblePriorScouts(reconciliation, steer.acceptedInputSequence),
+    pendingSupersededNodeKeys: pendingNodeKeys,
   })
   if (evidence.status !== "available") return unavailable("task_graph_current_location_evidence_unavailable")
   assertNoExcludedScoutDependencies(input.nodes, input.input.proposal.nodes.map(node => node.key), evidence.excludedHistoricalNodeKeys)
+  const coverageNodes = buildTaskGraphLocationCoverageNodes(input.nodes, evidence)
+    .filter(node => !pendingNodeKeys.has(node.key))
   return evaluateTaskGraphObjectiveCoverage(evidence.effectiveRequirements,
-    buildTaskGraphLocationCoverageNodes(input.nodes, evidence), input.input.templates, input.input.scope.rootTaskId)
+    coverageNodes, input.input.templates, input.input.scope.rootTaskId)
 }
 
 export function canRetainCompatiblePriorScouts(state: SteeringReconciliationState, acceptedSequence: bigint): boolean {
