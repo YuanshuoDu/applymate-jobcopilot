@@ -1527,8 +1527,10 @@ const databaseUrl = disposableUrl()
 const describePg = databaseUrl ? describe : describe.skip
 let pool: Pool
 
-function launch(mode: "park" | "crash-child" | "resume", ids: FixtureIds): FixtureProcess {
-  const child = spawn(process.execPath, ["--import", "tsx", PROCESS_FIXTURE, mode, JSON.stringify(ids)], {
+function launch(mode: "park" | "crash-child" | "resume", ids: FixtureIds, leaseProfile?: "restart-recovery"): FixtureProcess {
+  const args = ["--import", "tsx", PROCESS_FIXTURE, mode, JSON.stringify(ids)]
+  if (leaseProfile) args.push(leaseProfile)
+  const child = spawn(process.execPath, args, {
     cwd: process.cwd(), env: fixtureWorkerEnv(process.env, databaseUrl!), stdio: ["pipe", "pipe", "pipe"],
   })
   const output: string[] = []
@@ -1932,7 +1934,7 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
 
       await killAndWait(first.child)
       first = undefined
-      crashing = launch("crash-child", ids)
+      crashing = launch("crash-child", ids, "restart-recovery")
       await waitForMainMarker(ids, crashing, "P1143_CRASH_CHILD_BEFORE_MODEL_CALL", 30_000)
       await waitForMainMarker(ids, crashing, "P1143_CHILD_WORKER_CLAIMED_RUNNING", 30_000)
       const claimedChildren = await pool.query<{ id: string; status: string; leaseOwner: string | null; leaseLive: boolean; attemptCount: number; fixtureAlias: FixtureTaskAlias }>(
@@ -1978,7 +1980,7 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
       await emitNestedScoutRecoveryDiagnostic(ids, "crash_worker_stopped", [parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!])
       await waitForExpiredCrashLease(ids, parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!, CRASH_TEST_LEASE_EXPIRY_TIMEOUT_MS)
       await emitNestedScoutRecoveryDiagnostic(ids, "child_lease_expired", [parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!])
-      restarted = launch("resume", ids)
+      restarted = launch("resume", ids, "restart-recovery")
       await waitForMainMarker(ids, restarted, "P1143_RECOVERY_DEPTH2_QUEUED", 30_000)
       await emitNestedScoutRecoveryDiagnostic(ids, "recovery_requeued_depth_two", [parent.rows[0]!.id, crashedChild.id, crashedChild.leaseOwner!])
       await waitForMainMarker(ids, restarted, "P1143_CHILD_SCOUT_RECLAIMED", 30_000, crashedChild.fixtureAlias)

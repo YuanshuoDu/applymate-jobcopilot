@@ -13,9 +13,11 @@ import { createSubagentQueue } from "../../queue/subagent-queue.ts"
 import { enqueueTurn } from "../turns/turn-queue.ts"
 import { createCrashFixtureExecutor, createNestedScoutFixtureScripts } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 import { installWaitResolverDiagnostics } from "./nested-scout-wait-resolver-logging.mjs"
-const [, , mode, rawIds] = process.argv, ids = JSON.parse(rawIds)
+const [, , mode, rawIds, leaseProfile] = process.argv, ids = JSON.parse(rawIds)
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 10 })
-const CRASH_TEST_LEASE_MS = 30_000, CRASH_TEST_HEARTBEAT_MS = 10_000
+const restartRecovery = leaseProfile === "restart-recovery"
+const fixtureLeaseMs = restartRecovery ? 30_000 : 3_000
+const fixtureHeartbeatMs = restartRecovery ? 10_000 : 500
 const SAFE_RECOVERY_ERROR_CODES = new Set([
   "subagent_dispatch_delivery_uncertain", "lost", "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01",
   "ECONNRESET", "ETIMEDOUT", "wait_invalid", "wait_scope_error", "wait_conflict",
@@ -237,13 +239,13 @@ function recordRepairQueryTiming(snapshot, statement, elapsedMs) {
 async function start(mode) {
   installWaitResolverDiagnostics(say)
   const ownerId = `p1143-worker-${process.pid}`
-  const taskStore = mode === "park" ? undefined : withWaitingFinishDiagnostics(new PgSubagentTaskStore(pool, CRASH_TEST_LEASE_MS))
+  const taskStore = mode === "park" ? undefined : withWaitingFinishDiagnostics(new PgSubagentTaskStore(pool, fixtureLeaseMs))
   const taskAliases = new Map()
-  if (taskStore) {
+  if (taskStore && restartRecovery) {
     installClaimDiagnostics(taskStore, taskAliases)
     installHeartbeatDiagnostics(taskStore, taskAliases)
   }
-  const manager = taskStore ? new AgentTreeManager(taskStore, { heartbeatMs: CRASH_TEST_HEARTBEAT_MS }) : undefined
+  const manager = taskStore ? new AgentTreeManager(taskStore, { heartbeatMs: fixtureHeartbeatMs }) : undefined
   let recoveryStage = "manager_recover"
   if (mode === "resume" && manager) {
     const recoveryMarkers = new Set()
