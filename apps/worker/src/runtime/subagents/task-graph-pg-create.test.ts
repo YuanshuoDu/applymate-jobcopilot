@@ -245,10 +245,20 @@ describe("createGraphTasks", () => {
       await createGraphTasks({ query: vi.fn(async () => ({ rows: [], rowCount: 1 })) } as unknown as Pick<pg.PoolClient, "query">,
         schedule(template), { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map())
       expect(create.mock.calls[0]?.[3]).toMatchObject({ nestedScoutAuthority: "parent_template" })
+      expect(create.mock.calls[0]?.[3]).not.toHaveProperty("objectiveTaskGraphScoutAuthority")
+      await createGraphTasks({ query: vi.fn(async () => ({ rows: [], rowCount: 1 })) } as unknown as Pick<pg.PoolClient, "query">,
+        schedule(template), { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map(), undefined, undefined, true)
+      expect(create.mock.calls[1]?.[3]).toMatchObject({ objectiveTaskGraphScoutAuthority: schedule(template).scope, nestedScoutAuthority: "parent_template" })
       await createGraphTasks({ query: vi.fn(async () => ({ rows: [], rowCount: 1 })) } as unknown as Pick<pg.PoolClient, "query">,
         schedule({ ...template, constraints: [...(template.constraints ?? []), "forged sibling"] }),
-        { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map())
-      expect(create.mock.calls[1]?.[3]).not.toHaveProperty("nestedScoutAuthority")
+        { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map(), undefined, undefined, true)
+      expect(create.mock.calls[2]?.[3]).not.toHaveProperty("objectiveTaskGraphScoutAuthority")
+      expect(create.mock.calls[2]?.[3]).not.toHaveProperty("nestedScoutAuthority")
+      await createGraphTasks({ query: vi.fn(async () => ({ rows: [], rowCount: 1 })) } as unknown as Pick<pg.PoolClient, "query">,
+        { ...schedule(template), proposal: { expectedRevision: 0, nodes: [plannedNode({ key: "analysis", templateId: "analyst", goal: "Analyze", successCriteria: ["done"], dependsOn: [] })] },
+          templates: { analyst: TASK_GRAPH_TEMPLATES.analyst } },
+        { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map(), undefined, undefined, true)
+      expect(create.mock.calls[3]?.[3]).not.toHaveProperty("objectiveTaskGraphScoutAuthority")
     } finally { create.mockRestore() }
   })
 

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
-import { rm, writeFile } from "node:fs/promises"
 import { createRequire } from "node:module"
+import { rm, writeFile } from "node:fs/promises"
 import { spawn, type ChildProcess } from "node:child_process"
 import { isDeepStrictEqual } from "node:util"
 import { fileURLToPath } from "node:url"
@@ -12,6 +12,7 @@ import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import {
+  OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
   PLAN_LEDGER_SCHEMA_VERSION,
   parsePlanLedger,
   projectPlanLedger,
@@ -291,11 +292,42 @@ assertRequiredIntegrationServices(process.env.AGENT_RUNTIME_PG_TEST_REQUIRED ===
 const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 
 type DisposableWebPrismaClient = { $disconnect(): Promise<void> }
+type ObjectiveStartFixtureCommand = Readonly<{
+  sessionId: string; userId: string; clientMessageId: string; source: "user"; objective: string
+  content: readonly { type: "text"; text: string }[]
+  verificationRequirements: Readonly<{ schemaVersion: "agent-harness.v2.objective-requirements.v1"; requirements: readonly {
+    id: "candidate-count"; check: Readonly<{ kind: "candidate_count_gte"; minimum: 1 }>
+  }[] }>
+}>
+type ObjectiveStartFixtureResult = Readonly<{ inputId: string; turnId: string; sequence: string; disposition: string }>
+type ObjectiveStartFixtureService = Readonly<{ start(command: ObjectiveStartFixtureCommand): Promise<ObjectiveStartFixtureResult> }>
+const webRequire = createRequire(new URL("../../../../web/package.json", import.meta.url))
+
+async function createDisposableWebObjectiveStartService(connectionString: string): Promise<{
+  prisma: DisposableWebPrismaClient; commands: ObjectiveStartFixtureService
+}> {
+  const loaded: unknown = webRequire("@prisma/client")
+  const prismaConstructor = loaded && typeof loaded === "object" ? (loaded as { PrismaClient?: unknown }).PrismaClient : undefined
+  if (typeof prismaConstructor !== "function") throw new Error("Web Prisma client constructor is unavailable")
+  const prisma = new (prismaConstructor as new (options: { datasourceUrl: string }) => unknown)({ datasourceUrl: connectionString }) as DisposableWebPrismaClient
+  try {
+    // @ts-expect-error Worker TypeScript has no Web alias; Vitest resolves this test-only bridge.
+    const imported: unknown = await import("@/lib/agent/control-plane/commands/objective-start")
+    const constructor = imported && typeof imported === "object"
+      ? (imported as { ObjectiveStartCommandService?: unknown }).ObjectiveStartCommandService : undefined
+    if (typeof constructor !== "function") throw new Error("Production ObjectiveStart command service is unavailable")
+    const commands = new (constructor as new (db: unknown) => ObjectiveStartFixtureService)(prisma)
+    return { prisma, commands }
+  } catch (error: unknown) {
+    await prisma.$disconnect()
+    throw error
+  }
+}
+
 type UserSteerCommandService = Readonly<{ steer(command: {
   sessionId: string; userId: string; clientMessageId: string; source: "user"; expectedTurnId: string | null; expectedRevision?: number | null
   content: { type: "text"; text: string }[]
 }): Promise<{ inputId: string; turnId: string; disposition: string; sequence: string }> }>
-const webRequire = createRequire(new URL("../../../../web/package.json", import.meta.url))
 
 async function createDisposableWebSteerService(connectionString: string): Promise<{
   prisma: DisposableWebPrismaClient; commands: UserSteerCommandService
@@ -734,6 +766,7 @@ const DISCOVERY_SCHEDULE_ERROR_CODES = new Set([
   "task_graph_task_scope_invalid", "task_graph_scope_unavailable", "task_graph_verification_unverified", "revision_limit",
   "child_allowed_actions_exceed_parent_policy", "subagent_depth_limit", "subagent_fan_out_limit", "session_unavailable",
   "parent_task_unavailable", "parent_task_terminal", "subagent_task_disappeared", "subagent_task_insert_failed",
+  "nested_scout_creation_authority_invalid",
 ])
 const WAIT_HANDOFF_GATE_LABELS = new Map([
   ["waitId is required", "wait_id_required"],
@@ -1115,10 +1148,19 @@ async function repairCycleVerificationDiagnostic(pool: Pool, turnId: string): Pr
   }
 }
 
-function discoveryScheduleFailureDiagnostic(error: unknown): { errorName: string; errorCode: string } {
+function discoveryScheduleFailureDiagnostic(error: unknown): {
+  errorName: string; errorCode: string; sqlState: string | null; repositoryFrame: string | null
+} {
   const row = record(error)
   const errorName = diagnosticEnum(error instanceof Error ? error.name : row?.name, DISCOVERY_SCHEDULE_ERROR_NAMES) ?? "other"
   const rawCode = typeof row?.code === "string" ? row.code : error instanceof Error ? error.message : null
+  const sqlState = typeof row?.code === "string" && /^[A-Z0-9]{5}$/.test(row.code) ? row.code : null
+  const stack = error instanceof Error ? error.stack : typeof row?.stack === "string" ? row.stack : null
+  let repositoryFrame: string | null = null
+  for (const line of stack?.split(/\r?\n/) ?? []) {
+    const match = /\b((?:apps|packages)[\\/][\w./\\-]+\.ts):(\d+):\d+/.exec(line)
+    if (match?.[1] && match[2]) { repositoryFrame = `${match[1].replace(/\\/g, "/")}:${match[2]}`; break }
+  }
   const taskGraphCode = typeof rawCode === "string" && /^task_graph_[a-z0-9_]{1,80}$/.test(rawCode) ? rawCode : null
   const code = rawCode === "Child allowed actions exceed parent policy" ? "child_allowed_actions_exceed_parent_policy"
     : rawCode === "Subagent depth limit reached" ? "subagent_depth_limit"
@@ -1128,7 +1170,7 @@ function discoveryScheduleFailureDiagnostic(error: unknown): { errorName: string
             : rawCode === "Parent task is terminal" ? "parent_task_terminal"
               : rawCode === "Subagent task disappeared" ? "subagent_task_disappeared"
                 : rawCode === "Subagent task insert failed" ? "subagent_task_insert_failed" : rawCode
-  return { errorName, errorCode: taskGraphCode ?? diagnosticEnum(code, DISCOVERY_SCHEDULE_ERROR_CODES) ?? "other" }
+  return { errorName, errorCode: taskGraphCode ?? diagnosticEnum(code, DISCOVERY_SCHEDULE_ERROR_CODES) ?? "other", sqlState, repositoryFrame }
 }
 
 function diagnosticDiscoveryTasks(values: readonly unknown[]): RecordValue[] {
@@ -8790,6 +8832,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const leaseRecoveryOwner = fixture()
   const coverageRepairOwner = fixture()
   const scoutUnionOwner = fixture()
+  const objectiveScoutAuthorityOwner = fixture()
   const emptyAnalystOwner = fixture()
   const emptyAnalystOrphanOwner = fixture()
   const emptyAnalystCurrentReceiptOwner = fixture()
@@ -8888,7 +8931,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner,
       locationRepairOwner, locationMismatchOwner, locationConflictOwner, locationForeignOwner, replanApplicabilityOwner, leaseRecoveryOwner,
       coverageRepairOwner, scoutUnionOwner, emptyAnalystOwner, emptyAnalystOrphanOwner, emptyAnalystCurrentReceiptOwner,
-      emptyAnalystMutationOwner, rootRecoveryScanOwner, archivedWaitOwner]
+      emptyAnalystMutationOwner, rootRecoveryScanOwner, archivedWaitOwner, objectiveScoutAuthorityOwner]
     const allFixtureWorkersExited = [...fixtureProcessChildren].every(processFixtureExited)
     if (!allFixtureWorkersExited) cleanupFailures.push("fixture process Workers are not proven exited; queue cleanup was refused")
     let ownerRowsMayBeDeleted = false
@@ -19155,4 +19198,262 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       if (workerTwo && !processFixtureExited(workerTwo)) await killProcessFixture(workerTwo)
     }
   }, 150_000)
+
+  it("admits one registered Scout from a real ObjectiveStart without widening Root authority", async () => {
+    const value = objectiveScoutAuthorityOwner
+    const [workerQueue, canonical, commandPortModule, subagentQueue] = await Promise.all([
+      import("../../queue/production-bootstrap.js"), import("../canonical-turn-runtime.js"),
+      import("./pg-task-graph-command-port.js"), import("../../queue/subagent-queue.js"),
+    ])
+    const { createTurnQueue, TURN_QUEUE_NAME } = await import("../turns/turn-queue.js")
+    turnQueueName = TURN_QUEUE_NAME
+    childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
+
+    await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`,
+      [value.userId, `${value.userId}@example.invalid`])
+    await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Objective Scout authority fixture', 'running', 'test', CURRENT_TIMESTAMP)`, [value.sessionId, value.userId])
+    const startService = await createDisposableWebObjectiveStartService(databaseUrl!)
+    let started: ObjectiveStartFixtureResult | undefined
+    try {
+      started = await startService.commands.start({
+        sessionId: value.sessionId, userId: value.userId, clientMessageId: `p3-1221-objective-start:${value.suffix}`,
+        source: "user", objective: "Find one software engineering role in Dublin",
+        content: [{ type: "text", text: "Find one software engineering role in Dublin" }],
+        verificationRequirements: {
+          schemaVersion: "agent-harness.v2.objective-requirements.v1",
+          requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+        },
+      })
+    } finally {
+      await startService.prisma.$disconnect()
+    }
+    if (!started) throw new Error("Production ObjectiveStart did not return a Turn")
+    expect(started.disposition).toBe("started")
+    value.turnId = started.turnId
+    const persistedTurn = await pool!.query<{ input: unknown; executionMode: string | null }>(
+      `SELECT "input", "executionMode" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [value.turnId, value.sessionId, value.userId],
+    )
+    expect(persistedTurn.rows[0]?.executionMode).toBe("canonical_task_graph")
+    expect(record(persistedTurn.rows[0]?.input)?.intent).toEqual(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
+
+    const flags: ProductionAgentFlags = {
+      taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
+      consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
+    }
+    const profile = {
+      provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
+      continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+      supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const,
+    }
+    const planCallId = `p3-1221-scout-plan:${value.turnId}`
+    const forgedCallId = `p3-1221-root-scout-search:${value.turnId}`
+    const forgedSearchInput = { target: "Software Engineer", location: "Dublin", limit: 1 }
+    const rootToolNames = deferredSignal<string[]>()
+    const releaseRootDenialProbe = deferredSignal<void>()
+    const releaseScoutExecution = deferredSignal<void>()
+    type Admission =
+      | Readonly<{ kind: "accepted"; status: "accepted" | "duplicate"; revision: number; nodes: readonly { key: string; taskId: string; status: string }[] }>
+      | Readonly<{ kind: "rejected"; errorName: string; errorCode: string; sqlState: string | null; repositoryFrame: string | null;
+        executionModeIsNull: boolean; turnLeaseBound: boolean; rootLeaseBound: boolean; rootStepBound: boolean }>
+    const admission = deferredSignal<Admission>()
+    const baseCommandPort = commandPortModule.createPgTaskGraphCommandPort(pool!)
+    const appendWithReconciliation = baseCommandPort.appendAndScheduleWithReconciliation
+    let admissionObserved = false
+    const observeAdmission = async (
+      scope: Parameters<typeof baseCommandPort.appendAndSchedule>[0]["scope"],
+      action: () => ReturnType<typeof baseCommandPort.appendAndSchedule>,
+    ): ReturnType<typeof baseCommandPort.appendAndSchedule> => {
+      try {
+        const receipt = await action()
+        if (!admissionObserved) {
+          admissionObserved = true
+          admission.resolve({ kind: "accepted", status: receipt.status, revision: receipt.revision,
+            nodes: receipt.nodes.map(node => ({ key: node.key, taskId: node.taskId, status: node.status })) })
+        }
+        return receipt
+      } catch (error: unknown) {
+        if (!admissionObserved) {
+          admissionObserved = true
+          const authority = await pool!.query<{
+            executionModeIsNull: boolean; turnLeaseBound: boolean; rootLeaseBound: boolean; rootStepBound: boolean
+          }>(
+            `SELECT turn."executionMode" IS NULL AS "executionModeIsNull",
+               (turn."status" = 'in_progress' AND turn."rootTaskId" = $4 AND turn."leaseOwnerId" = $5 AND turn."leaseVersion" = $6)
+                 AS "turnLeaseBound",
+               EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root
+                 JOIN "agent_sessions" AS session ON session."id" = root."sessionId" AND session."userId" = $1
+                 WHERE root."id" = $4 AND root."sessionId" = $2 AND root."turnId" = $3
+                   AND root."parentTaskId" IS NULL AND root."role" = 'orchestrator' AND root."status" = 'running'
+                   AND root."leaseOwner" = $5 AND root."attemptCount" = $8) AS "rootLeaseBound",
+               EXISTS (SELECT 1 FROM "agent_steps" AS step
+                 WHERE step."id" = $7 AND step."sessionId" = $2 AND step."turnId" = $3
+                   AND step."taskId" = $4 AND step."attempt" = $8) AS "rootStepBound"
+             FROM "agent_turns" AS turn JOIN "agent_sessions" AS session
+               ON session."id" = turn."sessionId" AND session."userId" = $1
+             WHERE turn."id" = $3 AND turn."sessionId" = $2 AND turn."userId" = $1`,
+            [scope.userId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.turnLeaseOwner,
+              scope.turnLeaseVersion, scope.stepId, scope.parentAttemptCount],
+          )
+          const binding = authority.rows[0]
+          admission.resolve({ kind: "rejected", ...discoveryScheduleFailureDiagnostic(error),
+            executionModeIsNull: binding?.executionModeIsNull === true, turnLeaseBound: binding?.turnLeaseBound === true,
+            rootLeaseBound: binding?.rootLeaseBound === true, rootStepBound: binding?.rootStepBound === true })
+        }
+        throw error
+      }
+    }
+    const observedCommandPort = {
+      ...baseCommandPort,
+      appendAndSchedule: (input: Parameters<typeof baseCommandPort.appendAndSchedule>[0]) =>
+        observeAdmission(input.scope, () => baseCommandPort.appendAndSchedule(input)),
+      appendAndScheduleWithReconciliation: appendWithReconciliation ? async (
+        input: Parameters<NonNullable<typeof appendWithReconciliation>>[0],
+        operation: Parameters<NonNullable<typeof appendWithReconciliation>>[1],
+      ) => observeAdmission(input.scope, () => appendWithReconciliation(input, operation)) : undefined,
+    }
+    let modelRequests = 0
+    const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
+      workerId: value.ownerId, productionFlags: flags, taskGraphCommandPort: observedCommandPort,
+      taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: authorizeUnreservedUsage,
+      modelRuntimeFactory: () => {
+        const adapter: ModelAdapter = {
+          id: "p3-1221-objective-scout-authority-fixture", profile,
+          async *stream(request) {
+            modelRequests += 1
+            if (modelRequests === 1) {
+              rootToolNames.resolve(request.tools.map(tool => record(tool)?.name)
+                .filter((name): name is string => typeof name === "string").sort())
+              yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
+                expectedRevision: 0,
+                nodes: [{ key: "scout", templateId: "scout", goal: "Find one current role in Dublin",
+                  successCriteria: ["Return one role with a source reference"], dependsOn: [], verification: SCOUT_VERIFICATION }],
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (modelRequests === 2) {
+              const plan = record(latestToolResult(request, planCallId))
+              if (plan?.status !== "accepted" && plan?.status !== "duplicate") {
+                throw new Error("Fixture stops after rejected registered Scout admission")
+              }
+              await releaseRootDenialProbe.promise
+              yield { type: "tool_call_completed", callId: forgedCallId, name: "jobs.search",
+                arguments: forgedSearchInput }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            throw new Error("Objective Scout authority fixture reached an unexpected model request")
+          },
+        }
+        return { adapter, registry: {} as never, candidates: [] }
+      },
+    })
+    bootstrap = await workerQueue.createProductionWorkerBootstrap({
+      pool: pool!, runtime, ownerId: value.ownerId, turnQueueFactory: createTurnQueue, turnRecoveryIntervalMs: 100,
+      waitResolverFactory: () => ({ async close() {} }) as never,
+      waitResolver: { intervalMs: 3_600_000, batchSize: 10, ownerId: `p3-1221-objective-wait-resolver-${value.suffix}` },
+      subagents: {
+        intervalMs: 10,
+        async execute({ lease }) {
+          if (lease.turnId === value.turnId && lease.sessionId === value.sessionId && lease.userId === value.userId) {
+            await releaseScoutExecution.promise
+          }
+          return { status: "failed", failureReason: "objective_scout_fixture_stopped", retryDisposition: "terminal" }
+        },
+      },
+    })
+
+    try {
+      const names = await withinIntegrationDeadline(rootToolNames.promise, "ObjectiveStart Root did not request its tools", 30_000)
+      const expectedRootControls = ["agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.wait"]
+      expect(names).toEqual(expectedRootControls)
+      expect(names).not.toContain("jobs.search")
+      let planned: Admission
+      try {
+        planned = await withinIntegrationDeadline(admission.promise, "ObjectiveStart Root did not attempt registered Scout admission", 30_000)
+      } catch {
+        const progress = await turnProgressDiagnostics(pool!, value.turnId, planCallId, [forgedCallId])
+        throw new Error(`ObjectiveStart Scout first failure: ${compactTurnProgressDiagnostics(progress, 3_000)}`)
+      }
+      const persistedRoot = await pool!.query<{ id: string; role: string; allowedActions: string[] }>(
+        `SELECT root."id", root."role", root."allowedActions" FROM "agent_turns" AS turn
+         JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+         JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
+         WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND session."userId" = $3`,
+        [value.turnId, value.sessionId, value.userId],
+      )
+      expect(persistedRoot.rows).toHaveLength(1)
+      const root = persistedRoot.rows[0]
+      expect(root?.role).toBe("orchestrator")
+      expect(root?.allowedActions.slice().sort()).toEqual(expectedRootControls)
+      if (planned.kind !== "accepted") throw new Error(
+        `Registered Scout admission failed at ${planned.errorName}/${planned.errorCode}; sqlState=${planned.sqlState ?? "none"}; `
+        + `frame=${planned.repositoryFrame ?? "none"}; executionModeIsNull=${planned.executionModeIsNull}; `
+        + `turnLeaseBound=${planned.turnLeaseBound}; rootLeaseBound=${planned.rootLeaseBound}; rootStepBound=${planned.rootStepBound}`,
+      )
+      expect(planned).toMatchObject({ status: "accepted", revision: 1, nodes: [{ key: "scout", status: "queued" }] })
+      const childId = planned.nodes[0]?.taskId
+      expect(childId).toBeTruthy()
+      const persistedChild = await pool!.query<{
+        id: string; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string; role: string; taskType: string
+        depth: number; status: string; goal: string; allowedActions: string[]; constraints: string[]; expectedOutputSchema: unknown; context: unknown
+        userId: string; turnRootTaskId: string
+      }>(
+        `SELECT child."id", child."sessionId", child."turnId", child."rootTaskId", child."parentTaskId", child."role", child."taskType",
+           child."depth", child."status", child."goal", child."allowedActions", child."constraints", child."expectedOutputSchema", child."context",
+           session."userId", turn."rootTaskId" AS "turnRootTaskId"
+         FROM "sub_agent_tasks" AS child
+         JOIN "agent_sessions" AS session ON session."id" = child."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = child."turnId" AND turn."sessionId" = child."sessionId"
+         WHERE child."id" = $1 AND child."sessionId" = $2 AND child."turnId" = $3
+           AND session."userId" = $4 AND turn."userId" = $4`,
+        [childId, value.sessionId, value.turnId, value.userId],
+      )
+      expect(persistedChild.rows).toHaveLength(1)
+      const child = persistedChild.rows[0]!
+      const registeredScoutActions = [...TASK_GRAPH_TEMPLATES.scout.allowedActions, "wait_subagents", "scout.delegate", "scout.results"]
+      expect(child).toMatchObject({
+        id: childId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId: root?.id, parentTaskId: root?.id,
+        turnRootTaskId: root?.id, userId: value.userId, role: "scout", taskType: "job_discovery", depth: 1,
+        goal: "Find one current role in Dublin", allowedActions: registeredScoutActions,
+        constraints: TASK_GRAPH_TEMPLATES.scout.constraints,
+        expectedOutputSchema: TASK_GRAPH_TEMPLATES.scout.expectedOutputSchema,
+      })
+      expect(["queued", "running"]).toContain(child.status)
+      expect(record(child.context)?.nestedScoutProfile).toBe("applymate:nested-scout-profile:v1")
+      releaseRootDenialProbe.resolve()
+      const denialDeadline = Date.now() + 10_000
+      let denial: { blocker: string | null; errorCode: string | null; jobsSearchCallCount: string } | undefined
+      while (!denial && Date.now() < denialDeadline) {
+        const receipt = await pool!.query<{
+          blocker: string | null; errorCode: string | null; jobsSearchCallCount: string
+        }>(
+          `SELECT event."payload"->'final'->>'blocker' AS "blocker",
+             event."payload"->>'errorCode' AS "errorCode",
+             (SELECT COUNT(*)::text FROM "agent_items" AS call
+               WHERE call."sessionId" = event."sessionId" AND call."turnId" = event."turnId"
+                 AND call."taskId" = turn."rootTaskId" AND call."type" = 'tool_call'
+                 AND call."content"->>'toolName' = 'jobs.search') AS "jobsSearchCallCount"
+           FROM "agent_events" AS event
+           JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+             AND turn."userId" = $1 AND turn."rootTaskId" = event."taskId"
+           JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = $1
+           WHERE event."sessionId" = $2 AND event."turnId" = $3 AND event."taskId" = turn."rootTaskId"
+             AND event."type" = 'turn.failed' AND event."actor" = 'orchestrator'
+             AND event."correlationId" = turn."id"
+           ORDER BY event."sequence" DESC LIMIT 1`,
+          [value.userId, value.sessionId, value.turnId],
+        )
+        denial = receipt.rows[0]
+        if (!denial) await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      expect(denial).toEqual({ blocker: "objective_task_graph_root_tool_disabled", errorCode: "invalid_output", jobsSearchCallCount: "0" })
+    } finally {
+      releaseRootDenialProbe.resolve()
+      releaseScoutExecution.resolve()
+    }
+  }, 60_000)
 })
