@@ -1,6 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useSyncExternalStore, useState } from 'react'
+import { normalizeAgentLocationAllowlist } from '@jobcopilot/shared'
 
 export const AGENT_SESSION_QUERY_PARAM = 'sessionId'
 
@@ -17,6 +18,12 @@ export interface ActiveTurnDto {
   revision: number
   goal?: string
   canSteerLocation?: true
+  locationScope?: ActiveTurnLocationScopeDto
+}
+
+export interface ActiveTurnLocationScopeDto {
+  confirmed: { locations: string[]; status: 'pending' | 'adopted' }
+  appliedLocations?: string[]
 }
 
 export interface AgentTurnsResponse {
@@ -44,6 +51,26 @@ function nonEmptyString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null
 }
 
+function canonicalLocations(value: unknown): string[] | null {
+  const normalized = normalizeAgentLocationAllowlist(value)
+  return normalized && Array.isArray(value) && normalized.length === value.length
+    && normalized.every((location, index) => location === value[index]) ? [...normalized] : null
+}
+
+function parseLocationScope(value: unknown): ActiveTurnLocationScopeDto | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const row = value as Record<string, unknown>, confirmed = row.confirmed
+  if (Object.keys(row).some(key => key !== 'confirmed' && key !== 'appliedLocations')
+    || !confirmed || typeof confirmed !== 'object' || Array.isArray(confirmed)) return undefined
+  const confirmation = confirmed as Record<string, unknown>, locations = canonicalLocations(confirmation.locations)
+  if (Object.keys(confirmation).length !== 2 || !locations
+    || confirmation.status !== 'pending' && confirmation.status !== 'adopted') return undefined
+  const applied = Object.hasOwn(row, 'appliedLocations') ? canonicalLocations(row.appliedLocations) : undefined
+  if (Object.hasOwn(row, 'appliedLocations') && !applied
+    || confirmation.status === 'adopted' && (!applied || locations.join('\0') !== applied.join('\0'))) return undefined
+  return { confirmed: { locations, status: confirmation.status as 'pending' | 'adopted' }, ...(applied ? { appliedLocations: applied } : {}) }
+}
+
 export function parseActiveTurn(value: unknown): ActiveTurnDto | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const row = value as Record<string, unknown>
@@ -53,11 +80,13 @@ export function parseActiveTurn(value: unknown): ActiveTurnDto | null {
   if (!id || typeof status !== 'string' || !ACTIVE_TURN_STATUSES.has(status as ActiveTurnStatus)) return null
   if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0) return null
   const goal = typeof row.goal === 'string' && row.goal.trim() ? row.goal : undefined
+  const locationScope = parseLocationScope(row.locationScope)
   return {
     id, status: status as ActiveTurnStatus, revision,
     ...(goal ? { goal } : {}),
     ...(row.canSteerLocation === true && (status === 'in_progress' || status === 'waiting_for_dependency')
       ? { canSteerLocation: true as const } : {}),
+    ...(locationScope ? { locationScope } : {}),
   }
 }
 
