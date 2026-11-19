@@ -14400,7 +14400,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         expect(persistedRevise?.outputStatus).toBe("accepted")
         expect(acceptedRevision).toBe(expectedRevision)
         expect(loadedRevisionIncludesAcceptedPlan).toBe(true)
-        expect(replacementNode?.taskId).toEqual(expect.any(String))
+        if (!replacementNode) throw new Error("accepted replacement Scout is missing from the graph")
+        expect(replacementNode.taskId).toEqual(expect.any(String))
         const replacementTask = await checkpoint.query<{ id: string; status: string; role: string; goal: string;
           rootTaskId: string | null; parentTaskId: string | null }>(
           `SELECT task."id", task."status", task."role", task."goal", task."rootTaskId", task."parentTaskId"
