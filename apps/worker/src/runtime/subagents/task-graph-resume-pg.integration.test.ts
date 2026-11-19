@@ -296,7 +296,7 @@ type ObjectiveStartFixtureCommand = Readonly<{
   sessionId: string; userId: string; clientMessageId: string; source: "user"; objective: string
   content: readonly { type: "text"; text: string }[]
   verificationRequirements: Readonly<{ schemaVersion: "agent-harness.v2.objective-requirements.v1"; requirements: readonly {
-    id: "candidate-count"; check: Readonly<{ kind: "candidate_count_gte"; minimum: 1 }>
+    id: string; check: Readonly<{ kind: "candidate_count_gte" | "finding_count_gte"; minimum: number }>
   }[] }>
 }>
 type ObjectiveStartFixtureResult = Readonly<{ inputId: string; turnId: string; sequence: string; disposition: string }>
@@ -8833,6 +8833,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const coverageRepairOwner = fixture()
   const scoutUnionOwner = fixture()
   const objectiveScoutAuthorityOwner = fixture()
+  const objectiveAnalystAuthorityOwner = fixture()
   const emptyAnalystOwner = fixture()
   const emptyAnalystOrphanOwner = fixture()
   const emptyAnalystCurrentReceiptOwner = fixture()
@@ -8931,7 +8932,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner,
       locationRepairOwner, locationMismatchOwner, locationConflictOwner, locationForeignOwner, replanApplicabilityOwner, leaseRecoveryOwner,
       coverageRepairOwner, scoutUnionOwner, emptyAnalystOwner, emptyAnalystOrphanOwner, emptyAnalystCurrentReceiptOwner,
-      emptyAnalystMutationOwner, rootRecoveryScanOwner, archivedWaitOwner, objectiveScoutAuthorityOwner]
+      emptyAnalystMutationOwner, rootRecoveryScanOwner, archivedWaitOwner, objectiveScoutAuthorityOwner,
+      objectiveAnalystAuthorityOwner]
     const allFixtureWorkersExited = [...fixtureProcessChildren].every(processFixtureExited)
     if (!allFixtureWorkersExited) cleanupFailures.push("fixture process Workers are not proven exited; queue cleanup was refused")
     let ownerRowsMayBeDeleted = false
@@ -19454,6 +19456,282 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     } finally {
       releaseRootDenialProbe.resolve()
       releaseScoutExecution.resolve()
+    }
+  }, 60_000)
+
+  it("admits a registered Scout-to-Analyst plan from a typed finding ObjectiveStart", async () => {
+    const value = objectiveAnalystAuthorityOwner
+    const [workerQueue, canonical, subagentQueue, commandPortModule] = await Promise.all([
+      import("../../queue/production-bootstrap.js"), import("../canonical-turn-runtime.js"),
+      import("../../queue/subagent-queue.js"), import("./pg-task-graph-command-port.js"),
+    ])
+    const { createTurnQueue, TURN_QUEUE_NAME } = await import("../turns/turn-queue.js")
+    turnQueueName = TURN_QUEUE_NAME
+    childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
+
+    await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`,
+      [value.userId, `${value.userId}@example.invalid`])
+    await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Objective Analyst authority fixture', 'running', 'test', CURRENT_TIMESTAMP)`, [value.sessionId, value.userId])
+    const objective = "Find and assess one software engineering role in Dublin"
+    const requirements = {
+      schemaVersion: "agent-harness.v2.objective-requirements.v1",
+      requirements: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+        { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+      ],
+    } as const satisfies ObjectiveStartFixtureCommand["verificationRequirements"]
+    const startService = await createDisposableWebObjectiveStartService(databaseUrl!)
+    let started: ObjectiveStartFixtureResult | undefined
+    try {
+      started = await startService.commands.start({
+        sessionId: value.sessionId, userId: value.userId, clientMessageId: `p3-1231-objective-start:${value.suffix}`,
+        source: "user", objective, content: [{ type: "text", text: objective }], verificationRequirements: requirements,
+      })
+    } finally {
+      await startService.prisma.$disconnect()
+    }
+    if (!started) throw new Error("Production ObjectiveStart did not return a Turn")
+    expect(started.disposition).toBe("started")
+    value.turnId = started.turnId
+    const persistedTurn = await pool!.query<{ input: unknown; executionMode: string | null }>(
+      `SELECT "input", "executionMode" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [value.turnId, value.sessionId, value.userId],
+    )
+    expect(persistedTurn.rows[0]?.executionMode).toBe("canonical_task_graph")
+    expect(record(persistedTurn.rows[0]?.input)).toMatchObject({
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, verificationRequirements: requirements,
+    })
+
+    const flags: ProductionAgentFlags = {
+      taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
+      consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
+    }
+    const profile = {
+      provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
+      continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+      supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const,
+    }
+    const planCallId = `p3-1231-analyst-plan:${value.turnId}`
+    const rootToolNames = deferredSignal<string[]>()
+    const planReceipt = deferredSignal<RecordValue>()
+    const releaseRootContinuation = deferredSignal<void>()
+    const releaseChildExecution = deferredSignal<void>()
+    const scoutClaimed = deferredSignal<string>()
+    let targetRootTaskId: string | null = null
+    let analystExecutionStarted = false
+    const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
+      workerId: value.ownerId, productionFlags: flags, authorizeUsage: authorizeUnreservedUsage,
+      taskGraphTemplates: TASK_GRAPH_TEMPLATES, taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
+      modelRuntimeFactory: async ({ userId: factoryUserId, state }) => {
+        const stateRootTaskId = typeof state.rootTaskId === "string" && state.rootTaskId.length > 0
+          ? state.rootTaskId : null
+        const targetFactoryCandidate = factoryUserId === value.userId && state.scope.userId === value.userId
+          && state.goal === objective && state.snapshot.goal?.id === `turn-goal:${value.turnId}`
+        const targetTurn = targetFactoryCandidate ? await pool!.query<{
+          id: string; sessionId: string; userId: string; rootTaskId: string; rootLeaseOwner: string
+        }>(
+          `SELECT turn."id", turn."sessionId", turn."userId", root."id" AS "rootTaskId", root."leaseOwner" AS "rootLeaseOwner"
+           FROM "agent_turns" AS turn
+           JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+           JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+             AND root."turnId" = turn."id" AND root."rootTaskId" = root."id"
+           WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+             AND turn."executionMode" = 'canonical_task_graph' AND turn."status" = 'in_progress'
+             AND turn."leaseOwnerId" IS NOT NULL AND turn."leaseExpiresAt" > CURRENT_TIMESTAMP
+             AND root."parentTaskId" IS NULL AND root."role" = 'orchestrator' AND root."status" = 'running'
+             AND root."leaseOwner" = turn."leaseOwnerId" AND root."leaseExpiresAt" > CURRENT_TIMESTAMP`,
+          [value.turnId, value.sessionId, value.userId],
+        ) : undefined
+        const targetTurnMatches = targetTurn?.rows.length === 1 && targetTurn.rows[0]?.id === value.turnId
+          && targetTurn.rows[0]?.sessionId === value.sessionId && targetTurn.rows[0]?.userId === value.userId
+          && typeof targetTurn.rows[0]?.rootTaskId === "string" && targetTurn.rows[0].rootTaskId.length > 0
+          && typeof targetTurn.rows[0]?.rootLeaseOwner === "string" && targetTurn.rows[0].rootLeaseOwner.length > 0
+        if (targetTurnMatches) {
+          const persistedRootTaskId = targetTurn.rows[0]!.rootTaskId
+          if (stateRootTaskId !== null && stateRootTaskId !== persistedRootTaskId) {
+            throw new Error("p3_1231_root_state_mismatch")
+          }
+          if (targetRootTaskId !== null && targetRootTaskId !== persistedRootTaskId) {
+            throw new Error("p3_1231_root_identity_changed")
+          }
+          targetRootTaskId = persistedRootTaskId
+        }
+        const targetFactory = targetTurnMatches && targetRootTaskId === targetTurn.rows[0]?.rootTaskId
+        if (!targetFactory) {
+          const adapter: ModelAdapter = {
+            id: "p3-1231-non-target-recovery-guard", profile,
+            async *stream(request) {
+              void request
+              throw new Error("p3_1231_non_target_turn_blocked")
+            },
+          }
+          return { adapter, registry: {} as never, candidates: [] }
+        }
+        let modelRequests = 0
+        const adapter: ModelAdapter = {
+          id: "p3-1231-objective-analyst-authority-fixture", profile,
+          async *stream(request) {
+            if (request.metadata.userId !== value.userId || request.metadata.sessionId !== value.sessionId
+              || request.metadata.turnId !== value.turnId || request.metadata.taskId !== targetRootTaskId) {
+              throw new Error("p3_1231_model_request_scope_mismatch")
+            }
+            modelRequests += 1
+            if (modelRequests === 1) {
+              rootToolNames.resolve(request.tools.map(tool => record(tool)?.name)
+                .filter((name): name is string => typeof name === "string").sort())
+              yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
+                expectedRevision: 0,
+                nodes: [
+                  { key: "scout", templateId: "scout", goal: "Find one current software engineering role in Dublin",
+                    successCriteria: ["Return one candidate with observed source evidence"], dependsOn: [], verification: SCOUT_VERIFICATION },
+                  { key: "analyst", templateId: "analyst", goal: "Analyze the Scout candidate and its observed evidence",
+                    successCriteria: ["Return one evidence-bound finding"], dependsOn: ["scout"], verification: DISCOVERY_ANALYST_VERIFICATION },
+                ],
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (modelRequests === 2) {
+              const plan = record(latestToolResult(request, planCallId))
+              if (!plan) throw new Error("Objective Analyst plan result was missing from the next model request")
+              planReceipt.resolve(plan)
+              await releaseRootContinuation.promise
+              throw new Error("Fixture stops after ObjectiveStart Analyst admission")
+            }
+            throw new Error("Objective Analyst authority fixture reached an unexpected model request")
+          },
+        }
+        return { adapter, registry: {} as never, candidates: [] }
+      },
+    })
+    bootstrap = await workerQueue.createProductionWorkerBootstrap({
+      pool: pool!, runtime, ownerId: value.ownerId, turnQueueFactory: createTurnQueue, turnRecoveryIntervalMs: 100,
+      waitResolverFactory: () => ({ async close() {} }) as never,
+      waitResolver: { intervalMs: 3_600_000, batchSize: 10, ownerId: `p3-1231-objective-wait-resolver-${value.suffix}` },
+      subagents: {
+        intervalMs: 10,
+        async execute({ lease }) {
+          if (lease.turnId === value.turnId && lease.sessionId === value.sessionId && lease.userId === value.userId) {
+            if (lease.role === "scout") scoutClaimed.resolve(lease.id)
+            if (lease.role === "analyst") analystExecutionStarted = true
+            await releaseChildExecution.promise
+          }
+          return { status: "failed", failureReason: "objective_analyst_fixture_stopped", retryDisposition: "terminal" }
+        },
+      },
+    })
+
+    try {
+      const expectedRootControls = ["agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.wait"]
+      let names: string[]
+      try {
+        names = await withinIntegrationDeadline(rootToolNames.promise, "ObjectiveStart Root did not request its tools", 30_000)
+      } catch {
+        const progress = await turnProgressDiagnostics(pool!, value.turnId, planCallId, [])
+        throw new Error(`ObjectiveStart Analyst root tools first failure: ${compactTurnProgressDiagnostics(progress, 3_000)}`)
+      }
+      expect(names).toEqual(expectedRootControls)
+      let plan: RecordValue
+      try {
+        plan = await withinIntegrationDeadline(planReceipt.promise, "ObjectiveStart Root did not return the Analyst plan result", 30_000)
+      } catch {
+        const progress = await turnProgressDiagnostics(pool!, value.turnId, planCallId, [])
+        throw new Error(`ObjectiveStart Analyst first failure: ${compactTurnProgressDiagnostics(progress, 3_000)}`)
+      }
+      expect(plan).toMatchObject({ status: "accepted", revision: 1 })
+      const receiptNodes = Array.isArray(plan.nodes) ? plan.nodes.map(record) : []
+      expect(receiptNodes).toHaveLength(2)
+      expect(receiptNodes[0]).toMatchObject({ key: "scout", status: "queued" })
+      expect(receiptNodes[1]).toMatchObject({ key: "analyst", status: "waiting" })
+      const scoutTaskId = receiptNodes[0]?.taskId
+      const analystTaskId = receiptNodes[1]?.taskId
+      expect(typeof scoutTaskId).toBe("string")
+      expect(typeof analystTaskId).toBe("string")
+      if (typeof scoutTaskId !== "string" || typeof analystTaskId !== "string") throw new Error("Objective plan child IDs were missing")
+      expect(await withinIntegrationDeadline(scoutClaimed.promise, "Runnable Objective Scout was not claimed", 10_000)).toBe(scoutTaskId)
+
+      const persistedRoot = await pool!.query<{ id: string; role: string; allowedActions: string[] }>(
+        `SELECT root."id", root."role", root."allowedActions" FROM "agent_turns" AS turn
+         JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+         JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
+         WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND session."userId" = $3`,
+        [value.turnId, value.sessionId, value.userId],
+      )
+      expect(persistedRoot.rows).toHaveLength(1)
+      const root = persistedRoot.rows[0]!
+      expect(root.role).toBe("orchestrator")
+      expect(root.allowedActions.slice().sort()).toEqual(expectedRootControls)
+      expect(root.allowedActions).not.toContain("jobs.search")
+
+      const graphResult = await pool!.query<{ content: unknown; revision: number }>(
+        `SELECT item."content", item."revision" FROM "agent_items" AS item
+         JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+         JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+         WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
+           AND item."type" = 'task_graph' AND turn."userId" = $5 AND session."userId" = $5`,
+        [taskGraphItemId(root.id), value.sessionId, value.turnId, root.id, value.userId],
+      )
+      expect(graphResult.rows).toHaveLength(1)
+      expect([1, 2]).toContain(graphResult.rows[0]?.revision)
+      const graph = record(graphResult.rows[0]?.content)
+      expect(graph?.schemaVersion).toBe(TASK_GRAPH_SNAPSHOT_VERSION)
+      const graphNodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+      const scoutNode = graphNodes.find(node => node?.key === "scout")
+      const analystNode = graphNodes.find(node => node?.key === "analyst")
+      expect(scoutNode).toMatchObject({
+        taskId: scoutTaskId, templateId: "scout", dependsOn: [], verificationDisposition: "typed", verification: SCOUT_VERIFICATION,
+      })
+      expect(analystNode).toMatchObject({
+        taskId: analystTaskId, templateId: "analyst", dependsOn: ["scout"], verificationDisposition: "typed",
+        verification: DISCOVERY_ANALYST_VERIFICATION,
+      })
+      expect(analystNode?.verification).toMatchObject({ criteria: [
+        { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+        { id: "findings-from-scout", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout" } },
+      ] })
+
+      const children = await pool!.query<{
+        id: string; role: string; taskType: string; status: string; depth: number; allowedActions: string[]
+        constraints: string[]; expectedOutputSchema: unknown; rootTaskId: string; parentTaskId: string; userId: string
+      }>(
+        `SELECT child."id", child."role", child."taskType", child."status", child."depth", child."allowedActions",
+           child."constraints", child."expectedOutputSchema", child."rootTaskId", child."parentTaskId", session."userId"
+         FROM "sub_agent_tasks" AS child
+         JOIN "agent_sessions" AS session ON session."id" = child."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = child."turnId" AND turn."sessionId" = child."sessionId"
+         WHERE child."id" = ANY($1::text[]) AND child."sessionId" = $2 AND child."turnId" = $3
+           AND child."rootTaskId" = $4 AND child."parentTaskId" = $4 AND session."userId" = $5 AND turn."userId" = $5`,
+        [[scoutTaskId, analystTaskId], value.sessionId, value.turnId, root.id, value.userId],
+      )
+      expect(children.rows).toHaveLength(2)
+      const scout = children.rows.find(child => child.id === scoutTaskId)
+      const analyst = children.rows.find(child => child.id === analystTaskId)
+      expect(scout).toMatchObject({
+        id: scoutTaskId, role: "scout", taskType: "job_discovery", status: "running", depth: 1,
+        rootTaskId: root.id, parentTaskId: root.id, userId: value.userId,
+        allowedActions: [...TASK_GRAPH_TEMPLATES.scout.allowedActions, "wait_subagents", "scout.delegate", "scout.results"],
+        constraints: TASK_GRAPH_TEMPLATES.scout.constraints, expectedOutputSchema: TASK_GRAPH_TEMPLATES.scout.expectedOutputSchema,
+      })
+      expect(analyst).toMatchObject({
+        id: analystTaskId, role: "analyst", taskType: TASK_GRAPH_TEMPLATES.analyst.taskType, status: "waiting", depth: 1,
+        rootTaskId: root.id, parentTaskId: root.id, userId: value.userId,
+        allowedActions: TASK_GRAPH_TEMPLATES.analyst.allowedActions,
+        constraints: TASK_GRAPH_TEMPLATES.analyst.constraints,
+        expectedOutputSchema: TASK_GRAPH_TEMPLATES.analyst.expectedOutputSchema,
+      })
+      expect(analystExecutionStarted).toBe(false)
+      const dispatches = await pool!.query<{ taskId: string }>(
+        `SELECT dispatch."payload"->>'taskId' AS "taskId" FROM "agent_outbox" AS dispatch
+         WHERE dispatch."topic" = 'agent.subagent.dispatch' AND dispatch."aggregateId" = $1
+           AND dispatch."payload"->>'taskId' = ANY($2::text[]) ORDER BY dispatch."payload"->>'taskId'`,
+        [value.sessionId, [scoutTaskId, analystTaskId]],
+      )
+      expect(dispatches.rows.map(dispatch => dispatch.taskId)).toEqual([scoutTaskId])
+    } finally {
+      releaseRootContinuation.resolve()
+      releaseChildExecution.resolve()
     }
   }, 60_000)
 })
