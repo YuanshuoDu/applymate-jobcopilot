@@ -228,6 +228,7 @@ function assertDisposableServiceUrls() {
   const successiveMode = mode === "park-successive-replan" || mode === "resume-successive-replan"
   const localSuccessiveProof = successiveMode && process.env.AGENT_REPLAN_PROOF_LOCAL_DISPOSABLE === "1"
   const databaseValue = process.env.AGENT_RUNTIME_PG_TEST_URL
+  const databaseConfiguredValue = process.env.DATABASE_URL
   const redisTestValue = process.env.AGENT_TURN_REDIS_TEST_URL
   const redisConfiguredValue = process.env.REDIS_URL
   if (process.env.CI !== "true" || process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true"
@@ -240,14 +241,18 @@ function assertDisposableServiceUrls() {
     const database = new URL(databaseValue)
     const redisTest = new URL(redisTestValue)
     const redisConfigured = new URL(redisConfiguredValue)
+    const localSuccessivePair = (database.port === "15433" && redisTest.port === "16380")
+      || (database.port === "15432" && redisTest.port === "16379")
     if (database.protocol !== "postgresql:" || database.hostname !== "127.0.0.1"
-      || database.port !== (localSuccessiveProof ? "15433" : "5432")
+      || (localSuccessiveProof ? !localSuccessivePair : database.port !== "5432")
       || database.username !== "postgres" || database.password !== "postgres"
       || database.pathname !== "/applymate_agent_brain_ci" || database.search || database.hash
+      || localSuccessiveProof && databaseConfiguredValue !== databaseValue
       || redisTest.protocol !== "redis:"
       || (localSuccessiveProof ? redisTest.hostname !== "127.0.0.1"
         : !["127.0.0.1", "localhost", "::1", "[::1]"].includes(redisTest.hostname))
-      || redisTest.port !== (localSuccessiveProof ? "16380" : "6379") || redisTest.pathname !== "/15" || redisTest.username || redisTest.password
+      || (!localSuccessiveProof && redisTest.port !== "6379")
+      || redisTest.pathname !== "/15" || redisTest.username || redisTest.password
       || redisTest.search || redisTest.hash || redisConfigured.href !== redisTest.href) {
       throw new Error("invalid")
     }
