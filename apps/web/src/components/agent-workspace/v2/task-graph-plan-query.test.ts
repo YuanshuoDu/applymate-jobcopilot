@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { PLAN_LEDGER_MAX_PERSISTED_NODES } from '@jobcopilot/agent-protocol'
 
 import type { TimelineItem } from './timeline-reducer'
 import type { SupervisorTaskSummary, SupervisorTurnSummary } from './task-tree-projection'
@@ -87,6 +88,24 @@ describe('TaskGraph query projection', () => {
     expect(buildTaskGraphTaskLookupUrl('session-1', events)).toBe(
       '/api/agent/sessions/session-1/tasks?taskId=root-task&taskId=native-child-1&taskId=native-child-2&graphItemId=native-graph&graphTurnId=turn-1&rootTaskId=root-task&graphRevision=2&verificationSummaryVersion=2',
     )
+  })
+
+  it('queries Root plus every node through the persisted graph capacity and rejects over-capacity graphs', () => {
+    for (const nodeCount of [9, PLAN_LEDGER_MAX_PERSISTED_NODES]) {
+      const nodes = Array.from({ length: nodeCount }, (_, index) => graphNode(`node-${index + 1}`, `task-${index + 1}`))
+      const latest = graphItem(nodes, '2026-09-23T12:00:00.000Z', 'session-1', `graph-${nodeCount}`, 'root-task')
+      const ids = ['root-task', ...nodes.map(node => node.taskId)]
+      const url = buildTaskGraphTaskLookupUrl('session-1', [latest])!
+
+      expect(selectCurrentTaskGraphTaskIds([latest], 'session-1')).toEqual(ids)
+      expect(new URLSearchParams(url.split('?')[1]).getAll('taskId')).toEqual(ids)
+    }
+
+    const overCapacity = graphItem(Array.from({ length: PLAN_LEDGER_MAX_PERSISTED_NODES + 1 }, (_, index) =>
+      graphNode(`overflow-${index + 1}`, `overflow-task-${index + 1}`)), '2026-09-23T12:00:00.000Z',
+    'session-1', 'graph-over-capacity')
+    expect(selectCurrentTaskGraphTaskIds([overCapacity], 'session-1')).toEqual([])
+    expect(buildTaskGraphTaskLookupUrl('session-1', [overCapacity])).toBeNull()
   })
 
   it('restores only the selected job on the matching preparation Turn and session', () => {

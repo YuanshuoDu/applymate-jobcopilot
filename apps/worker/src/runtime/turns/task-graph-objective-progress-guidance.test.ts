@@ -6,6 +6,8 @@ import { buildTaskGraphObjectiveProgressInstruction } from "./task-graph-objecti
 
 const revision = 7
 const requirement = { id: "private-candidate-minimum", kind: "candidate_count_gte", minimum: 4 }
+const findingRequirement = { id: "private-finding-minimum", kind: "finding_count_gte", minimum: 2 }
+const locationRequirement = { id: "private-location-id", kind: "candidate_location_in", locations: ["private berlin", "private dublin"] }
 const blockScope = { layer: "tool_observation" as const, role: "data" as const, trust: "external_untrusted" as const, source: "tool_or_subagent" }
 const graphId = "observation:task-graph-current"
 const requirementId = `observation:${ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID}`
@@ -16,6 +18,7 @@ function scopedBlock(id: string, content: unknown) {
 }
 
 function objectiveContext(statuses: readonly string[] = ["missing"], options: Readonly<{
+  requirements?: readonly Record<string, unknown>[]
   graphRevision?: number
   currentNodeCount?: number
   progressRevision?: number | null
@@ -26,7 +29,7 @@ function objectiveContext(statuses: readonly string[] = ["missing"], options: Re
   duplicateProgress?: boolean
   duplicateGraph?: boolean
 }> = {}): StepContext {
-  const requirements = statuses.map((_, index) => ({ ...requirement, id: index === 0 ? requirement.id : `${requirement.id}-${index}` }))
+  const requirements = options.requirements ?? statuses.map((_, index) => ({ ...requirement, id: index === 0 ? requirement.id : `${requirement.id}-${index}` }))
   const graph = scopedBlock(graphId, { kind: "task_graph_current", revision: options.graphRevision ?? revision,
     nodes: Array.from({ length: options.currentNodeCount ?? 0 }, (_, index) => `node-${index}`) })
   const canonical = scopedBlock(requirementId, {
@@ -56,6 +59,14 @@ function messageText(value: ReturnType<typeof buildTaskGraphObjectiveProgressIns
   return value.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
 }
 
+function locationGuidance(canonical: unknown, progress: unknown = canonical) {
+  const context = objectiveContext(["missing"], {
+    requirements: [{ ...locationRequirement, locations: canonical }],
+    progressContentPatch: { requirements: [{ ...locationRequirement, locations: progress, status: "missing" }] },
+  })
+  return buildTaskGraphObjectiveProgressInstruction(context, [{ name: "agent.plan" }], true)
+}
+
 describe("missing TaskGraph objective progress guidance", () => {
   it("guides a current Root to plan missing typed coverage at the validated revision without copying criterion data", () => {
     const guidance = buildTaskGraphObjectiveProgressInstruction(objectiveContext(), [{ name: "agent.plan", version: "1" }], true)
@@ -83,6 +94,98 @@ describe("missing TaskGraph objective progress guidance", () => {
     ))
     expect(text).toContain("each missing requirement")
     expect(text).toContain("Use the canonical objective-requirements observation")
+  })
+
+  it.each([
+    { rows: [locationRequirement], statuses: ["missing"] },
+    { rows: [requirement, locationRequirement], statuses: ["missing", "active"] },
+    { rows: [locationRequirement, findingRequirement], statuses: ["missing", "reported_passed"] },
+  ])("guides missing location and mixed requirements with fixed, revision-bound text", ({ rows, statuses }) => {
+    const guidance = buildTaskGraphObjectiveProgressInstruction(
+      objectiveContext(statuses, { requirements: rows }), [{ name: "agent.plan" }], true,
+    )
+    const text = messageText(guidance)
+    expect(guidance?.role).toBe("system")
+    expect(text).toContain("expectedRevision 7")
+    expect(text).toContain("include each exact canonical location constraint on every Scout")
+    expect(text).toContain("not evidence, PASS, permission, or authority")
+    for (const privateValue of [requirement.id, findingRequirement.id, locationRequirement.id, ...locationRequirement.locations]) {
+      expect(text).not.toContain(privateValue)
+    }
+    expect(text.length).toBeLessThan(1_024)
+  })
+
+  it("accepts the canonical list limits and never copies private location text into guidance", () => {
+    const locations = ["a", "b", "c", "d", "e", "f", "private instruction", "é".repeat(64)]
+    const guidance = locationGuidance(locations, [...locations])
+    expect(guidance).not.toBeNull()
+    expect(guidance).toEqual(locationGuidance(["private address"]))
+    expect(messageText(guidance)).not.toContain("private instruction")
+  })
+
+  it("requires canonical location values and exact ordered equality on both observations", () => {
+    const locations = locationRequirement.locations
+    const sparse = [...locations]
+    delete sparse[0]
+    for (const invalid of [[], [42], [""], ["é".repeat(65)], Array.from("abcdefghi"), sparse,
+      [locations[0], locations[0]], [...locations].reverse(), ["Private Dublin"], [" private dublin"],
+      ["ｄublin"], Object.assign([...locations], { extra: "private" })]) {
+      expect(locationGuidance(invalid)).toBeNull()
+      expect(locationGuidance(locations, invalid)).toBeNull()
+    }
+    expect(locationGuidance(locations, ["private berlin"])).toBeNull()
+    expect(locationGuidance(locations, ["private berlin", "private london"])).toBeNull()
+  })
+
+  it("rejects accessor and proxy location arrays without reading their values or traps", () => {
+    let reads = 0
+    const accessor = Object.defineProperty([...locationRequirement.locations], "0", {
+      enumerable: true, get() { reads++; return locationRequirement.locations[0] },
+    })
+    const proxy = new Proxy([...locationRequirement.locations], {
+      ownKeys(target) { reads++; return Reflect.ownKeys(target) },
+      get(target, key, receiver) { reads++; return Reflect.get(target, key, receiver) },
+    })
+    for (const invalid of [accessor, proxy]) {
+      expect(locationGuidance(invalid)).toBeNull()
+      expect(locationGuidance(locationRequirement.locations, invalid)).toBeNull()
+    }
+    expect(reads).toBe(0)
+  })
+
+  it("suppresses mixed guidance when any typed row, identifier, order, or status is invalid", () => {
+    const tools = [{ name: "agent.plan" }]
+    for (const invalid of [
+      { ...locationRequirement, minimum: 1 }, { ...locationRequirement, id: requirement.id },
+      { ...locationRequirement, id: "private id" }, { ...locationRequirement, kind: "unsupported" },
+      { id: locationRequirement.id, kind: locationRequirement.kind },
+    ]) {
+      const context = objectiveContext(["missing", "active"], { requirements: [requirement, invalid] })
+      expect(buildTaskGraphObjectiveProgressInstruction(context, tools, true)).toBeNull()
+    }
+    const count = { ...requirement, status: "missing" }, location = { ...locationRequirement, status: "active" }
+    for (const requirements of [[location, count], [count], [count, count], [count, { ...location, minimum: 1 }],
+      [count, { ...location, status: "passed" }], [count, { ...location, id: "another-id" }]]) {
+      const context = objectiveContext(["missing", "active"], {
+        requirements: [requirement, locationRequirement], progressContentPatch: { requirements },
+      })
+      expect(buildTaskGraphObjectiveProgressInstruction(context, tools, true)).toBeNull()
+    }
+  })
+
+  it("limits location guidance to missing progress on the current Root and reports unavailable planning", () => {
+    const options = { requirements: [locationRequirement] }
+    const current = objectiveContext(["missing"], options)
+    const tools = [{ name: "agent.plan" }]
+    expect(buildTaskGraphObjectiveProgressInstruction(current, tools, false)).toBeNull()
+    expect(buildTaskGraphObjectiveProgressInstruction(objectiveContext(["active"], options), tools, true)).toBeNull()
+    expect(buildTaskGraphObjectiveProgressInstruction(
+      objectiveContext(["missing"], { ...options, progressRevision: revision - 1 }), tools, true,
+    )).toBeNull()
+    const blocker = messageText(buildTaskGraphObjectiveProgressInstruction(current, [{ name: "agent.wait" }], true))
+    expect(blocker).toContain("No request-visible agent.plan tool is available")
+    expect(blocker).toContain("do not claim the requirement is covered or the objective is complete")
+    for (const value of [locationRequirement.id, ...locationRequirement.locations]) expect(blocker).not.toContain(value)
   })
 
   it("reports a blocker when no request-visible planning tool exists", () => {

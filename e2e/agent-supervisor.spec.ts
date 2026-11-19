@@ -974,6 +974,79 @@ test('refresh restores the selected saved job and its graph before the Writer ar
   await expect(page.locator('[data-selected-job-preparation="true"]').getByLabel(isZh ? '已保存的职位' : 'Saved job')).toHaveValue('fixture-selected-job', { timeout: 10_000 })
   await expect(page.locator('[data-agent-task-graph-plan="true"]')).toContainText('Prepare Systems Engineer at Fixture Systems')
 })
+
+test('selected Writer disclosure loads its exact version lazily and fences a late response after switching tasks', async ({ page }, testInfo) => {
+  const fixture = await installSupervisorFixture(page, true, true)
+  const isZh = testInfo.project.name.includes('zh')
+  await page.goto(`/agent-preview?supervisor=1&locale=${isZh ? 'zh' : 'en'}&sessionId=${SESSION_A}`)
+  await showTaskDetails(page, isZh)
+  await expect(page.locator('[data-selected-job-draft="true"]')).toContainText('Persisted cover-letter fixture body.', { timeout: 20_000 })
+
+  const artifactRequests: string[] = []
+  page.on('request', request => {
+    const url = new URL(request.url())
+    if (request.method() === 'GET' && url.pathname.includes('/artifacts/')) artifactRequests.push(url.href)
+  })
+  const initialRequestCount = artifactRequests.length
+  const firstWriter = page.locator('[data-task-node-id="task:writer-fixture-draft"]')
+  await expect(firstWriter).toBeVisible()
+  await firstWriter.click()
+  const selection = page.locator('[data-agent-supervisor-selection]')
+  const disclosure = selection.locator('[data-selected-worker-draft-disclosure="true"]')
+  const openLabel = isZh ? '打开已保存草稿' : 'Open saved draft'
+  await expect(disclosure.getByRole('button', { name: openLabel })).toBeVisible()
+  await expect(disclosure.locator('[data-selected-job-draft="true"]')).toHaveCount(0)
+  expect(artifactRequests).toHaveLength(initialRequestCount)
+
+  let resolveHeldResponse!: () => void
+  let markRequestHeld!: () => void
+  let finishHeldRoute!: () => void
+  const heldResponse = new Promise<void>(resolve => { resolveHeldResponse = resolve })
+  const requestHeld = new Promise<void>(resolve => { markRequestHeld = resolve })
+  const heldRouteFinished = new Promise<void>(resolve => { finishHeldRoute = resolve })
+  await page.route(/\/api\/agent\/sessions\/fixture-session-a\/artifacts\/fixture-cover-letter\/versions\/1\?/, async route => {
+    markRequestHeld()
+    await heldResponse
+    try { await route.fallback() } catch { /* The browser may have aborted after the selected task changed. */ }
+    finishHeldRoute()
+  })
+
+  await disclosure.getByRole('button', { name: openLabel }).click()
+  await requestHeld
+  const firstWorkerRequest = new URL(artifactRequests[artifactRequests.length - 1]!)
+  expect(firstWorkerRequest.pathname).toBe('/api/agent/sessions/fixture-session-a/artifacts/fixture-cover-letter/versions/1')
+  expect(firstWorkerRequest.searchParams.get('contentHash')).toBe(`sha256:${'a'.repeat(64)}`)
+  expect(firstWorkerRequest.searchParams.get('sourceDigest')).toBe(`sha256:${'b'.repeat(64)}`)
+
+  await page.evaluate(async () => {
+    const response = await fetch('/__agent_fixture__/selected-job-graph', { method: 'POST' })
+    if (!response.ok) throw new Error('Could not release the second selected-job TaskGraph fixture.')
+  })
+  await expect.poll(() => fixture.selectedJobGraphEventSent, { timeout: 10_000 }).toBe(true)
+  const nextWriter = page.locator('[data-task-node-id="task:writer-fixture-draft-next"]')
+  await expect(nextWriter).toBeVisible({ timeout: 10_000 })
+  await nextWriter.click()
+  const nextDisclosure = page.locator('[data-agent-supervisor-selection] [data-selected-worker-draft-disclosure="true"]')
+  await expect(nextDisclosure.getByRole('button', { name: openLabel })).toBeVisible()
+  await expect(nextDisclosure.locator('[data-selected-job-draft="true"]')).toHaveCount(0)
+
+  resolveHeldResponse()
+  await heldRouteFinished
+  await expect(nextDisclosure.locator('[data-selected-job-draft="true"]')).toHaveCount(0)
+  await expect(nextDisclosure).not.toContainText('Persisted cover-letter fixture body.')
+
+  const requestsBeforeNextOpen = artifactRequests.length
+  await nextDisclosure.getByRole('button', { name: openLabel }).click()
+  const nextDraft = nextDisclosure.locator('[data-selected-job-draft="true"]')
+  await expect(nextDraft).toContainText('Second selected-job cover-letter fixture body.', { timeout: 10_000 })
+  const nextWorkerRequest = artifactRequests.slice(requestsBeforeNextOpen).map(value => new URL(value))
+    .find(url => url.pathname === '/api/agent/sessions/fixture-session-a/artifacts/fixture-cover-letter-next/versions/1')
+  expect(nextWorkerRequest?.searchParams.get('contentHash')).toBe(`sha256:${'c'.repeat(64)}`)
+  expect(nextWorkerRequest?.searchParams.get('sourceDigest')).toBe(`sha256:${'d'.repeat(64)}`)
+  await nextDisclosure.getByRole('button', { name: isZh ? '收起已保存草稿' : 'Close saved draft' }).click()
+  await expect(nextDisclosure.locator('[data-selected-job-draft="true"]')).toHaveCount(0)
+})
+
 test('a newer selected-job Turn hides the prior plan and draft until its graph arrives, while ordinary chat keeps them visible', async ({ page }, testInfo) => {
   const fixture = await installSupervisorFixture(page, true, true)
   const isZh = testInfo.project.name.includes('zh')
