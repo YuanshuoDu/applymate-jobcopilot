@@ -9,6 +9,7 @@ import type { JobDiscoveryOutput } from "../tools/job-discovery-client.js"
 
 import { createObservedEvidenceIndex, hydrateObservedEvidence } from "./child-evidence.js"
 import { buildChildResumeObservations, mergeDurableWaitObservation, resolveDurableWaitOutcome } from "./child-resume-observations.js"
+import { safeSubagentWaitJson } from "./durable-subagent-wait-store.js"
 import type { SubagentLease } from "./types.js"
 
 const targetId = "subagent-00000000-0000-4000-8000-000000000001"
@@ -236,6 +237,35 @@ describe("durable child wait resume observation", () => {
     expect((tasks[1]?.result as Record<string, unknown>).finalText).toBe(redactSensitiveText(freeText))
     expect(JSON.stringify(content.input)).not.toContain(phoneShapedCallId)
     expect(JSON.stringify(content.output)).not.toContain(phoneShapedCallId)
+  })
+
+  it("preserves only the exact canonical wait ID across the second observation projection", () => {
+    const waitId = NUMERIC_UUID
+    const ids = [...wait.input.taskIds]
+    const loadedOutput = { ...wait.output, waitId, taskIds: ids, matchedTaskIds: [...ids].sort(),
+      tasks: ids.map(id => wait.output.tasks.find(task => task.taskId === id)!) }
+    const row = { id: waitId, status: "ready", mode: "all", targetTaskIds: wait.input.taskIds,
+      matchedTaskIds: wait.output.matchedTaskIds, deadlineAt: wait.output.deadlineAt, result: { outcome: loadedOutput } }
+    const resolved = resolveDurableWaitOutcome(row, row.targetTaskIds, row.matchedTaskIds, new Date("2026-10-22T10:00:00.000Z"))
+    expect(redactSensitiveText(waitId)).not.toBe(waitId)
+    expect(resolved.waitId).toBe(waitId)
+
+    // The first safe projection preserves the validated ID but returns a fresh object without its private marker.
+    const loaded = safeSubagentWaitJson(resolved, 16_384) as typeof resolved
+    expect(loaded.waitId).toBe(waitId)
+    const restored = mergeDurableWaitObservation([], { ...wait, waitId, output: loaded })
+    const content = restored[0]?.content as Record<string, unknown>
+    const output = content.output as typeof loaded
+    const sensitiveResult = output.tasks.find(task => task.taskId === targetId)?.result as Record<string, unknown>
+    expect(output.waitId).toBe(waitId)
+    expect(sensitiveResult.finalText).toBe(redactSensitiveText(freeText))
+    expect(sensitiveResult.finalText).not.toContain(targetId)
+    expect(() => mergeDurableWaitObservation([], { ...wait, waitId, output: { ...loaded, waitId: ORDINARY_UUID } }))
+      .toThrow("child_resume_invalid_wait_result")
+    const noncanonicalId = "wait-415-555-0134"
+    const legacy = mergeDurableWaitObservation([], { ...wait, waitId: noncanonicalId, output: { ...wait.output, waitId: noncanonicalId } })
+    expect(((legacy[0]?.content as Record<string, unknown>).output as Record<string, unknown>).waitId)
+      .toBe(redactSensitiveText(noncanonicalId))
   })
 
   it("matches wait observations by exact raw ID and fails closed on conflicting or duplicate lineage", () => {
