@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest"
 
 import { loadChildSameAttemptContinuation, prioritizeMailboxMessages, projectChildFinalText } from "./child-mailbox-continuation.js"
 import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
+import { scoutDelegateSpawnKey } from "./scout-delegate-spawn-key.js"
+import { spawnKey } from "./pg-store-persistence.js"
 import type { SubagentLease } from "./types.js"
 
 type Row = Record<string, unknown>
@@ -104,7 +106,7 @@ function sourceWaitEvidence(child: SubagentLease, waits: readonly Row[], items: 
 }
 
 function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], current = currentRow(child), priorSteps: Row[] = [], priorItems: Row[] = [], filterTaskScope = false,
-  consumedWaitRows: Row[] = [], waitTargetRows: Row[] = [], canonicalWaitRows: Row[] = consumedWaitRows) {
+  consumedWaitRows: Row[] = [], waitTargetRows: Row[] = [], canonicalWaitRows: Row[] = consumedWaitRows, delegateProofs: Row[] = []) {
   const source = sourceWaitEvidence(child, canonicalWaitRows, items)
   const persistedItems = source.items
   const queries: Array<{ sql: string; values: readonly unknown[] }> = []
@@ -112,6 +114,11 @@ function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], current
     query: vi.fn(async (query: string, values: readonly unknown[] = []) => {
       queries.push({ sql: query, values })
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(query) || query.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (query.includes('FROM unnest($1::text[]) AS expected')) {
+        const keys = Array.isArray(values[0]) ? values[0] as string[] : []
+        const rows = delegateProofs.filter(row => keys.includes(String(row.idempotencyKey)))
+        return { rows, rowCount: rows.length }
+      }
       if (query.startsWith('SELECT wait."id" AS "id"')) {
         const rows = consumedWaitRows.map(row => ({ id: row.waitId ?? row.id }))
         return { rows, rowCount: rows.length }
@@ -188,6 +195,27 @@ function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], current
 }
 
 describe("same-attempt mailbox continuation", () => {
+  it("uses the same scoped delegate restore proof for a mailbox continuation", async () => {
+    const child = lease(), taskId = "subagent-00000000-0000-4000-8000-000000000101", toolCallId = "delegate-current"
+    const childItems = [
+      item(child),
+      item(child, { id: "delegate-call-item", type: "tool_call", phase: null, revision: 0,
+        content: { toolCallId, toolName: "scout.delegate", input: { goal: "Inspect roles" } } }),
+      item(child, { id: "delegate-result-item", type: "tool_result", phase: null, revision: 1,
+        content: { toolCallId, output: { taskId: "subagent-[REDACTED_PHONE]", status: "queued" }, errorCode: null } }),
+    ]
+    const proof = { idempotencyKey: spawnKey(child.sessionId, scoutDelegateSpawnKey(child.id, child.attemptCount, toolCallId)),
+      spawnId: "spawn-current", spawnPayload: { taskId }, childTaskId: taskId, childSessionId: child.sessionId, childTurnId: child.turnId,
+      childRootTaskId: child.rootTaskId, childParentTaskId: child.id, childDepth: 2, childRole: "scout", childTaskType: "job_discovery",
+      sessionUserId: child.userId, turnId: child.turnId, turnSessionId: child.sessionId, turnUserId: child.userId }
+    const db = fakePool(child, [step(child)], childItems, currentRow(child), [], [], false, [], [], [], [proof])
+    const restored = await loadChildSameAttemptContinuation(db.pool as never, child, now)
+    expect(restored?.observations.find(block => block.id === "child-resume:delegate-result-item")?.content).toMatchObject({
+      toolCallId, toolName: "scout.delegate", output: { taskId, status: "queued" },
+    })
+    expect(db.queries.filter(query => query.sql.includes("FROM unnest($1::text[]) AS expected"))).toHaveLength(1)
+  })
+
   it("restores current checkpoint plus cumulative same-task accounting without sibling ordinals or tool replay", async () => {
     const child = lease()
     const db = fakePool(child, [
