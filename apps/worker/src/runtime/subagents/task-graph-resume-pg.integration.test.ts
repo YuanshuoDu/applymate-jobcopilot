@@ -15899,7 +15899,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     [seattleJobId, value.userId, `https://jobs.example.invalid/${seattleJobId}`,
       dublinJobId, `https://jobs.example.invalid/${dublinJobId}`, berlinJobId, `https://jobs.example.invalid/${berlinJobId}`])
 
-    const workerEnv = { BULLMQ_STALLED_INTERVAL_MS: "30000" }
+    const workerEnv = { DATABASE_URL: databaseUrl!, BULLMQ_STALLED_INTERVAL_MS: "30000" }
     const fixtureInput = { ...value, seattleJobId, dublinJobId, berlinJobId }
     let firstWorker: ProcessFixtureChild | undefined
     let resumeWorker: ProcessFixtureChild | undefined
@@ -15919,7 +15919,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       try { parsed = record(JSON.parse(line.slice(prefix.length)) as unknown) } catch { /* marker remains invalid */ }
       expect(parsed).toEqual(fields)
     }
-    const startupFailureProjection = (child: ProcessFixtureChild) => {
+    const startupFailureProjection = (
+      child: ProcessFixtureChild,
+      phase: "before_seattle_waiting_marker" | "after_berlin_plan_before_dublin_interrupt" = "before_seattle_waiting_marker",
+    ) => {
       const allowedNames = new Set([
         "Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "AbortError", "TimeoutError",
         "ConnectionError", "MaxRetriesPerRequestError", "ReplyError",
@@ -15943,6 +15946,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         ["P3_SUCCESSIVE_REPLAN_PLAN_ACCEPTED ", "berlin_plan_accepted"],
         ["P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED ", "dublin_interrupt_requested"],
         ["P3_SUCCESSIVE_REPLAN_FINAL ", "final"],
+        ["P3_SUCCESSIVE_REPLAN_BERLIN_REQUEST ", "berlin_request"],
+        ["P3_SUCCESSIVE_REPLAN_BERLIN_LIST_PROOF ", "berlin_list_proof"],
       ])
       for (const line of child.output) {
         const markerPhase = [...phaseByMarker].find(([prefix]) => line.startsWith(prefix))?.[1]
@@ -15975,7 +15980,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         }
       }
       return {
-        phase: "before_seattle_waiting_marker", observedPhases: observedPhases.slice(0, 8),
+        phase, observedPhases: observedPhases.slice(0, 8),
         exitCode: child.exitCode, stdoutLineCount: child.output.length,
         stderrLineCount: child.errors.length, errorNames: Object.fromEntries(names), errorCodes: Object.fromEntries(codes),
         fixtureCodes: Object.fromEntries(fixtureCodes), missingModule: moduleName, firstWorkerFrame: sourceFrame,
@@ -16157,8 +16162,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         [taskId, value.sessionId, value.turnId, rootTaskId, value.userId])
       return result.rows[0]
     }
-    const readSteerFailureBoundary = async (phase: "dublin" | "berlin", accepted: AcceptedLocationSteer | undefined) => {
+    const readSteerFailureBoundary = async (
+      phase: "dublin" | "berlin",
+      accepted: AcceptedLocationSteer | undefined,
+      process: ProcessFixtureChild = firstWorker!,
+    ) => {
       const isBerlin = phase === "berlin"
+      const dublinTask = isBerlin && dublinTaskId ? await readTask(dublinTaskId).catch(() => undefined) : undefined
       const turnPromise = pool!.query<{ revision: number; status: string; rootTaskId: string | null; leaseOwnerId: string | null;
         leaseVersion: number; leaseExpiresAt: Date | null }>(
         `SELECT turn."revision", turn."status", turn."rootTaskId", turn."leaseOwnerId", turn."leaseVersion", turn."leaseExpiresAt"
@@ -16224,7 +16234,24 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const turn = turnResult.rows[0]
       const input = inputResult.rows[0]
       const latestRootStep = latestRootStepResult.rows[0]
-      const firstWorkerExited = processFixtureExited(firstWorker!)
+      const [berlinPlanCalls, currentNodes, graphItem] = isBerlin ? await Promise.all([
+        readPlanCallsForKey("scout-berlin-final").catch(() => []),
+        graphNodes().catch(() => []),
+        pool!.query<{ revision: number }>(
+          `SELECT item."revision" FROM "agent_items" AS item
+           JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+           JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+           WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
+             AND item."type" = 'task_graph' AND turn."rootTaskId" = $4
+             AND turn."userId" = $5 AND session."userId" = $5`,
+          [taskGraphItemId(rootTaskId), value.sessionId, value.turnId, rootTaskId, value.userId],
+        ).catch(() => ({ rows: [] })),
+      ]) : [[], [], { rows: [] }]
+      const acceptedBerlinPlanResults = await Promise.all(berlinPlanCalls.map(call =>
+        readPlanResultStatus(call.toolCallId).catch(() => false)))
+      const berlinNode = currentNodes.find(node => node.key === "scout-berlin-final")
+      const berlinTask = berlinNode?.taskId ? await readTask(berlinNode.taskId).catch(() => undefined) : undefined
+      const observedProcessExited = processFixtureExited(process)
       const inputStatuses = new Set(["accepted", "consumed", "rejected", "cancelled"])
       const waitStatuses = new Set(["waiting", "ready", "timed_out", "interrupted", "closed"])
       const toolStatuses = new Set(["started", "completed", "failed", "interrupted"])
@@ -16281,11 +16308,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         ["P3_SUCCESSIVE_REPLAN_BERLIN_REQUEST ", "berlin_request"],
         ["P3_SUCCESSIVE_REPLAN_BERLIN_LIST_PROOF ", "berlin_list_proof"],
         ["P3_SUCCESSIVE_REPLAN_CRASH_CUT ", "crash_cut"],
+        ["P3_SUCCESSIVE_REPLAN_CONTEXT ", "resume_context"],
+        ["P3_SUCCESSIVE_REPLAN_PLAN_ACCEPTED ", "berlin_plan_accepted"],
+        ["P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED ", "dublin_interrupt_requested"],
+        ["P3_SUCCESSIVE_REPLAN_FINAL ", "final"],
       ]
-      const observedMarkers = markers.filter(([prefix]) => firstWorker?.output.some(line => line.startsWith(prefix)))
+      const observedMarkers = markers.filter(([prefix]) => process.output.some(line => line.startsWith(prefix)))
         .map(([, stage]) => stage)
       const projectMarker = (prefix: string, fields: readonly string[]) => {
-        const line = firstWorker?.output.find(value => value.startsWith(prefix))
+        const line = process.output.find(value => value.startsWith(prefix))
         if (!line) return null
         let source: RecordValue | null = null
         try { source = record(JSON.parse(line.slice(prefix.length)) as unknown) } catch { /* keep closed marker projection */ }
@@ -16301,11 +16332,35 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const dublinRetirement = isBerlin && dublinTaskId
         ? await readRetirement(dublinTaskId, "scout-dublin-replacement").catch(() => null) : false
       return {
-        processExited: firstWorkerExited,
-        processExitCode: firstWorker!.exitCode,
-        processSignalReceived: firstWorker!.signalCode !== null,
-        processStdoutLineCount: diagnosticBoundedCount(firstWorker!.output.length),
-        processStderrLineCount: diagnosticBoundedCount(firstWorker!.errors.length),
+        processExited: observedProcessExited,
+        processExitCode: process.exitCode,
+        processSignalReceived: process.signalCode !== null,
+        processStdoutLineCount: diagnosticBoundedCount(process.output.length),
+        processStderrLineCount: diagnosticBoundedCount(process.errors.length),
+        processFailure: startupFailureProjection(process, isBerlin && process === resumeWorker
+          ? "after_berlin_plan_before_dublin_interrupt" : "before_seattle_waiting_marker"),
+        dublinTask: isBerlin ? {
+          status: diagnosticEnum(dublinTask?.status, PROCESS_FIXTURE_TASK_STATUSES) ?? "missing",
+          role: diagnosticEnum(dublinTask?.role, new Set(["scout", "analyst"])) ?? "other",
+          attemptCount: diagnosticBoundedCount(dublinTask?.attemptCount),
+          attemptCountBeforeRestart: diagnosticBoundedCount(dublinAttemptBeforeRestart),
+          attemptRelation: !dublinTask ? "missing"
+            : dublinTask.attemptCount === dublinAttemptBeforeRestart ? "same"
+              : dublinTask.attemptCount > dublinAttemptBeforeRestart ? "advanced" : "regressed",
+          leaseOwnerPresent: typeof dublinTask?.leaseOwner === "string" && dublinTask.leaseOwner.length > 0,
+          leaseLive: dublinTask?.leaseExpiresAt instanceof Date && dublinTask.leaseExpiresAt.getTime() > Date.now(),
+          leaseExpired: dublinTask?.leaseExpiresAt instanceof Date && dublinTask.leaseExpiresAt.getTime() <= Date.now(),
+          leaseSegmentPresent: dublinTask?.leaseSegmentStartedAt instanceof Date,
+          interruptRequested: dublinTask?.interruptRequestedAt instanceof Date,
+        } : undefined,
+        berlinPlan: isBerlin ? {
+          callCount: diagnosticBoundedCount(berlinPlanCalls.length),
+          acceptedResultCount: diagnosticBoundedCount(acceptedBerlinPlanResults.filter(Boolean).length),
+          graphRevision: diagnosticBoundedCount(graphItem.rows[0]?.revision),
+          nodePresent: !!berlinNode,
+          nodeTaskPresent: typeof berlinNode?.taskId === "string" && berlinNode.taskId.length > 0,
+          nodeStatus: diagnosticEnum(berlinTask?.status, PROCESS_FIXTURE_TASK_STATUSES) ?? "missing",
+        } : undefined,
         turnStatus: diagnosticEnum(turn?.status, PROCESS_FIXTURE_TURN_STATUSES) ?? "missing",
         rootPresent: typeof turn?.rootTaskId === "string" && turn.rootTaskId === rootTaskId,
         turnRevision: diagnosticBoundedCount(turn?.revision),
@@ -16350,7 +16405,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           status: diagnosticEnum(row.status, waitStatuses) ?? "other",
           suspended: row.suspendedAt instanceof Date,
         })),
-        tools: toolsResult.rows.slice(0, 3).map(row => ({
+        tools: toolsResult.rows.slice(0, 4).map(row => ({
           tool: row.toolName === "agent.list" ? "list" : row.toolName === "agent.plan" ? "plan"
             : row.toolName === "agent.retire_superseded_scout" ? "retire" : "wait",
           callStatus: diagnosticEnum(row.callStatus, toolStatuses) ?? "other",
@@ -16366,6 +16421,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         berlinListProofMarker: projectMarker("P3_SUCCESSIVE_REPLAN_BERLIN_LIST_PROOF ",
           ["listResultPresent", "seattleInterrupted", "dublinRunning", "unresolvedSteeringCuePresent",
             "berlinScopePresent", "priorRetirementPresent", "noBerlinPlanYet"]),
+        dublinInterruptMarker: isBerlin ? projectMarker("P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED ",
+          ["interruptRequested", "liveLeaseBound", "rootLeaseMatchesProcess"]) : undefined,
+        resumeContextMarker: isBerlin ? projectMarker("P3_SUCCESSIVE_REPLAN_CONTEXT ",
+          ["unresolvedSteeringCuePresent", "berlinScopePresent", "priorRetirementPresent", "planToolAvailable",
+            "rootLeaseMatchesProcess"]) : undefined,
+        berlinPlanAcceptedMarker: isBerlin ? projectMarker("P3_SUCCESSIVE_REPLAN_PLAN_ACCEPTED ",
+          ["accepted", "berlinNodePresent", "acceptedPlanCount", "rootLeaseMatchesProcess"]) : undefined,
       }
     }
 
@@ -16520,7 +16582,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
       berlinTaskId = (await graphNodes()).find(node => node.key === "scout-berlin-final")?.taskId ?? ""
       if (!berlinTaskId) throw new Error("Replacement Worker omitted its Berlin Scout task identity")
-      const dublinInterrupt = await waitForProcessLine(resumeWorker, "P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED ", 90_000)
+      let dublinInterrupt: string
+      try {
+        dublinInterrupt = await waitForProcessLine(resumeWorker, "P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED ", 90_000)
+      } catch {
+        throw new Error("Dublin post-plan boundary="
+          + JSON.stringify(await readSteerFailureBoundary("berlin", acceptedBerlin, resumeWorker)))
+      }
       assertMarker(dublinInterrupt, "P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED ",
         { interruptRequested: true, liveLeaseBound: true, rootLeaseMatchesProcess: true })
       resumeWorker.stdin?.write("release-dublin\n")

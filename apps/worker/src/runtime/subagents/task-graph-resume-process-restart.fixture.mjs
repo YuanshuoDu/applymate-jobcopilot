@@ -232,7 +232,7 @@ function assertDisposableServiceUrls() {
   const redisConfiguredValue = process.env.REDIS_URL
   if (process.env.CI !== "true" || process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true"
     || process.env.AGENT_TURN_REDIS_TEST_DISPOSABLE !== "true"
-    || successiveMode && (!localSuccessiveProof || process.env.AGENT_RUNTIME_PG_TEST_REQUIRED !== "true")
+    || successiveMode && process.env.AGENT_RUNTIME_PG_TEST_REQUIRED !== "true"
     || !databaseValue || !redisTestValue || !redisConfiguredValue) {
     throw new Error("p3_restart_fixture_requires_dedicated_disposable_ci_services")
   }
@@ -246,7 +246,7 @@ function assertDisposableServiceUrls() {
       || (localSuccessiveProof ? !localSuccessivePair : database.port !== "5432")
       || database.username !== "postgres" || database.password !== "postgres"
       || database.pathname !== "/applymate_agent_brain_ci" || database.search || database.hash
-      || localSuccessiveProof && databaseConfiguredValue !== databaseValue
+      || successiveMode && databaseConfiguredValue !== databaseValue
       || redisTest.protocol !== "redis:"
       || (localSuccessiveProof ? redisTest.hostname !== "127.0.0.1"
         : !["127.0.0.1", "localhost", "::1", "[::1]"].includes(redisTest.hostname))
