@@ -13709,7 +13709,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
 
     await waitForPersistedTaskWait(pool!, value.turnId, initialWaitKey, 20_000, initialWaitCallId)
     if (!seattleTaskId) throw new Error("Initial Seattle plan did not return a task ID")
-    const seattleTask = await waitForCompletedTask(seattleTaskId)
+    const initialSeattlePlanTaskId = seattleTaskId
+    const seattleTask = await waitForCompletedTask(initialSeattlePlanTaskId)
     expectPassedVerificationReport(record(seattleTask.result)?.taskGraphVerificationReport, "candidate-count")
     const digestResult = (result: unknown) => {
       const serialized = JSON.stringify(result)
@@ -13772,7 +13773,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       })}`)
     }
     if (!dublinTaskId) throw new Error("Dublin revise plan did not return a task ID")
-    const dublinTask = await waitForCompletedTask(dublinTaskId)
+    const revisedDublinPlanTaskId = dublinTaskId
+    const dublinTask = await waitForCompletedTask(revisedDublinPlanTaskId)
     expectPassedVerificationReport(record(dublinTask.result)?.taskGraphVerificationReport, "candidate-count")
     const secondResume = await reconcileDurableWaits(pool!, { ownerId: `p3-1219-result-resolver-${value.suffix}` })
     expect(secondResume.woken).toBeGreaterThan(0)
@@ -13801,59 +13803,149 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(dublinWaitState.rows).toHaveLength(1)
     expect(dublinWaitState.rows[0]).toMatchObject({ status: "ready" })
     expect(dublinWaitState.rows[0]?.suspendedAt).toBeInstanceOf(Date)
-    const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue
-    await expectGroundedTaskGraphFinalCopies(pool!, value, rootTaskId, finalResponse, finalCandidate)
-
     const client = await pool!.connect()
-    let binding: ReturnType<typeof buildTaskGraphFinalSummaryBinding>
+    let loadedGraph: Awaited<ReturnType<typeof loadTaskGraph>>
+    let finalResponse: RecordValue | null = null
+    let finalItemContent: RecordValue | null = null
     try {
       await client.query("BEGIN READ ONLY")
       await client.query("SELECT set_config('app.user_id', $1, true)", [value.userId])
-      binding = buildTaskGraphFinalSummaryBinding(await loadTaskGraph(client, {
+      loadedGraph = await loadTaskGraph(client, {
         userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId, parentTaskId: rootTaskId,
-      }, false))
+      }, false, { includeSourceProvenance: true })
+      const persistedTurn = await client.query<{ finalResponse: string | null }>(
+        `SELECT "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+        [value.turnId, value.sessionId, value.userId],
+      )
+      finalResponse = record(JSON.parse(persistedTurn.rows[0]?.finalResponse ?? "null"))
+      const finalItems = await client.query<{ content: unknown }>(
+        `SELECT item."content" FROM "agent_items" AS item
+         JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+         WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3
+           AND session."userId" = $4 AND turn."userId" = $4 AND turn."rootTaskId" = $3
+           AND item."type" = 'agent_message' AND item."phase" = 'final_answer' AND item."status" = 'completed'
+         ORDER BY item."createdAt" DESC LIMIT 1`,
+        [value.sessionId, value.turnId, rootTaskId, value.userId],
+      )
+      expect(finalItems.rows).toHaveLength(1)
+      finalItemContent = record(finalItems.rows[0]?.content)
     } finally {
       await client.query("ROLLBACK").catch(() => undefined)
       client.release()
     }
-    if (!binding) throw new Error("Current replan applicability graph did not produce a final-summary binding")
-    const retainedSeattle = await pool!.query<{ status: string; result: unknown }>(
-      `SELECT "status", "result" FROM "sub_agent_tasks"
-       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [seattleTaskId, value.sessionId, value.turnId],
-    )
-    const retainedResult = retainedSeattle.rows[0]?.result
-    const earlierResultUnchanged = retainedResult !== undefined && digestResult(retainedResult) === seattleResultDigest
-    const responseReportsOneCurrentResult = typeof finalResponse.response === "string"
-      && finalResponse.response.includes("Search results: 1 unique job reported (complete coverage).")
-    const includesEarlierResult = binding.summary.discoveredJobs.some(item => item.jobId === seattleJobId)
-    const includesCurrentResult = binding.summary.discoveredJobs.some(item => item.jobId === dublinJobId)
-    if (!earlierResultUnchanged || includesEarlierResult || !responseReportsOneCurrentResult) {
+    const finalNodes = loadedGraph.snapshot?.nodes ?? []
+    const seattleNodeIndex = finalNodes.findIndex(node => node.key === "scout-seattle")
+    const dublinNodeIndex = finalNodes.findIndex(node => node.key === "scout-dublin")
+    const seattleNode = seattleNodeIndex >= 0 ? finalNodes[seattleNodeIndex] : undefined
+    const dublinNode = dublinNodeIndex >= 0 ? finalNodes[dublinNodeIndex] : undefined
+    const seattleFinalTask = seattleNode ? loadedGraph.tasks.get(seattleNode.taskId) : undefined
+    const earlierResultUnchanged = seattleFinalTask !== undefined
+      && digestResult(seattleFinalTask.result) === seattleResultDigest
+    const seattleCheckpointMap = loadedGraph.sourceInputCheckpointByNodeKey
+    const acceptedSteerSequence = BigInt(accepted.sequence)
+    const sourceCheckpointRelation = (nodeKey: string) => {
+      if (!seattleCheckpointMap) return { relation: "unknown", reason: "provenance_not_returned" }
+      if (!seattleCheckpointMap.has(nodeKey)) return { relation: "unknown", reason: "node_checkpoint_not_mapped" }
+      const checkpoint = seattleCheckpointMap.get(nodeKey)
+      if (!checkpoint) return { relation: "unknown", reason: "no_validated_source_step_checkpoint" }
+      return checkpoint.inputThroughSequence < acceptedSteerSequence
+        ? { relation: "predates_accepted_steer", reason: null }
+        : { relation: "covers_accepted_steer", reason: null }
+    }
+    const seattleCheckpoint = sourceCheckpointRelation("scout-seattle")
+    const dublinCheckpoint = sourceCheckpointRelation("scout-dublin")
+    const finalItemFinal = record(finalItemContent?.final)
+    const finalManifest = record(finalItemContent?.taskGraphSources)
+    const manifestSources = Array.isArray(finalManifest?.sources) ? finalManifest.sources.map(record) : []
+    const historicalNodeIndices = Array.isArray(finalManifest?.historicalNodeIndices)
+      ? finalManifest.historicalNodeIndices : []
+    const finalResponseText = typeof finalResponse?.response === "string" ? finalResponse.response : ""
+    const finalResponseSummary = typeof finalResponse?.summary === "string" ? finalResponse.summary : ""
+    const responseReportsOneCurrentResult = finalResponseText.includes("Search results: 1 unique job reported (complete coverage).")
+    const structuredSummaryReportsOneCurrentResult = finalResponseSummary.includes("discovered jobs: 1 (complete)")
+    const finalResponseOmitsRawCandidate = !finalResponseText.includes(finalCandidate)
+    const finalItemTextMatchesEnvelope = finalItemContent?.text === finalResponseText
+      && finalItemFinal?.response === finalResponseText
+    const finalItemSummaryMatchesEnvelope = finalItemFinal?.summary === finalResponseSummary
+    const seattleIsHistorical = historicalNodeIndices.includes(seattleNodeIndex)
+      && !manifestSources.some(source => source?.nodeIndex === seattleNodeIndex)
+    const dublinSourceKeepsOriginalOrdinal = manifestSources.some(source =>
+      source?.nodeIndex === dublinNodeIndex && source?.role === "scout")
+    const manifestHasOnlyCurrentDublinSource = manifestSources.length === 1 && dublinSourceKeepsOriginalOrdinal
+    const manifestMarksOnlySeattleHistorical = historicalNodeIndices.length === 1
+      && historicalNodeIndices[0] === seattleNodeIndex
+    const seattleTaskMatchesInitialPlanReceipt = seattleNode?.taskId === initialSeattlePlanTaskId
+    const dublinTaskMatchesReplanPlanReceipt = dublinNode?.taskId === revisedDublinPlanTaskId
+    const identitiesMatchPlanReceipts = seattleTaskMatchesInitialPlanReceipt && dublinTaskMatchesReplanPlanReceipt
+    const finalManifestIsV2 = finalManifest?.schemaVersion === "agent-harness.v2.task-graph-sources.v2"
+    if (!earlierResultUnchanged || seattleCheckpoint.relation !== "predates_accepted_steer"
+      || dublinCheckpoint.relation !== "covers_accepted_steer" || !responseReportsOneCurrentResult
+      || !structuredSummaryReportsOneCurrentResult || !finalManifestIsV2 || !seattleIsHistorical
+      || !manifestMarksOnlySeattleHistorical || !dublinSourceKeepsOriginalOrdinal || !manifestHasOnlyCurrentDublinSource
+      || !finalItemTextMatchesEnvelope || !finalItemSummaryMatchesEnvelope || !finalResponseOmitsRawCandidate) {
       console.info("Replan applicability safe evidence", JSON.stringify({
-        earlierTaskRowCount: retainedSeattle.rows.length,
-        earlierTaskStatus: diagnosticEnum(retainedSeattle.rows[0]?.status, TASK_DIAGNOSTIC_STATUSES),
-        earlierResultPresent: retainedResult !== undefined && retainedResult !== null,
+        graphHasTwoExpectedNodes: finalNodes.length === 2 && seattleNodeIndex >= 0 && dublinNodeIndex >= 0,
+        seattleTaskMatchesInitialPlanReceipt,
+        dublinTaskMatchesReplanPlanReceipt,
         earlierResultUnchanged,
         resumedRequestIncludesEarlierNode,
         resumedRequestMarksEarlierNodePredatesSteer,
         resumedRequestIncludesEarlierWait,
         finalRequestIncludesEarlierNode,
-        includesEarlierResult,
-        includesCurrentResult,
-        discoveredCount: binding.summary.counts.discoveredJobs.knownCount,
+        seattleCheckpointRelation: seattleCheckpoint.relation,
+        seattleCheckpointUnknownReason: seattleCheckpoint.reason,
+        dublinCheckpointRelation: dublinCheckpoint.relation,
+        dublinCheckpointUnknownReason: dublinCheckpoint.reason,
+        finalManifestIsV2,
+        seattleIsHistorical,
+        manifestMarksOnlySeattleHistorical,
+        dublinSourceKeepsOriginalOrdinal,
+        manifestHasOnlyCurrentDublinSource,
+        finalItemTextMatchesEnvelope,
+        finalItemSummaryMatchesEnvelope,
+        finalResponseOmitsRawCandidate,
         finalResponseReportsOneCurrentResult: responseReportsOneCurrentResult,
+        structuredSummaryReportsOneCurrentResult,
       }))
     }
     expect({
-      includesEarlierResult,
-      includesCurrentResult,
-      reportedCount: binding.summary.counts.discoveredJobs.knownCount,
+      graphHasTwoExpectedNodes: finalNodes.length === 2 && seattleNodeIndex >= 0 && dublinNodeIndex >= 0,
+      identitiesMatchPlanReceipts,
+      earlierResultUnchanged,
+      seattleCheckpointRelation: seattleCheckpoint.relation,
+      seattleCheckpointUnknownReason: seattleCheckpoint.reason,
+      dublinCheckpointRelation: dublinCheckpoint.relation,
+      dublinCheckpointUnknownReason: dublinCheckpoint.reason,
+      finalManifestIsV2,
+      seattleIsHistorical,
+      manifestMarksOnlySeattleHistorical,
+      dublinSourceKeepsOriginalOrdinal,
+      manifestHasOnlyCurrentDublinSource,
+      finalItemTextMatchesEnvelope,
+      finalItemSummaryMatchesEnvelope,
+      finalResponseOmitsRawCandidate,
       finalResponseReportsOneCurrentResult: responseReportsOneCurrentResult,
+      structuredSummaryReportsOneCurrentResult,
     }, "The current final summary should report only the post-steer Dublin evidence")
       .toEqual({
-        includesEarlierResult: false,
-        includesCurrentResult: true,
-        reportedCount: 1,
+        graphHasTwoExpectedNodes: true,
+        identitiesMatchPlanReceipts: true,
+        earlierResultUnchanged: true,
+        seattleCheckpointRelation: "predates_accepted_steer",
+        seattleCheckpointUnknownReason: null,
+        dublinCheckpointRelation: "covers_accepted_steer",
+        dublinCheckpointUnknownReason: null,
+        finalManifestIsV2: true,
+        seattleIsHistorical: true,
+        manifestMarksOnlySeattleHistorical: true,
+        dublinSourceKeepsOriginalOrdinal: true,
+        manifestHasOnlyCurrentDublinSource: true,
+        finalItemTextMatchesEnvelope: true,
+        finalItemSummaryMatchesEnvelope: true,
+        finalResponseOmitsRawCandidate: true,
         finalResponseReportsOneCurrentResult: true,
+        structuredSummaryReportsOneCurrentResult: true,
       })
   }, 90_000)
 
