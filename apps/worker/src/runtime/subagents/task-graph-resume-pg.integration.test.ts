@@ -50,6 +50,7 @@ import { parseNativeVerificationPacket } from "./native-verification-packet.js"
 import { createPgNativeVerificationPort } from "./pg-native-verification-port.js"
 import { readNativeVerificationTerminalProofWithClient } from "./native-verification-pg-readback.js"
 import { TASK_GRAPH_TEMPLATES, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
+import { NESTED_SCOUT_PROFILE_MARKER, templatesForInteractiveScoutDelegation } from "./nested-scout-profile.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { ROLE_RESULT_SCHEMA, RoleResultValidationError, validateRoleResult, type StructuredRoleResult } from "./role-results.js"
 import { createObservedEvidenceIndex, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
@@ -14148,7 +14149,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const rootRuntime = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
-      taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: authorizeUnreservedUsage,
+      taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES }, authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: () => {
         const adapter: ModelAdapter = {
           id: "p3-1219-typed-location-root-fixture", profile,
@@ -14651,7 +14652,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const rootRuntime = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
-      taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES }, authorizeUsage: authorizeUnreservedUsage,
+      taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: authorizeUnreservedUsage,
       modelRuntimeFactory: () => ({ adapter: {
         id: "p3-1240-typed-location-root-fixture", profile,
         async *stream(request) {
@@ -14840,16 +14841,22 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         const replacementNode = loaded.snapshot?.nodes.find(node => node.key === "scout-dublin-replacement")
         const oldTask = await checkpoint.query<{ status: string; role: string; leaseOwner: string | null;
           id: string; attemptCount: number; leaseSegmentStartedAt: Date | null; leaseExpiresAt: Date | null;
-          interruptRequestedAt: Date | null; rootTaskId: string | null; parentTaskId: string | null }>(
+          interruptRequestedAt: Date | null; rootTaskId: string | null; parentTaskId: string | null;
+          allowedActions: unknown; context: unknown }>(
           `SELECT task."id", task."status", task."role", task."attemptCount", task."leaseSegmentStartedAt",
              task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt",
-             task."rootTaskId", task."parentTaskId" FROM "sub_agent_tasks" AS task
+             task."rootTaskId", task."parentTaskId", task."allowedActions", task."context" FROM "sub_agent_tasks" AS task
            JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
            JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
            WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
              AND task."parentTaskId" = $4 AND turn."rootTaskId" = $4 AND session."userId" = $5 AND turn."userId" = $5`,
           [seattleTaskId, value.sessionId, value.turnId, rootTaskId, value.userId])
         const currentSeattleLease = oldTask.rows[0]
+        const nestedScout = templatesForInteractiveScoutDelegation(TASK_GRAPH_TEMPLATES, TASK_GRAPH_TEMPLATES)?.scout
+        const seattleContext = record(currentSeattleLease?.context)
+        expect(seattleContext?.nestedScoutProfile).toBe(NESTED_SCOUT_PROFILE_MARKER)
+        if (!nestedScout) throw new Error("Canonical Scout nested profile was not registered")
+        expect(currentSeattleLease?.allowedActions).toEqual(nestedScout.allowedActions)
         const rootRow = await checkpoint.query<{ allowedActions: unknown }>(
           `SELECT root."allowedActions" FROM "sub_agent_tasks" AS root
            JOIN "agent_sessions" AS session ON session."id" = root."sessionId"
