@@ -880,6 +880,15 @@ const PROCESS_FIXTURE_STEP_STATUSES = new Set([
 ])
 const PROCESS_FIXTURE_TOOL_STATUSES = new Set([...ITEM_DIAGNOSTIC_STATUSES, "interrupted", "none", "other"])
 const PROCESS_FIXTURE_WAIT_OUTPUT_STATUSES = new Set(["waiting", "ready", "timed_out", "none", "other"])
+const SUCCESSIVE_RECOVERY_STAGES = new Set(["candidate_not_seen", "candidate_seen", "session_lock_mismatch", "turn_lock_mismatch",
+  "expiry_preview_rejected", "root_turn_not_recoverable", "task_lock_parity_mismatch", "recovery_clock_missing",
+  "lease_expiry_fence_mismatch", "unsettled_external_call_rejected", "durable_wait_graph_blocked",
+  "task_graph_transition_blocked", "task_graph_finish_blocked", "task_update_rejected"])
+const SUCCESSIVE_WAIT_PROJECTION_STAGES = new Set(["invalid_input", "wait_row_count", "wait_validation", "lease_fence_validation",
+  "wait_timestamp_validation", "timeout_validation", "target_validation", "target_match_validation", "call_result_validation",
+  "call_timestamp_validation", "call_contract_validation", "safe_serialization_validation", "optimistic_update_missed"])
+const SUCCESSIVE_WAIT_PROJECTION_DISPOSITIONS = new Set(["skipped", "repaired", "already_current", "rejected"])
+const SUCCESSIVE_RECOVERY_DISPATCH_FIELDS = ["present", "payloadValid", "task", "session", "root", "owner", "generation", "published"] as const
 const PROCESS_FIXTURE_FAILURE_CATEGORIES = new Set([
   "none", "other", "tool_result_missing", "database_deadlock", "database_serialization", "database_lock_wait",
   "coordination_invalid_input", "coordination_task_not_found", "coordination_scope_error",
@@ -16010,6 +16019,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         ["P3_SUCCESSIVE_REPLAN_CRASH_CUT ", "crash_cut"],
         ["P3_SUCCESSIVE_REPLAN_CONTEXT ", "resume_context"],
         ["P3_SUCCESSIVE_REPLAN_PLAN_ACCEPTED ", "berlin_plan_accepted"],
+        ["P3_SUCCESSIVE_REPLAN_RECOVERY_TRACE ", "dublin_recovery_trace"],
         ["P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED ", "dublin_interrupt_requested"],
         ["P3_SUCCESSIVE_REPLAN_FINAL ", "final"],
         ["P3_SUCCESSIVE_REPLAN_BERLIN_REQUEST ", "berlin_request"],
@@ -16393,6 +16403,44 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         }
         return result
       }
+      const recoveryTracePrefix = "P3_SUCCESSIVE_REPLAN_RECOVERY_TRACE "
+      const recoveryTraceLine = process.output.find(value => value.startsWith(recoveryTracePrefix))
+      let recoveryTrace: RecordValue | null = null
+      if (recoveryTraceLine) {
+        try {
+          const source = record(JSON.parse(recoveryTraceLine.slice(recoveryTracePrefix.length)) as unknown)
+          const dispatch = record(source?.dispatch)
+          const expectedKeys = ["scanCount", "candidateNotSeenScanCount", "candidateSeenScanCount", "targetSeen",
+            "firstTargetSeenRejectionStage", "waitProjectionDisposition", "waitProjectionStage", "childWaitResumable",
+            "waitRegistrationFound", "waitRegistrationRejected", "blockingExternalCall", "dispatch", "malformedTrace"]
+          const exact = !!source && Object.keys(source).length === expectedKeys.length
+            && expectedKeys.every(key => Object.hasOwn(source, key))
+          const projectedDispatch = dispatch && Object.keys(dispatch).length === SUCCESSIVE_RECOVERY_DISPATCH_FIELDS.length
+            && SUCCESSIVE_RECOVERY_DISPATCH_FIELDS.every(key => Object.hasOwn(dispatch, key))
+            ? Object.fromEntries(SUCCESSIVE_RECOVERY_DISPATCH_FIELDS.map(key =>
+              [key, typeof dispatch[key] === "boolean" ? dispatch[key] : null])) : null
+          if (exact && (source!.dispatch === null || projectedDispatch !== null)) {
+            const nullableEnum = (value: unknown, allowed: ReadonlySet<string>) => value === null
+              ? null : diagnosticEnum(value, allowed) ?? "other"
+            const nullableBoolean = (value: unknown) => typeof value === "boolean" ? value : null
+            recoveryTrace = {
+              scanCount: diagnosticBoundedCount(source!.scanCount),
+              candidateNotSeenScanCount: diagnosticBoundedCount(source!.candidateNotSeenScanCount),
+              candidateSeenScanCount: diagnosticBoundedCount(source!.candidateSeenScanCount),
+              targetSeen: nullableBoolean(source!.targetSeen),
+              firstTargetSeenRejectionStage: nullableEnum(source!.firstTargetSeenRejectionStage, SUCCESSIVE_RECOVERY_STAGES),
+              waitProjectionDisposition: nullableEnum(source!.waitProjectionDisposition, SUCCESSIVE_WAIT_PROJECTION_DISPOSITIONS),
+              waitProjectionStage: nullableEnum(source!.waitProjectionStage, SUCCESSIVE_WAIT_PROJECTION_STAGES),
+              childWaitResumable: nullableBoolean(source!.childWaitResumable),
+              waitRegistrationFound: nullableBoolean(source!.waitRegistrationFound),
+              waitRegistrationRejected: nullableBoolean(source!.waitRegistrationRejected),
+              blockingExternalCall: nullableBoolean(source!.blockingExternalCall),
+              dispatch: projectedDispatch,
+              malformedTrace: source!.malformedTrace === true,
+            }
+          }
+        } catch { /* omit malformed fixture diagnostics */ }
+      }
       const seattleRetirement = seattleTaskId
         ? await readRetirement(seattleTaskId, "scout-seattle").catch(() => null) : false
       const dublinRetirement = isBerlin && dublinTaskId
@@ -16481,6 +16529,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         })),
         seattleRetirementReceiptPresent: seattleRetirement,
         dublinRetirementReceiptPresent: dublinRetirement,
+        successiveRecoveryTrace: recoveryTrace,
         observedMarkers: observedMarkers.slice(0, 8),
         berlinRequestMarker: projectMarker("P3_SUCCESSIVE_REPLAN_BERLIN_REQUEST ",
           ["requestEntered", "freshSteeringCuePresent", "berlinScopePresent", "listToolAvailable"]),
@@ -16627,7 +16676,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           dublinBeforeRestart.leaseOwner, value.userId])
       if (expiredDublinLease.rowCount !== 1) throw new Error("Exact killed Dublin lease was not expired for normal reclaim")
 
-      resumeWorker = startTaskGraphRestartWorker("resume-successive-replan", { ...fixtureInput, dublinAttemptBeforeRestart }, workerEnv)
+      resumeWorker = startTaskGraphRestartWorker("resume-successive-replan", { ...fixtureInput, dublinAttemptBeforeRestart }, {
+        ...workerEnv, NODE_ENV: "test", AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID: dublinTaskId,
+      })
       const context = await waitForProcessLine(resumeWorker, "P3_SUCCESSIVE_REPLAN_CONTEXT ", 90_000)
       assertMarker(context, "P3_SUCCESSIVE_REPLAN_CONTEXT ",
         { unresolvedSteeringCuePresent: true, berlinScopePresent: true, priorRetirementPresent: true, planToolAvailable: true,

@@ -84,6 +84,8 @@ let stdinBuffer = ""
 let initialWaitLineage = null
 let archivedWaitChildProgress = 0
 let successiveSeattleSearchHeld = false
+let successiveRecoveryTrace
+let successiveRecoveryTraceEmitted = false
 const successiveChildLeases = new Map()
 let successiveRootLease = null
 const queuedCommands = []
@@ -98,6 +100,65 @@ function onStdinData(chunk) {
 }
 process.stdin.on("data", onStdinData)
 function say(value) { process.stdout.write(value + "\n") }
+const SUCCESSIVE_RECOVERY_TRACE_PREFIX = "WORKER_B_RECOVERY_PREDICATE_TRACE "
+const SUCCESSIVE_RECOVERY_STAGES = new Set(["candidate_not_seen", "candidate_seen", "session_lock_mismatch", "turn_lock_mismatch",
+  "expiry_preview_rejected", "root_turn_not_recoverable", "task_lock_parity_mismatch", "recovery_clock_missing",
+  "lease_expiry_fence_mismatch", "unsettled_external_call_rejected", "durable_wait_graph_blocked",
+  "task_graph_transition_blocked", "task_graph_finish_blocked", "task_update_rejected"])
+const SUCCESSIVE_WAIT_PROJECTION_STAGES = new Set(["invalid_input", "wait_row_count", "wait_validation", "lease_fence_validation",
+  "wait_timestamp_validation", "timeout_validation", "target_validation", "target_match_validation", "call_result_validation",
+  "call_timestamp_validation", "call_contract_validation", "safe_serialization_validation", "optimistic_update_missed"])
+const SUCCESSIVE_WAIT_PROJECTION_DISPOSITIONS = new Set(["skipped", "repaired", "already_current", "rejected"])
+const SUCCESSIVE_DISPATCH_KEYS = ["present", "payloadValid", "task", "session", "root", "owner", "generation", "published"]
+function boundedRecoveryCount(value) { return Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 10_000) : 0 }
+function recoveryTraceBoolean(value) { return typeof value === "boolean" ? value : null }
+function armSuccessiveRecoveryTrace() {
+  const target = process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID
+  if (mode !== "resume-successive-replan" || process.env.NODE_ENV !== "test"
+    || typeof target !== "string" || !target || target.length > 256) return
+  successiveRecoveryTrace = { scanCount: 0, candidateNotSeenScanCount: 0, candidateSeenScanCount: 0,
+    targetSeen: false, firstTargetSeenRejectionStage: null, waitProjectionDisposition: null,
+    waitProjectionStage: null, childWaitResumable: null, waitRegistrationFound: null,
+    waitRegistrationRejected: null, blockingExternalCall: null, dispatch: null, malformedTrace: false }
+  const originalInfo = console.info.bind(console)
+  console.info = (...args) => {
+    const line = args[0]
+    if (typeof line !== "string" || !line.startsWith(SUCCESSIVE_RECOVERY_TRACE_PREFIX)) return originalInfo(...args)
+    try {
+      const source = record(JSON.parse(line.slice(SUCCESSIVE_RECOVERY_TRACE_PREFIX.length)))
+      const stage = source && SUCCESSIVE_RECOVERY_STAGES.has(source.rejectionStage) ? source.rejectionStage : null
+      const pages = source && Array.isArray(source.pages) ? source.pages : null
+      if (!source || !stage || !pages || pages.length > 16) { successiveRecoveryTrace.malformedTrace = true; return }
+      const targetSeen = pages.some(page => record(page)?.targetSeen === true)
+      successiveRecoveryTrace.scanCount = boundedRecoveryCount(successiveRecoveryTrace.scanCount + 1)
+      if (targetSeen) {
+        successiveRecoveryTrace.targetSeen = true
+        successiveRecoveryTrace.candidateSeenScanCount = boundedRecoveryCount(successiveRecoveryTrace.candidateSeenScanCount + 1)
+        if (successiveRecoveryTrace.firstTargetSeenRejectionStage === null) {
+          successiveRecoveryTrace.firstTargetSeenRejectionStage = stage
+          successiveRecoveryTrace.waitProjectionDisposition = SUCCESSIVE_WAIT_PROJECTION_DISPOSITIONS.has(source.waitProjectionDisposition)
+            ? source.waitProjectionDisposition : "other"
+          successiveRecoveryTrace.waitProjectionStage = SUCCESSIVE_WAIT_PROJECTION_STAGES.has(source.waitProjectionStage)
+            ? source.waitProjectionStage : source.waitProjectionStage === undefined ? null : "other"
+          successiveRecoveryTrace.childWaitResumable = recoveryTraceBoolean(source.childWaitResumable)
+          successiveRecoveryTrace.waitRegistrationFound = recoveryTraceBoolean(source.waitRegistrationFound)
+          successiveRecoveryTrace.waitRegistrationRejected = recoveryTraceBoolean(source.waitRegistrationRejected)
+          successiveRecoveryTrace.blockingExternalCall = recoveryTraceBoolean(source.blockingExternalCall)
+          const dispatch = record(source.dispatch)
+          successiveRecoveryTrace.dispatch = dispatch ? Object.fromEntries(SUCCESSIVE_DISPATCH_KEYS.map(key =>
+            [key, recoveryTraceBoolean(dispatch[key])])) : null
+        }
+      } else if (stage === "candidate_not_seen") {
+        successiveRecoveryTrace.candidateNotSeenScanCount = boundedRecoveryCount(successiveRecoveryTrace.candidateNotSeenScanCount + 1)
+      }
+    } catch { successiveRecoveryTrace.malformedTrace = true }
+  }
+}
+function emitSuccessiveRecoveryTrace() {
+  if (!successiveRecoveryTrace || successiveRecoveryTraceEmitted) return
+  successiveRecoveryTraceEmitted = true
+  say("P3_SUCCESSIVE_REPLAN_RECOVERY_TRACE " + JSON.stringify(successiveRecoveryTrace))
+}
 function noReservationUsageAuthorization() {
   return {
     outputReservationRequired: false,
@@ -1734,6 +1795,7 @@ async function waitForSuccessiveDublinReclaim(rootTaskId, taskId, priorAttempt, 
       && row.interruptRequestedAt === null) return row
     await sleep(25)
   }
+  emitSuccessiveRecoveryTrace()
   throw new Error("p3_successive_replan_dublin_not_reclaimed")
 }
 async function countSuccessiveBerlinPlans(rootTaskId) {
@@ -2096,6 +2158,7 @@ async function waitForSuccessiveTurnCompletion(rootTaskId, timeoutMs = 120_000) 
   throw new Error("p3_successive_replan_turn_not_completed")
 }
 async function runSuccessiveReplanWorker(resume) {
+  if (resume) armSuccessiveRecoveryTrace()
   const ownerId = "p3-process-restart-successive-worker-" + process.pid
   const calls = successiveWaitIds(ids)
   const runtime = await startSuccessiveReplanRuntime(ownerId, resume, calls)
