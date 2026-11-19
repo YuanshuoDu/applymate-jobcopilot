@@ -8,6 +8,7 @@ import type { ExecutionOwner } from "../execution-owner.js"
 import { InMemoryToolLifecycleSink, ToolLifecycle, type LifecycleCall } from "./lifecycle.js"
 import { createToolResultReferenceRepository } from "./tool-result-reference-repo.js"
 import { redactJobReadOutput } from "./job-read-output-redaction.js"
+import { prepareScoutResultsOutput } from "./scout-results-output-redaction.js"
 import { InMemoryToolResultReferenceStore, prepareLifecycleValue } from "./redaction.js"
 import { createToolResultsReadTool } from "./tool-results-read-tool.js"
 import { ToolRegistry } from "./registry.js"
@@ -211,6 +212,34 @@ function durableLifecyclePool(sourceCallId: string) {
 }
 
 describe("ToolLifecycle", () => {
+  it("returns and records only verified nested Scout candidate Job IDs", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const scoutResultsCall: LifecycleCall = { ...call, toolName: "scout.results", taskId: "parent-1", rootTaskId: "root-1" }
+    const raw = { availability: "available", children: [{ taskId: "child-1", status: "completed",
+      candidates: [{ jobId: numericUuidV4, source: "greenhouse" }] }] }
+    const expected = prepareScoutResultsOutput(raw)
+    const returned = await lifecycle.completed(scoutResultsCall, raw)
+    expect(expected).not.toBeNull()
+    expect(returned).toEqual(expected)
+    expect(returned).toMatchObject({ children: [{ candidates: [{ jobId: numericUuidV4 }] }] })
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output: returned })
+    expect(sink.events[0]?.payload.output).toEqual(returned)
+  })
+
+  it("keeps malformed Scout results on generic redaction", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const scoutResultsCall: LifecycleCall = { ...call, toolName: "scout.results", taskId: "parent-1", rootTaskId: "root-1" }
+    const raw = { availability: "available", children: [{ taskId: "child-1", status: "completed",
+      candidates: [{ jobId: numericUuidV4, source: "greenhouse" }] }], unverified: numericUuidV4 }
+    expect(prepareScoutResultsOutput(raw)).toBeNull()
+    const returned = await lifecycle.completed(scoutResultsCall, raw)
+    expect(returned).toEqual(prepareLifecycleValue(raw).safe)
+    expect(returned).toMatchObject({ children: [{ candidates: [{ jobId: "[REDACTED_PHONE]" }] }] })
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output: returned })
+    expect(sink.events[0]?.payload.output).toEqual(returned)
+  })
   it("emits replayable started, progress, and result Items without raw sensitive data", async () => {
     const sink = new InMemoryToolLifecycleSink()
     const lifecycle = new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore(), now: () => "2026-08-31T12:00:00.000Z" })

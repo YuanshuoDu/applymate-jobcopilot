@@ -52,6 +52,24 @@ async function resumeDiscovery(output: unknown, callId: string) {
   return { sink, observations: buildChildResumeObservations(lifecycleRows(sink, call), resumeLease).observations }
 }
 
+function scoutResultsOutput(jobId: string) {
+  return { availability: "available", children: [{ taskId: "subagent-grandchild", status: "completed",
+    candidates: [{ jobId, source: "greenhouse" }] }] }
+}
+
+function resumedToolOutput(output: unknown, toolName = "scout.results", callStatus = "completed"): RepositoryJsonValue {
+  const common = { sessionId: resumeLease.sessionId, turnId: resumeLease.turnId, taskId: resumeLease.id, rootTaskId: resumeLease.rootTaskId,
+    stepId: "step-1", attempt: 1, ordinal: 1 }
+  const rows = [
+    { ...common, id: "scout-results-call", revision: 1, type: "tool_call", status: callStatus,
+      content: { toolCallId: "scout-results-call", toolName, input: {} } },
+    { ...common, id: "scout-results-result", revision: 2, type: "tool_result", status: "completed",
+      content: { toolCallId: "scout-results-call", output, errorCode: null } },
+  ]
+  const content = buildChildResumeObservations(rows, resumeLease).observations[0]?.content as Record<string, unknown>
+  return content.output as RepositoryJsonValue
+}
+
 function lifecycleRows(sink: InMemoryToolLifecycleSink, call: LifecycleCall, ordinal = 0) {
   return sink.replay().map(({ item }, revision) => ({
     id: item.id, revision, sessionId: item.sessionId, turnId: item.turnId, taskId: call.taskId, rootTaskId: call.rootTaskId,
@@ -63,6 +81,22 @@ function lifecycleRows(sink: InMemoryToolLifecycleSink, call: LifecycleCall, ord
 }
 
 describe("durable child wait resume observation", () => {
+  it("restores canonical candidate IDs only from a validated completed scout.results pair", () => {
+    expect(redactSensitiveText(NUMERIC_UUID)).not.toBe(NUMERIC_UUID)
+    const restored = resumedToolOutput(scoutResultsOutput(NUMERIC_UUID))
+    expect(restored).toEqual(scoutResultsOutput(NUMERIC_UUID))
+
+    const malformed = { ...scoutResultsOutput(NUMERIC_UUID), extra: "not part of the closed result shape" }
+    for (const output of [
+      resumedToolOutput(malformed),
+      resumedToolOutput(scoutResultsOutput(NUMERIC_UUID), "scout.delegate"),
+      resumedToolOutput(scoutResultsOutput(NUMERIC_UUID), "scout.results", "started"),
+    ]) {
+      expect(JSON.stringify(output)).not.toContain(NUMERIC_UUID)
+      expect(JSON.stringify(output)).toContain("[REDACTED_PHONE]")
+    }
+  })
+
   it("preserves strict canonical discovery IDs through lifecycle, resume, and hydration", async () => {
     expect(redactSensitiveText(NUMERIC_UUID)).not.toBe(NUMERIC_UUID)
     expect(redactSensitiveText(ORDINARY_UUID)).toBe(ORDINARY_UUID)
