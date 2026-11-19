@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from "node:crypto"
+import { spawn, type ChildProcess } from "node:child_process"
 import { createRequire } from "node:module"
+import { createServer, type Server } from "node:http"
+import { fileURLToPath } from "node:url"
 import { Queue, Worker, type Job } from "bullmq"
 import Redis from "ioredis"
 import { Pool } from "pg"
@@ -63,7 +66,7 @@ import { SCHEDULED_POST_GATE_AUDIT_CRITERIA, SCHEDULED_POST_GATE_AUDIT_GOAL,
   parseScheduledPostGateHandoff, SCHEDULED_POST_GATE_HANDOFF_EVENT } from "./scheduled-post-gate-contract.js"
 import { scheduledPostGateTaskTemplates } from "./scheduled-post-gate-task-templates.js"
 import { parseSubagentDispatchJobId } from "./dispatch-identity.js"
-import { dispatchPendingSubagentOutbox, type SubagentExecutor, type SubagentQueueLike } from "../../queue/subagent-queue.js"
+import { dispatchPendingSubagentOutbox, persistSubagentDispatch, type SubagentExecutor, type SubagentQueueLike } from "../../queue/subagent-queue.js"
 import type { SubagentJobPayload } from "./types.js"
 import { runSubagentQueueJob } from "../../queue/subagent-pause-dispatch.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
@@ -108,6 +111,14 @@ type FixtureWebDatabase = Readonly<{ db: {
   $transaction<T>(work: (tx: unknown) => Promise<T>): Promise<T>
   customAgentRole: { findMany(args: unknown): Promise<readonly unknown[]> }
 } }>
+type MaterialRecoveryProcessConfig = Readonly<{ queueName: string; userId: string; sessionId: string; turnId: string;
+  rootTaskId: string; taskId: string; prepareTaskId: string; webUrl: string }>
+type MaterialRecoveryMarker = Readonly<Record<string, unknown>>
+type MaterialRecoveryMarkerWaiter = { marker: string; resolve(value: MaterialRecoveryMarker): void; reject(error: Error): void;
+  timer: ReturnType<typeof setTimeout> }
+type MaterialRecoveryProcessHandle = { child: ChildProcess; buffered: Array<{ marker: string; value: MaterialRecoveryMarker }>;
+  waiters: MaterialRecoveryMarkerWaiter[]; partial: string; failure: Error | null }
+type MaterialRecoveryWebBridge = Readonly<{ url: string; server: Server; close(): Promise<void> }>
 type SourceWriterRaceProbe = {
   jobId: string
   updateApplied: ReturnType<typeof testBarrier>
@@ -271,6 +282,137 @@ const scheduledApiHelpersPath = "@/lib/api-helpers"
 const recoveryAuthModulePath = "@/lib/auth"
 const recoveryInterruptRoutePath = "@/app/api/agent/sessions/[id]/turns/[turnId]/interrupt/route"
 const recoveryRunNowRoutePath = "@/app/api/agent/automations/[id]/run/route"
+const materialRecoveryProcessFixturePath = fileURLToPath(new URL("./scheduled-material-drift-process-restart.fixture.mjs", import.meta.url))
+const MATERIAL_RECOVERY_PROCESS_MODE = process.env.AGENT_MATERIAL_DRIFT_PROCESS_RESTART === "true"
+const MATERIAL_RECOVERY_LEASE_MS = 10_000
+const MATERIAL_RECOVERY_HEARTBEAT_MS = 2_000
+const MATERIAL_RECOVERY_BRIDGE_PATH = "/api/internal/agent-runtime/scheduled-pipeline"
+const MATERIAL_RECOVERY_BRIDGE_MAX_BYTES = 64_000
+if (MATERIAL_RECOVERY_PROCESS_MODE && (!databaseUrl || !redisUrl || process.env.CI !== "true"
+  || process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true" || process.env.AGENT_TURN_REDIS_TEST_DISPOSABLE !== "true")) {
+  throw new Error("material_recovery_process_restart_requires_guarded_disposable_services")
+}
+
+async function startMaterialRecoveryWebBridge(fetcher: typeof fetch, workerSecret: string): Promise<MaterialRecoveryWebBridge> {
+  const server = createServer((request, response) => {
+    void (async () => {
+      if (request.method !== "POST" || request.url !== MATERIAL_RECOVERY_BRIDGE_PATH) {
+        request.resume(); response.writeHead(404).end(); return
+      }
+      if (request.headers["x-agent-worker-secret"] !== workerSecret
+        || !/^application\/json(?:\s*;|$)/i.test(request.headers["content-type"] ?? "")) {
+        request.resume(); response.writeHead(401).end(); return
+      }
+      const chunks: Buffer[] = []; let size = 0; let oversized = false
+      for await (const chunk of request) {
+        const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+        size += value.length
+        if (size > MATERIAL_RECOVERY_BRIDGE_MAX_BYTES) { oversized = true; chunks.length = 0 }
+        else if (!oversized) chunks.push(value)
+      }
+      if (oversized || size === 0) { response.writeHead(413).end(); return }
+      const routed = await fetcher(new Request(`http://scheduled-audit-fixture.invalid${MATERIAL_RECOVERY_BRIDGE_PATH}`, {
+        method: "POST", headers: { "content-type": request.headers["content-type"] ?? "application/json",
+          "x-agent-worker-secret": workerSecret }, body: Buffer.concat(chunks),
+      }))
+      const body = Buffer.from(await routed.arrayBuffer())
+      response.writeHead(routed.status, { "content-type": routed.headers.get("content-type") ?? "application/json" }).end(body)
+    })().catch(() => { if (!response.headersSent) response.writeHead(500).end(); else response.destroy() })
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolve)
+  })
+  const address = server.address()
+  if (!address || typeof address === "string") throw new Error("material_recovery_web_bridge_unavailable")
+  return { server, url: `http://127.0.0.1:${address.port}`, close: () => new Promise((resolve, reject) => {
+    server.close(error => error ? reject(error) : resolve())
+  }) }
+}
+
+function startMaterialRecoveryProcess(mode: "crash" | "resume", config: MaterialRecoveryProcessConfig): MaterialRecoveryProcessHandle {
+  const child = spawn(process.execPath, ["--import", "tsx", materialRecoveryProcessFixturePath,
+    JSON.stringify({ mode, ...config })], { cwd: process.cwd(), env: { ...process.env, AGENT_WEB_URL: config.webUrl },
+    stdio: ["pipe", "pipe", "pipe"] })
+  const handle: MaterialRecoveryProcessHandle = { child, buffered: [], waiters: [], partial: "", failure: null }
+  child.stdout?.on("data", chunk => collectMaterialRecoveryOutput(handle, String(chunk)))
+  child.stderr?.on("data", () => undefined)
+  child.once("error", () => failMaterialRecoveryWaiters(handle, new Error("material_recovery_worker_spawn_failed")))
+  child.once("exit", (code, signal) => {
+    if (handle.waiters.length) failMaterialRecoveryWaiters(handle,
+      new Error(`material_recovery_worker_exit_${code ?? signal ?? "unknown"}`))
+  })
+  return handle
+}
+
+function collectMaterialRecoveryOutput(handle: MaterialRecoveryProcessHandle, chunk: string): void {
+  const lines = `${handle.partial}${chunk}`.split(/\r?\n/)
+  handle.partial = lines.pop() ?? ""
+  for (const line of lines) {
+    const match = /^([A-Z_]+) (\{.*\})$/.exec(line)
+    if (!match) continue
+    let value: MaterialRecoveryMarker
+    try { const parsed: unknown = JSON.parse(match[2]!); value = debugRecord(parsed) ?? {} }
+    catch { failMaterialRecoveryWaiters(handle, new Error("material_recovery_worker_marker_invalid")); continue }
+    if (match[1] === "ERROR") {
+      const code = typeof value.code === "string" && /^[a-z0-9_]{1,100}$/.test(value.code) ? value.code : "failed"
+      handle.failure = new Error(`material_recovery_worker_${code}`)
+      failMaterialRecoveryWaiters(handle, handle.failure)
+      continue
+    }
+    const waiterIndex = handle.waiters.findIndex(waiter => waiter.marker === match[1])
+    if (waiterIndex < 0) { handle.buffered.push({ marker: match[1]!, value }); continue }
+    const [waiter] = handle.waiters.splice(waiterIndex, 1)
+    clearTimeout(waiter!.timer); waiter!.resolve(value)
+  }
+}
+
+function failMaterialRecoveryWaiters(handle: MaterialRecoveryProcessHandle, error: Error): void {
+  for (const waiter of handle.waiters.splice(0)) { clearTimeout(waiter.timer); waiter.reject(error) }
+}
+
+function nextMaterialRecoveryMarker(handle: MaterialRecoveryProcessHandle, marker: string, timeoutMs = 30_000): Promise<MaterialRecoveryMarker> {
+  const index = handle.buffered.findIndex(item => item.marker === marker)
+  if (index >= 0) return Promise.resolve(handle.buffered.splice(index, 1)[0]!.value)
+  if (handle.failure) return Promise.reject(handle.failure)
+  return new Promise((resolve, reject) => {
+    const waiter: MaterialRecoveryMarkerWaiter = { marker, resolve, reject,
+      timer: setTimeout(() => {
+        const index = handle.waiters.indexOf(waiter)
+        if (index >= 0) handle.waiters.splice(index, 1)
+        reject(new Error(`material_recovery_worker_marker_timeout_${marker.toLowerCase()}`))
+      }, timeoutMs) }
+    handle.waiters.push(waiter)
+  })
+}
+
+async function stopMaterialRecoveryProcess(handle: MaterialRecoveryProcessHandle | undefined, signal: NodeJS.Signals = "SIGKILL"): Promise<void> {
+  if (!handle) return
+  const child = handle.child
+  if (child.exitCode === null && child.signalCode === null) {
+    const exited = waitForMaterialRecoveryProcessExit(handle)
+    if (!child.kill(signal)) throw new Error("material_recovery_worker_kill_rejected")
+    const result = await exited
+    if (result.signal !== signal) throw new Error("material_recovery_worker_exit_signal_mismatch")
+  } else if (signal === "SIGKILL" && child.signalCode !== "SIGKILL") {
+    throw new Error("material_recovery_worker_was_not_killed")
+  }
+}
+
+function waitForMaterialRecoveryProcessExit(handle: MaterialRecoveryProcessHandle, timeoutMs = 30_000): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  const { child } = handle
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve({ code: child.exitCode, signal: child.signalCode })
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("material_recovery_worker_exit_timeout")), timeoutMs)
+    child.once("exit", (code, signal) => { clearTimeout(timer); resolve({ code, signal }) })
+  })
+}
+
+function allowMaterialRecoveryGate(handle: MaterialRecoveryProcessHandle): void {
+  if (!handle.child.stdin || handle.child.stdin.destroyed) throw new Error("material_recovery_worker_stdin_unavailable")
+  handle.child.stdin.end("ALLOW_GATE\n")
+}
+
 let pool: Pool | undefined
 let runner: Runner | undefined
 let disconnectWebDatabase: (() => Promise<void>) | undefined
@@ -735,7 +877,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(approvals.rows[0]?.count ?? 0).toBe(0)
   }, 120_000)
 
-  it("routes a stopped drift through fresh Run Now proof after a same-process Worker-instance restart", async () => {
+  it("routes a stopped drift through fresh Run Now proof after a Worker restart", async () => {
     let recoveryChildAdapterDiagnostic: string | null = null
     const nativeVerificationTrace: string[] = []
     const rootCompletionTrace: string[] = []
@@ -861,6 +1003,9 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     let turnQueue: Queue | undefined
     let childQueue: Queue<SubagentJobPayload> | undefined
     let childWorker: Worker<SubagentJobPayload, unknown> | undefined
+    let recoveryWebBridge: MaterialRecoveryWebBridge | undefined
+    let crashedRecoveryProcess: MaterialRecoveryProcessHandle | undefined
+    let resumedRecoveryProcess: MaterialRecoveryProcessHandle | undefined
     let redis: Redis | undefined
     let childRedis: Redis | undefined
     let runJob: Promise<unknown> | undefined
@@ -931,7 +1076,9 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       ])
       const productionChild = await import("./production-child-runtime.js")
       const gateRuntime = await import("./scheduled-gate-child-runtime.js")
-      let manager = new AgentTreeManager(new PgSubagentTaskStore(pool as never))
+      let manager = new AgentTreeManager(new PgSubagentTaskStore(pool as never,
+        MATERIAL_RECOVERY_PROCESS_MODE ? MATERIAL_RECOVERY_LEASE_MS : 60_000),
+      MATERIAL_RECOVERY_PROCESS_MODE ? { heartbeatMs: MATERIAL_RECOVERY_HEARTBEAT_MS } : {})
       const childModelRuntimeFactory = ({ task }: { task: { id: string; role: string; attemptCount: number } }): ModelAdapter => {
         let round = 0
         const jobReadCallId = `fresh-job-read-${task.id}-${task.attemptCount}`
@@ -1504,15 +1651,106 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       const originalPrepareResult = originalPrepare.rows[0]!.result
       expect(await loadPersistedScheduledPrepareProof(pool as never, scope, fixture.ids.prepareTaskId,
         originalPrepareResult, beforeRestartAnalyzeKey, beforeRestartReceipt.prepareWaitId)).toBeNull()
-      const previousChildWorker = childWorker
-      await previousChildWorker.close()
-      manager = new AgentTreeManager(new PgSubagentTaskStore(pool as never))
-      childWorker = createChildWorker()
-      expect(childWorker).not.toBe(previousChildWorker)
-      expect(childWorkerGeneration).toBe(2)
-      await childWorker.waitUntilReady()
-      await childQueue.resume()
-      gateDispatchQueuePaused = false
+      if (MATERIAL_RECOVERY_PROCESS_MODE) {
+        recoveryWebBridge = await startMaterialRecoveryWebBridge(response.fetcher, process.env.AGENT_WORKER_SECRET ?? "")
+        const processConfig: MaterialRecoveryProcessConfig = { queueName: childQueueName, userId: fixture.ids.userId,
+          sessionId: fixture.ids.sessionId, turnId: recoveryTurnId, rootTaskId: rootTaskId!, taskId: freshGateTaskId,
+          prepareTaskId: beforeRestartPrepare.id, webUrl: recoveryWebBridge.url }
+        const previousChildWorker = childWorker
+        await previousChildWorker.close()
+        childWorker = undefined
+        crashedRecoveryProcess = startMaterialRecoveryProcess("crash", processConfig)
+        expect(await nextMaterialRecoveryMarker(crashedRecoveryProcess, "READY")).toMatchObject({ mode: "crash" })
+        await childQueue.resume()
+        gateDispatchQueuePaused = false
+        const crashCut = await nextMaterialRecoveryMarker(crashedRecoveryProcess, "CRASH_CUT")
+        expect(crashCut).toMatchObject({ taskScopeMatches: true, freshPrepareProof: true })
+        const gateAtCrash = await pool!.query<{ status: string; attemptCount: number; role: string; taskType: string;
+          sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string; userId: string; leaseOwner: string | null;
+          leaseExpiresAt: Date | null }>(`SELECT task."status", task."attemptCount", task."role", task."taskType", task."sessionId",
+            task."turnId", task."rootTaskId", task."parentTaskId", session."userId", task."leaseOwner", task."leaseExpiresAt"
+          FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id"=task."sessionId"
+          JOIN "agent_turns" turn ON turn."id"=task."turnId" AND turn."sessionId"=task."sessionId"
+            AND turn."userId"=session."userId" AND turn."rootTaskId"=task."rootTaskId"
+          WHERE task."id"=$1 AND task."sessionId"=$2 AND task."turnId"=$3 AND task."rootTaskId"=$4 AND session."userId"=$5`,
+        [freshGateTaskId, fixture.ids.sessionId, recoveryTurnId, rootTaskId, fixture.ids.userId])
+        expect(gateAtCrash.rows).toHaveLength(1)
+        const crashedLease = gateAtCrash.rows[0]!
+        expect(crashedLease).toMatchObject({ status: "running", role: "prepare", taskType: SCHEDULED_GATE_TASK_TYPE,
+          sessionId: fixture.ids.sessionId, turnId: recoveryTurnId, rootTaskId, parentTaskId: rootTaskId, userId: fixture.ids.userId })
+        expect(crashedLease.attemptCount).toBe(crashCut.attemptCount)
+        expect(typeof crashedLease.leaseOwner).toBe("string")
+        expect(crashedLease.leaseExpiresAt).toBeInstanceOf(Date)
+        if (!crashedLease.leaseOwner || !crashedLease.leaseExpiresAt) throw new Error("fresh Gate process crash lease missing")
+        expect(response.gateCalls()).toBe(0)
+        await stopMaterialRecoveryProcess(crashedRecoveryProcess)
+        crashedRecoveryProcess = undefined
+
+        const expiryRecovery = await import("./pg-store-expiry-recovery.js")
+        const recoveryDeadline = Date.now() + 20_000
+        let recoveredGate = false
+        while (Date.now() < recoveryDeadline && !recoveredGate) {
+          const expired = await pool!.query<{ expired: boolean }>(`SELECT "leaseExpiresAt" <= clock_timestamp() AS "expired"
+            FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3 AND "status"='running'
+              AND "leaseOwner"=$4`, [freshGateTaskId, fixture.ids.sessionId, recoveryTurnId, crashedLease.leaseOwner])
+          if (expired.rows[0]?.expired === true) {
+            const rows = await expiryRecovery.recoverExpired(pool as never, { now: new Date(), limit: 10,
+              sessionId: fixture.ids.sessionId, turnId: recoveryTurnId })
+            const recoveredTask = rows.find(task => task.id === freshGateTaskId && task.status === "queued")
+            if (recoveredTask) {
+              await persistSubagentDispatch(pool as never, { taskId: recoveredTask.id, sessionId: recoveredTask.sessionId,
+                rootTaskId: recoveredTask.rootTaskId ?? rootTaskId!, ownerId: `recovery-${randomUUID()}` }, true)
+              const pending = await pool!.query<{ idempotencyKey: string }>(`SELECT "idempotencyKey" FROM "agent_outbox"
+                WHERE "topic"='agent.subagent.dispatch' AND "aggregateId"=$1 AND "publishedAt" IS NULL`, [fixture.ids.sessionId])
+              expect(pending.rows.map(row => row.idempotencyKey)).toEqual([`subagent-dispatch:${freshGateTaskId}`])
+              const dispatched = await dispatchPendingSubagentOutbox(pool as never, childQueue!, 1, fixture.ids.sessionId)
+              expect(dispatched).toBe(1)
+              recoveredGate = true
+              const published = await pool!.query<{ publishedAt: Date | null }>(`SELECT "publishedAt" FROM "agent_outbox"
+                WHERE "topic"='agent.subagent.dispatch' AND "aggregateId"=$1 AND "idempotencyKey"=$2`,
+              [fixture.ids.sessionId, `subagent-dispatch:${freshGateTaskId}`])
+              expect(published.rows).toEqual([{ publishedAt: expect.any(Date) }])
+            }
+          } else await new Promise(resolve => setTimeout(resolve, 100))
+        }
+        if (!recoveredGate) throw new Error("expired fresh Gate claim was not recovered for the exact Turn")
+        const queuedGateAfterRecovery = await pool!.query<{ status: string; attemptCount: number; leaseOwner: string | null }>(`SELECT "status", "attemptCount", "leaseOwner"
+          FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3 AND "rootTaskId"=$4`,
+        [freshGateTaskId, fixture.ids.sessionId, recoveryTurnId, rootTaskId])
+        expect(queuedGateAfterRecovery.rows).toEqual([{ status: "queued", attemptCount: crashedLease.attemptCount, leaseOwner: null }])
+
+        resumedRecoveryProcess = startMaterialRecoveryProcess("resume", processConfig)
+        expect(await nextMaterialRecoveryMarker(resumedRecoveryProcess, "READY")).toMatchObject({ mode: "resume" })
+        const reclaimed = await nextMaterialRecoveryMarker(resumedRecoveryProcess, "RECLAIMED")
+        expect(reclaimed).toMatchObject({ taskScopeMatches: true, freshPrepareProof: true })
+        expect(reclaimed.attemptCount).toBeGreaterThan(crashedLease.attemptCount)
+        const reboundGate = await pool!.query<{ status: string; attemptCount: number; leaseOwner: string | null; taskType: string;
+          turnId: string; rootTaskId: string; parentTaskId: string }>(`SELECT "status", "attemptCount", "leaseOwner", "taskType", "turnId", "rootTaskId", "parentTaskId"
+          FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3 AND "rootTaskId"=$4`,
+        [freshGateTaskId, fixture.ids.sessionId, recoveryTurnId, rootTaskId])
+        expect(reboundGate.rows).toHaveLength(1)
+        expect(reboundGate.rows[0]).toMatchObject({ status: "running", attemptCount: reclaimed.attemptCount,
+          taskType: SCHEDULED_GATE_TASK_TYPE, turnId: recoveryTurnId, rootTaskId, parentTaskId: rootTaskId })
+        expect(typeof reboundGate.rows[0]?.leaseOwner).toBe("string")
+        expect(reboundGate.rows[0]?.leaseOwner).not.toBe(crashedLease.leaseOwner)
+        allowMaterialRecoveryGate(resumedRecoveryProcess)
+        expect(await nextMaterialRecoveryMarker(resumedRecoveryProcess, "GATE_HTTP")).toMatchObject({ status: 200 })
+        await nextMaterialRecoveryMarker(resumedRecoveryProcess, "TASK_FINISHED")
+        expect(await waitForMaterialRecoveryProcessExit(resumedRecoveryProcess)).toEqual({ code: 0, signal: null })
+        resumedRecoveryProcess = undefined
+        await recoveryWebBridge.close()
+        recoveryWebBridge = undefined
+      } else {
+        const previousChildWorker = childWorker
+        await previousChildWorker.close()
+        manager = new AgentTreeManager(new PgSubagentTaskStore(pool as never))
+        childWorker = createChildWorker()
+        expect(childWorker).not.toBe(previousChildWorker)
+        expect(childWorkerGeneration).toBe(2)
+        await childWorker.waitUntilReady()
+        await childQueue.resume()
+        gateDispatchQueuePaused = false
+      }
       expect(modelStateJson).not.toContain(String(originalSourceMarker?.proofDigest))
       expect(modelStateJson).not.toContain(JSON.stringify(originalSourceMarker))
       expect(modelRequestJson.length).toBeGreaterThanOrEqual(2)
@@ -1667,6 +1905,9 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       [[fixture.ids.turnId, recoveryTurnId], fixture.ids.sessionId, fixture.ids.userId, currentJob.id])
       expect(noSubmission.rows[0]).toEqual({ approvals: 0, submitApprovals: 0, submittedTasks: 0 })
     } finally {
+      await stopMaterialRecoveryProcess(crashedRecoveryProcess).catch(() => undefined)
+      await stopMaterialRecoveryProcess(resumedRecoveryProcess).catch(() => undefined)
+      await recoveryWebBridge?.close().catch(() => undefined)
       if (runJob) await runJob.catch(() => undefined)
       dispatchActive = false
       await dispatchLoop?.catch(() => undefined)
