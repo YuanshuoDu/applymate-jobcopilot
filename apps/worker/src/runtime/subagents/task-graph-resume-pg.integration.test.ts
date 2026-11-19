@@ -16362,9 +16362,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         dublinRetirementReceiptPresent: dublinRetirement,
         observedMarkers: observedMarkers.slice(0, 8),
         berlinRequestMarker: projectMarker("P3_SUCCESSIVE_REPLAN_BERLIN_REQUEST ",
-          ["requestEntered", "privateCuePresent", "berlinScopePresent", "listToolAvailable"]),
+          ["requestEntered", "freshSteeringCuePresent", "berlinScopePresent", "listToolAvailable"]),
         berlinListProofMarker: projectMarker("P3_SUCCESSIVE_REPLAN_BERLIN_LIST_PROOF ",
-          ["listResultPresent", "seattleInterrupted", "dublinRunning", "privateCuePresent",
+          ["listResultPresent", "seattleInterrupted", "dublinRunning", "unresolvedSteeringCuePresent",
             "berlinScopePresent", "priorRetirementPresent", "noBerlinPlanYet"]),
       }
     }
@@ -16421,7 +16421,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         throw new Error("Berlin crash-cut boundary=" + JSON.stringify(await readSteerFailureBoundary("berlin", acceptedBerlin)))
       }
       assertMarker(crashCut, "P3_SUCCESSIVE_REPLAN_CRASH_CUT ", { inspectResultValid: true, steerConsumed: true,
-        privateCuePresent: true, berlinScopePresent: true, priorRetirementPresent: true, acceptedBerlinPlanCount: 0,
+        unresolvedSteeringCuePresent: true, berlinScopePresent: true, priorRetirementPresent: true, acceptedBerlinPlanCount: 0,
         rootLeaseMatchesProcess: true })
       const turnAtCut = await currentTurn()
       if (turnAtCut.status !== "in_progress" || !turnAtCut.leaseOwnerId
@@ -16502,7 +16502,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       resumeWorker = startTaskGraphRestartWorker("resume-successive-replan", { ...fixtureInput, dublinAttemptBeforeRestart }, workerEnv)
       const context = await waitForProcessLine(resumeWorker, "P3_SUCCESSIVE_REPLAN_CONTEXT ", 90_000)
       assertMarker(context, "P3_SUCCESSIVE_REPLAN_CONTEXT ",
-        { privateCuePresent: true, berlinScopePresent: true, priorRetirementPresent: true, planToolAvailable: true,
+        { unresolvedSteeringCuePresent: true, berlinScopePresent: true, priorRetirementPresent: true, planToolAvailable: true,
           rootLeaseMatchesProcess: true })
       const resumedTurn = await currentTurn()
       if (resumeWorker.pid === firstWorker.pid || resumedTurn.status !== "in_progress"
