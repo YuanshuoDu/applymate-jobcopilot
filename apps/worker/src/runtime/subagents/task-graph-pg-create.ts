@@ -15,7 +15,7 @@ import { canonicalTaskGraphJson, taskGraphSnapshot, type TaskGraphSnapshot } fro
 import { materializeTaskGraphDependencyContext, type ScopedDependencyResult } from "./task-graph-dependency-context.js"
 import { validateTaskGraphRepairTargets } from "./task-graph-pg-create-repair-validation.js"
 import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-context-loader.js"
-import { evaluateTaskGraphObjectiveCoverage } from "../planning/task-graph-objective-coverage.js"
+import { evaluateTaskGraphPlanObjectiveCoverage } from "./task-graph-plan-objective-coverage.js"
 import { isScheduledDraftTemplate, scheduledDraftPair, scheduledDraftTaskContext, selectVerifiedScheduledDraftCandidate, type ScheduledDraftCandidateBinding } from "./scheduled-draft-candidate.js"
 import { sourceIntentForTaskGraphNode } from "./task-graph-source-intent-context.js"
 import { scheduledScoutPlanCapacityAllowed } from "./scheduled-taskgraph-plan-capacity.js"
@@ -127,7 +127,7 @@ export async function createGraphTasks(
     preflightStatuses.set(node.key, status); logicalStatuses.set(node.key, status)
   })
   await validateTaskGraphRepairTargets(client, input, current, priorTaskIds)
-  const coverage = evaluateTaskGraphObjectiveCoverage(input.verificationRequirements ?? { status: "absent" }, appended.state.nodes, input.templates, input.scope.rootTaskId)
+  const coverage = await evaluateTaskGraphPlanObjectiveCoverage({ client, input, nodes: appended.state.nodes, provenance })
   if (coverage.status === "invalid") throw Object.assign(new Error("Canonical objective verification requirements are invalid"), {
     code: "task_graph_objective_requirements_invalid",
   })

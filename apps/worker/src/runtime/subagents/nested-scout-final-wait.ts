@@ -140,13 +140,23 @@ function hasDeliveredWaitOutcome(input: PrepareFinalDependencyWaitInput, taskIds
   })
   if (matches.length === 0) return false
   const latest = matches[matches.length - 1]!
+  const canonicalCallId = latest.content.toolCallId
+  const aliases = input.toolCallAliases ? [...input.toolCallAliases].filter(([, id]) => id === canonicalCallId) : []
+  if (aliases.length > 1) return false
+  const alias = aliases[0]?.[0]
+  if (alias !== undefined && !safeId(alias)) return false
   const expected = waitProjection(latest.id, latest.content, taskIds)
   if (!expected) return false
+  const visibleId = alias === undefined ? expected.id : `tool-call-observation:${alias}`
   const visible = input.context.blocks.filter((block: ContextBlock) => block.layer === "tool_observation" && block.role === "data"
-    && block.trust === "external_untrusted" && block.source === "tool-or-subagent" && block.id === expected.id)
+    && block.trust === "external_untrusted" && block.source === "tool-or-subagent" && block.id === visibleId)
   if (visible.length !== 1) return false
-  const content = safeRecord(visible[0]!.content), projection = content && waitProjection(expected.id, content, taskIds)
-  return !!projection && JSON.stringify(projection.signature) === JSON.stringify(expected.signature)
+  const content = safeRecord(visible[0]!.content)
+  if (!content) return false
+  if (alias !== undefined && content.toolCallId !== alias) return false
+  const canonicalContent = alias === undefined ? content : { ...content, toolCallId: canonicalCallId }
+  const delivered = waitProjection(expected.id, canonicalContent, taskIds)
+  return !!delivered && JSON.stringify(delivered.signature) === JSON.stringify(expected.signature)
 }
 
 function waitProjection(id: string, content: Record<string, unknown>, taskIds: readonly string[]): { id: string; signature: readonly unknown[] } | null {

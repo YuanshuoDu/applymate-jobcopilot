@@ -262,13 +262,14 @@ function dedicatedRedisUrl(): string | null {
   if (!value) return null
   const url = new URL(value)
   const localProof = process.env.AGENT_REPLAN_PROOF_LOCAL_DISPOSABLE === "1"
+  const expectedPort = localProof ? "16380" : "6379"
   const expectedHost = localProof ? url.hostname === "127.0.0.1" : ["127.0.0.1", "localhost", "::1"].includes(url.hostname)
   if (
     process.env.CI !== "true"
     || process.env.AGENT_TURN_REDIS_TEST_DISPOSABLE !== "true"
     || url.protocol !== "redis:"
     || !expectedHost
-    || url.port !== (localProof ? "16380" : "6379")
+    || url.port !== expectedPort
     || url.pathname !== "/15"
     || url.username !== ""
     || url.password !== ""
@@ -317,6 +318,32 @@ async function createDisposableWebObjectiveStartService(connectionString: string
     if (typeof constructor !== "function") throw new Error("Production ObjectiveStart command service is unavailable")
     const commands = new (constructor as new (db: unknown) => ObjectiveStartFixtureService)(prisma)
     return { prisma, commands }
+  } catch (error: unknown) {
+    await prisma.$disconnect()
+    throw error
+  }
+}
+
+type UserSteerCommandService = Readonly<{ steer(command: {
+  sessionId: string; userId: string; clientMessageId: string; source: "user"; expectedTurnId: string | null; expectedRevision?: number | null
+  content: { type: "text"; text: string }[]
+}): Promise<{ inputId: string; turnId: string; disposition: string; sequence: string }> }>
+
+async function createDisposableWebSteerService(connectionString: string): Promise<{
+  prisma: DisposableWebPrismaClient; commands: UserSteerCommandService
+}> {
+  const loaded: unknown = webRequire("@prisma/client")
+  const prismaConstructor = loaded && typeof loaded === "object"
+    ? (loaded as { PrismaClient?: unknown }).PrismaClient : undefined
+  if (typeof prismaConstructor !== "function") throw new Error("Web Prisma client constructor is unavailable")
+  const prisma = new (prismaConstructor as new (options: { datasourceUrl: string }) => unknown)({ datasourceUrl: connectionString }) as DisposableWebPrismaClient
+  try {
+    const commandsModule = "@/lib/agent/control-plane/commands/agent-command-service"
+    const imported: unknown = await import(commandsModule)
+    const serviceConstructor = imported && typeof imported === "object"
+      ? (imported as { AgentCommandService?: unknown }).AgentCommandService : undefined
+    if (typeof serviceConstructor !== "function") throw new Error("Production User Steer command service is unavailable")
+    return { prisma, commands: new (serviceConstructor as new (db: DisposableWebPrismaClient) => UserSteerCommandService)(prisma) }
   } catch (error: unknown) {
     await prisma.$disconnect()
     throw error
@@ -8797,6 +8824,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const discoveryRestartOwner = fixture()
   const verificationRepairOwner = fixture()
   const lateRepairOwner = fixture()
+  const replanApplicabilityOwner = fixture()
   const locationRepairOwner = fixture()
   const locationMismatchOwner = fixture()
   const locationConflictOwner = fixture()
@@ -8861,6 +8889,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       maxToolCalls: VERIFICATION_REPAIR_TOOL_BUDGET,
     })
     await seed(pool, lateRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxToolCalls: 10 })
+    await seed(pool, replanApplicabilityOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     const locationRepairLimits = { ...DISCOVERY_FIXTURE_TURN_LIMITS,
       maxSteps: VERIFICATION_REPAIR_STEP_BUDGET, maxToolCalls: VERIFICATION_REPAIR_TOOL_BUDGET }
     await seed(pool, locationRepairOwner, "waiting_for_user", locationRepairLimits)
@@ -8900,7 +8929,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     const fixtureOwners = [owner, resumeFailureOwner, failureOwner, operationalFailureOwner, operationalDeadlineOwner, operationalAppendOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner,
       discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner,
-      locationRepairOwner, locationMismatchOwner, locationConflictOwner, locationForeignOwner, leaseRecoveryOwner,
+      locationRepairOwner, locationMismatchOwner, locationConflictOwner, locationForeignOwner, replanApplicabilityOwner, leaseRecoveryOwner,
       coverageRepairOwner, scoutUnionOwner, emptyAnalystOwner, emptyAnalystOrphanOwner, emptyAnalystCurrentReceiptOwner,
       emptyAnalystMutationOwner, rootRecoveryScanOwner, archivedWaitOwner, objectiveScoutAuthorityOwner]
     const allFixtureWorkersExited = [...fixtureProcessChildren].every(processFixtureExited)
@@ -13485,6 +13514,483 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       if (workerThree) await stopProcessFixture(workerThree)
     }
   }, 240_000)
+
+  it("keeps pre-steer Scout evidence out of the current final summary after a real replan", async () => {
+    const value = replanApplicabilityOwner
+    const [workerQueue, canonical, commandPortModule, subagentQueue] = await Promise.all([
+      import("../../queue/production-bootstrap.js"),
+      import("../canonical-turn-runtime.js"),
+      import("./pg-task-graph-command-port.js"),
+      import("../../queue/subagent-queue.js"),
+    ])
+    const { createProductionChildExecutor } = await import("./production-child-runtime.js")
+    const { createTurnQueue, enqueueTurn, TURN_QUEUE_NAME } = await import("../turns/turn-queue.js")
+    turnQueueName = TURN_QUEUE_NAME
+    childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
+
+    const seattleJobId = fixtureJobId(value.suffix)
+    const dublinJobId = fixtureJobId(value.suffix, 1)
+    // Keep the canonical objective location-free; Dublin is a natural-language steer, not a fabricated typed criterion.
+    const steerText = `Only Dublin roles are relevant ${value.suffix}`
+    const initialPlanCallId = `p3-1219-applicability-plan-seattle:${value.turnId}`
+    const initialWaitCallId = `p3-1219-applicability-wait-seattle:${value.turnId}`
+    const revisePlanCallId = `p3-1219-applicability-plan-dublin:${value.turnId}`
+    const reviseWaitCallId = `p3-1219-applicability-wait-dublin:${value.turnId}`
+    const initialWaitKey = `p3-1219-applicability-seattle:${value.turnId}`
+    const reviseWaitKey = `p3-1219-applicability-dublin:${value.turnId}`
+
+    await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb
+      WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
+      value.turnId, JSON.stringify({ goal: "Find software engineering roles" }), value.sessionId, value.userId,
+    ])
+    await activateFixtureTurn(pool!, value)
+    await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
+      VALUES ($1, $2, 'Seattle Fixture Labs', 'Software Engineer', 'Seattle', 'saved', $3, 'Pre-steer synthetic search evidence', 'greenhouse', CURRENT_TIMESTAMP),
+        ($4, $2, 'Dublin Fixture Labs', 'Software Engineer', 'Dublin', 'saved', $5, 'Post-steer synthetic search evidence', 'greenhouse', CURRENT_TIMESTAMP)`, [
+      seattleJobId, value.userId, `https://jobs.example.invalid/${seattleJobId}`,
+      dublinJobId, `https://jobs.example.invalid/${dublinJobId}`,
+    ])
+
+    const flags: ProductionAgentFlags = {
+      taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
+      consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
+    }
+    const profile = {
+      provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
+      continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+      supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const,
+    }
+    let rootFixtureStage = "not_started"
+    let seattleTaskId: string | undefined
+    let dublinTaskId: string | undefined
+    let revisionBeforeDublinReplan: number | undefined
+    let finalRequestIncludesEarlierNode = false
+    let resumedRequestIncludesEarlierNode = false
+    let resumedRequestMarksEarlierNodePredatesSteer = false
+    let resumedRequestIncludesEarlierWait = false
+    const finalCandidate = "The Dublin-only search is complete."
+    const rootRuntime = await canonical.createCanonicalTurnRuntime(pool!, {
+      workerId: value.ownerId, productionFlags: flags,
+      taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
+      taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES },
+      authorizeUsage: authorizeUnreservedUsage,
+      modelRuntimeFactory: () => {
+        const adapter: ModelAdapter = {
+          id: "p3-1219-replan-applicability-root-fixture", profile,
+          async *stream(request) {
+            const graph = currentGraphFromRequest(request)
+            const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+            const seattle = nodes.find(node => node?.key === "scout-seattle")
+            const dublin = nodes.find(node => node?.key === "scout-dublin")
+            const steerVisible = JSON.stringify(request.messages).includes(steerText)
+
+            if (!dublin && steerVisible) {
+              rootFixtureStage = "resume_graph"
+              resumedRequestIncludesEarlierNode = Boolean(seattle)
+              rootFixtureStage = "resume_old_result"
+              if (seattle?.status === "completed") {
+                expectPassedVerificationReport(seattle.verificationReport, "candidate-count")
+              }
+              rootFixtureStage = "resume_wait_result"
+              try {
+                const previousWait = waitOutcomeFromRequest(request, 1, "scout")
+                resumedRequestIncludesEarlierWait = Boolean(seattleTaskId && previousWait.tasks.some(task => record(task)?.taskId === seattleTaskId))
+              } catch {
+                resumedRequestIncludesEarlierWait = false
+              }
+              rootFixtureStage = "resume_source_intent"
+              const sourceIntent = Array.isArray(graph?.sourceIntent) ? graph.sourceIntent.map(record) : []
+              resumedRequestMarksEarlierNodePredatesSteer = sourceIntent.some(item =>
+                item?.nodeKey === "scout-seattle" && item?.inputRelation === "predates_current_inputs")
+              rootFixtureStage = "resume_revision"
+              const revision = graph?.revision
+              if (typeof revision !== "number") throw new Error("Steer replan did not receive the current graph revision")
+              revisionBeforeDublinReplan = revision
+              rootFixtureStage = "revise_plan"
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.plan")
+              yield { type: "tool_call_completed", callId: revisePlanCallId, name: "agent.plan", arguments: {
+                expectedRevision: revision,
+                nodes: [{ key: "scout-dublin", templateId: "scout", goal: "Find software engineering roles in Dublin only",
+                  successCriteria: ["Return one evidence-bound Dublin role"], dependsOn: [], verification: SCOUT_VERIFICATION }],
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+
+            if (!seattle && !dublin) {
+              rootFixtureStage = "initial_plan"
+              expect(latestToolResult(request, initialPlanCallId)).toBeNull()
+              expect(graph?.revision ?? 0).toBe(0)
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.plan")
+              yield { type: "tool_call_completed", callId: initialPlanCallId, name: "agent.plan", arguments: {
+                expectedRevision: 0,
+                nodes: [{ key: "scout-seattle", templateId: "scout", goal: "Find software engineering roles in Seattle",
+                  successCriteria: ["Return one evidence-bound role"], dependsOn: [], verification: SCOUT_VERIFICATION }],
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+
+            if (seattle && !dublin && !steerVisible) {
+              rootFixtureStage = "initial_wait"
+              seattleTaskId = planTaskIds(request, initialPlanCallId, 1)[0]
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
+              yield { type: "tool_call_completed", callId: initialWaitCallId, name: "agent.wait", arguments: {
+                idempotencyKey: initialWaitKey, taskIds: [seattleTaskId], mode: "all", timeoutMs: 30_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+
+            if (dublin && dublin.status !== "completed") {
+              rootFixtureStage = "revise_wait"
+              dublinTaskId = planTaskIds(request, revisePlanCallId, 1)[0]
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
+              const currentRevision = graph?.revision
+              if (typeof currentRevision !== "number") throw new Error("Revised plan did not retain a graph revision")
+              if (revisionBeforeDublinReplan === undefined) throw new Error("Revised plan was not based on a recorded graph revision")
+              expect(currentRevision).toBeGreaterThan(revisionBeforeDublinReplan)
+              yield { type: "tool_call_completed", callId: reviseWaitCallId, name: "agent.wait", arguments: {
+                idempotencyKey: reviseWaitKey, taskIds: [dublinTaskId], mode: "all", timeoutMs: 30_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+
+            if (dublin && dublin.status === "completed") {
+              dublinTaskId = planTaskIds(request, revisePlanCallId, 1)[0]
+              rootFixtureStage = "final_graph_read"
+              rootFixtureStage = "final_graph_keys"
+              finalRequestIncludesEarlierNode = nodes.some(node => node?.key === "scout-seattle")
+              expect(dublin).toBeDefined()
+              rootFixtureStage = "final_graph_statuses"
+              expect(dublin.status).toBe("completed")
+              rootFixtureStage = "final_graph_reports"
+              expectPassedVerificationReport(dublin.verificationReport, "candidate-count")
+              if (finalRequestIncludesEarlierNode) {
+                expectPassedVerificationReport(
+                  nodes.find(node => node?.key === "scout-seattle")?.verificationReport,
+                  "candidate-count",
+                )
+              }
+              rootFixtureStage = "final_graph_revision"
+              expect(graph?.revision).toBeGreaterThan(revisionBeforeDublinReplan ?? Number.MAX_SAFE_INTEGER)
+              rootFixtureStage = "final_response"
+              yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: finalCandidate }) }
+              yield { type: "completed", finishReason: "stop" }
+              return
+            }
+            throw new Error(`Unexpected replan applicability graph state: ${JSON.stringify({
+              nodeCount: nodes.length,
+              hasSeattle: Boolean(seattle),
+              hasDublin: Boolean(dublin),
+              steerVisible,
+            })}`)
+          },
+        }
+        return { adapter, registry: {} as never, candidates: [] }
+      },
+    })
+    const childExecutor = createProductionChildExecutor({
+      pool: pool!, authorizeUsage: authorizeUnreservedUsage,
+      modelRuntimeFactory: ({ task }) => {
+        if (task.role !== "scout") throw new Error("Replan applicability fixture expected Scout children only")
+        const location = task.goal.includes("Dublin") ? "Dublin" : "Seattle"
+        const jobId = location === "Dublin" ? dublinJobId : seattleJobId
+        const waitKey = location === "Dublin" ? reviseWaitKey : initialWaitKey
+        let round = 0
+        return {
+          id: `p3-1219-replan-applicability-${location.toLowerCase()}-child-fixture`, profile,
+          async *stream(request) {
+            round += 1
+            if (round === 1) {
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
+              yield { type: "tool_call_completed", callId: `p3-1219-applicability-search:${task.id}`, name: "jobs.search",
+                arguments: { target: "Software Engineer", location, limit: 10 } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
+            const evidence = { id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "greenhouse" }
+            const result = {
+              schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+              candidates: [{ jobId, source: evidence.source, url: null, evidenceIds: [evidence.id] }],
+              evidence: [evidence], summary: `Found the fixture role in ${location}`,
+            }
+            yield { type: "text_delta", text: JSON.stringify(result) }
+            yield { type: "completed", finishReason: "stop" }
+          },
+        }
+      },
+    })
+    bootstrap = await workerQueue.createProductionWorkerBootstrap({
+      pool: pool!, runtime: rootRuntime, ownerId: value.ownerId, turnQueueFactory: createTurnQueue,
+      turnRecoveryIntervalMs: 100,
+      waitResolverFactory: () => ({ async close() {} }),
+      waitResolver: { intervalMs: 3_600_000, batchSize: 10, ownerId: `p3-1219-manual-wait-resolver-${value.suffix}` },
+      subagents: { execute: childExecutor, intervalMs: 10 },
+    })
+
+    await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+    const waitForCompletedTask = async (taskId: string) => {
+      const deadline = Date.now() + 45_000
+      while (Date.now() < deadline) {
+        const result = await pool!.query<{ status: string; result: unknown; failureReason: string | null }>(
+          `SELECT "status", "result", "failureReason" FROM "sub_agent_tasks"
+           WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [taskId, value.sessionId, value.turnId],
+        )
+        const row = result.rows[0]
+        if (row?.status === "completed") return row
+        if (row && ["failed", "interrupted", "cancelled", "closed"].includes(row.status)) {
+          throw new Error(`Replan applicability child ended as ${row.status}: ${row.failureReason ?? "no failure reason"}`)
+        }
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      throw new Error("Replan applicability child did not complete before the deadline")
+    }
+
+    await waitForPersistedTaskWait(pool!, value.turnId, initialWaitKey, 20_000, initialWaitCallId)
+    if (!seattleTaskId) throw new Error("Initial Seattle plan did not return a task ID")
+    const initialSeattlePlanTaskId = seattleTaskId
+    const seattleTask = await waitForCompletedTask(initialSeattlePlanTaskId)
+    expectPassedVerificationReport(record(seattleTask.result)?.taskGraphVerificationReport, "candidate-count")
+    const digestResult = (result: unknown) => {
+      const serialized = JSON.stringify(result)
+      if (serialized === undefined) throw new Error("Completed Scout result could not be serialized")
+      return createHash("sha256").update(serialized).digest("hex")
+    }
+    const seattleResultDigest = digestResult(seattleTask.result)
+    const suspended = await pool!.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId])
+    expect(suspended.rows[0]?.status).toBe("waiting_for_dependency")
+
+    const steerTarget = await pool!.query<{ status: string; revision: number; rootTaskId: string | null; leaseOwnerId: string | null }>(
+      `SELECT "status", "revision", "rootTaskId", "leaseOwnerId" FROM "agent_turns"
+       WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [value.turnId, value.sessionId, value.userId],
+    )
+    expect(steerTarget.rows[0]).toMatchObject({ status: "waiting_for_dependency", leaseOwnerId: null })
+    expect(steerTarget.rows[0]?.rootTaskId).toBeTruthy()
+    const webSteer = await createDisposableWebSteerService(databaseUrl!)
+    const accepted = await (async () => {
+      try {
+        return await webSteer.commands.steer({
+          sessionId: value.sessionId, userId: value.userId,
+          clientMessageId: `p3-1219-replan-steer:${value.suffix}`, source: "user",
+          expectedTurnId: value.turnId, expectedRevision: Number(steerTarget.rows[0]?.revision),
+          content: [{ type: "text", text: steerText }],
+        })
+      } finally {
+        await webSteer.prisma.$disconnect()
+      }
+    })()
+    expect(accepted.disposition).toBe("steered")
+    expect(accepted.turnId).toBe(value.turnId)
+    const acceptedInput = await pool!.query<{ id: string; status: string; acceptedSequence: string }>(
+      `SELECT "id", "status", "acceptedSequence" FROM "agent_inputs"
+       WHERE "id" = $1 AND "sessionId" = $2 AND "targetTurnId" = $3 AND "userId" = $4`,
+      [accepted.inputId, value.sessionId, value.turnId, value.userId],
+    )
+    expect(acceptedInput.rows).toHaveLength(1)
+    expect(acceptedInput.rows[0]?.status).toBe("accepted")
+    expect(String(acceptedInput.rows[0]?.acceptedSequence)).toBe(accepted.sequence)
+    expect(BigInt(accepted.sequence)).toBeGreaterThan(0n)
+    const firstResume = await reconcileDurableWaits(pool!, { ownerId: `p3-1219-steer-resolver-${value.suffix}` })
+    expect(firstResume.woken).toBeGreaterThan(0)
+    try {
+      await waitForPersistedTaskWait(pool!, value.turnId, reviseWaitKey)
+    } catch {
+      const [turnState, waitState, childState] = await Promise.all([
+        pool!.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId]),
+        pool!.query<{ status: string; suspendedAt: Date | null }>(`SELECT "status", "suspendedAt" FROM "agent_wait_conditions"
+          WHERE "turnId" = $1 AND "sessionId" = $2 AND "idempotencyKey" = $3`, [value.turnId, value.sessionId, reviseWaitKey]),
+        dublinTaskId ? pool!.query<{ status: string }>(`SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+          [dublinTaskId, value.sessionId, value.turnId]) : Promise.resolve({ rows: [] as { status: string }[] }),
+      ])
+      throw new Error(`Dublin wait diagnostic=${JSON.stringify({
+        rootStage: rootFixtureStage, turnStatus: turnState.rows[0]?.status ?? "missing",
+        waitStatus: waitState.rows[0]?.status ?? "missing", waitSuspended: waitState.rows[0]?.suspendedAt instanceof Date,
+        dublinTaskStatus: childState.rows[0]?.status ?? "missing",
+        earlierNodeProjected: resumedRequestIncludesEarlierNode,
+        earlierSourceIntentMarksPredates: resumedRequestMarksEarlierNodePredatesSteer,
+        earlierWaitProjected: resumedRequestIncludesEarlierWait,
+      })}`)
+    }
+    if (!dublinTaskId) throw new Error("Dublin revise plan did not return a task ID")
+    const revisedDublinPlanTaskId = dublinTaskId
+    const dublinTask = await waitForCompletedTask(revisedDublinPlanTaskId)
+    expectPassedVerificationReport(record(dublinTask.result)?.taskGraphVerificationReport, "candidate-count")
+    const secondResume = await reconcileDurableWaits(pool!, { ownerId: `p3-1219-result-resolver-${value.suffix}` })
+    expect(secondResume.woken).toBeGreaterThan(0)
+    await waitForTurnStatus(pool!, value.turnId, "completed", 45_000, reviseWaitCallId, [initialPlanCallId, revisePlanCallId])
+
+    const inputState = await pool!.query<{ status: string; consumedByStepId: string | null; acceptedSequence: string }>(
+      `SELECT "status", "consumedByStepId", "acceptedSequence" FROM "agent_inputs"
+       WHERE "id" = $1 AND "sessionId" = $2 AND "targetTurnId" = $3 AND "userId" = $4`,
+      [accepted.inputId, value.sessionId, value.turnId, value.userId],
+    )
+    expect(inputState.rows[0]).toMatchObject({ status: "consumed", acceptedSequence: accepted.sequence })
+    expect(inputState.rows[0]?.consumedByStepId).toBeTruthy()
+
+    const turn = await pool!.query<{ status: string; rootTaskId: string | null; finalResponse: string | null }>(
+      `SELECT "status", "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [value.turnId, value.sessionId, value.userId],
+    )
+    expect(turn.rows[0]).toMatchObject({ status: "completed" })
+    const rootTaskId = turn.rows[0]?.rootTaskId
+    if (!rootTaskId || !seattleTaskId || !dublinTaskId) throw new Error("Completed replan applicability graph lost a task identity")
+    const dublinWaitState = await pool!.query<{ status: string; suspendedAt: Date | null }>(
+      `SELECT "status", "suspendedAt" FROM "agent_wait_conditions"
+       WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4 AND "idempotencyKey" = $5`,
+      [value.userId, value.sessionId, value.turnId, rootTaskId, reviseWaitKey],
+    )
+    expect(dublinWaitState.rows).toHaveLength(1)
+    expect(dublinWaitState.rows[0]).toMatchObject({ status: "ready" })
+    expect(dublinWaitState.rows[0]?.suspendedAt).toBeInstanceOf(Date)
+    const client = await pool!.connect()
+    let loadedGraph: Awaited<ReturnType<typeof loadTaskGraph>>
+    let finalResponse: RecordValue | null = null
+    let finalItemContent: RecordValue | null = null
+    try {
+      await client.query("BEGIN READ ONLY")
+      await client.query("SELECT set_config('app.user_id', $1, true)", [value.userId])
+      loadedGraph = await loadTaskGraph(client, {
+        userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId, parentTaskId: rootTaskId,
+      }, false, { includeSourceProvenance: true })
+      const persistedTurn = await client.query<{ finalResponse: string | null }>(
+        `SELECT "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+        [value.turnId, value.sessionId, value.userId],
+      )
+      finalResponse = record(JSON.parse(persistedTurn.rows[0]?.finalResponse ?? "null"))
+      const finalItems = await client.query<{ content: unknown }>(
+        `SELECT item."content" FROM "agent_items" AS item
+         JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+         WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3
+           AND session."userId" = $4 AND turn."userId" = $4 AND turn."rootTaskId" = $3
+           AND item."type" = 'agent_message' AND item."phase" = 'final_answer' AND item."status" = 'completed'
+         ORDER BY item."createdAt" DESC LIMIT 1`,
+        [value.sessionId, value.turnId, rootTaskId, value.userId],
+      )
+      expect(finalItems.rows).toHaveLength(1)
+      finalItemContent = record(finalItems.rows[0]?.content)
+    } finally {
+      await client.query("ROLLBACK").catch(() => undefined)
+      client.release()
+    }
+    const finalNodes = loadedGraph.snapshot?.nodes ?? []
+    const seattleNodeIndex = finalNodes.findIndex(node => node.key === "scout-seattle")
+    const dublinNodeIndex = finalNodes.findIndex(node => node.key === "scout-dublin")
+    const seattleNode = seattleNodeIndex >= 0 ? finalNodes[seattleNodeIndex] : undefined
+    const dublinNode = dublinNodeIndex >= 0 ? finalNodes[dublinNodeIndex] : undefined
+    const seattleFinalTask = seattleNode ? loadedGraph.tasks.get(seattleNode.taskId) : undefined
+    const earlierResultUnchanged = seattleFinalTask !== undefined
+      && digestResult(seattleFinalTask.result) === seattleResultDigest
+    const seattleCheckpointMap = loadedGraph.sourceInputCheckpointByNodeKey
+    const acceptedSteerSequence = BigInt(accepted.sequence)
+    const sourceCheckpointRelation = (nodeKey: string) => {
+      if (!seattleCheckpointMap) return { relation: "unknown", reason: "provenance_not_returned" }
+      if (!seattleCheckpointMap.has(nodeKey)) return { relation: "unknown", reason: "node_checkpoint_not_mapped" }
+      const checkpoint = seattleCheckpointMap.get(nodeKey)
+      if (!checkpoint) return { relation: "unknown", reason: "no_validated_source_step_checkpoint" }
+      return checkpoint.inputThroughSequence < acceptedSteerSequence
+        ? { relation: "predates_accepted_steer", reason: null }
+        : { relation: "covers_accepted_steer", reason: null }
+    }
+    const seattleCheckpoint = sourceCheckpointRelation("scout-seattle")
+    const dublinCheckpoint = sourceCheckpointRelation("scout-dublin")
+    const finalItemFinal = record(finalItemContent?.final)
+    const finalManifest = record(finalItemContent?.taskGraphSources)
+    const manifestSources = Array.isArray(finalManifest?.sources) ? finalManifest.sources.map(record) : []
+    const historicalNodeIndices = Array.isArray(finalManifest?.historicalNodeIndices)
+      ? finalManifest.historicalNodeIndices : []
+    const finalResponseText = typeof finalResponse?.response === "string" ? finalResponse.response : ""
+    const finalResponseSummary = typeof finalResponse?.summary === "string" ? finalResponse.summary : ""
+    const responseReportsOneCurrentResult = finalResponseText.includes("Search results: 1 unique job reported (complete coverage).")
+    const structuredSummaryReportsOneCurrentResult = finalResponseSummary.includes("discovered jobs: 1 (complete)")
+    const finalResponseOmitsRawCandidate = !finalResponseText.includes(finalCandidate)
+    const finalItemTextMatchesEnvelope = finalItemContent?.text === finalResponseText
+      && finalItemFinal?.response === finalResponseText
+    const finalItemSummaryMatchesEnvelope = finalItemFinal?.summary === finalResponseSummary
+    const seattleIsHistorical = historicalNodeIndices.includes(seattleNodeIndex)
+      && !manifestSources.some(source => source?.nodeIndex === seattleNodeIndex)
+    const dublinSourceKeepsOriginalOrdinal = manifestSources.some(source =>
+      source?.nodeIndex === dublinNodeIndex && source?.role === "scout")
+    const manifestHasOnlyCurrentDublinSource = manifestSources.length === 1 && dublinSourceKeepsOriginalOrdinal
+    const manifestMarksOnlySeattleHistorical = historicalNodeIndices.length === 1
+      && historicalNodeIndices[0] === seattleNodeIndex
+    const seattleTaskMatchesInitialPlanReceipt = seattleNode?.taskId === initialSeattlePlanTaskId
+    const dublinTaskMatchesReplanPlanReceipt = dublinNode?.taskId === revisedDublinPlanTaskId
+    const identitiesMatchPlanReceipts = seattleTaskMatchesInitialPlanReceipt && dublinTaskMatchesReplanPlanReceipt
+    const finalManifestIsV2 = finalManifest?.schemaVersion === "agent-harness.v2.task-graph-sources.v2"
+    if (!earlierResultUnchanged || seattleCheckpoint.relation !== "predates_accepted_steer"
+      || dublinCheckpoint.relation !== "covers_accepted_steer" || !responseReportsOneCurrentResult
+      || !structuredSummaryReportsOneCurrentResult || !finalManifestIsV2 || !seattleIsHistorical
+      || !manifestMarksOnlySeattleHistorical || !dublinSourceKeepsOriginalOrdinal || !manifestHasOnlyCurrentDublinSource
+      || !finalItemTextMatchesEnvelope || !finalItemSummaryMatchesEnvelope || !finalResponseOmitsRawCandidate) {
+      console.info("Replan applicability safe evidence", JSON.stringify({
+        graphHasTwoExpectedNodes: finalNodes.length === 2 && seattleNodeIndex >= 0 && dublinNodeIndex >= 0,
+        seattleTaskMatchesInitialPlanReceipt,
+        dublinTaskMatchesReplanPlanReceipt,
+        earlierResultUnchanged,
+        resumedRequestIncludesEarlierNode,
+        resumedRequestMarksEarlierNodePredatesSteer,
+        resumedRequestIncludesEarlierWait,
+        finalRequestIncludesEarlierNode,
+        seattleCheckpointRelation: seattleCheckpoint.relation,
+        seattleCheckpointUnknownReason: seattleCheckpoint.reason,
+        dublinCheckpointRelation: dublinCheckpoint.relation,
+        dublinCheckpointUnknownReason: dublinCheckpoint.reason,
+        finalManifestIsV2,
+        seattleIsHistorical,
+        manifestMarksOnlySeattleHistorical,
+        dublinSourceKeepsOriginalOrdinal,
+        manifestHasOnlyCurrentDublinSource,
+        finalItemTextMatchesEnvelope,
+        finalItemSummaryMatchesEnvelope,
+        finalResponseOmitsRawCandidate,
+        finalResponseReportsOneCurrentResult: responseReportsOneCurrentResult,
+        structuredSummaryReportsOneCurrentResult,
+      }))
+    }
+    expect({
+      graphHasTwoExpectedNodes: finalNodes.length === 2 && seattleNodeIndex >= 0 && dublinNodeIndex >= 0,
+      identitiesMatchPlanReceipts,
+      earlierResultUnchanged,
+      seattleCheckpointRelation: seattleCheckpoint.relation,
+      seattleCheckpointUnknownReason: seattleCheckpoint.reason,
+      dublinCheckpointRelation: dublinCheckpoint.relation,
+      dublinCheckpointUnknownReason: dublinCheckpoint.reason,
+      finalManifestIsV2,
+      seattleIsHistorical,
+      manifestMarksOnlySeattleHistorical,
+      dublinSourceKeepsOriginalOrdinal,
+      manifestHasOnlyCurrentDublinSource,
+      finalItemTextMatchesEnvelope,
+      finalItemSummaryMatchesEnvelope,
+      finalResponseOmitsRawCandidate,
+      finalResponseReportsOneCurrentResult: responseReportsOneCurrentResult,
+      structuredSummaryReportsOneCurrentResult,
+    }, "The current final summary should report only the post-steer Dublin evidence")
+      .toEqual({
+        graphHasTwoExpectedNodes: true,
+        identitiesMatchPlanReceipts: true,
+        earlierResultUnchanged: true,
+        seattleCheckpointRelation: "predates_accepted_steer",
+        seattleCheckpointUnknownReason: null,
+        dublinCheckpointRelation: "covers_accepted_steer",
+        dublinCheckpointUnknownReason: null,
+        finalManifestIsV2: true,
+        seattleIsHistorical: true,
+        manifestMarksOnlySeattleHistorical: true,
+        dublinSourceKeepsOriginalOrdinal: true,
+        manifestHasOnlyCurrentDublinSource: true,
+        finalItemTextMatchesEnvelope: true,
+        finalItemSummaryMatchesEnvelope: true,
+        finalResponseOmitsRawCandidate: true,
+        finalResponseReportsOneCurrentResult: true,
+        structuredSummaryReportsOneCurrentResult: true,
+      })
+  }, 90_000)
 
   it("replans a canonical discovery Turn from durable child evidence and persists the owner-scoped shortlist", async () => {
     const [workerQueue, canonical, commandPortModule, subagentQueue] = await Promise.all([

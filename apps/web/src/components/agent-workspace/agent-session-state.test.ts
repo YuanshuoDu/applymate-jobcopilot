@@ -38,6 +38,31 @@ describe('agent session URL and active Turn DTO', () => {
     })
   })
 
+  it('grants the location capability only from a literal true on the matching projection', () => {
+    const active = { id: 'turn_1', status: 'in_progress', revision: 3 }
+    expect(parseAgentTurnsResponse({
+      turns: [{ ...active, canSteerLocation: true }],
+      projection: { activeTurnId: 'turn_1', activeTurn: { ...active, canSteerLocation: true } },
+    }).activeTurn).toEqual({ ...active, canSteerLocation: true })
+    for (const value of [false, 1, 'true', null]) {
+      expect(parseAgentTurnsResponse({
+        projection: { activeTurnId: 'turn_1', activeTurn: { ...active, canSteerLocation: value } },
+      }).activeTurn).toEqual(active)
+    }
+    for (const status of ['queued', 'waiting_for_approval', 'waiting_for_user']) {
+      expect(parseAgentTurnsResponse({
+        projection: { activeTurnId: 'turn_1', activeTurn: { ...active, status, canSteerLocation: true } },
+      }).activeTurn).toEqual({ ...active, status })
+    }
+    expect(parseAgentTurnsResponse({
+      turns: [{ ...active, canSteerLocation: true }],
+      projection: { activeTurnId: 'turn_1' },
+    }).activeTurn).toEqual(active)
+    expect(parseAgentTurnsResponse({
+      projection: { activeTurnId: 'turn_2', activeTurn: { ...active, canSteerLocation: true } },
+    }).activeTurn).toBeNull()
+  })
+
   it('treats only a complete active-Turn projection as authoritative', () => {
     expect(hasAuthoritativeAgentTurnState({ turns: [], projection: { activeTurnId: null, activeTurn: null } })).toBe(true)
     expect(hasAuthoritativeAgentTurnState({ turns: [], projection: { activeTurnId: 'turn_1', activeTurn: { id: 'turn_1', status: 'in_progress', revision: 1 } } })).toBe(true)

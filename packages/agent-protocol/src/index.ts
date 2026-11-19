@@ -28,6 +28,14 @@ export { AgentSessionSchema, SessionSourceSchema, SessionStatusSchema } from './
 export type { AgentSession, SessionSource, SessionStatus } from './session.js'
 export { AgentSessionControlActionSchema, AgentSessionControlCommandSchema } from './session-control.js'
 export type { AgentSessionControlAction, AgentSessionControlCommand } from './session-control.js'
+export {
+  formatObjectiveLocationSteerMessage,
+  OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE,
+  OBJECTIVE_LOCATION_STEER_SCHEMA_VERSION,
+  ObjectiveLocationSteerReceiptSchema,
+  ObjectiveLocationSteerRequestSchema,
+} from './objective-location-steer.js'
+export type { ObjectiveLocationSteerReceipt, ObjectiveLocationSteerRequest } from './objective-location-steer.js'
 export { AgentTurnSchema, TurnSourceSchema, TurnStatusSchema } from './turn.js'
 export type { AgentTurn, TurnSource, TurnStatus } from './turn.js'
 export { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, TurnIntentSchema } from './turn-intent.js'
