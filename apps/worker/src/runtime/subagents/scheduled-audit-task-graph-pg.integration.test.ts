@@ -63,10 +63,9 @@ import { SCHEDULED_POST_GATE_AUDIT_CRITERIA, SCHEDULED_POST_GATE_AUDIT_GOAL,
   parseScheduledPostGateHandoff, SCHEDULED_POST_GATE_HANDOFF_EVENT } from "./scheduled-post-gate-contract.js"
 import { scheduledPostGateTaskTemplates } from "./scheduled-post-gate-task-templates.js"
 import { parseSubagentDispatchJobId } from "./dispatch-identity.js"
-import { dispatchPendingSubagentOutbox } from "../../queue/subagent-queue.js"
+import { dispatchPendingSubagentOutbox, type SubagentExecutor, type SubagentQueueLike } from "../../queue/subagent-queue.js"
 import type { SubagentJobPayload } from "./types.js"
 import { runSubagentQueueJob } from "../../queue/subagent-pause-dispatch.js"
-import type { SubagentExecutor } from "../../queue/subagent-queue.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 
 const databaseUrl = dedicatedDisposableUrl()
@@ -736,7 +735,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(approvals.rows[0]?.count ?? 0).toBe(0)
   }, 120_000)
 
-  it("routes a stopped drift through fresh Run Now Analyze, Prepare, and Gate proof", async () => {
+  it("routes a stopped drift through fresh Run Now proof after a same-process Worker-instance restart", async () => {
     let recoveryChildAdapterDiagnostic: string | null = null
     const nativeVerificationTrace: string[] = []
     const rootCompletionTrace: string[] = []
@@ -869,6 +868,10 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     let dispatchActive = false
     let dispatchLoop: Promise<void> | undefined
     let dispatchFailure: unknown
+    let childWorkerGeneration = 0
+    let gateDispatchTaskId: string | null = null
+    let gateDispatchQueuePaused = false
+    let gateDispatchPublished = false
     let modelFactoryCalls = 0
     let modelStateJson = ""
     const modelRequestJson: string[] = []
@@ -928,7 +931,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       ])
       const productionChild = await import("./production-child-runtime.js")
       const gateRuntime = await import("./scheduled-gate-child-runtime.js")
-      const manager = new AgentTreeManager(new PgSubagentTaskStore(pool as never))
+      let manager = new AgentTreeManager(new PgSubagentTaskStore(pool as never))
       const childModelRuntimeFactory = ({ task }: { task: { id: string; role: string; attemptCount: number } }): ModelAdapter => {
         let round = 0
         const jobReadCallId = `fresh-job-read-${task.id}-${task.attemptCount}`
@@ -1077,17 +1080,47 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       childRedis = new Redis(redisUrl!, { maxRetriesPerRequest: null, connectTimeout: 2_000,
         retryStrategy: attempt => attempt > 3 ? null : 100 })
       childQueue = new Queue<SubagentJobPayload>(childQueueName, { connection: childRedis.duplicate(), skipVersionCheck: true })
-      childWorker = new Worker<SubagentJobPayload, unknown>(childQueueName, async job => {
-        const identity = parseSubagentDispatchJobId(job.id, job.data.taskId)
-        if (!identity) throw new Error("Run Now recovery child dispatch identity invalid")
-        return runSubagentQueueJob(pool as never, manager, executeChild, job.data, identity)
-      }, { connection: childRedis.duplicate(), concurrency: 1, skipVersionCheck: true })
+      const createChildWorker = () => {
+        childWorkerGeneration += 1
+        return new Worker<SubagentJobPayload, unknown>(childQueueName, async job => {
+          const identity = parseSubagentDispatchJobId(job.id, job.data.taskId)
+          if (!identity) throw new Error("Run Now recovery child dispatch identity invalid")
+          return runSubagentQueueJob(pool as never, manager, executeChild, job.data, identity)
+        }, { connection: childRedis!.duplicate(), concurrency: 1, skipVersionCheck: true })
+      }
+      childWorker = createChildWorker()
+      const dispatchQueue: SubagentQueueLike = { add: async (name, payload, options) => {
+        const candidate = await pool!.query<{ role: string; taskType: string; status: string; turnId: string | null }>(`SELECT "role", "taskType", "status", "turnId"
+          FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`, [payload.taskId, fixture.ids.sessionId])
+        const task = candidate.rows[0]
+        if (task?.role === "prepare" && task.taskType === SCHEDULED_GATE_TASK_TYPE && task.status === "queued"
+          && task.turnId === recoveryTurnId) {
+          if (gateDispatchTaskId) throw new Error("Run Now recovery queued more than one fresh Gate dispatch")
+          await childQueue!.pause()
+          gateDispatchQueuePaused = true
+          gateDispatchTaskId = payload.taskId
+        }
+        return childQueue!.add(name, payload, options)
+      } }
       await Promise.all([childQueue.waitUntilReady(), childWorker.waitUntilReady()])
       dispatchActive = true
       dispatchLoop = (async () => {
         while (dispatchActive) {
-          try { await dispatchPendingSubagentOutbox(pool as never, childQueue!, 20, fixture.ids.sessionId) }
+          try { await dispatchPendingSubagentOutbox(pool as never, dispatchQueue, 1, fixture.ids.sessionId) }
           catch (error: unknown) { dispatchFailure = error; dispatchActive = false; return }
+          if (gateDispatchTaskId) {
+            const outbox = await pool!.query<{ publishedAt: Date | null }>(`SELECT "publishedAt" FROM "agent_outbox"
+              WHERE "topic"='agent.subagent.dispatch' AND "idempotencyKey"=$1 AND "aggregateId"=$2`,
+            [`subagent-dispatch:${gateDispatchTaskId}`, fixture.ids.sessionId])
+            if (outbox.rows.length !== 1 || !(outbox.rows[0]?.publishedAt instanceof Date)) {
+              dispatchFailure = new Error("Run Now recovery fresh Gate outbox was not committed")
+              dispatchActive = false
+              return
+            }
+            gateDispatchPublished = true
+            dispatchActive = false
+            return
+          }
           await new Promise(resolve => setTimeout(resolve, 25))
         }
       })()
@@ -1418,6 +1451,68 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
         throw new Error("Fresh Run Now Analyze handoff returned scheduled_pipeline_mode_mismatch at POST /api/internal/agent-runtime/scheduled-pipeline")
       }
       expect(["completed", "waiting_for_dependency", "waiting_for_user"]).toContain(workerStatus)
+      const gateDispatchDeadline = Date.now() + 15_000
+      while (!gateDispatchPublished && !dispatchFailure && Date.now() < gateDispatchDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      if (dispatchFailure) throw new Error("Run Now recovery subagent outbox dispatch failed before Worker-instance restart")
+      if (!gateDispatchTaskId || !gateDispatchPublished || !gateDispatchQueuePaused || !childQueue || !childWorker) {
+        throw new Error("Fresh Gate dispatch did not reach the paused same-queue restart cut")
+      }
+      const freshGateTaskId = gateDispatchTaskId
+      await dispatchLoop
+      expect(response.gateCalls()).toBe(0)
+      const queuedGate = await pool!.query<{ status: string }>(`SELECT task."status" FROM "sub_agent_tasks" task
+        JOIN "agent_sessions" session ON session."id"=task."sessionId" AND session."userId"=$2
+        JOIN "agent_turns" turn ON turn."id"=task."turnId" AND turn."sessionId"=task."sessionId" AND turn."userId"=$2
+        WHERE task."id"=$1 AND task."sessionId"=$3 AND task."turnId"=$4 AND task."taskType"=$5`,
+      [freshGateTaskId, fixture.ids.userId, fixture.ids.sessionId, recoveryTurnId, SCHEDULED_GATE_TASK_TYPE])
+      expect(queuedGate.rows).toEqual([{ status: "queued" }])
+      const beforeRestartGraph = await loadTaskGraph(pool as never, { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
+        turnId: recoveryTurnId, rootTaskId: rootTaskId!, parentTaskId: rootTaskId! }, false)
+      if (!beforeRestartGraph.snapshot) throw new Error("Fresh pre-Gate TaskGraph snapshot was not persisted")
+      const beforeRestartPrepareNode = beforeRestartGraph.snapshot.nodes.find(node => node.key === "prepare")
+      const beforeRestartPrepare = beforeRestartPrepareNode?.taskId ? beforeRestartGraph.tasks.get(beforeRestartPrepareNode.taskId) : undefined
+      if (!beforeRestartPrepare || beforeRestartPrepare.status !== "completed") {
+        throw new Error("Fresh Prepare task was not completed before the Worker-instance restart cut")
+      }
+      const scope = { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: recoveryTurnId, rootTaskId: rootTaskId! }
+      const beforeRestartExecution = await pool!.query<{ state: unknown; attemptCount: number }>(`SELECT "state", "attemptCount"
+        FROM "agent_executions" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`,
+      [fixture.executionOwner.executionId, scope.userId, scope.sessionId])
+      const beforeRestartExecutionRow = beforeRestartExecution.rows[0]
+      const beforeRestartAnalyzeKey = debugRecord(debugRecord(beforeRestartExecutionRow?.state)?.scheduledTaskGraphContinuation)?.key
+      if (!beforeRestartExecutionRow || typeof beforeRestartAnalyzeKey !== "string") {
+        throw new Error("Fresh Analyze checkpoint was not persisted before the Worker-instance restart cut")
+      }
+      const beforeRestartReceipt = await readScheduledGateRegistrationReceipt(pool as never, { ...scope, gateTaskId: freshGateTaskId,
+        owner: { ...scope, rootAttemptCount: rootTask.rows[0]!.attemptCount, executionId: fixture.executionOwner.executionId,
+          executionAttemptCount: beforeRestartExecutionRow.attemptCount } })
+      if (!beforeRestartReceipt) throw new Error("Fresh Gate receipt was not bound before the Worker-instance restart cut")
+      const beforeRestartProof = await loadPersistedScheduledPrepareProof(pool as never, scope, beforeRestartPrepare.id,
+        beforeRestartPrepare.result, beforeRestartAnalyzeKey, beforeRestartReceipt.prepareWaitId)
+      expect(beforeRestartProof?.receipt).toMatchObject({ owner: beforeRestartReceipt.owner,
+        checkpointDigest: beforeRestartReceipt.checkpointDigest })
+      expect(beforeRestartProof?.result).toMatchObject({ role: "prepare", status: "completed", taskId: beforeRestartPrepare.id,
+        attemptCount: beforeRestartPrepare.attemptCount, jobs: [{ jobId: currentJob.id, status: "prepared" }] })
+      const originalPrepare = await pool!.query<{ result: unknown }>(`SELECT task."result" FROM "sub_agent_tasks" task
+        JOIN "agent_sessions" session ON session."id"=task."sessionId" AND session."userId"=$2
+        JOIN "agent_turns" turn ON turn."id"=task."turnId" AND turn."sessionId"=task."sessionId" AND turn."userId"=$2
+        WHERE task."id"=$1 AND task."sessionId"=$3 AND task."turnId"=$4 AND task."taskType"='scheduled_application_prepare'`,
+      [fixture.ids.prepareTaskId, fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId])
+      expect(originalPrepare.rows).toHaveLength(1)
+      const originalPrepareResult = originalPrepare.rows[0]!.result
+      expect(await loadPersistedScheduledPrepareProof(pool as never, scope, fixture.ids.prepareTaskId,
+        originalPrepareResult, beforeRestartAnalyzeKey, beforeRestartReceipt.prepareWaitId)).toBeNull()
+      const previousChildWorker = childWorker
+      await previousChildWorker.close()
+      manager = new AgentTreeManager(new PgSubagentTaskStore(pool as never))
+      childWorker = createChildWorker()
+      expect(childWorker).not.toBe(previousChildWorker)
+      expect(childWorkerGeneration).toBe(2)
+      await childWorker.waitUntilReady()
+      await childQueue.resume()
+      gateDispatchQueuePaused = false
       expect(modelStateJson).not.toContain(String(originalSourceMarker?.proofDigest))
       expect(modelStateJson).not.toContain(JSON.stringify(originalSourceMarker))
       expect(modelRequestJson.length).toBeGreaterThanOrEqual(2)
@@ -1535,6 +1630,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       expect(analystNode?.taskId).toBeTruthy()
       expect(prepareNode?.taskId).toBeTruthy()
       expect(gateNode?.taskId).toBeTruthy()
+      expect(gateDispatchTaskId).toBe(gateNode!.taskId)
       expect([scoutNode?.taskId, analystNode?.taskId, prepareNode?.taskId]).not.toContain(fixture.ids.prepareTaskId)
       expect(graphState.nodes.filter(node => ["fresh-scout", "fresh-analyst", "prepare"].includes(node.key))
         .every(node => node.status === "completed" && node.failureReason === null)).toBe(true)
@@ -1542,7 +1638,6 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       expect(graphState.nodes.find(node => node.key === "fresh-analyst")?.verificationReport?.status).toBe("passed")
       const preparedTask = currentGraph.tasks.get(prepareNode!.taskId)
       if (!preparedTask || !Number.isSafeInteger(preparedTask.attemptCount)) throw new Error("Fresh Prepare task result was not persisted")
-      const scope = { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: recoveryTurnId, rootTaskId: rootTaskId! }
       const currentExecution = await pool!.query<{ state: unknown; attemptCount: number }>(`SELECT "state", "attemptCount"
         FROM "agent_executions" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`,
       [fixture.executionOwner.executionId, scope.userId, scope.sessionId])
@@ -1558,16 +1653,18 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       expect(persisted?.receipt).toMatchObject({ owner: bound.owner, checkpointDigest: bound.checkpointDigest })
       expect(persisted?.result).toMatchObject({ role: "prepare", status: "completed", taskId: preparedTask.id,
         attemptCount: preparedTask.attemptCount, jobs: [{ jobId: currentJob.id, status: "prepared" }] })
+      expect(await loadPersistedScheduledPrepareProof(pool as never, scope, fixture.ids.prepareTaskId,
+        originalPrepareResult, analyzeKey, bound.prepareWaitId)).toBeNull()
       const gateTask = currentGraph.tasks.get(gateNode!.taskId)
       expect(gateTask).toMatchObject({ role: "prepare", taskType: SCHEDULED_GATE_TASK_TYPE, status: "waiting_for_user",
         result: { structuredResult: { status: "question_required", kind: "weak_cover_letter" } } })
       const noSubmission = await pool!.query<{ approvals: number; submitApprovals: number; submittedTasks: number }>(`
         SELECT
-          (SELECT COUNT(*)::int FROM "agent_approvals" WHERE "turnId"=$1 AND "sessionId"=$2) AS "approvals",
-          (SELECT COUNT(*)::int FROM "agent_approvals" WHERE "turnId"=$1 AND "sessionId"=$2 AND "type"='submit_application') AS "submitApprovals",
+          (SELECT COUNT(*)::int FROM "agent_approvals" WHERE "turnId"=ANY($1::text[]) AND "sessionId"=$2) AS "approvals",
+          (SELECT COUNT(*)::int FROM "agent_approvals" WHERE "turnId"=ANY($1::text[]) AND "sessionId"=$2 AND "type"='submit_application') AS "submitApprovals",
           (SELECT COUNT(*)::int FROM "application_tasks" WHERE "userId"=$3 AND "sessionId"=$2 AND "jobId"=$4
             AND "status" IN ('submitted','applied')) AS "submittedTasks"`,
-      [recoveryTurnId, fixture.ids.sessionId, fixture.ids.userId, currentJob.id])
+      [[fixture.ids.turnId, recoveryTurnId], fixture.ids.sessionId, fixture.ids.userId, currentJob.id])
       expect(noSubmission.rows[0]).toEqual({ approvals: 0, submitApprovals: 0, submittedTasks: 0 })
     } finally {
       if (runJob) await runJob.catch(() => undefined)
