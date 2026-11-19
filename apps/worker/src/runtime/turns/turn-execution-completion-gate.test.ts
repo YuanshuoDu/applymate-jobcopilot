@@ -50,9 +50,13 @@ import { OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE } from "@jobcopilot/agent-
 import { STEERING_RECONCILIATION_EVENT_TYPE } from "../subagents/steering-reconciliation-contract.js"
 import { assertCompletionAllowed, checkTaskGraphTerminalVerification, completionRecoverySnapshot, repairReportState, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-completion-gate.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
-import { TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY } from "./completion-recovery-context.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
+import { buildGroundedTaskGraphFinalResponse } from "../subagents/task-graph-final-response.js"
+import { taskGraphFinalSummaryCopiesMatch } from "../finalizer.js"
+import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
+import { buildTaskGraphFinalSourceManifest } from "../subagents/task-graph-final-source-manifest.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA } from "./task-graph-terminal-assessment.js"
 import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
@@ -1063,23 +1067,80 @@ describe("TaskGraph terminal verification gate", () => {
   })
 
   it("lets a later valid repair resolve a previously rejected repair without mutating its failed row", async () => {
+    const oldScout = node("old-scout", "task-old-scout")
     const target = node("scout", "task-scout"), relation = { graphRootTaskId: "root-1", nodeKey: target.key, taskId: target.taskId, criterionIds: ["candidate-present"] }
     const rejected = node("repair-first", "task-repair-first", relation), repair = node("repair-second", "task-repair-second", relation)
+    const oldResult = { ...structuredResult("passed"), candidates: [{ jobId: "old-job", source: "greenhouse", url: null, evidenceIds: ["read:job:old-job"] }],
+      evidence: [{ id: "read:job:old-job", kind: "job", ref: "old-job", source: "greenhouse" }] }
+    const oldReport = { ...report("passed"), resultDigest: taskGraphResultDigest(oldResult) }
     const rejectedReport = { ...report("passed"), status: "unverified", reasonCode: "repair_target_unresolved", evidenceDigest: null }
     const receipt = { schemaVersion: "agent-harness.v2.task-graph-repair-receipt.v1", graphRootTaskId: "root-1", targetNodeKey: target.key, targetTaskId: target.taskId,
       criterionIds: relation.criterionIds, repairNodeKey: repair.key, repairTaskId: repair.taskId, verifierVersion: TASK_GRAPH_VERIFIER_VERSION, evidenceDigest: digest }
     const tasks = [
+      { id: oldScout.taskId, status: "completed", role: "scout", taskType: "scout", failureReason: null, result: { structuredResult: oldResult, taskGraphVerificationReport: oldReport } },
       { id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_failed", result: storedResult("failed") },
       { id: rejected.taskId, status: "failed", role: "scout", failureReason: "task_graph_repair_target_unresolved", result: { structuredResult: structuredResult("passed"), taskGraphVerificationReport: rejectedReport } },
       { id: repair.taskId, status: "completed", role: "scout", failureReason: null, result: { ...storedResult("passed"), taskGraphRepairReceipt: receipt } },
     ]
-    await expect(checkTaskGraphTerminalVerification(graphClient([target, rejected, repair], tasks), graphLease, "root-1")).resolves.toMatchObject({ ok: true })
-    const unresolved = await checkTaskGraphTerminalVerification(graphClient([target, rejected], tasks.slice(0, 2)), graphLease, "root-1")
+    const loaded = { rootTaskId: "root-1", snapshot: { nodes: [oldScout, target, rejected, repair] },
+      item: { id: taskGraphItemId("root-1"), revision: 1, content: {}, createdAt: nowValue }, state: { revision: 1 },
+      tasks: new Map(tasks.map(task => [task.id, { ...task, taskType: "scout" }])),
+      sourceInputCheckpointByNodeKey: new Map(), sourceInputRelationByNodeKey: new Map() }
+    graphLoadHarness.enabled = true
+    graphLoadHarness.value = loaded
+    reconciliationHarness.enabled = true
+    reconciliationHarness.value = { originalInputId: null, currentRevision: 1, decisionStepId: null, decisionStepOrdinal: null,
+      decisionStepAttempt: null, decisionInputThroughSequence: null, agendaPlanRevision: null, lastReconciledInputThroughSequence: 12n, unresolvedInputs: [] }
+    locationReaderHarness.enabled = true
+    locationReaderHarness.value = { kind: "confirmed", locations: ["dublin"], acceptedInputSequence: 12n }
+    locationCompletionHarness.enabled = true
+    locationCompletionHarness.value = { kind: "applicable", historicalNodeIndices: new Set([0]) }
+    const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('SELECT turn."input"')) return { rows: [{ input: { verificationRequirements: { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: [] } } }], rowCount: 1 }
+      const hinted = params?.[3] === OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE
+      return { rows: hinted ? [{ id: "typed-location-hint" }] : [], rowCount: hinted ? 1 : 0 }
+    }) } as never
+    const accepted = await checkTaskGraphTerminalVerification(client, graphLease, "root-1")
+    expect(accepted).toMatchObject({ ok: true })
+    if (!accepted.ok) return
+    const binding = accepted[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+    if (!binding) throw new Error("expected the terminal gate to return its current final-summary binding")
+    expect(binding?.resolvedRepairTaskIds).toEqual(["task-repair-first", "task-scout"])
+    expect(binding?.members?.map(member => [member.nodeIndex, member.taskId, member.kind])).toEqual([
+      [0, "task-old-scout", "historical"], [1, "task-scout", "business"],
+      [2, "task-repair-first", "business"], [3, "task-repair-second", "business"],
+    ])
+    expect(binding?.summary.taskOutcomes.map(outcome => outcome.taskId)).not.toContain("task-old-scout")
+    expect(binding?.summary.discoveredJobs[0]?.taskIds).toEqual(["task-repair-first", "task-repair-second"])
+    const finalResponse = buildGroundedTaskGraphFinalResponse(binding)
+    expect(finalResponse).toContain("Search results: 1 unique job reported (partial coverage).")
+    expect(finalResponse).toContain("Search: 2 failed tasks; valid structured result reported completed. Verified repair evidence covers the affected criteria.")
+    expect(finalResponse).not.toContain("Inspect the reported Search task outcome.")
+    expect(finalResponse).not.toContain("old-job")
+    const finalItemId = "final-item-combined"
+    const summary = formatTaskGraphFinalSummary(binding.summary)
+    const manifest = buildTaskGraphFinalSourceManifest(binding, finalItemId)!
+    expect(manifest).toMatchObject({ schemaVersion: "agent-harness.v2.task-graph-sources.v2", historicalNodeIndices: [0],
+      sources: [{ nodeIndex: 1 }, { nodeIndex: 2 }, { nodeIndex: 3 }] })
+    const finalContent = { text: finalResponse, final: { response: finalResponse, summary }, taskGraphSources: manifest }
+    const serialized = JSON.stringify({ response: finalResponse, summary })
+    expect(taskGraphFinalSummaryCopiesMatch(binding, binding, finalContent, serialized, finalItemId)).toBe(true)
+    expect(taskGraphFinalSummaryCopiesMatch(binding, { ...binding, resolvedRepairTaskIds: ["task-scout"] }, finalContent, serialized, finalItemId)).toBe(false)
+    expect(taskGraphFinalSummaryCopiesMatch(binding, { ...binding, members: binding.members?.map(member => member.nodeIndex === 0
+      ? { ...member, kind: "business" as const } : member) }, finalContent, serialized, finalItemId)).toBe(false)
+    const unresolvedLoaded = { ...loaded, snapshot: { nodes: [target, rejected] },
+      tasks: new Map([tasks[1]!, tasks[2]!].map(task => [task.id, { ...task, taskType: "scout" }])) }
+    graphLoadHarness.value = unresolvedLoaded
+    locationCompletionHarness.value = { kind: "applicable", historicalNodeIndices: new Set() }
+    const unresolved = await checkTaskGraphTerminalVerification(graphClient([target, rejected], [tasks[1]!, tasks[2]!]), graphLease, "root-1")
     expect(unresolved).toMatchObject({ ok: false })
     if (unresolved.ok) return
+    expect(Reflect.get(unresolved, TASK_GRAPH_FINAL_SUMMARY_BINDING)).toBeUndefined()
     expect(unresolved.feedback).toContain("nodeOrdinal=2 status=unverified reasonCode=repair_target_unresolved")
-    const rejectedResult = tasks[1]!.result as Record<string, unknown>
-    const forged = [{ ...tasks[0] }, { ...tasks[1], result: { ...rejectedResult, taskGraphRepairReceipt: { ...receipt, targetTaskId: "foreign" } } }, tasks[2]!]
+    const rejectedResult = tasks[2]!.result as Record<string, unknown>
+    const forged = [{ ...tasks[1]! }, { ...tasks[2]!, result: { ...rejectedResult, taskGraphRepairReceipt: { ...receipt, targetTaskId: "foreign" } } }, tasks[3]!]
+    graphLoadHarness.value = { ...loaded, snapshot: { nodes: [target, rejected, repair] },
+      tasks: new Map(forged.map(task => [task.id, { ...task, taskType: "scout" }])) }
     await expect(checkTaskGraphTerminalVerification(graphClient([target, rejected, repair], forged), graphLease, "root-1")).resolves.toMatchObject({ ok: false })
   })
 
