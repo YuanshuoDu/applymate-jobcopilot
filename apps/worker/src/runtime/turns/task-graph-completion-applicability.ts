@@ -13,6 +13,7 @@ export function taskGraphCompletionApplicability(
   latestUserRevision: LatestUserRevision | undefined,
   currentRevision: number,
   verifiedCompletedTaskIds: ReadonlySet<string>,
+  compatibleRetainedScoutKeys: ReadonlySet<string> = new Set(),
 ): TaskGraphCompletionApplicability {
   if (!latestUserRevision) return { kind: "applicable", historicalNodeIndices: new Set() }
   if (!loaded.snapshot || !loaded.item || loaded.item.revision !== currentRevision
@@ -26,6 +27,11 @@ export function taskGraphCompletionApplicability(
     const source = loaded.sourceInputCheckpointByNodeKey.get(node.key)
     if (!source) return { kind: "replan" }
     if (source.inputThroughSequence < latestUserRevision.inputThroughSequence) {
+      if (role === "scout" && compatibleRetainedScoutKeys.has(node.key) && task?.status === "completed"
+        && task.failureReason === null && verifiedCompletedTaskIds.has(task.id)) {
+        currentRoles.add(role)
+        continue
+      }
       if (task?.status === "completed" && task.failureReason === null && verifiedCompletedTaskIds.has(task.id)) {
         historicalNodeIndices.add(nodeIndex)
         historicalKeys.add(node.key)

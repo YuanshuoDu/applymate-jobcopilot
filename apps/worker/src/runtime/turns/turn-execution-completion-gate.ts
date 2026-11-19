@@ -1,5 +1,6 @@
 import { TASK_GRAPH_DENIAL_CHECKPOINT, type TurnExecutionOptions } from "./turn-execution-types.js"
 import type pg from "pg"
+import { OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE } from "@jobcopilot/agent-protocol"
 import type { TurnLease } from "./lease.js"
 import { loadTaskGraph, type GraphIdentityScope } from "../subagents/task-graph-pg-state.js"
 import { taskGraphItemId, type StoredTaskGraphNode } from "../subagents/task-graph-snapshot.js"
@@ -12,6 +13,8 @@ import { readSteeringReconciliationState } from "../subagents/steering-reconcili
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { applyCompletionRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
+import { readTaskGraphConfirmedLocationSteer } from "../subagents/task-graph-confirmed-location-steer.js"
+import { resolveTaskGraphConfirmedLocationCompletion } from "./task-graph-confirmed-location-completion.js"
 import { taskGraphCompletionApplicability } from "./task-graph-completion-applicability.js"
 import { assertCompletionAllowed, TASK_GRAPH_FEEDBACK, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-terminal-decision.js"
 export { assertCompletionAllowed, TASK_GRAPH_VERIFICATION_BLOCKER }
@@ -81,6 +84,24 @@ async function hasReconciliationEventHint(client: pg.PoolClient, lease: TurnLeas
   [lease.sessionId, lease.turnId, rootTaskId, STEERING_RECONCILIATION_EVENT_TYPE, lease.ownerId, lease.leaseVersion, lease.userId])
   return result.rows.length > 0
 }
+async function hasConfirmedLocationEventHint(client: pg.PoolClient, lease: TurnLease, rootTaskId: string): Promise<boolean> {
+  const result = await client.query(`SELECT 1 FROM "agent_events" AS event
+    JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+    JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+    WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = $4
+      AND turn."rootTaskId" = $3 AND turn."leaseOwnerId" = $5 AND turn."leaseVersion" = $6
+      AND session."userId" = $7 AND turn."userId" = $7 LIMIT 1`,
+  [lease.sessionId, lease.turnId, rootTaskId, OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE, lease.ownerId, lease.leaseVersion, lease.userId])
+  return result.rows.length > 0
+}
+async function readPersistedTurnInput(client: pg.PoolClient, lease: TurnLease, rootTaskId: string): Promise<{ found: boolean; input?: unknown }> {
+  const result = await client.query(`SELECT turn."input" FROM "agent_turns" AS turn
+    JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+    WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND turn."rootTaskId" = $4
+      AND turn."leaseOwnerId" = $5 AND turn."leaseVersion" = $6 AND turn."status" = 'in_progress' LIMIT 2`,
+  [lease.turnId, lease.sessionId, lease.userId, rootTaskId, lease.ownerId, lease.leaseVersion])
+  return result.rows.length === 1 ? { found: true, input: result.rows[0]?.input } : { found: false }
+}
 /** Rechecks durable reports against the current immutable graph inside the caller's transaction. */
 export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, lease: TurnLease, rootTaskId: string, nativeVerificationPassed = false, requireTaskGraph = false): Promise<Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>> {
   let graphRevision: number | null = null
@@ -94,19 +115,32 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
   const scope: GraphIdentityScope = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId, parentTaskId: rootTaskId }
   try {
     let reconciliationState: SteeringReconciliationState | null = null
-    if (await hasReconciliationEventHint(client, lease, rootTaskId)) {
+    const hasRevisionHint = await hasReconciliationEventHint(client, lease, rootTaskId)
+    const hasLocationHint = await hasConfirmedLocationEventHint(client, lease, rootTaskId)
+    if (hasRevisionHint || hasLocationHint) {
       reconciliationState = await readSteeringReconciliationState(client, { ...scope, turnLeaseOwner: lease.ownerId,
         turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1 })
       if (reconciliationState.unresolvedInputs.length) return { ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK }
     }
+    let confirmedLocation: Awaited<ReturnType<typeof readTaskGraphConfirmedLocationSteer>> | null = null
+    if (hasLocationHint) {
+      const cutoff = reconciliationState?.lastReconciledInputThroughSequence
+      if (typeof cutoff !== "bigint" || cutoff < 0n) return deny("result_applicability")
+      confirmedLocation = await readTaskGraphConfirmedLocationSteer(client, {
+        userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId,
+      }, cutoff)
+      if (confirmedLocation.kind === "pending") return { ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK }
+      if (confirmedLocation.kind === "unavailable" || confirmedLocation.kind === "absent") return deny("result_applicability")
+    }
     const latestUserRevision = reconciliationState?.latestUserRevision
-    const loaded = await loadTaskGraph(client, scope, true, latestUserRevision ? { includeSourceProvenance: true } : {})
+    const loaded = await loadTaskGraph(client, scope, true, latestUserRevision || confirmedLocation?.kind === "confirmed" ? { includeSourceProvenance: true } : {})
     if (!loaded.snapshot) {
-      if (latestUserRevision) return deny("result_applicability")
+      if (latestUserRevision || confirmedLocation?.kind === "confirmed") return deny("result_applicability")
       const plans = await client.query(`SELECT 1 FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId" JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId" WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3 AND event."taskId" = $4 AND event."payload"->>'kind' IN ('proposal', 'native_command') AND session."userId" = $5 AND turn."userId" = $5 LIMIT 1`, [lease.sessionId, lease.turnId, taskGraphItemId(rootTaskId), rootTaskId, lease.userId])
       return plans.rows.length || requireTaskGraph ? deny() : { ok: true }
     }
-    if (latestUserRevision && (!loaded.item || reconciliationState?.currentRevision !== loaded.item.revision)) return deny("result_applicability")
+    if ((latestUserRevision || confirmedLocation?.kind === "confirmed")
+      && (!loaded.item || reconciliationState?.currentRevision !== loaded.item.revision)) return deny("result_applicability")
     if (requireTaskGraph && loaded.snapshot.nodes.length === 0) return deny()
     graphRevision = loaded.item && Number.isSafeInteger(loaded.item.revision) && loaded.item.revision >= 1 ? loaded.item.revision : null
     denialCheckpoint = buildTaskGraphDenialCheckpoint(loaded, rootTaskId)
@@ -157,12 +191,23 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
         return deny("repair_receipt", [...(targetReport ? reportFeedback(target, targetReport, nodes, "invalid_receipt") : []), ...reportFeedback(repair, report, nodes)])
       }
     }
+    const verifiedCompletedTaskIds = new Set([...reports].flatMap(([taskId, report]) => {
+      const task = loaded.tasks.get(taskId)
+      return report.status === "passed" && task?.status === "completed" && task.failureReason === null ? [taskId] : []
+    }))
     let historicalNodeIndices: ReadonlySet<number> = new Set()
-    if (latestUserRevision) {
-      const verifiedCompletedTaskIds = new Set([...reports].flatMap(([taskId, report]) => {
-        const task = loaded.tasks.get(taskId)
-        return report.status === "passed" && task?.status === "completed" && task.failureReason === null ? [taskId] : []
-      }))
+    if (confirmedLocation?.kind === "confirmed") {
+      const persisted = await readPersistedTurnInput(client, lease, rootTaskId)
+      if (!persisted.found) return deny("result_applicability")
+      const locationCompletion = await resolveTaskGraphConfirmedLocationCompletion({
+        client, loaded, scope, reconciliation: reconciliationState!, confirmed: confirmedLocation,
+        persistedTurnInput: persisted.input, verifiedCompletedTaskIds,
+      })
+      if (locationCompletion.kind === "pending") return { ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK }
+      if (locationCompletion.kind !== "applicable") return deny("result_applicability")
+      historicalNodeIndices = locationCompletion.historicalNodeIndices
+    }
+    if (latestUserRevision && confirmedLocation?.kind !== "confirmed") {
       const applicability = taskGraphCompletionApplicability(loaded, latestUserRevision, reconciliationState!.currentRevision, verifiedCompletedTaskIds)
       if (applicability.kind === "replan") return deny("result_applicability")
       historicalNodeIndices = applicability.historicalNodeIndices

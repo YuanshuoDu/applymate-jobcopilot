@@ -35,6 +35,17 @@ describe("TaskGraph completion applicability", () => {
     expect(result).toEqual({ kind: "applicable", historicalNodeIndices: new Set([0]) })
   })
 
+  it("keeps only an independently verified compatible prior Scout current", () => {
+    const graphValue = loaded([
+      { key: "old-scout", taskId: "old-scout-task", role: "scout", checkpoint: 9n, relation: "predates_current_inputs" },
+      { key: "scout", taskId: "scout-task", role: "scout", checkpoint: 10n, relation: "covers_current_inputs" },
+      { key: "analyst", taskId: "analyst-task", role: "analyst", checkpoint: 10n, relation: "covers_current_inputs" },
+    ])
+    const result = taskGraphCompletionApplicability(graphValue, latest, 6,
+      ids("old-scout-task", "scout-task", "analyst-task"), new Set(["old-scout"]))
+    expect(result).toEqual({ kind: "applicable", historicalNodeIndices: new Set() })
+  })
+
   it("requests replanning when excluded historical role has no current verified result", () => {
     const result = taskGraphCompletionApplicability(loaded([
       { key: "old-scout", taskId: "old-scout-task", role: "scout", checkpoint: 9n, relation: "predates_current_inputs" },

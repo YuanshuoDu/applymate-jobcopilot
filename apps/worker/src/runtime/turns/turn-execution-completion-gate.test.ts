@@ -1,5 +1,23 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
+const locationReaderHarness = vi.hoisted(() => ({ enabled: false, value: null as unknown, calls: [] as unknown[][] }))
+vi.mock("../subagents/task-graph-confirmed-location-steer.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../subagents/task-graph-confirmed-location-steer.js")>()
+  return { ...actual, readTaskGraphConfirmedLocationSteer: (...args: Parameters<typeof actual.readTaskGraphConfirmedLocationSteer>) => {
+    if (!locationReaderHarness.enabled) return actual.readTaskGraphConfirmedLocationSteer(...args)
+    locationReaderHarness.calls.push(args)
+    return Promise.resolve(locationReaderHarness.value as Awaited<ReturnType<typeof actual.readTaskGraphConfirmedLocationSteer>>)
+  } }
+})
+const locationCompletionHarness = vi.hoisted(() => ({ enabled: false, value: null as unknown, calls: [] as unknown[][] }))
+vi.mock("./task-graph-confirmed-location-completion.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./task-graph-confirmed-location-completion.js")>()
+  return { ...actual, resolveTaskGraphConfirmedLocationCompletion: (...args: Parameters<typeof actual.resolveTaskGraphConfirmedLocationCompletion>) => {
+    if (!locationCompletionHarness.enabled) return actual.resolveTaskGraphConfirmedLocationCompletion(...args)
+    locationCompletionHarness.calls.push(args)
+    return Promise.resolve(locationCompletionHarness.value as Awaited<ReturnType<typeof actual.resolveTaskGraphConfirmedLocationCompletion>>)
+  } }
+})
 const reconciliationHarness = vi.hoisted(() => ({ enabled: false, value: null as unknown, error: null as Error | null, calls: [] as unknown[][] }))
 vi.mock("../subagents/steering-reconciliation-read.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../subagents/steering-reconciliation-read.js")>()
@@ -28,6 +46,8 @@ import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SE
   type TurnEngineCompletionGate } from "./turn-execution-types.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK,
   type SteeringReconciliationState } from "../subagents/steering-reconciliation-contract.js"
+import { OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE } from "@jobcopilot/agent-protocol"
+import { STEERING_RECONCILIATION_EVENT_TYPE } from "../subagents/steering-reconciliation-contract.js"
 import { assertCompletionAllowed, checkTaskGraphTerminalVerification, completionRecoverySnapshot, repairReportState, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-completion-gate.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js"
@@ -42,6 +62,8 @@ import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK } from "../subagents/schedul
 afterEach(() => {
   reconciliationHarness.enabled = false; reconciliationHarness.value = null; reconciliationHarness.error = null; reconciliationHarness.calls = []
   graphLoadHarness.enabled = false; graphLoadHarness.value = null; graphLoadHarness.calls = []
+  locationReaderHarness.enabled = false; locationReaderHarness.value = null; locationReaderHarness.calls = []
+  locationCompletionHarness.enabled = false; locationCompletionHarness.value = null; locationCompletionHarness.calls = []
 })
 
 type GateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate">
@@ -640,7 +662,8 @@ describe("TaskGraph terminal verification gate", () => {
     const queries: Array<{ sql: string; params?: unknown[] }> = []
     const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
       queries.push({ sql, params })
-      return { rows: hasHint ? [{ id: "receipt-hint" }] : [], rowCount: hasHint ? 1 : 0 }
+      const hinted = hasHint && params?.[3] === STEERING_RECONCILIATION_EVENT_TYPE
+      return { rows: hinted ? [{ id: "receipt-hint" }] : [], rowCount: hinted ? 1 : 0 }
     }) } as never
 
     await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1")).resolves.toMatchObject({ ok: true })
@@ -662,6 +685,52 @@ describe("TaskGraph terminal verification gate", () => {
     expect(hint?.params).toEqual(["session-1", "turn-1", "root-1", expect.any(String), "worker-1", 1, "user-1"])
     expect(reconciliationHarness.calls[1]?.[1]).toMatchObject({ turnLeaseOwner: "worker-1", turnLeaseVersion: 1,
       parentLeaseOwner: "worker-1", parentAttemptCount: 1, rootTaskId: "root-1" })
+  })
+
+  it("routes the typed location event through the exact reconciled cutoff and persisted Turn input", async () => {
+    const state: SteeringReconciliationState = { originalInputId: null, currentRevision: 1, decisionStepId: null,
+      decisionStepOrdinal: null, decisionStepAttempt: null, decisionInputThroughSequence: null, agendaPlanRevision: null,
+      lastReconciledInputThroughSequence: 12n, unresolvedInputs: [] }
+    const loaded = { rootTaskId: "root-1", snapshot: { nodes: [] }, item: { id: "graph-item", revision: 1, content: {}, createdAt: nowValue },
+      state: { revision: 1, nodes: [] }, tasks: new Map(), sourceInputCheckpointByNodeKey: new Map(), sourceInputRelationByNodeKey: new Map() }
+    reconciliationHarness.enabled = true
+    reconciliationHarness.value = state
+    graphLoadHarness.enabled = true
+    graphLoadHarness.value = loaded
+    locationReaderHarness.enabled = true
+    locationReaderHarness.value = { kind: "confirmed", locations: ["dublin"], acceptedInputSequence: 12n }
+    locationCompletionHarness.enabled = true
+    locationCompletionHarness.value = { kind: "applicable", historicalNodeIndices: new Set() }
+    const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('SELECT turn."input"')) return { rows: [{ input: { verificationRequirements: { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: [] } } }], rowCount: 1 }
+      const hinted = params?.[3] === OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE
+      return { rows: hinted ? [{ id: "typed-location-hint" }] : [], rowCount: hinted ? 1 : 0 }
+    }) } as never
+
+    await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1")).resolves.toMatchObject({ ok: true })
+    expect(locationReaderHarness.calls[0]?.[1]).toEqual({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1" })
+    expect(locationReaderHarness.calls[0]?.[2]).toBe(12n)
+    expect(graphLoadHarness.calls[0]?.[3]).toEqual({ includeSourceProvenance: true })
+    expect(locationCompletionHarness.calls[0]?.[0]).toMatchObject({ reconciliation: state, confirmed: locationReaderHarness.value,
+      persistedTurnInput: { verificationRequirements: { requirements: [] } } })
+  })
+
+  it("blocks a typed location steer that is newer than the validated reconciliation cutoff", async () => {
+    const state: SteeringReconciliationState = { originalInputId: null, currentRevision: 1, decisionStepId: null,
+      decisionStepOrdinal: null, decisionStepAttempt: null, decisionInputThroughSequence: null, agendaPlanRevision: null,
+      lastReconciledInputThroughSequence: 10n, unresolvedInputs: [] }
+    reconciliationHarness.enabled = true
+    reconciliationHarness.value = state
+    locationReaderHarness.enabled = true
+    locationReaderHarness.value = { kind: "pending" }
+    const client = { query: vi.fn(async (_sql: string, params?: unknown[]) => {
+      const hinted = params?.[3] === OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE
+      return { rows: hinted ? [{ id: "typed-location-hint" }] : [], rowCount: hinted ? 1 : 0 }
+    }) } as never
+    await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1"))
+      .resolves.toMatchObject({ ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK })
+    expect(locationReaderHarness.calls[0]?.[2]).toBe(10n)
+    expect(graphLoadHarness.calls).toHaveLength(0)
   })
 
   it("blocks unresolved steering with the existing steering recovery before graph loading", async () => {
