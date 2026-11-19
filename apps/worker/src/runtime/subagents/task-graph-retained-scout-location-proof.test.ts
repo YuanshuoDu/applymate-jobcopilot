@@ -61,7 +61,7 @@ async function fixture(options: Readonly<{
       sequence: 2, payload: { taskId: scope.taskId, toolCallId: "call-1", toolName: "jobs.search", status: "completed", errorCode: null } },
   ]
   let task: GraphTaskRow & {
-    sessionId: string; turnId: string; rootTaskId: string; turnRootTaskId: string; userId: string
+    sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string; turnRootTaskId: string; userId: string
     turnSource: string; turnExecutionMode: string; turnInput: unknown
   } = {
     id: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
