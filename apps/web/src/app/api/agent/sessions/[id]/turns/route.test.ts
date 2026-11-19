@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(), sessionFindFirst: vi.fn(), turnFindMany: vi.fn(), turnFindFirst: vi.fn(), inputCount: vi.fn(),
@@ -27,8 +27,10 @@ function turn(id: string, index: number, status = "completed", goal = `Goal ${in
 }
 
 describe("agent turns query API", () => {
+  afterEach(() => vi.unstubAllEnvs())
   beforeEach(() => {
     vi.resetModules()
+    vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "1")
     mocks.requireAuth.mockReset(); mocks.sessionFindFirst.mockReset(); mocks.turnFindMany.mockReset(); mocks.turnFindFirst.mockReset(); mocks.inputCount.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
@@ -53,9 +55,47 @@ describe("agent turns query API", () => {
     }))
     expect(mocks.turnFindFirst).toHaveBeenCalledWith(expect.objectContaining({
       where: { sessionId: "session_1", userId: "user_1", status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] } },
-      select: expect.objectContaining({ input: true }),
+      select: expect.objectContaining({ input: true, executionMode: true, rootTaskId: true }),
     }))
     expect(mocks.inputCount).toHaveBeenCalledWith({ where: { sessionId: "session_1", userId: "user_1", status: "accepted", delivery: "follow_up" } })
+  })
+
+  it("exposes location steering only for an enabled canonical user TaskGraph Turn", async () => {
+    const eligible = {
+      ...turn("turn_2", 2, "in_progress"), executionMode: "canonical_task_graph", rootTaskId: "root_2",
+      input: { goal: "Goal", intent: { kind: "objective_task_graph_execution", version: 1 } },
+    }
+    for (const row of [eligible, { ...eligible, status: "waiting_for_dependency" }]) {
+      mocks.turnFindFirst.mockResolvedValueOnce(row)
+      const { GET } = await import("./route")
+      const response = await GET(request() as never, params)
+      expect((await response.json()).projection.activeTurn.canSteerLocation).toBe(true)
+    }
+    const ineligible = [
+      { ...eligible, source: "automation" },
+      { ...eligible, status: "waiting_for_approval" },
+      { ...eligible, executionMode: "legacy" },
+      { ...eligible, rootTaskId: "  " },
+      { ...eligible, input: { intent: { kind: "objective_task_graph_execution", version: 2 } } },
+      { ...eligible, input: { intent: { kind: "objective_task_graph_execution", version: 1, extra: true } } },
+    ]
+    for (const row of ineligible) {
+      mocks.turnFindFirst.mockResolvedValueOnce(row)
+      const { GET } = await import("./route")
+      const response = await GET(request() as never, params)
+      expect((await response.json()).projection.activeTurn).not.toHaveProperty("canSteerLocation")
+    }
+  })
+
+  it("hides location steering when the server feature flag is off", async () => {
+    vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "0")
+    mocks.turnFindFirst.mockResolvedValueOnce({
+      ...turn("turn_2", 2, "in_progress"), executionMode: "canonical_task_graph", rootTaskId: "root_2",
+      input: { intent: { kind: "objective_task_graph_execution", version: 1 } },
+    })
+    const { GET } = await import("./route")
+    const response = await GET(request() as never, params)
+    expect((await response.json()).projection.activeTurn).not.toHaveProperty("canSteerLocation")
   })
 
   it("omits a missing active goal without fabricating a substitute or dropping controls", async () => {
