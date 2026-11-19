@@ -11,12 +11,14 @@ import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { applyCompletionRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
 import { assertCompletionAllowed, TASK_GRAPH_FEEDBACK, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-terminal-decision.js"
+import { verifyTaskGraphObjectiveFindingAggregation } from "./task-graph-objective-finding-aggregation.js"
 export { assertCompletionAllowed, TASK_GRAPH_VERIFICATION_BLOCKER }
 
 export function completionRecoverySnapshot(snapshot: StepContextSnapshot, stepId: string, feedback: string): StepContextSnapshot {
   return applyCompletionRecovery(snapshot, stepId, feedback)
 }
-type GateFeedbackCode = "legacy_unverified" | "verification_report" | "repair_receipt" | "repair_criterion"
+type GateFeedbackCode = "legacy_unverified" | "verification_report" | "repair_receipt" | "repair_criterion" | "finding_count_shortfall"
+type GateFeedbackCounts = Readonly<{ criterionId: string; required: number; observed: number }>
 type RepairFeedbackState = "missing" | "pending" | "terminal" | "unavailable" | "missing_receipt" | "rejected" | "invalid_receipt" | "invalid_report"
 type GateFeedbackDetail = Readonly<{ nodeOrdinal: number; criterionOrdinal?: number; status: "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode; repairState?: RepairFeedbackState }>
 const ACTIVE_REPAIR_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user"])
@@ -46,13 +48,13 @@ function reportFeedback(node: StoredTaskGraphNode, report: GateReport, nodes: re
     ? [{ nodeOrdinal: nodeIndex + 1, status: "unverified", reasonCode: report.reasonCode, repairState }]
     : []
 }
-function feedbackText(code: GateFeedbackCode | undefined, details: readonly GateFeedbackDetail[]): string {
+function feedbackText(code: GateFeedbackCode | undefined, details: readonly GateFeedbackDetail[], counts?: GateFeedbackCounts): string {
   const rendered = details.map(item => {
     const criterion = item.criterionOrdinal === undefined ? "" : ` criterionOrdinal=${item.criterionOrdinal}`
     const repair = item.repairState ? ` repair=${item.repairState}` : ""
     return `nodeOrdinal=${item.nodeOrdinal}${criterion} status=${item.status} reasonCode=${item.reasonCode}${repair}`
   })
-  const parts = [...(code ? [`issue=${code}`] : []), ...rendered]
+  const parts = [...(code ? [`issue=${code}`] : []), ...(counts ? [`required=${counts.required} observed=${counts.observed}`, `criterionId=${counts.criterionId}`] : []), ...rendered]
   const render = (included: number) => `${TASK_GRAPH_FEEDBACK}${parts.slice(0, included).map(part => ` ${part}`).join("")}`
   const complete = render(parts.length)
   if (complete.length <= 512) return complete
@@ -72,8 +74,8 @@ function row(value: unknown): Record<string, unknown> {
 export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, lease: TurnLease, rootTaskId: string, nativeVerificationPassed = false, requireTaskGraph = false): Promise<Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>> {
   let graphRevision: number | null = null
   let denialCheckpoint: TaskGraphDenialCheckpoint | null = null
-  const deny = (code?: GateFeedbackCode, details: readonly GateFeedbackDetail[] = []) => {
-    const decision = { ok: false as const, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: feedbackText(code, details) }
+  const deny = (code?: GateFeedbackCode, details: readonly GateFeedbackDetail[] = [], counts?: GateFeedbackCounts) => {
+    const decision = { ok: false as const, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: feedbackText(code, details, counts) }
     if (graphRevision !== null) Object.defineProperty(decision, TASK_GRAPH_RECOVERY_REVISION, { value: graphRevision, enumerable: true })
     if (denialCheckpoint) Object.defineProperty(decision, TASK_GRAPH_DENIAL_CHECKPOINT, { value: denialCheckpoint })
     return decision
@@ -135,6 +137,11 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
         return deny("repair_receipt", [...(targetReport ? reportFeedback(target, targetReport, nodes, "invalid_receipt") : []), ...reportFeedback(repair, report, nodes)])
       }
     }
+    const findingAggregation = await verifyTaskGraphObjectiveFindingAggregation({ client, lease, rootTaskId,
+      fullNodes: nodes, applicableTaskIds: new Set(nodes.map(node => node.taskId)), tasks: loaded.tasks, reports,
+      discoveryTurnEligibility: loaded.discoveryTurnEligibility })
+    if (findingAggregation.status === "invalid") return deny()
+    if (findingAggregation.status === "shortfall") return deny("finding_count_shortfall", [], findingAggregation)
     const binding = buildTaskGraphFinalSummaryBinding(loaded)
     return binding ? { ok: true, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding } : { ok: true }
   } catch { graphRevision = null; denialCheckpoint = null; return deny() }

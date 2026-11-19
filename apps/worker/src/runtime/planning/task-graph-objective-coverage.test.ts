@@ -23,6 +23,14 @@ const scoutNode = (key: string, taskId: string, verification = scoutVerification
   verification, taskId, depth: 1, status: "failed" as const, verificationDisposition: "typed" as const,
   ...(repairOf ? { repairOf } : {}),
 })
+const analystVerification = (minimum: number): TaskGraphVerificationContract => ({
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+  criteria: [{ id: "findings", check: { kind: "finding_count_gte", minimum } }],
+})
+const analystNode = (key: string, taskId: string, minimum: number, repairOf?: TaskGraphNodeProposal["repairOf"]) => ({
+  key, taskId, templateId: "analyst", goal: "Analyze roles", successCriteria: ["Return findings"], dependsOn: [],
+  verification: analystVerification(minimum), ...(repairOf ? { repairOf } : {}),
+})
 const relation = (nodeKey: string, taskId: string) => ({ graphRootTaskId: "root-task", nodeKey, taskId, criterionIds: ["roles"] })
 const locationRelation = (nodeKey: string, taskId: string) => ({ graphRootTaskId: "root-task", nodeKey, taskId, criterionIds: ["candidate-location"] })
 
@@ -47,6 +55,27 @@ describe("TaskGraph objective coverage", () => {
       .toEqual({ status: "absent" })
     expect(evaluateTaskGraphObjectiveCoverage({ status: "invalid" }, [], templates, "root-task"))
       .toEqual({ status: "invalid" })
+  })
+
+  it("allows independent Analyst partitions only when current minima cover the immutable finding target", () => {
+    const findings = resolveRootTaskVerificationRequirements(turnInput([
+      { id: "findings", check: { kind: "finding_count_gte", minimum: 4 } },
+    ]))
+    const first = analystNode("partition-a", "task-a", 2)
+    const second = analystNode("partition-b", "task-b", 2)
+    expect(evaluateTaskGraphObjectiveCoverage(findings, [first, second], templates, "root-task"))
+      .toEqual({ status: "covered" })
+    expect(evaluateTaskGraphObjectiveCoverage(findings, [first, analystNode("partition-b", "task-b", 1)], templates, "root-task"))
+      .toMatchObject({ status: "incomplete", requirements: [{ id: "findings", minimum: 4 }] })
+    expect(evaluateTaskGraphObjectiveCoverage(findings, [first, { ...second, templateId: "scout" }], templates, "root-task"))
+      .toMatchObject({ status: "incomplete", requirements: [{ id: "findings", minimum: 4 }] })
+
+    const repaired = analystNode("repair-a", "task-repair-a", 1, {
+      graphRootTaskId: "root-task", nodeKey: "partition-a", taskId: "task-a", criterionIds: ["findings"],
+    })
+    expect(evaluateTaskGraphObjectiveCoverage(findings, [analystNode("partition-a", "task-a", 4), repaired,
+      analystNode("partition-b", "task-b", 2)], templates, "root-task"))
+      .toMatchObject({ status: "incomplete", requirements: [{ id: "findings", minimum: 4 }] })
   })
 
   it("rejects missing, weak, duplicate, wrong-role, and wrong-kind requirements", () => {
