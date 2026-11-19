@@ -16,9 +16,10 @@ vi.mock("../subagents/task-graph-snapshot.js", async importOriginal => {
 vi.mock("../subagents/task-graph-pg-event-validation.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../subagents/task-graph-pg-event-validation.js")>()
   return { ...actual, parsePersistedTaskGraphReceipt: (_type: unknown, payload: unknown) => {
-    const event = payload && typeof payload === "object" ? (payload as { event?: { idempotencyKey?: unknown } }).event : undefined
+    const event = payload && typeof payload === "object"
+      ? (payload as { event?: { idempotencyKey?: unknown; nodeKey?: unknown } }).event : undefined
     return event?.idempotencyKey === harness.ackKey
-      ? { type: "task.interrupted", nodeKey: "old-scout", idempotencyKey: harness.ackKey } : null
+      ? { type: "task.interrupted", nodeKey: event.nodeKey, idempotencyKey: harness.ackKey } : null
   } }
 })
 vi.mock("../subagents/task-graph-confirmed-location-steer.js", async importOriginal => {
@@ -52,18 +53,19 @@ const newNode = { key: "new-scout", taskId: "new-task", templateId: "scout", goa
   dependsOn: [], depth: 1, verificationDisposition: "typed", verification: locations("dublin") }
 const snapshot = { schemaVersion: "agent-harness.v2.task-graph", nodes: [oldNode, newNode] }
 
-function loaded(): LoadedGraph {
+function loaded(replacementStatus: string = "completed", replacementFailure: string | null = null): LoadedGraph {
   return { rootTaskId: "root", discoveryTurnEligibility: "ordinary", item: { id: graphId, revision: 8, content: {}, createdAt: new Date(0) },
     snapshot, state: { revision: 8 }, tasks: new Map([
       ["old-task", { id: "old-task", role: "scout", taskType: "job_discovery", status: "interrupted", failureReason: "Subagent task subtree was interrupted", attemptCount: 2, result: null }],
-      ["new-task", { id: "new-task", role: "scout", taskType: "job_discovery", status: "completed", failureReason: null, attemptCount: 1, result: {} }],
+      ["new-task", { id: "new-task", role: "scout", taskType: "job_discovery", status: replacementStatus,
+        failureReason: replacementFailure, attemptCount: 1, result: {} }],
     ]), sourceInputCheckpointByNodeKey: new Map([
       ["old-scout", { inputThroughSequence: 9n }], ["new-scout", { inputThroughSequence: 10n }],
     ]) } as unknown as LoadedGraph
 }
 const reconciliation = { unresolvedInputs: [], currentRevision: 8, lastReconciledInputThroughSequence: 10n } as never
 
-function client(callTaskId = "old-task") {
+function client(callTaskId = "old-task", ackMode: "valid" | "missing" | "wrong" = "valid") {
   const planEvent = { id: "plan-event", sequence: "11", type: "item.delta", actor: "orchestrator", itemId: graphId,
     taskId: "root", correlationId: "turn", causationId: "revise-step", idempotencyKey: planKey, hasOutbox: true,
     payload: { kind: "proposal", fingerprint: "a".repeat(64), revision: 5, content: snapshot,
@@ -90,7 +92,11 @@ function client(callTaskId = "old-task") {
     if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "old-task", status: "interrupted", role: "scout",
       taskType: "job_discovery", attemptCount: 2, interruptRequestedAt: new Date(receipt.interruptRequestedAt), leaseOwner: null,
       leaseExpiresAt: null, hasChild: false }] }
-    if (sql.includes('event."idempotencyKey" = $5')) return { rows: [ackEvent] }
+    if (sql.includes('event."idempotencyKey" = $5')) {
+      if (ackMode === "missing") return { rows: [] }
+      const payload = ackMode === "wrong" ? { ...ackPayload, event: { ...ackPayload.event, nodeKey: "other-scout" } } : ackPayload
+      return { rows: [{ ...ackEvent, payload }] }
+    }
     if (sql.includes('ANY($1::text[])')) return { rows: [
       { id: "action-step", ordinal: 9, attempt: 1, status: "failed", taskId: "root" },
       { id: "revise-step", ordinal: 6, attempt: 1, status: "interrupted", taskId: "root" },
@@ -121,6 +127,28 @@ describe("task graph retirement completion read", () => {
         receiptEventId: "retirement-event", lifecycleEventId: "ack-event" },
     ]]))
     expect(db.query.mock.calls.some(([sql]) => String(sql).includes('item."type" = \'tool_result\''))).toBe(false)
+  })
+
+  it("retains an acknowledged retirement after its replacement later fails during a newer steer", async () => {
+    harness.snapshot = snapshot
+    harness.confirmed = acceptedSteer
+    harness.ackKey = ackKey
+    const laterSteer = { unresolvedInputs: [{ id: "later-input", acceptedSequence: 20n, status: "accepted" }],
+      currentRevision: 8, lastReconciledInputThroughSequence: 10n }
+
+    await expect(readTaskGraphRetiredScouts(client() as never, scope, loaded("interrupted", "Subagent task subtree was interrupted"),
+      laterSteer as never)).resolves.toEqual(new Map([[
+      "old-scout", { nodeKey: "old-scout", taskId: "old-task", attempt: 2, interruptRequestedAt: receipt.interruptRequestedAt,
+        receiptEventId: "retirement-event", lifecycleEventId: "ack-event" },
+    ]]))
+  })
+
+  it.each(["missing", "wrong"] as const)("does not prove retirement with a %s ack", async mode => {
+      harness.snapshot = snapshot
+      harness.confirmed = acceptedSteer
+      harness.ackKey = ackKey
+      await expect(readTaskGraphRetiredScouts(client("old-task", mode) as never, scope, loaded(), reconciliation))
+        .resolves.toEqual(new Map())
   })
 
   it("fails closed for malformed receipts and a call with a different target", async () => {

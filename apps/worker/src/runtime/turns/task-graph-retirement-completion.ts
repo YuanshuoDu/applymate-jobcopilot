@@ -37,8 +37,7 @@ export async function readTaskGraphRetiredScouts(client: Client, scope: Scope, l
   reconciliation: SteeringReconciliationState): Promise<ReadonlyMap<string, TaskGraphRetiredScoutProof>> {
   try {
     if (!client || !scopeValid(scope) || loaded.discoveryTurnEligibility !== "ordinary" || !loaded.item || !loaded.snapshot
-      || !loaded.state || loaded.item.revision !== loaded.state.revision || !loaded.sourceInputCheckpointByNodeKey
-      || reconciliation.unresolvedInputs.length > 0) return empty()
+      || !loaded.state || loaded.item.revision !== loaded.state.revision || !loaded.sourceInputCheckpointByNodeKey) return empty()
     const eligible = loaded.snapshot.nodes.filter(node => {
       const task = loaded.tasks.get(node.taskId)
       return task?.status === "interrupted" && isOrdinaryRegisteredScout(node, { ...task, failureReason: null })
@@ -86,7 +85,8 @@ async function validateRetirement(client: Client, scope: Scope, loaded: LoadedGr
     || state.currentRevision !== revision || task.status !== "interrupted" || task.attemptCount !== receipt.attempt || current.dependsOn.length !== 0
     || nodes.some(node => node.key !== current.key && (node.dependsOn.includes(current.key) || node.repairOf?.nodeKey === current.key))
     || checkpoint(loaded, current.key) === null || checkpoint(loaded, current.key)! >= accepted
-    || replacement.taskId !== receipt.replacementTaskId || !replacementTask || !isOrdinaryRegisteredScout(replacement, replacementTask)
+    || replacement.taskId !== receipt.replacementTaskId || !replacementTask
+    || !isOrdinaryRegisteredScout(replacement, { ...replacementTask, failureReason: null })
     || checkpoint(loaded, replacement.key) === null || checkpoint(loaded, replacement.key)!.toString() !== receipt.replacementSourceSequence
     || checkpoint(loaded, replacement.key)! < accepted) return null
   const actionStep = event.causationId
