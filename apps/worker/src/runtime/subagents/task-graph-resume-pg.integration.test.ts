@@ -18746,7 +18746,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const forgedCallId = `p3-1221-root-scout-search:${value.turnId}`
     const forgedSearchInput = { target: "Software Engineer", location: "Dublin", limit: 1 }
     const rootToolNames = deferredSignal<string[]>()
-    const forgedToolResult = deferredSignal<{ blocker: string | null; errorCode: string | null; jobsSearchCallCount: string | null }>()
     const releaseRootDenialProbe = deferredSignal<void>()
     const releaseScoutExecution = deferredSignal<void>()
     type Admission =
@@ -18840,34 +18839,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            if (modelRequests === 3) {
-              let denial: { blocker: string | null; errorCode: string | null; jobsSearchCallCount: string | null } | undefined
-              for (let attempt = 0; attempt < 20 && !denial; attempt += 1) {
-                const receipt = await pool!.query<{
-                  blocker: string | null; errorCode: string | null; jobsSearchCallCount: string
-                }>(
-                  `SELECT event."payload"->'final'->>'blocker' AS "blocker",
-                     event."payload"->>'errorCode' AS "errorCode",
-                     (SELECT COUNT(*)::text FROM "agent_items" AS call
-                       WHERE call."sessionId" = event."sessionId" AND call."turnId" = event."turnId"
-                         AND call."taskId" = event."taskId" AND call."type" = 'tool_call'
-                         AND call."content"->>'toolName' = 'jobs.search') AS "jobsSearchCallCount"
-                   FROM "agent_events" AS event
-                   JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
-                     AND turn."userId" = $1 AND turn."rootTaskId" = event."taskId"
-                   JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = $1
-                   WHERE event."sessionId" = $2 AND event."turnId" = $3 AND event."taskId" = turn."rootTaskId"
-                     AND event."type" = 'turn.failed'
-                   ORDER BY event."sequence" DESC LIMIT 1`,
-                  [value.userId, value.sessionId, value.turnId],
-                )
-                denial = receipt.rows[0]
-                if (!denial) await new Promise(resolve => setTimeout(resolve, 25))
-              }
-              forgedToolResult.resolve({ blocker: denial?.blocker ?? null, errorCode: denial?.errorCode ?? null,
-                jobsSearchCallCount: denial?.jobsSearchCallCount ?? null })
-              throw new Error("Fixture stops after checking direct Root tool denial")
-            }
             throw new Error("Objective Scout authority fixture reached an unexpected model request")
           },
         }
@@ -18948,8 +18919,32 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(["queued", "running"]).toContain(child.status)
       expect(record(child.context)?.nestedScoutProfile).toBe("applymate:nested-scout-profile:v1")
       releaseRootDenialProbe.resolve()
-      const forged = await withinIntegrationDeadline(forgedToolResult.promise, "Direct Root Scout tool call was not rejected", 30_000)
-      expect(forged).toEqual({ blocker: "objective_task_graph_root_tool_disabled", errorCode: "invalid_output", jobsSearchCallCount: "0" })
+      const denialDeadline = Date.now() + 10_000
+      let denial: { blocker: string | null; errorCode: string | null; jobsSearchCallCount: string } | undefined
+      while (!denial && Date.now() < denialDeadline) {
+        const receipt = await pool!.query<{
+          blocker: string | null; errorCode: string | null; jobsSearchCallCount: string
+        }>(
+          `SELECT event."payload"->'final'->>'blocker' AS "blocker",
+             event."payload"->>'errorCode' AS "errorCode",
+             (SELECT COUNT(*)::text FROM "agent_items" AS call
+               WHERE call."sessionId" = event."sessionId" AND call."turnId" = event."turnId"
+                 AND call."taskId" = turn."rootTaskId" AND call."type" = 'tool_call'
+                 AND call."content"->>'toolName' = 'jobs.search') AS "jobsSearchCallCount"
+           FROM "agent_events" AS event
+           JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+             AND turn."userId" = $1 AND turn."rootTaskId" = event."taskId"
+           JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = $1
+           WHERE event."sessionId" = $2 AND event."turnId" = $3 AND event."taskId" = turn."rootTaskId"
+             AND event."type" = 'turn.failed' AND event."actor" = 'orchestrator'
+             AND event."correlationId" = turn."id"
+           ORDER BY event."sequence" DESC LIMIT 1`,
+          [value.userId, value.sessionId, value.turnId],
+        )
+        denial = receipt.rows[0]
+        if (!denial) await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      expect(denial).toEqual({ blocker: "objective_task_graph_root_tool_disabled", errorCode: "invalid_output", jobsSearchCallCount: "0" })
     } finally {
       releaseRootDenialProbe.resolve()
       releaseScoutExecution.resolve()
