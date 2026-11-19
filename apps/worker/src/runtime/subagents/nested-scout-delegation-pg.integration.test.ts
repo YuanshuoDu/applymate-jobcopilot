@@ -168,9 +168,12 @@ async function readMainProgressDiagnostic(ids: FixtureIds, output: string[]) {
       && SAFE_WAIT_RESUME_STAGES.includes(match[2] as typeof SAFE_WAIT_RESUME_STAGES[number])
       ? [{ code: match[1], stage: match[2] }] : []
   })
+  const safeWaitingFinishCodes = ["idempotency_conflict", "revision_mismatch", "graph_invalid_transition", "graph_state_missing",
+    "graph_child_missing", "graph_attempt_invalid", "graph_wait_identity_invalid", "graph_revision_mismatch", "graph_resume_blocked",
+    "wait_invalid", "wait_scope_error", "wait_conflict", "pg_40001", "pg_40p01", "pg_55p03", "pg_57014", "pg_08000", "pg_08003", "pg_08006", "pg_57p01", "other"] as const
   const waitingFinishFailures = output.flatMap(value => {
-    const match = value.match(/^P1143_WAITING_FINISH_DIAGNOSTIC:(idempotency_conflict|revision_mismatch|other)$/)
-    return match ? [match[1]] : []
+    const match = value.match(/^P1143_WAITING_FINISH_DIAGNOSTIC:([a-z0-9_]+)$/)
+    return match && safeWaitingFinishCodes.includes(match[1] as typeof safeWaitingFinishCodes[number]) ? [match[1]] : []
   })
   const waitResolverErrorCodes = waitResolverErrorCodesFromOutput(output)
   try {
