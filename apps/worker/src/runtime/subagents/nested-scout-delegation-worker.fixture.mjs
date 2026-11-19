@@ -13,9 +13,11 @@ import { createSubagentQueue } from "../../queue/subagent-queue.ts"
 import { enqueueTurn } from "../turns/turn-queue.ts"
 import { createCrashFixtureExecutor, createNestedScoutFixtureScripts } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 import { installWaitResolverDiagnostics } from "./nested-scout-wait-resolver-logging.mjs"
-const [, , mode, rawIds] = process.argv, ids = JSON.parse(rawIds)
+const [, , mode, rawIds, leaseProfile] = process.argv, ids = JSON.parse(rawIds)
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 10 })
-const CRASH_TEST_LEASE_MS = 3_000, CRASH_TEST_HEARTBEAT_MS = 500
+const restartRecovery = leaseProfile === "restart-recovery"
+const CRASH_TEST_LEASE_MS = restartRecovery ? 30_000 : 3_000
+const CRASH_TEST_HEARTBEAT_MS = restartRecovery ? 10_000 : 500
 const SAFE_RECOVERY_ERROR_CODES = new Set([
   "subagent_dispatch_delivery_uncertain", "lost", "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01",
   "ECONNRESET", "ETIMEDOUT", "wait_invalid", "wait_scope_error", "wait_conflict",
