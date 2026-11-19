@@ -17,7 +17,7 @@ import type { DiscoveryShortlistResult } from "./subagents/discovery-shortlist.j
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
 
 type Row = Record<string, unknown>
-const OBJECTIVE_TASK_GRAPH_CONTROL_TOOLS = new Set(["agent.plan", "agent.ask_user", "agent.wait", "agent.list", "agent.reconcile"])
+const OBJECTIVE_TASK_GRAPH_CONTROL_TOOLS = new Set(["agent.plan", "agent.ask_user", "agent.wait", "agent.list", "agent.reconcile", "agent.retire_superseded_scout"])
 
 /** Root objectives may coordinate through TaskGraph and read evidence; child writes remain template-bound. */
 export function objectiveTaskGraphRootToolAllowed(value: unknown): boolean {

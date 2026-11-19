@@ -16,7 +16,7 @@ const scope: TaskGraphExecutionScope = {
   stepId: "step-1", turnLeaseOwner: "turn-owner", turnLeaseVersion: 1, parentLeaseOwner: "root-owner", parentAttemptCount: 1,
 }
 const acceptedInputSequence = 20n
-const confirmed = { kind: "confirmed" as const, locations: ["dublin"], acceptedInputSequence }
+const confirmed = { kind: "confirmed" as const, locations: ["dublin"], acceptedInputSequence, acceptedInputId: "input-1" }
 const locationCriterion = (locations: readonly string[]) => ({ id: "candidate-location",
   check: { kind: "candidate_location_in" as const, locations } })
 const verification = (locations: readonly string[]) => ({ schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout" as const,
