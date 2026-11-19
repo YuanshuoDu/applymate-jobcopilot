@@ -15907,8 +15907,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let seattleTaskId = ""
     let dublinTaskId = ""
     let berlinTaskId = ""
-    let acceptedDublin: ObjectiveLocationSteerFixtureResult | undefined
-    let acceptedBerlin: ObjectiveLocationSteerFixtureResult | undefined
+    type AcceptedLocationSteer = ObjectiveLocationSteerFixtureResult & {
+      readonly expectedRevision: number
+      readonly expectedLeaseVersion: number
+    }
+    let acceptedDublin: AcceptedLocationSteer | undefined
+    let acceptedBerlin: AcceptedLocationSteer | undefined
     let dublinAttemptBeforeRestart = 0
     const assertMarker = (line: string, prefix: string, fields: RecordValue) => {
       let parsed: RecordValue | null = null
@@ -16007,7 +16011,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         return loaded.snapshot?.nodes ?? []
       } finally { await client.query("ROLLBACK").catch(() => undefined); client.release() }
     }
-    const acceptLocation = async (location: "Dublin" | "Berlin", clientMessageId: string) => {
+    const acceptLocation = async (location: "Dublin" | "Berlin", clientMessageId: string): Promise<AcceptedLocationSteer> => {
       const turn = await currentTurn()
       const service = await createDisposableWebObjectiveLocationSteerService(databaseUrl!)
       try {
@@ -16025,7 +16029,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           || String(persisted.rows[0]?.acceptedSequence) !== String(accepted.sequence)) {
           throw new Error("Process-restart location steer did not persist as the exact accepted input")
         }
-        return accepted
+        return { ...accepted, expectedRevision: turn.revision, expectedLeaseVersion: turn.leaseVersion }
       } finally { await service.prisma.$disconnect() }
     }
     const readTask = async (taskId: string) => {
@@ -16153,14 +16157,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         [taskId, value.sessionId, value.turnId, rootTaskId, value.userId])
       return result.rows[0]
     }
-    const readDublinFailureBoundary = async () => {
-      const turnPromise = pool!.query<{ status: string; rootTaskId: string | null; leaseOwnerId: string | null;
+    const readSteerFailureBoundary = async (phase: "dublin" | "berlin", accepted: AcceptedLocationSteer | undefined) => {
+      const isBerlin = phase === "berlin"
+      const turnPromise = pool!.query<{ revision: number; status: string; rootTaskId: string | null; leaseOwnerId: string | null;
         leaseVersion: number; leaseExpiresAt: Date | null }>(
-        `SELECT turn."status", turn."rootTaskId", turn."leaseOwnerId", turn."leaseVersion", turn."leaseExpiresAt"
+        `SELECT turn."revision", turn."status", turn."rootTaskId", turn."leaseOwnerId", turn."leaseVersion", turn."leaseExpiresAt"
          FROM "agent_turns" AS turn JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
          WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND session."userId" = $3`,
         [value.turnId, value.sessionId, value.userId])
-      const inputPromise = acceptedDublin ? pool!.query<{ status: string; acceptedSequence: string;
+      const inputPromise = accepted ? pool!.query<{ status: string; acceptedSequence: string;
         consumedByStepId: string | null; stepStatus: string | null; stepTaskId: string | null;
         inputThroughSequence: string | bigint | null }>(
         `SELECT input."status", input."acceptedSequence", input."consumedByStepId", step."status" AS "stepStatus",
@@ -16171,17 +16176,33 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
            AND step."turnId" = input."targetTurnId"
          WHERE input."id" = $1 AND input."userId" = $2 AND input."sessionId" = $3 AND input."targetTurnId" = $4
            AND turn."rootTaskId" = $5 AND turn."userId" = $2 AND session."userId" = $2`,
-        [acceptedDublin.inputId, value.userId, value.sessionId, value.turnId, rootTaskId]) : Promise.resolve({ rows: [] })
+        [accepted.inputId, value.userId, value.sessionId, value.turnId, rootTaskId]) : Promise.resolve({ rows: [] })
+      const waitKeys = [`p3-1248-initial:${value.turnId}`, `p3-1248-after-seattle:${value.turnId}`,
+        `p3-1248-after-dublin:${value.turnId}`]
       const waitsPromise = pool!.query<{ waitKind: string; status: string; suspendedAt: Date | null }>(
-        `SELECT CASE WHEN wait."idempotencyKey" = $4 THEN 'initial' ELSE 'after_seattle' END AS "waitKind",
+        `SELECT CASE WHEN wait."idempotencyKey" = $4 THEN 'initial'
+             WHEN wait."idempotencyKey" = $5 THEN 'after_seattle' ELSE 'after_dublin' END AS "waitKind",
            wait."status", wait."suspendedAt" FROM "agent_wait_conditions" AS wait
          JOIN "agent_sessions" AS session ON session."id" = wait."sessionId"
          JOIN "agent_turns" AS turn ON turn."id" = wait."turnId" AND turn."sessionId" = wait."sessionId"
          WHERE wait."sessionId" = $1 AND wait."turnId" = $2 AND wait."userId" = $3
-           AND wait."parentTaskId" = $5 AND turn."rootTaskId" = $5 AND turn."userId" = $3 AND session."userId" = $3
+           AND wait."parentTaskId" = $7 AND turn."rootTaskId" = $7 AND turn."userId" = $3 AND session."userId" = $3
            AND wait."idempotencyKey" = ANY($6::text[]) ORDER BY wait."createdAt"`,
-        [value.sessionId, value.turnId, value.userId, `p3-1248-initial:${value.turnId}`, rootTaskId,
-          [`p3-1248-initial:${value.turnId}`, `p3-1248-after-seattle:${value.turnId}`]])
+        [value.sessionId, value.turnId, value.userId, waitKeys[0], waitKeys[1], waitKeys, rootTaskId])
+      const latestRootStepPromise = pool!.query<{ id: string; status: string; inputThroughSequence: string | bigint | null }>(
+        `SELECT step."id", step."status", step."inputThroughSequence"
+         FROM "agent_steps" AS step JOIN "agent_sessions" AS session ON session."id" = step."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = step."turnId" AND turn."sessionId" = step."sessionId"
+         WHERE step."sessionId" = $1 AND step."turnId" = $2 AND step."taskId" = $3
+           AND turn."rootTaskId" = $3 AND turn."userId" = $4 AND session."userId" = $4
+         ORDER BY step."createdAt" DESC, step."ordinal" DESC LIMIT 1`,
+        [value.sessionId, value.turnId, rootTaskId, value.userId])
+      const suffix = `:${value.turnId}`
+      const toolCallIds = isBerlin
+        ? [`p3-1248-berlin-inspect${suffix}`, `p3-1248-berlin-plan${suffix}`,
+          `p3-1248-retire-dublin${suffix}`, `p3-1248-final-wait${suffix}`]
+        : [`p3-1248-dublin-plan${suffix}`, `p3-1248-retire-seattle${suffix}`,
+          `p3-1248-first-retirement-wait${suffix}`]
       const toolsPromise = pool!.query<{ toolName: string; callStatus: string; resultStatus: string | null;
         outputStatus: string | null; errorCode: string | null }>(
         `SELECT call."content"->>'toolName' AS "toolName", call."status" AS "callStatus",
@@ -16196,12 +16217,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
            AND turn."rootTaskId" = $3 AND turn."userId" = $4 AND session."userId" = $4
            AND call."content"->>'toolCallId' = ANY($5::text[])
          ORDER BY call."createdAt"`,
-        [value.sessionId, value.turnId, rootTaskId, value.userId,
-          [`p3-1248-dublin-plan:${value.turnId}`, `p3-1248-retire-seattle:${value.turnId}`,
-            `p3-1248-first-retirement-wait:${value.turnId}`]])
-      const [turnResult, inputResult, waitsResult, toolsResult] = await Promise.all([turnPromise, inputPromise, waitsPromise, toolsPromise])
+        [value.sessionId, value.turnId, rootTaskId, value.userId, toolCallIds])
+      const [turnResult, inputResult, waitsResult, latestRootStepResult, toolsResult] = await Promise.all([
+        turnPromise, inputPromise, waitsPromise, latestRootStepPromise, toolsPromise,
+      ])
       const turn = turnResult.rows[0]
       const input = inputResult.rows[0]
+      const latestRootStep = latestRootStepResult.rows[0]
+      const firstWorkerExited = processFixtureExited(firstWorker!)
       const inputStatuses = new Set(["accepted", "consumed", "rejected", "cancelled"])
       const waitStatuses = new Set(["waiting", "ready", "timed_out", "interrupted", "closed"])
       const toolStatuses = new Set(["started", "completed", "failed", "interrupted"])
@@ -16250,13 +16273,51 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           generationStates.length = 0
         } finally { await queue.close().catch(() => undefined) }
       }
+      const markers: ReadonlyArray<readonly [string, string]> = [
+        ["P3_SUCCESSIVE_REPLAN_SEATTLE_WAITING ", "seattle_waiting"],
+        ["P3_SUCCESSIVE_REPLAN_SEATTLE_INTERRUPT_REQUESTED ", "seattle_interrupt_requested"],
+        ["P3_SUCCESSIVE_REPLAN_CHILD_HELD ", "child_held"],
+        ["P3_SUCCESSIVE_REPLAN_FIRST_RETIREMENT ", "first_retirement"],
+        ["P3_SUCCESSIVE_REPLAN_BERLIN_REQUEST ", "berlin_request"],
+        ["P3_SUCCESSIVE_REPLAN_BERLIN_LIST_PROOF ", "berlin_list_proof"],
+        ["P3_SUCCESSIVE_REPLAN_CRASH_CUT ", "crash_cut"],
+      ]
+      const observedMarkers = markers.filter(([prefix]) => firstWorker?.output.some(line => line.startsWith(prefix)))
+        .map(([, stage]) => stage)
+      const projectMarker = (prefix: string, fields: readonly string[]) => {
+        const line = firstWorker?.output.find(value => value.startsWith(prefix))
+        if (!line) return null
+        let source: RecordValue | null = null
+        try { source = record(JSON.parse(line.slice(prefix.length)) as unknown) } catch { /* keep closed marker projection */ }
+        const result: Record<string, boolean | null> = { present: true }
+        for (const field of fields) {
+          const fieldValue = source?.[field]
+          result[field] = typeof fieldValue === "boolean" ? fieldValue : null
+        }
+        return result
+      }
+      const seattleRetirement = seattleTaskId
+        ? await readRetirement(seattleTaskId, "scout-seattle").catch(() => null) : false
+      const dublinRetirement = isBerlin && dublinTaskId
+        ? await readRetirement(dublinTaskId, "scout-dublin-replacement").catch(() => null) : false
       return {
-        processExited: processFixtureExited(firstWorker!),
+        processExited: firstWorkerExited,
+        processExitCode: firstWorker!.exitCode,
+        processSignalReceived: firstWorker!.signalCode !== null,
+        processStdoutLineCount: diagnosticBoundedCount(firstWorker!.output.length),
+        processStderrLineCount: diagnosticBoundedCount(firstWorker!.errors.length),
         turnStatus: diagnosticEnum(turn?.status, PROCESS_FIXTURE_TURN_STATUSES) ?? "missing",
         rootPresent: typeof turn?.rootTaskId === "string" && turn.rootTaskId === rootTaskId,
+        turnRevision: diagnosticBoundedCount(turn?.revision),
+        expectedTurnRevision: diagnosticBoundedCount(accepted?.expectedRevision),
+        turnRevisionMatchesAcceptedRevision: typeof turn?.revision === "number"
+          && typeof accepted?.expectedRevision === "number" && turn.revision === accepted.expectedRevision,
         turnLeaseOwnerPresent: typeof turn?.leaseOwnerId === "string" && turn.leaseOwnerId.length > 0,
         turnLeaseLive: turn?.leaseExpiresAt instanceof Date && turn.leaseExpiresAt.getTime() > Date.now(),
         turnLeaseVersion: diagnosticBoundedCount(turn?.leaseVersion),
+        expectedLeaseVersion: diagnosticBoundedCount(accepted?.expectedLeaseVersion),
+        leaseVersionAdvanced: typeof accepted?.expectedLeaseVersion === "number"
+          && typeof turn?.leaseVersion === "number" && turn.leaseVersion > accepted.expectedLeaseVersion,
         dispatchRows: diagnosticBoundedCount(dispatchResult.rows.length),
         dispatchGeneration: diagnosticBoundedCount(dispatchGeneration),
         dispatchOwnerPresent: typeof dispatch?.ownerId === "string" && dispatch.ownerId.length > 0,
@@ -16272,25 +16333,39 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           kind: item.kind,
           payloadMatches: item.payloadMatches,
         })),
-        dublinInputStatus: diagnosticEnum(input?.status, inputStatuses) ?? "missing",
-        dublinInputConsumed: input?.status === "consumed" && typeof input.consumedByStepId === "string",
-        dublinConsumerIsRoot: !!input && input.stepTaskId === rootTaskId,
-        dublinConsumerStepStatus: diagnosticEnum(input?.stepStatus, new Set(["streaming", "completed", "failed", "interrupted"])) ?? "missing",
-        dublinConsumerThroughSequenceCoversInput: !!input && input.inputThroughSequence !== null
+        acceptedInputStatus: diagnosticEnum(input?.status, inputStatuses) ?? "missing",
+        acceptedInputConsumed: input?.status === "consumed" && typeof input.consumedByStepId === "string",
+        inputConsumerIsRoot: !!input && input.stepTaskId === rootTaskId,
+        inputConsumerStepStatus: diagnosticEnum(input?.stepStatus, new Set(["streaming", "completed", "failed", "interrupted"])) ?? "missing",
+        inputConsumerThroughSequenceCoversInput: !!input && input.inputThroughSequence !== null
           && BigInt(input.inputThroughSequence) >= BigInt(input.acceptedSequence),
-        waits: waitsResult.rows.slice(0, 2).map(row => ({
-          kind: row.waitKind === "initial" ? "initial" : "after_seattle",
+        latestRootStepStatus: diagnosticEnum(latestRootStep?.status,
+          new Set(["queued", "running", "streaming", "completed", "failed", "interrupted"])) ?? "missing",
+        latestRootStepIsInputConsumer: !!input && latestRootStep?.id === input.consumedByStepId,
+        latestRootStepThroughSequenceCoversInput: !!input && latestRootStep?.inputThroughSequence !== null
+          && latestRootStep?.inputThroughSequence !== undefined
+          && BigInt(latestRootStep.inputThroughSequence) >= BigInt(input.acceptedSequence),
+        waits: waitsResult.rows.slice(0, 3).map(row => ({
+          kind: diagnosticEnum(row.waitKind, new Set(["initial", "after_seattle", "after_dublin"])) ?? "other",
           status: diagnosticEnum(row.status, waitStatuses) ?? "other",
           suspended: row.suspendedAt instanceof Date,
         })),
         tools: toolsResult.rows.slice(0, 3).map(row => ({
-          tool: row.toolName === "agent.plan" ? "plan"
+          tool: row.toolName === "agent.list" ? "list" : row.toolName === "agent.plan" ? "plan"
             : row.toolName === "agent.retire_superseded_scout" ? "retire" : "wait",
           callStatus: diagnosticEnum(row.callStatus, toolStatuses) ?? "other",
           resultStatus: row.resultStatus === null ? "missing" : diagnosticEnum(row.resultStatus, toolStatuses) ?? "other",
           outputStatus: row.outputStatus === null ? "missing" : diagnosticEnum(row.outputStatus, outputStatuses) ?? "other",
           errorCode: row.errorCode === null ? null : diagnosticErrorCode(row.errorCode),
         })),
+        seattleRetirementReceiptPresent: seattleRetirement,
+        dublinRetirementReceiptPresent: dublinRetirement,
+        observedMarkers: observedMarkers.slice(0, 8),
+        berlinRequestMarker: projectMarker("P3_SUCCESSIVE_REPLAN_BERLIN_REQUEST ",
+          ["requestEntered", "privateCuePresent", "berlinScopePresent", "listToolAvailable"]),
+        berlinListProofMarker: projectMarker("P3_SUCCESSIVE_REPLAN_BERLIN_LIST_PROOF ",
+          ["listResultPresent", "seattleInterrupted", "dublinRunning", "privateCuePresent",
+            "berlinScopePresent", "priorRetirementPresent", "noBerlinPlanYet"]),
       }
     }
 
@@ -16309,7 +16384,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       try {
         interruptRequested = await waitForProcessLine(firstWorker, "P3_SUCCESSIVE_REPLAN_SEATTLE_INTERRUPT_REQUESTED ", 60_000)
       } catch {
-        throw new Error("Dublin steer boundary=" + JSON.stringify(await readDublinFailureBoundary()))
+        throw new Error("Dublin steer boundary=" + JSON.stringify(await readSteerFailureBoundary("dublin", acceptedDublin)))
       }
       assertMarker(interruptRequested, "P3_SUCCESSIVE_REPLAN_SEATTLE_INTERRUPT_REQUESTED ",
         { replacementAccepted: true, interruptRequested: true, rootLeaseMatchesProcess: true })
@@ -16339,7 +16414,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const acceptedSecond = await acceptLocation("Berlin", `p3-1248-berlin:${value.suffix}`)
       acceptedBerlin = acceptedSecond
       await reconcileDurableWaits(pool!, { ownerId: `p3-1248-wake-berlin-${value.suffix}` })
-      const crashCut = await waitForProcessLine(firstWorker, "P3_SUCCESSIVE_REPLAN_CRASH_CUT ", 60_000)
+      let crashCut: string
+      try {
+        crashCut = await waitForProcessLine(firstWorker, "P3_SUCCESSIVE_REPLAN_CRASH_CUT ", 60_000)
+      } catch {
+        throw new Error("Berlin crash-cut boundary=" + JSON.stringify(await readSteerFailureBoundary("berlin", acceptedBerlin)))
+      }
       assertMarker(crashCut, "P3_SUCCESSIVE_REPLAN_CRASH_CUT ", { inspectResultValid: true, steerConsumed: true,
         privateCuePresent: true, berlinScopePresent: true, priorRetirementPresent: true, acceptedBerlinPlanCount: 0,
         rootLeaseMatchesProcess: true })

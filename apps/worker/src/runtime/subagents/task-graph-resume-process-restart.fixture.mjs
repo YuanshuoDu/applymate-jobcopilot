@@ -1933,6 +1933,9 @@ function startSuccessiveReplanRuntime(ownerId, resume, calls) {
               yield { type: "completed", finishReason: "tool_calls" }; return
             }
             if (firstRetirementWaitIssued && !berlinInspectionIssued) {
+              say("P3_SUCCESSIVE_REPLAN_BERLIN_REQUEST " + JSON.stringify({ requestEntered: true,
+                privateCuePresent: facts.privateCuePresent, berlinScopePresent: facts.berlinScopePresent,
+                listToolAvailable: request.tools.some(tool => record(tool)?.name === "agent.list") }))
               if (!facts.privateCuePresent || !facts.berlinScopePresent || !request.tools.some(tool => record(tool)?.name === "agent.list")) {
                 throw new Error("p3_successive_replan_berlin_inspection_context_missing")
               }
@@ -1946,8 +1949,13 @@ function startSuccessiveReplanRuntime(ownerId, resume, calls) {
               const prior = await readSuccessiveRetirement(rootTaskId, successiveSeattleKey, seattle?.taskId,
                 dublin?.taskId, calls.retireSeattle)
               const planCount = await countSuccessiveBerlinPlans(rootTaskId)
-              if (!listing || !listed.some(task => task?.taskId === seattle?.taskId && task.status === "interrupted")
-                || !listed.some(task => task?.taskId === dublin?.taskId && task.status === "running")
+              const seattleInterrupted = listed.some(task => task?.taskId === seattle?.taskId && task.status === "interrupted")
+              const dublinRunning = listed.some(task => task?.taskId === dublin?.taskId && task.status === "running")
+              say("P3_SUCCESSIVE_REPLAN_BERLIN_LIST_PROOF " + JSON.stringify({ listResultPresent: Boolean(listing),
+                seattleInterrupted, dublinRunning, privateCuePresent: facts.privateCuePresent,
+                berlinScopePresent: facts.berlinScopePresent, priorRetirementPresent: Boolean(prior),
+                noBerlinPlanYet: planCount === 0 }))
+              if (!listing || !seattleInterrupted || !dublinRunning
                 || !facts.privateCuePresent || !facts.berlinScopePresent || !prior || planCount !== 0) {
                 throw new Error("p3_successive_replan_crash_cut_proof_invalid")
               }
