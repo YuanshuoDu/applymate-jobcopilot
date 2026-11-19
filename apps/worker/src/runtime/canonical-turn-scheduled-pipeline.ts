@@ -88,7 +88,7 @@ export function createCanonicalTurnScheduledPipeline(pool: pg.Pool, options: Can
       const { candidateStore, recoveredCandidate, waitPort, questionStore, nativeQuestionWaitEnabled, ...completion } = input
       const continueAfterAnalyze = completion.continueAfterAnalyze ?? (options.commandPort && waitPort
         ? createScheduledAutomationPrepareContinuation({ commandPort: options.commandPort, waitPort,
-          verifyReadyPrepare: ({ scope, prepareTaskId, signal }) => verifyPersistedScheduledPrepare(pool, scope, prepareTaskId, signal) }) : undefined)
+          verifyReadyPrepare: ({ scope, prepareTaskId, waitId, signal }) => verifyPersistedScheduledPrepare(pool, scope, prepareTaskId, waitId, signal) }) : undefined)
       const continueAfterGate = completion.continueAfterGate ?? (options.commandPort && waitPort
         ? createScheduledAutomationGateContinuation({ pool, commandPort: options.commandPort, waitPort, questionStore,
           nativeQuestionWaitEnabled: nativeQuestionWaitEnabled === true, ...(options.fetcher ? { fetcher: options.fetcher } : {}) }) : undefined)
@@ -106,7 +106,7 @@ export function createCanonicalTurnScheduledPipeline(pool: pg.Pool, options: Can
 }
 
 async function verifyPersistedScheduledPrepare(pool: Pick<pg.Pool, "connect">,
-  scope: TaskGraphExecutionScope, prepareTaskId: string, signal: AbortSignal): Promise<ScheduledPrepareVerification> {
+  scope: TaskGraphExecutionScope, prepareTaskId: string, waitId: string, signal: AbortSignal): Promise<ScheduledPrepareVerification> {
   if (signal.aborted) throw signal.reason ?? new Error("scheduled_prepare_verification_cancelled")
   return withScheduledPipelineRead(pool, scope.userId, async client => {
     const loaded = await loadTaskGraph(client, { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
@@ -128,7 +128,7 @@ async function verifyPersistedScheduledPrepare(pool: Pick<pg.Pool, "connect">,
       scope: { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
         parentTaskId: scope.rootTaskId, taskId: prepareTaskId, attemptCount: task.attemptCount },
       snapshot, current, tasks: loaded.tasks, structuredResult: envelope.structuredResult,
-      referenceVerificationMode: { phase: "persisted_gate" },
+      referenceVerificationMode: { phase: "persisted_gate" }, resumedWait: { scope, waitId, prepareTaskId },
       completionGraphRevision: current.revision,
     })
     if (signal.aborted) throw signal.reason ?? new Error("scheduled_prepare_verification_cancelled")

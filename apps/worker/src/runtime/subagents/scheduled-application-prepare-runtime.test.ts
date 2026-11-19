@@ -19,7 +19,10 @@ const { createArtifactRepository, loadSelectedJobArtifactContext } = vi.hoisted(
   createArtifactRepository: vi.fn(), loadSelectedJobArtifactContext: vi.fn(),
 }))
 vi.mock("../turns/turn-question-store.js", () => ({ createPgTurnQuestionStore: () => ({ readScheduledPrepareChoice }) }))
-vi.mock("../../db/agent-artifact-repo.js", () => ({ createAgentArtifactRepository: createArtifactRepository }))
+vi.mock("../../db/agent-artifact-repo.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../../db/agent-artifact-repo.js")>(),
+  createAgentArtifactRepository: createArtifactRepository,
+}))
 vi.mock("./selected-job-artifact-context.js", () => ({ loadSelectedJobArtifactContext }))
 
 const now = new Date("2026-10-21T10:00:00.000Z")
@@ -86,7 +89,7 @@ function installArtifactStore() {
     const existing = bases.get(input.id)
     if (existing && JSON.stringify(existing) !== JSON.stringify(input)) throw Object.assign(new Error("immutable base conflict"), { code: "receipt_conflict" })
     bases.set(input.id, input)
-    return input as never
+    return baseArtifactRow(input)
   })
   const find = vi.fn(async (_userId: string, artifactId: string) => heads.get(artifactId) ?? null)
   const saveDraft = vi.fn(async (input: AgentArtifactDraftWrite) => {
@@ -95,7 +98,8 @@ function installArtifactStore() {
       if (existing.requestHash !== input.requestHash) throw Object.assign(new Error("Task tool receipt conflict"), { code: "receipt_conflict" })
       return existing.row
     }
-    const row = { id: `version-${receipts.size + 1}`, artifactId: input.id, version: 1, userId: input.userId, sessionId: input.sessionId,
+    const version = (heads.get(input.id)?.version ?? 0) + 1
+    const row = { id: `version-${receipts.size + 1}`, artifactId: input.id, version, userId: input.userId, sessionId: input.sessionId,
       jobId: input.jobId, artifactType: input.artifactType, content: input.content, contentHash: input.hash, sourceDigest: input.sourceDigest,
       constraintHash: input.constraintHash, provenanceRefs: [...input.provenanceRefs], evidenceRefs: [...input.evidenceRefs], baseId: input.baseId,
       baseHash: input.baseHash, previousHash: input.previousHash, taskId: input.taskId, toolCallId: input.toolCallId,
@@ -104,12 +108,17 @@ function installArtifactStore() {
     heads.set(input.id, { id: input.id, userId: input.userId, jobId: input.jobId, artifactType: input.artifactType, lifecycle: "draft",
       baseId: input.baseId, baseHash: input.baseHash, content: input.content, hash: input.hash, constraintHash: input.constraintHash,
       provenanceRefs: [...input.provenanceRefs], evidenceRefs: [...input.evidenceRefs], previousHash: input.previousHash,
-      version: 1, createdAt: new Date(), updatedAt: new Date() })
+      version, createdAt: new Date(), updatedAt: new Date() })
     return row
   })
   const repository = { insertBaseWithClient, find, saveDraft }
   createArtifactRepository.mockReturnValue(repository)
-  return { bases, baseFences, receipts, saveDraft }
+  return { bases, baseFences, heads, receipts, saveDraft }
+}
+
+function baseArtifactRow(input: AgentArtifactBaseInsert): AgentArtifactRow {
+  return { ...input, lifecycle: "base", baseId: input.id, baseHash: input.hash, previousHash: null,
+    version: 1, createdAt: now, updatedAt: now }
 }
 
 function persist(pool: pg.Pool, binding: ScheduledPrepareArtifactWriteBinding) {
@@ -119,11 +128,11 @@ function persist(pool: pg.Pool, binding: ScheduledPrepareArtifactWriteBinding) {
   return persistScheduledPrepareMaterial(pool, input as never, "resume", { summary: "tailored output" }, sources as never)
 }
 
-function artifactPool(): pg.Pool {
+function artifactPool(store: ReturnType<typeof installArtifactStore>): pg.Pool {
   let nextTransactionId = 0
   let activeTransactionId: string | null = null
   const client = {
-    query: vi.fn(async (sql: string) => {
+    query: vi.fn(async (sql: string, params?: readonly unknown[]) => {
       if (sql === "BEGIN") {
         activeTransactionId = String(++nextTransactionId)
         return { rows: [] }
@@ -134,6 +143,14 @@ function artifactPool(): pg.Pool {
       if (sql.includes("pg_advisory_xact_lock(hashtext($1), hashtext($2))")) {
         if (activeTransactionId === null) throw new Error("artifact job lock expected an open transaction")
         return { rows: [{ pg_advisory_xact_lock: null }] }
+      }
+      if (sql.includes("FOR UPDATE OF session, turn, root, task")) {
+        return { rows: [{ id: params?.[0], turnStatus: "in_progress", sessionStatus: "running", rootAttemptCount: 2 }] }
+      }
+      if (sql.includes('FROM "agent_artifact"') && sql.includes('"lifecycle" = $4 FOR UPDATE')) {
+        const [userId, jobId, kind, lifecycle] = params ?? []
+        const rows = lifecycle === "base" ? [...store.bases.values()].map(baseArtifactRow) : [...store.heads.values()]
+        return { rows: rows.filter(row => row.userId === userId && row.jobId === jobId && row.artifactType === kind) }
       }
       if (sql === "COMMIT" || sql === "ROLLBACK") activeTransactionId = null
       return { rows: [] }
@@ -204,7 +221,7 @@ describe("scheduled Prepare production runtime", () => {
   })
 
   it("replays the same material reference across a Worker restart and lease retry", async () => {
-    const store = installArtifactStore(), pool = artifactPool(), original = artifactBinding()
+    const store = installArtifactStore(), pool = artifactPool(store), original = artifactBinding()
     const retry = artifactBinding({ taskFence: { ...original.taskFence, leaseOwner: "worker-b", attemptCount: 2 }, requestHash: original.requestHash })
 
     const first = await persist(pool, original), replay = await persist(pool, retry)
@@ -218,8 +235,8 @@ describe("scheduled Prepare production runtime", () => {
       turnLeaseVersion: currentOwner.turnLeaseVersion })
   })
 
-  it("keeps the source base stable but gives a later execution attempt its own material identity", async () => {
-    const store = installArtifactStore(), pool = artifactPool(), firstBinding = artifactBinding()
+  it("gives a later execution attempt a new version of the unique draft", async () => {
+    const store = installArtifactStore(), pool = artifactPool(store), firstBinding = artifactBinding()
     const laterBinding = artifactBinding({ executionAttemptCount: firstBinding.executionAttemptCount + 1 })
     const firstIdentity = scheduledPrepareArtifactIdentity(firstBinding, 2), laterIdentity = scheduledPrepareArtifactIdentity(laterBinding, 2)
 
@@ -229,13 +246,15 @@ describe("scheduled Prepare production runtime", () => {
     expect(laterIdentity.baseConstraintHash).toBe(firstIdentity.baseConstraintHash)
     expect(laterIdentity.draftId).not.toBe(firstIdentity.draftId)
     expect(laterIdentity.toolCallId).not.toBe(firstIdentity.toolCallId)
-    expect(later.artifactId).not.toBe(first.artifactId)
+    expect(later.artifactId).toBe(first.artifactId)
+    expect(later.version).toBe(first.version + 1)
+    expect(store.heads.size).toBe(1)
     expect(store.bases.size).toBe(1)
     expect(store.receipts.size).toBe(2)
   })
 
   it("fails closed if checkpoint or choice semantics change inside one execution attempt", async () => {
-    const store = installArtifactStore(), pool = artifactPool(), original = artifactBinding()
+    const store = installArtifactStore(), pool = artifactPool(store), original = artifactBinding()
     const changed = artifactBinding({ checkpointDigest: "f".repeat(64), resumeTailoringChoiceDigest: "a".repeat(64) })
     const firstIdentity = scheduledPrepareArtifactIdentity(original, 2), changedIdentity = scheduledPrepareArtifactIdentity(changed, 2)
 

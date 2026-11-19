@@ -4,6 +4,7 @@ import type { ScheduledAutomationSnapshot } from "./scheduled-automation-snapsho
 import { parseScheduledAuditReport } from "./scheduled-audit-contract.js"
 import type { ScheduledTaskGraphContinuationReceipt } from "./scheduled-taskgraph-continuation-receipt.js"
 import { isCanonicalAnalyzeCheckpointTimestamp, scheduledAnalyzeCheckpointDigest } from "../turns/turn-question-scheduled-source-fingerprint.js"
+import { resumedPrepareWaitOwner, type ResumedPrepareWait } from "./scheduled-prepare-checkpoint-wait.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -12,7 +13,8 @@ export type ScheduledPrepareCheckpoint = Readonly<{ checkpointDigest: string; el
 
 /** Rechecks Analyze state at its original stage, Gate stage, or the exact completed Audit report checkpoint. */
 export async function readScheduledPrepareCheckpoint(client: Queryable, receipt: ScheduledTaskGraphContinuationReceipt,
-  automation: ScheduledAutomationSnapshot, handoffKey: string, checkpointStage: ScheduledPrepareCheckpointStage): Promise<ScheduledPrepareCheckpoint | null> {
+  automation: ScheduledAutomationSnapshot, handoffKey: string, checkpointStage: ScheduledPrepareCheckpointStage,
+  resumedWait?: ResumedPrepareWait): Promise<ScheduledPrepareCheckpoint | null> {
   if (checkpointStage !== "prepare" && checkpointStage !== "gate" && checkpointStage !== "audit_completed_report") return null
   const owner = receipt.owner
   const rows = await client.query(`SELECT "id", "status", "attemptCount", "checkpoint", "state" FROM "agent_executions"
@@ -27,8 +29,11 @@ export async function readScheduledPrepareCheckpoint(client: Queryable, receipt:
     || !state || !marker || marker.key !== handoffKey || marker.snapshotDigest !== receipt.snapshotDigest
     || marker.graphRevision !== receipt.analyzeGraphRevision || marker.evidenceDigest !== receipt.evidenceDigest) return null
   const allowTurnLeaseDrift = checkpointStage !== "prepare"
+  const checkpointOwner = !allowTurnLeaseDrift && !same(marker.owner, owner) && resumedWait
+    ? await resumedPrepareWaitOwner(client, owner, resumedWait, handoffKey) : owner
+  if (!checkpointOwner) return null
   const computed = analyzeCheckpointDigest(allowTurnLeaseDrift ? { ...state, nextStage: "prepare" } : state,
-    receipt, handoffKey, allowTurnLeaseDrift)
+    receipt, handoffKey, allowTurnLeaseDrift, checkpointOwner)
   if (!computed) return null
   const scored = state.scoredJobs
   const eligible = Array.isArray(scored) ? scored.map(value => { const row = record(value); return { job: record(row?.job), score: row?.score } })
@@ -37,12 +42,13 @@ export async function readScheduledPrepareCheckpoint(client: Queryable, receipt:
   return eligible ? { checkpointDigest: computed, eligibleJobIds: eligible } : null
 }
 
-function analyzeCheckpointDigest(state: Row, receipt: ScheduledTaskGraphContinuationReceipt, handoffKey: string, allowTurnLeaseDrift: boolean): string | null {
+function analyzeCheckpointDigest(state: Row, receipt: ScheduledTaskGraphContinuationReceipt, handoffKey: string,
+  allowTurnLeaseDrift: boolean, checkpointOwner: ScheduledTaskGraphContinuationReceipt["owner"]): string | null {
   const marker = record(state.scheduledTaskGraphContinuation), scouted = state.scoutedJobs, scored = state.scoredJobs
   if (state.nextStage !== "prepare" || !marker || !Array.isArray(scouted) || !Array.isArray(scored) || !safeCount(state.analysisFailed)) return null
   const owner = receipt.owner, stableOwner = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount, owner.executionId, owner.executionAttemptCount]
   if (marker.key !== handoffKey || marker.snapshotDigest !== receipt.snapshotDigest || marker.graphRevision !== receipt.analyzeGraphRevision
-    || marker.evidenceDigest !== receipt.evidenceDigest || !(allowTurnLeaseDrift ? sameStableOwner(marker.owner, owner) : same(marker.owner, owner))) return null
+    || marker.evidenceDigest !== receipt.evidenceDigest || !(allowTurnLeaseDrift ? sameStableOwner(marker.owner, owner) : same(marker.owner, checkpointOwner))) return null
   const scoutedIds = new Set<string>()
   for (const value of scouted) { const job = record(value); if (!job || !validId(job.id) || job.userId !== owner.userId || scoutedIds.has(job.id)) return null; scoutedIds.add(job.id) }
   if (Number(state.analysisFailed) + scored.length !== scoutedIds.size) return null

@@ -1,11 +1,8 @@
 import { createHash } from "node:crypto"
 import type pg from "pg"
-import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
-import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 import type { ToolExecutionContext } from "../tools/types.js"
 import { loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
-import { type ScheduledAutomationPipelineAttestation } from "./scheduled-automation-pipeline-bridge.js"
 import { revalidateScheduledPipelineGraphAttestation } from "./scheduled-pipeline-current-attestation.js"
 import { projectScheduledPipelineGraph } from "./scheduled-pipeline-graph-shape.js"
 import { scheduledPrepareCheckpointDigest, scheduledPrepareCohortJobIds, scheduledPrepareLiveCheckpointBinding } from "./scheduled-prepare-runtime-context.js"
@@ -23,6 +20,8 @@ import type { ScheduledApplicationPrepareDependencies, ScheduledPrepareOwner, Ve
 import { eligibleScheduledPrepareScore, prepareScheduledJobMaterials, resolveScheduledPrepareChoice,
   scheduledPrepareCitedRefs, scheduledPrepareContainsRefs } from "./scheduled-application-prepare-materials.js"
 import type { ScheduledPrepareMaterialDetail, ScheduledPrepareMaterialOptions } from "./scheduled-application-prepare-materials.js"
+import { readScheduledPrepareOwnerAdmission, scheduledPrepareDependencyWaitMatchesGraph,
+  scheduledPrepareTurnOwnerFromAdmission } from "./scheduled-prepare-owner-admission.js"
 export { persistScheduledPrepareMaterial, scheduledPrepareArtifactIdentity } from "./scheduled-application-prepare-materials.js"
 
 type Row = Record<string, unknown>
@@ -53,38 +52,44 @@ async function loadInvocation(options: Options, context: ToolExecutionContext): 
   const client = await options.pool.connect()
   try {
     await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-    const persisted = await readPersistedOwner(client, lease, owner)
+    const persisted = await readScheduledPrepareOwnerAdmission(client, lease, owner, options.now?.() ?? new Date())
     const scope: GraphIdentityScope = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!, rootTaskId: lease.rootTaskId, parentTaskId: lease.rootTaskId }
     const loaded = await loadTaskGraph(client, scope, false), snapshot = loaded.snapshot
     if (!snapshot || !loaded.state) throw new Error("scheduled_prepare_graph_invalid")
     const current = currentTaskGraph(loaded)
     if (current.nodes.length !== snapshot.nodes.length) throw new Error("scheduled_prepare_graph_invalid")
-    const receipt = await readPrivateReceipt(client, scope, persisted.owner)
+    const receipt = await readPrivateReceipt(client, scope)
     const version = receipt && scheduledTaskGraphContinuationKeyVersion(receipt.continuationKey)
     if (!receipt || !version || scheduledTaskGraphStableContinuationKey(receipt) !== receipt.continuationKey) throw new Error("scheduled_prepare_receipt_invalid")
     const shape = projectScheduledPipelineGraph(snapshot.nodes, version, "prepare")
     if (!shape || shape.prepare.taskId !== lease.id) throw new Error("scheduled_prepare_graph_invalid")
     const taskRow = loaded.tasks.get(lease.id), node = shape.prepare
     if (!taskRow || !prepareTaskMatches(taskRow, node, lease) || current.nodes.find(value => value.key === "prepare")?.status !== "running") throw new Error("scheduled_prepare_task_invalid")
+    if (!scheduledPrepareDependencyWaitMatchesGraph(persisted, snapshot, current.nodes, lease.id)) throw new Error("scheduled_prepare_owner_stale")
+    const prepareOwner = scheduledPrepareTurnOwnerFromAdmission(persisted, receipt.owner)
     const automation = parseScheduledAutomationSnapshot(record(persisted.turn.input)?.scheduledAutomationSnapshot)
     if (!automation) throw new Error("scheduled_prepare_snapshot_invalid")
-    const bridged = await revalidateScheduledPipelineGraphAttestation({ scope: persisted.owner, schedule: automation,
+    const bridged = await revalidateScheduledPipelineGraphAttestation({ scope: prepareOwner, schedule: automation,
       snapshot, current, tasks: loaded.tasks, receipt,
       verifyCompletedNode: input => verifyCompletedTaskGraphNodeEvidence(client, input) })
     if (bridged.status !== "ready" || bridged.attestation.evidenceDigest !== receipt.evidenceDigest
       || bridged.attestation.snapshotDigest !== receipt.snapshotDigest) throw new Error("scheduled_prepare_analyze_unverified")
-    const liveBinding = scheduledPrepareLiveCheckpointBinding(receipt, persisted.owner, bridged.attestation)
+    const liveBinding = scheduledPrepareLiveCheckpointBinding(receipt, prepareOwner, bridged.attestation)
     if (!liveBinding) throw new Error("scheduled_prepare_receipt_invalid")
     const handoffKey = liveBinding.continuationKey
     const prepareCohort = scheduledPrepareCohortJobIds(bridged.attestation)
-    const checkpoint = await readExecutionCheckpoint(client, receipt, persisted.turn, persisted.owner, handoffKey,
+    const checkpoint = await readExecutionCheckpoint(client, receipt, persisted.turn, prepareOwner, handoffKey,
       [...prepareCohort], options.now?.() ?? new Date())
     const proposal = { expectedRevision: receipt.analyzeGraphRevision, nodes: [{ key: node.key, templateId: node.templateId,
       goal: node.goal, successCriteria: node.successCriteria, dependsOn: node.dependsOn }] }
     const handoff = { status: "analyze_checkpointed" as const, continuationKey: handoffKey,
       checkpointDigest: receipt.checkpointDigest, claimTokenDigest: checkpoint.claimTokenDigest,
       executionId: receipt.owner.executionId, executionAttemptCount: receipt.owner.executionAttemptCount }
-    const graphInput = { scope: persisted.executionScope, executionOwner: { executionId: receipt.owner.executionId, executionAttemptCount: receipt.owner.executionAttemptCount },
+    const executionScope = { userId: prepareOwner.userId, sessionId: prepareOwner.sessionId, turnId: prepareOwner.turnId,
+      rootTaskId: prepareOwner.rootTaskId, parentTaskId: prepareOwner.rootTaskId, stepId: "scheduled-prepare",
+      turnLeaseOwner: prepareOwner.turnLeaseOwnerId, turnLeaseVersion: prepareOwner.turnLeaseVersion,
+      parentLeaseOwner: prepareOwner.turnLeaseOwnerId, parentAttemptCount: prepareOwner.rootAttemptCount }
+    const graphInput = { scope: executionScope, executionOwner: { executionId: receipt.owner.executionId, executionAttemptCount: receipt.owner.executionAttemptCount },
       handoff, attestation: bridged.attestation, proposal }
     if (!scheduledAnalyzeGraphMatches(graphInput, snapshot, current, loaded.tasks, true)) throw new Error("scheduled_prepare_graph_binding_invalid")
     const analystEnvelope = record(loaded.tasks.get(shape.analyst.taskId)?.result)
@@ -112,49 +117,14 @@ async function loadInvocation(options: Options, context: ToolExecutionContext): 
   finally { client.release() }
 }
 
-async function readPersistedOwner(client: Queryable, lease: SubagentLease, owner: ExecutionOwnerFence) {
-  const sql = "SELECT task.\"role\",task.\"taskType\",task.\"status\" AS \"taskStatus\",task.\"leaseOwner\" AS \"taskLeaseOwner\",task.\"leaseExpiresAt\" AS \"taskLeaseExpiresAt\",task.\"attemptCount\" AS \"taskAttemptCount\",task.\"interruptRequestedAt\",task.\"context\",turn.\"id\" AS \"turnId\",turn.\"source\",turn.\"executionMode\",turn.\"input\",turn.\"status\" AS \"turnStatus\",turn.\"leaseOwnerId\",turn.\"leaseVersion\",turn.\"leaseExpiresAt\",turn.\"rootTaskId\" AS \"turnRootTaskId\",root.\"status\" AS \"rootStatus\",root.\"attemptCount\" AS \"rootAttemptCount\",root.\"leaseOwner\" AS \"rootLeaseOwner\",session.\"userId\" AS \"userId\" FROM \"sub_agent_tasks\" task JOIN \"agent_turns\" turn ON turn.\"id\"=task.\"turnId\" AND turn.\"sessionId\"=task.\"sessionId\" JOIN \"sub_agent_tasks\" root ON root.\"id\"=task.\"rootTaskId\" AND root.\"sessionId\"=task.\"sessionId\" JOIN \"agent_sessions\" session ON session.\"id\"=task.\"sessionId\" WHERE task.\"id\"=$1 AND task.\"sessionId\"=$2 AND task.\"turnId\"=$3 AND task.\"rootTaskId\"=$4 AND task.\"parentTaskId\"=$4 AND turn.\"userId\"=$5 AND session.\"userId\"=$5 AND task.\"status\"=$6 AND root.\"status\"=$6"
-  const result = await client.query<Row>(sql, [lease.id, lease.sessionId, lease.turnId, lease.rootTaskId, lease.userId, "running"])
-  const row = record(result.rows[0]), now = Date.now()
-  if (result.rows.length !== 1 || !row || row.userId !== lease.userId || row.role !== "prepare" || row.taskType !== "scheduled_application_prepare"
-    || row.taskStatus !== "running" || row.taskLeaseOwner !== lease.ownerId || lease.leaseOwner !== lease.ownerId
-    || Number(row.taskAttemptCount) !== lease.attemptCount || row.interruptRequestedAt !== null || !future(row.taskLeaseExpiresAt, now)
-    || row.turnId !== lease.turnId || row.turnRootTaskId !== lease.rootTaskId || row.turnStatus !== "in_progress"
-    || typeof row.leaseOwnerId !== "string" || !Number.isSafeInteger(Number(row.leaseVersion)) || Number(row.leaseVersion) < 1
-        || !future(row.leaseExpiresAt, now) || Number(row.rootAttemptCount) < 1 || row.rootLeaseOwner !== row.leaseOwnerId
-    || !scheduledSnapshotMatches({ source: row.source, executionMode: row.executionMode, input: row.input }, snapshotDigest(row.input))) {
-    throw new Error("scheduled_prepare_owner_stale")
-  }
-  const turnOwner: ScheduledPrepareOwner = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!,
-    rootTaskId: lease.rootTaskId, rootAttemptCount: Number(row.rootAttemptCount), turnLeaseOwnerId: row.leaseOwnerId as string,
-    turnLeaseVersion: Number(row.leaseVersion), executionId: "", executionAttemptCount: 0 }
-  const taskFence: AgentArtifactTaskFence = { taskId: lease.id, userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!,
-    rootTaskId: lease.rootTaskId, parentTaskId: lease.parentTaskId, leaseOwner: lease.ownerId, attemptCount: lease.attemptCount }
-  const executionScope = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!, rootTaskId: lease.rootTaskId,
-    parentTaskId: lease.rootTaskId, stepId: "scheduled-prepare", turnLeaseOwner: turnOwner.turnLeaseOwnerId,
-    turnLeaseVersion: turnOwner.turnLeaseVersion, parentLeaseOwner: turnOwner.turnLeaseOwnerId, parentAttemptCount: turnOwner.rootAttemptCount }
-  if (owner.userId !== lease.userId || owner.sessionId !== lease.sessionId || owner.turnId !== lease.turnId
-    || owner.rootTaskId !== lease.rootTaskId || owner.taskId !== lease.id || owner.ownerId !== lease.ownerId || owner.attemptCount !== lease.attemptCount) {
-    throw new Error("scheduled_prepare_owner_stale")
-  }
-  return { owner: turnOwner, taskFence, executionScope,
-    turn: { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!, rootTaskId: lease.rootTaskId,
-      source: row.source, executionMode: row.executionMode, input: row.input, status: row.turnStatus,
-      leaseOwnerId: row.leaseOwnerId, leaseVersion: Number(row.leaseVersion), leaseExpiresAt: row.leaseExpiresAt as Date | string },
-    root: { id: lease.rootTaskId, userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!,
-      status: row.rootStatus as string, attemptCount: Number(row.rootAttemptCount) } }
-}
-
-async function readPrivateReceipt(client: Queryable, scope: GraphIdentityScope, owner: ScheduledPrepareOwner) {
+async function readPrivateReceipt(client: Queryable, scope: GraphIdentityScope) {
   const sql = "SELECT event.\"type\",event.\"itemId\",event.\"taskId\",event.\"actor\",event.\"payload\",event.\"idempotencyKey\",EXISTS(SELECT 1 FROM \"agent_outbox\" outbox WHERE outbox.\"idempotencyKey\"='agent-event:'||event.\"id\" OR outbox.\"payload\"->>'eventId'=event.\"id\") AS \"hasOutbox\" FROM \"agent_events\" event JOIN \"agent_sessions\" session ON session.\"id\"=event.\"sessionId\" JOIN \"agent_turns\" turn ON turn.\"id\"=event.\"turnId\" AND turn.\"sessionId\"=event.\"sessionId\" WHERE event.\"sessionId\"=$1 AND event.\"turnId\"=$2 AND session.\"userId\"=$3 AND turn.\"userId\"=$3 AND event.\"type\"=$4"
   const rows = await client.query<Row>(sql, [scope.sessionId, scope.turnId, scope.userId, SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_EVENT])
   if (rows.rows.length !== 1) return null
   const row = record(rows.rows[0]), receipt = parseScheduledTaskGraphContinuationReceipt(row?.payload)
   if (!row || row.itemId !== null || row.taskId !== null || row.actor !== "system" || row.hasOutbox !== false
     || typeof row.idempotencyKey !== "string" || !row.idempotencyKey.startsWith("scheduled-prepare:") || !receipt) return null
-  const a = receipt.owner
-  return sameTurnLineage(a, owner)
-    ? receipt : null
+  return receipt
 }
 
 export { scheduledPrepareAnalyzeSnapshot, scheduledPrepareLiveCheckpointBinding } from "./scheduled-prepare-runtime-context.js"
@@ -179,11 +149,6 @@ async function readExecutionCheckpoint(client: Queryable, receipt: NonNullable<R
   return { state, claimTokenDigest }
 }
 
-function sameTurnLineage(left: ScheduledPrepareOwner | ScheduledAutomationPipelineAttestation["owner"], right: ScheduledPrepareOwner | ScheduledAutomationPipelineAttestation["owner"]): boolean {
-  return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
-    && left.rootTaskId === right.rootTaskId && left.rootAttemptCount === right.rootAttemptCount
-}
-
 function record(value: unknown): Row | null { return value && typeof value === "object" && !Array.isArray(value) ? value as Row : null }
 
 function prepareTaskMatches(task: GraphTaskRow, node: TaskGraphSnapshot["nodes"][number], lease: SubagentLease): boolean {
@@ -191,17 +156,6 @@ function prepareTaskMatches(task: GraphTaskRow, node: TaskGraphSnapshot["nodes"]
   return node.templateId === "prepare" && task.id === node.taskId && task.status === "running" && task.attemptCount === lease.attemptCount
     && task.role === template.role && task.taskType === template.taskType && same(task.expectedOutputSchema, template.expectedOutputSchema)
     && same(task.allowedActions, template.allowedActions)
-}
-function future(value: unknown, now: number): boolean {
-  const timestamp = value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : Number.NaN
-  return Number.isFinite(timestamp) && timestamp > now
-}
-function snapshotDigest(value: unknown): string {
-  const snapshot = parseScheduledAutomationSnapshot(record(record(value)?.scheduledAutomationSnapshot))
-  if (!snapshot) return ""
-  const projection = [snapshot.schemaVersion, snapshot.targetRoles, snapshot.targetLocations, snapshot.minScore,
-    snapshot.dailyCap, snapshot.requireApproval, snapshot.autoApply]
-  return `sha256:${createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex")}`
 }
 function same(left: unknown, right: unknown): boolean {
   try { return canonicalTaskGraphJson(left) === canonicalTaskGraphJson(right) } catch { return false }

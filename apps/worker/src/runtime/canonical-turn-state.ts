@@ -15,6 +15,7 @@ import { COGNITIVE_AGENDA_EVENT_TYPE, parseCognitiveAgendaReceipt, type Cognitiv
 import { hydrateNativeVerificationHistoricalAdvisories } from "./subagents/native-verification-historical-advisory.js"
 import { recoverCanonicalTurnQuestionContext } from "./turns/turn-question-runtime-support.js"
 import { buildCanonicalTurnResumeState } from "./canonical-turn-wait-resume-accounting.js"
+import { readScheduledRecoveryWaitRows } from "./canonical-turn-scheduled-recovery-wait.js"
 import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK } from "./turns/completion-recovery-context.js"
 import { restoreTaskGraphDenialProgress, TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE } from "./turns/task-graph-denial-resume.js"
 export type CanonicalTurnState = {
@@ -134,7 +135,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     if (!turn) throw new Error("turn_not_owned")
     const consumedWaits = options.consumeWaitOutcomes ? await consumeDurableWaitOutcomes({ client, lease, turn, now }) : []
     const stepsResult = await client.query<Row>(
-      `SELECT "id", "taskId", "ordinal", "attempt", "status", "finishReason", "errorCode", "inputThroughSequence", "consumedInputIds", "inputTokens", "outputTokens", "estimatedCostUsd"
+      `SELECT "id", "taskId", "ordinal", "attempt", "status", "finishReason", "errorCode", "inputThroughSequence", "consumedInputIds", "inputTokens", "outputTokens", "estimatedCostUsd", "modelProfileSnapshot"
        FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2 AND ("taskId" IS NULL OR "taskId" = $3)
        ORDER BY "ordinal" ASC, "attempt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
@@ -151,6 +152,9 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
           AND event."type" IN ('model.started', 'model.completed', 'model.usage', 'tool_call.started', 'tool_call.completed', 'tool_call.failed', 'step.completed', 'final.rejected', 'item.started', 'item.delta', 'item.completed', '${STEERING_MARKER_EVENT_TYPE}', '${COGNITIVE_AGENDA_EVENT_TYPE}', '${TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE}')
        ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
     )
+    const scheduledRecoveryWaitRows = await readScheduledRecoveryWaitRows(client, { scope: {
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: String(turn.rootTaskId ?? ""),
+    }, steps: stepsResult.rows, events: eventsResult.rows })
     const priorInputs = await client.query<Row>(
       `SELECT "id", "targetTurnId", "content", "acceptedSequence", "delivery", "status", "consumedByStepId", "consumedAt", "cancelledAt", 'user' AS "historyRole", "acceptedSequence" AS "historySequence" FROM "agent_inputs"
        WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" IS NOT NULL AND "targetTurnId" <> $3
@@ -223,6 +227,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     const baseResume = buildCanonicalTurnResumeState({ last, maxOrdinal, steps: stepsResult.rows,
       persistedToolCallCount: itemsResult.rows.filter(item => item.type === "tool_call").length, items: itemsResult.rows, events: eventsResult.rows,
       scope: { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: rootTaskId ?? "" }, recoveredWaitControl,
+      scheduledRecoveryWaitRows,
       taskGraphDenialProgress })
     const resume = baseResume && restoredAgenda ? { ...baseResume, cognitiveAgendaReceipt: restoredAgenda } : baseResume
     if (resume?.finalEvidenceRecoveryUsed) snapshot = applyCompletionRecovery(snapshot, "resume", FINAL_EVIDENCE_RECOVERY_FEEDBACK)

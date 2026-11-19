@@ -197,7 +197,7 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
   const proofCurrent = request.action === 'scheduled_audit_execute'
     ? await isScheduledTaskGraphAuditChildGateProofCurrent({ ...proofInput, auditActor: request.auditActor }, tx)
     : await isScheduledTaskGraphGateProofCurrent(proofInput, tx)
-  const prepareIsCurrent = request.action === 'gate' && gateRootWait && snapshot.requireApproval
+  const prepareIsCurrent = request.action === 'gate' && gateRootWait && (snapshot.requireApproval || record(turn.input)?.automationRunMode === 'manual')
     ? await validateScheduledTaskGraphAuditPrepareSource({ owner, snapshot, proof: request.prepareProof,
       ...(waitId ? { scheduledWaitId: waitId } : {}), reader: tx, gateWait: gateRootWait }).catch(() => false)
     : await (request.action === 'scheduled_audit_execute' ? validateScheduledTaskGraphAuditPrepareSource : validateScheduledPrepareWaitIdentity)

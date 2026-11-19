@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto"
+import { scheduledPrepareDependencyWaitKey } from "./scheduled-prepare-checkpoint-wait.js"
 import type { DurableWaitPort } from "../tools/coordination-types.js"
 import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphExecutionScope, TaskGraphReadScope, TaskGraphScheduledPrepareInput } from "./task-graph-command-port.js"
 import type { ScheduledPipelinePrepareContinuation } from "./scheduled-pipeline-completion.js"
@@ -19,7 +19,7 @@ export type ScheduledPipelinePrepareResult = Readonly<{ status: "waiting_for_dep
   | Readonly<{ status: "waiting_for_choice"; waitId: string }>
   | Readonly<{ status: "ready"; prepareProof: ScheduledPrepareTaskGraphProof;
     choice: Readonly<{ required: true; status: "answered"; scheduledWaitId: string }> | Readonly<{ required: false }> }>
-type ReadyPrepareVerifier = (input: Readonly<{ scope: TaskGraphExecutionScope; prepareTaskId: string; signal: AbortSignal }>) => Promise<ScheduledPrepareVerification>
+type ReadyPrepareVerifier = (input: Readonly<{ scope: TaskGraphExecutionScope; prepareTaskId: string; waitId: string; signal: AbortSignal }>) => Promise<ScheduledPrepareVerification>
 
 /** Appends the fixed Prepare node and waits on its durable same-root TaskGraph task. */
 export function createScheduledAutomationPrepareContinuation(input: Readonly<{
@@ -81,12 +81,12 @@ export function createScheduledAutomationPrepareContinuation(input: Readonly<{
     const wait = await input.waitPort.wait({ userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
       stepId: continuation.recoveryStepId, taskId: scope.rootTaskId, rootTaskId: scope.rootTaskId,
       targetTaskIds: [nodes[0].taskId], mode: "all", timeoutMs: WAIT_TIMEOUT_MS,
-      idempotencyKey: waitKey(continuation.proof.continuationKey, continuation.recoveryStepId) })
+      idempotencyKey: scheduledPrepareDependencyWaitKey(continuation.proof.continuationKey, continuation.recoveryStepId) })
     const prepareTaskId = nodes[0]!.taskId
     if (!wait.waitId.trim() || !["waiting", "ready"].includes(wait.status) || wait.matchedTaskIds.some(taskId => taskId !== prepareTaskId)
       || (wait.status === "ready" && (wait.matchedTaskIds.length !== 1 || wait.matchedTaskIds[0] !== prepareTaskId))) throw new Error("scheduled_prepare_wait_invalid")
     if (wait.status === "waiting") return { status: "waiting_for_dependency", waitId: wait.waitId }
-    const verified = await input.verifyReadyPrepare?.({ scope, prepareTaskId, signal: continuation.signal })
+    const verified = await input.verifyReadyPrepare?.({ scope, prepareTaskId, waitId: wait.waitId, signal: continuation.signal })
     if (!verified?.verified) throw new Error("scheduled_prepare_completion_unverified")
     const prepareProof = buildScheduledPrepareTaskGraphProof(verified.facts, { waitId: wait.waitId, status: "ready", mode: "all",
       targetTaskIds: [prepareTaskId], matchedTaskIds: [prepareTaskId] })
@@ -114,11 +114,6 @@ function hasScheduledPrepare(graph: Awaited<ReturnType<TaskGraphCommandPort["rea
     && prepare.goal === PREPARE_GOAL && sameJson(prepare.successCriteria, PREPARE_CRITERIA)
     && prepare.failureReason === null && prepare.status === "completed"
     && (!gate || gate.status !== "failed" && gate.status !== "cancelled" && gate.failureReason === null))
-}
-
-function waitKey(continuationKey: string, recoveryStepId: string): string {
-  const digest = createHash("sha256").update(`${continuationKey}\0${recoveryStepId}`, "utf8").digest("hex")
-  return `scheduled-prepare-dependency:${digest}`
 }
 
 function sameJson(left: unknown, right: unknown): boolean { try { return canonicalTaskGraphJson(left) === canonicalTaskGraphJson(right) } catch { return false } }

@@ -16,7 +16,7 @@ const MAX_ROWS = 65
 type Row = Record<string, unknown>
 type CandidateSource = Readonly<{ sourceEventId: string; stepId: string; ordinal: number }>
 
-/** Validates a historical Prepare source only after its exact approved choice and recovery tail are proven. */
+/** Verifies the historical Prepare source, choice policy, and operational recovery tail. */
 export async function validateScheduledTaskGraphAuditPrepareSource(input: Readonly<{
   owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; proof: unknown; scheduledWaitId?: string; reader?: Prisma.TransactionClient;
   gateWait?: ScheduledGateRootWait
@@ -25,7 +25,9 @@ export async function validateScheduledTaskGraphAuditPrepareSource(input: Readon
     const reader = input.reader ?? db
     const snapshot = parseScheduledAutomationSnapshot(input.snapshot), receipt = exactRecord(input.proof, ['receipt', 'completion', 'result'])?.receipt
     const parsedReceipt = parseScheduledPrepareChoiceReceipt(receipt, input.owner, scheduledAutomationSnapshotDigest(snapshot))
-    if (!parsedReceipt || input.gateWait && !snapshot.requireApproval || (snapshot.requireApproval ? !isScheduledPrepareChoiceWaitId(input.owner.turnId, input.scheduledWaitId)
+    if (!parsedReceipt || input.gateWait && !snapshot.requireApproval
+      && (input.gateWait.turn.status !== 'waiting_for_dependency' || input.gateWait.approvalIds.length !== 0)
+      || (snapshot.requireApproval ? !isScheduledPrepareChoiceWaitId(input.owner.turnId, input.scheduledWaitId)
       : input.scheduledWaitId !== undefined)) return false
     const [receipts, candidates] = await Promise.all([
       reader.agentEvent.findMany({ where: { sessionId: input.owner.sessionId, turnId: input.owner.turnId, type: RECEIPT_EVENT,

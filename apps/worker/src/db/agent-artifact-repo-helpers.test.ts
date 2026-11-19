@@ -3,7 +3,7 @@ import type { Pool } from "pg"
 
 import {
   artifactTaskFenceIsCurrent, artifactTaskLeaseIsLive, AgentArtifactRepositoryError,
-  findCurrentDraftHeadWithClient, findReviewReceiptWithClient,
+  findAgentArtifactByScopeWithClient, findCurrentDraftHeadWithClient, findReviewReceiptWithClient,
   toAgentArtifactReviewRow, toAgentArtifactRow, toAgentArtifactVersionRow, type AgentArtifactTaskFence,
 } from "./agent-artifact-repo-helpers.js"
 
@@ -12,7 +12,7 @@ const fence: AgentArtifactTaskFence = {
   parentTaskId: "parent-a", leaseOwner: "worker-a", attemptCount: 2,
 }
 
-function clientWith(rows: Array<{ readonly id: string } | { readonly live: boolean }>) {
+function clientWith(rows: Array<{ readonly id: string; readonly turnStatus?: string } | { readonly live: boolean }>) {
   let index = 0
   return { query: vi.fn(async (_sql: string, _values?: unknown[]) => {
     const row = rows[index++]
@@ -21,6 +21,31 @@ function clientWith(rows: Array<{ readonly id: string } | { readonly live: boole
 }
 
 describe("selected-job artifact task fence helpers", () => {
+  it("locks the unique scoped base or draft artifact before reusing its immutable identity", async () => {
+    const createdAt = new Date("2026-11-18T00:00:00.000Z")
+    const query = vi.fn(async (_sql: string, _values?: unknown[]) => ({ rows: [{ id: "base-a", userId: "user-a", jobId: "job-a", artifactType: "cover_letter",
+      lifecycle: "base", baseId: "base-a", baseHash: "base-hash", content: {}, hash: "base-hash", constraintHash: "constraints",
+      provenanceRefs: ["job:job-a"], evidenceRefs: ["job:job-a"], previousHash: null, version: 1, createdAt, updatedAt: createdAt }], rowCount: 1 }))
+    const client = { query }
+
+    await expect(findAgentArtifactByScopeWithClient(client as never,
+      { userId: "user-a", jobId: "job-a", artifactType: "cover_letter", lifecycle: "base" }))
+      .resolves.toMatchObject({ id: "base-a", lifecycle: "base", baseId: "base-a", baseHash: "base-hash" })
+    expect(query.mock.calls[0]?.[0]).toContain('"artifactType" = $3 AND "lifecycle" = $4 FOR UPDATE')
+    expect(query.mock.calls[0]?.[1]).toEqual(["user-a", "job-a", "cover_letter", "base"])
+  })
+
+  it("returns no scoped artifact for invalid scope or ambiguous rows", async () => {
+    const query = vi.fn(async (_sql: string, _values?: unknown[]) => ({ rows: [{ id: "one" }, { id: "two" }], rowCount: 2 }))
+    const client = { query }
+    await expect(findAgentArtifactByScopeWithClient(client as never,
+      { userId: " ", jobId: "job-a", artifactType: "resume", lifecycle: "base" })).resolves.toBeNull()
+    expect(query).not.toHaveBeenCalled()
+    await expect(findAgentArtifactByScopeWithClient(client as never,
+      { userId: "user-a", jobId: "job-a", artifactType: "resume", lifecycle: "base" })).resolves.toBeNull()
+    expect(query).toHaveBeenCalledOnce()
+  })
+
   it("reads the current draft head and exact review receipt through only the supplied client", async () => {
     const calls: Array<{ sql: string; values?: unknown[] }> = []
     const query = vi.fn(async (sql: string, values?: unknown[]) => {
@@ -100,22 +125,22 @@ describe("selected-job artifact task fence helpers", () => {
     expect(taskSql).toContain("FOR UPDATE OF session, turn, root, task")
     expect(taskSql).toContain('task."context"->\'selectedJobPreparation\'->>\'jobId\' = $9')
     expect(taskSql).toContain('root."interruptRequestedAt" IS NULL')
-    expect(taskValues).toEqual(["task-a", "user-a", "session-a", "turn-a", "root-a", "parent-a", "worker-a", 2, "job-a", "selected_job", null, null])
+    expect(taskValues).toEqual(["task-a", "user-a", "session-a", "turn-a", "root-a", "parent-a", "worker-a", 2, "job-a", "selected_job", null, null, null])
     expect(client.query.mock.calls[1]?.[0]).toContain('parent."interruptRequestedAt" IS NULL FOR UPDATE')
   })
 
   it("requires the captured live Turn lease for scheduled Prepare artifact writes", async () => {
     const scheduledFence: AgentArtifactTaskFence = {
-      ...fence, taskFenceMode: "scheduled_prepare", turnLeaseOwnerId: "turn-worker-a", turnLeaseVersion: 6,
+      ...fence, taskFenceMode: "scheduled_prepare", turnLeaseOwnerId: "turn-worker-a", turnLeaseVersion: 6, rootAttemptCount: 3,
     }
-    const current = clientWith([{ id: "task-a" }, { id: "parent-a" }])
+    const current = clientWith([{ id: "task-a", turnStatus: "in_progress" }, { id: "parent-a" }])
     await expect(artifactTaskFenceIsCurrent(current as unknown as Pick<Pool, "query">, scheduledFence, "job-a")).resolves.toBe(true)
     const [taskSql, taskValues] = current.query.mock.calls[0] as unknown as [string, unknown[]]
     expect(taskSql).toContain('turn."leaseOwnerId" = $11')
     expect(taskSql).toContain('turn."leaseVersion" = $12')
     expect(taskSql).toContain('turn."leaseExpiresAt" > clock_timestamp()')
     expect(taskValues).toEqual(["task-a", "user-a", "session-a", "turn-a", "root-a", "parent-a", "worker-a", 2, "job-a",
-      "scheduled_prepare", "turn-worker-a", 6])
+      "scheduled_prepare", "turn-worker-a", 6, 3])
 
     const missingLease = clientWith([])
     await expect(artifactTaskFenceIsCurrent(missingLease as unknown as Pick<Pool, "query">,

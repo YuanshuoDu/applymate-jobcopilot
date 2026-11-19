@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { buildCanonicalTurnResumeState } from "./canonical-turn-wait-resume-accounting.js"
+import { scheduledPipelineRecoveryStepMarker, withScheduledPipelineRecoveryStepProfile } from "./subagents/scheduled-pipeline-recovery-step.js"
 import type { RecoveredArchivedWaitControl } from "./turns/turn-execution-wait.js"
 import type { TaskGraphDenialProgress } from "./turns/turn-execution-types.js"
 
@@ -96,14 +97,39 @@ function combinedNativeAndArchivedEvents(): Array<Record<string, unknown>> {
 function build(input: {
   steps?: readonly Record<string, unknown>[]; items?: readonly Record<string, unknown>[]; events?: readonly Record<string, unknown>[]
   persistedToolCallCount?: number; recoveredWaitControl?: RecoveredArchivedWaitControl; taskGraphDenialProgress?: TaskGraphDenialProgress
+  scheduledRecoveryWaitRows?: readonly Record<string, unknown>[]
 }) {
   return buildCanonicalTurnResumeState({ last: { ordinal: 4, inputThroughSequence: "8", consumedInputIds: ["input-1"] }, maxOrdinal: 4,
     steps: input.steps ?? [{ ...archivedStep }], items: input.items ?? [call, result], events: input.events ?? archivedEvents,
     persistedToolCallCount: input.persistedToolCallCount ?? 1, scope, recoveredWaitControl: input.recoveredWaitControl,
-    taskGraphDenialProgress: input.taskGraphDenialProgress })
+    taskGraphDenialProgress: input.taskGraphDenialProgress, scheduledRecoveryWaitRows: input.scheduledRecoveryWaitRows })
 }
 
 describe("canonical resume accounting for archived waits", () => {
+  it("does not treat a model-free scheduled recovery dependency wait as an archived model batch", () => {
+    const owner = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId }
+    const source = { owner, sourceEventId: "candidate-event", sourceStepId: "candidate-step", sourceStepOrdinal: 3,
+      rootAttemptCount: 2, inputThroughSequence: "8", consumedInputIds: [] as string[] }
+    const marker = scheduledPipelineRecoveryStepMarker({ owner, source, recoveryStepId: "recovery-step", recoveryCursor: 1,
+      inputThroughSequence: "8" })
+    const recovery = { id: marker.recoveryStepId, taskId: scope.rootTaskId, ordinal: 4, attempt: 1, status: "waiting_for_tool",
+      errorCode: null, inputThroughSequence: "8", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0,
+      modelProfileSnapshot: withScheduledPipelineRecoveryStepProfile({}, marker) }
+    const started = { ...archivedEvents[0]!, id: "recovery-start", type: "step.started", sequence: "1",
+      correlationId: recovery.id, idempotencyKey: `turn:${scope.turnId}:event:step-started:${recovery.id}`,
+      payload: { stepId: recovery.id, ordinal: 4, taskId: scope.rootTaskId, scheduledPipelineRecoveryStep: marker } }
+    const completed = { ...archivedEvents[4]!, id: "recovery-completed", type: "step.completed", sequence: "2",
+      correlationId: recovery.id, idempotencyKey: `turn:${scope.turnId}:event:step-completed:${recovery.id}`,
+      payload: { stepId: recovery.id, status: "waiting_for_dependency", taskId: scope.rootTaskId, waitId: "recovery-wait" } }
+    const wait = { id: "recovery-wait", userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
+      parentTaskId: scope.rootTaskId, stepId: recovery.id, status: "ready", targetTaskIds: ["prepare-1"], matchedTaskIds: ["prepare-1"],
+      mode: "all", suspendedAt: new Date(), consumedAt: new Date() }
+    const resumed = build({ steps: [recovery], items: [], events: [started, completed], persistedToolCallCount: 1,
+      scheduledRecoveryWaitRows: [wait] })
+    expect(resumed?.toolCallCount).toBe(1)
+    expect(resumed?.usage).toEqual({ inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 })
+  })
+
   it("carries restored private denial progress without changing ordinary counters", () => {
     const progress: TaskGraphDenialProgress = { taskId: scope.rootTaskId, graphRevision: 4, verificationDigest: "a".repeat(64),
       inputThroughSequence: 8n, consumedInputIds: ["input-1"], count: 2 }

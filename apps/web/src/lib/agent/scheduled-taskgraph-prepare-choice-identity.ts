@@ -3,6 +3,8 @@ import { db } from "@/lib/db"
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint"
 import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapshot"
 import { isScheduledPrepareChoiceWaitId, parseScheduledPrepareChoiceReceipt, scheduledPrepareChoiceBinding, scheduledPrepareChoiceId } from "./scheduled-taskgraph-run-receipt"
+import { parseScheduledTaskGraphPrepareProof } from "./scheduled-taskgraph-prepare-proof"
+import { validateScheduledTaskGraphAuditPrepareSource } from "./scheduled-taskgraph-audit-prepare-source"
 
 const RECEIPT_EVENT = "agent.plan.scheduled_prepare_binding"
 const CANDIDATE_EVENT = "native_verification.scheduled_candidate_staged"
@@ -13,9 +15,11 @@ const CHOICE_CONTENT = { waitKind: "question", toolCallId: null, stage: "schedul
 export { isScheduledPrepareChoiceWaitId }
 
 /** Validates the separate Worker choice wait against its private receipt and persisted final step. */
-export async function validateScheduledPrepareWaitIdentity(input: Readonly<{
+type PrepareWaitInput = Readonly<{
   owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; proof: unknown; scheduledWaitId?: string
-}>): Promise<boolean> {
+}>
+
+export async function validateScheduledPrepareWaitIdentity(input: PrepareWaitInput): Promise<boolean> {
   let snapshot: ReturnType<typeof parseScheduledAutomationSnapshot>
   try { snapshot = parseScheduledAutomationSnapshot(input.snapshot) } catch { return false }
   const proof = exactRecord(input.proof, ["receipt", "completion", "result"]), receipt = parseScheduledPrepareChoiceReceipt(proof?.receipt, input.owner)
@@ -28,13 +32,16 @@ export async function validateScheduledPrepareWaitIdentity(input: Readonly<{
   ])
   if (receipts.length >= 65 || candidates.length >= 65 || receipts.filter(row => sameCanonicalJson(row.payload, receipt)).length !== 1) return false
   const latest = await db.agentStep.findFirst({ where: { sessionId: input.owner.sessionId, turnId: input.owner.turnId, taskId: input.owner.rootTaskId },
-    orderBy: { ordinal: "desc" }, select: { id: true } })
+    orderBy: { ordinal: "desc" }, select: { id: true, status: true } })
   const matching = candidates.flatMap(row => {
     const candidate = parseChoiceCandidate(row.payload, row.type, row.taskId, row.correlationId, input.owner)
     return candidate && (snapshot.requireApproval ? scheduledPrepareChoiceId(receipt, candidate.finalStepId, candidate.finalStepOrdinal) === input.scheduledWaitId
       : candidate.finalStepId === latest?.id) ? [candidate] : []
   })
-  if (matching.length !== 1 || !latest) return false
+  if (!latest || matching.length > 1) return false
+  if (matching[0]?.finalStepId !== latest.id) {
+    return latest.status === "streaming" && validateRecoveredPrepareWait(input, latest.id)
+  }
   const candidate = matching[0]!, waitId = scheduledPrepareChoiceId(receipt, candidate.finalStepId, candidate.finalStepOrdinal)
   if (snapshot.requireApproval && waitId !== input.scheduledWaitId) return false
   const itemId = `agent-wait:question:${waitId}`
@@ -55,6 +62,22 @@ export async function validateScheduledPrepareWaitIdentity(input: Readonly<{
     && sameCanonicalJson(content.scheduledPrepareChoiceBinding, binding)
     && item.status === "completed" && validIso(content.answeredAt) && content.answerAvailable === true
     && ["apply_ai_changes", "keep_resume"].includes(String(content.answer)))
+}
+
+async function validateRecoveredPrepareWait(input: PrepareWaitInput, stepId: string): Promise<boolean> {
+  const proof = parseScheduledTaskGraphPrepareProof(input.proof), { owner } = input
+  const receiptOwner = record(proof?.receipt.owner), wait = record(proof?.completion.wait)
+  if (!proof || !receiptOwner || !Number.isSafeInteger(receiptOwner.turnLeaseVersion)
+    || Number(receiptOwner.turnLeaseVersion) >= owner.turnLeaseVersion || !validId(wait?.waitId)) return false
+  const rows = await db.agentWaitCondition.findMany({ where: {
+    userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, parentTaskId: owner.rootTaskId,
+    stepId, status: "ready", mode: "all", suspendedAt: null, consumedAt: null,
+  }, select: { id: true, idempotencyKey: true, targetTaskIds: true, matchedTaskIds: true }, take: 2 })
+  const row = rows[0], targets = [proof.result.taskId]
+  return rows.length === 1 && row?.id === wait.waitId
+    && /^scheduled-prepare-dependency:[a-f0-9]{64}$/.test(row.idempotencyKey)
+    && sameCanonicalJson(row.targetTaskIds, targets) && sameCanonicalJson(row.matchedTaskIds, targets)
+    && await validateScheduledTaskGraphAuditPrepareSource(input)
 }
 
 function parseChoiceCandidate(value: unknown, type: unknown, taskId: unknown, correlationId: unknown, owner: ScheduledTaskGraphPipelineOwner) {
