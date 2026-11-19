@@ -4831,7 +4831,9 @@ describe("private final dependency wait admission", () => {
   }
 
   it("waits through the registered tool path before verifying or persisting the live candidate", async () => {
-    const root = fixture(identity("task", "parent-1")), callbackInputs: PrepareFinalDependencyWaitInput[] = []
+    const canonicalCallId = "child-wait-call:415-555-0134"
+    const root = fixture(identity("task", "parent-1"), undefined, [{ id: "child-resume:source-result",
+      content: { toolCallId: canonicalCallId, toolName: "wait_subagents" } }]), callbackInputs: PrepareFinalDependencyWaitInput[] = []
     const callback = vi.fn((input: PrepareFinalDependencyWaitInput) => {
       callbackInputs.push(input)
       return { taskIds: [childId] }
@@ -4859,6 +4861,9 @@ describe("private final dependency wait admission", () => {
     expect(result).toMatchObject({ status: "waiting_for_dependency", stepCount: 1, toolCallCount: 1 })
     expect(callback).toHaveBeenCalledTimes(1)
     expect(input?.identity).toBe(root.options.identity)
+    const aliases = [...(input?.toolCallAliases ?? [])].filter(([, id]) => id === canonicalCallId)
+    expect(aliases).toHaveLength(1)
+    expect(aliases[0]?.[0]).not.toBe(canonicalCallId)
     expect(input?.step).toMatchObject({ id: input.context.stepId, ordinal: 0 })
     expect(input?.snapshot).toBe(root.options.snapshot)
     expect(input?.context.schemaVersion).toBe("agent-harness.v2")
