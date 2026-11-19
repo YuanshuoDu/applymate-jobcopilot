@@ -160,8 +160,11 @@ function validObjectiveProgress(planRevision: unknown, goalRevision: string | nu
     || snapshot.requirements.some(row => row.status !== "unknown"))) return false
   return delta.requirements.length === snapshot.requirements.length && delta.requirements.every((row, index) => {
     const current = snapshot.requirements[index]
-    return row.id === current?.id && row.kind === current.kind && row.minimum === current.minimum && row.afterStatus === current.status
-      && (delta.availability !== "unavailable" || row.beforeStatus === "unknown")
+    if (!current || row.id !== current.id || row.kind !== current.kind || row.afterStatus !== current.status) return false
+    if (current.kind === "candidate_location_in") {
+      if (row.kind !== "candidate_location_in") return false
+    } else if (row.kind === "candidate_location_in" || row.minimum !== current.minimum) return false
+    return delta.availability !== "unavailable" || row.beforeStatus === "unknown"
   })
 }
 
