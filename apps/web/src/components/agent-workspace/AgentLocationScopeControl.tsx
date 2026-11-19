@@ -2,7 +2,7 @@
 
 import React, { useReducer, useRef, type FormEvent } from 'react'
 import { OBJECTIVE_LOCATION_STEER_SCHEMA_VERSION, ObjectiveLocationSteerRequestSchema, validate, type ObjectiveLocationSteerRequest } from '@jobcopilot/agent-protocol'
-import { normalizeAgentLocationAllowlist } from '@jobcopilot/shared'
+import { normalizeAgentLocationAllowlist } from '@jobcopilot/shared/agent-location-normalization'
 import { useI18n } from '@/lib/i18n'
 import type { ActiveTurnDto, AgentTurnStateReadiness } from './agent-session-state'
 
