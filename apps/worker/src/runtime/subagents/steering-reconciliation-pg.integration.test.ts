@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import { createRequire } from "node:module"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool, type PoolClient } from "pg"
 import { redactAgentEvent, redactSensitiveText } from "@jobcopilot/shared"
@@ -11,13 +12,17 @@ import { steeringMarkerIdempotencyKey } from "../context/steering-marker.js"
 import { writeTaskGraphSnapshot } from "./task-graph-pg-events.js"
 import { parseTaskGraphSnapshot, taskGraphItemId, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
+import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
+import { resolveRootTaskVerificationRequirements } from "../context/root-task-objective.js"
 import { lockTaskGraphScope } from "./task-graph-pg-state.js"
-import type { TaskGraphExecutionScope, TaskGraphNativeCommandInput } from "./task-graph-command-port.js"
+import type { TaskGraphExecutionScope, TaskGraphNativeCommandInput, TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
 import { createStoredAgentInputMapper, loadUnresolvedSteeringContext } from "../context/steering-reconciliation-context.js"
 import { assertNoUnresolvedSteering, readSteeringReconciliationState } from "./steering-reconciliation-read.js"
 import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } from "./steering-reconciliation-ledger.js"
-import { steeringReconciliationIdempotencyKey } from "./steering-reconciliation-contract.js"
+import { steeringReconciliationIdempotencyKey, STEERING_RECONCILIATION_EVENT_TYPE } from "./steering-reconciliation-contract.js"
+import { loadTaskGraph } from "./task-graph-pg-state.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const EVENT_COLUMNS = '"id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload"'
@@ -29,7 +34,10 @@ function disposableUrl(): string | null {
     return null
   }
   const url = new URL(value)
-  if (url.protocol !== "postgresql:" || url.hostname !== "127.0.0.1" || url.port !== "5432"
+  const localProofPort = process.env.CI === "true" && required
+    && process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE === "true"
+    && process.env.AGENT_REPLAN_PROOF_LOCAL_DISPOSABLE === "1" && url.port === "15432"
+  if (url.protocol !== "postgresql:" || url.hostname !== "127.0.0.1" || url.port !== "5432" && !localProofPort
     || url.username !== "postgres" || url.password !== "postgres" || url.pathname !== `/${DATABASE_NAME}`
     || url.search || url.hash) throw new Error("Steering reconciliation requires the dedicated loopback disposable URL")
   return value
@@ -51,6 +59,7 @@ const ids = {
 const runtimeRole = `steering_reconcile_runtime_${suffix.replaceAll("-", "")}`
 const acceptanceApplicationName = `steer_accept_${suffix}`
 const decisionApplicationName = `steer_decide_${suffix}`
+const webRequire = createRequire(new URL("../../../../web/package.json", import.meta.url))
 const future = new Date(Date.now() + 10 * 60_000)
 const clientMessageId = (inputId: string) => `steering-${inputId}-415-555-0100`
 const executionIdentity = { kind: "turn" as const, userId: ids.user, sessionId: ids.session, turnId: ids.turn, taskId: ids.root,
@@ -77,6 +86,43 @@ function agenda(stepId: string, cursor: bigint, planRevision: number) {
     agenda: { ...buildCognitiveActionAgenda(context(stepId, cursor, [])), planRevision }, inputThroughSequence: cursor, consumedInputIds: [] })
   if (!payload) throw new Error("steering reconciliation fixture agenda was invalid")
   return payload
+}
+type WebStartResult = Readonly<{ inputId: string; turnId: string; sequence: string; disposition: string }>
+type WebLocationCommand = Readonly<{ schemaVersion: "agent-harness.v2.objective-location-steer.v1"; clientMessageId: string;
+  expectedTurnId: string; expectedRevision: number; locations: readonly string[]; userId: string; sessionId: string }>
+type WebLocationResult = Readonly<{ inputId: string; turnId: string; disposition: string; sequence: string }>
+type DisposableWebCommands = Readonly<{
+  prisma: { $disconnect(): Promise<void> }
+  start(command: Readonly<{ sessionId: string; userId: string; clientMessageId: string; source: "user"; objective: string;
+    content: readonly { type: "text"; text: string }[]; verificationRequirements: Readonly<{ schemaVersion: "agent-harness.v2.objective-requirements.v2";
+      requirements: readonly { id: string; check: Readonly<{ kind: "candidate_location_in"; locations: readonly string[] }> }[] }> }>): Promise<WebStartResult>
+  acceptLocation(command: WebLocationCommand): Promise<WebLocationResult>
+}>
+async function createDisposableWebCommands(connectionString: string): Promise<DisposableWebCommands> {
+  const loaded: unknown = webRequire("@prisma/client")
+  const constructor = loaded && typeof loaded === "object" ? (loaded as { PrismaClient?: unknown }).PrismaClient : undefined
+  if (typeof constructor !== "function") throw new Error("Web Prisma client constructor is unavailable")
+  const prisma = new (constructor as new (options: { datasourceUrl: string }) => DisposableWebCommands["prisma"])(
+    { datasourceUrl: connectionString })
+  try {
+    const [objectiveModule, locationModule] = await Promise.all([
+      // @ts-expect-error The Worker TypeScript project does not compile Web path aliases; Vitest resolves these test-only imports.
+      import("@/lib/agent/control-plane/commands/objective-start"),
+      // @ts-expect-error The Worker TypeScript project does not compile Web path aliases; Vitest resolves these test-only imports.
+      import("@/lib/agent/control-plane/commands/objective-location-steer"),
+    ])
+    const ObjectiveStart = objectiveModule.ObjectiveStartCommandService as unknown as new (db: unknown) => Pick<DisposableWebCommands, "start">
+    const acceptLocation = locationModule.acceptObjectiveLocationSteer as unknown as
+      (db: unknown, command: WebLocationCommand) => Promise<WebLocationResult>
+    const startService = new ObjectiveStart(prisma)
+    return { prisma, start: command => startService.start(command), acceptLocation: command => acceptLocation(prisma, command) }
+  } catch (error: unknown) {
+    await prisma.$disconnect()
+    throw error
+  }
+}
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
 async function insertEvent(input: { id: string; sequence: number; type: string; actor: string; itemId: string | null; taskId: string | null;
   correlationId: string; causationId?: string | null; idempotencyKey: string; payload: unknown }): Promise<void> {
@@ -200,6 +246,45 @@ async function seedToolCall(stepId: string, callId: string, name: "agent.reconci
   await insertEvent({ id: `${callId}-started-event`, sequence, type: "tool_call.started", actor: "orchestrator", itemId, taskId: ids.root,
     correlationId: callId, idempotencyKey: `${executionKey(executionIdentity)}:event:tool-started:${callId}`,
     payload: { toolCallId: callId, toolName: name, taskId: ids.root } })
+}
+async function seedScopedStep(input: { id: string; sessionId: string; turnId: string; rootTaskId: string; ordinal: number }): Promise<void> {
+  await adminPool!.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+    VALUES ($1, $2, $3, $4, $5, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+  [input.id, input.sessionId, input.turnId, input.rootTaskId, input.ordinal])
+}
+async function appendScopedEvent(input: { sessionId: string; turnId: string; id: string; type: string; actor: string;
+  itemId: string | null; taskId: string | null; correlationId: string; idempotencyKey: string; payload: unknown }): Promise<number> {
+  const allocated = await adminPool!.query<{ sequence: string }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+    WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"::text AS "sequence"`, [input.sessionId, ids.user])
+  const sequence = Number(allocated.rows[0]?.sequence)
+  if (!Number.isSafeInteger(sequence) || sequence < 1) throw new Error("could not allocate scoped fixture event")
+  await adminPool!.query(`INSERT INTO "agent_events" (${EVENT_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10, $11::jsonb)`,
+    [input.id, input.sessionId, input.turnId, input.itemId, input.taskId, sequence, input.type, input.actor,
+      input.correlationId, input.idempotencyKey, JSON.stringify(input.payload)])
+  return sequence
+}
+async function seedScopedAgenda(input: { sessionId: string; turnId: string; rootTaskId: string; step: StepContext; planRevision: number }): Promise<void> {
+  const payload = buildCognitiveAgendaReceipt({ sessionId: input.sessionId, turnId: input.turnId, taskId: input.rootTaskId,
+    stepId: input.step.stepId, agenda: { ...buildCognitiveActionAgenda(input.step), planRevision: input.planRevision },
+    inputThroughSequence: input.step.inputThroughSequence, consumedInputIds: input.step.consumedInputIds })
+  if (!payload) throw new Error("coalesced steer fixture agenda was invalid")
+  await appendScopedEvent({ sessionId: input.sessionId, turnId: input.turnId, id: randomUUID(), type: "cognitive.agenda",
+    actor: "orchestrator", itemId: null, taskId: input.rootTaskId, correlationId: input.step.stepId,
+    idempotencyKey: `cognitive.agenda:${input.step.stepId}`, payload })
+}
+async function seedScopedPlanCall(input: { sessionId: string; turnId: string; rootTaskId: string; stepId: string;
+  callId: string; userId: string; ownerId: string; leaseVersion: number; plan: unknown }): Promise<void> {
+  const itemId = randomUUID(), identity = { kind: "turn" as const, userId: input.userId, sessionId: input.sessionId,
+    turnId: input.turnId, taskId: input.rootTaskId, rootTaskId: input.rootTaskId, ownerId: input.ownerId,
+    leaseVersion: input.leaseVersion, leaseExpiresAt: new Date(0) }
+  await adminPool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "createdAt", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, 'tool_call', 'started', NULL, 0, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [itemId, input.sessionId, input.turnId, input.stepId, input.rootTaskId,
+      JSON.stringify({ toolCallId: input.callId, toolName: "agent.plan", toolVersion: "1", input: input.plan })])
+  await appendScopedEvent({ sessionId: input.sessionId, turnId: input.turnId, id: randomUUID(), type: "tool_call.started",
+    actor: "orchestrator", itemId, taskId: input.rootTaskId, correlationId: input.callId,
+    idempotencyKey: `${executionKey(identity)}:event:tool-started:${input.callId}`,
+    payload: { toolCallId: input.callId, toolName: "agent.plan", taskId: input.rootTaskId } })
 }
 async function runtimeTransaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await runtimePool!.connect()
@@ -681,5 +766,150 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
       cursor: String(priorCursor), ids: [] })
     expect(await markerState()).toEqual(beforeFailure)
     expect(acceptedSequence).toBeGreaterThan(priorCursor)
+  })
+
+  it("coalesces two persisted typed location steers and admits Berlin while the Seattle Scout remains live", async () => {
+    const locationSessionId = `coalesced-steers-session-${suffix}`, rootTaskId = `coalesced-steers-root-${suffix}`
+    const objective = "Find software engineering roles in Seattle"
+    const requirements = { schemaVersion: "agent-harness.v2.objective-requirements.v2" as const,
+      requirements: [{ id: "candidate-location", check: { kind: "candidate_location_in" as const, locations: ["Seattle"] } }] }
+    await adminPool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, $3, 'running', 'test', CURRENT_TIMESTAMP)`, [locationSessionId, ids.user, objective])
+    const web = await createDisposableWebCommands(databaseUrl!)
+    const oldFlag = process.env.AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED
+    let started: WebStartResult | undefined
+    try {
+      process.env.AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED = "1"
+      started = await web.start({ sessionId: locationSessionId, userId: ids.user, clientMessageId: `coalesced-start-${suffix}`,
+        source: "user", objective, content: [{ type: "text", text: objective }], verificationRequirements: requirements })
+    } finally {
+      if (oldFlag === undefined) delete process.env.AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED
+      else process.env.AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED = oldFlag
+    }
+    if (!started) throw new Error("ObjectiveStart did not return a typed location fixture Turn")
+    expect(started.disposition).toBe("started")
+
+    const turnOwner = `coalesced-turn-owner-${suffix}`, rootOwner = turnOwner
+    const leaseExpiresAt = new Date(Date.now() + 10 * 60_000)
+    await adminPool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+        "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
+      VALUES ($1, $2, $3, NULL, NULL, $4, 0, 'orchestrator', 'root', 'running', $5, '[]'::jsonb, '[]'::jsonb,
+        '["agent.plan","agent.reconcile"]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 2, $6, $7, CURRENT_TIMESTAMP)`,
+    [rootTaskId, locationSessionId, started.turnId, `/${rootTaskId}`, objective, rootOwner, leaseExpiresAt])
+    await adminPool!.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+      [rootTaskId, locationSessionId, started.turnId])
+    const turnRow = await adminPool!.query<{ revision: number; input: unknown }>(`UPDATE "agent_turns" SET "rootTaskId" = $1,
+        "status" = 'in_progress', "leaseOwnerId" = $2, "leaseExpiresAt" = $3, "leaseStartedAt" = CURRENT_TIMESTAMP,
+        "leaseVersion" = 1, "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $4 AND "sessionId" = $5 AND "userId" = $6 AND "status" = 'queued' RETURNING "revision", "input"`,
+    [rootTaskId, turnOwner, leaseExpiresAt, started.turnId, locationSessionId, ids.user])
+    expect(turnRow.rows).toHaveLength(1)
+    const turnRevision = turnRow.rows[0]!.revision
+    const initialRequirements = resolveRootTaskVerificationRequirements(turnRow.rows[0]!.input)
+    expect(initialRequirements).toEqual({ status: "valid", requirements: [
+      { id: "candidate-location", kind: "candidate_location_in", locations: ["seattle"] },
+    ] })
+    const identityScope = { userId: ids.user, sessionId: locationSessionId, turnId: started.turnId,
+      rootTaskId, parentTaskId: rootTaskId, turnLeaseOwner: turnOwner, turnLeaseVersion: 1,
+      parentLeaseOwner: rootOwner, parentAttemptCount: 1 }
+    const hydration = { userId: ids.user, sessionId: locationSessionId, turnId: started.turnId, rootTaskId,
+      parentTaskId: rootTaskId, turnLeaseOwner: turnOwner, turnLeaseVersion: 1,
+      parentLeaseOwner: rootOwner, parentAttemptCount: 1 }
+    const builder = new StepContextBuilder(createPgInputClaimStore(adminPool!, { userId: ids.user }), undefined, () => new Date(), hydration)
+    const lease = { ownerId: turnOwner, leaseVersion: 1, now: new Date() }
+    const firstStepId = `coalesced-initial-plan-${suffix}`
+    await seedScopedStep({ id: firstStepId, sessionId: locationSessionId, turnId: started.turnId, rootTaskId, ordinal: 0 })
+    const goal = { id: "objective", content: objective }
+    const firstContext = await builder.build({ scope: { userId: ids.user }, sessionId: locationSessionId, turnId: started.turnId,
+      taskId: rootTaskId, stepId: firstStepId, rootInputId: started.inputId, lease,
+      snapshot: { system: [], profile: [], goal, steerHistory: [], businessRefs: [], toolObservations: [], taskGraphRevision: 0 } })
+    const scoutContract = (locations: readonly string[]) => ({ schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout" as const,
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: 1 } },
+        { id: "candidate-location", check: { kind: "candidate_location_in" as const, locations } }] })
+    const initialPlan = { expectedRevision: 0, nodes: [{ key: "scout-seattle", templateId: "scout", goal: "Find Seattle roles",
+      successCriteria: ["Find Seattle job candidates"], dependsOn: [], verification: scoutContract(["seattle"]) }] }
+    await seedScopedAgenda({ sessionId: locationSessionId, turnId: started.turnId, rootTaskId, step: firstContext, planRevision: 0 })
+    await seedScopedPlanCall({ sessionId: locationSessionId, turnId: started.turnId, rootTaskId, stepId: firstStepId,
+      callId: `coalesced-initial-call-${suffix}`, userId: ids.user, ownerId: turnOwner, leaseVersion: 1, plan: initialPlan })
+    const commandPort = createPgTaskGraphCommandPort(adminPool!)
+    const initialInput: TaskGraphScheduleInput = { scope: { ...identityScope, stepId: firstStepId }, proposal: initialPlan,
+      templates: TASK_GRAPH_TEMPLATES, verificationRequirements: initialRequirements }
+    const initialReceipt = await commandPort.appendAndSchedule(initialInput)
+    expect(initialReceipt).toMatchObject({ status: "accepted", revision: 1, nodes: [{ key: "scout-seattle", status: "queued" }] })
+    const seattleTaskId = initialReceipt.nodes[0]!.taskId
+    const scoutOwner = `coalesced-scout-owner-${suffix}`
+    const startedScout = await adminPool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'running', "attemptCount" = 1,
+        "leaseOwner" = $2, "leaseExpiresAt" = $3, "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $1 AND "sessionId" = $4 AND "turnId" = $5 AND "rootTaskId" = $6 AND "parentTaskId" = $6 AND "status" = 'queued'`,
+    [seattleTaskId, scoutOwner, leaseExpiresAt, locationSessionId, started.turnId, rootTaskId])
+    expect(startedScout.rowCount).toBe(1)
+    await adminPool!.query(`UPDATE "agent_steps" SET "status" = 'completed', "completedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [firstStepId])
+
+    const locationResults: WebLocationResult[] = []
+    try {
+      for (const location of ["Dublin", "Berlin"] as const) {
+        const result = await web.acceptLocation({ schemaVersion: "agent-harness.v2.objective-location-steer.v1",
+          clientMessageId: `coalesced-${location.toLowerCase()}-${suffix}`, expectedTurnId: started.turnId,
+          expectedRevision: turnRevision, locations: [location], userId: ids.user, sessionId: locationSessionId })
+        expect(result.disposition).toBe("steered")
+        locationResults.push(result)
+      }
+    } finally { await web.prisma.$disconnect() }
+    expect(locationResults).toHaveLength(2)
+    const sequences = locationResults.map(item => BigInt(item.sequence))
+    expect(sequences[1]).toBeGreaterThan(sequences[0]!)
+
+    const reviseStepId = `coalesced-revise-${suffix}`, reviseCallId = `coalesced-revise-call-${suffix}`
+    await seedScopedStep({ id: reviseStepId, sessionId: locationSessionId, turnId: started.turnId, rootTaskId, ordinal: 1 })
+    const reviseContext = await builder.build({ scope: { userId: ids.user }, sessionId: locationSessionId, turnId: started.turnId,
+      taskId: rootTaskId, stepId: reviseStepId, rootInputId: started.inputId, lease,
+      snapshot: { system: [], profile: [], goal, steerHistory: [], businessRefs: [], toolObservations: [], taskGraphRevision: 1 } })
+    expect(reviseContext.consumedInputIds).toEqual(expect.arrayContaining(locationResults.map(item => item.inputId)))
+    expect(reviseContext.inputThroughSequence).toBe(sequences[1])
+    await seedScopedAgenda({ sessionId: locationSessionId, turnId: started.turnId, rootTaskId, step: reviseContext, planRevision: 1 })
+    const berlinPlan = { expectedRevision: 1, nodes: [{ key: "scout-berlin", templateId: "scout", goal: "Find Berlin roles",
+      successCriteria: ["Find Berlin job candidates"], dependsOn: [], verification: scoutContract(["berlin"]) }] }
+    await seedScopedPlanCall({ sessionId: locationSessionId, turnId: started.turnId, rootTaskId, stepId: reviseStepId,
+      callId: reviseCallId, userId: ids.user, ownerId: turnOwner, leaseVersion: 1, plan: berlinPlan })
+    const reviseScope = { ...identityScope, stepId: reviseStepId }
+    const revised = await commandPort.appendAndScheduleWithReconciliation!({ scope: reviseScope, proposal: berlinPlan,
+      templates: TASK_GRAPH_TEMPLATES, verificationRequirements: initialRequirements },
+    { scope: reviseScope, decision: "revise", expectedRevision: 1, callId: reviseCallId, rootInputId: started.inputId })
+    expect(revised).toMatchObject({ status: "accepted", revision: 2, nodes: [{ key: "scout-berlin", status: "queued" }] })
+
+    const client = await adminPool!.connect()
+    try {
+      await client.query("BEGIN")
+      await client.query("SELECT set_config('app.user_id', $1, true)", [ids.user])
+      const reconciliation = await readSteeringReconciliationState(client, reviseScope)
+      expect(reconciliation.latestUserRevision).toMatchObject({ resultingRevision: 2, stepId: reviseStepId,
+        inputThroughSequence: sequences[1], acceptedSteerInputs: locationResults.map((item, index) => ({ id: item.inputId, acceptedSequence: sequences[index] })) })
+      expect(reconciliation.lastReconciledInputThroughSequence).toBe(sequences[1])
+      const receiptRows = await client.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = $3 AND "payload"->>'stepId' = $4 LIMIT 2`,
+      [locationSessionId, started.turnId, STEERING_RECONCILIATION_EVENT_TYPE, reviseStepId])
+      expect(receiptRows.rows).toHaveLength(1)
+      const receipt = record((receiptRows.rows[0]?.payload))
+      expect(receipt?.steerInputIds).toEqual(locationResults.map(item => item.inputId).sort())
+      expect(receipt?.inputCheckpoint).toEqual({ throughSequence: String(sequences[1]) })
+      const graph = await loadTaskGraph(client, { userId: ids.user, sessionId: locationSessionId, turnId: started.turnId,
+        rootTaskId, parentTaskId: rootTaskId }, false, { includeSourceProvenance: true, currentStepId: reviseStepId, currentStepAttempt: 1 })
+      expect(graph.snapshot?.nodes.map(node => node.key)).toEqual(["scout-seattle", "scout-berlin"])
+      expect(graph.tasks.get(seattleTaskId)?.status).toBe("running")
+      const berlinNode = graph.snapshot?.nodes.find(node => node.key === "scout-berlin")
+      expect(berlinNode?.verification?.criteria.find(item => item.id === "candidate-location"))
+        .toEqual({ id: "candidate-location", check: { kind: "candidate_location_in", locations: ["berlin"] } })
+      const source = graph.sourceInputCheckpointByNodeKey?.get("scout-seattle")
+      expect(source?.inputThroughSequence).toBeLessThan(sequences[0]!)
+      expect(graph.currentInputCheckpoint?.inputThroughSequence).toBe(sequences[1])
+      const row = await client.query<{ status: string }>(`SELECT "status" FROM "sub_agent_tasks"
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4`,
+      [revised.nodes[0]?.taskId, locationSessionId, started.turnId, rootTaskId])
+      expect(row.rows).toEqual([{ status: "queued" }])
+      await client.query("COMMIT")
+    } catch (error: unknown) {
+      await client.query("ROLLBACK").catch(() => undefined)
+      throw error
+    } finally { client.release() }
   })
 })
