@@ -81,9 +81,23 @@ function validAuthority(input: PendingScopeInput): boolean {
         || state.latestUserRevision.resultingRevision > revision)) return false
   const pending = state.unresolvedInputs.length === 1 ? state.unresolvedInputs[0] : undefined
   return prepared.steerInputIds.length === 1 && pending?.status === "consumed"
-    && pending.consumedByStepId === scope.stepId && pending.acceptedSequence === confirmed.acceptedInputSequence
+    && consumerMatchesDecisionStep(pending, state, scope)
+    && pending.acceptedSequence === confirmed.acceptedInputSequence
     && pending.id === prepared.steerInputIds[0] && pending.id === confirmed.acceptedInputId
 }
+
+function consumerMatchesDecisionStep(
+  pending: SteeringReconciliationState["unresolvedInputs"][number], state: SteeringReconciliationState,
+  scope: TaskGraphExecutionScope,
+): boolean {
+  const consumerId = pending.consumedByStepId, consumerOrdinal = pending.consumingOrdinal
+  const decisionOrdinal = state.decisionStepOrdinal
+  if (!validId(consumerId) || !validOrdinal(consumerOrdinal) || !validOrdinal(decisionOrdinal)) return false
+  if (consumerId === scope.stepId) return consumerOrdinal === decisionOrdinal
+  return consumerOrdinal < decisionOrdinal
+}
+
+function validOrdinal(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
 
 function graphNodes(loaded: LoadedGraph, scope: TaskGraphExecutionScope): Array<{
   node: StoredTaskGraphNode; task: GraphTaskRow; checkpoint: bigint

@@ -115,9 +115,10 @@ function decide(specs: readonly Spec[], options: Readonly<{
   reconciliation?: SteeringReconciliationState
   acceptedSequence?: bigint
   added?: readonly TaskGraphObjectiveLineageNode[]
+  scope?: TaskGraphExecutionScope
 }> = {}) {
   const loaded = loadedGraph(specs)
-  return classifyPendingSupersededScouts({ loaded, scope, reconciliation: options.reconciliation ?? reconciliation,
+  return classifyPendingSupersededScouts({ loaded, scope: options.scope ?? scope, reconciliation: options.reconciliation ?? reconciliation,
     prepared: options.prepared ?? prepared(), confirmed: { ...confirmed,
       acceptedInputSequence: options.acceptedSequence ?? acceptedInputSequence }, expectedRevision: 1,
     nodes: lineage(loaded, options.added) })
@@ -136,6 +137,46 @@ describe("pending superseded Scout scope", () => {
     expect(result).toEqual({ status: "available", pendingNodeKeys: new Set(["old-berlin"]) })
     expect(JSON.stringify(loaded.snapshot)).toBe(before)
     expect([...loaded.tasks.values()].map(task => task.status)).toEqual(["running", "running"])
+  })
+
+  it("accepts the exact confirmed input consumed by an earlier owned Root Step", () => {
+    const priorConsumer = { ...reconciliation, decisionStepOrdinal: 3, unresolvedInputs: [
+      { ...reconciliation.unresolvedInputs[0]!, consumedByStepId: "step-earlier", consumingOrdinal: 2 },
+    ] }
+    expect(decide([{ key: "old-seattle", taskId: "task-seattle", locations: ["seattle"] }],
+      { reconciliation: priorConsumer })).toEqual({ status: "available", pendingNodeKeys: new Set(["old-seattle"]) })
+  })
+
+  it("rejects a different consumer at the current decision ordinal", () => {
+    const wrongConsumer = { ...reconciliation, decisionStepOrdinal: 3, unresolvedInputs: [
+      { ...reconciliation.unresolvedInputs[0]!, consumedByStepId: "step-other", consumingOrdinal: 3 },
+    ] }
+    expect(decide([{ key: "old-seattle", taskId: "task-seattle", locations: ["seattle"] }],
+      { reconciliation: wrongConsumer })).toEqual({ status: "unavailable" })
+  })
+
+  it.each([
+    ["missing consumer", null, 2], ["missing ordinal", "step-other", null],
+    ["invalid ordinal", "step-other", -1], ["future ordinal", "step-other", 4],
+  ] as const)("rejects %s persisted ordering", (_label, consumerId, ordinal) => {
+    const invalidConsumer = { ...reconciliation, decisionStepOrdinal: 3, unresolvedInputs: [
+      { ...reconciliation.unresolvedInputs[0]!, consumedByStepId: consumerId, consumingOrdinal: ordinal },
+    ] }
+    expect(decide([{ key: "old-seattle", taskId: "task-seattle", locations: ["seattle"] }],
+      { reconciliation: invalidConsumer })).toEqual({ status: "unavailable" })
+  })
+
+  it("keeps owner lease and exact accepted-input fences for an earlier consumer", () => {
+    const priorConsumer = { ...reconciliation, decisionStepOrdinal: 3, unresolvedInputs: [
+      { ...reconciliation.unresolvedInputs[0]!, consumedByStepId: "step-earlier", consumingOrdinal: 2 },
+    ] }
+    const specs = [{ key: "old-seattle", taskId: "task-seattle", locations: ["seattle"] }]
+    expect(decide(specs, { reconciliation: priorConsumer })).toMatchObject({ status: "available" })
+    expect(decide(specs, { reconciliation: priorConsumer, scope: { ...scope, turnLeaseVersion: 2 } }))
+      .toEqual({ status: "unavailable" })
+    expect(decide(specs, { reconciliation: priorConsumer, acceptedSequence: 21n })).toEqual({ status: "unavailable" })
+    expect(decide(specs, { reconciliation: priorConsumer, prepared: { ...prepared(), steerInputIds: ["other-input"] } }))
+      .toEqual({ status: "unavailable" })
   })
 
   it("uses verifier label equality and refuses policy-recognized remote or wildcard selectors", () => {

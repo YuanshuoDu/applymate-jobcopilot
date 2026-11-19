@@ -11,6 +11,7 @@ import { readSteeringReconciliationState } from "./steering-reconciliation-read.
 import type { SteeringReconciliationState } from "./steering-reconciliation-contract.js"
 import type { PreparedSteeringReconciliation } from "./steering-reconciliation-contract.js"
 import { classifyPendingSupersededScouts } from "./task-graph-pending-scout-scope.js"
+import { readTaskGraphRetiredScouts } from "../turns/task-graph-retirement-completion.js"
 
 type Client = Pick<pg.PoolClient, "query">
 export type TaskGraphAvailableLocationEvidence = Extract<TaskGraphCurrentLocationEvidenceResult, { status: "available" }>
@@ -47,6 +48,8 @@ export async function evaluateTaskGraphPlanObjectiveCoverage(input: CoverageInpu
     includeSourceProvenance: true, currentStepId: input.input.scope.stepId,
     currentStepAttempt: 1,
   })
+  const retiredScouts = await readTaskGraphRetiredScouts(input.client, input.input.scope, loaded, reconciliation)
+  const retiredNodeKeys = new Set(retiredScouts.keys())
   const pending = input.prepared
     ? classifyPendingSupersededScouts({ loaded, scope: input.input.scope, reconciliation, prepared: input.prepared,
       confirmed: steer, expectedRevision: input.input.proposal.expectedRevision, nodes: input.nodes })
@@ -56,12 +59,13 @@ export async function evaluateTaskGraphPlanObjectiveCoverage(input: CoverageInpu
     client: input.client, loaded, scope: input.input.scope, initialRequirements: requirements,
     verifiedCurrentLocations: steer.locations, acceptedInputSequence: steer.acceptedInputSequence,
     retainCompatiblePriorScouts: canRetainCompatiblePriorScouts(reconciliation, steer.acceptedInputSequence),
-    pendingSupersededNodeKeys: pendingNodeKeys,
+    pendingSupersededNodeKeys: pendingNodeKeys, retiredNodeKeys,
   })
   if (evidence.status !== "available") return unavailable("task_graph_current_location_evidence_unavailable")
-  assertNoExcludedScoutDependencies(input.nodes, input.input.proposal.nodes.map(node => node.key), evidence.excludedHistoricalNodeKeys)
+  const excludedNodeKeys = new Set([...evidence.excludedHistoricalNodeKeys, ...retiredNodeKeys])
+  assertNoExcludedScoutDependencies(input.nodes, input.input.proposal.nodes.map(node => node.key), excludedNodeKeys)
   const coverageNodes = buildTaskGraphLocationCoverageNodes(input.nodes, evidence)
-    .filter(node => !pendingNodeKeys.has(node.key))
+    .filter(node => !pendingNodeKeys.has(node.key) && !retiredNodeKeys.has(node.key))
   return evaluateTaskGraphObjectiveCoverage(evidence.effectiveRequirements,
     coverageNodes, input.input.templates, input.input.scope.rootTaskId)
 }
@@ -104,6 +108,7 @@ function assertNoExcludedScoutDependencies(
     if (seen.has(key)) return false
     const node = byKey.get(key)
     if (!node) return false
+    if (node.repairOf && excluded.has(node.repairOf.nodeKey)) return true
     const next = new Set(seen).add(key)
     return node.dependsOn.some(dependency => reachesExcluded(dependency, next))
   }
