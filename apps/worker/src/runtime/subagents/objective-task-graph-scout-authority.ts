@@ -112,7 +112,7 @@ function matchingScope(scope: GraphScope, input: SubagentTaskSpec): boolean {
 }
 
 /** Reuses Session/Turn/Root/Step locks already held by the TaskGraph schedule transaction. */
-export async function hasOwnedObjectiveScoutAuthority(
+export async function admitOwnedObjectiveScout(
   client: Queryable, input: SubagentTaskSpec, authority: GraphScope | undefined,
 ): Promise<boolean> {
   if (!authority || !matchingScope(authority, input)) return false
@@ -124,11 +124,12 @@ export async function hasOwnedObjectiveScoutAuthority(
   if (!candidate) return false
   if (!registeredScoutSpec(candidate as Record<string, unknown>)) return false
   const result = await client.query(`WITH live AS MATERIALIZED (SELECT clock_timestamp() AS "at")
-    SELECT turn."input" FROM live
+    SELECT turn."input", turn."executionMode" FROM live
     JOIN "agent_sessions" AS session ON session."id" = $1 AND session."userId" = $2
       AND session."status" NOT IN ('aborted', 'archived')
     JOIN "agent_turns" AS turn ON turn."id" = $3 AND turn."sessionId" = session."id" AND turn."userId" = session."userId"
-      AND turn."source" = 'user' AND turn."executionMode" = 'canonical_task_graph' AND turn."status" = 'in_progress'
+      AND turn."source" = 'user' AND (turn."executionMode" IS NULL OR turn."executionMode" = 'canonical_task_graph')
+      AND turn."status" = 'in_progress'
       AND turn."rootTaskId" = $4 AND turn."leaseOwnerId" = $5 AND turn."leaseVersion" = $6 AND turn."leaseExpiresAt" > live."at"
     JOIN "sub_agent_tasks" AS root ON root."id" = $4 AND root."sessionId" = session."id" AND root."turnId" = turn."id"
       AND root."rootTaskId" = root."id" AND root."parentTaskId" IS NULL AND root."role" = 'orchestrator'
@@ -140,5 +141,16 @@ export async function hasOwnedObjectiveScoutAuthority(
       AND newer."turnId" = turn."id" AND newer."taskId" = root."id" AND newer."ordinal" > step."ordinal")`,
   [authority.sessionId, authority.userId, authority.turnId, authority.rootTaskId, authority.turnLeaseOwner,
     authority.turnLeaseVersion, authority.parentLeaseOwner, authority.parentAttemptCount, authority.stepId])
-  return result.rows.length === 1 && exactObjectiveIntent((result.rows[0] as Record<string, unknown>).input)
+  if (result.rows.length !== 1) return false
+  const turn = result.rows[0] as Record<string, unknown>
+  if (!exactObjectiveIntent(turn.input)) return false
+  if (turn.executionMode === "canonical_task_graph") return true
+  if (turn.executionMode !== null) return false
+  const promoted = await client.query(`UPDATE "agent_turns" AS turn SET "executionMode" = 'canonical_task_graph'
+    WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+      AND turn."source" = 'user' AND turn."status" = 'in_progress' AND turn."rootTaskId" = $4
+      AND turn."leaseOwnerId" = $5 AND turn."leaseVersion" = $6 AND turn."executionMode" IS NULL
+      AND turn."leaseExpiresAt" > clock_timestamp() RETURNING turn."id"`,
+  [authority.turnId, authority.sessionId, authority.userId, authority.rootTaskId, authority.turnLeaseOwner, authority.turnLeaseVersion])
+  return promoted.rowCount === 1 && promoted.rows.length === 1
 }

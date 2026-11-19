@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 import type { GraphScope } from "./task-graph-pg-state.js"
-import { isRegisteredObjectiveScoutTemplate, hasOwnedObjectiveScoutAuthority } from "./objective-task-graph-scout-authority.js"
+import { isRegisteredObjectiveScoutTemplate, admitOwnedObjectiveScout } from "./objective-task-graph-scout-authority.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
 import { templatesForInteractiveScoutDelegation } from "./nested-scout-profile.js"
 
@@ -21,8 +21,11 @@ function liveRow(overrides: Record<string, unknown> = {}) {
     stepTaskId: scope.rootTaskId, stepStatus: "streaming", ...overrides }
 }
 
-function clientFor(rows: unknown[]) {
-  const query = vi.fn(async (_sql: string, _values?: unknown[]) => ({ rows, rowCount: rows.length }))
+function clientFor(rows: unknown[], casRows: unknown[] = [{ id: scope.turnId }]) {
+  const query = vi.fn(async (sql: string, _values?: unknown[]) => {
+    const selected = sql.startsWith('UPDATE "agent_turns"') ? casRows : rows
+    return { rows: selected, rowCount: selected.length }
+  })
   return { client: { query } as never, query }
 }
 
@@ -42,11 +45,11 @@ describe("objective TaskGraph Scout authority", () => {
       role: scout.role, taskType: scout.taskType, goal: "Find roles", allowedActions: scout.allowedActions, constraints: scout.constraints,
       context: {}, expectedOutputSchema: scout.expectedOutputSchema }
     const accepted = clientFor([liveRow()])
-    await expect(hasOwnedObjectiveScoutAuthority(accepted.client, input, scope)).resolves.toBe(true)
+    await expect(admitOwnedObjectiveScout(accepted.client, input, scope)).resolves.toBe(true)
     const sql = accepted.query.mock.calls[0]?.[0] ?? ""
     expect(sql).not.toContain("FOR UPDATE")
     for (const predicate of [
-      'session."userId" = $2', "turn.\"source\" = 'user'", "turn.\"executionMode\" = 'canonical_task_graph'",
+      'session."userId" = $2', "turn.\"source\" = 'user'", 'turn."executionMode" IS NULL OR turn."executionMode" = \'canonical_task_graph\'',
       'turn."leaseExpiresAt" > live."at"', 'root."leaseExpiresAt" > live."at"', 'root."leaseOwner" = $7',
       'root."attemptCount" = $8', 'step."taskId" = root."id"', 'step."status" = \'streaming\'',
       'newer."ordinal" > step."ordinal"',
@@ -59,11 +62,36 @@ describe("objective TaskGraph Scout authority", () => {
       { ...objectiveInput, intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, extra: true } },
       { ...objectiveInput, input: { goal: objectiveInput.goal, intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } },
     ]) {
-      const denied = clientFor([{ input: inputValue }])
-      await expect(hasOwnedObjectiveScoutAuthority(denied.client, input, scope)).resolves.toBe(false)
+      const denied = clientFor([liveRow({ input: inputValue })])
+      await expect(admitOwnedObjectiveScout(denied.client, input, scope)).resolves.toBe(false)
+      expect(denied.query).toHaveBeenCalledTimes(1)
     }
+    const conflictingMode = clientFor([liveRow({ executionMode: "selected_job" })])
+    await expect(admitOwnedObjectiveScout(conflictingMode.client, input, scope)).resolves.toBe(false)
+    expect(conflictingMode.query).toHaveBeenCalledTimes(1)
     const foreignOrStale = clientFor([])
-    await expect(hasOwnedObjectiveScoutAuthority(foreignOrStale.client, input, scope)).resolves.toBe(false)
+    await expect(admitOwnedObjectiveScout(foreignOrStale.client, input, scope)).resolves.toBe(false)
+  })
+
+  it("promotes only a verified NULL execution mode with an exact live owner-and-lease CAS", async () => {
+    const input = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, parentTaskId: scope.rootTaskId,
+      role: scout.role, taskType: scout.taskType, goal: "Find roles", allowedActions: scout.allowedActions,
+      constraints: scout.constraints, context: {}, expectedOutputSchema: scout.expectedOutputSchema }
+    const unpinned = clientFor([liveRow({ executionMode: null })])
+    await expect(admitOwnedObjectiveScout(unpinned.client, input, scope)).resolves.toBe(true)
+    expect(unpinned.query).toHaveBeenCalledTimes(2)
+    expect(unpinned.query.mock.calls[0]?.[0]).toContain('(turn."executionMode" IS NULL OR turn."executionMode" = \'canonical_task_graph\')')
+    const cas = unpinned.query.mock.calls[1]?.[0] ?? ""
+    for (const predicate of [
+      'turn."userId" = $3', 'turn."source" = \'user\'', 'turn."rootTaskId" = $4',
+      'turn."leaseOwnerId" = $5', 'turn."leaseVersion" = $6', 'turn."executionMode" IS NULL',
+      'turn."leaseExpiresAt" > clock_timestamp()',
+    ]) expect(cas).toContain(predicate)
+    expect(unpinned.query.mock.calls[1]?.[1]).toEqual([scope.turnId, scope.sessionId, scope.userId, scope.rootTaskId,
+      scope.turnLeaseOwner, scope.turnLeaseVersion])
+    const failedCas = clientFor([liveRow({ executionMode: null })], [])
+    await expect(admitOwnedObjectiveScout(failedCas.client, input, scope)).resolves.toBe(false)
+    expect(failedCas.query).toHaveBeenCalledTimes(2)
   })
 
   it("does not query or authorize a stale scope, non-root parent, or altered Scout spec", async () => {
@@ -71,13 +99,13 @@ describe("objective TaskGraph Scout authority", () => {
       role: scout.role, taskType: scout.taskType, goal: "Find roles", allowedActions: scout.allowedActions, constraints: scout.constraints,
       context: {}, expectedOutputSchema: scout.expectedOutputSchema }
     const mismatched = clientFor([])
-    await expect(hasOwnedObjectiveScoutAuthority(mismatched.client, input, { ...scope, stepId: "stale-step" })).resolves.toBe(false)
+    await expect(admitOwnedObjectiveScout(mismatched.client, input, { ...scope, stepId: "stale-step" })).resolves.toBe(false)
     expect(mismatched.query.mock.calls[0]?.[1]?.[8]).toBe("stale-step")
     const childParent = clientFor([liveRow()])
-    await expect(hasOwnedObjectiveScoutAuthority(childParent.client, { ...input, parentTaskId: "child-1" }, scope)).resolves.toBe(false)
+    await expect(admitOwnedObjectiveScout(childParent.client, { ...input, parentTaskId: "child-1" }, scope)).resolves.toBe(false)
     expect(childParent.query).not.toHaveBeenCalled()
     const altered = clientFor([liveRow()])
-    await expect(hasOwnedObjectiveScoutAuthority(altered.client, { ...input, allowedActions: ["jobs.search"] }, scope)).resolves.toBe(false)
+    await expect(admitOwnedObjectiveScout(altered.client, { ...input, allowedActions: ["jobs.search"] }, scope)).resolves.toBe(false)
     expect(altered.query).not.toHaveBeenCalled()
   })
 
@@ -86,13 +114,13 @@ describe("objective TaskGraph Scout authority", () => {
     const input = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, parentTaskId: scope.rootTaskId,
       role: scout.role, taskType: scout.taskType, goal: "Find roles", allowedActions: scout.allowedActions, constraints: scout.constraints,
       context, expectedOutputSchema: scout.expectedOutputSchema }
-    const accepted = clientFor([{ input: objectiveInput }])
-    await expect(hasOwnedObjectiveScoutAuthority(accepted.client, input, scope)).resolves.toBe(true)
+    const accepted = clientFor([liveRow({ input: objectiveInput })])
+    await expect(admitOwnedObjectiveScout(accepted.client, input, scope)).resolves.toBe(true)
     expect(context.taskGraphDependencyResults).toEqual({ schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [{ role: "analyst" }] })
-    const invalid = clientFor([{ input: objectiveInput }])
-    await expect(hasOwnedObjectiveScoutAuthority(invalid.client, { ...input, context: { ...context, extra: true } }, scope)).resolves.toBe(false)
-    const tooMany = clientFor([{ input: objectiveInput }])
-    await expect(hasOwnedObjectiveScoutAuthority(tooMany.client, { ...input, context: { taskGraphDependencyResults: {
+    const invalid = clientFor([liveRow({ input: objectiveInput })])
+    await expect(admitOwnedObjectiveScout(invalid.client, { ...input, context: { ...context, extra: true } }, scope)).resolves.toBe(false)
+    const tooMany = clientFor([liveRow({ input: objectiveInput })])
+    await expect(admitOwnedObjectiveScout(tooMany.client, { ...input, context: { taskGraphDependencyResults: {
       schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: Array.from({ length: 9 }, () => ({})),
     } } }, scope)).resolves.toBe(false)
     expect(tooMany.query).not.toHaveBeenCalled()

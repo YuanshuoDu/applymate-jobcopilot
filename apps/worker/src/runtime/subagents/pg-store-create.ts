@@ -7,7 +7,7 @@ import { assertNoUnresolvedSteering } from "./steering-reconciliation-ledger.js"
 import type { SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
 import { filterNestedScoutProtectedActions, hasNestedScoutPrivateContext, hasNestedScoutProtectedActions,
   isNestedScoutCreationAuthorityValid, type NestedScoutCreationAuthority } from "./nested-scout-creation-authority.js"
-import { hasOwnedObjectiveScoutAuthority } from "./objective-task-graph-scout-authority.js"
+import { admitOwnedObjectiveScout } from "./objective-task-graph-scout-authority.js"
 import type { GraphScope } from "./task-graph-pg-state.js"
 
 export async function readSubagentTask(client: Queryable, taskId: string, sessionId: string): Promise<SubagentTaskRecord> {
@@ -109,7 +109,7 @@ export async function createSubagentTask(
   const requestedActions = actionList(input.allowedActions)
   const exceedsParent = Boolean(parentRow && requestedActions.some(action => !parentActions.includes(action)))
   const objectiveScoutAuthority = exceedsParent
-    && await hasOwnedObjectiveScoutAuthority(client, input, options.objectiveTaskGraphScoutAuthority)
+    && await admitOwnedObjectiveScout(client, input, options.objectiveTaskGraphScoutAuthority)
   if (exceedsParent && !objectiveScoutAuthority) {
     throw new Error("Child allowed actions exceed parent policy")
   }

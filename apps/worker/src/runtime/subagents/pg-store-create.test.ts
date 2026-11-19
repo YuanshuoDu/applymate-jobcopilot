@@ -53,13 +53,21 @@ function authorizedCreateFixture(parent: Record<string, unknown>, childOverrides
         const [sessionId, userId, turnId, rootTaskId, turnLeaseOwner, turnLeaseVersion, parentLeaseOwner, parentAttemptCount, stepId] = params ?? []
         const rows = objectiveAuthorityRows.filter(row => row.sessionId === sessionId && row.userId === userId
           && row.sessionStatus !== "aborted" && row.sessionStatus !== "archived" && row.turnId === turnId
-          && row.turnSource === "user" && row.executionMode === "canonical_task_graph" && row.turnStatus === "in_progress"
+          && row.turnSource === "user" && (row.executionMode === null || row.executionMode === "canonical_task_graph") && row.turnStatus === "in_progress"
           && row.turnRootTaskId === rootTaskId && row.turnLeaseOwner === turnLeaseOwner && row.turnLeaseVersion === turnLeaseVersion
           && row.rootTaskId === rootTaskId && row.rootRootTaskId === rootTaskId && row.rootParentTaskId == null
           && row.rootRole === "orchestrator" && row.rootTaskType === "root" && row.rootStatus === "running"
           && row.parentLeaseOwner === parentLeaseOwner && row.parentAttemptCount === parentAttemptCount && row.interruptRequestedAt == null
           && row.stepId === stepId && row.stepTaskId === rootTaskId && row.stepStatus === "streaming")
         return { rows, rowCount: rows.length }
+      }
+      if (sql.startsWith('UPDATE "agent_turns" AS turn SET')) {
+        const [turnId, sessionId, userId, rootTaskId, turnLeaseOwner, turnLeaseVersion] = params ?? []
+        const matchingNullMode = objectiveAuthorityRows.some(row => row.turnId === turnId && row.sessionId === sessionId
+          && row.userId === userId && row.turnRootTaskId === rootTaskId && row.turnSource === "user"
+          && row.executionMode === null && row.turnStatus === "in_progress" && row.turnLeaseOwner === turnLeaseOwner
+          && row.turnLeaseVersion === turnLeaseVersion)
+        return { rows: matchingNullMode ? [{ id: turnId }] : [], rowCount: matchingNullMode ? 1 : 0 }
       }
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('SELECT "rootTaskId", "turnId"')) return { rows: [{ rootTaskId: "root-1", turnId: "turn-1" }], rowCount: 1 }
@@ -96,6 +104,13 @@ describe("pg-store task creation helpers", () => {
     await createSubagentTask(fixture.client, task, true, { objectiveTaskGraphScoutAuthority: scope })
     expect(fixture.insertValues).toHaveLength(1)
     expect(fixture.insertValues[0]?.[12]).toBe(JSON.stringify(actions))
+
+    const legacyMode = authorizedCreateFixture(parent, {}, 0, [{ ...row, executionMode: null }])
+    await createSubagentTask(legacyMode.client, task, true, { objectiveTaskGraphScoutAuthority: scope })
+    const promotionIndex = legacyMode.calls.findIndex(sql => sql.startsWith('UPDATE "agent_turns" AS turn SET'))
+    const insertIndex = legacyMode.calls.findIndex(sql => sql.startsWith('INSERT INTO "sub_agent_tasks"'))
+    expect(promotionIndex).toBeGreaterThanOrEqual(0)
+    expect(promotionIndex).toBeLessThan(insertIndex)
 
     const fake = authorizedCreateFixture(parent)
     await expect(createSubagentTask(fake.client, task, true, { objectiveTaskGraphScoutAuthority: scope }))
