@@ -4,7 +4,7 @@ import { artifactTaskFenceIsCurrent, artifactTaskLeaseIsLive } from "./agent-art
 import type { AgentArtifactTaskFence } from "./agent-artifact-repo-helpers.js"
 import { parseTaskGraphSnapshot } from "../runtime/subagents/task-graph-snapshot.js"
 
-const fence: AgentArtifactTaskFence = { taskId: "prepare-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1",
+const baseFence: AgentArtifactTaskFence = { taskId: "prepare-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1",
   rootTaskId: "root-1", parentTaskId: "root-1", leaseOwner: "prepare-worker", attemptCount: 4,
   taskFenceMode: "scheduled_prepare", turnLeaseOwnerId: "turn-worker", turnLeaseVersion: 7, rootAttemptCount: 3 }
 const graph = { schemaVersion: "agent-harness.v2.task-graph", nodes: [
@@ -16,9 +16,11 @@ const validWait = {
   result: { request: { mode: "all", targetTaskIds: ["prepare-1"], timeoutMs: 60_000 } },
   stepTaskId: "root-1", stepStatus: "waiting_for_tool", attempt: 3, ordinal: 5, latestOrdinal: 5,
 }
+const parseSnapshot = vi.fn(parseTaskGraphSnapshot)
+const fence: AgentArtifactTaskFence = { ...baseFence, taskGraphItemId: "canonical-graph-item", parseTaskGraphSnapshot: parseSnapshot }
 
 function client(options: { turnStatus?: string; turnLeaseVersion?: number; rootAttemptCount?: number;
-  waits?: readonly Record<string, unknown>[]; tasks?: readonly Record<string, unknown>[]; taskLive?: boolean } = {}) {
+  waits?: readonly Record<string, unknown>[]; tasks?: readonly Record<string, unknown>[]; taskLive?: boolean; graphContent?: unknown } = {}) {
   const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
   const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
     calls.push({ sql, values })
@@ -27,7 +29,7 @@ function client(options: { turnStatus?: string; turnLeaseVersion?: number; rootA
       return { rows: [{ id: fence.taskId, turnStatus: options.turnStatus ?? "waiting_for_dependency",
         sessionStatus: "running", rootAttemptCount: options.rootAttemptCount ?? 3 }] }
     }
-    if (sql.includes('FROM "agent_items" AS item')) return { rows: [{ content: graph }] }
+    if (sql.includes('FROM "agent_items" AS item')) return { rows: [{ content: options.graphContent ?? graph }] }
     if (sql.includes('FROM "agent_wait_conditions" AS wait')) return { rows: [...(options.waits ?? [validWait])] }
     if (sql.includes("task.\"id\" = ANY($1::text[])")) return { rows: [...(options.tasks ?? [{ id: "prepare-1", status: "running" }])] }
     if (sql.includes('SELECT task."leaseExpiresAt"')) return { rows: [{ live: options.taskLive ?? true }] }
@@ -40,7 +42,7 @@ describe("scheduled Prepare artifact dependency-wait transaction fence", () => {
   it("keeps the actively leased parent Turn path", async () => {
     const db = client({ turnStatus: "in_progress" })
 
-    const accepted = await artifactTaskFenceIsCurrent(db.client, fence, "job-1")
+    const accepted = await artifactTaskFenceIsCurrent(db.client, baseFence, "job-1")
     expect(accepted, JSON.stringify(db.calls.map(call => ({ sql: call.sql.slice(0, 90), values: call.values })))).toBe(true)
 
     expect(db.calls).toHaveLength(1)
@@ -48,7 +50,7 @@ describe("scheduled Prepare artifact dependency-wait transaction fence", () => {
   })
 
   it("locks and verifies one current suspended root wait and exact nonterminal graph targets", async () => {
-    expect(() => parseTaskGraphSnapshot(graph)).not.toThrow()
+    parseSnapshot.mockClear()
     const db = client()
 
     const accepted = await artifactTaskFenceIsCurrent(db.client, fence, "job-1")
@@ -64,6 +66,33 @@ describe("scheduled Prepare artifact dependency-wait transaction fence", () => {
     expect(db.calls[waitLock]?.sql).toContain("FOR UPDATE OF wait, step")
     expect(db.calls[0]?.values?.[11]).toBe(7)
     expect(db.calls[0]?.values?.[12]).toBe(3)
+    expect(db.calls[graphLock]?.values?.[0]).toBe("canonical-graph-item")
+    expect(parseSnapshot).toHaveBeenCalledOnce()
+    expect(parseSnapshot).toHaveBeenCalledWith(graph)
+  })
+
+  it("fails closed when the dependency-wait parser binding is absent", async () => {
+    const db = client()
+
+    await expect(artifactTaskFenceIsCurrent(db.client, baseFence, "job-1")).resolves.toBe(false)
+    expect(db.calls.some(call => call.sql.includes('FROM "agent_items" AS item'))).toBe(false)
+  })
+
+  it("fails closed when strict parsing rejects the graph or returns invalid node IDs", async () => {
+    parseSnapshot.mockClear()
+    const invalidSnapshot = client({ graphContent: { schemaVersion: "invalid", nodes: [] } })
+    await expect(artifactTaskFenceIsCurrent(invalidSnapshot.client, fence, "job-1")).resolves.toBe(false)
+    expect(parseSnapshot).toHaveBeenCalledOnce()
+
+    const rejected = client()
+    await expect(artifactTaskFenceIsCurrent(rejected.client, {
+      ...fence, parseTaskGraphSnapshot: () => { throw new Error("task_graph_snapshot_invalid") },
+    }, "job-1")).resolves.toBe(false)
+
+    const invalidNodeId = client()
+    await expect(artifactTaskFenceIsCurrent(invalidNodeId.client, {
+      ...fence, parseTaskGraphSnapshot: () => ({ nodes: [{ taskId: "" }] }),
+    }, "job-1")).resolves.toBe(false)
   })
 
   it.each([

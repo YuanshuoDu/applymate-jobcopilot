@@ -1,13 +1,16 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { HarnessModelRequest } from "@jobcopilot/agent-model"
-import type { AgentArtifactBaseInsert, AgentArtifactDraftWrite, AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
+import type { AgentArtifactBaseInsert, AgentArtifactDraftWrite, AgentArtifactRow, AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { ScheduledPrepareArtifactWriteBinding, ScheduledPrepareJobInput } from "../tools/scheduled-application-prepare.js"
 import type { AnalystResult } from "./role-results.js"
 import type { ScheduledPrepareMaterialSources } from "./scheduled-application-prepare-materials.js"
 import { persistScheduledPrepareMaterial, prepareScheduledJobMaterials, scheduledPrepareArtifactIdentity, scheduledPrepareCitedRefs } from "./scheduled-application-prepare-materials.js"
 
-const { createArtifactRepository, createTurnEngineStore, loadSelectedJobArtifactContext, withFencedArtifactWriteTransaction } = vi.hoisted(() => ({
+const { AgentArtifactRepositoryError, createArtifactRepository, createTurnEngineStore, loadSelectedJobArtifactContext, withFencedArtifactWriteTransaction } = vi.hoisted(() => ({
+  AgentArtifactRepositoryError: class extends Error {
+    constructor(readonly code: string, message: string) { super(message); this.name = "AgentArtifactRepositoryError" }
+  },
   createArtifactRepository: vi.fn(), createTurnEngineStore: vi.fn(), loadSelectedJobArtifactContext: vi.fn(),
   withFencedArtifactWriteTransaction: vi.fn(async <T>(pool: pg.Pool, _userId: string, _jobId: string,
     work: (client: pg.PoolClient) => Promise<T>) => {
@@ -15,7 +18,7 @@ const { createArtifactRepository, createTurnEngineStore, loadSelectedJobArtifact
     try { return await work(client) } finally { client.release() }
   }),
 }))
-vi.mock("../../db/agent-artifact-repo.js", () => ({ createAgentArtifactRepository: createArtifactRepository }))
+vi.mock("../../db/agent-artifact-repo.js", () => ({ AgentArtifactRepositoryError, createAgentArtifactRepository: createArtifactRepository }))
 vi.mock("../../db/agent-artifact-write-transaction.js", () => ({ withFencedArtifactWriteTransaction }))
 vi.mock("./selected-job-artifact-context.js", () => ({ loadSelectedJobArtifactContext }))
 vi.mock("../turns/turn-engine-store.js", () => ({ createPgTurnEngineStore: createTurnEngineStore }))
@@ -33,6 +36,21 @@ const binding: ScheduledPrepareArtifactWriteBinding = {
   evidenceDigest: "d".repeat(64), checkpointDigest: "e".repeat(64), analyzeGraphRevision: 5, prepareScheduleRevision: 6,
   resumeTailoringChoiceDigest: null, jobId: "job-a", score: 80, sourceDigest, evidenceRefs, kind: "resume",
   toolCallId: "prepare-call-a", requestHash: "stable-request-hash",
+}
+
+function baseArtifact(base: AgentArtifactBaseInsert): AgentArtifactRow {
+  return {
+    ...base,
+    lifecycle: "base",
+    baseId: base.id,
+    baseHash: base.hash,
+    provenanceRefs: [...base.provenanceRefs],
+    evidenceRefs: [...base.evidenceRefs],
+    previousHash: null,
+    version: 1,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  }
 }
 
 describe("scheduled Prepare material persistence", () => {
@@ -243,11 +261,20 @@ describe("scheduled Prepare material persistence", () => {
     const baseClients: unknown[] = []
     const draftWrites: AgentArtifactDraftWrite[] = []
     const draftClients: unknown[] = []
-    const client = { query: vi.fn(async (_sql: string) => ({ rows: [] })), release: vi.fn() }
+    const client = { query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
+      if (sql.includes('root."attemptCount" AS "rootAttemptCount"')) {
+        const current = values[0] === "prepare-task-a" && values[1] === "user-a" && values[2] === "session-a" && values[3] === "turn-a"
+          && values[10] === "turn-owner-current" && values[11] === 12 && values[12] === 2
+        const rows = current ? [{ id: "prepare-task-a", turnStatus: "in_progress", sessionStatus: "running", rootAttemptCount: 2 }] : []
+        return { rows, rowCount: rows.length }
+      }
+      return { rows: [], rowCount: 0 }
+    }), release: vi.fn() }
     const repository = {
-      insertBaseWithClient: vi.fn(async (writeClient: unknown, _base: unknown, taskFence: AgentArtifactTaskFence) => {
+      insertBaseWithClient: vi.fn(async (writeClient: unknown, base: AgentArtifactBaseInsert, taskFence: AgentArtifactTaskFence) => {
         baseClients.push(writeClient)
         baseFences.push(taskFence)
+        return baseArtifact(base)
       }),
       find: vi.fn(async () => null),
       saveDraft: vi.fn(async (write: AgentArtifactDraftWrite, writeClient: unknown) => {
@@ -288,9 +315,20 @@ describe("scheduled Prepare material persistence", () => {
       { sourceRef: "persona:fact-a", content: { value: "confirmed fact" } },
     ] }
     const baseWrites: AgentArtifactBaseInsert[] = []
-    const client = { query: vi.fn(async (_sql: string) => ({ rows: [] })), release: vi.fn() }
+    const client = { query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
+      if (sql.includes('root."attemptCount" AS "rootAttemptCount"')) {
+        const current = values[0] === "prepare-task-a" && values[1] === "user-a" && values[2] === "session-a" && values[3] === "turn-a"
+          && values[10] === "turn-owner-current" && values[11] === 12 && values[12] === 2
+        const rows = current ? [{ id: "prepare-task-a", turnStatus: "in_progress", sessionStatus: "running", rootAttemptCount: 2 }] : []
+        return { rows, rowCount: rows.length }
+      }
+      return { rows: [], rowCount: 0 }
+    }), release: vi.fn() }
     const repository = {
-      insertBaseWithClient: vi.fn(async (_client: unknown, base: AgentArtifactBaseInsert) => { baseWrites.push(base) }),
+      insertBaseWithClient: vi.fn(async (_client: unknown, base: AgentArtifactBaseInsert) => {
+        baseWrites.push(base)
+        return baseArtifact(base)
+      }),
       find: vi.fn(async () => null),
       saveDraft: vi.fn(async (write: AgentArtifactDraftWrite) => ({ artifactId: write.id, version: 1, contentHash: write.hash,
         sourceDigest: write.sourceDigest } as never)),

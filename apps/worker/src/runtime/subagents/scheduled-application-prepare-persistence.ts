@@ -6,6 +6,7 @@ import { AgentArtifactRepositoryError } from "../../db/agent-artifact-repo.js"
 import { withFencedArtifactWriteTransaction } from "../../db/agent-artifact-write-transaction.js"
 import { loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
+import { parseTaskGraphSnapshot, taskGraphItemId } from "./task-graph-snapshot.js"
 import type { ScheduledPrepareArtifactWriteBinding, ScheduledPrepareJobInput } from "../tools/scheduled-application-prepare.js"
 
 export type ScheduledPrepareMaterialSources = Awaited<ReturnType<typeof loadSelectedJobArtifactContext>>
@@ -40,7 +41,8 @@ export async function persistScheduledPrepareMaterial(pool: pg.Pool, input: Sche
     hash, constraintHash: identity.baseConstraintHash, provenanceRefs: [...provenanceRefs], evidenceRefs: [...provenanceRefs] }
   const taskFence: AgentArtifactTaskFence = { ...binding.taskFence, taskFenceMode: "scheduled_prepare",
     turnLeaseOwnerId: input.invocation.owner.turnLeaseOwnerId, turnLeaseVersion: input.invocation.owner.turnLeaseVersion,
-    rootAttemptCount: input.invocation.owner.rootAttemptCount }
+    rootAttemptCount: input.invocation.owner.rootAttemptCount,
+    taskGraphItemId: taskGraphItemId(binding.taskFence.rootTaskId), parseTaskGraphSnapshot }
   const repository = createAgentArtifactRepository(pool)
   const write: AgentArtifactDraftWrite = { id: identity.draftId, userId: binding.userId, sessionId: binding.sessionId, jobId: binding.jobId,
     artifactType: kind, content, hash: hashArtifactContent(content), constraintHash: identity.constraintHash, provenanceRefs: [...provenanceRefs],

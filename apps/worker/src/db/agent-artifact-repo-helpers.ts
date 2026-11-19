@@ -16,6 +16,10 @@ export type AgentArtifactTaskFence = {
   readonly turnLeaseOwnerId?: string
   readonly turnLeaseVersion?: number
   readonly rootAttemptCount?: number
+  readonly taskGraphItemId?: string
+  readonly parseTaskGraphSnapshot?: (value: unknown) => Readonly<{
+    nodes: readonly Readonly<{ taskId: string }>[]
+  }>
 }
 export type AgentArtifactScope = Readonly<{ userId: string; jobId: string; artifactType: string; lifecycle: AgentArtifactLifecycle }>
 

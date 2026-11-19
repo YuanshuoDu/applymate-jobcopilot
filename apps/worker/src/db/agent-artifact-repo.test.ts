@@ -33,20 +33,21 @@ function createArtifactTransactionPool(race?: ArtifactLeaseRace) {
         return result()
       }
       if (sql.includes("set_config") || sql.includes("pg_advisory_xact_lock")) return result()
-      if (sql.includes('FROM "sub_agent_tasks" AS task')) {
-        const current = values[10] === currentLeaseOwner && values[11] === currentLeaseVersion
-        return result(current ? [{ id: "prepare-task-a" }] : [])
-      }
-      if (sql.includes('FROM "sub_agent_tasks" AS parent')) return result([{ id: "root-task-a" }])
       if (sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()')) {
         liveChecks += 1
-        const live = values[6] === currentLeaseOwner && values[7] === currentLeaseVersion
+        const live = values[0] === "prepare-task-a" && values[1] === "session-a" && values[2] === "worker-a" && values[3] === 1
         if (live && race === "between_base_and_draft" && baseWasInserted && liveChecks === 1) {
           currentLeaseOwner = "turn-worker-b"
           currentLeaseVersion = 7
         }
         return result([{ live } as ArtifactTestRow])
       }
+      if (sql.includes('FROM "sub_agent_tasks" AS task')) {
+        const currentTurn = values[9] !== "scheduled_prepare"
+          || (values[10] === currentLeaseOwner && values[11] === currentLeaseVersion && values[12] === 3)
+        return result(currentTurn ? [{ id: "prepare-task-a", turnStatus: "in_progress", sessionStatus: "running", rootAttemptCount: 3 }] : [])
+      }
+      if (sql.includes('FROM "sub_agent_tasks" AS parent')) return result([{ id: "root-task-a" }])
       if (sql.includes('FROM "agent_artifact_version"') && sql.includes('"taskId" = $1')) {
         return result(versions.filter(row => row.taskId === values[0] && row.toolCallId === values[1]))
       }
@@ -211,7 +212,7 @@ describe("agent artifact repository", () => {
     expect(draftInsert).toBeGreaterThan(baseRead)
     expect(versionInsert).toBeGreaterThan(draftInsert)
     expect(calls[ownerLock]?.values).toEqual([taskFence.taskId, taskFence.userId, taskFence.sessionId, taskFence.turnId,
-      taskFence.rootTaskId, taskFence.parentTaskId, taskFence.leaseOwner, taskFence.attemptCount, "job-a", "selected_job", null, null])
+      taskFence.rootTaskId, taskFence.parentTaskId, taskFence.leaseOwner, taskFence.attemptCount, "job-a", "selected_job", null, null, null])
     expect(client.release).toHaveBeenCalledTimes(1)
   })
 
@@ -253,20 +254,20 @@ describe("agent artifact repository", () => {
     const client = {
       query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
         calls.push({ sql, values })
+        if (sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()')) return { rows: [{ live: true }], rowCount: 1 }
         if (sql.includes('FROM "sub_agent_tasks" AS task')) {
-          const current = values[10] === currentTurnLeaseOwner && values[11] === currentTurnLeaseVersion
-          return { rows: current ? [{ id: "prepare-task-a" }] : [], rowCount: current ? 1 : 0 }
+          const current = values[10] === currentTurnLeaseOwner && values[11] === currentTurnLeaseVersion && values[12] === 3
+          return { rows: current ? [{ id: "prepare-task-a", turnStatus: "in_progress", sessionStatus: "running", rootAttemptCount: 3 }] : [], rowCount: current ? 1 : 0 }
         }
         if (sql.includes('FROM "sub_agent_tasks" AS parent')) return { rows: [{ id: "root-task-a" }], rowCount: 1 }
         if (sql.startsWith('INSERT INTO "agent_artifact"')) return { rows: [baseRow], rowCount: 1 }
-        if (sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()')) return { rows: [{ live: true }], rowCount: 1 }
         return { rows: [], rowCount: 0 }
       }),
     }
     const taskFence = {
       taskId: "prepare-task-a", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-task-a",
       parentTaskId: "root-task-a", leaseOwner: "worker-a", attemptCount: 1, taskFenceMode: "scheduled_prepare" as const,
-      turnLeaseOwnerId: "turn-worker-a", turnLeaseVersion: 6,
+      turnLeaseOwnerId: "turn-worker-a", turnLeaseVersion: 6, rootAttemptCount: 3,
     }
 
     await client.query("BEGIN")
@@ -619,7 +620,7 @@ describe("agent artifact repository", () => {
     expect(draftInsert).toBeGreaterThan(baseRead)
     expect(versionInsert).toBeGreaterThan(draftInsert)
     expect(calls[ownerLock]?.values).toEqual([taskFence.taskId, taskFence.userId, taskFence.sessionId, taskFence.turnId,
-      taskFence.rootTaskId, taskFence.parentTaskId, taskFence.leaseOwner, taskFence.attemptCount, "job-a", "selected_job", null, null])
+      taskFence.rootTaskId, taskFence.parentTaskId, taskFence.leaseOwner, taskFence.attemptCount, "job-a", "selected_job", null, null, null])
     expect(client.release).toHaveBeenCalledTimes(1)
   })
 
@@ -638,14 +639,16 @@ describe("agent artifact repository", () => {
         calls.push({ sql, values })
         if (sql.includes("pg_current_xact_id()::text AS transaction_id")) return { rows: [{ transaction_id: "42" }], rowCount: 1 }
         if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql) || sql.includes("set_config") || sql.includes("pg_advisory_xact_lock")) return { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()')) return { rows: [{ live: true }], rowCount: 1 }
         if (sql.includes('FROM "sub_agent_tasks" AS task')) {
           const scheduledPrepareFenceMatches = values[9] !== "scheduled_prepare"
-            || (values[10] === currentTurnLeaseOwner && values[11] === currentTurnLeaseVersion)
-          return { rows: scheduledPrepareFenceMatches ? [{ id: "prepare-task-a" }] : [], rowCount: scheduledPrepareFenceMatches ? 1 : 0 }
+            || (values[10] === currentTurnLeaseOwner && values[11] === currentTurnLeaseVersion && values[12] === 3)
+          return { rows: scheduledPrepareFenceMatches
+            ? [{ id: "prepare-task-a", turnStatus: "in_progress", sessionStatus: "running", rootAttemptCount: 3 }]
+            : [], rowCount: scheduledPrepareFenceMatches ? 1 : 0 }
         }
         if (sql.includes('FROM "sub_agent_tasks" AS parent')) return { rows: [{ id: "root-task-a" }], rowCount: 1 }
         if (sql.includes('FROM "agent_artifact_version"') && sql.includes('"taskId" = $1')) return { rows: [existingVersion], rowCount: 1 }
-        if (sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()')) return { rows: [{ live: true }], rowCount: 1 }
         return { rows: [], rowCount: 0 }
       }),
       release: vi.fn(),
@@ -660,7 +663,7 @@ describe("agent artifact repository", () => {
     const staleFence = {
       taskId: "prepare-task-a", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-task-a",
       parentTaskId: "root-task-a", leaseOwner: "worker-a", attemptCount: 1, taskFenceMode: "scheduled_prepare" as const,
-      turnLeaseOwnerId: "turn-worker-a", turnLeaseVersion: 6,
+      turnLeaseOwnerId: "turn-worker-a", turnLeaseVersion: 6, rootAttemptCount: 3,
     }
 
     await expect(repository.saveDraft({ ...draft, taskFence: staleFence })).rejects.toMatchObject({ code: "task_fence_denied" })
@@ -687,7 +690,7 @@ describe("agent artifact repository", () => {
     const taskFence = {
       taskId: "prepare-task-a", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-task-a",
       parentTaskId: "root-task-a", leaseOwner: "worker-a", attemptCount: 1, taskFenceMode: "scheduled_prepare" as const,
-      turnLeaseOwnerId: "turn-worker-a", turnLeaseVersion: 6,
+      turnLeaseOwnerId: "turn-worker-a", turnLeaseVersion: 6, rootAttemptCount: 3,
     }
     const base = { id: "scheduled-base:atomic", userId: "user-a", jobId: "job-a", artifactType: "resume", content: { summary: "source" },
       hash: "base-hash", constraintHash: "base-hash", provenanceRefs: ["resume:source"], evidenceRefs: ["resume:source"] }
@@ -715,7 +718,7 @@ describe("agent artifact repository", () => {
     const taskFence = {
       taskId: "prepare-task-a", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-task-a",
       parentTaskId: "root-task-a", leaseOwner: "worker-a", attemptCount: 1, taskFenceMode: "scheduled_prepare" as const,
-      turnLeaseOwnerId: "turn-worker-a", turnLeaseVersion: 6,
+      turnLeaseOwnerId: "turn-worker-a", turnLeaseVersion: 6, rootAttemptCount: 3,
     }
     const base = { id: "scheduled-base:atomic", userId: "user-a", jobId: "job-a", artifactType: "resume", content: { summary: "source" },
       hash: "base-hash", constraintHash: "base-hash", provenanceRefs: ["resume:source"], evidenceRefs: ["resume:source"] }
@@ -742,7 +745,7 @@ describe("agent artifact repository", () => {
     const taskFence = {
       taskId: "prepare-task-a", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-task-a",
       parentTaskId: "root-task-a", leaseOwner: "worker-a", attemptCount: 1, taskFenceMode: "scheduled_prepare" as const,
-      turnLeaseOwnerId: "turn-worker-a", turnLeaseVersion: 6,
+      turnLeaseOwnerId: "turn-worker-a", turnLeaseVersion: 6, rootAttemptCount: 3,
     }
     const base = { id: "scheduled-base:atomic", userId: "user-a", jobId: "job-a", artifactType: "resume", content: { summary: "source" },
       hash: "base-hash", constraintHash: "base-hash", provenanceRefs: ["resume:source"], evidenceRefs: ["resume:source"] }

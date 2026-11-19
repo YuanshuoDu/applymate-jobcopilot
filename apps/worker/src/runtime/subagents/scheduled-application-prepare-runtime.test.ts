@@ -117,7 +117,8 @@ function installArtifactStore() {
 }
 
 function baseArtifactRow(input: AgentArtifactBaseInsert): AgentArtifactRow {
-  return { ...input, lifecycle: "base", baseId: input.id, baseHash: input.hash, previousHash: null,
+  return { ...input, provenanceRefs: [...input.provenanceRefs], evidenceRefs: [...input.evidenceRefs],
+    lifecycle: "base", baseId: input.id, baseHash: input.hash, previousHash: null,
     version: 1, createdAt: now, updatedAt: now }
 }
 

@@ -1,6 +1,5 @@
 import type { Pool } from "pg"
 import { RUNNABLE_SESSION } from "../runtime/session-gate.js"
-import { parseTaskGraphSnapshot, taskGraphItemId } from "../runtime/subagents/task-graph-snapshot.js"
 import type { AgentArtifactTaskFence } from "./agent-artifact-repo-helpers.js"
 
 type QueryClient = Pick<Pool, "query">
@@ -78,7 +77,8 @@ export async function artifactTaskLeaseIsLive(client: QueryClient, fence: AgentA
 }
 
 async function scheduledPrepareDependencyWaitIsCurrent(client: QueryClient, fence: AgentArtifactTaskFence): Promise<boolean> {
-  if (!positive(fence.rootAttemptCount)) return false
+  if (!positive(fence.rootAttemptCount) || !validText(fence.taskGraphItemId)
+    || typeof fence.parseTaskGraphSnapshot !== "function") return false
   const graphRows = await client.query<Row>(
     `SELECT item."content" FROM "agent_items" AS item
       JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
@@ -87,11 +87,12 @@ async function scheduledPrepareDependencyWaitIsCurrent(client: QueryClient, fenc
         AND item."type" = 'task_graph' AND session."userId" = $5 AND session."status" = 'running'
         AND turn."userId" = $5 AND turn."status" = 'waiting_for_dependency' AND turn."leaseVersion" = $6
       FOR UPDATE OF item`,
-    [taskGraphItemId(fence.rootTaskId), fence.sessionId, fence.turnId, fence.rootTaskId, fence.userId, fence.turnLeaseVersion],
+    [fence.taskGraphItemId, fence.sessionId, fence.turnId, fence.rootTaskId, fence.userId, fence.turnLeaseVersion],
   )
   if (graphRows.rows.length !== 1) return false
-  let snapshot
-  try { snapshot = parseTaskGraphSnapshot(graphRows.rows[0]?.content) } catch { return false }
+  let nodeIds
+  try { nodeIds = parseIds(fence.parseTaskGraphSnapshot(graphRows.rows[0]?.content).nodes.map(node => node.taskId)) } catch { return false }
+  if (!nodeIds) return false
   const waits = await client.query<Row>(
     `SELECT wait."targetTaskIds", wait."mode", wait."status", wait."suspendedAt", wait."consumedAt", wait."result",
         step."taskId" AS "stepTaskId", step."status" AS "stepStatus", step."attempt", step."ordinal",
@@ -105,7 +106,6 @@ async function scheduledPrepareDependencyWaitIsCurrent(client: QueryClient, fenc
     [fence.userId, fence.sessionId, fence.turnId, fence.rootTaskId],
   )
   if (waits.rows.length !== 1 || !validWait(waits.rows[0], fence)) return false
-  const nodeIds = snapshot.nodes.map(node => node.taskId)
   const tasks = await client.query<Row>(
     `SELECT task."id", task."status" FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
       WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
@@ -117,7 +117,7 @@ async function scheduledPrepareDependencyWaitIsCurrent(client: QueryClient, fenc
   if (statusById.size !== nodeIds.length) return false
   const targets = parseIds(waits.rows[0]?.targetTaskIds)
   if (!targets || !targets.includes(fence.taskId)) return false
-  const pending = snapshot.nodes.filter(node => !TERMINAL_GRAPH_TASKS.has(String(statusById.get(node.taskId)))).map(node => node.taskId)
+  const pending = nodeIds.filter(taskId => !TERMINAL_GRAPH_TASKS.has(String(statusById.get(taskId))))
   return sameIds(targets, pending)
 }
 
