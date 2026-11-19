@@ -495,6 +495,7 @@ describe("durable steering reconciliation reader", () => {
     expect(state.decisionInputThroughSequence).toBe(20n)
     expect(state.agendaPlanRevision).toBe(1)
     expect(state).not.toHaveProperty("latestUserRevision")
+    expect(state).not.toHaveProperty("lastReconciledInputThroughSequence")
     expect(f.calls.some(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 
@@ -551,6 +552,8 @@ describe("durable steering reconciliation reader", () => {
     const laterScope = { ...scope, stepId: "later-step" }
     const state = await readSteeringReconciliationState(f.client, laterScope)
     expect(state.unresolvedInputs).toEqual([{ id: "steer-2", acceptedSequence: 15n, status: "consumed", consumedByStepId: "origin-step", consumingOrdinal: 0 }])
+    expect(state).not.toHaveProperty("latestUserRevision")
+    expect(state.lastReconciledInputThroughSequence).toBe(10n)
     await expect(assertNoUnresolvedSteering(f.client, laterScope)).rejects.toThrow("steering_reconciliation_pending")
   })
 
@@ -659,8 +662,22 @@ describe("durable steering reconciliation reader", () => {
       ordinal: index * 2, attempt: 1, status: "completed", inputThroughSequence: steer.acceptedSequence, consumedInputIds: [steer.id] }))
     const f = cursorFixture({ entries, currentStepId: "current-step", currentOrdinal: 7, currentCursor: "30", currentRevision: 6, inputs: steers, consumers })
     const state = await readSteeringReconciliationState(f.client, { ...scope, stepId: "current-step" })
-    expect(state.latestUserRevision).toEqual({ resultingRevision: 5, stepId: "user-revise-two", inputThroughSequence: 20n })
+    expect(state.latestUserRevision).toEqual({ resultingRevision: 5, stepId: "user-revise-two", inputThroughSequence: 20n,
+      soleSteerSequence: 20n, previousUserRevisionInputThroughSequence: 10n })
+    expect(state.lastReconciledInputThroughSequence).toBe(30n)
     expect(state.unresolvedInputs).toEqual([])
+  })
+
+  it("omits the sole-steer cursor when a validated revise covers multiple owned steers", async () => {
+    const steers = [input("steer-a", "steer", "consumed", "10", "consumer-a"), input("steer-b", "steer", "consumed", "11", "consumer-b")]
+    const entries = [historyEntry(legacyReceipt("v2", "multi-revise", "11", steers.map(row => row.id), "multi"), 1)]
+    historyOverride.entries = entries
+    const consumers = steers.map((steer, index) => ({ id: steer.consumedByStepId, taskId: scope.rootTaskId, ordinal: index,
+      attempt: 1, status: "completed", inputThroughSequence: steer.acceptedSequence, consumedInputIds: [steer.id] }))
+    const f = cursorFixture({ entries, currentStepId: "later-step", currentOrdinal: 2, currentCursor: "11", inputs: steers, consumers })
+    const state = await readSteeringReconciliationState(f.client, { ...scope, stepId: "later-step" })
+    expect(state.latestUserRevision).toEqual({ resultingRevision: 3, stepId: "multi-revise", inputThroughSequence: 11n })
+    expect(state.lastReconciledInputThroughSequence).toBe(11n)
   })
 
   it("allows a consumed steer receipt followed by an empty branch receipt at the same stored Step cursor", async () => {

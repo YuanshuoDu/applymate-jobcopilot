@@ -211,9 +211,9 @@ export async function readSteeringReconciliationState(client: Client, scope: Ste
     if (expected.some(input => !input.consumer || input.consumer.ordinal > stored.stepOrdinal
       || input.consumer.ordinal === stored.stepOrdinal && input.consumer.attempt > stored.stepAttempt)
       || expected.map(input => input.id).sort().join("\0") !== stored.receipt.steerInputIds.join("\0")) throw new Error("steering_reconciliation_receipt_incomplete")
-    if (stored.receipt.decision === "revise" && expected.length > 0) latestUserRevision = {
-      resultingRevision: stored.receipt.resultingRevision, stepId: stored.receipt.stepId, inputThroughSequence: through,
-    }
+    if (stored.receipt.decision === "revise" && expected.length > 0) latestUserRevision = { resultingRevision: stored.receipt.resultingRevision,
+      stepId: stored.receipt.stepId, inputThroughSequence: through, ...(expected.length === 1 ? { soleSteerSequence: expected[0]!.acceptedSequence } : {}),
+      ...(latestUserRevision ? { previousUserRevisionInputThroughSequence: latestUserRevision.inputThroughSequence } : {}) }
     expected.forEach(input => unresolved.delete(input.id))
   }
   while (!next.done) {
@@ -228,6 +228,7 @@ export async function readSteeringReconciliationState(client: Client, scope: Ste
     decisionStepOrdinal: decision?.ordinal ?? null, decisionStepAttempt: decision?.attempt ?? null,
     decisionInputThroughSequence: decision?.cursor ?? null, agendaPlanRevision,
     ...(latestUserRevision ? { latestUserRevision } : {}),
+    ...(previousCheckpoint !== null ? { lastReconciledInputThroughSequence: previousCheckpoint } : {}),
     unresolvedInputs: current.map(({ id, acceptedSequence, status, consumedByStepId, consumingOrdinal }) => ({ id, acceptedSequence, status, consumedByStepId, consumingOrdinal })) }
 }
 
