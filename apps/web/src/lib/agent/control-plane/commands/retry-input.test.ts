@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from '@jobcopilot/agent-protocol'
 
 import { isRetryableTurnStatus, parsePersistedRetryContent } from './retry-input'
+import { RETRY_LINEAGE_SCHEMA_VERSION } from './retry-lineage'
 import { OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION } from './types'
 
 afterEach(() => vi.unstubAllEnvs())
@@ -141,6 +142,15 @@ describe('persisted retry input', () => {
     expect(() => parsePersistedRetryContent('turn-1', {
       goal: 'Retry', content: [{ type: 'image', url: 'https://example.test/image' }],
     })).toThrow()
+  })
+
+  it('validates but does not copy a prior private retry receipt into the next retry', () => {
+    const base = { goal: 'Retry the same objective', content: [{ type: 'text', text: 'Retry the same objective' }] }
+    const receipt = { schemaVersion: RETRY_LINEAGE_SCHEMA_VERSION, predecessorTurnId: 'turn-before', acceptedInputId: 'input-before', acceptedSequence: '18' }
+    expect(parsePersistedRetryContent('turn-retry', { ...base, retryLineage: receipt })).toEqual(base)
+    for (const retryLineage of [
+      { ...receipt, acceptedSequence: '0' }, { ...receipt, extra: true }, { ...receipt, acceptedInputId: '' },
+    ]) expect(() => parsePersistedRetryContent('turn-retry', { ...base, retryLineage })).toThrow()
   })
 
   it('rejects unknown fields and invalid values in persisted retry intent', () => {
