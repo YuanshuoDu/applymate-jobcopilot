@@ -14620,6 +14620,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const postReviseWaitCallId = `p3-1240-post-revise-wait:${value.turnId}`
     const postReviseListCallId = `p3-1240-post-revise-list:${value.turnId}`
     const berlinPlanCallId = `p3-1246-berlin-plan:${value.turnId}`
+    const berlinRefreshCallId = `p3-1246-berlin-refresh:${value.turnId}`
     const dublinRetireCallId = `p3-1246-retire-dublin:${value.turnId}`
     const finalWaitCallId = `p3-1246-final-wait:${value.turnId}`
     const finalListCallId = `p3-1246-final-list:${value.turnId}`
@@ -14631,6 +14632,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let postReviseWaitIssued = false, postReviseListIssued = false, receiptObserved = false, confirmationVisible = false
     let dublinVisible = false, retirementResultObserved = false, retirementLeaseAtRequestVerified = false
     let dublinTaskId = "", berlinTaskId = "", berlinPlanAttempted = false, dublinRetirementAttempted = false
+    let berlinRefreshIssued = false, berlinStartedObserved = false, berlinGraphRefreshVerified = false
     let finalWaitIssued = false, finalListIssued = false, secondReceiptObserved = false
     let secondConfirmationVisible = false, berlinVisible = false, dublinLeaseAtRequestVerified = false
     let acceptedSteerSequence: string | null = null
@@ -14660,6 +14662,39 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const deadline = Date.now() + 25_000
       while (Date.now() < deadline && !dublinHeld) await new Promise(resolve => setTimeout(resolve, 25))
       if (!dublinHeld) throw new Error("Dublin Scout did not reach its held post-wait execution")
+    }
+    const waitForBerlinStarted = async (taskId: string) => {
+      const nodeKey = "scout-berlin-final", deadline = Date.now() + 25_000
+      while (Date.now() < deadline) {
+        const target = await pool!.query<{ id: string; status: string; role: string; attemptCount: number;
+          leaseOwner: string | null; leaseExpiresAt: Date | null; leaseSegmentStartedAt: Date | null }>(
+          `SELECT task."id", task."status", task."role", task."attemptCount", task."leaseOwner",
+             task."leaseExpiresAt", task."leaseSegmentStartedAt"
+           FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+           JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+           WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
+             AND task."parentTaskId" = $4 AND turn."rootTaskId" = $4 AND session."userId" = $5 AND turn."userId" = $5`,
+          [taskId, value.sessionId, value.turnId, rootTaskId, value.userId])
+        const row = target.rows[0]
+        if (row?.id === taskId && row.status === "running" && row.role === "scout"
+          && Number.isSafeInteger(row.attemptCount) && row.attemptCount > 0 && row.leaseOwner
+          && row.leaseExpiresAt && row.leaseExpiresAt.getTime() > Date.now() && row.leaseSegmentStartedAt) {
+          const started = await pool!.query<{ count: number }>(
+            `SELECT COUNT(*)::int AS "count" FROM "agent_events" AS event
+             JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+             JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+             WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3 AND event."taskId" = $4
+               AND event."type" IN ('task_graph.lifecycle', 'item.delta')
+               AND event."payload"->>'kind' = 'lifecycle' AND event."payload"->'event'->>'type' = 'task.started'
+               AND event."payload"->'event'->>'nodeKey' = $5 AND event."idempotencyKey" = $6
+               AND turn."rootTaskId" = $8 AND turn."userId" = $7 AND session."userId" = $7`,
+            [value.sessionId, value.turnId, taskGraphItemId(rootTaskId), taskId, nodeKey,
+              taskGraphLifecycleKey(rootTaskId, nodeKey, row.attemptCount, "task.started"), value.userId, rootTaskId])
+          if (started.rows[0]?.count === 1) return
+        }
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      throw new Error("Berlin Scout did not commit its exact running start lifecycle")
     }
     const settleSeattle = async () => {
       const deadline = Date.now() + 30_000
@@ -14975,8 +15010,33 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               throw new Error("Second retirement did not follow the accepted Berlin replacement plan")
             }
             berlinTaskId = berlin.taskId
+            if (!berlinRefreshIssued) {
+              await waitForBerlinStarted(berlinTaskId)
+              berlinStartedObserved = true
+              berlinRefreshIssued = true
+              yield { type: "tool_call_completed", callId: berlinRefreshCallId, name: "agent.list", arguments: {} }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            const refresh = record(latestToolResult(request, berlinRefreshCallId))
+            const refreshedTasks = Array.isArray(refresh?.tasks) ? refresh.tasks.map(record) : []
+            const persistedGraph = await pool!.query<{ revision: number }>(
+              `SELECT item."revision" FROM "agent_items" AS item JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+               JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+               WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
+                 AND item."type" = 'task_graph' AND turn."rootTaskId" = $4 AND turn."userId" = $5
+                 AND session."userId" = $5 LIMIT 2`,
+              [taskGraphItemId(rootTaskId), value.sessionId, value.turnId, rootTaskId, value.userId])
+            if (!berlinStartedObserved
+              || refreshedTasks.filter(task => task?.taskId === berlinTaskId && task.status === "running").length !== 1
+              || refreshedTasks.filter(task => task?.taskId === dublinTaskId && task.status === "running").length !== 1
+              || typeof revision !== "number" || persistedGraph.rows.length !== 1
+              || revision !== persistedGraph.rows[0]?.revision || revision <= planResult.revision) {
+              throw new Error("Fresh agent.list did not observe the started Berlin Scout and current live Dublin graph")
+            }
+            berlinGraphRefreshVerified = true
             rootToolsAtBerlinRetirement = request.tools.map(tool => record(tool)?.name).filter((name): name is string => typeof name === "string")
-            if (!rootToolsAtBerlinRetirement.includes("agent.retire_superseded_scout")) {
+            if (!rootToolsAtBerlinRetirement.includes("agent.list") || !rootToolsAtBerlinRetirement.includes("agent.retire_superseded_scout")) {
               throw new Error("Typed Objective Root omitted the scoped second retirement tool")
             }
             const [target, descendants] = await Promise.all([
@@ -15114,7 +15174,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     const readSafeBoundary = async (rootId: string) => {
       const callIds = [planCallId, initialWaitCallId, reviseCallId, retireCallId, postReviseWaitCallId, postReviseListCallId,
-        berlinPlanCallId, dublinRetireCallId, finalWaitCallId, finalListCallId]
+        berlinPlanCallId, berlinRefreshCallId, dublinRetireCallId, finalWaitCallId, finalListCallId]
       const [items, events, graph, policies] = await Promise.all([
         pool!.query<{ type: string; status: string; stepId: string | null; content: unknown }>(
           `SELECT item."type", item."status", item."stepId", item."content" FROM "agent_items" AS item
@@ -15203,6 +15263,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         firstRetirementWait: summarize(postReviseWaitCallId, "agent.wait"),
         firstRefresh: summarize(postReviseListCallId, "agent.list"),
         secondReplacementPlan: summarize(berlinPlanCallId, "agent.plan"),
+        berlinRefresh: summarize(berlinRefreshCallId, "agent.list"),
         secondRetirement: summarize(dublinRetireCallId, "agent.retire_superseded_scout"),
         finalWait: summarize(finalWaitCallId, "agent.wait"),
         finalRefresh: summarize(finalListCallId, "agent.list"),
@@ -15388,7 +15449,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForFinalReplanReady(rootTaskId)
       await reconcileDurableWaits(pool!, { ownerId: `p3-1246-retirement-wake-berlin-${value.suffix}` })
       await waitForTurnStatus(pool!, value.turnId, "completed", 60_000, finalWaitCallId,
-        [reviseCallId, retireCallId, postReviseListCallId, berlinPlanCallId, dublinRetireCallId, finalListCallId])
+        [reviseCallId, retireCallId, postReviseListCallId, berlinPlanCallId, berlinRefreshCallId, dublinRetireCallId, finalListCallId])
 
       const checkpoint = await pool!.connect()
       try {
@@ -15748,6 +15809,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
            WHERE input."id" = $1 AND input."sessionId" = $2 AND input."targetTurnId" = $3
              AND input."userId" = $4 AND turn."userId" = $4 AND turn."rootTaskId" = $5`,
           [acceptedSecond.inputId, value.sessionId, value.turnId, value.userId, rootTaskId])
+        const finalRetirementBoundary = await readSafeBoundary(rootTaskId)
         expect({ firstSteer: { observed: receiptObserved, confirmationVisible, dublinVisible, accepted: accepted.disposition,
             input: acceptedInput.rows[0] },
           secondSteer: { observed: secondReceiptObserved, confirmationVisible: secondConfirmationVisible, berlinVisible,
@@ -15771,7 +15833,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               idempotencyKey: interruptedLifecycle.idempotencyKey, hasOutbox: interruptedLifecycle.hasOutbox,
               payloadKind: interruptedPayload?.kind ?? null, eventType: interruptedTaskGraphEvent?.type ?? null },
             lease: currentSeattleLease, attemptPreserved: seattleAttemptPreserved },
-          secondRetirement: { leaseAtRequestVerified: dublinLeaseAtRequestVerified, expectedRevision: dublinRetirementExpectedRevision,
+          secondRetirement: { leaseAtRequestVerified: dublinLeaseAtRequestVerified,
+            berlinStartedObserved, berlinGraphRefreshVerified, expectedRevision: dublinRetirementExpectedRevision,
             result: { output: safeDublinRetireOutput, errorCode: dublinRetireResult.rows[0]?.errorCode },
             eventCount: dublinRetirementEvent.rows.length, beforeWorkerAck: dublinRetirementBeforeWorkerAck,
             eventIdentity: dublinRetirementEvent.rows[0] && { type: dublinRetirementEvent.rows[0].type,
@@ -15786,6 +15849,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               idempotencyKey: dublinInterruptedLifecycle.idempotencyKey, hasOutbox: dublinInterruptedLifecycle.hasOutbox,
               payloadKind: dublinInterruptedPayload?.kind ?? null, eventType: dublinInterruptedTaskGraphEvent?.type ?? null },
             lease: currentDublinLease, attemptPreserved: dublinAttemptPreserved },
+          berlinRefresh: finalRetirementBoundary.berlinRefresh,
           graphRevision: loaded.item?.revision, graphKeys: loaded.snapshot?.nodes.map(node => node.key),
           dublinDependencies: replacementNode.dependsOn, dublinTask: replacementTask.rows[0],
           berlinDependencies: finalNode.dependsOn, berlinTask: finalTask.rows[0], berlinCandidates: finalCandidates,
@@ -15814,7 +15878,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             lease: { id: seattleTaskId, status: "interrupted", role: "scout", leaseOwner: null,
               attemptCount: originalSeattleLease?.attemptCount, leaseExpiresAt: null, interruptRequestedAt: expect.any(Date),
               rootTaskId, parentTaskId: rootTaskId }, attemptPreserved: true },
-          secondRetirement: { leaseAtRequestVerified: true, expectedRevision: expect.any(Number),
+          berlinRefresh: { callCount: 1, callStatus: "completed", callNameMatches: true, resultCount: 1 },
+          secondRetirement: { leaseAtRequestVerified: true, berlinStartedObserved: true, berlinGraphRefreshVerified: true,
+            expectedRevision: expect.any(Number),
             result: { output: { status: "interrupt_requested", taskId: dublinTaskId, attempt: originalDublinLease?.attemptCount }, errorCode: null },
             eventCount: 1, beforeWorkerAck: true, eventIdentity: { type: TASK_GRAPH_SUPERSEDED_SCOUT_RETIREMENT_EVENT_TYPE,
               actor: "system", correlationId: value.turnId, itemId: taskGraphItemId(rootTaskId), taskId: dublinTaskId,
