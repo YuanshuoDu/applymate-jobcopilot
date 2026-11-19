@@ -21,8 +21,14 @@ describe("discovery persona projection", () => {
     expect(result.kind).toBe("accepted")
     if (result.kind !== "accepted") return
     expect(result.payload.projection.facts.map(fact => fact.factId)).toEqual(["b", "a", "z"])
-    expect(result.payload.canonicalUtf8Bytes).toBe(Buffer.byteLength(canonicalDiscoveryPersonaProjection(result.payload.projection), "utf8"))
-    expect(result.payload.digest).toMatch(/^[a-f0-9]{64}$/)
+    const expectedCanonical = '{"schemaVersion":"applymate.discovery-persona-projection.v1","purpose":"discovery","facts":[' +
+      '{"factId":"b","key":"city","label":"Label city","category":"experience","source":"manual","value":"Dublin","normalizedValue":"dublin","updatedAt":"2026-10-24T12:00:00.000Z"},' +
+      '{"factId":"a","key":"skill","label":"Label skill","category":"experience","source":"manual","value":"Go","normalizedValue":"go","updatedAt":"2026-10-24T12:00:00.000Z"},' +
+      '{"factId":"z","key":"skill","label":"Label skill","category":"experience","source":"manual","value":"Rust","normalizedValue":"rust","updatedAt":"2026-10-24T12:00:00.000Z"}]}'
+    expect(canonicalDiscoveryPersonaProjection(result.payload.projection)).toBe(expectedCanonical)
+    expect(result.payload.canonicalUtf8Bytes).toBe(607)
+    expect(result.payload.canonicalUtf8Bytes).toBe(Buffer.byteLength(expectedCanonical, "utf8"))
+    expect(result.payload.digest).toBe("9674b94bf04564e334b3d82dd53f68244afaefff7ccbe2276a4876bc7f52225a")
   })
 
   it("accepts exactly 32 facts and refuses a 33rd without retaining a partial projection", () => {
@@ -39,14 +45,23 @@ describe("discovery persona projection", () => {
   })
 
   it("measures UTF-8 projection bytes and accepts the exact cap but overflows above it", () => {
-    const baseline = projectDiscoveryPersonaFacts([row("fact", "skill", "x")])
+    const value = 'x 😀\n"quoted" \\ value'
+    const baseline = projectDiscoveryPersonaFacts([row("fact", "skill", value)])
     expect(baseline.kind).toBe("accepted")
     if (baseline.kind !== "accepted") return
     const baselineBytes = baseline.payload.canonicalUtf8Bytes
-    const exactRow = { ...row("fact", "skill", "x"), evidence: { label: "Label skill" + "p".repeat(DISCOVERY_PERSONA_BYTE_LIMIT - baselineBytes) } }
+    const exactLabel = "Label skill" + "p".repeat(DISCOVERY_PERSONA_BYTE_LIMIT - baselineBytes)
+    const exactRow = { ...row("fact", "skill", value), evidence: { label: exactLabel } }
     const exact = projectDiscoveryPersonaFacts([exactRow])
     expect(exact.kind).toBe("accepted")
     if (exact.kind === "accepted") expect(exact.payload.canonicalUtf8Bytes).toBe(DISCOVERY_PERSONA_BYTE_LIMIT)
+
+    const over = projectDiscoveryPersonaFacts([{ ...exactRow, evidence: { label: `${exactLabel}p` } }])
+    expect(over.kind).toBe("overflow")
+    if (over.kind === "overflow") {
+      expect(over.payload.reason).toBe("byte_limit")
+      expect(over.payload.canonicalUtf8Bytes).toBe(DISCOVERY_PERSONA_BYTE_LIMIT + 1)
+    }
 
     const unicode = projectDiscoveryPersonaFacts([row("fact", "skill", "😀".repeat(DISCOVERY_PERSONA_BYTE_LIMIT))])
     expect(unicode.kind).toBe("overflow")

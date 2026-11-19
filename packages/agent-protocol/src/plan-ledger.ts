@@ -1,10 +1,12 @@
 import { validTaskGraphResultEnvelopeKeys } from './plan-ledger-task-graph-metadata.js'
 import { parsePlanLedgerTaskGraphSnapshotNodes, PLAN_LEDGER_MAX_PERSISTED_NODES, PLAN_LEDGER_MAX_SNAPSHOT_BYTES } from './plan-ledger-package-refs.js'
 
+export { PLAN_LEDGER_MAX_PERSISTED_NODES }
+
 export const PLAN_LEDGER_SCHEMA_VERSION = 'agent-harness.v2.plan-ledger'
 export const TASK_GRAPH_SCHEMA_VERSION = 'agent-harness.v2.task-graph', TASK_GRAPH_MAX_IDENTIFIER_LENGTH = 128
 const RESULT_VERSION = 'agent-harness.v2.subagent.result'
-const MAX_TASK_ROWS = 12, MAX_ID = TASK_GRAPH_MAX_IDENTIFIER_LENGTH, MAX_PRIVATE_RESULT_ID = 256, MAX_LEDGER_BYTES = 16_000
+const MAX_TASK_ROWS = PLAN_LEDGER_MAX_PERSISTED_NODES + 1, MAX_ID = TASK_GRAPH_MAX_IDENTIFIER_LENGTH, MAX_PRIVATE_RESULT_ID = 256, MAX_LEDGER_BYTES = 16_000
 const MAX_DEPENDENCIES = 8
 const STATUSES = ['queued', 'running', 'retrying', 'waiting', 'waiting_for_user', 'completed', 'failed', 'interrupted', 'cancelled', 'closed'] as const
 const TERMINAL = new Set(['completed', 'failed', 'interrupted', 'cancelled', 'closed'])

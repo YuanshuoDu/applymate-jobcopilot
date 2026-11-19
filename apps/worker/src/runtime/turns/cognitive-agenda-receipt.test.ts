@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { normalizeAgentLocationAllowlist } from "@jobcopilot/shared"
 
 import { buildCognitiveActionAgenda, type CognitiveActionAgenda } from "./cognitive-action-agenda.js"
 import {
@@ -17,6 +18,11 @@ import { TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION } from "../context/task-gr
 import { taskGraphObjectiveProgressDelta, type ObjectiveProgressSnapshot } from "../context/task-graph-objective-progress-delta.js"
 
 const scope: CognitiveAgendaReceiptScope = { sessionId: "session-1", turnId: "turn-1", taskId: "task-1", stepId: "turn:turn-1:step:0" }
+function canonicalLocations(values: readonly string[]): readonly string[] {
+  const normalized = normalizeAgentLocationAllowlist(values)
+  if (!normalized) throw new Error("fixture location list should be valid")
+  return normalized
+}
 
 function context(taskGraphRevision?: number): StepContext {
   return {
@@ -136,6 +142,53 @@ describe("cognitive agenda receipt", () => {
     expect(parseCognitiveAgendaReceipt({ ...v2, progressDelta: { ...progressDelta, currentPlanRevision: 8 } }, scope)).toBeNull()
     expect(parseCognitiveAgendaReceipt({ ...v2, objectiveProgressSnapshot: { ...objectiveProgressSnapshot, advisory: false } }, scope)).toBeNull()
     expect(parseCognitiveAgendaReceipt({ ...v2, privateText: "do not expose" }, scope)).toBeNull()
+    if (!v2 || v2.schemaVersion !== COGNITIVE_AGENDA_RECEIPT_V2_SCHEMA_VERSION) throw new Error("fixture should be a v2 receipt")
+    const firstRequirement = v2.progressDelta.requirements[0]
+    if (!firstRequirement) throw new Error("fixture delta should contain a requirement")
+    expect(parseCognitiveAgendaReceipt({ ...v2, progressDelta: {
+      ...v2.progressDelta, requirements: [firstRequirement, firstRequirement],
+    } }, scope)).toBeNull()
+  })
+
+  it("round-trips canonical location rows in v2 without changing v1 or count-only compatibility", () => {
+    const objectiveProgressSnapshot: ObjectiveProgressSnapshot = { schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION,
+      advisory: true, revision: 7, requirements: [{ id: "candidate-location", kind: "candidate_location_in",
+        locations: canonicalLocations([" Dublin ", "BERLIN", "dublin"]), status: "active" }] }
+    const progressDelta = taskGraphObjectiveProgressDelta(null, objectiveProgressSnapshot, false)
+    const v2 = buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context(7)),
+      objectiveProgress: { goalRevision: "c".repeat(64), objectiveProgressSnapshot, progressDelta } })
+
+    expect(v2).toMatchObject({ schemaVersion: COGNITIVE_AGENDA_RECEIPT_V2_SCHEMA_VERSION,
+      objectiveProgressSnapshot, progressDelta })
+    expect(parseCognitiveAgendaReceipt(v2, scope)).toEqual(v2)
+    expect(parseCognitiveAgendaReceipt(receipt(7), scope)?.schemaVersion).toBe(COGNITIVE_AGENDA_RECEIPT_SCHEMA_VERSION)
+    expect(parseCognitiveAgendaReceipt({ ...v2!, objectiveProgressSnapshot: { ...objectiveProgressSnapshot,
+      requirements: [{ ...objectiveProgressSnapshot.requirements[0], locationHash: "d".repeat(64) }] } }, scope)).toBeNull()
+  })
+
+  it("downgrades an oversized aggregate location progress payload to a bounded v1 receipt", () => {
+    const requirements = Array.from({ length: 8 }, (_, index) => ({
+      id: "location-" + index + "-" + "x".repeat(24),
+      kind: "candidate_location_in" as const,
+      locations: canonicalLocations(Array.from({ length: 8 }, (_, locationIndex) =>
+        "city-" + String(index).padStart(2, "0") + "-" + String(locationIndex).padStart(2, "0") + "-" + "x".repeat(30))),
+      status: "reported_passed" as const,
+    }))
+    const current: ObjectiveProgressSnapshot = { schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION,
+      advisory: true, revision: 7, requirements }
+    const previous: ObjectiveProgressSnapshot = { ...current, revision: 6,
+      requirements: current.requirements.map(row => ({ ...row, status: "active" })) }
+    const progressDelta = taskGraphObjectiveProgressDelta(previous, current, true)
+    const value = buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context(7)),
+      objectiveProgress: { goalRevision: "f".repeat(64), objectiveProgressSnapshot: current, progressDelta } })
+
+    expect(Buffer.byteLength(JSON.stringify(current), "utf8")).toBeLessThan(COGNITIVE_AGENDA_RECEIPT_MAX_BYTES)
+    expect(Buffer.byteLength(JSON.stringify(progressDelta), "utf8")).toBeLessThan(COGNITIVE_AGENDA_RECEIPT_MAX_BYTES)
+    expect(value?.schemaVersion).toBe(COGNITIVE_AGENDA_RECEIPT_SCHEMA_VERSION)
+    expect(value).not.toHaveProperty("objectiveProgressSnapshot")
+    expect(value).not.toHaveProperty("progressDelta")
+    expect(Buffer.byteLength(JSON.stringify(value), "utf8")).toBeLessThanOrEqual(COGNITIVE_AGENDA_RECEIPT_MAX_BYTES)
+    expect(parseCognitiveAgendaReceipt(value, scope)).toEqual(value)
   })
 
   it("preserves the valid agenda when maximum objective progress would exceed the receipt bound", () => {
