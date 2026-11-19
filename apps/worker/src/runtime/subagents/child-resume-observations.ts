@@ -5,7 +5,7 @@ import type { ContextSeedBlock } from "../context/step-context-builder.js"
 import type { ChildToolReplayReceipt, ChildWaitReplayReceipt } from "../turns/turn-execution-options.js"
 import type { SubagentLease } from "./types.js"
 import { dateValue, DurableSubagentWaitError, object as waitObject, safeSubagentWaitJson, waitResult, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
-import { markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
+import { markCanonicalSubagentWaitId, markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
 import { buildChildResumeReplayReceipts, type ChildResumeReplayPair, type ChildResumeReplayReceiptSet } from "./child-resume-replay-receipts.js"
 import { redactJobReadOutput } from "../tools/job-read-output-redaction.js"
 import { isSubagentTaskId } from "../tools/redaction.js"
@@ -148,7 +148,6 @@ export function countChildResumeToolCalls(rows: readonly Row[], lease: SubagentL
   }
   return count
 }
-
 export function mergeDurableWaitObservation(observations: readonly ContextSeedBlock[], wait: DurableWaitResume): readonly ContextSeedBlock[] {
   if (!wait.waitId.trim() || !wait.stepId.trim() || !canonicalToolCallId(wait.toolCallId) || !wait.sourceItemId.trim()
     || !Number.isSafeInteger(wait.attempt) || !Number.isSafeInteger(wait.ordinal) || wait.attempt < 1 || wait.ordinal < 0) {
@@ -182,6 +181,7 @@ export function mergeDurableWaitObservation(observations: readonly ContextSeedBl
   const alignedOutput = { taskIds: rawOutputIds, matchedTaskIds: rawMatchedIds, tasks: rawOutputIds.map(id => taskById.get(id)!) }
   if (!markCanonicalSubagentWaitTargetIds({ targetTaskIds: inputIds }, alignedInput, inputIds)
     || !markCanonicalSubagentWaitTargetIds({ targetTaskIds: rawOutputIds }, alignedOutput, rawOutputIds)) throw new Error("child_resume_invalid_wait_result")
+  markCanonicalSubagentWaitId(output, wait.waitId) // exact validated ID; noncanonical legacy IDs remain redacted
   const sourceObservationId = `child-resume:${wait.sourceItemId}`
   const sourceMatches = observations.filter(item => item.id === sourceObservationId)
   const matching = observations.filter(item => object(item.content)?.toolCallId === wait.toolCallId)

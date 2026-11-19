@@ -365,7 +365,7 @@ describe("child attempt durable resume", () => {
       durableWait: { waitId: WAIT_ID, stepId: sourceStepId, ordinal: 18, toolCallId: "wait-call" },
       observations: [
         { id: "child-resume:delegate-result-item", content: { toolCallId: delegateCallId, toolName: "scout.delegate", output: { taskId: delegateTaskId, status: "queued" } } },
-        { id: "child-resume:wait-result-id", content: { toolCallId: "wait-call", toolName: "wait_subagents", output: { waitId: "[REDACTED_PHONE]", status: "ready" } } },
+        { id: "child-resume:wait-result-id", content: { toolCallId: "wait-call", toolName: "wait_subagents", output: { waitId: WAIT_ID, status: "ready" } } },
       ],
     })
     expect(restored?.durableWait).not.toHaveProperty("continuationStepId")
