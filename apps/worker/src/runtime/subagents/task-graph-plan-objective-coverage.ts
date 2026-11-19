@@ -38,9 +38,8 @@ export async function evaluateTaskGraphPlanObjectiveCoverage(input: CoverageInpu
   const cutoff = reconciliation.decisionInputThroughSequence
   if (cutoff === null) return unavailable("task_graph_current_location_steer_unavailable")
   const steer = await readTaskGraphConfirmedLocationSteer(input.client, steerScope, cutoff)
-  if (steer.kind === "absent" || steer.kind === "unavailable") return unavailable("task_graph_current_location_steer_unavailable")
   if (steer.kind === "pending") return unavailable("task_graph_current_location_steer_pending")
-
+  if (steer.kind !== "confirmed") return unavailable("task_graph_current_location_steer_unavailable")
   const loaded = await loadTaskGraph(input.client, input.input.scope, false, {
     includeSourceProvenance: true, currentStepId: input.input.scope.stepId,
     currentStepAttempt: 1,
