@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useSyncExternalStore, useState } from 'react'
-import { normalizeAgentLocationAllowlist } from '@jobcopilot/shared'
+import { normalizeAgentLocationAllowlist } from '@jobcopilot/shared/agent-location-normalization'
 
 export const AGENT_SESSION_QUERY_PARAM = 'sessionId'
 
