@@ -111,10 +111,16 @@ export interface ToolExecutionResult {
   readonly nativeQuestionReceipt?: NativeQuestionControlReceipt
 }
 
+export type ToolLifecycleFailure =
+  | Readonly<{ kind: "diagnostic"; detail: unknown }>
+  | Readonly<{ kind: "safe_output"; output: unknown }>
+
 export interface ToolLifecyclePayload {
   readonly toolCallId: string
   readonly toolName: string
   readonly toolVersion: string
   readonly status: string
-  readonly [key: string]: RepositoryJsonValue
+  readonly failureKind?: "diagnostic" | "safe_output"
+  readonly failureDetail?: RepositoryJsonValue
+  readonly [key: string]: RepositoryJsonValue | undefined
 }
