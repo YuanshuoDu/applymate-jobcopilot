@@ -42,6 +42,32 @@ describe('SelectedTaskDetailsPanel', () => {
     expect(html).toContain('data-child-worker-attach="true"')
     expect(html).toContain('Send follow-up')
     expect(html).toContain('Interrupt task and descendants')
+    expect(html).not.toContain('data-selected-worker-draft-disclosure')
+  })
+
+  it('adds a closed saved-draft disclosure for the selected completed Writer child only', () => {
+    const artifactRef = { artifactId: 'draft-1', version: 2, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` }
+    const root: ChildWorkerTask = {
+      id: 'root-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1',
+      role: 'orchestrator', taskType: 'root', status: 'completed', goal: 'Write a letter', hasResult: false,
+    }
+    const parent: ChildWorkerTask = {
+      id: 'parent-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1', parentTaskId: 'root-1',
+      role: 'analyst', taskType: 'analysis', status: 'completed', goal: 'Collect sources', hasResult: true,
+    }
+    const writer: ChildWorkerTask = {
+      id: 'writer-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1', parentTaskId: 'parent-1',
+      role: 'writer', taskType: 'cover_letter_draft', status: 'completed', goal: 'Write a cover letter', hasResult: true, artifactRef,
+    }
+    const writerNode: TaskTreeNode = { id: 'task:writer-1', kind: 'task', label: 'Cover letter', status: 'completed' }
+    const html = renderToStaticMarkup(<SelectedTaskDetailsPanel
+      sessionId="session-1" selectedNode={writerNode} selectedWorker={writer} selectedTurn={turn} selectedItem={undefined}
+      tasks={[root, parent, writer]} turns={[turn]} items={[]} treeNodes={[writerNode]} lifecycleRevision={4}
+      onSelectNode={vi.fn()} onReturnToCurrent={vi.fn()} onAccepted={vi.fn()} onConflict={vi.fn()}
+    />)
+    expect(html).toContain('data-selected-worker-draft-disclosure="true"')
+    expect(html).toContain('Open saved draft')
+    expect(html).not.toContain('data-selected-job-draft="true"')
   })
 
   it('selects a target only when its task node is still in the current tree', () => {

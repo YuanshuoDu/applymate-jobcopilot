@@ -1015,14 +1015,15 @@ function diagnosticRootFailureCode(value: unknown): string {
 
 async function rootFailureDiagnostic(pool: Pool, turnId: string): Promise<RecordValue> {
   try {
-    const result = await pool.query<{ errorCode: string | null; final: unknown }>(
-      `SELECT event."payload"->>'errorCode' AS "errorCode", event."payload"->'final' AS "final"
+    const config: QueryConfig<unknown[]> & { query_timeout: number } = {
+      text: `SELECT event."payload"->>'errorCode' AS "errorCode", event."payload"->'final' AS "final"
        FROM "agent_events" AS event JOIN "agent_turns" AS turn
          ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
        WHERE event."turnId" = $1 AND event."type" = 'turn.failed' AND event."taskId" = turn."rootTaskId"
        ORDER BY event."sequence" DESC LIMIT 1`,
-      [turnId],
-    )
+      values: [turnId], query_timeout: ANALYST_WAIT_DIAGNOSTIC_QUERY_TIMEOUT_MS,
+    }
+    const result = await pool.query<{ errorCode: string | null; final: unknown }>(config)
     const row = result.rows[0]
     const final = record(row?.final)
     return {
@@ -6398,6 +6399,9 @@ type AnalystWaitDiagWaitRow = {
   turnId: string
   parentTaskId: string
 }
+type ScopedPersistedTaskWaitRow = AnalystWaitDiagWaitRow & { idempotencyKey: string }
+type PersistedTaskWaitScope = Readonly<{ userId: string; sessionId: string; parentTaskId: string }>
+type PersistedTaskWaitScopeSource = PersistedTaskWaitScope | (() => PersistedTaskWaitScope | undefined)
 
 function analystWaitDiagIncrement(value: number): number { return Math.min(99, value + 1) }
 
@@ -6540,6 +6544,7 @@ function analystWaitDiagRecordHelperExit(
   context: AnalystWaitDiagContext,
   row: AnalystWaitDiagWaitRow | undefined,
   outcome: "suspended" | "ready_before_suspend" | "timed_out",
+  expectedScope?: PersistedTaskWaitScope,
 ): Promise<void> | undefined {
   const state = context.state
   state.helperExits = analystWaitDiagIncrement(state.helperExits)
@@ -6552,6 +6557,7 @@ function analystWaitDiagRecordHelperExit(
     waitSessionMatchesFixture: row ? row.sessionId === context.sessionId : null,
     waitTurnMatchesFixture: row ? row.turnId === turnId : null,
     waitParentMatchesRoot: row && state.expectedRootTaskId ? row.parentTaskId === state.expectedRootTaskId : null,
+    waitParentMatchesRequestedScope: row && expectedScope ? row.parentTaskId === expectedScope.parentTaskId : null,
     leaseScope: context.leaseScope,
   }
   if (outcome === "suspended") {
@@ -6619,12 +6625,28 @@ async function waitForPersistedTaskWait(
   diagnosticToolCallId?: string,
   diagnosticFixtureCounters?: LeaseRecoveryFixtureDiagnostics,
   analystWaitDiag?: AnalystWaitDiagContext,
-): Promise<{ id: string }> {
+  exactWaitScope?: PersistedTaskWaitScopeSource,
+): Promise<{ id: string; parentTaskId?: string }> {
   const deadline = Date.now() + timeoutMs
   let lastWaitRow: AnalystWaitDiagWaitRow | undefined
+  let lastExpectedScope: PersistedTaskWaitScope | undefined
   while (Date.now() < deadline) {
-    let row: { id: string; status: string; suspendedAt: Date | null } | AnalystWaitDiagWaitRow | undefined
-    if (analystWaitDiag) {
+    const expectedScope = typeof exactWaitScope === "function" ? exactWaitScope() : exactWaitScope
+    let row: { id: string; status: string; suspendedAt: Date | null } | AnalystWaitDiagWaitRow | ScopedPersistedTaskWaitRow | undefined
+    if (exactWaitScope && expectedScope) {
+      lastExpectedScope = expectedScope
+      const result = await pool.query<ScopedPersistedTaskWaitRow>(
+        `SELECT "id", "status", "suspendedAt", "userId", "sessionId", "turnId", "parentTaskId", "idempotencyKey"
+         FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3
+           AND "parentTaskId" = $4 AND "idempotencyKey" = $5 LIMIT 1`,
+        [expectedScope.userId, expectedScope.sessionId, turnId, expectedScope.parentTaskId, idempotencyKey],
+      )
+      const candidate = result.rows[0]
+      lastWaitRow = candidate
+      row = candidate && candidate.userId === expectedScope.userId && candidate.sessionId === expectedScope.sessionId
+        && candidate.turnId === turnId && candidate.parentTaskId === expectedScope.parentTaskId
+        && candidate.idempotencyKey === idempotencyKey ? candidate : undefined
+    } else if (!exactWaitScope && analystWaitDiag) {
       const result = await pool.query<AnalystWaitDiagWaitRow>(
         `SELECT "id", "status", "suspendedAt", "userId", "sessionId", "turnId", "parentTaskId"
          FROM "agent_wait_conditions" WHERE "turnId" = $1 AND "idempotencyKey" = $2`,
@@ -6632,7 +6654,7 @@ async function waitForPersistedTaskWait(
       )
       row = result.rows[0]
       lastWaitRow = result.rows[0]
-    } else {
+    } else if (!exactWaitScope) {
       const result = await pool.query<{ id: string; status: string; suspendedAt: Date | null }>(
         `SELECT "id", "status", "suspendedAt" FROM "agent_wait_conditions" WHERE "turnId" = $1 AND "idempotencyKey" = $2`,
         [turnId, idempotencyKey],
@@ -6641,14 +6663,14 @@ async function waitForPersistedTaskWait(
     }
     if (row?.status === "waiting" && row.suspendedAt instanceof Date) {
       if (analystWaitDiag) {
-        const diagnostic = analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "suspended")
+        const diagnostic = analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "suspended", expectedScope)
         if (diagnostic) await diagnostic
       }
-      return { id: row.id }
+      return { id: row.id, ...(expectedScope && "parentTaskId" in row ? { parentTaskId: row.parentTaskId } : {}) }
     }
     if (row?.status === "ready") {
       if (analystWaitDiag) {
-        const diagnostic = analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "ready_before_suspend")
+        const diagnostic = analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "ready_before_suspend", expectedScope)
         if (diagnostic) await diagnostic
       }
       throw new Error("Follow-up child completed before its durable parent wait suspended")
@@ -6656,7 +6678,7 @@ async function waitForPersistedTaskWait(
     await new Promise(resolve => setTimeout(resolve, 20))
   }
   if (analystWaitDiag) {
-    const diagnostic = analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "timed_out")
+    const diagnostic = analystWaitDiagRecordHelperExit(pool, turnId, analystWaitDiag, lastWaitRow, "timed_out", lastExpectedScope)
     if (diagnostic) await diagnostic
   }
   const diagnostics = diagnosticToolCallId
@@ -6799,6 +6821,29 @@ async function restartFollowUpWaitDiagnostics(
     return { available: false }
   }
 }
+
+describe("persisted TaskGraph wait scope", () => {
+  it("does not accept a same-key wait owned by a foreign parent", async () => {
+    const expectedScope: PersistedTaskWaitScope = {
+      userId: "user-1", sessionId: "session-1", parentTaskId: "target-parent",
+    }
+    const foreignWait: ScopedPersistedTaskWaitRow = {
+      id: "foreign-wait", status: "waiting", suspendedAt: new Date(), idempotencyKey: "same-key",
+      userId: expectedScope.userId, sessionId: expectedScope.sessionId, turnId: "turn-1", parentTaskId: "foreign-parent",
+    }
+    const query = vi.fn(async (sql: string, values?: unknown[]) => {
+      expect(sql).toContain('AND "parentTaskId" = $4 AND "idempotencyKey" = $5 LIMIT 1')
+      expect(values).toEqual([expectedScope.userId, expectedScope.sessionId, "turn-1", expectedScope.parentTaskId, "same-key"])
+      const matched = values?.[3] === foreignWait.parentTaskId
+      return { rows: matched ? [foreignWait] : [], rowCount: matched ? 1 : 0 } as QueryResult<ScopedPersistedTaskWaitRow>
+    })
+    const pool = { query } as unknown as Pool
+
+    await expect(waitForPersistedTaskWait(pool, "turn-1", "same-key", 1, undefined, undefined, undefined, expectedScope))
+      .rejects.toThrow("Follow-up parent wait was not durably suspended")
+    expect(query).toHaveBeenCalledTimes(1)
+  })
+})
 
 describe("compact TaskGraph wait failure diagnostics", () => {
   it("projects restart child markers through the safe diagnostic allowlists", () => {
@@ -15588,9 +15633,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     turnQueueName = turnQueueModule.TURN_QUEUE_NAME
     childQueueName = (await import("../../queue/subagent-queue.js")).SUBAGENT_QUEUE_NAME
     await activateFixtureTurn(pool!, value)
+    const targetTurnGoal = "Analyze at least 75 percent of the four jobs found by the Scout"
     await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb
       WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
-      value.turnId, JSON.stringify({ goal: "Analyze at least 75 percent of the four jobs found by the Scout" }), value.sessionId, value.userId,
+      value.turnId, JSON.stringify({ goal: targetTurnGoal }), value.sessionId, value.userId,
     ])
     for (let index = 0; index < ids.length; index++) {
       await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
@@ -15627,7 +15673,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const initialWaitKey = `p3-cohort-coverage-initial-wait:${value.turnId}`
     const repairWaitKey = `p3-cohort-coverage-repair-wait:${value.turnId}`
     let rootExecution = 0
+    let targetRootTaskId: string | null = null
+    let targetScriptedModelRequestCount = 0
     let rootFailureStage = "not_started"
+    let lastModelRequestScope: RecordValue | null = null
     let initialWaitOutcomeDiagnostic: RecordValue | null = null
     const waitLoadDiagnostics: RecordValue[] = []
     const waitBoundaryDiagnostics: RecordValue[] = []
@@ -15642,6 +15691,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const repairWaitDiagnosticState: AnalystWaitDiagState = {
       leaseArrivals: 0, leaseObservations: [], leaseObservationOverflow: false, expectedRootTaskId: null,
       helperExits: 0, rootTurnStateReads: 0, lastHelperExit: null,
+    }
+    const targetRootWaitScope = (): PersistedTaskWaitScope | undefined => {
+      const rootTaskId = targetRootTaskId
+      if (!rootTaskId || repairWaitDiagnosticState.expectedRootTaskId !== rootTaskId) return undefined
+      return { userId: value.userId, sessionId: value.sessionId, parentTaskId: rootTaskId }
     }
     const repairWaitDiagnostic: AnalystWaitDiagContext = {
       state: repairWaitDiagnosticState, sessionId: value.sessionId, userId: value.userId,
@@ -15703,8 +15757,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           const consumeWaitOutcomes = loaderOptions?.consumeWaitOutcomes === true
           if (execution >= 2) {
             const waitObservation = cohortWaitObservationDiagnostic(state.snapshot.toolObservations)
+            const waitKey = rootFailureStage === "repair_wait" ? repairWaitKey : initialWaitKey
             const waitBoundary = consumeWaitOutcomes && waitObservation.waitResultCount === 0
-              ? await cohortWaitBoundaryDiagnostics(statePool as Pool, value.turnId, initialWaitKey)
+              ? await cohortWaitBoundaryDiagnostics(statePool as Pool, value.turnId, waitKey)
               : undefined
             recordWaitBoundaryDiagnostic({
               execution: diagnosticBoundedCount(execution), stage: "state_loader_return", consumeWaitOutcomes,
@@ -15733,18 +15788,63 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         }
         return state
       },
-      modelRuntimeFactory: () => {
-        const execution = ++rootExecution
+      modelRuntimeFactory: async ({ userId: factoryUserId, state }) => {
+        const stateRootTaskId = typeof state.rootTaskId === "string" && state.rootTaskId.length > 0
+          ? state.rootTaskId : null
+        const snapshotGoalId = typeof state.snapshot.goal?.id === "string" ? state.snapshot.goal.id : null
+        const targetFactoryCandidate = factoryUserId === value.userId && state.scope.userId === value.userId
+          && state.goal === targetTurnGoal && snapshotGoalId === `turn-goal:${value.turnId}`
+        let targetFactoryMatchesTurn = false
+        let candidateRootTaskId: string | null = null
+        if (targetFactoryCandidate) {
+          const targetRootTurnQuery: QueryConfig<unknown[]> = {
+            text: `SELECT "rootTaskId" FROM "agent_turns"
+                   WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 LIMIT 1`,
+            values: [value.turnId, value.sessionId, value.userId],
+          }
+          const targetRootTurn = await pool!.query<{ rootTaskId: string | null }>(targetRootTurnQuery)
+          const persistedRootTaskId = targetRootTurn.rows[0]?.rootTaskId
+          targetFactoryMatchesTurn = typeof persistedRootTaskId === "string" && persistedRootTaskId.length > 0
+            && (stateRootTaskId === null || stateRootTaskId === persistedRootTaskId)
+          if (targetFactoryMatchesTurn) candidateRootTaskId = persistedRootTaskId
+        }
+        if (!targetFactoryMatchesTurn || candidateRootTaskId === null) {
+          const adapter: ModelAdapter = {
+            id: "p3-cohort-non-target-recovery-guard", profile,
+            async *stream(request) {
+              void request
+              throw new Error("cohort_fixture_non_target_turn_blocked")
+            },
+          }
+          return { adapter, registry: {} as never, candidates: [] }
+        }
+        targetRootTaskId = candidateRootTaskId
+        repairWaitDiagnosticState.expectedRootTaskId = candidateRootTaskId
+        let execution: number | null = null
         let round = 0
         const adapter: ModelAdapter = {
           id: "p3-explicit-cohort-coverage-root-fixture", profile,
           async *stream(request) {
+            const metadata = request.metadata
+            const requestScope = {
+              userMatchesFixture: metadata.userId === value.userId,
+              sessionMatchesFixture: metadata.sessionId === value.sessionId,
+              turnMatchesFixture: metadata.turnId === value.turnId,
+              rootTaskMatchesFixture: metadata.taskId === targetRootTaskId,
+            }
+            lastModelRequestScope = requestScope
+            if (Object.values(requestScope).some(matches => matches !== true)) {
+              throw new Error("cohort_fixture_non_target_turn_blocked")
+            }
+            if (execution === null) execution = ++rootExecution
+            const scriptExecution = execution
+            targetScriptedModelRequestCount += 1
             round += 1
-            if (execution >= 2) {
+            if (scriptExecution >= 2) {
               recordWaitBoundaryDiagnostic({
-                execution: diagnosticBoundedCount(execution), stage: "final_request_messages",
+                execution: diagnosticBoundedCount(scriptExecution), stage: "final_request_messages",
                 consumeWaitOutcomes: flags.consumeWaitOutcomes === true,
-                ...cohortWaitOutcomeRequestDiagnostic(request, execution === 2 ? 1 : 2),
+                ...cohortWaitOutcomeRequestDiagnostic(request, scriptExecution === 2 ? 1 : 2),
               })
             }
             const graph = currentGraphFromRequest(request), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
@@ -15752,7 +15852,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             const analysis = nodes.find(node => node?.key === "analysis")
             const downstream = nodes.find(node => node?.key === "downstream")
             const repair = nodes.find(node => node?.key === "analysis-repair")
-            if (execution === 1 && round === 1) {
+            if (scriptExecution === 1 && round === 1) {
               rootFailureStage = "initial_plan"
               yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
                 expectedRevision: 0,
@@ -15765,7 +15865,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            if (execution === 1 && round === 2) {
+            if (scriptExecution === 1 && round === 2) {
               rootFailureStage = "initial_wait"
               initialTaskIds = planTaskIds(request, planCallId, 3)
               targetTaskId = initialTaskIds[1]!
@@ -15776,7 +15876,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            if (execution === 2 && round === 1) {
+            if (scriptExecution === 2 && round === 1) {
               rootFailureStage = "initial_wait_resume"
               initialWaitOutcomeDiagnostic = cohortWaitOutcomeRequestDiagnostic(request, 1)
               const outcome = waitOutcomeFromRequest(request, 1)
@@ -15807,7 +15907,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            if (execution === 2 && round === 2) {
+            if (scriptExecution === 2 && round === 2) {
               rootFailureStage = "repair_plan_receipt"
               const repairIds = planTaskIds(request, repairPlanCallId, 1)
               repairTaskId = repairIds[0]!
@@ -15823,7 +15923,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            if (execution === 3 && round === 1) {
+            if (scriptExecution === 3 && round === 1) {
+              rootFailureStage = "repair_wait_resume"
               const outcome = waitOutcomeFromRequest(request, 2)
               expect(outcome.status).toBe("ready")
               expect(outcome.tasks.map(task => record(task)?.status)).toEqual(["completed", "completed"])
@@ -15838,7 +15939,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "completed", finishReason: "stop" }
               return
             }
-            throw new Error(`Unexpected cohort coverage root round ${execution}/${round}`)
+            rootFailureStage = "unexpected_round"
+            throw new Error(`Unexpected cohort coverage root round ${scriptExecution}/${round}`)
           },
         }
         return { adapter, registry: {} as never, candidates: [] }
@@ -15928,22 +16030,36 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         recoveryFactory: () => ({ close: async () => undefined }) as never,
       },
     })
-    await turnQueueModule.enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
-    try {
-      await waitForPersistedTaskWait(pool!, value.turnId, initialWaitKey)
-    } catch (error) {
-      if (!(error instanceof Error) || error.message !== "Follow-up parent wait was not durably suspended") throw error
-      const [rootFailure, rootActivity] = await Promise.all([
+    const coverageWaitFailureDiagnostic = async (stage: "initial_wait" | "repair_wait"): Promise<string> => {
+      const rootTurn = await analystWaitDiagReadRootTurn(pool!, value.turnId, repairWaitDiagnostic)
+      const waitKey = stage === "initial_wait" ? initialWaitKey : repairWaitKey
+      const [rootFailure, planWaitReceipts, waitBoundary] = await Promise.all([
         rootFailureDiagnostic(pool!, value.turnId),
         cohortRepairFailureDiagnostics(pool!, value.turnId, [planCallId, initialWaitCallId, repairPlanCallId, repairWaitCallId]),
+        cohortWaitBoundaryDiagnostics(pool!, value.turnId, waitKey),
       ])
-      const initialWaitBoundary = await cohortWaitBoundaryDiagnostics(pool!, value.turnId, initialWaitKey)
-      throw new Error(JSON.stringify({
-        stage: "initial_wait_suspension",
-        rootExecution: diagnosticBoundedCount(rootExecution), rootFailureStage, rootFailure, rootActivity,
-        initialWaitOutcome: initialWaitOutcomeDiagnostic, initialWaitBoundary, waitLoads: waitLoadDiagnostics,
-        waitBoundaries: waitBoundaryDiagnostics,
-      }))
+      return boundedDiagnostic(JSON.stringify({
+        stage, rootTurn,
+        rootFailure, planWaitReceipts, waitBoundary,
+        rootExecution: diagnosticBoundedCount(rootExecution), rootFailureStage,
+        targetRootPresent: targetRootTaskId !== null,
+        lastModelRequestScope,
+        targetScriptedModelRequestCount: diagnosticBoundedCount(targetScriptedModelRequestCount),
+        failedCoverageObserved, repairAccepted, repairWaitCallPrepared,
+        initialWaitOutcome: initialWaitOutcomeDiagnostic,
+        waitLoads: waitLoadDiagnostics, waitBoundaries: waitBoundaryDiagnostics,
+        wait: analystWaitDiagProjection(repairWaitDiagnosticState),
+      }), 4_000)
+    }
+    await turnQueueModule.enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+    try {
+      const persistedInitialWait = await waitForPersistedTaskWait(
+        pool!, value.turnId, initialWaitKey, 20_000, undefined, undefined, repairWaitDiagnostic, targetRootWaitScope,
+      )
+      expect(persistedInitialWait.parentTaskId).toBe(targetRootTaskId)
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "Follow-up parent wait was not durably suspended") throw error
+      throw new Error(`${error.message}; coverageWaitDiagnostic=${await coverageWaitFailureDiagnostic("initial_wait")}`)
     }
     expect(initialTaskIds).toHaveLength(3)
     const taskStore = new PgSubagentTaskStore(pool!)
@@ -15962,30 +16078,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await executeChild(initialTaskIds[0]!, `p3-cohort-scout-${value.suffix}`)
     await executeChild(targetTaskId, `p3-cohort-analyst-${value.suffix}`, "failed")
     try {
-      await waitForPersistedTaskWait(pool!, value.turnId, repairWaitKey, 20_000, undefined, undefined, repairWaitDiagnostic)
+      const persistedRepairWait = await waitForPersistedTaskWait(
+        pool!, value.turnId, repairWaitKey, 20_000, undefined, undefined, repairWaitDiagnostic, targetRootWaitScope,
+      )
+      expect(persistedRepairWait.parentTaskId).toBe(targetRootTaskId)
     } catch (error) {
       if (!(error instanceof Error) || error.message !== "Follow-up parent wait was not durably suspended") throw error
-      const waitBoundary: RecordValue | null = repairWaitDiagnosticState.lastHelperExit
-        ? Object.fromEntries(Object.entries(repairWaitDiagnosticState.lastHelperExit).filter(([key]) => key !== "leaseScope"))
-        : null
-      let rootFailure: RecordValue = { available: false }
-      try {
-        rootFailure = await rootFailureDiagnostic(pool!, value.turnId)
-      } catch {
-        // Diagnostic failures must not replace the original wait timeout.
-      }
-      const rootActivity = await cohortRepairFailureDiagnostics(pool!, value.turnId, [
-        planCallId, initialWaitCallId, repairPlanCallId, repairWaitCallId,
-      ])
-      const initialWaitBoundary = await cohortWaitBoundaryDiagnostics(pool!, value.turnId, initialWaitKey)
-      const diagnosis = JSON.stringify({
-        rootExecution: diagnosticBoundedCount(rootExecution), rootFailureStage, failedCoverageObserved, repairAccepted, repairWaitCallPrepared,
-        helperExits: diagnosticBoundedCount(repairWaitDiagnosticState.helperExits), rootFailure,
-        initialWaitOutcome: initialWaitOutcomeDiagnostic,
-        waitLoads: waitLoadDiagnostics, waitBoundaries: waitBoundaryDiagnostics,
-        waitBoundary, initialWaitBoundary, rootActivity,
-      })
-      throw new Error(`${error.message}; repairWaitDiagnostic=${diagnosis}`)
+      throw new Error(`${error.message}; coverageWaitDiagnostic=${await coverageWaitFailureDiagnostic("repair_wait")}`)
     }
     expect(failedCoverageObserved).toBe(true)
     expect(repairAccepted).toBe(true)
@@ -16006,6 +16105,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(turn.rows[0]?.status).toBe("completed")
     const rootTaskId = turn.rows[0]?.rootTaskId
     if (!rootTaskId) throw new Error("Completed coverage repair lost its root TaskGraph identity")
+    expect(targetRootTaskId).toBe(rootTaskId)
+    expect(rootExecution).toBe(3)
+    expect(targetScriptedModelRequestCount).toBe(5)
+    expect(lastModelRequestScope).toEqual({
+      userMatchesFixture: true, sessionMatchesFixture: true, turnMatchesFixture: true, rootTaskMatchesFixture: true,
+    })
     const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue
     await expectGroundedTaskGraphFinalCopies(
       pool!, value, rootTaskId, finalResponse,

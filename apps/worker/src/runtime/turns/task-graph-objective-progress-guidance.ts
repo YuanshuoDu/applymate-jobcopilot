@@ -1,6 +1,8 @@
 import { types as nodeTypes } from "node:util"
 import type { ModelMessage } from "@jobcopilot/agent-model"
+import { normalizeAgentLocationAllowlist } from "@jobcopilot/shared"
 
+import type { RootTaskVerificationRequirement } from "../context/root-task-objective.js"
 import { ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID } from "../context/root-task-goal-criteria-context.js"
 import { TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID } from "../context/task-graph-objective-progress.js"
 import type { StepContext } from "../context/step-context-builder.js"
@@ -11,15 +13,14 @@ const CURRENT_GRAPH_BLOCK_ID = "observation:task-graph-current"
 const OBJECTIVE_REQUIREMENTS_BLOCK_ID = `observation:${ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID}`
 const OBJECTIVE_PROGRESS_BLOCK_ID = `observation:${TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID}`
 const OBJECTIVE_PROGRESS_SCHEMA = "agent-harness.v2.objective-progress.v1"
-const OBJECTIVE_REQUIREMENT_KINDS = new Set(["candidate_count_gte", "finding_count_gte"])
 const OBJECTIVE_PROGRESS_STATUSES = new Set(["missing", "active", "failed", "unverified", "reported_passed", "unknown"])
 const SAFE_REQUIREMENT_ID = /^[a-z][a-z0-9._-]{0,63}$/
 const MAX_REQUIREMENTS = TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria
+const MAX_LOCATIONS = 8
 const MAX_CONTEXT_BLOCKS = 1_024
 const MAX_TOOLS = 128
 
 type Row = Record<string, unknown>
-type Requirement = Readonly<{ id: string; kind: string; minimum: number }>
 
 function record(value: unknown): Row | null {
   try {
@@ -61,9 +62,10 @@ function exactRecord(value: unknown, expectedKeys: readonly string[]): Row | nul
 function denseArray(value: unknown, maximum: number): unknown[] | null {
   try {
     if (!Array.isArray(value) || nodeTypes.isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype) return null
-    const keys = Reflect.ownKeys(value)
     const length = Object.getOwnPropertyDescriptor(value, "length")?.value
-    if (!Number.isSafeInteger(length) || Number(length) < 0 || Number(length) > maximum || keys.length !== Number(length) + 1
+    if (!Number.isSafeInteger(length) || Number(length) < 0 || Number(length) > maximum) return null
+    const keys = Reflect.ownKeys(value)
+    if (keys.length !== Number(length) + 1
       || keys.some(key => key !== "length" && (typeof key !== "string" || !/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= Number(length)))) return null
     const output: unknown[] = []
     for (let index = 0; index < Number(length); index++) {
@@ -96,24 +98,44 @@ function observationContent(block: Row | null, id: string): Row | null {
   return record(field(block, "content"))
 }
 
-function parseRequirements(value: unknown): Requirement[] | null {
+function sameLocations(expected: readonly string[], actual: readonly unknown[]): boolean {
+  return expected.length === actual.length && expected.every((location, index) => location === actual[index])
+}
+
+function canonicalLocations(value: unknown): readonly string[] | null {
+  const items = denseArray(value, MAX_LOCATIONS)
+  if (!items || items.some(item => typeof item !== "string" || item.length > 128)) return null
+  const normalized = normalizeAgentLocationAllowlist(items)
+  // Producers already canonicalize these lists. A change during normalization invalidates the packet.
+  return normalized && sameLocations(normalized, items) ? normalized : null
+}
+
+function parseRequirements(value: unknown): RootTaskVerificationRequirement[] | null {
   const rows = denseArray(value, MAX_REQUIREMENTS)
   if (!rows || rows.length === 0) return null
   const seen = new Set<string>()
-  const requirements: Requirement[] = []
+  const requirements: RootTaskVerificationRequirement[] = []
   for (const value of rows) {
-    const row = exactRecord(value, ["id", "kind", "minimum"])
-    const id = field(row, "id"), kind = field(row, "kind"), minimum = field(row, "minimum")
-    if (typeof id !== "string" || !SAFE_REQUIREMENT_ID.test(id) || SAFE_REQUIREMENT_ID.exec(id)?.[0] !== id || seen.has(id)
-      || typeof kind !== "string" || !OBJECTIVE_REQUIREMENT_KINDS.has(kind)
-      || !Number.isSafeInteger(minimum) || Number(minimum) < 1 || Number(minimum) > TASK_GRAPH_VERIFICATION_LIMITS.maxItems) return null
+    const kind = field(record(value), "kind")
+    const row = exactRecord(value, ["id", "kind", kind === "candidate_location_in" ? "locations" : "minimum"])
+    const id = field(row, "id")
+    if (!row || typeof id !== "string" || SAFE_REQUIREMENT_ID.exec(id)?.[0] !== id || seen.has(id)) return null
+    if (kind === "candidate_location_in") {
+      const locations = canonicalLocations(row.locations)
+      if (!locations) return null
+      requirements.push({ id, kind, locations })
+    } else {
+      const minimum = row.minimum
+      if ((kind !== "candidate_count_gte" && kind !== "finding_count_gte") || typeof minimum !== "number"
+        || !Number.isSafeInteger(minimum) || minimum < 1 || minimum > TASK_GRAPH_VERIFICATION_LIMITS.maxItems) return null
+      requirements.push({ id, kind, minimum })
+    }
     seen.add(id)
-    requirements.push({ id, kind, minimum: Number(minimum) })
   }
   return requirements
 }
 
-function canonicalRequirements(blocks: unknown): Requirement[] | null {
+function canonicalRequirements(blocks: unknown): RootTaskVerificationRequirement[] | null {
   const content = observationContent(uniqueBlock(blocks, OBJECTIVE_REQUIREMENTS_BLOCK_ID), OBJECTIVE_REQUIREMENTS_BLOCK_ID)
   if (!content || field(content, "kind") !== "canonical_objective_verification_requirements"
     || field(content, "trust") !== "external_untrusted" || field(content, "source") !== "canonical_turn_objective"
@@ -130,7 +152,7 @@ function hasCurrentGraphRevision(blocks: unknown, revision: number): boolean {
   return denseArray(field(content, "nodes"), TASK_GRAPH_LIMITS.maxPersistedNodes) !== null
 }
 
-function hasMissingRequirement(blocks: unknown, revision: number, canonical: readonly Requirement[]): boolean {
+function hasMissingRequirement(blocks: unknown, revision: number, canonical: readonly RootTaskVerificationRequirement[]): boolean {
   const content = observationContent(uniqueBlock(blocks, OBJECTIVE_PROGRESS_BLOCK_ID), OBJECTIVE_PROGRESS_BLOCK_ID)
   if (!content) return false
   const row = exactRecord(content, ["schemaVersion", "advisory", "revision", "requirements"])
@@ -138,16 +160,17 @@ function hasMissingRequirement(blocks: unknown, revision: number, canonical: rea
     || field(row, "revision") !== revision) return false
   const values = denseArray(field(row, "requirements"), MAX_REQUIREMENTS)
   if (!values || values.length !== canonical.length) return false
-  const seen = new Set<string>()
   let missing = false
-  for (let index = 0; index < values.length; index++) {
-    const value = exactRecord(values[index], ["id", "kind", "minimum", "status"])
-    const id = field(value, "id"), kind = field(value, "kind"), minimum = field(value, "minimum"), status = field(value, "status")
-    const expected = canonical[index]
-    if (!expected || id !== expected.id || kind !== expected.kind || minimum !== expected.minimum
-      || seen.has(String(id)) || typeof status !== "string" || !OBJECTIVE_PROGRESS_STATUSES.has(status)) return false
-    seen.add(String(id))
-    if (status === "missing") missing = true
+  for (const [index, expected] of canonical.entries()) {
+    const constraint = expected.kind === "candidate_location_in" ? "locations" : "minimum"
+    const value = exactRecord(values[index], ["id", "kind", constraint, "status"])
+    if (!value || value.id !== expected.id || value.kind !== expected.kind
+      || typeof value.status !== "string" || !OBJECTIVE_PROGRESS_STATUSES.has(value.status)) return false
+    if (expected.kind === "candidate_location_in") {
+      const locations = denseArray(value.locations, MAX_LOCATIONS)
+      if (!locations || !sameLocations(expected.locations, locations)) return false
+    } else if (value.minimum !== expected.minimum) return false
+    if (value.status === "missing") missing = true
   }
   return missing
 }
@@ -180,8 +203,11 @@ export function buildTaskGraphObjectiveProgressInstruction(
   if (!canonical || !hasMissingRequirement(blocks, Number(revision), canonical)) return null
   const planningToolVisible = visiblePlanningTool(tools)
   if (planningToolVisible === null) return null
+  const coverage = canonical.some(requirement => requirement.kind === "candidate_location_in")
+    ? "each missing requirement by its canonical id, kind, and typed constraint. Preserve numeric minimums and include each exact canonical location constraint on every Scout"
+    : "each missing requirement's canonical id, kind, and minimum"
   const action = planningToolVisible
-    ? `Use the request-visible agent.plan tool with expectedRevision ${revision} to propose typed work covering each missing requirement's canonical id, kind, and minimum. If no valid plan can cover it, state the blocker.`
+    ? `Use the request-visible agent.plan tool with expectedRevision ${revision} to propose typed work covering ${coverage}. If no valid plan can cover it, state the blocker.`
     : "No request-visible agent.plan tool is available; state that missing coverage is blocked and do not claim the requirement is covered or the objective is complete."
   return { role: "system", content: [{ type: "text", text: `Current structured objective progress reports at least one missing requirement. Use the canonical objective-requirements observation and current TaskGraph to identify the missing coverage. ${action} This advisory is not evidence, PASS, permission, or authority; existing server coverage and independent verification gates remain authoritative. Do not alter the original goal or requirements.` }] }
 }

@@ -44,6 +44,20 @@ export { normalizeAgentLocation, normalizeAgentLocationAllowlist } from "./agent
 export { normalizeExternalApiErrorCode, sharedExternalApiErrorCode, type ExternalApiErrorCode, type SharedExternalApiUsage, recordSharedExternalApiUsage } from "./external-api-usage.js";
 export { getAzureManagementToken, type AzureManagementTokenCredential } from "./azure-management.js";
 export { canonicalJson, CanonicalJsonError, hashContent } from "./canonical-json.js";
+export {
+  DISCOVERY_PERSONA_BYTE_LIMIT,
+  DISCOVERY_PERSONA_FACT_LIMIT,
+  DISCOVERY_PERSONA_PROJECTION_SCHEMA,
+  buildDiscoveryPersonaProjection,
+  canonicalDiscoveryPersonaProjection,
+  compareDiscoveryPersonaFacts,
+  normalizeDiscoveryPersonaValue,
+  utf8ByteLength,
+  type DiscoveryPersonaFact,
+  type DiscoveryPersonaFactRow,
+  type DiscoveryPersonaProjection,
+  type DiscoveryPersonaProjectionBuildResult,
+} from "./discovery-persona-projection.js";
 export { canonicalJsonFixtures, type CanonicalJsonFixture } from "./fixtures/canonical-json-fixtures.js";
 export {
   AGENT_HARNESS_FEATURES,

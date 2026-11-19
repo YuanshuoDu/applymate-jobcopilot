@@ -1,11 +1,13 @@
 import { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { listDiscoveryPersonaFacts, setDiscoveryPersonaFactConsent } from '@/lib/persona-facts'
+import { estimatePersonaDiscoveryCapacity } from '@/lib/persona-discovery-capacity'
 
 export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
-  const response = ok({ facts: await listDiscoveryPersonaFacts(auth.userId) })
+  const facts = await listDiscoveryPersonaFacts(auth.userId)
+  const response = ok({ facts, capacity: estimatePersonaDiscoveryCapacity(facts) })
   response.headers.set('Cache-Control', 'private, no-store')
   return response
 }
