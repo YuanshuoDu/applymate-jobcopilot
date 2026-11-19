@@ -170,14 +170,16 @@ describeWithPostgres("Writer review feedback persistence on disposable PostgreSQ
       `CREATE TABLE "agent_sessions" ("id" text PRIMARY KEY, "userId" text NOT NULL, "status" text NOT NULL, UNIQUE ("id", "userId"))`,
       `CREATE TABLE "agent_turns" (
         "id" text PRIMARY KEY, "sessionId" text NOT NULL, "userId" text NOT NULL, "rootTaskId" text NOT NULL,
-        "status" text NOT NULL, "leaseOwnerId" text, "leaseVersion" integer NOT NULL DEFAULT 0, "leaseExpiresAt" timestamptz
+        "status" text NOT NULL, "leaseOwnerId" text, "leaseVersion" integer NOT NULL DEFAULT 0,
+        "leaseExpiresAt" timestamptz, "leaseStartedAt" TIMESTAMP(3)
       )`,
       `CREATE TABLE "sub_agent_tasks" (
         "id" text PRIMARY KEY, "sessionId" text NOT NULL, "turnId" text NOT NULL, "rootTaskId" text NOT NULL,
         "parentTaskId" text, "role" text NOT NULL, "taskType" text NOT NULL, "status" text NOT NULL,
         "leaseOwner" text, "leaseExpiresAt" timestamptz,
         "attemptCount" integer NOT NULL DEFAULT 1, "interruptRequestedAt" timestamptz, "context" jsonb NOT NULL,
-        "absoluteDeadlineAt" TIMESTAMP(3), "leaseSegmentStartedAt" TIMESTAMP(3)
+        "absoluteDeadlineAt" TIMESTAMP(3), "leaseSegmentStartedAt" TIMESTAMP(3), "completedAt" TIMESTAMP(3),
+        "closedAt" TIMESTAMP(3), "nextAttemptAt" TIMESTAMP(3)
       )`,
       `CREATE TABLE "agent_artifact" (
         "id" text PRIMARY KEY, "userId" text NOT NULL, "jobId" text NOT NULL, "artifactType" text NOT NULL,

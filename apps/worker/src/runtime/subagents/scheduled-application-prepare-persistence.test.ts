@@ -4,6 +4,7 @@ import type { AgentArtifactBaseInsert, AgentArtifactDraftWrite } from "../../db/
 import type { ScheduledPrepareArtifactWriteBinding, ScheduledPrepareJobInput } from "../tools/scheduled-application-prepare.js"
 import type { ScheduledPrepareMaterialSources } from "./scheduled-application-prepare-persistence.js"
 import { persistScheduledPrepareMaterial } from "./scheduled-application-prepare-persistence.js"
+import { taskGraphItemId } from "./task-graph-snapshot.js"
 
 const { createArtifactRepository, loadSelectedJobArtifactContext, artifactTaskFenceIsCurrent, findArtifactByScope } = vi.hoisted(() => ({
   createArtifactRepository: vi.fn(), loadSelectedJobArtifactContext: vi.fn(),
@@ -116,6 +117,9 @@ describe("scheduled Prepare fenced persistence", () => {
     expect(events.indexOf("artifact-find-base")).toBeLessThan(events.indexOf("base-insert-call"))
     expect(events.indexOf("base-insert-call")).toBeLessThan(events.indexOf("draft-save-call"))
     expect(events.indexOf("draft-save-call")).toBeLessThan(events.indexOf("commit"))
+    expect(artifactTaskFenceIsCurrent).toHaveBeenCalledWith(client, expect.objectContaining({
+      taskGraphItemId: taskGraphItemId(binding.taskFence.rootTaskId), parseTaskGraphSnapshot: expect.any(Function),
+    }), binding.jobId)
     expect(repository.insertBaseWithClient).toHaveBeenCalledWith(client, expect.objectContaining({ userId: "user-a", jobId: "job-a" }),
       expect.objectContaining({ taskFenceMode: "scheduled_prepare", turnLeaseOwnerId: "turn-owner-current", turnLeaseVersion: 12, rootAttemptCount: 2 }))
     expect(repository.saveDraft).toHaveBeenCalledWith(expect.objectContaining({
