@@ -111,6 +111,9 @@ function makeDb(options: {
       findFirst: vi.fn(async (args: unknown) => {
         const where = whereOf(args)
         if (where.id) {
+          const created = turns.find((turn) => turn.id === where.id && turn.sessionId === where.sessionId
+            && turn.userId === where.userId && (where.source === undefined || turn.source === where.source))
+          if (created) return { ...created }
           const target = options.retryTarget
           return target && where.id === target.id && where.sessionId === "session_1" && where.userId === ownerId ? { ...target } : null
         }
@@ -122,12 +125,22 @@ function makeDb(options: {
       }),
       create: vi.fn(async (args: unknown) => {
         const data = (args as { data: Row }).data
-        active = { id: String(data.id), source: data.source, status: "queued", revision: 0, input: data.input }
+        active = { id: String(data.id), sessionId: data.sessionId, userId: data.userId, source: data.source, status: "queued", revision: 0, input: data.input }
         turns.push(active)
         return { id: active.id }
       }),
       updateMany: vi.fn(async (args: unknown) => {
         const where = whereOf(args)
+        if (where.revision === undefined) {
+          const current = turns.find((turn) => turn.id === where.id && turn.sessionId === where.sessionId
+            && turn.userId === where.userId && turn.source === where.source)
+          if (!current) return { count: 0 }
+          const data = (args as { data: Row }).data
+          const updated = { ...current, input: data.input }
+          turns = turns.map((turn) => turn.id === current.id ? updated : turn)
+          if (active?.id === current.id) active = updated
+          return { count: 1 }
+        }
         if (!active || where.id !== active.id || where.revision !== active.revision) return { count: 0 }
         const interrupted: Row & { revision: number } = { ...active, status: "interrupted", revision: active.revision + 1 }
         active = interrupted
@@ -313,12 +326,12 @@ function acceptedSteeringRows(count: number): Row[] {
   })
 }
 
-function retryTarget(status = "failed", input: unknown = { goal: "Find backend roles", content: [...content] }) {
-  return { id: "turn_failed", sessionId: "session_1", userId: "user_1", status, source: "user", revision: 4, input }
+function retryTarget(status = "failed", input: unknown = { goal: "Find backend roles", content: [...content] }, source = "user", executionMode: string | null = null) {
+  return { id: "turn_failed", sessionId: "session_1", userId: "user_1", status, source, executionMode, revision: 4, input }
 }
 
-function retryCommand(clientMessageId: string, expectedRevision: number | null = 4) {
-  return { sessionId: "session_1", userId: "user_1", clientMessageId, source: "user" as const, targetTurnId: "turn_failed", expectedRevision }
+function retryCommand(clientMessageId: string, expectedRevision: number | null = 4, source: "user" | "automation" = "user", targetTurnId = "turn_failed") {
+  return { sessionId: "session_1", userId: "user_1", clientMessageId, source, targetTurnId, expectedRevision }
 }
 
 function replacementCommand(clientMessageId: string, expectedTurnId: string, expectedRevision = 0, source: "user" | "automation" = "user") {
@@ -1144,6 +1157,7 @@ describe("AgentCommandService", () => {
     expect(fake.state.active).toMatchObject({ status: "queued", source: "user" })
     expect(fake.state.active).toMatchObject({ input: { goal: "Canonical persisted retry objective", content } })
     expect(fake.state.active?.input).not.toHaveProperty("intent")
+    expect(fake.state.active?.input).not.toHaveProperty("retryLineage")
     expect(fake.state.inputs).toHaveLength(1)
     expect(fake.state.inputs[0]).toMatchObject({ delivery: "follow_up", content })
     expect(fake.state.events.map(event => event.type)).toEqual(["turn.started", "input.accepted"])
@@ -1153,7 +1167,7 @@ describe("AgentCommandService", () => {
   it("preserves server-owned discovery intent when retrying a failed Turn", async () => {
     const intent = { kind: "interactive_discovery_shortlist", version: 1 } as const
     const input = { goal: "Retry discovery", content: [...content], intent }
-    const fake = makeDb({ retryTarget: retryTarget("failed", input) })
+    const fake = makeDb({ retryTarget: retryTarget("failed", input, "user", "canonical_task_graph") })
 
     await new AgentCommandService(fake.db).retry(retryCommand("retry_discovery"))
 
@@ -1172,7 +1186,7 @@ describe("AgentCommandService", () => {
       intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
       verificationRequirements,
     }
-    const fake = makeDb({ retryTarget: retryTarget("failed", input) })
+    const fake = makeDb({ retryTarget: retryTarget("failed", input, "user", "canonical_task_graph") })
 
     await new AgentCommandService(fake.db).retry(retryCommand("retry_objective"))
 
@@ -1182,6 +1196,10 @@ describe("AgentCommandService", () => {
       intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
       verificationRequirements,
     })
+    expect(fake.state.active?.input).toMatchObject({ retryLineage: {
+      schemaVersion: "agent-harness.v2.retry-lineage.v1", predecessorTurnId: "turn_failed",
+      acceptedInputId: fake.state.inputs[0]?.id, acceptedSequence: String(fake.state.inputs[0]?.acceptedSequence),
+    } })
   })
 
   it("retries location verification requirements when the capability gate is enabled", async () => {
@@ -1270,15 +1288,51 @@ describe("AgentCommandService", () => {
   })
 
   it("returns the original result for a duplicate retry without new durable facts", async () => {
-    const fake = makeDb({ retryTarget: retryTarget() })
+    const fake = makeDb({ retryTarget: retryTarget("failed", {
+      goal: "Plan and execute the objective", content: [...content], intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+    }, "user", "canonical_task_graph") })
     const service = new AgentCommandService(fake.db)
     const first = await service.retry(retryCommand("retry_duplicate"))
+    const receipt = (fake.state.active?.input as Row | undefined)?.retryLineage
     const second = await service.retry(retryCommand("retry_duplicate", 999))
 
     expect(second).toMatchObject({ disposition: "duplicate", originalDisposition: "started", turnId: first.turnId, inputId: first.inputId, sequence: first.sequence })
+    expect((fake.state.active?.input as Row | undefined)?.retryLineage).toEqual(receipt)
+    expect(fake.tx.agentTurn.updateMany).toHaveBeenCalledTimes(1)
     expect(fake.state.inputs).toHaveLength(1)
     expect(fake.state.events).toHaveLength(2)
     expect(fake.state.outbox.filter(entry => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+  })
+
+  it("replaces lineage with the immediate predecessor on an explicit repeat retry", async () => {
+    const input = { goal: "Plan and execute the objective", content: [...content], intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT }
+    const first = makeDb({ retryTarget: retryTarget("failed", input, "user", "canonical_task_graph") })
+    const firstResult = await new AgentCommandService(first.db).retry(retryCommand("retry_first"))
+    const secondTarget = { ...retryTarget("failed", first.state.active?.input, "user", "canonical_task_graph"), id: firstResult.turnId }
+    const second = makeDb({ retryTarget: secondTarget })
+
+    const secondResult = await new AgentCommandService(second.db).retry(retryCommand("retry_second", 4, "user", firstResult.turnId))
+
+    expect(second.state.active?.input).toMatchObject({ retryLineage: {
+      schemaVersion: "agent-harness.v2.retry-lineage.v1", predecessorTurnId: firstResult.turnId,
+      acceptedInputId: second.state.inputs[0]?.id, acceptedSequence: String(second.state.inputs[0]?.acceptedSequence),
+    } })
+    expect(secondResult.turnId).not.toBe(firstResult.turnId)
+  })
+
+  it("does not add lineage for automation sourced retries or noncanonical predecessors", async () => {
+    const objective = { goal: "Plan and execute the objective", content: [...content], intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT }
+    const commandAutomation = makeDb({ retryTarget: retryTarget("failed", objective, "user", "canonical_task_graph") })
+    await new AgentCommandService(commandAutomation.db).retry(retryCommand("retry_automation_command", 4, "automation"))
+    expect(commandAutomation.state.active?.input).not.toHaveProperty("retryLineage")
+
+    const scheduled = makeDb({ retryTarget: retryTarget("failed", objective, "automation", "canonical_task_graph") })
+    await new AgentCommandService(scheduled.db).retry(retryCommand("retry_automation_source"))
+    expect(scheduled.state.active?.input).not.toHaveProperty("retryLineage")
+
+    const legacy = makeDb({ retryTarget: retryTarget("failed", objective, "user", "legacy_pipeline_adapter") })
+    await new AgentCommandService(legacy.db).retry(retryCommand("retry_legacy_mode"))
+    expect(legacy.state.active?.input).not.toHaveProperty("retryLineage")
   })
 
   it("rejects an active conflict, invalid target, ownership mismatch, and malformed persisted input", async () => {
