@@ -366,6 +366,7 @@ describe("createGraphTasks", () => {
     const query = vi.fn(async (sql: string, values?: unknown[]) => {
       const admission = ownedTurnScopeRow(sql, values)
       if (admission) return admission
+      if (sql.includes('turn."executionMode" AS "turnExecutionMode"')) return { rows: [], rowCount: 0 }
       if (sql.includes('SELECT "id", "rootTaskId", "parentTaskId", "path"')) return { rows: [{
         id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running",
         allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],

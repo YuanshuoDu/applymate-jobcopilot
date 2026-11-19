@@ -16,6 +16,7 @@ export interface ActiveTurnDto {
   status: ActiveTurnStatus
   revision: number
   goal?: string
+  canSteerLocation?: true
 }
 
 export interface AgentTurnsResponse {
@@ -52,7 +53,12 @@ export function parseActiveTurn(value: unknown): ActiveTurnDto | null {
   if (!id || typeof status !== 'string' || !ACTIVE_TURN_STATUSES.has(status as ActiveTurnStatus)) return null
   if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0) return null
   const goal = typeof row.goal === 'string' && row.goal.trim() ? row.goal : undefined
-  return { id, status: status as ActiveTurnStatus, revision, ...(goal ? { goal } : {}) }
+  return {
+    id, status: status as ActiveTurnStatus, revision,
+    ...(goal ? { goal } : {}),
+    ...(row.canSteerLocation === true && (status === 'in_progress' || status === 'waiting_for_dependency')
+      ? { canSteerLocation: true as const } : {}),
+  }
 }
 
 export function parseAgentTurnsResponse(value: unknown): AgentSessionState {
