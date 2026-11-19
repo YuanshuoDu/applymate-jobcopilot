@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 // @ts-expect-error Fixture-only JavaScript module has no declaration; Vitest resolves the import at runtime.
-import { classifyWaitTaskAliases, compareWaitTaskIds, isSafeParentResumeDiagnostic, parentResumeFixtureErrorClass } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
+import { childResumeInvocationCorrelation, classifyWaitTaskAliases, compareWaitTaskIds, isSafeParentResumeDiagnostic, parentResumeFixtureErrorClass } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 
 type ToolPair = Readonly<{ callId: string; output: unknown; isError: boolean }>
 type PairApi = Readonly<{
@@ -170,6 +170,18 @@ describe("nested Scout parent resume diagnostics", () => {
     expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:p1143_fixture_tool_pair_request_invalid")).toBe(false)
     expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:p1143_fixture_tool_pair_call_invalid")).toBe(false)
     expect(isSafeParentResumeDiagnostic("P1143_PARENT_RESUME_ERROR:wait_input_parse:p1143_fixture_wait_input_invalid")).toBe(false)
+  })
+})
+
+describe("nested Scout child resume invocation correlation", () => {
+  it("binds a bounded per-worker ordinal to the fixed fixture mode", () => {
+    expect(childResumeInvocationCorrelation("resume", 1)).toBe("resume:1")
+    expect(childResumeInvocationCorrelation("resume", 2)).toBe("resume:2")
+    expect(childResumeInvocationCorrelation("crash-child", 1)).toBe("crash-child:1")
+    expect(childResumeInvocationCorrelation("park", 4_096)).toBe("park:4096")
+    expect(childResumeInvocationCorrelation("resume", 4_097)).toBe("resume:overflow")
+    expect(childResumeInvocationCorrelation("unknown", 1)).toBeNull()
+    expect(childResumeInvocationCorrelation("resume", 0)).toBe("resume:overflow")
   })
 })
 

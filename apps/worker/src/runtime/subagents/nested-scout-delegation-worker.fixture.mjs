@@ -11,7 +11,7 @@ import { commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.
 import { createProductionWorkerBootstrap } from "../../queue/production-bootstrap.ts"
 import { createSubagentQueue } from "../../queue/subagent-queue.ts"
 import { enqueueTurn } from "../turns/turn-queue.ts"
-import { createCrashFixtureExecutor, createNestedScoutFixtureScripts } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
+import { childResumeInvocationCorrelation, createCrashFixtureExecutor, createNestedScoutFixtureScripts } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 import { installWaitResolverDiagnostics } from "./nested-scout-wait-resolver-logging.mjs"
 const [, , mode, rawIds, leaseProfile] = process.argv, ids = JSON.parse(rawIds)
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 10 })
@@ -282,10 +282,13 @@ async function start(mode) {
   })
   const markerState = { closedStepRejected: false, parallelObserved: false }
   let resumeLoaderDiagnosticCount = 0
+  let resumeLoaderInvocationSequence = 0
   const executeChild = createProductionChildExecutor({ pool, subagentManager: () => runtime.manager,
     authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
       settle: async () => undefined, settleUnknown: async () => undefined }), jobDiscoveryClient: discoveryClient(),
     resumeLoader: async lease => {
+      const invocation = childResumeInvocationCorrelation(mode, ++resumeLoaderInvocationSequence)
+      const taskAlias = fixtureTaskAlias(lease)
       let stage = "repair_consumed_waits", connection = 0
       const repairStartedAt = Date.now()
       const repairStartedAtMonotonic = performance.now()
@@ -348,13 +351,13 @@ async function start(mode) {
       } }).resumeLoader
       try { return await loader(lease) }
       catch (error) {
-        if (resumeLoaderDiagnosticCount < MAX_LEASE_DIAGNOSTICS) {
+        if (invocation && resumeLoaderDiagnosticCount < MAX_LEASE_DIAGNOSTICS) {
           resumeLoaderDiagnosticCount += 1
           const validationStage = error && typeof error === "object" && SAFE_WAIT_RESUME_DIAGNOSTIC_STAGES.has(error.sourceLifecycleStage) ? error.sourceLifecycleStage : error && typeof error === "object" && SAFE_WAIT_RESUME_DIAGNOSTIC_STAGES.has(error.resumeValidationStage) ? error.resumeValidationStage : "other"
           try {
-            say(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseDiagnostic(lease), stage, errorCode: recoveryErrorClass(error, true), validationStage })}`)
+            say(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${JSON.stringify({ invocation, ...safeLeaseDiagnostic(lease, taskAlias), stage, errorCode: recoveryErrorClass(error, true), validationStage })}`)
             if (stage === "repair_consumed_waits") say(`P1143_REPAIR_LEASE_ROW_DIAGNOSTIC:${JSON.stringify({
-              task: fixtureTaskAlias(lease), attempt: boundedAttempt(lease.attemptCount),
+              invocation, task: taskAlias, attempt: boundedAttempt(lease.attemptCount),
               leaseVersion: boundedAttempt(lease.attemptCount), leaseVersionSource: "attemptCount",
               guard: error?.message === "Child task lease is stale" ? "row_lease_stale"
                 : error?.message === "Current child lease expired during consumed wait repair" ? "post_query_lease_lost"
@@ -366,7 +369,7 @@ async function start(mode) {
             if (stage === "repair_consumed_waits") {
               repairTimings.elapsedMs = boundedDurationMs(repairStartedAtMonotonic)
               say(`P1143_REPAIR_TIMING_DIAGNOSTIC:${JSON.stringify({
-                task: fixtureTaskAlias(lease), attempt: boundedAttempt(lease.attemptCount),
+                invocation, task: taskAlias, attempt: boundedAttempt(lease.attemptCount),
                 leaseVersion: boundedAttempt(lease.attemptCount), leaseVersionSource: "attemptCount", ...repairTimings,
               })}`)
             }

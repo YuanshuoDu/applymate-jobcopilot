@@ -309,11 +309,17 @@ function safeFixtureLeaseFields(payload: Record<string, unknown>): boolean {
     && SAFE_FIXTURE_EXPIRY_BUCKETS.includes(payload.expiryBucket as typeof SAFE_FIXTURE_EXPIRY_BUCKETS[number])
 }
 
+function safeLoaderInvocation(value: unknown): boolean {
+  const match = typeof value === "string" ? value.match(/^(?:park|crash-child|resume):([1-9]\d{0,3}|overflow)$/) : null
+  return !!match && (match[1] === "overflow" || Number(match[1]) <= 4_096)
+}
+
 function isSafeChildResumeLoaderDiagnostic(value: string): boolean {
   const payload = safeDiagnosticPayload(value, "P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:")
   if (!payload || !safeFixtureLeaseFields(payload)) return false
-  const exactKeys = ["task", "attempt", "leaseVersion", "leaseVersionSource", "status", "leaseState", "ownerFence", "attemptFence", "expiryBucket", "stage", "errorCode", "validationStage"]
+  const exactKeys = ["invocation", "task", "attempt", "leaseVersion", "leaseVersionSource", "status", "leaseState", "ownerFence", "attemptFence", "expiryBucket", "stage", "errorCode", "validationStage"]
   return Object.keys(payload).sort().join("|") === exactKeys.sort().join("|")
+    && safeLoaderInvocation(payload.invocation)
     && SAFE_CHILD_RESUME_LOADER_STAGES.includes(payload.stage as typeof SAFE_CHILD_RESUME_LOADER_STAGES[number])
     && SAFE_CHILD_RESUME_LOADER_CODES.includes(payload.errorCode as typeof SAFE_CHILD_RESUME_LOADER_CODES[number])
     && SAFE_CHILD_RESUME_VALIDATION_STAGES.includes(payload.validationStage as typeof SAFE_CHILD_RESUME_VALIDATION_STAGES[number])
@@ -340,10 +346,11 @@ function isSafeTaskClaimDiagnostic(value: string): boolean {
 function isSafeRepairLeaseRowDiagnostic(value: string): boolean {
   const payload = safeDiagnosticPayload(value, "P1143_REPAIR_LEASE_ROW_DIAGNOSTIC:")
   if (!payload) return false
-  const exactKeys = ["task", "attempt", "leaseVersion", "leaseVersionSource", "guard", "present", "status", "rowAttempt", "leaseState",
+  const exactKeys = ["invocation", "task", "attempt", "leaseVersion", "leaseVersionSource", "guard", "present", "status", "rowAttempt", "leaseState",
     "ownerFence", "attemptFence", "scopeFence", "expiryAtRepairStart", "expiryAtRowRead", "interruptRequested"]
   const attemptOk = (entry: unknown) => entry === "other" || (typeof entry === "number" && Number.isInteger(entry) && entry >= 0 && entry <= 3)
   return Object.keys(payload).sort().join("|") === exactKeys.sort().join("|")
+    && safeLoaderInvocation(payload.invocation)
     && SAFE_FIXTURE_TASK_ALIASES.includes(payload.task as typeof SAFE_FIXTURE_TASK_ALIASES[number])
     && attemptOk(payload.attempt) && attemptOk(payload.leaseVersion) && attemptOk(payload.rowAttempt)
     && payload.leaseVersionSource === "attemptCount"
@@ -362,12 +369,13 @@ function isSafeRepairLeaseRowDiagnostic(value: string): boolean {
 function isSafeRepairTimingDiagnostic(value: string): boolean {
   const payload = safeDiagnosticPayload(value, "P1143_REPAIR_TIMING_DIAGNOSTIC:")
   if (!payload) return false
-  const exactKeys = ["task", "attempt", "leaseVersion", "leaseVersionSource", "poolConnectMs", "beginMs", "userConfigMs", "sessionLockQueryMs",
+  const exactKeys = ["invocation", "task", "attempt", "leaseVersion", "leaseVersionSource", "poolConnectMs", "beginMs", "userConfigMs", "sessionLockQueryMs",
     "taskRowQueryMs", "consumedWaitScanMs", "repairSourceQueryCount", "repairSourceQueryTotalMs", "repairSourceQueryMaxMs",
     "finalLeaseFenceQueryMs", "commitMs", "queryCount", "totalQueryMs", "elapsedMs"]
   const durationOk = (entry: unknown) => entry === null || typeof entry === "number" && Number.isInteger(entry) && entry >= 0 && entry <= 120_000
   const countOk = (entry: unknown) => typeof entry === "number" && Number.isInteger(entry) && entry >= 0 && entry <= 4_096
   return Object.keys(payload).sort().join("|") === exactKeys.sort().join("|")
+    && safeLoaderInvocation(payload.invocation)
     && SAFE_FIXTURE_TASK_ALIASES.includes(payload.task as typeof SAFE_FIXTURE_TASK_ALIASES[number])
     && (payload.attempt === "other" || typeof payload.attempt === "number" && Number.isInteger(payload.attempt) && payload.attempt >= 0 && payload.attempt <= 3)
     && (payload.leaseVersion === "other" || typeof payload.leaseVersion === "number" && Number.isInteger(payload.leaseVersion) && payload.leaseVersion >= 0 && payload.leaseVersion <= 3)
@@ -1824,17 +1832,24 @@ describePg("nested Scout delegation: disposable Worker and PostgreSQL", () => {
   it("reclaims a claimed Scout child after a pre-model Worker crash and joins source-bound children across Worker restart", async () => {
     const safeLeaseFields = { task: "depth_two_scout_alpha", attempt: 2, leaseVersion: 2, leaseVersionSource: "attemptCount",
       status: "running", leaseState: "expired", ownerFence: "match", attemptFence: "match", expiryBucket: "expired" }
-    expect(isSafeChildResumeLoaderDiagnostic(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseFields,
+    const safeInvocation = { invocation: "resume:3" }
+    expect(isSafeChildResumeLoaderDiagnostic(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${JSON.stringify({ ...safeInvocation, ...safeLeaseFields,
       stage: "child_attempt_resume", errorCode: "child_resume_owner_mismatch", validationStage: "lease_fence" })}`)).toBe(true)
+    expect(isSafeChildResumeLoaderDiagnostic(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${JSON.stringify({ ...safeInvocation, ...safeLeaseFields,
+      stage: "repair_consumed_waits", errorCode: "wait_scope_error", validationStage: "lease_fence" })}`)).toBe(true)
+    expect(isSafeChildResumeLoaderDiagnostic(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseFields,
+      stage: "child_attempt_resume", errorCode: "child_resume_owner_mismatch", validationStage: "lease_fence" })}`)).toBe(false)
+    expect(isSafeChildResumeLoaderDiagnostic(`P1143_CHILD_RESUME_LOADER_DIAGNOSTIC:${JSON.stringify({ ...safeInvocation, ...safeLeaseFields,
+      invocation: "fixture-id-sentinel", stage: "child_attempt_resume", errorCode: "child_resume_owner_mismatch", validationStage: "lease_fence" })}`)).toBe(false)
     expect(isSafeHeartbeatDiagnostic(`P1143_HEARTBEAT_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseFields, outcome: "lost", elapsedMs: 50 })}`)).toBe(true)
     expect(isSafeTaskClaimDiagnostic(`P1143_TASK_CLAIM_DIAGNOSTIC:${JSON.stringify({ ...safeLeaseFields, outcome: "claimed", elapsedMs: 50 })}`)).toBe(true)
     expect(isSafeRepairLeaseRowDiagnostic(`P1143_REPAIR_LEASE_ROW_DIAGNOSTIC:${JSON.stringify({
-      task: "depth_two_scout_alpha", attempt: 2, leaseVersion: 2, leaseVersionSource: "attemptCount", guard: "row_lease_stale",
+      ...safeInvocation, task: "depth_two_scout_alpha", attempt: 2, leaseVersion: 2, leaseVersionSource: "attemptCount", guard: "row_lease_stale",
       present: true, status: "running", rowAttempt: 2, leaseState: "expired", ownerFence: "match", attemptFence: "match",
       scopeFence: "match", expiryAtRepairStart: "expired", expiryAtRowRead: "expired", interruptRequested: "absent",
     })}`)).toBe(true)
     expect(isSafeRepairTimingDiagnostic(`P1143_REPAIR_TIMING_DIAGNOSTIC:${JSON.stringify({
-      task: "depth_two_scout_alpha", attempt: 2, leaseVersion: 2, leaseVersionSource: "attemptCount",
+      ...safeInvocation, task: "depth_two_scout_alpha", attempt: 2, leaseVersion: 2, leaseVersionSource: "attemptCount",
       poolConnectMs: 1, beginMs: 1, userConfigMs: 1, sessionLockQueryMs: 2_500, taskRowQueryMs: 1,
       consumedWaitScanMs: 1, repairSourceQueryCount: 8, repairSourceQueryTotalMs: 20, repairSourceQueryMaxMs: 8,
       finalLeaseFenceQueryMs: 1, commitMs: null, queryCount: 16, totalQueryMs: 2_600, elapsedMs: 2_700,

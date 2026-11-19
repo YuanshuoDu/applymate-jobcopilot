@@ -6,6 +6,14 @@ import { findExactToolResult, findUniqueWaitInput } from "./nested-scout-fixture
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null }
 const MAX_DIAGNOSTIC_TASK_IDS = 8
 const MAX_DIAGNOSTIC_TASK_ID_LENGTH = 256
+const SAFE_RESUME_WORKER_MODES = new Set(["park", "crash-child", "resume"])
+const MAX_RESUME_LOADER_INVOCATION = 4_096
+export function childResumeInvocationCorrelation(mode, sequence) {
+  if (!SAFE_RESUME_WORKER_MODES.has(mode)) return null
+  const ordinal = Number.isSafeInteger(sequence) && sequence > 0 && sequence <= MAX_RESUME_LOADER_INVOCATION
+    ? String(sequence) : "overflow"
+  return `${mode}:${ordinal}`
+}
 export function compareWaitTaskIds(expectedTaskIds, actualTaskIds, expectedByAlias) {
   const boundedStrings = value => Array.isArray(value) && value.length <= MAX_DIAGNOSTIC_TASK_IDS
     && value.every(id => typeof id === "string" && id.length > 0 && id.length <= MAX_DIAGNOSTIC_TASK_ID_LENGTH)
