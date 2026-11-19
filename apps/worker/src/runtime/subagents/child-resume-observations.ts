@@ -8,6 +8,7 @@ import { dateValue, DurableSubagentWaitError, object as waitObject, safeSubagent
 import { markCanonicalSubagentWaitId, markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
 import { buildChildResumeReplayReceipts, type ChildResumeReplayPair, type ChildResumeReplayReceiptSet } from "./child-resume-replay-receipts.js"
 import { redactJobReadOutput } from "../tools/job-read-output-redaction.js"
+import { prepareScoutResultsOutput } from "../tools/scout-results-output-redaction.js"
 import { isSubagentTaskId } from "../tools/redaction.js"
 import { createDurableDiscoveryAssembly, parseDurableDiscoveryReference, reduceDurableDiscoveryChunk, type DurableDiscoveryAssembly } from "./child-durable-discovery.js"
 
@@ -119,7 +120,7 @@ export function buildChildResumeObservations(rows: readonly Row[], lease: Subage
 export function projectChildResumeObservations(replay: ChildResumeReplayReceiptSet,
   delegateResults?: ReadonlyMap<string, RestoredScoutDelegate>): ChildResumeObservationSet {
   if (replay.pairs.length > MAX_RESTORED_OBSERVATIONS) throw new Error("child_resume_observation_limit")
-  const verifiedReads = verifiedDiscoveryReadPairs(replay.pairs)
+  const verifiedScoutResults = new Set(replay.childToolReplayReceipts.filter(receipt => receipt.toolName === "scout.results" && receipt.result.status === "completed" && receipt.result.errorCode === null).map(receipt => receipt.resultItem.id)), verifiedReads = verifiedDiscoveryReadPairs(replay.pairs)
   const restored = replay.pairs.map((item, index) => {
     const delegate = item.toolName === "scout.delegate" && item.status === "completed" ? delegateResults?.get(item.resultItemId) : undefined
     if (delegate && (!isSubagentTaskId(delegate.taskId) || delegate.status !== "queued" && delegate.status !== "duplicate")) throw new Error("child_resume_delegate_receipt_unavailable")
@@ -127,6 +128,7 @@ export function projectChildResumeObservations(replay: ChildResumeReplayReceiptS
       input: boundedJson(item.input, MAX_TOOL_INPUT_BYTES), status: item.status,
       output: delegate ? boundedNormalizedJson({ taskId: delegate.taskId, status: delegate.status }, MAX_TOOL_OUTPUT_BYTES)
         : item.toolName === "jobs.discover" ? boundedDiscoveryJson(item.output, MAX_TOOL_OUTPUT_BYTES)
+          : item.toolName === "scout.results" && item.status === "completed" && verifiedScoutResults.has(item.resultItemId) ? boundedNormalizedJson(prepareScoutResultsOutput(item.output) ?? safeJson(item.output), MAX_TOOL_OUTPUT_BYTES)
           : item.toolName === "tool_results.read" && verifiedReads.has(index) ? boundedNormalizedJson(item.output as RepositoryJsonValue, MAX_TOOL_OUTPUT_BYTES) : boundedJson(item.output, MAX_TOOL_OUTPUT_BYTES),
       errorCode: item.status === "completed" ? null : "tool_execution_failed" } }
   })
@@ -200,7 +202,6 @@ export function mergeDurableWaitObservation(observations: readonly ContextSeedBl
   return [...observations.filter(observation => observation.id !== sourceObservationId
     && object(observation.content)?.toolCallId !== wait.toolCallId), item]
 }
-
 function inputIdsOf(value: unknown): string[] {
   const input = object(value)
   if (!input || !exactKeys(input, ["idempotencyKey", "taskIds", "mode", "timeoutMs"])
@@ -212,7 +213,6 @@ function inputIdsOf(value: unknown): string[] {
     || Number(input.timeoutMs) < 1 || Number(input.timeoutMs) > 30_000) throw new Error("child_resume_invalid_wait_input")
   return input.taskIds as string[]
 }
-
 export function sameIds(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && new Set(left).size === left.length && new Set(right).size === right.length && left.every(id => right.includes(id))
 }
