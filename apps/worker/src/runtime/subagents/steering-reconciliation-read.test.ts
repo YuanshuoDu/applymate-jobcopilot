@@ -663,6 +663,8 @@ describe("durable steering reconciliation reader", () => {
     const f = cursorFixture({ entries, currentStepId: "current-step", currentOrdinal: 7, currentCursor: "30", currentRevision: 6, inputs: steers, consumers })
     const state = await readSteeringReconciliationState(f.client, { ...scope, stepId: "current-step" })
     expect(state.latestUserRevision).toEqual({ resultingRevision: 5, stepId: "user-revise-two", inputThroughSequence: 20n,
+      decisionStepOrdinal: 3, decisionStepAttempt: 1,
+      acceptedSteerInputs: [{ id: "steer-two", acceptedSequence: 20n }],
       soleSteerSequence: 20n, previousUserRevisionInputThroughSequence: 10n })
     expect(state.lastReconciledInputThroughSequence).toBe(30n)
     expect(state.unresolvedInputs).toEqual([])
@@ -676,7 +678,9 @@ describe("durable steering reconciliation reader", () => {
       attempt: 1, status: "completed", inputThroughSequence: steer.acceptedSequence, consumedInputIds: [steer.id] }))
     const f = cursorFixture({ entries, currentStepId: "later-step", currentOrdinal: 2, currentCursor: "11", inputs: steers, consumers })
     const state = await readSteeringReconciliationState(f.client, { ...scope, stepId: "later-step" })
-    expect(state.latestUserRevision).toEqual({ resultingRevision: 3, stepId: "multi-revise", inputThroughSequence: 11n })
+    expect(state.latestUserRevision).toEqual({ resultingRevision: 3, stepId: "multi-revise", inputThroughSequence: 11n,
+      decisionStepOrdinal: 1, decisionStepAttempt: 1,
+      acceptedSteerInputs: [{ id: "steer-a", acceptedSequence: 10n }, { id: "steer-b", acceptedSequence: 11n }] })
     expect(state.lastReconciledInputThroughSequence).toBe(11n)
   })
 

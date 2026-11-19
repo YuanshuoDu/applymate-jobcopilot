@@ -5,6 +5,8 @@ import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-grap
 import type { TaskGraphObjectiveLineageNode } from "../planning/task-graph-objective-lineage.js"
 import { loadTaskGraph, type LoadedGraph } from "./task-graph-pg-state.js"
 import { readTaskGraphConfirmedLocationSteer } from "./task-graph-confirmed-location-steer.js"
+import { readTaskGraphConfirmedLocationBatch } from "./task-graph-confirmed-location-batch.js"
+import type { TaskGraphConfirmedLocationBatchResult } from "./task-graph-confirmed-location-batch.js"
 import { resolveTaskGraphCurrentLocationEvidence, type TaskGraphCurrentLocationEvidenceResult } from "./task-graph-current-location-evidence.js"
 import type { TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import { readSteeringReconciliationState } from "./steering-reconciliation-read.js"
@@ -44,6 +46,18 @@ export async function evaluateTaskGraphPlanObjectiveCoverage(input: CoverageInpu
   const steer = await readTaskGraphConfirmedLocationSteer(input.client, steerScope, cutoff)
   if (steer.kind === "pending") return unavailable("task_graph_current_location_steer_pending")
   if (steer.kind !== "confirmed") return unavailable("task_graph_current_location_steer_unavailable")
+  let effectiveSteer: typeof steer | Extract<TaskGraphConfirmedLocationBatchResult, { kind: "confirmed" }> = steer
+  if (input.prepared && Array.isArray(input.prepared.steerInputIds) && input.prepared.steerInputIds.length > 1) {
+    const batch = await readTaskGraphConfirmedLocationBatch({ client: input.client, scope: input.input.scope,
+      consumedThroughSequence: cutoff, prepared: input.prepared, reconciliation })
+    if (batch.kind === "confirmed") {
+      if (batch.acceptedInputId !== steer.acceptedInputId || batch.acceptedInputSequence !== steer.acceptedInputSequence
+        || JSON.stringify(batch.locations) !== JSON.stringify(steer.locations)) {
+        return unavailable("task_graph_current_location_steer_unavailable")
+      }
+      effectiveSteer = batch
+    }
+  }
   const loaded = await loadTaskGraph(input.client, input.input.scope, false, {
     includeSourceProvenance: true, currentStepId: input.input.scope.stepId,
     currentStepAttempt: 1,
@@ -52,13 +66,14 @@ export async function evaluateTaskGraphPlanObjectiveCoverage(input: CoverageInpu
   const retiredNodeKeys = new Set(retiredScouts.keys())
   const pending = input.prepared
     ? classifyPendingSupersededScouts({ loaded, scope: input.input.scope, reconciliation, prepared: input.prepared,
-      confirmed: steer, expectedRevision: input.input.proposal.expectedRevision, nodes: input.nodes })
+      confirmed: effectiveSteer, expectedRevision: input.input.proposal.expectedRevision, nodes: input.nodes })
     : { status: "available" as const, pendingNodeKeys: new Set<string>() }
   const pendingNodeKeys = pending.status === "available" ? pending.pendingNodeKeys : new Set<string>()
   const evidence = await resolveTaskGraphCurrentLocationEvidence({
     client: input.client, loaded, scope: input.input.scope, initialRequirements: requirements,
-    verifiedCurrentLocations: steer.locations, acceptedInputSequence: steer.acceptedInputSequence,
-    retainCompatiblePriorScouts: canRetainCompatiblePriorScouts(reconciliation, steer.acceptedInputSequence),
+    verifiedCurrentLocations: effectiveSteer.locations, acceptedInputSequence: effectiveSteer.acceptedInputSequence,
+    retainCompatiblePriorScouts: canRetainCompatiblePriorScouts(reconciliation, effectiveSteer.acceptedInputSequence,
+      "acceptedInputIds" in effectiveSteer ? effectiveSteer : undefined),
     pendingSupersededNodeKeys: pendingNodeKeys, retiredNodeKeys,
   })
   if (evidence.status !== "available") return unavailable("task_graph_current_location_evidence_unavailable")
@@ -70,7 +85,10 @@ export async function evaluateTaskGraphPlanObjectiveCoverage(input: CoverageInpu
     coverageNodes, input.input.templates, input.input.scope.rootTaskId)
 }
 
-export function canRetainCompatiblePriorScouts(state: SteeringReconciliationState, acceptedSequence: bigint): boolean {
+export function canRetainCompatiblePriorScouts(
+  state: SteeringReconciliationState, acceptedSequence: bigint,
+  confirmedBatch?: Extract<TaskGraphConfirmedLocationBatchResult, { kind: "confirmed" }>,
+): boolean {
   const lastReconciled = state.lastReconciledInputThroughSequence
   const latest = state.latestUserRevision
   if (state.unresolvedInputs.length === 0 && latest === undefined
@@ -78,6 +96,25 @@ export function canRetainCompatiblePriorScouts(state: SteeringReconciliationStat
   const solePendingSteer = state.unresolvedInputs.length === 1
     && state.unresolvedInputs[0]?.acceptedSequence === acceptedSequence
   if (solePendingSteer && latest === undefined && (lastReconciled === undefined || lastReconciled < acceptedSequence)) return true
+  const members = latest?.acceptedSteerInputs
+  if (members && members.length > 1) {
+    if (!confirmedBatch || confirmedBatch.acceptedInputSequence !== acceptedSequence
+      || confirmedBatch.acceptedInputIds.length !== members.length || confirmedBatch.acceptedInputSequences.length !== members.length
+      || confirmedBatch.acceptedInputId !== confirmedBatch.acceptedInputIds.at(-1)) return false
+    let previous = 0n
+    const seen = new Set<string>()
+    for (let index = 0; index < members.length; index++) {
+      const member = members[index]!
+      if (!member.id || seen.has(member.id) || typeof member.acceptedSequence !== "bigint" || member.acceptedSequence <= previous
+        || member.acceptedSequence > acceptedSequence || confirmedBatch.acceptedInputIds[index] !== member.id
+        || confirmedBatch.acceptedInputSequences[index] !== member.acceptedSequence) return false
+      seen.add(member.id)
+      previous = member.acceptedSequence
+    }
+    return previous === acceptedSequence && state.unresolvedInputs.length === 0
+      && latest.previousUserRevisionInputThroughSequence === undefined && latest.inputThroughSequence >= acceptedSequence
+      && lastReconciled !== undefined && lastReconciled >= latest.inputThroughSequence
+  }
   return state.unresolvedInputs.length === 0 && latest?.soleSteerSequence === acceptedSequence
     && latest.previousUserRevisionInputThroughSequence === undefined && latest.inputThroughSequence >= acceptedSequence
     && lastReconciled !== undefined && lastReconciled >= latest.inputThroughSequence

@@ -3,22 +3,25 @@ import type { TaskGraphObjectiveLineageNode } from "../planning/task-graph-objec
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { validateTaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import type { TaskGraphConfirmedLocationSteerResult } from "./task-graph-confirmed-location-steer.js"
+import type { TaskGraphConfirmedLocationBatchResult } from "./task-graph-confirmed-location-batch.js"
 import { NESTED_SCOUT_PROFILE_MARKER, templatesForInteractiveScoutDelegation } from "./nested-scout-profile.js"
 import type { TaskGraphExecutionScope, TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
 import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
 import { canonicalTaskGraphJson, taskGraphItemId, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { parseRegisteredScoutEnvelope } from "./task-graph-command-port.js"
-import type { PreparedSteeringReconciliation, SteeringReconciliationState } from "./steering-reconciliation-contract.js"
+import { STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS, type PreparedSteeringReconciliation, type SteeringReconciliationState } from "./steering-reconciliation-contract.js"
 
 type ConfirmedSteer = Extract<TaskGraphConfirmedLocationSteerResult, { kind: "confirmed" }>
+type ConfirmedBatch = Extract<TaskGraphConfirmedLocationBatchResult, { kind: "confirmed" }>
+type Confirmed = ConfirmedSteer | ConfirmedBatch
 type PersistedGraphNodes = NonNullable<ReturnType<typeof graphNodes>>
 type PendingScopeInput = Readonly<{
   loaded: LoadedGraph
   scope: TaskGraphExecutionScope
   reconciliation: SteeringReconciliationState
   prepared: PreparedSteeringReconciliation
-  confirmed: ConfirmedSteer
+  confirmed: Confirmed
   expectedRevision: number
   nodes: readonly TaskGraphObjectiveLineageNode[]
 }>
@@ -79,13 +82,23 @@ function validAuthority(input: PendingScopeInput): boolean {
     || state.latestUserRevision !== undefined
       && (state.latestUserRevision.inputThroughSequence >= confirmed.acceptedInputSequence
         || state.latestUserRevision.resultingRevision > revision)) return false
-  const pending = state.unresolvedInputs.length === 1 ? state.unresolvedInputs[0] : undefined
-  return prepared.steerInputIds.length === 1 && pending?.status === "consumed"
-    && consumerMatchesDecisionStep(pending, state, scope)
-    && pending.acceptedSequence === confirmed.acceptedInputSequence
-    && pending.id === prepared.steerInputIds[0] && pending.id === confirmed.acceptedInputId
+  if (!prepared.steerInputIds.length || prepared.steerInputIds.length > STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS
+    || new Set(prepared.steerInputIds).size !== prepared.steerInputIds.length
+    || prepared.steerInputIds.some((id, index) => !validId(id) || index > 0 && prepared.steerInputIds[index - 1]! >= id)) return false
+  const expected = state.unresolvedInputs.filter(input => input.acceptedSequence <= prepared.inputThroughSequence)
+  if (expected.length !== prepared.steerInputIds.length || state.unresolvedInputs.length !== expected.length
+    || expected.some(input => input.status !== "consumed" || !consumerMatchesDecisionStep(input, state, scope))
+    || [...expected.map(input => input.id)].sort().join("\0") !== prepared.steerInputIds.join("\0")) return false
+  const sequences = "acceptedInputSequences" in confirmed ? confirmed.acceptedInputSequences : [confirmed.acceptedInputSequence]
+  const ids = "acceptedInputIds" in confirmed ? confirmed.acceptedInputIds : [confirmed.acceptedInputId]
+  return sequences.length === ids.length && ids.length === expected.length
+    && new Set(ids).size === ids.length && new Set(sequences).size === sequences.length
+    && sequences.every(sequence => typeof sequence === "bigint" && sequence > 0n && sequence <= MAX_SEQUENCE)
+    && ids.every((id, index) => id === expected.find(input => input.acceptedSequence === sequences[index])?.id)
+    && ids.slice().sort().join("\0") === prepared.steerInputIds.join("\0")
+    && sequences.reduce((max, sequence) => sequence > max ? sequence : max, 0n) === confirmed.acceptedInputSequence
+    && ids.includes(confirmed.acceptedInputId)
 }
-
 function consumerMatchesDecisionStep(
   pending: SteeringReconciliationState["unresolvedInputs"][number], state: SteeringReconciliationState,
   scope: TaskGraphExecutionScope,
@@ -96,9 +109,7 @@ function consumerMatchesDecisionStep(
   if (consumerId === scope.stepId) return consumerOrdinal === decisionOrdinal
   return consumerOrdinal < decisionOrdinal
 }
-
 function validOrdinal(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
-
 function graphNodes(loaded: LoadedGraph, scope: TaskGraphExecutionScope): Array<{
   node: StoredTaskGraphNode; task: GraphTaskRow; checkpoint: bigint
 }> | undefined {

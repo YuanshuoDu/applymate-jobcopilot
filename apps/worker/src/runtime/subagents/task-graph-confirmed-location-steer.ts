@@ -8,6 +8,12 @@ type Row = Record<string, unknown>
 export type TaskGraphConfirmedLocationSteerScope = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string }>
 export type TaskGraphConfirmedLocationSteerResult = Readonly<{ kind: "absent" | "pending" | "unavailable" }>
   | Readonly<{ kind: "confirmed"; locations: readonly string[]; acceptedInputSequence: bigint; acceptedInputId: string }>
+export type TaskGraphConfirmedLocationSteerCandidate = Readonly<{
+  event: Row
+  acceptedRows: readonly Row[]
+  duplicateCount: number
+  stepRows: readonly Row[]
+}>
 const UNAVAILABLE: TaskGraphConfirmedLocationSteerResult = Object.freeze({ kind: "unavailable" })
 const PENDING: TaskGraphConfirmedLocationSteerResult = Object.freeze({ kind: "pending" })
 const INPUT_STATUSES = new Set(["accepted", "queued", "consumed"])
@@ -59,6 +65,19 @@ function canonicalLocations(value: unknown): readonly string[] | null {
   const locations = normalizeAgentLocationAllowlist(receipt.locations)
   return locations && sameJson(locations, receipt.locations) ? locations : null
 }
+function acceptedLocationEvent(event: Row | undefined, scope: TaskGraphConfirmedLocationSteerScope):
+  Readonly<{ sequence: bigint; causationId: string; locations: readonly string[] }> | null {
+  const eventSequence = sequence(event?.sequence), causationId = event?.causationId, locations = canonicalLocations(event?.payload)
+  if (!event || !id(event.id) || eventSequence === null || eventSequence < 1n || event.sessionId !== scope.sessionId
+    || event.turnId !== scope.turnId || event.taskId !== scope.rootTaskId || event.turnRootTaskId !== scope.rootTaskId
+    || event.turnUserId !== scope.userId || event.sessionUserId !== scope.userId
+    || event.type !== OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE || event.actor !== "user" || event.correlationId !== scope.turnId
+    || event.turnSource !== "user" || event.turnExecutionMode !== "canonical_task_graph"
+    || event.itemId !== null || !id(causationId) || !locations) return null
+  const receipt = object(event.payload), acceptedSequence = receipt && validate(ObjectiveLocationSteerReceiptSchema, receipt)
+    ? BigInt((receipt as ObjectiveLocationSteerReceipt).acceptedInputSequence) : null
+  return acceptedSequence !== null && eventSequence > acceptedSequence ? { sequence: acceptedSequence, causationId, locations } : null
+}
 function validScope(scope: TaskGraphConfirmedLocationSteerScope): boolean {
   const value = object(scope)
   return Boolean(value && Object.keys(value).sort().join(",") === "rootTaskId,sessionId,turnId,userId"
@@ -97,6 +116,34 @@ function consumedByOwnedRootStep(row: Row, scope: TaskGraphConfirmedLocationStee
     && new Set(consumedIds).size === consumedIds.length && consumedIds.includes(inputId)
 }
 
+/** Shared strict binding for single and set-based readers. */
+export function validateTaskGraphConfirmedLocationSteerCandidate(
+  candidate: TaskGraphConfirmedLocationSteerCandidate, scope: TaskGraphConfirmedLocationSteerScope,
+  consumedThroughSequence: bigint, exactAcceptedSequence?: bigint,
+): TaskGraphConfirmedLocationSteerResult {
+  try {
+    if (!candidate || !validScope(scope) || typeof consumedThroughSequence !== "bigint"
+      || consumedThroughSequence < 0n || consumedThroughSequence > MAX_SEQUENCE
+      || !Array.isArray(candidate.acceptedRows) || candidate.acceptedRows.length !== 1
+      || !Array.isArray(candidate.stepRows) || !Number.isSafeInteger(candidate.duplicateCount) || candidate.duplicateCount !== 0) return UNAVAILABLE
+    if (exactAcceptedSequence !== undefined && (typeof exactAcceptedSequence !== "bigint"
+      || exactAcceptedSequence < 1n || exactAcceptedSequence > MAX_SEQUENCE)) return UNAVAILABLE
+    const event = candidate.event, acceptedEvent = acceptedLocationEvent(event, scope)
+    if (!acceptedEvent) return UNAVAILABLE
+    const { sequence: acceptedSequence, causationId, locations } = acceptedEvent
+    const input = candidate.acceptedRows[0]!
+    if (exactAcceptedSequence !== undefined && acceptedSequence !== exactAcceptedSequence
+      || !acceptedInputValid(input, scope, causationId, acceptedSequence, locations)) return UNAVAILABLE
+    if (input.status === "consumed") {
+      if (candidate.stepRows.length !== 1 || !consumedByOwnedRootStep(candidate.stepRows[0]!, scope,
+        String(input.inputId), String(input.consumedByStepId), acceptedSequence)) return UNAVAILABLE
+    } else if (candidate.stepRows.length !== 0) return UNAVAILABLE
+    if (acceptedSequence > consumedThroughSequence) return PENDING
+    if (input.status !== "consumed") return UNAVAILABLE
+    return { kind: "confirmed", locations, acceptedInputSequence: acceptedSequence, acceptedInputId: String(input.inputId) }
+  } catch { return UNAVAILABLE }
+}
+
 /** Reads only the latest owner-bound E2 location acceptance; callers supply their trusted Step cutoff. */
 export async function readTaskGraphConfirmedLocationSteer(
   client: Client,
@@ -132,13 +179,8 @@ async function readConfirmedLocationSteer(client: Client, scope: TaskGraphConfir
       : [scope.sessionId, scope.turnId, OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE, scope.userId])
     if (!latest.rows.length) return exact ? UNAVAILABLE : Object.freeze({ kind: "absent" })
     if (latest.rows.length !== 1) return UNAVAILABLE
-    const event = latest.rows[0]!, eventSequence = sequence(event.sequence), causationId = event.causationId
-    const locations = canonicalLocations(event.payload)
-    if (!id(event.id) || eventSequence === null || eventSequence < 1n || event.sessionId !== scope.sessionId || event.turnId !== scope.turnId
-      || event.taskId !== scope.rootTaskId || event.turnRootTaskId !== scope.rootTaskId || event.turnUserId !== scope.userId || event.sessionUserId !== scope.userId
-      || event.type !== OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE || event.actor !== "user" || event.correlationId !== scope.turnId
-      || event.turnSource !== "user" || event.turnExecutionMode !== "canonical_task_graph"
-      || event.itemId !== null || !id(causationId) || !locations) return UNAVAILABLE
+    const event = latest.rows[0]!, causationId = event.causationId
+    if (!acceptedLocationEvent(event, scope)) return UNAVAILABLE
     const duplicates = await client.query<Row>(`SELECT 1 FROM "agent_events" AS event
       JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
       JOIN "agent_sessions" AS session ON session."id" = event."sessionId" AND session."userId" = turn."userId"
@@ -162,12 +204,9 @@ async function readConfirmedLocationSteer(client: Client, scope: TaskGraphConfir
         AND accepted_item."sessionId" = accepted_event."sessionId" AND accepted_item."turnId" = accepted_event."turnId"
       WHERE accepted_event."id" = $1 AND accepted_event."sessionId" = $3 AND accepted_event."turnId" = $4 LIMIT 2`,
     [causationId, scope.userId, scope.sessionId, scope.turnId])
-    const receipt = object(event.payload), acceptedSequence = receipt && validate(ObjectiveLocationSteerReceiptSchema, receipt)
-      ? BigInt((receipt as ObjectiveLocationSteerReceipt).acceptedInputSequence) : null
-    if (accepted.rows.length !== 1 || acceptedSequence === null || exact && acceptedSequence !== exactAcceptedSequence || eventSequence <= acceptedSequence
-      || !acceptedInputValid(accepted.rows[0]!, scope, causationId, acceptedSequence, locations)) return UNAVAILABLE
-    const input = accepted.rows[0]!
-    if (input.status === "consumed") {
+    let steps: Row[] = []
+    const input = accepted.rows[0]
+    if (input?.status === "consumed") {
       const step = await client.query<Row>(`SELECT step."id" AS "stepId", step."sessionId", step."turnId", step."taskId", step."ordinal", step."attempt",
           step."status", step."inputThroughSequence", step."consumedInputIds", turn."rootTaskId" AS "turnRootTaskId",
           turn."userId" AS "turnUserId", session."userId" AS "sessionUserId"
@@ -176,10 +215,10 @@ async function readConfirmedLocationSteer(client: Client, scope: TaskGraphConfir
         WHERE step."id" = $1 AND step."sessionId" = $2 AND step."turnId" = $3 AND step."taskId" = $4
           AND turn."rootTaskId" = $4 AND turn."userId" = $5 AND session."userId" = $5 LIMIT 2`,
       [input.consumedByStepId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.userId])
-      if (step.rows.length !== 1 || !consumedByOwnedRootStep(step.rows[0]!, scope, String(input.inputId), String(input.consumedByStepId), acceptedSequence)) return UNAVAILABLE
+      steps = step.rows
     }
-    if (acceptedSequence > consumedThroughSequence) return PENDING
-    if (input.status !== "consumed") return UNAVAILABLE
-    return { kind: "confirmed", locations, acceptedInputSequence: acceptedSequence, acceptedInputId: String(input.inputId) }
+    return validateTaskGraphConfirmedLocationSteerCandidate({ event, acceptedRows: accepted.rows,
+      duplicateCount: duplicates.rows.length, stepRows: steps }, scope, consumedThroughSequence,
+    exact ? exactAcceptedSequence : undefined)
   } catch { return UNAVAILABLE }
 }

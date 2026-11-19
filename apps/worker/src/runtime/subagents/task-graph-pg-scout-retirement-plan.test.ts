@@ -1,5 +1,13 @@
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { describe, expect, it, vi } from "vitest"
+const batchHarness = vi.hoisted(() => ({ value: null as unknown, calls: [] as unknown[][] }))
+vi.mock("./task-graph-confirmed-location-batch.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./task-graph-confirmed-location-batch.js")>()
+  return { ...actual, readTaskGraphConfirmedLocationBatchForReceipt: (...args: Parameters<typeof actual.readTaskGraphConfirmedLocationBatchForReceipt>) => {
+    batchHarness.calls.push(args)
+    return Promise.resolve(batchHarness.value as Awaited<ReturnType<typeof actual.readTaskGraphConfirmedLocationBatchForReceipt>>)
+  } }
+})
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
 import type { TaskGraphExecutionScope } from "./task-graph-schedule-input.js"
 import { buildTaskGraphSupersededScoutRetirementPlan } from "./task-graph-pg-scout-retirement-plan.js"
@@ -51,7 +59,8 @@ function fixtures(oldLocations: readonly string[] = ["berlin"]) {
       receipt: { status: "accepted", revision: 3, nodes: [{ key: "scout-new", taskId: "task-new", status: "queued" }], readyTaskIds: ["task-new"] },
     } }
   const reconciliationReceipt = { schemaVersion: STEERING_RECONCILIATION_SCHEMA_VERSION, sessionId: "session", turnId: "turn", rootTaskId: "root",
-    stepId: "plan-step", decision: "revise", observedRevision: 2, resultingRevision: 3, steerInputIds: ["steer-input"], inputCheckpoint: { throughSequence: "20" } }
+    stepId: "plan-step", decision: "revise", observedRevision: 2, resultingRevision: 3,
+    steerInputIds: ["steer-a", "steer-input"], inputCheckpoint: { throughSequence: "20" } }
   const reconEvent = { id: "reconcile-event", sequence: "32", type: "agent.plan.reconciliation", actor: "orchestrator", itemId: null,
     taskId: "root", correlationId: "turn", causationId: "plan-step",
     idempotencyKey: steeringReconciliationIdempotencyKey({ ...scope, stepId: "plan-step" }, "plan-call"), payload: reconciliationReceipt, hasOutbox: false }
@@ -60,7 +69,9 @@ function fixtures(oldLocations: readonly string[] = ["berlin"]) {
   const client = { query } as unknown as Pick<PoolClient, "query">
   const reconciliation = { originalInputId: "root-input", currentRevision: 4, decisionStepId: "action-step", decisionStepOrdinal: 3,
     decisionStepAttempt: 1, decisionInputThroughSequence: 25n, agendaPlanRevision: 4,
-    latestUserRevision: { resultingRevision: 3, stepId: "plan-step", inputThroughSequence: 20n, soleSteerSequence: 20n },
+    latestUserRevision: { resultingRevision: 3, stepId: "plan-step", inputThroughSequence: 20n,
+      acceptedSteerInputs: [{ id: "steer-a", acceptedSequence: 10n }, { id: "steer-input", acceptedSequence: 20n }],
+      decisionStepOrdinal: 2, decisionStepAttempt: 1 },
     lastReconciledInputThroughSequence: 20n, unresolvedInputs: [] }
   const confirmed = { kind: "confirmed" as const, locations: ["dublin"], acceptedInputSequence: 20n, acceptedInputId: "steer-input" }
   const input = { client, scope, expectedRevision: 4, taskId: "task-old", callId: "retire-call", loaded, reconciliation, confirmed }
@@ -68,8 +79,20 @@ function fixtures(oldLocations: readonly string[] = ["berlin"]) {
 }
 
 describe("superseded Scout retirement plan", () => {
+  it("rebinds all accepted typed steer members from the original decision Step", async () => {
+    const fixture = fixtures()
+    batchHarness.value = { kind: "confirmed", locations: ["dublin"], acceptedInputSequence: 20n,
+      acceptedInputId: "steer-input", acceptedInputIds: ["steer-a", "steer-input"], acceptedInputSequences: [10n, 20n] }
+    const plan = await buildTaskGraphSupersededScoutRetirementPlan(fixture.input)
+    expect(plan).toMatchObject({ acceptedPlanRevision: 3, acceptedSteerSequence: "20" })
+    expect(batchHarness.calls[0]?.[0]).toMatchObject({ inputIds: ["steer-a", "steer-input"], inputThroughSequence: 20n,
+      decisionStep: { id: "plan-step", ordinal: 2, attempt: 1 } })
+  })
+
   it("rebinds a later action revision to the earlier accepted confirmed plan", async () => {
     const fixture = fixtures()
+    batchHarness.value = { kind: "confirmed", locations: ["dublin"], acceptedInputSequence: 20n,
+      acceptedInputId: "steer-input", acceptedInputIds: ["steer-a", "steer-input"], acceptedInputSequences: [10n, 20n] }
     const plan = await buildTaskGraphSupersededScoutRetirementPlan(fixture.input)
     expect(plan).toMatchObject({ graphRevision: 4, acceptedPlanRevision: 3, nodeKey: "scout-old", taskId: "task-old",
       acceptedSteerSequence: "20", reconciliationStepId: "plan-step", replacementNodeKey: "scout-new", replacementTaskId: "task-new" })
@@ -80,11 +103,15 @@ describe("superseded Scout retirement plan", () => {
 
   it("requires reconciliation to name the exact confirmed steer input", async () => {
     const fixture = fixtures()
+    batchHarness.value = { kind: "confirmed", locations: ["dublin"], acceptedInputSequence: 20n,
+      acceptedInputId: "steer-input", acceptedInputIds: ["steer-a", "steer-input"], acceptedInputSequences: [10n, 20n] }
     await expect(buildTaskGraphSupersededScoutRetirementPlan({ ...fixture.input,
       confirmed: { ...fixture.input.confirmed, acceptedInputId: "different-steer" } })).resolves.toBeNull()
   })
 
   it.each([["overlap", ["dublin"]], ["ambiguous selector", ["remote"]]])("rejects %s old scope", async (_label, locations) => {
+    batchHarness.value = { kind: "confirmed", locations: ["dublin"], acceptedInputSequence: 20n,
+      acceptedInputId: "steer-input", acceptedInputIds: ["steer-a", "steer-input"], acceptedInputSequences: [10n, 20n] }
     expect(await buildTaskGraphSupersededScoutRetirementPlan(fixtures(locations).input)).toBeNull()
   })
 })

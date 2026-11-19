@@ -6,7 +6,7 @@ import { taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey } from "..
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
 import { readTaskGraphRetiredScouts } from "./task-graph-retirement-completion.js"
 
-const harness = vi.hoisted(() => ({ snapshot: null as unknown, confirmed: null as unknown, ackKey: "", steerCalls: [] as unknown[][] }))
+const harness = vi.hoisted(() => ({ snapshot: null as unknown, confirmed: null as unknown, ackKey: "", batchCalls: [] as unknown[][] }))
 vi.mock("../subagents/task-graph-pending-scout-scope.js", () => ({ isOrdinaryRegisteredScout: (_node: unknown, task: unknown) =>
   !!task && typeof task === "object" && (task as { failureReason?: unknown }).failureReason === null }))
 vi.mock("../subagents/task-graph-snapshot.js", async importOriginal => {
@@ -22,17 +22,17 @@ vi.mock("../subagents/task-graph-pg-event-validation.js", async importOriginal =
       ? { type: "task.interrupted", nodeKey: event.nodeKey, idempotencyKey: harness.ackKey } : null
   } }
 })
-vi.mock("../subagents/task-graph-confirmed-location-steer.js", async importOriginal => {
-  const actual = await importOriginal<typeof import("../subagents/task-graph-confirmed-location-steer.js")>()
-  return { ...actual, readTaskGraphConfirmedLocationSteerAtSequence: async (...args: unknown[]) => {
-    harness.steerCalls.push(args)
+vi.mock("../subagents/task-graph-confirmed-location-batch.js", () => ({
+  readTaskGraphConfirmedLocationBatchForReceipt: async (...args: unknown[]) => {
+    harness.batchCalls.push(args)
     return harness.confirmed
-  } }
-})
+  },
+}))
 
 const scope = { userId: "user", sessionId: "session", turnId: "turn", rootTaskId: "root", parentTaskId: "root" }
 const graphId = taskGraphItemId(scope.rootTaskId), planKey = taskGraphProposalKey(scope.rootTaskId, 4)
-const acceptedSteer = { kind: "confirmed", locations: ["dublin"], acceptedInputSequence: 10n, acceptedInputId: "accepted-input" }
+const acceptedSteer = { kind: "confirmed", locations: ["dublin"], acceptedInputSequence: 10n, acceptedInputId: "accepted-input",
+  acceptedInputIds: ["accepted-input"], acceptedInputSequences: [10n] }
 const receiptKey = taskGraphScoutRetirementIdempotencyKeyFromIdentity({ scope: { ...scope, stepId: "action-step" },
   expectedRevision: 8, taskId: "old-task", callId: "retire-call" })!
 const ackKey = taskGraphLifecycleKey(scope.rootTaskId, "old-scout", 2, "task.interrupted")
@@ -110,7 +110,7 @@ function client(callTaskId = "old-task", ackMode: "valid" | "missing" | "wrong" 
   return { query }
 }
 
-afterEach(() => { harness.snapshot = null; harness.confirmed = null; harness.ackKey = ""; harness.steerCalls = [] })
+afterEach(() => { harness.snapshot = null; harness.confirmed = null; harness.ackKey = ""; harness.batchCalls = [] })
 
 describe("task graph retirement completion read", () => {
   it("accepts the committed request and exact Worker ack without requiring a tool result", async () => {
@@ -121,7 +121,9 @@ describe("task graph retirement completion read", () => {
 
     const result = await readTaskGraphRetiredScouts(db as never, scope, loaded(), reconciliation)
     expect(db.query).toHaveBeenCalledTimes(7)
-    expect(harness.steerCalls[0]?.[1]).toEqual({ userId: "user", sessionId: "session", turnId: "turn", rootTaskId: "root" })
+    expect(harness.batchCalls[0]?.[0]).toMatchObject({ scope: { userId: "user", sessionId: "session", turnId: "turn", rootTaskId: "root" },
+      consumedThroughSequence: 10n, inputIds: ["accepted-input"], inputThroughSequence: 10n,
+      decisionStep: { id: "revise-step", ordinal: 6, attempt: 1 } })
     expect(result).toEqual(new Map([[
       "old-scout", { nodeKey: "old-scout", taskId: "old-task", attempt: 2, interruptRequestedAt: receipt.interruptRequestedAt,
         receiptEventId: "retirement-event", lifecycleEventId: "ack-event" },
@@ -129,18 +131,26 @@ describe("task graph retirement completion read", () => {
     expect(db.query.mock.calls.some(([sql]) => String(sql).includes('item."type" = \'tool_result\''))).toBe(false)
   })
 
-  it("retains an acknowledged retirement after its replacement later fails during a newer steer", async () => {
+  it("revalidates the original batch when a later revise becomes the latest user revision", async () => {
     harness.snapshot = snapshot
     harness.confirmed = acceptedSteer
     harness.ackKey = ackKey
-    const laterSteer = { unresolvedInputs: [{ id: "later-input", acceptedSequence: 20n, status: "accepted" }],
-      currentRevision: 8, lastReconciledInputThroughSequence: 10n }
+    const laterSteer = { unresolvedInputs: [], currentRevision: 8, lastReconciledInputThroughSequence: 20n,
+      latestUserRevision: { resultingRevision: 8, stepId: "later-revise-step", inputThroughSequence: 20n,
+        acceptedSteerInputs: [{ id: "later-input", acceptedSequence: 20n }], decisionStepOrdinal: 10, decisionStepAttempt: 1 } }
 
     await expect(readTaskGraphRetiredScouts(client() as never, scope, loaded("interrupted", "Subagent task subtree was interrupted"),
       laterSteer as never)).resolves.toEqual(new Map([[
       "old-scout", { nodeKey: "old-scout", taskId: "old-task", attempt: 2, interruptRequestedAt: receipt.interruptRequestedAt,
         receiptEventId: "retirement-event", lifecycleEventId: "ack-event" },
     ]]))
+  })
+
+  it("does not prove a retirement when the verified batch differs from its original receipt", async () => {
+    harness.snapshot = snapshot
+    harness.confirmed = { ...acceptedSteer, acceptedInputIds: ["later-input"] }
+    harness.ackKey = ackKey
+    await expect(readTaskGraphRetiredScouts(client() as never, scope, loaded(), reconciliation)).resolves.toEqual(new Map())
   })
 
   it.each(["missing", "wrong"] as const)("does not prove retirement with a %s ack", async mode => {

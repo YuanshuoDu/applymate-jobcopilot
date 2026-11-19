@@ -90,14 +90,14 @@ const reconciliation: SteeringReconciliationState = {
     consumedByStepId: scope.stepId, consumingOrdinal: 2 }],
 }
 
-function prepared(): PreparedSteeringReconciliation {
-  const inputIds = ["input-1"], callId = "plan-call-1"
+function prepared(inputIds = ["input-1"], through = acceptedInputSequence): PreparedSteeringReconciliation {
+  const callId = "plan-call-1"
   return {
     scope, callId, decision: "revise", expectedRevision: 1, resultingRevision: 2, steerInputIds: inputIds,
-    inputThroughSequence: acceptedInputSequence, idempotencyKey: steeringReconciliationIdempotencyKey(scope, callId)!,
+    inputThroughSequence: through, idempotencyKey: steeringReconciliationIdempotencyKey(scope, callId)!,
     receipt: { schemaVersion: STEERING_RECONCILIATION_SCHEMA_VERSION, sessionId: scope.sessionId, turnId: scope.turnId,
       rootTaskId: scope.rootTaskId, stepId: scope.stepId, decision: "revise", observedRevision: 1, resultingRevision: 2,
-      steerInputIds: inputIds, inputCheckpoint: { throughSequence: acceptedInputSequence.toString() } },
+      steerInputIds: inputIds, inputCheckpoint: { throughSequence: through.toString() } },
   }
 }
 
@@ -137,6 +137,23 @@ describe("pending superseded Scout scope", () => {
     expect(result).toEqual({ status: "available", pendingNodeKeys: new Set(["old-berlin"]) })
     expect(JSON.stringify(loaded.snapshot)).toBe(before)
     expect([...loaded.tasks.values()].map(task => task.status)).toEqual(["running", "running"])
+  })
+
+  it("admits a multi-steer partition only when every prepared member is in the verified batch", () => {
+    const loaded = { ...loadedGraph([{ key: "old-berlin", taskId: "task-berlin", locations: ["berlin"] }]),
+      currentInputCheckpoint: { inputThroughSequence: 30n } }
+    const state = { ...reconciliation, decisionInputThroughSequence: 30n, unresolvedInputs: [
+      { id: "input-1", acceptedSequence: 20n, status: "consumed" as const, consumedByStepId: scope.stepId, consumingOrdinal: 2 },
+      { id: "input-2", acceptedSequence: 30n, status: "consumed" as const, consumedByStepId: scope.stepId, consumingOrdinal: 2 },
+    ] }
+    const batch = { kind: "confirmed" as const, locations: ["dublin"], acceptedInputSequence: 30n, acceptedInputId: "input-2",
+      acceptedInputIds: ["input-1", "input-2"], acceptedInputSequences: [20n, 30n] }
+    const valid = classifyPendingSupersededScouts({ loaded, scope, reconciliation: state, prepared: prepared(["input-1", "input-2"], 30n),
+      confirmed: batch, expectedRevision: 1, nodes: lineage(loaded) })
+    expect(valid).toEqual({ status: "available", pendingNodeKeys: new Set(["old-berlin"]) })
+    const partial = classifyPendingSupersededScouts({ loaded, scope, reconciliation: state, prepared: prepared(["input-1", "input-2"], 30n),
+      confirmed: { ...batch, acceptedInputIds: ["input-2"], acceptedInputSequences: [30n] }, expectedRevision: 1, nodes: lineage(loaded) })
+    expect(partial).toEqual({ status: "unavailable" })
   })
 
   it("accepts the exact confirmed input consumed by an earlier owned Root Step", () => {
