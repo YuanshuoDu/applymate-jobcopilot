@@ -3,6 +3,7 @@ import { describe, expectTypeOf, it } from "vitest"
 import type { ChildWaitClaimRecovery, ChildWaitOrphanRecovery } from "../subagents/child-durable-wait-replay.js"
 import type { EmptyAnalystCandidateAuthorizer } from "../subagents/task-graph-empty-analyst-candidate.js"
 import type { TurnEngineToolCall } from "./turn-engine-types.js"
+import type { PrepareFinalDependencyWaitInput } from "./turn-execution-options.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions } from "./turn-execution-types.js"
 
 describe("turn execution options type boundary", () => {
@@ -28,5 +29,7 @@ describe("turn execution options type boundary", () => {
     expectTypeOf<TurnExecutionOptions["identity"]>().toEqualTypeOf<TurnExecutionIdentity>()
     expectTypeOf<TurnExecutionOptions["authorizeEmptyAnalystCandidate"]>()
       .toEqualTypeOf<EmptyAnalystCandidateAuthorizer | undefined>()
+    expectTypeOf<PrepareFinalDependencyWaitInput["toolCallAliases"]>()
+      .toEqualTypeOf<ReadonlyMap<string, string> | undefined>()
   })
 })
