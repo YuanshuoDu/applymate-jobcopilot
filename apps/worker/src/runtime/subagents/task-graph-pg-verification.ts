@@ -1,6 +1,6 @@
 import type pg from "pg"
 import { createHash } from "node:crypto"
-import { evaluateTaskGraphVerification, evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst, evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery, taskGraphVerificationDependencyNodeKeys, taskGraphVerificationRole, TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, type TaskGraphVerificationContract, type TaskGraphVerificationEvaluation, type TaskGraphVerificationEvidenceProjection, type TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
+import { evaluateTaskGraphVerification, evaluateTaskGraphVerificationWithExactEmptyScoutResult, evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst, evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery, taskGraphVerificationDependencyNodeKeys, taskGraphVerificationRole, TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, type TaskGraphVerificationContract, type TaskGraphVerificationEvaluation, type TaskGraphVerificationEvidenceProjection, type TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import { parseTaskGraphSnapshot, canonicalTaskGraphJson, type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { createObservedEvidenceIndex, hydrateObservedEvidence, parseAndBindStructuredResult } from "./child-evidence.js"
 import { observedJobLocationProjection } from "./child-observed-job-facts.js"
@@ -9,6 +9,7 @@ import { taskGraphEvidenceDigest, type TaskGraphVerificationScope } from "./task
 import { TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, TASK_GRAPH_VERIFIER_VERSION, type TaskGraphVerificationDependencyBinding, type TaskGraphVerificationReport } from "./task-graph-verification-report.js"
 import { validateRoleResult, type AnalystResult } from "./role-results.js"
 import { completedZeroDiscoveryDigest, emptyAnalystCoverageDigest, hasNoCurrentAttemptTaskGraphToolReceipts } from "./task-graph-empty-analyst-proof.js"
+import { objectiveEmptySearchCriterionIds } from "./task-graph-pg-empty-search-shortfall.js"
 export { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-verification-report.js"
 export type { TaskGraphVerificationScope } from "./task-graph-pg-verification-receipt-validation.js"
 type Queryable = Pick<pg.PoolClient, "query">
@@ -93,8 +94,21 @@ async function verifyTaskGraphEvidenceForStatus(client: Queryable, input: Verify
     let verifiedEmptyDiscoveryDigest: string | undefined
     let projection: TaskGraphVerificationEvidenceProjection
     if (index.entries.size === 0 && role === "scout" && bound.role === "scout" && bound.candidates.length === 0) {
-      const persistedScout = persistedEmptyScoutResult(task.result, input.structuredResult)
-      if (!persistedScout) return unavailable(contract, "canonical_evidence_missing")
+      const objectiveCriterionIds = objectiveEmptySearchCriterionIds({ scope: input.scope, node: storedNode,
+        turnSource: task.turnSource, turnExecutionMode: task.turnExecutionMode, turnInput: task.turnInput, receipts })
+      if (objectiveCriterionIds) {
+        projection = contract.criteria.some(item => item.check.kind === "candidate_location_in")
+          ? { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, role: "scout", candidates: [], evidenceIds: [] }
+          : { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout", candidates: [], evidenceIds: [] }
+        const evaluation = evaluateTaskGraphVerificationWithExactEmptyScoutResult(contract, projection, input.dependencies)
+        if (evaluation.status === "failed" && evaluation.criteria.every(item => item.status !== "unverified")
+          && objectiveCriterionIds.every(id => evaluation.criteria.some(item => item.criterionId === id && item.status === "failed"))) {
+          const resultDigest = taskGraphResultDigest(bound)
+          const digest = taskGraphEvidenceDigest(receipts.items, receipts.outcomes, [], resultDigest, receipts.replayReceipts)
+          return { verified: false, report: report(evaluation, digest, resultDigest), evaluation, projection, structuredResult: bound }
+        }
+      }
+      if (!persistedEmptyScoutResult(task.result, input.structuredResult)) return unavailable(contract, "canonical_evidence_missing")
       verifiedEmptyDiscoveryDigest = await completedZeroDiscoveryDigest(client, input.scope, receipts, task)
       if (!verifiedEmptyDiscoveryDigest) return unavailable(contract, "canonical_evidence_missing")
       projection = requiresObservedLocation
