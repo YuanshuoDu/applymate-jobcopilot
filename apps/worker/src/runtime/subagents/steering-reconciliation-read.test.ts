@@ -13,6 +13,7 @@ import {
   STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
   STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION,
   STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
+  STEERING_RECONCILIATION_OPERATIONAL_FAILURE_SCHEMA_VERSION,
   type SteeringReconciliationReceipt,
 } from "./steering-reconciliation-contract.js"
 import type { SteeringReconciliationHistoryEntry } from "./steering-reconciliation-history.js"
@@ -22,6 +23,9 @@ import { taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapsh
 import { taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import { TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, parseTaskGraphFailedBranchRepairRelation,
   taskGraphFailedBranchRepairFingerprint } from "./task-graph-pg-failed-branch-relation.js"
+import { TASK_GRAPH_OPERATIONAL_FAILED_BRANCH_RELATION_SCHEMA_VERSION, parseTaskGraphOperationalFailedBranchRelation,
+  taskGraphOperationalFailedBranchFingerprint } from "./task-graph-pg-operational-failed-branch-relation.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { assertNoUnresolvedSteering, readSteeringReconciliationState } from "./steering-reconciliation-read.js"
 
 const historyOverride = vi.hoisted(() => ({ entries: null as readonly unknown[] | null }))
@@ -212,8 +216,8 @@ function failedBranchReceipt(stepId: string, cursor: string, observedRevision: n
   return parsed
 }
 
-function legacyReceipt(version: "v1" | "v2", stepId: string, cursor: string, steerInputIds: readonly string[], suffix: string): SteeringReconciliationReceipt {
-  const callId = `legacy-call-${suffix}`, observedRevision = 1
+function legacyReceipt(version: "v1" | "v2", stepId: string, cursor: string, steerInputIds: readonly string[], suffix: string, observedRevision = 1): SteeringReconciliationReceipt {
+  const callId = `legacy-call-${suffix}`
   const base = { sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, stepId,
     decision: version === "v1" ? "keep" as const : "revise" as const,
     observedRevision, resultingRevision: version === "v1" ? observedRevision : observedRevision + 2,
@@ -236,6 +240,38 @@ function legacyReceipt(version: "v1" | "v2", stepId: string, cursor: string, ste
   const parsed = parseSteeringReconciliationReceipt({ schemaVersion: STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION, ...base, supersession }, { ...scope, stepId })
   if (!parsed) throw new Error("v2 receipt fixture must satisfy the stored contract")
   return parsed
+}
+
+function operationalFailureReceipt(stepId: string, cursor: string, observedRevision: number, suffix: string): SteeringReconciliationReceipt {
+  const callId = `operational-call-${suffix}`
+  const replaceOperationalFailure = { root: { nodeKey: "analyst-old", taskId: "analyst-task" },
+    sources: [{ nodeKey: "analyst-old", taskId: "analyst-task", replacementKey: "analyst-fresh" }] }
+  const nodes = [{ key: "analyst-fresh", templateId: "analyst", goal: "Review evidence", successCriteria: ["Rank findings"], dependsOn: [],
+    verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst" as const,
+      criteria: [{ id: "findings", check: { kind: "finding_count_gte" as const, minimum: 1 } }] } }]
+  const failedEvent = { id: `operational-failed-${suffix}`, sequence: "41",
+    idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "analyst-old", 2, "task.failed") }
+  const relation = parseTaskGraphOperationalFailedBranchRelation({
+    schemaVersion: TASK_GRAPH_OPERATIONAL_FAILED_BRANCH_RELATION_SCHEMA_VERSION,
+    operationKey: steeringReconciliationIdempotencyKey({ ...scope, stepId }, callId), graphRootTaskId: scope.rootTaskId,
+    observedRevision, resultingRevision: observedRevision + 1,
+    failedSource: { source: replaceOperationalFailure.root, attemptCount: 2, failureReason: "child_resume_evidence_unavailable",
+      resultDigest: "a".repeat(64), event: failedEvent }, observedGraphEvent: failedEvent,
+    sources: [{ source: replaceOperationalFailure.root, replacementKey: "analyst-fresh" }], priorCancellations: [], cancellations: [],
+    verifiedExternalDependencies: [], planEvent: { id: `operational-plan-${suffix}`, sequence: "43",
+      idempotencyKey: taskGraphProposalKey(scope.rootTaskId, observedRevision) },
+    requestFingerprint: taskGraphOperationalFailedBranchFingerprint({ rootTaskId: scope.rootTaskId, expectedRevision: observedRevision,
+      replaceOperationalFailure, nodes }),
+    agentPlanCall: { callId, stepId, expectedRevision: observedRevision, replaceOperationalFailure },
+  })
+  if (!relation) throw new Error("operational failure relation fixture must be valid")
+  const receipt = parseSteeringReconciliationReceipt({
+    schemaVersion: STEERING_RECONCILIATION_OPERATIONAL_FAILURE_SCHEMA_VERSION, sessionId: scope.sessionId, turnId: scope.turnId,
+    rootTaskId: scope.rootTaskId, stepId, decision: "revise", observedRevision, resultingRevision: observedRevision + 1,
+    steerInputIds: [], inputCheckpoint: { throughSequence: cursor }, operationalFailure: relation,
+  }, { ...scope, stepId })
+  if (!receipt) throw new Error("operational failure receipt fixture must be valid")
+  return receipt
 }
 
 function historyEntry(receipt: SteeringReconciliationReceipt, stepOrdinal: number): SteeringReconciliationHistoryEntry {
@@ -458,6 +494,7 @@ describe("durable steering reconciliation reader", () => {
     expect(state.unresolvedInputs).toEqual([{ id: "steer-1", acceptedSequence: 10n, status: "consumed", consumedByStepId: "origin-step", consumingOrdinal: 0 }])
     expect(state.decisionInputThroughSequence).toBe(20n)
     expect(state.agendaPlanRevision).toBe(1)
+    expect(state).not.toHaveProperty("latestUserRevision")
     expect(f.calls.some(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 
@@ -606,6 +643,24 @@ describe("durable steering reconciliation reader", () => {
     const f = longReadFixture(270, 269)
     await expect(readSteeringReconciliationState(f.client, scope)).rejects.toThrow("steering_reconciliation_receipt_invalid")
     expect(f.calls.filter(call => call.sql.includes('event."type" = $3')).length).toBeGreaterThan(4)
+  })
+
+  it("tracks the latest validated user revise across later keep and empty operational repair receipts", async () => {
+    const steers = [input("steer-one", "steer", "consumed", "10", "consumer-one"),
+      input("steer-two", "steer", "consumed", "20", "consumer-two"), input("steer-three", "steer", "consumed", "30", "consumer-three")]
+    const entries = [
+      historyEntry(legacyReceipt("v2", "user-revise-one", "10", [steers[0]!.id], "user-revise-one"), 1),
+      historyEntry(legacyReceipt("v2", "user-revise-two", "20", [steers[1]!.id], "user-revise-two", 3), 3),
+      historyEntry(legacyReceipt("v1", "later-keep", "30", [steers[2]!.id], "later-keep", 5), 5),
+      historyEntry(operationalFailureReceipt("empty-operational-repair", "30", 5, "empty-repair"), 6),
+    ]
+    historyOverride.entries = entries
+    const consumers = steers.map((steer, index) => ({ id: steer.consumedByStepId, taskId: scope.rootTaskId,
+      ordinal: index * 2, attempt: 1, status: "completed", inputThroughSequence: steer.acceptedSequence, consumedInputIds: [steer.id] }))
+    const f = cursorFixture({ entries, currentStepId: "current-step", currentOrdinal: 7, currentCursor: "30", currentRevision: 6, inputs: steers, consumers })
+    const state = await readSteeringReconciliationState(f.client, { ...scope, stepId: "current-step" })
+    expect(state.latestUserRevision).toEqual({ resultingRevision: 5, stepId: "user-revise-two", inputThroughSequence: 20n })
+    expect(state.unresolvedInputs).toEqual([])
   })
 
   it("allows a consumed steer receipt followed by an empty branch receipt at the same stored Step cursor", async () => {
