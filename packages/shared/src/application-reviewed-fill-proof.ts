@@ -4,7 +4,8 @@ export const REVIEWED_APPLICATION_FILL_SOURCE_SCHEMA = "agent-harness.v2.selecte
 export const REVIEWED_APPLICATION_FILL_BROWSER_START_SCHEMA = "agent-harness.v2.reviewed-application-fill-browser-start.v1" as const
 
 export type ReviewedApplicationFillSourceSelection =
-  | Readonly<{ kind: "absent" | "invalid" }>
+  | Readonly<{ kind: "absent" }>
+  | Readonly<{ kind: "invalid" }>
   | Readonly<{ kind: "selected"; sourceTurnId: string }>
 
 export type ReviewedApplicationFillBrowserStartBinding = Readonly<{
