@@ -16014,6 +16014,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const add = (counts: Map<string, number>, value: string) => counts.set(value, Math.min(3, (counts.get(value) ?? 0) + 1))
       const phaseByMarker = new Map([
         ["P3_SUCCESSIVE_REPLAN_SEATTLE_WAITING ", "seattle_waiting"],
+        ["P3_SUCCESSIVE_REPLAN_DUBLIN_REFRESHED ", "dublin_graph_refresh"],
         ["P3_SUCCESSIVE_REPLAN_SEATTLE_INTERRUPT_REQUESTED ", "seattle_interrupt_requested"],
         ["P3_SUCCESSIVE_REPLAN_FIRST_RETIREMENT ", "first_retirement"],
         ["P3_SUCCESSIVE_REPLAN_CRASH_CUT ", "crash_cut"],
@@ -16287,7 +16288,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const toolCallIds = isBerlin
         ? [`p3-1248-berlin-inspect${suffix}`, `p3-1248-berlin-plan${suffix}`,
           `p3-1248-retire-dublin${suffix}`, `p3-1248-final-wait${suffix}`]
-        : [`p3-1248-dublin-plan${suffix}`, `p3-1248-retire-seattle${suffix}`,
+        : [`p3-1248-dublin-plan${suffix}`, `p3-1248-dublin-refresh${suffix}`, `p3-1248-retire-seattle${suffix}`,
           `p3-1248-first-retirement-wait${suffix}`]
       const toolsPromise = pool!.query<{ toolName: string; callStatus: string; resultStatus: string | null;
         outputStatus: string | null; errorCode: string | null }>(
@@ -16378,6 +16379,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
       const markers: ReadonlyArray<readonly [string, string]> = [
         ["P3_SUCCESSIVE_REPLAN_SEATTLE_WAITING ", "seattle_waiting"],
+        ["P3_SUCCESSIVE_REPLAN_DUBLIN_REFRESHED ", "dublin_graph_refresh"],
         ["P3_SUCCESSIVE_REPLAN_SEATTLE_INTERRUPT_REQUESTED ", "seattle_interrupt_requested"],
         ["P3_SUCCESSIVE_REPLAN_CHILD_HELD ", "child_held"],
         ["P3_SUCCESSIVE_REPLAN_FIRST_RETIREMENT ", "first_retirement"],
@@ -16531,6 +16533,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         dublinRetirementReceiptPresent: dublinRetirement,
         successiveRecoveryTrace: recoveryTrace,
         observedMarkers: observedMarkers.slice(0, 8),
+        dublinRefreshMarker: isBerlin ? undefined : projectMarker("P3_SUCCESSIVE_REPLAN_DUBLIN_REFRESHED ",
+          ["planAccepted", "startLifecycleObserved", "childHeld", "listShowsBothRunning",
+            "graphRevisionMatches", "graphRevisionAdvanced"]),
         berlinRequestMarker: projectMarker("P3_SUCCESSIVE_REPLAN_BERLIN_REQUEST ",
           ["requestEntered", "freshSteeringCuePresent", "berlinScopePresent", "listToolAvailable"]),
         berlinListProofMarker: projectMarker("P3_SUCCESSIVE_REPLAN_BERLIN_LIST_PROOF ",
@@ -16564,7 +16569,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         throw new Error("Dublin steer boundary=" + JSON.stringify(await readSteerFailureBoundary("dublin", acceptedDublin)))
       }
       assertMarker(interruptRequested, "P3_SUCCESSIVE_REPLAN_SEATTLE_INTERRUPT_REQUESTED ",
-        { replacementAccepted: true, interruptRequested: true, rootLeaseMatchesProcess: true })
+        { replacementAccepted: true, interruptRequested: true, dublinStartedObserved: true,
+          dublinGraphRefreshVerified: true, rootLeaseMatchesProcess: true })
       nodes = await graphNodes()
       const dublinNode = nodes.find(node => node.key === "scout-dublin-replacement")
       if (!dublinNode?.taskId) throw new Error("Restart fixture omitted its exact Dublin replacement node")
