@@ -36,6 +36,23 @@ export { pinnedFetch, validatePinnedUrl, type PinnedFetchOptions } from "./pinne
 export { redactAgentEvent, redactSensitiveText, redactSensitiveValue } from "./agent-redaction.js";
 export { hashAgentReceiptValue } from "./agent-receipt.js";
 export {
+  bindReviewedApplicationSubmissionMaterial,
+  buildApplicationSubmissionManifest,
+  hashApplicationSubmissionMaterial,
+  hashReviewedApplicationMaterialProof,
+  isApplicationSubmissionManifest,
+  isApplicationSubmissionMaterial,
+  matchesReviewedApplicationMaterialProof,
+  type ApplicationSubmissionManifest,
+  type ApplicationSubmissionMaterial,
+  type LegacyApplicationSubmissionManifest,
+  type LegacyApplicationSubmissionMaterial,
+  type ReviewedApplicationMaterialProof,
+  type ReviewedApplicationSubmissionManifest,
+  type ReviewedApplicationSubmissionMaterial,
+} from "./application-submission-material.js";
+
+export {
   buildAgentSourceMaterialFenceKey,
   normalizeAgentSourceMaterialFenceError,
   sortUniqueAgentSourceMaterialFenceUserIds,
