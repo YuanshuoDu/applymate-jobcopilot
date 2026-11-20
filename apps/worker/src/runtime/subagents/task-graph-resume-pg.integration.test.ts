@@ -4595,6 +4595,7 @@ type FixtureQueueJobIdentity = Readonly<{
   queueName: string
   kind: "subagent"
   jobId: string
+  userId: string
   sessionId: string
   turnId: string
   taskId: string
@@ -4610,7 +4611,13 @@ type ProcessFixtureChild = ChildProcess & {
   fixtureScopes?: readonly FixtureProcessScope[]
   terminationSignal?: NodeJS.Signals | null
   staleBullJobKeys?: Set<string>
+  historicalSubagentCleanupEligible?: boolean
+  sigkillSubagentProofs?: FixtureSubagentSigkillProof[]
 }
+type FixtureSubagentSigkillProof = Readonly<{
+  queueName: string; jobId: string; userId: string; sessionId: string; turnId: string
+  taskId: string; rootTaskId: string; ownerId: string; attemptCount: number; generation: number
+}>
 type FixtureCleanupJob = {
   id: string | undefined
   name: string
@@ -4623,9 +4630,15 @@ type FixtureCleanupQueue = {
   toKey(jobId: string): string
   getJob(jobId: string): Promise<FixtureCleanupJob | undefined>
 }
-type FixtureRedisConnection = { del(key: string): Promise<unknown> }
+type FixtureRedisConnection = {
+  del(key: string): Promise<unknown>
+  exists(key: string): Promise<number>
+  pttl(key: string): Promise<number>
+}
+type FixtureLockWait = Readonly<{ now?: () => number; sleep?: (milliseconds: number) => Promise<void> }>
 const fixtureProcessChildren = new Set<ProcessFixtureChild>()
 const FIXTURE_DISPATCH_GENERATION_LIMIT = 32
+const FIXTURE_SUBAGENT_LOCK_DURATION_MS = 30_000 // BullMQ Worker default; createSubagentQueue does not override it.
 
 function fixtureJobIdentityKey(queueName: string, jobId: string): string {
   return `${queueName}\u0000${jobId}`
@@ -4639,7 +4652,7 @@ function parseFixtureQueueJobIdentity(value: unknown): FixtureQueueJobIdentity |
   const expected = kind === "turn"
     ? "currentGeneration,generation,jobId,kind,ownerId,queueName,sessionId,turnId"
     : kind === "subagent"
-      ? "currentGeneration,generation,jobId,kind,ownerId,queueName,rootTaskId,sessionId,taskId,turnId"
+      ? "currentGeneration,generation,jobId,kind,ownerId,queueName,rootTaskId,sessionId,taskId,turnId,userId"
       : ""
   if (!expected || keys !== expected || typeof source.queueName !== "string" || !source.queueName.trim()
     || typeof source.jobId !== "string" || !source.jobId.trim()
@@ -4656,11 +4669,12 @@ function parseFixtureQueueJobIdentity(value: unknown): FixtureQueueJobIdentity |
       currentGeneration: source.currentGeneration }
   }
   if (kind !== "subagent") return null
-  if (typeof source.taskId !== "string" || !source.taskId.trim()
+  if (typeof source.userId !== "string" || !source.userId.trim()
+    || typeof source.taskId !== "string" || !source.taskId.trim()
     || typeof source.rootTaskId !== "string" || !source.rootTaskId.trim()) return null
   const generation = Number(source.generation)
   if (source.jobId !== subagentDispatchJobId(source.taskId, generation)) return null
-  return { queueName: source.queueName, kind, jobId: source.jobId, sessionId: source.sessionId,
+  return { queueName: source.queueName, kind, jobId: source.jobId, userId: source.userId, sessionId: source.sessionId,
     turnId: source.turnId, taskId: source.taskId, rootTaskId: source.rootTaskId, ownerId: source.ownerId,
     generation, currentGeneration: source.currentGeneration }
 }
@@ -4681,7 +4695,8 @@ async function removeExactFixtureQueueJob(
   rawIdentity: unknown,
   queue: FixtureCleanupQueue,
   redisConnection: FixtureRedisConnection,
-  proof: Readonly<{ allWorkersExited: boolean; exactSigkillOwner: boolean }>,
+  proof: Readonly<{ allWorkersExited: boolean; exactSigkillOwner: boolean;
+    sigkillChildren?: readonly ProcessFixtureChild[]; lockWait?: FixtureLockWait }>,
 ): Promise<"absent" | "removed"> {
   const identity = parseFixtureQueueJobIdentity(rawIdentity)
   if (!identity || queue.name !== identity.queueName) throw new Error("Fixture queue job identity is unrecognized")
@@ -4696,13 +4711,41 @@ async function removeExactFixtureQueueJob(
   const removableStates = new Set(["completed", "failed", "waiting", "delayed", "paused", "waiting-children", "active", "prioritized"])
   if (!removableStates.has(state)) throw new Error("Fixture queue job state is unrecognized")
   if (state === "active") {
-    if (identity.kind !== "turn" || !proof.exactSigkillOwner) {
-      throw new Error("Active fixture job has no exact exited SIGKILL owner proof")
+    if (identity.kind === "turn") {
+      if (!proof.exactSigkillOwner) throw new Error("Active fixture job has no exact exited SIGKILL owner proof")
+      await redisConnection.del(queue.toKey(identity.jobId) + ":lock")
+    } else {
+      if (identity.currentGeneration || !proof.sigkillChildren?.some(child =>
+        processFixtureProvesExactSigkill(child, identity, job.data))) {
+        throw new Error("Active fixture subagent job lacks exact historical SIGKILL proof")
+      }
+      await waitForFixtureSubagentLockRelease(redisConnection, queue.toKey(identity.jobId) + ":lock", proof.lockWait)
     }
-    await redisConnection.del(queue.toKey(identity.jobId) + ":lock")
   }
   await job.remove()
   return "removed"
+}
+
+async function waitForFixtureSubagentLockRelease(
+  redisConnection: FixtureRedisConnection,
+  lockKey: string,
+  options: FixtureLockWait = {},
+): Promise<void> {
+  const now = options.now ?? Date.now
+  const sleep = options.sleep ?? (milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)))
+  const deadline = now() + FIXTURE_SUBAGENT_LOCK_DURATION_MS
+  while (true) {
+    const exists = await redisConnection.exists(lockKey)
+    const ttl = await redisConnection.pttl(lockKey)
+    // PTTL is the later atomic observation; it can prove expiry if EXISTS saw the key just before it vanished.
+    if (ttl === -2) return
+    if (exists !== 1 || !Number.isSafeInteger(ttl) || ttl < 0 || ttl > FIXTURE_SUBAGENT_LOCK_DURATION_MS) {
+      throw new Error("Historical fixture subagent lock state is unrecognized")
+    }
+    const remaining = deadline - now()
+    if (remaining <= 0) throw new Error("Historical fixture subagent lock did not expire within its BullMQ TTL")
+    await sleep(Math.min(remaining, ttl === 0 ? 25 : 100))
+  }
 }
 
 function fixtureOwnerRowsMayBeDeleted(identitiesLoaded: boolean, failuresBeforeQueueCleanup: number, failuresAfterQueueCleanup: number): boolean {
@@ -4727,12 +4770,20 @@ function fixtureProcessScopes(value: Record<string, unknown>): FixtureProcessSco
 function processFixtureProvesExactSigkill(
   child: ProcessFixtureChild,
   identity: FixtureQueueJobIdentity,
+  jobData?: unknown,
 ): boolean {
   if (!processFixtureExited(child) || child.terminationSignal !== "SIGKILL" || child.signalCode !== "SIGKILL"
     || !child.fixtureScopes?.some(scope => scope.sessionId === identity.sessionId && scope.turnId === identity.turnId)) return false
   if (identity.kind === "turn") return child.staleBullJobKeys?.has(fixtureJobIdentityKey(identity.queueName, identity.jobId)) ?? false
-  // A started-task marker lacks the Bull dispatch generation, so it cannot authorize lock removal.
-  return false
+  if (identity.currentGeneration || !child.historicalSubagentCleanupEligible || jobData === undefined) return false
+  const payload = parseSubagentJobPayload(jobData)
+  return Boolean(payload && child.sigkillSubagentProofs?.some(proof =>
+    proof.queueName === identity.queueName && proof.jobId === identity.jobId && proof.userId === identity.userId
+      && proof.sessionId === identity.sessionId && proof.turnId === identity.turnId && proof.taskId === identity.taskId
+      && proof.rootTaskId === identity.rootTaskId && proof.generation === identity.generation
+      && Number.isSafeInteger(proof.attemptCount) && proof.attemptCount > 0
+      && payload.taskId === proof.taskId && payload.sessionId === proof.sessionId
+      && payload.rootTaskId === proof.rootTaskId && payload.ownerId === proof.ownerId))
 }
 
 function fixtureActiveCleanupDiagnostic(
@@ -4770,6 +4821,24 @@ function noteFixtureSigkillTurnJob(child: ProcessFixtureChild, queueName: string
   child.terminationSignal = "SIGKILL"
   child.staleBullJobKeys ??= new Set()
   child.staleBullJobKeys.add(fixtureJobIdentityKey(queueName, jobId))
+}
+
+function noteFixtureSigkillSubagentJob(
+  child: ProcessFixtureChild,
+  identity: FixtureQueueJobIdentity,
+  userId: string,
+  attemptCount: number,
+): void {
+  if (identity.kind !== "subagent" || !identity.currentGeneration || !userId.trim() || userId !== identity.userId
+    || !Number.isSafeInteger(attemptCount) || attemptCount < 1
+    || !child.fixtureScopes?.some(scope => scope.sessionId === identity.sessionId && scope.turnId === identity.turnId)) {
+    throw new Error("Fixture subagent SIGKILL proof is not bound to its live owner")
+  }
+  child.terminationSignal = "SIGKILL"
+  child.sigkillSubagentProofs ??= []
+  child.sigkillSubagentProofs.push({ queueName: identity.queueName, jobId: identity.jobId, userId,
+    sessionId: identity.sessionId, turnId: identity.turnId, taskId: identity.taskId, rootTaskId: identity.rootTaskId,
+    ownerId: identity.ownerId, attemptCount, generation: identity.generation })
 }
 
 function fixtureDispatchGenerations(attemptValue: unknown, publishedAt: Date | string | null): Array<{ generation: number; currentGeneration: boolean }> {
@@ -4851,7 +4920,7 @@ async function readExactFixtureQueueJobs(
       for (const { generation, currentGeneration } of fixtureDispatchGenerations(row.attemptCount, row.publishedAt)) {
         identities.push({ queueName, kind: "subagent", jobId: subagentDispatchJobId(row.taskId, generation),
           sessionId: owner.sessionId, turnId: owner.turnId, taskId: row.taskId, rootTaskId: row.rootTaskId,
-          ownerId: payload.ownerId, generation, currentGeneration })
+          userId: owner.userId, ownerId: payload.ownerId, generation, currentGeneration })
       }
     }
   }
@@ -8421,8 +8490,48 @@ describe("TaskGraph exact fixture queue cleanup", () => {
         toKey: (jobId: string) => `bull:${identity.queueName}:${jobId}`,
         getJob: vi.fn(async (jobId: string) => job?.id === jobId ? job : undefined),
       } satisfies FixtureCleanupQueue,
-      redis: { del: vi.fn(async (_key: string) => 1) } satisfies FixtureRedisConnection,
+      redis: { del: vi.fn(async (_key: string) => 1), exists: vi.fn(async () => 0),
+        pttl: vi.fn(async () => -2) } satisfies FixtureRedisConnection,
     }
+  }
+
+  const historicalSubagentIdentity: FixtureQueueJobIdentity = {
+    queueName: "fixture-subagent-queue", kind: "subagent", jobId: subagentDispatchJobId("cleanup-task", 2),
+    userId: "cleanup-user", sessionId: identity.sessionId, turnId: identity.turnId,
+    taskId: "cleanup-task", rootTaskId: "cleanup-root", ownerId: "current-child-owner",
+    generation: 2, currentGeneration: false,
+  }
+
+  function subagentCleanupFixture(
+    job: FixtureCleanupJob,
+    lock: Readonly<{ exists: number; ttl: number }> = { exists: 0, ttl: -2 },
+  ) {
+    const queue: FixtureCleanupQueue = {
+      name: historicalSubagentIdentity.queueName,
+      toKey: jobId => `bull:${historicalSubagentIdentity.queueName}:${jobId}`,
+      getJob: vi.fn(async jobId => jobId === historicalSubagentIdentity.jobId ? job : undefined),
+    }
+    const redis = {
+      del: vi.fn(async () => 1),
+      exists: vi.fn(async () => lock.exists),
+      pttl: vi.fn(async () => lock.ttl),
+    } satisfies FixtureRedisConnection
+    return { queue, redis }
+  }
+
+  function killedSubagentChild(
+    historic: Extract<FixtureQueueJobIdentity, { kind: "subagent" }>,
+    ownerId = "crash-child-owner",
+    signalCode: NodeJS.Signals | null = "SIGKILL",
+  ): ProcessFixtureChild {
+    const child = {
+      exitCode: 0, signalCode, terminationSignal: null,
+      historicalSubagentCleanupEligible: true,
+      fixtureScopes: [{ sessionId: historic.sessionId, turnId: historic.turnId }],
+    } as unknown as ProcessFixtureChild
+    const crashIdentity = { ...historic, ownerId, currentGeneration: true }
+    noteFixtureSigkillSubagentJob(child, crashIdentity, historic.userId, 3)
+    return child
   }
 
   it("removes only an exact owned active job after its SIGKILL worker exited", async () => {
@@ -8499,35 +8608,151 @@ describe("TaskGraph exact fixture queue cleanup", () => {
   })
 
   it("does not treat a task-start marker as generation-specific subagent lock proof", async () => {
-    const subagentIdentity: FixtureQueueJobIdentity = {
-      queueName: "fixture-subagent-queue", kind: "subagent", jobId: subagentDispatchJobId("cleanup-task", 2),
-      sessionId: identity.sessionId, turnId: identity.turnId, taskId: "cleanup-task", rootTaskId: "cleanup-root",
-      ownerId: identity.ownerId, generation: 2, currentGeneration: false,
-    }
     const child = {
       exitCode: 0, signalCode: "SIGKILL", terminationSignal: "SIGKILL",
       fixtureScopes: [{ sessionId: identity.sessionId, turnId: identity.turnId }],
       output: ["P3_DISCOVERY_CHILD_STARTED cleanup-task scout"],
     } as unknown as ProcessFixtureChild
-    expect(processFixtureProvesExactSigkill(child, subagentIdentity)).toBe(false)
+    expect(processFixtureProvesExactSigkill(child, historicalSubagentIdentity)).toBe(false)
 
     const job: FixtureCleanupJob = {
-      id: subagentIdentity.jobId, name: "subagent",
-      data: { taskId: subagentIdentity.taskId, sessionId: subagentIdentity.sessionId,
-        rootTaskId: subagentIdentity.rootTaskId, ownerId: subagentIdentity.ownerId },
+      id: historicalSubagentIdentity.jobId, name: "subagent",
+      data: { taskId: historicalSubagentIdentity.taskId, sessionId: historicalSubagentIdentity.sessionId,
+        rootTaskId: historicalSubagentIdentity.rootTaskId, ownerId: historicalSubagentIdentity.ownerId },
       getState: vi.fn(async () => "active"), remove: vi.fn(async () => undefined),
     }
-    const queue: FixtureCleanupQueue = {
-      name: subagentIdentity.queueName,
-      toKey: jobId => `bull:${subagentIdentity.queueName}:${jobId}`,
-      getJob: vi.fn(async jobId => jobId === subagentIdentity.jobId ? job : undefined),
-    }
-    const redisConnection = { del: vi.fn(async () => 1) }
-    await expect(removeExactFixtureQueueJob(subagentIdentity, queue, redisConnection, {
-      allWorkersExited: true, exactSigkillOwner: true,
-    })).rejects.toThrow("Active fixture job has no exact exited SIGKILL owner proof")
-    expect(redisConnection.del).not.toHaveBeenCalled()
+    const { queue, redis } = subagentCleanupFixture(job)
+    await expect(removeExactFixtureQueueJob(historicalSubagentIdentity, queue, redis, {
+      allWorkersExited: true, exactSigkillOwner: true, sigkillChildren: [child],
+    })).rejects.toThrow("Active fixture subagent job lacks exact historical SIGKILL proof")
+    expect(redis.del).not.toHaveBeenCalled()
     expect(job.remove).not.toHaveBeenCalled()
+  })
+
+  it("rejects a historical child when the exact crashed owner differs from the queue payload", async () => {
+    const job: FixtureCleanupJob = {
+      id: historicalSubagentIdentity.jobId, name: "subagent",
+      data: { taskId: historicalSubagentIdentity.taskId, sessionId: historicalSubagentIdentity.sessionId,
+        rootTaskId: historicalSubagentIdentity.rootTaskId, ownerId: "unrelated-child-owner" },
+      getState: vi.fn(async () => "active"), remove: vi.fn(async () => undefined),
+    }
+    const { queue, redis } = subagentCleanupFixture(job)
+    await expect(removeExactFixtureQueueJob(historicalSubagentIdentity, queue, redis, {
+      allWorkersExited: true, exactSigkillOwner: false,
+      sigkillChildren: [killedSubagentChild(historicalSubagentIdentity)],
+    })).rejects.toThrow("Active fixture subagent job lacks exact historical SIGKILL proof")
+    expect(redis.del).not.toHaveBeenCalled()
+    expect(job.remove).not.toHaveBeenCalled()
+  })
+
+  it("rejects a captured child proof when the process did not actually exit by SIGKILL", async () => {
+    const job: FixtureCleanupJob = {
+      id: historicalSubagentIdentity.jobId, name: "subagent",
+      data: { taskId: historicalSubagentIdentity.taskId, sessionId: historicalSubagentIdentity.sessionId,
+        rootTaskId: historicalSubagentIdentity.rootTaskId, ownerId: "crash-child-owner" },
+      getState: vi.fn(async () => "active"), remove: vi.fn(async () => undefined),
+    }
+    const { queue, redis } = subagentCleanupFixture(job)
+    await expect(removeExactFixtureQueueJob(historicalSubagentIdentity, queue, redis, {
+      allWorkersExited: true, exactSigkillOwner: false,
+      sigkillChildren: [killedSubagentChild(historicalSubagentIdentity, "crash-child-owner", null)],
+    })).rejects.toThrow("Active fixture subagent job lacks exact historical SIGKILL proof")
+    expect(redis.del).not.toHaveBeenCalled()
+    expect(job.remove).not.toHaveBeenCalled()
+  })
+
+  it("waits only within the BullMQ lock TTL and refuses a still-live child lock", async () => {
+    const job: FixtureCleanupJob = {
+      id: historicalSubagentIdentity.jobId, name: "subagent",
+      data: { taskId: historicalSubagentIdentity.taskId, sessionId: historicalSubagentIdentity.sessionId,
+        rootTaskId: historicalSubagentIdentity.rootTaskId, ownerId: "crash-child-owner" },
+      getState: vi.fn(async () => "active"), remove: vi.fn(async () => undefined),
+    }
+    const { queue, redis } = subagentCleanupFixture(job, { exists: 1, ttl: 500 })
+    let now = 0
+    await expect(removeExactFixtureQueueJob(historicalSubagentIdentity, queue, redis, {
+      allWorkersExited: true, exactSigkillOwner: false,
+      sigkillChildren: [killedSubagentChild(historicalSubagentIdentity)],
+      lockWait: { now: () => now, sleep: async () => { now = FIXTURE_SUBAGENT_LOCK_DURATION_MS } },
+    })).rejects.toThrow("Historical fixture subagent lock did not expire within its BullMQ TTL")
+    expect(redis.exists).toHaveBeenCalledWith(`bull:${historicalSubagentIdentity.queueName}:${historicalSubagentIdentity.jobId}:lock`)
+    expect(redis.pttl).toHaveBeenCalledWith(`bull:${historicalSubagentIdentity.queueName}:${historicalSubagentIdentity.jobId}:lock`)
+    expect(redis.del).not.toHaveBeenCalled()
+    expect(job.remove).not.toHaveBeenCalled()
+  })
+
+  it("refuses a persistent or malformed child lock TTL", async () => {
+    const job: FixtureCleanupJob = {
+      id: historicalSubagentIdentity.jobId, name: "subagent",
+      data: { taskId: historicalSubagentIdentity.taskId, sessionId: historicalSubagentIdentity.sessionId,
+        rootTaskId: historicalSubagentIdentity.rootTaskId, ownerId: "crash-child-owner" },
+      getState: vi.fn(async () => "active"), remove: vi.fn(async () => undefined),
+    }
+    const { queue, redis } = subagentCleanupFixture(job, { exists: 1, ttl: -1 })
+    await expect(removeExactFixtureQueueJob(historicalSubagentIdentity, queue, redis, {
+      allWorkersExited: true, exactSigkillOwner: false,
+      sigkillChildren: [killedSubagentChild(historicalSubagentIdentity)],
+    })).rejects.toThrow("Historical fixture subagent lock state is unrecognized")
+    expect(redis.del).not.toHaveBeenCalled()
+    expect(job.remove).not.toHaveBeenCalled()
+  })
+
+  it("removes an exact historical child only after its lock is absent", async () => {
+    const job: FixtureCleanupJob = {
+      id: historicalSubagentIdentity.jobId, name: "subagent",
+      data: { taskId: historicalSubagentIdentity.taskId, sessionId: historicalSubagentIdentity.sessionId,
+        rootTaskId: historicalSubagentIdentity.rootTaskId, ownerId: "crash-child-owner" },
+      getState: vi.fn(async () => "active"), remove: vi.fn(async () => undefined),
+    }
+    const { queue, redis } = subagentCleanupFixture(job)
+    await expect(removeExactFixtureQueueJob(historicalSubagentIdentity, queue, redis, {
+      allWorkersExited: true, exactSigkillOwner: false,
+      sigkillChildren: [killedSubagentChild(historicalSubagentIdentity)],
+    })).resolves.toBe("removed")
+    expect(redis.exists).toHaveBeenCalledWith(`bull:${historicalSubagentIdentity.queueName}:${historicalSubagentIdentity.jobId}:lock`)
+    expect(redis.pttl).toHaveBeenCalledWith(`bull:${historicalSubagentIdentity.queueName}:${historicalSubagentIdentity.jobId}:lock`)
+    expect(redis.del).not.toHaveBeenCalled()
+    expect(job.remove).toHaveBeenCalledTimes(1)
+  })
+
+  it("removes after a live lock reaches its normal expiry", async () => {
+    const job: FixtureCleanupJob = {
+      id: historicalSubagentIdentity.jobId, name: "subagent",
+      data: { taskId: historicalSubagentIdentity.taskId, sessionId: historicalSubagentIdentity.sessionId,
+        rootTaskId: historicalSubagentIdentity.rootTaskId, ownerId: "crash-child-owner" },
+      getState: vi.fn(async () => "active"), remove: vi.fn(async () => undefined),
+    }
+    const { queue, redis } = subagentCleanupFixture(job, { exists: 1, ttl: 100 })
+    redis.exists.mockResolvedValueOnce(1).mockResolvedValueOnce(0)
+    redis.pttl.mockResolvedValueOnce(100).mockResolvedValueOnce(-2)
+    let now = 0
+    await expect(removeExactFixtureQueueJob(historicalSubagentIdentity, queue, redis, {
+      allWorkersExited: true, exactSigkillOwner: false,
+      sigkillChildren: [killedSubagentChild(historicalSubagentIdentity)],
+      lockWait: { now: () => now, sleep: async milliseconds => { now += milliseconds } },
+    })).resolves.toBe("removed")
+    expect(redis.exists).toHaveBeenCalledTimes(2)
+    expect(redis.pttl).toHaveBeenCalledTimes(2)
+    expect(redis.del).not.toHaveBeenCalled()
+    expect(job.remove).toHaveBeenCalledTimes(1)
+  })
+
+  it("accepts the atomic PTTL expiry result when the key vanishes after EXISTS", async () => {
+    const job: FixtureCleanupJob = {
+      id: historicalSubagentIdentity.jobId, name: "subagent",
+      data: { taskId: historicalSubagentIdentity.taskId, sessionId: historicalSubagentIdentity.sessionId,
+        rootTaskId: historicalSubagentIdentity.rootTaskId, ownerId: "crash-child-owner" },
+      getState: vi.fn(async () => "active"), remove: vi.fn(async () => undefined),
+    }
+    const { queue, redis } = subagentCleanupFixture(job, { exists: 1, ttl: -2 })
+    await expect(removeExactFixtureQueueJob(historicalSubagentIdentity, queue, redis, {
+      allWorkersExited: true, exactSigkillOwner: false,
+      sigkillChildren: [killedSubagentChild(historicalSubagentIdentity)],
+    })).resolves.toBe("removed")
+    expect(redis.exists).toHaveBeenCalledTimes(1)
+    expect(redis.pttl).toHaveBeenCalledTimes(1)
+    expect(redis.del).not.toHaveBeenCalled()
+    expect(job.remove).toHaveBeenCalledTimes(1)
   })
 
   it("preserves fixture owner rows if any queue identity cleanup fails", () => {
@@ -8617,7 +8842,8 @@ describe("TaskGraph exact fixture queue cleanup", () => {
   it("allows historical child owner drift only with exact task and root bindings", async () => {
     const historical: FixtureQueueJobIdentity = {
       queueName: "fixture-subagent-queue", kind: "subagent", jobId: subagentDispatchJobId("cleanup-task", 2),
-      sessionId: identity.sessionId, turnId: identity.turnId, taskId: "cleanup-task", rootTaskId: "cleanup-root",
+      userId: "cleanup-user", sessionId: identity.sessionId, turnId: identity.turnId,
+      taskId: "cleanup-task", rootTaskId: "cleanup-root",
       ownerId: "current-child-owner", generation: 2, currentGeneration: false,
     }
     const job: FixtureCleanupJob = {
@@ -8630,7 +8856,9 @@ describe("TaskGraph exact fixture queue cleanup", () => {
       toKey: jobId => `bull:${historical.queueName}:${jobId}`,
       getJob: vi.fn(async jobId => jobId === historical.jobId ? job : undefined),
     }
-    const redisConnection = { del: vi.fn(async () => 1) }
+    const redisConnection: FixtureRedisConnection = {
+      del: vi.fn(async () => 1), exists: vi.fn(async () => 0), pttl: vi.fn(async () => -2),
+    }
     await expect(removeExactFixtureQueueJob(historical, queue, redisConnection, {
       allWorkersExited: true, exactSigkillOwner: false,
     })).resolves.toBe("removed")
@@ -9111,8 +9339,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             name: queue.name,
             toKey: jobId => queue.toKey(jobId),
             getJob: async jobId => await queue.getJob(jobId) as unknown as FixtureCleanupJob | undefined,
-          }, redis!, { allWorkersExited: allFixtureWorkersExited, exactSigkillOwner: staleLockWorkerExited })
-        }, error => error instanceof Error && error.message === "Active fixture job has no exact exited SIGKILL owner proof"
+          }, redis!, { allWorkersExited: allFixtureWorkersExited,
+            exactSigkillOwner: identity.kind === "turn" && staleLockWorkerExited,
+            sigkillChildren: [...fixtureProcessChildren] })
+        }, error => error instanceof Error && (error.message === "Active fixture job has no exact exited SIGKILL owner proof"
+          || error.message === "Active fixture subagent job lacks exact historical SIGKILL proof")
           ? fixtureActiveCleanupDiagnostic(identity, fixtureOwners, successiveReplanProcessOwner,
             [...fixtureProcessChildren]) : null)
       }
@@ -16734,7 +16965,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const dublinDispatchIdentity: FixtureQueueJobIdentity = {
         queueName: childQueueName, kind: "subagent",
         jobId: subagentDispatchJobId(dublinTaskId, dublinGeneration), sessionId: value.sessionId,
-        turnId: value.turnId, taskId: dublinTaskId, rootTaskId, ownerId: dublinPayload.ownerId,
+        turnId: value.turnId, taskId: dublinTaskId, rootTaskId, userId: value.userId, ownerId: dublinPayload.ownerId,
         generation: dublinGeneration, currentGeneration: true,
       }
       const dublinQueue = new Queue(childQueueName, { connection: redis, skipVersionCheck: true })
@@ -16804,6 +17035,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const dispatch = turnDispatchRow.rows[0]!
       const generation = dispatch.publishedAt === null ? dispatch.attemptCount : dispatch.attemptCount - 1
       if (!Number.isSafeInteger(generation) || generation < 0) throw new Error("Crash-cut dispatch generation was invalid")
+      noteFixtureSigkillSubagentJob(firstWorker, dublinDispatchIdentity, value.userId, dublinAtCrash.attemptCount)
       noteFixtureSigkillTurnJob(firstWorker, turnQueueName!, turnDispatch.turnJobId(value.turnId, generation))
       await killProcessFixture(firstWorker)
       if (firstWorker.signalCode !== "SIGKILL") throw new Error("First Root Worker process was not killed at the exact crash cut")
@@ -16962,42 +17194,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         || latestDublinGeneration <= historicalDublin.generation) {
         throw new Error("Dublin recovery did not publish a newer owner-bound dispatch generation")
       }
-      const historicalQueue = new Queue(historicalDublin.queueName, { connection: redis, skipVersionCheck: true })
-      try {
-        await historicalQueue.waitUntilReady()
-        const lockDurationMs = 30_000 // BullMQ Worker default; createSubagentQueue only overrides workerPollingOptions.
-        const stalledIntervalMs = Number(workerEnv.BULLMQ_STALLED_INTERVAL_MS)
-        if (stalledIntervalMs !== 30_000) {
-          throw new Error("The successive fixture BullMQ stalled interval is not the configured 30 seconds")
-        }
-        const settleDeadline = Date.now() + lockDurationMs + stalledIntervalMs + 5_000
-        let historicalDublinSettled = false
-        while (Date.now() < settleDeadline) {
-          const historicalJob = await historicalQueue.getJob(historicalDublin.jobId)
-          if (historicalJob) {
-            if (historicalJob.id !== historicalDublin.jobId || historicalJob.name !== "subagent"
-              || !fixtureJobPayloadMatches(historicalDublin, historicalJob.data)) {
-              throw new Error("The pre-crash Dublin BullMQ generation lost its exact payload identity")
-            }
-            const state = await historicalJob.getState()
-            if (state === "completed") {
-              const result = record(historicalJob.returnvalue)
-              const safeStaleSkip = result?.status === "skipped" && result.taskId === dublinTaskId
-                && (result.reason === "dispatch_identity_mismatch" || result.reason === "not_available")
-              if (!safeStaleSkip) {
-                throw new Error("The terminal Dublin task did not safely skip its historical dispatch")
-              }
-              historicalDublinSettled = true
-              break
-            }
-            if (state === "failed") throw new Error("The historical Dublin generation failed instead of settling as stale")
-          }
-          await new Promise(resolve => setTimeout(resolve, 250))
-        }
-        if (!historicalDublinSettled) {
-          throw new Error("The replacement Worker did not naturally settle the exact historical Dublin generation")
-        }
-      } finally { await historicalQueue.close() }
       await stopProcessFixture(resumeWorker)
 
       const finalTurn = await pool!.query<{ status: string; rootTaskId: string | null }>(
@@ -17079,6 +17275,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         || retirementCounts.rows[0]?.count !== 2 || rootToolCalls.rows.some(row => !allowedRootTools.has(row.toolName ?? ""))) {
         throw new Error("Final Root history duplicated a plan/retirement or admitted a non-orchestration tool")
       }
+      firstWorker.historicalSubagentCleanupEligible = true
     } finally {
       if (firstWorker) await killProcessFixture(firstWorker).catch(() => undefined)
       if (resumeWorker) await stopProcessFixture(resumeWorker).catch(() => undefined)
