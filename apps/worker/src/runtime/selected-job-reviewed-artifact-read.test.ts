@@ -17,10 +17,12 @@ import { readSelectedJobReviewedArtifactWithClient } from "./selected-job-review
 const scope = { userId: "user-1", sessionId: "session-1", jobId: "job-1", sourceTurnId: "source-turn-1" }
 const sourceDigest = `sha256:${"a".repeat(64)}`
 const content = "A reviewed cover letter for this role."
+const privatePlaceholder = "[Private selected-job response withheld]"
 const reference = { artifactId: "draft-1", version: 2, contentHash: hashArtifactContent(content), sourceDigest }
 const reviewHash = `sha256:${"b".repeat(64)}`
 const writerTaskId = "writer-task-1"
 const reviewerTaskId = "reviewer-task-1"
+const writerToolCallId = "writer-call-1"
 const reviewerToolCallId = "review-call-1"
 const snapshotNodes = [
   { key: "writer", taskId: writerTaskId, templateId: "cover_letter_writer", dependsOn: [] },
@@ -43,11 +45,14 @@ function graphNodes() {
 function toolReceipt(overrides: { call?: Record<string, unknown>; result?: Record<string, unknown>; event?: Record<string, unknown>;
   eventRow?: Record<string, unknown>; rows?: number; eventRows?: number } = {}) {
   const call = {
-    errorCode: null, input: { artifactRef: reference, decision: "passed", findings: [] }, status: "completed",
+    errorCode: null, input: { artifactRef: reference, decision: "passed", findings: [{
+      id: privatePlaceholder, code: privatePlaceholder, severity: "info", message: privatePlaceholder,
+      artifactHash: reference.contentHash, evidence: [{ artifactHash: reference.contentHash, path: "$.text", summary: privatePlaceholder }],
+    }] }, status: "completed",
     toolCallId: reviewerToolCallId, toolName: "artifact.review", toolVersion: "1", ...overrides.call,
   }
   const result = {
-    errorCode: null, output: { artifactRef: reference, reviewHash, status: "passed" }, toolCallId: reviewerToolCallId,
+    errorCode: null, output: { artifactRef: reference }, toolCallId: reviewerToolCallId,
     ...overrides.result,
   }
   const eventPayload = { errorCode: null, status: "completed", taskId: reviewerTaskId,
@@ -62,6 +67,19 @@ function toolReceipt(overrides: { call?: Record<string, unknown>; result?: Recor
   return { items: Array.from({ length: overrides.rows ?? 1 }, () => items).flat(),
     events: Array.from({ length: overrides.eventRows ?? 1 }, () => event) }
 }
+function writerToolReceipt() {
+  const call = { errorCode: null, input: { baseArtifactId: "base-1", baseHash: `sha256:${"c".repeat(64)}` },
+    status: "completed", toolCallId: writerToolCallId, toolName: "cover_letter.draft", toolVersion: "1" }
+  const items = [
+    { id: "writer-call-item", stepId: "writer-step-1", type: "tool_call", status: "completed", revision: 1, content: call },
+    { id: "writer-result-item", stepId: "writer-step-1", type: "tool_result", status: "completed", revision: 1,
+      content: { toolCallId: writerToolCallId, output: { artifactRef: reference }, errorCode: null } },
+  ]
+  const event = { id: "writer-event-1", sessionId: scope.sessionId, turnId: scope.sourceTurnId, taskId: writerTaskId,
+    actor: "subagent", itemId: "writer-call-item", type: "tool_call.completed", correlationId: writerToolCallId,
+    payload: { errorCode: null, status: "completed", taskId: writerTaskId, toolCallId: writerToolCallId, toolName: "cover_letter.draft" } }
+  return { items, events: [event] }
+}
 function client(options: { turn?: Record<string, unknown> | null; artifact?: Record<string, unknown> | null; receipt?: ReturnType<typeof toolReceipt> } = {}) {
   const query = vi.fn(async (sql: string, _params?: readonly unknown[]) => {
     if (sql.includes('FROM "agent_turns" AS turn')) return { rows: options.turn === null ? [] : [options.turn ?? {
@@ -70,10 +88,10 @@ function client(options: { turn?: Record<string, unknown> | null; artifact?: Rec
       rootStatus: "completed", rootRole: "orchestrator", rootTaskType: "root", rootDepth: 0,
     }] }
     if (sql.includes('FROM "agent_artifact_version"')) return { rows: options.artifact === null ? [] : [options.artifact ?? {
-      content, contentHash: reference.contentHash, sourceDigest,
+      content, contentHash: reference.contentHash, sourceDigest, taskId: writerTaskId, toolCallId: writerToolCallId,
     }] }
-    if (sql.includes('FROM "agent_items"')) return { rows: (options.receipt ?? toolReceipt()).items }
-    if (sql.includes('FROM "agent_events"')) return { rows: (options.receipt ?? toolReceipt()).events }
+    if (sql.includes('FROM "agent_items"')) return { rows: String(_params?.[2]) === writerTaskId ? writerToolReceipt().items : (options.receipt ?? toolReceipt()).items }
+    if (sql.includes('FROM "agent_events"')) return { rows: String(_params?.[2]) === writerTaskId ? writerToolReceipt().events : (options.receipt ?? toolReceipt()).events }
     throw new Error("unexpected query")
   })
   return { query }
@@ -105,6 +123,9 @@ describe("readSelectedJobReviewedArtifactWithClient", () => {
     const turnQuery = pg.query.mock.calls[0]
     expect(turnQuery?.[0]).toContain('turn."userId" = $3 AND session."userId" = $3')
     expect(turnQuery?.[1]).toEqual([scope.sourceTurnId, scope.sessionId, scope.userId])
+    const versionQuery = pg.query.mock.calls.find(([sql]) => sql.includes('FROM "agent_artifact_version"'))
+    expect(versionQuery?.[0]).toContain('AND "taskId"=$8')
+    expect(versionQuery?.[1]?.[7]).toBe(writerTaskId)
   })
 
   it.each([
@@ -159,5 +180,11 @@ describe("readSelectedJobReviewedArtifactWithClient", () => {
     mocks.readHead.mockReset().mockResolvedValue(reference)
     await expect(readSelectedJobReviewedArtifactWithClient(client({ artifact: null }) as never, scope)).resolves.toBeNull()
     await expect(readSelectedJobReviewedArtifactWithClient(client({ artifact: { content: "changed", contentHash: reference.contentHash, sourceDigest } }) as never, scope)).resolves.toBeNull()
+  })
+
+  it("rejects an immutable version created by a different Writer task", async () => {
+    const pg = client({ artifact: { content, contentHash: reference.contentHash, sourceDigest, taskId: "other-writer", toolCallId: writerToolCallId } })
+    await expect(readSelectedJobReviewedArtifactWithClient(pg as never, scope)).resolves.toBeNull()
+    expect(pg.query.mock.calls.some(([sql]) => sql.includes('FROM "agent_items"'))).toBe(false)
   })
 })

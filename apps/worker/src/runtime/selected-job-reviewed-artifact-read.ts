@@ -66,15 +66,16 @@ export async function readSelectedJobReviewedArtifactWithClient(
       || review.contentHash !== artifactRef.contentHash || review.sourceDigest !== artifactRef.sourceDigest
       || review.currentSourceDigest !== sourceDigest || review.status !== "passed" || review.taskId !== lineage.reviewerTaskId
       || review.reviewHash !== lineage.reviewHash || review.toolCallId.length > 256) return null
-    const content = await readArtifactContent(client, input, artifactRef)
-    if (content === null || !await hasPassedToolReceipt(client, input, lineage, artifactRef, review.toolCallId)) return null
+    const version = await readArtifactContent(client, input, artifactRef, lineage.writerTaskId)
+    if (!version || !await hasWrittenArtifactReceipt(client, input, lineage, artifactRef, version.toolCallId)
+      || !await hasPassedToolReceipt(client, input, lineage, artifactRef, review.toolCallId)) return null
     if (await readSelectedJobSourceDigestWithClient(client, input.userId, input.jobId) !== sourceDigest) return null
     return {
       sourceTurnId: input.sourceTurnId, rootTaskId: turn.rootTaskId, graphRevision: loaded.item.revision,
       jobId: input.jobId, writerTaskId: lineage.writerTaskId, reviewerTaskId: lineage.reviewerTaskId,
       reviewerToolCallId: review.toolCallId, reviewHash: lineage.reviewHash,
       artifactId: artifactRef.artifactId, version: artifactRef.version, contentHash: artifactRef.contentHash,
-      sourceDigest, content,
+      sourceDigest, content: version.content,
     }
   } catch {
     return null
@@ -150,47 +151,66 @@ function projectedReference(value: RecordValue | null, role: "writer" | "reviewe
   return parseReference(value.artifactRef)
 }
 
-async function readArtifactContent(client: Queryable, input: Readonly<{ userId: string; sessionId: string; jobId: string }>, ref: TaskGraphArtifactProjectionReference): Promise<string | null> {
-  const result = await client.query(`SELECT "content", "contentHash", "sourceDigest" FROM "agent_artifact_version"
+async function readArtifactContent(client: Queryable, input: Readonly<{ userId: string; sessionId: string; jobId: string }>, ref: TaskGraphArtifactProjectionReference, writerTaskId: string): Promise<{ content: string; toolCallId: string } | null> {
+  const result = await client.query(`SELECT "content", "contentHash", "sourceDigest", "taskId", "toolCallId" FROM "agent_artifact_version"
     WHERE "userId"=$1 AND "sessionId"=$2 AND "jobId"=$3 AND "artifactId"=$4 AND "version"=$5
-      AND "artifactType"='cover_letter' AND "contentHash"=$6 AND "sourceDigest"=$7`,
-  [input.userId, input.sessionId, input.jobId, ref.artifactId, ref.version, ref.contentHash, ref.sourceDigest])
+      AND "artifactType"='cover_letter' AND "contentHash"=$6 AND "sourceDigest"=$7 AND "taskId"=$8`,
+  [input.userId, input.sessionId, input.jobId, ref.artifactId, ref.version, ref.contentHash, ref.sourceDigest, writerTaskId])
   if (result.rows.length !== 1) return null
   const row = record(result.rows[0])
   if (!row || typeof row.content !== "string" || !row.content.trim() || row.content.length > MAX_CONTENT_LENGTH
-    || hashArtifactContent(row.content) !== ref.contentHash || row.contentHash !== ref.contentHash || row.sourceDigest !== ref.sourceDigest) return null
-  return row.content
+    || hashArtifactContent(row.content) !== ref.contentHash || row.contentHash !== ref.contentHash || row.sourceDigest !== ref.sourceDigest
+    || row.taskId !== writerTaskId || !text(row.toolCallId, 256)) return null
+  return { content: row.content, toolCallId: row.toolCallId }
 }
 
-async function hasPassedToolReceipt(client: Queryable, input: Readonly<{ sessionId: string; sourceTurnId: string }>, lineage: {
-  reviewerTaskId: string; reviewHash: string
-}, ref: TaskGraphArtifactProjectionReference, toolCallId: string): Promise<boolean> {
-  const params = [input.sessionId, input.sourceTurnId, lineage.reviewerTaskId, toolCallId]
+async function readCompletedToolReceipt(client: Queryable, input: Readonly<{ sessionId: string; sourceTurnId: string }>, taskId: string,
+  toolName: string, toolCallId: string): Promise<{ input: RecordValue; output: RecordValue } | null> {
+  const params = [input.sessionId, input.sourceTurnId, taskId, toolCallId]
   const items = await client.query(`SELECT "id", "stepId", "type", "status", "revision", "content" FROM "agent_items"
     WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId"=$3 AND "type" IN ('tool_call','tool_result')
       AND "content"->>'toolCallId'=$4 LIMIT 3`, params)
   const events = await client.query(`SELECT "id", "sessionId", "turnId", "taskId", "actor", "itemId", "type", "correlationId", "payload"
     FROM "agent_events" WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId"=$3 AND "correlationId"=$4
       AND "type" IN ('tool_call.completed','tool_call.failed') LIMIT 3`, params)
-  if (items.rows.length !== 2 || events.rows.length !== 1) return false
+  if (items.rows.length !== 2 || events.rows.length !== 1) return null
   const callItem = items.rows.find(row => record(row)?.type === "tool_call"), resultItem = items.rows.find(row => record(row)?.type === "tool_result")
   const callRow = record(callItem), resultRow = record(resultItem), event = record(events.rows[0])
-  const call = record(callRow?.content), callInput = record(call?.input), output = record(record(resultRow?.content)?.output)
+  const call = record(callRow?.content), callInput = record(call?.input), result = record(resultRow?.content)
+  const output = record(result?.output)
   const eventPayload = record(event?.payload)
-  if (!callRow || !resultRow || !event || callRow.id !== event.itemId || callRow.stepId !== resultRow.stepId
-    || !callRow.stepId || event.sessionId !== input.sessionId || event.turnId !== input.sourceTurnId
-    || event.taskId !== lineage.reviewerTaskId || event.actor !== "subagent" || event.correlationId !== toolCallId || event.type !== "tool_call.completed"
+  if (!callRow || !text(callRow.id, 256) || !resultRow || !text(resultRow.id, 256) || !event || !text(event.id, 256)
+    || callRow.id !== event.itemId || callRow.stepId !== resultRow.stepId || !callRow.stepId
+    || event.sessionId !== input.sessionId || event.turnId !== input.sourceTurnId
+    || event.taskId !== taskId || event.actor !== "subagent" || event.correlationId !== toolCallId || event.type !== "tool_call.completed"
     || !eventPayload || !exactKeys(eventPayload, "errorCode,status,taskId,toolCallId,toolName")
-    || eventPayload.errorCode !== null || eventPayload.status !== "completed" || eventPayload.taskId !== lineage.reviewerTaskId
-    || eventPayload.toolCallId !== toolCallId || eventPayload.toolName !== "artifact.review"
+    || eventPayload.errorCode !== null || eventPayload.status !== "completed" || eventPayload.taskId !== taskId
+    || eventPayload.toolCallId !== toolCallId || eventPayload.toolName !== toolName
     || !call || !exactKeys(call, "errorCode,input,status,toolCallId,toolName,toolVersion") || call.toolCallId !== toolCallId
-    || call.toolName !== "artifact.review" || call.toolVersion !== "1" || call.status !== "completed" || call.errorCode !== null
-    || !callInput || !exactKeys(callInput, "artifactRef,decision,findings") || !Array.isArray(callInput.findings)
-    || callInput.decision !== "passed" || !sameReference(parseReference(callInput.artifactRef), ref)) return false
+    || call.toolName !== toolName || call.toolVersion !== "1" || call.status !== "completed" || call.errorCode !== null
+    || !callInput || !result || !exactKeys(result, "errorCode,output,toolCallId")
+    || result.toolCallId !== toolCallId || result.errorCode !== null || !output) return null
   const restored = restoreToolCallState(items.rows.map(row => record(row)!), events.rows.map(row => record(row)!))
-  return Boolean(restored.pending.length === 0 && restored.observations.length === 1 && output
-    && exactKeys(output, "artifactRef,reviewHash,status") && output.status === "passed"
-    && output.reviewHash === lineage.reviewHash && sameReference(parseReference(output.artifactRef), ref))
+  return restored.pending.length === 0 && restored.observations.length === 1 && output
+    ? { input: callInput, output } : null
+}
+
+async function hasWrittenArtifactReceipt(client: Queryable, input: Readonly<{ sessionId: string; sourceTurnId: string }>, lineage: {
+  writerTaskId: string
+}, ref: TaskGraphArtifactProjectionReference, toolCallId: string): Promise<boolean> {
+  const receipt = await readCompletedToolReceipt(client, input, lineage.writerTaskId, "cover_letter.draft", toolCallId)
+  return Boolean(receipt && text(receipt.input.baseArtifactId, 256) && typeof receipt.input.baseHash === "string" && SHA256.test(receipt.input.baseHash)
+    && Object.keys(receipt.input).every(key => ["baseArtifactId", "baseHash", "expectedPreviousHash", "expectedPreviousVersion"].includes(key))
+    && exactKeys(receipt.output, "artifactRef") && sameReference(parseReference(receipt.output.artifactRef), ref))
+}
+
+async function hasPassedToolReceipt(client: Queryable, input: Readonly<{ sessionId: string; sourceTurnId: string }>, lineage: {
+  reviewerTaskId: string; reviewHash: string
+}, ref: TaskGraphArtifactProjectionReference, toolCallId: string): Promise<boolean> {
+  const receipt = await readCompletedToolReceipt(client, input, lineage.reviewerTaskId, "artifact.review", toolCallId)
+  return Boolean(receipt && exactKeys(receipt.input, "artifactRef,decision,findings") && Array.isArray(receipt.input.findings)
+    && receipt.input.decision === "passed" && sameReference(parseReference(receipt.input.artifactRef), ref)
+    && exactKeys(receipt.output, "artifactRef") && sameReference(parseReference(receipt.output.artifactRef), ref))
 }
 
 function parseReference(value: unknown): TaskGraphArtifactProjectionReference | null {
