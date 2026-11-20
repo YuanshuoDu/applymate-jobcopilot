@@ -24,7 +24,9 @@ import { runScheduledGatePrepareRootQuestion } from "./scheduled-gate-prepare-ro
 const DB_PATH = "@/lib/db"
 const GATE_SERVICE_PATH = "@/lib/agent/scheduled-taskgraph-run-service"
 
-export type ScheduledGatePrepareFixtureOptions = Readonly<{ jobCount?: number; scoutCount?: number; selectedJobCount?: number }>
+export type ScheduledGatePrepareFixtureOptions = Readonly<{
+  jobCount?: number; scoutCount?: number; selectedJobCount?: number; useSupportedAtsUrl?: boolean
+}>
 export type ScheduledGatePrepareFixture = Readonly<{
   ids: ScheduledGatePrepareSeedFixture["ids"] & { prepareTaskId: string; gateTaskId?: string }
   jobIds: readonly string[]; selectedJobIds: readonly string[]; jobRecords: ScheduledGatePrepareSeedFixture["jobRecords"]
@@ -48,9 +50,13 @@ export async function createScheduledGatePrepareFixture(pool: Pool, redisUrl: st
   if (options.jobCount !== undefined && (!Number.isSafeInteger(options.jobCount) || options.jobCount < 1 || options.jobCount > 10)) {
     throw new RangeError("scheduled_gate_prepare_job_count_invalid")
   }
-  const seed = await seedScheduledGatePrepareFixture(pool, { jobCount: options.jobCount ?? 1,
+  if (options.useSupportedAtsUrl !== undefined && typeof options.useSupportedAtsUrl !== "boolean") {
+    throw new TypeError("scheduled_gate_prepare_supported_ats_url_invalid")
+  }
+  const seeded = await seedScheduledGatePrepareFixture(pool, { jobCount: options.jobCount ?? 1,
     ...(options.scoutCount === undefined ? {} : { scoutCount: options.scoutCount }),
     ...(options.selectedJobCount === undefined ? {} : { selectedJobCount: options.selectedJobCount }) })
+  const seed = options.useSupportedAtsUrl ? await useSupportedAtsUrls(pool, seeded) : seeded
   const bridge = createBridge(pool, seed)
   const analyze = await bridge(seed.ownerV1)
   if (analyze.status !== "ready") throw new Error(`scheduled_gate_prepare_analyze_${analyze.reasonCode}`)
@@ -99,6 +105,20 @@ export async function createScheduledGatePrepareFixture(pool: Pool, redisUrl: st
       if (result.status !== "ready") throw new Error(`scheduled_gate_prepare_reattest_${result.reasonCode}`)
       return result.attestation
     } }
+}
+
+async function useSupportedAtsUrls(pool: Pool, seed: ScheduledGatePrepareSeedFixture): Promise<ScheduledGatePrepareSeedFixture> {
+  const updated = await pool.query<{ id: string }>(`UPDATE "Job" SET "url"='https://boards.greenhouse.io/fixture/jobs/' || "id"
+    WHERE "userId"=$1 AND "id"=ANY($2::text[]) RETURNING "id"`, [seed.ids.userId, seed.jobIds])
+  if (updated.rows.length !== seed.jobIds.length || new Set(updated.rows.map(row => row.id)).size !== seed.jobIds.length) {
+    throw new Error("scheduled_gate_prepare_supported_ats_jobs_missing")
+  }
+  const urlFor = (id: string) => `https://boards.greenhouse.io/fixture/jobs/${id}`
+  const jobRecords = seed.jobRecords.map(job => ({ ...job, url: urlFor(job.id) }))
+  const jobRecord = jobRecords.find(job => job.id === seed.jobId)
+  if (!jobRecord) throw new Error("scheduled_gate_prepare_supported_ats_job_missing")
+  return { ...seed, jobRecords, jobRecord,
+    scoredJobs: seed.scoredJobs.map(scored => ({ ...scored, job: { ...scored.job, url: urlFor(scored.job.id) } })) }
 }
 
 function createBridge(pool: Pool, seed: ScheduledGatePrepareSeedFixture) {

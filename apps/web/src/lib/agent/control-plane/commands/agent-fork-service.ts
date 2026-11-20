@@ -24,6 +24,13 @@ function json(value: unknown): Prisma.InputJsonValue {
   return value as Prisma.InputJsonValue
 }
 
+function inheritedTurnInput(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value
+  const input = { ...(value as Record<string, unknown>) }
+  delete input.materialDriftRecovery
+  return input
+}
+
 function required(value: string, field: string): string {
   if (typeof value !== "string" || value.trim().length === 0) throw invalidCommand(`${field} must be non-empty`)
   return value.trim()
@@ -155,7 +162,7 @@ export class AgentForkService {
       }
       await tx.agentTurn.createMany({ data: selectedTurns.map((turn) => ({
         id: turnMap.get(turn.id) as string, sessionId: id, userId: command.userId, status: turn.status, source: turn.source,
-        input: json(turn.input), finalResponse: turn.finalResponse, error: turn.error, rootTaskId: null,
+        input: json(inheritedTurnInput(turn.input)), finalResponse: turn.finalResponse, error: turn.error, rootTaskId: null,
         contextSnapshotId: snapshotId, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: json({}), budgetSnapshot: json({}),
         revision: 0, inputTokens: turn.inputTokens, outputTokens: turn.outputTokens, estimatedCostUsd: turn.estimatedCostUsd,
         durationMs: turn.durationMs, startedAt: turn.startedAt, completedAt: turn.completedAt, leaseOwnerId: null, leaseExpiresAt: null, leaseStartedAt: null, leaseVersion: 0,

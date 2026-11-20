@@ -108,8 +108,8 @@ function fakePool(options: FakeOptions = {}) {
         const row = dispatchRows.find(candidate => candidate.idempotencyKey === String(params?.[0]))
         return row ? { rows: [{ aggregateId: row.aggregateId, topic: row.topic ?? "agent.turn.dispatch" }], rowCount: 1 } : { rows: [], rowCount: 0 }
       }
+      if (sql.includes('COALESCE(turn."leaseOwnerId"')) return { rows: turn ? [{ ...turn, id: currentWakeup.turnId, sessionId: currentWakeup.sessionId }] : [], rowCount: turn ? 1 : 0 }
       if (sql.includes('SELECT turn."id"') && sql.includes('FROM "agent_turns"')) return { rows: turn ? [{ id: currentWakeup.turnId }] : [], rowCount: turn ? 1 : 0 }
-      if (sql.includes('SELECT turn."userId"')) return { rows: turn ? [turn] : [], rowCount: turn ? 1 : 0 }
       if (sql.includes('SELECT set_config')) return { rows: [], rowCount: 1 }
       if (sql.includes('SELECT "status", "taskId", "content"')) return { rows: item ? [item] : [], rowCount: item ? 1 : 0 }
       if (sql.includes('UPDATE "agent_sessions"')) {
@@ -300,7 +300,7 @@ describe("Agent wakeup consumer", () => {
     expect(fake.outboxUpdates).toEqual([])
     expect(fake.rows.get("scheduled_answer_1")?.publishedAt).toBeNull()
     expect(fake.rows.get("scheduled_answer_2")?.publishedAt).toBeNull()
-    expect(fake.calls.filter(([sql]) => sql.includes('SELECT turn."userId"'))).toHaveLength(1)
+    expect(fake.calls.filter(([sql]) => sql.includes('COALESCE(turn."leaseOwnerId"'))).toHaveLength(1)
     expect(fake.dispatchRows()).toHaveLength(0)
 
     fake.setLiveLease(false)

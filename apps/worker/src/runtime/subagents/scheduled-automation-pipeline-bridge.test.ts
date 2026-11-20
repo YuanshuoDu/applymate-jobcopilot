@@ -16,6 +16,7 @@ import { TASK_GRAPH_TEMPLATES as TEMPLATES } from "./task-graph-templates.js"
 import { SCHEDULED_GATE_NODE_CRITERIA, SCHEDULED_GATE_NODE_GOAL, SCHEDULED_GATE_OUTPUT_SCHEMA,
   SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE, SCHEDULED_GATE_TEMPLATE_ID } from "./scheduled-gate-contract.js"
 import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
+import { MATERIAL_DRIFT_RECOVERY_INTENT_SCHEMA, scheduledAutomationSnapshotDigest } from "./canonical-turn-scheduled-pipeline-context.js"
 import {
   createScheduledAutomationPipelineBridge,
   SCHEDULED_PIPELINE_ATTESTATION_SCHEMA,
@@ -56,6 +57,7 @@ const emptyDiscoveryDigest = "e".repeat(64)
 
 type FixtureOptions = Readonly<{
   candidateIds?: readonly string[]; findingIds?: readonly string[]; source?: string; mode?: string
+  materialDriftRecoveryVerified?: boolean
   rootAttemptCount?: number; snapshotInput?: unknown; health?: Record<string, unknown> | null
   scoutAttemptCount?: number
   rootStatus?: string; turnStatus?: string; turnLeaseOwnerId?: string | null; turnLeaseVersion?: number; turnLeaseExpiresAt?: Date | string | null
@@ -113,14 +115,16 @@ function makeFixture(options: FixtureOptions = {}) {
   const state: ScheduledAutomationPipelineBridgeState = {
     turn: {
       userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
-      source: options.source ?? "automation", executionMode: options.mode ?? "canonical_task_graph",
-      input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: options.snapshotInput ?? criteriaSnapshot },
+      source: options.source ?? "automation", executionMode: options.mode && options.mode !== "manual" ? options.mode : "canonical_task_graph",
+      input: options.mode === "manual" ? { automationRunMode: "manual", scheduledAutomationSnapshot: options.snapshotInput ?? criteriaSnapshot,
+        materialDriftRecovery: materialDriftRecoveryIntent(options.snapshotInput ?? criteriaSnapshot) }
+        : { automationRunMode: "scheduled", scheduledAutomationSnapshot: options.snapshotInput ?? criteriaSnapshot },
       status: options.turnStatus ?? "in_progress", leaseOwnerId: options.turnLeaseOwnerId ?? scope.turnLeaseOwnerId,
       leaseVersion: options.turnLeaseVersion ?? scope.turnLeaseVersion, leaseExpiresAt: options.turnLeaseExpiresAt ?? new Date(Date.now() + 60_000),
     },
     root: { id: scope.rootTaskId, userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
       status: options.rootStatus ?? "running", attemptCount: options.rootAttemptCount ?? scope.rootAttemptCount },
-    snapshot, current, tasks,
+    snapshot, current, tasks, ...(options.materialDriftRecoveryVerified === undefined ? {} : { materialDriftRecoveryVerified: options.materialDriftRecoveryVerified }),
   }
   const verifyCompletedNode = vi.fn(async (input: Parameters<ScheduledAutomationPipelineBridgeDependencies["verifyCompletedNode"]>[0]) => verificationProof(input.structuredResult, input.node.templateId))
   const dependencies: ScheduledAutomationPipelineBridgeDependencies = { load: async () => state, verifyCompletedNode }
@@ -132,6 +136,21 @@ const PREPARE_CRITERIA = [
   "Prepare only jobs and 0-100 scores from the verified scheduled Analyze checkpoint.",
   "Persist immutable owner-fenced material references and return no resume or letter bodies.",
 ]
+
+function materialDriftRecoveryIntent(snapshot: unknown) {
+  const sourceMarker = { schemaVersion: "agent-harness.v2.scheduled-prepare-material-drift-terminal.v1",
+    reason: "scheduled_prepare_material_source_changed", owner: { userId: scope.userId, sessionId: scope.sessionId, turnId: "old-turn",
+      rootTaskId: "old-root", rootAttemptCount: 1, turnLeaseOwnerId: "old-worker", turnLeaseVersion: 1,
+      executionId: "execution-1", executionAttemptCount: 3 }, gate: { taskId: "old-gate", leaseOwnerId: "gate-worker", attemptCount: 1 },
+    analyzeFingerprintDigest: `sha256:${"1".repeat(64)}`, prepareProofDigest: `sha256:${"2".repeat(64)}`,
+    artifactDigest: `sha256:${"3".repeat(64)}`, currentMaterialDigest: `sha256:${"4".repeat(64)}`, proofDigest: `sha256:${"5".repeat(64)}` }
+  return { schemaVersion: MATERIAL_DRIFT_RECOVERY_INTENT_SCHEMA, turnId: scope.turnId, userId: scope.userId, sessionId: scope.sessionId,
+    automationId: "automation-1", previousTurnId: "old-turn", previousExecutionId: "execution-1", previousRecoveryTurnId: null,
+    previousGateTaskId: "old-gate",
+    previousGateAttemptCount: 1, previousRootTaskId: "old-root", previousRootAttemptCount: 1, previousTurnLeaseVersion: 1,
+    previousExecutionAttemptCount: 3, reservedExecutionAttemptCount: 4,
+    currentSnapshotDigest: scheduledAutomationSnapshotDigest(snapshot), sourceMarker }
+}
 
 function appendVerifiedPrepareAndGate(fixture: ReturnType<typeof makeFixture>, withGate: boolean) {
   const snapshot = fixture.state.snapshot as { schemaVersion: string; nodes: readonly unknown[] }
@@ -282,6 +301,15 @@ describe("scheduled automation TaskGraph pipeline bridge", () => {
     expect(fixture.verifyCompletedNode).toHaveBeenCalledTimes(2)
     expect(JSON.stringify(result.attestation)).not.toContain("9.2")
     expect(JSON.stringify(result.attestation)).not.toContain("jobs.example")
+  })
+
+  it("accepts manual recovery only after the persisted loader verifies its intent lineage", async () => {
+    const verified = makeFixture({ mode: "manual", materialDriftRecoveryVerified: true })
+    const result = await createScheduledAutomationPipelineBridge(verified.dependencies)(scope)
+    expect(result.status).toBe("ready")
+    const unverified = makeFixture({ mode: "manual", materialDriftRecoveryVerified: false })
+    await expect(createScheduledAutomationPipelineBridge(unverified.dependencies)(scope))
+      .resolves.toEqual({ status: "blocked", reasonCode: "scheduled_canonical_turn_required" })
   })
 
   it("keeps evidence identity stable when only the persisted Turn lease rotates", async () => {

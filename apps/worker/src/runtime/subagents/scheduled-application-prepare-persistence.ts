@@ -1,9 +1,12 @@
 import type pg from "pg"
 
 import { createAgentArtifactRepository, type AgentArtifactBaseInsert, type AgentArtifactDraftWrite, type AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
+import { artifactTaskFenceIsCurrent, findAgentArtifactByScopeWithClient } from "../../db/agent-artifact-repo-helpers.js"
+import { AgentArtifactRepositoryError } from "../../db/agent-artifact-repo.js"
 import { withFencedArtifactWriteTransaction } from "../../db/agent-artifact-write-transaction.js"
 import { loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
+import { parseTaskGraphSnapshot, taskGraphItemId } from "./task-graph-snapshot.js"
 import type { ScheduledPrepareArtifactWriteBinding, ScheduledPrepareJobInput } from "../tools/scheduled-application-prepare.js"
 
 export type ScheduledPrepareMaterialSources = Awaited<ReturnType<typeof loadSelectedJobArtifactContext>>
@@ -32,11 +35,14 @@ export async function persistScheduledPrepareMaterial(pool: pg.Pool, input: Sche
     : { kind: "scheduled_cover_letter_base", jobId: binding.jobId, sourceResumeId: sources.baseResumeId, sourceDigest: binding.sourceDigest }
   if (baseContent === undefined) throw new Error("scheduled_prepare_base_missing")
   const identity = scheduledPrepareArtifactIdentity(binding, input.invocation.owner.rootAttemptCount, provenanceRefs)
+  if (binding.kind !== kind) throw new AgentArtifactRepositoryError("precondition_failed", "Scheduled Prepare artifact kind does not match its write request.")
   const hash = hashArtifactContent(baseContent)
   const base: AgentArtifactBaseInsert = { id: identity.baseId, userId: binding.userId, jobId: binding.jobId, artifactType: kind, content: baseContent,
     hash, constraintHash: identity.baseConstraintHash, provenanceRefs: [...provenanceRefs], evidenceRefs: [...provenanceRefs] }
   const taskFence: AgentArtifactTaskFence = { ...binding.taskFence, taskFenceMode: "scheduled_prepare",
-    turnLeaseOwnerId: input.invocation.owner.turnLeaseOwnerId, turnLeaseVersion: input.invocation.owner.turnLeaseVersion }
+    turnLeaseOwnerId: input.invocation.owner.turnLeaseOwnerId, turnLeaseVersion: input.invocation.owner.turnLeaseVersion,
+    rootAttemptCount: input.invocation.owner.rootAttemptCount,
+    taskGraphItemId: taskGraphItemId(binding.taskFence.rootTaskId), parseTaskGraphSnapshot }
   const repository = createAgentArtifactRepository(pool)
   const write: AgentArtifactDraftWrite = { id: identity.draftId, userId: binding.userId, sessionId: binding.sessionId, jobId: binding.jobId,
     artifactType: kind, content, hash: hashArtifactContent(content), constraintHash: identity.constraintHash, provenanceRefs: [...provenanceRefs],
@@ -48,8 +54,21 @@ export async function persistScheduledPrepareMaterial(pool: pg.Pool, input: Sche
       || !scheduledPrepareProvenanceRefs(current, binding.jobId, provenanceRefs)) {
       throw new Error("scheduled_prepare_source_changed")
     }
-    await repository.insertBaseWithClient(client, base, taskFence)
-    return repository.saveDraft(write, client)
+    if (!await artifactTaskFenceIsCurrent(client, taskFence, binding.jobId)) {
+      throw new AgentArtifactRepositoryError("task_fence_denied", "Scheduled Prepare artifact task owner is stale or no longer admitted.")
+    }
+    const scope = { userId: binding.userId, jobId: binding.jobId, artifactType: kind }
+    const priorBase = await findAgentArtifactByScopeWithClient(client, { ...scope, lifecycle: "base" })
+    const baseRow = priorBase ?? await repository.insertBaseWithClient(client, base, taskFence)
+    if (baseRow.baseId !== baseRow.id || baseRow.baseHash !== baseRow.hash) {
+      throw new AgentArtifactRepositoryError("precondition_failed", "Scheduled Prepare base artifact is not a valid immutable anchor.")
+    }
+    const priorDraft = await findAgentArtifactByScopeWithClient(client, { ...scope, lifecycle: "draft" })
+    if (priorDraft && (priorDraft.baseId !== baseRow.id || priorDraft.baseHash !== baseRow.hash)) {
+      throw new AgentArtifactRepositoryError("stale_hash", "Scheduled Prepare draft does not reference the current immutable base.")
+    }
+    return repository.saveDraft({ ...write, id: priorDraft?.id ?? write.id, baseId: baseRow.id, baseHash: baseRow.hash,
+      previousHash: priorDraft?.hash ?? null }, client)
   })
   return { artifactId: row.artifactId, version: row.version, contentHash: row.contentHash, sourceDigest: row.sourceDigest }
 }

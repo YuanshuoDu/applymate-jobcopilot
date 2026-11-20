@@ -118,7 +118,7 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
       const prepared = parseScheduledPipelinePrepareContinuationResult(await input.continueAfterAnalyze({ owner: input.owner, executionOwner: input.executionOwner,
         attestation: evidence.attestation, proof: continuation.proof, candidateText: input.candidateText,
         finalStepId: input.finalStepId, finalStepOrdinal: input.finalStepOrdinal, recoveryStepId: input.recoveryStepId, signal: input.signal }), input.owner,
-        evidence.attestation, continuation.proof, input.finalStepId, input.finalStepOrdinal)
+        evidence.attestation, continuation.proof, input.finalStepId, input.finalStepOrdinal, input.recoveryStepId)
       if (!prepared) return { status: "blocked", errorCode: "scheduled_pipeline_prepare_proof_invalid" }
       if (prepared.status === "waiting_for_dependency") return { status: prepared.status, waitId: prepared.waitId, candidateText: input.candidateText }
       if (prepared.status === "waiting_for_choice") return { status: "waiting_for_user", waitId: prepared.waitId, candidateText: input.candidateText }

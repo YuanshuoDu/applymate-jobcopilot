@@ -53,6 +53,18 @@ describe("scheduled Prepare continuation proof parsing", () => {
       .toMatchObject({ status: "ready", choice: { required: false } })
   })
 
+  it("keeps the historical receipt on a recovery Step and rejects it on the original candidate Step", () => {
+    const { value, attestation, handoff } = fixture()
+    const resumed = { ...owner, turnLeaseOwnerId: "resumed", turnLeaseVersion: owner.turnLeaseVersion + 1 }
+    const reboundAttestation = { ...attestation, owner: resumed }
+    expect(parseScheduledPipelinePrepareContinuationResult(value, resumed, reboundAttestation, handoff, "candidate", 4)).toBeNull()
+    expect(parseScheduledPipelinePrepareContinuationResult(value, resumed, reboundAttestation, handoff, "candidate", 4, "recovery"))
+      .toMatchObject({ status: "ready", prepareProof: { receipt: value.prepareProof.receipt } })
+    const wrong = { ...resumed, rootAttemptCount: owner.rootAttemptCount + 1 }
+    expect(parseScheduledPipelinePrepareContinuationResult(value, wrong, { ...attestation, owner: wrong }, handoff, "candidate", 4, "recovery"))
+      .toBeNull()
+  })
+
   it("rejects missing, foreign, duplicate, or misbound source completion rows", () => {
     const input = fixture(), base = input.value
     const nodes = base.prepareProof.completion.nodes

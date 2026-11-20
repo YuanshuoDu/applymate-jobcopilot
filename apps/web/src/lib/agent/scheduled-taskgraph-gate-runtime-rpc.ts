@@ -19,6 +19,7 @@ import { parseScheduledAutomationSnapshot } from './scheduled-automation-snapsho
 import { scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { scheduledTaskGraphClaimMatches } from './scheduled-taskgraph-pipeline-fence'
 import { replayCompletedScheduledTaskGraphAuditReport, replayCompletedScheduledTaskGraphReport } from './scheduled-taskgraph-completed-report-replay'
+import { scheduledTaskGraphGatePreflightSnapshot, scheduledTaskGraphRecoverySnapshot } from './scheduled-taskgraph-recovery-callsite'
 import { blocked, matchingTurnSnapshot, scheduledTaskGraphClaimIsValid, scheduledTaskGraphLineageOwnerIsSame, scheduledTaskGraphRootLeaseIsLive } from './scheduled-taskgraph-pipeline-request'
 import { sameScheduledTaskGraphJson as sameJson } from './scheduled-taskgraph-canonical-prefix'
 import { runScheduledGate } from './stages/gate'
@@ -36,22 +37,22 @@ type OwnerState = { owner: ScheduledTaskGraphPipelineOwner; key: string; snapsho
 const CLAIM_TTL_MS = 600_000
 
 /** Runs the private Gate action or returns an Execute request after persisted proof validation. */
-export async function runScheduledTaskGraphActionRpc(request: GateAction, signal?: AbortSignal): Promise<Response | ScheduledContinuation> {
+export async function runScheduledTaskGraphActionRpc(request: GateAction, signal?: AbortSignal, workerRequest?: Request): Promise<Response | ScheduledContinuation> {
   if (signal?.aborted) return blocked(409, 'scheduled_pipeline_turn_stale')
-  if (request.action === 'gate') return runGateAction(request, signal)
+  if (request.action === 'gate') return runGateAction(request, signal, workerRequest)
   return request.action === 'scheduled_audit_execute' ? authorizeAuditExecute(request, signal) : authorizeExecute(request, signal)
 }
-async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?: AbortSignal): Promise<Response> {
+async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?: AbortSignal, workerRequest?: Request): Promise<Response> {
   const turn = await db.agentTurn.findFirst({ where: { id: request.owner.turnId, userId: request.owner.userId,
     sessionId: request.owner.sessionId, rootTaskId: request.owner.rootTaskId }, select: { input: true } })
-  const snapshot = matchingTurnSnapshot(turn?.input)
-  if (!snapshot) return blocked(409, 'scheduled_pipeline_mode_mismatch')
+  let snapshot = matchingTurnSnapshot(turn?.input)
+  if (!snapshot && turn) snapshot = await scheduledTaskGraphGatePreflightSnapshot({ client: db, request: workerRequest, owner: request.owner, turnInput: turn.input }); if (!snapshot) return blocked(409, 'scheduled_pipeline_mode_mismatch')
   const denied = await admission(request.owner.userId, snapshot)
   if (denied) return denied
   let preflightLocked: OwnerState | null = null
   const preflight = await db.$transaction(async tx => {
     await acquireScheduledTaskGraphGateSourceFence(tx, request.owner.userId, request.owner.userId)
-    const locked = preflightLocked = await lockOwner(tx, request, signal, true)
+    const locked = preflightLocked = await lockOwner(tx, request, signal, true, undefined, undefined, workerRequest)
     if (!locked) return null
     const checkpoint = scheduledTaskGraphAnalyzeCheckpointForGate(locked.state)
     await assertScheduledTaskGraphGateSourcesCurrent(tx, { owner: locked.owner, checkpoint })
@@ -71,8 +72,7 @@ async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?:
     ownedJobs: locked.jobs, persistedCheckpoint: checkpoint, activeClaimToken: locked.claimToken }, proof: request.prepareProof,
     packages: loaded.packages, materials: loaded.materials })
   if (!handoff) return blocked(409, 'scheduled_pipeline_attestation_invalid')
-  const assertFenceCurrent = (tx: Prisma.TransactionClient) => assertGateActionCurrent(tx, request, locked, signal, loaded.materials)
-  const assertFreshCurrent = async () => !signal?.aborted && await db.$transaction(assertFenceCurrent)
+  const assertFenceCurrent = (tx: Prisma.TransactionClient) => assertGateActionCurrent(tx, request, locked, signal, loaded.materials, workerRequest); const assertFreshCurrent = async () => !signal?.aborted && await db.$transaction(assertFenceCurrent)
   const configured = await loadUserAiConfig(locked.owner.userId, 'autoApply')
   const baseAiConfig = configured.resolvedKey ? configured : resolveConfig(APPLYMATE_BACKING)
   const aiConfig = { ...baseAiConfig, usageUserId: locked.owner.userId, usageFeatureKey: 'autoApply', usageRuntime: 'worker' as const }
@@ -85,7 +85,7 @@ async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?:
   const qualityOwner = { ...locked.owner, gateTaskId: request.gateTaskId, gateLeaseOwnerId: request.gateLeaseOwnerId,
     gateAttemptCount: request.gateAttemptCount, continuationKey: locked.key, claimToken: locked.claimToken }
   const scheduledGateQualityModelCall = createGateQualityUsageCaller({ owner: qualityOwner, signal, lockCurrentOwner: async tx => {
-    const current = await lockOwner(tx, request, signal)
+    const current = await lockOwner(tx, request, signal, false, undefined, undefined, workerRequest)
     return current && current.owner.executionId === locked.owner.executionId && current.owner.executionAttemptCount === locked.owner.executionAttemptCount
       && current.key === locked.key && current.claimToken === locked.claimToken ? qualityOwner : null } })
   const context: PipelineCtx = {
@@ -128,7 +128,7 @@ async function authorizeAuditExecute(request: ScheduledTaskGraphAuditExecuteRpcR
 }
 async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, signal?: AbortSignal, renew = false,
   gateCompletion?: { taskId: string; attemptCount: number; completionProof: unknown }, validateAnalyzeSource?: (owner: ScheduledTaskGraphPipelineOwner,
-    checkpoint: Record<string, unknown>) => Promise<void>): Promise<OwnerState | null> {
+    checkpoint: Record<string, unknown>) => Promise<void>, workerRequest?: Request): Promise<OwnerState | null> {
   if (signal?.aborted) return null
   const session = await tx.$queryRaw<Array<{ id: string; status: string }>>(Prisma.sql`
     SELECT "id", "status" FROM "agent_sessions"
@@ -145,8 +145,7 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
   if (!turn || turn.rootTaskId !== request.owner.rootTaskId || turn.source !== 'automation'
     || turn.executionMode !== 'canonical_task_graph' || request.action !== 'scheduled_audit_execute'
       && !scheduledTaskGraphGateTurnIsCurrent(turn, { owner: request.owner, mode: request.action === 'gate' ? 'gate_child' : 'root_execute' })) return null
-  const snapshot = matchingTurnSnapshot(turn.input)
-  if (!snapshot) return null
+  let snapshot = matchingTurnSnapshot(turn.input); if (!snapshot && (request.action !== 'gate' || !workerRequest)) return null
   const rootLock = await lockScheduledTaskGraphRootAction(tx, { owner: request.owner, action: request.action, turn,
     ...(request.action === 'gate' ? { gateTaskId: request.gateTaskId } : {}) })
   if (!rootLock) return null
@@ -169,6 +168,7 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
   if (signal?.aborted || !execution || execution.status !== 'running' || !Number.isSafeInteger(execution.attemptCount)) return null
   if (request.action === 'execute' && !scheduledTaskGraphRootLeaseIsLive(turn, request.owner)) return null
   const requestOwner: ScheduledTaskGraphPipelineOwner = { ...request.owner, executionId: execution.id, executionAttemptCount: execution.attemptCount }
+  if (!snapshot) snapshot = await scheduledTaskGraphRecoverySnapshot({ client: tx, request: workerRequest, owner: requestOwner, turnInput: turn.input, caller: 'gate' }); if (!snapshot) return null
   const gateRootWait = rootLock.gateWait ? { ...rootLock.gateWait, owner: requestOwner } : undefined
   let key: string
   try { key = scheduledTaskGraphContinuationKey(requestOwner, request.attestation) } catch { return null }
@@ -197,7 +197,7 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
   const proofCurrent = request.action === 'scheduled_audit_execute'
     ? await isScheduledTaskGraphAuditChildGateProofCurrent({ ...proofInput, auditActor: request.auditActor }, tx)
     : await isScheduledTaskGraphGateProofCurrent(proofInput, tx)
-  const prepareIsCurrent = request.action === 'gate' && gateRootWait && snapshot.requireApproval
+  const prepareIsCurrent = request.action === 'gate' && gateRootWait && (snapshot.requireApproval || record(turn.input)?.automationRunMode === 'manual')
     ? await validateScheduledTaskGraphAuditPrepareSource({ owner, snapshot, proof: request.prepareProof,
       ...(waitId ? { scheduledWaitId: waitId } : {}), reader: tx, gateWait: gateRootWait }).catch(() => false)
     : await (request.action === 'scheduled_audit_execute' ? validateScheduledTaskGraphAuditPrepareSource : validateScheduledPrepareWaitIdentity)
@@ -223,11 +223,11 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
   return { owner, key, snapshot, state, claimToken: claimToken as string, jobs,
     ...(waitId ? { waitId } : {}), ...(gateRootWait ? { gateRootWait } : {}) }
 }
-async function assertGateActionCurrent(tx: Prisma.TransactionClient, request: ScheduledTaskGraphGateRpcRequest, locked: OwnerState, signal: AbortSignal | undefined, expectedMaterials?: readonly { jobId: string; kind: string; artifactRef: unknown }[]): Promise<boolean> {
+async function assertGateActionCurrent(tx: Prisma.TransactionClient, request: ScheduledTaskGraphGateRpcRequest, locked: OwnerState, signal: AbortSignal | undefined, expectedMaterials?: readonly { jobId: string; kind: string; artifactRef: unknown }[], workerRequest?: Request): Promise<boolean> {
   if (signal?.aborted) return false
   await acquireScheduledTaskGraphGateSourceFence(tx, request.owner.userId, locked.owner.userId)
   const current = await lockOwner(tx, request, signal, false, undefined, (owner, checkpoint) =>
-    assertScheduledTaskGraphGateSourcesCurrent(tx, { owner, checkpoint }))
+    assertScheduledTaskGraphGateSourcesCurrent(tx, { owner, checkpoint }), workerRequest)
   if (!current || current.owner.executionId !== locked.owner.executionId || current.owner.executionAttemptCount !== locked.owner.executionAttemptCount
     || current.key !== locked.key || current.claimToken !== locked.claimToken) return false
   if (!expectedMaterials) return true

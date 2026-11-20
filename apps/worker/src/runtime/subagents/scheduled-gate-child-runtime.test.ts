@@ -176,7 +176,7 @@ function productionLoaderFixture(waitId: unknown = "agent-question:turn-1:canoni
     if (sql.includes('FROM "agent_wait_conditions"')) return { rows: [{ stepId: "prepare-step" }] }
     throw new Error(`unexpected fixed Gate loader query: ${sql}`)
   }), release: vi.fn() }
-  return { pool: { connect: async () => client }, client, storedOwner, registration, evidence, handoffKey }
+  return { pool: { connect: async () => client }, client, storedOwner, registration, evidence, handoffKey, checkpoint }
 }
 
 afterEach(() => {
@@ -257,6 +257,26 @@ describe("fixed scheduled Gate child runtime", () => {
     expect(handoff.post).not.toHaveBeenCalled()
     expect(loader.prepareProof).toHaveBeenCalledWith(expect.anything(), expect.anything(), "prepare-task", null,
       wrongKey, fixture.registration.prepareWaitId)
+  })
+
+  it.each([
+    { leaseVersion: 10, turnId: owner.turnId, expected: "completed" },
+    { leaseVersion: 9, turnId: owner.turnId, expected: "failed" },
+    { leaseVersion: 8, turnId: owner.turnId, expected: "failed" },
+    { leaseVersion: 10, turnId: "another-turn", expected: "failed" },
+  ])("attests with only a matching or advanced checkpoint lease ($leaseVersion/$turnId)", async test => {
+    const fixture = productionLoaderFixture()
+    fixture.checkpoint.scheduledTaskGraphContinuation.owner = { ...fixture.storedOwner, turnId: test.turnId,
+      turnLeaseOwnerId: "resumed-root-worker", turnLeaseVersion: test.leaseVersion }
+    handoff.post.mockResolvedValue(completed)
+    const executor = createScheduledGateChildExecutor({ pool: fixture.pool as never,
+      loadChoices: async () => ({ validatedChoice: null, priorChoices: [] }) })
+    await expect(executor({ lease: lease() })).resolves.toMatchObject({ status: test.expected })
+    if (test.expected === "failed") expect(handoff.post).not.toHaveBeenCalled()
+    else expect(handoff.post.mock.calls[0]?.[0]).toMatchObject({
+      owner: { turnLeaseOwnerId: "resumed-root-worker", turnLeaseVersion: 10 },
+      prepareProof: { receipt: { owner: fixture.storedOwner } },
+    })
   })
 
   it("rejects malformed persisted root wait identity while preserving absence when approval is disabled", async () => {

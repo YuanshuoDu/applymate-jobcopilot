@@ -12,6 +12,7 @@ import { scheduledPrepareAnalyzeSnapshot } from "./scheduled-prepare-runtime-con
 import type { ScheduledAutomationPersistedTurn } from "./scheduled-automation-pipeline-bridge.js"
 import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapshot.js"
 import { readScheduledPrepareCheckpoint, type ScheduledPrepareCheckpointStage } from "./scheduled-prepare-checkpoint.js"
+import type { ResumedPrepareWait } from "./scheduled-prepare-checkpoint-wait.js"
 import { parseScheduledTaskGraphContinuationReceipt, scheduledSnapshotMatches, SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_EVENT,
   scheduledTaskGraphContinuationKeyVersion, scheduledTaskGraphStableContinuationKey, type ScheduledTaskGraphContinuationReceipt } from "./scheduled-taskgraph-continuation-receipt.js"
 import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
@@ -30,7 +31,7 @@ export type ScheduledPrepareDependencyWait = Readonly<{ waitId: string; status: 
 export type ScheduledPrepareTaskGraphProof = Readonly<{ receipt: ScheduledTaskGraphContinuationReceipt; completion: ScheduledPrepareCompletionFacts & Readonly<{ wait: ScheduledPrepareDependencyWait }>; result: PrepareResult }>
 export type ScheduledPrepareVerification = Readonly<{ verified: true; facts: ScheduledPrepareTaskGraphProofFacts }> | Readonly<{ verified: false; reasonCode: string }>
 /** Verifies Prepare against its exact registered call, Analyze lineage, checkpoint, and immutable material rows. */
-export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable, input: Readonly<{ scope: ScheduledPrepareVerificationScope; snapshot: TaskGraphSnapshot; current: TaskGraphCurrentState; tasks: ReadonlyMap<string, GraphTaskRow>; structuredResult: unknown; completionGraphRevision: number; referenceVerificationMode: ScheduledPrepareToolResultVerificationMode; checkpointStage?: ScheduledPrepareCheckpointStage; gateWaitWitness?: ScheduledPrepareGateWaitWitness }>): Promise<ScheduledPrepareVerification> {
+export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable, input: Readonly<{ scope: ScheduledPrepareVerificationScope; snapshot: TaskGraphSnapshot; current: TaskGraphCurrentState; tasks: ReadonlyMap<string, GraphTaskRow>; structuredResult: unknown; completionGraphRevision: number; referenceVerificationMode: ScheduledPrepareToolResultVerificationMode; checkpointStage?: ScheduledPrepareCheckpointStage; gateWaitWitness?: ScheduledPrepareGateWaitWitness; resumedWait?: ResumedPrepareWait }>): Promise<ScheduledPrepareVerification> {
   try { const scope = input.scope, result = validateRoleResult(input.structuredResult, "prepare")
     if (result.status !== "completed" || result.taskId !== scope.taskId || result.attemptCount !== scope.attemptCount)
       return rejected("scheduled_prepare_result_invalid")
@@ -47,7 +48,8 @@ export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable,
       || !prepareGraphMatches(snapshot, current, scope, prepareTask, input.completionGraphRevision, prepare)) return rejected("scheduled_prepare_graph_invalid")
     const receipt = await readPrivateReceipt(client, scope)
     const root = receipt && await scheduledPrepareReceiptOwnerRootMatches(client, scope, receipt.owner,
-      input.referenceVerificationMode.phase, input.tasks, input.gateWaitWitness)
+      input.referenceVerificationMode.phase, input.tasks, input.gateWaitWitness,
+      input.referenceVerificationMode.phase === "finish" ? input.referenceVerificationMode.ownerId : undefined)
     if (!receipt || !root) return rejected("scheduled_prepare_receipt_invalid")
     const version = scheduledTaskGraphContinuationKeyVersion(receipt.continuationKey)
     if (!version || version !== graphVersion) return rejected("scheduled_prepare_receipt_invalid")
@@ -59,7 +61,8 @@ export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable,
     const automation = parseScheduledAutomationSnapshot(record(turn.input)?.scheduledAutomationSnapshot)
     const handoffKey = await verifyAnalyzePrefix(client, scope, snapshot, current, input.tasks, receipt, automation)
     if (!handoffKey) return rejected("scheduled_prepare_analyze_invalid")
-    const checkpoint = automation ? await readScheduledPrepareCheckpoint(client, receipt, automation, handoffKey, input.checkpointStage ?? "prepare") : null
+    const resumedWait = input.referenceVerificationMode.phase === "persisted_gate" && input.resumedWait?.prepareTaskId === prepare.taskId ? input.resumedWait : undefined
+    const checkpoint = automation ? await readScheduledPrepareCheckpoint(client, receipt, automation, handoffKey, input.checkpointStage ?? "prepare", resumedWait) : null
     if (!checkpoint || checkpoint.checkpointDigest !== receipt.checkpointDigest) return rejected("scheduled_prepare_checkpoint_invalid")
     const expectedIds = checkpoint.eligibleJobIds
     if (!sameIds(result.jobs.map(job => job.jobId), expectedIds) || result.snapshotDigest !== receipt.snapshotDigest

@@ -4,11 +4,17 @@ import type { AgentArtifactBaseInsert, AgentArtifactDraftWrite } from "../../db/
 import type { ScheduledPrepareArtifactWriteBinding, ScheduledPrepareJobInput } from "../tools/scheduled-application-prepare.js"
 import type { ScheduledPrepareMaterialSources } from "./scheduled-application-prepare-persistence.js"
 import { persistScheduledPrepareMaterial } from "./scheduled-application-prepare-persistence.js"
+import { taskGraphItemId } from "./task-graph-snapshot.js"
 
-const { createArtifactRepository, loadSelectedJobArtifactContext } = vi.hoisted(() => ({
+const { createArtifactRepository, loadSelectedJobArtifactContext, artifactTaskFenceIsCurrent, findArtifactByScope } = vi.hoisted(() => ({
   createArtifactRepository: vi.fn(), loadSelectedJobArtifactContext: vi.fn(),
+  artifactTaskFenceIsCurrent: vi.fn(), findArtifactByScope: vi.fn(),
 }))
 vi.mock("../../db/agent-artifact-repo.js", () => ({ createAgentArtifactRepository: createArtifactRepository }))
+vi.mock("../../db/agent-artifact-repo-helpers.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../../db/agent-artifact-repo-helpers.js")>(),
+  artifactTaskFenceIsCurrent, findAgentArtifactByScopeWithClient: findArtifactByScope,
+}))
 vi.mock("./selected-job-artifact-context.js", () => ({ loadSelectedJobArtifactContext }))
 
 const sourceDigest = "sha256:" + "c".repeat(64)
@@ -62,18 +68,25 @@ function createHarness(current: ScheduledPrepareMaterialSources = source, failDr
   }
   const pool = { connect: vi.fn(async () => client) } as unknown as Pool
   const repository = {
-    insertBaseWithClient: vi.fn(async (writeClient: PoolClient, _base: AgentArtifactBaseInsert) => {
+    insertBaseWithClient: vi.fn(async (writeClient: PoolClient, base: AgentArtifactBaseInsert) => {
       events.push("base-insert-call")
       await writeClient.query("INSERT BASE")
+      return { id: base.id, userId: base.userId, jobId: base.jobId, artifactType: base.artifactType,
+        lifecycle: "base", baseId: base.id, baseHash: base.hash, hash: base.hash }
     }),
     saveDraft: vi.fn(async (write: AgentArtifactDraftWrite, writeClient: PoolClient) => {
       events.push("draft-save-call")
       await writeClient.query("INSERT DRAFT HEAD")
       await writeClient.query("INSERT DRAFT VERSION")
       if (failDraft) throw new Error("draft version write failed")
-      return { artifactId: write.id, version: 1, contentHash: write.hash, sourceDigest: write.sourceDigest }
+      return { artifactId: write.id, version: write.previousHash ? 2 : 1, contentHash: write.hash, sourceDigest: write.sourceDigest }
     }),
   }
+  artifactTaskFenceIsCurrent.mockReset().mockImplementation(async () => { events.push("owner-fence"); return true })
+  findArtifactByScope.mockReset().mockImplementation(async (_client: PoolClient, scope: { lifecycle: string }) => {
+    events.push(`artifact-find-${scope.lifecycle}`)
+    return null
+  })
   createArtifactRepository.mockReturnValue(repository)
   loadSelectedJobArtifactContext.mockImplementation(async (readClient: PoolClient, userId: string, jobId: string) => {
     events.push("source-read")
@@ -100,12 +113,17 @@ describe("scheduled Prepare fenced persistence", () => {
     expect(events.indexOf("source-fence-verify")).toBeLessThan(events.indexOf("job-advisory"))
     expect(events.indexOf("job-advisory")).toBeLessThan(events.indexOf("source-read"))
     expect(events.indexOf("source-read")).toBeLessThan(events.indexOf("base-insert-call"))
+    expect(events.indexOf("owner-fence")).toBeLessThan(events.indexOf("artifact-find-base"))
+    expect(events.indexOf("artifact-find-base")).toBeLessThan(events.indexOf("base-insert-call"))
     expect(events.indexOf("base-insert-call")).toBeLessThan(events.indexOf("draft-save-call"))
     expect(events.indexOf("draft-save-call")).toBeLessThan(events.indexOf("commit"))
+    expect(artifactTaskFenceIsCurrent).toHaveBeenCalledWith(client, expect.objectContaining({
+      taskGraphItemId: taskGraphItemId(binding.taskFence.rootTaskId), parseTaskGraphSnapshot: expect.any(Function),
+    }), binding.jobId)
     expect(repository.insertBaseWithClient).toHaveBeenCalledWith(client, expect.objectContaining({ userId: "user-a", jobId: "job-a" }),
-      expect.objectContaining({ taskFenceMode: "scheduled_prepare", turnLeaseOwnerId: "turn-owner-current", turnLeaseVersion: 12 }))
+      expect.objectContaining({ taskFenceMode: "scheduled_prepare", turnLeaseOwnerId: "turn-owner-current", turnLeaseVersion: 12, rootAttemptCount: 2 }))
     expect(repository.saveDraft).toHaveBeenCalledWith(expect.objectContaining({
-      taskFence: expect.objectContaining({ taskFenceMode: "scheduled_prepare", turnLeaseOwnerId: "turn-owner-current", turnLeaseVersion: 12 }),
+      taskFence: expect.objectContaining({ taskFenceMode: "scheduled_prepare", turnLeaseOwnerId: "turn-owner-current", turnLeaseVersion: 12, rootAttemptCount: 2 }),
       provenanceRefs: evidenceRefs, evidenceRefs,
     }), client)
     expect(client.release).toHaveBeenCalledTimes(1)
@@ -140,5 +158,21 @@ describe("scheduled Prepare fenced persistence", () => {
     expect(events).toContain("rollback")
     expect(events).not.toContain("commit")
     expect(committedWrites).toEqual([])
+  })
+
+  it("reuses the existing immutable base and draft identity for fresh source materials", async () => {
+    const { pool, repository, input } = createHarness()
+    const base = { id: "base-existing", userId: "user-a", jobId: "job-a", artifactType: "resume", lifecycle: "base",
+      baseId: "base-existing", baseHash: "base-hash", hash: "base-hash" }
+    const draft = { id: "draft-existing", userId: "user-a", jobId: "job-a", artifactType: "resume", lifecycle: "draft",
+      baseId: "base-existing", baseHash: "base-hash", hash: "previous-draft-hash" }
+    findArtifactByScope.mockImplementation(async (_client: PoolClient, scope: { lifecycle: string }) => scope.lifecycle === "base" ? base : draft)
+
+    await expect(persistScheduledPrepareMaterial(pool, input, "resume", { summary: "freshly tailored" }, source))
+      .resolves.toMatchObject({ artifactId: "draft-existing", version: 2, sourceDigest })
+
+    expect(repository.insertBaseWithClient).not.toHaveBeenCalled()
+    expect(repository.saveDraft).toHaveBeenCalledWith(expect.objectContaining({ id: "draft-existing", baseId: "base-existing",
+      baseHash: "base-hash", previousHash: "previous-draft-hash" }), expect.any(Object))
   })
 })

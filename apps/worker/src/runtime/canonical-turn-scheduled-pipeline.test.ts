@@ -40,7 +40,7 @@ describe("canonical Turn scheduled pipeline assembly", () => {
     expect(assembly.bridge).toBe(bridge)
     expect(assembly.createCandidateStore(eventStore)).toBe(candidateStore)
     expect(candidateStoreFactory).toHaveBeenCalledWith({ pool, eventStore })
-    const owner = assembly.owner({ taskGraphPlanningEnabled: true, state: scheduledState, lease, root })
+    const owner = assembly.owner({ taskGraphPlanningEnabled: true, state: scheduledState, materialDriftRecovery: false, lease, root })
     expect(owner).toEqual({
       userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: root.id,
       rootAttemptCount: root.attemptCount, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
@@ -48,8 +48,10 @@ describe("canonical Turn scheduled pipeline assembly", () => {
     await expect(assembly.readCandidate({ store: candidateStore, owner, executionOwner })).resolves.toEqual(recoveredCandidate)
     expect(candidateStore.read).toHaveBeenCalledWith({ owner: executionOwner, rootAttemptCount: root.attemptCount })
 
-    expect(assembly.owner({ taskGraphPlanningEnabled: true, state: { ...scheduledState, automationRunMode: "manual" }, lease, root })).toBeUndefined()
-    expect(assembly.owner({ taskGraphPlanningEnabled: false, state: scheduledState, lease, root })).toBeUndefined()
+    const manual = { ...scheduledState, automationRunMode: "manual" } as const
+    expect(assembly.owner({ taskGraphPlanningEnabled: true, state: manual, materialDriftRecovery: false, lease, root })).toBeUndefined()
+    expect(assembly.owner({ taskGraphPlanningEnabled: true, state: manual, materialDriftRecovery: true, lease, root })).toEqual(owner)
+    expect(assembly.owner({ taskGraphPlanningEnabled: false, state: scheduledState, materialDriftRecovery: true, lease, root })).toBeUndefined()
   })
 
   it("keeps persisted bridge reads inside the user-scoped transaction", async () => {

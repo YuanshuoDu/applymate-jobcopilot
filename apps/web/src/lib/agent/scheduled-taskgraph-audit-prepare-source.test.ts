@@ -91,6 +91,29 @@ describe('Audit-only historical Prepare source validation', () => {
       source: { sourceEventId: candidateEvent.id, stepId: sourceStepId, ordinal: sourceStepOrdinal } }))
   })
 
+  it('accepts an approval-free dependency wait only with no recorded approval or Prepare choice', async () => {
+    const approvalFree = { ...snapshot, requireApproval: false }
+    const approvalFreeReceipt = { ...receipt, snapshotDigest: scheduledAutomationSnapshotDigest(approvalFree) }
+    mocks.events.mockImplementation((query: { where: Record<string, unknown> }) => {
+      if (query.where.type === 'agent.plan.scheduled_prepare_binding') return Promise.resolve([{ payload: approvalFreeReceipt }])
+      if (query.where.type === 'native_verification.scheduled_candidate_staged') return Promise.resolve([candidateEvent])
+      return Promise.resolve([])
+    })
+    mocks.choice.mockResolvedValue(null)
+    const gateWait = { waitId: 'root-gate-wait', stepId: 'recovery-tail', gateTaskId: 'gate-child', approvalIds: [], requestAttemptCount: 0, owner,
+      turn: { id: owner.turnId, status: 'waiting_for_dependency', leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: null },
+      root: { id: owner.rootTaskId, status: 'waiting' as const, attemptCount: owner.rootAttemptCount, waitId: 'root-gate-wait' } }
+    const input = { owner, snapshot: approvalFree, proof: { ...request.proof, receipt: approvalFreeReceipt }, gateWait }
+    await expect(validateScheduledTaskGraphAuditPrepareSource(input)).resolves.toBe(true)
+    expect(mocks.recoveryEvidence).toHaveBeenCalledWith(expect.objectContaining({ gateWait }))
+    await expect(validateScheduledTaskGraphAuditPrepareSource({ ...input, gateWait: { ...gateWait, approvalIds: ['approval'] } })).resolves.toBe(false)
+    await expect(validateScheduledTaskGraphAuditPrepareSource({ ...input, gateWait: {
+      ...gateWait, turn: { ...gateWait.turn, status: 'waiting_for_approval' },
+    } })).resolves.toBe(false)
+    mocks.choice.mockResolvedValue(choiceItem)
+    await expect(validateScheduledTaskGraphAuditPrepareSource(input)).resolves.toBe(false)
+  })
+
   it('accepts legacy v2 and receipt-bearing v3 candidates while rejecting malformed or widened payloads', async () => {
     const withPayload = (payload: unknown) => mocks.events.mockImplementation((query: { where: Record<string, unknown> }) => {
       if (query.where.type === 'agent.plan.scheduled_prepare_binding') return Promise.resolve([{ payload: receipt }])

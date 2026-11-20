@@ -149,6 +149,7 @@ export async function taskGraphRuntimeForTurn(input: {
   enabled: boolean
   turnSource?: string
   automationRunMode?: "scheduled" | "manual"
+  trustedMaterialDriftRecovery?: boolean
   turnInput?: unknown
   pool: Pick<pg.Pool, "connect">
   lease: TurnLease
@@ -158,6 +159,8 @@ export async function taskGraphRuntimeForTurn(input: {
   taskGraphTemplates?: Readonly<Record<string, TaskGraphTaskTemplate>>
 }): Promise<{ enabled: boolean; selectedJobMode: boolean; selectedJobPreparation: SelectedJobPreparation | undefined; scheduledDraftMode: boolean; templates: Readonly<Record<string, TaskGraphTaskTemplate>> | undefined }> {
   const scheduledAutomationRun = input.turnSource === "automation" && input.automationRunMode === "scheduled"
+  const manualRecoveryRun = input.turnSource === "automation" && input.automationRunMode === "manual" && input.trustedMaterialDriftRecovery === true
+  const automationPipelineRun = scheduledAutomationRun || manualRecoveryRun
   if (!input.enabled) return {
     enabled: false, selectedJobMode: false, selectedJobPreparation: undefined, scheduledDraftMode: false,
     templates: taskGraphTemplatesForApplicationFill(input.taskGraphTemplates, undefined),
@@ -177,15 +180,16 @@ export async function taskGraphRuntimeForTurn(input: {
         manualSnapshot = parseScheduledAutomationSnapshot(turnInput?.scheduledAutomationSnapshot)
         if (!manualSnapshot) throw new Error("scheduled_automation_context_invalid")
       }
+      if (manualRecoveryRun && !manualSnapshot) throw new Error("scheduled_automation_context_invalid")
     } else {
       throw new Error("scheduled_automation_context_invalid")
     }
   }
   const now = input.now()
   const [preparation, applicationFill] = await Promise.all([
-    scheduledAutomationRun ? Promise.resolve(undefined)
+    automationPipelineRun ? Promise.resolve(undefined)
       : (input.selectedJobPreparationLoader ?? loadSelectedJobPreparation)(input.pool, input.lease, now),
-    scheduledAutomationRun ? Promise.resolve(undefined)
+    automationPipelineRun ? Promise.resolve(undefined)
       : (input.applicationFillPreparationLoader ?? loadApplicationFillPreparation)(input.pool, input.lease, now),
   ])
   // Scheduled automation approvals are owned by the pipeline Gate; keep the #873 draft writer/reviewer path out.
@@ -193,7 +197,7 @@ export async function taskGraphRuntimeForTurn(input: {
   const templates = scheduledSnapshot
     ? taskGraphTemplatesForAutomationCriteria(input.taskGraphTemplates, criteriaForScheduledSnapshot(scheduledSnapshot), false, scheduledAutomationRun)
     : preparation ? taskGraphTemplatesForSelectedJob(preparation)
-      : manualSnapshot ? taskGraphTemplatesForAutomationCriteria(input.taskGraphTemplates, criteriaForScheduledSnapshot(manualSnapshot), true)
+      : manualSnapshot ? taskGraphTemplatesForAutomationCriteria(input.taskGraphTemplates, criteriaForScheduledSnapshot(manualSnapshot), true, manualRecoveryRun)
         : input.taskGraphTemplates
   if ((scheduledSnapshot || (manualSnapshot && !preparation)) && (!templates?.scout || !templates.analyst)) {
     return { enabled: false, selectedJobMode: false, selectedJobPreparation: undefined, scheduledDraftMode, templates: undefined }

@@ -9,6 +9,7 @@ import type { Queryable } from "./pg-store-persistence.js"
 import { scheduledAnalyzeGraphMatches as verifyScheduledAnalyzeGraph } from "./scheduled-analyze-graph-proof.js"
 import type { GraphTaskRow } from "./task-graph-pg-state.js"
 import { projectScheduledPipelineGraph } from "./scheduled-pipeline-graph-shape.js"
+import { readMaterialDriftRecoveryIntent, scheduledAutomationSnapshotDigest } from "./canonical-turn-scheduled-pipeline-context.js"
 
 export const SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA = "agent-harness.v2.scheduled-taskgraph-continuation-receipt.v1" as const
 export const SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_EVENT = "agent.plan.scheduled_prepare_binding" as const
@@ -75,10 +76,13 @@ export function scheduledTaskGraphClaimMatches(state: unknown, binding: Schedule
 export function scheduledSnapshotMatches(turnValue: unknown, digest: string): boolean {
   const turn = objectRecord(turnValue), input = objectRecord(turn?.input)
   const snapshot = parseScheduledAutomationSnapshot(input?.scheduledAutomationSnapshot)
-  if (!turn || turn.source !== "automation" || turn.executionMode !== "canonical_task_graph" || input?.automationRunMode !== "scheduled" || !snapshot) return false
-  const expected = `sha256:${createHash("sha256").update(JSON.stringify([snapshot.schemaVersion, snapshot.targetRoles,
-    snapshot.targetLocations, snapshot.minScore, snapshot.dailyCap, snapshot.requireApproval, snapshot.autoApply]), "utf8").digest("hex")}`
-  return digest === expected
+  const rawIntent = objectRecord(input?.materialDriftRecovery)
+  const recovery = readMaterialDriftRecoveryIntent({ ...turn, id: turn?.id ?? turn?.turnId ?? rawIntent?.turnId,
+    userId: turn?.userId ?? rawIntent?.userId, sessionId: turn?.sessionId ?? rawIntent?.sessionId })
+  if (!turn || turn.source !== "automation" || turn.executionMode !== "canonical_task_graph" || !snapshot) return false
+  const authorizedMode = input?.automationRunMode === "scheduled" ? recovery.status === "absent"
+    : input?.automationRunMode === "manual" && recovery.status === "valid"
+  return authorizedMode && digest === scheduledAutomationSnapshotDigest(snapshot)
 }
 
 /** Validates the persisted Analyze DAG, typed results, verification receipts, and bridge attestation. */

@@ -3,6 +3,7 @@ import type { TurnResumeState } from "./turns/turn-engine-types.js"
 import type { TaskGraphDenialProgress } from "./turns/turn-execution-types.js"
 import type { RecoveredArchivedWaitControl } from "./turns/turn-execution-wait.js"
 import { isTaskGraphDenialProgressValid } from "./turns/task-graph-denial-progress.js"
+import { isScheduledRecoveryOperationalWait } from "./canonical-turn-scheduled-recovery-wait.js"
 
 type Row = Record<string, unknown>
 type Usage = { inputTokens: number; outputTokens: number; estimatedCostUsd: number }
@@ -88,8 +89,9 @@ function finalEvidenceRecoveryUsed(events: readonly Row[], steps: readonly Row[]
 }
 
 /** Returns only a server-closed waiting Step's full emitted batch count. */
-function closedWaitBatchCount(step: Row, items: readonly Row[], events: readonly Row[], scope: Scope): number | undefined {
+function closedWaitBatchCount(step: Row, items: readonly Row[], events: readonly Row[], waits: readonly Row[], scope: Scope): number | undefined {
   if (step.status !== "waiting_for_tool" || typeof step.id !== "string" || !step.id || step.taskId != null && step.taskId !== scope.rootTaskId) return undefined
+  if (isScheduledRecoveryOperationalWait({ step, items, events, waits, scope })) return undefined
   const stepId = step.id, key = `turn:${scope.turnId}:event:step-completed:${stepId}`
   const completions = events.filter(event => event.type === "step.completed" && event.correlationId === stepId)
   if (completions.length === 0) return undefined
@@ -179,6 +181,7 @@ function closedWaitBatchCount(step: Row, items: readonly Row[], events: readonly
 export function buildCanonicalTurnResumeState(input: {
   readonly last?: Row; readonly maxOrdinal: number | null; readonly steps: readonly Row[]
   readonly persistedToolCallCount: number; readonly items: readonly Row[]; readonly events: readonly Row[]; readonly scope: Scope
+  readonly scheduledRecoveryWaitRows?: readonly Row[]
   readonly recoveredWaitControl?: RecoveredArchivedWaitControl
   readonly taskGraphDenialProgress?: TaskGraphDenialProgress
 }): TurnResumeState | undefined {
@@ -193,7 +196,7 @@ export function buildCanonicalTurnResumeState(input: {
   let toolCallCount = input.persistedToolCallCount
   const closedCounts = new Map<string, number>()
   for (const step of input.steps) {
-    const count = closedWaitBatchCount(step, input.items, input.events, input.scope)
+    const count = closedWaitBatchCount(step, input.items, input.events, input.scheduledRecoveryWaitRows ?? [], input.scope)
     if (count !== undefined && typeof step.id === "string") {
       const prefix = input.items.filter(item => item.stepId === step.id && item.type === "tool_call").length
       toolCallCount += count - prefix

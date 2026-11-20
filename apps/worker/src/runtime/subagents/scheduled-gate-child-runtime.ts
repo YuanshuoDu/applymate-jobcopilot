@@ -136,17 +136,22 @@ async function loadInvocation(pool: Pick<pg.Pool, "connect">, lease: SubagentLea
     const prepareProof = await loadPersistedScheduledPrepareProof(client,
       { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!, rootTaskId: lease.rootTaskId },
       prepareNode.taskId, prepareTask.result, evidence.prepareWaitContinuationKey, registration.prepareWaitId)
+    const claimOwner = record(record(record(row.state)?.scheduledTaskGraphContinuation)?.owner)
+    const original = prepareProof?.receipt.owner
+    const checkpointOwner = original && validId(claimOwner?.turnLeaseOwnerId) && typeof claimOwner.turnLeaseVersion === "number"
+      && Number.isSafeInteger(claimOwner.turnLeaseVersion)
+      && (claimOwner.turnLeaseVersion > original.turnLeaseVersion || (claimOwner.turnLeaseVersion === original.turnLeaseVersion
+        && claimOwner.turnLeaseOwnerId === original.turnLeaseOwnerId))
+      ? { ...original, turnLeaseOwnerId: claimOwner.turnLeaseOwnerId, turnLeaseVersion: claimOwner.turnLeaseVersion } : null
     if (!prepareProof || !scheduledGatePreparedJobIds(prepareProof) || prepareProof.completion.wait.waitId !== registration.prepareWaitId
-      || registration.prepareScheduleRevision !== prepareProof.receipt.prepareScheduleRevision
       || !samePreparedLineage(prepareProof, registration)
-      || !sameJson(prepareProof.receipt.owner, record(record(row.state)?.scheduledTaskGraphContinuation)?.owner)) {
+      || !checkpointOwner || !sameJson(checkpointOwner, claimOwner)) {
       throw new ScheduledGateRuntimeError("scheduled_gate_prepare_proof_invalid")
     }
-    const current = currentTaskGraph(graph)
-    const pipelineScope = pipelineOwner(prepareProof.receipt.owner)
-    const proof = await buildScheduledPipelineGraphAttestation({ scope: pipelineScope,
+    const { executionId: _executionId, executionAttemptCount: _attempt, ...attestationOwner } = checkpointOwner
+    const proof = await buildScheduledPipelineGraphAttestation({ scope: attestationOwner,
       schedule: record(row.turnInput)?.scheduledAutomationSnapshot, snapshot: graph.snapshot,
-      current, tasks: graph.tasks, verifyCompletedNode: input => verifyCompletedTaskGraphNodeEvidence(client, input) })
+      current: currentTaskGraph(graph), tasks: graph.tasks, verifyCompletedNode: input => verifyCompletedTaskGraphNodeEvidence(client, input) })
     const attestation = proof.status === "ready" ? proof.attestation : null
     if (attestation && (attestation.evidenceDigest !== evidence.evidenceDigest || attestation.snapshotDigest !== evidence.snapshotDigest
       || attestation.graphRevision !== evidence.analyzeGraphRevision)) throw new ScheduledGateRuntimeError("scheduled_gate_analyze_proof_invalid")
@@ -156,7 +161,6 @@ async function loadInvocation(pool: Pick<pg.Pool, "connect">, lease: SubagentLea
     return { owner: attestation.owner, attestation, prepareProof, ...(scheduledWaitId ? { scheduledWaitId } : {}) }
   } catch (error: unknown) {
     await client.query("ROLLBACK").catch(() => undefined)
-    if (error instanceof ScheduledGateRuntimeError) throw error
     throw error
   } finally { client.release() }
 }
@@ -226,10 +230,6 @@ function samePreparedLineage(proof: ScheduledPrepareTaskGraphProof, registration
     && proof.receipt.evidenceDigest === registration.evidenceDigest && proof.receipt.checkpointDigest === registration.checkpointDigest
     && proof.receipt.analyzeGraphRevision === registration.analyzeGraphRevision
     && proof.receipt.prepareScheduleRevision === registration.prepareScheduleRevision
-}
-function pipelineOwner(owner: ScheduledPrepareTaskGraphProof["receipt"]["owner"]): ScheduledAutomationPipelineBridgeScope {
-  return { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
-    rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion }
 }
 function sameLiveLease(row: Row, lease: SubagentLease, now: Date): boolean {
   const expiry = row.leaseExpiresAt instanceof Date ? row.leaseExpiresAt : new Date(String(row.leaseExpiresAt))

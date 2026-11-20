@@ -9,6 +9,7 @@ import { steeringReconciliationId, steeringReconciliationRevision, steeringRecon
 import { lockTaskGraphScope } from "./task-graph-pg-state.js"
 import { taskGraphItemId } from "./task-graph-snapshot.js"
 import { readSteeringReconciliationHistory } from "./steering-reconciliation-history.js"
+import { resolveSteeringAgendaStep } from "./scheduled-recovery-agenda-lineage.js"
 
 type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -219,20 +220,22 @@ export async function readSteeringReconciliationState(client: Client, scope: Ste
   }
   const current = [...unresolved.values()].sort(compareInput)
   if (decision && current.some(input => input.consumer && (compareStep(input.consumer, decision) > 0 || input.acceptedSequence > decision.cursor))) throw new Error("steering_reconciliation_cursor_invalid")
-  const agendaPlanRevision = decision ? await readAgenda(client, scope, decision.id) : null
+  const agendaPlanRevision = decision ? await readAgenda(client, scope, decision.agendaStepId) : null
   return { originalInputId: rootId, currentRevision: revision, decisionStepId: decision?.id ?? null,
     decisionStepOrdinal: decision?.ordinal ?? null, decisionStepAttempt: decision?.attempt ?? null,
     decisionInputThroughSequence: decision?.cursor ?? null, agendaPlanRevision,
     unresolvedInputs: current.map(({ id, acceptedSequence, status, consumedByStepId, consumingOrdinal }) => ({ id, acceptedSequence, status, consumedByStepId, consumingOrdinal })) }
 }
 
-async function readCurrentDecisionStep(client: Client, scope: SteeringReconciliationScope): Promise<Step> {
-  const result = await client.query<Row>(`SELECT "id", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds"
+async function readCurrentDecisionStep(client: Client, scope: SteeringReconciliationScope): Promise<Step & { agendaStepId: string }> {
+  const result = await client.query<Row>(`SELECT "id", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot"
     FROM "agent_steps" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 FOR UPDATE`,
   [scope.stepId, scope.sessionId, scope.turnId, scope.rootTaskId])
   const current = step(result.rows[0])
   if (!current || result.rows[0]?.taskId !== scope.rootTaskId || current.status !== "streaming" || current.attempt !== scope.parentAttemptCount) throw new Error("steering_reconciliation_decision_step_invalid")
-  return current
+  const agendaStepId = await resolveSteeringAgendaStep(client, scope, { id: current.id, ordinal: current.ordinal,
+    inputThroughSequence: current.cursor, modelProfileSnapshot: result.rows[0]?.modelProfileSnapshot })
+  return { ...current, agendaStepId }
 }
 
 export async function assertNoUnresolvedSteering(client: Client, scope: SteeringReconciliationScope): Promise<void> {

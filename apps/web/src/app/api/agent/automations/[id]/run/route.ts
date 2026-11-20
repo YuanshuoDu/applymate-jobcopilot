@@ -8,6 +8,7 @@ import { buildScheduledAutomationSnapshot, ScheduledAutomationSnapshotValidation
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
 import { AutomationTurnOccupiedError, ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
+import { startMaterialDriftRecovery } from "@/lib/agent/material-drift-recovery"
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import { isRuntimeAgentHarnessFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { createDualWriteSession } from '@/lib/agent/session/dual-write'
@@ -46,9 +47,9 @@ type SessionRow = {
 
 function serializeSession(session: SessionRow) {
   return {
-    ...session,
-    createdAt: session.createdAt.toISOString(),
-    updatedAt: session.updatedAt.toISOString(),
+    id: session.id, goal: session.goal, status: session.status, source: session.source,
+    memorySummary: session.memorySummary, qualityScore: session.qualityScore, currentTaskId: session.currentTaskId,
+    createdAt: session.createdAt.toISOString(), updatedAt: session.updatedAt.toISOString(),
     completedAt: session.completedAt?.toISOString() ?? null,
   }
 }
@@ -126,32 +127,37 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     throw error
   }
 
-  if (automation.sessionId) {
+  const runAt = new Date()
+  const recoveryResult = automation.sessionId
+    ? await startMaterialDriftRecovery(db, { automationId: automation.id, userId: auth.userId, sessionId: automation.sessionId, now: runAt })
+    : null
+  if (recoveryResult?.kind === "rejected") return err("Automation recovery could not be verified", 409)
+  if (recoveryResult?.kind === "already_started") return ok({
+    session: serializeSession(recoveryResult.session as SessionRow), turnId: recoveryResult.turnId,
+    executionId: recoveryResult.executionId, dispatchId: recoveryResult.dispatchId, turnStatus: recoveryResult.turnStatus,
+  }, 202)
+  const recovery = recoveryResult?.kind === "created" ? recoveryResult : null
+  if (!recovery && automation.sessionId) {
     const execution = await db.agentExecution.findFirst({
       where: { userId: auth.userId, sessionId: automation.sessionId },
       select: { status: true },
     })
     if (isActiveAutomationExecution(execution?.status)) return err("Automation is already running", 409)
   }
+  const runAutomation = recovery?.automation ?? automation
+  if (!recovery) {
+    const claim = await db.agentAutomation.updateMany({
+      where: runnableAutomationWhere(automation, auth.userId),
+      data: { lastRunAt: runAt, nextRunAt: nextRunAfterCurrent(automation.cron, runAt, automation.timezone) },
+    })
+    if (claim.count === 0) return err("Automation is paused", 409)
+  }
 
-  const runAt = new Date()
-  const claim = await db.agentAutomation.updateMany({
-    where: runnableAutomationWhere(automation, auth.userId),
-    data: {
-      lastRunAt: runAt,
-      nextRunAt: nextRunAfterCurrent(automation.cron, runAt, automation.timezone),
-    },
-  })
-  if (claim.count === 0) return err("Automation is paused", 409)
-
-  const resolution = await resolveAutomationSession(db, {
-    automationId: automation.id,
-    userId: auth.userId,
-    sessionId: automation.sessionId,
-    name: automation.name,
+  const resolution = recovery ? { session: recovery.session, created: false } : await resolveAutomationSession(db, {
+    automationId: automation.id, userId: auth.userId, sessionId: automation.sessionId, name: automation.name,
   })
   const { session, created } = resolution
-  if (!created) {
+  if (!recovery && !created) {
     const reopened = await db.agentSession.updateMany({
       where: { id: session.id, userId: auth.userId },
       data: { status: "running", completedAt: null, memorySummary: "Automation queued for execution." },
@@ -161,10 +167,10 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
 
   let canonicalTurn: Awaited<ReturnType<typeof ensureAutomationTurn>>
   try {
-    canonicalTurn = await ensureAutomationTurn(db, {
+    canonicalTurn = recovery ? { turnId: recovery.turnId, created: true } : await ensureAutomationTurn(db, {
       sessionId: session.id,
       userId: auth.userId,
-      name: automation.name,
+      name: runAutomation.name,
       automationRunMode: "manual",
       scheduledAutomationSnapshot,
     })
@@ -177,42 +183,52 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     'AGENT_PROTOCOL_V2_DUAL_WRITE',
     auth.userId,
   ).catch(() => false)
-  const dualWrite = dualWriteEnabled
-    ? await createDualWriteSession(db, {
-      sessionId: session.id,
-      userId: auth.userId,
-      goal: `Run automation: ${automation.name}`,
-      source: 'automation',
-      turnId: canonicalTurn.turnId,
-    })
-    : null
+  let dualWrite: Awaited<ReturnType<typeof createDualWriteSession>> | null = null
+  let dualWriteUnavailable = false
+  if (dualWriteEnabled) {
+    try {
+      dualWrite = await createDualWriteSession(db, {
+        sessionId: session.id, userId: auth.userId, goal: `Run automation: ${runAutomation.name}`,
+        source: 'automation', turnId: canonicalTurn.turnId,
+      })
+    } catch (error) {
+      if (!recovery) throw error
+      dualWriteUnavailable = true
+    }
+  }
   const eventInput = {
     sessionId: session.id,
     taskId: null,
     type: "automation_started" as const,
     speaker: "Orchestrator",
     title: "Automation started",
-    body: `Started automation: ${automation.name}`,
+    body: `Started automation: ${runAutomation.name}`,
     data: {
-      automationId: automation.id,
-      automation: automationPayload(automation),
+      automationId: runAutomation.id,
+      automation: automationPayload(runAutomation),
     },
   }
   const safeEvent = redactAgentEvent(eventInput)
-  let event: Parameters<typeof serializeEvent>[0]
-  try {
-    event = (dualWrite
-      ? await dualWrite.record(eventInput)
-      : await db.agentTranscriptEvent.create({ data: { ...eventInput, body: safeEvent.body, data: safeEvent.data ?? Prisma.JsonNull, durationMs: null } })) as Parameters<typeof serializeEvent>[0]
-  } catch (error) {
-    if (dualWrite) {
-      await dualWrite.finalize({
-        status: 'failed',
-        error: error instanceof Error ? error.message : 'Could not record automation start',
-      }).catch(() => undefined)
+  let event: Parameters<typeof serializeEvent>[0] | null = null
+  if (!dualWriteUnavailable) {
+    try {
+      event = (dualWrite
+        ? await dualWrite.record(eventInput)
+        : await db.agentTranscriptEvent.create({ data: { ...eventInput, body: safeEvent.body, data: safeEvent.data ?? Prisma.JsonNull, durationMs: null } })) as Parameters<typeof serializeEvent>[0]
+    } catch (error) {
+      if (dualWrite && !recovery) {
+        await dualWrite.finalize({
+          status: 'failed',
+          error: error instanceof Error ? error.message : 'Could not record automation start',
+        }).catch(() => undefined)
+      }
+      if (!recovery) throw error
     }
-    throw error
   }
+
+  if (recovery) return ok({ session: serializeSession(session as SessionRow), event: event ? serializeEvent(event) : null,
+    turnId: recovery.turnId, executionId: recovery.executionId, dispatchId: recovery.dispatchId, turnStatus: "queued" }, 202)
+  if (!event) throw new Error("Could not record automation start")
 
   let executionId: string | null = null
   try {
@@ -231,5 +247,4 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     ])
     return err(message, 503)
   }
-
 }

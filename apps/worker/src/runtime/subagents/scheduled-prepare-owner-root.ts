@@ -9,13 +9,14 @@ import type { ScheduledAutomationPersistedRoot } from "./scheduled-automation-pi
 type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 type Owner = Pick<ScheduledTaskGraphContinuationReceipt["owner"], "userId" | "sessionId" | "turnId" | "rootTaskId" | "rootAttemptCount">
-type Scope = Pick<Owner, "userId" | "sessionId" | "turnId" | "rootTaskId">
+type Scope = Pick<Owner, "userId" | "sessionId" | "turnId" | "rootTaskId"> & Readonly<{ taskId: string; attemptCount: number }>
 type Task = Readonly<{ id: string; role: string; taskType?: string; status: string; attemptCount?: number; failureReason: string | null }>
 type Mode = "finish" | "persisted_gate"
 
 /** Preserves live registration checks and accepts only a root parked on this graph's running Audit child. */
 export async function scheduledPrepareReceiptOwnerRootMatches(client: Client, scope: Scope, owner: Owner,
-  mode: Mode, tasks: ReadonlyMap<string, Task>, gateWaitWitness?: ScheduledPrepareGateWaitWitness): Promise<ScheduledAutomationPersistedRoot | null> {
+  mode: Mode, tasks: ReadonlyMap<string, Task>, gateWaitWitness?: ScheduledPrepareGateWaitWitness,
+  prepareLeaseOwnerId?: string): Promise<ScheduledAutomationPersistedRoot | null> {
   if (owner.userId !== scope.userId || owner.sessionId !== scope.sessionId || owner.turnId !== scope.turnId || owner.rootTaskId !== scope.rootTaskId) return null
   const rows = await client.query<Row>(`SELECT task."id", session."userId" AS "userId", task."sessionId", task."turnId", task."status", task."attemptCount",
       task."result", task."failureReason", turn."status" AS "turnStatus", turn."leaseOwnerId" AS "turnLeaseOwnerId",
@@ -39,7 +40,7 @@ export async function scheduledPrepareReceiptOwnerRootMatches(client: Client, sc
     }
     return root(owner, scope, "running")
   }
-  if (mode !== "persisted_gate" || row.status !== "waiting" || row.failureReason !== null
+  if (row.status !== "waiting" || row.failureReason !== null
     || !["waiting_for_dependency", "waiting_for_approval"].includes(String(row.turnStatus))
     || row.turnLeaseOwnerId !== null || row.turnLeaseExpiresAt !== null) return null
   const result = asRecord(row.result)
@@ -48,7 +49,7 @@ export async function scheduledPrepareReceiptOwnerRootMatches(client: Client, sc
   try { parsed = parseTerminalRootResult({ id: row.id, status: row.status, result: row.result, failureReason: row.failureReason }) } catch { return null }
   if (parsed.result.status !== "waiting_for_dependency" || !parsed.result.waitId) return null
   if (gateWaitWitness) {
-    if (!currentGateTaskMatches(tasks, gateWaitWitness) || !await scheduledPrepareGateRootWitnessMatches(client, { scope,
+    if (mode !== "persisted_gate" || !currentGateTaskMatches(tasks, gateWaitWitness) || !await scheduledPrepareGateRootWitnessMatches(client, { scope,
       rootStatus: "waiting", rootAttemptCount: owner.rootAttemptCount, turnStatus: String(row.turnStatus),
       turnLeaseOwnerId: row.turnLeaseOwnerId, turnLeaseExpiresAt: row.turnLeaseExpiresAt,
       turnLeaseVersion: row.turnLeaseVersion, turnLeaseValid: row.turnLeaseValid,
@@ -56,11 +57,75 @@ export async function scheduledPrepareReceiptOwnerRootMatches(client: Client, sc
     return root(owner, scope, "waiting")
   }
   if (row.turnStatus !== "waiting_for_dependency") return null
+  if (mode === "finish") {
+    const prepare = tasks.get(scope.taskId)
+    return prepare?.role === "prepare" && prepare.taskType === "scheduled_application_prepare"
+      && prepare.status === "completed" && prepare.failureReason === null && prepare.attemptCount === scope.attemptCount
+      && validId(prepareLeaseOwnerId) && await parkedPrepareWaitMatches(client, scope, owner.rootAttemptCount,
+        parsed.result.waitId, prepare, prepareLeaseOwnerId)
+      ? root(owner, scope, "waiting") : null
+  }
   const audits = [...tasks.values()].filter(task => task.role === SCHEDULED_AUDIT_ROLE && task.taskType === SCHEDULED_AUDIT_TASK_TYPE
     && task.status === "running" && task.failureReason === null && Number.isSafeInteger(task.attemptCount) && Number(task.attemptCount) > 0)
   if (audits.length !== 1 || !validId(audits[0]!.id)) return null
   return await parkedAuditWaitMatches(client, scope, owner.rootTaskId, owner.rootAttemptCount, parsed.result.waitId, audits[0]!)
     ? root(owner, scope, "waiting") : null
+}
+
+async function parkedPrepareWaitMatches(client: Client, scope: Scope, rootAttemptCount: number, waitId: string,
+  prepare: Task, leaseOwnerId: string): Promise<boolean> {
+  const rows = await client.query<Row>(`SELECT wait."id", wait."stepId", wait."targetTaskIds", wait."mode", wait."status", wait."result",
+      wait."suspendedAt", wait."resolvedAt", wait."consumedAt", parent."status" AS "parentStatus",
+      parent."attemptCount" AS "parentAttemptCount", parent."result" AS "parentResult", parent."failureReason" AS "parentFailureReason",
+      turn."status" AS "turnStatus", turn."leaseOwnerId" AS "turnLeaseOwnerId", turn."leaseExpiresAt" AS "turnLeaseExpiresAt",
+      step."taskId" AS "stepTaskId", step."attempt" AS "stepAttempt", step."status" AS "stepStatus", step."ordinal",
+      (SELECT MAX(current."ordinal") FROM "agent_steps" current WHERE current."sessionId"=step."sessionId"
+        AND current."turnId"=step."turnId" AND current."taskId"=step."taskId" AND current."attempt"=step."attempt") AS "latestOrdinal",
+      target."id" AS "targetTaskId", target."rootTaskId" AS "targetRootTaskId", target."parentTaskId" AS "targetParentTaskId",
+      target."sessionId" AS "targetSessionId", target."turnId" AS "targetTurnId", target."role" AS "targetRole",
+      target."taskType" AS "targetTaskType", target."status" AS "targetStatus", target."attemptCount" AS "targetAttemptCount",
+      target."failureReason" AS "targetFailureReason", target."leaseOwner" AS "targetLeaseOwner",
+      target."leaseExpiresAt" > clock_timestamp() AS "targetLeaseValid",
+      (SELECT count(*) FROM "agent_wait_conditions" active WHERE active."userId"=wait."userId"
+        AND active."sessionId"=wait."sessionId" AND active."turnId"=wait."turnId"
+        AND active."parentTaskId"=wait."parentTaskId" AND active."consumedAt" IS NULL) AS "activeWaitCount"
+    FROM "agent_wait_conditions" wait
+    JOIN "agent_sessions" session ON session."id"=wait."sessionId" AND session."userId"=wait."userId"
+    JOIN "agent_turns" turn ON turn."id"=wait."turnId" AND turn."sessionId"=wait."sessionId"
+      AND turn."userId"=wait."userId" AND turn."rootTaskId"=$4 AND turn."status"='waiting_for_dependency'
+      AND turn."leaseOwnerId" IS NULL AND turn."leaseExpiresAt" IS NULL
+    JOIN "sub_agent_tasks" parent ON parent."id"=wait."parentTaskId" AND parent."id"=$4
+      AND parent."sessionId"=wait."sessionId" AND parent."turnId"=wait."turnId" AND parent."rootTaskId"=$4
+      AND parent."parentTaskId" IS NULL AND parent."taskType"='root' AND parent."status"='waiting'
+      AND parent."attemptCount"=$10 AND parent."failureReason" IS NULL
+    JOIN "agent_steps" step ON step."id"=wait."stepId" AND step."sessionId"=wait."sessionId" AND step."turnId"=wait."turnId"
+    JOIN "sub_agent_tasks" target ON target."id"=$6 AND target."sessionId"=wait."sessionId" AND target."turnId"=wait."turnId"
+      AND target."rootTaskId"=$4 AND target."parentTaskId"=$4 AND target."role"=$7 AND target."taskType"=$8
+    WHERE wait."id"=$1 AND wait."userId"=$2 AND wait."sessionId"=$3 AND wait."turnId"=$5
+      AND wait."parentTaskId"=$4 AND step."attempt"=$10 AND (step."taskId"=$4 OR step."taskId" IS NULL)
+      AND step."status"='waiting_for_tool' AND target."status"='running' AND target."attemptCount"=$9
+      AND target."failureReason" IS NULL AND target."leaseOwner"=$11 AND target."leaseExpiresAt">clock_timestamp()`,
+  [waitId, scope.userId, scope.sessionId, scope.rootTaskId, scope.turnId, scope.taskId, prepare.role, prepare.taskType,
+    scope.attemptCount, rootAttemptCount, leaseOwnerId])
+  if (rows.rows.length !== 1) return false
+  const row = asRecord(rows.rows[0]), targets = stringArray(row?.targetTaskIds), result = asRecord(row?.result)
+  const request = asRecord(result?.request), requestTargets = stringArray(request?.targetTaskIds)
+  const parentResult = asRecord(row?.parentResult)
+  return !!row && row.id === waitId && Number(row.activeWaitCount) === 1 && row.suspendedAt !== null
+    && row.resolvedAt === null && row.consumedAt === null && row.mode === "all" && row.status === "waiting"
+    && row.parentStatus === "waiting" && Number(row.parentAttemptCount) === rootAttemptCount && row.parentFailureReason === null
+    && row.turnStatus === "waiting_for_dependency" && row.turnLeaseOwnerId === null && row.turnLeaseExpiresAt === null
+    && parentResult !== null && exact(parentResult, ["status", "stepCount", "toolCallCount", "finalItemId", "waitId"])
+    && parentResult.status === "waiting_for_dependency" && parentResult.finalItemId === null && parentResult.waitId === waitId
+    && validId(row.stepId) && row.stepAttempt === rootAttemptCount && (row.stepTaskId === null || row.stepTaskId === scope.rootTaskId)
+    && row.stepStatus === "waiting_for_tool" && row.ordinal === row.latestOrdinal
+    && row.targetTaskId === scope.taskId && row.targetRootTaskId === scope.rootTaskId && row.targetParentTaskId === scope.rootTaskId
+    && row.targetSessionId === scope.sessionId && row.targetTurnId === scope.turnId && row.targetRole === prepare.role
+    && row.targetTaskType === prepare.taskType && row.targetStatus === "running" && Number(row.targetAttemptCount) === scope.attemptCount
+    && row.targetFailureReason === null && row.targetLeaseOwner === leaseOwnerId && row.targetLeaseValid === true
+    && exact(result, ["request"]) && exact(request, ["targetTaskIds", "mode", "timeoutMs"])
+    && sameOne(targets, scope.taskId) && sameOne(requestTargets, scope.taskId) && request?.mode === "all"
+    && Number.isSafeInteger(request.timeoutMs) && Number(request.timeoutMs) > 0 && Number(request.timeoutMs) <= 86_400_000
 }
 
 function currentGateTaskMatches(tasks: ReadonlyMap<string, Task>, witness: ScheduledPrepareGateWaitWitness): boolean {

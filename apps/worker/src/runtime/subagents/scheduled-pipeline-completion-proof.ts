@@ -17,6 +17,7 @@ export function parseScheduledPipelinePrepareContinuationResult(
   handoff: ScheduledPipelineAnalyzeCheckpointProof,
   finalStepId: string,
   finalStepOrdinal: number,
+  recoveryStepId = finalStepId,
 ): Parsed | null {
   try {
     if (!value || typeof value !== "object" || Array.isArray(value)) return null
@@ -51,7 +52,7 @@ export function parseScheduledPipelinePrepareContinuationResult(
       || Object.keys(wait).sort().join(",") !== "matchedTaskIds,mode,status,targetTaskIds,waitId"
       || wait.status !== "ready" || wait.mode !== "all" || wait.targetTaskIds.length !== 1 || wait.matchedTaskIds.length !== 1
       || wait.targetTaskIds[0] !== strictRecord(nodes[prepareIndex])?.taskId || wait.matchedTaskIds[0] !== strictRecord(nodes[prepareIndex])?.taskId
-      || !validText(wait.waitId, 128) || !prepareProofMatches(owner, attestation, handoff, receipt, nodes)
+      || !validText(wait.waitId, 128) || !prepareProofMatches(owner, attestation, handoff, receipt, nodes, recoveryStepId !== finalStepId)
       || choiceRequired && scheduledPrepareChoiceWaitId({ receipt, finalStepId, finalStepOrdinal }) !== choice.scheduledWaitId) return null
     return { status: "ready", prepareProof: result.prepareProof,
       choice: choiceRequired ? { required: true, status: "answered", scheduledWaitId: choice!.scheduledWaitId as string } : { required: false } }
@@ -59,7 +60,8 @@ export function parseScheduledPipelinePrepareContinuationResult(
 }
 
 function prepareProofMatches(owner: ScheduledAutomationPipelineBridgeScope, attestation: ScheduledPipelineAttestation,
-  handoff: ScheduledPipelineAnalyzeCheckpointProof, receipt: ScheduledTaskGraphContinuationReceipt, nodes: unknown[]): boolean {
+  handoff: ScheduledPipelineAnalyzeCheckpointProof, receipt: ScheduledTaskGraphContinuationReceipt,
+  nodes: unknown[], recoveryStep: boolean): boolean {
   const v1 = attestation.schemaVersion === SCHEDULED_PIPELINE_ATTESTATION_V1_SCHEMA
   const expectedSourceProofs = v1 ? [{ taskId: attestation.scout.taskId, attemptCount: attestation.scout.attemptCount }]
     : attestation.scouts.map(source => ({ taskId: source.taskId, attemptCount: source.attemptCount }))
@@ -69,10 +71,14 @@ function prepareProofMatches(owner: ScheduledAutomationPipelineBridgeScope, atte
   const actualIds = sourceIds.filter((id): id is string => typeof id === "string")
   const expectedAnalystId = attestation.analyst.taskId
   const sourceAttemptsMatch = expectedSourceProofs.every(source => sourceRows.some(row => row?.taskId === source.taskId && row.attemptCount === source.attemptCount))
-  const ownerMatches = receipt.owner.userId === owner.userId && receipt.owner.sessionId === owner.sessionId
+  // A recovered receipt retains its immutable scheduling lease. The Worker verifier
+  // proves the wait lineage before returning it, and Gate compares it to stored facts.
+  const leaseMatches = receipt.owner.turnLeaseOwnerId === owner.turnLeaseOwnerId
+    && receipt.owner.turnLeaseVersion === owner.turnLeaseVersion
+    || recoveryStep && receipt.owner.turnLeaseVersion < owner.turnLeaseVersion
+  const ownerMatches = leaseMatches && receipt.owner.userId === owner.userId && receipt.owner.sessionId === owner.sessionId
     && receipt.owner.turnId === owner.turnId && receipt.owner.rootTaskId === owner.rootTaskId
-    && receipt.owner.rootAttemptCount === owner.rootAttemptCount && receipt.owner.turnLeaseOwnerId === owner.turnLeaseOwnerId
-    && receipt.owner.turnLeaseVersion === owner.turnLeaseVersion && receipt.owner.executionId === handoff.executionId
+    && receipt.owner.rootAttemptCount === owner.rootAttemptCount && receipt.owner.executionId === handoff.executionId
     && receipt.owner.executionAttemptCount === handoff.executionAttemptCount
   const sortedSources = [...expectedSources].sort()
   return ownerMatches && sourceRows.length === expectedSources.length && sourceRows.every(row => row?.role === "scout"

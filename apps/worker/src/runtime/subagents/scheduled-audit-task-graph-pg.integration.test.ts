@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from "node:crypto"
+import { spawn, type ChildProcess } from "node:child_process"
 import { createRequire } from "node:module"
+import { createServer, type Server } from "node:http"
+import { fileURLToPath } from "node:url"
 import { Queue, Worker, type Job } from "bullmq"
 import Redis from "ioredis"
 import { Pool } from "pg"
@@ -7,8 +10,10 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { Value } from "@sinclair/typebox/value"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TurnEngine } from "../turns/turn-engine.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
+import { createCanonicalExecutionProjection } from "../canonical-execution-projection.js"
 import { createCanonicalSessionProjection } from "../canonical-session-projection.js"
 import type { TurnEngineOptions, TurnEngineResult } from "../turns/turn-engine-types.js"
 import { SCHEDULED_PIPELINE_COMPLETION } from "../turns/turn-execution-types.js"
@@ -31,13 +36,15 @@ import { createScheduledAutomationPrepareContinuation } from "./scheduled-automa
 import { createScheduledGateChildExecutor } from "./scheduled-gate-child-runtime.js"
 import { createScheduledAuditChildExecutor } from "./scheduled-audit-child-runtime.js"
 import { createScheduledGatePrepareFixture } from "./scheduled-gate-prepare-pg-runner.fixture.js"
-import { parseScheduledGateTaskEnvelope, scheduledGatePreparedJobIds } from "./scheduled-gate-contract.js"
+import { parseScheduledGateTaskEnvelope, scheduledGatePreparedJobIds, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import type { ScheduledGateChoiceHistory } from "./pg-scheduled-task-graph-gate-choices.js"
-import { scheduledGateRootActions } from "./scheduled-gate-prepare-pg-resume.fixture.js"
+import { scheduledGateRootActions, SCHEDULED_GATE_BASE_RESUME } from "./scheduled-gate-prepare-pg-resume.fixture.js"
 import { parseScheduledAuditReport, SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, SCHEDULED_AUDIT_TASK_TYPE,
   SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK, SCHEDULED_POST_GATE_PLAN_REQUIRED_INSTRUCTION } from "./scheduled-post-gate-contract.js"
 import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
+import { createPgNativeVerificationPort } from "./pg-native-verification-port.js"
+import { readNativeVerificationTerminalProofWithClient } from "./native-verification-pg-readback.js"
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import { buildTaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
 import { buildGroundedTaskGraphFinalResponse } from "./task-graph-final-response.js"
@@ -45,8 +52,10 @@ import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGr
   TASK_GRAPH_ITEM_TYPE } from "./task-graph-snapshot.js"
 import { buildScheduledPrepareTaskGraphProof, verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-task-graph-verification.js"
 import { loadPersistedScheduledPrepareProof } from "./scheduled-gate-wait-match.js"
+import { readScheduledGateRegistrationReceipt } from "./scheduled-gate-registration-receipt.js"
 import { AgentTreeManager } from "./manager.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
 import { createCoordinationTools } from "../tools/coordination-tools.js"
 import { createTaskGraphPlanningTool } from "../tools/planning-executors.js"
@@ -57,10 +66,9 @@ import { SCHEDULED_POST_GATE_AUDIT_CRITERIA, SCHEDULED_POST_GATE_AUDIT_GOAL,
   parseScheduledPostGateHandoff, SCHEDULED_POST_GATE_HANDOFF_EVENT } from "./scheduled-post-gate-contract.js"
 import { scheduledPostGateTaskTemplates } from "./scheduled-post-gate-task-templates.js"
 import { parseSubagentDispatchJobId } from "./dispatch-identity.js"
-import { dispatchPendingSubagentOutbox } from "../../queue/subagent-queue.js"
+import { dispatchPendingSubagentOutbox, persistSubagentDispatch, type SubagentExecutor, type SubagentQueueLike } from "../../queue/subagent-queue.js"
 import type { SubagentJobPayload } from "./types.js"
 import { runSubagentQueueJob } from "../../queue/subagent-pause-dispatch.js"
-import type { SubagentExecutor } from "../../queue/subagent-queue.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 
 const databaseUrl = dedicatedDisposableUrl()
@@ -103,6 +111,14 @@ type FixtureWebDatabase = Readonly<{ db: {
   $transaction<T>(work: (tx: unknown) => Promise<T>): Promise<T>
   customAgentRole: { findMany(args: unknown): Promise<readonly unknown[]> }
 } }>
+type MaterialRecoveryProcessConfig = Readonly<{ queueName: string; userId: string; sessionId: string; turnId: string;
+  rootTaskId: string; taskId: string; prepareTaskId: string; webUrl: string }>
+type MaterialRecoveryMarker = Readonly<Record<string, unknown>>
+type MaterialRecoveryMarkerWaiter = { marker: string; resolve(value: MaterialRecoveryMarker): void; reject(error: Error): void;
+  timer: ReturnType<typeof setTimeout> }
+type MaterialRecoveryProcessHandle = { child: ChildProcess; buffered: Array<{ marker: string; value: MaterialRecoveryMarker }>;
+  waiters: MaterialRecoveryMarkerWaiter[]; partial: string; failure: Error | null }
+type MaterialRecoveryWebBridge = Readonly<{ url: string; server: Server; close(): Promise<void> }>
 type SourceWriterRaceProbe = {
   jobId: string
   updateApplied: ReturnType<typeof testBarrier>
@@ -113,6 +129,7 @@ type SourceWriterRaceProbe = {
 type GateRpcConnectionProbe = { captureNextSessionLockQuery: boolean; sessionLockBackendPid: number | null; sessionLockQueryCount: number }
 type ScheduledGateTestOptions = {
   useReservedQualityReview?: boolean
+  stopAtQualityQuestion?: boolean
   useStoredAiSettings?: boolean
   beforeSecondGateReceiptFence?: () => Promise<void>
   beforeGateRpc?: () => Promise<void>
@@ -261,6 +278,141 @@ const scheduledGateStagePath = "@/lib/agent/stages/gate"
 const scheduledModelRouterPath = "@/lib/model-router"
 const scheduledEntitlementsPath = "@/lib/entitlements"
 const scheduledWebDbPath = "@/lib/db"
+const scheduledApiHelpersPath = "@/lib/api-helpers"
+const recoveryAuthModulePath = "@/lib/auth"
+const recoveryInterruptRoutePath = "@/app/api/agent/sessions/[id]/turns/[turnId]/interrupt/route"
+const recoveryRunNowRoutePath = "@/app/api/agent/automations/[id]/run/route"
+const materialRecoveryProcessFixturePath = fileURLToPath(new URL("./scheduled-material-drift-process-restart.fixture.mjs", import.meta.url))
+const MATERIAL_RECOVERY_PROCESS_MODE = process.env.AGENT_MATERIAL_DRIFT_PROCESS_RESTART === "true"
+const MATERIAL_RECOVERY_LEASE_MS = 10_000
+const MATERIAL_RECOVERY_HEARTBEAT_MS = 2_000
+const MATERIAL_RECOVERY_BRIDGE_PATH = "/api/internal/agent-runtime/scheduled-pipeline"
+const MATERIAL_RECOVERY_BRIDGE_MAX_BYTES = 64_000
+if (MATERIAL_RECOVERY_PROCESS_MODE && (!databaseUrl || !redisUrl || process.env.CI !== "true"
+  || process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true" || process.env.AGENT_TURN_REDIS_TEST_DISPOSABLE !== "true")) {
+  throw new Error("material_recovery_process_restart_requires_guarded_disposable_services")
+}
+
+async function startMaterialRecoveryWebBridge(fetcher: typeof fetch, workerSecret: string): Promise<MaterialRecoveryWebBridge> {
+  const server = createServer((request, response) => {
+    void (async () => {
+      if (request.method !== "POST" || request.url !== MATERIAL_RECOVERY_BRIDGE_PATH) {
+        request.resume(); response.writeHead(404).end(); return
+      }
+      if (request.headers["x-agent-worker-secret"] !== workerSecret
+        || !/^application\/json(?:\s*;|$)/i.test(request.headers["content-type"] ?? "")) {
+        request.resume(); response.writeHead(401).end(); return
+      }
+      const chunks: Buffer[] = []; let size = 0; let oversized = false
+      for await (const chunk of request) {
+        const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+        size += value.length
+        if (size > MATERIAL_RECOVERY_BRIDGE_MAX_BYTES) { oversized = true; chunks.length = 0 }
+        else if (!oversized) chunks.push(value)
+      }
+      if (oversized || size === 0) { response.writeHead(413).end(); return }
+      const routed = await fetcher(new Request(`http://scheduled-audit-fixture.invalid${MATERIAL_RECOVERY_BRIDGE_PATH}`, {
+        method: "POST", headers: { "content-type": request.headers["content-type"] ?? "application/json",
+          "x-agent-worker-secret": workerSecret }, body: Buffer.concat(chunks),
+      }))
+      const body = Buffer.from(await routed.arrayBuffer())
+      response.writeHead(routed.status, { "content-type": routed.headers.get("content-type") ?? "application/json" }).end(body)
+    })().catch(() => { if (!response.headersSent) response.writeHead(500).end(); else response.destroy() })
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolve)
+  })
+  const address = server.address()
+  if (!address || typeof address === "string") throw new Error("material_recovery_web_bridge_unavailable")
+  return { server, url: `http://127.0.0.1:${address.port}`, close: () => new Promise((resolve, reject) => {
+    server.close(error => error ? reject(error) : resolve())
+  }) }
+}
+
+function startMaterialRecoveryProcess(mode: "crash" | "resume", config: MaterialRecoveryProcessConfig): MaterialRecoveryProcessHandle {
+  const child = spawn(process.execPath, ["--import", "tsx", materialRecoveryProcessFixturePath,
+    JSON.stringify({ mode, ...config })], { cwd: process.cwd(), env: { ...process.env, AGENT_WEB_URL: config.webUrl },
+    stdio: ["pipe", "pipe", "pipe"] })
+  const handle: MaterialRecoveryProcessHandle = { child, buffered: [], waiters: [], partial: "", failure: null }
+  child.stdout?.on("data", chunk => collectMaterialRecoveryOutput(handle, String(chunk)))
+  child.stderr?.on("data", () => undefined)
+  child.once("error", () => failMaterialRecoveryWaiters(handle, new Error("material_recovery_worker_spawn_failed")))
+  child.once("exit", (code, signal) => {
+    if (handle.waiters.length) failMaterialRecoveryWaiters(handle,
+      new Error(`material_recovery_worker_exit_${code ?? signal ?? "unknown"}`))
+  })
+  return handle
+}
+
+function collectMaterialRecoveryOutput(handle: MaterialRecoveryProcessHandle, chunk: string): void {
+  const lines = `${handle.partial}${chunk}`.split(/\r?\n/)
+  handle.partial = lines.pop() ?? ""
+  for (const line of lines) {
+    const match = /^([A-Z_]+) (\{.*\})$/.exec(line)
+    if (!match) continue
+    let value: MaterialRecoveryMarker
+    try { const parsed: unknown = JSON.parse(match[2]!); value = debugRecord(parsed) ?? {} }
+    catch { failMaterialRecoveryWaiters(handle, new Error("material_recovery_worker_marker_invalid")); continue }
+    if (match[1] === "ERROR") {
+      const code = typeof value.code === "string" && /^[a-z0-9_]{1,100}$/.test(value.code) ? value.code : "failed"
+      handle.failure = new Error(`material_recovery_worker_${code}`)
+      failMaterialRecoveryWaiters(handle, handle.failure)
+      continue
+    }
+    const waiterIndex = handle.waiters.findIndex(waiter => waiter.marker === match[1])
+    if (waiterIndex < 0) { handle.buffered.push({ marker: match[1]!, value }); continue }
+    const [waiter] = handle.waiters.splice(waiterIndex, 1)
+    clearTimeout(waiter!.timer); waiter!.resolve(value)
+  }
+}
+
+function failMaterialRecoveryWaiters(handle: MaterialRecoveryProcessHandle, error: Error): void {
+  for (const waiter of handle.waiters.splice(0)) { clearTimeout(waiter.timer); waiter.reject(error) }
+}
+
+function nextMaterialRecoveryMarker(handle: MaterialRecoveryProcessHandle, marker: string, timeoutMs = 30_000): Promise<MaterialRecoveryMarker> {
+  const index = handle.buffered.findIndex(item => item.marker === marker)
+  if (index >= 0) return Promise.resolve(handle.buffered.splice(index, 1)[0]!.value)
+  if (handle.failure) return Promise.reject(handle.failure)
+  return new Promise((resolve, reject) => {
+    const waiter: MaterialRecoveryMarkerWaiter = { marker, resolve, reject,
+      timer: setTimeout(() => {
+        const index = handle.waiters.indexOf(waiter)
+        if (index >= 0) handle.waiters.splice(index, 1)
+        reject(new Error(`material_recovery_worker_marker_timeout_${marker.toLowerCase()}`))
+      }, timeoutMs) }
+    handle.waiters.push(waiter)
+  })
+}
+
+async function stopMaterialRecoveryProcess(handle: MaterialRecoveryProcessHandle | undefined, signal: NodeJS.Signals = "SIGKILL"): Promise<void> {
+  if (!handle) return
+  const child = handle.child
+  if (child.exitCode === null && child.signalCode === null) {
+    const exited = waitForMaterialRecoveryProcessExit(handle)
+    if (!child.kill(signal)) throw new Error("material_recovery_worker_kill_rejected")
+    const result = await exited
+    if (result.signal !== signal) throw new Error("material_recovery_worker_exit_signal_mismatch")
+  } else if (signal === "SIGKILL" && child.signalCode !== "SIGKILL") {
+    throw new Error("material_recovery_worker_was_not_killed")
+  }
+}
+
+function waitForMaterialRecoveryProcessExit(handle: MaterialRecoveryProcessHandle, timeoutMs = 30_000): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  const { child } = handle
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve({ code: child.exitCode, signal: child.signalCode })
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("material_recovery_worker_exit_timeout")), timeoutMs)
+    child.once("exit", (code, signal) => { clearTimeout(timer); resolve({ code, signal }) })
+  })
+}
+
+function allowMaterialRecoveryGate(handle: MaterialRecoveryProcessHandle): void {
+  if (!handle.child.stdin || handle.child.stdin.destroyed) throw new Error("material_recovery_worker_stdin_unavailable")
+  handle.child.stdin.end("ALLOW_GATE\n")
+}
+
 let pool: Pool | undefined
 let runner: Runner | undefined
 let disconnectWebDatabase: (() => Promise<void>) | undefined
@@ -291,9 +443,14 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
   afterEach(async () => {
     await stopRunner()
     vi.doUnmock(scheduledGateQualityReviewPath)
+    vi.doUnmock("./scheduled-application-prepare-materials.js")
+    vi.doUnmock("../canonical-turn-native-verification-runtime.js")
+    vi.doUnmock("@/lib/agent/stages/gate-review-receipt")
     vi.doUnmock(scheduledGateStagePath)
     vi.doUnmock(scheduledModelRouterPath)
     vi.doUnmock(scheduledEntitlementsPath)
+    vi.doUnmock(scheduledApiHelpersPath)
+    vi.doUnmock(recoveryAuthModulePath)
     vi.doUnmock(scheduledRunServicePath)
     vi.doUnmock(scheduledTaskGraphRunServicePath)
     vi.doUnmock(scheduledTaskGraphFencePath)
@@ -718,6 +875,1057 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const approvals = await pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM "agent_approvals" WHERE "userId"=$1 AND "sessionId"=$2 AND "turnId"=$3
       AND "type"='review_application'`, [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId])
     expect(approvals.rows[0]?.count ?? 0).toBe(0)
+  }, 120_000)
+
+  it("routes a stopped drift through fresh Run Now proof after a Worker restart", async () => {
+    let recoveryChildAdapterDiagnostic: string | null = null
+    const nativeVerificationTrace: string[] = []
+    const rootCompletionTrace: string[] = []
+    vi.doMock("./scheduled-application-prepare-materials.js", async importOriginal => {
+      const actual = await importOriginal<typeof import("./scheduled-application-prepare-materials.js")>()
+      return { ...actual, prepareScheduledJobMaterials: async (...args: Parameters<typeof actual.prepareScheduledJobMaterials>) => {
+        try { return await actual.prepareScheduledJobMaterials(...args) }
+        catch (error: unknown) {
+          const row = error && typeof error === "object" ? error as { code?: unknown; name?: unknown; errorCode?: unknown; reasonCode?: unknown } : null
+          const message = error instanceof Error ? error.message : ""
+          const code = [row?.reasonCode, row?.errorCode, row?.code].find(value => typeof value === "string"
+            && (/^scheduled_prepare_[a-z0-9_]{1,80}$/.test(value) || /^[0-9A-Z_]{2,40}$/.test(value)
+              || /^(not_found|stale_hash|invalid_provenance|precondition_failed|receipt_conflict|stale_source|task_fence_denied)$/.test(value)))
+          const safeCode = /^scheduled_prepare_[a-z0-9_]{1,80}$/.test(message) ? message
+            : typeof code === "string" ? code : "unclassified"
+          const name = error instanceof Error ? error.name : row?.name
+          const safeErrorName = typeof name === "string" && /^[A-Za-z][A-Za-z0-9]{0,50}$/.test(name) ? name : "other"
+          recoveryChildAdapterDiagnostic = `prepare_material_failure:${safeCode}:${safeErrorName}`
+          throw error
+        }
+      } }
+    })
+    let fixture: Awaited<ReturnType<typeof createScheduledGatePrepareFixture>>
+    try { fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1, useSupportedAtsUrl: true }) }
+    catch (error: unknown) {
+      const reason = error instanceof Error ? error.message : "scheduled_prepare_fixture_failed"
+      throw new Error(`${reason}; ${recoveryChildAdapterDiagnostic ?? "prepare_material_failure:missing"}`)
+    }
+    fixtureUsers.push(fixture.ids.userId)
+    const race = await runScheduledGateSourceWriterRace(fixture, { update: () => ({ salary: "€100k+" }) })
+    expect(race.gateOutcome.status).toBe("fulfilled")
+    expect(race.gateOutcome.status === "fulfilled" && debugRecord(race.gateOutcome.value)?.status).toBe("failed")
+    const sourceExecutionBeforeRecovery = await pool!.query<{ state: unknown }>(`SELECT "state" FROM "agent_executions"
+      WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`, [fixture.executionOwner.executionId, fixture.ids.userId, fixture.ids.sessionId])
+    const originalSourceMarker = debugRecord(debugRecord(sourceExecutionBeforeRecovery.rows[0]?.state)?.scheduledTaskGraphMaterialDriftTerminal)
+    expect(originalSourceMarker).not.toBeNull()
+    const sourceMarkerOwner = debugRecord(originalSourceMarker?.owner)
+    const sourceMarkerGate = debugRecord(originalSourceMarker?.gate)
+    // Limit leak checks to recovery control data, leaving objective and current-material context untouched.
+    const privateMarkerValues = [originalSourceMarker?.schemaVersion, originalSourceMarker?.analyzeFingerprintDigest, originalSourceMarker?.prepareProofDigest,
+      originalSourceMarker?.artifactDigest, originalSourceMarker?.currentMaterialDigest, originalSourceMarker?.proofDigest,
+      sourceMarkerOwner?.turnId, sourceMarkerOwner?.rootTaskId, sourceMarkerOwner?.turnLeaseOwnerId,
+      sourceMarkerGate?.taskId, sourceMarkerGate?.leaseOwnerId].filter((value): value is string => typeof value === "string")
+    const privateModelMarkerValues = [...privateMarkerValues, sourceMarkerOwner?.executionId]
+      .filter((value): value is string => typeof value === "string")
+    // Run Now returns the active execution ID; the model request must hide its historical source value.
+    expect(privateMarkerValues).toHaveLength(11)
+    expect(privateModelMarkerValues).toHaveLength(12)
+    await stopRunner()
+
+    const automationId = `scheduled-recovery-automation-${randomUUID()}`
+    await pool!.query(`INSERT INTO "agent_automations"
+      ("id", "userId", "name", "enabled", "triggerType", "cron", "timezone", "targetRoles", "targetLocations",
+       "minScore", "dailyCap", "requireApproval", "autoApply", "sessionId", "createdAt", "updatedAt")
+      VALUES ($1,$2,'Recovery integration',TRUE,'weekdays','0 9 * * 1-5','Europe/Dublin',$3::text[],$4::text[],$5,$6,FALSE,FALSE,$7,
+        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`, [automationId, fixture.ids.userId, fixture.scheduleSnapshot.targetRoles,
+      fixture.scheduleSnapshot.targetLocations, fixture.scheduleSnapshot.minScore, fixture.scheduleSnapshot.dailyCap, fixture.ids.sessionId])
+
+    vi.doMock(recoveryAuthModulePath, () => ({ auth: async () => null }))
+    const actualApiHelpers = await vi.importActual<Record<string, unknown>>(scheduledApiHelpersPath)
+    vi.doMock(scheduledApiHelpersPath, () => ({ ...actualApiHelpers,
+      requireAuth: async () => ({ userId: fixture.ids.userId }) }))
+    const interruptRoute = await vi.importActual<{
+      POST(request: Request, context: { params: Promise<{ id: string; turnId: string }> }): Promise<Response>
+    }>(recoveryInterruptRoutePath)
+    const runNowRoute = await vi.importActual<{
+      POST(request: Request, context: { params: Promise<{ id: string }> }): Promise<Response>
+    }>(recoveryRunNowRoutePath)
+    const postInterrupt = (turnId: string, clientMessageId: string) => interruptRoute.POST(new Request(
+      `http://fixture.invalid/api/agent/sessions/${fixture.ids.sessionId}/turns/${turnId}/interrupt`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ clientMessageId, expectedRevision: null }),
+      }) as never, { params: Promise.resolve({ id: fixture.ids.sessionId, turnId }) })
+
+    const oldStop = await postInterrupt(fixture.ids.turnId, `interrupt_${randomUUID().replaceAll("-", "")}`)
+    expect(oldStop.status).toBe(202)
+    expect((await pool!.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id"=$1`, [fixture.ids.turnId]))
+      .rows[0]?.status).toBe("interrupted")
+
+    const runNow = await runNowRoute.POST(new Request(`http://fixture.invalid/api/agent/automations/${automationId}/run`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ materialDriftRecovery: { schemaVersion: "forged", turnId: "client-selected" } }),
+    }) as never, { params: Promise.resolve({ id: automationId }) })
+    expect(runNow.status).toBe(202)
+    const runNowBody = debugRecord(await runNow.json())
+    const runNowJson = JSON.stringify(runNowBody)
+    for (const privateField of ["materialDriftRecovery", "sourceMarker", "currentSnapshotDigest", "scheduledTaskGraphMaterialDriftTerminal",
+      "analyzeFingerprintDigest", "prepareProofDigest", "artifactDigest", "currentMaterialDigest", "proofDigest"]) {
+      expect(runNowJson).not.toContain(JSON.stringify(privateField))
+    }
+    for (const privateValue of privateMarkerValues) expect(runNowJson).not.toContain(privateValue)
+    const recoveryTurnId = typeof runNowBody?.turnId === "string" ? runNowBody.turnId : ""
+    expect(recoveryTurnId).not.toBe("")
+    const [sourceExecution, recoveryTurn, dispatch] = await Promise.all([
+      pool!.query<{ attemptCount: number }>(`SELECT "attemptCount" FROM "agent_executions"
+        WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`, [fixture.executionOwner.executionId, fixture.ids.userId, fixture.ids.sessionId]),
+      pool!.query<{ status: string; source: string; executionMode: string; input: unknown; rootTaskId: string | null }>(`SELECT "status", "source", "executionMode", "input", "rootTaskId"
+        FROM "agent_turns" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`,
+      [recoveryTurnId, fixture.ids.userId, fixture.ids.sessionId]),
+      pool!.query<{ id: string; publishedAt: Date | null; payload: unknown }>(`SELECT "id", "publishedAt", "payload" FROM "agent_outbox"
+        WHERE "topic"='agent.turn.dispatch' AND "idempotencyKey"=$1 AND "aggregateId"=$2`,
+      [`turn-dispatch:${recoveryTurnId}`, fixture.ids.sessionId]),
+    ])
+    const recoveryInput = debugRecord(recoveryTurn.rows[0]?.input)
+    const recoveryIntent = debugRecord(recoveryInput?.materialDriftRecovery)
+    const privateRecoveryValues = [recoveryIntent?.schemaVersion, recoveryIntent?.currentSnapshotDigest]
+      .filter((value): value is string => typeof value === "string")
+    expect(privateRecoveryValues).toHaveLength(2)
+    for (const privateValue of privateRecoveryValues) expect(runNowJson).not.toContain(privateValue)
+    expect(recoveryTurn.rows[0]).toMatchObject({ status: "queued", source: "automation", executionMode: "canonical_task_graph" })
+    let recoveryRootTaskId = recoveryTurn.rows[0]?.rootTaskId ?? null
+    expect(recoveryIntent).toMatchObject({ schemaVersion: "agent-harness.v2.material-drift-recovery.v2",
+      turnId: recoveryTurnId, userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, automationId,
+      previousTurnId: fixture.ids.turnId, previousExecutionId: fixture.executionOwner.executionId,
+      previousRecoveryTurnId: null, reservedExecutionAttemptCount: sourceExecution.rows[0]!.attemptCount,
+      sourceMarker: originalSourceMarker })
+    expect(typeof recoveryIntent?.currentSnapshotDigest).toBe("string")
+    expect(dispatch.rows).toHaveLength(1)
+    expect(dispatch.rows[0]).toMatchObject({ payload: { turnId: recoveryTurnId, sessionId: fixture.ids.sessionId,
+      ownerId: `web:${recoveryTurnId}` } })
+
+    let runtime: Awaited<ReturnType<(typeof import("../canonical-turn-runtime.js"))["createCanonicalTurnRuntime"]>> | undefined
+    let turnQueue: Queue | undefined
+    let childQueue: Queue<SubagentJobPayload> | undefined
+    let childWorker: Worker<SubagentJobPayload, unknown> | undefined
+    let recoveryWebBridge: MaterialRecoveryWebBridge | undefined
+    let crashedRecoveryProcess: MaterialRecoveryProcessHandle | undefined
+    let resumedRecoveryProcess: MaterialRecoveryProcessHandle | undefined
+    let redis: Redis | undefined
+    let childRedis: Redis | undefined
+    let runJob: Promise<unknown> | undefined
+      let runtimeFailure: string | null = null
+    let dispatchActive = false
+    let dispatchLoop: Promise<void> | undefined
+    let dispatchFailure: unknown
+    let childWorkerGeneration = 0
+    let gateDispatchTaskId: string | null = null
+    let gateDispatchQueuePaused = false
+    let gateDispatchPublished = false
+    let modelFactoryCalls = 0
+    let modelStateJson = ""
+    const modelRequestJson: string[] = []
+    let modelToolNames: string[] = []
+    let rootRound = 0
+    let recoveryAnalyzeProofReady = false
+    const currentJob = fixture.jobRecords[0]
+    if (!currentJob) throw new Error("Run Now recovery fixture has no current Job")
+    const discoveredSalaries: Array<string | null> = []
+    const response = await setupFetcher(fixture, { stopAtQualityQuestion: true })
+    const nativeCompletionRuntime = await vi.importActual<typeof import("../canonical-turn-native-verification-runtime.js")>(
+      "../canonical-turn-native-verification-runtime.js")
+    vi.doMock("../canonical-turn-native-verification-runtime.js", () => ({
+      ...nativeCompletionRuntime,
+      createCanonicalRootCompletionGate(input: Parameters<typeof nativeCompletionRuntime.createCanonicalRootCompletionGate>[0]) {
+        const capture = (phase: string, error: unknown) => {
+          const row = error && typeof error === "object" ? error as { code?: unknown; name?: unknown } : null
+          const safeMessage = error instanceof Error && /^(?:steering_reconciliation|native_verification|task_graph)_[a-z0-9_]{1,96}$/.test(error.message)
+            ? error.message : undefined
+          const code = typeof row?.code === "string" && /^[A-Za-z0-9_:-]{1,64}$/.test(row.code) ? row.code : safeMessage ?? "unclassified"
+          const name = error instanceof Error && /^[A-Za-z][A-Za-z0-9]{0,50}$/.test(error.name) ? error.name : "other"
+          rootCompletionTrace.push(`${phase}:${code}:${name}`)
+        }
+        const native = { ...input.nativeVerification,
+          async checkCompletion(...args: Parameters<typeof input.nativeVerification.checkCompletion>) {
+            try { return await input.nativeVerification.checkCompletion(...args) }
+            catch (error: unknown) { capture("native", error); throw error }
+          },
+        }
+        const gate = nativeCompletionRuntime.createCanonicalRootCompletionGate({ ...input, nativeVerification: native })
+        return gate ? new Proxy(gate, { apply: async (target, thisArg, args: Parameters<typeof gate>) => {
+          try { return await Reflect.apply(target, thisArg, args) }
+          catch (error: unknown) { capture("root_gate", error); throw error }
+        } }) : gate
+      },
+    }))
+    const scoutVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
+      criteria: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: 1 } },
+        { id: "candidate-evidence", check: { kind: "all_candidates_have_evidence" as const, minimumItems: 1 } },
+      ] }
+    const analystVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst" as const,
+      criteria: [
+        { id: "scout-membership", check: { kind: "findings_from_scout_dependency" as const, dependencyNodeKey: "fresh-scout" } },
+        { id: "finding-count", check: { kind: "finding_count_gte" as const, minimum: 1 } },
+      ] }
+    const modelProfile: ModelAdapter["profile"] = { provider: "fixture", model: "material-drift-recovery", nativeTools: true,
+      structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false,
+      supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false,
+      supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null,
+      maxOutputTokens: 2200, costClass: "low" }
+    try {
+      const [canonical, commandPort, templates, turnQueueModule, recoveryScanner, interruptProbe, scheduledPipelineModule] = await Promise.all([
+        import("../canonical-turn-runtime.js"), import("./pg-task-graph-command-port.js"), import("./task-graph-templates.js"),
+        import("../turns/turn-queue.js"), import("../turns/recovery-scanner.js"), import("../turns/turn-interrupt-probe.js"),
+        import("../canonical-turn-scheduled-pipeline.js"),
+      ])
+      const productionChild = await import("./production-child-runtime.js")
+      const gateRuntime = await import("./scheduled-gate-child-runtime.js")
+      let manager = new AgentTreeManager(new PgSubagentTaskStore(pool as never,
+        MATERIAL_RECOVERY_PROCESS_MODE ? MATERIAL_RECOVERY_LEASE_MS : 60_000),
+      MATERIAL_RECOVERY_PROCESS_MODE ? { heartbeatMs: MATERIAL_RECOVERY_HEARTBEAT_MS } : {})
+      const childModelRuntimeFactory = ({ task }: { task: { id: string; role: string; attemptCount: number } }): ModelAdapter => {
+        let round = 0
+        const jobReadCallId = `fresh-job-read-${task.id}-${task.attemptCount}`
+        return { id: `material-drift-${task.role}-child-fixture`, profile: modelProfile,
+          async *stream(request) {
+            round += 1
+            const visible = request.tools.map(tool => debugRecord(tool)?.name)
+            if (task.role === "scout" && round === 1) {
+              if (!visible.includes("jobs.discover")) throw new Error("Fresh Scout did not receive jobs.discover")
+              yield { type: "tool_call_completed", callId: `fresh-discover-${task.id}-${task.attemptCount}`,
+                name: "jobs.discover", arguments: { targetRoles: fixture.scheduleSnapshot.targetRoles,
+                  targetLocations: fixture.scheduleSnapshot.targetLocations } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (task.role === "analyst" && round === 1) {
+              if (!visible.includes("jobs.get")) {
+                throw new Error("Fresh Analyst did not receive the current Job read tool")
+              }
+              yield { type: "tool_call_completed", callId: jobReadCallId,
+                name: "jobs.get", arguments: { jobId: currentJob.id } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (task.role === "scout" || task.role === "analyst") {
+              if (task.role === "scout" && round !== 2 || task.role === "analyst" && round !== 2) {
+                throw new Error("Fresh recovery child reached an unexpected model round")
+              }
+              const readJobResult = (): Record<string, unknown> => {
+                const parts = request.messages.flatMap(message => message.content)
+                const callIds = new Set(parts.flatMap(part =>
+                  part.type === "tool_use" && part.name === "jobs.get" ? [part.id] : []))
+                const results = parts.filter(part => part.type === "tool_result" && callIds.has(part.toolUseId))
+                const expectedSalary = discoveredSalaries[discoveredSalaries.length - 1] ?? null
+                for (const result of [...results].reverse()) {
+                  if (result.type !== "tool_result" || result.isError || typeof result.content !== "string") continue
+                  const parsed = debugRecord(result.content), job = debugRecord(parsed?.job)
+                  if (parsed && job?.id === currentJob.id && job.salary === expectedSalary) return parsed
+                }
+                recoveryChildAdapterDiagnostic = `jobs.get:currentResultMissing;calls=${callIds.size};results=${results.length}`
+                throw new Error("Fresh Analyst did not receive a successful current-Job evidence read")
+              }
+              const job = task.role === "analyst" ? debugRecord(readJobResult().job) : null
+              if (task.role === "analyst" && job?.id !== currentJob.id) {
+                recoveryChildAdapterDiagnostic = `analyst-job-matches=${job?.id === currentJob.id}`
+                throw new Error("Fresh Analyst read did not match the current Job")
+              }
+              const jobSource = typeof job?.source === "string" && job.source.trim().length > 0 && job.source.length <= 256
+                ? job.source : "jobs.read"
+              const jobEvidence = { id: `read:job:${currentJob.id}`, kind: "job", ref: currentJob.id,
+                source: task.role === "analyst" ? jobSource : currentJob.source }
+              const structured = task.role === "scout"
+                ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+                  candidates: [{ jobId: currentJob.id, source: currentJob.source, url: null, evidenceIds: [jobEvidence.id] }],
+                  evidence: [jobEvidence], summary: "Discovered the current owner-scoped fixture Job" }
+                : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+                  findings: [{ jobId: currentJob.id, score: 9, evidenceIds: [jobEvidence.id] }],
+                  evidence: [jobEvidence], summary: "Analyzed the current Job with fresh owner-scoped evidence" }
+              yield { type: "text_delta", text: JSON.stringify(structured) }
+              yield { type: "completed", finishReason: "stop" }
+              return
+            }
+            if (task.role === "prepare") {
+              const parts = request.messages.flatMap(message => message.content)
+              const toolResult = parts.find(part => part.type === "tool_result")
+              if (visible.includes("scheduled.application.prepare")) {
+                if (!toolResult || toolResult.type !== "tool_result") {
+                  yield { type: "tool_call_completed", callId: `fresh-prepare-${task.id}-${task.attemptCount}`,
+                    name: "scheduled.application.prepare", arguments: {} }
+                  yield { type: "completed", finishReason: "tool_calls" }
+                  return
+                }
+                if (toolResult.isError) {
+                  let result: Record<string, unknown> | null = null
+                  try { result = debugRecord(JSON.parse(toolResult.content)) } catch { /* keep only bounded error metadata */ }
+                  const error = debugRecord(result?.error)
+                  const safeCode = [result?.errorCode, result?.reasonCode, result?.code,
+                    error?.errorCode, error?.reasonCode, error?.code]
+                    .find(value => typeof value === "string" && /^[a-z0-9_]{1,100}$/.test(value))
+                  const ownerRows = await pool!.query<{ taskStatus: string; taskLeaseOwner: string | null; taskAttemptCount: number;
+                    taskLeaseExpiresAt: Date | string | null; taskParentTaskId: string | null; turnStatus: string; turnLeaseOwner: string | null;
+                    turnLeaseVersion: number; turnLeaseExpiresAt: Date | string | null; turnRootTaskId: string | null; source: string;
+                    executionMode: string | null; rootStatus: string; rootLeaseOwner: string | null; rootAttemptCount: number }>(
+                    `SELECT task."status" AS "taskStatus", task."leaseOwner" AS "taskLeaseOwner", task."attemptCount" AS "taskAttemptCount",
+                      task."leaseExpiresAt" AS "taskLeaseExpiresAt", task."parentTaskId" AS "taskParentTaskId", turn."status" AS "turnStatus",
+                      turn."leaseOwnerId" AS "turnLeaseOwner", turn."leaseVersion" AS "turnLeaseVersion", turn."leaseExpiresAt" AS "turnLeaseExpiresAt",
+                      turn."rootTaskId" AS "turnRootTaskId", turn."source", turn."executionMode", root."status" AS "rootStatus",
+                      root."leaseOwner" AS "rootLeaseOwner", root."attemptCount" AS "rootAttemptCount"
+                    FROM "sub_agent_tasks" task JOIN "agent_turns" turn ON turn."id"=task."turnId" AND turn."sessionId"=task."sessionId"
+                    JOIN "sub_agent_tasks" root ON root."id"=task."rootTaskId" AND root."sessionId"=task."sessionId" WHERE task."id"=$1`, [task.id])
+                  const owner = ownerRows.rows[0]
+                  const expires = (value: Date | string | null) => value !== null && new Date(value).getTime() > Date.now()
+                  const ownerState = owner ? { taskRunning: owner.taskStatus === "running", taskAttemptMatches: owner.taskAttemptCount === task.attemptCount,
+                    taskLeasePresent: Boolean(owner.taskLeaseOwner), taskLeaseFuture: expires(owner.taskLeaseExpiresAt),
+                    taskParentIsRoot: owner.taskParentTaskId === owner.turnRootTaskId, turnInProgress: owner.turnStatus === "in_progress",
+                    turnLeasePresent: Boolean(owner.turnLeaseOwner), turnLeaseFuture: expires(owner.turnLeaseExpiresAt),
+                    rootRunning: owner.rootStatus === "running", rootLeaseMatchesTurn: owner.rootLeaseOwner === owner.turnLeaseOwner,
+                    sourceAutomation: owner.source === "automation", canonicalMode: owner.executionMode === "canonical_task_graph" } : null
+                  recoveryChildAdapterDiagnostic = `prepare_tool_result_error:${typeof safeCode === "string"
+                    ? safeCode : Object.keys(result ?? {}).sort().join(",")};owner=${JSON.stringify(ownerState)}`
+                  throw new Error("Fresh Prepare tool returned an error")
+                }
+                yield { type: "text_delta", text: toolResult.content }
+                yield { type: "completed", finishReason: "stop" }
+                return
+              }
+              const prompt = parts.filter(part => part.type === "text").map(part => part.text).join("\n")
+              const text = prompt.includes("Tailor this resume") ? JSON.stringify(SCHEDULED_GATE_BASE_RESUME)
+                : prompt.includes("Write a concise, professional European application cover letter")
+                  ? "Fixture cover letter prepared for the fresh Run Now recovery integration test." : null
+              if (!text) {
+                recoveryChildAdapterDiagnostic = `prepare_prompt_unrecognized:length=${prompt.length}`
+                throw new Error("Fresh Prepare model received an unexpected material prompt")
+              }
+              yield { type: "text_delta", text }
+              yield { type: "completed", finishReason: "stop" }
+              return
+            }
+            throw new Error(`Unexpected fresh recovery child role: ${task.role}`)
+          } }
+      }
+      const childExecutor = productionChild.createProductionChildExecutor({ pool: pool as never,
+        authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
+          settle: async () => undefined, settleUnknown: async () => undefined }),
+        jobDiscoveryClient: { async discover(request) {
+          const live = await pool!.query<{ salary: string | null }>(`SELECT "salary" FROM "Job" WHERE "id"=$1 AND "userId"=$2`,
+            [currentJob.id, request.userId])
+          if (live.rows.length !== 1) throw new Error("Fresh discovery could not read its owner-scoped current Job")
+          const salary = live.rows[0]!.salary
+          discoveredSalaries.push(salary)
+          const evidenceId = `source:${currentJob.id}`
+          return { jobs: [{ id: currentJob.id, title: currentJob.role, company: currentJob.company,
+            location: currentJob.location, url: currentJob.url, description: currentJob.description,
+            fullDescription: currentJob.description, salary, logo: null, source: currentJob.source, evidenceRefs: [evidenceId] }],
+            evidence: [{ evidenceId, jobId: currentJob.id, kind: "source", source: currentJob.source,
+              url: currentJob.url, summary: "Current owner-scoped disposable Job row" }], nextCursor: null,
+            usage: { ledgerKey: `fixture:${request.toolCallId}`, toolName: "jobs.discover", toolVersion: "1",
+              toolCallId: request.toolCallId, sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
+              requests: 1, jobsProcessed: 1, jobsSucceeded: 1, jobsFailed: 0, providerFailures: 0, aiCalls: 0, providers: [],
+              estimatedCostUsd: 0, durationMs: 1 } }
+        } }, modelRuntimeFactory: childModelRuntimeFactory })
+      const gateExecutor = gateRuntime.createScheduledGateChildExecutor({ pool: pool as never, fetcher: response.fetcher })
+      const executeChild: SubagentExecutor = async input => input.lease.taskType === SCHEDULED_GATE_TASK_TYPE
+        ? gateExecutor({ lease: input.lease }) : childExecutor(input)
+      const childQueueName = `material-drift-recovery-${randomUUID()}`
+      childRedis = new Redis(redisUrl!, { maxRetriesPerRequest: null, connectTimeout: 2_000,
+        retryStrategy: attempt => attempt > 3 ? null : 100 })
+      childQueue = new Queue<SubagentJobPayload>(childQueueName, { connection: childRedis.duplicate(), skipVersionCheck: true })
+      const createChildWorker = () => {
+        childWorkerGeneration += 1
+        return new Worker<SubagentJobPayload, unknown>(childQueueName, async job => {
+          const identity = parseSubagentDispatchJobId(job.id, job.data.taskId)
+          if (!identity) throw new Error("Run Now recovery child dispatch identity invalid")
+          return runSubagentQueueJob(pool as never, manager, executeChild, job.data, identity)
+        }, { connection: childRedis!.duplicate(), concurrency: 1, skipVersionCheck: true })
+      }
+      childWorker = createChildWorker()
+      const dispatchQueue: SubagentQueueLike = { add: async (name, payload, options) => {
+        const candidate = await pool!.query<{ role: string; taskType: string; status: string; turnId: string | null }>(`SELECT "role", "taskType", "status", "turnId"
+          FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`, [payload.taskId, fixture.ids.sessionId])
+        const task = candidate.rows[0]
+        if (task?.role === "prepare" && task.taskType === SCHEDULED_GATE_TASK_TYPE && task.status === "queued"
+          && task.turnId === recoveryTurnId) {
+          if (gateDispatchTaskId) throw new Error("Run Now recovery queued more than one fresh Gate dispatch")
+          await childQueue!.pause()
+          gateDispatchQueuePaused = true
+          gateDispatchTaskId = payload.taskId
+        }
+        return childQueue!.add(name, payload, options)
+      } }
+      await Promise.all([childQueue.waitUntilReady(), childWorker.waitUntilReady()])
+      dispatchActive = true
+      dispatchLoop = (async () => {
+        while (dispatchActive) {
+          try { await dispatchPendingSubagentOutbox(pool as never, dispatchQueue, 1, fixture.ids.sessionId) }
+          catch (error: unknown) { dispatchFailure = error; dispatchActive = false; return }
+          if (gateDispatchTaskId) {
+            const outbox = await pool!.query<{ publishedAt: Date | null }>(`SELECT "publishedAt" FROM "agent_outbox"
+              WHERE "topic"='agent.subagent.dispatch' AND "idempotencyKey"=$1 AND "aggregateId"=$2`,
+            [`subagent-dispatch:${gateDispatchTaskId}`, fixture.ids.sessionId])
+            if (outbox.rows.length !== 1 || !(outbox.rows[0]?.publishedAt instanceof Date)) {
+              dispatchFailure = new Error("Run Now recovery fresh Gate outbox was not committed")
+              dispatchActive = false
+              return
+            }
+            gateDispatchPublished = true
+            dispatchActive = false
+            return
+          }
+          await new Promise(resolve => setTimeout(resolve, 25))
+        }
+      })()
+
+      runtime = await canonical.createCanonicalTurnRuntime(pool!, {
+        workerId: `material-drift-recovery-worker-${randomUUID()}`,
+        productionFlags: { taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
+          consumeWaitOutcomes: true, canonicalAutomationEnabled: true, turnBoundaryCompactionEnabled: false },
+        executionProjection: createCanonicalExecutionProjection(pool!),
+        taskGraphCommandPort: commandPort.createPgTaskGraphCommandPort(pool as never),
+        taskGraphTemplates: templates.TASK_GRAPH_TEMPLATES,
+        scheduledPipelineFetch: response.fetcher,
+        authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
+          settle: async () => undefined, settleUnknown: async () => undefined }),
+        nativeVerificationFactory: nativePool => {
+          const port = createPgNativeVerificationPort(nativePool)
+          const observe = async <T>(phase: string, work: () => Promise<T>): Promise<T> => {
+            try {
+              const result = await work()
+              const row = debugRecord(result), status = row?.status
+              nativeVerificationTrace.push(`${phase}:${typeof status === "string" ? status : "returned"}`)
+              return result
+            } catch (error: unknown) {
+              const record = error && typeof error === "object" ? error as { code?: unknown; name?: unknown } : null
+              const code = typeof record?.code === "string" && /^[A-Za-z0-9_:-]{1,64}$/.test(record.code) ? record.code : "unclassified"
+              const name = error instanceof Error && /^[A-Za-z][A-Za-z0-9]{0,50}$/.test(error.name) ? error.name : "other"
+              nativeVerificationTrace.push(`${phase}:error:${code}:${name}`)
+              throw error
+            }
+          }
+          return { port: { ...port,
+            ensureChildren: scope => observe("children", () => port.ensureChildren(scope)),
+            ensureRootGoal: input => observe("root_goal", () => port.ensureRootGoal(input)),
+          }, readTerminalProof: readNativeVerificationTerminalProofWithClient }
+        },
+        modelRuntimeFactory: ({ state }) => {
+          rootRound = 0
+          modelFactoryCalls += 1
+          modelStateJson = JSON.stringify(state, (_key, value: unknown) =>
+            typeof value === "bigint" ? value.toString() : value)
+          const adapter: ModelAdapter = { id: "material-drift-recovery-worker-fixture", profile: modelProfile,
+            async *stream(request) {
+              rootRound += 1
+              modelRequestJson.push(JSON.stringify(request))
+              modelToolNames = request.tools.map(tool => debugRecord(tool)?.name).filter((name): name is string => typeof name === "string")
+              if (!request.signal) throw new Error("canonical recovery model request omitted its cancellation signal")
+              if (rootRound === 1) {
+                if (!modelToolNames.includes("agent.plan")) throw new Error("Canonical recovery root did not receive agent.plan")
+                yield { type: "tool_call_completed", callId: `fresh-analysis-plan-${recoveryTurnId}`, name: "agent.plan", arguments: {
+                  expectedRevision: 0,
+                  nodes: [
+                    { key: "fresh-scout", templateId: "scout", goal: "Discover the current fixture Job after Stop and Run Now",
+                      successCriteria: ["Return current owner-scoped Job discovery evidence"], dependsOn: [], verification: scoutVerification },
+                    { key: "fresh-analyst", templateId: "analyst", goal: "Analyze the current fixture Job using fresh Scout and Job evidence",
+                      successCriteria: ["Return a score supported by current Scout and Job evidence; fresh Prepare reads the base resume"],
+                      dependsOn: ["fresh-scout"], verification: analystVerification },
+                  ],
+                } }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              if (rootRound !== 2) throw new Error("Canonical recovery root requested an unexpected extra model round")
+              const deadline = Date.now() + 75_000
+              const liveRoot = await pool!.query<{ rootTaskId: string | null; leaseOwnerId: string | null; leaseVersion: number }>(
+                `SELECT "rootTaskId", "leaseOwnerId", "leaseVersion" FROM "agent_turns" WHERE "id"=$1 AND "sessionId"=$2`,
+                [recoveryTurnId, fixture.ids.sessionId])
+              const rootTaskId = liveRoot.rows[0]?.rootTaskId, turnLeaseOwnerId = liveRoot.rows[0]?.leaseOwnerId
+              const liveRootTask = rootTaskId ? await pool!.query<{ attemptCount: number; status: string }>(
+                `SELECT "attemptCount", "status" FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`,
+                [rootTaskId, fixture.ids.sessionId]) : null
+              const rootAttemptCount = liveRootTask?.rows[0]?.attemptCount
+              if (!rootTaskId || !turnLeaseOwnerId || !Number.isSafeInteger(rootAttemptCount)
+                || liveRootTask?.rows[0]?.status !== "running") {
+                throw new Error("Run Now recovery Root was unavailable after the fresh plan")
+              }
+              while (Date.now() < deadline) {
+                if (dispatchFailure) throw new Error("Run Now recovery subagent outbox dispatch failed")
+                const tasks = await pool!.query<{ role: string; status: string; failureReason: string | null }>(`SELECT "role", "status", "failureReason"
+                  FROM "sub_agent_tasks" WHERE "turnId"=$1 AND "sessionId"=$2 AND "rootTaskId"=$3 AND "parentTaskId"=$3
+                    AND "role" IN ('scout','analyst')`, [recoveryTurnId, fixture.ids.sessionId, rootTaskId])
+                if (tasks.rows.some(task => task.status === "failed" || task.status === "interrupted" || task.status === "cancelled")) {
+                  throw new Error("Fresh Scout or Analyst did not complete")
+                }
+                if (tasks.rows.length === 2 && tasks.rows.every(task => task.status === "completed" && task.failureReason === null)) break
+                await new Promise(resolve => setTimeout(resolve, 25))
+              }
+              if (Date.now() >= deadline) throw new Error("Fresh Scout and Analyst did not complete before the recovery deadline")
+              const analyzeProof = await scheduledPipelineModule.createCanonicalTurnScheduledPipeline(pool!).bridge({
+                userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: recoveryTurnId, rootTaskId,
+                rootAttemptCount: rootAttemptCount!, turnLeaseOwnerId, turnLeaseVersion: liveRoot.rows[0]!.leaseVersion,
+              })
+              if (analyzeProof.status !== "ready") {
+                throw new Error(`Fresh Run Now Analyze evidence was not ready: ${analyzeProof.reasonCode}`)
+              }
+              recoveryAnalyzeProofReady = true
+              yield { type: "text_delta", text: "Fresh Run Now Analyze evidence passed persisted owner and recovery validation." }
+              yield { type: "completed", finishReason: "stop" }
+            } }
+          return { adapter, registry: {} as never, candidates: [] }
+        },
+      })
+      redis = new Redis(redisUrl!, { maxRetriesPerRequest: null, connectTimeout: 2_000,
+        retryStrategy: attempt => attempt > 3 ? null : 100 })
+      turnQueue = new Queue(turnQueueModule.TURN_QUEUE_NAME, { connection: redis.duplicate(), skipVersionCheck: true })
+      await turnQueue.waitUntilReady()
+      expect(await dispatchPendingTurnOutbox(pool as never, turnQueue, 10)).toBeGreaterThanOrEqual(1)
+      const dispatchedRow = await pool!.query<{ publishedAt: Date | null }>(`SELECT "publishedAt" FROM "agent_outbox" WHERE "id"=$1`,
+        [dispatch.rows[0]!.id])
+      expect(dispatchedRow.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      let job = await turnQueue.getJob(recoveryScanner.turnJobId(recoveryTurnId))
+      if (!job) throw new Error("Run Now recovery dispatch was not present in the real BullMQ queue")
+      let recoveryExecutionAttempts = 0
+      const runRecoveryTurnJob = async (data: TurnJobPayload, attemptsMade: number) => {
+        recoveryExecutionAttempts += 1
+        runJob = turnQueueModule.runTurnJob({ data, attemptsMade }, { pool: pool!, execute: runtime!.execute,
+          waitHandoff: ({ lease, waitId, now }) => suspendAndReleaseWait(pool as never, { lease, waitId, now }),
+          requireCanonicalAutomationMode: true, heartbeatMs: 1_000, interruptPollMs: 25,
+          isInterrupted: lease => interruptProbe.safePersistedInterrupt(pool!, lease) })
+        try { return await runJob }
+        catch (error: unknown) {
+          const name = error instanceof Error && /^[A-Za-z][A-Za-z0-9]{0,50}$/.test(error.name) ? error.name : "other"
+          const message = error instanceof Error && /^[a-z][a-z0-9_]{1,100}$/.test(error.message) ? error.message : "unclassified"
+          runtimeFailure = `${name}:${message}`
+          return { status: "threw" }
+        }
+      }
+      let workerResult = await runRecoveryTurnJob(job.data, job.attemptsMade)
+      let workerStatus = debugRecord(workerResult)?.status
+      for (let retry = 0; workerStatus === "requeued" && retry < 1; retry += 1) {
+        if (debugRecord(workerResult)?.reasonCode !== "lease_lost") break
+        await job.remove()
+        const recovered = await recoveryScanner.recoverTurnQueue(pool as never, turnQueue,
+          `material-drift-recovery-${randomUUID()}`)
+        const turn = await pool!.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id"=$1 AND "sessionId"=$2`,
+          [recoveryTurnId, fixture.ids.sessionId])
+        if (recovered.reclaimed < 1 || turn.rows[0]?.status !== "queued") {
+          throw new Error("Run Now recovery lease was not reclaimed for its single bounded retry")
+        }
+        const retryDispatchDeadline = Date.now() + 5_000
+        while (Date.now() < retryDispatchDeadline) {
+          const pending = await pool!.query<{ attemptCount: number }>(`SELECT "attemptCount" FROM "agent_outbox"
+            WHERE "topic"='agent.turn.dispatch' AND "idempotencyKey"=$1 AND "aggregateId"=$2 AND "publishedAt" IS NULL`,
+          [`turn-dispatch:${recoveryTurnId}`, fixture.ids.sessionId])
+          if (pending.rows[0]) {
+            await dispatchPendingTurnOutbox(pool as never, turnQueue, 10)
+            job = await turnQueue.getJob(recoveryScanner.turnJobId(recoveryTurnId, pending.rows[0].attemptCount))
+          }
+          if (job) break
+          await new Promise(resolve => setTimeout(resolve, 25))
+        }
+        if (!job) throw new Error("Run Now recovery retry was not present in the real BullMQ queue")
+        workerResult = await runRecoveryTurnJob(job.data, retry + 1)
+        workerStatus = debugRecord(workerResult)?.status
+      }
+      if (workerStatus === "waiting_for_dependency") {
+        await job.remove()
+        let waitReport = { scanned: 0, resolved: 0, woken: 0 }
+        const waitDeadline = Date.now() + 15_000
+        while (Date.now() < waitDeadline && waitReport.woken === 0) {
+          waitReport = await reconcileDurableWaits(pool as never, { ownerId: `material-drift-recovery-${randomUUID()}` })
+          if (waitReport.woken === 0) await new Promise(resolve => setTimeout(resolve, 100))
+        }
+        if (waitReport.woken !== 1) {
+          if (!recoveryRootTaskId) {
+            const currentTurn = await pool!.query<{ rootTaskId: string | null }>(`SELECT "rootTaskId" FROM "agent_turns"
+              WHERE "id"=$1 AND "sessionId"=$2 AND "userId"=$3`, [recoveryTurnId, fixture.ids.sessionId, fixture.ids.userId])
+            recoveryRootTaskId = currentTurn.rows[0]?.rootTaskId ?? null
+          }
+          if (!recoveryRootTaskId) throw new Error("Run Now recovery Root was not persisted")
+          const waitProbe = await pool!.query<{ status: string; mode: string; targetTaskIds: unknown; result: unknown;
+            suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null; turnStatus: string; turnLeaseOwnerId: string | null;
+            sessionStatus: string; parentStatus: string; parentAttemptCount: number; stepStatus: string; stepAttempt: number;
+            targetId: string | null; targetStatus: string | null; targetRootTaskId: string | null; targetParentTaskId: string | null;
+            targetSessionId: string | null; targetTurnId: string | null }>(`SELECT wait."status", wait."mode", wait."targetTaskIds", wait."result",
+              wait."suspendedAt", wait."resolvedAt", wait."consumedAt", turn."status" AS "turnStatus", turn."leaseOwnerId" AS "turnLeaseOwnerId",
+              session."status" AS "sessionStatus", parent."status" AS "parentStatus", parent."attemptCount" AS "parentAttemptCount",
+              step."status" AS "stepStatus", step."attempt" AS "stepAttempt", target."id" AS "targetId", target."status" AS "targetStatus",
+              target."rootTaskId" AS "targetRootTaskId", target."parentTaskId" AS "targetParentTaskId",
+              target."sessionId" AS "targetSessionId", target."turnId" AS "targetTurnId"
+            FROM "agent_wait_conditions" wait JOIN "agent_turns" turn ON turn."id"=wait."turnId" AND turn."sessionId"=wait."sessionId"
+            JOIN "agent_sessions" session ON session."id"=wait."sessionId" JOIN "sub_agent_tasks" parent ON parent."id"=wait."parentTaskId"
+            JOIN "agent_steps" step ON step."id"=wait."stepId" AND step."sessionId"=wait."sessionId" AND step."turnId"=wait."turnId"
+            LEFT JOIN "sub_agent_tasks" target ON wait."targetTaskIds" @> jsonb_build_array(target."id")
+              AND target."sessionId"=wait."sessionId" AND target."turnId"=wait."turnId"
+            WHERE wait."userId"=$1 AND wait."sessionId"=$2 AND wait."turnId"=$3 AND wait."parentTaskId"=$4
+              AND wait."consumedAt" IS NULL ORDER BY wait."createdAt" DESC LIMIT 3`,
+          [fixture.ids.userId, fixture.ids.sessionId, recoveryTurnId, recoveryRootTaskId])
+          const waitDiagnostics = waitProbe.rows.map(wait => {
+            const ids = Array.isArray(wait.targetTaskIds) ? wait.targetTaskIds : []
+            const request = debugRecord(debugRecord(wait.result)?.request)
+            const requestTargets = request?.targetTaskIds
+            return { status: wait.status, mode: wait.mode, targetCount: ids.length, targetRequestMatches: Array.isArray(requestTargets)
+              && ids.length === requestTargets.length && ids.every((id, index) => id === requestTargets[index]),
+              requestKeys: Object.keys(request ?? {}).sort(), suspended: wait.suspendedAt !== null, resolved: wait.resolvedAt !== null,
+              consumed: wait.consumedAt !== null, turnStatus: wait.turnStatus, turnLeasePresent: wait.turnLeaseOwnerId !== null,
+              sessionRunning: wait.sessionStatus === "running", parentWaiting: wait.parentStatus === "waiting",
+              rootAttemptPositive: wait.parentAttemptCount > 0, stepWaiting: wait.stepStatus === "waiting_for_tool", stepAttempt: wait.stepAttempt,
+              targetCompleted: wait.targetStatus === "completed", targetScopeMatches: wait.targetRootTaskId === recoveryRootTaskId
+                && wait.targetParentTaskId === recoveryRootTaskId && wait.targetSessionId === fixture.ids.sessionId && wait.targetTurnId === recoveryTurnId }
+          })
+          throw new Error(`Fresh Prepare wait was not woken: scanned=${waitReport.scanned}, resolved=${waitReport.resolved}, ${JSON.stringify(waitDiagnostics)}`)
+        }
+        const continuation = await pool!.query<{ attemptCount: number }>(`SELECT "attemptCount" FROM "agent_outbox"
+          WHERE "topic"='agent.turn.dispatch' AND "idempotencyKey"=$1 AND "aggregateId"=$2 AND "publishedAt" IS NULL`,
+        [`turn-dispatch:${recoveryTurnId}`, fixture.ids.sessionId])
+        if (continuation.rows.length !== 1) throw new Error("Run Now recovery continuation outbox was not ready")
+        await dispatchPendingTurnOutbox(pool as never, turnQueue, 10)
+        job = await turnQueue.getJob(recoveryScanner.turnJobId(recoveryTurnId, continuation.rows[0]!.attemptCount))
+        if (!job) throw new Error("Run Now recovery continuation was not present in the real BullMQ queue")
+        workerResult = await runRecoveryTurnJob(job.data, job.attemptsMade)
+        workerStatus = debugRecord(workerResult)?.status
+      }
+      if (!["completed", "waiting_for_dependency", "waiting_for_user"].includes(String(workerStatus))) {
+        const failures = await pool!.query<{ role: string; taskType: string; status: string; failureReason: string | null }>(
+          `SELECT "role", "taskType", "status", "failureReason" FROM "sub_agent_tasks"
+            WHERE "turnId"=$1 AND "sessionId"=$2 ORDER BY "createdAt"`, [recoveryTurnId, fixture.ids.sessionId])
+        const safeFailures = failures.rows.map(task => ({ role: task.role, taskType: task.taskType,
+          status: task.status, failureReason: /^[a-z0-9_]{1,100}$/.test(task.failureReason ?? "") ? task.failureReason : null }))
+        const taskResults = await pool!.query<{ id: string; attemptCount: number; role: string; result: unknown }>(
+          `SELECT "id", "attemptCount", "role", "result" FROM "sub_agent_tasks" WHERE "turnId"=$1 AND "sessionId"=$2`, [recoveryTurnId, fixture.ids.sessionId])
+        const failedRoot = taskResults.rows.find(task => task.role === "orchestrator")
+        const rootSteps = failedRoot ? await pool!.query<{ status: string; errorCode: string | null }>(`SELECT "status", "errorCode"
+          FROM "agent_steps" WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId"=$3 ORDER BY "ordinal" DESC LIMIT 8`,
+        [fixture.ids.sessionId, recoveryTurnId, failedRoot.id]) : { rows: [] }
+        const rootWaitRows = failedRoot ? await pool!.query<{ status: string; mode: string; targetTaskIds: unknown; matchedTaskIds: unknown;
+          suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null; stepStatus: string; ordinal: number; latestOrdinal: number }>(`SELECT wait."status",
+            wait."mode", wait."targetTaskIds", wait."matchedTaskIds", wait."suspendedAt", wait."resolvedAt", wait."consumedAt",
+            step."status" AS "stepStatus", step."ordinal", (SELECT MAX(current."ordinal") FROM "agent_steps" current
+              WHERE current."sessionId"=step."sessionId" AND current."turnId"=step."turnId" AND current."taskId"=step."taskId"
+                AND current."attempt"=step."attempt") AS "latestOrdinal"
+          FROM "agent_wait_conditions" wait JOIN "agent_steps" step ON step."id"=wait."stepId"
+            AND step."sessionId"=wait."sessionId" AND step."turnId"=wait."turnId"
+          WHERE wait."userId"=$1 AND wait."sessionId"=$2 AND wait."turnId"=$3 AND wait."parentTaskId"=$4
+          ORDER BY wait."createdAt" DESC LIMIT 4`, [fixture.ids.userId, fixture.ids.sessionId, recoveryTurnId, failedRoot.id]) : { rows: [] }
+        const rootWaitSummaries = rootWaitRows.rows.map(wait => ({ status: wait.status, mode: wait.mode,
+          targetCount: Array.isArray(wait.targetTaskIds) ? wait.targetTaskIds.length : null,
+          matchedCount: Array.isArray(wait.matchedTaskIds) ? wait.matchedTaskIds.length : null,
+          suspended: wait.suspendedAt !== null, resolved: wait.resolvedAt !== null, consumed: wait.consumedAt !== null,
+          stepStatus: wait.stepStatus, stepCurrent: wait.ordinal === wait.latestOrdinal }))
+        const candidateRows = failedRoot ? await pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_events"
+          WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId"=$3 AND "type"='native_verification.scheduled_candidate_staged'`,
+        [fixture.ids.sessionId, recoveryTurnId, failedRoot.id]) : { rows: [] }
+        const rootToolRows = failedRoot ? await pool!.query<{ type: string; itemStatus: string; content: unknown }>(`SELECT "type",
+          "status" AS "itemStatus", "content"
+          FROM "agent_items" WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId"=$3 AND "type" IN ('tool_call', 'tool_result')
+          ORDER BY "createdAt" DESC, "id" DESC LIMIT 12`, [fixture.ids.sessionId, recoveryTurnId, failedRoot.id]) : { rows: [] }
+        const rootRejections = failedRoot ? await pool!.query<{ type: string; code: string | null; blocker: string | null; errorCode: string | null }>(`SELECT "type",
+          "payload"->>'code' AS "code", "payload"->>'blocker' AS "blocker", "payload"->>'errorCode' AS "errorCode" FROM "agent_events"
+          WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId"=$3 AND "type" IN ('final.rejected', 'tool.call.failed', 'model.failed', 'step.completed')
+          ORDER BY "sequence" DESC LIMIT 8`, [fixture.ids.sessionId, recoveryTurnId, failedRoot.id]) : { rows: [] }
+        const rootFailureDiagnostics = { modelFactoryCalls, rootRound, recoveryAnalyzeProofReady, nativeVerificationTrace, rootCompletionTrace, runtimeFailure,
+          checkpointSaveDiagnostic: response.checkpointSaveDiagnostic(),
+          pipelineOutcome: response.pipelineOutcome(), pipelineResponses: response.pipelineResponses(), continuation: response.continuationState(),
+          gateCalls: response.gateCalls(), gateHttpFailures: response.gateHttpFailures().map(failure => ({ status: failure.status,
+            errorCode: failure.errorCode, phase: failure.testDiagnostic.phase, safeErrorCode: failure.testDiagnostic.safeErrorCode })),
+          candidateEventCount: candidateRows.rows[0]?.count ?? 0, waits: rootWaitSummaries,
+          rootTools: rootToolRows.rows.map(item => { const content = debugRecord(item.content), keys = Object.keys(content ?? {}).sort()
+            const name = [content?.toolName, content?.name].find(value => typeof value === "string")
+            return { type: item.type, itemStatus: item.itemStatus, contentKeys: keys,
+              toolName: typeof name === "string" && ["agent.plan", "agent.wait", "agent.list", "scheduled.application.prepare"].includes(name) ? name : "other",
+              errorCode: /^[a-z0-9_]{1,100}$/.test(typeof content?.errorCode === "string" ? content.errorCode : "") ? content?.errorCode : null }
+          }),
+          stepFailures: rootSteps.rows.map(step => ({ status: step.status,
+            errorCode: /^[a-z0-9_]{1,100}$/.test(step.errorCode ?? "") ? step.errorCode : null })),
+          rejections: rootRejections.rows.map(event => ({ type: event.type,
+            code: /^[a-z0-9_]{1,100}$/.test(event.code ?? "") ? event.code : null,
+            blocker: /^[a-z0-9_]{1,100}$/.test(event.blocker ?? "") ? event.blocker : null,
+            errorCode: /^[a-z0-9_]{1,100}$/.test(event.errorCode ?? "") ? event.errorCode : null })) }
+        const safeReports = taskResults.rows.map(task => {
+          const result = debugRecord(task.result), structured = debugRecord(result?.structuredResult), report = debugRecord(result?.taskGraphVerificationReport)
+          const prepareJobs = Array.isArray(structured?.jobs) ? structured.jobs.map(debugRecord) : []
+          const prepareMaterials = Array.isArray(structured?.materials) ? structured.materials.map(debugRecord) : []
+          const prepareStatuses = new Map(prepareJobs.flatMap(job => typeof job?.jobId === "string" && typeof job.status === "string"
+            ? [[job.jobId, job.status] as const] : []))
+          const finalText = typeof result?.finalText === "string" ? result.finalText : ""
+          let final: Record<string, unknown> | undefined
+          try { final = debugRecord(JSON.parse(finalText)) ?? undefined } catch { final = undefined }
+          const criteria = Array.isArray(report?.criteria) ? report.criteria.map(value => {
+            const row = debugRecord(value)
+            return { id: row?.id, status: row?.status, reasonCode: row?.reasonCode }
+          }) : []
+          const evidence = Array.isArray(final?.evidence) ? final.evidence.map(value => debugRecord(value)?.kind) : []
+          const findingEvidenceCounts = Array.isArray(final?.findings) ? final.findings.map(value => {
+            const ids = debugRecord(value)?.evidenceIds
+            return Array.isArray(ids) ? ids.length : 0
+          }) : []
+          return { role: task.role, resultKeys: Object.keys(result ?? {}).sort(), resultRole: structured?.role, resultStatus: structured?.status,
+            resultTaskBindingMatches: structured?.taskId === task.id, resultAttemptBindingMatches: structured?.attemptCount === task.attemptCount,
+            prepareJobCount: Array.isArray(structured?.jobs) ? prepareJobs.length : null,
+            prepareJobStatuses: prepareJobs.map(job => job && ["prepared", "skipped", "failed"].includes(String(job.status)) ? job.status : "invalid"),
+            prepareMaterialCount: Array.isArray(structured?.materials) ? prepareMaterials.length : null,
+            prepareMaterialKinds: prepareMaterials.map(material => material && ["resume", "cover_letter"].includes(String(material.kind)) ? material.kind : "invalid"),
+            prepareMaterialsBindToPreparedJobs: prepareMaterials.every(material => typeof material?.jobId === "string" && prepareStatuses.get(material.jobId) === "prepared"),
+            preparedJobsHaveResumeMaterial: prepareJobs.filter(job => job?.status === "prepared").every(job => prepareMaterials.some(material => material?.jobId === job?.jobId && material?.kind === "resume")),
+            snapshotDigestPresent: typeof structured?.snapshotDigest === "string" && /^sha256:[a-f0-9]{64}$/.test(structured.snapshotDigest),
+            checkpointDigestPresent: typeof structured?.checkpointDigest === "string" && /^[a-f0-9]{64}$/.test(structured.checkpointDigest),
+            structuredOutputFailureCategory: result?.structuredOutputFailureCategory,
+            evidenceCount: Array.isArray(structured?.evidence) ? structured.evidence.length : null,
+            finalTextLength: finalText.length, finalKeys: Object.keys(final ?? {}).sort(), finalRole: final?.role,
+            finalStatus: final?.status, finalEvidenceKinds: evidence, findingEvidenceCounts,
+            reportStatus: report?.status, reportReasonCode: report?.reasonCode, criteria }
+        })
+        throw new Error(`Run Now recovery worker returned ${String(workerStatus)} before Gate: ${JSON.stringify({ safeFailures,
+          safeReports, rootFailureDiagnostics, recoveryChildAdapterDiagnostic, reasonCode: debugRecord(workerResult)?.reasonCode })}`)
+      }
+      if (dispatchFailure) throw new Error("Run Now recovery subagent outbox dispatch failed")
+      const root = await pool!.query<{ rootTaskId: string | null; status: string; source: string; automationRunMode: string | null }>(
+        `SELECT turn."rootTaskId", turn."status", turn."source", turn."input"->>'automationRunMode' AS "automationRunMode"
+         FROM "agent_turns" AS turn WHERE turn."id"=$1 AND turn."userId"=$2 AND turn."sessionId"=$3`,
+      [recoveryTurnId, fixture.ids.userId, fixture.ids.sessionId])
+      const rootTaskId = root.rows[0]?.rootTaskId
+      expect(root.rows[0]).toMatchObject({ source: "automation", automationRunMode: "manual" })
+      expect(rootTaskId).toBeTruthy()
+      const rootTask = await pool!.query<{ role: string; taskType: string; status: string; failureReason: string | null; turnId: string; attemptCount: number; allowedActions: unknown }>(
+        `SELECT "role", "taskType", "status", "failureReason", "turnId", "attemptCount", "allowedActions" FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`,
+        [rootTaskId, fixture.ids.sessionId])
+      expect(rootTask.rows).toHaveLength(1)
+      expect(rootTask.rows[0]).toMatchObject({ role: "orchestrator", taskType: "root", turnId: recoveryTurnId })
+      expect(rootTask.rows[0]?.allowedActions).toEqual(expect.arrayContaining([...templates.TASK_GRAPH_TEMPLATES.prepare.allowedActions]))
+      const recoveryLineage = await (await import("./canonical-turn-scheduled-pipeline-context.js")).validateMaterialDriftRecoveryTurn(
+        pool!, { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: recoveryTurnId })
+      expect(recoveryLineage.status).toBe("valid")
+      expect(modelFactoryCalls).toBe(recoveryExecutionAttempts)
+      expect(modelToolNames).toContain("agent.plan")
+      expect(recoveryAnalyzeProofReady).toBe(true)
+      // Run Now persists manual mode; the private Web handoff must validate recovery lineage before admitting it.
+      if (rootTask.rows[0]?.failureReason === "scheduled_pipeline_mode_mismatch") {
+        throw new Error("Fresh Run Now Analyze handoff returned scheduled_pipeline_mode_mismatch at POST /api/internal/agent-runtime/scheduled-pipeline")
+      }
+      expect(["completed", "waiting_for_dependency", "waiting_for_user"]).toContain(workerStatus)
+      const gateDispatchDeadline = Date.now() + 15_000
+      while (!gateDispatchPublished && !dispatchFailure && Date.now() < gateDispatchDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      if (dispatchFailure) throw new Error("Run Now recovery subagent outbox dispatch failed before Worker-instance restart")
+      if (!gateDispatchTaskId || !gateDispatchPublished || !gateDispatchQueuePaused || !childQueue || !childWorker) {
+        throw new Error("Fresh Gate dispatch did not reach the paused same-queue restart cut")
+      }
+      const freshGateTaskId = gateDispatchTaskId
+      await dispatchLoop
+      expect(response.gateCalls()).toBe(0)
+      const queuedGate = await pool!.query<{ status: string }>(`SELECT task."status" FROM "sub_agent_tasks" task
+        JOIN "agent_sessions" session ON session."id"=task."sessionId" AND session."userId"=$2
+        JOIN "agent_turns" turn ON turn."id"=task."turnId" AND turn."sessionId"=task."sessionId" AND turn."userId"=$2
+        WHERE task."id"=$1 AND task."sessionId"=$3 AND task."turnId"=$4 AND task."taskType"=$5`,
+      [freshGateTaskId, fixture.ids.userId, fixture.ids.sessionId, recoveryTurnId, SCHEDULED_GATE_TASK_TYPE])
+      expect(queuedGate.rows).toEqual([{ status: "queued" }])
+      const beforeRestartGraph = await loadTaskGraph(pool as never, { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
+        turnId: recoveryTurnId, rootTaskId: rootTaskId!, parentTaskId: rootTaskId! }, false)
+      if (!beforeRestartGraph.snapshot) throw new Error("Fresh pre-Gate TaskGraph snapshot was not persisted")
+      const beforeRestartPrepareNode = beforeRestartGraph.snapshot.nodes.find(node => node.key === "prepare")
+      const beforeRestartPrepare = beforeRestartPrepareNode?.taskId ? beforeRestartGraph.tasks.get(beforeRestartPrepareNode.taskId) : undefined
+      if (!beforeRestartPrepare || beforeRestartPrepare.status !== "completed") {
+        throw new Error("Fresh Prepare task was not completed before the Worker-instance restart cut")
+      }
+      const scope = { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: recoveryTurnId, rootTaskId: rootTaskId! }
+      const beforeRestartExecution = await pool!.query<{ state: unknown; attemptCount: number }>(`SELECT "state", "attemptCount"
+        FROM "agent_executions" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`,
+      [fixture.executionOwner.executionId, scope.userId, scope.sessionId])
+      const beforeRestartExecutionRow = beforeRestartExecution.rows[0]
+      const beforeRestartAnalyzeKey = debugRecord(debugRecord(beforeRestartExecutionRow?.state)?.scheduledTaskGraphContinuation)?.key
+      if (!beforeRestartExecutionRow || typeof beforeRestartAnalyzeKey !== "string") {
+        throw new Error("Fresh Analyze checkpoint was not persisted before the Worker-instance restart cut")
+      }
+      const beforeRestartReceipt = await readScheduledGateRegistrationReceipt(pool as never, { ...scope, gateTaskId: freshGateTaskId,
+        owner: { ...scope, rootAttemptCount: rootTask.rows[0]!.attemptCount, executionId: fixture.executionOwner.executionId,
+          executionAttemptCount: beforeRestartExecutionRow.attemptCount } })
+      if (!beforeRestartReceipt) throw new Error("Fresh Gate receipt was not bound before the Worker-instance restart cut")
+      const beforeRestartProof = await loadPersistedScheduledPrepareProof(pool as never, scope, beforeRestartPrepare.id,
+        beforeRestartPrepare.result, beforeRestartAnalyzeKey, beforeRestartReceipt.prepareWaitId)
+      expect(beforeRestartProof?.receipt).toMatchObject({ owner: beforeRestartReceipt.owner,
+        checkpointDigest: beforeRestartReceipt.checkpointDigest })
+      expect(beforeRestartProof?.result).toMatchObject({ role: "prepare", status: "completed", taskId: beforeRestartPrepare.id,
+        attemptCount: beforeRestartPrepare.attemptCount, jobs: [{ jobId: currentJob.id, status: "prepared" }] })
+      const originalPrepare = await pool!.query<{ result: unknown }>(`SELECT task."result" FROM "sub_agent_tasks" task
+        JOIN "agent_sessions" session ON session."id"=task."sessionId" AND session."userId"=$2
+        JOIN "agent_turns" turn ON turn."id"=task."turnId" AND turn."sessionId"=task."sessionId" AND turn."userId"=$2
+        WHERE task."id"=$1 AND task."sessionId"=$3 AND task."turnId"=$4 AND task."taskType"='scheduled_application_prepare'`,
+      [fixture.ids.prepareTaskId, fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId])
+      expect(originalPrepare.rows).toHaveLength(1)
+      const originalPrepareResult = originalPrepare.rows[0]!.result
+      expect(await loadPersistedScheduledPrepareProof(pool as never, scope, fixture.ids.prepareTaskId,
+        originalPrepareResult, beforeRestartAnalyzeKey, beforeRestartReceipt.prepareWaitId)).toBeNull()
+      if (MATERIAL_RECOVERY_PROCESS_MODE) {
+        recoveryWebBridge = await startMaterialRecoveryWebBridge(response.fetcher, process.env.AGENT_WORKER_SECRET ?? "")
+        const processConfig: MaterialRecoveryProcessConfig = { queueName: childQueueName, userId: fixture.ids.userId,
+          sessionId: fixture.ids.sessionId, turnId: recoveryTurnId, rootTaskId: rootTaskId!, taskId: freshGateTaskId,
+          prepareTaskId: beforeRestartPrepare.id, webUrl: recoveryWebBridge.url }
+        const previousChildWorker = childWorker
+        await previousChildWorker.close()
+        childWorker = undefined
+        crashedRecoveryProcess = startMaterialRecoveryProcess("crash", processConfig)
+        expect(await nextMaterialRecoveryMarker(crashedRecoveryProcess, "READY")).toMatchObject({ mode: "crash" })
+        await childQueue.resume()
+        gateDispatchQueuePaused = false
+        const crashCut = await nextMaterialRecoveryMarker(crashedRecoveryProcess, "CRASH_CUT")
+        expect(crashCut).toMatchObject({ taskScopeMatches: true, freshPrepareProof: true })
+        const gateAtCrash = await pool!.query<{ status: string; attemptCount: number; role: string; taskType: string;
+          sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string; userId: string; leaseOwner: string | null;
+          leaseExpiresAt: Date | null }>(`SELECT task."status", task."attemptCount", task."role", task."taskType", task."sessionId",
+            task."turnId", task."rootTaskId", task."parentTaskId", session."userId", task."leaseOwner", task."leaseExpiresAt"
+          FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id"=task."sessionId"
+          JOIN "agent_turns" turn ON turn."id"=task."turnId" AND turn."sessionId"=task."sessionId"
+            AND turn."userId"=session."userId" AND turn."rootTaskId"=task."rootTaskId"
+          WHERE task."id"=$1 AND task."sessionId"=$2 AND task."turnId"=$3 AND task."rootTaskId"=$4 AND session."userId"=$5`,
+        [freshGateTaskId, fixture.ids.sessionId, recoveryTurnId, rootTaskId, fixture.ids.userId])
+        expect(gateAtCrash.rows).toHaveLength(1)
+        const crashedLease = gateAtCrash.rows[0]!
+        expect(crashedLease).toMatchObject({ status: "running", role: "prepare", taskType: SCHEDULED_GATE_TASK_TYPE,
+          sessionId: fixture.ids.sessionId, turnId: recoveryTurnId, rootTaskId, parentTaskId: rootTaskId, userId: fixture.ids.userId })
+        expect(crashedLease.attemptCount).toBe(crashCut.attemptCount)
+        expect(typeof crashedLease.leaseOwner).toBe("string")
+        expect(crashedLease.leaseExpiresAt).toBeInstanceOf(Date)
+        if (!crashedLease.leaseOwner || !crashedLease.leaseExpiresAt) throw new Error("fresh Gate process crash lease missing")
+        expect(response.gateCalls()).toBe(0)
+        await stopMaterialRecoveryProcess(crashedRecoveryProcess)
+        crashedRecoveryProcess = undefined
+
+        const expiryRecovery = await import("./pg-store-expiry-recovery.js")
+        const recoveryDeadline = Date.now() + 20_000
+        let recoveredGate = false
+        while (Date.now() < recoveryDeadline && !recoveredGate) {
+          const expired = await pool!.query<{ expired: boolean }>(`SELECT "leaseExpiresAt" <= clock_timestamp() AS "expired"
+            FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3 AND "status"='running'
+              AND "leaseOwner"=$4`, [freshGateTaskId, fixture.ids.sessionId, recoveryTurnId, crashedLease.leaseOwner])
+          if (expired.rows[0]?.expired === true) {
+            const rows = await expiryRecovery.recoverExpired(pool as never, { now: new Date(), limit: 10,
+              sessionId: fixture.ids.sessionId, turnId: recoveryTurnId })
+            const recoveredTask = rows.find(task => task.id === freshGateTaskId && task.status === "queued")
+            if (recoveredTask) {
+              await persistSubagentDispatch(pool as never, { taskId: recoveredTask.id, sessionId: recoveredTask.sessionId,
+                rootTaskId: recoveredTask.rootTaskId ?? rootTaskId!, ownerId: `recovery-${randomUUID()}` }, true)
+              const pending = await pool!.query<{ idempotencyKey: string }>(`SELECT "idempotencyKey" FROM "agent_outbox"
+                WHERE "topic"='agent.subagent.dispatch' AND "aggregateId"=$1 AND "publishedAt" IS NULL`, [fixture.ids.sessionId])
+              expect(pending.rows.map(row => row.idempotencyKey)).toEqual([`subagent-dispatch:${freshGateTaskId}`])
+              const dispatched = await dispatchPendingSubagentOutbox(pool as never, childQueue!, 1, fixture.ids.sessionId)
+              expect(dispatched).toBe(1)
+              recoveredGate = true
+              const published = await pool!.query<{ publishedAt: Date | null }>(`SELECT "publishedAt" FROM "agent_outbox"
+                WHERE "topic"='agent.subagent.dispatch' AND "aggregateId"=$1 AND "idempotencyKey"=$2`,
+              [fixture.ids.sessionId, `subagent-dispatch:${freshGateTaskId}`])
+              expect(published.rows).toEqual([{ publishedAt: expect.any(Date) }])
+            }
+          } else await new Promise(resolve => setTimeout(resolve, 100))
+        }
+        if (!recoveredGate) throw new Error("expired fresh Gate claim was not recovered for the exact Turn")
+        const queuedGateAfterRecovery = await pool!.query<{ status: string; attemptCount: number; leaseOwner: string | null }>(`SELECT "status", "attemptCount", "leaseOwner"
+          FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3 AND "rootTaskId"=$4`,
+        [freshGateTaskId, fixture.ids.sessionId, recoveryTurnId, rootTaskId])
+        expect(queuedGateAfterRecovery.rows).toEqual([{ status: "queued", attemptCount: crashedLease.attemptCount, leaseOwner: null }])
+
+        resumedRecoveryProcess = startMaterialRecoveryProcess("resume", processConfig)
+        expect(await nextMaterialRecoveryMarker(resumedRecoveryProcess, "READY")).toMatchObject({ mode: "resume" })
+        const reclaimed = await nextMaterialRecoveryMarker(resumedRecoveryProcess, "RECLAIMED")
+        expect(reclaimed).toMatchObject({ taskScopeMatches: true, freshPrepareProof: true })
+        expect(reclaimed.attemptCount).toBeGreaterThan(crashedLease.attemptCount)
+        const reboundGate = await pool!.query<{ status: string; attemptCount: number; leaseOwner: string | null; taskType: string;
+          turnId: string; rootTaskId: string; parentTaskId: string }>(`SELECT "status", "attemptCount", "leaseOwner", "taskType", "turnId", "rootTaskId", "parentTaskId"
+          FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3 AND "rootTaskId"=$4`,
+        [freshGateTaskId, fixture.ids.sessionId, recoveryTurnId, rootTaskId])
+        expect(reboundGate.rows).toHaveLength(1)
+        expect(reboundGate.rows[0]).toMatchObject({ status: "running", attemptCount: reclaimed.attemptCount,
+          taskType: SCHEDULED_GATE_TASK_TYPE, turnId: recoveryTurnId, rootTaskId, parentTaskId: rootTaskId })
+        expect(typeof reboundGate.rows[0]?.leaseOwner).toBe("string")
+        expect(reboundGate.rows[0]?.leaseOwner).not.toBe(crashedLease.leaseOwner)
+        allowMaterialRecoveryGate(resumedRecoveryProcess)
+        expect(await nextMaterialRecoveryMarker(resumedRecoveryProcess, "GATE_HTTP")).toMatchObject({ status: 200 })
+        await nextMaterialRecoveryMarker(resumedRecoveryProcess, "TASK_FINISHED")
+        expect(await waitForMaterialRecoveryProcessExit(resumedRecoveryProcess)).toEqual({ code: 0, signal: null })
+        resumedRecoveryProcess = undefined
+        await recoveryWebBridge.close()
+        recoveryWebBridge = undefined
+      } else {
+        const previousChildWorker = childWorker
+        await previousChildWorker.close()
+        manager = new AgentTreeManager(new PgSubagentTaskStore(pool as never))
+        childWorker = createChildWorker()
+        expect(childWorker).not.toBe(previousChildWorker)
+        expect(childWorkerGeneration).toBe(2)
+        await childWorker.waitUntilReady()
+        await childQueue.resume()
+        gateDispatchQueuePaused = false
+      }
+      expect(modelStateJson).not.toContain(String(originalSourceMarker?.proofDigest))
+      expect(modelStateJson).not.toContain(JSON.stringify(originalSourceMarker))
+      expect(modelRequestJson.length).toBeGreaterThanOrEqual(2)
+      for (const privateField of ["materialDriftRecovery", "sourceMarker", "currentSnapshotDigest", "scheduledTaskGraphMaterialDriftTerminal",
+        "analyzeFingerprintDigest", "prepareProofDigest", "artifactDigest", "currentMaterialDigest", "proofDigest"]) {
+        for (const requestJson of modelRequestJson) expect(requestJson).not.toContain(JSON.stringify(privateField))
+      }
+      for (const privateValue of privateModelMarkerValues) for (const requestJson of modelRequestJson) expect(requestJson).not.toContain(privateValue)
+      for (const privateValue of privateRecoveryValues) for (const requestJson of modelRequestJson) expect(requestJson).not.toContain(privateValue)
+      expect(discoveredSalaries).toContain("€100k+")
+      const gateDeadline = Date.now() + 60_000
+      let gateBoundaryObserved = false
+      while (Date.now() < gateDeadline) {
+        const gate = await pool!.query<{ status: string; failureReason: string | null }>(`SELECT "status", "failureReason"
+          FROM "sub_agent_tasks" WHERE "turnId"=$1 AND "sessionId"=$2 AND "role"='prepare' AND "taskType"=$3
+          ORDER BY "createdAt" DESC LIMIT 1`, [recoveryTurnId, fixture.ids.sessionId, SCHEDULED_GATE_TASK_TYPE])
+        const status = gate.rows[0]?.status
+        if (status === "failed") break
+        if (response.gateCalls() > 0 && status === "waiting_for_user") {
+          gateBoundaryObserved = true
+          break
+        }
+        const prepare = await pool!.query<{ status: string }>(`SELECT "status" FROM "sub_agent_tasks"
+          WHERE "turnId"=$1 AND "sessionId"=$2 AND "taskType"='scheduled_application_prepare'
+          ORDER BY "createdAt" DESC LIMIT 1`, [recoveryTurnId, fixture.ids.sessionId])
+        if (prepare.rows[0]?.status === "failed") break
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      if (!gateBoundaryObserved) {
+        const tasks = await pool!.query<{ role: string; taskType: string; status: string; failureReason: string | null }>(
+          `SELECT "role", "taskType", "status", "failureReason" FROM "sub_agent_tasks"
+            WHERE "turnId"=$1 AND "sessionId"=$2 ORDER BY "createdAt"`, [recoveryTurnId, fixture.ids.sessionId])
+        const prepareTask = await pool!.query<{ id: string }>(`SELECT "id" FROM "sub_agent_tasks"
+          WHERE "turnId"=$1 AND "sessionId"=$2 AND "taskType"='scheduled_application_prepare' ORDER BY "createdAt" DESC LIMIT 1`,
+        [recoveryTurnId, fixture.ids.sessionId])
+        const prepareResultRow = await pool!.query<{ id: string; attemptCount: number; result: unknown }>(`SELECT "id", "attemptCount", "result"
+          FROM "sub_agent_tasks" WHERE "turnId"=$1 AND "sessionId"=$2 AND "taskType"='scheduled_application_prepare'
+          ORDER BY "createdAt" DESC LIMIT 1`, [recoveryTurnId, fixture.ids.sessionId])
+        const prepareEnvelope = debugRecord(prepareResultRow.rows[0]?.result), prepareResult = debugRecord(prepareEnvelope?.structuredResult)
+        const prepareJobs = Array.isArray(prepareResult?.jobs) ? prepareResult.jobs.map(debugRecord) : []
+        const prepareMaterials = Array.isArray(prepareResult?.materials) ? prepareResult.materials.map(debugRecord) : []
+        const prepareStatuses = new Map(prepareJobs.flatMap(job => typeof job?.jobId === "string" && typeof job.status === "string"
+          ? [[job.jobId, job.status] as const] : []))
+        const prepareResultDiagnostics = { role: prepareResult?.role, status: prepareResult?.status,
+          taskBindingMatches: prepareResult?.taskId === prepareResultRow.rows[0]?.id,
+          attemptBindingMatches: prepareResult?.attemptCount === prepareResultRow.rows[0]?.attemptCount,
+          jobCount: Array.isArray(prepareResult?.jobs) ? prepareJobs.length : null,
+          jobStatuses: prepareJobs.map(job => job && ["prepared", "skipped", "failed"].includes(String(job.status)) ? job.status : "invalid"),
+          materialCount: Array.isArray(prepareResult?.materials) ? prepareMaterials.length : null,
+          materialKinds: prepareMaterials.map(material => material && ["resume", "cover_letter"].includes(String(material.kind)) ? material.kind : "invalid"),
+          materialsBindToPreparedJobs: prepareMaterials.every(material => typeof material?.jobId === "string" && prepareStatuses.get(material.jobId) === "prepared"),
+          preparedJobsHaveResumeMaterial: prepareJobs.filter(job => job?.status === "prepared").every(job => prepareMaterials.some(material => material?.jobId === job?.jobId && material?.kind === "resume")),
+          snapshotDigestPresent: typeof prepareResult?.snapshotDigest === "string" && /^sha256:[a-f0-9]{64}$/.test(prepareResult.snapshotDigest),
+          checkpointDigestPresent: typeof prepareResult?.checkpointDigest === "string" && /^[a-f0-9]{64}$/.test(prepareResult.checkpointDigest) }
+        const prepareModelSteps = prepareResultRow.rows[0]?.id ? await pool!.query<{ status: string; errorCode: string | null }>(`SELECT "status", "errorCode"
+          FROM "agent_steps" WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId"=$3 AND "id" LIKE 'scheduled-prepare-model:%'
+          ORDER BY "createdAt"`, [fixture.ids.sessionId, recoveryTurnId, prepareResultRow.rows[0].id]) : { rows: [] }
+        const prepareModelStepDiagnostics = prepareModelSteps.rows.map(step => ({ status: step.status,
+          errorCode: /^[a-z0-9_]{1,100}$/.test(step.errorCode ?? "") ? step.errorCode : null }))
+        const currentGraphForDiagnostic = rootTaskId ? await loadTaskGraph(pool as never, { userId: fixture.ids.userId,
+          sessionId: fixture.ids.sessionId, turnId: recoveryTurnId, rootTaskId, parentTaskId: rootTaskId }, false) : null
+        const graphTaskIds = currentGraphForDiagnostic?.snapshot?.nodes.map(node => node.taskId) ?? []
+        const ownerState = await pool!.query<{ turnStatus: string; turnLeasePresent: boolean; turnLeaseExpiryPresent: boolean;
+          rootStatus: string; rootLeasePresent: boolean; rootLeaseExpiryPresent: boolean; rootAttemptCount: number;
+          rootInterrupted: boolean; sessionStatus: string; source: string; executionMode: string }>(`SELECT turn."status" AS "turnStatus",
+            turn."leaseOwnerId" IS NOT NULL AS "turnLeasePresent", turn."leaseExpiresAt" IS NOT NULL AS "turnLeaseExpiryPresent",
+            root."status" AS "rootStatus", root."leaseOwner" IS NOT NULL AS "rootLeasePresent",
+            root."leaseExpiresAt" IS NOT NULL AS "rootLeaseExpiryPresent", root."attemptCount" AS "rootAttemptCount",
+            root."interruptRequestedAt" IS NOT NULL AS "rootInterrupted", session."status" AS "sessionStatus", turn."source", turn."executionMode"
+          FROM "agent_turns" turn JOIN "sub_agent_tasks" root ON root."id"=turn."rootTaskId" AND root."sessionId"=turn."sessionId"
+          JOIN "agent_sessions" session ON session."id"=turn."sessionId"
+          WHERE turn."id"=$1 AND turn."sessionId"=$2 AND turn."userId"=$3`, [recoveryTurnId, fixture.ids.sessionId, fixture.ids.userId])
+        const waitState = await pool!.query<{ targetTaskIds: unknown; mode: string; status: string; suspendedAt: Date | null;
+          consumedAt: Date | null; stepTaskId: string | null; stepStatus: string; attempt: number; ordinal: number; latestOrdinal: number }>(`SELECT wait."targetTaskIds",
+            wait."mode", wait."status", wait."suspendedAt", wait."consumedAt", step."taskId" AS "stepTaskId", step."status" AS "stepStatus",
+            step."attempt", step."ordinal", (SELECT MAX(current."ordinal") FROM "agent_steps" current WHERE current."sessionId"=step."sessionId"
+              AND current."turnId"=step."turnId" AND current."taskId"=step."taskId" AND current."attempt"=step."attempt") AS "latestOrdinal"
+          FROM "agent_wait_conditions" wait JOIN "agent_steps" step ON step."id"=wait."stepId"
+            AND step."sessionId"=wait."sessionId" AND step."turnId"=wait."turnId"
+          WHERE wait."userId"=$1 AND wait."sessionId"=$2 AND wait."turnId"=$3 AND wait."parentTaskId"=$4
+            AND wait."consumedAt" IS NULL ORDER BY wait."createdAt" DESC, wait."id" DESC LIMIT 3`,
+        [fixture.ids.userId, fixture.ids.sessionId, recoveryTurnId, rootTaskId])
+        const prepareTaskId = prepareTask.rows[0]?.id
+        const dependencyWaitDiagnostics = waitState.rows.map(wait => {
+          const targetIds = Array.isArray(wait.targetTaskIds) ? wait.targetTaskIds.filter((id): id is string => typeof id === "string") : []
+          return { status: wait.status, mode: wait.mode, suspended: wait.suspendedAt !== null, consumed: wait.consumedAt !== null,
+            targetCount: targetIds.length, targetsPrepare: typeof prepareTaskId === "string" && targetIds.includes(prepareTaskId),
+            exactGraphTargets: targetIds.length === graphTaskIds.length && graphTaskIds.every(id => targetIds.includes(id)),
+            rootStep: wait.stepTaskId === null || wait.stepTaskId === rootTaskId, stepStatus: wait.stepStatus,
+            stepCurrent: wait.ordinal === wait.latestOrdinal, attemptPositive: wait.attempt > 0 }
+        })
+        throw new Error(`Fresh Gate boundary was not observed: ${JSON.stringify({ workerStatus, recoveryChildAdapterDiagnostic,
+          gateCalls: response.gateCalls(), gateHttpFailureCount: response.gateHttpFailures().length, gateFailure: response.gateDiagnostics(),
+          gateHttpFailures: response.gateHttpFailures().map(({ status, errorCode, testDiagnostic }) => ({ status, errorCode,
+            phase: testDiagnostic.phase, safeErrorCode: testDiagnostic.safeErrorCode })),
+          prepareWait: response.continuationState().prepareWait,
+          ownerState: ownerState.rows[0], dependencyWaitCount: waitState.rows.length, dependencyWaitDiagnostics,
+          prepareResultDiagnostics, prepareModelStepDiagnostics,
+          tasks: tasks.rows.map(task => ({ role: task.role,
+            taskType: task.taskType, status: task.status,
+            failureReason: /^[a-z0-9_]{1,100}$/.test(task.failureReason ?? "") ? task.failureReason : null })) })}`)
+      }
+      expect(gateBoundaryObserved).toBe(true)
+      expect(response.gateCalls()).toBe(1)
+      expect(response.gateHttpFailures()).toEqual([])
+
+      const currentGraph = await loadTaskGraph(pool as never, { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
+        turnId: recoveryTurnId, rootTaskId: rootTaskId!, parentTaskId: rootTaskId! }, false)
+      if (!currentGraph.snapshot) throw new Error("Run Now recovery TaskGraph snapshot was not persisted")
+      const graphState = currentTaskGraph(currentGraph)
+      const graphNodes = new Map(currentGraph.snapshot.nodes.map(node => [node.key, node]))
+      const scoutNode = graphNodes.get("fresh-scout"), analystNode = graphNodes.get("fresh-analyst")
+      const prepareNode = graphNodes.get("prepare"), gateNode = graphNodes.get("gate")
+      expect(scoutNode?.taskId).toBeTruthy()
+      expect(analystNode?.taskId).toBeTruthy()
+      expect(prepareNode?.taskId).toBeTruthy()
+      expect(gateNode?.taskId).toBeTruthy()
+      expect(gateDispatchTaskId).toBe(gateNode!.taskId)
+      expect([scoutNode?.taskId, analystNode?.taskId, prepareNode?.taskId]).not.toContain(fixture.ids.prepareTaskId)
+      expect(graphState.nodes.filter(node => ["fresh-scout", "fresh-analyst", "prepare"].includes(node.key))
+        .every(node => node.status === "completed" && node.failureReason === null)).toBe(true)
+      expect(graphState.nodes.find(node => node.key === "fresh-scout")?.verificationReport?.status).toBe("passed")
+      expect(graphState.nodes.find(node => node.key === "fresh-analyst")?.verificationReport?.status).toBe("passed")
+      const preparedTask = currentGraph.tasks.get(prepareNode!.taskId)
+      if (!preparedTask || !Number.isSafeInteger(preparedTask.attemptCount)) throw new Error("Fresh Prepare task result was not persisted")
+      const currentExecution = await pool!.query<{ state: unknown; attemptCount: number }>(`SELECT "state", "attemptCount"
+        FROM "agent_executions" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`,
+      [fixture.executionOwner.executionId, scope.userId, scope.sessionId])
+      const execution = currentExecution.rows[0]
+      const analyzeKey = debugRecord(debugRecord(execution?.state)?.scheduledTaskGraphContinuation)?.key
+      if (!execution || typeof analyzeKey !== "string") throw new Error("Fresh Analyze checkpoint was not persisted")
+      const bound = await readScheduledGateRegistrationReceipt(pool as never, { ...scope, gateTaskId: gateNode!.taskId,
+        owner: { ...scope, rootAttemptCount: rootTask.rows[0]!.attemptCount, executionId: fixture.executionOwner.executionId,
+          executionAttemptCount: execution.attemptCount } })
+      if (!bound) throw new Error("Fresh Gate binding was not persisted")
+      const persisted = await loadPersistedScheduledPrepareProof(pool as never, scope, preparedTask.id, preparedTask.result,
+        analyzeKey, bound.prepareWaitId)
+      expect(persisted?.receipt).toMatchObject({ owner: bound.owner, checkpointDigest: bound.checkpointDigest })
+      expect(persisted?.result).toMatchObject({ role: "prepare", status: "completed", taskId: preparedTask.id,
+        attemptCount: preparedTask.attemptCount, jobs: [{ jobId: currentJob.id, status: "prepared" }] })
+      expect(await loadPersistedScheduledPrepareProof(pool as never, scope, fixture.ids.prepareTaskId,
+        originalPrepareResult, analyzeKey, bound.prepareWaitId)).toBeNull()
+      const gateTask = currentGraph.tasks.get(gateNode!.taskId)
+      expect(gateTask).toMatchObject({ role: "prepare", taskType: SCHEDULED_GATE_TASK_TYPE, status: "waiting_for_user",
+        result: { structuredResult: { status: "question_required", kind: "weak_cover_letter" } } })
+      const noSubmission = await pool!.query<{ approvals: number; submitApprovals: number; submittedTasks: number }>(`
+        SELECT
+          (SELECT COUNT(*)::int FROM "agent_approvals" WHERE "turnId"=ANY($1::text[]) AND "sessionId"=$2) AS "approvals",
+          (SELECT COUNT(*)::int FROM "agent_approvals" WHERE "turnId"=ANY($1::text[]) AND "sessionId"=$2 AND "type"='submit_application') AS "submitApprovals",
+          (SELECT COUNT(*)::int FROM "application_tasks" WHERE "userId"=$3 AND "sessionId"=$2 AND "jobId"=$4
+            AND "status" IN ('submitted','applied')) AS "submittedTasks"`,
+      [[fixture.ids.turnId, recoveryTurnId], fixture.ids.sessionId, fixture.ids.userId, currentJob.id])
+      expect(noSubmission.rows[0]).toEqual({ approvals: 0, submitApprovals: 0, submittedTasks: 0 })
+    } finally {
+      await stopMaterialRecoveryProcess(crashedRecoveryProcess).catch(() => undefined)
+      await stopMaterialRecoveryProcess(resumedRecoveryProcess).catch(() => undefined)
+      await recoveryWebBridge?.close().catch(() => undefined)
+      if (runJob) await runJob.catch(() => undefined)
+      dispatchActive = false
+      await dispatchLoop?.catch(() => undefined)
+      await runtime?.close().catch(() => undefined)
+      if (turnQueue) {
+        const queuedJobId = (await import("../turns/recovery-scanner.js")).turnJobId(recoveryTurnId)
+        const queuedJob = await turnQueue.getJob(queuedJobId).catch(() => null)
+        await queuedJob?.remove().catch(() => undefined)
+        await turnQueue.close().catch(() => undefined)
+      }
+      await childWorker?.close().catch(() => undefined)
+      if (childQueue) {
+        await childQueue.obliterate({ force: true }).catch(() => undefined)
+        await childQueue.close().catch(() => undefined)
+      }
+      await childRedis?.quit().catch(() => childRedis?.disconnect())
+      await redis?.quit().catch(() => undefined)
+    }
   }, 120_000)
 
   it("does not commit a Gate skip when material-only drift wins the fenced recheck", async () => {
@@ -2810,8 +4018,19 @@ async function stopRunner(): Promise<void> {
   await active.redis.quit().catch(() => active.redis.disconnect())
 }
 async function setupFetcher(fixture: Fixture, options: ScheduledGateTestOptions = {}) {
+  const reviewReceiptPath = "@/lib/agent/stages/gate-review-receipt"
+  if (options.stopAtQualityQuestion) vi.doMock(reviewReceiptPath, async importOriginal => ({
+    ...await importOriginal<Record<string, unknown>>(),
+    createGateReviewReceipt: async () => { throw new Error("recovery_fixture_approval_forbidden") },
+  }))
+  else vi.doUnmock(reviewReceiptPath)
   if (options.useReservedQualityReview) vi.doMock(scheduledGateQualityReviewPath, async importOriginal => importOriginal())
+  else if (options.stopAtQualityQuestion) vi.doMock(scheduledGateQualityReviewPath, () => ({
+    reviewApplicationQuality: async () => ({ kind: "valid", result: { clScore: 3, fitGap: "Fixture fit gap",
+      recommendation: "Ask whether to revise the cover letter", readyToApply: false } }),
+  }))
   else vi.doMock(scheduledGateQualityReviewPath, () => ({ reviewApplicationQuality: async () => ({ kind: "unavailable" }) }))
+  if (!options.useReservedQualityReview && !options.beforeSecondGateReceiptFence && !options.beforeSecondGateSourceFence) vi.doUnmock(scheduledGateStagePath)
   const customRoleLookups: CustomAgentRoleLookup[] = []
   const customModelCalls: string[] = []
   const gateQualityCalls: number[] = []
@@ -2907,7 +4126,8 @@ async function setupFetcher(fixture: Fixture, options: ScheduledGateTestOptions 
   const storedModelRouter = options.useStoredAiSettings
     ? await vi.importActual<{ loadUserAiConfig(userId: string, featureId: string): Promise<unknown> }>(scheduledModelRouterPath)
     : null
-  vi.doMock(scheduledModelRouterPath, () => ({ APPLYMATE_BACKING: { provider: "minimax", model: "MiniMax-M3" },
+  vi.doMock(scheduledModelRouterPath, async importOriginal => ({ ...await importOriginal() as Record<string, unknown>,
+    APPLYMATE_BACKING: { provider: "minimax", model: "MiniMax-M3" },
     loadUserAiConfig: storedModelRouter?.loadUserAiConfig ?? (async () => ({ resolvedKey: "fixture-key", apiKey: "fixture-user-secret",
       credentialSource: "user", provider: "minimax", model: "MiniMax-M3" })),
     resolveConfig: () => ({ resolvedKey: "fixture-key", provider: "minimax", model: "MiniMax-M3" }),
@@ -2918,10 +4138,14 @@ async function setupFetcher(fixture: Fixture, options: ScheduledGateTestOptions 
           inputTokens: 21, outputTokens: 8, provider: "minimax", model: "MiniMax-M3" }
       } }),
     estimateAiCostUsd: () => 0.0001,
-    modelChat: vi.fn(async (_messages: unknown, config: unknown) => {
+    modelChat: vi.fn(async (messages: unknown, config: unknown) => {
       const feature = debugRecord(config)?.usageFeatureKey
       if (typeof feature === "string" && feature.startsWith("custom_")) customModelCalls.push(feature)
-      return { text: "fixture model response" }
+      const prompt = Array.isArray(messages) ? messages.map(message => debugRecord(message)?.content)
+        .filter((content): content is string => typeof content === "string").join("\n") : ""
+      return { text: prompt.includes("Output this exact JSON structure:")
+        ? JSON.stringify({ score: 85, matchedKeywords: ["TypeScript"], missingKeywords: ["Kubernetes"],
+          recommendation: "Highlight the TypeScript service work." }) : "fixture model response" }
     }) }))
   const constraintFunctions = await vi.importActual<{ tailoringConstraints(job: unknown, config: unknown): unknown }>("@/lib/agent/stages/prepare")
   const artifactHashes = await vi.importActual<{ hashArtifactConstraints(value: unknown): string }>("@/lib/agent/artifacts/hash")
@@ -2969,6 +4193,8 @@ async function setupFetcher(fixture: Fixture, options: ScheduledGateTestOptions 
     isFeatureAllowed: async () => true,
     hasEffectiveEntitlement: async () => true, resolveAiAccess: async () => "available" }))
   let pipelineOutcome = "not_called"
+  let checkpointSaveDiagnostic = "not_checked"
+  const pipelineResponses: Array<{ status: number; disposition: string | null; errorCode: string | null }> = []
   let continuation = { gateResume: "not_called", analyzeCheckpoint: "not_checked", continuationKey: "not_checked",
     waitBinding: "not_checked", ownerCurrentRecheck: "not_checked", prepareWait: "not_checked",
     gateInputRecheck: "not_checked", gateProofCurrent: "not_checked",
@@ -3063,6 +4289,7 @@ async function setupFetcher(fixture: Fixture, options: ScheduledGateTestOptions 
   }>("@/lib/agent/scheduled-taskgraph-pipeline-checkpoint")
   type ScheduledTaskGraphFenceProbe = {
     isScheduledTaskGraphOwnerCurrent(owner: unknown, key: string, claimToken: string): Promise<boolean>
+    scheduledTaskGraphClaimMatches(state: unknown, key: string, owner: unknown, claimToken: string): boolean
     priorScheduledTaskGraphContinuation(input: { state: unknown; owner: AuditExecutionOwner; snapshot: unknown;
       attestation: unknown; ownedJobs: readonly unknown[] }): { owner: AuditExecutionOwner; key: string } | null
     saveScheduledTaskGraphCheckpoint(input: unknown): Promise<boolean>
@@ -3079,6 +4306,28 @@ async function setupFetcher(fixture: Fixture, options: ScheduledGateTestOptions 
       try {
         const saved = await taskGraphFence.saveScheduledTaskGraphCheckpoint(input)
         continuation.checkpointSave = saved ? "saved" : "rejected"
+        if (!saved) {
+          const value = debugRecord(input), owner = debugRecord(value?.owner), key = value?.key, claimToken = value?.claimToken
+          const expected = value?.expectedState, next = value?.state
+          let latest: Record<string, unknown> | null = null, ownerCurrent = false
+          if (owner && typeof key === "string" && typeof claimToken === "string") {
+            try {
+              latest = debugRecord(await diagnosticWebDb.db.agentExecution.findFirst({
+                where: { id: owner.executionId, userId: owner.userId, sessionId: owner.sessionId },
+                select: { status: true, attemptCount: true, state: true },
+              }))
+              ownerCurrent = await taskGraphFence.isScheduledTaskGraphOwnerCurrent(owner, key, claimToken)
+            } catch { /* retain only bounded checkpoint-state metadata */ }
+          }
+          const latestState = debugRecord(latest?.state), expectedState = debugRecord(expected), nextState = debugRecord(next)
+          const stage = (candidate: unknown) => debugSafeEnum(debugRecord(candidate)?.nextStage,
+            ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"]) ?? "other"
+          const args = [typeof key === "string" ? key : "", owner, typeof claimToken === "string" ? claimToken : ""] as const
+          checkpointSaveDiagnostic = `expected=${stage(expectedState)};next=${stage(nextState)};persisted=${stage(latestState)};`
+            + `persistedRunning=${latest?.status === "running"};attemptMatches=${latest?.attemptCount === owner?.executionAttemptCount};`
+            + `expectedStateMatches=${debugSameJson(expected, latest?.state)};expectedClaimMatches=${taskGraphFence.scheduledTaskGraphClaimMatches(expected, ...args)};`
+            + `nextClaimMatches=${taskGraphFence.scheduledTaskGraphClaimMatches(next, ...args)};ownerCurrent=${ownerCurrent}`
+        }
         return saved
       } catch (error) { continuation.checkpointSave = "threw"; throw error }
     },
@@ -3187,6 +4436,7 @@ async function setupFetcher(fixture: Fixture, options: ScheduledGateTestOptions 
     },
   }))
   type RunServiceProbe = { runAgentPipeline(input: unknown): Promise<unknown> }
+  vi.resetModules()
   const runService = await vi.importActual<RunServiceProbe>(scheduledRunServicePath)
   vi.doMock(scheduledRunServicePath, () => ({ ...runService, runAgentPipeline: async (input: unknown) => {
     try {
@@ -3396,6 +4646,13 @@ async function setupFetcher(fixture: Fixture, options: ScheduledGateTestOptions 
       try { response = await route.POST(request) }
       finally { if (options.gateRpcConnectionProbe) options.gateRpcConnectionProbe.captureNextSessionLockQuery = false }
     } else response = await route.POST(request)
+    if (body.action !== "gate" && pipelineResponses.length < 8) {
+      const routeBody = debugRecord(await response.clone().json().catch(() => null))
+      pipelineResponses.push({ status: response.status,
+        disposition: debugSafeEnum(routeBody?.status, ["completed", "waiting_for_user", "waiting_for_external_user", "waiting_for_dependency",
+          "analyze_checkpointed", "gate_checkpointed", "blocked"]),
+        errorCode: diagnosticGateErrorCode(routeBody?.errorCode) })
+    }
     if (body.action === "scheduled_audit_execute" && response.status === 409) {
       auditPreflight = { ...auditPreflight, completedReportReplay: await inspectCompletedAuditReplay(body) }
     }
@@ -3473,6 +4730,10 @@ async function setupFetcher(fixture: Fixture, options: ScheduledGateTestOptions 
     webDatabase: fixtureWebDb.db,
     gateReceiptFenceAssertions: () => gateReceiptFenceAssertions,
     gateCalls: () => gates,
+    pipelineResponses: () => [...pipelineResponses],
+    pipelineOutcome: () => pipelineOutcome,
+    checkpointSaveDiagnostic: () => checkpointSaveDiagnostic,
+    continuationState: () => ({ ...continuation }),
     gateDiagnostics: () => gateDiagnostics,
     gateHttpFailures: () => [...gateHttpFailures],
     gateResponses: () => [...gateResponses],

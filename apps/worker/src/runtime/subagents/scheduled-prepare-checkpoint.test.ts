@@ -55,6 +55,17 @@ describe("scheduled Prepare checkpoint reader", () => {
     await expect(read(fixture(), stage)).resolves.toBeNull()
   })
 
+  it("requires the original lease on a Prepare checkpoint without a verified recovery wait", async () => {
+    const value = fixture()
+    value.state.nextStage = "prepare"
+    value.execution.status = "running"
+    value.execution.checkpoint = "prepare"
+    await expect(read(value, "prepare")).resolves.toBeNull()
+    value.state.scheduledTaskGraphContinuation.owner = owner
+    await expect(read(value, "prepare")).resolves.toEqual({ checkpointDigest: value.checkpointDigest, eligibleJobIds: ["job-1"] })
+    expect(value.query).toHaveBeenCalledTimes(2)
+  })
+
   it("rejects an unknown runtime checkpoint mode", async () => {
     await expect(read(fixture(), "unknown" as never)).resolves.toBeNull()
   })

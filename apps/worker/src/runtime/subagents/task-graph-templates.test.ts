@@ -277,6 +277,31 @@ describe("TaskGraph server-owned templates", () => {
     expect(userTurn.templates).not.toHaveProperty("prepare")
   })
 
+  it("enables fresh scheduled pipeline templates only for a verified manual recovery token", async () => {
+    const selectedJobPreparationLoader = vi.fn(async () => { throw new Error("must not load old selected-job state") })
+    const applicationFillPreparationLoader = vi.fn(async () => { throw new Error("must not load old application-fill state") })
+    const recovered = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
+      automationRunMode: "manual", trustedMaterialDriftRecovery: true,
+      turnInput: { scheduledAutomationSnapshot: validScheduledSnapshot() },
+      selectedJobPreparationLoader, applicationFillPreparationLoader,
+    }))
+    expect(recovered.scheduledDraftMode).toBe(false)
+    expect(Object.keys(recovered.templates ?? {})).toEqual([
+      "scout", "analyst", "scheduled.application.execute", "scheduled.post_gate_audit",
+    ])
+    expect(recovered.templates?.scout.context).toEqual({
+      scheduledAutomationCriteria: { targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70 },
+    })
+    expect(selectedJobPreparationLoader).not.toHaveBeenCalled()
+    expect(applicationFillPreparationLoader).not.toHaveBeenCalled()
+    const ordinaryManual = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
+      automationRunMode: "manual", trustedMaterialDriftRecovery: false,
+      turnInput: { scheduledAutomationSnapshot: validScheduledSnapshot() },
+    }))
+    expect(ordinaryManual.templates).not.toHaveProperty("scheduled.application.execute")
+    expect(ordinaryManual.templates).not.toHaveProperty("scheduled.post_gate_audit")
+  })
+
   it("propagates invalid bound-fill or loader failures before runtime root creation", async () => {
     const base = {
       pool: {} as never, lease: {} as never, now: () => new Date(), enabled: true,

@@ -127,7 +127,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const setup = await prepareCanonicalTurnSetup({ pool, lease, signal, now, options, manager, rootTasks, executionProjection, sessionProjection, coordinationEnabled, childExecutionEnabled, consumeWaitOutcomes })
     if ("earlyResult" in setup) return setup.earlyResult
     let state = setup.state
-    const { interactiveDiscoveryMode, objectiveTaskGraphMode, taskGraphPlanningEnabled, selectedJobMode, scheduledDraftMode, selectedJobPreparation,
+    const { interactiveDiscoveryMode, objectiveTaskGraphMode, taskGraphPlanningEnabled, selectedJobMode, scheduledDraftMode, selectedJobPreparation, trustedMaterialDriftRecovery,
       turnCoordination, nativeQuestionWaitEnabled, toolCapabilities, lifecycle, toolRuntime, rootTools, root, durableWaitPort } = setup
     let acceptedGraphWitness: Extract<Awaited<ReturnType<typeof selectedJobArtifactCompletionGateWithWitness>>, { ok: true }>['witness'] | undefined
     const nativeVerification = createCanonicalNativeVerificationRuntime({
@@ -165,7 +165,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const turnStore = turnStoreForInteractiveDiscovery(baseTurnStore, interactiveDiscoveryMode, () => acceptedDiscoveryShortlist)
     const { owner, mode: nativeSemanticProgressMode } = await configureNativeSemanticProgress({ taskId: root.id, lease, store: turnStore, nativeVerification, featureEnabled: productionFlags?.nativeSemanticProgressMemoryEnabled === true, taskGraphPlanningEnabled, now: now() })
     const scheduledCandidateStore = scheduledPipeline.createCandidateStore(turnStore)
-    const scheduledPipelineOwner = scheduledPipeline.owner({ taskGraphPlanningEnabled, state, lease, root })
+    const scheduledPipelineOwner = scheduledPipeline.owner({ taskGraphPlanningEnabled, state, materialDriftRecovery: trustedMaterialDriftRecovery, lease, root })
     const recoveredScheduledCandidate = await scheduledPipeline.readCandidate({ store: scheduledCandidateStore, owner: scheduledPipelineOwner, executionOwner: owner })
     lifecycle.owner = { kind: "turn", taskId: root.id, lease }
     lifecycle.sink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)

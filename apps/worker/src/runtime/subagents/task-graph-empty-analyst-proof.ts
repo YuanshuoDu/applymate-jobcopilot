@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 import type pg from "pg"
 import { scheduledAutomationCriteria } from "./scheduled-automation-snapshot.js"
+import { verifiedMaterialDriftRecoveryCriteria } from "./canonical-turn-scheduled-pipeline-context.js"
 import { loadTaskGraphVerificationReceipts } from "./task-graph-pg-verification-receipts.js"
 import type { TaskGraphVerificationScope } from "./task-graph-pg-verification-receipt-validation.js"
 import type { TaskGraphVerificationDependencyBinding } from "./task-graph-verification-report.js"
@@ -109,8 +110,8 @@ export async function completedZeroDiscoveryDigest(
   const results = receipts.items.filter(item => item.type === "tool_result")
   if (calls.length < 1 || calls.length > 32 || receipts.items.length !== calls.length * 2
     || results.length !== calls.length || receipts.outcomes.size !== calls.length) return undefined
-  const turnInput = record(task.turnInput), criteria = scheduledAutomationCriteria(turnInput)
-  if (task.turnSource !== "automation" || task.turnExecutionMode !== "canonical_task_graph" || turnInput?.automationRunMode !== "scheduled" || !criteria) return undefined
+  const turnInput = record(task.turnInput), criteria = turnInput?.automationRunMode === "scheduled" ? scheduledAutomationCriteria(turnInput) : await verifiedMaterialDriftRecoveryCriteria(client, scope, task)
+  if (task.turnSource !== "automation" || task.turnExecutionMode !== "canonical_task_graph" || !criteria) return undefined
   const callIds = new Set<string>(), ordinals = new Set<string>(), resultById = new Map<string, Row>()
   for (const item of results) {
     const content = record(item.content), callId = content && strictText(content.toolCallId) ? content.toolCallId : undefined

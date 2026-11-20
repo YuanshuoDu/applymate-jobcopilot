@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { scheduledAutomationSnapshotDigest } from "./scheduled-taskgraph-pipeline-checkpoint"
 import { isScheduledPrepareChoiceWaitId, validateScheduledPrepareWaitIdentity } from "./scheduled-taskgraph-prepare-choice-identity"
+import { scheduledTaskGraphPrepareResultDigest } from "./scheduled-taskgraph-prepare-proof"
 
-const mocks = vi.hoisted(() => ({ events: vi.fn(), steps: vi.fn(), items: vi.fn() }))
-vi.mock("@/lib/db", () => ({ db: { agentEvent: { findMany: mocks.events }, agentStep: { findFirst: mocks.steps }, agentItem: { findFirst: mocks.items } } }))
+const mocks = vi.hoisted(() => ({ events: vi.fn(), steps: vi.fn(), items: vi.fn(), waits: vi.fn(), recovery: vi.fn() }))
+vi.mock("@/lib/db", () => ({ db: { agentEvent: { findMany: mocks.events }, agentStep: { findFirst: mocks.steps },
+  agentItem: { findFirst: mocks.items }, agentWaitCondition: { findMany: mocks.waits } } }))
+vi.mock("./scheduled-taskgraph-audit-prepare-source", () => ({ validateScheduledTaskGraphAuditPrepareSource: mocks.recovery }))
 
 const owner = { userId: "user_1", sessionId: "session_1", turnId: "turn_1", rootTaskId: "root_1", rootAttemptCount: 2,
   turnLeaseOwnerId: "worker_1", turnLeaseVersion: 4, executionId: "execution_1", executionAttemptCount: 0 }
@@ -39,6 +42,8 @@ describe("scheduled prepare choice identity source scope", () => {
     mocks.events.mockReset()
     mocks.steps.mockReset()
     mocks.items.mockReset()
+    mocks.waits.mockReset()
+    mocks.recovery.mockReset()
   })
 
   it("keeps legacy v2 and null-receipt candidates valid", async () => {
@@ -64,6 +69,43 @@ describe("scheduled prepare choice identity source scope", () => {
     mocks.steps.mockImplementation((query: { where: { id?: string } }) => Promise.resolve(query.where.id
       ? { id: finalStepId, status: "streaming" } : { id: "newer-recovery-step" }))
     await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot, proof })).resolves.toBe(false)
+    expect(mocks.recovery).not.toHaveBeenCalled()
+  })
+
+  it("accepts a historical Prepare receipt only with the latest ready wait and a verified recovery tail", async () => {
+    configureCandidate(scopedCandidate(owner.userId))
+    mocks.steps.mockResolvedValue({ id: "recovery-step", status: "streaming" })
+    const resumedOwner = { ...owner, turnLeaseOwnerId: "recovered-worker", turnLeaseVersion: owner.turnLeaseVersion + 1 }
+    const target = ["prepare"]
+    const wait = { waitId: "prepare-wait", status: "ready", mode: "all", targetTaskIds: target, matchedTaskIds: target }
+    const result = { schemaVersion: "agent-harness.v2.subagent.result", role: "prepare", status: "completed", taskId: "prepare",
+      attemptCount: 1, snapshotDigest: receipt.snapshotDigest, checkpointDigest: receipt.checkpointDigest, jobs: [], materials: [] }
+    const completionNode = (taskId: string, role: string, taskType: string, dependsOnTaskIds: string[]) =>
+      ({ taskId, attemptCount: 1, role, taskType, status: "completed", verification: "passed", dependsOnTaskIds })
+    const nodes = [completionNode("scout", "scout", "job_discovery", []),
+      completionNode("analyst", "analyst", "job_analysis", ["scout"]),
+      { ...completionNode("prepare", "prepare", "scheduled_application_prepare", ["analyst"]),
+        tool: "scheduled.application.prepare@1", resultDigest: scheduledTaskGraphPrepareResultDigest(result) }]
+    const recoveredProof = { receipt, result, completion: {
+      schemaVersion: "agent-harness.v2.scheduled-taskgraph-prepare-completion.v1", graphRevision: 11, nodes, wait,
+    } }
+    const matchingWait = { id: wait.waitId, idempotencyKey: `scheduled-prepare-dependency:${"d".repeat(64)}`,
+      targetTaskIds: target, matchedTaskIds: target }
+    const input = { owner: resumedOwner, snapshot, proof: recoveredProof }
+    mocks.waits.mockResolvedValue([matchingWait])
+    mocks.recovery.mockResolvedValue(true)
+    await expect(validateScheduledPrepareWaitIdentity(input)).resolves.toBe(true)
+    expect(mocks.waits).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({
+      stepId: "recovery-step", userId: owner.userId, turnId: owner.turnId, parentTaskId: owner.rootTaskId, consumedAt: null,
+    }) }))
+    await expect(validateScheduledPrepareWaitIdentity({ ...input, owner })).resolves.toBe(false)
+    mocks.recovery.mockResolvedValue(false)
+    await expect(validateScheduledPrepareWaitIdentity(input)).resolves.toBe(false)
+    mocks.recovery.mockResolvedValue(true)
+    for (const invalid of [[], [{ ...matchingWait, targetTaskIds: ["another-task"] }], [matchingWait, matchingWait]]) {
+      mocks.waits.mockResolvedValue(invalid)
+      await expect(validateScheduledPrepareWaitIdentity(input)).resolves.toBe(false)
+    }
   })
 
   it("accepts only canonical choice IDs for the current Turn", () => {

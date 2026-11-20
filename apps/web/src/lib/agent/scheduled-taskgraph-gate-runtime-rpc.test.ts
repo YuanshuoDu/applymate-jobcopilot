@@ -8,15 +8,16 @@ import { readScheduledTaskGraphGateMaterialDriftProof } from './scheduled-taskgr
 import { gateFailureDiagnostic } from './scheduled-taskgraph-pipeline-request'
 
 const mocks = vi.hoisted(() => ({
-  transaction: vi.fn(), queryRaw: vi.fn(), jobs: vi.fn(), update: vi.fn(), turn: vi.fn(), config: vi.fn(), resume: vi.fn(),
+  transaction: vi.fn(), queryRaw: vi.fn(), jobs: vi.fn(), update: vi.fn(), turn: vi.fn(), executionRead: vi.fn(), config: vi.fn(), resume: vi.fn(),
   active: vi.fn(), feature: vi.fn(), access: vi.fn(), entitlement: vi.fn(), aiConfig: vi.fn(), roles: vi.fn(),
   isProof: vi.fn(), auditProof: vi.fn(), auditPrepareSource: vi.fn(), loadInput: vi.fn(), buildCheckpoint: vi.fn(), validateWait: vi.fn(), executeGate: vi.fn(),
   policy: vi.fn(), completedReplay: vi.fn(), auditCompletedReplay: vi.fn(),
   childFence: vi.fn(), sourceFence: vi.fn(), sourceValidation: vi.fn(), sourceTerminal: vi.fn(),
+  recoverySnapshot: vi.fn(), gatePreflightSnapshot: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({ db: {
-  $transaction: mocks.transaction, agentTurn: { findFirst: mocks.turn }, agentConfig: { findUnique: mocks.config },
+  $transaction: mocks.transaction, agentTurn: { findFirst: mocks.turn }, agentExecution: { findFirst: mocks.executionRead }, agentConfig: { findUnique: mocks.config },
   resume: { findFirst: mocks.resume },
 } }))
 vi.mock('@/lib/model-router', () => ({ APPLYMATE_BACKING: 'default', loadUserAiConfig: mocks.aiConfig,
@@ -61,6 +62,8 @@ vi.mock('./scheduled-taskgraph-pipeline-checkpoint', () => ({ scheduledAutomatio
 vi.mock('./scheduled-taskgraph-run-service', () => ({ validateScheduledPrepareWaitIdentity: mocks.validateWait }))
 vi.mock('./scheduled-taskgraph-completed-report-replay', () => ({ replayCompletedScheduledTaskGraphReport: mocks.completedReplay,
   replayCompletedScheduledTaskGraphAuditReport: mocks.auditCompletedReplay }))
+vi.mock('./scheduled-taskgraph-recovery-callsite', () => ({ scheduledTaskGraphRecoverySnapshot: mocks.recoverySnapshot,
+  scheduledTaskGraphGatePreflightSnapshot: mocks.gatePreflightSnapshot }))
 vi.mock('./stages/gate', () => ({ runScheduledGate: mocks.policy }))
 vi.mock('./scheduled-taskgraph-gate-service', () => ({ executeScheduledTaskGraphGate: mocks.executeGate }))
 
@@ -182,6 +185,9 @@ beforeEach(() => {
   for (const mock of Object.values(mocks)) mock.mockReset()
   queryIndex = 0
   mocks.turn.mockResolvedValue({ input: { automationRunMode: 'scheduled', scheduledAutomationSnapshot: snapshot } })
+  mocks.executionRead.mockResolvedValue({ id: owner.executionId, attemptCount: owner.executionAttemptCount })
+  mocks.recoverySnapshot.mockResolvedValue(snapshot)
+  mocks.gatePreflightSnapshot.mockResolvedValue(snapshot)
   mocks.active.mockResolvedValue(true)
   mocks.feature.mockResolvedValue(true)
   mocks.access.mockResolvedValue('enabled')
@@ -223,6 +229,57 @@ beforeEach(() => {
 })
 
 describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
+  it('preflights and transactionally revalidates a manual Gate recovery admission', async () => {
+    const request = new Request('https://local.test/internal', { headers: { 'x-agent-worker-secret': 'worker-secret' } })
+    const turnInput = { automationRunMode: 'manual', scheduledAutomationSnapshot: snapshot,
+      materialDriftRecovery: { schemaVersion: 'server-owned' } }
+    mocks.turn.mockResolvedValue({ input: turnInput })
+    configureGateLock({ turn: { ...databaseTurn('waiting_for_tool'), input: turnInput } })
+
+    const result = await runScheduledTaskGraphActionRpc(gateRequest(), undefined, request) as Response
+
+    expect(result.status).toBe(200)
+    expect(mocks.gatePreflightSnapshot).toHaveBeenCalledOnce()
+    expect(mocks.gatePreflightSnapshot).toHaveBeenCalledWith({ client: expect.any(Object), request,
+      owner: requestOwner, turnInput })
+    expect(mocks.recoverySnapshot).toHaveBeenCalledTimes(2)
+    expect(mocks.recoverySnapshot).toHaveBeenNthCalledWith(1, expect.objectContaining({ client: tx, request,
+      owner, turnInput, caller: 'gate' }))
+    expect(mocks.recoverySnapshot).toHaveBeenNthCalledWith(2, expect.objectContaining({ client: tx, request,
+      owner, turnInput, caller: 'gate' }))
+    expect(mocks.executeGate).toHaveBeenCalledOnce()
+  })
+
+  it('denies Gate if recovery admission changes after the transaction locks', async () => {
+    const request = new Request('https://local.test/internal', { headers: { 'x-agent-worker-secret': 'worker-secret' } })
+    const turnInput = { automationRunMode: 'manual', scheduledAutomationSnapshot: snapshot,
+      materialDriftRecovery: { schemaVersion: 'server-owned' } }
+    mocks.turn.mockResolvedValue({ input: turnInput })
+    mocks.gatePreflightSnapshot.mockResolvedValue(snapshot)
+    mocks.recoverySnapshot.mockResolvedValueOnce(null)
+    configureGateLock({ turn: { ...databaseTurn('waiting_for_tool'), input: turnInput } })
+
+    const result = await runScheduledTaskGraphActionRpc(gateRequest(), undefined, request) as Response
+
+    expect(result.status).toBe(409)
+    await expect(result.json()).resolves.toMatchObject({ errorCode: 'scheduled_pipeline_turn_stale' })
+    expect(mocks.recoverySnapshot).toHaveBeenCalledOnce()
+    expect(mocks.executeGate).not.toHaveBeenCalled()
+    expect(mocks.loadInput).not.toHaveBeenCalled()
+    expect(mocks.policy).not.toHaveBeenCalled()
+  })
+
+  it.each(['execute', 'audit'] as const)('does not invoke recovery admission for manual %s', async action => {
+    const turnInput = { automationRunMode: 'manual', scheduledAutomationSnapshot: snapshot }
+    configureGateLock({ turn: { ...databaseTurn('in_progress'), input: turnInput } })
+    const request = action === 'execute' ? executeRequest() : auditExecuteRequest()
+
+    await runScheduledTaskGraphActionRpc(request)
+
+    expect(mocks.recoverySnapshot).not.toHaveBeenCalled()
+    expect(mocks.gatePreflightSnapshot).not.toHaveBeenCalled()
+  })
+
   it('acquires the source fence before owner locks and validates sources before Gate proof loading', async () => {
     const events: string[] = []
     const originalQuery = mocks.queryRaw.getMockImplementation()!

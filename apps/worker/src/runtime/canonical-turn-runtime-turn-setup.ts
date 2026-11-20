@@ -34,6 +34,7 @@ import { taskGraphDenialCheckpointFromDecision } from "./turns/task-graph-termin
 import type { TurnEngineQueryClient } from "./turns/turn-engine-owner-sql.js"
 import type { DiscoveryShortlistResult } from "./subagents/discovery-shortlist.js"
 import { withInteractiveDiscoveryFinalResponse } from "./interactive-discovery-runtime.js"
+import { failMaterialDriftRecovery, readMaterialDriftRecoveryIntent, validateMaterialDriftRecoveryTurn } from "./subagents/canonical-turn-scheduled-pipeline-context.js"
 
 type TaskGraphRuntimeResult = Awaited<ReturnType<typeof taskGraphRuntimeForTurn>>
 type RuntimeTool = ReturnType<NonNullable<CanonicalTurnRuntimeOptions["toolRuntimeFactory"]>>
@@ -46,6 +47,7 @@ export type CanonicalTurnSetup = {
   readonly taskGraphPlanningEnabled: boolean
   readonly selectedJobMode: boolean
   readonly scheduledDraftMode: boolean
+  readonly trustedMaterialDriftRecovery: boolean
   readonly selectedJobPreparation: TaskGraphRuntimeResult["selectedJobPreparation"]
   readonly taskGraphTemplateRoles: Readonly<Record<string, string>> | undefined
   readonly turnCoordination: ReturnType<typeof createCanonicalTurnCoordination>
@@ -104,11 +106,24 @@ export async function prepareCanonicalTurnSetup(input: {
   const durableWaitPort = createPgDurableWaitPort(pool)
   const state = await (options.stateLoader?.(pool, lease, now(), { consumeWaitOutcomes: input.consumeWaitOutcomes, durableWaitControlReader: durableWaitPort })
     ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: input.consumeWaitOutcomes, durableWaitControlReader: durableWaitPort }))
+  let trustedMaterialDriftRecovery = false
+  const candidate = readMaterialDriftRecoveryIntent({ id: lease.turnId, userId: lease.userId, sessionId: lease.sessionId,
+    source: state.source, executionMode: "canonical_task_graph", input: state.turnInput })
+  if (candidate.status === "invalid" || (candidate.status === "valid" && (state.source !== "automation" || state.automationRunMode !== "manual"))) {
+    return { earlyResult: await failMaterialDriftRecovery({ lease, state, rootTasks, executionProjection, sessionProjection, now }) }
+  }
+  if (candidate.status === "valid") {
+    const validated = await validateMaterialDriftRecoveryTurn(pool, lease, candidate.intent)
+    if (validated.status === "unavailable") throw new Error("material_drift_recovery_validation_unavailable")
+    if (validated.status !== "valid") return { earlyResult: await failMaterialDriftRecovery({ lease, state, rootTasks, executionProjection, sessionProjection, now }) }
+    trustedMaterialDriftRecovery = true
+  }
   const objectiveTaskGraphMode = state.intent?.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind
     && state.intent.version === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version
   const graph = await taskGraphRuntimeForTurn({
     enabled: options.productionFlags?.taskGraphPlanningEnabled === true && input.coordinationEnabled,
     pool, lease, now, turnSource: state.source, automationRunMode: state.automationRunMode, turnInput: state.turnInput,
+    trustedMaterialDriftRecovery,
     selectedJobPreparationLoader: options.selectedJobPreparationLoader,
     applicationFillPreparationLoader: options.applicationFillPreparationLoader,
     taskGraphTemplates: options.taskGraphTemplates,
@@ -117,9 +132,9 @@ export async function prepareCanonicalTurnSetup(input: {
     || !options.taskGraphCommandPort || !graph.templates || Object.keys(graph.templates).length === 0 || !rootTasks.checkCompletion) && !signal.aborted) {
     return { earlyResult: await failObjectiveTaskGraphUnavailable({ lease, state, rootTasks, executionProjection, sessionProjection, now }) }
   }
-  if (state.source === "automation" && state.automationRunMode === "scheduled"
+  if (((state.source === "automation" && state.automationRunMode === "scheduled") || trustedMaterialDriftRecovery)
     && (!graph.enabled || !input.childExecutionEnabled || !input.coordinationEnabled || !input.consumeWaitOutcomes) && !signal.aborted) {
-    const result = { status: "failed" as const, errorCode: "scheduled_task_graph_unavailable", stepCount: 0, toolCallCount: 0 }
+    const result = { status: "failed" as const, errorCode: trustedMaterialDriftRecovery ? "material_drift_recovery_task_graph_unavailable" : "scheduled_task_graph_unavailable", stepCount: 0, toolCallCount: 0 }
     const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot, toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions: [], now: now() })
     await rootTasks.finish({ lease, rootTaskId: root.id, result, now: now() })
     await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
@@ -179,13 +194,13 @@ export async function prepareCanonicalTurnSetup(input: {
     .filter(value => !objectiveTaskGraphMode || objectiveTaskGraphRootToolAllowed(value))
     .filter(value => verificationRequirements.status !== "valid" || !["agent.spawn", "spawn_subagent", "agent.followup"].includes(String(record(value).name ?? "")))
   const allowedActions = objectiveTaskGraphMode ? rootTaskAllowedActions(rootTools, undefined, false)
-    : addScheduledPrepareActions(rootTaskAllowedActions(rootTools, turnTaskGraphTemplates, graph.enabled), state, graph.enabled)
+    : addScheduledPrepareActions(rootTaskAllowedActions(rootTools, turnTaskGraphTemplates, graph.enabled), state, graph.enabled, trustedMaterialDriftRecovery)
   const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot,
     toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions, now: now() })
   lifecycle.taskGraphParentAttemptCount = root.attemptCount
   turnCoordination.bindRoot(root)
   return {
-    state, interactiveDiscoveryMode, objectiveTaskGraphMode, taskGraphPlanningEnabled: graph.enabled, selectedJobMode: graph.selectedJobMode, scheduledDraftMode: graph.scheduledDraftMode,
+    state, interactiveDiscoveryMode, objectiveTaskGraphMode, taskGraphPlanningEnabled: graph.enabled, selectedJobMode: graph.selectedJobMode, scheduledDraftMode: graph.scheduledDraftMode, trustedMaterialDriftRecovery,
     selectedJobPreparation: graph.selectedJobPreparation, taskGraphTemplateRoles, turnCoordination, nativeQuestionWaitEnabled, toolCapabilities,
     durableWaitPort, lifecycle, toolRuntime, rootTools, root,
   }
@@ -210,8 +225,9 @@ export function addScheduledPrepareActions(
   allowedActions: string[],
   state: Pick<CanonicalTurnState, "source" | "automationRunMode">,
   graphEnabled: boolean,
+  trustedMaterialDriftRecovery = false,
 ): string[] {
-  if (state.source === "automation" && state.automationRunMode === "scheduled" && graphEnabled) {
+  if (((state.source === "automation" && state.automationRunMode === "scheduled") || trustedMaterialDriftRecovery) && graphEnabled) {
     allowedActions.push(...TASK_GRAPH_TEMPLATES.prepare.allowedActions.filter(action => !allowedActions.includes(action)))
   }
   return allowedActions
