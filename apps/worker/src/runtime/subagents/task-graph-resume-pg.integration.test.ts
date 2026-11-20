@@ -322,12 +322,27 @@ type UserSteerCommandService = Readonly<{ steer(command: {
 }): Promise<{ inputId: string; turnId: string; disposition: string; sequence: string }> }>
 const webRequire = createRequire(new URL("../../../../web/package.json", import.meta.url))
 
+type ObjectiveStartCountRequirement = Readonly<{
+  id: string
+  check: Readonly<{ kind: "candidate_count_gte" | "finding_count_gte"; minimum: number }>
+}>
+type ObjectiveStartLocationRequirement = Readonly<{
+  id: "candidate-location"
+  check: Readonly<{ kind: "candidate_location_in"; locations: readonly string[] }>
+}>
+type ObjectiveStartFixtureVerificationRequirements =
+  | Readonly<{
+      schemaVersion: "agent-harness.v2.objective-requirements.v1"
+      requirements: readonly ObjectiveStartCountRequirement[]
+    }>
+  | Readonly<{
+      schemaVersion: "agent-harness.v2.objective-requirements.v2"
+      requirements: readonly (ObjectiveStartCountRequirement | ObjectiveStartLocationRequirement)[]
+    }>
 type ObjectiveStartFixtureCommand = Readonly<{
   sessionId: string; userId: string; clientMessageId: string; source: "user"; objective: string
   content: readonly { type: "text"; text: string }[]
-  verificationRequirements: Readonly<{ schemaVersion: "agent-harness.v2.objective-requirements.v2"; requirements: readonly {
-    id: "candidate-count" | "candidate-location"; check: Readonly<{ kind: "candidate_count_gte"; minimum: 1 } | { kind: "candidate_location_in"; locations: readonly string[] }>
-  }[] }>
+  verificationRequirements: ObjectiveStartFixtureVerificationRequirements
 }>
 type ObjectiveStartFixtureResult = Readonly<{ inputId: string; turnId: string; sequence: string; disposition: string }>
 type ObjectiveStartFixtureService = Readonly<{ start(command: ObjectiveStartFixtureCommand): Promise<ObjectiveStartFixtureResult> }>
@@ -19704,7 +19719,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         source: "user", objective: "Find one software engineering role in Dublin",
         content: [{ type: "text", text: "Find one software engineering role in Dublin" }],
         verificationRequirements: {
-          schemaVersion: "agent-harness.v2.objective-requirements.v2",
+          schemaVersion: "agent-harness.v2.objective-requirements.v1",
           requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
         },
       })
