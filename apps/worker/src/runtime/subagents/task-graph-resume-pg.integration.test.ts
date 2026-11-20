@@ -225,9 +225,15 @@ const SELECTED_JOB_REVIEW_READ_CALL_ID = "ac6-selected-job-review-read"
 const SELECTED_JOB_REVIEW_CALL_ID = "ac6-selected-job-review-receipt"
 const SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS = Object.freeze({
   commandReceived: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_COMMAND_RECEIVED",
+  managerRunInvoked: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_MANAGER_RUN_INVOKED",
+  fixtureLeaseAccepted: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_FIXTURE_LEASE_ACCEPTED",
+  childExecutorInvoked: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_CHILD_EXECUTOR_INVOKED",
+  childExecutorRejected: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_CHILD_EXECUTOR_REJECTED",
+  childExecutorSettled: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_CHILD_EXECUTOR_SETTLED",
   round1Entered: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_ROUND_1_ENTERED",
   artifactVersionReadYieldReached: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_ARTIFACT_VERSION_READ_YIELD_REACHED",
   round2Entered: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_ROUND_2_ENTERED",
+  artifactVersionReadResultVerified: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_ARTIFACT_VERSION_READ_RESULT_VERIFIED",
   readyEmissionReached: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_READY_EMISSION_REACHED",
 })
 
@@ -3215,9 +3221,15 @@ async function reviewSelectedJobThroughRestartedWorker(
     }
     const phaseEvidence = {
       commandReceived: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.commandReceived),
+      managerRunInvoked: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.managerRunInvoked),
+      fixtureLeaseAccepted: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.fixtureLeaseAccepted),
+      childExecutorInvoked: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.childExecutorInvoked),
+      childExecutorRejected: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.childExecutorRejected),
+      childExecutorSettled: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.childExecutorSettled),
       round1Entered: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.round1Entered),
       artifactVersionReadYieldReached: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.artifactVersionReadYieldReached),
       round2Entered: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.round2Entered),
+      artifactVersionReadResultVerified: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.artifactVersionReadResultVerified),
       readyEmissionReached: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.readyEmissionReached),
     }
     try {
