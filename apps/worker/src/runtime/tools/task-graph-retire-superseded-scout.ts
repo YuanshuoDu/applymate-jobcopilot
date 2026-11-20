@@ -11,6 +11,7 @@ import {
 } from "../subagents/task-graph-scout-retirement-contract.js"
 import { steeringReconciliationId } from "../subagents/steering-reconciliation-contract.js"
 import { taskGraphExecutionScope, type ReconciliationFenceOptions } from "./steering-reconciliation.js"
+import { markTaskGraphRetirementOutput } from "./task-graph-retirement-output-redaction.js"
 import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "./types.js"
 
 type Registry = Readonly<{ register?(definition: RuntimeToolDefinition): void }>
@@ -77,10 +78,12 @@ async function executeRetirement(
   }
   try { options.manager.signalTaskSubtree(scope.sessionId, scope.rootTaskId, [input.taskId]) }
   catch { /* The committed database marker remains authoritative and heartbeat-visible. */ }
-  return {
-    status: result.status === "duplicate" ? "already_requested" as const : "interrupt_requested" as const,
-    taskId: receipt.taskId, attempt: receipt.attempt,
-  }
+  const status = result.status === "duplicate" ? "already_requested" as const : "interrupt_requested" as const
+  const output = { status, taskId: receipt.taskId, attempt: receipt.attempt }
+  markTaskGraphRetirementOutput(output, { sessionId: scope.sessionId, turnId: scope.turnId,
+    rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, stepId: scope.stepId, toolCallId: context.toolCallId },
+  receipt.taskId, status, receipt.attempt)
+  return output
 }
 
 export function createTaskGraphSupersededScoutRetirementTool(options: Options): RuntimeToolDefinition {

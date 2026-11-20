@@ -3,7 +3,6 @@ import {
   type ToolCallItem,
   type ToolResultItem,
 } from "@jobcopilot/agent-protocol"
-
 import type { ExecutionOwner } from "../execution-owner.js"
 import { MAX_TOOL_RESULT_BYTES, type ToolResultReferenceRepository } from "./tool-result-reference-types.js"
 import { prepareLifecycleValue, prepareSafeValue, prepareScheduledPrepareLifecycleOutput, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeLifecyclePreview, type PreparedLifecycleValue, type ToolResultReferenceStore } from "./redaction.js"
@@ -11,6 +10,7 @@ import { redactJobReadOutput } from "./job-read-output-redaction.js"
 import { isVerifiedToolResultChunk } from "./tool-result-reference-repo.js"
 import { hasNativeCoordinationEnvelope, prepareResolvedOwnerWaitLifecycleOutput, prepareVerifiedToolResultChunk } from "./lifecycle-receipt-output.js"
 import { prepareScoutDelegateLifecycleOutput } from "./scout-delegate-output-redaction.js"
+import { prepareTaskGraphRetirementLifecycleOutput } from "./task-graph-retirement-output-redaction.js"
 import { ToolExecutionError, type ToolLifecyclePayload } from "./types.js"
 import { isTaskGraphResultPageLike, prepareAgentListLifecycleInput, prepareTaskGraphResultPageOutput } from "./task-graph-result-page-redaction.js"
 
@@ -182,6 +182,8 @@ export class ToolLifecycle {
       }
     } else if (call.toolName === "scout.delegate") {
       prepared = prepareScoutDelegateLifecycleOutput(output, call) ?? prepareLifecycleValue(output)
+    } else if (call.toolName === "agent.retire_superseded_scout") {
+      prepared = prepareTaskGraphRetirementLifecycleOutput(output, call) ?? prepareLifecycleValue(output)
     } else if (call.toolName === "jobs.search" || call.toolName === "jobs.get" || call.toolName === "jobs.discover") {
       prepared = prepareSafeValue(redactJobReadOutput(call.toolName, output))
     } else if (call.toolName === "tool_results.read") {
@@ -227,12 +229,10 @@ export class ToolLifecycle {
   private async append(event: ToolLifecycleEvent): Promise<void> {
     await this.options.sink.append(event)
   }
-
   private observeDiscoveryAttempt(event: DiscoveryAttemptLifecycleEvent): void {
     if (event.call.toolName !== "jobs.discover") return
     try { this.options.onDiscoveryAttemptLifecycleEvent?.(event) } catch { /* Observation cannot change a committed tool outcome. */ }
   }
-
   private payload(call: LifecycleCall, status: string, extra: Record<string, unknown>): ToolLifecyclePayload {
     return { toolCallId: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status, ...extra } as ToolLifecyclePayload
   }
