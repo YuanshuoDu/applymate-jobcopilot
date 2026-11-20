@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { Prisma } from "@prisma/client"
 
 import { resolvePendingApprovalInTransaction } from "./decision"
-import { validateReviewedFillHandoff, assertReviewedFillDecisionWait } from "./reviewed-fill-handoff"
+import { validateReviewedFillHandoff, assertReviewedFillDecisionWait, ReviewedFillHandoffDeferredError } from "./reviewed-fill-handoff"
 import { REVIEWED_FILL_SOURCE_EVENT, REVIEWED_FILL_SOURCE_SCHEMA } from "./reviewed-fill-source-binding"
 import { waitItemId } from "../broker/item-ids"
 
@@ -116,7 +116,7 @@ describe("reviewed fill handoff", () => {
     await expect(validateReviewedFillHandoff(fake.tx, command)).rejects.toMatchObject({ code: "reviewed_fill_source_unavailable" })
   })
 
-  it("rejects scheduled, expired, consumed, stopped, and competing-turn authority", async () => {
+  it("rejects invalid authority and defers active predecessors or competing turns", async () => {
     const scheduled = handoffHarness({ scheduled: true })
     await expect(assertReviewedFillDecisionWait(scheduled.tx, { approvalId: "approval_1", userId: "user_1", sessionId: "session_1", decision: "approved", now: NOW }))
       .rejects.toMatchObject({ code: "reviewed_fill_source_unavailable" })
@@ -132,10 +132,14 @@ describe("reviewed fill handoff", () => {
     stopped.completePredecessor()
     stopped.approvalTurn.status = "interrupted"
     await expect(validateReviewedFillHandoff(stopped.tx, command)).rejects.toMatchObject({ code: "reviewed_fill_source_unavailable" })
+    const predecessorActive = handoffHarness({ status: "approved", event: true })
+    predecessorActive.completePredecessor()
+    predecessorActive.approvalTurn.status = "in_progress"
+    await expect(validateReviewedFillHandoff(predecessorActive.tx, command)).rejects.toBeInstanceOf(ReviewedFillHandoffDeferredError)
     const competing = handoffHarness({ status: "approved", event: true })
     competing.completePredecessor()
     vi.mocked(competing.tx.agentTurn.findMany).mockResolvedValueOnce([{ id: "other_active_turn" }] as never)
-    await expect(validateReviewedFillHandoff(competing.tx, command)).rejects.toMatchObject({ code: "reviewed_fill_source_unavailable" })
+    await expect(validateReviewedFillHandoff(competing.tx, command)).rejects.toBeInstanceOf(ReviewedFillHandoffDeferredError)
   })
 
   it("fails closed when the accepted selector has duplicate private source events", async () => {

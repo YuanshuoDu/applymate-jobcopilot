@@ -20,6 +20,14 @@ type Approval = {
   expiresAt: Date | null; decidedAt: Date | null; payload: unknown
 }
 
+export class ReviewedFillHandoffDeferredError extends Error {
+  readonly code = "reviewed_fill_handoff_deferred" as const
+  constructor() {
+    super("The reviewed fill is waiting for the current Session Turn to finish")
+    this.name = "ReviewedFillHandoffDeferredError"
+  }
+}
+
 export async function existingFillCommandResult(
   tx: CommandTransaction, turnId: string, identity: CommandIdentity, sourceTurnId?: string,
   original?: Pick<ExistingCommand, "id" | "acceptedSequence">,
@@ -145,8 +153,12 @@ export async function validateReviewedFillHandoff(
     where: { id: waitItemId("approval", approval.id), sessionId: input.sessionId,
       turnId: approval.turnId!, type: "approval_request", status: "completed" }, select: { content: true, revision: true },
   })
-  if (!predecessor || predecessor.source !== "user" || predecessor.status !== "completed" || !present(predecessor.rootTaskId)
+  if (!predecessor || predecessor.source !== "user" || !present(predecessor.rootTaskId)
     || !wait || !waitMatches(wait.content, approval, true, wait.revision)) throw new ReviewedFillSourceBindingError()
+  if (predecessor.status !== "completed") {
+    if (ACTIVE_TURNS.some(status => status === predecessor.status)) throw new ReviewedFillHandoffDeferredError()
+    throw new ReviewedFillSourceBindingError()
+  }
   const hasFill = present(task.fillTurnId)
   if (hasFill) {
     if (task.fillTurnSessionId !== input.sessionId || task.fillTurnUserId !== input.userId
@@ -154,13 +166,12 @@ export async function validateReviewedFillHandoff(
       || !await acceptedFillTurnMatchesReviewedSource(tx, {
         turnId: task.fillTurnId!, userId: input.userId, sessionId: input.sessionId, sourceTurnId: input.sourceTurnId,
       })) throw new ReviewedFillSourceBindingError()
+    return
   } else if (task.status !== "waiting_for_user" || task.checkpoint !== "materials_ready") {
     throw new ReviewedFillSourceBindingError()
   }
   const active = await tx.agentTurn.findMany({
     where: { userId: input.userId, sessionId: input.sessionId, status: { in: [...ACTIVE_TURNS] } }, select: { id: true },
   })
-  if (active.length > (hasFill ? 1 : 0) || active.some(row => row.id !== task.fillTurnId)) {
-    throw new ReviewedFillSourceBindingError()
-  }
+  if (active.length > 0) throw new ReviewedFillHandoffDeferredError()
 }
