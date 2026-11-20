@@ -51,6 +51,14 @@ export {
   type ReviewedApplicationSubmissionManifest,
   type ReviewedApplicationSubmissionMaterial,
 } from "./application-submission-material.js";
+export {
+  parseReviewedApplicationFillBrowserStartEvent,
+  parseReviewedApplicationFillSource,
+  REVIEWED_APPLICATION_FILL_BROWSER_START_SCHEMA,
+  REVIEWED_APPLICATION_FILL_SOURCE_SCHEMA,
+  type ReviewedApplicationFillBrowserStartBinding,
+  type ReviewedApplicationFillSourceSelection,
+} from "./application-reviewed-fill-proof.js";
 
 export {
   buildAgentSourceMaterialFenceKey,
