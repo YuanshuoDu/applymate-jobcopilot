@@ -14,7 +14,9 @@ function dependencies() {
   const childExecutor = vi.fn()
   const manager = { spawnFromLease: vi.fn() }
   const runtime = { manager } as unknown as CanonicalTurnRuntime
-  const bootstrap = { close: vi.fn(async () => undefined) } as never
+  const lifecycleOrder: string[] = []
+  const bootstrap = { runtime, close: vi.fn(async () => { lifecycleOrder.push("bootstrap:close") }) } as never
+  const handoffClose = vi.fn(async () => { lifecycleOrder.push("handoff:close") })
   const authorization = vi.fn() as unknown as NonNullable<CanonicalTurnRuntimeOptions["authorizeUsage"]>
   const executionProjection = {} as NonNullable<CanonicalTurnRuntimeOptions["executionProjection"]>
   const sessionProjection = {} as NonNullable<CanonicalTurnRuntimeOptions["sessionProjection"]>
@@ -26,6 +28,8 @@ function dependencies() {
     registeredOptions = typeof options.bootstrapOptions === "function"
       ? options.bootstrapOptions(createdRuntime)
       : options.bootstrapOptions
+    options.onBootstrapReady?.(bootstrap)
+    options.startAgentRunWorker()
     return bootstrap
   })
 
@@ -36,6 +40,10 @@ function dependencies() {
     createCanonicalExecutionProjection: vi.fn(() => executionProjection),
     createCanonicalSessionProjection: vi.fn(() => sessionProjection),
     startProductionAgentRuntime,
+    startReviewedFillHandoffOutboxPublisher: vi.fn(() => {
+      lifecycleOrder.push("handoff:start")
+      return { close: handoffClose }
+    }),
   }
 
   return {
@@ -50,6 +58,8 @@ function dependencies() {
     createOptionalProductionChildExecutor,
     resolvedDependencies,
     startProductionAgentRuntime,
+    lifecycleOrder,
+    handoffClose,
     get registeredOptions() { return registeredOptions },
   }
 }
@@ -66,16 +76,16 @@ describe("production Worker runtime composition", () => {
     }
     const fixture = dependencies()
     const workerId = "worker_fixture"
-    const onBootstrapReady = vi.fn()
-    const startAgentRunWorker = vi.fn()
+    const onBootstrapReady = vi.fn(() => { fixture.lifecycleOrder.push("ready") })
+    const startAgentRunWorker = vi.fn(() => { fixture.lifecycleOrder.push("router") })
 
-    await expect(startProductionWorkerRuntime({
+    const started = await startProductionWorkerRuntime({
       pool: fixture.pool,
       workerId,
       productionFlags: flags,
       onBootstrapReady,
       startAgentRunWorker,
-    }, fixture.resolvedDependencies)).resolves.toBe(fixture.bootstrap)
+    }, fixture.resolvedDependencies)
 
     expect(fixture.createOptionalProductionChildExecutor).toHaveBeenCalledWith(expect.objectContaining({
       enabled: true, pool: fixture.pool, subagentManager: expect.any(Function),
@@ -97,10 +107,14 @@ describe("production Worker runtime composition", () => {
       waitResolver: {},
     })
     const startupOptions = fixture.startProductionAgentRuntime.mock.calls[0]?.[0]
-    expect(startupOptions?.onBootstrapReady).toBe(onBootstrapReady)
+    expect(startupOptions?.onBootstrapReady).toEqual(expect.any(Function))
     expect(startupOptions?.startAgentRunWorker).toBe(startAgentRunWorker)
-    expect(onBootstrapReady).not.toHaveBeenCalled()
-    expect(startAgentRunWorker).not.toHaveBeenCalled()
+    expect(started.runtime).toBe(fixture.runtime)
+    expect(onBootstrapReady).toHaveBeenCalledWith(started)
+    expect(startAgentRunWorker).toHaveBeenCalledOnce()
+    expect(fixture.lifecycleOrder).toEqual(["handoff:start", "ready", "router"])
+    await started.close()
+    expect(fixture.lifecycleOrder).toEqual(["handoff:start", "ready", "router", "handoff:close", "bootstrap:close"])
   })
 
   it("omits disabled child and wait consumers while preserving the resolved flags", async () => {
@@ -122,6 +136,7 @@ describe("production Worker runtime composition", () => {
     }, fixture.resolvedDependencies)
 
     expect(fixture.registeredOptions).toEqual({})
+    expect(fixture.resolvedDependencies.startReviewedFillHandoffOutboxPublisher).toHaveBeenCalledOnce()
     expect(fixture.resolvedDependencies.createCanonicalTurnRuntime).toHaveBeenCalledWith(
       fixture.pool,
       expect.objectContaining({ productionFlags: flags }),
