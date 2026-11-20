@@ -4,6 +4,7 @@ import { ACTIVE_TURN_STATUSES } from "../control-plane/commands/transaction"
 import { ApprovalStoreError, type ApprovalDecision } from "./types"
 import { assertReviewedFillDecisionWait } from "./reviewed-fill-handoff"
 import { persistReviewedFillSourceInTransaction } from "./reviewed-fill-source-binding"
+import { enqueueReviewedFillHandoffInTransaction } from "./reviewed-fill-handoff-outbox"
 
 type Tx = Prisma.TransactionClient
 
@@ -116,9 +117,15 @@ export async function resolvePendingApprovalInTransaction(
     data: { status: input.decision, decidedAt: input.now },
   })
   if (updated.count !== 1) throw new ApprovalStoreError("approval_not_approved", "Approval receipt resolution raced with another decision")
-  if (input.reviewedSourceTurnId !== undefined) await persistReviewedFillSourceInTransaction(tx, {
-    approvalId: row.id, userId: row.userId, sessionId: row.sessionId,
-    decision: input.decision, sourceTurnId: input.reviewedSourceTurnId,
-  })
+  if (input.reviewedSourceTurnId !== undefined) {
+    await persistReviewedFillSourceInTransaction(tx, {
+      approvalId: row.id, userId: row.userId, sessionId: row.sessionId,
+      decision: input.decision, sourceTurnId: input.reviewedSourceTurnId,
+    })
+    await enqueueReviewedFillHandoffInTransaction(tx, {
+      approvalId: row.id, userId: row.userId, sessionId: row.sessionId,
+      sourceTurnId: input.reviewedSourceTurnId, now: input.now,
+    })
+  }
   return { ...row, turnId }
 }

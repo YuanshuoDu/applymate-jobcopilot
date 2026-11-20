@@ -25,6 +25,10 @@ function handoffHarness(options: { scheduled?: boolean; status?: string; expires
     status: "waiting_for_approval", revision: 4, rootTaskId: "root_1" }
   const sourceTurn = { id: "source_turn_1", userId: "user_1", sessionId: "session_1", source: "user",
     status: "completed", rootTaskId: "source_root_1", input: { selectedJobPreparation: { jobId: "job_1" } } }
+  const fillTurn = { id: "fill_turn_1", userId: "user_1", sessionId: "session_1", source: "user", status: "in_progress", input: {
+    clientMessageId: "agent-reviewed-fill:approval_1",
+    reviewedApplicationMaterialSource: { schemaVersion: REVIEWED_FILL_SOURCE_SCHEMA, sourceTurnId: sourceTurn.id },
+  } }
   const waitContent: Record<string, unknown> = {
     waitKind: "approval", approvalId: approval.id, toolCallId: approval.toolCallId,
     action: "review_application", scopeHash: approval.scopeHash, receiptRevision: approval.revision,
@@ -67,7 +71,8 @@ function handoffHarness(options: { scheduled?: boolean; status?: string; expires
     },
     agentTurn: {
       findFirst: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
-        const row = where.id === sourceTurn.id ? sourceTurn : where.id === approvalTurn.id ? approvalTurn : null
+        const row = where.id === sourceTurn.id ? sourceTurn : where.id === approvalTurn.id ? approvalTurn
+          : where.id === fillTurn.id ? fillTurn : null
         if (!row || row.userId !== where.userId || row.sessionId !== where.sessionId
           || (where.status && row.status !== where.status) || (where.source && row.source !== where.source)) return null
         return row
@@ -79,9 +84,10 @@ function handoffHarness(options: { scheduled?: boolean; status?: string; expires
         && where.sessionId === waitItem.sessionId && where.turnId === waitItem.turnId
         && where.type === waitItem.type && where.status === waitItem.status ? waitItem : null),
     },
+    agentOutbox: { create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => data) },
   }
   return {
-    tx: tx as unknown as Prisma.TransactionClient, approval, task, approvalTurn, sourceTurn, waitItem, events,
+    tx: tx as unknown as Prisma.TransactionClient, approval, task, approvalTurn, sourceTurn, fillTurn, waitItem, events,
     async accept() {
       await resolvePendingApprovalInTransaction(tx as unknown as Prisma.TransactionClient, {
         id: approval.id, userId: approval.userId, sessionId: approval.sessionId, decision: "approved", now: NOW,
@@ -98,7 +104,8 @@ function handoffHarness(options: { scheduled?: boolean; status?: string; expires
   }
 }
 
-const command = { approvalId: "approval_1", userId: "user_1", sessionId: "session_1", applicationTaskId: "application_1", sourceTurnId: "source_turn_1", now: NOW }
+const command = { approvalId: "approval_1", userId: "user_1", sessionId: "session_1", applicationTaskId: "application_1",
+  sourceTurnId: "source_turn_1", clientMessageId: "agent-reviewed-fill:approval_1", now: NOW }
 
 describe("reviewed fill handoff", () => {
   it("records only the exact manual canonical wait, then admits after its predecessor completes", async () => {
@@ -107,7 +114,19 @@ describe("reviewed fill handoff", () => {
     expect(fake.events).toHaveLength(1)
     await expect(validateReviewedFillHandoff(fake.tx, command)).rejects.toMatchObject({ code: "reviewed_fill_source_unavailable" })
     fake.completePredecessor()
-    await expect(validateReviewedFillHandoff(fake.tx, command)).resolves.toBeUndefined()
+    await expect(validateReviewedFillHandoff(fake.tx, command)).resolves.toEqual({ sourceTurnId: "source_turn_1" })
+  })
+
+  it("replays an exact started fill from its private approval binding when dispatch has only the outbox id", async () => {
+    const fake = handoffHarness({ status: "approved", event: true })
+    fake.completePredecessor()
+    Object.assign(fake.task, { status: "filling", checkpoint: "taskgraph_fill_queued", fillTurnId: fake.fillTurn.id,
+      fillTurnSessionId: "session_1", fillTurnUserId: "user_1" })
+    const replay = { approvalId: "approval_1", userId: "user_1", sessionId: "session_1",
+      applicationTaskId: "application_1", clientMessageId: "agent-reviewed-fill:approval_1", now: NOW }
+    await expect(validateReviewedFillHandoff(fake.tx, replay)).resolves.toEqual({ sourceTurnId: "source_turn_1" })
+    await expect(validateReviewedFillHandoff(fake.tx, { ...replay, approvalId: "other_approval" }))
+      .rejects.toMatchObject({ code: "reviewed_fill_source_unavailable" })
   })
 
   it("rejects a forged command selector without the accepted source event", async () => {

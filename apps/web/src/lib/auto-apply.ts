@@ -1,7 +1,7 @@
 import { db } from "@/lib/db";
 import { Prisma } from "@prisma/client";
 import { hashApprovalNonce, hashApprovalScope, type ApprovalScope } from "@jobcopilot/agent-protocol";
-import { hashAgentReceiptValue, matchesApplyTaskSubmitPayload, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
+import { hashAgentReceiptValue, matchesApplyTaskSubmitPayload, reviewedFillHandoffIdempotencyKey, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
 import { createSubmitIntent, enqueueApplyTask, isReplayableSubmitState, resolveExistingSubmitIntent } from "@/lib/apply-queue-client";
 import { AgentCommandService } from '@/lib/agent/control-plane/commands/agent-command-service'
 import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
@@ -48,11 +48,11 @@ export async function queueApplicationFill(input: {
     if (!task?.sessionId || (input.sessionId && input.sessionId !== task.sessionId)) {
       throw new AutoApplyError("The application is missing its scoped Agent session.")
     }
-    const clientMessageId = input.retry
+    const reviewedMessageId = input.reviewedSourceApprovalId ? reviewedFillHandoffIdempotencyKey(input.reviewedSourceApprovalId) : null
+    if (input.reviewedSourceApprovalId && !reviewedMessageId) throw new AutoApplyError("Reviewed material approval is unavailable.")
+    const clientMessageId = reviewedMessageId ?? (input.retry
       ? `application-fill-retry:${input.applicationTaskId}:${input.retryId}`
-      : input.resumeAfterUserInput
-        ? `application-fill-resume:${input.applicationTaskId}`
-        : `application-fill:${input.applicationTaskId}`
+      : `application-fill${input.resumeAfterUserInput ? "-resume" : ""}:${input.applicationTaskId}`)
     const result = await new AgentCommandService(db).startApplicationFillForReview({
       sessionId: task.sessionId, userId: input.userId, clientMessageId,
       applicationTaskId: input.applicationTaskId, retry: input.retry, resumeAfterUserInput: input.resumeAfterUserInput,

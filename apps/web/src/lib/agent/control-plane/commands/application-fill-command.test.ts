@@ -156,7 +156,11 @@ function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSe
   return { db, tx, state: { get task() { return task }, get sessionStatus() { return sessionStatus }, get turns() { return turns }, get inputs() { return inputs }, get items() { return items }, get events() { return events }, get outbox() { return outbox } } }
 }
 
-const command = (clientMessageId: string, retry = false, resumeAfterUserInput = false, reviewedSourceTurnId?: string, reviewedSourceApprovalId?: string) => ({ sessionId: "session_1", userId: "user_1", applicationTaskId: "application_1", clientMessageId, ...(retry ? { retry: true } : {}), ...(resumeAfterUserInput ? { resumeAfterUserInput: true } : {}), ...(reviewedSourceTurnId ? { reviewedSourceTurnId } : {}), ...(reviewedSourceApprovalId ? { reviewedSourceApprovalId } : {}) })
+const command = (clientMessageId: string, retry = false, resumeAfterUserInput = false, reviewedSourceTurnId?: string,
+  reviewedSourceApprovalId?: string, reviewedSourcePredecessorTurnId?: string) => ({ sessionId: "session_1", userId: "user_1",
+  applicationTaskId: "application_1", clientMessageId, ...(retry ? { retry: true } : {}), ...(resumeAfterUserInput ? { resumeAfterUserInput: true } : {}),
+  ...(reviewedSourceTurnId ? { reviewedSourceTurnId } : {}), ...(reviewedSourceApprovalId ? { reviewedSourceApprovalId } : {}),
+  ...(reviewedSourcePredecessorTurnId ? { reviewedSourcePredecessorTurnId } : {}) })
 
 function readyToResume() {
   const waitAt = new Date("2026-10-15T10:00:00.000Z")
@@ -184,10 +188,10 @@ describe("startApplicationFillForReview", () => {
 
   it("persists only the validated reviewed source on the new fill Turn and preserves its input", async () => {
     const fake = harness({}, false, undefined, { reviewedSourceTurnId: "source_turn_1", reviewedSourceApprovalId: "approval_1" })
-    const result = await startApplicationFillForReview(fake.db, command("fill_reviewed_source", false, false, "source_turn_1", "approval_1"))
+    const result = await startApplicationFillForReview(fake.db, command("agent-reviewed-fill:approval_1", false, false, "source_turn_1", "approval_1"))
     const created = fake.state.turns.find(turn => turn.id === result.turnId)
     expect(created?.input).toMatchObject({
-      clientMessageId: "fill_reviewed_source", goal: "Fill the server-bound application form for user review. Never submit it.",
+      clientMessageId: "agent-reviewed-fill:approval_1", goal: "Fill the server-bound application form for user review. Never submit it.",
       reviewedApplicationMaterialSource: {
         schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source_turn_1",
       },
@@ -195,11 +199,40 @@ describe("startApplicationFillForReview", () => {
     expect(fake.tx.agentTurn.updateMany).toHaveBeenCalledTimes(1)
   })
 
+  it("deduplicates only the exact original approval's bound fill", async () => {
+    const clientMessageId = "agent-reviewed-fill:approval_1"
+    const turnInput = { clientMessageId, reviewedApplicationMaterialSource: {
+      schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source_turn_1",
+    } }
+    const seed = { status: "filling", checkpoint: "taskgraph_fill_queued", fillTurnId: "fill_turn_1",
+      fillTurnSessionId: "session_1", fillTurnUserId: "user_1" }
+    const resume = { turnStatus: "completed", turnInput }
+    const accepted = harness(seed, false, resume, { reviewedSourceTurnId: "source_turn_1", reviewedSourceApprovalId: "approval_1" })
+    accepted.state.inputs.push({ id: "input_fill_1", clientMessageId, sessionId: "session_1", userId: "user_1",
+      targetTurnId: "fill_turn_1", acceptedSequence: BigInt(9) })
+    await expect(startApplicationFillForReview(accepted.db, command(clientMessageId, false, false, "source_turn_1", "approval_1")))
+      .resolves.toMatchObject({ turnId: "fill_turn_1", disposition: "duplicate" })
+
+    const otherApproval = harness(seed, false, resume, { reviewedSourceTurnId: "source_turn_1", reviewedSourceApprovalId: "approval_2" })
+    otherApproval.state.inputs.push({ id: "input_fill_1", clientMessageId, sessionId: "session_1", userId: "user_1",
+      targetTurnId: "fill_turn_1", acceptedSequence: BigInt(9) })
+    await expect(startApplicationFillForReview(otherApproval.db, command("agent-reviewed-fill:approval_2", false, false, "source_turn_1", "approval_2")))
+      .rejects.toMatchObject({ code: "reviewed_fill_source_unavailable" })
+  })
+
   it("rejects a forged reviewed command without the original accepted approval", async () => {
     const fake = harness({}, false, undefined, { reviewedSourceTurnId: "source_turn_1" })
     await expect(startApplicationFillForReview(fake.db, command("fill_forged_source", false, false, "source_turn_1")))
       .rejects.toMatchObject({ code: "invalid_command" })
     expect(fake.state.turns).toHaveLength(1)
+    expect(fake.state.outbox).toHaveLength(0)
+  })
+
+  it("binds the internal handoff predecessor to the exact approved Turn", async () => {
+    const fake = harness({}, false, undefined, { reviewedSourceTurnId: "source_turn_1", reviewedSourceApprovalId: "approval_1" })
+    await expect(startApplicationFillForReview(fake.db, command("agent-reviewed-fill:approval_1", false, false,
+      undefined, "approval_1", "other_predecessor"))).rejects.toMatchObject({ code: "reviewed_fill_source_unavailable" })
+    expect(fake.state.task.fillTurnId).toBeNull()
     expect(fake.state.outbox).toHaveLength(0)
   })
 
