@@ -14120,6 +14120,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const planCallId = `p3-1240-plan:${value.turnId}`
     const initialWaitCallId = `p3-1240-wait:${value.turnId}`
     const reviseCallId = `p3-1240-revise:${value.turnId}`
+    const postPlanListCallId = `p3-1240-post-plan-list:${value.turnId}`
     const retireCallId = `p3-1240-retire-scout:${value.turnId}`
     const postReviseWaitCallId = `p3-1240-post-revise-wait:${value.turnId}`
     const postReviseListCallId = `p3-1240-post-revise-list:${value.turnId}`
@@ -14127,21 +14128,29 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const postReviseWaitKey = `p3-1240-post-revise:${value.turnId}`
     const confirmationCue = "the user explicitly confirmed these allowed job locations:"
     let seattleTaskId = "", initialWaitIssued = false, reviseAttempted = false, retirementAttempted = false
-    let postReviseWaitIssued = false, postReviseListIssued = false, receiptObserved = false, confirmationVisible = false
+    let postPlanListIssued = false, postReviseWaitIssued = false, postReviseListIssued = false
+    let preRetirementListMatched = false, receiptObserved = false, confirmationVisible = false
     let dublinVisible = false, retirementResultObserved = false, retirementLeaseAtRequestVerified = false
     let rootToolsAtRevise: string[] = [], rootToolsAtRetirement: string[] = []
     let initialGraphRevision: number | undefined, reviseExpectedRevision: number | undefined, retirementExpectedRevision: number | undefined
     let rootTaskId = "", replacementTaskId: string | undefined
-    let scoutSearchCalls = 0, seattleHeld = false
+    let scoutSearchCalls = 0, seattleHeld = false, dublinHeld = false
     let adapterStage = "not_started", proofKind = "not_read", requestHasConfirmation = false, requestHasDublin = false
     let originalSeattleLease: { id: string; status: string; role: string; attemptCount: number; leaseOwner: string | null;
       leaseExpiresAt: Date | null; leaseSegmentStartedAt: Date | null; interruptRequestedAt: Date | null } | null = null
     let releaseSeattle!: () => void
     const releaseSeattleGate = new Promise<void>(resolve => { releaseSeattle = resolve })
+    let releaseDublin!: () => void
+    const releaseDublinGate = new Promise<void>(resolve => { releaseDublin = resolve })
     const childHeld = async () => {
       const deadline = Date.now() + 25_000
       while (Date.now() < deadline && !seattleHeld) await new Promise(resolve => setTimeout(resolve, 25))
       if (!seattleHeld) throw new Error("Seattle Scout did not reach its held post-wait execution")
+    }
+    const replacementHeld = async () => {
+      const deadline = Date.now() + 25_000
+      while (Date.now() < deadline && !dublinHeld) await new Promise(resolve => setTimeout(resolve, 25))
+      if (!dublinHeld) throw new Error("Dublin replacement Scout did not reach its held post-search execution")
     }
     const settleSeattle = async () => {
       const deadline = Date.now() + 30_000
@@ -14239,7 +14248,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             return
           }
           if (reviseAttempted && !retirementAttempted) {
-            adapterStage = "retire_superseded_scout"
+            adapterStage = postPlanListIssued ? "retire_superseded_scout" : "refresh_before_retirement"
             const planResult = record(latestToolResult(request, reviseCallId))
             const revision = graph?.revision
             const acceptedPlanNodes = Array.isArray(planResult?.nodes) ? planResult.nodes.map(record) : []
@@ -14250,6 +14259,29 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               throw new Error("Retirement request did not follow the accepted replacement plan")
             }
             replacementTaskId = replacement.taskId
+            if (!postPlanListIssued) {
+              await replacementHeld()
+              postPlanListIssued = true
+              yield { type: "tool_call_completed", callId: postPlanListCallId, name: "agent.list", arguments: {} }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            const listing = record(latestToolResult(request, postPlanListCallId))
+            const listedTasks = Array.isArray(listing?.tasks) ? listing.tasks.map(record) : []
+            const persistedGraph = await pool!.query<{ revision: number }>(
+              `SELECT item."revision" FROM "agent_items" AS item
+               JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+               JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+               WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
+                 AND item."type" = 'task_graph' AND turn."rootTaskId" = $4
+                 AND session."userId" = $5 AND turn."userId" = $5 LIMIT 2`,
+              [taskGraphItemId(rootTaskId), value.sessionId, value.turnId, rootTaskId, value.userId])
+            if (!dublinHeld || !listedTasks.some(task => task?.taskId === replacement.taskId && task?.status === "running")
+              || persistedGraph.rows.length !== 1 || typeof revision !== "number"
+              || revision !== persistedGraph.rows[0]?.revision) {
+              throw new Error("Fresh Root list did not match the held replacement and current graph revision")
+            }
+            preRetirementListMatched = true
             rootToolsAtRetirement = request.tools.map(tool => record(tool)?.name).filter((name): name is string => typeof name === "string")
             if (!rootToolsAtRetirement.includes("agent.retire_superseded_scout")) {
               throw new Error("Typed Objective Root did not receive the scoped retirement tool")
@@ -14299,6 +14331,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             retirementResultObserved = true
             const taskIds = [seattleTaskId, ...(typeof replacement?.taskId === "string" ? [replacement.taskId] : [])]
             postReviseWaitIssued = true
+            releaseDublin()
             yield { type: "tool_call_completed", callId: postReviseWaitCallId, name: "agent.wait", arguments: {
               idempotencyKey: postReviseWaitKey, taskIds: [...new Set(taskIds)], mode: "all", timeoutMs: 30_000,
             } }
@@ -14362,13 +14395,20 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             yield { type: "completed", finishReason: "tool_calls" }
             return
           }
-          await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
           if (location === "Seattle") {
+            await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
             seattleHeld = true
             if (request.signal.aborted) throw new Error("Seattle Scout fixture was interrupted")
             await Promise.race([releaseSeattleGate, new Promise<never>((_resolve, reject) => {
               request.signal.addEventListener("abort", () => reject(new Error("Seattle Scout fixture was interrupted")), { once: true })
             })])
+          } else {
+            dublinHeld = true
+            if (request.signal.aborted) throw new Error("Dublin Scout fixture was interrupted")
+            await Promise.race([releaseDublinGate, new Promise<never>((_resolve, reject) => {
+              request.signal.addEventListener("abort", () => reject(new Error("Dublin Scout fixture was interrupted")), { once: true })
+            })])
+            await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
           }
           const evidence = { id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "greenhouse" }
           yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout",
@@ -14394,7 +14434,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
            WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3
              AND item."type" IN ('tool_call', 'tool_result') AND item."content"->>'toolCallId' = ANY($4::text[])
              AND turn."rootTaskId" = $3 AND turn."userId" = $5 AND session."userId" = $5`,
-          [value.sessionId, value.turnId, rootId, [reviseCallId, retireCallId, postReviseWaitCallId], value.userId]),
+          [value.sessionId, value.turnId, rootId, [reviseCallId, postPlanListCallId, retireCallId, postReviseWaitCallId], value.userId]),
         pool!.query<{ payload: unknown; actor: string; correlationId: string; itemId: string | null; taskId: string | null;
           causationId: string | null; hasOutbox: boolean }>(
           `SELECT event."payload", event."actor", event."correlationId", event."itemId", event."taskId", event."causationId",
@@ -14449,6 +14489,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const retirementCall = items.rows.find(row => row.type === "tool_call" && record(row.content)?.toolCallId === retireCallId)
       return {
         plan: summarize(reviseCallId, "agent.plan"),
+        preRetirementList: summarize(postPlanListCallId, "agent.list"),
         retirement: summarize(retireCallId, "agent.retire_superseded_scout"),
         wait: summarize(postReviseWaitCallId, "agent.wait"),
         graphRevision: graph.rows.length === 1 ? graph.rows[0]?.revision ?? null : null,
@@ -14781,6 +14822,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
              AND input."userId" = $4 AND turn."userId" = $4 AND turn."rootTaskId" = $5`,
           [accepted.inputId, value.sessionId, value.turnId, value.userId, rootTaskId])
         expect({ receiptObserved, confirmationVisible, dublinVisible,
+          preRetirementListMatched,
           rootCannotSeeGenericInterrupt: !rootToolsAtRevise.includes("agent.interrupt") && !allowedActions.includes("agent.interrupt"),
           typedRetirementVisible: rootToolsAtRetirement.includes("agent.retire_superseded_scout")
             && allowedActions.includes("agent.retire_superseded_scout"),
@@ -14815,6 +14857,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           reviseResult: reviseResult.rows[0],
           acceptedInput: acceptedInput.rows[0], scoutSearchObserved: scoutSearchCalls > 0,
         }).toMatchObject({ receiptObserved: true, confirmationVisible: true, dublinVisible: true,
+          preRetirementListMatched: true,
           rootCannotSeeGenericInterrupt: true, typedRetirementVisible: true, rootAllowedActionsUnchanged: true,
           retirementLeaseAtRequestVerified: true, retirementResultObserved: true,
           retirementExpectedRevision: expect.any(Number),
@@ -14859,6 +14902,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       } finally { await checkpoint.query("ROLLBACK").catch(() => undefined); checkpoint.release() }
     } finally {
       releaseSeattle()
+      releaseDublin()
       if (seattleTaskId) await settleSeattle().catch(() => undefined)
     }
   }, 120_000)
