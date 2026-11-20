@@ -204,6 +204,37 @@ describe("current location evidence", () => {
     }))).resolves.toEqual({ status: "unavailable" })
   })
 
+  it("keeps an ACKed retired Scout separate from a running plan-pending Scout", async () => {
+    const loaded = loadedGraph([
+      { key: "retired-scout", taskId: "retired-task", checkpoint: 10n, status: "interrupted" },
+      { key: "pending-scout", taskId: "pending-task", checkpoint: 10n, status: "running" },
+      { key: "current-scout", taskId: "current-task", checkpoint: 20n, status: "completed" },
+    ])
+    const result = await resolveTaskGraphCurrentLocationEvidence(input(loaded, {
+      retiredNodeKeys: new Set(["retired-scout"]), pendingSupersededNodeKeys: new Set(["pending-scout"]),
+    }))
+
+    expect(result.status).toBe("available")
+    if (result.status !== "available") return
+    expect(result.excludedHistoricalNodeKeys).toEqual(new Set())
+    expect(result.compatibleRetainedNodeKeys).toEqual(new Set())
+    expect(reproof).not.toHaveBeenCalled()
+  })
+
+  it("does not let a predecessor retirement proof hide a failed replacement", async () => {
+    const loaded = loadedGraph([
+      { key: "retired-scout", taskId: "retired-task", checkpoint: 10n, status: "interrupted" },
+      { key: "failed-replacement", taskId: "replacement-task", checkpoint: 15n, status: "failed", failureReason: "failed" },
+      { key: "current-scout", taskId: "current-task", checkpoint: 20n, status: "completed" },
+    ])
+
+    await expect(resolveTaskGraphCurrentLocationEvidence(input(loaded, { retiredNodeKeys: new Set(["retired-scout"]) })))
+      .resolves.toEqual({ status: "unavailable" })
+    await expect(resolveTaskGraphCurrentLocationEvidence(input(loaded, {
+      retiredNodeKeys: new Set(["retired-scout", "failed-replacement"]),
+    }))).resolves.toEqual({ status: "unavailable" })
+  })
+
   it.each([
     ["task role mismatch", { role: "analyst" }],
     ["task type mismatch", { taskType: "selected_job_discovery" }],

@@ -10,13 +10,21 @@ import { readSteeringReconciliationState } from "./steering-reconciliation-read.
 import { buildTaskGraphLocationCoverageNodes, canRetainCompatiblePriorScouts, evaluateTaskGraphPlanObjectiveCoverage } from "./task-graph-plan-objective-coverage.js"
 import { classifyPendingSupersededScouts } from "./task-graph-pending-scout-scope.js"
 
-const { pendingScope } = vi.hoisted(() => ({ pendingScope: vi.fn() }))
+const { pendingScope, retiredScouts, evaluateCoverage } = vi.hoisted(() => ({
+  pendingScope: vi.fn(), retiredScouts: vi.fn(), evaluateCoverage: vi.fn(),
+}))
+
+vi.mock("../planning/task-graph-objective-coverage.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../planning/task-graph-objective-coverage.js")>()
+  return { ...actual, evaluateTaskGraphObjectiveCoverage: evaluateCoverage }
+})
 
 vi.mock("./task-graph-pg-state.js", () => ({ loadTaskGraph: vi.fn() }))
 vi.mock("./task-graph-confirmed-location-steer.js", () => ({ readTaskGraphConfirmedLocationSteer: vi.fn() }))
 vi.mock("./task-graph-current-location-evidence.js", () => ({ resolveTaskGraphCurrentLocationEvidence: vi.fn() }))
 vi.mock("./steering-reconciliation-read.js", () => ({ readSteeringReconciliationState: vi.fn() }))
 vi.mock("./task-graph-pending-scout-scope.js", () => ({ classifyPendingSupersededScouts: pendingScope }))
+vi.mock("../turns/task-graph-retirement-completion.js", () => ({ readTaskGraphRetiredScouts: retiredScouts }))
 
 const client = { query: vi.fn() } as never
 const scope = {
@@ -63,6 +71,8 @@ beforeEach(() => {
   vi.mocked(loadTaskGraph).mockResolvedValue({} as never)
   vi.mocked(resolveTaskGraphCurrentLocationEvidence).mockResolvedValue({ status: "unavailable" })
   pendingScope.mockReturnValue({ status: "unavailable" })
+  retiredScouts.mockResolvedValue(new Map())
+  evaluateCoverage.mockReturnValue({ status: "covered" })
 })
 
 describe("TaskGraph plan objective coverage", () => {
@@ -151,6 +161,30 @@ describe("TaskGraph plan objective coverage", () => {
     expect(available([], []).excludedHistoricalNodeKeys).toEqual(new Set())
   })
 
+  it("keeps ACKed retirement separate from a plan-pending Scout and excludes both from coverage", async () => {
+    const nodes = [locationScout("retired-scout", ["berlin"]), locationScout("pending-scout", ["berlin"]),
+      locationScout("current-scout", ["dublin"])]
+    const proof = { nodeKey: "retired-scout", taskId: "retired-task", attempt: 1,
+      interruptRequestedAt: "2026-11-19T10:00:00.000Z", receiptEventId: "retirement", lifecycleEventId: "ack" }
+    vi.mocked(readTaskGraphConfirmedLocationSteer).mockResolvedValue(confirmed)
+    retiredScouts.mockResolvedValue(new Map([["retired-scout", proof]]))
+    pendingScope.mockReturnValue({ status: "available", pendingNodeKeys: new Set(["pending-scout"]) })
+    vi.mocked(resolveTaskGraphCurrentLocationEvidence).mockResolvedValue(available([], []))
+
+    const request = { ...input({ status: "absent" }), proposal: { expectedRevision: 1, nodes: [{ key: "current-scout",
+      templateId: "scout", goal: "Find Dublin roles", successCriteria: ["Find candidates"], dependsOn: [] }] } }
+    await expect(evaluateTaskGraphPlanObjectiveCoverage({ client, input: request,
+      nodes, provenance, prepared: { decision: "revise" } as PreparedSteeringReconciliation,
+    })).resolves.toEqual({ status: "covered" })
+
+    const evidenceInput = vi.mocked(resolveTaskGraphCurrentLocationEvidence).mock.calls[0]?.[0]
+    expect(evidenceInput?.retiredNodeKeys).toEqual(new Set(["retired-scout"]))
+    expect(evidenceInput?.pendingSupersededNodeKeys).toEqual(new Set(["pending-scout"]))
+    const coveredNodes = evaluateCoverage.mock.calls[0]?.[1] as readonly TaskGraphObjectiveLineageNode[] | undefined
+    expect(coveredNodes?.map(node => node.key))
+      .toEqual(["current-scout"])
+  })
+
   it("keeps verified completed-Scout reuse when the pending partition is unavailable", async () => {
     const nodes = [locationScout("completed-scout", ["berlin"])]
     vi.mocked(readTaskGraphConfirmedLocationSteer).mockResolvedValue(confirmed)
@@ -225,5 +259,24 @@ describe("TaskGraph plan objective coverage", () => {
 
     await expect(evaluateTaskGraphPlanObjectiveCoverage({ client, input: request, nodes, provenance }))
       .rejects.toMatchObject({ code: "task_graph_dependency_unverified" })
+  })
+
+  it("rejects a proposed repair that targets an ACKed retired Scout", async () => {
+    const retired = { ...scout("retired-scout"), taskId: "retired-task" }
+    const repairOf = {
+      nodeKey: "retired-scout", taskId: "retired-task", graphRootTaskId: scope.rootTaskId, criterionIds: ["candidate-count"],
+    }
+    const repair: TaskGraphObjectiveLineageNode = { ...analyst("new-analysis"), repairOf }
+    const nodes = [retired, repair]
+    retiredScouts.mockResolvedValue(new Map([["retired-scout", { nodeKey: "retired-scout", taskId: "retired-task", attempt: 1,
+      interruptRequestedAt: "2026-11-19T10:00:00.000Z", receiptEventId: "retirement", lifecycleEventId: "ack" }]]))
+    vi.mocked(readTaskGraphConfirmedLocationSteer).mockResolvedValue(confirmed)
+    vi.mocked(resolveTaskGraphCurrentLocationEvidence).mockResolvedValue(available([], []))
+    const request = { ...input({ status: "absent" }), proposal: { expectedRevision: 1, nodes: [{ key: "new-analysis",
+      templateId: "analyst", goal: "Repair", successCriteria: ["done"], dependsOn: [], repairOf }] } }
+
+    await expect(evaluateTaskGraphPlanObjectiveCoverage({ client, input: request, nodes, provenance }))
+      .rejects.toMatchObject({ code: "task_graph_dependency_unverified" })
+    expect(evaluateCoverage).not.toHaveBeenCalled()
   })
 })
