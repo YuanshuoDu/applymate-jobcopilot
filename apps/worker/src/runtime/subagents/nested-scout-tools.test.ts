@@ -4,6 +4,8 @@ import { NESTED_SCOUT_ALLOWED_SOURCES, NESTED_SCOUT_PROFILE_MARKER } from "./nes
 import { captureDiscoveryQueryCriteria, createDiscoveryQueryFootprintForAttempts } from "./child-discovery-query-footprint.js"
 import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "./child-discovery-attempt.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { scoutDelegateSpawnKey } from "./scout-delegate-spawn-key.js"
+import { InMemoryToolLifecycleSink, ToolLifecycle } from "../tools/lifecycle.js"
 import {
   createNestedScoutTools, deriveNestedScoutSourceScope, nestedScoutQueryAllowed,
   nestedScoutTaskScopeFromContext, readDirectScoutChildren, restrictNestedScoutScope,
@@ -86,18 +88,24 @@ describe("nested Scout source scope", () => {
 describe("nested Scout tools", () => {
   it("spawns through the canonical manager with the actual step and tool-call identity", async () => {
     const spawnFromLease = vi.fn(async (spec: Record<string, unknown>) => ({ atomic: true as const, duplicate: false,
-      task: { id: "subagent-child", parentTaskId: lease.id, userId: lease.userId, sessionId: lease.sessionId,
+      task: { id: "subagent-00000000-0000-4000-8000-000000000002", parentTaskId: lease.id, userId: lease.userId, sessionId: lease.sessionId,
         turnId: lease.turnId, rootTaskId: lease.rootTaskId, depth: 2, role: "scout", taskType: "job_discovery", context: spec.context } }))
     const tools = createNestedScoutTools({ pool: { connect: async () => { throw new Error("not used") } } as never,
       lease, profile, subagentManager: () => ({ spawnFromLease } as never), discoveryAttemptSidecar: () => sidecar() })
     const result = await tools[0]!.execute(executionContext(), { goal: "Check Berlin engineers", sourceSlice: ["greenhouse"] })
 
-    expect(result).toEqual({ taskId: "subagent-child", status: "queued" })
+    expect(result).toEqual({ taskId: "subagent-00000000-0000-4000-8000-000000000002", status: "queued" })
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const returned = await lifecycle.completed({ id: "call-9", toolName: "scout.delegate", toolVersion: "1", sessionId: lease.sessionId,
+      turnId: lease.turnId!, rootTaskId: lease.rootTaskId, taskId: lease.id, stepId: "step-7" }, result)
+    expect(returned).toEqual(result)
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output: result })
     expect(spawnFromLease).toHaveBeenCalledWith(expect.objectContaining({
       role: "scout", taskType: "job_discovery", allowedActions: ["jobs.discover", "tool_results.read"],
       constraints: ["Do not invent role requirements.", "Use only the server-published Scout tools and immutable discovery scope in task context."],
       context: expect.objectContaining({ nestedScoutSourceSlice: ["greenhouse"] }),
-    }), expect.stringMatching(/^scout-delegate:/), lease, { stepId: "step-7", toolCallId: "call-9" })
+    }), scoutDelegateSpawnKey(lease.id, lease.attemptCount, "call-9"), lease, { stepId: "step-7", toolCallId: "call-9" })
   })
 
   it("maps only the typed unsupported-budget denial and preserves lease-loss errors", async () => {

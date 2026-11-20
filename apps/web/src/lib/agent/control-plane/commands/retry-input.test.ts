@@ -155,12 +155,17 @@ describe('persisted retry input', () => {
 
   it('rejects unknown fields and invalid values in persisted retry intent', () => {
     const base = { goal: 'Retry discovery', content: [{ type: 'text', text: 'Retry discovery' }] }
+    expect(() => parsePersistedRetryContent('turn-recovery', {
+      ...base,
+      materialDriftRecovery: { schemaVersion: 'agent-harness.v2.material-drift-recovery.v1' },
+    })).toThrow()
     for (const intent of [
       { kind: 'interactive_discovery_shortlist', version: 1, extra: true },
       { kind: 'other', version: 1 },
       { kind: 'interactive_discovery_shortlist', version: 2 },
       { kind: 'objective_task_graph_execution', version: 1, extra: true },
       { kind: 'objective_task_graph_execution', version: 2 },
+      { kind: 'objective_task_graph_execution', version: 1, materialDriftRecovery: { schemaVersion: 'agent-harness.v2.material-drift-recovery.v1' } },
     ]) {
       expect(() => parsePersistedRetryContent('turn-4', { ...base, intent })).toThrow()
     }

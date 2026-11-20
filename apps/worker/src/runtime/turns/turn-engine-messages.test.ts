@@ -550,6 +550,28 @@ describe("TurnEngine model message mapping", () => {
     expect(request.tools).toEqual(tools)
   })
 
+  it("adds fixed reconciliation guidance for a resumed Root without promoting the steer text", () => {
+    const steer = { id: "steer-a:part:0", layer: "pending_input" as const, role: "data" as const,
+      trust: "external_untrusted" as const, source: "user_input", content: { inputId: "steer-a", partIndex: 0, text: "PRIVATE_STEER_SENTINEL" } }
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({
+      context: { ...context(), taskGraphRevision: 5, hasUnresolvedConsumedSteer: true, blocks: [...context().blocks, steer] }, model,
+      tools: [{ name: "agent.reconcile", version: "1" }, { name: "agent.plan", version: "1" }],
+      sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1", rootTaskId: "root-1",
+      signal: new AbortController().signal, freshSteering: false,
+    })
+    const systemText = request.messages.filter(message => message.role === "system")
+      .flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n")
+    const requestText = JSON.stringify(request.messages)
+
+    expect(systemText).toContain("Previously accepted user steering remains unresolved")
+    expect(systemText).toContain('agent.reconcile with decision "keep" and expectedRevision 5')
+    expect(systemText).toContain("agent.plan with expectedRevision 5")
+    expect(systemText).not.toContain("PRIVATE_STEER_SENTINEL")
+    expect(requestText).toContain("PRIVATE_STEER_SENTINEL")
+    expect(systemText).not.toContain("Fresh user steering is present")
+  })
+
   it.each([
     ["no revision", undefined, true],
     ["invalid revision", -1, true],

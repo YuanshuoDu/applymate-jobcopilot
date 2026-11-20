@@ -37,6 +37,26 @@ describe("TaskGraph follow-up binding validation", () => {
     expect(validateTaskGraphFollowUpBinding(bindingWithValidKey)).not.toBeNull()
   })
 
+  it("accepts eligible private history without requiring historical outcomes", () => {
+    const current = preparedBinding(ref("artifact-current"))
+    const history: TaskGraphFinalSummaryMember = { nodeIndex: 0, nodeKey: "history-node", templateId: "scout", taskId: "history-task",
+      role: "scout", taskType: "scout", taskStatus: "completed", kind: "historical" }
+    const prepared = { ...current.members![0]!, nodeIndex: 1 }
+    const partitioned = { ...current, members: [history, prepared] }
+    const facts = validateTaskGraphFollowUpBinding(partitioned)
+
+    expect(facts?.outcomes.has("history-task")).toBe(false)
+    expect(facts?.outcomes.has("prepare-task-1")).toBe(true)
+    expect(validateTaskGraphFollowUpBinding({ ...partitioned, members: [history], summary: reduceTaskGraphFinalSummary({ graphRevision: 3, nodes: [] }) })).toBeNull()
+    expect(validateTaskGraphFollowUpBinding({ ...partitioned, members: [{ ...history, role: "unsupported", templateId: "unsupported" }, prepared] })).toBeNull()
+    expect(validateTaskGraphFollowUpBinding({ ...partitioned, members: [{ ...history, templateId: "research" }, prepared] })).toBeNull()
+    expect(validateTaskGraphFollowUpBinding({ ...partitioned, members: [{ ...history, taskStatus: "running" as const }, prepared] })).toBeNull()
+    expect(validateTaskGraphFollowUpBinding({ ...partitioned, summary: { ...partitioned.summary, taskOutcomes: [
+      ...partitioned.summary.taskOutcomes,
+      { taskId: "history-task", role: "scout", taskStatus: "completed", resultState: "missing" },
+    ] } })).toBeNull()
+  })
+
   it("rejects outer-level materials or a nested reference inconsistent with the artifact summary", () => {
     const current = preparedBinding(ref("artifact-current"))
     const prepareRow = current.summary.prepareResults[0]!

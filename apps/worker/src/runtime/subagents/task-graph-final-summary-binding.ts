@@ -1,6 +1,7 @@
 import { reduceTaskGraphFinalSummary, type TaskGraphFinalSummary } from "./task-graph-final-summary.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
-import type { LoadedGraph } from "./task-graph-pg-state.js"
+import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
+import { validateRoleResult } from "./role-results.js"
 import type { SubagentTaskStatus } from "./types.js"
 
 export const TASK_GRAPH_FINAL_SUMMARY_BINDING: unique symbol = Symbol("task_graph_final_summary_binding")
@@ -13,8 +14,9 @@ export type TaskGraphFinalSummaryMember = Readonly<{
   role: string
   taskType: string
   taskStatus: SubagentTaskStatus
-  kind: "business" | "internal_control"
+  kind: "business" | "internal_control" | "historical"
 }>
+type CurrentTaskGraphFinalSummaryMember = TaskGraphFinalSummaryMember & Readonly<{ kind: "business" | "internal_control" }>
 
 export type TaskGraphFinalSummaryBinding = Readonly<{
   /** Required on bindings produced by this module; optional only for legacy internal carriers, which cannot emit a manifest. */
@@ -26,8 +28,10 @@ export type TaskGraphFinalSummaryBinding = Readonly<{
 }>
 
 /** Builds a private freshness binding from one already-loaded, owner-scoped current graph. */
-export function buildTaskGraphFinalSummaryBinding(loaded: LoadedGraph): TaskGraphFinalSummaryBinding | null {
+export function buildTaskGraphFinalSummaryBinding(loaded: LoadedGraph, historicalNodeIndices?: ReadonlySet<number>): TaskGraphFinalSummaryBinding | null {
+  const selectedHistory = selectedIndices(historicalNodeIndices)
   if (!loaded.item) {
+    if (selectedHistory.length > 0) throw new Error("task_graph_final_summary_historical_selection_invalid")
     if (loaded.snapshot || loaded.state || loaded.tasks.size > 0) throw new Error("task_graph_final_summary_graph_invalid")
     return null
   }
@@ -50,7 +54,18 @@ export function buildTaskGraphFinalSummaryBinding(loaded: LoadedGraph): TaskGrap
       taskType: task.taskType, taskStatus: task.status,
       kind: isNativeVerificationControl(task.role, task.taskType) ? "internal_control" : "business" }
   })
-  const nodes = members.map(member => {
+  for (const nodeIndex of selectedHistory) {
+    const member = members[nodeIndex]
+    const task = member && loaded.tasks.get(member.taskId)
+    if (!member || !task || !isHistoricalScoutAnalyst(member, task)) {
+      throw new Error("task_graph_final_summary_historical_selection_invalid")
+    }
+  }
+  const boundMembers = members.map(member => selectedHistory.includes(member.nodeIndex) ? { ...member, kind: "historical" as const } : member)
+  if (selectedHistory.length > 0 && !boundMembers.some(member => member.kind === "business")) {
+    throw new Error("task_graph_final_summary_historical_selection_invalid")
+  }
+  const nodes = boundMembers.filter((member): member is CurrentTaskGraphFinalSummaryMember => member.kind !== "historical").map(member => {
     const task = loaded.tasks.get(member.taskId)!
     const nested = persistedStructuredResult(task.result)
     return {
@@ -64,7 +79,7 @@ export function buildTaskGraphFinalSummaryBinding(loaded: LoadedGraph): TaskGrap
   })
   const graphRevision = loaded.item.revision
   const summary = reduceTaskGraphFinalSummary({ graphRevision, nodes })
-  return { rootTaskId: loaded.rootTaskId, graphItemId: loaded.item.id, graphRevision, members, summary }
+  return { rootTaskId: loaded.rootTaskId, graphItemId: loaded.item.id, graphRevision, members: boundMembers, summary }
 }
 
 /** Compares the exact current graph revision and all deterministic reducer facts. */
@@ -92,6 +107,28 @@ function persistedStructuredResult(value: unknown): Readonly<{ present: boolean;
   const envelope = jsonRecord(value)
   if (!envelope || !Object.hasOwn(envelope, "structuredResult")) return { present: false }
   return { present: true, value: envelope.structuredResult }
+}
+
+function selectedIndices(value?: ReadonlySet<number>): number[] {
+  if (value === undefined) return []
+  try {
+    if (!value || typeof value[Symbol.iterator] !== "function") throw new Error()
+    const indices: number[] = [], seen = new Set<number>()
+    for (const index of value) {
+      if (indices.length >= TASK_GRAPH_LIMITS.maxPersistedNodes || !Number.isSafeInteger(index) || index < 0 || seen.has(index)) throw new Error()
+      indices.push(index)
+      seen.add(index)
+    }
+    return indices
+  } catch { throw new Error("task_graph_final_summary_historical_selection_invalid") }
+}
+
+function isHistoricalScoutAnalyst(member: TaskGraphFinalSummaryMember, task: GraphTaskRow): boolean {
+  if ((member.role !== "scout" && member.role !== "analyst") || member.templateId !== member.role || member.taskStatus !== "completed"
+    || task.role !== member.role || task.status !== member.taskStatus) return false
+  const nested = persistedStructuredResult(task.result)
+  if (!nested.present) return false
+  try { validateRoleResult(nested.value, member.role); return true } catch { return false }
 }
 
 function jsonRecord(value: unknown): Record<string, unknown> | null {

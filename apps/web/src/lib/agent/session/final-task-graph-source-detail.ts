@@ -8,6 +8,7 @@ import {
 
 import {
   parseFinalTaskGraphSourceManifest,
+  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2,
   TASK_GRAPH_SOURCE_ROLES,
   TASK_GRAPH_SOURCE_TASK_STATUSES,
   type FinalTaskGraphSource,
@@ -103,12 +104,22 @@ export function projectFinalTaskGraphSourceDetail(input: {
   }
 
   if (!isCanonicalTaskGraphSourceManifest(input.finalItemId, manifest)) return null
+  const historicalNodeIndices = manifest.schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2
+    ? new Set(manifest.historicalNodeIndices) : new Set<number>()
+  for (const nodeIndex of historicalNodeIndices) {
+    const historicalNode = snapshot.nodes[nodeIndex]
+    const historicalTask = historicalNode && taskById.get(historicalNode.taskId)
+    if (!historicalNode || !historicalTask || historicalTask.status !== 'completed'
+      || (historicalTask.role !== 'scout' && historicalTask.role !== 'analyst')
+      || historicalNode.templateId !== historicalTask.role) return null
+  }
   const businessNodes = snapshot.nodes.flatMap((node, nodeIndex) => {
     const task = taskById.get(node.taskId)!
     return task.role === 'auditor' && task.taskType === 'native_verification' ? [] : [{ node, nodeIndex, task }]
   })
-  if (manifest.sources.length !== businessNodes.length) return null
-  for (const [index, member] of businessNodes.entries()) {
+  const sourcedNodes = businessNodes.filter(member => !historicalNodeIndices.has(member.nodeIndex))
+  if (manifest.sources.length !== sourcedNodes.length) return null
+  for (const [index, member] of sourcedNodes.entries()) {
     const source = manifest.sources[index]!
     if (source.nodeIndex !== member.nodeIndex || source.taskStatus !== member.task.status || !sourceRoleMatches(member.task, source)
       || source.resultState === 'valid' && !roleResultMatches(member.task.result, source)) return null
