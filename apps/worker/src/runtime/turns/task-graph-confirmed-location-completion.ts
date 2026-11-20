@@ -3,6 +3,8 @@ import { resolveRootTaskVerificationRequirements, type RootTaskVerificationRequi
 import { evaluateTaskGraphObjectiveCoverage } from "../planning/task-graph-objective-coverage.js"
 import type { TaskGraphObjectiveLineageNode } from "../planning/task-graph-objective-lineage.js"
 import { TASK_GRAPH_TEMPLATES } from "../subagents/task-graph-templates.js"
+import { readTaskGraphConfirmedLocationBatchForReceipt } from "../subagents/task-graph-confirmed-location-batch.js"
+import type { TaskGraphConfirmedLocationBatchResult } from "../subagents/task-graph-confirmed-location-batch.js"
 import { buildTaskGraphLocationCoverageNodes, canRetainCompatiblePriorScouts,
   type TaskGraphAvailableLocationEvidence } from "../subagents/task-graph-plan-objective-coverage.js"
 import { resolveTaskGraphCurrentLocationEvidence } from "../subagents/task-graph-current-location-evidence.js"
@@ -48,11 +50,31 @@ export async function resolveTaskGraphConfirmedLocationCompletion(
     if (!loaded.snapshot || !Number.isSafeInteger(revision) || Number(revision) < 1
       || reconciliation.currentRevision !== revision) return REPLAN
 
+    const latest = reconciliation.latestUserRevision
+    let effectiveConfirmed: typeof confirmed | Extract<TaskGraphConfirmedLocationBatchResult, { kind: "confirmed" }> = confirmed
+    if (latest?.acceptedSteerInputs && latest.acceptedSteerInputs.length > 1) {
+      if (!Number.isSafeInteger(latest.decisionStepOrdinal) || !Number.isSafeInteger(latest.decisionStepAttempt)) return UNAVAILABLE
+      const batch = await readTaskGraphConfirmedLocationBatchForReceipt({ client: input.client,
+        scope: { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId },
+        consumedThroughSequence: cursor, inputIds: latest.acceptedSteerInputs.map(member => member.id).sort(),
+        inputThroughSequence: latest.inputThroughSequence,
+        decisionStep: { id: latest.stepId, ordinal: latest.decisionStepOrdinal!, attempt: latest.decisionStepAttempt! } })
+      if (batch.kind === "confirmed") {
+        if (batch.acceptedInputId !== confirmed.acceptedInputId || batch.acceptedInputSequence !== confirmed.acceptedInputSequence
+          || JSON.stringify(batch.locations) !== JSON.stringify(confirmed.locations)) return REPLAN
+        if (latest.acceptedSteerInputs.length !== batch.acceptedInputIds.length
+          || latest.acceptedSteerInputs.some((member, index) => member.id !== batch.acceptedInputIds[index]
+            || member.acceptedSequence !== batch.acceptedInputSequences[index])) return UNAVAILABLE
+        effectiveConfirmed = batch
+      }
+    }
+
     const initialRequirements: RootTaskVerificationRequirementsResolution = resolveRootTaskVerificationRequirements(input.persistedTurnInput)
     const evidence = await resolveTaskGraphCurrentLocationEvidence({
       client: input.client, loaded, scope, initialRequirements, verifiedCurrentLocations: confirmed.locations,
-      acceptedInputSequence: confirmed.acceptedInputSequence,
-      retainCompatiblePriorScouts: canRetainCompatiblePriorScouts(reconciliation, confirmed.acceptedInputSequence),
+      acceptedInputSequence: effectiveConfirmed.acceptedInputSequence,
+      retainCompatiblePriorScouts: canRetainCompatiblePriorScouts(reconciliation, effectiveConfirmed.acceptedInputSequence,
+        "acceptedInputIds" in effectiveConfirmed ? effectiveConfirmed : undefined),
       retiredNodeKeys: input.retiredNodeKeys,
     })
     if (evidence.status !== "available") return UNAVAILABLE

@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 const evidenceHarness = vi.hoisted(() => ({ value: null as unknown, calls: [] as unknown[][] }))
+const batchHarness = vi.hoisted(() => ({ value: null as unknown, calls: [] as unknown[][] }))
+vi.mock("../subagents/task-graph-confirmed-location-batch.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../subagents/task-graph-confirmed-location-batch.js")>()
+  return { ...actual, readTaskGraphConfirmedLocationBatchForReceipt: (...args: Parameters<typeof actual.readTaskGraphConfirmedLocationBatchForReceipt>) => {
+    batchHarness.calls.push(args)
+    return Promise.resolve(batchHarness.value as Awaited<ReturnType<typeof actual.readTaskGraphConfirmedLocationBatchForReceipt>>)
+  } }
+})
 vi.mock("../subagents/task-graph-current-location-evidence.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../subagents/task-graph-current-location-evidence.js")>()
   return { ...actual, resolveTaskGraphCurrentLocationEvidence: (...args: Parameters<typeof actual.resolveTaskGraphCurrentLocationEvidence>) => {
@@ -17,7 +25,7 @@ import { buildTaskGraphFinalSummaryBinding } from "../subagents/task-graph-final
 import { resolveTaskGraphConfirmedLocationCompletion } from "./task-graph-confirmed-location-completion.js"
 import { taskGraphCompletionApplicability } from "./task-graph-completion-applicability.js"
 
-afterEach(() => { evidenceHarness.value = null; evidenceHarness.calls = [] })
+afterEach(() => { evidenceHarness.value = null; evidenceHarness.calls = []; batchHarness.value = null; batchHarness.calls = [] })
 
 const scope = { userId: "user", sessionId: "session", turnId: "turn", rootTaskId: "root", parentTaskId: "root" }
 const confirmed = { kind: "confirmed" as const, locations: ["dublin"], acceptedInputSequence: 20n, acceptedInputId: "accepted-input" }
@@ -74,6 +82,52 @@ describe("confirmed location terminal applicability", () => {
       resultingRevision: 5, stepId: "revise", inputThroughSequence: 20n, soleSteerSequence: 20n,
     }), confirmed, persistedTurnInput: {}, verifiedCompletedTaskIds: new Set(["old-task", "current-task"]) }))
       .resolves.toEqual({ kind: "replan" })
+  })
+
+  it("rebinds every coalesced accepted steer before applying the final location scope", async () => {
+    const nodes = [scout("old-scout", "old-task", "london"), scout("current-scout", "current-task", "dublin")]
+    const loaded = graph(nodes, [10n, 30n])
+    const state = { ...reconciliation({ resultingRevision: 5, stepId: "revise", inputThroughSequence: 30n,
+      acceptedSteerInputs: [{ id: "accepted-old", acceptedSequence: 20n }, { id: "accepted-input", acceptedSequence: 30n }],
+      decisionStepOrdinal: 4, decisionStepAttempt: 2 }), decisionInputThroughSequence: 30n, lastReconciledInputThroughSequence: 30n }
+    batchHarness.value = { kind: "confirmed", locations: ["dublin"], acceptedInputSequence: 30n, acceptedInputId: "accepted-input",
+      acceptedInputIds: ["accepted-old", "accepted-input"], acceptedInputSequences: [20n, 30n] }
+    evidenceHarness.value = available(["old-scout"])
+
+    const result = await resolveTaskGraphConfirmedLocationCompletion({ client, loaded, scope, reconciliation: state,
+      confirmed: { ...confirmed, acceptedInputSequence: 30n }, persistedTurnInput: {},
+      verifiedCompletedTaskIds: new Set(["old-task", "current-task"]) })
+
+    expect(result).toEqual({ kind: "applicable", historicalNodeIndices: new Set() })
+    expect(batchHarness.calls[0]?.[0]).toMatchObject({ inputIds: ["accepted-input", "accepted-old"],
+      inputThroughSequence: 30n, decisionStep: { id: "revise", ordinal: 4, attempt: 2 } })
+    expect(evidenceHarness.calls[0]?.[0]).toMatchObject({ verifiedCurrentLocations: ["dublin"],
+      acceptedInputSequence: 30n, retainCompatiblePriorScouts: true })
+  })
+
+  it("falls back to fresh evidence when a mixed multi-input receipt has no typed batch proof", async () => {
+    const state = { ...reconciliation({ resultingRevision: 5, stepId: "revise", inputThroughSequence: 30n,
+      acceptedSteerInputs: [{ id: "accepted-old", acceptedSequence: 20n }, { id: "accepted-input", acceptedSequence: 30n }],
+      decisionStepOrdinal: 4, decisionStepAttempt: 2 }), decisionInputThroughSequence: 30n, lastReconciledInputThroughSequence: 30n }
+    batchHarness.value = { kind: "unavailable" }
+    evidenceHarness.value = available()
+    const loaded = graph([scout("current-scout", "current-task", "dublin")], [30n])
+    const result = await resolveTaskGraphConfirmedLocationCompletion({ client, loaded, scope, reconciliation: state,
+      confirmed: { ...confirmed, acceptedInputSequence: 30n }, persistedTurnInput: {}, verifiedCompletedTaskIds: new Set(["current-task"]) })
+    expect(result).toEqual({ kind: "applicable", historicalNodeIndices: new Set() })
+    expect(evidenceHarness.calls[0]?.[0]).toMatchObject({ acceptedInputSequence: 30n, retainCompatiblePriorScouts: false })
+  })
+
+  it("does not let a confirmed but mismatched batch override the current typed steer", async () => {
+    const state = { ...reconciliation({ resultingRevision: 5, stepId: "revise", inputThroughSequence: 30n,
+      acceptedSteerInputs: [{ id: "accepted-old", acceptedSequence: 20n }, { id: "accepted-input", acceptedSequence: 30n }],
+      decisionStepOrdinal: 4, decisionStepAttempt: 2 }), decisionInputThroughSequence: 30n, lastReconciledInputThroughSequence: 30n }
+    batchHarness.value = { kind: "confirmed", locations: ["dublin"], acceptedInputSequence: 30n, acceptedInputId: "other-input",
+      acceptedInputIds: ["accepted-old", "other-input"], acceptedInputSequences: [20n, 30n] }
+    const result = await resolveTaskGraphConfirmedLocationCompletion({ client, loaded: graph([], []), scope, reconciliation: state,
+      confirmed: { ...confirmed, acceptedInputSequence: 30n }, persistedTurnInput: {}, verifiedCompletedTaskIds: new Set() })
+    expect(result).toEqual({ kind: "replan" })
+    expect(evidenceHarness.calls).toHaveLength(0)
   })
 
   it("does not retire an analysis path that depends on an excluded historical Scout", async () => {

@@ -3,6 +3,8 @@ import type pg from "pg"
 import type { TaskGraphExecutionScope } from "./task-graph-schedule-input.js"
 import { isOrdinaryRegisteredScout } from "./task-graph-pending-scout-scope.js"
 import type { TaskGraphConfirmedLocationSteerResult } from "./task-graph-confirmed-location-steer.js"
+import { readTaskGraphConfirmedLocationBatchForReceipt } from "./task-graph-confirmed-location-batch.js"
+import type { TaskGraphConfirmedLocationSteerScope } from "./task-graph-confirmed-location-steer.js"
 import { parseSteeringReconciliationReceipt, STEERING_RECONCILIATION_EVENT_TYPE,
   type SteeringReconciliationState } from "./steering-reconciliation-contract.js"
 import { parsePersistedTaskGraphReceipt } from "./task-graph-pg-event-validation.js"
@@ -13,6 +15,7 @@ import { taskGraphScoutRetirementIdempotencyKey, type TaskGraphScoutRetirementIn
 
 type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
+type AcceptedSteerInputs = NonNullable<SteeringReconciliationState["latestUserRevision"]>["acceptedSteerInputs"]
 type PlanInput = TaskGraphScoutRetirementInput & Readonly<{
   client: Client
   loaded: LoadedGraph
@@ -54,7 +57,8 @@ function validGraph(input: PlanInput): boolean {
     && state.currentRevision === revision && state.agendaPlanRevision === revision && state.decisionStepId === scope.stepId
     && state.decisionInputThroughSequence !== null && state.unresolvedInputs.length === 0
     && state.lastReconciledInputThroughSequence !== undefined && state.lastReconciledInputThroughSequence >= accepted
-    && latest !== undefined && latest.resultingRevision <= Number(revision) && id(latest.stepId) && latest.soleSteerSequence === accepted
+    && latest !== undefined && latest.resultingRevision <= Number(revision) && id(latest.stepId)
+    && (latest.acceptedSteerInputs !== undefined || latest.soleSteerSequence === accepted)
     && latest.inputThroughSequence <= state.decisionInputThroughSequence
     && loaded.currentInputCheckpoint?.inputThroughSequence === state.decisionInputThroughSequence
     && id(confirmed.acceptedInputId) && accepted > 0n && accepted <= MAX_SEQUENCE
@@ -70,6 +74,8 @@ export async function buildTaskGraphSupersededScoutRetirementPlan(input: PlanInp
     const latest = reconciliation.latestUserRevision
     if (!latest) return null
     const accepted = confirmed.acceptedInputSequence, currentLocations = locations(confirmed.locations)!
+    const memberIds = acceptedSteerInputIds(latest.acceptedSteerInputs, confirmed)
+    if (!memberIds) return null
     const snapshot = loaded.snapshot!, item = loaded.item!, revision = item.revision
     const nodes = new Map(snapshot.nodes.map(node => [node.key, node] as const))
     const taskIds = new Set(snapshot.nodes.map(node => node.taskId))
@@ -84,8 +90,16 @@ export async function buildTaskGraphSupersededScoutRetirementPlan(input: PlanInp
     if (!oldLocations || oldLocations.some(value => currentLocations.includes(value))) return null
     const plan = await acceptedPlan(input.client, loaded, scope, latest.resultingRevision, reconciliation)
     const reconciliationEvent = await acceptedReconciliation(input.client, scope, latest.resultingRevision, latest.stepId,
-      reconciliation, accepted, confirmed.acceptedInputId)
+      reconciliation, memberIds)
     if (!plan || !reconciliationEvent || plan.sequence >= reconciliationEvent.sequence) return null
+    if (!Number.isSafeInteger(latest.decisionStepOrdinal) || !Number.isSafeInteger(latest.decisionStepAttempt)) return null
+    const decisionStep = { id: latest.stepId, ordinal: latest.decisionStepOrdinal!, attempt: latest.decisionStepAttempt! }
+    const batch = await readTaskGraphConfirmedLocationBatchForReceipt({ client: input.client, scope: identityScope(scope),
+      consumedThroughSequence: reconciliation.lastReconciledInputThroughSequence!, inputIds: reconciliationEvent.receipt.steerInputIds,
+      inputThroughSequence: BigInt(reconciliationEvent.receipt.inputCheckpoint.throughSequence), decisionStep })
+    if (batch.kind !== "confirmed" || batch.acceptedInputId !== confirmed.acceptedInputId
+      || batch.acceptedInputSequence !== accepted || canonicalTaskGraphJson(batch.locations) !== canonicalTaskGraphJson(currentLocations)
+      || !sameAcceptedInputs(batch, latest.acceptedSteerInputs)) return null
     const created = plan.receiptNodes.filter(entry => {
       const node = nodes.get(entry.key), task = node && loaded.tasks.get(node.taskId)
       const source = loaded.sourceInputCheckpointByNodeKey?.get(entry.key)?.inputThroughSequence
@@ -150,7 +164,7 @@ async function acceptedPlan(client: Client, loaded: LoadedGraph, scope: TaskGrap
 }
 
 async function acceptedReconciliation(client: Client, scope: TaskGraphExecutionScope, planRevision: number, planStepId: string,
-  state: SteeringReconciliationState, accepted: bigint, acceptedInputId: string): Promise<Readonly<{ receipt: NonNullable<ReturnType<typeof parseSteeringReconciliationReceipt>>; id: string; sequence: bigint; idempotencyKey: string }> | null> {
+  state: SteeringReconciliationState, acceptedInputIds: readonly string[]): Promise<Readonly<{ receipt: NonNullable<ReturnType<typeof parseSteeringReconciliationReceipt>>; id: string; sequence: bigint; idempotencyKey: string }> | null> {
   const result = await client.query<Row>(`SELECT event."id", event."sequence", event."type", event."actor", event."itemId", event."taskId",
       event."correlationId", event."causationId", event."idempotencyKey", event."payload",
       EXISTS (SELECT 1 FROM "agent_outbox" AS outbox WHERE outbox."idempotencyKey" = 'agent-event:' || event."id") AS "hasOutbox"
@@ -164,8 +178,44 @@ async function acceptedReconciliation(client: Client, scope: TaskGraphExecutionS
     || row.causationId !== planStepId || row.hasOutbox !== false || !id(row.id)
     || typeof row.idempotencyKey !== "string" || receipt.schemaVersion !== "agent-harness.v2.plan-reconciliation.v1"
     || receipt.decision !== "revise" || receipt.observedRevision !== planRevision - 1 || receipt.resultingRevision !== planRevision
-    || receipt.steerInputIds.length !== 1 || receipt.steerInputIds[0] !== acceptedInputId || receipt.stepId !== state.latestUserRevision?.stepId
+    || canonicalTaskGraphJson([...receipt.steerInputIds].sort()) !== canonicalTaskGraphJson(acceptedInputIds)
+    || receipt.stepId !== state.latestUserRevision?.stepId
     || receipt.inputCheckpoint.throughSequence !== state.latestUserRevision?.inputThroughSequence.toString()
-    || state.latestUserRevision?.soleSteerSequence !== accepted) return null
+    || state.latestUserRevision?.resultingRevision !== planRevision) return null
   return { receipt, id: row.id, sequence: seq, idempotencyKey: row.idempotencyKey }
+}
+
+function identityScope(scope: TaskGraphExecutionScope): TaskGraphConfirmedLocationSteerScope {
+  return { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId }
+}
+
+function acceptedSteerInputIds(
+  members: AcceptedSteerInputs,
+  confirmed: Extract<TaskGraphConfirmedLocationSteerResult, { kind: "confirmed" }>,
+): readonly string[] | null {
+  if (members === undefined) return confirmed.acceptedInputSequence > 0n && id(confirmed.acceptedInputId)
+    ? [confirmed.acceptedInputId] : null
+  if (!Array.isArray(members) || members.length < 1 || members.length > 128) return null
+  let previous = 0n
+  const bySequence: Array<{ id: string; acceptedSequence: bigint }> = []
+  for (const member of members) {
+    if (!member || !id(member.id) || typeof member.acceptedSequence !== "bigint" || member.acceptedSequence <= previous
+      || member.acceptedSequence > MAX_SEQUENCE) return null
+    bySequence.push({ id: member.id, acceptedSequence: member.acceptedSequence })
+    previous = member.acceptedSequence
+  }
+  const last = bySequence.at(-1)
+  if (!last || last.id !== confirmed.acceptedInputId || last.acceptedSequence !== confirmed.acceptedInputSequence) return null
+  const ids = bySequence.map(member => member.id).sort()
+  return new Set(ids).size === ids.length ? ids : null
+}
+
+function sameAcceptedInputs(
+  batch: Extract<Awaited<ReturnType<typeof readTaskGraphConfirmedLocationBatchForReceipt>>, { kind: "confirmed" }>,
+  members: AcceptedSteerInputs,
+): boolean {
+  if (members === undefined) return batch.acceptedInputIds.length === 1
+  if (!Array.isArray(members) || members.length !== batch.acceptedInputIds.length) return false
+  return members.every((member, index) => member?.id === batch.acceptedInputIds[index]
+    && member?.acceptedSequence === batch.acceptedInputSequences[index])
 }
