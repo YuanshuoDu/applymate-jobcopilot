@@ -4193,6 +4193,38 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
   })
 
+  it("prompts a resumed Root to reconcile an already-consumed unresolved steer", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const build = root.options.contextBuilder.build
+    const steer = { id: "steer-a:part:0", layer: "pending_input" as const, role: "data" as const,
+      trust: "external_untrusted" as const, source: "user_input", content: { inputId: "steer-a", partIndex: 0, text: "PRIVATE_STEER_SENTINEL" } }
+    root.options = {
+      ...root.options,
+      snapshot: { ...root.options.snapshot, taskGraphRevision: 6 },
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 8n, consumedInputIds: ["steer-a"],
+        usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+      tools: [{ name: "jobs.search", version: "1" }, { name: "agent.reconcile", version: "1" }, { name: "agent.plan", version: "1" }],
+      contextBuilder: { build: async request => {
+        const context = await build(request)
+        return { ...context, taskGraphRevision: 6, consumedInputIds: ["steer-a"], hasUnresolvedConsumedSteer: true, blocks: [...context.blocks, steer] }
+      } },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const request = root.requests[0]
+    const systemText = request?.messages.filter(message => message.role === "system")
+      .flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n") ?? ""
+
+    expect(result.status).toBe("completed")
+    expect(root.requests).toHaveLength(2)
+    expect(systemText).toContain("Previously accepted user steering remains unresolved")
+    expect(systemText).toContain('agent.reconcile with decision "keep" and expectedRevision 6')
+    expect(systemText).toContain("agent.plan with expectedRevision 6")
+    expect(systemText).not.toContain("PRIVATE_STEER_SENTINEL")
+    expect(JSON.stringify(request?.messages)).toContain("PRIVATE_STEER_SENTINEL")
+    expect(systemText).not.toContain("Fresh user steering is present")
+  })
+
   it.each([
     { label: "validated revision", recoveryFeedback: tagTaskGraphRepairRecovery(`${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing`, 23), expectedRevision: 23 },
     { label: "missing revision", recoveryFeedback: tagTaskGraphRepairRecovery(`${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing`, null), expectedRevision: null },
@@ -4799,7 +4831,9 @@ describe("private final dependency wait admission", () => {
   }
 
   it("waits through the registered tool path before verifying or persisting the live candidate", async () => {
-    const root = fixture(identity("task", "parent-1")), callbackInputs: PrepareFinalDependencyWaitInput[] = []
+    const canonicalCallId = "child-wait-call:415-555-0134"
+    const root = fixture(identity("task", "parent-1"), undefined, [{ id: "child-resume:source-result",
+      content: { toolCallId: canonicalCallId, toolName: "wait_subagents" } }]), callbackInputs: PrepareFinalDependencyWaitInput[] = []
     const callback = vi.fn((input: PrepareFinalDependencyWaitInput) => {
       callbackInputs.push(input)
       return { taskIds: [childId] }
@@ -4827,6 +4861,9 @@ describe("private final dependency wait admission", () => {
     expect(result).toMatchObject({ status: "waiting_for_dependency", stepCount: 1, toolCallCount: 1 })
     expect(callback).toHaveBeenCalledTimes(1)
     expect(input?.identity).toBe(root.options.identity)
+    const aliases = [...(input?.toolCallAliases ?? [])].filter(([, id]) => id === canonicalCallId)
+    expect(aliases).toHaveLength(1)
+    expect(aliases[0]?.[0]).not.toBe(canonicalCallId)
     expect(input?.step).toMatchObject({ id: input.context.stepId, ordinal: 0 })
     expect(input?.snapshot).toBe(root.options.snapshot)
     expect(input?.context.schemaVersion).toBe("agent-harness.v2")

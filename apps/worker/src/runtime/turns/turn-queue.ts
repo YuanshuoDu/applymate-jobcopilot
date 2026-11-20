@@ -82,8 +82,6 @@ export interface RunTurnJobOptions {
   isInterrupted?: (lease: TurnLease) => Promise<boolean>
   /** Bounded cross-process Stop probe interval; omitted means no probe. */
   interruptPollMs?: number
-  /** Durable child fence used when this Turn loses ownership unexpectedly. */
-  interruptSubagents?: (lease: TurnLease) => Promise<unknown>
 }
 
 export async function markTurnDispatchClaimed(pool: LeasePool, payload: TurnJobPayload): Promise<void> {
@@ -186,7 +184,7 @@ export async function runTurnJob(
     if (decision.disposition === "skip") return { status: "skipped", reasonCode: decision.reasonCode }
     if (decision.disposition === "retry") {
       if (decision.reasonCode === "lease_lost") {
-        await options.interruptSubagents?.(heartbeat.currentLease).catch(() => undefined)
+        // Child leases recover independently during the Turn ownership handoff.
         await expireTurnLease(options.pool, heartbeat.currentLease, options.now?.() ?? new Date()).catch(() => undefined)
         return { status: "requeued", reasonCode: decision.reasonCode }
       }
@@ -238,18 +236,11 @@ export async function enqueueTurn(
   await queue.add("turn", payload, { jobId: turnJobId(payload.turnId), attempts: TURN_MAX_ATTEMPTS })
 }
 
-export function createTurnQueue(options: {
-  pool: LeasePool
-  execute: TurnExecutor
-  waitHandoff?: TurnWaitHandoff
+type TurnQueueOptions = Omit<RunTurnJobOptions, "active" | "now" | "requireCanonicalAutomationMode"> & {
   queue?: TurnQueueLike
-  interrupts?: RootAbortControllerRegistry
-  leaseMs?: number
-  heartbeatMs?: number
-  interruptPollMs?: number
-  isInterrupted?: (lease: TurnLease) => Promise<boolean>
-  interruptSubagents?: (lease: TurnLease) => Promise<unknown>
-}): { queue: TurnQueueLike; worker: Worker<TurnJobPayload>; active: TurnExecutionRegistry; close: () => Promise<void> } {
+}
+
+export function createTurnQueue(options: TurnQueueOptions): { queue: TurnQueueLike; worker: Worker<TurnJobPayload>; active: TurnExecutionRegistry; close: () => Promise<void> } {
   const queue = attachTurnDispatchStateProbe(options.queue ?? new Queue<TurnJobPayload>(TURN_QUEUE_NAME, { connection: redisConnection, skipVersionCheck: true }))
   const active = new TurnExecutionRegistry()
   const worker = new Worker<TurnJobPayload>(
@@ -265,7 +256,6 @@ export function createTurnQueue(options: {
       heartbeatMs: options.heartbeatMs,
       interruptPollMs: options.interruptPollMs,
       isInterrupted: options.isInterrupted ?? (lease => safePersistedInterrupt(options.pool, lease)),
-      interruptSubagents: options.interruptSubagents,
     }),
     // Queue-wide stalled recovery needs two passes; the Turn fallback targets about 60 seconds.
     { connection: redisConnection, concurrency: 1, skipVersionCheck: true, ...workerPollingOptions(process.env, 30_000) },
