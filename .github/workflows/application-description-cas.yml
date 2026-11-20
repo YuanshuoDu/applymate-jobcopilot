@@ -88,6 +88,10 @@ jobs:
           cache: pnpm
       - name: Install frozen dependencies
         run: pnpm install --frozen-lockfile
+      - name: Build shared route dependencies
+        run: |
+          pnpm --filter @jobcopilot/agent-protocol build
+          pnpm --filter @jobcopilot/shared build
       - name: Generate Prisma client
         env:
           DATABASE_URL: postgresql://description_fixture:description_fixture_only@127.0.0.1:5432/applymate_description_cas_test

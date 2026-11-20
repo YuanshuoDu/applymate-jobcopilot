@@ -5,6 +5,7 @@
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
+import { acquireSourceMaterialFence } from '@/lib/agent/source-material-fence'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -17,7 +18,7 @@ export async function GET(_req: NextRequest, { params }: Params) {
   if (!resume || resume.userId !== auth.userId) return err('Not found', 404)
 
   const versions = await db.resumeVersion.findMany({
-    where: { resumeId: id },
+    where: { resumeId: id, userId: auth.userId },
     orderBy: { createdAt: 'desc' },
     take: 20,
     select: { id: true, name: true, createdAt: true },
@@ -31,34 +32,37 @@ export async function POST(req: NextRequest, { params }: Params) {
   if (isErrorResponse(auth)) return auth
 
   const { id } = await params
-  const resume = await db.resume.findUnique({ where: { id } })
-  if (!resume || resume.userId !== auth.userId) return err('Not found', 404)
+  return db.$transaction(async tx => {
+    await acquireSourceMaterialFence(tx, [auth.userId])
+    const resume = await tx.resume.findFirst({ where: { id, userId: auth.userId } })
+    if (!resume) return err('Not found', 404)
 
-  const body = await req.json().catch(() => null)
-  const versionId: string | undefined = body?.versionId
-  if (!versionId) return err('versionId is required')
+    const body = await req.json().catch(() => null)
+    const versionId: string | undefined = body?.versionId
+    if (!versionId) return err('versionId is required')
 
-  const version = await db.resumeVersion.findUnique({
-    where: { id: versionId },
-    select: { id: true, resumeId: true, userId: true, content: true, name: true },
+    const version = await tx.resumeVersion.findFirst({
+      where: { id: versionId, resumeId: id, userId: auth.userId },
+      select: { id: true, resumeId: true, userId: true, content: true, name: true },
+    })
+    if (!version || version.resumeId !== id || version.userId !== auth.userId) return err('Version not found', 404)
+
+    // Snapshot current state before restoring (allows undo)
+    await tx.resumeVersion.create({
+      data: {
+        resumeId: id,
+        userId: auth.userId,
+        content: resume.content as object,
+        name: resume.name,
+      },
+    })
+
+    // Restore: update resume content from the version snapshot
+    const updated = await tx.resume.update({
+      where: { id, userId: auth.userId },
+      data: { content: version.content as object, name: version.name },
+    })
+
+    return ok(updated)
   })
-  if (!version || version.resumeId !== id || version.userId !== auth.userId) return err('Version not found', 404)
-
-  // Snapshot current state before restoring (allows undo)
-  await db.resumeVersion.create({
-    data: {
-      resumeId: id,
-      userId: auth.userId,
-      content: resume.content as object,
-      name: resume.name,
-    },
-  })
-
-  // Restore: update resume content from the version snapshot
-  const updated = await db.resume.update({
-    where: { id },
-    data: { content: version.content as object, name: version.name },
-  })
-
-  return ok(updated)
 }

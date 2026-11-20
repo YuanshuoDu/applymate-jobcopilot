@@ -2,11 +2,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Job } from '@prisma/client'
 import type { PipelineCtx, ScoredJob } from '../types'
 import { AgentExecutionCancelledError } from '../execution-control'
+import { AnalyzeSourceChangedError, createAnalyzeSourceFingerprint, readAnalyzeSourceChangedClaims } from './analyze-model-input'
 
 const mocks = vi.hoisted(() => ({
   update: vi.fn(),
   activityCreate: vi.fn(),
   transaction: vi.fn(),
+  sourceFence: vi.fn(),
+  jobFindFirst: vi.fn(),
+  resumeFindFirst: vi.fn(),
   applicationTaskUpsert: vi.fn(),
   applicationTaskFindUnique: vi.fn(),
   applicationTaskUpdateMany: vi.fn(),
@@ -18,7 +22,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@/lib/db', () => ({
   db: {
     $transaction: mocks.transaction,
-    job: { update: mocks.update },
+    job: { findFirst: mocks.jobFindFirst, update: mocks.update },
+    resume: { findFirst: mocks.resumeFindFirst },
     activity: { create: mocks.activityCreate },
     applicationTask: {
       upsert: mocks.applicationTaskUpsert,
@@ -35,6 +40,8 @@ vi.mock('@/lib/model-router', () => ({
 vi.mock('./analyze-model-call', () => ({
   completeAnalyzeModelCall: mocks.completeAnalyzeModelCall,
 }))
+
+vi.mock('../source-material-fence', () => ({ acquireSourceMaterialFence: mocks.sourceFence }))
 
 import { AnalyzeRecoveryPersistenceError, runAnalyze } from './analyze'
 
@@ -60,7 +67,7 @@ function context(emit = vi.fn()): PipelineCtx {
     roleConfigs: {
       analyst: { provider: 'minimax', model: 'MiniMax-M3', enabled: true },
     } as PipelineCtx['roleConfigs'],
-    resumeText: 'TypeScript developer with Node.js experience.',
+    resumeText: '\nSUMMARY:\nTypeScript developer with Node.js experience.',
     resumeContent: {} as PipelineCtx['resumeContent'],
     defaultResume: { id: 'resume_1', name: 'Base resume', templateId: null, templateOptions: null, directionId: null, basicsDetached: false },
     aiConfig: { provider: 'minimax', model: 'MiniMax-M3' }, autonomous: false, emit,
@@ -78,6 +85,11 @@ describe('runAnalyze', () => {
   beforeEach(() => {
     vi.resetAllMocks()
     mocks.completeAnalyzeModelCall.mockImplementation(async () => (await mocks.adapterResponse()).text)
+    mocks.sourceFence.mockResolvedValue(undefined)
+    mocks.jobFindFirst.mockResolvedValue({
+      company: job.company, role: job.role, location: job.location, description: job.description, source: job.source, url: job.url,
+    })
+    mocks.resumeFindFirst.mockResolvedValue({ id: 'resume_1', content: { summary: 'TypeScript developer with Node.js experience.' } })
     mocks.update.mockResolvedValue({})
     mocks.activityCreate.mockResolvedValue({})
     mocks.applicationTaskUpsert.mockResolvedValue({ id: 'task_1' })
@@ -90,7 +102,8 @@ describe('runAnalyze', () => {
         findUnique: mocks.applicationTaskFindUnique,
         updateMany: mocks.applicationTaskUpdateMany,
       },
-      job: { update: mocks.update },
+      job: { findFirst: mocks.jobFindFirst, update: mocks.update },
+      resume: { findFirst: mocks.resumeFindFirst },
       activity: { create: mocks.activityCreate },
       agentExecution: { updateMany: mocks.executionUpdateMany },
     }))
@@ -126,13 +139,167 @@ describe('runAnalyze', () => {
     expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ data: { score: 73, analysisNote: 'Add cloud experience.' } }))
   })
 
+  it('keeps model work outside the fence and validates sources before owner, task, and score writes', async () => {
+    const order: string[] = []
+    mocks.sourceFence.mockImplementation(async () => { order.push('source_fence') })
+    mocks.jobFindFirst.mockImplementation(async () => {
+      order.push('job_read')
+      return { company: job.company, role: job.role, location: job.location, description: job.description, source: job.source, url: job.url }
+    })
+    mocks.resumeFindFirst.mockImplementation(async () => {
+      order.push('resume_read')
+      return { id: 'resume_1', content: { summary: 'TypeScript developer with Node.js experience.' } }
+    })
+    mocks.adapterResponse.mockImplementation(async () => {
+      order.push('model_call')
+      return { text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":[],"recommendation":"Good fit."}' }
+    })
+    mocks.applicationTaskUpdateMany.mockImplementation(async () => {
+      if (mocks.adapterResponse.mock.calls.length > 0) order.push('task_transition')
+      return { count: 1 }
+    })
+    mocks.update.mockImplementation(async () => { order.push('job_score'); return {} })
+    mocks.activityCreate.mockImplementation(async () => { order.push('activity'); return {} })
+    const assertScoreOwnerCurrent = vi.fn(async () => { order.push('owner_check'); return true })
+    const onScoredJob = vi.fn(async () => { order.push('score_journal') })
+
+    await runAnalyze([job], context(), { assertScoreOwnerCurrent, onScoredJob })
+
+    expect(order).toEqual([
+      'model_call', 'source_fence', 'job_read', 'resume_read', 'owner_check',
+      'task_transition', 'job_score', 'activity', 'score_journal',
+    ])
+  })
+
+  it.each([
+    ['Job input drift', () => mocks.jobFindFirst.mockResolvedValue({
+      company: job.company, role: job.role, location: job.location, description: 'Changed description', source: job.source, url: job.url,
+    })],
+    ['Resume selection drift', () => mocks.resumeFindFirst.mockResolvedValue({ id: 'resume_2', content: { summary: 'Candidate resume' } })],
+    ['Resume text drift', () => mocks.resumeFindFirst.mockResolvedValue({ id: 'resume_1', content: { summary: 'Changed candidate resume' } })],
+  ])('does not persist a model result after %s', async (_label, changeInput) => {
+    mocks.adapterResponse.mockResolvedValue({
+      text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":[],"recommendation":"Good fit."}',
+    })
+    changeInput()
+    const assertScoreOwnerCurrent = vi.fn(async () => true)
+    const onScoredJob = vi.fn()
+    const onScoreFailure = vi.fn()
+
+    await expect(runAnalyze([job], context(), { assertScoreOwnerCurrent, onScoredJob, onScoreFailure }))
+      .rejects.toBeInstanceOf(AnalyzeSourceChangedError)
+
+    expect(mocks.sourceFence).toHaveBeenCalledOnce()
+    expect(assertScoreOwnerCurrent).toHaveBeenCalledOnce()
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledTimes(2)
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: expect.objectContaining({ jobId: 'job_1', sessionId: null, checkpoint: 'match_analysis' }),
+      data: expect.objectContaining({ status: 'failed', checkpoint: 'analyze_source_changed' }),
+    }))
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+    expect(onScoredJob).not.toHaveBeenCalled()
+    expect(onScoreFailure).not.toHaveBeenCalled()
+  })
+
+  it('waits for the concurrent batch and cleans only its exact in-progress claims after source drift', async () => {
+    const siblingJob = { ...job, id: 'job_2', role: 'Data Engineer' }
+    const siblingModel = deferred<string>()
+    let markSiblingStarted!: () => void
+    let markStaleFenceStarted!: () => void
+    const siblingStarted = new Promise<void>(resolve => { markSiblingStarted = resolve })
+    const staleFenceStarted = new Promise<void>(resolve => { markStaleFenceStarted = resolve })
+    mocks.jobFindFirst.mockImplementation(async (args: { where: { id: string } }) => ({
+      company: job.company, role: job.role, location: job.location,
+      description: args.where.id === 'job_1' ? 'Edited while scoring' : job.description,
+      source: job.source, url: job.url,
+    }))
+    mocks.completeAnalyzeModelCall.mockImplementation(async (args: { jobId: string }) => {
+      if (args.jobId === 'job_2') { markSiblingStarted(); return siblingModel.promise }
+      return '{"score":73,"matchedKeywords":[],"missingKeywords":[],"recommendation":"Good fit."}'
+    })
+    mocks.sourceFence.mockImplementation(async () => { markStaleFenceStarted() })
+    const onScoredJob = vi.fn()
+    const result = runAnalyze([job, siblingJob], context(), { onScoredJob })
+
+    await Promise.all([siblingStarted, staleFenceStarted])
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledTimes(2)
+    const earlyReturn = await Promise.race([
+      result.then(() => 'settled', () => 'settled'),
+      new Promise<'waiting'>(resolve => setTimeout(() => resolve('waiting'), 0)),
+    ])
+    expect(earlyReturn).toBe('waiting')
+
+    siblingModel.resolve('{"score":91,"matchedKeywords":[],"missingKeywords":[],"recommendation":"Strong fit."}')
+    await expect(result).rejects.toBeInstanceOf(AnalyzeSourceChangedError)
+
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledTimes(4)
+    const claimTokens = new Map<string, Date>(mocks.applicationTaskUpdateMany.mock.calls.slice(0, 2).map(([raw]): [string, Date] => {
+      const args = raw as { where: { jobId: string }; data: { updatedAt: Date } }
+      return [args.where.jobId, args.data.updatedAt]
+    }))
+    expect(mocks.applicationTaskUpdateMany.mock.calls.slice(2).map(([args]) => args.where.jobId).sort()).toEqual(['job_1', 'job_2'])
+    for (const [raw] of mocks.applicationTaskUpdateMany.mock.calls.slice(2)) {
+      const args = raw as { where: { jobId: string; updatedAt: Date }; data: { status: string; checkpoint: string } }
+      expect(args).toMatchObject({
+        where: { status: 'analyzing', sessionId: null, checkpoint: 'match_analysis', updatedAt: expect.any(Date) },
+        data: { status: 'failed', checkpoint: 'analyze_source_changed' },
+      })
+      expect(args.where.updatedAt).toEqual(claimTokens.get(args.where.jobId))
+    }
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+    expect(onScoredJob).not.toHaveBeenCalled()
+  })
+
+  it('preserves source-change classification and exact claim metadata when cleanup persistence fails', async () => {
+    mocks.adapterResponse.mockResolvedValue({
+      text: '{"score":73,"matchedKeywords":[],"missingKeywords":[],"recommendation":"Good fit."}',
+    })
+    mocks.jobFindFirst.mockResolvedValue({
+      company: job.company, role: job.role, location: job.location, description: 'Edited source', source: job.source, url: job.url,
+    })
+    const cleanupFailure = new Error('temporary database failure')
+    let updates = 0
+    mocks.applicationTaskUpdateMany.mockImplementation(async () => {
+      if (++updates === 2) throw cleanupFailure
+      return { count: 1 }
+    })
+
+    const error = await runAnalyze([job], context()).then(() => null, caught => caught)
+
+    expect(error).toBeInstanceOf(AnalyzeSourceChangedError)
+    expect(readAnalyzeSourceChangedClaims(error)).toEqual([{
+      jobId: job.id,
+      analysisFenceAt: (mocks.applicationTaskUpdateMany.mock.calls[0]![0] as { data: { updatedAt: Date } }).data.updatedAt.toISOString(),
+    }])
+    expect(updates).toBe(2)
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+  })
+
+  it('keeps owner loss on the cancellation path and does not clean claims for a new owner', async () => {
+    mocks.jobFindFirst.mockResolvedValue({
+      company: job.company, role: job.role, location: job.location, description: 'Edited source', source: job.source, url: job.url,
+    })
+    const assertScoreOwnerCurrent = vi.fn(async () => false)
+
+    await expect(runAnalyze([job], context(), { assertScoreOwnerCurrent })).rejects.toBeInstanceOf(AgentExecutionCancelledError)
+
+    expect(assertScoreOwnerCurrent).toHaveBeenCalledOnce()
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledOnce()
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+  })
+
   it('journals a validated score in its DB transaction after recording an attempt before the model call', async () => {
     const order: string[] = []
     let scoringTransaction: unknown
     mocks.transaction.mockImplementation(async (work: (tx: unknown) => Promise<unknown>) => {
       const tx = {
         applicationTask: { upsert: mocks.applicationTaskUpsert, findUnique: mocks.applicationTaskFindUnique, updateMany: mocks.applicationTaskUpdateMany },
-        job: { update: mocks.update }, activity: { create: mocks.activityCreate }, agentExecution: { updateMany: mocks.executionUpdateMany },
+        job: { findFirst: mocks.jobFindFirst, update: mocks.update }, resume: { findFirst: mocks.resumeFindFirst },
+        activity: { create: mocks.activityCreate }, agentExecution: { updateMany: mocks.executionUpdateMany },
       }
       if (mocks.adapterResponse.mock.calls.length > 0) scoringTransaction = tx
       const result = await work(tx)
@@ -154,7 +321,9 @@ describe('runAnalyze', () => {
     expect(order).toEqual(['db_commit', 'journal_attempt', 'model_call', 'journal_score', 'db_commit'])
     expect(recovery.onScoredJob).toHaveBeenCalledWith(expect.objectContaining({
       job, score: 73, analysisFenceAt: expect.any(String),
-    }), scoringTransaction)
+    }), scoringTransaction, expect.objectContaining({
+      version: 'agent-harness.v2.analyze-source-input.v1', digest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }))
   })
 
   it('does not classify a durable-journal write failure as a scoring failure', async () => {
@@ -169,7 +338,8 @@ describe('runAnalyze', () => {
       const writes = { scores: [] as unknown[], activities: [] as unknown[] }
       const result = await work({
         applicationTask: { upsert: mocks.applicationTaskUpsert, findUnique: mocks.applicationTaskFindUnique, updateMany: mocks.applicationTaskUpdateMany },
-        job: { update: async (args: unknown) => { writes.scores.push(args); return mocks.update(args) } },
+        job: { findFirst: mocks.jobFindFirst, update: async (args: unknown) => { writes.scores.push(args); return mocks.update(args) } },
+        resume: { findFirst: mocks.resumeFindFirst },
         activity: { create: async (args: unknown) => { writes.activities.push(args); return mocks.activityCreate(args) } },
         agentExecution: { updateMany: mocks.executionUpdateMany },
       })
@@ -196,7 +366,8 @@ describe('runAnalyze', () => {
     mocks.transaction.mockImplementation(async (work: (tx: unknown) => Promise<unknown>) => {
       const tx = {
         applicationTask: { upsert: mocks.applicationTaskUpsert, findUnique: mocks.applicationTaskFindUnique, updateMany: mocks.applicationTaskUpdateMany },
-        job: { update: mocks.update }, activity: { create: mocks.activityCreate }, agentExecution: { updateMany: mocks.executionUpdateMany },
+        job: { findFirst: mocks.jobFindFirst, update: mocks.update }, resume: { findFirst: mocks.resumeFindFirst },
+        activity: { create: mocks.activityCreate }, agentExecution: { updateMany: mocks.executionUpdateMany },
       }
       if (mocks.adapterResponse.mock.calls.length > 0) scoringTransaction = tx
       return work(tx)
@@ -269,13 +440,35 @@ describe('runAnalyze', () => {
       job, score: 88, matchedKeywords: ['TypeScript'], missingKeywords: ['AWS'],
       recommendation: 'Apply after tailoring.', analysisFenceAt: '2026-10-19T12:00:00.123Z',
     }
+    const sourceFingerprintsByJob = { [job.id]: createAnalyzeSourceFingerprint({
+      userId: 'user_1', jobId: job.id, job, resumeId: 'resume_1', resumeText: context().resumeText,
+    }) }
 
-    const result = await runAnalyze([job], context(), { existingScoredJobs: [durable] })
+    const result = await runAnalyze([job], context(), { existingScoredJobs: [durable], sourceFingerprintsByJob })
 
     expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [durable] } })
     expect(mocks.adapterResponse).not.toHaveBeenCalled()
     expect(mocks.applicationTaskUpsert).not.toHaveBeenCalled()
-    expect(mocks.transaction).not.toHaveBeenCalled()
+    expect(mocks.transaction).toHaveBeenCalledOnce()
+    expect(mocks.sourceFence).toHaveBeenCalledOnce()
+    expect(mocks.jobFindFirst).toHaveBeenCalledWith(expect.objectContaining({ where: { id: job.id, userId: 'user_1' } }))
+  })
+
+  it('fails closed on a recovered score without provenance and carries its exact cleanup claim', async () => {
+    const durable: ScoredJob = {
+      job, score: 88, matchedKeywords: ['TypeScript'], missingKeywords: ['AWS'],
+      recommendation: 'Apply after tailoring.', analysisFenceAt: '2026-10-19T12:00:00.123Z',
+    }
+    const error = await runAnalyze([job], context(), { existingScoredJobs: [durable] }).then(() => null, caught => caught)
+
+    expect(error).toBeInstanceOf(AnalyzeSourceChangedError)
+    expect(readAnalyzeSourceChangedClaims(error)).toEqual([{ jobId: job.id, analysisFenceAt: durable.analysisFenceAt }])
+    expect(mocks.adapterResponse).not.toHaveBeenCalled()
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'failed', checkpoint: 'analyze_source_changed' }),
+    }))
   })
 
   it('treats a non-JSON AI response as a failed score instead of persisting 0%', async () => {
@@ -374,7 +567,8 @@ describe('runAnalyze', () => {
     mocks.transaction.mockImplementation(async (work: (tx: unknown) => Promise<unknown>) => {
       const tx = {
         applicationTask: { upsert: mocks.applicationTaskUpsert, findUnique: mocks.applicationTaskFindUnique, updateMany: mocks.applicationTaskUpdateMany },
-        job: { update: mocks.update }, activity: { create: mocks.activityCreate }, agentExecution: { updateMany: mocks.executionUpdateMany },
+        job: { findFirst: mocks.jobFindFirst, update: mocks.update }, resume: { findFirst: mocks.resumeFindFirst },
+        activity: { create: mocks.activityCreate }, agentExecution: { updateMany: mocks.executionUpdateMany },
       }
       transactions.push(tx)
       return work(tx)
@@ -417,6 +611,7 @@ describe('runAnalyze', () => {
         OR: [
           { status: { in: ['discovered', 'analyzing'] } },
           { status: 'failed', checkpoint: 'match_analysis_failed' },
+          { status: 'failed', checkpoint: 'analyze_source_changed' },
         ],
         AND: [
           { sessionId: null },
@@ -491,6 +686,7 @@ describe('runAnalyze', () => {
         OR: [
           { status: { in: ['discovered', 'analyzing'] } },
           { status: 'failed', checkpoint: 'match_analysis_failed' },
+          { status: 'failed', checkpoint: 'analyze_source_changed' },
         ],
         updatedAt: taskUpdatedAt,
       }),
@@ -513,6 +709,7 @@ describe('runAnalyze', () => {
       where: expect.objectContaining({ OR: [
         { status: { in: ['discovered', 'analyzing'] } },
         { status: 'failed', checkpoint: 'match_analysis_failed' },
+        { status: 'failed', checkpoint: 'analyze_source_changed' },
       ] }),
     }))
     expect(mocks.adapterResponse).toHaveBeenCalledOnce()

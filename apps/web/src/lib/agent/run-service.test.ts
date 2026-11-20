@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentExecutionCancelledError } from "./execution-control";
 import { buildScheduledTaskGraphPrepareCheckpoint, scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey } from "./scheduled-taskgraph-pipeline-checkpoint";
+import { scheduledTaskGraphRunCheckpointIsCurrent, type ScheduledTaskGraphRunInput } from "./scheduled-taskgraph-audit-action";
+import { scheduledTaskGraphExecuteGateCompletionProof } from "./scheduled-taskgraph-gate-rpc";
+import { checkpointState } from "./run-service-helpers";
+import type { PipelineCheckpointState } from "./types";
 
 const mocks = vi.hoisted(() => ({
   createHistory: vi.fn(),
@@ -12,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   executionUpdateMany: vi.fn(),
   executionTransaction: vi.fn(),
   executionUpsert: vi.fn(),
+  applicationTaskUpdateMany: vi.fn(),
   turnFindFirst: vi.fn(),
   rootFindFirst: vi.fn(),
   findConfig: vi.fn(),
@@ -31,7 +36,41 @@ const mocks = vi.hoisted(() => ({
   finishScheduledExecution: vi.fn(),
   ownerFenceCheck: vi.fn(),
   gateProofCurrent: vi.fn(),
+  sourceValidation: vi.fn(),
 }));
+
+type PrepareResumeInput = {
+  executionState: unknown; scheduledState: unknown; scheduled?: ScheduledTaskGraphRunInput
+  assertScheduledOwnerCurrent: Parameters<typeof scheduledTaskGraphRunCheckpointIsCurrent>[0]["assertOwnerCurrent"]
+  assertScheduledAnalyzeSourcesCurrent?: (tx: Parameters<typeof scheduledTaskGraphRunCheckpointIsCurrent>[0]["tx"]) => Promise<void>
+}
+async function mockPrepareRunResumeState(input: PrepareResumeInput): Promise<{ scheduledState: unknown; resumeState: PipelineCheckpointState | undefined }> {
+  const resumeState = checkpointState(input.executionState), scheduledState = input.scheduledState, scheduled = input.scheduled
+  if (scheduled?.prepareProof === undefined) return { scheduledState, resumeState }
+  const gateProof = scheduledTaskGraphExecuteGateCompletionProof(scheduled.gateCompletionProof)
+  const gate = gateProof?.gate as { taskId: string; attemptCount: number } | undefined
+  const proofInput = { owner: scheduled.owner, snapshot: scheduled.snapshot, analyzeCheckpoint: scheduledState,
+    analyzeAttestation: scheduled.attestation, prepareProof: scheduled.prepareProof,
+    ...(gate ? { gate: { ...gate, phase: "completed" as const, completionProof: scheduled.gateCompletionProof } } : {}) }
+  const gateResumeState = await mocks.buildScheduledTaskGraphGateResumeState({
+    owner: scheduled.owner, snapshot: scheduled.snapshot, attestation: scheduled.attestation, continuationKey: scheduled.continuationKey,
+    claimToken: scheduled.claimToken, ownedJobs: scheduled.ownedJobs, persistedCheckpoint: scheduledState, prepareProof: scheduled.prepareProof,
+    ...(scheduled.action === "scheduled_audit_execute" ? { auditActor: scheduled.auditActor } : {}),
+    ...(scheduled.gateCompletionProof !== undefined ? { gateCompletionProof: scheduled.gateCompletionProof } : {}),
+    ...(scheduled.scheduledWaitId ? { scheduledWaitId: scheduled.scheduledWaitId } : {}) })
+  const safeCheckpoint = mocks.serializeScheduledTaskGraphCheckpoint(gateResumeState)
+  const saved = safeCheckpoint && await mocks.saveScheduledCheckpoint({ expectedState: scheduledState, state: safeCheckpoint,
+    owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken,
+    assertOwnerCurrent: async (tx: Parameters<typeof scheduledTaskGraphRunCheckpointIsCurrent>[0]["tx"]) => {
+      await input.assertScheduledAnalyzeSourcesCurrent?.(tx)
+      return scheduledTaskGraphRunCheckpointIsCurrent({ scheduled, proofInput, tx, assertOwnerCurrent: input.assertScheduledOwnerCurrent })
+    } })
+  if (!saved) {
+    const { AgentExecutionCancelledError: Cancelled } = await import("./execution-control")
+    throw new Cancelled()
+  }
+  return { scheduledState: safeCheckpoint, resumeState: gateResumeState as PipelineCheckpointState }
+}
 
 vi.mock("@/lib/db", () => ({
   db: {
@@ -39,6 +78,7 @@ vi.mock("@/lib/db", () => ({
     agentRun: { create: mocks.createHistory },
     $transaction: mocks.executionTransaction,
     agentExecution: { findFirst: mocks.executionFindFirst, findUnique: mocks.executionFindUnique, updateMany: mocks.executionUpdateMany, upsert: mocks.executionUpsert },
+    applicationTask: { updateMany: mocks.applicationTaskUpdateMany },
     agentTranscriptEvent: { findFirst: mocks.findTranscript },
     agentTurn: { findFirst: mocks.turnFindFirst },
     subAgentTask: { findFirst: mocks.rootFindFirst },
@@ -73,6 +113,8 @@ vi.mock("@/lib/agent/scheduled-taskgraph-run-service", () => ({
   runScheduledTaskGraphAnalyzeOnly: mocks.runScheduledTaskGraphAnalyzeOnly,
   buildScheduledTaskGraphGateResumeState: mocks.buildScheduledTaskGraphGateResumeState,
   serializeScheduledTaskGraphCheckpoint: mocks.serializeScheduledTaskGraphCheckpoint,
+  prepareRunResumeState: mockPrepareRunResumeState,
+  assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent: mocks.sourceValidation,
 }));
 vi.mock("@/lib/agent/scheduled-taskgraph-pipeline-fence", async importOriginal => {
   const actual = await importOriginal<typeof import("@/lib/agent/scheduled-taskgraph-pipeline-fence")>();
@@ -143,11 +185,13 @@ describe("runAgentPipeline", () => {
     mocks.createHistory.mockResolvedValue({});
     mocks.executionUpsert.mockResolvedValue({ id: "execution_1" });
     mocks.executionUpdateMany.mockResolvedValue({ count: 1 });
+    mocks.applicationTaskUpdateMany.mockResolvedValue({ count: 1 });
     mocks.executionFindUnique.mockResolvedValue({ attemptCount: 1 });
     mocks.executionFindFirst.mockResolvedValue({ id: "execution_1", sessionId: "session_1", state: null });
     mocks.turnFindFirst.mockResolvedValue({ id: "turn_1" });
     mocks.executionTransaction.mockImplementation((work: (tx: unknown) => Promise<unknown>) => work({
       agentExecution: { updateMany: mocks.executionUpdateMany, findUnique: mocks.executionFindUnique },
+      applicationTask: { updateMany: mocks.applicationTaskUpdateMany },
     }));
     mocks.runScheduledTaskGraphAnalyzeOnly.mockResolvedValue(scheduledProof);
     mocks.buildScheduledTaskGraphGateResumeState.mockResolvedValue({ nextStage: "gate" });
@@ -156,6 +200,7 @@ describe("runAgentPipeline", () => {
     mocks.saveScheduledCheckpoint.mockResolvedValue(true);
     mocks.ownerFenceCheck.mockResolvedValue(true);
     mocks.gateProofCurrent.mockResolvedValue(true);
+    mocks.sourceValidation.mockResolvedValue(undefined);
     mocks.finishScheduledExecution.mockResolvedValue(true);
     mocks.record.mockResolvedValue({});
     mocks.activate.mockResolvedValue(true);
@@ -204,6 +249,91 @@ describe("runAgentPipeline", () => {
       assertCurrent: expect.any(Function),
     }));
   }, 30_000);
+
+  it("terminalizes a normal source-change execution before surfacing the dedicated error", async () => {
+    const { createAnalyzeSourceChangedErrorWithClaims } = await import("./stages/analyze-model-input")
+    const failure = createAnalyzeSourceChangedErrorWithClaims([{ jobId: "job_1", analysisFenceAt: "2026-10-19T12:00:00.123Z" }])
+    mocks.runPipeline.mockRejectedValueOnce(failure)
+    const { runAgentPipeline } = await import("./run-service")
+
+    await expect(runAgentPipeline({
+      userId: "user_1", sessionId: "session_1", autonomous: false,
+      aiConfig: { provider: "minimax", model: "MiniMax-M3", apiKey: "key" },
+    })).rejects.toBe(failure)
+
+    expect(mocks.executionUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: "failed", error: failure.message }),
+    }))
+    expect(mocks.finalize).toHaveBeenCalledWith({ status: "failed", report: null })
+    expect(mocks.createHistory).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "failed" }) }))
+  })
+
+  it("surfaces failed source-change compensation without reporting the execution as recovered", async () => {
+    const { createAnalyzeSourceChangedErrorWithClaims } = await import("./stages/analyze-model-input")
+    const failure = createAnalyzeSourceChangedErrorWithClaims([{ jobId: "job_1", analysisFenceAt: "2026-10-19T12:00:00.123Z" }])
+    mocks.runPipeline.mockRejectedValueOnce(failure)
+    mocks.applicationTaskUpdateMany.mockRejectedValueOnce(new Error("temporary database failure"))
+    const { runAgentPipeline } = await import("./run-service")
+
+    await expect(runAgentPipeline({ userId: "user_1", sessionId: "session_1", autonomous: false,
+      aiConfig: { provider: "minimax", model: "MiniMax-M3", apiKey: "key" } })).rejects.toMatchObject({
+        name: "AnalyzeSourceChangeCleanupError", message: "Analyze source-change cleanup failed.",
+      })
+
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledOnce()
+    expect(mocks.finalize).not.toHaveBeenCalled()
+    expect(mocks.createHistory).not.toHaveBeenCalled()
+  })
+
+  it("keeps cancellation during source-change compensation on the existing silent path", async () => {
+    const { createAnalyzeSourceChangedErrorWithClaims } = await import("./stages/analyze-model-input")
+    const { AgentExecutionCancelledError: CurrentCancellationError } = await import("./execution-control")
+    const failure = createAnalyzeSourceChangedErrorWithClaims([{ jobId: "job_1", analysisFenceAt: "2026-10-19T12:00:00.123Z" }])
+    mocks.runPipeline.mockRejectedValueOnce(failure)
+    mocks.applicationTaskUpdateMany.mockRejectedValueOnce(new CurrentCancellationError())
+    const { runAgentPipeline } = await import("./run-service")
+
+    await expect(runAgentPipeline({ userId: "user_1", sessionId: "session_1", autonomous: false,
+      aiConfig: { provider: "minimax", model: "MiniMax-M3", apiKey: "key" } })).resolves.toBeNull()
+
+    expect(mocks.finalize).not.toHaveBeenCalled()
+    expect(mocks.createHistory).not.toHaveBeenCalled()
+  })
+
+  it("passes scheduled source change to the route without preempting its atomic terminal CAS", async () => {
+    const { createAnalyzeSourceChangedErrorWithClaims } = await import("./stages/analyze-model-input")
+    const failure = createAnalyzeSourceChangedErrorWithClaims([{ jobId: "job_1", analysisFenceAt: "2026-10-19T12:00:00.123Z" }])
+    mocks.runScheduledTaskGraphAnalyzeOnly.mockRejectedValueOnce(failure)
+    const { runAgentPipeline } = await import("./run-service")
+    const continuationKey = scheduledTaskGraphContinuationKey(scheduledOwner, scheduledAttestation)
+    const initialState = { nextStage: "scout", scheduledTaskGraphClaim: {
+      schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key: continuationKey,
+      claimToken: scheduledClaimToken, owner: scheduledOwner,
+    } }
+
+    await expect(runAgentPipeline(scheduledRunInput(initialState))).rejects.toBe(failure)
+
+    expect(mocks.finishScheduledExecution).not.toHaveBeenCalled()
+    expect(mocks.executionUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.finalize).not.toHaveBeenCalled()
+    expect(mocks.createHistory).not.toHaveBeenCalled()
+  })
+
+  it("keeps true execution cancellation on the silent cancellation path", async () => {
+    const { AgentExecutionCancelledError: CurrentCancellationError } = await import("./execution-control")
+    mocks.runPipeline.mockRejectedValueOnce(new CurrentCancellationError())
+    const { runAgentPipeline } = await import("./run-service")
+
+    await expect(runAgentPipeline({
+      userId: "user_1", sessionId: "session_1", autonomous: false,
+      aiConfig: { provider: "minimax", model: "MiniMax-M3", apiKey: "key" },
+    })).resolves.toBeNull()
+
+    expect(mocks.executionUpdateMany).not.toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: "failed" }),
+    }))
+    expect(mocks.finalize).not.toHaveBeenCalledWith({ status: "failed", report: null })
+  })
 
   it("returns only the scheduled Analyze proof without running Prepare, Gate, or finalization", async () => {
     const { runAgentPipeline } = await import("./run-service");

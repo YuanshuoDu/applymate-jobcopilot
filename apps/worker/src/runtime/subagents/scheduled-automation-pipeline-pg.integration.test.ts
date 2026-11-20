@@ -123,8 +123,57 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       executionId: value.executionId, executionAttemptCount: 1,
     }
     const claimToken = `scheduled-analysis-claim-${randomUUID()}`
-    const jobIds = [value.jobId, `scheduled-pipeline-missing-${randomUUID()}`]
-    const jobs = jobIds.map(id => ({ id, userId: value.userId }))
+    const jobIds = [value.jobId, `scheduled-pipeline-unscored-${randomUUID()}`]
+    const jobFixtures = jobIds.map((id, index) => ({
+      id, userId: value.userId, company: index === 0 ? "Fixture Systems" : "Fixture Labs",
+      role: index === 0 ? "Software Engineer" : "Backend Engineer", location: "Dublin",
+      description: `Build reliable TypeScript services for scheduled Analyze fixture ${index + 1}.`, source: "fixture",
+      url: `https://jobs.example.invalid/scheduled-analysis/${index + 1}`,
+    }))
+    for (const job of jobFixtures) {
+      await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "url", "description", "source", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)`,
+      [job.id, job.userId, job.company, job.role, job.location, job.url, job.description, job.source])
+    }
+    const baseResumeId = `scheduled-analysis-resume-${value.turnId}`
+    const baseResumeContent = {
+      contact: { name: "Scheduled Fixture Candidate", email: "candidate@example.invalid", location: "Dublin" },
+      summary: "TypeScript engineer with experience building reliable services.",
+      experience: [{ company: "Fixture Systems", role: "Software Engineer", period: "2022-2026", bullets: ["Built TypeScript services."] }],
+      education: [], skills: ["TypeScript", "Node.js"],
+    }
+    await pool!.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "createdAt", "updatedAt")
+      VALUES ($1, $2, 'Scheduled Analyze Fixture Resume', $3::jsonb, 'base', 'manual', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [baseResumeId, value.userId, JSON.stringify(baseResumeContent)])
+    const sourceJobsResult = await pool!.query<{
+      id: string; userId: string; company: string; role: string; location: string | null
+      description: string | null; source: string | null; url: string | null
+    }>(`SELECT "id", "userId", "company", "role", "location", "description", "source", "url" FROM "Job"
+      WHERE "userId" = $1 AND "id" = ANY($2::text[])`, [value.userId, jobIds])
+    const sourceJobsById = new Map(sourceJobsResult.rows.map(job => [job.id, job]))
+    if (sourceJobsById.size !== jobIds.length) throw new Error("Scheduled Analyze fixture did not seed every candidate Job.")
+    const jobs = jobIds.map(id => {
+      const job = sourceJobsById.get(id)
+      if (!job) throw new Error("Scheduled Analyze fixture could not load a seeded Job source.")
+      return job
+    })
+    const sourceResumeResult = await pool!.query<{ id: string; content: unknown }>(
+      `SELECT "id", "content" FROM "Resume" WHERE "id" = $1 AND "userId" = $2 AND "isDefault" = true`,
+      [baseResumeId, value.userId])
+    const sourceResume = sourceResumeResult.rows[0]
+    if (!sourceResume) throw new Error("Scheduled Analyze fixture could not load its default Resume source.")
+    const analyzeSourceModulePath = "@/lib/agent/stages/analyze-model-input"
+    const analyzeSourceModule = await import(analyzeSourceModulePath) as unknown as {
+      createAnalyzeSourceFingerprint: (input: { userId: string; jobId: string
+        job: { company: string; role: string; location: string | null; description: string | null; source: string | null; url: string | null }
+        resumeId: string; resumeText: string }) => { version: string; digest: string }
+    }
+    const resumeTypesModulePath = "@/lib/agent/types"
+    const resumeTypesModule = await import(resumeTypesModulePath) as unknown as { resumeToText: (content: unknown) => string }
+    const resumeText = resumeTypesModule.resumeToText(sourceResume.content)
+    const sourceFingerprintsByJob = new Map(jobs.map(job => [job.id, analyzeSourceModule.createAnalyzeSourceFingerprint({
+      userId: job.userId, jobId: job.id, job, resumeId: sourceResume.id, resumeText,
+    })]))
     const snapshot = { schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
       targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], minScore: 70,
       dailyCap: 10, requireApproval: true, autoApply: false }
@@ -166,7 +215,8 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         ...actual,
         runAnalyze: async (pending: Array<{ id: string; userId: string }>, _ctx: unknown,
           recovery?: { existingScoredJobs?: Array<{ job: { id: string }; score: number; matchedKeywords: string[]; missingKeywords: string[]; recommendation: string; analysisFenceAt: string }>; initialFailed?: number;
-            beforeScore?: (jobId: string) => Promise<void>; onScoredJob?: (row: { job: { id: string }; score: number; matchedKeywords: string[]; missingKeywords: string[]; recommendation: string; analysisFenceAt: string }) => Promise<void> }) => {
+            beforeScore?: (jobId: string) => Promise<void>; onScoredJob?: (row: { job: { id: string }; score: number; matchedKeywords: string[]; missingKeywords: string[]; recommendation: string; analysisFenceAt: string },
+              tx: unknown, sourceFingerprint: { version: string; digest: string }) => Promise<void> }) => {
           pendingCalls.push(pending.map(job => job.id))
           const scoredJobs = [...(recovery?.existingScoredJobs ?? [])]
           for (const job of pending) {
@@ -174,7 +224,9 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
             await recovery?.beforeScore?.(job.id)
             const scored = { job, score: job.id === jobIds[0] ? 82 : 74, matchedKeywords: ["TypeScript"],
               missingKeywords: ["AWS"], recommendation: "Apply after tailoring.", analysisFenceAt: new Date().toISOString() }
-            await recovery?.onScoredJob?.(scored)
+            const sourceFingerprint = sourceFingerprintsByJob.get(job.id)
+            if (!sourceFingerprint) throw new Error("Scheduled Analyze fixture omitted a source fingerprint.")
+            await recovery?.onScoredJob?.(scored, undefined, sourceFingerprint)
             scoredJobs.push(scored)
             if (crashAfterFirstScore) { crashAfterFirstScore = false; throw new Error("simulated worker restart") }
           }
@@ -780,6 +832,29 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     await pool!.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "createdAt", "updatedAt")
       VALUES ($1, $2, 'Fixture Base Resume', $3::jsonb, 'base', 'manual', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
     [baseResumeId, value.userId, JSON.stringify(baseResumeContent)])
+    const analyzeJobResult = await pool!.query<{
+      id: string; userId: string; company: string; role: string; location: string | null;
+      description: string | null; source: string | null; url: string | null;
+    }>(`SELECT "id", "userId", "company", "role", "location", "description", "source", "url"
+      FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [value.jobId, value.userId])
+    const analyzeJob = analyzeJobResult.rows[0]
+    if (!analyzeJob) throw new Error("Scheduled Prepare fixture could not load its Job source.")
+    const analyzeResumeResult = await pool!.query<{ id: string; content: unknown }>(`SELECT "id", "content" FROM "Resume"
+      WHERE "id" = $1 AND "userId" = $2 AND "isDefault" = true`, [baseResumeId, value.userId])
+    const analyzeResume = analyzeResumeResult.rows[0]
+    if (!analyzeResume) throw new Error("Scheduled Prepare fixture could not load its default Resume source.")
+    const analyzeSourceModulePath = "@/lib/agent/stages/analyze-model-input"
+    const analyzeSourceModule = await import(analyzeSourceModulePath) as unknown as {
+      createAnalyzeSourceFingerprint: (input: { userId: string; jobId: string;
+        job: { company: string; role: string; location: string | null; description: string | null; source: string | null; url: string | null };
+        resumeId: string; resumeText: string }) => { version: string; digest: string }
+    }
+    const resumeTypesModulePath = "@/lib/agent/types"
+    const resumeTypesModule = await import(resumeTypesModulePath) as unknown as { resumeToText: (content: unknown) => string }
+    const analyzeSourceFingerprint = analyzeSourceModule.createAnalyzeSourceFingerprint({
+      userId: analyzeJob.userId, jobId: analyzeJob.id, job: analyzeJob, resumeId: analyzeResume.id,
+      resumeText: resumeTypesModule.resumeToText(analyzeResume.content),
+    })
     await persistToolReceipt(pool!, value, value.scoutTaskId, "scout-step", "jobs.discover", "discover-call", {
       query: "Software Engineer Dublin",
     }, discoveryOutput(value), 1)
@@ -954,6 +1029,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
           owner: claimOwner, snapshotDigest: result.attestation.snapshotDigest, graphRevision: result.attestation.graphRevision,
           evidenceDigest: result.attestation.evidenceDigest },
         scoutedJobs: [jobRecord],
+        scheduledTaskGraphAnalyzeSourceFingerprints: { [analyzeJob.id]: analyzeSourceFingerprint },
         scoredJobs: [{ job: { ...jobRecord, coverLetter: null }, score: 82, matchedKeywords: ["TypeScript"],
           missingKeywords: ["PostgreSQL"], recommendation: "Apply after tailoring.", analysisFenceAt: new Date().toISOString() }],
         analysisFailed: 0,
@@ -1137,7 +1213,11 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         if (priorWorkerSecret === undefined) delete process.env.AGENT_WORKER_SECRET
         else process.env.AGENT_WORKER_SECRET = priorWorkerSecret
       }
-      expect(reboundHandoff.status).toBe("analyze_checkpointed")
+      const handoffDiagnostic = reboundHandoff.status === "blocked"
+        ? `blocked:${reboundHandoff.errorCode}` : `status:${reboundHandoff.status}`
+      expect(reboundHandoff.status,
+        `Scheduled route handoff ${handoffDiagnostic}; routePipelineCalls=${routePipelineCalls.length}`)
+        .toBe("analyze_checkpointed")
       if (reboundHandoff.status !== "analyze_checkpointed") throw new Error("Scheduled route did not return a rebound Analyze proof")
       expect(routePipelineCalls).toHaveLength(1)
       expect(routePipelineCalls[0]).toMatchObject({ owner: resumedOwner, continuationKey })

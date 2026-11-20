@@ -21,6 +21,7 @@ import { reportJobApiJobs, trackedJobApiFetch } from '@/lib/api-usage/job-api-us
 import { getRuntimeAtsPolicy } from '@/lib/runtime-ats-policy'
 import { detectAtsSource } from '@jobcopilot/shared/ats-url'
 import { fetchExternalText } from '@/lib/safe-outbound-url'
+import { writeEnrichmentSourceMaterial } from '@/lib/agent/enrichment-source-write'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -53,8 +54,8 @@ export async function POST(_req: NextRequest, { params }: Params) {
   if (isErrorResponse(auth)) return auth
 
   const { id } = await params
-  const job = await db.job.findUnique({ where: { id } })
-  if (!job || job.userId !== auth.userId) return err('Not found', 404)
+  const job = await db.job.findFirst({ where: { id, userId: auth.userId } })
+  if (!job) return err('Not found', 404)
 
   const { rapidapiKey: rapidKey, rapidapiSource } = await getDiscoveryApiAccess(auth.userId)
   const rapidOwner = rapidapiSource === 'user' ? 'user' : 'platform'
@@ -212,24 +213,18 @@ export async function POST(_req: NextRequest, { params }: Params) {
     } catch { /* non-fatal */ }
   }
 
-  // ── Persist enrichment to DB ──────────────────────────────────────────────
-  const updateData: Record<string, unknown> = {}
-  if (result.description && !job.description) updateData.description = result.description
-  if (result.salary      && !job.salary)      updateData.salary      = result.salary
-  if (result.logo        && !job.logo)        updateData.logo        = result.logo
-  if (result.hiringManager || result.salaryContext) {
-    updateData.analysisNote = JSON.stringify({
+  // Keep all network work above the source fence; only the CAS writes hold its lock.
+  const enrichedJob = await db.$transaction(tx => writeEnrichmentSourceMaterial(tx, job, {
+    description: result.description,
+    salary: result.salary,
+    logo: result.logo,
+    analysisNote: result.hiringManager || result.salaryContext ? JSON.stringify({
       hiringManager: result.hiringManager ?? null,
       salaryContext: result.salaryContext ?? null,
       enrichedAt:    new Date().toISOString(),
-    })
-  }
-
-  if (Object.keys(updateData).length > 0) {
-    await db.job.update({ where: { id }, data: updateData })
-  }
-
-  const enrichedJob = await db.job.findUnique({ where: { id } })
+    }) : undefined,
+  }))
+  if (!enrichedJob) return err('Not found', 404)
 
   return ok({
     job:         enrichedJob,

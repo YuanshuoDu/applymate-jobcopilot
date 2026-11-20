@@ -307,12 +307,6 @@ describe("Web approval receipt store", () => {
       return lookupCount <= 2 ? null : stored
     })
     tx.applicationTask.findFirst.mockResolvedValue({ id: "review_task_1" })
-    mockApprovalCreate(tx, async ({ data }) => {
-      if (stored) throw Object.assign(new Error("duplicate approval id"), { code: "P2002" })
-      const created = { ...rowTemplate, ...data, status: "pending", decidedAt: null, consumedAt: null } as ApprovalRow
-      stored = created
-      return created
-    })
 
     let pendingMaterialsReady = 0
     let committedMaterialsReady = 0
@@ -322,11 +316,15 @@ describe("Web approval receipt store", () => {
       pendingMaterialsReady += 1
       return data
     })
+    let transactionQueryBase = 0
+    let transactionLookupBase = 0
     const transaction = db.$transaction as unknown as {
       mockImplementation: (implementation: (work: (value: typeof tx) => Promise<unknown>) => Promise<unknown>) => void
     }
     transaction.mockImplementation(async work => {
       const before = pendingMaterialsReady
+      transactionQueryBase = tx.$queryRaw.mock.calls.length
+      transactionLookupBase = tx.agentApproval.findFirst.mock.calls.length
       try {
         const result = await work(tx)
         committedMaterialsReady += pendingMaterialsReady - before
@@ -347,7 +345,31 @@ describe("Web approval receipt store", () => {
     })
     const ownerCheck = vi.fn(async () => true)
     const ownerFence = { ...gateReplayInput(scope).scheduledOwnerFence, assertCurrent: ownerCheck }
-    const issue = gateReplayInput(scope, prepare, ownerFence)
+    const hookOrder: string[] = []
+    const scheduledSourceHooks = {
+      acquireFence: vi.fn(async (transactionClient: Prisma.TransactionClient, userId: string) => {
+        hookOrder.push("fence")
+        expect(transactionClient).toBe(tx)
+        expect(userId).toBe(scope.userId)
+        expect(tx.$queryRaw).toHaveBeenCalledTimes(transactionQueryBase)
+        expect(tx.agentApproval.findFirst).toHaveBeenCalledTimes(transactionLookupBase)
+      }),
+      validateFinalSource: vi.fn(async (transactionClient: Prisma.TransactionClient, validatedScope: ApprovalScopeInput) => {
+        hookOrder.push("validate")
+        expect(transactionClient).toBe(tx)
+        expect(validatedScope).toEqual(scope)
+        expect(tx.$queryRaw.mock.calls.length).toBeGreaterThan(transactionQueryBase)
+        expect(ownerCheck).toHaveBeenCalled()
+      }),
+    }
+    mockApprovalCreate(tx, async ({ data }) => {
+      hookOrder.push("create")
+      if (stored) throw Object.assign(new Error("duplicate approval id"), { code: "P2002" })
+      const created = { ...rowTemplate, ...data, status: "pending", decidedAt: null, consumedAt: null } as ApprovalRow
+      stored = created
+      return created
+    })
+    const issue = { ...gateReplayInput(scope, prepare, ownerFence), scheduledSourceHooks }
     const issued = await issueApprovalReceipt(db, issue)
     const replayed = await issueApprovalReceipt(db, issue)
 
@@ -357,10 +379,112 @@ describe("Web approval receipt store", () => {
     expect(materialEventAttempts).toBe(2)
     expect(committedMaterialsReady).toBe(1)
     expect(ownerCheck).toHaveBeenCalledTimes(3)
+    expect(scheduledSourceHooks.acquireFence).toHaveBeenCalledTimes(3)
+    expect(scheduledSourceHooks.validateFinalSource).toHaveBeenCalledTimes(3)
+    expect(hookOrder).toEqual(["fence", "validate", "create", "fence", "validate", "create", "fence", "validate"])
     expect(tx.agentApproval.create).toHaveBeenCalledTimes(2)
     expect(tx.agentItem.create).toHaveBeenCalledOnce()
     expect(tx.agentEvent.create.mock.calls.length).toBe(2)
     expect(tx.agentApproval.updateMany).not.toHaveBeenCalled()
+  })
+
+  it("acquires the source fence before owner locks and rolls back when final validation fails", async () => {
+    const row = await approvalRow()
+    const { db, tx } = mockDb(row)
+    const validationError = Object.assign(new Error("source validation failed"), { code: "P2002" })
+    let rollbackCount = 0
+    let pendingPreparationWrites = 0
+    let committedPreparationWrites = 0
+    tx.applicationTaskEvent.create.mockImplementation(async ({ data }) => {
+      pendingPreparationWrites += 1
+      return data
+    })
+    const transaction = db.$transaction as unknown as {
+      mockImplementation: (implementation: (work: (value: typeof tx) => Promise<unknown>) => Promise<unknown>) => void
+    }
+    transaction.mockImplementation(async work => {
+      const before = pendingPreparationWrites
+      try {
+        const result = await work(tx)
+        committedPreparationWrites += pendingPreparationWrites - before
+        return result
+      } catch (error) {
+        pendingPreparationWrites = before
+        rollbackCount += 1
+        throw error
+      }
+    })
+    const scheduledSourceHooks = {
+      acquireFence: vi.fn(async (transactionClient: Prisma.TransactionClient, userId: string) => {
+        expect(transactionClient).toBe(tx)
+        expect(userId).toBe(scopeInput.userId)
+        expect(tx.$queryRaw).not.toHaveBeenCalled()
+      }),
+      validateFinalSource: vi.fn(async (transactionClient: Prisma.TransactionClient, scope: ApprovalScopeInput) => {
+        expect(transactionClient).toBe(tx)
+        expect(scope).toEqual(scopeInput)
+        expect(tx.$queryRaw).toHaveBeenCalled()
+        throw validationError
+      }),
+    }
+    const prepareInTransaction = vi.fn(async (transactionClient: Prisma.TransactionClient) => {
+      await (transactionClient as unknown as typeof tx).applicationTaskEvent.create({ data: { type: "materials_ready" } })
+      return { scope: scopeInput, taskId: "task_1", payload: { jobId: scopeInput.jobId } }
+    })
+
+    await expect(issueApprovalReceipt(db, {
+      scope: scopeInput,
+      approvalId: "scheduled_approval_1",
+      nonce: "nonce_1",
+      title: "Submit",
+      body: "Review",
+      payload: { jobId: scopeInput.jobId },
+      prepareInTransaction,
+      projectWait: false,
+      scheduledSourceHooks,
+    })).rejects.toBe(validationError)
+
+    expect(rollbackCount).toBe(1)
+    expect(db.$transaction).toHaveBeenCalledOnce()
+    expect(scheduledSourceHooks.acquireFence).toHaveBeenCalledOnce()
+    expect(scheduledSourceHooks.validateFinalSource).toHaveBeenCalledOnce()
+    expect(prepareInTransaction).toHaveBeenCalledOnce()
+    expect(tx.applicationTaskEvent.create).toHaveBeenCalledOnce()
+    expect(pendingPreparationWrites).toBe(0)
+    expect(committedPreparationWrites).toBe(0)
+    expect(tx.agentApproval.create).not.toHaveBeenCalled()
+  })
+
+  it("rolls back and skips owner replay when source-fence acquisition fails", async () => {
+    const scope = gateReplayScope()
+    const { db, tx } = mockDb(await gateReplayRow(scope))
+    const fenceError = Object.assign(new Error("source fence failed"), { code: "P2002" })
+    let rollbackCount = 0
+    const transaction = db.$transaction as unknown as {
+      mockImplementation: (implementation: (work: (value: typeof tx) => Promise<unknown>) => Promise<unknown>) => void
+    }
+    transaction.mockImplementation(async work => {
+      try {
+        return await work(tx)
+      } catch (error) {
+        rollbackCount += 1
+        throw error
+      }
+    })
+    const scheduledSourceHooks = {
+      acquireFence: vi.fn(async () => { throw fenceError }),
+      validateFinalSource: vi.fn(async () => undefined),
+    }
+
+    await expect(issueApprovalReceipt(db, { ...gateReplayInput(scope), scheduledSourceHooks })).rejects.toBe(fenceError)
+
+    expect(db.$transaction).toHaveBeenCalledOnce()
+    expect(rollbackCount).toBe(1)
+    expect(scheduledSourceHooks.acquireFence).toHaveBeenCalledOnce()
+    expect(scheduledSourceHooks.validateFinalSource).not.toHaveBeenCalled()
+    expect(tx.$queryRaw).not.toHaveBeenCalled()
+    expect(tx.agentApproval.findFirst).not.toHaveBeenCalled()
+    expect(tx.agentApproval.create).not.toHaveBeenCalled()
   })
 
   it("preserves approved Gate replay state and rejects expired, rejected, consumed, or mismatched rows", async () => {
@@ -371,8 +495,32 @@ describe("Web approval receipt store", () => {
     const approvedDb = mockDb(approvedRow)
     approvedDb.tx.agentApproval.findFirst.mockResolvedValue(approvedRow)
     approvedDb.tx.applicationTask.findFirst.mockResolvedValue({ id: "review_task_1" })
-    const approved = await issueApprovalReceipt(approvedDb.db, gateReplayInput(currentScope))
+    const replayOrder: string[] = []
+    const replayOwnerCheck = vi.fn(async () => true)
+    const scheduledSourceHooks = {
+      acquireFence: vi.fn(async (transactionClient: Prisma.TransactionClient, userId: string) => {
+        replayOrder.push("fence")
+        expect(transactionClient).toBe(approvedDb.tx)
+        expect(userId).toBe(currentScope.userId)
+        expect(approvedDb.tx.$queryRaw).not.toHaveBeenCalled()
+      }),
+      validateFinalSource: vi.fn(async (transactionClient: Prisma.TransactionClient, scope: ApprovalScopeInput) => {
+        replayOrder.push("validate")
+        expect(transactionClient).toBe(approvedDb.tx)
+        expect(scope).toEqual(currentScope)
+        expect(approvedDb.tx.$queryRaw).toHaveBeenCalled()
+        expect(replayOwnerCheck).toHaveBeenCalledOnce()
+      }),
+    }
+    const scheduledOwnerFence = { ...gateReplayInput(currentScope).scheduledOwnerFence, assertCurrent: replayOwnerCheck }
+    const approved = await issueApprovalReceipt(approvedDb.db, {
+      ...gateReplayInput(currentScope, undefined, scheduledOwnerFence),
+      scheduledSourceHooks,
+    })
     expect(approved.approval).toMatchObject({ status: "approved", scope: { revision: 3, expiresAt: timeAt(60).toISOString() } })
+    expect(replayOrder).toEqual(["fence", "validate"])
+    expect(scheduledSourceHooks.acquireFence).toHaveBeenCalledOnce()
+    expect(scheduledSourceHooks.validateFinalSource).toHaveBeenCalledOnce()
     expect(approvedDb.tx.agentApproval.create).not.toHaveBeenCalled()
     expect(approvedDb.tx.agentApproval.updateMany).not.toHaveBeenCalled()
 
