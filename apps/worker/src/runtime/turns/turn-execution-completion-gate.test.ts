@@ -53,6 +53,7 @@ import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY } from "./completion-recovery-context.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
+import { buildGroundedTaskGraphFinalResponse } from "../subagents/task-graph-final-response.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA } from "./task-graph-terminal-assessment.js"
 import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
@@ -1073,10 +1074,20 @@ describe("TaskGraph terminal verification gate", () => {
       { id: rejected.taskId, status: "failed", role: "scout", failureReason: "task_graph_repair_target_unresolved", result: { structuredResult: structuredResult("passed"), taskGraphVerificationReport: rejectedReport } },
       { id: repair.taskId, status: "completed", role: "scout", failureReason: null, result: { ...storedResult("passed"), taskGraphRepairReceipt: receipt } },
     ]
-    await expect(checkTaskGraphTerminalVerification(graphClient([target, rejected, repair], tasks), graphLease, "root-1")).resolves.toMatchObject({ ok: true })
+    const accepted = await checkTaskGraphTerminalVerification(graphClient([target, rejected, repair], tasks), graphLease, "root-1")
+    expect(accepted).toMatchObject({ ok: true })
+    if (!accepted.ok) return
+    const binding = accepted[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+    expect(binding?.resolvedRepairTaskIds).toEqual(["task-repair-first", "task-scout"])
+    const finalResponse = buildGroundedTaskGraphFinalResponse(binding!)
+    expect(finalResponse).toContain("Search results: 1 unique job reported (partial coverage).")
+    expect(finalResponse).toContain("Search: 2 failed tasks; valid structured result reported completed. Verified repair evidence covers the affected criteria.")
+    expect(finalResponse).not.toContain("Inspect the reported Search task outcome.")
+    expect(finalResponse).not.toContain("task-repair-first")
     const unresolved = await checkTaskGraphTerminalVerification(graphClient([target, rejected], tasks.slice(0, 2)), graphLease, "root-1")
     expect(unresolved).toMatchObject({ ok: false })
     if (unresolved.ok) return
+    expect(Reflect.get(unresolved, TASK_GRAPH_FINAL_SUMMARY_BINDING)).toBeUndefined()
     expect(unresolved.feedback).toContain("nodeOrdinal=2 status=unverified reasonCode=repair_target_unresolved")
     const rejectedResult = tasks[1]!.result as Record<string, unknown>
     const forged = [{ ...tasks[0] }, { ...tasks[1], result: { ...rejectedResult, taskGraphRepairReceipt: { ...receipt, targetTaskId: "foreign" } } }, tasks[2]!]

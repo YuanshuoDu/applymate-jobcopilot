@@ -3,6 +3,7 @@ import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
 import {
   buildTaskGraphFinalSummaryBinding,
+  readResolvedRepairTaskIds,
   sameTaskGraphFinalSummaryBinding,
   TASK_GRAPH_FINAL_SUMMARY_BINDING,
 } from "./task-graph-final-summary-binding.js"
@@ -28,6 +29,9 @@ const analystResult = (jobId: string) => ({
 function row(id: string, role: string, taskType: string, result: unknown, attemptCount?: number): GraphTaskRow {
   return { id, role, taskType, status: "completed", failureReason: null, result,
     ...(attemptCount === undefined ? {} : { attemptCount }) }
+}
+function failedRow(id: string, role: string, taskType: string): GraphTaskRow {
+  return { ...row(id, role, taskType, null), status: "failed", failureReason: "task_graph_verification_failed" }
 }
 
 function graph(revision: number, nodeIds: readonly string[], rows: readonly GraphTaskRow[], stateRevision = revision): LoadedGraph {
@@ -166,6 +170,24 @@ describe("current TaskGraph final-summary binding", () => {
     expect(reordered.summary).toEqual(first.summary)
     expect(sameTaskGraphFinalSummaryBinding(first, changedControl)).toBe(false)
     expect(sameTaskGraphFinalSummaryBinding(first, reordered)).toBe(false)
+  })
+
+  it("normalizes resolution metadata to current failed business members and binds it for freshness", () => {
+    const loaded = graph(4, ["failed-scout", "completed-scout", "control"], [
+      failedRow("failed-scout", "scout", "research"),
+      row("completed-scout", "scout", "research", { structuredResult: scoutResult("job-a") }),
+      row("control", "auditor", "native_verification", {}),
+    ])
+    const resolved = buildTaskGraphFinalSummaryBinding(loaded, undefined, new Set(["missing", "control", "completed-scout", "failed-scout"]))!
+    const unresolved = buildTaskGraphFinalSummaryBinding(loaded)!
+    const stale = { ...resolved, members: resolved.members?.map(member => member.taskId === "failed-scout"
+      ? { ...member, taskStatus: "completed" as const } : member) }
+
+    expect(resolved.resolvedRepairTaskIds).toEqual(["failed-scout"])
+    expect(readResolvedRepairTaskIds(resolved)).toEqual(new Set(["failed-scout"]))
+    expect(readResolvedRepairTaskIds(stale)).toEqual(new Set())
+    expect(sameTaskGraphFinalSummaryBinding(resolved, unresolved)).toBe(false)
+    expect(sameTaskGraphFinalSummaryBinding(resolved, stale)).toBe(false)
   })
 
   it("binds Prepare results to the persisted task attempt", () => {
