@@ -4470,15 +4470,20 @@ async function checkTerminalTaskGraph(pool: Pool, lease: TurnLease, rootTaskId: 
   }
 }
 
-async function currentGroundedTaskGraphResponse(pool: Pool, owner: Fixture, rootTaskId: string): Promise<string> {
+async function currentGroundedTaskGraphResponse(
+  pool: Pool, owner: Fixture, rootTaskId: string, resolvedRepairTaskIds: readonly string[] = [],
+): Promise<string> {
   const client = await pool.connect()
   try {
     await client.query("BEGIN READ ONLY")
     await client.query("SELECT set_config('app.user_id', $1, true)", [owner.userId])
-    const binding = buildTaskGraphFinalSummaryBinding(await loadTaskGraph(client, {
+    const loaded = await loadTaskGraph(client, {
       userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId, parentTaskId: rootTaskId,
-    }, false))
+    }, false)
+    const expectedRepairs = [...resolvedRepairTaskIds].sort()
+    const binding = buildTaskGraphFinalSummaryBinding(loaded, undefined, expectedRepairs.length ? new Set(expectedRepairs) : undefined)
     if (!binding) throw new Error("Current TaskGraph did not produce its final-summary binding")
+    expect(binding.resolvedRepairTaskIds ?? []).toEqual(expectedRepairs)
     return buildGroundedTaskGraphFinalResponse(binding)
   } finally {
     await client.query("ROLLBACK").catch(() => undefined)
@@ -4488,8 +4493,9 @@ async function currentGroundedTaskGraphResponse(pool: Pool, owner: Fixture, root
 
 async function expectGroundedTaskGraphFinalCopies(
   pool: Pool, owner: Fixture, rootTaskId: string, finalResponse: RecordValue, rawCandidate: string,
+  resolvedRepairTaskIds: readonly string[] = [],
 ): Promise<void> {
-  const expected = await currentGroundedTaskGraphResponse(pool, owner, rootTaskId)
+  const expected = await currentGroundedTaskGraphResponse(pool, owner, rootTaskId, resolvedRepairTaskIds)
   expect(finalResponse.response).toBe(expected)
   expect(finalResponse.response).not.toContain(rawCandidate)
   const finalItems = await pool.query<{ content: unknown }>(`SELECT "content" FROM "agent_items"
@@ -10386,7 +10392,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(resumedGraphReachedModel).toBe(true)
     expect(followUpGraphReachedModel).toBe(true)
     const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue
-    await expectGroundedTaskGraphFinalCopies(pool!, owner, rootTaskId!, finalResponse, FINAL_MARKER)
+    const repairTarget = largeSourceRepairTarget.current
+    if (!repairTarget) throw new Error("Final assertions lost the oversized source repair target identity")
+    await expectGroundedTaskGraphFinalCopies(pool!, owner, rootTaskId!, finalResponse, FINAL_MARKER, [repairTarget.taskId])
 
     const children = await pool!.query<{ id: string; goal: string; status: string; result: RecordValue | null; context: RecordValue; role: string; failureReason: string | null }>(
       `SELECT "id", "goal", "status", "result", "context", "role", "failureReason" FROM "sub_agent_tasks"
@@ -10413,8 +10421,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       summary: LARGE_SOURCE_REPAIR_GOAL,
       evidence: [{ id: "read:job:fixture-job-1", kind: "job", ref: "fixture-job-1", source: "fixture" }],
     })
-    const repairTarget = largeSourceRepairTarget.current
-    if (!repairTarget) throw new Error("Final assertions lost the oversized source repair target identity")
     expect(record(childByGoal.get(LARGE_SOURCE_REPAIR_GOAL)?.result)?.taskGraphRepairReceipt).toMatchObject({
       graphRootTaskId: repairTarget.graphRootTaskId,
       targetNodeKey: "large-source", targetTaskId: repairTarget.taskId,
@@ -15958,7 +15964,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const rootTaskId = turn.rows[0]?.rootTaskId
     expect(rootTaskId).toBeTruthy()
     if (!rootTaskId) throw new Error("Completed interactive shortlist lost its root TaskGraph identity")
-    await expectGroundedTaskGraphFinalCopies(pool!, value, rootTaskId, finalResponse, "The verified shortlist is ready")
+    const repairTargetTaskId = initialPlanTaskIds?.[0]
+    if (!repairTargetTaskId) throw new Error("Completed repair lost its original Scout identity")
+    await expectGroundedTaskGraphFinalCopies(pool!, value, rootTaskId, finalResponse, "The verified shortlist is ready", [repairTargetTaskId])
     const rejection = await pool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'final.rejected' AND "payload"->>'blocker' = 'task_graph_verification_unverified'`, [value.turnId, value.sessionId])
     expect(rejection.rowCount).toBeGreaterThan(0)
     const tasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown; context: unknown }>(`SELECT "id", "goal", "status", "failureReason", "result", "context" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3`, [value.turnId, value.sessionId, rootTaskId])
@@ -16435,6 +16443,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await expectGroundedTaskGraphFinalCopies(
       pool!, value, rootTaskId, finalResponse,
       "The declared cohort coverage was verified after repair",
+      [targetTaskId],
     )
     const tasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown }>(
       `SELECT "id", "goal", "status", "failureReason", "result" FROM "sub_agent_tasks"
@@ -18346,7 +18355,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(finalTurn.rows[0]?.rootTaskId).toBe(rootTaskId)
     const finalResponse = JSON.parse(finalTurn.rows[0]?.finalResponse ?? "null") as RecordValue
     await expectGroundedTaskGraphFinalCopies(
-      pool!, value, rootTaskId, finalResponse, "Lease recovery repair unlocked the original dependent",
+      pool!, value, rootTaskId, finalResponse, "Lease recovery repair unlocked the original dependent", [targetTaskId],
     )
     const completedTasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown }>(
       "SELECT \"id\", \"goal\", \"status\", \"failureReason\", \"result\" FROM \"sub_agent_tasks\" WHERE \"turnId\" = $1 AND \"sessionId\" = $2 AND \"parentTaskId\" = $3",
