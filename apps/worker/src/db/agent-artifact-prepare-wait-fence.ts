@@ -94,18 +94,28 @@ async function scheduledPrepareDependencyWaitIsCurrent(client: QueryClient, fenc
   try { nodeIds = parseIds(fence.parseTaskGraphSnapshot(graphRows.rows[0]?.content).nodes.map(node => node.taskId)) } catch { return false }
   if (!nodeIds) return false
   const waits = await client.query<Row>(
-    `SELECT wait."targetTaskIds", wait."mode", wait."status", wait."suspendedAt", wait."consumedAt", wait."result",
+    `SELECT root."result" AS "rootResult", wait."id", wait."targetTaskIds", wait."mode", wait."status",
+        wait."suspendedAt", wait."resolvedAt", wait."consumedAt", wait."result",
         step."taskId" AS "stepTaskId", step."status" AS "stepStatus", step."attempt", step."ordinal",
         (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."sessionId" = step."sessionId"
           AND current."turnId" = step."turnId" AND current."taskId" = step."taskId" AND current."attempt" = step."attempt") AS "latestOrdinal"
-      FROM "agent_wait_conditions" AS wait JOIN "agent_steps" AS step ON step."id" = wait."stepId"
+      FROM "agent_wait_conditions" AS wait
+      JOIN "sub_agent_tasks" AS root ON root."id" = wait."parentTaskId"
+        AND root."sessionId" = wait."sessionId" AND root."turnId" = wait."turnId"
+        AND root."rootTaskId" = root."id" AND root."parentTaskId" IS NULL AND root."status" = 'waiting'
+      JOIN "agent_steps" AS step ON step."id" = wait."stepId"
         AND step."sessionId" = wait."sessionId" AND step."turnId" = wait."turnId"
       WHERE wait."userId" = $1 AND wait."sessionId" = $2 AND wait."turnId" = $3 AND wait."parentTaskId" = $4
         AND wait."consumedAt" IS NULL
       ORDER BY wait."createdAt" DESC, wait."id" DESC LIMIT 2 FOR UPDATE OF wait, step`,
     [fence.userId, fence.sessionId, fence.turnId, fence.rootTaskId],
   )
-  if (waits.rows.length !== 1 || !validWait(waits.rows[0], fence)) return false
+  if (waits.rows.length !== 1) return false
+  const rootResult = object(waits.rows[0]?.rootResult)
+  if (!rootResult || !exactKeys(rootResult, "finalItemId,status,stepCount,toolCallCount,waitId")
+    || rootResult.status !== "waiting_for_dependency" || rootResult.finalItemId !== null
+    || !validCount(rootResult.stepCount) || !validCount(rootResult.toolCallCount) || !validText(rootResult.waitId)
+    || !validWait(waits.rows[0], fence, rootResult.waitId)) return false
   const tasks = await client.query<Row>(
     `SELECT task."id", task."status" FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
       WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
@@ -121,8 +131,9 @@ async function scheduledPrepareDependencyWaitIsCurrent(client: QueryClient, fenc
   return sameIds(targets, pending)
 }
 
-function validWait(row: Row | undefined, fence: AgentArtifactTaskFence): boolean {
-  if (!row || row.status !== "waiting" || row.mode !== "all" || row.suspendedAt == null || row.consumedAt !== null
+function validWait(row: Row | undefined, fence: AgentArtifactTaskFence, rootWaitId: string): boolean {
+  if (!row || row.id !== rootWaitId || row.status !== "waiting" || row.mode !== "all" || row.suspendedAt == null
+    || row.resolvedAt !== null || row.consumedAt !== null
     || (row.stepTaskId !== null && row.stepTaskId !== fence.rootTaskId) || row.stepStatus !== "waiting_for_tool"
     || !positive(Number(row.attempt)) || Number(row.attempt) !== fence.rootAttemptCount
     || !positive(Number(row.ordinal)) || Number(row.ordinal) !== Number(row.latestOrdinal)) return false
@@ -151,3 +162,4 @@ function sameIds(left: readonly string[], right: readonly string[]): boolean {
 }
 function validText(value: unknown): value is string { return typeof value === "string" && value.trim().length > 0 }
 function positive(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
+function validCount(value: unknown): boolean { return Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 2_147_483_647 }

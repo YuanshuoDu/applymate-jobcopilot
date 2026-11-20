@@ -11,15 +11,16 @@ const graph = { schemaVersion: "agent-harness.v2.task-graph", nodes: [
   { key: "prepare", taskId: "prepare-1", templateId: "fixture", depth: 1, goal: "Prepare", dependsOn: [],
     successCriteria: ["Prepare"], verificationDisposition: "legacy_unverified" },
 ] }
+const validRootResult = { status: "waiting_for_dependency", stepCount: 4, toolCallCount: 2, finalItemId: null, waitId: "wait-1" }
 const validWait = {
-  targetTaskIds: ["prepare-1"], mode: "all", status: "waiting", suspendedAt: new Date(), consumedAt: null,
+  id: "wait-1", targetTaskIds: ["prepare-1"], mode: "all", status: "waiting", suspendedAt: new Date(), resolvedAt: null, consumedAt: null,
   result: { request: { mode: "all", targetTaskIds: ["prepare-1"], timeoutMs: 60_000 } },
   stepTaskId: "root-1", stepStatus: "waiting_for_tool", attempt: 3, ordinal: 5, latestOrdinal: 5,
 }
 const parseSnapshot = vi.fn(parseTaskGraphSnapshot)
 const fence: AgentArtifactTaskFence = { ...baseFence, taskGraphItemId: "canonical-graph-item", parseTaskGraphSnapshot: parseSnapshot }
 
-function client(options: { turnStatus?: string; turnLeaseVersion?: number; rootAttemptCount?: number;
+function client(options: { turnStatus?: string; turnLeaseVersion?: number; rootAttemptCount?: number; rootResult?: unknown;
   waits?: readonly Record<string, unknown>[]; tasks?: readonly Record<string, unknown>[]; taskLive?: boolean; graphContent?: unknown } = {}) {
   const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
   const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
@@ -30,7 +31,10 @@ function client(options: { turnStatus?: string; turnLeaseVersion?: number; rootA
         sessionStatus: "running", rootAttemptCount: options.rootAttemptCount ?? 3 }] }
     }
     if (sql.includes('FROM "agent_items" AS item')) return { rows: [{ content: options.graphContent ?? graph }] }
-    if (sql.includes('FROM "agent_wait_conditions" AS wait')) return { rows: [...(options.waits ?? [validWait])] }
+    if (sql.includes('FROM "agent_wait_conditions" AS wait')) {
+      const waitRows = options.waits ?? [validWait]
+      return { rows: waitRows.map(wait => ({ ...wait, rootResult: options.rootResult ?? validRootResult })) }
+    }
     if (sql.includes("task.\"id\" = ANY($1::text[])")) return { rows: [...(options.tasks ?? [{ id: "prepare-1", status: "running" }])] }
     if (sql.includes('SELECT task."leaseExpiresAt"')) return { rows: [{ live: options.taskLive ?? true }] }
     throw new Error("unexpected artifact Prepare wait-fence query")
@@ -64,9 +68,12 @@ describe("scheduled Prepare artifact dependency-wait transaction fence", () => {
     expect(graphLock).toBeLessThan(waitLock)
     expect(waitLock).toBeLessThan(graphTaskLock)
     expect(db.calls[waitLock]?.sql).toContain("FOR UPDATE OF wait, step")
+    expect(db.calls[waitLock]?.sql).toContain('root."result" AS "rootResult"')
+    expect(db.calls[waitLock]?.sql).toContain('root."id" = wait."parentTaskId"')
     expect(db.calls[0]?.values?.[11]).toBe(7)
     expect(db.calls[0]?.values?.[12]).toBe(3)
     expect(db.calls[graphLock]?.values?.[0]).toBe("canonical-graph-item")
+    expect(db.calls[0]?.sql).not.toContain('root."result"')
     expect(parseSnapshot).toHaveBeenCalledOnce()
     expect(parseSnapshot).toHaveBeenCalledWith(graph)
   })
@@ -97,6 +104,10 @@ describe("scheduled Prepare artifact dependency-wait transaction fence", () => {
 
   it.each([
     { label: "ambiguous waits", waits: [validWait, { ...validWait, id: "other" }] },
+    { label: "missing wait identity", waits: [{ ...validWait, id: undefined }] },
+    { label: "Root result has no wait ID", rootResult: { status: "waiting_for_dependency", stepCount: 4, toolCallCount: 2, finalItemId: null } },
+    { label: "Root result names a different wait", rootResult: { ...validRootResult, waitId: "other-wait" } },
+    { label: "resolved wait", waits: [{ ...validWait, resolvedAt: new Date() }] },
     { label: "unsuspended wait", waits: [{ ...validWait, suspendedAt: null }] },
     { label: "consumed wait", waits: [{ ...validWait, consumedAt: new Date() }] },
     { label: "wrong mode", waits: [{ ...validWait, mode: "any" }] },
@@ -122,6 +133,10 @@ describe("scheduled Prepare artifact dependency-wait transaction fence", () => {
 
     const expired = client({ taskLive: false })
     await expect(artifactTaskLeaseIsLive(expired.client, fence)).resolves.toBe(false)
+
+    const changedRootWait = client({ rootResult: { ...validRootResult, waitId: "other-wait" } })
+    await expect(artifactTaskLeaseIsLive(changedRootWait.client, fence)).resolves.toBe(false)
+    expect(changedRootWait.calls.some(call => call.sql.includes('SELECT task."leaseExpiresAt"'))).toBe(false)
   })
 
   it("rejects missing root-attempt or stale Turn-lease identity", async () => {
