@@ -3,12 +3,12 @@ import { getGoogleAccessToken } from '@/lib/gmail-helpers'
 import { classifyGmailMessage, extractRecommendationCards, inferApplicationMetadata } from './index'
 import type { GmailMessageKind } from './classification'
 import { fetchRecentGmailMessages, type GmailRemoteMessage } from './gmail-client'
-import { activityTypeForGmailMessage, canApplyGmailStatus, gmailEventLabel, statusForGmailMessage } from './lifecycle'
 import { findConfidentGmailJobMatch, type GmailMatchableJob } from './matching'
+import { recordLinkedGmailEvent, trackAndProjectLinkedStatusMessage, type GmailTrackedMessageData } from './gmail-status-projection'
 import { extractInterviewSchedule } from './interview-schedule'
 import { readNotificationPreferences } from '@/lib/settings-preferences'
 import type { NotificationPreferences } from '@/lib/types'
-import { purgeTemporaryGeneratedCoverLetters } from '@/lib/cover-letter-retention'
+import { statusForGmailMessage } from './lifecycle'
 
 export interface GmailSyncResult {
   connected: boolean
@@ -27,6 +27,9 @@ const EMPTY_RESULT: GmailSyncResult = {
   newRecommendations: 0,
   error: null,
 }
+const GMAIL_RETRY_REQUIRED = 'Gmail sync has messages that need retry'
+
+type ProcessedMessageResult = { imported: boolean; matched: boolean; statusUpdated: boolean; recommendations: number; retryNeeded: boolean }
 
 export async function syncGmailForUser(userId: string, now = new Date()): Promise<GmailSyncResult> {
   const accessToken = await getGoogleAccessToken(userId).catch(() => null)
@@ -50,11 +53,12 @@ export async function syncGmailForUser(userId: string, now = new Date()): Promis
       fetchRecentGmailMessages(accessToken, since, userId),
       db.job.findMany({
         where: { userId },
-        select: { id: true, company: true, role: true, status: true, appliedAt: true },
+        select: { id: true, company: true, role: true, status: true },
       }),
     ])
     const orderedMessages = messages.sort((left, right) => left.receivedAt.getTime() - right.receivedAt.getTime())
     const result: GmailSyncResult = { ...EMPTY_RESULT, connected: true }
+    let retryNeeded = false
 
     for (const message of orderedMessages) {
       const processed = await processMessage(userId, message, jobs, now, notificationPreferences)
@@ -62,12 +66,12 @@ export async function syncGmailForUser(userId: string, now = new Date()): Promis
       result.matchedMessages += processed.matched ? 1 : 0
       result.statusUpdates += processed.statusUpdated ? 1 : 0
       result.newRecommendations += processed.recommendations
+      retryNeeded ||= processed.retryNeeded
     }
 
-    await db.gmailSyncState.update({
-      where: { userId },
-      data: { lastSyncedAt: now, lastError: null },
-    })
+    const cursorUpdate = retryNeeded ? { lastError: GMAIL_RETRY_REQUIRED } : { lastSyncedAt: now, lastError: null }
+    result.error = retryNeeded ? GMAIL_RETRY_REQUIRED : null
+    await db.gmailSyncState.update({ where: { userId }, data: cursorUpdate })
     if (result.newRecommendations > 0) await notifyNewRecommendations(userId, result.newRecommendations, now)
     return result
   } catch (error) {
@@ -80,10 +84,10 @@ export async function syncGmailForUser(userId: string, now = new Date()): Promis
 async function processMessage(
   userId: string,
   message: GmailRemoteMessage,
-  jobs: Array<GmailMatchableJob & { appliedAt: Date | null }>,
+  jobs: Array<GmailMatchableJob>,
   now: Date,
   notificationPreferences: NotificationPreferences,
-) {
+): Promise<ProcessedMessageResult> {
   const existing = await db.gmailMessage.findUnique({
     where: { userId_gmailMessageId: { userId, gmailMessageId: message.id } },
     select: { id: true, kind: true, scheduledAt: true },
@@ -93,11 +97,11 @@ async function processMessage(
       const scheduledAt = extractInterviewSchedule(`${message.subject}\n${message.text}`, message.receivedAt)
       if (scheduledAt) await db.gmailMessage.update({ where: { id: existing.id }, data: { scheduledAt } })
     }
-    return { imported: false, matched: false, statusUpdated: false, recommendations: 0 }
+    return { imported: false, matched: false, statusUpdated: false, recommendations: 0, retryNeeded: false }
   }
 
   const kind = classifyGmailMessage({ subject: message.subject, excerpt: message.snippet, body: message.text })
-  if (kind === 'other') return { imported: false, matched: false, statusUpdated: false, recommendations: 0 }
+  if (kind === 'other') return { imported: false, matched: false, statusUpdated: false, recommendations: 0, retryNeeded: false }
 
   const inferred = inferApplicationMetadata(message.subject)
   const match = findConfidentGmailJobMatch(jobs, {
@@ -108,19 +112,33 @@ async function processMessage(
   const scheduledAt = kind === 'interview_invitation'
     ? extractInterviewSchedule(`${message.subject}\n${message.text}`, message.receivedAt)
     : null
-  const tracked = await createTrackedMessage(userId, message, kind, inferred, match?.job.id ?? null, match?.confidence ?? null, scheduledAt, now)
-  if (!tracked) return { imported: false, matched: false, statusUpdated: false, recommendations: 0 }
+  const trackedData = trackedMessageData(userId, message, kind, inferred, match?.job.id ?? null, match?.confidence ?? null, scheduledAt, now)
+  if (match && statusForGmailMessage(kind)) {
+    const projection = await trackAndProjectLinkedStatusMessage(
+      userId, match.job, message.receivedAt, kind, notificationPreferences, trackedData,
+    )
+    if (projection.kind === 'duplicate') {
+      return { imported: false, matched: false, statusUpdated: false, recommendations: 0, retryNeeded: false }
+    }
+    if (projection.kind === 'retry') {
+      return { imported: false, matched: false, statusUpdated: false, recommendations: 0, retryNeeded: true }
+    }
+    return { imported: true, matched: true, statusUpdated: projection.statusUpdated, recommendations: 0, retryNeeded: false }
+  }
+
+  const tracked = await createTrackedMessage(trackedData)
+  if (!tracked) return { imported: false, matched: false, statusUpdated: false, recommendations: 0, retryNeeded: false }
 
   const recommendations = kind === 'recommendation_digest'
     ? await persistRecommendations(userId, tracked.id, message)
     : 0
-  if (!match) return { imported: true, matched: false, statusUpdated: false, recommendations }
+  if (!match) return { imported: true, matched: false, statusUpdated: false, recommendations, retryNeeded: false }
 
-  const statusUpdated = await projectLinkedMessage(userId, match.job, message, kind, notificationPreferences)
-  return { imported: true, matched: true, statusUpdated, recommendations }
+  await recordLinkedGmailEvent(userId, match.job, kind)
+  return { imported: true, matched: true, statusUpdated: false, recommendations, retryNeeded: false }
 }
 
-async function createTrackedMessage(
+function trackedMessageData(
   userId: string,
   message: GmailRemoteMessage,
   kind: GmailMessageKind,
@@ -129,27 +147,29 @@ async function createTrackedMessage(
   matchConfidence: number | null,
   scheduledAt: Date | null,
   now: Date,
-) {
+): GmailTrackedMessageData {
+  return {
+    userId,
+    gmailMessageId: message.id,
+    gmailThreadId: message.threadId,
+    kind,
+    senderEmail: message.senderEmail,
+    senderName: message.senderName,
+    subject: message.subject || '(No subject)',
+    excerpt: truncate(message.text || message.snippet, 1_500),
+    inferredCompany: inferred.company,
+    inferredRole: inferred.role,
+    receivedAt: message.receivedAt,
+    scheduledAt,
+    jobId,
+    matchConfidence,
+    processedAt: now,
+  }
+}
+
+async function createTrackedMessage(data: GmailTrackedMessageData) {
   try {
-    return await db.gmailMessage.create({
-      data: {
-        userId,
-        gmailMessageId: message.id,
-        gmailThreadId: message.threadId,
-        kind,
-        senderEmail: message.senderEmail,
-        senderName: message.senderName,
-        subject: message.subject || '(No subject)',
-        excerpt: truncate(message.text || message.snippet, 1_500),
-        inferredCompany: inferred.company,
-        inferredRole: inferred.role,
-        receivedAt: message.receivedAt,
-        scheduledAt,
-        jobId,
-        matchConfidence,
-        processedAt: now,
-      },
-    })
+    return await db.gmailMessage.create({ data })
   } catch (error) {
     if (isUniqueConstraintError(error)) return null
     throw error
@@ -187,69 +207,6 @@ async function backfillInterviewSchedules(userId: string) {
     const scheduledAt = extractInterviewSchedule(`${message.subject}\n${message.excerpt ?? ''}`, message.receivedAt)
     if (scheduledAt) await db.gmailMessage.update({ where: { id: message.id }, data: { scheduledAt } })
   }))
-}
-
-async function projectLinkedMessage(
-  userId: string,
-  job: GmailMatchableJob & { appliedAt: Date | null },
-  message: GmailRemoteMessage,
-  kind: GmailMessageKind,
-  notificationPreferences: NotificationPreferences,
-): Promise<boolean> {
-  const nextStatus = statusForGmailMessage(kind)
-  const statusUpdated = Boolean(nextStatus && canApplyGmailStatus(job.status, nextStatus))
-  if (nextStatus && statusUpdated) {
-    await db.job.update({
-      where: { id: job.id },
-      data: {
-        status: nextStatus,
-        workflowState: 'submitted',
-        ...(nextStatus === 'applied' && !job.appliedAt ? { appliedAt: message.receivedAt } : {}),
-      },
-    })
-    job.status = nextStatus
-    if (nextStatus === 'applied' && !job.appliedAt) job.appliedAt = message.receivedAt
-    if (nextStatus === 'applied') await purgeTemporaryGeneratedCoverLetters(userId, job.id).catch(() => undefined)
-  }
-
-  await db.activity.create({
-    data: {
-      userId,
-      jobId: job.id,
-      type: activityTypeForGmailMessage(kind),
-      text: `Gmail ${gmailEventLabel(kind)} from ${job.company} for ${job.role}${statusUpdated ? ` — status updated to ${nextStatus}` : ''}`,
-      color: colorForGmailKind(kind),
-    },
-  })
-  if (statusUpdated) await createStatusNotification(userId, job.id, job.company, job.role, kind, notificationPreferences)
-  return statusUpdated
-}
-
-function gmailPreferenceKey(kind: GmailMessageKind): keyof NotificationPreferences {
-  if (kind === 'rejection') return 'reject'
-  if (kind === 'interview_invitation') return 'interview'
-  if (kind === 'offer') return 'offer'
-  return 'apply'
-}
-
-async function createStatusNotification(
-  userId: string,
-  jobId: string,
-  company: string,
-  role: string,
-  kind: GmailMessageKind,
-  notificationPreferences: NotificationPreferences,
-) {
-  if (!notificationPreferences[gmailPreferenceKey(kind)]) return
-  await db.notification.create({
-    data: {
-      userId,
-      jobId,
-      type: 'gmail_application_update',
-      title: `${company}: ${gmailEventLabel(kind)}`,
-      body: role,
-    },
-  }).catch(() => undefined)
 }
 
 async function notifyNewRecommendations(userId: string, count: number, now: Date) {
