@@ -43,6 +43,9 @@ describe("reviewed fill handoff contract", () => {
     ]
     for (const value of malformed) expect(parseReviewedFillHandoffIntent(value)).toBeNull()
     expect(reviewedFillHandoffIdempotencyKey(" ")).toBeNull()
+    const longApproval = "a".repeat(256)
+    expect(reviewedFillHandoffIdempotencyKey(longApproval)).toBeNull()
+    expect(buildReviewedFillHandoffIntent({ ...identity, approvalId: longApproval })).toBeNull()
   })
 
   it("rebinds the selected outbox row to its payload Session and approval key", () => {

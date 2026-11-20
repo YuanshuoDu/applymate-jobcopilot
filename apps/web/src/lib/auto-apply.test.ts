@@ -641,6 +641,16 @@ describe("auto-apply authorization", () => {
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
   });
 
+  it("binds a reviewed fill command key to its exact approval", async () => {
+    vi.stubEnv("ENABLE_APPLICATION_FILL_TASKGRAPH", "1");
+    const { queueApplicationFill } = await import("./auto-apply");
+    await queueApplicationFill({ ...input, reviewedSourceTurnId: "source_turn_1", reviewedSourceApprovalId: "approval_1" });
+    expect(mocks.startApplicationFillForReview).toHaveBeenCalledWith(expect.objectContaining({
+      clientMessageId: "agent-reviewed-fill:approval_1", reviewedSourceApprovalId: "approval_1", reviewedSourceTurnId: "source_turn_1",
+    }));
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
   it("routes enabled fill-for-review to one deterministic canonical Turn without enqueuing ApplyQueue", async () => {
     vi.stubEnv("ENABLE_APPLICATION_FILL_TASKGRAPH", "1");
     const { queueApplicationFill } = await import("./auto-apply");

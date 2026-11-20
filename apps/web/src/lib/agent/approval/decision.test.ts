@@ -31,6 +31,8 @@ function makeTransaction(
     payload: { applicationTaskId: "task_1", jobId: "job_1" },
   }
   let queryCount = 0
+  const applicationEvents: Array<Record<string, unknown>> = []
+  const outboxCreate = vi.fn(async ({ data }: { data: Record<string, unknown> }) => data)
   const tx = {
     $queryRaw: vi.fn(async () => {
       queryCount += 1
@@ -51,13 +53,14 @@ function makeTransaction(
       : null) },
     applicationTask: { findFirst: vi.fn(async () => ({ id: "task_1", jobId: "job_1" })) },
     applicationTaskEvent: {
-      findMany: vi.fn(async () => []),
-      create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => data),
+      findMany: vi.fn(async () => applicationEvents),
+      create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => { applicationEvents.push(data); return data }),
     },
+    agentOutbox: { create: outboxCreate },
   }
   return {
     row, tx: tx as unknown as Prisma.TransactionClient, rawQuery: tx.$queryRaw, turnFindFirst: tx.agentTurn.findFirst,
-    approvalUpdate: tx.agentApproval.updateMany, applicationEventCreate: tx.applicationTaskEvent.create,
+    approvalUpdate: tx.agentApproval.updateMany, applicationEventCreate: tx.applicationTaskEvent.create, outboxCreate,
   }
 }
 
@@ -123,6 +126,10 @@ describe("Web pending approval freshness", () => {
       data: expect.objectContaining({ taskId: "task_1", type: "reviewed_material_source_bound", actor: "user" }),
     }))
     expect(fake.approvalUpdate.mock.invocationCallOrder[0]).toBeLessThan(fake.applicationEventCreate.mock.invocationCallOrder[0])
+    expect(fake.outboxCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ topic: "agent.reviewed-fill.dispatch", idempotencyKey: "agent-reviewed-fill:approval_1" }),
+    }))
+    expect(fake.applicationEventCreate.mock.invocationCallOrder[0]).toBeLessThan(fake.outboxCreate.mock.invocationCallOrder[0])
   })
 
   it("preserves consumed receipt replay semantics without a freshness read", async () => {

@@ -6,7 +6,6 @@ import type { CommandTransaction } from "../control-plane/commands/transaction"
 import type { ExistingCommand } from "../control-plane/commands/existing-command"
 import { AgentCommandError } from "../control-plane/commands/errors"
 import {
-  acceptedFillTurnMatchesReviewedSource,
   matchesReviewedSourceTurn,
   readAcceptedReviewedFillSource,
   ReviewedFillSourceBindingError,
@@ -125,8 +124,9 @@ function eligiblePendingApproval(row: Approval, input: { userId: string; session
 /** Revalidates the accepted decision under Session and ApplicationTask locks before starting or acknowledging its fill. */
 export async function validateReviewedFillHandoff(
   tx: HandoffClient,
-  input: { approvalId: string; userId: string; sessionId: string; applicationTaskId: string; sourceTurnId: string; now?: Date },
-): Promise<void> {
+  input: { approvalId: string; userId: string; sessionId: string; applicationTaskId: string; sourceTurnId?: string;
+    predecessorTurnId?: string; clientMessageId: string; now?: Date },
+): Promise<{ sourceTurnId: string }> {
   const now = input.now ?? new Date()
   const approval = await tx.agentApproval.findFirst({
     where: { id: input.approvalId, userId: input.userId, sessionId: input.sessionId, type: "review_application", status: "approved" },
@@ -135,6 +135,7 @@ export async function validateReviewedFillHandoff(
   }) as Approval | null
   const jobId = approval?.jobId
   if (!approval || !present(jobId) || !eligibleApproval(approval, { ...input, jobId }, now)) throw new ReviewedFillSourceBindingError()
+  if (input.predecessorTurnId && approval.turnId !== input.predecessorTurnId) throw new ReviewedFillSourceBindingError()
   const task = await tx.applicationTask.findFirst({
     where: { id: input.applicationTaskId, userId: input.userId, sessionId: input.sessionId, jobId },
     select: { id: true, status: true, checkpoint: true, fillTurnId: true, fillTurnSessionId: true, fillTurnUserId: true },
@@ -142,9 +143,10 @@ export async function validateReviewedFillHandoff(
   if (!task || task.id !== approval.taskId) throw new ReviewedFillSourceBindingError()
   const binding = await readAcceptedReviewedFillSource(tx, {
     approvalId: approval.id, userId: input.userId, sessionId: input.sessionId,
-    applicationTaskId: input.applicationTaskId, jobId, requestedSourceTurnId: input.sourceTurnId,
+    applicationTaskId: input.applicationTaskId, jobId,
+    ...(input.sourceTurnId ? { requestedSourceTurnId: input.sourceTurnId } : {}),
   })
-  if (!binding || binding.sourceTurnId !== input.sourceTurnId) throw new ReviewedFillSourceBindingError()
+  if (!binding || (input.sourceTurnId && binding.sourceTurnId !== input.sourceTurnId)) throw new ReviewedFillSourceBindingError()
   const predecessor = await tx.agentTurn.findFirst({
     where: { id: approval.turnId!, userId: input.userId, sessionId: input.sessionId },
     select: { id: true, source: true, status: true, rootTaskId: true },
@@ -161,12 +163,14 @@ export async function validateReviewedFillHandoff(
   }
   const hasFill = present(task.fillTurnId)
   if (hasFill) {
+    const fillTurn = await tx.agentTurn.findFirst({
+      where: { id: task.fillTurnId!, userId: input.userId, sessionId: input.sessionId }, select: { input: true },
+    })
     if (task.fillTurnSessionId !== input.sessionId || task.fillTurnUserId !== input.userId
       || !["filling", "waiting_for_user", "waiting_for_authorization", "completed"].includes(task.status)
-      || !await acceptedFillTurnMatchesReviewedSource(tx, {
-        turnId: task.fillTurnId!, userId: input.userId, sessionId: input.sessionId, sourceTurnId: input.sourceTurnId,
-      })) throw new ReviewedFillSourceBindingError()
-    return
+      || !matchesReviewedSourceTurn(fillTurn?.input, binding.sourceTurnId)
+      || record(fillTurn?.input)?.clientMessageId !== input.clientMessageId) throw new ReviewedFillSourceBindingError()
+    return { sourceTurnId: binding.sourceTurnId }
   } else if (task.status !== "waiting_for_user" || task.checkpoint !== "materials_ready") {
     throw new ReviewedFillSourceBindingError()
   }
@@ -174,4 +178,5 @@ export async function validateReviewedFillHandoff(
     where: { userId: input.userId, sessionId: input.sessionId, status: { in: [...ACTIVE_TURNS] } }, select: { id: true },
   })
   if (active.length > 0) throw new ReviewedFillHandoffDeferredError()
+  return { sourceTurnId: binding.sourceTurnId }
 }

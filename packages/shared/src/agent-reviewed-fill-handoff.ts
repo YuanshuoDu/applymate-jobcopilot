@@ -51,7 +51,8 @@ function exactRecord(value: unknown, keys: readonly string[]): Record<string, un
 export function parseReviewedFillHandoffIntent(value: unknown): ReviewedFillHandoffIntent | null {
   const intent = exactRecord(value, INTENT_KEYS)
   if (!intent || intent.schemaVersion !== REVIEWED_FILL_HANDOFF_SCHEMA
-    || !IDENTITY_KEYS.every(key => isIdentity(intent[key]))) return null
+    || !IDENTITY_KEYS.every(key => isIdentity(intent[key])) || !isIdentity(intent.approvalId)
+    || !reviewedFillHandoffIdempotencyKey(intent.approvalId)) return null
   return intent as ReviewedFillHandoffIntent
 }
 
@@ -60,7 +61,8 @@ export function buildReviewedFillHandoffIntent(input: ReviewedFillHandoffIdentit
 }
 
 export function reviewedFillHandoffIdempotencyKey(approvalId: string): string | null {
-  return isIdentity(approvalId) ? `agent-reviewed-fill:${approvalId}` : null
+  const key = `agent-reviewed-fill:${approvalId}`
+  return isIdentity(approvalId) && key.length <= 256 ? key : null
 }
 
 export function buildReviewedFillHandoffOutboxData(input: ReviewedFillHandoffIdentity): ReviewedFillHandoffOutboxData | null {
