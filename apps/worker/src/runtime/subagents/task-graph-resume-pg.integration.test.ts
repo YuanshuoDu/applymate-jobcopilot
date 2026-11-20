@@ -4735,6 +4735,37 @@ function processFixtureProvesExactSigkill(
   return false
 }
 
+function fixtureActiveCleanupDiagnostic(
+  identity: FixtureQueueJobIdentity,
+  owners: readonly Fixture[],
+  successiveOwner: Fixture,
+  children: readonly ProcessFixtureChild[],
+): RecordValue {
+  const scoped = children.filter(child => child.fixtureScopes?.some(scope =>
+    scope.sessionId === identity.sessionId && scope.turnId === identity.turnId))
+  const modes = [...new Set(scoped.map(child => child.fixtureMode === "park-successive-replan"
+    ? "park_successive_replan" : child.fixtureMode === "resume-successive-replan"
+      ? "resume_successive_replan" : "other_fixture_worker"))].sort()
+  const matchingOwnerIndexes = owners.flatMap((owner, index) =>
+    owner.sessionId === identity.sessionId && owner.turnId === identity.turnId ? [index] : [])
+  const ownerManifestIndex = matchingOwnerIndexes.length === 1 && matchingOwnerIndexes[0]! <= 128
+    ? matchingOwnerIndexes[0]! : null
+  const sameAsSuccessive = successiveOwner.sessionId === identity.sessionId && successiveOwner.turnId === identity.turnId
+  const exitedSigkill = (child: ProcessFixtureChild) => processFixtureExited(child)
+    && child.terminationSignal === "SIGKILL" && child.signalCode === "SIGKILL"
+  return {
+    state: "active",
+    kind: identity.kind,
+    generationClass: identity.currentGeneration ? "current" : "historical",
+    fixtureClass: sameAsSuccessive ? "successive_replan" : ownerManifestIndex !== null ? "other_known_fixture" : "unmatched",
+    ownerManifestIndex,
+    scopedProcessCount: Math.min(scoped.length, 64),
+    scopedExitedSigkill: scoped.some(exitedSigkill),
+    exactExitedSigkillJobProof: scoped.some(child => processFixtureProvesExactSigkill(child, identity)),
+    scopedProcessModes: modes,
+  }
+}
+
 function noteFixtureSigkillTurnJob(child: ProcessFixtureChild, queueName: string, jobId: string): void {
   child.terminationSignal = "SIGKILL"
   child.staleBullJobKeys ??= new Set()
@@ -8430,6 +8461,29 @@ describe("TaskGraph exact fixture queue cleanup", () => {
     expect(redisConnection.del).not.toHaveBeenCalled()
   })
 
+  it("classifies a refused active job without projecting fixture identities", () => {
+    const owner: Fixture = { userId: "private-user", sessionId: "private-session", turnId: "private-turn",
+      ownerId: "private-owner", suffix: "private" }
+    const activeIdentity: FixtureQueueJobIdentity = { ...identity, sessionId: owner.sessionId, turnId: owner.turnId }
+    const child = {
+      exitCode: null, signalCode: "SIGKILL", terminationSignal: "SIGKILL",
+      fixtureMode: "park-successive-replan",
+      fixtureScopes: [{ sessionId: owner.sessionId, turnId: owner.turnId }],
+      staleBullJobKeys: new Set<string>(),
+    } as unknown as ProcessFixtureChild
+    const projection = fixtureActiveCleanupDiagnostic(activeIdentity, [owner], owner, [child])
+
+    expect(projection).toEqual({
+      state: "active", kind: "turn", generationClass: "historical", fixtureClass: "successive_replan",
+      ownerManifestIndex: 0, scopedProcessCount: 1, scopedExitedSigkill: true, exactExitedSigkillJobProof: false,
+      scopedProcessModes: ["park_successive_replan"],
+    })
+    expect(JSON.stringify(projection)).not.toContain(owner.userId)
+    expect(JSON.stringify(projection)).not.toContain(owner.sessionId)
+    expect(JSON.stringify(projection)).not.toContain(owner.turnId)
+    expect(JSON.stringify(projection)).not.toContain(owner.ownerId)
+  })
+
   it("refuses active cleanup while a fixture worker may still be alive", async () => {
     const job: FixtureCleanupJob = {
       id: identity.jobId, name: "turn", data: payload,
@@ -8994,9 +9048,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
 
   afterAll(async () => {
     const cleanupFailures: string[] = []
-    const attempt = async (label: string, action: () => Promise<unknown>) => {
+    const attempt = async (label: string, action: () => Promise<unknown>, safeFailureDetail?: (error: unknown) => RecordValue | null) => {
       try { await action() } catch (error: unknown) {
-        cleanupFailures.push(label + ": " + (error instanceof Error ? error.stack ?? error.message : String(error)))
+        const detail = safeFailureDetail?.(error)
+        cleanupFailures.push(label + (detail ? " classification=" + JSON.stringify(detail) : "")
+          + ": " + (error instanceof Error ? error.stack ?? error.message : String(error)))
       }
     }
     let bootstrapClosed = bootstrap === undefined
@@ -9056,7 +9112,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             toKey: jobId => queue.toKey(jobId),
             getJob: async jobId => await queue.getJob(jobId) as unknown as FixtureCleanupJob | undefined,
           }, redis!, { allWorkersExited: allFixtureWorkersExited, exactSigkillOwner: staleLockWorkerExited })
-        })
+        }, error => error instanceof Error && error.message === "Active fixture job has no exact exited SIGKILL owner proof"
+          ? fixtureActiveCleanupDiagnostic(identity, fixtureOwners, successiveReplanProcessOwner,
+            [...fixtureProcessChildren]) : null)
       }
       const closedQueues = new Set<Queue>()
       for (const currentQueue of queues) {
