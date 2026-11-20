@@ -16798,6 +16798,46 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(finalWaitTasks).toHaveLength(2)
       expect(finalWaitTasks.some(task => task?.taskId === dublinTaskId && task.status === "interrupted")).toBe(true)
       expect(finalWaitTasks.some(task => task?.taskId === berlinTaskId && task.status === "completed")).toBe(true)
+
+      const finalTurnDispatches = await pool!.query<{ payload: unknown; attemptCount: number; publishedAt: Date | null }>(
+        `SELECT dispatch."payload", dispatch."attemptCount", dispatch."publishedAt"
+         FROM "agent_outbox" AS dispatch
+         JOIN "agent_sessions" AS session ON session."id" = $1 AND session."userId" = $3
+         JOIN "agent_turns" AS turn ON turn."id" = $2 AND turn."sessionId" = $1 AND turn."userId" = $3
+           AND turn."rootTaskId" = $4
+         WHERE dispatch."aggregateId" = turn."sessionId" AND dispatch."topic" = $5
+           AND dispatch."idempotencyKey" = $6`,
+        [value.sessionId, value.turnId, value.userId, rootTaskId, turnDispatch.TURN_DISPATCH_TOPIC,
+          turnDispatch.turnDispatchKey(value.turnId)])
+      const finalDispatchRow = finalTurnDispatches.rows[0]
+      const finalPayload = finalDispatchRow ? fixtureTurnDispatchPayloadForOwner(finalDispatchRow.payload, value) : null
+      const finalGeneration = finalDispatchRow
+        ? fixtureDispatchGenerations(finalDispatchRow.attemptCount, finalDispatchRow.publishedAt)
+          .find(entry => entry.currentGeneration)?.generation : undefined
+      if (finalTurnDispatches.rows.length !== 1 || !finalPayload || finalGeneration === undefined
+        || !turnQueueName || !redis) throw new Error("Final Root dispatch identity was not exact")
+      const finalRootJobId = turnDispatch.turnJobId(value.turnId, finalGeneration)
+      const finalRootIdentity: FixtureQueueJobIdentity = { queueName: turnQueueName, kind: "turn",
+        jobId: finalRootJobId, sessionId: value.sessionId, turnId: value.turnId, ownerId: finalPayload.ownerId,
+        generation: finalGeneration, currentGeneration: true }
+      const finalTurnQueue = new Queue(turnQueueName, { connection: redis, skipVersionCheck: true })
+      try {
+        await finalTurnQueue.waitUntilReady()
+        const finalRootJob = await finalTurnQueue.getJob(finalRootJobId)
+        if (!finalRootJob || finalRootJob.name !== "turn" || !fixtureJobPayloadMatches(finalRootIdentity, finalRootJob.data)) {
+          throw new Error("Completed Turn did not retain its exact current Root dispatch")
+        }
+        const ackDeadline = Date.now() + 10_000
+        let finalRootJobState = await finalRootJob.getState()
+        while (finalRootJobState !== "completed" && Date.now() < ackDeadline) {
+          if (finalRootJobState === "failed") throw new Error("Final Root dispatch was failed before acknowledgement")
+          await new Promise(resolve => setTimeout(resolve, 25))
+          finalRootJobState = await finalRootJob.getState()
+        }
+        if (finalRootJobState !== "completed") {
+          throw new Error("Final Root dispatch was not acknowledged before fixture shutdown")
+        }
+      } finally { await finalTurnQueue.close() }
       await stopProcessFixture(resumeWorker)
 
       const finalTurn = await pool!.query<{ status: string; rootTaskId: string | null }>(
@@ -16861,10 +16901,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
          JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
          JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
          WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = $3
-           AND event."taskId" = ANY($4::text[]) AND event."itemId" = $5 AND turn."rootTaskId" = $5
+           AND event."taskId" = ANY($4::text[]) AND event."itemId" = $5 AND turn."rootTaskId" = $7
            AND turn."userId" = $6 AND session."userId" = $6`,
         [value.sessionId, value.turnId, TASK_GRAPH_SUPERSEDED_SCOUT_RETIREMENT_EVENT_TYPE,
-          [seattleTaskId, dublinTaskId], taskGraphItemId(rootTaskId), value.userId])
+          [seattleTaskId, dublinTaskId], taskGraphItemId(rootTaskId), value.userId, rootTaskId])
       const rootToolCalls = await pool!.query<{ toolName: string | null }>(
         `SELECT item."content"->>'toolName' AS "toolName" FROM "agent_items" AS item
          JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
