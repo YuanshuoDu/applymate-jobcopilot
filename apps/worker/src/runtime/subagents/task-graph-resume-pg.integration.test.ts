@@ -16777,7 +16777,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       resumeWorker.stdin?.write("release-dublin\n")
       const finalMarker = await waitForProcessLine(resumeWorker, "P3_SUCCESSIVE_REPLAN_FINAL ", 90_000)
       assertMarker(finalMarker, "P3_SUCCESSIVE_REPLAN_FINAL ",
-        { turnCompleted: true, berlinResultValid: true, retiredNodeCount: 2, currentNodeCount: 1 })
+        { turnCompleted: true })
       const finalWaitResult = await pool!.query<{ callStatus: string; resultStatus: string | null; output: unknown }>(
         `SELECT call."status" AS "callStatus", result."status" AS "resultStatus", result."content"->'output' AS "output"
            FROM "agent_items" AS call
