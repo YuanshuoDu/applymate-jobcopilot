@@ -787,25 +787,20 @@ describe("agent session actions API", () => {
     expect(mocks.queueApplicationFill).not.toHaveBeenCalled()
   })
 
-  it("queues a legacy review only with the source recovered from its accepted private binding", async () => {
+  it("does not queue a reviewed selector through a legacy-only approval path", async () => {
     mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
       type: "review_application", payload: { applicationTaskId: "task_1", jobId: "job_1" },
     }))
     mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
-    mocks.resolveLegacyApproval.mockResolvedValueOnce({ disposition: "legacy_only", decision: "approved" })
-    mocks.readAcceptedReviewedFillSource.mockResolvedValueOnce({ sourceTurnId: "source_turn_1" })
-    mocks.jobFindFirst.mockResolvedValueOnce({ company: "Example", role: "Engineer", url: "https://jobs.example/apply" })
-    mocks.queueApplicationFill.mockResolvedValueOnce({ taskId: "fill_turn_1", turnId: "fill_turn_1" })
+    mocks.resolveLegacyApproval.mockRejectedValueOnce({ code: "reviewed_fill_source_unavailable" })
 
     const res = await callPost(postRequest({
       type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
       reviewedSourceTurnId: "source_turn_1",
     }) as never, ctx)
 
-    expect(res.status).toBe(200)
-    expect(mocks.queueApplicationFill).toHaveBeenCalledWith(expect.objectContaining({
-      applicationTaskId: "task_1", reviewedSourceTurnId: "source_turn_1",
-    }))
+    expect(res.status).toBe(409)
+    expect(mocks.queueApplicationFill).not.toHaveBeenCalled()
   })
 
   it("recovers the original reviewed-source binding on approved-fill replay without a selector", async () => {
@@ -824,7 +819,7 @@ describe("agent session actions API", () => {
       approvalId: "approval_1", applicationTaskId: "task_1", jobId: "job_1",
     }))
     expect(mocks.queueApplicationFill).toHaveBeenCalledWith(expect.objectContaining({
-      reviewedSourceTurnId: "source_turn_1", applicationTaskId: "task_1",
+      reviewedSourceTurnId: "source_turn_1", reviewedSourceApprovalId: "approval_1", applicationTaskId: "task_1",
     }))
   })
 

@@ -635,8 +635,8 @@ describe("auto-apply authorization", () => {
     const { queueApplicationFill } = await import("./auto-apply");
     await expect(queueApplicationFill({
       userId: "user_1", jobId: "job_1", applicationTaskId: "application_1", applyUrl: input.applyUrl,
-      reviewedSourceTurnId: "source_turn_1",
-    })).rejects.toThrow("Reviewed material fill is unavailable while TaskGraph fill is disabled");
+      reviewedSourceTurnId: "source_turn_1", reviewedSourceApprovalId: "approval_1",
+    })).rejects.toThrow("accepted approval and enabled TaskGraph fill");
     expect(mocks.taskUpdate).not.toHaveBeenCalled();
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
   });

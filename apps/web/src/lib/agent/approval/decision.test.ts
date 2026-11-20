@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { Prisma } from "@prisma/client"
 
 import { resolvePendingApprovalInTransaction } from "./decision"
+import { waitItemId } from "../broker/item-ids"
 
 const NOW = new Date("2026-09-01T00:00:00.000Z")
 
@@ -20,11 +21,14 @@ function makeTransaction(
     userId: "user_1",
     turnId: "turn_1",
     toolCallId: "call_1",
+    jobId: "job_1",
     type: "submit_application",
     status,
     scopeHash: "scope_hash",
     revision: 3,
     expiresAt: new Date("2026-09-01T01:00:00.000Z"),
+    decidedAt: null,
+    payload: { applicationTaskId: "task_1", jobId: "job_1" },
   }
   let queryCount = 0
   const tx = {
@@ -39,7 +43,12 @@ function makeTransaction(
     },
     agentTurn: { findFirst: vi.fn(async ({ where }: { where: Record<string, unknown> }) => where.id === "source_turn_1"
       ? { id: "source_turn_1", userId: "user_1", sessionId: "session_1", status: "completed", source: "user", rootTaskId: "root_1", input: { selectedJobPreparation: { jobId: "job_1" } } }
-      : { id: row.turnId, status: turnStatus }) },
+      : { id: row.turnId, userId: row.userId, sessionId: row.sessionId, source: "user", status: turnStatus, revision: row.revision + 1 }) },
+    agentItem: { findFirst: vi.fn(async ({ where }: { where: Record<string, unknown> }) => where.id === waitItemId("approval", row.id)
+      ? { id: where.id, revision: 0, content: { waitKind: "approval", approvalId: row.id, toolCallId: row.toolCallId,
+        action: "review_application", scopeHash: row.scopeHash, receiptRevision: row.revision,
+        expiresAt: row.expiresAt.toISOString(), decision: null } }
+      : null) },
     applicationTask: { findFirst: vi.fn(async () => ({ id: "task_1", jobId: "job_1" })) },
     applicationTaskEvent: {
       findMany: vi.fn(async () => []),
@@ -104,7 +113,7 @@ describe("Web pending approval freshness", () => {
   })
 
   it("writes reviewed-source binding after the successful approval CAS in the same transaction", async () => {
-    const fake = makeTransaction()
+    const fake = makeTransaction("pending", { hasRequest: true, hasGoalRevision: false }, true, "waiting_for_approval")
     Object.assign(fake.row, {
       type: "review_application", jobId: "job_1", payload: { applicationTaskId: "task_1", jobId: "job_1" },
     })

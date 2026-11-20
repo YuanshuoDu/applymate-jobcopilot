@@ -83,7 +83,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
               const queued = await queueApplicationFill({
                 userId: auth.userId, jobId: payload.jobId, applyUrl: job.url,
                 applicationTaskId: payload.applicationTaskId, sessionId: id,
-                ...(binding ? { reviewedSourceTurnId: binding.sourceTurnId } : {}),
+                ...(binding ? { reviewedSourceTurnId: binding.sourceTurnId, reviewedSourceApprovalId: prior.id } : {}),
               })
               return ok({ ...queued, duplicate: true })
             }

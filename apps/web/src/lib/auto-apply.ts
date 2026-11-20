@@ -17,7 +17,7 @@ export async function queueApplicationFill(input: {
   applicationTaskId: string;
   resumeAfterUserInput?: boolean;
   sessionId?: string;
-  reviewedSourceTurnId?: string;
+  reviewedSourceTurnId?: string; reviewedSourceApprovalId?: string;
   retry?: boolean;
   retryId?: string;
 }): Promise<{ taskId: string; turnId?: string; disposition?: string }> {
@@ -36,7 +36,7 @@ export async function queueApplicationFill(input: {
     throw new AutoApplyError(error instanceof Error ? error.message : "Application fill was denied by policy.")
   }
   const taskGraphEnabled = applicationFillTaskGraphEnabled();
-  if (input.reviewedSourceTurnId && !taskGraphEnabled) throw new AutoApplyError("Reviewed material fill is unavailable while TaskGraph fill is disabled.");
+  if (Boolean(input.reviewedSourceTurnId) !== Boolean(input.reviewedSourceApprovalId) || input.reviewedSourceTurnId && !taskGraphEnabled) throw new AutoApplyError("Reviewed material fill requires an accepted approval and enabled TaskGraph fill.");
   if (taskGraphEnabled) {
     if (input.retry && (!input.retryId || !/^[A-Za-z0-9_-]{8,128}$/.test(input.retryId))) {
       throw new AutoApplyError("A valid retry request ID is required for an explicit application fill retry.")
@@ -56,7 +56,7 @@ export async function queueApplicationFill(input: {
     const result = await new AgentCommandService(db).startApplicationFillForReview({
       sessionId: task.sessionId, userId: input.userId, clientMessageId,
       applicationTaskId: input.applicationTaskId, retry: input.retry, resumeAfterUserInput: input.resumeAfterUserInput,
-      ...(input.reviewedSourceTurnId ? { reviewedSourceTurnId: input.reviewedSourceTurnId } : {}),
+      ...(input.reviewedSourceTurnId ? { reviewedSourceTurnId: input.reviewedSourceTurnId, reviewedSourceApprovalId: input.reviewedSourceApprovalId } : {}),
     })
     return { taskId: result.turnId, turnId: result.turnId, disposition: result.disposition }
   }

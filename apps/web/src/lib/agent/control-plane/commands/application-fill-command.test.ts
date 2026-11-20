@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { PrismaClient } from "@prisma/client"
+import { waitItemId } from "../../broker/item-ids"
 
 const executionMocks = vi.hoisted(() => ({ interruptActiveTurn: vi.fn() }))
 vi.mock("./execution-cancellation", () => ({ interruptActiveTurn: executionMocks.interruptActiveTurn }))
@@ -9,7 +10,7 @@ import { startApplicationFillForReview } from "./application-fill-command"
 type Row = Record<string, unknown>
 type Task = { id: string; userId: string; sessionId: string; jobId: string; resumeId: string | null; coverLetterId: string | null; status: string; checkpoint: string | null; fillTurnId: string | null; fillTurnSessionId: string | null; fillTurnUserId: string | null; confirmedAnswers?: unknown }
 type ResumeSeed = { waitEvents?: Row[]; answerEvents?: Row[]; fillers?: Row[]; rootLeaseOwnerId?: string | null; rootLeaseExpiresAt?: Date | null; sessionStatus?: string; turnStatus?: string; turnSessionId?: string; turnUserId?: string; turnInput?: unknown; activeTurn?: boolean }
-type MaterialSeed = { jobOwned?: boolean; resumeAssociated?: boolean; coverLetterAssociated?: boolean; reviewedSourceTurnId?: string }
+type MaterialSeed = { jobOwned?: boolean; resumeAssociated?: boolean; coverLetterAssociated?: boolean; reviewedSourceTurnId?: string; reviewedSourceApprovalId?: string }
 
 function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSeed, materialSeed: MaterialSeed = {}) {
   let task: Task = { id: "application_1", userId: "user_1", sessionId: "session_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null, status: "waiting_for_user", checkpoint: "materials_ready", fillTurnId: null, fillTurnSessionId: null, fillTurnUserId: null, confirmedAnswers: null, ...seed }
@@ -19,11 +20,30 @@ function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSe
     id: materialSeed.reviewedSourceTurnId, sessionId: "session_1", userId: "user_1", status: "completed", source: "user",
     rootTaskId: "root_1", input: { selectedJobPreparation: { jobId: "job_1" } },
   })
+  const approvedSource = Boolean(materialSeed.reviewedSourceApprovalId && materialSeed.reviewedSourceTurnId)
+  if (approvedSource) turns.push({ id: "gate_turn_1", sessionId: "session_1", userId: "user_1", source: "user",
+    status: "completed", revision: 5, rootTaskId: "gate_root_1" })
   if (resume?.activeTurn) turns.push({ id: "turn_active", sessionId: "session_1", userId: "user_1", status: "in_progress", revision: 0, input: {} })
   const fillers = resume?.fillers ?? []
   let inputs: Row[] = []
   let items: Row[] = []
   let events: Row[] = []
+  const taskEvents: Row[] = approvedSource ? [{ id: "binding_1", taskId: task.id, type: "reviewed_material_source_bound", actor: "user",
+    data: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", approvalId: materialSeed.reviewedSourceApprovalId,
+      sourceTurnId: materialSeed.reviewedSourceTurnId } }] : []
+  const approval = approvedSource ? {
+    id: materialSeed.reviewedSourceApprovalId, userId: "user_1", sessionId: "session_1", turnId: "gate_turn_1",
+    taskId: task.id, jobId: task.jobId, toolCallId: "gate_call_1", type: "review_application", status: "approved",
+    scopeHash: "gate_scope_1", revision: 3, decidedAt: new Date("2026-10-15T10:00:00.000Z"),
+    expiresAt: new Date(Date.now() + 60_000), payload: { applicationTaskId: task.id, jobId: task.jobId },
+  } : null
+  const approvalWait = approvedSource ? { id: waitItemId("approval", materialSeed.reviewedSourceApprovalId!), sessionId: "session_1",
+    turnId: "gate_turn_1", type: "approval_request", status: "completed", revision: 1, content: {
+      waitKind: "approval", approvalId: materialSeed.reviewedSourceApprovalId, toolCallId: "gate_call_1",
+      action: "review_application", scopeHash: "gate_scope_1", receiptRevision: 3,
+      expiresAt: approval!.expiresAt!.toISOString(), decision: "approved", responseAvailable: true,
+      respondedAt: "2026-10-15T10:00:00.000Z",
+    } } : null
   let outbox: Row[] = []
   let eventSequence = BigInt(0)
   let applicationEventRead = 0
@@ -63,6 +83,8 @@ function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSe
         return turns.find(turn => turn.sessionId === where.sessionId && turn.userId === where.userId && (where.status as { in: string[] }).in.includes(String(turn.status))) ?? null
       }),
       create: vi.fn(async ({ data }: { data: Row }) => { turns.push(data); return { id: data.id } }),
+      findMany: vi.fn(async ({ where }: { where: Row }) => turns.filter(turn => turn.sessionId === where.sessionId && turn.userId === where.userId
+        && (where.status as { in: string[] }).in.includes(String(turn.status))).map(turn => ({ id: turn.id }))),
       updateMany: vi.fn(async ({ where, data }: { where: Row; data: Row }) => {
         const turn = turns.find(row => row.id === where.id && row.sessionId === where.sessionId && row.userId === where.userId
           && row.status === where.status && row.source === where.source)
@@ -71,7 +93,23 @@ function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSe
         return { count: 1 }
       }),
     },
-    agentItem: { create: vi.fn(async ({ data }: { data: Row }) => { items.push(data); return data }) },
+    agentItem: {
+      findFirst: vi.fn(async ({ where }: { where: Row }) => approvalWait && where.id === approvalWait.id && where.sessionId === approvalWait.sessionId
+        && where.turnId === approvalWait.turnId && where.type === approvalWait.type && where.status === approvalWait.status ? approvalWait : null),
+      create: vi.fn(async ({ data }: { data: Row }) => { items.push(data); return data }),
+    },
+    agentApproval: { findFirst: vi.fn(async ({ where }: { where: Row }) => {
+      const status = where.status
+      const matches = status === undefined || status === approval?.status
+        || Boolean(status && typeof status === "object" && "in" in status
+          && Array.isArray((status as { in: unknown }).in) && ((status as { in: string[] }).in).includes(String(approval?.status)))
+      return approval && where.id === approval.id && where.userId === approval.userId && where.sessionId === approval.sessionId
+        && matches && (!where.type || where.type === approval.type) ? approval : null
+    }) },
+    applicationTaskEvent: {
+      findMany: vi.fn(async () => taskEvents.slice(0, 2)),
+      create: vi.fn(async ({ data }: { data: Row }) => { taskEvents.push(data); return data }),
+    },
     agentEvent: {
       findFirst: vi.fn(async (args: unknown) => {
         const where = (args as { where: Row }).where
@@ -82,7 +120,7 @@ function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSe
     agentOutbox: { create: vi.fn(async ({ data }: { data: Row }) => { if (failOutbox) throw new Error("outbox unavailable"); outbox.push(data); return data }) },
     applicationTask: {
       findFirst: vi.fn(async ({ where }: { where: Row }) => task.id === where.id && task.userId === where.userId
-        && task.sessionId === where.sessionId ? { id: task.id, jobId: task.jobId } : null),
+        && task.sessionId === where.sessionId && (!where.jobId || where.jobId === task.jobId) ? task : null),
       updateMany: vi.fn(async ({ where, data }: { where: Row; data: Row }) => {
         if (task.id !== where.id || task.userId !== where.userId || task.sessionId !== where.sessionId || task.status !== where.status || task.checkpoint !== where.checkpoint || task.fillTurnId !== where.fillTurnId) return { count: 0 }
         task = { ...task, ...data } as Task
@@ -118,7 +156,7 @@ function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSe
   return { db, tx, state: { get task() { return task }, get sessionStatus() { return sessionStatus }, get turns() { return turns }, get inputs() { return inputs }, get items() { return items }, get events() { return events }, get outbox() { return outbox } } }
 }
 
-const command = (clientMessageId: string, retry = false, resumeAfterUserInput = false, reviewedSourceTurnId?: string) => ({ sessionId: "session_1", userId: "user_1", applicationTaskId: "application_1", clientMessageId, ...(retry ? { retry: true } : {}), ...(resumeAfterUserInput ? { resumeAfterUserInput: true } : {}), ...(reviewedSourceTurnId ? { reviewedSourceTurnId } : {}) })
+const command = (clientMessageId: string, retry = false, resumeAfterUserInput = false, reviewedSourceTurnId?: string, reviewedSourceApprovalId?: string) => ({ sessionId: "session_1", userId: "user_1", applicationTaskId: "application_1", clientMessageId, ...(retry ? { retry: true } : {}), ...(resumeAfterUserInput ? { resumeAfterUserInput: true } : {}), ...(reviewedSourceTurnId ? { reviewedSourceTurnId } : {}), ...(reviewedSourceApprovalId ? { reviewedSourceApprovalId } : {}) })
 
 function readyToResume() {
   const waitAt = new Date("2026-10-15T10:00:00.000Z")
@@ -145,8 +183,8 @@ describe("startApplicationFillForReview", () => {
   })
 
   it("persists only the validated reviewed source on the new fill Turn and preserves its input", async () => {
-    const fake = harness({}, false, undefined, { reviewedSourceTurnId: "source_turn_1" })
-    const result = await startApplicationFillForReview(fake.db, command("fill_reviewed_source", false, false, "source_turn_1"))
+    const fake = harness({}, false, undefined, { reviewedSourceTurnId: "source_turn_1", reviewedSourceApprovalId: "approval_1" })
+    const result = await startApplicationFillForReview(fake.db, command("fill_reviewed_source", false, false, "source_turn_1", "approval_1"))
     const created = fake.state.turns.find(turn => turn.id === result.turnId)
     expect(created?.input).toMatchObject({
       clientMessageId: "fill_reviewed_source", goal: "Fill the server-bound application form for user review. Never submit it.",
@@ -157,13 +195,21 @@ describe("startApplicationFillForReview", () => {
     expect(fake.tx.agentTurn.updateMany).toHaveBeenCalledTimes(1)
   })
 
-  it("rejects a reviewed source that is not an owned completed preparation for the task job", async () => {
+  it("rejects a forged reviewed command without the original accepted approval", async () => {
     const fake = harness({}, false, undefined, { reviewedSourceTurnId: "source_turn_1" })
+    await expect(startApplicationFillForReview(fake.db, command("fill_forged_source", false, false, "source_turn_1")))
+      .rejects.toMatchObject({ code: "invalid_command" })
+    expect(fake.state.turns).toHaveLength(1)
+    expect(fake.state.outbox).toHaveLength(0)
+  })
+
+  it("rejects a reviewed source that is not an owned completed preparation for the task job", async () => {
+    const fake = harness({}, false, undefined, { reviewedSourceTurnId: "source_turn_1", reviewedSourceApprovalId: "approval_1" })
     const source = fake.state.turns.find(turn => turn.id === "source_turn_1")!
     source.input = { selectedJobPreparation: { jobId: "another_job" } }
-    await expect(startApplicationFillForReview(fake.db, command("fill_wrong_source", false, false, "source_turn_1")))
+    await expect(startApplicationFillForReview(fake.db, command("fill_wrong_source", false, false, "source_turn_1", "approval_1")))
       .rejects.toMatchObject({ code: "reviewed_fill_source_unavailable" })
-    expect(fake.state.turns.some(turn => turn.id !== "source_turn_1")).toBe(false)
+    expect(fake.state.turns).toHaveLength(2)
     expect(fake.state.outbox).toHaveLength(0)
   })
 
