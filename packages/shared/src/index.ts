@@ -34,6 +34,19 @@ export { isSafeAiEndpoint } from "./safe-ai-endpoint.js";
 export { credentialContext, decryptSecret, encryptSecret, isEncryptedSecret, maskStoredSecret } from "./secret-crypto.js";
 export { pinnedFetch, validatePinnedUrl, type PinnedFetchOptions } from "./pinned-outbound.js";
 export { redactAgentEvent, redactSensitiveText, redactSensitiveValue } from "./agent-redaction.js";
+export {
+  REVIEWED_FILL_HANDOFF_SCHEMA,
+  REVIEWED_FILL_HANDOFF_TOPIC,
+  buildReviewedFillHandoffIntent,
+  buildReviewedFillHandoffOutboxData,
+  parseReviewedFillHandoffIntent,
+  parseReviewedFillHandoffOutboxRow,
+  reviewedFillHandoffIdempotencyKey,
+  type ReviewedFillHandoffIdentity,
+  type ReviewedFillHandoffIntent,
+  type ReviewedFillHandoffOutboxData,
+  type ReviewedFillHandoffOutboxRow,
+} from "./agent-reviewed-fill-handoff.js";
 export { hashAgentReceiptValue } from "./agent-receipt.js";
 export { normalizeAgentLocation, normalizeAgentLocationAllowlist } from "./agent-location-normalization.js";
 export { normalizeExternalApiErrorCode, sharedExternalApiErrorCode, type ExternalApiErrorCode, type SharedExternalApiUsage, recordSharedExternalApiUsage } from "./external-api-usage.js";
