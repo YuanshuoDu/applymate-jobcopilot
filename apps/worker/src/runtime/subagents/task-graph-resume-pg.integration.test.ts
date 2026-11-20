@@ -16047,6 +16047,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let acceptedDublin: AcceptedLocationSteer | undefined
     let acceptedBerlin: AcceptedLocationSteer | undefined
     let dublinAttemptBeforeRestart = 0
+    let killedDublinDispatch: FixtureQueueJobIdentity | undefined
     const assertMarker = (line: string, prefix: string, fields: RecordValue) => {
       let parsed: RecordValue | null = null
       try { parsed = record(JSON.parse(line.slice(prefix.length)) as unknown) } catch { /* marker remains invalid */ }
@@ -16187,6 +16188,18 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         [taskId, value.sessionId, value.turnId, rootTaskId, value.userId])
       return result.rows[0]
     }
+    const readDublinDispatch = () => pool!.query<{ payload: unknown; attemptCount: unknown; publishedAt: Date | null }>(
+      `SELECT dispatch."payload", dispatch."attemptCount", dispatch."publishedAt"
+       FROM "agent_outbox" AS dispatch
+       JOIN "agent_sessions" AS session ON session."id" = dispatch."aggregateId" AND session."id" = $1
+         AND session."userId" = $5
+       JOIN "agent_turns" AS turn ON turn."id" = $2 AND turn."sessionId" = session."id"
+         AND turn."userId" = $5 AND turn."rootTaskId" = $4
+       JOIN "sub_agent_tasks" AS task ON task."id" = $3 AND task."sessionId" = session."id"
+         AND task."turnId" = turn."id" AND task."rootTaskId" = $4 AND task."parentTaskId" = $4
+       WHERE dispatch."aggregateId" = session."id" AND dispatch."topic" = 'agent.subagent.dispatch'
+         AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"`,
+      [value.sessionId, value.turnId, dublinTaskId, rootTaskId, value.userId])
     const readRetirement = async (taskId: string, nodeKey: string) => {
       const task = await readTask(taskId)
       if (!task) return false
@@ -16706,6 +16719,36 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       if (dublinStartedOperations.rows.length !== 1 || dublinStartedOperations.rows[0]?.count !== 0) {
         throw new Error("Dublin claimed-before-model attempt already had a started model or tool operation")
       }
+      const dublinDispatchRows = await readDublinDispatch()
+      const dublinDispatch = dublinDispatchRows.rows[0]
+      const dublinPayload = parseSubagentJobPayload(dublinDispatch?.payload)
+      const dublinGeneration = dublinDispatch
+        ? fixtureDispatchGenerations(dublinDispatch.attemptCount, dublinDispatch.publishedAt)
+          .find(entry => entry.currentGeneration)?.generation : undefined
+      if (dublinDispatchRows.rows.length !== 1 || !dublinDispatch || !dublinPayload
+        || dublinPayload.taskId !== dublinTaskId || dublinPayload.sessionId !== value.sessionId
+        || dublinPayload.rootTaskId !== rootTaskId || dublinPayload.ownerId !== dublinAtCrash.leaseOwner
+        || dublinDispatch.publishedAt === null || dublinGeneration === undefined || !childQueueName || !redis) {
+        throw new Error("Dublin's active dispatch was not bound to its exact published outbox generation")
+      }
+      const dublinDispatchIdentity: FixtureQueueJobIdentity = {
+        queueName: childQueueName, kind: "subagent",
+        jobId: subagentDispatchJobId(dublinTaskId, dublinGeneration), sessionId: value.sessionId,
+        turnId: value.turnId, taskId: dublinTaskId, rootTaskId, ownerId: dublinPayload.ownerId,
+        generation: dublinGeneration, currentGeneration: true,
+      }
+      const dublinQueue = new Queue(childQueueName, { connection: redis, skipVersionCheck: true })
+      try {
+        await dublinQueue.waitUntilReady()
+        const activeDublinJob = await dublinQueue.getJob(dublinDispatchIdentity.jobId)
+        if (!activeDublinJob || activeDublinJob.id !== dublinDispatchIdentity.jobId || activeDublinJob.name !== "subagent"
+          || !fixtureJobPayloadMatches(dublinDispatchIdentity, activeDublinJob.data)
+          || await activeDublinJob.getState() !== "active"
+          || await redis.exists(dublinQueue.toKey(dublinDispatchIdentity.jobId) + ":lock") !== 1) {
+          throw new Error("Dublin's exact published generation was not active under its BullMQ lock at the crash cut")
+        }
+      } finally { await dublinQueue.close() }
+      killedDublinDispatch = dublinDispatchIdentity
       const turnAtCut = await currentTurn()
       if (turnAtCut.status !== "in_progress" || !turnAtCut.leaseOwnerId
         || !(turnAtCut.leaseExpiresAt instanceof Date) || turnAtCut.leaseExpiresAt.getTime() <= Date.now()) {
@@ -16896,6 +16939,65 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           throw new Error("Final Root dispatch was not acknowledged before fixture shutdown")
         }
       } finally { await finalTurnQueue.close() }
+
+      const historicalDublin = killedDublinDispatch
+      if (!historicalDublin || historicalDublin.kind !== "subagent" || !redis) {
+        throw new Error("The exact pre-crash Dublin dispatch identity was not retained")
+      }
+      const retiredDublinBeforeSettling = await readTask(dublinTaskId)
+      if (!retiredDublinBeforeSettling || retiredDublinBeforeSettling.status !== "interrupted"
+        || retiredDublinBeforeSettling.attemptCount <= dublinAttemptBeforeRestart) {
+        throw new Error("Dublin was not durably interrupted after its resumed attempt before stale dispatch settlement")
+      }
+      const latestDublinDispatchRows = await readDublinDispatch()
+      const latestDublinDispatch = latestDublinDispatchRows.rows[0]
+      const latestDublinPayload = parseSubagentJobPayload(latestDublinDispatch?.payload)
+      const latestDublinGeneration = latestDublinDispatch
+        ? fixtureDispatchGenerations(latestDublinDispatch.attemptCount, latestDublinDispatch.publishedAt)
+          .find(entry => entry.currentGeneration)?.generation : undefined
+      if (latestDublinDispatchRows.rows.length !== 1 || !latestDublinDispatch || !latestDublinPayload
+        || latestDublinPayload.taskId !== dublinTaskId || latestDublinPayload.sessionId !== value.sessionId
+        || latestDublinPayload.rootTaskId !== rootTaskId || latestDublinPayload.ownerId === historicalDublin.ownerId
+        || latestDublinDispatch.publishedAt === null || latestDublinGeneration === undefined
+        || latestDublinGeneration <= historicalDublin.generation) {
+        throw new Error("Dublin recovery did not publish a newer owner-bound dispatch generation")
+      }
+      const historicalQueue = new Queue(historicalDublin.queueName, { connection: redis, skipVersionCheck: true })
+      try {
+        await historicalQueue.waitUntilReady()
+        const lockDurationMs = 30_000 // BullMQ Worker default; createSubagentQueue only overrides workerPollingOptions.
+        const stalledIntervalMs = Number(workerEnv.BULLMQ_STALLED_INTERVAL_MS)
+        if (stalledIntervalMs !== 30_000) {
+          throw new Error("The successive fixture BullMQ stalled interval is not the configured 30 seconds")
+        }
+        const settleDeadline = Date.now() + lockDurationMs + stalledIntervalMs + 5_000
+        let historicalDublinSettled = false
+        while (Date.now() < settleDeadline) {
+          const historicalJob = await historicalQueue.getJob(historicalDublin.jobId)
+          if (historicalJob) {
+            if (historicalJob.id !== historicalDublin.jobId || historicalJob.name !== "subagent"
+              || !fixtureJobPayloadMatches(historicalDublin, historicalJob.data)) {
+              throw new Error("The pre-crash Dublin BullMQ generation lost its exact payload identity")
+            }
+            const state = await historicalJob.getState()
+            if (state === "completed") {
+              const result = record(historicalJob.returnvalue)
+              const safeStaleSkip = result?.status === "skipped" && result.taskId === dublinTaskId
+                && (result.reason === "dispatch_identity_mismatch" || result.reason === "not_available")
+              if (!safeStaleSkip) {
+                throw new Error("The terminal Dublin task did not safely skip its historical dispatch")
+              }
+              historicalDublinSettled = true
+              break
+            }
+            if (state === "failed") throw new Error("The historical Dublin generation failed instead of settling as stale")
+          }
+          await new Promise(resolve => setTimeout(resolve, 250))
+        }
+        if (!historicalDublinSettled) {
+          throw new Error("The replacement Worker did not naturally settle the exact historical Dublin generation")
+        }
+      } finally { await historicalQueue.close() }
       await stopProcessFixture(resumeWorker)
 
       const finalTurn = await pool!.query<{ status: string; rootTaskId: string | null }>(
