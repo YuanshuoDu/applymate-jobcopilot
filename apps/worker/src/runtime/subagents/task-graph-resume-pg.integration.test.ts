@@ -16545,7 +16545,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           ["listResultPresent", "seattleInterrupted", "dublinRunning", "unresolvedSteeringCuePresent",
             "berlinScopePresent", "priorRetirementPresent", "noBerlinPlanYet"]),
         dublinInterruptMarker: isBerlin ? projectMarker("P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED ",
-          ["interruptRequested", "liveLeaseBound", "rootLeaseMatchesProcess"]) : undefined,
+          ["interruptRequestAccepted", "liveLeaseBound", "workerAcknowledged", "rootLeaseMatchesProcess"]) : undefined,
         resumeContextMarker: isBerlin ? projectMarker("P3_SUCCESSIVE_REPLAN_CONTEXT ",
           ["unresolvedSteeringCuePresent", "berlinScopePresent", "priorRetirementPresent", "planToolAvailable",
             "rootLeaseMatchesProcess"]) : undefined,
@@ -16759,12 +16759,45 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         throw new Error("Dublin post-plan boundary="
           + JSON.stringify(await readSteerFailureBoundary("berlin", acceptedBerlin, resumeWorker)))
       }
-      assertMarker(dublinInterrupt, "P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED ",
-        { interruptRequested: true, liveLeaseBound: true, rootLeaseMatchesProcess: true })
+      const dublinInterruptPrefix = "P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED "
+      const dublinInterruptState = record(JSON.parse(dublinInterrupt.slice(dublinInterruptPrefix.length)) as unknown)
+      const liveLeaseBound = dublinInterruptState?.liveLeaseBound === true
+      const workerAcknowledged = dublinInterruptState?.workerAcknowledged === true
+      expect(Object.keys(dublinInterruptState ?? {}).sort()).toEqual([
+        "interruptRequestAccepted", "liveLeaseBound", "workerAcknowledged", "rootLeaseMatchesProcess",
+      ].sort())
+      expect(dublinInterruptState).toMatchObject({ interruptRequestAccepted: true, rootLeaseMatchesProcess: true })
+      expect(liveLeaseBound).not.toBe(workerAcknowledged)
+      assertMarker(dublinInterrupt, dublinInterruptPrefix, {
+        interruptRequestAccepted: true, liveLeaseBound, workerAcknowledged, rootLeaseMatchesProcess: true,
+      })
+      if (workerAcknowledged) {
+        expect(await readRetirement(dublinTaskId, "scout-dublin-replacement")).toBe(true)
+      }
       resumeWorker.stdin?.write("release-dublin\n")
       const finalMarker = await waitForProcessLine(resumeWorker, "P3_SUCCESSIVE_REPLAN_FINAL ", 90_000)
       assertMarker(finalMarker, "P3_SUCCESSIVE_REPLAN_FINAL ",
         { turnCompleted: true, berlinResultValid: true, retiredNodeCount: 2, currentNodeCount: 1 })
+      const finalWaitResult = await pool!.query<{ callStatus: string; resultStatus: string | null; output: unknown }>(
+        `SELECT call."status" AS "callStatus", result."status" AS "resultStatus", result."content"->'output' AS "output"
+           FROM "agent_items" AS call
+           JOIN "agent_sessions" AS session ON session."id" = call."sessionId"
+           JOIN "agent_turns" AS turn ON turn."id" = call."turnId" AND turn."sessionId" = call."sessionId"
+           LEFT JOIN "agent_items" AS result ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
+             AND result."taskId" = call."taskId" AND result."stepId" = call."stepId" AND result."type" = 'tool_result'
+             AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
+          WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3 AND call."type" = 'tool_call'
+            AND call."content"->>'toolCallId' = $4 AND call."content"->>'toolName' = 'agent.wait'
+            AND turn."rootTaskId" = $3 AND turn."userId" = $5 AND session."userId" = $5`,
+        [value.sessionId, value.turnId, rootTaskId, `p3-1248-final-wait:${value.turnId}`, value.userId])
+      expect(finalWaitResult.rows).toHaveLength(1)
+      const finalWaitOutput = record(finalWaitResult.rows[0]?.output)
+      const finalWaitTasks = Array.isArray(finalWaitOutput?.tasks) ? finalWaitOutput.tasks.map(record) : []
+      expect(finalWaitResult.rows[0]).toMatchObject({ callStatus: "completed", resultStatus: "completed" })
+      expect(finalWaitOutput?.status).toBe("ready")
+      expect(finalWaitTasks).toHaveLength(2)
+      expect(finalWaitTasks.some(task => task?.taskId === dublinTaskId && task.status === "interrupted")).toBe(true)
+      expect(finalWaitTasks.some(task => task?.taskId === berlinTaskId && task.status === "completed")).toBe(true)
       await stopProcessFixture(resumeWorker)
 
       const finalTurn = await pool!.query<{ status: string; rootTaskId: string | null }>(

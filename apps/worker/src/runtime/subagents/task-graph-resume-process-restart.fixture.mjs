@@ -2240,12 +2240,28 @@ function startSuccessiveReplanRuntime(ownerId, resume, calls) {
           if (dublinRetirementIssued && !finalWaitIssued) {
             const retirement = record(latestToolResult(request, calls.retireDublin))
             const dublinRow = await successiveTaskRow(rootTaskId, dublin?.taskId)
+            const expectedAttempt = dublinReclaimAttempt
+            const acceptedAttempt = Number.isSafeInteger(expectedAttempt)
+              && expectedAttempt > ids.dublinAttemptBeforeRestart
+              && retirement?.attempt === expectedAttempt && dublinRow?.attemptCount === expectedAttempt
+            const liveLeaseBound = !!acceptedAttempt && dublinRow?.status === "running"
+              && dublinRow.interruptRequestedAt instanceof Date && observedSuccessiveLeaseMatches(rootTaskId, dublinRow)
+              && dublinRow.leaseExpiresAt instanceof Date && dublinRow.leaseExpiresAt.getTime() > Date.now()
+            const retirementProof = acceptedAttempt && !liveLeaseBound
+              ? await readSuccessiveRetirement(rootTaskId, successiveDublinKey, dublin.taskId, berlin.taskId, calls.retireDublin)
+              : null
+            const workerAcknowledged = !!retirementProof && retirementProof.receipt.attempt === expectedAttempt
+              && retirementProof.task.attemptCount === expectedAttempt && retirementProof.task.status === "interrupted"
+              && retirementProof.task.interruptRequestedAt instanceof Date && retirementProof.task.leaseOwner === null
+              && retirementProof.task.leaseExpiresAt === null
             if (retirement?.status !== "interrupt_requested" || retirement.taskId !== dublin?.taskId
-              || !dublinRow || dublinRow.status !== "running" || dublinRow.interruptRequestedAt === null
+              || !dublinRow || dublinRow.role !== "scout" || !acceptedAttempt
+              || liveLeaseBound === workerAcknowledged
               || !request.tools.some(tool => record(tool)?.name === "agent.wait")) {
               throw new Error("p3_successive_replan_dublin_retirement_result_invalid")
             }
-            say("P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED " + JSON.stringify({ interruptRequested: true, liveLeaseBound: true,
+            say("P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED " + JSON.stringify({ interruptRequestAccepted: true,
+              liveLeaseBound, workerAcknowledged,
               rootLeaseMatchesProcess: await requireSuccessiveRootLeaseMatchesProcess(rootTaskId) }))
             finalWaitIssued = true
             yield toolCall(calls.finalWait, "agent.wait", successiveWaitArgs(calls.finalWaitKey, [dublin.taskId, berlin.taskId]))
