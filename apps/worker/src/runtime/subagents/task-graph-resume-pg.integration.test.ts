@@ -16017,9 +16017,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         ["P3_SUCCESSIVE_REPLAN_DUBLIN_REFRESHED ", "dublin_graph_refresh"],
         ["P3_SUCCESSIVE_REPLAN_SEATTLE_INTERRUPT_REQUESTED ", "seattle_interrupt_requested"],
         ["P3_SUCCESSIVE_REPLAN_FIRST_RETIREMENT ", "first_retirement"],
+        ["P3_SUCCESSIVE_REPLAN_CHILD_CLAIMED_BEFORE_MODEL ", "dublin_claimed_before_model"],
         ["P3_SUCCESSIVE_REPLAN_CRASH_CUT ", "crash_cut"],
         ["P3_SUCCESSIVE_REPLAN_CONTEXT ", "resume_context"],
         ["P3_SUCCESSIVE_REPLAN_PLAN_ACCEPTED ", "berlin_plan_accepted"],
+        ["P3_SUCCESSIVE_REPLAN_BERLIN_REFRESHED ", "berlin_refresh"],
         ["P3_SUCCESSIVE_REPLAN_RECOVERY_TRACE ", "dublin_recovery_trace"],
         ["P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED ", "dublin_interrupt_requested"],
         ["P3_SUCCESSIVE_REPLAN_FINAL ", "final"],
@@ -16388,6 +16390,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         ["P3_SUCCESSIVE_REPLAN_CRASH_CUT ", "crash_cut"],
         ["P3_SUCCESSIVE_REPLAN_CONTEXT ", "resume_context"],
         ["P3_SUCCESSIVE_REPLAN_PLAN_ACCEPTED ", "berlin_plan_accepted"],
+        ["P3_SUCCESSIVE_REPLAN_BERLIN_REFRESHED ", "berlin_refresh"],
         ["P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED ", "dublin_interrupt_requested"],
         ["P3_SUCCESSIVE_REPLAN_FINAL ", "final"],
       ]
@@ -16534,7 +16537,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         successiveRecoveryTrace: recoveryTrace,
         observedMarkers: observedMarkers.slice(0, 8),
         dublinRefreshMarker: isBerlin ? undefined : projectMarker("P3_SUCCESSIVE_REPLAN_DUBLIN_REFRESHED ",
-          ["planAccepted", "startLifecycleObserved", "childHeld", "listShowsBothRunning",
+          ["planAccepted", "startLifecycleObserved", "childClaimedBeforeModel", "listShowsBothRunning",
             "graphRevisionMatches", "graphRevisionAdvanced"]),
         berlinRequestMarker: projectMarker("P3_SUCCESSIVE_REPLAN_BERLIN_REQUEST ",
           ["requestEntered", "freshSteeringCuePresent", "berlinScopePresent", "listToolAvailable"]),
@@ -16548,6 +16551,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             "rootLeaseMatchesProcess"]) : undefined,
         berlinPlanAcceptedMarker: isBerlin ? projectMarker("P3_SUCCESSIVE_REPLAN_PLAN_ACCEPTED ",
           ["accepted", "berlinNodePresent", "acceptedPlanCount", "rootLeaseMatchesProcess"]) : undefined,
+        berlinRefreshMarker: isBerlin ? projectMarker("P3_SUCCESSIVE_REPLAN_BERLIN_REFRESHED ",
+          ["listResultPresent", "dublinSearchHeld", "dublinRunning", "berlinVerified", "graphRevisionMatches",
+            "graphRevisionAdvanced"]) : undefined,
       }
     }
 
@@ -16606,6 +16612,42 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       assertMarker(crashCut, "P3_SUCCESSIVE_REPLAN_CRASH_CUT ", { inspectResultValid: true, steerConsumed: true,
         unresolvedSteeringCuePresent: true, berlinScopePresent: true, priorRetirementPresent: true, acceptedBerlinPlanCount: 0,
         rootLeaseMatchesProcess: true })
+      const dublinClaimedBeforeModel = await waitForProcessLine(firstWorker,
+        "P3_SUCCESSIVE_REPLAN_CHILD_CLAIMED_BEFORE_MODEL ", 60_000)
+      assertMarker(dublinClaimedBeforeModel, "P3_SUCCESSIVE_REPLAN_CHILD_CLAIMED_BEFORE_MODEL ", {
+        role: "scout", location: "dublin", claimObserved: true, startLifecycleObserved: true,
+        modelStarted: false, toolStarted: false,
+      })
+      const dublinAtCrash = await readTask(dublinTaskId)
+      if (!dublinAtCrash || dublinAtCrash.status !== "running" || !dublinAtCrash.leaseOwner
+        || dublinAtCrash.attemptCount !== dublinBeforeRestart.attemptCount
+        || dublinAtCrash.leaseOwner !== dublinBeforeRestart.leaseOwner
+        || !(dublinAtCrash.leaseExpiresAt instanceof Date) || dublinAtCrash.leaseExpiresAt.getTime() <= Date.now()
+        || dublinAtCrash.interruptRequestedAt !== null) {
+        throw new Error("Dublin pre-model crash cut lost its exact live claimed attempt")
+      }
+      const dublinStartedOperations = await pool!.query<{ count: number }>(
+        `SELECT ((SELECT COUNT(*)::int FROM "agent_events" AS event
+            WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3
+              AND event."type" IN ('model.started', 'tool_call.started'))
+          + (SELECT COUNT(*)::int FROM "agent_items" AS call
+            JOIN "agent_steps" AS step ON step."id" = call."stepId" AND step."sessionId" = call."sessionId"
+              AND step."turnId" = call."turnId" AND step."taskId" = call."taskId"
+            WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3
+              AND call."type" = 'tool_call' AND call."status" IN ('started', 'streaming')
+              AND step."attempt" = $4))::int AS "count"
+         FROM "sub_agent_tasks" AS task
+         JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+         WHERE task."id" = $3 AND task."sessionId" = $1 AND task."turnId" = $2 AND task."rootTaskId" = $5
+           AND task."parentTaskId" = $5 AND task."status" = 'running' AND task."attemptCount" = $4
+           AND task."leaseOwner" = $6 AND task."leaseExpiresAt" > clock_timestamp() AND task."interruptRequestedAt" IS NULL
+           AND turn."rootTaskId" = $5 AND turn."userId" = $7 AND session."userId" = $7`,
+        [value.sessionId, value.turnId, dublinTaskId, dublinAtCrash.attemptCount, rootTaskId,
+          dublinAtCrash.leaseOwner, value.userId])
+      if (dublinStartedOperations.rows.length !== 1 || dublinStartedOperations.rows[0]?.count !== 0) {
+        throw new Error("Dublin claimed-before-model attempt already had a started model or tool operation")
+      }
       const turnAtCut = await currentTurn()
       if (turnAtCut.status !== "in_progress" || !turnAtCut.leaseOwnerId
         || !(turnAtCut.leaseExpiresAt instanceof Date) || turnAtCut.leaseExpiresAt.getTime() <= Date.now()) {
@@ -16705,6 +16747,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
       berlinTaskId = (await graphNodes()).find(node => node.key === "scout-berlin-final")?.taskId ?? ""
       if (!berlinTaskId) throw new Error("Replacement Worker omitted its Berlin Scout task identity")
+      const berlinRefresh = await waitForProcessLine(resumeWorker, "P3_SUCCESSIVE_REPLAN_BERLIN_REFRESHED ", 90_000)
+      assertMarker(berlinRefresh, "P3_SUCCESSIVE_REPLAN_BERLIN_REFRESHED ", {
+        listResultPresent: true, dublinSearchHeld: true, dublinRunning: true, berlinVerified: true,
+        graphRevisionMatches: true, graphRevisionAdvanced: true,
+      })
       let dublinInterrupt: string
       try {
         dublinInterrupt = await waitForProcessLine(resumeWorker, "P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED ", 90_000)
