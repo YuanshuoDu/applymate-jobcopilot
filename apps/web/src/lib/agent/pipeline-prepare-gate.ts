@@ -118,6 +118,7 @@ export async function runPrepareGateStages(
         const result = await withRunRecorderWriteOwnership(db as never, {
           sessionId: ctx.sessionId,
           userId: ctx.userId,
+          requireSourceMaterialFence: true,
           owner: {
             executionAttempt: ctx.executionAttempt,
             turnId: ctx.turnId,
