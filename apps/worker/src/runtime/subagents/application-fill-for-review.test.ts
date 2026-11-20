@@ -34,6 +34,7 @@ const browserPageMock = {
   goto: vi.fn(async () => null),
   close: vi.fn(async () => undefined),
   url: vi.fn(() => "https://boards.greenhouse.io/acme/jobs/123"),
+  locator: vi.fn(),
 }
 const browserPage = browserPageMock as unknown as Page
 
@@ -119,6 +120,13 @@ function setMocks(): void {
   vi.mocked(executeBrowserFill).mockResolvedValue({ status: "manual", error: null, durationMs: 3, reviewReady: true } as HarnessResult)
   vi.mocked(evaluateUnattendedApplyControl).mockResolvedValue({ allowed: true, flow: "greenhouse", message: null })
   vi.mocked(checkRateLimit).mockResolvedValue({ allowed: true } as Awaited<ReturnType<typeof checkRateLimit>>)
+}
+
+function configureCoverLetterField(value: () => string, count = 1, tag = "textarea"): void {
+  browserPageMock.locator.mockImplementation(() => ({
+    count: vi.fn().mockResolvedValue(count),
+    evaluate: vi.fn(async (read: (element: Element) => unknown) => read({ tagName: tag, get value() { return value() } } as unknown as Element)),
+  } as never))
 }
 
 beforeEach(() => { vi.resetAllMocks(); setMocks(); vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(null) })
@@ -230,13 +238,17 @@ describe("executeApplicationFillForReview", () => {
       jobCoverLetter: "Older job letter",
     }))
     vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
-    vi.mocked(executeBrowserFill).mockResolvedValue({ status: "manual", error: null, durationMs: 3, reviewReady: true, log: [{ field: "coverLetter", action: "fill" }] } as HarnessResult)
+    let pageText = reviewedMaterial.content
+    configureCoverLetterField(() => pageText)
+    vi.mocked(executeBrowserFill).mockResolvedValue({ status: "manual", error: null, durationMs: 3, reviewReady: true, log: [{ field: "coverLetter", selector: "textarea#cover-letter", action: "fill" }] } as HarnessResult)
 
     const result = await executeApplicationFillForReview({ pool, lease: lease() })
     const fill = vi.mocked(executeBrowserFill).mock.calls[0]?.[0] as Record<string, unknown>
 
     expect(result).toMatchObject({ status: "completed", result: { status: "filled_for_user_review" } })
     expect(fill).toMatchObject({ submit: false, persona: { coverLetter: reviewedMaterial.content } })
+    expect(browserPageMock.locator).toHaveBeenCalledWith("textarea#cover-letter")
+    expect(browserPageMock.locator.mock.results[0]?.value.evaluate).toHaveBeenCalledWith(expect.any(Function), undefined, { timeout: 1000 })
     expect(JSON.stringify(queries.mock.calls)).not.toContain(reviewedMaterial.content)
     const event = queries.mock.calls.find(([sql]) => String(sql).includes('INSERT INTO "application_task_events"'))
     expect(event).toBeDefined()
@@ -254,6 +266,64 @@ describe("executeApplicationFillForReview", () => {
     expect(result).toMatchObject({ status: "waiting_for_user", failureReason: "review_required" })
     expect(persistApplicationFillWait).toHaveBeenCalledWith(pool, expect.objectContaining({ checkpoint: "form_answer_required", detail: "review_required" }))
     expect(completeApplicationFillForReview).not.toHaveBeenCalled()
+  })
+
+  it("waits when a supported flow truncates the reviewed letter", async () => {
+    const longLetter = "A".repeat(2501)
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue({ ...reviewedMaterial, content: longLetter })
+    configureCoverLetterField(() => longLetter.slice(0, 2000))
+    vi.mocked(executeBrowserFill).mockResolvedValue({ status: "manual", error: null, durationMs: 3, reviewReady: true, log: [{ field: "coverLetter", selector: "textarea#cover-letter", action: "fill" }] } as HarnessResult)
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(result).toMatchObject({ status: "waiting_for_user", failureReason: "review_required" })
+    expect(completeApplicationFillForReview).not.toHaveBeenCalled()
+  })
+
+  it("waits when a later custom-answer fill rewrites the reviewed letter", async () => {
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    let pageText = reviewedMaterial.content
+    configureCoverLetterField(() => pageText)
+    vi.mocked(fillCustomQuestions).mockImplementation(async () => { pageText = "overwritten by custom questions" })
+    vi.mocked(executeBrowserFill).mockResolvedValue({ status: "manual", error: null, durationMs: 3, reviewReady: true, log: [{ field: "coverLetter", selector: "textarea#cover-letter", action: "fill" }] } as HarnessResult)
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(result).toMatchObject({ status: "waiting_for_user", failureReason: "review_required" })
+    expect(fillCustomQuestions).toHaveBeenCalledOnce()
+    expect(completeApplicationFillForReview).not.toHaveBeenCalled()
+  })
+
+  it("requires a reliable successful selector from result.log and ignores result.items", async () => {
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    vi.mocked(executeBrowserFill).mockResolvedValue({
+      status: "manual", error: null, durationMs: 3, reviewReady: true,
+      items: [{ id: "browser-action:1", type: "browser_action", phase: "completed", action: "fill", selector: "textarea#cover-letter", field: "coverLetter", value: "[REDACTED]" }],
+    } as HarnessResult)
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(result).toMatchObject({ status: "waiting_for_user", failureReason: "review_required" })
+    expect(browserPageMock.locator).not.toHaveBeenCalled()
+    expect(completeApplicationFillForReview).not.toHaveBeenCalled()
+  })
+
+  it("waits when the exact selector is ambiguous or does not resolve to one input or textarea", async () => {
+    for (const option of [{ count: 2, tag: "textarea" }, { count: 1, tag: "div" }]) {
+      const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+      vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+      configureCoverLetterField(() => reviewedMaterial.content, option.count, option.tag)
+      vi.mocked(executeBrowserFill).mockResolvedValue({ status: "manual", error: null, durationMs: 3, reviewReady: true, log: [{ field: "coverLetter", selector: "textarea#cover-letter", action: "fill" }] } as HarnessResult)
+
+      const result = await executeApplicationFillForReview({ pool, lease: lease() })
+
+      expect(result).toMatchObject({ status: "waiting_for_user", failureReason: "review_required" })
+      expect(completeApplicationFillForReview).not.toHaveBeenCalled()
+      vi.resetAllMocks(); setMocks(); vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(null)
+    }
   })
 
   it("fails a stale reviewed selector before opening a browser and cannot fall back to legacy text", async () => {

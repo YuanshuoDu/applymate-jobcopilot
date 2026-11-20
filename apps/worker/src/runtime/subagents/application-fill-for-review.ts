@@ -1,4 +1,5 @@
 import type { Pool } from "pg"
+import type { Page } from "playwright-core"
 import { unlinkSync } from "node:fs"
 import { withCloakContext } from "../../cloak/pool.js"
 import { acknowledgeApplicationFillCancellation, completeApplicationFillForReview, failApplicationFillBeforeBrowser, persistApplicationFillWait, type ApplicationFillCompletionStaleGate } from "../../db/application-task-completion.js"
@@ -96,8 +97,8 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
         if (lease.signal.aborted || result.classification === "cancelled") return cancelledOutcome()
         if (result.waitReason) return { kind: "wait" as const, detail: waitDetail(result.waitReason) }
         if (result.reviewReady) {
-          if (start.reviewedMaterial && !reviewedMaterialWasFilled(result)) return { kind: "wait" as const, detail: "review_required" as const }
           await fillCustomQuestions(page, task.persona, [], task.confirmedAnswers)
+          if (start.reviewedMaterial && !await reviewedMaterialWasFilled(page, result, start.reviewedMaterial.content)) return { kind: "wait" as const, detail: "review_required" as const }
           const needs = safeNeeds(await inspectFormReviewNeeds(page))
           if (needs.missing.length || needs.sensitive.length) {
             return { kind: "needs" as const, needs, detail: needs.sensitive.length ? "unknown_sensitive_field" as const : "required_field" as const }
@@ -207,13 +208,27 @@ function isAllowedDestination(raw: string, flow: FlowType, approved: string): bo
 }
 function waitDetail(reason: NonNullable<Awaited<ReturnType<typeof detectBrowserWait>>>["reason"]): WaitDetail { return reason === "captcha" ? "captcha_required" : reason === "login_required" ? "authentication_required" : reason === "mfa_required" ? "mfa_required" : reason === "stale_review" ? "stale_review" : "unknown_sensitive_field" }; function waitDetailFromResult(result: HarnessResult): WaitDetail { return result.classification === "cancelled" ? "cancelled" : result.classification === "browser_crash" ? "fill_outcome_uncertain" : result.classification === "untrusted_input" ? "unknown_sensitive_field" : "review_required" }
 function safeNeeds(needs: FormReviewNeeds): FormReviewNeeds { const safe = (fields: FormReviewNeeds["missing"]) => fields.map(({ key, label }) => ({ key, label: label.slice(0, 200) })); return { missing: safe(needs.missing), sensitive: safe(needs.sensitive) } }
-function reviewedMaterialWasFilled(result: HarnessResult): boolean {
-  return [...(result.log ?? []), ...(result.items ?? [])].some(entry => {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false
+async function reviewedMaterialWasFilled(page: Page, result: HarnessResult, expected: string): Promise<boolean> {
+  const selectors: string[] = []
+  for (const entry of result.log ?? []) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue
     const value = entry as Record<string, unknown>
-    return value.field === "coverLetter" && ["fill", "replay-fill"].includes(String(value.action))
-      && (value.phase === undefined || value.phase === "completed")
-  })
+    if (value.field !== "coverLetter" || !["fill", "replay-fill"].includes(String(value.action))
+      || (value.phase !== undefined && value.phase !== "completed")) continue
+    if (typeof value.selector !== "string" || !value.selector.trim() || value.selector.length > 2048) return false
+    selectors.push(value.selector)
+  }
+  const unique = [...new Set(selectors)]
+  if (unique.length !== 1) return false
+  try {
+    const field = page.locator(unique[0]!)
+    if (await field.count() !== 1) return false
+    const current = await field.evaluate(element => {
+      const tag = element.tagName.toLowerCase()
+      return tag === "input" || tag === "textarea" ? (element as HTMLInputElement | HTMLTextAreaElement).value : null
+    }, undefined, { timeout: 1000 })
+    return current === expected
+  } catch { return false }
 }
 async function loadFillContext(pool: Pool, lease: SubagentLease): Promise<FillContext | null> {
   const client = await pool.connect()
