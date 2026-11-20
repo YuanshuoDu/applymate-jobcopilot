@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 
 import type { AgentTreeManager } from "../subagents/manager.js"
 import { TaskGraphCommandError, type TaskGraphCommandPort } from "../subagents/task-graph-command-port.js"
+import { restoreToolCallState } from "../turns/persisted-tool-call-state.js"
 import {
   TASK_GRAPH_SUPERSEDED_SCOUT_RETIREMENT_SCHEMA_VERSION,
   type TaskGraphScoutRetirementInput,
@@ -12,12 +13,15 @@ import { ToolRegistry } from "./registry.js"
 import {
   createTaskGraphSupersededScoutRetirementTool,
 } from "./task-graph-retire-superseded-scout.js"
+import { InMemoryToolLifecycleSink, ToolLifecycle, type LifecycleCall } from "./lifecycle.js"
 import type { ToolExecutionContext } from "./types.js"
 
-function receipt(overrides: Partial<TaskGraphSupersededScoutRetirementReceipt> = {}): TaskGraphSupersededScoutRetirementReceipt {
+const phoneLikeChildId = "subagent-00000000-0000-4000-8000-000000000001"
+
+function receipt(overrides: Partial<TaskGraphSupersededScoutRetirementReceipt> = {}, taskId = "scout-1"): TaskGraphSupersededScoutRetirementReceipt {
   return {
     schemaVersion: TASK_GRAPH_SUPERSEDED_SCOUT_RETIREMENT_SCHEMA_VERSION,
-    sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", nodeKey: "old-scout", taskId: "scout-1",
+    sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", nodeKey: "old-scout", taskId,
     attempt: 2, interruptRequestedAt: "2026-11-19T10:00:00.000Z", graphRevision: 4, acceptedPlanRevision: 3,
     acceptedSteerSequence: "8", reconciliationStepId: "step-reconcile", reconciliationThroughSequence: "9",
     reconciliationEventId: "event-reconcile", reconciliationEventSequence: "11",
@@ -28,12 +32,12 @@ function receipt(overrides: Partial<TaskGraphSupersededScoutRetirementReceipt> =
   }
 }
 
-function fixture(status: "requested" | "duplicate" = "requested") {
+function fixture(status: "requested" | "duplicate" = "requested", targetTaskId = "scout-1") {
   const order: string[] = []
   const requestSupersededScoutRetirement = vi.fn(async (input: TaskGraphScoutRetirementInput): Promise<TaskGraphScoutRetirementResult> => {
     order.push("port")
-    expect(input).toMatchObject({ expectedRevision: 4, taskId: "scout-1", callId: "call-1" })
-    return { status, taskId: "scout-1", receiptEventId: "private-event-id", receipt: receipt() }
+    expect(input).toMatchObject({ expectedRevision: 4, taskId: targetTaskId, callId: "call-1" })
+    return { status, taskId: targetTaskId, receiptEventId: "private-event-id", receipt: receipt({}, targetTaskId) }
   })
   const commandPort = { requestSupersededScoutRetirement } as unknown as TaskGraphCommandPort
   const signalTaskSubtree = vi.fn(() => { order.push("signal") })
@@ -45,7 +49,13 @@ function fixture(status: "requested" | "duplicate" = "requested") {
     taskId: "root-1", rootTaskId: "root-1", toolCallId: "call-1", signal: new AbortController().signal,
     capabilities: ["coordination", "canManageChildren"], reportProgress: async () => undefined,
   }
-  return { options, context, requestSupersededScoutRetirement, signalTaskSubtree, order }
+  return { options, context, requestSupersededScoutRetirement, signalTaskSubtree, order, targetTaskId }
+}
+
+function lifecycleCall(context: ToolExecutionContext): LifecycleCall {
+  return { id: context.toolCallId!, toolName: "agent.retire_superseded_scout", toolVersion: "1",
+    sessionId: context.sessionId, turnId: context.turnId, stepId: context.stepId,
+    taskId: context.taskId, rootTaskId: context.rootTaskId }
 }
 
 describe("agent.retire_superseded_scout", () => {
@@ -59,6 +69,31 @@ describe("agent.retire_superseded_scout", () => {
     expect(state.signalTaskSubtree).toHaveBeenCalledWith("session-1", "root-1", ["scout-1"])
     expect(JSON.stringify(output)).not.toContain("private-event-id")
     expect(output).not.toHaveProperty("acceptedSteerSequence")
+  })
+
+  it.each([
+    ["requested", "interrupt_requested"],
+    ["duplicate", "already_requested"],
+  ] as const)("preserves the verified phone-like task ID through lifecycle and persisted Root replay for %s", async (portStatus, outputStatus) => {
+    const state = fixture(portStatus, phoneLikeChildId)
+    const output = await createTaskGraphSupersededScoutRetirementTool(state.options).execute(state.context,
+      { expectedRevision: 4, taskId: phoneLikeChildId })
+    const call = lifecycleCall(state.context), sink = new InMemoryToolLifecycleSink(), lifecycle = new ToolLifecycle({ sink })
+    const expected = { taskId: phoneLikeChildId, status: outputStatus, attempt: 2 }
+    await lifecycle.started(call, { expectedRevision: 4, taskId: phoneLikeChildId })
+    const returned = await lifecycle.completed(call, output)
+    expect(returned).toEqual(expected)
+    const completed = sink.events.at(-1)!
+    expect(completed.item).toMatchObject({ type: "tool_result", output: expected })
+    expect(completed.payload.output).toEqual(expected)
+
+    const restored = restoreToolCallState([
+      { id: "call-item", stepId: call.stepId, type: "tool_call", status: "completed", revision: 1,
+        content: { toolCallId: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed", input: { expectedRevision: 4, taskId: phoneLikeChildId } } },
+      { id: "result-item", stepId: call.stepId, type: "tool_result", status: "completed", revision: 1,
+        content: { toolCallId: call.id, output: completed.payload.output, errorCode: null } },
+    ], [{ type: completed.eventType, payload: completed.payload }])
+    expect(restored.observations[0]?.content.output).toEqual(expected)
   })
 
   it("reports an idempotent replay as already requested and rejects mismatched receipts without signaling", async () => {
