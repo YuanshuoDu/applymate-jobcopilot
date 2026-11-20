@@ -16192,6 +16192,20 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     childQueueName = (await import("../../queue/subagent-queue.js")).SUBAGENT_QUEUE_NAME
     await activateFixtureTurn(pool!, value)
     const targetTurnGoal = "Analyze at least 75 percent of the four jobs found by the Scout"
+    const baseOwnerTurnBeforeBootstrapQuery: QueryConfig<unknown[]> & { query_timeout: number } = {
+      text: `SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      values: [owner.turnId, owner.sessionId, owner.userId],
+      query_timeout: ANALYST_WAIT_DIAGNOSTIC_QUERY_TIMEOUT_MS,
+    }
+    const baseOwnerTurnBeforeBootstrap = await pool!.query<{ status: string }>(baseOwnerTurnBeforeBootstrapQuery)
+    const baseOwnerStatusAtBootstrap = diagnosticEnum(baseOwnerTurnBeforeBootstrap.rows[0]?.status, TURN_DIAGNOSTIC_STATUSES)
+      ?? (baseOwnerTurnBeforeBootstrap.rows[0] ? "other" : "missing")
+    const baseOwnerQueuedAtBootstrap = baseOwnerStatusAtBootstrap === "queued"
+    const targetAndBaseOwnerScopesDistinct = {
+      user: owner.userId !== value.userId,
+      session: owner.sessionId !== value.sessionId,
+      turn: owner.turnId !== value.turnId,
+    }
     await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb
       WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
       value.turnId, JSON.stringify({ goal: targetTurnGoal }), value.sessionId, value.userId,
@@ -16233,6 +16247,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let rootExecution = 0
     let targetRootTaskId: string | null = null
     let targetScriptedModelRequestCount = 0
+    let baseOwnerTargetScriptRequestCount = 0
+    let nonTargetFactoryInvocationCount = 0
+    let baseOwnerNonTargetModelRequestCount = 0
     let rootFailureStage = "not_started"
     let lastModelRequestScope: RecordValue | null = null
     let initialWaitOutcomeDiagnostic: RecordValue | null = null
@@ -16367,10 +16384,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           if (targetFactoryMatchesTurn) candidateRootTaskId = persistedRootTaskId
         }
         if (!targetFactoryMatchesTurn || candidateRootTaskId === null) {
+          nonTargetFactoryInvocationCount += 1
           const adapter: ModelAdapter = {
             id: "p3-cohort-non-target-recovery-guard", profile,
             async *stream(request) {
-              void request
+              const metadata = request.metadata
+              if (metadata.turnId === owner.turnId && metadata.sessionId === owner.sessionId
+                && metadata.userId === owner.userId) baseOwnerNonTargetModelRequestCount += 1
               throw new Error("cohort_fixture_non_target_turn_blocked")
             },
           }
@@ -16384,6 +16404,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           id: "p3-explicit-cohort-coverage-root-fixture", profile,
           async *stream(request) {
             const metadata = request.metadata
+            if (metadata.turnId === owner.turnId && metadata.sessionId === owner.sessionId
+              && metadata.userId === owner.userId) baseOwnerTargetScriptRequestCount += 1
             const requestScope = {
               userMatchesFixture: metadata.userId === value.userId,
               sessionMatchesFixture: metadata.sessionId === value.sessionId,
@@ -16603,6 +16625,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         targetRootPresent: targetRootTaskId !== null,
         lastModelRequestScope,
         targetScriptedModelRequestCount: diagnosticBoundedCount(targetScriptedModelRequestCount),
+        baseOwnerStatusAtBootstrap, baseOwnerQueuedAtBootstrap, targetAndBaseOwnerScopesDistinct,
+        baseOwnerTargetScriptRequestCount: diagnosticBoundedCount(baseOwnerTargetScriptRequestCount),
+        baseOwnerNonTargetModelRequestCount: diagnosticBoundedCount(baseOwnerNonTargetModelRequestCount),
+        nonTargetFactoryInvocationCount: diagnosticBoundedCount(nonTargetFactoryInvocationCount),
         failedCoverageObserved, repairAccepted, repairWaitCallPrepared,
         initialWaitOutcome: initialWaitOutcomeDiagnostic,
         waitLoads: waitLoadDiagnostics, waitBoundaries: waitBoundaryDiagnostics,
@@ -16656,6 +16682,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await waitForTurnStatus(pool!, value.turnId, "completed", 45_000, repairWaitKey)
     expect(repairPassed).toBe(true)
     expect(downstreamCompleted).toBe(true)
+    expect(targetAndBaseOwnerScopesDistinct).toEqual({ user: true, session: true, turn: true })
+    expect(baseOwnerTargetScriptRequestCount).toBe(0)
+    expect(targetScriptedModelRequestCount).toBeGreaterThan(0)
+    if (baseOwnerQueuedAtBootstrap) {
+      expect(baseOwnerNonTargetModelRequestCount).toBeGreaterThan(0)
+      expect(nonTargetFactoryInvocationCount).toBeGreaterThan(0)
+    }
     const turn = await pool!.query<{ status: string; rootTaskId: string | null; finalResponse: string | null }>(
       `SELECT "status", "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
       [value.turnId, value.sessionId, value.userId],

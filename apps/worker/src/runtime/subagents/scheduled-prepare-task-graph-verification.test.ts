@@ -155,9 +155,12 @@ function checkpointFixture(stage: "prepare" | "gate" | "audit_completed_report")
     scout: { taskId: "scout-1", attemptCount: 1, report: publicTaskGraphVerificationReport(scoutReport) },
     analyst: { taskId: "analyst-1", attemptCount: 2, report: publicTaskGraphVerificationReport(analystReport), bindings: [dependencyBinding] } })
   const scoredProjection = [{ jobId: "job-1", score: 80, matchedKeywords: ["typescript"], missingKeywords: [], recommendation: "review" }]
+  const sourceFingerprint = { version: "agent-harness.v2.analyze-source-input.v1",
+    digest: createHash("sha256").update("job-1/current-source", "utf8").digest("hex") }
+  const sourceFingerprints = [["job-1", sourceFingerprint.version, sourceFingerprint.digest]]
   const checkpointDigest = createHash("sha256").update(JSON.stringify({ owner: [owner.userId, owner.sessionId, owner.turnId,
     owner.rootTaskId, owner.rootAttemptCount, owner.executionId, owner.executionAttemptCount], snapshotDigest, evidenceDigest,
-    analyzeGraphRevision: 12, analysisFailed: 0, scoredJobs: scoredProjection }), "utf8").digest("hex")
+    analyzeGraphRevision: 12, analysisFailed: 0, scoredJobs: scoredProjection, sourceFingerprints }), "utf8").digest("hex")
   const receiptBinding = { owner, continuationKey: `scheduled-taskgraph:sha256:${"0".repeat(64)}`, snapshotDigest,
     evidenceDigest, checkpointDigest, analyzeGraphRevision: 12, prepareScheduleRevision: 13 }
   const continuationKey = scheduledTaskGraphStableContinuationKey(receiptBinding)!
@@ -180,7 +183,7 @@ function checkpointFixture(stage: "prepare" | "gate" | "audit_completed_report")
       : node.key === "analyst" ? publicTaskGraphVerificationReport(analystReport) : null })) }
   const persistedStage = stage === "audit_completed_report" ? "completed" : stage
   const state = { nextStage: persistedStage, analysisFailed: 0, scoutedJobs: [{ id: "job-1", userId: owner.userId }], scoredJobs,
-    scheduledTaskGraphContinuation: { key: "handoff-key", snapshotDigest, graphRevision: 12, evidenceDigest,
+    scheduledTaskGraphAnalyzeSourceFingerprints: { "job-1": sourceFingerprint }, scheduledTaskGraphContinuation: { key: "handoff-key", snapshotDigest, graphRevision: 12, evidenceDigest,
       owner: stage !== "prepare" ? { ...owner, turnLeaseOwnerId: "turn-owner-2", turnLeaseVersion: 5 } : owner },
     ...(stage === "audit_completed_report" ? { report: { processed: 1, applied: 0, queued: 0, pending: 0,
       skipped: 1, failed: 0, durationMs: 9 } } : {}) }

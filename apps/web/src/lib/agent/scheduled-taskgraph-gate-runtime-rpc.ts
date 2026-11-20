@@ -10,13 +10,15 @@ import { loadRoleConfigs, toRoleConfigMap } from './role-config'
 import { isActiveAccount } from './run-service-helpers'
 import { AgentExecutionCancelledError } from './execution-control'
 import { buildScheduledTaskGraphGateCheckpoint } from './scheduled-taskgraph-gate-checkpoint'
+import { acquireScheduledTaskGraphGateSourceFence, assertScheduledTaskGraphGateSourcesCurrent, createScheduledTaskGraphGateOwnerFence, scheduledTaskGraphGateMaterialReferences, scheduledTaskGraphGateRecord as record } from './scheduled-taskgraph-gate-source'
+import { respondToScheduledTaskGraphGateActionFailure } from './scheduled-taskgraph-gate-source-terminal'
 import { isScheduledTaskGraphAuditChildGateProofCurrent, isScheduledTaskGraphGateProofCurrent, loadScheduledTaskGraphGateInput, scheduledTaskGraphAnalyzeCheckpointForGate } from './scheduled-taskgraph-gate-input'
 import { parseScheduledTaskGraphAttestation, scheduledTaskGraphAttestationCandidates } from './scheduled-taskgraph-attestation-candidates'
 import { parseScheduledAutomationSnapshot } from './scheduled-automation-snapshot'
 import { scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { scheduledTaskGraphClaimMatches } from './scheduled-taskgraph-pipeline-fence'
 import { replayCompletedScheduledTaskGraphAuditReport, replayCompletedScheduledTaskGraphReport } from './scheduled-taskgraph-completed-report-replay'
-import { blocked, gateFailureDiagnostic, matchingTurnSnapshot, scheduledTaskGraphClaimIsValid, scheduledTaskGraphLineageOwnerIsSame, scheduledTaskGraphRootLeaseIsLive } from './scheduled-taskgraph-pipeline-request'
+import { blocked, matchingTurnSnapshot, scheduledTaskGraphClaimIsValid, scheduledTaskGraphLineageOwnerIsSame, scheduledTaskGraphRootLeaseIsLive } from './scheduled-taskgraph-pipeline-request'
 import { sameScheduledTaskGraphJson as sameJson } from './scheduled-taskgraph-canonical-prefix'
 import { runScheduledGate } from './stages/gate'
 import { createGateQualityUsageCaller } from './control-plane/gate-quality-usage'
@@ -27,14 +29,13 @@ import { validateScheduledPrepareWaitIdentity } from './scheduled-taskgraph-run-
 import { authorizeScheduledAuditContinuation, resolveScheduledTaskGraphAuditClaimOwner, scheduledTaskGraphPrepareWaitId, validateScheduledTaskGraphAuditPrepareSource } from './scheduled-taskgraph-audit-action'
 import type { PipelineCtx } from './pipeline-context'
 type GateAction = ScheduledTaskGraphGateRpcRequest | ScheduledTaskGraphExecuteRpcRequest | ScheduledTaskGraphAuditExecuteRpcRequest
-type ExecuteContinuation = Readonly<{ kind: 'execute'; request: ScheduledTaskGraphExecuteRpcRequest }>
-type AuditExecuteContinuation = Readonly<{ kind: 'scheduled_audit_execute'; request: ScheduledTaskGraphAuditExecuteRpcRequest }>
+type ScheduledContinuation = Readonly<{ kind: 'execute'; request: ScheduledTaskGraphExecuteRpcRequest } | { kind: 'scheduled_audit_execute'; request: ScheduledTaskGraphAuditExecuteRpcRequest }>
 type TurnRow = { id: string; userId: string; sessionId: string; rootTaskId: string | null; source: string; executionMode: string | null; input: unknown; status: string; leaseOwnerId: string | null; leaseVersion: number; leaseExpiresAt: Date | null }
 type OwnerState = { owner: ScheduledTaskGraphPipelineOwner; key: string; snapshot: ReturnType<typeof parseScheduledAutomationSnapshot>; state: Record<string, unknown>; claimToken: string; jobs: Job[]; waitId?: string; gateRootWait?: ScheduledGateRootWait }
 const CLAIM_TTL_MS = 600_000
 
 /** Runs the private Gate action or returns an Execute request after persisted proof validation. */
-export async function runScheduledTaskGraphActionRpc(request: GateAction, signal?: AbortSignal): Promise<Response | ExecuteContinuation | AuditExecuteContinuation> {
+export async function runScheduledTaskGraphActionRpc(request: GateAction, signal?: AbortSignal): Promise<Response | ScheduledContinuation> {
   if (signal?.aborted) return blocked(409, 'scheduled_pipeline_turn_stale')
   if (request.action === 'gate') return runGateAction(request, signal)
   return request.action === 'scheduled_audit_execute' ? authorizeAuditExecute(request, signal) : authorizeExecute(request, signal)
@@ -47,14 +48,19 @@ async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?:
   const denied = await admission(request.owner.userId, snapshot)
   if (denied) return denied
 
+  let preflightLocked: OwnerState | null = null
   const preflight = await db.$transaction(async tx => {
-    const locked = await lockOwner(tx, request, signal, true)
+    await acquireScheduledTaskGraphGateSourceFence(tx, request.owner.userId, request.owner.userId)
+    const locked = preflightLocked = await lockOwner(tx, request, signal, true)
     if (!locked) return null
     const checkpoint = scheduledTaskGraphAnalyzeCheckpointForGate(locked.state)
+    await assertScheduledTaskGraphGateSourcesCurrent(tx, { owner: locked.owner, checkpoint })
     const loaded = checkpoint && await loadScheduledTaskGraphGateInput({ owner: locked.owner, snapshot, analyzeCheckpoint: checkpoint, analyzeAttestation: request.attestation, prepareProof: request.prepareProof,
       gate: { taskId: request.gateTaskId, attemptCount: request.gateAttemptCount, phase: 'running' }, ...(locked.gateRootWait ? { gateRootWait: locked.gateRootWait } : {}) }, tx)
     return { locked, checkpoint, loaded }
-  })
+  }).catch(error => respondToScheduledTaskGraphGateActionFailure({ error, request, locked: preflightLocked, signal,
+    phase: 'owner_assertion', rethrowUnknown: true }))
+  if (preflight instanceof Response) return preflight
   if (!preflight) return blocked(409, 'scheduled_pipeline_turn_stale')
   const { locked, checkpoint, loaded } = preflight
   if (!checkpoint || !loaded) return blocked(409, 'scheduled_pipeline_attestation_invalid')
@@ -88,7 +94,7 @@ async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?:
     defaultResume: { id: resume.id, name: resume.name, templateId: resume.templateId ?? null, templateOptions: resume.templateOptions,
       directionId: resume.directionId ?? null, basicsDetached: resume.basicsDetached ?? false },
     aiConfig, executionAttempt: { id: locked.owner.executionId, attemptCount: locked.owner.executionAttemptCount },
-    scheduledTaskGraphOwnerFence: { owner: locked.owner, key: locked.key, claimToken: locked.claimToken, gateTaskId: request.gateTaskId, assertCurrent: assertFenceCurrent }, scheduledGateQualityModelCall,
+    scheduledTaskGraphOwnerFence: createScheduledTaskGraphGateOwnerFence(locked, request.gateTaskId, assertFenceCurrent), scheduledGateQualityModelCall,
     assertExecutionCurrent: assertFreshCurrent,
     autonomous: snapshot.autoApply, emit: () => undefined, signal,
   }
@@ -100,12 +106,11 @@ async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?:
       priorChoices: request.priorChoices ?? [] }, runScheduledGate)
     return Response.json(result)
   } catch (error) {
-    return blocked(error instanceof AgentExecutionCancelledError ? 409 : 500,
-      error instanceof AgentExecutionCancelledError ? 'scheduled_pipeline_turn_stale' : 'scheduled_pipeline_execution_failed', gateFailureDiagnostic(failurePhase, error))
+    return respondToScheduledTaskGraphGateActionFailure({ error, request, locked, signal, phase: failurePhase })
   }
 }
 
-async function authorizeExecute(request: ScheduledTaskGraphExecuteRpcRequest, signal?: AbortSignal): Promise<Response | ExecuteContinuation> {
+async function authorizeExecute(request: ScheduledTaskGraphExecuteRpcRequest, signal?: AbortSignal): Promise<Response | ScheduledContinuation> {
   const proof = scheduledTaskGraphExecuteGateCompletionProof(request.gateCompletionProof), gate = record(proof?.gate)
   if (!proof || !gate || !sameJson(proof.prepareProof, request.prepareProof)) return blocked(409, 'scheduled_pipeline_gate_proof_invalid')
   const replay = await replayCompletedScheduledTaskGraphReport(request, { taskId: String(gate.taskId), attemptCount: Number(gate.attemptCount) }, signal)
@@ -115,16 +120,15 @@ async function authorizeExecute(request: ScheduledTaskGraphExecuteRpcRequest, si
   if (!locked) return blocked(409, 'scheduled_pipeline_gate_proof_invalid')
   return { kind: 'execute', request: { ...request, ...(locked.waitId ? { scheduledWaitId: locked.waitId } : {}) } }
 }
-async function authorizeAuditExecute(request: ScheduledTaskGraphAuditExecuteRpcRequest, signal?: AbortSignal): Promise<Response | AuditExecuteContinuation> {
-  return authorizeScheduledAuditContinuation({ request,
-    matchesProof: sameJson,
+async function authorizeAuditExecute(request: ScheduledTaskGraphAuditExecuteRpcRequest, signal?: AbortSignal): Promise<Response | ScheduledContinuation> {
+  return authorizeScheduledAuditContinuation({ request, matchesProof: sameJson,
     replay: gate => replayCompletedScheduledTaskGraphAuditReport(request, gate, signal),
-    load: (tx, gate) => lockOwner(tx, request, signal, false, { ...gate, completionProof: request.gateCompletionProof }),
-  })
+    load: (tx, gate) => lockOwner(tx, request, signal, false, { ...gate, completionProof: request.gateCompletionProof }) })
 }
 
 async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, signal?: AbortSignal, renew = false,
-  gateCompletion?: { taskId: string; attemptCount: number; completionProof: unknown }): Promise<OwnerState | null> {
+  gateCompletion?: { taskId: string; attemptCount: number; completionProof: unknown }, validateAnalyzeSource?: (owner: ScheduledTaskGraphPipelineOwner,
+    checkpoint: Record<string, unknown>) => Promise<void>): Promise<OwnerState | null> {
   if (signal?.aborted) return null
   const session = await tx.$queryRaw<Array<{ id: string; status: string }>>(Prisma.sql`
     SELECT "id", "status" FROM "agent_sessions"
@@ -188,6 +192,7 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
   const gate = request.action === 'gate'
     ? { taskId: request.gateTaskId, attemptCount: request.gateAttemptCount, phase: 'running' as const }
     : { taskId: gateCompletion!.taskId, attemptCount: gateCompletion!.attemptCount, phase: 'completed' as const, completionProof: gateCompletion!.completionProof }
+  await validateAnalyzeSource?.(owner, state)
   const proofInput = { owner, snapshot, analyzeCheckpoint: state, analyzeAttestation: request.attestation, prepareProof: request.prepareProof, gate, ...(request.action === 'gate' && gateRootWait ? { gateRootWait } : {}) }
   const proofCurrent = request.action === 'scheduled_audit_execute'
     ? await isScheduledTaskGraphAuditChildGateProofCurrent({ ...proofInput, auditActor: request.auditActor }, tx)
@@ -219,10 +224,11 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
     ...(waitId ? { waitId } : {}), ...(gateRootWait ? { gateRootWait } : {}) }
 }
 
-async function assertGateActionCurrent(tx: Prisma.TransactionClient, request: ScheduledTaskGraphGateRpcRequest, locked: OwnerState,
-  signal: AbortSignal | undefined, expectedMaterials?: readonly { jobId: string; kind: string; artifactRef: unknown }[]): Promise<boolean> {
+async function assertGateActionCurrent(tx: Prisma.TransactionClient, request: ScheduledTaskGraphGateRpcRequest, locked: OwnerState, signal: AbortSignal | undefined, expectedMaterials?: readonly { jobId: string; kind: string; artifactRef: unknown }[]): Promise<boolean> {
   if (signal?.aborted) return false
-  const current = await lockOwner(tx, request, signal)
+  await acquireScheduledTaskGraphGateSourceFence(tx, request.owner.userId, locked.owner.userId)
+  const current = await lockOwner(tx, request, signal, false, undefined, (owner, checkpoint) =>
+    assertScheduledTaskGraphGateSourcesCurrent(tx, { owner, checkpoint }))
   if (!current || current.owner.executionId !== locked.owner.executionId || current.owner.executionAttemptCount !== locked.owner.executionAttemptCount
     || current.key !== locked.key || current.claimToken !== locked.claimToken) return false
   if (!expectedMaterials) return true
@@ -231,7 +237,7 @@ async function assertGateActionCurrent(tx: Prisma.TransactionClient, request: Sc
     analyzeCheckpoint: checkpoint, analyzeAttestation: request.attestation, prepareProof: request.prepareProof,
     gate: { taskId: request.gateTaskId, attemptCount: request.gateAttemptCount, phase: 'running' },
     ...(current.gateRootWait ? { gateRootWait: current.gateRootWait } : {}) }, tx)
-  return Boolean(fresh && sameJson(materialRefs(fresh.materials), materialRefs(expectedMaterials)))
+  return Boolean(fresh && sameJson(scheduledTaskGraphGateMaterialReferences(fresh.materials), scheduledTaskGraphGateMaterialReferences(expectedMaterials)))
 }
 
 async function admission(userId: string, snapshot: ReturnType<typeof parseScheduledAutomationSnapshot>): Promise<Response | null> {
@@ -241,10 +247,4 @@ async function admission(userId: string, snapshot: ReturnType<typeof parseSchedu
   if (access === 'disabled') return blocked(403, 'scheduled_pipeline_ai_unavailable')
   if (snapshot.autoApply && !await hasEffectiveEntitlement(userId, 'auto_apply')) return blocked(403, 'scheduled_pipeline_entitlement_required')
   return null
-}
-function materialRefs(rows: readonly { jobId: string; kind: string; artifactRef: unknown }[]) { return rows.map(row => [row.jobId, row.kind, row.artifactRef]).sort((a, b) => String(a[0]).localeCompare(String(b[0])) || String(a[1]).localeCompare(String(b[1]))) }
-function record(value: unknown): Record<string, unknown> | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-  const prototype = Object.getPrototypeOf(value)
-  return prototype === Object.prototype || prototype === null ? value as Record<string, unknown> : null
 }

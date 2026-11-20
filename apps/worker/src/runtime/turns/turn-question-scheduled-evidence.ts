@@ -3,6 +3,7 @@ import { createHash } from "node:crypto"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { scheduledPipelineContinuationKeyVersion } from "@jobcopilot/agent-protocol"
 import { parseScheduledTaskGraphContinuationReceipt, scheduledTaskGraphStableContinuationKey } from "../subagents/scheduled-taskgraph-continuation-receipt.js"
+import { isCanonicalAnalyzeCheckpointTimestamp, scheduledAnalyzeCheckpointDigest } from "./turn-question-scheduled-source-fingerprint.js"
 
 export const TURN_SCHEDULED_PREPARE_CHOICE_SCHEMA = "agent-harness.v2.scheduled-prepare-choice-wait.v1" as const
 export const TURN_SCHEDULED_PREPARE_CHOICE_STAGE = "scheduled_prepare" as const
@@ -74,11 +75,12 @@ export function scheduledAnalyzeCheckpointEvidence(value: unknown): Readonly<{
     seen.add(job.id); rows.push({ jobId: job.id, score: row.score, matchedKeywords: [...row.matchedKeywords as string[]],
       missingKeywords: [...row.missingKeywords as string[]], recommendation: row.recommendation, ...(hasFence ? { analysisFenceAt: row.analysisFenceAt } : {}) })
   }
-  const projection = { owner: [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount, owner.executionId,
-    owner.executionAttemptCount], snapshotDigest: marker.snapshotDigest, evidenceDigest: marker.evidenceDigest,
-      analyzeGraphRevision: marker.graphRevision, analysisFailed: state.analysisFailed, scoredJobs: rows }
+  const checkpointDigest = scheduledAnalyzeCheckpointDigest({ state,
+    owner: [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount, owner.executionId, owner.executionAttemptCount],
+    snapshotDigest: marker.snapshotDigest, evidenceDigest: marker.evidenceDigest, analyzeGraphRevision: marker.graphRevision,
+    analysisFailed: state.analysisFailed, scoredJobs: rows })
+  if (!checkpointDigest) return null
   try {
-    const checkpointDigest = createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex")
     const continuationKey = scheduledTaskGraphStableContinuationKey({ owner, continuationKey: marker.key,
       snapshotDigest: marker.snapshotDigest, evidenceDigest: marker.evidenceDigest, checkpointDigest,
       analyzeGraphRevision: marker.graphRevision, prepareScheduleRevision: marker.graphRevision + 1 })
@@ -182,4 +184,4 @@ function dense(value: unknown): unknown[] | null {
   return value
 }
 function stringArray(value: unknown): value is string[] { const rows = dense(value); return !!rows && rows.every(item => typeof item === "string") }
-function validIso(value: unknown): boolean { return typeof value === "string" && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value }
+function validIso(value: unknown): boolean { return isCanonicalAnalyzeCheckpointTimestamp(value) }

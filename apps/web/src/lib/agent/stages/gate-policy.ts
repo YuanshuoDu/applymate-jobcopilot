@@ -1,9 +1,8 @@
 import type { PipelineCtx, ApplicationPackage, GateOutput, StageResult } from '../types'
 import { stageOk } from '../types'
-import { skipApplicationForGate } from '../application-control'
 import { AgentExecutionCancelledError } from '../execution-control'
 import { requireLegacyPolicy } from '../policy/legacy'
-import { createGateReviewReceipt, findGateReviewReceiptReplay } from './gate-review-receipt'
+import { createGateReviewReceipt, findGateReviewReceiptReplay, skipGateApplication } from './gate-review-receipt'
 import { reviewApplicationQuality } from './gate-quality-review'
 import { parseScheduledTaskGraphGateChoiceHistory, scheduledTaskGraphGateChoiceKey,
   type ScheduledTaskGraphGateQuestion } from '../scheduled-taskgraph-gate-service'
@@ -97,7 +96,7 @@ export async function runGatePolicy(packages: readonly ApplicationPackage[], ctx
         appliedPrior.add(scheduledTaskGraphGateChoiceKey(priorChoice))
         if (priorChoice.choiceId === 'skip') {
           skipped.push(pkg)
-          await skipApplicationForGate({ userId: ctx.userId, jobId: pkg.job.id, sessionId: ctx.sessionId, checkpoint: 'review_quality_declined', owner: gateWriteOwner(ctx) })
+          await skipGateApplication(ctx, pkg, 'review_quality_declined', scheduled, gateWriteOwner(ctx))
           continue
         }
       }
@@ -147,13 +146,7 @@ export async function runGatePolicy(packages: readonly ApplicationPackage[], ctx
         }
         if (decision === 'skip') {
           skipped.push(pkg)
-          await skipApplicationForGate({
-            userId: ctx.userId,
-            jobId: pkg.job.id,
-            sessionId: ctx.sessionId,
-            checkpoint: 'review_quality_declined',
-            owner: gateWriteOwner(ctx),
-          })
+          await skipGateApplication(ctx, pkg, 'review_quality_declined', scheduled, gateWriteOwner(ctx))
           if (deferredQuestion && appliedPrior.size === priorChoices.length) break
           continue
         }
@@ -164,7 +157,7 @@ export async function runGatePolicy(packages: readonly ApplicationPackage[], ctx
       choiceMatched = true
       if (scheduledChoice.choiceId === 'skip') {
         skipped.push(pkg)
-        await skipApplicationForGate({ userId: ctx.userId, jobId: pkg.job.id, sessionId: ctx.sessionId, checkpoint: 'review_quality_declined', owner: gateWriteOwner(ctx) })
+        await skipGateApplication(ctx, pkg, 'review_quality_declined', scheduled, gateWriteOwner(ctx))
         if (deferredQuestion && appliedPrior.size === priorChoices.length) break
         continue
       }
@@ -172,13 +165,7 @@ export async function runGatePolicy(packages: readonly ApplicationPackage[], ctx
 
     if (pkg.score < minMatchScore && !includeBorderline) {
       skipped.push(pkg)
-      await skipApplicationForGate({
-        userId: ctx.userId,
-        jobId: pkg.job.id,
-        sessionId: ctx.sessionId,
-        checkpoint: 'below_match_threshold',
-        owner: gateWriteOwner(ctx),
-      })
+      await skipGateApplication(ctx, pkg, 'below_match_threshold', scheduled, gateWriteOwner(ctx))
       emit('agent_observation', {
         role:        'reviewer',
         observation: `✕ jump over: ${pkg.score}% < threshold ${minMatchScore}%`,

@@ -2,13 +2,16 @@ import { createHash } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { Prisma } from '@prisma/client'
 import { AgentExecutionCancelledError } from './execution-control'
+import { createAnalyzeSourceChangedErrorWithClaims } from './stages/analyze-model-input'
+import { isScheduledTaskGraphGateSourceChangedError, isScheduledTaskGraphGateSourceProofInvalidError } from './scheduled-taskgraph-gate-source'
+import { gateFailureDiagnostic } from './scheduled-taskgraph-pipeline-request'
 
 const mocks = vi.hoisted(() => ({
   transaction: vi.fn(), queryRaw: vi.fn(), jobs: vi.fn(), update: vi.fn(), turn: vi.fn(), config: vi.fn(), resume: vi.fn(),
   active: vi.fn(), feature: vi.fn(), access: vi.fn(), entitlement: vi.fn(), aiConfig: vi.fn(), roles: vi.fn(),
   isProof: vi.fn(), auditProof: vi.fn(), auditPrepareSource: vi.fn(), loadInput: vi.fn(), buildCheckpoint: vi.fn(), validateWait: vi.fn(), executeGate: vi.fn(),
   policy: vi.fn(), completedReplay: vi.fn(), auditCompletedReplay: vi.fn(),
-  childFence: vi.fn(),
+  childFence: vi.fn(), sourceFence: vi.fn(), sourceValidation: vi.fn(), sourceTerminal: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({ db: {
@@ -25,6 +28,22 @@ vi.mock('./types', () => ({ resumeToText: vi.fn(() => 'resume') }))
 vi.mock('./role-config', () => ({ loadRoleConfigs: mocks.roles, toRoleConfigMap: vi.fn(() => ({})) }))
 vi.mock('./run-service-helpers', () => ({ isActiveAccount: mocks.active }))
 vi.mock('./scheduled-taskgraph-gate-checkpoint', () => ({ buildScheduledTaskGraphGateCheckpoint: mocks.buildCheckpoint }))
+vi.mock('./scheduled-taskgraph-gate-source', async importOriginal => {
+  const actual = await importOriginal<typeof import('./scheduled-taskgraph-gate-source')>()
+  return { ...actual, acquireScheduledTaskGraphGateSourceFence: mocks.sourceFence,
+    assertScheduledTaskGraphGateSourcesCurrent: mocks.sourceValidation,
+    createScheduledTaskGraphGateOwnerFence: (locked: Parameters<typeof actual.createScheduledTaskGraphGateOwnerFence>[0],
+      gateTaskId: Parameters<typeof actual.createScheduledTaskGraphGateOwnerFence>[1],
+      assertCurrent: Parameters<typeof actual.createScheduledTaskGraphGateOwnerFence>[2]) => ({
+      ...actual.createScheduledTaskGraphGateOwnerFence(locked, gateTaskId, assertCurrent),
+      sourceHooks: { acquireFence: mocks.sourceFence, validateSource: (tx: unknown, jobId: string) =>
+        mocks.sourceValidation(tx, { owner: locked.owner, jobId }) },
+    }) }
+})
+vi.mock('./scheduled-taskgraph-gate-source-terminal', async importOriginal => ({
+  ...await importOriginal<typeof import('./scheduled-taskgraph-gate-source-terminal')>(),
+  respondToScheduledTaskGraphGateActionFailure: mocks.sourceTerminal,
+}))
 vi.mock('./scheduled-taskgraph-gate-input', () => ({ isScheduledTaskGraphGateProofCurrent: mocks.isProof,
   isScheduledTaskGraphAuditChildGateProofCurrent: mocks.auditProof,
   loadScheduledTaskGraphGateInput: mocks.loadInput, scheduledTaskGraphAnalyzeCheckpointForGate: (value: unknown) => value }))
@@ -78,6 +97,7 @@ const multiScoutAttestation = { schemaVersion: 'agent-harness.v2.scheduled-pipel
     resultDigest: 'c'.repeat(64), nodeDigest: 'd'.repeat(64), evidenceDigest: 'e'.repeat(64), reportDigest: 'f'.repeat(64),
     dependsOnTaskIds: ['scout-task-a', 'scout-task-b'], jobIds: ['job-1'] }, evidenceDigest: 'a'.repeat(64) }
 const proof = { receipt: { proof: true } }
+const analysisFenceAt = '2026-10-20T09:00:00.000Z'
 const job = { id: 'job-1', userId: owner.userId }
 const packageRow = { userId: owner.userId, sessionId: owner.sessionId, jobId: job.id, package: {} }
 const materials = [{ userId: owner.userId, sessionId: owner.sessionId, jobId: job.id, kind: 'resume', artifactRef: { artifactId: 'artifact-1' } }]
@@ -170,6 +190,21 @@ beforeEach(() => {
   mocks.auditProof.mockResolvedValue(true)
   mocks.auditPrepareSource.mockResolvedValue(true)
   mocks.childFence.mockResolvedValue(true)
+  mocks.sourceFence.mockResolvedValue(undefined)
+  mocks.sourceValidation.mockResolvedValue(undefined)
+  mocks.sourceTerminal.mockImplementation(async (input: { error: unknown; phase: 'owner_assertion' | 'gate_execution'; rethrowUnknown?: boolean }) => {
+    if (isScheduledTaskGraphGateSourceProofInvalidError(input.error)) {
+      return Response.json({ status: 'blocked', errorCode: 'scheduled_pipeline_attestation_invalid' }, { status: 409 })
+    }
+    if (isScheduledTaskGraphGateSourceChangedError(input.error)) {
+      return Response.json({ status: 'blocked', errorCode: 'scheduled_pipeline_source_changed' }, { status: 409 })
+    }
+    if (input.rethrowUnknown) throw input.error
+    const cancelled = input.error instanceof AgentExecutionCancelledError
+    const response = { status: 'blocked', errorCode: cancelled ? 'scheduled_pipeline_turn_stale' : 'scheduled_pipeline_execution_failed' }
+    return Response.json(process.env.NODE_ENV === 'test'
+      ? { ...response, testDiagnostic: gateFailureDiagnostic(input.phase, input.error) } : response, { status: cancelled ? 409 : 500 })
+  })
   mocks.loadInput.mockResolvedValue(loaded)
   mocks.buildCheckpoint.mockReturnValue({ checkpoint: { nextStage: 'gate' }, packages: [] })
   mocks.validateWait.mockResolvedValue(true)
@@ -184,6 +219,196 @@ beforeEach(() => {
 })
 
 describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
+  it('acquires the source fence before owner locks and validates sources before Gate proof loading', async () => {
+    const events: string[] = []
+    const originalQuery = mocks.queryRaw.getMockImplementation()!
+    mocks.sourceFence.mockImplementation(async () => { events.push('source-fence') })
+    mocks.sourceValidation.mockImplementation(async (_tx: unknown, input: { checkpoint?: unknown }) => {
+      if (input.checkpoint !== undefined) events.push('initial-source-validation')
+    })
+    mocks.queryRaw.mockImplementation(async (...args: unknown[]) => {
+      if (!events.includes('owner-lock')) events.push('owner-lock')
+      return await originalQuery(...args)
+    })
+    mocks.loadInput.mockImplementation(async () => { events.push('proof-load'); return loaded })
+
+    const result = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+
+    expect(result.status).toBe(200)
+    expect(events[0]).toBe('source-fence')
+    expect(events[1]).toBe('owner-lock')
+    expect(events.indexOf('initial-source-validation')).toBeGreaterThan(events.indexOf('owner-lock'))
+    expect(events.indexOf('initial-source-validation')).toBeLessThan(events.indexOf('proof-load'))
+    expect(mocks.sourceFence).toHaveBeenCalledWith(tx, owner.userId, owner.userId)
+  })
+
+  it('rolls back a Gate claim renewal when source validation fails after owner locks', async () => {
+    const events: string[] = []
+    const originalQuery = mocks.queryRaw.getMockImplementation()!
+    let committedRenewals = 0
+    mocks.sourceFence.mockImplementation(async () => { events.push('source-fence') })
+    const sourceError = createAnalyzeSourceChangedErrorWithClaims([{ jobId: 'job-1', analysisFenceAt }])
+    mocks.sourceValidation.mockRejectedValueOnce(sourceError)
+    mocks.sourceTerminal.mockImplementation(async () => {
+      expect(transactionActive).toBe(false)
+      return Response.json({ status: 'blocked', errorCode: 'scheduled_pipeline_source_changed' }, { status: 409 })
+    })
+    mocks.queryRaw.mockImplementation(async (...args: unknown[]) => {
+      events.push('owner-row-lock')
+      return await originalQuery(...args)
+    })
+    let transactionActive = false
+    mocks.transaction.mockImplementation(async (work: (client: unknown) => unknown) => {
+      let stagedRenewals = 0
+      const transactional = { ...tx, agentExecution: { updateMany: async (...args: unknown[]) => {
+        const result = await mocks.update(...args) as { count: number }
+        if (result.count === 1) stagedRenewals += 1
+        return result
+      } } }
+      transactionActive = true
+      try {
+        const result = await work(transactional)
+        committedRenewals += stagedRenewals
+        return result
+      } finally { transactionActive = false }
+    })
+
+    const result = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+    const body = await result.json()
+
+    expect(result.status).toBe(409)
+    expect(body).toMatchObject({ status: 'blocked', errorCode: 'scheduled_pipeline_source_changed' })
+    expect(events[0]).toBe('source-fence')
+    expect(events[1]).toBe('owner-row-lock')
+    expect(mocks.update).toHaveBeenCalledOnce()
+    expect(committedRenewals).toBe(0)
+    expect(mocks.sourceTerminal).toHaveBeenCalledOnce()
+    expect(mocks.loadInput).not.toHaveBeenCalled()
+    expect(mocks.executeGate).not.toHaveBeenCalled()
+  })
+
+  it('preserves unrelated preflight transaction failures', async () => {
+    const error = new Error('database unavailable')
+    mocks.sourceValidation.mockRejectedValueOnce(error)
+
+    await expect(runScheduledTaskGraphActionRpc(gateRequest())).rejects.toBe(error)
+    expect(mocks.loadInput).not.toHaveBeenCalled()
+    expect(mocks.executeGate).not.toHaveBeenCalled()
+  })
+
+  it('terminalizes source drift discovered after preflight only after rolling back the final Gate transaction', async () => {
+    const sourceError = createAnalyzeSourceChangedErrorWithClaims([{ jobId: 'job-1', analysisFenceAt }])
+    let activeTransactions = 0, committedReceipts = 0
+    mocks.sourceValidation.mockResolvedValueOnce(undefined).mockRejectedValueOnce(sourceError)
+    mocks.transaction.mockImplementation(async (work: (client: unknown) => unknown) => {
+      let stagedReceipts = 0
+      const transactional = { ...tx, stageReceipt: async () => { stagedReceipts += 1 } }
+      activeTransactions += 1
+      try {
+        const result = await work(transactional)
+        committedReceipts += stagedReceipts
+        return result
+      } finally { activeTransactions -= 1 }
+    })
+    mocks.sourceTerminal.mockImplementation(async (input: { error: unknown; locked: unknown; request: unknown }) => {
+      expect(activeTransactions).toBe(0)
+      expect(input.error).toBe(sourceError)
+      expect(input.locked).toMatchObject({ owner, key: claim.key, claimToken: claim.claimToken })
+      expect(input.request).toMatchObject({ gateTaskId: gateTask.id, gateLeaseOwnerId: 'gate-lease', gateAttemptCount: 2 })
+      return Response.json({ status: 'blocked', errorCode: 'scheduled_pipeline_source_changed' }, { status: 409 })
+    })
+    mocks.executeGate.mockImplementation(async (input: { context: {
+      scheduledTaskGraphOwnerFence: { assertCurrent(transaction: unknown): Promise<boolean>;
+        sourceHooks: { acquireFence(transaction: unknown, userId: string): Promise<void>; validateSource(transaction: unknown, jobId: string): Promise<void> } }
+    } }) => {
+      await mocks.transaction(async (transaction: unknown) => {
+        const fence = input.context.scheduledTaskGraphOwnerFence
+        await fence.sourceHooks.acquireFence(transaction, owner.userId)
+        if (!await fence.assertCurrent(transaction)) throw new AgentExecutionCancelledError()
+        await (transaction as { stageReceipt(): Promise<void> }).stageReceipt()
+        await fence.sourceHooks.validateSource(transaction, 'job-1')
+      })
+      return { status: 'completed' }
+    })
+
+    const response = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toMatchObject({ status: 'blocked', errorCode: 'scheduled_pipeline_source_changed' })
+    expect(committedReceipts).toBe(0)
+    expect(mocks.sourceTerminal).toHaveBeenCalledOnce()
+  })
+
+  it('keeps non-source final Gate transaction failures as execution failures', async () => {
+    const error = new Error('database unavailable')
+    let committedReceipts = 0
+    mocks.sourceValidation.mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined).mockRejectedValueOnce(error)
+    mocks.transaction.mockImplementation(async (work: (client: unknown) => unknown) => {
+      let stagedReceipts = 0
+      const result = await work({ ...tx, stageReceipt: async () => { stagedReceipts += 1 } })
+      committedReceipts += stagedReceipts
+      return result
+    })
+    mocks.executeGate.mockImplementation(async (input: { context: {
+      scheduledTaskGraphOwnerFence: { assertCurrent(transaction: unknown): Promise<boolean>;
+        sourceHooks: { acquireFence(transaction: unknown, userId: string): Promise<void>; validateSource(transaction: unknown, jobId: string): Promise<void> } }
+    } }) => {
+      await mocks.transaction(async (transaction: unknown) => {
+        const fence = input.context.scheduledTaskGraphOwnerFence
+        await fence.sourceHooks.acquireFence(transaction, owner.userId)
+        if (!await fence.assertCurrent(transaction)) throw new AgentExecutionCancelledError()
+        await (transaction as { stageReceipt(): Promise<void> }).stageReceipt()
+        await fence.sourceHooks.validateSource(transaction, 'job-1')
+      })
+      return { status: 'completed' }
+    })
+
+    const response = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+
+    expect(response.status).toBe(500)
+    await expect(response.json()).resolves.toMatchObject({ status: 'blocked', errorCode: 'scheduled_pipeline_execution_failed',
+      testDiagnostic: { phase: 'gate_execution', errorClass: 'error' } })
+    expect(committedReceipts).toBe(0)
+    expect(mocks.sourceTerminal).toHaveBeenCalledOnce()
+    expect(mocks.sourceTerminal.mock.calls[0]?.[0]?.error).toBe(error)
+  })
+
+  it('provides live source hooks that fence before owner revalidation', async () => {
+    const events: string[] = []
+    const originalQuery = mocks.queryRaw.getMockImplementation()!
+    mocks.sourceFence.mockImplementation(async () => { events.push('source-fence') })
+    mocks.sourceValidation.mockImplementation(async (_tx: unknown, input: { checkpoint?: unknown }) => {
+      if (input.checkpoint === undefined) events.push('live-source-validation')
+    })
+    mocks.queryRaw.mockImplementation(async (...args: unknown[]) => {
+      events.push('owner-row-lock')
+      return await originalQuery(...args)
+    })
+    mocks.executeGate.mockImplementation(async (input: { context: {
+      scheduledTaskGraphOwnerFence: { assertCurrent(transaction: unknown): Promise<boolean>;
+        sourceHooks: { acquireFence(transaction: unknown, userId: string): Promise<void>; validateSource(transaction: unknown, jobId: string): Promise<void> } }
+    } }) => {
+      await mocks.transaction(async (transaction: unknown) => {
+        const fence = input.context.scheduledTaskGraphOwnerFence
+        await fence.sourceHooks.acquireFence(transaction, owner.userId)
+        if (!await fence.assertCurrent(transaction)) throw new AgentExecutionCancelledError()
+        await fence.sourceHooks.validateSource(transaction, 'job-1')
+      })
+      return { status: 'completed' }
+    })
+
+    const result = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+
+    expect(result.status).toBe(200)
+    const finalFence = events.lastIndexOf('source-fence')
+    const finalOwnerLock = events.lastIndexOf('owner-row-lock')
+    const finalValidation = events.lastIndexOf('live-source-validation')
+    expect(finalFence).toBeGreaterThanOrEqual(0)
+    expect(finalOwnerLock).toBeGreaterThan(finalFence)
+    expect(finalValidation).toBeGreaterThan(finalOwnerLock)
+    expect(mocks.sourceValidation).toHaveBeenCalledWith(tx, { owner, jobId: 'job-1' })
+  })
+
   it('keeps account and entitlement checks while allowing exhausted quality calls to degrade per package', async () => {
     mocks.active.mockResolvedValue(false)
     const denied = await runScheduledTaskGraphActionRpc(gateRequest())
@@ -316,13 +541,16 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
       try { return await work(tx) } finally { transactionCallbackActive = false }
     })
     mocks.executeGate.mockImplementation(async (input: { context: {
-      scheduledTaskGraphOwnerFence: { gateTaskId: string; assertCurrent(transaction: unknown): Promise<boolean> }
+      scheduledTaskGraphOwnerFence: { gateTaskId: string; assertCurrent(transaction: unknown): Promise<boolean>;
+        sourceHooks: { acquireFence(transaction: unknown, userId: string): Promise<void>; validateSource(transaction: unknown, jobId: string): Promise<void> } }
     } }) => {
       expect(input.context.scheduledTaskGraphOwnerFence.gateTaskId).toBe('gate-1')
       await mocks.transaction(async (transaction: unknown) => {
+        await input.context.scheduledTaskGraphOwnerFence.sourceHooks.acquireFence(transaction, owner.userId)
         if (!await input.context.scheduledTaskGraphOwnerFence.assertCurrent(transaction)) {
           throw new AgentExecutionCancelledError()
         }
+        await input.context.scheduledTaskGraphOwnerFence.sourceHooks.validateSource(transaction, 'job-1')
         receiptWrites += 1
       })
       return { status: 'completed' }
@@ -335,6 +563,60 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     expect(inputLoads).toBe(3)
     expect(events).toEqual(['preflight', 'receipt_material_recheck'])
     expect(receiptWrites).toBe(0)
+    expect(mocks.sourceValidation).toHaveBeenCalledTimes(3)
+  })
+
+  it('reports source drift before a changed material loader can cancel final receipt replay', async () => {
+    const sourceError = createAnalyzeSourceChangedErrorWithClaims([{ jobId: 'job-1', analysisFenceAt }])
+    const changed = { ...loaded, materials: [{ ...materials[0]!, artifactRef: { artifactId: 'artifact-2' } }] }
+    const events: string[] = []
+    let sourceChecks = 0, inputLoads = 0, committedWrites = 0, transactionActive = false
+    mocks.sourceValidation.mockImplementation(async () => {
+      sourceChecks += 1
+      events.push(`source-${sourceChecks}`)
+      if (sourceChecks === 3) throw sourceError
+    })
+    mocks.loadInput.mockImplementation(async () => {
+      inputLoads += 1
+      events.push(`materials-${inputLoads}`)
+      return inputLoads === 3 ? changed : loaded
+    })
+    mocks.transaction.mockImplementation(async (work: (client: unknown) => unknown) => {
+      transactionActive = true
+      let stagedWrites = 0
+      try {
+        const result = await work({ ...tx, stageReceipt: async () => { stagedWrites += 1 } })
+        committedWrites += stagedWrites
+        return result
+      } finally { transactionActive = false }
+    })
+    mocks.sourceTerminal.mockImplementation(async input => {
+      expect(transactionActive).toBe(false)
+      expect(input.error).toBe(sourceError)
+      return Response.json({ status: 'blocked', errorCode: 'scheduled_pipeline_source_changed' }, { status: 409 })
+    })
+    mocks.executeGate.mockImplementation(async (input: { context: {
+      scheduledTaskGraphOwnerFence: { assertCurrent(transaction: unknown): Promise<boolean>;
+        sourceHooks: { acquireFence(transaction: unknown, userId: string): Promise<void>; validateSource(transaction: unknown, jobId: string): Promise<void> } }
+    } }) => {
+      await mocks.transaction(async (transaction: unknown) => {
+        const fence = input.context.scheduledTaskGraphOwnerFence
+        await fence.sourceHooks.acquireFence(transaction, owner.userId)
+        if (!await fence.assertCurrent(transaction)) throw new AgentExecutionCancelledError()
+        await (transaction as { stageReceipt(): Promise<void> }).stageReceipt()
+        await fence.sourceHooks.validateSource(transaction, 'job-1')
+      })
+      return { status: 'completed' }
+    })
+
+    const response = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toMatchObject({ status: 'blocked', errorCode: 'scheduled_pipeline_source_changed' })
+    expect(events).toEqual(['source-1', 'materials-1', 'source-2', 'materials-2', 'source-3'])
+    expect(inputLoads).toBe(2)
+    expect(committedWrites).toBe(0)
+    expect(mocks.sourceTerminal).toHaveBeenCalledOnce()
   })
 
   it('projects a safe test-only owner assertion phase without exposing the thrown message', async () => {

@@ -26,9 +26,12 @@ const snapshotDigest = "sha256:" + createHash("sha256").update(JSON.stringify([s
 const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", stepId: "root-final-step", gateTaskId: "gate-1", requestAttemptCount: 0 }
 const checkpointOwner = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
   rootAttemptCount: 1, turnLeaseOwnerId: "turn-owner", turnLeaseVersion: 3, executionId: "execution-1", executionAttemptCount: 2 }
-const checkpointState = { nextStage: "gate", scoutedJobs: Array.from({ length: 60 }, (_, index) => ({ id: `job-${index + 1}`, userId: scope.userId })),
-  scoredJobs: Array.from({ length: 60 }, (_, index) => ({ job: { id: `job-${index + 1}`, userId: scope.userId }, score: 80, matchedKeywords: ["TypeScript"], missingKeywords: [],
+const checkpointJobIds = Array.from({ length: 60 }, (_, index) => `job-${index + 1}`)
+const checkpointState = { nextStage: "gate", scoutedJobs: checkpointJobIds.map(id => ({ id, userId: scope.userId })),
+  scoredJobs: checkpointJobIds.map(id => ({ job: { id, userId: scope.userId }, score: 80, matchedKeywords: ["TypeScript"], missingKeywords: [],
     recommendation: "Prepared candidate.", analysisFenceAt: "2026-10-23T12:00:00.000Z" })), analysisFailed: 0,
+  scheduledTaskGraphAnalyzeSourceFingerprints: Object.fromEntries(checkpointJobIds.map(id => [id, { version: "agent-harness.v2.analyze-source-input.v1",
+    digest: createHash("sha256").update(`${id}/current-source`, "utf8").digest("hex") }])),
   scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
     key: "scheduled-taskgraph:sha256:" + "a".repeat(64), snapshotDigest, evidenceDigest: "b".repeat(64), graphRevision: 2, owner: checkpointOwner } }
 const checkpointEvidence = scheduledGateCheckpointEvidence(checkpointState)!

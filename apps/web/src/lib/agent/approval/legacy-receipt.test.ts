@@ -4,6 +4,7 @@ import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol
 import { protocolScope } from "./types"
 import { SCHEDULED_GATE_REVIEW_MARKER_SCHEMA } from "./gate-replay"
 import type { LegacyReceiptInput } from "./legacy-receipt"
+import { createAnalyzeSourceChangedErrorWithClaims } from "../stages/analyze-model-input"
 
 const mocks = vi.hoisted(() => ({
   consumeApprovalAndReserve: vi.fn(),
@@ -209,6 +210,7 @@ describe("Gate receipt replay identity", () => {
       claimToken: "claim_token_1",
       gateTaskId: "gate_task_1",
       assertCurrent: async () => true,
+      sourceHooks: { acquireFence: vi.fn(async () => {}), validateSource: vi.fn(async () => {}) },
     }
     return {
       userId: "user_1",
@@ -313,17 +315,37 @@ describe("Gate receipt replay identity", () => {
     expect(issued[2]?.nonce).not.toBe(issued[0]?.nonce)
     expect(issued[3]?.approvalId).toBe(issued[0]?.approvalId)
     expect(issued[3]?.payload).not.toEqual(issued[0]?.payload)
+    const storeInput = mocks.issueApprovalReceipt.mock.calls[0]?.[1]
+    const sourceHooks = first.scheduledOwnerFence?.sourceHooks
+    expect(storeInput.scheduledSourceHooks?.acquireFence).toBe(sourceHooks?.acquireFence)
+    await storeInput.scheduledSourceHooks.validateFinalSource({} as Prisma.TransactionClient, { jobId: "job_1" } as never)
+    expect(sourceHooks?.validateSource).toHaveBeenCalledWith(expect.anything(), "job_1")
+  })
+
+  it("fails closed when scheduled receipt issuance has no source fence hooks", async () => {
+    const { issueLegacyReceipt } = await import("./legacy-receipt")
+    const ownerFence = gateInput().scheduledOwnerFence!
+    const input = gateInput({ replayMode: "scheduled-taskgraph-gate-review", scheduledOwnerFence: { ...ownerFence, sourceHooks: undefined } })
+
+    await expect(issueLegacyReceipt({} as PrismaClient, input)).rejects.toMatchObject({ name: "AgentExecutionCancelledError" })
+    expect(mocks.issueApprovalReceipt).not.toHaveBeenCalled()
   })
 
   it("probes a scheduled Gate receipt without preparation or writes when absent", async () => {
     const { findScheduledGateReviewReceiptReplay } = await import("./legacy-receipt")
     const prepareInTransaction = vi.fn()
-    const input = gateInput({ replayMode: "scheduled-taskgraph-gate-review", prepareInTransaction })
+    const order: string[] = []
+    const sourceHooks = { acquireFence: vi.fn(async () => { order.push("source-fence") }),
+      validateSource: vi.fn(async () => { order.push("source-validation") }) }
+    const initial = gateInput({ replayMode: "scheduled-taskgraph-gate-review", prepareInTransaction })
+    const input = { ...initial, scheduledOwnerFence: { ...initial.scheduledOwnerFence!, sourceHooks,
+      assertCurrent: vi.fn(async () => { order.push("owner-validation"); return true }) } }
     const tx = {
-      agentExecution: { findFirst: vi.fn().mockResolvedValue({ id: "execution_1" }) },
-      agentApproval: { findFirst: vi.fn().mockResolvedValue(null) },
+      agentExecution: { findFirst: vi.fn(async () => { order.push("execution-read"); return { id: "execution_1" } }) },
+      agentApproval: { findFirst: vi.fn(async () => { order.push("receipt-read"); return null }) },
       applicationTask: { findFirst: vi.fn() },
     }
+    mocks.lockOpenSession.mockImplementation(async () => { order.push("session-lock") })
     const db = { $transaction: vi.fn(async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx)) } as unknown as PrismaClient
 
     await expect(findScheduledGateReviewReceiptReplay(db, input as LegacyReceiptInput & { replayMode: "scheduled-taskgraph-gate-review" })).resolves.toBeNull()
@@ -333,9 +355,40 @@ describe("Gate receipt replay identity", () => {
     expect(tx.agentExecution.findFirst).toHaveBeenCalledWith(expect.objectContaining({ where: {
       id: "execution_1", userId: "user_1", status: "running", attemptCount: 4,
     } }))
+    expect(sourceHooks.validateSource).toHaveBeenCalledWith(tx, "job_1")
+    expect(order).toEqual(["source-fence", "session-lock", "owner-validation", "execution-read", "source-validation", "receipt-read"])
     expect(mocks.refreshAgentExecutionAttempt).not.toHaveBeenCalled()
     expect(mocks.issueApprovalReceipt).not.toHaveBeenCalled()
     expect(prepareInTransaction).not.toHaveBeenCalled()
+  })
+
+  it("preserves Analyze source drift before material proof loading during independent replay", async () => {
+    const { findScheduledGateReviewReceiptReplay } = await import("./legacy-receipt")
+    const order: string[] = []
+    const sourceError = createAnalyzeSourceChangedErrorWithClaims([{ jobId: "job_1", analysisFenceAt: "2026-09-01T00:00:00.000Z" }])
+    const materialProofLoader = vi.fn(async () => { order.push("material-proof-loader") })
+    const sourceHooks = { acquireFence: vi.fn(async () => { order.push("source-fence") }),
+      validateSource: vi.fn(async () => { order.push("receipt-job-validation") }) }
+    const initial = gateInput({ replayMode: "scheduled-taskgraph-gate-review" })
+    const input = { ...initial, scheduledOwnerFence: { ...initial.scheduledOwnerFence!, sourceHooks,
+      assertCurrent: vi.fn(async () => {
+        order.push("analyze-source-validation")
+        if (order.length > 0) throw sourceError
+        await materialProofLoader()
+        return true
+      }) } }
+    const receiptRead = vi.fn()
+    const tx = { agentExecution: { findFirst: vi.fn() }, agentApproval: { findFirst: receiptRead }, applicationTask: { findFirst: vi.fn() } }
+    mocks.lockOpenSession.mockImplementation(async () => { order.push("session-lock") })
+    const db = { $transaction: vi.fn(async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx)) } as unknown as PrismaClient
+
+    await expect(findScheduledGateReviewReceiptReplay(db, input as LegacyReceiptInput & { replayMode: "scheduled-taskgraph-gate-review" }))
+      .rejects.toBe(sourceError)
+
+    expect(order).toEqual(["source-fence", "session-lock", "analyze-source-validation"])
+    expect(materialProofLoader).not.toHaveBeenCalled()
+    expect(sourceHooks.validateSource).not.toHaveBeenCalled()
+    expect(receiptRead).not.toHaveBeenCalled()
   })
 
   it("recovers an exact persisted scheduled Gate receipt and validates its linked task", async () => {

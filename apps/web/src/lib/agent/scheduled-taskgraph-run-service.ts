@@ -15,7 +15,8 @@ import { gateDecisionsFromOutput, parseGateDecisions, restoreGateOutput, schedul
   scheduledTaskGraphPipelineStageOrder as stageOrder, type ScheduledTaskGraphGateDecisions } from "./scheduled-taskgraph-gate-choice-evidence"
 import type { PipelineCtx } from "./pipeline-context"
 import type { PipelineCheckpointState } from "./types"
-import { assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent } from "./scheduled-taskgraph-source-change-task-cleanup"
+import { assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent, scheduledAnalyzeSourceChangedErrorForUntrustedState,
+  scheduledAnalyzeSourceProofIsUntrusted, scheduledSourceChangeTaskClaims } from "./scheduled-taskgraph-source-change-task-cleanup"
 
 export { isScheduledPrepareChoiceWaitId, validateScheduledPrepareWaitIdentity }
 export { assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent } from "./scheduled-taskgraph-source-change-task-cleanup"
@@ -149,8 +150,15 @@ export async function runScheduledTaskGraphAnalyzeOnly(input: ScheduledTaskGraph
   if (existing?.scheduledTaskGraphContinuation !== undefined) {
     const prior = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot: input.snapshot,
       attestation: input.attestation, ownedJobs, existingCheckpoint: input.state })
-    if (!prior.alreadyPersisted || prior.continuationKey !== continuationKey) throw new AgentExecutionCancelledError()
+    if (!prior.alreadyPersisted || prior.continuationKey !== continuationKey
+      || !scheduledTaskGraphClaimMatches(input.state, continuationKey, owner, claimToken)) throw new AgentExecutionCancelledError()
     checkpoint = prior.checkpoint
+    if (scheduledAnalyzeSourceProofIsUntrusted(checkpoint, ownedJobs.map(job => job.id))) {
+      const sourceChanged = scheduledAnalyzeSourceChangedErrorForUntrustedState(checkpoint)
+      const claims = sourceChanged && scheduledSourceChangeTaskClaims(sourceChanged, checkpoint)
+      if (sourceChanged && claims?.length && claims.length === checkpoint.scoredJobs?.length) throw sourceChanged
+      throw new AgentExecutionCancelledError()
+    }
   } else {
     if (existing?.nextStage !== "scout") throw new AgentExecutionCancelledError()
     const analyze = await runScheduledTaskGraphAnalyze({

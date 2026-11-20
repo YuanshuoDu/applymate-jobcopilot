@@ -46,9 +46,12 @@ const snapshotDigest = "sha256:" + createHash("sha256").update(JSON.stringify([s
 const checkpointOwner = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
   rootAttemptCount: 1, turnLeaseOwnerId: owner.ownerId, turnLeaseVersion: owner.leaseVersion,
   executionId: "execution-1", executionAttemptCount: 3 }
+const sourceFingerprint = { version: "agent-harness.v2.analyze-source-input.v1",
+  digest: createHash("sha256").update("job-1/current-source", "utf8").digest("hex") }
 const checkpointState = { nextStage: "gate", scoutedJobs: [{ id: "job-1", userId: owner.userId }],
   scoredJobs: [{ job: { id: "job-1", userId: owner.userId }, score: 81, matchedKeywords: ["TypeScript"], missingKeywords: [],
     recommendation: "Continue.", analysisFenceAt: "2026-10-23T12:00:00.000Z" }], analysisFailed: 0,
+  scheduledTaskGraphAnalyzeSourceFingerprints: { "job-1": sourceFingerprint },
   scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
     key: "scheduled-taskgraph:sha256:" + "a".repeat(64), snapshotDigest, evidenceDigest: "b".repeat(64), graphRevision: 9, owner: checkpointOwner } }
 const checkpointEvidence = scheduledGateCheckpointEvidence(checkpointState)!
