@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { GET } from "./route"
 
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(), sessionFindFirst: vi.fn(), turnFindMany: vi.fn(), turnFindFirst: vi.fn(), inputCount: vi.fn(),
@@ -27,8 +28,9 @@ function turn(id: string, index: number, status = "completed", goal = `Goal ${in
 }
 
 describe("agent turns query API", () => {
+  afterEach(() => vi.unstubAllEnvs())
   beforeEach(() => {
-    vi.resetModules()
+    vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "1")
     mocks.requireAuth.mockReset(); mocks.sessionFindFirst.mockReset(); mocks.turnFindMany.mockReset(); mocks.turnFindFirst.mockReset(); mocks.inputCount.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
@@ -38,7 +40,6 @@ describe("agent turns query API", () => {
   })
 
   it("projects the owned active Turn goal independently of the chronological page", async () => {
-    const { GET } = await import("./route")
     const response = await GET(request("?limit=1") as never, params)
     expect(response.status).toBe(200)
     const body = await response.json()
@@ -53,15 +54,49 @@ describe("agent turns query API", () => {
     }))
     expect(mocks.turnFindFirst).toHaveBeenCalledWith(expect.objectContaining({
       where: { sessionId: "session_1", userId: "user_1", status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] } },
-      select: expect.objectContaining({ input: true }),
+      select: expect.objectContaining({ input: true, executionMode: true, rootTaskId: true }),
     }))
     expect(mocks.inputCount).toHaveBeenCalledWith({ where: { sessionId: "session_1", userId: "user_1", status: "accepted", delivery: "follow_up" } })
+  })
+
+  it("exposes location steering only for an enabled canonical user TaskGraph Turn", async () => {
+    const eligible = {
+      ...turn("turn_2", 2, "in_progress"), executionMode: "canonical_task_graph", rootTaskId: "root_2",
+      input: { goal: "Goal", intent: { kind: "objective_task_graph_execution", version: 1 } },
+    }
+    for (const row of [eligible, { ...eligible, status: "waiting_for_dependency" }]) {
+      mocks.turnFindFirst.mockResolvedValueOnce(row)
+      const response = await GET(request() as never, params)
+      expect((await response.json()).projection.activeTurn.canSteerLocation).toBe(true)
+    }
+    const ineligible = [
+      { ...eligible, source: "automation" },
+      { ...eligible, status: "waiting_for_approval" },
+      { ...eligible, executionMode: "legacy" },
+      { ...eligible, rootTaskId: "  " },
+      { ...eligible, input: { intent: { kind: "objective_task_graph_execution", version: 2 } } },
+      { ...eligible, input: { intent: { kind: "objective_task_graph_execution", version: 1, extra: true } } },
+    ]
+    for (const row of ineligible) {
+      mocks.turnFindFirst.mockResolvedValueOnce(row)
+      const response = await GET(request() as never, params)
+      expect((await response.json()).projection.activeTurn).not.toHaveProperty("canSteerLocation")
+    }
+  })
+
+  it("hides location steering when the server feature flag is off", async () => {
+    vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "0")
+    mocks.turnFindFirst.mockResolvedValueOnce({
+      ...turn("turn_2", 2, "in_progress"), executionMode: "canonical_task_graph", rootTaskId: "root_2",
+      input: { intent: { kind: "objective_task_graph_execution", version: 1 } },
+    })
+    const response = await GET(request() as never, params)
+    expect((await response.json()).projection.activeTurn).not.toHaveProperty("canSteerLocation")
   })
 
   it("omits a missing active goal without fabricating a substitute or dropping controls", async () => {
     mocks.turnFindMany.mockResolvedValueOnce([])
     mocks.turnFindFirst.mockResolvedValueOnce({ ...turn("turn_2", 2, "in_progress"), input: { content: [{ type: "text", text: "PRIVATE_CONTEXT" }] } })
-    const { GET } = await import("./route")
     const response = await GET(request("?limit=1") as never, params)
     const body = await response.json()
     expect(body.projection.activeTurn).toEqual({ id: "turn_2", status: "in_progress", revision: 2 })
@@ -78,7 +113,6 @@ describe("agent turns query API", () => {
       const active = { ...turn("turn_2", 2, "in_progress"), input }
       mocks.turnFindMany.mockResolvedValueOnce([active])
       mocks.turnFindFirst.mockResolvedValueOnce(active)
-      const { GET } = await import("./route")
       const response = await GET(request("?limit=1") as never, params)
       const body = await response.json()
       expect(body.turns).toMatchObject([{ id: "turn_2", goal: "Process agent task" }])
@@ -91,7 +125,6 @@ describe("agent turns query API", () => {
     for (const goal of ["   ", 42, { value: "not a canonical goal" }]) {
       mocks.turnFindMany.mockResolvedValueOnce([])
       mocks.turnFindFirst.mockResolvedValueOnce({ ...turn("turn_2", 2, "in_progress"), input: { goal } })
-      const { GET } = await import("./route")
       const response = await GET(request("?limit=1") as never, params)
       const body = await response.json()
       expect(body.projection.activeTurn).toEqual({ id: "turn_2", status: "in_progress", revision: 2 })
@@ -100,7 +133,6 @@ describe("agent turns query API", () => {
 
   it("returns 404 for a foreign session and does not read turn state", async () => {
     mocks.sessionFindFirst.mockResolvedValueOnce(null)
-    const { GET } = await import("./route")
     const response = await GET(request() as never, params)
     expect(response.status).toBe(404)
     expect(mocks.turnFindMany).not.toHaveBeenCalled()
@@ -109,7 +141,6 @@ describe("agent turns query API", () => {
   })
 
   it("rejects invalid cursors before database access", async () => {
-    const { GET } = await import("./route")
     const response = await GET(request("?cursor=invalid") as never, params)
     expect(response.status).toBe(400)
     expect(mocks.sessionFindFirst).not.toHaveBeenCalled()

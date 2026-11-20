@@ -15,10 +15,11 @@ import { canonicalTaskGraphJson, taskGraphSnapshot, type TaskGraphSnapshot } fro
 import { materializeTaskGraphDependencyContext, type ScopedDependencyResult } from "./task-graph-dependency-context.js"
 import { validateTaskGraphRepairTargets } from "./task-graph-pg-create-repair-validation.js"
 import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-context-loader.js"
-import { evaluateTaskGraphObjectiveCoverage } from "../planning/task-graph-objective-coverage.js"
+import { evaluateTaskGraphPlanObjectiveCoverage } from "./task-graph-plan-objective-coverage.js"
 import { isScheduledDraftTemplate, scheduledDraftPair, scheduledDraftTaskContext, selectVerifiedScheduledDraftCandidate, type ScheduledDraftCandidateBinding } from "./scheduled-draft-candidate.js"
 import { sourceIntentForTaskGraphNode } from "./task-graph-source-intent-context.js"
 import { scheduledScoutPlanCapacityAllowed } from "./scheduled-taskgraph-plan-capacity.js"
+import { isRegisteredObjectiveScoutTemplate } from "./objective-task-graph-scout-authority.js"
 
 const EXTERNAL_ACTION = /(?:^|[._-])(submit|send|publish|delete|mutate|execute)(?:$|[._-])/i
 const REGISTERED_NESTED_SCOUT = templatesForInteractiveScoutDelegation(TASK_GRAPH_TEMPLATES, TASK_GRAPH_TEMPLATES)?.scout
@@ -59,7 +60,7 @@ function assertWriterReviewPlan(nodes: readonly TaskGraphNodeProposal[]): void {
 export async function createGraphTasks(
   client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent, current: TaskGraphState,
   priorTaskIds: ReadonlyMap<string, string>, provenance?: Pick<LoadedGraph, "sourceInputCheckpointByNodeKey" | "currentInputCheckpoint">,
-  operationalFailureReuse?: OperationalFailureCapacityReuse,
+  operationalFailureReuse?: OperationalFailureCapacityReuse, objectiveTaskGraphScoutAuthority = false,
 ): Promise<CreatedGraphTasks> {
   if (input.verificationRequirements?.status === "invalid") {
     throw Object.assign(new Error("Canonical objective verification requirements are invalid"), {
@@ -75,8 +76,7 @@ export async function createGraphTasks(
   if (applicationFillerCount > 1) throw Object.assign(new Error("TaskGraph Turn may contain at most one application filler"), { code: "task_graph_application_filler_limit" })
   const options = {
     registeredTemplateIds: new Set(Object.keys(input.templates)),
-    // Lifetime DAG size is independent from the active-child fan-out limit.
-    // createSubagentTask enforces fan-out against nonterminal rows on each insert.
+    // Lifetime DAG size and active-child fan-out are enforced independently.
     maxNodes: TASK_GRAPH_LIMITS.maxNodes,
     maxDepth: Math.min(TASK_GRAPH_LIMITS.maxDepth, policy.maxDepth),
   }
@@ -127,7 +127,7 @@ export async function createGraphTasks(
     preflightStatuses.set(node.key, status); logicalStatuses.set(node.key, status)
   })
   await validateTaskGraphRepairTargets(client, input, current, priorTaskIds)
-  const coverage = evaluateTaskGraphObjectiveCoverage(input.verificationRequirements ?? { status: "absent" }, appended.state.nodes, input.templates, input.scope.rootTaskId)
+  const coverage = await evaluateTaskGraphPlanObjectiveCoverage({ client, input, nodes: appended.state.nodes, provenance })
   if (coverage.status === "invalid") throw Object.assign(new Error("Canonical objective verification requirements are invalid"), {
     code: "task_graph_objective_requirements_invalid",
   })
@@ -192,6 +192,7 @@ export async function createGraphTasks(
     }, true, {
       preserveEmptyAllowedActions: isApplicationFillerTemplate(node.templateId, template.role, template.taskType),
       taskGraphChildDeadline: true,
+      ...(objectiveTaskGraphScoutAuthority && isRegisteredObjectiveScoutTemplate(node.templateId, template) ? { objectiveTaskGraphScoutAuthority: input.scope } : {}),
       ...(nestedScoutAuthority ? { nestedScoutAuthority } : {}),
     })
     if (status === "waiting") {
