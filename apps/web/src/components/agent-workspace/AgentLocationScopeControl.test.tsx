@@ -32,6 +32,22 @@ describe('AgentLocationScopeControl', () => {
     expect(renderToStaticMarkup(<AgentLocationScopeControl {...props} activeTurn={{ ...activeTurn, status: 'waiting_for_approval' }} />)).toBe('')
   })
 
+  it('shows confirmed and applied scopes separately, and follows the current Turn only', () => {
+    const props = { sessionId: 'session_1', activeTurn, sessionStatus: 'running', turnStateReadiness: 'ready' as const }
+    const pending = renderToStaticMarkup(<AgentLocationScopeControl {...props} activeTurn={{ ...activeTurn,
+      locationScope: { confirmed: { locations: ['dublin'], status: 'pending' }, appliedLocations: ['berlin'] },
+    }} />)
+    expect(pending).toContain('Confirmed locations waiting for the plan to adopt them: dublin')
+    expect(pending).toContain('Current plan search locations: berlin')
+    const adopted = renderToStaticMarkup(<AgentLocationScopeControl {...props} activeTurn={{ ...activeTurn,
+      locationScope: { confirmed: { locations: ['dublin'], status: 'adopted' }, appliedLocations: ['dublin'] },
+    }} />)
+    expect(adopted).toContain('Confirmed locations adopted by the plan: dublin')
+    const nextTurn = renderToStaticMarkup(<AgentLocationScopeControl {...props} activeTurn={{ ...activeTurn, id: 'turn_2' }} />)
+    expect(nextTurn).not.toContain('berlin')
+    expect(nextTurn).not.toContain('dublin')
+  })
+
   it('splits by line and preserves commas inside each location', () => {
     expect(parseLocationScopeDraft('Washington, D.C.\n Dublin \nDUBLIN\n')).toEqual(['dublin', 'washington, d.c.'])
     expect(parseLocationScopeDraft('  \n')).toBeNull()
