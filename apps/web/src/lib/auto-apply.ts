@@ -17,6 +17,7 @@ export async function queueApplicationFill(input: {
   applicationTaskId: string;
   resumeAfterUserInput?: boolean;
   sessionId?: string;
+  reviewedSourceTurnId?: string;
   retry?: boolean;
   retryId?: string;
 }): Promise<{ taskId: string; turnId?: string; disposition?: string }> {
@@ -34,7 +35,9 @@ export async function queueApplicationFill(input: {
   } catch (error) {
     throw new AutoApplyError(error instanceof Error ? error.message : "Application fill was denied by policy.")
   }
-  if (applicationFillTaskGraphEnabled()) {
+  const taskGraphEnabled = applicationFillTaskGraphEnabled();
+  if (input.reviewedSourceTurnId && !taskGraphEnabled) throw new AutoApplyError("Reviewed material fill is unavailable while TaskGraph fill is disabled.");
+  if (taskGraphEnabled) {
     if (input.retry && (!input.retryId || !/^[A-Za-z0-9_-]{8,128}$/.test(input.retryId))) {
       throw new AutoApplyError("A valid retry request ID is required for an explicit application fill retry.")
     }
@@ -53,6 +56,7 @@ export async function queueApplicationFill(input: {
     const result = await new AgentCommandService(db).startApplicationFillForReview({
       sessionId: task.sessionId, userId: input.userId, clientMessageId,
       applicationTaskId: input.applicationTaskId, retry: input.retry, resumeAfterUserInput: input.resumeAfterUserInput,
+      ...(input.reviewedSourceTurnId ? { reviewedSourceTurnId: input.reviewedSourceTurnId } : {}),
     })
     return { taskId: result.turnId, turnId: result.turnId, disposition: result.disposition }
   }
@@ -215,7 +219,6 @@ export async function queueAutonomousApplication(input: {
       data: { workflowState: "queued", analysisNote: "[Approved submission] Applying in the background after explicit user authorization." },
     });
     if (job.count !== 1) throw new AutoApplyError("This application is no longer ready for the approved submission step.");
-
     const lockedApproval = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
       SELECT "id" FROM "agent_approvals"
       WHERE "id" = ${approval.id} AND "userId" = ${input.userId} AND "sessionId" = ${receiptSessionId}

@@ -8,13 +8,17 @@ import { startApplicationFillForReview } from "./application-fill-command"
 
 type Row = Record<string, unknown>
 type Task = { id: string; userId: string; sessionId: string; jobId: string; resumeId: string | null; coverLetterId: string | null; status: string; checkpoint: string | null; fillTurnId: string | null; fillTurnSessionId: string | null; fillTurnUserId: string | null; confirmedAnswers?: unknown }
-type ResumeSeed = { waitEvents?: Row[]; answerEvents?: Row[]; fillers?: Row[]; rootLeaseOwnerId?: string | null; rootLeaseExpiresAt?: Date | null; sessionStatus?: string; turnStatus?: string; turnSessionId?: string; turnUserId?: string; activeTurn?: boolean }
-type MaterialSeed = { jobOwned?: boolean; resumeAssociated?: boolean; coverLetterAssociated?: boolean }
+type ResumeSeed = { waitEvents?: Row[]; answerEvents?: Row[]; fillers?: Row[]; rootLeaseOwnerId?: string | null; rootLeaseExpiresAt?: Date | null; sessionStatus?: string; turnStatus?: string; turnSessionId?: string; turnUserId?: string; turnInput?: unknown; activeTurn?: boolean }
+type MaterialSeed = { jobOwned?: boolean; resumeAssociated?: boolean; coverLetterAssociated?: boolean; reviewedSourceTurnId?: string }
 
 function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSeed, materialSeed: MaterialSeed = {}) {
   let task: Task = { id: "application_1", userId: "user_1", sessionId: "session_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null, status: "waiting_for_user", checkpoint: "materials_ready", fillTurnId: null, fillTurnSessionId: null, fillTurnUserId: null, confirmedAnswers: null, ...seed }
   let sessionStatus = resume?.sessionStatus ?? (resume ? "waiting_for_user" : "running")
-  let turns: Row[] = seed.fillTurnId ? [{ id: seed.fillTurnId, sessionId: resume?.turnSessionId ?? "session_1", userId: resume?.turnUserId ?? "user_1", status: resume?.turnStatus ?? (resume ? "waiting_for_user" : "completed"), revision: 0, input: {}, leaseOwnerId: resume?.rootLeaseOwnerId ?? null, leaseExpiresAt: resume?.rootLeaseExpiresAt ?? null }] : []
+  let turns: Row[] = seed.fillTurnId ? [{ id: seed.fillTurnId, sessionId: resume?.turnSessionId ?? "session_1", userId: resume?.turnUserId ?? "user_1", status: resume?.turnStatus ?? (resume ? "waiting_for_user" : "completed"), revision: 0, input: resume?.turnInput ?? {}, leaseOwnerId: resume?.rootLeaseOwnerId ?? null, leaseExpiresAt: resume?.rootLeaseExpiresAt ?? null }] : []
+  if (materialSeed.reviewedSourceTurnId) turns.push({
+    id: materialSeed.reviewedSourceTurnId, sessionId: "session_1", userId: "user_1", status: "completed", source: "user",
+    rootTaskId: "root_1", input: { selectedJobPreparation: { jobId: "job_1" } },
+  })
   if (resume?.activeTurn) turns.push({ id: "turn_active", sessionId: "session_1", userId: "user_1", status: "in_progress", revision: 0, input: {} })
   const fillers = resume?.fillers ?? []
   let inputs: Row[] = []
@@ -54,10 +58,18 @@ function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSe
     agentTurn: {
       findFirst: vi.fn(async (args: unknown) => {
         const where = (args as { where: Row }).where
-        if (where.id) return turns.find(turn => turn.id === where.id && turn.sessionId === where.sessionId && turn.userId === where.userId) ?? null
+        if (where.id) return turns.find(turn => turn.id === where.id && turn.sessionId === where.sessionId && turn.userId === where.userId
+          && (!where.status || turn.status === where.status) && (!where.source || turn.source === where.source)) ?? null
         return turns.find(turn => turn.sessionId === where.sessionId && turn.userId === where.userId && (where.status as { in: string[] }).in.includes(String(turn.status))) ?? null
       }),
       create: vi.fn(async ({ data }: { data: Row }) => { turns.push(data); return { id: data.id } }),
+      updateMany: vi.fn(async ({ where, data }: { where: Row; data: Row }) => {
+        const turn = turns.find(row => row.id === where.id && row.sessionId === where.sessionId && row.userId === where.userId
+          && row.status === where.status && row.source === where.source)
+        if (!turn) return { count: 0 }
+        Object.assign(turn, data)
+        return { count: 1 }
+      }),
     },
     agentItem: { create: vi.fn(async ({ data }: { data: Row }) => { items.push(data); return data }) },
     agentEvent: {
@@ -69,6 +81,8 @@ function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSe
     },
     agentOutbox: { create: vi.fn(async ({ data }: { data: Row }) => { if (failOutbox) throw new Error("outbox unavailable"); outbox.push(data); return data }) },
     applicationTask: {
+      findFirst: vi.fn(async ({ where }: { where: Row }) => task.id === where.id && task.userId === where.userId
+        && task.sessionId === where.sessionId ? { id: task.id, jobId: task.jobId } : null),
       updateMany: vi.fn(async ({ where, data }: { where: Row; data: Row }) => {
         if (task.id !== where.id || task.userId !== where.userId || task.sessionId !== where.sessionId || task.status !== where.status || task.checkpoint !== where.checkpoint || task.fillTurnId !== where.fillTurnId) return { count: 0 }
         task = { ...task, ...data } as Task
@@ -104,7 +118,7 @@ function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSe
   return { db, tx, state: { get task() { return task }, get sessionStatus() { return sessionStatus }, get turns() { return turns }, get inputs() { return inputs }, get items() { return items }, get events() { return events }, get outbox() { return outbox } } }
 }
 
-const command = (clientMessageId: string, retry = false, resumeAfterUserInput = false) => ({ sessionId: "session_1", userId: "user_1", applicationTaskId: "application_1", clientMessageId, ...(retry ? { retry: true } : {}), ...(resumeAfterUserInput ? { resumeAfterUserInput: true } : {}) })
+const command = (clientMessageId: string, retry = false, resumeAfterUserInput = false, reviewedSourceTurnId?: string) => ({ sessionId: "session_1", userId: "user_1", applicationTaskId: "application_1", clientMessageId, ...(retry ? { retry: true } : {}), ...(resumeAfterUserInput ? { resumeAfterUserInput: true } : {}), ...(reviewedSourceTurnId ? { reviewedSourceTurnId } : {}) })
 
 function readyToResume() {
   const waitAt = new Date("2026-10-15T10:00:00.000Z")
@@ -128,6 +142,29 @@ describe("startApplicationFillForReview", () => {
     const preflightIndex = fake.tx.$queryRaw.mock.calls.findIndex(([query]) => ((query as { strings?: readonly string[] }).strings ?? []).join(" ").includes('FROM "application_tasks" AS app'))
     expect(preflightIndex).toBeGreaterThanOrEqual(0)
     expect(fake.tx.agentTurn.create.mock.invocationCallOrder[0]).toBeGreaterThan(fake.tx.$queryRaw.mock.invocationCallOrder[preflightIndex] ?? Number.POSITIVE_INFINITY)
+  })
+
+  it("persists only the validated reviewed source on the new fill Turn and preserves its input", async () => {
+    const fake = harness({}, false, undefined, { reviewedSourceTurnId: "source_turn_1" })
+    const result = await startApplicationFillForReview(fake.db, command("fill_reviewed_source", false, false, "source_turn_1"))
+    const created = fake.state.turns.find(turn => turn.id === result.turnId)
+    expect(created?.input).toMatchObject({
+      clientMessageId: "fill_reviewed_source", goal: "Fill the server-bound application form for user review. Never submit it.",
+      reviewedApplicationMaterialSource: {
+        schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source_turn_1",
+      },
+    })
+    expect(fake.tx.agentTurn.updateMany).toHaveBeenCalledTimes(1)
+  })
+
+  it("rejects a reviewed source that is not an owned completed preparation for the task job", async () => {
+    const fake = harness({}, false, undefined, { reviewedSourceTurnId: "source_turn_1" })
+    const source = fake.state.turns.find(turn => turn.id === "source_turn_1")!
+    source.input = { selectedJobPreparation: { jobId: "another_job" } }
+    await expect(startApplicationFillForReview(fake.db, command("fill_wrong_source", false, false, "source_turn_1")))
+      .rejects.toMatchObject({ code: "reviewed_fill_source_unavailable" })
+    expect(fake.state.turns.some(turn => turn.id !== "source_turn_1")).toBe(false)
+    expect(fake.state.outbox).toHaveLength(0)
   })
 
   it.each([
@@ -156,6 +193,15 @@ describe("startApplicationFillForReview", () => {
     expect(fake.state.turns).toHaveLength(1)
     expect(fake.state.inputs).toHaveLength(1)
     expect(fake.state.outbox.filter(entry => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+  })
+
+  it("returns the exact original accepted input receipt on a same-message replay", async () => {
+    const fake = harness()
+    const first = await startApplicationFillForReview(fake.db, command("fill_replay_receipt"))
+    fake.state.inputs.unshift({ id: "earlier_input", clientMessageId: "other_command", sessionId: "session_1", userId: "user_1",
+      targetTurnId: first.turnId, acceptedSequence: BigInt(1) })
+    const replay = await startApplicationFillForReview(fake.db, command("fill_replay_receipt"))
+    expect(replay).toMatchObject({ inputId: first.inputId, turnId: first.turnId, sequence: first.sequence, disposition: "duplicate" })
   })
 
   it("rolls back the task claim and Turn if dispatch outbox creation fails", async () => {
@@ -188,6 +234,23 @@ describe("startApplicationFillForReview", () => {
     expect(result.turnId).not.toBe("turn_previous")
     expect(fake.state.task).toMatchObject({ fillTurnId: result.turnId, status: "filling", checkpoint: "taskgraph_fill_queued" })
     expect(fake.state.turns).toHaveLength(2)
+  })
+
+  it("inherits the original reviewed source on an explicit fill retry without a new selector", async () => {
+    const fake = harness(
+      { status: "failed", checkpoint: "fill_prestart_failed", fillTurnId: "turn_previous", fillTurnSessionId: "session_1", fillTurnUserId: "user_1" },
+      false,
+      { turnStatus: "failed", turnInput: { reviewedApplicationMaterialSource: {
+        schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source_turn_1",
+      } }, fillers: [{ id: "subagent_fill_1", status: "failed", leaseOwner: null, leaseExpiresAt: null }] },
+      { reviewedSourceTurnId: "source_turn_1" },
+    )
+    const result = await startApplicationFillForReview(fake.db, command("fill_retry_source", true))
+    expect(fake.state.turns.find(turn => turn.id === result.turnId)?.input).toMatchObject({
+      reviewedApplicationMaterialSource: {
+        schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source_turn_1",
+      },
+    })
   })
 
   it("waits for a Stop-cancelled filler to become terminal and lease-free before an explicit retry", async () => {

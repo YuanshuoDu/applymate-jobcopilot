@@ -34,12 +34,22 @@ function makeTransaction(
       return [freshness]
     }),
     agentApproval: {
-      findFirst: vi.fn(async () => row),
-      updateMany: vi.fn(async () => ({ count: 1 })),
+      findFirst: vi.fn(async () => ({ ...row })),
+      updateMany: vi.fn(async ({ data }: { data: Record<string, unknown> }) => { Object.assign(row, data); return { count: 1 } }),
     },
-    agentTurn: { findFirst: vi.fn(async () => ({ id: row.turnId, status: turnStatus })) },
+    agentTurn: { findFirst: vi.fn(async ({ where }: { where: Record<string, unknown> }) => where.id === "source_turn_1"
+      ? { id: "source_turn_1", userId: "user_1", sessionId: "session_1", status: "completed", source: "user", rootTaskId: "root_1", input: { selectedJobPreparation: { jobId: "job_1" } } }
+      : { id: row.turnId, status: turnStatus }) },
+    applicationTask: { findFirst: vi.fn(async () => ({ id: "task_1", jobId: "job_1" })) },
+    applicationTaskEvent: {
+      findMany: vi.fn(async () => []),
+      create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => data),
+    },
   }
-  return { row, tx: tx as unknown as Prisma.TransactionClient, rawQuery: tx.$queryRaw, turnFindFirst: tx.agentTurn.findFirst }
+  return {
+    row, tx: tx as unknown as Prisma.TransactionClient, rawQuery: tx.$queryRaw, turnFindFirst: tx.agentTurn.findFirst,
+    approvalUpdate: tx.agentApproval.updateMany, applicationEventCreate: tx.applicationTaskEvent.create,
+  }
 }
 
 const input = {
@@ -91,6 +101,19 @@ describe("Web pending approval freshness", () => {
       data: { status: "approved", decidedAt: NOW },
     })
     expect(fake.tx.$queryRaw).toHaveBeenCalledTimes(2)
+  })
+
+  it("writes reviewed-source binding after the successful approval CAS in the same transaction", async () => {
+    const fake = makeTransaction()
+    Object.assign(fake.row, {
+      type: "review_application", jobId: "job_1", payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    })
+    await resolvePendingApprovalInTransaction(fake.tx, { ...input, reviewedSourceTurnId: "source_turn_1" })
+    expect(fake.row.status).toBe("approved")
+    expect(fake.applicationEventCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ taskId: "task_1", type: "reviewed_material_source_bound", actor: "user" }),
+    }))
+    expect(fake.approvalUpdate.mock.invocationCallOrder[0]).toBeLessThan(fake.applicationEventCreate.mock.invocationCallOrder[0])
   })
 
   it("preserves consumed receipt replay semantics without a freshness read", async () => {

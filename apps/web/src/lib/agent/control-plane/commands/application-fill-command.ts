@@ -3,18 +3,23 @@ import { Prisma, type PrismaClient } from "@prisma/client"
 import { interruptActiveTurn } from "./execution-cancellation"
 import { AgentCommandError, invalidCommand, isUniqueViolation } from "./errors"
 import { assertApplicationFillPreflight, assertApplicationFillRetryReady, lockApplicationFillTask } from "./application-fill-preflight"
-import { acceptInputFacts, createRootTurn, findActiveTurn, findExistingCommand, lockOpenSession, type CommandTransaction } from "./transaction"
+import { acceptInputFacts, createRootTurn, findActiveTurn, findExistingCommand, lockOpenSession, type CommandTransaction, type ExistingCommand } from "./transaction"
 import type { CommandIdentity, CommandResult, InterruptCommand } from "./types"
+import { matchesReviewedSourceTurn, ReviewedFillSourceBindingError, persistReviewedSourceOnFillTurn, reviewedSourceForExistingFillTurn, validateReviewedSourceForApplication } from "../../approval/reviewed-fill-source-binding"
 
 const START_CHECKPOINTS = ["materials_ready"]
 const CONTENT = [{ type: "text" as const, text: "Fill the server-bound application form for user review. Never submit it." }]
 
-async function existingFillResult(tx: CommandTransaction, turnId: string, identity: CommandIdentity): Promise<CommandResult> {
+async function existingFillResult(
+  tx: CommandTransaction, turnId: string, identity: CommandIdentity, sourceTurnId?: string,
+  original?: Pick<ExistingCommand, "id" | "acceptedSequence">,
+): Promise<CommandResult> {
   const turn = await tx.agentTurn.findFirst({
-    where: { id: turnId, sessionId: identity.sessionId, userId: identity.userId }, select: { id: true },
+    where: { id: turnId, sessionId: identity.sessionId, userId: identity.userId }, select: { id: true, input: true },
   })
   if (!turn) throw new AgentCommandError("retry_target_invalid", "The bound application fill Turn is unavailable", 409)
-  const input = await tx.agentInput.findFirst({
+  if (sourceTurnId && !matchesReviewedSourceTurn(turn.input, sourceTurnId)) throw new ReviewedFillSourceBindingError()
+  const input = original ?? await tx.agentInput.findFirst({
     where: { sessionId: identity.sessionId, userId: identity.userId, targetTurnId: turnId },
     orderBy: { createdAt: "asc" }, select: { id: true, acceptedSequence: true },
   })
@@ -27,6 +32,7 @@ type FillCommand = {
   userId: string
   clientMessageId: string
   applicationTaskId: string
+  reviewedSourceTurnId?: string
   retry?: boolean
   resumeAfterUserInput?: boolean
 }
@@ -37,7 +43,9 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
     if (typeof value !== "string" || !value.trim() || value.length > 256) throw invalidCommand(`Application fill requires a valid ${name}`)
   }
   if ((command.retry !== undefined && typeof command.retry !== "boolean") || (command.resumeAfterUserInput !== undefined && typeof command.resumeAfterUserInput !== "boolean")
-    || (command.retry && command.resumeAfterUserInput)) throw invalidCommand("Application fill retry and user-input resume are separate actions")
+    || (command.retry && command.resumeAfterUserInput) || (command.reviewedSourceTurnId && (command.retry || command.resumeAfterUserInput))) {
+    throw invalidCommand("Application fill retry and user-input resume are separate actions")
+  }
   const identity: CommandIdentity = { sessionId: command.sessionId, userId: command.userId, clientMessageId: command.clientMessageId, source: "user" }
   try {
     return await db.$transaction(async (tx) => {
@@ -46,7 +54,7 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
         const existing = await findExistingCommand(tx, identity.sessionId, identity.clientMessageId)
         if (existing) {
           if (!existing.targetTurnId) throw new AgentCommandError("turn_not_active", "Duplicate application fill has no target Turn", 409)
-          return { inputId: existing.id, turnId: existing.targetTurnId, disposition: "duplicate", originalDisposition: "started", sequence: existing.acceptedSequence.toString() }
+          return existingFillResult(tx, existing.targetTurnId, identity, command.reviewedSourceTurnId, existing)
         }
       }
 
@@ -76,7 +84,11 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
               expectedRevision: resume.active.revision,
             }
             await interruptActiveTurn(tx, interrupt, resume.active, { taskGraphFillCancellation: "preserve" })
-            return await createFillTurn(tx, resumeIdentity, task, command.applicationTaskId, true)
+            const reviewedSourceTurnId = await reviewedSourceForExistingFillTurn(tx, {
+              turnId: task.fillTurnId, userId: identity.userId, sessionId: identity.sessionId,
+              applicationTaskId: command.applicationTaskId,
+            })
+            return await createFillTurn(tx, resumeIdentity, task, command.applicationTaskId, true, reviewedSourceTurnId)
           }
         }
         throw new AgentCommandError("retry_target_invalid", "Application task is not ready to resume after persisted user answers", 409)
@@ -85,7 +97,7 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
         if (task.fillTurnSessionId !== identity.sessionId || task.fillTurnUserId !== identity.userId) {
           throw new AgentCommandError("agent_session_not_found", "Application fill ownership did not match", 404)
         }
-        return existingFillResult(tx, task.fillTurnId, identity)
+        return existingFillResult(tx, task.fillTurnId, identity, command.reviewedSourceTurnId)
       }
 
       if (command.retry) {
@@ -96,7 +108,14 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
       const active = await findActiveTurn(tx, identity.sessionId, identity.userId)
       if (active) throw new AgentCommandError("retry_active_conflict", "Finish or stop the active Turn before starting an application fill", 409, { turnId: active.id })
       await assertApplicationFillPreflight(tx, command.applicationTaskId, identity)
-      return createFillTurn(tx, identity, task, command.applicationTaskId)
+      const reviewedSourceTurnId = command.reviewedSourceTurnId ?? (command.retry && task.fillTurnId
+        ? await reviewedSourceForExistingFillTurn(tx, { turnId: task.fillTurnId, userId: identity.userId,
+          sessionId: identity.sessionId, applicationTaskId: command.applicationTaskId }) : undefined)
+      if (reviewedSourceTurnId) await validateReviewedSourceForApplication(tx, {
+        sourceTurnId: reviewedSourceTurnId, userId: identity.userId, sessionId: identity.sessionId,
+        applicationTaskId: command.applicationTaskId,
+      })
+      return createFillTurn(tx, identity, task, command.applicationTaskId, false, reviewedSourceTurnId)
     })
   } catch (error: unknown) {
     if (!isUniqueViolation(error)) throw error
@@ -114,7 +133,7 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
         if (!resumed) throw error
         return resumed
       }
-      return existingFillResult(tx, task.fillTurnId, identity)
+      return existingFillResult(tx, task.fillTurnId, identity, command.reviewedSourceTurnId)
     })
   }
 }
@@ -125,8 +144,13 @@ async function createFillTurn(
   task: { id: string; status: string; checkpoint: string | null; fillTurnId: string | null },
   applicationTaskId: string,
   resumeSession = false,
+  reviewedSourceTurnId?: string,
 ): Promise<CommandResult> {
   const turn = await createRootTurn(tx, identity, CONTENT)
+  if (reviewedSourceTurnId) await persistReviewedSourceOnFillTurn(tx, {
+    turnId: turn.id, userId: identity.userId, sessionId: identity.sessionId,
+    clientMessageId: identity.clientMessageId, sourceTurnId: reviewedSourceTurnId,
+  })
   const accepted = await acceptInputFacts(tx, identity, CONTENT, turn, "follow_up", "started", true)
   const claim = await tx.applicationTask.updateMany({
     where: { id: applicationTaskId, userId: identity.userId, sessionId: identity.sessionId,

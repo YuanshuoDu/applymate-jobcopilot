@@ -29,6 +29,13 @@ describe("session action support", () => {
     expect(approvalTitle("cancelled")).toBe("Cancelled")
   })
 
+  it("accepts only a bounded source selector on an approved application review", () => {
+    expect(readBody({ type: "approval_response", decision: "approved", reviewedSourceTurnId: "source_turn_1" }))
+      .toMatchObject({ reviewedSourceTurnId: "source_turn_1" })
+    expect(readBody({ type: "approval_response", decision: "rejected", reviewedSourceTurnId: "source_turn_1" })).toBeNull()
+    expect(readBody({ type: "approval_response", decision: "approved", reviewedSourceTurnId: "  " })).toBeNull()
+  })
+
   it("requires a stable request ID for explicit fill retries", () => {
     expect(readBody({ type: "retry_application_fill", applicationTaskId: " task_1 ", requestId: "retry_12345678" })).toEqual({
       type: "retry_application_fill", applicationTaskId: "task_1", requestId: "retry_12345678",

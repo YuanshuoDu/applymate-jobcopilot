@@ -2,6 +2,7 @@ import { Prisma } from "@prisma/client"
 
 import { ACTIVE_TURN_STATUSES } from "../control-plane/commands/transaction"
 import { ApprovalStoreError, type ApprovalDecision } from "./types"
+import { persistReviewedFillSourceInTransaction } from "./reviewed-fill-source-binding"
 
 type Tx = Prisma.TransactionClient
 
@@ -11,6 +12,7 @@ export interface PendingApprovalDecisionInput {
   sessionId: string
   decision: ApprovalDecision
   now: Date
+  reviewedSourceTurnId?: string
 }
 
 export interface ResolvedApprovalRow {
@@ -110,5 +112,9 @@ export async function resolvePendingApprovalInTransaction(
     data: { status: input.decision, decidedAt: input.now },
   })
   if (updated.count !== 1) throw new ApprovalStoreError("approval_not_approved", "Approval receipt resolution raced with another decision")
+  if (input.reviewedSourceTurnId !== undefined) await persistReviewedFillSourceInTransaction(tx, {
+    approvalId: row.id, userId: row.userId, sessionId: row.sessionId,
+    decision: input.decision, sourceTurnId: input.reviewedSourceTurnId,
+  })
   return { ...row, turnId }
 }

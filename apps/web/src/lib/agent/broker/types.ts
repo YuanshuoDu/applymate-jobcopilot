@@ -40,6 +40,7 @@ export interface WaitCommandInput {
 
 export interface ApprovalDecisionInput extends WaitCommandInput {
   decision: WaitDecision
+  reviewedSourceTurnId?: string
 }
 
 export interface QuestionAnswerInput extends WaitCommandInput {
