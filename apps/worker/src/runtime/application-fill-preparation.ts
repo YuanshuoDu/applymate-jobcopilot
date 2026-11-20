@@ -7,9 +7,11 @@ export type ApplicationFillPreparation = Readonly<{ available: true }>
 type BoundApplicationTask = {
   id: string
   userId: string
+  jobId: string
   sessionId: string | null
   fillTurnSessionId: string | null
   fillTurnUserId: string | null
+  turnInput: unknown
   status: string
   checkpoint: string | null
 }
@@ -28,7 +30,8 @@ export async function loadApplicationFillPreparation(
     await client.query("BEGIN")
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", lease.userId])
     const bound = await client.query<BoundApplicationTask>(
-      `SELECT app."id", app."userId", app."sessionId", app."fillTurnSessionId", app."fillTurnUserId", app."status", app."checkpoint"
+      `SELECT app."id", app."userId", app."jobId", app."sessionId", app."fillTurnSessionId", app."fillTurnUserId", app."status", app."checkpoint",
+              turn."input" AS "turnInput"
        FROM "agent_turns" AS turn
        INNER JOIN "application_tasks" AS app ON app."fillTurnId" = turn."id"
        WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
@@ -48,6 +51,19 @@ export async function loadApplicationFillPreparation(
     }
     if (task.status !== "filling" || task.checkpoint !== "taskgraph_fill_queued") {
       throw new Error("application_fill_state_invalid")
+    }
+
+    const selector = reviewedSourceSelector(task.turnInput)
+    if (selector.kind === "invalid") return await commitUnavailable(client, () => { committed = true })
+    if (selector.kind === "selected") {
+      // The terminal reader imports TaskGraph state; defer loading it until the marked path.
+      const { readSelectedJobReviewedArtifactWithClient } = await import("./selected-job-reviewed-artifact-read.js")
+      const proof = await readSelectedJobReviewedArtifactWithClient(client, {
+        userId: lease.userId, sessionId: lease.sessionId, jobId: task.jobId, sourceTurnId: selector.sourceTurnId,
+      })
+      if (!proof || proof.jobId !== task.jobId || proof.sourceTurnId !== selector.sourceTurnId) {
+        return await commitUnavailable(client, () => { committed = true })
+      }
     }
 
     const materials = await client.query<{ id: string }>(
@@ -80,4 +96,30 @@ async function commitUnavailable(client: Pick<pg.PoolClient, "query">, markCommi
   await client.query("COMMIT")
   markCommitted()
   return undefined
+}
+
+type ReviewedSourceSelector = Readonly<{ kind: "absent" | "invalid" }>
+  | Readonly<{ kind: "selected"; sourceTurnId: string }>
+
+function reviewedSourceSelector(value: unknown): ReviewedSourceSelector {
+  const input = plainRecord(value)
+  if (!input) return { kind: "invalid" }
+  if (!Object.prototype.hasOwnProperty.call(input, "reviewedApplicationMaterialSource")) return { kind: "absent" }
+  const source = plainRecord(input.reviewedApplicationMaterialSource)
+  if (!source || Object.keys(source).sort().join(",") !== "schemaVersion,sourceTurnId"
+    || source.schemaVersion !== "agent-harness.v2.selected-job-reviewed-fill-source.v1"
+    || typeof source.sourceTurnId !== "string" || !source.sourceTurnId.trim() || source.sourceTurnId.length > 256) {
+    return { kind: "invalid" }
+  }
+  return { kind: "selected", sourceTurnId: source.sourceTurnId }
+}
+
+function plainRecord(value: unknown): Record<string, unknown> | null {
+  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
+  try {
+    const prototype = Object.getPrototypeOf(parsed)
+    return (prototype === Object.prototype || prototype === null) && Object.getOwnPropertySymbols(parsed).length === 0
+      ? parsed as Record<string, unknown> : null
+  } catch { return null }
 }
