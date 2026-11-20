@@ -11,6 +11,11 @@ export function safeTaskGraphRevision(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined
 }
 
+export function requireNonEmptyId(value: string, field: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) throw new TypeError(`${field} must be non-empty`)
+  return value
+}
+
 export function ensureTurnInputs(inputs: readonly StoredAgentInput[], request: { readonly sessionId: string; readonly turnId: string; readonly scope: TenantScope }, createError: (inputId: string) => Error): void {
   for (const input of inputs) if (input.sessionId !== request.sessionId || input.targetTurnId !== request.turnId || input.userId !== request.scope.userId || !["steer", "follow_up"].includes(input.delivery)) throw createError(input.id)
 }
@@ -96,6 +101,7 @@ type StepSteeringContext = Readonly<{
   renderInputs: readonly StoredAgentInput[]
   activeInputIds: readonly string[]
   markerInputs: readonly StoredAgentInput[]
+  hasUnresolvedConsumedSteer: boolean
 }>
 
 export async function loadStepSteeringContext(
@@ -122,7 +128,10 @@ export async function loadStepSteeringContext(
     ? [...await markerLoader!({ sessionId: request.sessionId, turnId: request.turnId, inputIds: activeInputIds, lease: request.lease })]
     : []
   assertHydratedSteeringInputs(activeInputIds, markerInputs)
-  return { activeInputIds, markerInputs, renderInputs: mergeSteeringInputs(mergeSteeringInputs(claimed.inputs, markerInputs), unresolvedInputs) }
+  const hasUnresolvedConsumedSteer = scope !== undefined && scope.userId === request.scope.userId && scope.rootTaskId === request.taskId
+    && scope.parentTaskId === request.taskId && unresolvedInputs.some(input => input.delivery === "steer" && input.status === "consumed")
+  return { activeInputIds, markerInputs, hasUnresolvedConsumedSteer,
+    renderInputs: mergeSteeringInputs(mergeSteeringInputs(claimed.inputs, markerInputs), unresolvedInputs) }
 }
 
 export function stepSteeringMarkerControl(
