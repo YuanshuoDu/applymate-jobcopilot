@@ -95,7 +95,7 @@ export async function runPrepare(
           isDefault: false, directionId: defaultResume.directionId, kind: 'adapted',
           parentResumeId: defaultResume.id, targetJobId: sj.job.id, origin: 'ai-adapted',
           basicsDetached: defaultResume.basicsDetached,
-        } }))
+        } }), { sourceMaterialFence: true })
         tailoredResumeId = saved.id
         tailoredResumeName = saved.name
         tailoredResumeArtifact = buildDraftArtifactSummary({ id: saved.id, kind: 'resume', content: tailored, baseArtifactId: defaultResume.id, baseHash, constraints, provenance })

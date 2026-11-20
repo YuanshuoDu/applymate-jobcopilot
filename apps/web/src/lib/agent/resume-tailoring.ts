@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { modelChat, parseAiJson, type AiConfig } from '@/lib/model-router'
 import { buildPersona } from '@/lib/persona'
 import { personaEvidenceContext, retrievePersonaEvidence } from '@/lib/persona-evidence'
+import { acquireSourceMaterialFence } from './source-material-fence'
 import { assertSupportedClaims, type EvidenceInput } from './artifacts/provenance'
 import { buildDraftArtifactSummary } from './artifacts/repository'
 import type { ArtifactConstraintSet } from './artifacts/types'
@@ -64,21 +65,24 @@ export async function tailorResumeForAgent(input: TailoringInput): Promise<Tailo
   if (!content || Array.isArray(content)) throw new Error('The writer returned an invalid resume document.')
   const provenance = assertSupportedClaims({ content, evidence: evidenceInputs, allowedContext: [job.company, job.role, evidence] })
 
-  const created = await db.resume.create({
-    data: {
-      userId: input.userId,
-      name: `Tailored for ${job.company} - ${job.role}`,
-      content: content as Prisma.InputJsonValue,
-      templateId: resume.templateId,
-      templateOptions: resume.templateOptions ?? undefined,
-      isDefault: false,
-      directionId: resume.directionId,
-      kind: 'adapted',
-      parentResumeId: resume.id,
-      targetJobId: job.id,
-      origin: 'ai-adapted',
-      basicsDetached: resume.basicsDetached,
-    },
+  const created = await db.$transaction(async tx => {
+    await acquireSourceMaterialFence(tx, [input.userId])
+    return tx.resume.create({
+      data: {
+        userId: input.userId,
+        name: `Tailored for ${job.company} - ${job.role}`,
+        content: content as Prisma.InputJsonValue,
+        templateId: resume.templateId,
+        templateOptions: resume.templateOptions ?? undefined,
+        isDefault: false,
+        directionId: resume.directionId,
+        kind: 'adapted',
+        parentResumeId: resume.id,
+        targetJobId: job.id,
+        origin: 'ai-adapted',
+        basicsDetached: resume.basicsDetached,
+      },
+    })
   })
   await db.activity.create({
     data: {
