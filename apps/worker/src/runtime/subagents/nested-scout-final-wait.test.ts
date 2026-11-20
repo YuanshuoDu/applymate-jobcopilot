@@ -1,10 +1,13 @@
 import { readFileSync } from "node:fs"
 import { describe, expect, it, vi } from "vitest"
 import type { PrepareFinalDependencyWaitInput } from "../turns/turn-execution-options.js"
+import type { StepContextSnapshot } from "../context/step-context-builder.js"
+import { createChildContextBuilder } from "./child-context.js"
 import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 import { createNestedScoutFinalWait, prepareNestedScoutFinalWait } from "./nested-scout-final-wait.js"
 import type { NestedScoutChildRow } from "./nested-scout-tools.js"
-import type { SubagentLease } from "./types.js"
+import { projectChildToolCallIdsForModelContext } from "../turns/turn-tool-call-id-projection.js"
+import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 
 const controller = new AbortController()
 const lease = {
@@ -27,6 +30,19 @@ const child = (taskId: string, status = "running"): NestedScoutChildRow => ({
     nestedScoutSourceSlice: ["greenhouse"], nestedScoutQueryScope: [{ source: "greenhouse", targetRoles: ["Engineer"], targetLocations: [], maxPageSize: 20 }],
   }, result: null, failureReason: null,
 })
+async function projectedChildContext(input: PrepareFinalDependencyWaitInput, snapshot: StepContextSnapshot) {
+  if (input.identity.kind !== "task") throw new Error("fixture requires a task identity")
+  const task: SubagentTaskRecord = {
+    id: input.identity.taskId, userId: input.identity.userId, sessionId: input.identity.sessionId, turnId: input.identity.turnId,
+    rootTaskId: input.identity.rootTaskId, parentTaskId: input.identity.rootTaskId, path: "/root-task/parent-task", depth: 1,
+    role: "scout", taskType: "job_discovery", status: "running", goal: "Scout jobs", constraints: [], successCriteria: [],
+    allowedActions: [], context: {}, expectedOutputSchema: null, result: null, failureReason: null, attemptCount: input.identity.attemptCount,
+    maxAttempts: 3, leaseOwner: input.identity.ownerId, leaseExpiresAt: input.identity.leaseExpiresAt, interruptRequestedAt: null,
+    budgetSnapshot: {}, toolPolicySnapshot: {},
+  }
+  const initial: StepContextSnapshot = { system: [], profile: [], goal: { id: "goal", content: "Scout jobs" }, steerHistory: [], businessRefs: [], toolObservations: [] }
+  return createChildContextBuilder(task, initial).build({ scope: { userId: input.identity.userId }, identity: input.identity, stepId: input.step.id, snapshot })
+}
 function waitObservation(status: "ready" | "timed_out" = "ready", taskStatus = "completed", suffix = "1") {
   const id = `child-resume:item-${suffix}`
   const content = {
@@ -89,6 +105,52 @@ describe("nested Scout final dependency wait", () => {
     const observed = waitObservation(status, taskStatus), base = waitInput()
     const input = { ...base, snapshot: { ...base.snapshot, toolObservations: [observed.snapshot] }, context: { ...base.context, blocks: [observed.context] } }
     expect(prepareNestedScoutFinalWait(input, lease, [child("child-a", taskStatus)])).toBeNull()
+  })
+
+  it("matches a ready child wait through only its request-local model alias", async () => {
+    const base = waitInput()
+    if (base.identity.kind !== "task") throw new Error("fixture requires a task identity")
+    const completed = [child("child-a", "completed")]
+    const safe = waitObservation(), safeSnapshot = { ...base.snapshot, toolObservations: [safe.snapshot] }
+    const safeProjection = projectChildToolCallIdsForModelContext(safeSnapshot, base.identity, base.step.id)
+    const safeContext = await projectedChildContext(base, safeProjection.snapshot)
+    expect(safeProjection.aliasToCanonical.size).toBe(0)
+    expect(prepareNestedScoutFinalWait({ ...base, snapshot: safeSnapshot, context: safeContext,
+      toolCallAliases: safeProjection.aliasToCanonical }, lease, completed)).toBeNull()
+
+    const canonicalCallId = "child-wait-call:415-555-0134"
+    const unsafe = waitObservation(), source = { ...unsafe.snapshot, content: { ...unsafe.snapshot.content, toolCallId: canonicalCallId } }
+    const snapshot = { ...base.snapshot, toolObservations: [source] }
+    const projection = projectChildToolCallIdsForModelContext(snapshot, base.identity, base.step.id)
+    const context = await projectedChildContext(base, projection.snapshot)
+    const aliasEntry = [...projection.aliasToCanonical].find(([, id]) => id === canonicalCallId)
+    expect(aliasEntry).toBeDefined()
+    const [alias] = aliasEntry!
+    const visibleId = `tool-call-observation:${alias}`
+    const input = { ...base, snapshot, context, toolCallAliases: projection.aliasToCanonical }
+    expect(context.blocks.filter(block => block.id === visibleId)).toHaveLength(1)
+    expect(prepareNestedScoutFinalWait(input, lease, completed)).toBeNull()
+    expect(prepareNestedScoutFinalWait({ ...input, toolCallAliases: new Map() }, lease, completed)).toEqual({ taskIds: ["child-a"] })
+    expect(prepareNestedScoutFinalWait({ ...input, toolCallAliases: new Map([[alias, "wrong-canonical-id"]]) }, lease, completed))
+      .toEqual({ taskIds: ["child-a"] })
+    expect(prepareNestedScoutFinalWait({ ...input, toolCallAliases: new Map([["toolcall-unknown", canonicalCallId]]) }, lease, completed))
+      .toEqual({ taskIds: ["child-a"] })
+    expect(prepareNestedScoutFinalWait({ ...input, toolCallAliases: new Map([[alias, canonicalCallId], ["toolcall-other", canonicalCallId]]) }, lease, completed))
+      .toEqual({ taskIds: ["child-a"] })
+    const changedBlocks = context.blocks.map(block => {
+      if (block.id !== visibleId) return block
+      const content = block.content as { readonly [key: string]: unknown }
+      const output = content.output as { readonly [key: string]: unknown }
+      return { ...block, content: { ...content, output: { ...output, waitId: "changed-wait" } } as typeof block.content }
+    })
+    expect(prepareNestedScoutFinalWait({ ...input, context: { ...context, blocks: changedBlocks } }, lease, completed))
+      .toEqual({ taskIds: ["child-a"] })
+    const wrongCallBlocks = context.blocks.map(block => block.id === visibleId
+      ? { ...block, content: { ...(block.content as { readonly [key: string]: unknown }), toolCallId: "toolcall-unknown" } as typeof block.content } : block)
+    expect(prepareNestedScoutFinalWait({ ...input, context: { ...context, blocks: wrongCallBlocks } }, lease, completed))
+      .toEqual({ taskIds: ["child-a"] })
+    expect(prepareNestedScoutFinalWait({ ...input, context: { ...context, blocks: context.blocks.filter(block => block.id !== visibleId) } }, lease, completed))
+      .toEqual({ taskIds: ["child-a"] })
   })
 
   it("requires another wait when a source-bound receipt was dropped from the built context", () => {

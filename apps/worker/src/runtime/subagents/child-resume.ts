@@ -3,7 +3,8 @@ import type { ContextSeedBlock } from "../context/step-context-builder.js"
 import type { TurnResumeState } from "../turns/turn-engine-types.js"
 import type { ChildToolReplayReceipt, ChildWaitReplayReceipt } from "../turns/turn-execution-options.js"
 import type { SubagentLease } from "./types.js"
-import { buildChildResumeObservations, countChildResumeToolCalls, integer, mergeDurableWaitObservation, type DurableWaitResume } from "./child-resume-observations.js"
+import { countChildResumeToolCalls, integer, mergeDurableWaitObservation, type DurableWaitResume } from "./child-resume-observations.js"
+import { buildChildResumeObservationsWithDelegateReceipts } from "./child-resume-delegate-receipts.js"
 import { loadChildConsumedWaitResume } from "./child-resume-consumed-wait.js"
 import { loadChildWaitCallRecovery } from "./child-resume-wait-call-recovery.js"
 import type { ChildWaitClaimRecovery, ChildWaitOrphanRecovery } from "./child-durable-wait-replay.js"
@@ -82,7 +83,7 @@ function waitResumeItemsSql(): string {
     ORDER BY step."attempt" ASC, step."ordinal" ASC, item."createdAt" ASC, item."id" ASC LIMIT ${MAX_PRIOR_ITEMS + 1}`
 }
 
-function summarizePriorAttempts(stepRows: readonly Row[], itemRows: readonly Row[], lease: SubagentLease): ChildAttemptResume {
+async function summarizePriorAttempts(client: Pick<pg.PoolClient, "query">, stepRows: readonly Row[], itemRows: readonly Row[], lease: SubagentLease): Promise<ChildAttemptResume> {
   let lastOrdinal = 0, lastAttempt = 0, lastStatus = "", toolCallCount = 0
   let inputThroughSequence = 0n, inputTokens = 0, outputTokens = 0, estimatedCostUsd = 0
   const consumedInputIds: string[] = [], consumed = new Set<string>()
@@ -101,7 +102,7 @@ function summarizePriorAttempts(stepRows: readonly Row[], itemRows: readonly Row
     if (!Number.isSafeInteger(inputTokens) || !Number.isSafeInteger(outputTokens) || !Number.isFinite(estimatedCostUsd)) throw new Error("child_resume_usage_overflow")
   }
   const nextOrdinal = ["completed", "waiting_for_tool", "waiting_for_approval", "waiting_for_user"].includes(lastStatus) ? lastOrdinal + 1 : lastOrdinal
-  const restored = buildChildResumeObservations(itemRows, lease)
+  const restored = await buildChildResumeObservationsWithDelegateReceipts(client, itemRows, lease)
   toolCallCount = countChildResumeToolCalls(itemRows, lease)
   return { resume: { nextOrdinal, stepCount: stepRows.length, toolCallCount, inputThroughSequence, consumedInputIds,
     usage: { inputTokens, outputTokens, estimatedCostUsd } }, observations: restored.observations,
@@ -117,7 +118,7 @@ export async function loadChildPriorAttemptResume(client: Pick<pg.PoolClient, "q
   if (prior.rows.length === 0) return undefined
   const items = await client.query<Row>(itemsSql(), [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.rootTaskId, lease.attemptCount])
   if (items.rows.length > MAX_PRIOR_ITEMS) throw new Error("child_resume_item_limit")
-  return summarizePriorAttempts(prior.rows, items.rows, lease)
+  return summarizePriorAttempts(client, prior.rows, items.rows, lease)
 }
 
 export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLease, now = new Date(), durableWait?: DurableWaitResume): Promise<ChildAttemptResume | undefined> {
@@ -182,7 +183,7 @@ export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLe
       : await client.query<Row>(itemsSql(), [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.rootTaskId, lease.attemptCount])
     if (itemResult.rows.length > MAX_PRIOR_ITEMS) throw new Error("child_resume_item_limit")
     const currentAttemptItemOrdinal = currentAttemptWait ? Math.max(...sameAttempt.rows.map(row => integer(row, "ordinal"))) : undefined
-    const restored = buildChildResumeObservations(itemResult.rows, lease, currentAttemptItemOrdinal, waitResume ? [waitResume] : [])
+    const restored = await buildChildResumeObservationsWithDelegateReceipts(client, itemResult.rows, lease, currentAttemptItemOrdinal, waitResume ? [waitResume] : [])
     let restoredObservations = restored.observations
     if (waitResume) restoredObservations = mergeDurableWaitObservation(restoredObservations, waitResume)
     const waitCallRecovery = currentAttemptWait?.continuationStepId
