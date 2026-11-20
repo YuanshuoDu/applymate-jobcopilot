@@ -10,6 +10,7 @@ import { createToolResultReferenceRepository } from "./tool-result-reference-rep
 import { redactJobReadOutput } from "./job-read-output-redaction.js"
 import { prepareScoutResultsOutput } from "./scout-results-output-redaction.js"
 import { InMemoryToolResultReferenceStore, prepareLifecycleValue } from "./redaction.js"
+import { markScoutDelegateOutput } from "./scout-delegate-output-redaction.js"
 import { createToolResultsReadTool } from "./tool-results-read-tool.js"
 import { ToolRegistry } from "./registry.js"
 import { ToolRouter } from "./router.js"
@@ -24,6 +25,8 @@ import { SCHEDULED_APPLICATION_PREPARE_OUTPUT_SCHEMA } from "./scheduled-applica
 const call: LifecycleCall = { id: "call-1", toolName: "jobs.search", toolVersion: "1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1" }
 const ordinaryCall: LifecycleCall = { ...call, toolName: "notes.read" }
 const planCall: LifecycleCall = { ...call, toolName: "agent.plan" }
+const numericDelegateTaskId = "subagent-00000000-0000-4000-8000-000000000002"
+const scoutDelegateCall: LifecycleCall = { ...call, id: "delegate-call", toolName: "scout.delegate", taskId: "parent-1", rootTaskId: "root-1" }
 const prepareTaskId = "subagent-abcdefab-cdef-4abc-8def-abcdefabcdef"
 const scheduledPrepareSummary = {
   schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: prepareTaskId, attemptCount: 2,
@@ -239,6 +242,29 @@ describe("ToolLifecycle", () => {
     expect(returned).toMatchObject({ children: [{ candidates: [{ jobId: "[REDACTED_PHONE]" }] }] })
     expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output: returned })
     expect(sink.events[0]?.payload.output).toEqual(returned)
+  })
+
+  it("returns and persists only an invocation-proven Scout delegate child ID", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const output = { taskId: numericDelegateTaskId, status: "queued" as const }
+    expect(markScoutDelegateOutput(output, { sessionId: scoutDelegateCall.sessionId, turnId: scoutDelegateCall.turnId,
+      rootTaskId: scoutDelegateCall.rootTaskId!, parentTaskId: scoutDelegateCall.taskId!, stepId: scoutDelegateCall.stepId,
+      toolCallId: scoutDelegateCall.id }, numericDelegateTaskId, "queued")).toBe(true)
+
+    const returned = await lifecycle.completed(scoutDelegateCall, output)
+    expect(returned).toEqual(output)
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output })
+    expect(sink.events[0]?.payload.output).toEqual(output)
+  })
+
+  it("keeps unmarked Scout delegate IDs on generic redaction", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const raw = { taskId: numericDelegateTaskId, status: "queued" }
+    const returned = await lifecycle.completed(scoutDelegateCall, raw)
+    expect(returned).toEqual(prepareLifecycleValue(raw).safe)
+    expect(returned).not.toEqual(raw)
   })
   it("emits replayable started, progress, and result Items without raw sensitive data", async () => {
     const sink = new InMemoryToolLifecycleSink()

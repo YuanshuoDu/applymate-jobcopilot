@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 
 import { Prisma } from "@prisma/client"
-import type { InputContentPart, TurnSource } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, type InputContentPart, type TurnSource } from "@jobcopilot/agent-protocol"
 
 import { appendAgentEventWithOutboxInTransaction } from "../../session/fact-store"
 import { activeTurnChanged, sessionNotFound } from "./errors"
@@ -100,6 +100,8 @@ export async function createRootTurn(
       id: randomUUID(),
       sessionId: command.sessionId,
       userId: command.userId,
+      ...(command.source === "user" && intent?.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind
+        && intent.version === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version ? { executionMode: "canonical_task_graph" as const } : {}),
       status: "queued",
       source: command.source,
       input: json({

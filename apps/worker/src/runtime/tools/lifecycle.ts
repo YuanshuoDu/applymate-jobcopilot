@@ -10,9 +10,11 @@ import { prepareLifecycleValue, prepareSafeValue, prepareScheduledPrepareLifecyc
 import { redactJobReadOutput } from "./job-read-output-redaction.js"
 import { isVerifiedToolResultChunk } from "./tool-result-reference-repo.js"
 import { hasNativeCoordinationEnvelope, prepareResolvedOwnerWaitLifecycleOutput, prepareVerifiedToolResultChunk } from "./lifecycle-receipt-output.js"
+import { prepareScoutDelegateLifecycleOutput } from "./scout-delegate-output-redaction.js"
 import { prepareScoutResultsOutput } from "./scout-results-output-redaction.js"
 import { ToolExecutionError, type ToolLifecyclePayload } from "./types.js"
 import { isTaskGraphResultPageLike, prepareAgentListLifecycleInput, prepareTaskGraphResultPageOutput } from "./task-graph-result-page-redaction.js"
+
 export type ToolLifecyclePhase = "started" | "progress" | "completed" | "failed" | "cancelled"
 export type DiscoveryAttemptLifecycleEvent =
   | Readonly<{ call: LifecycleCall; phase: "started" }>
@@ -37,7 +39,6 @@ export type ToolLifecycleOwnerContext = {
 export type ToolLifecycleOwnerResolver = (context: ToolLifecycleOwnerContext) => ExecutionOwner
 export class InMemoryToolLifecycleSink implements ToolLifecycleSink {
   readonly events: ToolLifecycleEvent[] = []
-
   async append(event: ToolLifecycleEvent): Promise<void> {
     this.events.push(event)
   }
@@ -46,7 +47,6 @@ export class InMemoryToolLifecycleSink implements ToolLifecycleSink {
     return this.events.map((event) => ({ ...event, item: { ...event.item }, payload: { ...event.payload } }))
   }
 }
-
 export interface ToolLifecycleOptions {
   readonly sink: ToolLifecycleSink
   /** Legacy test seam; oversized values never fall back to this store. */
@@ -63,12 +63,10 @@ export class ToolLifecycle {
   private readonly maxEventBytes: number
   private readonly inputs = new Map<string, unknown>()
   private readonly pageCalls = new Set<string>()
-
   constructor(private readonly options: ToolLifecycleOptions) {
     this.now = options.now ?? (() => new Date().toISOString())
     this.maxEventBytes = options.maxEventBytes ?? 8 * 1024
   }
-
   async started(call: LifecycleCall, input: unknown): Promise<void> {
     const timestamp = this.now()
     const listInput = call.toolName === "agent.list" ? prepareAgentListLifecycleInput(input, this.maxEventBytes) : null
@@ -181,6 +179,8 @@ export class ToolLifecycle {
       } catch {
         throw new ToolExecutionError("scheduled_prepare_lifecycle_output_invalid", "Scheduled Prepare output is invalid")
       }
+    } else if (call.toolName === "scout.delegate") {
+      prepared = prepareScoutDelegateLifecycleOutput(output, call) ?? prepareLifecycleValue(output)
     } else if (call.toolName === "jobs.search" || call.toolName === "jobs.get" || call.toolName === "jobs.discover") {
       prepared = prepareSafeValue(redactJobReadOutput(call.toolName, output))
     } else if (call.toolName === "tool_results.read") {
