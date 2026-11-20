@@ -20239,7 +20239,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
 
     try {
       const names = await withinIntegrationDeadline(rootToolNames.promise, "ObjectiveStart Root did not request its tools", 30_000)
-      const expectedRootControls = ["agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.wait"]
+      const expectedRootControls = ["agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.retire_superseded_scout", "agent.wait"]
       expect(names).toEqual(expectedRootControls)
       expect(names).not.toContain("jobs.search")
       let planned: Admission
