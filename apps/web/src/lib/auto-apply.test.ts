@@ -631,6 +631,16 @@ describe("auto-apply authorization", () => {
     expect(mocks.startApplicationFillForReview).not.toHaveBeenCalled();
   });
 
+  it("never sends a reviewed-source fill through the legacy ApplyQueue path", async () => {
+    const { queueApplicationFill } = await import("./auto-apply");
+    await expect(queueApplicationFill({
+      userId: "user_1", jobId: "job_1", applicationTaskId: "application_1", applyUrl: input.applyUrl,
+      reviewedSourceTurnId: "source_turn_1", reviewedSourceApprovalId: "approval_1",
+    })).rejects.toThrow("accepted approval and enabled TaskGraph fill");
+    expect(mocks.taskUpdate).not.toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
   it("routes enabled fill-for-review to one deterministic canonical Turn without enqueuing ApplyQueue", async () => {
     vi.stubEnv("ENABLE_APPLICATION_FILL_TASKGRAPH", "1");
     const { queueApplicationFill } = await import("./auto-apply");

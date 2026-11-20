@@ -195,6 +195,7 @@ export async function decideApproval(db: PrismaClient, input: ApprovalDecisionIn
     try {
       approval = await resolvePendingApprovalInTransaction(tx, {
         id: input.waitId, userId: input.userId, sessionId: input.sessionId, decision: input.decision, now,
+        ...(input.reviewedSourceTurnId !== undefined ? { reviewedSourceTurnId: input.reviewedSourceTurnId } : {}),
       })
     } catch (error) {
       if (error instanceof ApprovalStoreError) {

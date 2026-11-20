@@ -2,6 +2,8 @@ import { Prisma } from "@prisma/client"
 
 import { ACTIVE_TURN_STATUSES } from "../control-plane/commands/transaction"
 import { ApprovalStoreError, type ApprovalDecision } from "./types"
+import { assertReviewedFillDecisionWait } from "./reviewed-fill-handoff"
+import { persistReviewedFillSourceInTransaction } from "./reviewed-fill-source-binding"
 
 type Tx = Prisma.TransactionClient
 
@@ -11,6 +13,7 @@ export interface PendingApprovalDecisionInput {
   sessionId: string
   decision: ApprovalDecision
   now: Date
+  reviewedSourceTurnId?: string
 }
 
 export interface ResolvedApprovalRow {
@@ -105,10 +108,17 @@ export async function resolvePendingApprovalInTransaction(
   if (row.status !== "pending") throw new ApprovalStoreError(row.status === "consumed" ? "approval_already_consumed" : "approval_not_approved", "Approval receipt is no longer pending")
   if (row.expiresAt && row.expiresAt <= input.now) throw new ApprovalStoreError("approval_expired", "Approval receipt has expired")
   await assertApprovalFreshnessInTransaction(tx, { id: row.id, sessionId: row.sessionId, turnId, userId: input.userId })
+  if (input.reviewedSourceTurnId !== undefined) await assertReviewedFillDecisionWait(tx, {
+    approvalId: row.id, userId: row.userId, sessionId: row.sessionId, decision: input.decision, now: input.now,
+  })
   const updated = await tx.agentApproval.updateMany({
     where: { id: input.id, userId: input.userId, sessionId: input.sessionId, status: "pending", turnId, revision: row.revision },
     data: { status: input.decision, decidedAt: input.now },
   })
   if (updated.count !== 1) throw new ApprovalStoreError("approval_not_approved", "Approval receipt resolution raced with another decision")
+  if (input.reviewedSourceTurnId !== undefined) await persistReviewedFillSourceInTransaction(tx, {
+    approvalId: row.id, userId: row.userId, sessionId: row.sessionId,
+    decision: input.decision, sourceTurnId: input.reviewedSourceTurnId,
+  })
   return { ...row, turnId }
 }

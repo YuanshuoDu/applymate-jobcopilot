@@ -159,7 +159,7 @@ export async function validateLegacyReceipt(db: PrismaClient, input: LegacyRecei
 
 export async function resolveLegacyApproval(
   db: PrismaClient,
-  input: { approval: ScopedApprovalRecord; userId: string; sessionId: string; decision: "approved" | "rejected" },
+  input: { approval: ScopedApprovalRecord; userId: string; sessionId: string; decision: "approved" | "rejected"; reviewedSourceTurnId?: string },
   options: { beforeResolve?: () => Promise<void>; beforeLegacyOnlyResolve?: () => Promise<void> } = {},
 ): Promise<LegacyApprovalResolution> {
   const approval = input.approval
@@ -191,6 +191,7 @@ export async function resolveLegacyApproval(
     expectedTurnId: approval.turnId,
     expectedRevision: turn.revision,
     decision: input.decision,
+    ...(input.reviewedSourceTurnId !== undefined ? { reviewedSourceTurnId: input.reviewedSourceTurnId } : {}),
   })
   return { disposition: "canonical_wait", decision: input.decision, result }
 }
