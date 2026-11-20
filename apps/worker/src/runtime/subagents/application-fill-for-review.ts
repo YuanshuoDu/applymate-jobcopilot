@@ -12,6 +12,8 @@ import { fillCustomQuestions } from "../../flows/helpers.js"
 import { executeBrowserFill, type FlowType } from "../../flows/index.js"
 import { evaluateUnattendedApplyControl } from "../../queue/unattended-apply-control.js"
 import { checkRateLimit } from "../../rate-limit.js"
+import { createReviewedApplicationFillReadback, type ReviewedApplicationFillReadback } from "../../db/reviewed-application-fill-completion.js"
+import type { SelectedJobReviewedArtifact } from "../selected-job-reviewed-artifact-read.js"
 import { claimApplicationFillBrowserStart, reviewedApplicationFillSelector, type BrowserStartClaim } from "../reviewed-application-fill-binding.js"
 import type { SubagentExecutionResult, SubagentLease } from "./types.js"
 type WaitDetail = "captcha_required" | "authentication_required" | "mfa_required" | "unknown_sensitive_field" | "required_field" | "stale_review" | "review_required" | "fill_outcome_uncertain" | "unattended_apply_unavailable" | "cancelled"; type WaitCheckpoint = "fill_outcome_uncertain" | "form_answer_required"
@@ -98,12 +100,13 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
         if (result.waitReason) return { kind: "wait" as const, detail: waitDetail(result.waitReason) }
         if (result.reviewReady) {
           await fillCustomQuestions(page, task.persona, [], task.confirmedAnswers)
-          if (start.reviewedMaterial && !await reviewedMaterialWasFilled(page, result, start.reviewedMaterial.content)) return { kind: "wait" as const, detail: "review_required" as const }
+          const reviewedFillReadback = start.reviewedMaterial ? await reviewedMaterialWasFilled(page, result, start.reviewedMaterial, lease, context.applicationTaskId) : undefined
+          if (start.reviewedMaterial && !reviewedFillReadback) return { kind: "wait" as const, detail: "review_required" as const }
           const needs = safeNeeds(await inspectFormReviewNeeds(page))
           if (needs.missing.length || needs.sensitive.length) {
             return { kind: "needs" as const, needs, detail: needs.sensitive.length ? "unknown_sensitive_field" as const : "required_field" as const }
           }
-          return { kind: "ready" as const, result }
+          return { kind: "ready" as const, result, ...(reviewedFillReadback ? { reviewedFillReadback } : {}) }
         }
         return { kind: "wait" as const, detail: waitDetailFromResult(result) }
       } finally { lease.signal.removeEventListener("abort", closeOnAbort) }
@@ -112,8 +115,10 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
     if (outcome.kind === "wait") return wait(pool, lease, outcome.detail === "fill_outcome_uncertain" ? "fill_outcome_uncertain" : "form_answer_required", outcome.detail, undefined, input.stageObserver)
     if (outcome.kind === "needs") return wait(pool, lease, "form_answer_required", outcome.detail, outcome.needs, input.stageObserver)
     if (outcome.kind !== "ready") return failed("fill_outcome_uncertain")
-    const completed = input.stageObserver ? await completeForReview(pool, lease, input.stageObserver) : await completeApplicationFillForReview(pool, { lease })
-    return completed.status === "completed" ? { status: "completed", result: { status: "filled_for_user_review" } }
+    const completed = input.stageObserver ? await completeForReview(pool, lease, input.stageObserver, outcome.reviewedFillReadback)
+      : await completeApplicationFillForReview(pool, { lease, ...(outcome.reviewedFillReadback ? { reviewedFillReadback: outcome.reviewedFillReadback } : {}) })
+    return completed.status === "waiting" ? { status: "waiting_for_user", failureReason: "stale_review" }
+      : completed.status === "completed" ? { status: "completed", result: { status: "filled_for_user_review" } }
       : lease.signal.aborted ? acknowledgeCancellation(pool, lease) : failed(completed.status === "stale" ? "lease_lost" : "fill_completion_conflict")
   } catch {
     return lease.signal.aborted ? acknowledgeCancellation(pool, lease) : wait(pool, lease, "fill_outcome_uncertain", "fill_outcome_uncertain", undefined, input.stageObserver)
@@ -145,10 +150,10 @@ async function preBrowserFailure(pool: Pool, lease: SubagentLease, reason: strin
 }
 function cancelledOutcome() { return { kind: "wait" as const, detail: "cancelled" as const } }; function needsCompletionReplay(row: FillContext): boolean { return row.turnStatus === "waiting_for_approval" && ((row.taskStatus === "waiting_for_authorization" && row.checkpoint === "form_filled" && row.sessionStatus === "waiting_for_user") || (row.taskStatus === "filling" && row.checkpoint === "submission_authorized" && ["running", "waiting_for_user"].includes(row.sessionStatus)) || (row.taskStatus === "waiting_for_authorization" && row.checkpoint === "queue_retry" && ["running", "waiting_for_user"].includes(row.sessionStatus))) }
 function discardResume(path: string): void { try { unlinkSync(path) } catch { /* temporary file may already be gone */ } }; function observeStage(observer: StageObserver | undefined, event: ApplicationFillStageObservation): void { if (observer) try { observer(event) } catch {} }
-async function completeForReview(pool: Pool, lease: SubagentLease, observer?: StageObserver) {
+async function completeForReview(pool: Pool, lease: SubagentLease, observer?: StageObserver, reviewedFillReadback?: ReviewedApplicationFillReadback) {
   try {
     let staleGate: ApplicationFillCompletionStaleGate | undefined
-    const result = await completeApplicationFillForReview(pool, { lease, ...(observer ? { onStaleGate: (gate: ApplicationFillCompletionStaleGate) => { staleGate = gate } } : {}) })
+    const result = await completeApplicationFillForReview(pool, { lease, ...(reviewedFillReadback ? { reviewedFillReadback } : {}), ...(observer ? { onStaleGate: (gate: ApplicationFillCompletionStaleGate) => { staleGate = gate } } : {}) })
     if (observer) observeStage(observer, { stage: "completion", outcome: result.status, leaseLost: result.status === "stale" && !lease.signal.aborted, signalAborted: lease.signal.aborted, ...(result.status === "stale" && staleGate ? { staleGate } : {}) }); return result
   } catch (error) { if (observer) observeStage(observer, { stage: "completion", outcome: "unavailable", leaseLost: false, signalAborted: lease.signal.aborted }); throw error }
 }
@@ -208,7 +213,7 @@ function isAllowedDestination(raw: string, flow: FlowType, approved: string): bo
 }
 function waitDetail(reason: NonNullable<Awaited<ReturnType<typeof detectBrowserWait>>>["reason"]): WaitDetail { return reason === "captcha" ? "captcha_required" : reason === "login_required" ? "authentication_required" : reason === "mfa_required" ? "mfa_required" : reason === "stale_review" ? "stale_review" : "unknown_sensitive_field" }; function waitDetailFromResult(result: HarnessResult): WaitDetail { return result.classification === "cancelled" ? "cancelled" : result.classification === "browser_crash" ? "fill_outcome_uncertain" : result.classification === "untrusted_input" ? "unknown_sensitive_field" : "review_required" }
 function safeNeeds(needs: FormReviewNeeds): FormReviewNeeds { const safe = (fields: FormReviewNeeds["missing"]) => fields.map(({ key, label }) => ({ key, label: label.slice(0, 200) })); return { missing: safe(needs.missing), sensitive: safe(needs.sensitive) } }
-async function reviewedMaterialWasFilled(page: Page, result: HarnessResult, expected: string): Promise<boolean> {
+async function reviewedMaterialWasFilled(page: Page, result: HarnessResult, proof: SelectedJobReviewedArtifact, lease: SubagentLease, applicationTaskId: string) {
   const selectors: string[] = []
   for (const entry of result.log ?? []) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue
@@ -227,7 +232,7 @@ async function reviewedMaterialWasFilled(page: Page, result: HarnessResult, expe
       const tag = element.tagName.toLowerCase()
       return tag === "input" || tag === "textarea" ? (element as HTMLInputElement | HTMLTextAreaElement).value : null
     }, undefined, { timeout: 1000 })
-    return current === expected
+    return current === proof.content ? createReviewedApplicationFillReadback(lease, applicationTaskId, proof) : null
   } catch { return false }
 }
 async function loadFillContext(pool: Pool, lease: SubagentLease): Promise<FillContext | null> {

@@ -254,6 +254,22 @@ describe("executeApplicationFillForReview", () => {
     expect(event).toBeDefined()
     expect(JSON.stringify(event)).not.toContain(reviewedMaterial.content)
     expect(readSelectedJobReviewedArtifactWithClient).toHaveBeenCalledOnce()
+    const completion = vi.mocked(completeApplicationFillForReview).mock.calls[0]?.[1]
+    expect(completion?.reviewedFillReadback).toMatchObject({
+      schemaVersion: "agent-harness.v2.reviewed-application-fill-readback.v1", sourceTurnId: reviewedMaterial.sourceTurnId,
+      reviewedCoverLetterHash: expect.stringMatching(/^[a-f0-9]{64}$/), attemptCount: 1,
+    })
+    expect(JSON.stringify(completion?.reviewedFillReadback)).not.toContain(reviewedMaterial.content)
+  })
+
+  it("returns the stale_review wait produced by reviewed completion without claiming success", async () => {
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    configureCoverLetterField(() => reviewedMaterial.content)
+    vi.mocked(executeBrowserFill).mockResolvedValue({ status: "manual", error: null, durationMs: 3, reviewReady: true, log: [{ field: "coverLetter", selector: "textarea#cover-letter", action: "fill" }] } as HarnessResult)
+    vi.mocked(completeApplicationFillForReview).mockResolvedValue({ status: "waiting" })
+
+    await expect(executeApplicationFillForReview({ pool, lease: lease() })).resolves.toMatchObject({ status: "waiting_for_user", failureReason: "stale_review" })
   })
 
   it("does not claim the reviewed material was applied when the chosen form did not consume it", async () => {

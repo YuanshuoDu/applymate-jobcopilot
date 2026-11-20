@@ -1,16 +1,19 @@
 import { randomUUID } from "node:crypto"
 import type { Pool, PoolClient } from "pg"
 import { createApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
-import { hashAgentReceiptValue, redactSensitiveText } from "@jobcopilot/shared"
+import { buildApplicationSubmissionManifest, hashAgentReceiptValue, hashApplicationSubmissionMaterial, type ReviewedApplicationSubmissionMaterial } from "@jobcopilot/shared"
 import type { FormReviewNeeds } from "../harness/form-review.js"
-import { isFormAnswerKeyV2 } from "../form-answer-key.js"
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js"
 import { protocolScope, type ApprovalScopeInput, type IssueApprovalReceiptInput } from "../runtime/approval/types.js"
 import type { SubagentLease } from "../runtime/subagents/types.js"
 import { hashArtifactContent } from "../runtime/subagents/artifact-adapters.js"
+import { acquireSourceMaterialFence } from "./source-material-fence.js"
 import { ensureSubmissionArtifactWithClient } from "./submission-artifact.js"
+import { reviewedApplicationFillSelector } from "../runtime/reviewed-application-fill-binding.js"
+import { readReviewedApplicationFillCompletionMaterial, type ReviewedApplicationFillReadback } from "./reviewed-application-fill-completion.js"
+import { isFillWaitDetail, writeApplicationFillWaitWithClient, type FillWaitCheckpoint } from "./application-task-fill-wait.js"
 
-type TurnRow = { id: string; status: string; revision: number }
+type TurnRow = { id: string; status: string; revision: number; input: unknown }
 type ApplicationRow = { id: string; userId: string; sessionId: string | null; jobId: string; fillTurnId: string | null; fillTurnSessionId: string | null
   fillTurnUserId: string | null; status: string; checkpoint: string | null; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown }
 type ExistingApprovalRow = { id: string; userId: string; sessionId: string; turnId: string | null; jobId: string | null; type: string; taskId: string | null; status: string
@@ -18,13 +21,10 @@ type ExistingApprovalRow = { id: string; userId: string; sessionId: string; turn
 type ExistingArtifactRow = { id: string; userId: string; jobId: string; artifactType: string; lifecycle: string; baseId: string | null; baseHash: string | null
   content: unknown; hash: string; constraintHash: string; provenanceRefs: unknown; evidenceRefs: unknown; previousHash: string | null; version: number }
 type FillStatus = { status: "completed" | "waiting" | "stale" | "conflict" | "failed" | "cancelled" }; export type ApplicationFillCompletionStaleGate = "lease_input_invalid" | "session_scope" | "turn_row_unavailable" | "turn_status_queued" | "turn_status_interrupted" | "turn_status_terminal" | "turn_status_other" | "child_lease_fence" | "application_task_scope"
-type WaitCheckpoint = "fill_outcome_uncertain" | "form_answer_required"
-type WaitDetail = "captcha_required" | "authentication_required" | "mfa_required" | "unknown_sensitive_field" | "required_field" | "stale_review" | "review_required" | "fill_outcome_uncertain" | "unattended_apply_unavailable" | "cancelled" | "browser_fill_failed"
 type Client = Pick<PoolClient, "query">; type StaleGateObserver = (gate: ApplicationFillCompletionStaleGate) => void
 function reportStaleGate(observer: StaleGateObserver | undefined, gate: ApplicationFillCompletionStaleGate): void { if (observer) try { observer(gate) } catch {} }
 const COMPLETION_TITLE = "Final submission authorization"
 const COMPLETION_BODY = "The form was filled without submission. Review the current job, material alignment, required answers, and sensitive declarations before authorizing an external submission."
-const SAFE_WAIT_DETAILS = new Set<WaitDetail>(["captcha_required", "authentication_required", "mfa_required", "unknown_sensitive_field", "required_field", "stale_review", "review_required", "fill_outcome_uncertain", "unattended_apply_unavailable", "cancelled", "browser_fill_failed"])
 
 function validLease(lease: SubagentLease, now: Date, cancellation = false): boolean {
   return Boolean(lease.id.trim() && lease.userId.trim() && lease.sessionId.trim() && lease.turnId?.trim() && lease.ownerId.trim()
@@ -38,7 +38,7 @@ async function lockFillScope(client: Client, lease: SubagentLease, now: Date, ca
   const sessionStates = cancellation ? "'running', 'waiting_for_user', 'paused', 'aborted'" : "'running', 'waiting_for_user'"
   const session = await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 AND "status" IN (${sessionStates}) FOR UPDATE`, [lease.sessionId, lease.userId])
   if (!session.rows[0]) { if (onStaleGate) reportStaleGate(onStaleGate, "session_scope"); return null }
-  const turnResult = await client.query<TurnRow>(`SELECT "id", "status", "revision" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`, [lease.turnId, lease.sessionId, lease.userId])
+  const turnResult = await client.query<TurnRow>(`SELECT "id", "status", "revision", "input" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`, [lease.turnId, lease.sessionId, lease.userId])
   const turn = turnResult.rows[0]
   if (!turn || (!(cancellation ? ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency", "interrupted"] : ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency"]).includes(turn.status) && !(allowQueuedCompletion && turn.status === "queued"))) { if (onStaleGate) reportStaleGate(onStaleGate, !turn ? "turn_row_unavailable" : turn.status === "queued" ? "turn_status_queued" : turn.status === "interrupted" ? "turn_status_interrupted" : ["completed", "failed", "cancelled"].includes(turn.status) ? "turn_status_terminal" : "turn_status_other"); return null }
   const interruptCheck = cancellation ? "IS NOT NULL" : "IS NULL"
@@ -106,12 +106,14 @@ function approvalResourceHash(value: string): string | undefined {
   return match?.[0] === value ? match[1] : undefined
 }
 
-async function existingCompletion(client: Client, lease: SubagentLease, task: ApplicationRow, turn: TurnRow, approvedOnly = false): Promise<boolean> {
+async function existingCompletion(client: Client, lease: SubagentLease, task: ApplicationRow, turn: TurnRow, approvedOnly = false, reviewed?: ReviewedApplicationSubmissionMaterial): Promise<boolean> {
   const payload = submissionPayload(task), turnId = lease.turnId
   if (!turnId) return false
   const answersHash = await hashAgentReceiptValue("answers", task.confirmedAnswers ?? null)
-  const materialHash = await hashAgentReceiptValue("material", payload)
-  const artifactContent = { schemaVersion: "agent-harness.application-submission.v1", ...payload, answersHash }
+  const materialHash = reviewed ? await hashApplicationSubmissionMaterial(reviewed) : await hashAgentReceiptValue("material", payload)
+  const artifactContent = reviewed ? buildApplicationSubmissionManifest(reviewed, answersHash)
+    : { schemaVersion: "agent-harness.application-submission.v1", ...payload, answersHash }
+  if (!artifactContent || !materialHash) return false
   let artifactHash: string
   try { artifactHash = hashArtifactContent(artifactContent) } catch { return false }
   const artifactId = `application:${task.id}`, taskRef = `application-task:${task.id}`
@@ -142,36 +144,66 @@ async function existingCompletion(client: Client, lease: SubagentLease, task: Ap
 }
 
 /** Commits the review checkpoint, immutable manifest, approval, Turn wait, and Session projection together. */
-export async function completeApplicationFillForReview(pool: Pool, input: { readonly lease: SubagentLease; readonly now?: Date; readonly onStaleGate?: StaleGateObserver }): Promise<FillStatus> {
+export async function completeApplicationFillForReview(pool: Pool, input: { readonly lease: SubagentLease; readonly now?: Date; readonly onStaleGate?: StaleGateObserver; readonly reviewedFillReadback?: ReviewedApplicationFillReadback }): Promise<FillStatus> {
   const { lease } = input, now = input.now ?? new Date()
   if (!validLease(lease, now) || !lease.turnId) { if (input.onStaleGate) reportStaleGate(input.onStaleGate, "lease_input_invalid"); return { status: "stale" } }
   const turnId = lease.turnId
   return inTransaction(pool, lease.userId, async client => {
+    const hintRows = await client.query<{ input: unknown }>(`SELECT "input" FROM "agent_turns" WHERE "id"=$1 AND "sessionId"=$2 AND "userId"=$3`, [turnId, lease.sessionId, lease.userId])
+    const hint = hintRows.rows.length === 1 ? reviewedApplicationFillSelector(hintRows.rows[0]!.input) : { kind: "invalid" as const }
+    if (hint.kind !== "absent") await acquireSourceMaterialFence(client, [lease.userId])
     const locked = await lockFillScope(client, lease, now, false, input.onStaleGate, true)
     if (!locked) return { status: "stale" }
     const { turn, task } = locked
+    const selector = reviewedApplicationFillSelector(turn.input)
     const awaitingApproval = task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", authorizedForSubmission = task.status === "filling" && task.checkpoint === "submission_authorized", queueRetry = task.status === "waiting_for_authorization" && task.checkpoint === "queue_retry"
-    if (awaitingApproval || authorizedForSubmission || queueRetry) return turn.status === "waiting_for_approval"
-      ? { status: await existingCompletion(client, lease, task, turn, authorizedForSubmission || queueRetry) ? "completed" : "conflict" } : { status: "conflict" }
+    const replay = awaitingApproval || authorizedForSubmission || queueRetry
+    if (!sameSelector(hint, selector)) return !replay && canPersistStaleReviewWait(task, turn)
+      ? writeStaleReviewWait(client, lease, task.id, turn.revision, now) : { status: "conflict" }
+    let reviewed: ReviewedApplicationSubmissionMaterial | undefined
+    if (selector.kind !== "absent") {
+      if (selector.kind === "selected") reviewed = await readReviewedApplicationFillCompletionMaterial(client, {
+        lease, applicationTaskId: task.id, jobId: task.jobId, sourceTurnId: selector.sourceTurnId,
+        legacyMaterial: submissionPayload(task), readback: input.reviewedFillReadback, requireCurrentAttempt: !replay,
+      }) ?? undefined
+      if (!reviewed) return !replay && canPersistStaleReviewWait(task, turn)
+        ? writeStaleReviewWait(client, lease, task.id, turn.revision, now) : { status: "conflict" }
+    }
+    if (replay) return turn.status === "waiting_for_approval"
+      ? { status: await existingCompletion(client, lease, task, turn, authorizedForSubmission || queueRetry, reviewed) ? "completed" : "conflict" } : { status: "conflict" }
     if (task.status !== "filling" || task.checkpoint !== "browser_active" || !["in_progress", "waiting_for_dependency", "queued"].includes(turn.status)) return { status: "conflict" }
     const transitioned = await client.query(`UPDATE "application_tasks" SET "status" = 'waiting_for_authorization', "checkpoint" = 'form_filled', "error" = NULL, "question" = NULL, "updatedAt" = $4 WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "status" = 'filling' AND "checkpoint" = 'browser_active' RETURNING "id"`, [task.id, lease.userId, lease.sessionId, now])
     if (transitioned.rowCount !== 1) return { status: "conflict" }
     await client.query(`INSERT INTO "application_task_events" ("id", "taskId", "type", "actor", "body", "data", "createdAt")
       VALUES ($1, $2, 'form_filled', 'worker', $3, $4::jsonb, $5)`, [randomUUID(), task.id, "Form filled without submission; final user authorization requested.", JSON.stringify({ turnId: lease.turnId }), now])
     const answersHash = await hashAgentReceiptValue("answers", task.confirmedAnswers ?? null)
-    const artifact = await ensureSubmissionArtifactWithClient(client, { applicationTaskId: task.id, userId: lease.userId, jobId: task.jobId, resumeId: task.resumeId, coverLetterId: task.coverLetterId, answersHash })
+    const artifact = await ensureSubmissionArtifactWithClient(client, { applicationTaskId: task.id, userId: lease.userId, jobId: task.jobId, resumeId: task.resumeId, coverLetterId: task.coverLetterId, answersHash,
+      ...(reviewed ? { reviewedCoverLetterHash: reviewed.reviewedCoverLetterHash } : {}) })
     const resourceHash = approvalResourceHash(artifact.hash)
     if (!resourceHash) throw new Error("Application submission artifact hash is invalid")
     const payload = submissionPayload(task)
+    const materialHash = reviewed ? await hashApplicationSubmissionMaterial(reviewed) : await hashAgentReceiptValue("material", payload)
+    if (!materialHash) throw new Error("Application submission material is invalid")
     const approvalInput: IssueApprovalReceiptInput = { approvalId: `application-fill:${task.id}:${turnId}`, taskId: task.id,
       scope: { userId: lease.userId, sessionId: lease.sessionId, turnId, jobId: task.jobId, toolCallId: `application-submit:${task.id}`, action: "submit_application", resourceHash,
-        materialHash: await hashAgentReceiptValue("material", payload), answersHash, revision: turn.revision, expiresAt: new Date(now.getTime() + 15 * 60 * 1000) },
+        materialHash, answersHash, revision: turn.revision, expiresAt: new Date(now.getTime() + 15 * 60 * 1000) },
       title: COMPLETION_TITLE, body: COMPLETION_BODY, impact: { externalSubmission: true, jobId: task.jobId }, payload, nonce: createApprovalNonce() }
     const receipt = await createPgApprovalStore(pool, { userId: lease.userId }).issueInTransaction(client, approvalInput)
     await client.query(`INSERT INTO "agent_transcript_events" ("id", "sessionId", "taskId", "type", "speaker", "title", "body", "data", "createdAt") VALUES ($1, $2, NULL, 'approval_request', 'Executor', $3, $4, jsonb_build_object('approval', jsonb_build_object('id', $5::text, 'type', 'submit_application', 'title', $3::text, 'body', $4::text, 'impact', jsonb_build_object('externalSubmission', true, 'jobId', $6::text), 'payload', $7::jsonb, 'scopeHash', $8::text, 'status', 'pending')), $9)`, [randomUUID(), lease.sessionId, COMPLETION_TITLE, COMPLETION_BODY, receipt.approval.id, task.jobId, JSON.stringify(payload), receipt.approval.scopeHash, now])
     await client.query(`UPDATE "agent_sessions" SET "status" = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = $2 WHERE "id" = $1 AND "userId" = $3`, [lease.sessionId, now, lease.userId])
     return { status: "completed" }
   })
+}
+
+function sameSelector(left: ReturnType<typeof reviewedApplicationFillSelector>, right: ReturnType<typeof reviewedApplicationFillSelector>): boolean {
+  return left.kind === right.kind && (left.kind !== "selected" || (right.kind === "selected" && left.sourceTurnId === right.sourceTurnId))
+}
+function canPersistStaleReviewWait(task: ApplicationRow, turn: TurnRow): boolean {
+  return task.status === "filling" && task.checkpoint === "browser_active" && ["in_progress", "waiting_for_user", "waiting_for_dependency"].includes(turn.status)
+}
+async function writeStaleReviewWait(client: Client, lease: SubagentLease, applicationTaskId: string, turnRevision: number, now: Date): Promise<FillStatus> {
+  return { status: await writeApplicationFillWaitWithClient(client, { lease, applicationTaskId, turnRevision,
+    checkpoint: "form_answer_required", detail: "stale_review", now }) }
 }
 
 const SAFE_PRESTART_FAILURE = "Application fill could not start after the final retry attempt."
@@ -193,58 +225,19 @@ export async function failApplicationFillBeforeBrowser(pool: Pool, input: { read
   })
 }
 
-function waitMessage(detail: WaitDetail): string {
-  const messages: Record<WaitDetail, string> = {
-    captcha_required: "A site challenge requires your action before the fill can continue.", authentication_required: "Sign in to the application site before the fill can continue.",
-    mfa_required: "Complete the verification step before the fill can continue.", unknown_sensitive_field: "Review and confirm the sensitive application fields before the fill can continue.",
-    required_field: "Provide the missing required application information before the fill can continue.", stale_review: "The application changed during review. Review the current form before continuing.",
-    review_required: "Review the filled application before continuing.", fill_outcome_uncertain: "The browser stopped after starting the fill. This fill does not submit the application. Stop this Turn before requesting another fill attempt.",
-    unattended_apply_unavailable: "Unattended form fill is unavailable. Review the application manually.", cancelled: "The application fill was cancelled.",
-    browser_fill_failed: "The application form could not be filled. Review it manually before continuing.",
-  }
-  return messages[detail]
-}
-
-function safeNeeds(needs?: FormReviewNeeds): FormReviewNeeds {
-  const clean = (fields: FormReviewNeeds["missing"] | undefined) => (fields ?? []).slice(0, 10).map(({ key, label }) => ({
-    key: key && isFormAnswerKeyV2(key) ? key : null,
-    label: redactSensitiveText(label).slice(0, 200),
-  }))
-  return { missing: clean(needs?.missing), sensitive: clean(needs?.sensitive) }
-}
-
 /** Persists an application-specific wait without using the legacy unfenced pause path. */
 export async function persistApplicationFillWait(
-  pool: Pool, input: { readonly lease: SubagentLease; readonly checkpoint: WaitCheckpoint; readonly detail: string; readonly needs?: FormReviewNeeds; readonly now?: Date },
+  pool: Pool, input: { readonly lease: SubagentLease; readonly checkpoint: FillWaitCheckpoint; readonly detail: string; readonly needs?: FormReviewNeeds; readonly now?: Date },
 ): Promise<FillStatus> {
-  const { lease } = input, now = input.now ?? new Date(), detail = input.detail as WaitDetail
-  if (!validLease(lease, now) || !lease.turnId || !SAFE_WAIT_DETAILS.has(detail)) return { status: "stale" }
+  const { lease } = input, now = input.now ?? new Date(), detail = input.detail
+  if (!validLease(lease, now) || !lease.turnId || !isFillWaitDetail(detail)) return { status: "stale" }
   return inTransaction(pool, lease.userId, async client => {
     const locked = await lockFillScope(client, lease, now)
     if (!locked) return { status: "stale" }
     const { turn, task } = locked
-    const expectedCheckpoint = input.checkpoint
-    if (task.status === "waiting_for_user" && task.checkpoint === expectedCheckpoint) return { status: "waiting" }
+    if (task.status === "waiting_for_user" && task.checkpoint === input.checkpoint) return { status: "waiting" }
     if (task.status !== "filling" || task.checkpoint !== "browser_active" || !["in_progress", "waiting_for_user", "waiting_for_dependency"].includes(turn.status)) return { status: "conflict" }
-    const needs = safeNeeds(input.needs), message = waitMessage(detail)
-    const checkpoint: WaitCheckpoint = detail === "fill_outcome_uncertain" ? "fill_outcome_uncertain" : expectedCheckpoint
-    const question = checkpoint === "form_answer_required" ? { waitId: randomUUID(), detail: message, missing: needs.missing, sensitive: needs.sensitive } : null
-    const updated = await client.query(`UPDATE "application_tasks" SET "status" = 'waiting_for_user', "checkpoint" = $4, "error" = $5,
-      "question" = $6::jsonb, "updatedAt" = $7 WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3
-      AND "status" = 'filling' AND "checkpoint" = 'browser_active' RETURNING "id"`,
-    [task.id, lease.userId, lease.sessionId, checkpoint, message, JSON.stringify(question), now])
-    if (updated.rowCount !== 1) return { status: "conflict" }
-    await client.query(`INSERT INTO "application_task_events" ("id", "taskId", "type", "actor", "body", "data", "createdAt")
-      VALUES ($1, $2, $3, 'worker', $4, $5::jsonb, $6)`, [randomUUID(), task.id, checkpoint, message,
-      JSON.stringify({ reason: detail, missingCount: needs.missing.length, sensitiveCount: needs.sensitive.length, turnId: lease.turnId, attemptCount: lease.attemptCount }), now])
-    await client.query(`INSERT INTO "agent_transcript_events" ("id", "sessionId", "taskId", "type", "speaker", "title", "body", "data", "createdAt")
-      VALUES ($1, $2, NULL, 'subagent_result', 'Executor', 'Application fill needs your attention', $3, $4::jsonb, $5)`,
-    [randomUUID(), lease.sessionId, message, JSON.stringify({ applicationTaskId: task.id, checkpoint, turnId: lease.turnId }), now])
-    const turnUpdate = await client.query(`UPDATE "agent_turns" SET "status" = 'waiting_for_user', "revision" = "revision" + 1,
-      "completedAt" = NULL, "updatedAt" = $4 WHERE "id" = $1 AND "sessionId" = $2 AND "revision" = $3
-      AND "status" IN ('in_progress', 'waiting_for_user', 'waiting_for_dependency') RETURNING "id"`, [lease.turnId, lease.sessionId, turn.revision, now])
-    if (turnUpdate.rowCount !== 1) return { status: "conflict" }
-    await client.query(`UPDATE "agent_sessions" SET "status" = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = $2 WHERE "id" = $1 AND "userId" = $3`, [lease.sessionId, now, lease.userId])
-    return { status: "waiting" }
+    return { status: await writeApplicationFillWaitWithClient(client, { lease, applicationTaskId: task.id, turnRevision: turn.revision,
+      checkpoint: input.checkpoint, detail, needs: input.needs, now }) }
   })
 }
