@@ -1,5 +1,6 @@
 import type pg from "pg"
 import type { TurnLease } from "./turns/lease.js"
+import { reviewedApplicationFillSelector } from "./reviewed-application-fill-binding.js"
 
 /** A positive marker carries no ApplicationTask identity into model-visible context. */
 export type ApplicationFillPreparation = Readonly<{ available: true }>
@@ -53,7 +54,7 @@ export async function loadApplicationFillPreparation(
       throw new Error("application_fill_state_invalid")
     }
 
-    const selector = reviewedSourceSelector(task.turnInput)
+    const selector = reviewedApplicationFillSelector(task.turnInput)
     if (selector.kind === "invalid") return await commitUnavailable(client, () => { committed = true })
     if (selector.kind === "selected") {
       // The terminal reader imports TaskGraph state; defer loading it until the marked path.
@@ -96,30 +97,4 @@ async function commitUnavailable(client: Pick<pg.PoolClient, "query">, markCommi
   await client.query("COMMIT")
   markCommitted()
   return undefined
-}
-
-type ReviewedSourceSelector = Readonly<{ kind: "absent" | "invalid" }>
-  | Readonly<{ kind: "selected"; sourceTurnId: string }>
-
-function reviewedSourceSelector(value: unknown): ReviewedSourceSelector {
-  const input = plainRecord(value)
-  if (!input) return { kind: "invalid" }
-  if (!Object.prototype.hasOwnProperty.call(input, "reviewedApplicationMaterialSource")) return { kind: "absent" }
-  const source = plainRecord(input.reviewedApplicationMaterialSource)
-  if (!source || Object.keys(source).sort().join(",") !== "schemaVersion,sourceTurnId"
-    || source.schemaVersion !== "agent-harness.v2.selected-job-reviewed-fill-source.v1"
-    || typeof source.sourceTurnId !== "string" || !source.sourceTurnId.trim() || source.sourceTurnId.length > 256) {
-    return { kind: "invalid" }
-  }
-  return { kind: "selected", sourceTurnId: source.sourceTurnId }
-}
-
-function plainRecord(value: unknown): Record<string, unknown> | null {
-  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
-  try {
-    const prototype = Object.getPrototypeOf(parsed)
-    return (prototype === Object.prototype || prototype === null) && Object.getOwnPropertySymbols(parsed).length === 0
-      ? parsed as Record<string, unknown> : null
-  } catch { return null }
 }
