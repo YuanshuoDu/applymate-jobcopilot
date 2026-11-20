@@ -13,6 +13,7 @@ import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { formatObjectiveLocationSteerMessage } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import {
+  OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
   PLAN_LEDGER_SCHEMA_VERSION,
   parsePlanLedger,
   projectPlanLedger,
@@ -19703,7 +19704,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         source: "user", objective: "Find one software engineering role in Dublin",
         content: [{ type: "text", text: "Find one software engineering role in Dublin" }],
         verificationRequirements: {
-          schemaVersion: "agent-harness.v2.objective-requirements.v1",
+          schemaVersion: "agent-harness.v2.objective-requirements.v2",
           requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
         },
       })
@@ -19781,6 +19782,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           )
           const binding = authority.rows[0]
           admission.resolve({ kind: "rejected", ...discoveryScheduleFailureDiagnostic(error),
+            sqlState: null, repositoryFrame: null,
             executionModeIsNull: binding?.executionModeIsNull === true, turnLeaseBound: binding?.turnLeaseBound === true,
             rootLeaseBound: binding?.rootLeaseBound === true, rootStepBound: binding?.rootStepBound === true })
         }
