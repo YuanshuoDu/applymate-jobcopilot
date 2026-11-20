@@ -20,6 +20,7 @@ const reconciliationMocks = vi.hoisted(() => ({
   scheduledPrepare: vi.fn(), scheduledAuditAppend: vi.fn(), scheduledAuditCompletion: vi.fn(), scheduledAuditInvocation: vi.fn(),
   scheduledAuditResumeContext: vi.fn(), scheduledGateVerification: vi.fn(),
   operationalFailureReplacement: vi.fn(),
+  scoutRetirement: vi.fn(),
 }))
 vi.mock("./steering-reconciliation-ledger.js", () => ({
   prepareSteeringReconciliation: reconciliationMocks.prepare,
@@ -27,6 +28,7 @@ vi.mock("./steering-reconciliation-ledger.js", () => ({
   assertNoUnresolvedSteering: reconciliationMocks.assertNoUnresolvedSteering,
 }))
 vi.mock("./task-graph-pg-create.js", () => ({ createGraphTasks: reconciliationMocks.create }))
+vi.mock("./task-graph-pg-scout-retirement.js", () => ({ requestSupersededScoutRetirement: reconciliationMocks.scoutRetirement }))
 vi.mock("./task-graph-pg-operational-failure-replacement.js", () => ({
   scheduleTaskGraphOperationalFailureReplacement: reconciliationMocks.operationalFailureReplacement,
 }))
@@ -307,6 +309,15 @@ function invalidSelectorProposal(kind: "unknown" | "indirect" | "wrong-template"
 
 describe("createPgTaskGraphCommandPort", () => {
   beforeEach(() => { vi.clearAllMocks() })
+  it("routes the private superseded Scout request through its store command", async () => {
+    const fake = fakePool(scheduleInput()), input = { scope: scheduleInput().scope, expectedRevision: 4,
+      taskId: "task-old", callId: "retire-call" }
+    const result = { status: "requested" as const, taskId: "task-old", receiptEventId: "receipt-event", receipt: {} as never }
+    reconciliationMocks.scoutRetirement.mockResolvedValueOnce(result)
+    await expect(createPgTaskGraphCommandPort(fake.pool).requestSupersededScoutRetirement!(input)).resolves.toBe(result)
+    expect(reconciliationMocks.scoutRetirement).toHaveBeenCalledWith(fake.pool, input)
+  })
+
   it("routes the fixed Audit append and proof reads through owner-scoped transactions", async () => {
     const fake = fakePool(scheduleInput()), input = {} as never
     reconciliationMocks.scheduledAuditAppend.mockResolvedValue({ status: "accepted", revision: 13, nodes: [],

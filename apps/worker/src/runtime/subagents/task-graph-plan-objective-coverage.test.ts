@@ -45,7 +45,7 @@ const input = (verificationRequirements: TaskGraphScheduleInput["verificationReq
     analyst: { role: "analyst", taskType: "analysis", allowedActions: [] } }, verificationRequirements,
 })
 const provenance = { sourceInputCheckpointByNodeKey: new Map(), currentInputCheckpoint: { inputThroughSequence: 100n } }
-const confirmed = { kind: "confirmed" as const, locations: ["dublin"], acceptedInputSequence: 100n }
+const confirmed = { kind: "confirmed" as const, locations: ["dublin"], acceptedInputSequence: 100n, acceptedInputId: "steer-input" }
 const available = (compatible: string[], excluded: string[]): Extract<TaskGraphCurrentLocationEvidenceResult, { status: "available" }> => ({
   status: "available", effectiveRequirements: { status: "valid", requirements: [
     { id: "candidate-location", kind: "candidate_location_in", locations: ["dublin"] },

@@ -23,6 +23,7 @@ export type TaskGraphConfirmedLocationCompletionInput = Readonly<{
   confirmed: TaskGraphConfirmedLocationSteerResult
   persistedTurnInput: unknown
   verifiedCompletedTaskIds: ReadonlySet<string>
+  retiredNodeKeys?: ReadonlySet<string>
 }>
 
 const ABSENT: TaskGraphConfirmedLocationCompletionResult = Object.freeze({ kind: "absent" })
@@ -52,12 +53,14 @@ export async function resolveTaskGraphConfirmedLocationCompletion(
       client: input.client, loaded, scope, initialRequirements, verifiedCurrentLocations: confirmed.locations,
       acceptedInputSequence: confirmed.acceptedInputSequence,
       retainCompatiblePriorScouts: canRetainCompatiblePriorScouts(reconciliation, confirmed.acceptedInputSequence),
+      retiredNodeKeys: input.retiredNodeKeys,
     })
     if (evidence.status !== "available") return UNAVAILABLE
+    if (input.retiredNodeKeys?.size && !reconciliation.latestUserRevision) return REPLAN
     const historicalNodeIndices = new Set<number>()
     if (reconciliation.latestUserRevision) {
       const applicable = taskGraphCompletionApplicability(loaded, reconciliation.latestUserRevision, Number(revision),
-        input.verifiedCompletedTaskIds, evidence.compatibleRetainedNodeKeys)
+        input.verifiedCompletedTaskIds, evidence.compatibleRetainedNodeKeys, input.retiredNodeKeys)
       if (applicable.kind === "replan") return REPLAN
       for (const index of applicable.historicalNodeIndices) historicalNodeIndices.add(index)
     }
@@ -68,8 +71,10 @@ export async function resolveTaskGraphConfirmedLocationCompletion(
       historicalNodeIndices.add(index)
     }
     const historicalKeys = new Set(loaded.snapshot.nodes.flatMap((node, index) => historicalNodeIndices.has(index) ? [node.key] : []))
-    if (dependsOnExcludedScout(loaded.snapshot.nodes, historicalNodeIndices, historicalKeys)) return REPLAN
-    if (!objectiveCovered(loaded.snapshot.nodes, evidence, historicalNodeIndices, scope.rootTaskId)) return REPLAN
+    const retiredKeys = input.retiredNodeKeys ?? new Set<string>()
+    const excludedKeys = new Set([...historicalKeys, ...retiredKeys])
+    if (dependsOnExcludedScout(loaded.snapshot.nodes, historicalNodeIndices, excludedKeys)) return REPLAN
+    if (!objectiveCovered(loaded.snapshot.nodes, evidence, historicalNodeIndices, retiredKeys, scope.rootTaskId)) return REPLAN
     return { kind: "applicable", historicalNodeIndices }
   } catch {
     return UNAVAILABLE
@@ -78,10 +83,10 @@ export async function resolveTaskGraphConfirmedLocationCompletion(
 
 function objectiveCovered(
   nodes: readonly TaskGraphObjectiveLineageNode[], evidence: Available,
-  historical: ReadonlySet<number>, rootTaskId: string,
+  historical: ReadonlySet<number>, retired: ReadonlySet<string>, rootTaskId: string,
 ): boolean {
   if (evidence.effectiveRequirements.requirements.filter(item => item.kind === "candidate_location_in").length !== 1) return false
-  const selectedNodes = nodes.filter((_node, index) => !historical.has(index))
+  const selectedNodes = nodes.filter((node, index) => !historical.has(index) && !retired.has(node.key))
   const projected = buildTaskGraphLocationCoverageNodes(selectedNodes, evidence)
   return evaluateTaskGraphObjectiveCoverage(evidence.effectiveRequirements, projected, TASK_GRAPH_TEMPLATES, rootTaskId).status === "covered"
 }

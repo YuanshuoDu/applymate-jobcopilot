@@ -23,6 +23,8 @@ export type TaskGraphCurrentLocationEvidenceInput = Readonly<{
   retainCompatiblePriorScouts: boolean
   /** Plan-only partition; terminal completion never supplies pending Scouts. */
   pendingSupersededNodeKeys?: ReadonlySet<string>
+  /** Terminal-only partition from an exact retirement receipt and Worker ack. */
+  retiredNodeKeys?: ReadonlySet<string>
 }>
 export type TaskGraphCurrentLocationEvidenceResult =
   | Readonly<{
@@ -48,13 +50,14 @@ export async function resolveTaskGraphCurrentLocationEvidence(
     const nodes = ownedNodes(loaded, scope)
     if (!nodes) return UNAVAILABLE
     const pending = pendingScoutSet(input.pendingSupersededNodeKeys, nodes, loaded, input.acceptedInputSequence)
-    if (!pending) return UNAVAILABLE
+    const retired = terminalRetiredScoutSet(input.retiredNodeKeys, nodes, loaded, input.acceptedInputSequence)
+    if (!pending || !retired || [...retired].some(key => pending.has(key))) return UNAVAILABLE
 
     const locationRequirement = requirements.requirements.find(item => item.kind === "candidate_location_in")
     if (!locationRequirement || locationRequirement.kind !== "candidate_location_in") return UNAVAILABLE
     const compatibleRetainedNodeKeys = new Set<string>(), excludedHistoricalNodeKeys = new Set<string>()
     for (const { node, task } of nodes) {
-      if (pending.has(node.key)) continue
+      if (pending.has(node.key) || retired.has(node.key)) continue
       if (!isScoutIdentity(node, task)) {
         if (looksLikeScout(node, task)) return UNAVAILABLE
         continue
@@ -81,6 +84,28 @@ export async function resolveTaskGraphCurrentLocationEvidence(
   } catch {
     return UNAVAILABLE
   }
+}
+
+function terminalRetiredScoutSet(
+  value: ReadonlySet<string> | undefined,
+  nodes: readonly { node: StoredTaskGraphNode; task: GraphTaskRow }[],
+  loaded: LoadedGraph,
+  acceptedSequence: bigint,
+): ReadonlySet<string> | undefined {
+  if (value === undefined) return new Set()
+  if (!(value instanceof Set) || value.size > nodes.length) return undefined
+  const result = new Set<string>()
+  for (const key of value) {
+    const source = nodes.find(item => item.node.key === key)
+    const checkpoint = loaded.sourceInputCheckpointByNodeKey?.get(key)
+    if (typeof key !== "string" || !source || !isScoutIdentity(source.node, source.task)
+      || source.task.status !== "interrupted" || !Number.isSafeInteger(source.task.attemptCount)
+      || source.task.attemptCount! < 1 || !ordinaryTypedScout(source.node)
+      || source.node.dependsOn.length > 0 || !validCheckpoint(checkpoint)
+      || checkpoint.inputThroughSequence >= acceptedSequence) return undefined
+    result.add(key)
+  }
+  return result
 }
 
 function pendingScoutSet(

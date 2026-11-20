@@ -15,11 +15,12 @@ import type { TaskGraphCurrentLocationEvidenceResult } from "../subagents/task-g
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
 import { buildTaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 import { resolveTaskGraphConfirmedLocationCompletion } from "./task-graph-confirmed-location-completion.js"
+import { taskGraphCompletionApplicability } from "./task-graph-completion-applicability.js"
 
 afterEach(() => { evidenceHarness.value = null; evidenceHarness.calls = [] })
 
 const scope = { userId: "user", sessionId: "session", turnId: "turn", rootTaskId: "root", parentTaskId: "root" }
-const confirmed = { kind: "confirmed" as const, locations: ["dublin"], acceptedInputSequence: 20n }
+const confirmed = { kind: "confirmed" as const, locations: ["dublin"], acceptedInputSequence: 20n, acceptedInputId: "accepted-input" }
 const criterion = (location: string) => ({ id: "candidate-location", check: { kind: "candidate_location_in" as const, locations: [location] } })
 function scout(key: string, taskId: string, location: string, dependsOn: string[] = []) {
   return { key, taskId, templateId: "scout", goal: "Find candidates", successCriteria: ["Find candidates"], dependsOn, depth: 1,
@@ -84,6 +85,39 @@ describe("confirmed location terminal applicability", () => {
       resultingRevision: 5, stepId: "revise", inputThroughSequence: 20n, soleSteerSequence: 20n,
     }), confirmed, persistedTurnInput: {}, verifiedCompletedTaskIds: new Set(["old-task", "current-task", "analysis-task"]) }))
       .resolves.toEqual({ kind: "replan" })
+  })
+
+  it("keeps a retired Scout distinct from completed history while evaluating current scope", async () => {
+    const nodes = [scout("retired-scout", "retired-task", "london"), scout("current-scout", "current-task", "dublin")]
+    const base = graph(nodes, [10n, 20n])
+    const tasks = new Map(base.tasks)
+    tasks.set("retired-task", { ...tasks.get("retired-task")!, status: "interrupted" })
+    const loaded = { ...base, tasks, state: { ...base.state!, nodes: base.state!.nodes.map((node, index) => index === 0
+      ? { ...node, status: "interrupted" as const } : node) } }
+    evidenceHarness.value = available()
+    const retiredNodeKeys = new Set(["retired-scout"])
+    const result = await resolveTaskGraphConfirmedLocationCompletion({ client, loaded, scope, reconciliation: reconciliation({
+      resultingRevision: 5, stepId: "revise", inputThroughSequence: 20n, soleSteerSequence: 20n,
+    }), confirmed, persistedTurnInput: {}, verifiedCompletedTaskIds: new Set(["current-task"]), retiredNodeKeys })
+
+    expect(result).toEqual({ kind: "applicable", historicalNodeIndices: new Set() })
+    expect(evidenceHarness.calls[0]?.[0]).toMatchObject({ retiredNodeKeys })
+    expect(taskGraphCompletionApplicability(loaded, undefined, 5, new Set(), new Set(), retiredNodeKeys)).toEqual({ kind: "replan" })
+  })
+
+  it("does not permit current analysis to depend on a terminally retired Scout", async () => {
+    const nodes = [scout("retired-scout", "retired-task", "london"), scout("current-scout", "current-task", "dublin"),
+      analyst("analysis", "analysis-task", ["retired-scout"])]
+    const base = graph(nodes as ReturnType<typeof scout>[], [10n, 20n, 20n])
+    const tasks = new Map(base.tasks)
+    tasks.set("retired-task", { ...tasks.get("retired-task")!, status: "interrupted" })
+    const loaded = { ...base, tasks, state: { ...base.state!, nodes: base.state!.nodes.map((node, index) => index === 0
+      ? { ...node, status: "interrupted" as const } : node) } }
+    evidenceHarness.value = available()
+    await expect(resolveTaskGraphConfirmedLocationCompletion({ client, loaded, scope, reconciliation: reconciliation({
+      resultingRevision: 5, stepId: "revise", inputThroughSequence: 20n, soleSteerSequence: 20n,
+    }), confirmed, persistedTurnInput: {}, verifiedCompletedTaskIds: new Set(["current-task", "analysis-task"]),
+      retiredNodeKeys: new Set(["retired-scout"]) })).resolves.toEqual({ kind: "replan" })
   })
 
   it("does not retain old Scouts when a newer unrelated material revision supersedes the scope", async () => {
