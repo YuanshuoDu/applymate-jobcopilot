@@ -705,7 +705,8 @@ describe("production child runtime", () => {
       context: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER },
       expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, leaseExpiresAt: new Date(Date.now() + 60_000),
     }
-    const nestedChild = { ...scoutLease, id: "grandchild-scout", parentTaskId: scoutLease.id, rootTaskId: scoutLease.rootTaskId, depth: 2 }
+    const nestedChildTaskId = "subagent-00000000-0000-4000-8000-000000000002"
+    const nestedChild = { ...scoutLease, id: nestedChildTaskId, parentTaskId: scoutLease.id, rootTaskId: scoutLease.rootTaskId, depth: 2 }
     const manager = { spawnFromLease: vi.fn(async () => ({ task: nestedChild, duplicate: false, atomic: true as const })) }
     const managerProvider = vi.fn(() => manager)
     const turnPersistence = recordingStore()
@@ -719,6 +720,8 @@ describe("production child runtime", () => {
 
     const scoutExecution = await scoutExecutor({ lease: scoutLease })
     expect(scoutExecution).toMatchObject({ status: "completed" })
+    expect(scoutRequests).toHaveLength(3)
+    expect(modelToolOutput(scoutRequests[2]!, "scout-delegate-call")).toEqual({ taskId: nestedChildTaskId, status: "queued" })
     expect(managerProvider).toHaveBeenCalledOnce()
     expect(manager.spawnFromLease).toHaveBeenCalledOnce()
     expect(manager.spawnFromLease).toHaveBeenCalledWith(expect.objectContaining({
@@ -878,9 +881,17 @@ describe("production child runtime", () => {
       return { taskItems, taskEvents, resultContent }
     }
     const scoutPersisted = assertPersistedCall(scoutLease.id, "scout-discover-call", "jobs.discover")
+    const scoutDelegatePersisted = assertPersistedCall(scoutLease.id, "scout-delegate-call", "scout.delegate")
     const analystPersisted = assertPersistedCall(analystLease.id, "analyst-get-call", "jobs.get")
+    const expectedDelegateOutput = { taskId: nestedChildTaskId, status: "queued" }
+    expect(scoutDelegatePersisted.resultContent.output).toEqual(expectedDelegateOutput)
+    expect(scoutDelegatePersisted.taskEvents).toContainEqual(expect.objectContaining({ type: "tool_call.completed",
+      correlationId: "scout-delegate-call", itemId: null, payload: expect.objectContaining({ output: expectedDelegateOutput }) }))
     const scoutObservations = restoreToolCallState(scoutPersisted.taskItems, scoutPersisted.taskEvents).observations
     const analystObservations = restoreToolCallState(analystPersisted.taskItems, analystPersisted.taskEvents).observations
+    expect(scoutObservations).toContainEqual(expect.objectContaining({ content: expect.objectContaining({
+      toolCallId: "scout-delegate-call", toolName: "scout.delegate", status: "completed", output: expectedDelegateOutput,
+    }) }))
     expect(scoutObservations).toContainEqual(expect.objectContaining({
       content: expect.objectContaining({ toolCallId: "scout-discover-call", toolName: "jobs.discover", status: "completed", output: scoutPersisted.resultContent.output }),
     }))

@@ -61,7 +61,8 @@ describe("unresolved steering context hydration", () => {
     const loaded = await loadUnresolvedSteeringContext(fake.client, scope, mapInput, message => new Error(message))
 
     expect(loaded).toHaveLength(1)
-    expect(loaded[0]).toMatchObject({ id: "steer-a", sessionId: scope.sessionId, targetTurnId: scope.turnId, userId: scope.userId, delivery: "steer", content: parts })
+    expect(loaded[0]).toMatchObject({ id: "steer-a", sessionId: scope.sessionId, targetTurnId: scope.turnId, userId: scope.userId,
+      delivery: "steer", status: "consumed", consumedByStepId: "step-zero", content: parts })
     expect(fake.calls[0]?.values).toEqual([scope.sessionId, scope.turnId, scope.userId, ["steer-a"]])
     expect(fake.calls[0]?.sql).toContain('accepted_item."content" AS "acceptedItemContent"')
   })

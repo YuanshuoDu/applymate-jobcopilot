@@ -1,10 +1,11 @@
 import { NextRequest } from "next/server"
 import type { Prisma } from "@prisma/client"
 
-import { schemaVersion } from "@jobcopilot/agent-protocol"
+import { schemaVersion, TurnIntentSchema, validate } from "@jobcopilot/agent-protocol"
 
 import { db } from "@/lib/db"
 import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
+import { objectiveLocationVerificationEnabled } from "@/lib/agent/control-plane/commands/types"
 
 import {
   afterCursor,
@@ -33,7 +34,17 @@ const TURN_SELECT = {
   },
 } satisfies Prisma.AgentTurnSelect
 
-function activeTurnProjection(row: TurnQueryRow | null) {
+const ACTIVE_TURN_SELECT = { ...TURN_SELECT, executionMode: true, rootTaskId: true } satisfies Prisma.AgentTurnSelect
+type ActiveTurnQueryRow = TurnQueryRow & Readonly<{ executionMode: string | null; rootTaskId: string | null }>
+
+function hasObjectiveTaskGraphIntent(value: unknown): boolean {
+  const input = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
+  const intent = input?.intent
+  return validate(TurnIntentSchema, intent) && !!intent && typeof intent === "object" && !Array.isArray(intent)
+    && "kind" in intent && intent.kind === "objective_task_graph_execution"
+}
+
+function activeTurnProjection(row: ActiveTurnQueryRow | null) {
   if (!row) return null
   const input = row.input && typeof row.input === "object" && !Array.isArray(row.input)
     ? row.input as Record<string, unknown>
@@ -45,6 +56,9 @@ function activeTurnProjection(row: TurnQueryRow | null) {
     status: projected.status,
     revision: projected.revision,
     ...(hasCanonicalGoal ? { goal: projected.goal } : {}),
+    ...(objectiveLocationVerificationEnabled() && row.source === "user" && row.executionMode === "canonical_task_graph"
+      && typeof row.rootTaskId === "string" && Boolean(row.rootTaskId.trim()) && hasObjectiveTaskGraphIntent(row.input)
+      && (row.status === "in_progress" || row.status === "waiting_for_dependency") ? { canSteerLocation: true as const } : {}),
   }
 }
 
@@ -67,12 +81,12 @@ export async function GET(request: NextRequest, context: RouteContext) {
     }),
     db.agentTurn.findFirst({
       where: { sessionId, userId: auth.userId, status: { in: [...ACTIVE_STATUSES] } },
-      orderBy: { createdAt: "asc" }, select: TURN_SELECT,
+      orderBy: { createdAt: "asc" }, select: ACTIVE_TURN_SELECT,
     }),
     db.agentInput.count({ where: { sessionId, userId: auth.userId, status: "accepted", delivery: "follow_up" } }),
   ])
   const result = pageResult(rows as TurnQueryRow[], page, "turns", sessionId)
-  const activeProjection = activeTurnProjection(activeTurn as TurnQueryRow | null)
+  const activeProjection = activeTurnProjection(activeTurn as ActiveTurnQueryRow | null)
   return ok({
     schemaVersion,
     turns: result.rows.map(turnDto),

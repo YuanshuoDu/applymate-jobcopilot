@@ -16,6 +16,14 @@ const scoutResult = (jobId: string) => ({
   evidence: [{ id: "evidence-job", kind: "job", ref: jobId, source: "private-source" }],
   summary: "PRIVATE_ROLE_NARRATIVE",
 })
+const analystResult = (jobId: string) => ({
+  schemaVersion: ROLE_RESULT_SCHEMA,
+  role: "analyst",
+  status: "completed",
+  findings: [{ jobId, score: 8, evidenceIds: ["evidence-job"] }],
+  evidence: [{ id: "evidence-job", kind: "job", ref: jobId, source: "private-source" }],
+  summary: "PRIVATE_ANALYST_NARRATIVE",
+})
 
 function row(id: string, role: string, taskType: string, result: unknown, attemptCount?: number): GraphTaskRow {
   return { id, role, taskType, status: "completed", failureReason: null, result,
@@ -57,6 +65,42 @@ describe("current TaskGraph final-summary binding", () => {
     expect(JSON.stringify(binding)).not.toContain("PRIVATE_FINAL_TEXT")
     expect(JSON.stringify(binding)).not.toContain("control-job")
     expect(JSON.stringify(binding)).not.toContain("old-job")
+  })
+
+  it("keeps historical Scout and Analyst members private while reducing current rows at original indices", () => {
+    const loaded = graph(8, ["old-scout", "current-analyst", "old-analyst", "current-scout"], [
+      row("old-scout", "scout", "scout", { status: "completed", structuredResult: scoutResult("old-job") }),
+      row("current-analyst", "analyst", "analyst", { status: "completed", structuredResult: analystResult("current-job") }),
+      row("old-analyst", "analyst", "analyst", { status: "completed", structuredResult: { ...analystResult("old-job"), status: "partial" } }),
+      row("current-scout", "scout", "scout", { status: "completed", structuredResult: scoutResult("current-job") }),
+    ])
+    const binding = buildTaskGraphFinalSummaryBinding(loaded, new Set([0, 2]))!
+
+    expect(binding.members?.map(member => [member.nodeIndex, member.kind])).toEqual([
+      [0, "historical"], [1, "business"], [2, "historical"], [3, "business"],
+    ])
+    expect(binding.summary.discoveredJobs).toEqual([{ jobId: "current-job", taskIds: ["current-scout"] }])
+    expect(binding.summary.analyzedJobs).toEqual([{ jobId: "current-job", findings: [{ taskId: "current-analyst", score: 8 }] }])
+    expect(binding.summary.taskOutcomes.map(outcome => outcome.taskId)).toEqual(["current-analyst", "current-scout"])
+    expect(JSON.stringify(binding)).not.toMatch(/old-job|PRIVATE_ROLE_NARRATIVE|PRIVATE_ANALYST_NARRATIVE/)
+  })
+
+  it("rejects invalid, unsupported, stale, and all-historical selections", () => {
+    const validScout = graph(4, ["historical-scout"], [
+      row("historical-scout", "scout", "scout", { status: "completed", structuredResult: scoutResult("old-job") }),
+    ])
+    const unsupported = graph(4, ["unsupported"], [row("unsupported", "odd-role", "scout", { status: "completed", structuredResult: scoutResult("old-job") })])
+    const staleRole = graph(4, ["stale-role"], [row("stale-role", "scout", "scout", { status: "completed", structuredResult: analystResult("old-job") })])
+    const staleStatusTask = { ...row("stale-status", "scout", "scout", { status: "completed", structuredResult: scoutResult("old-job") }), status: "failed" as const }
+    const staleStatus = graph(4, ["stale-status"], [staleStatusTask])
+    const wrongTemplate = graph(4, ["wrong-template"], [row("wrong-template", "scout", "research", { status: "completed", structuredResult: scoutResult("old-job") })])
+
+    for (const index of [-1, 0.5, 1]) expect(() => buildTaskGraphFinalSummaryBinding(validScout, new Set([index])))
+      .toThrow("task_graph_final_summary_historical_selection_invalid")
+    for (const candidate of [unsupported, staleRole, staleStatus, wrongTemplate]) expect(() => buildTaskGraphFinalSummaryBinding(candidate, new Set([0])))
+      .toThrow("task_graph_final_summary_historical_selection_invalid")
+    expect(() => buildTaskGraphFinalSummaryBinding(validScout, new Set([0])))
+      .toThrow("task_graph_final_summary_historical_selection_invalid")
   })
 
   it("keeps no-graph legacy calls unbound and rejects inconsistent current graph scope", () => {
