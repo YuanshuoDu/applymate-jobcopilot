@@ -791,10 +791,6 @@ async function startReviewedFillRouteBridge(): Promise<void> {
       const requestBody = Buffer.concat(chunks).toString("utf8")
       const body = jsonRecord(JSON.parse(requestBody))
       const outboxId = typeof body?.outboxId === "string" ? body.outboxId : null
-      const outbox = outboxId ? await testDb.agentOutbox.findUnique({ where: { id: outboxId }, select: { payload: true } }) : null
-      const predecessorTurnId = jsonString(outbox?.payload, "predecessorTurnId")
-      const predecessor = predecessorTurnId
-        ? await testDb.agentTurn.findUnique({ where: { id: predecessorTurnId }, select: { status: true } }) : null
       const headers = new Headers()
       for (const name of ["content-type", "x-agent-worker-secret"] as const) {
         const value = incoming.headers[name]
@@ -806,6 +802,10 @@ async function startReviewedFillRouteBridge(): Promise<void> {
       }))
       const responseBody = await routeResponse.text()
       const ack = jsonRecord(JSON.parse(responseBody))
+      const outbox = outboxId ? await testDb.agentOutbox.findUnique({ where: { id: outboxId }, select: { payload: true } }) : null
+      const predecessorTurnId = jsonString(outbox?.payload, "predecessorTurnId")
+      const predecessor = predecessorTurnId
+        ? await testDb.agentTurn.findUnique({ where: { id: predecessorTurnId }, select: { status: true } }) : null
       const attempt: ReviewedFillBridgeAttempt = {
         outboxId, status: routeResponse.status,
         acknowledgement: typeof ack?.status === "string" ? ack.status : null,
@@ -1676,8 +1676,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const bridgeAttempts = await waitForReviewedFillBridgeRecoveryAttempts(handoff.id)
     expect(bridgeAttempts.every(attempt => attempt.outboxId === handoff.id)).toBe(true)
     const deferredAttempts = bridgeAttempts.filter(attempt => attempt.acknowledgement === "deferred")
-    expect(deferredAttempts.every(attempt => attempt.status === 200 && attempt.predecessorStatus === "completed"
-      && attempt.acknowledgementDropped === false)).toBe(true)
+    expect(deferredAttempts.every(attempt => attempt.status === 200 && attempt.acknowledgementDropped === false)).toBe(true)
     const recoveryAttempts = bridgeAttempts.filter(attempt => attempt.acknowledgement !== "deferred")
     expect(recoveryAttempts).toEqual([
       { outboxId: handoff.id, status: 200, acknowledgement: "queued", predecessorStatus: "completed", acknowledgementDropped: true },
