@@ -41,6 +41,7 @@ export interface WaitCommandInput {
 export interface ApprovalDecisionInput extends WaitCommandInput {
   decision: WaitDecision
   reviewedSourceTurnId?: string
+  receiptNonce?: string
 }
 
 export interface QuestionAnswerInput extends WaitCommandInput {
