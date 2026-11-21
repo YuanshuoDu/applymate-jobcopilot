@@ -15,6 +15,7 @@ export interface ChildWorkerTask extends SupervisorTaskSummary {
 interface FollowUpTarget { readonly taskId: string; readonly turnId: string; readonly attemptCount: number }
 interface FollowUpRequest extends FollowUpTarget { readonly sessionId: string; readonly clientMessageId: string; readonly text: string }
 const SAFE_CHILD_TIMELINE_TYPES = new Set(['agent_message', 'tool_call', 'tool_result', 'approval_request', 'question', 'task_graph'])
+const SAFE_CHILD_TOOL_NAMES = new Set(['jobs.search', 'jobs.get', 'jobs.discover', 'scout.delegate', 'scout.results', 'agent.wait'])
 
 export function childFollowUpTarget(task: ChildWorkerTask | null, sessionId: string): FollowUpTarget | null {
   if (!task || task.sessionId !== sessionId || !task.rootTaskId || !task.parentTaskId || task.id === task.rootTaskId
@@ -22,18 +23,30 @@ export function childFollowUpTarget(task: ChildWorkerTask | null, sessionId: str
   return { taskId: task.id, turnId: task.turnId, attemptCount: Number(task.attemptCount) }
 }
 
-export function taskTimelineItems(items: readonly TimelineItem[], taskId: string): TimelineItem[] {
-  return items.filter(item => item.taskId === taskId && SAFE_CHILD_TIMELINE_TYPES.has(item.type)).map(projectChildTimelineItem)
+export function taskTimelineItems(items: readonly TimelineItem[], task: ChildWorkerTask | null, sessionId: string): TimelineItem[] {
+  if (!task || !sessionId || task.sessionId !== sessionId || !task.id || typeof task.turnId !== 'string' || !task.turnId) return []
+  return items.filter(item => item.sessionId === sessionId && item.turnId === task.turnId
+    && item.taskId === task.id && SAFE_CHILD_TIMELINE_TYPES.has(item.type)).map(projectChildTimelineItem)
 }
 
 function projectChildTimelineItem(item: TimelineItem): TimelineItem {
+  const toolCard = item.type === 'tool_call' || item.type === 'tool_result'
+  const toolName = toolCard ? safeChildToolName(item) : null
   return {
     schemaVersion: item.schemaVersion, id: item.id, sessionId: item.sessionId, turnId: item.turnId,
     stepId: item.stepId, taskId: item.taskId, type: item.type, status: item.status, phase: item.phase,
-    revision: item.revision, content: item.type === 'tool_call' || item.type === 'tool_result' ? {} : { parts: [{ type: 'redacted' }] },
+    revision: item.revision, content: toolCard ? (toolName ? { toolName } : {}) : { parts: [{ type: 'redacted' }] },
     startedAt: item.startedAt, completedAt: item.completedAt, createdAt: item.createdAt, updatedAt: item.updatedAt,
     source: item.source, sequence: item.sequence,
   }
+}
+
+function safeChildToolName(item: TimelineItem): string | null {
+  if (item.source !== 'durable' && item.source !== 'replay') return null
+  const content = item.content
+  if (!content || typeof content !== 'object' || Array.isArray(content) || !Object.hasOwn(content, 'toolName')) return null
+  const name = (content as Record<string, unknown>).toolName
+  return typeof name === 'string' && SAFE_CHILD_TOOL_NAMES.has(name) ? name : null
 }
 
 export async function postChildTaskFollowUp(request: FollowUpRequest, refreshTasks: () => void | Promise<void>, fetcher: typeof fetch = fetch): Promise<'accepted' | 'conflict'> {
@@ -59,7 +72,7 @@ export function ChildWorkerAttachView({ sessionId, task, items, onClose, onConfl
 }) {
   const { lang } = useI18n()
   const target = childFollowUpTarget(task, sessionId)
-  const taskItems = taskTimelineItems(items, task.id)
+  const taskItems = taskTimelineItems(items, task, sessionId)
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [feedback, setFeedback] = useState<'accepted' | 'conflict' | 'failed' | null>(null)

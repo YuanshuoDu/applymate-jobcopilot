@@ -18,11 +18,13 @@ const child: ChildWorkerTask = {
   createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-01T00:05:00.000Z',
 }
 
-function item(id: string, taskId: string, text: string, type = 'agent_message', content: unknown = { parts: [{ type: 'text', text }] }): TimelineItem {
+type ItemOptions = Partial<Pick<TimelineItem, 'sessionId' | 'turnId' | 'source' | 'status'>>
+
+function item(id: string, taskId: string, text: string, type = 'agent_message', content: unknown = { parts: [{ type: 'text', text }] }, options: ItemOptions = {}): TimelineItem {
   return {
-    schemaVersion: 'agent-harness.v2', id, sessionId: 'session-1', turnId: 'turn-2', stepId: null, taskId,
-    type, status: 'completed', phase: 'commentary', revision: 1, content,
-    startedAt: null, completedAt: null, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-01T00:00:00.000Z', source: 'replay', sequence: null,
+    schemaVersion: 'agent-harness.v2', id, sessionId: options.sessionId ?? 'session-1', turnId: options.turnId ?? 'turn-2', stepId: null, taskId,
+    type, status: options.status ?? 'completed', phase: 'commentary', revision: 1, content,
+    startedAt: null, completedAt: null, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-01T00:00:00.000Z', source: options.source ?? 'replay', sequence: null,
   }
 }
 
@@ -131,7 +133,7 @@ describe('ChildWorkerAttachView', () => {
       { type: 'text', text: 'child evidence' }, { type: 'suggested_action', command: 'submit_application', arguments: {} },
     ] } }
     const items = [own, item('root-event', 'root-1', 'root evidence'), item('other-event', 'other-child', 'other evidence')]
-    expect(taskTimelineItems(items, child.id).map(entry => entry.id)).toEqual(['child-event'])
+    expect(taskTimelineItems(items, child, 'session-1').map(entry => entry.id)).toEqual(['child-event'])
     const render = () => renderToStaticMarkup(<ChildWorkerAttachView sessionId="session-1" task={child} items={items} onClose={vi.fn()} onConflict={vi.fn()} />)
     language.value = 'en'
     const english = render()
@@ -167,7 +169,7 @@ describe('ChildWorkerAttachView', () => {
     ]
     const hidden = ['reasoning_summary', 'subagent_activity', 'artifact', 'error', 'unknown', 'private_event']
       .map(type => item(`hidden-${type}`, child.id, `RAW_${type.toUpperCase()}`, type))
-    const projected = taskTimelineItems([...allowed, ...hidden], child.id)
+    const projected = taskTimelineItems([...allowed, ...hidden], child, 'session-1')
     expect(projected.map(entry => entry.id)).toEqual(allowed.map(entry => entry.id))
     expect(JSON.stringify(projected)).not.toMatch(/RAW_|SECRET_ERROR|private-tool/)
 
@@ -175,5 +177,59 @@ describe('ChildWorkerAttachView', () => {
     for (const entry of allowed) expect(markup).toContain(`data-agent-harness-item="${entry.id}"`)
     for (const entry of hidden) expect(markup).not.toContain(`data-agent-harness-item="${entry.id}"`)
     expect(markup).not.toMatch(/RAW_|SECRET_ERROR|private-tool/)
+  })
+
+  it('binds activity to the displayed session, Turn, and child, hiding missing or conflicting scope', () => {
+    const own = item('own-event', child.id, 'private message')
+    const mismatched = [
+      item('wrong-session', child.id, 'wrong session', 'tool_call', { toolName: 'jobs.search' }, { sessionId: 'session-2' }),
+      item('wrong-turn', child.id, 'wrong turn', 'tool_call', { toolName: 'jobs.search' }, { turnId: 'turn-3' }),
+      item('wrong-child', 'child/two', 'wrong child', 'tool_call', { toolName: 'jobs.search' }),
+    ]
+    expect(taskTimelineItems([own, ...mismatched], child, 'session-1').map(entry => entry.id)).toEqual(['own-event'])
+    expect(taskTimelineItems([own], { ...child, turnId: null }, 'session-1')).toEqual([])
+    expect(taskTimelineItems([own], { ...child, id: '' }, 'session-1')).toEqual([])
+    expect(taskTimelineItems([own], child, '')).toEqual([])
+    expect(taskTimelineItems([own], child, 'session-2')).toEqual([])
+    const markup = renderToStaticMarkup(<ChildWorkerAttachView sessionId="session-2" task={child} items={[own]} onClose={vi.fn()} onConflict={vi.fn()} />)
+    expect(markup).toContain('No activity recorded for this worker yet.')
+    expect(markup).not.toContain('data-agent-harness-item="own-event"')
+    expect(markup).toContain('disabled=""')
+  })
+
+  it('shows only canonical discovery tool names from durable or replayed lifecycle cards', () => {
+    const names = ['jobs.search', 'jobs.get', 'jobs.discover', 'scout.delegate', 'scout.results', 'agent.wait']
+    const safe = names.flatMap((toolName, index) => (['durable', 'replay'] as const).map((source, sourceIndex) => item(
+      `safe-${index}-${source}`, child.id, '', sourceIndex ? 'tool_result' : 'tool_call', {
+        toolName, toolCallId: `private-call-id-${index}`, input: { token: 'PRIVATE_ARGUMENT' },
+        output: 'PRIVATE_OUTPUT', errorCode: 'PRIVATE_ERROR', privateJobId: 'PRIVATE_JOB_ID',
+      }, { source, status: index === 0 && sourceIndex === 0 ? 'running' : 'completed' },
+    )))
+    const inheritedToolName = Object.create({ toolName: 'jobs.search' }) as Record<string, unknown>
+    const hidden = [
+      item('private-name', child.id, '', 'tool_call', { toolName: 'private.tool', input: 'PRIVATE_ARGUMENT' }, { source: 'durable' }),
+      item('legacy-name', child.id, '', 'tool_result', { name: 'jobs.search', output: 'PRIVATE_OUTPUT' }, { source: 'replay' }),
+      item('inherited-name', child.id, '', 'tool_call', inheritedToolName, { source: 'durable' }),
+      item('transient-name', child.id, '', 'tool_call', { toolName: 'jobs.search' }, { source: 'transient' }),
+      item('unknown-source', child.id, '', 'tool_result', { toolName: 'jobs.get' }, { source: 'unknown' }),
+    ]
+    const projected = taskTimelineItems([...safe, ...hidden], child, 'session-1')
+    expect(projected.slice(0, safe.length).map(entry => entry.content)).toEqual(names.flatMap(toolName => [{ toolName }, { toolName }]))
+    expect(projected[0]).toMatchObject({ status: 'running', createdAt: safe[0]!.createdAt, updatedAt: safe[0]!.updatedAt })
+    expect(projected.slice(safe.length).map(entry => entry.content)).toEqual([{}, {}, {}, {}, {}])
+    expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_ARGUMENT|PRIVATE_OUTPUT|PRIVATE_ERROR|PRIVATE_JOB_ID|private-call-id|private\.tool/)
+
+    const render = () => renderToStaticMarkup(<ChildWorkerAttachView sessionId="session-1" task={child} items={[...safe, ...hidden]} onClose={vi.fn()} onConflict={vi.fn()} />)
+    language.value = 'en'
+    const english = render()
+    for (const name of names) expect(english).toContain(`<strong>${name}</strong>`)
+    expect(english).toContain('data-tool-status="running"')
+    expect(english).toContain('agent.toolCall')
+    expect(english).toContain('agent.toolResult')
+    expect(english).not.toMatch(/PRIVATE_ARGUMENT|PRIVATE_OUTPUT|PRIVATE_ERROR|PRIVATE_JOB_ID|private-call-id|private\.tool/)
+    language.value = 'zh'
+    expect(render()).toContain('所选工作线程活动')
+    expect(render()).toContain('<strong>jobs.search</strong>')
+    language.value = 'en'
   })
 })
