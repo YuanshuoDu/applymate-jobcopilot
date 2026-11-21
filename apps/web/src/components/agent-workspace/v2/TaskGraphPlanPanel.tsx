@@ -141,7 +141,7 @@ function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
 
-function TaskGraphPlanSection({ plan, verificationSummary, sessionId, lang, t }: {
+function TaskGraphPlanSection({ plan, successCriteria, verificationSummary, sessionId, lang, t }: {
   readonly plan: PlanLedgerWithRepairTargetGoals
   readonly successCriteria: ReadonlyMap<string, readonly string[]> | null
   readonly verificationSummary: TaskGraphVerificationSummaryDto | null
@@ -165,7 +165,8 @@ function TaskGraphPlanSection({ plan, verificationSummary, sessionId, lang, t }:
         {plan.nodes.map((node, index) => (
           <li key={node.key} style={nodeStyle}>
             <strong style={goalStyle}>{node.goal}</strong>
-            {successCriteria?.get(node.key)?.length ? <div role="group" aria-label={lang === 'zh' ? '成功标准' : 'Success criteria'} data-task-graph-success-criteria="true">
+            {successCriteria?.get(node.key)?.length ? <div role="group" aria-label={lang === 'zh' ? '验收标准' : 'Success criteria'} data-task-graph-success-criteria="true">
+              <strong>{lang === 'zh' ? '验收标准' : 'Success criteria'}</strong>
               <ul>{successCriteria.get(node.key)?.map((criterion, index) => <li key={index}>{criterion}</li>)}</ul>
             </div> : null}
             {node.repairTargetGoal && <div data-task-graph-repair-target="true">{taskGraphPlanLabel(lang, 'agent.taskGraph.repairAttemptFor')} {node.repairTargetGoal}</div>}

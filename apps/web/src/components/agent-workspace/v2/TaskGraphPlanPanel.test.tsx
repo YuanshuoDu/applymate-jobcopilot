@@ -42,6 +42,7 @@ describe('TaskGraphPlanPanel', () => {
 
     expect(accepted.match(/data-task-graph-success-criteria="true"/g)).toHaveLength(2)
     expect(accepted).toContain('aria-label="Success criteria"')
+    expect(accepted).toContain('<strong>Success criteria</strong>')
     expect(accepted).toContain('Collect &lt;script&gt;public evidence&lt;/script&gt;')
     expect(accepted).toContain('Compare the sources')
     expect(accepted).not.toContain('<script>')
@@ -54,7 +55,9 @@ describe('TaskGraphPlanPanel', () => {
     vi.stubGlobal('window', {})
     vi.stubGlobal('localStorage', { getItem: () => 'zh' })
     try {
-      expect(renderToStaticMarkup(<I18nProvider>{panel({ identity, projection })}</I18nProvider>)).toContain('aria-label="成功标准"')
+      const chinese = renderToStaticMarkup(<I18nProvider>{panel({ identity, projection })}</I18nProvider>)
+      expect(chinese).toContain('aria-label="验收标准"')
+      expect(chinese).toContain('<strong>验收标准</strong>')
     } finally { vi.unstubAllGlobals() }
   })
 
