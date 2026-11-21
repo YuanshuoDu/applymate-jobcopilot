@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { GET } from "./route"
 
 const mocks = vi.hoisted(() => ({
-  requireAuth: vi.fn(), sessionFindFirst: vi.fn(), turnFindMany: vi.fn(), turnFindFirst: vi.fn(), inputCount: vi.fn(),
+  requireAuth: vi.fn(), sessionFindFirst: vi.fn(), turnFindMany: vi.fn(), turnFindFirst: vi.fn(), dbTurnFindFirst: vi.fn(), inputCount: vi.fn(),
+  transaction: vi.fn(), queryRaw: vi.fn(), locationScope: vi.fn(),
 }))
 
 vi.mock("@/lib/api-helpers", () => ({
@@ -11,7 +12,9 @@ vi.mock("@/lib/api-helpers", () => ({
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
 }))
 
-vi.mock("@/lib/db", () => ({ db: { agentSession: { findFirst: mocks.sessionFindFirst }, agentTurn: { findMany: mocks.turnFindMany, findFirst: mocks.turnFindFirst }, agentInput: { count: mocks.inputCount } } }))
+vi.mock("@/lib/agent/session/active-turn-location-scope", () => ({ readActiveTurnLocationScope: mocks.locationScope }))
+
+vi.mock("@/lib/db", () => ({ db: { agentSession: { findFirst: mocks.sessionFindFirst }, agentTurn: { findMany: mocks.turnFindMany, findFirst: mocks.dbTurnFindFirst }, agentInput: { count: mocks.inputCount }, $transaction: mocks.transaction } }))
 
 const params = { params: Promise.resolve({ id: "session_1" }) }
 
@@ -31,7 +34,10 @@ describe("agent turns query API", () => {
   afterEach(() => vi.unstubAllEnvs())
   beforeEach(() => {
     vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "1")
-    mocks.requireAuth.mockReset(); mocks.sessionFindFirst.mockReset(); mocks.turnFindMany.mockReset(); mocks.turnFindFirst.mockReset(); mocks.inputCount.mockReset()
+    mocks.requireAuth.mockReset(); mocks.sessionFindFirst.mockReset(); mocks.turnFindMany.mockReset(); mocks.turnFindFirst.mockReset(); mocks.dbTurnFindFirst.mockReset(); mocks.inputCount.mockReset()
+    mocks.transaction.mockReset().mockImplementation((callback: (tx: unknown) => unknown) => callback({ $queryRaw: mocks.queryRaw, agentTurn: { findFirst: mocks.turnFindFirst } }))
+    mocks.queryRaw.mockReset().mockResolvedValue([])
+    mocks.locationScope.mockReset().mockResolvedValue(null)
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
     mocks.turnFindMany.mockResolvedValue([turn("turn_1", 1)])
@@ -84,6 +90,36 @@ describe("agent turns query API", () => {
     }
   })
 
+  it("returns only the durable safe location projection from one owner-scoped repeatable snapshot", async () => {
+    const active = { ...turn("turn_2", 2, "in_progress"), executionMode: "canonical_task_graph", rootTaskId: "root_2",
+      input: { intent: { kind: "objective_task_graph_execution", version: 1 } } }
+    mocks.turnFindFirst.mockResolvedValueOnce(active)
+    mocks.locationScope.mockResolvedValueOnce({ confirmed: { locations: ["dublin"], status: "pending" }, appliedLocations: ["berlin"] })
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+    expect(body.projection.activeTurn.locationScope).toEqual({
+      confirmed: { locations: ["dublin"], status: "pending" }, appliedLocations: ["berlin"],
+    })
+    expect(mocks.turnFindFirst).toHaveBeenCalledWith(expect.objectContaining({ where: { sessionId: "session_1", userId: "user_1", status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] } } }))
+    expect(mocks.dbTurnFindFirst).not.toHaveBeenCalled()
+    expect(mocks.locationScope).toHaveBeenCalledWith(expect.anything(), {
+      userId: "user_1", sessionId: "session_1", turnId: "turn_2", rootTaskId: "root_2",
+    })
+    expect(mocks.transaction.mock.calls[0]?.[1]).toMatchObject({ isolationLevel: "RepeatableRead" })
+    expect(JSON.stringify(body)).not.toMatch(/inputId|receiptSequence|stepId|rootTaskId/)
+  })
+
+  it("reads the active Turn in the repeatable snapshot and does not reuse location scope when no Turn is active", async () => {
+    mocks.turnFindFirst.mockResolvedValueOnce(null)
+    mocks.locationScope.mockResolvedValueOnce({ confirmed: { locations: ["dublin"], status: "adopted" }, appliedLocations: ["dublin"] })
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+    expect(body.projection).toMatchObject({ activeTurnId: null, activeTurn: null })
+    expect(mocks.turnFindFirst).toHaveBeenCalledTimes(1)
+    expect(mocks.dbTurnFindFirst).not.toHaveBeenCalled()
+    expect(mocks.locationScope).not.toHaveBeenCalled()
+    expect(mocks.transaction.mock.calls[0]?.[1]).toMatchObject({ isolationLevel: "RepeatableRead" })
+  })
   it("hides location steering when the server feature flag is off", async () => {
     vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "0")
     mocks.turnFindFirst.mockResolvedValueOnce({

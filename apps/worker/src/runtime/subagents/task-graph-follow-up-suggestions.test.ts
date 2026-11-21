@@ -52,6 +52,28 @@ describe("TaskGraph follow-up suggestion reducer", () => {
     expect(suggestions).toHaveLength(3)
   })
 
+  it("suppresses only resolved failure advice and keeps independent result issues", () => {
+    const current = binding([
+      { taskId: "resolved-analysis", role: "analyst", taskStatus: "failed", structuredResult: analyst("job-resolved") },
+      { taskId: "unrelated-scout", role: "scout", taskStatus: "failed" },
+    ])
+    const resolved = { ...current, resolvedRepairTaskIds: ["resolved-analysis"] }
+    const partial = binding([{ taskId: "partial-scout", role: "scout", taskStatus: "failed", structuredResult: scout("job-partial", "partial") }])
+    const missing = binding([{ taskId: "missing-analysis", role: "analyst", taskStatus: "failed" }])
+    const malformed = { ...current, resolvedRepairTaskIds: ["foreign-task"] }
+
+    expect(reduceTaskGraphFollowUpSuggestions(resolved)).toContainEqual({ kind: "inspect_task_result", taskId: "unrelated-scout",
+      role: "scout", taskStatus: "failed", resultState: "missing" })
+    expect(reduceTaskGraphFollowUpSuggestions(resolved)).not.toContainEqual(expect.objectContaining({ kind: "inspect_task_result", taskId: "resolved-analysis" }))
+    expect(reduceTaskGraphFollowUpSuggestions({ ...missing, resolvedRepairTaskIds: ["missing-analysis"] })).toContainEqual({
+      kind: "inspect_task_result", taskId: "missing-analysis", role: "analyst", taskStatus: "failed", resultState: "missing",
+    })
+    expect(reduceTaskGraphFollowUpSuggestions({ ...partial, resolvedRepairTaskIds: ["partial-scout"] })).toContainEqual({
+      kind: "inspect_task_result", taskId: "partial-scout", role: "scout", taskStatus: "failed", resultState: "valid",
+    })
+    expect(reduceTaskGraphFollowUpSuggestions(malformed)).toContainEqual(expect.objectContaining({ taskId: "resolved-analysis" }))
+  })
+
   it.each(["needs_revision", "rejected", "stale"] as const)("references the exact current artifact for a %s review", reviewStatus => {
     const ref = artifact(`private-artifact-${reviewStatus}`)
     const suggestions = reduceTaskGraphFollowUpSuggestions(binding([

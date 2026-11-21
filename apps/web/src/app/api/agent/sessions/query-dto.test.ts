@@ -401,10 +401,22 @@ describe("agent query DTO redaction", () => {
   it("does not expose turn input, task result, or tool arguments", () => {
     expect(turnDto({
       id: "turn_1", sessionId: "session_1", source: "user", status: "completed", revision: 2,
-      input: { goal: "Find Dublin jobs", content: [{ type: "text", text: "private" }] },
+      input: { goal: "Find Dublin jobs", content: [{ type: "text", text: "private" }], retryLineage: {
+        schemaVersion: "agent-harness.v2.retry-lineage.v1", predecessorTurnId: "private-source-turn",
+        acceptedInputId: "private-accepted-input", acceptedSequence: "18",
+      } },
       steps: [{ id: "step_1" }], items: [{ id: "item_final" }],
       createdAt: date, updatedAt: new Date("2026-08-31T00:01:00Z"), completedAt: null,
     })).not.toHaveProperty("input")
+    expect(JSON.stringify(turnDto({
+      id: "turn_1", sessionId: "session_1", source: "user", status: "completed", revision: 2,
+      input: { goal: "Find Dublin jobs", content: [{ type: "text", text: "private" }], retryLineage: {
+        schemaVersion: "agent-harness.v2.retry-lineage.v1", predecessorTurnId: "private-source-turn",
+        acceptedInputId: "private-accepted-input", acceptedSequence: "18",
+      } },
+      steps: [{ id: "step_1" }], items: [{ id: "item_final" }],
+      createdAt: date, updatedAt: new Date("2026-08-31T00:01:00Z"), completedAt: null,
+    }))).not.toContain("private-source-turn")
     expect(taskDto({
       id: "task_1", sessionId: "session_1", turnId: "turn_1", rootTaskId: "task_1", parentTaskId: null, path: "/task_1",
       role: "scout", taskType: "jobs", status: "passed", goal: "Find jobs",
