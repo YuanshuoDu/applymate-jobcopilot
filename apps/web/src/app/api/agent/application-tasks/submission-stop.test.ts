@@ -35,11 +35,28 @@ const startData = {
   approvalId: identity.approvalId, constraintHash: "",
 }
 
-type FixtureOptions = { stages?: ApplicationSubmissionStopStage[]; malformed?: "body" | "actor" | "payload"; submitted?: boolean; uncertain?: boolean; settled?: boolean }
+type FixtureOptions = {
+  stages?: ApplicationSubmissionStopStage[]; malformed?: "body" | "actor" | "payload"
+  submitted?: boolean; uncertain?: boolean; settled?: boolean; reviewed?: boolean; drift?: boolean
+  turnStatus?: string; sessionStatus?: string; invalidLease?: boolean
+  turnEvent?: "turn.interrupt.requested" | "turn.interrupted" | "turn.failed"
+}
 
 async function fixture(options: FixtureOptions = {}) {
-  const materialHash = await hashAgentReceiptValue("material", { applicationTaskId: task.id, jobId: task.jobId, resumeId: task.resumeId, coverLetterId: null })
-  const answersHash = await hashAgentReceiptValue("answers", task.confirmedAnswers)
+  const material = { applicationTaskId: task.id, jobId: task.jobId, resumeId: task.resumeId, coverLetterId: null }
+  const proof = {
+    jobId: identity.jobId, sourceTurnId: "source-turn-1", rootTaskId: "root-1", graphRevision: 4,
+    writerTaskId: "writer-1", reviewerTaskId: "reviewer-1", reviewerToolCallId: "review-call-1",
+    reviewHash: `sha256:${"c".repeat(64)}`, artifactId: "cover-letter:job-1", version: 3,
+    contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}`,
+  }
+  const reviewedCoverLetterHash = await hashAgentReceiptValue("reviewed-application-material", {
+    schemaVersion: "agent-harness.v2.reviewed-application-material-proof.v1", ...proof,
+  })
+  const frozenMaterial = options.reviewed ? { ...material, reviewedCoverLetterHash } : material
+  const materialHash = await hashAgentReceiptValue("material", frozenMaterial)
+  const frozenAnswers = task.confirmedAnswers
+  const answersHash = await hashAgentReceiptValue("answers", frozenAnswers)
   const artifactHash = "c".repeat(64)
   const nonceHash = "d".repeat(64)
   const expiresAt = new Date(Date.now() + 60_000)
@@ -57,6 +74,7 @@ async function fixture(options: FixtureOptions = {}) {
   }
   const currentTask = {
     ...task,
+    ...(options.drift ? { resumeId: "resume-after-approval", coverLetterId: "letter-after-approval", confirmedAnswers: { questions: ["changed"] } } : {}),
     ...(options.submitted ? { status: "submitted", checkpoint: "submission_verified" } : {}),
     ...(options.uncertain ? { status: "waiting_for_user", checkpoint: "submission_uncertain" } : {}),
   }
@@ -92,21 +110,30 @@ async function fixture(options: FixtureOptions = {}) {
     turnId: identity.fillTurnId, jobId: identity.jobId, toolCallId: `application-submit:${task.id}`,
     type: "submit_application", status: "consumed", scopeHash: constraintHash, resourceHash: artifactHash,
     materialHash, answersHash, nonceHash, revision: 4, expiresAt, decidedAt: new Date(), consumedAt: new Date(),
-    payload: { applicationTaskId: task.id, jobId: identity.jobId, resumeId: task.resumeId, coverLetterId: null, confirmedAnswers: task.confirmedAnswers },
+    payloadApplicationTaskId: task.id, payloadJobId: identity.jobId,
   }
   const submitAttempt = {
     id: "attempt-row-1", userId: identity.userId, jobId: identity.jobId, receiptId: identity.receiptId,
     constraintHash, artifactHash, state: options.submitted ? "submitted" : options.uncertain ? "failed" : "reserved",
     responseRef: options.submitted ? "receipt-ref" : null,
   }
+  const now = Date.now()
+  const turn = {
+    id: identity.fillTurnId, status: options.turnStatus ?? "completed",
+    leaseOwnerId: options.turnStatus === "in_progress" ? "lease-owner-1" : null,
+    leaseStartedAt: options.turnStatus === "in_progress" ? new Date(now - 1_000) : null,
+    leaseExpiresAt: options.turnStatus === "in_progress" ? new Date(now + 60_000) : null,
+    leaseVersion: options.turnStatus === "in_progress" ? 2 : 0,
+    ...(options.invalidLease ? { leaseOwnerId: null, leaseExpiresAt: new Date(now - 1_000) } : {}),
+  }
   const create = vi.fn(async ({ data }: { data: typeof protocolRows[number] }) => { protocolRows.push(data) })
   const raw = vi.fn(async (query: Prisma.Sql) => {
     const sql = query.sql
     if (sql.includes('FROM "application_tasks"')) return [currentTask]
     if (sql.includes('FROM "agent_sessions"') && sql.includes("NOT IN")) return [{ id: identity.sessionId }]
-    if (sql.includes('FROM "agent_sessions"')) return [{ status: "completed" }]
-    if (sql.includes('FROM "agent_turns"')) return [{ id: identity.fillTurnId, status: "completed", leaseOwnerId: null, leaseExpiresAt: null }]
-    if (sql.includes('FROM "agent_events"')) return [{ stopped: false }]
+    if (sql.includes('FROM "agent_sessions"')) return [{ status: options.sessionStatus ?? (options.turnStatus === "in_progress" ? "running" : "completed") }]
+    if (sql.includes('FROM "agent_turns"')) return [turn]
+    if (sql.includes('FROM "agent_events"')) return [{ stopped: options.turnEvent !== undefined }]
     if (sql.includes('FROM "sub_agent_tasks"')) return [{ id: "filler-1", status: "completed", leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null, role: "application_filler", taskType: "application_fill_for_review" }]
     if (sql.includes('FROM "Job"')) return [{ id: identity.jobId }]
     if (sql.includes('FROM "application_task_events"') && sql.includes('"id" IN')) return [...protocolRows]
@@ -118,7 +145,7 @@ async function fixture(options: FixtureOptions = {}) {
   const tx = { $queryRaw: raw, applicationTaskEvent: { create } } as unknown as Prisma.TransactionClient
   const input = { userId: identity.userId, sessionId: identity.sessionId, applicationTaskId: task.id,
     expectedAttemptTarget: createApplicationSubmissionStopTarget(attempt) }
-  return { tx, input, attempt, protocolRows, create, raw }
+  return { tx, input, attempt, protocolRows, create, raw, approval, materialHash, answersHash }
 }
 
 describe("private application submission Stop transaction", () => {
@@ -144,6 +171,68 @@ describe("private application submission Stop transaction", () => {
       }, "stop_requested"), type: "submission_stop_protocol", actor: "user", body,
       data: expect.objectContaining({ stage: "stop_requested", executionId: identity.executionId }),
     }) })
+  })
+
+  it("accepts the exact v2 domain commitment after current application material drifts", async () => {
+    const f = await fixture({ reviewed: true, drift: true })
+    await expect(requestApplicationSubmissionStopInTransaction(f.tx, f.input)).resolves.toBe("stop_requested")
+    expect(f.approval.materialHash).toBe(f.materialHash)
+    expect(f.materialHash).not.toBe(await hashAgentReceiptValue("material", {
+      applicationTaskId: task.id, jobId: task.jobId, resumeId: task.resumeId, coverLetterId: null,
+    }))
+    expect(f.approval.answersHash).toBe(f.answersHash)
+    expect(f.create).toHaveBeenCalledTimes(1)
+    const sql = f.raw.mock.calls.map(([query]) => query.sql).join("\n")
+    expect(sql).not.toContain('"confirmedAnswers"')
+    expect(sql).not.toContain('"resumeId"')
+    expect(sql).not.toContain('"coverLetterId"')
+    const approvalSql = f.raw.mock.calls.map(([query]) => query.sql).find(query => query.includes('FROM "agent_approvals"'))
+    expect(approvalSql).toContain('"payload"->>\'applicationTaskId\'')
+    expect(approvalSql).toContain('"payload"->>\'jobId\'')
+    expect(approvalSql).not.toMatch(/,\s*"payload"(?:\s|,|$)/)
+  })
+
+  it("preserves a v1 consumed approval against its frozen material and answer hashes", async () => {
+    const f = await fixture()
+    await expect(requestApplicationSubmissionStopInTransaction(f.tx, f.input)).resolves.toBe("stop_requested")
+    expect(f.approval.materialHash).toBe(f.materialHash)
+    expect(f.approval.answersHash).toBe(f.answersHash)
+  })
+
+  it("allows a known active owning Turn with a valid lease", async () => {
+    const f = await fixture({ turnStatus: "in_progress" })
+    await expect(requestApplicationSubmissionStopInTransaction(f.tx, f.input)).resolves.toBe("stop_requested")
+  })
+
+  it.each(["failed", "cancelled", "interrupted", "queued", "unknown"])("rejects unsupported Turn state %s without writing", async turnStatus => {
+    const f = await fixture({ turnStatus })
+    await expect(requestApplicationSubmissionStopInTransaction(f.tx, f.input)).rejects.toMatchObject({ code: "stop_scope_invalid" })
+    expect(f.create).not.toHaveBeenCalled()
+  })
+
+  it("rejects an active Turn without a normal live lease", async () => {
+    const f = await fixture({ turnStatus: "in_progress", invalidLease: true })
+    await expect(requestApplicationSubmissionStopInTransaction(f.tx, f.input)).rejects.toMatchObject({ code: "stop_scope_invalid" })
+    expect(f.create).not.toHaveBeenCalled()
+  })
+
+  it("rejects an active Turn when its owning session is not running", async () => {
+    const f = await fixture({ turnStatus: "in_progress", sessionStatus: "paused" })
+    await expect(requestApplicationSubmissionStopInTransaction(f.tx, f.input)).rejects.toMatchObject({ code: "stop_scope_invalid" })
+    expect(f.create).not.toHaveBeenCalled()
+  })
+
+  it.each(["turn.interrupt.requested", "turn.interrupted", "turn.failed"] as const)("rejects %s evidence even when the Turn snapshot looks normal", async turnEvent => {
+    const f = await fixture({ turnEvent })
+    await expect(requestApplicationSubmissionStopInTransaction(f.tx, f.input)).rejects.toMatchObject({ code: "stop_scope_invalid" })
+    expect(f.create).not.toHaveBeenCalled()
+  })
+
+  it("rejects a consumed approval whose frozen scope no longer hashes to its receipt", async () => {
+    const f = await fixture()
+    f.approval.nonceHash = "e".repeat(64)
+    await expect(requestApplicationSubmissionStopInTransaction(f.tx, f.input)).rejects.toMatchObject({ code: "stop_scope_invalid" })
+    expect(f.create).not.toHaveBeenCalled()
   })
 
   it("replays a persisted Stop without writing a second event", async () => {

@@ -2,7 +2,6 @@ import { createHash, timingSafeEqual } from "node:crypto"
 
 import { Prisma } from "@prisma/client"
 import { hashApprovalScope } from "@jobcopilot/agent-protocol"
-import { hashAgentReceiptValue } from "@jobcopilot/shared"
 import { APPLICATION_SUBMISSION_STOP_PROTOCOL_SCHEMA, applicationSubmissionStopEventId, matchesExactApplicationSubmissionStopAttempt, parseApplicationSubmissionStopRecord, type ApplicationSubmissionStopAttempt, type ApplicationSubmissionStopEventKey, type ApplicationSubmissionStopStage } from "@jobcopilot/shared/application-submission-stop-protocol"
 import { protocolScope } from "@/lib/agent/approval/types"
 import { evaluateApplicationSubmissionEvidence, type SubmissionEvidenceEventType } from "@/lib/agent/application-submission-evidence"
@@ -16,11 +15,9 @@ const START_EVENT_KEYS = ["executionId", "workerTaskId", "applicationTaskId", "u
 export type ApplicationSubmissionStopOutcome = "stop_requested" | "too_late" | "submitted" | "uncertain"
 export type ApplicationSubmissionStopInput = Readonly<{ userId: string; sessionId: string; applicationTaskId: string; expectedAttemptTarget: string }>
 export class ApplicationSubmissionStopError extends Error { constructor(readonly code: "stop_scope_invalid" | "stop_target_stale" | "stop_protocol_invalid", message: string) { super(message); this.name = "ApplicationSubmissionStopError" } }
-
 type TaskRow = {
   id: string; userId: string; sessionId: string | null; jobId: string; status: string; checkpoint: string | null
   fillTurnId: string | null; fillTurnSessionId: string | null; fillTurnUserId: string | null; workerTaskId: string | null
-  resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown
 }
 type EventRow = { id: string; taskId: string; type: string; actor: string; data: unknown }
 type AttemptRow = { id: string; userId: string; jobId: string; receiptId: string; constraintHash: string; artifactHash: string; state: string; responseRef: string | null }
@@ -28,9 +25,10 @@ type ApprovalRow = {
   id: string; userId: string; sessionId: string; taskId: string | null; turnId: string | null; jobId: string | null
   toolCallId: string | null; type: string; status: string; scopeHash: string | null; resourceHash: string | null
   materialHash: string | null; answersHash: string | null; nonceHash: string | null; revision: number
-  expiresAt: Date | null; decidedAt: Date | null; consumedAt: Date | null; payload: unknown
+  expiresAt: Date | null; decidedAt: Date | null; consumedAt: Date | null
+  payloadApplicationTaskId: string | null; payloadJobId: string | null
 }
-type ProtocolEventRow = EventRow & { body: string }
+type ProtocolEventRow = EventRow & { body: string }; type TurnRow = { id: string; status: string; leaseOwnerId: string | null; leaseStartedAt: Date | null; leaseExpiresAt: Date | null; leaseVersion: number }
 function fail(code: ConstructorParameters<typeof ApplicationSubmissionStopError>[0], message: string): never { throw new ApplicationSubmissionStopError(code, message) }
 function record(value: unknown): Record<string, unknown> | null { return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null }
 function nonEmpty(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.trim() === value }
@@ -40,6 +38,13 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
   return actual.length === expected.length && actual.every((key, index) => key === expected[index])
 }
 function validHash(value: unknown): value is string { return typeof value === "string" && /^[a-f0-9]{64}$/.test(value) }
+function normalTurn(turn: TurnRow, sessionStatus: string): boolean {
+  if (!Number.isSafeInteger(turn.leaseVersion) || turn.leaseVersion < 0) return false
+  if (turn.status === "completed") return turn.leaseOwnerId === null && turn.leaseStartedAt === null && turn.leaseExpiresAt === null
+  const now = Date.now(), started = turn.leaseStartedAt?.getTime(), expires = turn.leaseExpiresAt?.getTime()
+  return turn.status === "in_progress" && sessionStatus === "running" && nonEmpty(turn.leaseOwnerId) && turn.leaseVersion > 0
+    && started !== undefined && expires !== undefined && Number.isFinite(started) && Number.isFinite(expires) && started <= now && expires > now
+}
 function stopEventKey(attempt: ApplicationSubmissionStopAttempt): ApplicationSubmissionStopEventKey {
   return { sessionId: attempt.sessionId, fillTurnId: attempt.fillTurnId, applicationTaskId: attempt.applicationTaskId,
     userId: attempt.userId, jobId: attempt.jobId, approvalId: attempt.approvalId, receiptId: attempt.receiptId,
@@ -64,7 +69,7 @@ function targetMatches(target: unknown, attempt: ApplicationSubmissionStopAttemp
 async function readTask(tx: Prisma.TransactionClient, input: ApplicationSubmissionStopInput, lock: boolean): Promise<TaskRow | null> {
   const suffix = lock ? Prisma.sql`FOR UPDATE` : Prisma.empty
   const rows = await tx.$queryRaw<TaskRow[]>(Prisma.sql`
-    SELECT "id", "userId", "sessionId", "jobId", "status", "checkpoint", "fillTurnId", "fillTurnSessionId", "fillTurnUserId", "workerTaskId", "resumeId", "coverLetterId", "confirmedAnswers"
+    SELECT "id", "userId", "sessionId", "jobId", "status", "checkpoint", "fillTurnId", "fillTurnSessionId", "fillTurnUserId", "workerTaskId"
     FROM "application_tasks" WHERE "id" = ${input.applicationTaskId} AND "userId" = ${input.userId}
       AND "sessionId" = ${input.sessionId} ${suffix}
   `)
@@ -105,20 +110,19 @@ export async function requestApplicationSubmissionStopInTransaction(
   const sessions = await tx.$queryRaw<Array<{ status: string }>>(Prisma.sql`
     SELECT "status" FROM "agent_sessions" WHERE "id" = ${input.sessionId} AND "userId" = ${input.userId}
   `)
-  if (sessions.length !== 1 || !["idle", "running", "pausing", "resuming", "waiting_for_user", "paused", "completed"].includes(sessions[0]!.status)) {
+  const sessionStatus = sessions[0]?.status
+  if (sessions.length !== 1 || !sessionStatus || !["idle", "running", "pausing", "resuming", "waiting_for_user", "paused", "completed"].includes(sessionStatus)) {
     fail("stop_scope_invalid", "The owning session is not in a supported state.")
   }
-  const turns = await tx.$queryRaw<Array<{ id: string; status: string; leaseOwnerId: string | null; leaseExpiresAt: Date | null }>>(Prisma.sql`
-    SELECT "id", "status", "leaseOwnerId", "leaseExpiresAt" FROM "agent_turns"
+  const turns = await tx.$queryRaw<TurnRow[]>(Prisma.sql`
+    SELECT "id", "status", "leaseOwnerId", "leaseStartedAt", "leaseExpiresAt", "leaseVersion" FROM "agent_turns"
     WHERE "id" = ${candidate.fillTurnId} AND "sessionId" = ${input.sessionId} AND "userId" = ${input.userId} FOR UPDATE
   `)
   const turn = turns[0]
-  if (turns.length !== 1 || turn?.status !== "completed" || turn.leaseOwnerId !== null || turn.leaseExpiresAt !== null) {
-    fail("stop_scope_invalid", "The exact Fill Turn is not normally completed and lease-free.")
-  }
+  if (turns.length !== 1 || !turn || !normalTurn(turn, sessionStatus)) fail("stop_scope_invalid", "The Fill Turn state or lease is not supported.")
   const interrupted = await tx.$queryRaw<Array<{ stopped: boolean }>>(Prisma.sql`
     SELECT EXISTS (SELECT 1 FROM "agent_events" WHERE "sessionId" = ${input.sessionId}
-      AND "turnId" = ${candidate.fillTurnId} AND "type" = 'turn.interrupted') AS "stopped"
+      AND "turnId" = ${candidate.fillTurnId} AND "type" IN ('turn.interrupt.requested', 'turn.interrupted', 'turn.failed')) AS "stopped"
   `)
   if (interrupted[0]?.stopped !== false) fail("stop_scope_invalid", "The Fill Turn has interruption evidence.")
   const fillers = await tx.$queryRaw<Array<{ id: string; status: string; leaseOwner: string | null; leaseExpiresAt: Date | null; interruptRequestedAt: Date | null; role: string; taskType: string }>>(Prisma.sql`
@@ -167,28 +171,24 @@ export async function requestApplicationSubmissionStopInTransaction(
     || !validHash(submitAttempt?.artifactHash)) fail("stop_scope_invalid", "The reserved submission attempt is missing or mismatched.")
   const approvals = await tx.$queryRaw<ApprovalRow[]>(Prisma.sql`
     SELECT "id", "userId", "sessionId", "taskId", "turnId", "jobId", "toolCallId", "type", "status", "scopeHash",
-      "resourceHash", "materialHash", "answersHash", "nonceHash", "revision", "expiresAt", "decidedAt", "consumedAt", "payload"
+      "resourceHash", "materialHash", "answersHash", "nonceHash", "revision", "expiresAt", "decidedAt", "consumedAt",
+      "payload"->>'applicationTaskId' AS "payloadApplicationTaskId", "payload"->>'jobId' AS "payloadJobId"
     FROM "agent_approvals" WHERE "id" = ${queue.approvalId} AND "userId" = ${input.userId}
       AND "sessionId" = ${input.sessionId} FOR UPDATE
   `)
   const approval = approvals[0]
-  const payload = record(approval?.payload)
-  const materialHash = await hashAgentReceiptValue("material", { applicationTaskId: task.id, jobId: task.jobId,
-    resumeId: task.resumeId ?? null, coverLetterId: task.coverLetterId ?? null })
-  const answersHash = await hashAgentReceiptValue("answers", task.confirmedAnswers ?? null)
   if (approvals.length !== 1 || approval?.id !== queue.approvalId || approval.taskId !== task.id || approval.turnId !== task.fillTurnId
     || approval.jobId !== task.jobId || approval.toolCallId !== `application-submit:${task.id}` || approval.type !== "submit_application"
-    || approval.status !== "consumed" || !approval.consumedAt || !approval.decidedAt || approval.scopeHash !== queue.constraintHash
-    || approval.resourceHash !== submitAttempt.artifactHash || !validHash(approval.materialHash) || approval.materialHash !== materialHash
-    || !validHash(approval.answersHash) || approval.answersHash !== answersHash || !validHash(approval.nonceHash)
-    || !approval.expiresAt || !Number.isInteger(approval.revision) || approval.revision < 0
-    || !payload || payload.applicationTaskId !== task.id || payload.jobId !== task.jobId
-    || payload.resumeId !== (task.resumeId ?? null) || payload.coverLetterId !== (task.coverLetterId ?? null)
-    || ("confirmedAnswers" in payload && JSON.stringify(payload.confirmedAnswers ?? null) !== JSON.stringify(task.confirmedAnswers ?? null))) {
-    fail("stop_scope_invalid", "The consumed submit approval no longer matches its reservation and material.")
+    || approval.status !== "consumed" || !approval.consumedAt || !approval.decidedAt || !approval.expiresAt
+    || approval.decidedAt > approval.consumedAt || approval.consumedAt > approval.expiresAt
+    || approval.scopeHash !== queue.constraintHash || approval.resourceHash !== submitAttempt.artifactHash
+    || !validHash(approval.materialHash) || !validHash(approval.answersHash) || !validHash(approval.nonceHash)
+    || !Number.isSafeInteger(approval.revision) || approval.revision < 0
+    || approval.payloadApplicationTaskId !== task.id || approval.payloadJobId !== task.jobId) {
+    fail("stop_scope_invalid", "The consumed submit approval no longer matches its reserved scope.")
   }
-  const approvalScope = protocolScope({ userId: input.userId, sessionId: input.sessionId, turnId: task.fillTurnId!, jobId: task.jobId,
-    toolCallId: approval.toolCallId, action: "submit_application", resourceHash: approval.resourceHash!, materialHash: approval.materialHash!,
+  const approvalScope = protocolScope({ userId: approval.userId, sessionId: approval.sessionId, turnId: approval.turnId!, jobId: approval.jobId!,
+    toolCallId: approval.toolCallId!, action: "submit_application", resourceHash: approval.resourceHash!, materialHash: approval.materialHash!,
     answersHash: approval.answersHash!, revision: approval.revision, expiresAt: approval.expiresAt }, approval.nonceHash!)
   if (await hashApprovalScope(approvalScope) !== approval.scopeHash) fail("stop_scope_invalid", "The consumed approval hash is invalid.")
   const starts = attemptEvents.filter(event => event.type === "submission_execution_started")
