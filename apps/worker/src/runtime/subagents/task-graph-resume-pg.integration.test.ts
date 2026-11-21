@@ -14162,6 +14162,22 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const scoutSearchEmissionsByTask = new Map<string, number>()
     let adapterStage = "not_started", proofKind = "not_read", requestHasConfirmation = false, requestHasDublin = false
     let requestHasBerlin = false
+    let preRetirementGuards: {
+      acceptedPlanMatchesReplacement: boolean | null
+      replacementHeld: boolean | null
+      replacementListedRunning: boolean | null
+      persistedGraphUnique: boolean | null
+      persistedGraphRevisionMatches: boolean | null
+      retirementToolAvailable: boolean | null
+      seattleTaskMatchesOriginalLease: boolean | null
+      seattleLeaseStillLive: boolean | null
+      noSeattleDescendants: boolean | null
+      seattleHeld: boolean | null
+    } = {
+      acceptedPlanMatchesReplacement: null, replacementHeld: null, replacementListedRunning: null,
+      persistedGraphUnique: null, persistedGraphRevisionMatches: null, retirementToolAvailable: null,
+      seattleTaskMatchesOriginalLease: null, seattleLeaseStillLive: null, noSeattleDescendants: null, seattleHeld: null,
+    }
     let originalSeattleLease: { id: string; status: string; role: string; attemptCount: number; leaseOwner: string | null;
       leaseExpiresAt: Date | null; leaseSegmentStartedAt: Date | null; interruptRequestedAt: Date | null } | null = null
     let originalDublinLease: { id: string; status: string; role: string; attemptCount: number; leaseOwner: string | null;
@@ -14302,6 +14318,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             const revision = graph?.revision
             const acceptedPlanNodes = Array.isArray(planResult?.nodes) ? planResult.nodes.map(record) : []
             const acceptedReplacement = acceptedPlanNodes.find(node => node?.key === "scout-dublin-replacement")
+            preRetirementGuards.acceptedPlanMatchesReplacement = planResult?.status === "accepted"
+              && typeof planResult.revision === "number" && typeof revision === "number"
+              && revision >= planResult.revision && typeof dublin?.taskId === "string"
+              && acceptedReplacement?.taskId === dublin.taskId
             if (planResult?.status !== "accepted" || typeof planResult.revision !== "number"
               || typeof revision !== "number" || revision < planResult.revision
               || typeof dublin?.taskId !== "string" || acceptedReplacement?.taskId !== dublin.taskId) {
@@ -14326,6 +14346,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                  AND item."type" = 'task_graph' AND turn."rootTaskId" = $4
                  AND session."userId" = $5 AND turn."userId" = $5 LIMIT 2`,
               [taskGraphItemId(rootTaskId), value.sessionId, value.turnId, rootTaskId, value.userId])
+            preRetirementGuards.replacementHeld = dublinHeld
+            preRetirementGuards.replacementListedRunning = listedTasks.some(task => task?.taskId === dublin.taskId
+              && task?.status === "running")
+            preRetirementGuards.persistedGraphUnique = persistedGraph.rows.length === 1
+            preRetirementGuards.persistedGraphRevisionMatches = persistedGraph.rows.length === 1
+              && typeof revision === "number" && revision === persistedGraph.rows[0]?.revision
             if (!dublinHeld || scoutSearchEmissionsByTask.get(dublin.taskId) !== 1
               || !listedTasks.some(task => task?.taskId === dublin.taskId && task?.status === "running")
               || persistedGraph.rows.length !== 1 || typeof revision !== "number"
@@ -14334,6 +14360,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             preRetirementListMatched = true
             rootToolsAtRetirement = request.tools.map(tool => record(tool)?.name).filter((name): name is string => typeof name === "string")
+            preRetirementGuards.retirementToolAvailable = rootToolsAtRetirement.includes("agent.retire_superseded_scout")
             if (!rootToolsAtRetirement.includes("agent.retire_superseded_scout")) {
               throw new Error("Typed Objective Root did not receive the scoped retirement tool")
             }
@@ -14356,6 +14383,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 [seattleTaskId, value.sessionId, value.turnId, rootTaskId, value.userId]),
             ])
             const row = target.rows[0]
+            preRetirementGuards.seattleTaskMatchesOriginalLease = Boolean(row && originalSeattleLease
+              && row.id === seattleTaskId && row.status === "running" && row.role === "scout"
+              && row.attemptCount === originalSeattleLease.attemptCount && row.leaseOwner === originalSeattleLease.leaseOwner
+              && row.leaseSegmentStartedAt?.getTime() === originalSeattleLease.leaseSegmentStartedAt?.getTime())
+            preRetirementGuards.seattleLeaseStillLive = Boolean(row && row.interruptRequestedAt === null
+              && row.leaseExpiresAt && row.leaseExpiresAt.getTime() > Date.now())
+            preRetirementGuards.noSeattleDescendants = descendants.rows[0]?.count === 0
+            preRetirementGuards.seattleHeld = seattleHeld
             if (!row || !originalSeattleLease || row.id !== seattleTaskId || row.status !== "running" || row.role !== "scout"
               || row.attemptCount !== originalSeattleLease.attemptCount || row.leaseOwner !== originalSeattleLease.leaseOwner
               || row.leaseSegmentStartedAt?.getTime() !== originalSeattleLease.leaseSegmentStartedAt?.getTime()
@@ -14764,6 +14799,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           && event.causationId === retirementCall?.stepId && event.hasOutbox === false
           && receipt.attempt === originalSeattleLease?.attemptCount
           && receipt.graphRevision === retirementExpectedRevision && receipt.replacementTaskId === replacementTaskId),
+        preRetirementGuards,
       }
     }
     const waitForRootWaitBoundary = async (rootTaskId: string, waitKey: string, stage: string, resultCallId: string) => {
