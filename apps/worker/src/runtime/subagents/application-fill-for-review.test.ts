@@ -31,7 +31,7 @@ vi.mock("../../rate-limit.js", () => ({ checkRateLimit: vi.fn() }))
 vi.mock("../selected-job-reviewed-artifact-read.js", () => ({ readSelectedJobReviewedArtifactWithClient: vi.fn() }))
 
 const browserPageMock = {
-  goto: vi.fn(async () => null),
+  goto: vi.fn(async (): Promise<Awaited<ReturnType<Page["goto"]>>> => null),
   close: vi.fn(async () => undefined),
   url: vi.fn(() => "https://boards.greenhouse.io/acme/jobs/123"),
   locator: vi.fn(),
