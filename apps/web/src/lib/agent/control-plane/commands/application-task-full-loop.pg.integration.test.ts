@@ -253,7 +253,7 @@ type ApplicationFillExecutorTrace = {
 }
 type ApplicationFillCompletionStaleGate = "lease_input_invalid" | "session_scope" | "turn_row_unavailable" | "turn_status_queued" | "turn_status_interrupted" | "turn_status_terminal" | "turn_status_other" | "child_lease_fence" | "application_task_scope"
 type ApplicationFillStageTrace = { entryValidation: boolean; waitPersistence: boolean; completion: boolean; accepted: boolean; rejected: boolean; waiting: boolean; completed: boolean; stale: boolean; conflict: boolean; failed: boolean; cancelled: boolean; unavailable: boolean; leaseLost: boolean; signalAborted: boolean; staleGate?: ApplicationFillCompletionStaleGate }
-type ApplicationFillAcquisitionPhase = "before_control_read" | "before_pattern_read" | "context_requested" | "page_acquired" | "navigation_returned" | "navigation_response_success" | "navigation_response_unavailable" | "destination_allowed" | "destination_rejected" | "wait_detection_returned" | "fill_returned"
+type ApplicationFillAcquisitionPhase = "before_control_read" | "before_pattern_read" | "context_requested" | "page_acquired" | "navigation_returned" | "navigation_response_success" | "navigation_response_unavailable" | "destination_allowed" | "destination_rejected" | "wait_detection_returned" | "outer_wait_clear" | "outer_wait_detected" | "executor_started" | "executor_wait_clear" | "executor_wait_detected" | "deterministic_flow_started" | "deterministic_flow_review_ready" | "deterministic_flow_wait" | "deterministic_flow_other" | "fill_returned" | "callback_settled" | "context_returned"
 type ApplicationFillPhaseTrace = { phase: ApplicationFillAcquisitionPhase }
 type ApplicationTaskRow = {
   id: string; userId: string; jobId: string; sessionId: string | null; fillTurnId: string | null
@@ -443,7 +443,7 @@ function applicationFillStageTraces(child: Child | undefined, startIndex = 0): A
 
 const APPLICATION_FILL_ACQUISITION_PHASES = new Set<ApplicationFillAcquisitionPhase>([
   "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned",
-  "navigation_response_success", "navigation_response_unavailable", "destination_allowed", "destination_rejected", "wait_detection_returned", "fill_returned",
+  "navigation_response_success", "navigation_response_unavailable", "destination_allowed", "destination_rejected", "wait_detection_returned", "outer_wait_clear", "outer_wait_detected", "executor_started", "executor_wait_clear", "executor_wait_detected", "deterministic_flow_started", "deterministic_flow_review_ready", "deterministic_flow_wait", "deterministic_flow_other", "fill_returned", "callback_settled", "context_returned",
 ])
 
 function applicationFillAcquisitionPhases(child: Child | undefined, startIndex = 0): Array<ApplicationFillPhaseTrace | { traceInvalid: true }> {
@@ -461,7 +461,7 @@ function applicationFillAcquisitionPhases(child: Child | undefined, startIndex =
       traces.push({ phase: row.phase as ApplicationFillAcquisitionPhase })
     } catch { traces.push({ traceInvalid: true }) }
   }
-  return traces.slice(-12)
+  return traces.slice(-24)
 }
 
 const APPLICATION_FILL_STALE_GATES: readonly ApplicationFillCompletionStaleGate[] = [
@@ -496,7 +496,7 @@ describe("ApplicationTask full-loop stage trace parser", () => {
 describe("ApplicationTask full-loop acquisition phase trace parser", () => {
   const phases: readonly ApplicationFillAcquisitionPhase[] = [
     "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned",
-    "navigation_response_success", "navigation_response_unavailable", "destination_allowed", "destination_rejected", "wait_detection_returned", "fill_returned",
+    "navigation_response_success", "navigation_response_unavailable", "destination_allowed", "destination_rejected", "wait_detection_returned", "outer_wait_clear", "outer_wait_detected", "executor_started", "executor_wait_clear", "executor_wait_detected", "deterministic_flow_started", "deterministic_flow_review_ready", "deterministic_flow_wait", "deterministic_flow_other", "fill_returned", "callback_settled", "context_returned",
   ]
 
   it.each(phases)("accepts only the sanitized %s phase after the supplied offset", phase => {
@@ -513,9 +513,9 @@ describe("ApplicationTask full-loop acquisition phase trace parser", () => {
       "APPLICATION_FILL_PHASE_TRACE " + JSON.stringify({ phase: "context_requested", url: "private" }),
     ]
     expect(applicationFillAcquisitionPhases({ lines: invalid } as unknown as Child)).toEqual([{ traceInvalid: true }, { traceInvalid: true }])
-    const lines = Array.from({ length: 16 }, (_, index) =>
+    const lines = Array.from({ length: 30 }, (_, index) =>
       "APPLICATION_FILL_PHASE_TRACE " + JSON.stringify({ phase: phases[index % phases.length] }))
-    expect(applicationFillAcquisitionPhases({ lines } as unknown as Child)).toHaveLength(12)
+    expect(applicationFillAcquisitionPhases({ lines } as unknown as Child)).toHaveLength(24)
   })
 })
 
@@ -1247,7 +1247,7 @@ async function reviewedFillTimeoutSnapshot(input: {
   const runtime = {
     executor: applicationFillExecutorTraces(worker, input.traceOffset).slice(-4),
     stages: applicationFillStageTraces(worker, input.traceOffset).slice(-6),
-    phases: applicationFillAcquisitionPhases(worker, input.traceOffset).slice(-8),
+    phases: applicationFillAcquisitionPhases(worker, input.traceOffset).slice(-16),
     workerExited: worker ? exited(worker) : null,
   }
   try {

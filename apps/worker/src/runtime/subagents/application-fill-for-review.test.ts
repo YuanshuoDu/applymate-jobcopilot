@@ -33,6 +33,7 @@ vi.mock("../selected-job-reviewed-artifact-read.js", () => ({ readSelectedJobRev
 const browserPageMock = {
   goto: vi.fn(async (): Promise<Awaited<ReturnType<Page["goto"]>>> => null),
   close: vi.fn(async () => undefined),
+  setDefaultTimeout: vi.fn(),
   url: vi.fn(() => "https://boards.greenhouse.io/acme/jobs/123"),
   locator: vi.fn(),
 }
@@ -133,6 +134,25 @@ beforeEach(() => { vi.resetAllMocks(); setMocks(); vi.mocked(readSelectedJobRevi
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers() })
 
 describe("executeApplicationFillForReview", () => {
+  it("sets a finite page-action timeout only after claiming reviewed material", async () => {
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    vi.mocked(detectBrowserWait).mockImplementation(async () => {
+      expect(browserPageMock.setDefaultTimeout).toHaveBeenCalledWith(30_000)
+      return null
+    })
+
+    await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(browserPageMock.setDefaultTimeout).toHaveBeenCalledOnce()
+    expect(detectBrowserWait).toHaveBeenCalledOnce()
+    browserPageMock.setDefaultTimeout.mockClear()
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(null)
+    vi.mocked(detectBrowserWait).mockResolvedValue(null)
+    await executeApplicationFillForReview({ pool: poolFor(context()).pool, lease: lease() })
+    expect(browserPageMock.setDefaultTimeout).not.toHaveBeenCalled()
+  })
+
   it.each([["role", { role: "analyst" }], ["task type", { taskType: "application_fill" }]])("rejects an unexpected exact %s before querying task context", async (_name, leaseOverride) => {
     const { pool, connects } = poolFor(context())
     const result = await executeApplicationFillForReview({ pool, lease: lease(leaseOverride as Partial<SubagentLease>) })
@@ -163,7 +183,7 @@ describe("executeApplicationFillForReview", () => {
 
     expect(observations.filter(event => event.stage === "browser_acquisition").map(event => event.phase)).toEqual([
       "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned",
-      "navigation_response_success", "destination_allowed", "wait_detection_returned", "fill_returned",
+      "navigation_response_success", "destination_allowed", "wait_detection_returned", "outer_wait_clear", "executor_started", "fill_returned", "callback_settled", "context_returned",
     ])
     browserPageMock.url.mockReturnValueOnce("https://outside.example/")
     const rejectedObservations: ApplicationFillStageObservation[] = []
@@ -171,7 +191,7 @@ describe("executeApplicationFillForReview", () => {
       lease: lease(), stageObserver: event => rejectedObservations.push(event) })).resolves.toMatchObject({ status: "waiting_for_user" })
     expect(rejectedObservations.filter(event => event.stage === "browser_acquisition").map(event => event.phase)).toEqual([
       "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned",
-      "navigation_response_unavailable", "destination_rejected",
+      "navigation_response_unavailable", "destination_rejected", "callback_settled", "context_returned",
     ])
     expect(executeBrowserFill).toHaveBeenCalledOnce()
     const legacyObservations: ApplicationFillStageObservation[] = []
@@ -238,6 +258,7 @@ describe("executeApplicationFillForReview", () => {
     })
     expect(JSON.stringify(fill)).not.toContain("attacker.test")
     expect(JSON.stringify(fill)).not.toContain("client-job")
+    expect(vi.mocked(executeBrowserFill).mock.calls[0]?.[1]).not.toHaveProperty("reviewedCoverLetter")
     expect(fillCustomQuestions).toHaveBeenCalledWith(browserPage, expect.objectContaining({ email: "db@example.test" }), [], { salary: "€80,000" })
     expect(vi.mocked(executeBrowserFill).mock.calls[0]?.[0]).not.toHaveProperty("confirmedAnswers")
     expect(JSON.stringify(vi.mocked(executeBrowserFill).mock.calls[0]?.[0])).not.toContain("€80,000")
@@ -272,6 +293,8 @@ describe("executeApplicationFillForReview", () => {
 
     expect(result).toMatchObject({ status: "completed", result: { status: "filled_for_user_review" } })
     expect(fill).toMatchObject({ submit: false, persona: { coverLetter: reviewedMaterial.content } })
+    expect(fill).not.toHaveProperty("reviewedCoverLetter")
+    expect(vi.mocked(executeBrowserFill).mock.calls[0]?.[1]).toMatchObject({ reviewedCoverLetter: { content: reviewedMaterial.content } })
     expect(browserPageMock.locator).toHaveBeenCalledWith("textarea#cover-letter")
     expect(browserPageMock.locator.mock.results[0]?.value.evaluate).toHaveBeenCalledWith(expect.any(Function), undefined, { timeout: 1000 })
     expect(JSON.stringify(queries.mock.calls)).not.toContain(reviewedMaterial.content)
@@ -469,11 +492,14 @@ describe("executeApplicationFillForReview", () => {
     ["unknown_sensitive_field", "unknown_sensitive_field"], ["stale_review", "stale_review"],
   ])("maps %s to a fixed user wait", async (reason, detail) => {
     vi.mocked(detectBrowserWait).mockResolvedValue({ reason: reason as "captcha", message: "Never persist this page text" })
-    const { pool } = poolFor(context())
-    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    const observations: ApplicationFillStageObservation[] = []
+    const result = await executeApplicationFillForReview({ pool, lease: lease(), stageObserver: event => observations.push(event) })
     expect(result).toMatchObject({ status: "waiting_for_user", failureReason: detail })
     expect(persistApplicationFillWait).toHaveBeenCalledWith(pool, expect.objectContaining({ checkpoint: "form_answer_required", detail }))
     expect(JSON.stringify(vi.mocked(persistApplicationFillWait).mock.calls[0]?.[1])).not.toContain("Never persist this page text")
+    expect(observations).toContainEqual({ stage: "browser_acquisition", phase: "outer_wait_detected" })
     expect(executeBrowserFill).not.toHaveBeenCalled()
   })
 
