@@ -29,6 +29,40 @@ const tasks: SupervisorTaskSummary[] = [{
 }]
 
 describe('TaskGraphPlanPanel', () => {
+  it('shows criteria from the identity-matched graph snapshot as escaped text only', () => {
+    const graphItems = [item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+      { key: 'scout', templateId: 'scout', goal: 'Find evidence', successCriteria: ['Collect <script>public evidence</script>'], dependsOn: [], depth: 1, taskId: 'task-a' },
+      { key: 'analyst', templateId: 'analyst', goal: 'Assess evidence', successCriteria: ['Compare the sources'], dependsOn: ['scout'], depth: 2, taskId: 'task-b' },
+    ] })]
+    const ownedTasks = [...tasks, { ...tasks[1]!, id: 'task-b', goal: 'Assess evidence', taskType: 'analyst' }]
+    const projection = projectCurrentTaskGraph(graphItems, ownedTasks, 'session-1')!
+    const identity = selectedTaskGraphIdentity(graphItems, 'session-1')!
+    const panel = (ledger?: unknown) => <TaskGraphPlanPanel sessionId="session-1" items={graphItems} tasks={ownedTasks} ledger={ledger} />
+    const accepted = renderToStaticMarkup(panel({ identity, projection }))
+
+    expect(accepted.match(/data-task-graph-success-criteria="true"/g)).toHaveLength(2)
+    expect(accepted).toContain('aria-label="Success criteria"')
+    expect(accepted).toContain('<strong>Success criteria</strong>')
+    expect(accepted).toContain('Collect &lt;script&gt;public evidence&lt;/script&gt;')
+    expect(accepted).toContain('Compare the sources')
+    expect(accepted).not.toContain('<script>')
+    expect(accepted.indexOf('Status: Queued')).toBeLessThan(accepted.indexOf('data-task-graph-success-criteria'))
+    expect(accepted.indexOf('Dependencies:')).toBeLessThan(accepted.indexOf('data-task-graph-success-criteria'))
+    expect(renderToStaticMarkup(panel())).not.toContain('data-task-graph-success-criteria')
+    const wrongKeys = { ...projection, nodes: [{ ...projection.nodes[0]!, key: 'foreign-node' }, projection.nodes[1]!] }
+    expect(renderToStaticMarkup(panel({ identity, projection: wrongKeys }))).not.toContain('data-task-graph-success-criteria')
+    expect(renderToStaticMarkup(panel({ identity: { ...identity, turnId: 'older-turn' }, projection })))
+      .not.toContain('data-task-graph-success-criteria')
+
+    vi.stubGlobal('window', {})
+    vi.stubGlobal('localStorage', { getItem: () => 'zh' })
+    try {
+      const chinese = renderToStaticMarkup(<I18nProvider>{panel({ identity, projection })}</I18nProvider>)
+      expect(chinese).toContain('aria-label="验收标准"')
+      expect(chinese).toContain('<strong>验收标准</strong>')
+    } finally { vi.unstubAllGlobals() }
+  })
+
   it('renders the latest native graph from owned task state without exposing private metadata or implying pass', () => {
     const metadata = {
       schemaVersion: 'agent-harness.v2.task-graph.native-delegation.v1', operationKind: 'spawn',

@@ -169,6 +169,22 @@ describe("current location evidence", () => {
     expect(reproof).not.toHaveBeenCalled()
   })
 
+  it("skips only a separately validated plan-pending Scout without calling it historical", async () => {
+    const loaded = loadedGraph([{ key: "active-scout", taskId: "active-task", checkpoint: 10n, status: "running" }])
+    const result = await resolveTaskGraphCurrentLocationEvidence(input(loaded, {
+      pendingSupersededNodeKeys: new Set(["active-scout"]),
+    }))
+
+    expect(result).toMatchObject({ status: "available" })
+    if (result.status !== "available") return
+    expect(result.excludedHistoricalNodeKeys).toEqual(new Set())
+    expect(result.compatibleRetainedNodeKeys).toEqual(new Set())
+    expect(reproof).not.toHaveBeenCalled()
+    await expect(resolveTaskGraphCurrentLocationEvidence(input(loaded, {
+      pendingSupersededNodeKeys: new Set(["missing-node"]),
+    }))).resolves.toEqual({ status: "unavailable" })
+  })
+
   it.each([
     ["task role mismatch", { role: "analyst" }],
     ["task type mismatch", { taskType: "selected_job_discovery" }],
