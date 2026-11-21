@@ -1,5 +1,5 @@
 import { createServer as createHttpsServer } from "node:https"
-import { createServer as createHttpServer } from "node:http"
+import { createServer as createHttpServer, request as createHttpRequest } from "node:http"
 import { connect as connectTcp } from "node:net"
 import { createHash } from "node:crypto"
 import { readFile } from "node:fs/promises"
@@ -13,6 +13,7 @@ const SOCKET = process.env.APPLICATION_TASK_FULL_LOOP_SOCKET_PATH
 const REVIEWED_SOURCE_GOAL = "FULL_LOOP_REVIEWED_SOURCE: produce and review a selected-job cover letter"
 const REVIEWED_COVER_LETTER = "SYNTHETIC REVIEWED COVER LETTER — isolated fill only."
 const REVIEWED_SOURCE_SCHEMA = "agent-harness.v2.subagent.result"
+const REVIEWED_FILL_BRIDGE_PATH = "/__applymate-reviewed-fill"
 const reviewedHash = createHash("sha256").update(REVIEWED_COVER_LETTER).digest("hex")
 const stageObserver = process.env.APPLICATION_TASK_FULL_LOOP_STAGE_OBSERVER_TEST === "true" ? applicationFillStageTrace() : undefined
 const tls = async () => {
@@ -30,6 +31,7 @@ function listen(server, ...args) {
 }
 async function startSite() {
   if (!SOCKET) throw new Error("APPLICATION_TASK_FULL_LOOP_SOCKET_PATH_required")
+  const reviewedFillRouteSocketPath = required("APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_SOCKET_PATH")
   await unlink(SOCKET).catch(() => undefined)
   let submitCount = 0, reviewedSubmitCount = 0, reviewedMaterialExactCount = 0
   const requests = []
@@ -134,6 +136,24 @@ async function startSite() {
   })
   await listen(site, SOCKET)
   const proxy = createHttpServer((request, response) => {
+    if (request.method === "POST" && request.url === REVIEWED_FILL_BRIDGE_PATH) {
+      const forwarded = createHttpRequest({
+        socketPath: reviewedFillRouteSocketPath, path: "/api/internal/agent-runtime/reviewed-fill", method: "POST",
+        headers: {
+          ...(typeof request.headers["content-type"] === "string" ? { "content-type": request.headers["content-type"] } : {}),
+          ...(typeof request.headers["x-agent-worker-secret"] === "string"
+            ? { "x-agent-worker-secret": request.headers["x-agent-worker-secret"] } : {}),
+        },
+      }, routed => {
+        response.writeHead(routed.statusCode ?? 502, { "content-type": routed.headers["content-type"] ?? "application/json" })
+        routed.on("aborted", () => { if (!response.destroyed) response.destroy() })
+        routed.on("error", () => { if (!response.destroyed) response.destroy() })
+        routed.pipe(response)
+      })
+      forwarded.on("error", () => { if (!response.destroyed) response.destroy() })
+      request.pipe(forwarded)
+      return
+    }
     blocked.push(safeBlockedTarget(request.url))
     response.writeHead(405).end("CONNECT required")
   })
@@ -202,11 +222,12 @@ async function startWorker() {
   const noOpProjection = { start: async () => undefined, finish: async () => undefined }
   const [{ createCanonicalTurnRuntime }, { createOptionalProductionChildExecutor }, { startProductionAgentRuntime },
     { startProductionWorkerRuntime }, { resolveProductionAgentFlags }, taskGraphCommandPortModule,
-    taskGraphTemplatesModule, queue, outbox, { withCloakContext, closeAllSlots }, redis] = await Promise.all([
+    taskGraphTemplatesModule, queue, outbox, reviewedFillOutbox, { withCloakContext, closeAllSlots }, redis] = await Promise.all([
     import("../runtime/canonical-turn-runtime.ts"), import("../runtime/subagents/production-child-runtime.ts"),
     import("./production-bootstrap.ts"), import("./production-worker-runtime.ts"), import("../runtime/production-agent-flags.ts"),
     import("../runtime/subagents/pg-task-graph-command-port.ts"), import("../runtime/subagents/task-graph-templates.ts"),
-    import("./apply-queue.ts"), import("./application-submit-outbox.ts"), import("../cloak/pool.js"), import("../redis.ts"),
+    import("./apply-queue.ts"), import("./application-submit-outbox.ts"), import("./reviewed-fill-handoff-outbox.ts"),
+    import("../cloak/pool.js"), import("../redis.ts"),
   ])
   const flags = { ...resolveProductionAgentFlags(), taskGraphPlanningEnabled: true, childExecutionEnabled: true,
     coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false }
@@ -330,6 +351,10 @@ async function startWorker() {
     createWorkerUsageAuthorizer: () => authorizeUsage,
     createCanonicalExecutionProjection: () => noOpProjection,
     createCanonicalSessionProjection: () => noOpProjection,
+    startReviewedFillHandoffOutboxPublisher: publisherPool => reviewedFillOutbox.startReviewedFillHandoffOutboxPublisher(publisherPool, {
+      endpointUrl: required("APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_ENDPOINT_URL"),
+      secret: required("APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_SECRET"), pollMs: 250,
+    }),
     startProductionAgentRuntime: options => startProductionAgentRuntime({
       ...options,
       bootstrapOptions: runtime => {

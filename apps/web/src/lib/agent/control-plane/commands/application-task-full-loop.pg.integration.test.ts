@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { createRequire } from "node:module"
 import { spawn, type ChildProcess } from "node:child_process"
+import { createServer, type Server } from "node:http"
 import { connect as connectSocket } from "node:net"
 import { access, unlink } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -26,6 +27,8 @@ const candidateName = "A B"
 const candidateEmail = `${runId.slice(0, 1)}@${runId.slice(1, 3)}.co`
 const reviewedCoverLetter = "SYNTHETIC REVIEWED COVER LETTER — isolated fill only."
 const reviewedSourceGoal = "FULL_LOOP_REVIEWED_SOURCE: produce and review a selected-job cover letter"
+const reviewedFillBridgePath = "/__applymate-reviewed-fill"
+const reviewedFillEndpointUrl = `http://127.0.0.1:9443${reviewedFillBridgePath}`
 const ids = {
   user: `full-loop-user-${runId}`,
   foreignUser: `full-loop-foreign-${runId}`,
@@ -185,6 +188,13 @@ type FixtureStats = {
   browserTrace: string[]
   browserProgress: Array<{ event: string; elapsedMs: number; length?: number }>
 }
+type ReviewedFillBridgeAttempt = {
+  outboxId: string | null
+  status: number
+  acknowledgement: string | null
+  predecessorStatus: string | null
+  acknowledgementDropped: boolean
+}
 type ApplicationFillExecutorTrace = {
   attemptCount: number | null
   executorInvocationOrdinal: number
@@ -209,6 +219,7 @@ type ApplicationTaskRow = {
 const workerCwd = resolve(process.cwd(), "../worker")
 const fixturePath = resolve(workerCwd, "src/queue/application-task-full-loop.fixture.mjs")
 const socketPath = join(tmpdir(), `applymate-${runId}.sock`)
+const reviewedFillRouteSocketPath = join(tmpdir(), `am-${runId.slice(0, 16)}-rf.sock`)
 const tlsPaths = ["AGENT_TEST_TLS_CERT_PATH", "AGENT_TEST_TLS_KEY_PATH", "AGENT_TEST_TLS_CA_PATH"] as const
 const testDb = new PrismaClient({ datasources: { db: { url: databaseUrl ?? DATABASE_URL } } })
 const workerRequire = createRequire(new URL("../../../../../../worker/package.json", import.meta.url))
@@ -227,6 +238,15 @@ let subagentQueue: InstanceType<typeof Queue> | undefined
 let createdUsers: string[] = []
 const reviewedSessionIds: string[] = []
 const reviewedJobIds: string[] = []
+const reviewedFillBridgeSecret = `application-task-full-loop-${runId}`
+const reviewedFillBridgeAttempts: ReviewedFillBridgeAttempt[] = []
+let reviewedFillBridgeServer: Server | undefined
+let reviewedFillRouteDb: PrismaClient | undefined
+let dropNextReviewedFillAcknowledgement = false
+let priorAgentWorkerSecret: string | undefined
+let priorDatabaseUrl: string | undefined
+let agentWorkerSecretOverridden = false
+let databaseUrlOverridden = false
 let dbConnected = false
 let priorApplicationFillTaskGraph: string | undefined
 
@@ -265,7 +285,10 @@ function spawnFixture(mode: "site" | "worker"): Child {
       AGENT_TURN_REDIS_TEST_DISPOSABLE: "true", RUN_AGENT_TURN_REDIS_INTEGRATION: "1",
       CLOAK_PROXY_URL: "http://127.0.0.1:9443", APPLICATION_TASK_FULL_LOOP_SOCKET_PATH: socketPath,
       APPLICATION_TASK_FULL_LOOP_STAGE_OBSERVER_TEST: mode === "worker" ? "true" : "false",
-      ...(mode === "worker" ? { AGENT_WEB_URL: "", WEB_APP_URL: "", APPLYMATE_WEB_URL: "", AGENT_WORKER_SECRET: "" } : {}),
+      APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_SOCKET_PATH: reviewedFillRouteSocketPath,
+      ...(mode === "worker" ? { AGENT_WEB_URL: "", WEB_APP_URL: "", APPLYMATE_WEB_URL: "", AGENT_WORKER_SECRET: "",
+        APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_ENDPOINT_URL: reviewedFillEndpointUrl,
+        APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_SECRET: reviewedFillBridgeSecret } : {}),
       BULLMQ_STALLED_INTERVAL_MS: "30000",
       ...(mode === "worker" ? { APPLICATION_TASK_FULL_LOOP_USER_ID: ids.user } : {}),
     },
@@ -469,10 +492,11 @@ async function signedBearer(userId: string): Promise<string> {
     .setSubject(userId).setIssuedAt().setExpirationTime("5m").sign(getAuthJwtSecret())
 }
 
-function apiRequest(path: string, token: string, method: "GET" | "PATCH" | "POST", body?: unknown): NextRequest {
+function apiRequest(path: string, token: string, method: "GET" | "PATCH" | "POST", body?: unknown,
+  additionalHeaders: Record<string, string> = {}): NextRequest {
   return new NextRequest(`http://localhost${path}`, {
     method,
-    headers: { authorization: `Bearer ${token}`, ...(body ? { "content-type": "application/json" } : {}) },
+    headers: { ...additionalHeaders, authorization: `Bearer ${token}`, ...(body ? { "content-type": "application/json" } : {}) },
     ...(body ? { body: JSON.stringify(body) } : {}),
   })
 }
@@ -740,6 +764,105 @@ function jsonRecord(value: unknown): Record<string, unknown> | null {
     : null
 }
 
+async function startReviewedFillRouteBridge(): Promise<void> {
+  const { db } = await import("@/lib/db")
+  reviewedFillRouteDb = db
+  const { POST: reviewedFillRoute } = await import("@/app/api/internal/agent-runtime/reviewed-fill/route")
+  dropNextReviewedFillAcknowledgement = true
+  reviewedFillBridgeAttempts.length = 0
+  await unlink(reviewedFillRouteSocketPath).catch(() => undefined)
+  const server = createServer((incoming, outgoing) => {
+    void (async () => {
+      if (incoming.method !== "POST" || incoming.url !== "/api/internal/agent-runtime/reviewed-fill") {
+        outgoing.writeHead(404).end()
+        return
+      }
+      const chunks: Buffer[] = []
+      let length = 0
+      for await (const chunk of incoming) {
+        const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+        length += value.byteLength
+        if (length > 1_024) {
+          outgoing.writeHead(413).end()
+          return
+        }
+        chunks.push(value)
+      }
+      const requestBody = Buffer.concat(chunks).toString("utf8")
+      const body = jsonRecord(JSON.parse(requestBody))
+      const outboxId = typeof body?.outboxId === "string" ? body.outboxId : null
+      const outbox = outboxId ? await testDb.agentOutbox.findUnique({ where: { id: outboxId }, select: { payload: true } }) : null
+      const predecessorTurnId = jsonString(outbox?.payload, "predecessorTurnId")
+      const predecessor = predecessorTurnId
+        ? await testDb.agentTurn.findUnique({ where: { id: predecessorTurnId }, select: { status: true } }) : null
+      const headers = new Headers()
+      for (const name of ["content-type", "x-agent-worker-secret"] as const) {
+        const value = incoming.headers[name]
+        if (typeof value === "string") headers.set(name, value)
+        else if (Array.isArray(value)) headers.set(name, value.join(","))
+      }
+      const routeResponse = await reviewedFillRoute(new NextRequest(new URL(incoming.url ?? "/", "http://127.0.0.1"), {
+        method: "POST", headers, body: requestBody,
+      }))
+      const responseBody = await routeResponse.text()
+      const ack = jsonRecord(JSON.parse(responseBody))
+      const attempt: ReviewedFillBridgeAttempt = {
+        outboxId, status: routeResponse.status,
+        acknowledgement: typeof ack?.status === "string" ? ack.status : null,
+        predecessorStatus: predecessor?.status ?? null,
+        acknowledgementDropped: false,
+      }
+      const dropAcknowledgement = dropNextReviewedFillAcknowledgement
+        && routeResponse.status === 200 && attempt.acknowledgement === "queued"
+      if (dropAcknowledgement) {
+        dropNextReviewedFillAcknowledgement = false
+        attempt.acknowledgementDropped = true
+      }
+      reviewedFillBridgeAttempts.push(attempt)
+      if (dropAcknowledgement) {
+        outgoing.destroy()
+        return
+      }
+      outgoing.writeHead(routeResponse.status, { "content-type": routeResponse.headers.get("content-type") ?? "application/json" })
+      outgoing.end(responseBody)
+    })().catch(() => {
+      if (!outgoing.destroyed) outgoing.writeHead(500).end()
+    })
+  })
+  reviewedFillBridgeServer = server
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen)
+    server.listen(reviewedFillRouteSocketPath, resolveListen)
+  })
+}
+
+async function stopReviewedFillRouteBridge(): Promise<void> {
+  const server = reviewedFillBridgeServer
+  reviewedFillBridgeServer = undefined
+  if (!server) return
+  let closeError: unknown
+  try {
+    await new Promise<void>((resolveClose, rejectClose) => server.close(error => error ? rejectClose(error) : resolveClose()))
+  } catch (error) {
+    closeError = error
+  } finally {
+    await unlink(reviewedFillRouteSocketPath).catch(() => undefined)
+  }
+  if (closeError) throw closeError
+}
+
+async function waitForReviewedFillBridgeAttempts(outboxId: string, count: number, timeoutMs = 30_000): Promise<ReviewedFillBridgeAttempt[]> {
+  const until = Date.now() + timeoutMs
+  let attempts = reviewedFillBridgeAttempts.filter(attempt => attempt.outboxId === outboxId)
+  while (attempts.length < count && Date.now() < until) {
+    if (worker && exited(worker)) throw new Error("Worker exited before the reviewed-fill publisher retried the internal route")
+    await delay(50)
+    attempts = reviewedFillBridgeAttempts.filter(attempt => attempt.outboxId === outboxId)
+  }
+  if (attempts.length < count) throw new Error("reviewed_fill_publisher_retry_timeout")
+  return attempts.slice(0, count)
+}
+
 const ALL_QUEUE_STATES = ["waiting", "active", "delayed", "completed", "failed", "paused", "waiting-children", "prioritized"] as const
 const CLEANUP_DEADLINE_EXCEEDED = "Scoped BullMQ cleanup deadline exceeded"
 const queueDisconnects = new WeakMap<object, Promise<void>>()
@@ -1003,8 +1126,15 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     applyQueue = new Queue("apply-tasks", { connection: { host: "127.0.0.1", port: 6379, db: 15 } })
     turnQueue = new Queue("agent-turns", { connection: { host: "127.0.0.1", port: 6379, db: 15 } })
     subagentQueue = new Queue("agent-subagents", { connection: { host: "127.0.0.1", port: 6379, db: 15 } })
+    priorAgentWorkerSecret = process.env.AGENT_WORKER_SECRET
+    process.env.AGENT_WORKER_SECRET = reviewedFillBridgeSecret
+    agentWorkerSecretOverridden = true
+    priorDatabaseUrl = process.env.DATABASE_URL
+    process.env.DATABASE_URL = databaseUrl!
+    databaseUrlOverridden = true
     await testDb.$connect()
     dbConnected = true
+    await startReviewedFillRouteBridge()
     site = spawnFixture("site")
     await waitLine(site, "FIXTURE_READY")
     worker = spawnFixture("worker")
@@ -1015,12 +1145,22 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     let cleanupError: unknown
     try { await stopFixture(worker) } catch (error) { cleanupError = error }
     try { await stopFixture(site) } catch (error) { cleanupError ??= error }
+    try { await stopReviewedFillRouteBridge() } catch (error) { cleanupError ??= error }
     try { await cleanRunArtifacts() } catch (error) { cleanupError ??= error }
     const queueCloseDeadline = Date.now() + 4_000
     try { await closeQueueWithinDeadline(applyQueue, queueCloseDeadline) } catch (error) { cleanupError ??= error }
     try { await closeQueueWithinDeadline(turnQueue, queueCloseDeadline) } catch (error) { cleanupError ??= error }
     try { await closeQueueWithinDeadline(subagentQueue, queueCloseDeadline) } catch (error) { cleanupError ??= error }
+    try { await reviewedFillRouteDb?.$disconnect() } catch (error) { cleanupError ??= error }
     try { await testDb.$disconnect(); dbConnected = false } catch (error) { cleanupError ??= error }
+    if (databaseUrlOverridden) {
+      if (priorDatabaseUrl === undefined) delete process.env.DATABASE_URL
+      else process.env.DATABASE_URL = priorDatabaseUrl
+    }
+    if (agentWorkerSecretOverridden) {
+      if (priorAgentWorkerSecret === undefined) delete process.env.AGENT_WORKER_SECRET
+      else process.env.AGENT_WORKER_SECRET = priorAgentWorkerSecret
+    }
     if (priorApplicationFillTaskGraph === undefined) delete process.env.ENABLE_APPLICATION_FILL_TASKGRAPH
     else process.env.ENABLE_APPLICATION_FILL_TASKGRAPH = priorApplicationFillTaskGraph
     if (cleanupError) throw cleanupError
@@ -1444,8 +1584,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const reviewKey = `reviewed-review-positive-${runId}`
     const firstRequest = await startReviewedApplicationReview({ ...scenario, sourceTurnId: source.turnId, token, key: reviewKey })
     expect(firstRequest.response.status).toBe(202)
-    const reviewTurnId = firstRequest.body.turnId
-    expect(typeof reviewTurnId).toBe("string")
+    const reviewTurnValue = firstRequest.body.turnId
+    if (typeof reviewTurnValue !== "string" || !reviewTurnValue.trim()) throw new Error("reviewed_application_review_turn_id_invalid")
+    const reviewTurnId = reviewTurnValue
     const duplicateRequest = await startReviewedApplicationReview({ ...scenario, sourceTurnId: source.turnId, token, key: reviewKey })
     expect([200, 202]).toContain(duplicateRequest.response.status)
     expect(duplicateRequest.body.turnId).toBe(reviewTurnId)
@@ -1474,12 +1615,25 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(nonceResponse.status).toBe(200)
     const nonceBody = await jsonResponse(nonceResponse)
     const receiptNonce = typeof nonceBody.receiptNonce === "string" ? nonceBody.receiptNonce : ""
-    expect(receiptNonce.length).toBeGreaterThan(20)
-    const { POST: approvalAction } = await import("@/app/api/agent/sessions/[id]/actions/route")
-    const decision = await approvalAction(apiRequest(`/api/agent/sessions/${scenario.sessionId}/actions`, token, "POST", {
-      type: "approval_response", approvalId, decision: "approved", receiptNonce, reviewedSourceTurnId: source.turnId,
-    }), { params: Promise.resolve({ id: scenario.sessionId }) })
-    expect(decision.status).toBe(200)
+    expect(receiptNonce).toMatch(/^[a-f0-9]{64}$/)
+    const decisionFence = await testDb.agentTurn.findUniqueOrThrow({ where: { id: reviewTurnId }, select: {
+      id: true, userId: true, sessionId: true, revision: true,
+    } })
+    expect(decisionFence).toMatchObject({ id: reviewTurnId, userId: ids.user, sessionId: scenario.sessionId })
+    const decisionRevision = decisionFence.revision
+    if (typeof decisionRevision !== "number" || !Number.isSafeInteger(decisionRevision) || decisionRevision < 0) {
+      throw new Error("reviewed_approval_turn_revision_invalid")
+    }
+    const decisionClientMessageId = `reviewed-approval-decision-${runId}`
+    const { POST: decideApprovalWait } = await import("@/app/api/agent/sessions/[id]/approvals/[approvalId]/route")
+    const decision = await decideApprovalWait(apiRequest(
+      `/api/agent/sessions/${scenario.sessionId}/approvals/${approvalId}`, token, "POST", {
+        clientMessageId: decisionClientMessageId, expectedTurnId: reviewTurnId,
+        expectedRevision: decisionRevision, decision: "approved", receiptNonce,
+      }, { "idempotency-key": decisionClientMessageId }), {
+      params: Promise.resolve({ id: scenario.sessionId, approvalId }),
+    })
+    expect(decision.status).toBe(202)
     expect((await waitForAgentTurnTerminal(String(reviewTurnId))).status).toBe("completed")
     expect(await testDb.agentApproval.findUniqueOrThrow({ where: { id: approvalId }, select: { status: true } })).toEqual({ status: "approved" })
     expect(await testDb.agentItem.findUniqueOrThrow({ where: { id: waitId }, select: { status: true } })).toEqual({ status: "completed" })
@@ -1495,20 +1649,23 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(handoffs).toHaveLength(1)
     const handoff = handoffs[0]!
     expect(handoff).toMatchObject({ topic: "agent.reviewed-fill.dispatch", aggregateId: scenario.sessionId,
-      idempotencyKey: `agent-reviewed-fill:${approvalId}`, publishedAt: null })
+      idempotencyKey: `agent-reviewed-fill:${approvalId}` })
     const handoffPayload = jsonRecord(handoff.payload)
     expect(Object.keys(handoffPayload ?? {}).sort()).toEqual(["approvalId", "applicationTaskId", "predecessorTurnId", "schemaVersion", "sessionId", "userId"])
     expect(handoffPayload).toEqual({ schemaVersion: "agent-harness.v2.reviewed-fill-handoff.v1", userId: ids.user,
       sessionId: scenario.sessionId, applicationTaskId, approvalId, predecessorTurnId: reviewTurnId })
 
-    const { db } = await import("@/lib/db")
-    const { processReviewedFillHandoffOutbox } = await import("@/lib/agent/approval/reviewed-fill-handoff-outbox")
-    // Model a lost acknowledgement: the durable dispatch commits, but the caller never observes its result.
-    const lostAcknowledgementAttempt = processReviewedFillHandoffOutbox(db, handoff.id)
+    const bridgeAttempts = await waitForReviewedFillBridgeAttempts(handoff.id, 2)
+    expect(bridgeAttempts).toEqual([
+      { outboxId: handoff.id, status: 200, acknowledgement: "queued", predecessorStatus: "completed", acknowledgementDropped: true },
+      { outboxId: handoff.id, status: 200, acknowledgement: "duplicate", predecessorStatus: "completed", acknowledgementDropped: false },
+    ])
+    expect(reviewedFillBridgeAttempts.filter(attempt => attempt.outboxId === handoff.id)).toHaveLength(2)
+    const publishedHandoff = await testDb.agentOutbox.findUniqueOrThrow({ where: { id: handoff.id } })
+    expect(publishedHandoff.publishedAt).toBeInstanceOf(Date)
+    expect(publishedHandoff.attemptCount).toBe(1)
     const firstFill = await waitForReviewedApplicationTask(scenario.jobId, task => Boolean(task.fillTurnId))
-    await lostAcknowledgementAttempt
     const fillTurnId = firstFill.fillTurnId!
-    expect(await processReviewedFillHandoffOutbox(db, handoff.id)).toBe("duplicate")
     const replayedTask = await testDb.applicationTask.findUniqueOrThrow({ where: { id: applicationTaskId! } })
     expect(replayedTask.fillTurnId).toBe(fillTurnId)
     expect(await testDb.agentTurn.count({ where: { id: fillTurnId, sessionId: scenario.sessionId } })).toBe(1)
