@@ -33,7 +33,7 @@ async function startSite() {
   if (!SOCKET) throw new Error("APPLICATION_TASK_FULL_LOOP_SOCKET_PATH_required")
   const reviewedFillRouteSocketPath = required("APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_SOCKET_PATH")
   await unlink(SOCKET).catch(() => undefined)
-  let submitCount = 0, reviewedSubmitCount = 0, reviewedMaterialExactCount = 0
+  let submitCount = 0, reviewedSubmitCount = 0, reviewedMaterialExactCount = 0, reviewedGetCount = 0
   const requests = []
   const browserTrace = []
   const browserProgress = []
@@ -76,6 +76,7 @@ async function startSite() {
       return
     }
     if (request.method === "GET" && request.url === "/example-reviewed/jobs/1") {
+      reviewedGetCount += 1
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" })
       response.end(`<!doctype html><title>Fixture Application</title><form method="post" action="/example-reviewed/jobs/1">
         <label for="first_name">First name</label><input id="first_name" name="first_name" required>
@@ -190,7 +191,7 @@ async function startSite() {
     const lines = buffer.split("\n")
     buffer = lines.pop() ?? ""
     for (const line of lines.map(value => value.trim())) {
-      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, reviewedSubmitCount, reviewedMaterialExactCount, blocked, requests, browserTrace, browserProgress })}`)
+      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, reviewedSubmitCount, reviewedMaterialExactCount, reviewedGetCount, blocked, requests, browserTrace, browserProgress })}`)
       if (line === "shutdown") {
         process.stdin.pause()
         for (const response of held) response.destroy()

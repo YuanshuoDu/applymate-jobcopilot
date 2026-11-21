@@ -157,12 +157,23 @@ describe("executeApplicationFillForReview", () => {
   it("reports the closed reviewed browser acquisition phase sequence", async () => {
     const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
     vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    browserPageMock.goto.mockResolvedValueOnce({ ok: () => true } as unknown as Awaited<ReturnType<Page["goto"]>>)
     const observations: ApplicationFillStageObservation[] = []
     await executeApplicationFillForReview({ pool, lease: lease(), stageObserver: event => observations.push(event) })
 
     expect(observations.filter(event => event.stage === "browser_acquisition").map(event => event.phase)).toEqual([
-      "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned", "fill_returned",
+      "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned",
+      "navigation_response_success", "destination_allowed", "wait_detection_returned", "fill_returned",
     ])
+    browserPageMock.url.mockReturnValueOnce("https://outside.example/")
+    const rejectedObservations: ApplicationFillStageObservation[] = []
+    await expect(executeApplicationFillForReview({ pool: poolFor(context({ turnInput: reviewedTurnInput })).pool,
+      lease: lease(), stageObserver: event => rejectedObservations.push(event) })).resolves.toMatchObject({ status: "waiting_for_user" })
+    expect(rejectedObservations.filter(event => event.stage === "browser_acquisition").map(event => event.phase)).toEqual([
+      "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned",
+      "navigation_response_unavailable", "destination_rejected",
+    ])
+    expect(executeBrowserFill).toHaveBeenCalledOnce()
     const legacyObservations: ApplicationFillStageObservation[] = []
     await executeApplicationFillForReview({ pool: poolFor(context()).pool, lease: lease(), stageObserver: event => legacyObservations.push(event) })
     expect(legacyObservations.filter(event => event.stage === "browser_acquisition")).toEqual([])

@@ -16,7 +16,7 @@ import { claimApplicationFillBrowserStart, reviewedApplicationFillSelector, type
 import { reviewedMaterialWasFilled } from "./application-fill-reviewed-readback.js"
 import type { SubagentExecutionResult, SubagentLease } from "./types.js"
 type WaitDetail = "captcha_required" | "authentication_required" | "mfa_required" | "unknown_sensitive_field" | "required_field" | "stale_review" | "review_required" | "fill_outcome_uncertain" | "unattended_apply_unavailable" | "cancelled"; type WaitCheckpoint = "fill_outcome_uncertain" | "form_answer_required"
-export type ApplicationFillAcquisitionPhase = "before_control_read" | "before_pattern_read" | "context_requested" | "page_acquired" | "navigation_returned" | "fill_returned"
+export type ApplicationFillAcquisitionPhase = "before_control_read" | "before_pattern_read" | "context_requested" | "page_acquired" | "navigation_returned" | "navigation_response_success" | "navigation_response_unavailable" | "destination_allowed" | "destination_rejected" | "wait_detection_returned" | "fill_returned"
 export type ApplicationFillStageObservation =
   | Readonly<{ stage: "entry_validation" | "wait_persistence" | "completion"; outcome: "accepted" | "rejected" | "waiting" | "completed" | "stale" | "conflict" | "failed" | "cancelled" | "unavailable"; leaseLost: boolean; signalAborted: boolean; staleGate?: ApplicationFillCompletionStaleGate }>
   | Readonly<{ stage: "browser_acquisition"; phase: ApplicationFillAcquisitionPhase }>
@@ -85,13 +85,17 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
       lease.signal.addEventListener("abort", closeOnAbort, { once: true })
       try {
         if (lease.signal.aborted) { closeOnAbort(); return cancelledOutcome() }
-        await page.goto(task.applyUrl, { waitUntil: "domcontentloaded", timeout: 30_000 })
+        const navigationResponse = await page.goto(task.applyUrl, { waitUntil: "domcontentloaded", timeout: 30_000 })
         observeAcquisitionPhase("navigation_returned")
+        observeAcquisitionPhase(navigationResponse?.ok() ? "navigation_response_success" : "navigation_response_unavailable")
         if (lease.signal.aborted) return cancelledOutcome()
-        if (!isAllowedDestination(page.url(), control.flow, task.applyUrl)) {
+        const destinationAllowed = isAllowedDestination(page.url(), control.flow, task.applyUrl)
+        observeAcquisitionPhase(destinationAllowed ? "destination_allowed" : "destination_rejected")
+        if (!destinationAllowed) {
           return { kind: "wait" as const, detail: "fill_outcome_uncertain" as const }
         }
         const browserWait = await detectBrowserWait(page)
+        observeAcquisitionPhase("wait_detection_returned")
         if (browserWait) return { kind: "wait" as const, detail: waitDetail(browserWait.reason) }
         if (lease.signal.aborted) return cancelledOutcome()
         const result = await executeBrowserFill({

@@ -224,6 +224,7 @@ type FixtureStats = {
   submitCount: number
   reviewedSubmitCount: number
   reviewedMaterialExactCount: number
+  reviewedGetCount: number
   blocked: string[]
   requests: string[]
   browserTrace: string[]
@@ -252,7 +253,7 @@ type ApplicationFillExecutorTrace = {
 }
 type ApplicationFillCompletionStaleGate = "lease_input_invalid" | "session_scope" | "turn_row_unavailable" | "turn_status_queued" | "turn_status_interrupted" | "turn_status_terminal" | "turn_status_other" | "child_lease_fence" | "application_task_scope"
 type ApplicationFillStageTrace = { entryValidation: boolean; waitPersistence: boolean; completion: boolean; accepted: boolean; rejected: boolean; waiting: boolean; completed: boolean; stale: boolean; conflict: boolean; failed: boolean; cancelled: boolean; unavailable: boolean; leaseLost: boolean; signalAborted: boolean; staleGate?: ApplicationFillCompletionStaleGate }
-type ApplicationFillAcquisitionPhase = "before_control_read" | "before_pattern_read" | "context_requested" | "page_acquired" | "navigation_returned" | "fill_returned"
+type ApplicationFillAcquisitionPhase = "before_control_read" | "before_pattern_read" | "context_requested" | "page_acquired" | "navigation_returned" | "navigation_response_success" | "navigation_response_unavailable" | "destination_allowed" | "destination_rejected" | "wait_detection_returned" | "fill_returned"
 type ApplicationFillPhaseTrace = { phase: ApplicationFillAcquisitionPhase }
 type ApplicationTaskRow = {
   id: string; userId: string; jobId: string; sessionId: string | null; fillTurnId: string | null
@@ -365,6 +366,7 @@ function childSummary(child: Child) {
 function fixtureStatsSummary(stats: FixtureStats) {
   return {
     submitCount: stats.submitCount,
+    reviewedGetCount: stats.reviewedGetCount,
     blockedCount: stats.blocked.length,
     requestCount: stats.requests.length,
     browserTrace: stats.browserTrace,
@@ -440,7 +442,8 @@ function applicationFillStageTraces(child: Child | undefined, startIndex = 0): A
 }
 
 const APPLICATION_FILL_ACQUISITION_PHASES = new Set<ApplicationFillAcquisitionPhase>([
-  "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned", "fill_returned",
+  "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned",
+  "navigation_response_success", "navigation_response_unavailable", "destination_allowed", "destination_rejected", "wait_detection_returned", "fill_returned",
 ])
 
 function applicationFillAcquisitionPhases(child: Child | undefined, startIndex = 0): Array<ApplicationFillPhaseTrace | { traceInvalid: true }> {
@@ -492,7 +495,8 @@ describe("ApplicationTask full-loop stage trace parser", () => {
 
 describe("ApplicationTask full-loop acquisition phase trace parser", () => {
   const phases: readonly ApplicationFillAcquisitionPhase[] = [
-    "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned", "fill_returned",
+    "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned",
+    "navigation_response_success", "navigation_response_unavailable", "destination_allowed", "destination_rejected", "wait_detection_returned", "fill_returned",
   ]
 
   it.each(phases)("accepts only the sanitized %s phase after the supplied offset", phase => {
@@ -1231,12 +1235,12 @@ function reviewedFillDiagnosticValue(value: unknown, allowed: ReadonlySet<string
 }
 
 async function reviewedFillTimeoutSnapshot(input: {
-  sessionId: string; jobId: string; applicationTaskId: string; fillTurnId: string; traceOffset: number
+  sessionId: string; jobId: string; applicationTaskId: string; fillTurnId: string; traceOffset: number; reviewedGetBaseline: number
 }) {
   const stats = await requestFixtureStats(300).catch(() => null)
   const fixture = stats ? {
     available: true,
-    reviewedPageGetObserved: stats.requests.includes("GET /example-reviewed/jobs/1"),
+    reviewedPageGetObserved: stats.reviewedGetCount > input.reviewedGetBaseline,
     exactReviewedCoverLetterObserved: stats.reviewedMaterialExactCount > 0,
     noReviewedSubmitRequest: stats.reviewedSubmitCount === 0 && !stats.requests.includes("POST /example-reviewed/jobs/1"),
   } : { available: false }
@@ -1867,6 +1871,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const decisionClientMessageId = `reviewed-approval-decision-${runId}`
     const { POST: decideApprovalWait } = await import("@/app/api/agent/sessions/[id]/approvals/[approvalId]/route")
     const reviewedFillTraceOffset = worker?.lines.length ?? 0
+    const reviewedGetBaseline = (await requestFixtureStats()).reviewedGetCount
     const decision = await decideApprovalWait(apiRequest(
       `/api/agent/sessions/${scenario.sessionId}/approvals/${approvalId}`, token, "POST", {
         clientMessageId: decisionClientMessageId, expectedTurnId: reviewTurnId,
@@ -1929,7 +1934,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", 180_000)
     } catch {
       const snapshot = await reviewedFillTimeoutSnapshot({ sessionId: scenario.sessionId, jobId: scenario.jobId,
-        applicationTaskId: applicationTaskId!, fillTurnId, traceOffset: reviewedFillTraceOffset })
+        applicationTaskId: applicationTaskId!, fillTurnId, traceOffset: reviewedFillTraceOffset, reviewedGetBaseline })
       throw new Error(`Reviewed fill timeout snapshot ${JSON.stringify(snapshot)}`)
     }
     expect(completedFill.fillTurnId).toBe(fillTurnId)
@@ -1976,6 +1981,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     }
     expect(fixtureStats.browserTrace).toContain("input:cover_letter")
     expect(fixtureStats.reviewedMaterialExactCount).toBeGreaterThan(0)
+    expect(fixtureStats.reviewedGetCount).toBeGreaterThan(reviewedGetBaseline)
     expect(JSON.stringify(fixtureStats)).not.toContain(reviewedCoverLetter)
     expect(fixtureStats.reviewedSubmitCount).toBe(0)
     expect(fixtureStats.requests).not.toContain("POST /example-reviewed/jobs/1")
@@ -2036,6 +2042,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(await testDb.applicationTask.count({ where: { userId: ids.user, sessionId: scenario.sessionId, jobId: scenario.jobId } })).toBe(0)
     expect(await testDb.agentOutbox.count({ where: { aggregateId: scenario.sessionId, topic: "agent.reviewed-fill.dispatch" } })).toBe(0)
     const after = await requestFixtureStats()
+    expect(after.reviewedGetCount).toBe(before.reviewedGetCount)
     expect(after.requests.filter(path => path.includes("/example-reviewed/jobs/1"))).toEqual(
       before.requests.filter(path => path.includes("/example-reviewed/jobs/1")))
     expect(after.reviewedSubmitCount).toBe(0)

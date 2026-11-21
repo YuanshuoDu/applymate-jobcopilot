@@ -48,7 +48,7 @@ export function traceApplicationFillExecutor(executor) {
 export function applicationFillStageTrace() {
   return event => {
     try {
-      const acquisitionPhases = ["before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned", "fill_returned"]
+      const acquisitionPhases = ["before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned", "navigation_response_success", "navigation_response_unavailable", "destination_allowed", "destination_rejected", "wait_detection_returned", "fill_returned"]
       if (event?.stage === "browser_acquisition") {
         if (!acquisitionPhases.includes(event.phase)) return
         process.stdout.write("APPLICATION_FILL_PHASE_TRACE " + JSON.stringify({ phase: event.phase }) + "\n")
