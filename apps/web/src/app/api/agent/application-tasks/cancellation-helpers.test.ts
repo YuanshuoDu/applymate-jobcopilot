@@ -40,6 +40,7 @@ const binding = {
   fillTurnId: "turn_1",
   fillTurnSessionId: "session_1",
   fillTurnUserId: "user_1",
+  workerTaskId: null,
 }
 
 describe("application-task cancellation helpers", () => {
@@ -78,19 +79,23 @@ describe("application-task cancellation helpers", () => {
     })
   })
 
-  it("locks replay only for the complete original binding and stopped-before-submit state", async () => {
-    const task = { id: "task_1", ...binding }
+  it.each([
+    { label: "null", workerTaskId: null },
+    { label: "identified", workerTaskId: "worker_1" },
+  ] as const)("locks replay only for the exact $label Worker attempt and stopped-before-submit state", async ({ workerTaskId }) => {
+    const task = { id: "task_1", ...binding, workerTaskId }
     const locked = await lockStoppedFillReplay({ $queryRaw: mocks.queryRaw } as never, task, "user_1")
 
     expect(locked).toBe(true)
     const query = mocks.queryRaw.mock.calls[0]?.[0] as { sql: string; values: unknown[] }
     expect(query.sql).toContain('FROM "application_tasks"')
     expect(query.sql).toContain('"fillTurnId" = ?')
+    expect(query.sql).toContain('"workerTaskId" IS NOT DISTINCT FROM ?')
     expect(query.sql).toContain('"status" = ?')
     expect(query.sql).toContain('"checkpoint" = ?')
     expect(query.sql).toContain("FOR UPDATE")
     expect(query.values).toEqual([
-      "task_1", "user_1", "session_1", "turn_1", "session_1", "user_1", "cancelled", "turn_stopped_before_submit",
+      "task_1", "user_1", "session_1", "turn_1", "session_1", "user_1", workerTaskId, "cancelled", "turn_stopped_before_submit",
     ])
   })
 
