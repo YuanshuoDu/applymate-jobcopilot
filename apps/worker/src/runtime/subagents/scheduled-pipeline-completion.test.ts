@@ -634,6 +634,13 @@ describe("scheduled pipeline pre-terminal completion", () => {
       .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_entitlement_required" })
   })
 
+  it("keeps the source-change 409 blocker nonterminal without converting it to a retry", async () => {
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.", signal: new AbortController().signal,
+      bridge: async () => ready, fetcher: vi.fn<typeof fetch>(async () => response(409,
+        { status: "blocked", errorCode: "scheduled_pipeline_source_changed" })) }))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_source_changed" })
+  })
+
   it("maps transient continuation failures to a nonterminal refresh retry", async () => {
     await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.", signal: new AbortController().signal,
       bridge: async () => ready, fetcher: vi.fn<typeof fetch>(async () => response(500, {})) }))

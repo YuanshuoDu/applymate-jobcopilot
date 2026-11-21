@@ -2,7 +2,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => {
   const agentRun = vi.fn().mockResolvedValue({ status: "submitted", durationMs: 11 });
+  const outcomeTransaction = { nextId: 1000, currentId: null as string | null };
   const outcomeQuery = vi.fn(async (sql: string) => {
+    if (sql === "BEGIN") {
+      outcomeTransaction.currentId = String(outcomeTransaction.nextId++);
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes("pg_current_xact_id()::text AS transaction_id")) {
+      return { rows: outcomeTransaction.currentId ? [{ transaction_id: outcomeTransaction.currentId }] : [], rowCount: 1 };
+    }
+    if (sql === "COMMIT" || sql === "ROLLBACK") {
+      outcomeTransaction.currentId = null;
+      return { rows: [], rowCount: 1 };
+    }
     if (sql.includes('SELECT "sessionId" FROM application_tasks')) return { rows: [{ sessionId: "session-1" }], rowCount: 1 };
     if (sql.includes('FROM agent_sessions')) return { rows: [{ id: "session-1" }], rowCount: 1 };
     if (sql.includes('FROM agent_turns')) return { rows: [{ id: "turn-1" }], rowCount: 1 };
@@ -47,6 +59,7 @@ const mocks = vi.hoisted(() => {
     insertApplyResult: vi.fn().mockResolvedValue(1),
     query: vi.fn().mockResolvedValue({ rowCount: 1 }),
     outcomeQuery,
+    outcomeTransaction,
     outcomeClient,
     loadTaskContext: vi.fn(),
     detectCaptcha: vi.fn().mockResolvedValue(false),
@@ -242,6 +255,8 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.claimUnattendedSubmission.mockReset().mockResolvedValue("claimed");
     mocks.releaseUncertainSubmission.mockReset().mockResolvedValue({ kind: "current", value: true });
     mocks.updateJobForSubmission.mockReset().mockResolvedValue({ kind: "current", value: true });
+    mocks.outcomeTransaction.nextId = 1000;
+    mocks.outcomeTransaction.currentId = null;
     mocks.outcomeQuery.mockClear();
     mocks.outcomeClient.release.mockClear();
     mocks.workerHandler = undefined;

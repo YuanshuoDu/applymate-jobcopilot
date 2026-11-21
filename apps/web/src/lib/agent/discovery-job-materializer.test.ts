@@ -8,6 +8,12 @@ import {
 } from './discovery-job-materializer'
 import type { DiscoveredJob } from './discover'
 
+const mocks = vi.hoisted(() => ({
+  sourceFence: vi.fn(async (_tx: unknown, _userIds: readonly string[]) => undefined),
+}))
+
+vi.mock('./source-material-fence', () => ({ acquireSourceMaterialFence: mocks.sourceFence }))
+
 type StoredJob = { id: string; userId: string; url: string | null; source: string | null; description?: string | null; status?: string; notes?: string | null; score?: number | null; finalResumeId?: string | null }
 const fence = {
   userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', stepId: 'step-1',
@@ -19,7 +25,7 @@ function candidate(url = 'https://jobs.example/role/1?utm_source=mail'): Discove
 }
 
 function fixture(initial: StoredJob[] = [], options: {
-  raceOnCreate?: boolean; afterCreate?: () => void; scope?: Partial<{
+  raceOnCreate?: boolean; afterCreate?: () => void; sourceFenceFailure?: Error; scope?: Partial<{
     sessionStatus: string; turnStatus: string; turnRootTaskId: string; rootStatus: string; rootInterrupted: Date | null
     childStatus: string; childInterrupted: Date | null; childClosed: Date | null; childLeaseOwner: string
     childAttemptCount: number; childLive: boolean; childActions: unknown; stepAttempt: number; stepStatus: string
@@ -30,6 +36,10 @@ function fixture(initial: StoredJob[] = [], options: {
   const whereQueries: Array<{ userId: string; url?: string }> = []
   const updateQueries: Array<{ where: { id: string; userId: string; description: string | null }; data: { description: string } }> = []
   const queryLog: string[] = []
+  const eventLog: string[] = []
+  const tenantConfig: Array<{ sql: string; values: unknown[] }> = []
+  const sourceFenceClients: unknown[] = []
+  let transactionClient: unknown
   const scope = {
     sessionStatus: 'running', turnStatus: 'in_progress', turnRootTaskId: fence.rootTaskId,
     rootStatus: 'running', rootInterrupted: null as Date | null,
@@ -39,15 +49,23 @@ function fixture(initial: StoredJob[] = [], options: {
     ...options.scope,
   }
   let raced = false
+  mocks.sourceFence.mockClear()
+  mocks.sourceFence.mockImplementation(async (tx, userIds) => {
+    eventLog.push(`source-fence:${userIds.join(',')}`)
+    sourceFenceClients.push(tx)
+    if (options.sourceFenceFailure) throw options.sourceFenceFailure
+  })
 
   const delegate = (view: Map<string, StoredJob>, transactional: boolean) => ({
     findMany: vi.fn(async ({ where }: { where: { userId: string; url?: string } }) => {
+      eventLog.push('job.findMany')
       whereQueries.push(where)
       return [...view.values()]
         .filter(row => row.userId === where.userId && (where.url === undefined || row.url === where.url))
         .map(({ id, url, source, description }) => ({ id, url, source, description: description ?? null }))
     }),
     updateMany: vi.fn(async ({ where, data }: { where: { id: string; userId: string; description: string | null }; data: { description: string } }) => {
+      eventLog.push('job.updateMany')
       updateQueries.push({ where, data })
       const row = view.get(where.id)
       if (!row || row.userId !== where.userId || (row.description ?? null) !== where.description) return { count: 0 }
@@ -55,6 +73,7 @@ function fixture(initial: StoredJob[] = [], options: {
       return { count: 1 }
     }),
     create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
+      eventLog.push('job.create')
       createData.push(data)
       const id = String(data.id)
       if (options.raceOnCreate && transactional && !raced) {
@@ -75,11 +94,20 @@ function fixture(initial: StoredJob[] = [], options: {
       const staged = new Map(rows)
       const transaction = {
         job: delegate(staged, true),
-        $executeRaw: vi.fn(async () => 1),
-        $executeRawUnsafe: vi.fn(async () => 1),
+        $executeRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+          eventLog.push('tenant-config')
+          tenantConfig.push({ sql: strings.join('?').replace(/\s+/g, ' ').trim(), values })
+          return 1
+        }),
+        $executeRawUnsafe: vi.fn(async () => { eventLog.push('tenant-role'); return 1 }),
         $queryRaw: vi.fn(async (query: { sql: string }) => {
           const sql = query.sql
           queryLog.push(sql)
+          eventLog.push(sql.includes('FROM "agent_sessions"') ? 'session-lock'
+            : sql.includes('FROM "agent_turns"') ? 'turn-lock'
+              : sql.includes('FROM "agent_steps"') ? 'step-lock'
+                : sql.includes('clock_timestamp()') ? 'lease-check'
+                  : sql.includes("'scout'") ? 'child-lock' : 'root-lock')
           if (sql.includes('FROM "agent_sessions"')) return [{ id: fence.sessionId, status: scope.sessionStatus }]
           if (sql.includes('FROM "agent_turns"')) return scope.turnStatus === 'in_progress' && scope.turnRootTaskId === fence.rootTaskId
             ? [{ id: fence.turnId, rootTaskId: scope.turnRootTaskId, status: scope.turnStatus }] : []
@@ -106,13 +134,14 @@ function fixture(initial: StoredJob[] = [], options: {
           throw new Error(`Unexpected materializer SQL: ${sql}`)
         }),
       }
+      transactionClient = transaction
       const result = await callback(transaction)
       rows.clear()
       for (const [id, row] of staged) rows.set(id, row)
       return result
     },
   } as unknown as DiscoveryJobMaterializerDatabase
-  return { database, rows, createData, whereQueries, updateQueries, queryLog, scope }
+  return { database, rows, createData, whereQueries, updateQueries, queryLog, eventLog, tenantConfig, sourceFenceClients, get transactionClient() { return transactionClient }, scope }
 }
 
 describe('discovery job URL identity', () => {
@@ -220,6 +249,38 @@ describe('discovery job URL identity', () => {
     expect(clockChecks).toHaveLength(2)
     expect(clockChecks[0]).toBeGreaterThan(stepLock)
     expect(clockChecks[1]).toBe(db.queryLog.length - 1)
+  })
+
+  it('sets tenant context and acquires the source fence before owner locks and Job reads', async () => {
+    const db = fixture()
+    await materializeDiscoveredJobs('user-1', [candidate()], undefined, fence, { db: db.database })
+
+    expect(db.tenantConfig).toEqual([{ sql: "SELECT set_config('app.user_id', ?, true)", values: ['user-1'] }])
+    expect(mocks.sourceFence).toHaveBeenCalledWith(db.transactionClient, ['user-1'])
+    const tenantSetup = db.eventLog.indexOf('tenant-config')
+    const sourceFence = db.eventLog.indexOf('source-fence:user-1')
+    const firstOwnerLock = db.eventLog.indexOf('session-lock')
+    const jobRead = db.eventLog.indexOf('job.findMany')
+    expect(tenantSetup).toBeGreaterThanOrEqual(0)
+    expect(sourceFence).toBeGreaterThan(tenantSetup)
+    expect(firstOwnerLock).toBeGreaterThan(sourceFence)
+    expect(jobRead).toBeGreaterThan(sourceFence)
+    expect(db.sourceFenceClients).toEqual([db.transactionClient])
+    expect(db.whereQueries.every(query => query.userId === 'user-1')).toBe(true)
+  })
+
+  it('fails before owner locks or Job writes when source fence acquisition fails', async () => {
+    const db = fixture([], { sourceFenceFailure: new Error('source material fence transaction verification failed') })
+
+    await expect(materializeDiscoveredJobs('user-1', [candidate()], undefined, fence, { db: db.database }))
+      .rejects.toThrow('source material fence transaction verification failed')
+
+    expect(db.eventLog.indexOf('source-fence:user-1')).toBeGreaterThan(db.eventLog.indexOf('tenant-config'))
+    expect(db.queryLog).toEqual([])
+    expect(db.whereQueries).toEqual([])
+    expect(db.createData).toEqual([])
+    expect(db.updateQueries).toEqual([])
+    expect(db.rows.size).toBe(0)
   })
 
   it.each([

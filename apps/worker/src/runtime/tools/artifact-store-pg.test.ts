@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import type { Pool } from "pg"
+import { vi } from "vitest"
 import type { AgentArtifactSourceDigestReader } from "../../db/agent-artifact-repo.js"
 import { hashArtifactContent } from "../subagents/artifact-adapters.js"
 import { PgArtifactToolStore } from "./artifact-store-pg.js"
@@ -23,6 +24,34 @@ function executionContext(taskId = "task-a", toolCallId = "call-a", leaseOwner =
 }
 
 describe("PgArtifactToolStore immutable persistence", () => {
+  it("preserves stale_hash mapping for duplicate source-base IDs with matching or changed content", async () => {
+    const duplicate = Object.assign(new Error("duplicate key violates unique constraint"), { code: "23505" })
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const client = {
+      query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+        calls.push({ sql, values })
+        if (sql.includes("pg_current_xact_id()::text AS transaction_id")) return { rows: [{ transaction_id: "42" }], rowCount: 1 }
+        if (sql.startsWith('INSERT INTO "agent_artifact"')) throw duplicate
+        return { rows: [], rowCount: 0 }
+      }),
+      release: vi.fn(),
+    }
+    const pool = { connect: vi.fn(async () => client) } as unknown as Pool
+    const store = new PgArtifactToolStore(pool)
+    const existingBase = { id: "resume-base-a", type: "resume" as const, userId: "user-a", jobId: "job-a", content: { summary: "same" } }
+
+    await expect(store.registerBase(existingBase)).rejects.toMatchObject({ code: "stale_hash" })
+    await expect(store.registerBase({ ...existingBase, content: { summary: "changed" } })).rejects.toMatchObject({ code: "stale_hash" })
+
+    const inserts = calls.filter(call => call.sql.startsWith('INSERT INTO "agent_artifact"'))
+    expect(inserts).toHaveLength(2)
+    expect(inserts.map(call => call.values?.[0])).toEqual(["resume-base-a", "resume-base-a"])
+    expect(inserts.map(call => call.values?.[5])).toEqual(['{"summary":"same"}', '{"summary":"changed"}'])
+    expect(inserts.every(call => !call.sql.includes("ON CONFLICT"))).toBe(true)
+    expect(calls.filter(call => call.sql === "ROLLBACK")).toHaveLength(2)
+    expect(client.release).toHaveBeenCalledTimes(2)
+  })
+
   it("persists, reads exact versions and reviews across store instances", async () => {
     const pool = new FakeArtifactPool() as unknown as Pool
     const writer = new PgArtifactToolStore(pool)
@@ -295,22 +324,27 @@ class FakeArtifactPool {
   }
   async connect() {
     let releaseLock: (() => void) | undefined
+    let jobLockHeld = false
     return {
       query: async (sql: string, values?: unknown[]) => {
-        if (sql.includes("pg_advisory_xact_lock")) {
+        if (sql.includes("hashtextextended($1::text, 0)")) return this.query(sql, values)
+        if (sql.includes("pg_advisory_xact_lock(hashtext($1), hashtext($2))")) {
+          if (jobLockHeld) return this.empty()
           const predecessor = this.advisoryLockTail
           this.advisoryLockTail = new Promise<void>(resolve => { releaseLock = resolve })
           await predecessor
+          jobLockHeld = true
           return this.empty()
         }
         const result = await this.query(sql, values)
-        if (sql === "COMMIT" || sql === "ROLLBACK") { releaseLock?.(); releaseLock = undefined }
+        if (sql === "COMMIT" || sql === "ROLLBACK") { releaseLock?.(); releaseLock = undefined; jobLockHeld = false }
         return result
       },
-      release: () => { releaseLock?.(); releaseLock = undefined },
+      release: () => { releaseLock?.(); releaseLock = undefined; jobLockHeld = false },
     }
   }
   async query(sql: string, values: unknown[] = []): Promise<Result> {
+    if (sql.includes("pg_current_xact_id()::text AS transaction_id")) return this.one({ transaction_id: "42" })
     if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql) || sql.includes("set_config") || sql.includes("pg_advisory_xact_lock")) return { rows: [], rowCount: 0 }
     if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("selectedJobPreparation")) {
       const valid = (values[0] === "task-a" || values[0] === "review-task") && values[1] === "user-a" && values[2] === "session-a"

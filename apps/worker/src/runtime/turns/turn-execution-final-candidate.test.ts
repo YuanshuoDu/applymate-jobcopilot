@@ -247,6 +247,30 @@ describe("atomic TaskGraph finalization recovery", () => {
     expect(recordFinalResponse).not.toHaveBeenCalled()
   })
 
+  it("waits for the scheduled source-change dependency without retrying completion", async () => {
+    const waitForUser = vi.fn(), recordFinalResponse = vi.fn()
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
+    const scheduledCompletion = vi.fn(async () => ({ status: "blocked" as const, errorCode: "scheduled_pipeline_source_changed" }))
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = scheduledCompletion
+    const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [{ id: "job-1", kind: "job" as const, ownerId: "user-1" }], toolObservations: [] }
+    const options = {
+      identity: { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() },
+      scope: { userId: "user-1" }, goal: "Find a role", snapshot, completionGate,
+      store: { updateStep: vi.fn(async () => undefined), waitForUser, recordFinalResponse },
+    } as unknown as TurnExecutionOptions
+
+    const outcome = await completeWithTestDefaults({ options, writer: { append: vi.fn(async () => ({ id: "event-1" })) } as unknown as TurnExecutionEventWriter,
+      step: { id: "step-1", ordinal: 0 },
+      output: { text: "An answer.", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop", usage: null, continuation: null } satisfies ModelStepResult,
+      snapshot, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      signal: new AbortController().signal, now: () => new Date(), onStepClosed: vi.fn() })
+
+    expect(outcome).toEqual({ kind: "wait", result: { status: "waiting_for_dependency", errorCode: "scheduled_pipeline_source_changed", stepCount: 1, toolCallCount: 0 } })
+    expect(scheduledCompletion).toHaveBeenCalledTimes(1)
+    expect(waitForUser).not.toHaveBeenCalled()
+    expect(recordFinalResponse).not.toHaveBeenCalled()
+  })
+
   it("keeps the race event raw while replanning with its revision-scoped recovery envelope", async () => {
     const feedback = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing. issue=verification_report nodeOrdinal=2 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing"
     const recoveryFeedback = tagTaskGraphRepairRecovery(feedback, 41)

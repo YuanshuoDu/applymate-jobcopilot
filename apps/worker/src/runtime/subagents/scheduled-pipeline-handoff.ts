@@ -8,7 +8,8 @@ import { parseScheduledGateResult, scheduledGatePreparedJobIds, type ScheduledGa
 import type { ScheduledPrepareTaskGraphProof } from "./scheduled-prepare-task-graph-verification.js"
 
 const path = "/api/internal/agent-runtime/scheduled-pipeline"
-const blockedErrors = new Set(["scheduled_pipeline_owner_mismatch", "scheduled_pipeline_turn_stale", "scheduled_pipeline_mode_mismatch", "scheduled_pipeline_root_mismatch", "scheduled_pipeline_execution_mismatch", "scheduled_pipeline_attestation_invalid", "scheduled_pipeline_snapshot_mismatch", "scheduled_pipeline_discovery_incomplete", "scheduled_pipeline_jobs_mismatch", "scheduled_pipeline_claim_conflict", "scheduled_pipeline_analysis_interrupted", "scheduled_pipeline_request_invalid", "scheduled_pipeline_unauthorized", "scheduled_pipeline_account_unavailable", "scheduled_pipeline_entitlement_required", "scheduled_pipeline_ai_unavailable", "scheduled_pipeline_ai_budget_exhausted"])
+const SOURCE_CHANGED_ERROR = "scheduled_pipeline_source_changed"
+const blockedErrors = new Set(["scheduled_pipeline_owner_mismatch", "scheduled_pipeline_turn_stale", "scheduled_pipeline_mode_mismatch", "scheduled_pipeline_root_mismatch", "scheduled_pipeline_execution_mismatch", "scheduled_pipeline_attestation_invalid", "scheduled_pipeline_snapshot_mismatch", "scheduled_pipeline_discovery_incomplete", "scheduled_pipeline_jobs_mismatch", "scheduled_pipeline_claim_conflict", "scheduled_pipeline_analysis_interrupted", "scheduled_pipeline_request_invalid", "scheduled_pipeline_unauthorized", "scheduled_pipeline_account_unavailable", "scheduled_pipeline_entitlement_required", "scheduled_pipeline_ai_unavailable", "scheduled_pipeline_ai_budget_exhausted", SOURCE_CHANGED_ERROR])
 
 export type ScheduledPipelineAnalyzeCheckpointProof = Readonly<{
   status: "analyze_checkpointed"
@@ -54,6 +55,11 @@ export type ScheduledPipelineGateInput = Readonly<{
 export type ScheduledPipelineGateResponse = ScheduledGateResult | Readonly<{ status: "blocked"; errorCode: string }>
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 
+function isKnownBlockedResponse(status: number, errorCode: unknown): boolean {
+  if (typeof errorCode !== "string" || !blockedErrors.has(errorCode)) return false
+  return errorCode === SOURCE_CHANGED_ERROR ? status === 409 : status >= 400 && status < 500
+}
+
 /** Authenticated server-to-server continuation; secrets remain in the header and are never serialized. */
 export async function postScheduledPipelineContinuation(input: HandoffInput, signal: AbortSignal, fetcher: typeof fetch = globalThis.fetch): Promise<ScheduledPipelineHandoff> {
   if ("prepareProof" in input && Object.hasOwn(input, "scheduledWaitId") && (typeof input.scheduledWaitId !== "string"
@@ -92,7 +98,7 @@ export async function postScheduledPipelineContinuation(input: HandoffInput, sig
       : { status: "waiting_for_user", waitId: payload.waitId, waitKind: "external" }
   }
   const errorCode = payload.errorCode
-  if (response.status >= 400 && response.status < 500 && payload.status === "blocked" && typeof errorCode === "string" && blockedErrors.has(errorCode)) return { status: "blocked", errorCode }
+  if (payload.status === "blocked" && typeof errorCode === "string" && isKnownBlockedResponse(response.status, errorCode)) return { status: "blocked", errorCode }
   throw new Error(response.status === 202 ? "scheduled_pipeline_handoff_in_progress" : "scheduled_pipeline_handoff_retryable")
 }
 
@@ -122,8 +128,8 @@ export async function postScheduledPipelineExecute(input: ScheduledPipelineAudit
     return { status: "waiting_for_user", waitId: payload.waitId }
   }
   const errorCode = payload.errorCode
-  if (response.status >= 400 && response.status < 500 && payload.status === "blocked" && typeof errorCode === "string"
-    && (blockedErrors.has(errorCode) || errorCode === "scheduled_pipeline_gate_proof_invalid")) {
+  if (payload.status === "blocked" && typeof errorCode === "string" && (isKnownBlockedResponse(response.status, errorCode)
+    || response.status >= 400 && response.status < 500 && errorCode === "scheduled_pipeline_gate_proof_invalid")) {
     return { status: "blocked", errorCode }
   }
   throw new Error(response.status === 202 ? "scheduled_pipeline_handoff_in_progress" : "scheduled_pipeline_handoff_retryable")
@@ -160,8 +166,8 @@ export async function postScheduledPipelineGate(input: ScheduledPipelineGateInpu
     throw new Error("scheduled_pipeline_gate_response_invalid")
   }
   const errorCode = payload.errorCode
-  if (response.status >= 400 && response.status < 500 && payload.status === "blocked" && typeof errorCode === "string"
-    && (blockedErrors.has(errorCode) || errorCode.startsWith("scheduled_pipeline_gate_"))) return { status: "blocked", errorCode }
+  if (payload.status === "blocked" && typeof errorCode === "string" && (isKnownBlockedResponse(response.status, errorCode)
+    || response.status >= 400 && response.status < 500 && errorCode.startsWith("scheduled_pipeline_gate_"))) return { status: "blocked", errorCode }
   throw new Error(response.status === 202 ? "scheduled_pipeline_handoff_in_progress" : "scheduled_pipeline_handoff_retryable")
 }
 

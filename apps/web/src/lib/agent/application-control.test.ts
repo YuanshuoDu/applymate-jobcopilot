@@ -19,6 +19,25 @@ vi.mock("@/lib/db", () => ({
   },
 }))
 
+function trackTransactionOutcome() {
+  const outcome = { committed: false, rolledBack: false }
+  mocks.transaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => {
+    try {
+      const result = await callback({
+        $queryRaw: mocks.queryRaw,
+        applicationTask: { upsert: mocks.taskUpsert, updateMany: mocks.taskUpdateMany, findUnique: mocks.taskFindUnique },
+        applicationTaskEvent: { create: mocks.eventCreate },
+      })
+      outcome.committed = true
+      return result
+    } catch (error) {
+      outcome.rolledBack = true
+      throw error
+    }
+  })
+  return outcome
+}
+
 describe("application control plane", () => {
   beforeEach(() => {
     mocks.taskUpsert.mockReset().mockResolvedValue({ id: "task_1" })
@@ -79,6 +98,92 @@ describe("application control plane", () => {
       checkpoint: "below_match_threshold", owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 2 }, assertScheduledGateCurrent } }))
       .resolves.toBe(true)
     expect(assertScheduledGateCurrent).toHaveBeenCalledOnce()
+    expect(mocks.taskUpdateMany).toHaveBeenCalledOnce()
+  })
+
+  it("acquires the source fence before owner locks and validates through the same transaction before skipping", async () => {
+    const order: string[] = []
+    let transactionClient: unknown
+    mocks.transaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => {
+      const tx = {
+        $queryRaw: mocks.queryRaw,
+        applicationTask: { upsert: mocks.taskUpsert, updateMany: mocks.taskUpdateMany, findUnique: mocks.taskFindUnique },
+        applicationTaskEvent: { create: mocks.eventCreate },
+      }
+      transactionClient = tx
+      return callback(tx)
+    })
+    mocks.queryRaw
+      .mockImplementationOnce(async () => { order.push("session-lock"); return [{ id: "session_1" }] })
+      .mockImplementationOnce(async () => { order.push("turn-lock"); return [{ id: "turn_1", status: "waiting_for_user" }] })
+    mocks.taskUpdateMany.mockImplementationOnce(async () => { order.push("skip-update"); return { count: 1 } })
+    const sourceHooks = {
+      acquireFence: vi.fn(async (tx: unknown) => { expect(tx).toBe(transactionClient); order.push("source-fence") }),
+      validateSource: vi.fn(async (tx: unknown) => { expect(tx).toBe(transactionClient); order.push("source-validation") }),
+    }
+    const assertScheduledGateCurrent = vi.fn(async (tx: unknown) => {
+      expect(tx).toBe(transactionClient)
+      order.push("owner-validation")
+      return true
+    })
+
+    await expect(skipApplicationForGate({ userId: "user_1", jobId: "job_1", sessionId: "session_1",
+      checkpoint: "below_match_threshold", sourceHooks,
+      owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 2 }, assertScheduledGateCurrent } }))
+      .resolves.toBe(true)
+
+    expect(order).toEqual(["source-fence", "session-lock", "turn-lock", "owner-validation", "source-validation", "skip-update"])
+    expect(sourceHooks.acquireFence).toHaveBeenCalledOnce()
+    expect(sourceHooks.validateSource).toHaveBeenCalledOnce()
+  })
+
+  it("rolls back and skips no task when final source validation fails", async () => {
+    const outcome = trackTransactionOutcome()
+    mocks.queryRaw.mockResolvedValueOnce([{ id: "session_1" }]).mockResolvedValueOnce([{ id: "turn_1", status: "waiting_for_user" }])
+    const validationError = new Error("source validation rejected")
+    const sourceHooks = {
+      acquireFence: vi.fn(async () => {}),
+      validateSource: vi.fn(async () => { throw validationError }),
+    }
+    const assertScheduledGateCurrent = vi.fn(async () => true)
+
+    await expect(skipApplicationForGate({ userId: "user_1", jobId: "job_1", sessionId: "session_1",
+      checkpoint: "below_match_threshold", sourceHooks,
+      owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 2 }, assertScheduledGateCurrent } }))
+      .rejects.toBe(validationError)
+
+    expect(outcome).toEqual({ committed: false, rolledBack: true })
+    expect(sourceHooks.acquireFence).toHaveBeenCalledOnce()
+    expect(sourceHooks.validateSource).toHaveBeenCalledOnce()
+    expect(assertScheduledGateCurrent).toHaveBeenCalledOnce()
+    expect(mocks.taskUpdateMany).not.toHaveBeenCalled()
+  })
+
+  it("rolls back before owner locks or task mutation when source fence acquisition fails", async () => {
+    const outcome = trackTransactionOutcome()
+    const fenceError = new Error("source fence rejected")
+    const sourceHooks = {
+      acquireFence: vi.fn(async () => { throw fenceError }),
+      validateSource: vi.fn(async () => {}),
+    }
+
+    await expect(skipApplicationForGate({ userId: "user_1", jobId: "job_1", sessionId: "session_1",
+      checkpoint: "below_match_threshold", sourceHooks,
+      owner: { turnId: "turn_1" } }))
+      .rejects.toBe(fenceError)
+
+    expect(outcome).toEqual({ committed: false, rolledBack: true })
+    expect(sourceHooks.acquireFence).toHaveBeenCalledOnce()
+    expect(sourceHooks.validateSource).not.toHaveBeenCalled()
+    expect(mocks.queryRaw).not.toHaveBeenCalled()
+    expect(mocks.taskUpdateMany).not.toHaveBeenCalled()
+  })
+
+  it("preserves the existing skip behavior when source hooks and owner are omitted", async () => {
+    await expect(skipApplicationForGate({ userId: "user_1", jobId: "job_1", checkpoint: "review_quality_declined" }))
+      .resolves.toBe(true)
+
+    expect(mocks.queryRaw).not.toHaveBeenCalled()
     expect(mocks.taskUpdateMany).toHaveBeenCalledOnce()
   })
 

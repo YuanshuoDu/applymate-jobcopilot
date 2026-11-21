@@ -1,6 +1,7 @@
 import type { Pool, PoolClient } from "pg";
 
 import type { InsertApplyResult } from "./apply-results.js";
+import { acquireSourceMaterialFence } from "./source-material-fence.js";
 import { completeFillForReview, finishApplicationTask, pauseForFormInput, USER_TAKEOVER_CHECKPOINT } from "./application-task-state.js";
 import type { FormReviewNeeds } from "../harness/form-review.js";
 
@@ -29,6 +30,7 @@ export async function persistLegacyApplicationTaskOutcome<T>(
   write: (client: PoolClient) => Promise<T>,
   options: { readonly lockLatestTurn?: boolean } = {},
 ): Promise<LegacyApplicationTaskOutcomeResult<T>> {
+  await acquireSourceMaterialFence(client, [scope.userId]);
   const snapshot = await client.query<{ sessionId: string | null }>(
     `SELECT "sessionId" FROM application_tasks WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3`,
     [scope.applicationTaskId, scope.userId, scope.jobId],
