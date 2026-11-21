@@ -465,7 +465,7 @@ describe("loadCanonicalTurnState", () => {
     }
   })
 
-  it("restores exact supported intents and preserves absence", async () => {
+  it("restores exact scoped intents without granting generic mode authority and preserves absence", async () => {
     const exact = pool({ turn: { input: { goal: "Find jobs", intent: { kind: "interactive_discovery_shortlist", version: 1 } }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
     await expect(loadCanonicalTurnState(exact, lease)).resolves.toMatchObject({
       intent: { kind: "interactive_discovery_shortlist", version: 1 },
@@ -474,10 +474,29 @@ describe("loadCanonicalTurnState", () => {
     await expect(loadCanonicalTurnState(objective, lease)).resolves.toMatchObject({
       intent: { kind: "objective_task_graph_execution", version: 1 },
     })
+    const reviewedIntent = { kind: "reviewed_application_review", version: 1, sourceTurnId: "source-turn-1", jobId: "job-1" }
+    const reviewed = pool({ turn: { input: { goal: "Review verified materials", intent: reviewedIntent }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
+    const reviewedState = await loadCanonicalTurnState(reviewed, lease)
+    expect(reviewedState.intent).toEqual(reviewedIntent)
+    expect(reviewedState.intent?.kind).not.toBe("objective_task_graph_execution")
+    expect(reviewedState.intent?.kind).not.toBe("interactive_discovery_shortlist")
+    const reviewedTurnQuery = reviewed.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_turns" WHERE "id" = $1'))
+    expect(reviewedTurnQuery?.[0]).toContain('WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3')
+    expect(reviewedTurnQuery?.[1]).toEqual(["turn-1", "session-1", "user-1", "worker-1", 1, expect.any(Date)])
 
     const absent = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
     await expect(loadCanonicalTurnState(absent, lease)).resolves.not.toHaveProperty("intent")
-    for (const intent of [undefined, null, { kind: "interactive_discovery_shortlist", version: 2 }, { kind: "interactive_discovery_shortlist", version: 1, userControlled: true }, { kind: "other", version: 1 }]) {
+    for (const intent of [
+      undefined,
+      null,
+      { kind: "interactive_discovery_shortlist", version: 2 },
+      { kind: "interactive_discovery_shortlist", version: 1, userControlled: true },
+      { kind: "other", version: 1 },
+      { kind: "reviewed_application_review", version: 1, sourceTurnId: "source-turn-1" },
+      { kind: "reviewed_application_review", version: 1, sourceTurnId: "source-turn-1", jobId: "job-1", extra: true },
+      { kind: "reviewed_application_review", version: 1, sourceTurnId: "", jobId: "job-1" },
+      { kind: "reviewed_application_review", version: 1, sourceTurnId: "source-turn-1", jobId: "" },
+    ]) {
       const value = pool({ turn: { input: { goal: "Find jobs", intent }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
       await expect(loadCanonicalTurnState(value, lease)).rejects.toThrow("turn_intent_invalid")
     }

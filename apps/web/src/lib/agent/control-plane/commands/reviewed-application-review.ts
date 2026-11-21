@@ -1,5 +1,5 @@
 import { Prisma, type PrismaClient } from "@prisma/client"
-import { REVIEWED_APPLICATION_REVIEW_INTENT } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, REVIEWED_APPLICATION_REVIEW_INTENT } from "@jobcopilot/agent-protocol"
 
 import { duplicateCommandResult } from "./agent-command-service"
 import { invalidCommand, isUniqueViolation, retryActiveConflict, turnNotActive } from "./errors"
@@ -63,7 +63,12 @@ function parseCommand(value: unknown): ReviewedApplicationReviewCommand {
 function selectedJobId(value: unknown): string | null {
   const input = record(value)
   const selected = record(input?.selectedJobPreparation)
-  if (!input || Object.hasOwn(input, "intent") || !selected
+  const intent = record(input?.intent)
+  const validIntent = !input || !Object.hasOwn(input, "intent") || !!intent
+    && Object.keys(intent).sort().join(",") === "kind,version"
+    && intent.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind
+    && intent.version === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version
+  if (!input || !validIntent || !selected
     || Object.keys(selected).sort().join(",") !== "jobId" || !identity(selected.jobId)) return null
   return selected.jobId
 }

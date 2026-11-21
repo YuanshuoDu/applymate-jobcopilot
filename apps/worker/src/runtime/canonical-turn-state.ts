@@ -1,5 +1,5 @@
 import type pg from "pg"
-import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, TurnIntentSchema, validate, type TenantScope, type RepositoryJsonValue, type TurnIntent, type TurnSource } from "@jobcopilot/agent-protocol"
+import { TurnIntentSchema, validate, type TenantScope, type RepositoryJsonValue, type TurnIntent, type TurnSource } from "@jobcopilot/agent-protocol"
 
 import { loadCanonicalTurnSnapshot } from "./context/canonical-turn-snapshot-loader.js"
 import type { SelectedJobMemoryRecord } from "./context/selected-job-memory.js"
@@ -77,8 +77,7 @@ function turnIntent(value: unknown): CanonicalTurnIntent | undefined {
   if (!Object.hasOwn(source, "intent")) return undefined
   const intent = source.intent
   if (!validate(TurnIntentSchema, intent)) throw new Error("turn_intent_invalid")
-  return (intent as TurnIntent).kind === INTERACTIVE_DISCOVERY_INTENT.kind
-    ? INTERACTIVE_DISCOVERY_INTENT : OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT
+  return intent as TurnIntent
 }
 
 function cognitiveAgendaReceipt(events: readonly Row[], lease: TurnLease, rootTaskId: unknown): CognitiveAgendaReceipt | undefined {
