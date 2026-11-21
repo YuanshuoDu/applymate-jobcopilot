@@ -128,14 +128,17 @@ async function readLockedTurn(client: Queryable, lease: TurnLease): Promise<Lock
     ? { rootTaskId: row.rootTaskId, intent, revision: Number(row.revision) } : null
 }
 async function lockLiveRoot(client: Queryable, lease: TurnLease, rootTaskId: string): Promise<boolean> {
-  const result = await client.query(`SELECT "id", "status", "role", "taskType", "depth", "attemptCount", "leaseOwner",
-      "leaseExpiresAt", "interruptRequestedAt", "failureReason", "completedAt", "closedAt", "nextAttemptAt"
-    FROM "sub_agent_tasks" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3 AND "turnId"=$4
-      AND "rootTaskId"=$1 AND "parentTaskId" IS NULL AND "role"='orchestrator' AND "taskType"='root' AND "depth"=0
-      AND "status"='running' AND "leaseOwner"=$5 AND "attemptCount"=1
-      AND date_trunc('milliseconds',"leaseExpiresAt")=date_trunc('milliseconds',$6::timestamptz)
-      AND "leaseExpiresAt">clock_timestamp() AND "interruptRequestedAt" IS NULL AND "failureReason" IS NULL
-      AND "completedAt" IS NULL AND "closedAt" IS NULL AND "nextAttemptAt" IS NULL FOR UPDATE`,
+  const result = await client.query(`SELECT root."id", root."status", root."role", root."taskType", root."depth", root."attemptCount", root."leaseOwner",
+      root."leaseExpiresAt", root."interruptRequestedAt", root."failureReason", root."completedAt", root."closedAt", root."nextAttemptAt"
+    FROM "sub_agent_tasks" AS root
+    JOIN "agent_sessions" AS session ON session."id"=root."sessionId" AND session."userId"=$2
+    JOIN "agent_turns" AS turn ON turn."id"=root."turnId" AND turn."sessionId"=session."id" AND turn."userId"=session."userId"
+    WHERE root."id"=$1 AND root."sessionId"=$3 AND root."turnId"=$4 AND turn."rootTaskId"=$1
+      AND root."rootTaskId"=$1 AND root."parentTaskId" IS NULL AND root."role"='orchestrator' AND root."taskType"='root' AND root."depth"=0
+      AND root."status"='running' AND root."leaseOwner"=$5 AND root."attemptCount"=1
+      AND date_trunc('milliseconds',root."leaseExpiresAt")=date_trunc('milliseconds',$6::timestamptz)
+      AND root."leaseExpiresAt">clock_timestamp() AND root."interruptRequestedAt" IS NULL AND root."failureReason" IS NULL
+      AND root."completedAt" IS NULL AND root."closedAt" IS NULL AND root."nextAttemptAt" IS NULL FOR UPDATE OF root`,
   [rootTaskId, lease.userId, lease.sessionId, lease.turnId, lease.ownerId, lease.leaseExpiresAt])
   const row = record(result.rows[0])
   return result.rows.length === 1 && row?.id === rootTaskId && row.status === "running" && row.role === "orchestrator"

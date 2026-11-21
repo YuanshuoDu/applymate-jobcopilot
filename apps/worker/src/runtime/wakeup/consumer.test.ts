@@ -156,7 +156,7 @@ function fakePool(options: FakeOptions = {}) {
       if (sql.includes('UPDATE "agent_turns"')) {
         const rowCount = options.turnUpdateRows ?? 1
         const turnId = String(params?.[0]), turn = turns.get(turnId)
-        if (rowCount === 1 && sql.includes("SET \"status\" = 'queued'")) turns.set(turnId, turn ? { ...turn, status: "queued", revision: turn.revision + 1, hasLiveLease: false, leaseOwnerId: null, leaseExpiresAt: null, leaseStartedAt: null } : turn)
+        if (rowCount === 1 && sql.includes("SET \"status\" = 'queued'") && turn) turns.set(turnId, { ...turn, status: "queued", revision: turn.revision + 1, hasLiveLease: false, leaseOwnerId: null, leaseExpiresAt: null, leaseStartedAt: null })
         return { rows: [], rowCount }
       }
       if (sql.includes('INSERT INTO "agent_outbox"') && params?.[1] === "agent.turn.dispatch") {

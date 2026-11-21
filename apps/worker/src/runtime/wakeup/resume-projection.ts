@@ -39,10 +39,10 @@ export async function appendResumeEvent(client: Client, payload: AgentTurnWakeup
 export async function hasMatchingWakeupEvent(client: Client, payload: AgentTurnWakeupPayload): Promise<boolean> {
   const event = (await client.query<WakeupEventProjection>(`SELECT "sessionId", "turnId", "itemId", "type", "payload" FROM "agent_events" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "itemId" = $4 AND "type" = 'turn.wakeup' FOR SHARE`, [payload.eventId, payload.sessionId, payload.turnId, payload.itemId])).rows[0]
   const value = record(event?.payload)
-  return Boolean(event && event.itemId === payload.itemId && event.type === "turn.wakeup"
-    && value.waitKind === payload.waitKind && value.waitId === payload.waitId && value.itemId === payload.itemId
+  if (!event || event.itemId !== payload.itemId || event.type !== "turn.wakeup" || !value) return false
+  return value.waitKind === payload.waitKind && value.waitId === payload.waitId && value.itemId === payload.itemId
     && value.turnId === payload.turnId && value.toolCallId === payload.toolCallId && value.status === payload.status
-    && value.nextTurnRevision === payload.nextTurnRevision)
+    && value.nextTurnRevision === payload.nextTurnRevision
 }
 
 /** Defers only the exact live canonical wait whose owner still needs to settle it. */

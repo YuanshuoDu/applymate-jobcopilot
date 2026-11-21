@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import { hashApprovalNonce, hashApprovalScope, type ApprovalScope } from "@jobcopilot/agent-protocol"
+import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
 import { hashReviewedApplicationMaterialProof } from "@jobcopilot/shared"
-import { protocolScope } from "./approval/types.js"
+import { protocolScope, type ApprovalScopeInput } from "./approval/types.js"
+import type { Pool } from "pg"
 import { SessionPauseRequestedError } from "./session-gate.js"
 import type { TurnLease } from "./turns/lease.js"
 
@@ -38,7 +39,7 @@ function freshTask(overrides: Record<string, unknown> = {}) {
     fillTurnUserId: null, startedAt: null, completedAt: null, ...overrides }
 }
 function input(overrides: Partial<{ rootTaskId: string; intent: unknown; now: Date }> = {}) {
-  return { pool: { connect: vi.fn(async () => client()) }, lease, rootTaskId: overrides.rootTaskId ?? "review-root-1",
+  return { pool: { connect: vi.fn(async () => client()) } as unknown as Pool, lease, rootTaskId: overrides.rootTaskId ?? "review-root-1",
     intent: overrides.intent ?? intent, now: overrides.now ?? now }
 }
 function client() {
@@ -91,7 +92,7 @@ beforeEach(() => {
   mocks.readProof.mockResolvedValue({ ...proof })
   mocks.issue.mockImplementation(async (_client: unknown, raw: unknown) => {
     mocks.state.issueCalls += 1
-    const issue = raw as { approvalId: string; taskId: string; scope: ApprovalScope; title: string; body: string; payload: unknown }
+    const issue = raw as { approvalId: string; taskId: string; scope: ApprovalScopeInput; title: string; body: string; payload: unknown }
     mocks.state.scope = issue.scope as unknown as Record<string, unknown>
     const nonceHash = await hashApprovalNonce("private-approval-nonce")
     const scopeHash = await hashApprovalScope(protocolScope(issue.scope, nonceHash))
@@ -140,7 +141,12 @@ describe("issueOrReplayReviewedApplicationReview", () => {
     expect(mocks.state.order[0]).toBe("BEGIN")
     expect(mocks.state.order.indexOf("source-fence")).toBeLessThan(mocks.state.order.findIndex(sql => sql.includes("FROM \"agent_sessions\"")))
     expect(mocks.issue).toHaveBeenCalledTimes(1)
-    const issue = mocks.issue.mock.calls[0]?.[1] as { projectWait?: boolean; taskId: string; scope: ApprovalScope; payload: unknown }
+    const rootSql = mocks.state.order.find(sql => sql.includes('FROM "sub_agent_tasks" AS root'))
+    expect(rootSql).toContain('JOIN "agent_sessions" AS session')
+    expect(rootSql).toContain('JOIN "agent_turns" AS turn')
+    expect(rootSql).toContain('FOR UPDATE OF root')
+    expect(rootSql).not.toContain('root."userId"')
+    const issue = mocks.issue.mock.calls[0]?.[1] as { projectWait?: boolean; taskId: string; scope: ApprovalScopeInput; payload: unknown }
     expect(issue.projectWait).toBeUndefined()
     expect(issue.taskId).toBe("application-1")
     expect(issue.scope.action).toBe("review_application")
@@ -158,7 +164,7 @@ describe("issueOrReplayReviewedApplicationReview", () => {
 
   it("replays the same pending Wait after scope-hash rotation without issuing another receipt", async () => {
     await issueOrReplayReviewedApplicationReview(input())
-    const savedScope = mocks.state.scope as unknown as ApprovalScope
+    const savedScope = mocks.state.scope as unknown as ApprovalScopeInput
     const rotatedNonceHash = await hashApprovalNonce("rotated-private-nonce")
     const rotatedScopeHash = await hashApprovalScope(protocolScope(savedScope, rotatedNonceHash))
     mocks.state.approval!.nonceHash = rotatedNonceHash

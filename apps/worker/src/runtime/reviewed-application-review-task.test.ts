@@ -53,11 +53,11 @@ describe("reviewed application review task binding", () => {
   })
 
   it("stores proof identities and canonical receipt scope without letter content or nonce", async () => {
-    const query = vi.fn(async () => ({ rows: [], rowCount: 1 }))
+    const query = vi.fn(async (_sql: string, _params?: readonly unknown[]) => ({ rows: [] as unknown[], rowCount: 1 }))
     await writeReviewedApplicationReviewBinding({ query } as never, binding, scope.now)
     const [sql, params] = query.mock.calls[0]!
     expect(sql).toContain("application_task_events")
-    const data = JSON.parse(String(params[4])) as Record<string, unknown>
+    const data = JSON.parse(String(params?.[4])) as Record<string, unknown>
     expect(data).toEqual(binding)
     expect(JSON.stringify(data)).not.toContain("nonce")
     expect(JSON.stringify(data)).not.toContain("letter")
@@ -66,7 +66,7 @@ describe("reviewed application review task binding", () => {
   it("replays only one exact private event and rejects duplicates or malformed extra fields", async () => {
     const row = { taskId: binding.applicationTaskId, type: REVIEW_BINDING_EVENT, actor: "worker",
       body: "Reviewed application approval binding recorded.", data: binding }
-    const query = vi.fn(async () => ({ rows: [row], rowCount: 1 }))
+    const query = vi.fn(async (_sql: string, _params?: readonly unknown[]) => ({ rows: [row] as unknown[], rowCount: 1 }))
     await expect(readReviewedApplicationReviewBinding({ query } as never, binding.applicationTaskId, binding.reviewTurnId)).resolves.toEqual(binding)
     expect(sameReviewedApplicationReviewBinding({ ...binding, receiptScope: { ...binding.receiptScope } }, binding)).toBe(true)
     query.mockResolvedValueOnce({ rows: [{ ...row, data: { ...binding, letter: "private" } }], rowCount: 1 })
