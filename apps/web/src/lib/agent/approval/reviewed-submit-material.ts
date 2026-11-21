@@ -1,4 +1,4 @@
-import type { PrismaClient } from "@prisma/client"
+import { Prisma, type PrismaClient } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope, type ApprovalScope } from "@jobcopilot/agent-protocol"
 import {
   bindReviewedApplicationSubmissionMaterial, buildApplicationSubmissionManifest, hashAgentReceiptValue,
@@ -7,24 +7,91 @@ import {
   type LegacyApplicationSubmissionMaterial,
 } from "@jobcopilot/shared"
 import { hashArtifactContent } from "../artifacts/hash"
+import { acquireSourceMaterialFence } from "../source-material-fence"
 
 const START_EVENT = "reviewed_application_fill_browser_started"
 const REVIEWED_MANIFEST_SCHEMA = "agent-harness.application-submission.v2"
 const TASK_REF_PREFIX = "application-task:"
 
 type Client = Pick<PrismaClient, "agentApproval" | "agentArtifact" | "agentTurn" | "applicationTask" | "applicationTaskEvent" | "subAgentTask">
-type Input = Readonly<{ userId: string; sessionId: string; applicationTaskId: string; jobId: string; fillTurnId: string; approvalId: string; receiptNonce: string }>
+export type ReviewedSubmitMaterialInput = Readonly<{ userId: string; sessionId: string; applicationTaskId: string; jobId: string; fillTurnId: string; approvalId: string; receiptNonce: string }>
+type Input = ReviewedSubmitMaterialInput
 type ReceiptRow = { id: string; userId: string; sessionId: string; turnId: string; jobId: string; taskId: string | null; type: string; status: string
   toolCallId: string | null; payload: unknown; resourceHash: string | null; materialHash: string | null; answersHash: string | null; scopeHash: string | null
   nonceHash: string | null; revision: number; expiresAt: Date | null }
 type ArtifactRow = { id: string; userId: string; jobId: string; artifactType: string; lifecycle: string; baseId: string | null; baseHash: string | null
   content: unknown; hash: string; constraintHash: string; provenanceRefs: unknown; evidenceRefs: unknown; previousHash: string | null; version: number }
+type ReplayReceipt = Readonly<{ nonceHash: string | null; resourceHash: string | null; materialHash: string | null; answersHash: string | null
+  expiresAt: Date | null; sessionId: string | null; turnId: string | null; toolCallId: string | null; jobId: string | null; revision: number; scopeHash: string | null }>
 type MaterialResult =
   | Readonly<{ mode: "legacy" }>
   | Readonly<{ mode: "reviewed"; ready: true; resourceHash: string; materialHash: string; answersHash: string }>
   | Readonly<{ mode: "unavailable" }>
 
 const UNAVAILABLE: MaterialResult = Object.freeze({ mode: "unavailable" })
+
+/** Acquire the shared source fence and the submit scope in the established row-lock order. */
+export async function lockReviewedSubmitSourceScope(tx: Prisma.TransactionClient, input: Input): Promise<boolean> {
+  await acquireSourceMaterialFence(tx, [input.userId])
+  const session = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT "id" FROM "agent_sessions" WHERE "id" = ${input.sessionId} AND "userId" = ${input.userId} FOR UPDATE
+  `)
+  if (!exactlyLocked(session, input.sessionId)) return false
+  const turn = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT "id" FROM "agent_turns" WHERE "id" = ${input.fillTurnId} AND "sessionId" = ${input.sessionId}
+      AND "userId" = ${input.userId} FOR UPDATE
+  `)
+  if (!exactlyLocked(turn, input.fillTurnId)) return false
+  const task = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT "id" FROM "application_tasks" WHERE "id" = ${input.applicationTaskId} AND "userId" = ${input.userId}
+      AND "sessionId" = ${input.sessionId} AND "fillTurnId" = ${input.fillTurnId} AND "jobId" = ${input.jobId} FOR UPDATE
+  `)
+  if (!exactlyLocked(task, input.applicationTaskId)) return false
+  const job = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT "id" FROM "Job" WHERE "id" = ${input.jobId} AND "userId" = ${input.userId} FOR UPDATE
+  `)
+  if (!exactlyLocked(job, input.jobId)) return false
+  const approval = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT "id" FROM "agent_approvals" WHERE "id" = ${input.approvalId} AND "userId" = ${input.userId}
+      AND "sessionId" = ${input.sessionId} AND "taskId" = ${input.applicationTaskId} AND "turnId" = ${input.fillTurnId}
+      AND "jobId" = ${input.jobId} AND "type" = 'submit_application' FOR UPDATE
+  `)
+  return exactlyLocked(approval, input.approvalId)
+}
+
+export function sameReviewedSubmitMaterialSnapshot(left: MaterialResult, right: MaterialResult): boolean {
+  if (left.mode === "unavailable" || right.mode !== left.mode) return false
+  return left.mode === "legacy" || (right.mode === "reviewed" && left.resourceHash === right.resourceHash
+    && left.materialHash === right.materialHash && left.answersHash === right.answersHash)
+}
+
+export async function lockAndRereadReviewedSubmitMaterial(tx: Prisma.TransactionClient, input: Input, expected: MaterialResult): Promise<boolean> {
+  return await lockReviewedSubmitSourceScope(tx, input)
+    && sameReviewedSubmitMaterialSnapshot(expected, await resolveReviewedSubmitMaterial(tx, input))
+}
+
+export function submitMaterialHashesMatch(proof: MaterialResult, approval: Pick<ReceiptRow, "resourceHash" | "materialHash" | "answersHash">,
+  legacyMaterialHash: string, legacyAnswersHash: string): boolean {
+  if (proof.mode === "unavailable") return false
+  return proof.mode === "legacy" ? approval.materialHash === legacyMaterialHash && approval.answersHash === legacyAnswersHash
+    : approval.resourceHash === proof.resourceHash && approval.materialHash === proof.materialHash && approval.answersHash === proof.answersHash
+}
+
+export async function replayReceiptScopeMatches(approval: ReplayReceipt,
+input: Pick<Input, "userId" | "receiptNonce">): Promise<boolean> {
+  if (!approval.nonceHash || !approval.resourceHash || !approval.materialHash || !approval.answersHash || !approval.expiresAt
+    || !approval.sessionId || !approval.turnId || !approval.toolCallId || !approval.jobId || !input.receiptNonce) return false
+  const nonceHash = await hashApprovalNonce(input.receiptNonce)
+  const scope: ApprovalScope = { userId: input.userId, sessionId: approval.sessionId, turnId: approval.turnId, jobId: approval.jobId,
+    toolCallId: approval.toolCallId, action: "submit_application", resourceHash: approval.resourceHash,
+    materialHash: approval.materialHash, answersHash: approval.answersHash, revision: approval.revision,
+    nonceHash, expiresAt: approval.expiresAt.toISOString() }
+  return nonceHash === approval.nonceHash && await hashApprovalScope(scope) === approval.scopeHash
+}
+
+function exactlyLocked(rows: readonly { id: string }[], expectedId: string): boolean {
+  return rows.length === 1 && rows[0]?.id === expectedId
+}
 
 /**
  * Read-only preflight; every result is advisory. Call again on the existing transaction client after
@@ -57,7 +124,7 @@ export async function resolveReviewedSubmitMaterial(client: Client, input: Input
       })
       if (starts.length !== 0) return UNAVAILABLE
       const artifacts = await client.agentArtifact.findMany({
-        where: { id: `application:${task.id}`, userId: input.userId, jobId: input.jobId, artifactType: "application", lifecycle: "base" },
+        where: { id: `application:${task.id}`, userId: input.userId, jobId: input.jobId },
         take: 2, select: { content: true },
       })
       if (artifacts.length > 1 || artifacts.some(row => hasReviewedManifestVersion(row.content))) return UNAVAILABLE

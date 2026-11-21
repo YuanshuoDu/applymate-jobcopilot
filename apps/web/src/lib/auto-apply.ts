@@ -1,8 +1,8 @@
 import { db } from "@/lib/db";
 import { Prisma } from "@prisma/client";
-import { hashApprovalNonce, hashApprovalScope, type ApprovalScope } from "@jobcopilot/agent-protocol";
 import { hashAgentReceiptValue, matchesApplyTaskSubmitPayload, reviewedFillHandoffIdempotencyKey, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
 import { createSubmitIntent, enqueueApplyTask, isReplayableSubmitState, resolveExistingSubmitIntent } from "@/lib/apply-queue-client";
+import { lockAndRereadReviewedSubmitMaterial, replayReceiptScopeMatches, resolveReviewedSubmitMaterial, submitMaterialHashesMatch } from "@/lib/agent/approval/reviewed-submit-material";
 import { AgentCommandService } from '@/lib/agent/control-plane/commands/agent-command-service'
 import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
 import { applicationFillTaskGraphEnabled, asRecord, assertActiveAccount, assertJobPreflight, assertUnattendedApplyEnabled, AutoApplyError, validateAutoApplyUrl } from "./auto-apply-guards";
@@ -121,24 +121,17 @@ export async function queueAutonomousApplication(input: {
   };
   const snapshotMaterialHash = await hashAgentReceiptValue("material", material);
   const snapshotAnswersHash = await hashAgentReceiptValue("answers", taskSnapshot?.confirmedAnswers ?? null);
-  let replayReceiptValid = !input.replayOnly;
-  if (input.replayOnly && approval && input.receiptNonce && approval.nonceHash && approval.resourceHash && approval.materialHash && approval.answersHash && approval.expiresAt && approval.sessionId && approval.turnId && approval.toolCallId && approval.jobId) {
-    const scope: ApprovalScope = {
-      userId: input.userId, sessionId: approval.sessionId, turnId: approval.turnId, jobId: approval.jobId,
-      toolCallId: approval.toolCallId, action: "submit_application", resourceHash: approval.resourceHash,
-      materialHash: approval.materialHash, answersHash: approval.answersHash, revision: approval.revision,
-      nonceHash: approval.nonceHash, expiresAt: approval.expiresAt.toISOString(),
-    };
-    replayReceiptValid = approval.nonceHash === await hashApprovalNonce(input.receiptNonce) &&
-      approval.scopeHash === await hashApprovalScope(scope);
-  }
+  const reviewedInput = { userId: input.userId, sessionId: taskSnapshot?.sessionId ?? "", applicationTaskId: input.applicationTaskId,
+    jobId: input.jobId, fillTurnId: taskSnapshot?.fillTurnId ?? "", approvalId: input.approvalId, receiptNonce: input.receiptNonce ?? "" };
+  const materialProof = await resolveReviewedSubmitMaterial(db, reviewedInput);
+  const replayReceiptValid = !input.replayOnly || Boolean(approval && await replayReceiptScopeMatches(approval, reviewedInput));
   if (!approval || !taskSnapshot?.sessionId || !taskSnapshot.fillTurnId ||
     (input.sessionId && input.sessionId !== taskSnapshot.sessionId) || approval.sessionId !== taskSnapshot.sessionId ||
     approval.taskId !== input.applicationTaskId || approval.turnId !== taskSnapshot.fillTurnId ||
     payload.applicationTaskId !== input.applicationTaskId || payload.jobId !== input.jobId ||
     payload.resumeId !== material.resumeId || payload.coverLetterId !== material.coverLetterId ||
     ("confirmedAnswers" in payload && JSON.stringify(payload.confirmedAnswers ?? null) !== JSON.stringify(taskSnapshot?.confirmedAnswers ?? null)) ||
-    approval.materialHash !== snapshotMaterialHash || approval.answersHash !== snapshotAnswersHash ||
+    !submitMaterialHashesMatch(materialProof, approval, snapshotMaterialHash, snapshotAnswersHash) ||
     !approval.toolCallId || approval.jobId !== input.jobId || !approval.expiresAt ||
     !approval.scopeHash || !input.receiptNonce || !replayReceiptValid) {
     throw new AutoApplyError("A current, explicit approval is required before this application can be submitted.");
@@ -178,9 +171,12 @@ export async function queueAutonomousApplication(input: {
     applicationTaskId: input.applicationTaskId, userId: input.userId, jobId: input.jobId,
     sessionId: receiptSessionId, fillTurnId, receiptId: approval.id, constraintHash: approval.scopeHash,
   })) throw new AutoApplyError("The submit payload does not match the current approved application attempt.");
+  const lockedMaterialHash = materialProof.mode === "reviewed" ? materialProof.materialHash : snapshotMaterialHash;
+  const lockedAnswersHash = materialProof.mode === "reviewed" ? materialProof.answersHash : snapshotAnswersHash;
 
   const taskId = await db.$transaction(async tx => {
     const taskWhere = { id: input.applicationTaskId, userId: input.userId, jobId: input.jobId, sessionId: receiptSessionId, fillTurnId };
+    if (!await lockAndRereadReviewedSubmitMaterial(tx, reviewedInput, materialProof)) return false;
     const current = await tx.applicationTask.findFirst({
       where: taskWhere,
       select: { status: true, checkpoint: true, workerTaskId: true, resumeId: true, coverLetterId: true, confirmedAnswers: true, question: true },
@@ -193,7 +189,30 @@ export async function queueAutonomousApplication(input: {
       return resolveExistingSubmitIntent(tx, intent);
     }
     if (input.replayOnly && approval.status !== "approved") return false;
-    if (current.status !== "waiting_for_authorization" || current.checkpoint !== "form_filled" || !current.resumeId || current.question !== null) return false;
+    if (current.status !== "waiting_for_authorization" || !["form_filled", "queue_retry"].includes(current.checkpoint ?? "") || !current.resumeId || current.question !== null) return false;
+    if (current.checkpoint === "queue_retry") {
+      if (!input.replayOnly || approval.status !== "approved" || !approval.expiresAt || approval.expiresAt <= new Date()) return false;
+      const [outbox, queuedEvent] = await Promise.all([tx.agentOutbox.findUnique({ where: { idempotencyKey: intent.idempotencyKey } }),
+        tx.applicationTaskEvent.findFirst({ where: { taskId: input.applicationTaskId, type: "submission_queued", AND: [
+          { data: { path: ["workerTaskId"], equals: intent.payload.workerTaskId } }, { data: { path: ["fillTurnId"], equals: fillTurnId } },
+          { data: { path: ["receiptId"], equals: approval.id } },
+        ] }, select: { id: true } })]);
+      if (outbox || queuedEvent) return false;
+    }
+
+    const lockedApproval = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT "id" FROM "agent_approvals"
+      WHERE "id" = ${approval.id} AND "userId" = ${input.userId} AND "sessionId" = ${receiptSessionId}
+        AND "taskId" = ${input.applicationTaskId} AND "turnId" = ${fillTurnId}
+        AND "jobId" = ${input.jobId} AND "toolCallId" = ${approval.toolCallId}
+        AND "type" = 'submit_application' AND "status" = 'approved' AND "scopeHash" = ${approval.scopeHash}
+        AND "nonceHash" = ${approval.nonceHash} AND "resourceHash" = ${approval.resourceHash}
+        AND "materialHash" = ${lockedMaterialHash} AND "answersHash" = ${lockedAnswersHash}
+        AND "revision" = ${approval.revision} AND "expiresAt" = ${approval.expiresAt} AND "expiresAt" > CURRENT_TIMESTAMP
+        AND "payload" = ${JSON.stringify(approval.payload)}::jsonb
+      FOR UPDATE
+    `);
+    if (lockedApproval.length !== 1) throw new AutoApplyError("The approved submission receipt changed before its intent was committed.");
 
     const resume = await tx.resume.findFirst({
       where: { id: current.resumeId, userId: input.userId, OR: [{ targetJobId: input.jobId }, { isDefault: true }] }, select: { id: true },
@@ -204,7 +223,7 @@ export async function queueAutonomousApplication(input: {
     })) return false;
 
     const claim = await tx.applicationTask.updateMany({
-      where: { ...taskWhere, workerTaskId: current.workerTaskId, status: "waiting_for_authorization", checkpoint: "form_filled",
+      where: { ...taskWhere, workerTaskId: current.workerTaskId, status: "waiting_for_authorization", checkpoint: current.checkpoint,
         resumeId: material.resumeId, coverLetterId: material.coverLetterId,
         confirmedAnswers: { equals: taskSnapshot.confirmedAnswers === null ? Prisma.DbNull : taskSnapshot.confirmedAnswers as Prisma.InputJsonValue }, question: { equals: Prisma.DbNull } },
       data: { status: "filling", checkpoint: "submission_authorized", question: Prisma.DbNull, workerTaskId: intent.payload.workerTaskId, startedAt: new Date() },
@@ -219,20 +238,6 @@ export async function queueAutonomousApplication(input: {
       data: { workflowState: "queued", analysisNote: "[Approved submission] Applying in the background after explicit user authorization." },
     });
     if (job.count !== 1) throw new AutoApplyError("This application is no longer ready for the approved submission step.");
-    const lockedApproval = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
-      SELECT "id" FROM "agent_approvals"
-      WHERE "id" = ${approval.id} AND "userId" = ${input.userId} AND "sessionId" = ${receiptSessionId}
-        AND "taskId" = ${input.applicationTaskId} AND "turnId" = ${fillTurnId}
-        AND "jobId" = ${input.jobId} AND "toolCallId" = ${approval.toolCallId}
-        AND "type" = 'submit_application' AND "status" = 'approved' AND "scopeHash" = ${approval.scopeHash}
-        AND "nonceHash" = ${approval.nonceHash} AND "resourceHash" = ${approval.resourceHash}
-        AND "materialHash" = ${snapshotMaterialHash} AND "answersHash" = ${snapshotAnswersHash}
-        AND "revision" = ${approval.revision} AND "expiresAt" = ${approval.expiresAt} AND "expiresAt" > CURRENT_TIMESTAMP
-        AND "payload" = ${JSON.stringify(approval.payload)}::jsonb
-      FOR UPDATE
-    `);
-    if (lockedApproval.length !== 1) throw new AutoApplyError("The approved submission receipt changed before its intent was committed.");
-
     const identity = intent.payload;
     await tx.applicationTaskEvent.create({ data: {
       taskId: input.applicationTaskId, type: "submission_queued", actor: "user", body: "User approved this job for background submission.",
