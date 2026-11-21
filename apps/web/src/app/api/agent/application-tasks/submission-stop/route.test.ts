@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { POST } from "./route"
 
 const mocks = vi.hoisted(() => {
   class MockApplicationSubmissionStopError extends Error {
@@ -32,7 +33,6 @@ function request(body: unknown, query = "") {
 
 describe("authenticated application submission Stop route", () => {
   beforeEach(() => {
-    vi.resetModules()
     mocks.requireAuth.mockReset().mockResolvedValue({ userId: "authenticated-owner" })
     mocks.requestStop.mockReset().mockResolvedValue("stop_requested")
     mocks.transaction.mockReset().mockImplementation(async (callback: unknown) => {
@@ -42,7 +42,6 @@ describe("authenticated application submission Stop route", () => {
   })
 
   it("uses the authenticated owner in one RLS transaction and returns only a bounded outcome", async () => {
-    const { POST } = await import("./route")
     const response = await POST(request(validBody) as never)
 
     expect(response.status).toBe(200)
@@ -55,7 +54,6 @@ describe("authenticated application submission Stop route", () => {
 
   it("passes through a durable grant-first too_late outcome", async () => {
     mocks.requestStop.mockResolvedValueOnce("too_late")
-    const { POST } = await import("./route")
     const response = await POST(request(validBody) as never)
 
     expect(response.status).toBe(200)
@@ -65,7 +63,6 @@ describe("authenticated application submission Stop route", () => {
 
   it.each(["submitted", "uncertain"] as const)("preserves the finite %s outcome", async outcome => {
     mocks.requestStop.mockResolvedValueOnce(outcome)
-    const { POST } = await import("./route")
     const response = await POST(request(validBody) as never)
 
     expect(response.status).toBe(200)
@@ -78,7 +75,6 @@ describe("authenticated application submission Stop route", () => {
     ["extra operation", { ...validBody, action: "cancel" }],
     ["malformed target", { ...validBody, expectedAttemptTarget: "private-target" }],
   ])("rejects a %s request before opening the transaction", async (_label, body) => {
-    const { POST } = await import("./route")
     const response = await POST(request(body) as never)
 
     expect(response.status).toBe(422)
@@ -90,7 +86,6 @@ describe("authenticated application submission Stop route", () => {
 
   it("returns authentication errors without opening a transaction", async () => {
     mocks.requireAuth.mockResolvedValueOnce(Response.json({ error: "Unauthorized" }, { status: 401 }))
-    const { POST } = await import("./route")
     const response = await POST(request(validBody) as never)
 
     expect(response.status).toBe(401)
@@ -99,7 +94,6 @@ describe("authenticated application submission Stop route", () => {
   })
 
   it("rejects query parameters outside the closed request before opening the transaction", async () => {
-    const { POST } = await import("./route")
     const response = await POST(request(validBody, "?userId=untrusted") as never)
 
     expect(response.status).toBe(422)
@@ -108,7 +102,6 @@ describe("authenticated application submission Stop route", () => {
 
   it("maps scoped helper conflicts to a bounded uncertain result without exposing error data", async () => {
     mocks.requestStop.mockRejectedValueOnce(new mocks.MockApplicationSubmissionStopError("stop_target_stale", "private identity"))
-    const { POST } = await import("./route")
     const response = await POST(request(validBody) as never)
 
     expect(response.status).toBe(409)
@@ -121,7 +114,6 @@ describe("authenticated application submission Stop route", () => {
       await (callback as (client: typeof tx) => Promise<unknown>)(tx)
       throw new Error("private commit failure")
     })
-    const { POST } = await import("./route")
     const response = await POST(request(validBody) as never)
 
     expect(response.status).toBe(503)
@@ -137,7 +129,6 @@ describe("authenticated application submission Stop route", () => {
       try { return await (callback as (client: typeof tx) => Promise<unknown>)(tx) }
       catch (error) { rolledBack = true; throw error }
     })
-    const { POST } = await import("./route")
     const response = await POST(request(validBody) as never)
 
     expect(response.status).toBe(503)
