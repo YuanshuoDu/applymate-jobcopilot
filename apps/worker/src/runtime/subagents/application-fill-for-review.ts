@@ -113,7 +113,7 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
           jobDescription: task.jobDescription,
           resumePath,
           submit: false,
-        }, { page, pattern, aiAvailable: true, harnessConfig: { userId: lease.userId, signal: lease.signal }, ...(reviewedSelector.kind === "selected" && input.stageObserver ? { reviewedPhaseObserver: observeAcquisitionPhase } : {}) })
+        }, { page, pattern, aiAvailable: true, harnessConfig: { userId: lease.userId, signal: lease.signal }, ...(start.reviewedMaterial && control.flow === "greenhouse" ? { reviewedCoverLetter: { content: start.reviewedMaterial.content } } : {}), ...(reviewedSelector.kind === "selected" && input.stageObserver ? { reviewedPhaseObserver: observeAcquisitionPhase } : {}) })
         observeAcquisitionPhase("fill_returned")
         if (lease.signal.aborted || result.classification === "cancelled") return cancelledOutcome()
         if (result.waitReason) return { kind: "wait" as const, detail: waitDetail(result.waitReason) }

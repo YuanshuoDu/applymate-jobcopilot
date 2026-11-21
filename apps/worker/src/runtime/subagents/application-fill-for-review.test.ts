@@ -258,6 +258,7 @@ describe("executeApplicationFillForReview", () => {
     })
     expect(JSON.stringify(fill)).not.toContain("attacker.test")
     expect(JSON.stringify(fill)).not.toContain("client-job")
+    expect(vi.mocked(executeBrowserFill).mock.calls[0]?.[1]).not.toHaveProperty("reviewedCoverLetter")
     expect(fillCustomQuestions).toHaveBeenCalledWith(browserPage, expect.objectContaining({ email: "db@example.test" }), [], { salary: "€80,000" })
     expect(vi.mocked(executeBrowserFill).mock.calls[0]?.[0]).not.toHaveProperty("confirmedAnswers")
     expect(JSON.stringify(vi.mocked(executeBrowserFill).mock.calls[0]?.[0])).not.toContain("€80,000")
@@ -292,6 +293,8 @@ describe("executeApplicationFillForReview", () => {
 
     expect(result).toMatchObject({ status: "completed", result: { status: "filled_for_user_review" } })
     expect(fill).toMatchObject({ submit: false, persona: { coverLetter: reviewedMaterial.content } })
+    expect(fill).not.toHaveProperty("reviewedCoverLetter")
+    expect(vi.mocked(executeBrowserFill).mock.calls[0]?.[1]).toMatchObject({ reviewedCoverLetter: { content: reviewedMaterial.content } })
     expect(browserPageMock.locator).toHaveBeenCalledWith("textarea#cover-letter")
     expect(browserPageMock.locator.mock.results[0]?.value.evaluate).toHaveBeenCalledWith(expect.any(Function), undefined, { timeout: 1000 })
     expect(JSON.stringify(queries.mock.calls)).not.toContain(reviewedMaterial.content)
