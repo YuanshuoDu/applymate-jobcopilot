@@ -66,7 +66,7 @@ function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0
 }
 
-function isCanonicalJobId(value: unknown): value is string {
+export function isCanonicalJobId(value: unknown): value is string {
   return typeof value === "string" && (CUID_V1.test(value) || UUID_V4.test(value))
 }
 

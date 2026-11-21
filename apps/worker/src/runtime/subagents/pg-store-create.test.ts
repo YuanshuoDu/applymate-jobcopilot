@@ -84,7 +84,7 @@ function authorizedCreateFixture(parent: Record<string, unknown>, childOverrides
 }
 
 describe("pg-store task creation helpers", () => {
-  it("allows only the exact owned objective Scout scope past the parent action subset check", async () => {
+  it("allows only exact owned objective child specs past the parent action subset check", async () => {
     const scope: GraphScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
       stepId: "step-1", turnLeaseOwner: "turn-owner", turnLeaseVersion: 2, parentLeaseOwner: "root-owner", parentAttemptCount: 1 }
     const actions = ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"]
@@ -101,31 +101,55 @@ describe("pg-store task creation helpers", () => {
       role: "scout", taskType: "job_discovery", goal: "Find roles", constraints: TASK_GRAPH_TEMPLATES.scout.constraints,
       successCriteria: ["Return matching jobs"], allowedActions: actions, context: {},
       expectedOutputSchema: TASK_GRAPH_TEMPLATES.scout.expectedOutputSchema, policy: normalizeSubagentPolicy() }
-    await createSubagentTask(fixture.client, task, true, { objectiveTaskGraphScoutAuthority: scope })
+    await createSubagentTask(fixture.client, task, true, { objectiveTaskGraphChildAuthority: scope })
     expect(fixture.insertValues).toHaveLength(1)
     expect(fixture.insertValues[0]?.[12]).toBe(JSON.stringify(actions))
 
     const legacyMode = authorizedCreateFixture(parent, {}, 0, [{ ...row, executionMode: null }])
-    await createSubagentTask(legacyMode.client, task, true, { objectiveTaskGraphScoutAuthority: scope })
+    await createSubagentTask(legacyMode.client, task, true, { objectiveTaskGraphChildAuthority: scope })
     const promotionIndex = legacyMode.calls.findIndex(sql => sql.startsWith('UPDATE "agent_turns" AS turn SET'))
     const insertIndex = legacyMode.calls.findIndex(sql => sql.startsWith('INSERT INTO "sub_agent_tasks"'))
     expect(promotionIndex).toBeGreaterThanOrEqual(0)
     expect(promotionIndex).toBeLessThan(insertIndex)
 
     const fake = authorizedCreateFixture(parent)
-    await expect(createSubagentTask(fake.client, task, true, { objectiveTaskGraphScoutAuthority: scope }))
+    await expect(createSubagentTask(fake.client, task, true, { objectiveTaskGraphChildAuthority: scope }))
       .rejects.toThrow("Child allowed actions exceed parent policy")
     expect(fake.insertValues).toHaveLength(0)
 
     const stale = authorizedCreateFixture(parent, {}, 0, [row])
-    await expect(createSubagentTask(stale.client, task, true, { objectiveTaskGraphScoutAuthority: { ...scope, stepId: "old-step" } }))
+    await expect(createSubagentTask(stale.client, task, true, { objectiveTaskGraphChildAuthority: { ...scope, stepId: "old-step" } }))
       .rejects.toThrow("Child allowed actions exceed parent policy")
     expect(stale.insertValues).toHaveLength(0)
 
     const altered = authorizedCreateFixture(parent, {}, 0, [row])
     await expect(createSubagentTask(altered.client, { ...task, allowedActions: [...actions, "applications.submit"] }, true,
-      { objectiveTaskGraphScoutAuthority: scope })).rejects.toThrow("Child allowed actions exceed parent policy")
+      { objectiveTaskGraphChildAuthority: scope })).rejects.toThrow("Child allowed actions exceed parent policy")
     expect(altered.insertValues).toHaveLength(0)
+
+    const analystActions = TASK_GRAPH_TEMPLATES.analyst.allowedActions
+    const analystTask = { ...task, role: "analyst", taskType: TASK_GRAPH_TEMPLATES.analyst.taskType,
+      constraints: TASK_GRAPH_TEMPLATES.analyst.constraints, allowedActions: analystActions,
+      expectedOutputSchema: TASK_GRAPH_TEMPLATES.analyst.expectedOutputSchema }
+    const analystChild = { role: "analyst", taskType: TASK_GRAPH_TEMPLATES.analyst.taskType, allowedActions: analystActions,
+      expectedOutputSchema: TASK_GRAPH_TEMPLATES.analyst.expectedOutputSchema }
+    const admittedAnalyst = authorizedCreateFixture(parent, analystChild, 0, [row])
+    await createSubagentTask(admittedAnalyst.client, analystTask, true, { objectiveTaskGraphChildAuthority: scope })
+    expect(admittedAnalyst.insertValues[0]?.[12]).toBe(JSON.stringify(analystActions))
+
+    const foreignAnalyst = authorizedCreateFixture(parent, analystChild, 0, [{ ...row, userId: "foreign-user" }])
+    await expect(createSubagentTask(foreignAnalyst.client, analystTask, true, { objectiveTaskGraphChildAuthority: scope }))
+      .rejects.toThrow("Child allowed actions exceed parent policy")
+    expect(foreignAnalyst.insertValues).toHaveLength(0)
+
+    const alteredAnalyst = authorizedCreateFixture(parent, analystChild, 0, [row])
+    await expect(createSubagentTask(alteredAnalyst.client, { ...analystTask, allowedActions: [...analystActions, "applications.submit"] }, true,
+      { objectiveTaskGraphChildAuthority: scope })).rejects.toThrow("Child allowed actions exceed parent policy")
+    expect(alteredAnalyst.insertValues).toHaveLength(0)
+
+    const noAuthority = authorizedCreateFixture(parent, analystChild, 0, [row])
+    await expect(createSubagentTask(noAuthority.client, analystTask, true)).rejects.toThrow("Child allowed actions exceed parent policy")
+    expect(noAuthority.insertValues).toHaveLength(0)
   })
 
   it("keeps the root bootstrap action union while rejecting unproven nested actions and context", async () => {
