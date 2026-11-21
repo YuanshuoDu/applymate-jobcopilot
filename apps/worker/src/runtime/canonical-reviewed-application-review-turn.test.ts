@@ -3,7 +3,6 @@ import type { Pool, PoolClient } from "pg"
 import type { RepositoryJsonValue, TenantScope } from "@jobcopilot/agent-protocol"
 import type { TurnExecutionOwnerFence } from "./execution-owner.js"
 import type { TurnEngineOptions, TurnEngineStore } from "./turns/turn-engine-types.js"
-import type { TurnEnginePool } from "./turns/turn-engine-owner-sql.js"
 import type { TurnEngineTerminalGuard } from "./turns/turn-engine-terminal-commit.js"
 import type { TurnLease } from "./turns/lease.js"
 import { runCanonicalReviewedApplicationReviewTurn } from "./canonical-reviewed-application-review-turn.js"
@@ -13,7 +12,7 @@ const USER = "user-review", SESSION = "session-review", TURN = "turn-review", RO
 const SOURCE = "source-turn", JOB = "job-review", APP = "application-review"
 const APPROVAL = `reviewed-application-review:${TURN}`, WAIT_ITEM = `agent-wait:approval:${APPROVAL}`
 const TOOL_CALL = `review_application:${TURN}`, ROOT_INPUT = "root-input-review"
-const ROOT_INPUT_SEQUENCE = 22n
+const ROOT_INPUT_SEQUENCE = 22n, TERMINAL_STEP = `reviewed-application-review:terminal:${TURN}`
 const RESOURCE = hash("a"), MATERIAL = hash("b"), ANSWERS = hash("c"), SCOPE = hash("d")
 const EXPIRES = new Date("2026-11-21T10:15:00.000Z")
 const lease: TurnLease = { turnId: TURN, sessionId: SESSION, ownerId: "worker-review", userId: USER, leaseVersion: 3,
@@ -97,6 +96,23 @@ describe("canonical reviewed application review Turn", () => {
     expect(f.store.recordFinalResponse).toHaveBeenCalledOnce()
   })
 
+  it("replays a claimed root input from its exact stable Step checkpoint", async () => {
+    const savedSequence = 31n, f = fixture({ issueStatus: "approved", inputStatus: "consumed",
+      consumedByStepId: TERMINAL_STEP, savedCheckpoint: { inputThroughSequence: savedSequence, consumedInputIds: [ROOT_INPUT] } })
+    await expect(runCanonicalReviewedApplicationReviewTurn(f.input)).resolves.toMatchObject({ status: "completed" })
+    expect(f.inputQuery).toHaveBeenCalledWith(expect.stringContaining('FROM "agent_steps"'), expect.any(Array))
+    expect(f.store.startStep).toHaveBeenCalledWith(expect.objectContaining({
+      stepId: TERMINAL_STEP, inputThroughSequence: savedSequence, consumedInputIds: [ROOT_INPUT],
+    }))
+    expect(f.contextBuild).toHaveBeenCalledWith(expect.objectContaining({ mode: "retry", rootInputId: ROOT_INPUT }))
+  })
+
+  it("rejects a root input consumed by another Step before opening its terminal Step", async () => {
+    const f = fixture({ issueStatus: "approved", inputStatus: "consumed", consumedByStepId: "other-step" })
+    await expect(runCanonicalReviewedApplicationReviewTurn(f.input)).rejects.toThrow("reviewed_application_root_input_unavailable")
+    expect(f.store.startStep).not.toHaveBeenCalled()
+  })
+
   it("rejects terminalization when resolved Wait evidence disagrees with the approval decision", async () => {
     const f = fixture({ issueStatus: "rejected", resolvedStatus: "approved" })
     await expect(runCanonicalReviewedApplicationReviewTurn(f.input)).rejects.toThrow("reviewed_application_decision_unverified")
@@ -112,6 +128,8 @@ describe("canonical reviewed application review Turn", () => {
 function fixture(options: {
   issueStatus?: "issued" | "waiting" | "approved" | "rejected" | "denied"
   approvalId?: string; sourceTurnId?: string; resolvedStatus?: "approved" | "rejected"
+  inputStatus?: "accepted" | "consumed"; consumedByStepId?: string | null
+  savedCheckpoint?: { inputThroughSequence: bigint; consumedInputIds: readonly string[] }
 } = {}) {
   const issueStatus = options.issueStatus ?? "approved", approvalId = options.approvalId ?? APPROVAL
   let terminalGuard: TurnEngineTerminalGuard | undefined
@@ -125,9 +143,12 @@ function fixture(options: {
   const inputQuery = vi.fn(async (sql: string) => ({ rows: sql.includes('FROM "agent_sessions"')
     ? [{ id: SESSION }]
     : sql.includes('FROM "agent_turns"') ? [{ id: TURN }]
+      : sql.includes('FROM "agent_steps"') ? [{ inputThroughSequence: options.savedCheckpoint?.inputThroughSequence ?? ROOT_INPUT_SEQUENCE,
+        consumedInputIds: options.savedCheckpoint?.consumedInputIds ?? [ROOT_INPUT] }]
       : sql.includes('FROM "agent_inputs"') ? [{ id: ROOT_INPUT, sessionId: SESSION, targetTurnId: TURN, userId: USER,
-        clientMessageId: "review-command", delivery: "follow_up", status: "accepted", content: [{ type: "text", text: "Review application materials" }], acceptedSequence: ROOT_INPUT_SEQUENCE,
-        consumedByStepId: null, consumedAt: null, createdAt: NOW }]
+        clientMessageId: "review-command", delivery: "follow_up", status: options.inputStatus ?? "accepted", content: [{ type: "text", text: "Review application materials" }], acceptedSequence: ROOT_INPUT_SEQUENCE,
+        consumedByStepId: options.inputStatus === "consumed" ? options.consumedByStepId ?? TERMINAL_STEP : null,
+        consumedAt: options.inputStatus === "consumed" ? NOW : null, createdAt: NOW }]
         : [], rowCount: 1 }))
   const pool = { connect: vi.fn(async () => ({ query: inputQuery, release: vi.fn() })) } as unknown as Pool
   const store: TurnEngineStore = {
@@ -145,7 +166,7 @@ function fixture(options: {
       return { status: "completed", finalItemId: input.terminal.finalItemId, events: [] }
     }),
   } as unknown as TurnEngineStore
-  const contextBuild = vi.fn(async () => ({ inputThroughSequence: ROOT_INPUT_SEQUENCE, consumedInputIds: [ROOT_INPUT] }))
+  const contextBuild = vi.fn(async () => ({ inputThroughSequence: options.savedCheckpoint?.inputThroughSequence ?? ROOT_INPUT_SEQUENCE, consumedInputIds: [ROOT_INPUT] }))
   const contextBuilder = { build: contextBuild } as unknown as TurnEngineOptions["contextBuilder"]
   const issue = vi.fn(async () => issueStatus === "denied" ? { status: "denied" as const } : {
     status: issueStatus, approvalId, waitItemId: `agent-wait:approval:${approvalId}`,
@@ -154,7 +175,7 @@ function fixture(options: {
     pool, lease, rootTaskId: ROOT, scope, intent, goal: "Record the review decision", snapshot,
     contextBuilder, modelProfileSnapshot: { profile: "deterministic" } satisfies RepositoryJsonValue,
     rootInputId: ROOT_INPUT, rootContextInputId: ROOT_INPUT, signal: new AbortController().signal, issue,
-    now: () => NOW, storeFactory: vi.fn((_pool: TurnEnginePool, guard?: TurnEngineTerminalGuard) => { terminalGuard = guard; return store }),
+    now: () => NOW, storeFactory: vi.fn((_pool: Pool, guard?: TurnEngineTerminalGuard) => { terminalGuard = guard; return store }),
   }
   return { input, issue, contextBuild, store, query, inputQuery, appendEvent: store.appendEvent as ReturnType<typeof vi.fn>, get recorded() { return recorded } }
 }

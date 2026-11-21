@@ -7,12 +7,10 @@ import { executionOwnerFence } from "./execution-owner.js"
 import type { TurnLease } from "./turns/lease.js"
 import { createPgTurnEngineStore } from "./turns/turn-engine-store.js"
 import type { TurnEngineOptions, TurnEngineResult, TurnEngineStore } from "./turns/turn-engine-types.js"
-import type { TurnEnginePool } from "./turns/turn-engine-owner-sql.js"
 import type { TurnEngineTerminalGuard } from "./turns/turn-engine-terminal-commit.js"
 import { toRepositoryJson } from "./turns/turn-engine-types.js"
 import { verifyCandidateFinal } from "./verifier.js"
 import { finalizeTurn, serializeFinalResponse } from "./finalizer.js"
-import type { TurnResumeState } from "./turns/turn-engine-types.js"
 
 type ReviewIntent = Extract<TurnIntent, { kind: "reviewed_application_review" }>
 type ReviewOwner = Extract<ReturnType<typeof executionOwnerFence>, { kind: "turn" }>
@@ -21,13 +19,13 @@ type IssueResult = Readonly<{ status: "issued" | "waiting" | "approved" | "rejec
 type IssueReview = (input: { pool: Pool; lease: TurnLease; rootTaskId: string; intent: ReviewIntent; now?: Date }) => Promise<IssueResult>
 type Decision = Readonly<{ status: "approved" | "rejected"; approvalId: string; waitItemId: string }>
 type RecordValue = Record<string, unknown>
-type StoreFactory = (pool: TurnEnginePool, guard?: TurnEngineTerminalGuard) => TurnEngineStore
+type StoreFactory = (pool: Pool, guard?: TurnEngineTerminalGuard) => TurnEngineStore
 
 export type CanonicalReviewedApplicationReviewTurnInput = Readonly<{
   pool: Pool; lease: TurnLease; rootTaskId: string; scope: TenantScope; intent: ReviewIntent; goal: string
   snapshot: TurnEngineOptions["snapshot"]; contextBuilder: TurnEngineOptions["contextBuilder"]
   modelProfileSnapshot: RepositoryJsonValue; rootInputId: string; rootContextInputId?: string
-  resume?: TurnResumeState; signal: AbortSignal; issue: IssueReview; now?: () => Date
+  signal: AbortSignal; issue: IssueReview; now?: () => Date
   storeFactory?: StoreFactory
 }>
 
@@ -63,18 +61,19 @@ export async function runCanonicalReviewedApplicationReviewTurn(input: Canonical
   if (input.signal.aborted) return { status: "interrupted", stepCount: 0, toolCallCount: 0, errorCode: "turn_cancelled" }
   decision = { status: result.status, approvalId: result.approvalId, waitItemId: result.waitItemId }
 
-  const inputThroughSequence = await rootInputSequence(input, owner, stepIdFor(owner.turnId), now())
+  const rootCheckpoint = await rootInputCheckpoint(input, owner, stepIdFor(owner.turnId), now())
   if (input.signal.aborted) return { status: "interrupted", stepCount: 0, toolCallCount: 0, errorCode: "turn_cancelled" }
   const stepId = `${STEP_PREFIX}${owner.turnId}`, step = await store.startStep({ owner, stepId, ordinal: 0, attempt: 1,
-    inputThroughSequence, consumedInputIds: [], modelProfileSnapshot: toRepositoryJson(input.modelProfileSnapshot), now: now() })
+    inputThroughSequence: rootCheckpoint.inputThroughSequence, consumedInputIds: rootCheckpoint.consumedInputIds,
+    modelProfileSnapshot: toRepositoryJson(input.modelProfileSnapshot), now: now() })
   const stepStarted = await store.appendEvent({ owner, id: eventId(owner.turnId, `step-started:${step.id}`), itemId: null,
     type: "step.started", correlationId: step.id, causationId: start.id, idempotencyKey: `turn:${owner.turnId}:event:step-started:${step.id}`,
     payload: { stepId: step.id, ordinal: step.ordinal, taskId: owner.taskId } })
   const context = await input.contextBuilder.build({ scope: input.scope, sessionId: owner.sessionId, turnId: owner.turnId, stepId: step.id,
     snapshot: input.snapshot, ...(input.rootInputId ? { rootInputId: input.rootInputId } : {}),
     ...(input.rootContextInputId ? { rootContextInputId: input.rootContextInputId } : {}), taskId: owner.taskId,
-    mode: input.rootInputId ? "new" : "retry", lease: { ownerId: owner.ownerId, leaseVersion: owner.leaseVersion, now: now() }, now: now() })
-  if (!context.consumedInputIds.includes(input.rootInputId) || context.inputThroughSequence < inputThroughSequence) throw new Error("reviewed_application_root_input_unclaimed")
+    mode: rootCheckpoint.mode, lease: { ownerId: owner.ownerId, leaseVersion: owner.leaseVersion, now: now() }, now: now() })
+  if (!context.consumedInputIds.includes(input.rootInputId) || context.inputThroughSequence < rootCheckpoint.inputThroughSequence) throw new Error("reviewed_application_root_input_unclaimed")
   const stepCount = step.ordinal + 1, toolCallCount = 0
   const message = decision.status === "approved"
     ? "The user approved the reviewed application materials for a later form fill."
@@ -98,15 +97,25 @@ export async function runCanonicalReviewedApplicationReviewTurn(input: Canonical
   return { status: "completed", finalItemId, finalText: message, stepCount, toolCallCount }
 }
 
-async function rootInputSequence(input: CanonicalReviewedApplicationReviewTurnInput, owner: ReviewOwner, stepId: string, now: Date): Promise<bigint> {
-  const found = await createPgInputClaimStore(input.pool, input.scope).withTransaction(transaction => transaction.loadRootInputContext?.({
-    sessionId: owner.sessionId, turnId: owner.turnId, inputId: input.rootInputId,
-    lease: { ownerId: owner.ownerId, leaseVersion: owner.leaseVersion, now },
-  }) ?? Promise.resolve(null))
-  if (!found || found.id !== input.rootInputId || found.userId !== owner.userId || found.sessionId !== owner.sessionId
-    || found.targetTurnId !== owner.turnId || found.delivery !== "follow_up"
-    || (found.status === "consumed" && found.consumedByStepId !== stepId)) throw new Error("reviewed_application_root_input_unavailable")
-  return found.acceptedSequence
+async function rootInputCheckpoint(input: CanonicalReviewedApplicationReviewTurnInput, owner: ReviewOwner, stepId: string, now: Date) {
+  return createPgInputClaimStore(input.pool, input.scope).withTransaction(async transaction => {
+    const lease = { ownerId: owner.ownerId, leaseVersion: owner.leaseVersion, now }
+    const found = await transaction.loadRootInputContext?.({ sessionId: owner.sessionId, turnId: owner.turnId, inputId: input.rootInputId, lease })
+    if (!found || found.id !== input.rootInputId || found.userId !== owner.userId || found.sessionId !== owner.sessionId
+      || found.targetTurnId !== owner.turnId || found.delivery !== "follow_up") throw new Error("reviewed_application_root_input_unavailable")
+    if (found.status !== "consumed") {
+      if ((found.status !== "accepted" && found.status !== "queued") || found.consumedByStepId !== null || found.consumedAt !== null) {
+        throw new Error("reviewed_application_root_input_unavailable")
+      }
+      return { inputThroughSequence: found.acceptedSequence, consumedInputIds: [] as readonly string[], mode: "new" as const }
+    }
+    if (found.consumedByStepId !== stepId || found.consumedAt === null) throw new Error("reviewed_application_root_input_unavailable")
+    const checkpoint = await transaction.getCheckpoint({ sessionId: owner.sessionId, turnId: owner.turnId, stepId, lease })
+    if (checkpoint.inputThroughSequence < found.acceptedSequence || !checkpoint.consumedInputIds.includes(input.rootInputId)) {
+      throw new Error("reviewed_application_root_checkpoint_invalid")
+    }
+    return { ...checkpoint, mode: "retry" as const }
+  })
 }
 function stepIdFor(turnId: string): string { return `${STEP_PREFIX}${turnId}` }
 
