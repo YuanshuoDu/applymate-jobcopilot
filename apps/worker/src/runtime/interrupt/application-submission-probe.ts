@@ -198,6 +198,8 @@ export function startApplicationSubmissionStopProbe(options: {
   onUnavailable(error: unknown): void
   onStopped(): void
   intervalMs?: number
+  /** Trusted in-process test composition only; ordinary queue calls keep the legacy check. */
+  stopCheck?: (pool: Pool, scope: ApplicationSubmissionStartScope) => Promise<boolean>
 }): ApplicationSubmissionStopProbe {
   let closed = false
   let observedStop = false
@@ -206,7 +208,7 @@ export function startApplicationSubmissionStopProbe(options: {
   const pollNow = async (): Promise<void> => {
     if (closed || observedStop || unavailable) return
     if (inFlight) return inFlight
-    const current = isApplicationSubmissionStopped(options.pool, options.scope)
+    const current = (options.stopCheck ?? isApplicationSubmissionStopped)(options.pool, options.scope)
       .then(async stopped => {
         if (!stopped || closed || observedStop) return
         observedStop = true

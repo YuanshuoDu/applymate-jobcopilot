@@ -13,7 +13,7 @@ vi.mock("../runtime/approval/pg-store.js", () => ({
 }))
 vi.mock("./submission-guard.js", () => ({ withExactSubmissionClientWrite: mocks.withFence }))
 
-import { recordApplicationSubmissionStopStage } from "./application-submission-stop-state.js"
+import { inspectApplicationSubmissionStopState, recordApplicationSubmissionStopStage } from "./application-submission-stop-state.js"
 import { markSubmissionRequestStarted, type ApplicationSubmissionStartScope } from "./application-task-state.js"
 
 const scope: ApplicationSubmissionStartScope = {
@@ -103,6 +103,18 @@ describe("Worker application submission Stop storage", () => {
     const test = harness({ events: [stageRow("armed"), stageRow("stop_requested")] })
     await expect(recordApplicationSubmissionStopStage(test.pool, test.client, scope, "dispatch_granted")).resolves.toBe("stopped")
     expect(test.events).toHaveLength(2)
+  })
+
+  it("inspects exact committed stages without creating or acknowledging a grant", async () => {
+    for (const [stages, expected] of [
+      [[], "missing"], [["armed"], "armed"], [["armed", "dispatch_granted"], "granted"],
+      [["armed", "stop_requested"], "stopped"], [["armed", "dispatch_granted", "stop_requested"], "fenced"],
+    ] as const) {
+      const test = harness({ events: stages.map(stage => stageRow(stage)) })
+      await expect(inspectApplicationSubmissionStopState(test.pool, test.client, scope)).resolves.toBe(expected)
+      expect(test.events).toHaveLength(stages.length)
+      expect(test.calls.some(call => call.sql.includes('INSERT INTO "application_task_events"'))).toBe(false)
+    }
   })
 
   it("matches the start event ID and closed data keys written by application-task-state", async () => {

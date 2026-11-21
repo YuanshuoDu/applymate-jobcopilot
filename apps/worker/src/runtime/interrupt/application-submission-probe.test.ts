@@ -195,6 +195,28 @@ describe("application submission Stop probe", () => {
     await expect(isApplicationSubmissionStopped(pool, scope)).resolves.toBe(true);
   });
 
+  it("keeps completed Turns denied by default", async () => {
+    const { pool } = fakePool("completed");
+    await expect(isApplicationSubmissionStopped(pool, scope)).resolves.toBe(true);
+  });
+
+  it("uses a trusted protocol Stop check only when explicitly composed", async () => {
+    vi.useFakeTimers();
+    const { pool } = fakePool("completed");
+    const controller = new AbortController();
+    const stopCheck = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const probe = startApplicationSubmissionStopProbe({
+      pool, scope, stopCheck, closePage: vi.fn().mockResolvedValue(undefined), controller,
+      hasSubmissionStarted: () => false, onStopped: vi.fn(), onUnavailable: vi.fn(), intervalMs: 100_000,
+    });
+    await probe.pollNow();
+    expect(controller.signal.aborted).toBe(false);
+    await probe.pollNow();
+    probe.stop();
+    expect(controller.signal.aborted).toBe(true);
+    expect(stopCheck).toHaveBeenCalledTimes(2);
+  });
+
   it("aborts the active browser best effort after observing Stop", async () => {
     vi.useFakeTimers();
     const { pool } = fakePool("interrupted");
