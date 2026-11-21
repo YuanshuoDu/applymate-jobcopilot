@@ -2,16 +2,21 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { TaskGraphObjectiveLineageNode } from "../planning/task-graph-objective-lineage.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
 import type { TaskGraphScheduleInput } from "./task-graph-command-port.js"
+import type { PreparedSteeringReconciliation } from "./steering-reconciliation-contract.js"
 import { loadTaskGraph } from "./task-graph-pg-state.js"
 import { readTaskGraphConfirmedLocationSteer } from "./task-graph-confirmed-location-steer.js"
 import { resolveTaskGraphCurrentLocationEvidence, type TaskGraphCurrentLocationEvidenceResult } from "./task-graph-current-location-evidence.js"
 import { readSteeringReconciliationState } from "./steering-reconciliation-read.js"
 import { buildTaskGraphLocationCoverageNodes, canRetainCompatiblePriorScouts, evaluateTaskGraphPlanObjectiveCoverage } from "./task-graph-plan-objective-coverage.js"
+import { classifyPendingSupersededScouts } from "./task-graph-pending-scout-scope.js"
+
+const { pendingScope } = vi.hoisted(() => ({ pendingScope: vi.fn() }))
 
 vi.mock("./task-graph-pg-state.js", () => ({ loadTaskGraph: vi.fn() }))
 vi.mock("./task-graph-confirmed-location-steer.js", () => ({ readTaskGraphConfirmedLocationSteer: vi.fn() }))
 vi.mock("./task-graph-current-location-evidence.js", () => ({ resolveTaskGraphCurrentLocationEvidence: vi.fn() }))
 vi.mock("./steering-reconciliation-read.js", () => ({ readSteeringReconciliationState: vi.fn() }))
+vi.mock("./task-graph-pending-scout-scope.js", () => ({ classifyPendingSupersededScouts: pendingScope }))
 
 const client = { query: vi.fn() } as never
 const scope = {
@@ -25,6 +30,12 @@ const scout = (key: string, dependsOn: readonly string[] = []): TaskGraphObjecti
   key, templateId: "scout", dependsOn, verification: {
     schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
     criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+  },
+})
+const locationScout = (key: string, locations: readonly string[]): TaskGraphObjectiveLineageNode => ({
+  key, templateId: "scout", dependsOn: [], verificationDisposition: "typed", verification: {
+    schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+    criteria: [{ id: "candidate-location", check: { kind: "candidate_location_in", locations } }],
   },
 })
 const analyst = (key: string, dependsOn: readonly string[] = []): TaskGraphObjectiveLineageNode => ({ key, templateId: "analyst", dependsOn })
@@ -51,6 +62,7 @@ beforeEach(() => {
   vi.mocked(readTaskGraphConfirmedLocationSteer).mockResolvedValue({ kind: "absent" })
   vi.mocked(loadTaskGraph).mockResolvedValue({} as never)
   vi.mocked(resolveTaskGraphCurrentLocationEvidence).mockResolvedValue({ status: "unavailable" })
+  pendingScope.mockReturnValue({ status: "unavailable" })
 })
 
 describe("TaskGraph plan objective coverage", () => {
@@ -116,6 +128,43 @@ describe("TaskGraph plan objective coverage", () => {
       criteria: [{ id: "candidate-count" }, { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["dublin"] } }],
     })
     expect(prior.verification?.criteria).toHaveLength(1)
+  })
+
+  it("filters an admitted running Scout only from plan coverage and keeps its key out of history", async () => {
+    const nodes = [locationScout("old-scout", ["berlin"]), locationScout("new-scout", ["dublin"])]
+    vi.mocked(readTaskGraphConfirmedLocationSteer).mockResolvedValue(confirmed)
+    vi.mocked(readSteeringReconciliationState).mockResolvedValue({
+      ...reconciliationState, unresolvedInputs: [{ id: "input-1", acceptedSequence: 100n, status: "consumed",
+        consumedByStepId: scope.stepId, consumingOrdinal: 1 }],
+    })
+    pendingScope.mockReturnValue({ status: "available", pendingNodeKeys: new Set(["old-scout"]) })
+    vi.mocked(resolveTaskGraphCurrentLocationEvidence).mockResolvedValue(available([], []))
+
+    await expect(evaluateTaskGraphPlanObjectiveCoverage({ client, input: input({ status: "absent" }), nodes, provenance,
+      prepared: { decision: "revise" } as PreparedSteeringReconciliation })).resolves.toEqual({ status: "covered" })
+
+    expect(classifyPendingSupersededScouts).toHaveBeenCalledWith(expect.objectContaining({
+      expectedRevision: 1, confirmed, reconciliation: expect.objectContaining({ unresolvedInputs: expect.any(Array) }), nodes,
+    }))
+    expect(vi.mocked(resolveTaskGraphCurrentLocationEvidence).mock.calls[0]?.[0].pendingSupersededNodeKeys)
+      .toEqual(new Set(["old-scout"]))
+    expect(available([], []).excludedHistoricalNodeKeys).toEqual(new Set())
+  })
+
+  it("keeps verified completed-Scout reuse when the pending partition is unavailable", async () => {
+    const nodes = [locationScout("completed-scout", ["berlin"])]
+    vi.mocked(readTaskGraphConfirmedLocationSteer).mockResolvedValue(confirmed)
+    vi.mocked(readSteeringReconciliationState).mockResolvedValue({
+      ...reconciliationState, lastReconciledInputThroughSequence: 90n,
+      unresolvedInputs: [{ id: "input-1", acceptedSequence: 100n, status: "consumed",
+        consumedByStepId: scope.stepId, consumingOrdinal: 1 }],
+    })
+    pendingScope.mockReturnValue({ status: "unavailable" })
+    vi.mocked(resolveTaskGraphCurrentLocationEvidence).mockResolvedValue(available(["completed-scout"], []))
+
+    await expect(evaluateTaskGraphPlanObjectiveCoverage({ client, input: input({ status: "absent" }), nodes, provenance,
+      prepared: { decision: "revise" } as PreparedSteeringReconciliation })).resolves.toEqual({ status: "covered" })
+    expect(vi.mocked(resolveTaskGraphCurrentLocationEvidence).mock.calls[0]?.[0].pendingSupersededNodeKeys).toEqual(new Set())
   })
 
   it("rechecks a pending typed steer against the exact current Step cursor", async () => {

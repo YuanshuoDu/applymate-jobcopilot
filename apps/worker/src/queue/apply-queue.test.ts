@@ -12,6 +12,7 @@ const mockWithCloakContext = vi.fn();
 const mockIsUserActive = vi.fn().mockResolvedValue(true);
 const mockSubmitContext = vi.fn();
 const mockMarkSubmissionRequestStarted = vi.fn().mockResolvedValue("started");
+const mockMarkSubmitted = vi.fn();
 const mockClaimUnattendedSubmission = vi.fn().mockResolvedValue("claimed");
 const mockReleaseUncertainSubmission = vi.fn().mockResolvedValue({ kind: "current", value: true });
 const mockUpdateJobForSubmission = vi.fn().mockResolvedValue({ kind: "current", value: true });
@@ -1089,7 +1090,105 @@ describe("apply-queue (unit — mocked)", () => {
     }));
   });
 
-  it("keeps a continuation error in the started and uncertain state", async () => {
+  it("holds the exact submission fence until the route continuation is acknowledged", async () => {
+    let resolveContinuation!: () => void;
+    const continuationGate = new Promise<void>((resolve) => { resolveContinuation = resolve; });
+    let signalContinuationStarted!: () => void;
+    const continuationStarted = new Promise<void>((resolve) => { signalContinuationStarted = resolve; });
+    let continuationStartedFlag = false;
+    let continuationAcknowledged = false;
+    let releasedBeforeAcknowledgement = false;
+    let releasesWhenContinuationStarted = 0;
+    const baseQuery = mockTurnClient.query.getMockImplementation();
+    const intervalSpy = vi.spyOn(globalThis, "setInterval").mockReturnValue({ unref: vi.fn() } as unknown as ReturnType<typeof setInterval>);
+    mockTurnClient.query.mockImplementation(async (sql: string) => {
+      if (continuationStartedFlag && !continuationAcknowledged && (sql === "COMMIT" || sql === "ROLLBACK")) releasedBeforeAcknowledgement = true;
+      return baseQuery!(sql);
+    });
+    mockProviderSubmitClick.mockImplementationOnce(() => {
+      continuationStartedFlag = true;
+      releasesWhenContinuationStarted = mockTurnClient.release.mock.calls.length;
+      signalContinuationStarted();
+    });
+    submitToolMocks.create.mockImplementation(({ submit }: { submit: (input: unknown) => Promise<unknown> }) => ({
+      execute: async () => {
+        try {
+          await submit({ target: {}, artifact: {}, context: {}, beforeSubmit: async () => true });
+          mockMarkSubmitted();
+          return { status: "submitted", confirmationId: "application:application-task-1", postSubmitUrl: null, errorCode: null, output: null };
+        } catch (error: unknown) {
+          const errorCode = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "browser_failed";
+          return { status: errorCode === "browser_manual" ? "manual" : "failed", confirmationId: null, postSubmitUrl: null, errorCode, output: null };
+        }
+      },
+    }));
+    let routeDispatch: Promise<MockPageRouteResult | null> | null = null;
+    mockHarnessRun.mockImplementation(async (_page: unknown, task: { beforeSubmit?: (intent?: { url: string; method: string }) => Promise<boolean> }) => {
+      const intent = { url: "https://example.com/jobs/123/apply", method: "POST" };
+      if (!await task.beforeSubmit?.(intent)) return { status: "submission_blocked", error: "Submission guard denied.", durationMs: 123 };
+      routeDispatch = dispatchPageRequest(intent.url, intent.method, { continueGate: continuationGate });
+      void routeDispatch.catch(() => undefined);
+      await continuationStarted;
+      return { status: "submitted", error: null, durationMs: 123 };
+    });
+
+    let processor: Promise<unknown> | null = null;
+    try {
+      vi.stubEnv("APPLY_TIMEOUT_MS", "30000");
+      vi.resetModules();
+      await import("./apply-queue.js");
+      processor = Promise.resolve(mockProcessor({
+        data: {
+          applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1", sessionId: "agent-session-1", fillTurnId: "agent-turn-1",
+          applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+          receiptId: "approval-1", constraintHash: "c".repeat(64),
+        },
+      }));
+      await continuationStarted;
+      intervalSpy.mockRestore();
+
+      expect(mockTurnClient.release).toHaveBeenCalledTimes(releasesWhenContinuationStarted);
+      expect(releasedBeforeAcknowledgement).toBe(false);
+      continuationAcknowledged = true;
+      resolveContinuation();
+      await processor;
+      await routeDispatch;
+
+      expect(releasedBeforeAcknowledgement).toBe(false);
+      expect(mockTurnClient.release).toHaveBeenCalledTimes(releasesWhenContinuationStarted + 1);
+      expect(mockMarkSubmitted).toHaveBeenCalledOnce();
+      expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "submitted" }));
+    } finally {
+      continuationAcknowledged = true;
+      resolveContinuation();
+      if (processor) await processor.catch(() => undefined);
+      if (baseQuery) mockTurnClient.query.mockImplementation(baseQuery);
+      intervalSpy.mockRestore();
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+  }, 15_000);
+
+  it("keeps a deferred continuation rejection in the started and uncertain state", async () => {
+    let rejectContinuation!: (error: Error) => void;
+    const continuationGate = new Promise<void>((_resolve, reject) => { rejectContinuation = reject; });
+    let signalContinuationStarted!: () => void;
+    const continuationStarted = new Promise<void>((resolve) => { signalContinuationStarted = resolve; });
+    let continuationStartedFlag = false;
+    let acknowledgementRejected = false;
+    let releasedBeforeAcknowledgement = false;
+    let releasesWhenContinuationStarted = 0;
+    const baseQuery = mockTurnClient.query.getMockImplementation();
+    const intervalSpy = vi.spyOn(globalThis, "setInterval").mockReturnValue({ unref: vi.fn() } as unknown as ReturnType<typeof setInterval>);
+    mockTurnClient.query.mockImplementation(async (sql: string) => {
+      if (continuationStartedFlag && !acknowledgementRejected && (sql === "COMMIT" || sql === "ROLLBACK")) releasedBeforeAcknowledgement = true;
+      return baseQuery!(sql);
+    });
+    mockProviderSubmitClick.mockImplementationOnce(() => {
+      continuationStartedFlag = true;
+      releasesWhenContinuationStarted = mockTurnClient.release.mock.calls.length;
+      signalContinuationStarted();
+    });
     submitToolMocks.create.mockImplementation(({ submit }: { submit: (input: unknown) => Promise<unknown> }) => ({
       execute: async () => {
         try {
@@ -1104,29 +1203,158 @@ describe("apply-queue (unit — mocked)", () => {
       const intent = { url: "https://example.com/jobs/123/apply", method: "POST" };
       const allowed = task.beforeSubmit ? await task.beforeSubmit(intent) : false;
       if (!allowed) return { status: "submission_blocked", error: "Submission guard denied.", durationMs: 123 };
-      const route = await dispatchPageRequest(intent.url, intent.method, { continueError: new Error("browser route closed") });
+      const route = await dispatchPageRequest(intent.url, intent.method, { continueGate: continuationGate });
       expect(route?.continue).toHaveBeenCalledOnce();
       return { status: "failed", error: "The route continuation failed.", durationMs: 123 };
     });
 
-    await import("./apply-queue.js");
-    await mockProcessor({
-      data: {
-        applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1", sessionId: "agent-session-1", fillTurnId: "agent-turn-1",
-        applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
-        receiptId: "approval-1", constraintHash: "c".repeat(64),
+    let processor: Promise<unknown> | null = null;
+    try {
+      await import("./apply-queue.js");
+      processor = Promise.resolve(mockProcessor({
+        data: {
+          applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1", sessionId: "agent-session-1", fillTurnId: "agent-turn-1",
+          applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+          receiptId: "approval-1", constraintHash: "c".repeat(64),
+        },
+      }));
+      await continuationStarted;
+      intervalSpy.mockRestore();
+      expect(mockTurnClient.release).toHaveBeenCalledTimes(releasesWhenContinuationStarted);
+      expect(releasedBeforeAcknowledgement).toBe(false);
+
+      acknowledgementRejected = true;
+      rejectContinuation(new Error("browser route closed"));
+      await processor;
+
+      expect(mockMarkSubmissionRequestStarted).toHaveBeenCalledOnce();
+      expect(mockProviderSubmitClick).toHaveBeenCalledOnce();
+      expect(mockTurnClient.release).toHaveBeenCalledTimes(releasesWhenContinuationStarted + 1);
+      expect(mockTurnClient.query).toHaveBeenCalledWith("COMMIT");
+      expect(mockTurnClient.query).not.toHaveBeenCalledWith("ROLLBACK");
+      expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({
+        status: "manual",
+        error: expect.stringContaining("started"),
+      }));
+      expect(mockFinishApplicationTask.mock.calls.filter(([, , status, checkpoint]) =>
+        status === "waiting_for_user" && checkpoint === "submission_uncertain",
+      )).toHaveLength(1);
+    } finally {
+      acknowledgementRejected = true;
+      rejectContinuation(new Error("test cleanup"));
+      if (processor) await processor.catch(() => undefined);
+      if (baseQuery) mockTurnClient.query.mockImplementation(baseQuery);
+      intervalSpy.mockRestore();
+      vi.resetModules();
+    }
+  }, 15_000);
+
+  it("starts context shutdown before releasing an acknowledgement timeout and keeps late success uncertain", async () => {
+    let resolveContinuation!: () => void;
+    const continuationGate = new Promise<void>((resolve) => { resolveContinuation = resolve; });
+    let resolveContextClose!: () => void;
+    let signalContinuationStarted!: () => void;
+    let signalContextCloseStarted!: () => void;
+    let signalFenceReleased!: () => void;
+    let signalUncertainWritten!: () => void;
+    const continuationStarted = new Promise<void>((resolve) => { signalContinuationStarted = resolve; });
+    const contextCloseStarted = new Promise<void>((resolve) => { signalContextCloseStarted = resolve; });
+    const fenceReleased = new Promise<void>((resolve) => { signalFenceReleased = resolve; });
+    const uncertainWritten = new Promise<void>((resolve) => { signalUncertainWritten = resolve; });
+    const contextCloseGate = new Promise<void>((resolve) => { resolveContextClose = resolve; });
+    const events: string[] = [];
+    let routeDispatch: Promise<MockPageRouteResult | null> | null = null;
+    vi.useFakeTimers();
+    const intervalSpy = vi.spyOn(globalThis, "setInterval").mockReturnValue({ unref: vi.fn() } as unknown as ReturnType<typeof setInterval>);
+    let releasesWhenContinuationStarted = 0;
+    let continuationStartedFlag = false;
+    mockTurnClient.release.mockImplementation(() => {
+      if (continuationStartedFlag && mockTurnClient.release.mock.calls.length === releasesWhenContinuationStarted + 1) {
+        events.push("fence-release");
+        signalFenceReleased();
+      }
+    });
+    mockContext.close.mockImplementationOnce(async () => {
+      events.push("context-close-start");
+      signalContextCloseStarted();
+      await contextCloseGate;
+      resolveContinuation();
+    });
+    mockFinishApplicationTask.mockImplementation(async (_pool: unknown, _taskId: string, _status: string, checkpoint: string) => {
+      if (checkpoint === "submission_uncertain") {
+        events.push("uncertain-write");
+        signalUncertainWritten();
+      }
+      return undefined;
+    });
+    mockProviderSubmitClick.mockImplementationOnce(() => {
+      releasesWhenContinuationStarted = mockTurnClient.release.mock.calls.length;
+      continuationStartedFlag = true;
+      signalContinuationStarted();
+    });
+    submitToolMocks.create.mockImplementation(({ submit }: { submit: (input: unknown) => Promise<unknown> }) => ({
+      execute: async () => {
+        try {
+          await submit({ target: {}, artifact: {}, context: {}, beforeSubmit: async () => true });
+          mockMarkSubmitted();
+          return { status: "submitted", confirmationId: "application:application-task-1", postSubmitUrl: null, errorCode: null, output: null };
+        } catch (error: unknown) {
+          const errorCode = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "browser_failed";
+          return { status: errorCode === "browser_manual" ? "manual" : "failed", confirmationId: null, postSubmitUrl: null, errorCode, output: null };
+        }
       },
+    }));
+    mockHarnessRun.mockImplementation(async (_page: unknown, task: { beforeSubmit?: (intent?: { url: string; method: string }) => Promise<boolean> }) => {
+      const intent = { url: "https://example.com/jobs/123/apply", method: "POST" };
+      if (!await task.beforeSubmit?.(intent)) return { status: "submission_blocked", error: "Submission guard denied.", durationMs: 123 };
+      routeDispatch = dispatchPageRequest(intent.url, intent.method, { continueGate: continuationGate });
+      void routeDispatch.catch(() => undefined);
+      await continuationStarted;
+      return { status: "submitted", error: null, durationMs: 123 };
     });
 
-    expect(mockMarkSubmissionRequestStarted).toHaveBeenCalledOnce();
-    expect(mockProviderSubmitClick).toHaveBeenCalledOnce();
-    expect(mockTurnClient.query).toHaveBeenCalledWith("COMMIT");
-    expect(mockTurnClient.query).not.toHaveBeenCalledWith("ROLLBACK");
-    expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({
-      status: "manual",
-      error: expect.stringContaining("started"),
-    }));
-  });
+    let processor: Promise<unknown> | null = null;
+    try {
+      vi.stubEnv("APPLY_TIMEOUT_MS", "30000");
+      vi.resetModules();
+      await import("./apply-queue.js");
+      processor = Promise.resolve(mockProcessor({
+        data: {
+          applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1", sessionId: "agent-session-1", fillTurnId: "agent-turn-1",
+          applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+          receiptId: "approval-1", constraintHash: "c".repeat(64),
+        },
+      }));
+      await continuationStarted;
+      expect(mockTurnClient.release).toHaveBeenCalledTimes(releasesWhenContinuationStarted);
+      expect(mockMarkSubmitted).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(8_000);
+      await Promise.all([contextCloseStarted, fenceReleased, uncertainWritten]);
+      expect(events.indexOf("context-close-start")).toBeLessThan(events.indexOf("fence-release"));
+      expect(events.indexOf("fence-release")).toBeLessThan(events.indexOf("uncertain-write"));
+      expect(mockTurnClient.release).toHaveBeenCalledTimes(releasesWhenContinuationStarted + 1);
+      expect(mockInsertApplyResult).not.toHaveBeenCalled();
+
+      resolveContextClose();
+      await processor;
+      await routeDispatch;
+      expect(mockMarkSubmitted).not.toHaveBeenCalled();
+      expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "manual" }));
+      expect(mockFinishApplicationTask.mock.calls.filter(([, , status, checkpoint]) =>
+        status === "waiting_for_user" && checkpoint === "submission_uncertain",
+      )).toHaveLength(1);
+      expect(mockTurnClient.release).toHaveBeenCalledTimes(releasesWhenContinuationStarted + 1);
+    } finally {
+      resolveContextClose();
+      resolveContinuation();
+      if (processor) await processor.catch(() => undefined);
+      intervalSpy.mockRestore();
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+  }, 15_000);
 
   it("preserves the committed start marker when the lock-holder COMMIT fails after continuation", async () => {
     const task = { status: "filling", checkpoint: "browser_active" };
@@ -1402,7 +1630,7 @@ describe("apply-queue (unit — mocked)", () => {
     expect(mockInsertApplyResult).not.toHaveBeenCalled();
   });
 
-  it("keeps the timed-out submit attempt active until context closure settles its route", async () => {
+  it("releases the timed-out route fence once while context closure remains pending", async () => {
     let resolveContinuationAttempted!: () => void;
     const continuationAttempted = new Promise<void>((resolve) => { resolveContinuationAttempted = resolve; });
     let resolveContinuation!: () => void;
@@ -1411,17 +1639,21 @@ describe("apply-queue (unit — mocked)", () => {
     let signalContextCloseStarted!: () => void;
     const contextCloseGate = new Promise<void>((resolve) => { resolveContextClose = resolve; });
     const contextCloseStarted = new Promise<void>((resolve) => { signalContextCloseStarted = resolve; });
-    let commitsBeforeRequest = 0;
+    let releasesWhenContinuationStarted = 0;
     let duplicateRequestWasAborted = false;
     let processorSettled = false;
     let finalGateResult: boolean | null = null;
     let firstRoute: MockPageRouteResult | null = null;
+    const intervalSpy = vi.spyOn(globalThis, "setInterval").mockReturnValue({ unref: vi.fn() } as unknown as ReturnType<typeof setInterval>);
     mockContext.close.mockImplementationOnce(async () => {
       signalContextCloseStarted();
       await contextCloseGate;
       resolveContinuation();
     });
-    mockProviderSubmitClick.mockImplementationOnce(() => resolveContinuationAttempted());
+    mockProviderSubmitClick.mockImplementationOnce(() => {
+      releasesWhenContinuationStarted = mockTurnClient.release.mock.calls.length;
+      resolveContinuationAttempted();
+    });
     submitToolMocks.create.mockImplementation(({ submit }: { submit: (input: unknown) => Promise<unknown> }) => ({
       execute: async () => submit({ target: {}, artifact: {}, context: {}, beforeSubmit: async () => true }),
     }));
@@ -1430,7 +1662,6 @@ describe("apply-queue (unit — mocked)", () => {
       finalGateResult = task.beforeSubmit ? await task.beforeSubmit(intent) : false;
       if (!finalGateResult) return { status: "submission_blocked", error: "Submission guard denied.", durationMs: 123 };
 
-      commitsBeforeRequest = mockTurnClient.query.mock.calls.filter(([sql]) => sql === "COMMIT").length;
       await dispatchPageRequest(intent.url, intent.method, { continueGate: continuationGate, onRouteCreated: (route) => { firstRoute = route; } });
       if (!firstRoute?.continue.mock.calls.length) return { status: "failed", error: "The exact request route was not continued.", durationMs: 123 };
       return { status: "submitted", error: null, durationMs: 123 };
@@ -1448,22 +1679,18 @@ describe("apply-queue (unit — mocked)", () => {
         },
       })).then(() => { processorSettled = true; });
 
-      await vi.waitFor(() => expect(mockProviderSubmitClick).toHaveBeenCalledOnce(), { timeout: 4_000 });
       await continuationAttempted;
-      await vi.waitFor(() => {
-        const commitCount = mockTurnClient.query.mock.calls.filter(([sql]) => sql === "COMMIT").length;
-        expect(commitCount).toBeGreaterThan(commitsBeforeRequest);
-      }, { timeout: 2_000 });
+      intervalSpy.mockRestore();
+      expect(mockTurnClient.release).toHaveBeenCalledTimes(releasesWhenContinuationStarted);
       await vi.waitFor(() => expect(mockFinishApplicationTask).toHaveBeenCalledWith(
         expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.stringContaining("Apply timeout"), "submit", expectedSubmissionIdentity,
       ), { timeout: 7_000 });
+      await vi.waitFor(() => expect(mockTurnClient.release).toHaveBeenCalledTimes(releasesWhenContinuationStarted + 1), { timeout: 2_000 });
       await contextCloseStarted;
 
       const duplicateRequest = await dispatchPageRequest("https://example.com/jobs/123/apply", "POST");
       duplicateRequestWasAborted = Boolean(duplicateRequest && duplicateRequest.abort.mock.calls.length === 1);
-      expect(mockTurnClient.query.mock.calls.filter(([sql]) => sql === "COMMIT").length)
-        .toBeGreaterThan(commitsBeforeRequest);
-      expect(mockTurnClient.query).toHaveBeenCalledWith("COMMIT");
+      expect(mockTurnClient.release).toHaveBeenCalledTimes(releasesWhenContinuationStarted + 1);
       expect(duplicateRequestWasAborted).toBe(true);
       expect(processorSettled).toBe(false);
       expect(mockContext.close).toHaveBeenCalledOnce();
@@ -1473,11 +1700,13 @@ describe("apply-queue (unit — mocked)", () => {
       await mockContext.close.mock.results[0]?.value;
       await processor;
       expect(processorSettled).toBe(true);
+      expect(mockTurnClient.release).toHaveBeenCalledTimes(releasesWhenContinuationStarted + 1);
       expect(mockContext.unroute).toHaveBeenCalledOnce();
       expect(mockInsertApplyResult).toHaveBeenCalledTimes(1);
     } finally {
       resolveContextClose();
       resolveContinuation();
+      intervalSpy.mockRestore();
       vi.unstubAllEnvs();
       vi.resetModules();
     }

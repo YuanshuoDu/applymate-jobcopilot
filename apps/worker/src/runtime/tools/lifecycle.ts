@@ -12,7 +12,7 @@ import { isVerifiedToolResultChunk } from "./tool-result-reference-repo.js"
 import { hasNativeCoordinationEnvelope, prepareResolvedOwnerWaitLifecycleOutput, prepareVerifiedToolResultChunk } from "./lifecycle-receipt-output.js"
 import { prepareScoutDelegateLifecycleOutput } from "./scout-delegate-output-redaction.js"
 import { prepareScoutResultsOutput } from "./scout-results-output-redaction.js"
-import { ToolExecutionError, type ToolLifecyclePayload } from "./types.js"
+import { ToolExecutionError, type ToolLifecycleFailure, type ToolLifecyclePayload } from "./types.js"
 import { isTaskGraphResultPageLike, prepareAgentListLifecycleInput, prepareTaskGraphResultPageOutput } from "./task-graph-result-page-redaction.js"
 
 export type ToolLifecyclePhase = "started" | "progress" | "completed" | "failed" | "cancelled"
@@ -113,16 +113,19 @@ export class ToolLifecycle {
   }
 
   async completed(call: LifecycleCall, output: unknown, signal?: AbortSignal): Promise<unknown> { return this.result(call, "completed", null, output, signal) }
-  async failed(call: LifecycleCall, phase: "failed" | "cancelled", errorCode: string, detail?: unknown): Promise<unknown> {
-    return this.result(call, phase, errorCode, detail)
+
+  async failed(call: LifecycleCall, phase: "failed" | "cancelled", errorCode: string, failure: ToolLifecycleFailure): Promise<unknown> {
+    return this.result(call, phase, errorCode, failure.kind === "diagnostic" ? null : failure.output, undefined, failure.kind === "diagnostic" ? { detail: failure.detail } : undefined)
   }
-  private async result(call: LifecycleCall, phase: "completed" | "failed" | "cancelled", errorCode: string | null, output: unknown, signal?: AbortSignal): Promise<unknown> {
+
+  private async result(call: LifecycleCall, phase: "completed" | "failed" | "cancelled", errorCode: string | null, output: unknown, signal?: AbortSignal, diagnostic?: { detail: unknown }): Promise<unknown> {
     const timestamp = this.now()
     const pageCall = this.pageCalls.delete(call.id)
     const discoveryObservation = { output: output ?? null }
     const safeOutput = phase === "completed"
       ? await this.persistCompletedOutput(call, output ?? null, pageCall, discoveryObservation)
-      : sanitizeLifecyclePreview(output ?? null, this.maxEventBytes)
+      : diagnostic ? null : sanitizeLifecyclePreview(output ?? null, this.maxEventBytes)
+    const safeFailureDetail = diagnostic ? sanitizeLifecyclePreview(diagnostic.detail, this.maxEventBytes) : undefined
     if (phase === "completed" && signal?.aborted) throw new ToolExecutionError("cancelled", "Tool execution was interrupted")
     const item: ToolResultItem = {
       schemaVersion,
@@ -139,9 +142,9 @@ export class ToolLifecycle {
       errorCode,
     }
     if (phase === "completed" && signal?.aborted) throw new ToolExecutionError("cancelled", "Tool execution was interrupted")
-    await this.append({ phase, eventType: phase === "completed" ? "tool_call.completed" : "tool_call.failed", item, payload: this.payload(call, phase, { output: safeOutput, errorCode }) })
+    await this.append({ phase, eventType: phase === "completed" ? "tool_call.completed" : "tool_call.failed", item, payload: this.payload(call, phase, { ...(phase === "completed" ? {} : { failureKind: diagnostic ? "diagnostic" : "safe_output" }), ...(diagnostic ? { failureDetail: safeFailureDetail } : {}), output: safeOutput, errorCode }) })
     this.inputs.delete(call.id)
-    this.observeDiscoveryAttempt({ call, phase, output: phase === "completed" ? discoveryObservation.output : output ?? null })
+    this.observeDiscoveryAttempt({ call, phase, output: phase === "completed" ? discoveryObservation.output : diagnostic?.detail ?? output ?? null })
     return safeOutput
   }
 
