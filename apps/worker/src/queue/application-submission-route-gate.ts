@@ -5,9 +5,9 @@ import type { ApplicationSubmissionStartScope } from "../db/application-task-sta
 import type { ApplicationSubmitIdentity } from "./application-submit-fence.js";
 import { finishApplicationTask } from "../db/application-task-state.js";
 import { UNCONFIRMED_SUBMISSION_MESSAGE } from "../db/submission-guard.js";
-import { acquireApplicationSubmissionStartFence } from "../runtime/interrupt/application-submission-probe.js";
+import { acquireApplicationSubmissionStartFence, startApplicationSubmissionStopProbe, type ApplicationSubmissionStopProbe } from "../runtime/interrupt/application-submission-probe.js";
 import { matchesSubmissionRequest, type SubmissionRequestIntent } from "../flows/submission-intent.js";
-import type { ApplyJobRunContext } from "./apply-job-runner.js";
+import type { ApplyJobRunContext, StagedApplicationSubmissionStopProtocol } from "./apply-job-runner.js";
 
 const ROUTE_CONTINUATION_ACK_TIMEOUT_MS = 8_000;
 
@@ -32,6 +32,21 @@ export async function loadApprovedTurnScope(
     sessionId: approval.scope.sessionId, turnId: identity.fillTurnId,
   };
 }
+
+export function startApplyJobSubmissionStopProbe(
+  context: ApplyJobRunContext, stopCheck?: StagedApplicationSubmissionStopProtocol["isStopped"],
+): ApplicationSubmissionStopProbe {
+  const { state } = context;
+  return startApplicationSubmissionStopProbe({
+    pool: getPool(), scope: state.approvedTurnScope!, closePage: context.lifecycle!.closeActivePage,
+    controller: state.stopController, hasSubmissionStarted: () => state.submissionRequestStarted,
+    onStopped: () => { state.turnStopped = true; },
+    onUnavailable: error => { state.submissionFenceUnavailable = true;
+      console.warn("[apply-worker] Agent turn state probe failed:", error instanceof Error ? error.message : String(error)); },
+    ...(stopCheck ? { stopCheck: (_pool, scope) => stopCheck(scope) } : {}),
+  });
+}
+
 export function createApplicationSubmissionRouteHandler(
   context: ApplyJobRunContext,
   page: Page,
@@ -131,7 +146,9 @@ export function createApplicationSubmissionRouteHandler(
           return;
         }
         state.submissionExecutionStartAttempted = true;
-        const fence = await acquireApplicationSubmissionStartFence(getPool(), state.approvedTurnScope!);
+        const fence = context.stagedSubmissionStopProtocol
+          ? await context.stagedSubmissionStopProtocol.acquireStartFence(state.approvedTurnScope!)
+          : await acquireApplicationSubmissionStartFence(getPool(), state.approvedTurnScope!);
         if (fence.state === "uncertain") {
           state.pendingSubmissionFence = fence;
           state.submissionRequestStarted = true;

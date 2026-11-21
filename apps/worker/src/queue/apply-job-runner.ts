@@ -4,28 +4,18 @@ import type { Job } from "bullmq";
 import { getPool } from "../db/apply-results.js";
 import * as legacyFillOutcomes from "./legacy-apply-outcomes.js";
 import { loadTaskContext, type TaskContext } from "../db/load-task-context.js";
-import {
-  claimApplicationTask,
-  finishApplicationTask,
-  isUserActive,
-  type ApplicationSubmissionStartScope,
-} from "../db/application-task-state.js";
+import { claimApplicationTask, finishApplicationTask, isUserActive, type ApplicationSubmissionStartScope } from "../db/application-task-state.js";
 import { checkRateLimit } from "../rate-limit.js";
 import { evaluateUnattendedApplyControl } from "./unattended-apply-control.js";
 import { claimUnattendedSubmission } from "../db/submission-guard.js";
-import {
-  isApplicationSubmissionStopped,
-  startApplicationSubmissionStopProbe,
-  type ApplicationSubmissionStartFence,
-  type ApplicationSubmissionStopProbe,
-} from "../runtime/interrupt/application-submission-probe.js";
+import { isApplicationSubmissionStopped, type ApplicationSubmissionStartFence, type ApplicationSubmissionStopProbe } from "../runtime/interrupt/application-submission-probe.js";
 import type { ApplicationSubmitIdentity } from "./application-submit-fence.js";
 import type { FlowType } from "../flows/index.js";
 import type { SubmissionRequestIntent } from "../flows/submission-intent.js";
 import type { HarnessResult } from "../harness/agent-harness.js";
 import { APPLY_TIMEOUT_MS, createApplyJobFinalization, finalizeApplyJob, handleApplyJobFailure, persistStoppedSubmission } from "./apply-job-finalization.js";
 import { runApplyBrowserSession } from "./apply-browser-session.js";
-import { loadApprovedTurnScope } from "./application-submission-route-gate.js";
+import { loadApprovedTurnScope, startApplyJobSubmissionStopProbe } from "./application-submission-route-gate.js";
 import { handOffUnavailableUnattendedTask } from "./apply-job-outcomes.js";
 
 export type ApplyJobRunState = {
@@ -74,6 +64,11 @@ export type ApplyJobLifecycle = {
 
 export type SubmissionUncertainTaskWrite = "written" | "superseded" | "failed";
 
+export type StagedApplicationSubmissionStopProtocol = Readonly<{
+  isStopped(scope: ApplicationSubmissionStartScope): Promise<boolean>;
+  acquireStartFence(scope: ApplicationSubmissionStartScope): Promise<ApplicationSubmissionStartFence>;
+}>;
+
 export type ApplyJobRunContext = {
   job: Job<ApplyTaskPayload>;
   payload: ApplyTaskPayload;
@@ -86,10 +81,14 @@ export type ApplyJobRunContext = {
   taskContext: TaskContext | null;
   lifecycle: ApplyJobLifecycle | null;
   isQueuePaused(): Promise<boolean>;
+  stagedSubmissionStopProtocol?: StagedApplicationSubmissionStopProtocol;
   state: ApplyJobRunState;
 };
 
-export function createApplyJobProcessor(dependencies: { isQueuePaused(): Promise<boolean> }) {
+export function createApplyJobProcessor(dependencies: {
+  isQueuePaused(): Promise<boolean>;
+  stagedSubmissionStopProtocol?: StagedApplicationSubmissionStopProtocol;
+}) {
   return async (job: Job<ApplyTaskPayload>): Promise<void> => {
     const payload = job.data;
     const workerTaskId = typeof job.id === "string" ? job.id : "";
@@ -143,7 +142,8 @@ export function createApplyJobProcessor(dependencies: { isQueuePaused(): Promise
     const context: ApplyJobRunContext = {
       job, payload, workerTaskId, executionId, submissionIdentity, validSubmitPayload, domain,
       startedAt: Date.now(), taskContext: null, lifecycle: null,
-      isQueuePaused: dependencies.isQueuePaused, state,
+      isQueuePaused: dependencies.isQueuePaused,
+      ...(dependencies.stagedSubmissionStopProtocol ? { stagedSubmissionStopProtocol: dependencies.stagedSubmissionStopProtocol } : {}), state,
     };
     context.lifecycle = createApplyJobFinalization(context);
 
@@ -198,23 +198,17 @@ export function createApplyJobProcessor(dependencies: { isQueuePaused(): Promise
 
       if (operation === "submit" && submissionIdentity) {
         state.approvedTurnScope = await loadApprovedTurnScope(submissionIdentity, executionId, workerTaskId);
-        if (await isApplicationSubmissionStopped(getPool(), state.approvedTurnScope)) {
-          if (!await persistStoppedSubmission({
-            identity: submissionIdentity, jobTitle: context.taskContext.jobTitle,
-            jobCompany: context.taskContext.jobCompany, startedAt: context.startedAt,
-          })) { state.submissionSuperseded = true; return; }
-          state.resultWritten = true;
-          return;
+        if (!dependencies.stagedSubmissionStopProtocol) {
+          if (await isApplicationSubmissionStopped(getPool(), state.approvedTurnScope)) {
+            if (!await persistStoppedSubmission({
+              identity: submissionIdentity, jobTitle: context.taskContext.jobTitle,
+              jobCompany: context.taskContext.jobCompany, startedAt: context.startedAt,
+            })) { state.submissionSuperseded = true; return; }
+            state.resultWritten = true;
+            return;
+          }
+          state.stopProbe = startApplyJobSubmissionStopProbe(context);
         }
-        state.stopProbe = startApplicationSubmissionStopProbe({
-          pool: getPool(), scope: state.approvedTurnScope, closePage: context.lifecycle.closeActivePage,
-          controller: state.stopController, hasSubmissionStarted: () => state.submissionRequestStarted,
-          onStopped: () => { state.turnStopped = true; },
-          onUnavailable: (error) => {
-            state.submissionFenceUnavailable = true;
-            console.warn("[apply-worker] Agent turn state probe failed:", error instanceof Error ? error.message : String(error));
-          },
-        });
       }
       if (operation === "submit" && submissionIdentity) {
         const claim = await claimUnattendedSubmission(getPool(), submissionIdentity, workerTaskId);
@@ -224,6 +218,17 @@ export function createApplyJobProcessor(dependencies: { isQueuePaused(): Promise
           return;
         }
         state.submissionClaimed = true;
+        if (dependencies.stagedSubmissionStopProtocol) {
+          if (await dependencies.stagedSubmissionStopProtocol.isStopped(state.approvedTurnScope!)) {
+            if (!await persistStoppedSubmission({
+              identity: submissionIdentity, jobTitle: context.taskContext.jobTitle,
+              jobCompany: context.taskContext.jobCompany, startedAt: context.startedAt,
+            })) { state.submissionSuperseded = true; return; }
+            state.resultWritten = true;
+            return;
+          }
+          state.stopProbe = startApplyJobSubmissionStopProbe(context, dependencies.stagedSubmissionStopProtocol.isStopped);
+        }
       }
 
       const browserExecution = runApplyBrowserSession(context);

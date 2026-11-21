@@ -427,6 +427,22 @@ describe("apply-queue (unit — mocked)", () => {
     );
   }, 30_000);
 
+  it("constructs a second same-queue Worker only from an explicit staged server dependency", async () => {
+    const { Worker } = await import("bullmq");
+    const mod = await import("./apply-queue.js");
+    const priorCalls = vi.mocked(Worker).mock.calls.length;
+    const stagedSubmissionStopProtocol = {
+      isStopped: vi.fn(async (..._args: unknown[]) => false),
+      acquireStartFence: vi.fn(async (..._args: unknown[]) => ({ state: "inactive" as const, release: async () => undefined })),
+    };
+    expect(mod.createApplyWorker({ stagedSubmissionStopProtocol })).toBeDefined();
+    const call = vi.mocked(Worker).mock.calls[priorCalls];
+    expect(call?.[0]).toBe(mod.QUEUE_NAME);
+    expect(call?.[1]).toEqual(expect.any(Function));
+    expect(call?.[2]).toMatchObject({ autorun: false, skipVersionCheck: true });
+    mod.createApplyWorker();
+  });
+
   it("reconciles only the current completed exact submit delivery after its Redis lock is absent", async () => {
     await import("./apply-queue.js");
     const completed = mockWorkerListeners.get("completed");
