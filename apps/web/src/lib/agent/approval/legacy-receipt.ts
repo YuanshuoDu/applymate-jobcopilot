@@ -171,13 +171,13 @@ export async function resolveLegacyApproval(
     where: { id: waitItemId("approval", approval.id), sessionId: input.sessionId, turnId: approval.turnId },
     select: { id: true, revision: true },
   }) : null
-  const turn = approval.type === "review_application" || item ? await db.agentTurn.findFirst({
+  const loadTurn = () => db.agentTurn.findFirst({
     where: { id: approval.turnId, sessionId: input.sessionId, userId: input.userId },
     select: { id: true, revision: true, input: true },
-  }) : null
+  })
+  let turn = approval.type === "review_application" || item ? await loadTurn() : null
   const turnInput = turn?.input
-  const turnIntent = turnInput && typeof turnInput === "object" && !Array.isArray(turnInput)
-    ? (turnInput as Record<string, unknown>).intent : null
+  const turnIntent = turnInput && typeof turnInput === "object" && !Array.isArray(turnInput) ? (turnInput as Record<string, unknown>).intent : null
   const markedReviewedApplication = approval.type === "review_application" && (
     approval.id.startsWith("reviewed-application-review:") || approval.toolCallId?.startsWith("review_application:") === true
     || Boolean(turnIntent && typeof turnIntent === "object" && !Array.isArray(turnIntent)
@@ -187,6 +187,7 @@ export async function resolveLegacyApproval(
       return await resolveLegacyOnlyInTransaction(db, input, options)
     } catch (error) {
       if (!(error instanceof CanonicalWaitFoundError)) throw error
+      turn = await loadTurn()
     }
   }
   if (!turn) throw new Error("Approval turn is no longer available")

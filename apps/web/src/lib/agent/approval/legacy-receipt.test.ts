@@ -190,6 +190,30 @@ describe("resolveLegacyApproval same-Turn fence", () => {
     expect(mocks.appendAgentEventWithOutboxInTransaction).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ type: "approval.resolved", outboxTopic: "agent.session.event" }))
   })
 
+  it("reloads the owner Turn revision when a canonical Wait appears during legacy admission", async () => {
+    const approval = approvalRecord({ id: "legacy_review_1", type: "review_application" })
+    let turnReads = 0
+    mocks.rootTurnFindFirst.mockImplementation(async () => {
+      turnReads += 1
+      return { id: "turn_1", status: "waiting_for_approval", revision: turnReads === 1 ? 2 : 9,
+        input: { intent: { kind: "objective_task_graph_execution", version: 1 } } }
+    })
+    mocks.rootItemFindFirst.mockResolvedValueOnce(null)
+    mocks.txItemFindFirst.mockResolvedValueOnce({ id: "agent-wait:approval:legacy_review_1" })
+    const { resolveLegacyApproval } = await import("./legacy-receipt")
+
+    const result = await resolveLegacyApproval(fakeDb(), { approval, userId: "user_1", sessionId: "session_1",
+      decision: "approved", receiptNonce: "legacy-nonce" })
+
+    expect(result.disposition).toBe("canonical_wait")
+    expect(mocks.rootTurnFindFirst).toHaveBeenCalledTimes(2)
+    expect(mocks.decideApproval).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      decision: "approved", expectedRevision: 9,
+    }))
+    expect(mocks.decideApproval.mock.calls[0]?.[1]).not.toHaveProperty("receiptNonce")
+    expect(mocks.resolvePendingApprovalInTransaction).not.toHaveBeenCalled()
+  })
+
   it("fails closed when multiple active approvals are present", async () => {
     mocks.txItemFindMany.mockResolvedValue([
       { content: { approvalId: "approval_2" } },
