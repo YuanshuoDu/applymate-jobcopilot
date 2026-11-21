@@ -851,16 +851,34 @@ async function stopReviewedFillRouteBridge(): Promise<void> {
   if (closeError) throw closeError
 }
 
-async function waitForReviewedFillBridgeAttempts(outboxId: string, count: number, timeoutMs = 30_000): Promise<ReviewedFillBridgeAttempt[]> {
+async function waitForReviewedFillBridgeRecoveryAttempts(outboxId: string, timeoutMs = 30_000): Promise<ReviewedFillBridgeAttempt[]> {
   const until = Date.now() + timeoutMs
   let attempts = reviewedFillBridgeAttempts.filter(attempt => attempt.outboxId === outboxId)
-  while (attempts.length < count && Date.now() < until) {
+  while (attempts.filter(attempt => attempt.acknowledgement !== "deferred").length < 2 && Date.now() < until) {
     if (worker && exited(worker)) throw new Error("Worker exited before the reviewed-fill publisher retried the internal route")
     await delay(50)
     attempts = reviewedFillBridgeAttempts.filter(attempt => attempt.outboxId === outboxId)
   }
-  if (attempts.length < count) throw new Error("reviewed_fill_publisher_retry_timeout")
-  return attempts.slice(0, count)
+  if (attempts.filter(attempt => attempt.acknowledgement !== "deferred").length < 2) {
+    throw new Error("reviewed_fill_publisher_retry_timeout")
+  }
+  return attempts
+}
+
+async function waitForReviewedFillOutboxPublished(outboxId: string, timeoutMs = 30_000) {
+  const until = Date.now() + timeoutMs
+  let outbox = await testDb.agentOutbox.findUnique({
+    where: { id: outboxId }, select: { publishedAt: true, attemptCount: true },
+  })
+  while (!outbox?.publishedAt && Date.now() < until) {
+    if (worker && exited(worker)) throw new Error("Worker exited before the reviewed-fill outbox was marked published")
+    await delay(50)
+    outbox = await testDb.agentOutbox.findUnique({
+      where: { id: outboxId }, select: { publishedAt: true, attemptCount: true },
+    })
+  }
+  if (!outbox?.publishedAt) throw new Error("reviewed_fill_outbox_publish_timeout")
+  return outbox
 }
 
 const ALL_QUEUE_STATES = ["waiting", "active", "delayed", "completed", "failed", "paused", "waiting-children", "prioritized"] as const
@@ -1655,13 +1673,18 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(handoffPayload).toEqual({ schemaVersion: "agent-harness.v2.reviewed-fill-handoff.v1", userId: ids.user,
       sessionId: scenario.sessionId, applicationTaskId, approvalId, predecessorTurnId: reviewTurnId })
 
-    const bridgeAttempts = await waitForReviewedFillBridgeAttempts(handoff.id, 2)
-    expect(bridgeAttempts).toEqual([
+    const bridgeAttempts = await waitForReviewedFillBridgeRecoveryAttempts(handoff.id)
+    expect(bridgeAttempts.every(attempt => attempt.outboxId === handoff.id)).toBe(true)
+    const deferredAttempts = bridgeAttempts.filter(attempt => attempt.acknowledgement === "deferred")
+    expect(deferredAttempts.every(attempt => attempt.status === 200 && attempt.predecessorStatus === "completed"
+      && attempt.acknowledgementDropped === false)).toBe(true)
+    const recoveryAttempts = bridgeAttempts.filter(attempt => attempt.acknowledgement !== "deferred")
+    expect(recoveryAttempts).toEqual([
       { outboxId: handoff.id, status: 200, acknowledgement: "queued", predecessorStatus: "completed", acknowledgementDropped: true },
       { outboxId: handoff.id, status: 200, acknowledgement: "duplicate", predecessorStatus: "completed", acknowledgementDropped: false },
     ])
-    expect(reviewedFillBridgeAttempts.filter(attempt => attempt.outboxId === handoff.id)).toHaveLength(2)
-    const publishedHandoff = await testDb.agentOutbox.findUniqueOrThrow({ where: { id: handoff.id } })
+    expect(reviewedFillBridgeAttempts).toHaveLength(bridgeAttempts.length)
+    const publishedHandoff = await waitForReviewedFillOutboxPublished(handoff.id)
     expect(publishedHandoff.publishedAt).toBeInstanceOf(Date)
     expect(publishedHandoff.attemptCount).toBe(1)
     const firstFill = await waitForReviewedApplicationTask(scenario.jobId, task => Boolean(task.fillTurnId))
