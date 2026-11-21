@@ -25,13 +25,31 @@ export function childFollowUpTarget(task: ChildWorkerTask | null, sessionId: str
 
 export function taskTimelineItems(items: readonly TimelineItem[], task: ChildWorkerTask | null, sessionId: string): TimelineItem[] {
   if (!task || !sessionId || task.sessionId !== sessionId || !task.id || typeof task.turnId !== 'string' || !task.turnId) return []
-  return items.filter(item => item.sessionId === sessionId && item.turnId === task.turnId
-    && item.taskId === task.id && SAFE_CHILD_TIMELINE_TYPES.has(item.type)).map(projectChildTimelineItem)
+  const scoped = items.filter(item => item.sessionId === sessionId && item.turnId === task.turnId
+    && item.taskId === task.id && SAFE_CHILD_TIMELINE_TYPES.has(item.type))
+  const toolCalls = childToolCallMatches(scoped)
+  return scoped.map(item => projectChildTimelineItem(item, toolCalls))
 }
 
-function projectChildTimelineItem(item: TimelineItem): TimelineItem {
+interface ChildToolCallMatch { readonly toolName: string | null; count: number }
+
+function childToolCallMatches(items: readonly TimelineItem[]): Map<string, ChildToolCallMatch> {
+  const matches = new Map<string, ChildToolCallMatch>()
+  for (const item of items) {
+    if (item.type !== 'tool_call') continue
+    const toolCallId = ownString(item.content, 'toolCallId')
+    const key = toolCallId ? childToolCallKey(item.stepId, toolCallId) : null
+    if (!key) continue
+    const previous = matches.get(key)
+    if (previous) { previous.count += 1; continue }
+    matches.set(key, { toolName: persisted(item.source) ? canonicalToolName(item.content) : null, count: 1 })
+  }
+  return matches
+}
+
+function projectChildTimelineItem(item: TimelineItem, toolCalls: ReadonlyMap<string, ChildToolCallMatch>): TimelineItem {
   const toolCard = item.type === 'tool_call' || item.type === 'tool_result'
-  const toolName = toolCard ? safeChildToolName(item) : null
+  const toolName = toolCard ? safeChildToolName(item, toolCalls) : null
   return {
     schemaVersion: item.schemaVersion, id: item.id, sessionId: item.sessionId, turnId: item.turnId,
     stepId: item.stepId, taskId: item.taskId, type: item.type, status: item.status, phase: item.phase,
@@ -41,13 +59,32 @@ function projectChildTimelineItem(item: TimelineItem): TimelineItem {
   }
 }
 
-function safeChildToolName(item: TimelineItem): string | null {
-  if (item.source !== 'durable' && item.source !== 'replay') return null
-  const content = item.content
-  if (!content || typeof content !== 'object' || Array.isArray(content) || !Object.hasOwn(content, 'toolName')) return null
-  const name = (content as Record<string, unknown>).toolName
+function safeChildToolName(item: TimelineItem, toolCalls: ReadonlyMap<string, ChildToolCallMatch>): string | null {
+  if (!persisted(item.source)) return null
+  if (item.type === 'tool_call') return canonicalToolName(item.content)
+  if (item.type !== 'tool_result') return null
+  const toolCallId = ownString(item.content, 'toolCallId')
+  const key = toolCallId ? childToolCallKey(item.stepId, toolCallId) : null
+  const match = key ? toolCalls.get(key) : undefined
+  return match?.count === 1 ? match.toolName : null
+}
+
+function canonicalToolName(value: unknown): string | null {
+  const content = record(value)
+  const name = content && Object.hasOwn(content, 'toolName') ? content.toolName : null
   return typeof name === 'string' && SAFE_CHILD_TOOL_NAMES.has(name) ? name : null
 }
+function ownString(value: unknown, key: string): string | null {
+  const content = record(value)
+  const candidate = content && Object.hasOwn(content, key) ? content[key] : null
+  return typeof candidate === 'string' && candidate.length > 0 && candidate.length <= 256 ? candidate : null
+}
+function childToolCallKey(stepId: string | null, toolCallId: string): string | null {
+  if (stepId !== null && (typeof stepId !== 'string' || stepId.length === 0)) return null
+  return JSON.stringify([stepId, toolCallId])
+}
+function persisted(source: TimelineItem['source']): boolean { return source === 'durable' || source === 'replay' }
+function record(value: unknown): Record<string, unknown> | null { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null }
 
 export async function postChildTaskFollowUp(request: FollowUpRequest, refreshTasks: () => void | Promise<void>, fetcher: typeof fetch = fetch): Promise<'accepted' | 'conflict'> {
   const response = await fetcher(`/api/agent/sessions/${encodeURIComponent(request.sessionId)}/tasks/${encodeURIComponent(request.taskId)}/messages`, {

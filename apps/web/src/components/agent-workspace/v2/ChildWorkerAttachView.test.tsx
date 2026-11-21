@@ -18,15 +18,17 @@ const child: ChildWorkerTask = {
   createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-01T00:05:00.000Z',
 }
 
-type ItemOptions = Partial<Pick<TimelineItem, 'sessionId' | 'turnId' | 'source' | 'status'>>
+type ItemOptions = Partial<Pick<TimelineItem, 'sessionId' | 'turnId' | 'stepId' | 'source' | 'status'>>
 
 function item(id: string, taskId: string, text: string, type = 'agent_message', content: unknown = { parts: [{ type: 'text', text }] }, options: ItemOptions = {}): TimelineItem {
   return {
-    schemaVersion: 'agent-harness.v2', id, sessionId: options.sessionId ?? 'session-1', turnId: options.turnId ?? 'turn-2', stepId: null, taskId,
+    schemaVersion: 'agent-harness.v2', id, sessionId: options.sessionId ?? 'session-1', turnId: options.turnId ?? 'turn-2', stepId: options.stepId ?? null, taskId,
     type, status: options.status ?? 'completed', phase: 'commentary', revision: 1, content,
     startedAt: null, completedAt: null, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-01T00:00:00.000Z', source: options.source ?? 'replay', sequence: null,
   }
 }
+
+function opaqueCallId(seed: number): string { return `tc_${seed.toString(16).padStart(64, '0')}` }
 
 describe('ChildWorkerAttachView', () => {
   it('targets only a running real child with its current positive attempt count', () => {
@@ -199,25 +201,43 @@ describe('ChildWorkerAttachView', () => {
 
   it('shows only canonical discovery tool names from durable or replayed lifecycle cards', () => {
     const names = ['jobs.search', 'jobs.get', 'jobs.discover', 'scout.delegate', 'scout.results', 'agent.wait']
-    const safe = names.flatMap((toolName, index) => (['durable', 'replay'] as const).map((source, sourceIndex) => item(
-      `safe-${index}-${source}`, child.id, '', sourceIndex ? 'tool_result' : 'tool_call', {
-        toolName, toolCallId: `private-call-id-${index}`, input: { token: 'PRIVATE_ARGUMENT' },
-        output: 'PRIVATE_OUTPUT', errorCode: 'PRIVATE_ERROR', privateJobId: 'PRIVATE_JOB_ID',
-      }, { source, status: index === 0 && sourceIndex === 0 ? 'running' : 'completed' },
-    )))
+    const pairs = names.flatMap((toolName, index) => (['durable', 'replay'] as const).map((callSource, sourceIndex) => ({
+      toolName, callId: opaqueCallId(index * 2 + sourceIndex), callSource,
+      resultSource: callSource === 'durable' ? 'replay' as const : 'durable' as const,
+      stepId: sourceIndex ? `step-${index}` : null,
+    })))
+    const safe = pairs.flatMap((pair, index) => [
+      item(`safe-call-${index}`, child.id, '', 'tool_call', {
+        toolCallId: pair.callId, toolName: pair.toolName, inputAvailable: true,
+        ...(index === 0 ? {} : { input: { token: 'PRIVATE_ARGUMENT' }, privateCallId: 'PRIVATE_CALL_ID' }),
+      }, { source: pair.callSource, stepId: pair.stepId, status: index === 0 ? 'running' : 'completed' }),
+      item(`safe-result-${index}`, child.id, '', 'tool_result', {
+        toolCallId: pair.callId, errorCode: index === 0 ? null : 'PRIVATE_ERROR', outputAvailable: true,
+        ...(index === 0 ? {} : { output: 'PRIVATE_OUTPUT', toolName: 'UNTRUSTED_RESULT_NAME', privateResultId: 'PRIVATE_RESULT_ID' }),
+      }, { source: pair.resultSource, stepId: pair.stepId }),
+    ])
     const inheritedToolName = Object.create({ toolName: 'jobs.search' }) as Record<string, unknown>
     const hidden = [
       item('private-name', child.id, '', 'tool_call', { toolName: 'private.tool', input: 'PRIVATE_ARGUMENT' }, { source: 'durable' }),
       item('legacy-name', child.id, '', 'tool_result', { name: 'jobs.search', output: 'PRIVATE_OUTPUT' }, { source: 'replay' }),
       item('inherited-name', child.id, '', 'tool_call', inheritedToolName, { source: 'durable' }),
-      item('transient-name', child.id, '', 'tool_call', { toolName: 'jobs.search' }, { source: 'transient' }),
-      item('unknown-source', child.id, '', 'tool_result', { toolName: 'jobs.get' }, { source: 'unknown' }),
+      item('transient-call', child.id, '', 'tool_call', { toolCallId: opaqueCallId(90), toolName: 'jobs.search' }, { source: 'transient' }),
+      item('transient-result', child.id, '', 'tool_result', { toolCallId: opaqueCallId(0), toolName: 'jobs.get' }, { source: 'transient' }),
+      item('transient-call-result', child.id, '', 'tool_result', { toolCallId: opaqueCallId(90) }, { source: 'durable' }),
+      item('unknown-call', child.id, '', 'tool_call', { toolCallId: opaqueCallId(91), toolName: 'jobs.get' }, { source: 'unknown' }),
+      item('unknown-call-result', child.id, '', 'tool_result', { toolCallId: opaqueCallId(91) }, { source: 'replay' }),
+      item('unknown-result', child.id, '', 'tool_result', { toolCallId: opaqueCallId(0) }, { source: 'unknown' }),
+      item('malformed-call-id', child.id, '', 'tool_result', { toolCallId: { id: opaqueCallId(92) } }, { source: 'durable' }),
     ]
     const projected = taskTimelineItems([...safe, ...hidden], child, 'session-1')
-    expect(projected.slice(0, safe.length).map(entry => entry.content)).toEqual(names.flatMap(toolName => [{ toolName }, { toolName }]))
+    expect(safe.slice(0, 2).map(entry => entry.content)).toEqual([
+      { toolCallId: opaqueCallId(0), toolName: 'jobs.search', inputAvailable: true },
+      { toolCallId: opaqueCallId(0), errorCode: null, outputAvailable: true },
+    ])
+    expect(projected.slice(0, safe.length).map(entry => entry.content)).toEqual(pairs.flatMap(pair => [{ toolName: pair.toolName }, { toolName: pair.toolName }]))
     expect(projected[0]).toMatchObject({ status: 'running', createdAt: safe[0]!.createdAt, updatedAt: safe[0]!.updatedAt })
-    expect(projected.slice(safe.length).map(entry => entry.content)).toEqual([{}, {}, {}, {}, {}])
-    expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_ARGUMENT|PRIVATE_OUTPUT|PRIVATE_ERROR|PRIVATE_JOB_ID|private-call-id|private\.tool/)
+    expect(projected.slice(safe.length).map(entry => entry.content)).toEqual(Array.from({ length: hidden.length }, () => ({})))
+    expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_ARGUMENT|PRIVATE_OUTPUT|PRIVATE_ERROR|PRIVATE_CALL_ID|PRIVATE_RESULT_ID|tc_[0-9a-f]{64}|UNTRUSTED_RESULT_NAME|private\.tool/)
 
     const render = () => renderToStaticMarkup(<ChildWorkerAttachView sessionId="session-1" task={child} items={[...safe, ...hidden]} onClose={vi.fn()} onConflict={vi.fn()} />)
     language.value = 'en'
@@ -226,10 +246,48 @@ describe('ChildWorkerAttachView', () => {
     expect(english).toContain('data-tool-status="running"')
     expect(english).toContain('agent.toolCall')
     expect(english).toContain('agent.toolResult')
-    expect(english).not.toMatch(/PRIVATE_ARGUMENT|PRIVATE_OUTPUT|PRIVATE_ERROR|PRIVATE_JOB_ID|private-call-id|private\.tool/)
+    expect(english).not.toMatch(/PRIVATE_ARGUMENT|PRIVATE_OUTPUT|PRIVATE_ERROR|PRIVATE_CALL_ID|PRIVATE_RESULT_ID|tc_[0-9a-f]{64}|UNTRUSTED_RESULT_NAME|private\.tool/)
     language.value = 'zh'
     expect(render()).toContain('所选工作线程活动')
     expect(render()).toContain('<strong>jobs.search</strong>')
     language.value = 'en'
+  })
+
+  it('requires one same-scope same-Step call for a durable result name', () => {
+    const call = (id: string, name: string, options: ItemOptions = {}, callId = 'opaque-join-id') => item(id, child.id, '', 'tool_call', {
+      toolCallId: callId, toolName: name, inputAvailable: true,
+    }, options)
+    const result = (id: string, options: ItemOptions = {}, callId = 'opaque-join-id') => item(id, child.id, '', 'tool_result', {
+      toolCallId: callId, outputAvailable: true, errorCode: null,
+    }, options)
+    const matchingCall = call('matching-call', 'jobs.search', { source: 'durable', stepId: null }, opaqueCallId(101))
+    const matchingResult = result('matching-result', { source: 'replay', stepId: null }, opaqueCallId(101))
+    const mismatchedStepCall = call('mismatched-step-call', 'jobs.get', { source: 'durable', stepId: null }, opaqueCallId(102))
+    const mismatchedStepResult = result('mismatched-step-result', { source: 'durable', stepId: 'step-1' }, opaqueCallId(102))
+    const missingCallResult = item('missing-call-result', child.id, '', 'tool_result', {
+      toolCallId: opaqueCallId(103), outputAvailable: true, errorCode: null,
+    }, { source: 'durable', stepId: null })
+    const foreignCalls = [
+      call('foreign-session-call', 'jobs.search', { source: 'durable', sessionId: 'session-2', stepId: null }, opaqueCallId(104)),
+      call('foreign-turn-call', 'jobs.get', { source: 'durable', turnId: 'turn-3', stepId: null }, opaqueCallId(107)),
+      item('foreign-task-call', 'child/two', '', 'tool_call', { toolCallId: opaqueCallId(108), toolName: 'jobs.discover' }, { source: 'durable', stepId: null }),
+    ]
+    const foreignResults = [result('foreign-session-result', { source: 'durable', stepId: null }, opaqueCallId(104)),
+      result('foreign-turn-result', { source: 'durable', stepId: null }, opaqueCallId(107)),
+      result('foreign-task-result', { source: 'durable', stepId: null }, opaqueCallId(108))]
+    const duplicateCalls = [call('duplicate-call-a', 'jobs.search', { source: 'durable' }, opaqueCallId(105)), call('duplicate-call-b', 'jobs.get', { source: 'replay' }, opaqueCallId(105))]
+    const duplicateResult = result('duplicate-result', { source: 'durable' }, opaqueCallId(105))
+    const resultClaimOnly = item('result-claim-only', child.id, '', 'tool_result', {
+      toolCallId: opaqueCallId(106), toolName: 'jobs.search', outputAvailable: true,
+    }, { source: 'durable' })
+    const projected = taskTimelineItems([
+      matchingCall, matchingResult, mismatchedStepCall, mismatchedStepResult, missingCallResult, ...foreignCalls,
+      ...foreignResults, ...duplicateCalls, duplicateResult, resultClaimOnly,
+    ], child, 'session-1')
+    expect(projected.map(entry => entry.content)).toEqual([
+      { toolName: 'jobs.search' }, { toolName: 'jobs.search' }, { toolName: 'jobs.get' }, {}, {}, {}, {}, {},
+      { toolName: 'jobs.search' }, { toolName: 'jobs.get' }, {}, {},
+    ])
+    expect(JSON.stringify(projected.map(entry => entry.content))).not.toMatch(/tc_[0-9a-f]{64}/)
   })
 })
