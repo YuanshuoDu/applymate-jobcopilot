@@ -9,6 +9,7 @@ import { detectBrowserWait, type HarnessResult } from "../../harness/agent-harne
 import { inspectFormReviewNeeds, type FormReviewNeeds } from "../../harness/form-review.js"
 import { fillCustomQuestions } from "../../flows/helpers.js"
 import { executeBrowserFill, type FlowType } from "../../flows/index.js"
+import type { ReviewedFillExecutionPhase } from "../../flows/browser-fill-executor.js"
 import { evaluateUnattendedApplyControl } from "../../queue/unattended-apply-control.js"
 import { checkRateLimit } from "../../rate-limit.js"
 import type { ReviewedApplicationFillReadback } from "../../db/reviewed-application-fill-completion.js"
@@ -16,7 +17,7 @@ import { claimApplicationFillBrowserStart, reviewedApplicationFillSelector, type
 import { reviewedMaterialWasFilled } from "./application-fill-reviewed-readback.js"
 import type { SubagentExecutionResult, SubagentLease } from "./types.js"
 type WaitDetail = "captcha_required" | "authentication_required" | "mfa_required" | "unknown_sensitive_field" | "required_field" | "stale_review" | "review_required" | "fill_outcome_uncertain" | "unattended_apply_unavailable" | "cancelled"; type WaitCheckpoint = "fill_outcome_uncertain" | "form_answer_required"
-export type ApplicationFillAcquisitionPhase = "before_control_read" | "before_pattern_read" | "context_requested" | "page_acquired" | "navigation_returned" | "navigation_response_success" | "navigation_response_unavailable" | "destination_allowed" | "destination_rejected" | "wait_detection_returned" | "fill_returned"
+export type ApplicationFillAcquisitionPhase = "before_control_read" | "before_pattern_read" | "context_requested" | "page_acquired" | "navigation_returned" | "navigation_response_success" | "navigation_response_unavailable" | "destination_allowed" | "destination_rejected" | "wait_detection_returned" | "outer_wait_clear" | "outer_wait_detected" | "executor_started" | ReviewedFillExecutionPhase | "fill_returned" | "callback_settled" | "context_returned"
 export type ApplicationFillStageObservation =
   | Readonly<{ stage: "entry_validation" | "wait_persistence" | "completion"; outcome: "accepted" | "rejected" | "waiting" | "completed" | "stale" | "conflict" | "failed" | "cancelled" | "unavailable"; leaseLost: boolean; signalAborted: boolean; staleGate?: ApplicationFillCompletionStaleGate }>
   | Readonly<{ stage: "browser_acquisition"; phase: ApplicationFillAcquisitionPhase }>
@@ -97,8 +98,10 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
         }
         const browserWait = await detectBrowserWait(page)
         observeAcquisitionPhase("wait_detection_returned")
+        observeAcquisitionPhase(browserWait ? "outer_wait_detected" : "outer_wait_clear")
         if (browserWait) return { kind: "wait" as const, detail: waitDetail(browserWait.reason) }
         if (lease.signal.aborted) return cancelledOutcome()
+        observeAcquisitionPhase("executor_started")
         const result = await executeBrowserFill({
           jobId: "server-bound-application",
           applyUrl: task.applyUrl,
@@ -110,7 +113,7 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
           jobDescription: task.jobDescription,
           resumePath,
           submit: false,
-        }, { page, pattern, aiAvailable: true, harnessConfig: { userId: lease.userId, signal: lease.signal } })
+        }, { page, pattern, aiAvailable: true, harnessConfig: { userId: lease.userId, signal: lease.signal }, ...(reviewedSelector.kind === "selected" && input.stageObserver ? { reviewedPhaseObserver: observeAcquisitionPhase } : {}) })
         observeAcquisitionPhase("fill_returned")
         if (lease.signal.aborted || result.classification === "cancelled") return cancelledOutcome()
         if (result.waitReason) return { kind: "wait" as const, detail: waitDetail(result.waitReason) }
@@ -125,8 +128,9 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
           return { kind: "ready" as const, result, ...(reviewedFillReadback ? { reviewedFillReadback } : {}) }
         }
         return { kind: "wait" as const, detail: waitDetailFromResult(result) }
-      } finally { lease.signal.removeEventListener("abort", closeOnAbort) }
+      } finally { lease.signal.removeEventListener("abort", closeOnAbort); observeAcquisitionPhase("callback_settled") }
     })
+    observeAcquisitionPhase("context_returned")
     if (outcome.kind === "wait" && outcome.detail === "cancelled") return acknowledgeCancellation(pool, lease)
     if (outcome.kind === "wait") return wait(pool, lease, outcome.detail === "fill_outcome_uncertain" ? "fill_outcome_uncertain" : "form_answer_required", outcome.detail, undefined, input.stageObserver)
     if (outcome.kind === "needs") return wait(pool, lease, "form_answer_required", outcome.detail, outcome.needs, input.stageObserver)

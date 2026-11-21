@@ -18,8 +18,16 @@ describe("browser.fill_form", () => {
     const page = {
       locator: vi.fn().mockReturnValue({ first: () => ({ count: vi.fn().mockResolvedValue(0), isVisible: vi.fn().mockResolvedValue(false) }) }),
     } as never;
-    const result = await executeBrowserFill({ ...input, atsType: "lever" }, { page });
+    const phases: string[] = [];
+    const result = await executeBrowserFill({ ...input, atsType: "lever" }, { page, reviewedPhaseObserver: phase => phases.push(phase) });
     expect(result.status).toBe("manual");
+    expect(result.reviewReady).toBe(true);
+    expect(phases).toEqual(["executor_wait_clear", "deterministic_flow_started", "deterministic_flow_review_ready"]);
+  });
+
+  it("does not let an observer error change the deterministic fill", async () => {
+    const page = { locator: vi.fn().mockReturnValue({ first: () => ({ count: vi.fn().mockResolvedValue(0), isVisible: vi.fn().mockResolvedValue(false) }) }) } as never;
+    const result = await executeBrowserFill({ ...input, atsType: "lever" }, { page, reviewedPhaseObserver: () => { throw new Error("private observer error"); } });
     expect(result.reviewReady).toBe(true);
   });
 });

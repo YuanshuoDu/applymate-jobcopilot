@@ -43,7 +43,10 @@ export interface BrowserFillExecutorContext {
   pattern?: FormPatternRow | null;
   aiAvailable?: boolean;
   harnessConfig?: Omit<HarnessConfig, "dryRun" | "mode" | "maxTurns">;
+  reviewedPhaseObserver?: (phase: ReviewedFillExecutionPhase) => void;
 }
+
+export type ReviewedFillExecutionPhase = "executor_wait_clear" | "executor_wait_detected" | "deterministic_flow_started" | "deterministic_flow_review_ready" | "deterministic_flow_wait" | "deterministic_flow_other";
 
 export function parseFillFormInput(input: unknown): FillFormInput {
   assertValid(FillFormInputSchema, input, "browser.fill_form input");
@@ -65,12 +68,18 @@ export async function executeBrowserFill(input: unknown, context: BrowserFillExe
 
   if (strategy.kind === "budget") return { status: "manual", error: "AI fallback budget exhausted.", durationMs: 0, classification: "budget_exhausted", reviewReady: false };
   const wait = await detectBrowserWait(context.page);
+  observeReviewedPhase(context, wait ? "executor_wait_detected" : "executor_wait_clear");
   if (wait) {
     await Promise.resolve(context.harnessConfig?.onWait?.({ reason: wait.reason, jobId: value.jobId, message: wait.message })).catch(() => undefined);
     return { status: "manual", error: wait.message, durationMs: 0, classification: "waiting_for_user", waitReason: wait.reason };
   }
   if (strategy.kind === "pattern") return replayPatternForReview(context.page, strategy.pattern, value.persona);
-  if (strategy.kind === "deterministic") return withDeterministicEvidence(await runDeterministicFlow(strategy.atsType, context.page, task));
+  if (strategy.kind === "deterministic") {
+    observeReviewedPhase(context, "deterministic_flow_started");
+    const result = await runDeterministicFlow(strategy.atsType, context.page, task);
+    observeReviewedPhase(context, result.waitReason || result.classification === "waiting_for_user" ? "deterministic_flow_wait" : result.reviewReady ? "deterministic_flow_review_ready" : "deterministic_flow_other");
+    return withDeterministicEvidence(result);
+  }
 
   const harness = new AgentHarness({
     userId: context.harnessConfig?.userId ?? "runtime",
@@ -80,6 +89,10 @@ export async function executeBrowserFill(input: unknown, context: BrowserFillExe
     ...context.harnessConfig,
   });
   return harness.run(context.page, task);
+}
+
+function observeReviewedPhase(context: BrowserFillExecutorContext, phase: ReviewedFillExecutionPhase): void {
+  try { context.reviewedPhaseObserver?.(phase); } catch { /* diagnostics must not affect filling */ }
 }
 
 function withDeterministicEvidence(result: HarnessResult): HarnessResult {

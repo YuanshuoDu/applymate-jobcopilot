@@ -183,7 +183,7 @@ describe("executeApplicationFillForReview", () => {
 
     expect(observations.filter(event => event.stage === "browser_acquisition").map(event => event.phase)).toEqual([
       "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned",
-      "navigation_response_success", "destination_allowed", "wait_detection_returned", "fill_returned",
+      "navigation_response_success", "destination_allowed", "wait_detection_returned", "outer_wait_clear", "executor_started", "fill_returned", "callback_settled", "context_returned",
     ])
     browserPageMock.url.mockReturnValueOnce("https://outside.example/")
     const rejectedObservations: ApplicationFillStageObservation[] = []
@@ -191,7 +191,7 @@ describe("executeApplicationFillForReview", () => {
       lease: lease(), stageObserver: event => rejectedObservations.push(event) })).resolves.toMatchObject({ status: "waiting_for_user" })
     expect(rejectedObservations.filter(event => event.stage === "browser_acquisition").map(event => event.phase)).toEqual([
       "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned",
-      "navigation_response_unavailable", "destination_rejected",
+      "navigation_response_unavailable", "destination_rejected", "callback_settled", "context_returned",
     ])
     expect(executeBrowserFill).toHaveBeenCalledOnce()
     const legacyObservations: ApplicationFillStageObservation[] = []
@@ -489,11 +489,14 @@ describe("executeApplicationFillForReview", () => {
     ["unknown_sensitive_field", "unknown_sensitive_field"], ["stale_review", "stale_review"],
   ])("maps %s to a fixed user wait", async (reason, detail) => {
     vi.mocked(detectBrowserWait).mockResolvedValue({ reason: reason as "captcha", message: "Never persist this page text" })
-    const { pool } = poolFor(context())
-    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    const observations: ApplicationFillStageObservation[] = []
+    const result = await executeApplicationFillForReview({ pool, lease: lease(), stageObserver: event => observations.push(event) })
     expect(result).toMatchObject({ status: "waiting_for_user", failureReason: detail })
     expect(persistApplicationFillWait).toHaveBeenCalledWith(pool, expect.objectContaining({ checkpoint: "form_answer_required", detail }))
     expect(JSON.stringify(vi.mocked(persistApplicationFillWait).mock.calls[0]?.[1])).not.toContain("Never persist this page text")
+    expect(observations).toContainEqual({ stage: "browser_acquisition", phase: "outer_wait_detected" })
     expect(executeBrowserFill).not.toHaveBeenCalled()
   })
 
