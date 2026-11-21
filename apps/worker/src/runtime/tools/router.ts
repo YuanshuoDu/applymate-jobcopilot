@@ -6,6 +6,7 @@ import type {
   RuntimeToolDefinition,
   ToolCallRequest,
   ToolExecutionResult,
+  ToolLifecycleFailure,
   ToolRouterContext,
   ToolExecutionContext,
 } from "./types.js"
@@ -63,7 +64,7 @@ export class ToolRouter {
   private async run(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> {
     const call: LifecycleCall = { ...context, id: request.id, toolName: request.toolName, toolVersion: request.toolVersion }
     if (context.signal?.aborted) {
-      await this.lifecycle.failed(call, "cancelled", "cancelled", { message: "Tool execution was interrupted before it started" })
+      await this.lifecycle.failed(call, "cancelled", "cancelled", { kind: "diagnostic", detail: { message: "Tool execution was interrupted before it started" } })
       return { ...request, status: "cancelled", errorCode: "cancelled" }
     }
     const isAskUserRequest = request.toolName === "agent.ask_user"
@@ -131,16 +132,16 @@ export class ToolRouter {
         ...(nativeQuestionReceipt ? { nativeQuestionReceipt } : {}) }
     } catch (error: unknown) {
       if (isSessionPauseRequestedError(error)) {
-        await this.lifecycle.failed(call, "failed", error.code, { message: "Session work is fenced by a durable pause request" })
+        await this.lifecycle.failed(call, "failed", error.code, { kind: "diagnostic", detail: { message: "Session work is fenced by a durable pause request" } })
         throw error
       }
       const code = execution?.signal.aborted ? execution.abortCode() : this.errorCode(error)
       const phase = code === "cancelled" || code === "timeout" ? "cancelled" : "failed"
       const structuredOutput = error instanceof ToolExecutionError ? error.safeOutput : undefined
-      const failureDetail = structuredOutput === undefined
-        ? { message: error instanceof Error ? error.message : "Tool execution failed" }
-        : structuredOutput
-      const safeOutput = await this.lifecycle.failed(call, phase, code, failureDetail)
+      const failure: ToolLifecycleFailure = structuredOutput === undefined
+        ? { kind: "diagnostic", detail: { message: error instanceof Error ? error.message : "Tool execution failed" } }
+        : { kind: "safe_output", output: structuredOutput }
+      const safeOutput = await this.lifecycle.failed(call, phase, code, failure)
       return {
         ...request,
         status: phase === "cancelled" ? "cancelled" : "failed",
