@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 import {
   APPLICATION_SUBMISSION_STOP_PROTOCOL_SCHEMA,
   APPLICATION_SUBMISSION_STOP_STAGES,
+  applicationSubmissionStopEventId,
   matchesExactApplicationSubmissionStopAttempt,
   parseApplicationSubmissionStopRecord,
   type ApplicationSubmissionStopAttempt,
@@ -69,5 +70,18 @@ describe("application submission stop protocol", () => {
       expect(matchesExactApplicationSubmissionStopAttempt({ ...record(), ...changed }, attempt)).toBe(false)
     }
     expect(matchesExactApplicationSubmissionStopAttempt({ ...record(), unknown: true }, attempt)).toBe(false)
+  })
+  it("uses deterministic stage keys that bind the receipt and WorkerTask", () => {
+    const key = {
+      sessionId: attempt.sessionId, fillTurnId: attempt.fillTurnId, applicationTaskId: attempt.applicationTaskId,
+      userId: attempt.userId, jobId: attempt.jobId, approvalId: attempt.approvalId, receiptId: attempt.receiptId,
+      constraintHash: attempt.constraintHash, workerTaskId: attempt.workerTaskId,
+    }
+    const armedId = applicationSubmissionStopEventId(key, "armed")
+    expect(armedId).toMatch(/^application-stop-v1-armed-[a-f0-9]{64}$/)
+    expect(applicationSubmissionStopEventId(key, "armed")).toBe(armedId)
+    expect(applicationSubmissionStopEventId(key, "dispatch_granted")).not.toBe(armedId)
+    expect(applicationSubmissionStopEventId({ ...key, workerTaskId: "worker_2" }, "armed")).not.toBe(armedId)
+    expect(applicationSubmissionStopEventId({ ...key, receiptId: "receipt_2", approvalId: "receipt_2" }, "armed")).not.toBe(armedId)
   })
 })

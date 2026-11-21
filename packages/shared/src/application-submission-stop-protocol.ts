@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto"
+
 export const APPLICATION_SUBMISSION_STOP_PROTOCOL_SCHEMA = "agent-harness.v2.application-submission-stop.v1" as const
 
 export const APPLICATION_SUBMISSION_STOP_STAGES = ["armed", "stop_requested", "dispatch_granted"] as const
@@ -79,4 +81,19 @@ export function matchesExactApplicationSubmissionStopAttempt(
     && record.constraintHash === expected.constraintHash
     && record.workerTaskId === expected.workerTaskId
     && record.executionId === expected.executionId
+}
+
+export type ApplicationSubmissionStopEventKey = Omit<ApplicationSubmissionStopAttempt, "executionId">
+
+/** Stable per-stage server key; executionId stays in the record so a new execution cannot reuse this receipt. */
+export function applicationSubmissionStopEventId(
+  key: ApplicationSubmissionStopEventKey,
+  stage: ApplicationSubmissionStopStage,
+): string {
+  const digest = createHash("sha256").update(JSON.stringify([
+    APPLICATION_SUBMISSION_STOP_PROTOCOL_SCHEMA,
+    key.userId, key.sessionId, key.fillTurnId, key.applicationTaskId, key.jobId,
+    key.approvalId, key.receiptId, key.constraintHash, key.workerTaskId, stage,
+  ])).digest("hex")
+  return `application-stop-v1-${stage}-${digest}`
 }
