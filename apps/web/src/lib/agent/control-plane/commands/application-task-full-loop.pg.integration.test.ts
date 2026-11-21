@@ -24,6 +24,8 @@ const REDIS_URL = "redis://127.0.0.1:6379/15"
 const runId = randomUUID().replaceAll("-", "")
 const candidateName = "A B"
 const candidateEmail = `${runId.slice(0, 1)}@${runId.slice(1, 3)}.co`
+const reviewedCoverLetter = "SYNTHETIC REVIEWED COVER LETTER — isolated fill only."
+const reviewedSourceGoal = "FULL_LOOP_REVIEWED_SOURCE: produce and review a selected-job cover letter"
 const ids = {
   user: `full-loop-user-${runId}`,
   foreignUser: `full-loop-foreign-${runId}`,
@@ -176,6 +178,8 @@ const describeWithServices = enabled ? describe : describe.skip
 type Child = ChildProcess & { readonly lines: string[]; readonly errors: string[] }
 type FixtureStats = {
   submitCount: number
+  reviewedSubmitCount: number
+  reviewedMaterialExactCount: number
   blocked: string[]
   requests: string[]
   browserTrace: string[]
@@ -221,6 +225,8 @@ let applyQueue: InstanceType<typeof Queue> | undefined
 let turnQueue: InstanceType<typeof Queue> | undefined
 let subagentQueue: InstanceType<typeof Queue> | undefined
 let createdUsers: string[] = []
+const reviewedSessionIds: string[] = []
+const reviewedJobIds: string[] = []
 let dbConnected = false
 let priorApplicationFillTaskGraph: string | undefined
 
@@ -259,6 +265,7 @@ function spawnFixture(mode: "site" | "worker"): Child {
       AGENT_TURN_REDIS_TEST_DISPOSABLE: "true", RUN_AGENT_TURN_REDIS_INTEGRATION: "1",
       CLOAK_PROXY_URL: "http://127.0.0.1:9443", APPLICATION_TASK_FULL_LOOP_SOCKET_PATH: socketPath,
       APPLICATION_TASK_FULL_LOOP_STAGE_OBSERVER_TEST: mode === "worker" ? "true" : "false",
+      ...(mode === "worker" ? { AGENT_WEB_URL: "", WEB_APP_URL: "", APPLYMATE_WEB_URL: "", AGENT_WORKER_SECRET: "" } : {}),
       BULLMQ_STALLED_INTERVAL_MS: "30000",
       ...(mode === "worker" ? { APPLICATION_TASK_FULL_LOOP_USER_ID: ids.user } : {}),
     },
@@ -860,21 +867,25 @@ async function cleanRunArtifacts(): Promise<void> {
     await unlink(socketPath).catch(() => undefined)
     return
   }
+  const sessionIds = [ids.session, ...reviewedSessionIds]
   const [submitOutbox, task, sessionTurns, sessionSubagents] = await Promise.all([
-    testDb.agentOutbox.findMany({ where: { aggregateId: ids.session, topic: "application.submit.dispatch" }, select: { payload: true } }),
+    testDb.agentOutbox.findMany({ where: { aggregateId: { in: sessionIds }, topic: "application.submit.dispatch" }, select: { payload: true } }),
     gateTaskId ? testDb.applicationTask.findUnique({ where: { id: gateTaskId }, select: { workerTaskId: true } }) : Promise.resolve(null),
-    testDb.agentTurn.findMany({ where: { sessionId: ids.session }, select: { id: true } }),
-    testDb.subAgentTask.findMany({ where: { sessionId: ids.session }, select: { id: true } }),
+    testDb.agentTurn.findMany({ where: { sessionId: { in: sessionIds } }, select: { id: true } }),
+    testDb.subAgentTask.findMany({ where: { sessionId: { in: sessionIds } }, select: { id: true } }),
   ])
   const ownedSubmitJobIds = new Set(submitOutbox.map(row => jsonString(row.payload, "workerTaskId")).filter((id): id is string => Boolean(id)))
   if (task?.workerTaskId) ownedSubmitJobIds.add(task.workerTaskId)
+  const ownedApplicationTaskIds = new Set((await testDb.applicationTask.findMany({
+    where: { sessionId: { in: sessionIds } }, select: { id: true, workerTaskId: true },
+  })).flatMap(row => [row.id, ...(row.workerTaskId ? [row.workerTaskId] : [])]))
   const ownedTurnIds = new Set(sessionTurns.map(turnRow => turnRow.id))
   const ownedSubagentTaskIds = new Set(sessionSubagents.map(taskRow => taskRow.id))
   const queueCleanupDeadline = Date.now() + 20_000
   const queueCleanup = await Promise.allSettled([
     removeScopedQueueJobs(applyQueue, job => {
       const applicationTaskId = jsonString(job.data, "applicationTaskId")
-      return Boolean(job.id && ownedSubmitJobIds.has(job.id)) || (gateTaskId !== undefined && applicationTaskId === gateTaskId)
+      return Boolean(job.id && ownedSubmitJobIds.has(job.id)) || Boolean(applicationTaskId && ownedApplicationTaskIds.has(applicationTaskId))
     }, queueCleanupDeadline),
     removeScopedQueueJobs(turnQueue, job => {
       const turnId = jsonString(job.data, "turnId")
@@ -886,7 +897,12 @@ async function cleanRunArtifacts(): Promise<void> {
     }, queueCleanupDeadline),
   ])
   const failedQueueCleanup = queueCleanup.some(result => result.status === "rejected")
-  await testDb.agentOutbox.deleteMany({ where: { aggregateId: ids.session } })
+  await testDb.agentOutbox.deleteMany({ where: { aggregateId: { in: sessionIds } } })
+  if (reviewedJobIds.length) {
+    await testDb.agentArtifact.deleteMany({ where: { userId: ids.user, jobId: { in: reviewedJobIds } } })
+    await testDb.agentSession.deleteMany({ where: { id: { in: reviewedSessionIds }, userId: ids.user } })
+    await testDb.job.deleteMany({ where: { id: { in: reviewedJobIds }, userId: ids.user } })
+  }
   if (createdUsers.length) await testDb.user.deleteMany({ where: { id: { in: createdUsers } } })
   await unlink(socketPath).catch(() => undefined)
   if (failedQueueCleanup) throw new Error("Scoped BullMQ cleanup left owned jobs behind")
@@ -897,6 +913,82 @@ async function assertNoSubmitBeforeApproval(): Promise<void> {
   const outbox = await testDb.agentOutbox.count({ where: { topic: "application.submit.dispatch", aggregateId: ids.session } })
   expect(outbox).toBe(0)
   expect(await requestFixtureStats()).toMatchObject({ submitCount: 0, blocked: [] })
+}
+
+async function waitForAgentTurnTerminal(turnId: string, timeoutMs = 180_000) {
+  const until = Date.now() + timeoutMs
+  let latest: { status: string; error: string | null } | null = null
+  while (Date.now() < until) {
+    latest = await testDb.agentTurn.findUnique({ where: { id: turnId }, select: { status: true, error: true } })
+    if (latest && ["completed", "failed", "cancelled", "interrupted"].includes(latest.status)) return latest
+    if (worker && exited(worker)) throw new Error("Worker exited while waiting for a canonical Turn")
+    await delay(100)
+  }
+  throw new Error(`Canonical Turn did not reach terminal state; status=${latest?.status ?? "missing"}`)
+}
+
+async function waitForReviewedApproval(approvalId: string, timeoutMs = 90_000) {
+  const until = Date.now() + timeoutMs
+  while (Date.now() < until) {
+    const approval = await testDb.agentApproval.findUnique({ where: { id: approvalId } })
+    if (approval) return approval
+    if (worker && exited(worker)) throw new Error("Worker exited while waiting for reviewed approval")
+    await delay(100)
+  }
+  throw new Error("Worker did not issue the reviewed-application approval")
+}
+
+async function waitForReviewedApplicationTask(jobId: string, predicate: (task: ApplicationTaskRow) => boolean, timeoutMs = 120_000): Promise<ApplicationTaskRow> {
+  const until = Date.now() + timeoutMs
+  let latest: ApplicationTaskRow | null = null
+  while (Date.now() < until) {
+    latest = await testDb.applicationTask.findUnique({ where: { userId_jobId: { userId: ids.user, jobId } } }) as ApplicationTaskRow | null
+    if (latest && predicate(latest)) return latest
+    if (worker && exited(worker)) throw new Error("Worker exited while waiting for reviewed ApplicationTask")
+    await delay(100)
+  }
+  throw new Error(`Reviewed ApplicationTask did not reach the expected state; status=${latest?.status ?? "missing"}; checkpoint=${latest?.checkpoint ?? "missing"}`)
+}
+
+async function createReviewedSourceScenario(label: "positive" | "stale", description: string) {
+  const jobId = `full-loop-reviewed-job-${runId}-${label}`
+  const sessionId = `full-loop-reviewed-session-${runId}-${label}`
+  reviewedJobIds.push(jobId)
+  reviewedSessionIds.push(sessionId)
+  await testDb.job.create({ data: {
+    id: jobId, userId: ids.user, company: "ApplyMate Synthetic Fixture Employer", role: "Software Engineer", location: "Dublin",
+    url: "https://boards.greenhouse.io/example/reviewed/jobs/1", description, keywords: "TypeScript", score: 92,
+    workflowState: "ready_to_apply", status: "saved",
+  } })
+  await testDb.agentSession.create({ data: { id: sessionId, userId: ids.user, goal: `Isolated reviewed fill ${label}`, status: "running", source: "application_full_loop_reviewed" } })
+  return { jobId, sessionId }
+}
+
+async function startSelectedJobSource(input: { sessionId: string; jobId: string; token: string; key: string }) {
+  const { POST } = await import("@/app/api/agent/sessions/[id]/messages/route")
+  const response = await POST(apiRequest(`/api/agent/sessions/${input.sessionId}/messages`, input.token, "POST", {
+    clientMessageId: input.key, delivery: "follow_up", expectedTurnId: null, expectedRevision: 0,
+    content: [{ type: "text", text: reviewedSourceGoal }], selectedJobPreparation: { jobId: input.jobId },
+  }), { params: Promise.resolve({ id: input.sessionId }) })
+  expect(response.status).toBe(202)
+  const body = await jsonResponse(response)
+  expect(typeof body.turnId).toBe("string")
+  const turnId = body.turnId as string
+  const terminal = await waitForAgentTurnTerminal(turnId)
+  expect(terminal.status).toBe("completed")
+  const turn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: turnId } })
+  expect(turn).toMatchObject({ source: "user", status: "completed", executionMode: "canonical_task_graph" })
+  expect(turn.input).toMatchObject({ selectedJobPreparation: { jobId: input.jobId } })
+  return { turnId, turn }
+}
+
+async function startReviewedApplicationReview(input: { sessionId: string; sourceTurnId: string; token: string; key: string }) {
+  const { POST } = await import("@/app/api/agent/sessions/[id]/reviewed-application-review/route")
+  const path = `/api/agent/sessions/${input.sessionId}/reviewed-application-review`
+  const response = await POST(apiRequest(path, input.token, "POST", {
+    sourceTurnId: input.sourceTurnId, idempotencyKey: input.key,
+  }), { params: Promise.resolve({ id: input.sessionId }) })
+  return { response, body: await jsonResponse(response) }
 }
 
 describeWithServices("ApplicationTask production full-loop PostgreSQL integration", () => {
@@ -1316,6 +1408,182 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     }
     expect(redeliveryEvent.jobId).toBe(workerTaskId)
     expect((await requestFixtureStats()).submitCount).toBe(1)
+  }, 300_000)
+
+  it("runs selected-job Writer → Reviewer → user approval → the same submit-disabled Fill Turn", async () => {
+    const scenario = await createReviewedSourceScenario("positive", "Synthetic source description for reviewed fill integration.")
+    const token = await signedBearer(ids.user)
+    const source = await startSelectedJobSource({ ...scenario, token, key: `reviewed-source-positive-${runId}` })
+    const sourceChildren = await testDb.subAgentTask.findMany({ where: {
+      sessionId: scenario.sessionId, turnId: source.turnId, role: { in: ["writer", "reviewer"] }, status: "completed",
+    }, select: { id: true, role: true, result: true } })
+    expect(sourceChildren.map(child => child.role).sort()).toEqual(["reviewer", "writer"])
+    const writer = sourceChildren.find(child => child.role === "writer")!
+    const reviewer = sourceChildren.find(child => child.role === "reviewer")!
+    const writerResult = jsonRecord(writer.result)
+    const reviewerResult = jsonRecord(reviewer.result)
+    expect(writerResult).toMatchObject({ schemaVersion: "agent-harness.v2.subagent.result", role: "writer", status: "completed" })
+    expect(reviewerResult).toMatchObject({ schemaVersion: "agent-harness.v2.subagent.result", role: "reviewer", status: "completed", reviewStatus: "passed" })
+    const artifactRef = jsonRecord(writerResult?.artifactRef)
+    expect(artifactRef).toMatchObject({ artifactId: expect.any(String), version: expect.any(Number),
+      contentHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/), sourceDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) })
+    expect(reviewerResult?.artifactRef).toEqual(artifactRef)
+    const versions = await testDb.agentArtifactVersion.findMany({ where: {
+      userId: ids.user, sessionId: scenario.sessionId, jobId: scenario.jobId, artifactId: artifactRef!.artifactId as string,
+    }, select: { artifactId: true, version: true, content: true, contentHash: true, sourceDigest: true, taskId: true } })
+    expect(versions).toHaveLength(1)
+    expect(versions[0]).toMatchObject({ artifactId: artifactRef!.artifactId, version: artifactRef!.version,
+      content: reviewedCoverLetter, contentHash: artifactRef!.contentHash, sourceDigest: artifactRef!.sourceDigest, taskId: writer.id })
+    const reviews = await testDb.agentArtifactReview.findMany({ where: {
+      userId: ids.user, sessionId: scenario.sessionId, jobId: scenario.jobId, artifactId: artifactRef!.artifactId as string,
+      version: artifactRef!.version as number, status: "passed",
+    }, select: { artifactId: true, version: true, taskId: true, reviewHash: true, status: true } })
+    expect(reviews).toHaveLength(1)
+    expect(reviews[0]).toMatchObject({ taskId: reviewer.id, reviewHash: reviewerResult?.reviewHash, status: "passed" })
+
+    const reviewKey = `reviewed-review-positive-${runId}`
+    const firstRequest = await startReviewedApplicationReview({ ...scenario, sourceTurnId: source.turnId, token, key: reviewKey })
+    expect(firstRequest.response.status).toBe(202)
+    const reviewTurnId = firstRequest.body.turnId
+    expect(typeof reviewTurnId).toBe("string")
+    const duplicateRequest = await startReviewedApplicationReview({ ...scenario, sourceTurnId: source.turnId, token, key: reviewKey })
+    expect([200, 202]).toContain(duplicateRequest.response.status)
+    expect(duplicateRequest.body.turnId).toBe(reviewTurnId)
+
+    const approvalId = `reviewed-application-review:${String(reviewTurnId)}`
+    const approval = await waitForReviewedApproval(approvalId)
+    expect(approval).toMatchObject({ id: approvalId, userId: ids.user, sessionId: scenario.sessionId,
+      turnId: reviewTurnId, type: "review_application", status: "pending", jobId: scenario.jobId })
+    const applicationTaskId = approval.taskId
+    expect(typeof applicationTaskId).toBe("string")
+    const taskBeforeDecision = await testDb.applicationTask.findUniqueOrThrow({ where: { id: applicationTaskId! } })
+    expect(taskBeforeDecision).toMatchObject({ userId: ids.user, sessionId: scenario.sessionId, jobId: scenario.jobId,
+      status: "waiting_for_user", checkpoint: "materials_ready" })
+    const waitId = `agent-wait:approval:${approvalId}`
+    const waitItem = await testDb.agentItem.findUniqueOrThrow({ where: { id: waitId } })
+    expect(waitItem).toMatchObject({ id: waitId, sessionId: scenario.sessionId, turnId: reviewTurnId,
+      type: "approval_request", status: "started" })
+    expect(waitItem.content).toMatchObject({ waitKind: "approval", approvalId, action: "review_application",
+      impact: { externalSubmission: false, jobId: scenario.jobId } })
+    expect(jsonRecord(waitItem.content)).not.toHaveProperty("responseAvailable")
+
+    const { GET: getApproval } = await import("@/app/api/agent/sessions/[id]/approvals/[approvalId]/route")
+    const nonceResponse = await getApproval(apiRequest(`/api/agent/sessions/${scenario.sessionId}/approvals/${approvalId}`, token, "GET"), {
+      params: Promise.resolve({ id: scenario.sessionId, approvalId }),
+    })
+    expect(nonceResponse.status).toBe(200)
+    const nonceBody = await jsonResponse(nonceResponse)
+    const receiptNonce = typeof nonceBody.receiptNonce === "string" ? nonceBody.receiptNonce : ""
+    expect(receiptNonce.length).toBeGreaterThan(20)
+    const { POST: approvalAction } = await import("@/app/api/agent/sessions/[id]/actions/route")
+    const decision = await approvalAction(apiRequest(`/api/agent/sessions/${scenario.sessionId}/actions`, token, "POST", {
+      type: "approval_response", approvalId, decision: "approved", receiptNonce, reviewedSourceTurnId: source.turnId,
+    }), { params: Promise.resolve({ id: scenario.sessionId }) })
+    expect(decision.status).toBe(200)
+    expect((await waitForAgentTurnTerminal(String(reviewTurnId))).status).toBe("completed")
+    expect(await testDb.agentApproval.findUniqueOrThrow({ where: { id: approvalId }, select: { status: true } })).toEqual({ status: "approved" })
+    expect(await testDb.agentItem.findUniqueOrThrow({ where: { id: waitId }, select: { status: true } })).toEqual({ status: "completed" })
+
+    const sourceEvents = await testDb.applicationTaskEvent.findMany({ where: {
+      taskId: applicationTaskId!, type: "reviewed_material_source_bound", actor: "user",
+    }, select: { type: true, actor: true, data: true } })
+    expect(sourceEvents).toHaveLength(1)
+    expect(sourceEvents[0]).toMatchObject({ type: "reviewed_material_source_bound", actor: "user",
+      data: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", approvalId, sourceTurnId: source.turnId } })
+    expect(JSON.stringify(sourceEvents[0]?.data)).not.toContain(reviewedCoverLetter)
+    const handoffs = await testDb.agentOutbox.findMany({ where: { topic: "agent.reviewed-fill.dispatch", aggregateId: scenario.sessionId } })
+    expect(handoffs).toHaveLength(1)
+    const handoff = handoffs[0]!
+    expect(handoff).toMatchObject({ topic: "agent.reviewed-fill.dispatch", aggregateId: scenario.sessionId,
+      idempotencyKey: `agent-reviewed-fill:${approvalId}`, publishedAt: null })
+    const handoffPayload = jsonRecord(handoff.payload)
+    expect(Object.keys(handoffPayload ?? {}).sort()).toEqual(["approvalId", "applicationTaskId", "predecessorTurnId", "schemaVersion", "sessionId", "userId"])
+    expect(handoffPayload).toEqual({ schemaVersion: "agent-harness.v2.reviewed-fill-handoff.v1", userId: ids.user,
+      sessionId: scenario.sessionId, applicationTaskId, approvalId, predecessorTurnId: reviewTurnId })
+
+    const { db } = await import("@/lib/db")
+    const { processReviewedFillHandoffOutbox } = await import("@/lib/agent/approval/reviewed-fill-handoff-outbox")
+    // Model a lost acknowledgement: the durable dispatch commits, but the caller never observes its result.
+    const lostAcknowledgementAttempt = processReviewedFillHandoffOutbox(db, handoff.id)
+    const firstFill = await waitForReviewedApplicationTask(scenario.jobId, task => Boolean(task.fillTurnId))
+    await lostAcknowledgementAttempt
+    const fillTurnId = firstFill.fillTurnId!
+    expect(await processReviewedFillHandoffOutbox(db, handoff.id)).toBe("duplicate")
+    const replayedTask = await testDb.applicationTask.findUniqueOrThrow({ where: { id: applicationTaskId! } })
+    expect(replayedTask.fillTurnId).toBe(fillTurnId)
+    expect(await testDb.agentTurn.count({ where: { id: fillTurnId, sessionId: scenario.sessionId } })).toBe(1)
+    expect(await testDb.agentOutbox.count({ where: { aggregateId: scenario.sessionId, topic: "agent.turn.dispatch",
+      idempotencyKey: `turn-dispatch:${fillTurnId}` } })).toBe(1)
+    const fillTurn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: fillTurnId } })
+    expect(jsonRecord(fillTurn.input)?.reviewedApplicationMaterialSource).toEqual({
+      schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: source.turnId,
+    })
+
+    const completedFill = await waitForReviewedApplicationTask(scenario.jobId,
+      task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", 180_000)
+    expect(completedFill.fillTurnId).toBe(fillTurnId)
+    const reviewedBrowserEvents = await testDb.applicationTaskEvent.findMany({ where: {
+      taskId: applicationTaskId!, type: "reviewed_application_fill_browser_started", actor: "worker",
+    }, select: { type: true, actor: true, data: true } })
+    expect(reviewedBrowserEvents).toHaveLength(1)
+    expect(reviewedBrowserEvents[0]?.data).toMatchObject({
+      schemaVersion: "agent-harness.v2.reviewed-application-fill-browser-start.v1", userId: ids.user,
+      sessionId: scenario.sessionId, fillTurnId, applicationTaskId, jobId: scenario.jobId, sourceTurnId: source.turnId,
+    })
+    expect(jsonRecord(reviewedBrowserEvents[0]?.data)?.reviewedCoverLetterHash).toMatch(/^sha256:[a-f0-9]{64}$/)
+    let fixtureStats = await requestFixtureStats()
+    const traceDeadline = Date.now() + 20_000
+    while (fixtureStats.reviewedMaterialExactCount < 1 && Date.now() < traceDeadline) {
+      await delay(100)
+      fixtureStats = await requestFixtureStats()
+    }
+    expect(fixtureStats.browserTrace).toContain("input:cover_letter")
+    expect(fixtureStats.reviewedMaterialExactCount).toBeGreaterThan(0)
+    expect(JSON.stringify(fixtureStats)).not.toContain(reviewedCoverLetter)
+    expect(fixtureStats.reviewedSubmitCount).toBe(0)
+    expect(fixtureStats.requests).not.toContain("POST /example/reviewed/jobs/1")
+
+    const submitApprovals = await testDb.agentApproval.findMany({ where: {
+      userId: ids.user, sessionId: scenario.sessionId, turnId: fillTurnId, taskId: applicationTaskId!,
+      jobId: scenario.jobId, type: "submit_application", status: "pending",
+    } })
+    expect(submitApprovals).toHaveLength(1)
+    const submitWaitId = `agent-wait:approval:${submitApprovals[0]!.id}`
+    expect(await testDb.agentItem.findUniqueOrThrow({ where: { id: submitWaitId } })).toMatchObject({
+      id: submitWaitId, sessionId: scenario.sessionId, turnId: fillTurnId, type: "approval_request", status: "started",
+      content: { waitKind: "approval", approvalId: submitApprovals[0]!.id, action: "submit_application" },
+    })
+    expect(await testDb.agentOutbox.count({ where: { aggregateId: scenario.sessionId, topic: "application.submit.dispatch" } })).toBe(0)
+    expect((await submitQueueJobs()).filter(job => jsonString(job.data, "applicationTaskId") === applicationTaskId)).toHaveLength(0)
+    expect(fixtureStats.reviewedSubmitCount).toBe(0)
+  }, 300_000)
+
+  it("denies reviewed approval when the selected-job source changes after Writer and Reviewer finish", async () => {
+    const scenario = await createReviewedSourceScenario("stale", "Original synthetic source description.")
+    const token = await signedBearer(ids.user)
+    const source = await startSelectedJobSource({ ...scenario, token, key: `reviewed-source-stale-${runId}` })
+    const sourceChildren = await testDb.subAgentTask.findMany({ where: {
+      sessionId: scenario.sessionId, turnId: source.turnId, role: { in: ["writer", "reviewer"] }, status: "completed",
+    }, select: { role: true, result: true } })
+    expect(sourceChildren.map(child => child.role).sort()).toEqual(["reviewer", "writer"])
+    expect(jsonRecord(sourceChildren.find(child => child.role === "reviewer")?.result)).toMatchObject({ reviewStatus: "passed" })
+    const before = await requestFixtureStats()
+    await testDb.job.update({ where: { id: scenario.jobId }, data: { description: "Synthetic description changed after review." } })
+    const started = await startReviewedApplicationReview({ ...scenario, sourceTurnId: source.turnId, token, key: `reviewed-review-stale-${runId}` })
+    expect(started.response.status).toBe(202)
+    expect(typeof started.body.turnId).toBe("string")
+    const reviewTurnId = started.body.turnId as string
+    const terminal = await waitForAgentTurnTerminal(reviewTurnId)
+    expect(terminal.status).toBe("failed")
+    expect(terminal.error).toBe("reviewed_application_review_denied")
+    expect(await testDb.agentApproval.count({ where: { userId: ids.user, sessionId: scenario.sessionId, type: "review_application" } })).toBe(0)
+    expect(await testDb.applicationTask.count({ where: { userId: ids.user, sessionId: scenario.sessionId, jobId: scenario.jobId } })).toBe(0)
+    expect(await testDb.agentOutbox.count({ where: { aggregateId: scenario.sessionId, topic: "agent.reviewed-fill.dispatch" } })).toBe(0)
+    const after = await requestFixtureStats()
+    expect(after.requests.filter(path => path.includes("/example/reviewed/jobs/1"))).toEqual(
+      before.requests.filter(path => path.includes("/example/reviewed/jobs/1")))
+    expect(after.reviewedSubmitCount).toBe(0)
+    expect(after.requests).not.toContain("POST /example/reviewed/jobs/1")
   }, 300_000)
 })
 
