@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 
 import { Prisma } from "@prisma/client"
-import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, type InputContentPart, type TurnSource } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, REVIEWED_APPLICATION_REVIEW_INTENT, type InputContentPart, type TurnSource } from "@jobcopilot/agent-protocol"
 
 import { appendAgentEventWithOutboxInTransaction } from "../../session/fact-store"
 import { activeTurnChanged, sessionNotFound } from "./errors"
@@ -95,13 +95,15 @@ export async function createRootTurn(
   verificationRequirements?: ObjectiveVerificationRequirements | null,
 ): Promise<ActiveTurn> {
   const goal = explicitGoal ?? (content.filter((part) => part.type === "text").map((part) => part.text).join("\n").trim() || "Process the provided content")
+  const canonicalExecution = command.source === "user" && (selectedJobPreparation !== undefined
+    || (intent?.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind && intent.version === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version)
+    || (intent?.kind === REVIEWED_APPLICATION_REVIEW_INTENT.kind && intent.version === REVIEWED_APPLICATION_REVIEW_INTENT.version))
   const turn = await tx.agentTurn.create({
     data: {
       id: randomUUID(),
       sessionId: command.sessionId,
       userId: command.userId,
-      ...(command.source === "user" && intent?.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind
-        && intent.version === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version ? { executionMode: "canonical_task_graph" as const } : {}),
+      ...(canonicalExecution ? { executionMode: "canonical_task_graph" as const } : {}),
       status: "queued",
       source: command.source,
       input: json({

@@ -122,7 +122,8 @@ function makeDb(options: {
       }),
       create: vi.fn(async (args: unknown) => {
         const data = (args as { data: Row }).data
-        active = { id: String(data.id), source: data.source, status: "queued", revision: 0, input: data.input }
+        active = { id: String(data.id), source: data.source, status: "queued", revision: 0, input: data.input,
+          ...(data.executionMode === undefined ? {} : { executionMode: data.executionMode }) }
         turns.push(active)
         return { id: active.id }
       }),
@@ -603,6 +604,7 @@ describe("AgentCommandService", () => {
 
     expect(result.disposition).toBe("started")
     expect(fake.state.active?.input).toMatchObject({ selectedJobPreparation: { jobId: "job_1" } })
+    expect(fake.state.active?.executionMode).toBe("canonical_task_graph")
     expect(JSON.stringify(fake.state.items[0]?.content)).not.toContain("job_1")
   })
 
