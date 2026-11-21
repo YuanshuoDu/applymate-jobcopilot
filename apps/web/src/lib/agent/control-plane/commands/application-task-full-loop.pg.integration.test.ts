@@ -1854,7 +1854,24 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const reviewTurnId = started.body.turnId as string
     const terminal = await waitForAgentTurnTerminal(reviewTurnId)
     expect(terminal.status).toBe("failed")
-    expect(terminal.error).toBe("reviewed_application_review_denied")
+    const failedReviewTurn = await testDb.agentTurn.findFirst({ where: {
+      id: reviewTurnId, userId: ids.user, sessionId: scenario.sessionId, session: { userId: ids.user }, source: "user", status: "failed",
+    }, select: { rootTaskId: true, input: true } })
+    expect(failedReviewTurn?.input).toMatchObject({ intent: {
+      kind: "reviewed_application_review", version: 1, sourceTurnId: source.turnId, jobId: scenario.jobId,
+    } })
+    const rootTaskId = failedReviewTurn?.rootTaskId
+    if (typeof rootTaskId !== "string" || !rootTaskId) throw new Error("reviewed_application_failed_root_missing")
+    const failureReceipt = await testDb.subAgentTask.findFirst({ where: {
+      id: rootTaskId, rootTaskId, sessionId: scenario.sessionId, turnId: reviewTurnId, parentTaskId: null,
+      role: "orchestrator", taskType: "root", session: { userId: ids.user },
+    }, select: { id: true, rootTaskId: true, sessionId: true, turnId: true, parentTaskId: true,
+      role: true, taskType: true, status: true, failureReason: true, result: true } })
+    expect(failureReceipt).toMatchObject({
+      id: rootTaskId, rootTaskId, sessionId: scenario.sessionId, turnId: reviewTurnId, parentTaskId: null,
+      role: "orchestrator", taskType: "root", status: "failed", failureReason: "reviewed_application_review_denied",
+      result: { status: "failed", stepCount: 0, toolCallCount: 0, finalItemId: null, waitId: null },
+    })
     expect(await testDb.agentApproval.count({ where: { userId: ids.user, sessionId: scenario.sessionId, type: "review_application" } })).toBe(0)
     expect(await testDb.applicationTask.count({ where: { userId: ids.user, sessionId: scenario.sessionId, jobId: scenario.jobId } })).toBe(0)
     expect(await testDb.agentOutbox.count({ where: { aggregateId: scenario.sessionId, topic: "agent.reviewed-fill.dispatch" } })).toBe(0)
