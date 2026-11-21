@@ -466,16 +466,20 @@ describe("ToolLifecycle", () => {
     const observed: unknown[] = []
     const lifecycle = new ToolLifecycle({
       sink,
+      maxEventBytes: 256,
       onDiscoveryAttemptLifecycleEvent: event => {
         observed.push(event)
         if (event.phase !== "started") throw new Error("observer failure")
       },
     })
-    const failure = { usage: discoverUsage(call.id) }
+    const failure = { message: "x".repeat(2_000), usage: discoverUsage(call.id) }
     await lifecycle.started({ ...call, toolName: "jobs.discover" }, {})
-    await expect(lifecycle.failed({ ...call, toolName: "jobs.discover" }, "failed", "job_discovery_failed", failure)).resolves.toBeDefined()
+    await expect(lifecycle.failed({ ...call, toolName: "jobs.discover" }, "failed", "job_discovery_failed", { kind: "diagnostic", detail: failure })).resolves.toBeNull()
     expect(observed).toHaveLength(2)
+    expect(observed[1]).toMatchObject({ output: failure })
     expect(sink.events.at(-1)?.phase).toBe("failed")
+    expect(sink.events.at(-1)).toMatchObject({ item: { output: null }, payload: { failureKind: "diagnostic", output: null, errorCode: "job_discovery_failed", failureDetail: { $truncated: true } } })
+    expect(JSON.stringify(sink.events)).not.toContain("ledger-discover")
   })
 
   it("uses the 6 KiB resume limit only for jobs.discover lifecycle output", async () => {
@@ -673,8 +677,8 @@ describe("ToolLifecycle", () => {
     const sink = new InMemoryToolLifecycleSink()
     const lifecycle = new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore(), now: () => "2026-08-31T12:00:00.000Z" })
     await lifecycle.started(call, {})
-    await lifecycle.failed(call, "cancelled", "cancelled", { reason: "stop" })
-    expect(sink.events.at(-1)).toMatchObject({ phase: "cancelled", item: { status: "interrupted", errorCode: "cancelled" } })
+    await lifecycle.failed(call, "cancelled", "cancelled", { kind: "diagnostic", detail: { reason: "stop" } })
+    expect(sink.events.at(-1)).toMatchObject({ phase: "cancelled", item: { status: "interrupted", errorCode: "cancelled", output: null }, payload: { failureKind: "diagnostic", output: null, failureDetail: { reason: "stop" } } })
   })
 
   it("persists only oversized completed output with the actual call identity", async () => {
