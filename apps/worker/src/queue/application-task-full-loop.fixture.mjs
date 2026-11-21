@@ -5,7 +5,7 @@ import { createHash } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { unlink } from "node:fs/promises"
 import { Pool } from "pg"
-import { HOST, fixtureModel, required, safeBlockedTarget } from "./application-task-full-loop.fixture-support.mjs"
+import { HOST, assertToolMessagePairs, failModel, fixtureModel, required, safeBlockedTarget } from "./application-task-full-loop.fixture-support.mjs"
 import { applicationFillStageTrace, traceApplicationFillExecutor } from "./application-task-full-loop.trace-support.mjs"
 
 const [, , mode] = process.argv

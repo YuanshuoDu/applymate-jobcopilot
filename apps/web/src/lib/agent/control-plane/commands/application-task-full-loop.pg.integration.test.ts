@@ -82,10 +82,50 @@ const SAFE_DIAGNOSTIC_ERROR_CODES = new Set([
   "fill_prestart_failure_unavailable",
   "fill_completion_conflict",
 ])
+const REVIEWED_SOURCE_DIAGNOSTIC_STATUSES = new Set([
+  "queued", "running", "waiting", "completed", "failed", "cancelled", "interrupted", "retrying",
+])
+const REVIEWED_SOURCE_DIAGNOSTIC_TOOLS = new Set([
+  "agent.plan", "agent.wait", "cover_letter.draft", "artifact.version.read", "artifact.review",
+])
 
 function diagnosticMachineErrorCode(value: unknown): string | null {
   if (value === null || value === undefined) return null
   return typeof value === "string" && SAFE_DIAGNOSTIC_ERROR_CODES.has(value) ? value : "present"
+}
+
+function reviewedSourceDiagnosticStatus(value: unknown): string {
+  return typeof value === "string" && REVIEWED_SOURCE_DIAGNOSTIC_STATUSES.has(value) ? value : "other"
+}
+
+function reviewedSourceDiagnosticSummary(
+  turn: { status: unknown; error: unknown } | null,
+  tasks: readonly { role: unknown; status: unknown; failureReason: unknown }[],
+  tools: readonly { status: unknown; content: unknown }[],
+) {
+  return {
+    root: { status: reviewedSourceDiagnosticStatus(turn?.status), errorCode: diagnosticMachineErrorCode(turn?.error) },
+    tasks: tasks.map(task => ({
+      role: task.role === "writer" || task.role === "reviewer" ? task.role : "other",
+      status: reviewedSourceDiagnosticStatus(task.status), failureCode: diagnosticMachineErrorCode(task.failureReason),
+    })),
+    tools: tools.map(item => {
+      const name = jsonString(item.content, "toolName")
+      return { name: name && REVIEWED_SOURCE_DIAGNOSTIC_TOOLS.has(name) ? name : "other",
+        status: reviewedSourceDiagnosticStatus(item.status) }
+    }),
+  }
+}
+
+async function reviewedSourceTurnDiagnostics(sessionId: string, turnId: string) {
+  const [turn, tasks, tools] = await Promise.all([
+    testDb.agentTurn.findUnique({ where: { id: turnId }, select: { status: true, error: true } }),
+    testDb.subAgentTask.findMany({ where: { sessionId, turnId }, orderBy: { createdAt: "asc" }, take: 12,
+      select: { role: true, status: true, failureReason: true } }),
+    testDb.agentItem.findMany({ where: { sessionId, turnId, type: "tool_call" }, orderBy: { createdAt: "asc" }, take: 24,
+      select: { status: true, content: true } }),
+  ])
+  return reviewedSourceDiagnosticSummary(turn, tasks, tools)
 }
 
 const SAFE_SUBMIT_OUTBOX_ERROR_CATEGORIES = [
@@ -422,6 +462,31 @@ describe("ApplicationTask full-loop stage trace parser", () => {
     }
     const child = { lines: [`APPLICATION_FILL_STAGE_TRACE ${JSON.stringify(trace)}`] } as unknown as Child
     expect(applicationFillStageTraces(child)).toEqual([{ traceInvalid: true }])
+  })
+})
+
+describe("reviewed source turn diagnostics", () => {
+  it("keeps only bounded allowlisted fields", () => {
+    const summary = reviewedSourceDiagnosticSummary(
+      { status: "failed", error: "private root error detail" },
+      [
+        { role: "writer", status: "failed", failureReason: "application_fill_material_unavailable" },
+        { role: "private role", status: "private status", failureReason: "private task error" },
+      ],
+      [
+        { status: "completed", content: { toolName: "agent.plan", input: { text: "private source text" } } },
+        { status: "private status", content: { toolName: "private.tool", arguments: { secret: "private" } } },
+      ],
+    )
+    expect(summary).toEqual({
+      root: { status: "failed", errorCode: "present" },
+      tasks: [
+        { role: "writer", status: "failed", failureCode: "application_fill_material_unavailable" },
+        { role: "other", status: "other", failureCode: "present" },
+      ],
+      tools: [{ name: "agent.plan", status: "completed" }, { name: "other", status: "other" }],
+    })
+    expect(JSON.stringify(summary)).not.toContain("private")
   })
 })
 
@@ -1116,7 +1181,10 @@ async function startSelectedJobSource(input: { sessionId: string; jobId: string;
   expect(typeof body.turnId).toBe("string")
   const turnId = body.turnId as string
   const terminal = await waitForAgentTurnTerminal(turnId)
-  expect(terminal.status).toBe("completed")
+  if (terminal.status !== "completed") {
+    const diagnostics = await reviewedSourceTurnDiagnostics(input.sessionId, turnId)
+    throw new Error(`selected_job_source_turn_not_completed ${JSON.stringify(diagnostics)}`)
+  }
   const turn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: turnId } })
   expect(turn).toMatchObject({ source: "user", status: "completed", executionMode: "canonical_task_graph" })
   expect(turn.input).toMatchObject({ selectedJobPreparation: { jobId: input.jobId } })

@@ -247,4 +247,4 @@ function fixtureModel() {
     registry: {}, candidates: [],
   }
 }
-export { HOST, fixtureModel, required, safeBlockedTarget }
+export { HOST, assertToolMessagePairs, failModel, fixtureModel, required, safeBlockedTarget }
