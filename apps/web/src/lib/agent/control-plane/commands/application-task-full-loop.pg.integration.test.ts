@@ -10,6 +10,7 @@ import { setTimeout as delay } from "node:timers/promises"
 
 import { Prisma, PrismaClient } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
+import { hashReviewedApplicationMaterialProof } from "@jobcopilot/shared"
 import { SignJWT } from "jose"
 import { NextRequest } from "next/server"
 import { afterAll, beforeAll, describe, expect, it, onTestFailed, vi } from "vitest"
@@ -1651,6 +1652,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const scenario = await createReviewedSourceScenario("positive", "Synthetic source description for reviewed fill integration.")
     const token = await signedBearer(ids.user)
     const source = await startSelectedJobSource({ ...scenario, token, key: `reviewed-source-positive-${runId}` })
+    const sourceRootTaskId = source.turn.rootTaskId
+    if (typeof sourceRootTaskId !== "string" || !sourceRootTaskId) throw new Error("reviewed_source_root_missing")
+    const sourceGraph = await testDb.agentItem.findFirstOrThrow({ where: {
+      sessionId: scenario.sessionId, turnId: source.turnId, taskId: sourceRootTaskId, type: "task_graph",
+    }, select: { revision: true } })
     const sourceChildren = await testDb.subAgentTask.findMany({ where: {
       sessionId: scenario.sessionId, turnId: source.turnId, role: { in: ["writer", "reviewer"] }, status: "completed",
     }, select: { id: true, role: true, status: true, result: true } })
@@ -1690,7 +1696,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const reviews = await testDb.agentArtifactReview.findMany({ where: {
       userId: ids.user, sessionId: scenario.sessionId, jobId: scenario.jobId, artifactId: artifactRef!.artifactId as string,
       version: artifactRef!.version as number, status: "passed",
-    }, select: { artifactId: true, version: true, taskId: true, reviewHash: true, status: true } })
+    }, select: { artifactId: true, version: true, taskId: true, toolCallId: true, reviewHash: true, status: true } })
     expect(reviews).toHaveLength(1)
     const review = reviews[0]
     const exactReviewerReceipt = Boolean(review && review.taskId === reviewer.id
@@ -1767,7 +1773,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(handoff).toMatchObject({ topic: "agent.reviewed-fill.dispatch", aggregateId: scenario.sessionId,
       idempotencyKey: `agent-reviewed-fill:${approvalId}` })
     const handoffPayload = jsonRecord(handoff.payload)
-    expect(Object.keys(handoffPayload ?? {}).sort()).toEqual(["approvalId", "applicationTaskId", "predecessorTurnId", "schemaVersion", "sessionId", "userId"])
+    expect(Object.keys(handoffPayload ?? {}).sort()).toEqual([
+      "approvalId", "applicationTaskId", "predecessorTurnId", "schemaVersion", "sessionId", "userId",
+    ].sort())
     expect(handoffPayload).toEqual({ schemaVersion: "agent-harness.v2.reviewed-fill-handoff.v1", userId: ids.user,
       sessionId: scenario.sessionId, applicationTaskId, approvalId, predecessorTurnId: reviewTurnId })
 
@@ -1803,11 +1811,37 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       taskId: applicationTaskId!, type: "reviewed_application_fill_browser_started", actor: "worker",
     }, select: { type: true, actor: true, data: true } })
     expect(reviewedBrowserEvents).toHaveLength(1)
-    expect(reviewedBrowserEvents[0]?.data).toMatchObject({
+    const reviewedBrowserBinding = jsonRecord(reviewedBrowserEvents[0]?.data)
+    expect(Object.keys(reviewedBrowserBinding ?? {}).sort()).toEqual([
+      "applicationTaskId", "artifactId", "attemptCount", "contentHash", "fillTurnId", "fillerTaskId", "graphRevision",
+      "jobId", "leaseExpiresAt", "leaseOwner", "reviewHash", "reviewerTaskId", "reviewerToolCallId", "rootTaskId",
+      "schemaVersion", "sessionId", "sourceDigest", "sourceTurnId", "userId", "version", "writerTaskId",
+    ])
+    expect(reviewedBrowserBinding).toMatchObject({
       schemaVersion: "agent-harness.v2.reviewed-application-fill-browser-start.v1", userId: ids.user,
       sessionId: scenario.sessionId, fillTurnId, applicationTaskId, jobId: scenario.jobId, sourceTurnId: source.turnId,
+      rootTaskId: sourceRootTaskId, graphRevision: sourceGraph.revision, writerTaskId: writer.id, reviewerTaskId: reviewer.id,
+      reviewerToolCallId: review!.toolCallId, reviewHash: review!.reviewHash, artifactId: artifactRef!.artifactId,
+      version: artifactRef!.version, contentHash: artifactRef!.contentHash, sourceDigest: artifactRef!.sourceDigest,
     })
-    expect(jsonRecord(reviewedBrowserEvents[0]?.data)?.reviewedCoverLetterHash).toMatch(/^sha256:[a-f0-9]{64}$/)
+    const reviewedProofHash = await hashReviewedApplicationMaterialProof({
+      jobId: scenario.jobId, sourceTurnId: source.turnId, rootTaskId: sourceRootTaskId,
+      graphRevision: sourceGraph.revision, writerTaskId: writer.id, reviewerTaskId: reviewer.id,
+      reviewerToolCallId: review!.toolCallId, reviewHash: review!.reviewHash, artifactId: artifactRef!.artifactId,
+      version: artifactRef!.version, contentHash: artifactRef!.contentHash, sourceDigest: artifactRef!.sourceDigest,
+    })
+    if (!reviewedProofHash) throw new Error("reviewed_application_proof_hash_invalid")
+    const submissionManifest = await testDb.agentArtifact.findUniqueOrThrow({
+      where: { id: `application:${applicationTaskId}` },
+      select: { id: true, userId: true, jobId: true, artifactType: true, lifecycle: true, content: true },
+    })
+    expect(submissionManifest).toMatchObject({ id: `application:${applicationTaskId}`, userId: ids.user,
+      jobId: scenario.jobId, artifactType: "application", lifecycle: "base" })
+    expect(jsonRecord(submissionManifest.content)).toMatchObject({
+      schemaVersion: "agent-harness.application-submission.v2", applicationTaskId, jobId: scenario.jobId,
+      reviewedCoverLetterHash: reviewedProofHash,
+    })
+    expect(reviewedProofHash).toMatch(/^[a-f0-9]{64}$/)
     let fixtureStats = await requestFixtureStats()
     const traceDeadline = Date.now() + 20_000
     while (fixtureStats.reviewedMaterialExactCount < 1 && Date.now() < traceDeadline) {
