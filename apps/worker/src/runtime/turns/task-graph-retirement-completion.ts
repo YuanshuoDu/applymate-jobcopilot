@@ -7,7 +7,7 @@ import { parsePersistedTaskGraphReceipt } from "../subagents/task-graph-pg-event
 import { parseSteeringReconciliationReceipt, STEERING_RECONCILIATION_EVENT_TYPE, STEERING_RECONCILIATION_SCHEMA_VERSION, type SteeringReconciliationState } from "../subagents/steering-reconciliation-contract.js"
 import { parseTaskGraphSupersededScoutRetirementReceipt, TASK_GRAPH_SUPERSEDED_SCOUT_RETIREMENT_EVENT_TYPE,
   taskGraphScoutRetirementIdempotencyKeyFromIdentity, type TaskGraphSupersededScoutRetirementReceipt } from "../subagents/task-graph-scout-retirement-contract.js"
-import { readTaskGraphConfirmedLocationSteerAtSequence } from "../subagents/task-graph-confirmed-location-steer.js"
+import { readTaskGraphConfirmedLocationBatchForReceipt } from "../subagents/task-graph-confirmed-location-batch.js"
 import type { GraphIdentityScope, LoadedGraph } from "../subagents/task-graph-pg-state.js"
 import type { TaskGraphRetiredScoutProof } from "../subagents/task-graph-final-summary-binding.js"
 
@@ -29,8 +29,7 @@ function sequence(value: unknown): bigint | null {
     return n > 0n && n <= MAX_SEQUENCE ? n : null } catch { return null }
 }
 function timestamp(value: unknown): string | null { const date = value instanceof Date ? value : typeof value === "string" ? new Date(value) : null; return date && Number.isFinite(date.getTime()) ? date.toISOString() : null }
-function scopeValid(scope: Scope): boolean { return [scope.userId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId].every(id)
-  && scope.parentTaskId === scope.rootTaskId }
+function scopeValid(scope: Scope): boolean { return [scope.userId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId].every(id) && scope.parentTaskId === scope.rootTaskId }
 
 /** Returns only internally proven terminal retirements; invalid receipts remain subject to the old gate. */
 export async function readTaskGraphRetiredScouts(client: Client, scope: Scope, loaded: LoadedGraph,
@@ -89,19 +88,24 @@ async function validateRetirement(client: Client, scope: Scope, loaded: LoadedGr
     || !isOrdinaryRegisteredScout(replacement, { ...replacementTask, failureReason: null })
     || checkpoint(loaded, replacement.key) === null || checkpoint(loaded, replacement.key)!.toString() !== receipt.replacementSourceSequence
     || checkpoint(loaded, replacement.key)! < accepted) return null
-  const actionStep = event.causationId
-  const steerScope = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId }
-  const [plan, reconciliation, taskRow, ack, steps, acceptedSteer, action] = await Promise.all([
+  const actionStep = event.causationId, steerScope = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId }
+  const [plan, reconciliation, taskRow, ack, steps, action] = await Promise.all([
     readEvent(client, scope, receipt.planEventId, receipt.planEventSequence),
     readEvent(client, scope, receipt.reconciliationEventId, receipt.reconciliationEventSequence),
     readTask(client, scope, receipt), readAck(client, scope, loaded, receipt),
     readSteps(client, scope, actionStep, receipt.reconciliationStepId),
-    readTaskGraphConfirmedLocationSteerAtSequence(client, steerScope, BigInt(receipt.reconciliationThroughSequence), accepted),
     readAction(client, scope, actionStep, receipt, String(event.idempotencyKey)),
   ])
-  if (!plan || !reconciliation || !taskRow || !ack || !steps || acceptedSteer.kind !== "confirmed" || !action) return null
+  if (!plan || !reconciliation || !taskRow || !ack || !steps || !action) return null
   const planPayload = plan.payload, planReceipt = object(planPayload.receipt), planItem = object(planPayload.item)
   const reconciliationReceipt = parseSteeringReconciliationReceipt(reconciliation.payload)
+  if (!reconciliationReceipt || reconciliationReceipt.decision !== "revise" || reconciliationReceipt.resultingRevision !== receipt.acceptedPlanRevision
+    || reconciliationReceipt.inputCheckpoint.throughSequence !== receipt.reconciliationThroughSequence) return null
+  const acceptedSteer = await readTaskGraphConfirmedLocationBatchForReceipt({ client, scope: steerScope,
+    consumedThroughSequence: BigInt(receipt.reconciliationThroughSequence), inputIds: reconciliationReceipt.steerInputIds,
+    inputThroughSequence: BigInt(receipt.reconciliationThroughSequence),
+    decisionStep: { id: steps.reconciliation.id, ordinal: steps.reconciliation.ordinal, attempt: steps.reconciliation.attempt } })
+  if (acceptedSteer.kind !== "confirmed" || acceptedSteer.acceptedInputSequence !== accepted) return null
   const plannedLocations = nodeLocations(receipt, plan)
   if (plan.sequence >= reconciliation.sequence || reconciliation.sequence >= eventSeq || eventSeq >= ack.sequence
     || steps.action.ordinal <= steps.reconciliation.ordinal || timestamp(taskRow.interruptRequestedAt) !== receipt.interruptRequestedAt
@@ -119,8 +123,7 @@ async function validateRetirement(client: Client, scope: Scope, loaded: LoadedGr
     || reconciliationReceipt.rootTaskId !== scope.rootTaskId || reconciliationReceipt.decision !== "revise"
     || reconciliationReceipt.observedRevision + 1 !== receipt.acceptedPlanRevision
     || reconciliationReceipt.resultingRevision !== receipt.acceptedPlanRevision || reconciliationReceipt.stepId !== receipt.reconciliationStepId
-    || reconciliationReceipt.inputCheckpoint.throughSequence !== receipt.reconciliationThroughSequence
-    || reconciliationReceipt.steerInputIds.length !== 1 || reconciliationReceipt.steerInputIds[0] !== acceptedSteer.acceptedInputId
+    || canonicalTaskGraphJson([...acceptedSteer.acceptedInputIds].sort()) !== canonicalTaskGraphJson(reconciliationReceipt.steerInputIds)
     || plannedLocations === null || canonicalTaskGraphJson(plannedLocations) !== canonicalTaskGraphJson(acceptedSteer.locations)) return null
   try { parsePersistedTaskGraphReceipt(plan.type, planPayload, loaded.item!, loaded.snapshot!, scope, {
     type: plan.type, itemId: plan.itemId, taskId: plan.taskId, idempotencyKey: plan.idempotencyKey,
@@ -206,7 +209,6 @@ async function readTask(client: Client, scope: Scope, receipt: TaskGraphSupersed
     && Number(row.attemptCount) === receipt.attempt && row.leaseOwner === null && row.leaseExpiresAt === null
     && row.hasChild === false && timestamp(row.interruptRequestedAt) === receipt.interruptRequestedAt ? row : null
 }
-
 async function readAck(client: Client, scope: Scope, loaded: LoadedGraph, receipt: TaskGraphSupersededScoutRetirementReceipt): Promise<EventRow & { sequence: bigint } | null> {
   const key = taskGraphLifecycleKey(scope.rootTaskId, receipt.nodeKey, receipt.attempt, "task.interrupted")
   const result = await client.query<Row>(`SELECT event."id", event."sequence", event."type", event."actor", event."itemId", event."taskId",
@@ -231,7 +233,6 @@ async function readAck(client: Client, scope: Scope, loaded: LoadedGraph, receip
   return event?.type === "task.interrupted" && event.nodeKey === receipt.nodeKey && event.idempotencyKey === key && seq
     ? { ...row, sequence: seq } : null
 }
-
 async function readSteps(client: Client, scope: Scope, actionStepId: string, reconciliationStepId: string): Promise<{ action: StepRow; reconciliation: StepRow } | null> {
   const result = await client.query<StepRow>(`SELECT step."id", step."ordinal", step."attempt", step."status", step."taskId",
       turn."rootTaskId" AS "turnRootTaskId", turn."userId" AS "turnUserId", session."userId" AS "sessionUserId"

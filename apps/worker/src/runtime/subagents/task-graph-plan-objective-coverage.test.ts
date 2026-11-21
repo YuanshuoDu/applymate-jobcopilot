@@ -5,13 +5,14 @@ import type { TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import type { PreparedSteeringReconciliation } from "./steering-reconciliation-contract.js"
 import { loadTaskGraph } from "./task-graph-pg-state.js"
 import { readTaskGraphConfirmedLocationSteer } from "./task-graph-confirmed-location-steer.js"
+import { readTaskGraphConfirmedLocationBatch } from "./task-graph-confirmed-location-batch.js"
 import { resolveTaskGraphCurrentLocationEvidence, type TaskGraphCurrentLocationEvidenceResult } from "./task-graph-current-location-evidence.js"
 import { readSteeringReconciliationState } from "./steering-reconciliation-read.js"
 import { buildTaskGraphLocationCoverageNodes, canRetainCompatiblePriorScouts, evaluateTaskGraphPlanObjectiveCoverage } from "./task-graph-plan-objective-coverage.js"
 import { classifyPendingSupersededScouts } from "./task-graph-pending-scout-scope.js"
 
-const { pendingScope, retiredScouts, evaluateCoverage } = vi.hoisted(() => ({
-  pendingScope: vi.fn(), retiredScouts: vi.fn(), evaluateCoverage: vi.fn(),
+const { pendingScope, retiredScouts, evaluateCoverage, confirmedBatch } = vi.hoisted(() => ({
+  pendingScope: vi.fn(), retiredScouts: vi.fn(), evaluateCoverage: vi.fn(), confirmedBatch: vi.fn(),
 }))
 
 vi.mock("../planning/task-graph-objective-coverage.js", async importOriginal => {
@@ -21,6 +22,7 @@ vi.mock("../planning/task-graph-objective-coverage.js", async importOriginal => 
 
 vi.mock("./task-graph-pg-state.js", () => ({ loadTaskGraph: vi.fn() }))
 vi.mock("./task-graph-confirmed-location-steer.js", () => ({ readTaskGraphConfirmedLocationSteer: vi.fn() }))
+vi.mock("./task-graph-confirmed-location-batch.js", () => ({ readTaskGraphConfirmedLocationBatch: confirmedBatch }))
 vi.mock("./task-graph-current-location-evidence.js", () => ({ resolveTaskGraphCurrentLocationEvidence: vi.fn() }))
 vi.mock("./steering-reconciliation-read.js", () => ({ readSteeringReconciliationState: vi.fn() }))
 vi.mock("./task-graph-pending-scout-scope.js", () => ({ classifyPendingSupersededScouts: pendingScope }))
@@ -71,6 +73,7 @@ beforeEach(() => {
   vi.mocked(loadTaskGraph).mockResolvedValue({} as never)
   vi.mocked(resolveTaskGraphCurrentLocationEvidence).mockResolvedValue({ status: "unavailable" })
   pendingScope.mockReturnValue({ status: "unavailable" })
+  confirmedBatch.mockResolvedValue({ kind: "unavailable" })
   retiredScouts.mockResolvedValue(new Map())
   evaluateCoverage.mockReturnValue({ status: "covered" })
 })
@@ -97,6 +100,40 @@ describe("TaskGraph plan objective coverage", () => {
     const nodes = [scout("old-scout")]
     await expect(evaluateTaskGraphPlanObjectiveCoverage({ client, input: input(), nodes })).resolves.toEqual({ status: "covered" })
     expect(readSteeringReconciliationState).not.toHaveBeenCalled()
+  })
+
+  it("uses only a fully rebound multi-input proof for the planner and pending partition", async () => {
+    const batch = { kind: "confirmed" as const, locations: ["dublin"], acceptedInputSequence: 100n,
+      acceptedInputId: "steer-input", acceptedInputIds: ["steer-old", "steer-input"], acceptedInputSequences: [90n, 100n] }
+    vi.mocked(readTaskGraphConfirmedLocationSteer).mockResolvedValue(confirmed)
+    confirmedBatch.mockResolvedValue(batch)
+    pendingScope.mockReturnValue({ status: "available", pendingNodeKeys: new Set<string>() })
+    vi.mocked(resolveTaskGraphCurrentLocationEvidence).mockResolvedValue(available([], []))
+    const prepared = { steerInputIds: ["steer-input", "steer-old"] } as unknown as PreparedSteeringReconciliation
+    await expect(evaluateTaskGraphPlanObjectiveCoverage({ client, input: input(), nodes: [analyst("fresh")], provenance, prepared }))
+      .resolves.toEqual({ status: "covered" })
+    expect(readTaskGraphConfirmedLocationBatch).toHaveBeenCalledWith(expect.objectContaining({
+      client, scope, consumedThroughSequence: 100n, prepared, reconciliation: reconciliationState,
+    }))
+    expect(pendingScope).toHaveBeenCalledWith(expect.objectContaining({ confirmed: batch, prepared }))
+    expect(vi.mocked(resolveTaskGraphCurrentLocationEvidence).mock.calls.at(-1)?.[0]).toMatchObject({
+      verifiedCurrentLocations: ["dublin"], acceptedInputSequence: 100n,
+    })
+  })
+
+  it.each([
+    ["input identity", { acceptedInputId: "other-input" }],
+    ["accepted sequence", { acceptedInputSequence: 99n }],
+    ["location set", { locations: ["berlin"] }],
+  ] as const)("rejects a confirmed batch with a mismatched latest steer %s", async (_label, mismatch) => {
+    vi.mocked(readTaskGraphConfirmedLocationSteer).mockResolvedValue(confirmed)
+    confirmedBatch.mockResolvedValue({ kind: "confirmed", locations: ["dublin"], acceptedInputSequence: 100n,
+      acceptedInputId: "steer-input", acceptedInputIds: ["steer-old", "steer-input"], acceptedInputSequences: [90n, 100n], ...mismatch })
+    const prepared = { steerInputIds: ["steer-old", "steer-input"] } as unknown as PreparedSteeringReconciliation
+
+    await expect(evaluateTaskGraphPlanObjectiveCoverage({ client, input: input(), nodes: [], provenance, prepared }))
+      .rejects.toMatchObject({ code: "task_graph_current_location_steer_unavailable" })
+    expect(resolveTaskGraphCurrentLocationEvidence).not.toHaveBeenCalled()
   })
 
   it.each([
