@@ -165,10 +165,6 @@ function TaskGraphPlanSection({ plan, successCriteria, verificationSummary, sess
         {plan.nodes.map((node, index) => (
           <li key={node.key} style={nodeStyle}>
             <strong style={goalStyle}>{node.goal}</strong>
-            {successCriteria?.get(node.key)?.length ? <div role="group" aria-label={lang === 'zh' ? '验收标准' : 'Success criteria'} data-task-graph-success-criteria="true">
-              <strong>{lang === 'zh' ? '验收标准' : 'Success criteria'}</strong>
-              <ul>{successCriteria.get(node.key)?.map((criterion, index) => <li key={index}>{criterion}</li>)}</ul>
-            </div> : null}
             {node.repairTargetGoal && <div data-task-graph-repair-target="true">{taskGraphPlanLabel(lang, 'agent.taskGraph.repairAttemptFor')} {node.repairTargetGoal}</div>}
             {repairAttention[index] && <div data-task-graph-repair-attention="true"><strong>{taskGraphPlanLabel(lang, 'agent.taskGraph.repairChecksNeedingAttention')}</strong><TaskGraphVerificationSummary node={repairAttention[index]} lang={lang} /></div>}
             {verificationSummary && <TaskGraphVerificationSummary node={verificationSummary.nodes[index]} lang={lang} />}
@@ -187,6 +183,10 @@ function TaskGraphPlanSection({ plan, successCriteria, verificationSummary, sess
                 ))}</ul>}
             </div>
             <div><span>{taskGraphPlanLabel(lang, 'agent.taskGraph.readiness')}:</span> {taskGraphPlanLabel(lang, READINESS_LABELS[node.readiness])}</div>
+            {successCriteria?.get(node.key)?.length ? <div role="group" aria-label={lang === 'zh' ? '验收标准' : 'Success criteria'} data-task-graph-success-criteria="true">
+              <strong>{lang === 'zh' ? '验收标准' : 'Success criteria'}</strong>
+              <ul>{successCriteria.get(node.key)?.map((criterion, index) => <li key={index}>{criterion}</li>)}</ul>
+            </div> : null}
           </li>
         ))}
       </ol>

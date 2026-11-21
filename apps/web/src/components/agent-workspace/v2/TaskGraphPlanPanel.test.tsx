@@ -46,6 +46,8 @@ describe('TaskGraphPlanPanel', () => {
     expect(accepted).toContain('Collect &lt;script&gt;public evidence&lt;/script&gt;')
     expect(accepted).toContain('Compare the sources')
     expect(accepted).not.toContain('<script>')
+    expect(accepted.indexOf('Status: Queued')).toBeLessThan(accepted.indexOf('data-task-graph-success-criteria'))
+    expect(accepted.indexOf('Dependencies:')).toBeLessThan(accepted.indexOf('data-task-graph-success-criteria'))
     expect(renderToStaticMarkup(panel())).not.toContain('data-task-graph-success-criteria')
     const wrongKeys = { ...projection, nodes: [{ ...projection.nodes[0]!, key: 'foreign-node' }, projection.nodes[1]!] }
     expect(renderToStaticMarkup(panel({ identity, projection: wrongKeys }))).not.toContain('data-task-graph-success-criteria')
