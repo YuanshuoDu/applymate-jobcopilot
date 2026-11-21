@@ -370,10 +370,10 @@ function fixtureStatsSummary(stats: FixtureStats) {
   }
 }
 
-function applicationFillExecutorTraces(child: Child | undefined): Array<ApplicationFillExecutorTrace | { traceInvalid: true }> {
+function applicationFillExecutorTraces(child: Child | undefined, startIndex = 0): Array<ApplicationFillExecutorTrace | { traceInvalid: true }> {
   const prefix = "APPLICATION_FILL_EXEC_TRACE "
   const traces: Array<ApplicationFillExecutorTrace | { traceInvalid: true }> = []
-  for (const line of child?.lines ?? []) {
+  for (const line of (child?.lines ?? []).slice(startIndex)) {
     if (!line.startsWith(prefix)) continue
     try {
       const row = jsonRecord(JSON.parse(line.slice(prefix.length)))
@@ -412,11 +412,11 @@ function applicationFillExecutorTraces(child: Child | undefined): Array<Applicat
   return traces.slice(-12)
 }
 
-function applicationFillStageTraces(child: Child | undefined): Array<ApplicationFillStageTrace | { traceInvalid: true }> {
+function applicationFillStageTraces(child: Child | undefined, startIndex = 0): Array<ApplicationFillStageTrace | { traceInvalid: true }> {
   const prefix = "APPLICATION_FILL_STAGE_TRACE ", keys = ["entryValidation", "waitPersistence", "completion", "accepted", "rejected", "waiting", "completed", "stale", "conflict", "failed", "cancelled", "unavailable", "leaseLost", "signalAborted"]
   const staleGates = ["lease_input_invalid", "session_scope", "turn_row_unavailable", "turn_status_queued", "turn_status_interrupted", "turn_status_terminal", "turn_status_other", "child_lease_fence", "application_task_scope"]
   const traces: Array<ApplicationFillStageTrace | { traceInvalid: true }> = []
-  for (const line of child?.lines ?? []) {
+  for (const line of (child?.lines ?? []).slice(startIndex)) {
     if (!line.startsWith(prefix)) continue
     try {
       const row = jsonRecord(JSON.parse(line.slice(prefix.length)))
@@ -1168,6 +1168,74 @@ async function waitForReviewedApplicationTask(jobId: string, predicate: (task: A
   throw new Error(`Reviewed ApplicationTask did not reach the expected state; status=${latest?.status ?? "missing"}; checkpoint=${latest?.checkpoint ?? "missing"}`)
 }
 
+const REVIEWED_FILL_DIAGNOSTIC_STATUSES = new Set([
+  "queued", "in_progress", "running", "waiting", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency",
+  "waiting_for_authorization", "filling", "completed", "submitted", "failed", "cancelled", "interrupted", "retrying",
+])
+const REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS = new Set([
+  "materials_ready", "taskgraph_fill_queued", "browser_active", "form_answer_required", "fill_outcome_uncertain",
+  "form_filled", "submission_authorized", "queue_retry", "turn_stopped_before_submit", "fill_prestart_failed",
+])
+
+function reviewedFillDiagnosticValue(value: unknown, allowed: ReadonlySet<string>): string {
+  return value === null || value === undefined ? "none" : typeof value === "string" && allowed.has(value) ? value : "other"
+}
+
+async function reviewedFillTimeoutSnapshot(input: {
+  sessionId: string; jobId: string; applicationTaskId: string; fillTurnId: string; traceOffset: number
+}) {
+  const stats = await requestFixtureStats(300).catch(() => null)
+  const fixture = stats ? {
+    available: true,
+    reviewedPageGetObserved: stats.requests.includes("GET /example-reviewed/jobs/1"),
+    exactReviewedCoverLetterObserved: stats.reviewedMaterialExactCount > 0,
+    noReviewedSubmitRequest: stats.reviewedSubmitCount === 0 && !stats.requests.includes("POST /example-reviewed/jobs/1"),
+  } : { available: false }
+  const runtime = {
+    executor: applicationFillExecutorTraces(worker, input.traceOffset).slice(-4),
+    stages: applicationFillStageTraces(worker, input.traceOffset).slice(-6),
+    workerExited: worker ? exited(worker) : null,
+  }
+  try {
+    return await beforeDeadline(async () => {
+      const task = await testDb.applicationTask.findUnique({ where: { userId_jobId: { userId: ids.user, jobId: input.jobId } } }) as ApplicationTaskRow | null
+      const taskBound = Boolean(task && task.id === input.applicationTaskId && task.userId === ids.user
+        && task.sessionId === input.sessionId && task.jobId === input.jobId && task.fillTurnId === input.fillTurnId)
+      if (!task || !taskBound) return { databaseSnapshotAvailable: true, applicationTaskBound: taskBound, fixture, runtime }
+      const turn = await testDb.agentTurn.findFirst({ where: {
+        id: input.fillTurnId, userId: ids.user, sessionId: input.sessionId, session: { userId: ids.user },
+      }, select: { status: true, rootTaskId: true, error: true } })
+      const [root, fillers, events] = await Promise.all([
+        turn?.rootTaskId ? testDb.subAgentTask.findFirst({ where: {
+          id: turn.rootTaskId, rootTaskId: turn.rootTaskId, sessionId: input.sessionId, turnId: input.fillTurnId,
+          parentTaskId: null, role: "orchestrator", taskType: "root", session: { userId: ids.user },
+        }, select: { status: true, failureReason: true } }) : Promise.resolve(null),
+        turn?.rootTaskId ? testDb.subAgentTask.findMany({ where: {
+          sessionId: input.sessionId, turnId: input.fillTurnId, rootTaskId: turn.rootTaskId,
+          role: "application_filler", taskType: "application_fill_for_review", session: { userId: ids.user },
+        }, orderBy: { createdAt: "asc" }, take: 4, select: { status: true, failureReason: true } }) : Promise.resolve([]),
+        testDb.applicationTaskEvent.findMany({ where: { taskId: task.id, actor: "worker",
+          type: { in: ["reviewed_application_fill_browser_started", "form_filled"] } }, take: 4, select: { type: true } }),
+      ])
+      return {
+        databaseSnapshotAvailable: true, applicationTaskBound: true,
+        applicationTask: { status: reviewedFillDiagnosticValue(task.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+          checkpoint: reviewedFillDiagnosticValue(task.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS), errorPresent: Boolean(task.error) },
+        turn: { status: reviewedFillDiagnosticValue(turn?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES), errorCategory: diagnosticMachineErrorCode(turn?.error) },
+        root: { present: root !== null, status: reviewedFillDiagnosticValue(root?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+          failureCategory: diagnosticMachineErrorCode(root?.failureReason) },
+        fillers: fillers.map(filler => ({ status: reviewedFillDiagnosticValue(filler.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+          failureCategory: diagnosticMachineErrorCode(filler.failureReason) })),
+        events: { browserStarted: events.some(event => event.type === "reviewed_application_fill_browser_started"),
+          formFilled: events.some(event => event.type === "form_filled") },
+        fixture, runtime,
+      }
+    }, Date.now() + 1_200)
+  } catch {
+    return { databaseSnapshotAvailable: false, fixture, runtime }
+  }
+}
+
 async function createReviewedSourceScenario(label: "positive" | "stale", description: string) {
   const jobId = `full-loop-reviewed-job-${runId}-${label}`
   const sessionId = `full-loop-reviewed-session-${runId}-${label}`
@@ -1748,6 +1816,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     }
     const decisionClientMessageId = `reviewed-approval-decision-${runId}`
     const { POST: decideApprovalWait } = await import("@/app/api/agent/sessions/[id]/approvals/[approvalId]/route")
+    const reviewedFillTraceOffset = worker?.lines.length ?? 0
     const decision = await decideApprovalWait(apiRequest(
       `/api/agent/sessions/${scenario.sessionId}/approvals/${approvalId}`, token, "POST", {
         clientMessageId: decisionClientMessageId, expectedTurnId: reviewTurnId,
@@ -1804,8 +1873,15 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: source.turnId,
     })
 
-    const completedFill = await waitForReviewedApplicationTask(scenario.jobId,
-      task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", 180_000)
+    let completedFill: ApplicationTaskRow
+    try {
+      completedFill = await waitForReviewedApplicationTask(scenario.jobId,
+        task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", 180_000)
+    } catch {
+      const snapshot = await reviewedFillTimeoutSnapshot({ sessionId: scenario.sessionId, jobId: scenario.jobId,
+        applicationTaskId: applicationTaskId!, fillTurnId, traceOffset: reviewedFillTraceOffset })
+      throw new Error(`Reviewed fill timeout snapshot ${JSON.stringify(snapshot)}`)
+    }
     expect(completedFill.fillTurnId).toBe(fillTurnId)
     const reviewedBrowserEvents = await testDb.applicationTaskEvent.findMany({ where: {
       taskId: applicationTaskId!, type: "reviewed_application_fill_browser_started", actor: "worker",
@@ -1917,11 +1993,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
   }, 300_000)
 })
 
-async function requestFixtureStats(): Promise<FixtureStats> {
+async function requestFixtureStats(timeoutMs = 5_000): Promise<FixtureStats> {
   if (!site?.stdin) throw new Error("Fixture site is unavailable")
   const previous = site.lines.filter(line => line.startsWith("FIXTURE_STATE ")).length
   site.stdin.write("stats\n")
-  const until = Date.now() + 5_000
+  const until = Date.now() + timeoutMs
   while (Date.now() < until) {
     const lines = site.lines.filter(line => line.startsWith("FIXTURE_STATE "))
     if (lines.length > previous) return JSON.parse(lines[lines.length - 1]!.slice("FIXTURE_STATE ".length)) as FixtureStats
