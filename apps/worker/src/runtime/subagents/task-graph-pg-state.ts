@@ -5,6 +5,7 @@ import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGr
 import { parsePersistedTaskGraphReceipt } from "./task-graph-pg-event-validation.js"
 import { parsePersistedTaskGraphNativeReceipt } from "./task-graph-native-command.js"
 import { resolveTaskGraphRepairDependencies } from "./task-graph-dependency-context.js"
+import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 import { assertSessionWorkAdmission } from "../session-gate.js"
 import { revalidateTaskGraphDependencyBindings } from "./task-graph-pg-dependency-binding-readback.js"
 import type { SubagentTaskStatus } from "./types.js"
@@ -18,7 +19,7 @@ export type GraphEventScope = GraphIdentityScope & Readonly<{ stepId?: string }>
 export type GraphScope = TaskGraphReadScope & Readonly<{ stepId?: string }>
 export type GraphParent = Record<string, unknown>
 export type GraphItem = Readonly<{ id: string; revision: number; content: unknown; createdAt: unknown }>
-export type GraphTaskRow = Readonly<{ id: string; status: SubagentTaskStatus; role: string; taskType?: string; expectedOutputSchema?: unknown; allowedActions?: unknown; contextIsObject?: boolean; contextIsEmpty?: boolean; hasPrivateSelectionContext?: boolean; attemptCount?: number; failureReason: string | null; result: unknown }>
+export type GraphTaskRow = Readonly<{ id: string; status: SubagentTaskStatus; role: string; taskType?: string; expectedOutputSchema?: unknown; allowedActions?: unknown; contextIsObject?: boolean; contextIsEmpty?: boolean; contextIsCanonicalNestedScoutProfile?: boolean; hasPrivateSelectionContext?: boolean; attemptCount?: number; failureReason: string | null; result: unknown }>
 export type LoadedGraph = Readonly<{
   rootTaskId: string
   snapshot: TaskGraphSnapshot | null
@@ -115,12 +116,13 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
   const taskRows = await client.query(`SELECT task."id", task."status", task."role", task."taskType", task."expectedOutputSchema", task."allowedActions",
       COALESCE(jsonb_typeof(task."context") = 'object', false) AS "contextIsObject",
       COALESCE(task."context" = '{}'::jsonb, false) AS "contextIsEmpty",
+      COALESCE(task."context" = jsonb_build_object('nestedScoutProfile', $7::text), false) AS "contextIsCanonicalNestedScoutProfile",
       COALESCE(jsonb_typeof(task."context") = 'object' AND task."context" ?| ARRAY['selectedJobPreparation', 'coverLetterBase', 'writerReviewFeedback']::text[], false) AS "hasPrivateSelectionContext",
       task."attemptCount", task."failureReason", task."result"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
     WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3
       AND task."rootTaskId" = $4 AND task."parentTaskId" = $5 AND session."userId" = $6`,
-  [ids, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId])
+  [ids, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId, NESTED_SCOUT_PROFILE_MARKER])
   if (taskRows.rows.length !== ids.length) throw new Error("task_graph_task_scope_invalid")
   const tasks = new Map<string, GraphTaskRow>(taskRows.rows.map(raw => {
     const row = raw as Record<string, unknown>
@@ -130,6 +132,7 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
       allowedActions: row.allowedActions,
       contextIsObject: typeof row.contextIsObject === "boolean" ? row.contextIsObject : undefined,
       contextIsEmpty: typeof row.contextIsEmpty === "boolean" ? row.contextIsEmpty : undefined,
+      contextIsCanonicalNestedScoutProfile: typeof row.contextIsCanonicalNestedScoutProfile === "boolean" ? row.contextIsCanonicalNestedScoutProfile : undefined,
       hasPrivateSelectionContext: typeof row.hasPrivateSelectionContext === "boolean" ? row.hasPrivateSelectionContext : undefined,
       attemptCount: Number(row.attemptCount),
       failureReason: nonEmpty(row.failureReason) ? String(row.failureReason) : null, result: row.result ?? null,
