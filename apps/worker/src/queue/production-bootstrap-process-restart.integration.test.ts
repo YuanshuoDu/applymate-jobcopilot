@@ -206,7 +206,8 @@ function startWorker(mode: "accept-message" | "park-parent" | "resume-parent" | 
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, JSON.stringify(ids)], {
     cwd: workerCwd,
     env: { ...process.env, DATABASE_URL: databaseUrl!, REDIS_URL: redisUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!,
-      ...(mode === "resolve-checkpoint" ? { TSX_TSCONFIG_PATH: webTsconfigPath } : {}) },
+      ...(mode === "resolve-checkpoint" || (mode === "checkpoint-worker1" && ids.checkpointKind === "question")
+        ? { TSX_TSCONFIG_PATH: webTsconfigPath } : {}) },
     stdio: ["pipe", "pipe", "pipe"],
   }) as WorkerChild
   child.output = []
