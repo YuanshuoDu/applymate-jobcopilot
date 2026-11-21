@@ -252,6 +252,8 @@ type ApplicationFillExecutorTrace = {
 }
 type ApplicationFillCompletionStaleGate = "lease_input_invalid" | "session_scope" | "turn_row_unavailable" | "turn_status_queued" | "turn_status_interrupted" | "turn_status_terminal" | "turn_status_other" | "child_lease_fence" | "application_task_scope"
 type ApplicationFillStageTrace = { entryValidation: boolean; waitPersistence: boolean; completion: boolean; accepted: boolean; rejected: boolean; waiting: boolean; completed: boolean; stale: boolean; conflict: boolean; failed: boolean; cancelled: boolean; unavailable: boolean; leaseLost: boolean; signalAborted: boolean; staleGate?: ApplicationFillCompletionStaleGate }
+type ApplicationFillAcquisitionPhase = "before_control_read" | "before_pattern_read" | "context_requested" | "page_acquired" | "navigation_returned" | "fill_returned"
+type ApplicationFillPhaseTrace = { phase: ApplicationFillAcquisitionPhase }
 type ApplicationTaskRow = {
   id: string; userId: string; jobId: string; sessionId: string | null; fillTurnId: string | null
   status: string; checkpoint: string | null; question: unknown; confirmedAnswers: unknown
@@ -437,6 +439,28 @@ function applicationFillStageTraces(child: Child | undefined, startIndex = 0): A
   return traces.slice(-24)
 }
 
+const APPLICATION_FILL_ACQUISITION_PHASES = new Set<ApplicationFillAcquisitionPhase>([
+  "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned", "fill_returned",
+])
+
+function applicationFillAcquisitionPhases(child: Child | undefined, startIndex = 0): Array<ApplicationFillPhaseTrace | { traceInvalid: true }> {
+  const prefix = "APPLICATION_FILL_PHASE_TRACE "
+  const traces: Array<ApplicationFillPhaseTrace | { traceInvalid: true }> = []
+  for (const line of (child?.lines ?? []).slice(startIndex)) {
+    if (!line.startsWith(prefix)) continue
+    try {
+      const row = jsonRecord(JSON.parse(line.slice(prefix.length)))
+      if (!row || Object.keys(row).length !== 1 || !Object.hasOwn(row, "phase") || typeof row.phase !== "string"
+        || !APPLICATION_FILL_ACQUISITION_PHASES.has(row.phase as ApplicationFillAcquisitionPhase)) {
+        traces.push({ traceInvalid: true })
+        continue
+      }
+      traces.push({ phase: row.phase as ApplicationFillAcquisitionPhase })
+    } catch { traces.push({ traceInvalid: true }) }
+  }
+  return traces.slice(-12)
+}
+
 const APPLICATION_FILL_STALE_GATES: readonly ApplicationFillCompletionStaleGate[] = [
   "lease_input_invalid", "session_scope", "turn_row_unavailable", "turn_status_queued", "turn_status_interrupted",
   "turn_status_terminal", "turn_status_other", "child_lease_fence", "application_task_scope",
@@ -463,6 +487,31 @@ describe("ApplicationTask full-loop stage trace parser", () => {
     }
     const child = { lines: [`APPLICATION_FILL_STAGE_TRACE ${JSON.stringify(trace)}`] } as unknown as Child
     expect(applicationFillStageTraces(child)).toEqual([{ traceInvalid: true }])
+  })
+})
+
+describe("ApplicationTask full-loop acquisition phase trace parser", () => {
+  const phases: readonly ApplicationFillAcquisitionPhase[] = [
+    "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned", "fill_returned",
+  ]
+
+  it.each(phases)("accepts only the sanitized %s phase after the supplied offset", phase => {
+    const lines = [
+      "APPLICATION_FILL_PHASE_TRACE " + JSON.stringify({ phase: "fill_returned" }),
+      "APPLICATION_FILL_PHASE_TRACE " + JSON.stringify({ phase }),
+    ]
+    expect(applicationFillAcquisitionPhases({ lines } as unknown as Child, 1)).toEqual([{ phase }])
+  })
+
+  it("rejects unknown phases and extra data, and caps the sequence", () => {
+    const invalid = [
+      "APPLICATION_FILL_PHASE_TRACE " + JSON.stringify({ phase: "private_phase" }),
+      "APPLICATION_FILL_PHASE_TRACE " + JSON.stringify({ phase: "context_requested", url: "private" }),
+    ]
+    expect(applicationFillAcquisitionPhases({ lines: invalid } as unknown as Child)).toEqual([{ traceInvalid: true }, { traceInvalid: true }])
+    const lines = Array.from({ length: 16 }, (_, index) =>
+      "APPLICATION_FILL_PHASE_TRACE " + JSON.stringify({ phase: phases[index % phases.length] }))
+    expect(applicationFillAcquisitionPhases({ lines } as unknown as Child)).toHaveLength(12)
   })
 })
 
@@ -1194,6 +1243,7 @@ async function reviewedFillTimeoutSnapshot(input: {
   const runtime = {
     executor: applicationFillExecutorTraces(worker, input.traceOffset).slice(-4),
     stages: applicationFillStageTraces(worker, input.traceOffset).slice(-6),
+    phases: applicationFillAcquisitionPhases(worker, input.traceOffset).slice(-8),
     workerExited: worker ? exited(worker) : null,
   }
   try {

@@ -1,5 +1,4 @@
 import type { Pool } from "pg"
-import type { Page } from "playwright-core"
 import { unlinkSync } from "node:fs"
 import { withCloakContext } from "../../cloak/pool.js"
 import { acknowledgeApplicationFillCancellation, completeApplicationFillForReview, failApplicationFillBeforeBrowser, persistApplicationFillWait, type ApplicationFillCompletionStaleGate } from "../../db/application-task-completion.js"
@@ -12,12 +11,15 @@ import { fillCustomQuestions } from "../../flows/helpers.js"
 import { executeBrowserFill, type FlowType } from "../../flows/index.js"
 import { evaluateUnattendedApplyControl } from "../../queue/unattended-apply-control.js"
 import { checkRateLimit } from "../../rate-limit.js"
-import { createReviewedApplicationFillReadback, type ReviewedApplicationFillReadback } from "../../db/reviewed-application-fill-completion.js"
-import type { SelectedJobReviewedArtifact } from "../selected-job-reviewed-artifact-read.js"
+import type { ReviewedApplicationFillReadback } from "../../db/reviewed-application-fill-completion.js"
 import { claimApplicationFillBrowserStart, reviewedApplicationFillSelector, type BrowserStartClaim } from "../reviewed-application-fill-binding.js"
+import { reviewedMaterialWasFilled } from "./application-fill-reviewed-readback.js"
 import type { SubagentExecutionResult, SubagentLease } from "./types.js"
 type WaitDetail = "captcha_required" | "authentication_required" | "mfa_required" | "unknown_sensitive_field" | "required_field" | "stale_review" | "review_required" | "fill_outcome_uncertain" | "unattended_apply_unavailable" | "cancelled"; type WaitCheckpoint = "fill_outcome_uncertain" | "form_answer_required"
-export type ApplicationFillStageObservation = Readonly<{ stage: "entry_validation" | "wait_persistence" | "completion"; outcome: "accepted" | "rejected" | "waiting" | "completed" | "stale" | "conflict" | "failed" | "cancelled" | "unavailable"; leaseLost: boolean; signalAborted: boolean; staleGate?: ApplicationFillCompletionStaleGate }>
+export type ApplicationFillAcquisitionPhase = "before_control_read" | "before_pattern_read" | "context_requested" | "page_acquired" | "navigation_returned" | "fill_returned"
+export type ApplicationFillStageObservation =
+  | Readonly<{ stage: "entry_validation" | "wait_persistence" | "completion"; outcome: "accepted" | "rejected" | "waiting" | "completed" | "stale" | "conflict" | "failed" | "cancelled" | "unavailable"; leaseLost: boolean; signalAborted: boolean; staleGate?: ApplicationFillCompletionStaleGate }>
+  | Readonly<{ stage: "browser_acquisition"; phase: ApplicationFillAcquisitionPhase }>
 type StageObserver = (event: ApplicationFillStageObservation) => void; type FillContext = { applicationTaskId: string; jobId: string; turnInput: unknown; applicationUserId: string; applicationSessionId: string | null; fillTurnId: string | null; fillTurnSessionId: string | null; fillTurnUserId: string | null; taskStatus: string; checkpoint: string | null; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown; jobUserId: string; jobUrl: string | null; jobTitle: string; jobCompany: string; jobKeywords: string | null; jobDescription: string | null; jobCoverLetter: string | null; accountStatus: string; userName: string | null; userEmail: string; userPhone: string | null; userLocation: string | null; userLinkedin: string | null; personaFields: unknown; resumeContent: unknown; coverLetterContent: string | null; sessionUserId: string; sessionStatus: string; turnUserId: string; turnSessionId: string; turnStatus: string }
 const LOAD_CONTEXT_SQL = [
   'SELECT app."id" AS "applicationTaskId", app."jobId", turn."input" AS "turnInput", app."userId" AS "applicationUserId", app."sessionId" AS "applicationSessionId", app."fillTurnId", app."fillTurnSessionId", app."fillTurnUserId", app."status" AS "taskStatus", app."checkpoint", app."resumeId", app."coverLetterId", app."confirmedAnswers", job."userId" AS "jobUserId", job.url AS "jobUrl", job.role AS "jobTitle", job.company AS "jobCompany", job.keywords AS "jobKeywords", job.description AS "jobDescription", job."coverLetter" AS "jobCoverLetter", usr."accountStatus", usr.name AS "userName", usr.email AS "userEmail", usr.phone AS "userPhone", usr.location AS "userLocation", usr.linkedin AS "userLinkedin", usr."personaFields",',
@@ -39,6 +41,9 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
   if (!context || !matchesLeaseScope(context, lease)) return failed("fill_scope_mismatch")
   const reviewedSelector = reviewedApplicationFillSelector(context.turnInput)
   if (reviewedSelector.kind === "invalid") return failed("fill_reviewed_source_invalid")
+  const observeAcquisitionPhase = (phase: ApplicationFillAcquisitionPhase) => {
+    if (reviewedSelector.kind === "selected") observeStage(input.stageObserver, { stage: "browser_acquisition", phase })
+  }
   if (needsCompletionReplay(context)) {
     const completion = input.stageObserver ? await completeForReview(pool, lease, input.stageObserver) : await completeApplicationFillForReview(pool, { lease })
     return completion.status === "completed" ? { status: "completed", result: { status: "filled_for_user_review" } } : lease.signal.aborted ? acknowledgeCancellation(pool, lease) : failed(completion.status === "stale" ? "lease_lost" : "fill_completion_conflict")
@@ -68,15 +73,20 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
   if (start.status !== "claimed") { discardResume(resumePath); return start.status === "stale" || lease.signal.aborted || lease.interruptRequestedAt ? acknowledgeCancellation(pool, lease) : failed("fill_start_conflict") }
   if (start.reviewedMaterial) task.persona.coverLetter = start.reviewedMaterial.content
   try {
+    observeAcquisitionPhase("before_control_read")
     control = await evaluateUnattendedApplyControl(pool, task.applyUrl, lease.userId)
     if (!control.allowed) return wait(pool, lease, "form_answer_required", "unattended_apply_unavailable", undefined, input.stageObserver)
+    observeAcquisitionPhase("before_pattern_read")
     const pattern = await findFormPattern(lease.userId, new URL(task.applyUrl).hostname, urlPattern(task.applyUrl)).catch(() => null)
+    observeAcquisitionPhase("context_requested")
     const outcome = await withCloakContext(lease.userId, async page => {
+      observeAcquisitionPhase("page_acquired")
       const closeOnAbort = () => { void page.close().catch(() => undefined) }
       lease.signal.addEventListener("abort", closeOnAbort, { once: true })
       try {
         if (lease.signal.aborted) { closeOnAbort(); return cancelledOutcome() }
         await page.goto(task.applyUrl, { waitUntil: "domcontentloaded", timeout: 30_000 })
+        observeAcquisitionPhase("navigation_returned")
         if (lease.signal.aborted) return cancelledOutcome()
         if (!isAllowedDestination(page.url(), control.flow, task.applyUrl)) {
           return { kind: "wait" as const, detail: "fill_outcome_uncertain" as const }
@@ -96,6 +106,7 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
           resumePath,
           submit: false,
         }, { page, pattern, aiAvailable: true, harnessConfig: { userId: lease.userId, signal: lease.signal } })
+        observeAcquisitionPhase("fill_returned")
         if (lease.signal.aborted || result.classification === "cancelled") return cancelledOutcome()
         if (result.waitReason) return { kind: "wait" as const, detail: waitDetail(result.waitReason) }
         if (result.reviewReady) {
@@ -213,28 +224,7 @@ function isAllowedDestination(raw: string, flow: FlowType, approved: string): bo
 }
 function waitDetail(reason: NonNullable<Awaited<ReturnType<typeof detectBrowserWait>>>["reason"]): WaitDetail { return reason === "captcha" ? "captcha_required" : reason === "login_required" ? "authentication_required" : reason === "mfa_required" ? "mfa_required" : reason === "stale_review" ? "stale_review" : "unknown_sensitive_field" }; function waitDetailFromResult(result: HarnessResult): WaitDetail { return result.classification === "cancelled" ? "cancelled" : result.classification === "browser_crash" ? "fill_outcome_uncertain" : result.classification === "untrusted_input" ? "unknown_sensitive_field" : "review_required" }
 function safeNeeds(needs: FormReviewNeeds): FormReviewNeeds { const safe = (fields: FormReviewNeeds["missing"]) => fields.map(({ key, label }) => ({ key, label: label.slice(0, 200) })); return { missing: safe(needs.missing), sensitive: safe(needs.sensitive) } }
-async function reviewedMaterialWasFilled(page: Page, result: HarnessResult, proof: SelectedJobReviewedArtifact, lease: SubagentLease, applicationTaskId: string) {
-  const selectors: string[] = []
-  for (const entry of result.log ?? []) {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue
-    const value = entry as Record<string, unknown>
-    if (value.field !== "coverLetter" || !["fill", "replay-fill"].includes(String(value.action))
-      || (value.phase !== undefined && value.phase !== "completed")) continue
-    if (typeof value.selector !== "string" || !value.selector.trim() || value.selector.length > 2048) return false
-    selectors.push(value.selector)
-  }
-  const unique = [...new Set(selectors)]
-  if (unique.length !== 1) return false
-  try {
-    const field = page.locator(unique[0]!)
-    if (await field.count() !== 1) return false
-    const current = await field.evaluate(element => {
-      const tag = element.tagName.toLowerCase()
-      return tag === "input" || tag === "textarea" ? (element as HTMLInputElement | HTMLTextAreaElement).value : null
-    }, undefined, { timeout: 1000 })
-    return current === proof.content ? createReviewedApplicationFillReadback(lease, applicationTaskId, proof) : null
-  } catch { return false }
-}
+
 async function loadFillContext(pool: Pool, lease: SubagentLease): Promise<FillContext | null> {
   const client = await pool.connect()
   try {

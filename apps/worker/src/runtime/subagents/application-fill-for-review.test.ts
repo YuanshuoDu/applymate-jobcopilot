@@ -154,6 +154,20 @@ describe("executeApplicationFillForReview", () => {
     expect(Object.keys(observations[0]!).sort()).toEqual(["leaseLost", "outcome", "signalAborted", "stage"])
   })
 
+  it("reports the closed reviewed browser acquisition phase sequence", async () => {
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    const observations: ApplicationFillStageObservation[] = []
+    await executeApplicationFillForReview({ pool, lease: lease(), stageObserver: event => observations.push(event) })
+
+    expect(observations.filter(event => event.stage === "browser_acquisition").map(event => event.phase)).toEqual([
+      "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned", "fill_returned",
+    ])
+    const legacyObservations: ApplicationFillStageObservation[] = []
+    await executeApplicationFillForReview({ pool: poolFor(context()).pool, lease: lease(), stageObserver: event => legacyObservations.push(event) })
+    expect(legacyObservations.filter(event => event.stage === "browser_acquisition")).toEqual([])
+  })
+
   it("distinguishes wait-persistence stale results from completion stale results", async () => {
     const stageObserver = vi.fn()
     const waitPool = poolFor(context({ checkpoint: "browser_active" })).pool
