@@ -73,7 +73,7 @@ export async function scheduleTaskGraph(
   if (revision >= MAX_REVISION) throw new TaskGraphCommandError("revision_limit", "TaskGraph revision limit reached", revision)
   await requireTaskGraphContinuationBudget(client, input.scope)
   const created = await createGraphTasks(client, input, parent, current ?? { revision: 0, nodes: [], appliedEvents: [] },
-    new Map(loaded.snapshot?.nodes.map(node => [node.key, node.taskId]) ?? []), loaded)
+    new Map(loaded.snapshot?.nodes.map(node => [node.key, node.taskId]) ?? []), loaded, undefined, true, prepared ?? undefined)
   const stamped = stampCreatedScoutEnvelopes(created.snapshot, created.created, input.templates), snapshot = pinnedCriteria ? parseTaskGraphSnapshot({ ...stamped, rootSuccessCriteria: pinnedCriteria }) : stamped
   const receipt: TaskGraphScheduleReceipt = { status: "accepted", revision: created.state.revision, nodes: created.created, readyTaskIds: created.readyTaskIds }
   await writePlanReceipt(client, { scope: input.scope, state: created.state, snapshot, expectedRevision: revision,

@@ -233,7 +233,7 @@ describe("createGraphTasks", () => {
     await expect(create("analyst", "analyst", "research")).resolves.toEqual(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"])
   })
 
-  it("passes nested Scout authority only for the registered interactive template", async () => {
+  it("passes private Objective child authority only for exact registered templates on the opted normal path", async () => {
     const create = vi.spyOn(pgCreate, "createSubagentTask").mockResolvedValue(taskRow("scout") as never)
     const template = templatesForInteractiveScoutDelegation(TASK_GRAPH_TEMPLATES, TASK_GRAPH_TEMPLATES)!.scout!
     const schedule = (scout: NonNullable<typeof template>): TaskGraphScheduleInput => ({
@@ -245,10 +245,53 @@ describe("createGraphTasks", () => {
       await createGraphTasks({ query: vi.fn(async () => ({ rows: [], rowCount: 1 })) } as unknown as Pick<pg.PoolClient, "query">,
         schedule(template), { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map())
       expect(create.mock.calls[0]?.[3]).toMatchObject({ nestedScoutAuthority: "parent_template" })
+      expect(create.mock.calls[0]?.[3]).not.toHaveProperty("objectiveTaskGraphChildAuthority")
+      await createGraphTasks({ query: vi.fn(async () => ({ rows: [], rowCount: 1 })) } as unknown as Pick<pg.PoolClient, "query">,
+        schedule(template), { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map(), undefined, undefined, true)
+      expect(create.mock.calls[1]?.[3]).toMatchObject({ objectiveTaskGraphChildAuthority: schedule(template).scope, nestedScoutAuthority: "parent_template" })
       await createGraphTasks({ query: vi.fn(async () => ({ rows: [], rowCount: 1 })) } as unknown as Pick<pg.PoolClient, "query">,
         schedule({ ...template, constraints: [...(template.constraints ?? []), "forged sibling"] }),
+        { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map(), undefined, undefined, true)
+      expect(create.mock.calls[2]?.[3]).not.toHaveProperty("objectiveTaskGraphChildAuthority")
+      expect(create.mock.calls[2]?.[3]).not.toHaveProperty("nestedScoutAuthority")
+      await createGraphTasks({ query: vi.fn(async () => ({ rows: [], rowCount: 1 })) } as unknown as Pick<pg.PoolClient, "query">,
+        { ...schedule(template), proposal: { expectedRevision: 0, nodes: [plannedNode({ key: "analysis", templateId: "analyst", goal: "Analyze", successCriteria: ["done"], dependsOn: [] })] },
+          templates: { analyst: TASK_GRAPH_TEMPLATES.analyst } },
+        { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map(), undefined, undefined, true)
+      expect(create.mock.calls[3]?.[3]).toMatchObject({ objectiveTaskGraphChildAuthority: schedule(template).scope })
+      const analyst = TASK_GRAPH_TEMPLATES.analyst
+      await createGraphTasks({ query: vi.fn(async () => ({ rows: [], rowCount: 1 })) } as unknown as Pick<pg.PoolClient, "query">,
+        { ...schedule(template), proposal: { expectedRevision: 0, nodes: [plannedNode({ key: "analysis", templateId: "analyst", goal: "Analyze", successCriteria: ["done"], dependsOn: [] })] },
+          templates: { analyst: { ...analyst, allowedActions: [...analyst.allowedActions, "jobs.list"] } } },
+        { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map(), undefined, undefined, true)
+      expect(create.mock.calls[4]?.[3]).not.toHaveProperty("objectiveTaskGraphChildAuthority")
+      await createGraphTasks({ query: vi.fn(async () => ({ rows: [], rowCount: 1 })) } as unknown as Pick<pg.PoolClient, "query">,
+        { ...schedule(template), proposal: { expectedRevision: 0, nodes: [plannedNode({ key: "analysis", templateId: "analyst", goal: "Analyze", successCriteria: ["done"], dependsOn: [] })] },
+          templates: { analyst } },
         { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map())
-      expect(create.mock.calls[1]?.[3]).not.toHaveProperty("nestedScoutAuthority")
+      expect(create.mock.calls[5]?.[3]).not.toHaveProperty("objectiveTaskGraphChildAuthority")
+      const objective: TaskGraphScheduleInput = {
+        scope: schedule(template).scope,
+        proposal: { expectedRevision: 0, nodes: [
+          { key: "scout", templateId: "scout", goal: "Find candidates", successCriteria: ["Return candidates"], dependsOn: [], verification: scoutVerification },
+          { key: "analyst", templateId: "analyst", goal: "Analyze candidates", successCriteria: ["Return findings"], dependsOn: ["scout"], verification: analystVerification },
+        ] },
+        templates: { scout: TASK_GRAPH_TEMPLATES.scout, analyst },
+        verificationRequirements: { status: "valid", requirements: [
+          { id: "candidate-count", kind: "candidate_count_gte", minimum: 1 },
+          { id: "finding-count", kind: "finding_count_gte", minimum: 1 },
+        ] },
+      }
+      create.mockResolvedValueOnce({ ...taskRow("scout"), id: "scout-task" } as never)
+      create.mockResolvedValueOnce({ ...taskRow("analyst"), id: "analyst-task", taskType: analyst.taskType,
+        allowedActions: analyst.allowedActions, expectedOutputSchema: analyst.expectedOutputSchema } as never)
+      const result = await createGraphTasks({ query: vi.fn(async () => ({ rows: [], rowCount: 1 })) } as unknown as Pick<pg.PoolClient, "query">,
+        objective, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 } } },
+        createInitialTaskGraphState(), new Map(), undefined, undefined, true)
+      expect(result.created.map(node => [node.key, node.status])).toEqual([["scout", "queued"], ["analyst", "waiting"]])
+      expect(create.mock.calls[6]?.[3]).toMatchObject({ objectiveTaskGraphChildAuthority: objective.scope })
+      expect(create.mock.calls[7]?.[3]).toMatchObject({ objectiveTaskGraphChildAuthority: objective.scope })
+      expect(create.mock.calls[7]?.[1]?.allowedActions).toEqual(analyst.allowedActions)
     } finally { create.mockRestore() }
   })
 
@@ -366,6 +409,7 @@ describe("createGraphTasks", () => {
     const query = vi.fn(async (sql: string, values?: unknown[]) => {
       const admission = ownedTurnScopeRow(sql, values)
       if (admission) return admission
+      if (sql.includes('turn."executionMode" AS "turnExecutionMode"')) return { rows: [], rowCount: 0 }
       if (sql.includes('SELECT "id", "rootTaskId", "parentTaskId", "path"')) return { rows: [{
         id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running",
         allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],

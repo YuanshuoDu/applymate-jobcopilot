@@ -10,6 +10,9 @@ import { normalizeSubagentPolicy } from "./types.js"
 import type { Queryable } from "./pg-store-persistence.js"
 import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
+import { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
+import type { GraphScope } from "./task-graph-pg-state.js"
 
 function authorityParent(overrides: Record<string, unknown> = {}) {
   return {
@@ -30,7 +33,8 @@ function authorityRoot(overrides: Record<string, unknown> = {}) {
   }
 }
 
-function authorizedCreateFixture(parent: Record<string, unknown>, childOverrides: Record<string, unknown> = {}, totalChildren = 0) {
+function authorizedCreateFixture(parent: Record<string, unknown>, childOverrides: Record<string, unknown> = {}, totalChildren = 0,
+  objectiveAuthorityRows: readonly Record<string, unknown>[] = []) {
   const calls: string[] = []
   const insertValues: unknown[][] = []
   const child = {
@@ -45,6 +49,26 @@ function authorizedCreateFixture(parent: Record<string, unknown>, childOverrides
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push(sql)
       if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "turn-1" }], rowCount: 1 }
+      if (sql.includes('FROM live') && sql.includes('JOIN "agent_steps" AS step')) {
+        const [sessionId, userId, turnId, rootTaskId, turnLeaseOwner, turnLeaseVersion, parentLeaseOwner, parentAttemptCount, stepId] = params ?? []
+        const rows = objectiveAuthorityRows.filter(row => row.sessionId === sessionId && row.userId === userId
+          && row.sessionStatus !== "aborted" && row.sessionStatus !== "archived" && row.turnId === turnId
+          && row.turnSource === "user" && (row.executionMode === null || row.executionMode === "canonical_task_graph") && row.turnStatus === "in_progress"
+          && row.turnRootTaskId === rootTaskId && row.turnLeaseOwner === turnLeaseOwner && row.turnLeaseVersion === turnLeaseVersion
+          && row.rootTaskId === rootTaskId && row.rootRootTaskId === rootTaskId && row.rootParentTaskId == null
+          && row.rootRole === "orchestrator" && row.rootTaskType === "root" && row.rootStatus === "running"
+          && row.parentLeaseOwner === parentLeaseOwner && row.parentAttemptCount === parentAttemptCount && row.interruptRequestedAt == null
+          && row.stepId === stepId && row.stepTaskId === rootTaskId && row.stepStatus === "streaming")
+        return { rows, rowCount: rows.length }
+      }
+      if (sql.startsWith('UPDATE "agent_turns" AS turn SET')) {
+        const [turnId, sessionId, userId, rootTaskId, turnLeaseOwner, turnLeaseVersion] = params ?? []
+        const matchingNullMode = objectiveAuthorityRows.some(row => row.turnId === turnId && row.sessionId === sessionId
+          && row.userId === userId && row.turnRootTaskId === rootTaskId && row.turnSource === "user"
+          && row.executionMode === null && row.turnStatus === "in_progress" && row.turnLeaseOwner === turnLeaseOwner
+          && row.turnLeaseVersion === turnLeaseVersion)
+        return { rows: matchingNullMode ? [{ id: turnId }] : [], rowCount: matchingNullMode ? 1 : 0 }
+      }
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('SELECT "rootTaskId", "turnId"')) return { rows: [{ rootTaskId: "root-1", turnId: "turn-1" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS root')) return { rows: [{ id: "root-1", turnId: "turn-1", status: "running", interruptRequestedAt: null }], rowCount: 1 }
@@ -60,6 +84,74 @@ function authorizedCreateFixture(parent: Record<string, unknown>, childOverrides
 }
 
 describe("pg-store task creation helpers", () => {
+  it("allows only exact owned objective child specs past the parent action subset check", async () => {
+    const scope: GraphScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      stepId: "step-1", turnLeaseOwner: "turn-owner", turnLeaseVersion: 2, parentLeaseOwner: "root-owner", parentAttemptCount: 1 }
+    const actions = ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"]
+    const row = { sessionId: scope.sessionId, userId: scope.userId, sessionStatus: "active", turnId: scope.turnId,
+      turnSource: "user", executionMode: "canonical_task_graph", turnStatus: "in_progress", turnRootTaskId: scope.rootTaskId,
+      turnLeaseOwner: scope.turnLeaseOwner, turnLeaseVersion: scope.turnLeaseVersion,
+      input: { goal: "Find roles", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT },
+      rootTaskId: scope.rootTaskId, rootRootTaskId: scope.rootTaskId, rootParentTaskId: null, rootRole: "orchestrator",
+      rootTaskType: "root", rootStatus: "running", parentLeaseOwner: scope.parentLeaseOwner, parentAttemptCount: scope.parentAttemptCount,
+      interruptRequestedAt: null, stepId: scope.stepId, stepTaskId: scope.rootTaskId, stepStatus: "streaming" }
+    const parent = authorityRoot({ allowedActions: ["agent.plan", "agent.wait", "agent.list"] })
+    const fixture = authorizedCreateFixture(parent, {}, 0, [row])
+    const task = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, parentTaskId: scope.rootTaskId,
+      role: "scout", taskType: "job_discovery", goal: "Find roles", constraints: TASK_GRAPH_TEMPLATES.scout.constraints,
+      successCriteria: ["Return matching jobs"], allowedActions: actions, context: {},
+      expectedOutputSchema: TASK_GRAPH_TEMPLATES.scout.expectedOutputSchema, policy: normalizeSubagentPolicy() }
+    await createSubagentTask(fixture.client, task, true, { objectiveTaskGraphChildAuthority: scope })
+    expect(fixture.insertValues).toHaveLength(1)
+    expect(fixture.insertValues[0]?.[12]).toBe(JSON.stringify(actions))
+
+    const legacyMode = authorizedCreateFixture(parent, {}, 0, [{ ...row, executionMode: null }])
+    await createSubagentTask(legacyMode.client, task, true, { objectiveTaskGraphChildAuthority: scope })
+    const promotionIndex = legacyMode.calls.findIndex(sql => sql.startsWith('UPDATE "agent_turns" AS turn SET'))
+    const insertIndex = legacyMode.calls.findIndex(sql => sql.startsWith('INSERT INTO "sub_agent_tasks"'))
+    expect(promotionIndex).toBeGreaterThanOrEqual(0)
+    expect(promotionIndex).toBeLessThan(insertIndex)
+
+    const fake = authorizedCreateFixture(parent)
+    await expect(createSubagentTask(fake.client, task, true, { objectiveTaskGraphChildAuthority: scope }))
+      .rejects.toThrow("Child allowed actions exceed parent policy")
+    expect(fake.insertValues).toHaveLength(0)
+
+    const stale = authorizedCreateFixture(parent, {}, 0, [row])
+    await expect(createSubagentTask(stale.client, task, true, { objectiveTaskGraphChildAuthority: { ...scope, stepId: "old-step" } }))
+      .rejects.toThrow("Child allowed actions exceed parent policy")
+    expect(stale.insertValues).toHaveLength(0)
+
+    const altered = authorizedCreateFixture(parent, {}, 0, [row])
+    await expect(createSubagentTask(altered.client, { ...task, allowedActions: [...actions, "applications.submit"] }, true,
+      { objectiveTaskGraphChildAuthority: scope })).rejects.toThrow("Child allowed actions exceed parent policy")
+    expect(altered.insertValues).toHaveLength(0)
+
+    const analystActions = TASK_GRAPH_TEMPLATES.analyst.allowedActions
+    const analystTask = { ...task, role: "analyst", taskType: TASK_GRAPH_TEMPLATES.analyst.taskType,
+      constraints: TASK_GRAPH_TEMPLATES.analyst.constraints, allowedActions: analystActions,
+      expectedOutputSchema: TASK_GRAPH_TEMPLATES.analyst.expectedOutputSchema }
+    const analystChild = { role: "analyst", taskType: TASK_GRAPH_TEMPLATES.analyst.taskType, allowedActions: analystActions,
+      expectedOutputSchema: TASK_GRAPH_TEMPLATES.analyst.expectedOutputSchema }
+    const admittedAnalyst = authorizedCreateFixture(parent, analystChild, 0, [row])
+    await createSubagentTask(admittedAnalyst.client, analystTask, true, { objectiveTaskGraphChildAuthority: scope })
+    expect(admittedAnalyst.insertValues[0]?.[12]).toBe(JSON.stringify(analystActions))
+
+    const foreignAnalyst = authorizedCreateFixture(parent, analystChild, 0, [{ ...row, userId: "foreign-user" }])
+    await expect(createSubagentTask(foreignAnalyst.client, analystTask, true, { objectiveTaskGraphChildAuthority: scope }))
+      .rejects.toThrow("Child allowed actions exceed parent policy")
+    expect(foreignAnalyst.insertValues).toHaveLength(0)
+
+    const alteredAnalyst = authorizedCreateFixture(parent, analystChild, 0, [row])
+    await expect(createSubagentTask(alteredAnalyst.client, { ...analystTask, allowedActions: [...analystActions, "applications.submit"] }, true,
+      { objectiveTaskGraphChildAuthority: scope })).rejects.toThrow("Child allowed actions exceed parent policy")
+    expect(alteredAnalyst.insertValues).toHaveLength(0)
+
+    const noAuthority = authorizedCreateFixture(parent, analystChild, 0, [row])
+    await expect(createSubagentTask(noAuthority.client, analystTask, true)).rejects.toThrow("Child allowed actions exceed parent policy")
+    expect(noAuthority.insertValues).toHaveLength(0)
+  })
+
   it("keeps the root bootstrap action union while rejecting unproven nested actions and context", async () => {
     const rootActions = ["scout.delegate", "scout.results", "agent.plan"]
     const rootFixture = authorizedCreateFixture(authorityRoot(), { parentTaskId: null, depth: 0, allowedActions: rootActions })

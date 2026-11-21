@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { canonicalTaskGraphItemId, canonicalTaskGraphSourceKey, projectFinalTaskGraphSourceDetail } from './final-task-graph-source-detail'
-import { TASK_GRAPH_SOURCES_SCHEMA_VERSION } from './final-task-graph-source-manifest'
+import { TASK_GRAPH_SOURCES_SCHEMA_VERSION, TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2 } from './final-task-graph-source-manifest'
 
 const sessionId = 'session_1', userId = 'user_1', finalItemId = 'final_1', turnId = 'turn_1', rootTaskId = 'root_1'
 const sourceKey = canonicalTaskGraphSourceKey(finalItemId, 4, 0)
@@ -129,5 +129,50 @@ describe('projectFinalTaskGraphSourceDetail', () => {
     expect(query([sources[0]!])).toBeNull()
     expect(query([sources[0]!, forgedControlSource])).toBeNull()
     expect(query([...sources, forgedControlSource])).toBeNull()
+  })
+
+  it('validates v2 historical omissions against completed owned scout or analyst nodes only', () => {
+    const base = input()
+    const nodes = [
+      graph.nodes[0],
+      { key: 'analyst', templateId: 'analyst', goal: 'Assess roles', successCriteria: ['Score evidence'], dependsOn: ['scout'], depth: 2, taskId: 'child_2' },
+      { key: 'native-control', templateId: 'native_verification', goal: 'Verify answer', successCriteria: ['Check evidence'], dependsOn: ['analyst'], depth: 3, taskId: 'control_1' },
+    ]
+    const analystTask = { id: 'child_2', sessionId, turnId, rootTaskId, parentTaskId: rootTaskId, role: 'analyst', taskType: 'analyst', status: 'completed',
+      goal: 'Assess roles', result: { structuredResult: { role: 'analyst', status: 'completed' } }, hasResult: true, updatedAt }
+    const writerTask = { id: 'child_3', sessionId, turnId, rootTaskId, parentTaskId: rootTaskId, role: 'writer', taskType: 'writer', status: 'completed',
+      goal: 'Write result', result: null, hasResult: true, updatedAt }
+    const controlTask = { id: 'control_1', sessionId, turnId, rootTaskId, parentTaskId: rootTaskId, role: 'auditor', taskType: 'native_verification', status: 'completed',
+      goal: 'Verify answer', result: null, hasResult: false, updatedAt }
+    const taskRows = [...base.taskRows as Record<string, unknown>[], analystTask, controlTask]
+    const scoutSource = content.taskGraphSources.sources[0]!
+    const controlSource = { sourceKey: canonicalTaskGraphSourceKey(finalItemId, 4, 2), nodeIndex: 2, role: 'unsupported' as const,
+      taskStatus: 'completed' as const, resultState: 'unsupported_role' as const }
+    const extendedNodes = [nodes[0]!, nodes[1]!,
+      { key: 'writer', templateId: 'writer', goal: 'Write result', successCriteria: ['Write result'], dependsOn: ['analyst'], depth: 3, taskId: 'child_3' },
+      { ...nodes[2]!, dependsOn: ['writer'], depth: 4 }]
+    const v2Content = (sources: readonly unknown[], historicalNodeIndices: readonly number[]) => ({ taskGraphSources: {
+      schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2, graphRevision: 4, sources, historicalNodeIndices,
+    } })
+    const query = (sources: readonly unknown[], historicalNodeIndices: readonly number[], selectedKey = sourceKey,
+      scopedTaskRows: readonly unknown[] = taskRows, scopedNodes = nodes) => projectFinalTaskGraphSourceDetail({
+      ...base,
+      sourceKey: selectedKey,
+      finalItem: { ...(base.finalItem as object), content: v2Content(sources, historicalNodeIndices) },
+      graphRows: [{ ...(base.graphRows as object[])[0], content: { ...graph, nodes: scopedNodes } }],
+      taskRows: scopedTaskRows,
+    } as never)
+
+    const projected = query([scoutSource], [1])
+    expect(projected).toMatchObject({ role: 'scout', resultState: 'valid' })
+    expect(JSON.stringify(projected)).not.toContain('child_2')
+    expect(query([scoutSource], [1], canonicalTaskGraphSourceKey(finalItemId, 4, 1))).toBeNull()
+    expect(query([scoutSource], [1], sourceKey, taskRows.map(row => row.id === 'child_2' ? { ...row, role: 'writer' } : row))).toBeNull()
+    expect(query([scoutSource], [1], sourceKey, taskRows.map(row => row.id === 'child_2' ? { ...row, status: 'failed' } : row))).toBeNull()
+    expect(query([scoutSource], [1], sourceKey, taskRows, nodes.map((node, index) => index === 1 ? { ...node!, templateId: 'scout' } : node!))).toBeNull()
+    expect(query([scoutSource], [2])).toBeNull()
+    expect(query([scoutSource, controlSource], [1])).toBeNull()
+    expect(query([scoutSource], [0, 1])).toBeNull()
+    expect(query([scoutSource], [1], sourceKey, [...taskRows, writerTask], extendedNodes)).toBeNull()
   })
 })

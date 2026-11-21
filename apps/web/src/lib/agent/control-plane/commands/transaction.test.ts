@@ -93,6 +93,7 @@ describe("Agent command transaction helpers", () => {
 
     const input = agentTurn.create.mock.calls[0]?.[0]?.data.input
     expect(input).toEqual(expect.objectContaining({ goal: "Discovery goal", intent }))
+    expect(agentTurn.create.mock.calls[0]?.[0]?.data).not.toHaveProperty("executionMode")
   })
 
   it("persists the objective task-graph intent with the root dispatch", async () => {
@@ -106,6 +107,7 @@ describe("Agent command transaction helpers", () => {
       OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
     )
 
+    expect(agentTurn.create.mock.calls[0]?.[0]?.data).toMatchObject({ executionMode: "canonical_task_graph" })
     expect(agentTurn.create.mock.calls[0]?.[0]?.data.input).toEqual(expect.objectContaining({
       goal: "Find and assess options", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
     }))
@@ -114,6 +116,18 @@ describe("Agent command transaction helpers", () => {
       aggregateId: command.sessionId,
       idempotencyKey: "turn-dispatch:turn_objective",
     }))
+  })
+
+  it("does not pin canonical mode for a non-user Turn with the objective intent", async () => {
+    const agentTurn = { create: vi.fn().mockResolvedValue({ id: "turn_automation_objective" }) }
+    const agentOutbox = { create: vi.fn().mockResolvedValue({}) }
+    const tx = { agentTurn, agentOutbox } as unknown as CommandTransaction
+    const command = { sessionId: "session_1", userId: "user_1", clientMessageId: "client_automation", source: "automation" as const }
+
+    await createRootTurn(tx, command, [{ type: "text", text: "Automate an objective" }], undefined, undefined,
+      OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
+
+    expect(agentTurn.create.mock.calls[0]?.[0]?.data).not.toHaveProperty("executionMode")
   })
 
   it("persists valid, invalid-sentinel, and absent objective requirements distinctly", async () => {

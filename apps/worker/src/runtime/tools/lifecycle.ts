@@ -10,8 +10,11 @@ import { prepareLifecycleValue, prepareSafeValue, prepareScheduledPrepareLifecyc
 import { redactJobReadOutput } from "./job-read-output-redaction.js"
 import { isVerifiedToolResultChunk } from "./tool-result-reference-repo.js"
 import { hasNativeCoordinationEnvelope, prepareResolvedOwnerWaitLifecycleOutput, prepareVerifiedToolResultChunk } from "./lifecycle-receipt-output.js"
-import { ToolExecutionError, type ToolLifecyclePayload } from "./types.js"
+import { prepareScoutDelegateLifecycleOutput } from "./scout-delegate-output-redaction.js"
+import { prepareScoutResultsOutput } from "./scout-results-output-redaction.js"
+import { ToolExecutionError, type ToolLifecycleFailure, type ToolLifecyclePayload } from "./types.js"
 import { isTaskGraphResultPageLike, prepareAgentListLifecycleInput, prepareTaskGraphResultPageOutput } from "./task-graph-result-page-redaction.js"
+
 export type ToolLifecyclePhase = "started" | "progress" | "completed" | "failed" | "cancelled"
 export type DiscoveryAttemptLifecycleEvent =
   | Readonly<{ call: LifecycleCall; phase: "started" }>
@@ -36,7 +39,6 @@ export type ToolLifecycleOwnerContext = {
 export type ToolLifecycleOwnerResolver = (context: ToolLifecycleOwnerContext) => ExecutionOwner
 export class InMemoryToolLifecycleSink implements ToolLifecycleSink {
   readonly events: ToolLifecycleEvent[] = []
-
   async append(event: ToolLifecycleEvent): Promise<void> {
     this.events.push(event)
   }
@@ -45,7 +47,6 @@ export class InMemoryToolLifecycleSink implements ToolLifecycleSink {
     return this.events.map((event) => ({ ...event, item: { ...event.item }, payload: { ...event.payload } }))
   }
 }
-
 export interface ToolLifecycleOptions {
   readonly sink: ToolLifecycleSink
   /** Legacy test seam; oversized values never fall back to this store. */
@@ -62,12 +63,10 @@ export class ToolLifecycle {
   private readonly maxEventBytes: number
   private readonly inputs = new Map<string, unknown>()
   private readonly pageCalls = new Set<string>()
-
   constructor(private readonly options: ToolLifecycleOptions) {
     this.now = options.now ?? (() => new Date().toISOString())
     this.maxEventBytes = options.maxEventBytes ?? 8 * 1024
   }
-
   async started(call: LifecycleCall, input: unknown): Promise<void> {
     const timestamp = this.now()
     const listInput = call.toolName === "agent.list" ? prepareAgentListLifecycleInput(input, this.maxEventBytes) : null
@@ -115,17 +114,18 @@ export class ToolLifecycle {
 
   async completed(call: LifecycleCall, output: unknown, signal?: AbortSignal): Promise<unknown> { return this.result(call, "completed", null, output, signal) }
 
-  async failed(call: LifecycleCall, phase: "failed" | "cancelled", errorCode: string, detail?: unknown): Promise<unknown> {
-    return this.result(call, phase, errorCode, detail)
+  async failed(call: LifecycleCall, phase: "failed" | "cancelled", errorCode: string, failure: ToolLifecycleFailure): Promise<unknown> {
+    return this.result(call, phase, errorCode, failure.kind === "diagnostic" ? null : failure.output, undefined, failure.kind === "diagnostic" ? { detail: failure.detail } : undefined)
   }
 
-  private async result(call: LifecycleCall, phase: "completed" | "failed" | "cancelled", errorCode: string | null, output: unknown, signal?: AbortSignal): Promise<unknown> {
+  private async result(call: LifecycleCall, phase: "completed" | "failed" | "cancelled", errorCode: string | null, output: unknown, signal?: AbortSignal, diagnostic?: { detail: unknown }): Promise<unknown> {
     const timestamp = this.now()
     const pageCall = this.pageCalls.delete(call.id)
     const discoveryObservation = { output: output ?? null }
     const safeOutput = phase === "completed"
       ? await this.persistCompletedOutput(call, output ?? null, pageCall, discoveryObservation)
-      : sanitizeLifecyclePreview(output ?? null, this.maxEventBytes)
+      : diagnostic ? null : sanitizeLifecyclePreview(output ?? null, this.maxEventBytes)
+    const safeFailureDetail = diagnostic ? sanitizeLifecyclePreview(diagnostic.detail, this.maxEventBytes) : undefined
     if (phase === "completed" && signal?.aborted) throw new ToolExecutionError("cancelled", "Tool execution was interrupted")
     const item: ToolResultItem = {
       schemaVersion,
@@ -142,9 +142,9 @@ export class ToolLifecycle {
       errorCode,
     }
     if (phase === "completed" && signal?.aborted) throw new ToolExecutionError("cancelled", "Tool execution was interrupted")
-    await this.append({ phase, eventType: phase === "completed" ? "tool_call.completed" : "tool_call.failed", item, payload: this.payload(call, phase, { output: safeOutput, errorCode }) })
+    await this.append({ phase, eventType: phase === "completed" ? "tool_call.completed" : "tool_call.failed", item, payload: this.payload(call, phase, { ...(phase === "completed" ? {} : { failureKind: diagnostic ? "diagnostic" : "safe_output" }), ...(diagnostic ? { failureDetail: safeFailureDetail } : {}), output: safeOutput, errorCode }) })
     this.inputs.delete(call.id)
-    this.observeDiscoveryAttempt({ call, phase, output: phase === "completed" ? discoveryObservation.output : output ?? null })
+    this.observeDiscoveryAttempt({ call, phase, output: phase === "completed" ? discoveryObservation.output : diagnostic?.detail ?? output ?? null })
     return safeOutput
   }
 
@@ -182,6 +182,8 @@ export class ToolLifecycle {
       } catch {
         throw new ToolExecutionError("scheduled_prepare_lifecycle_output_invalid", "Scheduled Prepare output is invalid")
       }
+    } else if (call.toolName === "scout.delegate") {
+      prepared = prepareScoutDelegateLifecycleOutput(output, call) ?? prepareLifecycleValue(output)
     } else if (call.toolName === "jobs.search" || call.toolName === "jobs.get" || call.toolName === "jobs.discover") {
       prepared = prepareSafeValue(redactJobReadOutput(call.toolName, output))
     } else if (call.toolName === "tool_results.read") {
@@ -192,7 +194,8 @@ export class ToolLifecycle {
         : null
       prepared = verified ?? prepareLifecycleValue(output)
     } else {
-      prepared = prepareLifecycleValue(output)
+      const scoutResults = call.toolName === "scout.results" ? prepareScoutResultsOutput(output) : null
+      prepared = scoutResults === null ? prepareLifecycleValue(output) : prepareSafeValue(scoutResults)
     }
     if (call.toolName === "jobs.discover") discoveryObservation.output = output
     if (prepared.sizeBytes > MAX_TOOL_RESULT_BYTES) {
@@ -227,12 +230,10 @@ export class ToolLifecycle {
   private async append(event: ToolLifecycleEvent): Promise<void> {
     await this.options.sink.append(event)
   }
-
   private observeDiscoveryAttempt(event: DiscoveryAttemptLifecycleEvent): void {
     if (event.call.toolName !== "jobs.discover") return
     try { this.options.onDiscoveryAttemptLifecycleEvent?.(event) } catch { /* Observation cannot change a committed tool outcome. */ }
   }
-
   private payload(call: LifecycleCall, status: string, extra: Record<string, unknown>): ToolLifecyclePayload {
     return { toolCallId: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status, ...extra } as ToolLifecyclePayload
   }

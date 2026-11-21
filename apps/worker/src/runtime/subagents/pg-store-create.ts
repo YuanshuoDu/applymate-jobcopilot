@@ -7,6 +7,8 @@ import { assertNoUnresolvedSteering } from "./steering-reconciliation-ledger.js"
 import type { SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
 import { filterNestedScoutProtectedActions, hasNestedScoutPrivateContext, hasNestedScoutProtectedActions,
   isNestedScoutCreationAuthorityValid, type NestedScoutCreationAuthority } from "./nested-scout-creation-authority.js"
+import { admitOwnedObjectiveTaskGraphChild } from "./objective-task-graph-child-authority.js"
+import type { GraphScope } from "./task-graph-pg-state.js"
 
 export async function readSubagentTask(client: Queryable, taskId: string, sessionId: string): Promise<SubagentTaskRecord> {
   const result = await client.query(SELECT_TASK, [taskId, sessionId])
@@ -49,7 +51,8 @@ export async function createSubagentTask(
   client: Queryable,
   input: SubagentTaskSpec & { policy: SubagentPolicy },
   sessionLocked = false,
-  options: { preserveEmptyAllowedActions?: boolean; taskGraphChildDeadline?: boolean; nestedScoutAuthority?: NestedScoutCreationAuthority } = {},
+  options: { preserveEmptyAllowedActions?: boolean; taskGraphChildDeadline?: boolean; nestedScoutAuthority?: NestedScoutCreationAuthority;
+    objectiveTaskGraphChildAuthority?: GraphScope } = {},
 ): Promise<SubagentTaskRecord> {
   if (options.nestedScoutAuthority !== undefined && options.nestedScoutAuthority !== "parent_template" && options.nestedScoutAuthority !== "child_execution") {
     throw new Error("nested_scout_creation_authority_invalid")
@@ -104,7 +107,12 @@ export async function createSubagentTask(
   const modelProfile = parentRow ? (inheritedModel ?? input.modelProfileSnapshot ?? {}) : (input.modelProfileSnapshot ?? {})
   const parentActions = parentRow ? actionList(parentRow.allowedActions) : []
   const requestedActions = actionList(input.allowedActions)
-  if (parentRow && requestedActions.some(action => !parentActions.includes(action))) throw new Error("Child allowed actions exceed parent policy")
+  const exceedsParent = Boolean(parentRow && requestedActions.some(action => !parentActions.includes(action)))
+  const objectiveChildAuthority = exceedsParent
+    && await admitOwnedObjectiveTaskGraphChild(client, input, options.objectiveTaskGraphChildAuthority)
+  if (exceedsParent && !objectiveChildAuthority) {
+    throw new Error("Child allowed actions exceed parent policy")
+  }
   const allowedActions = parentRow && requestedActions.length === 0 && !options.preserveEmptyAllowedActions
     ? filterNestedScoutProtectedActions(parentActions) : requestedActions
   if (options.nestedScoutAuthority !== undefined) {

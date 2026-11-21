@@ -7,7 +7,7 @@ import { useI18n, type Lang } from '@/lib/i18n'
 import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '@/lib/task-graph-plan-labels'
 import { parsePlanLedgerWithRepairTargets, projectRepairAttentionSummaries, type PlanLedgerWithRepairTargetGoals } from '@/lib/task-graph-repair-display'
 
-import { projectCurrentTaskGraph, type TaskGraphEvidencePreview, type TaskGraphPlanReadiness, type TaskGraphPlanStatus } from './task-graph-plan'
+import { projectCurrentTaskGraph, projectTaskGraphSuccessCriteria, type TaskGraphEvidencePreview, type TaskGraphPlanReadiness, type TaskGraphPlanStatus } from './task-graph-plan'
 import { selectedTaskGraphIdentity, type TaskGraphIdentity } from './task-graph-plan-query'
 import { TaskGraphVerificationSummary } from './TaskGraphVerificationSummary'
 import type { SupervisorTaskSummary } from './task-tree-projection'
@@ -55,13 +55,14 @@ export function TaskGraphPlanPanel({ sessionId, items, tasks, ledger, discoveryS
     const matched = response && sameTaskGraphIdentity(response.identity, identity) ? response : null
     return {
       plan: matched?.projection ?? current, verificationSummary: matched?.verificationSummary ?? null,
+      successCriteria: matched ? projectTaskGraphSuccessCriteria(graphItems, identity, matched.projection) : null,
       shortlist: shortlist && sameTaskGraphIdentity(shortlist.identity, identity) ? shortlist.result : null,
     }
   }, [discoveryShortlist, items, ledger, selectedPreparationTurnId, sessionId, tasks])
   if (!view.plan && !view.shortlist) return null
 
   return <>
-    {view.plan && <TaskGraphPlanSection plan={view.plan} verificationSummary={view.verificationSummary} sessionId={sessionId} lang={lang} t={t} />}
+    {view.plan && <TaskGraphPlanSection plan={view.plan} successCriteria={view.successCriteria} verificationSummary={view.verificationSummary} sessionId={sessionId} lang={lang} t={t} />}
     {view.shortlist && <DiscoveryShortlistSection result={view.shortlist} lang={lang} />}
   </>
 }
@@ -140,8 +141,9 @@ function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
 
-function TaskGraphPlanSection({ plan, verificationSummary, sessionId, lang, t }: {
+function TaskGraphPlanSection({ plan, successCriteria, verificationSummary, sessionId, lang, t }: {
   readonly plan: PlanLedgerWithRepairTargetGoals
+  readonly successCriteria: ReadonlyMap<string, readonly string[]> | null
   readonly verificationSummary: TaskGraphVerificationSummaryDto | null
   readonly sessionId: string
   readonly lang: Lang
@@ -181,6 +183,10 @@ function TaskGraphPlanSection({ plan, verificationSummary, sessionId, lang, t }:
                 ))}</ul>}
             </div>
             <div><span>{taskGraphPlanLabel(lang, 'agent.taskGraph.readiness')}:</span> {taskGraphPlanLabel(lang, READINESS_LABELS[node.readiness])}</div>
+            {successCriteria?.get(node.key)?.length ? <div role="group" aria-label={lang === 'zh' ? '验收标准' : 'Success criteria'} data-task-graph-success-criteria="true">
+              <strong>{lang === 'zh' ? '验收标准' : 'Success criteria'}</strong>
+              <ul>{successCriteria.get(node.key)?.map((criterion, index) => <li key={index}>{criterion}</li>)}</ul>
+            </div> : null}
           </li>
         ))}
       </ol>
