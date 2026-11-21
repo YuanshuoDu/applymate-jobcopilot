@@ -83,6 +83,20 @@ export { normalizeExternalApiErrorCode, sharedExternalApiErrorCode, type Externa
 export { getAzureManagementToken, type AzureManagementTokenCredential } from "./azure-management.js";
 export { canonicalJson, CanonicalJsonError, hashContent } from "./canonical-json.js";
 export {
+  buildAgentSelectedJobMaterial,
+  readAgentSelectedJobBaseResume,
+  readAgentSelectedJobJob,
+  readAgentSelectedJobMaterial,
+  readAgentSelectedJobPersonaFacts,
+  type AgentSelectedJobJob,
+  type AgentSelectedJobMaterial,
+  type AgentSelectedJobMaterialQueryClient,
+  type AgentSelectedJobPersonaFact,
+  type AgentSelectedJobQueryParameter,
+  type AgentSelectedJobResume,
+  type AgentSelectedJobSourceMaterial,
+} from "./agent-selected-job-material.js";
+export {
   DISCOVERY_PERSONA_BYTE_LIMIT,
   DISCOVERY_PERSONA_FACT_LIMIT,
   DISCOVERY_PERSONA_PROJECTION_SCHEMA,
