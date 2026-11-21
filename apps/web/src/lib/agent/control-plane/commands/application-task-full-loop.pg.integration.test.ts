@@ -829,6 +829,17 @@ function jsonRecord(value: unknown): Record<string, unknown> | null {
     : null
 }
 
+async function reviewedSourceStructuredResult(taskStatus: string, value: unknown, role: "writer" | "reviewer") {
+  const { projectTaskGraphResult } = await import("../../../../../../worker/src/runtime/subagents/task-graph-result-projection")
+  const projection = projectTaskGraphResult(role, taskStatus, value)
+  if (projection.availability !== "available" || projection.role !== role) {
+    throw new Error("reviewed_source_worker_result_invalid")
+  }
+  const result = jsonRecord(jsonRecord(value)?.structuredResult)
+  if (!result || result.role !== role) throw new Error("reviewed_source_worker_result_invalid")
+  return result
+}
+
 async function startReviewedFillRouteBridge(): Promise<void> {
   const { db } = await import("@/lib/db")
   reviewedFillRouteDb = db
@@ -1642,30 +1653,49 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const source = await startSelectedJobSource({ ...scenario, token, key: `reviewed-source-positive-${runId}` })
     const sourceChildren = await testDb.subAgentTask.findMany({ where: {
       sessionId: scenario.sessionId, turnId: source.turnId, role: { in: ["writer", "reviewer"] }, status: "completed",
-    }, select: { id: true, role: true, result: true } })
+    }, select: { id: true, role: true, status: true, result: true } })
     expect(sourceChildren.map(child => child.role).sort()).toEqual(["reviewer", "writer"])
     const writer = sourceChildren.find(child => child.role === "writer")!
     const reviewer = sourceChildren.find(child => child.role === "reviewer")!
-    const writerResult = jsonRecord(writer.result)
-    const reviewerResult = jsonRecord(reviewer.result)
-    expect(writerResult).toMatchObject({ schemaVersion: "agent-harness.v2.subagent.result", role: "writer", status: "completed" })
-    expect(reviewerResult).toMatchObject({ schemaVersion: "agent-harness.v2.subagent.result", role: "reviewer", status: "completed", reviewStatus: "passed" })
+    const writerResult = await reviewedSourceStructuredResult(writer.status, writer.result, "writer")
+    const reviewerResult = await reviewedSourceStructuredResult(reviewer.status, reviewer.result, "reviewer")
+    expect(writerResult.role).toBe("writer")
+    expect(writerResult.status).toBe("completed")
+    expect(reviewerResult.role).toBe("reviewer")
+    expect(reviewerResult.status).toBe("completed")
+    expect(reviewerResult.reviewStatus).toBe("passed")
     const artifactRef = jsonRecord(writerResult?.artifactRef)
-    expect(artifactRef).toMatchObject({ artifactId: expect.any(String), version: expect.any(Number),
-      contentHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/), sourceDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) })
-    expect(reviewerResult?.artifactRef).toEqual(artifactRef)
+    const reviewerArtifactRef = jsonRecord(reviewerResult.artifactRef)
+    const validArtifactRef = typeof artifactRef?.artifactId === "string" && artifactRef.artifactId.length > 0
+      && Number.isSafeInteger(artifactRef.version)
+      && typeof artifactRef.contentHash === "string" && /^sha256:[a-f0-9]{64}$/.test(artifactRef.contentHash)
+      && typeof artifactRef.sourceDigest === "string" && /^sha256:[a-f0-9]{64}$/.test(artifactRef.sourceDigest)
+    expect(validArtifactRef).toBe(true)
+    const sameArtifactRef = Boolean(artifactRef && reviewerArtifactRef
+      && artifactRef.artifactId === reviewerArtifactRef.artifactId
+      && artifactRef.version === reviewerArtifactRef.version
+      && artifactRef.contentHash === reviewerArtifactRef.contentHash
+      && artifactRef.sourceDigest === reviewerArtifactRef.sourceDigest)
+    expect(sameArtifactRef).toBe(true)
     const versions = await testDb.agentArtifactVersion.findMany({ where: {
       userId: ids.user, sessionId: scenario.sessionId, jobId: scenario.jobId, artifactId: artifactRef!.artifactId as string,
     }, select: { artifactId: true, version: true, content: true, contentHash: true, sourceDigest: true, taskId: true } })
     expect(versions).toHaveLength(1)
-    expect(versions[0]).toMatchObject({ artifactId: artifactRef!.artifactId, version: artifactRef!.version,
-      content: reviewedCoverLetter, contentHash: artifactRef!.contentHash, sourceDigest: artifactRef!.sourceDigest, taskId: writer.id })
+    const version = versions[0]
+    const exactWriterArtifactVersion = Boolean(version && version.artifactId === artifactRef!.artifactId
+      && version.version === artifactRef!.version && version.content === reviewedCoverLetter
+      && version.contentHash === artifactRef!.contentHash && version.sourceDigest === artifactRef!.sourceDigest
+      && version.taskId === writer.id)
+    expect(exactWriterArtifactVersion).toBe(true)
     const reviews = await testDb.agentArtifactReview.findMany({ where: {
       userId: ids.user, sessionId: scenario.sessionId, jobId: scenario.jobId, artifactId: artifactRef!.artifactId as string,
       version: artifactRef!.version as number, status: "passed",
     }, select: { artifactId: true, version: true, taskId: true, reviewHash: true, status: true } })
     expect(reviews).toHaveLength(1)
-    expect(reviews[0]).toMatchObject({ taskId: reviewer.id, reviewHash: reviewerResult?.reviewHash, status: "passed" })
+    const review = reviews[0]
+    const exactReviewerReceipt = Boolean(review && review.taskId === reviewer.id
+      && review.reviewHash === reviewerResult.reviewHash && review.status === "passed")
+    expect(exactReviewerReceipt).toBe(true)
 
     const reviewKey = `reviewed-review-positive-${runId}`
     const firstRequest = await startReviewedApplicationReview({ ...scenario, sourceTurnId: source.turnId, token, key: reviewKey })
@@ -1811,9 +1841,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const source = await startSelectedJobSource({ ...scenario, token, key: `reviewed-source-stale-${runId}` })
     const sourceChildren = await testDb.subAgentTask.findMany({ where: {
       sessionId: scenario.sessionId, turnId: source.turnId, role: { in: ["writer", "reviewer"] }, status: "completed",
-    }, select: { role: true, result: true } })
+    }, select: { role: true, status: true, result: true } })
     expect(sourceChildren.map(child => child.role).sort()).toEqual(["reviewer", "writer"])
-    expect(jsonRecord(sourceChildren.find(child => child.role === "reviewer")?.result)).toMatchObject({ reviewStatus: "passed" })
+    const reviewer = sourceChildren.find(child => child.role === "reviewer")!
+    const reviewerResult = await reviewedSourceStructuredResult(reviewer.status, reviewer.result, "reviewer")
+    expect(reviewerResult.reviewStatus).toBe("passed")
     const before = await requestFixtureStats()
     await testDb.job.update({ where: { id: scenario.jobId }, data: { description: "Synthetic description changed after review." } })
     const started = await startReviewedApplicationReview({ ...scenario, sourceTurnId: source.turnId, token, key: `reviewed-review-stale-${runId}` })
