@@ -140,6 +140,15 @@ describe("Web pending approval freshness", () => {
     expect(fake.tx.agentApproval.updateMany).not.toHaveBeenCalled()
   })
 
+  it("blocks reviewed receipts from direct legacy store decisions", async () => {
+    const fake = makeTransaction()
+    fake.row.id = "reviewed-application-review:turn_1"
+    await expect(resolvePendingApprovalInTransaction(fake.tx, { ...input, id: fake.row.id }))
+      .rejects.toMatchObject({ code: "approval_scope_mismatch" })
+    expect(fake.tx.agentApproval.updateMany).not.toHaveBeenCalled()
+    expect(fake.tx.$queryRaw).toHaveBeenCalledTimes(2)
+  })
+
   it("fails closed when the approval session cannot be locked", async () => {
     const fake = makeTransaction("pending", { hasRequest: true, hasGoalRevision: false }, false)
 
