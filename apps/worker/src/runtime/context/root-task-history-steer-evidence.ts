@@ -8,7 +8,7 @@ import { assertInputClaimOwnerFence, type InputClaimQueryClient, type TurnExecut
 export type RootTaskHistorySteerEvidence = Readonly<{ kind: "no_accepted_steer" | "accepted_steer" | "unsafe" }>
 export type RootTaskHistorySteerEvidenceRequest = Readonly<{ sessionId: string; turnId: string; stepId: string; lease: TurnExecutionFence }>
 type Row = Record<string, unknown>
-type InputEvidence = Readonly<{ id: string; clientMessageId: string; delivery: string; sequence: bigint; content: unknown }>
+type InputEvidence = Readonly<{ id: string; clientMessageId: string; delivery: string; status: string; sequence: bigint; content: unknown }>
 const MAX_INPUT_EVIDENCE = 64
 const UNSAFE: RootTaskHistorySteerEvidence = Object.freeze({ kind: "unsafe" })
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
@@ -44,7 +44,7 @@ function equalJson(left: unknown, right: unknown): boolean {
 function inputIdMatches(value: unknown, id: string): boolean {
   return value === id || UUID.test(id) && value === redactSensitiveText(id)
 }
-function parseInput(row: Row, scope: TenantScope, request: RootTaskHistorySteerEvidenceRequest): InputEvidence | null {
+function parseInput(row: Row, scope: TenantScope, request: Readonly<{ sessionId: string; turnId: string }>): InputEvidence | null {
   const createdAt = timestamp(row.createdAt), consumedAt = row.consumedAt === null ? null : timestamp(row.consumedAt)
   const cancelledAt = row.cancelledAt === null ? null : timestamp(row.cancelledAt)
   const acceptedSequence = sequence(row.acceptedSequence)
@@ -60,9 +60,9 @@ function parseInput(row: Row, scope: TenantScope, request: RootTaskHistorySteerE
   const input = { schemaVersion, id: row.id, clientMessageId: row.clientMessageId, sessionId: row.sessionId,
     turnId: row.targetTurnId, delivery: row.delivery, state: status, content: row.content, createdAt, consumedAt }
   if (!validate(AgentInputSchema, input) || typeof row.id !== "string" || typeof row.clientMessageId !== "string") return null
-  return { id: row.id, clientMessageId: row.clientMessageId, delivery: String(row.delivery), sequence: acceptedSequence, content: row.content }
+  return { id: row.id, clientMessageId: row.clientMessageId, delivery: String(row.delivery), status: String(status), sequence: acceptedSequence, content: row.content }
 }
-function parseEvent(row: Row, input: InputEvidence, sessionId: string, turnId: string): { id: string; inputId: string; clientMessageId: string; delivery: string; sequence: bigint; parts: unknown } | null {
+function parseEvent(row: Row, input: InputEvidence, sessionId: string, turnId: string): { id: string; inputId: string; clientMessageId: string; delivery: string; disposition: string; source: string; sequence: bigint; parts: unknown } | null {
   const payload = record(row.acceptedPayload), item = record(row.acceptedItemContent)
   const payloadKeys = payload && Object.keys(payload).sort().join(",")
   const itemKeys = item && Object.keys(item).sort().join(",")
@@ -93,7 +93,51 @@ function parseEvent(row: Row, input: InputEvidence, sessionId: string, turnId: s
     || row.acceptedEventSessionId !== row.acceptedItemSessionId || row.acceptedEventTurnId !== row.acceptedItemTurnId
     || typeof row.acceptedEventId !== "string") return null
   return { id: String(row.acceptedEventId), inputId: input.id, clientMessageId: input.clientMessageId,
-    delivery: payload.delivery, sequence: acceptedSequence, parts: item.parts }
+    delivery: payload.delivery, disposition: payload.disposition, source: payload.source, sequence: acceptedSequence, parts: item.parts }
+}
+
+export type ValidatedRootTaskAcceptedInput = Readonly<{
+  id: string; status: string; delivery: "steer" | "follow_up"; acceptedSequence: bigint
+  source: "user" | "automation" | "system"; disposition: string; content: unknown
+}>
+
+/** Reuses the strict accepted input/event/item join for an already authorized same-Session transaction. */
+export async function readValidatedRootTaskAcceptedInputs(
+  client: InputClaimQueryClient, scope: TenantScope, request: Readonly<{ sessionId: string; turnId: string }>,
+): Promise<readonly ValidatedRootTaskAcceptedInput[] | undefined> {
+  const inputs = await client.query<Row>(`SELECT "id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence", "consumedByStepId", "consumedAt", "cancelledAt", "createdAt"
+    FROM "agent_inputs" WHERE "sessionId" = $1 AND "targetTurnId" = $2
+    ORDER BY "acceptedSequence" ASC, "id" ASC LIMIT ${MAX_INPUT_EVIDENCE + 1} FOR SHARE`, [request.sessionId, request.turnId])
+  if (inputs.rows.length > MAX_INPUT_EVIDENCE) return undefined
+  const events = await client.query<Row>(`SELECT event."id" AS "acceptedEventId", event."sessionId" AS "acceptedEventSessionId", event."turnId" AS "acceptedEventTurnId",
+      event."itemId" AS "acceptedEventItemId", event."taskId" AS "acceptedTaskId", event."sequence" AS "acceptedEventSequence", event."type" AS "acceptedType",
+      event."actor" AS "acceptedActor", event."correlationId" AS "acceptedCorrelationId", event."causationId" AS "acceptedEventCausationId",
+      event."idempotencyKey" AS "acceptedEventIdempotencyKey", event."payload" AS "acceptedPayload", event."createdAt" AS "acceptedEventCreatedAt",
+      item."id" AS "acceptedItemId", item."sessionId" AS "acceptedItemSessionId", item."turnId" AS "acceptedItemTurnId", item."stepId" AS "acceptedItemStepId",
+      item."taskId" AS "acceptedItemTaskId", item."type" AS "acceptedItemType", item."status" AS "acceptedItemStatus", item."content" AS "acceptedItemContent",
+      item."createdAt" AS "acceptedItemCreatedAt", item."updatedAt" AS "acceptedItemUpdatedAt"
+    FROM "agent_events" AS event LEFT JOIN "agent_items" AS item ON item."id" = event."itemId" AND item."sessionId" = event."sessionId" AND item."turnId" = event."turnId"
+    WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" IS NULL AND event."type" = 'input.accepted'
+    ORDER BY event."sequence" ASC, event."id" ASC LIMIT ${MAX_INPUT_EVIDENCE + 1} FOR SHARE OF event`, [request.sessionId, request.turnId])
+  if (events.rows.length > MAX_INPUT_EVIDENCE || inputs.rows.length !== events.rows.length) return undefined
+  const bySequence = new Map<bigint, InputEvidence>(), ids = new Set<string>(), sequences = new Set<bigint>(), callers = new Set<string>()
+  for (const row of inputs.rows) {
+    const input = parseInput(row, scope, request)
+    if (!input || ids.has(input.id) || sequences.has(input.sequence) || callers.has(input.clientMessageId)) return undefined
+    bySequence.set(input.sequence, input); ids.add(input.id); sequences.add(input.sequence); callers.add(input.clientMessageId)
+  }
+  const seenInputs = new Set<string>(), eventIds = new Set<string>(), eventSequences = new Set<bigint>(), accepted: ValidatedRootTaskAcceptedInput[] = []
+  for (const row of events.rows) {
+    const eventSequence = sequence(row.acceptedEventSequence), input = eventSequence === null ? undefined : bySequence.get(eventSequence)
+    const event = input ? parseEvent(row, input, request.sessionId, request.turnId) : null
+    if (!event || !input || seenInputs.has(event.inputId) || eventIds.has(event.id) || eventSequences.has(event.sequence)
+      || event.clientMessageId !== input.clientMessageId || event.delivery !== input.delivery || event.sequence !== input.sequence
+      || !equalJson(input.content, event.parts)) return undefined
+    accepted.push({ id: input.id, status: input.status, delivery: event.delivery as "steer" | "follow_up",
+      acceptedSequence: event.sequence, source: event.source as "user" | "automation" | "system", disposition: event.disposition, content: event.parts })
+    seenInputs.add(event.inputId); eventIds.add(event.id); eventSequences.add(event.sequence)
+  }
+  return seenInputs.size === ids.size ? accepted : undefined
 }
 
 /**
@@ -115,37 +159,7 @@ export async function readRootTaskHistorySteerEvidence(
     WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 FOR UPDATE`,
   [request.stepId, request.sessionId, request.turnId, rootTaskId])
   if (step.rows.length !== 1) return UNSAFE
-  const inputs = await client.query<Row>(`SELECT "id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence", "consumedByStepId", "consumedAt", "cancelledAt", "createdAt"
-    FROM "agent_inputs" WHERE "sessionId" = $1 AND "targetTurnId" = $2
-    ORDER BY "acceptedSequence" ASC, "id" ASC LIMIT ${MAX_INPUT_EVIDENCE + 1} FOR SHARE`, [request.sessionId, request.turnId])
-  if (inputs.rows.length > MAX_INPUT_EVIDENCE) return UNSAFE
-  const events = await client.query<Row>(`SELECT event."id" AS "acceptedEventId", event."sessionId" AS "acceptedEventSessionId", event."turnId" AS "acceptedEventTurnId",
-      event."itemId" AS "acceptedEventItemId", event."taskId" AS "acceptedTaskId", event."sequence" AS "acceptedEventSequence", event."type" AS "acceptedType",
-      event."actor" AS "acceptedActor", event."correlationId" AS "acceptedCorrelationId", event."causationId" AS "acceptedEventCausationId",
-      event."idempotencyKey" AS "acceptedEventIdempotencyKey", event."payload" AS "acceptedPayload", event."createdAt" AS "acceptedEventCreatedAt",
-      item."id" AS "acceptedItemId", item."sessionId" AS "acceptedItemSessionId", item."turnId" AS "acceptedItemTurnId", item."stepId" AS "acceptedItemStepId",
-      item."taskId" AS "acceptedItemTaskId", item."type" AS "acceptedItemType", item."status" AS "acceptedItemStatus", item."content" AS "acceptedItemContent",
-      item."createdAt" AS "acceptedItemCreatedAt", item."updatedAt" AS "acceptedItemUpdatedAt"
-    FROM "agent_events" AS event LEFT JOIN "agent_items" AS item ON item."id" = event."itemId" AND item."sessionId" = event."sessionId" AND item."turnId" = event."turnId"
-    WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" IS NULL AND event."type" = 'input.accepted'
-    ORDER BY event."sequence" ASC, event."id" ASC LIMIT ${MAX_INPUT_EVIDENCE + 1} FOR SHARE OF event`, [request.sessionId, request.turnId])
-  if (events.rows.length > MAX_INPUT_EVIDENCE || inputs.rows.length !== events.rows.length) return UNSAFE
-  const bySequence = new Map<bigint, InputEvidence>(), inputIds = new Set<string>(), inputSequences = new Set<bigint>(), clientMessages = new Set<string>()
-  for (const row of inputs.rows) {
-    const input = parseInput(row, scope, request)
-    if (!input || inputIds.has(input.id) || inputSequences.has(input.sequence) || clientMessages.has(input.clientMessageId)) return UNSAFE
-    inputIds.add(input.id)
-    bySequence.set(input.sequence, input); inputSequences.add(input.sequence); clientMessages.add(input.clientMessageId)
-  }
-  const seenInputs = new Set<string>(), eventIds = new Set<string>(), eventSequences = new Set<bigint>()
-  for (const row of events.rows) {
-    const eventSequence = sequence(row.acceptedEventSequence), input = eventSequence === null ? undefined : bySequence.get(eventSequence)
-    const event = input ? parseEvent(row, input, request.sessionId, request.turnId) : null
-    if (!event || !input || seenInputs.has(event.inputId) || eventIds.has(event.id) || eventSequences.has(event.sequence)
-      || event.clientMessageId !== input.clientMessageId || event.delivery !== input.delivery || event.sequence !== input.sequence
-      || !equalJson(input.content, event.parts)) return UNSAFE
-    seenInputs.add(event.inputId); eventIds.add(event.id); eventSequences.add(event.sequence)
-  }
-  if (seenInputs.size !== inputIds.size) return UNSAFE
-  return [...bySequence.values()].some(input => input.delivery === "steer") ? { kind: "accepted_steer" } : { kind: "no_accepted_steer" }
+  const inputs = await readValidatedRootTaskAcceptedInputs(client, scope, request)
+  if (!inputs) return UNSAFE
+  return inputs.some(input => input.delivery === "steer") ? { kind: "accepted_steer" } : { kind: "no_accepted_steer" }
 }

@@ -19,7 +19,7 @@ import { evaluateTaskGraphPlanObjectiveCoverage } from "./task-graph-plan-object
 import { isScheduledDraftTemplate, scheduledDraftPair, scheduledDraftTaskContext, selectVerifiedScheduledDraftCandidate, type ScheduledDraftCandidateBinding } from "./scheduled-draft-candidate.js"
 import { sourceIntentForTaskGraphNode } from "./task-graph-source-intent-context.js"
 import { scheduledScoutPlanCapacityAllowed } from "./scheduled-taskgraph-plan-capacity.js"
-import { isRegisteredObjectiveScoutTemplate } from "./objective-task-graph-scout-authority.js"
+import { isRegisteredObjectiveTaskGraphChildTemplate } from "./objective-task-graph-child-authority.js"
 import type { PreparedSteeringReconciliation } from "./steering-reconciliation-contract.js"
 
 const EXTERNAL_ACTION = /(?:^|[._-])(submit|send|publish|delete|mutate|execute)(?:$|[._-])/i
@@ -60,7 +60,7 @@ function assertWriterReviewPlan(nodes: readonly TaskGraphNodeProposal[]): void {
 export async function createGraphTasks(
   client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent, current: TaskGraphState,
   priorTaskIds: ReadonlyMap<string, string>, provenance?: Pick<LoadedGraph, "sourceInputCheckpointByNodeKey" | "currentInputCheckpoint">,
-  operationalFailureReuse?: OperationalFailureCapacityReuse, objectiveTaskGraphScoutAuthority = false,
+  operationalFailureReuse?: OperationalFailureCapacityReuse, objectiveTaskGraphChildAuthority = false,
   preparedReconciliation?: PreparedSteeringReconciliation,
 ): Promise<CreatedGraphTasks> {
   if (input.verificationRequirements?.status === "invalid") {
@@ -192,7 +192,7 @@ export async function createGraphTasks(
     }, true, {
       preserveEmptyAllowedActions: isApplicationFillerTemplate(node.templateId, template.role, template.taskType),
       taskGraphChildDeadline: true,
-      ...(objectiveTaskGraphScoutAuthority && isRegisteredObjectiveScoutTemplate(node.templateId, template) ? { objectiveTaskGraphScoutAuthority: input.scope } : {}),
+      ...(objectiveTaskGraphChildAuthority && isRegisteredObjectiveTaskGraphChildTemplate(node.templateId, template) ? { objectiveTaskGraphChildAuthority: input.scope } : {}),
       ...(nestedScoutAuthority ? { nestedScoutAuthority } : {}),
     })
     if (status === "waiting") {

@@ -7,7 +7,7 @@ import { assertNoUnresolvedSteering } from "./steering-reconciliation-ledger.js"
 import type { SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
 import { filterNestedScoutProtectedActions, hasNestedScoutPrivateContext, hasNestedScoutProtectedActions,
   isNestedScoutCreationAuthorityValid, type NestedScoutCreationAuthority } from "./nested-scout-creation-authority.js"
-import { admitOwnedObjectiveScout } from "./objective-task-graph-scout-authority.js"
+import { admitOwnedObjectiveTaskGraphChild } from "./objective-task-graph-child-authority.js"
 import type { GraphScope } from "./task-graph-pg-state.js"
 
 export async function readSubagentTask(client: Queryable, taskId: string, sessionId: string): Promise<SubagentTaskRecord> {
@@ -52,7 +52,7 @@ export async function createSubagentTask(
   input: SubagentTaskSpec & { policy: SubagentPolicy },
   sessionLocked = false,
   options: { preserveEmptyAllowedActions?: boolean; taskGraphChildDeadline?: boolean; nestedScoutAuthority?: NestedScoutCreationAuthority;
-    objectiveTaskGraphScoutAuthority?: GraphScope } = {},
+    objectiveTaskGraphChildAuthority?: GraphScope } = {},
 ): Promise<SubagentTaskRecord> {
   if (options.nestedScoutAuthority !== undefined && options.nestedScoutAuthority !== "parent_template" && options.nestedScoutAuthority !== "child_execution") {
     throw new Error("nested_scout_creation_authority_invalid")
@@ -108,9 +108,9 @@ export async function createSubagentTask(
   const parentActions = parentRow ? actionList(parentRow.allowedActions) : []
   const requestedActions = actionList(input.allowedActions)
   const exceedsParent = Boolean(parentRow && requestedActions.some(action => !parentActions.includes(action)))
-  const objectiveScoutAuthority = exceedsParent
-    && await admitOwnedObjectiveScout(client, input, options.objectiveTaskGraphScoutAuthority)
-  if (exceedsParent && !objectiveScoutAuthority) {
+  const objectiveChildAuthority = exceedsParent
+    && await admitOwnedObjectiveTaskGraphChild(client, input, options.objectiveTaskGraphChildAuthority)
+  if (exceedsParent && !objectiveChildAuthority) {
     throw new Error("Child allowed actions exceed parent policy")
   }
   const allowedActions = parentRow && requestedActions.length === 0 && !options.preserveEmptyAllowedActions
