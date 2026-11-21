@@ -73,6 +73,37 @@ describe("grounded TaskGraph final response", () => {
     expect(new TextEncoder().encode(response).byteLength).toBeLessThanOrEqual(4_096)
   })
 
+  it("labels only gate-bound repaired failures while preserving counts and legacy output", () => {
+    const summary = structuredSummary(), current = currentBinding(summary)
+    const baseline = buildGroundedTaskGraphFinalResponse(current)
+    const resolved = buildGroundedTaskGraphFinalResponse({ ...current, resolvedRepairTaskIds: ["private-analyst-task"] })
+    const legacy = binding(summary), legacyWithMetadata = { ...legacy, resolvedRepairTaskIds: ["private-analyst-task"] }
+    const stale = { ...current, resolvedRepairTaskIds: ["private-analyst-task"], members: current.members?.map(member =>
+      member.taskId === "private-analyst-task" ? { ...member, taskStatus: "completed" as const } : member) }
+    const staleResponse = buildGroundedTaskGraphFinalResponse(stale)
+
+    expect(resolved).toContain("Analysis: 1 failed task; structured result missing. Verified repair evidence covers the affected criteria.")
+    expect(resolved).toContain("Search results: 1 unique job reported (partial coverage).")
+    expect(resolved).toContain("Preparation outcomes: 3 job outcome records reported (partial coverage).")
+    expect(resolved).not.toContain("private-analyst-task")
+    expect(resolved).toContain("Inspect the reported Analysis task outcome.")
+    expect(baseline).toContain("Analysis: 1 failed task; structured result missing.")
+    expect(baseline).not.toContain("Verified repair evidence covers the affected criteria.")
+    expect(buildGroundedTaskGraphFinalResponse(legacyWithMetadata)).toBe(buildGroundedTaskGraphFinalResponse(legacy))
+    expect(staleResponse).not.toContain("Verified repair evidence covers the affected criteria.")
+    expect(staleResponse).toContain("Analysis: 1 failed task; structured result missing.")
+
+    const validFailure = reduceTaskGraphFinalSummary({ graphRevision: 10, nodes: [node("failed-analysis", "analyst", "failed", {
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+      findings: [{ jobId: "private-analysis-job", score: 7, evidenceIds: ["private-analysis-evidence"] }],
+      evidence: [{ id: "private-analysis-evidence", kind: "job", ref: "private-analysis-job", source: "private-source" }], summary: "PRIVATE_MODEL_PROSE",
+    })] })
+    const currentFailure = currentBinding(validFailure)
+    expect(buildGroundedTaskGraphFinalResponse(currentFailure)).toContain("Inspect the reported Analysis task outcome.")
+    expect(buildGroundedTaskGraphFinalResponse({ ...currentFailure, resolvedRepairTaskIds: ["failed-analysis"] }))
+      .not.toContain("Inspect the reported Analysis task outcome.")
+  })
+
   it("keeps not-requested, observed zero, and unavailable distinct", () => {
     const empty = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [] })
     const zero = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [node("empty-scout", "scout", "completed", {

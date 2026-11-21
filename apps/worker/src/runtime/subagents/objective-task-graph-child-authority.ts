@@ -10,10 +10,11 @@ import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT } from "./task-graph-dependency-context.js"
 import type { Queryable } from "./pg-store-persistence.js"
 
-const REGISTERED_OBJECTIVE_SCOUTS = [
-  TASK_GRAPH_TEMPLATES.scout,
-  templatesForInteractiveScoutDelegation(TASK_GRAPH_TEMPLATES, TASK_GRAPH_TEMPLATES)?.scout,
-].filter((template): template is TaskGraphTaskTemplate => Boolean(template))
+const REGISTERED_OBJECTIVE_CHILDREN = {
+  scout: [TASK_GRAPH_TEMPLATES.scout, templatesForInteractiveScoutDelegation(TASK_GRAPH_TEMPLATES, TASK_GRAPH_TEMPLATES)?.scout]
+    .filter((template): template is TaskGraphTaskTemplate => Boolean(template)),
+  analyst: [TASK_GRAPH_TEMPLATES.analyst],
+} satisfies Record<"scout" | "analyst", readonly TaskGraphTaskTemplate[]>
 
 function templateProjection(value: unknown): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
@@ -51,9 +52,9 @@ function validDependencyContext(value: unknown): boolean {
   catch { return false }
 }
 
-function registeredScoutSpec(candidate: Record<string, unknown>): boolean {
+function registeredObjectiveChildSpec(candidate: Record<string, unknown>): boolean {
   try {
-    return REGISTERED_OBJECTIVE_SCOUTS.some(template => {
+    return Object.values(REGISTERED_OBJECTIVE_CHILDREN).flat().some(template => {
       const expected = templateProjection(template) as Record<string, unknown> | null
       const context = plainRecord(candidate.context)
       if (!expected || !context) return false
@@ -83,9 +84,11 @@ function exactTemplate(value: unknown, registered: TaskGraphTaskTemplate): boole
   } catch { return false }
 }
 
-/** Matches the only registered Scout templates that ObjectiveStart may create directly. */
-export function isRegisteredObjectiveScoutTemplate(templateId: string, template: TaskGraphTaskTemplate): boolean {
-  return templateId === "scout" && REGISTERED_OBJECTIVE_SCOUTS.some(registered => exactTemplate(template, registered))
+/** Matches only registered read-only Scout and Analyst templates for ObjectiveStart. */
+export function isRegisteredObjectiveTaskGraphChildTemplate(templateId: string, template: TaskGraphTaskTemplate): boolean {
+  const registered = Object.hasOwn(REGISTERED_OBJECTIVE_CHILDREN, templateId)
+    ? REGISTERED_OBJECTIVE_CHILDREN[templateId as keyof typeof REGISTERED_OBJECTIVE_CHILDREN] : []
+  return registered.some(candidate => exactTemplate(template, candidate))
 }
 
 function exactObjectiveIntent(value: unknown): boolean {
@@ -112,7 +115,7 @@ function matchingScope(scope: GraphScope, input: SubagentTaskSpec): boolean {
 }
 
 /** Reuses Session/Turn/Root/Step locks already held by the TaskGraph schedule transaction. */
-export async function admitOwnedObjectiveScout(
+export async function admitOwnedObjectiveTaskGraphChild(
   client: Queryable, input: SubagentTaskSpec, authority: GraphScope | undefined,
 ): Promise<boolean> {
   if (!authority || !matchingScope(authority, input)) return false
@@ -122,7 +125,7 @@ export async function admitOwnedObjectiveScout(
       constraints: input.constraints, context: input.context, expectedOutputSchema: input.expectedOutputSchema })
   } catch { return false }
   if (!candidate) return false
-  if (!registeredScoutSpec(candidate as Record<string, unknown>)) return false
+  if (!registeredObjectiveChildSpec(candidate as Record<string, unknown>)) return false
   const result = await client.query(`WITH live AS MATERIALIZED (SELECT clock_timestamp() AS "at")
     SELECT turn."input", turn."executionMode" FROM live
     JOIN "agent_sessions" AS session ON session."id" = $1 AND session."userId" = $2
