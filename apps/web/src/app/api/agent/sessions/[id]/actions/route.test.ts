@@ -771,7 +771,8 @@ describe("agent session actions API", () => {
 
   it("persists an explicit reviewed-source selector through the approval decision transaction", async () => {
     mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
-      type: "review_application", payload: { applicationTaskId: "task_1", jobId: "job_1" },
+      id: "reviewed-application-review:turn_1", type: "review_application", toolCallId: "review_application:turn_1",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
     }))
     mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
     mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("approved"))
@@ -783,9 +784,56 @@ describe("agent session actions API", () => {
 
     expect(res.status).toBe(202)
     expect(mocks.resolveLegacyApproval).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      decision: "approved", reviewedSourceTurnId: "source_turn_1",
+      decision: "approved", receiptNonce: "nonce_1", reviewedSourceTurnId: "source_turn_1",
     }), expect.anything())
     expect(mocks.queueApplicationFill).not.toHaveBeenCalled()
+  })
+
+  it("forwards the supplied nonce for a marked reviewed approval when no source selector is present", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      id: "reviewed-application-review:turn_1", type: "review_application", toolCallId: "review_application:turn_1",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("approved"))
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "reviewed-application-review:turn_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    const resolutionInput = mocks.resolveLegacyApproval.mock.calls[0]?.[1]
+    expect(resolutionInput).toEqual(expect.objectContaining({ decision: "approved", receiptNonce: "nonce_1" }))
+    expect(resolutionInput).not.toHaveProperty("reviewedSourceTurnId")
+  })
+
+  it("keeps marked reviewed rejection canonical and sends no nonce", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      id: "reviewed-application-review:turn_1", type: "review_application", toolCallId: "review_application:turn_1",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("rejected"))
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "reviewed-application-review:turn_1", decision: "rejected",
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    const resolutionInput = mocks.resolveLegacyApproval.mock.calls[0]?.[1]
+    expect(resolutionInput).toEqual(expect.objectContaining({ decision: "rejected" }))
+    expect(resolutionInput).not.toHaveProperty("receiptNonce")
+  })
+
+  it("does not pass the new nonce field for ordinary approval types", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({ type: "send_gmail" }))
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("approved"))
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    const resolutionInput = mocks.resolveLegacyApproval.mock.calls[0]?.[1]
+    expect(resolutionInput).not.toHaveProperty("receiptNonce")
   })
 
   it("does not queue a reviewed selector through a legacy-only approval path", async () => {
