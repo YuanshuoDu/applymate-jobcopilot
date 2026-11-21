@@ -967,7 +967,7 @@ async function createReviewedSourceScenario(label: "positive" | "stale", descrip
 async function startSelectedJobSource(input: { sessionId: string; jobId: string; token: string; key: string }) {
   const { POST } = await import("@/app/api/agent/sessions/[id]/messages/route")
   const response = await POST(apiRequest(`/api/agent/sessions/${input.sessionId}/messages`, input.token, "POST", {
-    clientMessageId: input.key, delivery: "follow_up", expectedTurnId: null, expectedRevision: 0,
+    clientMessageId: input.key, delivery: "follow_up",
     content: [{ type: "text", text: reviewedSourceGoal }], selectedJobPreparation: { jobId: input.jobId },
   }), { params: Promise.resolve({ id: input.sessionId }) })
   expect(response.status).toBe(202)
