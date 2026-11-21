@@ -137,7 +137,7 @@ describe('AgentComposerActiveTurn', () => {
         useReducer: (_reducer: unknown, initialState: unknown) => {
           if (initialState !== null && typeof initialState === 'object' && 'clientMessageId' in initialState) return [replacement, dispatch]
           return [{ open: false, target: null, draft: '', reviewedLocations: null, request: null,
-            pending: false, error: null, received: false }, dispatch]
+            pending: false, error: null }, dispatch]
         },
         useRef: () => pendingRef,
       }
