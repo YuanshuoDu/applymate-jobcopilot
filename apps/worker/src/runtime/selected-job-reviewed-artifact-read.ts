@@ -103,9 +103,11 @@ async function readCompletedSourceTurn(client: Queryable, input: Readonly<{ user
 
 function selectedJobInput(value: unknown, jobId: string): boolean {
   const input = record(value), intent = record(input?.intent), selected = record(input?.selectedJobPreparation)
-  return Boolean(input && intent && selected && exactKeys(intent, "kind,version")
-    && intent.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind && intent.version === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version
-    && exactKeys(selected, "jobId") && selected.jobId === jobId)
+  if (!input || !selected || !exactKeys(selected, "jobId") || selected.jobId !== jobId) return false
+  if (Object.hasOwn(input, "intent")) return Boolean(intent && exactKeys(intent, "kind,version")
+    && intent.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind && intent.version === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version)
+  return exactKeys(input, "clientMessageId,content,goal,selectedJobPreparation")
+    && text(input.clientMessageId, 256) && typeof input.goal === "string" && Array.isArray(input.content)
 }
 
 function latestPassedLineage(snapshot: readonly { key: string; taskId: string; templateId: string; dependsOn: readonly string[] }[], graph: ReturnType<typeof currentTaskGraph>): {

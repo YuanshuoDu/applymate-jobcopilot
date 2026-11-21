@@ -80,10 +80,12 @@ function writerToolReceipt() {
     payload: { errorCode: null, status: "completed", taskId: writerTaskId, toolCallId: writerToolCallId, toolName: "cover_letter.draft" } }
   return { items, events: [event] }
 }
-function client(options: { turn?: Record<string, unknown> | null; artifact?: Record<string, unknown> | null; receipt?: ReturnType<typeof toolReceipt> } = {}) {
+function client(options: { turn?: Record<string, unknown> | null; turnInput?: unknown; artifact?: Record<string, unknown> | null; receipt?: ReturnType<typeof toolReceipt> } = {}) {
   const query = vi.fn(async (sql: string, _params?: readonly unknown[]) => {
     if (sql.includes('FROM "agent_turns" AS turn')) return { rows: options.turn === null ? [] : [options.turn ?? {
-      input: { intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, selectedJobPreparation: { jobId: scope.jobId } },
+      input: options.turnInput === undefined
+        ? { goal: "Prepare this selected job", content: [{ type: "text", text: "Prepare this job" }], clientMessageId: "message-1", selectedJobPreparation: { jobId: scope.jobId } }
+        : options.turnInput,
       rootTaskId: "root-1", turnStatus: "completed", turnSource: "user", executionMode: "canonical_task_graph",
       rootStatus: "completed", rootRole: "orchestrator", rootTaskType: "root", rootDepth: 0,
     }] }
@@ -126,6 +128,26 @@ describe("readSelectedJobReviewedArtifactWithClient", () => {
     const versionQuery = pg.query.mock.calls.find(([sql]) => sql.includes('FROM "agent_artifact_version"'))
     expect(versionQuery?.[0]).toContain('AND "taskId"=$8')
     expect(versionQuery?.[1]?.[7]).toBe(writerTaskId)
+  })
+
+  it("keeps accepting the exact historical Objective-shaped selected-job input", async () => {
+    const pg = client({ turnInput: {
+      goal: "Prepare this selected job", content: [{ type: "text", text: "Prepare this job" }], clientMessageId: "message-1",
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, selectedJobPreparation: { jobId: scope.jobId },
+    } })
+    await expect(readSelectedJobReviewedArtifactWithClient(pg as never, scope)).resolves.toMatchObject({ sourceTurnId: scope.sourceTurnId, jobId: scope.jobId })
+  })
+
+  it.each([
+    ["a different intent", { goal: "Prepare", content: [], clientMessageId: "message-1", intent: { kind: "interactive_discovery_shortlist", version: 1 }, selectedJobPreparation: { jobId: scope.jobId } }],
+    ["a malformed Objective intent", { goal: "Prepare", content: [], clientMessageId: "message-1", intent: { kind: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind, version: 2 }, selectedJobPreparation: { jobId: scope.jobId } }],
+    ["an absent-intent input with extra fields", { goal: "Prepare", content: [], clientMessageId: "message-1", extra: true, selectedJobPreparation: { jobId: scope.jobId } }],
+    ["a malformed selected-job marker", { goal: "Prepare", content: [], clientMessageId: "message-1", selectedJobPreparation: { jobId: scope.jobId, extra: true } }],
+    ["a historical unpinned Turn", { goal: "Prepare", content: [], clientMessageId: "message-1" }],
+  ])("rejects %s", async (_name, turnInput) => {
+    const pg = client({ turnInput })
+    await expect(readSelectedJobReviewedArtifactWithClient(pg as never, scope)).resolves.toBeNull()
+    expect(mocks.loadTaskGraph).not.toHaveBeenCalled()
   })
 
   it.each([
