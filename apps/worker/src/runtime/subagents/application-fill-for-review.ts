@@ -85,6 +85,7 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
       lease.signal.addEventListener("abort", closeOnAbort, { once: true })
       try {
         if (lease.signal.aborted) { closeOnAbort(); return cancelledOutcome() }
+        if (start.reviewedMaterial) page.setDefaultTimeout(30_000)
         const navigationResponse = await page.goto(task.applyUrl, { waitUntil: "domcontentloaded", timeout: 30_000 })
         observeAcquisitionPhase("navigation_returned")
         observeAcquisitionPhase(navigationResponse?.ok() ? "navigation_response_success" : "navigation_response_unavailable")

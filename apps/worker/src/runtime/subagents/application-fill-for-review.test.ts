@@ -33,6 +33,7 @@ vi.mock("../selected-job-reviewed-artifact-read.js", () => ({ readSelectedJobRev
 const browserPageMock = {
   goto: vi.fn(async (): Promise<Awaited<ReturnType<Page["goto"]>>> => null),
   close: vi.fn(async () => undefined),
+  setDefaultTimeout: vi.fn(),
   url: vi.fn(() => "https://boards.greenhouse.io/acme/jobs/123"),
   locator: vi.fn(),
 }
@@ -133,6 +134,25 @@ beforeEach(() => { vi.resetAllMocks(); setMocks(); vi.mocked(readSelectedJobRevi
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers() })
 
 describe("executeApplicationFillForReview", () => {
+  it("sets a finite page-action timeout only after claiming reviewed material", async () => {
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    vi.mocked(detectBrowserWait).mockImplementation(async () => {
+      expect(browserPageMock.setDefaultTimeout).toHaveBeenCalledWith(30_000)
+      return null
+    })
+
+    await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(browserPageMock.setDefaultTimeout).toHaveBeenCalledOnce()
+    expect(detectBrowserWait).toHaveBeenCalledOnce()
+    browserPageMock.setDefaultTimeout.mockClear()
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(null)
+    vi.mocked(detectBrowserWait).mockResolvedValue(null)
+    await executeApplicationFillForReview({ pool: poolFor(context()).pool, lease: lease() })
+    expect(browserPageMock.setDefaultTimeout).not.toHaveBeenCalled()
+  })
+
   it.each([["role", { role: "analyst" }], ["task type", { taskType: "application_fill" }]])("rejects an unexpected exact %s before querying task context", async (_name, leaseOverride) => {
     const { pool, connects } = poolFor(context())
     const result = await executeApplicationFillForReview({ pool, lease: lease(leaseOverride as Partial<SubagentLease>) })
