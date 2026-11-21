@@ -163,16 +163,17 @@ export async function resolveLegacyApproval(
   options: { beforeResolve?: () => Promise<void>; beforeLegacyOnlyResolve?: () => Promise<void> } = {},
 ): Promise<LegacyApprovalResolution> {
   const approval = input.approval
-  if (!approval.turnId || !approval.toolCallId || !approval.jobId || !approval.expiresAt) {
+  const turnId = approval.turnId
+  if (!turnId || !approval.toolCallId || !approval.jobId || !approval.expiresAt) {
     throw new Error("Approval is missing its scoped wait state")
   }
   await options.beforeResolve?.()
   const item = db.agentItem ? await db.agentItem.findFirst({
-    where: { id: waitItemId("approval", approval.id), sessionId: input.sessionId, turnId: approval.turnId },
+    where: { id: waitItemId("approval", approval.id), sessionId: input.sessionId, turnId },
     select: { id: true, revision: true },
   }) : null
   const loadTurn = () => db.agentTurn.findFirst({
-    where: { id: approval.turnId, sessionId: input.sessionId, userId: input.userId },
+    where: { id: turnId, sessionId: input.sessionId, userId: input.userId },
     select: { id: true, revision: true, input: true },
   })
   let turn = approval.type === "review_application" || item ? await loadTurn() : null
@@ -196,7 +197,7 @@ export async function resolveLegacyApproval(
     sessionId: input.sessionId,
     userId: input.userId,
     clientMessageId: `legacy-approval:${approval.id}:${input.decision}`,
-    expectedTurnId: approval.turnId,
+    expectedTurnId: turnId,
     expectedRevision: turn.revision,
     decision: input.decision,
     ...(input.reviewedSourceTurnId !== undefined ? { reviewedSourceTurnId: input.reviewedSourceTurnId } : {}),
@@ -246,5 +247,4 @@ function clientPayload(payload: unknown): unknown {
   delete safe.scheduledGateReview
   return safe
 }
-
 export { reissueApprovalNonce }

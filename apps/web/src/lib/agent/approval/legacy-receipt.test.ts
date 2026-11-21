@@ -99,6 +99,16 @@ describe("resolveLegacyApproval same-Turn fence", () => {
     expect(mocks.resolvePendingApprovalInTransaction).not.toHaveBeenCalled()
   }, 10_000)
 
+  it("rejects a receipt without an owner Turn before loading its Wait", async () => {
+    const approval = { ...approvalRecord(), turnId: null }
+    const { resolveLegacyApproval } = await import("./legacy-receipt")
+
+    await expect(resolveLegacyApproval(fakeDb(), { approval, userId: "user_1", sessionId: "session_1", decision: "approved" }))
+      .rejects.toThrow("Approval is missing its scoped wait state")
+    expect(mocks.rootItemFindFirst).not.toHaveBeenCalled()
+    expect(mocks.rootTurnFindFirst).not.toHaveBeenCalled()
+  })
+
   it("forwards the existing nonce and agreeing source only for a marked reviewed approval", async () => {
     const approval = approvalRecord({ id: "reviewed-application-review:turn_1", type: "review_application", toolCallId: "review_application:turn_1" })
     mocks.rootItemFindFirst.mockResolvedValue({ id: "agent-wait:approval:reviewed-application-review:turn_1", revision: 2 })
