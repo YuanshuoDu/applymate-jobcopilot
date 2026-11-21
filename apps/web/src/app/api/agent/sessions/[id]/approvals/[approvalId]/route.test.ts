@@ -17,6 +17,8 @@ vi.mock("@/lib/agent/broker/store", () => ({ decideApproval: mocks.decideApprova
 vi.mock("@/lib/agent/approval/legacy-receipt", () => ({ reissueApprovalNonce: mocks.reissueApprovalNonce }))
 
 const context = { params: Promise.resolve({ id: "session_1", approvalId: "approval_1" }) }
+const reviewedContext = { params: Promise.resolve({ id: "session_1", approvalId: "reviewed-application-review:turn_1" }) }
+const receiptNonce = "b".repeat(64)
 
 function request(body: unknown, headers: Record<string, string> = {}) {
   return new Request("http://localhost/api/agent/sessions/session_1/approvals/approval_1", {
@@ -41,6 +43,7 @@ describe("approval decision command API", () => {
     const response = await GET(request({}) as never, context)
 
     expect(response.status).toBe(200)
+    expect(response.headers.get("cache-control")).toBe("private, no-store, max-age=0")
     await expect(response.json()).resolves.toEqual(expect.objectContaining({ approvalId: "approval_1", receiptNonce: "nonce_1" }))
     expect(mocks.reissueApprovalNonce).toHaveBeenCalledWith(expect.anything(), { approvalId: "approval_1", sessionId: "session_1", userId: "user_1" })
   })
@@ -51,6 +54,31 @@ describe("approval decision command API", () => {
 
     expect(response.status).toBe(202)
     expect(mocks.decideApproval).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ sessionId: "session_1", userId: "user_1", waitId: "approval_1", expectedRevision: 5, decision: "approved" }))
+  })
+
+  it("passes a bounded nonce to the broker only for its stable reviewed Turn id", async () => {
+    const { POST } = await import("./route")
+    const response = await POST(request({ clientMessageId: "reviewed_decision", expectedTurnId: "turn_1", expectedRevision: 5,
+      decision: "approved", receiptNonce }) as never, reviewedContext)
+
+    expect(response.status).toBe(202)
+    expect(mocks.decideApproval).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      sessionId: "session_1", userId: "user_1", waitId: "reviewed-application-review:turn_1", expectedRevision: 5,
+      decision: "approved", receiptNonce,
+    }))
+  })
+
+  it.each([
+    ["malformed nonce", { receiptNonce: "not-a-nonce" }, reviewedContext],
+    ["nonce on rejection", { receiptNonce, decision: "rejected" }, reviewedContext],
+    ["nonce for another approval id", { receiptNonce }, context],
+  ])("rejects %s before the broker", async (_name, extra, routeContext) => {
+    const { POST } = await import("./route")
+    const response = await POST(request({ clientMessageId: "invalid_receipt", expectedTurnId: "turn_1", expectedRevision: 5,
+      decision: "approved", ...extra }) as never, routeContext)
+
+    expect(response.status).toBe(422)
+    expect(mocks.decideApproval).not.toHaveBeenCalled()
   })
 
   it("rejects client-supplied ownership or payload fields before the broker", async () => {

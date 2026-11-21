@@ -3,6 +3,7 @@ import { db } from "@/lib/db"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { applicationFillTaskGraphEnabled, queueApplicationFill, queueAutonomousApplication } from "@/lib/auto-apply"
 import { resolveLegacyApproval } from "@/lib/agent/approval/legacy-receipt"
+import { acceptedFillTurnMatchesReviewedSource, readAcceptedReviewedFillSource } from "@/lib/agent/approval/reviewed-fill-source-binding"
 import { updateAgentSession } from "@/lib/agent/session/repository"
 import { resumeLegacyApprovalTurnInTransaction } from "@/lib/agent/approval/legacy-approval-fence"
 import { isFeatureAllowed, resolveAiAccess } from "@/lib/entitlements"
@@ -23,7 +24,6 @@ interface RouteCtx {
 export async function POST(req: NextRequest, ctx: RouteCtx) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
-
   const { id } = await ctx.params
   const session = await db.agentSession.findFirst({ where: { id, userId: auth.userId }, select: { id: true } })
   if (!session) return err("Session not found", 404)
@@ -53,35 +53,50 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       }
       if (action.decision === "approved" && applicationFillTaskGraphEnabled()) {
         const prior = await db.agentApproval.findFirst({
-          where: { id: action.approvalId, sessionId: id, userId: auth.userId, status: "approved", type: "review_application" },
-          select: { payload: true },
+          where: { id: action.approvalId, sessionId: id, userId: auth.userId, status: { in: ["approved", "consumed"] }, type: "review_application" },
+          select: { id: true, status: true, payload: true },
         })
         const payload = applicationPayload(prior?.payload)
-        if (payload) {
-          const task = await db.applicationTask.findFirst({
-            where: { id: payload.applicationTaskId, userId: auth.userId, sessionId: id, jobId: payload.jobId },
-            select: { fillTurnId: true },
-          })
-          if (task?.fillTurnId) return ok({ turnId: task.fillTurnId, taskId: task.fillTurnId, duplicate: true })
-          const job = await db.job.findFirst({ where: { id: payload.jobId, userId: auth.userId }, select: { url: true } })
-          if (job) {
-            try {
+        if (payload && prior) {
+          try {
+            const binding = await readAcceptedReviewedFillSource(db, {
+              approvalId: prior.id, userId: auth.userId, sessionId: id,
+              applicationTaskId: payload.applicationTaskId, jobId: payload.jobId,
+              ...(action.reviewedSourceTurnId ? { requestedSourceTurnId: action.reviewedSourceTurnId } : {}),
+            })
+            const task = await db.applicationTask.findFirst({
+              where: { id: payload.applicationTaskId, userId: auth.userId, sessionId: id, jobId: payload.jobId },
+              select: { fillTurnId: true },
+            })
+            if (prior.status === "consumed" && (!binding || !task?.fillTurnId)) {
+              throw new Error("Consumed application approval has no matching reviewed fill to acknowledge")
+            }
+            if (task?.fillTurnId) {
+              if (binding && !await acceptedFillTurnMatchesReviewedSource(db, {
+                turnId: task.fillTurnId, userId: auth.userId, sessionId: id, sourceTurnId: binding.sourceTurnId,
+              })) throw new Error("Reviewed material binding does not match the queued fill")
+              return ok({ turnId: task.fillTurnId, taskId: task.fillTurnId, duplicate: true })
+            }
+            const job = await db.job.findFirst({ where: { id: payload.jobId, userId: auth.userId }, select: { url: true } })
+            if (job) {
               const queued = await queueApplicationFill({
                 userId: auth.userId, jobId: payload.jobId, applyUrl: job.url,
                 applicationTaskId: payload.applicationTaskId, sessionId: id,
+                ...(binding ? { reviewedSourceTurnId: binding.sourceTurnId, reviewedSourceApprovalId: prior.id } : {}),
               })
               return ok({ ...queued, duplicate: true })
-            } catch (error) {
-              return err(error instanceof Error ? error.message : "Could not resume the form-fill review pass", 409)
             }
+          } catch (error) {
+            return err(error instanceof Error ? error.message : "Could not resume the form-fill review pass", 409)
           }
         }
       }
       return err("Approval is no longer pending", 409)
     }
-
     const policyError = approvalActionPolicyError(approval, action.decision, Boolean(action.receiptNonce), auth.userId, id)
     if (policyError) return policyError
+    if (action.reviewedSourceTurnId && approval.type !== "review_application") return err("Reviewed material selection applies only to application review", 400)
+    if (action.reviewedSourceTurnId && !applicationFillTaskGraphEnabled()) return err("Reviewed material fill is unavailable while TaskGraph fill is disabled", 409)
     if (action.decision === "approved" && !action.receiptNonce) return err("A scoped receipt is required to approve this action", 428)
     if (action.decision === "approved" && approval.type === "tailor_resume") {
       if (!(await isFeatureAllowed(auth.userId, "tailored_resume"))) return err("This feature is not included in your current plan", 403)
@@ -95,6 +110,9 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         userId: auth.userId,
         sessionId: id,
         decision: action.decision === "approved" ? "approved" : "rejected",
+        ...(approval.type === "review_application" && action.reviewedSourceTurnId
+          ? { reviewedSourceTurnId: action.reviewedSourceTurnId } : {}),
+        ...(approval.type === "review_application" && action.decision === "approved" && action.receiptNonce ? { receiptNonce: action.receiptNonce } : {}),
       }, {
         beforeResolve: action.decision === "approved"
           ? () => validateReceiptForApproval(approval!, action.receiptNonce!, auth.userId, id)
@@ -158,7 +176,6 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     const response = await handleReviewApplicationApproval(id, auth.userId, action, approval)
     if (response) return response
   }
-
   if (action.decision === "approved" && approval?.type === "submit_application") {
     const payload = applicationPayload(approval.payload)
     if (!payload) return err("Submission authorization is missing its task.", 400)
@@ -173,12 +190,11 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not queue the approved application."
       await db.applicationTask.updateMany({
-        where: { id: payload.applicationTaskId, userId: auth.userId, status: "waiting_for_authorization" },
+        where: { id: payload.applicationTaskId, userId: auth.userId, jobId: payload.jobId, sessionId: id, fillTurnId: approval.turnId, status: "waiting_for_authorization", checkpoint: "form_filled" },
         data: { status: "waiting_for_authorization", checkpoint: "queue_retry", error: message },
       })
       return err(message, 409)
     }
-
     let projectedEvent: ReturnType<typeof serializeEvent> | null = null
     try {
       const event = await db.agentTranscriptEvent.create({
@@ -195,7 +211,6 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       return ok({ event: projectedEvent, queued: true, taskId: queued.taskId, projectionPending: true })
     }
   }
-
   if (approval?.type === "submit_application") {
     const payload = applicationPayload(approval.payload)
     if (payload) {
@@ -223,7 +238,6 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       }
     }
   }
-
   const event = await db.agentTranscriptEvent.create({
     data: {
       sessionId: id, taskId: null, type: "approval_response", speaker: "You",

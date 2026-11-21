@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto"
 import type { Pool, PoolClient } from "pg"
+import { parseReviewedApplicationFillSource, type ReviewedApplicationFillSourceSelection } from "@jobcopilot/shared"
 import { appendFencedSubmitAudit, lockApplicationSubmitFence, type ApplicationSubmitIdentity } from "../queue/application-submit-fence.js"
+import { acquireSourceMaterialFence } from "./source-material-fence.js"
 
 export type SubmissionAttemptState = "reserved" | "submitted" | "failed"
 export type ApplicationTarget = { readonly id: string; readonly userId: string; readonly jobId: string; readonly company: string; readonly role: string; readonly applyUrl: string; readonly source: string | null }
@@ -8,9 +10,9 @@ export type SubmissionAttempt = {
   readonly id: string; readonly userId: string; readonly jobId: string; readonly receiptId: string; readonly constraintHash: string; readonly artifactHash: string
   readonly state: SubmissionAttemptState; readonly responseRef: string | null; readonly errorCode: string | null; readonly createdAt: Date; readonly updatedAt: Date
 }
-export type SubmissionAuthorization = { readonly kind: "authorized"; readonly artifactHash: string } | { readonly kind: "fenced" }
-export type SubmissionClaim = { readonly kind: "reserved" | "replay"; readonly attempt: SubmissionAttempt; readonly artifactHash: string } | { readonly kind: "fenced" }
-export type SubmissionClaimAuthorizer = (client: PoolClient, mode: "new" | "replay") => Promise<SubmissionAuthorization>
+export type SubmissionAuthorization = { readonly kind: "authorized"; readonly artifactHash: string; readonly reviewedCoverLetter?: string } | { readonly kind: "fenced" }
+export type SubmissionClaim = { readonly kind: "reserved" | "replay"; readonly attempt: SubmissionAttempt; readonly artifactHash: string; readonly reviewedCoverLetter?: string } | { readonly kind: "fenced" }
+export type SubmissionClaimAuthorizer = (client: PoolClient, mode: "new" | "replay", source: ReviewedApplicationFillSourceSelection) => Promise<SubmissionAuthorization>
 export type SubmissionAttemptWrite = { readonly kind: "updated"; readonly attempt: SubmissionAttempt } | { readonly kind: "fenced" }
 
 export class ApplicationSubmitRepositoryError extends Error {
@@ -59,6 +61,9 @@ async function withTransaction<T>(pool: Pool, userId: string, work: (client: Poo
 function matches(attempt: SubmissionAttempt, identity: ApplicationSubmitIdentity): boolean {
   return attempt.userId === identity.userId && attempt.jobId === identity.jobId && attempt.receiptId === identity.approvalId && attempt.constraintHash === identity.constraintHash
 }
+function sameSource(left: ReviewedApplicationFillSourceSelection, right: ReviewedApplicationFillSourceSelection): boolean {
+  return left.kind === right.kind && (left.kind !== "selected" || (right.kind === "selected" && left.sourceTurnId === right.sourceTurnId))
+}
 
 export function createApplicationSubmitRepository(pool: Pool) {
   return {
@@ -69,15 +74,27 @@ export function createApplicationSubmitRepository(pool: Pool) {
     async reserveAndConsume(identity: ApplicationSubmitIdentity, authorize: SubmissionClaimAuthorizer): Promise<SubmissionClaim> {
       try {
         return await withTransaction(pool, identity.userId, async client => {
+          const hintRows = await client.query<{ input: unknown }>(
+            'SELECT "input" FROM "agent_turns" WHERE "id"=$1 AND "sessionId"=$2 AND "userId"=$3',
+            [identity.fillTurnId, identity.sessionId, identity.userId],
+          )
+          const hinted = hintRows.rows.length === 1 ? parseReviewedApplicationFillSource(hintRows.rows[0]!.input) : { kind: "invalid" as const }
+          if (hinted.kind !== "absent") await acquireSourceMaterialFence(client, [identity.userId])
           if (await lockApplicationSubmitFence(client, identity) === "superseded") {
             await appendFencedSubmitAudit(client, identity, "claim")
             return { kind: "fenced" }
           }
+          const turnRows = await client.query<{ input: unknown }>(
+            'SELECT "input" FROM "agent_turns" WHERE "id"=$1 AND "sessionId"=$2 AND "userId"=$3',
+            [identity.fillTurnId, identity.sessionId, identity.userId],
+          )
+          const source = turnRows.rows.length === 1 ? parseReviewedApplicationFillSource(turnRows.rows[0]!.input) : { kind: "invalid" as const }
+          if (!sameSource(hinted, source) || source.kind === "invalid") return { kind: "fenced" }
           const existingRow = await client.query<Record<string, unknown>>(`SELECT ${attemptColumns} FROM "submission_attempt" WHERE "receiptId" = $1 FOR UPDATE`, [identity.approvalId])
           const existing = existingRow.rows[0] ? asAttempt(existingRow.rows[0]) : null
           if (existing) {
             if (!matches(existing, identity)) throw new ApplicationSubmitRepositoryError("idempotency_conflict", "This approval is already bound to a different submission attempt.")
-            const authorization = await authorize(client, "replay")
+            const authorization = await authorize(client, "replay", source)
             if (authorization.kind === "fenced") {
               await appendFencedSubmitAudit(client, identity, "replay")
               return { kind: "fenced" }
@@ -85,7 +102,7 @@ export function createApplicationSubmitRepository(pool: Pool) {
             if (authorization.artifactHash !== existing.artifactHash) throw new ApplicationSubmitRepositoryError("idempotency_conflict", "This approval no longer matches its original artifact.")
             return { kind: "replay", attempt: existing, artifactHash: existing.artifactHash }
           }
-          const authorization = await authorize(client, "new")
+          const authorization = await authorize(client, "new", source)
           if (authorization.kind === "fenced") {
             await appendFencedSubmitAudit(client, identity, "claim")
             return { kind: "fenced" }
@@ -95,7 +112,8 @@ export function createApplicationSubmitRepository(pool: Pool) {
             `INSERT INTO "submission_attempt" (${attemptColumns}) VALUES ($1, $2, $3, $4, $5, $6, 'reserved', NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING ${attemptColumns}`,
             [randomUUID(), identity.userId, identity.jobId, identity.approvalId, identity.constraintHash, authorization.artifactHash],
           )
-          return { kind: "reserved", attempt: asAttempt(result.rows[0] ?? {}), artifactHash: authorization.artifactHash }
+          return { kind: "reserved", attempt: asAttempt(result.rows[0] ?? {}), artifactHash: authorization.artifactHash,
+            ...(authorization.reviewedCoverLetter ? { reviewedCoverLetter: authorization.reviewedCoverLetter } : {}) }
         })
       } catch (error: unknown) {
         if (isUniqueViolation(error)) throw new ApplicationSubmitRepositoryError("idempotency_replay", "This approval already has a submission attempt.")

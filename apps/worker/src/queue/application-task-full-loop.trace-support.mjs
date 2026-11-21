@@ -48,6 +48,12 @@ export function traceApplicationFillExecutor(executor) {
 export function applicationFillStageTrace() {
   return event => {
     try {
+      const acquisitionPhases = ["before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned", "fill_returned"]
+      if (event?.stage === "browser_acquisition") {
+        if (!acquisitionPhases.includes(event.phase)) return
+        process.stdout.write("APPLICATION_FILL_PHASE_TRACE " + JSON.stringify({ phase: event.phase }) + "\n")
+        return
+      }
       const stages = ["entry_validation", "wait_persistence", "completion"]
       const outcomes = ["accepted", "rejected", "waiting", "completed", "stale", "conflict", "failed", "cancelled", "unavailable"]
       const staleGates = ["lease_input_invalid", "session_scope", "turn_row_unavailable", "turn_status_queued", "turn_status_interrupted", "turn_status_terminal", "turn_status_other", "child_lease_fence", "application_task_scope"]

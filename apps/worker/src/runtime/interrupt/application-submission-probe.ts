@@ -1,6 +1,7 @@
 import type { Pool, PoolClient } from "pg"
 import { markSubmissionRequestStarted, type ApplicationSubmissionStartScope } from "../../db/application-task-state.js"
-import { appendFencedSubmitAudit, withExactAttemptFence } from "../../queue/application-submit-fence.js"
+import { readSubmissionTurnState, withReviewedApplicationSubmitRequestFence } from "../../db/reviewed-application-submit-request-fence.js"
+import { appendFencedSubmitAudit } from "../../queue/application-submit-fence.js"
 
 export const APPLICATION_SUBMISSION_STOP_POLL_MS = 250
 
@@ -47,6 +48,8 @@ export async function acquireApplicationSubmissionStartFence(
   let boundaryClient: PoolClient | undefined
   let open = false
   let released = false
+  let markerCommitted = false
+  let markerSourceTurnId: string | null = null
   const releaseReservedMarkerClient = (): void => {
     const reserved = markerClient
     markerClient = undefined
@@ -64,11 +67,17 @@ export async function acquireApplicationSubmissionStartFence(
     await markerConnection.query("BEGIN")
     open = true
     await markerConnection.query("SELECT set_config($1, $2, true)", ["app.user_id", scope.userId])
-    const markerAttempt = await withExactAttemptFence(markerConnection, scope, async () => {
+    const markerAttempt = await withReviewedApplicationSubmitRequestFence(markerConnection, scope, "marker", undefined, async () => {
       const state = await readSubmissionTurnState(markerConnection, scope)
       if (isStopped(state.sessionStatus, state.turnStatus, state.interrupted)) return "stopped" as const
       return await markSubmissionRequestStarted(markerConnection, scope)
     })
+    if (markerAttempt.kind === "invalid") {
+      await markerConnection.query("ROLLBACK")
+      open = false
+      releaseReservedMarkerClient()
+      return declined("inactive", releasePermitOnce)
+    }
     if (markerAttempt.kind === "superseded") {
       await appendFencedSubmitAudit(markerConnection, scope, "submission_start_marker")
       await markerConnection.query("COMMIT")
@@ -82,8 +91,10 @@ export async function acquireApplicationSubmissionStartFence(
       releaseReservedMarkerClient()
       return declined(markerAttempt.value, releasePermitOnce)
     }
+    markerSourceTurnId = markerAttempt.sourceTurnId
     try {
       await markerConnection.query("COMMIT")
+      markerCommitted = true
     } catch {
       // The durable marker may or may not have committed. Never release the
       // browser request in this case; the queue will persist an uncertain
@@ -105,10 +116,17 @@ export async function acquireApplicationSubmissionStartFence(
     await boundary.query("BEGIN")
     open = true
     await boundary.query("SELECT set_config($1, $2, true)", ["app.user_id", scope.userId])
-    const boundaryAttempt = await withExactAttemptFence(boundary, scope, async () => {
+    const boundaryAttempt = await withReviewedApplicationSubmitRequestFence(boundary, scope, "boundary", markerSourceTurnId, async () => {
       const state = await readSubmissionTurnState(boundary, scope)
       return isStopped(state.sessionStatus, state.turnStatus, state.interrupted) ? "stopped" as const : "ready" as const
     })
+    if (boundaryAttempt.kind === "invalid") {
+      await boundary.query("ROLLBACK")
+      open = false
+      releaseBoundaryClient()
+      releasePermitOnce()
+      return { state: "uncertain", release: async () => undefined }
+    }
     if (boundaryAttempt.kind === "superseded") {
       await appendFencedSubmitAudit(boundary, scope, "submission_request_boundary")
       await boundary.query("COMMIT")
@@ -146,27 +164,9 @@ export async function acquireApplicationSubmissionStartFence(
     } finally {
       try { releaseReservedMarkerClient() } finally { releasePermitOnce() }
     }
+    if (markerCommitted) return { state: "uncertain", release: async () => undefined }
     throw error
   }
-}
-
-async function readSubmissionTurnState(client: PoolClient, scope: ApplicationSubmissionStartScope): Promise<{
-  readonly sessionStatus: string | undefined
-  readonly turnStatus: string | undefined
-  readonly interrupted: boolean | undefined
-}> {
-  const session = await client.query<{ status: string }>(
-    `SELECT "status" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2`, [scope.sessionId, scope.userId],
-  )
-  const turn = await client.query<{ status: string }>(
-    `SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
-    [scope.turnId, scope.sessionId, scope.userId],
-  )
-  const interrupted = await client.query<{ stopped: boolean }>(
-    `SELECT EXISTS (SELECT 1 FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.interrupted') AS "stopped"`,
-    [scope.sessionId, scope.turnId],
-  )
-  return { sessionStatus: session.rows[0]?.status, turnStatus: turn.rows[0]?.status, interrupted: interrupted.rows[0]?.stopped }
 }
 
 async function declined(state: "stopped" | "inactive", releasePermit: () => void): Promise<ApplicationSubmissionStartFence> {
@@ -180,11 +180,9 @@ export async function isApplicationSubmissionStopped(pool: Pool, scope: Applicat
   try {
     await client.query("BEGIN"); open = true
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", scope.userId])
-    const session = await client.query<{ status: string }>(`SELECT "status" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2`, [scope.sessionId, scope.userId])
-    const turn = await client.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [scope.turnId, scope.sessionId, scope.userId])
-    const interrupted = await client.query<{ stopped: boolean }>(`SELECT EXISTS (SELECT 1 FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.interrupted') AS "stopped"`, [scope.sessionId, scope.turnId])
+    const state = await readSubmissionTurnState(client, scope)
     await client.query("COMMIT"); open = false
-    return isStopped(session.rows[0]?.status, turn.rows[0]?.status, interrupted.rows[0]?.stopped)
+    return isStopped(state.sessionStatus, state.turnStatus, state.interrupted)
   } catch (error: unknown) {
     if (open) await client.query("ROLLBACK").catch(() => undefined)
     throw error

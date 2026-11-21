@@ -1,13 +1,25 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { TurnLease } from "./turns/lease.js"
+import { readSelectedJobReviewedArtifactWithClient, type SelectedJobReviewedArtifact } from "./selected-job-reviewed-artifact-read.js"
 import { loadApplicationFillPreparation } from "./application-fill-preparation.js"
 
-type BoundRow = { id: string; userId: string; sessionId: string; fillTurnSessionId: string; fillTurnUserId: string; status: string; checkpoint: string }
+vi.mock("./selected-job-reviewed-artifact-read.js", () => ({ readSelectedJobReviewedArtifactWithClient: vi.fn() }))
+
+type BoundRow = { id: string; userId: string; jobId: string; sessionId: string; fillTurnSessionId: string; fillTurnUserId: string; turnInput: unknown; status: string; checkpoint: string }
 const boundTask: BoundRow = {
-  id: "application-a", userId: "user-a", sessionId: "session-a", fillTurnSessionId: "session-a", fillTurnUserId: "user-a",
+  id: "application-a", userId: "user-a", jobId: "job-a", sessionId: "session-a", fillTurnSessionId: "session-a", fillTurnUserId: "user-a",
+  turnInput: {},
   status: "filling", checkpoint: "taskgraph_fill_queued",
 }
+const reviewedProof: SelectedJobReviewedArtifact = {
+  sourceTurnId: "source-turn-a", rootTaskId: "root-a", graphRevision: 4, jobId: "job-a", writerTaskId: "writer-a",
+  reviewerTaskId: "reviewer-a", reviewerToolCallId: "review-call-a", reviewHash: `sha256:${"a".repeat(64)}`,
+  artifactId: "artifact-a", version: 2, contentHash: `sha256:${"b".repeat(64)}`,
+  sourceDigest: `sha256:${"c".repeat(64)}`, content: "reviewed draft",
+}
+
+beforeEach(() => vi.mocked(readSelectedJobReviewedArtifactWithClient).mockReset().mockResolvedValue(null))
 
 function fixture(boundRows: BoundRow[] = [boundTask], materialRows: Array<{ id: string }> = [{ id: "application-a" }]) {
   const lease: TurnLease = {
@@ -39,6 +51,8 @@ describe("application-fill preparation", () => {
 
     const read = test.calls.find(call => call.sql.includes('FROM "agent_turns"'))
     expect(read?.sql).toContain('turn."userId" = $3')
+    expect(read?.sql).toContain('app."jobId"')
+    expect(read?.sql).toContain('turn."input" AS "turnInput"')
     expect(read?.sql).toContain('turn."leaseOwnerId" = $4 AND turn."leaseVersion" = $5')
     expect(read?.sql).toContain('turn."leaseExpiresAt" > $6 AND turn."status" = \'in_progress\'')
     expect(read?.sql).toContain('app."fillTurnId" = turn."id"')
@@ -52,6 +66,68 @@ describe("application-fill preparation", () => {
     expect(materials?.values).toEqual(["application-a", "user-a", "session-a", "turn-a"])
     expect(test.calls.map(call => call.sql)).toContain("COMMIT")
     expect(test.client.release).toHaveBeenCalledOnce()
+    expect(readSelectedJobReviewedArtifactWithClient).not.toHaveBeenCalled()
+  })
+
+  it("exposes the template for an exact terminal reviewed source bound to this fill Job", async () => {
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedProof)
+    const sourceTurnId = reviewedProof.sourceTurnId
+    const test = fixture([{
+      ...boundTask,
+      turnInput: { reviewedApplicationMaterialSource: {
+        schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId,
+      } },
+    }])
+
+    await expect(loadApplicationFillPreparation(test.pool, test.lease)).resolves.toEqual({ available: true })
+    expect(readSelectedJobReviewedArtifactWithClient).toHaveBeenCalledWith(test.client, {
+      userId: "user-a", sessionId: "session-a", jobId: "job-a", sourceTurnId,
+    })
+  })
+
+  it.each(["stale", "ambiguous"]) ("withholds the template when the terminal source reader reports %s evidence", async () => {
+    const test = fixture([{
+      ...boundTask,
+      turnInput: { reviewedApplicationMaterialSource: {
+        schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source-turn-a",
+      } },
+    }])
+
+    await expect(loadApplicationFillPreparation(test.pool, test.lease)).resolves.toBeUndefined()
+    expect(readSelectedJobReviewedArtifactWithClient).toHaveBeenCalledOnce()
+    expect(test.calls.some(call => call.sql.includes('FROM "application_tasks" AS app'))).toBe(false)
+  })
+
+  it("rejects a reader proof that resolves a different Job or source Turn", async () => {
+    for (const proof of [{ ...reviewedProof, jobId: "job-b" }, { ...reviewedProof, sourceTurnId: "source-turn-b" }]) {
+      vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(proof)
+      const test = fixture([{
+        ...boundTask,
+        turnInput: { reviewedApplicationMaterialSource: {
+          schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source-turn-a",
+        } },
+      }])
+
+      await expect(loadApplicationFillPreparation(test.pool, test.lease)).resolves.toBeUndefined()
+      expect(test.calls.some(call => call.sql.includes('FROM "application_tasks" AS app'))).toBe(false)
+    }
+  })
+
+  it("fails closed on a malformed selector instead of treating it as legacy", async () => {
+    const selectors: unknown[] = [null, {},
+      { schemaVersion: "wrong", sourceTurnId: "source-turn-a" },
+      { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source-turn-a", extra: true },
+      { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: " " },
+    ]
+    for (const selector of selectors) {
+      const test = fixture([{
+        ...boundTask, turnInput: { reviewedApplicationMaterialSource: selector },
+      }])
+
+      await expect(loadApplicationFillPreparation(test.pool, test.lease)).resolves.toBeUndefined()
+      expect(readSelectedJobReviewedArtifactWithClient).not.toHaveBeenCalled()
+      expect(test.calls.some(call => call.sql.includes('FROM "application_tasks" AS app'))).toBe(false)
+    }
   })
 
   it("withholds the capability when no exact bound ApplicationTask exists", async () => {

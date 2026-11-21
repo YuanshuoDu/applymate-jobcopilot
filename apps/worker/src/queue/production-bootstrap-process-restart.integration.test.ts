@@ -200,11 +200,14 @@ type CommandAcceptance = { accepted: CommandAcceptanceResult; duplicate: Command
 
 const fixturePath = fileURLToPath(new URL("./production-bootstrap-process-restart.fixture.mjs", import.meta.url))
 const workerCwd = fileURLToPath(new URL("../..", import.meta.url))
+const webTsconfigPath = fileURLToPath(new URL("../../../web/tsconfig.json", import.meta.url))
 
 function startWorker(mode: "accept-message" | "park-parent" | "resume-parent" | "duplicate-turn-redelivery" | "park-active-follow-up" | "accept-active-follow-up" | "resume-active-follow-up" | "replay-active-terminal" | "policy-replay-worker1" | "policy-replay-worker2" | "checkpoint-worker1" | "checkpoint-worker2" | "resolve-checkpoint", ids: FixtureIds): WorkerChild {
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, JSON.stringify(ids)], {
     cwd: workerCwd,
-    env: { ...process.env, DATABASE_URL: databaseUrl!, REDIS_URL: redisUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl! },
+    env: { ...process.env, DATABASE_URL: databaseUrl!, REDIS_URL: redisUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!,
+      ...(mode === "resolve-checkpoint" || (mode === "checkpoint-worker1" && ids.checkpointKind === "question")
+        ? { TSX_TSCONFIG_PATH: webTsconfigPath } : {}) },
     stdio: ["pipe", "pipe", "pipe"],
   }) as WorkerChild
   child.output = []

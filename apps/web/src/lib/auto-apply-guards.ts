@@ -15,7 +15,10 @@ export async function assertActiveAccount(userId: string): Promise<void> {
   if (user?.accountStatus !== "active") throw new AutoApplyError("Account is not active.");
 }
 
-export async function assertUnattendedApplyEnabled(userId: string): Promise<void> {
+export async function assertUnattendedApplyEnabled(
+  userId: string,
+  options: { preserveUnexpectedErrors?: boolean } = {},
+): Promise<void> {
   try {
     if (!await isFeatureAllowed(userId, "auto_apply")) throw new AutoApplyError("This feature is not included in your current plan.");
     const aiAccess = await resolveAiAccess(userId);
@@ -26,6 +29,7 @@ export async function assertUnattendedApplyEnabled(userId: string): Promise<void
     }
   } catch (error) {
     if (error instanceof AutoApplyError) throw error;
+    if (options.preserveUnexpectedErrors) throw error;
     throw new AutoApplyError("Unattended applications are temporarily unavailable.");
   }
 }

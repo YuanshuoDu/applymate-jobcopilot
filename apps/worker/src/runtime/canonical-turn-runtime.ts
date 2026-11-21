@@ -42,6 +42,7 @@ import { type ScheduledAutomationPipelineBridgeResult, type ScheduledAutomationP
 import { type ScheduledPipelineCandidateStore } from "./subagents/scheduled-pipeline-candidate-store.js"
 import { createCanonicalTurnScheduledPipeline } from "./canonical-turn-scheduled-pipeline.js"
 import { prepareCanonicalTurnSetup, taskGraphDenialCheckpointReader, turnStoreForInteractiveDiscovery } from "./canonical-turn-runtime-turn-setup.js"
+import { loadAndDispatchCanonicalReviewedApplicationReview, type ReviewedApplicationReviewIssuer } from "./canonical-reviewed-application-review-dispatch.js"
 import type { TurnEngineQueryClient } from "./turns/turn-engine-owner-sql.js"
 import type { TurnQuestionStore } from "./turns/turn-question-contract.js"
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"; export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
@@ -57,15 +58,13 @@ export type CanonicalTurnRuntimeOptions = {
   /** Test seam for rebuilding the shortlist from persisted owner-scoped child results and observations. */
   readonly interactiveDiscoveryShortlistLoader?: (input: { readonly pool: Pick<pg.Pool, "connect">; readonly lease: TurnLease; readonly root: Pick<SubagentTaskRecord, "id" | "attemptCount"> }) => Promise<InteractiveDiscoveryShortlistProjection | undefined>
   readonly modelRuntimeFactory?: (input: { userId: string; config?: AiConfig; state: Omit<CanonicalTurnState, "turnInput"> }) => Promise<HarnessModelRuntime> | HarnessModelRuntime
-  readonly authorizeUsage?: UsageAuthorizer
+  /** Focused test seam for the exact canonical reviewed-application user Turn. */ readonly reviewedApplicationReviewIssuer?: ReviewedApplicationReviewIssuer
+  readonly authorizeUsage?: UsageAuthorizer; readonly manager?: AgentTreeManager; readonly rootTaskStore?: RootTaskStore
   /** Server-owned scheduler and trusted template registry; model input never supplies its task/tenant fence. */
-  readonly taskGraphCommandPort?: TaskGraphCommandPort
+  readonly taskGraphCommandPort?: TaskGraphCommandPort; readonly taskGraphTemplates?: Readonly<Record<string, TaskGraphTaskTemplate>>
   /** Focused caller seam; production defaults to the PostgreSQL-backed verifier runtime. */
   readonly nativeVerificationFactory?: (pool: pg.Pool) => NativeVerificationRuntime
-  readonly taskGraphTemplates?: Readonly<Record<string, TaskGraphTaskTemplate>>
   readonly toolRuntimeFactory?: (input: { pool: pg.Pool; policy: PolicyEngine; manager: AgentTreeManager; state: CanonicalTurnState }) => { registry: { list(capabilities?: readonly string[]): readonly unknown[]; resolve(name: string, version: string): { readonly idempotency: ToolIdempotency }; validateArguments(name: string, input: unknown, version?: string): true | string; register?(definition: RuntimeToolDefinition): void }; router: ToolRouter }
-  readonly manager?: AgentTreeManager
-  readonly rootTaskStore?: RootTaskStore
   readonly turnEngineStoreFactory?: (pool: pg.Pool, terminalGuard?: Parameters<typeof createPgTurnEngineStore>[1]) => TurnEngineStore
   readonly turnBoundaryCompactionRunner?: (input: Parameters<typeof runTurnBoundaryContextCompaction>[0]) => Promise<{ readonly status: string }>
   readonly contextBuilderFactory?: (input: { pool: pg.Pool; scope: { userId: string } }) => TurnEngineOptions["contextBuilder"]
@@ -124,11 +123,15 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       })
       return terminal.result
     }
-    const setup = await prepareCanonicalTurnSetup({ pool, lease, signal, now, options, manager, rootTasks, executionProjection, sessionProjection, coordinationEnabled, childExecutionEnabled, consumeWaitOutcomes })
+    const review = await loadAndDispatchCanonicalReviewedApplicationReview({ pool, lease, signal, options, rootTasks,
+      executionProjection, sessionProjection, now, coordinationEnabled, childExecutionEnabled, consumeWaitOutcomes })
+    if (review.result) return review.result
+    const setup = await prepareCanonicalTurnSetup({ pool, lease, signal, now, options: review.setupOptions, manager, rootTasks, executionProjection, sessionProjection, coordinationEnabled, childExecutionEnabled, consumeWaitOutcomes })
     if ("earlyResult" in setup) return setup.earlyResult
     let state = setup.state
     const { interactiveDiscoveryMode, objectiveTaskGraphMode, taskGraphPlanningEnabled, selectedJobMode, scheduledDraftMode, selectedJobPreparation,
-      turnCoordination, nativeQuestionWaitEnabled, toolCapabilities, lifecycle, toolRuntime, rootTools, root, durableWaitPort } = setup
+      turnCoordination, nativeQuestionWaitEnabled, toolCapabilities, lifecycle, toolRuntime, rootTools, root } = setup
+    const durableWaitPort = review.durableWaitPort
     let acceptedGraphWitness: Extract<Awaited<ReturnType<typeof selectedJobArtifactCompletionGateWithWitness>>, { ok: true }>['witness'] | undefined
     const nativeVerification = createCanonicalNativeVerificationRuntime({
       pool, factory: options.nativeVerificationFactory, coordination: turnCoordination, durableWaitPort,

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { PrismaClient } from "@prisma/client"
 
 import { answerQuestion, createQuestionWait, decideApproval } from "./store"
@@ -7,9 +7,17 @@ import { projectApprovalLedgerRow } from "@/components/agent-workspace/v2/approv
 import { createApprovalLedgerState, reduceApprovalLedger, selectApprovalLedgerProjection } from "@/components/agent-workspace/v2/approval-ledger-view"
 import { normalizeTimelineEvent } from "@/components/agent-workspace/v2/timeline-event-normalizer"
 
+const reviewedDecisionReader = vi.hoisted(() => vi.fn())
+vi.mock("../approval/reviewed-application-review-decision", () => ({ readReviewedApplicationReviewDecision: reviewedDecisionReader }))
+vi.mock("../approval/reviewed-fill-handoff", () => ({ assertReviewedFillDecisionWait: vi.fn() }))
+vi.mock("../approval/reviewed-fill-source-binding", () => ({ persistReviewedFillSourceInTransaction: vi.fn() }))
+vi.mock("../approval/reviewed-fill-handoff-outbox", () => ({ enqueueReviewedFillHandoffInTransaction: vi.fn() }))
+
+beforeEach(() => { reviewedDecisionReader.mockReset(); reviewedDecisionReader.mockResolvedValue({ status: "legacy" }) })
+
 type Row = Record<string, any> // Test fixture rows mirror Prisma JSON records.
 
-function fakeDb(taskId: string | null = null) {
+function fakeDb(taskId: string | null = null, sessionPresent = true) {
   const turn: Row = { id: "turn_1", status: "in_progress", revision: 4 }
   const item: Row = {
     id: "agent-wait:question:question_1", status: "started", revision: 0,
@@ -17,16 +25,20 @@ function fakeDb(taskId: string | null = null) {
   }
   const approval: Row = {
     id: "approval_1", sessionId: "session_1", userId: "user_1", turnId: "turn_1", taskId, toolCallId: "call_approval",
-    status: "pending", revision: 4, scopeHash: "scope_hash", expiresAt: new Date("2026-09-02T00:00:00.000Z"),
+    jobId: "job_1", type: "submit_application", status: "pending", revision: 4, scopeHash: "scope_hash", expiresAt: new Date("2026-09-02T00:00:00.000Z"),
   }
   const events: Row[] = []
   const outbox: Row[] = []
   const tx = {
     $queryRaw: vi.fn(async (query: unknown) => {
-      const strings = (query as { strings?: readonly string[] }).strings ?? []
+      const sqlQuery = query as { strings?: readonly string[] }
+      const strings = sqlQuery.strings ?? (Array.isArray(query) ? query as readonly string[] : [])
       const sql = strings.join(" ")
-      if (sql.includes('FROM "agent_sessions"')) return [{ id: "session_1" }]
-      if (sql.includes('FROM "agent_events"')) return [{ hasRequest: true, hasRevision: false }]
+      if (sql.includes("pg_current_xact_id")) return [{ transaction_id: "123" }]
+      if (sql.includes('FROM "agent_sessions"')) return sessionPresent ? [{ id: "session_1" }] : []
+      if (sql.includes('FROM "agent_turns"')) return [{ id: "turn_1" }]
+      if (sql.includes('FROM "application_tasks"')) return [{ id: "task_approval" }]
+      if (sql.includes('FROM "agent_events"')) return [{ hasRequest: true, hasGoalRevision: false }]
       return [{ eventSequence: BigInt(9) }]
     }),
     agentTurn: {
@@ -48,8 +60,9 @@ function fakeDb(taskId: string | null = null) {
       findFirst: vi.fn(async () => approval),
       updateMany: vi.fn(async ({ data }: { data: Row }) => { Object.assign(approval, data); return { count: 1 } }),
     },
+    applicationTaskEvent: { findMany: vi.fn(async () => []) },
     agentEvent: {
-      findFirst: vi.fn(async ({ where }: { where: Row }) => events.find((event) => event.idempotencyKey === where.idempotencyKey) ?? null),
+      findFirst: vi.fn(async ({ where }: { where: Row }) => events.find((event) => Object.entries(where).every(([key, value]) => event[key] === value)) ?? null),
       create: vi.fn(async ({ data }: { data: Row }) => { const event = { ...data, id: data.id ?? `event_${events.length + 1}`, sequence: BigInt(events.length + 10) }; events.push(event); return event }),
     },
     agentOutbox: { create: vi.fn(async ({ data }: { data: Row }) => { outbox.push(data); return data }) },
@@ -133,6 +146,8 @@ describe("Agent wait broker", () => {
     expect(result).toMatchObject({ status: decision, turnId: "turn_1", toolCallId: "call_approval" })
     expect(fake.approval.status).toBe(decision)
     expect(fake.turn.id).toBe("turn_1")
+    expect(fake.tx.$queryRaw.mock.calls.some(([query]) =>
+      ((query as { strings?: readonly string[] }).strings ?? []).join(" ").includes("pg_advisory_xact_lock"))).toBe(false)
     expect(fake.events).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: "approval.resolved", taskId }),
       expect.objectContaining({ type: "turn.wakeup", taskId: null }),
@@ -170,5 +185,79 @@ describe("Agent wait broker", () => {
     let state = reduceApprovalLedger(createApprovalLedgerState("session_1"), requested)
     state = reduceApprovalLedger(state, resolved)
     expect(selectApprovalLedgerProjection(state)).toMatchObject({ pendingCount: 0, approvals: [{ status: decision }] })
+  })
+
+  it("uses the server-selected reviewed source after the owner locks", async () => {
+    const fake = fakeDb("task_approval")
+    fake.turn.status = "waiting_for_approval"
+    fake.turn.revision = 5
+    fake.item.id = "agent-wait:approval:reviewed-application-review:turn_1"
+    fake.item.content = { waitKind: "approval", approvalId: "reviewed-application-review:turn_1",
+      toolCallId: "review_application:turn_1", scopeHash: "scope_hash" }
+    Object.assign(fake.approval, { id: "reviewed-application-review:turn_1", type: "review_application",
+      toolCallId: "review_application:turn_1" })
+    reviewedDecisionReader.mockResolvedValue({ status: "reviewed_approved", sourceTurnId: "source_turn_server" })
+
+    const result = await decideApproval(fake.db, { waitId: fake.approval.id, sessionId: "session_1", userId: "user_1",
+      expectedTurnId: "turn_1", expectedRevision: 5, clientMessageId: "reviewed_approve", decision: "approved",
+      receiptNonce: "one-time-nonce", now: new Date("2026-09-01T00:00:00.000Z") })
+
+    expect(result.status).toBe("approved")
+    expect(reviewedDecisionReader).toHaveBeenCalledWith(fake.tx, expect.objectContaining({ approvalId: fake.approval.id,
+      receiptNonce: "one-time-nonce", requestedSourceTurnId: undefined }))
+    const sourceBinding = await import("../approval/reviewed-fill-source-binding")
+    expect(sourceBinding.persistReviewedFillSourceInTransaction).toHaveBeenCalledWith(fake.tx, expect.objectContaining({
+      sourceTurnId: "source_turn_server", decision: "approved",
+    }))
+    const sql = (fake.tx.$queryRaw.mock.calls as unknown as Array<[unknown]>).map(([query]) => {
+      const queryRecord = query as { strings?: readonly string[] }
+      return (queryRecord.strings ?? (Array.isArray(query) ? query as readonly string[] : [])).join(" ")
+    })
+    const fence = sql.findIndex((query) => query.includes("pg_advisory_xact_lock"))
+    const session = sql.findIndex((query) => query.includes('FROM "agent_sessions"'))
+    const turn = sql.findIndex((query) => query.includes('FROM "agent_turns"'))
+    const task = sql.findIndex((query) => query.includes('FROM "application_tasks"'))
+    expect(fence).toBeGreaterThanOrEqual(0)
+    expect(fence).toBeLessThan(session)
+    expect(session).toBeLessThan(turn)
+    expect(turn).toBeLessThan(task)
+  })
+
+  it("preserves the legacy reviewed-source selector when no v2 marker exists", async () => {
+    const fake = fakeDb("task_approval")
+    fake.turn.status = "waiting_for_approval"
+    fake.turn.revision = 5
+    fake.item.id = "agent-wait:approval:approval_1"
+    fake.item.content = { waitKind: "approval", approvalId: "approval_1", toolCallId: "call_approval", scopeHash: "scope_hash" }
+    Object.assign(fake.approval, { type: "review_application" })
+    await decideApproval(fake.db, { waitId: "approval_1", sessionId: "session_1", userId: "user_1", expectedTurnId: "turn_1",
+      expectedRevision: 5, clientMessageId: "legacy_review", decision: "approved", reviewedSourceTurnId: "legacy_source",
+      now: new Date("2026-09-01T00:00:00.000Z") })
+    const sourceBinding = await import("../approval/reviewed-fill-source-binding")
+    expect(sourceBinding.persistReviewedFillSourceInTransaction).toHaveBeenCalledWith(fake.tx, expect.objectContaining({
+      decision: "approved", sourceTurnId: "legacy_source",
+    }))
+    expect(fake.tx.$queryRaw.mock.calls.some(([query]) =>
+      ((query as { strings?: readonly string[] }).strings ?? []).join(" ").includes("pg_advisory_xact_lock"))).toBe(false)
+  })
+
+  it("does not replay a command for a different decision", async () => {
+    const fake = fakeDb()
+    fake.turn.status = "waiting_for_approval"
+    fake.turn.revision = 5
+    fake.item.id = "agent-wait:approval:approval_1"
+    fake.item.content = { waitKind: "approval", approvalId: "approval_1", toolCallId: "call_approval", scopeHash: "scope_hash" }
+    const shared = { waitId: "approval_1", sessionId: "session_1", userId: "user_1", expectedTurnId: "turn_1",
+      expectedRevision: 5, clientMessageId: "approval_reuse", now: new Date("2026-09-01T00:00:00.000Z") }
+    await decideApproval(fake.db, { ...shared, decision: "approved" })
+    await expect(decideApproval(fake.db, { ...shared, decision: "rejected" })).rejects.toMatchObject({ code: "wait_not_pending" })
+    expect(fake.tx.agentApproval.updateMany).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps ordinary approval owner failures mapped to not found", async () => {
+    const fake = fakeDb(null, false)
+    await expect(decideApproval(fake.db, { waitId: "approval_1", sessionId: "session_1", userId: "user_1",
+      expectedTurnId: "turn_1", expectedRevision: 5, clientMessageId: "missing_owner", decision: "approved" }))
+      .rejects.toMatchObject({ code: "wait_not_found" })
   })
 })
