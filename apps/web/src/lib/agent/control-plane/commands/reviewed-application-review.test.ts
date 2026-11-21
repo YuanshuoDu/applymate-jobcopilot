@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 import type { PrismaClient } from "@prisma/client"
-import { REVIEWED_APPLICATION_REVIEW_INTENT } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, REVIEWED_APPLICATION_REVIEW_INTENT } from "@jobcopilot/agent-protocol"
 
 import * as transaction from "./transaction"
 import { ReviewedApplicationReviewCommandService, type ReviewedApplicationReviewCommand } from "./reviewed-application-review"
@@ -103,6 +103,18 @@ describe("ReviewedApplicationReviewCommandService", () => {
     expect(acceptInputFacts).not.toHaveBeenCalled()
   })
 
+  it("accepts the exact Objective v1 marker on canonical selected-job source history", async () => {
+    const { db, tx } = makeDb({ sourceRows: [{
+      input: { ...sourceInput(), intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT }, rootTaskId: "source_root_1",
+    }] })
+    const service = new ReviewedApplicationReviewCommandService(db)
+    vi.spyOn(transaction, "acceptInputFacts").mockResolvedValue({ inputId: "input_1", turnId: "review_turn_1", sequence: "17" })
+
+    await expect(service.start(command)).resolves.toMatchObject({ turnId: "review_turn_1", disposition: "started" })
+    expect(tx.agentTurn.create).toHaveBeenCalledOnce()
+    expect(tx.job.findFirst).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ id: "job_1" }) }))
+  })
+
   it("rejects reusing a command ID for another selected source", async () => {
     const existing = { id: "input_1", targetTurnId: "review_turn_1", delivery: "follow_up", acceptedSequence: BigInt(17) }
     const existingTurnInput = {
@@ -120,7 +132,9 @@ describe("ReviewedApplicationReviewCommandService", () => {
   it("rejects forged, missing, or non-canonical completed selected-job sources before creating a Root", async () => {
     const invalidSources = [
       [],
-      [{ input: { ...sourceInput(), intent: { kind: "objective_task_graph_execution", version: 1 } }, rootTaskId: "source_root_1" }],
+      [{ input: { ...sourceInput(), intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, version: 2 } }, rootTaskId: "source_root_1" }],
+      [{ input: { ...sourceInput(), intent: { ...OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, sourceTurnId: "different_source" } }, rootTaskId: "source_root_1" }],
+      [{ input: { ...sourceInput(), intent: { ...REVIEWED_APPLICATION_REVIEW_INTENT, sourceTurnId: "different_source", jobId: "job_1" } }, rootTaskId: "source_root_1" }],
       [{ input: { goal: "Prepare" }, rootTaskId: "source_root_1" }],
       [{ input: sourceInput(), rootTaskId: null }],
     ] as const
