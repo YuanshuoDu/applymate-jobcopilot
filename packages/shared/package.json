@@ -38,6 +38,10 @@
       "types": "./dist/agent-redaction.d.ts",
       "default": "./dist/agent-redaction.js"
     },
+    "./application-submission-stop-protocol": {
+      "types": "./dist/application-submission-stop-protocol.d.ts",
+      "default": "./dist/application-submission-stop-protocol.js"
+    },
     "./pinned-outbound": {
       "types": "./dist/pinned-outbound.d.ts",
       "default": "./dist/pinned-outbound.js"
