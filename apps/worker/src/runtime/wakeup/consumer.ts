@@ -1,12 +1,11 @@
-import { randomUUID } from "node:crypto"
 import type pg from "pg"
 import { getPool } from "../../db/apply-results.js"
 import { persistWakeupTurnDispatchInTransaction } from "../turns/recovery-scanner.js"
+import { appendResumeEvent, hasMatchingWakeupEvent, hasReviewedApplicationReviewIntent, wakeupLeaseDisposition } from "./resume-projection.js"
 import { AGENT_TURN_WAKEUP_TOPIC, parseWakeup, type AgentTurnWakeupPayload, type WakeupResult } from "./types.js"
 type Client = pg.PoolClient
 type PoolLike = Pick<pg.Pool, "connect">
 interface OutboxRow { id: string; aggregateId: string; payload: unknown; publishedAt?: Date | string | null }
-interface WakeupEventRow { sessionId: string; turnId: string; itemId: string | null; type: string; payload: unknown }
 type TerminalWakeupErrorCode = "schema_invalid_payload" | "outbox_scope_mismatch" | "event_lineage_mismatch" | "item_lineage_mismatch" | "tool_lineage_mismatch" | "turn_revision_conflict" | "wait_scope_mismatch"
 class TerminalWakeupError extends Error { constructor(readonly code: TerminalWakeupErrorCode, message: string) { super(message); this.name = "TerminalWakeupError" } }
 const DEFAULT_BATCH_SIZE = 10
@@ -18,34 +17,6 @@ function validateWakeupPayload(payload: AgentTurnWakeupPayload): void {
   const identifiers = [payload.eventId, payload.sessionId, payload.turnId, payload.itemId, payload.waitId]
   const validToolCallId = payload.toolCallId === null || (typeof payload.toolCallId === "string" && payload.toolCallId.trim().length > 0)
   if (!identifiers.every((value) => typeof value === "string" && value.trim().length > 0) || (payload.waitKind !== "approval" && payload.waitKind !== "question") || (payload.status !== "approved" && payload.status !== "rejected" && payload.status !== "answered") || !validToolCallId || !Number.isSafeInteger(payload.nextTurnRevision) || payload.nextTurnRevision < 0) throw new TerminalWakeupError("schema_invalid_payload", "Agent wakeup payload is invalid")
-}
-async function assertWakeupEvent(client: Client, payload: AgentTurnWakeupPayload): Promise<void> {
-  const result = await client.query<WakeupEventRow>(`SELECT "sessionId", "turnId", "itemId", "type", "payload" FROM "agent_events" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "itemId" = $4 AND "type" = 'turn.wakeup' FOR SHARE`, [payload.eventId, payload.sessionId, payload.turnId, payload.itemId])
-  const event = result.rows[0]
-  const eventPayload = record(event?.payload)
-  if (!event || event.itemId !== payload.itemId || event.type !== "turn.wakeup" || eventPayload.waitKind !== payload.waitKind || eventPayload.waitId !== payload.waitId || eventPayload.itemId !== payload.itemId || eventPayload.turnId !== payload.turnId || eventPayload.toolCallId !== payload.toolCallId || eventPayload.status !== payload.status || eventPayload.nextTurnRevision !== payload.nextTurnRevision) {
-    throw new TerminalWakeupError("event_lineage_mismatch", "Agent wakeup event lineage does not match payload")
-  }
-}
-async function appendResumeEvent(client: Client, payload: AgentTurnWakeupPayload, userId: string): Promise<void> {
-  const sequenceResult = await client.query<{ eventSequence: string | bigint }>(
-    `UPDATE "agent_sessions" AS session
-     SET "eventSequence" = "eventSequence" + 1
-     WHERE session."id" = $1 AND session."userId" = $2
-       AND session."status" NOT IN ('aborted', 'archived')
-     RETURNING "eventSequence"`,
-    [payload.sessionId, userId],
-  )
-  const sequence = sequenceResult.rows[0]?.eventSequence
-  if (sequence === undefined) throw new Error("Agent session sequence is unavailable for wakeup")
-  const eventId = randomUUID()
-  const eventPayload = { waitKind: payload.waitKind, waitId: payload.waitId, itemId: payload.itemId, turnId: payload.turnId, toolCallId: payload.toolCallId, status: payload.status, resumedFromEventId: payload.eventId }
-  await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload") VALUES ($1, $2, $3, $4, NULL, $5, 'turn.resumed', 'system', $3, $6, $7, $8::jsonb)`, [eventId, payload.sessionId, payload.turnId, payload.itemId, String(sequence), payload.eventId, `agent-wakeup:${payload.eventId}:resumed`, json(eventPayload)])
-  await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.session.event', $2, $3, $4::jsonb)`, [`agent-outbox-${eventId}`, payload.sessionId, `agent-event:${eventId}`, json({
-      eventId, sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId,
-      taskId: null, sequence: String(sequence), type: "turn.resumed", actor: "system",
-      correlationId: payload.turnId, causationId: payload.eventId, idempotencyKey: `agent-wakeup:${payload.eventId}:resumed`, payload: eventPayload,
-    })])
 }
 async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPayload): Promise<WakeupResult> {
   validateWakeupPayload(payload)
@@ -69,7 +40,8 @@ async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPaylo
   )
   const turn = turnResult.rows[0]
   if (!turn) return { status: "ignored", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
-  await assertWakeupEvent(client, payload)
+  const reviewedReview = hasReviewedApplicationReviewIntent(turn.input)
+  if (!await hasMatchingWakeupEvent(client, payload)) throw new TerminalWakeupError(reviewedReview ? "wait_scope_mismatch" : "event_lineage_mismatch", "Agent wakeup event lineage does not match payload")
   if (turn.status === "queued" || turn.status === "in_progress") {
     return { status: "already_resumed", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
   }
@@ -86,23 +58,24 @@ async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPaylo
     [payload.itemId, payload.sessionId, payload.turnId, payload.waitKind === "approval" ? "approval_request" : "question"],
   )
   const item = itemResult.rows[0]
-  if (!item || item.status !== "completed") return { status: "ignored", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
+  if (!item || item.status !== "completed") {
+    if (reviewedReview) throw new TerminalWakeupError("wait_scope_mismatch", "Reviewed application approval Wait is unavailable")
+    return { status: "ignored", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
+  }
   const content = item.content && typeof item.content === "object" && !Array.isArray(item.content) ? item.content as Record<string, unknown> : {}
   const itemWaitId = payload.waitKind === "approval"
     ? content.approvalId
     : content.waitId ?? content.questionId
-  if (content.waitKind !== payload.waitKind || itemWaitId !== payload.waitId) throw new TerminalWakeupError("item_lineage_mismatch", "Agent wait item lineage does not match wakeup")
+  if (content.waitKind !== payload.waitKind || itemWaitId !== payload.waitId) throw new TerminalWakeupError(reviewedReview ? "wait_scope_mismatch" : "item_lineage_mismatch", "Agent wait item lineage does not match wakeup")
   const itemToolCallId = typeof content.toolCallId === "string" ? content.toolCallId : null
-  if (itemToolCallId !== payload.toolCallId) throw new TerminalWakeupError("tool_lineage_mismatch", "Agent wait tool lineage does not match wakeup")
+  if (itemToolCallId !== payload.toolCallId) throw new TerminalWakeupError(reviewedReview ? "wait_scope_mismatch" : "tool_lineage_mismatch", "Agent wait tool lineage does not match wakeup")
 
-  const turnInput = record(turn.input)
-  const exactScheduledContinuationQuestion = payload.waitKind === "question" && payload.status === "answered"
-    && content.answerAvailable === true && content.answer !== null && content.answer !== undefined
-    && turn.source === "automation" && turn.executionMode === "canonical_task_graph"
-    && turnInput.automationRunMode === "scheduled"
-    && typeof turn.rootTaskId === "string" && turn.rootTaskId.length > 0
-    && (item.taskId === null || item.taskId === turn.rootTaskId)
-  if (exactScheduledContinuationQuestion && turn.hasLiveLease) {
+  const disposition = wakeupLeaseDisposition(payload, turn, {
+    id: payload.itemId, type: payload.waitKind === "approval" ? "approval_request" : "question",
+    status: item.status, taskId: item.taskId, content,
+  })
+  if (disposition === "wait_scope_mismatch") throw new TerminalWakeupError("wait_scope_mismatch", "Reviewed application approval Wait does not match its typed intent")
+  if (disposition === "defer") {
     return { status: "deferred", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
   }
 
@@ -241,13 +214,14 @@ export async function drainAgentWakeups(pool: PoolLike, batchSize = DEFAULT_BATC
     const rows = await selectPendingWakeups(pool, batchSize)
     if (rows.length === 0) return processed
     let retryPending = false
+    let deferredPending = false
     for (const row of rows) {
       const outcome = await processWakeupRow(pool, row)
       if (outcome === "published") processed += 1
-      if (outcome === "deferred") return processed
+      if (outcome === "deferred") deferredPending = true
       if (outcome === "retry") retryPending = true
     }
-    if (retryPending) return processed
+    if (retryPending || deferredPending) return processed
   }
 }
 
