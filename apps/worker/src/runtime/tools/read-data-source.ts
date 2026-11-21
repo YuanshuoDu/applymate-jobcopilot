@@ -17,10 +17,13 @@ import {
   type ReadToolDataSource,
   type ResumeRecord,
 } from "./read-tools.js"
+import {
+  readAgentSelectedJobBaseResume, readAgentSelectedJobJob, readAgentSelectedJobPersonaFacts,
+  type AgentSelectedJobMaterialQueryClient,
+  type AgentSelectedJobQueryParameter,
+} from "@jobcopilot/shared"
 
 interface JobRow extends JobRecord { createdAt: Date | string; updatedAt: Date | string }
-interface PersonaRow extends Omit<PersonaFactRecord, "confidence"> { confidence: number | string; allowedUses: string[] }
-interface ResumeRow extends Omit<ResumeRecord, "createdAt" | "updatedAt"> { createdAt: Date | string; updatedAt: Date | string }
 interface TaskRow {
   id: string; sessionId: string | null; status: string; checkpoint: string | null; question: unknown; sensitiveFlags: unknown
   resumeId: string | null; coverLetterId: string | null; startedAt: Date | string | null; completedAt: Date | string | null; createdAt: Date | string; updatedAt: Date | string
@@ -80,9 +83,18 @@ function job(row: JobRow): JobRecord {
   return { id: row.id, company: row.company, role: row.role, location: row.location ?? null, status: row.status, score: row.score ?? null, url: row.url ?? null, source: row.source ?? null, salary: row.salary ?? null, description: row.description ?? null, keywords: row.keywords ?? null }
 }
 
+export function createPostgresAgentSelectedJobMaterialQueryClient(pool: Pick<pg.Pool, "query">): AgentSelectedJobMaterialQueryClient {
+  return { query: async <Row>(sql: string, values: readonly AgentSelectedJobQueryParameter[]) => {
+    const result = await pool.query(sql, [...values])
+    // These statements are module-owned, parameterized and paired with a fixed row shape at each call site.
+    return { rows: result.rows as unknown as readonly Row[] }
+  } }
+}
+
 export function createPostgresReadToolDataSource(
   pool: Pick<pg.Pool, "query">,
 ): ReadToolDataSource & Required<Pick<ReadToolDataSource, "getOutcomesSummary">> {
+  const selectedJobClient = createPostgresAgentSelectedJobMaterialQueryClient(pool)
   return {
     async searchJobs(userId: string, input: JobSearchInput): Promise<JobSearchResult> {
       const page = input.page ?? 1
@@ -101,35 +113,17 @@ export function createPostgresReadToolDataSource(
     },
 
     async getJob(userId: string, jobId: string): Promise<JobRecord | null> {
-      const result = await pool.query<JobRow>(
-        `SELECT "id", "company", "role", "location", "status", "score", "url", "source", "salary", "description", "keywords", "createdAt", "updatedAt"
-         FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [jobId, userId],
-      )
-      return result.rows[0] ? job(result.rows[0]) : null
+      return readAgentSelectedJobJob(selectedJobClient, userId, jobId)
     },
 
     async retrievePersona(userId: string, input: PersonaRetrieveInput): Promise<{ facts: PersonaFactRecord[] }> {
-      const result = await pool.query<PersonaRow>(
-        `SELECT "id", "key", "category", "value", "source", "source_ref" AS "sourceRef", "confidence", "allowedUses"
-         FROM persona_facts
-         WHERE "userId" = $1 AND "status" = 'confirmed' AND ("expires_at" IS NULL OR "expires_at" > statement_timestamp())
-           AND ($2::text[] IS NULL OR "key" = ANY($2::text[]))
-           AND ($3::text IS NULL OR $3 = ANY("allowedUses"))
-         ORDER BY "updated_at" DESC, "id" DESC LIMIT 50`,
-        [userId, input.keys?.length ? input.keys : null, input.useCase ?? null],
-      )
-      return { facts: result.rows.map((row) => ({ ...row, confidence: Number(row.confidence), allowedUses: [...row.allowedUses] })) }
+      return { facts: (await readAgentSelectedJobPersonaFacts(selectedJobClient, userId, input)).map(fact => ({
+        ...fact, allowedUses: [...fact.allowedUses],
+      })) }
     },
 
     async getBaseResume(userId: string, input: BaseResumeInput): Promise<{ resume: ResumeRecord | null }> {
-      const result = await pool.query<ResumeRow>(
-        `SELECT "id", "name", "kind", "origin", "isDefault", "content", "createdAt", "updatedAt"
-         FROM "Resume" WHERE "userId" = $1 AND "kind" = 'base'
-           AND ($2::text IS NULL OR "id" = $2)
-           ORDER BY "isDefault" DESC, "updatedAt" DESC, "id" DESC LIMIT 1`, [userId, input.resumeId ?? null],
-      )
-      const row = result.rows[0]
-      return { resume: row ? { ...row, createdAt: iso(row.createdAt) as string, updatedAt: iso(row.updatedAt) as string } : null }
+      return { resume: await readAgentSelectedJobBaseResume(selectedJobClient, userId, input.resumeId) }
     },
 
     async getApplicationState(userId: string, input: ApplicationStateInput): Promise<ApplicationStateResult> {
