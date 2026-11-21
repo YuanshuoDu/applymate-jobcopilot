@@ -108,7 +108,9 @@ describe("scheduleTaskGraph objective Scout opt-in", () => {
 
   it("keeps the opt-in on a normal reconciled revise at a later revision", async () => {
     const revision = 4, loaded = graphAt(revision)
+    const prepared = { decision: "revise", expectedRevision: revision } as never
     schedulerMocks.load.mockResolvedValue(loaded as never)
+    schedulerMocks.prepare.mockResolvedValue(prepared)
     schedulerMocks.create.mockResolvedValue({ state: { revision: revision + 1 }, snapshot: {}, created: [], readyTaskIds: [] } as never)
     const client = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as unknown as Queryable
     const operation: SteeringReconciliationOperation = { scope: currentScope, decision: "revise", expectedRevision: revision, callId: "plan-call" }
@@ -118,5 +120,6 @@ describe("scheduleTaskGraph objective Scout opt-in", () => {
     expect(schedulerMocks.create).toHaveBeenCalledTimes(1)
     expect(schedulerMocks.create.mock.calls[0]?.[5]).toBe(loaded)
     expect(schedulerMocks.create.mock.calls[0]?.[7]).toBe(true)
+    expect(schedulerMocks.create.mock.calls[0]?.[8]).toBe(prepared)
   })
 })
