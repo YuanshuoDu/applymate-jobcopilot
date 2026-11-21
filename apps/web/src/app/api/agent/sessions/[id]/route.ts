@@ -1,6 +1,8 @@
 import { NextRequest } from "next/server"
 import { db } from "@/lib/db"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
+import { readApplicationSubmissionStopTargets } from "../../application-tasks/submission-stop-target"
+import type { SubmissionStopTargetTask } from "../../application-tasks/submission-stop-target"
 
 interface RouteCtx {
   params: Promise<{ id: string }>
@@ -8,6 +10,11 @@ interface RouteCtx {
 
 function iso(date: Date | null) {
   return date?.toISOString() ?? null
+}
+
+function noStore<T extends Response>(response: T): T {
+  response.headers.set("Cache-Control", "private, no-store")
+  return response
 }
 
 function missingControlPlaneTable(error: unknown) {
@@ -63,6 +70,7 @@ function serializeSession(session: {
     error: string | null
     question: unknown | null
     job: { company: string; role: string }
+    submissionStopTarget?: string
   }>
   execution: { id: string; status: string; checkpoint: string; error: string | null; attemptCount: number } | null
   questions: Array<{ id: string; stage: string; question: string; options: unknown }>
@@ -88,7 +96,7 @@ function serializeSession(session: {
 
 export async function GET(req: NextRequest, ctx: RouteCtx) {
   const auth = await requireAuth(req)
-  if (isErrorResponse(auth)) return auth
+  if (isErrorResponse(auth)) return noStore(auth)
 
   const { id } = await ctx.params
   const session = await db.agentSession.findFirst({
@@ -130,8 +138,8 @@ export async function GET(req: NextRequest, ctx: RouteCtx) {
     },
   })
 
-  if (!session) return err("Session not found", 404)
-  const [questions, applicationTasks, execution] = await Promise.all([
+  if (!session) return noStore(err("Session not found", 404))
+  const [questions, applicationTaskSnapshots, execution] = await Promise.all([
     optionalControlPlane(
       () => db.agentRunQuestion.findMany({
         where: { userId: auth.userId, runId: id, answer: null },
@@ -145,7 +153,12 @@ export async function GET(req: NextRequest, ctx: RouteCtx) {
         where: { userId: auth.userId, sessionId: id },
         orderBy: { updatedAt: "desc" },
         take: 20,
-        select: { id: true, status: true, checkpoint: true, error: true, question: true, job: { select: { company: true, role: true } } },
+        select: {
+          id: true, userId: true, sessionId: true, jobId: true, fillTurnId: true,
+          fillTurnSessionId: true, fillTurnUserId: true, workerTaskId: true,
+          status: true, checkpoint: true, error: true, question: true,
+          job: { select: { company: true, role: true } },
+        },
       }),
       [],
     ),
@@ -157,7 +170,15 @@ export async function GET(req: NextRequest, ctx: RouteCtx) {
       null,
     ),
   ])
-  return ok({ session: serializeSession({ ...session, questions, applicationTasks, execution }) })
+  const stopTargets = await optionalControlPlane(
+    () => readApplicationSubmissionStopTargets(auth.userId, id, applicationTaskSnapshots as SubmissionStopTargetTask[]),
+    new Map<string, string>(),
+  )
+  const applicationTasks = applicationTaskSnapshots.map(({ id: taskId, status, checkpoint, error, question, job }) => ({
+    id: taskId, status, checkpoint, error, question, job,
+    ...(stopTargets.get(taskId) ? { submissionStopTarget: stopTargets.get(taskId)! } : {}),
+  }))
+  return noStore(ok({ session: serializeSession({ ...session, questions, applicationTasks, execution }) }))
 }
 
 /** Records the user's own most recently opened conversation. */
