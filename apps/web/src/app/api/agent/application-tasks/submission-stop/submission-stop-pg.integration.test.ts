@@ -6,14 +6,17 @@ import { hashAgentReceiptValue } from "@jobcopilot/shared"
 import { applicationSubmissionStopEventId } from "@jobcopilot/shared/application-submission-stop-protocol"
 import { SignJWT } from "jose"
 import { NextRequest } from "next/server"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from "@/lib/auth-secret"
 import { createApplicationSubmissionStopTarget } from "../submission-stop"
+import { POST as postSubmissionStop } from "./route"
 import { createApplicationSubmitRepository } from "../../../../../../../../apps/worker/src/db/application-submit-repo.js"
 import type { ApplicationSubmissionStartScope } from "../../../../../../../../apps/worker/src/db/application-task-state.js"
 import { createPgApprovalStore } from "../../../../../../../../apps/worker/src/runtime/approval/pg-store.js"
 import { acquireApplicationSubmissionStartFenceWithStopProtocol } from "../../../../../../../../apps/worker/src/runtime/interrupt/application-submission-start-gate.js"
+
+vi.mock("@/lib/safe-auth", () => ({ safeAuth: async () => null }))
 
 const CI_DATABASE = "applymate_agent_brain_ci"
 const LOCAL_DATABASE = "applymate_submission_evidence_1134_test"
@@ -109,9 +112,8 @@ async function signedBearer(userId: string): Promise<string> {
 }
 
 async function requestStop(attempt: Attempt, userId: string): Promise<Response> {
-  const { POST } = await import("./route")
   const token = await signedBearer(userId)
-  return POST(new NextRequest("http://localhost/api/agent/application-tasks/submission-stop", {
+  return postSubmissionStop(new NextRequest("http://localhost/api/agent/application-tasks/submission-stop", {
     method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({ applicationTaskId: attempt.applicationTaskId, expectedAttemptTarget: attempt.target, sessionId: attempt.sessionId }),
   }))
@@ -273,7 +275,10 @@ describeWithPostgres("authenticated Submission Stop races the real Worker gate o
         .toEqual(["armed", "stop_requested"])
     } finally {
       release.resolve()
-      await Promise.allSettled([gatePromise])
+      const [settled] = await Promise.allSettled([gatePromise])
+      if (settled.status === "fulfilled" && settled.value.state === "ready") {
+        await settled.value.release(false).catch(() => undefined)
+      }
     }
   }, 15_000)
 
@@ -282,15 +287,17 @@ describeWithPostgres("authenticated Submission Stop races the real Worker gate o
     const pids: number[] = []
     const gate = await acquireApplicationSubmissionStartFenceWithStopProtocol(trackedWorkerPool(workerPool!, pids), gateScope(attempt))
     if (gate.state !== "ready") throw new Error("Worker did not hold the exact final request fence")
-    const workerPid = pids[pids.length - 1]
-    if (typeof workerPid !== "number") throw new Error("Worker final fence backend is unavailable")
 
     let stopSettled = false
     const stopPromise = requestStop(attempt, attempt.userId).then(response => { stopSettled = true; return response })
     let acknowledgementCount = 0
     const acknowledgement = deferred()
     const syntheticRouteCommand = acknowledgement.promise.then(() => { acknowledgementCount += 1 })
+    let acknowledgementSent = false
+    let gateCommitted = false
     try {
+      const workerPid = pids[pids.length - 1]
+      if (typeof workerPid !== "number") throw new Error("Worker final fence backend is unavailable")
       const webPid = await waitForStopBlockedBy(workerPid)
       expect(webPid).not.toBe(workerPid)
       expect(stopSettled).toBe(false)
@@ -299,8 +306,10 @@ describeWithPostgres("authenticated Submission Stop races the real Worker gate o
         .toEqual(["armed", "dispatch_granted"])
 
       acknowledgement.resolve()
+      acknowledgementSent = true
       await syntheticRouteCommand
       await gate.release(true)
+      gateCommitted = true
       const tooLate = await stopPromise
       expect(tooLate.status).toBe(200)
       await expect(tooLate.json()).resolves.toEqual({ outcome: "too_late" })
@@ -311,9 +320,8 @@ describeWithPostgres("authenticated Submission Stop races the real Worker gate o
       expect((await protocolEvents(attempt)).map(event => (event.data as { stage: string }).stage).sort())
         .toEqual(["armed", "dispatch_granted"])
     } finally {
-      acknowledgement.resolve()
-      await syntheticRouteCommand.catch(() => undefined)
-      await gate.release(true).catch(() => undefined)
+      if (!gateCommitted) await gate.release(false).catch(() => undefined)
+      if (acknowledgementSent) await syntheticRouteCommand.catch(() => undefined)
       await Promise.allSettled([stopPromise])
     }
   }, 15_000)
