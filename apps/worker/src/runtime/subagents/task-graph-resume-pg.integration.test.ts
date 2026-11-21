@@ -20727,7 +20727,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     })
 
     try {
-      const expectedRootControls = ["agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.wait"]
+      const expectedRootControls = ["agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.retire_superseded_scout", "agent.wait"]
       let names: string[]
       try {
         names = await withinIntegrationDeadline(rootToolNames.promise, "ObjectiveStart Root did not request its tools", 30_000)
