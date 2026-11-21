@@ -10,7 +10,6 @@ import { hashArtifactContent } from "../artifacts/hash"
 
 const START_EVENT = "reviewed_application_fill_browser_started"
 const REVIEWED_MANIFEST_SCHEMA = "agent-harness.application-submission.v2"
-const LEGACY_MANIFEST_SCHEMA = "agent-harness.application-submission.v1"
 const TASK_REF_PREFIX = "application-task:"
 
 type Client = Pick<PrismaClient, "agentApproval" | "agentArtifact" | "agentTurn" | "applicationTask" | "applicationTaskEvent" | "subAgentTask">
@@ -42,12 +41,9 @@ export async function resolveReviewedSubmitMaterial(client: Client, input: Input
     })
     if (taskRows.length !== 1) return UNAVAILABLE
     const task = taskRows[0]!
-    if (task.id !== input.applicationTaskId || task.userId !== input.userId || task.sessionId !== input.sessionId
-      || task.jobId !== input.jobId || task.fillTurnId !== input.fillTurnId || task.fillTurnSessionId !== input.sessionId
-      || task.fillTurnUserId !== input.userId) return UNAVAILABLE
     const turns = await client.agentTurn.findMany({
       where: { id: input.fillTurnId, userId: input.userId, sessionId: input.sessionId, source: "user" },
-      take: 2, select: { id: true, userId: true, sessionId: true, source: true, input: true },
+      take: 2, select: { id: true, userId: true, sessionId: true, source: true, rootTaskId: true, input: true },
     })
     if (turns.length !== 1) return UNAVAILABLE
     const turn = turns[0]!
@@ -60,22 +56,16 @@ export async function resolveReviewedSubmitMaterial(client: Client, input: Input
         take: 1, select: { id: true },
       })
       if (starts.length !== 0) return UNAVAILABLE
-      const material: LegacyApplicationSubmissionMaterial = {
-        applicationTaskId: task.id, jobId: task.jobId, resumeId: task.resumeId, coverLetterId: task.coverLetterId,
-      }
-      const answersHash = await hashAgentReceiptValue("answers", task.confirmedAnswers ?? null)
-      const legacyManifest = buildApplicationSubmissionManifest(material, answersHash)
-      if (!legacyManifest || legacyManifest.schemaVersion !== LEGACY_MANIFEST_SCHEMA) return UNAVAILABLE
       const artifacts = await client.agentArtifact.findMany({
-        where: { id: `application:${task.id}`, userId: input.userId, jobId: input.jobId }, take: 2,
-        select: { id: true, userId: true, jobId: true, artifactType: true, lifecycle: true, baseId: true, baseHash: true,
-          content: true, hash: true, constraintHash: true, provenanceRefs: true, evidenceRefs: true, previousHash: true, version: true },
+        where: { id: `application:${task.id}`, userId: input.userId, jobId: input.jobId, artifactType: "application", lifecycle: "base" },
+        take: 2, select: { content: true },
       })
-      if (artifacts.length > 1 || artifacts.some(row => hasReviewedManifestVersion(row.content)
-        || !artifactMatches(row, input, legacyManifest))) return UNAVAILABLE
+      if (artifacts.length > 1 || artifacts.some(row => hasReviewedManifestVersion(row.content))) return UNAVAILABLE
       return { mode: "legacy" }
     }
     if (selection.kind !== "selected") return UNAVAILABLE
+    const fillRootTaskId = turn.rootTaskId
+    if (typeof fillRootTaskId !== "string" || !fillRootTaskId || fillRootTaskId.trim() !== fillRootTaskId) return UNAVAILABLE
     const material: LegacyApplicationSubmissionMaterial = {
       applicationTaskId: task.id, jobId: task.jobId, resumeId: task.resumeId, coverLetterId: task.coverLetterId,
     }
@@ -85,7 +75,7 @@ export async function resolveReviewedSubmitMaterial(client: Client, input: Input
       orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: 2,
       select: { id: true, taskId: true, type: true, actor: true, data: true },
     })
-    const reviewed = await reviewedMaterialFromEvent(client, input, task, events, selection.sourceTurnId, material)
+    const reviewed = await reviewedMaterialFromEvent(client, input, task, events, selection.sourceTurnId, fillRootTaskId, material)
     if (!reviewed) return UNAVAILABLE
     const expectedMaterial = reviewed
     const expectedManifest = buildApplicationSubmissionManifest(expectedMaterial, answersHash)
@@ -110,24 +100,26 @@ export async function resolveReviewedSubmitMaterial(client: Client, input: Input
 async function reviewedMaterialFromEvent(client: Client, input: Input, task: {
   id: string; userId: string; sessionId: string | null; jobId: string; fillTurnId: string | null; fillTurnSessionId: string | null; fillTurnUserId: string | null
 }, rows: readonly { id: string; taskId: string; type: string; actor: string; data: unknown }[], sourceTurnId: string,
-material: LegacyApplicationSubmissionMaterial) {
-  if (task.sessionId !== input.sessionId || task.fillTurnId !== input.fillTurnId || task.fillTurnSessionId !== input.sessionId
+fillRootTaskId: string, material: LegacyApplicationSubmissionMaterial) {
+  if (task.id !== input.applicationTaskId || task.userId !== input.userId || task.sessionId !== input.sessionId
+    || task.jobId !== input.jobId || task.fillTurnId !== input.fillTurnId || task.fillTurnSessionId !== input.sessionId
     || task.fillTurnUserId !== input.userId || rows.length !== 1) return null
   const row = rows[0]!
   const binding = row.actor === "worker" && row.type === START_EVENT && row.taskId === task.id
     ? parseReviewedApplicationFillBrowserStartEvent(row.data) : null
   if (!binding || binding.userId !== input.userId || binding.sessionId !== input.sessionId || binding.fillTurnId !== input.fillTurnId
     || binding.applicationTaskId !== task.id || binding.jobId !== input.jobId || binding.proof.sourceTurnId !== sourceTurnId) return null
+  if (binding.proof.rootTaskId === fillRootTaskId) return null
   const tasks = await client.subAgentTask.findMany({
-    where: { id: binding.fillerTaskId, sessionId: input.sessionId, turnId: input.fillTurnId, session: { is: { userId: input.userId } },
-      role: "application_filler", taskType: "application_fill_for_review", status: "completed", attemptCount: binding.attemptCount,
-      rootTaskId: binding.proof.rootTaskId, completedAt: { not: null }, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null },
+    where: { sessionId: input.sessionId, turnId: input.fillTurnId, session: { is: { userId: input.userId } },
+      role: "application_filler", taskType: "application_fill_for_review", status: "completed",
+      rootTaskId: fillRootTaskId, completedAt: { not: null }, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null },
     take: 2, select: { id: true, attemptCount: true, status: true, completedAt: true, leaseOwner: true,
       leaseExpiresAt: true, interruptRequestedAt: true, rootTaskId: true },
   })
   if (tasks.length !== 1 || tasks[0]!.id !== binding.fillerTaskId || tasks[0]!.attemptCount !== binding.attemptCount
     || tasks[0]!.status !== "completed" || !tasks[0]!.completedAt || tasks[0]!.leaseOwner !== null
-    || tasks[0]!.leaseExpiresAt !== null || tasks[0]!.interruptRequestedAt !== null || tasks[0]!.rootTaskId !== binding.proof.rootTaskId) return null
+    || tasks[0]!.leaseExpiresAt !== null || tasks[0]!.interruptRequestedAt !== null || tasks[0]!.rootTaskId !== fillRootTaskId) return null
   return bindReviewedApplicationSubmissionMaterial(material, binding.proof)
 }
 
@@ -174,10 +166,12 @@ function exactSingleRef(value: unknown, expected: string): boolean {
   return Array.isArray(value) && value.length === 1 && value[0] === expected
 }
 function hasReviewedManifestVersion(value: unknown): boolean {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  if (!value || typeof value !== "object" || Array.isArray(value)) return true
   try {
+    if (Object.getPrototypeOf(value) !== Object.prototype || Object.getOwnPropertySymbols(value).length !== 0) return true
     const descriptor = Object.getOwnPropertyDescriptor(value, "schemaVersion")
-    return Boolean(descriptor && (!descriptor.enumerable || !("value" in descriptor) || descriptor.value === REVIEWED_MANIFEST_SCHEMA))
+    const commitment = Object.getOwnPropertyDescriptor(value, "reviewedCoverLetterHash")
+    return Boolean(commitment || descriptor && (!descriptor.enumerable || !("value" in descriptor) || descriptor.value === REVIEWED_MANIFEST_SCHEMA))
   } catch { return true }
 }
 function matchesLegacyPayload(value: unknown, expected: LegacyApplicationSubmissionMaterial): boolean {
