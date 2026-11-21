@@ -168,9 +168,9 @@ async function seedAttempt(label: string): Promise<Attempt> {
   ] })
   await testDb!.job.create({ data: { id: jobId, userId, company: "Synthetic Fixture", role: "Engineer", url: "https://jobs.example.invalid/apply" } })
   await testDb!.agentSession.create({ data: { id: sessionId, userId, goal: "Synthetic submission Stop fixture", source: "test", status: "running" } })
-  await testDb!.agentTurn.create({ data: { id: fillTurnId, sessionId, userId, source: "user", status: "completed",
-    input: {}, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {}, completedAt: new Date(),
-    leaseOwnerId: null, leaseExpiresAt: null } })
+  await testDb!.agentTurn.create({ data: { id: fillTurnId, sessionId, userId, source: "user", status: "waiting_for_dependency",
+    revision: 0, input: {}, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {},
+    leaseOwnerId: null, leaseStartedAt: null, leaseExpiresAt: null, leaseVersion: 0 } })
   await testDb!.subAgentTask.create({ data: { id: `stop-filler-${suffix}`, sessionId, turnId: fillTurnId,
     role: "application_filler", taskType: "application_fill_for_review", status: "completed", goal: "Synthetic completed filler",
     constraints: [], successCriteria: [], allowedActions: [], context: {}, expectedOutputSchema: {},
@@ -201,6 +201,12 @@ async function seedAttempt(label: string): Promise<Attempt> {
     return approval ? { kind: "authorized", artifactHash: approval.scope.resourceHash } : { kind: "fenced" }
   })
   if (claim.kind !== "reserved") throw new Error("Synthetic submit reservation did not succeed")
+  const completedTurn = await testDb!.agentTurn.updateMany({
+    where: { id: fillTurnId, sessionId, userId, status: "waiting_for_approval", revision: issued.approval.scope.revision + 1,
+      leaseOwnerId: null, leaseStartedAt: null, leaseExpiresAt: null, leaseVersion: 0 },
+    data: { status: "completed", revision: { increment: 1 }, completedAt: new Date() },
+  })
+  if (completedTurn.count !== 1) throw new Error("Synthetic approved Fill Turn did not complete at its exact wait revision")
   await testDb!.applicationTaskEvent.create({ data: { id: `queued-${suffix}`, taskId: applicationTaskId,
     type: "submission_queued", actor: "user", body: "Synthetic approved submit attempt queued.",
     data: { applicationTaskId, userId, jobId, sessionId, fillTurnId, approvalId, receiptId: approvalId,
