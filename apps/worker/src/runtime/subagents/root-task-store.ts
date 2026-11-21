@@ -178,9 +178,9 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
       const now = input.now ?? new Date()
       const next = rootTaskStatusFromTurnResult(input.result)
       const discoveryShortlist = parseRootTaskFinishMetadata(input.metadata, input.result.status)
-      // A user wait transitions the Turn before this root settlement runs.
-      // Keep every other result fenced to the active in-progress state.
-      const waitState = input.result.status === "waiting_for_user"
+      // A wait result can follow its Turn status transition; all other results need in-progress.
+      const waitState = input.result.status === "waiting_for_user" || input.result.status === "waiting_for_approval"
+      const expectedWaitStatus = input.result.status === "waiting_for_approval" ? "waiting_for_approval" : "waiting_for_user"
       const result = JSON.stringify({ status: input.result.status, stepCount: input.result.stepCount, toolCallCount: input.result.toolCallCount, finalItemId: input.result.finalItemId ?? null, waitId: input.result.waitId ?? null,
         ...(discoveryShortlist ? { structuredResult: { interactiveDiscoveryShortlist: discoveryShortlist } } : {}) })
       await transaction(pool, input.lease.userId, async (client) => {
@@ -188,7 +188,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
         const ownedTurn = await client.query(
            `SELECT "id", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
              AND "leaseOwnerId" = $4 AND "leaseVersion" = $5 AND "rootTaskId" = $6 AND "leaseExpiresAt" > CURRENT_TIMESTAMP
-             AND ${waitState ? `"status" IN ('in_progress', 'waiting_for_user')` : `"status" = 'in_progress'`} FOR UPDATE`,
+             AND ${waitState ? `"status" IN ('in_progress', '${expectedWaitStatus}')` : `"status" = 'in_progress'`} FOR UPDATE`,
            [input.lease.turnId, input.lease.sessionId, input.lease.userId, input.lease.ownerId, input.lease.leaseVersion, input.rootTaskId],
         )
         if (!ownedTurn.rows[0]) {

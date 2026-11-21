@@ -31,7 +31,7 @@ function row(overrides: Record<string, unknown> = {}) {
   }
 }
 
-function fakePool(existing: Record<string, unknown> | null = null, updateCount = 1, sessionStatus = "running", sessionUserId = "user-1", turnRootTaskId: string | null = "root-turn-1") {
+function fakePool(existing: Record<string, unknown> | null = null, updateCount = 1, sessionStatus = "running", sessionUserId = "user-1", turnRootTaskId: string | null = "root-turn-1", turnStatus = "in_progress") {
   const calls: string[] = []
   let rootStatus = String(existing?.status ?? row().status)
   const client = {
@@ -43,7 +43,7 @@ function fakePool(existing: Record<string, unknown> | null = null, updateCount =
         ? { rows: [{ id: "turn-1", sessionId: "session-1", userId: "user-1", rootTaskId: turnRootTaskId, status: "in_progress", leaseOwnerId: "worker-1", leaseVersion: 3 }], rowCount: 1 }
         : { rows: [], rowCount: 0 }
       if (sql.includes('SELECT "rootTaskId" FROM "agent_turns"')) return { rows: [{ rootTaskId: existing?.id ? "root-turn-1" : null }], rowCount: 1 }
-      if (sql.includes('SELECT "id", "rootTaskId" FROM "agent_turns"')) return turnRootTaskId === values?.[5]
+      if (sql.includes('SELECT "id", "rootTaskId" FROM "agent_turns"')) return turnRootTaskId === values?.[5] && (turnStatus === "in_progress" || sql.includes(`'${turnStatus}'`))
         ? { rows: [{ id: "turn-1", rootTaskId: turnRootTaskId }], rowCount: 1 }
         : { rows: [], rowCount: 0 }
       if (sql.includes("INSERT INTO \"sub_agent_tasks\"")) return { rows: [], rowCount: 1 }
@@ -553,6 +553,28 @@ describe("createPgRootTaskStore", () => {
     expect(taskUpdate).toContain("THEN $4::timestamp(3) ELSE NULL::timestamp(3) END")
     expect(taskUpdate).toContain('"updatedAt" = $4::timestamp(3)')
     expect(fake.client.query.mock.calls.some(([, values]) => String(values?.[1]).includes('"waitId":"wait-1"'))).toBe(true)
+  })
+
+  it("finishes the root while the exact approval wait owns the Turn lease", async () => {
+    const fake = fakePool(null, 1, "running", "user-1", "root-turn-1", "waiting_for_approval")
+    const result = { status: "waiting_for_approval" as const, stepCount: 2, toolCallCount: 1, waitId: "approval-1" }
+
+    await createPgRootTaskStore(fake.pool).finish({ lease, rootTaskId: "root-turn-1", result })
+
+    const ownerQuery = fake.client.query.mock.calls.find(([sql]) => sql.includes('SELECT "id", "rootTaskId" FROM "agent_turns"'))?.[0] ?? ""
+    const rootUpdate = fake.client.query.mock.calls.find(([sql]) => sql.includes('UPDATE "sub_agent_tasks" SET'))
+    expect(ownerQuery).toContain("'waiting_for_approval'")
+    expect(rootUpdate?.[1]?.[0]).toBe("waiting_for_user")
+    expect(JSON.parse(String(rootUpdate?.[1]?.[1]))).toMatchObject({ status: "waiting_for_approval", waitId: "approval-1" })
+  })
+
+  it("rejects a differently named wait state under the same Turn lease", async () => {
+    const fake = fakePool(null, 1, "running", "user-1", "root-turn-1", "waiting_for_approval")
+
+    await expect(createPgRootTaskStore(fake.pool).finish({
+      lease, rootTaskId: "root-turn-1", result: { status: "waiting_for_user", stepCount: 1, toolCallCount: 0, waitId: "question-1" },
+    })).rejects.toThrow("root_turn_fenced")
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.includes('UPDATE "sub_agent_tasks" SET'))).toBe(false)
   })
 
   it.each([
