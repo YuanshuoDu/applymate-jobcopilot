@@ -9,6 +9,7 @@ import { useI18n } from '@/lib/i18n'
 import { budgetViewState } from './agent-workspace-projection'
 import { SessionStatusCards } from './SessionStatusCards'
 import { SubmissionRecoveryControl } from './SubmissionRecoveryControl'
+import { SubmissionStopControl } from './SubmissionStopControl'
 import { focusQuestionOptions } from './session-focus-parts'
 
 interface DetailResponse { session: AgentSessionDetail }
@@ -40,7 +41,7 @@ export function SessionFocusPanel({ sessionId, onAttentionChange }: { sessionId:
 }
 function SessionFocusPanelInner({ sessionId, onAttentionChange }: { sessionId: string; onAttentionChange?: AttentionCallback }) {
   const { t } = useI18n()
-  const { data, loading, error, refetch } = useApi<DetailResponse>(`/api/agent/sessions/${sessionId}`)
+  const { data, loading, error, refetch } = useApi<DetailResponse>(`/api/agent/sessions/${sessionId}`, { cache: false })
   const session = data?.session
   const approvals = session?.approvals ?? []
   const applicationTasks = session?.applicationTasks ?? []
@@ -139,8 +140,11 @@ function SessionFocusPanelInner({ sessionId, onAttentionChange }: { sessionId: s
                 : <div key={`unmapped:${task.id}:${waitId ?? ''}:${field.label}`} style={rowMetaStyle}>{field.label}</div>)}
               {fields.some(field => field.key !== null) && waitId && <button onClick={() => { void answerAndResume(task.id, waitId, fields) }} style={resumeButtonStyle}>{t('agent.confirmAnswersResume')}</button>}
             </div>
+            <SubmissionStopControl sessionId={sessionId} applicationTaskId={task.id}
+              eligible={task.status === 'filling' && task.checkpoint === 'submission_request_started'}
+              target={task.submissionStopTarget} onRefresh={refetch} />
             {retryableFill && !retryReadinessLoading && retryReadiness?.tasks.some(row => row.id === task.id && row.cancelledFillRetryReady) && <RetryApplicationFillButton sessionId={sessionId} taskId={task.id} />}
-            {!['submitted', 'skipped', 'cancelled'].includes(task.status) && (
+            {task.checkpoint !== 'submission_request_started' && !['submitted', 'skipped', 'cancelled'].includes(task.status) && (
               <button onClick={() => { void cancelApplicationTask(task.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>{t('agent.cancel')}</button>
             )}
           </div>
