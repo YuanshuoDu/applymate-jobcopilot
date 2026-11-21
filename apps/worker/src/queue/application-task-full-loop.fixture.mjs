@@ -222,12 +222,13 @@ async function startWorker() {
   const noOpProjection = { start: async () => undefined, finish: async () => undefined }
   const [{ createCanonicalTurnRuntime }, { createOptionalProductionChildExecutor }, { startProductionAgentRuntime },
     { startProductionWorkerRuntime }, { resolveProductionAgentFlags }, taskGraphCommandPortModule,
-    taskGraphTemplatesModule, queue, outbox, reviewedFillOutbox, { withCloakContext, closeAllSlots }, redis] = await Promise.all([
+    taskGraphTemplatesModule, queue, outbox, reviewedFillOutbox, { withCloakContext, closeAllSlots }, redis,
+    { startAgentWakeupConsumer }] = await Promise.all([
     import("../runtime/canonical-turn-runtime.ts"), import("../runtime/subagents/production-child-runtime.ts"),
     import("./production-bootstrap.ts"), import("./production-worker-runtime.ts"), import("../runtime/production-agent-flags.ts"),
     import("../runtime/subagents/pg-task-graph-command-port.ts"), import("../runtime/subagents/task-graph-templates.ts"),
     import("./apply-queue.ts"), import("./application-submit-outbox.ts"), import("./reviewed-fill-handoff-outbox.ts"),
-    import("../cloak/pool.js"), import("../redis.ts"),
+    import("../cloak/pool.js"), import("../redis.ts"), import("../runtime/wakeup/consumer.ts"),
   ])
   const flags = { ...resolveProductionAgentFlags(), taskGraphPlanningEnabled: true, childExecutionEnabled: true,
     coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false }
@@ -386,7 +387,9 @@ async function startWorker() {
   subagents?.on("error", error => say(`SUBAGENT_WORKER_ERROR ${error.message}`))
   subagents?.on("stalled", jobId => say(`SUBAGENT_JOB_STALLED ${jobId}`))
   if (!turns || !subagents) throw new Error("canonical_turn_or_subagent_consumer_missing")
-  void queue.applyWorker.run().catch(() => say("APPLY_WORKER_RUN_FAILED")); say("CANONICAL_TURN_AND_SUBAGENT_CONSUMERS_READY")
+  void queue.applyWorker.run().catch(() => say("APPLY_WORKER_RUN_FAILED"))
+  say("CANONICAL_TURN_AND_SUBAGENT_CONSUMERS_READY")
+  const wakeupConsumer = startAgentWakeupConsumer(pool)
   say("WORKER_READY")
   process.stdin.setEncoding("utf8")
   let buffer = ""
@@ -396,6 +399,7 @@ async function startWorker() {
     buffer = lines.pop() ?? ""
     if (lines.some(line => line.trim() === "shutdown")) { process.stdin.pause(); resolve() }
   }))
+  await wakeupConsumer.close()
   await publisher.close()
   await bootstrap?.close()
   await queue.applyWorker.close()
