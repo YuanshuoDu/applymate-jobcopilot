@@ -4,12 +4,12 @@ import {
   inspectApplicationSubmissionStopState,
   recordApplicationSubmissionStopStage,
 } from "../../db/application-submission-stop-state.js"
-import { readSubmissionTurnState, withReviewedApplicationSubmitRequestFence } from "../../db/reviewed-application-submit-request-fence.js"
+import { readSubmissionTurnStopState, withReviewedApplicationSubmitRequestFence } from "../../db/reviewed-application-submit-request-fence.js"
 import type { ApplicationSubmissionStartFence } from "./application-submission-probe.js"
 import { appendFencedSubmitAudit } from "../../queue/application-submit-fence.js"
 
 type OpenTransaction = { readonly client: PoolClient; open: boolean; released: boolean }
-type StopTurnState = Awaited<ReturnType<typeof readSubmissionTurnState>>
+type StopTurnState = Awaited<ReturnType<typeof readSubmissionTurnStopState>>
 
 let protocolFenceQueue: Promise<void> = Promise.resolve()
 
@@ -69,8 +69,18 @@ function declined(state: "stopped" | "inactive" | "uncertain", releasePermit: ()
 }
 
 function mayContinueTurn(state: StopTurnState): boolean {
-  return state.interrupted === false && ["running", "completed"].includes(state.sessionStatus ?? "")
-    && ["in_progress", "completed"].includes(state.turnStatus ?? "")
+  const version = state.leaseVersion
+  if (state.interruptionEvidence !== false || typeof version !== "number" || !Number.isSafeInteger(version) || version < 0
+    || !["running", "completed"].includes(state.sessionStatus ?? "")) return false
+  if (state.turnStatus === "completed") {
+    return state.leaseOwnerId === null && state.leaseStartedAt === null && state.leaseExpiresAt === null
+  }
+  const started = state.leaseStartedAt instanceof Date ? state.leaseStartedAt.getTime() : Number.NaN
+  const expires = state.leaseExpiresAt instanceof Date ? state.leaseExpiresAt.getTime() : Number.NaN
+  const now = Date.now()
+  return state.turnStatus === "in_progress" && state.sessionStatus === "running"
+    && typeof state.leaseOwnerId === "string" && state.leaseOwnerId.length > 0 && state.leaseOwnerId.trim() === state.leaseOwnerId
+    && version > 0 && Number.isFinite(started) && Number.isFinite(expires) && started <= now && expires > now
 }
 
 /** Test composition only until the owning Web Stop action and coordinated rollout exist. */
@@ -88,7 +98,7 @@ export async function acquireApplicationSubmissionStartFenceWithStopProtocol(
   try {
     marker = await openTransaction(pool, scope.userId)
     const arm = await withReviewedApplicationSubmitRequestFence(marker.client, scope, "marker", undefined, async () => {
-      const state = await readSubmissionTurnState(marker!.client, scope)
+      const state = await readSubmissionTurnStopState(marker!.client, scope)
       if (!mayContinueTurn(state)) return hasExplicitStopSignal(state) ? "stopped" as const : "inactive" as const
       if (await markSubmissionRequestStarted(marker!.client, scope) !== "started") return "inactive" as const
       const recorded = await recordApplicationSubmissionStopStage(pool, marker!.client, scope, "armed")
@@ -110,7 +120,7 @@ export async function acquireApplicationSubmissionStartFenceWithStopProtocol(
 
     grant = await openTransaction(pool, scope.userId)
     const grantAttempt = await withReviewedApplicationSubmitRequestFence(grant.client, scope, "boundary", sourceTurnId, async () => {
-      const state = await readSubmissionTurnState(grant!.client, scope)
+      const state = await readSubmissionTurnStopState(grant!.client, scope)
       if (!mayContinueTurn(state)) return hasExplicitStopSignal(state) ? "stopped" as const : "uncertain" as const
       const recorded = await recordApplicationSubmissionStopStage(pool, grant!.client, scope, "dispatch_granted")
       return recorded === "recorded" ? "granted" as const : recorded === "stopped" ? "stopped" as const : "uncertain" as const
@@ -128,7 +138,7 @@ export async function acquireApplicationSubmissionStartFenceWithStopProtocol(
 
     boundary = await openTransaction(pool, scope.userId)
     const finalFence = await withReviewedApplicationSubmitRequestFence(boundary.client, scope, "boundary", sourceTurnId, async () => {
-      const state = await readSubmissionTurnState(boundary!.client, scope)
+      const state = await readSubmissionTurnStopState(boundary!.client, scope)
       if (await inspectApplicationSubmissionStopState(pool, boundary!.client, scope) !== "granted") return "uncertain" as const
       return mayContinueTurn(state) ? "ready" as const : "uncertain" as const
     })
@@ -176,7 +186,7 @@ export async function isApplicationSubmissionStoppedWithStopProtocol(
       : task.rows[0]?.checkpoint === "submission_request_started" ? "boundary" : null
     if (!phase) throw new Error("Application submission request phase is unavailable.")
     const fenced = await withReviewedApplicationSubmitRequestFence(tx.client, scope, phase, undefined, async () => {
-      const state = await readSubmissionTurnState(tx.client, scope)
+      const state = await readSubmissionTurnStopState(tx.client, scope)
       if (phase === "marker") {
         if (hasExplicitStopSignal(state)) return true
         if (!mayContinueTurn(state)) throw new Error("Application submission Turn state is unavailable.")
@@ -201,6 +211,6 @@ export async function isApplicationSubmissionStoppedWithStopProtocol(
 }
 
 function hasExplicitStopSignal(state: StopTurnState): boolean {
-  return state.interrupted === true || ["aborted", "archived", "closed", "failed", "cancelled"].includes(state.sessionStatus ?? "")
+  return state.interruptionEvidence === true || ["aborted", "archived", "closed", "failed", "cancelled"].includes(state.sessionStatus ?? "")
     || ["interrupted", "failed", "cancelled"].includes(state.turnStatus ?? "")
 }

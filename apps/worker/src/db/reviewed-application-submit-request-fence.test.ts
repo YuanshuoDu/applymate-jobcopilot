@@ -13,7 +13,7 @@ vi.mock("./reviewed-application-submit-material.js", () => ({
   readReviewedApplicationSubmitMaterial: mocks.readReviewedApplicationSubmitMaterial,
 }))
 
-import { withReviewedApplicationSubmitRequestFence } from "./reviewed-application-submit-request-fence.js"
+import { readSubmissionTurnState, readSubmissionTurnStopState, withReviewedApplicationSubmitRequestFence } from "./reviewed-application-submit-request-fence.js"
 
 const scope = {
   userId: "user_1", sessionId: "session_1", turnId: "turn_1", fillTurnId: "turn_1", applicationTaskId: "task_1",
@@ -76,6 +76,39 @@ function resetMocks() {
 }
 
 describe("reviewed application submit request source fence", () => {
+  it("reads lease and interruption evidence for the protocol without widening the legacy reader", async () => {
+    const calls: Array<{ sql: string; values?: unknown[] }> = []
+    const query = vi.fn(async (sql: string, values?: unknown[]) => {
+      calls.push({ sql, values })
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ status: "running" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_turns"')) return { rows: [{
+        status: "in_progress", leaseOwnerId: "worker-1", leaseStartedAt: new Date("2026-11-21T10:00:00Z"),
+        leaseExpiresAt: new Date("2026-11-21T10:05:00Z"), leaseVersion: 4,
+      }], rowCount: 1 }
+      if (sql.includes('FROM "agent_events"')) return { rows: [{ stopped: true }], rowCount: 1 }
+      throw new Error(`Unexpected query: ${sql}`)
+    })
+    const client = { query } as never
+
+    await expect(readSubmissionTurnStopState(client, scope)).resolves.toEqual({
+      sessionStatus: "running", turnStatus: "in_progress", leaseOwnerId: "worker-1",
+      leaseStartedAt: new Date("2026-11-21T10:00:00Z"), leaseExpiresAt: new Date("2026-11-21T10:05:00Z"),
+      leaseVersion: 4, interruptionEvidence: true,
+    })
+    expect(calls[1]?.sql).toContain('"leaseOwnerId", "leaseStartedAt", "leaseExpiresAt", "leaseVersion"')
+    expect(calls[1]?.values).toEqual([scope.turnId, scope.sessionId, scope.userId])
+    expect(calls[2]?.sql).toContain("'turn.interrupt.requested', 'turn.interrupted', 'turn.failed'")
+
+    calls.length = 0
+    await expect(readSubmissionTurnState(client, scope)).resolves.toEqual({
+      sessionStatus: "running", turnStatus: "in_progress", interrupted: true,
+    })
+    const legacyEventQuery = calls.find(call => call.sql.includes('FROM "agent_events"'))?.sql ?? ""
+    expect(legacyEventQuery).toContain('"type" = \'turn.interrupted\'')
+    expect(legacyEventQuery).not.toContain("turn.interrupt.requested")
+    expect(legacyEventQuery).not.toContain("turn.failed")
+  })
+
   it("locks source material before exact attempt rows and validates the consumed receipt and live reviewed proof", async () => {
     resetMocks()
     const { client, calls } = fixture()

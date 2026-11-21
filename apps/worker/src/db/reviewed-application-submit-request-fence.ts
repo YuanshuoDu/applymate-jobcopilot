@@ -62,6 +62,36 @@ export async function readSubmissionTurnState(client: PoolClient, scope: Applica
   return { sessionStatus: session.rows[0]?.status, turnStatus: turn.rows[0]?.status, interrupted: interrupted.rows[0]?.stopped }
 }
 
+export async function readSubmissionTurnStopState(client: PoolClient, scope: ApplicationSubmissionStartScope): Promise<{
+  readonly sessionStatus: string | undefined
+  readonly turnStatus: string | undefined
+  readonly leaseOwnerId: string | null | undefined
+  readonly leaseStartedAt: Date | null | undefined
+  readonly leaseExpiresAt: Date | null | undefined
+  readonly leaseVersion: number | undefined
+  readonly interruptionEvidence: boolean | undefined
+}> {
+  const session = await client.query<{ status: string }>(
+    `SELECT "status" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2`, [scope.sessionId, scope.userId],
+  )
+  const turn = await client.query<{
+    status: string; leaseOwnerId: string | null; leaseStartedAt: Date | null; leaseExpiresAt: Date | null; leaseVersion: number
+  }>(`SELECT "status", "leaseOwnerId", "leaseStartedAt", "leaseExpiresAt", "leaseVersion"
+    FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+  [scope.turnId, scope.sessionId, scope.userId])
+  const interruptions = await client.query<{ stopped: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+      AND "type" IN ('turn.interrupt.requested', 'turn.interrupted', 'turn.failed')) AS "stopped"`,
+    [scope.sessionId, scope.turnId],
+  )
+  const row = turn.rows[0]
+  return {
+    sessionStatus: session.rows[0]?.status, turnStatus: row?.status, leaseOwnerId: row?.leaseOwnerId,
+    leaseStartedAt: row?.leaseStartedAt, leaseExpiresAt: row?.leaseExpiresAt, leaseVersion: row?.leaseVersion,
+    interruptionEvidence: interruptions.rows[0]?.stopped,
+  }
+}
+
 async function readSource(client: PoolClient, scope: ApplicationSubmissionStartScope): Promise<ReviewedApplicationFillSourceSelection> {
   const result = await client.query<{ input: unknown }>(
     `SELECT "input" FROM "agent_turns" WHERE "id"=$1 AND "sessionId"=$2 AND "userId"=$3 LIMIT 2`,
