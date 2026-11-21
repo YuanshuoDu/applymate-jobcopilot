@@ -744,7 +744,8 @@ describe("agent session actions API", () => {
     expect(turnStatus).toBe("interrupted")
     expect(applicationTaskStatus).toBe("cancelled")
     expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith({
-      where: { id: "task_1", userId: "user_1", status: "waiting_for_authorization" },
+      where: { id: "task_1", userId: "user_1", jobId: "job_1", sessionId: "session_1", fillTurnId: "turn_1",
+        status: "waiting_for_authorization", checkpoint: "form_filled" },
       data: {
         status: "waiting_for_authorization",
         checkpoint: "queue_retry",

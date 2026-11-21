@@ -6,7 +6,7 @@ import {
 } from "@jobcopilot/shared"
 import { describe, expect, it, vi } from "vitest"
 import { hashArtifactContent } from "../artifacts/hash"
-import { resolveReviewedSubmitMaterial } from "./reviewed-submit-material"
+import { lockReviewedSubmitSourceScope, resolveReviewedSubmitMaterial, sameReviewedSubmitMaterialSnapshot } from "./reviewed-submit-material"
 
 const input = { userId: "user-1", sessionId: "session-1", applicationTaskId: "application-1", jobId: "job-1",
   fillTurnId: "fill-turn-1", approvalId: "approval-1", receiptNonce: "a".repeat(64) }
@@ -77,6 +77,30 @@ async function fixture(reviewed = false) {
 }
 
 describe("resolveReviewedSubmitMaterial", () => {
+  it("locks the exact owner scope in Session, Turn, Task, Job, approval order", async () => {
+    const responses: unknown[][] = [[{ transaction_id: "41" }], [{ transaction_id: "41" }],
+      [{ id: input.sessionId }], [{ id: input.fillTurnId }], [{ id: input.applicationTaskId }], [{ id: input.jobId }], [{ id: input.approvalId }]]
+    const queryRaw = vi.fn(async (_query: unknown) => responses.shift() ?? [])
+    await expect(lockReviewedSubmitSourceScope({ $queryRaw: queryRaw } as never, input)).resolves.toBe(true)
+    const statements = queryRaw.mock.calls.slice(2).map(([query]) => query as { sql: string; values: unknown[] })
+    expect(statements.map(query => query.sql)).toEqual(expect.arrayContaining([
+      expect.stringContaining('FROM "agent_sessions"'), expect.stringContaining('FROM "agent_turns"'),
+      expect.stringContaining('FROM "application_tasks"'), expect.stringContaining('FROM "Job"'), expect.stringContaining('FROM "agent_approvals"'),
+    ]))
+    expect(statements.map(query => query.values)).toEqual([
+      [input.sessionId, input.userId], [input.fillTurnId, input.sessionId, input.userId],
+      [input.applicationTaskId, input.userId, input.sessionId, input.fillTurnId, input.jobId], [input.jobId, input.userId],
+      [input.approvalId, input.userId, input.sessionId, input.applicationTaskId, input.fillTurnId, input.jobId],
+    ])
+  })
+
+  it("does not treat a changed proof mode or signed hash as the same material snapshot", () => {
+    expect(sameReviewedSubmitMaterialSnapshot({ mode: "legacy" }, { mode: "reviewed", ready: true,
+      resourceHash: "r", materialHash: "m", answersHash: "a" })).toBe(false)
+    expect(sameReviewedSubmitMaterialSnapshot({ mode: "reviewed", ready: true, resourceHash: "r", materialHash: "m", answersHash: "a" },
+      { mode: "reviewed", ready: true, resourceHash: "r", materialHash: "changed", answersHash: "a" })).toBe(false)
+  })
+
   it("preserves the legacy v1 path when no exact current-turn v2 event exists", async () => {
     const state = await fixture()
     state.fake.applicationTaskEvent.findMany.mockImplementationOnce(async query => [{ id: "old-event", taskId: input.applicationTaskId,
@@ -98,8 +122,7 @@ describe("resolveReviewedSubmitMaterial", () => {
     state.fake.agentArtifact.findMany.mockResolvedValueOnce([{ ...state.artifact, version: 2 }])
     await expect(resolveReviewedSubmitMaterial(state.fake as never, input)).resolves.toEqual({ mode: "legacy" })
     expect(state.fake.agentArtifact.findMany).toHaveBeenCalledWith({
-      where: { id: `application:${input.applicationTaskId}`, userId: input.userId, jobId: input.jobId,
-        artifactType: "application", lifecycle: "base" }, take: 2, select: { content: true },
+      where: { id: `application:${input.applicationTaskId}`, userId: input.userId, jobId: input.jobId }, take: 2, select: { content: true },
     })
     expect(state.fake.agentApproval.findMany).not.toHaveBeenCalled()
   })
@@ -147,9 +170,10 @@ describe("resolveReviewedSubmitMaterial", () => {
     state.fake.agentTurn.findMany.mockResolvedValueOnce([{ id: input.fillTurnId, userId: input.userId,
       sessionId: input.sessionId, source: "user", status: "waiting_for_approval", rootTaskId: fillRootTaskId, input: { goal: "legacy" } }])
     state.fake.applicationTaskEvent.findMany.mockResolvedValueOnce([])
+    state.fake.agentArtifact.findMany.mockResolvedValueOnce([{ ...state.artifact, artifactType: "other", lifecycle: "draft" }])
     await expect(resolveReviewedSubmitMaterial(state.fake as never, input)).resolves.toEqual({ mode: "unavailable" })
     expect(state.fake.agentArtifact.findMany).toHaveBeenCalledWith({ where: { id: `application:${input.applicationTaskId}`,
-      userId: input.userId, jobId: input.jobId, artifactType: "application", lifecycle: "base" }, take: 2, select: { content: true } })
+      userId: input.userId, jobId: input.jobId }, take: 2, select: { content: true } })
     expect(state.fake.agentApproval.findMany).not.toHaveBeenCalled()
   })
 
