@@ -1,8 +1,16 @@
 import { describe, expect, it } from "vitest"
 import { ROLE_RESULT_SCHEMA, type ArtifactVersionReference } from "./role-results.js"
 import { reduceTaskGraphFinalSummary } from "./task-graph-final-summary.js"
-import type { TaskGraphFinalSummaryBinding, TaskGraphFinalSummaryMember } from "./task-graph-final-summary-binding.js"
-import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
+import {
+  buildTaskGraphFinalSummaryBinding,
+  readResolvedRepairTaskIds,
+  type TaskGraphFinalSummaryBinding,
+  type TaskGraphFinalSummaryMember,
+  type TaskGraphRetiredScoutProof,
+} from "./task-graph-final-summary-binding.js"
+import { reduceTaskGraphFollowUpSuggestions } from "./task-graph-follow-up-suggestions.js"
+import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { validateTaskGraphFollowUpBinding } from "./task-graph-follow-up-validation.js"
 
 const hash = (value: string) => `sha256:${value.repeat(64)}`
@@ -16,6 +24,65 @@ function preparedBinding(materialRef: ArtifactVersionReference): TaskGraphFinalS
   const members: TaskGraphFinalSummaryMember[] = [{ nodeIndex: 0, nodeKey: "prepare-node", templateId: "prepare", taskId: "prepare-task-1",
     role: "prepare", taskType: "prepare_task", taskStatus: "completed", kind: "business" }]
   return { rootTaskId: "root-task-1", graphItemId: "graph-item-1", graphRevision: 3, members, summary }
+}
+
+const retiredScoutResult = {
+  schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+  candidates: [{ jobId: "retired-job", source: "fixture", url: null, evidenceIds: ["retired-evidence"] }],
+  evidence: [{ id: "retired-evidence", kind: "job", ref: "retired-job", source: "fixture" }],
+  summary: "PRIVATE_RETIRED_SCOUT_PROSE",
+}
+const failedAnalystResult = {
+  schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+  findings: [{ jobId: "current-job", score: 8, evidenceIds: ["current-evidence"] }],
+  evidence: [{ id: "current-evidence", kind: "job", ref: "current-job", source: "fixture" }],
+  summary: "PRIVATE_FAILED_ANALYST_PROSE",
+}
+const retirement: TaskGraphRetiredScoutProof = {
+  nodeKey: "node-retired", taskId: "task-retired", attempt: 2, interruptRequestedAt: "2026-11-19T10:00:00.000Z",
+  receiptEventId: "private-retirement-event", lifecycleEventId: "private-interrupted-event",
+}
+
+function mixedRetirementRepairBinding(): TaskGraphFinalSummaryBinding {
+  const retired: GraphTaskRow = {
+    id: "task-retired", role: "scout", taskType: "job_discovery", status: "interrupted",
+    failureReason: "Subagent task subtree was interrupted", result: { structuredResult: retiredScoutResult }, attemptCount: 2,
+  }
+  const failed: GraphTaskRow = {
+    id: "task-failed-analyst", role: "analyst", taskType: "job_analysis", status: "failed",
+    failureReason: "task_graph_verification_failed", result: { structuredResult: failedAnalystResult },
+  }
+  const loaded = {
+    rootTaskId: "root-task",
+    item: { id: "task-graph:root-task", revision: 3, content: {}, createdAt: new Date(0) },
+    snapshot: { nodes: [
+      { taskId: retired.id, key: retirement.nodeKey, templateId: "scout" },
+      { taskId: failed.id, key: "node-failed", templateId: "analyst" },
+    ] } as unknown as TaskGraphSnapshot,
+    state: { revision: 3 } as LoadedGraph["state"],
+    tasks: new Map([[retired.id, retired], [failed.id, failed]]),
+  } as LoadedGraph
+  return buildTaskGraphFinalSummaryBinding(loaded, undefined, new Set([failed.id]), new Map([[retirement.nodeKey, retirement]]))!
+}
+
+function followUpBinding(binding: TaskGraphFinalSummaryBinding) {
+  return {
+    rootTaskId: binding.rootTaskId,
+    graphItemId: binding.graphItemId,
+    graphRevision: binding.graphRevision,
+    members: binding.members,
+    summary: binding.summary,
+  }
+}
+
+function mutateRetired(
+  binding: TaskGraphFinalSummaryBinding,
+  update: (member: Extract<TaskGraphFinalSummaryMember, { kind: "retired" }>) => unknown,
+): unknown {
+  return {
+    ...followUpBinding(binding),
+    members: binding.members?.map(member => member.kind === "retired" ? update(member) : member),
+  }
 }
 
 describe("TaskGraph follow-up binding validation", () => {
@@ -72,5 +139,54 @@ describe("TaskGraph follow-up binding validation", () => {
     expect(validateTaskGraphFollowUpBinding(outerMaterials)).toBeNull()
     expect(validateTaskGraphFollowUpBinding(mismatchedNestedRef)).toBeNull()
     expect(validateTaskGraphFollowUpBinding(missingArtifactSummary)).toBeNull()
+  })
+})
+
+describe("TaskGraph follow-up bindings with retired Scouts", () => {
+  it("keeps resolved repair provenance while retirement remains noncontributing", () => {
+    const binding = mixedRetirementRepairBinding()
+    const facts = validateTaskGraphFollowUpBinding(followUpBinding(binding))
+    const suggestions = reduceTaskGraphFollowUpSuggestions(binding)
+
+    expect(binding.members?.map(member => member.kind)).toEqual(["retired", "business"])
+    expect(readResolvedRepairTaskIds(binding)).toEqual(new Set(["task-failed-analyst"]))
+    expect([...facts?.outcomes.keys() ?? []]).toEqual(["task-failed-analyst"])
+    expect(facts?.summary.taskOutcomes.map(outcome => outcome.taskId)).toEqual(["task-failed-analyst"])
+    expect(suggestions).not.toContainEqual(expect.objectContaining({ kind: "inspect_task_result", taskId: "task-failed-analyst" }))
+    expect(suggestions).toContainEqual({
+      kind: "view_reported_results", taskId: "task-failed-analyst", resultKind: "analysis",
+      jobIds: ["current-job"], artifactRefs: [],
+    })
+    expect(JSON.stringify(facts?.summary)).not.toMatch(/task-retired|retired-job|private-retirement-event/)
+    expect(JSON.stringify(suggestions)).not.toMatch(/task-retired|retired-job|private-retirement-event|private-interrupted-event/)
+  })
+
+  it("rejects malformed retirement members and their private metadata", () => {
+    const binding = mixedRetirementRepairBinding()
+    const malformed = [
+      mutateRetired(binding, member => ({ ...member, leaked: "private" })),
+      mutateRetired(binding, member => ({ ...member, retirement: { ...member.retirement, leaked: "private" } })),
+      mutateRetired(binding, member => ({ ...member, role: "analyst" })),
+      mutateRetired(binding, member => ({ ...member, taskStatus: "completed" })),
+      mutateRetired(binding, member => ({ ...member, retirement: { ...member.retirement, attempt: 0 } })),
+      mutateRetired(binding, member => ({ ...member, retirement: { ...member.retirement, interruptRequestedAt: "2026-11-19" } })),
+      mutateRetired(binding, member => ({ ...member, retirement: { ...member.retirement, receiptEventId: "x".repeat(257) } })),
+    ]
+
+    for (const value of malformed) expect(validateTaskGraphFollowUpBinding(value)).toBeNull()
+  })
+
+  it("rejects retired Scouts inserted into business outcomes", () => {
+    const binding = mixedRetirementRepairBinding(), base = followUpBinding(binding)
+    const retiredOutcome = {
+      taskId: "task-retired", role: "scout" as const, taskStatus: "interrupted" as const, resultState: "not_terminal" as const,
+    }
+
+    expect(validateTaskGraphFollowUpBinding({
+      ...base, summary: { ...base.summary, taskOutcomes: [retiredOutcome] },
+    })).toBeNull()
+    expect(validateTaskGraphFollowUpBinding({
+      ...base, summary: { ...base.summary, taskOutcomes: [...base.summary.taskOutcomes, retiredOutcome] },
+    })).toBeNull()
   })
 })

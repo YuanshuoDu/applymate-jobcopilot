@@ -4,6 +4,8 @@ import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
 import type { StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { validateRoleResult } from "./role-results.js"
 import type { SubagentTaskStatus } from "./types.js"
+import { normalizeResolvedRepairTaskIds } from "./task-graph-final-summary-repair-binding.js"
+export { readResolvedRepairTaskIds } from "./task-graph-final-summary-repair-binding.js"
 
 export const TASK_GRAPH_FINAL_SUMMARY_BINDING: unique symbol = Symbol("task_graph_final_summary_binding")
 
@@ -36,14 +38,22 @@ export type TaskGraphFinalSummaryBinding = Readonly<{
   graphItemId?: string
   graphRevision: number
   members?: readonly TaskGraphFinalSummaryMember[]
+  resolvedRepairTaskIds?: readonly string[]
   summary: TaskGraphFinalSummary
 }>
 
 /** Builds a private freshness binding from one already-loaded, owner-scoped current graph. */
-export function buildTaskGraphFinalSummaryBinding(loaded: LoadedGraph, historicalNodeIndices?: ReadonlySet<number>,
-  retiredScouts?: ReadonlyMap<string, TaskGraphRetiredScoutProof>): TaskGraphFinalSummaryBinding | null {
+export function buildTaskGraphFinalSummaryBinding(
+  loaded: LoadedGraph,
+  historicalNodeIndices?: ReadonlySet<number>,
+  resolvedRepairTaskIdsOrRetiredScouts?: ReadonlySet<string> | ReadonlyMap<string, TaskGraphRetiredScoutProof>,
+  retiredScouts?: ReadonlyMap<string, TaskGraphRetiredScoutProof>,
+): TaskGraphFinalSummaryBinding | null {
+  const thirdArgumentIsRetirementMap = isRetiredScoutMap(resolvedRepairTaskIdsOrRetiredScouts)
+  const resolvedRepairTaskIds = thirdArgumentIsRetirementMap ? undefined : resolvedRepairTaskIdsOrRetiredScouts as ReadonlySet<string> | undefined
+  const retirementSelection = thirdArgumentIsRetirementMap ? resolvedRepairTaskIdsOrRetiredScouts : retiredScouts
   const selectedHistory = selectedIndices(historicalNodeIndices)
-  const selectedRetirements = selectedRetiredScouts(retiredScouts)
+  const selectedRetirements = selectedRetiredScouts(retirementSelection)
   if (!loaded.item) {
     if (selectedHistory.length > 0) throw new Error("task_graph_final_summary_historical_selection_invalid")
     if (selectedRetirements.length > 0) throw new Error("task_graph_final_summary_retired_selection_invalid")
@@ -108,7 +118,9 @@ export function buildTaskGraphFinalSummaryBinding(loaded: LoadedGraph, historica
   })
   const graphRevision = loaded.item.revision
   const summary = reduceTaskGraphFinalSummary({ graphRevision, nodes })
-  return { rootTaskId: loaded.rootTaskId, graphItemId: loaded.item.id, graphRevision, members: boundMembers, summary }
+  const resolved = normalizeResolvedRepairTaskIds(resolvedRepairTaskIds, boundMembers, summary)
+  return { rootTaskId: loaded.rootTaskId, graphItemId: loaded.item.id, graphRevision, members: boundMembers,
+    ...(resolved ? { resolvedRepairTaskIds: resolved } : {}), summary }
 }
 
 /** Compares the exact current graph revision and all deterministic reducer facts. */
@@ -119,6 +131,7 @@ export function sameTaskGraphFinalSummaryBinding(
   try {
     if (!left || !right || left.rootTaskId !== right.rootTaskId || left.graphItemId !== right.graphItemId
       || JSON.stringify(left.members) !== JSON.stringify(right.members) || left.graphRevision !== right.graphRevision
+      || JSON.stringify(left.resolvedRepairTaskIds) !== JSON.stringify(right.resolvedRepairTaskIds)
       || left.summary.graphRevision !== left.graphRevision || right.summary.graphRevision !== right.graphRevision) return false
     return JSON.stringify(left.summary) === JSON.stringify(right.summary)
   }
@@ -127,7 +140,6 @@ export function sameTaskGraphFinalSummaryBinding(
 
 const TASK_STATUSES = new Set<SubagentTaskStatus>(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 function nonEmpty(value: unknown): value is string { return typeof value === "string" && value.trim().length > 0 }
-
 function isNativeVerificationControl(role: string, taskType: string): boolean {
   return role === "auditor" && taskType === "native_verification"
 }
@@ -167,6 +179,10 @@ function selectedRetiredScouts(value?: ReadonlyMap<string, TaskGraphRetiredScout
     }
     return result
   } catch { throw new Error("task_graph_final_summary_retired_selection_invalid") }
+}
+
+function isRetiredScoutMap(value: unknown): value is ReadonlyMap<string, TaskGraphRetiredScoutProof> {
+  return Boolean(value && typeof value === "object" && typeof (value as ReadonlyMap<string, TaskGraphRetiredScoutProof>).get === "function")
 }
 
 function validRetiredScout(proof: TaskGraphRetiredScoutProof, node: Pick<StoredTaskGraphNode, "key" | "templateId">, task: GraphTaskRow): boolean {

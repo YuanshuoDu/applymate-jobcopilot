@@ -38,6 +38,20 @@ describe('agent session URL and active Turn DTO', () => {
     })
   })
 
+  it('accepts only a canonical, owner-selected confirmed/applied scope projection', () => {
+    const turn = { id: 'turn_1', status: 'in_progress', revision: 3 }
+    const locationScope = { confirmed: { locations: ['dublin'], status: 'pending' }, appliedLocations: ['berlin'] }
+    expect(parseAgentTurnsResponse({ turns: [turn], projection: {
+      activeTurnId: 'turn_1', activeTurn: { ...turn, locationScope },
+    } }).activeTurn).toEqual({ ...turn, locationScope })
+    expect(parseAgentTurnsResponse({ projection: {
+      activeTurnId: 'turn_1', activeTurn: { ...turn, locationScope: { confirmed: { locations: ['Dublin'], status: 'adopted' }, appliedLocations: ['Dublin'] } },
+    } }).activeTurn).toEqual(turn)
+    expect(parseAgentTurnsResponse({ turns: [{ ...turn, id: 'turn_2' }], projection: {
+      activeTurnId: 'turn_2', activeTurn: { ...turn, id: 'turn_1', locationScope },
+    } }).activeTurn).toEqual({ id: 'turn_2', status: 'in_progress', revision: 3 })
+  })
+
   it('grants the location capability only from a literal true on the matching projection', () => {
     const active = { id: 'turn_1', status: 'in_progress', revision: 3 }
     expect(parseAgentTurnsResponse({
