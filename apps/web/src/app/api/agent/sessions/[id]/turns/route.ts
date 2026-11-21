@@ -1,11 +1,12 @@
 import { NextRequest } from "next/server"
-import type { Prisma } from "@prisma/client"
+import { Prisma } from "@prisma/client"
 
 import { schemaVersion, TurnIntentSchema, validate } from "@jobcopilot/agent-protocol"
 
 import { db } from "@/lib/db"
 import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { objectiveLocationVerificationEnabled } from "@/lib/agent/control-plane/commands/types"
+import { readActiveTurnLocationScope, type ActiveTurnLocationScopeProjection } from "@/lib/agent/session/active-turn-location-scope"
 
 import {
   afterCursor,
@@ -44,7 +45,7 @@ function hasObjectiveTaskGraphIntent(value: unknown): boolean {
     && "kind" in intent && intent.kind === "objective_task_graph_execution"
 }
 
-function activeTurnProjection(row: ActiveTurnQueryRow | null) {
+function activeTurnProjection(row: ActiveTurnQueryRow | null, locationScope: ActiveTurnLocationScopeProjection | null) {
   if (!row) return null
   const input = row.input && typeof row.input === "object" && !Array.isArray(row.input)
     ? row.input as Record<string, unknown>
@@ -59,6 +60,7 @@ function activeTurnProjection(row: ActiveTurnQueryRow | null) {
     ...(objectiveLocationVerificationEnabled() && row.source === "user" && row.executionMode === "canonical_task_graph"
       && typeof row.rootTaskId === "string" && Boolean(row.rootTaskId.trim()) && hasObjectiveTaskGraphIntent(row.input)
       && (row.status === "in_progress" || row.status === "waiting_for_dependency") ? { canSteerLocation: true as const } : {}),
+    ...(locationScope ? { locationScope } : {}),
   }
 }
 
@@ -72,21 +74,32 @@ export async function GET(request: NextRequest, context: RouteContext) {
   const session = await db.agentSession.findFirst({ where: { id: sessionId, userId: auth.userId }, select: { id: true } })
   if (!session) return sessionNotFound()
 
-  const [rows, activeTurn, queuedInputCount] = await Promise.all([
+  const [rows, activeState, queuedInputCount] = await Promise.all([
     db.agentTurn.findMany({
       where: { sessionId, userId: auth.userId, ...afterCursor(page.cursor) },
       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
       take: page.limit + 1,
       select: TURN_SELECT,
     }),
-    db.agentTurn.findFirst({
-      where: { sessionId, userId: auth.userId, status: { in: [...ACTIVE_STATUSES] } },
-      orderBy: { createdAt: "asc" }, select: ACTIVE_TURN_SELECT,
-    }),
+    db.$transaction(async tx => {
+      const activeTurn = await tx.agentTurn.findFirst({
+        where: { sessionId, userId: auth.userId, status: { in: [...ACTIVE_STATUSES] } },
+        orderBy: { createdAt: "asc" }, select: ACTIVE_TURN_SELECT,
+      })
+      const activeRow = activeTurn as ActiveTurnQueryRow | null
+      const canProjectLocationScope = objectiveLocationVerificationEnabled() && activeRow?.source === "user"
+        && activeRow.executionMode === "canonical_task_graph" && typeof activeRow.rootTaskId === "string"
+        && Boolean(activeRow.rootTaskId.trim()) && hasObjectiveTaskGraphIntent(activeRow.input)
+        && (activeRow.status === "in_progress" || activeRow.status === "waiting_for_dependency")
+      const locationScope = canProjectLocationScope ? await readActiveTurnLocationScope(tx, {
+        userId: auth.userId, sessionId, turnId: activeRow.id, rootTaskId: activeRow.rootTaskId,
+      }) : null
+      return { activeRow, locationScope }
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead }),
     db.agentInput.count({ where: { sessionId, userId: auth.userId, status: "accepted", delivery: "follow_up" } }),
   ])
   const result = pageResult(rows as TurnQueryRow[], page, "turns", sessionId)
-  const activeProjection = activeTurnProjection(activeTurn as ActiveTurnQueryRow | null)
+  const activeProjection = activeTurnProjection(activeState.activeRow, activeState.locationScope)
   return ok({
     schemaVersion,
     turns: result.rows.map(turnDto),

@@ -6,6 +6,7 @@ import type { TurnLease } from "./turns/lease.js"
 import { withRootTaskHistorySessionAuthorization } from "./context/root-task-history-session-memory.js"
 import { withRootTaskHistoryObjectiveSnapshot, withRootTaskHistorySearchFootprintSnapshot } from "./context/root-task-history-objective-snapshot.js"
 import { readRootTaskHistorySteerEvidence } from "./context/root-task-history-steer-evidence.js"
+import { RETRY_SOURCE_STEERING_OBSERVATION_ID, readRetrySourceSteeringObservation } from "./context/retry-source-steering.js"
 import { readRootTaskHistoryFence } from "./context/root-task-history-fence.js"
 import { projectRootTaskHistory, type ValidatedRootTaskHistoryOutcome } from "./context/root-task-history.js"
 import type { DirectRootTaskHistoryLoadInput, DirectRootTaskHistorySearchFootprintLoadInput } from "./context/root-task-history-direct-store.js"
@@ -47,7 +48,8 @@ type RootHistoryTransactionalBuilder = Readonly<{
 
 export function withoutCallerSearchFootprints(snapshot: StepContextSnapshot): StepContextSnapshot {
   return { ...snapshot, toolObservations: snapshot.toolObservations.filter(observation =>
-    observation.id !== ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_OBSERVATION_ID) }
+    observation.id !== ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_OBSERVATION_ID
+      && observation.id !== RETRY_SOURCE_STEERING_OBSERVATION_ID) }
 }
 
 async function replaceBuiltHistory(context: StepContext, snapshot: StepContextSnapshot): Promise<StepContext> {
@@ -69,7 +71,7 @@ async function replaceBuiltHistory(context: StepContext, snapshot: StepContextSn
 export async function buildCanonicalRootTaskHistoryContext(input: Readonly<{
   pool: Pick<pg.Pool, "connect">; scope: TenantScope; lease: TurnLease; rootTaskId: string; rootAttemptCount: number
   reader: DirectRootTaskHistoryReader; base: RootHistoryTransactionalBuilder
-  request: StepContextRequest; snapshot: StepContextSnapshot
+  request: StepContextRequest; snapshot: StepContextSnapshot; turnInput?: unknown
   crossSessionRootTaskHistoryEnabled?: boolean; objectiveHistoryIndexEnabled?: boolean
 }>): Promise<StepContext> {
   const now = input.request.now ?? new Date(), historyRequest: DirectRootTaskHistoryLoadInput = {
@@ -86,8 +88,13 @@ export async function buildCanonicalRootTaskHistoryContext(input: Readonly<{
       const claimTransaction = createPgInputClaimTransaction(transactionClient, input.scope)
       const sameSessionOutcomes = await input.reader.loadWithClient!(transactionClient, historyRequest)
       const cleanSnapshot = withoutCallerSearchFootprints(input.snapshot)
-      const sameSessionSnapshot = appendCanonicalRootTaskHistoryOutcomes({ snapshot: cleanSnapshot,
+      let sameSessionSnapshot = appendCanonicalRootTaskHistoryOutcomes({ snapshot: cleanSnapshot,
         sameSessionOutcomes, crossSessionRootTaskHistoryEnabled: false })
+      const retrySteering = await readRetrySourceSteeringObservation(transactionClient, input.scope, {
+        sessionId: input.request.sessionId, turnId: input.request.turnId, rootTaskId: input.rootTaskId, turnInput: input.turnInput,
+      })
+      if (retrySteering) sameSessionSnapshot = { ...sameSessionSnapshot,
+        toolObservations: [...sameSessionSnapshot.toolObservations, retrySteering] }
       let built = await input.base.buildInTransaction(claimTransaction, { ...input.request, snapshot: sameSessionSnapshot, taskId: input.rootTaskId })
       const steerEvidence = await readRootTaskHistorySteerEvidence(transactionClient, input.scope, {
         sessionId: input.request.sessionId, turnId: input.request.turnId, stepId: input.request.stepId,
