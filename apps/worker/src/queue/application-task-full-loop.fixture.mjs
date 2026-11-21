@@ -75,9 +75,9 @@ async function startSite() {
       response.writeHead(204).end()
       return
     }
-    if (request.method === "GET" && request.url === "/example/reviewed/jobs/1") {
+    if (request.method === "GET" && request.url === "/example-reviewed/jobs/1") {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" })
-      response.end(`<!doctype html><title>Fixture Application</title><form method="post" action="/example/reviewed/jobs/1">
+      response.end(`<!doctype html><title>Fixture Application</title><form method="post" action="/example-reviewed/jobs/1">
         <label for="first_name">First name</label><input id="first_name" name="first_name" required>
         <label for="cover_letter">Cover letter</label><textarea id="cover_letter" name="cover_letter" required></textarea>
         <button id="submit-app" type="submit">Submit application</button></form>
@@ -119,9 +119,9 @@ async function startSite() {
         </script>`)
       return
     }
-    if (request.method === "POST" && ["/example/jobs/1", "/example/reviewed/jobs/1"].includes(request.url)) {
+    if (request.method === "POST" && ["/example/jobs/1", "/example-reviewed/jobs/1"].includes(request.url)) {
       submitCount += 1
-      if (request.url === "/example/reviewed/jobs/1") reviewedSubmitCount += 1
+      if (request.url === "/example-reviewed/jobs/1") reviewedSubmitCount += 1
       held.add(response)
       request.resume()
       say(`SUBMIT_REQUEST ${submitCount}`)

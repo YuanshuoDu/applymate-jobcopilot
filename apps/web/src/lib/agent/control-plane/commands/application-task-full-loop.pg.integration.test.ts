@@ -1175,7 +1175,7 @@ async function createReviewedSourceScenario(label: "positive" | "stale", descrip
   reviewedSessionIds.push(sessionId)
   await testDb.job.create({ data: {
     id: jobId, userId: ids.user, company: "ApplyMate Synthetic Fixture Employer", role: "Software Engineer", location: "Dublin",
-    url: "https://boards.greenhouse.io/example/reviewed/jobs/1", description, keywords: "TypeScript", score: 92,
+    url: "https://boards.greenhouse.io/example-reviewed/jobs/1", description, keywords: "TypeScript", score: 92,
     workflowState: "ready_to_apply", status: "saved",
   } })
   await testDb.agentSession.create({ data: { id: sessionId, userId: ids.user, goal: `Isolated reviewed fill ${label}`, status: "running", source: "application_full_loop_reviewed" } })
@@ -1852,7 +1852,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(fixtureStats.reviewedMaterialExactCount).toBeGreaterThan(0)
     expect(JSON.stringify(fixtureStats)).not.toContain(reviewedCoverLetter)
     expect(fixtureStats.reviewedSubmitCount).toBe(0)
-    expect(fixtureStats.requests).not.toContain("POST /example/reviewed/jobs/1")
+    expect(fixtureStats.requests).not.toContain("POST /example-reviewed/jobs/1")
 
     const submitApprovals = await testDb.agentApproval.findMany({ where: {
       userId: ids.user, sessionId: scenario.sessionId, turnId: fillTurnId, taskId: applicationTaskId!,
@@ -1910,10 +1910,10 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(await testDb.applicationTask.count({ where: { userId: ids.user, sessionId: scenario.sessionId, jobId: scenario.jobId } })).toBe(0)
     expect(await testDb.agentOutbox.count({ where: { aggregateId: scenario.sessionId, topic: "agent.reviewed-fill.dispatch" } })).toBe(0)
     const after = await requestFixtureStats()
-    expect(after.requests.filter(path => path.includes("/example/reviewed/jobs/1"))).toEqual(
-      before.requests.filter(path => path.includes("/example/reviewed/jobs/1")))
+    expect(after.requests.filter(path => path.includes("/example-reviewed/jobs/1"))).toEqual(
+      before.requests.filter(path => path.includes("/example-reviewed/jobs/1")))
     expect(after.reviewedSubmitCount).toBe(0)
-    expect(after.requests).not.toContain("POST /example/reviewed/jobs/1")
+    expect(after.requests).not.toContain("POST /example-reviewed/jobs/1")
   }, 300_000)
 })
 
