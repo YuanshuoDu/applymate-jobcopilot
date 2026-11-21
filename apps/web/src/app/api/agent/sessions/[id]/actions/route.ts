@@ -24,7 +24,6 @@ interface RouteCtx {
 export async function POST(req: NextRequest, ctx: RouteCtx) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
-
   const { id } = await ctx.params
   const session = await db.agentSession.findFirst({ where: { id, userId: auth.userId }, select: { id: true } })
   if (!session) return err("Session not found", 404)
@@ -113,6 +112,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         decision: action.decision === "approved" ? "approved" : "rejected",
         ...(approval.type === "review_application" && action.reviewedSourceTurnId
           ? { reviewedSourceTurnId: action.reviewedSourceTurnId } : {}),
+        ...(approval.type === "review_application" && action.decision === "approved" && action.receiptNonce ? { receiptNonce: action.receiptNonce } : {}),
       }, {
         beforeResolve: action.decision === "approved"
           ? () => validateReceiptForApproval(approval!, action.receiptNonce!, auth.userId, id)

@@ -159,7 +159,7 @@ export async function validateLegacyReceipt(db: PrismaClient, input: LegacyRecei
 
 export async function resolveLegacyApproval(
   db: PrismaClient,
-  input: { approval: ScopedApprovalRecord; userId: string; sessionId: string; decision: "approved" | "rejected"; reviewedSourceTurnId?: string },
+  input: { approval: ScopedApprovalRecord; userId: string; sessionId: string; decision: "approved" | "rejected"; reviewedSourceTurnId?: string; receiptNonce?: string },
   options: { beforeResolve?: () => Promise<void>; beforeLegacyOnlyResolve?: () => Promise<void> } = {},
 ): Promise<LegacyApprovalResolution> {
   const approval = input.approval
@@ -171,17 +171,24 @@ export async function resolveLegacyApproval(
     where: { id: waitItemId("approval", approval.id), sessionId: input.sessionId, turnId: approval.turnId },
     select: { id: true, revision: true },
   }) : null
-  if (!item) {
+  const turn = approval.type === "review_application" || item ? await db.agentTurn.findFirst({
+    where: { id: approval.turnId, sessionId: input.sessionId, userId: input.userId },
+    select: { id: true, revision: true, input: true },
+  }) : null
+  const turnInput = turn?.input
+  const turnIntent = turnInput && typeof turnInput === "object" && !Array.isArray(turnInput)
+    ? (turnInput as Record<string, unknown>).intent : null
+  const markedReviewedApplication = approval.type === "review_application" && (
+    approval.id.startsWith("reviewed-application-review:") || approval.toolCallId?.startsWith("review_application:") === true
+    || Boolean(turnIntent && typeof turnIntent === "object" && !Array.isArray(turnIntent)
+      && (turnIntent as Record<string, unknown>).kind === "reviewed_application_review"))
+  if (!item && !markedReviewedApplication) {
     try {
       return await resolveLegacyOnlyInTransaction(db, input, options)
     } catch (error) {
       if (!(error instanceof CanonicalWaitFoundError)) throw error
     }
   }
-  const turn = await db.agentTurn.findFirst({
-    where: { id: approval.turnId, sessionId: input.sessionId, userId: input.userId },
-    select: { id: true, revision: true },
-  })
   if (!turn) throw new Error("Approval turn is no longer available")
   const result = await decideApproval(db, {
     waitId: approval.id,
@@ -192,6 +199,7 @@ export async function resolveLegacyApproval(
     expectedRevision: turn.revision,
     decision: input.decision,
     ...(input.reviewedSourceTurnId !== undefined ? { reviewedSourceTurnId: input.reviewedSourceTurnId } : {}),
+    ...(markedReviewedApplication && input.decision === "approved" && input.receiptNonce !== undefined ? { receiptNonce: input.receiptNonce } : {}),
   })
   return { disposition: "canonical_wait", decision: input.decision, result }
 }
