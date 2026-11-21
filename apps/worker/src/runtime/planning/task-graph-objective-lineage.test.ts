@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import type { RootTaskVerificationRequirement } from "../context/root-task-objective.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./task-graph-verification.js"
 import type { TaskGraphNodeProposal } from "./task-graph.js"
-import { selectTaskGraphObjectiveRequirementLineage } from "./task-graph-objective-lineage.js"
+import { selectTaskGraphObjectiveRequirementLineage, selectTaskGraphObjectiveRequirementLineages } from "./task-graph-objective-lineage.js"
 
 const requirement: RootTaskVerificationRequirement = { id: "roles", kind: "candidate_count_gte", minimum: 2 }
 const verification = () => ({ schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
@@ -27,6 +27,17 @@ describe("TaskGraph objective requirement lineage selector", () => {
     const retry = node("retry", "task-retry", repair("original", "task-original"))
     expect(selectTaskGraphObjectiveRequirementLineage(requirement, [original, first, retry], "root"))
       .toMatchObject({ status: "selected", node: retry })
+  })
+
+  it("returns one latest member per valid independent lineage", () => {
+    const first = node("first", "task-first")
+    const repaired = node("repaired", "task-repaired", repair("first", "task-first"))
+    const second = node("second", "task-second")
+    expect(selectTaskGraphObjectiveRequirementLineages(requirement, [first, repaired, second], "root"))
+      .toMatchObject({ status: "selected", lineages: [
+        { node: repaired, criterion: repaired.verification.criteria[0] },
+        { node: second, criterion: second.verification.criteria[0] },
+      ] })
   })
 
   it("accepts minimal current-observation nodes and preserves caller state", () => {

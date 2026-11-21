@@ -1,5 +1,5 @@
 import type { RootTaskVerificationRequirement, RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
-import { selectTaskGraphObjectiveRequirementLineage, type TaskGraphObjectiveLineageNode } from "./task-graph-objective-lineage.js"
+import { selectTaskGraphObjectiveRequirementLineage, selectTaskGraphObjectiveRequirementLineages, type TaskGraphObjectiveLineageNode } from "./task-graph-objective-lineage.js"
 import type { TaskGraphTaskTemplate } from "../subagents/task-graph-command-port.js"
 
 export type TaskGraphObjectiveCoverageRejection =
@@ -14,6 +14,7 @@ export type TaskGraphObjectiveCoverageResult =
   | Readonly<{ status: "incomplete"; requirements: readonly TaskGraphObjectiveCoverageRejection[] }>
 
 type CoverageNode = TaskGraphObjectiveLineageNode
+type NumericObjectiveRequirement = Extract<RootTaskVerificationRequirement, { minimum: number }>
 
 function expectedRole(kind: RootTaskVerificationRequirement["kind"]): TaskGraphObjectiveCoverageRejection["role"] {
   return kind === "finding_count_gte" ? "analyst" : "scout"
@@ -41,6 +42,31 @@ function everyScoutCoversLocation(
   })
 }
 
+function analystsCoverFindingCount(
+  requirement: NumericObjectiveRequirement,
+  nodes: readonly CoverageNode[],
+  templates: Readonly<Record<string, TaskGraphTaskTemplate>>,
+  rootTaskId: string,
+): boolean {
+  if (requirement.kind !== "finding_count_gte") return false
+  const selected = selectTaskGraphObjectiveRequirementLineages(requirement, nodes, rootTaskId)
+  if (selected.status !== "selected") return false
+  if (selected.lineages.length === 1) {
+    const { node, criterion } = selected.lineages[0]!
+    return node.verification?.role === "analyst" && templates[node.templateId]?.role === "analyst"
+      && criterion.check.kind === "finding_count_gte" && criterion.check.minimum >= requirement.minimum
+  }
+  let minimum = 0
+  for (const { node, criterion } of selected.lineages) {
+    const check = criterion.check
+    if (node.templateId !== "analyst" || node.verification?.role !== "analyst"
+      || templates[node.templateId]?.role !== "analyst" || check.kind !== "finding_count_gte"
+      || !Number.isSafeInteger(check.minimum) || check.minimum < 1) return false
+    minimum += check.minimum
+  }
+  return minimum >= requirement.minimum
+}
+
 /** Checks a complete post-append graph against requirements resolved from the persisted canonical Turn input.
  * Call only after the scheduler has validated every proposed repair target under its existing transaction locks.
  */
@@ -58,6 +84,8 @@ export function evaluateTaskGraphObjectiveCoverage(
     const role = expectedRole(requirement.kind)
     const covered = requirement.kind === "candidate_location_in"
       ? everyScoutCoversLocation(requirement, nodes, templates)
+      : requirement.kind === "finding_count_gte"
+        ? analystsCoverFindingCount(requirement, nodes, templates, rootTaskId)
       : (() => {
         const selected = selectTaskGraphObjectiveRequirementLineage(requirement, nodes, rootTaskId)
         const check = selected.status === "selected" ? selected.criterion.check : undefined

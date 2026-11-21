@@ -4,7 +4,6 @@ import { OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE } from "@jobcopilot/agent-
 import type { TurnLease } from "./lease.js"
 import { loadTaskGraph, type GraphIdentityScope } from "../subagents/task-graph-pg-state.js"
 import { taskGraphItemId, type StoredTaskGraphNode } from "../subagents/task-graph-snapshot.js"
-import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import { buildTaskGraphDenialCheckpoint, gateReport, repairIds,
   type GateReport, type TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_EVENT_TYPE, STEERING_RECONCILIATION_FEEDBACK,
@@ -16,15 +15,15 @@ import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } f
 import { readTaskGraphConfirmedLocationSteer } from "../subagents/task-graph-confirmed-location-steer.js"
 import { resolveTaskGraphConfirmedLocationCompletion } from "./task-graph-confirmed-location-completion.js"
 import { taskGraphCompletionApplicability } from "./task-graph-completion-applicability.js"
-import { assertCompletionAllowed, TASK_GRAPH_FEEDBACK, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-terminal-decision.js"
+import { assertCompletionAllowed, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-terminal-decision.js"
+import { taskGraphGateFeedbackText, verifyTaskGraphObjectiveFindingAggregation,
+  type TaskGraphGateFeedbackCode as GateFeedbackCode, type TaskGraphGateFeedbackCounts as GateFeedbackCounts,
+  type TaskGraphGateFeedbackDetail as GateFeedbackDetail, type TaskGraphGateRepairState as RepairFeedbackState } from "./task-graph-objective-finding-aggregation.js"
 export { assertCompletionAllowed, TASK_GRAPH_VERIFICATION_BLOCKER }
 
 export function completionRecoverySnapshot(snapshot: StepContextSnapshot, stepId: string, feedback: string): StepContextSnapshot {
   return applyCompletionRecovery(snapshot, stepId, feedback)
 }
-type GateFeedbackCode = "legacy_unverified" | "verification_report" | "repair_receipt" | "repair_criterion" | "result_applicability"
-type RepairFeedbackState = "missing" | "pending" | "terminal" | "unavailable" | "missing_receipt" | "rejected" | "invalid_receipt" | "invalid_report"
-type GateFeedbackDetail = Readonly<{ nodeOrdinal: number; criterionOrdinal?: number; status: "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode; repairState?: RepairFeedbackState }>
 const ACTIVE_REPAIR_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user"])
 const TERMINAL_REPAIR_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
 function repairStatusFeedback(status: string): RepairFeedbackState {
@@ -51,23 +50,6 @@ function reportFeedback(node: StoredTaskGraphNode, report: GateReport, nodes: re
   return details.length ? details : report.reasonCode === "repair_target_unresolved"
     ? [{ nodeOrdinal: nodeIndex + 1, status: "unverified", reasonCode: report.reasonCode, repairState }]
     : []
-}
-function feedbackText(code: GateFeedbackCode | undefined, details: readonly GateFeedbackDetail[]): string {
-  const rendered = details.map(item => {
-    const criterion = item.criterionOrdinal === undefined ? "" : ` criterionOrdinal=${item.criterionOrdinal}`
-    const repair = item.repairState ? ` repair=${item.repairState}` : ""
-    return `nodeOrdinal=${item.nodeOrdinal}${criterion} status=${item.status} reasonCode=${item.reasonCode}${repair}`
-  })
-  const parts = [...(code ? [`issue=${code}`] : []), ...rendered]
-  const render = (included: number) => `${TASK_GRAPH_FEEDBACK}${parts.slice(0, included).map(part => ` ${part}`).join("")}`
-  const complete = render(parts.length)
-  if (complete.length <= 512) return complete
-  for (let included = parts.length - 1; included >= 0; included -= 1) {
-    const omitted = ` (${parts.length - included} feedback items omitted; inspect TaskGraph before retrying.)`
-    const truncated = `${render(included)}${omitted}`
-    if (truncated.length <= 512) return truncated
-  }
-  return `${TASK_GRAPH_FEEDBACK} (${parts.length} feedback items omitted; inspect TaskGraph before retrying.)`
 }
 function row(value: unknown): Record<string, unknown> {
   let parsed = value
@@ -106,8 +88,8 @@ async function readPersistedTurnInput(client: pg.PoolClient, lease: TurnLease, r
 export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, lease: TurnLease, rootTaskId: string, nativeVerificationPassed = false, requireTaskGraph = false): Promise<Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>> {
   let graphRevision: number | null = null
   let denialCheckpoint: TaskGraphDenialCheckpoint | null = null
-  const deny = (code?: GateFeedbackCode, details: readonly GateFeedbackDetail[] = []) => {
-    const decision = { ok: false as const, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: feedbackText(code, details) }
+  const deny = (code?: GateFeedbackCode, details: readonly GateFeedbackDetail[] = [], counts?: GateFeedbackCounts) => {
+    const decision = { ok: false as const, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: taskGraphGateFeedbackText(code, details, counts) }
     if (graphRevision !== null) Object.defineProperty(decision, TASK_GRAPH_RECOVERY_REVISION, { value: graphRevision, enumerable: true })
     if (denialCheckpoint) Object.defineProperty(decision, TASK_GRAPH_DENIAL_CHECKPOINT, { value: denialCheckpoint })
     return decision
@@ -221,6 +203,12 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
       if (applicability.kind === "replan") return deny("result_applicability")
       historicalNodeIndices = applicability.historicalNodeIndices
     }
+    const applicableNodes = nodes.filter((_, index) => !historicalNodeIndices.has(index))
+    const findingAggregation = await verifyTaskGraphObjectiveFindingAggregation({ client, lease, rootTaskId,
+      fullNodes: nodes, applicableTaskIds: new Set(applicableNodes.map(node => node.taskId)), tasks: loaded.tasks, reports,
+      discoveryTurnEligibility: loaded.discoveryTurnEligibility })
+    if (findingAggregation.status === "invalid") return deny()
+    if (findingAggregation.status === "shortfall") return deny("finding_count_shortfall", [], findingAggregation)
     const binding = buildTaskGraphFinalSummaryBinding(loaded, historicalNodeIndices, resolvedRepairTaskIds)
     return binding ? { ok: true, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding } : { ok: true }
   } catch { graphRevision = null; denialCheckpoint = null; return deny() }
