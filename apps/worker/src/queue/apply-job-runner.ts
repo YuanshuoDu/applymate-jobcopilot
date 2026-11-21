@@ -36,6 +36,7 @@ export type ApplyJobRunState = {
   approvedTurnScope: ApplicationSubmissionStartScope | null;
   turnStopped: boolean;
   submissionRequestStarted: boolean;
+  submissionAcknowledgementUncertain: boolean;
   submissionExecutionStartAttempted: boolean;
   submissionContextCloseConfirmed: boolean;
   submissionPageCloseConfirmed: boolean;
@@ -52,6 +53,7 @@ export type ApplyJobRunState = {
   activeSubmissionContextClose: (() => Promise<void>) | null;
   activeSubmissionContextClosePromise: Promise<void> | null;
   applicationTaskFinalized: boolean;
+  submissionUncertainWrite: Promise<SubmissionUncertainTaskWrite> | null;
   queueCatchStarted: boolean;
   stopController: AbortController;
   stopProbe: ApplicationSubmissionStopProbe | null;
@@ -67,7 +69,10 @@ export type ApplyJobLifecycle = {
   closeActiveSubmissionContext(): Promise<void>;
   interruptStoppedTurn(): Promise<void>;
   releaseSubmissionFence(commit: boolean): Promise<void>;
+  markSubmissionUncertain(message: string): Promise<SubmissionUncertainTaskWrite>;
 };
+
+export type SubmissionUncertainTaskWrite = "written" | "superseded" | "failed";
 
 export type ApplyJobRunContext = {
   job: Job<ApplyTaskPayload>;
@@ -108,6 +113,7 @@ export function createApplyJobProcessor(dependencies: { isQueuePaused(): Promise
       approvedTurnScope: null,
       turnStopped: false,
       submissionRequestStarted: false,
+      submissionAcknowledgementUncertain: false,
       submissionExecutionStartAttempted: false,
       submissionContextCloseConfirmed: false,
       submissionPageCloseConfirmed: false,
@@ -124,6 +130,7 @@ export function createApplyJobProcessor(dependencies: { isQueuePaused(): Promise
       activeSubmissionContextClose: null,
       activeSubmissionContextClosePromise: null,
       applicationTaskFinalized: false,
+      submissionUncertainWrite: null,
       queueCatchStarted: false,
       stopController: new AbortController(),
       stopProbe: null,

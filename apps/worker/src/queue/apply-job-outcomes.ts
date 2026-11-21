@@ -32,7 +32,10 @@ export async function persistApplyJobOutcome(
   let usedFlow = state.usedFlow;
   const flow = state.flow;
 
-  if (state.turnStopped && !state.submissionRequestStarted && harnessResult.status !== "submitted") {
+  if (state.submissionAcknowledgementUncertain) {
+    harnessResult = { ...harnessResult, status: "manual", error: UNCONFIRMED_SUBMISSION_MESSAGE };
+    usedFlow = submissionIdentity ? "application.submit" : usedFlow;
+  } else if (state.turnStopped && !state.submissionRequestStarted && harnessResult.status !== "submitted") {
     harnessResult = { ...harnessResult, status: "failed", error: "Agent turn was stopped before the application submission request started." };
     usedFlow = submissionIdentity ? "application.submit" : usedFlow;
   } else if (state.submissionRequestStarted && harnessResult.status !== "submitted") {
@@ -43,7 +46,7 @@ export async function persistApplyJobOutcome(
   } else if (state.submissionFenceUnavailable && !state.submissionRequestStarted && harnessResult.status === "submission_blocked") {
     harnessResult = { ...harnessResult, status: "failed", error: "Agent turn state could not be verified, so the application was not submitted." };
   }
-  if (state.challengeBoundary && !state.turnStopped) {
+  if (state.challengeBoundary && !state.turnStopped && !state.submissionAcknowledgementUncertain) {
     harnessResult = {
       ...harnessResult,
       status: "manual",
@@ -58,11 +61,13 @@ export async function persistApplyJobOutcome(
 
   const submissionUncertain = state.submissionRequestStarted && harnessResult.status !== "submitted";
   if (submissionUncertain) {
-    if (await finishApplicationTask(
-      getPool(), applicationTaskId, "waiting_for_user", "submission_uncertain",
-      harnessResult.error ?? UNCONFIRMED_SUBMISSION_MESSAGE, "submit", submissionIdentity!,
-    ) === "superseded") { state.submissionSuperseded = true; return; }
-    state.applicationTaskFinalized = true;
+    if (!state.applicationTaskFinalized) {
+      if (await finishApplicationTask(
+        getPool(), applicationTaskId, "waiting_for_user", "submission_uncertain",
+        harnessResult.error ?? UNCONFIRMED_SUBMISSION_MESSAGE, "submit", submissionIdentity!,
+      ) === "superseded") { state.submissionSuperseded = true; return; }
+      state.applicationTaskFinalized = true;
+    }
     await context.lifecycle?.closeActiveSubmissionContext();
   }
   if (state.queueCatchStarted || state.submissionSuperseded) return;

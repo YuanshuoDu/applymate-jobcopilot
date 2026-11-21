@@ -5,7 +5,7 @@ import { finishApplicationTask, USER_TAKEOVER_CHECKPOINT } from "../db/applicati
 import { updateJobForSubmission, UNCONFIRMED_SUBMISSION_MESSAGE } from "../db/submission-guard.js";
 import { recordSubmissionExecutionSettled, type ApplicationSubmitIdentity } from "./application-submit-fence.js";
 import { createApplyResultNotification } from "./apply-job-outcomes.js";
-import type { ApplyJobLifecycle, ApplyJobRunContext } from "./apply-job-runner.js";
+import type { ApplyJobLifecycle, ApplyJobRunContext, SubmissionUncertainTaskWrite } from "./apply-job-runner.js";
 
 export const APPLY_TIMEOUT_MS = Number(process.env.APPLY_TIMEOUT_MS ?? "300000");
 export const TURN_STOPPED_MESSAGE = "Agent turn was stopped before the application submission request started."
@@ -58,7 +58,26 @@ export function createApplyJobFinalization(context: ApplyJobRunContext): ApplyJo
     state.submissionFenceRelease = fence.release(commit);
     return state.submissionFenceRelease;
   };
-  return { closeActivePage, closeActiveSubmissionContext, interruptStoppedTurn, releaseSubmissionFence };
+  const markSubmissionUncertain = (message: string): Promise<SubmissionUncertainTaskWrite> => {
+    if (state.applicationTaskFinalized) return Promise.resolve("written");
+    if (state.submissionSuperseded) return Promise.resolve("superseded");
+    if (state.submissionUncertainWrite) return state.submissionUncertainWrite;
+    if (!context.payload.applicationTaskId || !context.submissionIdentity) return Promise.resolve("failed");
+    const write = finishApplicationTask(
+      getPool(), context.payload.applicationTaskId, "waiting_for_user", "submission_uncertain",
+      message, "submit", context.submissionIdentity,
+    ).then((result): SubmissionUncertainTaskWrite => {
+      if (result === "superseded") { state.submissionSuperseded = true; return "superseded"; }
+      state.applicationTaskFinalized = true;
+      return "written";
+    }).catch((error: unknown): SubmissionUncertainTaskWrite => {
+      console.warn("[apply-worker] Could not persist uncertain task state:", error instanceof Error ? error.message : String(error));
+      return "failed";
+    }).finally(() => { state.submissionUncertainWrite = null; });
+    state.submissionUncertainWrite = write;
+    return write;
+  };
+  return { closeActivePage, closeActiveSubmissionContext, interruptStoppedTurn, releaseSubmissionFence, markSubmissionUncertain };
 }
 
 export async function persistStoppedSubmission(input: {
@@ -120,15 +139,7 @@ export async function handleApplyJobFailure(context: ApplyJobRunContext, error: 
     return false;
   }
   if (mayHaveOpenedBrowser && applicationTaskId && !state.applicationTaskFinalized) {
-    try {
-      const taskWrite = await finishApplicationTask(
-        getPool(), applicationTaskId, "waiting_for_user", "submission_uncertain", safeMessage, "submit", submissionIdentity!,
-      );
-      if (taskWrite === "superseded") { state.submissionSuperseded = true; return false; }
-      state.applicationTaskFinalized = true;
-    } catch (stateError: unknown) {
-      console.warn("[apply-worker] Could not persist uncertain task state:", stateError instanceof Error ? stateError.message : String(stateError));
-    }
+    if (await context.lifecycle?.markSubmissionUncertain(safeMessage) === "superseded") return false;
     if (state.activeSubmissionContextClose) await context.lifecycle?.closeActiveSubmissionContext();
     else await context.lifecycle?.closeActivePage();
   }

@@ -9,6 +9,8 @@ import { acquireApplicationSubmissionStartFence } from "../runtime/interrupt/app
 import { matchesSubmissionRequest, type SubmissionRequestIntent } from "../flows/submission-intent.js";
 import type { ApplyJobRunContext } from "./apply-job-runner.js";
 
+const ROUTE_CONTINUATION_ACK_TIMEOUT_MS = 8_000;
+
 export async function loadApprovedTurnScope(
   identity: ApplicationSubmitIdentity,
   executionId: string,
@@ -163,20 +165,15 @@ export function createApplicationSubmissionRouteHandler(
         }
         state.submissionRequestStarted = true;
         continuationAttempted = true;
-        let continuationFailed = false;
-        let continuationFailure: unknown;
-        const continuation = route.continue().then(
-          () => undefined,
-          (error: unknown) => {
-            continuationFailed = true;
-            continuationFailure = error;
-          },
-        );
+        const continuation = route.continue();
+        await waitForRouteContinuationAcknowledgement(continuation, state.stopController.signal);
         await context.lifecycle!.releaseSubmissionFence(true);
-        await continuation;
-        if (continuationFailed) throw continuationFailure;
       } catch (error: unknown) {
         state.submissionFenceUnavailable = true;
+        if (continuationAttempted) {
+          state.submissionAcknowledgementUncertain = true;
+          void context.lifecycle!.closeActiveSubmissionContext();
+        }
         console.warn(
           continuationAttempted
             ? "[apply-worker] Submission continuation outcome is uncertain:"
@@ -191,18 +188,11 @@ export function createApplicationSubmissionRouteHandler(
           });
         }
         if (continuationAttempted && applicationTaskId && !state.applicationTaskFinalized) {
-          try {
-            if (await finishApplicationTask(
-              getPool(), applicationTaskId, "waiting_for_user", "submission_uncertain",
-              UNCONFIRMED_SUBMISSION_MESSAGE, "submit", context.submissionIdentity!,
-            ) === "superseded") state.submissionSuperseded = true;
-            state.applicationTaskFinalized = true;
-          } catch (stateError: unknown) {
-            console.warn("[apply-worker] Could not promptly persist uncertain submission state:", stateError instanceof Error ? stateError.message : String(stateError));
+          if (await context.lifecycle!.markSubmissionUncertain(UNCONFIRMED_SUBMISSION_MESSAGE) === "superseded") {
+            state.submissionSuperseded = true;
           }
         }
-        if (continuationAttempted) void context.lifecycle!.closeActiveSubmissionContext();
-        else void context.lifecycle!.closeActivePage().catch(() => undefined);
+        if (!continuationAttempted) void context.lifecycle!.closeActivePage().catch(() => undefined);
       } finally {
         if (state.pendingSubmissionFence) {
           await context.lifecycle!.releaseSubmissionFence(continuationAttempted).catch((error: unknown) => {
@@ -219,4 +209,22 @@ export function createApplicationSubmissionRouteHandler(
       if (state.submissionRouteState.work === work) state.submissionRouteState.work = null;
     }
   };
+}
+
+async function waitForRouteContinuationAcknowledgement(continuation: Promise<void>, signal: AbortSignal): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  let onAbort: (() => void) | null = null;
+  try {
+    await Promise.race([continuation, new Promise<void>((_, reject) => {
+      onAbort = () => reject(signal.reason instanceof Error ? signal.reason : new Error("Submission continuation was interrupted."));
+      if (signal.aborted) { onAbort(); return; }
+      signal.addEventListener("abort", onAbort, { once: true });
+      timeout = setTimeout(() => reject(new Error("Submission route acknowledgement timed out.")), ROUTE_CONTINUATION_ACK_TIMEOUT_MS);
+      timeout.unref?.();
+    })]);
+    if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Submission continuation was interrupted.");
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
 }

@@ -1,6 +1,7 @@
 import { checkBudget, incrementBudget } from "../db/budget.js";
 import { CAPTCHA_USER_TAKEOVER_MESSAGE, CHALLENGE_DETECTION_FAILED_MESSAGE } from "../db/application-task-state.js";
 import { getPool } from "../db/apply-results.js";
+import { UNCONFIRMED_SUBMISSION_MESSAGE } from "../db/submission-guard.js";
 import { findFormPattern, recordPatternFailure, upsertFormPattern } from "../db/form-patterns.js";
 import { AgentHarness, type ApplyTask, type HarnessResult } from "../harness/agent-harness.js";
 import { runGreenhouseFlow } from "../flows/greenhouse-flow.js";
@@ -29,7 +30,14 @@ export async function runApplySubmitStrategy(
   if (payload.operation !== "submit" || !submissionIdentity) return runBrowserFlow();
   if (!approvedTurnScope) throw new Error("Approved application submission is missing its durable Turn scope.");
   const submit = createBrowserApplicationSubmitProvider({
-    run: runBrowserFlow,
+    run: async (beforeSubmit) => {
+      const result = await runBrowserFlow(beforeSubmit);
+      const activeRouteWork = context.state.submissionRouteState.work;
+      if (activeRouteWork) await activeRouteWork;
+      return context.state.submissionAcknowledgementUncertain
+        ? { ...result, status: "manual", error: UNCONFIRMED_SUBMISSION_MESSAGE }
+        : result;
+    },
     confirmationId: "application:" + applicationTaskId,
     postSubmitUrl: () => page.url(),
   });
