@@ -4,7 +4,7 @@ import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
 import { commitTurnTerminal, type TurnEngineTerminalGuard } from "./turn-engine-terminal-commit.js"
 import { createCanonicalTurnTerminalGuard } from "../canonical-turn-native-verification-runtime.js"
-import { SessionPauseRequestedError } from "../session-gate.js"
+import { SessionPauseRequestedError, sessionTerminalAdmissionKindFor } from "../session-gate.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 import { completeTurnCandidate } from "./turn-execution-final-candidate.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
@@ -16,14 +16,17 @@ import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summa
 import { taskGraphItemId, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
 import type { GraphTaskRow, LoadedGraph } from "../subagents/task-graph-pg-state.js"
 
-const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
+const { terminalSteeringReadMock } = vi.hoisted(() => ({ terminalSteeringReadMock: vi.fn() }))
 const { updateRootObjectiveHistoryProjectionMock } = vi.hoisted(() => ({ updateRootObjectiveHistoryProjectionMock: vi.fn(async () => true) }))
-vi.mock("../subagents/steering-reconciliation-ledger.js", async importOriginal => ({
-  ...await importOriginal<typeof import("../subagents/steering-reconciliation-ledger.js")>(),
-  assertNoUnresolvedSteering: assertNoUnresolvedSteeringMock,
+vi.mock("../subagents/steering-reconciliation-read.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../subagents/steering-reconciliation-read.js")>(),
+  readSteeringReconciliationStateForTerminal: (...args: unknown[]) => terminalSteeringReadMock(...args),
 }))
 vi.mock("../context/objective-history-projection.js", () => ({ updateRootObjectiveHistoryProjection: updateRootObjectiveHistoryProjectionMock }))
-beforeEach(() => updateRootObjectiveHistoryProjectionMock.mockReset().mockResolvedValue(true))
+beforeEach(() => {
+  updateRootObjectiveHistoryProjectionMock.mockReset().mockResolvedValue(true)
+  terminalSteeringReadMock.mockReset().mockResolvedValue({ unresolvedInputs: [] })
+})
 
 const now = new Date("2026-09-25T10:00:00.000Z")
 const owner = {
@@ -239,17 +242,29 @@ describe("atomic Turn terminal commit", () => {
 
   it("blocks native planning Root completion while steering remains unresolved", async () => {
     const fake = makePool([], undefined, { planningRoot: true })
-    assertNoUnresolvedSteeringMock.mockReset().mockRejectedValueOnce(new Error("steering_reconciliation_pending"))
+    terminalSteeringReadMock.mockResolvedValueOnce({ unresolvedInputs: [{ id: "steer-1" }] })
     await expect(commitTurnTerminal(fake.pool, input)).rejects.toThrow("steering_reconciliation_pending")
-    expect(assertNoUnresolvedSteeringMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+    expect(terminalSteeringReadMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.taskId, parentTaskId: owner.taskId,
       turnLeaseOwner: owner.ownerId, turnLeaseVersion: owner.leaseVersion, parentLeaseOwner: owner.ownerId, parentAttemptCount: 1,
-    }))
+    }), expect.any(Object))
     expect(fake.state.turn.status).toBe("in_progress")
     expect(fake.state.root.status).toBe("running")
     expect(fake.items.size).toBe(0)
     expect(fake.events.size).toBe(0)
     expect(fake.outboxes.size).toBe(0)
+  })
+
+  it("uses terminal steering admission for an exact paused planning Fill Root", async () => {
+    const fake = makePool([], undefined, { planningRoot: true, sessionStatus: "waiting_for_user", applicationTaskRows: 1, executionMode: "canonical_task_graph" })
+    await expect(commitTurnTerminal(fake.pool, input)).resolves.toMatchObject({ status: "completed", finalItemId: input.finalItemId })
+    const [client, terminalScope, admission] = terminalSteeringReadMock.mock.calls[0] ?? []
+    expect(terminalSteeringReadMock).toHaveBeenCalledOnce()
+    expect(terminalScope).toMatchObject({ sessionId: owner.sessionId, userId: owner.userId, turnId: owner.turnId, rootTaskId: owner.rootTaskId })
+    expect(admission).toEqual(expect.any(Object))
+    expect(() => sessionTerminalAdmissionKindFor(admission as never, client as never, terminalScope as never))
+      .toThrow("session_terminal_admission_mismatch")
+    expect(fake.state).toMatchObject({ turn: { status: "completed" }, root: { status: "completed" } })
   })
 
   it("completes the Turn and promotes only the oldest pending session follow-up atomically", async () => {

@@ -61,6 +61,7 @@ import type { ScheduledPipelineCandidateStore } from "./subagents/scheduled-pipe
 import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { TurnStateRefreshRetryError } from "./turns/turn-execution-question.js"
 import { createCanonicalTurnRuntime as createCanonicalTurnRuntimeImpl, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
+import { assertSessionTerminalAdmission } from "./session-gate.js"
 import { createChildExecutor, type ChildPublicDefinition } from "./subagents/child-executor.js"
 import type { TreeBudgetReservationStore } from "./subagents/tree-budget-types.js"
 import type { SubagentLease } from "./subagents/types.js"
@@ -5238,11 +5239,17 @@ describe("createCanonicalTurnRuntime", () => {
     expect(terminalGuards[0]).toEqual(expect.any(Function))
     const guard = terminalGuards[0]
     if (typeof guard !== "function") throw new Error("terminal guard was not created")
-    const client = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as never
+    const client = { query: vi.fn(async (sql: string) => sql.startsWith('SELECT session."id"') && sql.includes("pause_request")
+      ? { rows: [{ id: "session-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }) } as never
     const terminal = { stepId: "step-1", finalItemId: "final-1", finalContent: null, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, response: "{}" } as never
     await expect(guard(client, terminal)).resolves.toEqual({ ok: true })
     expect(roots.checkCompletion).toHaveBeenNthCalledWith(1, expect.objectContaining({ taskGraphVerification: true }))
     expect(roots.checkCompletion).toHaveBeenNthCalledWith(2, expect.objectContaining({ taskGraphVerification: true, client }))
+    expect(roots.checkCompletion).toHaveBeenLastCalledWith(expect.objectContaining({ client, terminalAdmission: undefined }))
+    const admission = await assertSessionTerminalAdmission(client, { sessionId: "session-1", userId: lease.userId, turnId: lease.turnId,
+      rootTaskId: "root-1", source: "user", executionMode: "canonical_task_graph" })
+    await expect(guard(client, terminal, admission)).resolves.toEqual({ ok: true })
+    expect(roots.checkCompletion).toHaveBeenLastCalledWith(expect.objectContaining({ client, terminalAdmission: admission }))
   })
 
   it("keeps selected-job finalization composed after the durable graph guard", async () => {

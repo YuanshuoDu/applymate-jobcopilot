@@ -82,14 +82,14 @@ export function createCanonicalSelectedJobCompletion(input: Readonly<{
 export function createCanonicalTurnTerminalGuard(input: Readonly<{
   enabled: boolean
   nativeVerification: Pick<ReturnType<typeof createCanonicalNativeVerificationRuntime>, "checkTerminal">
-  checkRootGraph?: (client: PoolClient, nativeVerificationPassed: boolean) => Promise<TurnEngineCompletionGateResult | undefined>
+  checkRootGraph?: (client: PoolClient, nativeVerificationPassed: boolean, admission: Parameters<TurnEngineTerminalGuard>[2]) => Promise<TurnEngineCompletionGateResult | undefined>
   finalizeSelectedJob?: (client: PoolClient) => Promise<TurnEngineCompletionGateResult>
 }>): TurnEngineTerminalGuard | undefined {
   if (!input.enabled) return undefined
-  return async (client, terminal: AtomicTurnCompletionInput & Readonly<{ response: string }>) => {
+  return async (client, terminal: AtomicTurnCompletionInput & Readonly<{ response: string }>, admission) => {
     const native = await input.nativeVerification.checkTerminal(client, terminal)
     if (native.denial) return native.denial
-    const graph = input.checkRootGraph ? await input.checkRootGraph(client, native.nativeVerificationPassed) : undefined
+    const graph = input.checkRootGraph ? await input.checkRootGraph(client, native.nativeVerificationPassed, admission) : undefined
     if (input.checkRootGraph && !graph) return { ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "TaskGraph completion verification is unavailable." }
     if (graph && !graph.ok) return graph
     if (!taskGraphFinalSummaryCopiesMatch(terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING], graph?.[TASK_GRAPH_FINAL_SUMMARY_BINDING], terminal.finalContent, terminal.response, terminal.finalItemId)) return {

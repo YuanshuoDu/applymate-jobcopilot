@@ -1,5 +1,35 @@
 import type pg from "pg"
 
+const terminalAdmissionBrand: unique symbol = Symbol("SessionTerminalAdmission")
+type TerminalAdmissionInput = Readonly<{ sessionId: string; userId: string; turnId: string; rootTaskId: string }>
+type TerminalAdmissionEvidence = TerminalAdmissionInput & Readonly<{ client: Pick<pg.PoolClient, "query">; kind: "work" | "derived_fill" }>
+const terminalAdmissions = new WeakMap<object, TerminalAdmissionEvidence>()
+const terminalAdmissionsByClient = new WeakMap<object, Set<object>>()
+export type SessionTerminalAdmission = Readonly<{ [terminalAdmissionBrand]: true }>
+
+function terminalAdmission(client: Pick<pg.PoolClient, "query">, input: TerminalAdmissionInput, kind: TerminalAdmissionEvidence["kind"]): SessionTerminalAdmission {
+  const receipt = Object.freeze({ [terminalAdmissionBrand]: true as const })
+  terminalAdmissions.set(receipt, { ...input, client, kind })
+  const receipts = terminalAdmissionsByClient.get(client) ?? new Set<object>()
+  receipts.add(receipt)
+  terminalAdmissionsByClient.set(client, receipts)
+  return receipt
+}
+
+export function revokeSessionTerminalAdmissionsForClient(client: Pick<pg.PoolClient, "query">): void {
+  for (const receipt of terminalAdmissionsByClient.get(client) ?? []) terminalAdmissions.delete(receipt)
+  terminalAdmissionsByClient.delete(client)
+}
+
+export function sessionTerminalAdmissionKindFor(
+  admission: SessionTerminalAdmission, client: Pick<pg.PoolClient, "query">, scope: TerminalAdmissionInput,
+): "work" | "derived_fill" {
+  const evidence = terminalAdmissions.get(admission as object)
+  if (!evidence || evidence.client !== client || evidence.sessionId !== scope.sessionId || evidence.userId !== scope.userId
+    || evidence.turnId !== scope.turnId || evidence.rootTaskId !== scope.rootTaskId) throw new Error("session_terminal_admission_mismatch")
+  return evidence.kind
+}
+
 /** Session statuses that still permit durable coordination and cleanup writes. */
 export const OPEN_SESSION = `session."status" NOT IN ('aborted', 'archived')`
 
@@ -50,10 +80,10 @@ export async function assertSessionWorkAdmission(
 export async function assertSessionTerminalAdmission(
   client: Pick<pg.PoolClient, "query">,
   input: { readonly sessionId: string; readonly userId: string; readonly turnId: string; readonly rootTaskId: string; readonly source: string | null; readonly executionMode: string | null },
-): Promise<void> {
+): Promise<SessionTerminalAdmission> {
   try {
     await assertSessionWorkAdmission(client, input)
-    return
+    return terminalAdmission(client, input, "work")
   } catch (error: unknown) {
     if (!isSessionPauseRequestedError(error)) throw error
   }
@@ -73,4 +103,5 @@ export async function assertSessionTerminalAdmission(
     [input.sessionId, input.userId, input.turnId, input.rootTaskId],
   )
   if (wait.rows.length !== 1) throw new SessionPauseRequestedError()
+  return terminalAdmission(client, input, "derived_fill")
 }
