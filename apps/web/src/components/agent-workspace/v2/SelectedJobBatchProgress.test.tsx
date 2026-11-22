@@ -16,9 +16,9 @@ function model(): SelectedJobBatchWorkbenchModel {
     source: { sessionId: 'session-1', sourceTurnId: 'source-turn', rootTaskId: 'source-root', graphItemId: 'source-graph', graphRevision: 3 },
     graph: { itemId: 'batch-graph', rootTaskId: 'batch-root', revision: 4 }, status: 'partial',
     jobs: [
-      { slotId: 'cover_letter_writer_slot_1', jobId: 'private-job-one', company: 'Beta', role: 'Engineer', status: 'completed',
+      { slotId: 'slot-1', jobId: 'private-job-one', company: 'Beta', role: 'Engineer', status: 'completed',
         writer: { status: 'completed', artifactRef: ref }, reviewer: { status: 'completed', reviewStatus: 'passed' } },
-      { slotId: 'cover_letter_writer_slot_2', jobId: 'private-job-two', company: 'Alpha', role: 'Analyst', status: 'failed',
+      { slotId: 'slot-2', jobId: 'private-job-two', company: 'Alpha', role: 'Analyst', status: 'failed',
         writer: { status: 'failed' }, reviewer: { status: 'pending' } },
     ],
   }
