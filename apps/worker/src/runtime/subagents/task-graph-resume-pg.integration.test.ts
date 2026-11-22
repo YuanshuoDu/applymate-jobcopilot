@@ -25,6 +25,7 @@ import type { ProductionAgentFlags } from "../production-agent-flags.js"
 import type { ProductionWorkerBootstrap, createProductionWorkerBootstrap } from "../../queue/production-bootstrap.js"
 import { createAgentArtifactRepository, findCurrentDraftHeadWithClient, findReviewReceiptWithClient, type AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import { createArtifactToolStore } from "../tools/artifact-tools.js"
+import { sanitizeLifecyclePreview } from "../tools/redaction.js"
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
 import { consumeDurableWaitOutcomes } from "./durable-wait-consumer.js"
 import { reconcileDurableWaits } from "./durable-wait-resolver.js"
@@ -10947,10 +10948,30 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(receiptItems.rows).toHaveLength(2)
       const call = receiptItems.rows.find(row => row.type === "tool_call")
       const result = receiptItems.rows.find(row => row.type === "tool_result")
+      const sanitizedDraftPreview = record(sanitizeLifecyclePreview({
+        baseArtifactId: plan.baseArtifactId,
+        baseHash: plan.baseHash,
+        content: plan.body,
+        constraints: { maxWords: 160 },
+      }))
+      expect(sanitizedDraftPreview).toEqual({
+        baseArtifactId: plan.baseArtifactId,
+        baseHash: plan.baseHash,
+        content: "[REDACTED]",
+        constraints: { maxWords: 160 },
+      })
+      const expectedPersistedDraftInput = {
+        baseArtifactId: sanitizedDraftPreview?.baseArtifactId,
+        baseHash: sanitizedDraftPreview?.baseHash,
+      }
+      const persistedDraftInput = record(record(call?.content)?.input)
       expect(call).toMatchObject({ status: "completed", attempt: 1, content: {
         toolCallId: plan.correctionDraftCallId, toolName: "cover_letter.draft", status: "completed", errorCode: null,
-        input: { baseArtifactId: plan.baseArtifactId, baseHash: plan.baseHash, content: "[REDACTED]", constraints: { maxWords: 160 } },
+        input: expectedPersistedDraftInput,
       } })
+      expect(persistedDraftInput).toEqual(expectedPersistedDraftInput)
+      expect(Object.prototype.hasOwnProperty.call(persistedDraftInput ?? {}, "content")).toBe(false)
+      expect(Object.prototype.hasOwnProperty.call(persistedDraftInput ?? {}, "constraints")).toBe(false)
       expect(result).toMatchObject({ status: "completed", attempt: 1, stepId: call?.stepId,
         content: { toolCallId: plan.correctionDraftCallId, errorCode: null, output: { artifactRef: committedRef } } })
 
