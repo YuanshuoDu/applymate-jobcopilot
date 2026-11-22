@@ -13,8 +13,10 @@ import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-
 import { defaultSubagentPolicy, parseSubagentJobPayload } from "./types.ts"
 import { PgSubagentTaskStore } from "./pg-store.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.ts"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.ts"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.ts"
+import { taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.ts"
+import { parseTaskGraphSupersededScoutRetirementReceipt, TASK_GRAPH_SUPERSEDED_SCOUT_RETIREMENT_EVENT_TYPE } from "./task-graph-scout-retirement-contract.ts"
 import { parsePlanLedger, projectPlanLedger } from "@jobcopilot/agent-protocol"
 
 const [, , mode, rawIds] = process.argv, ids = JSON.parse(rawIds)
@@ -28,6 +30,18 @@ const discoveryAnalystPlanCallId = "p3-process-restart-discovery-analyst-plan"
 const discoveryAnalystWaitCallId = "p3-process-restart-discovery-analyst-wait"
 const discoveryFinalMarker = "p3-process-restart-discovery-shortlist-ready"
 const processRestartSearchInput = Object.freeze({ target: "Software Engineer", location: "Dublin", limit: 10 })
+const successiveSeattleKey = "scout-seattle", successiveDublinKey = "scout-dublin-replacement", successiveBerlinKey = "scout-berlin-final"
+const successiveWaitIds = ids => ({
+  seattlePlan: `p3-1248-seattle-plan:${ids.turnId}`, seattleWait: `p3-1248-seattle-wait:${ids.turnId}`,
+  dublinPlan: `p3-1248-dublin-plan:${ids.turnId}`, dublinRefresh: `p3-1248-dublin-refresh:${ids.turnId}`,
+  retireSeattle: `p3-1248-retire-seattle:${ids.turnId}`,
+  firstWait: `p3-1248-first-retirement-wait:${ids.turnId}`, berlinInspect: `p3-1248-berlin-inspect:${ids.turnId}`,
+  berlinPlan: `p3-1248-berlin-plan:${ids.turnId}`, berlinRefresh: `p3-1248-berlin-refresh:${ids.turnId}`,
+  retireDublin: `p3-1248-retire-dublin:${ids.turnId}`,
+  finalWait: `p3-1248-final-wait:${ids.turnId}`, finalList: `p3-1248-final-list:${ids.turnId}`,
+  initialWaitKey: `p3-1248-initial:${ids.turnId}`, firstWaitKey: `p3-1248-after-seattle:${ids.turnId}`,
+  finalWaitKey: `p3-1248-after-dublin:${ids.turnId}`,
+})
 const TASK_GRAPH_KEY_ALLOWLIST = new Set(["source", "summary", followUpKey])
 const CHILD_FAILURE_DIAGNOSTIC_CODES = new Set(["invalid_structured_result", "model_incomplete", "invalid_output", "tool_execution_failed", "timeout", "cancelled", "step_limit", "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "final_unverified", "child_turn_missing", "child_resume_unavailable", "child_resume_evidence_unavailable", "selected_job_sources_unavailable", "selected_job_context_unavailable", "subagent_role_unknown"])
 const CHILD_EXCEPTION_DIAGNOSTIC_NAMES = new Set(["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "AbortError", "TimeoutError"])
@@ -71,6 +85,13 @@ let sharedRedisModule
 let stdinBuffer = ""
 let initialWaitLineage = null
 let archivedWaitChildProgress = 0
+let successiveSeattleSearchHeld = false
+const successiveHeldChildren = new Set()
+const successiveClaimedBeforeModel = new Set()
+let successiveRecoveryTrace
+let successiveRecoveryTraceEmitted = false
+const successiveChildLeases = new Map()
+let successiveRootLease = null
 const queuedCommands = []
 const commandWaiters = new Map()
 process.stdin.setEncoding("utf8")
@@ -83,6 +104,65 @@ function onStdinData(chunk) {
 }
 process.stdin.on("data", onStdinData)
 function say(value) { process.stdout.write(value + "\n") }
+const SUCCESSIVE_RECOVERY_TRACE_PREFIX = "WORKER_B_RECOVERY_PREDICATE_TRACE "
+const SUCCESSIVE_RECOVERY_STAGES = new Set(["candidate_not_seen", "candidate_seen", "session_lock_mismatch", "turn_lock_mismatch",
+  "expiry_preview_rejected", "root_turn_not_recoverable", "task_lock_parity_mismatch", "recovery_clock_missing",
+  "lease_expiry_fence_mismatch", "unsettled_external_call_rejected", "durable_wait_graph_blocked",
+  "task_graph_transition_blocked", "task_graph_finish_blocked", "task_update_rejected"])
+const SUCCESSIVE_WAIT_PROJECTION_STAGES = new Set(["invalid_input", "wait_row_count", "wait_validation", "lease_fence_validation",
+  "wait_timestamp_validation", "timeout_validation", "target_validation", "target_match_validation", "call_result_validation",
+  "call_timestamp_validation", "call_contract_validation", "safe_serialization_validation", "optimistic_update_missed"])
+const SUCCESSIVE_WAIT_PROJECTION_DISPOSITIONS = new Set(["skipped", "repaired", "already_current", "rejected"])
+const SUCCESSIVE_DISPATCH_KEYS = ["present", "payloadValid", "task", "session", "root", "owner", "generation", "published"]
+function boundedRecoveryCount(value) { return Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 10_000) : 0 }
+function recoveryTraceBoolean(value) { return typeof value === "boolean" ? value : null }
+function armSuccessiveRecoveryTrace() {
+  const target = process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID
+  if (mode !== "resume-successive-replan" || process.env.NODE_ENV !== "test"
+    || typeof target !== "string" || !target || target.length > 256) return
+  successiveRecoveryTrace = { scanCount: 0, candidateNotSeenScanCount: 0, candidateSeenScanCount: 0,
+    targetSeen: false, firstTargetSeenRejectionStage: null, waitProjectionDisposition: null,
+    waitProjectionStage: null, childWaitResumable: null, waitRegistrationFound: null,
+    waitRegistrationRejected: null, blockingExternalCall: null, dispatch: null, malformedTrace: false }
+  const originalInfo = console.info.bind(console)
+  console.info = (...args) => {
+    const line = args[0]
+    if (typeof line !== "string" || !line.startsWith(SUCCESSIVE_RECOVERY_TRACE_PREFIX)) return originalInfo(...args)
+    try {
+      const source = record(JSON.parse(line.slice(SUCCESSIVE_RECOVERY_TRACE_PREFIX.length)))
+      const stage = source && SUCCESSIVE_RECOVERY_STAGES.has(source.rejectionStage) ? source.rejectionStage : null
+      const pages = source && Array.isArray(source.pages) ? source.pages : null
+      if (!source || !stage || !pages || pages.length > 16) { successiveRecoveryTrace.malformedTrace = true; return }
+      const targetSeen = pages.some(page => record(page)?.targetSeen === true)
+      successiveRecoveryTrace.scanCount = boundedRecoveryCount(successiveRecoveryTrace.scanCount + 1)
+      if (targetSeen) {
+        successiveRecoveryTrace.targetSeen = true
+        successiveRecoveryTrace.candidateSeenScanCount = boundedRecoveryCount(successiveRecoveryTrace.candidateSeenScanCount + 1)
+        if (successiveRecoveryTrace.firstTargetSeenRejectionStage === null) {
+          successiveRecoveryTrace.firstTargetSeenRejectionStage = stage
+          successiveRecoveryTrace.waitProjectionDisposition = SUCCESSIVE_WAIT_PROJECTION_DISPOSITIONS.has(source.waitProjectionDisposition)
+            ? source.waitProjectionDisposition : "other"
+          successiveRecoveryTrace.waitProjectionStage = SUCCESSIVE_WAIT_PROJECTION_STAGES.has(source.waitProjectionStage)
+            ? source.waitProjectionStage : source.waitProjectionStage === undefined ? null : "other"
+          successiveRecoveryTrace.childWaitResumable = recoveryTraceBoolean(source.childWaitResumable)
+          successiveRecoveryTrace.waitRegistrationFound = recoveryTraceBoolean(source.waitRegistrationFound)
+          successiveRecoveryTrace.waitRegistrationRejected = recoveryTraceBoolean(source.waitRegistrationRejected)
+          successiveRecoveryTrace.blockingExternalCall = recoveryTraceBoolean(source.blockingExternalCall)
+          const dispatch = record(source.dispatch)
+          successiveRecoveryTrace.dispatch = dispatch ? Object.fromEntries(SUCCESSIVE_DISPATCH_KEYS.map(key =>
+            [key, recoveryTraceBoolean(dispatch[key])])) : null
+        }
+      } else if (stage === "candidate_not_seen") {
+        successiveRecoveryTrace.candidateNotSeenScanCount = boundedRecoveryCount(successiveRecoveryTrace.candidateNotSeenScanCount + 1)
+      }
+    } catch { successiveRecoveryTrace.malformedTrace = true }
+  }
+}
+function emitSuccessiveRecoveryTrace() {
+  if (!successiveRecoveryTrace || successiveRecoveryTraceEmitted) return
+  successiveRecoveryTraceEmitted = true
+  say("P3_SUCCESSIVE_REPLAN_RECOVERY_TRACE " + JSON.stringify(successiveRecoveryTrace))
+}
 function noReservationUsageAuthorization() {
   return {
     outputReservationRequired: false,
@@ -209,22 +289,34 @@ function assertPrivateArtifactFixtureGuardSelfTest() {
   }
 }
 function assertDisposableServiceUrls() {
+  const successiveMode = mode === "park-successive-replan" || mode === "resume-successive-replan"
+  const localSuccessiveProof = successiveMode && process.env.AGENT_REPLAN_PROOF_LOCAL_DISPOSABLE === "1"
   const databaseValue = process.env.AGENT_RUNTIME_PG_TEST_URL
+  const databaseConfiguredValue = process.env.DATABASE_URL
   const redisTestValue = process.env.AGENT_TURN_REDIS_TEST_URL
   const redisConfiguredValue = process.env.REDIS_URL
   if (process.env.CI !== "true" || process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true"
-    || process.env.AGENT_TURN_REDIS_TEST_DISPOSABLE !== "true" || !databaseValue || !redisTestValue || !redisConfiguredValue) {
+    || process.env.AGENT_TURN_REDIS_TEST_DISPOSABLE !== "true"
+    || successiveMode && process.env.AGENT_RUNTIME_PG_TEST_REQUIRED !== "true"
+    || !databaseValue || !redisTestValue || !redisConfiguredValue) {
     throw new Error("p3_restart_fixture_requires_dedicated_disposable_ci_services")
   }
   try {
     const database = new URL(databaseValue)
     const redisTest = new URL(redisTestValue)
     const redisConfigured = new URL(redisConfiguredValue)
-    if (database.protocol !== "postgresql:" || database.hostname !== "127.0.0.1" || database.port !== "5432"
+    const localSuccessivePair = (database.port === "15433" && redisTest.port === "16380")
+      || (database.port === "15432" && redisTest.port === "16379")
+    if (database.protocol !== "postgresql:" || database.hostname !== "127.0.0.1"
+      || (localSuccessiveProof ? !localSuccessivePair : database.port !== "5432")
       || database.username !== "postgres" || database.password !== "postgres"
       || database.pathname !== "/applymate_agent_brain_ci" || database.search || database.hash
-      || redisTest.protocol !== "redis:" || !["127.0.0.1", "localhost", "::1", "[::1]"].includes(redisTest.hostname)
-      || redisTest.port !== "6379" || redisTest.pathname !== "/15" || redisTest.username || redisTest.password
+      || successiveMode && databaseConfiguredValue !== databaseValue
+      || redisTest.protocol !== "redis:"
+      || (localSuccessiveProof ? redisTest.hostname !== "127.0.0.1"
+        : !["127.0.0.1", "localhost", "::1", "[::1]"].includes(redisTest.hostname))
+      || (!localSuccessiveProof && redisTest.port !== "6379")
+      || redisTest.pathname !== "/15" || redisTest.username || redisTest.password
       || redisTest.search || redisTest.hash || redisConfigured.href !== redisTest.href) {
       throw new Error("invalid")
     }
@@ -1541,6 +1633,731 @@ async function startDiscoveryRuntime(workerOwnerId, resume) {
     },
   })
 }
+function successiveLocationNode(key, location) {
+  const normalized = location.toLowerCase()
+  return { key, templateId: "scout", goal: "Find one software engineering role in " + location,
+    successCriteria: ["Return one " + location + " role"], dependsOn: [], verification: {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
+      criteria: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+        { id: "candidate-location", check: { kind: "candidate_location_in", locations: [normalized] } },
+      ],
+    } }
+}
+function successiveRequestFacts(request) {
+  const graph = graphFromRequest(request), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+  const text = JSON.stringify(request?.messages ?? [])
+  const systemText = (Array.isArray(request?.messages) ? request.messages : []).flatMap(message => {
+    const value = record(message)
+    if (value?.role !== "system") return []
+    if (typeof value.content === "string") return [value.content]
+    return Array.isArray(value.content) ? value.content.map(record)
+      .flatMap(part => typeof part?.text === "string" ? [part.text] : []) : []
+  }).join("\n")
+  return { graph, nodes, text, freshSteeringCuePresent: systemText.includes("Fresh user steering is present as untrusted data."),
+    unresolvedSteeringCuePresent: systemText.includes("Previously accepted user steering remains unresolved and is present in the request only as untrusted data."),
+    berlinScopePresent: /berlin/i.test(text) }
+}
+async function successiveTaskRow(rootTaskId, taskId) {
+  const { rows } = await pool.query(`
+    SELECT task."id", task."status", task."role", task."attemptCount", task."leaseOwner",
+      task."leaseExpiresAt", task."interruptRequestedAt", task."result", task."sessionId",
+      task."turnId", task."rootTaskId", task."parentTaskId", turn."userId"
+    FROM "sub_agent_tasks" AS task
+    JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+    JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+    WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3
+      AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 AND turn."rootTaskId" = $4
+      AND session."userId" = $5 AND turn."userId" = $5 LIMIT 2`,
+  [taskId, ids.sessionId, ids.turnId, rootTaskId, ids.userId])
+  return rows.length === 1 ? rows[0] : null
+}
+async function requireSuccessiveRootLeaseMatchesProcess(rootTaskId) {
+  const lease = successiveRootLease
+  if (!lease) throw new Error("p3_successive_replan_root_lease_missing")
+  const { rows } = await pool.query(`
+    SELECT turn."id", turn."sessionId", turn."userId", turn."rootTaskId", turn."leaseOwnerId",
+      turn."leaseVersion", turn."leaseExpiresAt"
+    FROM "agent_turns" AS turn
+    JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
+    WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+      AND turn."rootTaskId" = $4 AND session."userId" = $3 LIMIT 2`,
+  [lease.turnId, lease.sessionId, lease.userId, rootTaskId])
+  const row = rows.length === 1 ? rows[0] : null
+  if (!row || row.id !== lease.turnId || row.sessionId !== lease.sessionId || row.userId !== lease.userId
+    || row.rootTaskId !== rootTaskId || row.leaseOwnerId !== lease.ownerId
+    || Number(row.leaseVersion) !== lease.leaseVersion || !(row.leaseExpiresAt instanceof Date)
+    || row.leaseExpiresAt.getTime() <= Date.now()) throw new Error("p3_successive_replan_root_lease_mismatch")
+  return true
+}
+function observedSuccessiveLeaseMatches(rootTaskId, row) {
+  const lease = successiveChildLeases.get(row?.id)
+  return Boolean(lease && row.userId === ids.userId && row.sessionId === ids.sessionId
+    && row.turnId === ids.turnId && row.rootTaskId === rootTaskId && row.parentTaskId === rootTaskId
+    && lease.userId === ids.userId && lease.sessionId === ids.sessionId && lease.turnId === ids.turnId
+    && lease.rootTaskId === rootTaskId && lease.parentTaskId === rootTaskId
+    && lease.attemptCount === row.attemptCount && lease.leaseOwner === row.leaseOwner
+    && lease.ownerId === row.leaseOwner)
+}
+async function executeSuccessiveChild({ lease }, childExecutor) {
+  if (!lease || lease.role !== "scout" || lease.userId !== ids.userId || lease.sessionId !== ids.sessionId
+    || lease.turnId !== ids.turnId || typeof lease.id !== "string" || typeof lease.ownerId !== "string"
+    || typeof lease.rootTaskId !== "string" || !lease.rootTaskId || lease.parentTaskId !== lease.rootTaskId
+    || lease.leaseOwner !== lease.ownerId || !Number.isSafeInteger(lease.attemptCount) || lease.attemptCount < 1
+    || !(lease.leaseExpiresAt instanceof Date) || lease.leaseExpiresAt.getTime() <= Date.now()) {
+    throw new Error("p3_successive_replan_child_lease_invalid")
+  }
+  successiveChildLeases.set(lease.id, {
+    userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
+    rootTaskId: lease.rootTaskId, parentTaskId: lease.parentTaskId,
+    ownerId: lease.ownerId, leaseOwner: lease.leaseOwner, attemptCount: lease.attemptCount,
+  })
+  if (mode === "park-successive-replan" && typeof lease.goal === "string" && lease.goal.includes("Dublin")) {
+    await waitForSuccessiveTaskStarted(lease.rootTaskId, lease.id, successiveDublinKey)
+    successiveClaimedBeforeModel.add(lease.id)
+    say("P3_SUCCESSIVE_REPLAN_CHILD_CLAIMED_BEFORE_MODEL " + JSON.stringify({ role: "scout", location: "dublin",
+      claimObserved: true, startLifecycleObserved: true, modelStarted: false, toolStarted: false }))
+    await waitForCommand("release-dublin-before-model")
+  }
+  return await childExecutor({ lease })
+}
+async function successiveWaitState(rootTaskId, key) {
+  const { rows } = await pool.query(`
+    SELECT turn."status" AS "turnStatus", wait."status" AS "waitStatus", wait."suspendedAt",
+      graph."revision", graph."content"
+    FROM "agent_turns" AS turn
+    JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
+    JOIN "agent_wait_conditions" AS wait ON wait."userId" = turn."userId"
+      AND wait."sessionId" = turn."sessionId" AND wait."turnId" = turn."id"
+      AND wait."parentTaskId" = turn."rootTaskId" AND wait."idempotencyKey" = $4
+    JOIN "agent_items" AS graph ON graph."sessionId" = turn."sessionId" AND graph."turnId" = turn."id"
+      AND graph."taskId" = turn."rootTaskId" AND graph."id" = $5 AND graph."type" = 'task_graph'
+    WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND session."userId" = $3 LIMIT 2`,
+  [ids.turnId, ids.sessionId, ids.userId, key, taskGraphItemId(rootTaskId)])
+  return rows.length === 1 ? rows[0] : null
+}
+async function waitForSuccessiveSuspendedWait(rootTaskId, key, expectedKeys, timeoutMs = 45_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const wait = await successiveWaitState(rootTaskId, key)
+    const graph = record(wait?.content), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+    const keys = nodes.map(node => node?.key).sort()
+    if (wait?.turnStatus === "waiting_for_dependency" && wait.waitStatus === "waiting" && wait.suspendedAt
+      && isDeepStrictEqual(keys, [...expectedKeys].sort())) return { wait, nodes }
+    await sleep(25)
+  }
+  throw new Error("p3_successive_replan_wait_not_suspended")
+}
+async function waitForSuccessiveTaskStarted(rootTaskId, taskId, nodeKey, timeoutMs = 25_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const row = await successiveTaskRow(rootTaskId, taskId)
+    if (row?.status === "running" && row.role === "scout" && observedSuccessiveLeaseMatches(rootTaskId, row)
+      && row.leaseOwner && row.leaseExpiresAt instanceof Date && row.leaseExpiresAt.getTime() > Date.now()
+      && row.interruptRequestedAt === null) {
+      const { rows } = await pool.query(`
+        SELECT COUNT(*)::int AS "count" FROM "agent_events" AS event
+        JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+        JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+        WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3 AND event."taskId" = $4
+          AND event."type" IN ('task_graph.lifecycle', 'item.delta')
+          AND event."payload"->>'kind' = 'lifecycle' AND event."payload"->'event'->>'type' = 'task.started'
+          AND event."payload"->'event'->>'nodeKey' = $5
+          AND event."idempotencyKey" = $6 AND turn."rootTaskId" = $7
+          AND session."userId" = $8 AND turn."userId" = $8`,
+      [ids.sessionId, ids.turnId, taskGraphItemId(rootTaskId), taskId, nodeKey,
+        taskGraphLifecycleKey(rootTaskId, nodeKey, row.attemptCount, "task.started"), rootTaskId, ids.userId])
+      if (rows[0]?.count === 1) return row
+    }
+    await sleep(25)
+  }
+  throw new Error("p3_successive_replan_dublin_start_not_observed")
+}
+async function waitForSuccessiveChildBoundary(taskId, timeoutMs = 25_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (successiveHeldChildren.has(taskId) || successiveClaimedBeforeModel.has(taskId)) return
+    await sleep(25)
+  }
+  throw new Error("p3_successive_replan_dublin_child_not_held")
+}
+async function waitForSuccessiveChildSearchHeld(taskId, timeoutMs = 45_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (successiveHeldChildren.has(taskId)) return
+    await sleep(25)
+  }
+  throw new Error("p3_successive_replan_dublin_search_not_held")
+}
+async function successiveGraphRevision(rootTaskId) {
+  const { rows } = await pool.query(`
+    SELECT graph."revision" FROM "agent_items" AS graph
+    JOIN "agent_sessions" AS session ON session."id" = graph."sessionId"
+    JOIN "agent_turns" AS turn ON turn."id" = graph."turnId" AND turn."sessionId" = graph."sessionId"
+    WHERE graph."id" = $1 AND graph."sessionId" = $2 AND graph."turnId" = $3 AND graph."taskId" = $4
+      AND graph."type" = 'task_graph' AND turn."rootTaskId" = $4
+      AND session."userId" = $5 AND turn."userId" = $5 LIMIT 2`,
+  [taskGraphItemId(rootTaskId), ids.sessionId, ids.turnId, rootTaskId, ids.userId])
+  return rows.length === 1 && Number.isSafeInteger(rows[0]?.revision) ? rows[0].revision : null
+}
+async function readSuccessiveRetirement(rootTaskId, nodeKey, taskId, replacementTaskId, callId) {
+  const task = await successiveTaskRow(rootTaskId, taskId)
+  if (!task || task.status !== "interrupted" || task.role !== "scout" || !Number.isSafeInteger(task.attemptCount)) return null
+  const [receiptResult, ackResult] = await Promise.all([
+    pool.query(`
+      SELECT event."sequence", event."type", event."actor", event."correlationId", event."itemId",
+        event."taskId", event."causationId", event."payload", call."stepId" AS "actionStepId",
+        EXISTS (SELECT 1 FROM "agent_outbox" outbox WHERE outbox."idempotencyKey" = 'agent-event:' || event."id") AS "hasOutbox"
+      FROM "agent_events" AS event
+      JOIN "agent_items" AS call ON call."sessionId" = event."sessionId" AND call."turnId" = event."turnId"
+        AND call."taskId" = $3 AND call."type" = 'tool_call' AND call."content"->>'toolCallId' = $4
+      JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+      JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+      WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = $5
+        AND event."taskId" = $6 AND event."itemId" = $7 AND turn."rootTaskId" = $3
+        AND session."userId" = $8 AND turn."userId" = $8 ORDER BY event."sequence" LIMIT 2`,
+    [ids.sessionId, ids.turnId, rootTaskId, callId, TASK_GRAPH_SUPERSEDED_SCOUT_RETIREMENT_EVENT_TYPE,
+      taskId, taskGraphItemId(rootTaskId), ids.userId]),
+    pool.query(`
+      SELECT event."sequence", event."type", event."actor", event."correlationId", event."itemId",
+        event."taskId", event."causationId", event."payload", event."idempotencyKey",
+        EXISTS (SELECT 1 FROM "agent_outbox" outbox WHERE outbox."idempotencyKey" = 'agent-event:' || event."id") AS "hasOutbox"
+      FROM "agent_events" AS event
+      JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+      JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+      WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3
+        AND event."type" = 'item.delta' AND event."payload"->'event'->>'type' = 'task.interrupted'
+        AND event."idempotencyKey" = $4 AND turn."rootTaskId" = $5
+        AND session."userId" = $6 AND turn."userId" = $6 ORDER BY event."sequence" LIMIT 2`,
+    [ids.sessionId, ids.turnId, taskId, taskGraphLifecycleKey(rootTaskId, nodeKey, task.attemptCount, "task.interrupted"),
+      rootTaskId, ids.userId]),
+  ])
+  if (receiptResult.rows.length !== 1 || ackResult.rows.length !== 1) return null
+  const receiptRow = receiptResult.rows[0], ack = ackResult.rows[0]
+  const receipt = parseTaskGraphSupersededScoutRetirementReceipt(receiptRow.payload,
+    { sessionId: ids.sessionId, turnId: ids.turnId, rootTaskId, taskId })
+  const ackPayload = record(ack.payload), ackEvent = record(ackPayload?.event)
+  if (!receipt || receipt.attempt !== task.attemptCount || receipt.replacementTaskId !== replacementTaskId
+    || receiptRow.type !== TASK_GRAPH_SUPERSEDED_SCOUT_RETIREMENT_EVENT_TYPE || receiptRow.actor !== "system"
+    || receiptRow.correlationId !== ids.turnId || receiptRow.itemId !== taskGraphItemId(rootTaskId)
+    || receiptRow.taskId !== taskId || receiptRow.causationId !== receiptRow.actionStepId || receiptRow.hasOutbox !== false
+    || ack.type !== "item.delta" || ack.actor !== "system" || ack.correlationId !== ids.turnId
+    || ack.itemId !== taskGraphItemId(rootTaskId) || ack.taskId !== taskId || ack.causationId !== null
+    || ack.hasOutbox !== true || ackPayload?.kind !== "lifecycle" || ackEvent?.type !== "task.interrupted"
+    || BigInt(ack.sequence) <= BigInt(receiptRow.sequence)) return null
+  return { receipt, task }
+}
+async function waitForSuccessiveDublinReclaim(rootTaskId, taskId, priorAttempt, timeoutMs = 90_000) {
+  if (!Number.isSafeInteger(priorAttempt) || priorAttempt < 0) throw new Error("p3_successive_replan_prior_attempt_missing")
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const row = await successiveTaskRow(rootTaskId, taskId)
+    if (row?.status === "running" && row.role === "scout" && row.attemptCount > priorAttempt
+      && observedSuccessiveLeaseMatches(rootTaskId, row)
+      && row.leaseExpiresAt instanceof Date && row.leaseExpiresAt.getTime() > Date.now()
+      && row.interruptRequestedAt === null) return row
+    await sleep(25)
+  }
+  emitSuccessiveRecoveryTrace()
+  throw new Error("p3_successive_replan_dublin_not_reclaimed")
+}
+function successiveBerlinResultVerified(row, expectedJobId) {
+  const result = record(row?.result), structured = record(result?.structuredResult)
+  const candidates = Array.isArray(structured?.candidates) ? structured.candidates.map(record) : []
+  const report = record(result?.taskGraphVerificationReport)
+  const criteria = Array.isArray(report?.criteria) ? report.criteria.map(record) : []
+  return row?.status === "completed" && row.role === "scout" && structured?.role === "scout"
+    && candidates.length === 1 && candidates[0]?.jobId === expectedJobId
+    && report?.verifierVersion === TASK_GRAPH_VERIFIER_VERSION && report.status === "passed"
+    && report.reasonCode === "criteria_met" && /^[a-f0-9]{64}$/.test(String(report.evidenceDigest ?? ""))
+    && criteria.length === 2 && ["candidate-count", "candidate-location"].every(id => criteria.some(criterion =>
+      criterion?.criterionId === id && criterion.status === "passed" && criterion.reasonCode === "criteria_met"))
+}
+async function waitForSuccessiveBerlinVerified(rootTaskId, taskId, expectedJobId, timeoutMs = 45_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const row = await successiveTaskRow(rootTaskId, taskId)
+    if (successiveBerlinResultVerified(row, expectedJobId)) return row
+    if (row && ["failed", "interrupted", "cancelled", "closed"].includes(row.status)) {
+      throw new Error("p3_successive_replan_berlin_child_not_verified")
+    }
+    await sleep(25)
+  }
+  throw new Error("p3_successive_replan_berlin_child_not_verified")
+}
+async function countSuccessiveBerlinPlans(rootTaskId) {
+  const { rows } = await pool.query(`
+    SELECT COUNT(*)::int AS "count" FROM "agent_items" AS call
+    JOIN "agent_sessions" AS session ON session."id" = call."sessionId"
+    JOIN "agent_turns" AS turn ON turn."id" = call."turnId" AND turn."sessionId" = call."sessionId"
+    WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3
+      AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'agent.plan'
+      AND call."content"->'input'->'nodes' @> $4::jsonb AND turn."rootTaskId" = $3
+      AND session."userId" = $5 AND turn."userId" = $5`,
+  [ids.sessionId, ids.turnId, rootTaskId, JSON.stringify([{ key: successiveBerlinKey }]), ids.userId])
+  return rows.length === 1 && (rows[0]?.count === 0 || rows[0]?.count === 1) ? rows[0].count : null
+}
+function successiveWaitArgs(key, taskIds) {
+  return { idempotencyKey: key, taskIds, mode: "all", timeoutMs: 30_000 }
+}
+async function currentSuccessiveRootId() {
+  if (typeof ids.rootTaskId === "string" && ids.rootTaskId) return ids.rootTaskId
+  const { rows } = await pool.query(`
+    SELECT turn."rootTaskId" FROM "agent_turns" AS turn
+    JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
+    WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+      AND session."userId" = $3 AND turn."rootTaskId" IS NOT NULL LIMIT 2`,
+  [ids.turnId, ids.sessionId, ids.userId])
+  if (rows.length !== 1 || typeof rows[0]?.rootTaskId !== "string") throw new Error("p3_successive_replan_root_missing")
+  return rows[0].rootTaskId
+}
+async function waitForSuccessiveRootId(timeoutMs = 45_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try { return await currentSuccessiveRootId() } catch { await sleep(25) }
+  }
+  throw new Error("p3_successive_replan_root_not_initialized")
+}
+function acceptedNodeTaskId(request, callId, nodeKey) {
+  const result = record(latestToolResult(request, callId))
+  if (result?.status !== "accepted" || !Array.isArray(result.nodes)) return null
+  const matches = result.nodes.map(record).filter(node => node?.key === nodeKey)
+  return matches.length === 1 && typeof matches[0]?.taskId === "string" ? matches[0].taskId : null
+}
+async function assertSuccessiveLiveTask(rootTaskId, node) {
+  if (typeof node?.taskId !== "string") throw new Error("p3_successive_replan_task_missing")
+  const row = await successiveTaskRow(rootTaskId, node.taskId)
+  if (!row || row.status !== "running" || row.role !== "scout"
+    || !observedSuccessiveLeaseMatches(rootTaskId, row)
+    || !(row.leaseExpiresAt instanceof Date) || row.leaseExpiresAt.getTime() <= Date.now()
+    || row.interruptRequestedAt !== null) throw new Error("p3_successive_replan_live_task_missing")
+  return row
+}
+async function waitForSuccessiveInitialWait(rootTaskId, calls) {
+  const state = await waitForSuccessiveSuspendedWait(rootTaskId, calls.initialWaitKey, [successiveSeattleKey])
+  const seattle = state.nodes.find(node => node?.key === successiveSeattleKey)
+  if (typeof seattle?.taskId !== "string") throw new Error("p3_successive_replan_seattle_task_missing")
+  const deadline = Date.now() + 90_000
+  while (Date.now() < deadline) {
+    const row = await successiveTaskRow(rootTaskId, seattle.taskId)
+    if (!row || row.role !== "scout") throw new Error("p3_successive_replan_seattle_ownership_invalid")
+    if (row.status === "queued") {
+      if (row.leaseOwner !== null || row.leaseExpiresAt !== null || row.interruptRequestedAt !== null) {
+        throw new Error("p3_successive_replan_seattle_ownership_invalid")
+      }
+      await sleep(25)
+      continue
+    }
+    if (row.status === "running" && !successiveChildLeases.has(seattle.taskId)) {
+      await sleep(25)
+      continue
+    }
+    if (row.status !== "running" || row.attemptCount < 1
+      || !observedSuccessiveLeaseMatches(rootTaskId, row) || !(row.leaseExpiresAt instanceof Date)
+      || row.leaseExpiresAt.getTime() <= Date.now() || row.interruptRequestedAt !== null) {
+      throw new Error("p3_successive_replan_seattle_not_live")
+    }
+    if (!successiveSeattleSearchHeld) { await sleep(25); continue }
+    say("P3_SUCCESSIVE_REPLAN_SEATTLE_WAITING " + JSON.stringify({
+      planAccepted: true, waitSuspended: true, seattleLive: true,
+    }))
+    return
+  }
+  throw new Error("p3_successive_replan_seattle_not_live")
+}
+async function waitForSuccessiveFirstRetirement(rootTaskId, calls) {
+  const deadline = Date.now() + 90_000
+  while (Date.now() < deadline) {
+    const state = await successiveWaitState(rootTaskId, calls.firstWaitKey)
+    const graph = record(state?.content), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+    const seattle = nodes.find(node => node?.key === successiveSeattleKey)
+    const dublin = nodes.find(node => node?.key === successiveDublinKey)
+    const [retirement, dublinRow] = seattle && dublin ? await Promise.all([
+      readSuccessiveRetirement(rootTaskId, successiveSeattleKey, seattle.taskId, dublin.taskId, calls.retireSeattle),
+      successiveTaskRow(rootTaskId, dublin.taskId),
+    ]) : [null, null]
+    if (state?.turnStatus === "waiting_for_dependency" && state.waitStatus === "waiting" && state.suspendedAt
+      && nodes.length === 2 && retirement && dublinRow?.status === "running" && dublinRow.role === "scout"
+      && observedSuccessiveLeaseMatches(rootTaskId, dublinRow)
+      && dublinRow.leaseOwner && dublinRow.leaseExpiresAt instanceof Date && dublinRow.leaseExpiresAt.getTime() > Date.now()
+      && dublinRow.interruptRequestedAt === null) {
+      say("P3_SUCCESSIVE_REPLAN_FIRST_RETIREMENT " + JSON.stringify({
+        receiptValid: true, sameAttemptAck: retirement.receipt.attempt === retirement.task.attemptCount,
+        dublinLeaseLive: true, waitPending: true,
+      }))
+      return
+    }
+    await sleep(25)
+  }
+  throw new Error("p3_successive_replan_first_retirement_not_acknowledged")
+}
+async function successiveChildModel({ task }) {
+  if (task.role !== "scout") throw new Error("p3_successive_replan_unexpected_child_role")
+  const location = task.goal.includes("Seattle") ? "Seattle" : task.goal.includes("Dublin") ? "Dublin" : "Berlin"
+  const expectedJobId = ids[location.toLowerCase() + "JobId"]
+  if (typeof expectedJobId !== "string") throw new Error("p3_successive_replan_fixture_job_missing")
+  const input = { target: "Software Engineer", location, limit: 10 }
+  const callId = "p3-1248-search:" + task.id
+  return { id: "p3-successive-replan-" + location.toLowerCase() + "-child-model", profile: modelProfile(),
+    async *stream(request) {
+      const receipt = latestToolResultForExactToolInput(request, "jobs.search", input)
+      if (!receipt) {
+        if (!request.tools.some(tool => record(tool)?.name === "jobs.search")) throw new Error("p3_successive_replan_search_tool_missing")
+        yield toolCall(callId, "jobs.search", input)
+        yield { type: "completed", finishReason: "tool_calls" }
+        return
+      }
+      const search = record(receipt.result), jobs = Array.isArray(search?.jobs) ? search.jobs.map(record) : []
+      const job = jobs.find(item => item?.id === expectedJobId)
+      if (!job) throw new Error("p3_successive_replan_search_evidence_missing")
+      if (location === "Seattle" || location === "Dublin") {
+        successiveHeldChildren.add(task.id)
+        if (location === "Seattle") successiveSeattleSearchHeld = true
+        say("P3_SUCCESSIVE_REPLAN_CHILD_HELD " + JSON.stringify({ role: "scout", location: location.toLowerCase(), searchResultPresent: true }))
+        await waitForCommand(location === "Seattle" ? "release-seattle-child" : "release-dublin")
+      }
+      const evidenceId = "read:job:" + expectedJobId
+      const result = { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+        candidates: [{ jobId: expectedJobId, source: job.source ?? "greenhouse", url: null, evidenceIds: [evidenceId] }],
+        evidence: [{ id: evidenceId, kind: "job", ref: expectedJobId, source: job.source ?? "greenhouse" }],
+        summary: "Found the confirmed " + location + " fixture role" }
+      yield { type: "text_delta", text: JSON.stringify(result) }
+      yield { type: "completed", finishReason: "stop" }
+    },
+  }
+}
+function startSuccessiveReplanRuntime(ownerId, resume, calls) {
+  let initialWaitIssued = false, dublinPlanIssued = false, seattleRetirementIssued = false
+  let dublinStartedObserved = false, dublinRefreshIssued = false, dublinGraphRefreshVerified = false
+  let firstRetirementWaitIssued = false, berlinInspectionIssued = false, berlinPlanIssued = false
+  let berlinRefreshIssued = false, dublinRetirementIssued = false, finalWaitIssued = false, finalListIssued = false
+  let dublinReclaimAttempt
+  return createCanonicalTurnRuntime(pool, {
+    workerId: ownerId, productionFlags: flags(), taskGraphCommandPort: createPgTaskGraphCommandPort(pool),
+    taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => noReservationUsageAuthorization(),
+    modelRuntimeFactory() {
+      return { adapter: {
+        id: resume ? "p3-1248-successive-resume-model" : "p3-1248-successive-first-model", profile: modelProfile(),
+        async *stream(request) {
+          const facts = successiveRequestFacts(request), graph = facts.graph, nodes = facts.nodes
+          const seattle = nodes.find(node => node?.key === successiveSeattleKey)
+          const dublin = nodes.find(node => node?.key === successiveDublinKey)
+          const berlin = nodes.find(node => node?.key === successiveBerlinKey)
+          const rootTaskId = await waitForSuccessiveRootId()
+          if (!resume) {
+            if (!seattle) {
+              if (!request.tools.some(tool => record(tool)?.name === "agent.plan")) throw new Error("p3_successive_replan_initial_plan_missing")
+              yield toolCall(calls.seattlePlan, "agent.plan", { expectedRevision: 0,
+                nodes: [successiveLocationNode(successiveSeattleKey, "Seattle")] })
+              yield { type: "completed", finishReason: "tool_calls" }; return
+            }
+            if (!initialWaitIssued && !dublin) {
+              const seattleTaskId = acceptedNodeTaskId(request, calls.seattlePlan, successiveSeattleKey) ?? seattle.taskId
+              if (typeof seattleTaskId !== "string" || typeof graph?.revision !== "number") throw new Error("p3_successive_replan_initial_receipt_missing")
+              initialWaitIssued = true
+              yield toolCall(calls.seattleWait, "agent.wait", successiveWaitArgs(calls.initialWaitKey, [seattleTaskId]))
+              yield { type: "completed", finishReason: "tool_calls" }; return
+            }
+            if (!dublinPlanIssued && !dublin) {
+              if (!/dublin/i.test(facts.text) || !seattle || !request.tools.some(tool => record(tool)?.name === "agent.plan")
+                || typeof graph?.revision !== "number") throw new Error("p3_successive_replan_dublin_scope_missing")
+              dublinPlanIssued = true
+              yield toolCall(calls.dublinPlan, "agent.plan", { expectedRevision: graph.revision,
+                nodes: [successiveLocationNode(successiveDublinKey, "Dublin")] })
+              yield { type: "completed", finishReason: "tool_calls" }; return
+            }
+            if (dublin && !seattleRetirementIssued) {
+              const dublinTaskId = acceptedNodeTaskId(request, calls.dublinPlan, successiveDublinKey) ?? dublin.taskId
+              const plan = record(latestToolResult(request, calls.dublinPlan))
+              const acceptedNodes = Array.isArray(plan?.nodes) ? plan.nodes.map(record) : []
+              const acceptedDublin = acceptedNodes.find(node => node?.key === successiveDublinKey)
+              await assertSuccessiveLiveTask(rootTaskId, seattle)
+              if (plan?.status !== "accepted" || typeof plan.revision !== "number"
+                || dublinTaskId !== dublin.taskId || acceptedDublin?.taskId !== dublinTaskId
+                || typeof graph?.revision !== "number") throw new Error("p3_successive_replan_dublin_plan_receipt_invalid")
+              if (!dublinRefreshIssued) {
+                await waitForSuccessiveTaskStarted(rootTaskId, dublinTaskId, successiveDublinKey)
+                dublinStartedObserved = true
+                await waitForSuccessiveChildBoundary(dublinTaskId)
+                if (!request.tools.some(tool => record(tool)?.name === "agent.list")) {
+                  throw new Error("p3_successive_replan_dublin_refresh_tool_missing")
+                }
+                dublinRefreshIssued = true
+                yield toolCall(calls.dublinRefresh, "agent.list", { includeTerminal: true })
+                yield { type: "completed", finishReason: "tool_calls" }; return
+              }
+              const listing = record(latestToolResult(request, calls.dublinRefresh))
+              const listed = Array.isArray(listing?.tasks) ? listing.tasks.map(record) : []
+              const persistedRevision = await successiveGraphRevision(rootTaskId)
+              const dublinRunning = listed.filter(task => task?.taskId === dublinTaskId && task.status === "running").length === 1
+              const seattleRunning = listed.filter(task => task?.taskId === seattle.taskId && task.status === "running").length === 1
+              dublinGraphRefreshVerified = Boolean(listing && dublinStartedObserved && dublinRunning && seattleRunning
+                && typeof graph.revision === "number" && graph.revision === persistedRevision && graph.revision > plan.revision)
+              if (!dublinGraphRefreshVerified || !request.tools.some(tool => record(tool)?.name === "agent.retire_superseded_scout")) {
+                throw new Error("p3_successive_replan_dublin_refresh_invalid")
+              }
+              say("P3_SUCCESSIVE_REPLAN_DUBLIN_REFRESHED " + JSON.stringify({
+                planAccepted: true, startLifecycleObserved: dublinStartedObserved,
+                childClaimedBeforeModel: successiveClaimedBeforeModel.has(dublinTaskId),
+                listShowsBothRunning: true, graphRevisionMatches: true, graphRevisionAdvanced: true,
+              }))
+              seattleRetirementIssued = true
+              yield toolCall(calls.retireSeattle, "agent.retire_superseded_scout", {
+                expectedRevision: graph.revision, taskId: seattle.taskId,
+              })
+              yield { type: "completed", finishReason: "tool_calls" }; return
+            }
+            if (seattleRetirementIssued && !firstRetirementWaitIssued) {
+              const result = record(latestToolResult(request, calls.retireSeattle))
+              if (result?.status !== "interrupt_requested" || result.taskId !== seattle?.taskId
+                || !dublinStartedObserved || !dublinGraphRefreshVerified
+                || !request.tools.some(tool => record(tool)?.name === "agent.wait")) {
+                throw new Error("p3_successive_replan_seattle_retirement_result_missing")
+              }
+              say("P3_SUCCESSIVE_REPLAN_SEATTLE_INTERRUPT_REQUESTED " + JSON.stringify({ replacementAccepted: true, interruptRequested: true,
+                dublinStartedObserved, dublinGraphRefreshVerified,
+                rootLeaseMatchesProcess: await requireSuccessiveRootLeaseMatchesProcess(rootTaskId) }))
+              await waitForCommand("release-seattle")
+              if (typeof dublin?.taskId !== "string") throw new Error("p3_successive_replan_dublin_task_missing")
+              firstRetirementWaitIssued = true
+              yield toolCall(calls.firstWait, "agent.wait", successiveWaitArgs(calls.firstWaitKey, [seattle.taskId, dublin.taskId]))
+              yield { type: "completed", finishReason: "tool_calls" }; return
+            }
+            if (firstRetirementWaitIssued && !berlinInspectionIssued) {
+              say("P3_SUCCESSIVE_REPLAN_BERLIN_REQUEST " + JSON.stringify({ requestEntered: true,
+                freshSteeringCuePresent: facts.freshSteeringCuePresent, berlinScopePresent: facts.berlinScopePresent,
+                listToolAvailable: request.tools.some(tool => record(tool)?.name === "agent.list") }))
+              if (!facts.freshSteeringCuePresent || !facts.berlinScopePresent || !request.tools.some(tool => record(tool)?.name === "agent.list")) {
+                throw new Error("p3_successive_replan_berlin_inspection_context_missing")
+              }
+              berlinInspectionIssued = true
+              yield toolCall(calls.berlinInspect, "agent.list", { includeTerminal: true })
+              yield { type: "completed", finishReason: "tool_calls" }; return
+            }
+            if (berlinInspectionIssued) {
+              const listing = record(latestToolResult(request, calls.berlinInspect))
+              const listed = Array.isArray(listing?.tasks) ? listing.tasks.map(record) : []
+              const prior = await readSuccessiveRetirement(rootTaskId, successiveSeattleKey, seattle?.taskId,
+                dublin?.taskId, calls.retireSeattle)
+              const planCount = await countSuccessiveBerlinPlans(rootTaskId)
+              const seattleInterrupted = listed.some(task => task?.taskId === seattle?.taskId && task.status === "interrupted")
+              const dublinRunning = listed.some(task => task?.taskId === dublin?.taskId && task.status === "running")
+              say("P3_SUCCESSIVE_REPLAN_BERLIN_LIST_PROOF " + JSON.stringify({ listResultPresent: Boolean(listing),
+                seattleInterrupted, dublinRunning, unresolvedSteeringCuePresent: facts.unresolvedSteeringCuePresent,
+                berlinScopePresent: facts.berlinScopePresent, priorRetirementPresent: Boolean(prior),
+                noBerlinPlanYet: planCount === 0 }))
+              if (!listing || !seattleInterrupted || !dublinRunning
+                || !facts.unresolvedSteeringCuePresent || !facts.berlinScopePresent || !prior || planCount !== 0) {
+                throw new Error("p3_successive_replan_crash_cut_proof_invalid")
+              }
+              say("P3_SUCCESSIVE_REPLAN_CRASH_CUT " + JSON.stringify({
+                inspectResultValid: true, steerConsumed: true,
+                unresolvedSteeringCuePresent: facts.unresolvedSteeringCuePresent, berlinScopePresent: true,
+                priorRetirementPresent: true, acceptedBerlinPlanCount: 0,
+                rootLeaseMatchesProcess: await requireSuccessiveRootLeaseMatchesProcess(rootTaskId),
+              }))
+              await waitForCommand("continue-after-consumed-steer")
+              throw new Error("p3_successive_replan_crash_cut_not_killed")
+            }
+            throw new Error("p3_successive_replan_first_worker_state_invalid")
+          }
+          if (!berlinPlanIssued && !berlin) {
+            const prior = seattle && dublin ? await readSuccessiveRetirement(rootTaskId, successiveSeattleKey,
+              seattle.taskId, dublin.taskId, calls.retireSeattle) : null
+            const planCount = await countSuccessiveBerlinPlans(rootTaskId)
+            if (!seattle || !dublin || !facts.unresolvedSteeringCuePresent || !facts.berlinScopePresent || !prior
+              || planCount !== 0 || typeof graph?.revision !== "number"
+              || !request.tools.some(tool => record(tool)?.name === "agent.plan")) {
+              throw new Error("p3_successive_replan_resume_context_invalid")
+            }
+            say("P3_SUCCESSIVE_REPLAN_CONTEXT " + JSON.stringify({
+              unresolvedSteeringCuePresent: facts.unresolvedSteeringCuePresent,
+              berlinScopePresent: true, priorRetirementPresent: true, planToolAvailable: true,
+              rootLeaseMatchesProcess: await requireSuccessiveRootLeaseMatchesProcess(rootTaskId),
+            }))
+            berlinPlanIssued = true
+            yield toolCall(calls.berlinPlan, "agent.plan", { expectedRevision: graph.revision,
+              nodes: [successiveLocationNode(successiveBerlinKey, "Berlin")] })
+            yield { type: "completed", finishReason: "tool_calls" }; return
+          }
+          if (berlin && !dublinRetirementIssued) {
+            const plan = record(latestToolResult(request, calls.berlinPlan))
+            const berlinTaskId = acceptedNodeTaskId(request, calls.berlinPlan, successiveBerlinKey) ?? berlin.taskId
+            const planCount = await countSuccessiveBerlinPlans(rootTaskId)
+            if (plan?.status !== "accepted" || typeof plan.revision !== "number"
+              || typeof berlinTaskId !== "string" || berlinTaskId !== berlin.taskId || typeof dublin?.taskId !== "string"
+              || planCount !== 1 || typeof graph?.revision !== "number"
+              || !request.tools.some(tool => record(tool)?.name === "agent.retire_superseded_scout")) {
+              throw new Error("p3_successive_replan_berlin_plan_receipt_invalid")
+            }
+            if (!berlinRefreshIssued) {
+              say("P3_SUCCESSIVE_REPLAN_PLAN_ACCEPTED " + JSON.stringify({
+                accepted: true, berlinNodePresent: true, acceptedPlanCount: 1,
+                rootLeaseMatchesProcess: await requireSuccessiveRootLeaseMatchesProcess(rootTaskId),
+              }))
+              const dublinLease = await waitForSuccessiveDublinReclaim(rootTaskId, dublin?.taskId, ids.dublinAttemptBeforeRestart)
+              dublinReclaimAttempt = dublinLease.attemptCount
+              await waitForSuccessiveChildSearchHeld(dublin?.taskId)
+              const activeDublin = await successiveTaskRow(rootTaskId, dublin?.taskId)
+              const verifiedBerlin = await waitForSuccessiveBerlinVerified(rootTaskId, berlinTaskId, ids.berlinJobId)
+              if (!activeDublin || activeDublin.status !== "running" || activeDublin.role !== "scout"
+                || activeDublin.attemptCount !== dublinLease.attemptCount
+                || !observedSuccessiveLeaseMatches(rootTaskId, activeDublin)
+                || !(activeDublin.leaseExpiresAt instanceof Date) || activeDublin.leaseExpiresAt.getTime() <= Date.now()
+                || activeDublin.interruptRequestedAt !== null || !successiveBerlinResultVerified(verifiedBerlin, ids.berlinJobId)
+                || !request.tools.some(tool => record(tool)?.name === "agent.list")) {
+                throw new Error("p3_successive_replan_children_not_stable_for_refresh")
+              }
+              berlinRefreshIssued = true
+              yield toolCall(calls.berlinRefresh, "agent.list", { includeTerminal: true })
+              yield { type: "completed", finishReason: "tool_calls" }; return
+            }
+            const listing = record(latestToolResult(request, calls.berlinRefresh))
+            const listed = Array.isArray(listing?.tasks) ? listing.tasks.map(record) : []
+            const persistedRevision = await successiveGraphRevision(rootTaskId)
+            const activeDublin = await successiveTaskRow(rootTaskId, dublin?.taskId)
+            const verifiedBerlin = await successiveTaskRow(rootTaskId, berlinTaskId)
+            const dublinListed = listed.filter(task => task?.taskId === dublin?.taskId && task.status === "running").length === 1
+            const berlinListed = listed.filter(task => task?.taskId === berlinTaskId && task.status === "completed").length === 1
+            if (!listing || !dublinListed || !berlinListed || !activeDublin || activeDublin.status !== "running"
+              || !Number.isSafeInteger(dublinReclaimAttempt) || activeDublin.attemptCount !== dublinReclaimAttempt
+              || !observedSuccessiveLeaseMatches(rootTaskId, activeDublin)
+              || !(activeDublin.leaseExpiresAt instanceof Date) || activeDublin.leaseExpiresAt.getTime() <= Date.now()
+              || activeDublin.interruptRequestedAt !== null || !successiveBerlinResultVerified(verifiedBerlin, ids.berlinJobId)
+              || typeof graph.revision !== "number" || graph.revision !== persistedRevision || graph.revision <= plan.revision
+              || berlin.status !== "completed" || dublin.status !== "running") {
+              throw new Error("p3_successive_replan_berlin_refresh_invalid")
+            }
+            say("P3_SUCCESSIVE_REPLAN_BERLIN_REFRESHED " + JSON.stringify({ listResultPresent: true,
+              dublinSearchHeld: true, dublinRunning: true, berlinVerified: true,
+              graphRevisionMatches: true, graphRevisionAdvanced: true }))
+            dublinRetirementIssued = true
+            yield toolCall(calls.retireDublin, "agent.retire_superseded_scout", {
+              expectedRevision: graph.revision, taskId: dublin.taskId,
+            })
+            yield { type: "completed", finishReason: "tool_calls" }; return
+          }
+          if (dublinRetirementIssued && !finalWaitIssued) {
+            const retirement = record(latestToolResult(request, calls.retireDublin))
+            const dublinRow = await successiveTaskRow(rootTaskId, dublin?.taskId)
+            const expectedAttempt = dublinReclaimAttempt
+            const acceptedAttempt = Number.isSafeInteger(expectedAttempt)
+              && expectedAttempt > ids.dublinAttemptBeforeRestart
+              && retirement?.attempt === expectedAttempt && dublinRow?.attemptCount === expectedAttempt
+            const liveLeaseBound = !!acceptedAttempt && dublinRow?.status === "running"
+              && dublinRow.interruptRequestedAt instanceof Date && observedSuccessiveLeaseMatches(rootTaskId, dublinRow)
+              && dublinRow.leaseExpiresAt instanceof Date && dublinRow.leaseExpiresAt.getTime() > Date.now()
+            const retirementProof = acceptedAttempt && !liveLeaseBound
+              ? await readSuccessiveRetirement(rootTaskId, successiveDublinKey, dublin.taskId, berlin.taskId, calls.retireDublin)
+              : null
+            const workerAcknowledged = !!retirementProof && retirementProof.receipt.attempt === expectedAttempt
+              && retirementProof.task.attemptCount === expectedAttempt && retirementProof.task.status === "interrupted"
+              && retirementProof.task.interruptRequestedAt instanceof Date && retirementProof.task.leaseOwner === null
+              && retirementProof.task.leaseExpiresAt === null
+            if (retirement?.status !== "interrupt_requested" || retirement.taskId !== dublin?.taskId
+              || !dublinRow || dublinRow.role !== "scout" || !acceptedAttempt
+              || liveLeaseBound === workerAcknowledged
+              || !request.tools.some(tool => record(tool)?.name === "agent.wait")) {
+              throw new Error("p3_successive_replan_dublin_retirement_result_invalid")
+            }
+            say("P3_SUCCESSIVE_REPLAN_DUBLIN_INTERRUPT_REQUESTED " + JSON.stringify({ interruptRequestAccepted: true,
+              liveLeaseBound, workerAcknowledged,
+              rootLeaseMatchesProcess: await requireSuccessiveRootLeaseMatchesProcess(rootTaskId) }))
+            finalWaitIssued = true
+            yield toolCall(calls.finalWait, "agent.wait", successiveWaitArgs(calls.finalWaitKey, [dublin.taskId, berlin.taskId]))
+            yield { type: "completed", finishReason: "tool_calls" }; return
+          }
+          if (finalWaitIssued && !finalListIssued) {
+            const outcome = record(latestToolResult(request, calls.finalWait))
+            const tasks = Array.isArray(outcome?.tasks) ? outcome.tasks.map(record) : []
+            if (outcome?.status !== "ready" || !tasks.some(task => task?.taskId === dublin?.taskId && task.status === "interrupted")
+              || !tasks.some(task => task?.taskId === berlin?.taskId && task.status === "completed")
+              || !request.tools.some(tool => record(tool)?.name === "agent.list")) {
+              throw new Error("p3_successive_replan_final_wait_invalid")
+            }
+            finalListIssued = true
+            yield toolCall(calls.finalList, "agent.list", { includeTerminal: true })
+            yield { type: "completed", finishReason: "tool_calls" }; return
+          }
+          if (finalListIssued) {
+            const listing = record(latestToolResult(request, calls.finalList))
+            const tasks = Array.isArray(listing?.tasks) ? listing.tasks.map(record) : []
+            if (!tasks.some(task => task?.taskId === seattle?.taskId && task.status === "interrupted")
+              || !tasks.some(task => task?.taskId === dublin?.taskId && task.status === "interrupted")
+              || !tasks.some(task => task?.taskId === berlin?.taskId && task.status === "completed")) {
+              throw new Error("p3_successive_replan_final_list_invalid")
+            }
+            yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final",
+              response: "The confirmed Berlin search is complete." }) }
+            yield { type: "completed", finishReason: "stop" }; return
+          }
+          throw new Error("p3_successive_replan_resume_state_invalid")
+        },
+      }, registry: {}, candidates: [] }
+    },
+  })
+}
+async function waitForSuccessiveTurnCompletion(rootTaskId, timeoutMs = 120_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const [{ rows: turns }, { rows: graphs }] = await Promise.all([
+      pool.query(`
+        SELECT turn."status" FROM "agent_turns" AS turn
+        JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
+        WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+          AND session."userId" = $3 AND turn."rootTaskId" = $4 LIMIT 2`,
+      [ids.turnId, ids.sessionId, ids.userId, rootTaskId]),
+      pool.query(`
+        SELECT graph."id" FROM "agent_items" AS graph
+        JOIN "agent_sessions" AS session ON session."id" = graph."sessionId"
+        JOIN "agent_turns" AS turn ON turn."id" = graph."turnId" AND turn."sessionId" = graph."sessionId"
+        WHERE graph."id" = $1 AND graph."taskId" = $2 AND graph."sessionId" = $3 AND graph."turnId" = $4
+          AND graph."type" = 'task_graph' AND session."userId" = $5 AND turn."userId" = $5
+          AND turn."rootTaskId" = $2 LIMIT 2`,
+      [taskGraphItemId(rootTaskId), rootTaskId, ids.sessionId, ids.turnId, ids.userId]),
+    ])
+    if (turns.length === 1 && graphs.length === 1 && turns[0]?.status === "completed") {
+      const marker = { turnCompleted: true }
+      say("P3_SUCCESSIVE_REPLAN_FINAL " + JSON.stringify(marker))
+      return
+    }
+    await sleep(25)
+  }
+  throw new Error("p3_successive_replan_turn_not_completed")
+}
+async function runSuccessiveReplanWorker(resume) {
+  if (resume) armSuccessiveRecoveryTrace()
+  const ownerId = "p3-process-restart-successive-worker-" + process.pid
+  const calls = successiveWaitIds(ids)
+  const runtime = await startSuccessiveReplanRuntime(ownerId, resume, calls)
+  const executeTurn = runtime.execute
+  runtime.execute = input => {
+    const lease = input?.lease
+    if (lease?.turnId === ids.turnId && lease.sessionId === ids.sessionId && lease.userId === ids.userId
+      && typeof lease.ownerId === "string" && Number.isSafeInteger(lease.leaseVersion) && lease.leaseVersion > 0) {
+      successiveRootLease = { turnId: lease.turnId, sessionId: lease.sessionId, userId: lease.userId,
+        ownerId: lease.ownerId, leaseVersion: lease.leaseVersion }
+    }
+    return executeTurn(input)
+  }
+  const childExecutor = createProductionChildExecutor({
+    pool, authorizeUsage: async () => noReservationUsageAuthorization(),
+    modelRuntimeFactory: successiveChildModel,
+  })
+  const { createProductionWorkerBootstrap } = await import("../../queue/production-bootstrap.ts")
+  bootstrap = await createProductionWorkerBootstrap({
+    pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
+    waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-successive-resolver-" + process.pid },
+    subagents: { intervalMs: 10, async execute({ lease }) { return executeSuccessiveChild({ lease }, childExecutor) } },
+  })
+  const rootTaskId = await waitForSuccessiveRootId()
+  if (resume) await waitForSuccessiveTurnCompletion(rootTaskId)
+  else {
+    await waitForSuccessiveInitialWait(rootTaskId, calls)
+    await waitForSuccessiveFirstRetirement(rootTaskId, calls)
+  }
+  await waitForStop()
+}
 async function createArchivedWaitChildren(rootTaskId) {
   const store = new PgSubagentTaskStore(pool), policy = defaultSubagentPolicy(), taskIds = []
   for (let index = 0; index < 7; index++) {
@@ -2064,6 +2881,7 @@ try {
     process.stdin.off("data", onStdinData); process.stdin.pause(); process.stdin.destroy()
   }
   else if (mode === "park-parent" || mode === "resume-parent" || mode === "park-discovery" || mode === "resume-discovery"
+    || mode === "park-successive-replan" || mode === "resume-successive-replan"
     || mode === "crash-archived-wait" || mode === "resume-archived-wait") {
     assertDisposableServiceUrls()
     await loadSharedRedisModule()
@@ -2071,6 +2889,8 @@ try {
     else if (mode === "resume-parent") await runSecondWorker()
     else if (mode === "park-discovery") await runDiscoveryFirstWorker()
     else if (mode === "resume-discovery") await runDiscoverySecondWorker()
+    else if (mode === "park-successive-replan") await runSuccessiveReplanWorker(false)
+    else if (mode === "resume-successive-replan") await runSuccessiveReplanWorker(true)
     else if (mode === "crash-archived-wait") await runArchivedWaitFirstWorker()
     else await runArchivedWaitResumeWorker()
   }
