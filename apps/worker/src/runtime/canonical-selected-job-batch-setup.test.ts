@@ -8,7 +8,7 @@ import {
 const { loadGraphMock } = vi.hoisted(() => ({ loadGraphMock: vi.fn() }))
 vi.mock("./subagents/task-graph-pg-state.js", () => ({ loadTaskGraph: loadGraphMock }))
 
-import { prepareCanonicalSelectedJobBatchSetup } from "./canonical-selected-job-batch-setup.js"
+import { canonicalSelectedJobBatchRuntimeAvailable, failCanonicalSelectedJobBatchUnavailable, prepareCanonicalSelectedJobBatchForTurn, prepareCanonicalSelectedJobBatchSetup } from "./canonical-selected-job-batch-setup.js"
 import type { CanonicalTurnState } from "./canonical-turn-state.js"
 import { taskGraphItemId } from "./subagents/task-graph-snapshot.js"
 import type { TurnLease } from "./turns/lease.js"
@@ -42,6 +42,10 @@ type FixtureOptions = Readonly<{
   graphRevision?: number
   failJobQuery?: boolean
   state?: CanonicalTurnState
+  forTurn?: boolean
+  completionGate?: () => unknown
+  runtimeAvailable?: boolean
+  signal?: AbortSignal
 }>
 
 async function run(options: FixtureOptions = {}) {
@@ -79,7 +83,11 @@ async function run(options: FixtureOptions = {}) {
     item: { id: source.graphItemId, revision: options.graphRevision ?? source.graphRevision, content: {}, createdAt: new Date(0) },
     snapshot: { nodes: [{ key: "source", taskId: "source-task" }] }, state: {}, tasks: new Map(),
   })
-  const result = await prepareCanonicalSelectedJobBatchSetup({ pool, lease, state: options.state ?? batchState(), currentRootTaskId })
+  const state = options.state ?? batchState()
+  const result = options.forTurn
+    ? await prepareCanonicalSelectedJobBatchForTurn({ pool, lease, state, currentRootTaskId, signal: options.signal ?? new AbortController().signal,
+      completionGate: options.completionGate as never, runtimeAvailable: options.runtimeAvailable ?? true })
+    : await prepareCanonicalSelectedJobBatchSetup({ pool, lease, state, currentRootTaskId })
   return { result, calls, connect: pool.connect, release }
 }
 
@@ -157,5 +165,43 @@ describe("canonical selected-job batch setup proof", () => {
       expect(result).toEqual({ status: "not_batch" })
       expect(connect).not.toHaveBeenCalled()
     }
+  })
+
+  it("requires the trusted completion factory and runtime prerequisites before batch setup is returned", async () => {
+    const missingGate = await run({ forTurn: true })
+    expect(missingGate.result).toEqual({ status: "unavailable" })
+    const gateWithoutPrerequisites = await run({ forTurn: true, completionGate: () => undefined, runtimeAvailable: false })
+    expect(gateWithoutPrerequisites.result).toEqual({ status: "unavailable" })
+    const ready = await run({ forTurn: true, completionGate: () => undefined })
+    expect(ready.result.status).toBe("ready")
+  })
+
+  it("propagates abort for a claimed batch before opening a proof transaction", async () => {
+    const controller = new AbortController()
+    controller.abort(new Error("batch_cancelled"))
+    const connect = vi.fn()
+    await expect(prepareCanonicalSelectedJobBatchForTurn({ pool: { connect } as never, lease, state: batchState(), currentRootTaskId: null,
+      signal: controller.signal, completionGate: (() => undefined) as never, runtimeAvailable: true })).rejects.toThrow("batch_cancelled")
+    expect(connect).not.toHaveBeenCalled()
+  })
+
+  it("requires the concrete command-port operations used by planning and terminal verification", () => {
+    const commandPort = { appendAndScheduleWithReconciliation() {}, readCurrentWithClient() {} } as never
+    const common = { enabled: true, coordination: true, childExecution: true, consumeWaitOutcomes: true, commandPort, rootCompletion: true }
+    expect(canonicalSelectedJobBatchRuntimeAvailable(common)).toBe(true)
+    expect(canonicalSelectedJobBatchRuntimeAvailable({ ...common, commandPort: {} as never })).toBe(false)
+    expect(canonicalSelectedJobBatchRuntimeAvailable({ ...common, rootCompletion: false })).toBe(false)
+  })
+
+  it("finishes unavailable batches with an empty Root action list and failed projections", async () => {
+    const root = { id: "batch-root", attemptCount: 1 }
+    const ensure = vi.fn(async (input: { allowedActions: string[] }) => { expect(input.allowedActions).toEqual([]); return root })
+    const finish = vi.fn(), executionFinish = vi.fn(), sessionFinish = vi.fn()
+    await expect(failCanonicalSelectedJobBatchUnavailable({ lease, state: batchState(), rootTasks: { ensure, finish } as never,
+      executionProjection: { finish: executionFinish } as never, sessionProjection: { finish: sessionFinish } as never, now: () => new Date(0) }))
+      .resolves.toEqual({ status: "failed", summary: "selected_job_batch_unavailable" })
+    expect(finish).toHaveBeenCalledOnce()
+    expect(executionFinish).toHaveBeenCalledOnce()
+    expect(sessionFinish).toHaveBeenCalledOnce()
   })
 })
