@@ -1,8 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createApplicationSubmissionRouteHandler, loadApprovedTurnScope } from "./application-submission-route-gate.js";
 
-const mocks = vi.hoisted(() => ({ inspectSubmission: vi.fn(), legacyStartFence: vi.fn() }));
+const mocks = vi.hoisted(() => ({ inspectSubmission: vi.fn(), legacyStartFence: vi.fn(), finishTask: vi.fn() }));
 vi.mock("../db/apply-results.js", () => ({ getPool: vi.fn(() => ({})) }));
+vi.mock("../db/application-task-state.js", () => ({
+  finishApplicationTask: mocks.finishTask,
+  isConfirmedApplicationTaskFinish: (result: string) => result === "current" || result === "already_current",
+}));
 vi.mock("../runtime/approval/pg-store.js", () => ({
   createPgApprovalStore: vi.fn(() => ({ inspectSubmission: mocks.inspectSubmission })),
 }));
@@ -21,7 +25,7 @@ const identity = {
   constraintHash: "a".repeat(64),
 };
 
-function routeGateHarness(options: { fenceState?: "ready" | "stopped"; continueRoute?: () => Promise<void> } = {}) {
+function routeGateHarness(options: { fenceState?: "ready" | "stopped" | "uncertain"; continueRoute?: () => Promise<void> } = {}) {
   let acknowledge!: () => void;
   let routeCalled!: () => void;
   const continuation = new Promise<void>(resolve => { acknowledge = resolve; });
@@ -66,7 +70,7 @@ function routeGateHarness(options: { fenceState?: "ready" | "stopped"; continueR
     continue: vi.fn(() => { order.push("continue"); routeCalled(); return options.continueRoute ? options.continueRoute() : continuation; }),
     abort: vi.fn().mockResolvedValue(undefined), fallback: vi.fn().mockResolvedValue(undefined),
   };
-  return { acknowledge, continued, handler, lifecycle, onContinuationAcknowledged, order, releaseSubmissionFence, route, scope, stagedStartFence };
+  return { acknowledge, continued, handler, lifecycle, onContinuationAcknowledged, order, releaseSubmissionFence, route, scope, stagedStartFence, state };
 }
 
 describe("approved application route scope", () => {
@@ -85,6 +89,7 @@ describe("approved application route scope", () => {
       payload: { applicationTaskId: "task", jobId: "job" },
     });
     mocks.legacyStartFence.mockReset();
+    mocks.finishTask.mockReset().mockResolvedValue("current");
   });
 
   it("binds the approved scope to the exact queue execution", async () => {
@@ -164,5 +169,20 @@ describe("approved application route scope", () => {
     expect(harness.onContinuationAcknowledged).not.toHaveBeenCalled();
     expect(harness.releaseSubmissionFence).not.toHaveBeenCalled();
     expect(harness.lifecycle.interruptStoppedTurn).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["unconfirmed", false],
+    ["already_current", true],
+  ] as const)("finalizes an ambiguous start only for %s task result", async (result, finalized) => {
+    mocks.finishTask.mockResolvedValueOnce(result);
+    const harness = routeGateHarness({ fenceState: "uncertain" });
+
+    await harness.handler(harness.route as never);
+
+    expect(harness.route.abort).toHaveBeenCalledWith("failed");
+    expect(harness.route.continue).not.toHaveBeenCalled();
+    expect(harness.state.applicationTaskFinalized).toBe(finalized);
+    expect(mocks.finishTask).toHaveBeenCalledOnce();
   });
 });

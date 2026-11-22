@@ -172,6 +172,7 @@ vi.mock("../db/application-task-state.js", () => ({
   applicationTaskStillActive: vi.fn().mockResolvedValue(true),
   completeFillForReview: mockCompleteFillForReview,
   finishApplicationTask: mockFinishApplicationTask,
+  isConfirmedApplicationTaskFinish: (result: string) => result === "current" || result === "already_current",
   isUserActive: mockIsUserActive,
   markSubmissionRequestStarted: mockMarkSubmissionRequestStarted,
   needsUserTakeover: vi.fn().mockReturnValue(false),
@@ -358,7 +359,7 @@ describe("apply-queue (unit — mocked)", () => {
         ? "started"
         : "inactive"
     );
-    mockFinishApplicationTask.mockReset().mockResolvedValue(undefined);
+    mockFinishApplicationTask.mockReset().mockResolvedValue("current");
     mockClaimUnattendedSubmission.mockReset().mockResolvedValue("claimed");
     mockReleaseUncertainSubmission.mockReset().mockResolvedValue({ kind: "current", value: true });
     mockUpdateJobForSubmission.mockReset().mockResolvedValue({ kind: "current", value: true });
@@ -1301,7 +1302,7 @@ describe("apply-queue (unit — mocked)", () => {
         events.push("uncertain-write");
         signalUncertainWritten();
       }
-      return undefined;
+      return "current";
     });
     mockProviderSubmitClick.mockImplementationOnce(() => {
       releasesWhenContinuationStarted = mockTurnClient.release.mock.calls.length;
@@ -1388,6 +1389,7 @@ describe("apply-queue (unit — mocked)", () => {
         task.status = status;
         task.checkpoint = checkpoint;
       }
+      return "current";
     });
     mockMarkSubmissionRequestStarted.mockImplementationOnce(async () => {
       task.checkpoint = "submission_request_started";
@@ -1474,7 +1476,7 @@ describe("apply-queue (unit — mocked)", () => {
       return baseQuery!(sql);
     });
     configureMockBrowserSubmitTool();
-    mockFinishApplicationTask.mockImplementationOnce(async () => { order.push("finish-uncertain"); });
+    mockFinishApplicationTask.mockImplementationOnce(async () => { order.push("finish-uncertain"); return "current"; });
     mockHarnessRun.mockImplementation(async (_page: unknown, task: { beforeSubmit?: (intent?: { url: string; method: string }) => Promise<boolean> }) => {
       const intent = { url: "https://example.com/jobs/123/apply", method: "POST" };
       if (!await task.beforeSubmit?.(intent)) {
@@ -1578,6 +1580,7 @@ describe("apply-queue (unit — mocked)", () => {
     });
     mockFinishApplicationTask.mockImplementation(async (_pool: unknown, _id: string, status: string, checkpoint: string) => {
       current.task = { status, checkpoint };
+      return "current";
     });
     await import("./apply-queue.js");
 
@@ -1830,6 +1833,33 @@ describe("apply-queue (unit — mocked)", () => {
       expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.stringContaining("after it started"), "submit", expectedSubmissionIdentity,
     );
     expect(uncertaintyWasPersistedAtClose).toBe(true);
+  });
+
+  it("retries an unconfirmed uncertain outcome without repeating the request", async () => {
+    configureMockBrowserSubmitTool();
+    mockFinishApplicationTask.mockResolvedValue("unconfirmed");
+    mockHarnessRun.mockImplementation(async (_page: unknown, task: { beforeSubmit?: (intent?: { url: string; method: string }) => Promise<boolean> }) => {
+      const intent = { url: "https://example.com/jobs/123/apply", method: "POST" };
+      if (!await task.beforeSubmit?.(intent)) return { status: "submission_blocked", error: "Submission guard denied.", durationMs: 123 };
+      await dispatchPageRequest(intent.url, intent.method);
+      return { status: "manual", error: "Submission result is unknown.", durationMs: 123 };
+    });
+    await import("./apply-queue.js");
+    const data = {
+      applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1",
+      sessionId: "agent-session-1", fillTurnId: "agent-turn-1", applyUrl: "https://example.com/jobs/123/apply",
+      personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false, receiptId: "approval-1", constraintHash: "c".repeat(64),
+    };
+
+    await expect(mockProcessor({ data })).rejects.toThrow("Could not confirm the uncertain application task state.");
+    expect(mockProviderSubmitClick).toHaveBeenCalledOnce();
+    expect(mockFinishApplicationTask).toHaveBeenCalledTimes(2);
+    mockClaimUnattendedSubmission.mockResolvedValueOnce("unavailable");
+    await mockProcessor({ data });
+
+    expect(mockProviderSubmitClick).toHaveBeenCalledOnce();
+    expect(mockWithCloakContext).toHaveBeenCalledOnce();
+    expect(mockClaimUnattendedSubmission).toHaveBeenCalledTimes(2);
   });
 
   it("fills without submission, then creates the durable final-review checkpoint", async () => {
