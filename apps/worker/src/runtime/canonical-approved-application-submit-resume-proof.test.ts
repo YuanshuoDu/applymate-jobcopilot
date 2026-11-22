@@ -31,7 +31,7 @@ const reviewedArtifact = {
 }
 const reviewedBrowserStart = { actor: "worker", data: {
   schemaVersion: "agent-harness.v2.reviewed-application-fill-browser-start.v1", userId: "user-a", sessionId: "session-a",
-  fillTurnId: "turn-a", applicationTaskId: "application-a", fillerTaskId: "filler-a", jobId: "job-a", rootTaskId: "root-a",
+  fillTurnId: "turn-a", applicationTaskId: "application-a", fillerTaskId: "filler-a", jobId: "job-a", rootTaskId: "source-root",
   graphRevision: 7, attemptCount: 1, leaseOwner: "worker-a", leaseExpiresAt: "2026-11-22T12:00:30.000Z",
   sourceTurnId: "source-a", writerTaskId: "writer-a", reviewerTaskId: "reviewer-a", reviewerToolCallId: "review-tool-a",
   reviewHash: `sha256:${"a".repeat(64)}`, artifactId: "artifact-a", version: 2,
@@ -117,6 +117,16 @@ describe("canonical approved application submit resume proof", () => {
       events: [reviewedBrowserStart, reviewedBrowserStart],
     })
     await expect(readCanonicalApprovedApplicationSubmitResumeProof(duplicateBinding.client, { lease, rootTaskId: "root-a", now })).resolves.toBeNull()
+    expect(readReceipts).not.toHaveBeenCalled()
+  })
+
+  it.each(["root-a", "unrelated-root"])("rejects a browser binding with the wrong reviewed source Root %s", async sourceRootId => {
+    readReviewedArtifact.mockResolvedValue(reviewedArtifact)
+    const test = clientFor({
+      turn: { executionMode: null, input: { reviewedApplicationMaterialSource: reviewedMarker } },
+      events: [{ ...reviewedBrowserStart, data: { ...reviewedBrowserStart.data, rootTaskId: sourceRootId } }],
+    })
+    await expect(readCanonicalApprovedApplicationSubmitResumeProof(test.client, { lease, rootTaskId: "root-a", now })).resolves.toBeNull()
     expect(readReceipts).not.toHaveBeenCalled()
   })
 
