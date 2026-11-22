@@ -43,6 +43,28 @@ const ids = {
 const SAFE_DIAGNOSTIC_ERROR_CODES = new Set([
   "turn_execution_failed",
   "model_execution_failed",
+  "invalid_output",
+  "persistence_conflict",
+  "no_progress",
+  "budget_exceeded",
+  "tool_execution_failed",
+  "tool_result_replay_uncertain",
+  "tool_recovery_aborted",
+  "policy_requires_approval",
+  "approval_already_consumed",
+  "approval_not_approved",
+  "approval_expired",
+  "approval_scope_mismatch",
+  "approval_integrity_error",
+  "approval_nonce_mismatch",
+  "approval_revision_mismatch",
+  "approval_reservation_conflict",
+  "submission_attempt_fenced",
+  "submission_scope_mismatch",
+  "stale_artifact",
+  "submission_guard_denied",
+  "target_not_found",
+  "invalid_state",
   "application_fill_state_invalid",
   "application_fill_binding_invalid",
   "application_fill_material_unavailable",
@@ -544,6 +566,39 @@ describe("reviewed source turn diagnostics", () => {
       tools: [{ name: "agent.plan", status: "completed" }, { name: "other", status: "other" }],
     })
     expect(JSON.stringify(summary)).not.toContain("private")
+  })
+})
+
+describe("Stage8 terminal diagnostics", () => {
+  it("reports approval resume evidence without exposing IDs, receipt contents, or tool inputs", () => {
+    const summary = stage8FailureSummary({
+      expectedApprovalId: "private-approval-id",
+      turn: { status: "failed", error: "persistence_conflict", rootTaskId: "private-root-id" },
+      root: { status: "failed", failureReason: "lease_lost" },
+      applicationTask: { status: "waiting_for_authorization", checkpoint: "form_filled" },
+      approval: { status: "approved", toolCallId: "private-tool-call-id" },
+      wait: { status: "completed", content: {
+        waitKind: "approval", approvalId: "private-approval-id", toolCallId: "private-tool-call-id",
+        decision: "approved", responseAvailable: true, receiptNonce: "private-nonce",
+      } },
+      steps: [{ status: "failed", errorCode: "invalid_output" }],
+      tools: [{ type: "tool_call", status: "failed", content: {
+        toolName: "application.submit", errorCode: "policy_requires_approval", arguments: { secret: "private-input" },
+      } }],
+      events: [{ type: "approval.resolved" }, { type: "turn.resumed" }, { type: "turn.failed" }],
+    })
+    expect(summary).toMatchObject({
+      turn: { present: true, status: "failed", errorCode: "persistence_conflict" },
+      root: { present: true, status: "failed", failureCode: "lease_lost" },
+      applicationTask: { status: "waiting_for_authorization", checkpoint: "form_filled" },
+      approval: { present: true, status: "approved" },
+      wait: { present: true, status: "completed", kindMatches: true, approvalMatches: true,
+        toolCallMatches: true, decision: "approved", responseAvailable: true },
+      steps: [{ status: "failed", errorCode: "invalid_output" }],
+      tools: [{ type: "tool_call", name: "application.submit", status: "failed", errorCode: "policy_requires_approval" }],
+      events: { approval_resolved: true, turn_resumed: true, turn_failed: true },
+    })
+    expect(JSON.stringify(summary)).not.toMatch(/private|nonce|secret|input/)
   })
 })
 
@@ -1391,6 +1446,112 @@ type Stage8SubmitIntent = {
   workerTaskId: string
 }
 
+const STAGE8_APPROVAL_STATUSES = new Set(["pending", "approved", "consumed", "rejected", "expired"])
+const STAGE8_WAIT_STATUSES = new Set([...REVIEWED_FILL_DIAGNOSTIC_STATUSES, "started"])
+const STAGE8_TOOL_NAMES = new Set([
+  "agent.plan", "agent.wait", "wait_subagents", "application.submit", "cover_letter.draft",
+  "artifact.version.read", "artifact.review",
+])
+const STAGE8_EVENT_TYPES = [
+  "approval.resolved", "turn.resumed", "turn.failed", "turn.completed", "step.completed",
+  "tool_call.failed", "tool_call.completed",
+] as const
+
+type Stage8FailureEvidence = Readonly<{
+  expectedApprovalId: string
+  turn: { status: unknown; error: unknown; rootTaskId: unknown } | null
+  root: { status: unknown; failureReason: unknown } | null
+  applicationTask: { status: unknown; checkpoint: unknown } | null
+  approval: { status: unknown; toolCallId: unknown } | null
+  wait: { status: unknown; content: unknown } | null
+  steps: readonly { status: unknown; errorCode: unknown }[]
+  tools: readonly { type: unknown; status: unknown; content: unknown }[]
+  events: readonly { type: unknown }[]
+}>
+
+function stage8FailureSummary(evidence: Stage8FailureEvidence) {
+  const waitContent = jsonRecord(evidence.wait?.content)
+  const decision = waitContent?.decision
+  const approvalToolCallId = evidence.approval?.toolCallId
+  const eventTypes = new Set(evidence.events.map(event => event.type))
+  return {
+    turn: { present: evidence.turn !== null, status: reviewedFillDiagnosticValue(evidence.turn?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+      errorCode: diagnosticMachineErrorCode(evidence.turn?.error) },
+    root: { present: evidence.root !== null, status: reviewedFillDiagnosticValue(evidence.root?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+      failureCode: diagnosticMachineErrorCode(evidence.root?.failureReason) },
+    applicationTask: { present: evidence.applicationTask !== null,
+      status: reviewedFillDiagnosticValue(evidence.applicationTask?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+      checkpoint: reviewedFillDiagnosticValue(evidence.applicationTask?.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS) },
+    approval: { present: evidence.approval !== null,
+      status: reviewedFillDiagnosticValue(evidence.approval?.status, STAGE8_APPROVAL_STATUSES) },
+    wait: {
+      present: evidence.wait !== null,
+      status: reviewedFillDiagnosticValue(evidence.wait?.status, STAGE8_WAIT_STATUSES),
+      kindMatches: waitContent?.waitKind === "approval",
+      approvalMatches: waitContent?.approvalId === evidence.expectedApprovalId,
+      toolCallMatches: typeof approvalToolCallId === "string" && approvalToolCallId.length > 0
+        && waitContent?.toolCallId === approvalToolCallId,
+      decision: decision === "approved" || decision === "rejected" || decision === "cancelled" ? decision : "other",
+      responseAvailable: waitContent?.responseAvailable === true,
+    },
+    steps: evidence.steps.slice(-6).map(step => ({
+      status: reviewedFillDiagnosticValue(step.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+      errorCode: diagnosticMachineErrorCode(step.errorCode),
+    })),
+    tools: evidence.tools.slice(-8).map(item => {
+      const name = jsonString(item.content, "toolName")
+      return {
+        type: item.type === "tool_call" || item.type === "tool_result" ? item.type : "other",
+        name: name && STAGE8_TOOL_NAMES.has(name) ? name : "other",
+        status: reviewedFillDiagnosticValue(item.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+        errorCode: diagnosticMachineErrorCode(jsonString(item.content, "errorCode")),
+      }
+    }),
+    events: Object.fromEntries(STAGE8_EVENT_TYPES.map(type => [type.replaceAll(".", "_"), eventTypes.has(type)])),
+  }
+}
+
+async function stage8FillFailureSnapshot(prepared: Stage8PreparedScenario): Promise<unknown> {
+  try {
+    return await beforeDeadline(async () => {
+      const turn = await testDb.agentTurn.findFirst({ where: {
+        id: prepared.fillTurnId, userId: ids.user, sessionId: prepared.sessionId, session: { userId: ids.user },
+      }, select: { status: true, error: true, rootTaskId: true } })
+      const [root, applicationTask, approval, wait, steps, tools, events] = await Promise.all([
+        typeof turn?.rootTaskId === "string" ? testDb.subAgentTask.findFirst({ where: {
+          id: turn.rootTaskId, rootTaskId: turn.rootTaskId, sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
+          parentTaskId: null, role: "orchestrator", taskType: "root", session: { userId: ids.user },
+        }, select: { status: true, failureReason: true } }) : Promise.resolve(null),
+        testDb.applicationTask.findFirst({ where: {
+          id: prepared.applicationTaskId, userId: ids.user, sessionId: prepared.sessionId,
+          jobId: prepared.jobId, fillTurnId: prepared.fillTurnId,
+        }, select: { status: true, checkpoint: true } }),
+        testDb.agentApproval.findFirst({ where: {
+          id: prepared.submitApprovalId, userId: ids.user, sessionId: prepared.sessionId,
+          taskId: prepared.applicationTaskId, turnId: prepared.fillTurnId, jobId: prepared.jobId,
+          type: "submit_application",
+        }, select: { status: true, toolCallId: true } }),
+        testDb.agentItem.findFirst({ where: {
+          id: `agent-wait:approval:${prepared.submitApprovalId}`, sessionId: prepared.sessionId,
+          turnId: prepared.fillTurnId, type: "approval_request",
+        }, select: { status: true, content: true } }),
+        testDb.agentStep.findMany({ where: { sessionId: prepared.sessionId, turnId: prepared.fillTurnId },
+          orderBy: { ordinal: "asc" }, take: 8, select: { status: true, errorCode: true } }),
+        testDb.agentItem.findMany({ where: {
+          sessionId: prepared.sessionId, turnId: prepared.fillTurnId, type: { in: ["tool_call", "tool_result"] },
+        }, orderBy: { createdAt: "asc" }, take: 16, select: { type: true, status: true, content: true } }),
+        testDb.agentEvent.findMany({ where: {
+          sessionId: prepared.sessionId, turnId: prepared.fillTurnId, type: { in: [...STAGE8_EVENT_TYPES] },
+        }, orderBy: { sequence: "desc" }, take: 16, select: { type: true } }),
+      ])
+      return stage8FailureSummary({ expectedApprovalId: prepared.submitApprovalId, turn, root, applicationTask,
+        approval, wait, steps, tools, events })
+    }, Date.now() + 1_200)
+  } catch {
+    return { available: false }
+  }
+}
+
 async function prepareStage8Scenario(label: "stop-first" | "grant-first"): Promise<Stage8PreparedScenario> {
   const scenario = await createReviewedSourceScenario(`stage8-${label}`, `Synthetic Stage 8 ${label} source description.`)
   const token = await signedBearer(ids.user)
@@ -1579,7 +1740,12 @@ async function approveStage8Submit(prepared: Stage8PreparedScenario): Promise<St
     })}`)
   }
   expect(response.status).toBe(200)
-  expect((await waitForAgentTurnTerminal(prepared.fillTurnId)).status).toBe("completed")
+  const terminal = await waitForAgentTurnTerminal(prepared.fillTurnId)
+  if (terminal.status !== "completed") {
+    const snapshot = await stage8FillFailureSnapshot(prepared)
+    throw new Error(`stage8_fill_turn_terminal_failure:${JSON.stringify(snapshot)}`)
+  }
+  expect(terminal.status).toBe("completed")
 
   const resolvedApproval = await testDb.agentApproval.findUniqueOrThrow({ where: { id: prepared.submitApprovalId }, select: { status: true } })
   expect(resolvedApproval.status).toBe("approved")
