@@ -2621,10 +2621,47 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       && heldAckPayload.receiptId === submitApproval.id)).toBe(true)
     await proveLegacyQueueAckBarrier({ sessionId: ids.session, fillTurnId: successorTurnId,
       jobId: workerTaskId, attemptsStarted: heldAckJob!.attemptsStarted })
-    const uncertainBeforeKill = await testDb.applicationTask.findUniqueOrThrow({ where: { id: gateTaskId },
-      select: { status: true, checkpoint: true, fillTurnId: true, workerTaskId: true } })
-    expect(uncertainBeforeKill.status === "waiting_for_user" && uncertainBeforeKill.checkpoint === "submission_uncertain"
-      && uncertainBeforeKill.fillTurnId === successorTurnId && uncertainBeforeKill.workerTaskId === workerTaskId).toBe(true)
+    const uncertainBeforeKill = await testDb.applicationTask.findUnique({ where: { id: gateTaskId },
+      select: { userId: true, jobId: true, sessionId: true, status: true, checkpoint: true, fillTurnId: true, workerTaskId: true } })
+    const uncertaintyChecks = {
+      ownedRowPresent: uncertainBeforeKill?.userId === ids.user && uncertainBeforeKill.jobId === ids.job
+        && uncertainBeforeKill.sessionId === ids.session,
+      statusMatches: uncertainBeforeKill?.status === "waiting_for_user",
+      checkpointMatches: uncertainBeforeKill?.checkpoint === "submission_uncertain",
+      fillTurnMatches: uncertainBeforeKill?.fillTurnId === successorTurnId,
+      workerTaskMatches: uncertainBeforeKill?.workerTaskId === workerTaskId,
+    }
+    if (!Object.values(uncertaintyChecks).every(Boolean)) {
+      let exactStartReceiptCount: number | null = null
+      let exactSettledReceiptCount: number | null = null
+      try {
+        const executionReceipts = await testDb.applicationTaskEvent.findMany({ where: {
+          taskId: gateTaskId, actor: "worker",
+          type: { in: ["submission_execution_started", "submission_execution_settled"] },
+        }, select: { type: true, data: true } })
+        let startCount = 0
+        let settledCount = 0
+        for (const event of executionReceipts) {
+          const data = jsonRecord(event.data)
+          const exactIdentity = data !== null && typeof data.executionId === "string" && data.executionId.length > 0
+            && data.workerTaskId === workerTaskId && data.applicationTaskId === gateTaskId
+            && data.userId === ids.user && data.jobId === ids.job && data.sessionId === ids.session
+            && data.fillTurnId === successorTurnId && data.approvalId === submitApproval.id
+            && data.constraintHash === intent.constraintHash
+          if (!exactIdentity) continue
+          if (event.type === "submission_execution_started") startCount++
+          if (event.type === "submission_execution_settled") settledCount++
+        }
+        exactStartReceiptCount = startCount
+        exactSettledReceiptCount = settledCount
+      } catch {
+        exactStartReceiptCount = null
+        exactSettledReceiptCount = null
+      }
+      throw new Error(`legacy_uncertainty_predicate_mismatch ${JSON.stringify({
+        ...uncertaintyChecks, exactStartReceiptCount, exactSettledReceiptCount,
+      })}`)
+    }
     worker!.kill("SIGKILL")
     expect(await waitExit(worker!, 5_000)).toBe(true)
     worker = spawnFixture("worker")
