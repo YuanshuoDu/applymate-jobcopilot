@@ -2095,12 +2095,15 @@ async function approveStage8Submit(prepared: Stage8PreparedScenario): Promise<St
   })
   expect(resolvedWait.status).toBe("completed")
   const fillTurn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: prepared.fillTurnId }, select: {
-    id: true, userId: true, sessionId: true, source: true, executionMode: true, status: true,
+    id: true, userId: true, sessionId: true, source: true, executionMode: true, input: true, status: true,
     leaseOwnerId: true, leaseStartedAt: true, leaseExpiresAt: true,
   } })
   expect(fillTurn).toMatchObject({ id: prepared.fillTurnId, userId: ids.user, sessionId: prepared.sessionId,
-    source: "user", executionMode: "canonical_task_graph", status: "completed",
+    source: "user", executionMode: null, status: "completed",
     leaseOwnerId: null, leaseStartedAt: null, leaseExpiresAt: null })
+  expect(jsonRecord(fillTurn.input)?.reviewedApplicationMaterialSource).toEqual({
+    schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: prepared.sourceTurnId,
+  })
   const outboxRows = await testDb.agentOutbox.findMany({ where: {
     aggregateId: prepared.sessionId, topic: "application.submit.dispatch",
   }, select: { payload: true, publishedAt: true } })
