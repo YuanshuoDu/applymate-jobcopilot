@@ -451,6 +451,7 @@ describe('TaskGraphPlanPanel', () => {
       />)
       expect(html).toContain(`data-discovery-shortlist-status="${state.status}"`)
       expect(html).toContain(state.status === 'completed' ? 'Completed:' : state.status === 'partial' ? 'Partial results:' : 'Failed:')
+      expect(html).not.toContain('data-verified-shortlist-controls')
       for (const code of state.failures) expect(html).toContain(`data-discovery-failure-code="${code}"`)
       if (state.items.length) {
         expect(html).toContain('job-42')
