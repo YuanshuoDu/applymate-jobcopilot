@@ -9,6 +9,8 @@ import { canonicalTaskGraphItemId } from './final-task-graph-source-detail'
 const BATCH_GOAL = 'Prepare draft materials for the selected Jobs from the verified shortlist. Do not submit applications.'
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const ACTIVE_TURNS = new Set(['queued', 'in_progress'])
+const LIVE_TURNS = new Set(['queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval', 'waiting_for_user'])
+const FAILED_TURNS = new Set(['failed', 'interrupted', 'cancelled'])
 const ACTIVE_TASKS = new Set(['queued', 'running', 'retrying', 'waiting', 'waiting_for_user'])
 const FAILED_TASKS = new Set(['failed', 'interrupted', 'cancelled', 'closed'])
 const REVIEW_STATUSES = new Set(['passed', 'needs_revision', 'rejected', 'stale'])
@@ -48,6 +50,7 @@ async function readInTransaction(tx: Prisma.TransactionClient, input: Readonly<{
   const binding = batchBinding(turn?.input)
   if (!turn || turn.id !== input.turnId || turn.sessionId !== input.sessionId || turn.userId !== input.userId
     || turn.source !== 'user' || turn.executionMode !== 'canonical_task_graph' || !binding) return null
+  if (!LIVE_TURNS.has(turn.status) && turn.status !== 'completed' && !FAILED_TURNS.has(turn.status)) return null
   const verified = await verifyVerifiedShortlistSelection(tx, { id: input.sessionId, userId: input.userId }, binding.source, binding.selectedJobIds)
   if (!verified || !sameVerifiedShortlistSelectionBinding(verified, binding)) return null
   const jobs = await tx.job.findMany({ where: { userId: input.userId, id: { in: [...binding.selectedJobIds] } }, select: { id: true, company: true, role: true } })
@@ -73,7 +76,7 @@ async function readInTransaction(tx: Prisma.TransactionClient, input: Readonly<{
       taskId: turn.rootTaskId, type: 'task_graph' },
     select: { id: true, sessionId: true, turnId: true, taskId: true, type: true, revision: true, content: true },
   })
-  if (!graph) return ACTIVE_TASKS.has(root.status) ? pendingModel(input, binding.source, labels) : null
+  if (!graph) return LIVE_TURNS.has(turn.status) && ACTIVE_TASKS.has(root.status) ? pendingModel(input, binding.source, labels) : null
   if (graph.id !== canonicalTaskGraphItemId(turn.rootTaskId) || graph.sessionId !== input.sessionId || graph.turnId !== input.turnId
     || graph.taskId !== turn.rootTaskId || graph.type !== 'task_graph' || !Number.isSafeInteger(graph.revision) || graph.revision < 1 || hasRepairNode(graph.content)) return null
   let snapshot: ReturnType<typeof parseTaskGraphSnapshot>
@@ -100,7 +103,7 @@ async function readInTransaction(tx: Prisma.TransactionClient, input: Readonly<{
   }
   return { sessionId: input.sessionId, turnId: input.turnId, source: binding.source,
     graph: { itemId: graph.id, rootTaskId: turn.rootTaskId, revision: graph.revision },
-    status: aggregate(projected.map(job => job.status)), jobs: projected }
+    status: aggregate(projected.map(job => job.status), turn.status, root.status), jobs: projected }
 }
 
 async function projectPair(tx: Prisma.TransactionClient, owner: { userId: string; sessionId: string; turnId: string }, pair: Pair,
@@ -206,9 +209,10 @@ function taskStatus(value: string): BranchStatus | null {
   return ACTIVE_TASKS.has(value) ? 'pending' : null
 }
 
-function aggregate(statuses: readonly BranchStatus[]): 'pending' | 'partial' | 'completed' | 'failed' {
-  if (statuses.every(status => status === 'completed')) return 'completed'
-  if (statuses.every(status => status === 'failed')) return 'failed'
+function aggregate(statuses: readonly BranchStatus[], turnStatus: string, rootStatus: string): 'pending' | 'partial' | 'completed' | 'failed' {
+  if (FAILED_TURNS.has(turnStatus) || FAILED_TASKS.has(rootStatus)) return 'failed'
+  if (statuses.every(status => status === 'completed')) return turnStatus === 'completed' && rootStatus === 'completed' ? 'completed' : 'pending'
+  if (statuses.every(status => status === 'failed')) return turnStatus === 'completed' && rootStatus === 'completed' ? 'failed' : 'partial'
   return statuses.some(status => status === 'failed') ? 'partial' : 'pending'
 }
 
@@ -228,10 +232,7 @@ function safeText(value: unknown, max: number): value is string {
 function isDigest(value: unknown): value is string { return typeof value === 'string' && /^sha256:[a-f0-9]{64}$/.test(value) }
 function hasKeys(value: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key)) }
 function hasRepairNode(value: unknown): boolean { const nodes = record(value)?.nodes; return Array.isArray(nodes) && nodes.some(node => Object.hasOwn(record(node) ?? {}, 'repairOf')) }
-function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
-  const row = record(value)
-  return row && hasKeys(row, keys) ? row : null
-}
+function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null { const row = record(value); return row && hasKeys(row, keys) ? row : null }
 function record(value: unknown): Record<string, unknown> | null {
   if (typeof value === 'string') { try { value = JSON.parse(value) as unknown } catch { return null } }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null

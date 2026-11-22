@@ -60,21 +60,22 @@ const taskRows = selectedJobIds.flatMap((jobId, index) => {
   ]
 })
 
-function fixture(options: { queued?: boolean; rows?: typeof taskRows; graph?: typeof currentGraph; contextJob?: string; ownerMatch?: boolean } = {}) {
+function fixture(options: { queued?: boolean; rows?: typeof taskRows; graph?: typeof currentGraph | null; contextJob?: string; ownerMatch?: boolean; turnStatus?: string; rootStatus?: string } = {}) {
   const rows = (options.rows ?? taskRows).map(row => ({ ...row }))
   const selectedTurn = { id: owner.turnId, sessionId: owner.sessionId, userId: owner.userId, source: 'user',
-    executionMode: 'canonical_task_graph', status: options.queued ? 'queued' : 'in_progress',
+    executionMode: 'canonical_task_graph', status: options.turnStatus ?? (options.queued ? 'queued' : 'in_progress'),
     rootTaskId: options.queued ? null : root.id, input: batchInput }
+  const selectedRoot = { ...root, status: options.rootStatus ?? root.status }
   const tx = {
     agentSession: { findFirst: vi.fn().mockResolvedValue(options.ownerMatch === false ? null : { id: owner.sessionId, userId: owner.userId }) },
     agentTurn: { findFirst: vi.fn().mockImplementation(async ({ where }: { where: { id: string } }) =>
       where.id === sourceTurn.id ? sourceTurn : where.id === owner.turnId ? selectedTurn : null) },
     subAgentTask: {
-      findFirst: vi.fn().mockImplementation(async ({ where }: { where: { id: string } }) => where.id === sourceRoot.id ? sourceRoot : where.id === root.id ? root : null),
+      findFirst: vi.fn().mockImplementation(async ({ where }: { where: { id: string } }) => where.id === sourceRoot.id ? sourceRoot : where.id === root.id ? selectedRoot : null),
       findMany: vi.fn().mockResolvedValue(rows),
     },
     agentItem: { findFirst: vi.fn().mockImplementation(async ({ where }: { where: { id: string } }) =>
-      where.id === sourceGraph.id ? sourceGraph : where.id === currentGraph.id ? (options.graph ?? currentGraph) : null) },
+      where.id === sourceGraph.id ? sourceGraph : where.id === currentGraph.id ? (options.graph === undefined ? currentGraph : options.graph) : null) },
     job: { findMany: vi.fn().mockImplementation(async ({ where, select }: { where: { id: { in: string[] } }; select: Record<string, boolean> }) =>
       where.id.in.map((id, index) => select.company ? { id, company: `Company ${index + 1}`, role: `Role ${index + 1}` } : { id })) },
     agentArtifactVersion: { findFirst: vi.fn().mockImplementation(async ({ where }: { where: { artifactId: string; version: number } }) => {
@@ -117,7 +118,7 @@ describe('selected Job batch Workbench read model', () => {
   })
 
   it('projects two completed same-slot artifact and Reviewer receipts without private task output', async () => {
-    const test = fixture()
+    const test = fixture({ turnStatus: 'completed', rootStatus: 'completed' })
     const result = await readSelectedJobBatchWorkbenchModel(test.database, owner)
 
     expect(result).toMatchObject({ status: 'completed', graph: { itemId: currentGraph.id, revision: 5 }, jobs: [
@@ -130,6 +131,38 @@ describe('selected Job batch Workbench read model', () => {
     expect(serialized).not.toContain('reviewHash')
     expect(test.tx.agentArtifactVersion.findFirst).toHaveBeenCalledTimes(2)
     expect(test.tx.agentArtifactReview.findFirst).toHaveBeenCalledTimes(2)
+  })
+
+  it('uses the durable Turn and Root lifecycle before reporting batch completion', async () => {
+    const active = await readSelectedJobBatchWorkbenchModel(fixture({ turnStatus: 'in_progress', rootStatus: 'running' }).database, owner)
+    expect(active).toMatchObject({ status: 'pending', jobs: [
+      { status: 'completed', writer: { artifactRef: refs[0] }, reviewer: { reviewStatus: 'passed' } },
+      { status: 'completed', writer: { artifactRef: refs[1] }, reviewer: { reviewStatus: 'passed' } },
+    ] })
+
+    const turnFailed = await readSelectedJobBatchWorkbenchModel(fixture({ turnStatus: 'failed', rootStatus: 'completed' }).database, owner)
+    const rootFailed = await readSelectedJobBatchWorkbenchModel(fixture({ turnStatus: 'in_progress', rootStatus: 'failed' }).database, owner)
+    expect(turnFailed?.status).toBe('failed')
+    expect(rootFailed?.status).toBe('failed')
+    expect(turnFailed?.jobs).toEqual(active?.jobs)
+    expect(rootFailed?.jobs).toEqual(active?.jobs)
+
+    const completed = await readSelectedJobBatchWorkbenchModel(fixture({ turnStatus: 'completed', rootStatus: 'completed' }).database, owner)
+    expect(completed?.status).toBe('completed')
+    expect(completed?.jobs).toEqual(active?.jobs)
+  })
+
+  it('keeps mixed terminal snapshots non-complete and allows a missing graph only while both owners are active', async () => {
+    const evidence = await readSelectedJobBatchWorkbenchModel(fixture({ turnStatus: 'in_progress', rootStatus: 'running' }).database, owner)
+    for (const [turnStatus, rootStatus] of [['in_progress', 'completed'], ['completed', 'running']] as const) {
+      const mixed = await readSelectedJobBatchWorkbenchModel(fixture({ turnStatus, rootStatus }).database, owner)
+      expect(mixed?.status).not.toBe('completed')
+      expect(mixed?.jobs).toEqual(evidence?.jobs)
+    }
+
+    const beforeGraph = await readSelectedJobBatchWorkbenchModel(fixture({ graph: null, turnStatus: 'in_progress', rootStatus: 'running' }).database, owner)
+    expect(beforeGraph).toMatchObject({ status: 'pending', graph: null })
+    expect(await readSelectedJobBatchWorkbenchModel(fixture({ graph: null, turnStatus: 'completed', rootStatus: 'completed' }).database, owner)).toBeNull()
   })
 
   it('denies cross-slot task context, cross-linked graph, stale source, and foreign owner reads', async () => {
