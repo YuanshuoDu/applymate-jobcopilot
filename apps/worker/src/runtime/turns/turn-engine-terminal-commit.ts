@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
-import { assertSessionWorkAdmission } from "../session-gate.js"
+import { assertSessionTerminalAdmission } from "../session-gate.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity } from "../outbox-identity.js"
 import { toRepositoryJson, type AtomicTurnCompletionInput, type AtomicTurnCompletionResult, type TurnEngineEvent, type TurnEngineEventInput } from "./turn-engine-types.js"
 import type { TurnEngineCompletionGateResult } from "./turn-execution-types.js"
@@ -149,7 +149,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
     const chronologyLock = await acquireRootTaskHistoryChronologyLock(client, owner.userId)
     const session = await client.query<Row>(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived') FOR UPDATE`, [owner.sessionId, owner.userId])
     if (!session.rows[0]) throw conflict(`session ${owner.sessionId}`)
-    const turn = await client.query<Row>(`SELECT turn."id", turn."status", turn."finalResponse", turn."source", turn."input" FROM "agent_turns" AS turn
+    const turn = await client.query<Row>(`SELECT turn."id", turn."status", turn."finalResponse", turn."source", turn."executionMode", turn."input" FROM "agent_turns" AS turn
       WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND turn."rootTaskId" = $6 AND (
         (turn."status" = 'in_progress' AND turn."leaseOwnerId" = $4 AND turn."leaseVersion" = $5 AND turn."leaseExpiresAt" > CURRENT_TIMESTAMP)
         OR (turn."status" = 'completed' AND turn."leaseOwnerId" IS NULL AND turn."leaseExpiresAt" IS NULL AND turn."leaseVersion" = $5)) FOR UPDATE`,
@@ -168,7 +168,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
     if (committed && (turnRow.finalResponse !== input.response || task.status !== "completed" || task.leaseOwner !== null || Number(task.attemptCount) !== 1 || !sameJson(task.result, result))) throw conflict(`terminal receipt ${owner.turnId}`)
     if (!committed && (turnRow.status !== "in_progress" || task.status !== "running" || task.leaseOwner !== owner.ownerId || Number(task.attemptCount) !== 1)) throw conflict(`root task ${owner.taskId} fence`)
     if (!committed) {
-      await assertSessionWorkAdmission(client, { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId })
+      await assertSessionTerminalAdmission(client, { ...owner, source: typeof turnRow.source === "string" ? turnRow.source : null, executionMode: typeof turnRow.executionMode === "string" ? turnRow.executionMode : null })
       if (task.interruptRequestedAt != null) throw conflict(`root task ${owner.taskId} interrupted`)
       try {
         await assertPlanningRootHasNoUnresolvedSteering(client, task.allowedActions, {

@@ -39,7 +39,9 @@ const input = {
 type Row = Record<string, unknown>
 type Call = { sql: string; values?: readonly unknown[] }
 
-function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, options: { pause?: boolean; planningRoot?: boolean } = {}) {
+function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, options: {
+  pause?: boolean; planningRoot?: boolean; rootInterrupted?: boolean; leaseActive?: boolean; sessionStatus?: string; applicationTaskRows?: number; source?: string; executionMode?: string | null
+} = {}) {
   const calls: Call[] = []
   const events = new Map<string, Row>()
   const outboxes = new Map<string, Row>()
@@ -52,8 +54,9 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
     consumedAt: row.consumedAt ?? null, cancelledAt: row.cancelledAt ?? null,
   }))
   let sequence = 10n
-  let turn: Row = { id: owner.turnId, status: "in_progress", finalResponse: null, source: "user", ...(currentTurnInput === undefined ? {} : { input: currentTurnInput }) }
-  let root: Row = { id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, result: null, interruptRequestedAt: null,
+  let turn: Row = { id: owner.turnId, status: "in_progress", finalResponse: null, source: options.source ?? "user", executionMode: options.executionMode ?? null,
+    ...(currentTurnInput === undefined ? {} : { input: currentTurnInput }) }
+  let root: Row = { id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, result: null, interruptRequestedAt: options.rootInterrupted ? now : null,
     allowedActions: options.planningRoot ? ["agent.plan"] : [] }
   const client = {
     query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
@@ -62,10 +65,21 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
       if (sql.includes("pg_advisory_xact_lock")) return { rows: [], rowCount: 1 }
       if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "100" }], rowCount: 1 }
       if (sql.includes('SELECT "eventSequence" FROM "agent_sessions"')) return { rows: [{ eventSequence: sequence }], rowCount: 1 }
-      if (sql.includes('SELECT session."id" FROM "agent_sessions" AS session')) return options.pause ? { rows: [], rowCount: 0 } : { rows: [{ id: owner.sessionId }], rowCount: 1 }
-      if (sql.includes('FROM "agent_sessions"')) return { rows: values?.[0] === owner.sessionId && values?.[1] === owner.userId ? [{ id: owner.sessionId }] : [], rowCount: 1 }
+      if (sql.includes('JOIN "application_tasks" AS fill_task')) {
+        const count = options.pause || options.sessionStatus !== "waiting_for_user" ? 0 : options.applicationTaskRows ?? 0
+        return { rows: Array.from({ length: count }, (_, index) => ({ id: `session-${index}` })), rowCount: count }
+      }
+      if (sql.includes('SELECT session."id" FROM "agent_sessions" AS session')) {
+        return options.pause || (options.sessionStatus ?? "running") !== "running" ? { rows: [], rowCount: 0 } : { rows: [{ id: owner.sessionId }], rowCount: 1 }
+      }
+      if (sql.includes('FROM "agent_sessions"')) {
+        const unavailable = ["aborted", "archived"].includes(options.sessionStatus ?? "running")
+        const rows = values?.[0] === owner.sessionId && values?.[1] === owner.userId && !unavailable ? [{ id: owner.sessionId }] : []
+        return { rows, rowCount: rows.length }
+      }
       if (sql.includes('FROM "agent_turns" AS turn')) {
         if (values?.[0] !== owner.turnId || values[1] !== owner.sessionId || values[2] !== owner.userId || values[5] !== owner.taskId) return { rows: [], rowCount: 0 }
+        if (options.leaseActive === false) return { rows: [], rowCount: 0 }
         if (turn.status === "completed") return { rows: [{ ...turn }], rowCount: 1 }
         if (values[3] !== owner.ownerId || values[4] !== owner.leaseVersion) return { rows: [], rowCount: 0 }
         return { rows: [{ ...turn }], rowCount: 1 }
@@ -288,6 +302,66 @@ describe("atomic Turn terminal commit", () => {
     expect(fake.calls.filter(({ sql }) => sql.includes('INSERT INTO "agent_turns"'))).toHaveLength(1)
     expect(fake.calls.filter(({ sql }) => sql.includes('UPDATE "agent_inputs"'))).toHaveLength(1)
     expect(fake.calls.some(({ sql }) => /(?:UPDATE|DELETE) "(?:agent_items|agent_events)"/.test(sql))).toBe(false)
+  })
+
+  it("terminalizes an exact uncertain Fill Turn after its derived Session wait and preserves queued follow-up replay", async () => {
+    const fake = makePool([{ id: "accepted-follow-up", sessionId: owner.sessionId, userId: owner.userId, turnId: owner.turnId }], undefined, {
+      sessionStatus: "waiting_for_user", applicationTaskRows: 1, executionMode: "canonical_task_graph",
+    })
+
+    const first = await commitTurnTerminal(fake.pool, input)
+    const eventCount = fake.events.size
+    const replay = await commitTurnTerminal(fake.pool, input)
+
+    expect(first).toMatchObject({ status: "completed", finalItemId: input.finalItemId })
+    expect(replay).toEqual(first)
+    expect(fake.state).toMatchObject({ turn: { status: "completed" }, root: { status: "completed" } })
+    expect(fake.successors.size).toBe(1)
+    expect([...fake.successors.values()][0]).toMatchObject({ status: "queued", sessionId: owner.sessionId, userId: owner.userId })
+    expect(fake.followUps[0]?.targetTurnId).not.toBe(owner.turnId)
+    expect([...fake.outboxes.values()].filter(row => row.topic === "agent.turn.dispatch")).toHaveLength(1)
+    expect(fake.events.size).toBe(eventCount)
+    expect(fake.calls.some(({ sql }) => /UPDATE "agent_sessions" SET "status"/.test(sql))).toBe(false)
+  })
+
+  it.each([
+    ["unbound wait", { sessionStatus: "waiting_for_user" }],
+    ["wrong source", { sessionStatus: "waiting_for_user", applicationTaskRows: 1, source: "automation" }],
+    ["legacy execution", { sessionStatus: "waiting_for_user", applicationTaskRows: 1, executionMode: "legacy_pipeline_adapter" }],
+    ["approval wait", { sessionStatus: "waiting_for_approval", applicationTaskRows: 1 }],
+    ["explicit pause", { sessionStatus: "waiting_for_user", applicationTaskRows: 1, pause: true }],
+  ] as const)("does not terminalize a Fill Turn for %s", async (_case, options) => {
+    const fake = makePool([], undefined, options)
+    await expect(commitTurnTerminal(fake.pool, input)).rejects.toBeInstanceOf(SessionPauseRequestedError)
+    expect(fake.items.size).toBe(0)
+    expect(fake.events.size).toBe(0)
+    expect(fake.outboxes.size).toBe(0)
+    expect(fake.state).toMatchObject({ turn: { status: "in_progress" }, root: { status: "running" } })
+    expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
+  })
+
+  it.each(["aborted", "archived"] as const)("does not terminalize an %s Session", async sessionStatus => {
+    const fake = makePool([], undefined, { sessionStatus, applicationTaskRows: 1, executionMode: "canonical_task_graph" })
+    await expect(commitTurnTerminal(fake.pool, input)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+    expect(fake.items.size).toBe(0)
+    expect(fake.events.size).toBe(0)
+    expect(fake.outboxes.size).toBe(0)
+  })
+
+  it("does not let a matching uncertain application wait bypass an interrupted Root", async () => {
+    const fake = makePool([], undefined, { sessionStatus: "waiting_for_user", applicationTaskRows: 1, executionMode: "canonical_task_graph", rootInterrupted: true })
+    await expect(commitTurnTerminal(fake.pool, input)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+    expect(fake.items.size).toBe(0)
+    expect(fake.events.size).toBe(0)
+    expect(fake.outboxes.size).toBe(0)
+  })
+
+  it("does not let a matching uncertain application wait bypass an expired Turn lease", async () => {
+    const fake = makePool([], undefined, { sessionStatus: "waiting_for_user", applicationTaskRows: 1, executionMode: "canonical_task_graph", leaseActive: false })
+    await expect(commitTurnTerminal(fake.pool, input)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+    expect(fake.items.size).toBe(0)
+    expect(fake.events.size).toBe(0)
+    expect(fake.outboxes.size).toBe(0)
   })
 
   it("retains the exact server discovery intent on an atomically promoted follow-up Turn", async () => {
