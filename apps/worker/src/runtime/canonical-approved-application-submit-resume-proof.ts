@@ -51,6 +51,7 @@ export async function readCanonicalApprovedApplicationSubmitResumeProof(
       AND session."userId"=$4 AND root."role"='orchestrator' AND root."taskType"='root' AND root."depth"=0
       AND root."status" IN ('running','waiting','waiting_for_user') AND root."attemptCount"=1
       AND ((root."status"='running' AND root."leaseOwner"=$5 AND root."leaseExpiresAt">$6)
+        OR (root."status"='running' AND root."leaseOwner" IS NOT NULL AND root."leaseExpiresAt" IS NOT NULL AND root."leaseExpiresAt"<=$6)
         OR (root."status" IN ('waiting','waiting_for_user') AND root."leaseOwner" IS NULL AND root."leaseExpiresAt" IS NULL))
       AND root."interruptRequestedAt" IS NULL AND root."completedAt" IS NULL AND root."closedAt" IS NULL
       AND root."nextAttemptAt" IS NULL AND root."failureReason" IS NULL`,

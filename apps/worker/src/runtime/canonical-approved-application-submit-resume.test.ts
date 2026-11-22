@@ -68,9 +68,14 @@ describe("approved application fill Turn resume", () => {
     const binding = graphBinding()
     const completion = { ok: true as const, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding }
     const finalizationGuardCalls: unknown[] = []
+    const appended: Parameters<TurnEngineStore["appendEvent"]>[0][] = []
+    const startedOrdinals: number[] = []
     const storeFactory = (_pool: pg.Pool, guard?: NonNullable<Parameters<typeof import("./turns/turn-engine-store.js").createPgTurnEngineStore>[1]>) => ({
-      appendEvent: vi.fn(async input => ({ id: input.id })),
-      startStep: vi.fn(async input => ({ id: input.stepId, ordinal: input.ordinal })),
+      appendEvent: vi.fn(async (input: Parameters<TurnEngineStore["appendEvent"]>[0]) => { appended.push(input); return { id: input.id } }),
+      startStep: vi.fn(async (input: { stepId: string; ordinal: number }) => {
+        startedOrdinals.push(input.ordinal)
+        return { id: input.stepId, ordinal: input.ordinal }
+      }),
       updateStep: vi.fn(async () => undefined),
       recordFinalResponse: vi.fn(async input => {
         const terminal = { ...input.terminal!, owner: input.owner, response: input.response, now: input.now }
@@ -98,6 +103,12 @@ describe("approved application fill Turn resume", () => {
     expect((finalizationGuardCalls[0] as { result: unknown }).result).toEqual({ ok: true })
     expect(rootTasks.finish).toHaveBeenCalledWith(expect.objectContaining({ rootTaskId: "root-fill",
       result: expect.objectContaining({ status: "completed", stepCount: 3, toolCallCount: 1 }) }))
+    const started = appended.find(event => event.type === "turn.started")
+    expect(started).toMatchObject({ id: expect.stringMatching(/^turn:fill-turn:event:turn-started:[0-9a-f-]{36}$/),
+      itemId: null, correlationId: lease.turnId, causationId: null, idempotencyKey: `turn:${lease.turnId}:event:turn-started`,
+      payload: { goal: turnState().goal, taskId: "root-fill", rootTaskId: "root-fill" } })
+    expect(startedOrdinals).toEqual([2])
+    expect(appended.find(event => event.type === "step.started")?.causationId).toBe(started?.id)
     const finalResponse = JSON.parse(String((finalizationGuardCalls[0] as { terminal: { response: string } }).terminal.response)) as { response: string }
     expect(finalResponse.response).toContain("do not confirm that an application was submitted")
     expect((finalizationGuardCalls[0] as { terminal: { [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: TaskGraphFinalSummaryBinding } })

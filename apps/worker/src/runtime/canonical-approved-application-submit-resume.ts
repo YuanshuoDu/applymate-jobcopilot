@@ -12,7 +12,7 @@ import type { TurnEngineTerminalGuard } from "./turns/turn-engine-terminal-commi
 import type { TurnEngineStore } from "./turns/turn-engine-types.js"
 import type { TurnExecutionResult } from "./turns/turn-queue.js"
 import type { RootTaskStore } from "./subagents/root-task-store.js"
-import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "./subagents/task-graph-final-summary-binding.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
 import { buildGroundedTaskGraphFinalResponse } from "./subagents/task-graph-final-response.js"
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
 import { buildTaskGraphFinalSourceManifest } from "./subagents/task-graph-final-source-manifest.js"
@@ -115,7 +115,7 @@ export async function finishApprovedApplicationFillTurn(input: {
     const graph = await rootTasks.checkCompletion!({ lease, rootTaskId, now: input.now(), taskGraphVerification: true,
       nativeVerificationPassed: false, client: client as PoolClient, requireTaskGraph: true, terminalAdmission })
     if (!graph.ok) return graph
-    return taskGraphFinalSummaryCopiesMatch(terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING], graph[TASK_GRAPH_FINAL_SUMMARY_BINDING] as TaskGraphFinalSummaryBinding | undefined,
+    return taskGraphFinalSummaryCopiesMatch(terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING], graph[TASK_GRAPH_FINAL_SUMMARY_BINDING],
       terminal.finalContent, terminal.response, terminal.finalItemId) ? { ok: true } : deny
   }
   const store = (input.storeFactory ?? createPgTurnEngineStore)(input.pool, terminalGuard)
