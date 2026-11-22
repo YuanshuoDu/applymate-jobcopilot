@@ -402,12 +402,23 @@ describeWithServices("selected-job batch production full-loop", () => {
       && plain(results.get(String(call.toolCallId))?.output)?.status === "accepted")
     expect(batchPlanCalls).toHaveLength(2)
     expect(acceptedBatchPlans).toHaveLength(1)
+    const acceptedPlanOutput = plain(results.get(String(acceptedBatchPlans[0]?.toolCallId))?.output)
+    const admissionRevision = acceptedPlanOutput?.revision
+    expect(acceptedPlanOutput?.status).toBe("accepted")
+    if (typeof admissionRevision !== "number" || !Number.isSafeInteger(admissionRevision)) {
+      throw new Error("Accepted batch plan did not return an integer revision")
+    }
+    expect(admissionRevision).toBe(1)
 
     const graph = await db.agentItem.findFirst({ where: { sessionId, turnId, taskId: atBarrier.turn?.rootTaskId, type: "task_graph" },
       select: { id: true, revision: true, content: true } })
     const graphContent = plain(graph?.content), nodes = Array.isArray(graphContent?.nodes)
       ? graphContent.nodes.map(plain).filter((node): node is Record<string, unknown> => node !== null) : []
-    expect(graph?.revision).toBe(1)
+    const barrierRevision = graph?.revision
+    if (typeof barrierRevision !== "number" || !Number.isSafeInteger(barrierRevision)) {
+      throw new Error("Barrier TaskGraph did not have an integer revision")
+    }
+    expect(barrierRevision).toBeGreaterThanOrEqual(admissionRevision)
     expect(nodes).toHaveLength(4)
     for (let index = 0; index < jobIds.length; index++) {
       const templates = selectedJobBatchTemplatesForSlot(SELECTED_JOB_BATCH_SLOT_IDS[index]!)!
@@ -446,7 +457,12 @@ describeWithServices("selected-job batch production full-loop", () => {
     const terminalNodes = Array.isArray(plain(terminalGraph?.content)?.nodes)
       ? (plain(terminalGraph?.content)!.nodes as unknown[]).map(plain).filter((node): node is Record<string, unknown> => node !== null) : []
     expect(terminalGraph?.id).toBe(graph?.id)
-    expect(terminalGraph?.revision).toBeGreaterThan(graph?.revision ?? 0)
+    const terminalRevision = terminalGraph?.revision
+    if (typeof terminalRevision !== "number" || !Number.isSafeInteger(terminalRevision)) {
+      throw new Error("Terminal TaskGraph did not have an integer revision")
+    }
+    expect(terminalRevision).toBeGreaterThanOrEqual(barrierRevision)
+    expect(terminalRevision).toBeGreaterThan(admissionRevision)
     const nodeIdentity = (node: Record<string, unknown>) => ({
       key: node.key, taskId: node.taskId, templateId: node.templateId, dependsOn: node.dependsOn,
     })
