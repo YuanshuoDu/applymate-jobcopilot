@@ -118,6 +118,38 @@ describe('AgentSupervisorPlanView', () => {
     expect(api.calls).toContainEqual({ url, enabled: true })
   })
 
+  it('passes the preparation capability only alongside the exact current verified shortlist', () => {
+    const identity = selectedTaskGraphIdentity(items, 'session-1', 'turn-current')!
+    const shortlist = { identity, result: { schemaVersion: 1, status: 'completed', items: [
+      { jobId: 'job-one', score: 9, evidenceIds: ['read:job:job-one'] },
+      { jobId: 'job-two', score: 8, evidenceIds: ['read:job:job-two'] },
+    ], failures: [] } }
+    const html = renderToStaticMarkup(<AgentSupervisorPlanView sessionId="session-1" items={items} turns={turns} tasks={tasks}
+      currentGraphTasks={tasks.filter(row => row.turnId === 'turn-current')} currentLedger={currentLedger}
+      currentDiscoveryShortlist={shortlist} currentPreparationTurnId="turn-current" lifecycleRevision={7}
+      onPrepareBatch={async () => ({ turnId: 'batch-turn-started', disposition: 'started' })} onReturnToCurrent={() => undefined} />)
+
+    expect(html).toContain('data-verified-shortlist-controls="true"')
+    expect(html).toContain('job-one')
+    expect(html).toContain('job-two')
+  })
+
+  it('keeps the current plan and historical navigation visible with exact batch progress', () => {
+    const batchTurn = { ...turn('turn-current'), status: 'in_progress', selectedJobBatchPreparation: true as const }
+    const projection = { activeTurnId: 'turn-current', activeTurn: {
+      id: 'turn-current', status: 'in_progress', revision: 3, selectedJobBatchPreparation: true,
+    } }
+    const current = renderToStaticMarkup(view(undefined, undefined, items, tasks, [turn('turn-old'), batchTurn], projection))
+    expect(current).toContain('CURRENT_PLAN_MARKER')
+    expect(current).toContain('Loading selected job progress…')
+
+    const historical = renderToStaticMarkup(view(oldTurnNode.id, oldTurnNode, items, tasks, [
+      { ...turn('turn-old'), selectedJobBatchPreparation: true as const }, turn('turn-current'),
+    ]))
+    expect(historical).toContain('Return to current plan')
+    expect(historical).toContain('Loading selected job progress…')
+  })
+
   it('suppresses stale session, Turn, graph, or revision responses instead of showing another plan', () => {
     const url = buildTaskGraphTaskLookupUrl('session-1', items, 'turn-old')!
     const identity = selectedTaskGraphIdentity(items, 'session-1', 'turn-old')!

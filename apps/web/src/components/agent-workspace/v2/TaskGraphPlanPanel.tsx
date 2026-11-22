@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useMemo } from 'react'
+import React, { useMemo, useRef } from 'react'
 
 import { parseTaskGraphVerificationSummary, type TaskGraphVerificationSummary as TaskGraphVerificationSummaryDto } from '@jobcopilot/agent-protocol'
 import { useI18n, type Lang } from '@/lib/i18n'
@@ -9,8 +9,9 @@ import { parsePlanLedgerWithRepairTargets, projectRepairAttentionSummaries, type
 
 import { projectCurrentTaskGraph, projectTaskGraphSuccessCriteria, type TaskGraphEvidencePreview, type TaskGraphPlanReadiness, type TaskGraphPlanStatus } from './task-graph-plan'
 import { selectedTaskGraphIdentity, type TaskGraphIdentity } from './task-graph-plan-query'
+import type { SelectedJobBatchCommandResult } from './selected-job-batch-command'
 import { TaskGraphVerificationSummary } from './TaskGraphVerificationSummary'
-import { VerifiedShortlistPreparation } from './VerifiedShortlistPreparation'
+import { VerifiedShortlistPreparation, type VerifiedShortlistPreparationRequest } from './VerifiedShortlistPreparation'
 import type { SupervisorTaskSummary } from './task-tree-projection'
 import type { TimelineItem } from './timeline-reducer'
 
@@ -36,13 +37,17 @@ const STATUS_LABELS: Record<TaskGraphPlanStatus, TaskGraphPlanLabelKey> = {
   closed: 'agent.taskGraph.status.closed',
 }
 
-export function TaskGraphPlanPanel({ sessionId, items, tasks, ledger, discoveryShortlist, selectedPreparationTurnId }: {
+export function TaskGraphPlanPanel({ sessionId, items, tasks, ledger, discoveryShortlist, selectedPreparationTurnId,
+  selectionKey, onPrepareBatch, onBatchStarted }: {
   readonly sessionId: string
   readonly items: readonly TimelineItem[]
   readonly tasks: readonly SupervisorTaskSummary[]
   readonly ledger?: unknown
   readonly discoveryShortlist?: unknown
   readonly selectedPreparationTurnId?: string | null
+  readonly selectionKey?: string
+  readonly onPrepareBatch?: (request: VerifiedShortlistPreparationRequest) => Promise<SelectedJobBatchCommandResult>
+  readonly onBatchStarted?: (turnId: string) => void
 }) {
   const { lang, t } = useI18n()
   const view = useMemo(() => {
@@ -59,12 +64,42 @@ export function TaskGraphPlanPanel({ sessionId, items, tasks, ledger, discoveryS
       successCriteria: matched ? projectTaskGraphSuccessCriteria(graphItems, identity, matched.projection) : null,
     }
   }, [items, ledger, selectedPreparationTurnId, sessionId, tasks])
+  const identity = view.identity
+  const scope = taskGraphSelectionKey(identity, sessionId, selectedPreparationTurnId, selectionKey)
+  const activeScope = useRef(scope)
+  activeScope.current = scope
+  const onPrepare = onPrepareBatch && identity ? (request: VerifiedShortlistPreparationRequest) =>
+    runVerifiedShortlistBatchAction(identity, request, onPrepareBatch, () => activeScope.current === scope,
+      turnId => onBatchStarted?.(turnId)) : undefined
   if (!view.plan && !discoveryShortlist) return null
 
   return <>
     {view.plan && <TaskGraphPlanSection plan={view.plan} successCriteria={view.successCriteria} verificationSummary={view.verificationSummary} sessionId={sessionId} lang={lang} t={t} />}
-    <VerifiedShortlistPreparation sessionId={sessionId} identity={view.identity} lang={lang} value={discoveryShortlist} />
+    <VerifiedShortlistPreparation sessionId={sessionId} identity={view.identity} lang={lang} value={discoveryShortlist} onPrepare={onPrepare} />
   </>
+}
+
+export async function runVerifiedShortlistBatchAction(
+  identity: TaskGraphIdentity, request: VerifiedShortlistPreparationRequest,
+  start: (request: VerifiedShortlistPreparationRequest) => Promise<SelectedJobBatchCommandResult>,
+  isCurrent: () => boolean, onStarted?: (turnId: string) => void,
+): Promise<SelectedJobBatchCommandResult> {
+  if (!samePreparationSource(request.source, identity)) throw new Error('verified_shortlist_identity_changed')
+  const result = await start(request)
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(result.turnId)
+    || (result.disposition !== 'started' && result.disposition !== 'duplicate')) throw new Error('selected_job_batch_receipt_invalid')
+  if (isCurrent()) onStarted?.(result.turnId)
+  return result
+}
+
+function samePreparationSource(source: VerifiedShortlistPreparationRequest['source'], identity: TaskGraphIdentity): boolean {
+  return source.sessionId === identity.sessionId && source.sourceTurnId === identity.turnId
+    && source.rootTaskId === identity.rootTaskId && source.graphItemId === identity.graphItemId && source.graphRevision === identity.revision
+}
+
+function taskGraphSelectionKey(identity: TaskGraphIdentity | null, sessionId: string, turnId?: string | null, selectionKey?: string): string {
+  return JSON.stringify([selectionKey ?? null, sessionId, turnId ?? null, identity?.graphItemId ?? null,
+    identity?.rootTaskId ?? null, identity?.revision ?? null])
 }
 
 function parsePlanLedgerResponse(value: unknown): { identity: TaskGraphIdentity; projection: PlanLedgerWithRepairTargetGoals; verificationSummary: TaskGraphVerificationSummaryDto | null } | null {
