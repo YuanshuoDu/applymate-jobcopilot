@@ -17,7 +17,10 @@ export function createStage8FixtureControl() {
       if (line === "shutdown") {
         shuttingDown = true
         process.stdin.pause()
-        for (const waiter of waiters.values()) waiter.resolve("shutdown")
+        for (const waiter of waiters.values()) {
+          clearTimeout(waiter.timer)
+          waiter.resolve("shutdown")
+        }
         waiters.clear()
         finishShutdown()
       } else if (line) {
@@ -53,7 +56,9 @@ function trackStage8Pool(pool, control, workerTaskId, writeLine) {
       }
       return async (...args) => {
         const client = await target.connect(...args)
-        const identity = await client.query("SELECT pg_backend_pid() AS pid")
+        let identity
+        try { identity = await client.query("SELECT pg_backend_pid() AS pid") }
+        catch (error) { client.release(); throw error }
         const pid = identity.rows[0]?.pid
         if (Number.isSafeInteger(pid)) writeLine(`STAGE8_DB_PID ${workerTaskId} ${pid}`)
         let armedMarkerWritten = false
@@ -88,6 +93,7 @@ function trackStage8Pool(pool, control, workerTaskId, writeLine) {
 export function createStage8ApplyWorker({ queue, stopProtocol, pool, control, writeLine }) {
   return queue.createApplyWorker({ stagedSubmissionStopProtocol: {
     isStopped: scope => stopProtocol.isApplicationSubmissionStoppedWithStopProtocol(pool, scope),
+    onContinuationAcknowledged: scope => writeLine(`STAGE8_CONTINUE_ACK ${scope.workerTaskId}`),
     acquireStartFence: async scope => {
       const fence = await stopProtocol.acquireApplicationSubmissionStartFenceWithStopProtocol(
         trackStage8Pool(pool, control, scope.workerTaskId, writeLine), scope,
@@ -104,9 +110,8 @@ export function createStage8ApplyWorker({ queue, stopProtocol, pool, control, wr
         throw error
       }
       return { ...fence, release: async commit => {
-        if (commit) writeLine(`STAGE8_CONTINUE_ACK ${scope.workerTaskId}`)
         await fence.release(commit)
-        if (commit) writeLine(`STAGE8_FINAL_FENCE_RELEASED ${scope.workerTaskId}`)
+        writeLine(`STAGE8_FINAL_FENCE_RELEASED ${scope.workerTaskId}`)
       } }
     },
   } })
