@@ -4886,6 +4886,36 @@ function processFixtureProvesExactSigkill(
   return identity.kind === "turn" || scope.selectedTaskIds?.includes(identity.taskId) === true
 }
 
+function fixtureQueueCleanupOwnershipDiagnostic(input: {
+  readonly index: number
+  readonly queueLabel: string | undefined
+  readonly identity: FixtureQueueJobIdentity
+  readonly workers: Iterable<ProcessFixtureChild>
+  readonly allWorkersExited: boolean
+}): RecordValue {
+  const queueLabels = new Set(["turn queue", "subagent queue", "selected-job subagent queue", "correction Writer subagent queue"])
+  const queueLabel = diagnosticEnum(input.queueLabel, queueLabels) ?? "other"
+  const key = fixtureJobIdentityKey(input.identity.queueName, input.identity.jobId)
+  let matchingScopeWorkers = 0, matchingExitedSigkillWorkers = 0, exactJobWitnesses = 0
+  for (const child of input.workers) {
+    const scope = child.fixtureScopes?.find(value => value.sessionId === input.identity.sessionId
+      && value.turnId === input.identity.turnId)
+    if (!scope || input.identity.kind === "subagent" && !scope.selectedTaskIds?.includes(input.identity.taskId)) continue
+    matchingScopeWorkers += 1
+    if (!processFixtureExited(child) || child.terminationSignal !== "SIGKILL" || child.signalCode !== "SIGKILL") continue
+    matchingExitedSigkillWorkers += 1
+    if (child.staleBullJobKeys?.has(key)) exactJobWitnesses += 1
+  }
+  return {
+    stage: "active_job_missing_exact_sigkill_owner", index: diagnosticBoundedCount(input.index), queueLabel,
+    kind: input.identity.kind, generation: diagnosticBoundedCount(input.identity.generation),
+    currentGeneration: input.identity.currentGeneration, allWorkersExited: input.allWorkersExited,
+    matchingScopeWorkers: diagnosticBoundedCount(matchingScopeWorkers),
+    matchingExitedSigkillWorkers: diagnosticBoundedCount(matchingExitedSigkillWorkers),
+    exactJobWitnesses: diagnosticBoundedCount(exactJobWitnesses),
+  }
+}
+
 function noteFixtureSigkillTurnJob(child: ProcessFixtureChild, queueName: string, jobId: string): void {
   child.terminationSignal = "SIGKILL"
   child.staleBullJobKeys ??= new Set()
@@ -9306,19 +9336,30 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
       if (identities) for (const [index, identity] of identities.entries()) {
         await attempt("remove exact fixture queue job " + index, async () => {
-          const queue = queues.find(candidate => candidate.name === identity.queueName)?.queue
+          const queueSpec = queues.find(candidate => candidate.name === identity.queueName)
+          const queue = queueSpec?.queue
           if (!queue || !readyQueues.has(identity.queueName)) throw new Error("Exact fixture queue is unavailable")
           const staleLockWorkerExited = [...fixtureProcessChildren].some(child =>
             processFixtureProvesExactSigkill(child, identity))
-          await removeExactFixtureQueueJob(identity, {
-            name: queue.name,
-            toKey: jobId => queue.toKey(jobId),
-            getJob: async jobId => await queue.getJob(jobId) as unknown as FixtureCleanupJob | undefined,
-          }, redis!, {
-            allWorkersExited: allFixtureWorkersExited,
-            exactSigkillOwner: identity.kind === "turn" && staleLockWorkerExited,
-            exactSubagentSigkillOwner: identity.kind === "subagent" && staleLockWorkerExited,
-          })
+          try {
+            await removeExactFixtureQueueJob(identity, {
+              name: queue.name,
+              toKey: jobId => queue.toKey(jobId),
+              getJob: async jobId => await queue.getJob(jobId) as unknown as FixtureCleanupJob | undefined,
+            }, redis!, {
+              allWorkersExited: allFixtureWorkersExited,
+              exactSigkillOwner: identity.kind === "turn" && staleLockWorkerExited,
+              exactSubagentSigkillOwner: identity.kind === "subagent" && staleLockWorkerExited,
+            })
+          } catch (error: unknown) {
+            if (error instanceof Error && error.message === "Active fixture job has no exact exited SIGKILL owner proof") {
+              cleanupFailures.push("fixture queue ownership diagnostic " + JSON.stringify(fixtureQueueCleanupOwnershipDiagnostic({
+                index, queueLabel: queueSpec?.label, identity, workers: fixtureProcessChildren,
+                allWorkersExited: allFixtureWorkersExited,
+              })))
+            }
+            throw error
+          }
         })
       }
       const closedQueues = new Set<Queue>()
