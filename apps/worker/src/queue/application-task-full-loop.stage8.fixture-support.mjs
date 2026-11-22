@@ -1,3 +1,5 @@
+import { createStage8MarkerFenceTrace } from "./application-task-full-loop.stage8-marker-trace.mjs"
+
 const ARM_RELEASE = "stage8-release-arm"
 const FINAL_RELEASE = "stage8-release-final"
 const MAX_REVIEWED_POST_BYTES = 16_384
@@ -119,7 +121,7 @@ export function createStage8ApplicationSubmitDrain(outbox, control) {
   }
 }
 
-function trackStage8Pool(pool, control, workerTaskId, writeLine) {
+function trackStage8Pool(pool, control, workerTaskId, writeLine, markerTrace) {
   return new Proxy(pool, {
     get(target, key) {
       if (key !== "connect") {
@@ -144,7 +146,10 @@ function trackStage8Pool(pool, control, workerTaskId, writeLine) {
               const command = queryArgs[0]
               const sql = typeof command === "string" ? command : typeof command?.text === "string" ? command.text : ""
               const values = Array.isArray(queryArgs[1]) ? queryArgs[1] : Array.isArray(command?.values) ? command.values : []
-              const result = await connection.query(...queryArgs)
+              let result
+              try { result = await connection.query(...queryArgs) }
+              catch (error) { markerTrace?.observeError(sql, values); throw error }
+              markerTrace?.observe(sql, values, result)
               if (sql.includes('INSERT INTO "application_task_events"') && values[2] === "submission_stop_protocol") {
                 try { armedMarkerWritten = JSON.parse(values[4]).stage === "armed" } catch { armedMarkerWritten = false }
               }
@@ -189,16 +194,18 @@ export function createStage8ApplyWorker({ queue, stopProtocol, pool, control, wr
         writeLine("STAGE8_EXACT_SUBMISSION_ROUTE_MATCHED")
         writeLine("STAGE8_START_FENCE_ENTERED")
       }
+      const markerTrace = exactTarget ? createStage8MarkerFenceTrace(scope, writeStopPollLine) : null
       let fence
       try {
         fence = await stopProtocol.acquireApplicationSubmissionStartFenceWithStopProtocol(
-          trackStage8Pool(pool, control, scope.workerTaskId, writeLine), scope,
+          trackStage8Pool(pool, control, scope.workerTaskId, writeLine, markerTrace), scope,
         )
       } catch (error) {
-        if (exactTarget) writeLine("STAGE8_START_FENCE_RESULT threw")
+        if (exactTarget) { markerTrace?.finish(); writeLine("STAGE8_START_FENCE_RESULT threw") }
         throw error
       }
       if (exactTarget) {
+        markerTrace?.finish()
         const state = ["ready", "stopped", "inactive", "uncertain"].includes(fence.state) ? fence.state : "other"
         writeLine("STAGE8_START_FENCE_RESULT " + state)
       }

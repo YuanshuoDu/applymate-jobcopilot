@@ -302,6 +302,15 @@ type Stage8ExecutionFailure = Readonly<{
 const classifyStage8ExecutionFailure = (workerRequire("./src/queue/application-task-full-loop.trace-support.mjs") as {
   classifyStage8ExecutionFailure: (error: unknown) => Stage8ExecutionFailure
 }).classifyStage8ExecutionFailure
+const markerTraceSupport = workerRequire("./src/queue/application-task-full-loop.stage8-marker-trace.mjs") as {
+  sanitizeStage8MarkerFenceTrace: (value: unknown) => Readonly<Record<string, string>>
+  createStage8MarkerFenceTrace: (scope: Readonly<Record<string, unknown>>, writeLine: (line: string) => void) => {
+    observe: (sql: string, values: readonly unknown[], result: unknown) => void
+    observeError: (sql: string, values: readonly unknown[]) => void
+    finish: () => void
+  }
+}
+const { sanitizeStage8MarkerFenceTrace, createStage8MarkerFenceTrace } = markerTraceSupport
 const classifyStage8StopPollError = (workerRequire("./src/queue/application-task-full-loop.stage8.fixture-support.mjs") as {
   classifyStage8StopPollError: (error: unknown) => string
 }).classifyStage8StopPollError
@@ -596,6 +605,53 @@ describe("Stage8 terminal diagnostics", () => {
     expect(reviewedFillDiagnosticValue("PRIVATE_CHECKPOINT", REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS)).toBe("other")
   })
 
+  it("keeps marker-transaction diagnostics closed and bounded", () => {
+    const traceLines: string[] = []
+    const trace = createStage8MarkerFenceTrace({ sessionId: "private-session", fillTurnId: "private-turn",
+      applicationTaskId: "private-task", userId: "private-user", jobId: "private-job", approvalId: "private-approval",
+      constraintHash: "private-hash", workerTaskId: "private-worker" }, line => traceLines.push(line))
+    trace.observe("BEGIN", [], { rows: [] })
+    trace.observe(`WITH started AS (UPDATE application_tasks SET "checkpoint" = 'submission_request_started', "updatedAt" = NOW()
+      WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4 AND "fillTurnId" = $5
+        AND "status" = 'filling' AND "checkpoint" = 'browser_active' RETURNING "id")
+      INSERT INTO application_task_events ("id", "taskId", type, actor, body, data, "createdAt")
+      SELECT 'evt_' || $6, started."id", 'submission_execution_started', 'worker', 'Submit execution started', '{}'::jsonb, NOW() FROM started RETURNING "id"`,
+    [], { rowCount: 1, rows: [{ id: "private-event-id" }] })
+    trace.observe("ROLLBACK", [], { rows: [] })
+    expect(traceLines).toHaveLength(1)
+    const observed = JSON.parse(traceLines[0]!.slice("STAGE8_MARKER_TRANSACTION ".length)) as Record<string, string>
+    expect(observed).toMatchObject({ transaction: "rolled_back", lastPhase: "mark_started", markStarted: "started" })
+    expect(traceLines[0]).not.toMatch(/private-session|private-task|private-user|private-job|private-approval|private-hash|private-worker|private-event-id/)
+    const commitLines: string[] = []
+    const failedCommit = createStage8MarkerFenceTrace({}, line => commitLines.push(line))
+    failedCommit.observe("BEGIN", [], { rows: [] })
+    failedCommit.observeError("COMMIT", [])
+    expect(commitLines).toHaveLength(0)
+    failedCommit.observe("ROLLBACK", [], { rows: [] })
+    const failedCommitSnapshot = JSON.parse(commitLines[0]!.slice("STAGE8_MARKER_TRANSACTION ".length)) as Record<string, string>
+    expect(failedCommitSnapshot).toMatchObject({ transaction: "rolled_back", queryErrorPhase: "commit", lastPhase: "not_seen" })
+
+    const snapshot = sanitizeStage8MarkerFenceTrace({
+      transaction: "committed", lastPhase: "mark_started", queryErrorPhase: "PRIVATE_SQL", sourceReads: "multiple",
+      sessionLockRows: "one", turnLockRows: "one", fillerRows: "one", taskLock: "match", jobLockRows: "one",
+      taskRows: "one", taskStatus: "filling", taskCheckpoint: "browser_active", taskWorkerMatch: "match",
+      attemptRows: "one", attemptState: "reserved", attemptMatch: "match", approvalRows: "one",
+      approvalStatus: "consumed", approvalMatch: "match", priorStartRows: "zero", sessionStatus: "running",
+      turnStatus: "completed", lease: "lease_free", interruption: "clear", markStarted: "started", stopStage: "recorded",
+      sessionId: "PRIVATE_SESSION", workerTaskId: "PRIVATE_WORKER", constraintHash: "PRIVATE_HASH",
+    })
+    expect(snapshot).toMatchObject({ transaction: "committed", lastPhase: "mark_started", queryErrorPhase: "other",
+      taskCheckpoint: "browser_active", taskWorkerMatch: "match", attemptState: "reserved", approvalStatus: "consumed",
+      priorStartRows: "zero", sessionStatus: "running", turnStatus: "completed", lease: "lease_free",
+      markStarted: "started", stopStage: "recorded" })
+    const summary = stage8MarkerFenceSummary([
+      `STAGE8_MARKER_TRANSACTION ${JSON.stringify({ ...snapshot, sessionId: "PRIVATE_SESSION", hash: "PRIVATE_HASH" })}`,
+      "STAGE8_MARKER_TRANSACTION {invalid-json",
+    ])
+    expect(summary).toMatchObject({ transactionCount: 2, unclassifiedCount: 1, snapshot })
+    expect(JSON.stringify(summary)).not.toMatch(/PRIVATE|SESSION|WORKER|HASH|SQL/)
+  })
+
   it("summarizes only bounded first Stop-poll events and fixed error labels", () => {
     const known = classifyStage8StopPollError(new Error("Application submission request phase is unavailable."))
     const database = classifyStage8StopPollError(Object.assign(new Error("PRIVATE_DATABASE_DETAIL"), { code: "40P01" }))
@@ -625,6 +681,7 @@ describe("Stage8 terminal diagnostics", () => {
         caughtCodeCounts: { turn_binding_unavailable: 0, task_binding_unavailable: 0, request_phase_unavailable: 0,
           turn_state_unavailable: 0, stop_state_unavailable: 0, scope_changed: 0, poll_commit_failed: 0, database: 0, other: 0 },
         unclassifiedCount: 0 },
+      markerFence: { transactionCount: 0, snapshot: null, unclassifiedCount: 0 },
     })
   })
 
@@ -1971,6 +2028,7 @@ const STAGE8_BULL_STATES = new Set(["active", "completed", "delayed", "failed", 
 const STAGE8_FENCE_STATES = ["ready", "stopped", "inactive", "uncertain", "threw"] as const
 const STAGE8_STOP_POLL_ERRORS = ["turn_binding_unavailable", "task_binding_unavailable", "request_phase_unavailable",
   "turn_state_unavailable", "stop_state_unavailable", "scope_changed", "poll_commit_failed", "database", "other"] as const
+const STAGE8_MARKER_TRACE_PREFIX = "STAGE8_MARKER_TRANSACTION "
 
 function stage8StopPollSummary(lines: readonly string[]) {
   const eventCounts = { entered: 0, returnedContinue: 0, returnedStopped: 0, caught: 0 }
@@ -1992,6 +2050,17 @@ function stage8StopPollSummary(lines: readonly string[]) {
   return { eventCounts, caughtCodeCounts, unclassifiedCount }
 }
 
+function stage8MarkerFenceSummary(lines: readonly string[]) {
+  const markerLines = lines.filter(line => typeof line === "string" && line.startsWith(STAGE8_MARKER_TRACE_PREFIX)).slice(-64)
+  let snapshot: Readonly<Record<string, string>> | null = null
+  let unclassifiedCount = 0
+  for (const line of markerLines) {
+    try { snapshot = sanitizeStage8MarkerFenceTrace(JSON.parse(line.slice(STAGE8_MARKER_TRACE_PREFIX.length))) }
+    catch { unclassifiedCount += 1 }
+  }
+  return { transactionCount: markerLines.length, snapshot, unclassifiedCount }
+}
+
 function stage8RequestFenceSummary(lines: readonly string[]) {
   let routeMatched = false
   let fenceEntered = false
@@ -2005,7 +2074,7 @@ function stage8RequestFenceSummary(lines: readonly string[]) {
     else if (typeof line === "string" && line.startsWith("STAGE8_START_FENCE_RESULT ")) unclassifiedCount += 1
   }
   return { exactRouteMatched: routeMatched, exactFenceEntered: fenceEntered, resultCounts, unclassifiedCount,
-    stopPoll: stage8StopPollSummary(lines) }
+    stopPoll: stage8StopPollSummary(lines), markerFence: stage8MarkerFenceSummary(lines) }
 }
 
 async function stage8ApplyQueueState(workerTaskId: string) {
