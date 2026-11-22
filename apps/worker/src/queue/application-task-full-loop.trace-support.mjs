@@ -57,7 +57,7 @@ export function classifyStage8ExecutionFailure(error) {
   }
 }
 
-export function createStage8ExecutionFailureDiagnostics(userId, writeLine, input = process.stdin) {
+export function createStage8ExecutionFailureDiagnostics(writeLine, input = process.stdin) {
   let target = null
   let buffer = ""
   input.setEncoding("utf8")
@@ -75,7 +75,7 @@ export function createStage8ExecutionFailureDiagnostics(userId, writeLine, input
   })
   return {
     record(job, error) {
-      if (!target || job?.data?.userId !== userId || job?.data?.sessionId !== target.sessionId || job?.data?.turnId !== target.turnId) return false
+      if (!target || job?.data?.sessionId !== target.sessionId || job?.data?.turnId !== target.turnId) return false
       writeLine(`STAGE8_TURN_EXECUTION_FAILURE ${JSON.stringify(classifyStage8ExecutionFailure(error))}`)
       return true
     },

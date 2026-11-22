@@ -302,7 +302,7 @@ const classifyStage8ExecutionFailure = (workerRequire("./src/queue/application-t
   classifyStage8ExecutionFailure: (error: unknown) => Stage8ExecutionFailure
 }).classifyStage8ExecutionFailure
 const createStage8ExecutionFailureDiagnostics = (workerRequire("./src/queue/application-task-full-loop.trace-support.mjs") as {
-  createStage8ExecutionFailureDiagnostics: (userId: string, writeLine: (line: string) => void, input: PassThrough) => {
+  createStage8ExecutionFailureDiagnostics: (writeLine: (line: string) => void, input: PassThrough) => {
     record: (job: unknown, error: unknown) => boolean
   }
 }).createStage8ExecutionFailureDiagnostics
@@ -691,20 +691,20 @@ describe("Stage8 terminal diagnostics", () => {
     expect(JSON.stringify(summary)).not.toMatch(/PRIVATE|SECRET|private|C:\\\\|module\.ts|PRIVATE_RAW_FAILURE/)
   })
 
-  it("emits a diagnostic only for the exact in-memory fixture user, Session, and Fill Turn", () => {
+  it("matches the canonical Session/Turn queue payload without userId and rejects foreign scope", () => {
     const input = new PassThrough()
     const lines: string[] = []
-    const diagnostics = createStage8ExecutionFailureDiagnostics("private-user", line => lines.push(line), input)
+    const diagnostics = createStage8ExecutionFailureDiagnostics(line => lines.push(line), input)
     input.write("stage8-failure-target private-session private-fill-turn\n")
-    expect(diagnostics.record({ data: { userId: "private-user", sessionId: "other-session", turnId: "private-fill-turn" } }, new Error("PRIVATE_ERROR"))).toBe(false)
-    expect(diagnostics.record({ data: { userId: "private-user", sessionId: "private-session", turnId: "other-turn" } }, new Error("PRIVATE_ERROR"))).toBe(false)
-    expect(diagnostics.record({ data: { userId: "foreign-user", sessionId: "private-session", turnId: "private-fill-turn" } }, new Error("PRIVATE_ERROR"))).toBe(false)
-    expect(diagnostics.record({ data: { userId: "private-user", sessionId: "private-session", turnId: "private-fill-turn" } }, new Error("PRIVATE_ERROR"))).toBe(true)
+    expect(diagnostics.record({ data: { turnId: "private-fill-turn", sessionId: "other-session", ownerId: "agent-run:private-fill-turn" } }, new Error("PRIVATE_ERROR"))).toBe(false)
+    expect(diagnostics.record({ data: { turnId: "other-turn", sessionId: "private-session", ownerId: "agent-run:other-turn" } }, new Error("PRIVATE_ERROR"))).toBe(false)
+    expect(diagnostics.record({ data: { turnId: "private-fill-turn", sessionId: "private-session", ownerId: "agent-run:private-fill-turn" } }, new Error("PRIVATE_ERROR"))).toBe(true)
+
     expect(lines).toEqual([
       "STAGE8_FAILURE_TARGET_ARMED",
       'STAGE8_TURN_EXECUTION_FAILURE {"errorKind":"error","machineCode":"other","repoStage":"other","sqlState":"none"}',
     ])
-    expect(JSON.stringify(lines)).not.toMatch(/private-user|private-session|private-fill-turn|PRIVATE_ERROR/)
+    expect(JSON.stringify(lines)).not.toMatch(/private-session|private-fill-turn|PRIVATE_ERROR/)
     input.destroy()
   })
 })

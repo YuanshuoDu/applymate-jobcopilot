@@ -271,7 +271,7 @@ async function startWorker(stagedSubmissionStopProtocol = false) {
     import("../cloak/pool.js"), import("../redis.ts"), import("../runtime/wakeup/consumer.ts"),
   ])
   const control = stagedSubmissionStopProtocol ? createStage8FixtureControl() : undefined
-  const stage8FailureDiagnostics = control ? createStage8ExecutionFailureDiagnostics(userId, say) : undefined
+  const stage8FailureDiagnostics = control ? createStage8ExecutionFailureDiagnostics(say) : undefined
   const legacyAckWitness = stagedSubmissionStopProtocol ? undefined : createLegacyQueueAckWitness(say)
   const flags = { ...resolveProductionAgentFlags(), taskGraphPlanningEnabled: true, childExecutionEnabled: true,
     coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false }
