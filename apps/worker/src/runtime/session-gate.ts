@@ -49,7 +49,7 @@ export async function assertSessionWorkAdmission(
 /** Terminal receipt exception for the already-owned canonical application Fill Turn only. */
 export async function assertSessionTerminalAdmission(
   client: Pick<pg.PoolClient, "query">,
-  input: { readonly sessionId: string; readonly userId: string; readonly turnId: string; readonly source: string | null; readonly executionMode: string | null },
+  input: { readonly sessionId: string; readonly userId: string; readonly turnId: string; readonly rootTaskId: string; readonly source: string | null; readonly executionMode: string | null },
 ): Promise<void> {
   try {
     await assertSessionWorkAdmission(client, input)
@@ -57,16 +57,20 @@ export async function assertSessionTerminalAdmission(
   } catch (error: unknown) {
     if (!isSessionPauseRequestedError(error)) throw error
   }
-  if (input.source !== "user" || input.executionMode !== "canonical_task_graph") throw new SessionPauseRequestedError()
+  if (input.source !== "user" || (input.executionMode !== null && input.executionMode !== "canonical_task_graph")
+    || !input.rootTaskId.trim()) throw new SessionPauseRequestedError()
   const wait = await client.query<{ id: string }>(
     `SELECT session."id" FROM "agent_sessions" AS session
      JOIN "application_tasks" AS fill_task ON fill_task."sessionId" = session."id" AND fill_task."userId" = session."userId"
+     JOIN "sub_agent_tasks" AS filler ON filler."sessionId" = fill_task."sessionId" AND filler."turnId" = fill_task."fillTurnId"
      WHERE session."id" = $1 AND session."userId" = $2 AND session."status" = 'waiting_for_user'
        AND ${NO_UNRESOLVED_SESSION_PAUSE}
        AND fill_task."fillTurnId" = $3 AND fill_task."fillTurnSessionId" = $1 AND fill_task."fillTurnUserId" = $2
        AND fill_task."status" = 'waiting_for_user' AND fill_task."checkpoint" = 'submission_uncertain'
+       AND filler."rootTaskId" = $4 AND filler."parentTaskId" = $4 AND filler."role" = 'application_filler'
+       AND filler."taskType" = 'application_fill_for_review' AND filler."status" = 'completed'
      LIMIT 2`,
-    [input.sessionId, input.userId, input.turnId],
+    [input.sessionId, input.userId, input.turnId, input.rootTaskId],
   )
   if (wait.rows.length !== 1) throw new SessionPauseRequestedError()
 }

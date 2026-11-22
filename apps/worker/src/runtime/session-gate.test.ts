@@ -42,7 +42,7 @@ describe("Worker session gates", () => {
     const query = vi.fn(async (sql: string, _params?: unknown[]) => ({
       rows: sql.includes('JOIN "application_tasks" AS fill_task') ? [{ id: "session-1" }] : [],
     }))
-    const input = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", source: "user", executionMode: "canonical_task_graph" }
+    const input = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", source: "user", executionMode: "canonical_task_graph" }
 
     await expect(assertSessionTerminalAdmission({ query } as never, input)).resolves.toBeUndefined()
 
@@ -54,8 +54,21 @@ describe("Worker session gates", () => {
     expect(terminal).toContain(`fill_task."fillTurnSessionId" = $1`)
     expect(terminal).toContain(`fill_task."fillTurnUserId" = $2`)
     expect(terminal).toContain(`fill_task."status" = 'waiting_for_user' AND fill_task."checkpoint" = 'submission_uncertain'`)
+    expect(terminal).toContain(`filler."turnId" = fill_task."fillTurnId"`)
+    expect(terminal).toContain(`filler."rootTaskId" = $4 AND filler."parentTaskId" = $4`)
+    expect(terminal).toContain(`filler."role" = 'application_filler'`)
+    expect(terminal).toContain(`filler."taskType" = 'application_fill_for_review' AND filler."status" = 'completed'`)
     expect(terminal).toContain(`pause_request."type" = 'session.pause_requested'`)
-    expect(query.mock.calls[1]?.[1]).toEqual(["session-1", "user-1", "turn-1"])
+    expect(query.mock.calls[1]?.[1]).toEqual(["session-1", "user-1", "turn-1", "root-1"])
+  })
+
+  it("admits the production null-mode Fill Turn only with the exact completed Fill child and wait", async () => {
+    const query = vi.fn(async (sql: string) => ({ rows: sql.includes('JOIN "application_tasks" AS fill_task') ? [{ id: "session-1" }] : [] }))
+
+    await expect(assertSessionTerminalAdmission({ query } as never, {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", source: "user", executionMode: null,
+    })).resolves.toBeUndefined()
+    expect(query.mock.calls[1]?.[0]).toContain(`filler."status" = 'completed'`)
   })
 
   it.each([
@@ -64,9 +77,52 @@ describe("Worker session gates", () => {
   ])("does not use the derived wait exception for a %s", async (_case, source, executionMode) => {
     const query = vi.fn(async () => ({ rows: [] }))
     await expect(assertSessionTerminalAdmission({ query } as never, {
-      userId: "user-1", sessionId: "session-1", turnId: "turn-1", source, executionMode,
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", source, executionMode,
     })).rejects.toBeInstanceOf(SessionPauseRequestedError)
     expect(query).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not accept nullable mode without the exact Fill child receipt", async () => {
+    const query = vi.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [] }))
+
+    await expect(assertSessionTerminalAdmission({ query } as never, {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", source: "user", executionMode: null,
+    })).rejects.toBeInstanceOf(SessionPauseRequestedError)
+    expect(query).toHaveBeenCalledTimes(2)
+    expect(query.mock.calls[1]?.[0]).toContain(`filler."rootTaskId" = $4 AND filler."parentTaskId" = $4`)
+    expect(query.mock.calls[1]?.[1]).toEqual(["session-1", "user-1", "turn-1", "root-1"])
+  })
+
+  it("does not admit a Fill child rooted in a different Root", async () => {
+    const query = vi.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [] }))
+
+    await expect(assertSessionTerminalAdmission({ query } as never, {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", source: "user", executionMode: null,
+    })).rejects.toBeInstanceOf(SessionPauseRequestedError)
+    const terminal = query.mock.calls[1]?.[0] ?? ""
+    expect(terminal).toContain(`filler."turnId" = fill_task."fillTurnId"`)
+    expect(terminal).toContain(`filler."rootTaskId" = $4 AND filler."parentTaskId" = $4`)
+    expect(query.mock.calls[1]?.[1]).toEqual(["session-1", "user-1", "turn-1", "root-1"])
+  })
+
+  it("does not admit a same-Turn child with a noncanonical role or task type", async () => {
+    const query = vi.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [] }))
+
+    await expect(assertSessionTerminalAdmission({ query } as never, {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", source: "user", executionMode: null,
+    })).rejects.toBeInstanceOf(SessionPauseRequestedError)
+    const terminal = query.mock.calls[1]?.[0] ?? ""
+    expect(terminal).toContain(`filler."role" = 'application_filler'`)
+    expect(terminal).toContain(`filler."taskType" = 'application_fill_for_review'`)
+  })
+
+  it("does not use a still-waiting filler as completed terminal evidence", async () => {
+    const query = vi.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [] }))
+
+    await expect(assertSessionTerminalAdmission({ query } as never, {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", source: "user", executionMode: null,
+    })).rejects.toBeInstanceOf(SessionPauseRequestedError)
+    expect(query.mock.calls[1]?.[0]).toContain(`filler."status" = 'completed'`)
   })
 
   it.each([0, 2])("rejects a derived wait with %i eligible application bindings", async count => {
@@ -74,7 +130,7 @@ describe("Worker session gates", () => {
       rows: sql.includes('JOIN "application_tasks" AS fill_task') ? Array.from({ length: count }, (_, index) => ({ id: `session-${index}` })) : [],
     }))
     await expect(assertSessionTerminalAdmission({ query } as never, {
-      userId: "user-1", sessionId: "session-1", turnId: "turn-1", source: "user", executionMode: "canonical_task_graph",
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", source: "user", executionMode: "canonical_task_graph",
     })).rejects.toBeInstanceOf(SessionPauseRequestedError)
     expect(query).toHaveBeenCalledTimes(2)
   })
@@ -84,7 +140,7 @@ describe("Worker session gates", () => {
       rows: sql.includes('JOIN "application_tasks" AS fill_task') && !sql.includes("pause_request") ? [{ id: "session-1" }] : [],
     }))
     await expect(assertSessionTerminalAdmission({ query } as never, {
-      userId: "user-1", sessionId: "session-1", turnId: "turn-1", source: "user", executionMode: "canonical_task_graph",
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", source: "user", executionMode: "canonical_task_graph",
     })).rejects.toBeInstanceOf(SessionPauseRequestedError)
     expect(query.mock.calls[1]?.[0]).toContain(`fill_task."checkpoint" = 'submission_uncertain'`)
     expect(query.mock.calls[1]?.[0]).toContain(`pause_request."type" = 'session.pause_requested'`)
