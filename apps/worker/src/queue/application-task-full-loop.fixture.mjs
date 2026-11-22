@@ -17,23 +17,23 @@ const REVIEWED_FILL_BRIDGE_PATH = "/__applymate-reviewed-fill"
 const reviewedHash = createHash("sha256").update(REVIEWED_COVER_LETTER).digest("hex")
 const stageObserver = process.env.APPLICATION_TASK_FULL_LOOP_STAGE_OBSERVER_TEST === "true" ? applicationFillStageTrace() : undefined
 let legacyFinalResponseGate
-function armLegacyFinalResponseGate(rootTaskId) {
-  if (!/^root-[A-Za-z0-9_-]{1,120}$/.test(rootTaskId) || legacyFinalResponseGate) throw new Error("legacy_final_response_gate_arm_invalid")
+function armLegacyFinalResponseGate(turnId) {
+  if (typeof turnId !== "string" || !turnId || turnId.length > 256 || turnId.trim() !== turnId || legacyFinalResponseGate) throw new Error("legacy_final_response_gate_arm_invalid")
   let release
   const released = new Promise(resolve => { release = resolve })
-  legacyFinalResponseGate = { rootTaskId, release, released, claimed: false }
+  legacyFinalResponseGate = { turnId, release, released, claimed: false }
 }
-function releaseLegacyFinalResponseGate(rootTaskId) {
+function releaseLegacyFinalResponseGate(turnId) {
   const gate = legacyFinalResponseGate
-  if (!gate || gate.rootTaskId !== rootTaskId) return false
+  if (!gate || gate.turnId !== turnId) return false
   gate.release()
   return true
 }
-async function holdLegacyFinalResponse(rootTaskId) {
+async function holdLegacyFinalResponse(turnId) {
   const gate = legacyFinalResponseGate
-  if (!gate || gate.rootTaskId !== rootTaskId || gate.claimed) return
+  if (!gate || gate.turnId !== turnId || gate.claimed) return
   gate.claimed = true
-  say("LEGACY_FINAL_RESPONSE_GATE_REACHED")
+  say(`LEGACY_FINAL_RESPONSE_GATE_REACHED turnId=${turnId}`)
   let timer
   await Promise.race([gate.released, new Promise(resolve => {
     timer = setTimeout(resolve, 45_000)
@@ -374,7 +374,7 @@ async function startWorker() {
       ? createOptionalProductionChildExecutor({ ...options, authorizeUsage, modelRuntimeFactory: ({ task }) => selectedModelRuntime(task), ...(stageObserver ? { applicationFillStageObserver: stageObserver } : {}) }) : undefined),
     createCanonicalTurnRuntime: (runtimePool, productionOptions) => createCanonicalTurnRuntime(runtimePool, {
       ...productionOptions, ...taskGraphTemplatesModule.taskGraphRuntimeOptions(taskGraphCommandPort),
-      modelRuntimeFactory: ({ state }) => state.goal.includes(REVIEWED_SOURCE_GOAL) ? reviewedRootModel() : fixtureModel({ rootTaskId: state.rootTaskId, beforeFinalResponse: holdLegacyFinalResponse }), authorizeUsage,
+      modelRuntimeFactory: ({ state }) => state.goal.includes(REVIEWED_SOURCE_GOAL) ? reviewedRootModel() : fixtureModel({ beforeFinalResponse: () => holdLegacyFinalResponse(state.scope.turnId) }), authorizeUsage,
     }),
     createWorkerUsageAuthorizer: () => authorizeUsage,
     createCanonicalExecutionProjection: () => noOpProjection,

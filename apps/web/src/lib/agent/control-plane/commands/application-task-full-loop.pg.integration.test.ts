@@ -276,7 +276,7 @@ const { Queue } = workerRequire("bullmq") as { Queue: new (name: string, options
 } }
 let site: Child | undefined
 let worker: Child | undefined
-let legacyFinalResponseGateRootTaskId: string | undefined
+let legacyFinalResponseGateTurnId: string | undefined
 let applyQueue: InstanceType<typeof Queue> | undefined
 let turnQueue: InstanceType<typeof Queue> | undefined
 let subagentQueue: InstanceType<typeof Queue> | undefined
@@ -587,29 +587,37 @@ async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Pro
   throw new Error(`Fixture line ${expected} missing; child=${JSON.stringify(childSummary(child))}`)
 }
 
-async function armLegacyFinalResponseGate(rootTaskId: string): Promise<void> {
+async function armLegacyFinalResponseGate(turnId: string): Promise<void> {
   if (!worker?.stdin) throw new Error("Worker fixture stdin is unavailable")
-  legacyFinalResponseGateRootTaskId = rootTaskId
-  worker.stdin.write("arm-legacy-final-response " + rootTaskId + String.fromCharCode(10))
+  legacyFinalResponseGateTurnId = turnId
+  worker.stdin.write("arm-legacy-final-response " + turnId + String.fromCharCode(10))
   await waitLine(worker, "LEGACY_FINAL_RESPONSE_GATE_ARMED", 5_000)
 }
 
 async function releaseLegacyFinalResponseGate(): Promise<void> {
-  const rootTaskId = legacyFinalResponseGateRootTaskId
-  if (!rootTaskId || !worker?.stdin || exited(worker)) { legacyFinalResponseGateRootTaskId = undefined; return }
-  worker.stdin.write("release-legacy-final-response " + rootTaskId + String.fromCharCode(10))
+  const turnId = legacyFinalResponseGateTurnId
+  if (!turnId || !worker?.stdin || exited(worker)) { legacyFinalResponseGateTurnId = undefined; return }
+  worker.stdin.write("release-legacy-final-response " + turnId + String.fromCharCode(10))
   try { await waitLine(worker, "LEGACY_FINAL_RESPONSE_GATE_RELEASED", 3_000) }
-  finally { legacyFinalResponseGateRootTaskId = undefined }
+  finally { legacyFinalResponseGateTurnId = undefined }
 }
 
-async function expectLegacyFillTurnLeased(turnId: string, rootTaskId: string): Promise<void> {
+async function expectLegacyFillTurnLeased(turnId: string): Promise<string> {
   const turn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: turnId }, select: {
     userId: true, sessionId: true, rootTaskId: true, status: true, leaseOwnerId: true, leaseExpiresAt: true, completedAt: true,
   } })
-  expect(turn).toMatchObject({ userId: ids.user, sessionId: ids.session, rootTaskId, status: "in_progress", completedAt: null })
+  expect(turn).toMatchObject({ userId: ids.user, sessionId: ids.session, status: "in_progress", completedAt: null })
+  const rootTaskId = turn.rootTaskId
+  if (typeof rootTaskId !== "string" || !rootTaskId) throw new Error("Successor Fill Turn root identity is missing")
+  const root = await testDb.subAgentTask.findFirst({ where: {
+    id: rootTaskId, rootTaskId, sessionId: ids.session, turnId, parentTaskId: null,
+  }, select: { id: true, rootTaskId: true, sessionId: true, turnId: true, parentTaskId: true, role: true, taskType: true, status: true } })
+  expect(root).toMatchObject({ id: rootTaskId, rootTaskId, sessionId: ids.session, turnId, parentTaskId: null,
+    role: "orchestrator", taskType: "root", status: "running" })
   expect(turn.leaseOwnerId).toEqual(expect.any(String))
   expect(turn.leaseExpiresAt).toBeInstanceOf(Date)
   expect(turn.leaseExpiresAt!.getTime()).toBeGreaterThan(Date.now())
+  return rootTaskId
 }
 async function waitExit(child: Child, timeoutMs: number): Promise<boolean> {
   if (exited(child)) return true
@@ -1585,12 +1593,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(answeredJson).toMatchObject({ resumed: true })
     const confirmedTask = await waitForTask(task => task.status === "filling" && task.checkpoint === "taskgraph_fill_queued" && task.fillTurnId !== firstFillTurnId)
     const successorTurnId = confirmedTask.fillTurnId!
+    await armLegacyFinalResponseGate(successorTurnId)
     const successorTurn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: successorTurnId }, select: {
-      userId: true, sessionId: true, rootTaskId: true,
+      userId: true, sessionId: true,
     } })
     expect(successorTurn).toMatchObject({ userId: ids.user, sessionId: ids.session })
-    if (!successorTurn.rootTaskId) throw new Error("Successor Fill Turn root identity is missing")
-    await armLegacyFinalResponseGate(successorTurn.rootTaskId)
     expect(confirmedTask.confirmedAnswers).toMatchObject({ [field!.key!]: "Yes" })
     expect(JSON.stringify(await testDb.applicationTaskEvent.findMany({ where: { taskId: gateTaskId, type: "user_answers_confirmed" }, select: { data: true } }))).not.toContain("Yes")
     const duplicate = await answerApplicationTask(apiRequest(answerPath, ownerToken, "PATCH", answerBody))
@@ -1708,17 +1715,17 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     }), { params: Promise.resolve({ id: ids.session }) })
     expect(approved.status).toBe(200)
     await Promise.all([
-      waitLine(worker!, "LEGACY_FINAL_RESPONSE_GATE_REACHED", 45_000),
+      waitLine(worker!, `LEGACY_FINAL_RESPONSE_GATE_REACHED turnId=${successorTurnId}`, 45_000),
       waitLine(site!, "SUBMIT_REQUEST 1", 120_000),
     ])
     expect((await requestFixtureStats()).submitCount).toBe(1)
-    await expectLegacyFillTurnLeased(successorTurnId, successorTurn.rootTaskId!)
+    const successorRootTaskId = await expectLegacyFillTurnLeased(successorTurnId)
     await releaseLegacyFinalResponseGate()
     expect((await waitForAgentTurnTerminal(successorTurnId, 30_000)).status).toBe("completed")
     expect(await testDb.agentTurn.findUniqueOrThrow({ where: { id: successorTurnId }, select: {
       rootTaskId: true, status: true, completedAt: true, leaseOwnerId: true, leaseExpiresAt: true,
     } })).toMatchObject({
-      rootTaskId: successorTurn.rootTaskId, status: "completed", completedAt: expect.any(Date),
+      rootTaskId: successorRootTaskId, status: "completed", completedAt: expect.any(Date),
       leaseOwnerId: null, leaseExpiresAt: null,
     })
     const outbox = await testDb.agentOutbox.findMany({ where: { topic: "application.submit.dispatch", aggregateId: ids.session } })
