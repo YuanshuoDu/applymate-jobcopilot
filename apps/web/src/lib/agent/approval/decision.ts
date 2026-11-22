@@ -190,8 +190,9 @@ async function hasReviewedApplicationSignal(
   if (row.id.startsWith("reviewed-application-review:") || row.toolCallId?.startsWith("review_application:") === true) return true
   const [turn, events] = await Promise.all([
     tx.agentTurn.findFirst({ where: { id: turnId, sessionId: row.sessionId, userId: row.userId }, select: { input: true } }),
-    row.taskId ? tx.applicationTaskEvent.findMany({ where: { taskId: row.taskId, type: "reviewed_application_review_issued" },
-      take: 1, select: { id: true } }) : Promise.resolve([]),
+    row.taskId ? tx.applicationTaskEvent.findMany({ where: { taskId: row.taskId, type: "reviewed_application_review_issued",
+      OR: [{ data: { path: ["reviewTurnId"], equals: turnId } }, { data: { path: ["approvalId"], equals: row.id } }] },
+      take: 2, select: { id: true } }) : Promise.resolve([]),
   ])
   const input = jsonRecord(turn?.input), intent = jsonRecord(input?.intent)
   return intent?.kind === "reviewed_application_review" || events.length > 0
