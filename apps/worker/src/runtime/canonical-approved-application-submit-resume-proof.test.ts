@@ -23,8 +23,10 @@ const root = (status = "waiting_for_user", changes: Record<string, unknown> = {}
 
 function clientFor(options: { root?: Record<string, unknown>; turn?: Record<string, unknown>; node?: Record<string, unknown> } = {}) {
   const queries: string[] = []
-  const query = vi.fn(async (sql: string) => {
+  const calls: { sql: string; values?: readonly unknown[] }[] = []
+  const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
     queries.push(sql)
+    calls.push({ sql, values })
     if (sql.includes('FROM "agent_turns" AS turn JOIN "agent_sessions"')) return { rows: [{ ...turn, ...options.turn }] }
     if (sql.includes('FROM "sub_agent_tasks" AS root')) return { rows: [options.root ?? root()] }
     if (sql.includes('FROM "sub_agent_tasks" AS filler')) return { rows: [{ result: { status: "filled_for_user_review" } }] }
@@ -32,7 +34,7 @@ function clientFor(options: { root?: Record<string, unknown>; turn?: Record<stri
     if (sql.includes('FROM "application_task_events"')) return { rows: [] }
     throw new Error("unexpected proof query")
   })
-  return { client: { query } as never, query, queries }
+  return { client: { query } as never, query, queries, calls }
 }
 
 beforeEach(() => {
@@ -58,6 +60,9 @@ describe("canonical approved application submit resume proof", () => {
   it("admits only an expired prior Root owner for canonical reclaim", async () => {
     const test = clientFor({ root: root("running", { leaseOwner: "prior-owner", leaseExpiresAt: new Date("2026-11-22T11:59:00Z") }) })
     await expect(readCanonicalApprovedApplicationSubmitResumeProof(test.client, { lease, rootTaskId: "root-a", now })).resolves.toMatchObject({ state: "form_filled" })
+    const sql = test.calls[1]!.sql.replace(/\s+/g, " ")
+    expect(sql).toContain(`OR (root."status"='running' AND root."leaseOwner" IS NOT NULL AND root."leaseExpiresAt" IS NOT NULL AND root."leaseExpiresAt"<=$6)`)
+    expect(test.calls[1]!.values?.slice(4)).toEqual([lease.ownerId, now])
   })
 
   it.each([
