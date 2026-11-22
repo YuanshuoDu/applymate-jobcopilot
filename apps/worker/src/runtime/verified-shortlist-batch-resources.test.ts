@@ -61,7 +61,7 @@ function root(overrides: Record<string, unknown> = {}) {
   }
 }
 
-async function run(options: FixtureOptions = {}, selectedBinding = binding) {
+async function run(options: FixtureOptions = {}, selectedBinding: unknown = binding) {
   const calls: Array<{ sql: string; values: readonly unknown[] }> = []
   const responses: unknown[][] = [
     options.session === false ? [] : [{ id: lease.sessionId }],
@@ -135,6 +135,31 @@ describe("verified shortlist batch resource revalidation", () => {
     expect((await run({ root: badEvidence })).result).toBeNull()
     expect((await run({}, { ...binding, selectedJobIds: ["job-2", "job-1"] })).result).toBeNull()
     expect((await run({}, { ...binding, selectedJobIds: ["job-1", "job-other"] })).result).toBeNull()
+  })
+
+  it("normalizes the closed shared binding before comparing the persisted turn input", async () => {
+    const reordered = {
+      selectedJobIds: ["job-1", "job-2"],
+      source: { graphRevision: 12, graphItemId: source.graphItemId, rootTaskId: source.rootTaskId,
+        sourceTurnId: source.sourceTurnId, sessionId: source.sessionId },
+      schemaVersion: binding.schemaVersion,
+    }
+    const { result, calls } = await run({}, reordered)
+
+    expect(result).toHaveLength(2)
+    expect(calls[1]!.values[6]).toBe(JSON.stringify(binding))
+  })
+
+  it.each([
+    ["extra binding field", { ...binding, callerAuthority: true }],
+    ["wrong schema", { ...binding, schemaVersion: "future" }],
+    ["single Job", { ...binding, selectedJobIds: ["job-1"] }],
+    ["four Jobs", { ...binding, selectedJobIds: ["job-1", "job-2", "job-3", "job-4"] }],
+  ])("rejects %s before any database read", async (_label, malformed) => {
+    const { result, calls } = await run({}, malformed)
+
+    expect(result).toBeNull()
+    expect(calls).toHaveLength(0)
   })
 
   it("revalidates the caller's exact current Root after setup", async () => {

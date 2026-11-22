@@ -1,4 +1,10 @@
 import type pg from "pg"
+import {
+  parseVerifiedShortlistSelectionBinding,
+  SELECTED_JOB_BATCH_PREPARATION_INTENT,
+  VERIFIED_SHORTLIST_SELECTION_SCHEMA,
+  type VerifiedShortlistSelectionBinding,
+} from "@jobcopilot/agent-protocol"
 
 import { parseInteractiveDiscoveryShortlist } from "./interactive-discovery-contract.js"
 import { loadTaskGraph } from "./subagents/task-graph-pg-state.js"
@@ -9,24 +15,11 @@ import {
 import { taskGraphItemId } from "./subagents/task-graph-snapshot.js"
 import type { TurnLease } from "./turns/lease.js"
 
-const BINDING_SCHEMA = "agent-harness.v2.verified-shortlist-selection.v1"
-const BATCH_INTENT = "selected_job_batch_preparation"
+const BATCH_INTENT = SELECTED_JOB_BATCH_PREPARATION_INTENT.kind
 const DISCOVERY_INTENT = "interactive_discovery_shortlist"
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
-const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/
 
-/** Normalized only by the trusted closed parser at the Worker entry point. */
-export type VerifiedShortlistSelectionBinding = Readonly<{
-  schemaVersion: typeof BINDING_SCHEMA
-  source: Readonly<{
-    sessionId: string
-    sourceTurnId: string
-    rootTaskId: string
-    graphItemId: string
-    graphRevision: number
-  }>
-  selectedJobIds: readonly string[]
-}>
+export type { VerifiedShortlistSelectionBinding } from "@jobcopilot/agent-protocol"
 
 type QueryClient = Pick<pg.PoolClient, "query">
 type TurnRow = Readonly<{
@@ -44,10 +37,11 @@ export async function loadVerifiedShortlistBatchResources(input: Readonly<{
   client: QueryClient
   lease: TurnLease
   expectedRootTaskId: string | null
-  binding: VerifiedShortlistSelectionBinding
+  binding: unknown
 }>): Promise<readonly SelectedJobBatchSlot[] | null> {
-  const { client, lease, binding } = input
-  if (!validBinding(binding, lease) || (input.expectedRootTaskId !== null && !safeId(input.expectedRootTaskId))) return null
+  const { client, lease } = input
+  const binding = parseVerifiedShortlistSelectionBinding(input.binding)
+  if (!binding || !validBinding(binding, lease) || (input.expectedRootTaskId !== null && !safeId(input.expectedRootTaskId))) return null
 
   const sessionResult = await client.query<{ id: string }>(
     `SELECT "id" FROM "agent_sessions"
@@ -149,24 +143,16 @@ export async function loadVerifiedShortlistBatchResources(input: Readonly<{
 
 function validBinding(binding: VerifiedShortlistSelectionBinding, lease: TurnLease): boolean {
   const source = binding?.source, ids = binding?.selectedJobIds
-  return binding?.schemaVersion === BINDING_SCHEMA && !!source
+  return binding?.schemaVersion === VERIFIED_SHORTLIST_SELECTION_SCHEMA && !!source
     && source.sessionId === lease.sessionId && source.sourceTurnId !== lease.turnId
     && safeId(source.sessionId) && safeId(source.sourceTurnId) && safeId(source.rootTaskId)
     && source.graphItemId === taskGraphItemId(source.rootTaskId)
     && Number.isSafeInteger(source.graphRevision) && source.graphRevision >= 1
     && Array.isArray(ids) && ids.length >= 2 && ids.length <= SELECTED_JOB_BATCH_SLOT_IDS.length
-    && ids.length <= 3 && ids.every(id => typeof id === "string" && JOB_ID.test(id))
-    && new Set(ids).size === ids.length
 }
 
 function bindingJson(binding: VerifiedShortlistSelectionBinding): string {
-  const source = binding.source
-  return JSON.stringify({
-    schemaVersion: BINDING_SCHEMA,
-    source: { sessionId: source.sessionId, sourceTurnId: source.sourceTurnId, rootTaskId: source.rootTaskId,
-      graphItemId: source.graphItemId, graphRevision: source.graphRevision },
-    selectedJobIds: [...binding.selectedJobIds],
-  })
+  return JSON.stringify(binding)
 }
 
 function exactIntent(value: unknown, kind: string): boolean {
