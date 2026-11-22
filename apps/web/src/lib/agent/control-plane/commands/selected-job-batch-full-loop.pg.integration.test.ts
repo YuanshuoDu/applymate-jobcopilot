@@ -398,8 +398,10 @@ describeWithServices("selected-job batch production full-loop", () => {
         && reviewerNode.dependsOn.length === 1 && reviewerNode.dependsOn[0] === otherWriter.key
     })
     expect(crossedDependency).toBe(true)
-    expect(batchPlanCalls.some(call => call.status === "completed" && call.errorCode === null
-      && plain(results.get(String(call.toolCallId))?.output)?.status === "accepted")).toBe(true)
+    const acceptedBatchPlans = batchPlanCalls.filter(call => call.status === "completed" && call.errorCode === null
+      && plain(results.get(String(call.toolCallId))?.output)?.status === "accepted")
+    expect(batchPlanCalls).toHaveLength(2)
+    expect(acceptedBatchPlans).toHaveLength(1)
 
     const graph = await db.agentItem.findFirst({ where: { sessionId, turnId, taskId: atBarrier.turn?.rootTaskId, type: "task_graph" },
       select: { id: true, revision: true, content: true } })
@@ -440,10 +442,15 @@ describeWithServices("selected-job batch production full-loop", () => {
       select: { id: true, role: true, status: true, context: true } })
     expect(childRows).toHaveLength(4)
     const terminalGraph = await db.agentItem.findFirst({ where: { sessionId, turnId, taskId: rootTaskId, type: "task_graph" },
-      select: { content: true, revision: true } })
+      select: { id: true, content: true, revision: true } })
     const terminalNodes = Array.isArray(plain(terminalGraph?.content)?.nodes)
       ? (plain(terminalGraph?.content)!.nodes as unknown[]).map(plain).filter((node): node is Record<string, unknown> => node !== null) : []
-    expect(terminalGraph?.revision).toBe(1)
+    expect(terminalGraph?.id).toBe(graph?.id)
+    expect(terminalGraph?.revision).toBeGreaterThan(graph?.revision ?? 0)
+    const nodeIdentity = (node: Record<string, unknown>) => ({
+      key: node.key, taskId: node.taskId, templateId: node.templateId, dependsOn: node.dependsOn,
+    })
+    expect(terminalNodes.map(nodeIdentity)).toEqual(nodes.map(nodeIdentity))
     for (let index = 0; index < jobIds.length; index++) {
       const templates = selectedJobBatchTemplatesForSlot(SELECTED_JOB_BATCH_SLOT_IDS[index]!)!
       const writerNode = terminalNodes.find(node => node.templateId === templates.writerTemplateId)
