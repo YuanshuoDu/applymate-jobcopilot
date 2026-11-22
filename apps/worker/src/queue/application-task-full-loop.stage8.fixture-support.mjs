@@ -1,5 +1,6 @@
 const ARM_RELEASE = "stage8-release-arm"
 const FINAL_RELEASE = "stage8-release-final"
+const MAX_REVIEWED_POST_BYTES = 16_384
 const STOP_POLL_ERROR_MESSAGES = new Map([
   ["Application submission Turn binding is unavailable.", "turn_binding_unavailable"],
   ["Application submission task binding is unavailable.", "task_binding_unavailable"],
@@ -10,6 +11,38 @@ const STOP_POLL_ERROR_MESSAGES = new Map([
   ["Application submission Stop poll did not commit.", "poll_commit_failed"],
 ])
 const STOP_POLL_SQL_STATES = new Set(["08000", "08001", "08003", "08006", "23502", "23503", "23505", "23514", "40001", "40P01", "55P03", "57P01", "57P03"])
+
+export async function hasExactReviewedCoverLetter(request, expected) {
+  const contentType = String(request.headers?.["content-type"] ?? "").split(";", 1)[0].trim().toLowerCase()
+  const declaredSize = Number(request.headers?.["content-length"])
+  if (contentType !== "application/x-www-form-urlencoded" || declaredSize > MAX_REVIEWED_POST_BYTES) {
+    request.resume()
+    return false
+  }
+
+  const chunks = []
+  let size = 0
+  let exceededLimit = false
+  try {
+    for await (const chunk of request) {
+      if (exceededLimit) continue
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      size += bytes.length
+      if (size > MAX_REVIEWED_POST_BYTES) {
+        exceededLimit = true
+        chunks.length = 0
+        continue
+      }
+      chunks.push(bytes)
+    }
+  } catch {
+    return false
+  }
+  if (exceededLimit) return false
+
+  const fields = new URLSearchParams(Buffer.concat(chunks).toString("utf8")).getAll("cover_letter")
+  return fields.length === 1 && fields[0] === expected
+}
 
 export function classifyStage8StopPollError(error) {
   try {

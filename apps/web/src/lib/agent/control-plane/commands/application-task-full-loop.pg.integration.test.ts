@@ -248,6 +248,7 @@ type FixtureStats = {
   submitCount: number
   reviewedSubmitCount: number
   reviewedHeldSubmitCount: number
+  reviewedExactSubmissionCount: number
   reviewedMaterialExactCount: number
   reviewedGetCount: number
   blocked: string[]
@@ -3250,6 +3251,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const afterStopFirst = await requestFixtureStats()
       expect(afterStopFirst.reviewedSubmitCount).toBe(before.reviewedSubmitCount)
       expect(afterStopFirst.reviewedHeldSubmitCount).toBe(before.reviewedHeldSubmitCount)
+      expect(afterStopFirst.reviewedExactSubmissionCount).toBe(before.reviewedExactSubmissionCount)
       expect(afterStopFirst.blocked).toEqual([])
 
       await stopFixture(worker)
@@ -3288,12 +3290,14 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       await waitLine(worker, `STAGE8_FINAL_FENCE_RELEASED ${secondIntent.workerTaskId}`, 15_000)
       const sendDeadline = Date.now() + 15_000
       let afterGrant = await requestFixtureStats()
-      while (afterGrant.reviewedSubmitCount !== before.reviewedSubmitCount + 1 && Date.now() < sendDeadline) {
+      while ((afterGrant.reviewedSubmitCount !== before.reviewedSubmitCount + 1
+        || afterGrant.reviewedExactSubmissionCount !== before.reviewedExactSubmissionCount + 1) && Date.now() < sendDeadline) {
         await delay(50)
         afterGrant = await requestFixtureStats()
       }
       expect(afterGrant.reviewedSubmitCount).toBe(before.reviewedSubmitCount + 1)
       expect(afterGrant.reviewedHeldSubmitCount).toBe(before.reviewedHeldSubmitCount + 1)
+      expect(afterGrant.reviewedExactSubmissionCount).toBe(before.reviewedExactSubmissionCount + 1)
       expect(afterGrant.blocked).toEqual([])
 
       const tooLate = await blockedStop
