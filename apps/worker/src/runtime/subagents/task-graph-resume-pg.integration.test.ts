@@ -14480,6 +14480,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       acceptedPlanMatchesReplacement: boolean | null
       replacementHeld: boolean | null
       replacementListedRunning: boolean | null
+      replacementListed: boolean | null
+      replacementListStatus: string | null
+      replacementDatabaseRead: "not_attempted" | "ok" | "query_failed"
+      replacementDatabaseStatus: string | null
+      replacementLeaseExists: boolean | null
+      replacementLeaseMatches: boolean | null
+      replacementLeaseValid: boolean | null
       persistedGraphUnique: boolean | null
       persistedGraphRevisionMatches: boolean | null
       retirementToolAvailable: boolean | null
@@ -14489,6 +14496,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       seattleHeld: boolean | null
     } = {
       acceptedPlanMatchesReplacement: null, replacementHeld: null, replacementListedRunning: null,
+      replacementListed: null, replacementListStatus: null, replacementDatabaseRead: "not_attempted",
+      replacementDatabaseStatus: null, replacementLeaseExists: null,
+      replacementLeaseMatches: null, replacementLeaseValid: null,
       persistedGraphUnique: null, persistedGraphRevisionMatches: null, retirementToolAvailable: null,
       seattleTaskMatchesOriginalLease: null, seattleLeaseStillLive: null, noSeattleDescendants: null, seattleHeld: null,
     }
@@ -14685,6 +14695,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             const listing = record(latestToolResult(request, postPlanListCallId))
             const listedTasks = Array.isArray(listing?.tasks) ? listing.tasks.map(record) : []
+            const replacementListEntry = listedTasks.find(task => task?.taskId === dublin.taskId)
             const persistedGraph = await pool!.query<{ revision: number }>(
               `SELECT item."revision" FROM "agent_items" AS item
                JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
@@ -14694,6 +14705,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                  AND session."userId" = $5 AND turn."userId" = $5 LIMIT 2`,
               [taskGraphItemId(rootTaskId), value.sessionId, value.turnId, rootTaskId, value.userId])
             preRetirementGuards.replacementHeld = dublinHeld
+            preRetirementGuards.replacementListed = Boolean(replacementListEntry)
+            preRetirementGuards.replacementListStatus = replacementListEntry
+              ? diagnosticEnum(replacementListEntry.status, TASK_DIAGNOSTIC_STATUSES) ?? "other" : "missing"
             preRetirementGuards.replacementListedRunning = listedTasks.some(task => task?.taskId === dublin.taskId
               && task?.status === "running")
             preRetirementGuards.persistedGraphUnique = persistedGraph.rows.length === 1
@@ -14703,6 +14717,45 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               || !listedTasks.some(task => task?.taskId === dublin.taskId && task?.status === "running")
               || persistedGraph.rows.length !== 1 || typeof revision !== "number"
               || revision !== persistedGraph.rows[0]?.revision) {
+              preRetirementGuards.replacementDatabaseRead = "query_failed"
+              try {
+                const replacementSnapshot = await pool!.query<{
+                  id: string; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string
+                  status: string; attemptCount: number; leaseOwner: string | null; leaseExpiresAt: Date | null
+                  leaseSegmentStartedAt: Date | null; interruptRequestedAt: Date | null
+                  sessionUserId: string; turnUserId: string
+                }>(
+                  `SELECT task."id", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId",
+                     task."status", task."attemptCount", task."leaseOwner", task."leaseExpiresAt",
+                     task."leaseSegmentStartedAt", task."interruptRequestedAt",
+                     session."userId" AS "sessionUserId", turn."userId" AS "turnUserId"
+                   FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+                   JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+                   WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
+                     AND task."parentTaskId" = $4 AND turn."rootTaskId" = $4
+                     AND session."userId" = $5 AND turn."userId" = $5 LIMIT 2`,
+                  [dublin.taskId, value.sessionId, value.turnId, rootTaskId, value.userId])
+                const row = replacementSnapshot.rows.length === 1 ? replacementSnapshot.rows[0] : null
+                const taskMatchesReplacement = Boolean(row && row.id === dublin.taskId
+                  && row.sessionId === value.sessionId && row.turnId === value.turnId
+                  && row.rootTaskId === rootTaskId && row.parentTaskId === rootTaskId
+                  && row.sessionUserId === value.userId && row.turnUserId === value.userId)
+                const leaseFieldsPresent = Boolean(row && (row.leaseOwner !== null
+                  || row.leaseExpiresAt !== null || row.leaseSegmentStartedAt !== null))
+                const leaseMatchesReplacement = Boolean(row && taskMatchesReplacement
+                  && Number.isSafeInteger(row.attemptCount) && row.attemptCount > 0
+                  && row.leaseOwner && row.leaseExpiresAt instanceof Date && row.leaseSegmentStartedAt instanceof Date)
+                preRetirementGuards.replacementDatabaseRead = "ok"
+                preRetirementGuards.replacementDatabaseStatus = row
+                  ? diagnosticEnum(row.status, TASK_DIAGNOSTIC_STATUSES) ?? "other" : "missing"
+                preRetirementGuards.replacementLeaseExists = leaseFieldsPresent
+                preRetirementGuards.replacementLeaseMatches = leaseMatchesReplacement
+                preRetirementGuards.replacementLeaseValid = Boolean(row && leaseMatchesReplacement
+                  && row.status === "running" && row.leaseExpiresAt instanceof Date
+                  && row.leaseExpiresAt.getTime() > Date.now() && row.interruptRequestedAt === null)
+              } catch {
+                preRetirementGuards.replacementDatabaseRead = "query_failed"
+              }
               throw new Error("Fresh Root list did not match the held replacement and current graph revision")
             }
             preRetirementListMatched = true
