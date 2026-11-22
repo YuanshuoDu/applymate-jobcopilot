@@ -5,6 +5,7 @@ import type { SubagentTaskStatus } from "./types.js"
 import { parseTaskGraphNativeDelegation, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 import { parseRegisteredScoutEnvelope, taskGraphNodeKeysMatch, type RegisteredScoutEnvelope } from "./task-graph-command-port.js"
 import { APPLICATION_FILLER_TEMPLATE_ID } from "./role-policy.js"
+import { SELECTED_JOB_BATCH_TEMPLATE_CATALOG } from "@jobcopilot/agent-protocol"
 import { readPinnedRootCriteria } from "./root-plan-criteria.js"
 import { parseTaskGraphSnapshotPackageRefs, taskGraphSnapshotCapacityValid, taskGraphSnapshotStringList as stringList } from "./task-graph-snapshot-capacity.js"
 
@@ -35,7 +36,8 @@ const NODE_KEYS_WITH_DISPOSITION = `${LEGACY_NODE_KEYS},verificationDisposition`
 const NODE_KEYS_WITH_VERIFICATION = `${LEGACY_NODE_KEYS},verification,verificationDisposition`
 const NODE_KEYS_WITH_REPAIR = "dependsOn,depth,goal,key,repairOf,successCriteria,taskId,templateId,verification,verificationDisposition"
 const NATIVE_NODE_KEYS = "dependsOn,depth,goal,key,nativeDelegation,successCriteria,taskId,templateId,verificationDisposition"
-const SPECIALIZED_TEMPLATE_IDS = new Set(["cover_letter_writer", "cover_letter_reviewer", APPLICATION_FILLER_TEMPLATE_ID, "prepare", "gate", "scheduled_audit", "scheduled.application.execute", "scheduled.post_gate_audit"])
+const SPECIALIZED_TEMPLATE_IDS = new Set(["cover_letter_writer", "cover_letter_reviewer", APPLICATION_FILLER_TEMPLATE_ID, "prepare", "gate", "scheduled_audit", "scheduled.application.execute", "scheduled.post_gate_audit",
+  ...SELECTED_JOB_BATCH_TEMPLATE_CATALOG.flatMap(entry => [entry.writerTemplateId, entry.reviewerTemplateId])])
 
 const TASK_STATUSES = new Set<SubagentTaskStatus>([
   "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",

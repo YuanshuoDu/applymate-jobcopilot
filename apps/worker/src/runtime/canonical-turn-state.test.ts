@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
+import { SELECTED_JOB_BATCH_PREPARATION_INTENT } from "@jobcopilot/agent-protocol"
 import { sha256Hex } from "./context/context-compaction-canonical.js"
 import { snapshotChecksum } from "./context/context-snapshot-canonical.js"
 import { CONTEXT_SNAPSHOT_SCHEMA_VERSION, ContextSnapshotError, type ContextSnapshotContent } from "./context/context-snapshot-types.js"
@@ -474,10 +475,22 @@ describe("loadCanonicalTurnState", () => {
     await expect(loadCanonicalTurnState(objective, lease)).resolves.toMatchObject({
       intent: { kind: "objective_task_graph_execution", version: 1 },
     })
+    const batch = pool({ turn: { input: { goal: "Prepare selected jobs", intent: SELECTED_JOB_BATCH_PREPARATION_INTENT,
+      verifiedShortlistSelection: { malformed: true } }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
+    await expect(loadCanonicalTurnState(batch, lease)).resolves.toMatchObject({ intent: SELECTED_JOB_BATCH_PREPARATION_INTENT })
+    for (const input of [
+      { goal: "Prepare selected jobs", verifiedShortlistSelection: { malformed: true } },
+      { goal: "Prepare selected jobs", intent: { kind: "interactive_discovery_shortlist", version: 1 }, verifiedShortlistSelection: { malformed: true } },
+      { goal: "Prepare selected jobs", intent: { kind: "objective_task_graph_execution", version: 1 }, verifiedShortlistSelection: { malformed: true } },
+    ]) {
+      const orphan = pool({ turn: { input, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
+      await expect(loadCanonicalTurnState(orphan, lease)).rejects.toThrow("turn_intent_invalid")
+    }
 
     const absent = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
     await expect(loadCanonicalTurnState(absent, lease)).resolves.not.toHaveProperty("intent")
-    for (const intent of [undefined, null, { kind: "interactive_discovery_shortlist", version: 2 }, { kind: "interactive_discovery_shortlist", version: 1, userControlled: true }, { kind: "other", version: 1 }]) {
+    for (const intent of [undefined, null, { kind: "interactive_discovery_shortlist", version: 2 }, { kind: "interactive_discovery_shortlist", version: 1, userControlled: true },
+      { kind: "selected_job_batch_preparation", version: 2 }, { kind: "selected_job_batch_preparation", version: 1, clientControlled: true }, { kind: "other", version: 1 }]) {
       const value = pool({ turn: { input: { goal: "Find jobs", intent }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
       await expect(loadCanonicalTurnState(value, lease)).rejects.toThrow("turn_intent_invalid")
     }
