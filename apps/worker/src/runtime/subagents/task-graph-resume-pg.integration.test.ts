@@ -14206,8 +14206,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const resumed = record(JSON.parse(resumedLine.slice("P3_DISCOVERY_SCOUT_HISTORY_RESUMED ".length)))
       expect(resumed).toMatchObject({ attempt: 2, compactContext: true, rawHistoryAbsent: true })
       expect(typeof resumed?.modelMessageBytes === "number" && resumed.modelMessageBytes < 64 * 1024).toBe(true)
-      await waitForTurnStatus(pool!, value.turnId, "completed", 90_000,
-        DISCOVERY_RESTART_WAIT_CALL_ID, [DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID, DISCOVERY_RESTART_ANALYST_WAIT_CALL_ID])
+      try {
+        await waitForTurnStatus(pool!, value.turnId, "completed", 90_000,
+          DISCOVERY_RESTART_WAIT_CALL_ID, [DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID, DISCOVERY_RESTART_ANALYST_WAIT_CALL_ID])
+      } catch (error) {
+        const failure = waitForTurnStatusFailureDiagnostic(error)
+        const checkpoint = await scoutHistoryResumeFailureCheckpoint(
+          scoutTaskIdForCleanup!, rootTaskIdForCleanup!, before.reference, workerThree!,
+        )
+        let progress = JSON.stringify({ available: false })
+        try {
+          progress = compactTurnProgressDiagnostics(await turnProgressDiagnostics(pool!, value.turnId,
+            DISCOVERY_RESTART_WAIT_CALL_ID, [DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID, DISCOVERY_RESTART_ANALYST_WAIT_CALL_ID]), 900)
+        } catch { /* Keep the original bounded turn status failure if readback is unavailable. */ }
+        throw new Error(`Scout history root completion failed; status=${JSON.stringify(failure)}; safe checkpoint=${JSON.stringify(checkpoint)}; progress=${progress}`)
+      }
 
       const recoveredDispatch = await waitForRecoveredScoutDispatchCompletion(
         scoutTaskIdForCleanup!, rootTaskId!, dispatch.attemptCount,
