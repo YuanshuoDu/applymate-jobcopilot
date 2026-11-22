@@ -4,6 +4,8 @@ import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
 import { validateRoleResult } from "./role-results.js"
 import type { SubagentTaskStatus } from "./types.js"
 import { validateTaskGraphFollowUpBinding } from "./task-graph-follow-up-validation.js"
+import { hasSelectedJobBatchMembers, readBoundSelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
+import type { SelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
 
 export const TASK_GRAPH_FINAL_SUMMARY_BINDING: unique symbol = Symbol("task_graph_final_summary_binding")
 
@@ -26,6 +28,7 @@ export type TaskGraphFinalSummaryBinding = Readonly<{
   graphRevision: number
   members?: readonly TaskGraphFinalSummaryMember[]
   resolvedRepairTaskIds?: readonly string[]
+  selectedJobBatchFinalOutcome?: SelectedJobBatchFinalOutcome
   summary: TaskGraphFinalSummary
 }>
 
@@ -114,9 +117,17 @@ export function sameTaskGraphFinalSummaryBinding(
   right: TaskGraphFinalSummaryBinding | null | undefined,
 ): boolean {
   try {
-    if (!left || !right || left.rootTaskId !== right.rootTaskId || left.graphItemId !== right.graphItemId
+    if (!left || !right) return false
+    const leftHasBatch = hasSelectedJobBatchMembers(left), rightHasBatch = hasSelectedJobBatchMembers(right)
+    if (leftHasBatch !== rightHasBatch) return false
+    const leftBatch = left.selectedJobBatchFinalOutcome, rightBatch = right.selectedJobBatchFinalOutcome
+    if (leftHasBatch) {
+      if (!readBoundSelectedJobBatchFinalOutcome(left) || !readBoundSelectedJobBatchFinalOutcome(right)) return false
+    } else if (leftBatch !== undefined || rightBatch !== undefined) return false
+    if (left.rootTaskId !== right.rootTaskId || left.graphItemId !== right.graphItemId
       || JSON.stringify(left.members) !== JSON.stringify(right.members) || left.graphRevision !== right.graphRevision
       || JSON.stringify(left.resolvedRepairTaskIds) !== JSON.stringify(right.resolvedRepairTaskIds)
+      || JSON.stringify(leftBatch) !== JSON.stringify(rightBatch)
       || left.summary.graphRevision !== left.graphRevision || right.summary.graphRevision !== right.graphRevision) return false
     return JSON.stringify(left.summary) === JSON.stringify(right.summary)
   }
