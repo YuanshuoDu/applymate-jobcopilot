@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { assertSessionWorkAdmission, OPEN_SESSION, RUNNABLE_SESSION, SESSION_WORK_ADMISSION, SessionPauseRequestedError, isSessionPauseRequestedError } from "./session-gate.js"
+import { assertSessionTerminalAdmission, assertSessionWorkAdmission, OPEN_SESSION, RUNNABLE_SESSION, SESSION_WORK_ADMISSION, SessionPauseRequestedError, isSessionPauseRequestedError } from "./session-gate.js"
 
 describe("Worker session gates", () => {
   it("keeps runnable work fenced to open sessions", () => {
@@ -36,5 +36,58 @@ describe("Worker session gates", () => {
     const query = vi.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [] }))
     await expect(assertSessionWorkAdmission({ query } as never, { userId: "user-1", sessionId: "session-1", turnId: "turn-1" }))
       .rejects.toBeInstanceOf(SessionPauseRequestedError)
+  })
+
+  it("admits only the exact owned canonical Fill terminal receipt for a submission uncertainty wait", async () => {
+    const query = vi.fn(async (sql: string, _params?: unknown[]) => ({
+      rows: sql.includes('JOIN "application_tasks" AS fill_task') ? [{ id: "session-1" }] : [],
+    }))
+    const input = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", source: "user", executionMode: "canonical_task_graph" }
+
+    await expect(assertSessionTerminalAdmission({ query } as never, input)).resolves.toBeUndefined()
+
+    expect(query).toHaveBeenCalledTimes(2)
+    expect(query.mock.calls[0]?.[0]).toContain(SESSION_WORK_ADMISSION)
+    const terminal = query.mock.calls[1]?.[0] ?? ""
+    expect(terminal).toContain(`session."status" = 'waiting_for_user'`)
+    expect(terminal).toContain(`fill_task."fillTurnId" = $3`)
+    expect(terminal).toContain(`fill_task."fillTurnSessionId" = $1`)
+    expect(terminal).toContain(`fill_task."fillTurnUserId" = $2`)
+    expect(terminal).toContain(`fill_task."status" = 'waiting_for_user' AND fill_task."checkpoint" = 'submission_uncertain'`)
+    expect(terminal).toContain(`pause_request."type" = 'session.pause_requested'`)
+    expect(query.mock.calls[1]?.[1]).toEqual(["session-1", "user-1", "turn-1"])
+  })
+
+  it.each([
+    ["foreign source", "automation", "canonical_task_graph"],
+    ["noncanonical mode", "user", "legacy_pipeline_adapter"],
+  ])("does not use the derived wait exception for a %s", async (_case, source, executionMode) => {
+    const query = vi.fn(async () => ({ rows: [] }))
+    await expect(assertSessionTerminalAdmission({ query } as never, {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", source, executionMode,
+    })).rejects.toBeInstanceOf(SessionPauseRequestedError)
+    expect(query).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([0, 2])("rejects a derived wait with %i eligible application bindings", async count => {
+    const query = vi.fn(async (sql: string) => ({
+      rows: sql.includes('JOIN "application_tasks" AS fill_task') ? Array.from({ length: count }, (_, index) => ({ id: `session-${index}` })) : [],
+    }))
+    await expect(assertSessionTerminalAdmission({ query } as never, {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", source: "user", executionMode: "canonical_task_graph",
+    })).rejects.toBeInstanceOf(SessionPauseRequestedError)
+    expect(query).toHaveBeenCalledTimes(2)
+  })
+
+  it("keeps an unresolved explicit pause outside terminal admission even with matching application evidence", async () => {
+    const query = vi.fn(async (sql: string) => ({
+      rows: sql.includes('JOIN "application_tasks" AS fill_task') && !sql.includes("pause_request") ? [{ id: "session-1" }] : [],
+    }))
+    await expect(assertSessionTerminalAdmission({ query } as never, {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", source: "user", executionMode: "canonical_task_graph",
+    })).rejects.toBeInstanceOf(SessionPauseRequestedError)
+    expect(query.mock.calls[1]?.[0]).toContain(`fill_task."checkpoint" = 'submission_uncertain'`)
+    expect(query.mock.calls[1]?.[0]).toContain(`pause_request."type" = 'session.pause_requested'`)
+    expect(query.mock.calls[1]?.[0]).toContain(`resumed."sequence" > pause_request."sequence"`)
   })
 })
