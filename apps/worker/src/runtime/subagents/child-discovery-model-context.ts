@@ -13,15 +13,16 @@ type Input = Readonly<{
   definitions: readonly ChildPublicDefinition[]
 }>
 
-function hasDiscoveryTransportTools(definitions: readonly ChildPublicDefinition[]): boolean {
+function hasDiscoveryTransportTools(definitions: readonly ChildPublicDefinition[], actions: unknown): boolean {
   return ["jobs.discover", "tool_results.read"].every(name =>
+    Array.isArray(actions) && actions.includes(name) &&
     definitions.some(definition => definition.name === name && definition.version === "1"))
 }
 
 /** Hides verified discovery transport rows from model context without changing canonical resume state. */
 export function createChildDiscoveryModelContextBuilder(builder: ChildContextBuilder, input: Input): ChildContextBuilder {
   if (!isOrdinaryScout(input.lease, input.structuredRole, input.selectedJob, input.selectedJobPreparation)
-    || !hasDiscoveryTransportTools(input.definitions)) return builder
+    || !hasDiscoveryTransportTools(input.definitions, input.lease.allowedActions)) return builder
   return {
     build: request => {
       const snapshot = projectSnapshot(request.snapshot)

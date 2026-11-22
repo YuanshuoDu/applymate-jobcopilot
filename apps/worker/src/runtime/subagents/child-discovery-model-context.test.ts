@@ -7,7 +7,7 @@ import type { SubagentLease } from "./types.js"
 import { createChildDiscoveryModelContextBuilder } from "./child-discovery-model-context.js"
 
 const historyProjection = vi.hoisted(() => ({
-  project: vi.fn((observations: readonly { id: string; content: unknown }[]) =>
+  project: vi.fn((observations: readonly ContextSeedBlock[]): readonly ContextSeedBlock[] =>
     observations.filter(observation => observation.id !== "transport-chunk")),
 }))
 vi.mock("./child-discovery-history.js", () => ({ projectChildDiscoveryHistory: historyProjection.project }))
@@ -15,8 +15,9 @@ vi.mock("./child-discovery-history.js", () => ({ projectChildDiscoveryHistory: h
 const wait: ContextSeedBlock = { id: "child-resume:wait", content: { toolName: "wait_subagents", output: { status: "ready" } } }
 const chunk: ContextSeedBlock = { id: "transport-chunk", content: { toolName: "tool_results.read" } }
 const snapshot: StepContextSnapshot = { system: [], profile: [], goal: undefined, steerHistory: [], businessRefs: [], toolObservations: [wait, chunk] }
-const lease = { id: "child-a", role: "scout", taskType: "job_discovery", context: {} } as SubagentLease
-const owner = { kind: "task", userId: "user-a", sessionId: "session-a", turnId: "turn-a", taskId: "child-a", rootTaskId: "root-a", ownerId: "owner-a", attemptCount: 1 } as const
+const lease = { id: "child-a", role: "scout", taskType: "job_discovery", allowedActions: ["jobs.discover", "tool_results.read"], context: {} } as SubagentLease
+const owner = { kind: "task", userId: "user-a", sessionId: "session-a", turnId: "turn-a", taskId: "child-a", rootTaskId: "root-a", ownerId: "owner-a", attemptCount: 1,
+  leaseExpiresAt: new Date("2099-01-01T00:00:00.000Z") } as const
 const definitions = [
   { name: "jobs.discover", version: "1" }, { name: "tool_results.read", version: "1" },
 ] as unknown as readonly ChildPublicDefinition[]
@@ -62,6 +63,7 @@ describe("child discovery model context", () => {
     ["missing structured role", { structuredRole: undefined }],
     ["selected job", { selectedJob: "job-a" }],
     ["selected preparation", { selectedJobPreparation: { jobId: "job-a" } }],
+    ["missing allowed action", { lease: { ...lease, allowedActions: ["jobs.discover"] } as SubagentLease }],
     ["missing discover tool", { definitions: [{ name: "tool_results.read", version: "1" }] as unknown as readonly ChildPublicDefinition[] }],
     ["missing chunk reader", { definitions: [{ name: "jobs.discover", version: "1" }] as unknown as readonly ChildPublicDefinition[] }],
     ["wrong tool version", { definitions: [{ name: "jobs.discover", version: "2" }, { name: "tool_results.read", version: "1" }] as unknown as readonly ChildPublicDefinition[] }],
