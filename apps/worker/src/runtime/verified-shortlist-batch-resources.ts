@@ -43,10 +43,11 @@ type RootRow = Readonly<{
 export async function loadVerifiedShortlistBatchResources(input: Readonly<{
   client: QueryClient
   lease: TurnLease
+  expectedRootTaskId: string | null
   binding: VerifiedShortlistSelectionBinding
 }>): Promise<readonly SelectedJobBatchSlot[] | null> {
   const { client, lease, binding } = input
-  if (!validBinding(binding, lease)) return null
+  if (!validBinding(binding, lease) || (input.expectedRootTaskId !== null && !safeId(input.expectedRootTaskId))) return null
 
   const sessionResult = await client.query<{ id: string }>(
     `SELECT "id" FROM "agent_sessions"
@@ -65,17 +66,19 @@ export async function loadVerifiedShortlistBatchResources(input: Readonly<{
        AND session."userId" = $3 AND session."status" NOT IN ('aborted', 'archived')
        AND turn."source" = 'user' AND turn."executionMode" = 'canonical_task_graph'
        AND turn."status" = 'in_progress' AND turn."leaseOwnerId" = $4 AND turn."leaseVersion" = $5
+       AND turn."rootTaskId" IS NOT DISTINCT FROM $6
        AND turn."leaseStartedAt" IS NOT NULL AND turn."leaseExpiresAt" > clock_timestamp()
        AND turn."input"->'intent' = jsonb_build_object('kind', 'selected_job_batch_preparation', 'version', 1)
-       AND turn."input"->'verifiedShortlistSelection' = $6::jsonb
+       AND turn."input"->'verifiedShortlistSelection' = $7::jsonb
        AND NOT (turn."input" ? 'automationRunMode') AND NOT (turn."input" ? 'selectedJobPreparation')
      FOR UPDATE OF turn`,
-    [lease.turnId, lease.sessionId, lease.userId, lease.ownerId, lease.leaseVersion, bindingJson(binding)],
+    [lease.turnId, lease.sessionId, lease.userId, lease.ownerId, lease.leaseVersion,
+      input.expectedRootTaskId, bindingJson(binding)],
   )
   const current = currentResult.rows[0]
   if (!current || current.id !== lease.turnId || current.sessionId !== lease.sessionId || current.userId !== lease.userId
     || current.source !== "user" || current.status !== "in_progress" || current.executionMode !== "canonical_task_graph"
-    || current.leaseOwnerId !== lease.ownerId || current.leaseVersion !== lease.leaseVersion
+    || current.rootTaskId !== input.expectedRootTaskId || current.leaseOwnerId !== lease.ownerId || current.leaseVersion !== lease.leaseVersion
     || !exactIntent(current.input, BATCH_INTENT) || hasOwnInput(current.input, "automationRunMode")
     || hasOwnInput(current.input, "selectedJobPreparation")) return null
 
@@ -114,6 +117,7 @@ export async function loadVerifiedShortlistBatchResources(input: Readonly<{
     || root.rootTaskId !== source.rootTaskId || root.parentTaskId !== null || root.role !== "orchestrator"
     || root.taskType !== "root" || root.status !== "completed" || root.failureReason !== null) return null
   const rootValue = record(root.result), structuredResult = record(rootValue?.structuredResult)
+  if (rootValue?.status !== "completed") return null
   const shortlist = parseInteractiveDiscoveryShortlist(structuredResult?.interactiveDiscoveryShortlist)
   if (!shortlist || shortlist.status !== "completed"
     || shortlist.items.some(item => item.evidenceIds.length !== 1 || item.evidenceIds[0] !== `read:job:${item.jobId}`)) return null

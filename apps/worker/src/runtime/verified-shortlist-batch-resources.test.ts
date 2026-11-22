@@ -31,6 +31,7 @@ type FixtureOptions = Readonly<{
   graphRevision?: number
   graphItemId?: string
   graphNodes?: readonly unknown[]
+  expectedRootTaskId?: string | null
   jobs?: readonly { id: string }[]
 }>
 
@@ -80,7 +81,8 @@ async function run(options: FixtureOptions = {}, selectedBinding = binding) {
     snapshot: { nodes: options.graphNodes ?? [{ key: "source", taskId: "source-task" }] },
     state: {}, tasks: new Map(),
   })
-  const result = await loadVerifiedShortlistBatchResources({ client, lease, binding: selectedBinding })
+  const result = await loadVerifiedShortlistBatchResources({ client, lease, binding: selectedBinding,
+    expectedRootTaskId: options.expectedRootTaskId ?? null })
   return { result, calls, client }
 }
 
@@ -94,10 +96,12 @@ describe("verified shortlist batch resource revalidation", () => {
       rootTaskId: source.rootTaskId, parentTaskId: source.rootTaskId,
     }, false)
     const currentSql = calls[1]!.sql
-    expect(currentSql).toContain(`turn."input"->'verifiedShortlistSelection' = $6::jsonb`)
+    expect(currentSql).toContain(`turn."rootTaskId" IS NOT DISTINCT FROM $6`)
+    expect(currentSql).toContain(`turn."input"->'verifiedShortlistSelection' = $7::jsonb`)
     expect(currentSql).toContain("turn.\"leaseExpiresAt\" > clock_timestamp()")
     expect(currentSql).toContain("turn.\"leaseVersion\" = $5")
-    expect(JSON.parse(String(calls[1]!.values[5]))).toEqual(binding)
+    expect(calls[1]!.values[5]).toBeNull()
+    expect(JSON.parse(String(calls[1]!.values[6]))).toEqual(binding)
     expect(calls[2]!.sql).toContain("turn.\"executionMode\" IS NULL OR turn.\"executionMode\" = 'canonical_task_graph'")
     expect(calls[4]!.values[1]).toEqual(["job-1", "job-2"])
   })
@@ -107,12 +111,14 @@ describe("verified shortlist batch resource revalidation", () => {
     ["missing current Turn lease", { current: null }],
     ["wrong lease owner", { current: currentTurn({ leaseOwnerId: "other-worker" }) }],
     ["wrong lease attempt", { current: currentTurn({ leaseVersion: lease.leaseVersion + 1 }) }],
+    ["wrong current Root", { current: currentTurn({ rootTaskId: "unexpected-root" }) }],
     ["wrong current intent", { current: currentTurn({ input: { intent: { kind: "objective_task_graph_execution", version: 1 }, verifiedShortlistSelection: binding } }) }],
     ["missing discovery Turn", { sourceTurn: null }],
     ["foreign discovery owner", { sourceTurn: sourceTurn({ userId: "other-user" }) }],
     ["wrong discovery intent", { sourceTurn: sourceTurn({ input: { intent: { kind: "objective_task_graph_execution", version: 1 } } }) }],
     ["missing completed Root", { root: null }],
     ["wrong Root lineage", { root: root({ turnId: "other-turn" }) }],
+    ["noncompleted Root result", { root: root({ result: { status: "failed", structuredResult: { interactiveDiscoveryShortlist: shortlist } } }) }],
     ["stale graph revision", { graphRevision: source.graphRevision - 1 }],
     ["wrong graph item", { graphItemId: "another-graph" }],
     ["empty graph", { graphNodes: [] }],
@@ -129,5 +135,12 @@ describe("verified shortlist batch resource revalidation", () => {
     expect((await run({ root: badEvidence })).result).toBeNull()
     expect((await run({}, { ...binding, selectedJobIds: ["job-2", "job-1"] })).result).toBeNull()
     expect((await run({}, { ...binding, selectedJobIds: ["job-1", "job-other"] })).result).toBeNull()
+  })
+
+  it("revalidates the caller's exact current Root after setup", async () => {
+    const expectedRootTaskId = "batch-root"
+    const { result, calls } = await run({ expectedRootTaskId, current: currentTurn({ rootTaskId: expectedRootTaskId }) })
+    expect(result).toEqual([{ slotId: "slot-1", jobId: "job-1" }, { slotId: "slot-2", jobId: "job-2" }])
+    expect(calls[1]!.values[5]).toBe(expectedRootTaskId)
   })
 })
