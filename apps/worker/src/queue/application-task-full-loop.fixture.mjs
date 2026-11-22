@@ -8,7 +8,7 @@ import { Pool } from "pg"
 import { HOST, assertToolMessagePairs, failModel, fixtureModel, required, safeBlockedTarget } from "./application-task-full-loop.fixture-support.mjs"
 import { createLegacyQueueAckWitness } from "./application-task-full-loop.legacy-ack.fixture-support.mjs"
 import { closeStage8Workers, createStage8ApplicationSubmitDrain, createStage8ApplyWorker, createStage8FixtureControl } from "./application-task-full-loop.stage8.fixture-support.mjs"
-import { applicationFillStageTrace, traceApplicationFillExecutor } from "./application-task-full-loop.trace-support.mjs"
+import { applicationFillStageTrace, createStage8ExecutionFailureDiagnostics, traceApplicationFillExecutor } from "./application-task-full-loop.trace-support.mjs"
 
 const [, , mode] = process.argv
 const SOCKET = process.env.APPLICATION_TASK_FULL_LOOP_SOCKET_PATH
@@ -271,6 +271,7 @@ async function startWorker(stagedSubmissionStopProtocol = false) {
     import("../cloak/pool.js"), import("../redis.ts"), import("../runtime/wakeup/consumer.ts"),
   ])
   const control = stagedSubmissionStopProtocol ? createStage8FixtureControl() : undefined
+  const stage8FailureDiagnostics = control ? createStage8ExecutionFailureDiagnostics(userId, say) : undefined
   const legacyAckWitness = stagedSubmissionStopProtocol ? undefined : createLegacyQueueAckWitness(say)
   const flags = { ...resolveProductionAgentFlags(), taskGraphPlanningEnabled: true, childExecutionEnabled: true,
     coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false }
@@ -430,8 +431,10 @@ async function startWorker(stagedSubmissionStopProtocol = false) {
   const turns = bootstrap?.turns.worker
   turns?.on("active", job => say(`TURN_JOB_ACTIVE ${job?.id ?? "unknown"} turnId=${job?.data?.turnId ?? "unknown"}`))
   turns?.on("completed", (job, result) => say(`TURN_JOB_COMPLETED ${job?.id ?? "unknown"} turnId=${job?.data?.turnId ?? "unknown"} status=${result?.status ?? "unknown"}`))
-  turns?.on("failed", (job, error) => say(`TURN_JOB_FAILED ${job?.id ?? "unknown"} turnId=${job?.data?.turnId ?? "unknown"} ${error.message}`))
-  turns?.on("error", error => say(`TURN_WORKER_ERROR ${error.message}`))
+  turns?.on("failed", (job, error) => {
+    if (!stage8FailureDiagnostics?.record(job, error)) say("TURN_JOB_FAILED")
+  })
+  turns?.on("error", () => say("TURN_WORKER_ERROR"))
   turns?.on("stalled", jobId => say(`TURN_JOB_STALLED ${jobId}`))
   const subagents = bootstrap?.subagents?.queue.worker
   subagents?.on("active", job => say(`SUBAGENT_JOB_ACTIVE ${job?.id ?? "unknown"} taskId=${job?.data?.taskId ?? "unknown"}`))

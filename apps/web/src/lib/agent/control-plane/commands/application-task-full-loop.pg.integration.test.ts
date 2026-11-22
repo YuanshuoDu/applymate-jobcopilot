@@ -3,6 +3,7 @@ import { createRequire } from "node:module"
 import { spawn, type ChildProcess } from "node:child_process"
 import { createServer, type Server } from "node:http"
 import { connect as connectSocket } from "node:net"
+import { PassThrough } from "node:stream"
 import { access, unlink } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -291,6 +292,20 @@ const reviewedFillRouteSocketPath = join(tmpdir(), `am-${runId.slice(0, 16)}-rf.
 const tlsPaths = ["AGENT_TEST_TLS_CERT_PATH", "AGENT_TEST_TLS_KEY_PATH", "AGENT_TEST_TLS_CA_PATH"] as const
 const testDb = new PrismaClient({ datasources: { db: { url: databaseUrl ?? DATABASE_URL } } })
 const workerRequire = createRequire(new URL("../../../../../../worker/package.json", import.meta.url))
+type Stage8ExecutionFailure = Readonly<{
+  errorKind: "known_code" | "postgres" | "error" | "type_error" | "range_error" | "syntax_error" | "reference_error" | "aggregate_error" | "other" | "non_error"
+  machineCode: string
+  repoStage: "canonical_turn_runtime" | "canonical_turn_model" | "canonical_turn_setup" | "durable_wait" | "turn_queue" | "worker_runtime" | "other"
+  sqlState: string
+}>
+const classifyStage8ExecutionFailure = (workerRequire("./src/queue/application-task-full-loop.trace-support.mjs") as {
+  classifyStage8ExecutionFailure: (error: unknown) => Stage8ExecutionFailure
+}).classifyStage8ExecutionFailure
+const createStage8ExecutionFailureDiagnostics = (workerRequire("./src/queue/application-task-full-loop.trace-support.mjs") as {
+  createStage8ExecutionFailureDiagnostics: (userId: string, writeLine: (line: string) => void, input: PassThrough) => {
+    record: (job: unknown, error: unknown) => boolean
+  }
+}).createStage8ExecutionFailureDiagnostics
 const { Queue } = workerRequire("bullmq") as { Queue: new (name: string, options: { connection: { host: string; port: number; db: number } }) => {
   getJobs(states: readonly string[], start: number, end: number): Promise<Array<{ id?: string; data: unknown; attemptsMade: number; attemptsStarted: number; stalledCounter: number; getState(): Promise<string>; remove(): Promise<void> }>>
   getJob(id: string): Promise<{ id?: string; data: unknown; attemptsMade: number; attemptsStarted: number; stalledCounter: number; getState(): Promise<string>; remove(): Promise<void> } | undefined>
@@ -633,7 +648,7 @@ describe("Stage8 terminal diagnostics", () => {
       ],
     })
 
-    expect(summary.queueFailure).toEqual({
+    expect(summary.queueFailure).toMatchObject({
       deadLetters: { matchingCount: 3, unclassifiedCount: 2,
         records: [{ reasonCode: "execution_failed", errorCode: "turn_execution_error", attemptsMade: 2 }] },
       worker: { matchingLineCount: 3, errorCounts: {
@@ -642,6 +657,55 @@ describe("Stage8 terminal diagnostics", () => {
       }, unknownErrorCount: 2 },
     })
     expect(JSON.stringify(summary)).not.toMatch(/private|PRIVATE|SECRET|foreign|ownerId|turnId|sessionId/)
+  })
+
+  it("classifies only fixed execution labels and hides raw errors and source frames", () => {
+    const known = Object.assign(new Error("cognitive_agenda_resume_fence_invalid"), {
+      stack: "Error: PRIVATE_MESSAGE\n    at run (C:\\private\\apps\\worker\\src\\runtime\\canonical-turn-runtime.ts:10:2)",
+    })
+    const database = Object.assign(new TypeError("PRIVATE_DATABASE_DETAIL"), {
+      code: "40P01", stack: "TypeError: PRIVATE_DATABASE_DETAIL\n    at claim (C:\\private\\apps\\worker\\src\\runtime\\turns\\durable-wait-control.ts:5:1)",
+    })
+    const unknown = Object.assign(new Error("PRIVATE_EXCEPTION_TEXT"), {
+      code: "SECRET_CODE", stack: "Error: PRIVATE_EXCEPTION_TEXT\n    at private (C:\\private\\repo\\private-module.ts:1:1)",
+    })
+    expect(classifyStage8ExecutionFailure(known)).toEqual({ errorKind: "known_code",
+      machineCode: "cognitive_agenda_resume_fence_invalid", repoStage: "canonical_turn_runtime", sqlState: "none" })
+    expect(classifyStage8ExecutionFailure(database)).toEqual({ errorKind: "postgres", machineCode: "other",
+      repoStage: "durable_wait", sqlState: "40P01" })
+    expect(classifyStage8ExecutionFailure(unknown)).toEqual({ errorKind: "error", machineCode: "other",
+      repoStage: "other", sqlState: "other" })
+
+    const summary = stage8WorkerExecutionSummary([
+      `STAGE8_TURN_EXECUTION_FAILURE ${JSON.stringify(classifyStage8ExecutionFailure(known))}`,
+      `STAGE8_TURN_EXECUTION_FAILURE ${JSON.stringify(classifyStage8ExecutionFailure(database))}`,
+      `STAGE8_TURN_EXECUTION_FAILURE ${JSON.stringify(classifyStage8ExecutionFailure(unknown))}`,
+      'STAGE8_TURN_EXECUTION_FAILURE {"errorKind":"PRIVATE_RAW_FAILURE"}',
+      "TURN_JOB_FAILED PRIVATE_RAW_FAILURE",
+    ])
+    expect(summary).toMatchObject({ matchingLineCount: 4, unclassifiedCount: 1,
+      errorKindCounts: { known_code: 1, postgres: 1, error: 1 },
+      repoStageCounts: { canonical_turn_runtime: 1, durable_wait: 1, other: 1 },
+      machineCodeCounts: { cognitive_agenda_resume_fence_invalid: 1, other: 2 },
+      sqlStateCounts: { "40P01": 1, other: 1, none: 1 } })
+    expect(JSON.stringify(summary)).not.toMatch(/PRIVATE|SECRET|private|C:\\\\|module\.ts|PRIVATE_RAW_FAILURE/)
+  })
+
+  it("emits a diagnostic only for the exact in-memory fixture user, Session, and Fill Turn", () => {
+    const input = new PassThrough()
+    const lines: string[] = []
+    const diagnostics = createStage8ExecutionFailureDiagnostics("private-user", line => lines.push(line), input)
+    input.write("stage8-failure-target private-session private-fill-turn\n")
+    expect(diagnostics.record({ data: { userId: "private-user", sessionId: "other-session", turnId: "private-fill-turn" } }, new Error("PRIVATE_ERROR"))).toBe(false)
+    expect(diagnostics.record({ data: { userId: "private-user", sessionId: "private-session", turnId: "other-turn" } }, new Error("PRIVATE_ERROR"))).toBe(false)
+    expect(diagnostics.record({ data: { userId: "foreign-user", sessionId: "private-session", turnId: "private-fill-turn" } }, new Error("PRIVATE_ERROR"))).toBe(false)
+    expect(diagnostics.record({ data: { userId: "private-user", sessionId: "private-session", turnId: "private-fill-turn" } }, new Error("PRIVATE_ERROR"))).toBe(true)
+    expect(lines).toEqual([
+      "STAGE8_FAILURE_TARGET_ARMED",
+      'STAGE8_TURN_EXECUTION_FAILURE {"errorKind":"error","machineCode":"other","repoStage":"other","sqlState":"none"}',
+    ])
+    expect(JSON.stringify(lines)).not.toMatch(/private-user|private-session|private-fill-turn|PRIVATE_ERROR/)
+    input.destroy()
   })
 })
 
@@ -1592,6 +1656,16 @@ const STAGE8_WORKER_FAILURE_CODES = [
   "child_wait_claim_recovery_owner_mismatch", "child_resume_wait_tool_call_conflict",
 ] as const
 const STAGE8_WORKER_FAILURE_CODE_SET: ReadonlySet<string> = new Set(STAGE8_WORKER_FAILURE_CODES)
+const STAGE8_EXECUTION_ERROR_KINDS = ["known_code", "postgres", "error", "type_error", "range_error", "syntax_error", "reference_error", "aggregate_error", "other", "non_error"] as const
+const STAGE8_EXECUTION_REPO_STAGES = ["canonical_turn_runtime", "canonical_turn_model", "canonical_turn_setup", "durable_wait", "turn_queue", "worker_runtime", "other"] as const
+const STAGE8_EXECUTION_MACHINE_CODES = [
+  "cognitive_agenda_resume_fence_invalid", "turn_not_owned", "archived_wait_accounting_invalid",
+  "child_wait_claim_recovery_owner_mismatch", "child_resume_wait_tool_call_conflict", "persistence_conflict",
+  "turn_execution_error", "application_fill_material_unavailable", "application_fill_state_invalid",
+  "application_fill_binding_invalid", "lease_lost", "none", "other",
+] as const
+const STAGE8_EXECUTION_SQL_STATES = ["08000", "08001", "08003", "08006", "23502", "23503", "23505", "23514",
+  "40001", "40P01", "55P03", "57P01", "57P03", "none", "other"] as const
 
 function stage8DeadLetterSummary(rows: readonly unknown[], sessionId: string, turnId: string) {
   const records: Array<{ reasonCode: string; errorCode: string; attemptsMade: number }> = []
@@ -1630,6 +1704,36 @@ function stage8WorkerFailureSummary(lines: readonly string[], turnId: string) {
     else unknownErrorCount += 1
   }
   return { matchingLineCount, errorCounts, unknownErrorCount }
+}
+
+function stage8WorkerExecutionSummary(lines: readonly string[]) {
+  const errorKindCounts = Object.fromEntries(STAGE8_EXECUTION_ERROR_KINDS.map(value => [value, 0])) as Record<typeof STAGE8_EXECUTION_ERROR_KINDS[number], number>
+  const repoStageCounts = Object.fromEntries(STAGE8_EXECUTION_REPO_STAGES.map(value => [value, 0])) as Record<typeof STAGE8_EXECUTION_REPO_STAGES[number], number>
+  const machineCodeCounts = Object.fromEntries(STAGE8_EXECUTION_MACHINE_CODES.map(value => [value, 0])) as Record<typeof STAGE8_EXECUTION_MACHINE_CODES[number], number>
+  const sqlStateCounts = Object.fromEntries(STAGE8_EXECUTION_SQL_STATES.map(value => [value, 0])) as Record<typeof STAGE8_EXECUTION_SQL_STATES[number], number>
+  let matchingLineCount = 0
+  let unclassifiedCount = 0
+  for (const line of lines.slice(-64)) {
+    if (typeof line !== "string" || !line.startsWith("STAGE8_TURN_EXECUTION_FAILURE ")) continue
+    matchingLineCount += 1
+    if (line.length > 1_024 || /[\r\n]/.test(line)) { unclassifiedCount += 1; continue }
+    let value: unknown
+    try { value = JSON.parse(line.slice("STAGE8_TURN_EXECUTION_FAILURE ".length)) } catch { unclassifiedCount += 1; continue }
+    const record = jsonRecord(value)
+    if (!record || JSON.stringify(Object.keys(record).sort()) !== JSON.stringify(["errorKind", "machineCode", "repoStage", "sqlState"])
+      || !STAGE8_EXECUTION_ERROR_KINDS.includes(record.errorKind as typeof STAGE8_EXECUTION_ERROR_KINDS[number])
+      || !STAGE8_EXECUTION_MACHINE_CODES.includes(record.machineCode as typeof STAGE8_EXECUTION_MACHINE_CODES[number])
+      || !STAGE8_EXECUTION_REPO_STAGES.includes(record.repoStage as typeof STAGE8_EXECUTION_REPO_STAGES[number])
+      || !STAGE8_EXECUTION_SQL_STATES.includes(record.sqlState as typeof STAGE8_EXECUTION_SQL_STATES[number])) {
+      unclassifiedCount += 1
+      continue
+    }
+    errorKindCounts[record.errorKind as typeof STAGE8_EXECUTION_ERROR_KINDS[number]] += 1
+    machineCodeCounts[record.machineCode as typeof STAGE8_EXECUTION_MACHINE_CODES[number]] += 1
+    repoStageCounts[record.repoStage as typeof STAGE8_EXECUTION_REPO_STAGES[number]] += 1
+    sqlStateCounts[record.sqlState as typeof STAGE8_EXECUTION_SQL_STATES[number]] += 1
+  }
+  return { matchingLineCount, unclassifiedCount, errorKindCounts, machineCodeCounts, repoStageCounts, sqlStateCounts }
 }
 
 type Stage8FailureEvidence = Readonly<{
@@ -1689,7 +1793,8 @@ function stage8FailureSummary(evidence: Stage8FailureEvidence) {
     events: Object.fromEntries(STAGE8_EVENT_TYPES.map(type => [type.replaceAll(".", "_"), eventTypes.has(type)])),
     queueFailure: {
       deadLetters: stage8DeadLetterSummary(evidence.deadLetters, evidence.expectedSessionId, evidence.expectedTurnId),
-      worker: stage8WorkerFailureSummary(evidence.workerFailureLines, evidence.expectedTurnId),
+      worker: { ...stage8WorkerFailureSummary(evidence.workerFailureLines, evidence.expectedTurnId),
+        execution: stage8WorkerExecutionSummary(evidence.workerFailureLines) },
     },
   }
 }
@@ -1840,6 +1945,12 @@ async function prepareStage8Scenario(label: "stop-first" | "grant-first"): Promi
   expect((await requestFixtureStats()).reviewedSubmitCount).toBe(0)
   return { ...scenario, token, sourceTurnId: source.turnId, reviewTurnId, fillTurnId,
     applicationTaskId: reviewTask.id, submitApprovalId }
+}
+
+async function armStage8ExecutionFailureTarget(prepared: Stage8PreparedScenario) {
+  if (!worker?.stdin) throw new Error("Stage8 Worker is unavailable")
+  worker.stdin.write(`stage8-failure-target ${prepared.sessionId} ${prepared.fillTurnId}\n`)
+  await waitLine(worker, "STAGE8_FAILURE_TARGET_ARMED", 5_000)
 }
 
 async function approveStage8Submit(prepared: Stage8PreparedScenario): Promise<Stage8SubmitIntent> {
@@ -2853,6 +2964,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     worker = spawnFixture("worker-staged")
     await waitLine(worker, "WORKER_READY", 90_000)
     try {
+      await armStage8ExecutionFailureTarget(stopFirst)
       const firstIntent = await approveStage8Submit(stopFirst)
       worker.stdin?.write("stage8-release-publisher\n")
       await waitForStage8ApplyJob(stopFirst, firstIntent)
@@ -2882,6 +2994,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       await stopFixture(worker)
       worker = spawnFixture("worker-staged")
       await waitLine(worker, "WORKER_READY", 90_000)
+      await armStage8ExecutionFailureTarget(grantFirst)
       const secondIntent = await approveStage8Submit(grantFirst)
       worker.stdin?.write("stage8-release-publisher\n")
       await waitForStage8ApplyJob(grantFirst, secondIntent)
