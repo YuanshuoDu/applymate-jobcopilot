@@ -15,7 +15,7 @@ vi.mock('@/lib/gmail-tracking/sync', () => ({
   syncGmailForUser: mocks.syncGmailForUser,
 }))
 
-import { runAudit } from './audit'
+import { runAudit, runScheduledAudit } from './audit'
 
 function context(emit = vi.fn()): PipelineCtx {
   return {
@@ -114,5 +114,29 @@ describe('runAudit', () => {
 
     expect(result.data?.warnings).toEqual(['Gmail sync failed: network unavailable'])
     expect(mocks.findMany).not.toHaveBeenCalled()
+  })
+
+  it('scopes native scheduled verification by the admitted user and returns observations for a post-sync owner check', async () => {
+    mocks.findMany.mockResolvedValue([{ company: 'Example Co', role: 'Engineer', status: 'saved', workflowState: 'queued' }])
+    mocks.syncGmailForUser.mockResolvedValue({ ...synced, importedMessages: 0, newRecommendations: 0 })
+    const result = await runScheduledAudit({
+      userId: 'user_1', executeOutput: { queued: ['job_1'], failed: [] }, assertCurrent: async () => true,
+    })
+
+    expect(mocks.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { userId: 'user_1', id: { in: ['job_1'] } } }))
+    expect(mocks.syncGmailForUser).toHaveBeenCalledTimes(1)
+    expect(result).toMatchObject({ warnings: [], observations: [
+      expect.stringContaining('1 job(s) are queued'), expect.stringContaining('Gmail sync complete'),
+    ] })
+  })
+
+  it('does not sync Gmail when the admitted Auditor loses its owner fence before provider access', async () => {
+    mocks.findMany.mockResolvedValue([])
+    const result = await runScheduledAudit({
+      userId: 'user_1', executeOutput: { queued: ['job_1'], failed: [] }, assertCurrent: async () => false,
+    })
+
+    expect(result).toBeNull()
+    expect(mocks.syncGmailForUser).not.toHaveBeenCalled()
   })
 })

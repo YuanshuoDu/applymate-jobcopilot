@@ -20,8 +20,9 @@ export async function runAudit(
   options: Readonly<{ syncGmail?: boolean }> = {},
 ): Promise<StageResult<AuditOutput>> {
   const startedAt = Date.now()
-  const warnings = await verifyDispatchedJobs(executeOutput.queued, ctx)
-  if (options.syncGmail !== false) await syncGmailTracking(ctx, warnings)
+  const emit = (observation: string) => ctx.emit('agent_observation', { role: 'auditor', observation })
+  const warnings = await verifyDispatchedJobs(executeOutput.queued, emit)
+  if (options.syncGmail !== false) await syncGmailTracking(ctx.userId, warnings, emit)
 
   const processed = originalJobs.length
   const queued = executeOutput.queued.length
@@ -40,11 +41,25 @@ export async function runAudit(
   return stageOk('audit', { report, warnings }, 1, report.durationMs)
 }
 
-async function verifyDispatchedJobs(jobIds: string[], ctx: PipelineCtx): Promise<string[]> {
+export async function runScheduledAudit(input: {
+  userId: string
+  executeOutput: ExecuteOutput
+  assertCurrent: () => Promise<boolean>
+}): Promise<{ warnings: string[]; observations: string[]; durationMs: number } | null> {
+  if (typeof input.userId !== 'string' || input.userId.trim().length === 0) return null
+  const startedAt = Date.now(), observations: string[] = []
+  const emit = (observation: string) => observations.push(observation)
+  const warnings = await verifyDispatchedJobs(input.executeOutput.queued, emit, input.userId)
+  if (!await input.assertCurrent()) return null
+  await syncGmailTracking(input.userId, warnings, emit)
+  return { warnings, observations, durationMs: Date.now() - startedAt }
+}
+
+async function verifyDispatchedJobs(jobIds: string[], emit: (observation: string) => void, userId?: string): Promise<string[]> {
   if (jobIds.length === 0) return []
 
   const jobs = await db.job.findMany({
-    where: { id: { in: jobIds } },
+    where: userId === undefined ? { id: { in: jobIds } } : { userId, id: { in: jobIds } },
     select: {
       company: true,
       role: true,
@@ -68,56 +83,38 @@ async function verifyDispatchedJobs(jobIds: string[], ctx: PipelineCtx): Promise
     warnings.push(`${jobIds.length - jobs.length} queued job(s) could not be found during audit`)
   }
 
-  ctx.emit('agent_observation', {
-    role: 'auditor',
-    observation: warnings.length
-      ? `DB verification: ${jobs.length} dispatched job(s), ${warnings.length} warning(s)`
-      : `DB verification: ${jobs.length} job(s) are queued, submitting, or already confirmed submitted`,
-  })
+  emit(warnings.length
+    ? `DB verification: ${jobs.length} dispatched job(s), ${warnings.length} warning(s)`
+    : `DB verification: ${jobs.length} job(s) are queued, submitting, or already confirmed submitted`)
   return warnings
 }
 
-async function syncGmailTracking(ctx: PipelineCtx, warnings: string[]): Promise<void> {
+async function syncGmailTracking(userId: string, warnings: string[], emit: (observation: string) => void): Promise<void> {
   let result: GmailSyncResult
   try {
-    result = await syncGmailForUser(ctx.userId)
+    result = await syncGmailForUser(userId)
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown Gmail sync failure'
     warnings.push(`Gmail sync failed: ${message}`)
-    ctx.emit('agent_observation', {
-      role: 'auditor',
-      observation: '⚠ Gmail tracking could not be synced during this audit',
-    })
+    emit('⚠ Gmail tracking could not be synced during this audit')
     return
   }
 
   if (!result.connected) {
-    ctx.emit('agent_observation', {
-      role: 'auditor',
-      observation: '⚠ Gmail is not connected — connect Google to track application replies and recommendations.',
-    })
+    emit('⚠ Gmail is not connected — connect Google to track application replies and recommendations.')
     return
   }
 
   if (result.error) {
     warnings.push(`Gmail sync failed: ${result.error}`)
-    ctx.emit('agent_observation', {
-      role: 'auditor',
-      observation: '⚠ Gmail tracking returned an error; existing job statuses were not changed by this audit.',
-    })
+    emit('⚠ Gmail tracking returned an error; existing job statuses were not changed by this audit.')
     return
   }
 
   if (result.importedMessages === 0 && result.newRecommendations === 0) {
-    ctx.emit('agent_observation', {
-      role: 'auditor',
-      observation: '📬 Gmail sync complete — no new tracked messages or recommendations.',
-    })
+    emit('📬 Gmail sync complete — no new tracked messages or recommendations.')
     return
   }
 
-  ctx.emit('agent_observation', {
-    role: 'auditor',
-    observation: `📬 Gmail sync: ${result.importedMessages} new message(s), ${result.matchedMessages} matched, ${result.statusUpdates} application update(s), ${result.newRecommendations} recommendation(s).`,
-  })
+  emit(`📬 Gmail sync: ${result.importedMessages} new message(s), ${result.matchedMessages} matched, ${result.statusUpdates} application update(s), ${result.newRecommendations} recommendation(s).`)
 }
