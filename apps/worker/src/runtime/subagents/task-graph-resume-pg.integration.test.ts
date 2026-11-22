@@ -4881,9 +4881,14 @@ function processFixtureProvesExactSigkill(
   identity: FixtureQueueJobIdentity,
 ): boolean {
   if (!processFixtureExited(child) || child.terminationSignal !== "SIGKILL" || child.signalCode !== "SIGKILL") return false
-  const scope = child.fixtureScopes?.find(value => value.sessionId === identity.sessionId && value.turnId === identity.turnId)
-  if (!scope || !(child.staleBullJobKeys?.has(fixtureJobIdentityKey(identity.queueName, identity.jobId)) ?? false)) return false
-  return identity.kind === "turn" || scope.selectedTaskIds?.includes(identity.taskId) === true
+  const hasScope = child.fixtureScopes?.some(scope => fixtureProcessScopeMatchesIdentity(scope, identity)) ?? false
+  return hasScope && (child.staleBullJobKeys?.has(fixtureJobIdentityKey(identity.queueName, identity.jobId)) ?? false)
+}
+
+function fixtureProcessScopeMatchesIdentity(scope: FixtureProcessScope, identity: FixtureQueueJobIdentity): boolean {
+  if (scope.sessionId !== identity.sessionId || scope.turnId !== identity.turnId) return false
+  return identity.kind === "turn"
+    || scope.selectedQueueName === identity.queueName && scope.selectedTaskIds?.includes(identity.taskId) === true
 }
 
 function fixtureQueueCleanupOwnershipDiagnostic(input: {
@@ -4898,9 +4903,7 @@ function fixtureQueueCleanupOwnershipDiagnostic(input: {
   const key = fixtureJobIdentityKey(input.identity.queueName, input.identity.jobId)
   let matchingScopeWorkers = 0, matchingExitedSigkillWorkers = 0, exactJobWitnesses = 0
   for (const child of input.workers) {
-    const scope = child.fixtureScopes?.find(value => value.sessionId === input.identity.sessionId
-      && value.turnId === input.identity.turnId)
-    if (!scope || input.identity.kind === "subagent" && !scope.selectedTaskIds?.includes(input.identity.taskId)) continue
+    if (!(child.fixtureScopes?.some(scope => fixtureProcessScopeMatchesIdentity(scope, input.identity)) ?? false)) continue
     matchingScopeWorkers += 1
     if (!processFixtureExited(child) || child.terminationSignal !== "SIGKILL" || child.signalCode !== "SIGKILL") continue
     matchingExitedSigkillWorkers += 1
@@ -8724,6 +8727,36 @@ describe("TaskGraph exact fixture queue cleanup", () => {
     expect(job.remove).not.toHaveBeenCalled()
   })
 
+  it("matches the exact selected queue scope after the outer scope and rejects other queues or tasks", () => {
+    const subagentIdentity: FixtureQueueJobIdentity = {
+      queueName: "fixture-subagent-queue", kind: "subagent", jobId: subagentDispatchJobId("cleanup-task", 2),
+      sessionId: identity.sessionId, turnId: identity.turnId, taskId: "cleanup-task", rootTaskId: "cleanup-root",
+      ownerId: identity.ownerId, generation: 2, currentGeneration: false,
+    }
+    const selectedScope: FixtureProcessScope = {
+      sessionId: identity.sessionId, turnId: identity.turnId,
+      selectedQueueName: subagentIdentity.queueName, selectedTaskIds: [subagentIdentity.taskId],
+    }
+    const otherQueue = { ...subagentIdentity, queueName: "foreign-subagent-queue" }
+    const otherTask = { ...subagentIdentity, taskId: "foreign-task", jobId: subagentDispatchJobId("foreign-task", 2) }
+    const child = {
+      exitCode: 0, signalCode: "SIGKILL", terminationSignal: "SIGKILL",
+      fixtureScopes: [{ sessionId: identity.sessionId, turnId: identity.turnId }, selectedScope],
+      staleBullJobKeys: new Set([
+        fixtureJobIdentityKey(subagentIdentity.queueName, subagentIdentity.jobId),
+        fixtureJobIdentityKey(otherQueue.queueName, otherQueue.jobId),
+        fixtureJobIdentityKey(otherTask.queueName, otherTask.jobId),
+      ]),
+    } as unknown as ProcessFixtureChild
+    expect(processFixtureProvesExactSigkill(child, subagentIdentity)).toBe(true)
+    expect(fixtureQueueCleanupOwnershipDiagnostic({ index: 1, queueLabel: "correction Writer subagent queue",
+      identity: subagentIdentity, workers: [child], allWorkersExited: true })).toMatchObject({
+      matchingScopeWorkers: 1, matchingExitedSigkillWorkers: 1, exactJobWitnesses: 1,
+    })
+    expect(processFixtureProvesExactSigkill(child, otherQueue)).toBe(false)
+    expect(processFixtureProvesExactSigkill(child, otherTask)).toBe(false)
+  })
+
   it("permits active subagent cleanup only with an exact task and Bull-generation SIGKILL witness", async () => {
     const subagentIdentity: FixtureQueueJobIdentity = {
       queueName: "fixture-subagent-queue", kind: "subagent", jobId: subagentDispatchJobId("cleanup-task", 2),
@@ -8732,7 +8765,8 @@ describe("TaskGraph exact fixture queue cleanup", () => {
     }
     const child = {
       exitCode: 0, signalCode: "SIGKILL", terminationSignal: "SIGKILL",
-      fixtureScopes: [{ sessionId: identity.sessionId, turnId: identity.turnId, selectedTaskIds: [subagentIdentity.taskId] }],
+      fixtureScopes: [{ sessionId: identity.sessionId, turnId: identity.turnId,
+        selectedQueueName: subagentIdentity.queueName, selectedTaskIds: [subagentIdentity.taskId] }],
       staleBullJobKeys: new Set([fixtureJobIdentityKey(subagentIdentity.queueName, subagentIdentity.jobId)]),
     } as unknown as ProcessFixtureChild
     expect(processFixtureProvesExactSigkill(child, subagentIdentity)).toBe(true)
