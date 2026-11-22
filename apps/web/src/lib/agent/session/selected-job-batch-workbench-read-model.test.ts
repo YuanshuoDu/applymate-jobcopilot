@@ -120,7 +120,8 @@ function fixture(options: { queued?: boolean; rows?: readonly TestTaskRow[]; gra
       where.id.in.map((id, index) => select.company ? { id, company: `Company ${index + 1}`, role: `Role ${index + 1}` } : { id })) },
     agentArtifactVersion: { findFirst: vi.fn().mockImplementation(async ({ where }: { where: Record<string, string | number> }) => ({
       id: `version_${where.artifactId}_${where.version}`, ...where, userId: owner.userId, sessionId: owner.sessionId,
-      artifactType: 'cover_letter',
+      artifactType: 'cover_letter', previousHash: where.artifactId === refs[0]!.artifactId && Number(where.version) > refs[0]!.version
+        ? refs[0]!.contentHash : null,
     })) },
     agentArtifactReview: { findFirst: vi.fn().mockImplementation(async ({ where }: { where: Record<string, string | number> }) => ({
       ...where, currentSourceDigest: where.sourceDigest,
@@ -234,15 +235,23 @@ describe('selected Job batch Workbench read model', () => {
     expect(await readSelectedJobBatchWorkbenchModel(staleSource.database, owner)).toBeNull()
   })
 
-  it('requires a correction to be a newer version of the same source-bound artifact', async () => {
+  it('requires the exact next version to persist the initial artifact content hash as previousHash', async () => {
     const wrongChains = [
       { ...correctionRef, version: refs[0]!.version },
+      { ...correctionRef, version: refs[0]!.version + 2 },
       { ...correctionRef, sourceDigest: `sha256:${'f'.repeat(64)}` },
     ]
     for (const ref of wrongChains) {
       const test = fixture({ rows: correctionRows({ correctionRef: ref }), graph: graphWithCorrection() })
       expect(await readSelectedJobBatchWorkbenchModel(test.database, owner)).toBeNull()
     }
+
+    const wrongPreviousHash = fixture({ rows: correctionRows(), graph: graphWithCorrection() })
+    wrongPreviousHash.tx.agentArtifactVersion.findFirst.mockImplementation(async ({ where }: { where: Record<string, string | number> }) => ({
+      id: `version_${where.artifactId}_${where.version}`, ...where, userId: owner.userId, sessionId: owner.sessionId,
+      artifactType: 'cover_letter', previousHash: Number(where.version) === correctionRef.version ? `sha256:${'f'.repeat(64)}` : null,
+    }))
+    expect(await readSelectedJobBatchWorkbenchModel(wrongPreviousHash.database, owner)).toBeNull()
   })
 
   it('preserves a verified initial stale review instead of treating it as a correction grant', async () => {

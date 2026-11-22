@@ -102,11 +102,10 @@ async function readInTransaction(tx: Prisma.TransactionClient, input: Readonly<{
     let initial: SelectedJobBatchWorkbenchModel['jobs'][number] | null = null
     if (pair.correction) {
       initial = await projectPair(tx, input, pair, tasks, pair.initial, true)
-      if (!initial || initial.status !== 'completed' || initial.reviewer.reviewStatus !== 'needs_revision') return null
+      if (!initial || initial.status !== 'completed' || initial.reviewer.reviewStatus !== 'needs_revision' || !initial.writer.artifactRef) return null
     }
-    const outcome = await projectPair(tx, input, pair, tasks)
+    const outcome = await projectPair(tx, input, pair, tasks, pair.effective, false, pair.correction ? initial?.writer.artifactRef : undefined)
     if (!outcome) return null
-    if (pair.correction && outcome.status === 'completed' && (!initial || !sameSuccessor(initial, outcome))) return null
     projected.push(outcome)
   }
   return { sessionId: input.sessionId, turnId: input.turnId, source: binding.source,
@@ -115,7 +114,7 @@ async function readInTransaction(tx: Prisma.TransactionClient, input: Readonly<{
 }
 
 async function projectPair(tx: Prisma.TransactionClient, owner: { userId: string; sessionId: string; turnId: string }, pair: Pair,
-  tasks: Map<string, BatchTask>, members: PairMembers = pair.effective, requireCurrentSource = false): Promise<SelectedJobBatchWorkbenchModel['jobs'][number] | null> {
+  tasks: Map<string, BatchTask>, members: PairMembers = pair.effective, requireCurrentSource = false, expectedPrevious?: Ref): Promise<SelectedJobBatchWorkbenchModel['jobs'][number] | null> {
   const writer = tasks.get(members.writer.taskId), reviewer = tasks.get(members.reviewer.taskId)
   if (!writer || !reviewer || writer.role !== 'writer' || writer.taskType !== 'cover_letter_draft'
     || reviewer.role !== 'reviewer' || reviewer.taskType !== 'cover_letter_review'
@@ -133,11 +132,13 @@ async function projectPair(tx: Prisma.TransactionClient, owner: { userId: string
     where: { artifactId: writerRef.artifactId, version: writerRef.version, userId: owner.userId, sessionId: owner.sessionId,
       jobId: pair.jobId, artifactType: 'cover_letter', taskId: writer.id, contentHash: writerRef.contentHash, sourceDigest: writerRef.sourceDigest },
     select: { id: true, artifactId: true, version: true, userId: true, sessionId: true, jobId: true, artifactType: true,
-      taskId: true, contentHash: true, sourceDigest: true },
+      taskId: true, contentHash: true, sourceDigest: true, previousHash: true },
   })
   if (!version || version.artifactId !== writerRef.artifactId || version.version !== writerRef.version || version.userId !== owner.userId
     || version.sessionId !== owner.sessionId || version.jobId !== pair.jobId || version.artifactType !== 'cover_letter'
-    || version.taskId !== writer.id || version.contentHash !== writerRef.contentHash || version.sourceDigest !== writerRef.sourceDigest) return null
+    || version.taskId !== writer.id || version.contentHash !== writerRef.contentHash || version.sourceDigest !== writerRef.sourceDigest
+    || expectedPrevious && (writerRef.artifactId !== expectedPrevious.artifactId || writerRef.version !== expectedPrevious.version + 1
+      || writerRef.sourceDigest !== expectedPrevious.sourceDigest || version.previousHash !== expectedPrevious.contentHash)) return null
   const review = await tx.agentArtifactReview.findFirst({
     where: { artifactVersionId: version.id, userId: owner.userId, sessionId: owner.sessionId, jobId: pair.jobId,
       taskId: reviewer.id, artifactId: writerRef.artifactId, version: writerRef.version, contentHash: writerRef.contentHash,
@@ -163,12 +164,6 @@ function pairNodes(nodes: NonNullable<ReturnType<typeof parseTaskGraphSnapshot>>
     const chain = parsed[index]!
     return { ...label, initial: chain.initial, ...(chain.correction ? { correction: chain.correction } : {}), effective: chain.effective }
   })
-}
-
-function sameSuccessor(initial: SelectedJobBatchWorkbenchModel['jobs'][number], correction: SelectedJobBatchWorkbenchModel['jobs'][number]): boolean {
-  const previous = initial.writer.artifactRef, next = correction.writer.artifactRef
-  return Boolean(previous && next && previous.artifactId === next.artifactId && next.version > previous.version
-    && previous.sourceDigest === next.sourceDigest)
 }
 
 function roleResult(value: unknown, role: 'writer'): boolean {
