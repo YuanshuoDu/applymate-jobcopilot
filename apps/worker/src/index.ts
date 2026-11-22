@@ -36,6 +36,7 @@ async function main() {
     cloakPoolModule,
     deadLetterModule,
     canonicalRuntimeModule,
+    canonicalModelRoutingModule,
     aiUsageBridgeModule,
     productionBootstrapModule,
     productionChildRuntimeModule,
@@ -52,6 +53,7 @@ async function main() {
     import("./cloak/pool.js"),
     import("./queue/dead-letter.js"),
     import("./runtime/canonical-turn-runtime.js"),
+    import("./runtime/canonical-agent-model-routing.js"),
     import("./queue/ai-usage-bridge.js"),
     import("./queue/production-bootstrap.js"),
     import("./runtime/subagents/production-child-runtime.js"),
@@ -101,6 +103,7 @@ async function main() {
   const taskGraphCommandPort = productionFlags.taskGraphPlanningEnabled
     ? taskGraphCommandPortModule.createPgTaskGraphCommandPort(pool)
     : undefined;
+  const modelRouting = canonicalModelRoutingModule.createCanonicalAgentModelRouting();
   let canonicalBootstrap: Awaited<ReturnType<typeof productionBootstrapModule.createProductionWorkerBootstrap>> | undefined;
   let agentWakeupConsumer: ReturnType<typeof startAgentWakeupConsumer> | undefined;
   let agentMailboxOutboxConsumer: ReturnType<typeof startSubagentMailboxOutboxConsumer> | undefined;
@@ -144,10 +147,16 @@ async function main() {
         console.log("[worker] Agent run router started");
       },
     }, {
-      createOptionalProductionChildExecutor: productionChildRuntimeModule.createOptionalProductionChildExecutor,
+      createOptionalProductionChildExecutor: options => productionChildRuntimeModule.createOptionalProductionChildExecutor({
+        ...options,
+        modelRuntimeFactory: options.modelRuntimeFactory ?? (input => modelRouting.createChildAdapter({ task: input.task })),
+      }),
       createCanonicalTurnRuntime: (runtimePool, options) => canonicalRuntimeModule.createCanonicalTurnRuntime(runtimePool, {
         ...options,
         ...taskGraphRuntimeOptions(taskGraphCommandPort),
+        modelRuntimeFactory: options.modelRuntimeFactory ?? (input => modelRouting.createRootRuntime({
+          userId: input.userId, state: { modelProfileSnapshot: input.state.modelProfileSnapshot },
+        })),
       }),
       createWorkerUsageAuthorizer: aiUsageBridgeModule.createWorkerUsageAuthorizer,
       createCanonicalExecutionProjection,
