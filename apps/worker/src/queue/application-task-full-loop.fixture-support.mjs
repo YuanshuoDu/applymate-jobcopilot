@@ -212,7 +212,7 @@ function fillTaskDisposition(waitStatus, matchedTaskIds, targetTaskId, taskStatu
   failModel("application_fill_child_terminal_status_invalid")
 }
 
-function fixtureModel() {
+function fixtureModel(options = {}) {
   return {
     adapter: {
       id: "application-task-full-loop-model", profile: modelProfile(),
@@ -228,9 +228,9 @@ function fixtureModel() {
           yield { type: "completed", finishReason: "tool_calls" }
           return
         }
-
         const { history: waitHistory, requestedCount } = agentWaitHistory(request, targetTaskId)
         if (waitHistory.at(-1)?.disposition === "complete") {
+          await options.beforeFinalResponse?.(options.rootTaskId)
           yield { type: "text_delta", text: "The synthetic application fill reached its durable review boundary." }
           yield { type: "completed", finishReason: "stop" }
           return

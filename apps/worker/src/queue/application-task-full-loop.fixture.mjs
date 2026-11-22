@@ -16,6 +16,32 @@ const REVIEWED_SOURCE_SCHEMA = "agent-harness.v2.subagent.result"
 const REVIEWED_FILL_BRIDGE_PATH = "/__applymate-reviewed-fill"
 const reviewedHash = createHash("sha256").update(REVIEWED_COVER_LETTER).digest("hex")
 const stageObserver = process.env.APPLICATION_TASK_FULL_LOOP_STAGE_OBSERVER_TEST === "true" ? applicationFillStageTrace() : undefined
+let legacyFinalResponseGate
+function armLegacyFinalResponseGate(rootTaskId) {
+  if (!/^root-[A-Za-z0-9_-]{1,120}$/.test(rootTaskId) || legacyFinalResponseGate) throw new Error("legacy_final_response_gate_arm_invalid")
+  let release
+  const released = new Promise(resolve => { release = resolve })
+  legacyFinalResponseGate = { rootTaskId, release, released, claimed: false }
+}
+function releaseLegacyFinalResponseGate(rootTaskId) {
+  const gate = legacyFinalResponseGate
+  if (!gate || gate.rootTaskId !== rootTaskId) return false
+  gate.release()
+  return true
+}
+async function holdLegacyFinalResponse(rootTaskId) {
+  const gate = legacyFinalResponseGate
+  if (!gate || gate.rootTaskId !== rootTaskId || gate.claimed) return
+  gate.claimed = true
+  say("LEGACY_FINAL_RESPONSE_GATE_REACHED")
+  let timer
+  await Promise.race([gate.released, new Promise(resolve => {
+    timer = setTimeout(resolve, 45_000)
+    timer.unref?.()
+  })])
+  if (timer) clearTimeout(timer)
+  gate.release()
+}
 const tls = async () => {
   const cert = await readFile(required("AGENT_TEST_TLS_CERT_PATH"))
   const key = await readFile(required("AGENT_TEST_TLS_KEY_PATH"))
@@ -348,7 +374,7 @@ async function startWorker() {
       ? createOptionalProductionChildExecutor({ ...options, authorizeUsage, modelRuntimeFactory: ({ task }) => selectedModelRuntime(task), ...(stageObserver ? { applicationFillStageObserver: stageObserver } : {}) }) : undefined),
     createCanonicalTurnRuntime: (runtimePool, productionOptions) => createCanonicalTurnRuntime(runtimePool, {
       ...productionOptions, ...taskGraphTemplatesModule.taskGraphRuntimeOptions(taskGraphCommandPort),
-      modelRuntimeFactory: ({ state }) => state.goal.includes(REVIEWED_SOURCE_GOAL) ? reviewedRootModel() : fixtureModel(), authorizeUsage,
+      modelRuntimeFactory: ({ state }) => state.goal.includes(REVIEWED_SOURCE_GOAL) ? reviewedRootModel() : fixtureModel({ rootTaskId: state.rootTaskId, beforeFinalResponse: holdLegacyFinalResponse }), authorizeUsage,
     }),
     createWorkerUsageAuthorizer: () => authorizeUsage,
     createCanonicalExecutionProjection: () => noOpProjection,
@@ -398,7 +424,22 @@ async function startWorker() {
     buffer += chunk
     const lines = buffer.split("\n")
     buffer = lines.pop() ?? ""
-    if (lines.some(line => line.trim() === "shutdown")) { process.stdin.pause(); resolve() }
+    for (const line of lines.map(value => value.trim())) {
+      if (line.startsWith("arm-legacy-final-response ")) {
+        try {
+          armLegacyFinalResponseGate(line.slice("arm-legacy-final-response ".length))
+          say("LEGACY_FINAL_RESPONSE_GATE_ARMED")
+        } catch { say("LEGACY_FINAL_RESPONSE_GATE_ARM_FAILED") }
+      } else if (line.startsWith("release-legacy-final-response ")) {
+        if (releaseLegacyFinalResponseGate(line.slice("release-legacy-final-response ".length))) {
+          say("LEGACY_FINAL_RESPONSE_GATE_RELEASED")
+        }
+      } else if (line === "shutdown") {
+        process.stdin.pause()
+        resolve()
+        return
+      }
+    }
   }))
   await wakeupConsumer.close()
   await publisher.close()
