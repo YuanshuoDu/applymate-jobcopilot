@@ -1028,19 +1028,19 @@ async function waitForReviewedFillBridgeRecoveryAttempts(outboxId: string, timeo
   return attempts
 }
 
-async function waitForReviewedFillOutboxPublished(outboxId: string, timeoutMs = 30_000) {
+async function waitForOutboxPublished(outboxId: string, timeoutMs = 30_000) {
   const until = Date.now() + timeoutMs
   let outbox = await testDb.agentOutbox.findUnique({
     where: { id: outboxId }, select: { publishedAt: true, attemptCount: true },
   })
   while (!outbox?.publishedAt && Date.now() < until) {
-    if (worker && exited(worker)) throw new Error("Worker exited before the reviewed-fill outbox was marked published")
+    if (worker && exited(worker)) throw new Error("Worker exited before the outbox was marked published")
     await delay(50)
     outbox = await testDb.agentOutbox.findUnique({
       where: { id: outboxId }, select: { publishedAt: true, attemptCount: true },
     })
   }
-  if (!outbox?.publishedAt) throw new Error("reviewed_fill_outbox_publish_timeout")
+  if (!outbox?.publishedAt) throw new Error("outbox_publish_timeout")
   return outbox
 }
 
@@ -1720,10 +1720,17 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     ])
     expect((await requestFixtureStats()).submitCount).toBe(1)
     const outbox = await testDb.agentOutbox.findMany({ where: { topic: "application.submit.dispatch", aggregateId: ids.session },
-      select: { idempotencyKey: true, aggregateId: true, topic: true, payload: true, publishedAt: true } })
+      select: { id: true, idempotencyKey: true, aggregateId: true, topic: true, payload: true, publishedAt: true } })
     expect(outbox).toHaveLength(1)
-    expect(outbox[0]).toMatchObject({ aggregateId: ids.session, topic: "application.submit.dispatch", publishedAt: expect.any(Date) })
-    const intent = jsonRecord(outbox[0]!.payload)
+    const pendingOutbox = outbox[0]!
+    const publication = await waitForOutboxPublished(pendingOutbox.id)
+    const publishedOutbox = await testDb.agentOutbox.findUniqueOrThrow({ where: { id: pendingOutbox.id }, select: {
+      idempotencyKey: true, aggregateId: true, topic: true, payload: true, publishedAt: true,
+    } })
+    expect(publishedOutbox).toMatchObject({ idempotencyKey: pendingOutbox.idempotencyKey, aggregateId: ids.session,
+      topic: "application.submit.dispatch", publishedAt: publication.publishedAt })
+    expect(publishedOutbox.payload).toEqual(pendingOutbox.payload)
+    const intent = jsonRecord(publishedOutbox.payload)
     if (!intent) throw new Error("Submit outbox payload is not an object")
     expect(Object.keys(intent).sort()).toEqual([
       "applicationTaskId", "constraintHash", "fillTurnId", "jobId", "receiptId", "sessionId", "submitPayload", "userId", "workerTaskId",
@@ -1739,6 +1746,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(submitJob.id).toBe(workerTaskId)
     expect(await submitJob.getState()).toBe("active")
     expect(submitJob.data).toEqual(intent.submitPayload)
+    expect(submitJob.data).toMatchObject({ applicationTaskId: gateTaskId, userId: ids.user, jobId: ids.job,
+      sessionId: ids.session, fillTurnId: successorTurnId, receiptId: submitApproval.id, operation: "submit" })
     const successorRootTaskId = await expectLegacyFillTurnLeased(successorTurnId)
     await releaseLegacyFinalResponseGate()
     expect((await waitForAgentTurnTerminal(successorTurnId, 30_000)).status).toBe("completed")
@@ -1976,7 +1985,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       { outboxId: handoff.id, status: 200, acknowledgement: "duplicate", predecessorStatus: "completed", acknowledgementDropped: false },
     ])
     expect(reviewedFillBridgeAttempts).toHaveLength(bridgeAttempts.length)
-    const publishedHandoff = await waitForReviewedFillOutboxPublished(handoff.id)
+    const publishedHandoff = await waitForOutboxPublished(handoff.id)
     expect(publishedHandoff.publishedAt).toBeInstanceOf(Date)
     expect(publishedHandoff.attemptCount).toBe(1)
     const firstFill = await waitForReviewedApplicationTask(scenario.jobId, task => Boolean(task.fillTurnId))
