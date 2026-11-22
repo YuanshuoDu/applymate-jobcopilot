@@ -5987,7 +5987,98 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(await workerB.exited).toMatchObject({ code: 0, signal: null })
 
       await finishLoopWaitTarget(pool, taskStore, ids, policy, ids.secondTargetTaskId!)
-      expect((await reconcileDurableSubagentWaits(pool)).woken).toBeGreaterThan(0)
+      type WaitStatus = "missing" | "waiting" | "ready" | "timed_out" | "other"
+      const statusCategory = (status?: string): WaitStatus =>
+        status === "waiting" || status === "ready" || status === "timed_out" ? status : status ? "other" : "missing"
+      type ScheduleRow = { status: string; due: boolean }
+      let scheduleDiagnostic = { found: false, status: "missing" as WaitStatus, due: false }
+      try {
+        await waitFor(async () => {
+          const result = await pool.query<ScheduleRow>(`SELECT "status",
+            COALESCE("nextReconcileAt", "suspendedAt") <= timezone('UTC', clock_timestamp()) AS "due"
+            FROM "agent_wait_conditions"
+            WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4
+              AND "parentTaskId" = $5 AND "stepId" = $6`,
+          [secondWait!.waitId, ids.userId, ids.sessionId, ids.turnId, ids.waiterTaskId, secondWait!.stepId])
+          const row = result.rows[0]
+          scheduleDiagnostic = { found: Boolean(row), status: statusCategory(row?.status), due: row?.due === true }
+          if (!row || row.status === "waiting") {
+            if (row?.due) await reconcileDurableSubagentWaits(pool)
+            return null
+          }
+          return row.status
+        }, 12_000)
+      } catch (error: unknown) {
+        if (error instanceof Error && error.message === "Timed out waiting for durable child-wait state") {
+          throw new Error("Second wait did not leave its scheduled state: " + JSON.stringify(scheduleDiagnostic))
+        }
+        throw error
+      }
+
+      type SecondWaitProofRow = {
+        status: string
+        suspended: boolean
+        resolved: boolean
+        unconsumed: boolean
+        targetBound: boolean
+        targetMatched: boolean
+        targetCompleted: boolean
+        targetResultMatches: boolean
+        projectedResultMatches: boolean
+        parentQueued: boolean
+        attemptMatches: boolean
+        leaseClear: boolean
+        dispatchCount: number
+        dispatchPayloadMatches: boolean
+        dispatchUnpublished: boolean
+      }
+      const proofResult = await pool.query<SecondWaitProofRow>(`SELECT wait."status",
+          wait."suspendedAt" IS NOT NULL AS "suspended", wait."resolvedAt" IS NOT NULL AS "resolved",
+          wait."consumedAt" IS NULL AS "unconsumed", wait."targetTaskIds" = $7::jsonb AS "targetBound",
+          wait."matchedTaskIds" = $7::jsonb AS "targetMatched", target."status" = 'completed' AS "targetCompleted",
+          COALESCE(target."result"->>'finalText' = $8, FALSE) AS "targetResultMatches",
+          COALESCE(wait."result"->'outcome'->'tasks'->0->'result'->>'finalText' = $9, FALSE) AS "projectedResultMatches",
+          parent."status" = 'queued' AS "parentQueued", parent."attemptCount" = 1 AS "attemptMatches",
+          parent."leaseOwner" IS NULL AND parent."leaseExpiresAt" IS NULL AS "leaseClear",
+          dispatch."rowCount" AS "dispatchCount", dispatch."payloadMatches" AS "dispatchPayloadMatches",
+          dispatch."unpublished" AS "dispatchUnpublished"
+        FROM "agent_wait_conditions" AS wait
+        JOIN "sub_agent_tasks" AS parent ON parent."id" = wait."parentTaskId"
+          AND parent."sessionId" = wait."sessionId" AND parent."turnId" = wait."turnId"
+        LEFT JOIN "sub_agent_tasks" AS target ON target."id" = $10 AND target."sessionId" = wait."sessionId"
+          AND target."turnId" = wait."turnId" AND target."rootTaskId" = parent."rootTaskId"
+          AND target."parentTaskId" = parent."id"
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::int AS "rowCount",
+            COALESCE(BOOL_AND(outbox."payload"->>'taskId' = parent."id"
+              AND outbox."payload"->>'sessionId' = wait."sessionId"
+              AND outbox."payload"->>'rootTaskId' = parent."rootTaskId"), FALSE) AS "payloadMatches",
+            COALESCE(BOOL_AND(outbox."publishedAt" IS NULL), FALSE) AS "unpublished"
+          FROM "agent_outbox" AS outbox WHERE outbox."topic" = 'agent.subagent.dispatch'
+            AND outbox."aggregateId" = wait."sessionId" AND outbox."idempotencyKey" = $11
+        ) AS dispatch ON TRUE
+        WHERE wait."id" = $1 AND wait."userId" = $2 AND wait."sessionId" = $3 AND wait."turnId" = $4
+          AND wait."parentTaskId" = $5 AND wait."stepId" = $6`,
+      [secondWait!.waitId, ids.userId, ids.sessionId, ids.turnId, ids.waiterTaskId, secondWait!.stepId,
+        JSON.stringify([ids.secondTargetTaskId]), TARGET_RESULT_TEXT, REDACTED_TARGET_RESULT_TEXT, ids.secondTargetTaskId,
+        `subagent-dispatch:${ids.waiterTaskId}`])
+      const row = proofResult.rows[0]
+      const proof = {
+        found: Boolean(row), status: statusCategory(row?.status),
+        suspended: row?.suspended === true, resolved: row?.resolved === true, unconsumed: row?.unconsumed === true,
+        targetBound: row?.targetBound === true, targetMatched: row?.targetMatched === true,
+        targetCompleted: row?.targetCompleted === true, targetResultMatches: row?.targetResultMatches === true,
+        projectedResultMatches: row?.projectedResultMatches === true, parentQueued: row?.parentQueued === true,
+        attemptMatches: row?.attemptMatches === true, leaseClear: row?.leaseClear === true,
+        dispatchRows: Math.min(2, Math.max(0, Number(row?.dispatchCount ?? 0))) as 0 | 1 | 2,
+        dispatchPayloadMatches: row?.dispatchPayloadMatches === true, dispatchUnpublished: row?.dispatchUnpublished === true,
+      }
+      expect(proof, "Second wait persisted proof=" + JSON.stringify({ schedule: scheduleDiagnostic, proof })).toEqual({
+        found: true, status: "ready", suspended: true, resolved: true, unconsumed: true,
+        targetBound: true, targetMatched: true, targetCompleted: true, targetResultMatches: true,
+        projectedResultMatches: true, parentQueued: true, attemptMatches: true, leaseClear: true,
+        dispatchRows: 1, dispatchPayloadMatches: true, dispatchUnpublished: true,
+      })
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
 
       workerC = launchWorker("worker-b-loop-multi-complete-cut", queueName, ids)
