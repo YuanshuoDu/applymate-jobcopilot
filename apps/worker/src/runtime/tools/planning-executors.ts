@@ -10,7 +10,7 @@ import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
 import type { TaskGraphObjectiveCoverageRejection } from "../planning/task-graph-objective-coverage.js"
 import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
 import type { TaskGraphCommandPort, TaskGraphScheduleReceipt, TaskGraphTaskTemplate } from "../subagents/task-graph-command-port.js"
-import { pairSelectedJobBatchPlan, type SelectedJobBatchSlot } from "../subagents/selected-job-batch-plan.js"
+import { selectedJobBatchProposalAccepted, type SelectedJobBatchSlot } from "../subagents/selected-job-batch-plan.js"
 import { normalizeRootPlanCriteria } from "../subagents/root-plan-criteria.js"
 
 import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "./types.js"
@@ -111,7 +111,7 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     ? " Writer and Reviewer nodes use their specialized gates and omit verification and repairOf. For a selected-job cover letter, plan one cover_letter_writer first. If its completed Reviewer dependency reports needs_revision, you may append exactly one cover_letter_writer directly after that Reviewer in a later plan; do not loop or reuse that review for a second successful revision. A fresh review is required after the revision. Root decides whether to plan this follow-up; the Worker does not schedule it automatically."
     : ""
   const selectedJobBatchGuidance = options.selectedJobBatchSlots
-    ? " For a selected-job batch, submit every server-listed slot's Writer and same-slot Reviewer together in one initial revision-zero plan. Writers have no dependencies; each Reviewer depends only on its paired Writer. Do not add other nodes, verification, repair, or replacement modes."
+    ? " For a selected-job batch, submit every server-listed slot's Writer and same-slot Reviewer together in the initial revision-zero plan. If a Reviewer reports needs_revision, refresh the owner-scoped current graph and exact review evidence, then append at most one same-slot correction Writer directly after its original Reviewer and a fresh Reviewer directly after that Writer. Wait for the new pair and reverify the latest artifact and review. Batch plans accept only those complete per-Job pairs; do not add other work or use generic replacement modes. If capacity or budget cannot fit the pair, report the review as unresolved."
     : ""
   const postGateTemplatesAvailable = templates.some(([id]) => id === "scheduled.application.execute")
     && templates.some(([id]) => id === "scheduled.post_gate_audit")
@@ -144,13 +144,9 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
       throw new ToolExecutionError("task_graph_sensitive_key_rejected", "TaskGraph keys cannot contain contact or credential data")
     }
     if (options.selectedJobBatchSlots) {
-      if (input.expectedRevision !== 0 || modes.replaceUnstarted !== undefined || modes.replaceBranch !== undefined
-        || modes.replaceOperationalFailure !== undefined || input.nodes.some(node => Object.hasOwn(node, "repairOf")
-          || Object.hasOwn(node, "verification") || Object.hasOwn(node, "packageRefs"))) {
-        throw selectedJobBatchPlanError()
-      }
-      try { pairSelectedJobBatchPlan(input.nodes, options.selectedJobBatchSlots) }
-      catch { throw selectedJobBatchPlanError() }
+      const disallowedMode = modes.replaceUnstarted !== undefined || modes.replaceBranch !== undefined
+        || modes.replaceOperationalFailure !== undefined || input.expectedRevision > 0 && input.rootSuccessCriteria !== undefined
+      if (!selectedJobBatchProposalAccepted(input.nodes, input.expectedRevision, disallowedMode, options.selectedJobBatchSlots)) throw selectedJobBatchPlanError()
     }
     const reconciliation = steeringReconciliationOperation(context, options, "revise", input.expectedRevision)
     const operation = {

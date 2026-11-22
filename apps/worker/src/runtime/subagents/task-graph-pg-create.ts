@@ -21,6 +21,8 @@ import { sourceIntentForTaskGraphNode } from "./task-graph-source-intent-context
 import { scheduledScoutPlanCapacityAllowed } from "./scheduled-taskgraph-plan-capacity.js"
 import { isRegisteredObjectiveTaskGraphChildTemplate } from "./objective-task-graph-child-authority.js"
 import type { PreparedSteeringReconciliation } from "./steering-reconciliation-contract.js"
+import { assertWriterReviewPlan } from "./selected-job-batch-plan.js"
+import { assertSelectedJobBatchPlanAdmission } from "./selected-job-batch-correction-admission.js"
 
 const EXTERNAL_ACTION = /(?:^|[._-])(submit|send|publish|delete|mutate|execute)(?:$|[._-])/i
 const REGISTERED_NESTED_SCOUT = templatesForInteractiveScoutDelegation(TASK_GRAPH_TEMPLATES, TASK_GRAPH_TEMPLATES)?.scout
@@ -42,19 +44,6 @@ function safeTemplate(templateId: string, template: TaskGraphTaskTemplate): void
 
 function safeProposalSize(proposal: TaskGraphProposal): void {
   if (Buffer.byteLength(JSON.stringify(proposal), "utf8") > TASK_GRAPH_LIMITS.maxProposalBytes) throw new Error("task_graph_proposal_too_large")
-}
-
-function assertWriterReviewPlan(nodes: readonly TaskGraphNodeProposal[]): void {
-  const byKey = new Map(nodes.map(node => [node.key, node] as const))
-  const usedReviewers = new Set<string>()
-  for (const writer of nodes) {
-    if (writer.templateId !== "cover_letter_writer") continue
-    const reviewers = writer.dependsOn.filter(key => byKey.get(key)?.templateId === "cover_letter_reviewer")
-    if (reviewers.length > 1 || reviewers.some(key => usedReviewers.has(key))) {
-      throw Object.assign(new Error("Selected-job Writer and Reviewer dependencies conflict"), { code: "task_graph_writer_review_conflict" })
-    }
-    reviewers.forEach(key => usedReviewers.add(key))
-  }
 }
 
 export async function createGraphTasks(
@@ -83,6 +72,10 @@ export async function createGraphTasks(
   }
   const appended = appendTaskGraphProposal(current, input.proposal, options)
   if (!appended.ok) throw Object.assign(new Error(appended.error.message), { code: appended.error.code })
+  await assertSelectedJobBatchPlanAdmission({ client, scope: input.scope, current, proposedState: appended.state,
+    proposedNodes: input.proposal.nodes, templates: input.templates, priorTaskIds,
+    hasReplacementMode: !!(input.replaceUnstarted || input.replaceBranch || input.replaceOperationalFailure),
+    hasRootSuccessCriteria: input.rootSuccessCriteria !== undefined })
   if (!await scheduledScoutPlanCapacityAllowed(client, input.scope, appended.state.nodes)) {
     throw Object.assign(new Error("TaskGraph node limit exceeded"), { code: "node_limit" })
   }
