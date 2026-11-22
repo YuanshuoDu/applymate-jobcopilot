@@ -67,6 +67,7 @@ export type SubmissionUncertainTaskWrite = "written" | "superseded" | "failed";
 export type StagedApplicationSubmissionStopProtocol = Readonly<{
   isStopped(scope: ApplicationSubmissionStartScope): Promise<boolean>;
   acquireStartFence(scope: ApplicationSubmissionStartScope): Promise<ApplicationSubmissionStartFence>;
+  onContinuationAcknowledged?(scope: ApplicationSubmissionStartScope): void;
 }>;
 
 export type ApplyJobRunContext = {

@@ -184,6 +184,7 @@ export function createApplicationSubmissionRouteHandler(
         continuationAttempted = true;
         const continuation = route.continue();
         await waitForRouteContinuationAcknowledgement(continuation, state.stopController.signal);
+        context.stagedSubmissionStopProtocol?.onContinuationAcknowledged?.(state.approvedTurnScope!);
         await context.lifecycle!.releaseSubmissionFence(true);
       } catch (error: unknown) {
         state.submissionFenceUnavailable = true;

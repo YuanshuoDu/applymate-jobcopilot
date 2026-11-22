@@ -21,6 +21,54 @@ const identity = {
   constraintHash: "a".repeat(64),
 };
 
+function routeGateHarness(options: { fenceState?: "ready" | "stopped"; continueRoute?: () => Promise<void> } = {}) {
+  let acknowledge!: () => void;
+  let routeCalled!: () => void;
+  const continuation = new Promise<void>(resolve => { acknowledge = resolve; });
+  const continued = new Promise<void>(resolve => { routeCalled = resolve; });
+  const scope = { ...identity, turnId: identity.fillTurnId, workerTaskId: "worker-task", executionId: "execution" };
+  const order: string[] = [];
+  const stagedStartFence = vi.fn().mockResolvedValue({ state: options.fenceState ?? "ready", release: vi.fn() });
+  const state = {
+    queueCatchStarted: false, stopController: new AbortController(), approvedTurnScope: scope,
+    armedSubmissionIntent: { url: "https://jobs.example/apply", method: "POST" },
+    submissionCandidateSeen: false, submissionRequestStarted: false, submissionFenceTimer: null,
+    submissionFenceUnavailable: false, turnStopped: false, pendingSubmissionFence: null as null | { release(commit: boolean): Promise<void> },
+    submissionRouteState: { work: null, cleanup: null }, applicationTaskFinalized: false,
+  };
+  const releaseSubmissionFence = vi.fn(async (commit: boolean) => {
+    order.push(`release:${commit}`);
+    const fence = state.pendingSubmissionFence;
+    state.pendingSubmissionFence = null;
+    await fence?.release(commit);
+  });
+  const onContinuationAcknowledged = vi.fn((_scope: typeof scope) => { order.push("acknowledged"); });
+  const lifecycle = {
+    closeActivePage: vi.fn().mockResolvedValue(undefined),
+    closeActiveSubmissionContext: vi.fn().mockResolvedValue(undefined),
+    interruptStoppedTurn: vi.fn().mockResolvedValue(undefined),
+    releaseSubmissionFence,
+    markSubmissionUncertain: vi.fn().mockResolvedValue("written"),
+  };
+  const page = {};
+  const frame = { page: () => page };
+  const context = {
+    payload: { applicationTaskId: identity.applicationTaskId }, state,
+    submissionIdentity: identity,
+    stagedSubmissionStopProtocol: { isStopped: vi.fn(), acquireStartFence: stagedStartFence, onContinuationAcknowledged },
+    lifecycle,
+  };
+  const handler = createApplicationSubmissionRouteHandler(
+    context as never, page as never, { url: "https://jobs.example/apply", method: "POST" }, frame as never, new Set([page as never]),
+  );
+  const route = {
+    request: () => ({ url: () => "https://jobs.example/apply", method: () => "POST", frame: () => frame, isNavigationRequest: () => true }),
+    continue: vi.fn(() => { order.push("continue"); routeCalled(); return options.continueRoute ? options.continueRoute() : continuation; }),
+    abort: vi.fn().mockResolvedValue(undefined), fallback: vi.fn().mockResolvedValue(undefined),
+  };
+  return { acknowledge, continued, handler, lifecycle, onContinuationAcknowledged, order, releaseSubmissionFence, route, scope, stagedStartFence };
+}
+
 describe("approved application route scope", () => {
   beforeEach(() => {
     mocks.inspectSubmission.mockReset().mockResolvedValue({
@@ -65,49 +113,56 @@ describe("approved application route scope", () => {
   });
 
   it("uses the staged fence only when explicitly injected and holds it through route acknowledgement", async () => {
-    let acknowledge!: () => void;
-    let routeCalled!: () => void;
-    const continuation = new Promise<void>(resolve => { acknowledge = resolve; });
-    const continued = new Promise<void>(resolve => { routeCalled = resolve; });
-    const scope = { ...identity, turnId: identity.fillTurnId, workerTaskId: "worker-task", executionId: "execution" };
-    const stagedStartFence = vi.fn().mockResolvedValue({ state: "ready", release: vi.fn() });
-    const state = {
-      queueCatchStarted: false, stopController: new AbortController(), approvedTurnScope: scope,
-      armedSubmissionIntent: { url: "https://jobs.example/apply", method: "POST" },
-      submissionCandidateSeen: false, submissionRequestStarted: false, submissionFenceTimer: null,
-      submissionFenceUnavailable: false, turnStopped: false, pendingSubmissionFence: null as null | { release(commit: boolean): Promise<void> },
-      submissionRouteState: { work: null, cleanup: null },
-    };
-    const releaseSubmissionFence = vi.fn(async (commit: boolean) => {
-      const fence = state.pendingSubmissionFence;
-      state.pendingSubmissionFence = null;
-      await fence?.release(commit);
-    });
-    const page = {};
-    const frame = { page: () => page };
-    const context = {
-      payload: { applicationTaskId: identity.applicationTaskId }, state,
-      submissionIdentity: identity,
-      stagedSubmissionStopProtocol: { isStopped: vi.fn(), acquireStartFence: stagedStartFence },
-      lifecycle: { releaseSubmissionFence },
-    };
-    const handler = createApplicationSubmissionRouteHandler(
-      context as never, page as never, { url: "https://jobs.example/apply", method: "POST" }, frame as never, new Set([page as never]),
-    );
-    const route = {
-      request: () => ({ url: () => "https://jobs.example/apply", method: () => "POST", frame: () => frame, isNavigationRequest: () => true }),
-      continue: vi.fn(() => { routeCalled(); return continuation; }), abort: vi.fn().mockResolvedValue(undefined),
-      fallback: vi.fn().mockResolvedValue(undefined),
-    };
-
-    const handling = handler(route as never);
-    await continued;
-    expect(stagedStartFence).toHaveBeenCalledWith(scope);
+    const harness = routeGateHarness();
+    const handling = harness.handler(harness.route as never);
+    await harness.continued;
+    expect(harness.stagedStartFence).toHaveBeenCalledWith(harness.scope);
     expect(mocks.legacyStartFence).not.toHaveBeenCalled();
-    expect(releaseSubmissionFence).not.toHaveBeenCalled();
-    acknowledge();
+    expect(harness.onContinuationAcknowledged).not.toHaveBeenCalled();
+    expect(harness.releaseSubmissionFence).not.toHaveBeenCalled();
+    harness.acknowledge();
     await handling;
-    expect(releaseSubmissionFence).toHaveBeenCalledOnce();
-    expect(releaseSubmissionFence).toHaveBeenLastCalledWith(true);
+    expect(harness.onContinuationAcknowledged).toHaveBeenCalledOnce();
+    expect(harness.onContinuationAcknowledged).toHaveBeenCalledWith(harness.scope);
+    expect(harness.order).toEqual(["continue", "acknowledged", "release:true"]);
+    expect(harness.releaseSubmissionFence).toHaveBeenLastCalledWith(true);
+  });
+
+  it("does not acknowledge a rejected route continuation", async () => {
+    const harness = routeGateHarness({ continueRoute: () => Promise.reject(new Error("route rejected")) });
+    await harness.handler(harness.route as never);
+    expect(harness.onContinuationAcknowledged).not.toHaveBeenCalled();
+    expect(harness.releaseSubmissionFence).toHaveBeenLastCalledWith(true);
+  });
+
+  it("does not acknowledge a synchronous route continuation throw", async () => {
+    const harness = routeGateHarness({ continueRoute: () => { throw new Error("route threw"); } });
+    await harness.handler(harness.route as never);
+    expect(harness.onContinuationAcknowledged).not.toHaveBeenCalled();
+    expect(harness.releaseSubmissionFence).toHaveBeenLastCalledWith(true);
+  });
+
+  it("does not acknowledge a timed-out route continuation", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = routeGateHarness({ continueRoute: () => new Promise<void>(() => undefined) });
+      const handling = harness.handler(harness.route as never);
+      await harness.continued;
+      await vi.advanceTimersByTimeAsync(8_001);
+      await handling;
+      expect(harness.onContinuationAcknowledged).not.toHaveBeenCalled();
+      expect(harness.releaseSubmissionFence).toHaveBeenLastCalledWith(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not acknowledge or continue a stop-first route fence", async () => {
+    const harness = routeGateHarness({ fenceState: "stopped" });
+    await harness.handler(harness.route as never);
+    expect(harness.route.continue).not.toHaveBeenCalled();
+    expect(harness.onContinuationAcknowledged).not.toHaveBeenCalled();
+    expect(harness.releaseSubmissionFence).not.toHaveBeenCalled();
+    expect(harness.lifecycle.interruptStoppedTurn).toHaveBeenCalledOnce();
   });
 });
