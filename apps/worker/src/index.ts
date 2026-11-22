@@ -103,7 +103,6 @@ async function main() {
   const taskGraphCommandPort = productionFlags.taskGraphPlanningEnabled
     ? taskGraphCommandPortModule.createPgTaskGraphCommandPort(pool)
     : undefined;
-  const modelRouting = canonicalModelRoutingModule.createCanonicalAgentModelRouting();
   let canonicalBootstrap: Awaited<ReturnType<typeof productionBootstrapModule.createProductionWorkerBootstrap>> | undefined;
   let agentWakeupConsumer: ReturnType<typeof startAgentWakeupConsumer> | undefined;
   let agentMailboxOutboxConsumer: ReturnType<typeof startSubagentMailboxOutboxConsumer> | undefined;
@@ -147,17 +146,8 @@ async function main() {
         console.log("[worker] Agent run router started");
       },
     }, {
-      createOptionalProductionChildExecutor: options => productionChildRuntimeModule.createOptionalProductionChildExecutor({
-        ...options,
-        modelRuntimeFactory: options.modelRuntimeFactory ?? (input => modelRouting.createChildAdapter({ task: input.task })),
-      }),
-      createCanonicalTurnRuntime: (runtimePool, options) => canonicalRuntimeModule.createCanonicalTurnRuntime(runtimePool, {
-        ...options,
-        ...taskGraphRuntimeOptions(taskGraphCommandPort),
-        modelRuntimeFactory: options.modelRuntimeFactory ?? (input => modelRouting.createRootRuntime({
-          userId: input.userId, state: { modelProfileSnapshot: input.state.modelProfileSnapshot },
-        })),
-      }),
+      ...canonicalModelRoutingModule.bindProductionModelFactories(
+        productionChildRuntimeModule, canonicalRuntimeModule, () => taskGraphRuntimeOptions(taskGraphCommandPort)),
       createWorkerUsageAuthorizer: aiUsageBridgeModule.createWorkerUsageAuthorizer,
       createCanonicalExecutionProjection,
       createCanonicalSessionProjection,

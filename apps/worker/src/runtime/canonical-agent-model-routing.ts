@@ -9,6 +9,10 @@ type Dependencies = Readonly<{
   createRuntime: (options: HarnessModelRuntimeOptions) => HarnessModelRuntime
 }>
 
+type ChildRuntimeModule = Pick<typeof import("./subagents/production-child-runtime.js"), "createOptionalProductionChildExecutor">
+type CanonicalRuntimeModule = Pick<typeof import("./canonical-turn-runtime.js"), "createCanonicalTurnRuntime">
+type CanonicalRuntimeOptions = Parameters<CanonicalRuntimeModule["createCanonicalTurnRuntime"]>[1]
+
 type SnapshotOwner = Pick<SubagentTaskRecord, "userId" | "role" | "taskType" | "modelProfileSnapshot">
 
 const SCHEDULED_PREPARE_ROLE = "prepare"
@@ -62,6 +66,35 @@ export function createCanonicalAgentModelRouting(dependencies: Dependencies = {
         ? await dependencies.loadAutoApplyRoute(task.userId)
         : (await dependencies.loadAgentRoute(task.userId)).config
       return runtime(bindModelProfileSnapshot(config, task.modelProfileSnapshot)).adapter
+    },
+  }
+}
+
+/** Bind the route through the existing production seams while retaining caller overrides. */
+export function bindProductionModelFactories(
+  childRuntime: ChildRuntimeModule,
+  canonicalRuntime: CanonicalRuntimeModule,
+  taskGraphRuntimeOptions: () => Partial<CanonicalRuntimeOptions>,
+) {
+  const routing = createCanonicalAgentModelRouting()
+  return {
+    createOptionalProductionChildExecutor(options: Parameters<ChildRuntimeModule["createOptionalProductionChildExecutor"]>[0]) {
+      return childRuntime.createOptionalProductionChildExecutor({
+        ...options,
+        modelRuntimeFactory: options.modelRuntimeFactory ?? (input => routing.createChildAdapter({ task: input.task })),
+      })
+    },
+    createCanonicalTurnRuntime(
+      runtimePool: Parameters<CanonicalRuntimeModule["createCanonicalTurnRuntime"]>[0],
+      options: CanonicalRuntimeOptions,
+    ) {
+      return canonicalRuntime.createCanonicalTurnRuntime(runtimePool, {
+        ...options,
+        ...taskGraphRuntimeOptions(),
+        modelRuntimeFactory: options.modelRuntimeFactory ?? (input => routing.createRootRuntime({
+          userId: input.userId, state: { modelProfileSnapshot: input.state.modelProfileSnapshot },
+        })),
+      })
     },
   }
 }

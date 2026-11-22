@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from "vitest"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { AiConfig, WorkerAgentAiRoute } from "@jobcopilot/shared/llm"
 import type { HarnessModelRuntime, HarnessModelRuntimeOptions } from "./harness-model.js"
-import { bindModelProfileSnapshot, createCanonicalAgentModelRouting } from "./canonical-agent-model-routing.js"
+import { bindModelProfileSnapshot, bindProductionModelFactories, createCanonicalAgentModelRouting } from "./canonical-agent-model-routing.js"
+
+type ChildOptions = Parameters<typeof import("./subagents/production-child-runtime.js").createOptionalProductionChildExecutor>[0]
+type CanonicalFactory = typeof import("./canonical-turn-runtime.js").createCanonicalTurnRuntime
+type CanonicalOptions = Parameters<CanonicalFactory>[1]
 
 const agentConfig: AiConfig = { provider: "anthropic", model: "agent-model", apiKey: "fixture-agent-key", credentialSource: "user" }
 const autoApplyConfig: AiConfig = { provider: "openai", model: "auto-apply-model", apiKey: "fixture-auto-key", apiBase: "https://openai.fixture/v1", credentialSource: "platform" }
@@ -104,5 +108,35 @@ describe("canonical Agent model routing", () => {
     } })).rejects.toThrow("worker_model_profile_provider_mismatch")
     expect(loadAgentRoute).not.toHaveBeenCalled()
     expect(createRuntime).not.toHaveBeenCalled()
+  })
+
+  it("binds production seams lazily and preserves explicit runtime overrides", async () => {
+    let childOptions: ChildOptions | undefined
+    let canonicalOptions: CanonicalOptions | undefined
+    const childFactory = vi.fn((options: ChildOptions) => { childOptions = options; return undefined })
+    const canonicalFactory = vi.fn(async (_pool: Parameters<CanonicalFactory>[0], options: CanonicalOptions) => {
+      canonicalOptions = options
+      return {} as Awaited<ReturnType<CanonicalFactory>>
+    })
+    const taskGraphRuntimeOptions = vi.fn(() => ({} as Partial<CanonicalOptions>))
+    const dependencies = bindProductionModelFactories(
+      { createOptionalProductionChildExecutor: childFactory },
+      { createCanonicalTurnRuntime: canonicalFactory },
+      taskGraphRuntimeOptions,
+    )
+
+    expect(taskGraphRuntimeOptions).not.toHaveBeenCalled()
+    dependencies.createOptionalProductionChildExecutor({ pool: {} as ChildOptions["pool"] })
+    await dependencies.createCanonicalTurnRuntime({} as Parameters<CanonicalFactory>[0], { workerId: "fixture" })
+    expect(typeof childOptions?.modelRuntimeFactory).toBe("function")
+    expect(typeof canonicalOptions?.modelRuntimeFactory).toBe("function")
+    expect(taskGraphRuntimeOptions).toHaveBeenCalledOnce()
+
+    const explicitChild = vi.fn() as unknown as NonNullable<ChildOptions["modelRuntimeFactory"]>
+    const explicitRoot = vi.fn() as unknown as NonNullable<CanonicalOptions["modelRuntimeFactory"]>
+    dependencies.createOptionalProductionChildExecutor({ pool: {} as ChildOptions["pool"], modelRuntimeFactory: explicitChild })
+    await dependencies.createCanonicalTurnRuntime({} as Parameters<CanonicalFactory>[0], { workerId: "fixture", modelRuntimeFactory: explicitRoot })
+    expect(childOptions?.modelRuntimeFactory).toBe(explicitChild)
+    expect(canonicalOptions?.modelRuntimeFactory).toBe(explicitRoot)
   })
 })
