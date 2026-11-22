@@ -1,4 +1,5 @@
 import type { PoolClient } from "pg"
+import { hashApprovalScope } from "@jobcopilot/agent-protocol"
 import { parseReviewedApplicationFillSource, type ReviewedApplicationFillSourceSelection } from "@jobcopilot/shared"
 
 import { withExactAttemptFence } from "../queue/application-submit-fence.js"
@@ -7,6 +8,7 @@ import { hasReviewedSubmissionArtifact, readReviewedApplicationSubmitMaterial } 
 import { acquireSourceMaterialFence } from "./source-material-fence.js"
 
 type Phase = "marker" | "boundary"
+type FencePhase = Phase | "stop_poll"
 type ProofResult<T> = { readonly kind: "current"; readonly value: T; readonly sourceTurnId: string | null } | { readonly kind: "superseded" } | { readonly kind: "invalid" }
 type ApprovalRow = {
   userId: string; sessionId: string; turnId: string | null; taskId: string | null; jobId: string | null; toolCallId: string | null
@@ -15,12 +17,17 @@ type ApprovalRow = {
 }
 type AttemptRow = { userId: string; jobId: string; receiptId: string; constraintHash: string; artifactHash: string; state: string }
 type EventRow = { data: unknown }
+type StopPollApprovalRow = ApprovalRow & { id: string; nonceHash: string | null; revision: number }
 
 /** Rechecks a reviewed request under the shared source fence and exact attempt locks. */
-export async function withReviewedApplicationSubmitRequestFence<T>(
+export const withReviewedApplicationSubmitRequestFence = <T>(client: PoolClient, scope: ApplicationSubmissionStartScope,
+  phase: Phase, expectedSourceTurnId: string | null | undefined, work: (sourceTurnId?: string) => Promise<T>): Promise<ProofResult<T>> =>
+  withReviewedApplicationSubmitFenceInternal(client, scope, phase, expectedSourceTurnId, work)
+
+async function withReviewedApplicationSubmitFenceInternal<T>(
   client: PoolClient,
   scope: ApplicationSubmissionStartScope,
-  phase: Phase,
+  phase: FencePhase,
   expectedSourceTurnId: string | null | undefined,
   work: (sourceTurnId?: string) => Promise<T>,
 ): Promise<ProofResult<T>> {
@@ -32,9 +39,10 @@ export async function withReviewedApplicationSubmitRequestFence<T>(
       return { valid: false as const }
     }
     if (current.kind === "absent" && await hasReviewedSubmissionArtifact(client, scope)) return { valid: false as const }
-    if (current.kind === "selected" && !(await reviewedRequestIsCurrent(client, scope, phase, current.sourceTurnId))) {
-      return { valid: false as const }
-    }
+    const requestIsCurrent = current.kind !== "selected" || (phase === "stop_poll"
+      ? await reviewedStopPollIsCurrent(client, scope, current.sourceTurnId)
+      : await reviewedRequestIsCurrent(client, scope, phase, current.sourceTurnId))
+    if (!requestIsCurrent) return { valid: false as const }
     return { valid: true as const, value: await work(current.kind === "selected" ? current.sourceTurnId : undefined) }
   })
   if (fenced.kind === "superseded") return phase === "boundary"
@@ -42,6 +50,11 @@ export async function withReviewedApplicationSubmitRequestFence<T>(
   return fenced.value.valid ? { kind: "current", value: fenced.value.value,
     sourceTurnId: hinted.kind === "selected" ? hinted.sourceTurnId : null } : { kind: "invalid" }
 }
+
+/** Read-only pre-browser proof; request admission still uses the consumed/reserved marker fence. */
+export const withReviewedApplicationSubmitStopPollFence = <T>(client: PoolClient, scope: ApplicationSubmissionStartScope,
+  work: (sourceTurnId?: string) => Promise<T>): Promise<ProofResult<T>> =>
+  withReviewedApplicationSubmitFenceInternal(client, scope, "stop_poll", undefined, work)
 
 export async function readSubmissionTurnState(client: PoolClient, scope: ApplicationSubmissionStartScope): Promise<{
   readonly sessionStatus: string | undefined
@@ -141,6 +154,62 @@ async function reviewedRequestIsCurrent(
     currentSource: true,
   })
   return proof?.artifactHash === approval.resourceHash
+}
+
+async function reviewedStopPollIsCurrent(client: PoolClient, scope: ApplicationSubmissionStartScope, sourceTurnId: string): Promise<boolean> {
+  if (scope.turnId !== scope.fillTurnId) return false
+  const attempts = await client.query<{ state: string }>(`SELECT "state" FROM "submission_attempt" WHERE "receiptId"=$1 LIMIT 2 FOR UPDATE`, [scope.approvalId])
+  if (attempts.rows.length === 1 && attempts.rows[0]?.state === "reserved") return reviewedRequestIsCurrent(client, scope, "marker", sourceTurnId)
+  if (attempts.rows.length !== 0) return false
+  const tasks = await client.query<{ status: string; checkpoint: string; workerTaskId: string | null; resumeId: string | null; coverLetterId: string | null }>(
+    `SELECT "status","checkpoint","workerTaskId","resumeId","coverLetterId" FROM "application_tasks"
+      WHERE "id"=$1 AND "userId"=$2 AND "jobId"=$3 AND "sessionId"=$4 AND "fillTurnId"=$5 LIMIT 2 FOR UPDATE`,
+    [scope.applicationTaskId, scope.userId, scope.jobId, scope.sessionId, scope.fillTurnId])
+  if (tasks.rows.length !== 1 || tasks.rows[0]?.status !== "filling" || tasks.rows[0]?.checkpoint !== "browser_active"
+    || tasks.rows[0]?.workerTaskId !== scope.workerTaskId) return false
+  const [reservations, starts, stages] = await Promise.all([
+    client.query(`SELECT "id" FROM "agent_action_reservations" WHERE "approvalId"=$1 LIMIT 2 FOR UPDATE`, [scope.approvalId]),
+    client.query(`SELECT "id" FROM "application_task_events" WHERE "taskId"=$1 AND "type"='submission_execution_started'
+      AND "actor"='worker' AND "data"->>'approvalId'=$2 LIMIT 2`, [scope.applicationTaskId, scope.approvalId]),
+    client.query(`SELECT "id" FROM "application_task_events" WHERE "taskId"=$1 AND "type"='submission_stop_protocol'
+      AND "data"->>'approvalId'=$2 LIMIT 2`, [scope.applicationTaskId, scope.approvalId]),
+  ])
+  if (reservations.rows.length || starts.rows.length || stages.rows.length) return false
+  const approvals = await client.query<StopPollApprovalRow>(`SELECT "id","userId","sessionId","turnId","taskId","jobId","toolCallId","type","status",
+      "payload","resourceHash","materialHash","answersHash","scopeHash","nonceHash","revision","expiresAt","decidedAt","consumedAt"
+    FROM "agent_approvals" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3 LIMIT 2 FOR UPDATE`, [scope.approvalId, scope.userId, scope.sessionId])
+  const approval = approvals.rows[0]
+  if (approvals.rows.length !== 1 || !approval || !await validApprovedStopPollReceipt(approval, scope, tasks.rows[0]!)) return false
+  const requests = await client.query<{ payload: unknown }>(`SELECT request."payload" FROM "agent_events" AS request WHERE request."sessionId"=$1 AND request."turnId"=$2
+    AND request."type"='approval.requested' AND request."actor"='orchestrator' AND request."taskId"=$5
+    AND request."correlationId"=$3 AND request."idempotencyKey"=$4
+    AND NOT EXISTS (SELECT 1 FROM "agent_events" AS revision WHERE revision."sessionId"=$1 AND revision."type"='goal.revision'
+      AND revision."sequence">request."sequence") LIMIT 2`, [scope.sessionId, scope.fillTurnId, scope.approvalId, `approval:${scope.approvalId}:requested`, scope.applicationTaskId])
+  if (requests.rows.length !== 1) return false
+  const requestPayload = record(requests.rows[0]?.payload)
+  if (!requestPayload || Object.keys(requestPayload).sort().join(",") !== "action,approvalId,revision,scopeHash"
+    || requestPayload.action !== "submit_application" || requestPayload.approvalId !== scope.approvalId
+    || requestPayload.scopeHash !== approval.scopeHash || requestPayload.revision !== approval.revision) return false
+  const proof = await readReviewedApplicationSubmitMaterial({ client, identity: scope, sourceTurnId,
+    approval: { resourceHash: approval.resourceHash!, materialHash: approval.materialHash!, answersHash: approval.answersHash! }, currentSource: true })
+  return proof?.artifactHash === approval.resourceHash
+}
+
+async function validApprovedStopPollReceipt(row: StopPollApprovalRow, scope: ApplicationSubmissionStartScope,
+  task: { resumeId: string | null; coverLetterId: string | null }): Promise<boolean> {
+  const payload = record(row.payload), keys = payload ? Object.keys(payload).sort().join(",") : ""
+  const expiry = date(row.expiresAt), decided = date(row.decidedAt)
+  if (row.id !== `application-fill:${scope.applicationTaskId}:${scope.fillTurnId}` || row.userId !== scope.userId
+    || row.sessionId !== scope.sessionId || row.turnId !== scope.fillTurnId || row.taskId !== scope.applicationTaskId || row.jobId !== scope.jobId
+    || row.toolCallId !== `application-submit:${scope.applicationTaskId}` || row.type !== "submit_application" || row.status !== "approved"
+    || row.scopeHash !== scope.constraintHash || !digest(row.resourceHash) || !digest(row.materialHash) || !digest(row.answersHash)
+    || !digest(row.nonceHash) || !Number.isSafeInteger(row.revision) || row.revision < 0 || !expiry || expiry <= new Date()
+    || !decided || decided > expiry || row.consumedAt !== null || keys !== "applicationTaskId,coverLetterId,jobId,resumeId"
+    || payload?.applicationTaskId !== scope.applicationTaskId || payload.jobId !== scope.jobId
+    || payload.resumeId !== task.resumeId || payload.coverLetterId !== task.coverLetterId) return false
+  return await hashApprovalScope({ userId: row.userId, sessionId: row.sessionId, turnId: row.turnId!, jobId: row.jobId!,
+    toolCallId: row.toolCallId!, action: "submit_application", resourceHash: row.resourceHash!, materialHash: row.materialHash!,
+    answersHash: row.answersHash!, revision: row.revision, nonceHash: row.nonceHash, expiresAt: expiry.toISOString() }) === row.scopeHash
 }
 
 function validConsumedApproval(row: ApprovalRow, scope: ApplicationSubmissionStartScope): boolean {

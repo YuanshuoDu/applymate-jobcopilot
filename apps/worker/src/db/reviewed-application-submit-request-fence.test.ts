@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
+import { hashApprovalScope } from "@jobcopilot/agent-protocol"
 
 const mocks = vi.hoisted(() => ({
   withExactAttemptFence: vi.fn(),
@@ -13,7 +14,7 @@ vi.mock("./reviewed-application-submit-material.js", () => ({
   readReviewedApplicationSubmitMaterial: mocks.readReviewedApplicationSubmitMaterial,
 }))
 
-import { readSubmissionTurnState, readSubmissionTurnStopState, withReviewedApplicationSubmitRequestFence } from "./reviewed-application-submit-request-fence.js"
+import { readSubmissionTurnState, readSubmissionTurnStopState, withReviewedApplicationSubmitRequestFence, withReviewedApplicationSubmitStopPollFence } from "./reviewed-application-submit-request-fence.js"
 
 const scope = {
   userId: "user_1", sessionId: "session_1", turnId: "turn_1", fillTurnId: "turn_1", applicationTaskId: "task_1",
@@ -39,8 +40,8 @@ const startEvent = {
 }
 
 function fixture(options: {
-  phase?: "marker" | "boundary"; inputs?: unknown[]; taskCheckpoint?: string; taskWorkerTaskId?: string | null; attempt?: typeof attempt | null;
-  approval?: typeof approval | null; event?: unknown; proof?: unknown;
+  phase?: "marker" | "boundary" | "stop_poll"; inputs?: unknown[]; taskCheckpoint?: string; taskWorkerTaskId?: string | null; attempt?: typeof attempt | null;
+  approval?: Record<string, unknown> | null; event?: unknown; actionReservation?: boolean; startMarker?: boolean; stopStage?: boolean; requestPayload?: unknown;
 } = {}) {
   const phase = options.phase ?? "marker", inputs = options.inputs ?? [source(), source()]
   const boundaryEvent = options.event === undefined ? (phase === "marker" ? null : startEvent) : options.event
@@ -52,10 +53,21 @@ function fixture(options: {
       const input = inputs[Math.min(sourceReads++, inputs.length - 1)]
       return { rows: [{ input }], rowCount: 1 }
     }
-    if (sql.includes('FROM "application_tasks"')) return { rows: [{ status: "filling", checkpoint: options.taskCheckpoint ?? (phase === "marker" ? "browser_active" : "submission_request_started"), workerTaskId: options.taskWorkerTaskId ?? scope.workerTaskId }], rowCount: 1 }
-    if (sql.includes('FROM "submission_attempt"')) return { rows: options.attempt === null ? [] : [options.attempt ?? attempt], rowCount: options.attempt === null ? 0 : 1 }
+    if (sql.includes('FROM "application_tasks"')) return { rows: [{ status: "filling", checkpoint: options.taskCheckpoint ?? (phase === "boundary" ? "submission_request_started" : "browser_active"), workerTaskId: options.taskWorkerTaskId ?? scope.workerTaskId, resumeId: "resume_1", coverLetterId: null }], rowCount: 1 }
+    if (sql.includes('FROM "submission_attempt"')) {
+      const rows = options.attempt === null || phase === "stop_poll" && options.attempt === undefined ? [] : [options.attempt ?? attempt]
+      return { rows, rowCount: rows.length }
+    }
+    if (sql.includes('FROM "agent_action_reservations"')) return { rows: options.actionReservation ? [{ id: "reservation-1" }] : [], rowCount: options.actionReservation ? 1 : 0 }
     if (sql.includes('FROM "agent_approvals"')) return { rows: options.approval === null ? [] : [options.approval ?? approval], rowCount: options.approval === null ? 0 : 1 }
+    if (sql.includes('FROM "agent_events"')) return { rows: [{ payload: options.requestPayload ?? {
+      action: "submit_application", approvalId: scope.approvalId, scopeHash: scope.constraintHash, revision: 4,
+    } }], rowCount: 1 }
     if (sql.includes('FROM "application_task_events"')) {
+      if (phase === "stop_poll") {
+        const present = sql.includes("submission_execution_started") ? options.startMarker : options.stopStage
+        return { rows: present ? [{ id: "event-1" }] : [], rowCount: present ? 1 : 0 }
+      }
       const event = boundaryEvent && (!sql.includes("data\"->>'approvalId'") || (boundaryEvent as Record<string, unknown>).approvalId === values?.[1])
         ? boundaryEvent : null
       return { rows: event === null ? [] : [{ data: event }], rowCount: event === null ? 0 : 1 }
@@ -64,6 +76,18 @@ function fixture(options: {
   })
   const client = { query } as never
   return { client, calls }
+}
+
+async function approvedStopPollFixture(): Promise<{ readonly scope: typeof scope; readonly approval: Record<string, unknown>; readonly requestPayload: Record<string, unknown> }> {
+  const nonceHash = "e".repeat(64), expiresAt = new Date("2099-12-01T00:00:00.000Z"), revision = 4
+  const approvalId = `application-fill:${scope.applicationTaskId}:${scope.fillTurnId}`
+  const reviewedScope = { ...scope, approvalId, constraintHash: await hashApprovalScope({ userId: scope.userId, sessionId: scope.sessionId,
+    turnId: scope.fillTurnId, jobId: scope.jobId, toolCallId: `application-submit:${scope.applicationTaskId}`, action: "submit_application" as const,
+    resourceHash, materialHash, answersHash, revision, nonceHash, expiresAt: expiresAt.toISOString() }) }
+  return { scope: reviewedScope, approval: { ...approval, id: approvalId, status: "approved", scopeHash: reviewedScope.constraintHash, nonceHash, revision,
+    expiresAt, decidedAt: new Date("2099-11-20T00:00:00.000Z"), consumedAt: null }, requestPayload: {
+      action: "submit_application", approvalId, scopeHash: reviewedScope.constraintHash, revision,
+    } }
 }
 
 function resetMocks() {
@@ -139,6 +163,45 @@ describe("reviewed application submit request source fence", () => {
     expect(mocks.readReviewedApplicationSubmitMaterial).toHaveBeenCalledWith(expect.objectContaining({ currentSource: true, sourceTurnId: "source-turn-1" }))
   })
 
+  it("admits only the exact approved, unreserved reviewed request to the read-only Stop poll", async () => {
+    resetMocks()
+    const approved = await approvedStopPollFixture(), test = fixture({ phase: "stop_poll", approval: approved.approval, requestPayload: approved.requestPayload })
+    await expect(withReviewedApplicationSubmitStopPollFence(test.client, approved.scope, async sourceTurnId => sourceTurnId)).resolves.toEqual({
+      kind: "current", value: "source-turn-1", sourceTurnId: "source-turn-1",
+    })
+    expect(mocks.acquireSourceMaterialFence).toHaveBeenCalledWith(test.client, [approved.scope.userId])
+    expect(mocks.readReviewedApplicationSubmitMaterial).toHaveBeenCalledWith({ client: test.client, identity: approved.scope,
+      sourceTurnId: "source-turn-1", approval: { resourceHash, materialHash, answersHash }, currentSource: true })
+    expect(test.calls.some(call => call.sql.includes('FROM "agent_action_reservations"'))).toBe(true)
+    expect(test.calls.some(call => call.sql.includes("submission_execution_started"))).toBe(true)
+    expect(test.calls.some(call => call.sql.includes("submission_stop_protocol"))).toBe(true)
+    expect(test.calls.find(call => call.sql.includes('FROM "agent_events"'))?.sql).toContain("goal.revision")
+  })
+
+  it("keeps a consumed reserved attempt on the original strict marker proof during polling", async () => {
+    resetMocks()
+    const test = fixture({ phase: "stop_poll", attempt })
+    await expect(withReviewedApplicationSubmitStopPollFence(test.client, scope, async sourceTurnId => sourceTurnId))
+      .resolves.toMatchObject({ kind: "current", value: "source-turn-1" })
+    expect(test.calls.some(call => call.sql.includes('FROM "submission_attempt"') && call.sql.includes("FOR UPDATE"))).toBe(true)
+    expect(test.calls.find(call => call.sql.includes('FROM "agent_approvals"'))?.sql).toContain("FOR UPDATE")
+    expect(mocks.readReviewedApplicationSubmitMaterial).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ["expired approval", (row: Record<string, unknown>) => ({ ...row, expiresAt: new Date("2000-01-01T00:00:00.000Z") }), {}],
+    ["wrong consumer", (row: Record<string, unknown>) => ({ ...row, toolCallId: "another-consumer" }), {}],
+    ["wrong scope hash", (row: Record<string, unknown>) => ({ ...row, scopeHash: "f".repeat(64) }), {}],
+    ["partially reserved approval", (row: Record<string, unknown>) => row, { actionReservation: true }],
+    ["request marker already present", (row: Record<string, unknown>) => row, { startMarker: true }],
+  ] as const)("rejects %s before Stop polling", async (_name, change, options) => {
+    resetMocks()
+    const approved = await approvedStopPollFixture()
+    const test = fixture({ phase: "stop_poll", approval: change(approved.approval), requestPayload: approved.requestPayload, ...options })
+    await expect(withReviewedApplicationSubmitStopPollFence(test.client, approved.scope, async () => false)).resolves.toEqual({ kind: "invalid" })
+    expect(mocks.readReviewedApplicationSubmitMaterial).not.toHaveBeenCalled()
+  })
+
   it("retains the valid legacy path when no reviewed selector exists", async () => {
     resetMocks()
     const { client } = fixture({ inputs: [{}, {}] })
@@ -148,6 +211,13 @@ describe("reviewed application submit request source fence", () => {
 
     expect(mocks.acquireSourceMaterialFence).toHaveBeenCalledWith(client, [scope.userId])
     expect(mocks.hasReviewedSubmissionArtifact).toHaveBeenCalledWith(client, scope)
+    expect(mocks.readReviewedApplicationSubmitMaterial).not.toHaveBeenCalled()
+
+    resetMocks()
+    const legacyPoll = fixture({ phase: "stop_poll", inputs: [{}, {}] })
+    await expect(withReviewedApplicationSubmitStopPollFence(legacyPoll.client, scope, async () => "legacy-poll"))
+      .resolves.toMatchObject({ kind: "current", value: "legacy-poll", sourceTurnId: null })
+    expect(mocks.hasReviewedSubmissionArtifact).toHaveBeenCalledWith(legacyPoll.client, scope)
     expect(mocks.readReviewedApplicationSubmitMaterial).not.toHaveBeenCalled()
   })
 
