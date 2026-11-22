@@ -182,10 +182,12 @@ async function reviewedStopPollIsCurrent(client: PoolClient, scope: ApplicationS
       AND "type"='approval.receipt_rotated' AND "sequence">$4 AND ("correlationId"=$3 OR "payload"->>'approvalId'=$3) ORDER BY "sequence" DESC LIMIT 1`,
     [scope.sessionId, scope.fillTurnId, scope.approvalId, requests.rows[0]!.sequence])
   const rotation = rotations.rows[0], rotationPayload = record(rotation?.payload)
+  // Web may redact payload approvalId; the exact event routing fields remain authoritative.
   if (rotation ? rotation.actor !== "system" || rotation.taskId !== scope.applicationTaskId || rotation.correlationId !== scope.approvalId
     || rotation.idempotencyKey !== `approval:${scope.approvalId}:receipt-rotated:${approval.scopeHash}` || !rotationPayload
     || Object.keys(rotationPayload).sort().join(",") !== "approvalId,revision,scopeHash"
-    || rotationPayload.approvalId !== scope.approvalId || rotationPayload.scopeHash !== approval.scopeHash || rotationPayload.revision !== approval.revision
+    || (rotationPayload.approvalId !== scope.approvalId && rotationPayload.approvalId !== "[REDACTED]")
+    || rotationPayload.scopeHash !== approval.scopeHash || rotationPayload.revision !== approval.revision
     : originalScopeHash !== approval.scopeHash) return false
   const proof = await readReviewedApplicationSubmitMaterial({ client, identity: scope, sourceTurnId,
     approval: { resourceHash: approval.resourceHash!, materialHash: approval.materialHash!, answersHash: approval.answersHash! }, currentSource: true })

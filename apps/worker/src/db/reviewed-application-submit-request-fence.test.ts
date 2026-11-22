@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import { hashApprovalScope } from "@jobcopilot/agent-protocol"
+import { redactAgentEvent } from "@jobcopilot/shared"
 
 const mocks = vi.hoisted(() => ({
   withExactAttemptFence: vi.fn(),
@@ -100,6 +101,15 @@ function rotationEvent(submissionScope: typeof scope, overrides: Record<string, 
   return { actor: "system", taskId: submissionScope.applicationTaskId, correlationId: submissionScope.approvalId,
     idempotencyKey: `approval:${submissionScope.approvalId}:receipt-rotated:${submissionScope.constraintHash}`,
     payload: { approvalId: submissionScope.approvalId, scopeHash: submissionScope.constraintHash, revision: 4 }, sequence: "2", ...overrides }
+}
+
+function productionRotationPayload(submissionScope: typeof scope) {
+  return redactAgentEvent({ type: "approval.receipt_rotated", body: "", data: {
+    approvalId: submissionScope.approvalId, scopeHash: submissionScope.constraintHash, revision: 4,
+  }, routing: { sessionId: submissionScope.sessionId, turnId: submissionScope.fillTurnId,
+    itemId: `agent-wait:approval:${submissionScope.approvalId}`,
+    taskId: submissionScope.applicationTaskId, actor: "system", correlationId: submissionScope.approvalId,
+    causationId: null, outboxTopic: "agent.session.event" } }).data
 }
 
 function resetMocks() {
@@ -208,10 +218,26 @@ describe("reviewed application submit request source fence", () => {
     expect(query?.sql).toContain('ORDER BY "sequence" DESC LIMIT 1')
   })
 
+  it("accepts the canonical approvalId redaction produced by the real event router", async () => {
+    resetMocks()
+    const approved = await approvedStopPollFixture(), priorScopeHash = "f".repeat(64)
+    const payload = productionRotationPayload(approved.scope)
+    const redacted = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : null
+    expect({ marker: redacted?.approvalId === "[REDACTED]", scopeHashPreserved: redacted?.scopeHash === approved.scope.constraintHash,
+      revisionPreserved: redacted?.revision === 4, closedKeys: Object.keys(redacted ?? {}).sort().join(",") })
+      .toEqual({ marker: true, scopeHashPreserved: true, revisionPreserved: true, closedKeys: "approvalId,revision,scopeHash" })
+    const test = fixture({ phase: "stop_poll", approval: approved.approval,
+      requestPayload: { ...approved.requestPayload, scopeHash: priorScopeHash }, rotations: [rotationEvent(approved.scope, { payload })] })
+    await expect(withReviewedApplicationSubmitStopPollFence(test.client, approved.scope, async sourceTurnId => sourceTurnId)).resolves.toEqual({
+      kind: "current", value: "source-turn-1", sourceTurnId: "source-turn-1",
+    })
+  })
+
   it.each([
     ["missing rotation for changed hash", "missing"],
     ["stale rotation", "stale"],
     ["malformed rotation", "malformed"],
+    ["different literal approval id", "differentId"],
     ["foreign rotation", "foreign"],
     ["superseded by malformed latest rotation", "latest"],
     ["rotation predating the request", "predates"],
@@ -226,9 +252,25 @@ describe("reviewed application submit request source fence", () => {
         payload: { approvalId: approved.scope.approvalId, scopeHash: priorScopeHash, revision: 4 },
       })]
       : kind === "malformed" ? [rotationEvent(approved.scope, { payload: { ...exact.payload, unexpected: true } })]
+      : kind === "differentId" ? [rotationEvent(approved.scope, { payload: { ...exact.payload, approvalId: "different-approval" } })]
       : kind === "foreign" ? [rotationEvent(approved.scope, { taskId: "another-task" })]
       : [exact, rotationEvent(approved.scope, { sequence: "3", idempotencyKey: "wrong-key" })]
     const test = fixture({ phase: "stop_poll", approval: approved.approval, requestPayload, rotations })
+    await expect(withReviewedApplicationSubmitStopPollFence(test.client, approved.scope, async () => false)).resolves.toEqual({ kind: "invalid" })
+    expect(mocks.readReviewedApplicationSubmitMaterial).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ["foreign task", { taskId: "another-task" }],
+    ["foreign correlation", { correlationId: "another-approval" }],
+    ["wrong actor", { actor: "orchestrator" }],
+    ["wrong idempotency key", { idempotencyKey: "other-rotation" }],
+  ])("rejects the real redacted rotation with %s routing", async (_name, override) => {
+    resetMocks()
+    const approved = await approvedStopPollFixture(), priorScopeHash = "f".repeat(64)
+    const payload = productionRotationPayload(approved.scope)
+    const test = fixture({ phase: "stop_poll", approval: approved.approval,
+      requestPayload: { ...approved.requestPayload, scopeHash: priorScopeHash }, rotations: [rotationEvent(approved.scope, { ...override, payload })] })
     await expect(withReviewedApplicationSubmitStopPollFence(test.client, approved.scope, async () => false)).resolves.toEqual({ kind: "invalid" })
     expect(mocks.readReviewedApplicationSubmitMaterial).not.toHaveBeenCalled()
   })
