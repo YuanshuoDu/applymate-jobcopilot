@@ -12,6 +12,7 @@ export function createCorrectionWriterRestartModel(input) {
     id: "p3-correction-writer-restart-model",
     profile: modelProfile(),
     async *stream(request) {
+      say(`P3_CORRECTION_WRITER_MODEL_ENTERED attempt=${task.attemptCount}`)
       const hasReviewFrame = JSON.stringify(request.messages).includes("agent-harness.v2.writer-review-feedback")
       observations.reviewFeedbackIncluded = hasReviewFrame
       if (!hasReviewFrame) throw new Error("p3_correction_writer_review_feedback_missing")
@@ -40,6 +41,7 @@ export function createCorrectionWriterRestartModel(input) {
         throw new Error("p3_correction_writer_prior_draft_receipt_missing")
       }
       draftEmitted = true
+      say(`P3_CORRECTION_WRITER_DRAFT_EMITTED attempt=${task.attemptCount}`)
       yield { type: "tool_call_completed", callId, name: "cover_letter.draft", arguments: draftInput }
       yield { type: "completed", finishReason: "tool_calls" }
     },

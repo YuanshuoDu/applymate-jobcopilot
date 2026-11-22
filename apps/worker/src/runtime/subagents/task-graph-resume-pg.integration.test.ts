@@ -5348,6 +5348,64 @@ async function waitForProcessLine(child: ProcessFixtureChild, prefix: string, ti
   throw new Error("Timed out waiting for " + prefix + "; " + processFixtureDiagnostics(child))
 }
 
+async function correctionWriterReceiptTimeoutDiagnostics(input: {
+  pool: Pool; worker: ProcessFixtureChild; userId: string; sessionId: string; turnId: string; rootTaskId: string
+  taskId: string; jobId: string; ownerId: string; toolCallId: string; artifactId: string; sourceDigest: string; previousHash: string
+}): Promise<string> {
+  const modelEntered = input.worker.output.includes("P3_CORRECTION_WRITER_MODEL_ENTERED attempt=1")
+  const draftEmitted = input.worker.output.includes("P3_CORRECTION_WRITER_DRAFT_EMITTED attempt=1")
+  let client: PoolClient | undefined
+  try {
+    client = await input.pool.connect()
+    await client.query("BEGIN READ ONLY")
+    await client.query("SET LOCAL statement_timeout = '2000ms'")
+    const task = await client.query<{ status: string; attemptCount: number; ownerMatches: boolean; leaseActive: boolean }>(
+      `SELECT task."status", task."attemptCount", task."leaseOwner" = $7 AS "ownerMatches", task."leaseExpiresAt" > NOW() AS "leaseActive"
+       FROM "sub_agent_tasks" AS task
+       JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $2
+       JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+         AND turn."rootTaskId" = task."rootTaskId"
+       WHERE task."id" = $1 AND task."sessionId" = $3 AND task."turnId" = $4
+         AND task."rootTaskId" = $5 AND task."parentTaskId" = $5
+         AND task."context"->'selectedJobPreparation'->>'jobId' = $6`,
+      [input.taskId, input.userId, input.sessionId, input.turnId, input.rootTaskId, input.jobId, input.ownerId])
+    const receipts = await client.query<{ draftCall: boolean; draftResult: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM "agent_items" item JOIN "agent_steps" step
+          ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
+        WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND step."attempt" = 1
+          AND item."type" = 'tool_call' AND item."content"->>'toolCallId' = $4 AND item."content"->>'toolName' = 'cover_letter.draft') AS "draftCall",
+       EXISTS (SELECT 1 FROM "agent_items" item JOIN "agent_steps" step
+          ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
+        WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND step."attempt" = 1
+          AND item."type" = 'tool_result' AND item."content"->>'toolCallId' = $4 AND item."content"->>'errorCode' IS NULL
+          AND item."content"->'output'->'artifactRef'->>'artifactId' = $5
+          AND item."content"->'output'->'artifactRef'->>'version' = '2'
+          AND item."content"->'output'->'artifactRef'->>'sourceDigest' = $6) AS "draftResult"`,
+      [input.sessionId, input.turnId, input.taskId, input.toolCallId, input.artifactId, input.sourceDigest])
+    const artifact = await client.query<{ present: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM "agent_artifact_version" WHERE "userId" = $1 AND "sessionId" = $2 AND "jobId" = $3
+        AND "taskId" = $4 AND "toolCallId" = $5 AND "artifactId" = $6 AND "version" = 2
+        AND "sourceDigest" = $7 AND "previousHash" = $8) AS "present"`,
+      [input.userId, input.sessionId, input.jobId, input.taskId, input.toolCallId, input.artifactId, input.sourceDigest, input.previousHash])
+    await client.query("COMMIT")
+    const row = task.rows[0]
+    const allowedStatuses = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
+    const taskStatus = row && allowedStatuses.has(row.status) ? row.status : "missing_or_unknown"
+    const attemptCount = row && Number.isSafeInteger(row.attemptCount) && row.attemptCount >= 0 && row.attemptCount <= 3
+      ? String(row.attemptCount) : "unknown"
+    const bool = (value: unknown) => value === true ? "true" : "false"
+    const claimActive = taskStatus === "running" && row?.ownerMatches === true && row.leaseActive === true
+    return `taskStatus=${taskStatus} attemptCount=${attemptCount} ownerMatches=${bool(row?.ownerMatches)} leaseActive=${bool(row?.leaseActive)} claimActive=${bool(claimActive)} `
+      + `draftCall=${bool(receipts.rows[0]?.draftCall)} draftResult=${bool(receipts.rows[0]?.draftResult)} artifactVersion=${bool(artifact.rows[0]?.present)} `
+      + `modelEntered=${bool(modelEntered)} draftEmitted=${bool(draftEmitted)}`
+  } catch {
+    await client?.query("ROLLBACK").catch(() => undefined)
+    return `diagnostic=unavailable modelEntered=${modelEntered} draftEmitted=${draftEmitted}`
+  } finally {
+    client?.release()
+  }
+}
+
 function waitForProcessExit(child: ProcessFixtureChild, timeoutMs = 10_000): Promise<void> {
   return new Promise((resolve, reject) => {
     let timer: NodeJS.Timeout | undefined
@@ -10841,7 +10899,17 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const firstDelivery = await waitForProcessLine(workerOne,
         `P3_CORRECTION_WRITER_BULL_DELIVERY ${plan.correctionWriter.id} 0 `, 30_000)
       expect(firstDelivery).toBe(`P3_CORRECTION_WRITER_BULL_DELIVERY ${plan.correctionWriter.id} 0 ${workerOne.pid}`)
-      await waitForProcessLine(workerOne, `P3_CORRECTION_WRITER_RECEIPT_COMMITTED ${plan.correctionWriter.id} 1`, 30_000)
+      try {
+        await waitForProcessLine(workerOne, `P3_CORRECTION_WRITER_RECEIPT_COMMITTED ${plan.correctionWriter.id} 1`, 30_000)
+      } catch {
+        const progress = await correctionWriterReceiptTimeoutDiagnostics({
+          pool: pool!, worker: workerOne, userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+          rootTaskId: plan.rootTaskId, taskId: plan.correctionWriter.id, jobId: plan.jobId, ownerId: dispatchOwnerId,
+          toolCallId: plan.correctionDraftCallId, artifactId: plan.expectedArtifactId, sourceDigest: plan.sourceDigest,
+          previousHash: plan.predecessor.contentHash,
+        })
+        throw new Error("Correction Writer receipt barrier missed; " + progress)
+      }
 
       const firstAttempt = await pool!.query<{ status: string; attemptCount: number; leaseOwner: string | null; leaseExpiresAt: Date | null }>(
         `SELECT "status", "attemptCount", "leaseOwner", "leaseExpiresAt" FROM "sub_agent_tasks"
