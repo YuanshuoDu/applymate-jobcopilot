@@ -13770,6 +13770,29 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const reference = record(record(discoveryPair?.result.content)?.output)
       const refId = typeof reference?.$ref === "string" ? reference.$ref : ""
       const readPairs = pairs.filter(pair => record(pair.call.content)?.toolName === "tool_results.read")
+      const readStepIds = [...new Set(readPairs.map(pair => pair.call.stepId))]
+      const attemptSteps = await pool!.query<{
+        id: string; status: string; attempt: number; modelStartedCount: number; modelSettledCount: number
+      }>(`SELECT step."id", step."status", step."attempt",
+                 COUNT(DISTINCT started."id")::int AS "modelStartedCount",
+                 COUNT(DISTINCT settled."id")::int AS "modelSettledCount"
+          FROM "agent_steps" AS step
+          JOIN "agent_sessions" AS session ON session."id" = step."sessionId" AND session."userId" = $1
+          LEFT JOIN "agent_events" AS started ON started."sessionId" = step."sessionId"
+            AND started."turnId" = step."turnId" AND started."taskId" = step."taskId"
+            AND started."correlationId" = step."id" AND started."type" = 'model.started'
+          LEFT JOIN "agent_events" AS settled ON settled."sessionId" = step."sessionId"
+            AND settled."turnId" = step."turnId" AND settled."taskId" = step."taskId"
+            AND settled."correlationId" = step."id" AND settled."type" IN ('model.completed', 'model.failed')
+          WHERE step."sessionId" = $2 AND step."turnId" = $3 AND step."taskId" = $4
+            AND step."attempt" = 1
+          GROUP BY step."id", step."status", step."attempt"`,
+      [value.userId, value.sessionId, value.turnId, taskId])
+      const closedSteps = attemptSteps.rows.filter(step => step.status === "completed"
+        && step.modelStartedCount === 1 && step.modelSettledCount === 1)
+      const readStepsClosed = readStepIds.length > 0 && readStepIds.every(id => closedSteps.some(step => step.id === id))
+      const attemptStepsClosed = attemptSteps.rows.length > 0 && closedSteps.length === attemptSteps.rows.length
+      const noUnmatchedModelStarted = attemptSteps.rows.every(step => step.modelStartedCount === step.modelSettledCount)
       const sizeBytes = typeof reference?.sizeBytes === "number" ? reference.sizeBytes : 0
       const sha256 = typeof reference?.sha256 === "string" ? reference.sha256 : ""
       const chunks = readPairs.map(pair => {
@@ -13828,6 +13851,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         valid: calls.length === pairs.length && results.length === calls.length
           && new Set(calls.map(call => record(call.content)?.toolCallId)).size === calls.length
           && calls.every(call => call.status === "completed") && results.every(result => result.status === "completed")
+          && readStepsClosed && attemptStepsClosed && noUnmatchedModelStarted
           && [...calls, ...results].every(item => item.stepTaskId === taskId && item.stepAttempt === 1 && item.stepId.length > 0)
           && pairs.every(pair => pair.call.stepId === pair.result.stepId && pair.call.stepAttempt === pair.result.stepAttempt)
           && discoveryCalls.length === 1 && refRows.rows.length === 1 && Boolean(discoveryCall)
@@ -13847,7 +13871,57 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           && usage.estimatedCostUsd === 0 && usage.durationMs === 1,
         reference: { ref: refId, sizeBytes, sha256 },
         callCount: calls.length, readCallCount: readPairs.length, byteCount: bytes.length,
-        receiptFingerprint,
+        readStepsClosed, attemptStepsClosed, noUnmatchedModelStarted, receiptFingerprint,
+      }
+    }
+
+    const scoutHistoryFailureCheckpoint = async (taskId: string, rootTaskId: string) => {
+      try {
+        const checkpoint = await pool!.query<{
+          taskStatus: string; attemptCount: number; discoveryCallCount: number; readCallCount: number
+          completedReadResultCount: number; latestStepStatus: string | null; latestStepAttempt: number | null
+          unmatchedModelStartedCount: number
+        }>(`SELECT task."status" AS "taskStatus", task."attemptCount",
+                   (SELECT COUNT(*)::int FROM "agent_items" AS call
+                    JOIN "agent_steps" AS step ON step."id" = call."stepId" AND step."sessionId" = call."sessionId"
+                      AND step."turnId" = call."turnId" AND step."taskId" = call."taskId"
+                    WHERE call."sessionId" = task."sessionId" AND call."turnId" = task."turnId" AND call."taskId" = task."id"
+                      AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'jobs.discover' AND step."attempt" = 1) AS "discoveryCallCount",
+                   (SELECT COUNT(*)::int FROM "agent_items" AS call
+                    JOIN "agent_steps" AS step ON step."id" = call."stepId" AND step."sessionId" = call."sessionId"
+                      AND step."turnId" = call."turnId" AND step."taskId" = call."taskId"
+                    WHERE call."sessionId" = task."sessionId" AND call."turnId" = task."turnId" AND call."taskId" = task."id"
+                      AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'tool_results.read' AND step."attempt" = 1) AS "readCallCount",
+                   (SELECT COUNT(DISTINCT call."id")::int FROM "agent_items" AS call
+                    JOIN "agent_steps" AS step ON step."id" = call."stepId" AND step."sessionId" = call."sessionId"
+                      AND step."turnId" = call."turnId" AND step."taskId" = call."taskId"
+                    JOIN "agent_items" AS result ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
+                      AND result."taskId" = call."taskId" AND result."stepId" = call."stepId" AND result."type" = 'tool_result'
+                      AND result."content"->>'toolCallId' = call."content"->>'toolCallId' AND result."status" = 'completed'
+                    WHERE call."sessionId" = task."sessionId" AND call."turnId" = task."turnId" AND call."taskId" = task."id"
+                      AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'tool_results.read'
+                      AND call."status" = 'completed' AND step."attempt" = 1) AS "completedReadResultCount",
+                   (SELECT step."status" FROM "agent_steps" AS step WHERE step."sessionId" = task."sessionId"
+                    AND step."turnId" = task."turnId" AND step."taskId" = task."id" ORDER BY step."ordinal" DESC LIMIT 1) AS "latestStepStatus",
+                   (SELECT step."attempt" FROM "agent_steps" AS step WHERE step."sessionId" = task."sessionId"
+                    AND step."turnId" = task."turnId" AND step."taskId" = task."id" ORDER BY step."ordinal" DESC LIMIT 1) AS "latestStepAttempt",
+                   (SELECT COUNT(*)::int FROM "agent_events" AS started
+                    JOIN "agent_steps" AS step ON step."id" = started."correlationId" AND step."sessionId" = started."sessionId"
+                      AND step."turnId" = started."turnId" AND step."taskId" = started."taskId"
+                    WHERE started."sessionId" = task."sessionId" AND started."turnId" = task."turnId" AND started."taskId" = task."id"
+                      AND started."type" = 'model.started' AND step."attempt" = 1
+                      AND NOT EXISTS (SELECT 1 FROM "agent_events" AS settled WHERE settled."sessionId" = started."sessionId"
+                        AND settled."turnId" = started."turnId" AND settled."taskId" = started."taskId"
+                        AND settled."correlationId" = started."correlationId" AND settled."type" IN ('model.completed', 'model.failed')))
+                     AS "unmatchedModelStartedCount"
+            FROM "sub_agent_tasks" AS task
+            JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $1
+            WHERE task."sessionId" = $2 AND task."turnId" = $3 AND task."id" = $4
+              AND task."rootTaskId" = $5 AND task."role" = 'scout'`,
+        [value.userId, value.sessionId, value.turnId, taskId, rootTaskId])
+        return checkpoint.rows[0] ?? { snapshotAvailable: false }
+      } catch {
+        return { snapshotAvailable: false }
       }
     }
 
@@ -13972,17 +14046,25 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(dispatch.attemptCount).toBeGreaterThan(0)
 
       workerTwo = startTaskGraphRestartWorker("resume-discovery", {
-        ...value, jobId, paddingJobId, scoutHistoryWitness: true, pauseScoutHistoryAfterReads: true,
+        ...value, jobId, paddingJobId, scoutHistoryWitness: true, pauseScoutHistoryBeforeNextStep: true,
       }, restartWorkerEnv)
       await waitForProcessLine(workerTwo, "P3_DISCOVERY_SECOND_WORKER_READY ", 45_000)
-      const committedLine = await waitForProcessLine(workerTwo, "P3_DISCOVERY_SCOUT_HISTORY_COMMITTED ", 120_000)
+      let committedLine: string
+      try {
+        committedLine = await waitForProcessLine(workerTwo, "P3_DISCOVERY_SCOUT_HISTORY_COMMITTED ", 120_000)
+      } catch {
+        const checkpoint = await scoutHistoryFailureCheckpoint(scoutTaskIdForCleanup!, rootTaskId!)
+        throw new Error("Timed out waiting for Scout history barrier; safe checkpoint=" + JSON.stringify(checkpoint))
+      }
       const committed = record(JSON.parse(committedLine.slice("P3_DISCOVERY_SCOUT_HISTORY_COMMITTED ".length)))
-      expect(committed).toMatchObject({ attempt: 1, compactContext: true, rawHistoryAbsent: true })
-      expect(typeof committed?.modelMessageBytes === "number" && committed.modelMessageBytes < 64 * 1024).toBe(true)
+      expect(committed).toMatchObject({ attempt: 1, lastReadStepClosed: true })
       expect(typeof committed?.referenceBytes === "number" && committed.referenceBytes > 256 * 1024).toBe(true)
       expect(typeof committed?.readCalls === "number" && committed.readCalls > 50).toBe(true)
       const before = await collectHistory(scout.rows[0]!.id)
       expect(before.valid).toBe(true)
+      expect(before.readStepsClosed).toBe(true)
+      expect(before.attemptStepsClosed).toBe(true)
+      expect(before.noUnmatchedModelStarted).toBe(true)
       expect(before.byteCount).toBe(committed?.referenceBytes)
       expect(before.readCallCount).toBe(committed?.readCalls)
       const activeScout = await pool!.query<{ status: string; attemptCount: number; leaseExpiresAt: Date | null }>(

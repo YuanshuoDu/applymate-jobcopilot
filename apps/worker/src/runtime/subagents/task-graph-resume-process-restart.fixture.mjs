@@ -1950,8 +1950,31 @@ async function runDiscoverySecondWorker() {
   const historySupport = historyModule ? historyModule.createScoutHistoryRestartSupport({
     candidateJobId: ids.jobId, paddingJobId: ids.paddingJobId,
   }) : undefined
+  const historyTurnStoreModule = historySupport ? await import("../turns/turn-engine-store.ts") : undefined
+  const historyTurnStore = historyTurnStoreModule?.createPgTurnEngineStore(pool)
+  const finalReadBatchEmitted = new Map()
+  let historyBarrierUsed = false
+  const turnStore = historyTurnStore ? {
+    ...historyTurnStore,
+    async startStep(input) {
+      const taskId = input.owner.kind === "task" ? input.owner.taskId : undefined
+      const executionKey = taskId ? `${taskId}:${input.attempt}` : undefined
+      const finalReadBatch = executionKey ? finalReadBatchEmitted.get(executionKey) : undefined
+      if (!historyBarrierUsed && ids.pauseScoutHistoryBeforeNextStep === true && input.owner.kind === "task"
+        && input.attempt === 1 && finalReadBatch) {
+        historyBarrierUsed = true
+        say("P3_DISCOVERY_SCOUT_HISTORY_COMMITTED " + JSON.stringify({
+          attempt: 1, referenceBytes: finalReadBatch.referenceBytes, readCalls: finalReadBatch.readCalls,
+          lastReadStepClosed: true,
+        }))
+        await waitForCommand("continue-scout-history-next-step")
+      }
+      return historyTurnStore.startStep(input)
+    },
+  } : undefined
   const executeChild = createProductionChildExecutor({
     pool, authorizeUsage: async () => noReservationUsageAuthorization(),
+    ...(turnStore ? { turnStore } : {}),
     ...(historySupport ? { jobDiscoveryClient: historySupport.client } : {}),
     modelRuntimeFactory({ task }) {
       if (historySupport && task.role === "scout") {
@@ -2014,16 +2037,16 @@ async function runDiscoverySecondWorker() {
                 const readInput = { referenceId: reference.$ref, ...(cursor === undefined ? {} : { cursor }) }
                 yield toolCall(`${callPrefix}:read:${totalReadCalls++}:415-555-0134`, "tool_results.read", readInput)
               }
+              if (readBatchIndex === plan.cursorBatches.length) {
+                finalReadBatchEmitted.set(`${task.id}:${task.attemptCount}`, {
+                  referenceBytes: plan.sizeBytes, readCalls: totalReadCalls,
+                })
+              }
               yield { type: "completed", finishReason: "tool_calls" }; return
             }
+            if (ids.pauseScoutHistoryBeforeNextStep === true) throw new Error("p3_scout_history_pre_step_barrier_missing")
             const compact = projection(request, { ref: reference.$ref, sha256: reference.sha256, sizeBytes: reference.sizeBytes })
             if (!compact.compact) throw new Error("p3_scout_history_live_projection_missing")
-            say("P3_DISCOVERY_SCOUT_HISTORY_COMMITTED " + JSON.stringify({
-              attempt: 1, referenceBytes: plan.sizeBytes, readCalls: totalReadCalls,
-              compactContext: compact.compact, modelMessageBytes: compact.modelMessageBytes,
-              rawHistoryAbsent: compact.rawHistoryAbsent,
-            }))
-            if (ids.pauseScoutHistoryAfterReads === true) await waitForCommand("continue-scout-history-final")
             yield { type: "text_delta", text: JSON.stringify(completedScout()) }
             yield { type: "completed", finishReason: "stop" }; return
           }
