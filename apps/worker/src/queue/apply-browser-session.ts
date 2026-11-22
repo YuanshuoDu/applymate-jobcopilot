@@ -141,8 +141,8 @@ export async function runApplyBrowserSession(context: ApplyJobRunContext): Promi
         },
       } : {}),
     };
-    const runBrowserFlow = (typedSubmitGuard?: (intent?: SubmissionRequestIntent) => Promise<boolean>) =>
-      runApplyBrowserStrategy(context, page, applyTask, challengeAllowsAction, typedSubmitGuard);
+    const runBrowserFlow = (typedSubmitGuard?: (intent?: SubmissionRequestIntent) => Promise<boolean>, reviewedCoverLetter?: string) =>
+      runApplyBrowserStrategy(context, page, applyTask, challengeAllowsAction, typedSubmitGuard, reviewedCoverLetter);
     const harnessResult = await runApplySubmitStrategy(context, page, runBrowserFlow);
     if (state.queueCatchStarted || state.submissionSuperseded) return;
     await persistApplyJobOutcome(context, page, harnessResult);

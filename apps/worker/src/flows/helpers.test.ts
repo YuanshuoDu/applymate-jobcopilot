@@ -89,6 +89,26 @@ describe("submission authorization guard", () => {
     expect(guard).toHaveBeenCalledWith(intent);
   });
 
+  it("passes the exact submit locator used for intent resolution into the guard", async () => {
+    const click = vi.fn();
+    const submitter = {
+      count: vi.fn(async () => 1),
+      isVisible: vi.fn(async () => true),
+      evaluate: vi.fn(async () => ({ url: "https://apply.example.com/submit", method: "POST" })),
+      click,
+    };
+    const guard = vi.fn().mockResolvedValue(true);
+    const page = {
+      url: vi.fn(() => "https://apply.example.com/form"),
+      locator: vi.fn(() => ({ first: () => submitter })),
+      waitForLoadState: vi.fn().mockResolvedValue(undefined),
+    };
+
+    await expect(clickSubmit(page as never, ["button[type='submit']"], guard)).resolves.toEqual({ outcome: "submitted" });
+    expect(guard).toHaveBeenCalledWith({ url: "https://apply.example.com/submit", method: "POST" }, submitter);
+    expect(click).toHaveBeenCalledOnce();
+  });
+
   it("blocks when the runtime guard throws", async () => {
     await expect(assertSubmissionAuthorized(() => {
       throw new Error("revoked");

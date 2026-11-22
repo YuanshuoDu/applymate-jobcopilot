@@ -1,4 +1,4 @@
-import type { Page } from "playwright-core";
+import type { Locator, Page } from "playwright-core";
 import { formAnswerKeyForSelector, isAnswerableFormControl, isFormAnswerKeyV2 } from "../form-answer-key.js";
 import { readSubmissionRequestIntent, type SubmissionRequestIntent } from "./submission-intent.js";
 
@@ -154,7 +154,7 @@ export type SubmissionAuthorization =
   | { authorized: true }
   | { authorized: false; reason: SubmissionBlockedReason; message: string };
 
-export type SubmissionGuard = (intent?: SubmissionRequestIntent) => Promise<unknown> | unknown;
+export type SubmissionGuard = (intent?: SubmissionRequestIntent, submitter?: Locator) => Promise<unknown> | unknown;
 
 export type SubmitAttempt =
   | { outcome: "submitted" }
@@ -181,6 +181,7 @@ function blocked(
 export async function assertSubmissionAuthorized(
   beforeSubmit?: SubmissionGuard,
   intent?: SubmissionRequestIntent,
+  submitter?: Locator,
 ): Promise<SubmissionAuthorization> {
   if (!beforeSubmit) return blocked("missing_guard");
 
@@ -190,7 +191,7 @@ export async function assertSubmissionAuthorized(
       timeoutHandle = setTimeout(() => resolve(SUBMISSION_AUTH_TIMEOUT), SUBMISSION_AUTH_TIMEOUT_MS);
     });
     const result = await Promise.race([
-      Promise.resolve().then(() => beforeSubmit(intent)),
+      Promise.resolve().then(() => submitter ? beforeSubmit(intent, submitter) : beforeSubmit(intent)),
       timeout,
     ]);
     if (result === SUBMISSION_AUTH_TIMEOUT) return blocked("guard_timeout");
@@ -219,7 +220,7 @@ export async function clickSubmit(
         visibleWithoutIntent = true;
         continue;
       }
-      const authorization = await assertSubmissionAuthorized(beforeSubmit, intent);
+      const authorization = await assertSubmissionAuthorized(beforeSubmit, intent, button);
       if (authorization.authorized === false) {
         console.warn("[submission-guard] blocked", authorization.reason);
         return {
