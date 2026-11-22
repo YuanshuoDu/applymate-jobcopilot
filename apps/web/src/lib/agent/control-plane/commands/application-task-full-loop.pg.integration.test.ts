@@ -2608,8 +2608,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(await testDb.agentApproval.findUniqueOrThrow({
       where: { id: submitApproval.id }, select: { status: true },
     })).toEqual(approvalBeforeDuplicate)
-    expect((await requestFixtureStats()).submitCount).toBe(1)
     await waitForLegacyAckMarker(worker!, "LEGACY_ACK_BARRIER_REACHED attempt=1")
+    const legacyReceiverStats = await requestFixtureStats()
+    expect(legacyReceiverStats.submitCount).toBe(1)
     const heldAckJob = await applyQueue!.getJob(workerTaskId)
     expect(Boolean(heldAckJob)).toBe(true)
     expect(heldAckJob?.id === workerTaskId).toBe(true)
@@ -2634,6 +2635,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     if (!Object.values(uncertaintyChecks).every(Boolean)) {
       let exactStartReceiptCount: number | null = null
       let exactSettledReceiptCount: number | null = null
+      let exactExecutionPairCount: number | null = null
+      let requestStartedCheckpointStillPresent: boolean | null = null
       try {
         const executionReceipts = await testDb.applicationTaskEvent.findMany({ where: {
           taskId: gateTaskId, actor: "worker",
@@ -2641,6 +2644,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         }, select: { type: true, data: true } })
         let startCount = 0
         let settledCount = 0
+        const startExecutionIds = new Set<string>()
+        const settledExecutionIds = new Set<string>()
         for (const event of executionReceipts) {
           const data = jsonRecord(event.data)
           const exactIdentity = data !== null && typeof data.executionId === "string" && data.executionId.length > 0
@@ -2649,17 +2654,48 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
             && data.fillTurnId === successorTurnId && data.approvalId === submitApproval.id
             && data.constraintHash === intent.constraintHash
           if (!exactIdentity) continue
-          if (event.type === "submission_execution_started") startCount++
-          if (event.type === "submission_execution_settled") settledCount++
+          if (event.type === "submission_execution_started") {
+            startCount++
+            startExecutionIds.add(data.executionId as string)
+          }
+          if (event.type === "submission_execution_settled") {
+            settledCount++
+            settledExecutionIds.add(data.executionId as string)
+          }
         }
         exactStartReceiptCount = startCount
         exactSettledReceiptCount = settledCount
+        const pairedExecutionCount = [...startExecutionIds].filter(id => settledExecutionIds.has(id)).length
+        exactExecutionPairCount = Math.min(2, pairedExecutionCount)
+        const exactTaskIdentity = uncertaintyChecks.ownedRowPresent && uncertaintyChecks.fillTurnMatches
+          && uncertaintyChecks.workerTaskMatches
+        requestStartedCheckpointStillPresent = exactTaskIdentity && startCount === 1 && settledCount === 1
+          && pairedExecutionCount === 1 && uncertainBeforeKill?.checkpoint === "submission_request_started"
       } catch {
         exactStartReceiptCount = null
         exactSettledReceiptCount = null
+        exactExecutionPairCount = null
+        requestStartedCheckpointStillPresent = null
+      }
+      const taskOutcomeClass = !uncertainBeforeKill ? "row_missing"
+        : uncertainBeforeKill.status === "waiting_for_user" && uncertainBeforeKill.checkpoint === "submission_uncertain" ? "uncertain"
+        : uncertainBeforeKill.status === "submitted" && uncertainBeforeKill.checkpoint === "submission_verified" ? "verified_submitted"
+        : uncertainBeforeKill.status === "waiting_for_user" && uncertainBeforeKill.checkpoint === "user_takeover" ? "takeover_wait"
+        : uncertainBeforeKill.status === "failed" ? "terminal_failed"
+        : uncertainBeforeKill.status === "cancelled" && uncertainBeforeKill.checkpoint === "turn_stopped_before_submit" ? "stopped_before_submit"
+        : uncertainBeforeKill.status === "filling" && uncertainBeforeKill.checkpoint === "submission_request_started" ? "request_started"
+        : uncertainBeforeKill.status === "filling" && uncertainBeforeKill.checkpoint === "browser_active" ? "browser_active"
+        : uncertainBeforeKill.status === "waiting_for_authorization" && uncertainBeforeKill.checkpoint === "form_filled" ? "form_filled"
+        : "other"
+      const boundedCount = (value: number): number => Math.min(20, Math.max(0, Number.isSafeInteger(value) ? value : 0))
+      const receiverCounts = {
+        submitCount: boundedCount(legacyReceiverStats.submitCount),
+        matchingPostCount: boundedCount(legacyReceiverStats.requests.filter(request => request === "POST /example/jobs/1").length),
+        blockedCount: boundedCount(legacyReceiverStats.blocked.length),
       }
       throw new Error(`legacy_uncertainty_predicate_mismatch ${JSON.stringify({
-        ...uncertaintyChecks, exactStartReceiptCount, exactSettledReceiptCount,
+        ...uncertaintyChecks, taskOutcomeClass, exactStartReceiptCount, exactSettledReceiptCount,
+        exactExecutionPairCount, requestStartedCheckpointStillPresent, receiverCounts,
       })}`)
     }
     worker!.kill("SIGKILL")
