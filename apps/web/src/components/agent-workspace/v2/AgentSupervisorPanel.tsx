@@ -211,7 +211,7 @@ function SessionSupervisorPanel({ sessionId, timeline }: AgentSupervisorPanelPro
       <AgentSupervisorPlanView
         sessionId={sessionId} items={timeline.items} turns={turns} tasks={tasks} selectedNodeId={selectedId} selectedNode={selectedNode}
         currentGraphTasks={graphTasksQuery.data?.tasks ?? []} currentLedger={graphTasksQuery.data?.planLedger} currentDiscoveryShortlist={graphTasksQuery.data?.discoveryShortlist}
-        currentPreparationTurnId={selectedPreparationTurnId} lifecycleRevision={timeline.lifecycleRevision}
+        currentPreparationTurnId={selectedPreparationTurnId} activeTurnProjection={turnsQuery.data?.projection} lifecycleRevision={timeline.lifecycleRevision}
         onReturnToCurrent={selectionControls.onReturnToCurrent} />
       <SelectedJobDraftArtifact sessionId={sessionId} artifactRef={draftArtifactRef} />
       {timeline.cognitiveAgenda && <CognitiveAgendaCard agenda={timeline.cognitiveAgenda} agendas={timeline.cognitiveAgendas} taskLabels={agendaTaskLabels} />}

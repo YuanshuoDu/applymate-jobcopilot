@@ -135,6 +135,31 @@ describe('AgentSupervisorPanel selected evidence', () => {
     expect(html).not.toContain('PROJECTION_PRIVATE_GOAL')
   })
 
+  it('discovers an active batch beyond the first page after reload through its literal projection marker', () => {
+    const pageTurns = Array.from({ length: 100 }, (_, index) => ({
+      id: `turn-${index}`, sessionId: 'session-1', source: 'user', goal: `Goal ${index}`, status: 'completed', revision: 1,
+      activeStepId: null, finalItemId: null, createdAt: '', updatedAt: '', completedAt: null,
+    }))
+    const batchUrl = '/api/agent/sessions/session-1/selected-job-batches/turn-batch-hidden'
+    supervisorApi.responses.set('/api/agent/sessions/session-1/turns?limit=100', {
+      data: { turns: pageTurns, projection: { activeTurnId: 'turn-batch-hidden', activeTurn: {
+        id: 'turn-batch-hidden', status: 'in_progress', revision: 0, selectedJobBatchPreparation: true,
+      } } }, loading: false, error: null, refetch: () => undefined,
+    })
+    supervisorApi.responses.set(batchUrl, { data: {
+      sessionId: 'session-1', turnId: 'turn-batch-hidden',
+      source: { sessionId: 'session-1', sourceTurnId: 'source-hidden', rootTaskId: 'source-root', graphItemId: 'source-graph', graphRevision: 2 },
+      graph: null, status: 'pending', jobs: [
+        { slotId: 'slot-1', jobId: 'job-1', company: 'Reloaded One', role: 'Engineer', status: 'pending', writer: { status: 'pending' }, reviewer: { status: 'pending' } },
+        { slotId: 'slot-2', jobId: 'job-2', company: 'Reloaded Two', role: 'Analyst', status: 'pending', writer: { status: 'pending' }, reviewer: { status: 'pending' } },
+      ],
+    }, loading: false, error: null, refetch: () => undefined })
+
+    const html = renderToStaticMarkup(<AgentSupervisorPanel sessionId="session-1" timeline={pendingApprovalTimeline()} />)
+    expect(html).toContain('Reloaded One · Engineer')
+    expect(supervisorApi.calls).toContain(batchUrl)
+  })
+
   it.each(['waiting_for_user', 'in_progress'])('preserves pending approval controls for %s paged and projected Turns', status => {
     const current = { id: 'turn-current', sessionId: 'session-1', source: 'user', goal: 'Current goal', status, revision: 7,
       activeStepId: null, finalItemId: null, createdAt: '', updatedAt: '', completedAt: null }

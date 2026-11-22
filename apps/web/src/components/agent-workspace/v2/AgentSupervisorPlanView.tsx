@@ -7,6 +7,7 @@ import { useI18n } from '@/lib/i18n'
 import { taskGraphPlanLabel } from '@/lib/task-graph-plan-labels'
 
 import { TaskGraphPlanPanel } from './TaskGraphPlanPanel'
+import { resolveCurrentSelectedJobBatchTurn, SelectedJobBatchPlanProgress } from './SelectedJobBatchPlanProgress'
 import { buildTaskGraphTaskLookupUrl, resolveTaskGraphPlanInspectionSelection, selectedTaskGraphIdentity, type TaskGraphIdentity } from './task-graph-plan-query'
 import type { SupervisorTaskSummary, SupervisorTurnSummary } from './task-tree-projection'
 import type { TimelineItem } from './timeline-reducer'
@@ -34,7 +35,7 @@ export function supervisorPlanSelectionControls(
 
 export function AgentSupervisorPlanView({
   sessionId, items, turns, tasks, selectedNodeId, selectedNode, currentGraphTasks,
-  currentLedger, currentDiscoveryShortlist, currentPreparationTurnId, lifecycleRevision, onReturnToCurrent,
+  currentLedger, currentDiscoveryShortlist, currentPreparationTurnId, activeTurnProjection, lifecycleRevision, onReturnToCurrent,
 }: {
   readonly sessionId: string
   readonly items: readonly TimelineItem[]
@@ -46,12 +47,19 @@ export function AgentSupervisorPlanView({
   readonly currentLedger?: unknown
   readonly currentDiscoveryShortlist?: unknown
   readonly currentPreparationTurnId: string | null
+  readonly activeTurnProjection?: unknown
   readonly lifecycleRevision: number
   readonly onReturnToCurrent: () => void
 }) {
   const { lang, t } = useI18n()
   const selection = resolveTaskGraphPlanInspectionSelection({ sessionId, selectedNodeId, selectedNode, turns, tasks, items })
   const turnId = selection.kind === 'selected' ? selection.turnId : null
+  const currentBatch = resolveCurrentSelectedJobBatchTurn(turns, sessionId, activeTurnProjection)
+  const selectedTurn = turnId ? turns.find(candidate => candidate.sessionId === sessionId && candidate.id === turnId) : null
+  const batchTurnId = selection.kind === 'current' ? currentBatch.turnId
+    : selection.kind === 'selected' && selectedTurn?.selectedJobBatchPreparation === true ? turnId : null
+  const batchGraph = batchTurnId ? selectedTaskGraphIdentity(items, sessionId, batchTurnId) : null
+  const batchIsActive = Boolean(batchTurnId && batchTurnId === currentBatch.activeTurnId)
   const url = useMemo(() => turnId ? buildTaskGraphTaskLookupUrl(sessionId, items, turnId) : null, [items, sessionId, turnId])
   const expected = useMemo(() => turnId ? selectedTaskGraphIdentity(items, sessionId, turnId) : null, [items, sessionId, turnId])
   const historyQuery = useApi<TaskResponse>(url ?? '', { enabled: selection.kind === 'selected' && Boolean(url) })
@@ -64,12 +72,12 @@ export function AgentSupervisorPlanView({
   }, [historyQuery.refetch, refreshKey, selection.kind, url])
   const currentTasks = [...currentGraphTasks.filter(task => task.sessionId === sessionId), ...tasks.filter(task => task.sessionId === sessionId)]
 
-  if (selection.kind === 'current') return <TaskGraphPlanPanel
-    sessionId={sessionId} items={items} tasks={currentTasks} ledger={currentLedger}
-    discoveryShortlist={currentDiscoveryShortlist} selectedPreparationTurnId={currentPreparationTurnId}
-  />
+  if (selection.kind === 'current') return <>
+    <TaskGraphPlanPanel sessionId={sessionId} items={items} tasks={currentTasks} ledger={currentLedger}
+      discoveryShortlist={currentDiscoveryShortlist} selectedPreparationTurnId={currentPreparationTurnId} />
+    <SelectedJobBatchPlanProgress sessionId={sessionId} turnId={batchTurnId} expectedGraph={batchGraph} active={batchIsActive} lifecycleRevision={lifecycleRevision} />
+  </>
 
-  const turn = turnId ? turns.find(candidate => candidate.sessionId === sessionId && candidate.id === turnId) : null
   const matchingLedger = expected && matchesIdentity(historyQuery.data?.planLedger, expected)
   const unavailable = selection.kind === 'unavailable' || !turnId || !url || !expected
     || Boolean(!historyQuery.loading && !matchingLedger)
@@ -78,7 +86,7 @@ export function AgentSupervisorPlanView({
     <div style={contextStyle}>
       <div>
         <strong>{taskGraphPlanLabel(lang, 'agent.taskGraph.selectedPlan')}</strong>
-        {turn && <div>{turn.goal}</div>}
+        {selectedTurn && <div>{selectedTurn.goal}</div>}
       </div>
       <button type="button" onClick={onReturnToCurrent} style={buttonStyle}>
         {taskGraphPlanLabel(lang, 'agent.taskGraph.returnToCurrentPlan')}
@@ -93,6 +101,7 @@ export function AgentSupervisorPlanView({
           ledger={historyQuery.data?.planLedger} discoveryShortlist={historyQuery.data?.discoveryShortlist}
           selectedPreparationTurnId={turnId}
         />}
+    {batchTurnId && <SelectedJobBatchPlanProgress sessionId={sessionId} turnId={batchTurnId} expectedGraph={batchGraph} active={batchIsActive} lifecycleRevision={lifecycleRevision} />}
   </section>
 }
 
