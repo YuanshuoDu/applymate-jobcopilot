@@ -636,7 +636,8 @@ describe("Stage8 terminal diagnostics", () => {
       session: { status: "waiting_for_user" },
       turn: { status: "failed", error: "persistence_conflict", rootTaskId: "private-root-id" },
       root: { status: "failed", failureReason: "lease_lost" },
-      applicationTask: { status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: "private-worker-task-id" },
+      applicationTask: { status: "failed", checkpoint: "execution_failed", workerTaskId: "private-worker-task-id",
+        error: "approval_scope_mismatch" },
       approval: { status: "approved", toolCallId: "private-tool-call-id" },
       wait: { status: "completed", content: {
         waitKind: "approval", approvalId: "private-approval-id", toolCallId: "private-tool-call-id",
@@ -655,7 +656,8 @@ describe("Stage8 terminal diagnostics", () => {
       session: { present: true, status: "waiting_for_user" },
       turn: { present: true, status: "failed", errorCode: "persistence_conflict" },
       root: { present: true, status: "failed", failureCode: "lease_lost" },
-      applicationTask: { status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskMatches: true },
+      applicationTask: { status: "failed", checkpoint: "execution_failed", failureCode: "approval_scope_mismatch",
+        workerTaskMatches: true },
       approval: { present: true, status: "approved" },
       wait: { present: true, status: "completed", kindMatches: true, approvalMatches: true,
         toolCallMatches: true, decision: "approved", responseAvailable: true },
@@ -664,6 +666,13 @@ describe("Stage8 terminal diagnostics", () => {
       events: { approval_resolved: true, turn_resumed: true, turn_failed: true },
     })
     expect(JSON.stringify(summary)).not.toMatch(/private|nonce|secret|input/)
+  })
+
+  it("keeps unknown Stage 8 task errors closed", () => {
+    expect(stage8SubmissionFailureCode(null)).toBeNull()
+    expect(stage8SubmissionFailureCode("approval_scope_mismatch")).toBe("approval_scope_mismatch")
+    expect(stage8SubmissionFailureCode("PRIVATE_DATABASE_DETAIL")).toBe("other")
+    expect(JSON.stringify(stage8SubmissionFailureCode("PRIVATE_DATABASE_DETAIL"))).not.toContain("PRIVATE")
   })
 
   it("keeps only exact owned Turn DLQ facts and exact-turn Worker failure codes", () => {
@@ -1587,8 +1596,22 @@ const REVIEWED_FILL_DIAGNOSTIC_STATUSES = new Set([
 const REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS = new Set([
   "materials_ready", "taskgraph_fill_queued", "browser_active", "form_answer_required", "fill_outcome_uncertain",
   "form_filled", "submission_authorized", "submission_uncertain", "user_takeover", "queue_retry",
-  "turn_stopped_before_submit", "fill_prestart_failed",
+  "turn_stopped_before_submit", "fill_prestart_failed", "execution_failed",
 ])
+
+const STAGE8_SUBMISSION_FAILURE_CODES = new Set([
+  "approval_not_found", "approval_scope_mismatch", "approval_integrity_error", "approval_expired",
+  "approval_not_approved", "approval_already_consumed", "approval_nonce_mismatch", "approval_revision_mismatch",
+  "approval_reservation_conflict", "invalid_input", "target_not_found", "submission_attempt_fenced",
+  "submission_scope_mismatch", "idempotency_conflict", "idempotency_replay", "submission_in_flight",
+  "stale_artifact", "submission_guard_denied", "provider_invalid_response", "provider_error", "invalid_state",
+  "not_found", "browser_412", "browser_manual", "browser_failed", "submission_failed",
+])
+
+function stage8SubmissionFailureCode(value: unknown): string | null {
+  if (value === null || value === undefined) return null
+  return typeof value === "string" && STAGE8_SUBMISSION_FAILURE_CODES.has(value) ? value : "other"
+}
 
 function reviewedFillDiagnosticValue(value: unknown, allowed: ReadonlySet<string>): string {
   return value === null || value === undefined ? "none" : typeof value === "string" && allowed.has(value) ? value : "other"
@@ -1834,7 +1857,7 @@ type Stage8FailureEvidence = Readonly<{
   session: { status: unknown } | null
   turn: { status: unknown; error: unknown; rootTaskId: unknown } | null
   root: { status: unknown; failureReason: unknown } | null
-  applicationTask: { status: unknown; checkpoint: unknown; workerTaskId: unknown } | null
+  applicationTask: { status: unknown; checkpoint: unknown; workerTaskId: unknown; error: unknown } | null
   approval: { status: unknown; toolCallId: unknown } | null
   wait: { status: unknown; content: unknown } | null
   steps: readonly { status: unknown; errorCode: unknown }[]
@@ -1859,6 +1882,7 @@ function stage8FailureSummary(evidence: Stage8FailureEvidence) {
     applicationTask: { present: evidence.applicationTask !== null,
       status: reviewedFillDiagnosticValue(evidence.applicationTask?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
       checkpoint: reviewedFillDiagnosticValue(evidence.applicationTask?.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS),
+      failureCode: stage8SubmissionFailureCode(evidence.applicationTask?.error),
       workerTaskMatches: evidence.expectedWorkerTaskId === null ? null
         : evidence.applicationTask?.workerTaskId === evidence.expectedWorkerTaskId },
     approval: { present: evidence.approval !== null,
@@ -1912,7 +1936,7 @@ async function stage8FillFailureSnapshot(prepared: Stage8PreparedScenario, expec
         testDb.applicationTask.findFirst({ where: {
           id: prepared.applicationTaskId, userId: ids.user, sessionId: prepared.sessionId,
           jobId: prepared.jobId, fillTurnId: prepared.fillTurnId,
-        }, select: { status: true, checkpoint: true, workerTaskId: true } }),
+        }, select: { status: true, checkpoint: true, workerTaskId: true, error: true } }),
         testDb.agentApproval.findFirst({ where: {
           id: prepared.submitApprovalId, userId: ids.user, sessionId: prepared.sessionId,
           taskId: prepared.applicationTaskId, turnId: prepared.fillTurnId, jobId: prepared.jobId,
