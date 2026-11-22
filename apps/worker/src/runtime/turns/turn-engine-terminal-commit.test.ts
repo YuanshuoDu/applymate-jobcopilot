@@ -40,7 +40,7 @@ type Row = Record<string, unknown>
 type Call = { sql: string; values?: readonly unknown[] }
 
 function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, options: {
-  pause?: boolean; planningRoot?: boolean; rootInterrupted?: boolean; leaseActive?: boolean; sessionStatus?: string; applicationTaskRows?: number; source?: string; executionMode?: string | null
+  pause?: boolean; planningRoot?: boolean; rootInterrupted?: boolean; leaseActive?: boolean; sessionStatus?: string; applicationTaskRows?: number; applicationFillerRows?: number; source?: string; executionMode?: string | null
 } = {}) {
   const calls: Call[] = []
   const events = new Map<string, Row>()
@@ -66,7 +66,8 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
       if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "100" }], rowCount: 1 }
       if (sql.includes('SELECT "eventSequence" FROM "agent_sessions"')) return { rows: [{ eventSequence: sequence }], rowCount: 1 }
       if (sql.includes('JOIN "application_tasks" AS fill_task')) {
-        const count = options.pause || options.sessionStatus !== "waiting_for_user" ? 0 : options.applicationTaskRows ?? 0
+        const count = options.pause || options.sessionStatus !== "waiting_for_user" ? 0
+          : (options.applicationTaskRows ?? 0) * (options.applicationFillerRows ?? 1)
         return { rows: Array.from({ length: count }, (_, index) => ({ id: `session-${index}` })), rowCount: count }
       }
       if (sql.includes('SELECT session."id" FROM "agent_sessions" AS session')) {
@@ -324,10 +325,25 @@ describe("atomic Turn terminal commit", () => {
     expect(fake.calls.some(({ sql }) => /UPDATE "agent_sessions" SET "status"/.test(sql))).toBe(false)
   })
 
+  it("admits an exact null-mode Fill only with its same-Root canonical filler and durable wait", async () => {
+    const fake = makePool([], undefined, {
+      sessionStatus: "waiting_for_user", applicationTaskRows: 1, applicationFillerRows: 1, executionMode: null,
+    })
+
+    await expect(commitTurnTerminal(fake.pool, input)).resolves.toMatchObject({ status: "completed", finalItemId: input.finalItemId })
+    const admission = fake.calls.find(call => call.sql.includes('JOIN "application_tasks" AS fill_task'))
+    expect(admission?.sql).toContain('filler."turnId" = fill_task."fillTurnId"')
+    expect(admission?.sql).toContain('filler."rootTaskId" = $4 AND filler."parentTaskId" = $4')
+    expect(admission?.sql).toContain('filler."role" = \'application_filler\'')
+    expect(admission?.values).toEqual([owner.sessionId, owner.userId, owner.turnId, owner.rootTaskId])
+  })
+
   it.each([
     ["unbound wait", { sessionStatus: "waiting_for_user" }],
     ["wrong source", { sessionStatus: "waiting_for_user", applicationTaskRows: 1, source: "automation" }],
     ["legacy execution", { sessionStatus: "waiting_for_user", applicationTaskRows: 1, executionMode: "legacy_pipeline_adapter" }],
+    ["missing canonical filler", { sessionStatus: "waiting_for_user", applicationTaskRows: 1, applicationFillerRows: 0, executionMode: null }],
+    ["ambiguous canonical fillers", { sessionStatus: "waiting_for_user", applicationTaskRows: 1, applicationFillerRows: 2, executionMode: null }],
     ["approval wait", { sessionStatus: "waiting_for_approval", applicationTaskRows: 1 }],
     ["explicit pause", { sessionStatus: "waiting_for_user", applicationTaskRows: 1, pause: true }],
   ] as const)("does not terminalize a Fill Turn for %s", async (_case, options) => {
