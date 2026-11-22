@@ -6,7 +6,7 @@ import { readFile } from "node:fs/promises"
 import { unlink } from "node:fs/promises"
 import { Pool } from "pg"
 import { HOST, assertToolMessagePairs, failModel, fixtureModel, required, safeBlockedTarget } from "./application-task-full-loop.fixture-support.mjs"
-import { closeStage8Workers, createStage8ApplyWorker, createStage8FixtureControl } from "./application-task-full-loop.stage8.fixture-support.mjs"
+import { closeStage8Workers, createStage8ApplicationSubmitDrain, createStage8ApplyWorker, createStage8FixtureControl } from "./application-task-full-loop.stage8.fixture-support.mjs"
 import { applicationFillStageTrace, traceApplicationFillExecutor } from "./application-task-full-loop.trace-support.mjs"
 
 const [, , mode] = process.argv
@@ -410,7 +410,10 @@ async function startWorker(stagedSubmissionStopProtocol = false) {
       },
     }),
   })
-  const publisher = outbox.startApplicationSubmitOutboxPublisher(pool, queue.applyQueue, { pollMs: 250 })
+  const publisher = outbox.startApplicationSubmitOutboxPublisher(pool, queue.applyQueue, {
+    pollMs: 250,
+    ...(control ? { drain: createStage8ApplicationSubmitDrain(outbox, control) } : {}),
+  })
   let activeApplyWorker = queue.applyWorker
   if (stagedSubmissionStopProtocol) {
     const { getPool } = await import("../db/apply-results.ts")

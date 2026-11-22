@@ -47,6 +47,17 @@ export function createStage8FixtureControl() {
   }
 }
 
+export function createStage8ApplicationSubmitDrain(outbox, control) {
+  let released = false
+  return async (pool, queue) => {
+    if (!released) {
+      if (await control.waitFor("stage8-release-publisher", 900_000) !== "stage8-release-publisher") return 0
+      released = true
+    }
+    return outbox.drainApplicationSubmitOutbox(pool, queue)
+  }
+}
+
 function trackStage8Pool(pool, control, workerTaskId, writeLine) {
   return new Proxy(pool, {
     get(target, key) {

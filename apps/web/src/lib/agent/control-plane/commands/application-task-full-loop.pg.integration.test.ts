@@ -1461,30 +1461,32 @@ async function prepareStage8Scenario(label: "stop-first" | "grant-first"): Promi
     task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled" && Boolean(task.fillTurnId), 180_000)
   const fillTurnId = fill.fillTurnId
   if (typeof fillTurnId !== "string" || !fillTurnId.trim() || fill.id !== reviewTask.id) throw new Error("stage8_fill_identity_missing")
-  const fillTerminal = await waitForAgentTurnTerminal(fillTurnId)
-  expect(fillTerminal.status).toBe("completed")
-  const completedFillTurn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: fillTurnId }, select: {
-    id: true, userId: true, sessionId: true, source: true, executionMode: true, status: true,
-    leaseOwnerId: true, leaseStartedAt: true, leaseExpiresAt: true,
-  } })
-  expect(completedFillTurn).toMatchObject({ id: fillTurnId, userId: ids.user, sessionId: scenario.sessionId,
-    source: "user", executionMode: "canonical_task_graph", status: "completed",
-    leaseOwnerId: null, leaseStartedAt: null, leaseExpiresAt: null })
   const browserStarted = await testDb.applicationTaskEvent.findMany({ where: {
     taskId: reviewTask.id, type: "reviewed_application_fill_browser_started", actor: "worker",
   }, select: { id: true } })
   expect(browserStarted).toHaveLength(1)
-  const submitApprovals = await testDb.agentApproval.findMany({ where: {
-    userId: ids.user, sessionId: scenario.sessionId, turnId: fillTurnId, taskId: reviewTask.id,
-    jobId: scenario.jobId, type: "submit_application", status: "pending",
-  } })
+  const approvalWaitDeadline = Date.now() + 90_000
+  let submitApprovals = [] as Awaited<ReturnType<typeof testDb.agentApproval.findMany>>
+  let waitItems = [] as Awaited<ReturnType<typeof testDb.agentItem.findMany>>
+  while (Date.now() < approvalWaitDeadline) {
+    submitApprovals = await testDb.agentApproval.findMany({ where: {
+      userId: ids.user, sessionId: scenario.sessionId, turnId: fillTurnId, taskId: reviewTask.id,
+      jobId: scenario.jobId, type: "submit_application", status: "pending",
+    } })
+    if (submitApprovals.length === 1) {
+      waitItems = await testDb.agentItem.findMany({ where: {
+        id: `agent-wait:approval:${submitApprovals[0]!.id}`, sessionId: scenario.sessionId, turnId: fillTurnId,
+        type: "approval_request", status: "started",
+      } })
+      if (waitItems.length === 1) break
+    }
+    await delay(100)
+  }
   expect(submitApprovals).toHaveLength(1)
   const submitApprovalId = submitApprovals[0]!.id
-  const waitItems = await testDb.agentItem.findMany({ where: {
-    id: `agent-wait:approval:${submitApprovalId}`, sessionId: scenario.sessionId, turnId: fillTurnId,
-    type: "approval_request", status: "started",
-  } })
   expect(waitItems).toHaveLength(1)
+  expect(await testDb.agentTurn.findUniqueOrThrow({ where: { id: fillTurnId }, select: { status: true } }))
+    .toEqual({ status: "waiting_for_approval" })
   expect(jsonRecord(waitItems[0]!.content)).toMatchObject({ waitKind: "approval", approvalId: submitApprovalId,
     action: "submit_application" })
   expect(await testDb.agentOutbox.count({ where: { aggregateId: scenario.sessionId, topic: "application.submit.dispatch" } })).toBe(0)
@@ -1509,6 +1511,7 @@ async function approveStage8Submit(prepared: Stage8PreparedScenario): Promise<St
     type: "approval_response", approvalId: prepared.submitApprovalId, decision: "approved", receiptNonce,
   }), { params: Promise.resolve({ id: prepared.sessionId }) })
   expect(response.status).toBe(200)
+  expect((await waitForAgentTurnTerminal(prepared.fillTurnId)).status).toBe("completed")
 
   const resolvedApproval = await testDb.agentApproval.findUniqueOrThrow({ where: { id: prepared.submitApprovalId }, select: { status: true } })
   expect(resolvedApproval.status).toBe("approved")
@@ -2410,10 +2413,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const priorReviewedPostCount = before.requests.filter(path => path === "POST /example-reviewed/jobs/1").length
     const stopFirst = await prepareStage8Scenario("stop-first")
     await stopFixture(worker)
-    const firstIntent = await approveStage8Submit(stopFirst)
     worker = spawnFixture("worker-staged")
     await waitLine(worker, "WORKER_READY", 90_000)
     try {
+      const firstIntent = await approveStage8Submit(stopFirst)
+      worker.stdin?.write("stage8-release-publisher\n")
       await waitForStage8ApplyJob(stopFirst, firstIntent)
       await waitLine(worker, `STAGE8_ARM_COMMITTED ${firstIntent.workerTaskId}`, 90_000)
       expect(await readStage8Protocol(stopFirst, firstIntent)).toEqual(["armed"])
@@ -2439,9 +2443,10 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       await waitLine(worker, "WORKER_READY", 90_000)
       const grantFirst = await prepareStage8Scenario("grant-first")
       await stopFixture(worker)
-      const secondIntent = await approveStage8Submit(grantFirst)
       worker = spawnFixture("worker-staged")
       await waitLine(worker, "WORKER_READY", 90_000)
+      const secondIntent = await approveStage8Submit(grantFirst)
+      worker.stdin?.write("stage8-release-publisher\n")
       await waitForStage8ApplyJob(grantFirst, secondIntent)
       await waitLine(worker, `STAGE8_ARM_COMMITTED ${secondIntent.workerTaskId}`, 90_000)
       expect(await readStage8Protocol(grantFirst, secondIntent)).toEqual(["armed"])
@@ -2496,7 +2501,6 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(releasedStats.reviewedHeldSubmitCount).toBe(before.reviewedHeldSubmitCount)
       await waitForStage8JobSettled(secondIntent.workerTaskId, 30_000)
     } finally {
-      worker?.stdin?.write("stage8-release-arm\nstage8-release-final\n")
       site?.stdin?.write("release-held\n")
     }
   }, 900_000)
