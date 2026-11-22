@@ -1113,6 +1113,12 @@ async function runCorrectionWriterRestartWorker(resume) {
   if (!selected || selected.correctionWriterMode !== true || typeof selected.correctionWriterTaskId !== "string") {
     throw new Error("p3_correction_writer_restart_scope_missing")
   }
+  if (resume) {
+    assertNoPrivateArtifactFixtureData(selected, JSON.stringify(selected))
+    if (["body", "baseArtifactId", "baseHash", "predecessorRef", "correctionReadCallId"].some(key => Object.hasOwn(selected, key))) {
+      throw new Error("p3_correction_writer_resume_fixture_input_contains_private_artifact_data")
+    }
+  }
   const ownerId = `p3-correction-writer-worker-${resume ? "two" : "one"}-${process.pid}`
   const manager = new AgentTreeManager(new PgSubagentTaskStore(pool, 2_500), { heartbeatMs: 200 })
   const runtime = await startRuntime(ownerId, resume, manager)

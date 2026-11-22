@@ -2535,6 +2535,7 @@ type CorrectionWriterRestartPlan = Readonly<{
   body: string
   correctionWriter: SubagentTaskRecord
   correctionDraftCallId: string
+  correctionReadCallId: string
   baseArtifactId: string
   baseHash: string
   sourceDigest: string
@@ -2736,6 +2737,7 @@ async function prepareCorrectionWriterRestartPlan(
   return { store, rootTaskId: root.id, queueName, jobId: sources.jobId,
     body: `AC6_CORRECTION_WRITER_RESUMED_${value.suffix}`, correctionWriter,
     correctionDraftCallId: "p3-correction-draft",
+    correctionReadCallId: "p3-correction-predecessor-read",
     baseArtifactId, baseHash, sourceDigest: preparation.preparation.sourceDigest,
     predecessor, expectedArtifactId: predecessor.artifactId }
 }
@@ -10860,6 +10862,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       writerTaskId: plan.correctionWriter.id,
       correctionWriterTaskId: plan.correctionWriter.id,
       correctionDraftCallId: plan.correctionDraftCallId,
+      correctionReadCallId: plan.correctionReadCallId,
+      predecessorRef: plan.predecessor,
       baseArtifactId: plan.baseArtifactId,
       baseHash: plan.baseHash,
       body: plan.body,
@@ -10950,6 +10954,52 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(result).toMatchObject({ status: "completed", attempt: 1, stepId: call?.stepId,
         content: { toolCallId: plan.correctionDraftCallId, errorCode: null, output: { artifactRef: committedRef } } })
 
+      const predecessorReadItems = await pool!.query<{
+        type: string; status: string; stepId: string; attempt: number; content: RecordValue;
+      }>(`SELECT item."type", item."status", item."stepId", step."attempt", item."content"
+          FROM "agent_items" AS item JOIN "agent_steps" AS step ON step."id" = item."stepId"
+            AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
+          WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3
+            AND item."content"->>'toolCallId' = $4 AND item."type" IN ('tool_call', 'tool_result')
+          ORDER BY item."type"`, [value.sessionId, value.turnId, plan.correctionWriter.id, plan.correctionReadCallId])
+      expect(predecessorReadItems.rows).toHaveLength(2)
+      const predecessorReadCall = predecessorReadItems.rows.find(row => row.type === "tool_call")
+      const predecessorReadResult = predecessorReadItems.rows.find(row => row.type === "tool_result")
+      const readInput = record(record(predecessorReadCall?.content)?.input)
+      const readInputRef = record(readInput?.artifactRef)
+      const readOutput = record(record(predecessorReadResult?.content)?.output)
+      const readOutputRef = record(readOutput?.artifactRef)
+      expect(Boolean(predecessorReadCall && predecessorReadResult
+        && predecessorReadCall.status === "completed" && predecessorReadResult.status === "completed"
+        && predecessorReadCall.attempt === 1 && predecessorReadResult.attempt === 1
+        && predecessorReadCall.stepId === predecessorReadResult.stepId
+        && predecessorReadCall.content.toolName === "artifact.version.read"
+        && predecessorReadCall.content.status === "completed" && predecessorReadCall.content.errorCode === null
+        && Object.keys(readInputRef ?? {}).sort().join(",") === "artifactId,contentHash,sourceDigest,version"
+        && readInputRef?.artifactId === plan.predecessor.artifactId && readInputRef?.version === plan.predecessor.version
+        && readInputRef?.contentHash === plan.predecessor.contentHash && readInputRef?.sourceDigest === plan.predecessor.sourceDigest
+        && predecessorReadResult.content.errorCode === null
+        && Object.keys(readOutputRef ?? {}).sort().join(",") === "artifactId,contentHash,sourceDigest,version"
+        && readOutputRef?.artifactId === plan.predecessor.artifactId && readOutputRef?.version === plan.predecessor.version
+        && readOutputRef?.contentHash === plan.predecessor.contentHash && readOutputRef?.sourceDigest === plan.predecessor.sourceDigest)).toBe(true)
+      const predecessorReadOrder = await pool!.query<{
+        toolCallId: string; itemType: string; eventType: string; sequence: string;
+      }>(`SELECT item."content"->>'toolCallId' AS "toolCallId", item."type" AS "itemType",
+                 event."type" AS "eventType", event."sequence"::text AS "sequence"
+          FROM "agent_items" AS item JOIN "agent_events" AS event ON event."itemId" = item."id"
+            AND event."sessionId" = item."sessionId" AND event."turnId" = item."turnId" AND event."taskId" = item."taskId"
+          WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3
+            AND item."content"->>'toolCallId' = ANY($4::text[])
+            AND ((item."type" = 'tool_result' AND event."type" = 'item.completed')
+              OR (item."type" = 'tool_call' AND event."type" = 'tool_call.started'))`,
+        [value.sessionId, value.turnId, plan.correctionWriter.id, [plan.correctionReadCallId, plan.correctionDraftCallId]])
+      const predecessorReadCompletedSequence = predecessorReadOrder.rows.find(row =>
+        row.toolCallId === plan.correctionReadCallId && row.itemType === "tool_result" && row.eventType === "item.completed")?.sequence
+      const correctionDraftStartedSequence = predecessorReadOrder.rows.find(row =>
+        row.toolCallId === plan.correctionDraftCallId && row.itemType === "tool_call" && row.eventType === "tool_call.started")?.sequence
+      expect(Boolean(predecessorReadCompletedSequence && correctionDraftStartedSequence
+        && BigInt(predecessorReadCompletedSequence) < BigInt(correctionDraftStartedSequence))).toBe(true)
+
       const firstPid = workerOne.pid
       if (firstPid === undefined) throw new Error("Correction Writer first Worker has no process ID")
       noteFixtureSigkillSubagentJob(workerOne, plan.queueName, plan.correctionWriter.id)
@@ -10989,7 +11039,22 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const queuedAfterRecovery = await plan.store.get(plan.correctionWriter.id, value.sessionId)
       expect(queuedAfterRecovery).toMatchObject({ status: "queued", attemptCount: 1, leaseOwner: null })
 
-      workerTwo = startTaskGraphRestartWorker("correction-writer-worker-two", { ...value, selectedJob })
+      const resumeSelectedJob = {
+        correctionWriterMode: true,
+        queueName: plan.queueName,
+        userId: value.userId,
+        sessionId: value.sessionId,
+        turnId: value.turnId,
+        rootTaskId: plan.rootTaskId,
+        jobId: plan.jobId,
+        writerTaskId: plan.correctionWriter.id,
+        correctionWriterTaskId: plan.correctionWriter.id,
+        correctionDraftCallId: plan.correctionDraftCallId,
+        expectedVersion: 2,
+        expectedArtifactId: plan.expectedArtifactId,
+        sourceDigest: plan.sourceDigest,
+      }
+      workerTwo = startTaskGraphRestartWorker("correction-writer-worker-two", { ...value, selectedJob: resumeSelectedJob })
       expect(workerTwo.pid).not.toBe(firstPid)
       await waitForProcessLine(workerTwo, `P3_SELECTED_JOB_QUEUE_READY ${plan.queueName}`)
       await waitForProcessLine(workerTwo, "P3_CORRECTION_WRITER_RESTART_READY worker_two")
