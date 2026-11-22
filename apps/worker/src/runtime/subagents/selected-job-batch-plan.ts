@@ -1,8 +1,14 @@
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
+import {
+  isSelectedJobBatchTemplateId,
+  selectedJobBatchTemplatesForSlot,
+  SELECTED_JOB_BATCH_SLOT_IDS,
+} from "@jobcopilot/agent-protocol"
+import type { SelectedJobBatchSlotId } from "@jobcopilot/agent-protocol"
 import type { TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 
-export const SELECTED_JOB_BATCH_SLOT_IDS = ["slot-1", "slot-2", "slot-3", "slot-4"] as const
-export type SelectedJobBatchSlotId = typeof SELECTED_JOB_BATCH_SLOT_IDS[number]
+export { SELECTED_JOB_BATCH_SLOT_IDS }
+export type { SelectedJobBatchSlotId }
 export type SelectedJobBatchSlot = Readonly<{ slotId: SelectedJobBatchSlotId; jobId: string }>
 export type SelectedJobBatchTemplateRegistry = Readonly<{
   slots: readonly SelectedJobBatchSlot[]
@@ -98,15 +104,13 @@ function parseSlots(value: unknown): readonly SelectedJobBatchSlot[] {
 }
 
 function templateIds(slotId: SelectedJobBatchSlotId): Readonly<{ writer: string; reviewer: string }> {
-  const index = SELECTED_JOB_BATCH_SLOT_IDS.indexOf(slotId) + 1
-  return { writer: `cover_letter_writer_slot_${index}`, reviewer: `cover_letter_reviewer_slot_${index}` }
+  const entry = selectedJobBatchTemplatesForSlot(slotId)
+  if (!entry) throw new SelectedJobBatchPlanError("unknown_slot")
+  return { writer: entry.writerTemplateId, reviewer: entry.reviewerTemplateId }
 }
 
 function templateIdIsKnown(value: string): boolean {
-  return SELECTED_JOB_BATCH_SLOT_IDS.some(slotId => {
-    const ids = templateIds(slotId)
-    return value === ids.writer || value === ids.reviewer
-  })
+  return isSelectedJobBatchTemplateId(value)
 }
 
 function bindJob(template: TaskGraphTaskTemplate, jobId: string): TaskGraphTaskTemplate {

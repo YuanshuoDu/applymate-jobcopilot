@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
+import { SELECTED_JOB_BATCH_SLOT_IDS as PROTOCOL_SLOT_IDS } from "@jobcopilot/agent-protocol"
 import { taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import {
   createSelectedJobBatchTemplateRegistry,
   pairSelectedJobBatchPlan,
   SelectedJobBatchPlanError,
+  SELECTED_JOB_BATCH_SLOT_IDS,
   type SelectedJobBatchSlot,
 } from "./selected-job-batch-plan.js"
 import type { TaskGraphTaskTemplate } from "./task-graph-command-port.js"
@@ -24,6 +26,10 @@ const twoPairPlan = [
 ]
 
 describe("selected Job batch plan", () => {
+  it("reexports the shared finite slot catalog for existing Worker callers", () => {
+    expect(SELECTED_JOB_BATCH_SLOT_IDS).toBe(PROTOCOL_SLOT_IDS)
+  })
+
   it("builds finite slot templates from the existing Writer and Reviewer contracts", () => {
     const registry = createSelectedJobBatchTemplateRegistry(slots, prototypes)
 
@@ -64,6 +70,7 @@ describe("selected Job batch plan", () => {
     ["a missing pair member", twoPairPlan.slice(0, 3)],
     ["an extra node", [...twoPairPlan, node("extra", "cover_letter_writer_slot_3")]],
     ["an unknown template", [...twoPairPlan.slice(0, 3), node("unknown", "reviewer")]],
+    ["an out-of-range template", [...twoPairPlan.slice(0, 3), node("unknown", "cover_letter_reviewer_slot_5")]],
     ["a malformed node", [...twoPairPlan.slice(0, 3), { key: "missing-deps", templateId: "cover_letter_reviewer_slot_2" }]],
   ] as const)("rejects %s before graph materialization", (_case, plan) => {
     expect(() => pairSelectedJobBatchPlan(plan, slots)).toThrowError(SelectedJobBatchPlanError)
@@ -88,6 +95,7 @@ describe("selected Job batch plan", () => {
     const registry = createSelectedJobBatchTemplateRegistry(fourSlots, prototypes)
 
     expect(Object.keys(registry.templates)).toHaveLength(TASK_GRAPH_LIMITS.maxNodes)
+    expect(registry.templates).toHaveProperty("cover_letter_reviewer_slot_4")
     expect(() => createSelectedJobBatchTemplateRegistry([
       ...fourSlots, { slotId: "slot-5", jobId: "job-e" },
     ], prototypes)).toThrowError(SelectedJobBatchPlanError)

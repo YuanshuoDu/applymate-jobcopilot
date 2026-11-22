@@ -50,6 +50,13 @@ export {
   sameVerifiedShortlistSelectionBinding,
 } from './verified-shortlist-selection.js'
 export type { VerifiedShortlistSelectionBinding, VerifiedShortlistSourceIdentity } from './verified-shortlist-selection.js'
+export {
+  isSelectedJobBatchTemplateId,
+  SELECTED_JOB_BATCH_SLOT_IDS,
+  SELECTED_JOB_BATCH_TEMPLATE_CATALOG,
+  selectedJobBatchTemplatesForSlot,
+} from './selected-job-batch-templates.js'
+export type { SelectedJobBatchSlotId, SelectedJobBatchTemplateEntry, SelectedJobBatchTemplateId } from './selected-job-batch-templates.js'
 export { AgentStepSchema, AgentStepUsageSchema, StepStatusSchema } from './step.js'
 export type { AgentStep, AgentStepUsage, StepStatus } from './step.js'
 export {

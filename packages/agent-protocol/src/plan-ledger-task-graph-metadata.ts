@@ -1,4 +1,5 @@
 import type { TaskGraphSnapshotNode } from "./plan-ledger.js"
+import { isSelectedJobBatchTemplateId } from "./selected-job-batch-templates.js"
 import { isStrictNativeTaskGraphNode } from "./plan-ledger-native-metadata.js"
 
 const BASE_KEYS = "dependsOn,depth,goal,key,successCriteria,taskId,templateId"
@@ -121,7 +122,8 @@ export function parsePersistedTaskGraphNode(value: unknown): TaskGraphSnapshotNo
     const disposition = shape === "base" ? (hasVerification ? "typed" : "legacy_unverified") : value.verificationDisposition
     if (disposition !== "typed" && disposition !== "legacy_unverified" && disposition !== "specialized") return null
     if (disposition === "typed" ? !hasVerification || !verification(value.verification, value.templateId) : hasVerification) return null
-    if (disposition === "specialized" && value.templateId !== "cover_letter_writer" && value.templateId !== "cover_letter_reviewer") return null
+    if (disposition === "specialized" && value.templateId !== "cover_letter_writer" && value.templateId !== "cover_letter_reviewer"
+      && !isSelectedJobBatchTemplateId(value.templateId)) return null
     if (shape === "repair" && (disposition !== "typed" || !repairOf(value.repairOf))) return null
     return {
       key: value.key as string, templateId: value.templateId as string, goal: value.goal as string,
