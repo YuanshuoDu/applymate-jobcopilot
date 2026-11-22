@@ -573,6 +573,8 @@ describe("Stage8 terminal diagnostics", () => {
   it("reports approval resume evidence without exposing IDs, receipt contents, or tool inputs", () => {
     const summary = stage8FailureSummary({
       expectedApprovalId: "private-approval-id",
+      expectedSessionId: "private-session-id",
+      expectedTurnId: "private-turn-id",
       turn: { status: "failed", error: "persistence_conflict", rootTaskId: "private-root-id" },
       root: { status: "failed", failureReason: "lease_lost" },
       applicationTask: { status: "waiting_for_authorization", checkpoint: "form_filled" },
@@ -586,6 +588,8 @@ describe("Stage8 terminal diagnostics", () => {
         toolName: "application.submit", errorCode: "policy_requires_approval", arguments: { secret: "private-input" },
       } }],
       events: [{ type: "approval.resolved" }, { type: "turn.resumed" }, { type: "turn.failed" }],
+      deadLetters: [],
+      workerFailureLines: [],
     })
     expect(summary).toMatchObject({
       turn: { present: true, status: "failed", errorCode: "persistence_conflict" },
@@ -599,6 +603,45 @@ describe("Stage8 terminal diagnostics", () => {
       events: { approval_resolved: true, turn_resumed: true, turn_failed: true },
     })
     expect(JSON.stringify(summary)).not.toMatch(/private|nonce|secret|input/)
+  })
+
+  it("keeps only exact owned Turn DLQ facts and exact-turn Worker failure codes", () => {
+    const turnId = "private-fill-turn"
+    const sessionId = "private-session"
+    const owned = { turnId, sessionId, ownerId: "private-worker-owner", attemptsMade: 2,
+      reason_code: "execution_failed", error_code: "turn_execution_error" }
+    const summary = stage8FailureSummary({
+      expectedApprovalId: "private-approval",
+      expectedSessionId: sessionId,
+      expectedTurnId: turnId,
+      turn: { status: "failed", error: null, rootTaskId: "private-root" },
+      root: null, applicationTask: null, approval: null, wait: null, steps: [], tools: [], events: [],
+      deadLetters: [
+        { payload: owned },
+        { payload: { ...owned, sessionId: "foreign-session" } },
+        { payload: { ...owned, turnId: "foreign-turn" } },
+        { payload: { ...owned, error_code: "SECRET_EXCEPTION_TEXT" } },
+        { payload: { ...owned, unexpected: "PRIVATE_PAYLOAD" } },
+      ],
+      workerFailureLines: [
+        `TURN_JOB_FAILED job-1 turnId=${turnId} turn_not_owned`,
+        `TURN_JOB_FAILED job-2 turnId=${turnId} PRIVATE_EXCEPTION_TEXT`,
+        "TURN_JOB_FAILED foreign-job turnId=foreign-turn PRIVATE_FOREIGN_ERROR",
+        `TURN_JOB_FAILED job-3 turnId=${turnId}-suffix PRIVATE_NEAR_MATCH`,
+        `TURN_JOB_FAILED job-4 turnId=${turnId} SECRET_ERROR ${sessionId}`,
+        `prefix TURN_JOB_FAILED job-5 turnId=${turnId} PRIVATE_MALFORMED`,
+      ],
+    })
+
+    expect(summary.queueFailure).toEqual({
+      deadLetters: { matchingCount: 3, unclassifiedCount: 2,
+        records: [{ reasonCode: "execution_failed", errorCode: "turn_execution_error", attemptsMade: 2 }] },
+      worker: { matchingLineCount: 3, errorCounts: {
+        cognitive_agenda_resume_fence_invalid: 0, turn_not_owned: 1, archived_wait_accounting_invalid: 0,
+        child_wait_claim_recovery_owner_mismatch: 0, child_resume_wait_tool_call_conflict: 0,
+      }, unknownErrorCount: 2 },
+    })
+    expect(JSON.stringify(summary)).not.toMatch(/private|PRIVATE|SECRET|foreign|ownerId|turnId|sessionId/)
   })
 })
 
@@ -1456,9 +1499,62 @@ const STAGE8_EVENT_TYPES = [
   "approval.resolved", "turn.resumed", "turn.failed", "turn.completed", "step.completed",
   "tool_call.failed", "tool_call.completed",
 ] as const
+const STAGE8_DLQ_REASONS = new Set([
+  "schema_invalid_payload", "max_retries_exhausted", "execution_failed", "lease_lost",
+  "cognitive_agenda_resume_fence_invalid",
+])
+const STAGE8_DLQ_ERRORS = new Set([
+  "invalid_payload", "lease_not_available", "lease_lost", "cognitive_agenda_resume_fence_invalid", "turn_execution_error",
+])
+const STAGE8_WORKER_FAILURE_CODES = [
+  "cognitive_agenda_resume_fence_invalid", "turn_not_owned", "archived_wait_accounting_invalid",
+  "child_wait_claim_recovery_owner_mismatch", "child_resume_wait_tool_call_conflict",
+] as const
+const STAGE8_WORKER_FAILURE_CODE_SET: ReadonlySet<string> = new Set(STAGE8_WORKER_FAILURE_CODES)
+
+function stage8DeadLetterSummary(rows: readonly unknown[], sessionId: string, turnId: string) {
+  const records: Array<{ reasonCode: string; errorCode: string; attemptsMade: number }> = []
+  let unclassifiedCount = 0
+  for (const row of rows.slice(0, 8)) {
+    const payload = jsonRecord(jsonRecord(row)?.payload)
+    if (payload?.turnId !== turnId || payload.sessionId !== sessionId) continue
+    const keys = Object.keys(payload).sort()
+    if (JSON.stringify(keys) !== JSON.stringify(["attemptsMade", "error_code", "ownerId", "reason_code", "sessionId", "turnId"].sort())
+      || typeof payload.ownerId !== "string" || !payload.ownerId
+      || !Number.isSafeInteger(payload.attemptsMade) || Number(payload.attemptsMade) < 1 || Number(payload.attemptsMade) > 5) {
+      unclassifiedCount += 1
+      continue
+    }
+    if (typeof payload.reason_code !== "string" || !STAGE8_DLQ_REASONS.has(payload.reason_code)
+      || typeof payload.error_code !== "string" || !STAGE8_DLQ_ERRORS.has(payload.error_code)) {
+      unclassifiedCount += 1
+      continue
+    }
+    records.push({ reasonCode: payload.reason_code, errorCode: payload.error_code, attemptsMade: Number(payload.attemptsMade) })
+  }
+  return { matchingCount: records.length + unclassifiedCount, unclassifiedCount, records }
+}
+
+function stage8WorkerFailureSummary(lines: readonly string[], turnId: string) {
+  const errorCounts = Object.fromEntries(STAGE8_WORKER_FAILURE_CODES.map(code => [code, 0])) as Record<typeof STAGE8_WORKER_FAILURE_CODES[number], number>
+  let matchingLineCount = 0
+  let unknownErrorCount = 0
+  for (const line of lines.slice(-64)) {
+    if (typeof line !== "string" || line.length > 2_048 || /[\r\n]/.test(line)) continue
+    const match = /^TURN_JOB_FAILED \S+ turnId=(\S+) (.*)$/.exec(line)
+    if (!match || match[1] !== turnId) continue
+    matchingLineCount += 1
+    const error = match[2]!
+    if (STAGE8_WORKER_FAILURE_CODE_SET.has(error)) errorCounts[error as typeof STAGE8_WORKER_FAILURE_CODES[number]] += 1
+    else unknownErrorCount += 1
+  }
+  return { matchingLineCount, errorCounts, unknownErrorCount }
+}
 
 type Stage8FailureEvidence = Readonly<{
   expectedApprovalId: string
+  expectedSessionId: string
+  expectedTurnId: string
   turn: { status: unknown; error: unknown; rootTaskId: unknown } | null
   root: { status: unknown; failureReason: unknown } | null
   applicationTask: { status: unknown; checkpoint: unknown } | null
@@ -1467,6 +1563,8 @@ type Stage8FailureEvidence = Readonly<{
   steps: readonly { status: unknown; errorCode: unknown }[]
   tools: readonly { type: unknown; status: unknown; content: unknown }[]
   events: readonly { type: unknown }[]
+  deadLetters: readonly unknown[]
+  workerFailureLines: readonly string[]
 }>
 
 function stage8FailureSummary(evidence: Stage8FailureEvidence) {
@@ -1508,6 +1606,10 @@ function stage8FailureSummary(evidence: Stage8FailureEvidence) {
       }
     }),
     events: Object.fromEntries(STAGE8_EVENT_TYPES.map(type => [type.replaceAll(".", "_"), eventTypes.has(type)])),
+    queueFailure: {
+      deadLetters: stage8DeadLetterSummary(evidence.deadLetters, evidence.expectedSessionId, evidence.expectedTurnId),
+      worker: stage8WorkerFailureSummary(evidence.workerFailureLines, evidence.expectedTurnId),
+    },
   }
 }
 
@@ -1517,7 +1619,7 @@ async function stage8FillFailureSnapshot(prepared: Stage8PreparedScenario): Prom
       const turn = await testDb.agentTurn.findFirst({ where: {
         id: prepared.fillTurnId, userId: ids.user, sessionId: prepared.sessionId, session: { userId: ids.user },
       }, select: { status: true, error: true, rootTaskId: true } })
-      const [root, applicationTask, approval, wait, steps, tools, events] = await Promise.all([
+      const [root, applicationTask, approval, wait, steps, tools, events, deadLetters] = await Promise.all([
         typeof turn?.rootTaskId === "string" ? testDb.subAgentTask.findFirst({ where: {
           id: turn.rootTaskId, rootTaskId: turn.rootTaskId, sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
           parentTaskId: null, role: "orchestrator", taskType: "root", session: { userId: ids.user },
@@ -1543,9 +1645,12 @@ async function stage8FillFailureSnapshot(prepared: Stage8PreparedScenario): Prom
         testDb.agentEvent.findMany({ where: {
           sessionId: prepared.sessionId, turnId: prepared.fillTurnId, type: { in: [...STAGE8_EVENT_TYPES] },
         }, orderBy: { sequence: "desc" }, take: 16, select: { type: true } }),
+        testDb.agentOutbox.findMany({ where: { topic: "agent.turn.dlq", aggregateId: prepared.fillTurnId },
+          orderBy: { createdAt: "desc" }, take: 8, select: { payload: true } }),
       ])
-      return stage8FailureSummary({ expectedApprovalId: prepared.submitApprovalId, turn, root, applicationTask,
-        approval, wait, steps, tools, events })
+      return stage8FailureSummary({ expectedApprovalId: prepared.submitApprovalId, expectedSessionId: prepared.sessionId,
+        expectedTurnId: prepared.fillTurnId, turn, root, applicationTask, approval, wait, steps, tools, events,
+        deadLetters: turn ? deadLetters : [], workerFailureLines: turn ? worker?.lines ?? [] : [] })
     }, Date.now() + 1_200)
   } catch {
     return { available: false }
