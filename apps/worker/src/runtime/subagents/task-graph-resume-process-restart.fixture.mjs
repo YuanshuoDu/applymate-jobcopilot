@@ -12,6 +12,9 @@ import { hashArtifactContent } from "./artifact-adapters.ts"
 import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.ts"
 import { defaultSubagentPolicy, parseSubagentJobPayload } from "./types.ts"
 import { PgSubagentTaskStore } from "./pg-store.ts"
+import { AgentTreeManager } from "./manager.ts"
+import { parseSubagentDispatchJobId } from "./dispatch-identity.ts"
+import { createCorrectionWriterRestartModel } from "./task-graph-correction-writer-restart.fixture-support.mjs"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.ts"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.ts"
@@ -1035,6 +1038,15 @@ async function startSelectedJobQueueWorker(runtime) {
     if (!payload || payload.sessionId !== selected.sessionId || payload.rootTaskId !== selected.rootTaskId) {
       throw new Error("p3_selected_job_queue_payload_scope_invalid")
     }
+    const dispatchIdentity = selected.correctionWriterMode === true
+      ? parseSubagentDispatchJobId(job.id, payload.taskId)
+      : undefined
+    if (selected.correctionWriterMode === true) {
+      if (!dispatchIdentity || payload.taskId !== selected.correctionWriterTaskId) {
+        throw new Error("p3_correction_writer_dispatch_identity_invalid")
+      }
+      say(`P3_CORRECTION_WRITER_BULL_DELIVERY ${payload.taskId} ${dispatchIdentity.generation} ${process.pid}`)
+    }
     if (payload.taskId === selected.stopReviewerTaskId) {
       say("P3_SELECTED_JOB_STOP_REVIEW_QUEUED " + payload.taskId)
       await waitForCommand("start-selected-job-review:" + payload.taskId)
@@ -1049,7 +1061,7 @@ async function startSelectedJobQueueWorker(runtime) {
         throw new Error("p3_selected_job_child_lease_scope_invalid")
       }
       const taskSelection = record(record(lease.context)?.selectedJobPreparation)
-      const selectedTaskIds = [selected.writerTaskId, selected.reviewerTaskId, selected.stopReviewerTaskId]
+      const selectedTaskIds = [selected.writerTaskId, selected.reviewerTaskId, selected.stopReviewerTaskId, selected.correctionWriterTaskId]
         .filter(taskId => typeof taskId === "string")
       if (taskSelection?.jobId !== selected.jobId || !selectedTaskIds.includes(lease.id)) {
         throw new Error("p3_selected_job_task_lineage_invalid")
@@ -1062,6 +1074,10 @@ async function startSelectedJobQueueWorker(runtime) {
         pool,
         authorizeUsage: async () => noReservationUsageAuthorization(),
         modelRuntimeFactory: ({ task }) => {
+          if (task.id === selected.correctionWriterTaskId && selected.correctionWriterMode === true) {
+            return createCorrectionWriterRestartModel({ selected, task, observations, modelProfile,
+              latestToolResult, record, say, waitForCommand, roleResultSchema: ROLE_RESULT_SCHEMA })
+          }
           if (task.role === "writer") return selectedJobDraftModel(selected, task, observations)
           if (task.role === "reviewer") return selectedJobReviewerModel(selected, task, observations)
           throw new Error("p3_unexpected_selected_job_child_role")
@@ -1069,7 +1085,7 @@ async function startSelectedJobQueueWorker(runtime) {
       })
       childResult = await executor({ lease })
       return childResult
-    })
+    }, dispatchIdentity)
     const structured = record(record(childResult?.result)?.structuredResult)
     say("P3_SELECTED_JOB_CHILD_SETTLED " + payload.taskId + " " + JSON.stringify({
       ...leaseIdentity,
@@ -1081,7 +1097,8 @@ async function startSelectedJobQueueWorker(runtime) {
       observations,
     }))
     return outcome
-  }, { connection: redisConnection, skipVersionCheck: true, concurrency: 1 })
+  }, { connection: redisConnection, skipVersionCheck: true, concurrency: 1,
+    ...(selected.correctionWriterMode === true ? { lockDuration: 1_000, stalledInterval: 500, maxStalledCount: 1 } : {}) })
   selectedJobWorker = worker
   await worker.waitUntilReady()
   say("P3_SELECTED_JOB_QUEUE_READY " + selected.queueName)
@@ -1090,6 +1107,18 @@ async function startSelectedJobQueueWorker(runtime) {
 function flags() {
   return { cognitiveLoopEnabled: false, planningEnabled: true, planningExecutionEnabled: true, taskGraphPlanningEnabled: true,
     childExecutionEnabled: true, coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false }
+}
+async function runCorrectionWriterRestartWorker(resume) {
+  const selected = record(ids.selectedJob)
+  if (!selected || selected.correctionWriterMode !== true || typeof selected.correctionWriterTaskId !== "string") {
+    throw new Error("p3_correction_writer_restart_scope_missing")
+  }
+  const ownerId = `p3-correction-writer-worker-${resume ? "two" : "one"}-${process.pid}`
+  const manager = new AgentTreeManager(new PgSubagentTaskStore(pool, 2_500), { heartbeatMs: 200 })
+  const runtime = await startRuntime(ownerId, resume, manager)
+  await startSelectedJobQueueWorker(runtime)
+  say("P3_CORRECTION_WRITER_RESTART_READY " + (resume ? "worker_two" : "worker_one"))
+  await waitForStop()
 }
 function assertRestoredGraph(request) {
   const graph = graphFromRequest(request), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : [], expected = ids.expectedSnapshot?.nodes
@@ -1375,10 +1404,11 @@ function node(key, templateId, goal, successCriteria, dependsOn) {
   return { key, templateId, goal, successCriteria, dependsOn, verification }
 }
 function waitArgs(key, taskIds) { return { idempotencyKey: key + ":" + ids.turnId, taskIds, mode: "all", timeoutMs: 30_000 } }
-async function startRuntime(workerOwnerId, resume) {
+async function startRuntime(workerOwnerId, resume, manager) {
   return createCanonicalTurnRuntime(pool, {
     workerId: workerOwnerId, productionFlags: flags(), taskGraphCommandPort: createPgTaskGraphCommandPort(pool),
     taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => noReservationUsageAuthorization(),
+    ...(manager ? { manager } : {}),
     modelRuntimeFactory() {
       let modelRounds = 0
       return { adapter: {
@@ -2063,11 +2093,14 @@ try {
     say("P3_PRIVATE_FIXTURE_GUARD_OK")
     process.stdin.off("data", onStdinData); process.stdin.pause(); process.stdin.destroy()
   }
-  else if (mode === "park-parent" || mode === "resume-parent" || mode === "park-discovery" || mode === "resume-discovery"
+  else if (mode === "correction-writer-worker-one" || mode === "correction-writer-worker-two"
+    || mode === "park-parent" || mode === "resume-parent" || mode === "park-discovery" || mode === "resume-discovery"
     || mode === "crash-archived-wait" || mode === "resume-archived-wait") {
     assertDisposableServiceUrls()
     await loadSharedRedisModule()
-    if (mode === "park-parent") await runFirstWorker()
+    if (mode === "correction-writer-worker-one") await runCorrectionWriterRestartWorker(false)
+    else if (mode === "correction-writer-worker-two") await runCorrectionWriterRestartWorker(true)
+    else if (mode === "park-parent") await runFirstWorker()
     else if (mode === "resume-parent") await runSecondWorker()
     else if (mode === "park-discovery") await runDiscoveryFirstWorker()
     else if (mode === "resume-discovery") await runDiscoverySecondWorker()
