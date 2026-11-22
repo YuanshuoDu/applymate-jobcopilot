@@ -65,6 +65,14 @@ describe("verified shortlist selection admission", () => {
     expect(test.job.findMany).toHaveBeenCalledWith({ where: { userId: owner.userId, id: { in: selected } }, select: { id: true } })
   })
 
+  it("rejects malformed locked-owner identities before querying proof", async () => {
+    const test = fixture()
+
+    await expect(verifyVerifiedShortlistSelection(test.tx, { id: "session/1", userId: owner.userId }, source, selected)).resolves.toBeNull()
+    await expect(verifyVerifiedShortlistSelection(test.tx, { id: owner.id, userId: " user-1" }, source, selected)).resolves.toBeNull()
+    expect(test.agentTurn.findFirst).not.toHaveBeenCalled()
+  })
+
   it("canonicalizes the same selected set regardless of request order", async () => {
     const first = fixture(), second = fixture()
     const left = await verifyVerifiedShortlistSelection(first.tx, owner, source, ["job-2", "job-1"])

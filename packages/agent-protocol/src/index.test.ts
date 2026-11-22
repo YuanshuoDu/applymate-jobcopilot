@@ -5,8 +5,12 @@ import {
   AgentSessionSchema,
   AgentTurnSchema,
   OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+  SELECTED_JOB_BATCH_PREPARATION_INTENT,
   SessionControlEventPayloadSchema,
   TurnIntentSchema,
+  VERIFIED_SHORTLIST_SELECTION_SCHEMA,
+  parseVerifiedShortlistSelectionBinding,
+  sameVerifiedShortlistSelectionBinding,
   schemaVersion,
   validate,
 } from './index.js'
@@ -21,5 +25,14 @@ describe('public protocol export surface', () => {
     expect(SessionControlEventPayloadSchema.$id).toBe('agent.session.control.event-payload')
     expect(TurnIntentSchema.$id).toBe('agent.turn-intent')
     expect(validate(TurnIntentSchema, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)).toBe(true)
+    expect(validate(TurnIntentSchema, SELECTED_JOB_BATCH_PREPARATION_INTENT)).toBe(true)
+    expect(VERIFIED_SHORTLIST_SELECTION_SCHEMA).toBe('agent-harness.v2.verified-shortlist-selection.v1')
+    const binding = parseVerifiedShortlistSelectionBinding({
+      schemaVersion: VERIFIED_SHORTLIST_SELECTION_SCHEMA,
+      source: { sessionId: 'session-1', sourceTurnId: 'turn-1', rootTaskId: 'root-1', graphItemId: 'task-graph:root-1', graphRevision: 1 },
+      selectedJobIds: ['job-1', 'job-2'],
+    })
+    expect(binding).not.toBeNull()
+    expect(sameVerifiedShortlistSelectionBinding(binding, binding)).toBe(true)
   })
 })

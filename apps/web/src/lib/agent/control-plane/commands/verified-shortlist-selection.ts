@@ -1,30 +1,24 @@
-import { TurnIntentSchema, parseTaskGraphSnapshot, validate } from "@jobcopilot/agent-protocol"
+import {
+  VERIFIED_SHORTLIST_SELECTION_SCHEMA,
+  TurnIntentSchema,
+  parseTaskGraphSnapshot,
+  parseVerifiedShortlistJobIds,
+  parseVerifiedShortlistSelectionBinding,
+  parseVerifiedShortlistSourceIdentity,
+  validate,
+  type VerifiedShortlistSelectionBinding,
+  type VerifiedShortlistSourceIdentity,
+} from "@jobcopilot/agent-protocol"
 
 import { projectInteractiveDiscoveryShortlist } from "@/app/api/agent/sessions/[id]/tasks/interactive-discovery-shortlist"
 import { canonicalTaskGraphItemId } from "@/lib/agent/session/final-task-graph-source-detail"
 import type { CommandTransaction } from "./transaction"
 
-export const VERIFIED_SHORTLIST_SELECTION_SCHEMA = "agent-harness.v2.verified-shortlist-selection.v1" as const
-
-export type VerifiedShortlistSourceIdentity = Readonly<{
-  sessionId: string
-  sourceTurnId: string
-  rootTaskId: string
-  graphItemId: string
-  graphRevision: number
-}>
-
-export type VerifiedShortlistSelectionBinding = Readonly<{
-  schemaVersion: typeof VERIFIED_SHORTLIST_SELECTION_SCHEMA
-  source: VerifiedShortlistSourceIdentity
-  selectedJobIds: readonly string[]
-}>
+export { VERIFIED_SHORTLIST_SELECTION_SCHEMA, sameVerifiedShortlistSelectionBinding } from "@jobcopilot/agent-protocol"
+export type { VerifiedShortlistSelectionBinding, VerifiedShortlistSourceIdentity } from "@jobcopilot/agent-protocol"
 
 type LockedOwnerSession = Readonly<{ id: string; userId: string }>
-const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
-const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/
-const SOURCE_KEYS = ["sessionId", "sourceTurnId", "rootTaskId", "graphItemId", "graphRevision"] as const
-const BINDING_KEYS = ["schemaVersion", "source", "selectedJobIds"] as const
+const OWNER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 
 /** Rechecks source proof and owned Jobs inside the caller's locked Session transaction. */
 export async function verifyVerifiedShortlistSelection(
@@ -33,9 +27,9 @@ export async function verifyVerifiedShortlistSelection(
   sourceValue: unknown,
   selectionValue: unknown,
 ): Promise<VerifiedShortlistSelectionBinding | null> {
-  if (!safeId(owner.id) || !safeId(owner.userId)) return null
+  if (!safeOwnerId(owner.id) || !safeOwnerId(owner.userId)) return null
   const source = parseSource(sourceValue)
-  const selected = parseSelectedJobIds(selectionValue)
+  const selected = parseVerifiedShortlistJobIds(selectionValue)
   if (!source || source.sessionId !== owner.id || !selected) return null
 
   const turn = await tx.agentTurn.findFirst({
@@ -78,16 +72,7 @@ export async function verifyVerifiedShortlistSelection(
   if (jobs.length !== selectedJobIds.length || ownedJobs.size !== selectedJobIds.length
     || selectedJobIds.some(id => !ownedJobs.has(id))) return null
 
-  return freezeBinding(source, selectedJobIds)
-}
-
-/** Compares the persisted command intent to a fresh, canonicalized source/selection binding. */
-export function sameVerifiedShortlistSelectionBinding(persisted: unknown, expected: VerifiedShortlistSelectionBinding): boolean {
-  const left = parseBinding(persisted)
-  const right = parseBinding(expected)
-  return Boolean(left && right && sameSource(left.source, right.source)
-    && left.selectedJobIds.length === right.selectedJobIds.length
-    && left.selectedJobIds.every((id, index) => id === right.selectedJobIds[index]))
+  return parseVerifiedShortlistSelectionBinding({ schemaVersion: VERIFIED_SHORTLIST_SELECTION_SCHEMA, source, selectedJobIds })
 }
 
 function hasDiscoveryIntent(value: unknown): boolean {
@@ -98,38 +83,14 @@ function hasDiscoveryIntent(value: unknown): boolean {
 }
 
 function parseSource(value: unknown): VerifiedShortlistSourceIdentity | null {
-  const source = dataRecord(value, SOURCE_KEYS)
-  if (!source || !safeId(source.sessionId) || !safeId(source.sourceTurnId) || !safeId(source.rootTaskId)
-    || !safeId(source.graphItemId) || !Number.isSafeInteger(source.graphRevision) || Number(source.graphRevision) < 1) return null
-  if (source.graphItemId !== canonicalTaskGraphItemId(source.rootTaskId)) return null
-  return Object.freeze({ sessionId: source.sessionId, sourceTurnId: source.sourceTurnId, rootTaskId: source.rootTaskId,
-    graphItemId: source.graphItemId, graphRevision: Number(source.graphRevision) })
+  const source = parseVerifiedShortlistSourceIdentity(value)
+  if (!source || source.graphItemId !== canonicalTaskGraphItemId(source.rootTaskId)) return null
+  return source
 }
 
-function parseSelectedJobIds(value: unknown): string[] | null {
-  const rows = denseValues(value, 3)
-  if (!rows || rows.length < 2 || rows.some(id => typeof id !== "string" || id.trim() !== id || !JOB_ID.test(id))
-    || new Set(rows).size !== rows.length) return null
-  return rows as string[]
+function safeOwnerId(value: unknown): value is string {
+  return typeof value === "string" && value.trim() === value && OWNER_ID.test(value)
 }
-
-function parseBinding(value: unknown): VerifiedShortlistSelectionBinding | null {
-  const binding = dataRecord(value, BINDING_KEYS)
-  if (!binding || binding.schemaVersion !== VERIFIED_SHORTLIST_SELECTION_SCHEMA) return null
-  const source = parseSource(binding.source), selectedJobIds = parseSelectedJobIds(binding.selectedJobIds)
-  return source && selectedJobIds ? freezeBinding(source, selectedJobIds) : null
-}
-
-function freezeBinding(source: VerifiedShortlistSourceIdentity, selectedJobIds: readonly string[]): VerifiedShortlistSelectionBinding {
-  return Object.freeze({ schemaVersion: VERIFIED_SHORTLIST_SELECTION_SCHEMA, source,
-    selectedJobIds: Object.freeze([...selectedJobIds]) })
-}
-
-function sameSource(left: VerifiedShortlistSourceIdentity, right: VerifiedShortlistSourceIdentity): boolean {
-  return SOURCE_KEYS.every(key => left[key] === right[key])
-}
-
-function safeId(value: unknown): value is string { return typeof value === "string" && value.trim() === value && ID.test(value) }
 
 function dataRecord(value: unknown, exactKeys?: readonly string[]): Record<string, unknown> | null {
   try {
@@ -144,21 +105,5 @@ function dataRecord(value: unknown, exactKeys?: readonly string[]): Record<strin
       result[key] = descriptor.value
     }
     return result
-  } catch { return null }
-}
-
-function denseValues(value: unknown, maximum: number): unknown[] | null {
-  try {
-    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length > maximum) return null
-    const keys = Reflect.ownKeys(value), descriptors = Object.getOwnPropertyDescriptors(value)
-    if (keys.length !== value.length + 1 || keys.some(key => key !== "length" && (typeof key !== "string"
-      || !/^\d+$/.test(key) || String(Number(key)) !== key || Number(key) >= value.length))) return null
-    const rows: unknown[] = []
-    for (let index = 0; index < value.length; index += 1) {
-      const descriptor = descriptors[String(index)]
-      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return null
-      rows.push(descriptor.value)
-    }
-    return rows
   } catch { return null }
 }
