@@ -26,7 +26,8 @@ import { TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, parseTaskGraph
 import { TASK_GRAPH_OPERATIONAL_FAILED_BRANCH_RELATION_SCHEMA_VERSION, parseTaskGraphOperationalFailedBranchRelation,
   taskGraphOperationalFailedBranchFingerprint } from "./task-graph-pg-operational-failed-branch-relation.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
-import { assertNoUnresolvedSteering, readSteeringReconciliationState } from "./steering-reconciliation-read.js"
+import { assertSessionTerminalAdmission, SessionPauseRequestedError } from "../session-gate.js"
+import { assertNoUnresolvedSteering, readSteeringReconciliationState, readSteeringReconciliationStateForTerminal } from "./steering-reconciliation-read.js"
 
 const historyOverride = vi.hoisted(() => ({ entries: null as readonly unknown[] | null }))
 vi.mock("./steering-reconciliation-history.js", async importOriginal => {
@@ -68,7 +69,8 @@ function accepted(row: ReturnType<typeof input>, patch: Record<string, unknown> 
 }
 function fixture(options: { steerStatus?: string; steerConsumer?: string | null; source?: string; actor?: string; checkpointIds?: string[];
   cursor?: string; rootHint?: string | null; badItem?: boolean; badCorrelation?: boolean; laterDecision?: boolean; freshSteer?: boolean;
-  goalOnlyWithoutOriginal?: boolean; originalInputId?: string; originalClientMessageId?: string; originalPayloadInputId?: unknown } = {}) {
+  goalOnlyWithoutOriginal?: boolean; originalInputId?: string; originalClientMessageId?: string; originalPayloadInputId?: unknown;
+  workAdmissionDenied?: boolean; terminalFillEvidence?: boolean } = {}) {
   const currentScope = options.laterDecision ? { ...scope, stepId: "later-step" } : scope
   const originalClientMessageId = options.originalClientMessageId ?? "root-client-message"
   const root = input(options.originalInputId ?? "original-input", "steer", "consumed", "1", "origin-step")
@@ -108,7 +110,8 @@ function fixture(options: { steerStatus?: string; steerConsumer?: string | null;
   const calls: Array<{ sql: string; values?: unknown[] }> = []
   const client = { query: vi.fn(async (sql: string, values?: unknown[]) => {
     calls.push({ sql, values })
-    if (sql.startsWith('SELECT session."id"') && sql.includes("pause_request")) return { rows: [{ id: scope.sessionId }], rowCount: 1 }
+    if (sql.includes('JOIN "application_tasks" AS fill_task')) return { rows: options.terminalFillEvidence ? [{ id: scope.sessionId }] : [], rowCount: options.terminalFillEvidence ? 1 : 0 }
+    if (sql.startsWith('SELECT session."id"') && sql.includes("pause_request")) return { rows: options.workAdmissionDenied ? [] : [{ id: scope.sessionId }], rowCount: options.workAdmissionDenied ? 0 : 1 }
     if (sql.includes("FOR UPDATE") && sql.includes('FROM "agent_sessions"')) return { rows: [{ id: scope.sessionId }], rowCount: 1 }
     if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: scope.turnId }], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: [{ id: scope.rootTaskId }], rowCount: 1 }
@@ -487,6 +490,34 @@ function capacityReadFixture(pendingCount: number, consumedCount = 0) {
 afterEach(() => { historyOverride.entries = null })
 
 describe("durable steering reconciliation reader", () => {
+  it("keeps ordinary admission strict and permits only the same exact terminal receipt to skip work admission", async () => {
+    const f = fixture({ workAdmissionDenied: true, terminalFillEvidence: true })
+    const readScope = { ...scope, rootInputId: null }
+    await expect(readSteeringReconciliationState(f.client, readScope)).rejects.toBeInstanceOf(SessionPauseRequestedError)
+    const admission = await assertSessionTerminalAdmission(f.client, { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
+      rootTaskId: scope.rootTaskId, source: "user", executionMode: "canonical_task_graph" })
+    const beforeTerminalRead = f.calls.length
+
+    const state = await readSteeringReconciliationStateForTerminal(f.client, readScope, admission)
+
+    expect(state.unresolvedInputs).toEqual([{ id: "steer-1", acceptedSequence: 10n, status: "consumed", consumedByStepId: "origin-step", consumingOrdinal: 0 }])
+    expect(f.calls.slice(beforeTerminalRead).some(call => call.sql.startsWith('SELECT session."id"') && call.sql.includes("pause_request"))).toBe(false)
+    expect(f.calls.some(call => call.sql.includes('FROM "agent_sessions"') && call.sql.includes("FOR UPDATE"))).toBe(true)
+    expect(f.calls.some(call => call.sql.includes('FROM "agent_turns"') && call.sql.includes("FOR UPDATE"))).toBe(true)
+    expect(f.calls.some(call => call.sql.includes("WITH wall_clock"))).toBe(true)
+  })
+
+  it("rejects terminal receipts reused with another client or owner scope", async () => {
+    const f = fixture({ workAdmissionDenied: true, terminalFillEvidence: true })
+    const admission = await assertSessionTerminalAdmission(f.client, { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
+      rootTaskId: scope.rootTaskId, source: "user", executionMode: "canonical_task_graph" })
+    const other = fixture({ workAdmissionDenied: true, terminalFillEvidence: true })
+
+    await expect(readSteeringReconciliationStateForTerminal(other.client, scope, admission)).rejects.toThrow("session_terminal_admission_mismatch")
+    await expect(readSteeringReconciliationStateForTerminal(f.client, { ...scope, userId: "foreign-user" }, admission))
+      .rejects.toThrow("session_terminal_admission_mismatch")
+  })
+
   it("excludes the Turn-bound original regardless of delivery and validates historical consumption", async () => {
     const f = fixture({ rootHint: null })
     const state = await readSteeringReconciliationState(f.client, { ...scope, rootInputId: f.rootHint })

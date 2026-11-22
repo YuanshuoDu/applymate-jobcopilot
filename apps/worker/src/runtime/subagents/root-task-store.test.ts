@@ -2,19 +2,32 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
 import { createPgRootTaskStore } from "./root-task-store.js"
+import { assertSessionTerminalAdmission } from "../session-gate.js"
 import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
 
 const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
 const { updateRootObjectiveHistoryProjectionMock } = vi.hoisted(() => ({ updateRootObjectiveHistoryProjectionMock: vi.fn(async () => true) }))
+const terminalGraphCheckHarness = vi.hoisted(() => ({ enabled: false, calls: [] as unknown[][] }))
 vi.mock("./steering-reconciliation-ledger.js", async importOriginal => ({
   ...await importOriginal<typeof import("./steering-reconciliation-ledger.js")>(),
   assertNoUnresolvedSteering: assertNoUnresolvedSteeringMock,
 }))
 vi.mock("../context/objective-history-projection.js", () => ({ updateRootObjectiveHistoryProjection: updateRootObjectiveHistoryProjectionMock }))
+vi.mock("../turns/turn-execution-completion-gate.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../turns/turn-execution-completion-gate.js")>()
+  return { ...actual, checkTaskGraphTerminalVerification: (...args: Parameters<typeof actual.checkTaskGraphTerminalVerification>) => {
+    if (!terminalGraphCheckHarness.enabled) return actual.checkTaskGraphTerminalVerification(...args)
+    terminalGraphCheckHarness.calls.push(args)
+    return Promise.resolve({ ok: true as const })
+  } }
+})
 
-beforeEach(() => updateRootObjectiveHistoryProjectionMock.mockReset().mockResolvedValue(true))
+beforeEach(() => {
+  updateRootObjectiveHistoryProjectionMock.mockReset().mockResolvedValue(true)
+  terminalGraphCheckHarness.enabled = false; terminalGraphCheckHarness.calls = []
+})
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 3,
@@ -615,6 +628,24 @@ describe("createPgRootTaskStore", () => {
     expect(fake.calls).not.toContain("COMMIT")
     expect(fake.client.query.mock.calls.some(([sql]) => sql.includes('FROM "agent_items" AS item'))).toBe(true)
     expect(fake.client.query.mock.calls.some(([sql]) => sql.includes("payload"))).toBe(true)
+  })
+
+  it("forwards only the supplied terminal admission to graph verification on the caller client", async () => {
+    const fake = completionPool([], true, false, false)
+    const admission = await assertSessionTerminalAdmission(fake.client as never, { userId: lease.userId, sessionId: lease.sessionId,
+      turnId: lease.turnId, rootTaskId: "root-turn-1", source: "user", executionMode: "canonical_task_graph" })
+    terminalGraphCheckHarness.enabled = true
+    const store = createPgRootTaskStore(fake.pool)
+
+    await expect(store.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, client: fake.client as never, terminalAdmission: admission }))
+      .resolves.toEqual({ ok: true })
+    await expect(store.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, client: fake.client as never }))
+      .resolves.toEqual({ ok: true })
+
+    expect(terminalGraphCheckHarness.calls).toHaveLength(2)
+    expect(terminalGraphCheckHarness.calls[0]?.[0]).toBe(fake.client)
+    expect(terminalGraphCheckHarness.calls[0]?.[5]).toBe(admission)
+    expect(terminalGraphCheckHarness.calls[1]?.[5]).toBeUndefined()
   })
 
   it("holds its owned transaction until the asynchronous graph check resolves", async () => {

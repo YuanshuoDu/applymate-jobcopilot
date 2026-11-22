@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { assertSessionTerminalAdmission, assertSessionWorkAdmission, OPEN_SESSION, RUNNABLE_SESSION, SESSION_WORK_ADMISSION, SessionPauseRequestedError, isSessionPauseRequestedError } from "./session-gate.js"
+import { assertSessionTerminalAdmission, assertSessionWorkAdmission, OPEN_SESSION, RUNNABLE_SESSION, SESSION_WORK_ADMISSION, SessionPauseRequestedError, isSessionPauseRequestedError, revokeSessionTerminalAdmissionsForClient, sessionTerminalAdmissionKindFor } from "./session-gate.js"
 
 describe("Worker session gates", () => {
   it("keeps runnable work fenced to open sessions", () => {
@@ -44,7 +44,9 @@ describe("Worker session gates", () => {
     }))
     const input = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", source: "user", executionMode: "canonical_task_graph" }
 
-    await expect(assertSessionTerminalAdmission({ query } as never, input)).resolves.toBeUndefined()
+    const client = { query } as never
+    const admission = await assertSessionTerminalAdmission(client, input)
+    expect(sessionTerminalAdmissionKindFor(admission, client, input)).toBe("derived_fill")
 
     expect(query).toHaveBeenCalledTimes(2)
     expect(query.mock.calls[0]?.[0]).toContain(SESSION_WORK_ADMISSION)
@@ -62,12 +64,21 @@ describe("Worker session gates", () => {
     expect(query.mock.calls[1]?.[1]).toEqual(["session-1", "user-1", "turn-1", "root-1"])
   })
 
+  it("revokes terminal admission receipts when their transaction client is released", async () => {
+    const query = vi.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [{ id: "session-1" }] }))
+    const client = { query } as never
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", source: "user", executionMode: "canonical_task_graph" }
+    const admission = await assertSessionTerminalAdmission(client, scope)
+    revokeSessionTerminalAdmissionsForClient(client)
+    expect(() => sessionTerminalAdmissionKindFor(admission, client, scope)).toThrow("session_terminal_admission_mismatch")
+  })
+
   it("admits the production null-mode Fill Turn only with the exact completed Fill child and wait", async () => {
     const query = vi.fn(async (sql: string) => ({ rows: sql.includes('JOIN "application_tasks" AS fill_task') ? [{ id: "session-1" }] : [] }))
 
     await expect(assertSessionTerminalAdmission({ query } as never, {
       userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", source: "user", executionMode: null,
-    })).resolves.toBeUndefined()
+    })).resolves.toBeDefined()
     expect(query.mock.calls[1]?.[0]).toContain(`filler."status" = 'completed'`)
   })
 
