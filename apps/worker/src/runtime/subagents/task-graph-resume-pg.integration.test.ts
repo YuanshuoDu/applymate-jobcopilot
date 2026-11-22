@@ -4502,6 +4502,17 @@ function currentGraphFromRequest(request: HarnessModelRequest): RecordValue | nu
   return null
 }
 
+function currentGraphRequestDiagnostic(request: HarnessModelRequest): string {
+  let markers = 0
+  for (const message of request.messages) for (const part of message.content) {
+    if (part.type === "text" && part.text.includes('"kind":"task_graph_current"')) markers += 1
+  }
+  const graph = currentGraphFromRequest(request)
+  const revision = Number.isSafeInteger(graph?.revision) ? String(graph?.revision) : "none"
+  const nodes = Array.isArray(graph?.nodes) ? Math.min(graph.nodes.length, 16) : "none"
+  return `markers_${Math.min(markers, 99)}_revision_${revision}_nodes_${nodes}`
+}
+
 function expectPassedVerificationReport(value: unknown, ...criterionIds: string[]): void {
   const report = record(value)
   expect(report).toMatchObject({
@@ -8953,7 +8964,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, resumeFailureOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, failureOwner, "waiting_for_user")
     await seed(pool, operationalFailureOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
-    await seed(pool, operationalDeadlineOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, operationalAppendOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, stopOwner, "waiting_for_user")
     await seed(pool, restartOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
@@ -11693,6 +11703,47 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const expectedFailureReason = deadlineExpiry ? "task_graph_child_deadline_exceeded" : "child_resume_unavailable"
     const expectedFailureCategory = deadlineExpiry ? "execution_deadline_exceeded" : "resume_state_unavailable"
     const sourceGoal = `Recover Scout after its persisted execution state is unavailable ${value.suffix}`
+    if (deadlineExpiry) {
+      await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [
+        value.userId, `${value.userId}@example.invalid`,
+      ])
+      await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+        VALUES ($1, $2, $3, 'running', 'test', CURRENT_TIMESTAMP)`, [value.sessionId, value.userId, sourceGoal])
+      const startService = await createDisposableWebObjectiveStartService(databaseUrl!)
+      let started: ObjectiveStartFixtureResult | undefined
+      try {
+        started = await startService.commands.start({
+          sessionId: value.sessionId, userId: value.userId, clientMessageId: `p3-1234-objective-start:${value.suffix}`,
+          source: "user", objective: sourceGoal, content: [{ type: "text", text: sourceGoal }],
+          verificationRequirements: {
+            schemaVersion: "agent-harness.v2.objective-requirements.v1",
+            requirements: [
+              { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+            ],
+          },
+        })
+      } finally {
+        await startService.prisma.$disconnect()
+      }
+      if (!started) throw new Error("ObjectiveStart did not return an operational replacement Turn")
+      expect(started.disposition).toBe("started")
+      value.turnId = started.turnId
+      const turn = await pool!.query<{ input: unknown; source: string; executionMode: string | null }>(
+        `SELECT "input", "source", "executionMode" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+        [value.turnId, value.sessionId, value.userId],
+      )
+      expect(turn.rows).toHaveLength(1)
+      expect(turn.rows[0]).toMatchObject({ source: "user", executionMode: "canonical_task_graph" })
+      expect(record(turn.rows[0]?.input)).toMatchObject({
+        intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+        verificationRequirements: {
+          schemaVersion: "agent-harness.v2.objective-requirements.v1",
+          requirements: [
+            { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+          ],
+        },
+      })
+    }
     const dependentGoal = `Keep the Analyst behind the failed Scout ${value.suffix}`
     const independentGoal = `Complete unrelated Analyst work after the Scout failure ${value.suffix}`
     const replacementScoutGoal = `Read the source again with a fresh Scout ${value.suffix}`
@@ -11712,6 +11763,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
     let rootExecutions = 0
     let rootTaskId = ""
+    let targetRootTaskId: string | null = null
     let originalOperationalFailureResult: unknown
     let originalFailureEnvelopeObserved = false
     let initialTaskIds: string[] = []
@@ -11739,6 +11791,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let canonicalExecutionDiagnostic = "not_observed"
     let modelCallbackStageDiagnostic = "not_entered"
     let modelCallbackStatusDiagnostic = "not_observed"
+    let modelCallbackGraphDiagnostic = "not_observed"
     let modelCallbackFailureDiagnostic = "none"
     let finalGraphVerified = false
     let replacementWaitResumePath: "same_adapter" | "fresh_adapter" | null = null
@@ -11880,13 +11933,54 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       },
       taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES },
       authorizeUsage: authorizeUnreservedUsage,
-      modelRuntimeFactory: () => {
+      modelRuntimeFactory: async ({ userId: factoryUserId, state }) => {
+        if (deadlineExpiry) {
+          const stateRootTaskId = typeof state.rootTaskId === "string" && state.rootTaskId.length > 0 ? state.rootTaskId : null
+          const targetFactoryCandidate = factoryUserId === value.userId && state.scope.userId === value.userId
+            && state.goal === sourceGoal && state.snapshot.goal?.id === `turn-goal:${value.turnId}`
+          const targetTurn = targetFactoryCandidate ? await pool!.query<{
+            id: string; sessionId: string; userId: string; rootTaskId: string; rootLeaseOwner: string
+          }>(
+            `SELECT turn."id", turn."sessionId", turn."userId", root."id" AS "rootTaskId", root."leaseOwner" AS "rootLeaseOwner"
+             FROM "agent_turns" AS turn
+             JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+             JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+               AND root."turnId" = turn."id" AND root."rootTaskId" = root."id"
+             WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+               AND turn."executionMode" = 'canonical_task_graph' AND turn."status" = 'in_progress'
+               AND turn."leaseOwnerId" IS NOT NULL AND turn."leaseExpiresAt" > CURRENT_TIMESTAMP
+               AND root."parentTaskId" IS NULL AND root."role" = 'orchestrator' AND root."status" = 'running'
+               AND root."leaseOwner" = turn."leaseOwnerId" AND root."leaseExpiresAt" > CURRENT_TIMESTAMP`,
+            [value.turnId, value.sessionId, value.userId],
+          ) : undefined
+          const targetTurnMatches = targetTurn?.rows.length === 1 && targetTurn.rows[0]?.id === value.turnId
+            && targetTurn.rows[0]?.sessionId === value.sessionId && targetTurn.rows[0]?.userId === value.userId
+            && typeof targetTurn.rows[0]?.rootTaskId === "string" && targetTurn.rows[0].rootTaskId.length > 0
+            && typeof targetTurn.rows[0]?.rootLeaseOwner === "string" && targetTurn.rows[0].rootLeaseOwner.length > 0
+          if (targetTurnMatches) {
+            const persistedRootTaskId = targetTurn.rows[0]!.rootTaskId
+            if (stateRootTaskId !== null && stateRootTaskId !== persistedRootTaskId) throw new Error("p3_1234_root_state_mismatch")
+            if (targetRootTaskId !== null && targetRootTaskId !== persistedRootTaskId) throw new Error("p3_1234_root_identity_changed")
+            targetRootTaskId = persistedRootTaskId
+          }
+          if (!targetTurnMatches || targetRootTaskId !== targetTurn.rows[0]?.rootTaskId) {
+            const adapter: ModelAdapter = {
+              id: "p3-1234-non-target-recovery-guard", profile,
+              async *stream() { throw new Error("p3_1234_non_target_turn_blocked") },
+            }
+            return { adapter, registry: {} as never, candidates: [] }
+          }
+        }
         const execution = ++rootExecutions
         let round = 0
         const adapter: ModelAdapter = {
           id: "p3-operational-failure-replan-root-fixture", profile,
           async *stream(request) {
             try {
+            if (deadlineExpiry && (request.metadata.userId !== value.userId || request.metadata.sessionId !== value.sessionId
+              || request.metadata.turnId !== value.turnId || request.metadata.taskId !== targetRootTaskId)) {
+              throw new Error("p3_1234_model_request_scope_mismatch")
+            }
             round += 1
             modelCallbackStageDiagnostic = `execution_${execution}_round_${round}`
             if (execution === 1 && round === 1) {
@@ -11912,6 +12006,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               )
               rootTaskId = root.rows[0]?.rootTaskId ?? ""
               if (!rootTaskId) throw new Error("Operational failure fixture lost the current Root identity")
+              if (deadlineExpiry) {
+                const root = await pool!.query<{ role: string; allowedActions: string[] }>(`SELECT "role", "allowedActions" FROM "sub_agent_tasks"
+                  WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1 AND "parentTaskId" IS NULL`,
+                [rootTaskId, value.sessionId, value.turnId])
+                expect(root.rows).toHaveLength(1)
+                expect(root.rows[0]?.role).toBe("orchestrator")
+                expect(root.rows[0]?.allowedActions.slice().sort()).toEqual([
+                  "agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.wait",
+                ])
+              }
               yield { type: "tool_call_completed", callId: initialWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: initialWaitKey, taskIds: initialTaskIds, mode: "all", timeoutMs: 30_000,
               } }
@@ -11920,6 +12024,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             if (execution === 2 && round === 1) {
               modelCallbackStageDiagnostic = "failure_context_graph"
+              modelCallbackGraphDiagnostic = currentGraphRequestDiagnostic(request)
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
               modelCallbackStatusDiagnostic = nodes.map(node => safeLabel(node?.status)).join(",")
@@ -12269,7 +12374,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         throw error
       }
     }
-    await activateFixtureTurn(pool!, value)
+    if (!deadlineExpiry) await activateFixtureTurn(pool!, value)
     bootstrap = await createProductionWorkerBootstrap({
       pool: pool!, runtime, ownerId: value.ownerId, turnQueueFactory: createTurnQueue, turnRecoveryIntervalMs: 100,
       waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-operational-failure-resolver-${value.suffix}` },
@@ -12321,7 +12426,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForTurnStatus(pool!, value.turnId, "completed", 90_000, replacementWaitCallId)
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Turn status wait failed"
-      throw new Error(reason + "; replacementPlanCommand=" + replacementPlanCommandDiagnostic + "; replacementPlanResult=" + replacementPlanResultDiagnostic + "; canonicalExecution=" + canonicalExecutionDiagnostic + "; rootExecutions=" + rootExecutions + "; modelCallbackStage=" + modelCallbackStageDiagnostic + "; modelCallbackStatuses=" + modelCallbackStatusDiagnostic + "; modelCallbackFailure=" + modelCallbackFailureDiagnostic + "; replacementWaitCall=" + replacementWaitCallDiagnostic)
+      throw new Error(reason + "; replacementPlanCommand=" + replacementPlanCommandDiagnostic + "; replacementPlanResult=" + replacementPlanResultDiagnostic + "; canonicalExecution=" + canonicalExecutionDiagnostic + "; rootExecutions=" + rootExecutions + "; modelCallbackStage=" + modelCallbackStageDiagnostic + "; modelCallbackStatuses=" + modelCallbackStatusDiagnostic + "; modelCallbackGraph=" + modelCallbackGraphDiagnostic + "; modelCallbackFailure=" + modelCallbackFailureDiagnostic + "; replacementWaitCall=" + replacementWaitCallDiagnostic)
     }
     const turn = await pool!.query<{ rootTaskId: string | null; finalResponse: string | null; status: string }>(
       `SELECT "rootTaskId", "finalResponse", "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
@@ -12347,8 +12452,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(inlineFailureWaitObserved).toBe(true)
     expect(replacementPlanAccepted).toBe(true)
     expect(finalGraphVerified).toBe(true)
-    const tasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown; absoluteDeadlineAt: Date | null }>(
-      `SELECT task."id", task."goal", task."status", task."failureReason", task."result", task."absoluteDeadlineAt"
+    const tasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown; absoluteDeadlineAt: Date | null; role: string; taskType: string; allowedActions: string[]; expectedOutputSchema: unknown }>(
+      `SELECT task."id", task."goal", task."status", task."failureReason", task."result", task."absoluteDeadlineAt",
+        task."role", task."taskType", task."allowedActions", task."expectedOutputSchema"
        FROM "sub_agent_tasks" AS task
        JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $1
        JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
@@ -12367,10 +12473,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(byGoal.get(independentGoal)).toMatchObject({ id: independentTaskId, status: "completed", failureReason: null })
     expectPassedVerificationReport(record(byGoal.get(independentGoal)?.result)?.taskGraphVerificationReport, "finding-count")
     expect(byGoal.get(replacementScoutGoal)).toMatchObject({ id: replacementTaskIds[0], status: "completed", failureReason: null })
+    expect(byGoal.get(replacementScoutGoal)).toMatchObject({ role: TASK_GRAPH_TEMPLATES.scout.role,
+      taskType: TASK_GRAPH_TEMPLATES.scout.taskType, allowedActions: [...TASK_GRAPH_TEMPLATES.scout.allowedActions] })
+    expect(byGoal.get(replacementScoutGoal)?.expectedOutputSchema).toEqual(TASK_GRAPH_TEMPLATES.scout.expectedOutputSchema)
     expect(byGoal.get(replacementScoutGoal)?.absoluteDeadlineAt).toBeInstanceOf(Date)
     expect(byGoal.get(replacementScoutGoal)!.absoluteDeadlineAt!.getTime()).toBeGreaterThan(Date.now())
     expectPassedVerificationReport(record(byGoal.get(replacementScoutGoal)?.result)?.taskGraphVerificationReport, "candidate-count")
     expect(byGoal.get(replacementAnalystGoal)).toMatchObject({ id: replacementTaskIds[1], status: "completed", failureReason: null })
+    expect(byGoal.get(replacementAnalystGoal)).toMatchObject({ role: TASK_GRAPH_TEMPLATES.analyst.role,
+      taskType: TASK_GRAPH_TEMPLATES.analyst.taskType, allowedActions: [...TASK_GRAPH_TEMPLATES.analyst.allowedActions] })
+    expect(byGoal.get(replacementAnalystGoal)?.expectedOutputSchema).toEqual(TASK_GRAPH_TEMPLATES.analyst.expectedOutputSchema)
     expect(byGoal.get(replacementAnalystGoal)?.absoluteDeadlineAt).toBeInstanceOf(Date)
     expect(byGoal.get(replacementAnalystGoal)!.absoluteDeadlineAt!.getTime()).toBeGreaterThan(Date.now())
     expectPassedVerificationReport(record(byGoal.get(replacementAnalystGoal)?.result)?.taskGraphVerificationReport, "finding-count")
