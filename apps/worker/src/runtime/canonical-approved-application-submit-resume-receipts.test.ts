@@ -34,7 +34,8 @@ async function fixture(state: "form_filled" | "submission_authorized" = "form_fi
   const approval = { id: approvalId, userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, taskId: taskBase.id,
     jobId: taskBase.jobId, type: "submit_application", status: options.waitStatus ?? "approved", title: "Final submission authorization",
     body: "The form was filled without submission. Review the current job, material alignment, required answers, and sensitive declarations before authorizing an external submission.",
-    impact: { externalSubmission: true, jobId: taskBase.jobId }, payload: { applicationTaskId: taskBase.id, jobId: taskBase.jobId },
+    impact: { externalSubmission: true, jobId: taskBase.jobId }, payload: { applicationTaskId: taskBase.id, coverLetterId: taskBase.coverLetterId,
+      jobId: taskBase.jobId, resumeId: taskBase.resumeId },
     resourceHash, materialHash, answersHash, scopeHash, nonceHash, toolCallId: `application-submit:${taskBase.id}`, revision, expiresAt, decidedAt,
     consumedAt: null, waitItemId, waitStepId: null, waitTaskId: null, waitType: "approval_request", waitStatus: "completed",
     waitPhase: "commentary", waitRevision: 1, waitContent: { waitKind: "approval", approvalId, toolCallId: `application-submit:${taskBase.id}`,
@@ -90,6 +91,22 @@ describe("canonical approved application submit receipts", () => {
     })
     expect(result).toMatchObject({ state: "submission_authorized", workerTaskId: test.workerTaskId, outboxId: test.outboxId })
     expect(result).not.toHaveProperty("nonceHash")
+  })
+
+  it.each([
+    ["wrong resume", { resumeId: "resume-b" }],
+    ["wrong cover letter", { coverLetterId: "cover-letter-b" }],
+    ["missing nullable cover letter", {}],
+    ["extra field", { unexpected: true }],
+  ])("rejects an approval payload with %s", async (label, change) => {
+    const test = await fixture()
+    const approval = test.approval as Record<string, unknown>
+    const payload: Record<string, unknown> = { ...(approval.payload as Record<string, unknown>), ...change }
+    if (label === "missing nullable cover letter") delete payload.coverLetterId
+    approval.payload = payload
+    await expect(readCanonicalApprovedApplicationSubmitReceipts(test.client, {
+      lease, task: test.task, material, now: NOW, turnRevision: 13,
+    })).resolves.toBeNull()
   })
 
   it.each([
