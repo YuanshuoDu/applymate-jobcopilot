@@ -1656,6 +1656,14 @@ type Stage8PreparedScenario = {
   submitApprovalId: string
 }
 
+const STAGE8_RATE_LIMIT_DOMAIN = "boards.greenhouse.io"
+
+async function resetStage8DomainRateLimit(): Promise<void> {
+  if (!enabled || !applyQueue) throw new Error("stage8_rate_limit_isolation_unavailable")
+  const redis = await applyQueue.client
+  await redis.del(`ratelimit:domain:${ids.user}:${STAGE8_RATE_LIMIT_DOMAIN}`)
+}
+
 type Stage8SubmitIntent = {
   applicationTaskId: string
   userId: string
@@ -1877,6 +1885,7 @@ async function stage8FillFailureSnapshot(prepared: Stage8PreparedScenario): Prom
 }
 
 async function prepareStage8Scenario(label: "stop-first" | "grant-first"): Promise<Stage8PreparedScenario> {
+  await resetStage8DomainRateLimit()
   const scenario = await createReviewedSourceScenario(`stage8-${label}`, `Synthetic Stage 8 ${label} source description.`)
   const token = await signedBearer(ids.user)
   const source = await startSelectedJobSource({ ...scenario, token, key: `stage8-source-${label}-${runId}` })
