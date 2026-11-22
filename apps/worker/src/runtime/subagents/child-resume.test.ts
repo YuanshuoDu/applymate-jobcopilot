@@ -1,10 +1,19 @@
+import { Buffer } from "node:buffer"
+import { createHash } from "node:crypto"
+import { canonicalJson } from "@jobcopilot/shared"
 import { describe, expect, it, vi } from "vitest"
 
+import { MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_READ_BYTES } from "../tools/tool-result-reference-types.js"
+import { redactJobReadOutput } from "../tools/job-read-output-redaction.js"
+
+import { createObservedEvidenceIndex, hydrateObservedEvidence } from "./child-evidence.js"
+import { projectChildDiscoveryHistory } from "./child-discovery-history.js"
 import { loadChildAttemptResume } from "./child-resume.js"
 import { childWaitClaimEventKey } from "./child-durable-wait-replay.js"
 import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
 import { scoutDelegateSpawnKey } from "./scout-delegate-spawn-key.js"
 import { spawnKey } from "./pg-store-persistence.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { SubagentLease } from "./types.js"
 
 type Row = Record<string, unknown>
@@ -643,6 +652,117 @@ describe("child attempt durable resume", () => {
     const tooManyItems = fakePool(child, [step(child)], Array.from({ length: 1_025 }, (_, index) => item(child, { id: `item-${index}`, content: { toolCallId: `call-${index}`, toolName: "jobs.search" } })))
     await expect(loadChildAttemptResume(tooManyItems.pool as never, child)).rejects.toThrow("child_resume_item_limit")
   })
+
+  it("resumes valid large discovery history within shared step and per-step call limits", async () => {
+    const child = lease({ taskType: "job_discovery", allowedActions: ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"],
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, context: {} })
+    const jobs = [1, 2].map(number => {
+      const evidenceId = `source-${number}`
+      return { id: `c${number.toString(36).padStart(24, "0")}`, title: "Engineer", company: "Example",
+        location: "Dublin", url: `https://jobs.example/${number}`, description: "x".repeat(100_000),
+        fullDescription: "y".repeat(100_000), salary: null, logo: null, source: "greenhouse", evidenceRefs: [evidenceId] }
+    })
+    const discovery = {
+      jobs, evidence: jobs.map((job, index) => ({ evidenceId: `source-${index + 1}`, jobId: job.id, kind: "source",
+        source: "greenhouse", url: job.url, summary: "Source listing" })),
+      nextCursor: null, usage: { ledgerKey: "large-discovery", toolName: "jobs.discover", toolVersion: "1",
+        toolCallId: "discover-call", sessionId: child.sessionId, turnId: child.turnId, stepId: "step-1",
+        requests: 1, jobsProcessed: jobs.length, jobsSucceeded: jobs.length, jobsFailed: 0, providerFailures: 0,
+        aiCalls: 0, providers: ["greenhouse"], estimatedCostUsd: 0, durationMs: 1 },
+    }
+    const safeDiscovery = redactJobReadOutput("jobs.discover", discovery)
+    expect(safeDiscovery).not.toBe("[REDACTED]")
+    const encoded = Buffer.from(canonicalJson(safeDiscovery), "utf8")
+    expect(encoded.byteLength).toBeGreaterThan(256 * 1024)
+    expect(encoded.byteLength).toBeLessThanOrEqual(MAX_TOOL_RESULT_BYTES)
+    const digest = createHash("sha256").update(encoded).digest("hex")
+    const referenceId = "tool-result-abcdefab-cdef-4abc-8def-abcdefabcdef"
+    const reference = { $ref: referenceId, sizeBytes: encoded.byteLength, sha256: digest }
+    const steps: Row[] = []
+    const items: Row[] = []
+    let activeStepId = ""
+    let callsInStep = 0
+    let toolCallCount = 0
+    const addPair = (toolCallId: string, toolName: string, input: unknown, output: unknown) => {
+      if (callsInStep === 32) callsInStep = 0
+      if (callsInStep === 0) {
+        activeStepId = `step-${steps.length + 1}`
+        steps.push(step(child, { id: activeStepId, attempt: 1, ordinal: steps.length, status: "completed", consumedInputIds: [] }))
+      }
+      const ordinal = steps.length - 1
+      items.push(item(child, { id: `call-item-${toolCallCount}`, stepId: activeStepId, attempt: 1, ordinal,
+        revision: 0, type: "tool_call", status: "completed",
+        content: { toolCallId, toolName, toolVersion: "1", input } }))
+      items.push(item(child, { id: `result-item-${toolCallCount}`, stepId: activeStepId, attempt: 1, ordinal,
+        revision: 1, type: "tool_result", status: "completed",
+        content: { toolCallId, output, errorCode: null } }))
+      callsInStep += 1
+      toolCallCount += 1
+    }
+    addPair("discover-call", "jobs.discover", { targetRoles: ["Engineer"], targetLocations: ["Dublin"] }, reference)
+
+    let offset = 0
+    let readCount = 0
+    while (offset < encoded.byteLength) {
+      let end = Math.min(encoded.byteLength, offset + MAX_TOOL_RESULT_READ_BYTES)
+      const makeOutput = () => ({ ref: referenceId, sha256: digest, byteCount: encoded.byteLength,
+        chunk: encoded.subarray(offset, end).toString("utf8"), nextCursor: end < encoded.byteLength ? String(end) : null })
+      while (end > offset && Buffer.byteLength(JSON.stringify(makeOutput()), "utf8") > MAX_TOOL_RESULT_READ_BYTES) end -= 1
+      expect(end).toBeGreaterThan(offset)
+      const input = { referenceId, ...(offset === 0 ? {} : { cursor: String(offset) }) }
+      const output = makeOutput()
+      const readCallId = `read-call-${readCount}`
+      expect(Buffer.byteLength(JSON.stringify(output), "utf8")).toBeLessThanOrEqual(MAX_TOOL_RESULT_READ_BYTES)
+      addPair(readCallId, "tool_results.read", input, output)
+      offset = end
+      readCount += 1
+    }
+    expect(readCount).toBeGreaterThan(70)
+    expect(steps.length).toBeLessThanOrEqual(32)
+    expect(toolCallCount).toBeLessThanOrEqual(steps.length * 32)
+    const db = fakePool(child, steps, items)
+
+    const resumed = await loadChildAttemptResume(db.pool as never, child)
+
+    expect(resumed?.resume).toMatchObject({ stepCount: steps.length, toolCallCount })
+    expect(resumed?.childToolReplayReceipts).toHaveLength(toolCallCount)
+    expect(resumed?.childToolReplayReceipts?.[0]).toMatchObject({
+      toolName: "jobs.discover", result: { status: "completed", output: reference },
+    })
+    expect(resumed?.childToolReplayReceipts?.filter(receipt => receipt.toolName === "tool_results.read")).toHaveLength(readCount)
+    const rawObservations = resumed?.observations ?? []
+    expect(Buffer.byteLength(JSON.stringify(rawObservations), "utf8")).toBeGreaterThan(256 * 1024)
+    expect(rawObservations.filter(block => (block.content as Row).toolName === "tool_results.read")).toHaveLength(readCount)
+    const restoredChunks = rawObservations.filter(block => (block.content as Row).toolName === "tool_results.read")
+      .map(block => ((block.content as Row).output as Row).chunk).join("")
+    expect(restoredChunks).toBe(encoded.toString("utf8"))
+    const evidence = createObservedEvidenceIndex()
+    hydrateObservedEvidence(evidence, rawObservations)
+    expect([...evidence.entries.values()].map(entry => entry.ref)).toEqual(expect.arrayContaining(jobs.map(job => job.id)))
+
+    const modelHistory = projectChildDiscoveryHistory(rawObservations)
+    expect(modelHistory).not.toBe(rawObservations)
+    expect(Buffer.byteLength(JSON.stringify(modelHistory), "utf8")).toBeLessThanOrEqual(256 * 1024)
+    const compact = modelHistory.find(block => block.id === `child-discovery-history:${referenceId}`)
+    expect(compact?.content).toMatchObject({
+      discoveryReference: reference,
+      candidates: jobs.map(job => ({ jobId: job.id, source: job.source })),
+      omitted: { reason: "bounded_context" },
+    })
+    expect(compact?.content).not.toHaveProperty("toolCallId")
+    expect(JSON.stringify(compact?.content)).not.toContain("x".repeat(100))
+    const ineligibleLeases: Partial<SubagentLease>[] = [
+      { taskType: "research" },
+      { allowedActions: ["jobs.discover"] },
+      { context: { selectedJobPreparation: { jobId: jobs[0]!.id } } },
+      { expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", extra: true } },
+    ]
+    for (const policy of ineligibleLeases) {
+      const ineligible = { ...child, ...policy }
+      const rejected = fakePool(ineligible, steps, items)
+      await expect(loadChildAttemptResume(rejected.pool as never, ineligible)).rejects.toThrow("child_resume_observation_limit")
+    }
+  }, 30_000)
 
   it("fails closed when a tool call id crosses steps", async () => {
     const child = lease()

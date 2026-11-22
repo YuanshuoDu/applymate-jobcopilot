@@ -59,7 +59,7 @@ export async function buildChildResumeObservationsWithDelegateReceipts(
     }
     if (taskIds.size !== proofs.length) throw unavailable()
   }
-  return projectChildResumeObservations(replay, taskIds)
+  return projectChildResumeObservations(replay, taskIds, lease)
 }
 
 function proofFor(pair: ChildResumeReplayPair, lease: SubagentLease): SpawnProof {
