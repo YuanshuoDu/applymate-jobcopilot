@@ -139,6 +139,84 @@ function plain(value: unknown): Record<string, unknown> | null {
   } catch { return null }
 }
 
+const DIAGNOSTIC_STATUSES = ["queued", "in_progress", "waiting_for_user", "waiting_for_approval", "running", "retrying", "waiting", "completed", "failed", "interrupted", "cancelled", "closed"] as const
+const DIAGNOSTIC_ROLES = ["orchestrator", "writer", "reviewer", "scout", "analyst", "prepare", "auditor"] as const
+const DIAGNOSTIC_TOOLS = ["agent.plan", "agent.wait", "cover_letter.draft", "artifact.version.read", "artifact.review"] as const
+const DIAGNOSTIC_RESULTS = ["accepted", "duplicate", "ready", "waiting", "passed", "needs_revision", "rejected", "stale", "completed", "failed", "partial", "prepared", "skipped"] as const
+const DIAGNOSTIC_FAILURE_CODES = new Set([
+  "budget_exhausted", "business_precondition_failed", "discovery_memory_overflow", "final_unverified", "input_changed",
+  "invalid_output", "invalid_provenance", "invalid_structured_result", "no_progress", "not_found", "persistence_conflict",
+  "precondition_failed", "receipt_conflict", "root_terminal", "stale_hash", "stale_source", "task_fence_denied",
+  "selected_job_batch_completion_unavailable", "selected_job_batch_plan_invalid", "selected_job_batch_unavailable",
+  "selected_job_context_unavailable", "selected_job_output_contract_unavailable", "selected_job_sources_unavailable",
+  "task_graph_revision_mismatch", "task_graph_runtime_dependencies_unavailable", "task_graph_schedule_failed",
+  "task_graph_templates_unavailable", "task_graph_verification_unverified", "tool_execution_failed", "turn_execution_error", "unrecoverable_error",
+])
+
+function diagnosticEnum(value: unknown, allowed: readonly string[]): string {
+  return typeof value === "string" && allowed.includes(value) ? value : "other"
+}
+
+function diagnosticFailureCode(value: unknown): string {
+  return value == null ? "none" : typeof value === "string" && DIAGNOSTIC_FAILURE_CODES.has(value) ? value : "other"
+}
+
+function diagnosticBatchRole(templateId: unknown): string {
+  for (const slot of SELECTED_JOB_BATCH_SLOT_IDS) {
+    const templates = selectedJobBatchTemplatesForSlot(slot)
+    if (templateId === templates?.writerTemplateId) return "writer"
+    if (templateId === templates?.reviewerTemplateId) return "reviewer"
+  }
+  return "other"
+}
+
+function diagnosticToolResult(value: unknown): string {
+  if (value == null) return "none"
+  const result = plain(value)
+  if (!result) return "value"
+  const status = result.status ?? result.reviewStatus
+  if (typeof status === "string" && DIAGNOSTIC_RESULTS.includes(status as typeof DIAGNOSTIC_RESULTS[number])) return status
+  return typeof result.code === "string" && DIAGNOSTIC_FAILURE_CODES.has(result.code) ? "failed" : "value"
+}
+
+async function readBatchFailureDiagnostic(turnId: string) {
+  const turn = await db.agentTurn.findFirst({ where: { id: turnId, sessionId, userId },
+    select: { status: true, executionMode: true, rootTaskId: true, error: true } })
+  if (!turn) return { turnStatus: "missing", root: null, children: [], graph: null, tools: [] }
+  const rootId = turn.rootTaskId
+  const root = rootId ? await db.subAgentTask.findFirst({ where: { id: rootId, sessionId, turnId, rootTaskId: rootId, parentTaskId: null },
+    select: { role: true, status: true, failureReason: true } }) : null
+  const children = root ? await db.subAgentTask.findMany({ where: { sessionId, turnId, rootTaskId: rootId, parentTaskId: rootId },
+    select: { id: true, role: true, status: true, failureReason: true }, orderBy: { createdAt: "asc" }, take: 8 }) : []
+  const taskIds = rootId ? [rootId, ...children.map(task => task.id)] : []
+  const graph = rootId ? await db.agentItem.findFirst({ where: { sessionId, turnId, taskId: rootId, type: "task_graph" },
+    orderBy: { revision: "desc" }, select: { status: true, content: true } }) : null
+  const items = taskIds.length ? await db.agentItem.findMany({ where: { sessionId, turnId, taskId: { in: taskIds }, type: { in: ["tool_call", "tool_result"] } },
+    orderBy: { createdAt: "asc" }, take: 128, select: { type: true, status: true, content: true } }) : []
+  const calls = new Map<string, Record<string, unknown>>()
+  for (const item of items) {
+    const content = plain(item.content)
+    if (item.type === "tool_call" && typeof content?.toolCallId === "string") calls.set(content.toolCallId, content)
+  }
+  const toolResults = items.filter(item => item.type === "tool_result").slice(0, 64).map(item => {
+    const result = plain(item.content), call = typeof result?.toolCallId === "string" ? calls.get(result.toolCallId) : undefined
+    return { tool: diagnosticEnum(call?.toolName, DIAGNOSTIC_TOOLS), status: diagnosticEnum(call?.status ?? item.status, DIAGNOSTIC_STATUSES),
+      result: diagnosticToolResult(result?.output), failureCode: diagnosticFailureCode(call?.errorCode ?? result?.errorCode) }
+  })
+  const nodes = Array.isArray(plain(graph?.content)?.nodes) ? plain(graph?.content)!.nodes as unknown[] : []
+  return {
+    turn: { status: diagnosticEnum(turn.status, DIAGNOSTIC_STATUSES), executionMode: turn.executionMode === "canonical_task_graph" ? turn.executionMode : "other",
+      failureCode: diagnosticFailureCode(turn.error) },
+    root: root ? { role: diagnosticEnum(root.role, DIAGNOSTIC_ROLES), status: diagnosticEnum(root.status, DIAGNOSTIC_STATUSES),
+      failureCode: diagnosticFailureCode(root.failureReason) } : null,
+    children: children.map(task => ({ role: diagnosticEnum(task.role, DIAGNOSTIC_ROLES), status: diagnosticEnum(task.status, DIAGNOSTIC_STATUSES),
+      failureCode: diagnosticFailureCode(task.failureReason) })),
+    graph: graph ? { status: diagnosticEnum(graph.status, DIAGNOSTIC_STATUSES), nodeCount: Math.min(nodes.length, 16),
+      nodes: nodes.slice(0, 16).map(value => { const node = plain(value); return { role: diagnosticBatchRole(node?.templateId), status: diagnosticEnum(node?.status, DIAGNOSTIC_STATUSES) } }) } : null,
+    toolResultCount: Math.min(items.filter(item => item.type === "tool_result").length, 64), toolResults,
+  }
+}
+
 async function bearer(): Promise<string> {
   return new SignJWT({ authVersion: 1 }).setProtectedHeader({ alg: "HS256" })
     .setIssuer(EXTENSION_TOKEN_ISSUER).setAudience(EXTENSION_TOKEN_AUDIENCE)
@@ -303,7 +381,11 @@ describeWithServices("selected-job batch production full-loop", () => {
 
     worker.stdin?.write("continue-batch\n")
     const terminal = await waitForTurnTerminal(turnId, worker)
-    expect(terminal).toMatchObject({ status: "completed", executionMode: "canonical_task_graph" })
+    if (terminal.status !== "completed") {
+      try { console.error(`Selected Job batch terminal diagnostic ${JSON.stringify(await readBatchFailureDiagnostic(turnId))}`) }
+      catch { console.error('Selected Job batch terminal diagnostic {"diagnostic":"unavailable"}') }
+    }
+    expect({ status: terminal.status, executionMode: terminal.executionMode }).toMatchObject({ status: "completed", executionMode: "canonical_task_graph" })
     const rootTaskId = terminal.rootTaskId
     expect(rootTaskId).toBeTruthy()
     if (!rootTaskId) throw new Error("Completed batch Turn has no canonical Root")
