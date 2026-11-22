@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import { reduceTaskGraphFinalSummary } from "./task-graph-final-summary.js"
 import {
   attachSelectedJobBatchFinalOutcome, readBoundSelectedJobBatchFinalOutcome, renderSelectedJobBatchFinalOutcome,
+  readSelectedJobBatchFinalOutcome,
 } from "./selected-job-batch-final-outcome.js"
 import { sameTaskGraphFinalSummaryBinding, type TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCurrentNode } from "./task-graph-command-port.js"
@@ -29,7 +30,8 @@ function witness(options: { thirdFailed?: boolean; changedHash?: boolean; staleS
     outcomes.push(isFailed
       ? { slotId: slot.slotId, jobId: slot.jobId, status: "failed", writerTaskId, reviewerTaskId }
       : { slotId: slot.slotId, jobId: slot.jobId, status: "completed", writerTaskId, reviewerTaskId, evidence: {
-        artifactRef, reviewReceipt: { taskId: reviewerTaskId, artifactId, version: artifactRef.version,
+        artifactRef, artifactVersion: { ...artifactRef, artifactType: "cover_letter" as const, taskId: writerTaskId, previousHash: null },
+        reviewReceipt: { taskId: reviewerTaskId, artifactId, version: artifactRef.version,
           contentHash: artifactRef.contentHash, sourceDigest: artifactRef.sourceDigest,
           currentSourceDigest: options.staleSource && index === 0 ? digest("q") : artifactRef.sourceDigest,
           status: ["passed", "needs_revision", "rejected"][index] as "passed" | "needs_revision" | "rejected", reviewHash },
@@ -37,6 +39,39 @@ function witness(options: { thirdFailed?: boolean; changedHash?: boolean; staleS
   }
   const graphNodes = options.writersBeforeReviewers ? [...nodes.filter(node => node.templateId.includes("writer")), ...nodes.filter(node => node.templateId.includes("reviewer"))] : nodes
   return { graph: { revision: 12, nodes: graphNodes }, slots: outcomes }
+}
+
+function correctionWitness(): SelectedJobBatchCompletionWitness {
+  const initial = witness({ slotCount: 2 }), first = initial.slots[0]!
+  if (first.status !== "completed") throw new Error("fixture must have completed initial evidence")
+  const originalWriter = initial.graph.nodes.find(node => node.taskId === first.writerTaskId)!
+  const originalReviewer = initial.graph.nodes.find(node => node.taskId === first.reviewerTaskId)!
+  const priorReviewHash = digest("e"), priorRef = first.evidence.artifactRef
+  const initialNodes = initial.graph.nodes.map(node => node.taskId === first.reviewerTaskId
+    ? { ...node, resultProjection: { ...node.resultProjection!, reviewStatus: "needs_revision" as const, reviewHash: priorReviewHash } } : node)
+  const currentRef = { ...priorRef, version: priorRef.version + 1, contentHash: digest("f") }
+  const templates = selectedJobBatchTemplatesForSlot("slot-1")!
+  const correctionWriter = makeNode("writer-a-correction", templates.writerTemplateId, "writer-a-correction-task", "writer", currentRef, "completed", [originalReviewer.key])
+  const correctionReviewer = makeNode("reviewer-a-correction", templates.reviewerTemplateId, "reviewer-a-correction-task", "reviewer", currentRef,
+    "completed", [correctionWriter.key], "passed", digest("9"))
+  const priorEvidence = {
+    writerTaskId: originalWriter.taskId, reviewerTaskId: originalReviewer.taskId, artifactRef: priorRef,
+    artifactVersion: { ...priorRef, artifactType: "cover_letter" as const, taskId: originalWriter.taskId, previousHash: null },
+    reviewStatus: "needs_revision" as const, reviewHash: priorReviewHash,
+    reviewReceipt: { taskId: originalReviewer.taskId, artifactId: priorRef.artifactId, version: priorRef.version,
+      contentHash: priorRef.contentHash, sourceDigest: priorRef.sourceDigest, currentSourceDigest: priorRef.sourceDigest,
+      status: "needs_revision" as const, reviewHash: priorReviewHash },
+  }
+  const second = initial.slots[1]!
+  if (second.status !== "completed") throw new Error("fixture must have completed second branch")
+  return { graph: { revision: initial.graph.revision + 1, nodes: [...initialNodes, correctionWriter, correctionReviewer] }, slots: [
+    { ...first, writerTaskId: correctionWriter.taskId, reviewerTaskId: correctionReviewer.taskId,
+      evidence: { artifactRef: currentRef, artifactVersion: { ...currentRef, artifactType: "cover_letter" as const,
+        taskId: correctionWriter.taskId, previousHash: priorRef.contentHash }, reviewReceipt: { taskId: correctionReviewer.taskId, artifactId: currentRef.artifactId,
+        version: currentRef.version, contentHash: currentRef.contentHash, sourceDigest: currentRef.sourceDigest,
+        currentSourceDigest: currentRef.sourceDigest, status: "passed", reviewHash: digest("9") } }, priorEvidence },
+    second,
+  ] }
 }
 
 function makeNode(
@@ -89,6 +124,32 @@ describe("grounded selected-job batch final outcome", () => {
     expect(readBoundSelectedJobBatchFinalOutcome(binding!)?.slots.map(slot => [slot.slotId, slot.jobId])).toEqual([
       ["slot-1", "job-a"], ["slot-2", "job-b"],
     ])
+  })
+
+  it("binds the latest correction pair and its immutable initial review to every graph member", () => {
+    const ready = correctionWitness(), attached = attachSelectedJobBatchFinalOutcome(baseBinding(ready), ready)
+    expect(attached).not.toBeNull()
+    const outcome = readBoundSelectedJobBatchFinalOutcome(attached!)
+    expect(outcome?.slots[0]).toMatchObject({
+      writer: { taskId: "writer-a-correction-task" }, reviewer: { taskId: "reviewer-a-correction-task" },
+      artifactRef: { version: 2 }, reviewStatus: "passed",
+      priorPair: { writer: { taskId: "writer-a-task" }, reviewer: { taskId: "reviewer-a-task" },
+        evidence: { reviewStatus: "needs_revision", artifactRef: { version: 1 }, artifactVersion: { taskId: "writer-a-task", artifactType: "cover_letter" } } },
+    })
+    expect(attached?.members).toHaveLength(6)
+    expect(renderSelectedJobBatchFinalOutcome(attached!)).toEqual([
+      "Per-Job preparation outcomes:",
+      "Job 1: Writer completed; Reviewer completed; review passed.",
+      "Job 2: Writer completed; Reviewer completed; review needs revision.",
+    ])
+    expect(renderSelectedJobBatchFinalOutcome(attached!).join("\n")).not.toMatch(/writer-a-task|draft-a|sha256:|reviewHash/)
+    const changed = { ...outcome!, slots: outcome!.slots.map((slot, index) => index ? slot : ({ ...slot,
+      priorPair: { ...slot.priorPair!, evidence: { ...slot.priorPair!.evidence, reviewHash: digest("q") } } })) }
+    expect(readSelectedJobBatchFinalOutcome(changed, ready.graph.revision)).toBeNull()
+    const unrelatedDraft = { ...outcome!, slots: outcome!.slots.map((slot, index) => index ? slot : ({ ...slot,
+      artifactRef: { ...slot.artifactRef!, artifactId: "draft-other" } })) }
+    expect(readSelectedJobBatchFinalOutcome(unrelatedDraft, ready.graph.revision)).toBeNull()
+    expect(readBoundSelectedJobBatchFinalOutcome({ ...attached!, members: attached!.members?.slice(1) })).toBeNull()
   })
 
   it("rejects changed member, slot, graph revision, duplicate identity, pending, or stale evidence", () => {
