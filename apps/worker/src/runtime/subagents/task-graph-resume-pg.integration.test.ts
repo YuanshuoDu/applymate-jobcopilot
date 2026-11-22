@@ -2885,6 +2885,14 @@ function selectedJobSettlement(line: string, taskId: string): RecordValue {
   return value
 }
 
+function correctionWriterSettlement(line: string, taskId: string, generation: number): RecordValue {
+  const prefix = `P3_CORRECTION_WRITER_SETTLED ${taskId} ${generation} `
+  if (!line.startsWith(prefix)) throw new Error("Correction Writer generation settlement marker did not match")
+  const value = record(JSON.parse(line.slice(prefix.length)) as unknown)
+  if (!value || value.dispatchGeneration !== generation) throw new Error("Correction Writer settlement generation was invalid")
+  return value
+}
+
 async function traceSelectedJobWriterFromWorker(
   plan: SelectedJobArtifactRestartPlan,
   line: string,
@@ -11081,6 +11089,25 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const queuedAfterRecovery = await plan.store.get(plan.correctionWriter.id, value.sessionId)
       expect(queuedAfterRecovery).toMatchObject({ status: "queued", attemptCount: 1, leaseOwner: null })
 
+      expect(await dispatchPendingSubagentOutbox(pool!, queue, 10, value.sessionId)).toBe(1)
+      const republishedDispatch = await pool!.query<{ attemptCount: number; publishedAt: Date | null; payload: unknown }>(
+        `SELECT "attemptCount", "publishedAt", "payload" FROM "agent_outbox"
+         WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,
+        [value.sessionId, `subagent-dispatch:${plan.correctionWriter.id}`])
+      expect(republishedDispatch.rows).toHaveLength(1)
+      expect(republishedDispatch.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      const republishedPayload = parseSubagentJobPayload(republishedDispatch.rows[0]?.payload)
+      expect(republishedPayload).toEqual(dispatchPayload)
+      expect(republishedPayload).toMatchObject({ taskId: plan.correctionWriter.id, sessionId: value.sessionId,
+        rootTaskId: plan.rootTaskId, ownerId: dispatchOwnerId })
+      const republishedGeneration = (republishedDispatch.rows[0]?.attemptCount ?? 0) - 1
+      expect(republishedGeneration).toBeGreaterThan(0)
+      const republishedJobId = subagentDispatchJobId(plan.correctionWriter.id, republishedGeneration)
+      expect(republishedJobId).not.toBe(dispatchJobId)
+      const republishedBullJob = await queue.getJob(republishedJobId)
+      expect(republishedBullJob).toMatchObject({ id: republishedJobId, name: "subagent",
+        data: { taskId: plan.correctionWriter.id, sessionId: value.sessionId, rootTaskId: plan.rootTaskId, ownerId: dispatchOwnerId } })
+
       const resumeSelectedJob = {
         correctionWriterMode: true,
         queueName: plan.queueName,
@@ -11101,10 +11128,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForProcessLine(workerTwo, `P3_SELECTED_JOB_QUEUE_READY ${plan.queueName}`)
       await waitForProcessLine(workerTwo, "P3_CORRECTION_WRITER_RESTART_READY worker_two")
       const secondDelivery = await waitForProcessLine(workerTwo,
-        `P3_CORRECTION_WRITER_BULL_DELIVERY ${plan.correctionWriter.id} 0 `, 30_000)
-      expect(secondDelivery).toBe(`P3_CORRECTION_WRITER_BULL_DELIVERY ${plan.correctionWriter.id} 0 ${workerTwo.pid}`)
-      const settledLine = await waitForProcessLine(workerTwo, `P3_SELECTED_JOB_CHILD_SETTLED ${plan.correctionWriter.id} `, 30_000)
-      const settlement = selectedJobSettlement(settledLine, plan.correctionWriter.id)
+        `P3_CORRECTION_WRITER_BULL_DELIVERY ${plan.correctionWriter.id} ${republishedGeneration} `, 30_000)
+      expect(secondDelivery).toBe(`P3_CORRECTION_WRITER_BULL_DELIVERY ${plan.correctionWriter.id} ${republishedGeneration} ${workerTwo.pid}`)
+      const settledLine = await waitForProcessLine(workerTwo,
+        `P3_CORRECTION_WRITER_SETTLED ${plan.correctionWriter.id} ${republishedGeneration} `, 30_000)
+      const settlement = correctionWriterSettlement(settledLine, plan.correctionWriter.id, republishedGeneration)
       expect(settlement).toMatchObject({ role: "writer", attemptCount: 2, managerStatus: "completed", childStatus: "completed",
         ownerId: dispatchOwnerId, observations: { reviewFeedbackIncluded: true, draftReceiptReplayed: true } })
       const resumedRef = selectedJobArtifactReference(settlement.artifactRef)
@@ -11131,8 +11159,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
            AND "content"->>'toolCallId' = $4 AND "type" IN ('tool_call', 'tool_result')`,
         [value.sessionId, value.turnId, plan.correctionWriter.id, plan.correctionDraftCallId])
       expect(replayedReceiptCount.rows[0]?.count).toBe(2)
-      const completedBullJob = await queue.getJob(dispatchJobId)
-      expect(completedBullJob?.id).toBe(dispatchJobId)
+      const completedBullJob = await queue.getJob(republishedJobId)
+      expect(completedBullJob?.id).toBe(republishedJobId)
       expect(completedBullJob?.data).toMatchObject({ taskId: plan.correctionWriter.id, sessionId: value.sessionId,
         rootTaskId: plan.rootTaskId, ownerId: dispatchOwnerId })
       const completionDeadline = Date.now() + 5_000
@@ -11145,7 +11173,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
          WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,
         [value.sessionId, `subagent-dispatch:${plan.correctionWriter.id}`])
       expect(finalDispatch.rows).toHaveLength(1)
-      expect(finalDispatch.rows[0]).toMatchObject({ attemptCount: 1, publishedAt: expect.any(Date) })
+      expect(finalDispatch.rows[0]).toMatchObject({ attemptCount: republishedGeneration + 1, publishedAt: expect.any(Date) })
       expect(parseSubagentJobPayload(finalDispatch.rows[0]?.payload)).toEqual(dispatchPayload)
       success = true
     } finally {

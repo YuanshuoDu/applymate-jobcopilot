@@ -1104,7 +1104,8 @@ async function startSelectedJobQueueWorker(runtime) {
       return childResult
     }, dispatchIdentity)
     const structured = record(record(childResult?.result)?.structuredResult)
-    say("P3_SELECTED_JOB_CHILD_SETTLED " + payload.taskId + " " + JSON.stringify({
+    const settlement = {
+      ...(selected.correctionWriterMode === true && dispatchIdentity ? { dispatchGeneration: dispatchIdentity.generation } : {}),
       ...leaseIdentity,
       managerStatus: outcome.status,
       childStatus: childResult?.status ?? null,
@@ -1112,7 +1113,12 @@ async function startSelectedJobQueueWorker(runtime) {
       reviewStatus: structured?.reviewStatus ?? null,
       reviewHash: structured?.reviewHash ?? null,
       observations,
-    }))
+    }
+    const settlementJson = JSON.stringify(settlement)
+    say("P3_SELECTED_JOB_CHILD_SETTLED " + payload.taskId + " " + settlementJson)
+    if (selected.correctionWriterMode === true && dispatchIdentity) {
+      say(`P3_CORRECTION_WRITER_SETTLED ${payload.taskId} ${dispatchIdentity.generation} ${settlementJson}`)
+    }
     return outcome
   }, { connection: redisConnection, skipVersionCheck: true, concurrency: 1,
     ...(selected.correctionWriterMode === true ? { lockDuration: 1_000, stalledInterval: 500, maxStalledCount: 1 } : {}) })
