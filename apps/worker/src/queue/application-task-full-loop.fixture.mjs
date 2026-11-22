@@ -6,6 +6,7 @@ import { readFile } from "node:fs/promises"
 import { unlink } from "node:fs/promises"
 import { Pool } from "pg"
 import { HOST, assertToolMessagePairs, failModel, fixtureModel, required, safeBlockedTarget } from "./application-task-full-loop.fixture-support.mjs"
+import { createLegacyQueueAckWitness } from "./application-task-full-loop.legacy-ack.fixture-support.mjs"
 import { closeStage8Workers, createStage8ApplicationSubmitDrain, createStage8ApplyWorker, createStage8FixtureControl } from "./application-task-full-loop.stage8.fixture-support.mjs"
 import { applicationFillStageTrace, traceApplicationFillExecutor } from "./application-task-full-loop.trace-support.mjs"
 
@@ -270,6 +271,7 @@ async function startWorker(stagedSubmissionStopProtocol = false) {
     import("../cloak/pool.js"), import("../redis.ts"), import("../runtime/wakeup/consumer.ts"),
   ])
   const control = stagedSubmissionStopProtocol ? createStage8FixtureControl() : undefined
+  const legacyAckWitness = stagedSubmissionStopProtocol ? undefined : createLegacyQueueAckWitness(say)
   const flags = { ...resolveProductionAgentFlags(), taskGraphPlanningEnabled: true, childExecutionEnabled: true,
     coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false }
   const taskGraphCommandPort = flags.taskGraphPlanningEnabled
@@ -419,6 +421,8 @@ async function startWorker(stagedSubmissionStopProtocol = false) {
     const { getPool } = await import("../db/apply-results.ts")
     const stopProtocol = await import("../runtime/interrupt/application-submission-start-gate.ts")
     activeApplyWorker = createStage8ApplyWorker({ queue, stopProtocol, pool: getPool(), control, writeLine: say })
+  } else {
+    legacyAckWitness.wrap(queue.applyWorker)
   }
   activeApplyWorker.on("active", job => say(`APPLY_JOB_ACTIVE ${job?.id ?? "unknown"} attemptsMade=${job?.attemptsMade ?? -1} attemptsStarted=${job?.attemptsStarted ?? -1} stalledCounter=${job?.stalledCounter ?? -1}`))
   activeApplyWorker.on("stalled", (jobId, previousState) => say(`APPLY_JOB_STALLED ${jobId} previousState=${previousState}`))
@@ -449,7 +453,15 @@ async function startWorker(stagedSubmissionStopProtocol = false) {
       const lines = buffer.split("\n")
       buffer = lines.pop() ?? ""
       for (const line of lines.map(value => value.trim())) {
-        if (line.startsWith("arm-legacy-final-response ")) {
+        if (line.startsWith("arm-legacy-ack-barrier ")) {
+          let armed = false
+          try { armed = legacyAckWitness?.arm(JSON.parse(line.slice("arm-legacy-ack-barrier ".length))) === true } catch {}
+          say(armed ? "LEGACY_ACK_BARRIER_ARMED" : "LEGACY_ACK_BARRIER_ARM_FAILED")
+        } else if (line.startsWith("prove-legacy-ack-barrier ")) {
+          let proven = false
+          try { proven = legacyAckWitness?.proves(JSON.parse(line.slice("prove-legacy-ack-barrier ".length))) === true } catch {}
+          say(proven ? "LEGACY_ACK_BARRIER_PROVED" : "LEGACY_ACK_BARRIER_PROOF_REJECTED")
+        } else if (line.startsWith("arm-legacy-final-response ")) {
           try {
             armLegacyFinalResponseGate(line.slice("arm-legacy-final-response ".length))
             say("LEGACY_FINAL_RESPONSE_GATE_ARMED")
@@ -460,6 +472,7 @@ async function startWorker(stagedSubmissionStopProtocol = false) {
           }
         } else if (line === "shutdown") {
           process.stdin.pause()
+          legacyAckWitness?.releaseForShutdown()
           resolve()
           return
         }
