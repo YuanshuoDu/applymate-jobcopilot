@@ -57,6 +57,8 @@ export {
   selectedJobBatchTemplatesForSlot,
 } from './selected-job-batch-templates.js'
 export type { SelectedJobBatchSlotId, SelectedJobBatchTemplateEntry, SelectedJobBatchTemplateId } from './selected-job-batch-templates.js'
+export { parseSelectedJobBatchGraph } from './selected-job-batch-graph.js'
+export type { SelectedJobBatchGraphNode, SelectedJobBatchGraphPair, SelectedJobBatchGraphSlot } from './selected-job-batch-graph.js'
 export { AgentStepSchema, AgentStepUsageSchema, StepStatusSchema } from './step.js'
 export type { AgentStep, AgentStepUsage, StepStatus } from './step.js'
 export {
