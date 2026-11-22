@@ -1510,6 +1510,74 @@ async function approveStage8Submit(prepared: Stage8PreparedScenario): Promise<St
   const response = await approvalAction(apiRequest(`/api/agent/sessions/${prepared.sessionId}/actions`, prepared.token, "POST", {
     type: "approval_response", approvalId: prepared.submitApprovalId, decision: "approved", receiptNonce,
   }), { params: Promise.resolve({ id: prepared.sessionId }) })
+  if (response.status !== 200) {
+    const body = jsonRecord(await response.clone().json().catch(() => null))
+    const [approvalAfter, taskAfter] = await Promise.all([
+      testDb.agentApproval.findFirst({ where: { id: prepared.submitApprovalId, userId: ids.user,
+        sessionId: prepared.sessionId, taskId: prepared.applicationTaskId, turnId: prepared.fillTurnId,
+        jobId: prepared.jobId }, select: { status: true } }).catch(() => null),
+      testDb.applicationTask.findFirst({ where: { id: prepared.applicationTaskId, userId: ids.user,
+        sessionId: prepared.sessionId, jobId: prepared.jobId, fillTurnId: prepared.fillTurnId },
+        select: { checkpoint: true } }).catch(() => null),
+    ])
+    const routeError = jsonString(body, "error")
+    const routeCode = jsonString(body, "code") ?? jsonString(body, "errorCode")
+    const errorCategories: Record<string, string> = {
+      "Approval is no longer pending": "approval_not_pending",
+      "Approval receipt is no longer pending": "approval_not_pending",
+      "Approval receipt is not approved": "approval_not_approved",
+      "Approval receipt has expired": "approval_expired",
+      "Approval receipt nonce does not match": "approval_nonce_mismatch",
+      "Approval receipt scope does not match the requested action": "approval_scope_mismatch",
+      "Approval receipt scope integrity check failed": "approval_integrity_error",
+      "Approval receipt request event is unavailable": "approval_request_event_unavailable",
+      "Approval receipt is stale after a goal revision": "approval_revision_mismatch",
+      "Approval session is no longer available": "approval_session_unavailable",
+      "Approval turn is no longer available": "approval_turn_unavailable",
+      "The requested Agent wait was not found": "wait_not_found",
+      "The requested Agent wait is no longer pending": "wait_not_pending",
+      "The Agent wait is not owned by this session": "wait_scope_mismatch",
+      "The Agent wait revision is stale": "wait_revision_mismatch",
+      "The Agent wait has expired": "wait_expired",
+      "The previous wait command has incomplete state": "wait_state_incomplete",
+      "Account is not active.": "account_inactive",
+      "This feature is not included in your current plan.": "auto_apply_not_entitled",
+      "Monthly AI credits exhausted.": "ai_credits_exhausted",
+      "Unattended applications are temporarily unavailable.": "unattended_apply_unavailable",
+      "This job has no application URL.": "job_url_missing",
+      "The application URL is invalid.": "job_url_invalid",
+      "Automatic applications require an HTTPS destination.": "https_destination_required",
+      "Automatic application requires a direct supported ATS link, not a job-board or unknown destination.": "ats_destination_unsupported",
+      "Application preflight was denied by policy.": "job_preflight_denied",
+      "Submission policy denied this application.": "submission_policy_denied",
+      "A current, explicit approval is required before this application can be submitted.": "submit_receipt_or_reviewed_material_mismatch",
+      "The approval expired before its submit intent was committed.": "approval_expired_before_queue",
+      "The job could not be found for application preflight.": "job_preflight_missing",
+      "The submit payload does not match the current approved application attempt.": "submit_identity_mismatch",
+      "The approved submission receipt changed before its intent was committed.": "submit_receipt_changed",
+      "This application is no longer ready for the approved submission step.": "submit_task_or_job_state_conflict",
+    }
+    const knownCodes = new Set([
+      "approval_wait_active", "approval_not_found", "approval_not_approved", "approval_already_consumed",
+      "approval_expired", "approval_scope_mismatch", "approval_integrity_error", "approval_nonce_mismatch",
+      "approval_revision_mismatch", "approval_reservation_conflict", "wait_not_found", "wait_not_pending",
+      "wait_scope_mismatch", "wait_revision_mismatch", "wait_expired",
+    ])
+    const approvalStatus = ["pending", "approved", "consumed"].includes(approvalAfter?.status ?? "")
+      ? approvalAfter!.status : "other"
+    const taskCheckpoint = taskAfter?.checkpoint === "form_filled" || taskAfter?.checkpoint === "queue_retry"
+      ? taskAfter.checkpoint : "other"
+    const routeErrorCategory = routeError && Object.prototype.hasOwnProperty.call(errorCategories, routeError)
+      ? errorCategories[routeError] : "unclassified"
+    throw new Error(`stage8_submit_action_failure:${JSON.stringify({
+      httpStatus: response.status,
+      bodyKeys: Object.keys(body ?? {}).filter(key => ["error", "code", "errorCode"].includes(key)).sort(),
+      routeErrorCategory,
+      routeCode: routeCode && knownCodes.has(routeCode) ? routeCode : null,
+      approvalStatus,
+      taskCheckpoint,
+    })}`)
+  }
   expect(response.status).toBe(200)
   expect((await waitForAgentTurnTerminal(prepared.fillTurnId)).status).toBe("completed")
 
