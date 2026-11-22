@@ -755,8 +755,8 @@ type LegacyAckWitness = {
 
 async function createLegacyAckWitnessForTest(writeLine: (line: string) => void): Promise<LegacyAckWitness> {
   const supportUrl = new URL("../../../../../../worker/src/queue/application-task-full-loop.legacy-ack.fixture-support.mjs", import.meta.url)
-  const module = await import(supportUrl.href) as { createLegacyQueueAckWitness: (write: (line: string) => void) => LegacyAckWitness }
-  return module.createLegacyQueueAckWitness(writeLine)
+  const supportModule = await import(supportUrl.href) as { createLegacyQueueAckWitness: (write: (line: string) => void) => LegacyAckWitness }
+  return supportModule.createLegacyQueueAckWitness(writeLine)
 }
 
 describe("legacy queue acknowledgement fixture witness", () => {
@@ -1487,16 +1487,49 @@ async function waitForReviewedApproval(approvalId: string, timeoutMs = 90_000) {
   throw new Error("Worker did not issue the reviewed-application approval")
 }
 
-async function waitForReviewedApplicationTask(jobId: string, predicate: (task: ApplicationTaskRow) => boolean, timeoutMs = 120_000): Promise<ApplicationTaskRow> {
+async function waitForReviewedApplicationTask(jobId: string, predicate: (task: ApplicationTaskRow) => boolean, timeoutMs = 120_000, diagnoseStage8Prestart = false): Promise<ApplicationTaskRow> {
   const until = Date.now() + timeoutMs
   let latest: ApplicationTaskRow | null = null
   while (Date.now() < until) {
     latest = await testDb.applicationTask.findUnique({ where: { userId_jobId: { userId: ids.user, jobId } } }) as ApplicationTaskRow | null
     if (latest && predicate(latest)) return latest
+    if (diagnoseStage8Prestart && latest?.status === "failed" && latest.checkpoint === "fill_prestart_failed") {
+      const code = await stage8PrestartFailureCode(latest)
+      throw new Error(`Reviewed ApplicationTask failed before submit approval; prestartFailureCode=${code}`)
+    }
     if (worker && exited(worker)) throw new Error("Worker exited while waiting for reviewed ApplicationTask")
     await delay(100)
   }
   throw new Error(`Reviewed ApplicationTask did not reach the expected state; status=${latest?.status ?? "missing"}; checkpoint=${latest?.checkpoint ?? "missing"}`)
+}
+
+const STAGE8_PRESTART_FAILURE_CODES = new Set([
+  "fill_context_unavailable", "fill_material_unavailable", "fill_rate_limited", "fill_preflight_unavailable",
+])
+
+async function stage8PrestartFailureCode(task: ApplicationTaskRow): Promise<string> {
+  if (!task.sessionId || !task.fillTurnId) return "unavailable"
+  try {
+    const turn = await testDb.agentTurn.findFirst({ where: {
+      id: task.fillTurnId, userId: ids.user, sessionId: task.sessionId, session: { userId: ids.user },
+    }, select: { rootTaskId: true } })
+    if (!turn?.rootTaskId) return "unavailable"
+    const until = Date.now() + 3_000
+    while (true) {
+      const rows = await testDb.subAgentTask.findMany({ where: {
+        rootTaskId: turn.rootTaskId, sessionId: task.sessionId, turnId: task.fillTurnId,
+        parentTaskId: turn.rootTaskId, role: "application_filler", taskType: "application_fill_for_review",
+        status: "failed", session: { userId: ids.user },
+      }, take: 3, select: { failureReason: true } })
+      if (rows.length > 1) return "multiple"
+      if (rows.length === 1) {
+        const reason = rows[0]?.failureReason
+        return typeof reason === "string" && STAGE8_PRESTART_FAILURE_CODES.has(reason) ? reason : "other"
+      }
+      if (Date.now() >= until) return "none"
+      await delay(50)
+    }
+  } catch { return "unavailable" }
 }
 
 const REVIEWED_FILL_DIAGNOSTIC_STATUSES = new Set([
@@ -1910,7 +1943,8 @@ async function prepareStage8Scenario(label: "stop-first" | "grant-first"): Promi
     userId: ids.user, sessionId: scenario.sessionId, jobId: scenario.jobId,
   }, select: { id: true } })
   const fill = await waitForReviewedApplicationTask(scenario.jobId,
-    task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled" && Boolean(task.fillTurnId), 180_000)
+    task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled" && Boolean(task.fillTurnId),
+    180_000, label === "stop-first")
   const fillTurnId = fill.fillTurnId
   if (typeof fillTurnId !== "string" || !fillTurnId.trim() || fill.id !== reviewTask.id) throw new Error("stage8_fill_identity_missing")
   const browserStarted = await testDb.applicationTaskEvent.findMany({ where: {
