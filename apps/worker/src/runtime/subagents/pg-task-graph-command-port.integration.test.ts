@@ -1130,6 +1130,16 @@ async function prepareOperationalFailureReplan(pool: PgPool, commandPool: PgPool
     failedRoot, failureReason, input, operation, rawCallInput }
 }
 
+async function nextStepOrdinal(pool: PgPool, value: Fixture): Promise<number> {
+  const result = await pool.query<{ nextOrdinal: number }>(`SELECT COALESCE(MAX("ordinal"), 0) + 1 AS "nextOrdinal"
+    FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2`, [value.sessionId, value.turnId])
+  const nextOrdinal = result.rows[0]?.nextOrdinal
+  if (typeof nextOrdinal !== "number" || !Number.isSafeInteger(nextOrdinal) || nextOrdinal < 1) {
+    throw new Error("Failed-branch fixture could not allocate the next Step ordinal")
+  }
+  return nextOrdinal
+}
+
 async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, roleName: string, value: Fixture,
   replacementPrefix = "failed-replacement", options: Readonly<{
     retainedNodeCount?: number; addNativeSnapshot?: boolean; sourceCriterionShortfall?: boolean
@@ -1202,10 +1212,11 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
       outerRoot: outerRoot.rows[0] ? { status: outerRoot.rows[0].status,
         failureReason: safeReason(outerRoot.rows[0].failureReason) } : null })}`)
   }
+  const laterStepOrdinal = await nextStepOrdinal(pool, value)
   await pool.query(`INSERT INTO "agent_steps"
     ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
-    VALUES ($1, $2, $3, $4, 3, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
-  [value.laterStepId, value.sessionId, value.turnId, value.rootTaskId])
+    VALUES ($1, $2, $3, $4, $5, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+  [value.laterStepId, value.sessionId, value.turnId, value.rootTaskId, laterStepOrdinal])
   let planStepId = value.laterStepId
   if (options.addNativeSnapshot) {
     await seedReconciliationAgenda(pool, value, { id: value.laterStepId, sequence: await nextEventSequence(pool, value), cursor: 0n,
@@ -1228,10 +1239,11 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "status" = 'streaming'`,
     [value.laterStepId, value.sessionId, value.turnId])
     if (completedNativeStep.rowCount !== 1) throw new Error("Failed-branch fixture could not complete its native command Step")
+    const keepStepOrdinal = await nextStepOrdinal(pool, value)
     await pool.query(`INSERT INTO "agent_steps"
       ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
-      VALUES ($1, $2, $3, $4, 4, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
-    [value.keepStepId, value.sessionId, value.turnId, value.rootTaskId])
+      VALUES ($1, $2, $3, $4, $5, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+    [value.keepStepId, value.sessionId, value.turnId, value.rootTaskId, keepStepOrdinal])
     planStepId = value.keepStepId
   }
   const turnUsage = await pool.query(`UPDATE "agent_turns" SET "inputTokens" = 47, "outputTokens" = 13,
