@@ -110,6 +110,37 @@ describe("Worker Agent AI route selection", () => {
     expect(mocks.query.mock.calls[1]?.[1]).toEqual(["autoApply"]);
   });
 
+  it("holds the legacy pool client until both deferred platform route lookups finish", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "platform-route-test-key");
+    type QueryResult = { rows: unknown[] };
+    let resolveRoute!: (result: QueryResult) => void;
+    let resolveProvider!: (result: QueryResult) => void;
+    let routeStarted!: () => void;
+    let providerStarted!: () => void;
+    const routeResult = new Promise<QueryResult>(resolve => { resolveRoute = resolve; });
+    const providerResult = new Promise<QueryResult>(resolve => { resolveProvider = resolve; });
+    const routeQueryStarted = new Promise<void>(resolve => { routeStarted = resolve; });
+    const providerQueryStarted = new Promise<void>(resolve => { providerStarted = resolve; });
+    mocks.query
+      .mockResolvedValueOnce({ rows: [{ preferences: null }] })
+      .mockImplementationOnce(() => { routeStarted(); return routeResult; })
+      .mockImplementationOnce(() => { providerStarted(); return providerResult; });
+
+    const pending = loadWorkerAiConfig("legacy-owner");
+    await routeQueryStarted;
+    expect(mocks.release).not.toHaveBeenCalled();
+
+    resolveRoute({ rows: [{ defaultProvider: "openai", defaultModel: "gpt-managed" }] });
+    await providerQueryStarted;
+    expect(mocks.release).not.toHaveBeenCalled();
+
+    resolveProvider({ rows: [{ key: "openai", apiBase: "https://openai.example/v1", secretRef: "OPENAI_API_KEY", enabled: true, active: true }] });
+    await expect(pending).resolves.toMatchObject({
+      provider: "openai", model: "gpt-managed", apiBase: "https://openai.example/v1", apiKey: "platform-route-test-key",
+    });
+    expect(mocks.release).toHaveBeenCalledOnce();
+  });
+
   it("rejects a malformed Agent override without downgrading to AutoApply", async () => {
     mocks.query.mockResolvedValueOnce({ rows: [{ preferences: preferences({
       agent: { provider: "openai" },

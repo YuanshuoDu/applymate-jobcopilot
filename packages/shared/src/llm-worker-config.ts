@@ -37,7 +37,7 @@ export function getWorkerAiPool(): pg.Pool {
 /** Load the legacy Worker route, preserving AutoApply and platform fallback selection. */
 export async function loadWorkerAiConfig(userId: string): Promise<AiConfig> {
   const client = await getWorkerAiPool().connect();
-  try { return resolveLegacyWorkerAiConfig(client, await loadUserPreferences(client, userId)); }
+  try { return await resolveLegacyWorkerAiConfig(client, await loadUserPreferences(client, userId)); }
   finally { client.release(); }
 }
 
