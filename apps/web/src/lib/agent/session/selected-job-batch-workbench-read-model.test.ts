@@ -60,11 +60,11 @@ const taskRows = selectedJobIds.flatMap((jobId, index) => {
   ]
 })
 
-function fixture(options: { queued?: boolean; rows?: typeof taskRows; graph?: typeof currentGraph | null; contextJob?: string; ownerMatch?: boolean; turnStatus?: string; rootStatus?: string } = {}) {
+function fixture(options: { queued?: boolean; rows?: typeof taskRows; graph?: typeof currentGraph | null; contextJob?: string; ownerMatch?: boolean; turnStatus?: string; rootStatus?: string; storedInput?: unknown; turnSource?: string; executionMode?: string } = {}) {
   const rows = (options.rows ?? taskRows).map(row => ({ ...row }))
-  const selectedTurn = { id: owner.turnId, sessionId: owner.sessionId, userId: owner.userId, source: 'user',
-    executionMode: 'canonical_task_graph', status: options.turnStatus ?? (options.queued ? 'queued' : 'in_progress'),
-    rootTaskId: options.queued ? null : root.id, input: batchInput }
+  const selectedTurn = { id: owner.turnId, sessionId: owner.sessionId, userId: owner.userId, source: options.turnSource ?? 'user',
+    executionMode: options.executionMode ?? 'canonical_task_graph', status: options.turnStatus ?? (options.queued ? 'queued' : 'in_progress'),
+    rootTaskId: options.queued ? null : root.id, input: options.storedInput ?? batchInput }
   const selectedRoot = { ...root, status: options.rootStatus ?? root.status }
   const tx = {
     agentSession: { findFirst: vi.fn().mockResolvedValue(options.ownerMatch === false ? null : { id: owner.sessionId, userId: owner.userId }) },
@@ -115,6 +115,20 @@ describe('selected Job batch Workbench read model', () => {
     expect(result?.jobs[0]).not.toHaveProperty('writer.artifactRef')
     expect(result?.jobs[0]).not.toHaveProperty('reviewer.reviewStatus')
     expect(test.tx.subAgentTask.findMany).not.toHaveBeenCalled()
+  })
+
+  it('uses the closed shared Turn parser and canonical owner fields before reading source evidence', async () => {
+    const invalid = [
+      fixture({ storedInput: { ...batchInput, extra: true } }),
+      fixture({ storedInput: { ...batchInput, intent: { ...batchInput.intent, extra: true } } }),
+      fixture({ turnSource: 'automation' }),
+      fixture({ executionMode: 'legacy' }),
+    ]
+    for (const test of invalid) {
+      expect(await readSelectedJobBatchWorkbenchModel(test.database, owner)).toBeNull()
+      expect(test.tx.agentTurn.findFirst).toHaveBeenCalledTimes(1)
+      expect(test.tx.job.findMany).not.toHaveBeenCalled()
+    }
   })
 
   it('projects two completed same-slot artifact and Reviewer receipts without private task output', async () => {

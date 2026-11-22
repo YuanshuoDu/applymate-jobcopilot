@@ -23,7 +23,7 @@ interface RouteContext {
 const ACTIVE_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] as const
 
 const TURN_SELECT = {
-  id: true, sessionId: true, source: true, status: true, revision: true, input: true,
+  id: true, sessionId: true, source: true, executionMode: true, status: true, revision: true, input: true,
   createdAt: true, updatedAt: true, completedAt: true,
   steps: {
     where: { status: { in: [...ACTIVE_STATUSES] } }, orderBy: [{ ordinal: "desc" }, { attempt: "desc" }], take: 1,
@@ -56,6 +56,7 @@ function activeTurnProjection(row: ActiveTurnQueryRow | null, locationScope: Act
     id: projected.id,
     status: projected.status,
     revision: projected.revision,
+    ...(projected.selectedJobBatchPreparation ? { selectedJobBatchPreparation: true as const } : {}),
     ...(hasCanonicalGoal ? { goal: projected.goal } : {}),
     ...(objectiveLocationVerificationEnabled() && row.source === "user" && row.executionMode === "canonical_task_graph"
       && typeof row.rootTaskId === "string" && Boolean(row.rootTaskId.trim()) && hasObjectiveTaskGraphIntent(row.input)

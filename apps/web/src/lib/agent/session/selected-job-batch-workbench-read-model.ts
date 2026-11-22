@@ -5,8 +5,8 @@ import { parseTaskGraphSnapshot, parseVerifiedShortlistSelectionBinding, sameVer
 import { taskDto, type TaskQueryRow } from '@/app/api/agent/sessions/query-dto'
 import { verifyVerifiedShortlistSelection } from '@/lib/agent/control-plane/commands/verified-shortlist-selection'
 import { canonicalTaskGraphItemId } from './final-task-graph-source-detail'
+import { parseSelectedJobBatchTurnIdentity } from './selected-job-batch-turn-identity'
 
-const BATCH_GOAL = 'Prepare draft materials for the selected Jobs from the verified shortlist. Do not submit applications.'
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const ACTIVE_TURNS = new Set(['queued', 'in_progress'])
 const LIVE_TURNS = new Set(['queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval', 'waiting_for_user'])
@@ -47,7 +47,7 @@ async function readInTransaction(tx: Prisma.TransactionClient, input: Readonly<{
     where: { id: input.turnId, sessionId: input.sessionId, userId: input.userId },
     select: { id: true, sessionId: true, userId: true, source: true, executionMode: true, status: true, rootTaskId: true, input: true },
   })
-  const binding = batchBinding(turn?.input)
+  const binding = parseSelectedJobBatchTurnIdentity(turn?.input)
   if (!turn || turn.id !== input.turnId || turn.sessionId !== input.sessionId || turn.userId !== input.userId
     || turn.source !== 'user' || turn.executionMode !== 'canonical_task_graph' || !binding) return null
   if (!LIVE_TURNS.has(turn.status) && turn.status !== 'completed' && !FAILED_TURNS.has(turn.status)) return null
@@ -173,16 +173,6 @@ function roleResult(value: unknown, role: 'writer'): boolean {
     && result.role === role && result.status === 'completed')
 }
 
-function batchBinding(value: unknown) {
-  const input = exactRecord(value, ['clientMessageId', 'content', 'goal', 'intent', 'verifiedShortlistSelection'])
-  const intent = exactRecord(input?.intent, ['kind', 'version']), content = Array.isArray(input?.content) ? input.content : []
-  const part = exactRecord(content[0], ['type', 'text'])
-  if (!input || !safeText(input.clientMessageId, 128) || input.goal !== BATCH_GOAL || content.length !== 1
-    || !part || part.type !== 'text' || part.text !== BATCH_GOAL || intent?.kind !== 'selected_job_batch_preparation'
-    || intent.version !== 1) return null
-  return parseVerifiedShortlistSelectionBinding(input.verifiedShortlistSelection)
-}
-
 function taskContextMatches(value: unknown, jobId: string): boolean {
   const context = record(value), selected = exactRecord(context?.selectedJobPreparation, ['jobId'])
   return selected?.jobId === jobId
@@ -223,10 +213,6 @@ function sameRef(left: Ref, right: Ref): boolean {
 
 function safeLabel(value: unknown): string {
   return typeof value === 'string' && value.trim() === value && value.length > 0 && value.length <= 160 ? value : 'Saved job'
-}
-
-function safeText(value: unknown, max: number): value is string {
-  return typeof value === 'string' && value.length > 0 && value.length <= max && value.trim() === value
 }
 
 function isDigest(value: unknown): value is string { return typeof value === 'string' && /^sha256:[a-f0-9]{64}$/.test(value) }
