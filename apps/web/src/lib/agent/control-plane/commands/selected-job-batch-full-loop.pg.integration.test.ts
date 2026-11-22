@@ -139,26 +139,53 @@ function plain(value: unknown): Record<string, unknown> | null {
   } catch { return null }
 }
 
-const DIAGNOSTIC_STATUSES = ["queued", "in_progress", "waiting_for_user", "waiting_for_approval", "running", "retrying", "waiting", "completed", "failed", "interrupted", "cancelled", "closed"] as const
+const DIAGNOSTIC_STATUSES = ["queued", "in_progress", "waiting_for_user", "waiting_for_approval", "running", "retrying", "waiting", "streaming", "started", "completed", "failed", "interrupted", "cancelled", "closed"] as const
 const DIAGNOSTIC_ROLES = ["orchestrator", "writer", "reviewer", "scout", "analyst", "prepare", "auditor"] as const
+const DIAGNOSTIC_SUMMARY_ROLES = ["orchestrator", "writer", "reviewer", "other"] as const
 const DIAGNOSTIC_TOOLS = ["agent.plan", "agent.wait", "cover_letter.draft", "artifact.version.read", "artifact.review"] as const
 const DIAGNOSTIC_RESULTS = ["accepted", "duplicate", "ready", "waiting", "passed", "needs_revision", "rejected", "stale", "completed", "failed", "partial", "prepared", "skipped"] as const
 const DIAGNOSTIC_FAILURE_CODES = new Set([
-  "budget_exhausted", "business_precondition_failed", "discovery_memory_overflow", "final_unverified", "input_changed",
+  "budget_exhausted", "business_precondition_failed", "child_context_owner_mismatch", "child_resume_unavailable",
+  "cover_letter_base_unavailable", "discovery_memory_overflow", "final_unverified", "fixture_child_owner_mismatch",
+  "fixture_cross_slot_plan_not_rejected", "fixture_plan_receipt_invalid", "fixture_reviewer_read_receipt_invalid",
+  "fixture_reviewer_tool_receipt_invalid", "fixture_selected_job_context_missing", "fixture_turn_owner_mismatch",
+  "fixture_wait_limit_exceeded", "fixture_wait_receipt_invalid", "fixture_writer_tool_receipt_invalid", "input_changed",
   "invalid_output", "invalid_provenance", "invalid_structured_result", "no_progress", "not_found", "persistence_conflict",
-  "precondition_failed", "receipt_conflict", "root_terminal", "stale_hash", "stale_source", "task_fence_denied",
-  "selected_job_batch_completion_unavailable", "selected_job_batch_plan_invalid", "selected_job_batch_unavailable",
-  "selected_job_context_unavailable", "selected_job_output_contract_unavailable", "selected_job_sources_unavailable",
-  "task_graph_revision_mismatch", "task_graph_runtime_dependencies_unavailable", "task_graph_schedule_failed",
-  "task_graph_templates_unavailable", "task_graph_verification_unverified", "tool_execution_failed", "turn_execution_error", "unrecoverable_error",
+  "precondition_failed", "receipt_conflict", "root_terminal", "selected_job_base_resume_missing", "selected_job_batch_completion_unavailable",
+  "selected_job_batch_plan_invalid", "selected_job_batch_unavailable", "selected_job_context_unavailable", "selected_job_input_unavailable",
+  "selected_job_not_found", "selected_job_output_contract_unavailable", "selected_job_scope_invalid", "selected_job_sources_unavailable",
+  "stale_hash", "stale_source", "task_fence_denied", "task_graph_revision_mismatch", "task_graph_runtime_dependencies_unavailable",
+  "task_graph_schedule_failed", "task_graph_templates_unavailable", "task_graph_verification_unverified", "tool_execution_failed",
+  "turn_execution_error", "unrecoverable_error", "writer_review_dependency_invalid", "writer_review_receipt_unavailable",
+  "writer_review_status_invalid",
 ])
+const DATABASE_CONSTRAINT_CODES = new Set(["P2002", "P2003", "P2014", "23502", "23503", "23505", "23514"])
+const DATABASE_ERROR_CODES = new Set(["40001", "40P01", "57P01"])
 
 function diagnosticEnum(value: unknown, allowed: readonly string[]): string {
   return typeof value === "string" && allowed.includes(value) ? value : "other"
 }
 
 function diagnosticFailureCode(value: unknown): string {
-  return value == null ? "none" : typeof value === "string" && DIAGNOSTIC_FAILURE_CODES.has(value) ? value : "other"
+  if (value == null) return "none"
+  if (typeof value !== "string" || value.length > 512) return "other"
+  if (DIAGNOSTIC_FAILURE_CODES.has(value)) return value
+  if (DATABASE_CONSTRAINT_CODES.has(value) || /foreign key|23503|P2003/i.test(value)) return "database_constraint"
+  if (DATABASE_ERROR_CODES.has(value) || /SQLSTATE|deadlock detected|serialization failure/i.test(value)) return "database_error"
+  return "other"
+}
+
+function diagnosticAttempt(value: unknown): string {
+  return typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 ? "other" : value <= 3 ? String(value) : "4+"
+}
+
+function diagnosticGroups<T extends Record<string, string>>(rows: readonly T[]) {
+  const groups = new Map<string, { row: T; count: number }>()
+  for (const row of rows.slice(0, 64)) {
+    const key = JSON.stringify(row), previous = groups.get(key)
+    groups.set(key, previous ? { ...previous, count: previous.count + 1 } : { row, count: 1 })
+  }
+  return [...groups.values()].slice(0, 16).map(({ row, count }) => ({ ...row, count }))
 }
 
 function diagnosticBatchRole(templateId: unknown): string {
@@ -176,7 +203,7 @@ function diagnosticToolResult(value: unknown): string {
   if (!result) return "value"
   const status = result.status ?? result.reviewStatus
   if (typeof status === "string" && DIAGNOSTIC_RESULTS.includes(status as typeof DIAGNOSTIC_RESULTS[number])) return status
-  return typeof result.code === "string" && DIAGNOSTIC_FAILURE_CODES.has(result.code) ? "failed" : "value"
+  return diagnosticFailureCode(result.code) !== "none" && diagnosticFailureCode(result.code) !== "other" ? "failed" : "value"
 }
 
 async function readBatchFailureDiagnostic(turnId: string) {
@@ -189,19 +216,39 @@ async function readBatchFailureDiagnostic(turnId: string) {
   const children = root ? await db.subAgentTask.findMany({ where: { sessionId, turnId, rootTaskId: rootId, parentTaskId: rootId },
     select: { id: true, role: true, status: true, failureReason: true }, orderBy: { createdAt: "asc" }, take: 8 }) : []
   const taskIds = rootId ? [rootId, ...children.map(task => task.id)] : []
+  const taskRoles = new Map<string, string>()
+  if (root && rootId) taskRoles.set(rootId, diagnosticEnum(root.role, DIAGNOSTIC_ROLES))
+  for (const task of children) taskRoles.set(task.id, diagnosticEnum(task.role, DIAGNOSTIC_ROLES))
   const graph = rootId ? await db.agentItem.findFirst({ where: { sessionId, turnId, taskId: rootId, type: "task_graph" },
     orderBy: { revision: "desc" }, select: { status: true, content: true } }) : null
   const items = taskIds.length ? await db.agentItem.findMany({ where: { sessionId, turnId, taskId: { in: taskIds }, type: { in: ["tool_call", "tool_result"] } },
-    orderBy: { createdAt: "asc" }, take: 128, select: { type: true, status: true, content: true } }) : []
+    orderBy: { createdAt: "asc" }, take: 128, select: { type: true, status: true, taskId: true, content: true } }) : []
+  const steps = taskIds.length ? await db.agentStep.findMany({ where: { sessionId, turnId, taskId: { in: taskIds } },
+    orderBy: { ordinal: "asc" }, take: 128, select: { taskId: true, status: true, attempt: true, errorCode: true } }) : []
   const calls = new Map<string, Record<string, unknown>>()
   for (const item of items) {
     const content = plain(item.content)
     if (item.type === "tool_call" && typeof content?.toolCallId === "string") calls.set(content.toolCallId, content)
   }
-  const toolResults = items.filter(item => item.type === "tool_result").slice(0, 64).map(item => {
-    const result = plain(item.content), call = typeof result?.toolCallId === "string" ? calls.get(result.toolCallId) : undefined
-    return { tool: diagnosticEnum(call?.toolName, DIAGNOSTIC_TOOLS), status: diagnosticEnum(call?.status ?? item.status, DIAGNOSTIC_STATUSES),
-      result: diagnosticToolResult(result?.output), failureCode: diagnosticFailureCode(call?.errorCode ?? result?.errorCode) }
+  const toolSummary = DIAGNOSTIC_SUMMARY_ROLES.map(role => {
+    const roleItems = items.filter(item => diagnosticEnum(taskRoles.get(item.taskId ?? ""), DIAGNOSTIC_SUMMARY_ROLES) === role)
+    const toolCalls = roleItems.filter(item => item.type === "tool_call"), toolResults = roleItems.filter(item => item.type === "tool_result")
+    const callRows = toolCalls.map(item => { const call = plain(item.content); return {
+      tool: diagnosticEnum(call?.toolName, DIAGNOSTIC_TOOLS), status: diagnosticEnum(call?.status ?? item.status, DIAGNOSTIC_STATUSES),
+      failureCode: diagnosticFailureCode(call?.errorCode),
+    } })
+    const resultRows = toolResults.map(item => { const result = plain(item.content), call = typeof result?.toolCallId === "string" ? calls.get(result.toolCallId) : undefined; return {
+      tool: diagnosticEnum(call?.toolName, DIAGNOSTIC_TOOLS), status: diagnosticEnum(call?.status ?? item.status, DIAGNOSTIC_STATUSES),
+      result: diagnosticToolResult(result?.output), failureCode: diagnosticFailureCode(call?.errorCode ?? result?.errorCode),
+    } })
+    return { role, toolCallCount: Math.min(toolCalls.length, 64), toolCalls: diagnosticGroups(callRows),
+      toolResultCount: Math.min(toolResults.length, 64), toolResults: diagnosticGroups(resultRows) }
+  })
+  const stepSummary = DIAGNOSTIC_SUMMARY_ROLES.map(role => {
+    const roleSteps = steps.filter(step => diagnosticEnum(taskRoles.get(step.taskId ?? ""), DIAGNOSTIC_SUMMARY_ROLES) === role)
+    return { role, count: Math.min(roleSteps.length, 64), states: diagnosticGroups(roleSteps.map(step => ({
+      status: diagnosticEnum(step.status, DIAGNOSTIC_STATUSES), attempt: diagnosticAttempt(step.attempt), failureCode: diagnosticFailureCode(step.errorCode),
+    }))) }
   })
   const nodes = Array.isArray(plain(graph?.content)?.nodes) ? plain(graph?.content)!.nodes as unknown[] : []
   return {
@@ -213,7 +260,7 @@ async function readBatchFailureDiagnostic(turnId: string) {
       failureCode: diagnosticFailureCode(task.failureReason) })),
     graph: graph ? { status: diagnosticEnum(graph.status, DIAGNOSTIC_STATUSES), nodeCount: Math.min(nodes.length, 16),
       nodes: nodes.slice(0, 16).map(value => { const node = plain(value); return { role: diagnosticBatchRole(node?.templateId), status: diagnosticEnum(node?.status, DIAGNOSTIC_STATUSES) } }) } : null,
-    toolResultCount: Math.min(items.filter(item => item.type === "tool_result").length, 64), toolResults,
+    steps: stepSummary, tools: toolSummary,
   }
 }
 
