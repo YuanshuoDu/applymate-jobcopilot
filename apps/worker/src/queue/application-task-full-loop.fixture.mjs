@@ -374,7 +374,7 @@ async function startWorker() {
       ? createOptionalProductionChildExecutor({ ...options, authorizeUsage, modelRuntimeFactory: ({ task }) => selectedModelRuntime(task), ...(stageObserver ? { applicationFillStageObserver: stageObserver } : {}) }) : undefined),
     createCanonicalTurnRuntime: (runtimePool, productionOptions) => createCanonicalTurnRuntime(runtimePool, {
       ...productionOptions, ...taskGraphTemplatesModule.taskGraphRuntimeOptions(taskGraphCommandPort),
-      modelRuntimeFactory: ({ state }) => state.goal.includes(REVIEWED_SOURCE_GOAL) ? reviewedRootModel() : fixtureModel({ beforeFinalResponse: () => holdLegacyFinalResponse(state.scope.turnId) }), authorizeUsage,
+      modelRuntimeFactory: ({ state }) => state.goal.includes(REVIEWED_SOURCE_GOAL) ? reviewedRootModel() : fixtureModel({ beforeFinalResponse: request => holdLegacyFinalResponse(request.metadata.turnId) }), authorizeUsage,
     }),
     createWorkerUsageAuthorizer: () => authorizeUsage,
     createCanonicalExecutionProjection: () => noOpProjection,

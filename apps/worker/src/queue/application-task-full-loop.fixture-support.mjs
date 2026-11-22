@@ -230,7 +230,7 @@ function fixtureModel(options = {}) {
         }
         const { history: waitHistory, requestedCount } = agentWaitHistory(request, targetTaskId)
         if (waitHistory.at(-1)?.disposition === "complete") {
-          await options.beforeFinalResponse?.(options.rootTaskId)
+          await options.beforeFinalResponse?.(request)
           yield { type: "text_delta", text: "The synthetic application fill reached its durable review boundary." }
           yield { type: "completed", finishReason: "stop" }
           return
