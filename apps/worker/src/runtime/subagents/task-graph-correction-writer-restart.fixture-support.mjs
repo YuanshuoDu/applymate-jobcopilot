@@ -1,5 +1,5 @@
 export function createCorrectionWriterRestartModel(input) {
-  const { selected, task, observations, modelProfile, latestToolResult, record, say, waitForCommand, roleResultSchema } = input
+  const { selected, task, observations, modelProfile, latestToolResult, record, say, roleResultSchema } = input
   const callId = selected.correctionDraftCallId
   const readCallId = selected.correctionReadCallId
   const predecessorRef = record(selected.predecessorRef)
@@ -35,10 +35,6 @@ export function createCorrectionWriterRestartModel(input) {
           throw new Error("p3_correction_writer_draft_receipt_invalid")
         }
         observations.draftReceiptReplayed = task.attemptCount > 1
-        if (selected.pauseAfterCorrectionReceipt === true && task.attemptCount === 1) {
-          say(`P3_CORRECTION_WRITER_RECEIPT_COMMITTED ${task.id} ${task.attemptCount}`)
-          await waitForCommand(`continue-correction-writer:${task.id}`)
-        }
         yield { type: "text_delta", text: JSON.stringify({
           schemaVersion: roleResultSchema, role: "writer", status: "completed", artifactRef,
         }) }
@@ -70,6 +66,7 @@ export function createCorrectionWriterRestartModel(input) {
         throw new Error("p3_correction_writer_prior_draft_receipt_missing")
       }
       draftEmitted = true
+      observations.draftToolCallEmitted = true
       say(`P3_CORRECTION_WRITER_DRAFT_EMITTED attempt=${task.attemptCount}`)
       yield { type: "tool_call_completed", callId, name: "cover_letter.draft", arguments: draftInput }
       yield { type: "completed", finishReason: "tool_calls" }

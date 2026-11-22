@@ -1070,13 +1070,30 @@ async function startSelectedJobQueueWorker(runtime) {
         role: lease.role, ownerId: lease.ownerId, attemptCount: lease.attemptCount,
         taskId: lease.id, path: lease.path,
       }
+      const turnStore = createPgTurnEngineStore(pool)
+      const gatedTurnStore = {
+        ...turnStore,
+        async startStep(input) {
+          if (selected.correctionWriterMode === true && selected.pauseAfterCorrectionReceipt === true
+            && input.owner.kind === "task" && input.owner.taskId === selected.correctionWriterTaskId
+            && input.attempt === 1 && observations.predecessorArtifactRead === true
+            && observations.draftToolCallEmitted === true
+            && observations.postDraftStepGateReached !== true) {
+            observations.postDraftStepGateReached = true
+            say(`P3_CORRECTION_WRITER_POST_DRAFT_STEP_GATE ${lease.id} ${lease.attemptCount}`)
+            await waitForCommand(`continue-correction-writer:${lease.id}`)
+          }
+          return turnStore.startStep(input)
+        },
+      }
       const executor = createProductionChildExecutor({
         pool,
+        turnStore: gatedTurnStore,
         authorizeUsage: async () => noReservationUsageAuthorization(),
         modelRuntimeFactory: ({ task }) => {
           if (task.id === selected.correctionWriterTaskId && selected.correctionWriterMode === true) {
             return createCorrectionWriterRestartModel({ selected, task, observations, modelProfile,
-              latestToolResult, record, say, waitForCommand, roleResultSchema: ROLE_RESULT_SCHEMA })
+              latestToolResult, record, say, roleResultSchema: ROLE_RESULT_SCHEMA })
           }
           if (task.role === "writer") return selectedJobDraftModel(selected, task, observations)
           if (task.role === "reviewer") return selectedJobReviewerModel(selected, task, observations)

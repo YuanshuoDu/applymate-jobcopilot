@@ -10905,7 +10905,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         `P3_CORRECTION_WRITER_BULL_DELIVERY ${plan.correctionWriter.id} 0 `, 30_000)
       expect(firstDelivery).toBe(`P3_CORRECTION_WRITER_BULL_DELIVERY ${plan.correctionWriter.id} 0 ${workerOne.pid}`)
       try {
-        await waitForProcessLine(workerOne, `P3_CORRECTION_WRITER_RECEIPT_COMMITTED ${plan.correctionWriter.id} 1`, 30_000)
+        await waitForProcessLine(workerOne, `P3_CORRECTION_WRITER_POST_DRAFT_STEP_GATE ${plan.correctionWriter.id} 1`, 30_000)
       } catch {
         const progress = await correctionWriterReceiptTimeoutDiagnostics({
           pool: pool!, worker: workerOne, userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
@@ -11020,6 +11020,27 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         row.toolCallId === plan.correctionDraftCallId && row.itemType === "tool_call" && row.eventType === "tool_call.started")?.sequence
       expect(Boolean(predecessorReadCompletedSequence && correctionDraftStartedSequence
         && BigInt(predecessorReadCompletedSequence) < BigInt(correctionDraftStartedSequence))).toBe(true)
+
+      const draftStepBoundary = await pool!.query<{
+        stepStatus: string; stepCompletedEvent: boolean; unsettledModel: boolean; unsettledToolCall: boolean;
+      }>(`SELECT step."status" AS "stepStatus",
+          EXISTS (SELECT 1 FROM "agent_events" AS completed
+            WHERE completed."sessionId" = step."sessionId" AND completed."turnId" = step."turnId" AND completed."taskId" = step."taskId"
+              AND completed."type" = 'step.completed' AND completed."correlationId" = step."id") AS "stepCompletedEvent",
+          EXISTS (SELECT 1 FROM "agent_events" AS started
+            WHERE started."sessionId" = step."sessionId" AND started."turnId" = step."turnId" AND started."taskId" = step."taskId"
+              AND started."type" = 'model.started' AND NOT EXISTS (SELECT 1 FROM "agent_events" AS settled
+                WHERE settled."sessionId" = started."sessionId" AND settled."turnId" = started."turnId" AND settled."taskId" = started."taskId"
+                  AND settled."correlationId" = started."correlationId" AND settled."type" IN ('model.completed', 'model.failed'))) AS "unsettledModel",
+          EXISTS (SELECT 1 FROM "agent_events" AS started
+            WHERE started."sessionId" = step."sessionId" AND started."turnId" = step."turnId" AND started."taskId" = step."taskId"
+              AND started."type" = 'tool_call.started' AND NOT EXISTS (SELECT 1 FROM "agent_events" AS settled
+                WHERE settled."sessionId" = started."sessionId" AND settled."turnId" = started."turnId" AND settled."taskId" = started."taskId"
+                  AND settled."correlationId" = started."correlationId"
+                  AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted'))) AS "unsettledToolCall"
+         FROM "agent_steps" AS step WHERE step."sessionId" = $1 AND step."turnId" = $2 AND step."taskId" = $3
+           AND step."id" = $4`, [value.sessionId, value.turnId, plan.correctionWriter.id, call?.stepId])
+      expect(draftStepBoundary.rows).toEqual([{ stepStatus: "completed", stepCompletedEvent: true, unsettledModel: false, unsettledToolCall: false }])
 
       const firstPid = workerOne.pid
       if (firstPid === undefined) throw new Error("Correction Writer first Worker has no process ID")
