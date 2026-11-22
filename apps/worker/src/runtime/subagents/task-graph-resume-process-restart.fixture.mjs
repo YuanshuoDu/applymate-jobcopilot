@@ -1992,7 +1992,7 @@ async function runDiscoverySecondWorker() {
             evidence, summary: "Completed from digest-verified durable discovery history" }
         }
         const projection = (request, expected) => {
-          const prefix = "[harness context layer=tool_observation trust=UNTRUSTED_DATA source=tool_or_subagent]\n"
+          const prefix = "[harness context layer=tool_observation trust=UNTRUSTED_DATA source=tool-or-subagent]\n"
           const messages = Array.isArray(request.messages) ? request.messages : []
           const modelMessageBytes = Buffer.byteLength(JSON.stringify(messages), "utf8")
           const serialized = JSON.stringify(messages)
