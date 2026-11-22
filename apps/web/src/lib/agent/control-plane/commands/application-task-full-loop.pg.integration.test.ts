@@ -278,6 +278,7 @@ const { Queue } = workerRequire("bullmq") as { Queue: new (name: string, options
 } }
 let site: Child | undefined
 let worker: Child | undefined
+let legacyFinalResponseGateTurnId: string | undefined
 let applyQueue: InstanceType<typeof Queue> | undefined
 let turnQueue: InstanceType<typeof Queue> | undefined
 let subagentQueue: InstanceType<typeof Queue> | undefined
@@ -588,6 +589,38 @@ async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Pro
   throw new Error(`Fixture line ${expected} missing; child=${JSON.stringify(childSummary(child))}`)
 }
 
+async function armLegacyFinalResponseGate(turnId: string): Promise<void> {
+  if (!worker?.stdin) throw new Error("Worker fixture stdin is unavailable")
+  legacyFinalResponseGateTurnId = turnId
+  worker.stdin.write("arm-legacy-final-response " + turnId + String.fromCharCode(10))
+  await waitLine(worker, "LEGACY_FINAL_RESPONSE_GATE_ARMED", 5_000)
+}
+
+async function releaseLegacyFinalResponseGate(): Promise<void> {
+  const turnId = legacyFinalResponseGateTurnId
+  if (!turnId || !worker?.stdin || exited(worker)) { legacyFinalResponseGateTurnId = undefined; return }
+  worker.stdin.write("release-legacy-final-response " + turnId + String.fromCharCode(10))
+  try { await waitLine(worker, "LEGACY_FINAL_RESPONSE_GATE_RELEASED", 3_000) }
+  finally { legacyFinalResponseGateTurnId = undefined }
+}
+
+async function expectLegacyFillTurnLeased(turnId: string): Promise<string> {
+  const turn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: turnId }, select: {
+    userId: true, sessionId: true, rootTaskId: true, status: true, leaseOwnerId: true, leaseExpiresAt: true, completedAt: true,
+  } })
+  expect(turn).toMatchObject({ userId: ids.user, sessionId: ids.session, status: "in_progress", completedAt: null })
+  const rootTaskId = turn.rootTaskId
+  if (typeof rootTaskId !== "string" || !rootTaskId) throw new Error("Successor Fill Turn root identity is missing")
+  const root = await testDb.subAgentTask.findFirst({ where: {
+    id: rootTaskId, rootTaskId, sessionId: ids.session, turnId, parentTaskId: null,
+  }, select: { id: true, rootTaskId: true, sessionId: true, turnId: true, parentTaskId: true, role: true, taskType: true, status: true } })
+  expect(root).toMatchObject({ id: rootTaskId, rootTaskId, sessionId: ids.session, turnId, parentTaskId: null,
+    role: "orchestrator", taskType: "root", status: "running" })
+  expect(turn.leaseOwnerId).toEqual(expect.any(String))
+  expect(turn.leaseExpiresAt).toBeInstanceOf(Date)
+  expect(turn.leaseExpiresAt!.getTime()).toBeGreaterThan(Date.now())
+  return rootTaskId
+}
 async function waitExit(child: Child, timeoutMs: number): Promise<boolean> {
   if (exited(child)) return true
   return new Promise(resolveExit => {
@@ -1647,7 +1680,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
 
   afterAll(async () => {
     let cleanupError: unknown
-    try { await stopFixture(worker) } catch (error) { cleanupError = error }
+    try { await releaseLegacyFinalResponseGate() } catch (error) { cleanupError = error }
+    try { await stopFixture(worker) } catch (error) { cleanupError ??= error }
     try { await stopFixture(site) } catch (error) { cleanupError ??= error }
     try { await stopReviewedFillRouteBridge() } catch (error) { cleanupError ??= error }
     try { await cleanRunArtifacts() } catch (error) { cleanupError ??= error }
@@ -1843,6 +1877,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(answeredJson).toMatchObject({ resumed: true })
     const confirmedTask = await waitForTask(task => task.status === "filling" && task.checkpoint === "taskgraph_fill_queued" && task.fillTurnId !== firstFillTurnId)
     const successorTurnId = confirmedTask.fillTurnId!
+    await armLegacyFinalResponseGate(successorTurnId)
+    const successorTurn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: successorTurnId }, select: {
+      userId: true, sessionId: true,
+    } })
+    expect(successorTurn).toMatchObject({ userId: ids.user, sessionId: ids.session })
     expect(confirmedTask.confirmedAnswers).toMatchObject({ [field!.key!]: "Yes" })
     expect(JSON.stringify(await testDb.applicationTaskEvent.findMany({ where: { taskId: gateTaskId, type: "user_answers_confirmed" }, select: { data: true } }))).not.toContain("Yes")
     const duplicate = await answerApplicationTask(apiRequest(answerPath, ownerToken, "PATCH", answerBody))
@@ -1853,6 +1892,15 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const successorTurnJobs = await waitForStableTurnQueueJobs(successorTurnId)
     expect(successorTurnJobs).toHaveLength(1)
     expect(successorTurnJobs[0]?.id).toBeTruthy()
+    const initialTurnJobId = successorTurnJobs[0]?.id
+    if (!initialTurnJobId) throw new Error("Successor Turn dispatch is missing its initial BullMQ job ID")
+    const initialTurnCompletion = await waitLine(
+      worker!, `TURN_JOB_COMPLETED ${initialTurnJobId} turnId=${successorTurnId}`, 30_000,
+    )
+    expect(initialTurnCompletion).toContain("status=")
+    const initialTurnJob = await turnQueue!.getJob(initialTurnJobId)
+    expect(initialTurnJob).toBeDefined()
+    expect(await initialTurnJob!.getState()).toBe("completed")
     expect(await testDb.applicationTaskEvent.count({ where: { taskId: gateTaskId, type: "user_answers_confirmed" } })).toBe(1)
 
     const completedTask = await waitForTask(task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", 180_000)
@@ -1864,15 +1912,6 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       taskId: gateTaskId, type: "submit_application", status: "pending" } })).toBe(1)
     await assertNoSubmitBeforeApproval()
 
-    const originalTurnJobId = successorTurnJobs[0]?.id
-    if (!originalTurnJobId) throw new Error("Successor Turn dispatch is missing its BullMQ job ID")
-    const originalTurnCompletion = await waitLine(
-      worker!, `TURN_JOB_COMPLETED ${originalTurnJobId} turnId=${successorTurnId}`, 30_000,
-    )
-    expect(originalTurnCompletion).toContain("status=")
-    const originalTurnJob = await turnQueue!.getJob(originalTurnJobId)
-    expect(originalTurnJob).toBeDefined()
-    expect(await originalTurnJob!.getState()).toBe("completed")
 
     const turnDispatch = await testDb.agentOutbox.findUniqueOrThrow({
       where: { idempotencyKey: `turn-dispatch:${successorTurnId}` }, select: { payload: true },
@@ -1884,32 +1923,6 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       || !jsonString(turnDispatchPayload, "ownerId")) {
       throw new Error("Successor Turn dispatch payload is incomplete or mismatched")
     }
-    const turnBeforeDuplicate = await testDb.agentTurn.findUniqueOrThrow({
-      where: { id: successorTurnId },
-      select: { status: true, revision: true, leaseOwnerId: true, leaseExpiresAt: true, completedAt: true },
-    })
-    const taskBeforeDuplicate = await testDb.applicationTask.findUniqueOrThrow({
-      where: { id: gateTaskId }, select: { status: true, checkpoint: true, fillTurnId: true },
-    })
-    const duplicateTurnJobId = `test-duplicate-${successorTurnId}`
-    await turnQueue!.add("turn", turnDispatch.payload, { jobId: duplicateTurnJobId })
-    const duplicateTurnCompletion = await waitLine(
-      worker!, `TURN_JOB_COMPLETED ${duplicateTurnJobId} turnId=${successorTurnId}`, 30_000,
-    )
-    expect(duplicateTurnCompletion).toContain("status=skipped")
-    const duplicateTurnJob = await turnQueue!.getJob(duplicateTurnJobId)
-    expect(duplicateTurnJob).toBeDefined()
-    expect(await duplicateTurnJob!.getState()).toBe("completed")
-    expect(await testDb.agentTurn.findUniqueOrThrow({
-      where: { id: successorTurnId },
-      select: { status: true, revision: true, leaseOwnerId: true, leaseExpiresAt: true, completedAt: true },
-    })).toEqual(turnBeforeDuplicate)
-    expect(await testDb.applicationTask.findUniqueOrThrow({
-      where: { id: gateTaskId }, select: { status: true, checkpoint: true, fillTurnId: true },
-    })).toEqual(taskBeforeDuplicate)
-    expect(await testDb.agentApproval.count({ where: { userId: ids.user, sessionId: ids.session, turnId: successorTurnId,
-      taskId: gateTaskId, type: "submit_application", status: "pending" } })).toBe(1)
-    await assertNoSubmitBeforeApproval()
 
     const submitApproval = await testDb.agentApproval.findFirstOrThrow({ where: {
       userId: ids.user, sessionId: ids.session, turnId: successorTurnId,
@@ -1985,7 +1998,20 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       type: "approval_response", approvalId: submitApproval.id, decision: "approved", receiptNonce,
     }), { params: Promise.resolve({ id: ids.session }) })
     expect(approved.status).toBe(200)
-    await waitLine(site!, "SUBMIT_REQUEST 1", 120_000)
+    await Promise.all([
+      waitLine(worker!, `LEGACY_FINAL_RESPONSE_GATE_REACHED turnId=${successorTurnId}`, 45_000),
+      waitLine(site!, "SUBMIT_REQUEST 1", 120_000),
+    ])
+    expect((await requestFixtureStats()).submitCount).toBe(1)
+    const successorRootTaskId = await expectLegacyFillTurnLeased(successorTurnId)
+    await releaseLegacyFinalResponseGate()
+    expect((await waitForAgentTurnTerminal(successorTurnId, 30_000)).status).toBe("completed")
+    expect(await testDb.agentTurn.findUniqueOrThrow({ where: { id: successorTurnId }, select: {
+      rootTaskId: true, status: true, completedAt: true, leaseOwnerId: true, leaseExpiresAt: true,
+    } })).toMatchObject({
+      rootTaskId: successorRootTaskId, status: "completed", completedAt: expect.any(Date),
+      leaseOwnerId: null, leaseExpiresAt: null,
+    })
     const outbox = await testDb.agentOutbox.findMany({ where: { topic: "application.submit.dispatch", aggregateId: ids.session } })
     expect(outbox).toHaveLength(1)
     const intent = outbox[0]!.payload as Record<string, unknown>
@@ -2001,6 +2027,37 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     await waitLine(worker!, `APPLY_JOB_ACTIVE ${String(intent.workerTaskId)}`)
     const submitStarted = await waitForTask(task => task.checkpoint === "submission_request_started" || task.checkpoint === "submission_uncertain")
     expect(submitStarted.status).toBe(submitStarted.checkpoint === "submission_request_started" ? "filling" : "waiting_for_user")
+    const turnBeforeDuplicate = await testDb.agentTurn.findUniqueOrThrow({
+      where: { id: successorTurnId },
+      select: { status: true, revision: true, leaseOwnerId: true, leaseExpiresAt: true, completedAt: true },
+    })
+    const taskBeforeDuplicate = await testDb.applicationTask.findUniqueOrThrow({
+      where: { id: gateTaskId }, select: { status: true, checkpoint: true, fillTurnId: true },
+    })
+    const approvalBeforeDuplicate = await testDb.agentApproval.findUniqueOrThrow({
+      where: { id: submitApproval.id }, select: { status: true },
+    })
+    expect(approvalBeforeDuplicate.status).not.toBe("pending")
+    const duplicateTurnJobId = `test-duplicate-${successorTurnId}`
+    await turnQueue!.add("turn", turnDispatch.payload, { jobId: duplicateTurnJobId })
+    const duplicateTurnCompletion = await waitLine(
+      worker!, `TURN_JOB_COMPLETED ${duplicateTurnJobId} turnId=${successorTurnId}`, 30_000,
+    )
+    expect(duplicateTurnCompletion).toContain("status=skipped")
+    const duplicateTurnJob = await turnQueue!.getJob(duplicateTurnJobId)
+    expect(duplicateTurnJob).toBeDefined()
+    expect(await duplicateTurnJob!.getState()).toBe("completed")
+    expect(await testDb.agentTurn.findUniqueOrThrow({
+      where: { id: successorTurnId },
+      select: { status: true, revision: true, leaseOwnerId: true, leaseExpiresAt: true, completedAt: true },
+    })).toEqual(turnBeforeDuplicate)
+    expect(await testDb.applicationTask.findUniqueOrThrow({
+      where: { id: gateTaskId }, select: { status: true, checkpoint: true, fillTurnId: true },
+    })).toEqual(taskBeforeDuplicate)
+    expect(await testDb.agentApproval.findUniqueOrThrow({
+      where: { id: submitApproval.id }, select: { status: true },
+    })).toEqual(approvalBeforeDuplicate)
+    expect((await requestFixtureStats()).submitCount).toBe(1)
     worker!.kill("SIGKILL")
     expect(await waitExit(worker!, 5_000)).toBe(true)
     worker = spawnFixture("worker")

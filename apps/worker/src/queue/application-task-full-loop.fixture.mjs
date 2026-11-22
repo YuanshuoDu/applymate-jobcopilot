@@ -17,6 +17,32 @@ const REVIEWED_SOURCE_SCHEMA = "agent-harness.v2.subagent.result"
 const REVIEWED_FILL_BRIDGE_PATH = "/__applymate-reviewed-fill"
 const reviewedHash = createHash("sha256").update(REVIEWED_COVER_LETTER).digest("hex")
 const stageObserver = process.env.APPLICATION_TASK_FULL_LOOP_STAGE_OBSERVER_TEST === "true" ? applicationFillStageTrace() : undefined
+let legacyFinalResponseGate
+function armLegacyFinalResponseGate(turnId) {
+  if (typeof turnId !== "string" || !turnId || turnId.length > 256 || turnId.trim() !== turnId || legacyFinalResponseGate) throw new Error("legacy_final_response_gate_arm_invalid")
+  let release
+  const released = new Promise(resolve => { release = resolve })
+  legacyFinalResponseGate = { turnId, release, released, claimed: false }
+}
+function releaseLegacyFinalResponseGate(turnId) {
+  const gate = legacyFinalResponseGate
+  if (!gate || gate.turnId !== turnId) return false
+  gate.release()
+  return true
+}
+async function holdLegacyFinalResponse(turnId) {
+  const gate = legacyFinalResponseGate
+  if (!gate || gate.turnId !== turnId || gate.claimed) return
+  gate.claimed = true
+  say(`LEGACY_FINAL_RESPONSE_GATE_REACHED turnId=${turnId}`)
+  let timer
+  await Promise.race([gate.released, new Promise(resolve => {
+    timer = setTimeout(resolve, 45_000)
+    timer.unref?.()
+  })])
+  if (timer) clearTimeout(timer)
+  gate.release()
+}
 const tls = async () => {
   const cert = await readFile(required("AGENT_TEST_TLS_CERT_PATH"))
   const key = await readFile(required("AGENT_TEST_TLS_KEY_PATH"))
@@ -361,7 +387,7 @@ async function startWorker(stagedSubmissionStopProtocol = false) {
       ? createOptionalProductionChildExecutor({ ...options, authorizeUsage, modelRuntimeFactory: ({ task }) => selectedModelRuntime(task), ...(stageObserver ? { applicationFillStageObserver: stageObserver } : {}) }) : undefined),
     createCanonicalTurnRuntime: (runtimePool, productionOptions) => createCanonicalTurnRuntime(runtimePool, {
       ...productionOptions, ...taskGraphTemplatesModule.taskGraphRuntimeOptions(taskGraphCommandPort),
-      modelRuntimeFactory: ({ state }) => state.goal.includes(REVIEWED_SOURCE_GOAL) ? reviewedRootModel() : fixtureModel(), authorizeUsage,
+      modelRuntimeFactory: ({ state }) => state.goal.includes(REVIEWED_SOURCE_GOAL) ? reviewedRootModel() : fixtureModel({ beforeFinalResponse: () => holdLegacyFinalResponse(state.scope.turnId) }), authorizeUsage,
     }),
     createWorkerUsageAuthorizer: () => authorizeUsage,
     createCanonicalExecutionProjection: () => noOpProjection,
@@ -419,7 +445,22 @@ async function startWorker(stagedSubmissionStopProtocol = false) {
       buffer += chunk
       const lines = buffer.split("\n")
       buffer = lines.pop() ?? ""
-      if (lines.some(line => line.trim() === "shutdown")) { process.stdin.pause(); resolve() }
+      for (const line of lines.map(value => value.trim())) {
+        if (line.startsWith("arm-legacy-final-response ")) {
+          try {
+            armLegacyFinalResponseGate(line.slice("arm-legacy-final-response ".length))
+            say("LEGACY_FINAL_RESPONSE_GATE_ARMED")
+          } catch { say("LEGACY_FINAL_RESPONSE_GATE_ARM_FAILED") }
+        } else if (line.startsWith("release-legacy-final-response ")) {
+          if (releaseLegacyFinalResponseGate(line.slice("release-legacy-final-response ".length))) {
+            say("LEGACY_FINAL_RESPONSE_GATE_RELEASED")
+          }
+        } else if (line === "shutdown") {
+          process.stdin.pause()
+          resolve()
+          return
+        }
+      }
     })
   })
   await wakeupConsumer.close()
