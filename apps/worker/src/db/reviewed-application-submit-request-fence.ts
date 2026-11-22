@@ -18,6 +18,7 @@ type ApprovalRow = {
 type AttemptRow = { userId: string; jobId: string; receiptId: string; constraintHash: string; artifactHash: string; state: string }
 type EventRow = { data: unknown }
 type StopPollApprovalRow = ApprovalRow & { id: string; nonceHash: string | null; revision: number }
+type RotationEventRow = { actor: string; taskId: string | null; correlationId: string | null; idempotencyKey: string | null; payload: unknown }
 
 /** Rechecks a reviewed request under the shared source fence and exact attempt locks. */
 export const withReviewedApplicationSubmitRequestFence = <T>(client: PoolClient, scope: ApplicationSubmissionStartScope,
@@ -61,17 +62,10 @@ export async function readSubmissionTurnState(client: PoolClient, scope: Applica
   readonly turnStatus: string | undefined
   readonly interrupted: boolean | undefined
 }> {
-  const session = await client.query<{ status: string }>(
-    `SELECT "status" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2`, [scope.sessionId, scope.userId],
-  )
-  const turn = await client.query<{ status: string }>(
-    `SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
-    [scope.turnId, scope.sessionId, scope.userId],
-  )
-  const interrupted = await client.query<{ stopped: boolean }>(
-    `SELECT EXISTS (SELECT 1 FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.interrupted') AS "stopped"`,
-    [scope.sessionId, scope.turnId],
-  )
+  const session = await client.query<{ status: string }>(`SELECT "status" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2`, [scope.sessionId, scope.userId])
+  const turn = await client.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [scope.turnId, scope.sessionId, scope.userId])
+  const interrupted = await client.query<{ stopped: boolean }>(`SELECT EXISTS (SELECT 1 FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+    AND "type" = 'turn.interrupted') AS "stopped"`, [scope.sessionId, scope.turnId])
   return { sessionStatus: session.rows[0]?.status, turnStatus: turn.rows[0]?.status, interrupted: interrupted.rows[0]?.stopped }
 }
 
@@ -84,25 +78,17 @@ export async function readSubmissionTurnStopState(client: PoolClient, scope: App
   readonly leaseVersion: number | undefined
   readonly interruptionEvidence: boolean | undefined
 }> {
-  const session = await client.query<{ status: string }>(
-    `SELECT "status" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2`, [scope.sessionId, scope.userId],
-  )
+  const session = await client.query<{ status: string }>(`SELECT "status" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2`, [scope.sessionId, scope.userId])
   const turn = await client.query<{
     status: string; leaseOwnerId: string | null; leaseStartedAt: Date | null; leaseExpiresAt: Date | null; leaseVersion: number
-  }>(`SELECT "status", "leaseOwnerId", "leaseStartedAt", "leaseExpiresAt", "leaseVersion"
-    FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
-  [scope.turnId, scope.sessionId, scope.userId])
-  const interruptions = await client.query<{ stopped: boolean }>(
-    `SELECT EXISTS (SELECT 1 FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
-      AND "type" IN ('turn.interrupt.requested', 'turn.interrupted', 'turn.failed')) AS "stopped"`,
-    [scope.sessionId, scope.turnId],
-  )
+  }>(`SELECT "status", "leaseOwnerId", "leaseStartedAt", "leaseExpiresAt", "leaseVersion" FROM "agent_turns"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [scope.turnId, scope.sessionId, scope.userId])
+  const interruptions = await client.query<{ stopped: boolean }>(`SELECT EXISTS (SELECT 1 FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+    AND "type" IN ('turn.interrupt.requested', 'turn.interrupted', 'turn.failed')) AS "stopped"`, [scope.sessionId, scope.turnId])
   const row = turn.rows[0]
-  return {
-    sessionStatus: session.rows[0]?.status, turnStatus: row?.status, leaseOwnerId: row?.leaseOwnerId,
+  return { sessionStatus: session.rows[0]?.status, turnStatus: row?.status, leaseOwnerId: row?.leaseOwnerId,
     leaseStartedAt: row?.leaseStartedAt, leaseExpiresAt: row?.leaseExpiresAt, leaseVersion: row?.leaseVersion,
-    interruptionEvidence: interruptions.rows[0]?.stopped,
-  }
+    interruptionEvidence: interruptions.rows[0]?.stopped }
 }
 
 async function readSource(client: PoolClient, scope: ApplicationSubmissionStartScope): Promise<ReviewedApplicationFillSourceSelection> {
@@ -180,16 +166,27 @@ async function reviewedStopPollIsCurrent(client: PoolClient, scope: ApplicationS
     FROM "agent_approvals" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3 LIMIT 2 FOR UPDATE`, [scope.approvalId, scope.userId, scope.sessionId])
   const approval = approvals.rows[0]
   if (approvals.rows.length !== 1 || !approval || !await validApprovedStopPollReceipt(approval, scope, tasks.rows[0]!)) return false
-  const requests = await client.query<{ payload: unknown }>(`SELECT request."payload" FROM "agent_events" AS request WHERE request."sessionId"=$1 AND request."turnId"=$2
-    AND request."type"='approval.requested' AND request."actor"='orchestrator' AND request."taskId"=$5
-    AND request."correlationId"=$3 AND request."idempotencyKey"=$4
-    AND NOT EXISTS (SELECT 1 FROM "agent_events" AS revision WHERE revision."sessionId"=$1 AND revision."type"='goal.revision'
-      AND revision."sequence">request."sequence") LIMIT 2`, [scope.sessionId, scope.fillTurnId, scope.approvalId, `approval:${scope.approvalId}:requested`, scope.applicationTaskId])
+  const requests = await client.query<{ payload: unknown; sequence: string }>(
+    `SELECT request."payload",request."sequence" FROM "agent_events" AS request WHERE request."sessionId"=$1 AND request."turnId"=$2
+      AND request."type"='approval.requested' AND request."actor"='orchestrator' AND request."taskId"=$5 AND request."correlationId"=$3
+      AND request."idempotencyKey"=$4 AND NOT EXISTS (SELECT 1 FROM "agent_events" AS revision WHERE revision."sessionId"=$1 AND revision."type"='goal.revision'
+        AND revision."sequence">request."sequence") LIMIT 2`,
+    [scope.sessionId, scope.fillTurnId, scope.approvalId, `approval:${scope.approvalId}:requested`, scope.applicationTaskId])
   if (requests.rows.length !== 1) return false
-  const requestPayload = record(requests.rows[0]?.payload)
+  const requestPayload = record(requests.rows[0]?.payload), originalScopeHash = requestPayload?.scopeHash
   if (!requestPayload || Object.keys(requestPayload).sort().join(",") !== "action,approvalId,revision,scopeHash"
     || requestPayload.action !== "submit_application" || requestPayload.approvalId !== scope.approvalId
-    || requestPayload.scopeHash !== approval.scopeHash || requestPayload.revision !== approval.revision) return false
+    || !digest(originalScopeHash) || requestPayload.revision !== approval.revision) return false
+  const rotations = await client.query<RotationEventRow>(
+    `SELECT "actor","taskId","correlationId","idempotencyKey","payload" FROM "agent_events" WHERE "sessionId"=$1 AND "turnId"=$2
+      AND "type"='approval.receipt_rotated' AND "sequence">$4 AND ("correlationId"=$3 OR "payload"->>'approvalId'=$3) ORDER BY "sequence" DESC LIMIT 1`,
+    [scope.sessionId, scope.fillTurnId, scope.approvalId, requests.rows[0]!.sequence])
+  const rotation = rotations.rows[0], rotationPayload = record(rotation?.payload)
+  if (rotation ? rotation.actor !== "system" || rotation.taskId !== scope.applicationTaskId || rotation.correlationId !== scope.approvalId
+    || rotation.idempotencyKey !== `approval:${scope.approvalId}:receipt-rotated:${approval.scopeHash}` || !rotationPayload
+    || Object.keys(rotationPayload).sort().join(",") !== "approvalId,revision,scopeHash"
+    || rotationPayload.approvalId !== scope.approvalId || rotationPayload.scopeHash !== approval.scopeHash || rotationPayload.revision !== approval.revision
+    : originalScopeHash !== approval.scopeHash) return false
   const proof = await readReviewedApplicationSubmitMaterial({ client, identity: scope, sourceTurnId,
     approval: { resourceHash: approval.resourceHash!, materialHash: approval.materialHash!, answersHash: approval.answersHash! }, currentSource: true })
   return proof?.artifactHash === approval.resourceHash

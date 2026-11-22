@@ -42,6 +42,7 @@ const startEvent = {
 function fixture(options: {
   phase?: "marker" | "boundary" | "stop_poll"; inputs?: unknown[]; taskCheckpoint?: string; taskWorkerTaskId?: string | null; attempt?: typeof attempt | null;
   approval?: Record<string, unknown> | null; event?: unknown; actionReservation?: boolean; startMarker?: boolean; stopStage?: boolean; requestPayload?: unknown;
+  requestSequence?: string; rotations?: Array<Record<string, unknown>>;
 } = {}) {
   const phase = options.phase ?? "marker", inputs = options.inputs ?? [source(), source()]
   const boundaryEvent = options.event === undefined ? (phase === "marker" ? null : startEvent) : options.event
@@ -60,7 +61,12 @@ function fixture(options: {
     }
     if (sql.includes('FROM "agent_action_reservations"')) return { rows: options.actionReservation ? [{ id: "reservation-1" }] : [], rowCount: options.actionReservation ? 1 : 0 }
     if (sql.includes('FROM "agent_approvals"')) return { rows: options.approval === null ? [] : [options.approval ?? approval], rowCount: options.approval === null ? 0 : 1 }
-    if (sql.includes('FROM "agent_events"')) return { rows: [{ payload: options.requestPayload ?? {
+    if (sql.includes('FROM "agent_events"') && sql.includes("approval.receipt_rotated")) {
+      const rows = [...(options.rotations ?? [])].filter(row => Number(row.sequence) > Number(options.requestSequence ?? "1"))
+        .sort((left, right) => Number(right.sequence) - Number(left.sequence)).slice(0, 1)
+      return { rows, rowCount: rows.length }
+    }
+    if (sql.includes('FROM "agent_events"')) return { rows: [{ sequence: options.requestSequence ?? "1", payload: options.requestPayload ?? {
       action: "submit_application", approvalId: scope.approvalId, scopeHash: scope.constraintHash, revision: 4,
     } }], rowCount: 1 }
     if (sql.includes('FROM "application_task_events"')) {
@@ -88,6 +94,12 @@ async function approvedStopPollFixture(): Promise<{ readonly scope: typeof scope
     expiresAt, decidedAt: new Date("2099-11-20T00:00:00.000Z"), consumedAt: null }, requestPayload: {
       action: "submit_application", approvalId, scopeHash: reviewedScope.constraintHash, revision,
     } }
+}
+
+function rotationEvent(submissionScope: typeof scope, overrides: Record<string, unknown> = {}) {
+  return { actor: "system", taskId: submissionScope.applicationTaskId, correlationId: submissionScope.approvalId,
+    idempotencyKey: `approval:${submissionScope.approvalId}:receipt-rotated:${submissionScope.constraintHash}`,
+    payload: { approvalId: submissionScope.approvalId, scopeHash: submissionScope.constraintHash, revision: 4 }, sequence: "2", ...overrides }
 }
 
 function resetMocks() {
@@ -175,7 +187,73 @@ describe("reviewed application submit request source fence", () => {
     expect(test.calls.some(call => call.sql.includes('FROM "agent_action_reservations"'))).toBe(true)
     expect(test.calls.some(call => call.sql.includes("submission_execution_started"))).toBe(true)
     expect(test.calls.some(call => call.sql.includes("submission_stop_protocol"))).toBe(true)
-    expect(test.calls.find(call => call.sql.includes('FROM "agent_events"'))?.sql).toContain("goal.revision")
+    const requestQuery = test.calls.find(call => call.sql.includes("approval.requested"))
+    expect(requestQuery?.sql).toContain('request."actor"=\'orchestrator\'')
+    expect(requestQuery?.sql).toContain('request."taskId"=$5')
+    expect(requestQuery?.sql).toContain('request."correlationId"=$3')
+    expect(requestQuery?.sql).toContain('request."idempotencyKey"=$4')
+    expect(requestQuery?.sql).toContain("goal.revision")
+  })
+
+  it("accepts the exact latest receipt rotation after its immutable request event", async () => {
+    resetMocks()
+    const approved = await approvedStopPollFixture(), priorScopeHash = "f".repeat(64)
+    const test = fixture({ phase: "stop_poll", approval: approved.approval,
+      requestPayload: { ...approved.requestPayload, scopeHash: priorScopeHash }, rotations: [rotationEvent(approved.scope)] })
+    await expect(withReviewedApplicationSubmitStopPollFence(test.client, approved.scope, async sourceTurnId => sourceTurnId)).resolves.toEqual({
+      kind: "current", value: "source-turn-1", sourceTurnId: "source-turn-1",
+    })
+    const query = test.calls.find(call => call.sql.includes("approval.receipt_rotated"))
+    expect(query?.sql).toContain('"sequence">$4')
+    expect(query?.sql).toContain('ORDER BY "sequence" DESC LIMIT 1')
+  })
+
+  it.each([
+    ["missing rotation for changed hash", "missing"],
+    ["stale rotation", "stale"],
+    ["malformed rotation", "malformed"],
+    ["foreign rotation", "foreign"],
+    ["superseded by malformed latest rotation", "latest"],
+    ["rotation predating the request", "predates"],
+  ] as const)("rejects %s during Stop polling", async (_name, kind) => {
+    resetMocks()
+    const approved = await approvedStopPollFixture(), priorScopeHash = "f".repeat(64)
+    const exact = rotationEvent(approved.scope)
+    const requestPayload = { ...approved.requestPayload, scopeHash: priorScopeHash }
+    const rotations = kind === "missing" ? [] : kind === "predates" ? [rotationEvent(approved.scope, { sequence: "1" })]
+      : kind === "stale" ? [rotationEvent(approved.scope, {
+        idempotencyKey: `approval:${approved.scope.approvalId}:receipt-rotated:${priorScopeHash}`,
+        payload: { approvalId: approved.scope.approvalId, scopeHash: priorScopeHash, revision: 4 },
+      })]
+      : kind === "malformed" ? [rotationEvent(approved.scope, { payload: { ...exact.payload, unexpected: true } })]
+      : kind === "foreign" ? [rotationEvent(approved.scope, { taskId: "another-task" })]
+      : [exact, rotationEvent(approved.scope, { sequence: "3", idempotencyKey: "wrong-key" })]
+    const test = fixture({ phase: "stop_poll", approval: approved.approval, requestPayload, rotations })
+    await expect(withReviewedApplicationSubmitStopPollFence(test.client, approved.scope, async () => false)).resolves.toEqual({ kind: "invalid" })
+    expect(mocks.readReviewedApplicationSubmitMaterial).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ["foreign owner", { userId: "another-user" }],
+    ["foreign session", { sessionId: "another-session" }],
+    ["foreign turn", { turnId: "another-turn" }],
+    ["foreign task", { taskId: "another-task" }],
+    ["foreign job", { jobId: "another-job" }],
+  ])("rejects a Stop poll receipt with a %s", async (_name, override) => {
+    resetMocks()
+    const approved = await approvedStopPollFixture()
+    const test = fixture({ phase: "stop_poll", approval: { ...approved.approval, ...override }, requestPayload: approved.requestPayload })
+    await expect(withReviewedApplicationSubmitStopPollFence(test.client, approved.scope, async () => false)).resolves.toEqual({ kind: "invalid" })
+    expect(mocks.readReviewedApplicationSubmitMaterial).not.toHaveBeenCalled()
+  })
+
+  it("rejects a malformed immutable approval request scope digest", async () => {
+    resetMocks()
+    const approved = await approvedStopPollFixture()
+    const test = fixture({ phase: "stop_poll", approval: approved.approval,
+      requestPayload: { ...approved.requestPayload, scopeHash: "not-a-digest" } })
+    await expect(withReviewedApplicationSubmitStopPollFence(test.client, approved.scope, async () => false)).resolves.toEqual({ kind: "invalid" })
+    expect(mocks.readReviewedApplicationSubmitMaterial).not.toHaveBeenCalled()
   })
 
   it("keeps a consumed reserved attempt on the original strict marker proof during polling", async () => {
