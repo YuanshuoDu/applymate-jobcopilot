@@ -10933,7 +10933,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const committedRef = { artifactId: draft.rows[0]!.artifactId, version: draft.rows[0]!.version,
         contentHash: draft.rows[0]!.contentHash, sourceDigest: draft.rows[0]!.sourceDigest }
       expect(draft.rows[0]).toMatchObject({ artifactId: plan.expectedArtifactId, version: 2,
-        sourceDigest: plan.sourceDigest, previousHash: plan.predecessor.contentHash,
+        contentHash: hashArtifactContent(plan.body), sourceDigest: plan.sourceDigest, previousHash: plan.predecessor.contentHash,
         taskId: plan.correctionWriter.id, toolCallId: plan.correctionDraftCallId })
 
       const receiptItems = await pool!.query<{
@@ -10949,7 +10949,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const result = receiptItems.rows.find(row => row.type === "tool_result")
       expect(call).toMatchObject({ status: "completed", attempt: 1, content: {
         toolCallId: plan.correctionDraftCallId, toolName: "cover_letter.draft", status: "completed", errorCode: null,
-        input: { baseArtifactId: plan.baseArtifactId, baseHash: plan.baseHash, content: plan.body, constraints: { maxWords: 160 } },
+        input: { baseArtifactId: plan.baseArtifactId, baseHash: plan.baseHash, content: "[REDACTED]", constraints: { maxWords: 160 } },
       } })
       expect(result).toMatchObject({ status: "completed", attempt: 1, stepId: call?.stepId,
         content: { toolCallId: plan.correctionDraftCallId, errorCode: null, output: { artifactRef: committedRef } } })
