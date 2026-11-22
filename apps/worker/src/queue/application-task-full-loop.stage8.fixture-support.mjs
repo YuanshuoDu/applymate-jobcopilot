@@ -5,6 +5,7 @@ export function createStage8FixtureControl() {
   const queued = new Set()
   const waiters = new Map()
   let shuttingDown = false
+  let failureTarget = null
   let finishShutdown
   const shutdown = new Promise(resolve => { finishShutdown = resolve })
   process.stdin.setEncoding("utf8")
@@ -23,6 +24,9 @@ export function createStage8FixtureControl() {
         }
         waiters.clear()
         finishShutdown()
+      } else if (line.startsWith("stage8-failure-target ")) {
+        const match = /^stage8-failure-target (\S{1,256}) (\S{1,256})$/.exec(line)
+        if (!failureTarget && match) failureTarget = { sessionId: match[1], turnId: match[2] }
       } else if (line) {
         const waiter = waiters.get(line)
         if (waiter) { clearTimeout(waiter.timer); waiters.delete(line); waiter.resolve(line) }
@@ -32,6 +36,10 @@ export function createStage8FixtureControl() {
   })
   return {
     shutdown,
+    matchesSubmissionTarget(scope) {
+      return Boolean(failureTarget && scope?.sessionId === failureTarget.sessionId
+        && scope?.turnId === failureTarget.turnId && scope?.fillTurnId === failureTarget.turnId)
+    },
     waitFor(command, timeoutMs = 30_000) {
       if (shuttingDown) return Promise.resolve("shutdown")
       if (queued.delete(command)) return Promise.resolve(command)
@@ -106,9 +114,24 @@ export function createStage8ApplyWorker({ queue, stopProtocol, pool, control, wr
     isStopped: scope => stopProtocol.isApplicationSubmissionStoppedWithStopProtocol(pool, scope),
     onContinuationAcknowledged: scope => writeLine(`STAGE8_CONTINUE_ACK ${scope.workerTaskId}`),
     acquireStartFence: async scope => {
-      const fence = await stopProtocol.acquireApplicationSubmissionStartFenceWithStopProtocol(
-        trackStage8Pool(pool, control, scope.workerTaskId, writeLine), scope,
-      )
+      const exactTarget = control.matchesSubmissionTarget(scope)
+      if (exactTarget) {
+        writeLine("STAGE8_EXACT_SUBMISSION_ROUTE_MATCHED")
+        writeLine("STAGE8_START_FENCE_ENTERED")
+      }
+      let fence
+      try {
+        fence = await stopProtocol.acquireApplicationSubmissionStartFenceWithStopProtocol(
+          trackStage8Pool(pool, control, scope.workerTaskId, writeLine), scope,
+        )
+      } catch (error) {
+        if (exactTarget) writeLine("STAGE8_START_FENCE_RESULT threw")
+        throw error
+      }
+      if (exactTarget) {
+        const state = ["ready", "stopped", "inactive", "uncertain"].includes(fence.state) ? fence.state : "other"
+        writeLine("STAGE8_START_FENCE_RESULT " + state)
+      }
       if (fence.state !== "ready") return fence
       writeLine(`STAGE8_FINAL_FENCE_READY ${scope.workerTaskId}`)
       try {

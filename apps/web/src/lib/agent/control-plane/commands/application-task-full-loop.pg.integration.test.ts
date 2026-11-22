@@ -591,9 +591,11 @@ describe("Stage8 terminal diagnostics", () => {
       expectedApprovalId: "private-approval-id",
       expectedSessionId: "private-session-id",
       expectedTurnId: "private-turn-id",
+      expectedWorkerTaskId: "private-worker-task-id",
+      session: { status: "waiting_for_user" },
       turn: { status: "failed", error: "persistence_conflict", rootTaskId: "private-root-id" },
       root: { status: "failed", failureReason: "lease_lost" },
-      applicationTask: { status: "waiting_for_authorization", checkpoint: "form_filled" },
+      applicationTask: { status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: "private-worker-task-id" },
       approval: { status: "approved", toolCallId: "private-tool-call-id" },
       wait: { status: "completed", content: {
         waitKind: "approval", approvalId: "private-approval-id", toolCallId: "private-tool-call-id",
@@ -607,10 +609,12 @@ describe("Stage8 terminal diagnostics", () => {
       deadLetters: [],
       workerFailureLines: [],
     })
+    expect(REVIEWED_FILL_DIAGNOSTIC_STATUSES.has("waiting_for_user")).toBe(true)
     expect(summary).toMatchObject({
+      session: { present: true, status: "waiting_for_user" },
       turn: { present: true, status: "failed", errorCode: "persistence_conflict" },
       root: { present: true, status: "failed", failureCode: "lease_lost" },
-      applicationTask: { status: "waiting_for_authorization", checkpoint: "form_filled" },
+      applicationTask: { status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskMatches: true },
       approval: { present: true, status: "approved" },
       wait: { present: true, status: "completed", kindMatches: true, approvalMatches: true,
         toolCallMatches: true, decision: "approved", responseAvailable: true },
@@ -630,6 +634,8 @@ describe("Stage8 terminal diagnostics", () => {
       expectedApprovalId: "private-approval",
       expectedSessionId: sessionId,
       expectedTurnId: turnId,
+      expectedWorkerTaskId: null,
+      session: null,
       turn: { status: "failed", error: null, rootTaskId: "private-root" },
       root: null, applicationTask: null, approval: null, wait: null, steps: [], tools: [], events: [],
       deadLetters: [
@@ -1782,9 +1788,11 @@ type Stage8FailureEvidence = Readonly<{
   expectedApprovalId: string
   expectedSessionId: string
   expectedTurnId: string
+  expectedWorkerTaskId: string | null
+  session: { status: unknown } | null
   turn: { status: unknown; error: unknown; rootTaskId: unknown } | null
   root: { status: unknown; failureReason: unknown } | null
-  applicationTask: { status: unknown; checkpoint: unknown } | null
+  applicationTask: { status: unknown; checkpoint: unknown; workerTaskId: unknown } | null
   approval: { status: unknown; toolCallId: unknown } | null
   wait: { status: unknown; content: unknown } | null
   steps: readonly { status: unknown; errorCode: unknown }[]
@@ -1800,13 +1808,17 @@ function stage8FailureSummary(evidence: Stage8FailureEvidence) {
   const approvalToolCallId = evidence.approval?.toolCallId
   const eventTypes = new Set(evidence.events.map(event => event.type))
   return {
+    session: { present: evidence.session !== null,
+      status: reviewedFillDiagnosticValue(evidence.session?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES) },
     turn: { present: evidence.turn !== null, status: reviewedFillDiagnosticValue(evidence.turn?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
       errorCode: diagnosticMachineErrorCode(evidence.turn?.error) },
     root: { present: evidence.root !== null, status: reviewedFillDiagnosticValue(evidence.root?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
       failureCode: diagnosticMachineErrorCode(evidence.root?.failureReason) },
     applicationTask: { present: evidence.applicationTask !== null,
       status: reviewedFillDiagnosticValue(evidence.applicationTask?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
-      checkpoint: reviewedFillDiagnosticValue(evidence.applicationTask?.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS) },
+      checkpoint: reviewedFillDiagnosticValue(evidence.applicationTask?.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS),
+      workerTaskMatches: evidence.expectedWorkerTaskId === null ? null
+        : evidence.applicationTask?.workerTaskId === evidence.expectedWorkerTaskId },
     approval: { present: evidence.approval !== null,
       status: reviewedFillDiagnosticValue(evidence.approval?.status, STAGE8_APPROVAL_STATUSES) },
     wait: {
@@ -1841,12 +1853,15 @@ function stage8FailureSummary(evidence: Stage8FailureEvidence) {
   }
 }
 
-async function stage8FillFailureSnapshot(prepared: Stage8PreparedScenario): Promise<unknown> {
+async function stage8FillFailureSnapshot(prepared: Stage8PreparedScenario, expectedWorkerTaskId: string | null = null): Promise<unknown> {
   try {
     return await beforeDeadline(async () => {
-      const turn = await testDb.agentTurn.findFirst({ where: {
-        id: prepared.fillTurnId, userId: ids.user, sessionId: prepared.sessionId, session: { userId: ids.user },
-      }, select: { status: true, error: true, rootTaskId: true } })
+      const [session, turn] = await Promise.all([
+        testDb.agentSession.findFirst({ where: { id: prepared.sessionId, userId: ids.user }, select: { status: true } }),
+        testDb.agentTurn.findFirst({ where: {
+          id: prepared.fillTurnId, userId: ids.user, sessionId: prepared.sessionId, session: { userId: ids.user },
+        }, select: { status: true, error: true, rootTaskId: true } }),
+      ])
       const [root, applicationTask, approval, wait, steps, tools, events, deadLetters] = await Promise.all([
         typeof turn?.rootTaskId === "string" ? testDb.subAgentTask.findFirst({ where: {
           id: turn.rootTaskId, rootTaskId: turn.rootTaskId, sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
@@ -1855,7 +1870,7 @@ async function stage8FillFailureSnapshot(prepared: Stage8PreparedScenario): Prom
         testDb.applicationTask.findFirst({ where: {
           id: prepared.applicationTaskId, userId: ids.user, sessionId: prepared.sessionId,
           jobId: prepared.jobId, fillTurnId: prepared.fillTurnId,
-        }, select: { status: true, checkpoint: true } }),
+        }, select: { status: true, checkpoint: true, workerTaskId: true } }),
         testDb.agentApproval.findFirst({ where: {
           id: prepared.submitApprovalId, userId: ids.user, sessionId: prepared.sessionId,
           taskId: prepared.applicationTaskId, turnId: prepared.fillTurnId, jobId: prepared.jobId,
@@ -1877,11 +1892,52 @@ async function stage8FillFailureSnapshot(prepared: Stage8PreparedScenario): Prom
           orderBy: { createdAt: "desc" }, take: 8, select: { payload: true } }),
       ])
       return stage8FailureSummary({ expectedApprovalId: prepared.submitApprovalId, expectedSessionId: prepared.sessionId,
-        expectedTurnId: prepared.fillTurnId, turn, root, applicationTask, approval, wait, steps, tools, events,
+        expectedTurnId: prepared.fillTurnId, expectedWorkerTaskId, session, turn, root, applicationTask, approval, wait, steps, tools, events,
         deadLetters: turn ? deadLetters : [], workerFailureLines: turn ? worker?.lines ?? [] : [] })
     }, Date.now() + 1_200)
   } catch {
     return { available: false }
+  }
+}
+
+const STAGE8_BULL_STATES = new Set(["active", "completed", "delayed", "failed", "paused", "waiting", "waiting-children"])
+const STAGE8_FENCE_STATES = ["ready", "stopped", "inactive", "uncertain", "threw"] as const
+
+function stage8RequestFenceSummary(lines: readonly string[]) {
+  let routeMatched = false
+  let fenceEntered = false
+  let unclassifiedCount = 0
+  const resultCounts = Object.fromEntries(STAGE8_FENCE_STATES.map(state => [state, 0])) as Record<typeof STAGE8_FENCE_STATES[number], number>
+  for (const line of lines.slice(-64)) {
+    if (line === "STAGE8_EXACT_SUBMISSION_ROUTE_MATCHED") { routeMatched = true; continue }
+    if (line === "STAGE8_START_FENCE_ENTERED") { fenceEntered = true; continue }
+    const match = /^STAGE8_START_FENCE_RESULT (ready|stopped|inactive|uncertain|threw)$/.exec(line)
+    if (match) resultCounts[match[1] as typeof STAGE8_FENCE_STATES[number]] += 1
+    else if (typeof line === "string" && line.startsWith("STAGE8_START_FENCE_RESULT ")) unclassifiedCount += 1
+  }
+  return { exactRouteMatched: routeMatched, exactFenceEntered: fenceEntered, resultCounts, unclassifiedCount }
+}
+
+async function stage8ApplyQueueState(workerTaskId: string) {
+  const queue = applyQueue
+  if (!queue) return { available: false }
+  try {
+    return await beforeDeadline(async () => {
+      const job = await queue.getJob(workerTaskId)
+      if (!job) return { available: true, present: false, state: "missing" }
+      const state = await job.getState()
+      return { available: true, present: true, state: STAGE8_BULL_STATES.has(state) ? state : "other" }
+    }, Date.now() + 1_200)
+  } catch { return { available: false } }
+}
+
+async function waitForStage8Arm(prepared: Stage8PreparedScenario, intent: Stage8SubmitIntent): Promise<void> {
+  try { await waitLine(worker!, "STAGE8_ARM_COMMITTED " + intent.workerTaskId, 90_000) }
+  catch {
+    const [database, queue] = await Promise.all([
+      stage8FillFailureSnapshot(prepared, intent.workerTaskId), stage8ApplyQueueState(intent.workerTaskId),
+    ])
+    throw new Error("stage8_arm_commit_missing:" + JSON.stringify({ database, queue, requestFence: stage8RequestFenceSummary(worker?.lines ?? []) }))
   }
 }
 
@@ -3088,7 +3144,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const firstIntent = await approveStage8Submit(stopFirst)
       worker.stdin?.write("stage8-release-publisher\n")
       await waitForStage8ApplyJob(stopFirst, firstIntent)
-      await waitLine(worker, `STAGE8_ARM_COMMITTED ${firstIntent.workerTaskId}`, 90_000)
+      await waitForStage8Arm(stopFirst, firstIntent)
       expect(await readStage8Protocol(stopFirst, firstIntent)).toEqual(["armed"])
       const firstTarget = await readStage8StopTarget(stopFirst)
       const firstStop = await postStage8Stop(stopFirst, firstTarget)
@@ -3118,7 +3174,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const secondIntent = await approveStage8Submit(grantFirst)
       worker.stdin?.write("stage8-release-publisher\n")
       await waitForStage8ApplyJob(grantFirst, secondIntent)
-      await waitLine(worker, `STAGE8_ARM_COMMITTED ${secondIntent.workerTaskId}`, 90_000)
+      await waitForStage8Arm(grantFirst, secondIntent)
       expect(await readStage8Protocol(grantFirst, secondIntent)).toEqual(["armed"])
       const secondTarget = await readStage8StopTarget(grantFirst)
       worker.stdin?.write("stage8-release-arm\n")
