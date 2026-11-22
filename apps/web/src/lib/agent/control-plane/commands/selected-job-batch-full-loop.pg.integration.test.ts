@@ -281,6 +281,14 @@ async function postBatch(token: string) {
   return POST(request, { params: Promise.resolve({ id: sessionId }) })
 }
 
+async function getBatch(token: string, turnId: string) {
+  const { GET } = await import("@/app/api/agent/sessions/[id]/selected-job-batches/[turnId]/route")
+  const request = new NextRequest(`http://localhost/api/agent/sessions/${sessionId}/selected-job-batches/${turnId}`, {
+    headers: { authorization: `Bearer ${token}` },
+  })
+  return GET(request, { params: Promise.resolve({ id: sessionId, turnId }) })
+}
+
 async function waitForPublishedDispatch(turnId: string, timeoutMs = 15_000) {
   const until = Date.now() + timeoutMs, idempotencyKey = `turn-dispatch:${turnId}`
   while (Date.now() < until) {
@@ -450,8 +458,8 @@ describeWithServices("selected-job batch production full-loop", () => {
     expect(rootTaskId).toBeTruthy()
     if (!rootTaskId) throw new Error("Completed batch Turn has no canonical Root")
     const childRows = await db.subAgentTask.findMany({ where: { sessionId, turnId, rootTaskId, parentTaskId: rootTaskId },
-      select: { id: true, role: true, status: true, context: true } })
-    expect(childRows).toHaveLength(4)
+      select: { id: true, role: true, status: true, context: true, result: true } })
+    expect(childRows).toHaveLength(6)
     const terminalGraph = await db.agentItem.findFirst({ where: { sessionId, turnId, taskId: rootTaskId, type: "task_graph" },
       select: { id: true, content: true, revision: true } })
     const terminalNodes = Array.isArray(plain(terminalGraph?.content)?.nodes)
@@ -463,14 +471,25 @@ describeWithServices("selected-job batch production full-loop", () => {
     }
     expect(terminalRevision).toBeGreaterThanOrEqual(barrierRevision)
     expect(terminalRevision).toBeGreaterThan(admissionRevision)
+    expect(terminalNodes).toHaveLength(6)
     const nodeIdentity = (node: Record<string, unknown>) => ({
       key: node.key, taskId: node.taskId, templateId: node.templateId, dependsOn: node.dependsOn,
     })
-    expect(terminalNodes.map(nodeIdentity)).toEqual(nodes.map(nodeIdentity))
+    for (const initialNode of nodes) {
+      expect(terminalNodes.map(nodeIdentity)).toContainEqual(nodeIdentity(initialNode))
+    }
+    const correctionWriterNode = terminalNodes.find(node => node.key === "writer-correction-slot-1")
+    const correctionReviewerNode = terminalNodes.find(node => node.key === "reviewer-correction-slot-1")
+    expect(correctionWriterNode).toBeDefined()
+    expect(correctionWriterNode?.dependsOn).toEqual([nodes.find(node => node.key === "reviewer-slot-1")?.key])
+    expect(correctionReviewerNode?.dependsOn).toEqual([correctionWriterNode?.key])
+    expect(terminalNodes.filter(node => typeof node.key === "string" && node.key.includes("correction"))).toHaveLength(2)
     for (let index = 0; index < jobIds.length; index++) {
       const templates = selectedJobBatchTemplatesForSlot(SELECTED_JOB_BATCH_SLOT_IDS[index]!)!
-      const writerNode = terminalNodes.find(node => node.templateId === templates.writerTemplateId)
-      const reviewerNode = terminalNodes.find(node => node.templateId === templates.reviewerTemplateId)
+      const initialWriterNode = nodes.find(node => node.templateId === templates.writerTemplateId)
+      const initialReviewerNode = nodes.find(node => node.templateId === templates.reviewerTemplateId)
+      const writerNode = terminalNodes.find(node => node.key === initialWriterNode?.key)
+      const reviewerNode = terminalNodes.find(node => node.key === initialReviewerNode?.key)
       const writer = childRows.find(row => row.id === writerNode?.taskId)
       const reviewer = childRows.find(row => row.id === reviewerNode?.taskId)
       expect(writer).toMatchObject({ role: "writer", status: "completed" })
@@ -479,32 +498,90 @@ describeWithServices("selected-job batch production full-loop", () => {
       expect(plain(plain(reviewer?.context)?.selectedJobPreparation)?.jobId).toBe(jobIds[index])
       expect(reviewerNode?.dependsOn).toEqual([writerNode?.key])
     }
+    const correctionWriter = childRows.find(row => row.id === correctionWriterNode?.taskId)
+    const correctionReviewer = childRows.find(row => row.id === correctionReviewerNode?.taskId)
+    const initialReviewer = childRows.find(row => row.id === nodes.find(node => node.key === "reviewer-slot-1")?.taskId)
+    expect(correctionWriter).toMatchObject({ role: "writer", status: "completed" })
+    expect(correctionReviewer).toMatchObject({ role: "reviewer", status: "completed" })
+    expect(plain(plain(initialReviewer?.result)?.structuredResult)).toMatchObject({ role: "reviewer", status: "completed", reviewStatus: "needs_revision" })
+    expect(plain(plain(correctionReviewer?.result)?.structuredResult)).toMatchObject({ role: "reviewer", status: "completed", reviewStatus: "passed" })
+    expect(plain(plain(correctionWriter?.context)?.selectedJobPreparation)?.jobId).toBe(jobIds[0])
+    expect(plain(plain(correctionReviewer?.context)?.selectedJobPreparation)?.jobId).toBe(jobIds[0])
+
+    const completedPlanItems = await db.agentItem.findMany({ where: { sessionId, turnId, type: "tool_call" }, select: { content: true } })
+    const planCalls = completedPlanItems.map(item => plain(item.content)).filter((item): item is Record<string, unknown> => item !== null)
+      .filter(item => item.toolName === "agent.plan")
+    expect(planCalls).toHaveLength(3)
+    expect(planCalls[2]?.status).toBe("completed")
+    const correctionPlanInput = plain(planCalls[2]?.input)
+    const correctionPlanNodes = Array.isArray(correctionPlanInput?.nodes)
+      ? correctionPlanInput.nodes.map(plain).filter((node): node is Record<string, unknown> => node !== null) : []
+    expect(correctionPlanNodes.map(node => node.key)).toEqual(["writer-correction-slot-1", "reviewer-correction-slot-1"])
+    expect(correctionPlanNodes[0]?.templateId).toBe(selectedJobBatchTemplatesForSlot(SELECTED_JOB_BATCH_SLOT_IDS[0]!)?.writerTemplateId)
+    expect(correctionPlanNodes[1]?.templateId).toBe(selectedJobBatchTemplatesForSlot(SELECTED_JOB_BATCH_SLOT_IDS[0]!)?.reviewerTemplateId)
 
     const versions = await db.agentArtifactVersion.findMany({ where: { userId, sessionId, jobId: { in: selectedJobIds }, artifactType: "cover_letter" },
-      select: { id: true, artifactId: true, version: true, jobId: true, contentHash: true, sourceDigest: true, taskId: true } })
+      select: { id: true, artifactId: true, version: true, jobId: true, contentHash: true, sourceDigest: true, previousHash: true, taskId: true } })
     const reviews = await db.agentArtifactReview.findMany({ where: { userId, sessionId, jobId: { in: selectedJobIds } },
       select: { artifactVersionId: true, artifactId: true, version: true, jobId: true, contentHash: true, sourceDigest: true,
         currentSourceDigest: true, status: true, taskId: true, reviewHash: true } })
-    expect(versions).toHaveLength(2)
-    expect(reviews).toHaveLength(2)
-    expect(new Set(versions.map(row => row.jobId))).toEqual(new Set(selectedJobIds))
-    expect(new Set(reviews.map(row => row.jobId))).toEqual(new Set(selectedJobIds))
+    expect(versions).toHaveLength(3)
+    expect(reviews).toHaveLength(3)
+    const job1Versions = versions.filter(row => row.jobId === jobIds[0]).sort((left, right) => left.version - right.version)
+    const job2Versions = versions.filter(row => row.jobId === jobIds[1])
+    expect(job1Versions).toHaveLength(2)
+    expect(job2Versions).toHaveLength(1)
+    const initialDraft = job1Versions[0]!
+    const correctedDraft = job1Versions[1]!
+    const independentDraft = job2Versions[0]!
+    expect(initialDraft.version).toBe(1)
+    expect(correctedDraft.version).toBe(initialDraft.version + 1)
+    expect(correctedDraft.previousHash).toBe(initialDraft.contentHash)
+    expect(correctedDraft.artifactId).toBe(initialDraft.artifactId)
+    expect(correctedDraft.sourceDigest).toBe(initialDraft.sourceDigest)
+    expect(independentDraft.version).toBe(1)
+    expect(independentDraft.previousHash).toBeNull()
     expect(new Set(versions.map(row => row.sourceDigest)).size).toBe(2)
     expect(new Set(versions.map(row => row.artifactId)).size).toBe(2)
-    for (const version of versions) {
-      const review = reviews.find(row => row.jobId === version.jobId)
-      const reviewer = childRows.find(row => row.id === review?.taskId)
-      const writerNode = terminalNodes.find(node => {
-        const task = childRows.find(candidate => candidate.id === node.taskId)
-        return task?.role === "writer" && plain(plain(task.context)?.selectedJobPreparation)?.jobId === version.jobId
-      })
-      expect(review).toMatchObject({ artifactVersionId: version.id, artifactId: version.artifactId,
-        version: version.version, contentHash: version.contentHash, sourceDigest: version.sourceDigest,
-        currentSourceDigest: version.sourceDigest, status: "passed" })
+    expect(initialDraft.taskId).toBe(nodes.find(node => node.key === "writer-slot-1")?.taskId)
+    expect(correctedDraft.taskId).toBe(correctionWriterNode?.taskId)
+    expect(independentDraft.taskId).toBe(nodes.find(node => node.key === "writer-slot-2")?.taskId)
+    const initialReview = reviews.find(row => row.taskId === nodes.find(node => node.key === "reviewer-slot-1")?.taskId)
+    const correctionReview = reviews.find(row => row.taskId === correctionReviewerNode?.taskId)
+    const independentReview = reviews.find(row => row.taskId === nodes.find(node => node.key === "reviewer-slot-2")?.taskId)
+    expect(initialReview).toMatchObject({ artifactVersionId: initialDraft.id, artifactId: initialDraft.artifactId,
+      version: initialDraft.version, contentHash: initialDraft.contentHash, sourceDigest: initialDraft.sourceDigest,
+      currentSourceDigest: initialDraft.sourceDigest, status: "needs_revision" })
+    expect(correctionReview).toMatchObject({ artifactVersionId: correctedDraft.id, artifactId: correctedDraft.artifactId,
+      version: correctedDraft.version, contentHash: correctedDraft.contentHash, sourceDigest: correctedDraft.sourceDigest,
+      currentSourceDigest: correctedDraft.sourceDigest, status: "passed" })
+    expect(independentReview).toMatchObject({ artifactVersionId: independentDraft.id, artifactId: independentDraft.artifactId,
+      version: independentDraft.version, contentHash: independentDraft.contentHash, sourceDigest: independentDraft.sourceDigest,
+      currentSourceDigest: independentDraft.sourceDigest, status: "passed" })
+    for (const review of [initialReview, correctionReview, independentReview]) {
       expect(review?.reviewHash).toMatch(/^sha256:[a-f0-9]{64}$/)
-      expect(version.taskId).toBe(writerNode?.taskId)
-      expect(reviewer).toMatchObject({ role: "reviewer", status: "completed" })
+      expect(childRows.find(row => row.id === review?.taskId)).toMatchObject({ role: "reviewer", status: "completed" })
     }
+
+    const workbenchResponse = await getBatch(token, turnId)
+    expect(workbenchResponse.status).toBe(200)
+    const workbench = plain(await workbenchResponse.json())
+    expect(workbench).toMatchObject({ sessionId, turnId, status: "completed",
+      graph: { itemId: graph?.id, rootTaskId, revision: terminalRevision },
+      jobs: [
+        { slotId: "slot-1", jobId: jobIds[0], status: "completed", writer: { status: "completed",
+          artifactRef: { artifactId: correctedDraft.artifactId, version: correctedDraft.version,
+            contentHash: correctedDraft.contentHash, sourceDigest: correctedDraft.sourceDigest } },
+          reviewer: { status: "completed", reviewStatus: "passed" } },
+        { slotId: "slot-2", jobId: jobIds[1], status: "completed", writer: { status: "completed",
+          artifactRef: { artifactId: independentDraft.artifactId, version: independentDraft.version,
+            contentHash: independentDraft.contentHash, sourceDigest: independentDraft.sourceDigest } },
+          reviewer: { status: "completed", reviewStatus: "passed" } },
+      ] })
+    const workbenchText = JSON.stringify(workbench)
+    expect(workbenchText).not.toContain("BATCH_FEEDBACK_JOB_1_ONLY")
+    expect(workbenchText).not.toContain("BATCH_FEEDBACK_JOB_2_MUST_NOT_LEAK")
+    expect(workbenchText).not.toContain("Synthetic corrected job-specific cover letter")
 
     const finalItem = await db.agentItem.findFirst({ where: { sessionId, turnId, taskId: rootTaskId,
       type: "agent_message", phase: "final_answer", status: "completed" }, select: { content: true } })
