@@ -1,5 +1,25 @@
 const ARM_RELEASE = "stage8-release-arm"
 const FINAL_RELEASE = "stage8-release-final"
+const STOP_POLL_ERROR_MESSAGES = new Map([
+  ["Application submission Turn binding is unavailable.", "turn_binding_unavailable"],
+  ["Application submission task binding is unavailable.", "task_binding_unavailable"],
+  ["Application submission request phase is unavailable.", "request_phase_unavailable"],
+  ["Application submission Turn state is unavailable.", "turn_state_unavailable"],
+  ["Application submission Stop state is unavailable.", "stop_state_unavailable"],
+  ["Application submission scope changed during Stop polling.", "scope_changed"],
+  ["Application submission Stop poll did not commit.", "poll_commit_failed"],
+])
+const STOP_POLL_SQL_STATES = new Set(["08000", "08001", "08003", "08006", "23502", "23503", "23505", "23514", "40001", "40P01", "55P03", "57P01", "57P03"])
+
+export function classifyStage8StopPollError(error) {
+  try {
+    const message = error && typeof error === "object" && "message" in error && typeof error.message === "string"
+      ? error.message : null
+    if (message && STOP_POLL_ERROR_MESSAGES.has(message)) return STOP_POLL_ERROR_MESSAGES.get(message) ?? "other"
+    const code = error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : null
+    return code && STOP_POLL_SQL_STATES.has(code) ? "database" : "other"
+  } catch { return "other" }
+}
 
 export function createStage8FixtureControl() {
   const queued = new Set()
@@ -110,8 +130,25 @@ function trackStage8Pool(pool, control, workerTaskId, writeLine) {
 }
 
 export function createStage8ApplyWorker({ queue, stopProtocol, pool, control, writeLine }) {
+  let firstExactStopPollObserved = false
+  const writeStopPollLine = line => { try { writeLine(line) } catch { /* Stop diagnostics cannot change the protocol result. */ } }
   return queue.createApplyWorker({ stagedSubmissionStopProtocol: {
-    isStopped: scope => stopProtocol.isApplicationSubmissionStoppedWithStopProtocol(pool, scope),
+    isStopped: async scope => {
+      const exactTarget = control.matchesSubmissionTarget(scope)
+      if (!exactTarget || firstExactStopPollObserved) {
+        return stopProtocol.isApplicationSubmissionStoppedWithStopProtocol(pool, scope)
+      }
+      firstExactStopPollObserved = true
+      writeStopPollLine("STAGE8_STOP_POLL_ENTERED")
+      try {
+        const stopped = await stopProtocol.isApplicationSubmissionStoppedWithStopProtocol(pool, scope)
+        writeStopPollLine(stopped ? "STAGE8_STOP_POLL_RETURN_STOPPED" : "STAGE8_STOP_POLL_RETURN_CONTINUE")
+        return stopped
+      } catch (error) {
+        writeStopPollLine(`STAGE8_STOP_POLL_CAUGHT ${classifyStage8StopPollError(error)}`)
+        throw error
+      }
+    },
     onContinuationAcknowledged: scope => writeLine(`STAGE8_CONTINUE_ACK ${scope.workerTaskId}`),
     acquireStartFence: async scope => {
       const exactTarget = control.matchesSubmissionTarget(scope)

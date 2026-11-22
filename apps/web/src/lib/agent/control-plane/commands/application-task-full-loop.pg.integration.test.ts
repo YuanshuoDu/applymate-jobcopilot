@@ -301,6 +301,9 @@ type Stage8ExecutionFailure = Readonly<{
 const classifyStage8ExecutionFailure = (workerRequire("./src/queue/application-task-full-loop.trace-support.mjs") as {
   classifyStage8ExecutionFailure: (error: unknown) => Stage8ExecutionFailure
 }).classifyStage8ExecutionFailure
+const classifyStage8StopPollError = (workerRequire("./src/queue/application-task-full-loop.stage8.fixture-support.mjs") as {
+  classifyStage8StopPollError: (error: unknown) => string
+}).classifyStage8StopPollError
 const createStage8ExecutionFailureDiagnostics = (workerRequire("./src/queue/application-task-full-loop.trace-support.mjs") as {
   createStage8ExecutionFailureDiagnostics: (writeLine: (line: string) => void, input: PassThrough) => {
     record: (job: unknown, error: unknown) => boolean
@@ -586,6 +589,44 @@ describe("reviewed source turn diagnostics", () => {
 })
 
 describe("Stage8 terminal diagnostics", () => {
+  it("preserves only known post-Stop checkpoints", () => {
+    expect(reviewedFillDiagnosticValue("submission_uncertain", REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS)).toBe("submission_uncertain")
+    expect(reviewedFillDiagnosticValue("user_takeover", REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS)).toBe("user_takeover")
+    expect(reviewedFillDiagnosticValue("PRIVATE_CHECKPOINT", REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS)).toBe("other")
+  })
+
+  it("summarizes only bounded first Stop-poll events and fixed error labels", () => {
+    const known = classifyStage8StopPollError(new Error("Application submission request phase is unavailable."))
+    const database = classifyStage8StopPollError(Object.assign(new Error("PRIVATE_DATABASE_DETAIL"), { code: "40P01" }))
+    const unknown = classifyStage8StopPollError(new Error("PRIVATE_EXCEPTION_TEXT"))
+    expect([known, database, unknown]).toEqual(["request_phase_unavailable", "database", "other"])
+    const summary = stage8StopPollSummary([
+      "STAGE8_STOP_POLL_ENTERED", "STAGE8_STOP_POLL_RETURN_CONTINUE",
+      "STAGE8_STOP_POLL_CAUGHT request_phase_unavailable", "STAGE8_STOP_POLL_CAUGHT PRIVATE_EXCEPTION_TEXT",
+      "STAGE8_STOP_POLL_RETURN_STOPPED private-session-id",
+    ])
+    expect(summary).toEqual({
+      eventCounts: { entered: 1, returnedContinue: 1, returnedStopped: 0, caught: 1 },
+      caughtCodeCounts: { turn_binding_unavailable: 0, task_binding_unavailable: 0, request_phase_unavailable: 1,
+        turn_state_unavailable: 0, stop_state_unavailable: 0, scope_changed: 0, poll_commit_failed: 0, database: 0, other: 0 },
+      unclassifiedCount: 2,
+    })
+    expect(JSON.stringify(summary)).not.toMatch(/PRIVATE|private|DATABASE_DETAIL|EXCEPTION_TEXT|session-id/)
+    const requestSummary = stage8RequestFenceSummary([
+      ...Array.from({ length: 80 }, () => "unrelated fixture output"),
+      "STAGE8_EXACT_SUBMISSION_ROUTE_MATCHED", "STAGE8_START_FENCE_ENTERED", "STAGE8_START_FENCE_RESULT ready",
+      "STAGE8_STOP_POLL_ENTERED",
+    ])
+    expect(requestSummary).toEqual({
+      exactRouteMatched: true, exactFenceEntered: true,
+      resultCounts: { ready: 1, stopped: 0, inactive: 0, uncertain: 0, threw: 0 }, unclassifiedCount: 0,
+      stopPoll: { eventCounts: { entered: 1, returnedContinue: 0, returnedStopped: 0, caught: 0 },
+        caughtCodeCounts: { turn_binding_unavailable: 0, task_binding_unavailable: 0, request_phase_unavailable: 0,
+          turn_state_unavailable: 0, stop_state_unavailable: 0, scope_changed: 0, poll_commit_failed: 0, database: 0, other: 0 },
+        unclassifiedCount: 0 },
+    })
+  })
+
   it("reports approval resume evidence without exposing IDs, receipt contents, or tool inputs", () => {
     const summary = stage8FailureSummary({
       expectedApprovalId: "private-approval-id",
@@ -1545,7 +1586,8 @@ const REVIEWED_FILL_DIAGNOSTIC_STATUSES = new Set([
 ])
 const REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS = new Set([
   "materials_ready", "taskgraph_fill_queued", "browser_active", "form_answer_required", "fill_outcome_uncertain",
-  "form_filled", "submission_authorized", "queue_retry", "turn_stopped_before_submit", "fill_prestart_failed",
+  "form_filled", "submission_authorized", "submission_uncertain", "user_takeover", "queue_retry",
+  "turn_stopped_before_submit", "fill_prestart_failed",
 ])
 
 function reviewedFillDiagnosticValue(value: unknown, allowed: ReadonlySet<string>): string {
@@ -1902,6 +1944,28 @@ async function stage8FillFailureSnapshot(prepared: Stage8PreparedScenario, expec
 
 const STAGE8_BULL_STATES = new Set(["active", "completed", "delayed", "failed", "paused", "waiting", "waiting-children"])
 const STAGE8_FENCE_STATES = ["ready", "stopped", "inactive", "uncertain", "threw"] as const
+const STAGE8_STOP_POLL_ERRORS = ["turn_binding_unavailable", "task_binding_unavailable", "request_phase_unavailable",
+  "turn_state_unavailable", "stop_state_unavailable", "scope_changed", "poll_commit_failed", "database", "other"] as const
+
+function stage8StopPollSummary(lines: readonly string[]) {
+  const eventCounts = { entered: 0, returnedContinue: 0, returnedStopped: 0, caught: 0 }
+  const caughtCodeCounts = Object.fromEntries(STAGE8_STOP_POLL_ERRORS.map(code => [code, 0])) as Record<typeof STAGE8_STOP_POLL_ERRORS[number], number>
+  let unclassifiedCount = 0
+  const pollLines = lines.filter(line => typeof line === "string" && line.startsWith("STAGE8_STOP_POLL_")).slice(-64)
+  for (const line of pollLines) {
+    if (line === "STAGE8_STOP_POLL_ENTERED") eventCounts.entered += 1
+    else if (line === "STAGE8_STOP_POLL_RETURN_CONTINUE") eventCounts.returnedContinue += 1
+    else if (line === "STAGE8_STOP_POLL_RETURN_STOPPED") eventCounts.returnedStopped += 1
+    else if (typeof line === "string" && line.startsWith("STAGE8_STOP_POLL_CAUGHT ")) {
+      const match = /^STAGE8_STOP_POLL_CAUGHT ([a-z_]+)$/.exec(line)
+      if (match && STAGE8_STOP_POLL_ERRORS.includes(match[1] as typeof STAGE8_STOP_POLL_ERRORS[number])) {
+        eventCounts.caught += 1
+        caughtCodeCounts[match[1] as typeof STAGE8_STOP_POLL_ERRORS[number]] += 1
+      } else unclassifiedCount += 1
+    } else if (typeof line === "string" && line.startsWith("STAGE8_STOP_POLL_")) unclassifiedCount += 1
+  }
+  return { eventCounts, caughtCodeCounts, unclassifiedCount }
+}
 
 function stage8RequestFenceSummary(lines: readonly string[]) {
   let routeMatched = false
@@ -1915,7 +1979,8 @@ function stage8RequestFenceSummary(lines: readonly string[]) {
     if (match) resultCounts[match[1] as typeof STAGE8_FENCE_STATES[number]] += 1
     else if (typeof line === "string" && line.startsWith("STAGE8_START_FENCE_RESULT ")) unclassifiedCount += 1
   }
-  return { exactRouteMatched: routeMatched, exactFenceEntered: fenceEntered, resultCounts, unclassifiedCount }
+  return { exactRouteMatched: routeMatched, exactFenceEntered: fenceEntered, resultCounts, unclassifiedCount,
+    stopPoll: stage8StopPollSummary(lines) }
 }
 
 async function stage8ApplyQueueState(workerTaskId: string) {
