@@ -79,10 +79,10 @@ const currentLedger = ledger('turn-current', 'graph-current', 'root-current', 2,
 const oldTurnNode: TaskTreeNode = { id: 'turn:turn-old', kind: 'turn', label: 'Goal turn-old', status: 'failed' }
 
 function view(selectedNodeId?: string, selectedNode?: TaskTreeNode, visibleItems: TimelineItem[] = items,
-  visibleTasks: SupervisorTaskSummary[] = tasks) {
-  return <AgentSupervisorPlanView sessionId="session-1" items={visibleItems} turns={turns} tasks={visibleTasks} selectedNodeId={selectedNodeId}
+  visibleTasks: SupervisorTaskSummary[] = tasks, visibleTurns: SupervisorTurnSummary[] = turns, activeTurnProjection?: unknown) {
+  return <AgentSupervisorPlanView sessionId="session-1" items={visibleItems} turns={visibleTurns} tasks={visibleTasks} selectedNodeId={selectedNodeId}
     selectedNode={selectedNode} currentGraphTasks={visibleTasks.filter(row => row.turnId === 'turn-current')} currentLedger={currentLedger}
-    currentPreparationTurnId="turn-current" lifecycleRevision={7} onReturnToCurrent={() => undefined} />
+    currentPreparationTurnId="turn-current" activeTurnProjection={activeTurnProjection} lifecycleRevision={7} onReturnToCurrent={() => undefined} />
 }
 
 describe('AgentSupervisorPlanView', () => {
@@ -118,6 +118,38 @@ describe('AgentSupervisorPlanView', () => {
     expect(api.calls).toContainEqual({ url, enabled: true })
   })
 
+  it('passes the preparation capability only alongside the exact current verified shortlist', () => {
+    const identity = selectedTaskGraphIdentity(items, 'session-1', 'turn-current')!
+    const shortlist = { identity, result: { schemaVersion: 1, status: 'completed', items: [
+      { jobId: 'job-one', score: 9, evidenceIds: ['read:job:job-one'] },
+      { jobId: 'job-two', score: 8, evidenceIds: ['read:job:job-two'] },
+    ], failures: [] } }
+    const html = renderToStaticMarkup(<AgentSupervisorPlanView sessionId="session-1" items={items} turns={turns} tasks={tasks}
+      currentGraphTasks={tasks.filter(row => row.turnId === 'turn-current')} currentLedger={currentLedger}
+      currentDiscoveryShortlist={shortlist} currentPreparationTurnId="turn-current" lifecycleRevision={7}
+      onPrepareBatch={async () => ({ turnId: 'batch-turn-started', disposition: 'started' })} onReturnToCurrent={() => undefined} />)
+
+    expect(html).toContain('data-verified-shortlist-controls="true"')
+    expect(html).toContain('job-one')
+    expect(html).toContain('job-two')
+  })
+
+  it('keeps the current plan and historical navigation visible with exact batch progress', () => {
+    const batchTurn = { ...turn('turn-current'), status: 'in_progress', selectedJobBatchPreparation: true as const }
+    const projection = { activeTurnId: 'turn-current', activeTurn: {
+      id: 'turn-current', status: 'in_progress', revision: 3, selectedJobBatchPreparation: true,
+    } }
+    const current = renderToStaticMarkup(view(undefined, undefined, items, tasks, [turn('turn-old'), batchTurn], projection))
+    expect(current).toContain('CURRENT_PLAN_MARKER')
+    expect(current).toContain('Loading selected job progress…')
+
+    const historical = renderToStaticMarkup(view(oldTurnNode.id, oldTurnNode, items, tasks, [
+      { ...turn('turn-old'), selectedJobBatchPreparation: true as const }, turn('turn-current'),
+    ]))
+    expect(historical).toContain('Return to current plan')
+    expect(historical).toContain('Loading selected job progress…')
+  })
+
   it('suppresses stale session, Turn, graph, or revision responses instead of showing another plan', () => {
     const url = buildTaskGraphTaskLookupUrl('session-1', items, 'turn-old')!
     const identity = selectedTaskGraphIdentity(items, 'session-1', 'turn-old')!
@@ -149,7 +181,57 @@ describe('AgentSupervisorPlanView', () => {
     const current = renderToStaticMarkup(view())
     expect(current).toContain('CURRENT_PLAN_MARKER')
     expect(current).not.toContain('data-agent-plan-inspection=')
+    expect(api.calls.some(call => call.url.includes('/selected-job-batches/'))).toBe(false)
     expect(api.calls).toContainEqual({ url: '', enabled: false })
+
+    api.calls = []
+    const malformedMarker = renderToStaticMarkup(view(undefined, undefined, items, tasks, turns, {
+      activeTurnId: 'turn-current', activeTurn: { id: 'turn-current', status: 'in_progress', revision: 3, selectedJobBatchPreparation: 'true' },
+    }))
+    expect(malformedMarker).toContain('CURRENT_PLAN_MARKER')
+    expect(api.calls.some(call => call.url.includes('/selected-job-batches/'))).toBe(false)
+  })
+
+  it('shows a batch only when its exact historical Turn is inspected and marked', () => {
+    const batchTurn = { ...turn('turn-old'), selectedJobBatchPreparation: true as const }
+    const batchUrl = '/api/agent/sessions/session-1/selected-job-batches/turn-old'
+    api.responses.set(batchUrl, { data: {
+      sessionId: 'session-1', turnId: 'turn-old',
+      source: { sessionId: 'session-1', sourceTurnId: 'source-old', rootTaskId: 'source-root', graphItemId: 'source-graph', graphRevision: 2 },
+      graph: { itemId: 'graph-old', rootTaskId: 'root-old', revision: 4 }, status: 'pending',
+      jobs: [
+        { slotId: 'slot-1', jobId: 'job-1', company: 'Historic One', role: 'Engineer', status: 'pending', writer: { status: 'pending' }, reviewer: { status: 'pending' } },
+        { slotId: 'slot-2', jobId: 'job-2', company: 'Historic Two', role: 'Analyst', status: 'pending', writer: { status: 'pending' }, reviewer: { status: 'pending' } },
+      ],
+    }, loading: false, error: null, refetch: () => undefined })
+    const html = renderToStaticMarkup(view(oldTurnNode.id, oldTurnNode, items, tasks, [batchTurn, turns[1]!]))
+
+    expect(html).toContain('Historic One · Engineer')
+    expect(api.calls).toContainEqual({ url: batchUrl, enabled: true })
+  })
+
+  it('does not carry an older batch into the current plan when a newer ordinary Turn is active', () => {
+    const olderBatch = { ...turn('turn-old'), selectedJobBatchPreparation: true as const, createdAt: '2026-09-30T12:00:00.000Z' }
+    const currentOrdinary = { ...turn('turn-current'), status: 'in_progress', createdAt: '2026-10-01T12:00:00.000Z' }
+    const projection = { activeTurnId: 'turn-current', activeTurn: { id: 'turn-current', status: 'in_progress', revision: 3 } }
+    const html = renderToStaticMarkup(view(undefined, undefined, items, tasks, [olderBatch, currentOrdinary], projection))
+
+    expect(html).toContain('CURRENT_PLAN_MARKER')
+    expect(html).not.toContain('Selected jobs progress')
+    expect(api.calls.some(call => call.url.includes('/selected-job-batches/'))).toBe(false)
+  })
+
+  it('falls back to the latest known Turn only when that Turn is itself a batch', () => {
+    const olderBatch = { ...turn('turn-old'), selectedJobBatchPreparation: true as const }
+    const latestOrdinary = turn('turn-current')
+    const noActiveTurn = { activeTurnId: null, activeTurn: null }
+    const hidden = renderToStaticMarkup(view(undefined, undefined, items, tasks, [olderBatch, latestOrdinary], noActiveTurn))
+    expect(hidden).not.toContain('Selected jobs progress')
+    expect(api.calls.some(call => call.url.includes('/selected-job-batches/'))).toBe(false)
+
+    const latestBatch = { ...latestOrdinary, selectedJobBatchPreparation: true as const }
+    const shown = renderToStaticMarkup(view(undefined, undefined, items, tasks, [olderBatch, latestBatch], noActiveTurn))
+    expect(api.calls.some(call => call.url === '/api/agent/sessions/session-1/selected-job-batches/turn-current')).toBe(true)
   })
 
   it('does not render a cached response until its exact graph identity is current', () => {

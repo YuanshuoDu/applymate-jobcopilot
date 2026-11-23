@@ -4,6 +4,7 @@ import type { ToolExecutionContext } from "./types.js"
 import { createTaskGraphPlanningTool, registerTaskGraphPlanningTool } from "./planning-executors.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import type { TaskGraphCommandPort, TaskGraphScheduleReceipt, TaskGraphTaskTemplate } from "../subagents/task-graph-command-port.js"
+import { createSelectedJobBatchTemplateRegistry, type SelectedJobBatchSlot } from "../subagents/selected-job-batch-plan.js"
 import { resolveRootTaskVerificationRequirements } from "../context/root-task-objective.js"
 
 const proposal = {
@@ -57,7 +58,88 @@ function setup(templates: Readonly<Record<string, TaskGraphTaskTemplate>> = {
   return { tool, commandPort, getReceived: () => received, getOperation: () => operation }
 }
 
+const selectedBatchSlots: readonly SelectedJobBatchSlot[] = [
+  { slotId: "slot-1", jobId: "private-job-alpha" }, { slotId: "slot-2", jobId: "private-job-beta" },
+]
+const selectedBatchTemplates = createSelectedJobBatchTemplateRegistry(selectedBatchSlots, {
+  writer: { role: "writer", taskType: "cover_letter_draft", allowedActions: ["cover_letter.draft"] },
+  reviewer: { role: "reviewer", taskType: "cover_letter_review", allowedActions: ["artifact.review"] },
+}).templates
+const selectedBatchProposal = {
+  expectedRevision: 0,
+  nodes: [
+    { key: "writer-alpha", templateId: "cover_letter_writer_slot_1", goal: "Draft for the first Job", successCriteria: ["Create its draft"], dependsOn: [] },
+    { key: "reviewer-alpha", templateId: "cover_letter_reviewer_slot_1", goal: "Review the first draft", successCriteria: ["Review its Writer result"], dependsOn: ["writer-alpha"] },
+    { key: "writer-beta", templateId: "cover_letter_writer_slot_2", goal: "Draft for the second Job", successCriteria: ["Create its draft"], dependsOn: [] },
+    { key: "reviewer-beta", templateId: "cover_letter_reviewer_slot_2", goal: "Review the second draft", successCriteria: ["Review its Writer result"], dependsOn: ["writer-beta"] },
+  ],
+} as const
+const selectedBatchReceipt: TaskGraphScheduleReceipt = {
+  status: "accepted", revision: 1,
+  nodes: [
+    { key: "writer-alpha", taskId: "child-writer-alpha", status: "queued" },
+    { key: "reviewer-alpha", taskId: "child-reviewer-alpha", status: "waiting" },
+    { key: "writer-beta", taskId: "child-writer-beta", status: "queued" },
+    { key: "reviewer-beta", taskId: "child-reviewer-beta", status: "waiting" },
+  ],
+  readyTaskIds: ["child-writer-alpha", "child-writer-beta"],
+}
+
+function registeredSelectedBatchTool(responses: readonly TaskGraphScheduleReceipt[] = [selectedBatchReceipt]) {
+  let nextResponse = 0
+  const appendAndScheduleWithReconciliation = vi.fn(async () => responses[Math.min(nextResponse++, responses.length - 1)] ?? selectedBatchReceipt)
+  const commandPort: TaskGraphCommandPort = {
+    appendAndSchedule: vi.fn(async () => selectedBatchReceipt), appendAndScheduleWithReconciliation,
+    readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+  }
+  const registry = new ToolRegistry([])
+  registerTaskGraphPlanningTool(registry, true, {
+    commandPort, templates: selectedBatchTemplates, selectedJobBatchSlots: selectedBatchSlots,
+    turnLeaseOwner: "server-worker", turnLeaseVersion: 9, parentLeaseOwner: "server-worker",
+    parentAttemptCount: () => 1,
+  })
+  return { tool: registry.resolve("agent.plan", "1"), commandPort }
+}
+
 describe("agent.plan tool executor", () => {
+  it("registers and admits one complete initial same-slot Writer/Reviewer pair per selected Job", async () => {
+    const { tool, commandPort } = registeredSelectedBatchTool([selectedBatchReceipt, { ...selectedBatchReceipt, status: "duplicate" }])
+    expect(tool.description).toContain("submit every server-listed slot's Writer and same-slot Reviewer together")
+    await expect(tool.execute(context(), selectedBatchProposal)).resolves.toEqual(selectedBatchReceipt)
+    await expect(tool.execute(context(), selectedBatchProposal)).resolves.toMatchObject({ status: "duplicate" })
+    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledTimes(2)
+    expect(commandPort.appendAndSchedule).not.toHaveBeenCalled()
+  })
+
+  it("rejects incomplete, cross-linked, noninitial, replacement, and repair batch plans before port access", async () => {
+    const crossLinked = { ...selectedBatchProposal, nodes: selectedBatchProposal.nodes.map(node =>
+      node.key === "reviewer-alpha" ? { ...node, dependsOn: ["writer-beta"] } : node) }
+    const replacement = { ...selectedBatchProposal, nodes: [selectedBatchProposal.nodes[0]], replaceUnstarted: { nodeKey: "old-writer" } }
+    const repair = { ...selectedBatchProposal, nodes: selectedBatchProposal.nodes.map(node => node.key === "writer-alpha"
+      ? { ...node, repairOf: { graphRootTaskId: "runtime-root", nodeKey: "old-writer", taskId: "old-task", criterionIds: ["draft"] } } : node) }
+    const verification = { ...selectedBatchProposal, nodes: selectedBatchProposal.nodes.map((node, index) => index === 0
+      ? { ...node, verification: { unsupported: true } } : node) }
+    const packageRefs = { ...selectedBatchProposal, nodes: selectedBatchProposal.nodes.map((node, index) => index === 0
+      ? { ...node, packageRefs: ["private-package"] } : node) }
+    const invalid = [
+      { ...selectedBatchProposal, nodes: selectedBatchProposal.nodes.slice(0, 3) },
+      crossLinked,
+      { ...selectedBatchProposal, expectedRevision: 1 },
+      replacement,
+      repair,
+      verification,
+      packageRefs,
+    ]
+
+    for (const input of invalid) {
+      const { tool, commandPort } = registeredSelectedBatchTool()
+      await expect(tool.execute(context(), input)).rejects.toMatchObject({ code: "selected_job_batch_plan_invalid" })
+      expect(commandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
+      expect(commandPort.appendAndSchedule).not.toHaveBeenCalled()
+      expect(commandPort.readCurrent).not.toHaveBeenCalled()
+    }
+  })
+
   it("publishes advisory deadline replacement guidance on the registered public tool", () => {
     const templates = {
       scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },

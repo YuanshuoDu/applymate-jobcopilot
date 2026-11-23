@@ -7,6 +7,7 @@ export interface SupervisorTurnSummary {
   readonly source: string
   readonly goal: string
   readonly selectedJobId?: string
+  readonly selectedJobBatchPreparation?: true
   readonly status: string
   readonly revision: number
   readonly activeStepId: string | null

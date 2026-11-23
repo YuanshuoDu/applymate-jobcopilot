@@ -13,6 +13,7 @@ import { createCanonicalTurnCoordination } from "./canonical-turn-coordination.j
 import { createCanonicalPolicy } from "./policy/canonical-policy.js"
 import { resolveRootTaskVerificationRequirements } from "./context/root-task-objective.js"
 import { failSelectedJobPreparationUnavailable } from "./selected-job-preparation-gate.js"
+import { canonicalSelectedJobBatchRuntimeAvailable, failCanonicalSelectedJobBatchUnavailable, prepareCanonicalSelectedJobBatchForTurn, type CanonicalSelectedJobBatchReady } from "./canonical-selected-job-batch-setup.js"
 import { loadSelectedJobPreparation } from "./selected-job-preparation.js"
 import { TASK_GRAPH_TEMPLATES, taskGraphRuntimeForTurn } from "./subagents/task-graph-templates.js"
 import type { TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
@@ -45,6 +46,7 @@ export type CanonicalTurnSetup = {
   readonly objectiveTaskGraphMode: boolean
   readonly taskGraphPlanningEnabled: boolean
   readonly selectedJobMode: boolean
+  readonly selectedJobBatch?: CanonicalSelectedJobBatchReady
   readonly scheduledDraftMode: boolean
   readonly selectedJobPreparation: TaskGraphRuntimeResult["selectedJobPreparation"]
   readonly taskGraphTemplateRoles: Readonly<Record<string, string>> | undefined
@@ -99,6 +101,7 @@ export async function prepareCanonicalTurnSetup(input: {
   readonly coordinationEnabled: boolean
   readonly childExecutionEnabled: boolean
   readonly consumeWaitOutcomes: boolean
+  readonly batchCompletionGate?: typeof import("./canonical-selected-job-batch-runtime.js").createCanonicalSelectedJobBatchRuntime
 }): Promise<CanonicalTurnSetupResult> {
   const { pool, lease, signal, now, options, manager, rootTasks, executionProjection, sessionProjection } = input
   const durableWaitPort = createPgDurableWaitPort(pool)
@@ -106,7 +109,17 @@ export async function prepareCanonicalTurnSetup(input: {
     ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: input.consumeWaitOutcomes, durableWaitControlReader: durableWaitPort }))
   const objectiveTaskGraphMode = state.intent?.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind
     && state.intent.version === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version
-  const graph = await taskGraphRuntimeForTurn({
+  const batchSetup = await prepareCanonicalSelectedJobBatchForTurn({
+    pool, lease, state, currentRootTaskId: state.rootTaskId ?? null, signal, completionGate: input.batchCompletionGate,
+    runtimeAvailable: canonicalSelectedJobBatchRuntimeAvailable({ enabled: options.productionFlags?.taskGraphPlanningEnabled === true,
+      coordination: input.coordinationEnabled, childExecution: input.childExecutionEnabled, consumeWaitOutcomes: input.consumeWaitOutcomes,
+      commandPort: options.taskGraphCommandPort, rootCompletion: !!rootTasks.checkCompletion }),
+  })
+  if (batchSetup.status === "unavailable") return { earlyResult: await failCanonicalSelectedJobBatchUnavailable({ lease, state, rootTasks, executionProjection, sessionProjection, now }) }
+  const selectedJobBatch = batchSetup.status === "ready" ? batchSetup : undefined
+  const graph: TaskGraphRuntimeResult = selectedJobBatch ? {
+    enabled: true, selectedJobMode: false, selectedJobPreparation: undefined, scheduledDraftMode: false, templates: selectedJobBatch.templates,
+  } : await taskGraphRuntimeForTurn({
     enabled: options.productionFlags?.taskGraphPlanningEnabled === true && input.coordinationEnabled,
     pool, lease, now, turnSource: state.source, automationRunMode: state.automationRunMode, turnInput: state.turnInput,
     selectedJobPreparationLoader: options.selectedJobPreparationLoader,
@@ -172,20 +185,22 @@ export async function prepareCanonicalTurnSetup(input: {
     commandPort: options.taskGraphCommandPort, templates: turnTaskGraphTemplates, verificationRequirements,
     turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId,
     parentAttemptCount: () => lifecycle.taskGraphParentAttemptCount, rootInputId: state.rootInputId ?? null,
+    ...(selectedJobBatch ? { selectedJobBatchSlots: selectedJobBatch.slots } : {}),
   })
   if (input.coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities)
   if (nativeQuestionWaitEnabled) assertCanonicalQuestionSurface(toolRuntime.registry, toolCapabilities)
   const rootTools = rootToolSurface(toolRuntime.registry.list(toolCapabilities), graph.selectedJobMode, interactiveDiscoveryMode, isSelectedJobRootTool)
-    .filter(value => !objectiveTaskGraphMode || objectiveTaskGraphRootToolAllowed(value))
+    .filter(value => (!objectiveTaskGraphMode && !selectedJobBatch) || objectiveTaskGraphRootToolAllowed(value))
     .filter(value => verificationRequirements.status !== "valid" || !["agent.spawn", "spawn_subagent", "agent.followup"].includes(String(record(value).name ?? "")))
   const allowedActions = objectiveTaskGraphMode ? rootTaskAllowedActions(rootTools, undefined, false)
-    : addScheduledPrepareActions(rootTaskAllowedActions(rootTools, turnTaskGraphTemplates, graph.enabled), state, graph.enabled)
+    : selectedJobBatch ? rootTaskAllowedActions(rootTools, turnTaskGraphTemplates, true)
+      : addScheduledPrepareActions(rootTaskAllowedActions(rootTools, turnTaskGraphTemplates, graph.enabled), state, graph.enabled)
   const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot,
     toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions, now: now() })
   lifecycle.taskGraphParentAttemptCount = root.attemptCount
   turnCoordination.bindRoot(root)
   return {
-    state, interactiveDiscoveryMode, objectiveTaskGraphMode, taskGraphPlanningEnabled: graph.enabled, selectedJobMode: graph.selectedJobMode, scheduledDraftMode: graph.scheduledDraftMode,
+    state, interactiveDiscoveryMode, objectiveTaskGraphMode, taskGraphPlanningEnabled: graph.enabled, selectedJobMode: graph.selectedJobMode, ...(selectedJobBatch ? { selectedJobBatch } : {}), scheduledDraftMode: graph.scheduledDraftMode,
     selectedJobPreparation: graph.selectedJobPreparation, taskGraphTemplateRoles, turnCoordination, nativeQuestionWaitEnabled, toolCapabilities,
     durableWaitPort, lifecycle, toolRuntime, rootTools, root,
   }

@@ -110,7 +110,7 @@ export async function scheduleTaskGraphOperationalFailureReplacement(client: Cli
   const planRevision = expectedRevision + descendants.length
   const reuse: OperationalFailureCapacityReuse = { originalNodeCount: before.nodes.length, removedNodeCount: validation.value.sourceNodes.length }
   const created = await createGraphTasks(client, { ...input, proposal: { ...input.proposal, expectedRevision: planRevision } },
-    parent, working, new Map(retained.map(node => [node.key, node.taskId])), persisted, reuse)
+    parent, working, new Map(retained.map(node => [node.key, node.taskId])), persisted, reuse, true)
   const stamped = stampCreatedScoutEnvelopes(created.snapshot, created.created, input.templates)
   const snapshot = rootCriteria ? parseTaskGraphSnapshot({ ...stamped, rootSuccessCriteria: rootCriteria }) : stamped
   assertReplacementSnapshot(before, snapshot, validation.value.sourceNodes, validation.value.sourceToReplacementKey)

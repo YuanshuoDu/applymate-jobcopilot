@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 import type pg from "pg"
 import { describe, expect, it, vi } from "vitest"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 import { TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, type TaskGraphVerificationEvidenceProjection } from "../planning/task-graph-verification.js"
 import { SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION } from "./scheduled-automation-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
@@ -196,6 +197,45 @@ function replayData(options: { sourceResultItemId?: string; sourceSessionId?: st
 }
 
 describe("TaskGraph PostgreSQL verification evidence", () => {
+  it("reports a verified empty objective search as a failed candidate-count criterion", async () => {
+    const emptyTurn = { source: "user", executionMode: "canonical_task_graph", input: {
+      goal: "Find roles", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      verificationRequirements: { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+      ] },
+    } }
+    const data = durableRows({ output: { jobs: [], page: 1, hasMore: false }, turn: emptyTurn })
+    const result = await verifyTaskGraphNodeEvidence(data.client, { scope, snapshot, node, structuredResult: emptyScoutResult })
+    expect(result).toMatchObject({ verified: false, report: {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+      criteria: [
+        { criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "evidence-count", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "bound-candidate", status: "failed", reasonCode: "criterion_not_met" },
+      ], evidenceDigest: expect.stringMatching(/^[a-f0-9]{64}$/), resultDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+    }, projection: { role: "scout", candidates: [], evidenceIds: [] } })
+
+    const completed = durableRows({ output: { jobs: [], page: 1, hasMore: false }, turn: emptyTurn, task: {
+      id: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+      turnRootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, attemptCount: 1, status: "completed", role: "scout",
+      userId: scope.userId, result: { status: "completed", structuredResult: emptyScoutResult },
+    } })
+    await expect(verifyCompletedTaskGraphNodeEvidence(completed.client, { scope, snapshot, node, structuredResult: emptyScoutResult }))
+      .resolves.toMatchObject({ verified: false, report: { status: "failed", reasonCode: "criterion_not_met" } })
+  })
+
+  it("does not classify empty search receipts without an exact objective Turn", async () => {
+    const invalidTurn = { source: "automation", executionMode: "canonical_task_graph", input: {
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      verificationRequirements: { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+      ] },
+    } }
+    const data = durableRows({ output: { jobs: [], page: 1, hasMore: false }, turn: invalidTurn })
+    await expect(verifyTaskGraphNodeEvidence(data.client, { scope, snapshot, node, structuredResult: emptyScoutResult }))
+      .resolves.toMatchObject({ verified: false, report: { status: "unverified", reasonCode: "canonical_evidence_missing" } })
+  })
+
   it("verifies a zero-result Scout only from the complete persisted owner/attempt-bound discovery receipt", async () => {
     const emptyResult = emptyScoutResult
     const output = {

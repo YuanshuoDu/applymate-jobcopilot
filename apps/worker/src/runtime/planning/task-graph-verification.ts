@@ -120,7 +120,17 @@ export function evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst(
   return evaluateTaskGraphVerificationInternal(contract, projectionValue, dependencyEvidence, undefined, true)
 }
 
-function evaluateTaskGraphVerificationInternal(contract: TaskGraphVerificationContract, projectionValue: TaskGraphVerificationEvidenceProjection, dependencyEvidence?: TaskGraphVerificationDependencyEvidence, verifiedEmptyDiscoveryDigest?: string, allowExactEmptyAnalyst = false): TaskGraphVerificationEvaluation {
+/** PG verifier only: evaluates an exact empty Scout result without granting verified-empty discovery. */
+export function evaluateTaskGraphVerificationWithExactEmptyScoutResult(
+  contract: TaskGraphVerificationContract,
+  projectionValue: TaskGraphVerificationEvidenceProjection,
+  dependencyEvidence?: TaskGraphVerificationDependencyEvidence,
+): TaskGraphVerificationEvaluation {
+  if (contract.role !== "scout" || !isExactEmptyScoutProjection(projectionValue)) return unverifiedEvaluation(contract, "canonical_evidence_invalid")
+  return evaluateTaskGraphVerificationInternal(contract, projectionValue, dependencyEvidence, undefined, false, true)
+}
+
+function evaluateTaskGraphVerificationInternal(contract: TaskGraphVerificationContract, projectionValue: TaskGraphVerificationEvidenceProjection, dependencyEvidence?: TaskGraphVerificationDependencyEvidence, verifiedEmptyDiscoveryDigest?: string, allowExactEmptyAnalyst = false, allowExactEmptyScout = false): TaskGraphVerificationEvaluation {
   try {
     if ((contract.schemaVersion !== TASK_GRAPH_VERIFICATION_SCHEMA_VERSION && contract.schemaVersion !== TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2)
       || (contract.role !== "scout" && contract.role !== "analyst") || !Array.isArray(contract.criteria)
@@ -129,6 +139,7 @@ function evaluateTaskGraphVerificationInternal(contract: TaskGraphVerificationCo
       && contract.criteria.some(item => item.check.kind === "candidate_location_in")) return { status: "unverified", reasonCode: "contract_invalid", criteria: [] }
     const parsed = allowExactEmptyAnalyst
       ? parseExactEmptyAnalystProjection(projectionValue)
+      : allowExactEmptyScout ? parseExactEmptyScoutProjection(projectionValue)
       : parseTaskGraphVerificationEvidenceProjection(projectionValue)
     if (!parsed.ok) return unverifiedEvaluation(contract, parsed.reasonCode)
     if (parsed.value.role !== contract.role) return unverifiedEvaluation(contract, "role_mismatch")
@@ -183,6 +194,22 @@ function parseExactEmptyAnalystProjection(value: unknown): ReturnType<typeof par
     return { ok: false, reasonCode: "canonical_evidence_invalid" }
   }
   return { ok: true, value: { schemaVersion, role: "analyst", items: [], evidenceIds: [] } }
+}
+
+function isExactEmptyScoutProjection(value: unknown): boolean { return parseExactEmptyScoutProjection(value).ok }
+
+function parseExactEmptyScoutProjection(value: unknown): ReturnType<typeof parseTaskGraphVerificationEvidenceProjection> {
+  const row = exactPlainRecord(value, "candidates,evidenceIds,role,schemaVersion")
+  const evidenceIds = row && exactEmptyArray(row.evidenceIds) ? row.evidenceIds : undefined
+  const candidates = row && exactEmptyArray(row.candidates) ? row.candidates : undefined
+  const schemaVersion = row?.schemaVersion === TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION
+    ? TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION
+    : row?.schemaVersion === TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION
+      ? TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION : undefined
+  if (!row || !schemaVersion || row.role !== "scout" || !evidenceIds || !candidates) {
+    return { ok: false, reasonCode: "canonical_evidence_invalid" }
+  }
+  return { ok: true, value: { schemaVersion, role: "scout", items: [], evidenceIds: [] } }
 }
 
 function exactPlainRecord(value: unknown, keys: string): Record<string, unknown> | undefined {

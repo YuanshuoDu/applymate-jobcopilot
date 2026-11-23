@@ -144,6 +144,65 @@ describe('AgentSupervisorPanel selected evidence', () => {
     expect(html).not.toContain('PROJECTION_PRIVATE_GOAL')
   })
 
+  it('discovers an active batch beyond the first page after reload through its literal projection marker', () => {
+    const pageTurns = Array.from({ length: 100 }, (_, index) => ({
+      id: `turn-${index}`, sessionId: 'session-1', source: 'user', goal: `Goal ${index}`, status: 'completed', revision: 1,
+      activeStepId: null, finalItemId: null, createdAt: '', updatedAt: '', completedAt: null,
+    }))
+    const batchUrl = '/api/agent/sessions/session-1/selected-job-batches/turn-batch-hidden'
+    supervisorApi.responses.set('/api/agent/sessions/session-1/turns?limit=100', {
+      data: { turns: pageTurns, projection: { activeTurnId: 'turn-batch-hidden', activeTurn: {
+        id: 'turn-batch-hidden', status: 'in_progress', revision: 0, selectedJobBatchPreparation: true,
+      } } }, loading: false, error: null, refetch: () => undefined,
+    })
+    supervisorApi.responses.set(batchUrl, { data: {
+      sessionId: 'session-1', turnId: 'turn-batch-hidden',
+      source: { sessionId: 'session-1', sourceTurnId: 'source-hidden', rootTaskId: 'source-root', graphItemId: 'source-graph', graphRevision: 2 },
+      graph: null, status: 'pending', jobs: [
+        { slotId: 'slot-1', jobId: 'job-1', company: 'Reloaded One', role: 'Engineer', status: 'pending', writer: { status: 'pending' }, reviewer: { status: 'pending' } },
+        { slotId: 'slot-2', jobId: 'job-2', company: 'Reloaded Two', role: 'Analyst', status: 'pending', writer: { status: 'pending' }, reviewer: { status: 'pending' } },
+      ],
+    }, loading: false, error: null, refetch: () => undefined })
+
+    const html = renderToStaticMarkup(<AgentSupervisorPanel sessionId="session-1" timeline={pendingApprovalTimeline()} />)
+    expect(html).toContain('Reloaded One · Engineer')
+    expect(supervisorApi.calls).toContain(batchUrl)
+  })
+
+  it('connects the current verified shortlist to the selected-job batch command capability', () => {
+    const graph = item({ id: 'graph-current', taskId: 'root-current', turnId: 'turn-current', type: 'task_graph', revision: 4,
+      content: { schemaVersion: 'agent-harness.v2.task-graph', nodes: [{ key: 'scout', templateId: 'scout', goal: 'Find roles',
+        successCriteria: ['Verify evidence'], dependsOn: [], depth: 1, taskId: 'scout-current' }] } })
+    const preparation = item({ id: 'preparation-current', turnId: 'turn-current', type: 'user_message', sequence: '41', content: {
+      parts: [{ type: 'text', text: SELECTED_JOB_PREPARATION_MESSAGE_TEXT }],
+    } })
+    const identity = { sessionId: 'session-1', sourceTurnId: 'turn-current', rootTaskId: 'root-current', graphItemId: 'graph-current', graphRevision: 4 }
+    const discoveryShortlist = { identity: { sessionId: 'session-1', turnId: 'turn-current', rootTaskId: 'root-current', graphItemId: 'graph-current', revision: 4 }, result: {
+      schemaVersion: 1, status: 'completed', items: [
+        { jobId: 'job-one', score: 9, evidenceIds: ['read:job:job-one'] },
+        { jobId: 'job-two', score: 8, evidenceIds: ['read:job:job-two'] },
+      ], failures: [],
+    } }
+    const timeline = { ...pendingApprovalTimeline(), items: [graph, preparation] } satisfies AgentTimelineSnapshot
+    const turnsUrl = '/api/agent/sessions/session-1/turns?limit=100'
+    const tasksUrl = '/api/agent/sessions/session-1/tasks?limit=100'
+    const currentTurn = { id: 'turn-current', sessionId: 'session-1', source: 'user', goal: 'Find roles', status: 'completed',
+      revision: 4, activeStepId: null, finalItemId: null, createdAt: '', updatedAt: '', completedAt: null }
+    const currentTasks = [
+      { id: 'root-current', sessionId: 'session-1', turnId: 'turn-current', rootTaskId: 'root-current', role: 'orchestrator', taskType: 'root', status: 'completed', goal: 'Find roles', hasResult: true },
+      { id: 'scout-current', sessionId: 'session-1', turnId: 'turn-current', rootTaskId: 'root-current', role: 'scout', taskType: 'scout', status: 'completed', goal: 'Find roles', hasResult: true },
+    ]
+    const graphUrl = buildTaskGraphTaskLookupUrl('session-1', [graph, preparation], 'turn-current')!
+    supervisorApi.responses.set(turnsUrl, { data: { turns: [currentTurn] }, loading: false, error: null, refetch: vi.fn() })
+    supervisorApi.responses.set(tasksUrl, { data: { tasks: currentTasks }, loading: false, error: null, refetch: vi.fn() })
+    supervisorApi.responses.set(graphUrl, { data: { tasks: currentTasks, discoveryShortlist }, loading: false, error: null, refetch: vi.fn() })
+
+    const html = renderToStaticMarkup(<AgentSupervisorPanel sessionId="session-1" timeline={timeline} />)
+    expect(html).toContain('data-verified-shortlist-controls="true"')
+    expect(html).toContain('Prepare selected jobs')
+    expect(html).toContain(identity.sourceTurnId)
+  })
+
   it.each(['waiting_for_user', 'in_progress'])('preserves pending approval controls for %s paged and projected Turns', status => {
     const current = { id: 'turn-current', sessionId: 'session-1', source: 'user', goal: 'Current goal', status, revision: 7,
       activeStepId: null, finalItemId: null, createdAt: '', updatedAt: '', completedAt: null }
