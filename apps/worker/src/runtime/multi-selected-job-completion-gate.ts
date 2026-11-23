@@ -2,7 +2,7 @@ import type {
   AgentArtifactDraftHead, AgentArtifactDraftHeadScope, AgentArtifactReviewReceipt,
   AgentArtifactReviewReceiptScope,
 } from "../db/agent-artifact-repo.js"
-import { parseSelectedJobBatchGraph } from "@jobcopilot/agent-protocol"
+import { parseSelectedJobBatchGraph, SELECTED_JOB_BATCH_SLOT_IDS } from "@jobcopilot/agent-protocol"
 import {
   isSelectedJobBatchCorrectionSuccessor, readSelectedJobBatchCorrectionPriorEvidence,
   type SelectedJobBatchArtifactVersion, type SelectedJobBatchArtifactVersionScope,
@@ -125,7 +125,7 @@ export async function verifySelectedJobBatchCompletion(input: VerifySelectedJobB
 
 function bindPairs(input: VerifySelectedJobBatchCompletionInput): BoundPair[] | undefined {
   const { graph, pairs, taskContexts } = input
-  if (!Number.isSafeInteger(graph.revision) || graph.revision < 0 || pairs.length < 2 || pairs.length > 4
+  if (!Number.isSafeInteger(graph.revision) || graph.revision < 0 || pairs.length < 2 || pairs.length > SELECTED_JOB_BATCH_SLOT_IDS.length
     || taskContexts.length !== graph.nodes.length || new Set(pairs.map(pair => pair.jobId)).size !== pairs.length) return undefined
   const parsed = parseSelectedJobBatchGraph(graph.nodes, pairs.map(pair => pair.slotId))
   if (!parsed) return undefined

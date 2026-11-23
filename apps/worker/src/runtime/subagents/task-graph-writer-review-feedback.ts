@@ -1,5 +1,6 @@
 import type pg from "pg"
 import { parseSelectedJobBatchGraph, SELECTED_JOB_BATCH_TEMPLATE_CATALOG, type SelectedJobBatchGraphSlot } from "@jobcopilot/agent-protocol"
+import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { TaskGraphWriterReviewFeedbackError } from "./task-graph-writer-review-frame.js"
 import { hasPersistedTaskGraphMembership, loadTaskGraph, type LoadedGraph } from "./task-graph-pg-state.js"
 import { TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
@@ -213,7 +214,7 @@ function selectedBatchWriterSlot(
       || node.packageRefs || node.nativeDelegation || node.registeredScoutEnvelope)) return null
   const slotIds = SELECTED_JOB_BATCH_TEMPLATE_CATALOG.filter(entry => snapshot.nodes.some(node =>
     node.templateId === entry.writerTemplateId || node.templateId === entry.reviewerTemplateId)).map(entry => entry.slotId)
-  if (slotIds.length > 3) return null
+  if (slotIds.length * 2 + 2 > TASK_GRAPH_LIMITS.maxNodes) return null
   const slots = parseSelectedJobBatchGraph(snapshot.nodes, slotIds)
   const slot = slots?.find(candidate => candidate.effective.writer.taskId === lease.id)
   return slot && slot.effective.writer.key === writerNode.key && slot.effective.writer.templateId === writerNode.templateId ? slot : null
