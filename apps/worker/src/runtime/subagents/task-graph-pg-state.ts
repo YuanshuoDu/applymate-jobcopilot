@@ -19,7 +19,7 @@ export type GraphEventScope = GraphIdentityScope & Readonly<{ stepId?: string }>
 export type GraphScope = TaskGraphReadScope & Readonly<{ stepId?: string }>
 export type GraphParent = Record<string, unknown>
 export type GraphItem = Readonly<{ id: string; revision: number; content: unknown; createdAt: unknown }>
-export type GraphTaskRow = Readonly<{ id: string; status: SubagentTaskStatus; role: string; taskType?: string; expectedOutputSchema?: unknown; allowedActions?: unknown; contextIsObject?: boolean; contextIsEmpty?: boolean; contextIsCanonicalNestedScoutProfile?: boolean; hasPrivateSelectionContext?: boolean; attemptCount?: number; failureReason: string | null; result: unknown }>
+export type GraphTaskRow = Readonly<{ id: string; status: SubagentTaskStatus; role: string; taskType?: string; expectedOutputSchema?: unknown; allowedActions?: unknown; contextIsObject?: boolean; contextIsEmpty?: boolean; contextIsCanonicalNestedScoutProfile?: boolean; hasPrivateSelectionContext?: boolean; attemptCount?: number; failureReason: string | null; result: unknown; absoluteDeadlineAt?: unknown; deadlineObservedAt?: unknown }>
 export type LoadedGraph = Readonly<{
   rootTaskId: string
   snapshot: TaskGraphSnapshot | null
@@ -118,7 +118,9 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
       COALESCE(task."context" = '{}'::jsonb, false) AS "contextIsEmpty",
       COALESCE(task."context" = jsonb_build_object('nestedScoutProfile', $7::text), false) AS "contextIsCanonicalNestedScoutProfile",
       COALESCE(jsonb_typeof(task."context") = 'object' AND task."context" ?| ARRAY['selectedJobPreparation', 'coverLetterBase', 'writerReviewFeedback']::text[], false) AS "hasPrivateSelectionContext",
-      task."attemptCount", task."failureReason", task."result"
+      task."attemptCount", task."failureReason", task."result",
+      to_char(((to_jsonb(task)->>'absoluteDeadlineAt')::timestamptz) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS') || 'Z' AS "absoluteDeadlineAtUtc",
+      to_char(statement_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS') || 'Z' AS "deadlineObservedAtUtc"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
     WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3
       AND task."rootTaskId" = $4 AND task."parentTaskId" = $5 AND session."userId" = $6`,
@@ -136,6 +138,7 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
       hasPrivateSelectionContext: typeof row.hasPrivateSelectionContext === "boolean" ? row.hasPrivateSelectionContext : undefined,
       attemptCount: Number(row.attemptCount),
       failureReason: nonEmpty(row.failureReason) ? String(row.failureReason) : null, result: row.result ?? null,
+      ...(Object.hasOwn(row, "absoluteDeadlineAtUtc") ? { absoluteDeadlineAt: row.absoluteDeadlineAtUtc, deadlineObservedAt: row.deadlineObservedAtUtc } : {}),
     }]
   }))
   const events = await client.query(`SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload",
