@@ -2,14 +2,14 @@ import { randomUUID } from "node:crypto"
 import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
-import { assertSessionWorkAdmission } from "../session-gate.js"
+import { assertSessionTerminalAdmission, revokeSessionTerminalAdmissionsForClient, type SessionTerminalAdmission } from "../session-gate.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity } from "../outbox-identity.js"
 import { toRepositoryJson, type AtomicTurnCompletionInput, type AtomicTurnCompletionResult, type TurnEngineEvent, type TurnEngineEventInput } from "./turn-engine-types.js"
 import type { TurnEngineCompletionGateResult } from "./turn-execution-types.js"
 import { steeringReconciliationRecoveryError, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-completion-gate.js"
 import { tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
-import { assertPlanningRootHasNoUnresolvedSteering } from "../subagents/pg-store-create.js"
+import { assertTerminalPlanningRootHasNoUnresolvedSteering } from "../subagents/pg-store-create.js"
 import { updateRootObjectiveHistoryProjection } from "../context/objective-history-projection.js"
 import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { acquireRootTaskHistoryChronologyLock, appendRootTaskHistoryChronologyWitness, readRootTaskHistoryChronologyWitness } from "../context/root-task-history-chronology-witness.js"
@@ -18,7 +18,7 @@ type Pool = Pick<pg.Pool, "connect">
 type Client = pg.PoolClient
 type Row = Record<string, unknown>
 type TerminalInput = AtomicTurnCompletionInput & { readonly owner: TurnExecutionOwnerFence; readonly response: string; readonly now: Date }
-export type TurnEngineTerminalGuard = (client: pg.PoolClient, input: TerminalInput) => Promise<TurnEngineCompletionGateResult>
+export type TurnEngineTerminalGuard = (client: pg.PoolClient, input: TerminalInput, admission?: SessionTerminalAdmission) => Promise<TurnEngineCompletionGateResult>
 const json = (value: unknown) => JSON.stringify(value)
 const sameJson = (left: unknown, right: unknown) => json(toRepositoryJson(left)) === json(toRepositoryJson(right))
 function markerIdentity(value: SteeringMarkerPayload): string { return JSON.stringify({ schemaVersion: value.schemaVersion, kind: value.kind, status: value.status, sessionId: value.sessionId, turnId: value.turnId, taskId: value.taskId, inputId: value.inputId, idempotencyKey: value.idempotencyKey, obligationId: value.obligationId, goalRevision: value.goalRevision, planRevision: value.planRevision, acceptedSequence: value.acceptedSequence }) }
@@ -85,7 +85,7 @@ async function transaction<T>(pool: Pool, userId: string, work: (client: Client)
   } catch (error: unknown) {
     if (!committed) await client.query("ROLLBACK").catch(() => undefined)
     throw error
-  } finally { client.release() }
+  } finally { revokeSessionTerminalAdmissionsForClient(client); client.release() }
 }
 
 async function appendEvent(client: Client, input: TurnEngineEventInput): Promise<TurnEngineEvent> {
@@ -140,7 +140,6 @@ function events(input: TerminalInput, startedBy: string): TurnEngineEventInput[]
     idempotencyKey: `${prefix}${entry.suffix}`, payload: toRepositoryJson(entry.payload),
   }))
 }
-
 export async function commitTurnTerminal(pool: Pool, input: TerminalInput, finalizationGuard?: TurnEngineTerminalGuard): Promise<AtomicTurnCompletionResult> {
   if (input.owner.kind !== "turn") throw conflict(`child final response ${input.owner.taskId}`)
   const owner = input.owner
@@ -149,7 +148,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
     const chronologyLock = await acquireRootTaskHistoryChronologyLock(client, owner.userId)
     const session = await client.query<Row>(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived') FOR UPDATE`, [owner.sessionId, owner.userId])
     if (!session.rows[0]) throw conflict(`session ${owner.sessionId}`)
-    const turn = await client.query<Row>(`SELECT turn."id", turn."status", turn."finalResponse", turn."source", turn."input" FROM "agent_turns" AS turn
+    const turn = await client.query<Row>(`SELECT turn."id", turn."status", turn."finalResponse", turn."source", turn."executionMode", turn."input" FROM "agent_turns" AS turn
       WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND turn."rootTaskId" = $6 AND (
         (turn."status" = 'in_progress' AND turn."leaseOwnerId" = $4 AND turn."leaseVersion" = $5 AND turn."leaseExpiresAt" > CURRENT_TIMESTAMP)
         OR (turn."status" = 'completed' AND turn."leaseOwnerId" IS NULL AND turn."leaseExpiresAt" IS NULL AND turn."leaseVersion" = $5)) FOR UPDATE`,
@@ -167,15 +166,16 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
     const committed = turnRow.status === "completed"
     if (committed && (turnRow.finalResponse !== input.response || task.status !== "completed" || task.leaseOwner !== null || Number(task.attemptCount) !== 1 || !sameJson(task.result, result))) throw conflict(`terminal receipt ${owner.turnId}`)
     if (!committed && (turnRow.status !== "in_progress" || task.status !== "running" || task.leaseOwner !== owner.ownerId || Number(task.attemptCount) !== 1)) throw conflict(`root task ${owner.taskId} fence`)
+    let terminalAdmission: SessionTerminalAdmission | undefined
     if (!committed) {
-      await assertSessionWorkAdmission(client, { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId })
+      terminalAdmission = await assertSessionTerminalAdmission(client, { ...owner, source: typeof turnRow.source === "string" ? turnRow.source : null, executionMode: typeof turnRow.executionMode === "string" ? turnRow.executionMode : null })
       if (task.interruptRequestedAt != null) throw conflict(`root task ${owner.taskId} interrupted`)
       try {
-        await assertPlanningRootHasNoUnresolvedSteering(client, task.allowedActions, {
+        await assertTerminalPlanningRootHasNoUnresolvedSteering(client, task.allowedActions, {
           userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.taskId, parentTaskId: owner.taskId,
           turnLeaseOwner: owner.ownerId, turnLeaseVersion: owner.leaseVersion,
           parentLeaseOwner: String(task.leaseOwner), parentAttemptCount: Number(task.attemptCount),
-        })
+        }, terminalAdmission)
       } catch (error: unknown) {
         if (error instanceof Error && error.message === STEERING_RECONCILIATION_BLOCKER) throw steeringReconciliationRecoveryError()
         throw error
@@ -190,7 +190,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
       [owner.sessionId, owner.turnId, `turn:${owner.turnId}:event:step-completed:${input.stepId}`])
     if (!prior.rows[0]) throw conflict(`completed step event ${input.stepId}`)
     if (!committed && finalizationGuard) {
-      const decision = await finalizationGuard(client, input)
+      const decision = await finalizationGuard(client, input, terminalAdmission!)
       if (!decision || typeof decision !== "object" || decision.ok !== true) {
         if (decision && decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER && typeof decision.feedback === "string" && decision.feedback.length <= 512) {
           const stamped: unknown = Reflect.get(decision, TASK_GRAPH_RECOVERY_REVISION)
