@@ -139,6 +139,22 @@ describe("canonical Root steering reconciliation preflight", () => {
     expect(readTerminalState).not.toHaveBeenCalled()
   })
 
+  it("preserves the pause classification when a paused Root has malformed planning actions", async () => {
+    readTerminalState.mockReset()
+    lockRoot.mockReset().mockRejectedValueOnce(new SessionPauseRequestedError()).mockResolvedValueOnce({
+      id: scope.rootTaskId, rootTaskId: scope.rootTaskId, parentTaskId: null,
+      role: "orchestrator", taskType: "root", allowedActions: null,
+    })
+    admitTerminal.mockReset()
+    const fixture = poolFixture()
+
+    await expect(hasUnresolvedPlanningSteering(fixture.pool, scope)).rejects.toBeInstanceOf(SessionPauseRequestedError)
+    expect(admitTerminal).not.toHaveBeenCalled()
+    expect(readTerminalState).not.toHaveBeenCalled()
+    expect(fixture.query.mock.calls.at(-1)?.[0]).toBe("ROLLBACK")
+    expect(fixture.release).toHaveBeenCalledOnce()
+  })
+
   it("does not recover a stale owner lock or a denied terminal admission", async () => {
     readTerminalState.mockReset()
     lockRoot.mockReset().mockRejectedValueOnce(new Error("task_graph_step_fenced"))

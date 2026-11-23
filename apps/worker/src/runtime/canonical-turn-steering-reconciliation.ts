@@ -62,7 +62,9 @@ export async function hasUnresolvedPlanningSteering(pool: Pool, scope: TaskGraph
     catch (error: unknown) {
       if (!isSessionPauseRequestedError(error)) throw error
       root = await lockTaskGraphScope(client, scope, false)
-      if (!exactPlannerRoot(root, scope)) throw error
+      let plannerRoot = false
+      try { plannerRoot = exactPlannerRoot(root, scope) } catch { throw error }
+      if (!plannerRoot) throw error
       await lockPlannerStep(client, scope, error)
       admission = await terminalAdmissionForLockedPlanner(client, scope, error)
       hasPlannerRoot = true

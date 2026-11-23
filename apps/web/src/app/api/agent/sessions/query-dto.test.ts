@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
+import { SELECTED_JOB_BATCH_PREPARATION_INTENT, VERIFIED_SHORTLIST_SELECTION_SCHEMA } from "@jobcopilot/agent-protocol"
 import { projectFinalAnswerContent } from "@/lib/agent/session/final-answer-evidence-projection"
 import { canonicalTaskGraphSourceKey } from "@/lib/agent/session/final-task-graph-source-detail"
 import { TASK_GRAPH_SOURCES_SCHEMA_VERSION } from "@/lib/agent/session/final-task-graph-source-manifest"
@@ -398,6 +399,40 @@ describe("agent query DTO redaction", () => {
       expect(JSON.stringify(invalid)).not.toContain("private answer")
     }
   })
+
+  it("projects only a literal marker for the exact user-owned canonical batch Turn", () => {
+    const goal = "Prepare draft materials for the selected Jobs from the verified shortlist. Do not submit applications."
+    const input = {
+      clientMessageId: "message_1", goal, content: [{ type: "text", text: goal }],
+      intent: SELECTED_JOB_BATCH_PREPARATION_INTENT,
+      verifiedShortlistSelection: {
+        schemaVersion: VERIFIED_SHORTLIST_SELECTION_SCHEMA,
+        source: { sessionId: "private-source-session", sourceTurnId: "private-source-turn", rootTaskId: "private-root",
+          graphItemId: "private-graph", graphRevision: 4 },
+        selectedJobIds: ["private-job-1", "private-job-2"],
+      },
+    }
+    const base = {
+      id: "turn_1", sessionId: "session_1", source: "user", executionMode: "canonical_task_graph", status: "completed", revision: 2,
+      input, steps: [{ id: "step_1" }], items: [{ id: "item_final" }],
+      createdAt: date, updatedAt: date, completedAt: null,
+    }
+    const dto = turnDto(base)
+    expect(dto.selectedJobBatchPreparation).toBe(true)
+    expect(dto).not.toHaveProperty("verifiedShortlistSelection")
+    for (const privateValue of ["private-source-session", "private-source-turn", "private-root", "private-graph", "private-job-1"]) {
+      expect(JSON.stringify(dto)).not.toContain(privateValue)
+    }
+
+    const denied = [
+      { ...base, source: "automation" },
+      { ...base, executionMode: "legacy" },
+      { ...base, input: { ...input, intent: { ...input.intent, extra: true } } },
+      { ...base, input: { ...input, verifiedShortlistSelection: { ...input.verifiedShortlistSelection, extra: true } } },
+    ]
+    for (const row of denied) expect(turnDto(row)).not.toHaveProperty("selectedJobBatchPreparation")
+  })
+
   it("does not expose turn input, task result, or tool arguments", () => {
     expect(turnDto({
       id: "turn_1", sessionId: "session_1", source: "user", status: "completed", revision: 2,
