@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest"
 
+import { SELECTED_JOB_BATCH_TEMPLATE_CATALOG } from "./selected-job-batch-templates.js"
+import { projectPlanLedger, TASK_GRAPH_SCHEMA_VERSION } from "./plan-ledger.js"
 import { parsePersistedTaskGraphNode, validTaskGraphResultEnvelopeKeys } from "./plan-ledger-task-graph-metadata.js"
 
 const base = {
@@ -61,6 +63,43 @@ describe("Plan Ledger persisted TaskGraph metadata", () => {
     expect(repaired).not.toHaveProperty("repairOf")
     expect(legacy).toEqual(base)
     expect(specialized).toMatchObject({ templateId: "cover_letter_writer" })
+  })
+
+  it("projects two persisted batch pairs through the public ledger without leaking template metadata", () => {
+    const nodes = SELECTED_JOB_BATCH_TEMPLATE_CATALOG.slice(0, 2).flatMap((entry, index) => {
+      const writer = `writer-${index + 1}`, reviewer = `reviewer-${index + 1}`
+      return [
+        { key: writer, templateId: entry.writerTemplateId, goal: "Create a draft", successCriteria: ["Persist draft"],
+          dependsOn: [], depth: 1, taskId: `task-${writer}`, verificationDisposition: "specialized" },
+        { key: reviewer, templateId: entry.reviewerTemplateId, goal: "Review the draft", successCriteria: ["Persist review"],
+          dependsOn: [writer], depth: 2, taskId: `task-${reviewer}`, verificationDisposition: "specialized" },
+      ]
+    })
+    const ledger = projectPlanLedger({
+      sessionId: "session-1", revision: 1, rootTaskId: "root-1",
+      graph: { schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes },
+      tasks: nodes.map(node => ({ id: node.taskId, sessionId: "session-1", status: "queued", goal: node.goal, updatedAt: "2026-11-22T00:00:00.000Z" })),
+    })
+
+    expect(ledger?.nodes.map(node => [node.key, node.dependencies.map(dependency => dependency.key)])).toEqual([
+      ["writer-1", []], ["reviewer-1", ["writer-1"]], ["writer-2", []], ["reviewer-2", ["writer-2"]],
+    ])
+    expect(JSON.stringify(ledger)).not.toMatch(/cover_letter_(writer|reviewer)_slot|verificationDisposition|jobId/)
+  })
+
+  it("only accepts exact catalog batch templates on the specialized projection path", () => {
+    for (const entry of SELECTED_JOB_BATCH_TEMPLATE_CATALOG) {
+      for (const templateId of [entry.writerTemplateId, entry.reviewerTemplateId]) {
+        expect(parsePersistedTaskGraphNode({ ...base, templateId, verificationDisposition: "specialized" }))
+          .toMatchObject({ templateId })
+        expect(parsePersistedTaskGraphNode({ ...base, templateId, verificationDisposition: "typed", verification }))
+          .toBeNull()
+      }
+    }
+    for (const templateId of ["cover_letter_writer_slot_0", "cover_letter_writer_slot_5", "cover_letter_reviewer_slot_01",
+      "cover_letter_reviewer_slot_5", "cover_letter_writer_slot_1_extra"]) {
+      expect(parsePersistedTaskGraphNode({ ...base, templateId, verificationDisposition: "specialized" })).toBeNull()
+    }
   })
 
   it("projects valid persisted native spawn and followup metadata without exposing provenance", () => {

@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/lib/i18n'
 import { decoratePlanLedgerRepairTargets } from '@/lib/task-graph-repair-display'
-import { TaskGraphPlanPanel } from './TaskGraphPlanPanel'
+import { TaskGraphPlanPanel, runVerifiedShortlistBatchAction } from './TaskGraphPlanPanel'
 import { projectCurrentTaskGraph } from './task-graph-plan'
 import { selectedTaskGraphIdentity } from './task-graph-plan-query'
 import type { TimelineItem } from './timeline-reducer'
@@ -29,6 +29,94 @@ const tasks: SupervisorTaskSummary[] = [{
 }]
 
 describe('TaskGraphPlanPanel', () => {
+  it('enables preparation only for the exact current verified shortlist and a supplied command', () => {
+    const graphItems = [item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+        { key: 'scout', templateId: 'scout', goal: 'Find candidates', successCriteria: ['Verify roles'], dependsOn: [], depth: 1, taskId: 'task-a' },
+      ] }, '2026-10-02T12:00:00.000Z', 4, 'root-task', 'graph-batch-source', 'turn-1')]
+    const identity = selectedTaskGraphIdentity(graphItems, 'session-1')!
+    const shortlist = { identity, result: { schemaVersion: 1, status: 'completed', items: [
+      { jobId: 'job-a', score: 9, evidenceIds: ['read:job:job-a'] },
+      { jobId: 'job-b', score: 8, evidenceIds: ['read:job:job-b'] },
+    ], failures: [] } }
+    const props = { sessionId: 'session-1', items: graphItems, tasks, discoveryShortlist: shortlist }
+    const readonlyHtml = renderToStaticMarkup(<TaskGraphPlanPanel {...props} />)
+    const enabledHtml = renderToStaticMarkup(<TaskGraphPlanPanel {...props} onPrepareBatch={async () => ({ turnId: 'batch-turn-1', disposition: 'started' })} />)
+    const staleHtml = renderToStaticMarkup(<TaskGraphPlanPanel {...props} discoveryShortlist={{
+      ...shortlist, identity: { ...identity, revision: identity.revision - 1 },
+    }} onPrepareBatch={async () => ({ turnId: 'batch-turn-1', disposition: 'started' })} />)
+
+    expect(readonlyHtml).toContain('job-a')
+    expect(readonlyHtml).not.toContain('data-verified-shortlist-controls')
+    expect(enabledHtml).toContain('data-verified-shortlist-controls="true"')
+    expect(staleHtml).not.toContain('data-verified-shortlist-controls')
+  })
+
+  it('focuses only a valid exact server Turn and ignores a response after the selection changes', async () => {
+    const graphItems = [item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+        { key: 'scout', templateId: 'scout', goal: 'Find candidates', successCriteria: ['Verify roles'], dependsOn: [], depth: 1, taskId: 'task-a' },
+      ] }, '2026-10-02T12:00:00.000Z', 4, 'root-task', 'graph-batch-source', 'turn-1')]
+    const identity = selectedTaskGraphIdentity(graphItems, 'session-1')!
+    const request = { source: {
+      sessionId: identity.sessionId, sourceTurnId: identity.turnId, rootTaskId: identity.rootTaskId,
+      graphItemId: identity.graphItemId, graphRevision: identity.revision,
+    }, selectedJobIds: ['job-a', 'job-b'] }
+    const start = vi.fn(async () => ({ turnId: 'batch-turn-7', disposition: 'duplicate' as const }))
+    const onStarted = vi.fn()
+    await runVerifiedShortlistBatchAction(identity, request, start, () => true, onStarted)
+    expect(onStarted).toHaveBeenCalledExactlyOnceWith('batch-turn-7')
+
+    let release: ((value: { turnId: string; disposition: 'started' }) => void) | undefined
+    const delayedStart = () => new Promise<{ turnId: string; disposition: 'started' }>(resolve => { release = resolve })
+    let isCurrent = true
+    const staleFocus = vi.fn()
+    const pending = runVerifiedShortlistBatchAction(identity, request, delayedStart, () => isCurrent, staleFocus)
+    isCurrent = false
+    release?.({ turnId: 'batch-turn-stale', disposition: 'started' })
+    await pending
+    expect(staleFocus).not.toHaveBeenCalled()
+
+    const changedSource = { ...request, source: { ...request.source, graphRevision: request.source.graphRevision + 1 } }
+    await expect(runVerifiedShortlistBatchAction(identity, changedSource, start, () => true, onStarted))
+      .rejects.toThrow('verified_shortlist_identity_changed')
+    expect(start).toHaveBeenCalledTimes(1)
+    await expect(runVerifiedShortlistBatchAction(identity, request, async () => ({ turnId: 'bad/id', disposition: 'started' }), () => true))
+      .rejects.toThrow('selected_job_batch_receipt_invalid')
+  })
+
+  it('shows criteria from the identity-matched graph snapshot as escaped text only', () => {
+    const graphItems = [item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+      { key: 'scout', templateId: 'scout', goal: 'Find evidence', successCriteria: ['Collect <script>public evidence</script>'], dependsOn: [], depth: 1, taskId: 'task-a' },
+      { key: 'analyst', templateId: 'analyst', goal: 'Assess evidence', successCriteria: ['Compare the sources'], dependsOn: ['scout'], depth: 2, taskId: 'task-b' },
+    ] })]
+    const ownedTasks = [...tasks, { ...tasks[1]!, id: 'task-b', goal: 'Assess evidence', taskType: 'analyst' }]
+    const projection = projectCurrentTaskGraph(graphItems, ownedTasks, 'session-1')!
+    const identity = selectedTaskGraphIdentity(graphItems, 'session-1')!
+    const panel = (ledger?: unknown) => <TaskGraphPlanPanel sessionId="session-1" items={graphItems} tasks={ownedTasks} ledger={ledger} />
+    const accepted = renderToStaticMarkup(panel({ identity, projection }))
+
+    expect(accepted.match(/data-task-graph-success-criteria="true"/g)).toHaveLength(2)
+    expect(accepted).toContain('aria-label="Success criteria"')
+    expect(accepted).toContain('<strong>Success criteria</strong>')
+    expect(accepted).toContain('Collect &lt;script&gt;public evidence&lt;/script&gt;')
+    expect(accepted).toContain('Compare the sources')
+    expect(accepted).not.toContain('<script>')
+    expect(accepted.indexOf('Status: Queued')).toBeLessThan(accepted.indexOf('data-task-graph-success-criteria'))
+    expect(accepted.indexOf('Dependencies:')).toBeLessThan(accepted.indexOf('data-task-graph-success-criteria'))
+    expect(renderToStaticMarkup(panel())).not.toContain('data-task-graph-success-criteria')
+    const wrongKeys = { ...projection, nodes: [{ ...projection.nodes[0]!, key: 'foreign-node' }, projection.nodes[1]!] }
+    expect(renderToStaticMarkup(panel({ identity, projection: wrongKeys }))).not.toContain('data-task-graph-success-criteria')
+    expect(renderToStaticMarkup(panel({ identity: { ...identity, turnId: 'older-turn' }, projection })))
+      .not.toContain('data-task-graph-success-criteria')
+
+    vi.stubGlobal('window', {})
+    vi.stubGlobal('localStorage', { getItem: () => 'zh' })
+    try {
+      const chinese = renderToStaticMarkup(<I18nProvider>{panel({ identity, projection })}</I18nProvider>)
+      expect(chinese).toContain('aria-label="验收标准"')
+      expect(chinese).toContain('<strong>验收标准</strong>')
+    } finally { vi.unstubAllGlobals() }
+  })
+
   it('renders the latest native graph from owned task state without exposing private metadata or implying pass', () => {
     const metadata = {
       schemaVersion: 'agent-harness.v2.task-graph.native-delegation.v1', operationKind: 'spawn',
@@ -417,6 +505,7 @@ describe('TaskGraphPlanPanel', () => {
       />)
       expect(html).toContain(`data-discovery-shortlist-status="${state.status}"`)
       expect(html).toContain(state.status === 'completed' ? 'Completed:' : state.status === 'partial' ? 'Partial results:' : 'Failed:')
+      expect(html).not.toContain('data-verified-shortlist-controls')
       for (const code of state.failures) expect(html).toContain(`data-discovery-failure-code="${code}"`)
       if (state.items.length) {
         expect(html).toContain('job-42')

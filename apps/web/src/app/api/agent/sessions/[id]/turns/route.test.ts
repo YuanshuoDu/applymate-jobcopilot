@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { SELECTED_JOB_BATCH_PREPARATION_INTENT, VERIFIED_SHORTLIST_SELECTION_SCHEMA } from "@jobcopilot/agent-protocol"
 import { GET } from "./route"
 
 const mocks = vi.hoisted(() => ({
@@ -57,12 +58,39 @@ describe("agent turns query API", () => {
     expect(JSON.stringify(body)).not.toContain("PRIVATE_CONTEXT")
     expect(mocks.turnFindMany).toHaveBeenCalledWith(expect.objectContaining({
       where: { sessionId: "session_1", userId: "user_1" }, take: 2,
+      select: expect.objectContaining({ executionMode: true, input: true }),
     }))
     expect(mocks.turnFindFirst).toHaveBeenCalledWith(expect.objectContaining({
       where: { sessionId: "session_1", userId: "user_1", status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] } },
       select: expect.objectContaining({ input: true, executionMode: true, rootTaskId: true }),
     }))
     expect(mocks.inputCount).toHaveBeenCalledWith({ where: { sessionId: "session_1", userId: "user_1", status: "accepted", delivery: "follow_up" } })
+  })
+
+  it("projects the active batch marker independently when its Turn is beyond the chronological page", async () => {
+    const goal = "Prepare draft materials for the selected Jobs from the verified shortlist. Do not submit applications."
+    const binding = {
+      schemaVersion: VERIFIED_SHORTLIST_SELECTION_SCHEMA,
+      source: { sessionId: "session_1", sourceTurnId: "private_source_turn", rootTaskId: "private_source_root",
+        graphItemId: "private_source_graph", graphRevision: 3 },
+      selectedJobIds: ["private_job_1", "private_job_2"],
+    }
+    const activeBatch = {
+      ...turn("batch_turn", 2, "in_progress", goal), executionMode: "canonical_task_graph", rootTaskId: null,
+      input: { clientMessageId: "message_1", goal, content: [{ type: "text", text: goal }],
+        intent: SELECTED_JOB_BATCH_PREPARATION_INTENT, verifiedShortlistSelection: binding },
+    }
+    mocks.turnFindMany.mockResolvedValueOnce([turn("old_turn", 1)])
+    mocks.turnFindFirst.mockResolvedValueOnce(activeBatch)
+
+    const response = await GET(request("?limit=1") as never, params)
+    const body = await response.json()
+    expect(body.turns).toEqual([expect.objectContaining({ id: "old_turn" })])
+    expect(body.turns[0]).not.toHaveProperty("selectedJobBatchPreparation")
+    expect(body.projection.activeTurn).toMatchObject({ id: "batch_turn", selectedJobBatchPreparation: true })
+    for (const privateValue of ["private_source_turn", "private_source_root", "private_source_graph", "private_job_1"]) {
+      expect(JSON.stringify(body)).not.toContain(privateValue)
+    }
   })
 
   it("exposes location steering only for an enabled canonical user TaskGraph Turn", async () => {

@@ -18,6 +18,7 @@ import { InMemoryToolLifecycleSink, ToolLifecycle } from "../tools/lifecycle.js"
 import { ToolRegistry } from "../tools/registry.js"
 import { InMemoryToolResultReferenceStore } from "../tools/redaction.js"
 import { ToolRouter } from "../tools/router.js"
+import { ToolExecutionError } from "../tools/types.js"
 
 function identity(kind: "turn", taskId: string): Extract<TurnExecutionIdentity, { kind: "turn" }>
 function identity(kind: "task", taskId: string): Extract<TurnExecutionIdentity, { kind: "task" }>
@@ -342,6 +343,71 @@ describe("TurnExecutionEventWriter", () => {
     }, { ...executionOptions.snapshot, toolObservations: restored.observations }, new Set(), new AbortController().signal,
     () => new Date("2026-09-25T00:00:00.000Z"), undefined, () => undefined)).resolves.toMatchObject({ wait: null })
     expect(executionOptions.executeTool).toHaveBeenCalledOnce()
+  })
+
+  it("restores ordinary failures and cancellation without output while preserving structured safe output", async () => {
+    const expectedSafeOutput = { result: "safe", password: "[REDACTED]" }
+    const scenarios = [
+      { id: "ordinary", status: "failed" as const, errorCode: "tool_execution_failed", error: new Error("private failure detail"), expectedOutput: null },
+      { id: "cancelled", status: "cancelled" as const, errorCode: "cancelled", error: new Error("private cancellation detail"), expectedOutput: null },
+      { id: "structured", status: "failed" as const, errorCode: "upstream_unavailable",
+        error: new ToolExecutionError("upstream_unavailable", "private structured detail", { result: "safe", password: "secret" }),
+        expectedOutput: expectedSafeOutput },
+    ]
+
+    for (const scenario of scenarios) {
+      const events: Array<{ type: string; payload: unknown }> = []
+      const items = new Map<string, { id: string; stepId: string | null; type: string; status: string; revision: number; content: unknown }>()
+      const base = options(identity("turn", "root-1"), [])
+      const lifecycleSink = new InMemoryToolLifecycleSink()
+      const cancellation = new AbortController()
+      const registry = new ToolRegistry([{
+        schemaVersion: "agent-harness.v2", name: "test.failure", version: "1", description: "failure receipt fixture",
+        capabilities: ["read"], domain: "jobs", inputSchema: Type.Object({ query: Type.String() }, { additionalProperties: false }),
+        outputSchema: Type.Object({ result: Type.String() }, { additionalProperties: false }), risk: "read", idempotency: "read_only", timeoutMs: 100,
+        requiredCapabilities: [], execute: async () => {
+          if (scenario.id === "cancelled") cancellation.abort()
+          throw scenario.error
+        },
+      }])
+      const router = new ToolRouter(registry, new ToolLifecycle({ sink: lifecycleSink, references: new InMemoryToolResultReferenceStore() }))
+      const executionOptions: TurnExecutionOptions = {
+        ...base, capabilities: ["read"], signal: cancellation.signal, executeTool: createToolRouterExecutor(router),
+        store: {
+          ...base.store,
+          createItem: async ({ itemId, stepId, type, status, content }) => {
+            items.set(itemId, { id: itemId, stepId, type, status, revision: 0, content })
+            return { id: itemId, revision: 0 }
+          },
+          updateItem: async ({ itemId, expectedRevision, status, content }) => {
+            const current = items.get(itemId)
+            if (!current) throw new Error("fixture_item_missing")
+            items.set(itemId, { ...current, status, revision: expectedRevision + 1, content })
+            return { id: itemId, revision: expectedRevision + 1 }
+          },
+          appendEvent: async input => { events.push({ type: input.type, payload: input.payload }); return { id: input.id } },
+        },
+      }
+      const call = { id: `failure-${scenario.id}`, name: "test.failure", arguments: { query: "fixture" } }
+      const result = await executeToolWithItems(executionOptions, new TurnExecutionEventWriter(executionOptions),
+        { id: "step-1", ordinal: 0 }, call, () => new Date("2026-09-25T00:00:00.000Z"))
+      const restored = restoreToolCallState([...items.values()], events)
+      const observation = restored.observations.find(item => item.content.toolCallId === call.id)?.content
+
+      expect(result).toMatchObject({ status: scenario.status, errorCode: scenario.errorCode })
+      expect(restored.pending).toEqual([])
+      expect(observation).toEqual({ toolCallId: call.id, toolName: call.name, input: call.arguments,
+        status: scenario.status, output: scenario.expectedOutput, errorCode: scenario.errorCode })
+      expect(lifecycleSink.events.map(event => event.phase)).toEqual(["started", scenario.status === "cancelled" ? "cancelled" : "failed"])
+      expect(JSON.stringify({ items: [...items.values()], events })).not.toContain(scenario.error.message)
+      if (scenario.id === "structured") {
+        expect(result.output).toEqual(expectedSafeOutput)
+        expect(lifecycleSink.events.at(-1)?.item).toMatchObject({ output: expectedSafeOutput, errorCode: scenario.errorCode })
+        expect(JSON.stringify({ items: [...items.values()], events })).not.toContain("secret")
+      } else {
+        expect(result).not.toHaveProperty("output")
+      }
+    }
   })
 
   it("names child turn lifecycle events as task activity", async () => {

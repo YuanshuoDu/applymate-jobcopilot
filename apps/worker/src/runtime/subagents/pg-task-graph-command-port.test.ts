@@ -10,6 +10,7 @@ import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-v
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-verification-report.js"
 import { DISCOVERY_RECOVERY_SCHEMA_VERSION } from "./task-graph-discovery-recovery-contract.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
+import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 import { steeringReconciliationIdempotencyKey } from "./steering-reconciliation-contract.js"
 import type { PgSubagentPool } from "./types.js"
 import type { TaskGraphNodeProposal } from "../planning/task-graph.js"
@@ -1042,7 +1043,7 @@ describe("createPgTaskGraphCommandPort", () => {
       input.scope.turnId, input.scope.parentTaskId, input.scope.userId])
     expect(taskRead).toHaveLength(1)
     expect(taskRead[0]?.values).toEqual([nodes.map(([key]) => key), input.scope.sessionId, input.scope.turnId,
-      input.scope.rootTaskId, input.scope.parentTaskId, input.scope.userId])
+      input.scope.rootTaskId, input.scope.parentTaskId, input.scope.userId, NESTED_SCOUT_PROFILE_MARKER])
     expect(eventRead).toHaveLength(1)
   })
 

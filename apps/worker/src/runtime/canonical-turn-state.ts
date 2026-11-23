@@ -1,6 +1,5 @@
 import type pg from "pg"
-import { TurnIntentSchema, validate, type TenantScope, type RepositoryJsonValue, type TurnIntent, type TurnSource } from "@jobcopilot/agent-protocol"
-
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, TurnIntentSchema, validate, type TenantScope, type RepositoryJsonValue, type TurnIntent, type TurnSource } from "@jobcopilot/agent-protocol"
 import { loadCanonicalTurnSnapshot } from "./context/canonical-turn-snapshot-loader.js"
 import type { SelectedJobMemoryRecord } from "./context/selected-job-memory.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
@@ -49,12 +48,9 @@ export const INTERACTIVE_DISCOVERY_INTENT: Extract<TurnIntent, { kind: "interact
 type Row = Record<string, unknown>
 function turnSource(value: unknown): TurnSource | undefined { return value === "user" || value === "automation" || value === "system" ? value : undefined }
 function automationRunMode(value: unknown): "scheduled" | "manual" | undefined { return value === "scheduled" || value === "manual" ? value : undefined }
-function object(value: unknown): Row {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Row : {}
-}
+function object(value: unknown): Row { return value && typeof value === "object" && !Array.isArray(value) ? value as Row : {} }
 function json(value: unknown): RepositoryJsonValue {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return value
-  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (value === null || typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) return value
   if (Array.isArray(value)) return value.map(json)
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).filter(([, child]) => child !== undefined).map(([key, child]) => [key, json(child)]))
   return null
@@ -77,7 +73,12 @@ function turnIntent(value: unknown): CanonicalTurnIntent | undefined {
   if (!Object.hasOwn(source, "intent")) return undefined
   const intent = source.intent
   if (!validate(TurnIntentSchema, intent)) throw new Error("turn_intent_invalid")
-  return intent as TurnIntent
+  const parsed = intent as TurnIntent
+  if (parsed.kind === INTERACTIVE_DISCOVERY_INTENT.kind) return INTERACTIVE_DISCOVERY_INTENT
+  if (parsed.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind) return OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT
+  if (parsed.kind === SELECTED_JOB_BATCH_PREPARATION_INTENT.kind) return SELECTED_JOB_BATCH_PREPARATION_INTENT
+  if (parsed.kind === "reviewed_application_review") return parsed
+  throw new Error("turn_intent_invalid")
 }
 
 function cognitiveAgendaReceipt(events: readonly Row[], lease: TurnLease, rootTaskId: unknown): CognitiveAgendaReceipt | undefined {
@@ -131,6 +132,11 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     )
     const turn = turnResult.rows[0]
     if (!turn) throw new Error("turn_not_owned")
+    const persistedInput = object(turn.input)
+    if (Object.hasOwn(persistedInput, "verifiedShortlistSelection")) {
+      const intent = object(persistedInput.intent)
+      if (!validate(TurnIntentSchema, intent) || intent.kind !== SELECTED_JOB_BATCH_PREPARATION_INTENT.kind || intent.version !== SELECTED_JOB_BATCH_PREPARATION_INTENT.version) throw new Error("turn_intent_invalid")
+    }
     const consumedWaits = options.consumeWaitOutcomes ? await consumeDurableWaitOutcomes({ client, lease, turn, now }) : []
     const stepsResult = await client.query<Row>(
       `SELECT "id", "taskId", "ordinal", "attempt", "status", "finishReason", "errorCode", "inputThroughSequence", "consumedInputIds", "inputTokens", "outputTokens", "estimatedCostUsd"

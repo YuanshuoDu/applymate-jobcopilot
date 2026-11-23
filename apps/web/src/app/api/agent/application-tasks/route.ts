@@ -92,6 +92,7 @@ export async function DELETE(req: NextRequest) {
     select: {
       id: true, sessionId: true, status: true, checkpoint: true,
       fillTurnId: true, fillTurnSessionId: true, fillTurnUserId: true,
+      workerTaskId: true,
     },
   })
   if (!task) return err("Application task not found", 404)
@@ -125,6 +126,7 @@ export async function DELETE(req: NextRequest) {
         fillTurnId: task.fillTurnId,
         fillTurnSessionId: task.fillTurnSessionId,
         fillTurnUserId: task.fillTurnUserId,
+        workerTaskId: task.workerTaskId,
         status: { notIn: ["submitted", "skipped", "cancelled"] },
         OR: [{ checkpoint: null }, { checkpoint: { notIn: ["submission_request_started", "submission_uncertain"] } }],
       },
