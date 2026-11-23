@@ -1786,6 +1786,8 @@ type Stage8PreparedScenario = {
   applicationTaskId: string
   submitApprovalId: string
 }
+type Stage8FailureSnapshotScope = Pick<Stage8PreparedScenario,
+  "jobId" | "sessionId" | "fillTurnId" | "applicationTaskId" | "submitApprovalId">
 
 const STAGE8_RATE_LIMIT_DOMAIN = "boards.greenhouse.io"
 
@@ -1978,7 +1980,7 @@ function stage8FailureSummary(evidence: Stage8FailureEvidence) {
   }
 }
 
-async function stage8FillFailureSnapshot(prepared: Stage8PreparedScenario, expectedWorkerTaskId: string | null = null): Promise<unknown> {
+async function stage8FillFailureSnapshot(prepared: Stage8FailureSnapshotScope, expectedWorkerTaskId: string | null = null): Promise<unknown> {
   try {
     return await beforeDeadline(async () => {
       const [session, turn] = await Promise.all([
@@ -2943,8 +2945,39 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(submitJob.data).toMatchObject({ applicationTaskId: gateTaskId, userId: ids.user, jobId: ids.job,
       sessionId: ids.session, fillTurnId: successorTurnId, receiptId: submitApproval.id, operation: "submit" })
     const successorRootTaskId = await expectLegacyFillTurnLeased(successorTurnId)
-    await releaseLegacyFinalResponseGate()
-    expect((await waitForAgentTurnTerminal(successorTurnId, 30_000)).status).toBe("completed")
+    const legacyFailureScope = {
+      jobId: ids.job, sessionId: ids.session, fillTurnId: successorTurnId,
+      applicationTaskId: gateTaskId!, submitApprovalId: submitApproval.id,
+    } satisfies Stage8FailureSnapshotScope
+    let legacyPhase: "release_synthetic_response" | "await_queue_ack" | "await_task_uncertainty"
+      | "verify_session_wait" | "verify_live_fill_owner" | "await_fill_terminal" = "release_synthetic_response"
+    try {
+      if (!site?.stdin) throw new Error("synthetic_response_unavailable")
+      // The fixture's plain-text response is deliberately not a submission confirmation.
+      site.stdin.write("release-held\n")
+      legacyPhase = "await_queue_ack"
+      await waitForLegacyAckMarker(worker!, "LEGACY_ACK_BARRIER_REACHED attempt=1")
+      legacyPhase = "await_task_uncertainty"
+      await waitForTask(task => task.userId === ids.user && task.jobId === ids.job
+        && task.sessionId === ids.session && task.fillTurnId === successorTurnId && task.workerTaskId === workerTaskId
+        && task.status === "waiting_for_user" && task.checkpoint === "submission_uncertain")
+      legacyPhase = "verify_session_wait"
+      const uncertainSession = await testDb.agentSession.findUnique({ where: { id: ids.session }, select: {
+        userId: true, status: true, completedAt: true,
+      } })
+      if (uncertainSession?.userId !== ids.user || uncertainSession.status !== "waiting_for_user"
+        || uncertainSession.completedAt !== null) throw new Error("session_wait_mismatch")
+      legacyPhase = "verify_live_fill_owner"
+      if (await expectLegacyFillTurnLeased(successorTurnId) !== successorRootTaskId) throw new Error("fill_owner_changed")
+      legacyPhase = "await_fill_terminal"
+      await releaseLegacyFinalResponseGate()
+      if ((await waitForAgentTurnTerminal(successorTurnId, 30_000)).status !== "completed") {
+        throw new Error("fill_turn_not_completed")
+      }
+    } catch {
+      const snapshot = await stage8FillFailureSnapshot(legacyFailureScope, workerTaskId)
+      throw new Error(`legacy_fill_lifecycle_miss:${JSON.stringify({ phase: legacyPhase, snapshot })}`)
+    }
     expect(await testDb.agentTurn.findUniqueOrThrow({ where: { id: successorTurnId }, select: {
       rootTaskId: true, status: true, completedAt: true, leaseOwnerId: true, leaseExpiresAt: true,
     } })).toMatchObject({
@@ -2983,7 +3016,6 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(await testDb.agentApproval.findUniqueOrThrow({
       where: { id: submitApproval.id }, select: { status: true },
     })).toEqual(approvalBeforeDuplicate)
-    await waitForLegacyAckMarker(worker!, "LEGACY_ACK_BARRIER_REACHED attempt=1")
     const legacyReceiverStats = await requestFixtureStats()
     expect(legacyReceiverStats.submitCount).toBe(1)
     const heldAckJob = await applyQueue!.getJob(workerTaskId)
