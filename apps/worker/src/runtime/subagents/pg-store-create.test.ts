@@ -1,10 +1,16 @@
 import { describe, expect, it, vi } from "vitest"
-import { assertPlanningRootHasNoUnresolvedSteering, createSubagentTask } from "./pg-store-create.js"
+import { assertPlanningRootHasNoUnresolvedSteering, assertTerminalPlanningRootHasNoUnresolvedSteering, createSubagentTask } from "./pg-store-create.js"
+import { assertSessionTerminalAdmission } from "../session-gate.js"
 
 const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
+const { terminalSteeringReadMock } = vi.hoisted(() => ({ terminalSteeringReadMock: vi.fn() }))
 vi.mock("./steering-reconciliation-ledger.js", async importOriginal => ({
   ...await importOriginal<typeof import("./steering-reconciliation-ledger.js")>(),
   assertNoUnresolvedSteering: assertNoUnresolvedSteeringMock,
+}))
+vi.mock("./steering-reconciliation-read.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./steering-reconciliation-read.js")>(),
+  readSteeringReconciliationStateForTerminal: (...args: unknown[]) => terminalSteeringReadMock(...args),
 }))
 import { normalizeSubagentPolicy } from "./types.js"
 import type { Queryable } from "./pg-store-persistence.js"
@@ -278,6 +284,23 @@ describe("pg-store task creation helpers", () => {
     await assertPlanningRootHasNoUnresolvedSteering(client, ["agent.plan"], scope)
     expect(assertNoUnresolvedSteeringMock).toHaveBeenCalledWith(client, scope)
     await expect(assertPlanningRootHasNoUnresolvedSteering(client, undefined, scope)).rejects.toThrow("steering_reconciliation_root_policy_invalid")
+  })
+
+  it("uses the named terminal read only for an admitted planning Root and still rejects pending steering", async () => {
+    const client = { query: vi.fn(async () => ({ rows: [{ id: "session-1" }] })) } as never
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      turnLeaseOwner: "worker-1", turnLeaseVersion: 2, parentLeaseOwner: "worker-1", parentAttemptCount: 1 }
+    const admission = await assertSessionTerminalAdmission(client, { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
+      rootTaskId: scope.rootTaskId, source: "user", executionMode: "canonical_task_graph" })
+    terminalSteeringReadMock.mockReset().mockResolvedValue({ unresolvedInputs: [] })
+
+    await assertTerminalPlanningRootHasNoUnresolvedSteering(client, ["jobs.search"], scope, admission)
+    expect(terminalSteeringReadMock).not.toHaveBeenCalled()
+    await assertTerminalPlanningRootHasNoUnresolvedSteering(client, ["agent.plan"], scope, admission)
+    expect(terminalSteeringReadMock).toHaveBeenCalledWith(client, scope, admission)
+    terminalSteeringReadMock.mockResolvedValueOnce({ unresolvedInputs: [{ id: "steer-1" }] })
+    await expect(assertTerminalPlanningRootHasNoUnresolvedSteering(client, ["agent.plan"], scope, admission))
+      .rejects.toThrow("steering_reconciliation_pending")
   })
 
   it("inherits parent route and action bounds without relocking an already locked session", async () => {

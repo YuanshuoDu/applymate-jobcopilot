@@ -16,6 +16,7 @@ import {
 } from "./turns/turn-execution-types.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskGraphDenialCheckpointFromDecision, type TaskGraphDenialCheckpoint } from "./turns/task-graph-terminal-assessment.js"
 import type { TurnEngineTerminalGuard } from "./turns/turn-engine-terminal-commit.js"
+import { assertSessionTerminalAdmission } from "./session-gate.js"
 import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletionGate, createCanonicalTurnTerminalGuard, type NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "./subagents/task-graph-final-summary-binding.js"
 import { buildGroundedTaskGraphFinalResponse } from "./subagents/task-graph-final-response.js"
@@ -815,7 +816,9 @@ describe("canonical native verification runtime composition", () => {
   })
 
   it("preserves an existing root-graph denial after a valid native proof", async () => {
-    const client = { query: vi.fn() } as unknown as PoolClient
+    const client = { query: vi.fn(async () => ({ rows: [{ id: "session-1" }], rowCount: 1 })) } as unknown as PoolClient
+    const admission = await assertSessionTerminalAdmission(client, { sessionId: "session-1", userId: "user-1", turnId: "turn-1",
+      rootTaskId: "root-1", source: "user", executionMode: "canonical_task_graph" })
     const rootDenial = { ok: false as const, blocker: "typed_repair_unverified", feedback: "Repair evidence is still missing." }
     const checkTerminal = vi.fn(async () => ({ nativeVerificationPassed: true }))
     const checkRootGraph = vi.fn(async (actualClient: PoolClient, nativeVerificationPassed: boolean) => {
@@ -829,8 +832,9 @@ describe("canonical native verification runtime composition", () => {
     })
     if (!guard) throw new Error("terminal guard was not enabled")
 
-    await expect(guard(client, terminalInput)).resolves.toBe(rootDenial)
+    await expect(guard(client, terminalInput, admission)).resolves.toBe(rootDenial)
     expect(checkRootGraph).toHaveBeenCalledOnce()
+    expect(checkRootGraph).toHaveBeenCalledWith(client, true, admission)
     expect(finalizeSelectedJob).not.toHaveBeenCalled()
   })
 
