@@ -11,7 +11,7 @@ import { setTimeout as delay } from "node:timers/promises"
 
 import { Prisma, PrismaClient } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
-import { hashReviewedApplicationMaterialProof } from "@jobcopilot/shared"
+import { hashReviewedApplicationMaterialProof, matchesApplyTaskSubmitPayload } from "@jobcopilot/shared"
 import { applicationSubmissionStopEventId } from "@jobcopilot/shared/application-submission-stop-protocol"
 import { SignJWT } from "jose"
 import { NextRequest } from "next/server"
@@ -320,9 +320,10 @@ const createStage8ExecutionFailureDiagnostics = (workerRequire("./src/queue/appl
   }
 }).createStage8ExecutionFailureDiagnostics
 const { Queue } = workerRequire("bullmq") as { Queue: new (name: string, options: { connection: { host: string; port: number; db: number } }) => {
-  client: Promise<{ del(key: string): Promise<number> }>
-  getJobs(states: readonly string[], start: number, end: number): Promise<Array<{ id?: string; data: unknown; attemptsMade: number; attemptsStarted: number; stalledCounter: number; getState(): Promise<string>; remove(): Promise<void> }>>
-  getJob(id: string): Promise<{ id?: string; data: unknown; attemptsMade: number; attemptsStarted: number; stalledCounter: number; getState(): Promise<string>; remove(): Promise<void> } | undefined>
+  client: Promise<{ del(key: string): Promise<number>; get(key: string): Promise<string | null> }>
+  toKey(value: string): string
+  getJobs(states: readonly string[], start: number, end: number): Promise<Array<{ id?: string; data: unknown; attemptsMade: number; attemptsStarted: number; stalledCounter: number; opts?: { attempts?: number }; getState(): Promise<string>; remove(): Promise<void> }>>
+  getJob(id: string): Promise<{ id?: string; data: unknown; attemptsMade: number; attemptsStarted: number; stalledCounter: number; opts?: { attempts?: number }; getState(): Promise<string>; remove(): Promise<void> } | undefined>
   add(name: string, data: unknown, options: { jobId: string }): Promise<{ id?: string; getState(): Promise<string> }>
   close(): Promise<void>
   disconnect(): Promise<void>
@@ -2090,6 +2091,15 @@ async function stage8ApplyQueueState(workerTaskId: string) {
   } catch { return { available: false } }
 }
 
+async function throwStage8SettlementTimeout(prepared: Stage8PreparedScenario, workerTaskId: string): Promise<never> {
+  const [database, queue] = await Promise.all([
+    stage8FillFailureSnapshot(prepared, workerTaskId), stage8ApplyQueueState(workerTaskId),
+  ])
+  throw new Error("stage8_submit_worker_did_not_settle:" + JSON.stringify({
+    database, queue, requestFence: stage8RequestFenceSummary(worker?.lines ?? []),
+  }))
+}
+
 async function waitForStage8Arm(prepared: Stage8PreparedScenario, intent: Stage8SubmitIntent): Promise<void> {
   try { await waitLine(worker!, "STAGE8_ARM_COMMITTED " + intent.workerTaskId, 90_000) }
   catch {
@@ -2436,25 +2446,118 @@ async function waitForStage8StopBlockingPid(workerPid: number, timeoutMs = 5_000
   throw new Error("stage8_stop_did_not_wait_on_exact_worker_fence")
 }
 
-async function waitForStage8JobSettled(
+/** Missing Bull state is accepted only after the exact terminal execution and attempt are durable. */
+async function stage8ExecutionSettled(
+  prepared: Stage8PreparedScenario,
+  intent: Stage8SubmitIntent,
+) {
+  const queue = applyQueue
+  if (!queue) return null
+  const [task, approval, attempts, events, job] = await Promise.all([
+    testDb.applicationTask.findMany({ where: { id: prepared.applicationTaskId, userId: intent.userId,
+      jobId: intent.jobId, sessionId: intent.sessionId, fillTurnId: intent.fillTurnId },
+    select: { id: true, userId: true, jobId: true, sessionId: true, fillTurnId: true, workerTaskId: true,
+      status: true, checkpoint: true, completedAt: true } }),
+    testDb.agentApproval.findMany({ where: { id: intent.receiptId, userId: intent.userId,
+      jobId: intent.jobId, sessionId: intent.sessionId, turnId: intent.fillTurnId,
+      taskId: intent.applicationTaskId, type: "submit_application" },
+    select: { id: true, userId: true, jobId: true, sessionId: true, turnId: true, taskId: true, type: true, status: true } }),
+    testDb.submissionAttempt.findMany({ where: { userId: intent.userId, jobId: intent.jobId,
+      receiptId: intent.receiptId, constraintHash: intent.constraintHash },
+    select: { userId: true, jobId: true, receiptId: true, constraintHash: true, state: true, responseRef: true } }),
+    testDb.applicationTaskEvent.findMany({ where: { taskId: prepared.applicationTaskId,
+      type: { in: ["submission_execution_started", "submission_execution_settled"] } },
+    select: { id: true, taskId: true, type: true, actor: true, data: true } }),
+    queue.getJob(intent.workerTaskId),
+  ])
+  const executionKeys = ["applicationTaskId", "approvalId", "constraintHash", "executionId", "fillTurnId",
+    "jobId", "sessionId", "userId", "workerTaskId"].sort().join(",")
+  const start = events.find(event => event.type === "submission_execution_started")
+  const settled = events.find(event => event.type === "submission_execution_settled")
+  const startData = jsonRecord(start?.data)
+  const settledData = jsonRecord(settled?.data)
+  const executionId = jsonString(startData, "executionId")
+  const exactExecutionIdentity = (data: Record<string, unknown> | null) => Boolean(data && executionId
+    && Object.keys(data).sort().join(",") === executionKeys
+    && data.applicationTaskId === intent.applicationTaskId && data.approvalId === intent.receiptId
+    && data.constraintHash === intent.constraintHash && data.executionId === executionId
+    && data.fillTurnId === intent.fillTurnId && data.jobId === intent.jobId
+    && data.sessionId === intent.sessionId && data.userId === intent.userId
+    && data.workerTaskId === intent.workerTaskId)
+  const exactExecutionPair = events.length === 2 && start?.actor === "worker" && settled?.actor === "worker"
+    && start.taskId === intent.applicationTaskId && settled.taskId === intent.applicationTaskId
+    && start.id === `evt_${executionId}` && exactExecutionIdentity(startData) && exactExecutionIdentity(settledData)
+  const exactTaskIdentity = task.length === 1 && task[0]?.id === intent.applicationTaskId
+    && task[0].userId === intent.userId && task[0].jobId === intent.jobId
+    && task[0].sessionId === intent.sessionId && task[0].fillTurnId === intent.fillTurnId
+    && task[0].workerTaskId === intent.workerTaskId && task[0].completedAt instanceof Date
+  const exactStoppedTask = exactTaskIdentity && task[0]?.status === "failed"
+    && task[0]?.checkpoint === "turn_stopped_before_submit"
+  const exactConsumedApproval = approval.length === 1 && approval[0]?.id === intent.receiptId
+    && approval[0].userId === intent.userId && approval[0].jobId === intent.jobId
+    && approval[0].sessionId === intent.sessionId && approval[0].turnId === intent.fillTurnId
+    && approval[0].taskId === intent.applicationTaskId && approval[0].type === "submit_application"
+    && approval[0].status === "consumed"
+  const exactAttemptIdentity = attempts.length === 1 && attempts[0]?.userId === intent.userId
+    && attempts[0].jobId === intent.jobId && attempts[0].receiptId === intent.receiptId
+    && attempts[0].constraintHash === intent.constraintHash
+  const exactStoppedAttempt = exactAttemptIdentity && attempts[0]?.state === "failed" && attempts[0]?.responseRef === null
+  const lock = await (await queue.client).get(queue.toKey(`${intent.workerTaskId}:lock`))
+  if (!exactExecutionPair || !exactStoppedTask || !exactConsumedApproval || !exactStoppedAttempt || lock !== null) return null
+  if (!job) return "removed_after_exact_stop_settlement" as const
+  if (job.id !== intent.workerTaskId || !matchesApplyTaskSubmitPayload(job.data, intent)) return "mismatched_job" as const
+  const state = await job.getState()
+  return state === "completed" || state === "failed" ? state : null
+}
+
+async function waitForStage8StoppedExecutionSettlement(
   prepared: Stage8PreparedScenario,
   intent: Stage8SubmitIntent,
   timeoutMs = 30_000,
-): Promise<string> {
+): Promise<"completed" | "failed" | "removed_after_exact_stop_settlement" | "mismatched_job"> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
-    const job = await applyQueue?.getJob(intent.workerTaskId)
-    const state = await job?.getState()
-    if (state === "completed" || state === "failed") return state
+    const outcome = await stage8ExecutionSettled(prepared, intent)
+    if (outcome) return outcome
     await delay(100)
   }
-  const [database, queue] = await Promise.all([
-    stage8FillFailureSnapshot(prepared, intent.workerTaskId),
-    stage8ApplyQueueState(intent.workerTaskId),
-  ])
-  throw new Error("stage8_submit_worker_did_not_settle:" + JSON.stringify({
-    database, queue, requestFence: stage8RequestFenceSummary(worker?.lines ?? []),
-  }))
+  return throwStage8SettlementTimeout(prepared, intent.workerTaskId)
+}
+
+async function waitForStage8GrantJobSettled(
+  prepared: Stage8PreparedScenario,
+  intent: Stage8SubmitIntent,
+  timeoutMs = 30_000,
+): Promise<"completed" | "failed" | "removed_after_exact_terminal_proof" | "mismatched_job"> {
+  const until = Date.now() + timeoutMs
+  const expected = {
+    taskId: intent.applicationTaskId, userId: intent.userId, jobId: intent.jobId,
+    sessionId: intent.sessionId, fillTurnId: intent.fillTurnId, workerTaskId: intent.workerTaskId,
+    approvalId: intent.receiptId, constraintHash: intent.constraintHash,
+  }
+  const queue = applyQueue
+  if (!queue) throw new Error("stage8_apply_queue_unavailable")
+  while (Date.now() < until) {
+    const [job, lock] = await Promise.all([
+      queue.getJob(intent.workerTaskId),
+      (async () => (await queue.client).get(queue.toKey(`${intent.workerTaskId}:lock`)))(),
+    ])
+    if (lock === null) {
+      if (job) {
+        if (job.id !== intent.workerTaskId || !matchesApplyTaskSubmitPayload(job.data, intent)) return "mismatched_job"
+        const state = await job.getState()
+        if (state === "completed") return state
+        if (state === "failed" && job.attemptsMade >= (job.opts?.attempts ?? 1)) return state
+      } else {
+        try {
+          await waitForSubmissionTerminalProof(expected, Math.min(100, until - Date.now()))
+          return "removed_after_exact_terminal_proof"
+        } catch { /* Continue polling until the shared deadline, then emit bounded diagnostics. */ }
+      }
+    }
+    await delay(100)
+  }
+  return throwStage8SettlementTimeout(prepared, intent.workerTaskId)
 }
 
 describeWithServices("ApplicationTask production full-loop PostgreSQL integration", () => {
@@ -3325,13 +3428,20 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(await readStage8Protocol(stopFirst, firstIntent)).toEqual(["armed", "stop_requested"])
 
       worker.stdin?.write("stage8-release-arm\n")
-      expect(await waitForStage8JobSettled(stopFirst, firstIntent)).toBe("completed")
+      const stoppedSettlement = await waitForStage8StoppedExecutionSettlement(stopFirst, firstIntent)
+      expect(["completed", "removed_after_exact_stop_settlement"]).toContain(stoppedSettlement)
+      const settledDuplicateStop = await postStage8Stop(stopFirst, firstTarget)
+      expect(settledDuplicateStop.status).toBe(200)
+      await expect(jsonResponse(settledDuplicateStop)).resolves.toEqual({ outcome: "stop_requested" })
+      expect(await readStage8Protocol(stopFirst, firstIntent)).toEqual(["armed", "stop_requested"])
       expect(worker.lines.some(line => line === `STAGE8_FINAL_FENCE_READY ${firstIntent.workerTaskId}`)).toBe(false)
       const afterStopFirst = await requestFixtureStats()
       expect(afterStopFirst.reviewedSubmitCount).toBe(before.reviewedSubmitCount)
       expect(afterStopFirst.reviewedHeldSubmitCount).toBe(before.reviewedHeldSubmitCount)
       expect(afterStopFirst.reviewedExactSubmissionCount).toBe(before.reviewedExactSubmissionCount)
       expect(afterStopFirst.blocked).toEqual([])
+      expect(afterStopFirst.requests.filter(path => path === "POST /example-reviewed/jobs/1"))
+        .toHaveLength(priorReviewedPostCount)
 
       await stopFixture(worker)
       worker = spawnFixture("worker")
@@ -3397,7 +3507,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         releasedStats = await requestFixtureStats()
       }
       expect(releasedStats.reviewedHeldSubmitCount).toBe(before.reviewedHeldSubmitCount)
-      await waitForStage8JobSettled(grantFirst, secondIntent, 30_000)
+      const grantSettlement = await waitForStage8GrantJobSettled(grantFirst, secondIntent, 30_000)
+      expect(["completed", "removed_after_exact_terminal_proof"]).toContain(grantSettlement)
     } finally {
       site?.stdin?.write("release-held\n")
     }
