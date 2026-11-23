@@ -137,6 +137,8 @@ describe("runGreenhouseFlow", () => {
     expect(result.status).toBe("submitted");
     expect(field.fill).toHaveBeenCalledWith(content);
     expect(sequence.slice(-3)).toEqual(["readback", "guard", "click"]);
+    expect(beforeSubmit).toHaveBeenCalledOnce();
+    expect(beforeSubmit).toHaveBeenCalledWith({ url: "https://boards.greenhouse.io/booking/apply", method: "POST" });
     expect(submitter.click).toHaveBeenCalledOnce();
   });
 

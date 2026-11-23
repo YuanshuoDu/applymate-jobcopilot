@@ -95,13 +95,10 @@ export async function runGreenhouseFlow(
     ".submit-button",
     "#submit-app",
   ];
-  const finalSubmitGuard = approvedReviewedSubmit && options
-    ? async (intent?: Parameters<NonNullable<ApplyTask["beforeSubmit"]>>[0], submitter?: Locator) => {
-        if (!submitter || !await reviewedCoverLetterReadbackMatches(options.reviewedCoverLetter, submitter)) return false;
-        return task.beforeSubmit!(intent, submitter);
-      }
-    : task.beforeSubmit;
-  const submission = await clickSubmit(page, submitSelectors, finalSubmitGuard);
+  const verifyReviewedSubmitter = approvedReviewedSubmit && options
+    ? (submitter: Locator) => reviewedCoverLetterReadbackMatches(options.reviewedCoverLetter, submitter)
+    : undefined;
+  const submission = await clickSubmit(page, submitSelectors, task.beforeSubmit, verifyReviewedSubmitter);
   if (submission.outcome === "blocked") {
     log.push({ field: submission.reason, selector: "submit", action: "submission_blocked" });
     return { status: "submission_blocked", turns: 1, error: submission.message, durationMs: Date.now() - startedAt, log };
