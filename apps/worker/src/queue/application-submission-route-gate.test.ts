@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createApplicationSubmissionRouteHandler, loadApprovedTurnScope } from "./application-submission-route-gate.js";
+import { createSubmissionRouteObservation } from "./application-submission-route-observation.js";
 
 const mocks = vi.hoisted(() => ({ inspectSubmission: vi.fn(), legacyStartFence: vi.fn(), finishTask: vi.fn() }));
 vi.mock("../db/apply-results.js", () => ({ getPool: vi.fn(() => ({})) }));
@@ -33,12 +34,14 @@ function routeGateHarness(options: { fenceState?: "ready" | "stopped" | "uncerta
   const scope = { ...identity, turnId: identity.fillTurnId, workerTaskId: "worker-task", executionId: "execution" };
   const order: string[] = [];
   const stagedStartFence = vi.fn().mockResolvedValue({ state: options.fenceState ?? "ready", release: vi.fn() });
+  const stopController = new AbortController();
+  const observation = createSubmissionRouteObservation(stopController.signal);
   const state = {
-    queueCatchStarted: false, stopController: new AbortController(), approvedTurnScope: scope,
+    queueCatchStarted: false, stopController, approvedTurnScope: scope,
     armedSubmissionIntent: { url: "https://jobs.example/apply", method: "POST" },
     submissionCandidateSeen: false, submissionRequestStarted: false, submissionFenceTimer: null,
     submissionFenceUnavailable: false, turnStopped: false, pendingSubmissionFence: null as null | { release(commit: boolean): Promise<void> },
-    submissionRouteState: { work: null, cleanup: null }, applicationTaskFinalized: false,
+    submissionRouteState: { work: null, cleanup: null, observation }, applicationTaskFinalized: false,
   };
   const releaseSubmissionFence = vi.fn(async (commit: boolean) => {
     order.push(`release:${commit}`);
@@ -70,7 +73,7 @@ function routeGateHarness(options: { fenceState?: "ready" | "stopped" | "uncerta
     continue: vi.fn(() => { order.push("continue"); routeCalled(); return options.continueRoute ? options.continueRoute() : continuation; }),
     abort: vi.fn().mockResolvedValue(undefined), fallback: vi.fn().mockResolvedValue(undefined),
   };
-  return { acknowledge, continued, handler, lifecycle, onContinuationAcknowledged, order, releaseSubmissionFence, route, scope, stagedStartFence, state };
+  return { acknowledge, continued, handler, lifecycle, observation, onContinuationAcknowledged, order, releaseSubmissionFence, route, scope, stagedStartFence, state };
 }
 
 describe("approved application route scope", () => {
@@ -131,6 +134,31 @@ describe("approved application route scope", () => {
     expect(harness.onContinuationAcknowledged).toHaveBeenCalledWith(harness.scope);
     expect(harness.order).toEqual(["continue", "acknowledged", "release:true"]);
     expect(harness.releaseSubmissionFence).toHaveBeenLastCalledWith(true);
+  });
+
+  it("publishes the assigned exact route work before awaiting its continuation", async () => {
+    const harness = routeGateHarness();
+    const handling = harness.handler(harness.route as never);
+    await harness.continued;
+    const observed = await harness.observation.pending;
+
+    expect(observed.kind).toBe("matched");
+    if (observed.kind === "matched") expect(observed.work).toBe(harness.state.submissionRouteState.work);
+    expect(harness.order).toEqual(["continue"]);
+    harness.acknowledge();
+    await handling;
+  });
+
+  it("does not admit a later route after the armed observation is aborted", async () => {
+    const harness = routeGateHarness();
+    harness.state.stopController.abort();
+    await expect(harness.observation.pending).resolves.toEqual({ kind: "no_match" });
+
+    await harness.handler(harness.route as never);
+
+    expect(harness.route.abort).toHaveBeenCalledWith("aborted");
+    expect(harness.route.continue).not.toHaveBeenCalled();
+    expect(harness.stagedStartFence).not.toHaveBeenCalled();
   });
 
   it("does not acknowledge a rejected route continuation", async () => {

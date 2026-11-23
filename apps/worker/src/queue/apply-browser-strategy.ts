@@ -18,6 +18,7 @@ import { replayPattern } from "../patterns/replay.js";
 import type { Page } from "playwright-core";
 import type { ApplyJobRunContext } from "./apply-job-runner.js";
 import { APPLY_TIMEOUT_MS } from "./apply-job-finalization.js";
+import { runAndSettleSubmissionRoute } from "./application-submission-route-observation.js";
 
 export async function runApplySubmitStrategy(
   context: ApplyJobRunContext,
@@ -30,9 +31,11 @@ export async function runApplySubmitStrategy(
   if (payload.operation !== "submit" || !submissionIdentity) return runBrowserFlow();
   if (!approvedTurnScope) throw new Error("Approved application submission is missing its durable Turn scope.");
   const runAndObserveRoute = async (run: () => Promise<HarnessResult>): Promise<HarnessResult> => {
-    const result = await run();
-    const activeRouteWork = context.state.submissionRouteState.work;
-    if (activeRouteWork) await activeRouteWork;
+    const result = await runAndSettleSubmissionRoute({
+      run,
+      observation: () => context.state.submissionRouteState.observation,
+      currentWork: () => context.state.submissionRouteState.work,
+    });
     return context.state.submissionAcknowledgementUncertain
       ? { ...result, status: "manual", error: UNCONFIRMED_SUBMISSION_MESSAGE }
       : result;

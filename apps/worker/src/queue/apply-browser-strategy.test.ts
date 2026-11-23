@@ -2,10 +2,25 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { runGreenhouseFlow } from "../flows/greenhouse-flow.js";
 import { createPgApplicationSubmitTool, type ApplicationSubmitProvider } from "../runtime/tools/application-submit-tool.js";
 import { runApplyBrowserStrategy, runApplySubmitStrategy } from "./apply-browser-strategy.js";
+import { createSubmissionRouteObservation } from "./application-submission-route-observation.js";
 
 vi.mock("../flows/greenhouse-flow.js", () => ({ runGreenhouseFlow: vi.fn() }));
 vi.mock("../runtime/tools/application-submit-tool.js", () => ({ createPgApplicationSubmitTool: vi.fn() }));
 vi.mock("../db/apply-results.js", () => ({ getPool: vi.fn(() => ({})) }));
+
+function submitContext(submissionRouteState: {
+  work: Promise<void> | null
+  observation: ReturnType<typeof createSubmissionRouteObservation> | null
+}) {
+  return {
+    payload: { operation: "submit", userId: "user", jobId: "job", receiptId: "approval", constraintHash: "a".repeat(64), applicationTaskId: "task" },
+    submissionIdentity: {}, startedAt: Date.now(),
+    state: {
+      flow: "greenhouse", approvedTurnScope: { sessionId: "session", turnId: "turn" }, submissionRouteState,
+      submissionAcknowledgementUncertain: false, stopController: new AbortController(), queueCatchStarted: false,
+    },
+  } as never;
+}
 
 describe("apply browser strategy", () => {
   beforeEach(() => vi.mocked(runGreenhouseFlow).mockReset());
@@ -80,11 +95,14 @@ describe("apply browser strategy", () => {
       captured.provider = submit;
       return { execute: vi.fn().mockResolvedValue({ status: "failed", errorCode: "submission_attempt_fenced" }) } as never;
     });
-    const context = (flow: string) => ({
+    const context = (flow: string, submissionRouteState: {
+      work: Promise<void> | null
+      observation: ReturnType<typeof createSubmissionRouteObservation> | null
+    } = { work: null, observation: null }) => ({
       payload: { operation: "submit", userId: "user", jobId: "job", receiptId: "approval", constraintHash: "a".repeat(64), applicationTaskId: "task" },
       submissionIdentity: {}, startedAt: Date.now(),
       state: {
-        flow, approvedTurnScope: { sessionId: "session", turnId: "turn" }, submissionRouteState: { work: null },
+        flow, approvedTurnScope: { sessionId: "session", turnId: "turn" }, submissionRouteState,
         submissionAcknowledgementUncertain: false, stopController: new AbortController(), queueCatchStarted: false,
       },
     }) as never;
@@ -106,5 +124,72 @@ describe("apply browser strategy", () => {
     expect(leverProvider?.acceptsReviewedApplicationMaterial).toBeUndefined();
     await expect(leverProvider!(providerInput)).rejects.toMatchObject({ code: "browser_manual" });
     expect(runBrowserFlow).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for a route callback that arrives after a normal browser result", async () => {
+    const routeState = { work: null as Promise<void> | null, observation: null as ReturnType<typeof createSubmissionRouteObservation> | null };
+    const observations: ReturnType<typeof createSubmissionRouteObservation>[] = [];
+    const captured: { provider?: Parameters<typeof createPgApplicationSubmitTool>[0]["submit"] } = {};
+    vi.mocked(createPgApplicationSubmitTool).mockImplementation(({ submit }) => {
+      captured.provider = submit;
+      return { execute: vi.fn().mockResolvedValue({ status: "failed", errorCode: "submission_attempt_fenced" }) } as never;
+    });
+    const runBrowserFlow = vi.fn().mockImplementation(async () => {
+      const observation = createSubmissionRouteObservation();
+      observations.push(observation);
+      routeState.observation = observation;
+      return { status: "manual", durationMs: 1 };
+    });
+    const beforeSubmit = vi.fn().mockResolvedValue(true);
+    await runApplySubmitStrategy(submitContext(routeState), { url: () => "https://boards.greenhouse.io/acme" } as never, runBrowserFlow);
+    const provider = captured.provider as ApplicationSubmitProvider;
+    let releaseRoute!: () => void;
+    const work = new Promise<void>(resolve => { releaseRoute = resolve; });
+    let settled = false;
+    const pending = provider({ target: {} as never, artifact: {} as never, context: {} as never, beforeSubmit })
+      .finally(() => { settled = true; });
+
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    routeState.work = work;
+    expect(observations[0]?.observe(work)).toBe(true);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    releaseRoute();
+    await expect(pending).rejects.toMatchObject({ code: "browser_manual" });
+  });
+
+  it("settles held route work before preserving a rejected browser flow", async () => {
+    const routeState = { work: null as Promise<void> | null, observation: null as ReturnType<typeof createSubmissionRouteObservation> | null };
+    const observations: ReturnType<typeof createSubmissionRouteObservation>[] = [];
+    const captured: { provider?: Parameters<typeof createPgApplicationSubmitTool>[0]["submit"] } = {};
+    vi.mocked(createPgApplicationSubmitTool).mockImplementation(({ submit }) => {
+      captured.provider = submit;
+      return { execute: vi.fn().mockResolvedValue({ status: "failed", errorCode: "submission_attempt_fenced" }) } as never;
+    });
+    const runnerError = new Error("browser runner failed");
+    const runBrowserFlow = vi.fn().mockImplementation(async () => {
+      const observation = createSubmissionRouteObservation();
+      observations.push(observation);
+      routeState.observation = observation;
+      throw runnerError;
+    });
+    const beforeSubmit = vi.fn().mockResolvedValue(true);
+    await runApplySubmitStrategy(submitContext(routeState), { url: () => "https://boards.greenhouse.io/acme" } as never, runBrowserFlow);
+    const provider = captured.provider as ApplicationSubmitProvider;
+    let releaseRoute!: () => void;
+    const work = new Promise<void>(resolve => { releaseRoute = resolve; });
+    let settled = false;
+    const pending = provider({ target: {} as never, artifact: {} as never, context: {} as never, beforeSubmit })
+      .catch(error => { settled = true; throw error; });
+
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    routeState.work = work;
+    expect(observations[0]?.observe(work)).toBe(true);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    releaseRoute();
+    await expect(pending).rejects.toBe(runnerError);
   });
 });

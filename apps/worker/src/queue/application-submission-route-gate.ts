@@ -222,6 +222,7 @@ export function createApplicationSubmissionRouteHandler(
       }
     })();
     state.submissionRouteState.work = work;
+    state.submissionRouteState.observation?.observe(work);
     try {
       await work;
     } finally {
