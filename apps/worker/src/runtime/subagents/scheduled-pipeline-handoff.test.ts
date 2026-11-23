@@ -278,6 +278,12 @@ describe("scheduled pipeline HTTP handoff", () => {
     await expect(postScheduledPipelineGate(gateInput, new AbortController().signal,
       vi.fn<typeof fetch>(async () => reply(409, { status: "blocked", errorCode: "scheduled_pipeline_gate_task_stale" }))))
       .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_gate_task_stale" })
+    await expect(postScheduledPipelineGate(gateInput, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(409, { status: "blocked", errorCode: "scheduled_prepare_material_source_changed" }))))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_prepare_material_source_changed" })
+    await expect(postScheduledPipelineGate(gateInput, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(400, { status: "blocked", errorCode: "scheduled_prepare_material_source_changed" }))))
+      .rejects.toThrow("scheduled_pipeline_handoff_retryable")
   })
 
   it.each(["different-scheduled-choice", undefined])("rejects a missing or mismatched scheduled wait echo (%s)", async echoedScheduledWaitId => {

@@ -5,7 +5,8 @@ import { db } from '@/lib/db'
 import { parseScheduledAutomationSnapshot } from './scheduled-automation-snapshot'
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { parseScheduledTaskGraphPrepareProof, scheduledTaskGraphAnalyzeCheckpointDigest, type ParsedScheduledTaskGraphPrepareProof, type ScheduledTaskGraphPreparedMaterialRow, type ScheduledTaskGraphPreparedPackageRow } from './scheduled-taskgraph-gate-checkpoint'
-import { loadScheduledTaskGraphGateMaterials } from './scheduled-taskgraph-gate-materials'
+import { inspectScheduledTaskGraphGateMaterials } from './scheduled-taskgraph-gate-materials'
+import type { ScheduledTaskGraphGateMaterialDriftEvidence } from './scheduled-taskgraph-gate-material-drift'
 import { scheduledTaskGraphGateBindingIsCurrent, scheduledTaskGraphGateHistoryIsCurrent } from './scheduled-taskgraph-gate-history'
 import { parseScheduledTaskGraphGateResult, type ScheduledTaskGraphGateResult } from './scheduled-taskgraph-gate-service'
 import { projectScheduledTaskGraphCanonicalPrefix, sameScheduledTaskGraphJson, scheduledTaskGraphVerificationReportMatches, sameScheduledTaskGraphOwnerScope, sameScheduledTaskGraphIdSet, scheduledTaskGraphAuditNodeMatches, uniqueScheduledTaskGraphRows } from './scheduled-taskgraph-canonical-prefix'
@@ -22,12 +23,9 @@ const ID = /^[^\u0000-\u001f\u007f]{1,256}$/
 export type ScheduledTaskGraphGateInputRequest = Readonly<{ owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; analyzeCheckpoint: unknown;
   analyzeAttestation: unknown; prepareProof: unknown; gate?: Readonly<{ taskId: string; attemptCount: number; phase: 'running' | 'completed'; completionProof?: unknown }>; gateRootWait?: ScheduledGateRootWait }>
 export type ScheduledTaskGraphAuditChildGateInputRequest = ScheduledTaskGraphGateInputRequest & Readonly<{ auditActor: ScheduledTaskGraphAuditActor }>
-export type ScheduledTaskGraphPostGateGateInputRequest = Omit<ScheduledTaskGraphGateInputRequest, 'gate'> & Readonly<{
-  gate: Readonly<{ taskId: string; attemptCount: number; phase: 'completed'; completionProof: unknown }>
-  postGate: Readonly<{ actor: ScheduledTaskGraphPostGateActor; handoff: unknown; packageRefs?: readonly string[] }>
-}>
-export type ScheduledTaskGraphGateInput = Readonly<{ packages: readonly ScheduledTaskGraphPreparedPackageRow[];
-  materials: readonly ScheduledTaskGraphPreparedMaterialRow[]; gateResult?: ScheduledTaskGraphGateResult }>
+export type ScheduledTaskGraphPostGateGateInputRequest = Omit<ScheduledTaskGraphGateInputRequest, 'gate'> & Readonly<{ gate: Readonly<{ taskId: string; attemptCount: number; phase: 'completed'; completionProof: unknown }>; postGate: Readonly<{ actor: ScheduledTaskGraphPostGateActor; handoff: unknown; packageRefs?: readonly string[] }> }>
+export type ScheduledTaskGraphGateInput = Readonly<{ packages: readonly ScheduledTaskGraphPreparedPackageRow[]; materials: readonly ScheduledTaskGraphPreparedMaterialRow[]; gateResult?: ScheduledTaskGraphGateResult }>
+export type ScheduledTaskGraphGateInputInspection = Readonly<{ kind: 'valid'; input: ScheduledTaskGraphGateInput } | { kind: 'material_source_drift'; evidence: ScheduledTaskGraphGateMaterialDriftEvidence } | { kind: 'invalid' }>
 export function scheduledTaskGraphAnalyzeCheckpointForGate(value: unknown): Record<string, unknown> | null {
   const checkpoint = record(value)
   const stage = checkpoint?.nextStage
@@ -57,18 +55,18 @@ async function gateProofCurrent(input: ScheduledTaskGraphGateInputRequest, tx: P
       && await verifyCurrentTaskGraph(owner, marker, checkpointDigest, input.analyzeAttestation, proof, tx, input.gate, true, auditActor, auditFence, undefined, undefined, input.gateRootWait))
   } catch { return false }
 }
-export function loadScheduledTaskGraphGateInput(input: ScheduledTaskGraphGateInputRequest,
-  reader?: Prisma.TransactionClient): Promise<ScheduledTaskGraphGateInput | null> {
-  return loadGateInput(input, undefined, undefined, reader)
+export function loadScheduledTaskGraphGateInput(input: ScheduledTaskGraphGateInputRequest, reader?: Prisma.TransactionClient): Promise<ScheduledTaskGraphGateInput | null> { return loadGateInput(input, undefined, undefined, reader) }
+export function loadScheduledTaskGraphAuditChildGateInput(input: ScheduledTaskGraphAuditChildGateInputRequest): Promise<ScheduledTaskGraphGateInput | null> { return loadGateInput(input, input.auditActor) }
+export function loadScheduledTaskGraphPostGateGateInput(input: ScheduledTaskGraphPostGateGateInputRequest): Promise<ScheduledTaskGraphGateInput | null> { return !input?.gate || input.gate.phase !== 'completed' ? Promise.resolve(null) : loadGateInput(input, undefined, input.postGate) }
+export async function inspectScheduledTaskGraphGateInput(input: ScheduledTaskGraphGateInputRequest, reader: Prisma.TransactionClient): Promise<ScheduledTaskGraphGateInputInspection> {
+  if (!input?.gate || input.gate.phase !== 'running') return { kind: 'invalid' }
+  const result = await loadGateInput(input, undefined, undefined, reader, true)
+  return !result ? { kind: 'invalid' } : 'kind' in result ? result : { kind: 'valid', input: result }
 }
-export function loadScheduledTaskGraphAuditChildGateInput(input: ScheduledTaskGraphAuditChildGateInputRequest): Promise<ScheduledTaskGraphGateInput | null> {
-  return loadGateInput(input, input.auditActor)
-}
-export function loadScheduledTaskGraphPostGateGateInput(input: ScheduledTaskGraphPostGateGateInputRequest): Promise<ScheduledTaskGraphGateInput | null> {
-  if (!input?.gate || input.gate.phase !== 'completed') return Promise.resolve(null)
-  return loadGateInput(input, undefined, input.postGate)
-}
-async function loadGateInput(input: ScheduledTaskGraphGateInputRequest, auditActor?: ScheduledTaskGraphAuditActor, postGate?: ScheduledTaskGraphPostGateGateInputRequest['postGate'], reader?: Prisma.TransactionClient): Promise<ScheduledTaskGraphGateInput | null> {
+type GateInputLoadResult = ScheduledTaskGraphGateInput | Readonly<{ kind: 'material_source_drift'; evidence: ScheduledTaskGraphGateMaterialDriftEvidence }>
+function loadGateInput(input: ScheduledTaskGraphGateInputRequest, auditActor?: ScheduledTaskGraphAuditActor, postGate?: ScheduledTaskGraphPostGateGateInputRequest['postGate'], reader?: Prisma.TransactionClient): Promise<ScheduledTaskGraphGateInput | null>
+function loadGateInput(input: ScheduledTaskGraphGateInputRequest, auditActor: undefined, postGate: undefined, reader: Prisma.TransactionClient, inspectMaterialDrift: true): Promise<GateInputLoadResult | null>
+async function loadGateInput(input: ScheduledTaskGraphGateInputRequest, auditActor?: ScheduledTaskGraphAuditActor, postGate?: ScheduledTaskGraphPostGateGateInputRequest['postGate'], reader?: Prisma.TransactionClient, inspectMaterialDrift = false): Promise<GateInputLoadResult | null> {
   try {
     const currentReader = reader ?? db
     const owner = parseScheduledTaskGraphPipelineOwner(input.owner), snapshot = parseScheduledAutomationSnapshot(input.snapshot)
@@ -86,9 +84,10 @@ async function loadGateInput(input: ScheduledTaskGraphGateInputRequest, auditAct
         : db.$transaction(tx => verifyCurrentTaskGraph(owner, marker, checkpointDigest, input.analyzeAttestation,
           proof, tx, input.gate, true, auditActor, lockScheduledTaskGraphAuditChildFence, postGate, input.prepareProof, input.gateRootWait))
         : verifyCurrentTaskGraph(owner, marker, checkpointDigest, input.analyzeAttestation, proof, currentReader, input.gate, false, undefined, lockScheduledTaskGraphAuditChildFence, undefined, undefined, input.gateRootWait))) return null
-    const loaded = await loadScheduledTaskGraphGateMaterials({ owner, scoredJobs: checkpoint.scoredJobs,
+    const loaded = await inspectScheduledTaskGraphGateMaterials({ owner, scoredJobs: checkpoint.scoredJobs,
       minScore: snapshot.minScore, dailyCap: snapshot.dailyCap, taskId: proof.result.taskId,
       jobs: proof.result.jobs, materials: proof.result.materials, reader: currentReader })
+    if (loaded && 'kind' in loaded) return inspectMaterialDrift ? loaded : null
     if (!loaded || input.gate?.phase !== 'completed') return loaded
     const task = await currentReader.subAgentTask.findFirst({ where: { id: input.gate.taskId, sessionId: owner.sessionId,
       turnId: owner.turnId, rootTaskId: owner.rootTaskId, status: 'completed' }, select: { result: true } })

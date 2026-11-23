@@ -24,7 +24,7 @@ vi.mock('./scheduled-taskgraph-audit-child-fence', async importOriginal => ({
   lockScheduledTaskGraphAuditCompletedReportChildFence: mocks.completedAuditFence,
 }))
 
-import { isScheduledTaskGraphAuditChildGateProofCurrent, isScheduledTaskGraphAuditCompletedReportGateProofCurrent,
+import { inspectScheduledTaskGraphGateInput, isScheduledTaskGraphAuditChildGateProofCurrent, isScheduledTaskGraphAuditCompletedReportGateProofCurrent,
   isScheduledTaskGraphGateProofCurrent, loadScheduledTaskGraphAuditChildGateInput, loadScheduledTaskGraphPostGateGateInput,
   loadScheduledTaskGraphGateInput, scheduledTaskGraphAnalyzeCheckpointForGate, type ScheduledTaskGraphGateInputRequest } from './scheduled-taskgraph-gate-input'
 
@@ -608,6 +608,19 @@ describe('scheduled TaskGraph Gate input reload', () => {
     const foreignProvenance = setup()
     mocks.versions.mockResolvedValueOnce([{ ...foreignProvenance.resumeArtifact.version, provenanceRefs: ['foreign:source'] }, foreignProvenance.letterArtifact.version])
     await expect(loadScheduledTaskGraphGateInput(foreignProvenance.input)).resolves.toBeNull()
+  })
+
+  it('exposes material drift only after the exact running Gate proof and artifact references validate', async () => {
+    const valid = setup()
+    const request = attachGate(valid.input, valid.proof, valid.graph, valid.analyzeAttestation)
+    mocks.resume.mockResolvedValue({ ...resume, name: 'Updated base resume metadata' })
+
+    const inspection = await inspectScheduledTaskGraphGateInput(request, fixtureDb as unknown as Prisma.TransactionClient)
+    expect(inspection).toMatchObject({ kind: 'material_source_drift', evidence: {
+      artifactDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      currentMaterialDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+    } })
+    expect(JSON.stringify(inspection)).not.toContain('Updated base resume metadata')
   })
 
   it('rejects wrong task attempts and materials for skipped or unknown jobs', async () => {

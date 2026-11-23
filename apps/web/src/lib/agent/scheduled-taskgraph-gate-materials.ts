@@ -4,6 +4,7 @@ import { hashArtifactContent } from './artifacts/hash'
 import type { ArtifactKind, ArtifactProvenance, ArtifactSummary } from './artifacts/types'
 import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import type { ScheduledTaskGraphArtifactReference, ScheduledTaskGraphPreparedMaterialRow, ScheduledTaskGraphPreparedPackageRow } from './scheduled-taskgraph-gate-checkpoint'
+import { createScheduledTaskGraphGateMaterialDriftEvidence, type ScheduledTaskGraphGateMaterialDriftEvidence } from './scheduled-taskgraph-gate-material-drift'
 import { loadScheduledTaskGraphGateMaterialSources, type ScheduledTaskGraphGateSourceDigestBundle as SourceDigestBundle } from './scheduled-taskgraph-gate-material-sources'
 import type { ApplicationPackage, ScoredJob } from './types'
 
@@ -20,10 +21,8 @@ type PreparedMaterial = { jobId: string; kind: ArtifactKind; artifactRef: Schedu
 type ScheduledArtifactSummary = ArtifactSummary & { readonly sourceDigest: string }
 type GateMaterialsReader = Pick<Prisma.TransactionClient, 'agentSession' | 'job' | 'resume' | 'personaFact' | 'agentArtifactVersion' | 'agentArtifact'>
 
-export type ScheduledTaskGraphGateMaterials = Readonly<{
-  packages: readonly ScheduledTaskGraphPreparedPackageRow[]
-  materials: readonly ScheduledTaskGraphPreparedMaterialRow[]
-}>
+export type ScheduledTaskGraphGateMaterials = Readonly<{ packages: readonly ScheduledTaskGraphPreparedPackageRow[]; materials: readonly ScheduledTaskGraphPreparedMaterialRow[] }>
+export type ScheduledTaskGraphGateMaterialsInspection = ScheduledTaskGraphGateMaterials | Readonly<{ kind: 'material_source_drift'; evidence: ScheduledTaskGraphGateMaterialDriftEvidence }>
 
 /** Reloads the exact source and artifact rows named by a verified prepare result and builds Gate packages. */
 export async function loadScheduledTaskGraphGateMaterials(input: Readonly<{
@@ -36,6 +35,21 @@ export async function loadScheduledTaskGraphGateMaterials(input: Readonly<{
   materials: readonly PreparedMaterial[]
   reader?: GateMaterialsReader
 }>): Promise<ScheduledTaskGraphGateMaterials | null> {
+  const result = await inspectScheduledTaskGraphGateMaterials(input)
+  return result && 'kind' in result ? null : result
+}
+
+/** Returns a drift classification only after every referenced immutable artifact has passed its full integrity checks. */
+export async function inspectScheduledTaskGraphGateMaterials(input: Readonly<{
+  owner: ScheduledTaskGraphPipelineOwner
+  scoredJobs: unknown
+  minScore: number
+  dailyCap: number
+  taskId: string
+  jobs: readonly PreparedJob[]
+  materials: readonly PreparedMaterial[]
+  reader?: GateMaterialsReader
+}>): Promise<ScheduledTaskGraphGateMaterialsInspection | null> {
   try {
     const reader = input.reader ?? db
     const scores = parseScores(input.scoredJobs, input.owner.userId)
@@ -66,7 +80,8 @@ export async function loadScheduledTaskGraphGateMaterials(input: Readonly<{
     const byVersion = uniqueMap(versions, row => versionKey(row.jobId, row.artifactId, row.version, row.artifactType))
     const byHead = uniqueMap(heads, row => headKey(row.jobId, row.id, row.artifactType))
     if (!byVersion || !byHead) return null
-    const materialRows: ScheduledTaskGraphPreparedMaterialRow[] = []
+    const materialRows: ScheduledTaskGraphPreparedMaterialRow[] = [], evidenceRows: Record<string, unknown>[] = []
+    let materialDrift = false
     const packages: ScheduledTaskGraphPreparedPackageRow[] = []
     for (const candidate of eligible) {
       const jobId = candidate.job.id
@@ -75,17 +90,23 @@ export async function loadScheduledTaskGraphGateMaterials(input: Readonly<{
       if (!score || !current) return null
       const artifacts = input.materials.filter(item => item.jobId === jobId)
       const built = new Map<ArtifactKind, { summary: ArtifactSummary; body: unknown; ref: ScheduledTaskGraphArtifactReference }>()
+      let jobMaterialDrift = false
       for (const material of artifacts) {
         const ref = material.artifactRef, key = versionKey(jobId, ref.artifactId, ref.version, material.kind)
         const version = byVersion.get(key), head = byHead.get(headKey(jobId, ref.artifactId, material.kind))
         const source = sources.byJob.get(jobId)
-        if (!version || !head || !source || built.has(material.kind)
-          || !verifyArtifact(version, head, input.owner, jobId, material.kind, input.taskId, ref, source)) return null
+        if (!version || !head || !source || built.has(material.kind)) return null
+        const verification = verifyArtifact(version, head, input.owner, jobId, material.kind, input.taskId, ref, source)
+        if (!verification) return null
+        evidenceRows.push(verification.evidence)
+        if (!verification.current) { materialDrift = true; jobMaterialDrift = true }
         const summary = artifactSummary(version, material.kind, source)
+        if (!verification.current) { materialRows.push({ userId: input.owner.userId, sessionId: input.owner.sessionId, jobId, kind: material.kind, artifactRef: ref }); continue }
         if (!summary) return null
         built.set(material.kind, { summary, body: version.content, ref })
         materialRows.push({ userId: input.owner.userId, sessionId: input.owner.sessionId, jobId, kind: material.kind, artifactRef: ref })
       }
+      if (jobMaterialDrift) continue
       const resume = built.get('resume'), letter = built.get('cover_letter')
       if (!resume) return null
       const pkg: ApplicationPackage = {
@@ -98,6 +119,10 @@ export async function loadScheduledTaskGraphGateMaterials(input: Readonly<{
         ...(letter ? { coverLetter: letter.body as string, coverLetterId: letter.ref.artifactId, coverLetterArtifact: letter.summary } : {}),
       }
       packages.push({ userId: input.owner.userId, sessionId: input.owner.sessionId, jobId, package: pkg })
+    }
+    if (materialDrift) {
+      const evidence = createScheduledTaskGraphGateMaterialDriftEvidence(evidenceRows)
+      return evidence ? { kind: 'material_source_drift', evidence } : null
     }
     return { packages, materials: materialRows }
   } catch { return null }
@@ -135,16 +160,17 @@ function parseScores(value: unknown, userId: string): ScoredJob[] | null {
 }
 
 function verifyArtifact(versionValue: unknown, headValue: unknown, owner: ScheduledTaskGraphPipelineOwner,
-  jobId: string, kind: ArtifactKind, taskId: string, ref: ScheduledTaskGraphArtifactReference, source: SourceDigestBundle): boolean {
+  jobId: string, kind: ArtifactKind, taskId: string, ref: ScheduledTaskGraphArtifactReference,
+  source: SourceDigestBundle): { current: boolean; evidence: Record<string, unknown> } | null {
   const version = record(versionValue), head = record(headValue)
-  if (!version || !head) return false
+  if (!version || !head) return null
   const provenanceRefs = parseMaterialSourceRefs(version.provenanceRefs, source, jobId)
-  if (!provenanceRefs) return false
-  return version.userId === owner.userId && version.sessionId === owner.sessionId && version.jobId === jobId
+  if (!provenanceRefs) return null
+  const valid = version.userId === owner.userId && version.sessionId === owner.sessionId && version.jobId === jobId
     && version.artifactId === ref.artifactId && version.version === ref.version && version.artifactType === kind
     && version.taskId === taskId && validId(version.toolCallId) && isDigest(version.requestHash)
     && version.contentHash === ref.contentHash && version.sourceDigest === ref.sourceDigest
-    && source.digest === ref.sourceDigest && safeHash(version.content) === ref.contentHash
+    && safeHash(version.content) === ref.contentHash
     && (kind !== 'cover_letter' || typeof version.content === 'string' && version.content.trim().length > 0 && version.content.length <= 20_000)
     && isDigest(version.constraintHash) && validId(version.baseId) && isDigest(version.baseHash)
     && sameOrderedStrings(version.evidenceRefs, provenanceRefs)
@@ -154,6 +180,11 @@ function verifyArtifact(versionValue: unknown, headValue: unknown, owner: Schedu
     && head.baseId === version.baseId && head.baseHash === version.baseHash
     && head.constraintHash === version.constraintHash && sameOrderedStrings(head.provenanceRefs, provenanceRefs)
     && sameOrderedStrings(head.evidenceRefs, provenanceRefs)
+  if (!valid) return null
+  return { current: source.digest === ref.sourceDigest, evidence: { jobId, kind, taskId, artifactRef: ref,
+    toolCallId: version.toolCallId, requestHash: version.requestHash, baseId: version.baseId, baseHash: version.baseHash,
+    constraintHash: version.constraintHash, provenanceRefs, evidenceRefs: version.evidenceRefs,
+    currentSourceDigest: source.digest } }
 }
 
 function isRedactedCoverLetterHead(value: unknown, ref: ScheduledTaskGraphArtifactReference): boolean {

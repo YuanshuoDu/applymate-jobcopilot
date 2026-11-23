@@ -8,7 +8,7 @@ import type { Job } from "@prisma/client"
 import { isAnalyzeSourceChangedError, readAnalyzeSourceChangedClaims } from "./stages/analyze-model-input"
 
 const mocks = vi.hoisted(() => ({ analyze: vi.fn(), scoreOwner: vi.fn(), ownerCurrent: vi.fn(), save: vi.fn(), gateInput: vi.fn(), gateCheckpoint: vi.fn(),
-  gateMaterials: vi.fn(), taskRows: vi.fn(), validateSources: vi.fn(), runCheckpointCurrent: vi.fn(),
+  gateMaterials: vi.fn(), inspectGateMaterials: vi.fn(), taskRows: vi.fn(), validateSources: vi.fn(), runCheckpointCurrent: vi.fn(),
   useActualGateInput: false, useActualGateCheckpoint: false, events: vi.fn(), steps: vi.fn(), items: vi.fn() }))
 vi.mock("@/lib/db", () => ({ db: { agentEvent: { findMany: mocks.events }, agentStep: { findFirst: mocks.steps }, agentItem: { findFirst: mocks.items },
   subAgentTask: { findMany: mocks.taskRows } } }))
@@ -42,7 +42,8 @@ vi.mock("./scheduled-taskgraph-gate-checkpoint", async importOriginal => {
     return mocks.gateCheckpoint(...args)
   } }
 })
-vi.mock("./scheduled-taskgraph-gate-materials", () => ({ loadScheduledTaskGraphGateMaterials: mocks.gateMaterials }))
+vi.mock("./scheduled-taskgraph-gate-materials", () => ({ loadScheduledTaskGraphGateMaterials: mocks.gateMaterials,
+  inspectScheduledTaskGraphGateMaterials: mocks.inspectGateMaterials }))
 
 const owner = { userId: "user_1", sessionId: "session_1", turnId: "turn_1", rootTaskId: "root_1",
   rootAttemptCount: 2, turnLeaseOwnerId: "worker_1", turnLeaseVersion: 4, executionId: "execution_1", executionAttemptCount: 0 }
@@ -144,13 +145,15 @@ function buildAnalyzeCheckpoint(input: Parameters<typeof buildScheduledTaskGraph
 describe("runScheduledTaskGraphAnalyzeOnly", () => {
   beforeEach(() => {
     ;[mocks.analyze, mocks.scoreOwner, mocks.ownerCurrent, mocks.save, mocks.gateInput, mocks.gateCheckpoint, mocks.gateMaterials,
-      mocks.taskRows, mocks.validateSources, mocks.runCheckpointCurrent, mocks.events, mocks.steps, mocks.items].forEach(mock => mock.mockReset())
+      mocks.inspectGateMaterials, mocks.taskRows, mocks.validateSources, mocks.runCheckpointCurrent,
+      mocks.events, mocks.steps, mocks.items].forEach(mock => mock.mockReset())
     mocks.ownerCurrent.mockResolvedValue(true)
     mocks.scoreOwner.mockResolvedValue(true)
     mocks.save.mockResolvedValue(true)
     mocks.gateInput.mockReset()
     mocks.gateCheckpoint.mockReset()
     mocks.gateMaterials.mockReset().mockResolvedValue({ packages: [], materials: [] })
+    mocks.inspectGateMaterials.mockResolvedValue({ packages: [], materials: [] })
     mocks.validateSources.mockReset().mockResolvedValue({})
     mocks.runCheckpointCurrent.mockImplementation(async (raw: unknown) => {
       const input = raw as { tx: unknown; assertOwnerCurrent: (tx: never) => Promise<boolean> }
@@ -399,7 +402,7 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
     mocks.useActualGateCheckpoint = true
     mocks.gateInput.mockImplementation((args: { prepareProof: unknown }) => expect(parseScheduledTaskGraphPrepareProof(args.prepareProof)).not.toBeNull())
     mocks.gateCheckpoint.mockImplementation((args: { proof: unknown }) => expect(parseScheduledTaskGraphPrepareProof(args.proof)).not.toBeNull())
-    mocks.gateMaterials.mockResolvedValue({ packages: [], materials: [] })
+    mocks.inspectGateMaterials.mockResolvedValue({ packages: [], materials: [] })
     mocks.items.mockImplementation((args: { where: { id?: string } }) => Promise.resolve(args.where.id === graphId ? graph : null))
     mocks.taskRows.mockResolvedValue([
       { id: owner.rootTaskId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: null,
@@ -424,6 +427,8 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
       owner, snapshot, attestation: baseAttestation, continuationKey: key, claimToken, ownedJobs: [job],
       persistedCheckpoint: persisted, prepareProof,
     })
+    expect(mocks.inspectGateMaterials).toHaveBeenCalledWith(expect.objectContaining({ owner, taskId: "prepare_1",
+      jobs: prepareProof.result.jobs, materials: prepareProof.result.materials }))
     const transaction = { marker: "source-fenced" } as never
     const checks: string[] = []
     mocks.validateSources.mockImplementation(async () => { checks.push("source") })

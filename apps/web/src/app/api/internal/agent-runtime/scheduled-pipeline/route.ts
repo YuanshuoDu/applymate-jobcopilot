@@ -13,6 +13,7 @@ import { scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey, t
 import { loadDurableScheduledTaskGraphWait, loadScheduledTaskGraphWaitQuestion, priorScheduledTaskGraphContinuation, readScheduledTaskGraphWaitMarker, rebindScheduledTaskGraphWaitState, scheduledTaskGraphClaimMatches, scheduledTaskGraphOwnerMatches } from "@/lib/agent/scheduled-taskgraph-pipeline-fence";
 import { hasEffectiveEntitlement, isFeatureAllowed, resolveAiAccess } from "@/lib/entitlements";
 import { isAnalyzeSourceChangedError, isScheduledTaskGraphAnalyzeProofUntrusted, isScheduledTaskGraphSourceChangeTerminal, renewExpiredScheduledAnalyzeClaim, respondToScheduledTaskGraphAnalyzeSourceChange } from "@/lib/agent/scheduled-taskgraph-source-change-terminal";
+import { scheduledTaskGraphGateMaterialDriftTerminalForRequest } from "@/lib/agent/scheduled-taskgraph-gate-material-drift";
 import { parseScheduledTaskGraphAttestation, scheduledTaskGraphAttestationCandidates } from "@/lib/agent/scheduled-taskgraph-attestation-candidates";
 import { blocked, claimLeaseIsActive, claimLeaseIsValidAndExpired, completedResponse, hasMarkerlessScoutState, hasPrepareCheckpoint, isWaitResult, json, mapCheckpointError, matchingTurnSnapshot, parseScheduledTaskGraphPipelineRequest, record, reportLeaseIsCurrent, safeCount, validId, type ScheduledTaskGraphPipelineBody, type ScheduledTaskGraphStoredExecution } from "@/lib/agent/scheduled-taskgraph-pipeline-request";
 export const maxDuration = 300;
@@ -46,6 +47,7 @@ export async function POST(request: Request): Promise<Response> {
   if (isScheduledTaskGraphPostGateAction(rawBody)) return runScheduledTaskGraphPostGateTask(rawBody, request.signal);
   const parsed = await parseScheduledTaskGraphPipelineRequest(request);
   if (!parsed) return blocked(400, "scheduled_pipeline_request_invalid");
+  if (parsed.action === "gate" && await scheduledTaskGraphGateMaterialDriftTerminalForRequest(parsed)) return blocked(409, "scheduled_prepare_material_source_changed");
   let body: ScheduledTaskGraphPipelineBody;
   if (parsed.action === "legacy") body = parsed;
   else {
@@ -66,9 +68,7 @@ export async function POST(request: Request): Promise<Response> {
     db.agentSession.findFirst({ where: { id: owner.sessionId, userId: owner.userId }, select: { id: true } }),
     db.user.findUnique({ where: { id: owner.userId }, select: { accountStatus: true } }),
   ]);
-  if (!turn || !session || turn.userId !== owner.userId || turn.sessionId !== owner.sessionId || turn.rootTaskId !== owner.rootTaskId) {
-    return blocked(409, "scheduled_pipeline_owner_mismatch");
-  }
+  if (!turn || !session || turn.userId !== owner.userId || turn.sessionId !== owner.sessionId || turn.rootTaskId !== owner.rootTaskId) return blocked(409, "scheduled_pipeline_owner_mismatch");
   const snapshot = matchingTurnSnapshot(turn.input);
   if (turn.source !== "automation" || turn.executionMode !== "canonical_task_graph" || !snapshot) {
     return blocked(409, "scheduled_pipeline_mode_mismatch");

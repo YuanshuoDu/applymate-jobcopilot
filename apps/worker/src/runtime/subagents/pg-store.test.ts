@@ -1564,7 +1564,7 @@ describe("PgSubagentTaskStore", () => {
       if (sql.includes('FROM "agent_events"') && sql.includes('"type" = \'agent.plan.scheduled_gate_binding\'')) return { rows: [{ payload: receipt }] }
       if (sql.includes('SELECT event."itemId"')) return { rows: [{ itemId: null, taskId: null, actor: "system",
         idempotencyKey: scheduledGateRegistrationReceiptKey(continuationKey, "gate-1"), payload: receipt, hasOutbox: false }] }
-      if (sql.includes('FROM "agent_executions"') && sql.includes("FOR UPDATE")) { order.push("execution"); return { rows: [{ id: "execution-1" }] } }
+      if (sql.includes('FROM "agent_executions"') && sql.includes("FOR UPDATE")) { order.push("execution"); return { rows: [{ id: "execution-1", status: "running", error: null, state: {}, attemptCount: 0 }] } }
       if (sql.includes('session."status" AS "sessionStatus"')) return { rows: [gate] }
       if (sql.includes('SELECT clock_timestamp()')) return { rows: [{ checkedAt: now }] }
       if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rowCount: 1 }

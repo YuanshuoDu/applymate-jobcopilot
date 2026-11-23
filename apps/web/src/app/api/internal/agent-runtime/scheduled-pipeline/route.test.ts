@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   question: vi.fn(), runPipeline: vi.fn(), postGateTask: vi.fn(), gateAction: vi.fn(), validatePrepareWait: vi.fn(), snapshot: vi.fn(), loadAi: vi.fn(), resolveConfig: vi.fn(), featureAllowed: vi.fn(), entitlement: vi.fn(), aiAccess: vi.fn(),
   auditCurrent: vi.fn(), auditClaim: vi.fn(), auditRace: vi.fn(), validateAuditPrepare: vi.fn(),
   sourceTerminal: vi.fn(), sourceUntrusted: vi.fn(), sourceAnalyzeResponse: vi.fn(), sourceAnalyzeError: vi.fn(), renew: vi.fn(), snapshotDigest: vi.fn(),
+  materialTerminal: vi.fn(),
 }));
 vi.mock("@/lib/db", () => ({ db: {
   agentTurn: { findFirst: mocks.turn }, subAgentTask: { findFirst: mocks.root },
@@ -23,6 +24,9 @@ vi.mock("@/lib/agent/scheduled-taskgraph-source-change-terminal", () => ({
   isAnalyzeSourceChangedError: mocks.sourceAnalyzeError,
   isScheduledTaskGraphSourceChangeTerminal: mocks.sourceTerminal, isScheduledTaskGraphAnalyzeProofUntrusted: mocks.sourceUntrusted,
   renewExpiredScheduledAnalyzeClaim: mocks.renew, respondToScheduledTaskGraphAnalyzeSourceChange: mocks.sourceAnalyzeResponse,
+}));
+vi.mock("@/lib/agent/scheduled-taskgraph-gate-material-drift", () => ({
+  scheduledTaskGraphGateMaterialDriftTerminalForRequest: mocks.materialTerminal,
 }));
 vi.mock("@/lib/agent/scheduled-taskgraph-audit-action", () => ({
   claimScheduledAuditExecution: mocks.auditClaim, scheduledAuditChildIsCurrent: mocks.auditCurrent,
@@ -162,6 +166,23 @@ function canonicalQuestion(waitId: string, answer: string | null = null, patch: 
 }
 
 describe("scheduled pipeline continuation route", () => {
+  it("returns the dedicated material-drift reason for an exact persisted Gate terminal marker", async () => {
+    const gateBody = { action: "gate", owner, attestation, prepareProof: { receipt: {} }, gateTaskId: "gate-1",
+      gateLeaseOwnerId: "gate-lease", gateAttemptCount: 2 };
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "failed", attemptCount: 6,
+      error: "scheduled_prepare_material_source_changed", state: { scheduledTaskGraphMaterialDriftTerminal: {} } });
+    mocks.materialTerminal.mockReturnValue(true);
+    const { POST } = await import("./route");
+
+    const response = await POST(request(gateBody));
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ status: "blocked", errorCode: "scheduled_prepare_material_source_changed" });
+    expect(mocks.materialTerminal).toHaveBeenCalledWith(expect.objectContaining({ gateTaskId: "gate-1",
+      gateLeaseOwnerId: "gate-lease", gateAttemptCount: 2 }));
+    expect(mocks.gateAction).not.toHaveBeenCalled();
+  }, 15_000);
+
   beforeEach(() => {
     vi.resetModules();
     Object.values(mocks).forEach(mock => mock.mockReset());
@@ -172,6 +193,7 @@ describe("scheduled pipeline continuation route", () => {
     mocks.sourceUntrusted.mockReturnValue(false);
     mocks.sourceAnalyzeError.mockReturnValue(false);
     mocks.sourceAnalyzeResponse.mockResolvedValue(Response.json({ status: "blocked", errorCode: "scheduled_pipeline_claim_conflict" }, { status: 409 }));
+    mocks.materialTerminal.mockReturnValue(false);
     mocks.renew.mockImplementation((input: { state: Record<string, unknown>; claimToken: string }) => {
       const oldClaim = input.state.scheduledTaskGraphClaim as Record<string, unknown>;
       const now = new Date();
