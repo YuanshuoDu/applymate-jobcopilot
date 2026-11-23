@@ -35,6 +35,63 @@ describe("recovery scanner queue delivery", () => {
     expect(client.release).toHaveBeenCalledTimes(2)
   })
 
+  it("skips a stale captured payload and generation, then delivers the refreshed wakeup generation", async () => {
+    const calls: Array<[string, unknown[]?]> = []
+    const stalePayload = { turnId: "turn-race", sessionId: "session-race", ownerId: "web:turn-race" }
+    const refreshedPayload = { turnId: "turn-race", sessionId: "session-race", ownerId: "wakeup:event-race" }
+    const row = { id: "dispatch-race", aggregateId: "session-race", payload: stalePayload, attemptCount: 4,
+      publishedAt: null as Date | null }
+    let refreshBeforeSecondAdmission = true
+    const client = {
+      query: vi.fn(async (sql: string, params?: unknown[]) => {
+        calls.push([sql, params])
+        if (sql.includes('SELECT dispatch."id", dispatch."aggregateId"')) {
+          return { rows: row.publishedAt === null ? [{ ...row }] : [], rowCount: row.publishedAt === null ? 1 : 0 }
+        }
+        if (sql.includes('SELECT session."id"')) {
+          if (refreshBeforeSecondAdmission) {
+            row.payload = refreshedPayload
+            row.attemptCount += 1
+            refreshBeforeSecondAdmission = false
+          }
+          return { rows: [{ id: row.aggregateId }], rowCount: 1 }
+        }
+        if (sql.includes('SELECT dispatch."id" FROM "agent_outbox"')) {
+          const matchesSnapshot = JSON.stringify(row.payload) === params?.[3]
+            && row.attemptCount === params?.[4] && row.publishedAt === null
+          return { rows: matchesSnapshot ? [{ id: row.id }] : [], rowCount: matchesSnapshot ? 1 : 0 }
+        }
+        if (sql.includes('FROM "agent_turns" AS turn')) {
+          return { rows: [{ id: "turn-race", source: "user", executionMode: null }], rowCount: 1 }
+        }
+        if (sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP')) {
+          row.publishedAt = new Date("2026-11-23T10:00:00.000Z")
+          row.attemptCount += 1
+          return { rows: [], rowCount: 1 }
+        }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const pool = { connect: vi.fn().mockResolvedValue(client) } as unknown as LeasePool
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+
+    await expect(dispatchPendingTurnOutbox(pool, queue, 1)).resolves.toBe(0)
+
+    expect(queue.add).not.toHaveBeenCalled()
+    expect(row).toMatchObject({ payload: refreshedPayload, attemptCount: 5, publishedAt: null })
+    expect(calls.some(([sql]) => sql.includes('dispatch."payload" = $4::jsonb AND dispatch."attemptCount" = $5'))).toBe(true)
+
+    await expect(dispatchPendingTurnOutbox(pool, queue, 1)).resolves.toBe(1)
+
+    expect(queue.add).toHaveBeenCalledOnce()
+    expect(queue.add).toHaveBeenCalledWith("turn", refreshedPayload, {
+      jobId: turnJobId("turn-race", 5), attempts: 5,
+    })
+    expect(row.attemptCount).toBe(6)
+    expect(row.publishedAt).toEqual(new Date("2026-11-23T10:00:00.000Z"))
+  })
+
   it("does not let older safely held automation rows starve a later canonical dispatch", async () => {
     const heldRows = [
       { id: "unresolved-dispatch", aggregateId: "session-1", payload: { turnId: "turn-unresolved", sessionId: "session-1", ownerId: "agent-run:turn-unresolved" }, attemptCount: 0, publishedAt: null as Date | null },

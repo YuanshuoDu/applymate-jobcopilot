@@ -77,8 +77,9 @@ export async function dispatchPendingTurnOutbox(
           `SELECT dispatch."id" FROM "agent_outbox" AS dispatch
            WHERE dispatch."id" = $1 AND dispatch."aggregateId" = $2
              AND dispatch."topic" = $3 AND dispatch."publishedAt" IS NULL
+             AND dispatch."payload" = $4::jsonb AND dispatch."attemptCount" = $5
            FOR UPDATE`,
-          [row.id, sessionId, TURN_DISPATCH_TOPIC],
+          [row.id, sessionId, TURN_DISPATCH_TOPIC, JSON.stringify(row.payload), row.attemptCount ?? 0],
         )
         if (!pending.rows[0]) return "skipped"
         const lineageMismatch = (row.aggregateId !== undefined && row.aggregateId !== payload.sessionId) || sessionId !== payload.sessionId

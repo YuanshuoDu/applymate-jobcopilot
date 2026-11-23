@@ -600,6 +600,38 @@ describe("reviewed source turn diagnostics", () => {
 })
 
 describe("Stage8 terminal diagnostics", () => {
+  it("summarizes exact wakeup and dispatch outbox state without exposing identities", () => {
+    const sessionId = "private-session-id", turnId = "private-turn-id", approvalId = "private-approval-id"
+    const eventId = "private-wakeup-event-id"
+    const waitItemId = `agent-wait:approval:${approvalId}`
+    const wakeup = {
+      aggregateId: sessionId, idempotencyKey: `agent-event:${eventId}`, publishedAt: new Date(), attemptCount: 1, lastError: null,
+      payload: { eventId, sessionId, turnId, itemId: waitItemId, taskId: null, sequence: "17", type: "turn.wakeup",
+        actor: "user", correlationId: turnId, causationId: "private-resolved-event-id",
+        idempotencyKey: "private-command-key:wakeup", payload: { waitKind: "approval", waitId: approvalId, itemId: waitItemId,
+          turnId, toolCallId: "private-tool-call-id", status: "approved", nextTurnRevision: 6, answerAvailable: false } },
+    }
+    const dispatch = { aggregateId: sessionId, idempotencyKey: `turn-dispatch:${turnId}`, publishedAt: new Date(),
+      attemptCount: 3, lastError: null, payload: { ownerId: `wakeup:${eventId}`, sessionId, turnId } }
+    const summary = stage8WakeDispatchSummary({ dispatchRows: [dispatch], wakeupRows: [wakeup],
+      expectedSessionId: sessionId, expectedTurnId: turnId, expectedApprovalId: approvalId })
+
+    expect(summary).toEqual({
+      dispatch: { rows: "one", payloadMatches: true, ownerKind: "wakeup_exact", ownerMatchesWakeup: true,
+        published: true, attempts: "multiple", lastError: "none" },
+      wakeup: { rows: "one", receiptMatches: true, published: true, lastError: "none" },
+    })
+    expect(JSON.stringify(summary)).not.toMatch(/private|session-id|turn-id|approval-id|event-id|tool-call|command-key/)
+
+    const changed = stage8WakeDispatchSummary({ dispatchRows: [{ ...dispatch,
+      payload: { ...dispatch.payload, ownerId: "private-foreign-owner", privateField: "private" }, lastError: "PRIVATE_DATABASE_DETAIL" }],
+      wakeupRows: [{ ...wakeup, lastError: "PRIVATE_DATABASE_DETAIL" }],
+      expectedSessionId: sessionId, expectedTurnId: turnId, expectedApprovalId: approvalId })
+    expect(changed).toMatchObject({ dispatch: { payloadMatches: false, ownerKind: "invalid", ownerMatchesWakeup: false, lastError: "other" },
+      wakeup: { receiptMatches: true, lastError: "other" } })
+    expect(JSON.stringify(changed)).not.toMatch(/private|PRIVATE_DATABASE_DETAIL|foreign-owner/)
+  })
+
   it("preserves only known post-Stop checkpoints", () => {
     expect(reviewedFillDiagnosticValue("submission_uncertain", REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS)).toBe("submission_uncertain")
     expect(reviewedFillDiagnosticValue("user_takeover", REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS)).toBe("user_takeover")
@@ -1932,8 +1964,19 @@ type Stage8FailureEvidence = Readonly<{
   steps: readonly { status: unknown; errorCode: unknown }[]
   tools: readonly { type: unknown; status: unknown; content: unknown }[]
   events: readonly { type: unknown }[]
+  dispatchRows?: readonly Stage8OutboxDiagnosticRow[]
+  wakeupOutboxRows?: readonly Stage8OutboxDiagnosticRow[]
   deadLetters: readonly unknown[]
   workerFailureLines: readonly string[]
+}>
+
+type Stage8OutboxDiagnosticRow = Readonly<{
+  aggregateId: unknown
+  idempotencyKey: unknown
+  payload: unknown
+  publishedAt: unknown
+  attemptCount: unknown
+  lastError: unknown
 }>
 
 function stage8FailureSummary(evidence: Stage8FailureEvidence) {
@@ -1980,10 +2023,95 @@ function stage8FailureSummary(evidence: Stage8FailureEvidence) {
       }
     }),
     events: Object.fromEntries(STAGE8_EVENT_TYPES.map(type => [type.replaceAll(".", "_"), eventTypes.has(type)])),
+    outbox: stage8WakeDispatchSummary({
+      dispatchRows: evidence.dispatchRows ?? [], wakeupRows: evidence.wakeupOutboxRows ?? [],
+      expectedSessionId: evidence.expectedSessionId, expectedTurnId: evidence.expectedTurnId,
+      expectedApprovalId: evidence.expectedApprovalId,
+    }),
     queueFailure: {
       deadLetters: stage8DeadLetterSummary(evidence.deadLetters, evidence.expectedSessionId, evidence.expectedTurnId),
       worker: { ...stage8WorkerFailureSummary(evidence.workerFailureLines, evidence.expectedTurnId),
         execution: stage8WorkerExecutionSummary(evidence.workerFailureLines) },
+    },
+  }
+}
+
+const STAGE8_OUTBOX_ERRORS = new Set([
+  "event_lineage_mismatch", "item_lineage_mismatch", "outbox_scope_mismatch", "processing_error",
+  "queue_add_failed", "schema_invalid_payload", "tool_lineage_mismatch", "turn_dispatch_lineage_mismatch",
+  "turn_revision_conflict", "wait_scope_mismatch",
+])
+
+function stage8OutboxError(value: unknown): string {
+  return value == null ? "none" : typeof value === "string" && STAGE8_OUTBOX_ERRORS.has(value) ? value : "other"
+}
+
+function stage8OutboxCount(rows: readonly unknown[]): "zero" | "one" | "multiple" {
+  return rows.length === 0 ? "zero" : rows.length === 1 ? "one" : "multiple"
+}
+
+function stage8OutboxAttempts(value: unknown): "zero" | "one" | "multiple" | "invalid" {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value === 0 ? "zero" : value === 1 ? "one" : "multiple" : "invalid"
+}
+
+function stage8WakeDispatchSummary(input: {
+  dispatchRows: readonly Stage8OutboxDiagnosticRow[]
+  wakeupRows: readonly Stage8OutboxDiagnosticRow[]
+  expectedSessionId: string
+  expectedTurnId: string
+  expectedApprovalId: string
+}) {
+  const wake = input.wakeupRows.length === 1 ? input.wakeupRows[0] : undefined
+  const wakeEnvelope = jsonRecord(wake?.payload)
+  const wakeEventId = typeof wakeEnvelope?.eventId === "string" ? wakeEnvelope.eventId : null
+  const wakePayload = jsonRecord(wakeEnvelope?.payload)
+  const expectedWaitId = `agent-wait:approval:${input.expectedApprovalId}`
+  const wakeReceiptMatches = !!wake && wake.aggregateId === input.expectedSessionId
+    && wake.idempotencyKey === `agent-event:${wakeEventId}`
+    && typeof wakeEventId === "string" && wakeEventId.length > 0
+    && JSON.stringify(Object.keys(wakeEnvelope ?? {}).sort()) === JSON.stringify([
+      "actor", "causationId", "correlationId", "eventId", "idempotencyKey", "itemId", "payload", "sequence", "sessionId", "taskId", "turnId", "type",
+    ].sort())
+    && wakeEnvelope?.sessionId === input.expectedSessionId && wakeEnvelope.turnId === input.expectedTurnId
+    && wakeEnvelope.itemId === expectedWaitId && wakeEnvelope.taskId === null && wakeEnvelope.type === "turn.wakeup"
+    && wakeEnvelope.actor === "user" && wakeEnvelope.correlationId === input.expectedTurnId
+    && typeof wakeEnvelope.sequence === "string" && /^[0-9]+$/.test(wakeEnvelope.sequence)
+    && !!wakePayload && JSON.stringify(Object.keys(wakePayload).sort()) === JSON.stringify([
+      "answerAvailable", "itemId", "nextTurnRevision", "status", "toolCallId", "turnId", "waitId", "waitKind",
+    ].sort())
+    && wakePayload.waitKind === "approval" && wakePayload.waitId === input.expectedApprovalId
+    && wakePayload.itemId === expectedWaitId && wakePayload.turnId === input.expectedTurnId
+    && wakePayload.status === "approved" && wakePayload.answerAvailable === false
+    && typeof wakePayload.toolCallId === "string" && wakePayload.toolCallId.length > 0
+    && typeof wakePayload.nextTurnRevision === "number" && Number.isSafeInteger(wakePayload.nextTurnRevision)
+    && wakePayload.nextTurnRevision > 0
+
+  const dispatch = input.dispatchRows.length === 1 ? input.dispatchRows[0] : undefined
+  const dispatchPayload = jsonRecord(dispatch?.payload)
+  const dispatchPayloadMatches = !!dispatch && dispatch.aggregateId === input.expectedSessionId
+    && dispatch.idempotencyKey === `turn-dispatch:${input.expectedTurnId}`
+    && !!dispatchPayload && JSON.stringify(Object.keys(dispatchPayload).sort()) === JSON.stringify(["ownerId", "sessionId", "turnId"])
+    && dispatchPayload.sessionId === input.expectedSessionId && dispatchPayload.turnId === input.expectedTurnId
+    && typeof dispatchPayload.ownerId === "string" && dispatchPayload.ownerId.length > 0
+  const ownerId = dispatchPayload?.ownerId
+  const ownerKind = !dispatchPayloadMatches ? "invalid" : ownerId === `wakeup:${wakeEventId}` ? "wakeup_exact"
+    : typeof ownerId === "string" && ownerId.startsWith("wakeup:") ? "wakeup_other"
+      : typeof ownerId === "string" && ownerId.startsWith("web:") ? "web"
+        : typeof ownerId === "string" && ownerId.startsWith("recovery-") ? "recovery" : "other"
+
+  return {
+    dispatch: {
+      rows: stage8OutboxCount(input.dispatchRows), payloadMatches: dispatchPayloadMatches,
+      ownerKind, ownerMatchesWakeup: wakeReceiptMatches && ownerId === `wakeup:${wakeEventId}`,
+      published: dispatch ? dispatch.publishedAt != null : null,
+      attempts: dispatch ? stage8OutboxAttempts(dispatch.attemptCount) : "invalid",
+      lastError: dispatch ? stage8OutboxError(dispatch.lastError) : "none",
+    },
+    wakeup: {
+      rows: stage8OutboxCount(input.wakeupRows), receiptMatches: wakeReceiptMatches,
+      published: wake ? wake.publishedAt != null : null,
+      lastError: wake ? stage8OutboxError(wake.lastError) : "none",
     },
   }
 }
@@ -1997,7 +2125,7 @@ async function stage8FillFailureSnapshot(prepared: Stage8FailureSnapshotScope, e
           id: prepared.fillTurnId, userId: ids.user, sessionId: prepared.sessionId, session: { userId: ids.user },
         }, select: { status: true, error: true, rootTaskId: true } }),
       ])
-      const [root, applicationTask, approval, wait, steps, tools, events, deadLetters] = await Promise.all([
+      const [root, applicationTask, approval, wait, steps, tools, events, dispatchRows, wakeupOutboxRows, deadLetters] = await Promise.all([
         typeof turn?.rootTaskId === "string" ? testDb.subAgentTask.findFirst({ where: {
           id: turn.rootTaskId, rootTaskId: turn.rootTaskId, sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
           parentTaskId: null, role: "orchestrator", taskType: "root", session: { userId: ids.user },
@@ -2023,11 +2151,20 @@ async function stage8FillFailureSnapshot(prepared: Stage8FailureSnapshotScope, e
         testDb.agentEvent.findMany({ where: {
           sessionId: prepared.sessionId, turnId: prepared.fillTurnId, type: { in: [...STAGE8_EVENT_TYPES] },
         }, orderBy: { sequence: "desc" }, take: 16, select: { type: true } }),
+        testDb.agentOutbox.findMany({ where: { aggregateId: prepared.sessionId, topic: "agent.turn.dispatch",
+          idempotencyKey: `turn-dispatch:${prepared.fillTurnId}` }, take: 2,
+          select: { aggregateId: true, idempotencyKey: true, payload: true, publishedAt: true, attemptCount: true, lastError: true } }),
+        testDb.agentOutbox.findMany({ where: { aggregateId: prepared.sessionId, topic: "agent.turn.wakeup", AND: [
+          { payload: { path: ["turnId"], equals: prepared.fillTurnId } },
+          { payload: { path: ["itemId"], equals: `agent-wait:approval:${prepared.submitApprovalId}` } },
+        ] }, orderBy: { createdAt: "desc" }, take: 2,
+        select: { aggregateId: true, idempotencyKey: true, payload: true, publishedAt: true, attemptCount: true, lastError: true } }),
         testDb.agentOutbox.findMany({ where: { topic: "agent.turn.dlq", aggregateId: prepared.fillTurnId },
           orderBy: { createdAt: "desc" }, take: 8, select: { payload: true } }),
       ])
       return stage8FailureSummary({ expectedApprovalId: prepared.submitApprovalId, expectedSessionId: prepared.sessionId,
         expectedTurnId: prepared.fillTurnId, expectedWorkerTaskId, session, turn, root, applicationTask, approval, wait, steps, tools, events,
+        dispatchRows, wakeupOutboxRows,
         deadLetters: turn ? deadLetters : [], workerFailureLines: turn ? worker?.lines ?? [] : [] })
     }, Date.now() + 1_200)
   } catch {
