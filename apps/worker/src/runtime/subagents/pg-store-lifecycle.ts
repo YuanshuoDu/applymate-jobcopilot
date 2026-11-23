@@ -129,6 +129,7 @@ export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { tas
   const evidence = node.verificationDisposition === "typed" && node.verification
     ? await verifyTaskGraphNodeEvidence(client, { scope: { ...graph.scope, taskId: input.taskId, attemptCount: input.attemptCount }, snapshot: graph.snapshot, node, structuredResult,
       ...(dependencyKeys.length && dependencyProof ? { dependencies: dependencyProof.projections, dependencyBindings: dependencyProof.bindings } : {}),
+      ...(dependencyKeys.length && dependencyProof ? { scoutJobDescriptionWitnesses: dependencyProof.jobDescriptionWitnesses } : {}),
       graphRevision: graph.expectedRevision })
     : { verified: false, report: unverifiedFailureReport(node) }
   const typedPass = node.verificationDisposition === "typed" && evidence.verified && evidence.report.status === "passed"
