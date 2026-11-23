@@ -9,6 +9,7 @@ import {
 import {
   parseFinalTaskGraphSourceManifest,
   TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2,
+  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3,
   TASK_GRAPH_SOURCE_ROLES,
   TASK_GRAPH_SOURCE_TASK_STATUSES,
   type FinalTaskGraphSource,
@@ -105,6 +106,7 @@ export function projectFinalTaskGraphSourceDetail(input: {
 
   if (!isCanonicalTaskGraphSourceManifest(input.finalItemId, manifest)) return null
   const historicalNodeIndices = manifest.schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2
+    || manifest.schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3
     ? new Set(manifest.historicalNodeIndices) : new Set<number>()
   for (const nodeIndex of historicalNodeIndices) {
     const historicalNode = snapshot.nodes[nodeIndex]

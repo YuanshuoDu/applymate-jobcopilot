@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 
 import { isCanonicalTaskGraphSourceManifestWeb, parseFinalTaskGraphSourceManifest, TASK_GRAPH_SOURCES_SCHEMA_VERSION,
-  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2 } from './final-task-graph-source-manifest'
+  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2, TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3 } from './final-task-graph-source-manifest'
 
 const key = (letter: string) => `src_${letter.repeat(43)}`
 const valid = {
@@ -44,6 +44,31 @@ describe('parseFinalTaskGraphSourceManifest', () => {
     for (const value of cases) expect(parseFinalTaskGraphSourceManifest(value)).toBeNull()
   })
 
+  it('parses v3 opaque artifact proofs with empty history and preserves the exact commitment', () => {
+    const v3 = { ...valid, schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, historicalNodeIndices: [],
+      sources: [{ ...valid.sources[0]!, role: 'writer', artifactVersionProof: `avp_${'a'.repeat(64)}` }, valid.sources[1]!] }
+    expect(parseFinalTaskGraphSourceManifest(v3)).toEqual(v3)
+    expect(JSON.stringify(parseFinalTaskGraphSourceManifest(v3))).not.toMatch(/artifactId|contentHash|sourceDigest|jobId|taskId/i)
+  })
+
+  it('accepts V3 only when at least one eligible terminal artifact proof is present', () => {
+    const v3 = { ...valid, schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, historicalNodeIndices: [1],
+      sources: [{ ...valid.sources[0]!, role: 'reviewer', artifactVersionProof: `avp_${'b'.repeat(64)}` }] }
+    const invalidSources = [
+      { ...v3.sources[0]!, role: 'scout' },
+      { ...v3.sources[0]!, taskStatus: 'failed' },
+      { ...v3.sources[0]!, resultState: 'missing', roleResultStatus: undefined },
+      { ...v3.sources[0]!, roleResultStatus: 'partial' },
+      { ...v3.sources[0]!, artifactVersionProof: 'sha256:bad' },
+      { ...v3.sources[0]!, artifactVersionProof: undefined },
+      { ...v3.sources[0]!, artifactRef: { artifactId: 'private' } },
+    ]
+    for (const source of invalidSources) expect(parseFinalTaskGraphSourceManifest({ ...v3, sources: [source] })).toBeNull()
+    const proofless = Object.fromEntries(Object.entries(v3.sources[0]!).filter(([key]) => key !== 'artifactVersionProof'))
+    expect(parseFinalTaskGraphSourceManifest({ ...v3, sources: [proofless] })).toBeNull()
+    expect(parseFinalTaskGraphSourceManifest({ ...v3, historicalNodeIndices: [0] })).toBeNull()
+  })
+
   it('rejects accessor-backed fields before invoking them', () => {
     let invoked = false
     const accessorManifest = { ...valid }
@@ -59,6 +84,12 @@ describe('parseFinalTaskGraphSourceManifest', () => {
     const accessorSource = { ...valid.sources[0]! }
     Object.defineProperty(accessorSource, 'nodeIndex', { enumerable: true, get: () => { invoked = true; return 0 } })
     expect(parseFinalTaskGraphSourceManifest({ ...valid, sources: [accessorSource] })).toBeNull()
+    expect(invoked).toBe(false)
+
+    const accessorSources = [...valid.sources]
+    Object.defineProperty(accessorSources, '0', { enumerable: true, configurable: true,
+      get: () => { invoked = true; return valid.sources[0] } })
+    expect(parseFinalTaskGraphSourceManifest({ ...valid, sources: accessorSources })).toBeNull()
     expect(invoked).toBe(false)
 
     const historicalNodeIndices = new Array(1)
@@ -109,6 +140,10 @@ describe('parseFinalTaskGraphSourceManifest', () => {
       schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2, historicalNodeIndices: [1],
       sources: valid.sources.map(source => ({ ...source, sourceKey: workerKey(source.nodeIndex) })) })!
     expect(await isCanonicalTaskGraphSourceManifestWeb(finalItemId, v2Manifest)).toBe(true)
+    const v3Manifest = parseFinalTaskGraphSourceManifest({ ...valid,
+      schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, historicalNodeIndices: [],
+      sources: [{ ...valid.sources[0]!, role: 'writer', artifactVersionProof: `avp_${'c'.repeat(64)}`, sourceKey: workerKey(0) }] })!
+    expect(await isCanonicalTaskGraphSourceManifestWeb(finalItemId, v3Manifest)).toBe(true)
     expect(await isCanonicalTaskGraphSourceManifestWeb('other-item', manifest)).toBe(false)
 
     const crypto = globalThis.crypto

@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { createHash } from 'node:crypto'
+import { finalTaskGraphArtifactProofInput } from '@jobcopilot/agent-protocol'
 
 import { canonicalTaskGraphItemId, canonicalTaskGraphSourceKey } from '@/lib/agent/session/final-task-graph-source-detail'
 
@@ -6,7 +8,7 @@ const mocks = vi.hoisted(() => {
   const tenant = { userId: null as string | null }
   return {
     tenant,
-    requireAuth: vi.fn(), sessionFindFirst: vi.fn(), finalItemFindFirst: vi.fn(), turnFindFirst: vi.fn(), graphFindMany: vi.fn(), taskFindMany: vi.fn(),
+    requireAuth: vi.fn(), sessionFindFirst: vi.fn(), finalItemFindFirst: vi.fn(), turnFindFirst: vi.fn(), graphFindMany: vi.fn(), taskFindMany: vi.fn(), artifactVersionFindMany: vi.fn(),
     runWithTenantContext: vi.fn(async (userId: string, callback: () => Promise<unknown>) => {
       tenant.userId = userId
       try { return await callback() } finally { tenant.userId = null }
@@ -22,6 +24,7 @@ vi.mock('@/lib/api-helpers', () => ({
 vi.mock('@/lib/db', () => ({ db: {
   agentSession: { findFirst: mocks.sessionFindFirst }, agentItem: { findFirst: mocks.finalItemFindFirst, findMany: mocks.graphFindMany },
   agentTurn: { findFirst: mocks.turnFindFirst }, subAgentTask: { findMany: mocks.taskFindMany },
+  agentArtifactVersion: { findMany: mocks.artifactVersionFindMany },
 } }))
 vi.mock('@/lib/db/tenant-store', () => ({ runWithTenantContext: mocks.runWithTenantContext }))
 
@@ -34,7 +37,7 @@ function request() { return new Request(`http://localhost/api/agent/sessions/${s
 describe('final TaskGraph source detail API', () => {
   beforeEach(() => {
     vi.resetModules()
-    for (const mock of [mocks.requireAuth, mocks.sessionFindFirst, mocks.finalItemFindFirst, mocks.turnFindFirst, mocks.graphFindMany, mocks.taskFindMany]) mock.mockReset()
+    for (const mock of [mocks.requireAuth, mocks.sessionFindFirst, mocks.finalItemFindFirst, mocks.turnFindFirst, mocks.graphFindMany, mocks.taskFindMany, mocks.artifactVersionFindMany]) mock.mockReset()
     mocks.runWithTenantContext.mockClear(); mocks.tenant.userId = null
     mocks.requireAuth.mockResolvedValue({ userId: 'user_1' })
     mocks.sessionFindFirst.mockResolvedValue({ id: sessionId, userId: 'user_1' })
@@ -69,6 +72,7 @@ describe('final TaskGraph source detail API', () => {
     expect(body.task).toMatchObject({ role: 'scout', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed' })
     expect(body.task.goal).toContain('[redacted]')
     expect(body.task.verification).toEqual({ status: 'unavailable' })
+    expect(mocks.artifactVersionFindMany).not.toHaveBeenCalled()
     expect(mocks.runWithTenantContext).toHaveBeenCalledWith('user_1', expect.any(Function))
     expect(mocks.sessionFindFirst).toHaveBeenCalledWith({ where: { id: sessionId, userId: 'user_1' }, select: { id: true, userId: true } })
     expect(mocks.finalItemFindFirst).toHaveBeenCalledWith(expect.objectContaining({
@@ -85,6 +89,80 @@ describe('final TaskGraph source detail API', () => {
     const serialized = JSON.stringify(body)
     for (const privateValue of ['user_1', sessionId, turnId, rootTaskId, 'child_1', canonicalTaskGraphItemId(rootTaskId), 'PRIVATE_RAW_RESULT', 'PRIVATE_FINAL_TEXT', 'alex@example.test']) {
       expect(serialized).not.toContain(privateValue)
+    }
+  })
+
+  it('returns an immutable Viewer reference only for the exact V3 Writer proof and owner-scoped version row', async () => {
+    const artifactRef = { artifactId: 'artifact_1', version: 2, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` }
+    const preimage = finalTaskGraphArtifactProofInput(sourceKey, artifactRef)
+    const artifactVersionProof = `avp_${createHash('sha256').update(preimage).digest('hex')}`
+    mocks.finalItemFindFirst.mockResolvedValueOnce({
+      id: itemId, sessionId, turnId, taskId: rootTaskId, type: 'agent_message', status: 'completed', phase: 'final_answer',
+      content: { taskGraphSources: { schemaVersion: 'agent-harness.v2.task-graph-sources.v3', graphRevision: 4, historicalNodeIndices: [], sources: [
+        { sourceKey, nodeIndex: 0, role: 'writer', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed', artifactVersionProof },
+      ] } },
+    })
+    mocks.graphFindMany.mockResolvedValueOnce([{
+      id: canonicalTaskGraphItemId(rootTaskId), sessionId, turnId, taskId: rootTaskId, type: 'task_graph', revision: 4,
+      content: { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+        { key: 'writer', templateId: 'cover_letter_writer', goal: 'Write a selected-job draft', successCriteria: ['Write'], dependsOn: [], depth: 1, taskId: 'writer_1' },
+      ] },
+    }])
+    const writer = { id: 'writer_1', sessionId, turnId, rootTaskId, parentTaskId: rootTaskId, role: 'writer', taskType: 'cover_letter_draft',
+      status: 'completed', goal: 'Write a selected-job draft', context: { selectedJobPreparation: { jobId: 'job_1' } },
+      result: { status: 'completed', structuredResult: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'writer', status: 'completed', artifactRef } } }
+    mocks.taskFindMany.mockResolvedValueOnce([
+      { id: rootTaskId, sessionId, turnId, rootTaskId, parentTaskId: null, role: 'orchestrator', taskType: 'root', status: 'completed', goal: 'Research roles', result: null },
+      writer,
+    ])
+    const version = { ...artifactRef, userId: 'user_1', sessionId, jobId: 'job_1', taskId: 'writer_1', artifactType: 'cover_letter' }
+    mocks.artifactVersionFindMany.mockResolvedValueOnce([version])
+
+    const { GET } = await import('./route')
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(body.task.artifactRef).toEqual(artifactRef)
+    expect(body.task).not.toHaveProperty('artifactVersionProof')
+    expect(mocks.artifactVersionFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { ...artifactRef, userId: 'user_1', sessionId, jobId: 'job_1', artifactType: 'cover_letter', taskId: 'writer_1' },
+      take: 2,
+    }))
+  })
+
+  it('returns generic unavailable for missing, duplicate, foreign, or wrong-job immutable version rows', async () => {
+    const artifactRef = { artifactId: 'artifact_1', version: 2, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` }
+    const preimage = finalTaskGraphArtifactProofInput(sourceKey, artifactRef)
+    const artifactVersionProof = `avp_${createHash('sha256').update(preimage).digest('hex')}`
+    const { GET } = await import('./route')
+    for (const rows of [[], [{ ...artifactRef, userId: 'other', sessionId, jobId: 'job_1', taskId: 'writer_1', artifactType: 'cover_letter' }],
+      [{ ...artifactRef, userId: 'user_1', sessionId, jobId: 'job_other', taskId: 'writer_1', artifactType: 'cover_letter' }],
+      ...Array.from({ length: 1 }, () => [
+        { ...artifactRef, userId: 'user_1', sessionId, jobId: 'job_1', taskId: 'writer_1', artifactType: 'cover_letter' },
+        { ...artifactRef, userId: 'user_1', sessionId, jobId: 'job_1', taskId: 'writer_1', artifactType: 'cover_letter' },
+      ])]) {
+      mocks.finalItemFindFirst.mockResolvedValueOnce({
+        id: itemId, sessionId, turnId, taskId: rootTaskId, type: 'agent_message', status: 'completed', phase: 'final_answer',
+        content: { taskGraphSources: { schemaVersion: 'agent-harness.v2.task-graph-sources.v3', graphRevision: 4, historicalNodeIndices: [], sources: [
+          { sourceKey, nodeIndex: 0, role: 'writer', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed', artifactVersionProof },
+        ] } },
+      })
+      mocks.graphFindMany.mockResolvedValueOnce([{
+        id: canonicalTaskGraphItemId(rootTaskId), sessionId, turnId, taskId: rootTaskId, type: 'task_graph', revision: 4,
+        content: { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+          { key: 'writer', templateId: 'cover_letter_writer', goal: 'Write', successCriteria: ['Write'], dependsOn: [], depth: 1, taskId: 'writer_1' },
+        ] },
+      }])
+      mocks.taskFindMany.mockResolvedValueOnce([
+        { id: rootTaskId, sessionId, turnId, rootTaskId, parentTaskId: null, role: 'orchestrator', taskType: 'root', status: 'completed', goal: 'Research roles', result: null },
+        { id: 'writer_1', sessionId, turnId, rootTaskId, parentTaskId: rootTaskId, role: 'writer', taskType: 'cover_letter_draft', status: 'completed',
+          context: { selectedJobPreparation: { jobId: 'job_1' } }, result: { status: 'completed', structuredResult: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'writer', status: 'completed', artifactRef } } },
+      ])
+      mocks.artifactVersionFindMany.mockResolvedValueOnce(rows)
+      const response = await GET(request() as never, params)
+      expect(response.status).toBe(404)
+      expect(await response.text()).toContain('task_graph_source_unavailable')
     }
   })
 
