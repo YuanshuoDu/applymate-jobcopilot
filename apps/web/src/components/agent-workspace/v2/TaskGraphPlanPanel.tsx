@@ -37,6 +37,11 @@ const STATUS_LABELS: Record<TaskGraphPlanStatus, TaskGraphPlanLabelKey> = {
   closed: 'agent.taskGraph.status.closed',
 }
 
+type FailedBranchReplacementDisplay = {
+  readonly reason: 'previous_branch_unverified'
+  readonly successorNodeIndexes: readonly number[]
+}
+
 export function TaskGraphPlanPanel({ sessionId, items, tasks, ledger, discoveryShortlist, selectedPreparationTurnId,
   selectionKey, onPrepareBatch, onBatchStarted }: {
   readonly sessionId: string
@@ -61,6 +66,7 @@ export function TaskGraphPlanPanel({ sessionId, items, tasks, ledger, discoveryS
     return {
       identity,
       plan: matched?.projection ?? current, verificationSummary: matched?.verificationSummary ?? null,
+      failedBranchReplacement: matched?.failedBranchReplacement ?? null,
       successCriteria: matched ? projectTaskGraphSuccessCriteria(graphItems, identity, matched.projection) : null,
     }
   }, [items, ledger, selectedPreparationTurnId, sessionId, tasks])
@@ -74,7 +80,9 @@ export function TaskGraphPlanPanel({ sessionId, items, tasks, ledger, discoveryS
   if (!view.plan && !discoveryShortlist) return null
 
   return <>
-    {view.plan && <TaskGraphPlanSection plan={view.plan} successCriteria={view.successCriteria} verificationSummary={view.verificationSummary} sessionId={sessionId} lang={lang} t={t} />}
+    {view.plan && <TaskGraphPlanSection plan={view.plan} successCriteria={view.successCriteria}
+      verificationSummary={view.verificationSummary} failedBranchReplacement={view.failedBranchReplacement}
+      sessionId={sessionId} lang={lang} t={t} />}
     <VerifiedShortlistPreparation sessionId={sessionId} identity={view.identity} lang={lang} value={discoveryShortlist} onPrepare={onPrepare} />
   </>
 }
@@ -102,20 +110,44 @@ function taskGraphSelectionKey(identity: TaskGraphIdentity | null, sessionId: st
     identity?.rootTaskId ?? null, identity?.revision ?? null])
 }
 
-function parsePlanLedgerResponse(value: unknown): { identity: TaskGraphIdentity; projection: PlanLedgerWithRepairTargetGoals; verificationSummary: TaskGraphVerificationSummaryDto | null } | null {
+function parsePlanLedgerResponse(value: unknown): {
+  identity: TaskGraphIdentity
+  projection: PlanLedgerWithRepairTargetGoals
+  verificationSummary: TaskGraphVerificationSummaryDto | null
+  failedBranchReplacement: FailedBranchReplacementDisplay | null
+} | null {
   const response = record(value)
-  const identity = response ? record(response.identity) : null
-  const keys = response ? Object.keys(response).sort().join(',') : ''
-  if (!response || !identity || keys !== 'identity,projection' && keys !== 'identity,projection,verificationSummary' || Object.keys(identity).length !== 5
+  const { verificationSummary: rawSummary, failedBranchReplacement: rawReplacement, ...base } = response ?? {}
+  const identity = record(base.identity)
+  if (!response || !identity || Object.keys(base).sort().join(',') !== 'identity,projection' || Object.keys(identity).length !== 5
     || typeof identity.sessionId !== 'string' || typeof identity.graphItemId !== 'string'
     || typeof identity.turnId !== 'string' || typeof identity.rootTaskId !== 'string'
     || ![identity.sessionId, identity.graphItemId, identity.turnId, identity.rootTaskId].every(value => value.length > 0 && value.length <= 128 && value.trim() === value)
     || !Number.isSafeInteger(identity.revision) || Number(identity.revision) < 1) return null
-  const projection = parsePlanLedgerWithRepairTargets(response.projection)
+  const projection = parsePlanLedgerWithRepairTargets(base.projection)
   if (!projection || projection.sessionId !== identity.sessionId || projection.revision !== identity.revision) return null
-  const verificationSummary = keys === 'identity,projection,verificationSummary'
-    ? parseTaskGraphVerificationSummary(response.verificationSummary, projection.nodes.length) : null
-  return { identity: identity as unknown as TaskGraphIdentity, projection, verificationSummary }
+  const verificationSummary = Object.prototype.hasOwnProperty.call(response, 'verificationSummary')
+    ? parseTaskGraphVerificationSummary(rawSummary, projection.nodes.length) : null
+  return {
+    identity: identity as unknown as TaskGraphIdentity, projection, verificationSummary,
+    failedBranchReplacement: Object.prototype.hasOwnProperty.call(response, 'failedBranchReplacement')
+      ? parseFailedBranchReplacement(rawReplacement, projection.nodes.length) : null,
+  }
+}
+
+function parseFailedBranchReplacement(value: unknown, nodeCount: number): FailedBranchReplacementDisplay | null {
+  const replacement = record(value)
+  if (!replacement || Object.keys(replacement).sort().join(',') !== 'reason,successorNodeIndexes'
+    || replacement.reason !== 'previous_branch_unverified' || !Array.isArray(replacement.successorNodeIndexes)
+    || replacement.successorNodeIndexes.length === 0 || replacement.successorNodeIndexes.length > nodeCount) return null
+  let previousIndex = -1
+  const successorNodeIndexes: number[] = []
+  for (const index of replacement.successorNodeIndexes) {
+    if (typeof index !== 'number' || !Number.isSafeInteger(index) || index < 0 || index >= nodeCount || index <= previousIndex) return null
+    successorNodeIndexes.push(index)
+    previousIndex = index
+  }
+  return { reason: 'previous_branch_unverified', successorNodeIndexes }
 }
 
 function sameTaskGraphIdentity(left: TaskGraphIdentity, right: TaskGraphIdentity | null): boolean {
@@ -127,15 +159,17 @@ function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
 
-function TaskGraphPlanSection({ plan, successCriteria, verificationSummary, sessionId, lang, t }: {
+function TaskGraphPlanSection({ plan, successCriteria, verificationSummary, failedBranchReplacement, sessionId, lang, t }: {
   readonly plan: PlanLedgerWithRepairTargetGoals
   readonly successCriteria: ReadonlyMap<string, readonly string[]> | null
   readonly verificationSummary: TaskGraphVerificationSummaryDto | null
+  readonly failedBranchReplacement: FailedBranchReplacementDisplay | null
   readonly sessionId: string
   readonly lang: Lang
   readonly t: (key: string) => string
 }) {
   const repairAttention = projectRepairAttentionSummaries(plan, verificationSummary)
+  const replacementNodeIndexes = new Set(failedBranchReplacement?.successorNodeIndexes ?? [])
   return (
     <section
       aria-label={taskGraphPlanLabel(lang, 'agent.taskGraph.currentPlan')}
@@ -147,10 +181,15 @@ function TaskGraphPlanSection({ plan, successCriteria, verificationSummary, sess
       <h3 style={headingStyle}>{taskGraphPlanLabel(lang, 'agent.taskGraph.currentPlan')}</h3>
       <div><span>{t('agent.approvalLedger.revision')}:</span> {plan.revision}</div>
       {plan.goal && <p data-agent-task-graph-goal="true" style={planGoalStyle}>{plan.goal}</p>}
+      {failedBranchReplacement && <p role="note" data-task-graph-failed-branch-replacement="true">{taskGraphPlanLabel(lang, 'agent.taskGraph.failedBranchReplacement.reason')}</p>}
       <ol style={listStyle}>
         {plan.nodes.map((node, index) => (
-          <li key={node.key} style={nodeStyle}>
+          <li key={node.key} style={replacementNodeIndexes.has(index) ? replacementNodeStyle : nodeStyle}
+            data-task-graph-replacement-successor={replacementNodeIndexes.has(index) ? 'true' : undefined}>
             <strong style={goalStyle}>{node.goal}</strong>
+            {replacementNodeIndexes.has(index) && <span data-task-graph-replacement-label="true" style={replacementLabelStyle}>
+              {taskGraphPlanLabel(lang, 'agent.taskGraph.failedBranchReplacement.successor')}
+            </span>}
             {node.repairTargetGoal && <div data-task-graph-repair-target="true">{taskGraphPlanLabel(lang, 'agent.taskGraph.repairAttemptFor')} {node.repairTargetGoal}</div>}
             {repairAttention[index] && <div data-task-graph-repair-attention="true"><strong>{taskGraphPlanLabel(lang, 'agent.taskGraph.repairChecksNeedingAttention')}</strong><TaskGraphVerificationSummary node={repairAttention[index]} lang={lang} /></div>}
             {verificationSummary && <TaskGraphVerificationSummary node={verificationSummary.nodes[index]} lang={lang} />}
@@ -203,6 +242,8 @@ const headingStyle: React.CSSProperties = { margin: 0, color: 'var(--text)', fon
 const planGoalStyle: React.CSSProperties = { margin: 0, color: 'var(--text)', fontSize: 11, fontWeight: 650, overflowWrap: 'anywhere' }
 const listStyle: React.CSSProperties = { display: 'grid', gap: 8, margin: 0, paddingLeft: 18 }
 const nodeStyle: React.CSSProperties = { display: 'grid', gap: 3, minWidth: 0, overflowWrap: 'anywhere' }
+const replacementNodeStyle: React.CSSProperties = { ...nodeStyle, borderLeft: '3px solid var(--primary)', paddingLeft: 6 }
+const replacementLabelStyle: React.CSSProperties = { justifySelf: 'start', borderRadius: 999, padding: '1px 6px', background: 'rgba(var(--primary-rgb, 79,70,229), 0.08)', color: 'var(--primary)', fontSize: 9, fontWeight: 650 }
 const goalStyle: React.CSSProperties = { color: 'var(--text)', fontSize: 11 }
 const dependencyListStyle: React.CSSProperties = { display: 'grid', gap: 2, margin: '3px 0 0', paddingLeft: 16 }
 const evidenceStyle: React.CSSProperties = { display: 'grid', gap: 2, borderLeft: '2px solid var(--border)', paddingLeft: 6, overflowWrap: 'anywhere' }
