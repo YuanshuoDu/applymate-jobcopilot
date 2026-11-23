@@ -983,10 +983,12 @@ describe("apply-queue (unit — mocked)", () => {
     vi.useFakeTimers();
     const intervalSpy = vi.spyOn(globalThis, "setInterval").mockReturnValue({ unref: vi.fn() } as unknown as ReturnType<typeof setInterval>);
     let processor: Promise<unknown> | null = null;
+    let observationDeadlineMs = 0;
     let observationDeadlineAdvanced = false;
     try {
       await import("./apply-queue.js");
       const { SUBMISSION_START_OBSERVATION_TIMEOUT_MS } = await import("./apply-job-finalization.js");
+      observationDeadlineMs = SUBMISSION_START_OBSERVATION_TIMEOUT_MS;
       processor = Promise.resolve(mockProcessor({
         data: {
           applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1", sessionId: "agent-session-1", fillTurnId: "agent-turn-1",
@@ -995,12 +997,12 @@ describe("apply-queue (unit — mocked)", () => {
         },
       }));
       await popupRequestsBlocked;
-      await vi.advanceTimersByTimeAsync(SUBMISSION_START_OBSERVATION_TIMEOUT_MS);
+      await vi.advanceTimersByTimeAsync(observationDeadlineMs);
       observationDeadlineAdvanced = true;
       await processor;
     } finally {
       if (processor) {
-        if (!observationDeadlineAdvanced) await vi.advanceTimersByTimeAsync(SUBMISSION_START_OBSERVATION_TIMEOUT_MS);
+        if (!observationDeadlineAdvanced) await vi.advanceTimersByTimeAsync(observationDeadlineMs);
         await processor.catch(() => undefined);
       }
       intervalSpy.mockRestore();

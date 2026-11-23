@@ -2436,15 +2436,25 @@ async function waitForStage8StopBlockingPid(workerPid: number, timeoutMs = 5_000
   throw new Error("stage8_stop_did_not_wait_on_exact_worker_fence")
 }
 
-async function waitForStage8JobSettled(workerTaskId: string, timeoutMs = 30_000): Promise<string> {
+async function waitForStage8JobSettled(
+  prepared: Stage8PreparedScenario,
+  intent: Stage8SubmitIntent,
+  timeoutMs = 30_000,
+): Promise<string> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
-    const job = await applyQueue?.getJob(workerTaskId)
+    const job = await applyQueue?.getJob(intent.workerTaskId)
     const state = await job?.getState()
     if (state === "completed" || state === "failed") return state
     await delay(100)
   }
-  throw new Error("stage8_submit_worker_did_not_settle")
+  const [database, queue] = await Promise.all([
+    stage8FillFailureSnapshot(prepared, intent.workerTaskId),
+    stage8ApplyQueueState(intent.workerTaskId),
+  ])
+  throw new Error("stage8_submit_worker_did_not_settle:" + JSON.stringify({
+    database, queue, requestFence: stage8RequestFenceSummary(worker?.lines ?? []),
+  }))
 }
 
 describeWithServices("ApplicationTask production full-loop PostgreSQL integration", () => {
@@ -3315,7 +3325,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(await readStage8Protocol(stopFirst, firstIntent)).toEqual(["armed", "stop_requested"])
 
       worker.stdin?.write("stage8-release-arm\n")
-      expect(await waitForStage8JobSettled(firstIntent.workerTaskId)).toBe("completed")
+      expect(await waitForStage8JobSettled(stopFirst, firstIntent)).toBe("completed")
       expect(worker.lines.some(line => line === `STAGE8_FINAL_FENCE_READY ${firstIntent.workerTaskId}`)).toBe(false)
       const afterStopFirst = await requestFixtureStats()
       expect(afterStopFirst.reviewedSubmitCount).toBe(before.reviewedSubmitCount)
@@ -3387,7 +3397,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         releasedStats = await requestFixtureStats()
       }
       expect(releasedStats.reviewedHeldSubmitCount).toBe(before.reviewedHeldSubmitCount)
-      await waitForStage8JobSettled(secondIntent.workerTaskId, 30_000)
+      await waitForStage8JobSettled(grantFirst, secondIntent, 30_000)
     } finally {
       site?.stdin?.write("release-held\n")
     }
