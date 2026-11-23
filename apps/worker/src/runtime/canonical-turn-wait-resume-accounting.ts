@@ -3,6 +3,7 @@ import type { TurnResumeState } from "./turns/turn-engine-types.js"
 import type { TaskGraphDenialProgress } from "./turns/turn-execution-types.js"
 import type { RecoveredArchivedWaitControl } from "./turns/turn-execution-wait.js"
 import { isTaskGraphDenialProgressValid } from "./turns/task-graph-denial-progress.js"
+import { restorePlanSchemaRepair } from "./canonical-turn-plan-schema-repair-proof.js"
 
 type Row = Record<string, unknown>
 type Usage = { inputTokens: number; outputTokens: number; estimatedCostUsd: number }
@@ -183,7 +184,11 @@ export function buildCanonicalTurnResumeState(input: {
   readonly taskGraphDenialProgress?: TaskGraphDenialProgress
 }): TurnResumeState | undefined {
   const evidenceRecoveryUsed = finalEvidenceRecoveryUsed(input.events, input.steps, input.scope)
-  if (!input.last && input.maxOrdinal === null) return undefined
+  const planSchemaRepair = restorePlanSchemaRepair({ steps: input.steps, items: input.items, events: input.events, scope: input.scope })
+  if (!input.last && input.maxOrdinal === null) {
+    if (planSchemaRepair) throw new Error("plan_schema_repair_proof_invalid")
+    return undefined
+  }
   const usage = input.steps.reduce<Usage>((total, step) => ({
     inputTokens: total.inputTokens + Number(step.inputTokens ?? 0), outputTokens: total.outputTokens + Number(step.outputTokens ?? 0),
     estimatedCostUsd: total.estimatedCostUsd + Number(step.estimatedCostUsd ?? 0),
@@ -215,6 +220,7 @@ export function buildCanonicalTurnResumeState(input: {
     nextOrdinal: (input.maxOrdinal ?? Number(input.last?.ordinal)) + 1, stepCount: input.steps.length, toolCallCount,
     ...(evidenceRecoveryUsed ? { finalEvidenceRecoveryUsed: true } : {}),
     ...(taskGraphDenialProgress ? { taskGraphDenialProgress } : {}),
+    ...(planSchemaRepair ? { planSchemaRepair } : {}),
     inputThroughSequence: BigInt(String(input.last?.inputThroughSequence ?? 0)),
     consumedInputIds: Array.isArray(input.last?.consumedInputIds) ? input.last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
     usage,

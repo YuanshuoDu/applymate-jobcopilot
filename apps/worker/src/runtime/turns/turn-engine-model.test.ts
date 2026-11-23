@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { Type } from "@sinclair/typebox"
 import type { ModelAdapter, ModelResponse } from "@jobcopilot/agent-model"
 
 import { runModelStep } from "./turn-engine-model.js"
@@ -14,6 +15,7 @@ const request = {
   signal: new AbortController().signal,
   metadata: { sessionId: "s", turnId: "t", stepId: "step", taskId: "task" },
 }
+const planTool = { name: "agent.plan", inputSchema: Type.Object({ valid: Type.Boolean() }, { additionalProperties: false }) }
 
 function profile(nativeTools: boolean) {
   return {
@@ -101,6 +103,85 @@ describe("TurnEngine model step normalization", () => {
       },
     }
     await expect(runModelStep(missingValidator, request)).rejects.toMatchObject({ code: "invalid_output", message: "A tool arguments validator is required before execution" })
+  })
+
+  it("returns a closed rejection only for a completed lone registered Root agent.plan call", async () => {
+    const secret = "must-not-escape-invalid-plan-arguments"
+    const adapter: ModelAdapter = {
+      id: "fixture-native-plan-schema-rejection", profile: profile(true), async *stream() {
+        yield { type: "text_delta", text: secret }
+        yield { type: "reasoning_summary_delta", text: secret }
+        yield { type: "tool_call_completed", callId: "call-plan", name: "agent.plan", arguments: { secret } }
+        yield { type: "usage", inputTokens: 17, outputTokens: 9, estimatedCostUsd: 0.012 }
+        yield { type: "continuation", continuation: { cursor: "private-cursor" } }
+        yield { type: "completed", finishReason: "tool_calls" }
+      },
+    }
+    const result = await runModelStep(adapter, { ...request, tools: [planTool] }, () => "schema rejected", { classifyRootPlanSchemaRejection: true })
+
+    expect(result).toEqual({
+      text: "", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "tool_calls",
+      usage: { inputTokens: 17, outputTokens: 9, estimatedCostUsd: 0.012 }, continuation: null, planSchemaRejection: "invalid_arguments",
+    })
+    expect(JSON.stringify(result)).not.toContain(secret)
+    expect(JSON.stringify(result)).not.toContain("private-cursor")
+  })
+
+  it.each([
+    { label: "an unregistered plan tool", tools: [] as readonly unknown[], callName: "agent.plan", events: [{ type: "tool_call_completed", callId: "call", name: "agent.plan", arguments: {} }, { type: "completed", finishReason: "tool_calls" }] },
+    { label: "ambiguous plan registrations", tools: [planTool, planTool], callName: "agent.plan", events: [{ type: "tool_call_completed", callId: "call", name: "agent.plan", arguments: {} }, { type: "completed", finishReason: "tool_calls" }] },
+    { label: "an unsupported non-TypeBox schema", tools: [{ name: "agent.plan", inputSchema: { type: "object", additionalProperties: false } }], callName: "agent.plan", events: [{ type: "tool_call_completed", callId: "call", name: "agent.plan", arguments: {} }, { type: "completed", finishReason: "tool_calls" }] },
+    { label: "a different invalid tool", tools: [planTool], callName: "jobs.search", events: [{ type: "tool_call_completed", callId: "call", name: "jobs.search", arguments: {} }, { type: "completed", finishReason: "tool_calls" }] },
+    { label: "multiple calls after a rejected plan", tools: [planTool, { name: "jobs.search" }], callName: "agent.plan", events: [{ type: "tool_call_completed", callId: "first", name: "agent.plan", arguments: {} }, { type: "tool_call_completed", callId: "second", name: "jobs.search", arguments: {} }, { type: "completed", finishReason: "tool_calls" }] },
+    { label: "an incomplete second streamed call", tools: [planTool, { name: "jobs.search" }], callName: "agent.plan", events: [{ type: "tool_call_started", callId: "pending", name: "jobs.search" }, { type: "tool_call_completed", callId: "plan", name: "agent.plan", arguments: {} }, { type: "completed", finishReason: "tool_calls" }] },
+  ] as const)("does not repair $label", async ({ tools, events }) => {
+    const adapter: ModelAdapter = { id: "fixture-native-plan-negative", profile: profile(true), async *stream() { yield* events } }
+    await expect(runModelStep(adapter, { ...request, tools }, () => "schema_error", { classifyRootPlanSchemaRejection: true }))
+      .rejects.toMatchObject({ code: "invalid_output" })
+  })
+
+  it.each([
+    { label: "a tenant scope guard rejection for schema-valid arguments", arguments: { valid: true }, validation: "Tenant userId must be supplied by runtime scope" },
+    { label: "a nested tenant override even when the schema also rejects", arguments: { nested: { userId: "foreign-user" } }, validation: "Tenant userId must be supplied by runtime scope" },
+  ])("does not repair $label", async ({ arguments: input, validation }) => {
+    const adapter: ModelAdapter = { id: "fixture-native-plan-scope-rejection", profile: profile(true), async *stream() {
+      yield { type: "tool_call_completed", callId: "call-plan", name: "agent.plan", arguments: input }
+      yield { type: "completed", finishReason: "tool_calls" }
+    } }
+    await expect(runModelStep(adapter, { ...request, tools: [planTool] }, () => validation, { classifyRootPlanSchemaRejection: true }))
+      .rejects.toMatchObject({ code: "invalid_output", message: validation })
+  })
+
+  it("does not repair invalid structured output, an incomplete stream, or a transport failure", async () => {
+    const structured: ModelAdapter = {
+      id: "fixture-structured-invalid-plan", profile: profile(false), async *stream() { yield { type: "completed", finishReason: "stop" } },
+      complete: async (): Promise<ModelResponse> => ({ schemaVersion: "agent-harness.v2", provider: "fixture", model: "fixture-model", finishReason: "stop", toolCalls: [], usage: null, continuationCursor: null,
+        text: JSON.stringify({ schemaVersion: "agent-harness.v2", kind: "call_tool", callId: "call-plan", tool: "agent.plan", arguments: {} }) }),
+    }
+    await expect(runModelStep(structured, { ...request, tools: [planTool], capabilities: { ...request.capabilities, nativeTools: false } },
+      () => "schema_error", { classifyRootPlanSchemaRejection: true })).rejects.toThrow()
+
+    const incomplete: ModelAdapter = { id: "fixture-incomplete-plan", profile: profile(true), async *stream() {
+      yield { type: "tool_call_completed", callId: "call-plan", name: "agent.plan", arguments: {} }
+    } }
+    await expect(runModelStep(incomplete, { ...request, tools: [planTool] }, () => "schema_error", { classifyRootPlanSchemaRejection: true }))
+      .rejects.toMatchObject({ code: "invalid_output", message: "Model stream completed without a finish reason" })
+
+    const transport: ModelAdapter = { id: "fixture-transport-plan", profile: profile(true), async *stream() {
+      yield { type: "tool_call_completed", callId: "call-plan", name: "agent.plan", arguments: {} }
+      throw new Error("provider transport failed")
+    } }
+    await expect(runModelStep(transport, { ...request, tools: [planTool] }, () => "schema_error", { classifyRootPlanSchemaRejection: true }))
+      .rejects.toThrow("provider transport failed")
+  })
+
+  it("does not classify a rejected plan with a normal stop finish as a repairable response", async () => {
+    const adapter: ModelAdapter = { id: "fixture-native-invalid-plan-stop", profile: profile(true), async *stream() {
+      yield { type: "tool_call_completed", callId: "call-plan", name: "agent.plan", arguments: {} }
+      yield { type: "completed", finishReason: "stop" }
+    } }
+    await expect(runModelStep(adapter, { ...request, tools: [planTool] }, () => "schema_error", { classifyRootPlanSchemaRejection: true }))
+      .rejects.toMatchObject({ code: "invalid_output", message: "Model stream returned tool calls with a non-tool completion" })
   })
 
   it("fails closed when structured output reports a non-success finish", async () => {
