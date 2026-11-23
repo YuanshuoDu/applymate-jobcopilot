@@ -6,6 +6,8 @@ import type { SubagentTaskStatus } from "./types.js"
 import { validateTaskGraphFollowUpBinding } from "./task-graph-follow-up-validation.js"
 import { hasSelectedJobBatchMembers, readBoundSelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
 import type { SelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
+import { buildFinalExecutionFailureOutcomes, readFinalExecutionFailureOutcomes } from "./task-graph-final-failure-outcomes.js"
+import type { TaskGraphExecutionFailureCategory } from "./task-graph-failure-category.js"
 
 export const TASK_GRAPH_FINAL_SUMMARY_BINDING: unique symbol = Symbol("task_graph_final_summary_binding")
 
@@ -28,6 +30,7 @@ export type TaskGraphFinalSummaryBinding = Readonly<{
   graphRevision: number
   members?: readonly TaskGraphFinalSummaryMember[]
   resolvedRepairTaskIds?: readonly string[]
+  executionFailureOutcomes?: readonly Readonly<{ taskId: string; category: TaskGraphExecutionFailureCategory }>[]
   selectedJobBatchFinalOutcome?: SelectedJobBatchFinalOutcome
   summary: TaskGraphFinalSummary
 }>
@@ -89,8 +92,10 @@ export function buildTaskGraphFinalSummaryBinding(
   const graphRevision = loaded.item.revision
   const summary = reduceTaskGraphFinalSummary({ graphRevision, nodes })
   const resolved = normalizeResolvedRepairTaskIds(resolvedRepairTaskIds, boundMembers, summary)
+  const failureOutcomes = buildFinalExecutionFailureOutcomes(loaded, boundMembers, summary)
   return { rootTaskId: loaded.rootTaskId, graphItemId: loaded.item.id, graphRevision, members: boundMembers,
-    ...(resolved ? { resolvedRepairTaskIds: resolved } : {}), summary }
+    ...(resolved ? { resolvedRepairTaskIds: resolved } : {}),
+    ...(failureOutcomes ? { executionFailureOutcomes: failureOutcomes } : {}), summary }
 }
 
 /** Reads only bounded failed business members confirmed by this private binding. */
@@ -98,7 +103,10 @@ export function readResolvedRepairTaskIds(value: unknown): ReadonlySet<string> {
   try {
     const binding = record(value)
     if (!binding || !Object.hasOwn(binding, "resolvedRepairTaskIds")) return new Set()
-    const { resolvedRepairTaskIds: ids, ...legacyBinding } = binding
+    const ids = binding.resolvedRepairTaskIds
+    const legacyBinding = { ...binding }
+    delete legacyBinding.resolvedRepairTaskIds
+    delete legacyBinding.executionFailureOutcomes
     const facts = validateTaskGraphFollowUpBinding(legacyBinding), rows = dense(ids, TASK_GRAPH_LIMITS.maxPersistedNodes)
     if (!facts || !rows?.length) return new Set()
     const result = new Set<string>()
@@ -118,6 +126,8 @@ export function sameTaskGraphFinalSummaryBinding(
 ): boolean {
   try {
     if (!left || !right) return false
+    if (JSON.stringify([...readFinalExecutionFailureOutcomes(left)])
+      !== JSON.stringify([...readFinalExecutionFailureOutcomes(right)])) return false
     const leftHasBatch = hasSelectedJobBatchMembers(left), rightHasBatch = hasSelectedJobBatchMembers(right)
     if (leftHasBatch !== rightHasBatch) return false
     const leftBatch = left.selectedJobBatchFinalOutcome, rightBatch = right.selectedJobBatchFinalOutcome
