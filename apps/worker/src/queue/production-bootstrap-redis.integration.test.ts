@@ -311,7 +311,7 @@ describeWithRedis("production Turn dispatch and consumer (real Redis/BullMQ)", (
         executions.push({ turnId: lease.turnId, sessionId: lease.sessionId, userId: lease.userId, ownerId: lease.ownerId, leaseVersion: lease.leaseVersion })
         return { status: "completed" as const }
       },
-      manager: { interruptForTurn: async () => undefined, shutdown: async () => undefined },
+      manager: { shutdown: async () => undefined },
       childExecutionEnabled: false,
       coordinationEnabled: false,
       close: async () => undefined,

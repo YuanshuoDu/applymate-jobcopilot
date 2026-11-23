@@ -2,6 +2,7 @@
 
 import React, { useReducer, useRef, type FormEvent } from 'react'
 import { ObjectiveReplacementCommandError, replaceAgentObjective } from './agent-objective-replacement-command'
+import { AgentLocationScopeControl } from './AgentLocationScopeControl'
 import type { TurnComposerController } from './agent-turn-commands'
 import { useI18n } from '@/lib/i18n'
 
@@ -114,10 +115,10 @@ function ActiveTurnSession({ controller }: { controller: TurnComposerController 
     })
   }
 
-  if (!controller.activeTurn && !controller.messages.length && !controller.commandError && !replacement.open) return null
-
+  const showSessionArea = Boolean(controller.activeTurn || controller.messages.length || controller.commandError || replacement.open)
   return (
-    <div data-testid="active-turn-composer" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginBottom: 8, padding: '8px 10px', borderRadius: 8, background: 'rgba(79,70,229,0.05)', border: '1px solid rgba(79,70,229,0.14)', color: 'var(--text)', fontSize: 11 }}>
+    <>
+    {showSessionArea && <div data-testid="active-turn-composer" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginBottom: 8, padding: '8px 10px', borderRadius: 8, background: 'rgba(79,70,229,0.05)', border: '1px solid rgba(79,70,229,0.14)', color: 'var(--text)', fontSize: 11 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
         <span>{controller.activeTurn ? t(`agent.runStatus.${controller.activeTurn.status}`) : t('agent.messageStatus')}</span>
         {controller.activeTurn && (
@@ -186,7 +187,11 @@ function ActiveTurnSession({ controller }: { controller: TurnComposerController 
           ))}
         </div>
       )}
-    </div>
+    </div>}
+    <AgentLocationScopeControl sessionId={controller.sessionId} activeTurn={controller.activeTurn}
+      sessionStatus={controller.sessionStatus} turnStateReadiness={controller.turnStateReadiness}
+      onAccepted={() => controller.refresh?.()} />
+    </>
   )
 }
 

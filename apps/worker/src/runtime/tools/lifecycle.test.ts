@@ -8,7 +8,9 @@ import type { ExecutionOwner } from "../execution-owner.js"
 import { InMemoryToolLifecycleSink, ToolLifecycle, type LifecycleCall } from "./lifecycle.js"
 import { createToolResultReferenceRepository } from "./tool-result-reference-repo.js"
 import { redactJobReadOutput } from "./job-read-output-redaction.js"
+import { prepareScoutResultsOutput } from "./scout-results-output-redaction.js"
 import { InMemoryToolResultReferenceStore, prepareLifecycleValue } from "./redaction.js"
+import { markScoutDelegateOutput } from "./scout-delegate-output-redaction.js"
 import { createToolResultsReadTool } from "./tool-results-read-tool.js"
 import { ToolRegistry } from "./registry.js"
 import { ToolRouter } from "./router.js"
@@ -23,6 +25,8 @@ import { SCHEDULED_APPLICATION_PREPARE_OUTPUT_SCHEMA } from "./scheduled-applica
 const call: LifecycleCall = { id: "call-1", toolName: "jobs.search", toolVersion: "1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1" }
 const ordinaryCall: LifecycleCall = { ...call, toolName: "notes.read" }
 const planCall: LifecycleCall = { ...call, toolName: "agent.plan" }
+const numericDelegateTaskId = "subagent-00000000-0000-4000-8000-000000000002"
+const scoutDelegateCall: LifecycleCall = { ...call, id: "delegate-call", toolName: "scout.delegate", taskId: "parent-1", rootTaskId: "root-1" }
 const prepareTaskId = "subagent-abcdefab-cdef-4abc-8def-abcdefabcdef"
 const scheduledPrepareSummary = {
   schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: prepareTaskId, attemptCount: 2,
@@ -211,6 +215,57 @@ function durableLifecyclePool(sourceCallId: string) {
 }
 
 describe("ToolLifecycle", () => {
+  it("returns and records only verified nested Scout candidate Job IDs", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const scoutResultsCall: LifecycleCall = { ...call, toolName: "scout.results", taskId: "parent-1", rootTaskId: "root-1" }
+    const raw = { availability: "available", children: [{ taskId: "child-1", status: "completed",
+      candidates: [{ jobId: numericUuidV4, source: "greenhouse" }] }] }
+    const expected = prepareScoutResultsOutput(raw)
+    const returned = await lifecycle.completed(scoutResultsCall, raw)
+    expect(expected).not.toBeNull()
+    expect(returned).toEqual(expected)
+    expect(returned).toMatchObject({ children: [{ candidates: [{ jobId: numericUuidV4 }] }] })
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output: returned })
+    expect(sink.events[0]?.payload.output).toEqual(returned)
+  })
+
+  it("keeps malformed Scout results on generic redaction", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const scoutResultsCall: LifecycleCall = { ...call, toolName: "scout.results", taskId: "parent-1", rootTaskId: "root-1" }
+    const raw = { availability: "available", children: [{ taskId: "child-1", status: "completed",
+      candidates: [{ jobId: numericUuidV4, source: "greenhouse" }] }], unverified: numericUuidV4 }
+    expect(prepareScoutResultsOutput(raw)).toBeNull()
+    const returned = await lifecycle.completed(scoutResultsCall, raw)
+    expect(returned).toEqual(prepareLifecycleValue(raw).safe)
+    expect(returned).toMatchObject({ children: [{ candidates: [{ jobId: "[REDACTED_PHONE]" }] }] })
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output: returned })
+    expect(sink.events[0]?.payload.output).toEqual(returned)
+  })
+
+  it("returns and persists only an invocation-proven Scout delegate child ID", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const output = { taskId: numericDelegateTaskId, status: "queued" as const }
+    expect(markScoutDelegateOutput(output, { sessionId: scoutDelegateCall.sessionId, turnId: scoutDelegateCall.turnId,
+      rootTaskId: scoutDelegateCall.rootTaskId!, parentTaskId: scoutDelegateCall.taskId!, stepId: scoutDelegateCall.stepId,
+      toolCallId: scoutDelegateCall.id }, numericDelegateTaskId, "queued")).toBe(true)
+
+    const returned = await lifecycle.completed(scoutDelegateCall, output)
+    expect(returned).toEqual(output)
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output })
+    expect(sink.events[0]?.payload.output).toEqual(output)
+  })
+
+  it("keeps unmarked Scout delegate IDs on generic redaction", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const raw = { taskId: numericDelegateTaskId, status: "queued" }
+    const returned = await lifecycle.completed(scoutDelegateCall, raw)
+    expect(returned).toEqual(prepareLifecycleValue(raw).safe)
+    expect(returned).not.toEqual(raw)
+  })
   it("emits replayable started, progress, and result Items without raw sensitive data", async () => {
     const sink = new InMemoryToolLifecycleSink()
     const lifecycle = new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore(), now: () => "2026-08-31T12:00:00.000Z" })
@@ -411,16 +466,20 @@ describe("ToolLifecycle", () => {
     const observed: unknown[] = []
     const lifecycle = new ToolLifecycle({
       sink,
+      maxEventBytes: 256,
       onDiscoveryAttemptLifecycleEvent: event => {
         observed.push(event)
         if (event.phase !== "started") throw new Error("observer failure")
       },
     })
-    const failure = { usage: discoverUsage(call.id) }
+    const failure = { message: "x".repeat(2_000), usage: discoverUsage(call.id) }
     await lifecycle.started({ ...call, toolName: "jobs.discover" }, {})
-    await expect(lifecycle.failed({ ...call, toolName: "jobs.discover" }, "failed", "job_discovery_failed", failure)).resolves.toBeDefined()
+    await expect(lifecycle.failed({ ...call, toolName: "jobs.discover" }, "failed", "job_discovery_failed", { kind: "diagnostic", detail: failure })).resolves.toBeNull()
     expect(observed).toHaveLength(2)
+    expect(observed[1]).toMatchObject({ output: failure })
     expect(sink.events.at(-1)?.phase).toBe("failed")
+    expect(sink.events.at(-1)).toMatchObject({ item: { output: null }, payload: { failureKind: "diagnostic", output: null, errorCode: "job_discovery_failed", failureDetail: { $truncated: true } } })
+    expect(JSON.stringify(sink.events)).not.toContain("ledger-discover")
   })
 
   it("uses the 6 KiB resume limit only for jobs.discover lifecycle output", async () => {
@@ -618,8 +677,8 @@ describe("ToolLifecycle", () => {
     const sink = new InMemoryToolLifecycleSink()
     const lifecycle = new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore(), now: () => "2026-08-31T12:00:00.000Z" })
     await lifecycle.started(call, {})
-    await lifecycle.failed(call, "cancelled", "cancelled", { reason: "stop" })
-    expect(sink.events.at(-1)).toMatchObject({ phase: "cancelled", item: { status: "interrupted", errorCode: "cancelled" } })
+    await lifecycle.failed(call, "cancelled", "cancelled", { kind: "diagnostic", detail: { reason: "stop" } })
+    expect(sink.events.at(-1)).toMatchObject({ phase: "cancelled", item: { status: "interrupted", errorCode: "cancelled", output: null }, payload: { failureKind: "diagnostic", output: null, failureDetail: { reason: "stop" } } })
   })
 
   it("persists only oversized completed output with the actual call identity", async () => {

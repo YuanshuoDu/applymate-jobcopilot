@@ -19,6 +19,7 @@ function task(id: string, role: string, taskType: string, structuredResult?: unk
 }
 
 const scoutResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [], evidence: [], summary: "PRIVATE_TEXT" }
+const analystResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [], evidence: [], summary: "PRIVATE_ANALYST_TEXT" }
 
 describe("TaskGraph final source manifest", () => {
   it("emits every business outcome in graph order using final-item-bound opaque keys", () => {
@@ -34,6 +35,7 @@ describe("TaskGraph final source manifest", () => {
       { sourceKey: `src_${digest}`, nodeIndex: 0, role: "scout", taskStatus: "completed", resultState: "valid", roleResultStatus: "completed" },
       { sourceKey: expect.stringMatching(/^src_[A-Za-z0-9_-]{43}$/), nodeIndex: 2, role: "unsupported", taskStatus: "completed", resultState: "unsupported_role" },
     ] })
+    expect(Object.keys(manifest ?? {}).sort()).toEqual(["graphRevision", "schemaVersion", "sources"])
     expect(JSON.stringify(manifest)).not.toMatch(/private-root-id|private-final-item|private-scout-task|private-native-control|private-unknown-task|PRIVATE_TEXT/)
     expect(buildTaskGraphFinalSourceManifest(binding, "another-final-item")?.sources[0]?.sourceKey).not.toBe(manifest?.sources[0]?.sourceKey)
   })
@@ -55,6 +57,33 @@ describe("TaskGraph final source manifest", () => {
   it("keeps a current control-only graph free of user-facing source entries", () => {
     const binding = buildTaskGraphFinalSummaryBinding(graph([task("private-native-control", "auditor", "native_verification")]))!
     expect(buildTaskGraphFinalSourceManifest(binding, "private-final-item")).toBeNull()
+  })
+
+  it("emits sorted historical indices in v2 without historical source links", () => {
+    const binding = buildTaskGraphFinalSummaryBinding(graph([
+      task("private-old-scout", "scout", "scout", scoutResult),
+      task("private-current-analyst", "analyst", "analyst", analystResult),
+      task("private-old-analyst", "analyst", "analyst", analystResult),
+      task("private-current-unknown", "odd-role", "custom"),
+    ]), new Set([2, 0]))!
+    const manifest = buildTaskGraphFinalSourceManifest(binding, "private-final-item")
+
+    expect(manifest).toEqual({ schemaVersion: "agent-harness.v2.task-graph-sources.v2", graphRevision: 7,
+      historicalNodeIndices: [0, 2], sources: [
+        { sourceKey: expect.stringMatching(/^src_[A-Za-z0-9_-]{43}$/), nodeIndex: 1, role: "analyst", taskStatus: "completed", resultState: "valid", roleResultStatus: "completed" },
+        { sourceKey: expect.stringMatching(/^src_[A-Za-z0-9_-]{43}$/), nodeIndex: 3, role: "unsupported", taskStatus: "completed", resultState: "unsupported_role" },
+      ] })
+    expect(JSON.stringify(manifest)).not.toMatch(/private-old-scout|private-old-analyst|PRIVATE_TEXT|PRIVATE_ANALYST_TEXT/)
+    expect(manifest?.sources.map(source => source.nodeIndex)).toEqual([1, 3])
+  })
+
+  it("keeps the existing eight-member manifest bound when historical members are present", () => {
+    const rows = [task("private-history", "scout", "scout", scoutResult),
+      ...Array.from({ length: 8 }, (_, index) => task(`private-current-${index}`, "odd-role", "custom"))]
+    const binding = buildTaskGraphFinalSummaryBinding(graph(rows), new Set([0]))!
+
+    expect(() => buildTaskGraphFinalSourceManifest(binding, "private-final-item"))
+      .toThrow("task_graph_final_source_binding_invalid")
   })
 
   it("supports the full eight-node disclosure bound without dropping a business outcome", () => {

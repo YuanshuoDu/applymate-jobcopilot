@@ -7,6 +7,7 @@ import {
   parseObjectiveVerificationRequirements,
   type ObjectiveVerificationRequirements,
 } from './types'
+import { parseRetryLineageReceipt } from './retry-lineage'
 
 const RETRYABLE_STATUSES = new Set(['failed', 'interrupted', 'cancelled'])
 const MAX_RETRY_PARTS = 32
@@ -25,9 +26,10 @@ export function parsePersistedRetryContent(turnId: string, value: unknown): {
   intent?: TurnIntent
   verificationRequirements?: ObjectiveVerificationRequirements | null
 } {
-  if (!isRecord(value) || !exactKeys(value, ['goal', 'content', 'clientMessageId', 'selectedJobPreparation', 'intent', 'verificationRequirements']) ||
+  if (!isRecord(value) || !exactKeys(value, ['goal', 'content', 'clientMessageId', 'selectedJobPreparation', 'intent', 'verificationRequirements', 'retryLineage']) ||
     !boundedGoal(value.goal) || (value.clientMessageId !== undefined && !boundedString(value.clientMessageId, 256)) ||
     !Array.isArray(value.content) || value.content.length < 1 || value.content.length > MAX_RETRY_PARTS) throw retryInputInvalid(turnId)
+  if (Object.hasOwn(value, 'retryLineage') && !parseRetryLineageReceipt(value.retryLineage)) throw retryInputInvalid(turnId)
   const goal = value.goal
   const content: InputContentPart[] = []
   let attachmentCount = 0

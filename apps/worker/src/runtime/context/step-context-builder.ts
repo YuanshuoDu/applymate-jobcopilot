@@ -4,7 +4,7 @@ import { createPgContextOwnerFence as createPgContextOwnerFenceImpl } from "./st
 import { InputClaimStoreError, type InputClaimStore, type InputClaimTransaction, type TurnExecutionFence } from "./input-claim-store.js"
 import { appendNewObservedSteeringMarkers, type SteeringMarkerContext } from "./steering-marker-store.js"
 import type { SteeringMarkerPayload } from "./steering-marker.js"
-import { checkpointWithInputs, ensureTurnInputs as ensureTurnInputsImpl, loadStepSteeringContext, mergeDurableRootContextInput, pendingInputBlocks, rootInputTextMatchesGoal, safeTaskGraphRevision, stepSteeringMarkerControl } from "./step-context-support.js"
+import { checkpointWithInputs, ensureTurnInputs as ensureTurnInputsImpl, loadStepSteeringContext, mergeDurableRootContextInput, pendingInputBlocks, requireNonEmptyId, rootInputTextMatchesGoal, safeTaskGraphRevision, stepSteeringMarkerControl } from "./step-context-support.js"
 import type { HydrationScope } from "./steering-reconciliation-context.js"
 import type { TurnQuestionPlanningSummary } from "../turns/turn-question-planning-contract.js"
 import { planningClarificationContext, type PlanningClarificationHistoryPair } from "./planning-clarification-context.js"
@@ -61,6 +61,8 @@ export type StepContext = {
   readonly blocks: readonly ContextBlock[]
   readonly canonicalJson: string
   readonly taskGraphRevision?: number
+  /** Private server signal; excluded from the canonical serialized context. */
+  readonly hasUnresolvedConsumedSteer?: true
   readonly planningClarifications?: readonly TurnQuestionPlanningSummary[]
   readonly steeringMarkerControl?: StepSteeringMarkerControl
 }
@@ -99,11 +101,6 @@ export function createPgContextOwnerFence(pool: Pick<pg.Pool, "connect">): Conte
 
 const layerOrder: readonly ContextLayer[] = ["system", "profile", "goal", "steer_history", "business", "tool_observation", "pending_input"]
 
-function id(value: string, field: string): string {
-  if (typeof value !== "string" || value.trim().length === 0) throw new TypeError(`${field} must be non-empty`)
-  return value
-}
-
 function json(value: unknown): JsonValue {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value
   if (typeof value === "number") {
@@ -127,7 +124,7 @@ function stableJson(value: unknown): string {
 }
 
 function block(layer: ContextLayer, role: ContextRole, trust: ContextTrust, source: string, blockId: string, content: unknown): ContextBlock {
-  return { id: id(blockId, "block id"), layer, role, trust, source, content: json(content) }
+  return { id: requireNonEmptyId(blockId, "block id"), layer, role, trust, source, content: json(content) }
 }
 
 function isAttachmentBlock(item: ContextBlock): boolean { return item.content !== null && typeof item.content === "object" && !Array.isArray(item.content) && "attachmentId" in item.content }
@@ -181,8 +178,8 @@ export class StepContextBuilder {
   }
 
   private validateRequest(request: StepContextRequest): void {
-    id(request.sessionId, "sessionId"); id(request.turnId, "turnId"); id(request.stepId, "stepId")
-    if (request.rootContextInputId !== undefined) id(request.rootContextInputId, "rootContextInputId")
+    requireNonEmptyId(request.sessionId, "sessionId"); requireNonEmptyId(request.turnId, "turnId"); requireNonEmptyId(request.stepId, "stepId")
+    if (request.rootContextInputId !== undefined) requireNonEmptyId(request.rootContextInputId, "rootContextInputId")
     if (request.scope.userId !== this.store.scope.userId) throw new ContextOwnershipError("reference_owner_mismatch", "Builder scope does not match the claim store tenant")
   }
 
@@ -213,7 +210,7 @@ export class StepContextBuilder {
     const renderInputs = await mergeDurableRootContextInput(contextInputs, transaction, request,
       input => ensureTurnInputsImpl([input], request, inputId => new ContextOwnershipError("reference_owner_mismatch", "AgentInput " + inputId + " is outside the tenant Turn")))
     for (const reference of [...request.snapshot.businessRefs].sort((left, right) => left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id))) {
-      id(reference.id, "business reference id")
+      requireNonEmptyId(reference.id, "business reference id")
       if (reference.ownerId !== request.scope.userId) throw new ContextOwnershipError("reference_owner_mismatch", `Reference ${reference.id} is outside the tenant scope`)
       await this.ownerFence.assertReferenceOwned(reference, request.scope)
     }
@@ -244,6 +241,7 @@ export class StepContextBuilder {
     return {
       ...result,
       ...(taskGraphRevision === undefined ? {} : { taskGraphRevision }),
+      ...(steering.hasUnresolvedConsumedSteer ? { hasUnresolvedConsumedSteer: true as const } : {}),
       ...(clarification.summaries.length ? { planningClarifications: clarification.summaries } : {}),
       canonicalJson: stableJson({ ...result, inputThroughSequence: result.inputThroughSequence.toString() }),
       steeringMarkerControl: stepSteeringMarkerControl(request, claimed, steering, newlyClaimedSteerInputIds),

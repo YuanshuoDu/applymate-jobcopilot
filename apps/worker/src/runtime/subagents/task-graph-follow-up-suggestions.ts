@@ -1,5 +1,5 @@
 import type { ArtifactVersionReference } from "./role-results.js"
-import type { TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
+import { readResolvedRepairTaskIds, type TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
 import type { TaskGraphFinalSummary } from "./task-graph-final-summary.js"
 import { validateTaskGraphFollowUpBinding } from "./task-graph-follow-up-validation.js"
 
@@ -19,11 +19,14 @@ export type TaskGraphFollowUpSuggestion =
 /** Derives optional, bounded advice from a complete private current-summary binding. */
 export function reduceTaskGraphFollowUpSuggestions(binding: TaskGraphFinalSummaryBinding): readonly TaskGraphFollowUpSuggestion[] {
   try {
-    const facts = validateTaskGraphFollowUpBinding(binding)
+    const legacyBinding = { ...binding }
+    delete legacyBinding.resolvedRepairTaskIds
+    const facts = validateTaskGraphFollowUpBinding(legacyBinding), resolved = readResolvedRepairTaskIds(binding)
     if (!facts) return []
     const suggestions: TaskGraphFollowUpSuggestion[] = []
     for (const outcome of facts.outcomes.values()) {
-      if (outcome.taskStatus !== "completed" || outcome.resultState !== "valid" || outcome.roleResultStatus === "partial") {
+      const resolvedFailure = resolved.has(outcome.taskId) && outcome.taskStatus === "failed"
+      if ((!resolvedFailure && outcome.taskStatus !== "completed") || outcome.resultState !== "valid" || outcome.roleResultStatus === "partial") {
         suggestions.push({ kind: "inspect_task_result", taskId: outcome.taskId, role: outcome.role, taskStatus: outcome.taskStatus, resultState: outcome.resultState })
       }
     }

@@ -1,7 +1,8 @@
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
-import type { TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
+import { readResolvedRepairTaskIds, type TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
 import type { TaskGraphFinalSummary, TaskGraphSummaryCount } from "./task-graph-final-summary.js"
 import { reduceTaskGraphFollowUpSuggestions, type TaskGraphFollowUpSuggestion } from "./task-graph-follow-up-suggestions.js"
+import { renderSelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
 
 const MAX_RESPONSE_BYTES = 4_096
 const MAX_ARTIFACT_ROWS = TASK_GRAPH_LIMITS.maxPersistedNodes * 102
@@ -14,7 +15,7 @@ const ROLES = ["analyst", "prepare", "reviewer", "scout", "writer", "unsupported
 const REPORTED_STATUSES = ["completed", "partial"] as const
 const REVIEW_STATUSES = ["passed", "needs_revision", "rejected", "stale"] as const
 type TaskOutcome = TaskGraphFinalSummary["taskOutcomes"][number]
-type OutcomeGroup = Readonly<{ outcome: TaskOutcome; count: number }>
+type OutcomeGroup = Readonly<{ outcome: TaskOutcome; count: number; resolved: boolean }>
 
 /** Renders only deterministic facts from the current private TaskGraph binding. */
 export function buildGroundedTaskGraphFinalResponse(binding: TaskGraphFinalSummaryBinding): string {
@@ -29,6 +30,7 @@ export function buildGroundedTaskGraphFinalResponse(binding: TaskGraphFinalSumma
   const artifacts = artifactRows(summary.artifactReferences)
   const reviews = reviewRows(summary.reviewOutcomes)
   const lines = ["Task-reported results:"]
+  lines.push(...renderSelectedJobBatchFinalOutcome(binding))
   lines.push(countLine("Search results", summary.counts?.discoveredJobs, discovered, ["unique job", "unique jobs"]))
   lines.push(countLine("Analysis results", summary.counts?.analyzedJobs, analyzed, ["unique job with findings", "unique jobs with findings"]))
   lines.push(countLine("Preparation outcomes", summary.counts?.prepareJobs, prepare?.total ?? null, ["job outcome record", "job outcome records"]))
@@ -39,7 +41,7 @@ export function buildGroundedTaskGraphFinalResponse(binding: TaskGraphFinalSumma
   const reviewDetail = reviewBreakdown(summary.counts?.reviewOutcomes, summary.reviewOutcomes, reviews)
   if (reviewDetail) lines.push(reviewDetail)
   lines.push(artifactDetail(summary.counts?.artifactReferences, artifacts))
-  lines.push(...taskOutcomeLines(summary.taskOutcomes))
+  lines.push(...taskOutcomeLines(summary.taskOutcomes, readResolvedRepairTaskIds(binding)))
   lines.push(LIMITATION)
   return appendTaskGraphFollowUpSuggestions(boundLines(lines), reduceTaskGraphFollowUpSuggestions(binding))
 }
@@ -84,18 +86,19 @@ function artifactDetail(value: unknown, observed: number | null): string {
   return observed > 0 ? "See structured task details for the available artifact version references." : ""
 }
 
-function taskOutcomeLines(value: unknown): string[] {
+function taskOutcomeLines(value: unknown, resolvedRepairTaskIds: ReadonlySet<string>): string[] {
   const rows = dense(value, TASK_GRAPH_LIMITS.maxPersistedNodes)
   if (!rows) return ["Task states: unavailable."]
   if (!rows.length) return ["Task states: no business tasks recorded."]
-  const groups = new Map<string, { outcome: TaskOutcome; count: number }>()
+  const groups = new Map<string, { outcome: TaskOutcome; count: number; resolved: boolean }>()
   for (const candidate of rows) {
     const outcome = parseOutcome(candidate)
     if (!outcome) return ["Task states: unavailable."]
-    const key = `${outcome.role}|${outcome.taskStatus}|${outcome.resultState}|${outcome.roleResultStatus ?? ""}`
+    const resolved = resolvedRepairTaskIds.has(outcome.taskId)
+    const key = `${outcome.role}|${outcome.taskStatus}|${outcome.resultState}|${outcome.roleResultStatus ?? ""}|${resolved}`
     const group = groups.get(key)
     if (group) group.count += 1
-    else groups.set(key, { outcome, count: 1 })
+    else groups.set(key, { outcome, count: 1, resolved })
   }
   return ["Task states:", ...[...groups.values()].map(renderOutcome)]
 }
@@ -108,7 +111,7 @@ function renderOutcome(group: OutcomeGroup): string {
     : outcome.resultState === "missing" ? "structured result missing"
       : outcome.resultState === "invalid" ? "structured result invalid"
         : outcome.resultState === "not_terminal" ? "no terminal structured result yet" : "task type omitted from result details"
-  return `${label}: ${task}; ${result}.`
+  return `${label}: ${task}; ${result}.${group.resolved ? " Verified repair evidence covers the affected criteria." : ""}`
 }
 
 function taskState(value: TaskOutcome["taskStatus"]): string {

@@ -175,7 +175,8 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         let generatedDependencyWait = false
         if (output.toolCalls.length === 0 && output.finishReason === "stop" && output.provider !== "recovered" && options.identity.kind === "task" && options.prepareFinalDependencyWait) {
           assertExecutionAlive(options, signal)
-          const waitRequest = await options.prepareFinalDependencyWait({ identity: options.identity, step, context, snapshot, signal })
+          const waitRequest = await options.prepareFinalDependencyWait({ identity: options.identity, step, context, snapshot, signal,
+            ...(toolCallProjection ? { toolCallAliases: toolCallProjection.aliasToCanonical } : {}) })
           assertExecutionAlive(options, signal)
           const waitCall = prepareFinalDependencyWaitCall(options.identity, step, waitRequest)
           if (waitCall) {

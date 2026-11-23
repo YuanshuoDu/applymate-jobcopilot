@@ -1,9 +1,9 @@
 import type pg from "pg"
 import { Buffer } from "node:buffer"
 import { redactSensitiveText } from "@jobcopilot/shared"
-
 import { loadChildConsumedWaitResume, loadChildPriorAttemptResume, type ChildSameAttemptResume } from "./child-resume.js"
-import { buildChildResumeObservations, countChildResumeToolCalls, mergeDurableWaitObservation, type DurableWaitResume } from "./child-resume-observations.js"
+import { countChildResumeToolCalls, mergeDurableWaitObservation, type DurableWaitResume } from "./child-resume-observations.js"
+import { buildChildResumeObservationsWithDelegateReceipts } from "./child-resume-delegate-receipts.js"
 import type { SubagentLease } from "./types.js"
 type Row = Record<string, unknown>
 type ResumeClient = Pick<pg.PoolClient, "query" | "release">
@@ -210,7 +210,7 @@ export async function loadChildSameAttemptContinuation(
     const previousFinalText = validateItems(itemResult.rows, stepMap, lastOrdinal, lease, durableWaits)
     if (!previousFinalText) throw UNAVAILABLE
     const currentUsage = { inputTokens, outputTokens, estimatedCostUsd }
-    const restored = buildChildResumeObservations(itemResult.rows, lease, lastOrdinal, durableWaits)
+    const restored = await buildChildResumeObservationsWithDelegateReceipts(client, itemResult.rows, lease, lastOrdinal, durableWaits)
     const observations = restored.observations.filter(block => record(block.content)?.status === "completed")
     const prior = await loadChildPriorAttemptResume(client, lease)
     let allObservations = [...(prior?.observations ?? []).filter(block => record(block.content)?.status === "completed"), ...observations]

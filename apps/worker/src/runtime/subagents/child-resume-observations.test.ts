@@ -9,6 +9,7 @@ import type { JobDiscoveryOutput } from "../tools/job-discovery-client.js"
 
 import { createObservedEvidenceIndex, hydrateObservedEvidence } from "./child-evidence.js"
 import { buildChildResumeObservations, mergeDurableWaitObservation, resolveDurableWaitOutcome } from "./child-resume-observations.js"
+import { safeSubagentWaitJson } from "./durable-subagent-wait-store.js"
 import type { SubagentLease } from "./types.js"
 
 const targetId = "subagent-00000000-0000-4000-8000-000000000001"
@@ -52,6 +53,24 @@ async function resumeDiscovery(output: unknown, callId: string) {
   return { sink, observations: buildChildResumeObservations(lifecycleRows(sink, call), resumeLease).observations }
 }
 
+function scoutResultsOutput(jobId: string) {
+  return { availability: "available", children: [{ taskId: "subagent-grandchild", status: "completed",
+    candidates: [{ jobId, source: "greenhouse" }] }] }
+}
+
+function resumedToolOutput(output: unknown, toolName = "scout.results", callStatus = "completed"): RepositoryJsonValue {
+  const common = { sessionId: resumeLease.sessionId, turnId: resumeLease.turnId, taskId: resumeLease.id, rootTaskId: resumeLease.rootTaskId,
+    stepId: "step-1", attempt: 1, ordinal: 1 }
+  const rows = [
+    { ...common, id: "scout-results-call", revision: 1, type: "tool_call", status: callStatus,
+      content: { toolCallId: "scout-results-call", toolName, input: {} } },
+    { ...common, id: "scout-results-result", revision: 2, type: "tool_result", status: "completed",
+      content: { toolCallId: "scout-results-call", output, errorCode: null } },
+  ]
+  const content = buildChildResumeObservations(rows, resumeLease).observations[0]?.content as Record<string, unknown>
+  return content.output as RepositoryJsonValue
+}
+
 function lifecycleRows(sink: InMemoryToolLifecycleSink, call: LifecycleCall, ordinal = 0) {
   return sink.replay().map(({ item }, revision) => ({
     id: item.id, revision, sessionId: item.sessionId, turnId: item.turnId, taskId: call.taskId, rootTaskId: call.rootTaskId,
@@ -63,6 +82,22 @@ function lifecycleRows(sink: InMemoryToolLifecycleSink, call: LifecycleCall, ord
 }
 
 describe("durable child wait resume observation", () => {
+  it("restores canonical candidate IDs only from a validated completed scout.results pair", () => {
+    expect(redactSensitiveText(NUMERIC_UUID)).not.toBe(NUMERIC_UUID)
+    const restored = resumedToolOutput(scoutResultsOutput(NUMERIC_UUID))
+    expect(restored).toEqual(scoutResultsOutput(NUMERIC_UUID))
+
+    const malformed = { ...scoutResultsOutput(NUMERIC_UUID), extra: "not part of the closed result shape" }
+    for (const output of [
+      resumedToolOutput(malformed),
+      resumedToolOutput(scoutResultsOutput(NUMERIC_UUID), "scout.delegate"),
+      resumedToolOutput(scoutResultsOutput(NUMERIC_UUID), "scout.results", "started"),
+    ]) {
+      expect(JSON.stringify(output)).not.toContain(NUMERIC_UUID)
+      expect(JSON.stringify(output)).toContain("[REDACTED_PHONE]")
+    }
+  })
+
   it("preserves strict canonical discovery IDs through lifecycle, resume, and hydration", async () => {
     expect(redactSensitiveText(NUMERIC_UUID)).not.toBe(NUMERIC_UUID)
     expect(redactSensitiveText(ORDINARY_UUID)).toBe(ORDINARY_UUID)
@@ -236,6 +271,35 @@ describe("durable child wait resume observation", () => {
     expect((tasks[1]?.result as Record<string, unknown>).finalText).toBe(redactSensitiveText(freeText))
     expect(JSON.stringify(content.input)).not.toContain(phoneShapedCallId)
     expect(JSON.stringify(content.output)).not.toContain(phoneShapedCallId)
+  })
+
+  it("preserves only the exact canonical wait ID across the second observation projection", () => {
+    const waitId = NUMERIC_UUID
+    const ids = [...wait.input.taskIds]
+    const loadedOutput = { ...wait.output, waitId, taskIds: ids, matchedTaskIds: [...ids].sort(),
+      tasks: ids.map(id => wait.output.tasks.find(task => task.taskId === id)!) }
+    const row = { id: waitId, status: "ready", mode: "all", targetTaskIds: wait.input.taskIds,
+      matchedTaskIds: wait.output.matchedTaskIds, deadlineAt: wait.output.deadlineAt, result: { outcome: loadedOutput } }
+    const resolved = resolveDurableWaitOutcome(row, row.targetTaskIds, row.matchedTaskIds, new Date("2026-10-22T10:00:00.000Z"))
+    expect(redactSensitiveText(waitId)).not.toBe(waitId)
+    expect(resolved.waitId).toBe(waitId)
+
+    // The first safe projection preserves the validated ID but returns a fresh object without its private marker.
+    const loaded = safeSubagentWaitJson(resolved, 16_384) as typeof resolved
+    expect(loaded.waitId).toBe(waitId)
+    const restored = mergeDurableWaitObservation([], { ...wait, waitId, output: loaded })
+    const content = restored[0]?.content as Record<string, unknown>
+    const output = content.output as typeof loaded
+    const sensitiveResult = output.tasks.find(task => task.taskId === targetId)?.result as Record<string, unknown>
+    expect(output.waitId).toBe(waitId)
+    expect(sensitiveResult.finalText).toBe(redactSensitiveText(freeText))
+    expect(sensitiveResult.finalText).not.toContain(targetId)
+    expect(() => mergeDurableWaitObservation([], { ...wait, waitId, output: { ...loaded, waitId: ORDINARY_UUID } }))
+      .toThrow("child_resume_invalid_wait_result")
+    const noncanonicalId = "wait-415-555-0134"
+    const legacy = mergeDurableWaitObservation([], { ...wait, waitId: noncanonicalId, output: { ...wait.output, waitId: noncanonicalId } })
+    expect(((legacy[0]?.content as Record<string, unknown>).output as Record<string, unknown>).waitId)
+      .toBe(redactSensitiveText(noncanonicalId))
   })
 
   it("matches wait observations by exact raw ID and fails closed on conflicting or duplicate lineage", () => {

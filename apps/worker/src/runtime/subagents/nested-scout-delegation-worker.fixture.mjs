@@ -13,15 +13,30 @@ import { createSubagentQueue } from "../../queue/subagent-queue.ts"
 import { enqueueTurn } from "../turns/turn-queue.ts"
 import { createCrashFixtureExecutor, createNestedScoutFixtureScripts } from "./nested-scout-delegation-worker-fixture-scripts.mjs"
 import { installWaitResolverDiagnostics } from "./nested-scout-wait-resolver-logging.mjs"
-const [, , mode, rawIds] = process.argv, ids = JSON.parse(rawIds)
+const [, , mode, rawIds, leaseProfile] = process.argv, ids = JSON.parse(rawIds)
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 10 })
-const CRASH_TEST_LEASE_MS = 3_000, CRASH_TEST_HEARTBEAT_MS = 500
+const restartRecovery = leaseProfile === "restart-recovery"
+const CRASH_TEST_LEASE_MS = restartRecovery ? 30_000 : 3_000
+const CRASH_TEST_HEARTBEAT_MS = restartRecovery ? 10_000 : 500
 const SAFE_RECOVERY_ERROR_CODES = new Set([
   "subagent_dispatch_delivery_uncertain", "lost", "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01",
   "ECONNRESET", "ETIMEDOUT", "wait_invalid", "wait_scope_error", "wait_conflict",
   ...`owner_mismatch lease_expired wait_tool_call_conflict wait_step_lineage wait_lineage invalid_wait_result step_lineage item_lineage step_limit item_limit usage_overflow
     observation_limit invalid_tool_call invalid_wait_input tool_item_conflict invalid_item_status tool_call_conflict tool_result_conflict invalid_errorCode
     invalid_id invalid_sessionId invalid_turnId invalid_taskId invalid_rootTaskId invalid_stepId invalid_ordinal invalid_attempt invalid_inputThroughSequence invalid_inputTokens invalid_outputTokens invalid_estimatedCostUsd invalid_consumedInputIds`.split(/\s+/).map(code => `child_resume_${code}`),
+])
+const WAITING_FINISH_SQLSTATES = new Set(["40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "57P01"])
+const WAITING_FINISH_ERROR_CLASSES = new Map([
+  ["task_graph_transition_rejected:idempotency_conflict", "idempotency_conflict"],
+  ["task_graph_transition_rejected:revision_mismatch", "revision_mismatch"],
+  ["task_graph_transition_rejected:invalid_transition", "graph_invalid_transition"],
+  ["task_graph_state_missing", "graph_state_missing"],
+  ["task_graph_child_missing", "graph_child_missing"],
+  ["task_graph_attempt_count_invalid", "graph_attempt_invalid"],
+  ["task_graph_wait_identity_invalid", "graph_wait_identity_invalid"],
+  ["task_graph_revision_transition_mismatch", "graph_revision_mismatch"],
+  ["child_wait_graph_resume_blocked", "graph_resume_blocked"],
+  ["wait_invalid", "wait_invalid"], ["wait_scope_error", "wait_scope_error"], ["wait_conflict", "wait_conflict"],
 ])
 const SAFE_WAIT_RESUME_DIAGNOSTIC_STAGES = new Set(`required_value resume_scope source_step source_call_count source_call_input source_item_set wait_record_shape provenance_marker source_receipt_missing source_marker_without_result source_recovered_receipt_mismatch source_waiting_content source_waiting_output_shape source_waiting_identity source_waiting_targets source_waiting_matched_ids source_waiting_tasks source_waiting_task_ids source_waiting_deadline source_initial_call_shape source_call_completion_state source_result_completion_state source_call_completion_content source_result_completion_content source_waiting_output_missing source_event_chain reconciliation safe_result_shape source_start_event lease_fence source_ordinal wait_state wait_result_shape target_scope resolved_outcome tool_call call_binding receipt_pair receipt_identity receipt_ids receipt_deadline input_target_ids output_target_ids other`.split(" "))
 let bootstrap
@@ -107,7 +122,14 @@ function recoveryErrorClass(error, includeMessage = false) {
     return error instanceof Error ? "error" : "unknown"
   } catch { return "unknown" }
 }
-function withWaitingFinishDiagnostics(store) { const finish = store.finish.bind(store); store.finish = input => finish(input).catch(error => { if (input.status === "waiting") { const code = recoveryErrorClass(error, true); say(`P1143_WAITING_FINISH_DIAGNOSTIC:${code === "idempotency_conflict" || code === "revision_mismatch" ? code : "other"}`) } throw error }); return store }
+function waitingFinishDiagnosticCode(error) {
+  try {
+    const code = error && typeof error === "object" ? error.code ?? (error instanceof Error ? error.message : null) : null
+    if (typeof code !== "string") return "other"
+    return WAITING_FINISH_ERROR_CLASSES.get(code) ?? (WAITING_FINISH_SQLSTATES.has(code) ? `pg_${code.toLowerCase()}` : "other")
+  } catch { return "other" }
+}
+function withWaitingFinishDiagnostics(store) { const finish = store.finish.bind(store); store.finish = input => finish(input).catch(error => { if (input.status === "waiting") say(`P1143_WAITING_FINISH_DIAGNOSTIC:${waitingFinishDiagnosticCode(error)}`); throw error }); return store }
 async function start(mode) {
   installWaitResolverDiagnostics(say)
   const ownerId = `p1143-worker-${process.pid}`

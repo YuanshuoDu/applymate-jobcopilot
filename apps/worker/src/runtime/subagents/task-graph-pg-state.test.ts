@@ -14,6 +14,7 @@ import { SCHEDULED_GATE_NODE_CRITERIA, SCHEDULED_GATE_NODE_GOAL, SCHEDULED_GATE_
 import { SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, SCHEDULED_AUDIT_OUTPUT_SCHEMA,
   SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE, SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import { SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA } from "./scheduled-prepare-task-graph-verification.js"
+import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 
 type QueryResult = { rows: Array<Record<string, unknown>>; rowCount: number }
 type QueryCall = { sql: string; values: readonly unknown[] }
@@ -225,16 +226,21 @@ describe("TaskGraph PostgreSQL state loading", () => {
 
   it("loads persisted actions and only derived context flags with the existing task-row query", async () => {
     const allowedActions = ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"]
-    const fake = fakeClient({ taskRows: [validTaskRow({ allowedActions, contextIsObject: true, hasPrivateSelectionContext: false })] })
+    const fake = fakeClient({ taskRows: [validTaskRow({ allowedActions, contextIsObject: true, contextIsEmpty: false,
+      contextIsCanonicalNestedScoutProfile: true, hasPrivateSelectionContext: false })] })
 
     const loaded = await loadTaskGraph(fake.client, identity)
-    expect(loaded.tasks.get("child-1")).toMatchObject({ allowedActions, contextIsObject: true, hasPrivateSelectionContext: false })
+    expect(loaded.tasks.get("child-1")).toMatchObject({ allowedActions, contextIsObject: true, contextIsEmpty: false,
+      contextIsCanonicalNestedScoutProfile: true, hasPrivateSelectionContext: false })
     expect(loaded.tasks.get("child-1")).not.toHaveProperty("context")
     const taskQueries = fake.calls.filter(call => call.sql.startsWith('SELECT task."id", task."status"'))
     expect(taskQueries).toHaveLength(1)
     expect(taskQueries[0]?.sql).toContain('task."allowedActions"')
     expect(taskQueries[0]?.sql).toContain('AS "contextIsObject"')
     expect(taskQueries[0]?.sql).toContain('AS "contextIsEmpty"')
+    expect(taskQueries[0]?.sql).toContain('AS "contextIsCanonicalNestedScoutProfile"')
+    expect(taskQueries[0]?.sql).toContain("jsonb_build_object('nestedScoutProfile', $7::text)")
+    expect(taskQueries[0]?.values[6]).toBe(NESTED_SCOUT_PROFILE_MARKER)
     expect(taskQueries[0]?.sql).toContain('AS "hasPrivateSelectionContext"')
     expect(taskQueries[0]?.sql).toContain('task."context" ?| ARRAY[')
     expect(taskQueries[0]?.sql).toContain("selectedJobPreparation")
@@ -553,7 +559,7 @@ describe("TaskGraph PostgreSQL state loading", () => {
     const tasks = fake.calls.find(call => call.sql.startsWith('SELECT task."id", task."status"'))
     expect(tasks?.sql).toContain('task."rootTaskId" = $4 AND task."parentTaskId" = $5 AND session."userId" = $6')
     expect(tasks?.sql).toContain('task."attemptCount"')
-    expect(tasks?.values).toEqual([["child-1"], "session-1", "turn-1", "root-1", "root-1", "user-1"])
+    expect(tasks?.values).toEqual([["child-1"], "session-1", "turn-1", "root-1", "root-1", "user-1", NESTED_SCOUT_PROFILE_MARKER])
     const events = fake.calls.find(call => call.sql.startsWith('SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload"'))
     expect(events?.sql).toContain('SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload"')
     expect(events?.sql).toContain('event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3')

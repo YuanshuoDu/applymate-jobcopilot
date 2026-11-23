@@ -43,6 +43,7 @@ type RootHistoryAuthorizedWork = (client: pg.PoolClient, authorization: RootTask
   historyReadAllowed: boolean, searchFootprintReadAllowed?: boolean) => Promise<unknown>
 
 const discoveryPersona = vi.hoisted(() => ({ load: vi.fn() }))
+const retrySteering = vi.hoisted(() => ({ read: vi.fn() }))
 const rootHistoryHarness = vi.hoisted(() => ({
   createTransaction: vi.fn(), authorize: vi.fn(), readSteer: vi.fn(), readFence: vi.fn(), snapshot: vi.fn(), searchSnapshot: vi.fn(),
   inputTransaction: undefined as unknown, consentEnabled: true, searchFootprintReadAllowed: false, steerEvidence: { kind: "unsafe" } as unknown,
@@ -57,6 +58,10 @@ vi.mock("./context/input-claim-store.js", async () => ({
 vi.mock("./context/root-task-history-session-memory.js", () => ({
   withRootTaskHistorySessionAuthorization: rootHistoryHarness.authorize,
 }))
+vi.mock("./context/retry-source-steering.js", () => ({
+  RETRY_SOURCE_STEERING_OBSERVATION_ID: "retry-source-steering",
+  readRetrySourceSteeringObservation: retrySteering.read,
+}))
 vi.mock("./context/root-task-history-steer-evidence.js", () => ({ readRootTaskHistorySteerEvidence: rootHistoryHarness.readSteer }))
 vi.mock("./context/root-task-history-fence.js", async () => ({
   ...(await vi.importActual<typeof import("./context/root-task-history-fence.js")>("./context/root-task-history-fence.js")),
@@ -69,6 +74,7 @@ vi.mock("./context/root-task-history-objective-snapshot.js", () => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
+  retrySteering.read.mockResolvedValue(undefined)
   rootHistoryHarness.consentEnabled = true
   rootHistoryHarness.searchFootprintReadAllowed = false
   rootHistoryHarness.steerEvidence = { kind: "unsafe" }
@@ -762,6 +768,25 @@ describe("canonical Turn context builder", () => {
     const withoutHistory = { ...context, blocks: context.blocks.filter(block => block.id !== historyBlock?.id) }
     expect(buildCognitiveActionAgenda(context)).toEqual(buildCognitiveActionAgenda(withoutHistory))
     expect(progressCheckpointFromStepContext(context)).toEqual(progressCheckpointFromStepContext(withoutHistory))
+  })
+
+  it("passes the loaded Turn input into the owner-authorized retry-source reader before context build", async () => {
+    const database = checkedOutPool(), turnInput = { goal: "Find EU roles", retryLineage: { schemaVersion: "private" } }
+    retrySteering.read.mockResolvedValue({ id: "retry-source-steering", content: { kind: "retry_source_steering", advisoryOnly: true } })
+    const reader: DirectRootTaskHistoryReader = { load: async () => [], loadWithClient: async () => [] }
+    const callerSnapshot: StepContextRequest["snapshot"] = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [
+      { id: "retry-source-steering", content: { kind: "forged_retry_source" } },
+    ] }
+    const builder = createCanonicalTurnContextBuilder({ pool: database.pool, store: store([]), scope, lease,
+      rootTaskId: "root-a", rootAttemptCount: 2, planningEnabled: true, selectedJobMode: false,
+      turnInput, rootTaskHistoryDirectReader: reader, currentRootBudgetReader: async () => unavailableBudget })
+    const context = await builder.build({ scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "retry-source-step",
+      snapshot: callerSnapshot, now, lease: { ownerId: lease.ownerId, leaseVersion: lease.leaseVersion, now } })
+    expect(retrySteering.read).toHaveBeenCalledWith(database.client, scope, expect.objectContaining({
+      sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-a", turnInput,
+    }))
+    expect(context.blocks.filter(block => block.id === "observation:retry-source-steering")).toHaveLength(1)
+    expect(JSON.stringify(context.blocks)).not.toContain("forged_retry_source")
   })
 
   it("keeps consent, Step checkpoint, steer evidence, DB identity, and snapshot on one transaction client", async () => {

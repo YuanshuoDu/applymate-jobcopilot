@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { buildInteractiveDiscoveryShortlist, requireCurrentOwnerJobs, selectLatestDiscoveryTasks } from "./interactive-discovery-persistence.js"
+const { lockScopeMock, loadGraphMock } = vi.hoisted(() => ({ lockScopeMock: vi.fn(), loadGraphMock: vi.fn() }))
+vi.mock("./subagents/task-graph-pg-state.js", () => ({ lockTaskGraphScope: lockScopeMock, loadTaskGraph: loadGraphMock }))
+
+import { buildInteractiveDiscoveryShortlist, loadInteractiveDiscoveryShortlist, requireCurrentOwnerJobs, selectLatestDiscoveryTasks } from "./interactive-discovery-persistence.js"
 import { ROLE_RESULT_SCHEMA, type AnalystResult, type RoleEvidence, type ScoutResult } from "./subagents/role-results.js"
 import type { GraphTaskRow } from "./subagents/task-graph-pg-state.js"
 
@@ -29,6 +32,28 @@ function task(id: string, role: "scout" | "analyst", status: string): GraphTaskR
 }
 
 describe("interactive discovery persistence", () => {
+  it("loads itemless lifecycle identity fields needed for legacy diagnostic validation", async () => {
+    loadGraphMock.mockResolvedValue({
+      rootTaskId: "root-1", snapshot: { nodes: [node("scout", "scout-1"), node("analyst", "analyst-1")] }, item: null,
+      state: {}, tasks: new Map([[
+        "scout-1", task("scout-1", "scout", "completed"),
+      ], ["analyst-1", task("analyst-1", "analyst", "completed")]]),
+    })
+    const calls: string[] = []
+    const query = vi.fn(async (sql: string) => { calls.push(sql); return { rows: [], rowCount: 1 } })
+    const client = { query, release: vi.fn() }
+    await loadInteractiveDiscoveryShortlist({
+      pool: { connect: async () => client } as never,
+      lease: { userId: ownerUserId, sessionId: "session-1", turnId: "turn-1", ownerId: "owner-1", leaseVersion: 1 } as never,
+      root: { id: "root-1", attemptCount: 1 } as never,
+    })
+    const eventQuery = calls.find(sql => sql.includes('FROM "agent_events"'))!
+    for (const field of ["id", "actor", "itemId", "taskId", "correlationId", "causationId", "idempotencyKey", "payload"]) {
+      expect(eventQuery).toContain(`event."${field}"`)
+    }
+    expect(client.release).toHaveBeenCalledOnce()
+  })
+
   it("selects the initial persisted Scout and Analyst outputs", () => {
     const tasks = new Map([
       ["scout-1", task("scout-1", "scout", "completed")],

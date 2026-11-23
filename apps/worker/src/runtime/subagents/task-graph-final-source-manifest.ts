@@ -4,6 +4,7 @@ import type { TaskGraphFinalSummaryBinding, TaskGraphFinalSummaryMember } from "
 import type { SubagentTaskStatus } from "./types.js"
 
 export const TASK_GRAPH_FINAL_SOURCE_MANIFEST_SCHEMA = "agent-harness.v2.task-graph-sources.v1" as const
+export const TASK_GRAPH_FINAL_SOURCE_MANIFEST_HISTORY_SCHEMA = "agent-harness.v2.task-graph-sources.v2" as const
 const ROLES = new Set(["scout", "analyst", "writer", "reviewer", "prepare", "unsupported"])
 const TASK_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 const RESULT_STATES = new Set(["valid", "missing", "invalid", "unsupported_role", "not_terminal"])
@@ -22,6 +23,11 @@ export type TaskGraphFinalSourceManifest = Readonly<{
   schemaVersion: typeof TASK_GRAPH_FINAL_SOURCE_MANIFEST_SCHEMA
   graphRevision: number
   sources: readonly TaskGraphFinalSource[]
+}> | Readonly<{
+  schemaVersion: typeof TASK_GRAPH_FINAL_SOURCE_MANIFEST_HISTORY_SCHEMA
+  graphRevision: number
+  sources: readonly TaskGraphFinalSource[]
+  historicalNodeIndices: readonly number[]
 }>
 
 /** Emits only opaque selectors and bounded outcome facts; all graph identities stay private. */
@@ -29,6 +35,7 @@ export function buildTaskGraphFinalSourceManifest(binding: TaskGraphFinalSummary
   const members = binding.members
   if (!validPrivateBinding(binding) || !validItemId(finalItemId) || !members) throw new Error("task_graph_final_source_binding_invalid")
   const business = members.filter(member => member.kind === "business")
+  const historicalNodeIndices = members.filter(member => member.kind === "historical").map(member => member.nodeIndex)
   if (business.length > MAX_SOURCES) throw new Error("task_graph_final_source_limit_exceeded")
   const outcomes = binding.summary.taskOutcomes
   if (outcomes.length !== business.length) throw new Error("task_graph_final_source_outcomes_incomplete")
@@ -48,7 +55,10 @@ export function buildTaskGraphFinalSourceManifest(binding: TaskGraphFinalSummary
   if (sources.length !== outcomes.length || new Set(sources.map(source => source.sourceKey)).size !== sources.length) {
     throw new Error("task_graph_final_source_outcomes_incomplete")
   }
-  return sources.length ? { schemaVersion: TASK_GRAPH_FINAL_SOURCE_MANIFEST_SCHEMA, graphRevision: binding.graphRevision, sources } : null
+  if (!sources.length) return null
+  return historicalNodeIndices.length
+    ? { schemaVersion: TASK_GRAPH_FINAL_SOURCE_MANIFEST_HISTORY_SCHEMA, graphRevision: binding.graphRevision, sources, historicalNodeIndices }
+    : { schemaVersion: TASK_GRAPH_FINAL_SOURCE_MANIFEST_SCHEMA, graphRevision: binding.graphRevision, sources }
 }
 
 function validPrivateBinding(binding: TaskGraphFinalSummaryBinding): boolean {
@@ -57,11 +67,15 @@ function validPrivateBinding(binding: TaskGraphFinalSummaryBinding): boolean {
     || binding.summary?.graphRevision !== binding.graphRevision || !Array.isArray(binding.members)
     || !Array.isArray(binding.summary.taskOutcomes) || binding.members.length > MAX_SOURCES) return false
   const taskIds = new Set<string>(), nodeKeys = new Set<string>()
+  let hasHistorical = false, hasBusiness = false
   for (const [nodeIndex, member] of binding.members.entries()) {
     if (!validMember(member, nodeIndex) || taskIds.has(member.taskId) || nodeKeys.has(member.nodeKey)) return false
     taskIds.add(member.taskId)
     nodeKeys.add(member.nodeKey)
+    hasHistorical ||= member.kind === "historical"
+    hasBusiness ||= member.kind === "business"
   }
+  if (hasHistorical && !hasBusiness) return false
   return binding.summary.taskOutcomes.every(outcome => !!outcome && typeof outcome === "object"
       && Object.keys(outcome).every(key => ["taskId", "role", "taskStatus", "resultState", "roleResultStatus"].includes(key))
       && safeText(outcome.taskId) && ROLES.has(outcome.role) && TASK_STATUSES.has(outcome.taskStatus)
@@ -75,7 +89,8 @@ function validMember(value: TaskGraphFinalSummaryMember, nodeIndex: number): boo
   return keys === "kind,nodeIndex,nodeKey,role,taskId,taskStatus,taskType,templateId"
     && value.nodeIndex === nodeIndex && safeText(value.nodeKey) && safeText(value.templateId) && safeText(value.taskId)
     && safeText(value.role) && safeText(value.taskType) && TASK_STATUSES.has(value.taskStatus)
-    && (value.kind === "business" || value.kind === "internal_control")
+    && (value.kind === "business" || value.kind === "internal_control"
+      || value.kind === "historical" && (value.role === "scout" || value.role === "analyst") && value.templateId === value.role && value.taskStatus === "completed")
 }
 function validItemId(value: string): boolean { return safeText(value) && value.length <= 512 && !value.includes("\0") }
 function safeText(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.trim() === value && value.length <= 512 }

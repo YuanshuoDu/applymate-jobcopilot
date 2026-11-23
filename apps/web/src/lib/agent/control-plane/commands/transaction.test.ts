@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
-import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, VERIFIED_SHORTLIST_SELECTION_SCHEMA } from "@jobcopilot/agent-protocol"
 
 import { acceptInputFacts, assertExpectedTurn, commandEventKey, createRootTurn, fallbackDisposition, lockOpenSession, type CommandTransaction } from "./transaction"
 import { activeTurnChanged } from "./errors"
@@ -93,6 +93,7 @@ describe("Agent command transaction helpers", () => {
 
     const input = agentTurn.create.mock.calls[0]?.[0]?.data.input
     expect(input).toEqual(expect.objectContaining({ goal: "Discovery goal", intent }))
+    expect(agentTurn.create.mock.calls[0]?.[0]?.data).not.toHaveProperty("executionMode")
   })
 
   it("persists the objective task-graph intent with the root dispatch", async () => {
@@ -106,6 +107,7 @@ describe("Agent command transaction helpers", () => {
       OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
     )
 
+    expect(agentTurn.create.mock.calls[0]?.[0]?.data).toMatchObject({ executionMode: "canonical_task_graph" })
     expect(agentTurn.create.mock.calls[0]?.[0]?.data.input).toEqual(expect.objectContaining({
       goal: "Find and assess options", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
     }))
@@ -114,6 +116,56 @@ describe("Agent command transaction helpers", () => {
       aggregateId: command.sessionId,
       idempotencyKey: "turn-dispatch:turn_objective",
     }))
+  })
+
+  it("marks only the exact user batch intent and verified binding as canonical", async () => {
+    const agentTurn = { create: vi.fn().mockResolvedValue({ id: "turn_batch" }) }
+    const agentOutbox = { create: vi.fn().mockResolvedValue({}) }
+    const tx = { agentTurn, agentOutbox } as unknown as CommandTransaction
+    const command = { sessionId: "session_1", userId: "user_1", clientMessageId: "client_batch", source: "user" as const }
+    const selection = { schemaVersion: VERIFIED_SHORTLIST_SELECTION_SCHEMA, source: {
+      sessionId: command.sessionId, sourceTurnId: "source_turn", rootTaskId: "root_1", graphItemId: "task-graph-root_1", graphRevision: 3,
+    }, selectedJobIds: ["job_1", "job_2"] }
+
+    await createRootTurn(tx, command, [{ type: "text", text: "Prepare selected jobs" }], "Prepare selected jobs", undefined,
+      SELECTED_JOB_BATCH_PREPARATION_INTENT, undefined, selection)
+
+    const data = agentTurn.create.mock.calls[0]?.[0]?.data
+    expect(data).toMatchObject({ executionMode: "canonical_task_graph" })
+    expect(data.input).toEqual(expect.objectContaining({ intent: SELECTED_JOB_BATCH_PREPARATION_INTENT, verifiedShortlistSelection: selection }))
+    expect(data.input).not.toHaveProperty("selectedJobPreparation")
+    expect(agentOutbox.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
+      topic: "agent.turn.dispatch", aggregateId: command.sessionId, idempotencyKey: "turn-dispatch:turn_batch",
+    }) }))
+  })
+
+  it("rejects a batch intent without the exact user binding before Turn or outbox writes", async () => {
+    const agentTurn = { create: vi.fn() }, agentOutbox = { create: vi.fn() }
+    const command = { sessionId: "session_1", userId: "user_1", clientMessageId: "client_batch_invalid", source: "automation" as const }
+    const selection = { schemaVersion: VERIFIED_SHORTLIST_SELECTION_SCHEMA, source: {
+      sessionId: "session_1", sourceTurnId: "source_turn", rootTaskId: "root_1", graphItemId: "task-graph-root_1", graphRevision: 3,
+    }, selectedJobIds: ["job_1", "job_2"] }
+
+    await expect(createRootTurn({ agentTurn, agentOutbox } as unknown as CommandTransaction, command,
+      [{ type: "text", text: "Prepare selected jobs" }], undefined, undefined, SELECTED_JOB_BATCH_PREPARATION_INTENT))
+      .rejects.toThrow("selected_job_batch_turn_binding_invalid")
+    await expect(createRootTurn({ agentTurn, agentOutbox } as unknown as CommandTransaction,
+      { ...command, source: "user" }, [{ type: "text", text: "Prepare selected jobs" }], undefined, undefined,
+      SELECTED_JOB_BATCH_PREPARATION_INTENT, null, selection)).rejects.toThrow("selected_job_batch_turn_binding_invalid")
+    expect(agentTurn.create).not.toHaveBeenCalled()
+    expect(agentOutbox.create).not.toHaveBeenCalled()
+  })
+
+  it("does not pin canonical mode for a non-user Turn with the objective intent", async () => {
+    const agentTurn = { create: vi.fn().mockResolvedValue({ id: "turn_automation_objective" }) }
+    const agentOutbox = { create: vi.fn().mockResolvedValue({}) }
+    const tx = { agentTurn, agentOutbox } as unknown as CommandTransaction
+    const command = { sessionId: "session_1", userId: "user_1", clientMessageId: "client_automation", source: "automation" as const }
+
+    await createRootTurn(tx, command, [{ type: "text", text: "Automate an objective" }], undefined, undefined,
+      OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
+
+    expect(agentTurn.create.mock.calls[0]?.[0]?.data).not.toHaveProperty("executionMode")
   })
 
   it("persists valid, invalid-sentinel, and absent objective requirements distinctly", async () => {

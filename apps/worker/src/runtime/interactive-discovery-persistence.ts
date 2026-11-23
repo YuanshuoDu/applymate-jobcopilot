@@ -63,7 +63,7 @@ export async function loadInteractiveDiscoveryShortlist(input: {
       [input.lease.sessionId, input.lease.turnId, taskIds, input.lease.userId],
     )
     const events = await client.query<Row>(
-      `SELECT event."type", event."taskId", event."payload"
+      `SELECT event."id", event."type", event."actor", event."itemId", event."taskId", event."correlationId", event."causationId", event."idempotencyKey", event."payload"
        FROM "agent_events" AS event
        JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
        JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"

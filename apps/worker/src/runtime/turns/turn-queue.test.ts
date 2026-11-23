@@ -11,7 +11,6 @@ import { createTurnQueue, markTurnDispatchClaimed, runTurnJob, TurnExecutionRegi
 import type { TurnLease } from "./lease.js"
 import { RootAbortControllerRegistry } from "../interrupt/registry.js"
 import { COGNITIVE_AGENDA_RESUME_FENCE_INVALID } from "./dlq.js"
-import { TurnLeaseError } from "./lease.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 
 const lease: TurnLease = {
@@ -466,27 +465,60 @@ describe("Turn queue processor", () => {
     expect(terminal.calls.some(sql => sql.includes('INSERT INTO "agent_outbox"'))).toBe(true)
   })
 
-  it("interrupts the child tree before requeueing a lost Turn lease", async () => {
-    const fake = pool()
-    const execute = vi.fn().mockRejectedValue(new TurnLeaseError("lease_lost", "lost"))
-    const interruptSubagents = vi.fn().mockResolvedValue(2)
-    await expect(runTurnJob(
-      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
-      { pool: fake.pool, execute, interruptSubagents },
-    )).resolves.toEqual({ status: "requeued", reasonCode: "lease_lost" })
-    expect(interruptSubagents).toHaveBeenCalledWith(expect.objectContaining(lease))
-  })
+  it("requeues a stale Turn runner without cancelling still-running child tasks", async () => {
+    const state = {
+      status: "queued",
+      ownerId: null as string | null,
+      leaseVersion: 0,
+      childStatus: "running",
+      childInterruptRequestedAt: null as Date | null,
+    }
+    const queries: Array<[string, unknown[] | undefined]> = []
+    const client = {
+      query: vi.fn(async (sql: string, params?: unknown[]) => {
+        queries.push([sql, params])
+        if (containsSql(sql, `SET "status" = 'in_progress'`)) {
+          state.status = "in_progress"
+          state.ownerId = String(params?.[2])
+          state.leaseVersion += 1
+          const startedAt = params?.[3] as Date
+          return { rows: [{ ...lease, id: lease.turnId, leaseOwnerId: state.ownerId, leaseVersion: state.leaseVersion,
+            leaseStartedAt: startedAt, leaseExpiresAt: new Date(startedAt.getTime() + Number(params?.[4])) }], rowCount: 1 }
+        }
+        if (containsSql(sql, `SET "leaseExpiresAt" = LEAST`)) return { rows: [], rowCount: 0 }
+        if (containsSql(sql, `SET "leaseOwnerId" = NULL, "leaseExpiresAt" = $5`)) return { rows: [], rowCount: 0 }
+        if (sql.includes(`SELECT "status" FROM "agent_turns"`)) return { rows: [{ status: state.status }], rowCount: 1 }
+        return { rows: [{ ...lease, id: lease.turnId, userId: "user_1" }], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const fakePool = { connect: vi.fn().mockResolvedValue(client) }
+    let runnerSignal: AbortSignal | undefined
+    const execute = vi.fn(({ signal }: { signal: AbortSignal }) => {
+      // A later Worker owns the same Turn before this runner's next heartbeat.
+      state.ownerId = "owner_2"
+      state.leaseVersion = 2
+      runnerSignal = signal
+      return new Promise<TurnExecutionResult>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true })
+      })
+    })
 
-  it("keeps lease-loss requeue semantics when child cleanup fails", async () => {
-    const fake = pool()
-    const execute = vi.fn().mockRejectedValue(new TurnLeaseError("lease_lost", "lost"))
-    const interruptSubagents = vi.fn().mockRejectedValue(new Error("child bridge unavailable"))
-    await expect(runTurnJob(
+    const result = await runTurnJob(
       { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
-      { pool: fake.pool, execute, interruptSubagents },
-    )).resolves.toEqual({ status: "requeued", reasonCode: "lease_lost" })
-    expect(interruptSubagents).toHaveBeenCalledOnce()
-    expect(fake.calls.some(sql => containsSql(sql, 'SET "leaseOwnerId" = NULL, "leaseExpiresAt" = $5'))).toBe(true)
+      { pool: fakePool, execute, heartbeatMs: 1 },
+    )
+
+    expect(result).toEqual({ status: "requeued", reasonCode: "lease_lost" })
+    expect(runnerSignal?.aborted).toBe(true)
+    const oldLeaseExpirations = queries.filter(([sql]) => containsSql(sql, `SET "leaseOwnerId" = NULL, "leaseExpiresAt" = $5`))
+    expect(oldLeaseExpirations.length).toBeGreaterThan(0)
+    for (const [sql, params] of oldLeaseExpirations) {
+      expect(containsSql(sql, `WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwnerId" = $3 AND "leaseVersion" = $4`)).toBe(true)
+      expect(params?.slice(0, 4)).toEqual(["turn_1", "session_1", "owner_1", 1])
+    }
+    expect(state).toMatchObject({ ownerId: "owner_2", leaseVersion: 2, childStatus: "running", childInterruptRequestedAt: null })
+    expect(queries.some(([sql]) => sql.includes(`"sub_agent_tasks"`))).toBe(false)
   })
 
   it("converges a durable interrupted Turn after heartbeat renewal is fenced", async () => {

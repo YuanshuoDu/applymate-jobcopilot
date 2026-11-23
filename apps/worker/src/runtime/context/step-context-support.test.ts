@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest"
 import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
 
-import type { ContextBlock, ContextOwnerFence, StepContext } from "./step-context-builder.js"
-import type { InputClaimTransaction, StepCheckpoint, StoredAgentInput } from "./input-claim-store.js"
+import { StepContextBuilder, type ContextBlock, type ContextOwnerFence, type StepContext } from "./step-context-builder.js"
+import type { InputClaimStore, InputClaimTransaction, StepCheckpoint, StoredAgentInput } from "./input-claim-store.js"
+import type { HydrationScope } from "./steering-reconciliation-context.js"
 import { checkpointWithInputs, contextForAgenda, ensureTurnInputs, hasNewlyAcceptedInput, mergeDurableRootContextInput, mergeRootContextInput, pendingInputBlocks, rootInputTextMatchesGoal, safeTaskGraphRevision } from "./step-context-support.js"
 
 
@@ -15,6 +16,20 @@ const input = (id: string, sequence: bigint, content: readonly InputContentPart[
 const ownerFence: ContextOwnerFence = { assertReferenceOwned: async () => undefined, assertAttachmentOwned: async part => ({ attachmentId: part.attachmentId, filename: "safe.pdf" }) }
 const createBlock = (layer: ContextBlock["layer"], role: ContextBlock["role"], trust: ContextBlock["trust"], source: string, id: string, content: unknown): ContextBlock => ({ id, layer, role, trust, source, content: content as ContextBlock["content"] })
 const stepContext = (overrides: Partial<StepContext> = {}): StepContext => ({ schemaVersion: "agent-harness.v2", sessionId: "session-1", turnId: "turn-1", stepId: "step-1", inputThroughSequence: 0n, consumedInputIds: [], blocks: [], canonicalJson: "", ...overrides })
+const reconciliationScope: HydrationScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", turnLeaseOwner: "worker-1", turnLeaseVersion: 1, parentLeaseOwner: "worker-1", parentAttemptCount: 1, rootInputId: null }
+
+async function buildWithUnresolvedSteering(inputs: readonly StoredAgentInput[], taskId = "root-1", hydration = reconciliationScope) {
+  const transaction = {
+    getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+    claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }),
+    loadUnresolvedSteeringInputs: async () => inputs,
+    persistCheckpoint: async () => undefined,
+  } as unknown as InputClaimTransaction
+  const store: InputClaimStore = { scope, withTransaction: work => work(transaction) }
+  const builder = new StepContextBuilder(store, ownerFence, () => now, hydration)
+  return builder.build({ scope, sessionId: "session-1", turnId: "turn-1", stepId: "step-current", taskId,
+    snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [], taskGraphRevision: 7 } })
+}
 
 describe("step context support", () => {
   it("accepts only owner-scoped Turn steer and follow-up rows", () => {
@@ -24,6 +39,29 @@ describe("step context support", () => {
 
     expect(() => ensureTurnInputs([input("steer", 1n, []), followUp], request, error)).not.toThrow()
     expect(() => ensureTurnInputs([{ ...followUp, targetTurnId: "other-turn" }], request, error)).toThrow("AgentInput follow-up is outside the tenant Turn")
+  })
+
+  it("carries a private reconciliation signal only for consumed unresolved Root steering", async () => {
+    const unresolved = input("steer-a", 8n, [{ type: "text", text: "PRIVATE_STEER_SENTINEL" }])
+    const context = await buildWithUnresolvedSteering([unresolved])
+
+    expect(context.hasUnresolvedConsumedSteer).toBe(true)
+    expect(context.blocks).toContainEqual(expect.objectContaining({ layer: "pending_input", role: "data", trust: "external_untrusted",
+      content: { inputId: unresolved.id, partIndex: 0, text: "PRIVATE_STEER_SENTINEL" } }))
+    expect(context.canonicalJson).not.toContain("hasUnresolvedConsumedSteer")
+
+    const resolved = await buildWithUnresolvedSteering([])
+    const accepted = await buildWithUnresolvedSteering([{ ...unresolved, status: "accepted" }])
+    const followUp = await buildWithUnresolvedSteering([{ ...unresolved, delivery: "follow_up" }])
+    const child = await buildWithUnresolvedSteering([unresolved], "child-1")
+    const foreign = buildWithUnresolvedSteering([{ ...unresolved, targetTurnId: "other-turn" }])
+
+    expect(resolved.hasUnresolvedConsumedSteer).toBeUndefined()
+    expect(accepted.hasUnresolvedConsumedSteer).toBeUndefined()
+    expect(followUp.hasUnresolvedConsumedSteer).toBeUndefined()
+    expect(child.hasUnresolvedConsumedSteer).toBeUndefined()
+    await expect(buildWithUnresolvedSteering([{ ...unresolved, userId: "other-user" }])).rejects.toThrow("outside the tenant Turn")
+    await expect(foreign).rejects.toThrow("outside the tenant Turn")
   })
 
   it("accepts only safe nonnegative task graph revisions", () => {

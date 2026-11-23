@@ -71,6 +71,7 @@ describe("ToolRouter", () => {
       .toMatchObject({ toolName: "agent.ask_user", toolCallId: "ask-1", taskId: "root-a" })
     expect(sink.events[0]?.item).toMatchObject({ type: "tool_call", input: { question: "[REDACTED]", choices: [] } })
     expect(sink.events.at(-1)?.item).toMatchObject({ type: "tool_result", output: result.output })
+    expect(sink.events.at(-1)?.payload).not.toHaveProperty("failureKind")
     expect(JSON.stringify(sink.events)).not.toContain("Berlin")
   })
 
@@ -346,7 +347,7 @@ describe("ToolRouter", () => {
     controller.abort()
     await expect(router.execute({ ...context, signal: controller.signal }, { ...request, id: "pre-stopped" })).resolves.toMatchObject({ status: "cancelled", errorCode: "cancelled" })
     expect(execute).not.toHaveBeenCalled()
-    expect(sink.events.map((event) => event.phase)).toEqual(["cancelled"])
+    expect(sink.events[0]).toMatchObject({ phase: "cancelled", item: { output: null }, payload: { failureKind: "diagnostic", output: null, failureDetail: { message: "Tool execution was interrupted before it started" } } })
   })
 
   it("rejects malformed inputs and outputs without invoking an unsafe result", async () => {
@@ -363,11 +364,14 @@ describe("ToolRouter", () => {
     const small = makeRouter(async () => {
       throw new ToolExecutionError("tool_failed", "raw failure detail", { result: "safe", password: "secret" })
     })
-    await expect(small.router.execute(context, { ...request, id: "structured-small" })).resolves.toMatchObject({
+    const smallResult = await small.router.execute(context, { ...request, id: "structured-small" })
+    expect(smallResult).toMatchObject({
       status: "failed",
       errorCode: "tool_failed",
       output: { result: "safe", password: "[REDACTED]" },
     })
+    expect(small.sink.events.at(-1)).toMatchObject({ item: { output: smallResult.output }, payload: { failureKind: "safe_output", output: smallResult.output } })
+    expect(small.sink.events.at(-1)?.payload).not.toHaveProperty("failureDetail")
     expect(JSON.stringify(small.sink.events)).not.toContain("secret")
 
     const large = makeRouter(async () => {
@@ -379,6 +383,26 @@ describe("ToolRouter", () => {
       output: { $truncated: true, sizeBytes: expect.any(Number) },
     })
     expect(JSON.stringify(large.sink.events)).not.toContain("secret")
+
+    const messageOutput = makeRouter(async () => { throw new ToolExecutionError("upstream_unavailable", "private detail", { message: "Safe structured result" }) })
+    const messageResult = await messageOutput.router.execute(context, { ...request, id: "structured-message" })
+    expect(messageResult.output).toEqual({ message: "Safe structured result" })
+    expect(messageOutput.sink.events.at(-1)).toMatchObject({ item: { output: messageResult.output }, payload: { failureKind: "safe_output", output: messageResult.output } })
+    expect(messageOutput.sink.events.at(-1)?.payload).not.toHaveProperty("failureDetail")
+  })
+
+  it("keeps an ordinary failure diagnostic out of the authoritative result output", async () => {
+    const ordinary = makeRouter(async () => { throw new Error("The requested data could not be loaded") })
+    const result = await ordinary.router.execute(context, { ...request, id: "ordinary-failure" })
+    const terminal = ordinary.sink.events.at(-1)
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "tool_execution_failed" })
+    expect(result).not.toHaveProperty("output")
+    expect(terminal).toMatchObject({
+      eventType: "tool_call.failed",
+      item: { type: "tool_result", output: null, errorCode: "tool_execution_failed" },
+      payload: { failureKind: "diagnostic", output: null, errorCode: "tool_execution_failed", failureDetail: { message: "The requested data could not be loaded" } },
+    })
   })
 
   it("forces every executable read call through the deterministic policy hook", async () => {
@@ -422,7 +446,7 @@ describe("ToolRouter", () => {
     await expect(router.execute(context, request)).rejects.toBe(pause)
 
     expect(sink.events.map(event => event.phase)).toEqual(["started", "failed"])
-    expect(sink.events.at(-1)?.payload).toMatchObject({ errorCode: "session_pause_requested", output: { message: "Session work is fenced by a durable pause request" } })
+    expect(sink.events.at(-1)?.payload).toMatchObject({ failureKind: "diagnostic", errorCode: "session_pause_requested", output: null, failureDetail: { message: "Session work is fenced by a durable pause request" } })
   })
 
   it("executes only the safe input produced by a policy rewrite", async () => {

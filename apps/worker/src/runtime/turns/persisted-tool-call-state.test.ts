@@ -2,6 +2,24 @@ import { describe, expect, it } from "vitest"
 
 import { restoreToolCallState } from "./persisted-tool-call-state.js"
 
+function legacyFailure(phase: "failed" | "cancelled" = "failed") {
+  const callId = "call-legacy", taskId = "task-legacy", digest = "a".repeat(24), errorCode = phase === "failed" ? "tool_execution_failed" : "cancelled"
+  const payload = { toolCallId: callId, toolName: "jobs.search", toolVersion: "1", status: phase, output: { message: "safe diagnostic" }, errorCode }
+  return {
+    items: [
+      { id: "call-row", stepId: "step-legacy", taskId, type: "tool_call", status: "completed", revision: 1,
+        content: { toolCallId: callId, toolName: "jobs.search", toolVersion: "1", status: phase, errorCode } },
+      { id: "result-row", stepId: "step-legacy", taskId, type: "tool_result", status: "completed", revision: 1,
+        content: { toolCallId: callId, output: null, errorCode } },
+    ],
+    event: {
+      id: `tool-lifecycle:task:${taskId}:${callId}:${phase}:${digest}`, type: "tool_call.failed", actor: "subagent",
+      taskId, itemId: null, correlationId: callId, causationId: null,
+      idempotencyKey: `task:${taskId}:tool-lifecycle:${callId}:${phase}:${digest}`, payload,
+    },
+  }
+}
+
 describe("restoreToolCallState", () => {
   it("returns an unfinished persisted call for registry-based restart recovery", () => {
     const restored = restoreToolCallState([
@@ -154,5 +172,99 @@ describe("restoreToolCallState", () => {
     expect(() => restoreToolCallState([
       { id: "call-item", stepId: "step-0", type: "tool_call", revision: 0, content: { toolCallId: "call-2", toolName: "jobs.search" } },
     ], [])).toThrow("tool_result_replay_uncertain")
+  })
+
+  it.each(["failed", "cancelled"] as const)("ignores only a bound legacy %s diagnostic for an explicit null result", phase => {
+    const fixture = legacyFailure(phase)
+    const restored = restoreToolCallState(fixture.items, [fixture.event])
+    expect(restored.pending).toEqual([])
+    expect(restored.observations[0]?.content).toMatchObject({ status: phase, output: null, errorCode: fixture.event.payload.errorCode })
+  })
+
+  it("preserves a structured message-shaped output and the existing event-only recovery path", () => {
+    const fixture = legacyFailure()
+    const fixtureResult = fixture.items[1]!.content as Record<string, unknown>
+    fixtureResult.output = { message: "safe diagnostic" }
+    expect(restoreToolCallState(fixture.items, [fixture.event]).observations[0]?.content.output).toEqual({ message: "safe diagnostic" })
+
+    const fixturePayload = fixture.event.payload as Record<string, unknown>
+    fixturePayload.failureKind = "safe_output"
+    const eventOnly = restoreToolCallState([fixture.items[0]!], [fixture.event])
+    expect(eventOnly.pending[0]?.durableResult?.output).toEqual({ message: "safe diagnostic" })
+
+    const taggedNull = legacyFailure()
+    const taggedPayload = taggedNull.event.payload as Record<string, unknown>
+    taggedPayload.failureKind = "safe_output"
+    expect(() => restoreToolCallState(taggedNull.items, [taggedNull.event])).toThrow("tool_result_replay_uncertain")
+
+    const mismatched = legacyFailure()
+    const mismatchedResult = mismatched.items[1]!.content as Record<string, unknown>
+    mismatchedResult.output = { message: "other" }
+    expect(() => restoreToolCallState(mismatched.items, [mismatched.event])).toThrow("tool_result_replay_uncertain")
+  })
+
+  it("rejects an untagged legacy diagnostic without a complete explicit-null pair", () => {
+    const missingResult = legacyFailure()
+    expect(() => restoreToolCallState([missingResult.items[0]!], [missingResult.event])).toThrow("tool_result_replay_uncertain")
+
+    const foreignMissingResult = legacyFailure()
+    foreignMissingResult.event.id = "foreign-event"
+    expect(() => restoreToolCallState([foreignMissingResult.items[0]!], [foreignMissingResult.event])).toThrow("tool_result_replay_uncertain")
+
+    const missingOutput = legacyFailure()
+    delete (missingOutput.items[1]!.content as Record<string, unknown>).output
+    expect(() => restoreToolCallState(missingOutput.items, [missingOutput.event])).toThrow("tool_result_replay_uncertain")
+  })
+
+  it("rejects invalid tagged failure kinds and diagnostic events with non-null output", () => {
+    const invalidKind = legacyFailure()
+    const invalidPayload = invalidKind.event.payload as Record<string, unknown>
+    invalidPayload.failureKind = "unknown"
+    expect(() => restoreToolCallState(invalidKind.items, [invalidKind.event])).toThrow("tool_result_replay_uncertain")
+
+    const diagnosticOutput = legacyFailure()
+    const payload = diagnosticOutput.event.payload as Record<string, unknown>
+    payload.failureKind = "diagnostic"
+    payload.failureDetail = { message: "safe diagnostic" }
+    expect(() => restoreToolCallState(diagnosticOutput.items, [diagnosticOutput.event])).toThrow("tool_result_replay_uncertain")
+  })
+
+  it("uses the legacy v1 tool-version fallback but rejects an explicit mismatch", () => {
+    const legacy = legacyFailure()
+    delete (legacy.items[0]!.content as Record<string, unknown>).toolVersion
+    expect(restoreToolCallState(legacy.items, [legacy.event]).pending).toEqual([])
+
+    const mismatch = legacyFailure()
+    const mismatchCall = mismatch.items[0]!.content as Record<string, unknown>
+    mismatchCall.toolVersion = "2"
+    expect(() => restoreToolCallState(mismatch.items, [mismatch.event])).toThrow("tool_result_replay_uncertain")
+  })
+
+  it.each([
+    ["foreign origin", (event: Record<string, unknown>) => { event.id = "foreign-event" }],
+    ["wrong actor", (event: Record<string, unknown>) => { event.actor = "system" }],
+    ["wrong correlation", (event: Record<string, unknown>) => { event.correlationId = "other-call" }],
+    ["wrong causal binding", (event: Record<string, unknown>) => { event.causationId = "other-event" }],
+    ["wrong idempotency key", (event: Record<string, unknown>) => { event.idempotencyKey = "foreign-key" }],
+    ["wrong phase", (event: Record<string, unknown>) => { (event.payload as Record<string, unknown>).status = "cancelled" }],
+    ["wrong error code", (event: Record<string, unknown>) => { (event.payload as Record<string, unknown>).errorCode = "other_error" }],
+    ["wrong task", (event: Record<string, unknown>) => { event.taskId = "other-task" }],
+  ])("rejects a null-result legacy diagnostic with %s provenance", (_label, alter) => {
+    const fixture = legacyFailure()
+    alter(fixture.event)
+    expect(() => restoreToolCallState(fixture.items, [fixture.event])).toThrow("tool_result_replay_uncertain")
+  })
+
+  it("rejects duplicate legacy diagnostic authority and a nonterminal pair", () => {
+    const fixture = legacyFailure()
+    expect(() => restoreToolCallState(fixture.items, [fixture.event, fixture.event])).toThrow("tool_result_replay_uncertain")
+
+    const nonterminal = legacyFailure()
+    nonterminal.items[0]!.status = "started"
+    expect(() => restoreToolCallState(nonterminal.items, [nonterminal.event])).toThrow("tool_result_replay_uncertain")
+
+    const nonterminalResult = legacyFailure()
+    nonterminalResult.items[1]!.status = "started"
+    expect(() => restoreToolCallState(nonterminalResult.items, [nonterminalResult.event])).toThrow("tool_result_replay_uncertain")
   })
 })

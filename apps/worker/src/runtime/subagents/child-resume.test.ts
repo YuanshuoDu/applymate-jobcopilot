@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from "vitest"
 import { loadChildAttemptResume } from "./child-resume.js"
 import { childWaitClaimEventKey } from "./child-durable-wait-replay.js"
 import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
+import { scoutDelegateSpawnKey } from "./scout-delegate-spawn-key.js"
+import { spawnKey } from "./pg-store-persistence.js"
 import type { SubagentLease } from "./types.js"
 
 type Row = Record<string, unknown>
@@ -33,6 +35,13 @@ function step(child: SubagentLease, overrides: Row = {}): Row {
 function item(child: SubagentLease, overrides: Row = {}): Row {
   return { id: "item-call", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, rootTaskId: child.rootTaskId, stepId: "step-1", type: "tool_call", status: "completed",
     content: { toolCallId: "call-1", toolName: "jobs.search", input: { query: "Dublin" } }, attempt: 1, ordinal: 0, ...overrides }
+}
+
+function delegateSpawnProof(child: SubagentLease, taskId: string, toolCallId: string, attempt = 1): Row {
+  return { idempotencyKey: spawnKey(child.sessionId, scoutDelegateSpawnKey(child.id, attempt, toolCallId)), spawnId: "spawn-1", spawnPayload: { taskId },
+    childTaskId: taskId, childSessionId: child.sessionId, childTurnId: child.turnId, childRootTaskId: child.rootTaskId, childParentTaskId: child.id,
+    childDepth: 2, childRole: "scout", childTaskType: "job_discovery", sessionUserId: child.userId, turnId: child.turnId,
+    turnSessionId: child.sessionId, turnUserId: child.userId }
 }
 
 function consumedWait(child: SubagentLease, targetId = "grandchild-1", note?: string): Row {
@@ -128,7 +137,7 @@ function sourceWaitEvidence(child: SubagentLease, wait: Row | undefined, items: 
 }
 
 function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], consumedWait?: Row, targets: Row[] = [],
-  waitCalls: Row[] = [], waitResults: Row[] = [], waitEvents: Row[] = []) {
+  waitCalls: Row[] = [], waitResults: Row[] = [], waitEvents: Row[] = [], delegateProofs: Row[] = []) {
   const source = sourceWaitEvidence(child, consumedWait, items)
   const persistedItems = source.items
   const persistedEvents = [...source.events, ...waitEvents]
@@ -137,6 +146,11 @@ function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], consume
     query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
       calls.push({ sql, values })
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM unnest($1::text[]) AS expected')) {
+        const keys = Array.isArray(values[0]) ? values[0] as string[] : []
+        const rows = delegateProofs.filter(row => keys.includes(String(row.idempotencyKey)))
+        return { rows, rowCount: rows.length }
+      }
       if (sql.startsWith('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: child.sessionId }], rowCount: 1 }
       if (sql.startsWith('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: child.turnId }], rowCount: 1 }
       if (sql.startsWith('SELECT "id" FROM "sub_agent_tasks"')) {
@@ -216,6 +230,23 @@ function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], consume
 }
 
 describe("child attempt durable resume", () => {
+  it("restores a prior-attempt delegate only through its owner-scoped spawn receipt", async () => {
+    const child = lease({ attemptCount: 2 }), taskId = "subagent-00000000-0000-4000-8000-000000000101", toolCallId = "delegate-call"
+    const rows = [
+      item(child, { id: "delegate-call-item", revision: 0, type: "tool_call", content: { toolCallId, toolName: "scout.delegate", input: { goal: "Inspect roles" } } }),
+      item(child, { id: "delegate-result-item", revision: 1, type: "tool_result", content: { toolCallId,
+        output: { taskId: "subagent-[REDACTED_PHONE]", status: "queued" }, errorCode: null } }),
+    ]
+    const db = fakePool(child, [step(child)], rows, undefined, [], [], [], [], [delegateSpawnProof(child, taskId, toolCallId)])
+    const restored = await loadChildAttemptResume(db.pool as never, child)
+    expect(restored?.observations.find(block => block.id === "child-resume:delegate-result-item")?.content).toMatchObject({
+      toolCallId, toolName: "scout.delegate", output: { taskId, status: "queued" },
+    })
+    expect(db.calls.find(call => call.sql.includes("FROM unnest($1::text[]) AS expected"))?.values[0]).toEqual([
+      spawnKey(child.sessionId, scoutDelegateSpawnKey(child.id, 1, toolCallId)),
+    ])
+  })
+
   it("aggregates prior attempt cursors, usage, ordinals and trusted tool results", async () => {
     const child = lease()
     const db = fakePool(child, [
@@ -308,6 +339,7 @@ describe("child attempt durable resume", () => {
   it("resumes a validated resolved wait when no continuation step has been persisted", async () => {
     const child = lease({ attemptCount: 3 })
     const sourceStepId = `task:${child.id}:step:4:attempt:${child.attemptCount}`
+    const delegateCallId = "delegate-before-wait", delegateTaskId = "subagent-00000000-0000-4000-8000-000000000101"
     const wait = consumedWait(child)
     const input = { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 }
     const output = (wait.waitResult as Row).outcome
@@ -320,14 +352,21 @@ describe("child attempt durable resume", () => {
         content: { toolCallId: "wait-call", toolName: "wait_subagents", input } }),
       item(child, { id: "wait-result-id", stepId: sourceStepId, attempt: 3, ordinal: 18, type: "tool_result",
         content: { toolCallId: "wait-call", output: { ...(output as Row), status: "waiting", matchedTaskIds: [] }, errorCode: null } }),
-    ])
+      item(child, { id: "delegate-call-item", stepId: sourceStepId, attempt: 3, ordinal: 18, revision: 0, type: "tool_call",
+        content: { toolCallId: delegateCallId, toolName: "scout.delegate", input: { goal: "Inspect roles" } } }),
+      item(child, { id: "delegate-result-item", stepId: sourceStepId, attempt: 3, ordinal: 18, revision: 1, type: "tool_result",
+        content: { toolCallId: delegateCallId, output: { taskId: "subagent-[REDACTED_PHONE]", status: "queued" }, errorCode: null } }),
+    ], undefined, [], [], [], [], [delegateSpawnProof(child, delegateTaskId, delegateCallId, 3)])
 
     const restored = await loadChildAttemptResume(db.pool as never, child, new Date(), durableWait)
 
     expect(restored).toMatchObject({
-      resume: { nextOrdinal: 5, stepCount: 2, toolCallCount: 1 },
+      resume: { nextOrdinal: 5, stepCount: 2, toolCallCount: 2 },
       durableWait: { waitId: WAIT_ID, stepId: sourceStepId, ordinal: 18, toolCallId: "wait-call" },
-      observations: [{ id: "child-resume:wait-result-id", content: { toolCallId: "wait-call", toolName: "wait_subagents", output: { waitId: "[REDACTED_PHONE]", status: "ready" } } }],
+      observations: [
+        { id: "child-resume:delegate-result-item", content: { toolCallId: delegateCallId, toolName: "scout.delegate", output: { taskId: delegateTaskId, status: "queued" } } },
+        { id: "child-resume:wait-result-id", content: { toolCallId: "wait-call", toolName: "wait_subagents", output: { waitId: WAIT_ID, status: "ready" } } },
+      ],
     })
     expect(restored?.durableWait).not.toHaveProperty("continuationStepId")
     expect(restored).not.toHaveProperty("childWaitClaimRecovery")

@@ -1,4 +1,42 @@
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
+
+const locationReaderHarness = vi.hoisted(() => ({ enabled: false, value: null as unknown, calls: [] as unknown[][] }))
+vi.mock("../subagents/task-graph-confirmed-location-steer.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../subagents/task-graph-confirmed-location-steer.js")>()
+  return { ...actual, readTaskGraphConfirmedLocationSteer: (...args: Parameters<typeof actual.readTaskGraphConfirmedLocationSteer>) => {
+    if (!locationReaderHarness.enabled) return actual.readTaskGraphConfirmedLocationSteer(...args)
+    locationReaderHarness.calls.push(args)
+    return Promise.resolve(locationReaderHarness.value as Awaited<ReturnType<typeof actual.readTaskGraphConfirmedLocationSteer>>)
+  } }
+})
+const locationCompletionHarness = vi.hoisted(() => ({ enabled: false, value: null as unknown, calls: [] as unknown[][] }))
+vi.mock("./task-graph-confirmed-location-completion.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./task-graph-confirmed-location-completion.js")>()
+  return { ...actual, resolveTaskGraphConfirmedLocationCompletion: (...args: Parameters<typeof actual.resolveTaskGraphConfirmedLocationCompletion>) => {
+    if (!locationCompletionHarness.enabled) return actual.resolveTaskGraphConfirmedLocationCompletion(...args)
+    locationCompletionHarness.calls.push(args)
+    return Promise.resolve(locationCompletionHarness.value as Awaited<ReturnType<typeof actual.resolveTaskGraphConfirmedLocationCompletion>>)
+  } }
+})
+const reconciliationHarness = vi.hoisted(() => ({ enabled: false, value: null as unknown, error: null as Error | null, calls: [] as unknown[][] }))
+vi.mock("../subagents/steering-reconciliation-read.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../subagents/steering-reconciliation-read.js")>()
+  return { ...actual, readSteeringReconciliationState: (...args: Parameters<typeof actual.readSteeringReconciliationState>) => {
+    if (!reconciliationHarness.enabled) return actual.readSteeringReconciliationState(...args)
+    reconciliationHarness.calls.push(args)
+    if (reconciliationHarness.error) throw reconciliationHarness.error
+    return Promise.resolve(reconciliationHarness.value as Awaited<ReturnType<typeof actual.readSteeringReconciliationState>>)
+  } }
+})
+const graphLoadHarness = vi.hoisted(() => ({ enabled: false, value: null as unknown, calls: [] as unknown[][] }))
+vi.mock("../subagents/task-graph-pg-state.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../subagents/task-graph-pg-state.js")>()
+  return { ...actual, loadTaskGraph: (...args: Parameters<typeof actual.loadTaskGraph>) => {
+    if (!graphLoadHarness.enabled) return actual.loadTaskGraph(...args)
+    graphLoadHarness.calls.push(args)
+    return Promise.resolve(graphLoadHarness.value as Awaited<ReturnType<typeof actual.loadTaskGraph>>)
+  } }
+})
 
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnEngineStep } from "./turn-engine-types.js"
@@ -6,17 +44,28 @@ import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS,
   SCHEDULED_PIPELINE_COMPLETION, SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME, TASK_GRAPH_DENIAL_CHECKPOINT,
   type TurnEngineCompletionGate } from "./turn-execution-types.js"
-import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
+import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK,
+  type SteeringReconciliationState } from "../subagents/steering-reconciliation-contract.js"
+import { OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE } from "@jobcopilot/agent-protocol"
+import { STEERING_RECONCILIATION_EVENT_TYPE } from "../subagents/steering-reconciliation-contract.js"
 import { assertCompletionAllowed, checkTaskGraphTerminalVerification, completionRecoverySnapshot, repairReportState, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-completion-gate.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY } from "./completion-recovery-context.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
+import { buildGroundedTaskGraphFinalResponse } from "../subagents/task-graph-final-response.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA } from "./task-graph-terminal-assessment.js"
 import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "./turn-question-gate-choice-contract.js"
 import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK } from "../subagents/scheduled-post-gate-contract.js"
+
+afterEach(() => {
+  reconciliationHarness.enabled = false; reconciliationHarness.value = null; reconciliationHarness.error = null; reconciliationHarness.calls = []
+  graphLoadHarness.enabled = false; graphLoadHarness.value = null; graphLoadHarness.calls = []
+  locationReaderHarness.enabled = false; locationReaderHarness.value = null; locationReaderHarness.calls = []
+  locationCompletionHarness.enabled = false; locationCompletionHarness.value = null; locationCompletionHarness.calls = []
+})
 
 type GateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate">
 type GateWriter = Pick<TurnExecutionEventWriter, "append">
@@ -553,15 +602,17 @@ describe("TaskGraph terminal verification gate", () => {
     const recovered = applyCompletionRecovery(snapshot, "step-1", result.feedback)
     expect(recovered.system[0]?.content).toContain("at graph revision 7:")
     expect(recovered.system[0]?.content).toContain("nodeOrdinal=1 criterionOrdinal=1")
-    expect(reads[0]?.sql).toContain('item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4')
-    expect(reads[0]?.params).toEqual([expect.any(String), "session-1", "turn-1", "root-1", "user-1"])
+    const itemRead = reads.find(read => read.sql.includes('FROM "agent_items" AS item'))
+    expect(itemRead?.sql).toContain('item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4')
+    expect(itemRead?.params).toEqual([expect.any(String), "session-1", "turn-1", "root-1", "user-1"])
     expect(append).toHaveBeenCalledWith("final.rejected", step.id, null, expect.objectContaining({ feedback: expect.stringContaining("nodeOrdinal=1") }), `final-rejected:${step.id}`)
     expect(JSON.stringify(append.mock.calls[0]?.[3])).not.toContain("task-graph-repair-recovery.v1")
   })
 
   it("does not stamp missing or invalid graph revisions as ordinal authority", async () => {
-    const missing = { query: vi.fn(async (sql: string) => sql.includes('FROM "agent_items" AS item')
-      ? { rows: [], rowCount: 0 } : { rows: [{ id: "proposal" }], rowCount: 1 }) } as never
+    const missing = { query: vi.fn(async (sql: string) => sql.includes('event."type" = $4')
+      ? { rows: [], rowCount: 0 } : sql.includes('FROM "agent_items" AS item')
+        ? { rows: [], rowCount: 0 } : { rows: [{ id: "proposal" }], rowCount: 1 }) } as never
     const invalid = graphClient([node("scout", "task-scout")], [{ id: "task-scout", status: "failed", role: "scout", failureReason: "task_graph_verification_failed", result: storedResult("failed") }], 0)
     for (const completionGate of [
       async () => checkTaskGraphTerminalVerification(missing, graphLease, "root-1"),
@@ -580,6 +631,7 @@ describe("TaskGraph terminal verification gate", () => {
     const queries: string[] = []
     const client = { query: vi.fn(async (sql: string) => {
       queries.push(sql)
+      if (sql.includes('event."type" = $4')) return { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_items" AS item')) return { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_events" AS event')) return { rows: [{ id: "native-command-event" }], rowCount: 1 }
       throw new Error(`Unexpected graph query: ${sql}`)
@@ -588,7 +640,7 @@ describe("TaskGraph terminal verification gate", () => {
     await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1"))
       .resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
 
-    expect(queries[1]).toContain("IN ('proposal', 'native_command')")
+    expect(queries.find(sql => sql.includes("IN ('proposal', 'native_command')"))).toContain("IN ('proposal', 'native_command')")
   })
 
   it("requires a current non-empty graph only for explicit objective completion", async () => {
@@ -604,6 +656,132 @@ describe("TaskGraph terminal verification gate", () => {
     await expect(checkTaskGraphTerminalVerification(graphClient([scout], [{
       id: scout.taskId, status: "completed", role: "scout", failureReason: null, result: storedResult("passed"),
     }]), graphLease, "root-1", false, true)).resolves.toMatchObject({ ok: true })
+  })
+
+  it("uses an owner-scoped reconciliation hint and loads source checkpoints only for a validated revise", async () => {
+    const baseState: SteeringReconciliationState = { originalInputId: null, currentRevision: 1, decisionStepId: null,
+      decisionStepOrdinal: null, decisionStepAttempt: null, decisionInputThroughSequence: null, agendaPlanRevision: null, unresolvedInputs: [] }
+    const loaded = { rootTaskId: "root-1", snapshot: { nodes: [] }, item: { id: "graph-item", revision: 1, content: {}, createdAt: nowValue },
+      state: { revision: 1 }, tasks: new Map(), sourceInputCheckpointByNodeKey: new Map(), sourceInputRelationByNodeKey: new Map() }
+    graphLoadHarness.enabled = true
+    graphLoadHarness.value = loaded
+    reconciliationHarness.enabled = true
+    reconciliationHarness.value = baseState
+    let hasHint = false
+    const queries: Array<{ sql: string; params?: unknown[] }> = []
+    const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
+      queries.push({ sql, params })
+      const hinted = hasHint && params?.[3] === STEERING_RECONCILIATION_EVENT_TYPE
+      return { rows: hinted ? [{ id: "receipt-hint" }] : [], rowCount: hinted ? 1 : 0 }
+    }) } as never
+
+    await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1")).resolves.toMatchObject({ ok: true })
+    expect(reconciliationHarness.calls).toHaveLength(0)
+    expect(graphLoadHarness.calls[0]?.[3]).toEqual({})
+
+    hasHint = true
+    await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1")).resolves.toMatchObject({ ok: true })
+    expect(reconciliationHarness.calls).toHaveLength(1)
+    expect(graphLoadHarness.calls[1]?.[3]).toEqual({})
+
+    reconciliationHarness.value = { ...baseState, latestUserRevision: { resultingRevision: 1, stepId: "revise-step", inputThroughSequence: 10n } }
+    await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1")).resolves.toMatchObject({ ok: true })
+    expect(graphLoadHarness.calls[2]?.[3]).toEqual({ includeSourceProvenance: true })
+    const hint = queries.find(query => query.sql.includes('event."type" = $4'))
+    expect(hint?.sql).toContain('event."taskId" = $3')
+    expect(hint?.sql).toContain('turn."leaseOwnerId" = $5 AND turn."leaseVersion" = $6')
+    expect(hint?.sql).toContain("to_jsonb(turn)->>'source' = 'user'")
+    expect(hint?.params).toEqual(["session-1", "turn-1", "root-1", expect.any(String), "worker-1", 1, "user-1"])
+    expect(reconciliationHarness.calls[1]?.[1]).toMatchObject({ turnLeaseOwner: "worker-1", turnLeaseVersion: 1,
+      parentLeaseOwner: "worker-1", parentAttemptCount: 1, rootTaskId: "root-1" })
+  })
+
+  it("routes the typed location event through the exact reconciled cutoff and persisted Turn input", async () => {
+    const state: SteeringReconciliationState = { originalInputId: null, currentRevision: 1, decisionStepId: null,
+      decisionStepOrdinal: null, decisionStepAttempt: null, decisionInputThroughSequence: null, agendaPlanRevision: null,
+      lastReconciledInputThroughSequence: 12n, unresolvedInputs: [] }
+    const loaded = { rootTaskId: "root-1", snapshot: { nodes: [] }, item: { id: "graph-item", revision: 1, content: {}, createdAt: nowValue },
+      state: { revision: 1, nodes: [] }, tasks: new Map(), sourceInputCheckpointByNodeKey: new Map(), sourceInputRelationByNodeKey: new Map() }
+    reconciliationHarness.enabled = true
+    reconciliationHarness.value = state
+    graphLoadHarness.enabled = true
+    graphLoadHarness.value = loaded
+    locationReaderHarness.enabled = true
+    locationReaderHarness.value = { kind: "confirmed", locations: ["dublin"], acceptedInputSequence: 12n }
+    locationCompletionHarness.enabled = true
+    locationCompletionHarness.value = { kind: "applicable", historicalNodeIndices: new Set() }
+    const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('SELECT turn."input"')) return { rows: [{ input: { verificationRequirements: { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: [] } } }], rowCount: 1 }
+      const hinted = params?.[3] === OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE
+      return { rows: hinted ? [{ id: "typed-location-hint" }] : [], rowCount: hinted ? 1 : 0 }
+    }) } as never
+
+    await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1")).resolves.toMatchObject({ ok: true })
+    expect(locationReaderHarness.calls[0]?.[1]).toEqual({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1" })
+    expect(locationReaderHarness.calls[0]?.[2]).toBe(12n)
+    expect(graphLoadHarness.calls[0]?.[3]).toEqual({ includeSourceProvenance: true })
+    expect(locationCompletionHarness.calls[0]?.[0]).toMatchObject({ reconciliation: state, confirmed: locationReaderHarness.value,
+      persistedTurnInput: { verificationRequirements: { requirements: [] } } })
+  })
+
+  it("blocks a typed location steer that is newer than the validated reconciliation cutoff", async () => {
+    const state: SteeringReconciliationState = { originalInputId: null, currentRevision: 1, decisionStepId: null,
+      decisionStepOrdinal: null, decisionStepAttempt: null, decisionInputThroughSequence: null, agendaPlanRevision: null,
+      lastReconciledInputThroughSequence: 10n, unresolvedInputs: [] }
+    reconciliationHarness.enabled = true
+    reconciliationHarness.value = state
+    locationReaderHarness.enabled = true
+    locationReaderHarness.value = { kind: "pending" }
+    const client = { query: vi.fn(async (_sql: string, params?: unknown[]) => {
+      const hinted = params?.[3] === OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE
+      return { rows: hinted ? [{ id: "typed-location-hint" }] : [], rowCount: hinted ? 1 : 0 }
+    }) } as never
+    await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1"))
+      .resolves.toMatchObject({ ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK })
+    expect(locationReaderHarness.calls[0]?.[2]).toBe(10n)
+    expect(graphLoadHarness.calls).toHaveLength(0)
+  })
+
+  it("blocks unresolved steering with the existing steering recovery before graph loading", async () => {
+    const baseState: SteeringReconciliationState = { originalInputId: null, currentRevision: 1, decisionStepId: null,
+      decisionStepOrdinal: null, decisionStepAttempt: null, decisionInputThroughSequence: null, agendaPlanRevision: null,
+      unresolvedInputs: [{ id: "steer-1", acceptedSequence: 2n, status: "accepted", consumedByStepId: null, consumingOrdinal: null }] }
+    reconciliationHarness.enabled = true
+    reconciliationHarness.value = baseState
+    const client = { query: vi.fn(async () => ({ rows: [{ id: "receipt-hint" }], rowCount: 1 })) } as never
+    await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1"))
+      .resolves.toMatchObject({ ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK })
+    expect(graphLoadHarness.calls).toHaveLength(0)
+  })
+
+  it("returns a bounded applicability replan when only stale verified role evidence remains", async () => {
+    const baseState: SteeringReconciliationState = { originalInputId: null, currentRevision: 1, decisionStepId: null,
+      decisionStepOrdinal: null, decisionStepAttempt: null, decisionInputThroughSequence: null, agendaPlanRevision: null, unresolvedInputs: [],
+      latestUserRevision: { resultingRevision: 1, stepId: "revise-step", inputThroughSequence: 10n } }
+    const oldScout = node("old-scout", "old-scout-task")
+    const loaded = { rootTaskId: "root-1", snapshot: { nodes: [oldScout] }, item: { id: "graph-item", revision: 1, content: {}, createdAt: nowValue },
+      state: { revision: 1 }, tasks: new Map([[oldScout.taskId, { id: oldScout.taskId, status: "completed", role: "scout", taskType: "job_discovery",
+        failureReason: null, result: storedResult("passed") }]]), sourceInputCheckpointByNodeKey: new Map([[oldScout.key, { inputThroughSequence: 9n }]]),
+      sourceInputRelationByNodeKey: new Map([[oldScout.key, "unknown"]]) }
+    reconciliationHarness.enabled = true
+    reconciliationHarness.value = baseState
+    graphLoadHarness.enabled = true
+    graphLoadHarness.value = loaded
+    const client = { query: vi.fn(async () => ({ rows: [{ id: "receipt-hint" }], rowCount: 1 })) } as never
+    const decision = await checkTaskGraphTerminalVerification(client, graphLease, "root-1")
+    expect(decision).toMatchObject({ ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER,
+      feedback: expect.stringContaining("issue=result_applicability") })
+    if (decision.ok) return
+    expect(decision.feedback.length).toBeLessThanOrEqual(512)
+  })
+
+  it("fails closed when hinted reconciliation history is corrupt", async () => {
+    reconciliationHarness.enabled = true
+    reconciliationHarness.error = new Error("steering_reconciliation_receipt_invalid")
+    const client = { query: vi.fn(async () => ({ rows: [{ id: "receipt-hint" }], rowCount: 1 })) } as never
+    await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1"))
+      .resolves.toMatchObject({ ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER })
+    expect(graphLoadHarness.calls).toHaveLength(0)
   })
 
   it("fails closed for legacy-unverified and missing durable reports", async () => {
@@ -904,10 +1082,20 @@ describe("TaskGraph terminal verification gate", () => {
       { id: rejected.taskId, status: "failed", role: "scout", failureReason: "task_graph_repair_target_unresolved", result: { structuredResult: structuredResult("passed"), taskGraphVerificationReport: rejectedReport } },
       { id: repair.taskId, status: "completed", role: "scout", failureReason: null, result: { ...storedResult("passed"), taskGraphRepairReceipt: receipt } },
     ]
-    await expect(checkTaskGraphTerminalVerification(graphClient([target, rejected, repair], tasks), graphLease, "root-1")).resolves.toMatchObject({ ok: true })
+    const accepted = await checkTaskGraphTerminalVerification(graphClient([target, rejected, repair], tasks), graphLease, "root-1")
+    expect(accepted).toMatchObject({ ok: true })
+    if (!accepted.ok) return
+    const binding = accepted[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+    expect(binding?.resolvedRepairTaskIds).toEqual(["task-repair-first", "task-scout"])
+    const finalResponse = buildGroundedTaskGraphFinalResponse(binding!)
+    expect(finalResponse).toContain("Search results: 1 unique job reported (partial coverage).")
+    expect(finalResponse).toContain("Search: 2 failed tasks; valid structured result reported completed. Verified repair evidence covers the affected criteria.")
+    expect(finalResponse).not.toContain("Inspect the reported Search task outcome.")
+    expect(finalResponse).not.toContain("task-repair-first")
     const unresolved = await checkTaskGraphTerminalVerification(graphClient([target, rejected], tasks.slice(0, 2)), graphLease, "root-1")
     expect(unresolved).toMatchObject({ ok: false })
     if (unresolved.ok) return
+    expect(Reflect.get(unresolved, TASK_GRAPH_FINAL_SUMMARY_BINDING)).toBeUndefined()
     expect(unresolved.feedback).toContain("nodeOrdinal=2 status=unverified reasonCode=repair_target_unresolved")
     const rejectedResult = tasks[1]!.result as Record<string, unknown>
     const forged = [{ ...tasks[0] }, { ...tasks[1], result: { ...rejectedResult, taskGraphRepairReceipt: { ...receipt, targetTaskId: "foreign" } } }, tasks[2]!]

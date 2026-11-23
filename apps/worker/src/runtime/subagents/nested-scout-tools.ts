@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto"
 import { Type } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import type pg from "pg"
@@ -10,7 +9,9 @@ import { parseDiscoveryAttemptSidecar, type DiscoveryAttemptSidecar } from "./ch
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { projectNestedScoutResults } from "./nested-scout-result-projection.js"
 import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "../tools/types.js"
+import { markScoutDelegateOutput } from "../tools/scout-delegate-output-redaction.js"
 import { NestedScoutBudgetPolicyError, type SubagentLease, type SubagentTaskSpec } from "./types.js"
+import { scoutDelegateSpawnKey } from "./scout-delegate-spawn-key.js"
 
 const MAX_GOAL_LENGTH = 300, MAX_CHILDREN = 2, MAX_ROWS = 3, MAX_STORED_RESULT_BYTES = 65_536
 const MAX_PARENT_CONSTRAINTS = 31, MAX_CONSTRAINT_LENGTH = 1_000
@@ -139,7 +140,7 @@ export function createNestedScoutTools(options: NestedToolOptions): readonly Run
         ...(lease.budgetSnapshot === undefined ? {} : { budgetSnapshot: lease.budgetSnapshot }),
         policy: { maxDepth: 2, maxFanOut: 2 },
       }
-      const key = `scout-delegate:${createHash("sha256").update(JSON.stringify([lease.id, lease.attemptCount, callId])).digest("hex")}`
+      const key = scoutDelegateSpawnKey(lease.id, lease.attemptCount, callId)
       let result: Awaited<ReturnType<typeof manager.spawnFromLease>>
       try { result = await manager.spawnFromLease(spec, key, lease, { stepId: context.stepId, toolCallId: callId }) }
       catch (error: unknown) {
@@ -150,7 +151,13 @@ export function createNestedScoutTools(options: NestedToolOptions): readonly Run
       if (result.atomic !== true || !child || child.parentTaskId !== lease.id || child.userId !== lease.userId
         || child.sessionId !== lease.sessionId || child.turnId !== lease.turnId || child.rootTaskId !== lease.rootTaskId
         || child.depth !== 2 || child.role !== "scout" || child.taskType !== "job_discovery") throw unavailable("nested_scout_spawn_unavailable")
-      return { taskId: child.id, status: result.duplicate ? "duplicate" : "queued" }
+      const status = result.duplicate ? "duplicate" as const : "queued" as const
+      const receipt = { taskId: child.id, status }
+      if (!markScoutDelegateOutput(receipt, { sessionId: context.sessionId, turnId: context.turnId,
+        rootTaskId: lease.rootTaskId, parentTaskId: lease.id, stepId: context.stepId, toolCallId: callId }, child.id, status)) {
+        throw unavailable("nested_scout_spawn_unavailable")
+      }
+      return receipt
     },
   }
   const results: RuntimeToolDefinition = {

@@ -34,6 +34,8 @@ export type PrepareFinalDependencyWaitInput = Readonly<{
   step: TurnEngineStep
   context: StepContext
   snapshot: StepContextSnapshot
+  /** Engine-owned request-local aliases for model-visible child tool IDs. */
+  toolCallAliases?: ReadonlyMap<string, string>
   signal: AbortSignal
 }>
 export type PrepareFinalDependencyWait = (input: PrepareFinalDependencyWaitInput) =>

@@ -5,9 +5,11 @@ import type { ContextSeedBlock } from "../context/step-context-builder.js"
 import type { ChildToolReplayReceipt, ChildWaitReplayReceipt } from "../turns/turn-execution-options.js"
 import type { SubagentLease } from "./types.js"
 import { dateValue, DurableSubagentWaitError, object as waitObject, safeSubagentWaitJson, waitResult, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
-import { markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
-import { buildChildResumeReplayReceipts, type ChildResumeReplayPair } from "./child-resume-replay-receipts.js"
+import { markCanonicalSubagentWaitId, markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
+import { buildChildResumeReplayReceipts, type ChildResumeReplayPair, type ChildResumeReplayReceiptSet } from "./child-resume-replay-receipts.js"
 import { redactJobReadOutput } from "../tools/job-read-output-redaction.js"
+import { prepareScoutResultsOutput } from "../tools/scout-results-output-redaction.js"
+import { isSubagentTaskId } from "../tools/redaction.js"
 import { createDurableDiscoveryAssembly, parseDurableDiscoveryReference, reduceDurableDiscoveryChunk, type DurableDiscoveryAssembly } from "./child-durable-discovery.js"
 
 type Row = Record<string, unknown>
@@ -25,19 +27,9 @@ export type ChildResumeObservationSet = Readonly<{
   observations: readonly ContextSeedBlock[]; childToolReplayReceipts: readonly ChildToolReplayReceipt[]; childWaitReplayReceipts: readonly ChildWaitReplayReceipt[]
 }>
 
-function text(row: Row, key: string): string {
-  const value = row[key]
-  if (typeof value !== "string" || value.trim().length === 0) throw new Error(`child_resume_invalid_${key}`)
-  return value
-}
-export function integer(row: Row, key: string, minimum = 0): number {
-  const value = typeof row[key] === "number" ? row[key] : Number(row[key])
-  if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`child_resume_invalid_${key}`)
-  return value
-}
-function object(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
-}
+function text(row: Row, key: string): string { const value = row[key]; if (typeof value !== "string" || value.trim().length === 0) throw new Error(`child_resume_invalid_${key}`); return value }
+export function integer(row: Row, key: string, minimum = 0): number { const value = typeof row[key] === "number" ? row[key] : Number(row[key]); if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`child_resume_invalid_${key}`); return value }
+function object(value: unknown): Record<string, unknown> | null { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null }
 function waitTask(value: Row | null): value is Row & { readonly taskId: string } {
   return !!value && typeof value.taskId === "string"
 }
@@ -121,19 +113,31 @@ function verifiedDiscoveryReadPairs(pairs: readonly ChildResumeReplayPair[]): Se
   }
   return verified
 }
+type RestoredScoutDelegate = Readonly<{ taskId: string; status: "queued" | "duplicate" }>
 export function buildChildResumeObservations(rows: readonly Row[], lease: SubagentLease, currentAttemptOrdinal?: number, durableWaits: readonly DurableWaitResume[] = []): ChildResumeObservationSet {
-  const replay = buildChildResumeReplayReceipts(rows, lease, currentAttemptOrdinal, durableWaits)
+  return projectChildResumeObservations(buildChildResumeReplayReceipts(rows, lease, currentAttemptOrdinal, durableWaits))
+}
+export function projectChildResumeObservations(replay: ChildResumeReplayReceiptSet,
+  delegateResults?: ReadonlyMap<string, RestoredScoutDelegate>): ChildResumeObservationSet {
   if (replay.pairs.length > MAX_RESTORED_OBSERVATIONS) throw new Error("child_resume_observation_limit")
+  const verifiedScoutResults = new Set(replay.childToolReplayReceipts.filter(receipt =>
+    receipt.toolName === "scout.results" && receipt.result.status === "completed" && receipt.result.errorCode === null).map(receipt => receipt.resultItem.id))
   const verifiedReads = verifiedDiscoveryReadPairs(replay.pairs)
-  const restored = replay.pairs.map((item, index) => ({ id: `child-resume:${item.resultItemId}`, content: { toolCallId: item.toolCallId, toolName: item.toolName,
-    input: boundedJson(item.input, MAX_TOOL_INPUT_BYTES), status: item.status,
-    output: item.toolName === "jobs.discover" ? boundedDiscoveryJson(item.output, MAX_TOOL_OUTPUT_BYTES)
-      : item.toolName === "tool_results.read" && verifiedReads.has(index) ? boundedNormalizedJson(item.output as RepositoryJsonValue, MAX_TOOL_OUTPUT_BYTES) : boundedJson(item.output, MAX_TOOL_OUTPUT_BYTES),
-    errorCode: item.status === "completed" ? null : "tool_execution_failed" } }))
+  const restored = replay.pairs.map((item, index) => {
+    const delegate = item.toolName === "scout.delegate" && item.status === "completed" ? delegateResults?.get(item.resultItemId) : undefined
+    if (delegate && (!isSubagentTaskId(delegate.taskId) || delegate.status !== "queued" && delegate.status !== "duplicate")) throw new Error("child_resume_delegate_receipt_unavailable")
+    return { id: "child-resume:" + item.resultItemId, content: { toolCallId: item.toolCallId, toolName: item.toolName,
+      input: boundedJson(item.input, MAX_TOOL_INPUT_BYTES), status: item.status,
+      output: delegate ? boundedNormalizedJson({ taskId: delegate.taskId, status: delegate.status }, MAX_TOOL_OUTPUT_BYTES)
+        : item.toolName === "scout.results" && item.status === "completed" && verifiedScoutResults.has(item.resultItemId)
+          ? boundedNormalizedJson(prepareScoutResultsOutput(item.output) ?? safeJson(item.output), MAX_TOOL_OUTPUT_BYTES)
+          : item.toolName === "jobs.discover" ? boundedDiscoveryJson(item.output, MAX_TOOL_OUTPUT_BYTES)
+            : item.toolName === "tool_results.read" && verifiedReads.has(index) ? boundedNormalizedJson(item.output as RepositoryJsonValue, MAX_TOOL_OUTPUT_BYTES) : boundedJson(item.output, MAX_TOOL_OUTPUT_BYTES),
+      errorCode: item.status === "completed" ? null : "tool_execution_failed" } }
+  })
   if (Buffer.byteLength(JSON.stringify(restored), "utf8") > MAX_RESTORED_OBSERVATION_BYTES) throw new Error("child_resume_observation_limit")
   return { observations: restored, childToolReplayReceipts: replay.childToolReplayReceipts, childWaitReplayReceipts: replay.childWaitReplayReceipts }
 }
-
 export function countChildResumeToolCalls(rows: readonly Row[], lease: SubagentLease, currentAttemptOrdinal?: number): number {
   let count = 0
   for (const row of rows) {
@@ -148,7 +152,6 @@ export function countChildResumeToolCalls(rows: readonly Row[], lease: SubagentL
   }
   return count
 }
-
 export function mergeDurableWaitObservation(observations: readonly ContextSeedBlock[], wait: DurableWaitResume): readonly ContextSeedBlock[] {
   if (!wait.waitId.trim() || !wait.stepId.trim() || !canonicalToolCallId(wait.toolCallId) || !wait.sourceItemId.trim()
     || !Number.isSafeInteger(wait.attempt) || !Number.isSafeInteger(wait.ordinal) || wait.attempt < 1 || wait.ordinal < 0) {
@@ -182,6 +185,7 @@ export function mergeDurableWaitObservation(observations: readonly ContextSeedBl
   const alignedOutput = { taskIds: rawOutputIds, matchedTaskIds: rawMatchedIds, tasks: rawOutputIds.map(id => taskById.get(id)!) }
   if (!markCanonicalSubagentWaitTargetIds({ targetTaskIds: inputIds }, alignedInput, inputIds)
     || !markCanonicalSubagentWaitTargetIds({ targetTaskIds: rawOutputIds }, alignedOutput, rawOutputIds)) throw new Error("child_resume_invalid_wait_result")
+  markCanonicalSubagentWaitId(output, wait.waitId) // exact validated ID; noncanonical legacy IDs remain redacted
   const sourceObservationId = `child-resume:${wait.sourceItemId}`
   const sourceMatches = observations.filter(item => item.id === sourceObservationId)
   const matching = observations.filter(item => object(item.content)?.toolCallId === wait.toolCallId)
@@ -200,7 +204,6 @@ export function mergeDurableWaitObservation(observations: readonly ContextSeedBl
   return [...observations.filter(observation => observation.id !== sourceObservationId
     && object(observation.content)?.toolCallId !== wait.toolCallId), item]
 }
-
 function inputIdsOf(value: unknown): string[] {
   const input = object(value)
   if (!input || !exactKeys(input, ["idempotencyKey", "taskIds", "mode", "timeoutMs"])
@@ -212,11 +215,9 @@ function inputIdsOf(value: unknown): string[] {
     || Number(input.timeoutMs) < 1 || Number(input.timeoutMs) > 30_000) throw new Error("child_resume_invalid_wait_input")
   return input.taskIds as string[]
 }
-
 export function sameIds(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && new Set(left).size === left.length && new Set(right).size === right.length && left.every(id => right.includes(id))
 }
-
 function strictIds(value: unknown): string[] | undefined {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
   if (!Array.isArray(parsed)) return undefined
@@ -227,7 +228,6 @@ function strictIds(value: unknown): string[] | undefined {
   }
   return new Set(ids).size === ids.length ? ids : undefined
 }
-
 export function resolveDurableWaitOutcome(wait: Row, ids: readonly string[], currentMatched: readonly string[], now: Date): DurableSubagentWaitResult {
   const stored = waitObject(waitObject(wait.result).outcome)
   const rowMatched = strictIds(wait.matchedTaskIds), storedMatched = strictIds(stored.matchedTaskIds)

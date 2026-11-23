@@ -224,7 +224,7 @@ function denseArray(value: unknown, minLength: number, maxLength: number): unkno
   return value
 }
 
-function isSubagentTaskId(value: unknown): value is string {
+export function isSubagentTaskId(value: unknown): value is string {
   return typeof value === "string" && SUBAGENT_TASK_ID.test(value)
 }
 

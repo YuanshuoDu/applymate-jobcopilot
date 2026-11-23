@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 
-import { isCanonicalTaskGraphSourceManifestWeb, parseFinalTaskGraphSourceManifest, TASK_GRAPH_SOURCES_SCHEMA_VERSION } from './final-task-graph-source-manifest'
+import { isCanonicalTaskGraphSourceManifestWeb, parseFinalTaskGraphSourceManifest, TASK_GRAPH_SOURCES_SCHEMA_VERSION,
+  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2 } from './final-task-graph-source-manifest'
 
 const key = (letter: string) => `src_${letter.repeat(43)}`
 const valid = {
@@ -15,9 +16,56 @@ const valid = {
 
 describe('parseFinalTaskGraphSourceManifest', () => {
   it('projects only fixed, bounded positional fields and preserves valid outcome enums', () => {
+    expect(valid.schemaVersion).toBe('agent-harness.v2.task-graph-sources.v1')
     expect(parseFinalTaskGraphSourceManifest(valid)).toEqual(valid)
     const serialized = JSON.stringify(parseFinalTaskGraphSourceManifest(valid))
     expect(serialized).not.toMatch(/taskId|graphItemId|sessionId|userId|jobId|artifactId|goal|summary|resultText/i)
+  })
+
+  it('parses strict v2 historical indices without changing the v1 contract', () => {
+    const v2 = { ...valid, schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2, historicalNodeIndices: [1] }
+    expect(parseFinalTaskGraphSourceManifest(v2)).toEqual(v2)
+    const tooManySources = Array.from({ length: 9 }, (_, nodeIndex) => ({ ...valid.sources[0]!,
+      sourceKey: key(String.fromCharCode(65 + nodeIndex)), nodeIndex }))
+    const overlappingSource = { ...valid.sources[1]!, nodeIndex: 1 }
+    const cases = [
+      { ...v2, extra: true },
+      { ...v2, schemaVersion: 'agent-harness.v2.task-graph-sources.v3' },
+      { ...v2, sources: tooManySources },
+      { ...v2, historicalNodeIndices: [] },
+      { ...v2, historicalNodeIndices: [1, 1] },
+      { ...v2, historicalNodeIndices: [2, 1] },
+      { ...v2, historicalNodeIndices: [8] },
+      { ...v2, sources: [valid.sources[0], overlappingSource] },
+      { ...v2, historicalNodeIndices: [2] },
+      { ...v2, historicalNodeIndices: [1, 3, 4, 5, 6, 7, 0, 2] },
+      { ...valid, historicalNodeIndices: [1] },
+    ]
+    for (const value of cases) expect(parseFinalTaskGraphSourceManifest(value)).toBeNull()
+  })
+
+  it('rejects accessor-backed fields before invoking them', () => {
+    let invoked = false
+    const accessorManifest = { ...valid }
+    Object.defineProperty(accessorManifest, 'schemaVersion', { enumerable: true, get: () => { invoked = true; return valid.schemaVersion } })
+    expect(parseFinalTaskGraphSourceManifest(accessorManifest)).toBeNull()
+    expect(invoked).toBe(false)
+
+    const accessorRevision = { ...valid }
+    Object.defineProperty(accessorRevision, 'graphRevision', { enumerable: true, get: () => { invoked = true; return valid.graphRevision } })
+    expect(parseFinalTaskGraphSourceManifest(accessorRevision)).toBeNull()
+    expect(invoked).toBe(false)
+
+    const accessorSource = { ...valid.sources[0]! }
+    Object.defineProperty(accessorSource, 'nodeIndex', { enumerable: true, get: () => { invoked = true; return 0 } })
+    expect(parseFinalTaskGraphSourceManifest({ ...valid, sources: [accessorSource] })).toBeNull()
+    expect(invoked).toBe(false)
+
+    const historicalNodeIndices = new Array(1)
+    Object.defineProperty(historicalNodeIndices, '0', { enumerable: true, get: () => { invoked = true; return 1 } })
+    expect(parseFinalTaskGraphSourceManifest({ ...valid, schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2,
+      historicalNodeIndices })).toBeNull()
+    expect(invoked).toBe(false)
   })
 
   it('rejects malformed, extra, oversized, duplicate, or unordered manifest fields', () => {
@@ -57,6 +105,10 @@ describe('parseFinalTaskGraphSourceManifest', () => {
     const manifest = parseFinalTaskGraphSourceManifest({ ...valid,
       sources: valid.sources.map(source => ({ ...source, sourceKey: workerKey(source.nodeIndex) })) })!
     expect(await isCanonicalTaskGraphSourceManifestWeb(finalItemId, manifest)).toBe(true)
+    const v2Manifest = parseFinalTaskGraphSourceManifest({ ...valid,
+      schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2, historicalNodeIndices: [1],
+      sources: valid.sources.map(source => ({ ...source, sourceKey: workerKey(source.nodeIndex) })) })!
+    expect(await isCanonicalTaskGraphSourceManifestWeb(finalItemId, v2Manifest)).toBe(true)
     expect(await isCanonicalTaskGraphSourceManifestWeb('other-item', manifest)).toBe(false)
 
     const crypto = globalThis.crypto

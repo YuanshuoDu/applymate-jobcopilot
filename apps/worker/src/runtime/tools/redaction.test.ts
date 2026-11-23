@@ -3,7 +3,7 @@ import { redactSensitiveText } from "@jobcopilot/shared"
 
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
-import { InMemoryToolResultReferenceStore, prepareDurableWaitOutput, prepareLifecycleValue, prepareScheduledPrepareLifecycleOutput, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeForLifecycle } from "./redaction.js"
+import { InMemoryToolResultReferenceStore, isSubagentTaskId, prepareDurableWaitOutput, prepareLifecycleValue, prepareScheduledPrepareLifecycleOutput, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeForLifecycle } from "./redaction.js"
 import { nativeCoordinationOutput } from "./task-graph-coordination-bridge.js"
 import type { TaskGraphNativeCommandReceipt } from "../subagents/task-graph-command-port.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
@@ -278,6 +278,13 @@ describe("tool lifecycle redaction", () => {
   it("preserves generated spawn lineage after generic redaction would alter a phone-like UUID", () => {
     expect(prepareLifecycleValue(spawnReceipt).safe).not.toEqual(spawnReceipt)
     expect(prepareSubagentSpawnReceipt(spawnReceipt, { turnId, taskId: rootTaskId, rootTaskId }).safe).toEqual(spawnReceipt)
+  })
+
+  it("recognizes only canonical generated subagent UUIDv4 IDs", () => {
+    expect(isSubagentTaskId("subagent-00000000-0000-4000-8000-000000000002")).toBe(true)
+    expect(isSubagentTaskId("subagent-00000000-0000-1000-8000-000000000002")).toBe(false)
+    expect(isSubagentTaskId("+353 87 123 4567")).toBe(false)
+    expect(isSubagentTaskId("candidate@example.com")).toBe(false)
   })
 
   it("preserves only strict native spawn and follow-up envelopes bound to their child and root", () => {

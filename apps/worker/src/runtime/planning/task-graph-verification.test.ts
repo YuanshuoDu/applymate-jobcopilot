@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import {
   evaluateTaskGraphVerification,
+  evaluateTaskGraphVerificationWithExactEmptyScoutResult,
   evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst,
   evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery,
   TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
@@ -533,6 +534,31 @@ describe("TaskGraph durable evidence verification", () => {
         { criterionId: "evidence-count-two", status: "failed", reasonCode: "criterion_not_met" },
       ],
     })
+  })
+
+  it("evaluates exact empty Scout results without granting a verified-empty pass", () => {
+    const empty: TaskGraphVerificationEvidenceProjection = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION,
+      role: "scout", candidates: [], evidenceIds: [],
+    }
+    const typed = validatedContract("scout", [
+      { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+      { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["Dublin"] } },
+      { id: "candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 1 } },
+    ], TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2)
+    expect(evaluateTaskGraphVerification(typed, empty)).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_missing" })
+    expect(evaluateTaskGraphVerificationWithExactEmptyScoutResult(typed, empty)).toEqual({
+      status: "failed", reasonCode: "criterion_not_met", criteria: [
+        { criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "candidate-location", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "candidate-evidence", status: "failed", reasonCode: "criterion_not_met" },
+      ],
+    })
+    expect(evaluateTaskGraphVerificationWithExactEmptyScoutResult(typed, {
+      ...empty, emptyDiscoveryReceipt: { digest: "a".repeat(64) }, evidenceIds: [`read:source:jobs.discover:${"a".repeat(64)}`],
+    })).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
+    expect(evaluateTaskGraphVerificationWithExactEmptyScoutResult(typed, { ...empty, candidates: [{ jobId: "job", evidenceIds: [] }] } as never))
+      .toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
   })
 
   it("allows empty Analyst dependency coverage only for the matching verified Scout receipt", () => {

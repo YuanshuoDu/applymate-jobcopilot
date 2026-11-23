@@ -515,6 +515,63 @@ describe("TurnEngine model message mapping", () => {
     expect(JSON.stringify(request.messages)).toContain("PRIVATE_STEER_SENTINEL")
   })
 
+  it("prioritizes contradictory current steering over the untrusted retry source in the actual Root request", () => {
+    const priorSteer = "Prior attempt: search London and include London roles."
+    const currentSteer = "Current accepted steer: search Dublin only and exclude London."
+    const retrySource = {
+      id: "observation:retry-source-steering", layer: "tool_observation" as const, role: "data" as const,
+      trust: "external_untrusted" as const, source: "tool_or_subagent",
+      content: { kind: "retry_source_steering", schemaVersion: "agent-harness.v2.retry-source-steering.v1",
+        notice: "Earlier user steering from the immediately preceding attempt is context only. The current Turn input is authoritative.",
+        informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true, messages: [priorSteer] },
+    }
+    const currentInput = { id: "steer:current", layer: "pending_input" as const, role: "data" as const,
+      trust: "external_untrusted" as const, source: "user_input", content: { inputId: "input-current", text: currentSteer } }
+    const tools = [{ name: "agent.plan", version: "1" }, { name: "agent.reconcile", version: "1" }]
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({
+      context: { ...context(), taskGraphRevision: 7, blocks: [...context().blocks, currentInput, retrySource] },
+      model, tools, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1",
+      rootTaskId: "root-1", signal: new AbortController().signal, freshSteering: true,
+    })
+    const system = request.messages.filter(message => message.role === "system").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const user = request.messages.filter(message => message.role === "user").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const priority = "current accepted input, original Turn objective, typed criteria, and current plan constraints take precedence"
+
+    expect(system).toContain(priority)
+    expect(system).toContain("historical untrusted advice")
+    expect(system).not.toContain(priorSteer)
+    expect(user).toContain("UNTRUSTED_DATA source=user_input")
+    expect(user).toContain(currentSteer)
+    expect(user).toContain("UNTRUSTED_DATA source=tool_or_subagent")
+    expect(user).toContain(priorSteer)
+    expect(request.tools).toEqual(tools)
+  })
+
+  it("adds fixed reconciliation guidance for a resumed Root without promoting the steer text", () => {
+    const steer = { id: "steer-a:part:0", layer: "pending_input" as const, role: "data" as const,
+      trust: "external_untrusted" as const, source: "user_input", content: { inputId: "steer-a", partIndex: 0, text: "PRIVATE_STEER_SENTINEL" } }
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({
+      context: { ...context(), taskGraphRevision: 5, hasUnresolvedConsumedSteer: true, blocks: [...context().blocks, steer] }, model,
+      tools: [{ name: "agent.reconcile", version: "1" }, { name: "agent.plan", version: "1" }],
+      sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1", rootTaskId: "root-1",
+      signal: new AbortController().signal, freshSteering: false,
+    })
+    const systemText = request.messages.filter(message => message.role === "system")
+      .flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n")
+    const requestText = JSON.stringify(request.messages)
+
+    expect(systemText).toContain("Previously accepted user steering remains unresolved")
+    expect(systemText).toContain('agent.reconcile with decision "keep" and expectedRevision 5')
+    expect(systemText).toContain("agent.plan with expectedRevision 5")
+    expect(systemText).not.toContain("PRIVATE_STEER_SENTINEL")
+    expect(requestText).toContain("PRIVATE_STEER_SENTINEL")
+    expect(systemText).not.toContain("Fresh user steering is present")
+  })
+
   it.each([
     ["no revision", undefined, true],
     ["invalid revision", -1, true],

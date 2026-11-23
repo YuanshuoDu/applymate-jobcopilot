@@ -40,6 +40,22 @@ describe('AgentComposerActiveTurn', () => {
     expect(html).not.toContain('objective-replacement-form')
   })
 
+  it('places location steering in ActiveTurn only when the current projection grants it', () => {
+    const controller: TurnComposerController = {
+      sessionId: 'session_1', activeTurn: { id: 'turn_1', status: 'in_progress', revision: 4, canSteerLocation: true },
+      sessionStatus: 'running', turnStateReadiness: 'ready', delivery: 'steer', setDelivery: vi.fn(),
+      chatInput: 'ordinary chat draft', setChatInput: vi.fn(), sending: false, messages: [], commandError: null,
+      send: vi.fn(), interrupt: vi.fn(), interrupting: false,
+    }
+    expect(renderToString(<AgentComposerActiveTurn controller={controller} />)).toContain('open-location-scope')
+    expect(renderToString(<AgentComposerActiveTurn controller={{ ...controller,
+      activeTurn: { id: 'turn_1', status: 'in_progress', revision: 4 },
+    }} />)).not.toContain('open-location-scope')
+    expect(renderToString(<AgentComposerActiveTurn controller={{ ...controller,
+      activeTurn: { id: 'turn_1', status: 'waiting_for_approval', revision: 4, canSteerLocation: true },
+    }} />)).not.toContain('open-location-scope')
+  })
+
   it('only opens replacement for a running Session with an active Turn', () => {
     const controller: TurnComposerController = {
       sessionId: 'session_1', activeTurn: { id: 'turn_1', status: 'in_progress', revision: 2 }, sessionStatus: 'paused', delivery: 'steer',
@@ -118,7 +134,11 @@ describe('AgentComposerActiveTurn', () => {
       const actual = await importOriginal<typeof import('react')>()
       return {
         ...actual,
-        useReducer: () => [replacement, dispatch],
+        useReducer: (_reducer: unknown, initialState: unknown) => {
+          if (initialState !== null && typeof initialState === 'object' && 'clientMessageId' in initialState) return [replacement, dispatch]
+          return [{ open: false, target: null, draft: '', reviewedLocations: null, request: null,
+            pending: false, error: null }, dispatch]
+        },
         useRef: () => pendingRef,
       }
     })

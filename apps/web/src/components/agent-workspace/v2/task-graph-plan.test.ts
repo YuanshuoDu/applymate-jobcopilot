@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest'
 
 import type { TimelineItem } from './timeline-reducer'
 import type { SupervisorTaskSummary } from './task-tree-projection'
-import { parseTaskGraphSnapshot, projectCurrentTaskGraph } from './task-graph-plan'
+import { parseTaskGraphSnapshot, projectCurrentTaskGraph, projectTaskGraphSuccessCriteria } from './task-graph-plan'
+import { selectedTaskGraphIdentity } from './task-graph-plan-query'
 
 const sessionId = 'session-1'
 const schemaVersion = 'agent-harness.v2.task-graph'
@@ -27,6 +28,22 @@ function task(overrides: Partial<SupervisorTaskSummary> = {}): SupervisorTaskSum
 }
 
 describe('TaskGraph plan projection', () => {
+  it('projects success criteria only for the exact graph identity and matching ledger node keys', () => {
+    const graphItems = [graphItem({ schemaVersion, nodes: [
+      { ...graphNode('scout', 'task-a'), successCriteria: ['Find one source', 'Include its date'] },
+      graphNode('analyst', 'task-b', ['scout'], 2),
+    ] }, '2026-09-23T12:00:00.000Z', sessionId, 'graph-exact', 4)]
+    const plan = projectCurrentTaskGraph(graphItems, [task({ id: 'task-a' }), task({ id: 'task-b' })], sessionId)!
+    const identity = selectedTaskGraphIdentity(graphItems, sessionId)!
+
+    expect(projectTaskGraphSuccessCriteria(graphItems, identity, plan)).toEqual(new Map([
+      ['scout', ['Find one source', 'Include its date']], ['analyst', ['Evidence for analyst']],
+    ]))
+    expect(projectTaskGraphSuccessCriteria(graphItems, { ...identity, rootTaskId: 'foreign-root' }, plan)).toBeNull()
+    expect(projectTaskGraphSuccessCriteria(graphItems, identity, { ...plan, nodes: [{ ...plan.nodes[0]!, key: 'foreign-node' }, plan.nodes[1]!] })).toBeNull()
+    expect(projectTaskGraphSuccessCriteria([graphItems[0]!, graphItems[0]!], identity, plan)).toBeNull()
+  })
+
   it('projects persisted native spawn and followup nodes using owned task states only', () => {
     const metadata = {
       schemaVersion: 'agent-harness.v2.task-graph.native-delegation.v1', operationKind: 'spawn',

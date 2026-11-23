@@ -69,6 +69,8 @@ export type SteeringReconciliationState = Readonly<{
   decisionStepAttempt: number | null
   decisionInputThroughSequence: bigint | null
   agendaPlanRevision: number | null
+  latestUserRevision?: Readonly<{ resultingRevision: number; stepId: string; inputThroughSequence: bigint; soleSteerSequence?: bigint; previousUserRevisionInputThroughSequence?: bigint }>
+  lastReconciledInputThroughSequence?: bigint
   unresolvedInputs: readonly SteeringReconciliationPendingInput[]
 }>
 export type PreparedSteeringReconciliation = Readonly<{

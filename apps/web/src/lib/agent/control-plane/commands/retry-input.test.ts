@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from '@jobcopilot/agent-protocol'
 
 import { isRetryableTurnStatus, parsePersistedRetryContent } from './retry-input'
+import { RETRY_LINEAGE_SCHEMA_VERSION } from './retry-lineage'
 import { OBJECTIVE_LOCATION_REQUIREMENTS_SCHEMA_VERSION } from './types'
 
 afterEach(() => vi.unstubAllEnvs())
@@ -143,14 +144,28 @@ describe('persisted retry input', () => {
     })).toThrow()
   })
 
+  it('validates but does not copy a prior private retry receipt into the next retry', () => {
+    const base = { goal: 'Retry the same objective', content: [{ type: 'text', text: 'Retry the same objective' }] }
+    const receipt = { schemaVersion: RETRY_LINEAGE_SCHEMA_VERSION, predecessorTurnId: 'turn-before', acceptedInputId: 'input-before', acceptedSequence: '18' }
+    expect(parsePersistedRetryContent('turn-retry', { ...base, retryLineage: receipt })).toEqual(base)
+    for (const retryLineage of [
+      { ...receipt, acceptedSequence: '0' }, { ...receipt, extra: true }, { ...receipt, acceptedInputId: '' },
+    ]) expect(() => parsePersistedRetryContent('turn-retry', { ...base, retryLineage })).toThrow()
+  })
+
   it('rejects unknown fields and invalid values in persisted retry intent', () => {
     const base = { goal: 'Retry discovery', content: [{ type: 'text', text: 'Retry discovery' }] }
+    expect(() => parsePersistedRetryContent('turn-recovery', {
+      ...base,
+      materialDriftRecovery: { schemaVersion: 'agent-harness.v2.material-drift-recovery.v1' },
+    })).toThrow()
     for (const intent of [
       { kind: 'interactive_discovery_shortlist', version: 1, extra: true },
       { kind: 'other', version: 1 },
       { kind: 'interactive_discovery_shortlist', version: 2 },
       { kind: 'objective_task_graph_execution', version: 1, extra: true },
       { kind: 'objective_task_graph_execution', version: 2 },
+      { kind: 'objective_task_graph_execution', version: 1, materialDriftRecovery: { schemaVersion: 'agent-harness.v2.material-drift-recovery.v1' } },
     ]) {
       expect(() => parsePersistedRetryContent('turn-4', { ...base, intent })).toThrow()
     }
