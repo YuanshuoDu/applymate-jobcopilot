@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { redactAgentEvent } from "@jobcopilot/shared/agent-redaction"
 import type { LeasePool, TurnJobPayload } from "./lease.js"
 import type { CanonicalApprovedApplicationSubmitResumeProof } from "../canonical-approved-application-submit-resume-proof.js"
 
@@ -37,6 +38,37 @@ describe("approved Fill terminal claim", () => {
     }
   })
 
+  it("accepts only the shared-redacted availability bit on an otherwise exact approved wake", async () => {
+    const rawPayload = { waitKind: "approval", waitId: "approval-1", itemId: "agent-wait:approval:approval-1",
+      turnId: "70463535-4144-4bba-ae3b-b80578d2dd0b", toolCallId: "tool-1", status: "approved",
+      nextTurnRevision: 5, answerAvailable: false }
+    const redacted = redactAgentEvent({ type: "turn.wakeup", body: "", data: {
+      schemaVersion: "agent-harness.v2", id: "70463535-4144-4bba-ae3b-b80578d2dd0f",
+      sessionId: "70463535-4144-4bba-ae3b-b80578d2dd0a", turnId: rawPayload.turnId,
+      itemId: rawPayload.itemId, taskId: null, sequence: "11", type: "turn.wakeup", actor: "user",
+      correlationId: rawPayload.turnId, causationId: "70463535-4144-4bba-ae3b-b80578d2dd0e",
+      idempotencyKey: "agent-wait-command:command-1:wakeup", createdAt: "2026-11-22T10:00:00.000Z", payload: rawPayload,
+    } }).data as { payload?: Record<string, unknown> } | null
+    const redactedAvailability = redacted?.payload?.answerAvailable
+    expect(redactedAvailability).toBe("[REDACTED]")
+
+    const accepted = fixture(dispatchRow(null, 0), { wakePayload: { answerAvailable: redactedAvailability } })
+    expect(await claimApprovedFillTerminalLease({ pool: accepted.pool, payload, now: new Date("2026-11-22T10:00:00Z"), leaseMs: 60_000, dispatchGeneration: 0 })).not.toBeNull()
+
+    for (const overrides of [
+      { wakePayload: { answerAvailable: true } },
+      { wakePayload: { answerAvailable: "unknown" } },
+      { wakePayload: { answerAvailable: "[REDACTED]", status: "rejected" } },
+      { wakePayload: { answerAvailable: "[REDACTED]", extra: "unexpected" } },
+      { wakePayload: { answerAvailable: "[REDACTED]" }, resolvedPayload: { answerAvailable: true } },
+    ]) {
+      const rejected = fixture(dispatchRow(null, 0), overrides)
+      expect(await claimApprovedFillTerminalLease({ pool: rejected.pool, payload, now: new Date("2026-11-22T10:00:00Z"), leaseMs: 60_000, dispatchGeneration: 0 })).toBeNull()
+      expect(rejected.client.query).toHaveBeenCalledWith("ROLLBACK")
+      expect(rejected.client.query).not.toHaveBeenCalledWith("COMMIT")
+    }
+  })
+
   it("rejects a durable dispatch payload whose owner was changed by another generation", async () => {
     const changed = dispatchRow(null, 0)
     changed.payload = { ownerId: "other-owner", sessionId: payload.sessionId, turnId: payload.turnId }
@@ -70,13 +102,18 @@ function dispatchRow(publishedAt: Date | null, attemptCount: number) {
     payload: { ownerId: payload.ownerId, sessionId: payload.sessionId, turnId: payload.turnId }, publishedAt, attemptCount }
 }
 
-function fixture(dispatch: ReturnType<typeof dispatchRow>) {
+function fixture(dispatch: ReturnType<typeof dispatchRow>, overrides: {
+  readonly wakePayload?: Record<string, unknown>
+  readonly resolvedPayload?: Record<string, unknown>
+} = {}) {
+  const wakeEventPayload = { ...wakePayload, ...overrides.wakePayload }
+  const resolvedEventPayload = { ...wakePayload, ...overrides.resolvedPayload }
   const wake = { id: "event-wakeup-1", sessionId: payload.sessionId, turnId: payload.turnId, itemId: proof.waitItemId,
     taskId: null, sequence: "11", type: "turn.wakeup", actor: "user", correlationId: payload.turnId,
-    causationId: "event-resolved-1", idempotencyKey: "agent-wait-command:command-1:wakeup", payload: wakePayload }
+    causationId: "event-resolved-1", idempotencyKey: "agent-wait-command:command-1:wakeup", payload: wakeEventPayload }
   const resolved = { ...wake, id: "event-resolved-1", sequence: "10", type: "approval.resolved",
     taskId: proof.applicationTaskId, correlationId: proof.approvalId, causationId: proof.waitItemId,
-    idempotencyKey: "agent-wait-command:command-1" }
+    idempotencyKey: "agent-wait-command:command-1", payload: resolvedEventPayload }
   const resumed = { ...wake, id: "event-resumed-1", sequence: "12", type: "turn.resumed", actor: "system",
     taskId: null, correlationId: payload.turnId, causationId: wake.id, idempotencyKey: `agent-wakeup:${wake.id}:resumed`,
     payload: { itemId: proof.waitItemId, resumedFromEventId: wake.id, status: "approved", toolCallId: "tool-1",

@@ -136,12 +136,14 @@ async function exactApprovedWakeupReplay(client: Client, input: {
   if (wakeups.rows.length !== 1) return false
   const wake = wakeups.rows[0]!
   const payload = exact(wake.payload, "answerAvailable,itemId,nextTurnRevision,status,toolCallId,turnId,waitId,waitKind")
+  const normalizedWakePayload = payload && (payload.answerAvailable === false || payload.answerAvailable === "[REDACTED]")
+    ? { ...payload, answerAvailable: false } : null
   const nextTurnRevision = Number(payload?.nextTurnRevision)
   if (!validId(wake.id) || wake.sessionId !== lease.sessionId || wake.turnId !== lease.turnId || wake.itemId !== proof.waitItemId
     || wake.taskId !== null || wake.type !== "turn.wakeup" || wake.actor !== "user" || wake.correlationId !== lease.turnId
     || !validId(wake.causationId) || !validId(wake.idempotencyKey) || !sequence(wake.sequence)
     || !payload || payload.waitKind !== "approval" || payload.waitId !== proof.approvalId || payload.itemId !== proof.waitItemId
-    || payload.turnId !== lease.turnId || payload.status !== "approved" || payload.answerAvailable !== false
+    || payload.turnId !== lease.turnId || payload.status !== "approved" || !normalizedWakePayload
     || !validId(payload.toolCallId) || !Number.isSafeInteger(nextTurnRevision) || nextTurnRevision < 1
     || !validId(wake.idempotencyKey) || !wake.idempotencyKey.startsWith("agent-wait-command:") || !wake.idempotencyKey.endsWith(":wakeup")) return false
 
@@ -162,10 +164,12 @@ async function exactApprovedWakeupReplay(client: Client, input: {
     [wake.causationId, lease.sessionId, lease.turnId, proof.waitItemId],
   )
   const resolved = resolvedRows.rows[0]
+  const resolvedPayload = exact(resolved?.payload, "answerAvailable,itemId,nextTurnRevision,status,toolCallId,turnId,waitId,waitKind")
   if (resolvedRows.rows.length !== 1 || !resolved || resolved.actor !== "user" || resolved.taskId !== proof.applicationTaskId
     || resolved.correlationId !== proof.approvalId || resolved.causationId !== proof.waitItemId
     || resolved.idempotencyKey + ":wakeup" !== wake.idempotencyKey
-    || !sameValue(resolved.payload, wake.payload) || !before(resolved.sequence, wake.sequence)) return false
+    || !resolvedPayload || resolvedPayload.answerAvailable !== false
+    || !sameValue(resolvedPayload, normalizedWakePayload) || !before(resolved.sequence, wake.sequence)) return false
 
   const resumedRows = await client.query<Row>(
     `SELECT "id", "sessionId", "turnId", "itemId", "taskId", "sequence"::text AS "sequence",
