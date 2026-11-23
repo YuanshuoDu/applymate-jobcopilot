@@ -31,7 +31,8 @@ export async function readCanonicalApprovedApplicationSubmitResumeProof(
       session."status" AS "sessionStatus"
     FROM "agent_turns" AS turn JOIN "agent_sessions" AS session ON session."id"=turn."sessionId" AND session."userId"=turn."userId"
     WHERE turn."id"=$1 AND turn."sessionId"=$2 AND turn."userId"=$3 AND turn."rootTaskId"=$4
-      AND turn."source"='user' AND turn."executionMode"='canonical_task_graph' AND turn."status"='in_progress'
+      AND turn."source"='user' AND (turn."executionMode"='canonical_task_graph' OR turn."executionMode" IS NULL)
+      AND turn."status"='in_progress'
       AND turn."leaseOwnerId"=$5 AND turn."leaseVersion"=$6 AND turn."leaseExpiresAt">$7
       AND session."status" IN ('running','waiting_for_user')`,
   [lease.turnId, lease.sessionId, lease.userId, rootTaskId, lease.ownerId, lease.leaseVersion, now])
@@ -39,7 +40,8 @@ export async function readCanonicalApprovedApplicationSubmitResumeProof(
   const turn = turns.rows[0]!
   if (![turn.id, turn.userId, turn.sessionId, turn.rootTaskId].every(validId) || turn.id !== lease.turnId
     || turn.userId !== lease.userId || turn.sessionId !== lease.sessionId || turn.rootTaskId !== rootTaskId
-    || turn.source !== "user" || turn.executionMode !== "canonical_task_graph" || turn.status !== "in_progress"
+    || turn.source !== "user" || (turn.executionMode !== "canonical_task_graph" && turn.executionMode !== null)
+    || turn.status !== "in_progress"
     || turn.leaseOwnerId !== lease.ownerId || Number(turn.leaseVersion) !== lease.leaseVersion
     || !Number.isSafeInteger(turn.revision) || Number(turn.revision) < 1 || !future(turn.leaseExpiresAt, now)) return null
   const roots = await client.query<Row>(`SELECT root."id", root."status", root."leaseOwner", root."attemptCount", root."leaseExpiresAt",
@@ -86,8 +88,8 @@ export async function readCanonicalApprovedApplicationSubmitResumeProof(
     || task.fillTurnId !== lease.turnId || task.fillTurnSessionId !== lease.sessionId || task.fillTurnUserId !== lease.userId
     || task.question != null || (task.resumeId !== null && !validId(task.resumeId)) || (task.coverLetterId !== null && !validId(task.coverLetterId))) return null
   const selector = reviewedApplicationFillSelector(turn.input)
-  if (selector.kind === "invalid") return null
-  const material = await preparedMaterial(client, selector, task, lease, node.taskId, rootTaskId)
+  if (selector.kind === "invalid" || (turn.executionMode === null && selector.kind !== "selected")) return null
+  const material = await preparedMaterial(client, selector, task, lease, node.taskId)
   if (!material) return null
   const receipts = await readCanonicalApprovedApplicationSubmitReceipts(client, { lease, task, material, now, turnRevision: Number(turn.revision) })
   if (!receipts || receipts.state === "form_filled" && (task.status !== "waiting_for_authorization" || task.checkpoint !== "form_filled" || task.workerTaskId !== null)
@@ -109,7 +111,7 @@ export function sameCanonicalApprovedApplicationSubmitResumeProof(before: Canoni
 }
 
 async function preparedMaterial(client: Client, selector: ReturnType<typeof reviewedApplicationFillSelector>, task: Row,
-  lease: TurnLease, fillerTaskId: string, rootTaskId: string): Promise<ApplicationSubmissionMaterial | null> {
+  lease: TurnLease, fillerTaskId: string): Promise<ApplicationSubmissionMaterial | null> {
   const legacy = { applicationTaskId: task.id as string, jobId: task.jobId as string, resumeId: task.resumeId as string | null, coverLetterId: task.coverLetterId as string | null }
   const events = await client.query<Row>(`SELECT "actor", "data" FROM "application_task_events"
     WHERE "taskId"=$1 AND "type"='reviewed_application_fill_browser_started' AND "data"->>'fillTurnId'=$2 LIMIT 2`, [task.id, lease.turnId])
@@ -117,7 +119,7 @@ async function preparedMaterial(client: Client, selector: ReturnType<typeof revi
   if (selector.kind !== "selected" || events.rows.length !== 1) return null
   const current = await readSelectedJobReviewedArtifactWithClient(client, { userId: lease.userId, sessionId: lease.sessionId, jobId: task.jobId as string, sourceTurnId: selector.sourceTurnId })
   if (!current || current.jobId !== task.jobId || current.sourceTurnId !== selector.sourceTurnId
-    || !sameBrowserBinding(events.rows[0]!, lease, task, fillerTaskId, rootTaskId, current)) return null
+    || !sameBrowserBinding(events.rows[0]!, lease, task, fillerTaskId, current)) return null
   const proof: ReviewedApplicationMaterialProof = { jobId: current.jobId, sourceTurnId: current.sourceTurnId, rootTaskId: current.rootTaskId,
     graphRevision: current.graphRevision, writerTaskId: current.writerTaskId, reviewerTaskId: current.reviewerTaskId,
     reviewerToolCallId: current.reviewerToolCallId, reviewHash: current.reviewHash, artifactId: current.artifactId,
@@ -125,11 +127,11 @@ async function preparedMaterial(client: Client, selector: ReturnType<typeof revi
   return bindReviewedApplicationSubmissionMaterial(legacy, proof)
 }
 
-function sameBrowserBinding(row: Row, lease: TurnLease, task: Row, fillerTaskId: string, rootTaskId: string, proof: SelectedJobReviewedArtifact): boolean {
+function sameBrowserBinding(row: Row, lease: TurnLease, task: Row, fillerTaskId: string, proof: SelectedJobReviewedArtifact): boolean {
   const data = exact(row.data, "applicationTaskId,artifactId,attemptCount,contentHash,fillTurnId,fillerTaskId,graphRevision,jobId,leaseExpiresAt,leaseOwner,reviewHash,reviewerTaskId,reviewerToolCallId,rootTaskId,schemaVersion,sessionId,sourceDigest,sourceTurnId,userId,version,writerTaskId")
   return row.actor === "worker" && data?.schemaVersion === "agent-harness.v2.reviewed-application-fill-browser-start.v1"
     && data.userId === lease.userId && data.sessionId === lease.sessionId && data.fillTurnId === lease.turnId
-    && data.applicationTaskId === task.id && data.fillerTaskId === fillerTaskId && data.jobId === task.jobId && data.rootTaskId === rootTaskId
+    && data.applicationTaskId === task.id && data.fillerTaskId === fillerTaskId && data.jobId === task.jobId && data.rootTaskId === proof.rootTaskId
     && Number(data.graphRevision) === proof.graphRevision && Number.isSafeInteger(data.attemptCount) && Number(data.attemptCount) > 0
     && validId(data.leaseOwner) && isoDate(data.leaseExpiresAt) && data.sourceTurnId === proof.sourceTurnId
     && data.writerTaskId === proof.writerTaskId && data.reviewerTaskId === proof.reviewerTaskId

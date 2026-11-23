@@ -58,35 +58,41 @@ export async function claimApplicationTask(
 export async function finishApplicationTask(
   pool: Pool | PoolClient, taskId: string, status: TerminalStatus, checkpoint: string, error: string | null,
   operation: "fill" | "submit", identity?: ApplicationSubmitIdentity,
-): Promise<"current" | "superseded"> {
+): Promise<ApplicationTaskFinishResult> {
   if (operation === "submit" && !identity) throw new Error("Submit task results require an exact application attempt identity.");
-  const write = async (client: Pick<PoolClient, "query">): Promise<void> => {
+  if (operation === "submit" && taskId !== identity!.applicationTaskId) return "unconfirmed";
+  const write = async (client: Pick<PoolClient, "query">): Promise<ApplicationTaskFinishResult> => {
     const transitioned = await client.query<{ sessionId: string | null }>(
-    `UPDATE application_tasks
-     SET status = $2, "checkpoint" = $3, error = $4,
-           "completedAt" = CASE WHEN $2 IN ('submitted', 'failed') THEN NOW() ELSE NULL END,
-           "updatedAt" = NOW()
-     WHERE id = $1 AND (($5 = 'submit') OR ($5 = 'fill' AND "fillTurnId" IS NULL))
-       AND ($5 = 'fill' OR ("sessionId" = $6 AND "fillTurnId" = $7)) AND (
-         status NOT IN ('cancelled', 'submitted')
-         OR (status = 'cancelled' AND "checkpoint" = 'turn_stopped_before_submit'
-           AND $2 = 'waiting_for_user' AND $3 = 'submission_uncertain')
-       )
-        AND NOT ("checkpoint" IN ('submission_uncertain', 'admin_review') AND $2 <> 'submitted')
-       AND NOT ("checkpoint" = 'submission_request_started'
-         AND NOT ($2 = 'submitted' OR ($2 = 'waiting_for_user' AND $3 = 'submission_uncertain')))
-       AND (status IS DISTINCT FROM $2 OR "checkpoint" IS DISTINCT FROM $3 OR error IS DISTINCT FROM $4)
-     RETURNING "sessionId"`,
-    [taskId, status, checkpoint, error, operation, identity?.sessionId ?? null, identity?.fillTurnId ?? null],
-  );
-  if (transitioned.rowCount !== 1) return;
-  await client.query(
-    `INSERT INTO application_task_events (id, "taskId", type, actor, body, "createdAt")
-     VALUES ('evt_' || md5(random()::text || clock_timestamp()::text), $1, $2, 'worker', $3, NOW())`,
-    [taskId, status, redactSensitiveText(error ?? checkpoint)],
-  );
-  const sessionId = transitioned.rows[0]?.sessionId;
-  if (sessionId) await refreshSessionStatus(client as PoolClient, sessionId);
+      `UPDATE application_tasks
+       SET status = $2, "checkpoint" = $3, error = $4,
+           "completedAt" = CASE WHEN $2 IN ('submitted', 'failed') THEN NOW() ELSE NULL END, "updatedAt" = NOW()
+       WHERE id = $1 AND (($5 = 'submit') OR ($5 = 'fill' AND "fillTurnId" IS NULL))
+         AND ($5 = 'fill' OR ("sessionId" = $6 AND "fillTurnId" = $7)) AND (
+           status NOT IN ('cancelled', 'submitted') OR (status = 'cancelled' AND "checkpoint" = 'turn_stopped_before_submit'
+             AND $2 = 'waiting_for_user' AND $3 = 'submission_uncertain'))
+         AND NOT ("checkpoint" IN ('submission_uncertain', 'admin_review') AND $2 <> 'submitted')
+         AND NOT ("checkpoint" = 'submission_request_started' AND NOT ($2 = 'submitted' OR ($2 = 'waiting_for_user' AND $3 = 'submission_uncertain')))
+         AND (status IS DISTINCT FROM $2 OR "checkpoint" IS DISTINCT FROM $3 OR error IS DISTINCT FROM $4)
+       RETURNING "sessionId"`,
+      [taskId, status, checkpoint, error, operation, identity?.sessionId ?? null, identity?.fillTurnId ?? null],
+    );
+    if (transitioned.rowCount !== 1) {
+      if (operation !== "submit") return "unconfirmed";
+      const current = await client.query<{ status: string; checkpoint: string }>(
+        `SELECT status, "checkpoint" FROM application_tasks
+         WHERE id=$1 AND "userId"=$2 AND "jobId"=$3 AND "sessionId"=$4 AND "fillTurnId"=$5`,
+        [taskId, identity!.userId, identity!.jobId, identity!.sessionId, identity!.fillTurnId],
+      );
+      const row = current.rows[0];
+      const exactCurrent = current.rowCount === 1 && current.rows.length === 1 && row?.status === status && row.checkpoint === checkpoint;
+      return exactCurrent ? "already_current" : "unconfirmed";
+    }
+    await client.query(`INSERT INTO application_task_events (id, "taskId", type, actor, body, "createdAt")
+      VALUES ('evt_' || md5(random()::text || clock_timestamp()::text), $1, $2, 'worker', $3, NOW())`,
+    [taskId, status, redactSensitiveText(error ?? checkpoint)]);
+    const sessionId = transitioned.rows[0]?.sessionId;
+    if (sessionId) await refreshSessionStatus(client as PoolClient, sessionId);
+    return "current";
   };
   if (operation === "fill") {
     await write(pool as PoolClient);
@@ -96,8 +102,12 @@ export async function finishApplicationTask(
   const outcome = typeof (pool as Pool).connect === "function"
     ? await withExactSubmissionWrite(pool as Pool, attempt, "finish_application_task", client => write(client))
     : await withExactSubmissionClientWrite(pool as PoolClient, attempt, "finish_application_task", () => write(pool as PoolClient));
-  return outcome.kind;
+  return outcome.kind === "superseded" ? "superseded" : outcome.value;
 }
+
+export type ApplicationTaskFinishResult = "current" | "already_current" | "superseded" | "unconfirmed";
+export const isConfirmedApplicationTaskFinish = (result: ApplicationTaskFinishResult | void): result is "current" | "already_current" =>
+  result === "current" || result === "already_current";
 
 export async function applicationTaskStillActive(
   pool: Pool, taskId: string, userId: string, jobId: string, operation: "fill" | "submit", identity?: ApplicationSubmitIdentity,

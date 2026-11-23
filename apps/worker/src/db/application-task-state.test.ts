@@ -45,13 +45,14 @@ import {
   finishApplicationTask,
   needsUserTakeover,
   USER_TAKEOVER_CHECKPOINT,
+  isConfirmedApplicationTaskFinish,
   isUserActive,
   markSubmissionRequestStarted,
   pauseForFormInput,
 } from "./application-task-state.js";
 
 function testPool() {
-  const query = vi.fn();
+  const query = vi.fn().mockResolvedValue({ rowCount: 0, rows: [] });
   return { pool: { query } as unknown as Pool, query };
 }
 
@@ -88,10 +89,11 @@ describe("finishApplicationTask", () => {
     const { pool, query } = testPool();
     query
       .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({ rows: [{ status: "filling", checkpoint: "submission_request_started" }] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: null }] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: null }] })
-      .mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: null }] });
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
 
     await finishApplicationTask(pool, "task_1", "failed", "execution_failed", "Late cleanup callback", "submit", submissionIdentity);
     await finishApplicationTask(pool, "task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain", "submit", submissionIdentity);
@@ -101,8 +103,9 @@ describe("finishApplicationTask", () => {
     expect(failureGuard).toContain('"checkpoint" = \'submission_request_started\'');
     expect(failureGuard).toContain("NOT ($2 = 'submitted' OR ($2 = 'waiting_for_user' AND $3 = 'submission_uncertain'))");
     expect(query.mock.calls[0]?.[1]).toEqual(["task_1", "failed", "execution_failed", "Late cleanup callback", "submit", "session_1", "turn_1"]);
-    expect(query.mock.calls[1]?.[1]).toEqual(["task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain", "submit", "session_1", "turn_1"]);
-    expect(query.mock.calls[3]?.[1]).toEqual(["task_1", "submitted", "submission_verified", null, "submit", "session_1", "turn_1"]);
+    expect(query.mock.calls[1]?.[1]).toEqual(["task_1", "user_1", "job_1", "session_1", "turn_1"]);
+    expect(query.mock.calls[2]?.[1]).toEqual(["task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain", "submit", "session_1", "turn_1"]);
+    expect(query.mock.calls[4]?.[1]).toEqual(["task_1", "submitted", "submission_verified", null, "submit", "session_1", "turn_1"]);
   });
 
   it("repairs a Stop cancellation after request start while preserving the aborted session", async () => {
@@ -129,7 +132,7 @@ describe("finishApplicationTask", () => {
     const lateCleanup = String(query.mock.calls[4]?.[0]);
     expect(lateCleanup).toContain("\"checkpoint\" IN ('submission_uncertain', 'admin_review')");
     expect(lateCleanup).toContain("$2 <> 'submitted'");
-    expect(query).toHaveBeenCalledTimes(5);
+    expect(query).toHaveBeenCalledTimes(6);
   });
 
   it("retains ordinary refresh mapping for nonterminal sessions", async () => {
@@ -147,20 +150,27 @@ describe("finishApplicationTask", () => {
     expect(query).toHaveBeenCalledTimes(4);
   });
 
-  it.each(["cancelled", "submitted"] as const)("suppresses late callbacks after a %s task", async () => {
+  it.each(["cancelled", "submitted"] as const)("suppresses late callbacks after a %s task", async status => {
     const { pool, query } = testPool();
-    query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+    query
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({ rows: [{ status, checkpoint: "submission_verified" }] });
 
-    await finishApplicationTask(pool, "task_1", "failed", "execution_failed", "Late worker callback", "submit", submissionIdentity);
+    await expect(finishApplicationTask(pool, "task_1", "failed", "execution_failed", "Late worker callback", "submit", submissionIdentity))
+      .resolves.toBe("unconfirmed");
 
-    expect(query).toHaveBeenCalledOnce();
+    expect(query).toHaveBeenCalledTimes(2);
     expect(String(query.mock.calls[0]?.[0])).toContain("status NOT IN ('cancelled', 'submitted')");
     expect(String(query.mock.calls[0]?.[0])).toContain('RETURNING "sessionId"');
+    expect(String(query.mock.calls[1]?.[0])).toContain('WHERE id=$1 AND "userId"=$2 AND "jobId"=$3 AND "sessionId"=$4 AND "fillTurnId"=$5');
+    expect(query.mock.calls[1]?.[1]).toEqual(["task_1", "user_1", "job_1", "session_1", "turn_1"]);
   });
 
   it("suppresses a late account-suspended failure after submission became uncertain", async () => {
     const { pool, query } = testPool();
-    query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+    query
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ status: "waiting_for_user", checkpoint: "submission_uncertain" }] });
 
     await finishApplicationTask(pool, "task_1", "failed", "account_suspended", "Account suspended by an administrator.", "submit", submissionIdentity);
 
@@ -171,7 +181,7 @@ describe("finishApplicationTask", () => {
       "task_1", "failed", "account_suspended", "Account suspended by an administrator.", "submit", "session_1", "turn_1",
     ]);
     // A rejected transition must not create a misleading event or refresh the session.
-    expect(query).toHaveBeenCalledOnce();
+    expect(query).toHaveBeenCalledTimes(2);
   });
 
   it("allows an explicit submitted confirmation to resolve submission uncertainty", async () => {
@@ -207,19 +217,70 @@ describe("finishApplicationTask", () => {
     expect(transition).toContain("$2 <> 'submitted'");
     expect(query.mock.calls[0]?.[1]).toEqual(["task_1", status, checkpoint, error, "submit", "session_1", "turn_1"]);
     // A rejected transition must not create a Worker event or refresh the session.
-    expect(query).toHaveBeenCalledOnce();
+    expect(query).toHaveBeenCalledTimes(2);
   });
 
   it("suppresses a duplicate uncertainty callback after its first transition", async () => {
     const { pool, query } = testPool();
-    query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+    query
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ status: "waiting_for_user", checkpoint: "submission_uncertain" }] });
 
-    await finishApplicationTask(pool, "task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain", "submit", submissionIdentity);
+    await expect(finishApplicationTask(
+      pool, "task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain", "submit", submissionIdentity,
+    )).resolves.toBe("already_current");
 
-    expect(query).toHaveBeenCalledOnce();
+    expect(query).toHaveBeenCalledTimes(2);
     expect(String(query.mock.calls[0]?.[0])).toContain("status IS DISTINCT FROM $2");
     expect(String(query.mock.calls[0]?.[0])).toContain('"checkpoint" IS DISTINCT FROM $3');
     expect(String(query.mock.calls[0]?.[0])).toContain("error IS DISTINCT FROM $4");
+    expect(query.mock.calls[1]?.[0]).not.toContain("INSERT INTO application_task_events");
+    expect(isConfirmedApplicationTaskFinish("already_current")).toBe(true);
+    expect(isConfirmedApplicationTaskFinish("unconfirmed")).toBe(false);
+  });
+
+  it("does not confirm a zero-row transition when exact current state differs", async () => {
+    const { pool, query } = testPool();
+    query
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({ rows: [{ status: "filling", checkpoint: "submission_request_started" }] });
+
+    await expect(finishApplicationTask(
+      pool, "task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain", "submit", submissionIdentity,
+    )).resolves.toBe("unconfirmed");
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not update a task outside the exact attempt identity", async () => {
+    const { pool, query } = testPool();
+    await expect(finishApplicationTask(
+      pool, "other_task", "submitted", "submission_verified", null, "submit", submissionIdentity,
+    )).resolves.toBe("unconfirmed");
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("requires exactly one owned row for idempotent confirmation", async () => {
+    const { pool, query } = testPool();
+    query
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({ rowCount: 2, rows: [
+        { status: "waiting_for_user", checkpoint: "submission_uncertain" },
+        { status: "waiting_for_user", checkpoint: "submission_uncertain" },
+      ] });
+    await expect(finishApplicationTask(
+      pool, "task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain", "submit", submissionIdentity,
+    )).resolves.toBe("unconfirmed");
+  });
+
+  it("propagates a database error rather than confirming an unrecorded result", async () => {
+    const { pool, query } = testPool();
+    const failure = new Error("database unavailable");
+    query.mockRejectedValueOnce(failure);
+
+    await expect(finishApplicationTask(
+      pool, "task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain", "submit", submissionIdentity,
+    )).rejects.toBe(failure);
+    expect(query).toHaveBeenCalledOnce();
   });
 
   it("preserves submission uncertainty even when the task status is inconsistent", async () => {
@@ -232,7 +293,7 @@ describe("finishApplicationTask", () => {
     expect(transition).toContain("AND NOT (\"checkpoint\" IN ('submission_uncertain', 'admin_review') AND $2 <> 'submitted')");
     expect(transition).not.toContain("status = 'waiting_for_user' AND \"checkpoint\" IN");
     expect(query.mock.calls[0]?.[1]).toEqual(["task_1", "failed", "execution_failed", "Inconsistent late failure", "submit", "session_1", "turn_1"]);
-    expect(query).toHaveBeenCalledOnce();
+    expect(query).toHaveBeenCalledTimes(2);
   });
 
   it("suppresses every task/result transition when the exact attempt was superseded", async () => {

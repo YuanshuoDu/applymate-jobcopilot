@@ -34,7 +34,7 @@ const mocks = vi.hoisted(() => {
     claimApplicationTask: vi.fn().mockResolvedValue(true),
     isUserActive: vi.fn().mockResolvedValue(true),
     completeFillForReview: vi.fn().mockResolvedValue(true),
-    finishApplicationTask: vi.fn().mockResolvedValue(undefined),
+    finishApplicationTask: vi.fn().mockResolvedValue("current"),
     pauseForFormInput: vi.fn().mockResolvedValue(undefined),
     applicationTaskStillActive: vi.fn().mockResolvedValue(true),
     createNotification: vi.fn().mockResolvedValue(undefined),
@@ -131,7 +131,8 @@ vi.mock("../admin/ats-policy.js", () => ({
   loadEffectiveAtsPolicy: mocks.loadAtsPolicy,
   canUseAtsSource: mocks.canUseAtsSource,
 }));
-vi.mock("../db/application-task-state.js", () => ({
+vi.mock("../db/application-task-state.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../db/application-task-state.js")>()),
   CAPTCHA_USER_TAKEOVER_MESSAGE: "CAPTCHA detected. User takeover is required; no bypass was attempted.",
   CHALLENGE_DETECTION_FAILED_MESSAGE: "Challenge detection failed. User takeover is required; no bypass was attempted.",
   USER_TAKEOVER_CHECKPOINT: "user_takeover",

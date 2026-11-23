@@ -18,10 +18,22 @@ export type WorkerSubmissionStopStage = Extract<ApplicationSubmissionStopStage, 
 export type WorkerSubmissionStopWrite = "recorded" | "duplicate" | "stopped" | "fenced"
 export type WorkerSubmissionStopInspection = "missing" | "armed" | "stopped" | "granted" | "fenced"
 
-type TaskRow = { status: string; checkpoint: string | null; workerTaskId: string | null }
-type AttemptRow = { artifactHash: string; state: string }
+type TaskRow = {
+  status: string; checkpoint: string | null; workerTaskId: string | null; completedAt: Date | null
+  fillTurnSessionId: string | null; fillTurnUserId: string | null
+}
+type AttemptRow = { artifactHash: string; state: string; responseRef: string | null }
 type StartEventRow = { taskId: string; type: string; actor: string; data: unknown }
 type StopEventRow = { id: string; taskId: string; type: string; actor: string; body: string; data: unknown }
+type ExistingStopState =
+  | { readonly kind: "current"; readonly stages: Set<ApplicationSubmissionStopStage>; readonly task: TaskRow; readonly attempt: AttemptRow }
+  | { readonly kind: "superseded" }
+
+export type StoppedSubmissionFinalizationProof =
+  | { readonly kind: "ready"; readonly attemptState: "reserved" | "failed"; readonly artifactHash: string }
+  | { readonly kind: "already_finalized" }
+  | { readonly kind: "superseded" }
+  | { readonly kind: "unavailable" }
 
 const EVENT_TYPE = "submission_stop_protocol"
 const EVENT_BODY = "Application submission Stop protocol state recorded."
@@ -66,8 +78,8 @@ export async function recordApplicationSubmissionStopStage(
   const key = stopEventKey(attempt)
   const fenced = await withExactSubmissionClientWrite(client, attempt, `submission_stop_protocol_${stage}`, async () => {
     const existing = await readExistingStages(pool, client, attempt)
-    if (!existing) return "fenced"
-    const state = classifyStages(existing)
+    if (!existing || existing.kind !== "current") return "fenced"
+    const state = classifyStages(existing.stages)
     if (state === "stopped") return "stopped"
     if (stage === "armed" && state === "armed" || stage === "dispatch_granted" && state === "granted") return "duplicate"
     if (stage === "armed" ? state !== "missing" : state !== "armed") return "fenced"
@@ -91,26 +103,57 @@ export async function inspectApplicationSubmissionStopState(
   if (!attempt) return "fenced"
   const fenced = await withExactSubmissionClientWrite(client, attempt, "inspect_submission_stop_protocol", async () => {
     const existing = await readExistingStages(pool, client, attempt)
-    return existing ? classifyStages(existing) : "fenced"
+    return existing?.kind === "current" ? classifyStages(existing.stages) : "fenced"
   })
   return fenced.kind === "current" ? fenced.value : "fenced"
 }
 
+/** Reads the exact stop proof for post-tool terminalization inside its owner's transaction. */
+export async function readStoppedSubmissionFinalizationProof(
+  pool: Pool, client: PoolClient, scope: ApplicationSubmissionStartScope,
+): Promise<StoppedSubmissionFinalizationProof> {
+  if (scope.turnId !== scope.fillTurnId) return { kind: "unavailable" }
+  const attempt = parseApplicationSubmissionStopRecord({ schemaVersion: APPLICATION_SUBMISSION_STOP_PROTOCOL_SCHEMA,
+    stage: "armed", ...stopAttempt(scope) })
+  if (!attempt) return { kind: "unavailable" }
+  const existing = await readExistingStages(pool, client, attempt, "finalization")
+  if (!existing) return { kind: "unavailable" }
+  if (existing.kind === "superseded") return { kind: "superseded" }
+  if (classifyStages(existing.stages) !== "stopped") return { kind: "unavailable" }
+  if (existing.task.status === "failed") return { kind: "already_finalized" }
+  return { kind: "ready", attemptState: existing.attempt.state as "reserved" | "failed", artifactHash: existing.attempt.artifactHash }
+}
+
 async function readExistingStages(
   pool: Pool, client: PoolClient, attempt: ApplicationSubmissionStopAttempt,
-): Promise<Set<ApplicationSubmissionStopStage> | null> {
-  const taskRows = await client.query<TaskRow>(`SELECT "status", "checkpoint", "workerTaskId" FROM application_tasks
+  mode: "strict" | "finalization" = "strict",
+): Promise<ExistingStopState | null> {
+  const taskRows = await client.query<TaskRow>(`SELECT "status", "checkpoint", "workerTaskId", "completedAt", "fillTurnSessionId", "fillTurnUserId" FROM application_tasks
     WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4 AND "fillTurnId" = $5 FOR UPDATE`,
   [attempt.applicationTaskId, attempt.userId, attempt.jobId, attempt.sessionId, attempt.fillTurnId])
   const task = taskRows.rows[0]
-  if (taskRows.rows.length !== 1 || task?.status !== "filling" || task.checkpoint !== "submission_request_started" || task.workerTaskId !== attempt.workerTaskId) return null
-  const attempts = await client.query<AttemptRow>(`SELECT "artifactHash", "state" FROM "submission_attempt"
+  if (taskRows.rows.length !== 1 || !task) return null
+  if (mode === "finalization" && typeof task.workerTaskId === "string" && task.workerTaskId.trim()
+    && task.workerTaskId !== attempt.workerTaskId) return { kind: "superseded" }
+  if (task.workerTaskId !== attempt.workerTaskId) return null
+  const liveTask = task.status === "filling" && task.checkpoint === "submission_request_started" && task.completedAt === null
+  const validCompletedAt = task.completedAt instanceof Date && !Number.isNaN(task.completedAt.getTime())
+  const stoppedTask = task.status === "failed" && task.checkpoint === "turn_stopped_before_submit" && validCompletedAt
+  if (mode === "strict") {
+    if (task.status !== "filling" || task.checkpoint !== "submission_request_started") return null
+  } else if (!task.fillTurnSessionId || task.fillTurnSessionId !== attempt.sessionId || task.fillTurnUserId !== attempt.userId
+    || (!liveTask && !stoppedTask)) return null
+  const attempts = await client.query<AttemptRow>(`SELECT "artifactHash", "state", "responseRef" FROM "submission_attempt"
     WHERE "userId" = $1 AND "jobId" = $2 AND "receiptId" = $3 AND "constraintHash" = $4 FOR UPDATE`,
   [attempt.userId, attempt.jobId, attempt.receiptId, attempt.constraintHash])
-  if (attempts.rows.length !== 1 || attempts.rows[0]?.state !== "reserved") return null
+  const submissionAttempt = attempts.rows[0]
+  if (attempts.rows.length !== 1 || !submissionAttempt
+    || (mode === "strict" ? submissionAttempt.state !== "reserved"
+      : submissionAttempt.responseRef !== null || !["reserved", "failed"].includes(submissionAttempt.state))
+    || (stoppedTask && submissionAttempt.state !== "failed")) return null
   const approval = await createPgApprovalStore(pool, { userId: attempt.userId })
     .inspectSubmissionInTransaction(client, attempt.approvalId, attempt)
-  if (!approval || approval.status !== "consumed" || !approval.consumedAt || approval.scope.resourceHash !== attempts.rows[0]?.artifactHash) return null
+  if (!approval || approval.status !== "consumed" || !approval.consumedAt || approval.scope.resourceHash !== submissionAttempt.artifactHash) return null
   const started = await client.query<StartEventRow>(`SELECT "taskId", "type", "actor", "data" FROM "application_task_events" WHERE "id" = $1`,
     [`evt_${attempt.executionId}`])
   if (started.rows.length !== 1 || !matchesStartedEvent(started.rows[0], attempt)) return null
@@ -128,7 +171,14 @@ async function readExistingStages(
       || !record || record.stage !== stage || !matchesExactApplicationSubmissionStopAttempt(record, attempt) || existing.has(stage)) return null
     existing.add(stage)
   }
-  return existing
+  if (mode === "finalization") {
+    const evidence = await client.query(`SELECT "id" FROM "application_task_events"
+      WHERE "taskId" = $1 AND "type" = 'submission_evidence_recorded'
+        AND ("data"->>'approvalId' = $2 OR "data"->>'workerTaskId' = $3 OR "data"->>'executionId' = $4) LIMIT 1`,
+    [attempt.applicationTaskId, attempt.approvalId, attempt.workerTaskId, attempt.executionId])
+    if (evidence.rows.length !== 0) return null
+  }
+  return { kind: "current", stages: existing, task, attempt: submissionAttempt }
 }
 
 function classifyStages(stages: ReadonlySet<ApplicationSubmissionStopStage>): WorkerSubmissionStopInspection {

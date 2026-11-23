@@ -68,7 +68,7 @@ async function readApprovedWait(client: Client, input: { lease: TurnLease; task:
   [input.approvalId, input.waitItemId, input.lease.userId, input.lease.sessionId, input.lease.turnId, input.task.id, input.task.jobId])
   if (result.rows.length !== 1) return null
   const row = result.rows[0]!, expiry = date(row.expiresAt), decided = date(row.decidedAt)
-  const payload = exact(row.payload, "applicationTaskId,jobId"), impact = exact(row.impact, "externalSubmission,jobId")
+  const payload = exact(row.payload, "applicationTaskId,coverLetterId,jobId,resumeId"), impact = exact(row.impact, "externalSubmission,jobId")
   const content = exact(row.waitContent, "action,approvalId,body,decision,expiresAt,impact,receiptRevision,respondedAt,responseAvailable,scopeHash,title,toolCallId,waitKind")
   const waitImpact = exact(content?.impact, "externalSubmission,jobId")
   const event = exact(row.resolvedPayload, "answerAvailable,itemId,nextTurnRevision,status,toolCallId,turnId,waitId,waitKind")
@@ -78,6 +78,7 @@ async function readApprovedWait(client: Client, input: { lease: TurnLease; task:
     || !HEX.test(String(row.nonceHash)) || !Number.isSafeInteger(row.revision) || Number(row.revision) < 0
     || !expiry || expiry <= input.now || !decided || row.consumedAt != null
     || !payload || payload.applicationTaskId !== input.task.id || payload.jobId !== input.task.jobId
+    || payload.resumeId !== input.task.resumeId || payload.coverLetterId !== input.task.coverLetterId
     || impact?.externalSubmission !== true || impact.jobId !== input.task.jobId
     || row.waitItemId !== input.waitItemId || row.waitStepId !== null || row.waitTaskId !== null
     || row.waitType !== "approval_request" || row.waitStatus !== "completed" || row.waitPhase !== "commentary" || Number(row.waitRevision) !== 1

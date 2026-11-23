@@ -18,26 +18,35 @@ import { replayPattern } from "../patterns/replay.js";
 import type { Page } from "playwright-core";
 import type { ApplyJobRunContext } from "./apply-job-runner.js";
 import { APPLY_TIMEOUT_MS } from "./apply-job-finalization.js";
+import { runAndSettleSubmissionRoute } from "./application-submission-route-observation.js";
 
 export async function runApplySubmitStrategy(
   context: ApplyJobRunContext,
   page: Page,
-  runBrowserFlow: (typedSubmitGuard?: (intent?: SubmissionRequestIntent) => Promise<boolean>) => Promise<HarnessResult>,
+  runBrowserFlow: (typedSubmitGuard?: (intent?: SubmissionRequestIntent) => Promise<boolean>, reviewedCoverLetter?: string) => Promise<HarnessResult>,
 ): Promise<HarnessResult> {
   const { payload, submissionIdentity } = context;
   const { userId, jobId, receiptId, constraintHash, applicationTaskId } = payload;
   const approvedTurnScope = context.state.approvedTurnScope;
   if (payload.operation !== "submit" || !submissionIdentity) return runBrowserFlow();
   if (!approvedTurnScope) throw new Error("Approved application submission is missing its durable Turn scope.");
+  const runAndObserveRoute = async (run: () => Promise<HarnessResult>): Promise<HarnessResult> => {
+    const result = await runAndSettleSubmissionRoute({
+      run,
+      observation: () => context.state.submissionRouteState.observation,
+      currentWork: () => context.state.submissionRouteState.work,
+    });
+    return context.state.submissionAcknowledgementUncertain
+      ? { ...result, status: "manual", error: UNCONFIRMED_SUBMISSION_MESSAGE }
+      : result;
+  };
   const submit = createBrowserApplicationSubmitProvider({
-    run: async (beforeSubmit) => {
-      const result = await runBrowserFlow(beforeSubmit);
-      const activeRouteWork = context.state.submissionRouteState.work;
-      if (activeRouteWork) await activeRouteWork;
-      return context.state.submissionAcknowledgementUncertain
-        ? { ...result, status: "manual", error: UNCONFIRMED_SUBMISSION_MESSAGE }
-        : result;
-    },
+    run: (beforeSubmit) => runAndObserveRoute(() => runBrowserFlow(beforeSubmit)),
+    ...(context.state.flow === "greenhouse" ? {
+      runReviewed: async ({ beforeSubmit, reviewedCoverLetter }) => {
+        return runAndObserveRoute(() => runBrowserFlow(beforeSubmit, reviewedCoverLetter));
+      },
+    } : {}),
     confirmationId: "application:" + applicationTaskId,
     postSubmitUrl: () => page.url(),
   });
@@ -87,19 +96,29 @@ export async function runApplyBrowserStrategy(
   applyTask: ApplyTask,
   challengeAllowsAction: () => Promise<boolean>,
   typedSubmitGuard?: (intent?: SubmissionRequestIntent) => Promise<boolean>,
+  reviewedCoverLetter?: string,
 ): Promise<HarnessResult> {
   const { userId, dryRun } = context.payload;
   const taskContext = context.taskContext!;
   const { flow } = context.state;
+  if (reviewedCoverLetter !== undefined && (flow !== "greenhouse" || context.payload.operation !== "submit"
+    || applyTask.allowSubmit !== true || typeof applyTask.beforeSubmit !== "function" || !typedSubmitGuard)) return {
+    status: "manual", turns: 0, durationMs: 0,
+    error: "Reviewed application material is unsupported by this browser path.", log: [],
+  };
+  const reviewedTask = reviewedCoverLetter === undefined ? applyTask : {
+    ...applyTask,
+    persona: { ...applyTask.persona, coverLetter: reviewedCoverLetter },
+  };
   const browserTask: ApplyTask = typedSubmitGuard
     ? {
-        ...applyTask,
+        ...reviewedTask,
         beforeSubmit: async (intent?: SubmissionRequestIntent) => {
           if (!await typedSubmitGuard(intent)) return false;
-          return applyTask.beforeSubmit ? applyTask.beforeSubmit(intent) : true;
+          return reviewedTask.beforeSubmit ? reviewedTask.beforeSubmit(intent) : true;
         },
       }
-    : applyTask;
+    : reviewedTask;
   let result: HarnessResult | null = null;
   context.state.usedFlow = flow ? "programmatic" : null;
 
@@ -121,7 +140,9 @@ export async function runApplyBrowserStrategy(
     // The challenge branch already decided the outcome.
   } else if (flow === "greenhouse") {
     console.log("[apply-worker] Using Greenhouse pre-programmed flow");
-    result = await runGreenhouseFlow(page, browserTask);
+    result = await runGreenhouseFlow(page, browserTask, reviewedCoverLetter === undefined
+      ? undefined
+      : { reviewedCoverLetter, mode: "approved-submit" });
   } else if (flow === "lever") {
     console.log("[apply-worker] Using Lever pre-programmed flow");
     result = await runLeverFlow(page, browserTask);

@@ -4,7 +4,9 @@ import {
   inspectApplicationSubmissionStopState,
   recordApplicationSubmissionStopStage,
 } from "../../db/application-submission-stop-state.js"
-import { readSubmissionTurnStopState, withReviewedApplicationSubmitRequestFence } from "../../db/reviewed-application-submit-request-fence.js"
+import {
+  readSubmissionTurnStopState, withReviewedApplicationSubmitRequestFence, withReviewedApplicationSubmitStopPollFence,
+} from "../../db/reviewed-application-submit-request-fence.js"
 import type { ApplicationSubmissionStartFence } from "./application-submission-probe.js"
 import { appendFencedSubmitAudit } from "../../queue/application-submit-fence.js"
 
@@ -185,7 +187,7 @@ export async function isApplicationSubmissionStoppedWithStopProtocol(
     const phase = task.rows[0]?.checkpoint === "browser_active" ? "marker"
       : task.rows[0]?.checkpoint === "submission_request_started" ? "boundary" : null
     if (!phase) throw new Error("Application submission request phase is unavailable.")
-    const fenced = await withReviewedApplicationSubmitRequestFence(tx.client, scope, phase, undefined, async () => {
+    const work = async () => {
       const state = await readSubmissionTurnStopState(tx.client, scope)
       if (phase === "marker") {
         if (hasExplicitStopSignal(state)) return true
@@ -200,7 +202,10 @@ export async function isApplicationSubmissionStoppedWithStopProtocol(
       }
       if (stopState === "granted" && mayContinueTurn(state)) return false
       throw new Error("Application submission Stop state is unavailable.")
-    })
+    }
+    const fenced = phase === "marker"
+      ? await withReviewedApplicationSubmitStopPollFence(tx.client, scope, work)
+      : await withReviewedApplicationSubmitRequestFence(tx.client, scope, "boundary", undefined, work)
     if (fenced.kind !== "current") throw new Error("Application submission scope changed during Stop polling.")
     if (!await closeTransaction(tx, true)) throw new Error("Application submission Stop poll did not commit.")
     return fenced.value

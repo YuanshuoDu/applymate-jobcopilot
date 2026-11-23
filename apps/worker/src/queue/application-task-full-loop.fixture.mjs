@@ -7,7 +7,7 @@ import { unlink } from "node:fs/promises"
 import { Pool } from "pg"
 import { HOST, assertToolMessagePairs, failModel, fixtureModel, required, safeBlockedTarget } from "./application-task-full-loop.fixture-support.mjs"
 import { createLegacyQueueAckWitness } from "./application-task-full-loop.legacy-ack.fixture-support.mjs"
-import { closeStage8Workers, createStage8ApplicationSubmitDrain, createStage8ApplyWorker, createStage8FixtureControl } from "./application-task-full-loop.stage8.fixture-support.mjs"
+import { closeStage8Workers, createStage8ApplicationSubmitDrain, createStage8ApplyWorker, createStage8FixtureControl, hasExactReviewedCoverLetter } from "./application-task-full-loop.stage8.fixture-support.mjs"
 import { applicationFillStageTrace, createStage8ExecutionFailureDiagnostics, traceApplicationFillExecutor } from "./application-task-full-loop.trace-support.mjs"
 
 const [, , mode] = process.argv
@@ -61,7 +61,7 @@ async function startSite() {
   if (!SOCKET) throw new Error("APPLICATION_TASK_FULL_LOOP_SOCKET_PATH_required")
   const reviewedFillRouteSocketPath = required("APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_SOCKET_PATH")
   await unlink(SOCKET).catch(() => undefined)
-  let submitCount = 0, reviewedSubmitCount = 0, reviewedHeldSubmitCount = 0, reviewedMaterialExactCount = 0, reviewedGetCount = 0
+  let submitCount = 0, reviewedSubmitCount = 0, reviewedHeldSubmitCount = 0, reviewedExactSubmissionCount = 0, reviewedMaterialExactCount = 0, reviewedGetCount = 0
   const requests = []
   const browserTrace = []
   const browserProgress = []
@@ -155,7 +155,7 @@ async function startSite() {
         reviewedHeldSubmitCount += 1
       }
       held.add(response)
-      request.resume()
+      if (request.url === "/example-reviewed/jobs/1") void hasExactReviewedCoverLetter(request, REVIEWED_COVER_LETTER).then(matches => { if (matches) reviewedExactSubmissionCount++ }).catch(() => {}); else request.resume()
       say(`SUBMIT_REQUEST ${submitCount}`)
       response.on("close", () => {
         held.delete(response)
@@ -225,7 +225,7 @@ async function startSite() {
     const lines = buffer.split("\n")
     buffer = lines.pop() ?? ""
     for (const line of lines.map(value => value.trim())) {
-      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, reviewedSubmitCount, reviewedHeldSubmitCount, reviewedMaterialExactCount, reviewedGetCount, blocked, requests, browserTrace, browserProgress })}`)
+      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, reviewedSubmitCount, reviewedHeldSubmitCount, reviewedExactSubmissionCount, reviewedMaterialExactCount, reviewedGetCount, blocked, requests, browserTrace, browserProgress })}`)
       if (line === "release-held") {
         for (const response of held) {
           if (!response.destroyed && !response.writableEnded) response.writeHead(200, { "content-type": "text/plain" }).end("Synthetic fixture response.")

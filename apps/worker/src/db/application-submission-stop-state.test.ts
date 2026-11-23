@@ -13,7 +13,7 @@ vi.mock("../runtime/approval/pg-store.js", () => ({
 }))
 vi.mock("./submission-guard.js", () => ({ withExactSubmissionClientWrite: mocks.withFence }))
 
-import { inspectApplicationSubmissionStopState, recordApplicationSubmissionStopStage } from "./application-submission-stop-state.js"
+import { inspectApplicationSubmissionStopState, readStoppedSubmissionFinalizationProof, recordApplicationSubmissionStopStage } from "./application-submission-stop-state.js"
 import { markSubmissionRequestStarted, type ApplicationSubmissionStartScope } from "./application-task-state.js"
 
 const scope: ApplicationSubmissionStartScope = {
@@ -51,13 +51,19 @@ function harness(options: {
   const calls: Array<{ sql: string; values: unknown[] }> = []
   const query = vi.fn(async (sql: string, values: unknown[] = []) => {
     calls.push({ sql, values })
-    if (sql.includes("FROM application_tasks")) return { rows: options.taskRows ?? [{ status: "filling", checkpoint: "submission_request_started", workerTaskId: scope.workerTaskId }], rowCount: 1 }
-    if (sql.includes('FROM "submission_attempt"')) return { rows: options.attemptRows ?? [{ artifactHash: "artifact-hash", state: "reserved" }], rowCount: 1 }
+    if (sql.includes("FROM application_tasks")) return { rows: options.taskRows ?? [{ status: "filling", checkpoint: "submission_request_started", workerTaskId: scope.workerTaskId,
+      completedAt: null, fillTurnSessionId: scope.sessionId, fillTurnUserId: scope.userId }], rowCount: 1 }
+    if (sql.includes('FROM "submission_attempt"')) return { rows: options.attemptRows ?? [{ artifactHash: "artifact-hash", state: "reserved", responseRef: null }], rowCount: 1 }
     if (sql.includes('WHERE "id" = $1') && sql.includes('FROM "application_task_events"')) return { rows: options.startedRows ?? [startEvent], rowCount: 1 }
     if (sql.includes('WHERE "id" = ANY($1::text[])')) {
       const ids = values[0] as string[]
       return { rows: events.filter(row => ids.includes(String(row.id))), rowCount: events.length }
     }
+    if (sql.includes("submission_evidence_recorded")) return { rows: events.filter(row => {
+      const data = row.data as Record<string, unknown> | undefined
+      return row.type === "submission_evidence_recorded" && (data?.approvalId === values[1]
+        || data?.workerTaskId === values[2] || data?.executionId === values[3])
+    }), rowCount: 0 }
     if (sql.includes('INSERT INTO "application_task_events"')) {
       events.push({ id: values[0], taskId: values[1], type: values[2], actor: "worker", body: values[3], data: JSON.parse(String(values[4])) as unknown })
       return { rows: [{ id: values[0] }], rowCount: 1 }
@@ -103,6 +109,51 @@ describe("Worker application submission Stop storage", () => {
     const test = harness({ events: [stageRow("armed"), stageRow("stop_requested")] })
     await expect(recordApplicationSubmissionStopStage(test.pool, test.client, scope, "dispatch_granted")).resolves.toBe("stopped")
     expect(test.events).toHaveLength(2)
+  })
+
+  it("recognizes the exact live stopped attempt for post-tool finalization", async () => {
+    for (const state of ["reserved", "failed"] as const) {
+      const test = harness({ events: [stageRow("armed"), stageRow("stop_requested")], attemptRows: [{ artifactHash: "artifact-hash", state, responseRef: null }] })
+      await expect(readStoppedSubmissionFinalizationProof(test.pool, test.client, scope)).resolves.toEqual({
+        kind: "ready", attemptState: state, artifactHash: "artifact-hash",
+      })
+    }
+  })
+
+  it("recognizes only the same failed attempt as an already finalized stop", async () => {
+    const test = harness({
+      taskRows: [{ status: "failed", checkpoint: "turn_stopped_before_submit", workerTaskId: scope.workerTaskId,
+        completedAt: new Date(), fillTurnSessionId: scope.sessionId, fillTurnUserId: scope.userId }],
+      attemptRows: [{ artifactHash: "artifact-hash", state: "failed", responseRef: null }],
+      events: [stageRow("armed"), stageRow("stop_requested")],
+    })
+    await expect(readStoppedSubmissionFinalizationProof(test.pool, test.client, scope)).resolves.toEqual({ kind: "already_finalized" })
+  })
+
+  it.each([
+    ["terminal task with a reserved attempt", { taskRows: [{ status: "failed", checkpoint: "turn_stopped_before_submit", workerTaskId: scope.workerTaskId,
+      completedAt: new Date(), fillTurnSessionId: scope.sessionId, fillTurnUserId: scope.userId }] }],
+    ["attempt with a response reference", { attemptRows: [{ artifactHash: "artifact-hash", state: "failed", responseRef: "response-1" }] }],
+    ["contradictory grant", { events: [stageRow("armed"), stageRow("stop_requested"), stageRow("dispatch_granted")] }],
+    ["submitted evidence", { events: [stageRow("armed"), stageRow("stop_requested"), { id: "evidence-1", taskId: scope.applicationTaskId,
+      type: "submission_evidence_recorded", data: { approvalId: scope.approvalId, workerTaskId: scope.workerTaskId, executionId: scope.executionId } }] }],
+  ] as const)("rejects post-tool finalization proof with %s", async (_label, options) => {
+    const test = harness({ events: [stageRow("armed"), stageRow("stop_requested")], ...options })
+    await expect(readStoppedSubmissionFinalizationProof(test.pool, test.client, scope)).resolves.toEqual({ kind: "unavailable" })
+  })
+
+  it("ignores submitted evidence that belongs to a separate attempt", async () => {
+    const test = harness({ events: [stageRow("armed"), stageRow("stop_requested"), {
+      id: "other-evidence", taskId: scope.applicationTaskId, type: "submission_evidence_recorded",
+      data: { approvalId: "approval-other", workerTaskId: "worker-other", executionId: "execution-other" },
+    }] })
+    await expect(readStoppedSubmissionFinalizationProof(test.pool, test.client, scope)).resolves.toMatchObject({ kind: "ready" })
+  })
+
+  it("recognizes a same-turn workerTask replacement as superseded", async () => {
+    const test = harness({ taskRows: [{ status: "filling", checkpoint: "submission_request_started", workerTaskId: "worker-successor",
+      completedAt: null, fillTurnSessionId: scope.sessionId, fillTurnUserId: scope.userId }] })
+    await expect(readStoppedSubmissionFinalizationProof(test.pool, test.client, scope)).resolves.toEqual({ kind: "superseded" })
   })
 
   it("inspects exact committed stages without creating or acknowledging a grant", async () => {
