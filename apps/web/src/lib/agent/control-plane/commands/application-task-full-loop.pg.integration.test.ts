@@ -591,8 +591,8 @@ type LegacyAckWitness = {
 
 async function createLegacyAckWitnessForTest(writeLine: (line: string) => void): Promise<LegacyAckWitness> {
   const supportUrl = new URL("../../../../../../worker/src/queue/application-task-full-loop.legacy-ack.fixture-support.mjs", import.meta.url)
-  const module = await import(supportUrl.href) as { createLegacyQueueAckWitness: (write: (line: string) => void) => LegacyAckWitness }
-  return module.createLegacyQueueAckWitness(writeLine)
+  const fixtureSupport = await import(supportUrl.href) as { createLegacyQueueAckWitness: (write: (line: string) => void) => LegacyAckWitness }
+  return fixtureSupport.createLegacyQueueAckWitness(writeLine)
 }
 
 describe("legacy queue acknowledgement fixture witness", () => {
