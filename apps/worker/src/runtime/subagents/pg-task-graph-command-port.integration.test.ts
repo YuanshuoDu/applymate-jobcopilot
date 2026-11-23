@@ -20,7 +20,7 @@ import type { TurnLease } from "../turns/lease.js"
 import { TASK_GRAPH_TEMPLATES, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-dependency-verification.js"
-import { reverifyFailedTaskGraphNodeEvidence, verifyCompletedTaskGraphNodeEvidence, verifyTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
+import { verifyCompletedTaskGraphNodeEvidence, verifyTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { readScheduledDraftCandidateBinding, validateScheduledDraftCandidateWitness } from "./scheduled-draft-candidate.js"
 import type { TaskGraphVerificationDependencyBinding } from "./task-graph-verification-report.js"
 import { createChildDiscoveryObservers } from "./child-discovery-observers.js"
@@ -4417,10 +4417,10 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       expect(report).toMatchObject(input.shouldReject
         ? { status: "unverified", reasonCode: "canonical_evidence_ambiguous" }
         : { status: "passed", reasonCode: "criteria_met" })
-      expect({ taskType: analyst.taskType, status: analyst.status, failureReason: analyst.failureReason,
+      expect({ role: analyst.role, taskType: analyst.taskType, status: analyst.status, failureReason: analyst.failureReason,
         attemptCount: analyst.attemptCount }).toEqual(input.shouldReject
-        ? { taskType: "job_analysis", status: "failed", failureReason: "task_graph_verification_unverified", attemptCount: 1 }
-        : { taskType: "job_analysis", status: "completed", failureReason: null, attemptCount: 1 })
+        ? { role: "analyst", taskType: "job_analysis", status: "failed", failureReason: "task_graph_verification_unverified", attemptCount: 1 }
+        : { role: "analyst", taskType: "job_analysis", status: "completed", failureReason: null, attemptCount: 1 })
 
       const graphRow = await adminPool!.query<{ content: unknown; revision: number }>(`SELECT "content", "revision" FROM "agent_items"
         WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'task_graph'`,
@@ -4432,21 +4432,25 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       const graphScope = scheduledDraftGraphScope(value)
       const dependencyProof = await verifyCompletedScoutDependencies(adminPool!, graphScope, snapshot, analystGraphNode)
       if (!dependencyProof) throw new Error("Description witness terminal proof lost its completed Scout dependencies")
-      const terminalInput = {
-        scope: { ...graphScope, taskId: analystNode.taskId, attemptCount: 1 }, snapshot,
-        node: analystGraphNode, structuredResult: result.structuredResult,
-        dependencies: dependencyProof.projections, dependencyBindings: dependencyProof.bindings,
-        scoutJobDescriptionWitnesses: dependencyProof.jobDescriptionWitnesses, graphRevision: graphRow.rows[0]!.revision,
+      if (input.shouldReject) {
+        expect(analyst.role).toBe("analyst")
+        expect(Object.hasOwn(result, "structuredResult")).toBe(false)
+        expect(report).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_ambiguous",
+          evidenceDigest: null, resultDigest: null })
+      } else {
+        const terminalProof = await verifyCompletedTaskGraphNodeEvidence(adminPool!, {
+          scope: { ...graphScope, taskId: analystNode.taskId, attemptCount: 1 }, snapshot,
+          node: analystGraphNode, structuredResult: result.structuredResult,
+          dependencies: dependencyProof.projections, dependencyBindings: dependencyProof.bindings,
+          scoutJobDescriptionWitnesses: dependencyProof.jobDescriptionWitnesses, graphRevision: graphRow.rows[0]!.revision,
+        })
+        expect(terminalProof.verified).toBe(true)
+        expect({ status: terminalProof.report.status, reasonCode: terminalProof.report.reasonCode,
+          evidenceDigest: terminalProof.report.evidenceDigest, resultDigest: terminalProof.report.resultDigest }).toEqual({
+          status: report.status, reasonCode: report.reasonCode,
+          evidenceDigest: report.evidenceDigest, resultDigest: report.resultDigest,
+        })
       }
-      const terminalProof = input.shouldReject
-        ? await reverifyFailedTaskGraphNodeEvidence(adminPool!, terminalInput)
-        : await verifyCompletedTaskGraphNodeEvidence(adminPool!, terminalInput)
-      expect(terminalProof.verified).toBe(!input.shouldReject)
-      expect({ status: terminalProof.report.status, reasonCode: terminalProof.report.reasonCode,
-        evidenceDigest: terminalProof.report.evidenceDigest, resultDigest: terminalProof.report.resultDigest }).toEqual({
-        status: report.status, reasonCode: report.reasonCode,
-        evidenceDigest: report.evidenceDigest, resultDigest: report.resultDigest,
-      })
 
       const pairs = await adminPool!.query<{ taskId: string; toolName: string; pairCount: number }>(`SELECT call_item."taskId",
           call_item."content"->>'toolName' AS "toolName", COUNT(*)::int AS "pairCount"
