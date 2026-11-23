@@ -12014,7 +12014,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 expect(root.rows).toHaveLength(1)
                 expect(root.rows[0]?.role).toBe("orchestrator")
                 expect(root.rows[0]?.allowedActions.slice().sort()).toEqual([
-                  "agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.wait",
+                  "agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.retire_superseded_scout", "agent.wait",
                 ])
               }
               yield { type: "tool_call_completed", callId: initialWaitCallId, name: "agent.wait", arguments: {
@@ -21345,7 +21345,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       subagents: { execute: childExecutor, intervalMs: 10 },
     })
     await withinIntegrationDeadline(rootToolNames.promise, "ObjectiveStart Root did not request tools", 30_000)
-    expect(await rootToolNames.promise).toEqual(["agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.wait"])
+    expect(await rootToolNames.promise).toEqual(["agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.retire_superseded_scout", "agent.wait"])
     const initialPlan = await withinIntegrationDeadline(initialPlanReceipt.promise, "Root did not accept the Scout plan", 30_000)
     expect(initialPlan).toMatchObject({ status: "accepted", revision: 1, nodes: [{ key: "scout", status: "queued" }] })
     const initialNodes = Array.isArray(initialPlan.nodes) ? initialPlan.nodes.map(record) : []
