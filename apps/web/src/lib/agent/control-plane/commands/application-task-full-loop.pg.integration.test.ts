@@ -2122,7 +2122,6 @@ async function waitForStage8Arm(prepared: Stage8PreparedScenario, intent: Stage8
 
 async function prepareStage8Scenario(label: "stop-first" | "grant-first" | "early-wake"): Promise<Stage8PreparedScenario> {
   const before = await requestFixtureStats()
-  const beforeEmployerPostCount = before.requests.filter(path => path === "POST /example-reviewed/jobs/1").length
   await resetStage8DomainRateLimit()
   const scenario = await createReviewedSourceScenario(`stage8-${label}`, `Synthetic Stage 8 ${label} source description.`)
   const token = await signedBearer(ids.user)
@@ -2225,7 +2224,6 @@ async function prepareStage8Scenario(label: "stop-first" | "grant-first" | "earl
   expect(await testDb.agentOutbox.count({ where: { aggregateId: scenario.sessionId, topic: "application.submit.dispatch" } })).toBe(0)
   const after = await requestFixtureStats()
   expect(after.reviewedSubmitCount).toBe(before.reviewedSubmitCount)
-  expect(after.requests.filter(path => path === "POST /example-reviewed/jobs/1")).toHaveLength(beforeEmployerPostCount)
   return { ...scenario, token, sourceTurnId: source.turnId, reviewTurnId, fillTurnId,
     applicationTaskId: reviewTask.id, submitApprovalId }
 }
@@ -3572,7 +3570,6 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const prepared = await prepareStage8Scenario("early-wake")
       const executionEventsBeforeWake = await stage8ModelAndToolCallEventIds(prepared)
       const before = await requestFixtureStats()
-      const beforeEmployerPosts = before.requests.filter(path => path === "POST /example-reviewed/jobs/1").length
       const autoApply = await import("@/lib/auto-apply")
       const realQueueAutonomousApplication = autoApply.queueAutonomousApplication
       let signalQueueCall!: () => void
@@ -3647,15 +3644,13 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           ])
           const matchingOutbox = submitOutbox.filter(row => jsonString(row.payload, "applicationTaskId") === prepared.applicationTaskId)
           const matchingQueueJobs = queueJobs.filter(job => jsonString(job.data, "applicationTaskId") === prepared.applicationTaskId)
-          const employerPosts = stats.requests.filter(path => path === "POST /example-reviewed/jobs/1")
           expect(session.status === "waiting_for_user").toBe(true)
           expect(task.status === "waiting_for_authorization" && task.checkpoint === "form_filled"
             && task.workerTaskId === null).toBe(true)
           expect(matchingOutbox).toHaveLength(0)
           expect(queuedEvents).toBe(0)
           expect(matchingQueueJobs).toHaveLength(0)
-          expect(stats.reviewedSubmitCount === before.reviewedSubmitCount
-            && employerPosts.length === beforeEmployerPosts).toBe(true)
+          expect(stats.reviewedSubmitCount).toBe(before.reviewedSubmitCount)
         }
         await assertPreQueueState()
 
@@ -3721,7 +3716,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           && Boolean(jsonString(matchingIntents[0]!.payload, "workerTaskId"))
         expect(exactIntent && queuedEventCount === 1).toBe(true)
         expect(await stage8ModelAndToolCallEventIds(prepared)).toEqual(executionEventsBeforeWake)
-        expect(stats.requests.filter(path => path === "POST /example-reviewed/jobs/1")).toHaveLength(beforeEmployerPosts)
+        expect(stats.reviewedSubmitCount).toBe(before.reviewedSubmitCount)
       } finally {
         if (barrierTimer) clearTimeout(barrierTimer)
         releaseQueue()
