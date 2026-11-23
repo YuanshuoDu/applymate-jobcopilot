@@ -445,10 +445,10 @@ function scheduledDraftGraphScope(value: Fixture) {
 }
 
 function scheduledDraftRoleResult(role: "scout" | "analyst", jobId: string, hasFinding = true, score = 8): unknown {
-  const evidence = [{ id: `model-job-${role}`, kind: "job", ref: jobId, source: "fixture" }]
+  const evidence = [{ id: `model-job-${role}`, kind: "job", ref: jobId, source: "test" }]
   if (role === "scout") return {
     schemaVersion: ROLE_RESULT_SCHEMA, role, status: "completed",
-    candidates: [{ jobId, source: "fixture", url: null, evidenceIds: [evidence[0]!.id] }], evidence, summary: "Fixture candidate",
+    candidates: [{ jobId, source: "test", url: null, evidenceIds: [evidence[0]!.id] }], evidence, summary: "Fixture candidate",
   }
   return {
     schemaVersion: ROLE_RESULT_SCHEMA, role, status: "completed",
