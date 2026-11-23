@@ -1732,7 +1732,7 @@ async function reviewedFillTimeoutSnapshot(input: {
   }
 }
 
-async function createReviewedSourceScenario(label: "positive" | "stale" | "stage8-stop-first" | "stage8-grant-first", description: string) {
+async function createReviewedSourceScenario(label: "positive" | "stale" | "stage8-stop-first" | "stage8-grant-first" | "stage8-early-wake", description: string) {
   const jobId = `full-loop-reviewed-job-${runId}-${label}`
   const sessionId = `full-loop-reviewed-session-${runId}-${label}`
   reviewedJobIds.push(jobId)
@@ -2112,7 +2112,7 @@ async function waitForStage8Arm(prepared: Stage8PreparedScenario, intent: Stage8
   }
 }
 
-async function prepareStage8Scenario(label: "stop-first" | "grant-first"): Promise<Stage8PreparedScenario> {
+async function prepareStage8Scenario(label: "stop-first" | "grant-first" | "early-wake"): Promise<Stage8PreparedScenario> {
   await resetStage8DomainRateLimit()
   const scenario = await createReviewedSourceScenario(`stage8-${label}`, `Synthetic Stage 8 ${label} source description.`)
   const token = await signedBearer(ids.user)
@@ -2181,7 +2181,7 @@ async function prepareStage8Scenario(label: "stop-first" | "grant-first"): Promi
   }, select: { id: true } })
   const fill = await waitForReviewedApplicationTask(scenario.jobId,
     task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled" && Boolean(task.fillTurnId),
-    180_000, label === "stop-first")
+    180_000, label !== "grant-first")
   const fillTurnId = fill.fillTurnId
   if (typeof fillTurnId !== "string" || !fillTurnId.trim() || fill.id !== reviewTask.id) throw new Error("stage8_fill_identity_missing")
   const browserStarted = await testDb.applicationTaskEvent.findMany({ where: {
@@ -2224,7 +2224,7 @@ async function armStage8ExecutionFailureTarget(prepared: Stage8PreparedScenario)
   await waitLine(worker, "STAGE8_FAILURE_TARGET_ARMED", 5_000)
 }
 
-async function approveStage8Submit(prepared: Stage8PreparedScenario): Promise<Stage8SubmitIntent> {
+async function postStage8SubmitApproval(prepared: Stage8PreparedScenario): Promise<Response> {
   const approval = await testDb.agentApproval.findUniqueOrThrow({ where: { id: prepared.submitApprovalId } })
   expect(approval).toMatchObject({ id: prepared.submitApprovalId, userId: ids.user, sessionId: prepared.sessionId,
     taskId: prepared.applicationTaskId, turnId: prepared.fillTurnId, jobId: prepared.jobId,
@@ -2236,9 +2236,13 @@ async function approveStage8Submit(prepared: Stage8PreparedScenario): Promise<St
   const receiptNonce = jsonString(await jsonResponse(nonceResponse), "receiptNonce")
   expect(receiptNonce).toMatch(/^[a-f0-9]{64}$/)
   const { POST: approvalAction } = await import("@/app/api/agent/sessions/[id]/actions/route")
-  const response = await approvalAction(apiRequest(`/api/agent/sessions/${prepared.sessionId}/actions`, prepared.token, "POST", {
+  return approvalAction(apiRequest(`/api/agent/sessions/${prepared.sessionId}/actions`, prepared.token, "POST", {
     type: "approval_response", approvalId: prepared.submitApprovalId, decision: "approved", receiptNonce,
   }), { params: Promise.resolve({ id: prepared.sessionId }) })
+}
+
+async function approveStage8Submit(prepared: Stage8PreparedScenario): Promise<Stage8SubmitIntent> {
+  const response = await postStage8SubmitApproval(prepared)
   if (response.status !== 200) {
     const body = jsonRecord(await response.clone().json().catch(() => null))
     const [approvalAfter, taskAfter] = await Promise.all([
@@ -3545,6 +3549,175 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       site?.stdin?.write("release-held\n")
     }
   }, 900_000)
+
+  it.skipIf(process.env.RUN_STAGE8_APPROVED_FILL_EARLY_WAKE_WITNESS !== "1")(
+    "holds the real submit queue call until the original approved Fill Turn has a verified terminal receipt",
+    async () => {
+      await stopFixture(worker)
+      worker = spawnFixture("worker-staged")
+      await waitLine(worker, "WORKER_READY", 90_000)
+
+      const prepared = await prepareStage8Scenario("early-wake")
+      const before = await requestFixtureStats()
+      const beforeEmployerPosts = before.requests.filter(path => path === "POST /example-reviewed/jobs/1").length
+      const autoApply = await import("@/lib/auto-apply")
+      const realQueueAutonomousApplication = autoApply.queueAutonomousApplication
+      let signalQueueCall!: () => void
+      let releaseQueueCall!: () => void
+      const queueCallReached = new Promise<void>(resolve => { signalQueueCall = resolve })
+      const queueMayProceed = new Promise<void>(resolve => { releaseQueueCall = resolve })
+      let queueReleased = false
+      let queueCallCount = 0
+      let realQueueCallCount = 0
+      let queueScopeMatches = false
+      const releaseQueue = () => {
+        if (queueReleased) return
+        queueReleased = true
+        releaseQueueCall()
+      }
+      const queueSpy = vi.spyOn(autoApply, "queueAutonomousApplication").mockImplementation(async input => {
+        queueCallCount += 1
+        queueScopeMatches = input.userId === ids.user && input.sessionId === prepared.sessionId
+          && input.applicationTaskId === prepared.applicationTaskId && input.jobId === prepared.jobId
+          && input.approvalId === prepared.submitApprovalId
+        signalQueueCall()
+        await queueMayProceed
+        realQueueCallCount += 1
+        return realQueueAutonomousApplication(input)
+      })
+      let actionRequest: Promise<Response> | undefined
+      let actionSettled: Promise<void> | undefined
+      let barrierTimer: ReturnType<typeof setTimeout> | undefined
+      try {
+        actionRequest = postStage8SubmitApproval(prepared)
+        actionSettled = actionRequest.then(() => undefined, () => undefined)
+        await Promise.race([
+          queueCallReached,
+          new Promise<never>((_, reject) => {
+            barrierTimer = setTimeout(() => reject(new Error("stage8_early_wake_queue_call_not_reached")), 30_000)
+          }),
+        ])
+        if (barrierTimer) clearTimeout(barrierTimer)
+        expect(queueCallCount === 1 && queueScopeMatches && realQueueCallCount === 0).toBe(true)
+
+        const waitId = `agent-wait:approval:${prepared.submitApprovalId}`
+        const [approval, wait, resolvedEvents, wakeupEvents] = await Promise.all([
+          testDb.agentApproval.findFirstOrThrow({ where: { id: prepared.submitApprovalId, userId: ids.user,
+            sessionId: prepared.sessionId, taskId: prepared.applicationTaskId, turnId: prepared.fillTurnId,
+            jobId: prepared.jobId, type: "submit_application" }, select: { status: true } }),
+          testDb.agentItem.findFirstOrThrow({ where: { id: waitId, sessionId: prepared.sessionId,
+            turnId: prepared.fillTurnId, type: "approval_request" }, select: { status: true, content: true } }),
+          testDb.agentEvent.findMany({ where: { sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
+            taskId: prepared.applicationTaskId, type: "approval.resolved", actor: "user",
+            correlationId: prepared.submitApprovalId }, select: { id: true } }),
+          testDb.agentEvent.findMany({ where: { sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
+            itemId: waitId, type: "turn.wakeup" }, select: { id: true } }),
+        ])
+        const waitContent = jsonRecord(wait.content)
+        const committedApprovalWait = approval.status === "approved" && wait.status === "completed"
+          && waitContent?.waitKind === "approval" && waitContent.approvalId === prepared.submitApprovalId
+          && waitContent.action === "submit_application" && waitContent.decision === "approved"
+          && waitContent.responseAvailable === true && resolvedEvents.length === 1 && wakeupEvents.length === 1
+        expect(committedApprovalWait).toBe(true)
+
+        const assertPreQueueState = async () => {
+          const [session, task, submitOutbox, queuedEvents, queueJobs, stats] = await Promise.all([
+            testDb.agentSession.findFirstOrThrow({ where: { id: prepared.sessionId, userId: ids.user }, select: { status: true } }),
+            testDb.applicationTask.findFirstOrThrow({ where: { id: prepared.applicationTaskId, userId: ids.user,
+              sessionId: prepared.sessionId, jobId: prepared.jobId, fillTurnId: prepared.fillTurnId },
+              select: { status: true, checkpoint: true, workerTaskId: true } }),
+            testDb.agentOutbox.findMany({ where: { aggregateId: prepared.sessionId, topic: "application.submit.dispatch" },
+              select: { payload: true } }),
+            testDb.applicationTaskEvent.count({ where: { taskId: prepared.applicationTaskId, type: "submission_queued" } }),
+            submitQueueJobs(),
+            requestFixtureStats(),
+          ])
+          const matchingOutbox = submitOutbox.filter(row => jsonString(row.payload, "applicationTaskId") === prepared.applicationTaskId)
+          const matchingQueueJobs = queueJobs.filter(job => jsonString(job.data, "applicationTaskId") === prepared.applicationTaskId)
+          const employerPosts = stats.requests.filter(path => path === "POST /example-reviewed/jobs/1")
+          expect(session.status === "waiting_for_user").toBe(true)
+          expect(task.status === "waiting_for_authorization" && task.checkpoint === "form_filled"
+            && task.workerTaskId === null).toBe(true)
+          expect(matchingOutbox).toHaveLength(0)
+          expect(queuedEvents).toBe(0)
+          expect(matchingQueueJobs).toHaveLength(0)
+          expect(stats.reviewedSubmitCount === before.reviewedSubmitCount
+            && employerPosts.length === beforeEmployerPosts).toBe(true)
+        }
+        await assertPreQueueState()
+
+        const terminalDeadline = Date.now() + 45_000
+        let verifiedTerminal = false
+        while (Date.now() < terminalDeadline && !verifiedTerminal) {
+          const turn = await testDb.agentTurn.findFirst({ where: { id: prepared.fillTurnId, userId: ids.user,
+            sessionId: prepared.sessionId, source: "user" },
+            select: { status: true, rootTaskId: true, leaseOwnerId: true, leaseStartedAt: true, leaseExpiresAt: true } })
+          if (turn?.status === "completed" && typeof turn.rootTaskId === "string" && turn.rootTaskId) {
+            const [root, events] = await Promise.all([
+              testDb.subAgentTask.findMany({ where: { id: turn.rootTaskId, rootTaskId: turn.rootTaskId,
+                sessionId: prepared.sessionId, turnId: prepared.fillTurnId, parentTaskId: null,
+                role: "orchestrator", taskType: "root" }, select: { status: true, failureReason: true, result: true } }),
+              testDb.agentEvent.findMany({ where: { sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
+                taskId: turn.rootTaskId, type: "turn.completed", actor: "orchestrator" },
+                select: { itemId: true, taskId: true, payload: true } }),
+            ])
+            const event = events[0]
+            const payload = jsonRecord(event?.payload)
+            const finalItemId = event?.itemId
+            const finalItems = typeof finalItemId === "string" ? await testDb.agentItem.findMany({ where: {
+              id: finalItemId, sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
+              type: "agent_message", status: "completed",
+            }, select: { id: true, taskId: true, phase: true } }) : []
+            const rootResult = jsonRecord(root[0]?.result)
+            verifiedTerminal = root.length === 1 && root[0]?.status === "completed" && root[0]?.failureReason === null
+              && events.length === 1 && typeof finalItemId === "string" && finalItemId.length > 0
+              && event?.taskId === turn.rootTaskId && rootResult?.finalItemId === finalItemId
+              && payload?.turnId === prepared.fillTurnId && payload.taskId === turn.rootTaskId
+              && payload.finalItemId === finalItemId && finalItems.length === 1
+              && finalItems[0]?.taskId === turn.rootTaskId && finalItems[0]?.phase === "final_answer"
+              && turn.leaseOwnerId === null && turn.leaseStartedAt === null && turn.leaseExpiresAt === null
+          }
+          if (!verifiedTerminal) await delay(100)
+        }
+        expect(verifiedTerminal).toBe(true)
+        await assertPreQueueState()
+
+        releaseQueue()
+        const response = await actionRequest
+        expect(response.status).toBe(200)
+        expect(queueCallCount === 1 && realQueueCallCount === 1).toBe(true)
+        const [submitIntentRows, queuedEventCount, stats] = await Promise.all([
+          testDb.agentOutbox.findMany({ where: { aggregateId: prepared.sessionId, topic: "application.submit.dispatch" },
+            select: { payload: true } }),
+          testDb.applicationTaskEvent.count({ where: { taskId: prepared.applicationTaskId, type: "submission_queued" } }),
+          requestFixtureStats(),
+        ])
+        const matchingIntents = submitIntentRows.filter(row => jsonString(row.payload, "applicationTaskId") === prepared.applicationTaskId)
+        const exactIntent = matchingIntents.length === 1
+          && jsonString(matchingIntents[0]!.payload, "userId") === ids.user
+          && jsonString(matchingIntents[0]!.payload, "jobId") === prepared.jobId
+          && jsonString(matchingIntents[0]!.payload, "sessionId") === prepared.sessionId
+          && jsonString(matchingIntents[0]!.payload, "fillTurnId") === prepared.fillTurnId
+          && jsonString(matchingIntents[0]!.payload, "receiptId") === prepared.submitApprovalId
+          && Boolean(jsonString(matchingIntents[0]!.payload, "workerTaskId"))
+        expect(exactIntent && queuedEventCount === 1).toBe(true)
+        expect(stats.requests.filter(path => path === "POST /example-reviewed/jobs/1")).toHaveLength(beforeEmployerPosts)
+      } finally {
+        if (barrierTimer) clearTimeout(barrierTimer)
+        releaseQueue()
+        if (actionSettled) {
+          let settleTimer: ReturnType<typeof setTimeout> | undefined
+          try {
+            await Promise.race([actionSettled, new Promise<void>(resolve => { settleTimer = setTimeout(resolve, 60_000) })])
+          } finally {
+            if (settleTimer) clearTimeout(settleTimer)
+          }
+        }
+        queueSpy.mockRestore()
+      }
+    },
+    900_000,
+  )
 })
 
 async function requestFixtureStats(timeoutMs = 5_000): Promise<FixtureStats> {
