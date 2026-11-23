@@ -75,6 +75,8 @@ describe("coordination tool definitions", () => {
     expect(canonicalWait?.inputSchema).toBe(legacyWait?.inputSchema)
     expect(canonicalWait?.outputSchema).toBe(legacyWait?.outputSchema)
     expect(canonicalWait?.execute).toBe(legacyWait?.execute)
+    expect(canonicalWait?.description).toContain("A Root must issue this as the only tool call in its model response")
+    expect(canonicalWait?.description).toBe(legacyWait?.description)
     const legacyInterrupt = definitions.find(definition => definition.name === "interrupt_subagent")
     const canonicalInterrupt = definitions.find(definition => definition.name === "agent.interrupt")
     expect(legacyInterrupt).toBeDefined()
