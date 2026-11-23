@@ -14,6 +14,8 @@ import { createCanonicalTurnContextBuilder } from "./canonical-turn-context-buil
 import { createPgTurnEngineStore } from "./turns/turn-engine-store.js"
 import { issueOrReplayReviewedApplicationReview } from "./reviewed-application-review-issuance.js"
 import { runCanonicalReviewedApplicationReviewTurn } from "./canonical-reviewed-application-review-turn.js"
+import { finishApprovedApplicationFillTurn, readCurrentApprovedApplicationSubmitResumeProof } from "./canonical-approved-application-submit-resume.js"
+import { sameCanonicalApprovedApplicationSubmitResumeProof } from "./canonical-approved-application-submit-resume-proof.js"
 
 export type ReviewedApplicationReviewIssuer = typeof issueOrReplayReviewedApplicationReview
 type ReviewOptions = Readonly<{
@@ -31,11 +33,39 @@ export async function loadAndDispatchCanonicalReviewedApplicationReview<Options 
   coordinationEnabled: boolean; childExecutionEnabled: boolean; consumeWaitOutcomes: boolean
 }): Promise<{ readonly result: TurnExecutionResult | undefined; readonly setupOptions: Options & { stateLoader: () => Promise<CanonicalTurnState> }; readonly durableWaitPort: ReturnType<typeof createPgDurableWaitPort> }> {
   const durableWaitPort = createPgDurableWaitPort(input.pool)
-  const state = await (input.options.stateLoader?.(input.pool, input.lease, input.now(), {
-    consumeWaitOutcomes: input.consumeWaitOutcomes, durableWaitControlReader: durableWaitPort,
-  }) ?? loadCanonicalTurnState(input.pool, input.lease, input.now(), {
-    consumeWaitOutcomes: input.consumeWaitOutcomes, durableWaitControlReader: durableWaitPort,
-  }))
+  const loadState = (consumeWaitOutcomes: boolean) => input.options.stateLoader?.(input.pool, input.lease, input.now(), {
+    consumeWaitOutcomes, durableWaitControlReader: durableWaitPort,
+  }) ?? loadCanonicalTurnState(input.pool, input.lease, input.now(), { consumeWaitOutcomes, durableWaitControlReader: durableWaitPort })
+  const resumeEnabled = !input.options.stateLoader && input.options.productionFlags?.taskGraphPlanningEnabled === true
+    && input.coordinationEnabled && input.childExecutionEnabled && input.consumeWaitOutcomes
+    && !!input.options.taskGraphCommandPort && !!input.rootTasks.checkCompletion
+  if (resumeEnabled) {
+    const preflight = await readCurrentApprovedApplicationSubmitResumeProof({ pool: input.pool, lease: input.lease, now: input.now() })
+    if (preflight) {
+      // The proof must exist before the ordinary owner-fenced child-Wait consumption can write.
+      const state = await loadState(true)
+      if (state.rootTaskId !== preflight.rootTaskId) throw new Error("approved_application_fill_resume_root_changed")
+      const current = await readCurrentApprovedApplicationSubmitResumeProof({ pool: input.pool, lease: input.lease, now: input.now() })
+      if (!current || current.rootTaskId !== preflight.rootTaskId
+        || !sameCanonicalApprovedApplicationSubmitResumeProof(preflight.proof, current.proof)) {
+        throw new Error("approved_application_fill_resume_proof_changed")
+      }
+      const root = await input.rootTasks.ensure({ lease: input.lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot,
+        toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions: [], now: input.now() })
+      if (root.id !== preflight.rootTaskId || root.attemptCount !== 1) throw new Error("approved_application_fill_resume_root_changed")
+      const rebound = await readCurrentApprovedApplicationSubmitResumeProof({ pool: input.pool, lease: input.lease, now: input.now() })
+      if (!rebound || rebound.rootTaskId !== preflight.rootTaskId
+        || !sameCanonicalApprovedApplicationSubmitResumeProof(preflight.proof, rebound.proof)) {
+        throw new Error("approved_application_fill_resume_proof_changed")
+      }
+      const result = await finishApprovedApplicationFillTurn({ pool: input.pool, lease: input.lease, state,
+        rootTaskId: preflight.rootTaskId, proof: preflight.proof, signal: input.signal, rootTasks: input.rootTasks,
+        executionProjection: input.executionProjection, sessionProjection: input.sessionProjection, now: input.now,
+        ...(input.options.turnEngineStoreFactory ? { storeFactory: input.options.turnEngineStoreFactory } : {}) })
+      return { result, durableWaitPort, setupOptions: { ...input.options, stateLoader: async () => state } }
+    }
+  }
+  const state = await loadState(input.consumeWaitOutcomes)
   const result = await dispatchCanonicalReviewedApplicationReview({ ...input, state })
   return { result, durableWaitPort, setupOptions: { ...input.options, stateLoader: async () => state } }
 }

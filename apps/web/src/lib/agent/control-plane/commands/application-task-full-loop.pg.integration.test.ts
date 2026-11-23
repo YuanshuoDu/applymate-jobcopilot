@@ -3,6 +3,7 @@ import { createRequire } from "node:module"
 import { spawn, type ChildProcess } from "node:child_process"
 import { createServer, type Server } from "node:http"
 import { connect as connectSocket } from "node:net"
+import { PassThrough } from "node:stream"
 import { access, unlink } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -10,7 +11,7 @@ import { setTimeout as delay } from "node:timers/promises"
 
 import { Prisma, PrismaClient } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
-import { hashReviewedApplicationMaterialProof } from "@jobcopilot/shared"
+import { hashReviewedApplicationMaterialProof, matchesApplyTaskSubmitPayload } from "@jobcopilot/shared"
 import { applicationSubmissionStopEventId } from "@jobcopilot/shared/application-submission-stop-protocol"
 import { SignJWT } from "jose"
 import { NextRequest } from "next/server"
@@ -247,6 +248,7 @@ type FixtureStats = {
   submitCount: number
   reviewedSubmitCount: number
   reviewedHeldSubmitCount: number
+  reviewedExactSubmissionCount: number
   reviewedMaterialExactCount: number
   reviewedGetCount: number
   blocked: string[]
@@ -291,9 +293,37 @@ const reviewedFillRouteSocketPath = join(tmpdir(), `am-${runId.slice(0, 16)}-rf.
 const tlsPaths = ["AGENT_TEST_TLS_CERT_PATH", "AGENT_TEST_TLS_KEY_PATH", "AGENT_TEST_TLS_CA_PATH"] as const
 const testDb = new PrismaClient({ datasources: { db: { url: databaseUrl ?? DATABASE_URL } } })
 const workerRequire = createRequire(new URL("../../../../../../worker/package.json", import.meta.url))
+type Stage8ExecutionFailure = Readonly<{
+  errorKind: "known_code" | "postgres" | "error" | "type_error" | "range_error" | "syntax_error" | "reference_error" | "aggregate_error" | "other" | "non_error"
+  machineCode: string
+  repoStage: "canonical_turn_runtime" | "canonical_turn_model" | "canonical_turn_setup" | "durable_wait" | "turn_queue" | "worker_runtime" | "other"
+  sqlState: string
+}>
+const classifyStage8ExecutionFailure = (workerRequire("./src/queue/application-task-full-loop.trace-support.mjs") as {
+  classifyStage8ExecutionFailure: (error: unknown) => Stage8ExecutionFailure
+}).classifyStage8ExecutionFailure
+const markerTraceSupport = workerRequire("./src/queue/application-task-full-loop.stage8-marker-trace.mjs") as {
+  sanitizeStage8MarkerFenceTrace: (value: unknown) => Readonly<Record<string, string>>
+  createStage8MarkerFenceTrace: (scope: Readonly<Record<string, unknown>>, writeLine: (line: string) => void) => {
+    observe: (sql: string, values: readonly unknown[], result: unknown) => void
+    observeError: (sql: string, values: readonly unknown[]) => void
+    finish: () => void
+  }
+}
+const { sanitizeStage8MarkerFenceTrace, createStage8MarkerFenceTrace } = markerTraceSupport
+const classifyStage8StopPollError = (workerRequire("./src/queue/application-task-full-loop.stage8.fixture-support.mjs") as {
+  classifyStage8StopPollError: (error: unknown) => string
+}).classifyStage8StopPollError
+const createStage8ExecutionFailureDiagnostics = (workerRequire("./src/queue/application-task-full-loop.trace-support.mjs") as {
+  createStage8ExecutionFailureDiagnostics: (writeLine: (line: string) => void, input: PassThrough) => {
+    record: (job: unknown, error: unknown) => boolean
+  }
+}).createStage8ExecutionFailureDiagnostics
 const { Queue } = workerRequire("bullmq") as { Queue: new (name: string, options: { connection: { host: string; port: number; db: number } }) => {
-  getJobs(states: readonly string[], start: number, end: number): Promise<Array<{ id?: string; data: unknown; attemptsMade: number; attemptsStarted: number; stalledCounter: number; getState(): Promise<string>; remove(): Promise<void> }>>
-  getJob(id: string): Promise<{ id?: string; data: unknown; attemptsMade: number; attemptsStarted: number; stalledCounter: number; getState(): Promise<string>; remove(): Promise<void> } | undefined>
+  client: Promise<{ del(key: string): Promise<number>; get(key: string): Promise<string | null> }>
+  toKey(value: string): string
+  getJobs(states: readonly string[], start: number, end: number): Promise<Array<{ id?: string; data: unknown; attemptsMade: number; attemptsStarted: number; stalledCounter: number; opts?: { attempts?: number }; getState(): Promise<string>; remove(): Promise<void> }>>
+  getJob(id: string): Promise<{ id?: string; data: unknown; attemptsMade: number; attemptsStarted: number; stalledCounter: number; opts?: { attempts?: number }; getState(): Promise<string>; remove(): Promise<void> } | undefined>
   add(name: string, data: unknown, options: { jobId: string }): Promise<{ id?: string; getState(): Promise<string> }>
   close(): Promise<void>
   disconnect(): Promise<void>
@@ -570,12 +600,103 @@ describe("reviewed source turn diagnostics", () => {
 })
 
 describe("Stage8 terminal diagnostics", () => {
+  it("preserves only known post-Stop checkpoints", () => {
+    expect(reviewedFillDiagnosticValue("submission_uncertain", REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS)).toBe("submission_uncertain")
+    expect(reviewedFillDiagnosticValue("user_takeover", REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS)).toBe("user_takeover")
+    expect(reviewedFillDiagnosticValue("PRIVATE_CHECKPOINT", REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS)).toBe("other")
+  })
+
+  it("keeps marker-transaction diagnostics closed and bounded", () => {
+    const traceLines: string[] = []
+    const trace = createStage8MarkerFenceTrace({ sessionId: "private-session", fillTurnId: "private-turn",
+      applicationTaskId: "private-task", userId: "private-user", jobId: "private-job", approvalId: "private-approval",
+      constraintHash: "private-hash", workerTaskId: "private-worker" }, line => traceLines.push(line))
+    trace.observe("BEGIN", [], { rows: [] })
+    trace.observe(`WITH started AS (UPDATE application_tasks SET "checkpoint" = 'submission_request_started', "updatedAt" = NOW()
+      WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4 AND "fillTurnId" = $5
+        AND "status" = 'filling' AND "checkpoint" = 'browser_active' RETURNING "id")
+      INSERT INTO application_task_events ("id", "taskId", type, actor, body, data, "createdAt")
+      SELECT 'evt_' || $6, started."id", 'submission_execution_started', 'worker', 'Submit execution started', '{}'::jsonb, NOW() FROM started RETURNING "id"`,
+    [], { rowCount: 1, rows: [{ id: "private-event-id" }] })
+    trace.observe("ROLLBACK", [], { rows: [] })
+    expect(traceLines).toHaveLength(1)
+    const observed = JSON.parse(traceLines[0]!.slice("STAGE8_MARKER_TRANSACTION ".length)) as Record<string, string>
+    expect(observed).toMatchObject({ transaction: "rolled_back", lastPhase: "mark_started", markStarted: "started" })
+    expect(traceLines[0]).not.toMatch(/private-session|private-task|private-user|private-job|private-approval|private-hash|private-worker|private-event-id/)
+    const commitLines: string[] = []
+    const failedCommit = createStage8MarkerFenceTrace({}, line => commitLines.push(line))
+    failedCommit.observe("BEGIN", [], { rows: [] })
+    failedCommit.observeError("COMMIT", [])
+    expect(commitLines).toHaveLength(0)
+    failedCommit.observe("ROLLBACK", [], { rows: [] })
+    const failedCommitSnapshot = JSON.parse(commitLines[0]!.slice("STAGE8_MARKER_TRANSACTION ".length)) as Record<string, string>
+    expect(failedCommitSnapshot).toMatchObject({ transaction: "rolled_back", queryErrorPhase: "commit", lastPhase: "not_seen" })
+
+    const snapshot = sanitizeStage8MarkerFenceTrace({
+      transaction: "committed", lastPhase: "mark_started", queryErrorPhase: "PRIVATE_SQL", sourceReads: "multiple",
+      sessionLockRows: "one", turnLockRows: "one", fillerRows: "one", taskLock: "match", jobLockRows: "one",
+      taskRows: "one", taskStatus: "filling", taskCheckpoint: "browser_active", taskWorkerMatch: "match",
+      attemptRows: "one", attemptState: "reserved", attemptMatch: "match", approvalRows: "one",
+      approvalStatus: "consumed", approvalMatch: "match", priorStartRows: "zero", sessionStatus: "running",
+      turnStatus: "completed", lease: "lease_free", interruption: "clear", markStarted: "started", stopStage: "recorded",
+      sessionId: "PRIVATE_SESSION", workerTaskId: "PRIVATE_WORKER", constraintHash: "PRIVATE_HASH",
+    })
+    expect(snapshot).toMatchObject({ transaction: "committed", lastPhase: "mark_started", queryErrorPhase: "other",
+      taskCheckpoint: "browser_active", taskWorkerMatch: "match", attemptState: "reserved", approvalStatus: "consumed",
+      priorStartRows: "zero", sessionStatus: "running", turnStatus: "completed", lease: "lease_free",
+      markStarted: "started", stopStage: "recorded" })
+    const summary = stage8MarkerFenceSummary([
+      `STAGE8_MARKER_TRANSACTION ${JSON.stringify({ ...snapshot, sessionId: "PRIVATE_SESSION", hash: "PRIVATE_HASH" })}`,
+      "STAGE8_MARKER_TRANSACTION {invalid-json",
+    ])
+    expect(summary).toMatchObject({ transactionCount: 2, unclassifiedCount: 1, snapshot })
+    expect(JSON.stringify(summary)).not.toMatch(/PRIVATE|SESSION|WORKER|HASH|SQL/)
+  })
+
+  it("summarizes only bounded first Stop-poll events and fixed error labels", () => {
+    const known = classifyStage8StopPollError(new Error("Application submission request phase is unavailable."))
+    const database = classifyStage8StopPollError(Object.assign(new Error("PRIVATE_DATABASE_DETAIL"), { code: "40P01" }))
+    const unknown = classifyStage8StopPollError(new Error("PRIVATE_EXCEPTION_TEXT"))
+    expect([known, database, unknown]).toEqual(["request_phase_unavailable", "database", "other"])
+    const summary = stage8StopPollSummary([
+      "STAGE8_STOP_POLL_ENTERED", "STAGE8_STOP_POLL_RETURN_CONTINUE",
+      "STAGE8_STOP_POLL_CAUGHT request_phase_unavailable", "STAGE8_STOP_POLL_CAUGHT PRIVATE_EXCEPTION_TEXT",
+      "STAGE8_STOP_POLL_RETURN_STOPPED private-session-id",
+    ])
+    expect(summary).toEqual({
+      eventCounts: { entered: 1, returnedContinue: 1, returnedStopped: 0, caught: 1 },
+      caughtCodeCounts: { turn_binding_unavailable: 0, task_binding_unavailable: 0, request_phase_unavailable: 1,
+        turn_state_unavailable: 0, stop_state_unavailable: 0, scope_changed: 0, poll_commit_failed: 0, database: 0, other: 0 },
+      unclassifiedCount: 2,
+    })
+    expect(JSON.stringify(summary)).not.toMatch(/PRIVATE|private|DATABASE_DETAIL|EXCEPTION_TEXT|session-id/)
+    const requestSummary = stage8RequestFenceSummary([
+      ...Array.from({ length: 80 }, () => "unrelated fixture output"),
+      "STAGE8_EXACT_SUBMISSION_ROUTE_MATCHED", "STAGE8_START_FENCE_ENTERED", "STAGE8_START_FENCE_RESULT ready",
+      "STAGE8_STOP_POLL_ENTERED",
+    ])
+    expect(requestSummary).toEqual({
+      exactRouteMatched: true, exactFenceEntered: true,
+      resultCounts: { ready: 1, stopped: 0, inactive: 0, uncertain: 0, threw: 0 }, unclassifiedCount: 0,
+      stopPoll: { eventCounts: { entered: 1, returnedContinue: 0, returnedStopped: 0, caught: 0 },
+        caughtCodeCounts: { turn_binding_unavailable: 0, task_binding_unavailable: 0, request_phase_unavailable: 0,
+          turn_state_unavailable: 0, stop_state_unavailable: 0, scope_changed: 0, poll_commit_failed: 0, database: 0, other: 0 },
+        unclassifiedCount: 0 },
+      markerFence: { transactionCount: 0, snapshot: null, unclassifiedCount: 0 },
+    })
+  })
+
   it("reports approval resume evidence without exposing IDs, receipt contents, or tool inputs", () => {
     const summary = stage8FailureSummary({
       expectedApprovalId: "private-approval-id",
+      expectedSessionId: "private-session-id",
+      expectedTurnId: "private-turn-id",
+      expectedWorkerTaskId: "private-worker-task-id",
+      session: { status: "waiting_for_user" },
       turn: { status: "failed", error: "persistence_conflict", rootTaskId: "private-root-id" },
       root: { status: "failed", failureReason: "lease_lost" },
-      applicationTask: { status: "waiting_for_authorization", checkpoint: "form_filled" },
+      applicationTask: { status: "failed", checkpoint: "execution_failed", workerTaskId: "private-worker-task-id",
+        error: "approval_scope_mismatch" },
       approval: { status: "approved", toolCallId: "private-tool-call-id" },
       wait: { status: "completed", content: {
         waitKind: "approval", approvalId: "private-approval-id", toolCallId: "private-tool-call-id",
@@ -586,11 +707,16 @@ describe("Stage8 terminal diagnostics", () => {
         toolName: "application.submit", errorCode: "policy_requires_approval", arguments: { secret: "private-input" },
       } }],
       events: [{ type: "approval.resolved" }, { type: "turn.resumed" }, { type: "turn.failed" }],
+      deadLetters: [],
+      workerFailureLines: [],
     })
+    expect(REVIEWED_FILL_DIAGNOSTIC_STATUSES.has("waiting_for_user")).toBe(true)
     expect(summary).toMatchObject({
+      session: { present: true, status: "waiting_for_user" },
       turn: { present: true, status: "failed", errorCode: "persistence_conflict" },
       root: { present: true, status: "failed", failureCode: "lease_lost" },
-      applicationTask: { status: "waiting_for_authorization", checkpoint: "form_filled" },
+      applicationTask: { status: "failed", checkpoint: "execution_failed", failureCode: "approval_scope_mismatch",
+        workerTaskMatches: true },
       approval: { present: true, status: "approved" },
       wait: { present: true, status: "completed", kindMatches: true, approvalMatches: true,
         toolCallMatches: true, decision: "approved", responseAvailable: true },
@@ -599,6 +725,103 @@ describe("Stage8 terminal diagnostics", () => {
       events: { approval_resolved: true, turn_resumed: true, turn_failed: true },
     })
     expect(JSON.stringify(summary)).not.toMatch(/private|nonce|secret|input/)
+  })
+
+  it("keeps unknown Stage 8 task errors closed", () => {
+    expect(stage8SubmissionFailureCode(null)).toBeNull()
+    expect(stage8SubmissionFailureCode("approval_scope_mismatch")).toBe("approval_scope_mismatch")
+    expect(stage8SubmissionFailureCode("PRIVATE_DATABASE_DETAIL")).toBe("other")
+    expect(JSON.stringify(stage8SubmissionFailureCode("PRIVATE_DATABASE_DETAIL"))).not.toContain("PRIVATE")
+  })
+
+  it("keeps only exact owned Turn DLQ facts and exact-turn Worker failure codes", () => {
+    const turnId = "private-fill-turn"
+    const sessionId = "private-session"
+    const owned = { turnId, sessionId, ownerId: "private-worker-owner", attemptsMade: 2,
+      reason_code: "execution_failed", error_code: "turn_execution_error" }
+    const summary = stage8FailureSummary({
+      expectedApprovalId: "private-approval",
+      expectedSessionId: sessionId,
+      expectedTurnId: turnId,
+      expectedWorkerTaskId: null,
+      session: null,
+      turn: { status: "failed", error: null, rootTaskId: "private-root" },
+      root: null, applicationTask: null, approval: null, wait: null, steps: [], tools: [], events: [],
+      deadLetters: [
+        { payload: owned },
+        { payload: { ...owned, sessionId: "foreign-session" } },
+        { payload: { ...owned, turnId: "foreign-turn" } },
+        { payload: { ...owned, error_code: "SECRET_EXCEPTION_TEXT" } },
+        { payload: { ...owned, unexpected: "PRIVATE_PAYLOAD" } },
+      ],
+      workerFailureLines: [
+        `TURN_JOB_FAILED job-1 turnId=${turnId} turn_not_owned`,
+        `TURN_JOB_FAILED job-2 turnId=${turnId} PRIVATE_EXCEPTION_TEXT`,
+        "TURN_JOB_FAILED foreign-job turnId=foreign-turn PRIVATE_FOREIGN_ERROR",
+        `TURN_JOB_FAILED job-3 turnId=${turnId}-suffix PRIVATE_NEAR_MATCH`,
+        `TURN_JOB_FAILED job-4 turnId=${turnId} SECRET_ERROR ${sessionId}`,
+        `prefix TURN_JOB_FAILED job-5 turnId=${turnId} PRIVATE_MALFORMED`,
+      ],
+    })
+
+    expect(summary.queueFailure).toMatchObject({
+      deadLetters: { matchingCount: 3, unclassifiedCount: 2,
+        records: [{ reasonCode: "execution_failed", errorCode: "turn_execution_error", attemptsMade: 2 }] },
+      worker: { matchingLineCount: 3, errorCounts: {
+        cognitive_agenda_resume_fence_invalid: 0, turn_not_owned: 1, archived_wait_accounting_invalid: 0,
+        child_wait_claim_recovery_owner_mismatch: 0, child_resume_wait_tool_call_conflict: 0,
+      }, unknownErrorCount: 2 },
+    })
+    expect(JSON.stringify(summary)).not.toMatch(/private|PRIVATE|SECRET|foreign|ownerId|turnId|sessionId/)
+  })
+
+  it("classifies only fixed execution labels and hides raw errors and source frames", () => {
+    const known = Object.assign(new Error("cognitive_agenda_resume_fence_invalid"), {
+      stack: "Error: PRIVATE_MESSAGE\n    at run (C:\\private\\apps\\worker\\src\\runtime\\canonical-turn-runtime.ts:10:2)",
+    })
+    const database = Object.assign(new TypeError("PRIVATE_DATABASE_DETAIL"), {
+      code: "40P01", stack: "TypeError: PRIVATE_DATABASE_DETAIL\n    at claim (C:\\private\\apps\\worker\\src\\runtime\\turns\\durable-wait-control.ts:5:1)",
+    })
+    const unknown = Object.assign(new Error("PRIVATE_EXCEPTION_TEXT"), {
+      code: "SECRET_CODE", stack: "Error: PRIVATE_EXCEPTION_TEXT\n    at private (C:\\private\\repo\\private-module.ts:1:1)",
+    })
+    expect(classifyStage8ExecutionFailure(known)).toEqual({ errorKind: "known_code",
+      machineCode: "cognitive_agenda_resume_fence_invalid", repoStage: "canonical_turn_runtime", sqlState: "none" })
+    expect(classifyStage8ExecutionFailure(database)).toEqual({ errorKind: "postgres", machineCode: "other",
+      repoStage: "durable_wait", sqlState: "40P01" })
+    expect(classifyStage8ExecutionFailure(unknown)).toEqual({ errorKind: "error", machineCode: "other",
+      repoStage: "other", sqlState: "other" })
+
+    const summary = stage8WorkerExecutionSummary([
+      `STAGE8_TURN_EXECUTION_FAILURE ${JSON.stringify(classifyStage8ExecutionFailure(known))}`,
+      `STAGE8_TURN_EXECUTION_FAILURE ${JSON.stringify(classifyStage8ExecutionFailure(database))}`,
+      `STAGE8_TURN_EXECUTION_FAILURE ${JSON.stringify(classifyStage8ExecutionFailure(unknown))}`,
+      'STAGE8_TURN_EXECUTION_FAILURE {"errorKind":"PRIVATE_RAW_FAILURE"}',
+      "TURN_JOB_FAILED PRIVATE_RAW_FAILURE",
+    ])
+    expect(summary).toMatchObject({ matchingLineCount: 4, unclassifiedCount: 1,
+      errorKindCounts: { known_code: 1, postgres: 1, error: 1 },
+      repoStageCounts: { canonical_turn_runtime: 1, durable_wait: 1, other: 1 },
+      machineCodeCounts: { cognitive_agenda_resume_fence_invalid: 1, other: 2 },
+      sqlStateCounts: { "40P01": 1, other: 1, none: 1 } })
+    expect(JSON.stringify(summary)).not.toMatch(/PRIVATE|SECRET|private|C:\\\\|module\.ts|PRIVATE_RAW_FAILURE/)
+  })
+
+  it("matches the canonical Session/Turn queue payload without userId and rejects foreign scope", () => {
+    const input = new PassThrough()
+    const lines: string[] = []
+    const diagnostics = createStage8ExecutionFailureDiagnostics(line => lines.push(line), input)
+    input.write("stage8-failure-target private-session private-fill-turn\n")
+    expect(diagnostics.record({ data: { turnId: "private-fill-turn", sessionId: "other-session", ownerId: "agent-run:private-fill-turn" } }, new Error("PRIVATE_ERROR"))).toBe(false)
+    expect(diagnostics.record({ data: { turnId: "other-turn", sessionId: "private-session", ownerId: "agent-run:other-turn" } }, new Error("PRIVATE_ERROR"))).toBe(false)
+    expect(diagnostics.record({ data: { turnId: "private-fill-turn", sessionId: "private-session", ownerId: "agent-run:private-fill-turn" } }, new Error("PRIVATE_ERROR"))).toBe(true)
+
+    expect(lines).toEqual([
+      "STAGE8_FAILURE_TARGET_ARMED",
+      'STAGE8_TURN_EXECUTION_FAILURE {"errorKind":"error","machineCode":"other","repoStage":"other","sqlState":"none"}',
+    ])
+    expect(JSON.stringify(lines)).not.toMatch(/private-session|private-fill-turn|PRIVATE_ERROR/)
+    input.destroy()
   })
 })
 
@@ -633,6 +856,62 @@ describe("ApplicationTask submission attempt diagnostic classifier", () => {
   })
 })
 
+type LegacyAckFakeJob = {
+  id: string
+  attemptsStarted: number
+  data: { operation: string; sessionId: string; fillTurnId: string }
+}
+type LegacyAckFakeWorker = { processFn: (job: LegacyAckFakeJob, ...args: unknown[]) => Promise<string> }
+type LegacyAckWitness = {
+  arm(value: unknown): boolean
+  proves(value: unknown): boolean
+  wrap(worker: LegacyAckFakeWorker): void
+  releaseForShutdown(): void
+}
+
+async function createLegacyAckWitnessForTest(writeLine: (line: string) => void): Promise<LegacyAckWitness> {
+  const supportUrl = new URL("../../../../../../worker/src/queue/application-task-full-loop.legacy-ack.fixture-support.mjs", import.meta.url)
+  const supportModule = await import(supportUrl.href) as { createLegacyQueueAckWitness: (write: (line: string) => void) => LegacyAckWitness }
+  return supportModule.createLegacyQueueAckWitness(writeLine)
+}
+
+describe("legacy queue acknowledgement fixture witness", () => {
+  it("holds only the exact returned submit attempt until bounded teardown", async () => {
+    const markers: string[] = []
+    const witness = await createLegacyAckWitnessForTest(line => markers.push(line))
+    const worker: LegacyAckFakeWorker = { processFn: async () => "processed" }
+    witness.wrap(worker)
+    const scope = { sessionId: `full-loop-session-${"a".repeat(32)}`, fillTurnId: "turn_witness", expectedAttempt: 1 }
+    expect(witness.arm({ ...scope, extraAuthority: true })).toBe(false)
+    expect(witness.arm(scope)).toBe(true)
+    expect(witness.arm(scope)).toBe(false)
+
+    const unrelated: LegacyAckFakeJob = { id: "job_other", attemptsStarted: 1,
+      data: { operation: "submit", sessionId: scope.sessionId, fillTurnId: "turn_other" } }
+    await expect(worker.processFn(unrelated)).resolves.toBe("processed")
+    const retryAttempt: LegacyAckFakeJob = { id: "job_retry", attemptsStarted: 2,
+      data: { operation: "submit", sessionId: scope.sessionId, fillTurnId: scope.fillTurnId } }
+    await expect(worker.processFn(retryAttempt)).resolves.toBe("processed")
+    const fillJob: LegacyAckFakeJob = { id: "job_fill", attemptsStarted: 1,
+      data: { operation: "fill", sessionId: scope.sessionId, fillTurnId: scope.fillTurnId } }
+    await expect(worker.processFn(fillJob)).resolves.toBe("processed")
+    expect(markers).toEqual([])
+
+    const submitJob: LegacyAckFakeJob = { id: "job_submit", attemptsStarted: 1,
+      data: { operation: "submit", sessionId: scope.sessionId, fillTurnId: scope.fillTurnId } }
+    let processorSettled = false
+    const pending = worker.processFn(submitJob).then(result => { processorSettled = true; return result })
+    await vi.waitFor(() => expect(markers).toContain("LEGACY_ACK_BARRIER_REACHED attempt=1"))
+    expect(processorSettled).toBe(false)
+    const proof = { sessionId: scope.sessionId, fillTurnId: scope.fillTurnId, jobId: submitJob.id, attemptsStarted: 1 }
+    expect(witness.proves({ ...proof, jobId: "job_other" })).toBe(false)
+    expect(witness.proves(proof)).toBe(true)
+    witness.releaseForShutdown()
+    await expect(pending).resolves.toBe("processed")
+    expect(processorSettled).toBe(true)
+  })
+})
+
 async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Promise<string> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
@@ -642,6 +921,31 @@ async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Pro
     await delay(25)
   }
   throw new Error(`Fixture line ${expected} missing; child=${JSON.stringify(childSummary(child))}`)
+}
+
+async function waitForLegacyAckMarker(child: Child, expected: string, rejected?: string, timeoutMs = 10_000): Promise<void> {
+  const until = Date.now() + timeoutMs
+  while (Date.now() < until) {
+    if (child.lines.includes(expected)) return
+    if (rejected && child.lines.includes(rejected)) throw new Error("legacy_ack_barrier_control_rejected")
+    if (exited(child)) throw new Error("legacy_ack_barrier_worker_exited")
+    await delay(25)
+  }
+  throw new Error("legacy_ack_barrier_marker_timeout")
+}
+
+async function armLegacyQueueAckBarrier(sessionId: string, fillTurnId: string): Promise<void> {
+  if (!worker?.stdin) throw new Error("legacy_ack_barrier_worker_stdin_unavailable")
+  worker.stdin.write(`arm-legacy-ack-barrier ${JSON.stringify({ sessionId, fillTurnId, expectedAttempt: 1 })}\n`)
+  await waitForLegacyAckMarker(worker, "LEGACY_ACK_BARRIER_ARMED", "LEGACY_ACK_BARRIER_ARM_FAILED")
+}
+
+async function proveLegacyQueueAckBarrier(proof: {
+  sessionId: string; fillTurnId: string; jobId: string; attemptsStarted: number
+}): Promise<void> {
+  if (!worker?.stdin) throw new Error("legacy_ack_barrier_worker_stdin_unavailable")
+  worker.stdin.write(`prove-legacy-ack-barrier ${JSON.stringify(proof)}\n`)
+  await waitForLegacyAckMarker(worker, "LEGACY_ACK_BARRIER_PROVED", "LEGACY_ACK_BARRIER_PROOF_REJECTED")
 }
 
 async function armLegacyFinalResponseGate(turnId: string): Promise<void> {
@@ -953,13 +1257,13 @@ async function waitForWorkerRedelivery(child: Child, jobId: string, timeoutMs = 
     const redelivery = child.lines.map(parseApplyJobActiveEvent).find(event => event !== null && event.jobId === jobId
       && event.attemptsStarted >= 2 && event.stalledCounter >= 1)
     if (redelivery) return redelivery
-    if (exited(child)) throw new Error(`Worker exited before BullMQ redelivered ${jobId}; child=${JSON.stringify(childSummary(child))}`)
+    if (exited(child)) throw new Error(`BullMQ redelivery worker exited; workerLineCount=${child.lines.length}; workerErrorCount=${child.errors.length}`)
     await delay(50)
   }
   const matchingEvents = child.lines.map(parseApplyJobActiveEvent).filter((event): event is ApplyJobActiveEvent => event?.jobId === jobId)
   const maxAttemptsStarted = matchingEvents.length ? Math.max(...matchingEvents.map(event => event.attemptsStarted)) : null
   const maxStalledCounter = matchingEvents.length ? Math.max(...matchingEvents.map(event => event.stalledCounter)) : null
-  throw new Error(`BullMQ did not redeliver ${jobId}; matchingEventCount=${matchingEvents.length}; maxAttemptsStarted=${maxAttemptsStarted}; maxStalledCounter=${maxStalledCounter}`)
+  throw new Error(`BullMQ did not redeliver; matchingEventCount=${matchingEvents.length}; maxAttemptsStarted=${maxAttemptsStarted}; maxStalledCounter=${maxStalledCounter}`)
 }
 
 function jsonString(value: unknown, key: string): string | undefined {
@@ -1299,16 +1603,49 @@ async function waitForReviewedApproval(approvalId: string, timeoutMs = 90_000) {
   throw new Error("Worker did not issue the reviewed-application approval")
 }
 
-async function waitForReviewedApplicationTask(jobId: string, predicate: (task: ApplicationTaskRow) => boolean, timeoutMs = 120_000): Promise<ApplicationTaskRow> {
+async function waitForReviewedApplicationTask(jobId: string, predicate: (task: ApplicationTaskRow) => boolean, timeoutMs = 120_000, diagnoseStage8Prestart = false): Promise<ApplicationTaskRow> {
   const until = Date.now() + timeoutMs
   let latest: ApplicationTaskRow | null = null
   while (Date.now() < until) {
     latest = await testDb.applicationTask.findUnique({ where: { userId_jobId: { userId: ids.user, jobId } } }) as ApplicationTaskRow | null
     if (latest && predicate(latest)) return latest
+    if (diagnoseStage8Prestart && latest?.status === "failed" && latest.checkpoint === "fill_prestart_failed") {
+      const code = await stage8PrestartFailureCode(latest)
+      throw new Error(`Reviewed ApplicationTask failed before submit approval; prestartFailureCode=${code}`)
+    }
     if (worker && exited(worker)) throw new Error("Worker exited while waiting for reviewed ApplicationTask")
     await delay(100)
   }
   throw new Error(`Reviewed ApplicationTask did not reach the expected state; status=${latest?.status ?? "missing"}; checkpoint=${latest?.checkpoint ?? "missing"}`)
+}
+
+const STAGE8_PRESTART_FAILURE_CODES = new Set([
+  "fill_context_unavailable", "fill_material_unavailable", "fill_rate_limited", "fill_preflight_unavailable",
+])
+
+async function stage8PrestartFailureCode(task: ApplicationTaskRow): Promise<string> {
+  if (!task.sessionId || !task.fillTurnId) return "unavailable"
+  try {
+    const turn = await testDb.agentTurn.findFirst({ where: {
+      id: task.fillTurnId, userId: ids.user, sessionId: task.sessionId, session: { userId: ids.user },
+    }, select: { rootTaskId: true } })
+    if (!turn?.rootTaskId) return "unavailable"
+    const until = Date.now() + 3_000
+    while (true) {
+      const rows = await testDb.subAgentTask.findMany({ where: {
+        rootTaskId: turn.rootTaskId, sessionId: task.sessionId, turnId: task.fillTurnId,
+        parentTaskId: turn.rootTaskId, role: "application_filler", taskType: "application_fill_for_review",
+        status: "failed", session: { userId: ids.user },
+      }, take: 3, select: { failureReason: true } })
+      if (rows.length > 1) return "multiple"
+      if (rows.length === 1) {
+        const reason = rows[0]?.failureReason
+        return typeof reason === "string" && STAGE8_PRESTART_FAILURE_CODES.has(reason) ? reason : "other"
+      }
+      if (Date.now() >= until) return "none"
+      await delay(50)
+    }
+  } catch { return "unavailable" }
 }
 
 const REVIEWED_FILL_DIAGNOSTIC_STATUSES = new Set([
@@ -1317,8 +1654,23 @@ const REVIEWED_FILL_DIAGNOSTIC_STATUSES = new Set([
 ])
 const REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS = new Set([
   "materials_ready", "taskgraph_fill_queued", "browser_active", "form_answer_required", "fill_outcome_uncertain",
-  "form_filled", "submission_authorized", "queue_retry", "turn_stopped_before_submit", "fill_prestart_failed",
+  "form_filled", "submission_authorized", "submission_uncertain", "user_takeover", "queue_retry",
+  "turn_stopped_before_submit", "fill_prestart_failed", "execution_failed",
 ])
+
+const STAGE8_SUBMISSION_FAILURE_CODES = new Set([
+  "approval_not_found", "approval_scope_mismatch", "approval_integrity_error", "approval_expired",
+  "approval_not_approved", "approval_already_consumed", "approval_nonce_mismatch", "approval_revision_mismatch",
+  "approval_reservation_conflict", "invalid_input", "target_not_found", "submission_attempt_fenced",
+  "submission_scope_mismatch", "idempotency_conflict", "idempotency_replay", "submission_in_flight",
+  "stale_artifact", "submission_guard_denied", "provider_invalid_response", "provider_error", "invalid_state",
+  "not_found", "browser_412", "browser_manual", "browser_failed", "submission_failed",
+])
+
+function stage8SubmissionFailureCode(value: unknown): string | null {
+  if (value === null || value === undefined) return null
+  return typeof value === "string" && STAGE8_SUBMISSION_FAILURE_CODES.has(value) ? value : "other"
+}
 
 function reviewedFillDiagnosticValue(value: unknown, allowed: ReadonlySet<string>): string {
   return value === null || value === undefined ? "none" : typeof value === "string" && allowed.has(value) ? value : "other"
@@ -1434,6 +1786,16 @@ type Stage8PreparedScenario = {
   applicationTaskId: string
   submitApprovalId: string
 }
+type Stage8FailureSnapshotScope = Pick<Stage8PreparedScenario,
+  "jobId" | "sessionId" | "fillTurnId" | "applicationTaskId" | "submitApprovalId">
+
+const STAGE8_RATE_LIMIT_DOMAIN = "boards.greenhouse.io"
+
+async function resetStage8DomainRateLimit(): Promise<void> {
+  if (!enabled || !applyQueue) throw new Error("stage8_rate_limit_isolation_unavailable")
+  const redis = await applyQueue.client
+  await redis.del(`ratelimit:domain:${ids.user}:${STAGE8_RATE_LIMIT_DOMAIN}`)
+}
 
 type Stage8SubmitIntent = {
   applicationTaskId: string
@@ -1456,17 +1818,114 @@ const STAGE8_EVENT_TYPES = [
   "approval.resolved", "turn.resumed", "turn.failed", "turn.completed", "step.completed",
   "tool_call.failed", "tool_call.completed",
 ] as const
+const STAGE8_DLQ_REASONS = new Set([
+  "schema_invalid_payload", "max_retries_exhausted", "execution_failed", "lease_lost",
+  "cognitive_agenda_resume_fence_invalid",
+])
+const STAGE8_DLQ_ERRORS = new Set([
+  "invalid_payload", "lease_not_available", "lease_lost", "cognitive_agenda_resume_fence_invalid", "turn_execution_error",
+])
+const STAGE8_WORKER_FAILURE_CODES = [
+  "cognitive_agenda_resume_fence_invalid", "turn_not_owned", "archived_wait_accounting_invalid",
+  "child_wait_claim_recovery_owner_mismatch", "child_resume_wait_tool_call_conflict",
+] as const
+const STAGE8_WORKER_FAILURE_CODE_SET: ReadonlySet<string> = new Set(STAGE8_WORKER_FAILURE_CODES)
+const STAGE8_EXECUTION_ERROR_KINDS = ["known_code", "postgres", "error", "type_error", "range_error", "syntax_error", "reference_error", "aggregate_error", "other", "non_error"] as const
+const STAGE8_EXECUTION_REPO_STAGES = ["canonical_turn_runtime", "canonical_turn_model", "canonical_turn_setup", "durable_wait", "turn_queue", "worker_runtime", "other"] as const
+const STAGE8_EXECUTION_MACHINE_CODES = [
+  "cognitive_agenda_resume_fence_invalid", "turn_not_owned", "archived_wait_accounting_invalid",
+  "child_wait_claim_recovery_owner_mismatch", "child_resume_wait_tool_call_conflict", "persistence_conflict",
+  "turn_execution_error", "application_fill_material_unavailable", "application_fill_state_invalid",
+  "application_fill_binding_invalid", "lease_lost", "none", "other",
+] as const
+const STAGE8_EXECUTION_SQL_STATES = ["08000", "08001", "08003", "08006", "23502", "23503", "23505", "23514",
+  "40001", "40P01", "55P03", "57P01", "57P03", "none", "other"] as const
+
+function stage8DeadLetterSummary(rows: readonly unknown[], sessionId: string, turnId: string) {
+  const records: Array<{ reasonCode: string; errorCode: string; attemptsMade: number }> = []
+  let unclassifiedCount = 0
+  for (const row of rows.slice(0, 8)) {
+    const payload = jsonRecord(jsonRecord(row)?.payload)
+    if (payload?.turnId !== turnId || payload.sessionId !== sessionId) continue
+    const keys = Object.keys(payload).sort()
+    if (JSON.stringify(keys) !== JSON.stringify(["attemptsMade", "error_code", "ownerId", "reason_code", "sessionId", "turnId"].sort())
+      || typeof payload.ownerId !== "string" || !payload.ownerId
+      || !Number.isSafeInteger(payload.attemptsMade) || Number(payload.attemptsMade) < 1 || Number(payload.attemptsMade) > 5) {
+      unclassifiedCount += 1
+      continue
+    }
+    if (typeof payload.reason_code !== "string" || !STAGE8_DLQ_REASONS.has(payload.reason_code)
+      || typeof payload.error_code !== "string" || !STAGE8_DLQ_ERRORS.has(payload.error_code)) {
+      unclassifiedCount += 1
+      continue
+    }
+    records.push({ reasonCode: payload.reason_code, errorCode: payload.error_code, attemptsMade: Number(payload.attemptsMade) })
+  }
+  return { matchingCount: records.length + unclassifiedCount, unclassifiedCount, records }
+}
+
+function stage8WorkerFailureSummary(lines: readonly string[], turnId: string) {
+  const errorCounts = Object.fromEntries(STAGE8_WORKER_FAILURE_CODES.map(code => [code, 0])) as Record<typeof STAGE8_WORKER_FAILURE_CODES[number], number>
+  let matchingLineCount = 0
+  let unknownErrorCount = 0
+  for (const line of lines.slice(-64)) {
+    if (typeof line !== "string" || line.length > 2_048 || /[\r\n]/.test(line)) continue
+    const match = /^TURN_JOB_FAILED \S+ turnId=(\S+) (.*)$/.exec(line)
+    if (!match || match[1] !== turnId) continue
+    matchingLineCount += 1
+    const error = match[2]!
+    if (STAGE8_WORKER_FAILURE_CODE_SET.has(error)) errorCounts[error as typeof STAGE8_WORKER_FAILURE_CODES[number]] += 1
+    else unknownErrorCount += 1
+  }
+  return { matchingLineCount, errorCounts, unknownErrorCount }
+}
+
+function stage8WorkerExecutionSummary(lines: readonly string[]) {
+  const errorKindCounts = Object.fromEntries(STAGE8_EXECUTION_ERROR_KINDS.map(value => [value, 0])) as Record<typeof STAGE8_EXECUTION_ERROR_KINDS[number], number>
+  const repoStageCounts = Object.fromEntries(STAGE8_EXECUTION_REPO_STAGES.map(value => [value, 0])) as Record<typeof STAGE8_EXECUTION_REPO_STAGES[number], number>
+  const machineCodeCounts = Object.fromEntries(STAGE8_EXECUTION_MACHINE_CODES.map(value => [value, 0])) as Record<typeof STAGE8_EXECUTION_MACHINE_CODES[number], number>
+  const sqlStateCounts = Object.fromEntries(STAGE8_EXECUTION_SQL_STATES.map(value => [value, 0])) as Record<typeof STAGE8_EXECUTION_SQL_STATES[number], number>
+  let matchingLineCount = 0
+  let unclassifiedCount = 0
+  for (const line of lines.slice(-64)) {
+    if (typeof line !== "string" || !line.startsWith("STAGE8_TURN_EXECUTION_FAILURE ")) continue
+    matchingLineCount += 1
+    if (line.length > 1_024 || /[\r\n]/.test(line)) { unclassifiedCount += 1; continue }
+    let value: unknown
+    try { value = JSON.parse(line.slice("STAGE8_TURN_EXECUTION_FAILURE ".length)) } catch { unclassifiedCount += 1; continue }
+    const record = jsonRecord(value)
+    if (!record || JSON.stringify(Object.keys(record).sort()) !== JSON.stringify(["errorKind", "machineCode", "repoStage", "sqlState"])
+      || !STAGE8_EXECUTION_ERROR_KINDS.includes(record.errorKind as typeof STAGE8_EXECUTION_ERROR_KINDS[number])
+      || !STAGE8_EXECUTION_MACHINE_CODES.includes(record.machineCode as typeof STAGE8_EXECUTION_MACHINE_CODES[number])
+      || !STAGE8_EXECUTION_REPO_STAGES.includes(record.repoStage as typeof STAGE8_EXECUTION_REPO_STAGES[number])
+      || !STAGE8_EXECUTION_SQL_STATES.includes(record.sqlState as typeof STAGE8_EXECUTION_SQL_STATES[number])) {
+      unclassifiedCount += 1
+      continue
+    }
+    errorKindCounts[record.errorKind as typeof STAGE8_EXECUTION_ERROR_KINDS[number]] += 1
+    machineCodeCounts[record.machineCode as typeof STAGE8_EXECUTION_MACHINE_CODES[number]] += 1
+    repoStageCounts[record.repoStage as typeof STAGE8_EXECUTION_REPO_STAGES[number]] += 1
+    sqlStateCounts[record.sqlState as typeof STAGE8_EXECUTION_SQL_STATES[number]] += 1
+  }
+  return { matchingLineCount, unclassifiedCount, errorKindCounts, machineCodeCounts, repoStageCounts, sqlStateCounts }
+}
 
 type Stage8FailureEvidence = Readonly<{
   expectedApprovalId: string
+  expectedSessionId: string
+  expectedTurnId: string
+  expectedWorkerTaskId: string | null
+  session: { status: unknown } | null
   turn: { status: unknown; error: unknown; rootTaskId: unknown } | null
   root: { status: unknown; failureReason: unknown } | null
-  applicationTask: { status: unknown; checkpoint: unknown } | null
+  applicationTask: { status: unknown; checkpoint: unknown; workerTaskId: unknown; error: unknown } | null
   approval: { status: unknown; toolCallId: unknown } | null
   wait: { status: unknown; content: unknown } | null
   steps: readonly { status: unknown; errorCode: unknown }[]
   tools: readonly { type: unknown; status: unknown; content: unknown }[]
   events: readonly { type: unknown }[]
+  deadLetters: readonly unknown[]
+  workerFailureLines: readonly string[]
 }>
 
 function stage8FailureSummary(evidence: Stage8FailureEvidence) {
@@ -1475,13 +1934,18 @@ function stage8FailureSummary(evidence: Stage8FailureEvidence) {
   const approvalToolCallId = evidence.approval?.toolCallId
   const eventTypes = new Set(evidence.events.map(event => event.type))
   return {
+    session: { present: evidence.session !== null,
+      status: reviewedFillDiagnosticValue(evidence.session?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES) },
     turn: { present: evidence.turn !== null, status: reviewedFillDiagnosticValue(evidence.turn?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
       errorCode: diagnosticMachineErrorCode(evidence.turn?.error) },
     root: { present: evidence.root !== null, status: reviewedFillDiagnosticValue(evidence.root?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
       failureCode: diagnosticMachineErrorCode(evidence.root?.failureReason) },
     applicationTask: { present: evidence.applicationTask !== null,
       status: reviewedFillDiagnosticValue(evidence.applicationTask?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
-      checkpoint: reviewedFillDiagnosticValue(evidence.applicationTask?.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS) },
+      checkpoint: reviewedFillDiagnosticValue(evidence.applicationTask?.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS),
+      failureCode: stage8SubmissionFailureCode(evidence.applicationTask?.error),
+      workerTaskMatches: evidence.expectedWorkerTaskId === null ? null
+        : evidence.applicationTask?.workerTaskId === evidence.expectedWorkerTaskId },
     approval: { present: evidence.approval !== null,
       status: reviewedFillDiagnosticValue(evidence.approval?.status, STAGE8_APPROVAL_STATUSES) },
     wait: {
@@ -1508,16 +1972,24 @@ function stage8FailureSummary(evidence: Stage8FailureEvidence) {
       }
     }),
     events: Object.fromEntries(STAGE8_EVENT_TYPES.map(type => [type.replaceAll(".", "_"), eventTypes.has(type)])),
+    queueFailure: {
+      deadLetters: stage8DeadLetterSummary(evidence.deadLetters, evidence.expectedSessionId, evidence.expectedTurnId),
+      worker: { ...stage8WorkerFailureSummary(evidence.workerFailureLines, evidence.expectedTurnId),
+        execution: stage8WorkerExecutionSummary(evidence.workerFailureLines) },
+    },
   }
 }
 
-async function stage8FillFailureSnapshot(prepared: Stage8PreparedScenario): Promise<unknown> {
+async function stage8FillFailureSnapshot(prepared: Stage8FailureSnapshotScope, expectedWorkerTaskId: string | null = null): Promise<unknown> {
   try {
     return await beforeDeadline(async () => {
-      const turn = await testDb.agentTurn.findFirst({ where: {
-        id: prepared.fillTurnId, userId: ids.user, sessionId: prepared.sessionId, session: { userId: ids.user },
-      }, select: { status: true, error: true, rootTaskId: true } })
-      const [root, applicationTask, approval, wait, steps, tools, events] = await Promise.all([
+      const [session, turn] = await Promise.all([
+        testDb.agentSession.findFirst({ where: { id: prepared.sessionId, userId: ids.user }, select: { status: true } }),
+        testDb.agentTurn.findFirst({ where: {
+          id: prepared.fillTurnId, userId: ids.user, sessionId: prepared.sessionId, session: { userId: ids.user },
+        }, select: { status: true, error: true, rootTaskId: true } }),
+      ])
+      const [root, applicationTask, approval, wait, steps, tools, events, deadLetters] = await Promise.all([
         typeof turn?.rootTaskId === "string" ? testDb.subAgentTask.findFirst({ where: {
           id: turn.rootTaskId, rootTaskId: turn.rootTaskId, sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
           parentTaskId: null, role: "orchestrator", taskType: "root", session: { userId: ids.user },
@@ -1525,7 +1997,7 @@ async function stage8FillFailureSnapshot(prepared: Stage8PreparedScenario): Prom
         testDb.applicationTask.findFirst({ where: {
           id: prepared.applicationTaskId, userId: ids.user, sessionId: prepared.sessionId,
           jobId: prepared.jobId, fillTurnId: prepared.fillTurnId,
-        }, select: { status: true, checkpoint: true } }),
+        }, select: { status: true, checkpoint: true, workerTaskId: true, error: true } }),
         testDb.agentApproval.findFirst({ where: {
           id: prepared.submitApprovalId, userId: ids.user, sessionId: prepared.sessionId,
           taskId: prepared.applicationTaskId, turnId: prepared.fillTurnId, jobId: prepared.jobId,
@@ -1543,16 +2015,105 @@ async function stage8FillFailureSnapshot(prepared: Stage8PreparedScenario): Prom
         testDb.agentEvent.findMany({ where: {
           sessionId: prepared.sessionId, turnId: prepared.fillTurnId, type: { in: [...STAGE8_EVENT_TYPES] },
         }, orderBy: { sequence: "desc" }, take: 16, select: { type: true } }),
+        testDb.agentOutbox.findMany({ where: { topic: "agent.turn.dlq", aggregateId: prepared.fillTurnId },
+          orderBy: { createdAt: "desc" }, take: 8, select: { payload: true } }),
       ])
-      return stage8FailureSummary({ expectedApprovalId: prepared.submitApprovalId, turn, root, applicationTask,
-        approval, wait, steps, tools, events })
+      return stage8FailureSummary({ expectedApprovalId: prepared.submitApprovalId, expectedSessionId: prepared.sessionId,
+        expectedTurnId: prepared.fillTurnId, expectedWorkerTaskId, session, turn, root, applicationTask, approval, wait, steps, tools, events,
+        deadLetters: turn ? deadLetters : [], workerFailureLines: turn ? worker?.lines ?? [] : [] })
     }, Date.now() + 1_200)
   } catch {
     return { available: false }
   }
 }
 
+const STAGE8_BULL_STATES = new Set(["active", "completed", "delayed", "failed", "paused", "waiting", "waiting-children"])
+const STAGE8_FENCE_STATES = ["ready", "stopped", "inactive", "uncertain", "threw"] as const
+const STAGE8_STOP_POLL_ERRORS = ["turn_binding_unavailable", "task_binding_unavailable", "request_phase_unavailable",
+  "turn_state_unavailable", "stop_state_unavailable", "scope_changed", "poll_commit_failed", "database", "other"] as const
+const STAGE8_MARKER_TRACE_PREFIX = "STAGE8_MARKER_TRANSACTION "
+
+function stage8StopPollSummary(lines: readonly string[]) {
+  const eventCounts = { entered: 0, returnedContinue: 0, returnedStopped: 0, caught: 0 }
+  const caughtCodeCounts = Object.fromEntries(STAGE8_STOP_POLL_ERRORS.map(code => [code, 0])) as Record<typeof STAGE8_STOP_POLL_ERRORS[number], number>
+  let unclassifiedCount = 0
+  const pollLines = lines.filter(line => typeof line === "string" && line.startsWith("STAGE8_STOP_POLL_")).slice(-64)
+  for (const line of pollLines) {
+    if (line === "STAGE8_STOP_POLL_ENTERED") eventCounts.entered += 1
+    else if (line === "STAGE8_STOP_POLL_RETURN_CONTINUE") eventCounts.returnedContinue += 1
+    else if (line === "STAGE8_STOP_POLL_RETURN_STOPPED") eventCounts.returnedStopped += 1
+    else if (typeof line === "string" && line.startsWith("STAGE8_STOP_POLL_CAUGHT ")) {
+      const match = /^STAGE8_STOP_POLL_CAUGHT ([a-z_]+)$/.exec(line)
+      if (match && STAGE8_STOP_POLL_ERRORS.includes(match[1] as typeof STAGE8_STOP_POLL_ERRORS[number])) {
+        eventCounts.caught += 1
+        caughtCodeCounts[match[1] as typeof STAGE8_STOP_POLL_ERRORS[number]] += 1
+      } else unclassifiedCount += 1
+    } else if (typeof line === "string" && line.startsWith("STAGE8_STOP_POLL_")) unclassifiedCount += 1
+  }
+  return { eventCounts, caughtCodeCounts, unclassifiedCount }
+}
+
+function stage8MarkerFenceSummary(lines: readonly string[]) {
+  const markerLines = lines.filter(line => typeof line === "string" && line.startsWith(STAGE8_MARKER_TRACE_PREFIX)).slice(-64)
+  let snapshot: Readonly<Record<string, string>> | null = null
+  let unclassifiedCount = 0
+  for (const line of markerLines) {
+    try { snapshot = sanitizeStage8MarkerFenceTrace(JSON.parse(line.slice(STAGE8_MARKER_TRACE_PREFIX.length))) }
+    catch { unclassifiedCount += 1 }
+  }
+  return { transactionCount: markerLines.length, snapshot, unclassifiedCount }
+}
+
+function stage8RequestFenceSummary(lines: readonly string[]) {
+  let routeMatched = false
+  let fenceEntered = false
+  let unclassifiedCount = 0
+  const resultCounts = Object.fromEntries(STAGE8_FENCE_STATES.map(state => [state, 0])) as Record<typeof STAGE8_FENCE_STATES[number], number>
+  for (const line of lines.slice(-64)) {
+    if (line === "STAGE8_EXACT_SUBMISSION_ROUTE_MATCHED") { routeMatched = true; continue }
+    if (line === "STAGE8_START_FENCE_ENTERED") { fenceEntered = true; continue }
+    const match = /^STAGE8_START_FENCE_RESULT (ready|stopped|inactive|uncertain|threw)$/.exec(line)
+    if (match) resultCounts[match[1] as typeof STAGE8_FENCE_STATES[number]] += 1
+    else if (typeof line === "string" && line.startsWith("STAGE8_START_FENCE_RESULT ")) unclassifiedCount += 1
+  }
+  return { exactRouteMatched: routeMatched, exactFenceEntered: fenceEntered, resultCounts, unclassifiedCount,
+    stopPoll: stage8StopPollSummary(lines), markerFence: stage8MarkerFenceSummary(lines) }
+}
+
+async function stage8ApplyQueueState(workerTaskId: string) {
+  const queue = applyQueue
+  if (!queue) return { available: false }
+  try {
+    return await beforeDeadline(async () => {
+      const job = await queue.getJob(workerTaskId)
+      if (!job) return { available: true, present: false, state: "missing" }
+      const state = await job.getState()
+      return { available: true, present: true, state: STAGE8_BULL_STATES.has(state) ? state : "other" }
+    }, Date.now() + 1_200)
+  } catch { return { available: false } }
+}
+
+async function throwStage8SettlementTimeout(prepared: Stage8PreparedScenario, workerTaskId: string): Promise<never> {
+  const [database, queue] = await Promise.all([
+    stage8FillFailureSnapshot(prepared, workerTaskId), stage8ApplyQueueState(workerTaskId),
+  ])
+  throw new Error("stage8_submit_worker_did_not_settle:" + JSON.stringify({
+    database, queue, requestFence: stage8RequestFenceSummary(worker?.lines ?? []),
+  }))
+}
+
+async function waitForStage8Arm(prepared: Stage8PreparedScenario, intent: Stage8SubmitIntent): Promise<void> {
+  try { await waitLine(worker!, "STAGE8_ARM_COMMITTED " + intent.workerTaskId, 90_000) }
+  catch {
+    const [database, queue] = await Promise.all([
+      stage8FillFailureSnapshot(prepared, intent.workerTaskId), stage8ApplyQueueState(intent.workerTaskId),
+    ])
+    throw new Error("stage8_arm_commit_missing:" + JSON.stringify({ database, queue, requestFence: stage8RequestFenceSummary(worker?.lines ?? []) }))
+  }
+}
+
 async function prepareStage8Scenario(label: "stop-first" | "grant-first"): Promise<Stage8PreparedScenario> {
+  await resetStage8DomainRateLimit()
   const scenario = await createReviewedSourceScenario(`stage8-${label}`, `Synthetic Stage 8 ${label} source description.`)
   const token = await signedBearer(ids.user)
   const source = await startSelectedJobSource({ ...scenario, token, key: `stage8-source-${label}-${runId}` })
@@ -1619,7 +2180,8 @@ async function prepareStage8Scenario(label: "stop-first" | "grant-first"): Promi
     userId: ids.user, sessionId: scenario.sessionId, jobId: scenario.jobId,
   }, select: { id: true } })
   const fill = await waitForReviewedApplicationTask(scenario.jobId,
-    task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled" && Boolean(task.fillTurnId), 180_000)
+    task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled" && Boolean(task.fillTurnId),
+    180_000, label === "stop-first")
   const fillTurnId = fill.fillTurnId
   if (typeof fillTurnId !== "string" || !fillTurnId.trim() || fill.id !== reviewTask.id) throw new Error("stage8_fill_identity_missing")
   const browserStarted = await testDb.applicationTaskEvent.findMany({ where: {
@@ -1654,6 +2216,12 @@ async function prepareStage8Scenario(label: "stop-first" | "grant-first"): Promi
   expect((await requestFixtureStats()).reviewedSubmitCount).toBe(0)
   return { ...scenario, token, sourceTurnId: source.turnId, reviewTurnId, fillTurnId,
     applicationTaskId: reviewTask.id, submitApprovalId }
+}
+
+async function armStage8ExecutionFailureTarget(prepared: Stage8PreparedScenario) {
+  if (!worker?.stdin) throw new Error("Stage8 Worker is unavailable")
+  worker.stdin.write(`stage8-failure-target ${prepared.sessionId} ${prepared.fillTurnId}\n`)
+  await waitLine(worker, "STAGE8_FAILURE_TARGET_ARMED", 5_000)
 }
 
 async function approveStage8Submit(prepared: Stage8PreparedScenario): Promise<Stage8SubmitIntent> {
@@ -1754,12 +2322,15 @@ async function approveStage8Submit(prepared: Stage8PreparedScenario): Promise<St
   })
   expect(resolvedWait.status).toBe("completed")
   const fillTurn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: prepared.fillTurnId }, select: {
-    id: true, userId: true, sessionId: true, source: true, executionMode: true, status: true,
+    id: true, userId: true, sessionId: true, source: true, executionMode: true, input: true, status: true,
     leaseOwnerId: true, leaseStartedAt: true, leaseExpiresAt: true,
   } })
   expect(fillTurn).toMatchObject({ id: prepared.fillTurnId, userId: ids.user, sessionId: prepared.sessionId,
-    source: "user", executionMode: "canonical_task_graph", status: "completed",
+    source: "user", executionMode: null, status: "completed",
     leaseOwnerId: null, leaseStartedAt: null, leaseExpiresAt: null })
+  expect(jsonRecord(fillTurn.input)?.reviewedApplicationMaterialSource).toEqual({
+    schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: prepared.sourceTurnId,
+  })
   const outboxRows = await testDb.agentOutbox.findMany({ where: {
     aggregateId: prepared.sessionId, topic: "application.submit.dispatch",
   }, select: { payload: true, publishedAt: true } })
@@ -1877,15 +2448,118 @@ async function waitForStage8StopBlockingPid(workerPid: number, timeoutMs = 5_000
   throw new Error("stage8_stop_did_not_wait_on_exact_worker_fence")
 }
 
-async function waitForStage8JobSettled(workerTaskId: string, timeoutMs = 30_000): Promise<string> {
+/** Missing Bull state is accepted only after the exact terminal execution and attempt are durable. */
+async function stage8ExecutionSettled(
+  prepared: Stage8PreparedScenario,
+  intent: Stage8SubmitIntent,
+) {
+  const queue = applyQueue
+  if (!queue) return null
+  const [task, approval, attempts, events, job] = await Promise.all([
+    testDb.applicationTask.findMany({ where: { id: prepared.applicationTaskId, userId: intent.userId,
+      jobId: intent.jobId, sessionId: intent.sessionId, fillTurnId: intent.fillTurnId },
+    select: { id: true, userId: true, jobId: true, sessionId: true, fillTurnId: true, workerTaskId: true,
+      status: true, checkpoint: true, completedAt: true } }),
+    testDb.agentApproval.findMany({ where: { id: intent.receiptId, userId: intent.userId,
+      jobId: intent.jobId, sessionId: intent.sessionId, turnId: intent.fillTurnId,
+      taskId: intent.applicationTaskId, type: "submit_application" },
+    select: { id: true, userId: true, jobId: true, sessionId: true, turnId: true, taskId: true, type: true, status: true } }),
+    testDb.submissionAttempt.findMany({ where: { userId: intent.userId, jobId: intent.jobId,
+      receiptId: intent.receiptId, constraintHash: intent.constraintHash },
+    select: { userId: true, jobId: true, receiptId: true, constraintHash: true, state: true, responseRef: true } }),
+    testDb.applicationTaskEvent.findMany({ where: { taskId: prepared.applicationTaskId,
+      type: { in: ["submission_execution_started", "submission_execution_settled"] } },
+    select: { id: true, taskId: true, type: true, actor: true, data: true } }),
+    queue.getJob(intent.workerTaskId),
+  ])
+  const executionKeys = ["applicationTaskId", "approvalId", "constraintHash", "executionId", "fillTurnId",
+    "jobId", "sessionId", "userId", "workerTaskId"].sort().join(",")
+  const start = events.find(event => event.type === "submission_execution_started")
+  const settled = events.find(event => event.type === "submission_execution_settled")
+  const startData = jsonRecord(start?.data)
+  const settledData = jsonRecord(settled?.data)
+  const executionId = jsonString(startData, "executionId")
+  const exactExecutionIdentity = (data: Record<string, unknown> | null) => Boolean(data && executionId
+    && Object.keys(data).sort().join(",") === executionKeys
+    && data.applicationTaskId === intent.applicationTaskId && data.approvalId === intent.receiptId
+    && data.constraintHash === intent.constraintHash && data.executionId === executionId
+    && data.fillTurnId === intent.fillTurnId && data.jobId === intent.jobId
+    && data.sessionId === intent.sessionId && data.userId === intent.userId
+    && data.workerTaskId === intent.workerTaskId)
+  const exactExecutionPair = events.length === 2 && start?.actor === "worker" && settled?.actor === "worker"
+    && start.taskId === intent.applicationTaskId && settled.taskId === intent.applicationTaskId
+    && start.id === `evt_${executionId}` && exactExecutionIdentity(startData) && exactExecutionIdentity(settledData)
+  const exactTaskIdentity = task.length === 1 && task[0]?.id === intent.applicationTaskId
+    && task[0].userId === intent.userId && task[0].jobId === intent.jobId
+    && task[0].sessionId === intent.sessionId && task[0].fillTurnId === intent.fillTurnId
+    && task[0].workerTaskId === intent.workerTaskId && task[0].completedAt instanceof Date
+  const exactStoppedTask = exactTaskIdentity && task[0]?.status === "failed"
+    && task[0]?.checkpoint === "turn_stopped_before_submit"
+  const exactConsumedApproval = approval.length === 1 && approval[0]?.id === intent.receiptId
+    && approval[0].userId === intent.userId && approval[0].jobId === intent.jobId
+    && approval[0].sessionId === intent.sessionId && approval[0].turnId === intent.fillTurnId
+    && approval[0].taskId === intent.applicationTaskId && approval[0].type === "submit_application"
+    && approval[0].status === "consumed"
+  const exactAttemptIdentity = attempts.length === 1 && attempts[0]?.userId === intent.userId
+    && attempts[0].jobId === intent.jobId && attempts[0].receiptId === intent.receiptId
+    && attempts[0].constraintHash === intent.constraintHash
+  const exactStoppedAttempt = exactAttemptIdentity && attempts[0]?.state === "failed" && attempts[0]?.responseRef === null
+  const lock = await (await queue.client).get(queue.toKey(`${intent.workerTaskId}:lock`))
+  if (!exactExecutionPair || !exactStoppedTask || !exactConsumedApproval || !exactStoppedAttempt || lock !== null) return null
+  if (!job) return "removed_after_exact_stop_settlement" as const
+  if (job.id !== intent.workerTaskId || !matchesApplyTaskSubmitPayload(job.data, intent)) return "mismatched_job" as const
+  const state = await job.getState()
+  return state === "completed" || state === "failed" ? state : null
+}
+
+async function waitForStage8StoppedExecutionSettlement(
+  prepared: Stage8PreparedScenario,
+  intent: Stage8SubmitIntent,
+  timeoutMs = 30_000,
+): Promise<"completed" | "failed" | "removed_after_exact_stop_settlement" | "mismatched_job"> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
-    const job = await applyQueue?.getJob(workerTaskId)
-    const state = await job?.getState()
-    if (state === "completed" || state === "failed") return state
+    const outcome = await stage8ExecutionSettled(prepared, intent)
+    if (outcome) return outcome
     await delay(100)
   }
-  throw new Error("stage8_submit_worker_did_not_settle")
+  return throwStage8SettlementTimeout(prepared, intent.workerTaskId)
+}
+
+async function waitForStage8GrantJobSettled(
+  prepared: Stage8PreparedScenario,
+  intent: Stage8SubmitIntent,
+  timeoutMs = 30_000,
+): Promise<"completed" | "failed" | "removed_after_exact_terminal_proof" | "mismatched_job"> {
+  const until = Date.now() + timeoutMs
+  const expected = {
+    taskId: intent.applicationTaskId, userId: intent.userId, jobId: intent.jobId,
+    sessionId: intent.sessionId, fillTurnId: intent.fillTurnId, workerTaskId: intent.workerTaskId,
+    approvalId: intent.receiptId, constraintHash: intent.constraintHash,
+  }
+  const queue = applyQueue
+  if (!queue) throw new Error("stage8_apply_queue_unavailable")
+  while (Date.now() < until) {
+    const [job, lock] = await Promise.all([
+      queue.getJob(intent.workerTaskId),
+      (async () => (await queue.client).get(queue.toKey(`${intent.workerTaskId}:lock`)))(),
+    ])
+    if (lock === null) {
+      if (job) {
+        if (job.id !== intent.workerTaskId || !matchesApplyTaskSubmitPayload(job.data, intent)) return "mismatched_job"
+        const state = await job.getState()
+        if (state === "completed") return state
+        if (state === "failed" && job.attemptsMade >= (job.opts?.attempts ?? 1)) return state
+      } else {
+        try {
+          await waitForSubmissionTerminalProof(expected, Math.min(100, until - Date.now()))
+          return "removed_after_exact_terminal_proof"
+        } catch { /* Continue polling until the shared deadline, then emit bounded diagnostics. */ }
+      }
+    }
+    await delay(100)
+  }
+  return throwStage8SettlementTimeout(prepared, intent.workerTaskId)
 }
 
 describeWithServices("ApplicationTask production full-loop PostgreSQL integration", () => {
@@ -2114,6 +2788,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(answeredJson).toMatchObject({ resumed: true })
     const confirmedTask = await waitForTask(task => task.status === "filling" && task.checkpoint === "taskgraph_fill_queued" && task.fillTurnId !== firstFillTurnId)
     const successorTurnId = confirmedTask.fillTurnId!
+    await armLegacyQueueAckBarrier(ids.session, successorTurnId)
     await armLegacyFinalResponseGate(successorTurnId)
     const successorTurn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: successorTurnId }, select: {
       userId: true, sessionId: true,
@@ -2270,8 +2945,39 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(submitJob.data).toMatchObject({ applicationTaskId: gateTaskId, userId: ids.user, jobId: ids.job,
       sessionId: ids.session, fillTurnId: successorTurnId, receiptId: submitApproval.id, operation: "submit" })
     const successorRootTaskId = await expectLegacyFillTurnLeased(successorTurnId)
-    await releaseLegacyFinalResponseGate()
-    expect((await waitForAgentTurnTerminal(successorTurnId, 30_000)).status).toBe("completed")
+    const legacyFailureScope = {
+      jobId: ids.job, sessionId: ids.session, fillTurnId: successorTurnId,
+      applicationTaskId: gateTaskId!, submitApprovalId: submitApproval.id,
+    } satisfies Stage8FailureSnapshotScope
+    let legacyPhase: "release_synthetic_response" | "await_queue_ack" | "await_task_uncertainty"
+      | "verify_session_wait" | "verify_live_fill_owner" | "await_fill_terminal" = "release_synthetic_response"
+    try {
+      if (!site?.stdin) throw new Error("synthetic_response_unavailable")
+      // The fixture's plain-text response is deliberately not a submission confirmation.
+      site.stdin.write("release-held\n")
+      legacyPhase = "await_queue_ack"
+      await waitForLegacyAckMarker(worker!, "LEGACY_ACK_BARRIER_REACHED attempt=1")
+      legacyPhase = "await_task_uncertainty"
+      await waitForTask(task => task.userId === ids.user && task.jobId === ids.job
+        && task.sessionId === ids.session && task.fillTurnId === successorTurnId && task.workerTaskId === workerTaskId
+        && task.status === "waiting_for_user" && task.checkpoint === "submission_uncertain")
+      legacyPhase = "verify_session_wait"
+      const uncertainSession = await testDb.agentSession.findUnique({ where: { id: ids.session }, select: {
+        userId: true, status: true, completedAt: true,
+      } })
+      if (uncertainSession?.userId !== ids.user || uncertainSession.status !== "waiting_for_user"
+        || uncertainSession.completedAt !== null) throw new Error("session_wait_mismatch")
+      legacyPhase = "verify_live_fill_owner"
+      if (await expectLegacyFillTurnLeased(successorTurnId) !== successorRootTaskId) throw new Error("fill_owner_changed")
+      legacyPhase = "await_fill_terminal"
+      await releaseLegacyFinalResponseGate()
+      if ((await waitForAgentTurnTerminal(successorTurnId, 30_000)).status !== "completed") {
+        throw new Error("fill_turn_not_completed")
+      }
+    } catch {
+      const snapshot = await stage8FillFailureSnapshot(legacyFailureScope, workerTaskId)
+      throw new Error(`legacy_fill_lifecycle_miss:${JSON.stringify({ phase: legacyPhase, snapshot })}`)
+    }
     expect(await testDb.agentTurn.findUniqueOrThrow({ where: { id: successorTurnId }, select: {
       rootTaskId: true, status: true, completedAt: true, leaseOwnerId: true, leaseExpiresAt: true,
     } })).toMatchObject({
@@ -2310,13 +3016,101 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(await testDb.agentApproval.findUniqueOrThrow({
       where: { id: submitApproval.id }, select: { status: true },
     })).toEqual(approvalBeforeDuplicate)
-    expect((await requestFixtureStats()).submitCount).toBe(1)
+    const legacyReceiverStats = await requestFixtureStats()
+    expect(legacyReceiverStats.submitCount).toBe(1)
+    const heldAckJob = await applyQueue!.getJob(workerTaskId)
+    expect(Boolean(heldAckJob)).toBe(true)
+    expect(heldAckJob?.id === workerTaskId).toBe(true)
+    expect(await heldAckJob!.getState()).toBe("active")
+    expect(heldAckJob!.attemptsStarted).toBe(1)
+    const heldAckPayload = jsonRecord(heldAckJob!.data)
+    expect(Boolean(heldAckPayload && heldAckPayload.operation === "submit" && heldAckPayload.sessionId === ids.session
+      && heldAckPayload.fillTurnId === successorTurnId && heldAckPayload.applicationTaskId === gateTaskId
+      && heldAckPayload.receiptId === submitApproval.id)).toBe(true)
+    await proveLegacyQueueAckBarrier({ sessionId: ids.session, fillTurnId: successorTurnId,
+      jobId: workerTaskId, attemptsStarted: heldAckJob!.attemptsStarted })
+    const uncertainBeforeKill = await testDb.applicationTask.findUnique({ where: { id: gateTaskId },
+      select: { userId: true, jobId: true, sessionId: true, status: true, checkpoint: true, fillTurnId: true, workerTaskId: true } })
+    const uncertaintyChecks = {
+      ownedRowPresent: uncertainBeforeKill?.userId === ids.user && uncertainBeforeKill.jobId === ids.job
+        && uncertainBeforeKill.sessionId === ids.session,
+      statusMatches: uncertainBeforeKill?.status === "waiting_for_user",
+      checkpointMatches: uncertainBeforeKill?.checkpoint === "submission_uncertain",
+      fillTurnMatches: uncertainBeforeKill?.fillTurnId === successorTurnId,
+      workerTaskMatches: uncertainBeforeKill?.workerTaskId === workerTaskId,
+    }
+    if (!Object.values(uncertaintyChecks).every(Boolean)) {
+      let exactStartReceiptCount: number | null = null
+      let exactSettledReceiptCount: number | null = null
+      let exactExecutionPairCount: number | null = null
+      let requestStartedCheckpointStillPresent: boolean | null = null
+      try {
+        const executionReceipts = await testDb.applicationTaskEvent.findMany({ where: {
+          taskId: gateTaskId, actor: "worker",
+          type: { in: ["submission_execution_started", "submission_execution_settled"] },
+        }, select: { type: true, data: true } })
+        let startCount = 0
+        let settledCount = 0
+        const startExecutionIds = new Set<string>()
+        const settledExecutionIds = new Set<string>()
+        for (const event of executionReceipts) {
+          const data = jsonRecord(event.data)
+          const exactIdentity = data !== null && typeof data.executionId === "string" && data.executionId.length > 0
+            && data.workerTaskId === workerTaskId && data.applicationTaskId === gateTaskId
+            && data.userId === ids.user && data.jobId === ids.job && data.sessionId === ids.session
+            && data.fillTurnId === successorTurnId && data.approvalId === submitApproval.id
+            && data.constraintHash === intent.constraintHash
+          if (!exactIdentity) continue
+          if (event.type === "submission_execution_started") {
+            startCount++
+            startExecutionIds.add(data.executionId as string)
+          }
+          if (event.type === "submission_execution_settled") {
+            settledCount++
+            settledExecutionIds.add(data.executionId as string)
+          }
+        }
+        exactStartReceiptCount = startCount
+        exactSettledReceiptCount = settledCount
+        const pairedExecutionCount = [...startExecutionIds].filter(id => settledExecutionIds.has(id)).length
+        exactExecutionPairCount = Math.min(2, pairedExecutionCount)
+        const exactTaskIdentity = uncertaintyChecks.ownedRowPresent && uncertaintyChecks.fillTurnMatches
+          && uncertaintyChecks.workerTaskMatches
+        requestStartedCheckpointStillPresent = exactTaskIdentity && startCount === 1 && settledCount === 1
+          && pairedExecutionCount === 1 && uncertainBeforeKill?.checkpoint === "submission_request_started"
+      } catch {
+        exactStartReceiptCount = null
+        exactSettledReceiptCount = null
+        exactExecutionPairCount = null
+        requestStartedCheckpointStillPresent = null
+      }
+      const taskOutcomeClass = !uncertainBeforeKill ? "row_missing"
+        : uncertainBeforeKill.status === "waiting_for_user" && uncertainBeforeKill.checkpoint === "submission_uncertain" ? "uncertain"
+        : uncertainBeforeKill.status === "submitted" && uncertainBeforeKill.checkpoint === "submission_verified" ? "verified_submitted"
+        : uncertainBeforeKill.status === "waiting_for_user" && uncertainBeforeKill.checkpoint === "user_takeover" ? "takeover_wait"
+        : uncertainBeforeKill.status === "failed" ? "terminal_failed"
+        : uncertainBeforeKill.status === "cancelled" && uncertainBeforeKill.checkpoint === "turn_stopped_before_submit" ? "stopped_before_submit"
+        : uncertainBeforeKill.status === "filling" && uncertainBeforeKill.checkpoint === "submission_request_started" ? "request_started"
+        : uncertainBeforeKill.status === "filling" && uncertainBeforeKill.checkpoint === "browser_active" ? "browser_active"
+        : uncertainBeforeKill.status === "waiting_for_authorization" && uncertainBeforeKill.checkpoint === "form_filled" ? "form_filled"
+        : "other"
+      const boundedCount = (value: number): number => Math.min(20, Math.max(0, Number.isSafeInteger(value) ? value : 0))
+      const receiverCounts = {
+        submitCount: boundedCount(legacyReceiverStats.submitCount),
+        matchingPostCount: boundedCount(legacyReceiverStats.requests.filter(request => request === "POST /example/jobs/1").length),
+        blockedCount: boundedCount(legacyReceiverStats.blocked.length),
+      }
+      throw new Error(`legacy_uncertainty_predicate_mismatch ${JSON.stringify({
+        ...uncertaintyChecks, taskOutcomeClass, exactStartReceiptCount, exactSettledReceiptCount,
+        exactExecutionPairCount, requestStartedCheckpointStillPresent, receiverCounts,
+      })}`)
+    }
     worker!.kill("SIGKILL")
     expect(await waitExit(worker!, 5_000)).toBe(true)
     worker = spawnFixture("worker")
     await waitLine(worker, "WORKER_READY", 90_000)
     const redeliveryEvent = await waitForWorkerRedelivery(worker, workerTaskId)
-    expect(redeliveryEvent).toMatchObject({ jobId: workerTaskId })
+    expect(redeliveryEvent.jobId === workerTaskId).toBe(true)
     expect(redeliveryEvent.attemptsStarted).toBeGreaterThanOrEqual(2)
     expect(redeliveryEvent.stalledCounter).toBeGreaterThanOrEqual(1)
     const fixtureStats = await requestFixtureStats()
@@ -2650,10 +3444,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     worker = spawnFixture("worker-staged")
     await waitLine(worker, "WORKER_READY", 90_000)
     try {
+      await armStage8ExecutionFailureTarget(stopFirst)
       const firstIntent = await approveStage8Submit(stopFirst)
       worker.stdin?.write("stage8-release-publisher\n")
       await waitForStage8ApplyJob(stopFirst, firstIntent)
-      await waitLine(worker, `STAGE8_ARM_COMMITTED ${firstIntent.workerTaskId}`, 90_000)
+      await waitForStage8Arm(stopFirst, firstIntent)
       expect(await readStage8Protocol(stopFirst, firstIntent)).toEqual(["armed"])
       const firstTarget = await readStage8StopTarget(stopFirst)
       const firstStop = await postStage8Stop(stopFirst, firstTarget)
@@ -2665,12 +3460,20 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(await readStage8Protocol(stopFirst, firstIntent)).toEqual(["armed", "stop_requested"])
 
       worker.stdin?.write("stage8-release-arm\n")
-      expect(await waitForStage8JobSettled(firstIntent.workerTaskId)).toBe("completed")
+      const stoppedSettlement = await waitForStage8StoppedExecutionSettlement(stopFirst, firstIntent)
+      expect(["completed", "removed_after_exact_stop_settlement"]).toContain(stoppedSettlement)
+      const settledDuplicateStop = await postStage8Stop(stopFirst, firstTarget)
+      expect(settledDuplicateStop.status).toBe(200)
+      await expect(jsonResponse(settledDuplicateStop)).resolves.toEqual({ outcome: "stop_requested" })
+      expect(await readStage8Protocol(stopFirst, firstIntent)).toEqual(["armed", "stop_requested"])
       expect(worker.lines.some(line => line === `STAGE8_FINAL_FENCE_READY ${firstIntent.workerTaskId}`)).toBe(false)
       const afterStopFirst = await requestFixtureStats()
       expect(afterStopFirst.reviewedSubmitCount).toBe(before.reviewedSubmitCount)
       expect(afterStopFirst.reviewedHeldSubmitCount).toBe(before.reviewedHeldSubmitCount)
+      expect(afterStopFirst.reviewedExactSubmissionCount).toBe(before.reviewedExactSubmissionCount)
       expect(afterStopFirst.blocked).toEqual([])
+      expect(afterStopFirst.requests.filter(path => path === "POST /example-reviewed/jobs/1"))
+        .toHaveLength(priorReviewedPostCount)
 
       await stopFixture(worker)
       worker = spawnFixture("worker")
@@ -2679,10 +3482,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       await stopFixture(worker)
       worker = spawnFixture("worker-staged")
       await waitLine(worker, "WORKER_READY", 90_000)
+      await armStage8ExecutionFailureTarget(grantFirst)
       const secondIntent = await approveStage8Submit(grantFirst)
       worker.stdin?.write("stage8-release-publisher\n")
       await waitForStage8ApplyJob(grantFirst, secondIntent)
-      await waitLine(worker, `STAGE8_ARM_COMMITTED ${secondIntent.workerTaskId}`, 90_000)
+      await waitForStage8Arm(grantFirst, secondIntent)
       expect(await readStage8Protocol(grantFirst, secondIntent)).toEqual(["armed"])
       const secondTarget = await readStage8StopTarget(grantFirst)
       worker.stdin?.write("stage8-release-arm\n")
@@ -2707,12 +3511,14 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       await waitLine(worker, `STAGE8_FINAL_FENCE_RELEASED ${secondIntent.workerTaskId}`, 15_000)
       const sendDeadline = Date.now() + 15_000
       let afterGrant = await requestFixtureStats()
-      while (afterGrant.reviewedSubmitCount !== before.reviewedSubmitCount + 1 && Date.now() < sendDeadline) {
+      while ((afterGrant.reviewedSubmitCount !== before.reviewedSubmitCount + 1
+        || afterGrant.reviewedExactSubmissionCount !== before.reviewedExactSubmissionCount + 1) && Date.now() < sendDeadline) {
         await delay(50)
         afterGrant = await requestFixtureStats()
       }
       expect(afterGrant.reviewedSubmitCount).toBe(before.reviewedSubmitCount + 1)
       expect(afterGrant.reviewedHeldSubmitCount).toBe(before.reviewedHeldSubmitCount + 1)
+      expect(afterGrant.reviewedExactSubmissionCount).toBe(before.reviewedExactSubmissionCount + 1)
       expect(afterGrant.blocked).toEqual([])
 
       const tooLate = await blockedStop
@@ -2733,7 +3539,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         releasedStats = await requestFixtureStats()
       }
       expect(releasedStats.reviewedHeldSubmitCount).toBe(before.reviewedHeldSubmitCount)
-      await waitForStage8JobSettled(secondIntent.workerTaskId, 30_000)
+      const grantSettlement = await waitForStage8GrantJobSettled(grantFirst, secondIntent, 30_000)
+      expect(["completed", "removed_after_exact_terminal_proof"]).toContain(grantSettlement)
     } finally {
       site?.stdin?.write("release-held\n")
     }

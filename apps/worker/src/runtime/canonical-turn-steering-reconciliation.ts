@@ -2,7 +2,9 @@ import type pg from "pg"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
 import { lockTaskGraphScope } from "./subagents/task-graph-pg-state.js"
 export { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "./subagents/steering-reconciliation-contract.js"
-import { readSteeringReconciliationState } from "./subagents/steering-reconciliation-read.js"
+import { readSteeringReconciliationState, readSteeringReconciliationStateForTerminal } from "./subagents/steering-reconciliation-read.js"
+import { assertSessionTerminalAdmission, isSessionPauseRequestedError, revokeSessionTerminalAdmissionsForClient, SessionPauseRequestedError,
+  type SessionTerminalAdmission } from "./session-gate.js"
 
 type Client = Pick<pg.PoolClient, "query">
 type Pool = Pick<pg.Pool, "connect">
@@ -16,27 +18,73 @@ function rootHasPlanningAction(root: Row): boolean {
   return actions.includes("agent.plan")
 }
 
+function exactPlannerRoot(root: Row, scope: TaskGraphExecutionScope): boolean {
+  return root.id === scope.rootTaskId && root.rootTaskId === scope.rootTaskId && root.parentTaskId === null
+    && root.role === "orchestrator" && root.taskType === "root" && rootHasPlanningAction(root)
+}
+
+async function lockPlannerStep(client: Client, scope: TaskGraphExecutionScope, admissionDenied: SessionPauseRequestedError): Promise<void> {
+  const result = await client.query<Row>(`SELECT "id" FROM "agent_steps"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4
+      AND "status" = 'streaming' AND "attempt" = $5 FOR UPDATE`,
+  [scope.stepId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentAttemptCount])
+  if (result.rows.length !== 1) throw admissionDenied
+}
+
+async function terminalAdmissionForLockedPlanner(client: Client, scope: TaskGraphExecutionScope,
+  admissionDenied: SessionPauseRequestedError): Promise<SessionTerminalAdmission> {
+  const turn = await client.query<Row>(`SELECT "source", "executionMode" FROM "agent_turns"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $4
+      AND "leaseOwnerId" = $5 AND "leaseVersion" = $6 AND "status" = 'in_progress' FOR UPDATE`,
+  [scope.turnId, scope.sessionId, scope.userId, scope.rootTaskId, scope.turnLeaseOwner, scope.turnLeaseVersion])
+  const row = turn.rows.length === 1 ? turn.rows[0] : null
+  if (!row || typeof row.source !== "string" || !(row.executionMode === null || typeof row.executionMode === "string")) {
+    throw admissionDenied
+  }
+  return assertSessionTerminalAdmission(client, { sessionId: scope.sessionId, userId: scope.userId,
+    turnId: scope.turnId, rootTaskId: scope.rootTaskId, source: row.source, executionMode: row.executionMode })
+}
+
 /** Reads the owned current-Step ledger before native proof checks; terminal commit repeats the guard atomically. */
 export async function hasUnresolvedPlanningSteering(pool: Pool, scope: TaskGraphExecutionScope): Promise<boolean> {
   const client = await pool.connect()
   let committed = false
+  let admission: SessionTerminalAdmission | undefined
   try {
     await client.query("BEGIN ISOLATION LEVEL READ COMMITTED")
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", scope.userId])
-    const root = await lockTaskGraphScope(client, scope, true)
-    if (!rootHasPlanningAction(root)) {
+    let root: Row
+    let hasPlannerRoot: boolean
+    try {
+      root = await lockTaskGraphScope(client, scope, true)
+      hasPlannerRoot = rootHasPlanningAction(root)
+    }
+    catch (error: unknown) {
+      if (!isSessionPauseRequestedError(error)) throw error
+      root = await lockTaskGraphScope(client, scope, false)
+      if (!exactPlannerRoot(root, scope)) throw error
+      await lockPlannerStep(client, scope, error)
+      admission = await terminalAdmissionForLockedPlanner(client, scope, error)
+      hasPlannerRoot = true
+    }
+    if (!hasPlannerRoot) {
       await client.query("COMMIT")
       committed = true
       return false
     }
-    const state = await readSteeringReconciliationState(client, scope)
+    const state = admission
+      ? await readSteeringReconciliationStateForTerminal(client, scope, admission)
+      : await readSteeringReconciliationState(client, scope)
     await client.query("COMMIT")
     committed = true
     return state.unresolvedInputs.length > 0
   } catch (error: unknown) {
     if (!committed) await client.query("ROLLBACK").catch(() => undefined)
     throw error
-  } finally { client.release() }
+  } finally {
+    revokeSessionTerminalAdmissionsForClient(client)
+    client.release()
+  }
 }
 
 /** The terminal verifier uses its already-locked transaction client for this raw pending-input check. */

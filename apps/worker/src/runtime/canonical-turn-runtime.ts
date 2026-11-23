@@ -149,9 +149,9 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     }) : undefined
     const terminalGuard = createCanonicalTurnTerminalGuard({
       enabled: selectedJobMode || objectiveTaskGraphMode || !!rootTasks.checkCompletion || taskGraphPlanningEnabled, nativeVerification,
-      checkRootGraph: rootTasks.checkCompletion || taskGraphPlanningEnabled ? async (client, nativeVerificationPassed) => batchRuntime
+      checkRootGraph: rootTasks.checkCompletion || taskGraphPlanningEnabled ? async (client, nativeVerificationPassed, terminalAdmission) => batchRuntime
         ? batchRuntime.checkTerminal(client, nativeVerificationPassed)
-        : rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true, nativeVerificationPassed, client, requireTaskGraph: objectiveTaskGraphMode }) : undefined,
+        : rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true, nativeVerificationPassed, client, requireTaskGraph: objectiveTaskGraphMode, terminalAdmission }) : undefined,
       finalizeSelectedJob: selectedJobMode ? client => selectedJobArtifactFinalizationGuard({ client, commandPort: options.taskGraphCommandPort, lease, root, selectedJobId: selectedJobPreparation?.jobId, acceptedGraphWitness,
         readCurrentDraftHead: findCurrentDraftHeadWithClient, readCurrentSourceDigest: (queryClient, scope) => readSelectedJobSourceDigestWithClient(queryClient, scope.userId, scope.jobId), readCurrentReviewReceipt: findReviewReceiptWithClient,
       }) : scheduledDraftRuntime ? client => scheduledDraftRuntime.finalize(client) : undefined,

@@ -5,18 +5,59 @@ import type { Page } from "playwright-core";
 
 const COVER_LETTER_UNION = "textarea[name*='cover' i], textarea[id*='cover' i], textarea[placeholder*='cover' i]";
 
-function reviewedPage(options: { count?: number; visible?: boolean; value?: string } = {}) {
+function reviewedPage(options: {
+  count?: number; visible?: boolean; value?: string; onIntent?: () => void; onIntentValue?: string; sequence?: string[];
+  sameForm?: boolean; name?: string; disabled?: boolean; finalVisible?: boolean; finalCount?: number; duplicateName?: boolean;
+} = {}) {
+  let value = options.value ?? "";
+  let currentUrl = "https://boards.greenhouse.io/booking/jobs/123/applications/new";
+  const formElements = { namedItem: vi.fn(() => null as unknown) };
+  const form = { action: "https://boards.greenhouse.io/booking/apply", method: "POST", target: "", elements: formElements };
+  const fieldForm = options.sameForm === false ? {} : form;
+  const textarea = {
+    tagName: "TEXTAREA", form: fieldForm, name: options.name ?? "cover_letter",
+    matches: vi.fn((selector: string) => selector === ":disabled" && options.disabled === true),
+    getClientRects: vi.fn(() => options.finalVisible === false ? [] : [{}]),
+    get value() { return value; }, set value(next: string) { value = next; },
+  };
+  formElements.namedItem.mockReturnValue(options.duplicateName ? { length: 2 } : textarea);
+  const document = {
+    querySelectorAll: vi.fn(() => Array.from({ length: options.finalCount ?? 1 }, () => textarea)),
+    defaultView: { getComputedStyle: vi.fn(() => ({ display: "block", visibility: "visible" })) },
+    querySelector: vi.fn(() => null),
+  };
   const field = {
     count: vi.fn().mockResolvedValue(options.count ?? 1), isVisible: vi.fn().mockResolvedValue(options.visible ?? true),
-    inputValue: vi.fn().mockResolvedValue(options.value ?? ""), fill: vi.fn().mockResolvedValue(undefined),
+    inputValue: vi.fn(async () => { options.sequence?.push("readback"); return value; }),
+    fill: vi.fn(async (content: string) => { value = content; }),
   };
   const locator = { ...field, first: () => field };
+  const submitter = {
+    count: vi.fn().mockResolvedValue(1), isVisible: vi.fn().mockResolvedValue(true),
+    evaluate: vi.fn(async (callback: (element: Element, arg?: unknown) => unknown, arg?: unknown) => {
+      if (arg === undefined) {
+        options.onIntent?.();
+        if (options.onIntentValue !== undefined) value = options.onIntentValue;
+        return { url: form.action, method: form.method };
+      }
+      options.sequence?.push("readback");
+      const submitterElement = {
+        tagName: "BUTTON", type: "submit", form, formAction: "", formMethod: "", formTarget: "",
+        hasAttribute: () => false, ownerDocument: document,
+      };
+      return callback(submitterElement as unknown as Element, arg);
+    }),
+    click: vi.fn(async () => { options.sequence?.push("click"); currentUrl = "https://boards.greenhouse.io/booking/confirmation"; }),
+  };
+  const submitterLocator = { ...submitter, first: () => submitter };
   const page = {
-    url: () => "https://boards.greenhouse.io/booking/jobs/123/applications/new",
-    locator: vi.fn(() => locator),
+    url: () => currentUrl,
+    title: vi.fn().mockResolvedValue("Application Submitted"),
+    locator: vi.fn((selector: string) => selector === COVER_LETTER_UNION || selector.startsWith("textarea[") ? locator : submitterLocator),
+    waitForLoadState: vi.fn().mockResolvedValue(undefined),
     focus: vi.fn().mockResolvedValue(undefined), fill: vi.fn(), type: vi.fn(), click: vi.fn(), $$: vi.fn().mockResolvedValue([]),
   } as unknown as Page;
-  return { page, field };
+  return { page, field, submitter };
 }
 
 function reviewedTask(content: string) {
@@ -81,6 +122,81 @@ describe("runGreenhouseFlow", () => {
     expect(page.fill).not.toHaveBeenCalled();
     expect(page.type).not.toHaveBeenCalled();
     expect(page.click).not.toHaveBeenCalled();
+  });
+
+  it("allows approved submission only after a final exact readback immediately before the typed/session guard", async () => {
+    const content = "Reviewed source text";
+    const sequence: string[] = [];
+    const { page, field, submitter } = reviewedPage({ sequence });
+    const beforeSubmit = vi.fn(async () => { sequence.push("guard"); return true; });
+
+    const result = await runGreenhouseFlow(page, { ...reviewedTask(content), allowSubmit: true, beforeSubmit }, {
+      reviewedCoverLetter: content, mode: "approved-submit",
+    });
+
+    expect(result.status).toBe("submitted");
+    expect(field.fill).toHaveBeenCalledWith(content);
+    expect(sequence.slice(-3)).toEqual(["readback", "guard", "click"]);
+    expect(beforeSubmit).toHaveBeenCalledOnce();
+    expect(beforeSubmit).toHaveBeenCalledWith({ url: "https://boards.greenhouse.io/booking/apply", method: "POST" });
+    expect(submitter.click).toHaveBeenCalledOnce();
+  });
+
+  it("accepts only an exact existing reviewed value in approved mode; fill-only still refuses to reuse it", async () => {
+    const content = "Reviewed source text";
+    const approved = reviewedPage({ value: content });
+    const submit = await runGreenhouseFlow(approved.page, { ...reviewedTask(content), allowSubmit: true, beforeSubmit: vi.fn().mockResolvedValue(true) }, {
+      reviewedCoverLetter: content, mode: "approved-submit",
+    });
+    expect(submit.status).toBe("submitted");
+    expect(approved.field.fill).not.toHaveBeenCalled();
+
+    const fillOnly = reviewedPage({ value: content });
+    const review = await runGreenhouseFlow(fillOnly.page, reviewedTask(content), { reviewedCoverLetter: content });
+    expect(review).toMatchObject({ status: "manual", reviewReady: false });
+    expect(fillOnly.submitter.click).not.toHaveBeenCalled();
+  });
+
+  it("does not fill or submit in approved mode without both submit permission and the existing guard", async () => {
+    const { page, field, submitter } = reviewedPage();
+    const result = await runGreenhouseFlow(page, reviewedTask("Reviewed source text"), {
+      reviewedCoverLetter: "Reviewed source text", mode: "approved-submit",
+    });
+    expect(result).toMatchObject({ status: "manual", reviewReady: false });
+    expect(field.fill).not.toHaveBeenCalled();
+    expect(submitter.click).not.toHaveBeenCalled();
+  });
+
+  it("rejects a field changed while resolving the submit intent before invoking either guard or click", async () => {
+    const content = "Reviewed source text";
+    const sequence: string[] = [];
+    const { page, field, submitter } = reviewedPage({ sequence, onIntentValue: "Changed after final fill" });
+    const beforeSubmit = vi.fn().mockResolvedValue(true);
+    const result = await runGreenhouseFlow(page, { ...reviewedTask(content), allowSubmit: true, beforeSubmit }, {
+      reviewedCoverLetter: content, mode: "approved-submit",
+    });
+
+    expect(result.status).toBe("submission_blocked");
+    expect(beforeSubmit).not.toHaveBeenCalled();
+    expect(submitter.click).not.toHaveBeenCalled();
+    expect(field.fill).toHaveBeenCalledWith(content);
+  });
+
+  it.each([
+    ["a different form", { sameForm: false }], ["an unnamed field", { name: "" }],
+    ["a field in a disabled fieldset", { disabled: true }], ["an ambiguous field", { finalCount: 2 }],
+    ["a hidden field", { finalVisible: false }], ["a duplicate named control", { duplicateName: true }],
+  ])("blocks approved submit when reviewed text is in %s", async (_case, options) => {
+    const content = "Reviewed source text";
+    const { page, submitter } = reviewedPage(options);
+    const beforeSubmit = vi.fn().mockResolvedValue(true);
+    const result = await runGreenhouseFlow(page, { ...reviewedTask(content), allowSubmit: true, beforeSubmit }, {
+      reviewedCoverLetter: content, mode: "approved-submit",
+    });
+
+    expect(result.status).toBe("submission_blocked");
+    expect(beforeSubmit).not.toHaveBeenCalled();
+    expect(submitter.click).not.toHaveBeenCalled();
   });
 
   it.each([

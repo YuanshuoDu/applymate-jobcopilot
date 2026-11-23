@@ -1,4 +1,4 @@
-import type { Page } from "playwright-core";
+import type { Locator, Page } from "playwright-core";
 import { formAnswerKeyForSelector, isAnswerableFormControl, isFormAnswerKeyV2 } from "../form-answer-key.js";
 import { readSubmissionRequestIntent, type SubmissionRequestIntent } from "./submission-intent.js";
 
@@ -155,7 +155,6 @@ export type SubmissionAuthorization =
   | { authorized: false; reason: SubmissionBlockedReason; message: string };
 
 export type SubmissionGuard = (intent?: SubmissionRequestIntent) => Promise<unknown> | unknown;
-
 export type SubmitAttempt =
   | { outcome: "submitted" }
   | { outcome: "missing" }
@@ -179,18 +178,20 @@ function blocked(
 }
 
 export async function assertSubmissionAuthorized(
-  beforeSubmit?: SubmissionGuard,
-  intent?: SubmissionRequestIntent,
+  beforeSubmit?: SubmissionGuard, intent?: SubmissionRequestIntent, precheck?: () => Promise<boolean> | boolean,
 ): Promise<SubmissionAuthorization> {
   if (!beforeSubmit) return blocked("missing_guard");
-
+  let authorizationActive = true;
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   try {
     const timeout = new Promise<typeof SUBMISSION_AUTH_TIMEOUT>((resolve) => {
-      timeoutHandle = setTimeout(() => resolve(SUBMISSION_AUTH_TIMEOUT), SUBMISSION_AUTH_TIMEOUT_MS);
+      timeoutHandle = setTimeout(() => { authorizationActive = false; resolve(SUBMISSION_AUTH_TIMEOUT); },
+        SUBMISSION_AUTH_TIMEOUT_MS);
     });
     const result = await Promise.race([
-      Promise.resolve().then(() => beforeSubmit(intent)),
+      Promise.resolve().then(async () =>
+        (precheck && await precheck() !== true) || !authorizationActive ? false : beforeSubmit(intent)
+      ),
       timeout,
     ]);
     if (result === SUBMISSION_AUTH_TIMEOUT) return blocked("guard_timeout");
@@ -199,6 +200,7 @@ export async function assertSubmissionAuthorized(
   } catch {
     return blocked("guard_error");
   } finally {
+    authorizationActive = false;
     if (timeoutHandle) clearTimeout(timeoutHandle);
   }
 }
@@ -207,6 +209,7 @@ export async function clickSubmit(
   page: Page,
   selectors: string[],
   beforeSubmit?: SubmissionGuard,
+  verifySubmitter?: (submitter: Locator) => Promise<boolean> | boolean,
 ): Promise<SubmitAttempt> {
   let visibleWithoutIntent = false;
   for (const selector of selectors) {
@@ -219,7 +222,7 @@ export async function clickSubmit(
         visibleWithoutIntent = true;
         continue;
       }
-      const authorization = await assertSubmissionAuthorized(beforeSubmit, intent);
+      const authorization = await assertSubmissionAuthorized(beforeSubmit, intent, verifySubmitter ? () => verifySubmitter(button) : undefined);
       if (authorization.authorized === false) {
         console.warn("[submission-guard] blocked", authorization.reason);
         return {

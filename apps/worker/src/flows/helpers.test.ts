@@ -89,6 +89,82 @@ describe("submission authorization guard", () => {
     expect(guard).toHaveBeenCalledWith(intent);
   });
 
+  it("keeps the generic guard intent-only and gives the exact locator only to its verifier", async () => {
+    const click = vi.fn();
+    const submitter = {
+      count: vi.fn(async () => 1),
+      isVisible: vi.fn(async () => true),
+      evaluate: vi.fn(async () => ({ url: "https://apply.example.com/submit", method: "POST" })),
+      click,
+    };
+    const guard = vi.fn().mockResolvedValue(true);
+    const verifySubmitter = vi.fn().mockResolvedValue(true);
+    const page = {
+      url: vi.fn(() => "https://apply.example.com/form"),
+      locator: vi.fn(() => ({ first: () => submitter })),
+      waitForLoadState: vi.fn().mockResolvedValue(undefined),
+    };
+
+    await expect(clickSubmit(page as never, ["button[type='submit']"], guard, verifySubmitter)).resolves.toEqual({ outcome: "submitted" });
+    expect(verifySubmitter).toHaveBeenCalledWith(submitter);
+    expect(guard).toHaveBeenCalledWith({ url: "https://apply.example.com/submit", method: "POST" });
+    expect(click).toHaveBeenCalledOnce();
+  });
+
+  it("does not invoke the guard or click when the submitter verifier denies", async () => {
+    const click = vi.fn();
+    const submitter = {
+      count: vi.fn().mockResolvedValue(1),
+      isVisible: vi.fn().mockResolvedValue(true),
+      evaluate: vi.fn().mockResolvedValue({ url: "https://apply.example.com/submit", method: "POST" }),
+      click,
+    };
+    const page = {
+      url: vi.fn(() => "https://apply.example.com/form"),
+      locator: vi.fn(() => ({ first: () => submitter })),
+    };
+    const guard = vi.fn().mockResolvedValue(true);
+    const verifySubmitter = vi.fn().mockResolvedValue(false);
+
+    await expect(clickSubmit(page as never, ["button[type='submit']"], guard, verifySubmitter))
+      .resolves.toMatchObject({ outcome: "blocked", reason: "guard_false" });
+    expect(verifySubmitter).toHaveBeenCalledWith(submitter);
+    expect(guard).not.toHaveBeenCalled();
+    expect(click).not.toHaveBeenCalled();
+  });
+
+  it("does not call the guard when submitter verification resolves after the authorization timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const click = vi.fn();
+      const submitter = {
+        count: vi.fn().mockResolvedValue(1),
+        isVisible: vi.fn().mockResolvedValue(true),
+        evaluate: vi.fn().mockResolvedValue({ url: "https://apply.example.com/submit", method: "POST" }),
+        click,
+      };
+      const page = {
+        url: vi.fn(() => "https://apply.example.com/form"),
+        locator: vi.fn(() => ({ first: () => submitter })),
+      };
+      const guard = vi.fn().mockResolvedValue(true);
+      let resolveVerification!: (verified: boolean) => void;
+      const verification = new Promise<boolean>((resolve) => { resolveVerification = resolve; });
+      const verifySubmitter = vi.fn(() => verification);
+      const result = clickSubmit(page as never, ["button[type='submit']"], guard, verifySubmitter);
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(result).resolves.toMatchObject({ outcome: "blocked", reason: "guard_timeout" });
+      resolveVerification(true);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(guard).not.toHaveBeenCalled();
+      expect(click).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("blocks when the runtime guard throws", async () => {
     await expect(assertSubmissionAuthorized(() => {
       throw new Error("revoked");

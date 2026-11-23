@@ -17,6 +17,7 @@ import { APPLY_TIMEOUT_MS, createApplyJobFinalization, finalizeApplyJob, handleA
 import { runApplyBrowserSession } from "./apply-browser-session.js";
 import { loadApprovedTurnScope, startApplyJobSubmissionStopProbe } from "./application-submission-route-gate.js";
 import { handOffUnavailableUnattendedTask } from "./apply-job-outcomes.js";
+import type { SubmissionRouteObservation } from "./application-submission-route-observation.js";
 
 export type ApplyJobRunState = {
   resultWritten: boolean;
@@ -36,7 +37,7 @@ export type ApplyJobRunState = {
   submissionFenceTimer: ReturnType<typeof setTimeout> | null;
   activePageCloseRef: { current: (() => Promise<void>) | null };
   submissionFenceRelease: Promise<void> | null;
-  submissionRouteState: { work: Promise<void> | null; cleanup: (() => Promise<void>) | null };
+  submissionRouteState: { work: Promise<void> | null; cleanup: (() => Promise<void>) | null; observation: SubmissionRouteObservation | null };
   submissionCandidateSeen: boolean;
   armedSubmissionIntent: SubmissionRequestIntent | null;
   activeBrowserExecution: Promise<void> | null;
@@ -123,7 +124,7 @@ export function createApplyJobProcessor(dependencies: {
       submissionFenceTimer: null,
       activePageCloseRef: { current: null },
       submissionFenceRelease: null,
-      submissionRouteState: { work: null, cleanup: null },
+      submissionRouteState: { work: null, cleanup: null, observation: null },
       submissionCandidateSeen: false,
       armedSubmissionIntent: null,
       activeBrowserExecution: null,

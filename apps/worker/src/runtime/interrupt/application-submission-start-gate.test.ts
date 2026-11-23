@@ -2,7 +2,7 @@ import type { Pool } from "pg"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
-  mark: vi.fn(), record: vi.fn(), inspect: vi.fn(), readTurn: vi.fn(), readLegacyTurn: vi.fn(), reviewed: vi.fn(), audit: vi.fn(),
+  mark: vi.fn(), record: vi.fn(), inspect: vi.fn(), readTurn: vi.fn(), readLegacyTurn: vi.fn(), reviewed: vi.fn(), stopPoll: vi.fn(), audit: vi.fn(),
 }))
 vi.mock("../../db/application-task-state.js", () => ({ markSubmissionRequestStarted: mocks.mark }))
 vi.mock("../../db/application-submission-stop-state.js", () => ({
@@ -10,7 +10,7 @@ vi.mock("../../db/application-submission-stop-state.js", () => ({
 }))
 vi.mock("../../db/reviewed-application-submit-request-fence.js", () => ({
   readSubmissionTurnState: mocks.readLegacyTurn, readSubmissionTurnStopState: mocks.readTurn,
-  withReviewedApplicationSubmitRequestFence: mocks.reviewed,
+  withReviewedApplicationSubmitRequestFence: mocks.reviewed, withReviewedApplicationSubmitStopPollFence: mocks.stopPoll,
 }))
 vi.mock("../../queue/application-submit-fence.js", () => ({ appendFencedSubmitAudit: mocks.audit }))
 
@@ -66,6 +66,9 @@ beforeEach(() => {
   mocks.reviewed.mockReset().mockImplementation(async (
     _client: unknown, _scope: unknown, _phase: unknown, expected: string | null | undefined, work: () => Promise<unknown>,
   ) => ({ kind: "current", value: await work(), sourceTurnId: expected ?? "source-turn-1" }))
+  mocks.stopPoll.mockReset().mockImplementation(async (_client: unknown, _scope: unknown, work: () => Promise<unknown>) => ({
+    kind: "current", value: await work(), sourceTurnId: "source-turn-1",
+  }))
   mocks.audit.mockReset().mockResolvedValue(undefined)
 })
 
@@ -229,7 +232,7 @@ describe("protocol Stop probe composition", () => {
     })
     await probe.pollNow()
     expect(controller.signal.aborted).toBe(false)
-    expect(mocks.reviewed.mock.calls[0]?.[2]).toBe("marker")
+    expect(mocks.stopPoll).toHaveBeenCalledOnce()
     probe.stop()
 
     const afterArm = harness()
@@ -248,7 +251,7 @@ describe("protocol Stop probe composition", () => {
   it("allows only an exact normal completed Turn before arming", async () => {
     const test = harness({ checkpoint: "browser_active" })
     await expect(isApplicationSubmissionStoppedWithStopProtocol(test.pool, scope)).resolves.toBe(false)
-    expect(mocks.reviewed.mock.calls[0]?.[2]).toBe("marker")
+    expect(mocks.stopPoll).toHaveBeenCalledOnce()
 
     const stopped = harness({ checkpoint: "browser_active" })
     mocks.readTurn.mockResolvedValueOnce(completedTurn({ sessionStatus: "aborted" }))
@@ -259,6 +262,7 @@ describe("protocol Stop probe composition", () => {
     const test = harness({ checkpoint: "browser_active" })
     mocks.readTurn.mockResolvedValueOnce(activeTurn({ leaseExpiresAt: new Date(Date.now() - 1_000) }))
     await expect(isApplicationSubmissionStoppedWithStopProtocol(test.pool, scope)).rejects.toThrow("Turn state is unavailable")
+    expect(mocks.stopPoll).toHaveBeenCalledOnce()
     expect(test.clients[0]?.query).toHaveBeenLastCalledWith("ROLLBACK")
   })
 

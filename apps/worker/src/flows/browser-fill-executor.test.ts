@@ -17,9 +17,10 @@ describe("browser.fill_form", () => {
 
   it("uses the trusted reviewed context only for the deterministic Greenhouse flow", async () => {
     const letter = "R".repeat(2000);
+    let fieldValue = "";
     const field = {
       count: vi.fn().mockResolvedValue(1), isVisible: vi.fn().mockResolvedValue(true),
-      inputValue: vi.fn().mockResolvedValue(""), fill: vi.fn().mockResolvedValue(undefined),
+      inputValue: vi.fn(async () => fieldValue), fill: vi.fn(async (next: string) => { fieldValue = next; }),
     };
     const pageMock = {
       locator: vi.fn((selector: string) => selector.includes("textarea[name*='cover'") ? field : { count: vi.fn().mockResolvedValue(0) }),

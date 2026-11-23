@@ -9,7 +9,8 @@ import { buildTaskGraphDenialCheckpoint, gateReport, repairIds,
   type GateReport, type TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_EVENT_TYPE, STEERING_RECONCILIATION_FEEDBACK,
   type SteeringReconciliationState } from "../subagents/steering-reconciliation-contract.js"
-import { readSteeringReconciliationState } from "../subagents/steering-reconciliation-read.js"
+import { readSteeringReconciliationState, readSteeringReconciliationStateForTerminal } from "../subagents/steering-reconciliation-read.js"
+import type { SessionTerminalAdmission } from "../session-gate.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { applyCompletionRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
@@ -103,7 +104,7 @@ async function readPersistedTurnInput(client: pg.PoolClient, lease: TurnLease, r
   return result.rows.length === 1 ? { found: true, input: result.rows[0]?.input } : { found: false }
 }
 /** Rechecks durable reports against the current immutable graph inside the caller's transaction. */
-export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, lease: TurnLease, rootTaskId: string, nativeVerificationPassed = false, requireTaskGraph = false): Promise<Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>> {
+export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, lease: TurnLease, rootTaskId: string, nativeVerificationPassed = false, requireTaskGraph = false, terminalAdmission?: SessionTerminalAdmission): Promise<Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>> {
   let graphRevision: number | null = null
   let denialCheckpoint: TaskGraphDenialCheckpoint | null = null
   const deny = (code?: GateFeedbackCode, details: readonly GateFeedbackDetail[] = []) => {
@@ -118,8 +119,8 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
     const hasRevisionHint = await hasReconciliationEventHint(client, lease, rootTaskId)
     const hasLocationHint = await hasConfirmedLocationEventHint(client, lease, rootTaskId)
     if (hasRevisionHint || hasLocationHint) {
-      reconciliationState = await readSteeringReconciliationState(client, { ...scope, turnLeaseOwner: lease.ownerId,
-        turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1 })
+      const reconciliationScope = { ...scope, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1 }
+      reconciliationState = terminalAdmission ? await readSteeringReconciliationStateForTerminal(client, reconciliationScope, terminalAdmission) : await readSteeringReconciliationState(client, reconciliationScope)
       if (reconciliationState.unresolvedInputs.length) return { ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK }
     }
     let confirmedLocation: Awaited<ReturnType<typeof readTaskGraphConfirmedLocationSteer>> | null = null

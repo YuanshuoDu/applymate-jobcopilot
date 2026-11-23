@@ -11,6 +11,7 @@ import type { Page } from "playwright-core";
 import type { ApplyJobRunContext } from "./apply-job-runner.js";
 import { SUBMISSION_START_OBSERVATION_TIMEOUT_MS } from "./apply-job-finalization.js";
 import { createApplicationSubmissionRouteHandler } from "./application-submission-route-gate.js";
+import { createSubmissionRouteObservation } from "./application-submission-route-observation.js";
 import { runApplyBrowserStrategy, runApplySubmitStrategy } from "./apply-browser-strategy.js";
 import { persistApplyJobOutcome } from "./apply-job-outcomes.js";
 
@@ -102,6 +103,7 @@ export async function runApplyBrowserSession(context: ApplyJobRunContext): Promi
           if (state.queueCatchStarted || state.stopController.signal.aborted || state.turnStopped || state.submissionFenceUnavailable) return false;
           if (!state.approvedTurnScope) return true;
           if (state.armedSubmissionIntent || state.submissionCandidateSeen || state.submissionRequestStarted) return false;
+          let routeObservation: ReturnType<typeof createSubmissionRouteObservation> | null = null;
           try {
             const serviceWorkerControlsPage = await page.evaluate(() => Boolean(navigator.serviceWorker?.controller));
             if (serviceWorkerControlsPage) {
@@ -115,8 +117,13 @@ export async function runApplyBrowserSession(context: ApplyJobRunContext): Promi
             const routeHandler = createApplicationSubmissionRouteHandler(
               context, page, requestIntent, submissionFrame, pagesPresentWhenArmed,
             );
+            routeObservation = createSubmissionRouteObservation(state.stopController.signal);
+            state.submissionRouteState.observation = routeObservation;
             await submissionContext.route(routeMatcher, routeHandler);
-            state.submissionRouteState.cleanup = async () => { await submissionContext.unroute(routeMatcher, routeHandler); };
+            state.submissionRouteState.cleanup = async () => {
+              routeObservation?.dispose();
+              await submissionContext.unroute(routeMatcher, routeHandler);
+            };
             state.armedSubmissionIntent = requestIntent;
             state.submissionFenceTimer = setTimeout(() => {
               if (!state.armedSubmissionIntent || state.submissionCandidateSeen || state.submissionRequestStarted) return;
@@ -124,16 +131,19 @@ export async function runApplyBrowserSession(context: ApplyJobRunContext): Promi
               if (!state.stopController.signal.aborted) {
                 state.stopController.abort(new Error("The approved submission request did not start after the final approval gate."));
               }
-              void context.lifecycle!.closeActivePage();
+              void context.lifecycle!.closeActivePage().catch(() => undefined);
+              routeObservation?.close();
             }, SUBMISSION_START_OBSERVATION_TIMEOUT_MS);
             state.submissionFenceTimer.unref?.();
             if (state.stopController.signal.aborted || state.turnStopped) {
               state.armedSubmissionIntent = null;
+              routeObservation?.close();
               await context.lifecycle!.closeActivePage();
               return false;
             }
             return true;
           } catch (error: unknown) {
+            routeObservation?.dispose();
             state.submissionFenceUnavailable = true;
             console.warn("[apply-worker] Could not arm exact submission request gate:", error instanceof Error ? error.message : String(error));
             return false;
@@ -141,8 +151,8 @@ export async function runApplyBrowserSession(context: ApplyJobRunContext): Promi
         },
       } : {}),
     };
-    const runBrowserFlow = (typedSubmitGuard?: (intent?: SubmissionRequestIntent) => Promise<boolean>) =>
-      runApplyBrowserStrategy(context, page, applyTask, challengeAllowsAction, typedSubmitGuard);
+    const runBrowserFlow = (typedSubmitGuard?: (intent?: SubmissionRequestIntent) => Promise<boolean>, reviewedCoverLetter?: string) =>
+      runApplyBrowserStrategy(context, page, applyTask, challengeAllowsAction, typedSubmitGuard, reviewedCoverLetter);
     const harnessResult = await runApplySubmitStrategy(context, page, runBrowserFlow);
     if (state.queueCatchStarted || state.submissionSuperseded) return;
     await persistApplyJobOutcome(context, page, harnessResult);

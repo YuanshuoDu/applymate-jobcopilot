@@ -14,7 +14,7 @@ import { readReviewedApplicationFillCompletionMaterial, type ReviewedApplication
 import { isFillWaitDetail, writeApplicationFillWaitWithClient, type FillWaitCheckpoint } from "./application-task-fill-wait.js"
 
 type TurnRow = { id: string; status: string; revision: number; input: unknown }
-type ApplicationRow = { id: string; userId: string; sessionId: string | null; jobId: string; fillTurnId: string | null; fillTurnSessionId: string | null
+export type ApplicationRow = { id: string; userId: string; sessionId: string | null; jobId: string; fillTurnId: string | null; fillTurnSessionId: string | null
   fillTurnUserId: string | null; status: string; checkpoint: string | null; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown }
 type ExistingApprovalRow = { id: string; userId: string; sessionId: string; turnId: string | null; jobId: string | null; type: string; taskId: string | null; status: string
   toolCallId: string | null; payload: unknown; resourceHash: string | null; materialHash: string | null; answersHash: string | null; scopeHash: string | null; nonceHash: string | null; revision: number; expiresAt: Date | string | null }
@@ -106,7 +106,7 @@ function approvalResourceHash(value: string): string | undefined {
   return match?.[0] === value ? match[1] : undefined
 }
 
-async function existingCompletion(client: Client, lease: SubagentLease, task: ApplicationRow, turn: TurnRow, approvedOnly = false, reviewed?: ReviewedApplicationSubmissionMaterial): Promise<boolean> {
+export async function verifyExistingApplicationFillCompletion(client: Client, lease: Pick<SubagentLease, "turnId" | "userId" | "sessionId">, task: ApplicationRow, turn: Pick<TurnRow, "revision">, approvedOnly = false, reviewed?: ReviewedApplicationSubmissionMaterial, expectedApprovalRevision?: number): Promise<boolean> {
   const payload = submissionPayload(task), turnId = lease.turnId
   if (!turnId) return false
   const answersHash = await hashAgentReceiptValue("answers", task.confirmedAnswers ?? null)
@@ -137,7 +137,8 @@ async function existingCompletion(client: Client, lease: SubagentLease, task: Ap
     || approval.jobId !== task.jobId || approval.taskId !== task.id || approval.type !== "submit_application"
     || approval.toolCallId !== `application-submit:${task.id}` || approval.resourceHash !== resourceHash
     || approval.materialHash !== materialHash || approval.answersHash !== answersHash || !exactSubmissionPayload(approval.payload, payload)
-    || !Number.isSafeInteger(approval.revision) || approval.revision + 1 !== turn.revision) return false
+    || !Number.isSafeInteger(approval.revision) || (expectedApprovalRevision === undefined
+      ? approval.revision + 1 !== turn.revision : approval.revision !== expectedApprovalRevision)) return false
   const scope: ApprovalScopeInput = { userId: approval.userId, sessionId: approval.sessionId, turnId, jobId: task.jobId,
     toolCallId: `application-submit:${task.id}`, action: "submit_application", resourceHash, materialHash, answersHash, revision: approval.revision, expiresAt }
   return await hashApprovalScope(protocolScope(scope, approval.nonceHash)) === approval.scopeHash
@@ -170,7 +171,7 @@ export async function completeApplicationFillForReview(pool: Pool, input: { read
         ? writeStaleReviewWait(client, lease, task.id, turn.revision, now) : { status: "conflict" }
     }
     if (replay) return turn.status === "waiting_for_approval"
-      ? { status: await existingCompletion(client, lease, task, turn, authorizedForSubmission || queueRetry, reviewed) ? "completed" : "conflict" } : { status: "conflict" }
+      ? { status: await verifyExistingApplicationFillCompletion(client, lease, task, turn, authorizedForSubmission || queueRetry, reviewed) ? "completed" : "conflict" } : { status: "conflict" }
     if (task.status !== "filling" || task.checkpoint !== "browser_active" || !["in_progress", "waiting_for_dependency", "queued"].includes(turn.status)) return { status: "conflict" }
     const transitioned = await client.query(`UPDATE "application_tasks" SET "status" = 'waiting_for_authorization', "checkpoint" = 'form_filled', "error" = NULL, "question" = NULL, "updatedAt" = $4 WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "status" = 'filling' AND "checkpoint" = 'browser_active' RETURNING "id"`, [task.id, lease.userId, lease.sessionId, now])
     if (transitioned.rowCount !== 1) return { status: "conflict" }

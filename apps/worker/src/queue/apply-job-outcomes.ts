@@ -2,11 +2,13 @@ import { getPool, insertApplyResult, type InsertApplyResult } from "../db/apply-
 import * as legacyFillOutcomes from "./legacy-apply-outcomes.js";
 import {
   finishApplicationTask,
+  isConfirmedApplicationTaskFinish,
   CAPTCHA_USER_TAKEOVER_MESSAGE,
   CHALLENGE_DETECTION_FAILED_MESSAGE,
   needsUserTakeover,
   USER_TAKEOVER_CHECKPOINT,
 } from "../db/application-task-state.js";
+import { finalizeStoppedApplicationSubmission } from "../db/application-submission-stop-finalization.js";
 import { updateJobForSubmission, UNCONFIRMED_SUBMISSION_MESSAGE } from "../db/submission-guard.js";
 import { createNotification } from "../notifications/create-notification.js";
 import { notifyApplyResult } from "../notifications/notify-apply-result.js";
@@ -62,15 +64,37 @@ export async function persistApplyJobOutcome(
   const submissionUncertain = state.submissionRequestStarted && harnessResult.status !== "submitted";
   if (submissionUncertain) {
     if (!state.applicationTaskFinalized) {
-      if (await finishApplicationTask(
+      const taskWrite = await finishApplicationTask(
         getPool(), applicationTaskId, "waiting_for_user", "submission_uncertain",
         harnessResult.error ?? UNCONFIRMED_SUBMISSION_MESSAGE, "submit", submissionIdentity!,
-      ) === "superseded") { state.submissionSuperseded = true; return; }
+      );
+      if (taskWrite === "superseded") { state.submissionSuperseded = true; return; }
+      if (!isConfirmedApplicationTaskFinish(taskWrite)) throw new Error("Could not confirm the uncertain application task state.");
       state.applicationTaskFinalized = true;
     }
     await context.lifecycle?.closeActiveSubmissionContext();
   }
   if (state.queueCatchStarted || state.submissionSuperseded) return;
+
+  const scope = state.approvedTurnScope;
+  const mayFinalizeStoppedAttempt = context.stagedSubmissionStopProtocol !== undefined
+    && operation === "submit" && submissionIdentity !== null && scope !== null
+    && scope.applicationTaskId === applicationTaskId && scope.userId === userId && scope.jobId === jobId
+    && scope.sessionId === submissionIdentity.sessionId && scope.fillTurnId === submissionIdentity.fillTurnId
+    && scope.turnId === scope.fillTurnId && scope.approvalId === submissionIdentity.approvalId
+    && scope.constraintHash === submissionIdentity.constraintHash
+    && scope.workerTaskId === context.workerTaskId && scope.executionId === context.executionId
+    && state.submissionClaimed && state.turnStopped && state.submissionCandidateSeen
+    && state.submissionExecutionStartAttempted && !state.submissionRequestStarted
+    && !state.submissionAcknowledgementUncertain && !state.submissionFenceUnavailable
+    && !state.submissionTaskInactive && !state.applicationTaskFinalized
+    && !state.queueCatchStarted && !state.submissionSuperseded && harnessResult.status !== "submitted";
+  if (mayFinalizeStoppedAttempt && scope) {
+    const finalized = await finalizeStoppedApplicationSubmission(getPool(), scope);
+    if (finalized === "superseded") { state.submissionSuperseded = true; return; }
+    if (finalized === "already_finalized") { state.applicationTaskFinalized = true; return; }
+    if (finalized === "finalized") state.applicationTaskFinalized = true;
+  }
 
   if (operation === "fill") {
     const outcome = await legacyFillOutcomes.persistLegacyFillHarnessOutcome({
@@ -146,6 +170,7 @@ export async function persistApplyJobOutcome(
       harnessResult.error ?? null, operation === "submit" ? "submit" : "fill", submissionIdentity ?? undefined,
     );
     if (taskWrite === "superseded") { state.submissionSuperseded = true; return; }
+    if (!isConfirmedApplicationTaskFinish(taskWrite)) throw new Error("Could not confirm the final application task state.");
     state.applicationTaskFinalized = true;
   }
 }
@@ -180,12 +205,13 @@ export async function handOffUnavailableUnattendedTask(params: {
   if (resultId === null) return false;
   const jobWrite = await updateJobForSubmission(getPool(), identity, { status: "saved", workflowState: "ready_to_apply" }, "handoff_unavailable_submit");
   if (jobWrite.kind === "superseded") return false;
-  if (await finishApplicationTask(
+  const taskWrite = await finishApplicationTask(
     getPool(), params.applicationTaskId,
     params.operation === "submit" ? "waiting_for_authorization" : "waiting_for_user",
     params.operation === "submit" ? "form_filled" : "materials_ready",
     UNATTENDED_APPLY_UNAVAILABLE_MESSAGE, params.operation, identity,
-  ) === "superseded") return false;
+  );
+  if (!isConfirmedApplicationTaskFinish(taskWrite)) return false;
   createApplyResultNotification({
     userId: params.userId, jobId: params.jobId, jobTitle: params.jobTitle,
     jobCompany: params.jobCompany, status: "manual",

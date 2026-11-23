@@ -3,6 +3,10 @@ import type { HarnessResult } from "../../harness/agent-harness.js"
 import type { SubmissionRequestIntent } from "../../flows/submission-intent.js"
 
 export type BrowserSubmitRunner = (beforeSubmit: (intent?: SubmissionRequestIntent) => Promise<boolean>) => Promise<HarnessResult>
+export type ReviewedBrowserSubmitRunner = (input: Readonly<{
+  beforeSubmit: (intent?: SubmissionRequestIntent) => Promise<boolean>
+  reviewedCoverLetter: string
+}>) => Promise<HarnessResult>
 
 export class BrowserApplicationSubmitError extends Error {
   readonly provider = "browser"
@@ -24,12 +28,19 @@ export class BrowserApplicationSubmitError extends Error {
 /** Adapts the existing ATS/browser execution to the typed external-write port. */
 export function createBrowserApplicationSubmitProvider(input: {
   readonly run: BrowserSubmitRunner
+  readonly runReviewed?: ReviewedBrowserSubmitRunner
   readonly confirmationId: string
   readonly postSubmitUrl: () => string
 }): ApplicationSubmitProvider {
-  return async ({ beforeSubmit }) => {
-    const result = await input.run(beforeSubmit)
+  const provider: ApplicationSubmitProvider = async ({ beforeSubmit, reviewedCoverLetter }) => {
+    const result = reviewedCoverLetter !== undefined
+      ? input.runReviewed
+        ? await input.runReviewed({ beforeSubmit, reviewedCoverLetter })
+        : { status: "manual" as const, error: "Reviewed application material is unsupported by this browser path.", durationMs: 0, log: [] }
+      : await input.run(beforeSubmit)
     if (result.status !== "submitted") throw new BrowserApplicationSubmitError(result)
     return { confirmationId: input.confirmationId, postSubmitUrl: input.postSubmitUrl() }
   }
+  if (input.runReviewed) Object.assign(provider, { acceptsReviewedApplicationMaterial: true as const })
+  return provider
 }

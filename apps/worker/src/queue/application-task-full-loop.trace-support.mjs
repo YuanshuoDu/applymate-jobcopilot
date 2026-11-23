@@ -1,5 +1,87 @@
 let nextExecutorInvocationOrdinal = 0
 
+const STAGE8_MACHINE_CODES = new Set([
+  "cognitive_agenda_resume_fence_invalid", "turn_not_owned", "archived_wait_accounting_invalid",
+  "child_wait_claim_recovery_owner_mismatch", "child_resume_wait_tool_call_conflict",
+  "persistence_conflict", "turn_execution_error", "application_fill_material_unavailable",
+  "application_fill_state_invalid", "application_fill_binding_invalid", "lease_lost",
+])
+const STAGE8_SQLSTATES = new Set(["08000", "08001", "08003", "08006", "23502", "23503", "23505", "23514", "40001", "40P01", "55P03", "57P01", "57P03"])
+const STAGE8_REPO_FILES = new Map([
+  ["canonical-turn-runtime.ts", "canonical_turn_runtime"],
+  ["canonical-turn-runtime-model.ts", "canonical_turn_model"],
+  ["canonical-turn-runtime-turn-setup.ts", "canonical_turn_setup"],
+  ["canonical-turn-durable-wait-control.ts", "durable_wait"],
+  ["durable-wait-control.ts", "durable_wait"],
+  ["turn-execution-child-wait-recovery.ts", "durable_wait"],
+  ["durable-wait-resolver.ts", "durable_wait"],
+  ["durable-wait-control-reader.ts", "durable_wait"],
+  ["durable-wait-consumer.ts", "durable_wait"],
+  ["durable-child-wait-replay.ts", "durable_wait"],
+  ["durable-wait-store.ts", "durable_wait"],
+  ["agent-run-turn-executor.ts", "turn_queue"],
+  ["agent-run-queue.ts", "turn_queue"],
+  ["production-worker-runtime.ts", "worker_runtime"],
+])
+
+function stage8RepoStage(stack) {
+  if (typeof stack !== "string") return "other"
+  for (const frame of stack.split("\n").slice(1, 41)) {
+    const parenthesized = /^\s*at .+ \((.+):\d+:\d+\)$/.exec(frame)
+    const bare = /^\s*at ((?:file:\/\/)?[^\s]+):\d+:\d+$/.exec(frame)
+    const path = parenthesized?.[1] ?? bare?.[1]
+    if (!path) continue
+    const file = path.split(/[\\/]/).at(-1)
+    const stage = STAGE8_REPO_FILES.get(file)
+    if (stage) return stage
+  }
+  return "other"
+}
+
+export function classifyStage8ExecutionFailure(error) {
+  const isError = error instanceof Error
+  const message = isError && typeof error.message === "string" ? error.message : null
+  const code = isError && typeof error.code === "string" ? error.code : null
+  const machineCode = [message, code].find(value => value !== null && STAGE8_MACHINE_CODES.has(value))
+  const sqlValue = isError && typeof error.sqlState === "string" ? error.sqlState : code
+  const sqlState = sqlValue === null || sqlValue === undefined ? "none" : STAGE8_SQLSTATES.has(sqlValue) ? sqlValue : "other"
+  const errorKinds = new Map([["Error", "error"], ["TypeError", "type_error"], ["RangeError", "range_error"],
+    ["SyntaxError", "syntax_error"], ["ReferenceError", "reference_error"], ["AggregateError", "aggregate_error"]])
+  const errorKind = machineCode ? "known_code" : sqlState !== "none" && sqlState !== "other" ? "postgres"
+    : isError ? errorKinds.get(error.name) ?? "other" : "non_error"
+  return {
+    errorKind,
+    machineCode: machineCode ?? (message !== null || code !== null ? "other" : "none"),
+    repoStage: stage8RepoStage(isError ? error.stack : null),
+    sqlState,
+  }
+}
+
+export function createStage8ExecutionFailureDiagnostics(writeLine, input = process.stdin) {
+  let target = null
+  let buffer = ""
+  input.setEncoding("utf8")
+  input.on("data", chunk => {
+    buffer += String(chunk)
+    if (buffer.length > 1_024) buffer = buffer.slice(-1_024)
+    const lines = buffer.split("\n")
+    buffer = lines.pop() ?? ""
+    for (const line of lines) {
+      const match = /^stage8-failure-target ([^\s]{1,256}) ([^\s]{1,256})$/.exec(line.trim())
+      if (!match || target) continue
+      target = { sessionId: match[1], turnId: match[2] }
+      writeLine("STAGE8_FAILURE_TARGET_ARMED")
+    }
+  })
+  return {
+    record(job, error) {
+      if (!target || job?.data?.sessionId !== target.sessionId || job?.data?.turnId !== target.turnId) return false
+      writeLine(`STAGE8_TURN_EXECUTION_FAILURE ${JSON.stringify(classifyStage8ExecutionFailure(error))}`)
+      return true
+    },
+  }
+}
+
 export function traceApplicationFillExecutor(executor) {
   if (!executor) return undefined
   return async input => {
