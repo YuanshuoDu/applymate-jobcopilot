@@ -21,6 +21,8 @@ import { verifyCandidateFinal } from "./verifier.js"
 import { toRepositoryJson } from "./turns/turn-engine-types.js"
 import { readCanonicalApprovedApplicationSubmitResumeProof, sameCanonicalApprovedApplicationSubmitResumeProof,
   type CanonicalApprovedApplicationSubmitResumeProof } from "./canonical-approved-application-submit-resume-proof.js"
+import { approvedFillTerminalClaimRequeue, getApprovedFillTerminalClaim } from "./turns/approved-fill-terminal-claim.js"
+import { createApprovedFillResumeTerminalStepDescriptor } from "./turns/approved-fill-resume-terminal-step.js"
 
 type CurrentProof = Readonly<{ rootTaskId: string; proof: CanonicalApprovedApplicationSubmitResumeProof }>
 type StoreFactory = (pool: pg.Pool, guard?: TurnEngineTerminalGuard) => TurnEngineStore
@@ -72,6 +74,11 @@ export async function finishApprovedApplicationFillTurn(input: {
   readonly storeFactory?: StoreFactory
 }): Promise<TurnExecutionResult> {
   const { lease, rootTaskId, state, rootTasks } = input
+  const earlyClaim = getApprovedFillTerminalClaim(lease)
+  if (earlyClaim && (!sameCanonicalApprovedApplicationSubmitResumeProof(earlyClaim, input.proof)
+    || earlyClaim.state !== "form_filled" || earlyClaim.workerTaskId !== null || earlyClaim.outboxId !== null)) {
+    throw approvedFillTerminalClaimRequeue(lease)
+  }
   if (state.rootTaskId !== rootTaskId || state.source !== "user" || state.automationRunMode !== undefined
     || !rootTasks.checkCompletion) throw new Error("approved_application_fill_resume_scope_invalid")
   const owner = executionOwnerFence({ kind: "turn", taskId: rootTaskId, lease })
@@ -111,7 +118,10 @@ export async function finishApprovedApplicationFillTurn(input: {
       || terminal.finalItemId !== finalItemId || terminal.response !== response || terminal.stepCount !== stepCount
       || terminal.toolCallCount !== toolCallCount) return deny
     const current = await readCanonicalApprovedApplicationSubmitResumeProof(client, { lease, rootTaskId, now: input.now() })
-    if (!current || !sameCanonicalApprovedApplicationSubmitResumeProof(input.proof, current)) return deny
+    if (!current || !sameCanonicalApprovedApplicationSubmitResumeProof(earlyClaim ?? input.proof, current)) {
+      if (earlyClaim) throw approvedFillTerminalClaimRequeue(lease)
+      return deny
+    }
     const graph = await rootTasks.checkCompletion!({ lease, rootTaskId, now: input.now(), taskGraphVerification: true,
       nativeVerificationPassed: false, client: client as PoolClient, requireTaskGraph: true, terminalAdmission })
     if (!graph.ok) return graph
@@ -121,26 +131,32 @@ export async function finishApprovedApplicationFillTurn(input: {
   const store = (input.storeFactory ?? createPgTurnEngineStore)(input.pool, terminalGuard)
   await input.executionProjection.start(projectionScope)
   await input.sessionProjection.start(projectionScope)
-  const turnStarted = await store.appendEvent({ owner, id: `${eventId(lease.turnId, "turn-started")}:${randomUUID()}`, itemId: null, type: "turn.started",
+  const turnStarted = earlyClaim ? undefined : await store.appendEvent({ owner, id: `${eventId(lease.turnId, "turn-started")}:${randomUUID()}`, itemId: null, type: "turn.started",
     correlationId: lease.turnId, causationId: null, idempotencyKey: `turn:${lease.turnId}:event:turn-started`,
     payload: { goal: state.goal, taskId: rootTaskId, rootTaskId } })
   if (input.signal.aborted) return interruptedResult(input, rootTaskId, stepCount, toolCallCount)
-  const step = await store.startStep({ owner, stepId, ordinal, attempt: 1, inputThroughSequence: resume.inputThroughSequence,
-    consumedInputIds: [], modelProfileSnapshot: state.modelProfileSnapshot as RepositoryJsonValue, now: input.now() })
-  if (step.ordinal !== ordinal) throw new Error("approved_application_fill_resume_step_conflict")
-  const started = await store.appendEvent({ owner, id: eventId(lease.turnId, `step-started:${stepId}`), itemId: null,
-    type: "step.started", correlationId: stepId, causationId: turnStarted.id,
-    idempotencyKey: `turn:${lease.turnId}:event:step-started:${stepId}`,
-    payload: { stepId, ordinal, taskId: rootTaskId } })
-  await store.updateStep({ owner, stepId, status: "completed", finishReason: "stop", errorCode: null,
-    inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now: input.now() })
-  await store.appendEvent({ owner, id: eventId(lease.turnId, `step-completed:${stepId}`), itemId: null,
-    type: "step.completed", correlationId: stepId, causationId: started.id,
-    idempotencyKey: `turn:${lease.turnId}:event:step-completed:${stepId}`,
-    payload: { stepId, status: "completed", taskId: rootTaskId } })
+  const terminalDescriptor = earlyClaim ? createApprovedFillResumeTerminalStepDescriptor({ proof: earlyClaim, lease, rootTaskId,
+    ordinal, inputThroughSequence: resume.inputThroughSequence, consumedInputIds: [],
+    modelProfileSnapshot: toRepositoryJson(state.modelProfileSnapshot), stepCount, toolCallCount }) : undefined
+  if (!earlyClaim) {
+    const step = await store.startStep({ owner, stepId, ordinal, attempt: 1, inputThroughSequence: resume.inputThroughSequence,
+      consumedInputIds: [], modelProfileSnapshot: state.modelProfileSnapshot as RepositoryJsonValue, now: input.now() })
+    if (step.ordinal !== ordinal) throw new Error("approved_application_fill_resume_step_conflict")
+    const started = await store.appendEvent({ owner, id: eventId(lease.turnId, `step-started:${stepId}`), itemId: null,
+      type: "step.started", correlationId: stepId, causationId: turnStarted!.id,
+      idempotencyKey: `turn:${lease.turnId}:event:step-started:${stepId}`,
+      payload: { stepId, ordinal, taskId: rootTaskId } })
+    await store.updateStep({ owner, stepId, status: "completed", finishReason: "stop", errorCode: null,
+      inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now: input.now() })
+    await store.appendEvent({ owner, id: eventId(lease.turnId, `step-completed:${stepId}`), itemId: null,
+      type: "step.completed", correlationId: stepId, causationId: started.id,
+      idempotencyKey: `turn:${lease.turnId}:event:step-completed:${stepId}`,
+      payload: { stepId, status: "completed", taskId: rootTaskId } })
+  }
   if (input.signal.aborted) return interruptedResult(input, rootTaskId, stepCount, toolCallCount)
   const terminal = await store.recordFinalResponse({ owner, response, now: input.now(), terminal: {
-    stepId, finalItemId, finalContent, stepCount, toolCallCount, usage, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding,
+    stepId, finalItemId, finalContent, stepCount, toolCallCount, usage, ...(terminalDescriptor ? { approvedFillResumeTerminalStep: terminalDescriptor } : {}),
+    [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding,
   } })
   if (!terminal || terminal.status !== "completed" || terminal.finalItemId !== finalItemId) {
     throw new Error("approved_application_fill_resume_terminal_receipt_missing")

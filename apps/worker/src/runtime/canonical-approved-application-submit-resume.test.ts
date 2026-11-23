@@ -12,11 +12,15 @@ import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } f
 import { reduceTaskGraphFinalSummary } from "./subagents/task-graph-final-summary.js"
 import { taskGraphItemId } from "./subagents/task-graph-snapshot.js"
 
-const { readProof } = vi.hoisted(() => ({ readProof: vi.fn() }))
+const { readProof, getTerminalClaim, requeueFactory } = vi.hoisted(() => ({ readProof: vi.fn(), getTerminalClaim: vi.fn(), requeueFactory: vi.fn() }))
 vi.mock("./canonical-approved-application-submit-resume-proof.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./canonical-approved-application-submit-resume-proof.js")>()
   return { ...actual, readCanonicalApprovedApplicationSubmitResumeProof: readProof }
 })
+vi.mock("./turns/approved-fill-terminal-claim.js", () => ({
+  getApprovedFillTerminalClaim: getTerminalClaim,
+  approvedFillTerminalClaimRequeue: requeueFactory,
+}))
 
 const lease: TurnLease = { turnId: "fill-turn", sessionId: "session-1", userId: "user-1", ownerId: "worker-1", leaseVersion: 3,
   leaseStartedAt: new Date("2026-11-22T10:00:00Z"), leaseExpiresAt: new Date("2026-11-22T10:05:00Z") }
@@ -47,7 +51,10 @@ const graphBinding = (): TaskGraphFinalSummaryBinding => ({
 })
 
 describe("approved application fill Turn resume", () => {
-  beforeEach(() => readProof.mockReset())
+  beforeEach(() => {
+    readProof.mockReset(); getTerminalClaim.mockReset()
+    requeueFactory.mockReset().mockImplementation(() => Object.assign(new Error("approved_application_fill_resume_proof_changed"), { name: "ApprovedFillTerminalClaimRequeue" }))
+  })
 
   it("reads the exact active root and proof in one tenant-scoped read transaction", async () => {
     const client = { query: vi.fn(async (sql: string) => sql.includes('SELECT turn."rootTaskId"')
@@ -88,6 +95,7 @@ describe("approved application fill Turn resume", () => {
     const execution = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) } as unknown as CanonicalExecutionProjection
     const session = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) } as unknown as CanonicalSessionProjection
     const filled = proof("form_filled")
+    getTerminalClaim.mockReturnValue(filled)
     readProof.mockResolvedValue(proof("submission_authorized"))
 
     const result = await finishApprovedApplicationFillTurn({ pool: {} as pg.Pool, lease, state: turnState(), rootTaskId: "root-fill",
@@ -103,12 +111,10 @@ describe("approved application fill Turn resume", () => {
     expect((finalizationGuardCalls[0] as { result: unknown }).result).toEqual({ ok: true })
     expect(rootTasks.finish).toHaveBeenCalledWith(expect.objectContaining({ rootTaskId: "root-fill",
       result: expect.objectContaining({ status: "completed", stepCount: 3, toolCallCount: 1 }) }))
-    const started = appended.find(event => event.type === "turn.started")
-    expect(started).toMatchObject({ id: expect.stringMatching(/^turn:fill-turn:event:turn-started:[0-9a-f-]{36}$/),
-      itemId: null, correlationId: lease.turnId, causationId: null, idempotencyKey: `turn:${lease.turnId}:event:turn-started`,
-      payload: { goal: turnState().goal, taskId: "root-fill", rootTaskId: "root-fill" } })
-    expect(startedOrdinals).toEqual([2])
-    expect(appended.find(event => event.type === "step.started")?.causationId).toBe(started?.id)
+    expect(appended.some(event => event.type === "turn.started" || event.type === "step.started" || event.type === "step.completed")).toBe(false)
+    expect(startedOrdinals).toEqual([])
+    expect(appended).toEqual([])
+    expect((finalizationGuardCalls[0] as { terminal: { approvedFillResumeTerminalStep?: unknown } }).terminal.approvedFillResumeTerminalStep).toBeDefined()
     const finalResponse = JSON.parse(String((finalizationGuardCalls[0] as { terminal: { response: string } }).terminal.response)) as { response: string }
     expect(finalResponse.response).toContain("do not confirm that an application was submitted")
     expect((finalizationGuardCalls[0] as { terminal: { [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: TaskGraphFinalSummaryBinding } })
@@ -117,6 +123,35 @@ describe("approved application fill Turn resume", () => {
     expect(execution.start).toHaveBeenCalledOnce()
     expect(execution.finish).toHaveBeenCalledWith(expect.objectContaining({ result: { status: "completed" } }))
     expect(session.finish).toHaveBeenCalledWith(expect.objectContaining({ result: { status: "completed" } }))
+  })
+
+  it("keeps the classic after-intent continuation on the ordinary running-only Step path", async () => {
+    const client = { query: vi.fn(async () => ({ rows: [], rowCount: 1 })) }
+    const completion = { ok: true as const, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: graphBinding() }
+    const appended: Parameters<TurnEngineStore["appendEvent"]>[0][] = []
+    const startStep = vi.fn(async (input: { stepId: string; ordinal: number }) => ({ id: input.stepId, ordinal: input.ordinal }))
+    const storeFactory = (_pool: pg.Pool, guard?: NonNullable<Parameters<typeof import("./turns/turn-engine-store.js").createPgTurnEngineStore>[1]>) => ({
+      appendEvent: vi.fn(async (event: Parameters<TurnEngineStore["appendEvent"]>[0]) => { appended.push(event); return { id: event.id } }),
+      startStep, updateStep: vi.fn(async () => undefined),
+      recordFinalResponse: vi.fn(async input => {
+        const terminal = { ...input.terminal!, owner: input.owner, response: input.response, now: input.now }
+        const decision = await guard!(client as never, terminal as never, undefined)
+        return decision.ok ? { status: "completed" as const, finalItemId: terminal.finalItemId, events: [] } : undefined
+      }),
+    } as unknown as TurnEngineStore)
+    const rootTasks = { checkCompletion: vi.fn(async () => completion), finish: vi.fn(async () => undefined) } as unknown as RootTaskStore
+    const approved = proof("submission_authorized")
+    getTerminalClaim.mockReturnValue(undefined)
+    readProof.mockResolvedValue(approved)
+
+    await expect(finishApprovedApplicationFillTurn({ pool: {} as pg.Pool, lease, state: turnState(), rootTaskId: "root-fill", proof: approved,
+      signal: new AbortController().signal, rootTasks, executionProjection: { start: vi.fn(), finish: vi.fn() } as unknown as CanonicalExecutionProjection,
+      sessionProjection: { start: vi.fn(), finish: vi.fn() } as unknown as CanonicalSessionProjection, now, storeFactory: storeFactory as never,
+    })).resolves.toMatchObject({ status: "completed" })
+
+    expect(startStep).toHaveBeenCalledOnce()
+    expect(startStep).toHaveBeenCalledWith(expect.objectContaining({ consumedInputIds: [] }))
+    expect(appended.map(event => event.type)).toEqual(["turn.started", "step.started", "step.completed"])
   })
 
   it("denies a changed witness before the terminal receipt and root completion", async () => {
@@ -139,6 +174,32 @@ describe("approved application fill Turn resume", () => {
       sessionProjection: { start: vi.fn(), finish: vi.fn() } as unknown as CanonicalSessionProjection, now, storeFactory: storeFactory as never,
     })).rejects.toThrow("approved_application_fill_resume_terminal_receipt_missing")
     expect(rootTasks.checkCompletion).toHaveBeenCalledOnce()
+    expect(rootTasks.finish).not.toHaveBeenCalled()
+  })
+
+  it("requeues a fresh early claim when terminal revalidation loses its exact proof", async () => {
+    const client = { query: vi.fn(async () => ({ rows: [], rowCount: 1 })) }
+    const completion = { ok: true as const, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: graphBinding() }
+    const storeFactory = (_pool: pg.Pool, guard?: NonNullable<Parameters<typeof import("./turns/turn-engine-store.js").createPgTurnEngineStore>[1]>) => ({
+      appendEvent: vi.fn(async input => ({ id: input.id })), startStep: vi.fn(async input => ({ id: input.stepId, ordinal: input.ordinal })),
+      updateStep: vi.fn(async () => undefined), recordFinalResponse: vi.fn(async input => {
+        const terminal = { ...input.terminal!, owner: input.owner, response: input.response, now: input.now }
+        const decision = await guard!(client as never, terminal as never, undefined)
+        return decision.ok ? { status: "completed" as const, finalItemId: terminal.finalItemId, events: [] } : undefined
+      }),
+    } as unknown as TurnEngineStore)
+    const rootTasks = { checkCompletion: vi.fn(async () => completion), finish: vi.fn() } as unknown as RootTaskStore
+    const filled = proof("form_filled")
+    getTerminalClaim.mockReturnValue(filled)
+    readProof.mockResolvedValue(null)
+    const error = Object.assign(new Error("approved_application_fill_resume_proof_changed"), { name: "ApprovedFillTerminalClaimRequeue" })
+    requeueFactory.mockReturnValue(error)
+
+    await expect(finishApprovedApplicationFillTurn({ pool: {} as pg.Pool, lease, state: turnState(), rootTaskId: "root-fill", proof: filled,
+      signal: new AbortController().signal, rootTasks, executionProjection: { start: vi.fn(), finish: vi.fn() } as unknown as CanonicalExecutionProjection,
+      sessionProjection: { start: vi.fn(), finish: vi.fn() } as unknown as CanonicalSessionProjection, now, storeFactory: storeFactory as never,
+    })).rejects.toBe(error)
+    expect(requeueFactory).toHaveBeenCalledWith(lease)
     expect(rootTasks.finish).not.toHaveBeenCalled()
   })
 

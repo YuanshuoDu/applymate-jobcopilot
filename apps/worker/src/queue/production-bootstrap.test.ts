@@ -552,7 +552,8 @@ describe("production Worker bootstrap", () => {
 
   it("binds the canonical executor to the turn consumer and closes recovery before execution resources", async () => {
     const events: string[] = []
-    const canonical = runtime(events)
+    const approvedFillTerminalClaim = vi.fn(async () => null)
+    const canonical = { ...runtime(events), approvedFillTerminalClaim }
     let turnOptions: Parameters<typeof createTurnQueue>[0] | undefined
     const turnQueue = {
       queue: { add: vi.fn(), close: vi.fn(async () => { events.push("turn.queue.close") }) },
@@ -577,6 +578,7 @@ describe("production Worker bootstrap", () => {
     })
 
     expect(turnOptions?.execute).toBe(canonical.execute)
+    expect(turnOptions?.approvedFillTerminalClaim).toBe(approvedFillTerminalClaim)
     await turnOptions?.execute({ lease: {} as never, signal: new AbortController().signal })
     expect(events).toEqual(["execute"])
 

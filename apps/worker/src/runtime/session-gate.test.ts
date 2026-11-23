@@ -1,6 +1,12 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 
-import { assertSessionTerminalAdmission, assertSessionWorkAdmission, OPEN_SESSION, RUNNABLE_SESSION, SESSION_WORK_ADMISSION, SessionPauseRequestedError, isSessionPauseRequestedError, revokeSessionTerminalAdmissionsForClient, sessionTerminalAdmissionKindFor } from "./session-gate.js"
+const { getClaim, requeueClaim } = vi.hoisted(() => ({ getClaim: vi.fn(), requeueClaim: vi.fn() }))
+vi.mock("./turns/approved-fill-terminal-claim.js", () => ({ getApprovedFillTerminalClaim: getClaim, approvedFillTerminalClaimRequeue: requeueClaim }))
+
+beforeEach(() => { getClaim.mockReset(); requeueClaim.mockReset() })
+
+import { assertApprovedFillResumeTerminalAdmission, assertSessionTerminalAdmission, assertSessionWorkAdmission, OPEN_SESSION, RUNNABLE_SESSION, SESSION_WORK_ADMISSION, SessionPauseRequestedError, isSessionPauseRequestedError, revokeSessionTerminalAdmissionsForClient, sessionTerminalAdmissionKindFor } from "./session-gate.js"
+import { createApprovedFillResumeTerminalStepDescriptor } from "./turns/approved-fill-resume-terminal-step.js"
 
 describe("Worker session gates", () => {
   it("keeps runnable work fenced to open sessions", () => {
@@ -62,6 +68,96 @@ describe("Worker session gates", () => {
     expect(terminal).toContain(`filler."taskType" = 'application_fill_for_review' AND filler."status" = 'completed'`)
     expect(terminal).toContain(`pause_request."type" = 'session.pause_requested'`)
     expect(query.mock.calls[1]?.[1]).toEqual(["session-1", "user-1", "turn-1", "root-1"])
+  })
+
+  it("keeps the generic terminal gate from admitting the early form-filled Wait", async () => {
+    const query = vi.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [] }))
+    await expect(assertSessionTerminalAdmission({ query } as never, {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", source: "user", executionMode: "canonical_task_graph",
+    })).rejects.toBeInstanceOf(SessionPauseRequestedError)
+    expect(query.mock.calls[1]?.[0]).toContain(`fill_task."checkpoint" = 'submission_uncertain'`)
+    expect(query.mock.calls[1]?.[0]).not.toContain(`fill_task."checkpoint" = 'form_filled'`)
+  })
+
+  it("admits the early Fill terminal transaction only with its branded proof and exact task/child scope", async () => {
+    const lease = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", ownerId: "owner-1", leaseVersion: 2,
+      leaseStartedAt: new Date("2026-11-23T10:00:00Z"), leaseExpiresAt: new Date("2026-11-23T10:01:00Z") }
+    const proof = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", turnOwnerId: lease.ownerId,
+      turnLeaseVersion: lease.leaseVersion, turnRevision: 4, applicationTaskId: "application-1", jobId: "job-1", fillerTaskId: "filler-1",
+      graphRevision: 2, graphFingerprint: "graph", approvalId: "approval", waitItemId: "wait", approvalRevision: 3,
+      resourceHash: "a".repeat(64), materialHash: "b".repeat(64), answersHash: "c".repeat(64), state: "form_filled" as const,
+      workerTaskId: null, outboxId: null }
+    getClaim.mockReset().mockReturnValue(proof)
+    const descriptor = createApprovedFillResumeTerminalStepDescriptor({ proof, lease, rootTaskId: "root-1", ordinal: 1,
+      inputThroughSequence: 2n, consumedInputIds: [], modelProfileSnapshot: {}, stepCount: 2, toolCallCount: 0 })
+    const query = vi.fn(async (sql: string, _params?: unknown[]) => ({ rows: sql.includes('JOIN "application_tasks" AS fill_task') ? [{ id: "session-1" }]
+      : sql.includes('SELECT session."status"') ? [{ status: "waiting_for_user", noUnresolvedPause: true }] : [] }))
+    const client = { query } as never
+    const scope = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1",
+      source: "user", executionMode: "canonical_task_graph" }
+    const admission = await assertApprovedFillResumeTerminalAdmission(client, scope, descriptor)
+
+    expect(sessionTerminalAdmissionKindFor(admission, client, scope)).toBe("derived_fill")
+    expect(query).toHaveBeenCalledTimes(3)
+    const sql = query.mock.calls[2]?.[0] ?? ""
+    expect(sql).toContain(`fill_task."id" = $4`)
+    expect(sql).toContain(`fill_task."checkpoint" = 'form_filled'`)
+    expect(sql).toContain(`fill_task."checkpoint" = 'submission_authorized'`)
+    expect(sql).toContain(`filler."id" = $5 AND filler."rootTaskId" = $6 AND filler."parentTaskId" = $6`)
+    expect(sql).toContain(`filler."status" = 'completed'`)
+    expect(sql).toContain(`pause_request."type" = 'session.pause_requested'`)
+    expect(query.mock.calls[2]?.[1]).toEqual([lease.sessionId, lease.userId, lease.turnId, proof.applicationTaskId, proof.fillerTaskId, "root-1"])
+  })
+
+  it("requeues an exact early claim when the waiting Session has drifted Fill proof", async () => {
+    const lease = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", ownerId: "owner-1", leaseVersion: 2,
+      leaseStartedAt: new Date("2026-11-23T10:00:00Z"), leaseExpiresAt: new Date("2026-11-23T10:01:00Z") }
+    const proof = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", turnOwnerId: lease.ownerId,
+      turnLeaseVersion: lease.leaseVersion, turnRevision: 4, applicationTaskId: "application-1", jobId: "job-1", fillerTaskId: "filler-1",
+      graphRevision: 2, graphFingerprint: "graph", approvalId: "approval", waitItemId: "wait", approvalRevision: 3,
+      resourceHash: "a".repeat(64), materialHash: "b".repeat(64), answersHash: "c".repeat(64), state: "form_filled" as const,
+      workerTaskId: null, outboxId: null }
+    getClaim.mockReturnValue(proof)
+    const descriptor = createApprovedFillResumeTerminalStepDescriptor({ proof, lease, rootTaskId: "root-1", ordinal: 1,
+      inputThroughSequence: 2n, consumedInputIds: [], modelProfileSnapshot: {}, stepCount: 2, toolCallCount: 0 })
+    const requeue = new Error("requeue")
+    requeueClaim.mockReturnValue(requeue)
+    const query = vi.fn(async (sql: string) => ({ rows: sql.includes('SELECT session."status"')
+      ? [{ status: "waiting_for_user", noUnresolvedPause: true }] : [] }))
+    const scope = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1",
+      source: "user", executionMode: "canonical_task_graph" }
+
+    await expect(assertApprovedFillResumeTerminalAdmission({ query } as never, scope, descriptor)).rejects.toBe(requeue)
+    expect(requeueClaim).toHaveBeenCalledWith(lease)
+  })
+
+  it("keeps an explicit pause distinct from early-claim proof drift", async () => {
+    const lease = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", ownerId: "owner-1", leaseVersion: 2,
+      leaseStartedAt: new Date("2026-11-23T10:00:00Z"), leaseExpiresAt: new Date("2026-11-23T10:01:00Z") }
+    const proof = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", turnOwnerId: lease.ownerId,
+      turnLeaseVersion: lease.leaseVersion, turnRevision: 4, applicationTaskId: "application-1", jobId: "job-1", fillerTaskId: "filler-1",
+      graphRevision: 2, graphFingerprint: "graph", approvalId: "approval", waitItemId: "wait", approvalRevision: 3,
+      resourceHash: "a".repeat(64), materialHash: "b".repeat(64), answersHash: "c".repeat(64), state: "form_filled" as const,
+      workerTaskId: null, outboxId: null }
+    getClaim.mockReturnValue(proof)
+    const descriptor = createApprovedFillResumeTerminalStepDescriptor({ proof, lease, rootTaskId: "root-1", ordinal: 1,
+      inputThroughSequence: 2n, consumedInputIds: [], modelProfileSnapshot: {}, stepCount: 2, toolCallCount: 0 })
+    const query = vi.fn(async (sql: string) => ({ rows: sql.includes('SELECT session."status"')
+      ? [{ status: "waiting_for_user", noUnresolvedPause: false }] : [] }))
+    const scope = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1",
+      source: "user", executionMode: "canonical_task_graph" }
+
+    await expect(assertApprovedFillResumeTerminalAdmission({ query } as never, scope, descriptor)).rejects.toBeInstanceOf(SessionPauseRequestedError)
+    expect(requeueClaim).not.toHaveBeenCalled()
+  })
+
+  it("does not grant early Fill admission from a forged or foreign descriptor", async () => {
+    const query = vi.fn(async () => ({ rows: [{ id: "session-1" }] }))
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+      source: "user", executionMode: "canonical_task_graph" }
+    await expect(assertApprovedFillResumeTerminalAdmission({ query } as never, scope, {} as never))
+      .rejects.toBeInstanceOf(SessionPauseRequestedError)
+    expect(query).not.toHaveBeenCalled()
   })
 
   it("revokes terminal admission receipts when their transaction client is released", async () => {

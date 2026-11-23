@@ -885,6 +885,24 @@ async function routeCanonicalRootMutation(toolName: "agent.spawn" | "spawn_subag
 }
 
 describe("createCanonicalTurnRuntime", () => {
+  it("offers early approved-Fill admission only when the exact resume runtime is enabled", async () => {
+    const productionFlags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const enabled = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: lease.ownerId, productionFlags, taskGraphCommandPort: {} as TaskGraphCommandPort, rootTaskStore: rootStore() as never,
+    })
+    expect(enabled.approvedFillTerminalClaim).toBeTypeOf("function")
+    await enabled.close()
+
+    const disabled = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: lease.ownerId, productionFlags, taskGraphCommandPort: {} as TaskGraphCommandPort, rootTaskStore: rootStore() as never,
+      stateLoader: async () => state(),
+    })
+    expect(disabled.approvedFillTerminalClaim).toBeUndefined()
+    await disabled.close()
+  })
+
   it("routes reviewed-application review Turns before configured models and tool registries", async () => {
     const roots = rootStore(), events: RuntimeEvent[] = [], turnStore = store(events)
     const executionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }

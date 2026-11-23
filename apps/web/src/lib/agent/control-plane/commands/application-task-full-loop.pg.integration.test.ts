@@ -600,6 +600,38 @@ describe("reviewed source turn diagnostics", () => {
 })
 
 describe("Stage8 terminal diagnostics", () => {
+  it("summarizes exact wakeup and dispatch outbox state without exposing identities", () => {
+    const sessionId = "private-session-id", turnId = "private-turn-id", approvalId = "private-approval-id"
+    const eventId = "private-wakeup-event-id"
+    const waitItemId = `agent-wait:approval:${approvalId}`
+    const wakeup = {
+      aggregateId: sessionId, idempotencyKey: `agent-event:${eventId}`, publishedAt: new Date(), attemptCount: 1, lastError: null,
+      payload: { eventId, sessionId, turnId, itemId: waitItemId, taskId: null, sequence: "17", type: "turn.wakeup",
+        actor: "user", correlationId: turnId, causationId: "private-resolved-event-id",
+        idempotencyKey: "private-command-key:wakeup", payload: { waitKind: "approval", waitId: approvalId, itemId: waitItemId,
+          turnId, toolCallId: "private-tool-call-id", status: "approved", nextTurnRevision: 6, answerAvailable: false } },
+    }
+    const dispatch = { aggregateId: sessionId, idempotencyKey: `turn-dispatch:${turnId}`, publishedAt: new Date(),
+      attemptCount: 3, lastError: null, payload: { ownerId: `wakeup:${eventId}`, sessionId, turnId } }
+    const summary = stage8WakeDispatchSummary({ dispatchRows: [dispatch], wakeupRows: [wakeup],
+      expectedSessionId: sessionId, expectedTurnId: turnId, expectedApprovalId: approvalId })
+
+    expect(summary).toEqual({
+      dispatch: { rows: "one", payloadMatches: true, ownerKind: "wakeup_exact", ownerMatchesWakeup: true,
+        published: true, attempts: "multiple", lastError: "none" },
+      wakeup: { rows: "one", receiptMatches: true, published: true, lastError: "none" },
+    })
+    expect(JSON.stringify(summary)).not.toMatch(/private|session-id|turn-id|approval-id|event-id|tool-call|command-key/)
+
+    const changed = stage8WakeDispatchSummary({ dispatchRows: [{ ...dispatch,
+      payload: { ...dispatch.payload, ownerId: "private-foreign-owner", privateField: "private" }, lastError: "PRIVATE_DATABASE_DETAIL" }],
+      wakeupRows: [{ ...wakeup, lastError: "PRIVATE_DATABASE_DETAIL" }],
+      expectedSessionId: sessionId, expectedTurnId: turnId, expectedApprovalId: approvalId })
+    expect(changed).toMatchObject({ dispatch: { payloadMatches: false, ownerKind: "invalid", ownerMatchesWakeup: false, lastError: "other" },
+      wakeup: { receiptMatches: true, lastError: "other" } })
+    expect(JSON.stringify(changed)).not.toMatch(/private|PRIVATE_DATABASE_DETAIL|foreign-owner/)
+  })
+
   it("preserves only known post-Stop checkpoints", () => {
     expect(reviewedFillDiagnosticValue("submission_uncertain", REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS)).toBe("submission_uncertain")
     expect(reviewedFillDiagnosticValue("user_takeover", REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS)).toBe("user_takeover")
@@ -1732,7 +1764,7 @@ async function reviewedFillTimeoutSnapshot(input: {
   }
 }
 
-async function createReviewedSourceScenario(label: "positive" | "stale" | "stage8-stop-first" | "stage8-grant-first", description: string) {
+async function createReviewedSourceScenario(label: "positive" | "stale" | "stage8-stop-first" | "stage8-grant-first" | "stage8-early-wake", description: string) {
   const jobId = `full-loop-reviewed-job-${runId}-${label}`
   const sessionId = `full-loop-reviewed-session-${runId}-${label}`
   reviewedJobIds.push(jobId)
@@ -1786,6 +1818,14 @@ type Stage8PreparedScenario = {
   applicationTaskId: string
   submitApprovalId: string
 }
+
+async function stage8ModelAndToolCallEventIds(prepared: Pick<Stage8PreparedScenario, "sessionId" | "fillTurnId">): Promise<string[]> {
+  const events = await testDb.agentEvent.findMany({ where: { sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
+    type: { in: ["model.started", "tool_call.started", "tool_call.completed", "tool_call.failed"] } },
+    orderBy: [{ sequence: "asc" }, { id: "asc" }], select: { id: true, type: true } })
+  return events.map(event => `${event.type}:${event.id}`)
+}
+
 type Stage8FailureSnapshotScope = Pick<Stage8PreparedScenario,
   "jobId" | "sessionId" | "fillTurnId" | "applicationTaskId" | "submitApprovalId">
 
@@ -1924,8 +1964,19 @@ type Stage8FailureEvidence = Readonly<{
   steps: readonly { status: unknown; errorCode: unknown }[]
   tools: readonly { type: unknown; status: unknown; content: unknown }[]
   events: readonly { type: unknown }[]
+  dispatchRows?: readonly Stage8OutboxDiagnosticRow[]
+  wakeupOutboxRows?: readonly Stage8OutboxDiagnosticRow[]
   deadLetters: readonly unknown[]
   workerFailureLines: readonly string[]
+}>
+
+type Stage8OutboxDiagnosticRow = Readonly<{
+  aggregateId: unknown
+  idempotencyKey: unknown
+  payload: unknown
+  publishedAt: unknown
+  attemptCount: unknown
+  lastError: unknown
 }>
 
 function stage8FailureSummary(evidence: Stage8FailureEvidence) {
@@ -1972,10 +2023,95 @@ function stage8FailureSummary(evidence: Stage8FailureEvidence) {
       }
     }),
     events: Object.fromEntries(STAGE8_EVENT_TYPES.map(type => [type.replaceAll(".", "_"), eventTypes.has(type)])),
+    outbox: stage8WakeDispatchSummary({
+      dispatchRows: evidence.dispatchRows ?? [], wakeupRows: evidence.wakeupOutboxRows ?? [],
+      expectedSessionId: evidence.expectedSessionId, expectedTurnId: evidence.expectedTurnId,
+      expectedApprovalId: evidence.expectedApprovalId,
+    }),
     queueFailure: {
       deadLetters: stage8DeadLetterSummary(evidence.deadLetters, evidence.expectedSessionId, evidence.expectedTurnId),
       worker: { ...stage8WorkerFailureSummary(evidence.workerFailureLines, evidence.expectedTurnId),
         execution: stage8WorkerExecutionSummary(evidence.workerFailureLines) },
+    },
+  }
+}
+
+const STAGE8_OUTBOX_ERRORS = new Set([
+  "event_lineage_mismatch", "item_lineage_mismatch", "outbox_scope_mismatch", "processing_error",
+  "queue_add_failed", "schema_invalid_payload", "tool_lineage_mismatch", "turn_dispatch_lineage_mismatch",
+  "turn_revision_conflict", "wait_scope_mismatch",
+])
+
+function stage8OutboxError(value: unknown): string {
+  return value == null ? "none" : typeof value === "string" && STAGE8_OUTBOX_ERRORS.has(value) ? value : "other"
+}
+
+function stage8OutboxCount(rows: readonly unknown[]): "zero" | "one" | "multiple" {
+  return rows.length === 0 ? "zero" : rows.length === 1 ? "one" : "multiple"
+}
+
+function stage8OutboxAttempts(value: unknown): "zero" | "one" | "multiple" | "invalid" {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value === 0 ? "zero" : value === 1 ? "one" : "multiple" : "invalid"
+}
+
+function stage8WakeDispatchSummary(input: {
+  dispatchRows: readonly Stage8OutboxDiagnosticRow[]
+  wakeupRows: readonly Stage8OutboxDiagnosticRow[]
+  expectedSessionId: string
+  expectedTurnId: string
+  expectedApprovalId: string
+}) {
+  const wake = input.wakeupRows.length === 1 ? input.wakeupRows[0] : undefined
+  const wakeEnvelope = jsonRecord(wake?.payload)
+  const wakeEventId = typeof wakeEnvelope?.eventId === "string" ? wakeEnvelope.eventId : null
+  const wakePayload = jsonRecord(wakeEnvelope?.payload)
+  const expectedWaitId = `agent-wait:approval:${input.expectedApprovalId}`
+  const wakeReceiptMatches = !!wake && wake.aggregateId === input.expectedSessionId
+    && wake.idempotencyKey === `agent-event:${wakeEventId}`
+    && typeof wakeEventId === "string" && wakeEventId.length > 0
+    && JSON.stringify(Object.keys(wakeEnvelope ?? {}).sort()) === JSON.stringify([
+      "actor", "causationId", "correlationId", "eventId", "idempotencyKey", "itemId", "payload", "sequence", "sessionId", "taskId", "turnId", "type",
+    ].sort())
+    && wakeEnvelope?.sessionId === input.expectedSessionId && wakeEnvelope.turnId === input.expectedTurnId
+    && wakeEnvelope.itemId === expectedWaitId && wakeEnvelope.taskId === null && wakeEnvelope.type === "turn.wakeup"
+    && wakeEnvelope.actor === "user" && wakeEnvelope.correlationId === input.expectedTurnId
+    && typeof wakeEnvelope.sequence === "string" && /^[0-9]+$/.test(wakeEnvelope.sequence)
+    && !!wakePayload && JSON.stringify(Object.keys(wakePayload).sort()) === JSON.stringify([
+      "answerAvailable", "itemId", "nextTurnRevision", "status", "toolCallId", "turnId", "waitId", "waitKind",
+    ].sort())
+    && wakePayload.waitKind === "approval" && wakePayload.waitId === input.expectedApprovalId
+    && wakePayload.itemId === expectedWaitId && wakePayload.turnId === input.expectedTurnId
+    && wakePayload.status === "approved" && wakePayload.answerAvailable === false
+    && typeof wakePayload.toolCallId === "string" && wakePayload.toolCallId.length > 0
+    && typeof wakePayload.nextTurnRevision === "number" && Number.isSafeInteger(wakePayload.nextTurnRevision)
+    && wakePayload.nextTurnRevision > 0
+
+  const dispatch = input.dispatchRows.length === 1 ? input.dispatchRows[0] : undefined
+  const dispatchPayload = jsonRecord(dispatch?.payload)
+  const dispatchPayloadMatches = !!dispatch && dispatch.aggregateId === input.expectedSessionId
+    && dispatch.idempotencyKey === `turn-dispatch:${input.expectedTurnId}`
+    && !!dispatchPayload && JSON.stringify(Object.keys(dispatchPayload).sort()) === JSON.stringify(["ownerId", "sessionId", "turnId"])
+    && dispatchPayload.sessionId === input.expectedSessionId && dispatchPayload.turnId === input.expectedTurnId
+    && typeof dispatchPayload.ownerId === "string" && dispatchPayload.ownerId.length > 0
+  const ownerId = dispatchPayload?.ownerId
+  const ownerKind = !dispatchPayloadMatches ? "invalid" : ownerId === `wakeup:${wakeEventId}` ? "wakeup_exact"
+    : typeof ownerId === "string" && ownerId.startsWith("wakeup:") ? "wakeup_other"
+      : typeof ownerId === "string" && ownerId.startsWith("web:") ? "web"
+        : typeof ownerId === "string" && ownerId.startsWith("recovery-") ? "recovery" : "other"
+
+  return {
+    dispatch: {
+      rows: stage8OutboxCount(input.dispatchRows), payloadMatches: dispatchPayloadMatches,
+      ownerKind, ownerMatchesWakeup: wakeReceiptMatches && ownerId === `wakeup:${wakeEventId}`,
+      published: dispatch ? dispatch.publishedAt != null : null,
+      attempts: dispatch ? stage8OutboxAttempts(dispatch.attemptCount) : "invalid",
+      lastError: dispatch ? stage8OutboxError(dispatch.lastError) : "none",
+    },
+    wakeup: {
+      rows: stage8OutboxCount(input.wakeupRows), receiptMatches: wakeReceiptMatches,
+      published: wake ? wake.publishedAt != null : null,
+      lastError: wake ? stage8OutboxError(wake.lastError) : "none",
     },
   }
 }
@@ -1989,7 +2125,7 @@ async function stage8FillFailureSnapshot(prepared: Stage8FailureSnapshotScope, e
           id: prepared.fillTurnId, userId: ids.user, sessionId: prepared.sessionId, session: { userId: ids.user },
         }, select: { status: true, error: true, rootTaskId: true } }),
       ])
-      const [root, applicationTask, approval, wait, steps, tools, events, deadLetters] = await Promise.all([
+      const [root, applicationTask, approval, wait, steps, tools, events, dispatchRows, wakeupOutboxRows, deadLetters] = await Promise.all([
         typeof turn?.rootTaskId === "string" ? testDb.subAgentTask.findFirst({ where: {
           id: turn.rootTaskId, rootTaskId: turn.rootTaskId, sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
           parentTaskId: null, role: "orchestrator", taskType: "root", session: { userId: ids.user },
@@ -2015,11 +2151,20 @@ async function stage8FillFailureSnapshot(prepared: Stage8FailureSnapshotScope, e
         testDb.agentEvent.findMany({ where: {
           sessionId: prepared.sessionId, turnId: prepared.fillTurnId, type: { in: [...STAGE8_EVENT_TYPES] },
         }, orderBy: { sequence: "desc" }, take: 16, select: { type: true } }),
+        testDb.agentOutbox.findMany({ where: { aggregateId: prepared.sessionId, topic: "agent.turn.dispatch",
+          idempotencyKey: `turn-dispatch:${prepared.fillTurnId}` }, take: 2,
+          select: { aggregateId: true, idempotencyKey: true, payload: true, publishedAt: true, attemptCount: true, lastError: true } }),
+        testDb.agentOutbox.findMany({ where: { aggregateId: prepared.sessionId, topic: "agent.turn.wakeup", AND: [
+          { payload: { path: ["turnId"], equals: prepared.fillTurnId } },
+          { payload: { path: ["itemId"], equals: `agent-wait:approval:${prepared.submitApprovalId}` } },
+        ] }, orderBy: { createdAt: "desc" }, take: 2,
+        select: { aggregateId: true, idempotencyKey: true, payload: true, publishedAt: true, attemptCount: true, lastError: true } }),
         testDb.agentOutbox.findMany({ where: { topic: "agent.turn.dlq", aggregateId: prepared.fillTurnId },
           orderBy: { createdAt: "desc" }, take: 8, select: { payload: true } }),
       ])
       return stage8FailureSummary({ expectedApprovalId: prepared.submitApprovalId, expectedSessionId: prepared.sessionId,
         expectedTurnId: prepared.fillTurnId, expectedWorkerTaskId, session, turn, root, applicationTask, approval, wait, steps, tools, events,
+        dispatchRows, wakeupOutboxRows,
         deadLetters: turn ? deadLetters : [], workerFailureLines: turn ? worker?.lines ?? [] : [] })
     }, Date.now() + 1_200)
   } catch {
@@ -2112,7 +2257,8 @@ async function waitForStage8Arm(prepared: Stage8PreparedScenario, intent: Stage8
   }
 }
 
-async function prepareStage8Scenario(label: "stop-first" | "grant-first"): Promise<Stage8PreparedScenario> {
+async function prepareStage8Scenario(label: "stop-first" | "grant-first" | "early-wake"): Promise<Stage8PreparedScenario> {
+  const before = await requestFixtureStats()
   await resetStage8DomainRateLimit()
   const scenario = await createReviewedSourceScenario(`stage8-${label}`, `Synthetic Stage 8 ${label} source description.`)
   const token = await signedBearer(ids.user)
@@ -2181,7 +2327,7 @@ async function prepareStage8Scenario(label: "stop-first" | "grant-first"): Promi
   }, select: { id: true } })
   const fill = await waitForReviewedApplicationTask(scenario.jobId,
     task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled" && Boolean(task.fillTurnId),
-    180_000, label === "stop-first")
+    180_000, label !== "grant-first")
   const fillTurnId = fill.fillTurnId
   if (typeof fillTurnId !== "string" || !fillTurnId.trim() || fill.id !== reviewTask.id) throw new Error("stage8_fill_identity_missing")
   const browserStarted = await testDb.applicationTaskEvent.findMany({ where: {
@@ -2213,7 +2359,8 @@ async function prepareStage8Scenario(label: "stop-first" | "grant-first"): Promi
   expect(jsonRecord(waitItems[0]!.content)).toMatchObject({ waitKind: "approval", approvalId: submitApprovalId,
     action: "submit_application" })
   expect(await testDb.agentOutbox.count({ where: { aggregateId: scenario.sessionId, topic: "application.submit.dispatch" } })).toBe(0)
-  expect((await requestFixtureStats()).reviewedSubmitCount).toBe(0)
+  const after = await requestFixtureStats()
+  expect(after.reviewedSubmitCount).toBe(before.reviewedSubmitCount)
   return { ...scenario, token, sourceTurnId: source.turnId, reviewTurnId, fillTurnId,
     applicationTaskId: reviewTask.id, submitApprovalId }
 }
@@ -2224,7 +2371,7 @@ async function armStage8ExecutionFailureTarget(prepared: Stage8PreparedScenario)
   await waitLine(worker, "STAGE8_FAILURE_TARGET_ARMED", 5_000)
 }
 
-async function approveStage8Submit(prepared: Stage8PreparedScenario): Promise<Stage8SubmitIntent> {
+async function postStage8SubmitApproval(prepared: Stage8PreparedScenario): Promise<Response> {
   const approval = await testDb.agentApproval.findUniqueOrThrow({ where: { id: prepared.submitApprovalId } })
   expect(approval).toMatchObject({ id: prepared.submitApprovalId, userId: ids.user, sessionId: prepared.sessionId,
     taskId: prepared.applicationTaskId, turnId: prepared.fillTurnId, jobId: prepared.jobId,
@@ -2236,9 +2383,13 @@ async function approveStage8Submit(prepared: Stage8PreparedScenario): Promise<St
   const receiptNonce = jsonString(await jsonResponse(nonceResponse), "receiptNonce")
   expect(receiptNonce).toMatch(/^[a-f0-9]{64}$/)
   const { POST: approvalAction } = await import("@/app/api/agent/sessions/[id]/actions/route")
-  const response = await approvalAction(apiRequest(`/api/agent/sessions/${prepared.sessionId}/actions`, prepared.token, "POST", {
+  return approvalAction(apiRequest(`/api/agent/sessions/${prepared.sessionId}/actions`, prepared.token, "POST", {
     type: "approval_response", approvalId: prepared.submitApprovalId, decision: "approved", receiptNonce,
   }), { params: Promise.resolve({ id: prepared.sessionId }) })
+}
+
+async function approveStage8Submit(prepared: Stage8PreparedScenario): Promise<Stage8SubmitIntent> {
+  const response = await postStage8SubmitApproval(prepared)
   if (response.status !== 200) {
     const body = jsonRecord(await response.clone().json().catch(() => null))
     const [approvalAfter, taskAfter] = await Promise.all([
@@ -3545,6 +3696,180 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       site?.stdin?.write("release-held\n")
     }
   }, 900_000)
+
+  it(
+    "Stage 8 early wake: holds submit queue until the original approved Fill Turn has its terminal receipt",
+    async () => {
+      await stopFixture(worker)
+      worker = spawnFixture("worker-staged")
+      await waitLine(worker, "WORKER_READY", 90_000)
+
+      const prepared = await prepareStage8Scenario("early-wake")
+      const executionEventsBeforeWake = await stage8ModelAndToolCallEventIds(prepared)
+      const before = await requestFixtureStats()
+      const autoApply = await import("@/lib/auto-apply")
+      const realQueueAutonomousApplication = autoApply.queueAutonomousApplication
+      let signalQueueCall!: () => void
+      let releaseQueueCall!: () => void
+      const queueCallReached = new Promise<void>(resolve => { signalQueueCall = resolve })
+      const queueMayProceed = new Promise<void>(resolve => { releaseQueueCall = resolve })
+      let queueReleased = false
+      let queueCallCount = 0
+      let realQueueCallCount = 0
+      let queueScopeMatches = false
+      const releaseQueue = () => {
+        if (queueReleased) return
+        queueReleased = true
+        releaseQueueCall()
+      }
+      const queueSpy = vi.spyOn(autoApply, "queueAutonomousApplication").mockImplementation(async input => {
+        queueCallCount += 1
+        queueScopeMatches = input.userId === ids.user && input.sessionId === prepared.sessionId
+          && input.applicationTaskId === prepared.applicationTaskId && input.jobId === prepared.jobId
+          && input.approvalId === prepared.submitApprovalId
+        signalQueueCall()
+        await queueMayProceed
+        realQueueCallCount += 1
+        return realQueueAutonomousApplication(input)
+      })
+      let actionRequest: Promise<Response> | undefined
+      let actionSettled: Promise<void> | undefined
+      let barrierTimer: ReturnType<typeof setTimeout> | undefined
+      try {
+        actionRequest = postStage8SubmitApproval(prepared)
+        actionSettled = actionRequest.then(() => undefined, () => undefined)
+        await Promise.race([
+          queueCallReached,
+          new Promise<never>((_, reject) => {
+            barrierTimer = setTimeout(() => reject(new Error("stage8_early_wake_queue_call_not_reached")), 30_000)
+          }),
+        ])
+        if (barrierTimer) clearTimeout(barrierTimer)
+        expect(queueCallCount === 1 && queueScopeMatches && realQueueCallCount === 0).toBe(true)
+
+        const waitId = `agent-wait:approval:${prepared.submitApprovalId}`
+        const [approval, wait, resolvedEvents, wakeupEvents] = await Promise.all([
+          testDb.agentApproval.findFirstOrThrow({ where: { id: prepared.submitApprovalId, userId: ids.user,
+            sessionId: prepared.sessionId, taskId: prepared.applicationTaskId, turnId: prepared.fillTurnId,
+            jobId: prepared.jobId, type: "submit_application" }, select: { status: true } }),
+          testDb.agentItem.findFirstOrThrow({ where: { id: waitId, sessionId: prepared.sessionId,
+            turnId: prepared.fillTurnId, type: "approval_request" }, select: { status: true, content: true } }),
+          testDb.agentEvent.findMany({ where: { sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
+            taskId: prepared.applicationTaskId, type: "approval.resolved", actor: "user",
+            correlationId: prepared.submitApprovalId }, select: { id: true } }),
+          testDb.agentEvent.findMany({ where: { sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
+            itemId: waitId, type: "turn.wakeup" }, select: { id: true } }),
+        ])
+        const waitContent = jsonRecord(wait.content)
+        const committedApprovalWait = approval.status === "approved" && wait.status === "completed"
+          && waitContent?.waitKind === "approval" && waitContent.approvalId === prepared.submitApprovalId
+          && waitContent.action === "submit_application" && waitContent.decision === "approved"
+          && waitContent.responseAvailable === true && resolvedEvents.length === 1 && wakeupEvents.length === 1
+        expect(committedApprovalWait).toBe(true)
+
+        const assertPreQueueState = async () => {
+          const [session, task, submitOutbox, queuedEvents, queueJobs, stats] = await Promise.all([
+            testDb.agentSession.findFirstOrThrow({ where: { id: prepared.sessionId, userId: ids.user }, select: { status: true } }),
+            testDb.applicationTask.findFirstOrThrow({ where: { id: prepared.applicationTaskId, userId: ids.user,
+              sessionId: prepared.sessionId, jobId: prepared.jobId, fillTurnId: prepared.fillTurnId },
+              select: { status: true, checkpoint: true, workerTaskId: true } }),
+            testDb.agentOutbox.findMany({ where: { aggregateId: prepared.sessionId, topic: "application.submit.dispatch" },
+              select: { payload: true } }),
+            testDb.applicationTaskEvent.count({ where: { taskId: prepared.applicationTaskId, type: "submission_queued" } }),
+            submitQueueJobs(),
+            requestFixtureStats(),
+          ])
+          const matchingOutbox = submitOutbox.filter(row => jsonString(row.payload, "applicationTaskId") === prepared.applicationTaskId)
+          const matchingQueueJobs = queueJobs.filter(job => jsonString(job.data, "applicationTaskId") === prepared.applicationTaskId)
+          expect(session.status === "waiting_for_user").toBe(true)
+          expect(task.status === "waiting_for_authorization" && task.checkpoint === "form_filled"
+            && task.workerTaskId === null).toBe(true)
+          expect(matchingOutbox).toHaveLength(0)
+          expect(queuedEvents).toBe(0)
+          expect(matchingQueueJobs).toHaveLength(0)
+          expect(stats.reviewedSubmitCount).toBe(before.reviewedSubmitCount)
+        }
+        await assertPreQueueState()
+
+        const terminalDeadline = Date.now() + 45_000
+        let verifiedTerminal = false
+        while (Date.now() < terminalDeadline && !verifiedTerminal) {
+          const turn = await testDb.agentTurn.findFirst({ where: { id: prepared.fillTurnId, userId: ids.user,
+            sessionId: prepared.sessionId, source: "user" },
+            select: { status: true, rootTaskId: true, leaseOwnerId: true, leaseStartedAt: true, leaseExpiresAt: true } })
+          if (turn?.status === "completed" && typeof turn.rootTaskId === "string" && turn.rootTaskId) {
+            const [root, events] = await Promise.all([
+              testDb.subAgentTask.findMany({ where: { id: turn.rootTaskId, rootTaskId: turn.rootTaskId,
+                sessionId: prepared.sessionId, turnId: prepared.fillTurnId, parentTaskId: null,
+                role: "orchestrator", taskType: "root" }, select: { status: true, failureReason: true, result: true } }),
+              testDb.agentEvent.findMany({ where: { sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
+                taskId: turn.rootTaskId, type: "turn.completed", actor: "orchestrator" },
+                select: { itemId: true, taskId: true, payload: true } }),
+            ])
+            const event = events[0]
+            const payload = jsonRecord(event?.payload)
+            const finalItemId = event?.itemId
+            const finalItems = typeof finalItemId === "string" ? await testDb.agentItem.findMany({ where: {
+              id: finalItemId, sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
+              type: "agent_message", status: "completed",
+            }, select: { id: true, taskId: true, phase: true } }) : []
+            const rootResult = jsonRecord(root[0]?.result)
+            verifiedTerminal = root.length === 1 && root[0]?.status === "completed" && root[0]?.failureReason === null
+              && events.length === 1 && typeof finalItemId === "string" && finalItemId.length > 0
+              && event?.taskId === turn.rootTaskId && rootResult?.finalItemId === finalItemId
+              && payload?.turnId === prepared.fillTurnId && payload.taskId === turn.rootTaskId
+              && payload.finalItemId === finalItemId && finalItems.length === 1
+              && finalItems[0]?.taskId === turn.rootTaskId && finalItems[0]?.phase === "final_answer"
+              && turn.leaseOwnerId === null && turn.leaseStartedAt === null && turn.leaseExpiresAt === null
+          }
+          if (!verifiedTerminal) await delay(100)
+        }
+        if (!verifiedTerminal) {
+          const database = await stage8FillFailureSnapshot(prepared)
+          throw new Error("stage8_early_wake_terminal_missing:" + JSON.stringify({
+            database, requestFence: stage8RequestFenceSummary(worker?.lines ?? []),
+          }))
+        }
+        expect(await stage8ModelAndToolCallEventIds(prepared)).toEqual(executionEventsBeforeWake)
+        await assertPreQueueState()
+
+        releaseQueue()
+        const response = await actionRequest
+        expect(response.status).toBe(200)
+        expect(queueCallCount === 1 && realQueueCallCount === 1).toBe(true)
+        const [submitIntentRows, queuedEventCount, stats] = await Promise.all([
+          testDb.agentOutbox.findMany({ where: { aggregateId: prepared.sessionId, topic: "application.submit.dispatch" },
+            select: { payload: true } }),
+          testDb.applicationTaskEvent.count({ where: { taskId: prepared.applicationTaskId, type: "submission_queued" } }),
+          requestFixtureStats(),
+        ])
+        const matchingIntents = submitIntentRows.filter(row => jsonString(row.payload, "applicationTaskId") === prepared.applicationTaskId)
+        const exactIntent = matchingIntents.length === 1
+          && jsonString(matchingIntents[0]!.payload, "userId") === ids.user
+          && jsonString(matchingIntents[0]!.payload, "jobId") === prepared.jobId
+          && jsonString(matchingIntents[0]!.payload, "sessionId") === prepared.sessionId
+          && jsonString(matchingIntents[0]!.payload, "fillTurnId") === prepared.fillTurnId
+          && jsonString(matchingIntents[0]!.payload, "receiptId") === prepared.submitApprovalId
+          && Boolean(jsonString(matchingIntents[0]!.payload, "workerTaskId"))
+        expect(exactIntent && queuedEventCount === 1).toBe(true)
+        expect(await stage8ModelAndToolCallEventIds(prepared)).toEqual(executionEventsBeforeWake)
+        expect(stats.reviewedSubmitCount).toBe(before.reviewedSubmitCount)
+      } finally {
+        if (barrierTimer) clearTimeout(barrierTimer)
+        releaseQueue()
+        if (actionSettled) {
+          let settleTimer: ReturnType<typeof setTimeout> | undefined
+          try {
+            await Promise.race([actionSettled, new Promise<void>(resolve => { settleTimer = setTimeout(resolve, 60_000) })])
+          } finally {
+            if (settleTimer) clearTimeout(settleTimer)
+          }
+        }
+        queueSpy.mockRestore()
+      }
+    },
+    900_000,
+  )
 })
 
 async function requestFixtureStats(timeoutMs = 5_000): Promise<FixtureStats> {

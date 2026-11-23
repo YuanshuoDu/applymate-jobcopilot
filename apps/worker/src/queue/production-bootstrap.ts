@@ -11,6 +11,7 @@ import type {
   createTurnQueue,
   TurnExecutor,
 } from "../runtime/turns/turn-queue.js"
+import type { ApprovedFillTerminalClaimFallback } from "../runtime/turns/approved-fill-terminal-claim.js"
 import type { startTurnRecoveryScanner, TurnDispatchQueue } from "../runtime/turns/recovery-scanner.js"
 import type { RootAbortControllerRegistry } from "../runtime/interrupt/registry.js"
 import { TurnShutdownController } from "../runtime/turns/shutdown.js"
@@ -22,6 +23,7 @@ type LeasePool = Pick<pg.Pool, "connect">
 /** Runtime resources owned by the Worker process for canonical execution. */
 export interface CanonicalTurnRuntime {
   readonly execute: TurnExecutor
+  readonly approvedFillTerminalClaim?: ApprovedFillTerminalClaimFallback
   readonly manager: AgentTreeManager
   /** Server-owned gates used to reject partial child-agent production wiring. */
   readonly childExecutionEnabled: boolean
@@ -164,6 +166,7 @@ export async function createProductionWorkerBootstrap(
     turns = turnFactory({
       pool: options.pool,
       execute: options.runtime.execute,
+      approvedFillTerminalClaim: options.runtime.approvedFillTerminalClaim,
       interrupts: options.interrupts,
       waitHandoff: async input => {
         await createPgDurableWaitPort(options.pool).suspendAndRelease(input)
