@@ -576,6 +576,92 @@ describe("ApplicationTask submission attempt diagnostic classifier", () => {
   })
 })
 
+type LegacyAckFakeJob = {
+  id?: string
+  attemptsStarted: number
+  data: { operation: string; sessionId: string; fillTurnId: string }
+}
+type LegacyAckFakeWorker = { processFn: (job: LegacyAckFakeJob, ...args: unknown[]) => Promise<string> }
+type LegacyAckWitness = {
+  arm(value: unknown): boolean
+  proves(value: unknown): boolean
+  wrap(worker: LegacyAckFakeWorker): void
+  releaseForShutdown(): void
+}
+
+async function createLegacyAckWitnessForTest(writeLine: (line: string) => void): Promise<LegacyAckWitness> {
+  const supportUrl = new URL("../../../../../../worker/src/queue/application-task-full-loop.legacy-ack.fixture-support.mjs", import.meta.url)
+  const module = await import(supportUrl.href) as { createLegacyQueueAckWitness: (write: (line: string) => void) => LegacyAckWitness }
+  return module.createLegacyQueueAckWitness(writeLine)
+}
+
+describe("legacy queue acknowledgement fixture witness", () => {
+  it("holds only the exact returned submit attempt until bounded teardown", async () => {
+    const markers: string[] = []
+    let witness: LegacyAckWitness
+    const scope = { sessionId: `full-loop-session-${"a".repeat(32)}`, fillTurnId: "turn_witness", expectedAttempt: 1 }
+    const submitJob: LegacyAckFakeJob = { id: "job_submit", attemptsStarted: 1,
+      data: { operation: "submit", sessionId: scope.sessionId, fillTurnId: scope.fillTurnId } }
+    const proof = { sessionId: scope.sessionId, fillTurnId: scope.fillTurnId, jobId: submitJob.id, attemptsStarted: 1 }
+    witness = await createLegacyAckWitnessForTest(line => {
+      markers.push(line)
+      if (line === "LEGACY_ACK_BARRIER_REACHED attempt=1") expect(witness.proves(proof)).toBe(true)
+    })
+    const worker: LegacyAckFakeWorker = { processFn: async () => "processed" }
+    witness.wrap(worker)
+    expect(witness.arm({ ...scope, extraAuthority: true })).toBe(false)
+    expect(witness.arm(scope)).toBe(true)
+    expect(witness.arm(scope)).toBe(false)
+
+    const unrelated: LegacyAckFakeJob = { id: "job_other", attemptsStarted: 1,
+      data: { operation: "submit", sessionId: scope.sessionId, fillTurnId: "turn_other" } }
+    const retryAttempt: LegacyAckFakeJob = { id: "job_retry", attemptsStarted: 2,
+      data: { operation: "submit", sessionId: scope.sessionId, fillTurnId: scope.fillTurnId } }
+    const fillJob: LegacyAckFakeJob = { id: "job_fill", attemptsStarted: 1,
+      data: { operation: "fill", sessionId: scope.sessionId, fillTurnId: scope.fillTurnId } }
+    await expect(worker.processFn(unrelated)).resolves.toBe("processed")
+    await expect(worker.processFn(retryAttempt)).resolves.toBe("processed")
+    await expect(worker.processFn(fillJob)).resolves.toBe("processed")
+    expect(markers).toEqual([])
+
+    let processorSettled = false
+    const pending = worker.processFn(submitJob).then(result => { processorSettled = true; return result })
+    await vi.waitFor(() => expect(markers).toContain("LEGACY_ACK_BARRIER_REACHED attempt=1"))
+    expect(processorSettled).toBe(false)
+    expect(witness.proves({ ...proof, jobId: "job_other" })).toBe(false)
+    expect(witness.proves(proof)).toBe(true)
+    witness.releaseForShutdown()
+    expect(witness.proves(proof)).toBe(false)
+    await expect(pending).resolves.toBe("processed")
+    expect(processorSettled).toBe(true)
+  })
+
+  it("invalidates a historical barrier marker after its bounded hold expires", async () => {
+    const markers: string[] = []
+    const witness = await createLegacyAckWitnessForTest(line => markers.push(line))
+    const scope = { sessionId: `full-loop-session-${"b".repeat(32)}`, fillTurnId: "turn_expired_witness", expectedAttempt: 1 }
+    const job: LegacyAckFakeJob = { id: "job_expired", attemptsStarted: 1,
+      data: { operation: "submit", sessionId: scope.sessionId, fillTurnId: scope.fillTurnId } }
+    const proof = { sessionId: scope.sessionId, fillTurnId: scope.fillTurnId, jobId: job.id, attemptsStarted: 1 }
+    const worker: LegacyAckFakeWorker = { processFn: async () => "processed" }
+    witness.wrap(worker)
+    expect(witness.arm(scope)).toBe(true)
+    vi.useFakeTimers()
+    try {
+      const pending = worker.processFn(job)
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(markers).toEqual(["LEGACY_ACK_BARRIER_REACHED attempt=1"])
+      expect(witness.proves(proof)).toBe(true)
+      await vi.advanceTimersByTimeAsync(45_000)
+      await expect(pending).resolves.toBe("processed")
+      expect(witness.proves(proof)).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
 async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Promise<string> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
@@ -585,6 +671,31 @@ async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Pro
     await delay(25)
   }
   throw new Error(`Fixture line ${expected} missing; child=${JSON.stringify(childSummary(child))}`)
+}
+
+async function waitForLegacyAckMarker(child: Child, expected: string, rejected?: string, timeoutMs = 10_000): Promise<void> {
+  const until = Date.now() + timeoutMs
+  while (Date.now() < until) {
+    if (child.lines.includes(expected)) return
+    if (rejected && child.lines.includes(rejected)) throw new Error("legacy_ack_barrier_control_rejected")
+    if (exited(child)) throw new Error("legacy_ack_barrier_worker_exited")
+    await delay(25)
+  }
+  throw new Error("legacy_ack_barrier_marker_timeout")
+}
+
+async function armLegacyQueueAckBarrier(sessionId: string, fillTurnId: string): Promise<void> {
+  if (!worker?.stdin) throw new Error("legacy_ack_barrier_worker_stdin_unavailable")
+  worker.stdin.write(`arm-legacy-ack-barrier ${JSON.stringify({ sessionId, fillTurnId, expectedAttempt: 1 })}\n`)
+  await waitForLegacyAckMarker(worker, "LEGACY_ACK_BARRIER_ARMED", "LEGACY_ACK_BARRIER_ARM_FAILED")
+}
+
+async function proveLegacyQueueAckBarrier(proof: {
+  sessionId: string; fillTurnId: string; jobId: string; attemptsStarted: number
+}): Promise<void> {
+  if (!worker?.stdin) throw new Error("legacy_ack_barrier_worker_stdin_unavailable")
+  worker.stdin.write(`prove-legacy-ack-barrier ${JSON.stringify(proof)}\n`)
+  await waitForLegacyAckMarker(worker, "LEGACY_ACK_BARRIER_PROVED", "LEGACY_ACK_BARRIER_PROOF_REJECTED")
 }
 
 async function armLegacyFinalResponseGate(turnId: string): Promise<void> {
@@ -896,13 +1007,16 @@ async function waitForWorkerRedelivery(child: Child, jobId: string, timeoutMs = 
     const redelivery = child.lines.map(parseApplyJobActiveEvent).find(event => event !== null && event.jobId === jobId
       && event.attemptsStarted >= 2 && event.stalledCounter >= 1)
     if (redelivery) return redelivery
-    if (exited(child)) throw new Error(`Worker exited before BullMQ redelivered ${jobId}; child=${JSON.stringify(childSummary(child))}`)
+    if (exited(child)) throw new Error("worker_redelivery_worker_exited")
     await delay(50)
   }
   const matchingEvents = child.lines.map(parseApplyJobActiveEvent).filter((event): event is ApplyJobActiveEvent => event?.jobId === jobId)
-  const maxAttemptsStarted = matchingEvents.length ? Math.max(...matchingEvents.map(event => event.attemptsStarted)) : null
-  const maxStalledCounter = matchingEvents.length ? Math.max(...matchingEvents.map(event => event.stalledCounter)) : null
-  throw new Error(`BullMQ did not redeliver ${jobId}; matchingEventCount=${matchingEvents.length}; maxAttemptsStarted=${maxAttemptsStarted}; maxStalledCounter=${maxStalledCounter}`)
+  const maxAttemptsStarted = matchingEvents.length ? Math.max(...matchingEvents.map(event => event.attemptsStarted)) : 0
+  const maxStalledCounter = matchingEvents.length ? Math.max(...matchingEvents.map(event => event.stalledCounter)) : 0
+  const safeEventCount = Math.min(100, matchingEvents.length)
+  const safeAttemptsStarted = Math.min(10_000, Number.isSafeInteger(maxAttemptsStarted) ? maxAttemptsStarted : 0)
+  const safeStalledCounter = Math.min(10_000, Number.isSafeInteger(maxStalledCounter) ? maxStalledCounter : 0)
+  throw new Error(`worker_redelivery_timeout; matchingEventCount=${safeEventCount}; maxAttemptsStarted=${safeAttemptsStarted}; maxStalledCounter=${safeStalledCounter}`)
 }
 
 function jsonString(value: unknown, key: string): string | undefined {
@@ -1710,6 +1824,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     await assertNoSubmitBeforeApproval()
     expect(await testDb.agentOutbox.count({ where: { topic: "application.submit.dispatch", aggregateId: ids.session } })).toBe(0)
 
+    await armLegacyQueueAckBarrier(ids.session, successorTurnId)
     const approved = await approvalAction(apiRequest(actionPath, ownerToken, "POST", {
       type: "approval_response", approvalId: submitApproval.id, decision: "approved", receiptNonce,
     }), { params: Promise.resolve({ id: ids.session }) })
@@ -1749,6 +1864,16 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(submitJob.data).toMatchObject({ applicationTaskId: gateTaskId, userId: ids.user, jobId: ids.job,
       sessionId: ids.session, fillTurnId: successorTurnId, receiptId: submitApproval.id, operation: "submit" })
     const successorRootTaskId = await expectLegacyFillTurnLeased(successorTurnId)
+    site!.stdin!.write("release-held\n")
+    await waitForLegacyAckMarker(worker!, "LEGACY_ACK_BARRIER_REACHED attempt=1")
+    const uncertainBeforeCompletion = await waitForTask(task => task.status === "waiting_for_user" && task.checkpoint === "submission_uncertain")
+    expect(uncertainBeforeCompletion.fillTurnId === successorTurnId && uncertainBeforeCompletion.workerTaskId === workerTaskId).toBe(true)
+    const uncertainSession = await testDb.agentSession.findUnique({ where: { id: ids.session }, select: {
+      userId: true, status: true, completedAt: true,
+    } })
+    expect(uncertainSession?.userId === ids.user && uncertainSession.status === "waiting_for_user"
+      && uncertainSession.completedAt === null).toBe(true)
+    expect(await expectLegacyFillTurnLeased(successorTurnId) === successorRootTaskId).toBe(true)
     await releaseLegacyFinalResponseGate()
     expect((await waitForAgentTurnTerminal(successorTurnId, 30_000)).status).toBe("completed")
     expect(await testDb.agentTurn.findUniqueOrThrow({ where: { id: successorTurnId }, select: {
@@ -1757,8 +1882,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       rootTaskId: successorRootTaskId, status: "completed", completedAt: expect.any(Date),
       leaseOwnerId: null, leaseExpiresAt: null,
     })
-    const submitStarted = await waitForTask(task => task.checkpoint === "submission_request_started" || task.checkpoint === "submission_uncertain")
-    expect(submitStarted.status).toBe(submitStarted.checkpoint === "submission_request_started" ? "filling" : "waiting_for_user")
+    const submitStarted = await waitForTask(task => task.checkpoint === "submission_uncertain")
+    expect(submitStarted.status).toBe("waiting_for_user")
     const turnBeforeDuplicate = await testDb.agentTurn.findUniqueOrThrow({
       where: { id: successorTurnId },
       select: { status: true, revision: true, leaseOwnerId: true, leaseExpiresAt: true, completedAt: true },
@@ -1790,11 +1915,27 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       where: { id: submitApproval.id }, select: { status: true },
     })).toEqual(approvalBeforeDuplicate)
     expect((await requestFixtureStats()).submitCount).toBe(1)
+    const heldAckJob = await applyQueue!.getJob(workerTaskId)
+    expect(Boolean(heldAckJob)).toBe(true)
+    expect(heldAckJob?.id === workerTaskId).toBe(true)
+    expect(await heldAckJob!.getState()).toBe("active")
+    expect(heldAckJob!.attemptsStarted).toBe(1)
+    const heldAckPayload = jsonRecord(heldAckJob!.data)
+    expect(Boolean(heldAckPayload && heldAckPayload.operation === "submit" && heldAckPayload.sessionId === ids.session
+      && heldAckPayload.fillTurnId === successorTurnId && heldAckPayload.applicationTaskId === gateTaskId
+      && heldAckPayload.receiptId === submitApproval.id)).toBe(true)
+    const uncertainBeforeKill = await testDb.applicationTask.findUniqueOrThrow({ where: { id: gateTaskId },
+      select: { status: true, checkpoint: true, fillTurnId: true, workerTaskId: true } })
+    expect(uncertainBeforeKill.status === "waiting_for_user" && uncertainBeforeKill.checkpoint === "submission_uncertain"
+      && uncertainBeforeKill.fillTurnId === successorTurnId && uncertainBeforeKill.workerTaskId === workerTaskId).toBe(true)
+    await proveLegacyQueueAckBarrier({ sessionId: ids.session, fillTurnId: successorTurnId,
+      jobId: workerTaskId, attemptsStarted: heldAckJob!.attemptsStarted })
     worker!.kill("SIGKILL")
     expect(await waitExit(worker!, 5_000)).toBe(true)
     worker = spawnFixture("worker")
     await waitLine(worker, "WORKER_READY", 90_000)
     const redeliveryEvent = await waitForWorkerRedelivery(worker, workerTaskId)
+    expect(worker!.lines.includes("LEGACY_ACK_BARRIER_REACHED attempt=1")).toBe(false)
     expect(redeliveryEvent).toMatchObject({ jobId: workerTaskId })
     expect(redeliveryEvent.attemptsStarted).toBeGreaterThanOrEqual(2)
     expect(redeliveryEvent.stalledCounter).toBeGreaterThanOrEqual(1)
