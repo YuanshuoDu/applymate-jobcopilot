@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
-import { assertSessionTerminalAdmission, revokeSessionTerminalAdmissionsForClient, type SessionTerminalAdmission } from "../session-gate.js"
+import { assertApprovedFillResumeTerminalAdmission, assertSessionTerminalAdmission, revokeSessionTerminalAdmissionsForClient, type SessionTerminalAdmission } from "../session-gate.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity } from "../outbox-identity.js"
 import { toRepositoryJson, type AtomicTurnCompletionInput, type AtomicTurnCompletionResult, type TurnEngineEvent, type TurnEngineEventInput } from "./turn-engine-types.js"
 import type { TurnEngineCompletionGateResult } from "./turn-execution-types.js"
@@ -13,7 +13,7 @@ import { assertTerminalPlanningRootHasNoUnresolvedSteering } from "../subagents/
 import { updateRootObjectiveHistoryProjection } from "../context/objective-history-projection.js"
 import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { acquireRootTaskHistoryChronologyLock, appendRootTaskHistoryChronologyWitness, readRootTaskHistoryChronologyWitness } from "../context/root-task-history-chronology-witness.js"
-
+import { writeApprovedFillResumeTerminalStep } from "./approved-fill-resume-terminal-step.js"
 type Pool = Pick<pg.Pool, "connect">
 type Client = pg.PoolClient
 type Row = Record<string, unknown>
@@ -28,11 +28,9 @@ export async function projectRootTerminalEvent(client: Pick<pg.PoolClient, "quer
   if (!await updateRootObjectiveHistoryProjection(client, { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId }, { terminalEventId: eventId })) throw conflict(`terminal objective history ${eventId}`)
 }
 export function conflict(resource: string): Error { return Object.assign(new Error(`TurnEngine persistence conflict: ${resource}`), { name: "TurnEnginePersistenceConflict" }) }
-
 function record(value: unknown): Row {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Row : {}
 }
-
 function discoveryIntent(turnInput: unknown): { kind: "interactive_discovery_shortlist"; version: 1 } | undefined {
   const envelope = record(turnInput)
   const nested = record(envelope.input)
@@ -41,7 +39,6 @@ function discoveryIntent(turnInput: unknown): { kind: "interactive_discovery_sho
     || intent.kind !== "interactive_discovery_shortlist" || intent.version !== 1) return undefined
   return { kind: "interactive_discovery_shortlist", version: 1 }
 }
-
 async function promoteFollowUp(client: Client, owner: TurnExecutionOwnerFence, source: unknown, turnInput: unknown, row: Row, now: Date): Promise<void> {
   const content = row.content
   const clientMessageId = row.clientMessageId
@@ -73,7 +70,6 @@ async function promoteFollowUp(client: Client, owner: TurnExecutionOwnerFence, s
     if (!saved || saved.topic !== "agent.turn.dispatch" || saved.aggregateId !== owner.sessionId || !sameJson(saved.payload, payload)) throw conflict(`dispatch ${key} identity`)
   }
 }
-
 async function transaction<T>(pool: Pool, userId: string, work: (client: Client) => Promise<T>, guarded = false): Promise<T> {
   const client = await pool.connect(); let committed = false
   try {
@@ -144,6 +140,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
   if (input.owner.kind !== "turn") throw conflict(`child final response ${input.owner.taskId}`)
   const owner = input.owner
   if (owner.taskId !== owner.rootTaskId) throw conflict(`root task ${owner.taskId}`)
+  if (input.approvedFillResumeTerminalStep !== undefined && !finalizationGuard) throw conflict(`approved Fill terminal guard ${owner.turnId}`)
   return transaction(pool, owner.userId, async client => {
     const chronologyLock = await acquireRootTaskHistoryChronologyLock(client, owner.userId)
     const session = await client.query<Row>(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived') FOR UPDATE`, [owner.sessionId, owner.userId])
@@ -168,15 +165,15 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
     if (!committed && (turnRow.status !== "in_progress" || task.status !== "running" || task.leaseOwner !== owner.ownerId || Number(task.attemptCount) !== 1)) throw conflict(`root task ${owner.taskId} fence`)
     let terminalAdmission: SessionTerminalAdmission | undefined
     if (!committed) {
-      terminalAdmission = await assertSessionTerminalAdmission(client, { ...owner, source: typeof turnRow.source === "string" ? turnRow.source : null, executionMode: typeof turnRow.executionMode === "string" ? turnRow.executionMode : null })
+      const admissionInput = { ...owner, source: typeof turnRow.source === "string" ? turnRow.source : null, executionMode: typeof turnRow.executionMode === "string" ? turnRow.executionMode : null }
+      terminalAdmission = input.approvedFillResumeTerminalStep
+        ? await assertApprovedFillResumeTerminalAdmission(client, admissionInput, input.approvedFillResumeTerminalStep) : await assertSessionTerminalAdmission(client, admissionInput)
       if (task.interruptRequestedAt != null) throw conflict(`root task ${owner.taskId} interrupted`)
-      try {
-        await assertTerminalPlanningRootHasNoUnresolvedSteering(client, task.allowedActions, {
-          userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.taskId, parentTaskId: owner.taskId,
-          turnLeaseOwner: owner.ownerId, turnLeaseVersion: owner.leaseVersion,
-          parentLeaseOwner: String(task.leaseOwner), parentAttemptCount: Number(task.attemptCount),
-        }, terminalAdmission)
-      } catch (error: unknown) {
+      const planningScope = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.taskId,
+        parentTaskId: owner.taskId, turnLeaseOwner: owner.ownerId, turnLeaseVersion: owner.leaseVersion,
+        parentLeaseOwner: String(task.leaseOwner), parentAttemptCount: Number(task.attemptCount) }
+      try { await assertTerminalPlanningRootHasNoUnresolvedSteering(client, task.allowedActions, planningScope, terminalAdmission) }
+      catch (error: unknown) {
         if (error instanceof Error && error.message === STEERING_RECONCILIATION_BLOCKER) throw steeringReconciliationRecoveryError()
         throw error
       }
@@ -186,9 +183,12 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
       WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" IS NOT NULL AND "delivery" = 'follow_up'
         AND "status" IN ('accepted', 'queued') AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL
       ORDER BY "acceptedSequence" ASC, "id" ASC LIMIT 1 FOR UPDATE`, [owner.sessionId, owner.userId])).rows[0]
-    const prior = await client.query<Row>(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3 FOR UPDATE`,
-      [owner.sessionId, owner.turnId, `turn:${owner.turnId}:event:step-completed:${input.stepId}`])
-    if (!prior.rows[0]) throw conflict(`completed step event ${input.stepId}`)
+    const completedStepEventId = input.approvedFillResumeTerminalStep
+      ? await writeApprovedFillResumeTerminalStep({ client, owner, terminal: input, descriptor: input.approvedFillResumeTerminalStep,
+        now: input.now, alreadyCommitted: committed, appendEvent: event => appendEvent(client, event) })
+      : String((await client.query<Row>(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3 FOR UPDATE`,
+        [owner.sessionId, owner.turnId, `turn:${owner.turnId}:event:step-completed:${input.stepId}`])).rows[0]?.id ?? "")
+    if (!completedStepEventId) throw conflict(`completed step event ${input.stepId}`)
     if (!committed && finalizationGuard) {
       const decision = await finalizationGuard(client, input, terminalAdmission!)
       if (!decision || typeof decision !== "object" || decision.ok !== true) {
@@ -217,7 +217,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
       if (!row || row.sessionId !== owner.sessionId || row.turnId !== owner.turnId || row.stepId !== input.stepId || row.taskId !== owner.taskId
         || row.type !== "agent_message" || row.status !== "completed" || row.phase !== "final_answer" || Number(row.revision) !== 1 || !sameJson(row.content, content)) throw conflict(`final item ${input.finalItemId} identity`)
     }
-    const terminalEvents = events(input, String(prior.rows[0].id)); let previous: string | null = null
+    const terminalEvents = events(input, completedStepEventId); let previous: string | null = null
     const saved: TurnEngineEvent[] = []
     for (const entry of terminalEvents) {
       const event = await appendEvent(client, { ...entry, causationId: previous ?? entry.causationId })

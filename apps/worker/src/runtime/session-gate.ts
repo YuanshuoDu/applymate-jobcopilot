@@ -1,4 +1,6 @@
 import type pg from "pg"
+import { approvedFillResumeTerminalStepData, type ApprovedFillResumeTerminalStepDescriptor } from "./turns/approved-fill-resume-terminal-step.js"
+import { approvedFillTerminalClaimRequeue } from "./turns/approved-fill-terminal-claim.js"
 
 const terminalAdmissionBrand: unique symbol = Symbol("SessionTerminalAdmission")
 type TerminalAdmissionInput = Readonly<{ sessionId: string; userId: string; turnId: string; rootTaskId: string }>
@@ -103,5 +105,52 @@ export async function assertSessionTerminalAdmission(
     [input.sessionId, input.userId, input.turnId, input.rootTaskId],
   )
   if (wait.rows.length !== 1) throw new SessionPauseRequestedError()
+  return terminalAdmission(client, input, "derived_fill")
+}
+
+/** Admits only the branded, already-approved early Fill terminal continuation while its Session is derived-waiting. */
+export async function assertApprovedFillResumeTerminalAdmission(
+  client: Pick<pg.PoolClient, "query">,
+  input: { readonly sessionId: string; readonly userId: string; readonly turnId: string; readonly rootTaskId: string; readonly source: string | null; readonly executionMode: string | null },
+  descriptor: ApprovedFillResumeTerminalStepDescriptor,
+): Promise<SessionTerminalAdmission> {
+  const data = approvedFillResumeTerminalStepData(descriptor), proof = data?.proof
+  if (!data || !proof || proof.state !== "form_filled" || proof.workerTaskId !== null || proof.outboxId !== null
+    || proof.userId !== input.userId || proof.sessionId !== input.sessionId || proof.turnId !== input.turnId
+    || proof.rootTaskId !== input.rootTaskId || input.source !== "user"
+    || (input.executionMode !== null && input.executionMode !== "canonical_task_graph")) throw new SessionPauseRequestedError()
+  try {
+    await assertSessionWorkAdmission(client, input)
+    return terminalAdmission(client, input, "work")
+  } catch (error: unknown) {
+    if (!isSessionPauseRequestedError(error)) throw error
+  }
+  const session = await client.query<{ status: string; noUnresolvedPause: boolean }>(
+    `SELECT session."status", ${NO_UNRESOLVED_SESSION_PAUSE} AS "noUnresolvedPause" FROM "agent_sessions" AS session
+     WHERE session."id" = $1 AND session."userId" = $2 LIMIT 2`,
+    [input.sessionId, input.userId, input.turnId],
+  )
+  if (session.rows.length !== 1 || session.rows[0]?.noUnresolvedPause !== true) throw new SessionPauseRequestedError()
+  if (session.rows[0]?.status === "running") {
+    try { await assertSessionWorkAdmission(client, input); return terminalAdmission(client, input, "work") }
+    catch (error: unknown) { if (!isSessionPauseRequestedError(error)) throw error }
+  }
+  if (session.rows[0]?.status !== "waiting_for_user") throw new SessionPauseRequestedError()
+  const result = await client.query<{ id: string }>(
+    `SELECT session."id" FROM "agent_sessions" AS session
+     JOIN "application_tasks" AS fill_task ON fill_task."sessionId" = session."id" AND fill_task."userId" = session."userId"
+     JOIN "sub_agent_tasks" AS filler ON filler."sessionId" = fill_task."sessionId" AND filler."turnId" = fill_task."fillTurnId"
+     WHERE session."id" = $1 AND session."userId" = $2 AND session."status" = 'waiting_for_user' AND ${NO_UNRESOLVED_SESSION_PAUSE}
+       AND fill_task."id" = $4 AND fill_task."fillTurnId" = $3 AND fill_task."fillTurnSessionId" = $1 AND fill_task."fillTurnUserId" = $2
+       AND ((fill_task."status" = 'waiting_for_authorization' AND fill_task."checkpoint" = 'form_filled' AND fill_task."workerTaskId" IS NULL)
+         OR (fill_task."status" = 'filling' AND fill_task."checkpoint" = 'submission_authorized' AND fill_task."workerTaskId" IS NOT NULL))
+       AND filler."id" = $5 AND filler."rootTaskId" = $6 AND filler."parentTaskId" = $6
+       AND filler."role" = 'application_filler' AND filler."taskType" = 'application_fill_for_review' AND filler."status" = 'completed'
+       AND filler."leaseOwner" IS NULL AND filler."leaseExpiresAt" IS NULL AND filler."interruptRequestedAt" IS NULL
+       AND filler."completedAt" IS NOT NULL AND filler."closedAt" IS NULL AND filler."nextAttemptAt" IS NULL AND filler."failureReason" IS NULL
+     LIMIT 2`,
+    [input.sessionId, input.userId, input.turnId, proof.applicationTaskId, proof.fillerTaskId, input.rootTaskId],
+  )
+  if (result.rows.length !== 1) throw approvedFillTerminalClaimRequeue(data.lease)
   return terminalAdmission(client, input, "derived_fill")
 }

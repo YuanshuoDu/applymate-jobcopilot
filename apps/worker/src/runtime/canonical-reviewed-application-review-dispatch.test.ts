@@ -10,8 +10,9 @@ import type { TurnEngineOptions } from "./turns/turn-engine-types.js"
 import type { CanonicalApprovedApplicationSubmitResumeProof } from "./canonical-approved-application-submit-resume-proof.js"
 import { resolveProductionAgentFlags } from "./production-agent-flags.js"
 
-const { reviewTurn, loadState, readResumeProof, finishResume } = vi.hoisted(() => ({
+const { reviewTurn, loadState, readResumeProof, finishResume, getTerminalClaim, requeueTerminalClaim } = vi.hoisted(() => ({
   reviewTurn: { run: vi.fn() }, loadState: vi.fn(), readResumeProof: vi.fn(), finishResume: vi.fn(),
+  getTerminalClaim: vi.fn(), requeueTerminalClaim: vi.fn(),
 }))
 vi.mock("./canonical-reviewed-application-review-turn.js", () => ({ runCanonicalReviewedApplicationReviewTurn: reviewTurn.run }))
 vi.mock("./canonical-turn-state.js", () => ({ loadCanonicalTurnState: loadState }))
@@ -21,8 +22,11 @@ vi.mock("./canonical-approved-application-submit-resume.js", () => ({
 vi.mock("./canonical-approved-application-submit-resume-proof.js", () => ({
   sameCanonicalApprovedApplicationSubmitResumeProof: (before: unknown, after: unknown) => before === after,
 }))
+vi.mock("./turns/approved-fill-terminal-claim.js", () => ({
+  getApprovedFillTerminalClaim: getTerminalClaim, approvedFillTerminalClaimRequeue: requeueTerminalClaim,
+}))
 
-import { dispatchCanonicalReviewedApplicationReview, loadAndDispatchCanonicalReviewedApplicationReview } from "./canonical-reviewed-application-review-dispatch.js"
+import { approvedApplicationFillResumeEnabled, dispatchCanonicalReviewedApplicationReview, loadAndDispatchCanonicalReviewedApplicationReview } from "./canonical-reviewed-application-review-dispatch.js"
 
 const lease: TurnLease = { turnId: "turn-review", sessionId: "session-review", ownerId: "worker-review", userId: "user-review",
   leaseVersion: 2, leaseStartedAt: new Date("2026-11-21T10:00:00Z"), leaseExpiresAt: new Date("2026-11-21T10:01:00Z") }
@@ -72,6 +76,16 @@ describe("approved application fill terminal dispatch", () => {
     loadState.mockReset()
     readResumeProof.mockReset()
     finishResume.mockReset().mockResolvedValue({ status: "completed" })
+    getTerminalClaim.mockReset().mockReturnValue(undefined)
+    requeueTerminalClaim.mockReset().mockImplementation(() => new Error("approved_application_fill_resume_proof_changed"))
+  })
+
+  it("keeps the terminal resume behind the same complete production prerequisites", () => {
+    const flags = resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" })
+    expect(approvedApplicationFillResumeEnabled({ hasStateLoader: false, productionFlags: flags, taskGraphCommandPort: {} as TaskGraphCommandPort,
+      coordinationEnabled: true, childExecutionEnabled: true, consumeWaitOutcomes: true, hasRootCompletionCheck: true })).toBe(true)
+    expect(approvedApplicationFillResumeEnabled({ hasStateLoader: true, productionFlags: flags, taskGraphCommandPort: {} as TaskGraphCommandPort,
+      coordinationEnabled: true, childExecutionEnabled: true, consumeWaitOutcomes: true, hasRootCompletionCheck: true })).toBe(false)
   })
 
   it("requires a read-only proof before consuming child Waits and then completes the same Turn", async () => {
@@ -127,7 +141,49 @@ describe("approved application fill terminal dispatch", () => {
     expect(loadState).toHaveBeenCalledOnce()
     expect(finishResume).not.toHaveBeenCalled()
   })
+
+  it("requeues a privately claimed early wake when the proof is missing or changes", async () => {
+    const proof = { state: "form_filled" } as CanonicalApprovedApplicationSubmitResumeProof
+    const input = resumeInput()
+    getTerminalClaim.mockReturnValue(proof)
+    readResumeProof.mockResolvedValueOnce(null)
+    await expect(loadAndDispatchCanonicalReviewedApplicationReview(input)).rejects.toThrow("approved_application_fill_resume_proof_changed")
+    expect(requeueTerminalClaim).toHaveBeenCalledWith(lease)
+    expect(loadState).not.toHaveBeenCalled()
+    expect(reviewTurn.run).not.toHaveBeenCalled()
+
+    requeueTerminalClaim.mockClear()
+    readResumeProof.mockReset().mockResolvedValueOnce({ rootTaskId: "root-fill", proof }).mockResolvedValueOnce({ rootTaskId: "root-fill", proof: { ...proof } })
+    loadState.mockResolvedValue({ ...resumeState(), rootTaskId: "root-fill" })
+    await expect(loadAndDispatchCanonicalReviewedApplicationReview(input)).rejects.toThrow("approved_application_fill_resume_proof_changed")
+    expect(requeueTerminalClaim).toHaveBeenCalledWith(lease)
+    expect(finishResume).not.toHaveBeenCalled()
+  })
+
+  it("does not let a privately claimed Fill lease fall through to ordinary state loading", async () => {
+    const proof = { state: "form_filled" } as CanonicalApprovedApplicationSubmitResumeProof
+    getTerminalClaim.mockReturnValue(proof)
+    const input = resumeInput({ options: { stateLoader: vi.fn() } })
+    await expect(loadAndDispatchCanonicalReviewedApplicationReview(input)).rejects.toThrow("approved_application_fill_resume_proof_changed")
+    expect(requeueTerminalClaim).toHaveBeenCalledWith(lease)
+    expect(loadState).not.toHaveBeenCalled()
+  })
 })
+
+function resumeInput(overrides: Record<string, unknown> = {}) {
+  return { pool: { connect: vi.fn() } as unknown as pg.Pool, lease, signal: new AbortController().signal,
+    options: { productionFlags: resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1",
+      ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" }), taskGraphCommandPort: {} as TaskGraphCommandPort },
+    rootTasks: { ensure: vi.fn(async () => ({ id: "root-fill", attemptCount: 1 })), finish: vi.fn(), checkCompletion: vi.fn() } as unknown as RootTaskStore,
+    executionProjection: { start: vi.fn(), finish: vi.fn() } as unknown as CanonicalExecutionProjection,
+    sessionProjection: { start: vi.fn(), finish: vi.fn() } as unknown as CanonicalSessionProjection,
+    now: () => NOW, coordinationEnabled: true, childExecutionEnabled: true, consumeWaitOutcomes: true, ...overrides } as Parameters<typeof loadAndDispatchCanonicalReviewedApplicationReview>[0]
+}
+
+function resumeState(): CanonicalTurnState {
+  return { scope: { userId: lease.userId }, source: "user", goal: "Fill application", rootTaskId: "root-fill",
+    modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {}, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
+}
 
 function fixture(overrides: Partial<CanonicalTurnState> = {}) {
   const state: CanonicalTurnState = {

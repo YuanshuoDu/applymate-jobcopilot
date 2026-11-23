@@ -16,6 +16,7 @@ import { issueOrReplayReviewedApplicationReview } from "./reviewed-application-r
 import { runCanonicalReviewedApplicationReviewTurn } from "./canonical-reviewed-application-review-turn.js"
 import { finishApprovedApplicationFillTurn, readCurrentApprovedApplicationSubmitResumeProof } from "./canonical-approved-application-submit-resume.js"
 import { sameCanonicalApprovedApplicationSubmitResumeProof } from "./canonical-approved-application-submit-resume-proof.js"
+import { approvedFillTerminalClaimRequeue, claimApprovedFillTerminalLease, getApprovedFillTerminalClaim, type ApprovedFillTerminalClaimFallback } from "./turns/approved-fill-terminal-claim.js"
 
 export type ReviewedApplicationReviewIssuer = typeof issueOrReplayReviewedApplicationReview
 type ReviewOptions = Readonly<{
@@ -26,6 +27,27 @@ type ReviewOptions = Readonly<{
   turnEngineStoreFactory?: (pool: pg.Pool, terminalGuard?: Parameters<typeof createPgTurnEngineStore>[1]) => TurnEngineStore
 }>
 type StateLoader = (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date, options?: CanonicalTurnStateLoadOptions) => Promise<CanonicalTurnState>
+type ResumeGateInput = Readonly<{
+  hasStateLoader: boolean; productionFlags?: ProductionAgentFlags; taskGraphCommandPort?: TaskGraphCommandPort
+  coordinationEnabled: boolean; childExecutionEnabled: boolean; consumeWaitOutcomes: boolean; hasRootCompletionCheck: boolean
+}>
+
+export function approvedApplicationFillResumeEnabled(input: ResumeGateInput): boolean {
+  return !input.hasStateLoader && input.productionFlags?.taskGraphPlanningEnabled === true
+    && input.coordinationEnabled && input.childExecutionEnabled && input.consumeWaitOutcomes
+    && !!input.taskGraphCommandPort && input.hasRootCompletionCheck
+}
+
+export function approvedFillTerminalClaimOption(input: {
+  readonly options: ReviewOptions & { stateLoader?: StateLoader }; readonly rootTasks: RootTaskStore
+  readonly coordinationEnabled: boolean; readonly childExecutionEnabled: boolean; readonly consumeWaitOutcomes: boolean
+}): { readonly approvedFillTerminalClaim: ApprovedFillTerminalClaimFallback } | {} {
+  const { options, rootTasks } = input
+  return approvedApplicationFillResumeEnabled({ hasStateLoader: !!options.stateLoader, productionFlags: options.productionFlags,
+    taskGraphCommandPort: options.taskGraphCommandPort, coordinationEnabled: input.coordinationEnabled,
+    childExecutionEnabled: input.childExecutionEnabled, consumeWaitOutcomes: input.consumeWaitOutcomes,
+    hasRootCompletionCheck: !!rootTasks.checkCompletion }) ? { approvedFillTerminalClaim: claimApprovedFillTerminalLease } : {}
+}
 
 export async function loadAndDispatchCanonicalReviewedApplicationReview<Options extends ReviewOptions & { stateLoader?: StateLoader }>(input: {
   pool: pg.Pool; lease: TurnLease; signal: AbortSignal; options: Options; rootTasks: RootTaskStore
@@ -36,26 +58,43 @@ export async function loadAndDispatchCanonicalReviewedApplicationReview<Options 
   const loadState = (consumeWaitOutcomes: boolean) => input.options.stateLoader?.(input.pool, input.lease, input.now(), {
     consumeWaitOutcomes, durableWaitControlReader: durableWaitPort,
   }) ?? loadCanonicalTurnState(input.pool, input.lease, input.now(), { consumeWaitOutcomes, durableWaitControlReader: durableWaitPort })
-  const resumeEnabled = !input.options.stateLoader && input.options.productionFlags?.taskGraphPlanningEnabled === true
-    && input.coordinationEnabled && input.childExecutionEnabled && input.consumeWaitOutcomes
-    && !!input.options.taskGraphCommandPort && !!input.rootTasks.checkCompletion
+  const terminalClaim = getApprovedFillTerminalClaim(input.lease)
+  const resumeEnabled = approvedApplicationFillResumeEnabled({ hasStateLoader: !!input.options.stateLoader,
+    productionFlags: input.options.productionFlags, taskGraphCommandPort: input.options.taskGraphCommandPort,
+    coordinationEnabled: input.coordinationEnabled, childExecutionEnabled: input.childExecutionEnabled,
+    consumeWaitOutcomes: input.consumeWaitOutcomes, hasRootCompletionCheck: !!input.rootTasks.checkCompletion })
+  if (terminalClaim && !resumeEnabled) throw approvedFillTerminalClaimRequeue(input.lease)
   if (resumeEnabled) {
     const preflight = await readCurrentApprovedApplicationSubmitResumeProof({ pool: input.pool, lease: input.lease, now: input.now() })
+    if (terminalClaim && (!preflight || preflight.rootTaskId !== terminalClaim.rootTaskId
+      || !sameCanonicalApprovedApplicationSubmitResumeProof(terminalClaim, preflight.proof))) {
+      throw approvedFillTerminalClaimRequeue(input.lease)
+    }
     if (preflight) {
       // The proof must exist before the ordinary owner-fenced child-Wait consumption can write.
       const state = await loadState(true)
-      if (state.rootTaskId !== preflight.rootTaskId) throw new Error("approved_application_fill_resume_root_changed")
+      if (state.rootTaskId !== preflight.rootTaskId) {
+        if (terminalClaim) throw approvedFillTerminalClaimRequeue(input.lease)
+        throw new Error("approved_application_fill_resume_root_changed")
+      }
       const current = await readCurrentApprovedApplicationSubmitResumeProof({ pool: input.pool, lease: input.lease, now: input.now() })
       if (!current || current.rootTaskId !== preflight.rootTaskId
-        || !sameCanonicalApprovedApplicationSubmitResumeProof(preflight.proof, current.proof)) {
+        || !sameCanonicalApprovedApplicationSubmitResumeProof(preflight.proof, current.proof)
+        || (terminalClaim && !sameCanonicalApprovedApplicationSubmitResumeProof(terminalClaim, current.proof))) {
+        if (terminalClaim) throw approvedFillTerminalClaimRequeue(input.lease)
         throw new Error("approved_application_fill_resume_proof_changed")
       }
       const root = await input.rootTasks.ensure({ lease: input.lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot,
         toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions: [], now: input.now() })
-      if (root.id !== preflight.rootTaskId || root.attemptCount !== 1) throw new Error("approved_application_fill_resume_root_changed")
+      if (root.id !== preflight.rootTaskId || root.attemptCount !== 1) {
+        if (terminalClaim) throw approvedFillTerminalClaimRequeue(input.lease)
+        throw new Error("approved_application_fill_resume_root_changed")
+      }
       const rebound = await readCurrentApprovedApplicationSubmitResumeProof({ pool: input.pool, lease: input.lease, now: input.now() })
       if (!rebound || rebound.rootTaskId !== preflight.rootTaskId
-        || !sameCanonicalApprovedApplicationSubmitResumeProof(preflight.proof, rebound.proof)) {
+        || !sameCanonicalApprovedApplicationSubmitResumeProof(preflight.proof, rebound.proof)
+        || (terminalClaim && !sameCanonicalApprovedApplicationSubmitResumeProof(terminalClaim, rebound.proof))) {
+        if (terminalClaim) throw approvedFillTerminalClaimRequeue(input.lease)
         throw new Error("approved_application_fill_resume_proof_changed")
       }
       const result = await finishApprovedApplicationFillTurn({ pool: input.pool, lease: input.lease, state,
@@ -65,6 +104,7 @@ export async function loadAndDispatchCanonicalReviewedApplicationReview<Options 
       return { result, durableWaitPort, setupOptions: { ...input.options, stateLoader: async () => state } }
     }
   }
+  if (terminalClaim) throw approvedFillTerminalClaimRequeue(input.lease)
   const state = await loadState(input.consumeWaitOutcomes)
   const result = await dispatchCanonicalReviewedApplicationReview({ ...input, state })
   return { result, durableWaitPort, setupOptions: { ...input.options, stateLoader: async () => state } }

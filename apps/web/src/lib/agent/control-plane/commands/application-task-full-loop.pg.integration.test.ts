@@ -1786,6 +1786,14 @@ type Stage8PreparedScenario = {
   applicationTaskId: string
   submitApprovalId: string
 }
+
+async function stage8ModelAndToolCallEventIds(prepared: Pick<Stage8PreparedScenario, "sessionId" | "fillTurnId">): Promise<string[]> {
+  const events = await testDb.agentEvent.findMany({ where: { sessionId: prepared.sessionId, turnId: prepared.fillTurnId,
+    type: { in: ["model.started", "tool_call.started", "tool_call.completed", "tool_call.failed"] } },
+    orderBy: [{ sequence: "asc" }, { id: "asc" }], select: { id: true, type: true } })
+  return events.map(event => `${event.type}:${event.id}`)
+}
+
 type Stage8FailureSnapshotScope = Pick<Stage8PreparedScenario,
   "jobId" | "sessionId" | "fillTurnId" | "applicationTaskId" | "submitApprovalId">
 
@@ -3550,14 +3558,15 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     }
   }, 900_000)
 
-  it.skipIf(process.env.RUN_STAGE8_APPROVED_FILL_EARLY_WAKE_WITNESS !== "1")(
-    "holds the real submit queue call until the original approved Fill Turn has a verified terminal receipt",
+  it(
+    "Stage 8 early wake: holds submit queue until the original approved Fill Turn has its terminal receipt",
     async () => {
       await stopFixture(worker)
       worker = spawnFixture("worker-staged")
       await waitLine(worker, "WORKER_READY", 90_000)
 
       const prepared = await prepareStage8Scenario("early-wake")
+      const executionEventsBeforeWake = await stage8ModelAndToolCallEventIds(prepared)
       const before = await requestFixtureStats()
       const beforeEmployerPosts = before.requests.filter(path => path === "POST /example-reviewed/jobs/1").length
       const autoApply = await import("@/lib/auto-apply")
@@ -3680,6 +3689,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           if (!verifiedTerminal) await delay(100)
         }
         expect(verifiedTerminal).toBe(true)
+        expect(await stage8ModelAndToolCallEventIds(prepared)).toEqual(executionEventsBeforeWake)
         await assertPreQueueState()
 
         releaseQueue()
@@ -3701,6 +3711,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           && jsonString(matchingIntents[0]!.payload, "receiptId") === prepared.submitApprovalId
           && Boolean(jsonString(matchingIntents[0]!.payload, "workerTaskId"))
         expect(exactIntent && queuedEventCount === 1).toBe(true)
+        expect(await stage8ModelAndToolCallEventIds(prepared)).toEqual(executionEventsBeforeWake)
         expect(stats.requests.filter(path => path === "POST /example-reviewed/jobs/1")).toHaveLength(beforeEmployerPosts)
       } finally {
         if (barrierTimer) clearTimeout(barrierTimer)

@@ -15,6 +15,7 @@ import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment
 import type { TurnEngineQueryClient } from "./turn-engine-owner-sql.js"
 import type { CognitiveAgendaReceipt } from "./cognitive-agenda-receipt.js"
 import type { TurnEngineToolExecutor } from "./turn-engine-tool-executor.js"
+import type { ApprovedFillResumeTerminalStepDescriptor } from "./approved-fill-resume-terminal-step.js"
 export type { TurnEngineToolExecutor } from "./turn-engine-tool-executor.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "question" | "error"
@@ -63,6 +64,8 @@ export type AtomicTurnCompletionInput = {
   readonly usage: TurnUsage
   /** Validated discovery output persisted in the root task's terminal receipt. */
   readonly interactiveDiscoveryShortlist?: RepositoryJsonValue
+  /** In-process capability for the approved Fill-only atomic terminal continuation. */
+  readonly approvedFillResumeTerminalStep?: ApprovedFillResumeTerminalStepDescriptor
   readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: TaskGraphFinalSummaryBinding
 }
 

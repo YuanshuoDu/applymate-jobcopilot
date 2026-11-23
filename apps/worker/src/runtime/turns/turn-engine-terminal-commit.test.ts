@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
 import { commitTurnTerminal, type TurnEngineTerminalGuard } from "./turn-engine-terminal-commit.js"
+import { createApprovedFillResumeTerminalStepDescriptor } from "./approved-fill-resume-terminal-step.js"
 import { createCanonicalTurnTerminalGuard } from "../canonical-turn-native-verification-runtime.js"
 import { SessionPauseRequestedError, sessionTerminalAdmissionKindFor } from "../session-gate.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
@@ -16,14 +18,30 @@ import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summa
 import { taskGraphItemId, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
 import type { GraphTaskRow, LoadedGraph } from "../subagents/task-graph-pg-state.js"
 
-const { terminalSteeringReadMock } = vi.hoisted(() => ({ terminalSteeringReadMock: vi.fn() }))
+const { terminalSteeringReadMock, terminalStepWriteMock, earlyClaimMock, chronologyMockMode } = vi.hoisted(() => ({
+  terminalSteeringReadMock: vi.fn(), terminalStepWriteMock: vi.fn(async (_input: unknown) => "step-completed-special"),
+  earlyClaimMock: vi.fn(), chronologyMockMode: { enabled: false },
+}))
 const { updateRootObjectiveHistoryProjectionMock } = vi.hoisted(() => ({ updateRootObjectiveHistoryProjectionMock: vi.fn(async () => true) }))
+vi.mock("./approved-fill-terminal-claim.js", () => ({ getApprovedFillTerminalClaim: earlyClaimMock, approvedFillTerminalClaimRequeue: vi.fn() }))
+vi.mock("./approved-fill-resume-terminal-step.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./approved-fill-resume-terminal-step.js")>()
+  return { ...actual, writeApprovedFillResumeTerminalStep: (value: Parameters<typeof actual.writeApprovedFillResumeTerminalStep>[0]) => terminalStepWriteMock(value) }
+})
+vi.mock("../context/root-task-history-chronology-witness.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../context/root-task-history-chronology-witness.js")>()
+  return { ...actual, appendRootTaskHistoryChronologyWitness: (...args: Parameters<typeof actual.appendRootTaskHistoryChronologyWitness>) =>
+    chronologyMockMode.enabled ? Promise.resolve({ eventId: "chronology-witness-special", xid8: "100" }) : actual.appendRootTaskHistoryChronologyWitness(...args) }
+})
 vi.mock("../subagents/steering-reconciliation-read.js", async importOriginal => ({
   ...await importOriginal<typeof import("../subagents/steering-reconciliation-read.js")>(),
   readSteeringReconciliationStateForTerminal: (...args: unknown[]) => terminalSteeringReadMock(...args),
 }))
 vi.mock("../context/objective-history-projection.js", () => ({ updateRootObjectiveHistoryProjection: updateRootObjectiveHistoryProjectionMock }))
 beforeEach(() => {
+  terminalStepWriteMock.mockClear().mockResolvedValue("step-completed-special")
+  earlyClaimMock.mockReset()
+  chronologyMockMode.enabled = false
   updateRootObjectiveHistoryProjectionMock.mockReset().mockResolvedValue(true)
   terminalSteeringReadMock.mockReset().mockResolvedValue({ unresolvedInputs: [] })
 })
@@ -68,6 +86,7 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
       if (sql.includes("pg_advisory_xact_lock")) return { rows: [], rowCount: 1 }
       if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "100" }], rowCount: 1 }
       if (sql.includes('SELECT "eventSequence" FROM "agent_sessions"')) return { rows: [{ eventSequence: sequence }], rowCount: 1 }
+      if (sql.includes('SELECT session."status"') && sql.includes('AS "noUnresolvedPause"')) return { rows: [{ status: options.sessionStatus ?? "running", noUnresolvedPause: !options.pause }], rowCount: 1 }
       if (sql.includes('JOIN "application_tasks" AS fill_task')) {
         const count = options.pause || options.sessionStatus !== "waiting_for_user" ? 0
           : (options.applicationTaskRows ?? 0) * (options.applicationFillerRows ?? 1)
@@ -96,9 +115,9 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
         const [sessionId, turnId, taskId, stepId, itemId, completedEventId, parentSequence] = values ?? []
         const item = items.get(String(itemId))
         const completed = [...events.values()].find(event => event.id === completedEventId)
-        const stepMatches = sessionId === owner.sessionId && turnId === owner.turnId && taskId === owner.taskId && stepId === input.stepId
+        const stepMatches = sessionId === owner.sessionId && turnId === owner.turnId && taskId === owner.taskId && stepId === values?.[3]
         const itemMatches = item?.sessionId === owner.sessionId && item.turnId === owner.turnId && item.taskId === owner.taskId
-          && item.stepId === input.stepId && item.type === "agent_message" && item.status === "completed"
+          && item.stepId === values?.[3] && item.type === "agent_message" && item.status === "completed"
           && item.phase === "final_answer" && item.revision === 1
         const eventPayload = completed?.payload as Row | undefined
         if (!completed || !eventPayload) throw new Error("Expected the completed final-item event fixture")
@@ -210,6 +229,46 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
 }
 
 describe("atomic Turn terminal commit", () => {
+  it("writes an early approved Fill Step through the guarded terminal transaction", async () => {
+    const lease = { turnId: owner.turnId, sessionId: owner.sessionId, ownerId: owner.ownerId, userId: owner.userId, leaseVersion: owner.leaseVersion,
+      leaseStartedAt: now, leaseExpiresAt: owner.leaseExpiresAt }
+    const proof = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+      turnOwnerId: owner.ownerId, turnLeaseVersion: owner.leaseVersion, turnRevision: 4, applicationTaskId: "application-1", jobId: "job-1",
+      fillerTaskId: "filler-1", graphRevision: 2, graphFingerprint: "graph", approvalId: "approval-1", waitItemId: "wait-1",
+      approvalRevision: 3, resourceHash: "a".repeat(64), materialHash: "b".repeat(64), answersHash: "c".repeat(64),
+      state: "form_filled" as const, workerTaskId: null, outboxId: null }
+    earlyClaimMock.mockImplementation(candidate => candidate === lease ? proof : undefined)
+    const stepId = `approved-fill-resume:${createHash("sha256").update(lease.turnId, "utf8").digest("hex")}:${lease.leaseVersion}:1`
+    const descriptor = createApprovedFillResumeTerminalStepDescriptor({ proof, lease, rootTaskId: owner.rootTaskId, ordinal: 1,
+      inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: {}, stepCount: input.stepCount, toolCallCount: input.toolCallCount })
+    const fake = makePool([], undefined, { sessionStatus: "waiting_for_user", applicationTaskRows: 1, executionMode: "canonical_task_graph" })
+    chronologyMockMode.enabled = true
+    terminalStepWriteMock.mockImplementation(async (value: unknown) => {
+      expect((value as { client: unknown }).client).toBe(fake.client)
+      fake.calls.push({ sql: "APPROVED_TERMINAL_STEP" })
+      return "step-completed-special"
+    })
+    const earlyInput = { ...input, stepId, finalItemId: "final-early", approvedFillResumeTerminalStep: descriptor }
+    const scope = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId }
+    const guard = vi.fn(async (_client: pg.PoolClient, terminal: Parameters<TurnEngineTerminalGuard>[1], admission?: Parameters<TurnEngineTerminalGuard>[2]) => {
+      expect(terminal.stepId).toBe(stepId)
+      expect(sessionTerminalAdmissionKindFor(admission!, fake.client as never, scope)).toBe("derived_fill")
+      fake.calls.push({ sql: "GUARD" })
+      return { ok: true as const }
+    })
+
+    await expect(commitTurnTerminal(fake.pool, earlyInput, guard)).resolves.toMatchObject({ status: "completed", finalItemId: "final-early" })
+
+    expect(terminalStepWriteMock).toHaveBeenCalledOnce()
+    expect(terminalStepWriteMock.mock.calls[0]?.[0]).toMatchObject({ descriptor, alreadyCommitted: false })
+    const stepIndex = fake.calls.findIndex(call => call.sql === "APPROVED_TERMINAL_STEP")
+    const guardIndex = fake.calls.findIndex(call => call.sql === "GUARD")
+    const itemIndex = fake.calls.findIndex(call => call.sql.includes('INSERT INTO "agent_items"'))
+    expect(stepIndex).toBeGreaterThan(-1)
+    expect(stepIndex).toBeLessThan(guardIndex)
+    expect(guardIndex).toBeLessThan(itemIndex)
+  })
+
   it("projects the persisted Root-owned completion receipt and accepts the same event on replay", async () => {
     const fake = makePool()
     await commitTurnTerminal(fake.pool, input)

@@ -42,7 +42,9 @@ import { type ScheduledAutomationPipelineBridgeResult, type ScheduledAutomationP
 import { type ScheduledPipelineCandidateStore } from "./subagents/scheduled-pipeline-candidate-store.js"
 import { createCanonicalTurnScheduledPipeline } from "./canonical-turn-scheduled-pipeline.js"
 import { prepareCanonicalTurnSetup, taskGraphDenialCheckpointReader, turnStoreForInteractiveDiscovery } from "./canonical-turn-runtime-turn-setup.js"
-import { loadAndDispatchCanonicalReviewedApplicationReview, type ReviewedApplicationReviewIssuer } from "./canonical-reviewed-application-review-dispatch.js"
+import { approvedFillTerminalClaimOption, loadAndDispatchCanonicalReviewedApplicationReview, type ReviewedApplicationReviewIssuer } from "./canonical-reviewed-application-review-dispatch.js"
+import { getApprovedFillTerminalClaim } from "./turns/approved-fill-terminal-claim.js"
+import type { CanonicalTurnRuntime } from "../queue/production-bootstrap.js"
 import type { TurnEngineQueryClient } from "./turns/turn-engine-owner-sql.js"
 import type { TurnQuestionStore } from "./turns/turn-question-contract.js"
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"; export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
@@ -78,13 +80,7 @@ export type CanonicalTurnRuntimeOptions = {
   readonly now?: () => Date
 }
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
-export async function createCanonicalTurnRuntime(pool: pg.Pool, options: CanonicalTurnRuntimeOptions): Promise<{
-  execute: TurnExecutor
-  manager: AgentTreeManager
-  childExecutionEnabled: boolean
-  coordinationEnabled: boolean
-  close(): Promise<void>
-}> {
+export async function createCanonicalTurnRuntime(pool: pg.Pool, options: CanonicalTurnRuntimeOptions): Promise<{ -readonly [K in keyof CanonicalTurnRuntime]: CanonicalTurnRuntime[K] }> {
   if (!options.workerId.trim()) throw new TypeError("workerId must be non-empty")
   const now = options.now ?? (() => new Date())
   const manager = options.manager ?? new AgentTreeManager(new PgSubagentTaskStore(pool), { now })
@@ -106,7 +102,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
   let closed = false
   const execute: TurnExecutor = async ({ lease, signal }): Promise<TurnExecutionResult> => {
     if (closed) throw new Error("canonical_runtime_closed")
-    const terminal = await reconcileTerminal?.({ lease, now: now() })
+    const terminal = getApprovedFillTerminalClaim(lease) ? undefined : await reconcileTerminal?.({ lease, now: now() })
     // A woke Turn may carry a prior waiting result until ensure() rebinds it; only durable terminal results short-circuit.
     if (terminal && !isResumableRootResult(terminal.result)) {
       await executionProjection.finish({
@@ -246,5 +242,9 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     if (!webOwnsExecution) await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result }); await sessionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
     return { status: result.status, summary: result.errorCode, ...(result.waitId ? { waitId: result.waitId } : {}) }
   }
-  return { execute, manager, childExecutionEnabled, coordinationEnabled, async close() { closed = true } }
+  return {
+    execute, manager, childExecutionEnabled, coordinationEnabled,
+    ...approvedFillTerminalClaimOption({ options, rootTasks, coordinationEnabled, childExecutionEnabled, consumeWaitOutcomes }),
+    async close() { closed = true },
+  }
 }
