@@ -7,6 +7,7 @@ import { access, unlink } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
+import { isDeepStrictEqual } from "node:util"
 
 import { Prisma, PrismaClient } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
@@ -596,7 +597,7 @@ async function createLegacyAckWitnessForTest(writeLine: (line: string) => void):
 }
 
 describe("legacy queue acknowledgement fixture witness", () => {
-  it("holds only the exact returned submit attempt until bounded teardown", async () => {
+  it("holds only the exact returned submit attempt until shutdown and does not arm a restart worker", async () => {
     const markers: string[] = []
     let witness: LegacyAckWitness
     const scope = { sessionId: `full-loop-session-${"a".repeat(32)}`, fillTurnId: "turn_witness", expectedAttempt: 1 }
@@ -630,35 +631,20 @@ describe("legacy queue acknowledgement fixture witness", () => {
     expect(processorSettled).toBe(false)
     expect(witness.proves({ ...proof, jobId: "job_other" })).toBe(false)
     expect(witness.proves(proof)).toBe(true)
+
+    const restartMarkers: string[] = []
+    const restartWitness = await createLegacyAckWitnessForTest(line => restartMarkers.push(line))
+    const restartWorker: LegacyAckFakeWorker = { processFn: async () => "processed" }
+    restartWitness.wrap(restartWorker)
+    await expect(restartWorker.processFn(submitJob)).resolves.toBe("processed")
+    expect(restartMarkers).toEqual([])
+    expect(processorSettled).toBe(false)
+    expect(witness.proves(proof)).toBe(true)
+
     witness.releaseForShutdown()
     expect(witness.proves(proof)).toBe(false)
     await expect(pending).resolves.toBe("processed")
     expect(processorSettled).toBe(true)
-  })
-
-  it("invalidates a historical barrier marker after its bounded hold expires", async () => {
-    const markers: string[] = []
-    const witness = await createLegacyAckWitnessForTest(line => markers.push(line))
-    const scope = { sessionId: `full-loop-session-${"b".repeat(32)}`, fillTurnId: "turn_expired_witness", expectedAttempt: 1 }
-    const job: LegacyAckFakeJob = { id: "job_expired", attemptsStarted: 1,
-      data: { operation: "submit", sessionId: scope.sessionId, fillTurnId: scope.fillTurnId } }
-    const proof = { sessionId: scope.sessionId, fillTurnId: scope.fillTurnId, jobId: job.id, attemptsStarted: 1 }
-    const worker: LegacyAckFakeWorker = { processFn: async () => "processed" }
-    witness.wrap(worker)
-    expect(witness.arm(scope)).toBe(true)
-    vi.useFakeTimers()
-    try {
-      const pending = worker.processFn(job)
-      await Promise.resolve()
-      await Promise.resolve()
-      expect(markers).toEqual(["LEGACY_ACK_BARRIER_REACHED attempt=1"])
-      expect(witness.proves(proof)).toBe(true)
-      await vi.advanceTimersByTimeAsync(45_000)
-      await expect(pending).resolves.toBe("processed")
-      expect(witness.proves(proof)).toBe(false)
-    } finally {
-      vi.useRealTimers()
-    }
   })
 })
 
@@ -697,13 +683,23 @@ describe("fresh legacy fixture markers", () => {
     lines.push("LEGACY_FINAL_RESPONSE_GATE_PROOF_NOT_HELD")
     expect(freshFixtureLine(lines, proofMarkers, 1)).toBe("LEGACY_FINAL_RESPONSE_GATE_PROOF_NOT_HELD")
   })
+
+  it("ignores buffered queue acknowledgement decisions", () => {
+    const lines = ["LEGACY_ACK_BARRIER_PROVED"]
+    const decisionMarkers = ["LEGACY_ACK_BARRIER_PROVED", "LEGACY_ACK_BARRIER_PROOF_REJECTED"]
+    expect(freshFixtureLine(lines, decisionMarkers, lines.length)).toBeUndefined()
+    lines.push("LEGACY_ACK_BARRIER_PROOF_REJECTED")
+    expect(freshFixtureLine(lines, decisionMarkers, 1)).toBe("LEGACY_ACK_BARRIER_PROOF_REJECTED")
+  })
 })
 
-async function waitForLegacyAckMarker(child: Child, expected: string, rejected?: string, timeoutMs = 10_000): Promise<void> {
+async function waitForLegacyAckMarker(child: Child, expected: string, rejected: string,
+  afterIndex: number, timeoutMs = 10_000): Promise<void> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
-    if (child.lines.includes(expected)) return
-    if (rejected && child.lines.includes(rejected)) throw new Error("legacy_ack_barrier_control_rejected")
+    const decision = freshFixtureLine(child.lines, [expected, rejected], afterIndex)
+    if (decision === expected) return
+    if (decision === rejected) throw new Error("legacy_ack_barrier_control_rejected")
     if (exited(child)) throw new Error("legacy_ack_barrier_worker_exited")
     await delay(25)
   }
@@ -712,16 +708,35 @@ async function waitForLegacyAckMarker(child: Child, expected: string, rejected?:
 
 async function armLegacyQueueAckBarrier(sessionId: string, fillTurnId: string): Promise<void> {
   if (!worker?.stdin) throw new Error("legacy_ack_barrier_worker_stdin_unavailable")
+  const afterIndex = worker.lines.length
   worker.stdin.write(`arm-legacy-ack-barrier ${JSON.stringify({ sessionId, fillTurnId, expectedAttempt: 1 })}\n`)
-  await waitForLegacyAckMarker(worker, "LEGACY_ACK_BARRIER_ARMED", "LEGACY_ACK_BARRIER_ARM_FAILED")
+  await waitForLegacyAckMarker(worker, "LEGACY_ACK_BARRIER_ARMED", "LEGACY_ACK_BARRIER_ARM_FAILED", afterIndex)
 }
 
 async function proveLegacyQueueAckBarrier(proof: {
   sessionId: string; fillTurnId: string; jobId: string; attemptsStarted: number
 }): Promise<void> {
   if (!worker?.stdin) throw new Error("legacy_ack_barrier_worker_stdin_unavailable")
+  const afterIndex = worker.lines.length
   worker.stdin.write(`prove-legacy-ack-barrier ${JSON.stringify(proof)}\n`)
-  await waitForLegacyAckMarker(worker, "LEGACY_ACK_BARRIER_PROVED", "LEGACY_ACK_BARRIER_PROOF_REJECTED")
+  await waitForLegacyAckMarker(worker, "LEGACY_ACK_BARRIER_PROVED", "LEGACY_ACK_BARRIER_PROOF_REJECTED", afterIndex)
+}
+
+async function proveCurrentLegacyQueueAckHold(expected: {
+  sessionId: string; fillTurnId: string; jobId: string; applicationTaskId: string; receiptId: string; payload: unknown
+}): Promise<void> {
+  const heldJob = await applyQueue!.getJob(expected.jobId)
+  expect(Boolean(heldJob)).toBe(true)
+  expect(heldJob?.id === expected.jobId).toBe(true)
+  expect(await heldJob!.getState()).toBe("active")
+  expect(heldJob!.attemptsStarted).toBe(1)
+  expect(isDeepStrictEqual(heldJob!.data, expected.payload)).toBe(true)
+  const payload = jsonRecord(heldJob!.data)
+  expect(Boolean(payload && payload.operation === "submit" && payload.sessionId === expected.sessionId
+    && payload.fillTurnId === expected.fillTurnId && payload.applicationTaskId === expected.applicationTaskId
+    && payload.receiptId === expected.receiptId)).toBe(true)
+  await proveLegacyQueueAckBarrier({ sessionId: expected.sessionId, fillTurnId: expected.fillTurnId,
+    jobId: expected.jobId, attemptsStarted: heldJob!.attemptsStarted })
 }
 
 async function armLegacyFinalResponseGate(turnId: string): Promise<void> {
@@ -1915,6 +1930,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(uncertainSession?.userId === ids.user && uncertainSession.status === "waiting_for_user"
       && uncertainSession.completedAt === null).toBe(true)
     expect(await expectLegacyFillTurnLeased(successorTurnId) === successorRootTaskId).toBe(true)
+    await proveCurrentLegacyQueueAckHold({ sessionId: ids.session, fillTurnId: successorTurnId, jobId: workerTaskId,
+      applicationTaskId: gateTaskId, receiptId: submitApproval.id, payload: intent.submitPayload })
     await releaseLegacyFinalResponseGate()
     expect((await waitForAgentTurnTerminal(successorTurnId, 30_000)).status).toBe("completed")
     expect(await testDb.agentTurn.findUniqueOrThrow({ where: { id: successorTurnId }, select: {
@@ -1956,21 +1973,12 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       where: { id: submitApproval.id }, select: { status: true },
     })).toEqual(approvalBeforeDuplicate)
     expect((await requestFixtureStats()).submitCount).toBe(1)
-    const heldAckJob = await applyQueue!.getJob(workerTaskId)
-    expect(Boolean(heldAckJob)).toBe(true)
-    expect(heldAckJob?.id === workerTaskId).toBe(true)
-    expect(await heldAckJob!.getState()).toBe("active")
-    expect(heldAckJob!.attemptsStarted).toBe(1)
-    const heldAckPayload = jsonRecord(heldAckJob!.data)
-    expect(Boolean(heldAckPayload && heldAckPayload.operation === "submit" && heldAckPayload.sessionId === ids.session
-      && heldAckPayload.fillTurnId === successorTurnId && heldAckPayload.applicationTaskId === gateTaskId
-      && heldAckPayload.receiptId === submitApproval.id)).toBe(true)
+    await proveCurrentLegacyQueueAckHold({ sessionId: ids.session, fillTurnId: successorTurnId, jobId: workerTaskId,
+      applicationTaskId: gateTaskId, receiptId: submitApproval.id, payload: intent.submitPayload })
     const uncertainBeforeKill = await testDb.applicationTask.findUniqueOrThrow({ where: { id: gateTaskId },
       select: { status: true, checkpoint: true, fillTurnId: true, workerTaskId: true } })
     expect(uncertainBeforeKill.status === "waiting_for_user" && uncertainBeforeKill.checkpoint === "submission_uncertain"
       && uncertainBeforeKill.fillTurnId === successorTurnId && uncertainBeforeKill.workerTaskId === workerTaskId).toBe(true)
-    await proveLegacyQueueAckBarrier({ sessionId: ids.session, fillTurnId: successorTurnId,
-      jobId: workerTaskId, attemptsStarted: heldAckJob!.attemptsStarted })
     worker!.kill("SIGKILL")
     expect(await waitExit(worker!, 5_000)).toBe(true)
     worker = spawnFixture("worker")

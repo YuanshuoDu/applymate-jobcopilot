@@ -1,4 +1,3 @@
-const MAX_HOLD_MS = 45_000
 const SYNTHETIC_SESSION = /^full-loop-session-[a-f0-9]{32}$/
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
 
@@ -72,18 +71,15 @@ export function createLegacyQueueAckWitness(writeLine) {
       } catch {
         return result
       }
-      let settled = false, timer
+      let settled = false
       let resolveHold
       const held = new Promise(resolve => { resolveHold = resolve })
       const finish = () => {
         if (settled) return
         settled = true
-        clearTimeout(timer)
         releaseHold = null
         resolveHold()
       }
-      timer = setTimeout(finish, MAX_HOLD_MS)
-      timer.unref?.()
       releaseHold = finish
       writeLine("LEGACY_ACK_BARRIER_REACHED attempt=1")
       await held
