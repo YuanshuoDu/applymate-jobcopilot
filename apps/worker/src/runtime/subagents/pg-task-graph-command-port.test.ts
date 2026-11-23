@@ -255,7 +255,10 @@ function fakePool(input: TaskGraphScheduleInput, options: FakePoolOptions = {}) 
         ? empty
         : { rows: [{ id: itemId, revision: graphRevision, content: graphContent, createdAt: new Date("2026-09-20T12:00:00.000Z") }], rowCount: 1 }
       if (sql.includes('AS "hasExecutionEvidence"')) return options.sourceEvidence ? { rows: [options.sourceEvidence], rowCount: 1 } : empty
-      if (sql.startsWith('SELECT task."id", task."status"')) return { rows: taskRows, rowCount: taskRows.length }
+      if (sql.startsWith('SELECT task."id", task."status"')) {
+        const rows = sql.includes('AS "deadlineObservedAtUtc"') ? taskRows : taskRows.map(({ absoluteDeadlineAtUtc: _deadline, deadlineObservedAtUtc: _observed, ...row }) => row)
+        return { rows, rowCount: rows.length }
+      }
       if (sql.startsWith('SELECT event."payload"')) {
         if (values.length === 5 && options.includeReplay !== false) return { rows: [{ payload: replayPayload }], rowCount: 1 }
         if (values.length === 13 && options.sourceCancellationEvent && cancellationSourceProofMatches(options.sourceCancellationEvent, values)) {
@@ -933,39 +936,62 @@ describe("createPgTaskGraphCommandPort", () => {
 
   it("keeps generic reads provenance-free and exposes safe source intent only through the planning read", async () => {
     const input = scheduleInput()
+    const deadline = "2026-11-23T12:30:00.000Z", observedAt = "2026-11-23T12:00:00.000Z"
     const sourceStep = { id: "root-step", userId: input.scope.userId, turnUserId: input.scope.userId,
       sessionId: input.scope.sessionId, turnId: input.scope.turnId, rootTaskId: input.scope.rootTaskId,
       taskId: input.scope.rootTaskId, status: "streaming", attempt: 1, inputThroughSequence: "7", consumedInputIds: [],
       sessionEventSequence: "7", checkpointInputsValid: true, hasPendingAcceptedInputs: false, isDiscoveredCurrent: true,
       isExplicitCurrent: false, activeCount: 1 }
-    const fake = fakePool(input, { includeReplay: false, sourceStepRows: [sourceStep] })
+    const fake = fakePool(input, { includeReplay: false, sourceStepRows: [sourceStep], taskRows: [{
+      id: "child-1", status: "queued", role: "analyst", taskType: "research", failureReason: null, result: null,
+      absoluteDeadlineAtUtc: deadline, deadlineObservedAtUtc: observedAt,
+    }] })
     const port = createPgTaskGraphCommandPort(fake.pool)
     const { stepId: _stepId, ...scope } = input.scope
 
     const ordinary = await port.readCurrent(scope)
     expect(ordinary).not.toHaveProperty("sourceIntent")
+    expect(ordinary).not.toHaveProperty("activeChildDeadlines")
     expect(fake.calls.some(call => call.sql.startsWith("WITH current_candidates AS MATERIALIZED"))).toBe(false)
+    const taskReads = () => fake.calls.filter(call => call.sql.startsWith('SELECT task."id", task."status"'))
+    expect(taskReads()[0]?.sql).not.toContain("statement_timestamp()")
 
     const planning = await port.readCurrentForPlanning!(scope)
     expect(planning.current.sourceIntent).toEqual([{ nodeKey: "planned", goal: "Inspect the source",
       successCriteria: ["Evidence captured"], inputRelation: "unknown" }])
+    expect(planning.current.activeChildDeadlines).toEqual({ revision: 2, observedAt, entries: [{ nodeKey: "planned", deadlineAt: deadline }] })
     expect(planning.currentInputCheckpoint).toEqual({ inputThroughSequence: 7n })
     expect(JSON.stringify(planning.current)).not.toMatch(/currentInputCheckpoint|inputThroughSequence|source-step|root-step/)
     expect(fake.calls.filter(call => call.sql.startsWith("WITH current_candidates AS MATERIALIZED"))).toHaveLength(1)
+    expect(taskReads()).toHaveLength(2)
+    expect(taskReads()[1]?.sql).toContain("statement_timestamp()")
+    expect(taskReads()[1]?.sql).toContain("to_jsonb(task)->>'absoluteDeadlineAt'")
   })
 
   it("reloads graph state through the caller-owned client without opening another transaction", async () => {
     const input = scheduleInput()
-    const fake = fakePool(input, { includeReplay: false })
+    const deadline = "2026-11-23T12:30:00.000Z", observedAt = "2026-11-23T12:00:00.000Z"
+    const fake = fakePool(input, { includeReplay: false, taskRows: [{
+      id: "child-1", status: "queued", role: "analyst", taskType: "research", failureReason: null, result: null,
+      absoluteDeadlineAtUtc: deadline, deadlineObservedAtUtc: observedAt,
+    }] })
     const { stepId: _stepId, ...scope } = input.scope
     const port = createPgTaskGraphCommandPort(fake.pool)
 
-    await expect(port.readCurrentWithClient!(fake.client as unknown as pg.PoolClient, scope)).resolves.toMatchObject({ revision: 2 })
+    const ordinary = await port.readCurrentWithClient!(fake.client as unknown as pg.PoolClient, scope)
+    expect(ordinary).toMatchObject({ revision: 2 })
+    expect(ordinary).not.toHaveProperty("activeChildDeadlines")
+    const planning = await port.readCurrentForPlanningWithClient!(fake.client as unknown as pg.PoolClient, scope)
+    expect(planning.current.activeChildDeadlines).toEqual({ revision: 2, observedAt, entries: [{ nodeKey: "planned", deadlineAt: deadline }] })
     expect(fake.pool.connect).not.toHaveBeenCalled()
     expect(fake.calls.some(call => ["BEGIN", "COMMIT", "ROLLBACK"].includes(call.sql))).toBe(false)
     expect(fake.calls.find(call => call.sql.startsWith("SELECT set_config"))?.values).toEqual([input.scope.userId])
     expect(fake.calls.some(call => call.sql.startsWith('SELECT "id" FROM "agent_sessions"'))).toBe(true)
     expect(fake.calls.some(call => call.sql.startsWith('SELECT item."id"'))).toBe(true)
+    const taskReads = fake.calls.filter(call => call.sql.startsWith('SELECT task."id", task."status"'))
+    expect(taskReads).toHaveLength(2)
+    expect(taskReads[0]?.sql).not.toContain("statement_timestamp()")
+    expect(taskReads[1]?.sql).toContain("statement_timestamp()")
   })
 
   it("derives counts from the same owner-scoped LoadedGraph without another SELECT", async () => {

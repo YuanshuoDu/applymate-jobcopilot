@@ -31,7 +31,9 @@ export type LoadedGraph = Readonly<{
   sourceInputRelationByNodeKey?: ReadonlyMap<string, TaskGraphInputRelation>
   currentInputCheckpoint?: TaskGraphSourceCheckpoint | null
 }>
-export type TaskGraphSourceOptions = TaskGraphSourceLoadOptions & Readonly<{ includeSourceProvenance?: boolean }>
+export type TaskGraphSourceOptions = TaskGraphSourceLoadOptions & Readonly<{
+  includeSourceProvenance?: boolean; includeActiveChildDeadlines?: boolean
+}>
 export { currentTaskGraph } from "./task-graph-pg-current-node.js"
 type Queryable = Pick<pg.PoolClient, "query">
 function nonEmpty(value: unknown): value is string { return typeof value === "string" && value.trim().length > 0 }
@@ -113,14 +115,15 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
   const revision = Number(stored.revision)
   if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("task_graph_revision_invalid")
   const ids = snapshot.nodes.map(node => node.taskId)
+  const deadlineColumns = options.includeActiveChildDeadlines ? `,
+      to_char(((to_jsonb(task)->>'absoluteDeadlineAt')::timestamptz) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS') || 'Z' AS "absoluteDeadlineAtUtc",
+      to_char(statement_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS') || 'Z' AS "deadlineObservedAtUtc"` : ""
   const taskRows = await client.query(`SELECT task."id", task."status", task."role", task."taskType", task."expectedOutputSchema", task."allowedActions",
       COALESCE(jsonb_typeof(task."context") = 'object', false) AS "contextIsObject",
       COALESCE(task."context" = '{}'::jsonb, false) AS "contextIsEmpty",
       COALESCE(task."context" = jsonb_build_object('nestedScoutProfile', $7::text), false) AS "contextIsCanonicalNestedScoutProfile",
       COALESCE(jsonb_typeof(task."context") = 'object' AND task."context" ?| ARRAY['selectedJobPreparation', 'coverLetterBase', 'writerReviewFeedback']::text[], false) AS "hasPrivateSelectionContext",
-      task."attemptCount", task."failureReason", task."result",
-      to_char(((to_jsonb(task)->>'absoluteDeadlineAt')::timestamptz) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS') || 'Z' AS "absoluteDeadlineAtUtc",
-      to_char(statement_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS') || 'Z' AS "deadlineObservedAtUtc"
+      task."attemptCount", task."failureReason", task."result"${deadlineColumns}
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
     WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3
       AND task."rootTaskId" = $4 AND task."parentTaskId" = $5 AND session."userId" = $6`,
@@ -138,7 +141,7 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
       hasPrivateSelectionContext: typeof row.hasPrivateSelectionContext === "boolean" ? row.hasPrivateSelectionContext : undefined,
       attemptCount: Number(row.attemptCount),
       failureReason: nonEmpty(row.failureReason) ? String(row.failureReason) : null, result: row.result ?? null,
-      ...(Object.hasOwn(row, "absoluteDeadlineAtUtc") ? { absoluteDeadlineAt: row.absoluteDeadlineAtUtc, deadlineObservedAt: row.deadlineObservedAtUtc } : {}),
+      ...(options.includeActiveChildDeadlines && Object.hasOwn(row, "absoluteDeadlineAtUtc") ? { absoluteDeadlineAt: row.absoluteDeadlineAtUtc, deadlineObservedAt: row.deadlineObservedAtUtc } : {}),
     }]
   }))
   const events = await client.query(`SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload",
