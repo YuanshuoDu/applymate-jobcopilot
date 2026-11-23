@@ -1,7 +1,7 @@
 import { unlinkSync } from "node:fs";
 import { getPool, insertApplyResult } from "../db/apply-results.js";
 import * as legacyFillOutcomes from "./legacy-apply-outcomes.js";
-import { finishApplicationTask, USER_TAKEOVER_CHECKPOINT } from "../db/application-task-state.js";
+import { finishApplicationTask, isConfirmedApplicationTaskFinish, USER_TAKEOVER_CHECKPOINT } from "../db/application-task-state.js";
 import { updateJobForSubmission, UNCONFIRMED_SUBMISSION_MESSAGE } from "../db/submission-guard.js";
 import { recordSubmissionExecutionSettled, type ApplicationSubmitIdentity } from "./application-submit-fence.js";
 import { createApplyResultNotification } from "./apply-job-outcomes.js";
@@ -67,9 +67,8 @@ export function createApplyJobFinalization(context: ApplyJobRunContext): ApplyJo
       getPool(), context.payload.applicationTaskId, "waiting_for_user", "submission_uncertain",
       message, "submit", context.submissionIdentity,
     ).then((result): SubmissionUncertainTaskWrite => {
-      if (result === "superseded") { state.submissionSuperseded = true; return "superseded"; }
-      state.applicationTaskFinalized = true;
-      return "written";
+      if (result === "superseded") { state.submissionSuperseded = true; return "superseded"; } else if (!isConfirmedApplicationTaskFinish(result)) return "failed";
+      state.applicationTaskFinalized = true; return "written";
     }).catch((error: unknown): SubmissionUncertainTaskWrite => {
       console.warn("[apply-worker] Could not persist uncertain task state:", error instanceof Error ? error.message : String(error));
       return "failed";
@@ -101,7 +100,7 @@ export async function persistStoppedSubmission(input: {
   const taskWrite = await finishApplicationTask(
     getPool(), identity.applicationTaskId, "failed", "turn_stopped_before_submit", TURN_STOPPED_MESSAGE, "submit", identity,
   );
-  if (taskWrite === "superseded") return false;
+  if (!isConfirmedApplicationTaskFinish(taskWrite)) return false;
   createApplyResultNotification({
     userId: identity.userId, jobId: identity.jobId, jobTitle: input.jobTitle,
     jobCompany: input.jobCompany, status: "failed",
@@ -139,7 +138,9 @@ export async function handleApplyJobFailure(context: ApplyJobRunContext, error: 
     return false;
   }
   if (mayHaveOpenedBrowser && applicationTaskId && !state.applicationTaskFinalized) {
-    if (await context.lifecycle?.markSubmissionUncertain(safeMessage) === "superseded") return false;
+    const uncertaintyWrite = await context.lifecycle?.markSubmissionUncertain(safeMessage);
+    if (uncertaintyWrite === "superseded") return false;
+    if (uncertaintyWrite !== "written") return true;
     if (state.activeSubmissionContextClose) await context.lifecycle?.closeActiveSubmissionContext();
     else await context.lifecycle?.closeActivePage();
   }
@@ -186,6 +187,7 @@ export async function handleApplyJobFailure(context: ApplyJobRunContext, error: 
       safeMessage, operation === "submit" ? "submit" : "fill", submissionIdentity ?? undefined,
     ).catch((stateError: Error) => console.warn("[apply-worker] Could not persist task failure:", stateError.message));
     if (taskWrite === "superseded") { state.submissionSuperseded = true; return false; }
+    if (operation === "submit" && !isConfirmedApplicationTaskFinish(taskWrite)) return true;
     state.applicationTaskFinalized = true;
   }
   return false;

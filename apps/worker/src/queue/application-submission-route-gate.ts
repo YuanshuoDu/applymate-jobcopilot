@@ -3,7 +3,7 @@ import { getPool } from "../db/apply-results.js";
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
 import type { ApplicationSubmissionStartScope } from "../db/application-task-state.js";
 import type { ApplicationSubmitIdentity } from "./application-submit-fence.js";
-import { finishApplicationTask } from "../db/application-task-state.js";
+import { finishApplicationTask, isConfirmedApplicationTaskFinish } from "../db/application-task-state.js";
 import { UNCONFIRMED_SUBMISSION_MESSAGE } from "../db/submission-guard.js";
 import { acquireApplicationSubmissionStartFence, startApplicationSubmissionStopProbe, type ApplicationSubmissionStopProbe } from "../runtime/interrupt/application-submission-probe.js";
 import { matchesSubmissionRequest, type SubmissionRequestIntent } from "../flows/submission-intent.js";
@@ -158,11 +158,12 @@ export function createApplicationSubmissionRouteHandler(
             console.warn("[apply-worker] Could not release ambiguous submission start fence:", releaseError instanceof Error ? releaseError.message : String(releaseError));
           });
           try {
-            if (await finishApplicationTask(
+            const result = await finishApplicationTask(
               getPool(), applicationTaskId, "waiting_for_user", "submission_uncertain",
               UNCONFIRMED_SUBMISSION_MESSAGE, "submit", context.submissionIdentity!,
-            ) === "superseded") state.submissionSuperseded = true;
-            state.applicationTaskFinalized = true;
+            );
+            if (result === "superseded") state.submissionSuperseded = true;
+            state.applicationTaskFinalized = isConfirmedApplicationTaskFinish(result);
           } catch (stateError: unknown) {
             console.warn("[apply-worker] Could not persist ambiguous submission start state:", stateError instanceof Error ? stateError.message : String(stateError));
           }

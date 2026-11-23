@@ -79,7 +79,7 @@ const mocks = vi.hoisted(() => {
     isUserActive: vi.fn().mockResolvedValue(true),
     applicationTaskStillActive: vi.fn().mockResolvedValue(true),
     completeFillForReview: vi.fn().mockResolvedValue(true),
-    finishApplicationTask: vi.fn().mockResolvedValue(undefined),
+    finishApplicationTask: vi.fn().mockResolvedValue("current"),
     claimUnattendedSubmission: vi.fn().mockResolvedValue("claimed"),
     releaseUncertainSubmission: vi.fn().mockResolvedValue({ kind: "current", value: true }),
     updateJobForSubmission: vi.fn().mockResolvedValue({ kind: "current", value: true }),
@@ -171,7 +171,8 @@ vi.mock("../admin/ats-policy.js", () => ({
   loadEffectiveAtsPolicy: mocks.loadAtsPolicy,
   canUseAtsSource: mocks.canUseAtsSource,
 }));
-vi.mock("../db/application-task-state.js", () => ({
+vi.mock("../db/application-task-state.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../db/application-task-state.js")>()),
   USER_TAKEOVER_CHECKPOINT: "user_takeover",
   claimApplicationTask: mocks.claimApplicationTask,
   applicationTaskStillActive: mocks.applicationTaskStillActive,
@@ -251,7 +252,7 @@ describe("apply-queue Phase 5 pipeline", () => {
     vi.resetModules();
     vi.clearAllMocks();
     mocks.claimApplicationTask.mockReset().mockResolvedValue(true);
-    mocks.finishApplicationTask.mockReset().mockResolvedValue(undefined);
+    mocks.finishApplicationTask.mockReset().mockResolvedValue("current");
     mocks.claimUnattendedSubmission.mockReset().mockResolvedValue("claimed");
     mocks.releaseUncertainSubmission.mockReset().mockResolvedValue({ kind: "current", value: true });
     mocks.updateJobForSubmission.mockReset().mockResolvedValue({ kind: "current", value: true });
