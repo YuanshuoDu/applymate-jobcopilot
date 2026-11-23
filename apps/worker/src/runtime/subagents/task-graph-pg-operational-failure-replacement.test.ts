@@ -103,7 +103,7 @@ describe("scheduleTaskGraphOperationalFailureReplacement", () => {
     expect(mocks.proveFailure).toHaveBeenCalledWith(client, expect.objectContaining({ failedNode: source,
       failedRow: expect.objectContaining({ hasExecutionEvidence: true }) }))
     expect(mocks.create).toHaveBeenCalledWith(client, expect.objectContaining({ proposal: expect.objectContaining({ expectedRevision: 1 }) }),
-      parent, expect.objectContaining({ nodes: [] }), expect.any(Map), expect.any(Object), { originalNodeCount: 1, removedNodeCount: 1 })
+      parent, expect.objectContaining({ nodes: [] }), expect.any(Map), expect.any(Object), { originalNodeCount: 1, removedNodeCount: 1 }, true)
     expect(mocks.writePlan).toHaveBeenCalledWith(client, expect.objectContaining({ expectedRevision: 1,
       idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 1) }))
     expect(client.query).toHaveBeenCalledWith(expect.stringContaining('session."userId" = $5 AND turn."userId" = $5'),
@@ -112,6 +112,7 @@ describe("scheduleTaskGraphOperationalFailureReplacement", () => {
       expect.objectContaining({ failedSource: expect.objectContaining({ attemptCount: 2 }), priorCancellations: [], cancellations: [],
         observedGraphEvent: expect.objectContaining({ id: "failure-event" }) }))
     expect(checkBudget).toHaveBeenCalledOnce()
+    expect(checkBudget.mock.invocationCallOrder[0]).toBeLessThan(mocks.create.mock.invocationCallOrder[0]!)
   })
 
   it("allows a pristine waiting descendant whose only execution evidence is a proved Root wait", async () => {

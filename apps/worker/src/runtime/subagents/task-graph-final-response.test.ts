@@ -3,6 +3,7 @@ import { appendTaskGraphFollowUpSuggestions, buildGroundedTaskGraphFinalResponse
 import { ROLE_RESULT_SCHEMA, type ArtifactVersionReference } from "./role-results.js"
 import { reduceTaskGraphFinalSummary, type TaskGraphFinalSummary, type TaskGraphFinalSummaryNode } from "./task-graph-final-summary.js"
 import type { TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
+import type { SelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
 
 const digest = (value: string) => `sha256:${value.repeat(64)}`
 const artifactRef: ArtifactVersionReference = { artifactId: "private-cover-letter-1", version: 2, contentHash: digest("a"), sourceDigest: digest("b") }
@@ -19,6 +20,29 @@ function currentBinding(summary: TaskGraphFinalSummary): TaskGraphFinalSummaryBi
   return { rootTaskId: "root-task-1", graphItemId: "graph-item-1", graphRevision: summary.graphRevision, summary,
     members: summary.taskOutcomes.map((outcome, nodeIndex) => ({ nodeIndex, nodeKey: `node-${nodeIndex}`, templateId: outcome.role,
       taskId: outcome.taskId, role: outcome.role, taskType: `${outcome.role}_task`, taskStatus: outcome.taskStatus, kind: "business" })) }
+}
+
+function batchBinding(): TaskGraphFinalSummaryBinding {
+  const graphRevision = 12
+  const rows: SelectedJobBatchFinalOutcome["slots"] = [
+    { slotId: "slot-1", jobId: "private-job-a", writer: { nodeIndex: 0, nodeKey: "writer-a", templateId: "cover_letter_writer_slot_1", taskId: "writer-a-task", taskType: "cover_letter_draft" as const, role: "writer" as const, status: "completed" as const },
+      reviewer: { nodeIndex: 1, nodeKey: "reviewer-a", templateId: "cover_letter_reviewer_slot_1", taskId: "reviewer-a-task", taskType: "cover_letter_review" as const, role: "reviewer" as const, status: "completed" as const }, status: "completed" as const,
+      artifactRef: { artifactId: "private-artifact-a", version: 2, contentHash: digest("4"), sourceDigest: digest("5") }, reviewStatus: "passed" as const, reviewHash: digest("6") },
+    { slotId: "slot-2", jobId: "private-job-b", writer: { nodeIndex: 2, nodeKey: "writer-b", templateId: "cover_letter_writer_slot_2", taskId: "writer-b-task", taskType: "cover_letter_draft" as const, role: "writer" as const, status: "completed" as const },
+      reviewer: { nodeIndex: 3, nodeKey: "reviewer-b", templateId: "cover_letter_reviewer_slot_2", taskId: "reviewer-b-task", taskType: "cover_letter_review" as const, role: "reviewer" as const, status: "completed" as const }, status: "completed" as const,
+      artifactRef: { artifactId: "private-artifact-b", version: 3, contentHash: digest("7"), sourceDigest: digest("8") }, reviewStatus: "rejected" as const, reviewHash: digest("9") },
+  ]
+  const selectedJobBatchFinalOutcome: SelectedJobBatchFinalOutcome = {
+    schemaVersion: "agent-harness.v2.selected-job-batch-final-outcome.v1", graphRevision, slots: rows,
+  }
+  return {
+    rootTaskId: "root-batch", graphItemId: "graph-batch", graphRevision,
+    members: rows.flatMap(row => [row.writer, row.reviewer].map(member => ({ nodeIndex: member.nodeIndex, nodeKey: member.nodeKey,
+      templateId: member.templateId, taskId: member.taskId, role: member.role, taskType: member.taskType,
+      taskStatus: member.status, kind: "business" as const }))),
+    selectedJobBatchFinalOutcome,
+    summary: reduceTaskGraphFinalSummary({ graphRevision, nodes: [] }),
+  }
 }
 
 function structuredSummary(): TaskGraphFinalSummary {
@@ -71,6 +95,18 @@ describe("grounded TaskGraph final response", () => {
       expect(response).not.toContain(privateValue)
     }
     expect(new TextEncoder().encode(response).byteLength).toBeLessThanOrEqual(4_096)
+  })
+
+  it("renders only exact private batch proof as bounded per-Job review outcomes", () => {
+    const response = buildGroundedTaskGraphFinalResponse(batchBinding())
+    expect(response).toContain("Per-Job preparation outcomes:")
+    expect(response).toContain("Job 1: Writer completed; Reviewer completed; review passed.")
+    expect(response).toContain("Job 2: Writer completed; Reviewer completed; review rejected.")
+    for (const privateValue of ["private-job-", "private-artifact-", "sha256:", "reviewHash"]) expect(response).not.toContain(privateValue)
+    expect(new TextEncoder().encode(response).byteLength).toBeLessThanOrEqual(4_096)
+
+    const ordinary = buildGroundedTaskGraphFinalResponse(currentBinding(structuredSummary()))
+    expect(ordinary).not.toContain("Per-Job preparation outcomes:")
   })
 
   it("labels only gate-bound repaired failures while preserving counts and legacy output", () => {

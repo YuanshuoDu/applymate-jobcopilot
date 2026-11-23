@@ -1,7 +1,31 @@
 import { describe, expect, it, vi } from "vitest"
 
+const setupMocks = vi.hoisted(() => ({
+  prepareBatch: vi.fn(), failBatch: vi.fn(), graph: vi.fn(), registerPlanning: vi.fn(), ensure: vi.fn(),
+}))
+vi.mock("./canonical-selected-job-batch-setup.js", () => ({
+  canonicalSelectedJobBatchRuntimeAvailable: () => true,
+  prepareCanonicalSelectedJobBatchForTurn: setupMocks.prepareBatch,
+  failCanonicalSelectedJobBatchUnavailable: setupMocks.failBatch,
+}))
+vi.mock("./subagents/task-graph-templates.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./subagents/task-graph-templates.js")>()
+  return { ...actual, taskGraphRuntimeForTurn: setupMocks.graph }
+})
+vi.mock("./canonical-turn-coordination.js", () => ({ createCanonicalTurnCoordination: () => ({ nativeOptions: { enabled: false }, bindRoot: vi.fn() }) }))
+vi.mock("./policy/canonical-policy.js", () => ({ createCanonicalPolicy: () => ({}) }))
+vi.mock("./context/root-task-objective.js", () => ({ resolveRootTaskVerificationRequirements: () => ({ status: "none" }) }))
+vi.mock("./canonical-turn-config.js", () => ({ capabilities: () => [] }))
+vi.mock("./subagents/durable-wait-store.js", () => ({ createPgDurableWaitPort: () => ({}) }))
+vi.mock("./tools/coordination-executor-support.js", () => ({ toolSafeDurableWaitPort: (value: unknown) => value }))
+vi.mock("./mailbox/store.js", () => ({ PgCoordinationStore: class {} }))
+vi.mock("./turns/canonical-runtime-tool-recovery.js", () => ({
+  assertCanonicalCoordinationSurface: vi.fn(), assertCanonicalQuestionSurface: vi.fn(), isNativeQuestionWaitEnabled: () => false,
+}))
+vi.mock("./tools/planning-executors.js", () => ({ registerTaskGraphPlanningTool: setupMocks.registerPlanning }))
+
 import type { TurnEngineStore } from "./turns/turn-engine-types.js"
-import { addScheduledPrepareActions, taskGraphDenialCheckpointReader, taskGraphTemplateRoleView, turnStoreForInteractiveDiscovery } from "./canonical-turn-runtime-turn-setup.js"
+import { addScheduledPrepareActions, prepareCanonicalTurnSetup, taskGraphDenialCheckpointReader, taskGraphTemplateRoleView, turnStoreForInteractiveDiscovery } from "./canonical-turn-runtime-turn-setup.js"
 import { TASK_GRAPH_TEMPLATES } from "./subagents/task-graph-templates.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, type TaskGraphDenialCheckpoint } from "./turns/task-graph-terminal-assessment.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT } from "./turns/turn-execution-types.js"
@@ -91,5 +115,95 @@ describe("active TaskGraph template role view", () => {
     expect(Object.keys(roles ?? {})).toEqual(["scout", "analyst"])
     expect(JSON.stringify(roles)).not.toMatch(/privateRegistryContext|PRIVATE_TEMPLATE_CONTEXT|allowedActions/)
     expect(taskGraphTemplateRoleView(undefined)).toBeUndefined()
+  })
+})
+
+const batchIntent = { kind: "selected_job_batch_preparation", version: 1 } as const
+const batchReady = {
+  status: "ready" as const, binding: {} as never, slots: [{ slotId: "slot-1", jobId: "job-1" }, { slotId: "slot-2", jobId: "job-2" }],
+  templates: { cover_letter_writer_slot_1: { role: "writer", allowedActions: ["artifact.version.read", "cover_letter.draft"] },
+    cover_letter_reviewer_slot_1: { role: "reviewer", allowedActions: ["artifact.version.read", "artifact.review"] } } as never,
+}
+
+function setupState(intent: unknown = batchIntent) {
+  return { scope: { userId: owner.userId }, source: "user", intent, goal: "Prepare reviewed materials", turnInput: { intent },
+    modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {}, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } } as never
+}
+
+function setupInput(state = setupState(), batchGate?: () => unknown) {
+  const tools = ["agent.plan", "agent.ask_user", "agent.wait", "agent.list", "agent.reconcile", "jobs.search", "artifact.create", "agent.spawn"]
+    .map(name => ({ name }))
+  const root = { id: "root-1", attemptCount: 1 }
+  setupMocks.ensure.mockResolvedValue(root)
+  setupMocks.registerPlanning.mockClear()
+  const rootTasks = { ensure: setupMocks.ensure, checkCompletion: vi.fn() }
+  return {
+    pool: {} as never, lease: owner as never, signal: new AbortController().signal, now: () => new Date(),
+    options: {
+      stateLoader: vi.fn(async () => state), productionFlags: { taskGraphPlanningEnabled: true } as never,
+      taskGraphCommandPort: {} as never, toolRuntimeFactory: () => ({
+        registry: { list: () => tools, resolve: () => ({ idempotency: "pure" }), validateArguments: () => true }, router: {},
+      } as never),
+    } as never,
+    manager: {} as never, rootTasks: rootTasks as never, executionProjection: {} as never, sessionProjection: {} as never,
+    coordinationEnabled: true, childExecutionEnabled: true, consumeWaitOutcomes: true,
+    ...(batchGate ? { batchCompletionGate: batchGate as never } : {}),
+  }
+}
+
+describe("canonical batch production setup", () => {
+  it("uses only verified slot templates, planner constraints, and the restricted Root surface", async () => {
+    setupMocks.prepareBatch.mockResolvedValue(batchReady)
+    setupMocks.graph.mockRejectedValue(new Error("batch must not use generic TaskGraph setup"))
+    const setup = await prepareCanonicalTurnSetup(setupInput(undefined, () => undefined) as never)
+
+    expect("earlyResult" in setup).toBe(false)
+    if ("earlyResult" in setup) return
+    expect(setup.selectedJobBatch).toBe(batchReady)
+    expect(setup.selectedJobMode).toBe(false)
+    expect(setup.taskGraphTemplateRoles).toEqual({ cover_letter_writer_slot_1: "writer", cover_letter_reviewer_slot_1: "reviewer" })
+    expect(setupMocks.graph).not.toHaveBeenCalled()
+    expect(setupMocks.registerPlanning).toHaveBeenCalledWith(expect.anything(), true, expect.objectContaining({
+      templates: batchReady.templates, selectedJobBatchSlots: batchReady.slots,
+    }))
+    const toolNames = setup.rootTools.map(tool => (tool as { name: string }).name)
+    expect(toolNames).toEqual(["agent.plan", "agent.ask_user", "agent.wait", "agent.list", "agent.reconcile"])
+    expect(setupMocks.ensure.mock.calls[0]?.[0].allowedActions).toEqual([...toolNames, "artifact.version.read", "cover_letter.draft", "artifact.review"])
+  })
+
+  it("does not fall through to generic setup when verified batch proof is unavailable", async () => {
+    setupMocks.prepareBatch.mockResolvedValue({ status: "unavailable" })
+    setupMocks.failBatch.mockResolvedValue({ status: "failed", summary: "selected_job_batch_unavailable" })
+    setupMocks.graph.mockClear()
+    const result = await prepareCanonicalTurnSetup(setupInput() as never)
+
+    expect(result).toEqual({ earlyResult: { status: "failed", summary: "selected_job_batch_unavailable" } })
+    expect(setupMocks.failBatch).toHaveBeenCalledOnce()
+    expect(setupMocks.graph).not.toHaveBeenCalled()
+  })
+
+  it("does not fall through when the trusted batch terminal factory is absent", async () => {
+    setupMocks.prepareBatch.mockImplementation(async ({ completionGate }) => completionGate ? batchReady : { status: "unavailable" })
+    setupMocks.failBatch.mockResolvedValue({ status: "failed", summary: "selected_job_batch_unavailable" })
+    setupMocks.graph.mockClear()
+    const result = await prepareCanonicalTurnSetup(setupInput() as never)
+
+    expect(result).toEqual({ earlyResult: { status: "failed", summary: "selected_job_batch_unavailable" } })
+    expect(setupMocks.prepareBatch.mock.calls.at(-1)?.[0].completionGate).toBeUndefined()
+    expect(setupMocks.graph).not.toHaveBeenCalled()
+  })
+
+  it("keeps ordinary selected-job setup separate from the batch mode", async () => {
+    setupMocks.prepareBatch.mockResolvedValue({ status: "not_batch" })
+    setupMocks.graph.mockResolvedValue({ enabled: true, selectedJobMode: true, selectedJobPreparation: { jobId: "job-1" }, scheduledDraftMode: false,
+      templates: { writer: { role: "writer" }, reviewer: { role: "reviewer" } } })
+    const setup = await prepareCanonicalTurnSetup(setupInput(setupState({ kind: "selected_job_preparation", version: 1 })) as never)
+
+    expect("earlyResult" in setup).toBe(false)
+    if ("earlyResult" in setup) return
+    expect(setup.selectedJobMode).toBe(true)
+    expect(setup.selectedJobBatch).toBeUndefined()
+    expect(setupMocks.graph).toHaveBeenCalledOnce()
+    expect(setupMocks.registerPlanning.mock.calls.at(-1)?.[2]).not.toHaveProperty("selectedJobBatchSlots")
   })
 })

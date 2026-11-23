@@ -193,7 +193,7 @@ describe("DELETE /api/agent/application-tasks", () => {
     Object.values(mocks).forEach(mock => mock.mockReset())
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.applicationFillTaskGraphEnabled.mockReturnValue(false)
-    mocks.findFirst.mockResolvedValue({ id: "task_1", sessionId: "session_1", fillTurnId: null, fillTurnSessionId: null, fillTurnUserId: null, status: "waiting_for_authorization", checkpoint: "form_filled" })
+    mocks.findFirst.mockResolvedValue({ id: "task_1", sessionId: "session_1", fillTurnId: null, fillTurnSessionId: null, fillTurnUserId: null, workerTaskId: null, status: "waiting_for_authorization", checkpoint: "form_filled" })
     mocks.fillerFindMany.mockResolvedValue([])
     mocks.updateMany.mockResolvedValue({ count: 1 })
     mocks.queryRaw.mockResolvedValue([{ id: "task_1" }])
@@ -219,6 +219,7 @@ describe("DELETE /api/agent/application-tasks", () => {
       where: expect.objectContaining({
         id: "task_1",
         userId: "user_1",
+        workerTaskId: null,
         status: { notIn: ["submitted", "skipped", "cancelled"] },
         OR: [{ checkpoint: null }, { checkpoint: { notIn: ["submission_request_started", "submission_uncertain"] } }],
       }),
@@ -234,6 +235,53 @@ describe("DELETE /api/agent/application-tasks", () => {
       }),
       data: expect.objectContaining({ status: "cancelled" }),
     }))
+  })
+
+  it("cancels the currently observed pre-marker Worker attempt", async () => {
+    mocks.findFirst.mockResolvedValueOnce({
+      id: "task_1", sessionId: "session_1", status: "filling", checkpoint: "submission_authorized",
+      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: "worker_current",
+    })
+    const { DELETE } = await import("./route")
+
+    const response = await DELETE(new Request("http://localhost/api/agent/application-tasks?id=task_1", { method: "DELETE" }) as never)
+
+    expect(response.status).toBe(200)
+    expect(mocks.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      select: expect.objectContaining({ workerTaskId: true }),
+    }))
+    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ workerTaskId: "worker_current", fillTurnId: "turn_fill_1" }),
+    }))
+    expect(mocks.approvalUpdateMany).toHaveBeenCalledOnce()
+  })
+
+  it("conflicts when an approved same-Turn successor replaces the Worker attempt after the cancellation snapshot", async () => {
+    let currentTask = { workerTaskId: "worker_observed", status: "waiting_for_authorization", checkpoint: "form_filled" }
+    mocks.findFirst.mockResolvedValueOnce({
+      id: "task_1", sessionId: "session_1", status: "waiting_for_authorization", checkpoint: "form_filled",
+      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: "worker_observed",
+    })
+    mocks.updateMany.mockImplementationOnce(async (args: { where: { workerTaskId?: string | null } }) => {
+      // Simulate the approved submit transition committing after DELETE reads but before its CAS.
+      currentTask = { workerTaskId: "worker_successor", status: "filling", checkpoint: "submission_authorized" }
+      const workerAttemptMatches = args.where.workerTaskId === undefined || args.where.workerTaskId === currentTask.workerTaskId
+      return { count: workerAttemptMatches ? 1 : 0 }
+    })
+    const { DELETE } = await import("./route")
+
+    const response = await DELETE(new Request("http://localhost/api/agent/application-tasks?id=task_1", { method: "DELETE" }) as never)
+
+    expect(response.status).toBe(409)
+    expect(currentTask).toMatchObject({ workerTaskId: "worker_successor", status: "filling", checkpoint: "submission_authorized" })
+    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        id: "task_1", userId: "user_1", sessionId: "session_1", fillTurnId: "turn_fill_1",
+        workerTaskId: "worker_observed", status: { notIn: ["submitted", "skipped", "cancelled"] },
+      }),
+    }))
+    expect(mocks.eventCreate).not.toHaveBeenCalled()
+    expect(mocks.approvalUpdateMany).not.toHaveBeenCalled()
   })
 
   it("does not mutate an already screened-out task", async () => {
@@ -286,7 +334,7 @@ describe("DELETE /api/agent/application-tasks", () => {
   it("replays cancellation for the same stopped TaskGraph fill and cleans pending approvals", async () => {
     mocks.findFirst.mockResolvedValueOnce({
       id: "task_1", sessionId: "session_1", status: "cancelled", checkpoint: "turn_stopped_before_submit",
-      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: null,
     })
     const { DELETE } = await import("./route")
     const response = await DELETE(new Request("http://localhost/api/agent/application-tasks?id=task_1", { method: "DELETE" }) as never)
@@ -301,7 +349,7 @@ describe("DELETE /api/agent/application-tasks", () => {
     expect(mocks.queryRaw).toHaveBeenCalledOnce()
     expect(mocks.queryRaw).toHaveBeenCalledWith(expect.objectContaining({
       sql: expect.stringContaining("FOR UPDATE"),
-      values: ["task_1", "user_1", "session_1", "turn_fill_1", "session_1", "user_1", "cancelled", "turn_stopped_before_submit"],
+      values: ["task_1", "user_1", "session_1", "turn_fill_1", "session_1", "user_1", null, "cancelled", "turn_stopped_before_submit"],
     }))
     expect(mocks.updateMany).not.toHaveBeenCalled()
     expect(mocks.taskInterrupt).not.toHaveBeenCalled()
@@ -310,17 +358,18 @@ describe("DELETE /api/agent/application-tasks", () => {
   it("conflicts and leaves approvals pending if the stopped-fill binding changes before replay", async () => {
     const currentTask = {
       id: "task_1", userId: "user_1", sessionId: "session_1", fillTurnId: "turn_fill_2",
-      fillTurnSessionId: "session_1", fillTurnUserId: "user_1", status: "filling", checkpoint: "browser_active",
+      fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: null, status: "filling", checkpoint: "browser_active",
     }
     mocks.findFirst.mockResolvedValueOnce({
       id: "task_1", sessionId: "session_1", status: "cancelled", checkpoint: "turn_stopped_before_submit",
-      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: null,
     })
     mocks.queryRaw.mockImplementationOnce(async (query: { values: unknown[] }) => {
-      const [id, userId, sessionId, fillTurnId, fillTurnSessionId, fillTurnUserId, status, checkpoint] = query.values
+      const [id, userId, sessionId, fillTurnId, fillTurnSessionId, fillTurnUserId, workerTaskId, status, checkpoint] = query.values
       const matchesCurrentTask = id === currentTask.id && userId === currentTask.userId
         && sessionId === currentTask.sessionId && fillTurnId === currentTask.fillTurnId
         && fillTurnSessionId === currentTask.fillTurnSessionId && fillTurnUserId === currentTask.fillTurnUserId
+        && workerTaskId === currentTask.workerTaskId
         && status === currentTask.status && checkpoint === currentTask.checkpoint
       return matchesCurrentTask ? [{ id: currentTask.id }] : []
     })
@@ -331,7 +380,38 @@ describe("DELETE /api/agent/application-tasks", () => {
     expect(mocks.transaction).toHaveBeenCalledOnce()
     expect(mocks.queryRaw).toHaveBeenCalledWith(expect.objectContaining({
       sql: expect.stringContaining("FOR UPDATE"),
-      values: ["task_1", "user_1", "session_1", "turn_fill_1", "session_1", "user_1", "cancelled", "turn_stopped_before_submit"],
+      values: ["task_1", "user_1", "session_1", "turn_fill_1", "session_1", "user_1", null, "cancelled", "turn_stopped_before_submit"],
+    }))
+    expect(mocks.approvalUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.eventCreate).not.toHaveBeenCalled()
+  })
+
+  it("does not replay cancellation when the stopped Fill Turn belongs to another Worker attempt", async () => {
+    const currentTask = {
+      id: "task_1", userId: "user_1", sessionId: "session_1", fillTurnId: "turn_fill_1",
+      fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: "worker_successor",
+      status: "cancelled", checkpoint: "turn_stopped_before_submit",
+    }
+    mocks.findFirst.mockResolvedValueOnce({
+      id: "task_1", sessionId: "session_1", status: "cancelled", checkpoint: "turn_stopped_before_submit",
+      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: "worker_observed",
+    })
+    mocks.queryRaw.mockImplementationOnce(async (query: { values: unknown[] }) => {
+      const [id, userId, sessionId, fillTurnId, fillTurnSessionId, fillTurnUserId, workerTaskId, status, checkpoint] = query.values
+      const matchesCurrentTask = id === currentTask.id && userId === currentTask.userId
+        && sessionId === currentTask.sessionId && fillTurnId === currentTask.fillTurnId
+        && fillTurnSessionId === currentTask.fillTurnSessionId && fillTurnUserId === currentTask.fillTurnUserId
+        && workerTaskId === currentTask.workerTaskId && status === currentTask.status && checkpoint === currentTask.checkpoint
+      return matchesCurrentTask ? [{ id: currentTask.id }] : []
+    })
+    const { DELETE } = await import("./route")
+
+    const response = await DELETE(new Request("http://localhost/api/agent/application-tasks?id=task_1", { method: "DELETE" }) as never)
+
+    expect(response.status).toBe(409)
+    expect(mocks.queryRaw).toHaveBeenCalledWith(expect.objectContaining({
+      sql: expect.stringContaining('"workerTaskId" IS NOT DISTINCT FROM ?'),
+      values: ["task_1", "user_1", "session_1", "turn_fill_1", "session_1", "user_1", "worker_observed", "cancelled", "turn_stopped_before_submit"],
     }))
     expect(mocks.approvalUpdateMany).not.toHaveBeenCalled()
     expect(mocks.eventCreate).not.toHaveBeenCalled()
@@ -354,7 +434,7 @@ describe("DELETE /api/agent/application-tasks", () => {
     mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
     mocks.findFirst.mockResolvedValueOnce({
       id: "task_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active",
-      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: null,
     })
     mocks.fillerFindMany.mockResolvedValue([{ id: "filler_1", status: "running" }])
     mocks.taskInterrupt.mockResolvedValue({ disposition: "accepted" })
@@ -365,7 +445,7 @@ describe("DELETE /api/agent/application-tasks", () => {
     expect(response.status).toBe(200)
     expect(mocks.queryRaw).toHaveBeenCalledWith(expect.objectContaining({
       sql: expect.stringContaining("FOR UPDATE"),
-      values: ["task_1", "user_1", "session_1", "turn_fill_1", "session_1", "user_1", "cancelled", "turn_stopped_before_submit"],
+      values: ["task_1", "user_1", "session_1", "turn_fill_1", "session_1", "user_1", null, "cancelled", "turn_stopped_before_submit"],
     }))
     expect(mocks.eventCreate).not.toHaveBeenCalled()
     expect(mocks.approvalUpdateMany).toHaveBeenCalledOnce()
@@ -376,7 +456,7 @@ describe("DELETE /api/agent/application-tasks", () => {
     mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
     mocks.findFirst.mockResolvedValueOnce({
       id: "task_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active",
-      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: null,
     })
     mocks.fillerFindMany.mockResolvedValue([{ id: "filler_1", status: "running" }])
     mocks.taskInterrupt.mockResolvedValue({ disposition: "accepted" })
@@ -388,7 +468,7 @@ describe("DELETE /api/agent/application-tasks", () => {
     expect(response.status).toBe(409)
     expect(mocks.queryRaw).toHaveBeenCalledWith(expect.objectContaining({
       sql: expect.stringContaining("FOR UPDATE"),
-      values: ["task_1", "user_1", "session_1", "turn_fill_1", "session_1", "user_1", "cancelled", "turn_stopped_before_submit"],
+      values: ["task_1", "user_1", "session_1", "turn_fill_1", "session_1", "user_1", null, "cancelled", "turn_stopped_before_submit"],
     }))
     expect(mocks.eventCreate).not.toHaveBeenCalled()
     expect(mocks.approvalUpdateMany).not.toHaveBeenCalled()
@@ -398,7 +478,7 @@ describe("DELETE /api/agent/application-tasks", () => {
     mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
     mocks.findFirst.mockResolvedValueOnce({
       id: "task_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active",
-      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: null,
     })
     mocks.fillerFindMany.mockResolvedValue([{ id: "filler_1", status: "running" }])
     mocks.taskInterrupt.mockResolvedValue({ disposition: "accepted" })
@@ -425,7 +505,7 @@ describe("DELETE /api/agent/application-tasks", () => {
     mocks.applicationFillTaskGraphEnabled.mockReturnValue(false)
     mocks.findFirst.mockResolvedValueOnce({
       id: "task_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active",
-      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: null,
     })
     mocks.fillerFindMany.mockResolvedValue([{ id: "filler_1", status: "running" }])
     mocks.taskInterrupt.mockResolvedValue({ disposition: "accepted" })
@@ -440,11 +520,11 @@ describe("DELETE /api/agent/application-tasks", () => {
   })
 
   it("conflicts if answer-resume rebinds the task after the old filler interrupt", async () => {
-    let currentTaskBinding = { fillTurnId: "turn_old", fillTurnSessionId: "session_1", fillTurnUserId: "user_1" }
+    let currentTaskBinding = { fillTurnId: "turn_old", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: null as string | null }
     mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
     mocks.findFirst.mockResolvedValueOnce({
       id: "task_1", sessionId: "session_1", status: "waiting_for_user", checkpoint: "form_answer_required",
-      fillTurnId: "turn_old", fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+      fillTurnId: "turn_old", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: null,
     })
     mocks.fillerFindMany.mockResolvedValueOnce([{ id: "filler_old", status: "waiting_for_user" }])
     mocks.taskInterrupt.mockImplementationOnce(async () => {
@@ -452,8 +532,8 @@ describe("DELETE /api/agent/application-tasks", () => {
       return { disposition: "accepted" }
     })
     mocks.queryRaw.mockResolvedValueOnce([])
-    mocks.updateMany.mockImplementation(async (args: { where: { fillTurnId?: string | null; fillTurnSessionId?: string | null; fillTurnUserId?: string | null } }) => ({
-      count: (["fillTurnId", "fillTurnSessionId", "fillTurnUserId"] as const).every(key =>
+    mocks.updateMany.mockImplementation(async (args: { where: { fillTurnId?: string | null; fillTurnSessionId?: string | null; fillTurnUserId?: string | null; workerTaskId?: string | null } }) => ({
+      count: (["fillTurnId", "fillTurnSessionId", "fillTurnUserId", "workerTaskId"] as const).every(key =>
         args.where[key] === undefined || args.where[key] === currentTaskBinding[key],
       ) ? 1 : 0,
     }))
@@ -473,7 +553,7 @@ describe("DELETE /api/agent/application-tasks", () => {
     expect(mocks.updateMany).toHaveBeenCalledOnce()
     expect(mocks.queryRaw).toHaveBeenCalledWith(expect.objectContaining({
       sql: expect.stringContaining("FOR UPDATE"),
-      values: ["task_1", "user_1", "session_1", "turn_old", "session_1", "user_1", "cancelled", "turn_stopped_before_submit"],
+      values: ["task_1", "user_1", "session_1", "turn_old", "session_1", "user_1", null, "cancelled", "turn_stopped_before_submit"],
     }))
     expect(mocks.taskInterrupt).toHaveBeenCalledOnce()
     expect(mocks.eventCreate).not.toHaveBeenCalled()
@@ -484,7 +564,7 @@ describe("DELETE /api/agent/application-tasks", () => {
     mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
     mocks.findFirst.mockResolvedValueOnce({
       id: "task_1", sessionId: "session_1", status: "filling", checkpoint: "taskgraph_fill_queued",
-      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+      fillTurnId: "turn_fill_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", workerTaskId: null,
     })
     mocks.fillerFindMany
       .mockResolvedValueOnce([])

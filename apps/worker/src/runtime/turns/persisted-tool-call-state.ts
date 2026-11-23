@@ -69,6 +69,12 @@ function finalResults(events: readonly Row[], calls: ReadonlyMap<string, Row>): 
     const callItem = calls.get(data.toolCallId)
     if (!callItem) continue
     const call = object(callItem.content)
+    if (Object.prototype.hasOwnProperty.call(data, "failureKind")) {
+      if (event.type !== "tool_call.failed" || (data.status !== "failed" && data.status !== "cancelled")) throw new Error("tool_result_replay_uncertain")
+      if (data.failureKind === "diagnostic") {
+        if (data.output !== null || !Object.prototype.hasOwnProperty.call(data, "failureDetail")) throw new Error("tool_result_replay_uncertain")
+      } else if (data.failureKind !== "safe_output" || !Object.prototype.hasOwnProperty.call(data, "output")) throw new Error("tool_result_replay_uncertain")
+    }
     if (typeof call.toolName !== "string") continue
     if (typeof data.toolName === "string" && data.toolName !== call.toolName) throw new Error("tool_result_replay_uncertain")
     const previousReceipt = results.get(data.toolCallId)
@@ -92,6 +98,63 @@ function finalResults(events: readonly Row[], calls: ReadonlyMap<string, Row>): 
     results.set(data.toolCallId, { result: next, hasErrorCode, ...(hasErrorCode ? { errorCodeValue } : {}) })
   }
   return results
+}
+
+function exactKeys(row: Row, keys: readonly string[]): boolean { const actual = Object.keys(row); return actual.length === keys.length && keys.every(key => Object.prototype.hasOwnProperty.call(row, key)) }
+function messageDiagnostic(value: unknown): boolean {
+  const row = object(value)
+  return exactKeys(row, ["message"]) && typeof row.message === "string"
+}
+function legacyDiagnosticEvents(events: readonly Row[], calls: ReadonlyMap<string, Row>, results: ReadonlyMap<string, Row>): Row[] {
+  const candidates = new Map<string, Row[]>()
+  for (const event of events) {
+    const data = payload(event.payload), callId = typeof data.toolCallId === "string" ? data.toolCallId : undefined
+    if (!callId || Object.prototype.hasOwnProperty.call(data, "failureKind") || event.type !== "tool_call.failed"
+      || event.itemId != null || !messageDiagnostic(data.output)) continue
+    candidates.set(callId, [...candidates.get(callId) ?? [], event])
+  }
+  const projected = new Map<Row, Row>()
+  for (const [callId, rows] of candidates) {
+    const callItem = calls.get(callId), resultItem = results.get(callId), result = object(resultItem?.content)
+    if (resultItem && Object.prototype.hasOwnProperty.call(result, "output") && result.output !== null) continue
+    if (!callItem) continue
+    const origins = rows.map(event => ({ event, phase: legacyLifecycleOrigin(event, nonEmptyString(event.taskId) ?? "", callId) }))
+      .filter((entry): entry is { event: Row; phase: "failed" | "cancelled" } => entry.phase !== undefined)
+    if (origins.length === 0 || !resultItem) throw new Error("tool_result_replay_uncertain")
+    const { event, phase } = origins[0]!
+    if (rows.length !== 1) throw new Error("tool_result_replay_uncertain")
+    const data = payload(event.payload), call = object(callItem.content), taskId = callItem.taskId
+    const errorCode = nonEmptyString(data.errorCode), callVersion = call.toolVersion === undefined ? "1" : nonEmptyString(call.toolVersion)
+    if (!Object.prototype.hasOwnProperty.call(result, "output") || result.outputAvailable !== undefined && result.outputAvailable !== false
+      || result.output !== null || callItem.status !== "completed" || resultItem.status !== "completed"
+      || typeof callItem.id !== "string" || !callItem.id || typeof resultItem.id !== "string" || !resultItem.id || callItem.id === resultItem.id
+      || typeof callItem.stepId !== "string" || !callItem.stepId || resultItem.stepId !== callItem.stepId
+      || typeof taskId !== "string" || !taskId || resultItem.taskId !== taskId
+      || call.toolCallId !== callId || result.toolCallId !== callId || event.taskId !== taskId
+      || !exactKeys(data, ["toolCallId", "toolName", "toolVersion", "status", "output", "errorCode"]) || data.status !== phase || call.status !== phase
+      || (result.status !== undefined && result.status !== phase) || !errorCode
+      || call.errorCode !== errorCode || result.errorCode !== errorCode || data.toolName !== call.toolName
+      || !callVersion || data.toolVersion !== callVersion) {
+      throw new Error("tool_result_replay_uncertain")
+    }
+    const payloadWithoutDiagnostic = { ...data }
+    delete payloadWithoutDiagnostic.output
+    projected.set(event, { ...event, payload: payloadWithoutDiagnostic })
+  }
+  return events.map(event => projected.get(event) ?? event)
+}
+function legacyLifecycleOrigin(event: Row, taskId: string, callId: string): "failed" | "cancelled" | undefined {
+  const kind = event.actor === "orchestrator" ? "turn" : event.actor === "subagent" ? "task" : undefined
+  if (!kind || !taskId || event.type !== "tool_call.failed" || event.taskId !== taskId || event.itemId !== null
+    || event.causationId !== null || event.correlationId !== callId) return undefined
+  for (const phase of ["failed", "cancelled"] as const) {
+    const prefix = `tool-lifecycle:${kind}:${taskId}:${callId}:${phase}:`, id = event.id
+    if (typeof id !== "string" || !id.startsWith(prefix)) continue
+    const digest = id.slice(prefix.length)
+    if (/^[a-f0-9]{24}$/.test(digest)
+      && event.idempotencyKey === `${kind}:${taskId}:tool-lifecycle:${callId}:${phase}:${digest}`) return phase
+  }
+  return undefined
 }
 
 function itemResult(callId: string, toolName: string, call: Row, result: Row): TurnEngineToolResult {
@@ -126,7 +189,7 @@ export function restoreToolCallState(items: readonly Row[], events: readonly Row
     if (map.has(callId)) throw new Error("tool_result_replay_uncertain")
     map.set(callId, item)
   }
-  const finalByCall = finalResults(events, calls)
+  const finalByCall = finalResults(legacyDiagnosticEvents(events, calls, results), calls)
   const pending: PersistedToolCallRecovery[] = []
   const pendingIds = new Set<string>()
   for (const [callId, callItem] of calls) {
