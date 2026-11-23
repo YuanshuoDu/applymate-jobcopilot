@@ -5,6 +5,7 @@ import { isValidTaskGraphRepairRelation } from "./task-graph-repair-relation.js"
 import { isTaskGraphBlocking, isTaskGraphEventType, isTaskGraphTerminal, sameTaskGraphEvent, taskGraphEventAllowed, taskGraphNextStatus } from "./task-graph-transition-rules.js"
 import { createScheduledPostGateTaskGraphAppender, hasScheduledTaskGraphPackageRefsShape, parseScheduledTaskGraphPackageRefs,
   parseTaskGraphProposalRepairOf, taskGraphProposalTextArray as textArray } from "./scheduled-post-gate-task-graph-append.js"
+import { TASK_GRAPH_BRANCH_KEY_MAX_LENGTH, TASK_GRAPH_MAX_PROPOSAL_NODES } from "@jobcopilot/agent-protocol/task-graph-failed-branch-reconciliation"
 export { isValidTaskGraphRepairRelation } from "./task-graph-repair-relation.js"
 export type TaskGraphNodeStatus = SubagentTaskStatus
 export type TaskGraphVerificationDisposition = "typed" | "legacy_unverified" | "specialized"
@@ -23,10 +24,10 @@ export type TaskGraphValidationOptions = Readonly<{ registeredTemplateIds: Reado
 export const TASK_GRAPH_LIMITS = {
   maxProposalBytes: 32_000,
   maxSnapshotBytes: 40_000,
-  maxNodes: 8,
+  maxNodes: TASK_GRAPH_MAX_PROPOSAL_NODES,
   maxPersistedNodes: 11, maxScheduledPostGateAppendNodes: 4, maxScheduledPackageRefs: 50,
   maxDepth: 8,
-  maxKeyLength: 128,
+  maxKeyLength: TASK_GRAPH_BRANCH_KEY_MAX_LENGTH,
   maxTemplateIdLength: 128,
   maxGoalLength: 1200,
   maxSuccessCriteria: 8,

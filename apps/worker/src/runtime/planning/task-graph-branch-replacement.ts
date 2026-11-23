@@ -1,6 +1,11 @@
 import { Type } from "@sinclair/typebox"
 import { TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphProposal } from "./task-graph.js"
 import {
+  parseTaskGraphBranchReplacementContract,
+  type TaskGraphBranchReplacementContract,
+  type TaskGraphBranchReplacementContractParse,
+} from "@jobcopilot/agent-protocol/task-graph-failed-branch-reconciliation"
+import {
   taskGraphVerificationRole,
   validateTaskGraphVerificationContract,
   validateTaskGraphVerificationDependencySelectors,
@@ -17,10 +22,7 @@ export const TaskGraphBranchReplacementInputSchema = Type.Object({
     { minItems: 2, maxItems: TASK_GRAPH_LIMITS.maxNodes }),
 }, { additionalProperties: false })
 
-export type TaskGraphBranchReplacement = Readonly<{
-  root: Readonly<{ nodeKey: string; taskId: string }>
-  sources: readonly Readonly<{ nodeKey: string; taskId: string; replacementKey: string }>[]
-}>
+export type TaskGraphBranchReplacement = TaskGraphBranchReplacementContract
 
 export type TaskGraphBranchReplacementError =
   | "task_graph_branch_replacement_invalid"
@@ -31,9 +33,7 @@ export type TaskGraphBranchReplacementError =
   | "task_graph_branch_replacement_repair_reference"
   | "task_graph_dependency_unverified"
 
-export type TaskGraphBranchReplacementParse =
-  | Readonly<{ ok: true; value: TaskGraphBranchReplacement }>
-  | Readonly<{ ok: false; code: "task_graph_branch_replacement_invalid" }>
+export type TaskGraphBranchReplacementParse = TaskGraphBranchReplacementContractParse
 
 export type ValidatedTaskGraphBranchReplacement = Readonly<{
   sourceNodes: readonly StoredTaskGraphNode[]
@@ -45,66 +45,9 @@ export type TaskGraphBranchReplacementValidation =
   | Readonly<{ ok: true; value: ValidatedTaskGraphBranchReplacement }>
   | Readonly<{ ok: false; code: TaskGraphBranchReplacementError }>
 
-function plainRecord(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
-  try {
-    const prototype = Object.getPrototypeOf(value)
-    return prototype === Object.prototype || prototype === null ? value as Record<string, unknown> : undefined
-  } catch { return undefined }
-}
-
-function exactRecord(value: unknown, keys: string): Record<string, unknown> | undefined {
-  const record = plainRecord(value)
-  if (!record) return undefined
-  try {
-    const ownKeys = Reflect.ownKeys(value as object)
-    return ownKeys.every((key): key is string => typeof key === "string")
-      && ownKeys.sort().join(",") === keys ? record : undefined
-  } catch { return undefined }
-}
-
-function boundedText(value: unknown): value is string {
-  return typeof value === "string" && value.trim() === value && value.length > 0
-    && value.length <= TASK_GRAPH_LIMITS.maxKeyLength
-}
-
 /** Checks the immutable request shape before it reaches the command port. */
 export function parseTaskGraphBranchReplacement(value: unknown, proposalNodes?: readonly Readonly<{ key: string; repairOf?: unknown }>[]): TaskGraphBranchReplacementParse {
-  const branch = exactRecord(value, "root,sources"), root = branch && exactRecord(branch.root, "nodeKey,taskId")
-  if (!branch || !root || !boundedText(root.nodeKey) || !boundedText(root.taskId) || !Array.isArray(branch.sources)
-    || branch.sources.length < 2 || branch.sources.length > TASK_GRAPH_LIMITS.maxNodes) {
-    return { ok: false, code: "task_graph_branch_replacement_invalid" }
-  }
-  const ownKeys = Reflect.ownKeys(branch.sources)
-  if (ownKeys.length !== branch.sources.length + 1 || ownKeys.some((key, index) => key !== "length" && key !== String(index))) {
-    return { ok: false, code: "task_graph_branch_replacement_invalid" }
-  }
-  const sources: Array<{ nodeKey: string; taskId: string; replacementKey: string }> = []
-  const sourceKeys = new Set<string>(), taskIds = new Set<string>(), replacementKeys = new Set<string>()
-  for (const item of branch.sources) {
-    const source = exactRecord(item, "nodeKey,replacementKey,taskId")
-    if (!source || !boundedText(source.nodeKey) || !boundedText(source.taskId) || !boundedText(source.replacementKey)
-      || sourceKeys.has(source.nodeKey) || taskIds.has(source.taskId) || replacementKeys.has(source.replacementKey)) {
-      return { ok: false, code: "task_graph_branch_replacement_invalid" }
-    }
-    sourceKeys.add(source.nodeKey); taskIds.add(source.taskId); replacementKeys.add(source.replacementKey)
-    sources.push({ nodeKey: source.nodeKey, taskId: source.taskId, replacementKey: source.replacementKey })
-  }
-  if (!sources.some(source => source.nodeKey === root.nodeKey && source.taskId === root.taskId)) {
-    return { ok: false, code: "task_graph_branch_replacement_invalid" }
-  }
-  if (proposalNodes) {
-    if (!Array.isArray(proposalNodes) || proposalNodes.length > TASK_GRAPH_LIMITS.maxNodes
-      || proposalNodes.some(node => !plainRecord(node) || !boundedText(node.key))) {
-      return { ok: false, code: "task_graph_branch_replacement_invalid" }
-    }
-    const proposedKeys = proposalNodes.map(node => node.key)
-    if (proposedKeys.length !== sources.length || new Set(proposedKeys).size !== proposedKeys.length
-      || proposedKeys.some(key => !replacementKeys.has(key)) || proposalNodes.some(node => node.repairOf !== undefined)) {
-      return { ok: false, code: "task_graph_branch_replacement_invalid" }
-    }
-  }
-  return { ok: true, value: { root: { nodeKey: root.nodeKey, taskId: root.taskId }, sources } }
+  return parseTaskGraphBranchReplacementContract(value, proposalNodes)
 }
 
 function remapVerification(contract: TaskGraphVerificationContract, mapping: ReadonlyMap<string, string>): TaskGraphVerificationContract {

@@ -16,6 +16,7 @@ import {
 } from "./task-graph.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "./task-graph-verification.js"
 import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "../subagents/task-graph-child-deadline.js"
+import { TASK_GRAPH_MAX_PROPOSAL_NODES } from "@jobcopilot/agent-protocol/task-graph-failed-branch-reconciliation"
 
 const options: TaskGraphValidationOptions = {
   registeredTemplateIds: new Set(["scout", "analyst", "writer"]), maxNodes: 8, maxDepth: 4,
@@ -233,6 +234,7 @@ describe("TaskGraph planning kernel", () => {
   })
 
   it("enforces canonical persisted field and graph limits even when caller bounds are looser", () => {
+    expect(TASK_GRAPH_LIMITS.maxNodes).toBe(TASK_GRAPH_MAX_PROPOSAL_NODES)
     const state = createInitialTaskGraphState()
     const oversizedTemplateId = "t".repeat(129)
     const looseOptions: TaskGraphValidationOptions = {
