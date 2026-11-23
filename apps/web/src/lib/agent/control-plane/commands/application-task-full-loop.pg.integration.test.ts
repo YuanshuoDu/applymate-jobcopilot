@@ -2121,6 +2121,8 @@ async function waitForStage8Arm(prepared: Stage8PreparedScenario, intent: Stage8
 }
 
 async function prepareStage8Scenario(label: "stop-first" | "grant-first" | "early-wake"): Promise<Stage8PreparedScenario> {
+  const before = await requestFixtureStats()
+  const beforeEmployerPostCount = before.requests.filter(path => path === "POST /example-reviewed/jobs/1").length
   await resetStage8DomainRateLimit()
   const scenario = await createReviewedSourceScenario(`stage8-${label}`, `Synthetic Stage 8 ${label} source description.`)
   const token = await signedBearer(ids.user)
@@ -2221,7 +2223,9 @@ async function prepareStage8Scenario(label: "stop-first" | "grant-first" | "earl
   expect(jsonRecord(waitItems[0]!.content)).toMatchObject({ waitKind: "approval", approvalId: submitApprovalId,
     action: "submit_application" })
   expect(await testDb.agentOutbox.count({ where: { aggregateId: scenario.sessionId, topic: "application.submit.dispatch" } })).toBe(0)
-  expect((await requestFixtureStats()).reviewedSubmitCount).toBe(0)
+  const after = await requestFixtureStats()
+  expect(after.reviewedSubmitCount).toBe(before.reviewedSubmitCount)
+  expect(after.requests.filter(path => path === "POST /example-reviewed/jobs/1")).toHaveLength(beforeEmployerPostCount)
   return { ...scenario, token, sourceTurnId: source.turnId, reviewTurnId, fillTurnId,
     applicationTaskId: reviewTask.id, submitApprovalId }
 }
@@ -3688,7 +3692,12 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           }
           if (!verifiedTerminal) await delay(100)
         }
-        expect(verifiedTerminal).toBe(true)
+        if (!verifiedTerminal) {
+          const database = await stage8FillFailureSnapshot(prepared)
+          throw new Error("stage8_early_wake_terminal_missing:" + JSON.stringify({
+            database, requestFence: stage8RequestFenceSummary(worker?.lines ?? []),
+          }))
+        }
         expect(await stage8ModelAndToolCallEventIds(prepared)).toEqual(executionEventsBeforeWake)
         await assertPreQueueState()
 
