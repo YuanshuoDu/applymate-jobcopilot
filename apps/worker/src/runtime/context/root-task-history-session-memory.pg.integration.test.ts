@@ -11,17 +11,34 @@ import { setAgentSearchFootprintMemoryConsent } from "@/lib/agent-search-footpri
 import { sessionSnapshotFields, withAgentSearchFootprintSessionSnapshot } from "@/lib/agent-search-footprint-session-snapshot"
 // @ts-expect-error Worker Vitest supplies the Web alias for the real event fact-store writer.
 import { appendAgentEventWithOutboxInTransaction } from "@/lib/agent/session/fact-store"
-import { withRootTaskHistorySessionAuthorization, type AuthorizedRootTaskHistoryWork } from "./root-task-history-session-memory.js"
+import { ROOT_TASK_HISTORY_SESSION_AUTHORIZATION_EVENT_TYPE, withRootTaskHistorySessionAuthorization,
+  type AuthorizedRootTaskHistoryWork } from "./root-task-history-session-memory.js"
 import { createPgInputClaimStore, createPgInputClaimTransaction } from "./input-claim-store.js"
 import { StepContextBuilder } from "./step-context-builder.js"
 import { readRootTaskHistorySteerEvidence } from "./root-task-history-steer-evidence.js"
 import { executionOwnerFence, type TurnExecutionOwnerFence } from "../execution-owner.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
+import { toRepositoryJson } from "../turns/turn-engine-output.js"
 import { releaseTurnLease, type TurnLease } from "../turns/lease.js"
 import { readRootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.js"
 import { updateRootObjectiveHistoryProjection } from "./objective-history-projection.js"
 import { readRootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
 import { readRootTaskHistoryCandidates } from "./root-task-history-source-store.js"
+import { buildCanonicalRootTaskHistoryContext } from "../canonical-turn-root-task-history.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { createPgTaskGraphCommandPort } from "../subagents/pg-task-graph-command-port.js"
+import { TASK_GRAPH_TEMPLATES } from "../subagents/task-graph-templates.js"
+import { PgSubagentTaskStore } from "../subagents/pg-store.js"
+import { createPgRootTaskStore } from "../subagents/root-task-store.js"
+import { createObservedEvidenceIndex } from "../subagents/child-evidence.js"
+import { parseAndBindStructuredResultOutcome } from "../subagents/child-structured-result-outcome.js"
+import { createPgDirectRootTaskHistoryStore } from "./root-task-history-direct-store.js"
+import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
+import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "../turns/cognitive-agenda-receipt.js"
+import { STEERING_RECONCILIATION_EVENT_TYPE, parseSteeringReconciliationReceipt } from "../subagents/steering-reconciliation-contract.js"
+import type { TaskGraphReadScope, TaskGraphScheduleInput } from "../subagents/task-graph-command-port.js"
+import type { SteeringReconciliationOperation } from "../subagents/steering-reconciliation-contract.js"
+import type { StepContext } from "./step-context-builder.js"
 
 type WebPrisma = {
   $connect(): Promise<void>; $disconnect(): Promise<void>
@@ -432,6 +449,170 @@ async function setMatchingHistoryObjective(fixture: Fixture): Promise<void> {
     await client.query("ROLLBACK").catch(() => undefined)
     throw error
   } finally { client.release() }
+}
+
+const BRANCH_SCOUT_VERIFICATION = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  role: "scout",
+  criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+} as const
+
+function branchAnalystVerification(scoutKey: string) {
+  return { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst" as const,
+    criteria: [{ id: "from-scout", check: { kind: "findings_from_scout_dependency" as const, dependencyNodeKey: scoutKey } },
+      { id: "finding-count", check: { kind: "finding_count_gte" as const, minimum: 1 } }] }
+}
+
+function historyTaskGraphReadScope(fixture: Fixture): TaskGraphReadScope {
+  return { userId: fixture.userId, sessionId: fixture.sessionId, turnId: fixture.turnId,
+    rootTaskId: fixture.rootTaskId, parentTaskId: fixture.rootTaskId,
+    turnLeaseOwner: fixture.lease.ownerId, turnLeaseVersion: fixture.lease.leaseVersion,
+    parentLeaseOwner: fixture.lease.ownerId, parentAttemptCount: 1 }
+}
+
+function historyTaskGraphScope(fixture: Fixture, stepId: string): TaskGraphScheduleInput["scope"] {
+  return { ...historyTaskGraphReadScope(fixture), stepId }
+}
+
+async function persistPlanAgenda(fixture: Fixture, stepId: string, graphRevision: number): Promise<void> {
+  const context: StepContext = { schemaVersion: "agent-harness.v2", sessionId: fixture.sessionId,
+    turnId: fixture.turnId, stepId, inputThroughSequence: 0n, consumedInputIds: [], blocks: [],
+    canonicalJson: "{}", taskGraphRevision: graphRevision }
+  const receipt = buildCognitiveAgendaReceipt({ sessionId: fixture.sessionId, turnId: fixture.turnId,
+    taskId: fixture.rootTaskId, stepId, inputThroughSequence: 0n, consumedInputIds: [],
+    agenda: buildCognitiveActionAgenda(context) })
+  if (!receipt) throw new Error("Branch history fixture could not build the canonical plan agenda")
+  const key = `cognitive.agenda:${stepId}`
+  await createPgTurnEngineStore(testPool(workerApplication) as never).appendEvent({
+    owner: turnOwner(fixture), id: `history-agenda-${stepId}`, itemId: null,
+    type: COGNITIVE_AGENDA_EVENT_TYPE, correlationId: stepId, causationId: null,
+    idempotencyKey: key, payload: toRepositoryJson(receipt),
+  })
+}
+
+async function persistPlanCall(fixture: Fixture, stepId: string, callId: string, input: unknown): Promise<void> {
+  const itemId = `history-plan-call-item-${callId}`
+  await pool!.query(`INSERT INTO "agent_items" ("id","sessionId","turnId","stepId","taskId","type","status","content","startedAt","createdAt","updatedAt")
+    VALUES ($1,$2,$3,$4,$5,'tool_call','started',$6::jsonb,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
+  [itemId, fixture.sessionId, fixture.turnId, stepId, fixture.rootTaskId,
+    JSON.stringify({ toolCallId: callId, toolName: "agent.plan", toolVersion: "1", input })])
+  const key = `turn:${fixture.turnId}:event:tool-started:${callId}`
+  await createPgTurnEngineStore(testPool(workerApplication) as never).appendEvent({
+    owner: turnOwner(fixture), id: key, itemId, type: "tool_call.started", correlationId: callId,
+    causationId: null, idempotencyKey: key, payload: { toolCallId: callId, toolName: "agent.plan", taskId: fixture.rootTaskId },
+  })
+}
+
+async function createFailedScoutBranchReplacement(fixture: Fixture) {
+  await appendRootTurnStarted(fixture)
+  const templates = { scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst }
+  const actions = [...new Set(["agent.plan", ...Object.values(templates).flatMap(template => template.allowedActions)])]
+  await pool!.query(`UPDATE "sub_agent_tasks" SET "allowedActions"=$2::jsonb WHERE "id"=$1 AND "sessionId"=$3 AND "turnId"=$4`,
+    [fixture.rootTaskId, JSON.stringify(actions), fixture.sessionId, fixture.turnId])
+  const command = createPgTaskGraphCommandPort(pool!)
+  const initialScope = historyTaskGraphScope(fixture, fixture.stepId)
+  await persistPlanAgenda(fixture, fixture.stepId, 0)
+  const initial = await command.appendAndSchedule({ scope: initialScope, templates, proposal: { expectedRevision: 0, nodes: [
+    { key: "source-scout", templateId: "scout", goal: "Find initial candidates", successCriteria: ["Find one candidate"],
+      dependsOn: [], verification: BRANCH_SCOUT_VERIFICATION },
+    { key: "source-analyst", templateId: "analyst", goal: "Assess initial candidates", successCriteria: ["Return one finding"],
+      dependsOn: ["source-scout"], verification: branchAnalystVerification("source-scout") },
+  ] } })
+  const scout = initial.nodes.find(node => node.key === "source-scout")
+  if (initial.revision !== 1 || initial.nodes.length !== 2 || !scout) throw new Error("Branch history fixture did not create the typed Scout branch")
+
+  const invalid = parseAndBindStructuredResultOutcome("{malformed", "scout", createObservedEvidenceIndex())
+  if (invalid.kind !== "invalid" || invalid.category !== "result_shape_invalid") {
+    throw new Error("Branch history fixture did not reproduce the registered Scout output parser failure")
+  }
+  expect(invalid).toEqual({ kind: "invalid", category: "result_shape_invalid" })
+  const taskStore = new PgSubagentTaskStore(pool!)
+  const ownerId = `history-invalid-scout-${randomUUID()}`
+  const claimed = await taskStore.claim({ taskId: scout.taskId, sessionId: fixture.sessionId, ownerId,
+    policy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 }, now: new Date() })
+  if (!claimed || claimed.status !== "running") throw new Error("Branch history fixture could not claim the registered Scout")
+  const childResult = { status: "failed", stepCount: 2, toolCallCount: 1, finalItemId: null,
+    structuredOutputFailureCategory: invalid.category }
+  const finished = await taskStore.finish({ taskId: scout.taskId, sessionId: fixture.sessionId, ownerId,
+    attemptCount: claimed.attemptCount, status: "failed", retryDisposition: "terminal",
+    failureReason: "invalid_structured_result", result: childResult, now: new Date() })
+  if (finished !== "failed") throw new Error("Invalid Scout output did not reach the Worker terminal finish path")
+  const failure = await pool!.query<{ status: string; failureReason: string | null; result: unknown }>(
+    `SELECT "status","failureReason","result" FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3`,
+    [scout.taskId, fixture.sessionId, fixture.turnId])
+  const saved = failure.rows[0]?.result as Record<string, unknown> | undefined
+  const report = saved?.taskGraphVerificationReport as Record<string, unknown> | undefined
+  expect(failure.rows[0]).toMatchObject({ status: "failed", failureReason: "task_graph_verification_unverified" })
+  expect(saved?.structuredOutputFailureCategory).toBe("result_shape_invalid")
+  expect(report).toMatchObject({ status: "unverified", reasonCode: "result_invalid", evidenceDigest: null, resultDigest: null })
+
+  const afterFailure = await command.readCurrent(historyTaskGraphReadScope(fixture))
+  const failedScout = afterFailure.nodes.find(node => node.taskId === scout.taskId)
+  const waitingAnalyst = afterFailure.nodes.find(node => node.key === "source-analyst")
+  if (failedScout?.status !== "failed" || waitingAnalyst?.status !== "waiting") {
+    throw new Error("Invalid Scout failure did not persist its failed source and waiting dependent")
+  }
+  const nextStep = await createNextStep(fixture)
+  const scope = historyTaskGraphScope(nextStep, nextStep.stepId)
+  await persistPlanAgenda(nextStep, nextStep.stepId, afterFailure.revision)
+  const replaceBranch = { root: { nodeKey: failedScout.key, taskId: failedScout.taskId }, sources: [
+    { nodeKey: failedScout.key, taskId: failedScout.taskId, replacementKey: "replacement-scout" },
+    { nodeKey: waitingAnalyst.key, taskId: waitingAnalyst.taskId, replacementKey: "replacement-analyst" },
+  ] }
+  const nodes: TaskGraphScheduleInput["proposal"]["nodes"] = [
+    { key: "replacement-scout", templateId: "scout", goal: "Refresh candidate evidence", successCriteria: ["Find one refreshed candidate"],
+      dependsOn: [], verification: failedScout.verification ?? BRANCH_SCOUT_VERIFICATION },
+    { key: "replacement-analyst", templateId: "analyst", goal: "Reassess refreshed evidence", successCriteria: ["Return one refreshed finding"],
+      dependsOn: ["replacement-scout"], verification: branchAnalystVerification("replacement-scout") },
+  ]
+  const callId = `history-plan-${randomUUID()}`
+  const callInput = { expectedRevision: afterFailure.revision, nodes, replaceBranch }
+  await persistPlanCall(nextStep, nextStep.stepId, callId, callInput)
+  const plan: TaskGraphScheduleInput = { scope, templates, proposal: { expectedRevision: afterFailure.revision, nodes }, replaceBranch }
+  const operation: SteeringReconciliationOperation = { scope, decision: "revise", expectedRevision: afterFailure.revision, callId, replaceBranch }
+  const accepted = await command.appendAndScheduleWithReconciliation!(plan, operation)
+  const resultingRevision = afterFailure.revision + 2
+  if (accepted.status !== "accepted" || accepted.revision !== resultingRevision) {
+    throw new Error("Canonical branch command did not persist its descendant cancellation and replacement plan")
+  }
+  const receipts = await pool!.query<{ id: string; payload: unknown }>(`SELECT "id","payload" FROM "agent_events"
+    WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId"=$3 AND "type"=$4
+    ORDER BY "sequence" DESC LIMIT 2`,
+  [fixture.sessionId, fixture.turnId, fixture.rootTaskId, STEERING_RECONCILIATION_EVENT_TYPE])
+  const parsed = parseSteeringReconciliationReceipt(receipts.rows[0]?.payload)
+  expect(receipts.rows).toHaveLength(1)
+  expect(parsed?.failedBranch).toMatchObject({
+    resultingRevision,
+    cancellations: [{ source: { taskId: waitingAnalyst.taskId } }],
+    agentPlanCall: { callId, stepId: nextStep.stepId, expectedRevision: afterFailure.revision },
+    failedSource: { source: { taskId: scout.taskId } },
+  })
+  return { fixture: nextStep }
+}
+
+async function failAndReleaseRoot(fixture: Fixture): Promise<void> {
+  const errorCode = "provider_error", key = `turn:${fixture.turnId}:event:turn-failed:${errorCode}`
+  await createPgTurnEngineStore(testPool(workerApplication) as never).appendEvent({
+    owner: turnOwner(fixture), id: key, itemId: null, type: "turn.failed", correlationId: fixture.turnId,
+    causationId: null, idempotencyKey: key,
+    payload: { turnId: fixture.turnId, taskId: fixture.rootTaskId, errorCode, finalItemId: null },
+  })
+  await createPgRootTaskStore(pool! as never).finish({ lease: fixture.lease, rootTaskId: fixture.rootTaskId,
+    result: { status: "failed", stepCount: 2, toolCallCount: 1, errorCode }, now: new Date() })
+  if (!await releaseTurnLease(pool! as never, fixture.lease, "failed", new Date())) {
+    throw new Error("Branch history fixture could not commit the failed Root terminal witness")
+  }
+}
+
+async function buildPlannerHistoryContext(fixture: Fixture) {
+  const scope = { userId: fixture.userId }, now = new Date()
+  const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } as const
+  const request = { scope, sessionId: fixture.sessionId, turnId: fixture.turnId, stepId: fixture.stepId,
+    snapshot, lease: { ownerId: fixture.lease.ownerId, leaseVersion: fixture.lease.leaseVersion, now }, now }
+  return buildCanonicalRootTaskHistoryContext({ pool: pool!, scope, lease: fixture.lease,
+    rootTaskId: fixture.rootTaskId, rootAttemptCount: 1, reader: createPgDirectRootTaskHistoryStore(pool!),
+    base: new StepContextBuilder(createPgInputClaimStore(pool!, scope)), request, snapshot, turnInput: { goal: "History consent integration" },
+    crossSessionRootTaskHistoryEnabled: true })
 }
 
 async function chronologyState(sessionId: string) {
@@ -1032,5 +1213,61 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     const history = await readCrossSessionCandidates(current)
     expect(history.candidates.map(candidate => candidate.turnId)).not.toContain(source.turnId)
     expect(await chronologyState(source.sessionId)).toMatchObject({ events: "0", outboxes: "0" })
+  })
+
+  it("projects a real failed-Scout branch replacement into same-session planner history only", async () => {
+    const userId = await createUser(), sourceSessionId = await createSession(userId)
+    const source = await createTurn(userId, sourceSessionId)
+    await setMatchingHistoryObjective(source)
+    await setConsent(userId, true, 0)
+
+    const replacement = await createFailedScoutBranchReplacement(source)
+    await failAndReleaseRoot(replacement.fixture)
+
+    const sameSessionCurrent = await createTurn(userId, sourceSessionId)
+    await setMatchingHistoryObjective(sameSessionCurrent)
+    await appendRootTurnStarted(sameSessionCurrent)
+    const sameSessionContext = await buildPlannerHistoryContext(sameSessionCurrent)
+    const sameSessionHistory = sameSessionContext.blocks.find(block => block.id === "observation:root-task-history")
+    expect(sameSessionHistory).toBeDefined()
+    expect(sameSessionHistory?.content).toMatchObject({
+      kind: "root_task_history",
+      turns: [{
+        label: "earlier terminal attempt",
+        branchReplacementEpisode: {
+          schemaVersion: "agent-harness.v2.root-task-history-branch-replacement-episode.v1",
+          reason: "result_invalid",
+          failedRole: "scout",
+          replacedRoles: { scout: 1, analyst: 1, writer: 0, reviewer: 0, other: 0 },
+          successorRoles: { scout: 1, analyst: 1, writer: 0, reviewer: 0, other: 0 },
+        },
+      }],
+    })
+
+    const crossSessionId = await createSession(userId), crossSessionCurrent = await createTurn(userId, crossSessionId)
+    await setMatchingHistoryObjective(crossSessionCurrent)
+    await appendRootTurnStarted(crossSessionCurrent)
+    const crossSessionContext = await buildPlannerHistoryContext(crossSessionCurrent)
+    const crossSessionHistory = crossSessionContext.blocks.find(block => block.id === "observation:root-task-history")
+    expect(crossSessionHistory).toBeDefined()
+    expect(crossSessionHistory?.content).toMatchObject({
+      kind: "root_task_history",
+      turns: [expect.objectContaining({ label: "earlier terminal attempt", nodes: expect.arrayContaining([
+        expect.objectContaining({ taskKind: "scout", status: "cancelled" }),
+        expect.objectContaining({ taskKind: "analyst", status: "cancelled" }),
+      ]) })],
+    })
+    const crossSessionHistoryJson = JSON.stringify(crossSessionHistory?.content)
+    expect(crossSessionHistoryJson).toContain("root_task_history")
+    expect(crossSessionHistoryJson).not.toContain("branchReplacementEpisode")
+    const authorization = await pool!.query<{ sessionId: string; consentEnabled: boolean; gateEnabledAtCapture: boolean }>(`SELECT
+      "sessionId", "payload"->'consentEnabled' AS "consentEnabled", "payload"->'gateEnabledAtCapture' AS "gateEnabledAtCapture"
+      FROM "agent_events" WHERE "sessionId" = ANY($1::text[]) AND "type"=$2 ORDER BY "sessionId"`,
+    [[sourceSessionId, crossSessionId], ROOT_TASK_HISTORY_SESSION_AUTHORIZATION_EVENT_TYPE])
+    expect(authorization.rows).toHaveLength(2)
+    expect(authorization.rows).toEqual(expect.arrayContaining([
+      { sessionId: sourceSessionId, consentEnabled: true, gateEnabledAtCapture: true },
+      { sessionId: crossSessionId, consentEnabled: true, gateEnabledAtCapture: true },
+    ]))
   })
 })
