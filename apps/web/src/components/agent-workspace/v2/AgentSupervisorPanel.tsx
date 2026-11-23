@@ -16,13 +16,13 @@ import type { AgentTimelineSnapshot } from './use-agent-timeline'
 import { SelectedJobPreparationCard } from './SelectedJobPreparationCard'
 import { SelectedJobDraftArtifact } from './SelectedJobDraftArtifact'
 import { latestWriterArtifact } from './draft-artifact-projection'
+import { startSelectedJobBatch } from './selected-job-batch-command'
 import type { ChildWorkerTask } from './ChildWorkerAttachView'
 import { includeCurrentApprovalTurn, includeCurrentQuestionTurn } from './question-turn-lookup'
 import type { TaskTreeNode } from './types'
 import { SelectedTaskDetailsPanel } from './SelectedTaskDetailsPanel'
 
-export { EvidenceSummary, projectSelectedEvidence } from './agent-supervisor-evidence'
-export type { SelectedEvidenceProjection } from './agent-supervisor-evidence'
+export { EvidenceSummary, projectSelectedEvidence, type SelectedEvidenceProjection } from './agent-supervisor-evidence'
 
 interface PageInfo { hasMore?: boolean; nextCursor?: string | null }
 interface TurnsResponse { turns?: SupervisorTurnSummary[]; page?: PageInfo; projection?: unknown }
@@ -36,10 +36,11 @@ export interface AgentSupervisorPanelProps {
 /** V2 evidence panel for the live task tree and selected timeline evidence. */
 export function AgentSupervisorPanel(props: AgentSupervisorPanelProps) {
   // Query state must not carry an unscoped active projection across session changes.
-  return <SessionSupervisorPanel key={props.sessionId} {...props} />
+  if (!props.sessionId) return null
+  return <SessionSupervisorPanel key={props.sessionId} sessionId={props.sessionId} timeline={props.timeline} />
 }
 
-function SessionSupervisorPanel({ sessionId, timeline }: AgentSupervisorPanelProps) {
+function SessionSupervisorPanel({ sessionId, timeline }: { readonly sessionId: string; readonly timeline: AgentTimelineSnapshot }) {
   const { t } = useI18n()
   const [selectedNodeState, setSelectedNodeState] = useState<{ sessionId: string; id: string } | null>(null)
   const selectionControls = supervisorPlanSelectionControls(selectedNodeState, sessionId, setSelectedNodeState)
@@ -166,8 +167,6 @@ function SessionSupervisorPanel({ sessionId, timeline }: AgentSupervisorPanelPro
 
   const handlePreparationAccepted = useCallback((turnId: string, sequence: string) => { if (sessionId) setAcceptedPreparation({ sessionId, turnId, sequence }); refetchSupervisorRecords() }, [refetchSupervisorRecords, sessionId])
 
-  if (!sessionId) return null
-
   return (
     <aside className="agent-supervisor-panel" aria-label={t('agent.tasks')} data-agent-supervisor-panel="true">
       <style>{`
@@ -211,7 +210,11 @@ function SessionSupervisorPanel({ sessionId, timeline }: AgentSupervisorPanelPro
       <AgentSupervisorPlanView
         sessionId={sessionId} items={timeline.items} turns={turns} tasks={tasks} selectedNodeId={selectedId} selectedNode={selectedNode}
         currentGraphTasks={graphTasksQuery.data?.tasks ?? []} currentLedger={graphTasksQuery.data?.planLedger} currentDiscoveryShortlist={graphTasksQuery.data?.discoveryShortlist}
-        currentPreparationTurnId={selectedPreparationTurnId} lifecycleRevision={timeline.lifecycleRevision}
+        currentPreparationTurnId={selectedPreparationTurnId} activeTurnProjection={turnsQuery.data?.projection} lifecycleRevision={timeline.lifecycleRevision}
+        onPrepareBatch={request => startSelectedJobBatch(sessionId, request).then(result => {
+          refetchSupervisorRecords()
+          return result
+        })}
         onReturnToCurrent={selectionControls.onReturnToCurrent} />
       <SelectedJobDraftArtifact sessionId={sessionId} artifactRef={draftArtifactRef} sourceTurnId={turns.find(turn => turn.id === selectedPreparationTurnId && turn.status === 'completed')?.id ?? null} />
       {timeline.cognitiveAgenda && <CognitiveAgendaCard agenda={timeline.cognitiveAgenda} agendas={timeline.cognitiveAgendas} taskLabels={agendaTaskLabels} />}

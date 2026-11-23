@@ -8,6 +8,7 @@ import { publicToolCallIdOrNull, publicToolItemId } from "@/lib/agent/session/pu
 
 import { toIso, type CursorRow } from "./query-helpers"
 import { projectTaskEvidencePreview } from "./task-evidence-preview"
+import { parseSelectedJobBatchTurnIdentity, projectSelectedJobId } from "@/lib/agent/session/selected-job-batch-turn-identity"
 
 const SENSITIVE_KEY = /(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|answer|(?:full[_-]?)?resume(?:[_-]?(text|content|data))?|cv(?:[_-]?(text|content|data))?|raw[_-]?(content|text))/i
 function redactString(value: string): string { return redactFinalAnswerText(value) }
@@ -134,6 +135,7 @@ export interface TurnQueryRow extends CursorRow {
   id: string
   sessionId: string
   source: string
+  executionMode?: string | null
   status: string
   revision: number
   input: unknown
@@ -147,13 +149,15 @@ export interface TurnQueryRow extends CursorRow {
 export function turnDto(row: TurnQueryRow) {
   const input = record(row.input)
   const selectedJobId = projectSelectedJobId(input.selectedJobPreparation)
+  const selectedJobBatchPreparation = row.source === "user" && row.executionMode === "canonical_task_graph"
+    && parseSelectedJobBatchTurnIdentity(row.input) ? true : undefined
   return {
     schemaVersion,
     id: row.id,
     sessionId: row.sessionId,
     source: row.source,
     goal: typeof input.goal === "string" ? redactString(input.goal) : "Process agent task",
-    ...(selectedJobId ? { selectedJobId } : {}),
+    ...(selectedJobId ? { selectedJobId } : {}), ...(selectedJobBatchPreparation ? { selectedJobBatchPreparation } : {}),
     status: row.status,
     revision: row.revision,
     activeStepId: row.steps[0]?.id ?? null,
@@ -207,12 +211,6 @@ function projectArtifactRef(value: unknown, role: string, taskType: string, stat
     || !boundedIdentifier(ref.artifactId) || !Number.isSafeInteger(ref.version) || Number(ref.version) < 1
     || !isDigest(ref.contentHash) || !isDigest(ref.sourceDigest)) return null
   return { artifactId: ref.artifactId, version: Number(ref.version), contentHash: ref.contentHash, sourceDigest: ref.sourceDigest }
-}
-
-function projectSelectedJobId(value: unknown): string | null {
-  const selectedJobPreparation = record(value)
-  if (Object.keys(selectedJobPreparation).length !== 1 || !boundedIdentifier(selectedJobPreparation.jobId)) return null
-  return selectedJobPreparation.jobId
 }
 
 function boundedIdentifier(value: unknown): value is string {
