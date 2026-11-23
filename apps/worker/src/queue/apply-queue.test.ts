@@ -963,6 +963,8 @@ describe("apply-queue (unit — mocked)", () => {
   it("aborts popup first requests at the intent URL and a different URL", async () => {
     configureMockBrowserSubmitTool();
     let allowed: boolean | undefined;
+    let releasePopupRequests!: () => void;
+    const popupRequestsBlocked = new Promise<void>((resolve) => { releasePopupRequests = resolve; });
     const popupRoutes: Array<NonNullable<Awaited<ReturnType<typeof dispatchPageRequest>>>> = [];
     mockHarnessRun.mockImplementation(async (_page: unknown, task: { beforeSubmit?: (intent?: { url: string; method: string }) => Promise<boolean> }) => {
       allowed = task.beforeSubmit
@@ -974,17 +976,37 @@ describe("apply-queue (unit — mocked)", () => {
         if (actionRoute) popupRoutes.push(actionRoute);
         if (otherUrlRoute) popupRoutes.push(otherUrlRoute);
       }
+      releasePopupRequests();
       return { status: "manual", error: "Popup request was blocked before network continuation.", durationMs: 123 };
     });
 
-    await import("./apply-queue.js");
-    await mockProcessor({
-      data: {
-        applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1", sessionId: "agent-session-1", fillTurnId: "agent-turn-1",
-        applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
-        receiptId: "approval-1", constraintHash: "c".repeat(64),
-      },
-    });
+    vi.useFakeTimers();
+    const intervalSpy = vi.spyOn(globalThis, "setInterval").mockReturnValue({ unref: vi.fn() } as unknown as ReturnType<typeof setInterval>);
+    let processor: Promise<unknown> | null = null;
+    let observationDeadlineAdvanced = false;
+    try {
+      await import("./apply-queue.js");
+      const { SUBMISSION_START_OBSERVATION_TIMEOUT_MS } = await import("./apply-job-finalization.js");
+      processor = Promise.resolve(mockProcessor({
+        data: {
+          applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1", sessionId: "agent-session-1", fillTurnId: "agent-turn-1",
+          applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+          receiptId: "approval-1", constraintHash: "c".repeat(64),
+        },
+      }));
+      await popupRequestsBlocked;
+      await vi.advanceTimersByTimeAsync(SUBMISSION_START_OBSERVATION_TIMEOUT_MS);
+      observationDeadlineAdvanced = true;
+      await processor;
+    } finally {
+      if (processor) {
+        if (!observationDeadlineAdvanced) await vi.advanceTimersByTimeAsync(SUBMISSION_START_OBSERVATION_TIMEOUT_MS);
+        await processor.catch(() => undefined);
+      }
+      intervalSpy.mockRestore();
+      vi.useRealTimers();
+      vi.resetModules();
+    }
 
     expect(allowed).toBe(true);
     expect(popupRoutes).toHaveLength(2);
