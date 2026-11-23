@@ -1,5 +1,6 @@
 import type { TimelineItem } from './timeline-reducer'
 import type { TaskTreeNode } from './types'
+import { projectTaskWorkerFailure } from './child-worker-failure'
 
 export interface SupervisorTurnSummary {
   readonly id: string
@@ -87,7 +88,7 @@ export function projectSupervisorTree({ turns, items, tasks = [], labels = DEFAU
   const turnNodes = [...turns].sort(compareCreated).map(turn => {
     const turnItems = itemsByTurn.get(turn.id) ?? []
     const children = projectEvidence(turnItems, turn.activeStepId, turn.status, labels)
-    const taskChildren = projectTaskTree(tasksByTurn.get(turn.id) ?? [], labels, turnItems)
+    const taskChildren = projectTaskTree(tasksByTurn.get(turn.id) ?? [], labels, turnItems, turn.sessionId)
     return {
       id: `turn:${turn.id}`,
       kind: 'turn' as const,
@@ -149,21 +150,26 @@ function projectTools(items: readonly TimelineItem[], fallbackLabel: string): Ta
   })
 }
 
-function projectTask(task: SupervisorTaskSummary, fallbackLabel: string, items: readonly TimelineItem[]): TaskTreeNode {
+function projectTask(task: SupervisorTaskSummary, fallbackLabel: string, items: readonly TimelineItem[], expectedSessionId?: string): TaskTreeNode {
   const evidence = latestItem(items.filter(item => item.taskId === task.id))
+  const failure = projectTaskWorkerFailure({
+    taskId: task.id, sessionId: task.sessionId, expectedSessionId, rootTaskId: task.rootTaskId,
+    parentTaskId: task.parentTaskId, role: task.role, taskType: task.taskType,
+    status: task.status, reason: task.failureReason,
+  })
   return {
     id: `task:${task.id}`,
     kind: 'task',
     label: displayGoal(task.goal) || task.role || task.taskType || fallbackLabel,
     status: task.status,
     itemId: evidence?.id,
-    detail: task.failureReason ?? undefined,
+    ...failure,
     resultAvailable: task.hasResult || evidence?.type === 'tool_result',
   }
 }
 
-function projectTaskTree(tasks: readonly SupervisorTaskSummary[], labels: SupervisorTreeLabels, items: readonly TimelineItem[]): TaskTreeNode[] {
-  const nodes = new Map(tasks.map(task => [task.id, projectTask(task, labels.task, items)]))
+function projectTaskTree(tasks: readonly SupervisorTaskSummary[], labels: SupervisorTreeLabels, items: readonly TimelineItem[], expectedSessionId?: string): TaskTreeNode[] {
+  const nodes = new Map(tasks.map(task => [task.id, projectTask(task, labels.task, items, expectedSessionId)]))
   const children = new Map<string, TaskTreeNode[]>()
   const roots: TaskTreeNode[] = []
   for (const task of tasks) {
