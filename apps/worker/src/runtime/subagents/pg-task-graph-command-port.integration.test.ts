@@ -1632,7 +1632,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
         WHERE role.rolname = current_user AND relation.oid = ANY(ARRAY[
           'public."agent_sessions"'::regclass, 'public."agent_turns"'::regclass, 'public."sub_agent_tasks"'::regclass,
           'public."agent_steps"'::regclass, 'public."agent_items"'::regclass, 'public."agent_events"'::regclass,
-          'public."agent_outbox"'::regclass, 'public."agent_inputs"'::regclass
+          'public."agent_outbox"'::regclass, 'public."agent_inputs"'::regclass, 'public."Job"'::regclass
         ]) ORDER BY relation.relname`)
       expect(roleState.rows).toEqual([...TENANT_TABLES].sort().map(tableName => ({
         tenantScope: owner.userId, roleName, isSuperuser: false, bypassesRls: false, tableName, ownsTable: false,
