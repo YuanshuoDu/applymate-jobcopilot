@@ -8,6 +8,7 @@ import {
   needsUserTakeover,
   USER_TAKEOVER_CHECKPOINT,
 } from "../db/application-task-state.js";
+import { finalizeStoppedApplicationSubmission } from "../db/application-submission-stop-finalization.js";
 import { updateJobForSubmission, UNCONFIRMED_SUBMISSION_MESSAGE } from "../db/submission-guard.js";
 import { createNotification } from "../notifications/create-notification.js";
 import { notifyApplyResult } from "../notifications/notify-apply-result.js";
@@ -74,6 +75,26 @@ export async function persistApplyJobOutcome(
     await context.lifecycle?.closeActiveSubmissionContext();
   }
   if (state.queueCatchStarted || state.submissionSuperseded) return;
+
+  const scope = state.approvedTurnScope;
+  const mayFinalizeStoppedAttempt = context.stagedSubmissionStopProtocol !== undefined
+    && operation === "submit" && submissionIdentity !== null && scope !== null
+    && scope.applicationTaskId === applicationTaskId && scope.userId === userId && scope.jobId === jobId
+    && scope.sessionId === submissionIdentity.sessionId && scope.fillTurnId === submissionIdentity.fillTurnId
+    && scope.turnId === scope.fillTurnId && scope.approvalId === submissionIdentity.approvalId
+    && scope.constraintHash === submissionIdentity.constraintHash
+    && scope.workerTaskId === context.workerTaskId && scope.executionId === context.executionId
+    && state.submissionClaimed && state.turnStopped && state.submissionCandidateSeen
+    && state.submissionExecutionStartAttempted && !state.submissionRequestStarted
+    && !state.submissionAcknowledgementUncertain && !state.submissionFenceUnavailable
+    && !state.submissionTaskInactive && !state.applicationTaskFinalized
+    && !state.queueCatchStarted && !state.submissionSuperseded && harnessResult.status !== "submitted";
+  if (mayFinalizeStoppedAttempt && scope) {
+    const finalized = await finalizeStoppedApplicationSubmission(getPool(), scope);
+    if (finalized === "superseded") { state.submissionSuperseded = true; return; }
+    if (finalized === "already_finalized") { state.applicationTaskFinalized = true; return; }
+    if (finalized === "finalized") state.applicationTaskFinalized = true;
+  }
 
   if (operation === "fill") {
     const outcome = await legacyFillOutcomes.persistLegacyFillHarnessOutcome({
