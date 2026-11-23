@@ -4,6 +4,7 @@ import { createContext, createElement, useCallback, useContext, useEffect, useRe
 import { schemaVersion, type InputContentPart } from '@jobcopilot/agent-protocol'
 import type { ActiveTurnDto, AgentTurnStateReadiness } from './agent-session-state'
 import type { AgentSessionControlStatus } from './v2/AgentSessionPauseResumeControl'
+import type { TimelineSteeringMarkerState } from './v2/timeline-steering-markers'
 
 export type ComposerDelivery = 'steer' | 'follow_up'
 export type ComposerMessageStatus = 'sending' | 'accepted' | 'consumed' | 'failed'
@@ -60,6 +61,7 @@ export interface TurnComposerController {
   turnStateReadiness?: AgentTurnStateReadiness
   sessionStatus?: AgentSessionControlStatus | null
   refresh?: () => unknown
+  appliedSteeringMarkers?: TimelineSteeringMarkerState['applied']
   delivery: ComposerDelivery
   setDelivery: (delivery: ComposerDelivery) => void
   chatInput: string
