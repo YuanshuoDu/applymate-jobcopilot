@@ -22,26 +22,27 @@ function armLegacyFinalResponseGate(turnId) {
   if (typeof turnId !== "string" || !turnId || turnId.length > 256 || turnId.trim() !== turnId || legacyFinalResponseGate) throw new Error("legacy_final_response_gate_arm_invalid")
   let release
   const released = new Promise(resolve => { release = resolve })
-  legacyFinalResponseGate = { turnId, release, released, claimed: false }
+  legacyFinalResponseGate = { turnId, release, released, claimed: false, releasedState: false }
 }
 function releaseLegacyFinalResponseGate(turnId) {
   const gate = legacyFinalResponseGate
   if (!gate || gate.turnId !== turnId) return false
-  gate.release()
+  if (!gate.releasedState) {
+    gate.releasedState = true
+    gate.release()
+  }
   return true
+}
+function proveLegacyFinalResponseGateHeld(turnId) {
+  const gate = legacyFinalResponseGate
+  return Boolean(gate && gate.turnId === turnId && gate.claimed && !gate.releasedState)
 }
 async function holdLegacyFinalResponse(turnId) {
   const gate = legacyFinalResponseGate
-  if (!gate || gate.turnId !== turnId || gate.claimed) return
+  if (!gate || gate.turnId !== turnId || gate.claimed || gate.releasedState) return
   gate.claimed = true
   say(`LEGACY_FINAL_RESPONSE_GATE_REACHED turnId=${turnId}`)
-  let timer
-  await Promise.race([gate.released, new Promise(resolve => {
-    timer = setTimeout(resolve, 45_000)
-    timer.unref?.()
-  })])
-  if (timer) clearTimeout(timer)
-  gate.release()
+  await gate.released
 }
 const tls = async () => {
   const cert = await readFile(required("AGENT_TEST_TLS_CERT_PATH"))
@@ -450,9 +451,15 @@ async function startWorker() {
         if (releaseLegacyFinalResponseGate(line.slice("release-legacy-final-response ".length))) {
           say("LEGACY_FINAL_RESPONSE_GATE_RELEASED")
         }
+      } else if (line.startsWith("prove-legacy-final-response ")) {
+        const turnId = line.slice("prove-legacy-final-response ".length)
+        say(proveLegacyFinalResponseGateHeld(turnId)
+          ? "LEGACY_FINAL_RESPONSE_GATE_PROOF_HELD"
+          : "LEGACY_FINAL_RESPONSE_GATE_PROOF_NOT_HELD")
       } else if (line === "shutdown") {
         process.stdin.pause()
         legacyAckWitness.releaseForShutdown()
+        if (legacyFinalResponseGate) releaseLegacyFinalResponseGate(legacyFinalResponseGate.turnId)
         resolve()
         return
       }
