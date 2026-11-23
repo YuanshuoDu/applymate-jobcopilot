@@ -26,6 +26,10 @@ function outcome(id: string, sequence: bigint, nodes: readonly TaskGraphCurrentN
   return { sourceTurnId: "turn-" + id, sourceRootTaskId: "root-" + id, terminalSequence: sequence,
     terminalXid8: (sequence + 1_000n).toString(), terminalWitnessEventId: "witness-" + id, taskGraph: graph(nodes) }
 }
+const replacementEpisode = { schemaVersion: "agent-harness.v2.root-task-history-branch-replacement-episode.v1",
+  reason: "result_invalid", failedRole: "scout",
+  replacedRoles: { scout: 1, analyst: 1, writer: 0, reviewer: 0, other: 0 },
+  successorRoles: { scout: 1, analyst: 1, writer: 0, reviewer: 0, other: 0 } } as const
 function queryFootprint(targetRoles: readonly string[] = ["Backend Engineer"]) {
   return createDiscoveryQueryFootprint([{ criteria: { targetRoles, targetLocations: ["Dublin"],
     source: "lever", pageSize: 20, hasCursor: false }, outcome: "completed", requestCount: 1, observedCandidateCount: 3,
@@ -55,6 +59,39 @@ describe("root task history projection", () => {
     for (const forbidden of ["private-source", "turn-private", "root-private", "PRIVATE_", "criterion-a", "sourceTurnId", "verificationReport", "evidenceDigest"]) {
       expect(serialized).not.toContain(forbidden)
     }
+  })
+
+  it("projects only the closed same-session replacement episode and preserves base history when it is malformed", () => {
+    const local = { ...outcome("branch-local", 14n), sourceSessionDiffers: false, branchReplacementEpisode: replacementEpisode }
+    const projected = projectRootTaskHistory([local])
+    expect(projected?.content).toMatchObject({ turns: [{ branchReplacementEpisode: replacementEpisode }] })
+    const serialized = JSON.stringify(projected)
+    for (const forbidden of ["branch-local", "witness-branch-local", "digest", "taskId", "criterionId", "toolArguments"]) {
+      expect(serialized).not.toContain(forbidden)
+    }
+
+    const baseline = projectRootTaskHistory([outcome("branch-invalid", 15n)])
+    const malformed = projectRootTaskHistory([{ ...outcome("branch-invalid", 15n),
+      branchReplacementEpisode: { ...replacementEpisode, reason: "private_reason" } as unknown as typeof replacementEpisode }])
+    expect(malformed).toEqual(baseline)
+
+    const getter = { ...outcome("branch-getter", 16n) }
+    Object.defineProperty(getter, "branchReplacementEpisode", { enumerable: true, get: () => { throw new Error("untrusted accessor") } })
+    expect(projectRootTaskHistory([getter as unknown as ValidatedRootTaskHistoryOutcome]))
+      .toEqual(projectRootTaskHistory([outcome("branch-getter", 16n)]))
+  })
+
+  it("keeps replacement episodes only on same-session candidates in mixed-session mode", () => {
+    const foreign = { ...outcome("foreign-branch", 20n), sourceSessionDiffers: true,
+      terminalXid8: "200", terminalWitnessEventId: "foreign-witness", branchReplacementEpisode: replacementEpisode }
+    const local = { ...outcome("local-branch", 19n, [node({ templateId: "analyst" })]), sourceSessionDiffers: false,
+      terminalXid8: "100", branchReplacementEpisode: replacementEpisode }
+    const projected = projectRootTaskHistory([foreign, local], true)
+    const turns = (projected?.content as { turns?: Array<{ nodes: Array<{ taskKind: string }>; branchReplacementEpisode?: unknown }> } | undefined)?.turns
+    expect(turns).toHaveLength(2)
+    expect(turns?.filter(turn => turn.branchReplacementEpisode)).toHaveLength(1)
+    expect(turns?.find(turn => turn.branchReplacementEpisode)?.nodes).toEqual(expect.arrayContaining([expect.objectContaining({ taskKind: "analyst" })]))
+    expect(JSON.stringify(projected)).not.toContain("foreign-witness")
   })
 
   it("omits success reason codes and does not expose verifier proof fields", () => {
@@ -907,8 +944,10 @@ describe("root task history Scout query footprints", () => {
     const projected = projectRootTaskHistory([source])
     const history = projected?.content as { turns: Array<{ nodes: Array<Record<string, unknown>> }> }
     const emitted = history.turns[0]?.nodes ?? []
+    const withEpisode = projectRootTaskHistory([{ ...source, branchReplacementEpisode: replacementEpisode }])
 
     expect(Buffer.byteLength(JSON.stringify(projected), "utf8")).toBeLessThanOrEqual(8 * 1024)
+    expect(withEpisode).toEqual(projected)
     expect(emitted.filter(item => item.priorScoutQueryFootprint).length).toBeLessThan(4)
     expect(emitted.every(item => item.lesson !== undefined)).toBe(true)
   })

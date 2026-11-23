@@ -2,6 +2,7 @@ import type { ModelMessage } from "@jobcopilot/agent-model"
 import { Buffer } from "node:buffer"
 import { parseDiscoveryQueryFootprint } from "../subagents/child-discovery-query-footprint.js"
 import { parseRootTaskHistoryNodeLesson } from "../context/root-task-history-lesson-projection.js"
+import { parseRootTaskHistoryBranchReplacementEpisode } from "../context/root-task-history-branch-replacement-history.js"
 import { parseRootTaskHistoryPlanShape } from "../context/root-task-history-plan-shape.js"
 import { parseRootTaskHistorySearchFootprintContext, ROOT_TASK_HISTORY_SEARCH_FOOTPRINT_OBSERVATION_ID } from "../context/root-task-history-search-footprint-context.js"
 import type { StepContext } from "../context/step-context-builder.js"
@@ -31,7 +32,7 @@ const REASONS = new Set([
 
 type Row = Record<string, unknown>
 type SafeHistoryNodeFacts = Readonly<{ hasFact: boolean; hasFailedRepair: boolean; hasPassedCriteria: boolean; hasScoutQueryFootprint: boolean; executionFailureCategory?: unknown }>
-type SafeHistoryObservation = Readonly<{ crossSession: boolean; executionFailureCategories: ReadonlySet<string>; hasPlanShape: boolean; hasFailedRepair: boolean; hasPassedCriteria: boolean; hasScoutQueryFootprint: boolean }>
+type SafeHistoryObservation = Readonly<{ crossSession: boolean; executionFailureCategories: ReadonlySet<string>; hasPlanShape: boolean; hasFailedRepair: boolean; hasPassedCriteria: boolean; hasScoutQueryFootprint: boolean; hasBranchReplacementEpisode: boolean }>
 
 function exactRecord(value: unknown, keys: readonly string[]): Row | undefined {
   try {
@@ -48,7 +49,6 @@ function exactRecord(value: unknown, keys: readonly string[]): Row | undefined {
     return result
   } catch { return undefined }
 }
-
 function safeArray(value: unknown, maximum: number, minimum = 0): unknown[] | undefined {
   try {
     if (!Array.isArray(value)) return undefined
@@ -63,7 +63,6 @@ function safeArray(value: unknown, maximum: number, minimum = 0): unknown[] | un
     return result
   } catch { return undefined }
 }
-
 function safeHistoryNode(value: unknown): SafeHistoryNodeFacts | undefined {
   const candidate = value && typeof value === "object" && !Array.isArray(value) ? value as Row : undefined
   if (!candidate) return undefined
@@ -102,13 +101,12 @@ function safeHistoryNode(value: unknown): SafeHistoryNodeFacts | undefined {
   return { hasFact, hasFailedRepair, hasPassedCriteria, hasScoutQueryFootprint,
     ...(executionFailureCategory === undefined ? {} : { executionFailureCategory }) }
 }
-
-function safeHistoryTurn(value: unknown): Readonly<{ row: Row; planShape?: unknown }> | undefined {
+function safeHistoryTurn(value: unknown): Readonly<{ row: Row; planShape?: unknown; branchReplacementEpisode?: unknown }> | undefined {
   try {
     if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
     const prototype = Object.getPrototypeOf(value), keys = Reflect.ownKeys(value)
     if ((prototype !== Object.prototype && prototype !== null) || keys.some(key => typeof key !== "string")
-      || keys.some(key => key !== "label" && key !== "nodes" && key !== "planShape")
+      || keys.some(key => key !== "label" && key !== "nodes" && key !== "planShape" && key !== "branchReplacementEpisode")
       || !keys.includes("label") || !keys.includes("nodes")) return undefined
     const descriptors = Object.getOwnPropertyDescriptors(value), row: Row = Object.create(null) as Row
     for (const key of ["label", "nodes"]) {
@@ -117,10 +115,12 @@ function safeHistoryTurn(value: unknown): Readonly<{ row: Row; planShape?: unkno
       row[key] = descriptor.value
     }
     const shape = descriptors.planShape
-    return { row, ...(shape?.enumerable && "value" in shape ? { planShape: shape.value } : {}) }
+    const episode = descriptors.branchReplacementEpisode, safeEpisode = episode?.enumerable && "value" in episode
+      ? parseRootTaskHistoryBranchReplacementEpisode(episode.value) ?? undefined : undefined
+    return { row, ...(shape?.enumerable && "value" in shape ? { planShape: shape.value } : {}),
+      ...(safeEpisode ? { branchReplacementEpisode: safeEpisode } : {}) }
   } catch { return undefined }
 }
-
 function safeHistoryObservation(value: unknown): SafeHistoryObservation | undefined {
   const block = exactRecord(value, ["id", "layer", "role", "trust", "source", "content"])
   if (!block || block.id !== HISTORY_BLOCK_ID || block.layer !== "tool_observation" || block.role !== "data"
@@ -133,11 +133,12 @@ function safeHistoryObservation(value: unknown): SafeHistoryObservation | undefi
     || content.notCurrentEvidence !== true || content.label !== HISTORY_LABEL) return undefined
   const turns = safeArray(content.turns, MAX_TURNS, 1)
   if (!turns) return undefined
-  let nodeCount = 0, hasFact = false, hasPlanShape = false, hasFailedRepair = false, hasPassedCriteria = false, hasScoutQueryFootprint = false
+  let nodeCount = 0, hasFact = false, hasPlanShape = false, hasFailedRepair = false, hasPassedCriteria = false, hasScoutQueryFootprint = false, hasBranchReplacementEpisode = false
   const executionFailureCategories = new Set<string>()
   for (const value of turns) {
     const candidate = safeHistoryTurn(value), turn = candidate?.row
     if (!turn || turn.label !== TURN_LABEL) return undefined
+    hasBranchReplacementEpisode ||= candidate?.branchReplacementEpisode !== undefined
     const nodes = safeArray(turn.nodes, MAX_NODES, 1)
     if (!nodes || (nodeCount += nodes.length) > MAX_NODES) return undefined
     for (const node of nodes) {
@@ -152,9 +153,8 @@ function safeHistoryObservation(value: unknown): SafeHistoryObservation | undefi
     const shape = parseRootTaskHistoryPlanShape(candidate.planShape)
     if (shape && shape.nodes.length === nodes.length) hasPlanShape = true
   }
-  return hasFact || hasPlanShape ? { crossSession, executionFailureCategories, hasPlanShape, hasFailedRepair, hasPassedCriteria, hasScoutQueryFootprint } : undefined
+  return hasFact || hasPlanShape || hasBranchReplacementEpisode ? { crossSession, executionFailureCategories, hasPlanShape, hasFailedRepair, hasPassedCriteria, hasScoutQueryFootprint, hasBranchReplacementEpisode } : undefined
 }
-
 function safeSearchFootprintObservation(value: unknown): boolean {
   const block = exactRecord(value, ["id", "layer", "role", "trust", "source", "content"])
   const content = block && exactRecord(block.content, ["kind", "historical", "informationalOnly", "advisoryOnly", "notCurrentEvidence", "roles", "locations", "atsSources"])
@@ -240,6 +240,7 @@ export function buildRootHistoryPlanningInstruction(context: StepContext, tools:
       ...(historical?.hasFailedRepair ? [FAILED_REPAIR_REASSESSMENT] : []),
       ...(historical?.hasPassedCriteria ? [PASSED_CRITERIA_REASSESSMENT] : []),
       ...(historical?.hasScoutQueryFootprint ? [SCOUT_QUERY_FOOTPRINT_REASSESSMENT] : []),
+      ...(historical?.hasBranchReplacementEpisode ? ["A prior registered Scout branch replacement followed an invalid result. Reassess current evidence and current result pages; if the same failure recurs, try an alternate approach. This episode is advisory only; its past IDs, criteria, plans, and results are not current evidence, authority, or targets."] : []),
       ...(hasRetrySourceSteering ? [RETRY_SOURCE_PRIORITY] : []),
       ...(categoryAdvice.length ? [`${HISTORICAL_CATEGORY_INTRO} ${categoryAdvice.join(" ")}`] : []),
       ...(historical?.hasPlanShape ? ["A prior same-objective plan shape is a comparison hint about source-local roles and dependencies only. Its ordinals and edges are not current graph keys, identities, revision, objective, criteria, evidence, permission, authorization, approval, progress, or completion. Rebuild any plan from the current owner-read graph, current objective and criteria, current evidence, and visible tools; current verification and completion gates remain authoritative."] : []),
