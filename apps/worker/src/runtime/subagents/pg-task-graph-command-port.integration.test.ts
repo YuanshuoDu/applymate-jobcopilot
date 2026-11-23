@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
 import { redactAgentEvent, redactSensitiveText } from "@jobcopilot/shared"
@@ -138,7 +138,10 @@ function fixture(): Fixture {
 }
 
 function selectedJobId(value: Fixture): string { return `p3-task-graph-selected-job-${value.sessionId}` }
-function scheduledDraftJobId(value: Fixture, label: string): string { return `draft-${label}-${value.rootTaskId.slice(-36)}` }
+function scheduledDraftJobId(value: Fixture, label: string): string {
+  const suffix = createHash("sha256").update(`${value.rootTaskId}:${label}`).digest("hex").slice(0, 24)
+  return `c${suffix}`
+}
 
 function completedReviewerResultEnvelope() {
   const digest = `sha256:${"a".repeat(64)}`
@@ -475,7 +478,20 @@ async function persistVerifiedScheduledDraftRole(pool: PgPool, value: Fixture, s
   [stepId, value.sessionId, value.turnId, node.taskId, ordinal, attemptCount])
   const job = (structuredResult as { evidence?: Array<{ ref?: string }> }).evidence?.[0]?.ref
   if (typeof job !== "string") throw new Error("Scheduled-draft PostgreSQL fixture has no job evidence")
-  const output = { job: { id: job, source: "fixture" } }
+  const jobRecord = { id: job, company: "Fixture GmbH", role: "Software Engineer", location: "Berlin", status: "saved", score: 80,
+    url: "https://jobs.example.invalid/finalization", source: "test", salary: null,
+    description: "Original selected source for finalization", keywords: null }
+  const jobRow = await pool.query(`INSERT INTO "Job"
+    ("id", "userId", "company", "role", "location", "status", "score", "url", "source", "salary", "description", "keywords", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)
+    ON CONFLICT ("id") DO UPDATE SET "company" = EXCLUDED."company", "role" = EXCLUDED."role", "location" = EXCLUDED."location",
+      "status" = EXCLUDED."status", "score" = EXCLUDED."score", "url" = EXCLUDED."url", "source" = EXCLUDED."source",
+      "salary" = EXCLUDED."salary", "description" = EXCLUDED."description", "keywords" = EXCLUDED."keywords", "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "Job"."userId" = EXCLUDED."userId" RETURNING "id"`,
+  [job, value.userId, jobRecord.company, jobRecord.role, jobRecord.location, jobRecord.status, jobRecord.score, jobRecord.url,
+    jobRecord.source, jobRecord.salary, jobRecord.description, jobRecord.keywords])
+  if (jobRow.rows.length !== 1 || jobRow.rows[0]?.id !== job) throw new Error("Scheduled-draft fixture could not persist an owner-scoped full Job source")
+  const output = { job: jobRecord }
   const callContent = { toolCallId: callId, toolName: "jobs.get", toolVersion: "1", input: { jobId: job }, status: "completed", errorCode: null }
   const resultContent = { toolCallId: callId, output, errorCode: null }
   await pool.query(`INSERT INTO "agent_items"
@@ -1366,8 +1382,9 @@ async function seedReconciliationToolCall(pool: PgPool, value: Fixture, call: {
   })
 }
 
-const TENANT_TABLES = ["agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox", "agent_inputs"] as const
+const TENANT_TABLES = ["agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox", "agent_inputs", "Job"] as const
 const TENANT_POLICIES: ReadonlyArray<readonly [string, string, string]> = [
+  ["Job", "job", `"userId" = public.app_current_user_id()`],
   ["agent_sessions", "session", `"userId" = public.app_current_user_id()`],
   ["agent_turns", "turn", `"userId" = public.app_current_user_id() AND EXISTS (
     SELECT 1 FROM public."agent_sessions" AS session WHERE session."id" = "sessionId" AND session."userId" = public.app_current_user_id())`],
@@ -1397,7 +1414,7 @@ async function installTaskGraphTenantRls(pool: PgPool, policyPrefix: string, set
     FROM pg_class AS relation WHERE relation.oid = ANY(ARRAY[
       'public."agent_sessions"'::regclass, 'public."agent_turns"'::regclass, 'public."sub_agent_tasks"'::regclass,
       'public."agent_steps"'::regclass, 'public."agent_items"'::regclass, 'public."agent_events"'::regclass,
-      'public."agent_outbox"'::regclass, 'public."agent_inputs"'::regclass
+      'public."agent_outbox"'::regclass, 'public."agent_inputs"'::regclass, 'public."Job"'::regclass
     ])`)
   for (const table of TENANT_TABLES) {
     const row = prior.rows.find(candidate => candidate.tableName === table)
@@ -1514,6 +1531,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     await adminPool.query(`GRANT SELECT ON "agent_tree_budget_reservations", "agent_native_semantic_rejections", "agent_mailbox_messages",
       "agent_mailbox_hydration_checkpoints", "agent_tool_result_references", "agent_wait_conditions", "agent_transcript_events",
       "agent_approvals", "agent_artifact_version", "agent_artifact_review", "application_tasks" TO "${roleName}"`)
+    await adminPool.query(`GRANT SELECT ("id", "userId", "company", "role", "location", "status", "score", "url", "source", "salary", "description", "keywords") ON "Job" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("id") ON "agent_turns" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("id") ON "agent_steps" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO "${roleName}"`)
@@ -2717,6 +2735,8 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(writerContext?.selectedJobPreparation).toEqual({ jobId: highJobId })
     expect(reviewerContext?.selectedJobPreparation).toEqual({ jobId: highJobId })
     expect(writerContext?.scheduledDraftCandidateWitness).toEqual(reviewerContext?.scheduledDraftCandidateWitness)
+    expect((writerContext?.scheduledDraftCandidateWitness as { bindingVersion?: unknown })?.bindingVersion).toBe(2)
+    expect((writerContext?.scheduledDraftCandidateWitness as { jobMaterialDigest?: unknown })?.jobMaterialDigest).toMatch(/^sha256:[a-f0-9]{64}$/)
     expect(writerContext?.scheduledDraftCandidateWitness).toMatchObject({
       candidate: { jobId: highJobId, score: 9 }, sourceAnalystKeys: ["analyst-high"],
       analysts: [{ nodeKey: "analyst-high" }, { nodeKey: "analyst-low" }],
@@ -2902,6 +2922,16 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const restored = await adminPool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = 1
       WHERE "id" = $1 AND "sessionId" = $2 AND "attemptCount" = 2`, [analystTaskId, value.sessionId])
     expect(restored.rowCount).toBe(1)
+    await expect(validateScheduledDraftCandidateWitness(adminPool!, scheduledDraftGraphScope(value), binding.snapshot,
+      binding.graphRevision, binding.jobId, binding.witness)).resolves.toBe(true)
+    const changedMaterial = await adminPool!.query(`UPDATE "Job" SET "description" = 'Changed source for freshness probe'
+      WHERE "id" = $1 AND "userId" = $2`, [jobId, value.userId])
+    expect(changedMaterial.rowCount).toBe(1)
+    await expect(validateScheduledDraftCandidateWitness(adminPool!, scheduledDraftGraphScope(value), binding.snapshot,
+      binding.graphRevision, binding.jobId, binding.witness)).resolves.toBe(false)
+    const restoredMaterial = await adminPool!.query(`UPDATE "Job" SET "description" = 'Original selected source for finalization'
+      WHERE "id" = $1 AND "userId" = $2`, [jobId, value.userId])
+    expect(restoredMaterial.rowCount).toBe(1)
     await expect(validateScheduledDraftCandidateWitness(adminPool!, scheduledDraftGraphScope(value), binding.snapshot,
       binding.graphRevision, binding.jobId, binding.witness)).resolves.toBe(true)
   }, 60_000)
@@ -4223,9 +4253,6 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const sources = await seedVerifiedScheduledDraftSources(adminPool!, value, command, [
       { scoutKey: "scout-finalize", analystKey: "analyst-finalize", jobId, score: 9, hasFinding: true },
     ])
-    await adminPool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
-      VALUES ($1, $2, 'Fixture GmbH', 'Software Engineer', 'Berlin', 'saved', 'https://jobs.example.invalid/finalization',
-        'Original selected source for finalization', 'test', CURRENT_TIMESTAMP)`, [jobId, value.userId])
     await adminPool!.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "updatedAt")
       VALUES ($1, $2, 'Finalization fixture base', $3::jsonb, 'base', 'manual', TRUE, CURRENT_TIMESTAMP)`, [
       `scheduled-draft-resume-${value.sessionId}`, value.userId, JSON.stringify({ text: "Fixture base resume" }),
