@@ -1,6 +1,5 @@
 import type pg from "pg"
-import { approvedFillResumeTerminalStepData, type ApprovedFillResumeTerminalStepDescriptor } from "./turns/approved-fill-resume-terminal-step.js"
-import { approvedFillTerminalClaimRequeue } from "./turns/approved-fill-terminal-claim.js"
+import type { ApprovedFillResumeTerminalStepDescriptor } from "./turns/approved-fill-resume-terminal-step.js"
 
 const terminalAdmissionBrand: unique symbol = Symbol("SessionTerminalAdmission")
 type TerminalAdmissionInput = Readonly<{ sessionId: string; userId: string; turnId: string; rootTaskId: string }>
@@ -114,6 +113,7 @@ export async function assertApprovedFillResumeTerminalAdmission(
   input: { readonly sessionId: string; readonly userId: string; readonly turnId: string; readonly rootTaskId: string; readonly source: string | null; readonly executionMode: string | null },
   descriptor: ApprovedFillResumeTerminalStepDescriptor,
 ): Promise<SessionTerminalAdmission> {
+  const { approvedFillResumeTerminalStepData } = await import("./turns/approved-fill-resume-terminal-step.js")
   const data = approvedFillResumeTerminalStepData(descriptor), proof = data?.proof
   if (!data || !proof || proof.state !== "form_filled" || proof.workerTaskId !== null || proof.outboxId !== null
     || proof.userId !== input.userId || proof.sessionId !== input.sessionId || proof.turnId !== input.turnId
@@ -151,6 +151,9 @@ export async function assertApprovedFillResumeTerminalAdmission(
      LIMIT 2`,
     [input.sessionId, input.userId, input.turnId, proof.applicationTaskId, proof.fillerTaskId, input.rootTaskId],
   )
-  if (result.rows.length !== 1) throw approvedFillTerminalClaimRequeue(data.lease)
+  if (result.rows.length !== 1) {
+    const { approvedFillTerminalClaimRequeue } = await import("./turns/approved-fill-terminal-claim.js")
+    throw approvedFillTerminalClaimRequeue(data.lease)
+  }
   return terminalAdmission(client, input, "derived_fill")
 }
