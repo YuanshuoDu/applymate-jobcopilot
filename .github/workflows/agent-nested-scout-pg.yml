@@ -116,15 +116,16 @@ jobs:
             ]],
             ['/src/runtime/subagents/nested-scout-creation-authority-pg.integration.test.ts', [
               'rejects unregistered and privilege-escalation nested Scout attempts while allowing a persisted profile Scout to create fenced read-scoped children',
+              'enforces the shared Root maxToolCalls cap across competing nested Scout child leases',
             ]],
           ])
           const files = report.testResults
           const cases = files?.flatMap(file => file.assertionResults ?? []) ?? []
-          if (!report.success || report.numTotalTests !== 13 || report.numPassedTests !== 13 ||
+          if (!report.success || report.numTotalTests !== 14 || report.numPassedTests !== 14 ||
               report.numFailedTests !== 0 || report.numPendingTests !== 0 || report.numTodoTests !== 0 ||
-              files?.length !== expected.size || cases.length !== 13 ||
+              files?.length !== expected.size || cases.length !== 14 ||
               cases.some(test => test.status !== 'passed')) {
-            throw new Error('Expected all thirteen PostgreSQL cases to pass with no failed, skipped, pending or todo tests')
+            throw new Error('Expected all fourteen PostgreSQL cases to pass with no failed, skipped, pending or todo tests')
           }
           for (const result of files) {
             const name = result.name.replaceAll('\\', '/')
