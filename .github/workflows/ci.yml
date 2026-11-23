@@ -189,6 +189,14 @@ jobs:
         env:
           NODE_OPTIONS: --max-old-space-size=4096
         run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Verify authenticated submission Stop ordering on disposable PostgreSQL
+        env:
+          CI: "true"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism src/app/api/agent/application-tasks/submission-stop/submission-stop-pg.integration.test.ts
       - name: Install browser and isolation prerequisites before egress lockdown
         run: |
           sudo apt-get update

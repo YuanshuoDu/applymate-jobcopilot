@@ -4,9 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { formAnswerDraftKey, needsApplicationFillRetryPolling, RetryApplicationFillButton, SessionFocusPanel, startApplicationFillRetryPolling } from './SessionFocusPanel'
 import type { AgentSessionDetail } from './session-view-model'
 
-const mocks = vi.hoisted(() => ({ useApi: vi.fn(), formQuestionFields: vi.fn() }))
+const mocks = vi.hoisted(() => ({ useApi: vi.fn(), formQuestionFields: vi.fn(), lang: 'en' }))
 vi.mock('@/lib/hooks', () => ({ useApi: mocks.useApi }))
-vi.mock('@/lib/i18n', () => ({ useI18n: () => ({ t: (key: string) => key }) }))
+vi.mock('@/lib/i18n', () => ({ useI18n: () => ({ t: (key: string) => key, lang: mocks.lang }) }))
 vi.mock('@/lib/agent/application-task-input', () => ({ formQuestionFields: mocks.formQuestionFields }))
 
 type ApplicationTask = {
@@ -16,6 +16,7 @@ type ApplicationTask = {
   error: string | null
   question: unknown
   job: { company: string; role: string }
+  submissionStopTarget?: string
 }
 
 function installSession(applicationTasks: ApplicationTask[], retryTasks?: Array<{ id: string; cancelledFillRetryReady: boolean }>, retryLoading = false, overrides: Partial<AgentSessionDetail> = {}) {
@@ -310,5 +311,28 @@ describe('SessionFocusPanel application fill retry', () => {
     expect(notifications[0].dependencies).toEqual(notifications[1].dependencies)
     notifications[0].effect()
     expect(onAttentionChange).toHaveBeenCalledWith('session_1', false)
+  })
+
+  it('shows Stop only for the exact offered marker target and hides generic Cancel at that boundary', () => {
+    const offeredTarget = `ast1_${'a'.repeat(64)}`
+    installSession([{ ...task('filling', 'submission_request_started'), submissionStopTarget: offeredTarget }])
+    const eligible = renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)
+    expect(mocks.useApi).toHaveBeenCalledWith('/api/agent/sessions/session_1', { cache: false })
+    expect(eligible).toContain('Stop submission')
+    expect(eligible).not.toContain('agent.cancel')
+
+    installSession([task('filling', 'submission_request_started')])
+    const missingTarget = renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)
+    expect(missingTarget).not.toContain('Stop submission')
+    expect(missingTarget).not.toContain('agent.cancel')
+  })
+
+  it('does not treat an invalid or non-marker target as Stop authority', () => {
+    installSession([{ ...task('filling', 'submission_request_started'), submissionStopTarget: 'private-id' }])
+    expect(renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)).not.toContain('Stop submission')
+    installSession([{ ...task('filling', 'filling'), submissionStopTarget: `ast1_${'a'.repeat(64)}` }])
+    const preMarker = renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)
+    expect(preMarker).not.toContain('Stop submission')
+    expect(preMarker).toContain('agent.cancel')
   })
 })

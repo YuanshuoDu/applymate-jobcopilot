@@ -105,6 +105,7 @@ export interface AgentSessionDetail {
     error: string | null
     question: unknown | null
     job: { company: string; role: string }
+    submissionStopTarget?: string
   }>
   execution: { id: string; status: string; checkpoint: string; error: string | null; attemptCount: number } | null
   questions: Array<{ id: string; stage: string; question: string; options: unknown; pending?: boolean; answered?: boolean; answerAvailable?: boolean }>

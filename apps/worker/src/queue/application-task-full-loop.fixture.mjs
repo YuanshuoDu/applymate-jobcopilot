@@ -6,6 +6,7 @@ import { readFile } from "node:fs/promises"
 import { unlink } from "node:fs/promises"
 import { Pool } from "pg"
 import { HOST, assertToolMessagePairs, failModel, fixtureModel, required, safeBlockedTarget } from "./application-task-full-loop.fixture-support.mjs"
+import { closeStage8Workers, createStage8ApplicationSubmitDrain, createStage8ApplyWorker, createStage8FixtureControl } from "./application-task-full-loop.stage8.fixture-support.mjs"
 import { applicationFillStageTrace, traceApplicationFillExecutor } from "./application-task-full-loop.trace-support.mjs"
 
 const [, , mode] = process.argv
@@ -59,7 +60,7 @@ async function startSite() {
   if (!SOCKET) throw new Error("APPLICATION_TASK_FULL_LOOP_SOCKET_PATH_required")
   const reviewedFillRouteSocketPath = required("APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_SOCKET_PATH")
   await unlink(SOCKET).catch(() => undefined)
-  let submitCount = 0, reviewedSubmitCount = 0, reviewedMaterialExactCount = 0, reviewedGetCount = 0
+  let submitCount = 0, reviewedSubmitCount = 0, reviewedHeldSubmitCount = 0, reviewedMaterialExactCount = 0, reviewedGetCount = 0
   const requests = []
   const browserTrace = []
   const browserProgress = []
@@ -148,11 +149,17 @@ async function startSite() {
     }
     if (request.method === "POST" && ["/example/jobs/1", "/example-reviewed/jobs/1"].includes(request.url)) {
       submitCount += 1
-      if (request.url === "/example-reviewed/jobs/1") reviewedSubmitCount += 1
+      if (request.url === "/example-reviewed/jobs/1") {
+        reviewedSubmitCount += 1
+        reviewedHeldSubmitCount += 1
+      }
       held.add(response)
       request.resume()
       say(`SUBMIT_REQUEST ${submitCount}`)
-      response.on("close", () => held.delete(response))
+      response.on("close", () => {
+        held.delete(response)
+        if (request.url === "/example-reviewed/jobs/1") reviewedHeldSubmitCount = Math.max(0, reviewedHeldSubmitCount - 1)
+      })
       return
     }
     response.writeHead(404).end("fixture route not found")
@@ -217,7 +224,12 @@ async function startSite() {
     const lines = buffer.split("\n")
     buffer = lines.pop() ?? ""
     for (const line of lines.map(value => value.trim())) {
-      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, reviewedSubmitCount, reviewedMaterialExactCount, reviewedGetCount, blocked, requests, browserTrace, browserProgress })}`)
+      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, reviewedSubmitCount, reviewedHeldSubmitCount, reviewedMaterialExactCount, reviewedGetCount, blocked, requests, browserTrace, browserProgress })}`)
+      if (line === "release-held") {
+        for (const response of held) {
+          if (!response.destroyed && !response.writableEnded) response.writeHead(200, { "content-type": "text/plain" }).end("Synthetic fixture response.")
+        }
+      }
       if (line === "shutdown") {
         process.stdin.pause()
         for (const response of held) response.destroy()
@@ -234,7 +246,7 @@ async function startSite() {
   })
 }
 
-async function startWorker() {
+async function startWorker(stagedSubmissionStopProtocol = false) {
   const userId = required("APPLICATION_TASK_FULL_LOOP_USER_ID")
   if (!userId.startsWith("full-loop-user-")) throw new Error("application_task_full_loop_synthetic_user_required")
   const databaseUrl = required("AGENT_RUNTIME_PG_TEST_URL")
@@ -257,6 +269,7 @@ async function startWorker() {
     import("./apply-queue.ts"), import("./application-submit-outbox.ts"), import("./reviewed-fill-handoff-outbox.ts"),
     import("../cloak/pool.js"), import("../redis.ts"), import("../runtime/wakeup/consumer.ts"),
   ])
+  const control = stagedSubmissionStopProtocol ? createStage8FixtureControl() : undefined
   const flags = { ...resolveProductionAgentFlags(), taskGraphPlanningEnabled: true, childExecutionEnabled: true,
     coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false }
   const taskGraphCommandPort = flags.taskGraphPlanningEnabled
@@ -397,10 +410,19 @@ async function startWorker() {
       },
     }),
   })
-  const publisher = outbox.startApplicationSubmitOutboxPublisher(pool, queue.applyQueue, { pollMs: 250 })
-  queue.applyWorker.on("active", job => say(`APPLY_JOB_ACTIVE ${job?.id ?? "unknown"} attemptsMade=${job?.attemptsMade ?? -1} attemptsStarted=${job?.attemptsStarted ?? -1} stalledCounter=${job?.stalledCounter ?? -1}`))
-  queue.applyWorker.on("stalled", (jobId, previousState) => say(`APPLY_JOB_STALLED ${jobId} previousState=${previousState}`))
-  queue.applyWorker.on("failed", (job, error) => say(`APPLY_JOB_FAILED ${job?.id ?? "unknown"} ${error.message}`))
+  const publisher = outbox.startApplicationSubmitOutboxPublisher(pool, queue.applyQueue, {
+    pollMs: 250,
+    ...(control ? { drain: createStage8ApplicationSubmitDrain(outbox, control) } : {}),
+  })
+  let activeApplyWorker = queue.applyWorker
+  if (stagedSubmissionStopProtocol) {
+    const { getPool } = await import("../db/apply-results.ts")
+    const stopProtocol = await import("../runtime/interrupt/application-submission-start-gate.ts")
+    activeApplyWorker = createStage8ApplyWorker({ queue, stopProtocol, pool: getPool(), control, writeLine: say })
+  }
+  activeApplyWorker.on("active", job => say(`APPLY_JOB_ACTIVE ${job?.id ?? "unknown"} attemptsMade=${job?.attemptsMade ?? -1} attemptsStarted=${job?.attemptsStarted ?? -1} stalledCounter=${job?.stalledCounter ?? -1}`))
+  activeApplyWorker.on("stalled", (jobId, previousState) => say(`APPLY_JOB_STALLED ${jobId} previousState=${previousState}`))
+  activeApplyWorker.on("failed", (job, error) => say(`APPLY_JOB_FAILED ${job?.id ?? "unknown"} ${error.message}`))
   const turns = bootstrap?.turns.worker
   turns?.on("active", job => say(`TURN_JOB_ACTIVE ${job?.id ?? "unknown"} turnId=${job?.data?.turnId ?? "unknown"}`))
   turns?.on("completed", (job, result) => say(`TURN_JOB_COMPLETED ${job?.id ?? "unknown"} turnId=${job?.data?.turnId ?? "unknown"} status=${result?.status ?? "unknown"}`))
@@ -414,39 +436,48 @@ async function startWorker() {
   subagents?.on("error", error => say(`SUBAGENT_WORKER_ERROR ${error.message}`))
   subagents?.on("stalled", jobId => say(`SUBAGENT_JOB_STALLED ${jobId}`))
   if (!turns || !subagents) throw new Error("canonical_turn_or_subagent_consumer_missing")
-  void queue.applyWorker.run().catch(() => say("APPLY_WORKER_RUN_FAILED"))
+  void activeApplyWorker.run().catch(() => say("APPLY_WORKER_RUN_FAILED"))
   say("CANONICAL_TURN_AND_SUBAGENT_CONSUMERS_READY")
   const wakeupConsumer = startAgentWakeupConsumer(pool)
   say("WORKER_READY")
-  process.stdin.setEncoding("utf8")
-  let buffer = ""
-  await new Promise(resolve => process.stdin.on("data", chunk => {
-    buffer += chunk
-    const lines = buffer.split("\n")
-    buffer = lines.pop() ?? ""
-    for (const line of lines.map(value => value.trim())) {
-      if (line.startsWith("arm-legacy-final-response ")) {
-        try {
-          armLegacyFinalResponseGate(line.slice("arm-legacy-final-response ".length))
-          say("LEGACY_FINAL_RESPONSE_GATE_ARMED")
-        } catch { say("LEGACY_FINAL_RESPONSE_GATE_ARM_FAILED") }
-      } else if (line.startsWith("release-legacy-final-response ")) {
-        if (releaseLegacyFinalResponseGate(line.slice("release-legacy-final-response ".length))) {
-          say("LEGACY_FINAL_RESPONSE_GATE_RELEASED")
+  if (control) await control.shutdown
+  else await new Promise(resolve => {
+    process.stdin.setEncoding("utf8")
+    let buffer = ""
+    process.stdin.on("data", chunk => {
+      buffer += chunk
+      const lines = buffer.split("\n")
+      buffer = lines.pop() ?? ""
+      for (const line of lines.map(value => value.trim())) {
+        if (line.startsWith("arm-legacy-final-response ")) {
+          try {
+            armLegacyFinalResponseGate(line.slice("arm-legacy-final-response ".length))
+            say("LEGACY_FINAL_RESPONSE_GATE_ARMED")
+          } catch { say("LEGACY_FINAL_RESPONSE_GATE_ARM_FAILED") }
+        } else if (line.startsWith("release-legacy-final-response ")) {
+          if (releaseLegacyFinalResponseGate(line.slice("release-legacy-final-response ".length))) {
+            say("LEGACY_FINAL_RESPONSE_GATE_RELEASED")
+          }
+        } else if (line === "shutdown") {
+          process.stdin.pause()
+          resolve()
+          return
         }
-      } else if (line === "shutdown") {
-        process.stdin.pause()
-        resolve()
-        return
       }
-    }
-  }))
+    })
+  })
   await wakeupConsumer.close()
   await publisher.close()
   await bootstrap?.close()
-  await queue.applyWorker.close()
+  if (stagedSubmissionStopProtocol) {
+    await closeAllSlots()
+    const closed = await closeStage8Workers([activeApplyWorker, queue.applyWorker])
+    if (!closed) say("STAGE8_WORKER_CLOSE_DISCONNECTED")
+  } else {
+    await activeApplyWorker.close()
+    await closeAllSlots()
+  }
   await queue.applyQueue.close()
-  await closeAllSlots()
   const { getPool } = await import("../db/apply-results.ts")
   await getPool().end()
   await pool.end()
@@ -478,4 +509,5 @@ function sameArtifactRef(left, right) {
 
 if (mode === "site") await startSite()
 else if (mode === "worker") await startWorker()
-else throw new Error("fixture_mode_must_be_site_or_worker")
+else if (mode === "worker-staged") await startWorker(true)
+else throw new Error("fixture_mode_must_be_site_worker_or_worker_staged")

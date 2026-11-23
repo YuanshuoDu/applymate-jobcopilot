@@ -1,4 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import {
+  APPLICATION_SUBMISSION_STOP_PROTOCOL_SCHEMA,
+  applicationSubmissionStopEventId,
+} from "@jobcopilot/shared/application-submission-stop-protocol"
 
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
@@ -35,6 +39,40 @@ function getRequest() {
 }
 
 const params = { params: Promise.resolve({ id: "session_1" }) }
+const stopAttempt = {
+  userId: "user_1", sessionId: "session_1", fillTurnId: "private_turn", applicationTaskId: "application_1",
+  jobId: "private_job", approvalId: "private_receipt", receiptId: "private_receipt",
+  constraintHash: "a".repeat(64), workerTaskId: "private_worker", executionId: "private_execution",
+}
+const stopKey = {
+  userId: stopAttempt.userId, sessionId: stopAttempt.sessionId, fillTurnId: stopAttempt.fillTurnId,
+  applicationTaskId: stopAttempt.applicationTaskId, jobId: stopAttempt.jobId, approvalId: stopAttempt.approvalId,
+  receiptId: stopAttempt.receiptId, constraintHash: stopAttempt.constraintHash, workerTaskId: stopAttempt.workerTaskId,
+}
+
+function stopEvidenceEvents() {
+  return [
+    {
+      id: "queued_1", taskId: stopAttempt.applicationTaskId, type: "submission_queued", actor: "user", body: "queued",
+      data: stopKey,
+    },
+    {
+      id: `evt_${stopAttempt.executionId}`, taskId: stopAttempt.applicationTaskId,
+      type: "submission_execution_started", actor: "worker", body: "Submit execution started",
+      data: {
+        executionId: stopAttempt.executionId, workerTaskId: stopAttempt.workerTaskId,
+        applicationTaskId: stopAttempt.applicationTaskId, userId: stopAttempt.userId,
+        jobId: stopAttempt.jobId, sessionId: stopAttempt.sessionId, fillTurnId: stopAttempt.fillTurnId,
+        approvalId: stopAttempt.approvalId, constraintHash: stopAttempt.constraintHash,
+      },
+    },
+    {
+      id: applicationSubmissionStopEventId(stopKey, "armed"), taskId: stopAttempt.applicationTaskId,
+      type: "submission_stop_protocol", actor: "worker", body: "Application submission Stop protocol state recorded.",
+      data: { schemaVersion: APPLICATION_SUBMISSION_STOP_PROTOCOL_SCHEMA, stage: "armed", ...stopAttempt },
+    },
+  ]
+}
 
 describe("agent session detail API", () => {
   beforeEach(() => {
@@ -93,6 +131,7 @@ describe("agent session detail API", () => {
     const res = await GET(getRequest() as never, params)
 
     expect(res.status).toBe(200)
+    expect(res.headers.get("Cache-Control")).toBe("private, no-store")
     await expect(res.json()).resolves.toEqual({
       session: {
         id: "session_1",
@@ -184,6 +223,7 @@ describe("agent session detail API", () => {
     const res = await GET(getRequest() as never, params)
 
     expect(res.status).toBe(200)
+    expect(res.headers.get("Cache-Control")).toBe("private, no-store")
     await expect(res.json()).resolves.toMatchObject({
       session: { id: "session_1", questions: [], applicationTasks: [], execution: null },
     })
@@ -196,8 +236,44 @@ describe("agent session detail API", () => {
     const res = await GET(getRequest() as never, params)
 
     expect(res.status).toBe(404)
+    expect(res.headers.get("Cache-Control")).toBe("private, no-store")
     await expect(res.json()).resolves.toEqual({ error: "Session not found" })
   })
+
+  it("projects only an opaque target for the exact armed application attempt", async () => {
+    mocks.findFirst.mockResolvedValueOnce({
+      id: "session_1", goal: "Apply", status: "completed", source: "manual_run", memorySummary: "Done",
+      qualityScore: null, currentTaskId: null, createdAt: new Date(0), updatedAt: new Date(0), completedAt: new Date(0),
+      tasks: [], approvals: [],
+    })
+    const publicFields = {
+      id: "application_1", status: "filling", checkpoint: "submission_request_started", error: null,
+      question: null, job: { company: "Example", role: "Engineer" },
+    }
+    mocks.applicationTaskFindMany
+      .mockResolvedValueOnce([{ ...publicFields, userId: stopAttempt.userId, sessionId: stopAttempt.sessionId,
+        jobId: stopAttempt.jobId, fillTurnId: stopAttempt.fillTurnId, fillTurnSessionId: stopAttempt.sessionId,
+        fillTurnUserId: stopAttempt.userId, workerTaskId: stopAttempt.workerTaskId }])
+      .mockResolvedValueOnce([{
+        id: stopAttempt.applicationTaskId, userId: stopAttempt.userId, sessionId: stopAttempt.sessionId,
+        jobId: stopAttempt.jobId, fillTurnId: stopAttempt.fillTurnId, fillTurnSessionId: stopAttempt.sessionId,
+        fillTurnUserId: stopAttempt.userId, workerTaskId: stopAttempt.workerTaskId,
+        status: "filling", checkpoint: "submission_request_started", events: stopEvidenceEvents(),
+      }])
+    const { GET } = await import("./route")
+
+    const res = await GET(getRequest() as never, params)
+    const body = await res.json()
+
+    expect(res.status).toBe(200)
+    expect(res.headers.get("Cache-Control")).toBe("private, no-store")
+    expect(body.session.applicationTasks).toHaveLength(1)
+    expect(body.session.applicationTasks[0]).toMatchObject({ ...publicFields, submissionStopTarget: expect.stringMatching(/^ast1_[a-f0-9]{64}$/) })
+    const serialized = JSON.stringify(body)
+    for (const privateValue of [stopAttempt.userId, stopAttempt.jobId, stopAttempt.fillTurnId, stopAttempt.workerTaskId, stopAttempt.receiptId, stopAttempt.constraintHash]) {
+      expect(serialized).not.toContain(privateValue)
+    }
+  }, 15_000)
 
   it("deletes an owned session", async () => {
     const { DELETE } = await import("./route")
@@ -250,6 +326,7 @@ describe("agent session detail API", () => {
     const res = await GET(getRequest() as never, params)
 
     expect(res.status).toBe(401)
+    expect(res.headers.get("Cache-Control")).toBe("private, no-store")
     expect(mocks.findFirst).not.toHaveBeenCalled()
   })
 })
