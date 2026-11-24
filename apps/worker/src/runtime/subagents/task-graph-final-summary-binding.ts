@@ -4,8 +4,10 @@ import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
 import { validateRoleResult } from "./role-results.js"
 import type { SubagentTaskStatus } from "./types.js"
 import { validateTaskGraphFollowUpBinding } from "./task-graph-follow-up-validation.js"
-import { hasSelectedJobBatchMembers, readBoundSelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
+import { hasSelectedJobBatchMembers, readBoundSelectedJobBatchFinalOutcome, renderSelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
 import type { SelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
+import { hasObjectiveTailorFinalOutcome, readBoundObjectiveTailorFinalOutcome, renderObjectiveTailorFinalOutcome, type ObjectiveTailorFinalOutcomeProjection } from "./objective-tailor-final-summary-binding.js"
+export { hasObjectiveTailorFinalOutcome, readBoundObjectiveTailorFinalOutcome, renderObjectiveTailorFinalOutcome, renderSelectedJobBatchFinalOutcome }
 
 export const TASK_GRAPH_FINAL_SUMMARY_BINDING: unique symbol = Symbol("task_graph_final_summary_binding")
 
@@ -29,6 +31,7 @@ export type TaskGraphFinalSummaryBinding = Readonly<{
   members?: readonly TaskGraphFinalSummaryMember[]
   resolvedRepairTaskIds?: readonly string[]
   selectedJobBatchFinalOutcome?: SelectedJobBatchFinalOutcome
+  objectiveTailorFinalOutcome?: ObjectiveTailorFinalOutcomeProjection
   summary: TaskGraphFinalSummary
 }>
 
@@ -98,7 +101,9 @@ export function readResolvedRepairTaskIds(value: unknown): ReadonlySet<string> {
   try {
     const binding = record(value)
     if (!binding || !Object.hasOwn(binding, "resolvedRepairTaskIds")) return new Set()
-    const { resolvedRepairTaskIds: ids, ...legacyBinding } = binding
+    const ids = binding.resolvedRepairTaskIds, legacyBinding = { ...binding }
+    if (hasObjectiveTailorFinalOutcome(binding) && !readBoundObjectiveTailorFinalOutcome(binding)) return new Set()
+    Reflect.deleteProperty(legacyBinding, "objectiveTailorFinalOutcome"); Reflect.deleteProperty(legacyBinding, "resolvedRepairTaskIds")
     const facts = validateTaskGraphFollowUpBinding(legacyBinding), rows = dense(ids, TASK_GRAPH_LIMITS.maxPersistedNodes)
     if (!facts || !rows?.length) return new Set()
     const result = new Set<string>()
@@ -119,7 +124,10 @@ export function sameTaskGraphFinalSummaryBinding(
   try {
     if (!left || !right) return false
     const leftHasBatch = hasSelectedJobBatchMembers(left), rightHasBatch = hasSelectedJobBatchMembers(right)
-    if (leftHasBatch !== rightHasBatch) return false
+    const leftHasTailor = hasObjectiveTailorFinalOutcome(left), rightHasTailor = hasObjectiveTailorFinalOutcome(right)
+    if (leftHasBatch !== rightHasBatch || leftHasTailor !== rightHasTailor) return false
+    const leftTailor = readBoundObjectiveTailorFinalOutcome(left), rightTailor = readBoundObjectiveTailorFinalOutcome(right)
+    if (leftHasTailor && (!leftTailor || !rightTailor)) return false
     const leftBatch = left.selectedJobBatchFinalOutcome, rightBatch = right.selectedJobBatchFinalOutcome
     if (leftHasBatch) {
       if (!readBoundSelectedJobBatchFinalOutcome(left) || !readBoundSelectedJobBatchFinalOutcome(right)) return false
@@ -127,7 +135,7 @@ export function sameTaskGraphFinalSummaryBinding(
     if (left.rootTaskId !== right.rootTaskId || left.graphItemId !== right.graphItemId
       || JSON.stringify(left.members) !== JSON.stringify(right.members) || left.graphRevision !== right.graphRevision
       || JSON.stringify(left.resolvedRepairTaskIds) !== JSON.stringify(right.resolvedRepairTaskIds)
-      || JSON.stringify(leftBatch) !== JSON.stringify(rightBatch)
+      || JSON.stringify(leftBatch) !== JSON.stringify(rightBatch) || JSON.stringify(leftTailor) !== JSON.stringify(rightTailor)
       || left.summary.graphRevision !== left.graphRevision || right.summary.graphRevision !== right.graphRevision) return false
     return JSON.stringify(left.summary) === JSON.stringify(right.summary)
   }

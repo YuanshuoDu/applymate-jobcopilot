@@ -1,8 +1,7 @@
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
-import { readResolvedRepairTaskIds, type TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
+import { hasObjectiveTailorFinalOutcome, readBoundObjectiveTailorFinalOutcome, readResolvedRepairTaskIds, renderObjectiveTailorFinalOutcome, renderSelectedJobBatchFinalOutcome, type TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
 import type { TaskGraphFinalSummary, TaskGraphSummaryCount } from "./task-graph-final-summary.js"
 import { reduceTaskGraphFollowUpSuggestions, type TaskGraphFollowUpSuggestion } from "./task-graph-follow-up-suggestions.js"
-import { renderSelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
 
 const MAX_RESPONSE_BYTES = 4_096
 const MAX_ARTIFACT_ROWS = TASK_GRAPH_LIMITS.maxPersistedNodes * 102
@@ -20,7 +19,8 @@ type OutcomeGroup = Readonly<{ outcome: TaskOutcome; count: number; resolved: bo
 /** Renders only deterministic facts from the current private TaskGraph binding. */
 export function buildGroundedTaskGraphFinalResponse(binding: TaskGraphFinalSummaryBinding): string {
   const summary = binding?.summary
-  if (!summary || !Number.isSafeInteger(binding.graphRevision) || binding.graphRevision < 0 || summary.graphRevision !== binding.graphRevision) {
+  if (!summary || !Number.isSafeInteger(binding.graphRevision) || binding.graphRevision < 0 || summary.graphRevision !== binding.graphRevision
+    || hasObjectiveTailorFinalOutcome(binding) && !readBoundObjectiveTailorFinalOutcome(binding)) {
     return `Task-reported results are unavailable. ${LIMITATION}`
   }
 
@@ -30,7 +30,7 @@ export function buildGroundedTaskGraphFinalResponse(binding: TaskGraphFinalSumma
   const artifacts = artifactRows(summary.artifactReferences)
   const reviews = reviewRows(summary.reviewOutcomes)
   const lines = ["Task-reported results:"]
-  lines.push(...renderSelectedJobBatchFinalOutcome(binding))
+  lines.push(...renderSelectedJobBatchFinalOutcome(binding), ...renderObjectiveTailorFinalOutcome(binding))
   lines.push(countLine("Search results", summary.counts?.discoveredJobs, discovered, ["unique job", "unique jobs"]))
   lines.push(countLine("Analysis results", summary.counts?.analyzedJobs, analyzed, ["unique job with findings", "unique jobs with findings"]))
   lines.push(countLine("Preparation outcomes", summary.counts?.prepareJobs, prepare?.total ?? null, ["job outcome record", "job outcome records"]))
@@ -43,7 +43,7 @@ export function buildGroundedTaskGraphFinalResponse(binding: TaskGraphFinalSumma
   lines.push(artifactDetail(summary.counts?.artifactReferences, artifacts))
   lines.push(...taskOutcomeLines(summary.taskOutcomes, readResolvedRepairTaskIds(binding)))
   lines.push(LIMITATION)
-  return appendTaskGraphFollowUpSuggestions(boundLines(lines), reduceTaskGraphFollowUpSuggestions(binding))
+  return appendTaskGraphFollowUpSuggestions(boundLines(lines), reduceTaskGraphFollowUpSuggestions(hasObjectiveTailorFinalOutcome(binding) ? Object.fromEntries(Object.entries(binding).filter(([key]) => key !== "objectiveTailorFinalOutcome")) as unknown as TaskGraphFinalSummaryBinding : binding))
 }
 
 function countLine(label: string, value: unknown, observed: number | null, units: readonly [string, string]): string {
