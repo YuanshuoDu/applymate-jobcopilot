@@ -42,9 +42,8 @@ export type CanonicalTurnSetup = {
   readonly state: CanonicalTurnState
   readonly interactiveDiscoveryMode: boolean
   readonly objectiveTaskGraphMode: boolean
-  readonly taskGraphPlanningEnabled: boolean
-  readonly selectedJobMode: boolean; readonly objectiveTailorToolVersion?: ObjectiveTailorToolVersion
-  readonly selectedJobBatch?: CanonicalSelectedJobBatchReady
+  readonly taskGraphPlanningEnabled: boolean; readonly selectedJobMode: boolean
+  readonly objectiveTailorToolVersion?: ObjectiveTailorToolVersion; readonly selectedJobBatch?: CanonicalSelectedJobBatchReady
   readonly scheduledDraftMode: boolean
   readonly selectedJobPreparation: TaskGraphRuntimeResult["selectedJobPreparation"]
   readonly taskGraphTemplateRoles: Readonly<Record<string, string>> | undefined
