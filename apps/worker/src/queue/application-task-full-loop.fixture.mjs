@@ -7,6 +7,7 @@ import { unlink } from "node:fs/promises"
 import { Pool } from "pg"
 import { HOST, assertToolMessagePairs, failModel, fixtureModel, required, safeBlockedTarget } from "./application-task-full-loop.fixture-support.mjs"
 import { applicationFillStageTrace, traceApplicationFillExecutor } from "./application-task-full-loop.trace-support.mjs"
+import { objectiveApplicationPage, objectiveApplicationSlot, readObjectiveApplicationPost } from "./application-task-full-loop.objective-submit-fixture.mjs"
 
 const [, , mode] = process.argv
 const SOCKET = process.env.APPLICATION_TASK_FULL_LOOP_SOCKET_PATH
@@ -84,6 +85,9 @@ async function startSite() {
   const reviewedFillRouteSocketPath = required("APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_SOCKET_PATH")
   await unlink(SOCKET).catch(() => undefined)
   let submitCount = 0, reviewedSubmitCount = 0, reviewedMaterialExactCount = 0, objectiveMaterialExactCount = 0, reviewedGetCount = 0
+  const objectiveGetCounts = Array(8).fill(0)
+  const objectiveSubmitReceipts = Array.from({ length: 8 }, (_, index) => ({ slot: index + 1,
+    attempts: 0, validAttempts: 0, malformedAttempts: 0, last: null }))
   const requests = []
   const browserTrace = []
   const browserProgress = []
@@ -91,7 +95,7 @@ async function startSite() {
   const held = new Set()
   const siteSockets = new Set()
   const proxySockets = new Set()
-  const site = createHttpsServer(await tls(), (request, response) => {
+  const site = createHttpsServer(await tls(), async (request, response) => {
     const requestUrl = new URL(request.url ?? "/", "https://boards.greenhouse.io")
     requests.push(`${request.method ?? "GET"} ${requestUrl.pathname}`)
     if (requests.length > 20) requests.shift()
@@ -129,6 +133,31 @@ async function startSite() {
       if (browserTrace.length > 20) browserTrace.shift()
       if (browserProgress.length > 40) browserProgress.shift()
       response.writeHead(204).end()
+      return
+    }
+    const objectiveSlot = objectiveApplicationSlot(requestUrl.pathname)
+    if (request.method === "GET" && objectiveSlot !== null) {
+      objectiveGetCounts[objectiveSlot - 1] += 1
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+      response.end(objectiveApplicationPage(objectiveSlot))
+      return
+    }
+    if (request.method === "POST" && objectiveSlot !== null) {
+      const receipt = await readObjectiveApplicationPost(request, objectiveSlot)
+      const stats = objectiveSubmitReceipts[objectiveSlot - 1]
+      stats.attempts += 1
+      stats.last = receipt
+      if (receipt.valid) {
+        stats.validAttempts += 1
+        say(`OBJECTIVE_SUBMIT_RECEIVED slot=${objectiveSlot}`)
+        response.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+        response.end("<!doctype html><title>Application received</title><p>Fixture application received.</p>")
+      } else {
+        stats.malformedAttempts += 1
+        say(`OBJECTIVE_SUBMIT_REJECTED slot=${objectiveSlot} code=${receipt.code}`)
+        response.writeHead(400, { "content-type": "text/html; charset=utf-8" })
+        response.end("<!doctype html><title>Fixture request rejected</title>")
+      }
       return
     }
     if (request.method === "GET" && request.url === "/example-reviewed/jobs/1") {
@@ -247,7 +276,7 @@ async function startSite() {
     const lines = buffer.split("\n")
     buffer = lines.pop() ?? ""
     for (const line of lines.map(value => value.trim())) {
-      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, reviewedSubmitCount, reviewedMaterialExactCount, objectiveMaterialExactCount, reviewedGetCount, blocked, requests, browserTrace, browserProgress })}`)
+      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, reviewedSubmitCount, reviewedMaterialExactCount, objectiveMaterialExactCount, reviewedGetCount, objectiveGetCounts, objectiveSubmitReceipts, blocked, requests, browserTrace, browserProgress })}`)
       if (line === "shutdown") {
         process.stdin.pause()
         for (const response of held) response.destroy()
