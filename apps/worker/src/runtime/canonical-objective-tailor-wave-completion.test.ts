@@ -5,6 +5,9 @@ import type { ObjectiveTailorWaveCandidateWitness } from "./subagents/objective-
 import type { LoadedGraph } from "./subagents/task-graph-pg-state.js"
 import type { PoolClient } from "pg"
 import type { selectedJobArtifactCompletionGateWithWitness } from "./selected-job-completion-gate.js"
+import { bindObjectiveTailorCorrectionProof, objectiveTailorCorrectionNodeKeys, parseObjectiveTailorCorrectionProof, verifyAndBindObjectiveTailorCorrectionProof } from "./subagents/objective-tailor-correction-proof.js"
+import { readObjectiveTailorCorrectionCompletion } from "./subagents/objective-tailor-correction-completion.js"
+import { bindObjectiveTailorWaveCandidateWitness, makeObjectiveTailorWaveCandidateSelection } from "./subagents/objective-tailor-wave-witness.js"
 
 const mocks = vi.hoisted(() => ({ inventory: vi.fn(), head: vi.fn(), receipt: vi.fn(), source: vi.fn(), material: vi.fn(), gate: vi.fn(), project: vi.fn() }))
 vi.mock("./subagents/objective-tailor-wave-inventory.js", () => ({ readObjectiveTailorWaveInventory: mocks.inventory }))
@@ -21,12 +24,12 @@ const changedHash = `sha256:${"b".repeat(64)}`
 const user = "user-1", session = "session-1", turn = "turn-1", rootId = "root-1"
 
 function witness(index: number, materialDigest = HASH): ObjectiveTailorWaveCandidateWitness {
-  return { schemaVersion: "agent-harness.v2.objective-tailor-wave-witness.v1", candidateRef: `otc2_${String(index).repeat(64)}`,
-    sourceGraphRevision: 1, sourceGraphDigest: "a".repeat(64), sourceStatusDigest: "b".repeat(64),
-    analystProofDigest: "c".repeat(64), candidate: { jobId: `job-${index}`, score: 8, materialDigest },
-    sourceAnalystKeys: [`analyst-${index}`], slotId: `tailor-${index}`, writerNodeKey: `writer-${index}`,
-    reviewerNodeKey: `reviewer-${index}`, admittedRevision: 2 }
+  const selection = makeObjectiveTailorWaveCandidateSelection({ scope: { userId: user, sessionId: session, turnId: turn, rootTaskId: rootId, parentTaskId: rootId },
+    sourceGraphRevision: 1, sourceGraphDigest: "a".repeat(64), sourceStatusDigest: "b".repeat(64), analystProofDigest: "c".repeat(64),
+    candidate: { jobId: jobIdForIndex(index), score: 8, materialDigest }, sourceAnalystKey: `analyst-${index}` })!
+  return bindObjectiveTailorWaveCandidateWitness(selection, { slotId: `tailor-${index}`, admittedRevision: 2 })!
 }
+function jobIdForIndex(index: number): string { return `00000000-0000-4000-8000-${String(index).padStart(12, "0")}` }
 function makeFixture(entries: { index: number; writerStatus?: string; reviewerStatus?: string; review?: string; material?: string; source?: string }[]) {
   const slots = entries.map(({ index }) => {
     const proof = witness(index)
@@ -55,7 +58,7 @@ function makeFixture(entries: { index: number; writerStatus?: string; reviewerSt
     tasks.set(node.taskId, task)
     return { key: node.key, taskId: node.taskId, templateId: node.templateId, status, readiness: "ready", dependsOn: node.dependsOn }
   })
-  const byJob = new Map(entries.map(value => [`job-${value.index}`, value]))
+  const byJob = new Map(entries.map(value => [jobIdForIndex(value.index), value]))
   const loaded = { rootTaskId: rootId, item: { id: "graph-item", revision: 3, content: {}, createdAt: new Date(0) },
     snapshot: { schemaVersion: "agent-harness.v2.task-graph.v1", nodes, objectiveTailor: marker },
     state: { revision: 3, nodes: states, objectiveTailor: marker }, tasks, discoveryTurnEligibility: "ordinary" } as unknown as LoadedGraph
@@ -66,18 +69,18 @@ function makeFixture(entries: { index: number; writerStatus?: string; reviewerSt
   mocks.project.mockImplementation((role: string, _status: string, result: number) => {
     const index = result
     const ref = { artifactId: `artifact-${index}`, version: 1, contentHash: HASH, sourceDigest: HASH }
-    const reviewStatus = byJob.get(`job-${index}`)?.review ?? "passed"
-    return role === "writer" ? { schemaVersion: "agent-harness.v2.task-graph.result-projection.v1", trust: "untrusted", availability: "available", role, status: "completed", artifactRef: ref }
-      : { schemaVersion: "agent-harness.v2.task-graph.result-projection.v1", trust: "untrusted", availability: "available", role, status: "completed", artifactRef: ref, reviewStatus, reviewHash: HASH }
+    const reviewStatus = byJob.get(jobIdForIndex(index))?.review ?? "passed"
+    return role === "writer" ? { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available", role, status: "completed", artifactRef: ref }
+      : { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available", role, status: "completed", artifactRef: ref, reviewStatus, reviewHash: HASH }
   })
-  mocks.source.mockImplementation(async (_client: unknown, _userId: string, jobId: string) => byJob.get(jobId)?.source ?? HASH)
-  mocks.material.mockImplementation(async (_client: unknown, _userId: string, jobId: string) => byJob.get(jobId)?.material ?? HASH)
+  mocks.source.mockImplementation(async (_client: unknown, _userId: string, selectedJobId: string) => byJob.get(selectedJobId)?.source ?? HASH)
+  mocks.material.mockImplementation(async (_client: unknown, _userId: string, selectedJobId: string) => byJob.get(selectedJobId)?.material ?? HASH)
   mocks.head.mockImplementation(async (_client: unknown, scope: { artifactId: string }) => ({ artifactId: scope.artifactId, version: 1, contentHash: HASH, sourceDigest: HASH }))
   mocks.receipt.mockImplementation(async (_client: unknown, scope: Record<string, unknown>) => reviewReceipt(scope))
   mocks.gate.mockImplementation(async (input: Parameters<typeof selectedJobArtifactCompletionGateWithWitness>[0]) => {
     const index = Number(input.selectedJobId?.match(/[0-9]+$/)?.[0])
     const status = (byJob.get(input.selectedJobId ?? "")?.review ?? "passed") as AgentArtifactReviewReceipt["status"]
-    const checkedReceipt = await input.readCurrentReviewReceipt?.({ userId: user, sessionId: session, jobId: `job-${index}`,
+    const checkedReceipt = await input.readCurrentReviewReceipt?.({ userId: user, sessionId: session, jobId: jobIdForIndex(index),
       artifactId: `artifact-${index}`, version: 1, contentHash: HASH, sourceDigest: HASH,
       currentSourceDigest: HASH, status, taskId: `reviewer-task-${index}`, reviewHash: HASH })
     return checkedReceipt ? { ok: true, witness: { revision: 3, nodes: [] } }
@@ -99,6 +102,38 @@ function input(fixture: ReturnType<typeof makeFixture>, allowAbsent = false) {
   return { client, lease: { userId: user, sessionId: session, turnId: turn, ownerId: "owner-1", leaseVersion: 1,
     leaseStartedAt: new Date(0), leaseExpiresAt: new Date(60_000) }, root: { id: rootId, attemptCount: 1 }, loaded: fixture.loaded,
     allowAbsent }
+}
+function addPendingCorrection(fixture: ReturnType<typeof makeFixture>, index: number) {
+  const slot = fixture.slots[index - 1]!
+  const proof = bindObjectiveTailorCorrectionProof({ graphRevision: 3, slotId: slot.slotId, candidateWitness: slot.witness,
+    writerTaskId: slot.writerTaskId, reviewerTaskId: slot.reviewerTaskId,
+    artifactRef: { artifactId: `artifact-${index}`, version: 1, contentHash: HASH, sourceDigest: HASH },
+    artifactVersion: { artifactId: `artifact-${index}`, artifactType: "cover_letter", taskId: slot.writerTaskId,
+      version: 1, contentHash: HASH, sourceDigest: HASH, previousHash: null },
+    reviewReceipt: { jobId: slot.jobId, artifactId: `artifact-${index}`, version: 1, contentHash: HASH,
+      sourceDigest: HASH, currentSourceDigest: HASH, status: "needs_revision", taskId: slot.reviewerTaskId,
+      toolCallId: "prior-review", reviewHash: HASH } })!
+  const keys = objectiveTailorCorrectionNodeKeys(slot.slotId)!, writerTaskId = `writer-correction-${index}`, reviewerTaskId = `reviewer-correction-${index}`
+  const correction = { proof, writerTaskId, reviewerTaskId }
+  const oldMarker = fixture.inventory.marker!
+  const marker = { ...oldMarker, slots: oldMarker.slots.map((item, slotIndex) => slotIndex === index - 1 ? { ...item, correction: keys } : item) }
+  const writerNode = { key: keys.writerNodeKey, taskId: writerTaskId, templateId: "cover_letter_writer", goal: "correct",
+    successCriteria: [], dependsOn: [slot.witness.reviewerNodeKey] }
+  const reviewerNode = { key: keys.reviewerNodeKey, taskId: reviewerTaskId, templateId: "cover_letter_reviewer", goal: "review",
+    successCriteria: [], dependsOn: [keys.writerNodeKey] }
+  const loaded = fixture.loaded as unknown as { item: { revision: number }; snapshot: { nodes: unknown[]; objectiveTailor: unknown }; state: { revision: number; nodes: unknown[]; objectiveTailor: unknown }; tasks: Map<string, unknown> }
+  loaded.item.revision = 4
+  loaded.snapshot.objectiveTailor = marker; loaded.snapshot.nodes.push(writerNode, reviewerNode)
+  loaded.state.revision = 4; loaded.state.objectiveTailor = marker
+  loaded.state.nodes.push({ key: writerNode.key, taskId: writerTaskId, templateId: writerNode.templateId, status: "running", readiness: "ready", dependsOn: writerNode.dependsOn },
+    { key: reviewerNode.key, taskId: reviewerTaskId, templateId: reviewerNode.templateId, status: "queued", readiness: "waiting", dependsOn: reviewerNode.dependsOn })
+  loaded.tasks.set(writerTaskId, { id: writerTaskId, role: "writer", taskType: "cover_letter_draft", status: "running", result: null })
+  loaded.tasks.set(reviewerTaskId, { id: reviewerTaskId, role: "reviewer", taskType: "cover_letter_review", status: "queued", result: null })
+  const inventory = fixture.inventory as unknown as { graphRevision: number; marker: typeof fixture.inventory.marker; occupiedSlots: Array<typeof fixture.inventory.occupiedSlots[number]> }
+  inventory.graphRevision = 4
+  inventory.marker = marker as typeof inventory.marker
+  inventory.occupiedSlots[index - 1] = { ...slot, correction }
+  return { proof, writerTaskId, reviewerTaskId }
 }
 beforeEach(() => { vi.clearAllMocks() })
 
@@ -129,6 +164,26 @@ describe("canonical Objective Tailor V2 terminal evidence", () => {
     expect(result.outcomes[0]?.status).toBe("pending")
   })
 
+  it("still issues a distinct needs-revision slot proof while a prior slot correction is pending", async () => {
+    const fixture = makeFixture([{ index: 1 }, { index: 2, review: "needs_revision" }])
+    const correction = addPendingCorrection(fixture, 1), args = input(fixture)
+    expect(parseObjectiveTailorCorrectionProof(correction.proof)).toBeDefined()
+    expect(fixture.loaded.item?.revision).toBe(4)
+    const direct = await readObjectiveTailorCorrectionCompletion({ client: args.client as PoolClient, lease: args.lease,
+      root: args.root, loaded: fixture.loaded, scope: { userId: user, sessionId: session, turnId: turn, rootTaskId: rootId, parentTaskId: rootId },
+      slot: fixture.inventory.occupiedSlots[0]! })
+    expect(direct).toMatchObject({ status: "pending", writerTaskId: correction.writerTaskId })
+    const pending = await verifyCanonicalObjectiveTailorWaveCompletion(args)
+    expect(pending).toMatchObject({ status: "pending" })
+    if (pending.status !== "pending") return
+    expect(pending.outcomes.map(value => [value.slotId, value.status, value.writerTaskId])).toEqual([
+      ["tailor-1", "pending", correction.writerTaskId], ["tailor-2", "needs_revision", "writer-task-2"],
+    ])
+    const next = await verifyAndBindObjectiveTailorCorrectionProof({ client: args.client as never, lease: args.lease,
+      root: args.root, loaded: fixture.loaded, slotId: "tailor-2", expectedRevision: 4 })
+    expect(next).toMatchObject({ slotId: "tailor-2", prior: { reviewerTaskId: "reviewer-task-2" } })
+  })
+
   it("blocks a final read when one slot's material changes after candidate acceptance", async () => {
     const fixture = makeFixture([{ index: 1 }, { index: 2 }])
     const args = input(fixture)
@@ -148,9 +203,22 @@ describe("canonical Objective Tailor V2 terminal evidence", () => {
     const fixture = makeFixture([{ index: 1, review: "stale" }])
     const args = input(fixture)
     const result = await verifyCanonicalObjectiveTailorWaveCompletion(args)
-    expect(result.status).toBe("ready")
+    expect(result).toMatchObject({ status: "ready" })
     if (result.status !== "ready") return
     expect(result.outcomes[0]?.status).toBe("stale")
+  })
+
+  it.each(["missing", "newer"] as const)("isolates an unchanged-source %s draft head to its own slot", async drift => {
+    const fixture = makeFixture([{ index: 1 }, { index: 2 }])
+    const actual = await vi.importActual<typeof import("./selected-job-completion-gate.js")>("./selected-job-completion-gate.js")
+    mocks.gate.mockImplementation(actual.selectedJobArtifactCompletionGateWithWitness)
+    mocks.head.mockImplementation(async (_client: unknown, scope: { artifactId: string }) => scope.artifactId === "artifact-1"
+      ? drift === "missing" ? null : { artifactId: "artifact-1", version: 2, contentHash: changedHash, sourceDigest: HASH }
+      : { artifactId: scope.artifactId, version: 1, contentHash: HASH, sourceDigest: HASH })
+    const result = await verifyCanonicalObjectiveTailorWaveCompletion(input(fixture))
+    expect(result.status).toBe("ready")
+    if (result.status !== "ready") return
+    expect(result.outcomes.map(value => [value.slotId, value.status])).toEqual([["tailor-1", "stale"], ["tailor-2", "ready"]])
   })
 
   it("requires explicit absence and blocks correction or ambiguous inventory", async () => {

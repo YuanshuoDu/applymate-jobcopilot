@@ -5,6 +5,7 @@ import { isTaskGraphTerminal } from "../planning/task-graph-transition-rules.js"
 import type { TurnLease } from "../turns/lease.js"
 import { verifyCanonicalObjectiveTailorWaveCompletion, type ObjectiveTailorWaveCompletionWitness,
   type ObjectiveTailorWaveSlotStatus } from "../canonical-objective-tailor-wave-completion.js"
+import { parseObjectiveTailorCorrectionProof } from "./objective-tailor-correction-witness.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId } from "./task-graph-snapshot.js"
 import type { LoadedGraph } from "./task-graph-pg-state.js"
 import type { TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
@@ -156,11 +157,22 @@ function projectOutcome(loaded: LoadedGraph, witness: ObjectiveTailorWaveComplet
   const slots: ObjectiveTailorFinalOutcomeProjection["slots"][number][] = []
   for (let index = 0; index < marker.slots.length; index += 1) {
     const slot = marker.slots[index]!, outcome = witness.outcomes[index]!
-    const writer = snapshot.nodes.find(node => node.key === slot.writerNodeKey), reviewer = snapshot.nodes.find(node => node.key === slot.reviewerNodeKey)
+    const correction = slot.correction, correctionOutcome = record(outcome.correction)
+    const correctionProof = correctionOutcome && parseObjectiveTailorCorrectionProof(correctionOutcome.proof)
+    const writer = snapshot.nodes.find(node => node.key === (correction?.writerNodeKey ?? slot.writerNodeKey))
+    const reviewer = snapshot.nodes.find(node => node.key === (correction?.reviewerNodeKey ?? slot.reviewerNodeKey))
+    const initialWriter = snapshot.nodes.find(node => node.key === slot.writerNodeKey), initialReviewer = snapshot.nodes.find(node => node.key === slot.reviewerNodeKey)
     const proof = outcome.candidateWitness
-    if (!writer || !reviewer || proof.slotId !== slot.slotId || proof.candidate.jobId !== outcome.jobId
-      || proof.sourceAnalystKeys[0] !== slot.sourceAnalystNodeKey || proof.writerNodeKey !== writer.key || proof.reviewerNodeKey !== reviewer.key
+    if (!writer || !reviewer || !initialWriter || !initialReviewer || proof.slotId !== slot.slotId || proof.candidate.jobId !== outcome.jobId
+      || proof.sourceAnalystKeys[0] !== slot.sourceAnalystNodeKey || proof.writerNodeKey !== initialWriter.key || proof.reviewerNodeKey !== initialReviewer.key
       || writer.taskId !== outcome.writerTaskId || reviewer.taskId !== outcome.reviewerTaskId || outcome.status === "pending") return null
+    if (correction ? !correctionOutcome || !correctionProof || Object.keys(correctionOutcome).sort().join(",") !== "proof,reviewerTaskId,writerTaskId"
+      || correctionOutcome.writerTaskId !== writer.taskId || correctionOutcome.reviewerTaskId !== reviewer.taskId
+      || correctionProof.slotId !== slot.slotId || correctionProof.writerNodeKey !== correction.writerNodeKey
+      || correctionProof.reviewerNodeKey !== correction.reviewerNodeKey || correctionProof.prior.writerTaskId !== initialWriter.taskId
+      || correctionProof.prior.reviewerTaskId !== initialReviewer.taskId || canonicalTaskGraphJson(correctionProof.candidateWitness) !== canonicalTaskGraphJson(proof)
+      || loaded.tasks.get(initialWriter.taskId)?.status !== "completed" || loaded.tasks.get(initialReviewer.taskId)?.status !== "completed"
+      : correctionOutcome !== null) return null
     const status: SettledStatus = outcome.status
     const writerTask = loaded.tasks.get(writer.taskId), reviewerTask = loaded.tasks.get(reviewer.taskId)
     const failed = (task: typeof writerTask) => Boolean(task && ["failed", "interrupted", "cancelled", "closed"].includes(task.status))

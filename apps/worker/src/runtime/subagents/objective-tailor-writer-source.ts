@@ -6,6 +6,8 @@ import { readCurrentObjectiveTailorBinding } from "./objective-tailor-current-bi
 import { parseObjectiveTailorCandidateWitness, type ObjectiveTailorCandidateWitness } from "./objective-tailor-witness.js"
 import { parseObjectiveTailorWaveCandidateWitness, type ObjectiveTailorWaveCandidateWitness } from "./objective-tailor-wave-witness.js"
 import { readObjectiveTailorWaveInventory } from "./objective-tailor-wave-inventory.js"
+import { parseObjectiveTailorCorrectionProof } from "./objective-tailor-correction-witness.js"
+import { readObjectiveTailorCorrectionChildBinding } from "./objective-tailor-correction-child-source.js"
 import { readCurrentScheduledDraftJobMaterialDigest, scheduledDraftJobMaterialDigest } from "./scheduled-draft-job-material.js"
 import type { GraphIdentityScope, LoadedGraph } from "./task-graph-pg-state.js"
 import type { SubagentLease } from "./types.js"
@@ -54,13 +56,27 @@ async function loadWaveChildSource(client: Queryable, scope: GraphIdentityScope,
   lease: SubagentLease, row: Row): Promise<SelectedJobArtifactContextForChild | undefined> {
   const inventory = await readObjectiveTailorWaveInventory(client, scope, loaded)
   const leaseContext = record(lease.context), witness = parseObjectiveTailorWaveCandidateWitness(leaseContext?.objectiveTailorCandidateWitness)
+  const correction = leaseContext && Object.hasOwn(leaseContext, "objectiveTailorCorrectionProof")
+    ? parseObjectiveTailorCorrectionProof(leaseContext.objectiveTailorCorrectionProof) : undefined
   if (!inventory?.marker || !witness || !matchesWaveContext(row.context, lease.context, witness)) return undefined
-  const slots = inventory.occupiedSlots.filter(slot => (lease.role === "writer" ? slot.writerTaskId : slot.reviewerTaskId) === lease.id)
-  if (slots.length !== 1 || canonicalTaskGraphJson(slots[0]!.witness) !== canonicalTaskGraphJson(witness)) return undefined
+  if (leaseContext && Object.hasOwn(leaseContext, "objectiveTailorCorrectionProof") && !correction) return undefined
+  const slots = inventory.occupiedSlots.filter(slot => {
+    return correction
+      ? (lease.role === "writer" ? slot.correction?.writerTaskId : slot.correction?.reviewerTaskId) === lease.id
+      : (lease.role === "writer" ? slot.writerTaskId : slot.reviewerTaskId) === lease.id
+  })
+  const slot = slots[0]
+  if (slots.length !== 1 || !slot || canonicalTaskGraphJson(slot.witness) !== canonicalTaskGraphJson(witness)
+    || correction && (!slot.correction || canonicalTaskGraphJson(slot.correction.proof) !== canonicalTaskGraphJson(correction)
+      || canonicalTaskGraphJson(correction.candidateWitness) !== canonicalTaskGraphJson(witness))) return undefined
+  if (correction && !await readObjectiveTailorCorrectionChildBinding({ client, scope, loaded, taskId: lease.id,
+    role: lease.role as "writer" | "reviewer", context: lease.context, inventory })) return undefined
   const jobId = witness.candidate.jobId
   const source = await loadVerifiedJobSource(client, scope.userId, jobId, witness.candidate.materialDigest)
   if (!source) return undefined
   if (lease.role === "reviewer") return { context: source }
+  if (correction) return { context: source, assertCurrentDraftMaterial: materialRechecker(scope.userId, jobId, witness.candidate.materialDigest),
+    allowOwnCorrectionSuccessor: true }
   return { context: source, assertCurrentDraftMaterial: materialRechecker(scope.userId, jobId, witness.candidate.materialDigest) }
 }
 

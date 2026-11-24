@@ -7,6 +7,8 @@ import { readCurrentScheduledDraftJobMaterialDigest } from "./subagents/schedule
 import { selectedJobArtifactCompletionGateWithWitness } from "./selected-job-completion-gate.js"
 import type { SelectedJobBatchArtifactVersion, SelectedJobBatchArtifactVersionScope } from "./multi-selected-job-correction-evidence.js"
 import { readObjectiveTailorWaveInventory, type ObjectiveTailorWaveInventory } from "./subagents/objective-tailor-wave-inventory.js"
+import { readObjectiveTailorCorrectionCompletion } from "./subagents/objective-tailor-correction-completion.js"
+import type { ObjectiveTailorCorrectionProof } from "./subagents/objective-tailor-correction-witness.js"
 import type { ObjectiveTailorWaveCandidateWitness } from "./subagents/objective-tailor-wave-witness.js"
 import { canonicalTaskGraphJson } from "./subagents/task-graph-snapshot.js"
 import type { GraphIdentityScope, LoadedGraph } from "./subagents/task-graph-pg-state.js"
@@ -23,6 +25,7 @@ export type ObjectiveTailorWaveSlotOutcome = Readonly<{
   artifactRef?: TaskGraphArtifactProjectionReference; artifactVersion?: SelectedJobBatchArtifactVersion
   reviewReceipt?: Readonly<Pick<AgentArtifactReviewReceipt, "taskId" | "artifactId" | "version" | "contentHash" | "sourceDigest" | "currentSourceDigest" | "status" | "reviewHash" | "toolCallId">>
   currentSourceDigest?: string
+  correction?: Readonly<{ proof: ObjectiveTailorCorrectionProof; writerTaskId: string; reviewerTaskId: string }>
   candidateWitness: ObjectiveTailorWaveCandidateWitness
 }>
 export type ObjectiveTailorWaveCompletionWitness = Readonly<{
@@ -53,10 +56,16 @@ async function verifyCompletion(input: Input): Promise<ObjectiveTailorWaveComple
   try { inventory = await readObjectiveTailorWaveInventory(input.client, scope, input.loaded) } catch { return blocked([]) }
   if (!inventory) return blocked([])
   if (!inventory.marker) return input.allowAbsent && inventory.occupiedSlots.length === 0 ? { status: "absent" } : blocked([])
-  if (inventory.marker.slots.some(slot => slot.correction) || inventory.occupiedSlots.length !== inventory.marker.slots.length
-    || inventory.graphRevision !== input.loaded.item.revision) return blocked([])
+  if (inventory.occupiedSlots.length !== inventory.marker.slots.length || inventory.graphRevision !== input.loaded.item.revision) return blocked([])
   const outcomes: ObjectiveTailorWaveSlotOutcome[] = []
   for (const slot of inventory.occupiedSlots) {
+    if (slot.correction) {
+      const correction = await readObjectiveTailorCorrectionCompletion({ client: input.client, lease: input.lease, root: input.root,
+        loaded: input.loaded, scope, slot })
+      if (!correction) return blocked(outcomes)
+      outcomes.push(correction)
+      continue
+    }
     const writer = input.loaded.snapshot.nodes.find(node => node.key === slot.witness.writerNodeKey)
     const reviewer = input.loaded.snapshot.nodes.find(node => node.key === slot.witness.reviewerNodeKey)
     const writerTask = input.loaded.tasks.get(slot.writerTaskId), reviewerTask = input.loaded.tasks.get(slot.reviewerTaskId)
@@ -102,6 +111,7 @@ async function verifyCompletion(input: Input): Promise<ObjectiveTailorWaveComple
         reviewReceipt: receiptIdentity(receipt), currentSourceDigest }); continue
     }
     const checkedReceipt: { value: AgentArtifactReviewReceipt | null } = { value: null }
+    const checkedHead: { value: Awaited<ReturnType<typeof findCurrentDraftHeadWithClient>> | undefined } = { value: undefined }
     const checked = await selectedJobArtifactCompletionGateWithWitness({
       commandPort: { readCurrent: async () => ({ revision: inventory.graphRevision, nodes: [
         { key: writer.key, templateId: writer.templateId, goal: writer.goal, successCriteria: writer.successCriteria,
@@ -112,7 +122,11 @@ async function verifyCompletion(input: Input): Promise<ObjectiveTailorWaveComple
           resultSummary: null, resultProjection: reviewerProjection, failureReason: null },
       ] }) },
       lease: input.lease, root: input.root, selectedJobId: slot.jobId,
-      readCurrentDraftHead: scope => findCurrentDraftHeadWithClient(input.client, scope),
+      readCurrentDraftHead: async headScope => {
+        const head = await findCurrentDraftHeadWithClient(input.client, headScope)
+        checkedHead.value = head
+        return head
+      },
       readCurrentSourceDigest: () => readSelectedJobSourceDigestWithClient(input.client, scope.userId, slot.jobId),
       readCurrentReviewReceipt: async receiptScope => {
         const receipt = await findReviewReceiptWithClient(input.client, receiptScope)
@@ -121,7 +135,15 @@ async function verifyCompletion(input: Input): Promise<ObjectiveTailorWaveComple
       },
     })
     const verifiedReceipt = checkedReceipt.value
-    if (!checked.ok || !verifiedReceipt || verifiedReceipt.taskId !== slot.reviewerTaskId || verifiedReceipt.status !== reviewerProjection.reviewStatus
+    if (!checked.ok) {
+      if (checkedHead.value !== undefined && (checkedHead.value === null || !sameArtifact(artifactRef, checkedHead.value))
+        && await currentMaterialStillMatches(input.client, scope, slot.jobId, artifactRef.sourceDigest, slot.witness.candidate.materialDigest)) {
+        outcomes.push({ ...outcome(slot, "stale"), artifactRef, artifactVersion: version,
+          reviewReceipt: receiptIdentity(receipt), currentSourceDigest }); continue
+      }
+      return blocked(outcomes)
+    }
+    if (!verifiedReceipt || verifiedReceipt.taskId !== slot.reviewerTaskId || verifiedReceipt.status !== reviewerProjection.reviewStatus
       || verifiedReceipt.reviewHash !== reviewerProjection.reviewHash || verifiedReceipt.currentSourceDigest !== currentSourceDigest) return blocked(outcomes)
     const status = reviewerProjection.reviewStatus === "passed" ? "ready" : reviewerProjection.reviewStatus
     outcomes.push({ ...outcome(slot, status), artifactRef, artifactVersion: version,
@@ -172,6 +194,11 @@ async function readStaleReviewReceipt(client: PoolClient, scope: Omit<AgentArtif
     && row.sourceDigest === scope.sourceDigest && row.status === "stale" && row.taskId === scope.taskId
     && row.reviewHash === scope.reviewHash && SHA256.test(row.currentSourceDigest) && typeof row.toolCallId === "string" && row.toolCallId.trim()
     ? row : null
+}
+async function currentMaterialStillMatches(client: PoolClient, scope: GraphIdentityScope, jobId: string, sourceDigest: string, materialDigest: string): Promise<boolean> {
+  const source = await readSelectedJobSourceDigestWithClient(client, scope.userId, jobId)
+  const material = await readCurrentScheduledDraftJobMaterialDigest(client, scope.userId, jobId)
+  return source === sourceDigest && material === materialDigest
 }
 function digest(value: unknown): string { return createHash("sha256").update(canonicalTaskGraphJson(value)).digest("hex") }
 function sameWitness(left: ObjectiveTailorWaveCompletionWitness, right: ObjectiveTailorWaveCompletionWitness): boolean {

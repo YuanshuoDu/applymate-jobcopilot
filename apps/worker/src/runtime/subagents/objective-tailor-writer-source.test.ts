@@ -4,6 +4,7 @@ import { bindObjectiveTailorCandidateWitness, makeObjectiveTailorCandidateSelect
 import { objectiveTailorNodeKeysForCandidate, objectiveTailorPlan } from "./objective-task-graph-child-authority.js"
 import { bindObjectiveTailorWaveCandidateWitness, makeObjectiveTailorWaveCandidateSelection,
   objectiveTailorWavePairPlan } from "./objective-tailor-wave-witness.js"
+import { bindObjectiveTailorCorrectionProof, objectiveTailorCorrectionNodeKeys } from "./objective-tailor-correction-proof.js"
 import { loadObjectiveTailorChildSource } from "./objective-tailor-writer-source.js"
 import type { GraphIdentityScope, LoadedGraph } from "./task-graph-pg-state.js"
 import type { SubagentLease } from "./types.js"
@@ -76,6 +77,55 @@ function waveFixture(role: "writer" | "reviewer" = "writer") {
   mocks.digest.mockReturnValue(materialDigest)
   mocks.readMaterial.mockResolvedValue(materialDigest)
   return { client, row, lease, context }
+}
+
+const correctionKeys = objectiveTailorCorrectionNodeKeys("tailor-1")!
+const correctionProof = bindObjectiveTailorCorrectionProof({ graphRevision: 5, slotId: "tailor-1", candidateWitness: waveWitness,
+  writerTaskId: "wave-writer-task", reviewerTaskId: "wave-reviewer-task",
+  artifactRef: { artifactId: "artifact-1", version: 2, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: materialDigest },
+  artifactVersion: { artifactId: "artifact-1", artifactType: "cover_letter", taskId: "wave-writer-task", version: 2,
+    contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: materialDigest, previousHash: `sha256:${"b".repeat(64)}` },
+  reviewReceipt: { jobId, artifactId: "artifact-1", version: 2, contentHash: `sha256:${"a".repeat(64)}`,
+    sourceDigest: materialDigest, currentSourceDigest: materialDigest, status: "needs_revision", taskId: "wave-reviewer-task",
+    toolCallId: "review-call", reviewHash: `sha256:${"c".repeat(64)}` } })!
+
+function correctionWaveFixture(role: "writer" | "reviewer" = "writer") {
+  const writer = role === "writer", taskId = writer ? "wave-correction-writer" : "wave-correction-reviewer"
+  const base = wavePlan.templatesByNodeKey.get(writer ? waveWitness.writerNodeKey : waveWitness.reviewerNodeKey)!.context as Record<string, unknown>
+  const context = { ...base, objectiveTailorCorrectionProof: correctionProof }
+  const lease = { id: taskId, userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+    parentTaskId: scope.parentTaskId, role, taskType: writer ? "cover_letter_draft" : "cover_letter_review", status: "running",
+    attemptCount: 1, maxAttempts: 2, leaseOwner: "worker-1", ownerId: "worker-1", leaseExpiresAt: new Date(Date.now() + 60_000),
+    interruptRequestedAt: null, signal: new AbortController().signal, context, goal: "", path: "root.0", depth: 1,
+    constraints: [], successCriteria: [], allowedActions: [], expectedOutputSchema: {}, result: null, failureReason: null,
+    budgetSnapshot: null, toolPolicySnapshot: null } as unknown as SubagentLease
+  const row = { id: taskId, userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+    parentTaskId: scope.parentTaskId, role, taskType: lease.taskType, status: "running", attemptCount: 1, leaseOwner: "worker-1",
+    interruptRequestedAt: null, context }
+  const client = { query: vi.fn(async (_sql: string, _params: unknown[]) => ({ rows: [row], rowCount: 1 })) }
+  const correction = { proof: correctionProof, writerTaskId: "wave-correction-writer", reviewerTaskId: "wave-correction-reviewer" }
+  const marker = { schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, sourceNodeCount: 2,
+    slots: [{ slotId: "tailor-1", sourceAnalystNodeKey: "analyst-node", writerNodeKey: waveWitness.writerNodeKey,
+      reviewerNodeKey: waveWitness.reviewerNodeKey, correction: correctionKeys }] }
+  const nodes = [
+    { key: waveWitness.writerNodeKey, taskId: "wave-writer-task", templateId: "cover_letter_writer", dependsOn: [] },
+    { key: waveWitness.reviewerNodeKey, taskId: "wave-reviewer-task", templateId: "cover_letter_reviewer", dependsOn: [waveWitness.writerNodeKey] },
+    { key: correctionKeys.writerNodeKey, taskId: correction.writerTaskId, templateId: "cover_letter_writer", dependsOn: [waveWitness.reviewerNodeKey] },
+    { key: correctionKeys.reviewerNodeKey, taskId: correction.reviewerTaskId, templateId: "cover_letter_reviewer", dependsOn: [correctionKeys.writerNodeKey] },
+  ]
+  const taskRows = new Map(nodes.map(node => [node.taskId, { id: node.taskId,
+    role: node.templateId === "cover_letter_writer" ? "writer" : "reviewer", status: node.taskId === correction.writerTaskId ? "running" : "completed",
+    taskType: node.templateId === "cover_letter_writer" ? "cover_letter_draft" : "cover_letter_review" }]))
+  const loaded = { ...waveLoaded, item: { revision: 6 }, snapshot: { ...waveLoaded.snapshot!, nodes, objectiveTailor: marker },
+    state: { ...waveLoaded.state!, revision: 6, nodes: nodes.map(node => ({ ...node, status: taskRows.get(node.taskId)?.status })) },
+    tasks: taskRows } as unknown as LoadedGraph
+  mocks.waveInventory.mockResolvedValue({ marker,
+    occupiedSlots: [{ slotId: "tailor-1", jobId, sourceAnalystNodeKey: "analyst-node", witness: waveWitness,
+      writerTaskId: "wave-writer-task", reviewerTaskId: "wave-reviewer-task", correction }] })
+  mocks.source.mockResolvedValue(source)
+  mocks.digest.mockReturnValue(materialDigest)
+  mocks.readMaterial.mockResolvedValue(materialDigest)
+  return { client, lease, context, loaded }
 }
 
 beforeEach(() => vi.clearAllMocks())
@@ -151,6 +201,27 @@ describe("Objective tailor child source", () => {
     const { client, lease } = waveFixture("reviewer")
     const result = await loadObjectiveTailorChildSource(client as never, scope, waveLoaded, lease)
     expect(result).toEqual({ context: source })
+  })
+
+  it("admits only the persisted correction Writer and pins source plus prior artifact head during save", async () => {
+    const { client, lease, loaded } = correctionWaveFixture()
+    const result = await loadObjectiveTailorChildSource(client as never, scope, loaded, lease)
+    expect(result?.context).toBe(source)
+    expect(result?.assertCurrentDraftMaterial).toBeTypeOf("function")
+    expect(result?.allowOwnCorrectionSuccessor).toBe(true)
+    expect(await result!.assertCurrentDraftMaterial!(client as never, scope.userId, jobId)).toBe(true)
+    mocks.readMaterial.mockResolvedValue(`sha256:${"9".repeat(64)}`)
+    await expect(result!.assertCurrentDraftMaterial!(client as never, scope.userId, jobId)).resolves.toBe(false)
+  })
+
+  it("rejects a correction proof that differs from its persisted slot", async () => {
+    const { client, lease, loaded } = correctionWaveFixture()
+    mocks.waveInventory.mockResolvedValue({ marker: loaded.snapshot!.objectiveTailor,
+      occupiedSlots: [{ slotId: "tailor-1", jobId, witness: waveWitness, writerTaskId: "wave-writer-task",
+        reviewerTaskId: "wave-reviewer-task", correction: { proof: { ...correctionProof, graphRevision: 4 },
+          writerTaskId: "wave-correction-writer", reviewerTaskId: "wave-correction-reviewer" } }] })
+    await expect(loadObjectiveTailorChildSource(client as never, scope, loaded, lease)).resolves.toBeUndefined()
+    expect(mocks.source).not.toHaveBeenCalled()
   })
 
   it.each(["V1 context on V2 graph", "V2 context on unmarked graph", "wrong V2 task slot"] as const)(
