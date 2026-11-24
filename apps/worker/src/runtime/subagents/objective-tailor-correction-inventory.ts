@@ -27,7 +27,7 @@ export async function readObjectiveTailorCorrectionInventory(input: Readonly<{
   const reviewer = graph.snapshot?.nodes.filter(node => node.key === repair.reviewerNodeKey) ?? []
   const writerNode = writer[0], reviewerNode = reviewer[0]
   if (!writerNode || !reviewerNode || writer.length !== 1 || reviewer.length !== 1) return undefined
-  const proof = pairedProof(input.rows, writerNode.taskId, reviewerNode.taskId), parsed = proof && parseObjectiveTailorCorrectionProof(proof)
+  const parsed = pairedProof(input.rows, writerNode.taskId, reviewerNode.taskId)
   if (writer.length !== 1 || reviewer.length !== 1 || !writerNode || !reviewerNode || !parsed
     || !graph.state || !graph.item || graph.item.revision < parsed.admittedRevision
     || parsed.slotId !== input.slot.slotId || parsed.graphRevision + 1 !== parsed.admittedRevision
@@ -50,7 +50,7 @@ export async function readObjectiveTailorCorrectionInventory(input: Readonly<{
   return { proof: parsed, writerTaskId: writerNode.taskId, reviewerTaskId: reviewerNode.taskId }
 }
 
-function pairedProof(rows: readonly Row[], writerId: string, reviewerId: string): unknown {
+function pairedProof(rows: readonly Row[], writerId: string, reviewerId: string): ObjectiveTailorCorrectionProof | undefined {
   const writer = record(rows.find(row => row.id === writerId)?.context), reviewer = record(rows.find(row => row.id === reviewerId)?.context)
   if (!writer || !reviewer || writer.objectiveTailorCandidateMode !== true || reviewer.objectiveTailorCandidateMode !== true) return undefined
   const left = parseObjectiveTailorCorrectionProof(writer.objectiveTailorCorrectionProof)

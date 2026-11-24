@@ -457,7 +457,8 @@ class FakeArtifactPool {
     if (sql.includes('FROM "agent_artifact" AS artifact JOIN "agent_artifact_version" AS version_row')) {
       const artifact = this.artifacts.get(`${values[1]}:${values[0]}`)
       const version = this.versions.get(`${values[0]}:${Number(values[4]) + 1}`)
-      const valid = artifact?.jobId === values[2] && artifact.lifecycle === "draft" && artifact.version === Number(values[4]) + 1
+      if (!artifact || !version) return this.empty()
+      const valid = artifact.jobId === values[2] && artifact.lifecycle === "draft" && artifact.version === Number(values[4]) + 1
         && artifact.hash === version?.contentHash && artifact.previousHash === values[5]
         && version?.sessionId === values[3] && version.taskId === values[6] && version.previousHash === values[5]
         && version.sourceDigest === values[7]

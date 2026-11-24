@@ -56,11 +56,11 @@ function fixture(change?: "context" | "owner" | "initial-id" | "dependency" | "v
     ]) }
   const rows = [row("correction-writer-task", "writer", "cover_letter_draft", "queued", context),
     row("correction-reviewer-task", "reviewer", "cover_letter_review", "waiting", correctionContext)]
-  const version = { ...proof.prior.artifactVersion, userId: scope.userId, sessionId: scope.sessionId, jobId }
+  const version = { ...proof.prior.artifactVersion, userId: scope.userId, sessionId: scope.sessionId }
   const client = { query: vi.fn(async (sql: string) => ({ rows: change === "version" || !sql.includes('FROM "agent_artifact_version"') ? [] : [version] })) }
   mocks.receipt.mockResolvedValue({ userId: scope.userId, sessionId: scope.sessionId, jobId,
     ...proof.prior.reviewReceipt, ...(change === "receipt" ? { toolCallId: "different-review-call" } : {}) })
-  const slot = { slotId: "tailor-1", sourceAnalystNodeKey: "analyst-node", writerNodeKey: witness.writerNodeKey,
+  const slot = { slotId: "tailor-1" as const, sourceAnalystNodeKey: "analyst-node", writerNodeKey: witness.writerNodeKey,
     reviewerNodeKey: witness.reviewerNodeKey, correction: keys }
   return { client, loaded: graph as unknown as LoadedGraph, rows, slot, witness, proof, initialWriterId, initialReviewerId }
 }

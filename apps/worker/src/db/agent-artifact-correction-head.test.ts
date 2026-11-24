@@ -10,7 +10,7 @@ const exact = { artifactId: scope.artifactId, headVersion: 4, headHash: "sha256:
 
 describe("own correction successor head", () => {
   it("accepts only a locked exact v+1 current head written by this correction task", async () => {
-    const client = { query: vi.fn(async () => ({ rows: [exact] })) }
+    const client = { query: vi.fn(async (..._args: unknown[]) => ({ rows: [exact] })) }
     await expect(hasOwnCorrectionSuccessorHeadWithClient(client as never, scope)).resolves.toBe(true)
     expect(client.query).toHaveBeenCalledWith(expect.stringContaining('version_row."taskId"=$7'), [
       scope.artifactId, scope.userId, scope.jobId, scope.sessionId, scope.priorVersion, scope.priorContentHash,
