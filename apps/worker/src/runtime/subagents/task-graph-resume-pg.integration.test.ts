@@ -21779,8 +21779,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       })
       const firstWaitResult = await pool!.query<{
         id: string; status: string; mode: string; targetTaskIds: unknown; matchedTaskIds: unknown
-        suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null
-      }>(`SELECT "id", "status", "mode", "targetTaskIds", "matchedTaskIds", "suspendedAt", "resolvedAt", "consumedAt"
+        createdAt: Date; suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null
+      }>(`SELECT "id", "status", "mode", "targetTaskIds", "matchedTaskIds", "createdAt", "suspendedAt", "resolvedAt", "consumedAt"
           FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3
             AND "parentTaskId" = $4 AND "idempotencyKey" = $5`,
       [value.userId, value.sessionId, value.turnId, rootTaskId, firstWaitKey])
@@ -22053,10 +22053,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(dispatches.rows.every(row => row.publishedAt instanceof Date)).toBe(true)
       const waits = await pool!.query<{
         id: string; idempotencyKey: string; status: string; mode: string; targetTaskIds: unknown; matchedTaskIds: unknown
-        result: unknown; suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null
+        stepId: string; result: unknown; createdAt: Date; deadlineAt: Date; updatedAt: Date
+        suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null
       }>(
-        `SELECT "id", "idempotencyKey", "status", "mode", "targetTaskIds", "matchedTaskIds", "result",
-                "suspendedAt", "resolvedAt", "consumedAt" FROM "agent_wait_conditions"
+        `SELECT "id", "idempotencyKey", "status", "mode", "targetTaskIds", "matchedTaskIds", "stepId", "result",
+                "createdAt", "deadlineAt", "updatedAt", "suspendedAt", "resolvedAt", "consumedAt" FROM "agent_wait_conditions"
          WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4
            AND "idempotencyKey" LIKE $5 ORDER BY "idempotencyKey"`,
         [value.userId, value.sessionId, value.turnId, rootTaskId, `p3-1336-%:${value.turnId}:%`],
@@ -22068,21 +22069,33 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         }
         return stringIds(parsed, allowEmpty)
       }
-      const immediateReadyWaitHasReceipt = async (wait: typeof waits.rows[number]): Promise<boolean> => {
+      const waitHasExactToolReceipt = async (wait: typeof waits.rows[number]): Promise<boolean> => {
         const targets = exactIds(wait.targetTaskIds), matched = exactIds(wait.matchedTaskIds, true)
-        const persistedRequest = record(record(wait.result)?.request)
+        const persisted = record(wait.result), persistedRequest = record(persisted?.request)
         const persistedTargets = exactIds(persistedRequest?.targetTaskIds)
-        if (!targets || !matched || !persistedRequest || persistedRequest.mode !== "all"
-          || !sameUniqueIds(persistedTargets ?? [], targets) || !sameUniqueIds(matched, targets)) return false
+        if (!targets || !matched || !persistedRequest || persistedRequest.mode !== wait.mode || wait.mode !== "all"
+          || !sameUniqueIds(persistedTargets ?? [], targets) || matched.some(id => !targets.includes(id))) return false
+        if (wait.consumedAt instanceof Date) {
+          const outcome = record(persisted?.outcome)
+          const outcomeTargets = exactIds(outcome?.targetTaskIds), outcomeMatched = exactIds(outcome?.matchedTaskIds, true)
+          const outcomeTasks = Array.isArray(outcome?.tasks) ? outcome.tasks.map(record) : null
+          const outcomeTaskIds = outcomeTasks?.map(task => task?.taskId).filter((id): id is string => typeof id === "string") ?? []
+          if (outcome?.waitId !== wait.id || outcome.status !== wait.status
+            || !sameUniqueIds(outcomeTargets ?? [], targets) || !sameUniqueIds(outcomeMatched ?? [], matched)
+            || outcomeTasks === null || outcomeTasks.length !== targets.length || !sameUniqueIds(outcomeTaskIds, targets)) return false
+        }
         const receipts = await pool!.query<{
-          callStatus: string; callContent: unknown; resultStatus: string | null; resultContent: unknown
+          callStatus: string; callStepId: string; callContent: unknown
+          resultStatus: string | null; resultStepId: string | null; resultContent: unknown
         }>(`SELECT call."status" AS "callStatus", call."content" AS "callContent",
-                   result."status" AS "resultStatus", result."content" AS "resultContent"
+                   call."stepId" AS "callStepId", result."status" AS "resultStatus",
+                   result."stepId" AS "resultStepId", result."content" AS "resultContent"
             FROM "agent_items" AS call
             JOIN "agent_turns" AS turn ON turn."id" = call."turnId" AND turn."sessionId" = call."sessionId"
             JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
             LEFT JOIN "agent_items" AS result ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
               AND result."taskId" = call."taskId" AND result."type" = 'tool_result'
+              AND result."stepId" = call."stepId"
               AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
             WHERE call."sessionId" = $1 AND call."turnId" = $2 AND turn."userId" = $3 AND session."userId" = $3
               AND call."taskId" = $4 AND turn."rootTaskId" = $4 AND call."type" = 'tool_call'
@@ -22095,11 +22108,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         const outputTargets = exactIds(output?.taskIds), outputMatched = exactIds(output?.matchedTaskIds, true)
         const outputTasks = Array.isArray(output?.tasks) ? output.tasks.map(record) : null
         const outputTaskIds = outputTasks?.map(task => task?.taskId).filter((id): id is string => typeof id === "string") ?? []
+        const outputDeadline = typeof output?.deadlineAt === "string" ? Date.parse(output.deadlineAt) : NaN
         return receipt.callStatus === "completed" && receipt.resultStatus === "completed"
+          && receipt.callStepId === wait.stepId && receipt.resultStepId === wait.stepId
+          && typeof call?.toolCallId === "string" && call.toolCallId.length > 0
           && call?.toolName === "agent.wait" && input?.idempotencyKey === wait.idempotencyKey
           && input.mode === wait.mode && sameUniqueIds(exactIds(input.taskIds) ?? [], targets)
-          && result?.toolCallId === call.toolCallId && result?.errorCode === null
-          && output?.waitId === wait.id && output.status === "ready"
+          && result?.toolCallId === call.toolCallId && result?.toolName === "agent.wait" && result?.errorCode === null
+          && output?.waitId === wait.id && output.status === wait.status
+          && Number.isFinite(outputDeadline) && outputDeadline === wait.deadlineAt.getTime()
           && sameUniqueIds(outputTargets ?? [], targets) && sameUniqueIds(outputMatched ?? [], matched)
           && outputTasks !== null && outputTasks.length === targets.length && sameUniqueIds(outputTaskIds, targets)
       }
@@ -22108,11 +22125,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         let validState = false, ready = false
         if (wait.status === "ready" && wait.suspendedAt instanceof Date) {
           validState = wait.resolvedAt instanceof Date && wait.consumedAt instanceof Date
+            && wait.consumedAt >= wait.resolvedAt && await waitHasExactToolReceipt(wait)
           ready = validState
         } else if (wait.status === "ready" && wait.suspendedAt === null
           && wait.resolvedAt === null && wait.consumedAt === null) {
-          ready = await immediateReadyWaitHasReceipt(wait)
+          ready = await waitHasExactToolReceipt(wait)
           validState = ready
+        } else if (wait.status === "timed_out") {
+          const deadlineElapsed = wait.createdAt instanceof Date && wait.deadlineAt instanceof Date
+            && wait.deadlineAt > wait.createdAt && wait.resolvedAt instanceof Date
+            && wait.resolvedAt >= wait.deadlineAt && wait.updatedAt >= wait.resolvedAt
+          const terminalized = wait.suspendedAt instanceof Date
+            ? wait.resolvedAt instanceof Date && wait.suspendedAt <= wait.resolvedAt
+              && wait.consumedAt instanceof Date && wait.consumedAt >= wait.resolvedAt
+            : wait.suspendedAt === null && wait.consumedAt === null
+          validState = deadlineElapsed && terminalized && await waitHasExactToolReceipt(wait)
         } else if (wait.status === "waiting") {
           validState = wait.consumedAt === null
         }
@@ -22127,6 +22154,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const recoveredWave1Wait = waits.rows.find(wait => wait.id === firstWait.id)
       const otherWave1Waits = waits.rows.filter(wait => wait.id !== firstWait.id
         && wait.idempotencyKey.startsWith(`p3-1336-wave1-wait:${value.turnId}:`))
+      const wave1Poll = (key: string): number => {
+        const prefix = `p3-1336-wave1-wait:${value.turnId}:`
+        const suffix = key.startsWith(prefix) ? key.slice(prefix.length) : ""
+        return /^[1-9][0-9]*$/.test(suffix) ? Number(suffix) : 0
+      }
+      const firstTargets = exactIds(firstWait.targetTaskIds)
+      const laterReadyWave1Wait = otherWave1Waits.find(wait => wave1Poll(wait.idempotencyKey) > wave1Poll(firstWaitKey)
+        && firstWait.createdAt instanceof Date && wait.createdAt instanceof Date && wait.createdAt >= firstWait.createdAt
+        && firstTargets !== null && sameUniqueIds(exactIds(wait.targetTaskIds) ?? [], firstTargets)
+        && readyEvidence.get(wait.id) === true && waitStateValid.get(wait.id) === true)
       const boundedWaitCount = (count: number) => Math.min(count, 16)
       const safeWaitStatus = (status: string | undefined) =>
         status === "waiting" || status === "ready" || status === "timed_out" || status === "interrupted"
@@ -22141,6 +22178,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           suspended: recoveredWave1Wait?.suspendedAt instanceof Date,
           resolved: recoveredWave1Wait?.resolvedAt instanceof Date,
           consumed: recoveredWave1Wait?.consumedAt instanceof Date,
+          timeoutDeadlineElapsed: recoveredWave1Wait?.status === "timed_out"
+            && recoveredWave1Wait.deadlineAt instanceof Date && recoveredWave1Wait.resolvedAt instanceof Date
+            ? recoveredWave1Wait.resolvedAt >= recoveredWave1Wait.deadlineAt : false,
+          laterSameTargetReadyWait: laterReadyWave1Wait !== undefined,
           stateValid: recoveredWave1Wait ? waitStateValid.get(recoveredWave1Wait.id) === true : false,
           readyEvidence: recoveredWave1Wait ? readyEvidence.get(recoveredWave1Wait.id) === true : false,
         },
@@ -22153,9 +22194,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         },
       }
       const firstWaitRecovered = recoveredWave1Wait?.idempotencyKey === firstWaitKey
-        && recoveredWave1Wait?.status === "ready" && recoveredWave1Wait.suspendedAt instanceof Date
-        && recoveredWave1Wait.resolvedAt instanceof Date && recoveredWave1Wait.consumedAt instanceof Date
-        && readyEvidence.get(firstWait.id) === true
+        && (recoveredWave1Wait.status === "ready" || recoveredWave1Wait.status === "timed_out")
+        && recoveredWave1Wait.suspendedAt instanceof Date && recoveredWave1Wait.resolvedAt instanceof Date
+        && recoveredWave1Wait.consumedAt instanceof Date && waitStateValid.get(firstWait.id) === true
+        && (recoveredWave1Wait.status !== "timed_out" || laterReadyWave1Wait !== undefined)
       expect(firstWaitRecovered, `Objective Tailor first wait recovery: ${JSON.stringify(firstWaitDiagnostic)}`).toBe(true)
       expect(waits.rows.every(wait => /^p3-1336-(?:wave-source|wave-analyst|wave1|wave2|corrections)-wait:[^:]+:[1-9][0-9]*$/.test(wait.idempotencyKey)
         && waitStateValid.get(wait.id) === true)).toBe(true)
