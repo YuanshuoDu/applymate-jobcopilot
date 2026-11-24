@@ -3233,17 +3233,46 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         role: "orchestrator", taskType: "root", session: { userId: ids.user },
       }, select: { id: true, status: true, result: true, failureReason: true, attemptCount: true,
         leaseOwner: true, leaseExpiresAt: true, completedAt: true } })
-      expect(rootBeforeFinalApproval).toMatchObject({ id: fillRootTaskId, status: "waiting_for_user",
+      if (!rootBeforeFinalApproval) throw new Error("Objective Fill Root disappeared before final approval")
+      expect(rootBeforeFinalApproval).toMatchObject({ id: fillRootTaskId,
         attemptCount: 1, leaseOwner: null, leaseExpiresAt: null, completedAt: null })
-      expect([null, "policy_requires_approval"]).toContain(rootBeforeFinalApproval?.failureReason)
+      expect(["waiting", "waiting_for_user"]).toContain(rootBeforeFinalApproval.status)
       const rootWaitBeforeFinalApproval = jsonRecord(rootBeforeFinalApproval?.result)
-      expect(Object.keys(rootWaitBeforeFinalApproval ?? {}).sort()).toEqual([
+      if (!rootWaitBeforeFinalApproval) throw new Error("Objective Fill Root wait result is missing")
+      expect(Object.keys(rootWaitBeforeFinalApproval).sort()).toEqual([
         "finalItemId", "status", "stepCount", "toolCallCount", "waitId",
       ])
-      expect(rootWaitBeforeFinalApproval).toMatchObject({ status: "waiting_for_approval", finalItemId: null })
-      expect(Number.isSafeInteger(rootWaitBeforeFinalApproval?.stepCount)).toBe(true)
-      expect(Number.isSafeInteger(rootWaitBeforeFinalApproval?.toolCallCount)).toBe(true)
-      expect(rootWaitBeforeFinalApproval?.waitId === null || typeof rootWaitBeforeFinalApproval?.waitId === "string").toBe(true)
+      expect(rootWaitBeforeFinalApproval.finalItemId).toBeNull()
+      expect(Number.isSafeInteger(rootWaitBeforeFinalApproval.stepCount)).toBe(true)
+      expect(Number.isSafeInteger(rootWaitBeforeFinalApproval.toolCallCount)).toBe(true)
+      if (rootBeforeFinalApproval.status === "waiting") {
+        expect(rootBeforeFinalApproval.failureReason).toBeNull()
+        expect(rootWaitBeforeFinalApproval.status).toBe("waiting_for_dependency")
+        const dependencyWaitId = rootWaitBeforeFinalApproval.waitId
+        if (typeof dependencyWaitId !== "string" || dependencyWaitId.length === 0) {
+          throw new Error("Objective dependency Wait identity is missing")
+        }
+        const dependencyWait = await testDb.agentWaitCondition.findFirst({ where: {
+          id: dependencyWaitId, userId: ids.user, sessionId, turnId: fillTurnId,
+          parentTaskId: fillRootTaskId,
+        }, select: { id: true, userId: true, sessionId: true, turnId: true, parentTaskId: true, status: true,
+          suspendedAt: true, resolvedAt: true, consumedAt: true, step: { select: { taskId: true, attempt: true, status: true } } } })
+        expect(dependencyWait).toMatchObject({ id: dependencyWaitId, userId: ids.user, sessionId, turnId: fillTurnId,
+          parentTaskId: fillRootTaskId, suspendedAt: expect.any(Date), consumedAt: null,
+          step: { attempt: 1, status: "waiting_for_tool" } })
+        expect(["waiting", "ready"]).toContain(dependencyWait?.status)
+        expect([fillRootTaskId, null]).toContain(dependencyWait?.step.taskId)
+        if (dependencyWait?.status === "waiting") expect(dependencyWait.resolvedAt).toBeNull()
+        else expect(dependencyWait?.resolvedAt).toBeInstanceOf(Date)
+      } else {
+        expect(rootWaitBeforeFinalApproval.status).toBe("waiting_for_approval")
+        if (rootWaitBeforeFinalApproval.waitId === submitApproval.id) {
+          expect(rootBeforeFinalApproval.failureReason).toBeNull()
+        } else {
+          expect(rootWaitBeforeFinalApproval.waitId).toBeNull()
+          expect(rootBeforeFinalApproval?.failureReason).toBe("policy_requires_approval")
+        }
+      }
       const finalizationStepId = `objective-application-submit-finalize:${fillTurnId}`
       const stepsBeforeFinalApproval = await testDb.agentStep.findMany({ where: {
         sessionId, turnId: fillTurnId, taskId: fillRootTaskId,
