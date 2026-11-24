@@ -28,6 +28,38 @@ describe("createBrowserApplicationSubmitProvider", () => {
     })
   })
 
+  it.each([
+    [{ status: "manual", error: "No submit button found", durationMs: 1 }, "objective_submit_control_unavailable"],
+    [{ status: "manual", durationMs: 1 }, "objective_submit_confirmation_missing"],
+  ] as const)("adds only a bounded Objective reason for a manual browser result", async (result, objectiveReason) => {
+    const provider = createBrowserApplicationSubmitProvider({ run: vi.fn(),
+      runObjective: vi.fn(async () => result), supportsObjectiveTarget: () => true,
+      confirmationId: "objective-confirmation", postSubmitUrl: () => "" })
+    let caught: unknown
+    try {
+      await provider({ target: {} as never, context: {} as never, beforeSubmit: vi.fn(),
+        objectiveMaterial: { reviewedResumeContent: {}, reviewedCoverLetter: "Reviewed", confirmedAnswers: {},
+          approvedApplyUrl: "https://boards.greenhouse.io/acme/jobs/123" } })
+    } catch (error) { caught = error }
+    expect(caught).toMatchObject({ code: "browser_manual", objectiveReason, statusCode: 409 })
+    expect(String(caught)).not.toContain("private")
+  })
+
+  it("does not assign Objective reasons to legacy or unrelated manual outcomes", async () => {
+    const legacy = createBrowserApplicationSubmitProvider({ run: vi.fn(async () => ({
+      status: "manual" as const, error: "No submit button found", durationMs: 1,
+    })), confirmationId: "legacy", postSubmitUrl: () => "" })
+    await expect(legacy({ target: {} as never, artifact: {} as never, context: {} as never, beforeSubmit: vi.fn() }))
+      .rejects.toMatchObject({ code: "browser_manual", objectiveReason: undefined })
+    const unrelated = createBrowserApplicationSubmitProvider({ run: vi.fn(),
+      runObjective: vi.fn(async () => ({ status: "manual" as const, error: "CAPTCHA detected", durationMs: 1 })),
+      supportsObjectiveTarget: () => true, confirmationId: "objective", postSubmitUrl: () => "" })
+    await expect(unrelated({ target: {} as never, context: {} as never, beforeSubmit: vi.fn(), objectiveMaterial: {
+      reviewedResumeContent: {}, reviewedCoverLetter: "Reviewed", confirmedAnswers: {},
+      approvedApplyUrl: "https://boards.greenhouse.io/acme/jobs/123",
+    } })).rejects.toMatchObject({ code: "browser_manual", objectiveReason: undefined })
+  })
+
   it("advertises separate Objective capability only with its supported dedicated runner", async () => {
     const run = vi.fn(), beforeSubmit = vi.fn().mockResolvedValue(true)
     const material = { reviewedResumeContent: { basics: { name: "Candidate" } }, reviewedCoverLetter: "Reviewed",

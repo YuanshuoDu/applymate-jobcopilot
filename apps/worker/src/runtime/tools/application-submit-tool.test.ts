@@ -3,6 +3,7 @@ import type { AgentApproval } from "@jobcopilot/agent-protocol"
 import type { PoolClient } from "pg"
 
 import { InMemoryArtifactToolStore } from "./artifact-tools.js"
+import { BrowserApplicationSubmitError } from "./browser-submit-provider.js"
 import { createApplicationSubmitTool, type SubmissionApprovalStore, type SubmissionAttemptStore } from "./application-submit-tool.js"
 import type { ApplicationTarget, SubmissionAttempt, SubmissionClaimAuthorizer, SubmissionSourceSelection } from "../../db/application-submit-repo.js"
 import type { ApplicationSubmitIdentity } from "../../queue/application-submit-fence.js"
@@ -279,6 +280,48 @@ describe("application.submit typed tool", () => {
     expect(objectiveRead).not.toHaveBeenCalled()
     expect(tested.approvals.consumeSubmissionInTransaction).not.toHaveBeenCalled()
     expect(tested.submit).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ["No submit button found", "objective_submit_control_unavailable"],
+    [undefined, "objective_submit_confirmation_missing"],
+  ] as const)("stores Objective manual reason %s privately and replays only browser_manual", async (message, privateReason) => {
+    const tested = harness({ source: objectiveSelection })
+    objectiveRead.mockResolvedValue({ artifactHash: tested.base.hash.slice("sha256:".length), packet: objectiveMaterial, objectiveSource })
+    Object.assign(tested.submit, { acceptsObjectiveReviewedApplicationMaterial: true as const,
+      supportsObjectiveApplicationSubmitTarget: (url: unknown) => url === objectiveMaterial.approvedApplyUrl })
+    tested.submit.mockRejectedValueOnce(new BrowserApplicationSubmitError({ status: "manual",
+      ...(message ? { error: message } : {}), durationMs: 1 }, true))
+
+    const first = await tested.tool.execute(context(), input())
+    expect(first).toMatchObject({ status: "failed", errorCode: "browser_manual", output: null })
+    expect(JSON.stringify(first)).not.toContain("No submit button found")
+    expect(tested.attempts.rows.get(identity.approvalId)).toMatchObject({ state: "failed", errorCode: privateReason })
+
+    const replay = await tested.tool.execute(context(), input())
+    expect(replay).toMatchObject({ status: "failed", errorCode: "browser_manual", output: null })
+    expect(JSON.stringify(replay)).not.toContain(privateReason)
+    expect(tested.submit).toHaveBeenCalledOnce()
+    expect(objectiveRead).toHaveBeenCalledOnce()
+  })
+
+  it("preserves legacy browser_manual codes and ignores untrusted Objective subtypes", async () => {
+    const legacy = harness()
+    legacy.submit.mockRejectedValueOnce(new BrowserApplicationSubmitError({ status: "manual",
+      error: "No submit button found", durationMs: 1 }))
+    await expect(legacy.tool.execute(context(), input())).resolves.toMatchObject({ status: "failed", errorCode: "browser_manual" })
+    expect(legacy.attempts.rows.get(identity.approvalId)).toMatchObject({ state: "failed", errorCode: "browser_manual" })
+    await expect(legacy.tool.execute(context(), input())).resolves.toMatchObject({ status: "failed", errorCode: "browser_manual" })
+
+    const tested = harness({ source: objectiveSelection })
+    objectiveRead.mockResolvedValue({ artifactHash: tested.base.hash.slice("sha256:".length), packet: objectiveMaterial, objectiveSource })
+    Object.assign(tested.submit, { acceptsObjectiveReviewedApplicationMaterial: true as const,
+      supportsObjectiveApplicationSubmitTarget: () => true })
+    tested.submit.mockRejectedValueOnce(Object.assign(new Error("private message"), {
+      provider: "browser", statusCode: 409, code: "objective_submit_control_unavailable",
+    }))
+    await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "failed", errorCode: "browser_409" })
+    expect(tested.attempts.rows.get(identity.approvalId)).toMatchObject({ state: "failed", errorCode: "browser_409" })
   })
 
   it("fails closed when the approved artifact hash is stale", async () => {

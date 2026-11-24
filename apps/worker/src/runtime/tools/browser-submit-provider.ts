@@ -11,12 +11,15 @@ export type ObjectiveBrowserSubmitRunner = (input: Readonly<{
   beforeSubmit: (intent?: SubmissionRequestIntent) => Promise<boolean>
 }>) => Promise<HarnessResult>
 
+export type ObjectiveBrowserManualReason = "objective_submit_control_unavailable" | "objective_submit_confirmation_missing"
+
 export class BrowserApplicationSubmitError extends Error {
   readonly provider = "browser"
   readonly statusCode: number
   readonly code: "browser_412" | "browser_manual" | "browser_failed"
+  readonly objectiveReason: ObjectiveBrowserManualReason | undefined
 
-  constructor(result: HarnessResult) {
+  constructor(result: HarnessResult, objective = false) {
     super(result.error ?? "The browser did not confirm an application submission.")
     this.name = "BrowserApplicationSubmitError"
     this.statusCode = result.status === "submission_blocked" ? 412 : 409
@@ -25,7 +28,14 @@ export class BrowserApplicationSubmitError extends Error {
       : result.status === "manual"
         ? "browser_manual"
         : "browser_failed"
+    this.objectiveReason = objective ? objectiveManualReason(result) : undefined
   }
+}
+
+function objectiveManualReason(result: HarnessResult): ObjectiveBrowserManualReason | undefined {
+  if (result.status !== "manual") return undefined
+  if (result.error === "No submit button found") return "objective_submit_control_unavailable"
+  return result.error == null ? "objective_submit_confirmation_missing" : undefined
 }
 
 /** Adapts the existing ATS/browser execution to the typed external-write port. */
@@ -39,11 +49,11 @@ export function createBrowserApplicationSubmitProvider(input: {
   const provider: ApplicationSubmitProvider = async ({ target, context, beforeSubmit, objectiveMaterial }) => {
     if (objectiveMaterial) {
       if (!input.runObjective || !input.supportsObjectiveTarget?.(objectiveMaterial.approvedApplyUrl)) {
-        throw new BrowserApplicationSubmitError({ status: "manual", error: "Objective submission route is unavailable.", durationMs: 0 })
+        throw new BrowserApplicationSubmitError({ status: "manual", error: "Objective submission route is unavailable.", durationMs: 0 }, true)
       }
       const result = await input.runObjective({ target: { ...target, applyUrl: objectiveMaterial.approvedApplyUrl },
         material: objectiveMaterial, context, beforeSubmit })
-      if (result.status !== "submitted") throw new BrowserApplicationSubmitError(result)
+      if (result.status !== "submitted") throw new BrowserApplicationSubmitError(result, true)
       return { confirmationId: input.confirmationId, postSubmitUrl: input.postSubmitUrl() }
     }
     const result = await input.run(beforeSubmit)
