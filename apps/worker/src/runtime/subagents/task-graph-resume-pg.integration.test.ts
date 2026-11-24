@@ -73,7 +73,7 @@ import { parseStoredTaskGraphVerificationReport, TASK_GRAPH_EMPTY_ANALYST_VERIFI
 import { hasNoCurrentAttemptTaskGraphToolReceipts } from "./task-graph-empty-analyst-proof.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 // @ts-expect-error Fixture-only JavaScript module has no declaration; Vitest resolves the import at runtime.
-import { objectiveTailorWaveDiagnosticCode, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
+import { objectiveTailorCorrectionReceiptStatus, objectiveTailorWaveDiagnosticCode, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 import type { WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { readTaskGraphConfirmedLocationSteer } from "./task-graph-confirmed-location-steer.js"
@@ -5358,7 +5358,9 @@ async function waitForProcessLine(child: ProcessFixtureChild, prefix: string, ti
 
 const OBJECTIVE_TAILOR_WAVE_DIAGNOSTIC_CODES = new Set([
   "revision_mismatch", "revision_limit", "objective_tailor_wave_not_eligible", "objective_tailor_wave_source_stale",
-  "objective_tailor_wave_stale", "idempotency_conflict", "task_graph_state_missing",
+  "objective_tailor_wave_stale", "idempotency_conflict", "task_graph_state_missing", "objective_tailor_correction_stale",
+  "objective_tailor_correction_source_stale", "task_graph_continuation_budget_required", "objective_tailor_wave_failed",
+  "objective_tailor_wave_receipt_invalid",
 ])
 const OBJECTIVE_TAILOR_WAVE1_MODEL_MARKERS = [
   "GRAPH_CONTEXT_PARSED", "GRAPH_CONTEXT_UNAVAILABLE",
@@ -5386,6 +5388,20 @@ function latestObjectiveTailorMarkerValue(output: readonly string[], prefix: str
   if (!line) return "none"
   const value = line.slice(prefix.length)
   return allowed.has(value) ? value : "other"
+}
+
+function objectiveTailorSlot6ReceiptDiagnostic(output: readonly string[]): RecordValue {
+  const prefix = "TAILOR_CORRECTION_SLOT6_RECEIPT_"
+  const line = [...output].reverse().find(value => value.startsWith(prefix))
+  if (!line) return { status: "none" }
+  const value = line.slice(prefix.length)
+  const denied = /^DENIED ([a-z0-9_]{1,64})$/.exec(value)
+  if (denied) {
+    const code = denied[1]!
+    return { status: "denied", code: OBJECTIVE_TAILOR_MODEL_DIAGNOSTIC_CODES.has(code) ? code : "other" }
+  }
+  const statuses = new Set(["MISSING", "INVALID_REVISION", "INVALID_STATUS", "INVALID_NODES", "INVALID_READY", "ACCEPTED"])
+  return { status: statuses.has(value) ? value.toLowerCase() : "other" }
 }
 
 function objectiveTailorWaveMarkerDiagnostics(output: readonly string[]) {
@@ -5606,6 +5622,7 @@ function projectObjectiveTailorCorrectionWaitSnapshot(
       wave2WaitReady: output.includes("TAILOR_WAVE2_WAIT_READY"),
       wrongFeedbackRejected: output.includes("TAILOR_WRONG_FEEDBACK_REJECTED"),
       correctionSlot2ReceiptAccepted: output.includes("TAILOR_CORRECTION_SLOT2_RECEIPT_ACCEPTED"),
+      correctionSlot6Receipt: objectiveTailorSlot6ReceiptDiagnostic(output),
       correctionsWaitReady: output.includes("TAILOR_CORRECTIONS_WAIT_READY"),
       rootStreamFailed: output.includes("TAILOR_ROOT_STREAM_FAILED"),
     },
@@ -7491,6 +7508,34 @@ describe("persisted TaskGraph wait scope", () => {
 })
 
 describe("compact TaskGraph wait failure diagnostics", () => {
+  it("classifies correction receipts without retaining private error details", () => {
+    const valid = { status: "accepted", revision: 11, nodes: [{}, {}], readyTaskIds: ["ready"] }
+    expect(objectiveTailorCorrectionReceiptStatus(undefined, 10)).toBe("MISSING")
+    expect(objectiveTailorCorrectionReceiptStatus({ error: true, value: { code: "objective_tailor_correction_stale" } }, 10))
+      .toBe("DENIED objective_tailor_correction_stale")
+    expect(objectiveTailorCorrectionReceiptStatus({ error: true, value: { code: "privatedatabasedetail" } }, 10))
+      .toBe("DENIED other")
+    expect(objectiveTailorCorrectionReceiptStatus({ error: false, value: { ...valid, status: "waiting" } }, 10))
+      .toBe("INVALID_STATUS")
+    expect(objectiveTailorCorrectionReceiptStatus({ error: false, value: { ...valid, revision: 12 } }, 10))
+      .toBe("INVALID_REVISION")
+    expect(objectiveTailorCorrectionReceiptStatus({ error: false, value: { ...valid, nodes: [{}] } }, 10))
+      .toBe("INVALID_NODES")
+    expect(objectiveTailorCorrectionReceiptStatus({ error: false, value: { ...valid, readyTaskIds: [] } }, 10))
+      .toBe("INVALID_READY")
+    expect(objectiveTailorCorrectionReceiptStatus({ error: false, value: valid }, 10)).toBe("ACCEPTED")
+
+    const projected = projectObjectiveTailorCorrectionWaitSnapshot(undefined, [
+      "TAILOR_CORRECTION_SLOT6_RECEIPT_DENIED objective_tailor_correction_stale",
+    ])
+    expect(record(projected.stages).correctionSlot6Receipt).toEqual({ status: "denied", code: "objective_tailor_correction_stale" })
+    const privateProjection = projectObjectiveTailorCorrectionWaitSnapshot(undefined, [
+      "TAILOR_CORRECTION_SLOT6_RECEIPT_DENIED privatedatabasedetail",
+    ])
+    expect(record(privateProjection.stages).correctionSlot6Receipt).toEqual({ status: "denied", code: "other" })
+    expect(JSON.stringify(privateProjection)).not.toContain("privatedatabasedetail")
+  })
+
   it("projects correction wait state through fixed statuses, counts, and stage booleans", () => {
     const secretId = "synthetic-private-task-id"
     const projected = projectObjectiveTailorCorrectionWaitSnapshot({

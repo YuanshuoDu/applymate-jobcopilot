@@ -1,7 +1,8 @@
 import { createObjectiveTailorWaveDraftModel, waitForObjectiveTailorWave1WriterGate } from "./objective-tailor-wave-draft.fixture.mjs"
 import { createObjectiveTailorWaveSourceModel, diagnoseObjectiveTailorWaveOne, diagnoseObjectiveTailorWaveOneReceipt,
   diagnoseObjectiveTailorWaveGraph, fixturePhaseReady, fixtureObservation,
-  fixtureToolCalls, fixtureToolResult, objectiveTailorWaveDiagnosticCode, objectiveTailorWaveIdentity, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
+  fixtureToolCalls, fixtureToolResult, objectiveTailorCorrectionReceiptStatus, objectiveTailorWaveDiagnosticCode,
+  objectiveTailorWaveIdentity, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
 
 const WAIT_PREFIX = "p3-1336-", SOURCE_KEYS = ["scout-greenhouse", "scout-lever", "scout-workday", "analyst-greenhouse-a", "analyst-greenhouse-b",
   "analyst-lever", "analyst-workday"]
@@ -134,20 +135,19 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
         return
       }
       if (tailors.length === 5 && !tailors.some(call => call.input?.correctionSlotId === "tailor-6")) {
-        acceptedCorrectionReceipt(request, tailors[4])
-        say("TAILOR_CORRECTION_SLOT2_RECEIPT_ACCEPTED")
+        acceptedCorrectionReceipt(request, tailors[4], say, "SLOT2")
         const graph = currentGraph(request)
         yield* emit(`p3-1336-correct-slot-6:${turnId}`, "agent.tailor", { expectedRevision: graph.revision, correctionSlotId: "tailor-6" })
         return
       }
       if (tailors.length === 6 && !hasPhase(request, "corrections", turnId)) {
-        const first = acceptedCorrectionReceipt(request, tailors[4])
-        const second = acceptedCorrectionReceipt(request, tailors[5])
+        const first = acceptedCorrectionReceipt(request, tailors[4], say, "SLOT2")
+        const second = acceptedCorrectionReceipt(request, tailors[5], say, "SLOT6")
         yield* emitWait(request, "corrections", turnId, [...first.nodes, ...second.nodes].map(node => node.taskId)); return
       }
       if (tailors.length === 6 && hasPhase(request, "corrections", turnId) && !phaseReady(request, "corrections", turnId)) {
-        const first = acceptedCorrectionReceipt(request, tailors[4])
-        const second = acceptedCorrectionReceipt(request, tailors[5])
+        const first = acceptedCorrectionReceipt(request, tailors[4], say, "SLOT2")
+        const second = acceptedCorrectionReceipt(request, tailors[5], say, "SLOT6")
         yield* emitWait(request, "corrections", turnId, [...first.nodes, ...second.nodes].map(node => node.taskId)); return
       }
       if (phaseReady(request, "corrections", turnId)) {
@@ -223,12 +223,11 @@ function acceptedTailorReceipt(request, call, nodeCount) {
     || value.readyTaskIds?.length !== 4) throw new Error("fixture_wave_receipt_invalid")
   return value
 }
-function acceptedCorrectionReceipt(request, call) {
+function acceptedCorrectionReceipt(request, call, say, slot) {
   const result = fixtureToolResult(request, call), value = result?.value
-  const expectedRevision = call.input?.expectedRevision
-  if (!result || result.error || value?.status !== "accepted" || !Number.isSafeInteger(expectedRevision)
-    || value.revision !== expectedRevision + 1
-    || !Array.isArray(value.nodes) || value.nodes.length !== 2 || value.readyTaskIds?.length !== 1) throw new Error("fixture_correction_receipt_invalid")
+  const status = objectiveTailorCorrectionReceiptStatus(result, call.input?.expectedRevision)
+  say(`TAILOR_CORRECTION_${slot}_RECEIPT_${status}`)
+  if (status !== "ACCEPTED") throw new Error("fixture_correction_receipt_invalid")
   return value
 }
 function assertReplayMatches(request, original, replay) {
