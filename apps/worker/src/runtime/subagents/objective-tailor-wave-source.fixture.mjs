@@ -98,6 +98,47 @@ export function fixtureObservation(request, kind) {
   }
   throw new Error("fixture_observation_unavailable")
 }
+
+export function diagnoseObjectiveTailorWaveOne(request, expectedRevision, say) {
+  const matches = Array.isArray(request?.tools) ? request.tools.filter(tool => tool?.name === "agent.tailor") : []
+  say(matches.length === 0 ? "TAILOR_WAVE1_TOOL_ABSENT"
+    : matches.length !== 1 ? "TAILOR_WAVE1_TOOL_AMBIGUOUS"
+      : matches[0]?.version === "2" ? "TAILOR_WAVE1_TOOL_V2" : "TAILOR_WAVE1_TOOL_VERSION_OTHER")
+  let observation
+  try { observation = fixtureObservation(request, "objective_tailor_wave_candidate_catalog") }
+  catch { say("TAILOR_WAVE1_CATALOG_MISSING"); return undefined }
+  const catalog = observation?.catalog
+  if (!catalog || typeof catalog !== "object" || Array.isArray(catalog)
+    || catalog.schemaVersion !== "agent-harness.v2.objective-tailor-wave-catalog.v1"
+    || !Array.isArray(catalog.candidates)) {
+    say("TAILOR_WAVE1_CATALOG_INVALID"); return undefined
+  }
+  const candidateCount = catalog.candidates.length <= 8 ? catalog.candidates.length : "other"
+  say(`TAILOR_WAVE1_CATALOG_CANDIDATES ${candidateCount}`)
+  say(catalog.candidates.length === 8 ? "TAILOR_WAVE1_CATALOG_COUNT_MATCH" : "TAILOR_WAVE1_CATALOG_COUNT_MISMATCH")
+  const revisionMatches = Number.isSafeInteger(catalog.graphRevision) && catalog.graphRevision === expectedRevision
+  say(revisionMatches ? "TAILOR_WAVE1_CATALOG_REVISION_MATCH" : "TAILOR_WAVE1_CATALOG_REVISION_MISMATCH")
+  return matches.length === 1 && matches[0]?.version === "2" && revisionMatches && catalog.candidates.length === 8
+    ? catalog : undefined
+}
+
+export function diagnoseObjectiveTailorWaveOneReceipt(request, call, say) {
+  const result = fixtureToolResult(request, call), value = result?.value
+  if (!result) { say("TAILOR_WAVE1_RECEIPT_INVALID"); return undefined }
+  if (result.error) {
+    const code = value && typeof value === "object" ? value.code : undefined
+    say(new Set(["revision_mismatch", "objective_tailor_wave_source_stale", "objective_tailor_wave_stale",
+      "objective_tailor_wave_not_eligible", "idempotency_conflict"]).has(code)
+      ? "TAILOR_WAVE1_RECEIPT_DENIED" : "TAILOR_WAVE1_RECEIPT_DENIED_OTHER")
+    return undefined
+  }
+  const expectedRevision = call.input?.expectedRevision
+  const accepted = (value?.status === "accepted" || value?.status === "duplicate")
+    && Number.isSafeInteger(expectedRevision) && value.revision === expectedRevision + 1
+    && Array.isArray(value.nodes) && value.nodes.length === 8 && value.readyTaskIds?.length === 4
+  say(accepted ? "TAILOR_WAVE1_RECEIPT_ACCEPTED" : "TAILOR_WAVE1_RECEIPT_INVALID")
+  return accepted ? value : undefined
+}
 export function fixtureAllTasksCompleted(output, taskIds) {
   return Array.isArray(output.tasks) && output.tasks.length === taskIds.length
     && taskIds.every(id => output.tasks.some(task => task?.taskId === id && task.status === "completed"))

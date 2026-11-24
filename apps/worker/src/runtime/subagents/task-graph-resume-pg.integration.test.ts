@@ -5354,15 +5354,93 @@ async function waitForProcessLine(child: ProcessFixtureChild, prefix: string, ti
   throw new Error("Timed out waiting for " + prefix + "; " + processFixtureDiagnostics(child))
 }
 
-async function waitForObjectiveTailorSourceGraph(
+const OBJECTIVE_TAILOR_WAVE_DIAGNOSTIC_CODES = new Set([
+  "revision_mismatch", "revision_limit", "objective_tailor_wave_not_eligible", "objective_tailor_wave_source_stale",
+  "objective_tailor_wave_stale", "idempotency_conflict", "task_graph_state_missing",
+])
+const OBJECTIVE_TAILOR_WAVE1_MODEL_MARKERS = [
+  "TOOL_ABSENT", "TOOL_AMBIGUOUS", "TOOL_VERSION_OTHER", "TOOL_V2", "CATALOG_MISSING", "CATALOG_INVALID",
+  "CATALOG_COUNT_MATCH", "CATALOG_COUNT_MISMATCH", "CATALOG_REVISION_MATCH", "CATALOG_REVISION_MISMATCH",
+  "CANDIDATE_REFS_INVALID", "TOOL_CALL_EMITTED", "RECEIPT_ACCEPTED", "RECEIPT_DENIED", "RECEIPT_DENIED_OTHER",
+  "RECEIPT_INVALID",
+] as const
+
+function objectiveTailorWaveMarkerDiagnostics(output: readonly string[]) {
+  let catalogRead: RecordValue = { status: "none" }
+  let append: RecordValue = { status: "none" }
+  let catalogCandidates: number | "other" | null = null
+  for (let index = output.length - 1; index >= 0; index -= 1) {
+    const line = output[index]
+    const catalog = /^TAILOR_WAVE_CATALOG_READ (1[0-6]|[1-9]) (returned|absent) ([0-8])$/.exec(line ?? "")
+    const catalogFailure = /^TAILOR_WAVE_CATALOG_READ (1[0-6]|[1-9]) failed ([a-z0-9_]{1,64}) 0$/.exec(line ?? "")
+    if (catalog) {
+      catalogRead = { read: Number(catalog[1]), status: catalog[2], count: Number(catalog[3]) }
+      break
+    }
+    if (catalogFailure) {
+      const code = catalogFailure[2]!
+      catalogRead = { read: Number(catalogFailure[1]), status: "failed", count: 0,
+        code: OBJECTIVE_TAILOR_WAVE_DIAGNOSTIC_CODES.has(code) ? code : "other" }
+      break
+    }
+  }
+  for (let index = output.length - 1; index >= 0; index -= 1) {
+    const line = output[index]
+    const receipt = /^TAILOR_WAVE_APPEND (accepted|duplicate|other) ([0-8])$/.exec(line ?? "")
+    const failure = /^TAILOR_WAVE_APPEND failed ([a-z0-9_]{1,64})$/.exec(line ?? "")
+    if (receipt) {
+      append = { status: receipt[1], count: Number(receipt[2]) }
+      break
+    }
+    if (failure) {
+      const code = failure[1]!
+      append = { status: "failed", code: OBJECTIVE_TAILOR_WAVE_DIAGNOSTIC_CODES.has(code) ? code : "other" }
+      break
+    }
+  }
+  for (let index = output.length - 1; index >= 0; index -= 1) {
+    const match = /^TAILOR_WAVE1_CATALOG_CANDIDATES (0|[1-8]|other)$/.exec(output[index] ?? "")
+    if (match) {
+      catalogCandidates = match[1] === "other" ? "other" : Number(match[1])
+      break
+    }
+  }
+  return {
+    waveCatalogRead: catalogRead,
+    waveAppend: append,
+    wave1ModelStages: OBJECTIVE_TAILOR_WAVE1_MODEL_MARKERS.filter(marker => output.includes(`TAILOR_WAVE1 ${marker}`)),
+    wave1CatalogCandidates: catalogCandidates,
+  }
+}
+
+async function waitForObjectiveTailorStage(
   pool: Pool, child: ProcessFixtureChild, owner: Pick<Fixture, "userId" | "sessionId" | "turnId">,
+  stage: "source_graph" | "wave1_writers",
   timeoutMs = 180_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
   let nextReadAt = 0
   let progress: RecordValue = { available: false }
+  const successMarker = stage === "source_graph" ? "TAILOR_SOURCE_GRAPH_READY 7" : "TAILOR_WAVE1_WRITERS_PAUSED 4"
   const failed = (reason: "turn_missing" | "turn_terminal" | "root_terminal" | "worker_exited" | "deadline") => {
-    const markers = ["TAILOR_WAVE_WORKER_READY first", "TAILOR_SOURCE_GRAPH_READY 7", "TAILOR_WAVE1_WRITERS_PAUSED 4"]
+    const markers = [
+      ["TAILOR_WAVE_WORKER_READY first", "worker_ready"],
+      ["TAILOR_ROOT_FACTORY_ENTERED", "factory_entered"],
+      ["TAILOR_ROOT_FACTORY_BOUND", "factory_bound"],
+      ["TAILOR_ROOT_FACTORY_ROOT_UNAVAILABLE", "root_unavailable"],
+      ["TAILOR_ROOT_STREAM_ENTERED", "stream_entered"],
+      ["TAILOR_ROOT_REQUEST_SCOPE_OK", "request_scope_ok"],
+      ["TAILOR_ROOT_INITIAL_PLAN_REQUESTED", "initial_plan_requested"],
+      ["TAILOR_PLAN_FAILED objective_coverage_incomplete", "initial_plan_coverage_rejected"],
+      ["TAILOR_ROOT_SOURCE_WAIT_REQUESTED", "source_wait_requested"],
+      ["TAILOR_ROOT_ANALYST_PLAN_REQUESTED", "analyst_plan_requested"],
+      ["TAILOR_SOURCE_GRAPH_READY 7", "source_graph_ready"],
+      ["TAILOR_WAVE1_WRITERS_PAUSED 4", "wave1_writers_paused"],
+      ["TAILOR_WAVE1_WAIT_READY", "wave1_wait_ready"],
+      ["TAILOR_WAVE1_REPLAY_MATCHED", "wave1_replay_matched"],
+      ...OBJECTIVE_TAILOR_WAVE1_MODEL_MARKERS.map(marker => [`TAILOR_WAVE1 ${marker}`, `wave1_${marker.toLowerCase()}`] as const),
+      ["TAILOR_ROOT_STREAM_FAILED", "root_stream_failed"],
+    ] as const
     const rootStages = [
       ["TAILOR_ROOT_FACTORY_ENTERED", "factory_entered"],
       ["TAILOR_ROOT_FACTORY_BOUND", "factory_bound"],
@@ -5378,38 +5456,53 @@ async function waitForObjectiveTailorSourceGraph(
       const stage = rootStages.find(([marker]) => marker === line)?.[1]
       return stage ? [stage] : []
     })[0] ?? "not_started"
-    throw new Error(`Objective Tailor source stage ${reason}: ${JSON.stringify({
+    const lastKnownStage = [...child.output].reverse().flatMap(line => {
+      const marker = markers.find(([value]) => value === line)?.[1]
+      return marker ? [marker] : []
+    })[0] ?? "not_started"
+    throw new Error(`Objective Tailor ${stage} stage ${reason}: ${JSON.stringify({
       ...progress,
       reason,
       lastRootStage,
+      lastKnownStage,
       workerExited: child.exitCode !== null || child.signalCode !== null,
       stdoutLineCount: child.output.length,
       stderrLineCount: child.errors.length,
-      workerReady: child.output.includes(markers[0]),
+      workerReady: child.output.includes("TAILOR_WAVE_WORKER_READY first"),
       initialPlanCoverageRejected: child.output.includes("TAILOR_PLAN_FAILED objective_coverage_incomplete"),
-      sourceGraphReady: child.output.includes(markers[1]),
-      writersPaused: child.output.includes(markers[2]),
+      sourceGraphReady: child.output.includes("TAILOR_SOURCE_GRAPH_READY 7"),
+      writersPaused: child.output.includes("TAILOR_WAVE1_WRITERS_PAUSED 4"),
+      wave1WaitReady: child.output.includes("TAILOR_WAVE1_WAIT_READY"),
+      wave1ReplayMatched: child.output.includes("TAILOR_WAVE1_REPLAY_MATCHED"),
+      ...objectiveTailorWaveMarkerDiagnostics(child.output),
     })}`)
   }
 
   while (Date.now() < deadline) {
-    if (child.output.includes("TAILOR_SOURCE_GRAPH_READY 7")) return
+    if (child.output.includes(successMarker)) return
     if (child.exitCode !== null || child.signalCode !== null) failed("worker_exited")
     if (Date.now() >= nextReadAt) {
       nextReadAt = Date.now() + 750
       try {
         const result = await pool.query<{
-          turnStatus: string; rootStatus: string | null; rootTaskIdPresent: boolean; rootPresent: boolean; graphPresent: boolean
-          childCount: number; stepCount: number; dispatchCount: number; dispatchPublished: boolean
+          turnStatus: string; rootStatus: string | null; rootTaskIdPresent: boolean; rootPresent: boolean
+          graphRevision: number | null; graphNodeCount: number | null
+          waveMarkerPresent: boolean; waveSourceNodeCount: number | null; waveSlotCount: number | null
+          childCount: number; stepCount: number; writerCount: number; activeWriterCount: number
+          dispatchCount: number; dispatchPublished: boolean
         }>(`SELECT turn."status" AS "turnStatus", root."status" AS "rootStatus", turn."rootTaskId" IS NOT NULL AS "rootTaskIdPresent",
               root."id" IS NOT NULL AS "rootPresent",
-              EXISTS (SELECT 1 FROM "agent_items" AS item WHERE item."sessionId" = turn."sessionId"
-                AND item."turnId" = turn."id" AND item."taskId" = turn."rootTaskId" AND item."type" = 'task_graph') AS "graphPresent",
+              graph."revision" AS "graphRevision",
+              graph."nodeCount" AS "graphNodeCount",
+              graph."markerPresent" AS "waveMarkerPresent",
+              graph."sourceNodeCount" AS "waveSourceNodeCount",
+              graph."slotCount" AS "waveSlotCount",
               (SELECT COUNT(*)::int FROM "sub_agent_tasks" AS childTask WHERE childTask."sessionId" = turn."sessionId"
                 AND childTask."turnId" = turn."id" AND childTask."rootTaskId" = turn."rootTaskId"
                 AND childTask."parentTaskId" = turn."rootTaskId") AS "childCount",
               (SELECT COUNT(*)::int FROM "agent_steps" AS step WHERE step."sessionId" = turn."sessionId"
                 AND step."turnId" = turn."id" AND step."taskId" = turn."rootTaskId") AS "stepCount",
+              writers."writerCount", writers."activeWriterCount",
               (SELECT COUNT(*)::int FROM "agent_outbox" AS dispatch WHERE dispatch."aggregateId" = turn."sessionId"
                 AND dispatch."topic" = 'agent.turn.dispatch' AND dispatch."idempotencyKey" = 'turn-dispatch:' || turn."id") AS "dispatchCount",
               EXISTS (SELECT 1 FROM "agent_outbox" AS dispatch WHERE dispatch."aggregateId" = turn."sessionId"
@@ -5420,6 +5513,28 @@ async function waitForObjectiveTailorSourceGraph(
             LEFT JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
               AND root."turnId" = turn."id" AND root."rootTaskId" = root."id" AND root."parentTaskId" IS NULL
               AND root."role" = 'orchestrator' AND root."taskType" = 'root'
+            LEFT JOIN LATERAL (
+              SELECT item."revision",
+                CASE WHEN jsonb_typeof(item."content"->'nodes') = 'array'
+                  THEN jsonb_array_length(item."content"->'nodes') ELSE NULL END AS "nodeCount",
+                COALESCE(jsonb_typeof(item."content"->'objectiveTailorWave') = 'object', FALSE) AS "markerPresent",
+                CASE WHEN jsonb_typeof(item."content"->'objectiveTailorWave'->'sourceNodeCount') = 'number'
+                  AND item."content"->'objectiveTailorWave'->>'sourceNodeCount' ~ '^[0-9]{1,2}$'
+                  THEN (item."content"->'objectiveTailorWave'->>'sourceNodeCount')::int ELSE NULL END AS "sourceNodeCount",
+                CASE WHEN jsonb_typeof(item."content"->'objectiveTailorWave'->'slots') = 'array'
+                  THEN jsonb_array_length(item."content"->'objectiveTailorWave'->'slots') ELSE NULL END AS "slotCount"
+              FROM "agent_items" AS item WHERE item."sessionId" = turn."sessionId" AND item."turnId" = turn."id"
+                AND item."taskId" = turn."rootTaskId" AND item."type" = 'task_graph'
+              ORDER BY item."revision" DESC LIMIT 1
+            ) AS graph ON TRUE
+            LEFT JOIN LATERAL (
+              SELECT COUNT(*) FILTER (WHERE childTask."role" = 'writer')::int AS "writerCount",
+                COUNT(*) FILTER (WHERE childTask."role" = 'writer' AND childTask."status" = 'running'
+                  AND childTask."leaseOwner" IS NOT NULL AND childTask."leaseExpiresAt" > clock_timestamp())::int AS "activeWriterCount"
+              FROM "sub_agent_tasks" AS childTask WHERE childTask."sessionId" = turn."sessionId"
+                AND childTask."turnId" = turn."id" AND childTask."rootTaskId" = turn."rootTaskId"
+                AND childTask."parentTaskId" = turn."rootTaskId"
+            ) AS writers ON TRUE
             WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND session."userId" = $3`,
         [owner.turnId, owner.sessionId, owner.userId])
         const row = result.rows.length === 1 ? result.rows[0] : undefined
@@ -5429,9 +5544,16 @@ async function waitForObjectiveTailorSourceGraph(
           rootStatus: row.rootStatus === null ? "missing" : diagnosticEnum(row.rootStatus, TASK_DIAGNOSTIC_STATUSES) ?? "other",
           rootTaskIdPresent: row.rootTaskIdPresent,
           rootPresent: row.rootPresent,
-          graphPresent: row.graphPresent,
+          graphPresent: row.graphRevision !== null,
+          graphRevision: row.graphRevision === null ? null : diagnosticBoundedCount(row.graphRevision),
+          graphNodeCount: row.graphNodeCount === null ? null : diagnosticBoundedCount(row.graphNodeCount),
+          waveMarkerPresent: row.waveMarkerPresent,
+          waveSourceNodeCount: row.waveSourceNodeCount === null ? null : diagnosticBoundedCount(row.waveSourceNodeCount),
+          waveSlotCount: row.waveSlotCount === null ? null : diagnosticBoundedCount(row.waveSlotCount),
           childCount: diagnosticBoundedCount(row.childCount),
           stepCount: diagnosticBoundedCount(row.stepCount),
+          writerCount: diagnosticBoundedCount(row.writerCount),
+          activeWriterCount: diagnosticBoundedCount(row.activeWriterCount),
           dispatchCount: diagnosticBoundedCount(row.dispatchCount),
           dispatchPublished: row.dispatchPublished,
         } : { available: true, turnPresent: false }
@@ -21207,8 +21329,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
 
       firstWorker = startObjectiveTailorWaveWorker("first", value)
       await waitForProcessLine(firstWorker, "TAILOR_WAVE_WORKER_READY first", 60_000)
-      await waitForObjectiveTailorSourceGraph(pool!, firstWorker, value)
-      await waitForProcessLine(firstWorker, "TAILOR_WAVE1_WRITERS_PAUSED 4", 180_000)
+      await waitForObjectiveTailorStage(pool!, firstWorker, value, "source_graph")
+      await waitForObjectiveTailorStage(pool!, firstWorker, value, "wave1_writers")
       const ordinaryPlanRejected = await waitForProcessLine(firstWorker, "TAILOR_ORDINARY_PLAN_REJECTED ", 120_000)
       const ordinaryPlanRevision = /^TAILOR_ORDINARY_PLAN_REJECTED ([1-9][0-9]*)$/.exec(ordinaryPlanRejected)?.[1]
       expect(ordinaryPlanRevision).toBeDefined()

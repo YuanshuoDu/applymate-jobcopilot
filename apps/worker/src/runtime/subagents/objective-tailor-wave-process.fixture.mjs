@@ -103,6 +103,34 @@ async function run() {
     return models.rootModel({ ...input, state: { ...input.state, rootTaskId } })
   }
   const commandPort = graph.createPgTaskGraphCommandPort(pool)
+  let catalogReads = 0, waveAppendObserved = false
+  const diagnosticCommandPort = {
+    ...commandPort,
+    async readObjectiveTailorWaveCatalog(readScope) {
+      const read = ++catalogReads
+      try {
+        const catalog = await commandPort.readObjectiveTailorWaveCatalog(readScope)
+        if (read <= 16) say(`TAILOR_WAVE_CATALOG_READ ${read} ${catalog ? "returned" : "absent"} ${boundedCount(catalog?.candidates?.length, 8)}`)
+        return catalog
+      } catch (error) {
+        if (read <= 16) say(`TAILOR_WAVE_CATALOG_READ ${read} failed ${diagnosticCode(error)} 0`)
+        throw error
+      }
+    },
+    async appendObjectiveTailorWave(input) {
+      if (waveAppendObserved) return commandPort.appendObjectiveTailorWave(input)
+      waveAppendObserved = true
+      try {
+        const receipt = await commandPort.appendObjectiveTailorWave(input)
+        const status = receipt?.status === "accepted" || receipt?.status === "duplicate" ? receipt.status : "other"
+        say(`TAILOR_WAVE_APPEND ${status} ${boundedCount(receipt?.nodes?.length, 8)}`)
+        return receipt
+      } catch (error) {
+        say(`TAILOR_WAVE_APPEND failed ${diagnosticCode(error)}`)
+        throw error
+      }
+    },
+  }
   const authorizeUsage = async () => ({ outputReservationRequired: false, maxOutputTokens: null,
     settle: async () => undefined, settleUnknown: async () => undefined })
   const productionFlags = flags.resolveProductionAgentFlags()
@@ -113,7 +141,7 @@ async function run() {
     createOptionalProductionChildExecutor: options => options.enabled ? child.createOptionalProductionChildExecutor({ ...options,
       authorizeUsage, modelRuntimeFactory: models.childModel }) : undefined,
     createCanonicalTurnRuntime: (runtimePool, productionOptions) => runtime.createCanonicalTurnRuntime(runtimePool, {
-      ...productionOptions, ...templates.taskGraphRuntimeOptions(commandPort), modelRuntimeFactory: rootModelFactory, authorizeUsage,
+      ...productionOptions, ...templates.taskGraphRuntimeOptions(diagnosticCommandPort), modelRuntimeFactory: rootModelFactory, authorizeUsage,
     }),
     createWorkerUsageAuthorizer: () => authorizeUsage,
     createCanonicalExecutionProjection: execution.createCanonicalExecutionProjection,
@@ -134,6 +162,17 @@ async function run() {
   }
   say(`TAILOR_WAVE_WORKER_READY ${mode}`)
   await shutdown
+}
+
+function boundedCount(value, maximum) {
+  return Number.isSafeInteger(value) && value >= 0 ? Math.min(value, maximum) : 0
+}
+function diagnosticCode(error) {
+  if (!(error instanceof Error)) return "other"
+  const allowed = new Set(["revision_mismatch", "revision_limit", "objective_tailor_wave_not_eligible",
+    "objective_tailor_wave_source_stale", "objective_tailor_wave_stale", "idempotency_conflict", "task_graph_state_missing"])
+  const code = Object.getOwnPropertyDescriptor(error, "code")?.value
+  return allowed.has(code) ? code : "other"
 }
 
 run().catch(async () => {

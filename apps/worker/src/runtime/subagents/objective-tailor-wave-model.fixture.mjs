@@ -1,9 +1,8 @@
 import { createObjectiveTailorWaveDraftModel } from "./objective-tailor-wave-draft.fixture.mjs"
-import { createObjectiveTailorWaveSourceModel, fixtureAllTasksCompleted, fixtureObservation, fixtureToolCalls, fixtureToolResult, sourcePlan }
-  from "./objective-tailor-wave-source.fixture.mjs"
+import { createObjectiveTailorWaveSourceModel, diagnoseObjectiveTailorWaveOne, diagnoseObjectiveTailorWaveOneReceipt,
+  fixtureAllTasksCompleted, fixtureObservation, fixtureToolCalls, fixtureToolResult, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
 
-const WAIT_PREFIX = "p3-1336-"
-const SOURCE_KEYS = ["scout-greenhouse", "scout-lever", "scout-workday", "analyst-greenhouse-a", "analyst-greenhouse-b",
+const WAIT_PREFIX = "p3-1336-", SOURCE_KEYS = ["scout-greenhouse", "scout-lever", "scout-workday", "analyst-greenhouse-a", "analyst-greenhouse-b",
   "analyst-lever", "analyst-workday"]
 const ANALYST_KEYS = SOURCE_KEYS.filter(key => key.startsWith("analyst-"))
 const MODEL_PROFILE = { provider: "fixture", model: "objective-tailor-wave", nativeTools: true, structuredOutput: true,
@@ -54,9 +53,10 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
           yield* emitWait(request, "wave-analyst", turnId, analysts); return
         }
         say("TAILOR_SOURCE_GRAPH_READY 7")
-        yield* emitWave(turnId, "wave1", request, 4); return
+        yield* emitWave(turnId, "wave1", request, 4, say); return
       }
       if (tailors.length === 1 && !plans.some(call => call.id === `p3-1336-ordinary-plan:${turnId}`)) {
+        diagnoseObjectiveTailorWaveOneReceipt(request, tailors[0], say)
         const wave = acceptedTailorReceipt(request, tailors[0], 8)
         wave1Identity = sourceAndSlotIdentity(currentGraph(request))
         if (!wave1Identity) throw new Error("fixture_wave1_identity_unavailable")
@@ -90,7 +90,7 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
       if (tailors.length === 2 && phaseReady(request, "wave1", turnId)) {
         assertReplayMatches(request, tailors[0], tailors[1])
         say("TAILOR_WAVE1_REPLAY_MATCHED")
-        yield* emitWave(turnId, "wave2", request, 4); return
+        yield* emitWave(turnId, "wave2", request, 4, say); return
       }
       if (tailors.length === 3 && !hasPhase(request, "wave2", turnId)) {
         const wave = acceptedTailorReceipt(request, tailors[2], 8)
@@ -151,13 +151,19 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
   }
   return { rootModel, childModel }
 }
-
-function emitWave(turnId, phase, sourceRequest, count) {
-  const catalog = waveCatalog(sourceRequest), graph = currentGraph(sourceRequest), tool = sourceRequest.tools?.find(value => value?.name === "agent.tailor")
+function emitWave(turnId, phase, sourceRequest, count, say) {
+  const graph = currentGraph(sourceRequest)
+  const catalog = phase === "wave1" ? diagnoseObjectiveTailorWaveOne(sourceRequest, graph.revision, say)
+    : fixtureObservation(sourceRequest, "objective_tailor_wave_candidate_catalog")?.catalog
+  const tool = sourceRequest.tools?.find(value => value?.name === "agent.tailor")
   if (!catalog || catalog.graphRevision !== graph.revision || catalog.candidates.length !== (phase === "wave1" ? 8 : 4)
     || tool?.version !== "2") throw new Error("fixture_wave_catalog_unavailable")
   const candidateRefs = catalog.candidates.slice(0, count).map(value => value.candidateRef)
-  if (candidateRefs.length !== count || new Set(candidateRefs).size !== count) throw new Error("fixture_wave_candidates_invalid")
+  if (candidateRefs.length !== count || new Set(candidateRefs).size !== count) {
+    if (phase === "wave1") say("TAILOR_WAVE1_CANDIDATE_REFS_INVALID")
+    throw new Error("fixture_wave_candidates_invalid")
+  }
+  if (phase === "wave1") say("TAILOR_WAVE1_TOOL_CALL_EMITTED")
   return emit(`p3-1336-${phase}:${turnId}`, "agent.tailor", { expectedRevision: graph.revision, candidateRefs })
 }
 function emitWaveReplay(request, turnId, prior) {
@@ -223,7 +229,6 @@ function assertReplayMatches(request, original, replay) {
   if (duplicate.status !== "duplicate" || JSON.stringify(first.nodes) !== JSON.stringify(duplicate.nodes)
     || JSON.stringify(first.readyTaskIds) !== JSON.stringify(duplicate.readyTaskIds)) throw new Error("fixture_wave_replay_identity_mismatch")
 }
-function waveCatalog(request) { return fixtureObservation(request, "objective_tailor_wave_candidate_catalog")?.catalog }
 function currentGraph(request) { return fixtureObservation(request, "task_graph_current") }
 function graphKeys(graph) { return Array.isArray(graph.nodes) ? graph.nodes.map(node => node?.key).filter(key => typeof key === "string") : [] }
 function sourceAndSlotIdentity(graph) {
