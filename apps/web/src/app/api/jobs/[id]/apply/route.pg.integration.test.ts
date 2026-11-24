@@ -86,7 +86,8 @@ integration('manual application record concurrency with PostgreSQL', () => {
       "workflowState" "${schema}"."JobWorkflowState" NOT NULL DEFAULT 'draft',
       "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
       "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      "finalResumeId" TEXT, "finalCoverLetterId" TEXT
+      "finalResumeId" TEXT, "finalCoverLetterId" TEXT,
+      "finalResumeAssignmentRevision" INTEGER NOT NULL DEFAULT 0
     )`)
     await clientA.$executeRawUnsafe(`CREATE TABLE "${schema}"."Activity" (
       "id" TEXT PRIMARY KEY, "userId" TEXT NOT NULL, "jobId" TEXT,
