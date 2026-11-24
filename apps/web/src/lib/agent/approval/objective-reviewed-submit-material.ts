@@ -49,7 +49,7 @@ export async function resolveObjectiveReviewedSubmitMaterial(
     if (!sameTask(task, input) || turn.id !== input.fillTurnId || turn.userId !== input.userId || turn.sessionId !== input.sessionId
       || turn.source !== "user" || turn.status !== "waiting_for_approval" || turn.executionMode !== "canonical_task_graph"
       || !validDate(turn.createdAt) || !turn.rootTaskId || turn.rootTaskId.trim() !== turn.rootTaskId
-      || task.status !== "waiting_for_authorization" || task.checkpoint !== "form_filled") return null
+      || task.status !== "waiting_for_authorization" || !["form_filled", "queue_retry"].includes(task.checkpoint ?? "")) return null
     const source = parseObjectiveReviewedFillSource(turn.input)
     if (!source) return null
     const binding = await readBrowserBinding(client, input, task, turn)

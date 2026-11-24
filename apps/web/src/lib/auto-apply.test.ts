@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   txTaskEventFindFirst: vi.fn(),
   txTaskEventCreate: vi.fn(),
   outboxFindUnique: vi.fn(),
+  txOutboxFindMany: vi.fn(),
   outboxCreate: vi.fn(),
   txActivityCreate: vi.fn(),
   taskUpdate: vi.fn(),
@@ -34,6 +35,7 @@ const mocks = vi.hoisted(() => ({
   startApplicationFillForReview: vi.fn(),
   reviewedSubmitMaterial: vi.fn(),
   lockAndRereadReviewedSubmitMaterial: vi.fn(),
+  objectiveSubmitReplay: vi.fn(),
 }));
 let transactionClient: unknown;
 
@@ -59,6 +61,9 @@ vi.mock("@/lib/agent/approval/reviewed-submit-material", async importOriginal =>
   ...(await importOriginal<typeof import("@/lib/agent/approval/reviewed-submit-material")>()),
   resolveReviewedSubmitMaterial: mocks.reviewedSubmitMaterial,
   lockAndRereadReviewedSubmitMaterial: mocks.lockAndRereadReviewedSubmitMaterial,
+}));
+vi.mock("@/lib/agent/approval/objective-submit-approval-replay", () => ({
+  readObjectiveSubmitApprovalReplay: mocks.objectiveSubmitReplay,
 }));
 vi.mock("@/lib/runtime-feature-flags", () => ({ isRuntimeFeatureEnabled: mocks.runtimeFeatureEnabled }));
 vi.mock("@/lib/entitlements", () => ({ hasEffectiveEntitlement: mocks.hasEffectiveEntitlement, isFeatureAllowed: mocks.isFeatureAllowed, resolveAiAccess: mocks.resolveAiAccess }));
@@ -116,6 +121,7 @@ describe("auto-apply authorization", () => {
     mocks.txTaskFindFirst.mockResolvedValue({ status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: null, resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null, question: null });
     mocks.txTaskEventFindMany.mockResolvedValue([]);
     mocks.txTaskEventFindFirst.mockResolvedValue(null);
+    mocks.txOutboxFindMany.mockResolvedValue([]);
     mocks.resumeFindFirst.mockResolvedValue({ id: "resume_1" });
     mocks.coverLetterFindFirst.mockResolvedValue({ id: "cover_1" });
     mocks.jobFindFirst.mockResolvedValue({
@@ -133,7 +139,7 @@ describe("auto-apply authorization", () => {
       coverLetter: { findFirst: mocks.coverLetterFindFirst },
       job: { updateMany: mocks.jobUpdateMany },
       applicationTaskEvent: { findMany: mocks.txTaskEventFindMany, findFirst: mocks.txTaskEventFindFirst, create: mocks.txTaskEventCreate },
-      agentOutbox: { findUnique: mocks.outboxFindUnique, create: mocks.outboxCreate },
+      agentOutbox: { findUnique: mocks.outboxFindUnique, findMany: mocks.txOutboxFindMany, create: mocks.outboxCreate },
       activity: { create: mocks.txActivityCreate },
       $queryRaw: mocks.approvalLock,
     };
@@ -162,6 +168,7 @@ describe("auto-apply authorization", () => {
     mocks.startApplicationFillForReview.mockResolvedValue({ inputId: "input_1", turnId: "turn_fill_1", sequence: "1", disposition: "started" });
     mocks.reviewedSubmitMaterial.mockResolvedValue({ mode: "legacy" });
     mocks.lockAndRereadReviewedSubmitMaterial.mockImplementation(async (_tx, _scope, proof) => proof.mode !== "unavailable");
+    mocks.objectiveSubmitReplay.mockResolvedValue({ kind: "not_objective" });
     vi.stubEnv("ENABLE_APPLICATION_FILL_TASKGRAPH", "0");
   });
 
@@ -481,6 +488,10 @@ describe("auto-apply authorization", () => {
 
   it("resumes a queue_retry only with the exact unexpired approved receipt and no committed intent", async () => {
     const { queueAutonomousApplication } = await import("./auto-apply");
+    mocks.objectiveSubmitReplay.mockResolvedValue({ kind: "retryable" });
+    mocks.taskFindFirst.mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: "turn_1", fillTurnSessionId: "session_1",
+      fillTurnUserId: "user_1", workerTaskId: null, status: "waiting_for_authorization", checkpoint: "queue_retry",
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
     mocks.txTaskFindFirst.mockResolvedValueOnce({ status: "waiting_for_authorization", checkpoint: "queue_retry", workerTaskId: null,
       resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null, question: null });
 
@@ -489,10 +500,15 @@ describe("auto-apply authorization", () => {
     expect(result.taskId).toMatch(/^apply-submit-[a-f0-9]{64}$/);
     expect(mocks.txTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ checkpoint: "queue_retry" }) }));
     expect(mocks.outboxFindUnique).toHaveBeenCalledWith(expect.objectContaining({ where: { idempotencyKey: expect.any(String) } }));
-    expect(mocks.txTaskEventFindFirst).toHaveBeenCalledWith({ where: { taskId: input.applicationTaskId, type: "submission_queued", AND: [
-      { data: { path: ["workerTaskId"], equals: expect.stringMatching(/^apply-submit-/) } },
-      { data: { path: ["fillTurnId"], equals: "turn_1" } }, { data: { path: ["receiptId"], equals: "approval_1" } },
-    ] }, select: { id: true } });
+    expect(mocks.txOutboxFindMany).toHaveBeenCalledWith({ where: { topic: "application.submit.dispatch", aggregateId: "session_1", AND: [
+      { payload: { path: ["applicationTaskId"], equals: input.applicationTaskId } },
+      { payload: { path: ["fillTurnId"], equals: "turn_1" } },
+    ] }, take: 2, select: { id: true } });
+    expect(mocks.txTaskEventFindFirst).toHaveBeenCalledWith({ where: { taskId: input.applicationTaskId,
+      type: "submission_queued", data: { path: ["fillTurnId"], equals: "turn_1" } }, select: { id: true } });
+    expect(mocks.txTaskEventFindFirst).toHaveBeenCalledWith({ where: { taskId: input.applicationTaskId,
+      type: { in: ["submission_execution_started", "submission_execution_settled"] },
+      data: { path: ["fillTurnId"], equals: "turn_1" } }, select: { id: true } });
     expect(mocks.txTaskEventCreate.mock.calls[0]?.[0]?.data?.data).toMatchObject({ receiptId: "approval_1" });
     expect(mocks.txTaskEventCreate).toHaveBeenCalledTimes(1);
     expect(mocks.outboxCreate).toHaveBeenCalledTimes(1);
@@ -500,8 +516,67 @@ describe("auto-apply authorization", () => {
     mocks.txTaskFindFirst.mockResolvedValueOnce({ status: "waiting_for_authorization", checkpoint: "queue_retry", workerTaskId: null,
       resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null, question: null });
     mocks.outboxFindUnique.mockResolvedValueOnce(null);
-    mocks.txTaskEventFindFirst.mockResolvedValueOnce({ id: "already-queued-event" });
+    mocks.txTaskEventFindFirst.mockResolvedValueOnce({ id: "already-queued-event", data: { fillTurnId: "turn_1",
+      workerTaskId: "different-attempt", receiptId: "different-receipt" } });
     await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("no longer ready");
+  });
+
+  it("does not retry an Objective intent when any scoped queued event or outbox exists", async () => {
+    const { queueAutonomousApplication } = await import("./auto-apply");
+    mocks.objectiveSubmitReplay.mockResolvedValue({ kind: "retryable" });
+    mocks.taskFindFirst.mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: "turn_1", fillTurnSessionId: "session_1",
+      fillTurnUserId: "user_1", workerTaskId: null, status: "waiting_for_authorization", checkpoint: "queue_retry",
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
+    mocks.txTaskFindFirst.mockResolvedValueOnce({ status: "waiting_for_authorization", checkpoint: "queue_retry", workerTaskId: null,
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null, question: null });
+    mocks.txOutboxFindMany.mockResolvedValueOnce([{ id: "other-scoped-attempt" }]);
+
+    await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("no longer ready");
+    expect(mocks.txOutboxFindMany).toHaveBeenCalledOnce();
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a concurrent worker claim", { status: "waiting_for_authorization", checkpoint: "queue_retry", workerTaskId: "other-worker" }],
+    ["a changed checkpoint", { status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: null }],
+  ])("does not overwrite %s after the unlocked Objective retry probe", async (_name, lockedState) => {
+    const { queueAutonomousApplication } = await import("./auto-apply");
+    mocks.objectiveSubmitReplay.mockResolvedValue({ kind: "retryable" });
+    mocks.taskFindFirst.mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: "turn_1", fillTurnSessionId: "session_1",
+      fillTurnUserId: "user_1", workerTaskId: null, status: "waiting_for_authorization", checkpoint: "queue_retry",
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
+    mocks.txTaskFindFirst.mockResolvedValueOnce({ ...lockedState, resumeId: "resume_1", coverLetterId: null,
+      confirmedAnswers: null, question: null });
+
+    await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("no longer ready");
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.txOutboxFindMany).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+  });
+
+  it("acknowledges an exact accepted Objective intent without rereading current materials or writing", async () => {
+    const { queueAutonomousApplication } = await import("./auto-apply");
+    mocks.objectiveSubmitReplay.mockResolvedValue({ kind: "committed", taskId: "apply-submit-existing" });
+
+    await expect(queueAutonomousApplication({ ...input, replayOnly: true })).resolves.toEqual({ taskId: "apply-submit-existing" });
+    expect(mocks.reviewedSubmitMaterial).not.toHaveBeenCalled();
+    expect(mocks.lockAndRereadReviewedSubmitMaterial).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("does not let a replay-only V3 request create an intent from form_filled", async () => {
+    const { queueAutonomousApplication } = await import("./auto-apply");
+    mocks.objectiveSubmitReplay.mockResolvedValue({ kind: "invalid" });
+
+    await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("existing submission intent");
+    expect(mocks.reviewedSubmitMaterial).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
   });
 
   it("refuses queue_retry when a matching intent is already persisted or material changed", async () => {

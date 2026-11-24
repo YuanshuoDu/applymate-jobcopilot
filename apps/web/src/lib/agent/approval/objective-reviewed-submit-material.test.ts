@@ -98,6 +98,14 @@ describe("Objective reviewed submit material", () => {
     expect(JSON.stringify(actual)).not.toMatch(/resume-1|letter-1|source-turn-1|cover-artifact-1/)
   })
 
+  it("revalidates a queue_retry with the same current Objective proof", async () => {
+    const state = await fixture()
+    state.task.checkpoint = "queue_retry"
+
+    await expect(resolveObjectiveReviewedSubmitMaterial(state.client as never, input, state.task, state.turn,
+      state.verifyReceipt)).resolves.toEqual(state.expected)
+  })
+
   it.each(["duplicate manifest", "manifest hash drift", "browser proof mismatch", "foreign scope", "future review decision",
     "lease expired before browser start", "cover letter binding drift"])(
     "rejects %s without using another material path", async mode => {

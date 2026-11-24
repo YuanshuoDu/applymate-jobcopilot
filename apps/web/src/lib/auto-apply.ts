@@ -3,6 +3,7 @@ import { Prisma } from "@prisma/client";
 import { hashAgentReceiptValue, matchesApplyTaskSubmitPayload, reviewedFillHandoffIdempotencyKey, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
 import { createSubmitIntent, isReplayableSubmitState, resolveExistingSubmitIntent } from "@/lib/apply-queue-client";
 import { lockAndRereadReviewedSubmitMaterial, replayReceiptScopeMatches, resolveReviewedSubmitMaterial, submitMaterialHashesMatch } from "@/lib/agent/approval/reviewed-submit-material";
+import { readObjectiveSubmitApprovalReplay } from "@/lib/agent/approval/objective-submit-approval-replay";
 import { AgentCommandService } from '@/lib/agent/control-plane/commands/agent-command-service'
 import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
 import { applicationFillTaskGraphEnabled, asRecord, assertActiveAccount, assertJobPreflight, assertUnattendedApplyEnabled, AutoApplyError, validateAutoApplyUrl } from "./auto-apply-guards";
@@ -87,23 +88,26 @@ export async function queueAutonomousApplication(input: {
       id: input.approvalId, userId: input.userId, type: "submit_application",
       status: input.replayOnly ? { in: ["approved", "consumed"] } : "approved",
     },
-    select: { id: true, status: true, payload: true, sessionId: true, taskId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true, scopeHash: true, nonceHash: true, resourceHash: true, materialHash: true, answersHash: true },
+    select: { id: true, status: true, payload: true, sessionId: true, taskId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true, decidedAt: true, scopeHash: true, nonceHash: true, resourceHash: true, materialHash: true, answersHash: true },
   });
   const payload = asRecord(approval?.payload);
   const taskSnapshot = await db.applicationTask.findFirst({
     where: { id: input.applicationTaskId, userId: input.userId, jobId: input.jobId },
-    select: { sessionId: true, fillTurnId: true, workerTaskId: true, resumeId: true, coverLetterId: true, confirmedAnswers: true },
+    select: { sessionId: true, fillTurnId: true, fillTurnSessionId: true, fillTurnUserId: true, workerTaskId: true,
+      status: true, checkpoint: true, resumeId: true, coverLetterId: true, confirmedAnswers: true },
   });
-  const material = {
-    applicationTaskId: input.applicationTaskId,
-    jobId: input.jobId,
-    resumeId: taskSnapshot?.resumeId ?? null,
-    coverLetterId: taskSnapshot?.coverLetterId ?? null,
-  };
-  const snapshotMaterialHash = await hashAgentReceiptValue("material", material);
-  const snapshotAnswersHash = await hashAgentReceiptValue("answers", taskSnapshot?.confirmedAnswers ?? null);
   const reviewedInput = { userId: input.userId, sessionId: taskSnapshot?.sessionId ?? "", applicationTaskId: input.applicationTaskId,
     jobId: input.jobId, fillTurnId: taskSnapshot?.fillTurnId ?? "", approvalId: input.approvalId, receiptNonce: input.receiptNonce ?? "" };
+  const replayProbe = input.replayOnly ? await readObjectiveSubmitApprovalReplay(db, { ...reviewedInput,
+    task: taskSnapshot ? { id: input.applicationTaskId, userId: input.userId, jobId: input.jobId, ...taskSnapshot } : null, approval })
+    : { kind: "not_objective" as const };
+  if (replayProbe.kind === "committed") return { taskId: replayProbe.taskId };
+  if (replayProbe.kind === "invalid") throw new AutoApplyError("The existing submission intent could not be resolved.");
+  const objectiveRetry = replayProbe.kind === "retryable";
+  const material = { applicationTaskId: input.applicationTaskId, jobId: input.jobId,
+    resumeId: taskSnapshot?.resumeId ?? null, coverLetterId: taskSnapshot?.coverLetterId ?? null };
+  const snapshotMaterialHash = await hashAgentReceiptValue("material", material);
+  const snapshotAnswersHash = await hashAgentReceiptValue("answers", taskSnapshot?.confirmedAnswers ?? null);
   const materialProof = await resolveReviewedSubmitMaterial(db, reviewedInput);
   const replayReceiptValid = !input.replayOnly || Boolean(approval && await replayReceiptScopeMatches(approval, reviewedInput));
   if (!approval || !taskSnapshot?.sessionId || !taskSnapshot.fillTurnId ||
@@ -138,7 +142,7 @@ export async function queueAutonomousApplication(input: {
   const intent = createSubmitIntent(submitPayload);
 
   try {
-    if (!input.replayOnly) requireLegacyPolicy({
+    if (!input.replayOnly || objectiveRetry) requireLegacyPolicy({
       userId: input.userId, sessionId: receiptSessionId, turnId: approval.turnId,
       stepId: `submit:${input.applicationTaskId}`, toolCallId: approval.toolCallId, toolName: "application.submit",
       domain: "application", risk: "external_write", capabilities: ["read", "write", "external_write"],
@@ -169,16 +173,23 @@ export async function queueAutonomousApplication(input: {
       if (!isReplayableSubmitState(current.status, current.checkpoint)) return false;
       return resolveExistingSubmitIntent(tx, intent);
     }
+    if (objectiveRetry && (current.workerTaskId !== null || current.checkpoint !== "queue_retry")) return false;
     if (input.replayOnly && approval.status !== "approved") return false;
     if (current.status !== "waiting_for_authorization" || !["form_filled", "queue_retry"].includes(current.checkpoint ?? "") || !current.resumeId || current.question !== null) return false;
     if (current.checkpoint === "queue_retry") {
       if (!input.replayOnly || approval.status !== "approved" || !approval.expiresAt || approval.expiresAt <= new Date()) return false;
-      const [outbox, queuedEvent] = await Promise.all([tx.agentOutbox.findUnique({ where: { idempotencyKey: intent.idempotencyKey } }),
-        tx.applicationTaskEvent.findFirst({ where: { taskId: input.applicationTaskId, type: "submission_queued", AND: [
+      const [outbox, scopedOutboxes, queuedEvent, startedEvent] = await Promise.all([tx.agentOutbox.findUnique({ where: { idempotencyKey: intent.idempotencyKey } }),
+        objectiveRetry ? tx.agentOutbox.findMany({ where: { topic: intent.topic, aggregateId: receiptSessionId, AND: [
+          { payload: { path: ["applicationTaskId"], equals: input.applicationTaskId } }, { payload: { path: ["fillTurnId"], equals: fillTurnId } },
+        ] }, take: 2, select: { id: true } }) : Promise.resolve([]),
+        tx.applicationTaskEvent.findFirst({ where: { taskId: input.applicationTaskId, type: "submission_queued", ...(objectiveRetry
+          ? { data: { path: ["fillTurnId"], equals: fillTurnId } } : { AND: [
           { data: { path: ["workerTaskId"], equals: intent.payload.workerTaskId } }, { data: { path: ["fillTurnId"], equals: fillTurnId } },
           { data: { path: ["receiptId"], equals: approval.id } },
-        ] }, select: { id: true } })]);
-      if (outbox || queuedEvent) return false;
+        ] }) }, select: { id: true } }), objectiveRetry ? tx.applicationTaskEvent.findFirst({ where: { taskId: input.applicationTaskId,
+          type: { in: ["submission_execution_started", "submission_execution_settled"] }, data: { path: ["fillTurnId"], equals: fillTurnId } },
+        select: { id: true } }) : Promise.resolve(null)]);
+      if (outbox || scopedOutboxes.length || queuedEvent || startedEvent) return false;
     }
 
     const lockedApproval = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
