@@ -1655,6 +1655,62 @@ async function waitForReviewedApplicationTask(jobId: string, predicate: (task: A
   throw new Error(`Reviewed ApplicationTask did not reach the expected state; status=${latest?.status ?? "missing"}; checkpoint=${latest?.checkpoint ?? "missing"}`)
 }
 
+async function objectiveSubmitTimeoutSnapshot(input: {
+  sessionId: string; jobId: string; applicationTaskId: string; fillTurnId: string; approvalId: string
+  constraintHash: string; workerTaskId: string; slotOrdinal: number; routeGetBaseline: number
+}) {
+  try {
+    const [task, approval, starts, stats] = await Promise.all([
+      testDb.applicationTask.findFirst({ where: { id: input.applicationTaskId, userId: ids.user,
+        sessionId: input.sessionId, jobId: input.jobId, fillTurnId: input.fillTurnId } }),
+      testDb.agentApproval.findFirst({ where: { id: input.approvalId, userId: ids.user, sessionId: input.sessionId,
+        turnId: input.fillTurnId, taskId: input.applicationTaskId, jobId: input.jobId, type: "submit_application" } }),
+      testDb.applicationTaskEvent.findMany({ where: { taskId: input.applicationTaskId,
+        type: "submission_execution_started", actor: "worker" }, take: 2,
+        select: { id: true, taskId: true, type: true, actor: true, body: true, data: true } }),
+      requestFixtureStats(500).catch(() => null),
+    ])
+    const taskErrorCategory = await objectiveSubmitTaskErrorCategory(task?.error)
+    const startData = starts.length === 1 ? jsonRecord(starts[0]?.data) : null
+    const startExecutionId = typeof startData?.executionId === "string" ? startData.executionId : ""
+    const expectedStart = { applicationTaskId: input.applicationTaskId, approvalId: input.approvalId,
+      constraintHash: input.constraintHash, executionId: startExecutionId, fillTurnId: input.fillTurnId,
+      jobId: input.jobId, sessionId: input.sessionId, userId: ids.user, workerTaskId: input.workerTaskId }
+    const exactStartMarker = Boolean(starts.length === 1 && startExecutionId.length > 0
+      && starts[0]?.id === `evt_${startExecutionId}`
+      && starts[0]?.taskId === input.applicationTaskId && starts[0]?.type === "submission_execution_started"
+      && starts[0]?.actor === "worker" && starts[0]?.body === "Submit execution started"
+      && isDeepStrictEqual(startData, expectedStart))
+    const receipt = input.slotOrdinal >= 1 && input.slotOrdinal <= 8
+      ? stats?.objectiveSubmitReceipts[input.slotOrdinal - 1] : undefined
+    const observedGets = stats?.objectiveGetCounts[input.slotOrdinal - 1]
+    return {
+      available: Boolean(task),
+      task: task ? { status: reviewedFillDiagnosticValue(task.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+        checkpoint: reviewedFillDiagnosticValue(task.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS),
+        errorCategory: taskErrorCategory } : null,
+      selectedRouteGetDelta: Number.isSafeInteger(observedGets)
+        ? Math.min(1000, Math.max(0, Number(observedGets) - input.routeGetBaseline)) : null,
+      post: receipt ? { attempted: Math.min(1000, Math.max(0, receipt.attempts)),
+        valid: Math.min(1000, Math.max(0, receipt.validAttempts)), rejected: Math.min(1000, Math.max(0, receipt.malformedAttempts)) } : null,
+      consumedReceipt: Boolean(approval && approval.status === "consumed" && approval.consumedAt instanceof Date
+        && approval.scopeHash === input.constraintHash),
+      exactSubmissionStartMarker: exactStartMarker,
+      currentlyInRequestStartedCheckpoint: task?.status === "filling" && task.checkpoint === "submission_request_started",
+    }
+  } catch {
+    return { available: false }
+  }
+}
+
+async function objectiveSubmitTaskErrorCategory(value: unknown): Promise<string | null> {
+  if (value === "browser_manual") return "browser_manual"
+  const { CAPTCHA_USER_TAKEOVER_MESSAGE, CHALLENGE_DETECTION_FAILED_MESSAGE } = await import("../../../../../../worker/src/db/application-task-state")
+  if (value === CAPTCHA_USER_TAKEOVER_MESSAGE) return "captcha_user_takeover"
+  if (value === CHALLENGE_DETECTION_FAILED_MESSAGE) return "challenge_detection_failed"
+  return diagnosticMachineErrorCode(value)
+}
+
 async function waitForObjectiveFillerCompletion(input: {
   sessionId: string; fillTurnId: string; fillRootTaskId: string; fillerTaskId: string; attemptCount: number
 }, timeoutMs = 60_000) {
@@ -2470,6 +2526,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
   }, 300_000)
 
   it("runs selected-job Writer → Reviewer → user approval → the same submit-disabled Fill Turn", async () => {
+    const startedAt = Date.now()
     selectedJobFullLoopPhase("setup_started")
     const scenario = await createReviewedSourceScenario("positive", "Synthetic source description for reviewed fill integration.")
     const token = await signedBearer(ids.user)
@@ -2647,7 +2704,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     try {
       selectedJobFullLoopPhase("fill_form_wait_started")
       completedFill = await waitForReviewedApplicationTask(scenario.jobId,
-        task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", 180_000)
+        task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled",
+        Math.max(1, Math.min(180_000, startedAt + 290_000 - Date.now())))
       selectedJobFullLoopPhase("fill_form_filled")
     } catch {
       const snapshot = await reviewedFillTimeoutSnapshot({ sessionId: scenario.sessionId, jobId: scenario.jobId,
@@ -3391,10 +3449,21 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       }, select: { id: true, idempotencyKey: true, publishedAt: true, payload: true } })
       expect(submitDispatches).toHaveLength(1)
       const submitDispatch = submitDispatches[0]!
+      const submitWorkerTaskId = jsonString(submitDispatch.payload, "workerTaskId")
+      if (!submitWorkerTaskId) throw new Error("Submit outbox Worker task identity is missing")
       await waitForOutboxPublished(submitDispatch.id)
 
-      const submittedTask = await waitForReviewedApplicationTask(selectedJobId,
-        task => task.status === "submitted" && task.checkpoint === "submission_verified", 120_000)
+      let submittedTask: ApplicationTaskRow
+      try {
+        submittedTask = await waitForReviewedApplicationTask(selectedJobId,
+          task => task.status === "submitted" && task.checkpoint === "submission_verified", 120_000)
+      } catch {
+        const diagnostic = await objectiveSubmitTimeoutSnapshot({ sessionId, jobId: selectedJobId,
+          applicationTaskId: applicationTaskId!, fillTurnId, approvalId: submitApproval.id,
+          constraintHash: submitApproval.scopeHash, workerTaskId: submitWorkerTaskId, slotOrdinal: selectedFixtureOrdinal,
+          routeGetBaseline: beforeFinalApproval.objectiveGetCounts[selectedFixtureOrdinal - 1] ?? 0 })
+        throw new Error(`Objective final submit timeout snapshot ${JSON.stringify(diagnostic)}`)
+      }
       expect(submittedTask).toMatchObject({ id: applicationTaskId, userId: ids.user, sessionId,
         jobId: selectedJobId, fillTurnId, status: "submitted", checkpoint: "submission_verified" })
       const completedTask = await testDb.applicationTask.findUniqueOrThrow({ where: { id: applicationTaskId! } })
