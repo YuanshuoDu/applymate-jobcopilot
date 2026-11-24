@@ -7,6 +7,7 @@ import type { GraphIdentityScope, LoadedGraph } from "./task-graph-pg-state.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { makeObjectiveTailorWaveCandidateSelection, objectiveTailorWavePairPlan,
   parseObjectiveTailorWaveCandidateWitness, type ObjectiveTailorWaveCandidateWitness } from "./objective-tailor-wave-witness.js"
+import { readObjectiveTailorCorrectionInventory, type ObjectiveTailorCorrectionInventory } from "./objective-tailor-correction-inventory.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -20,6 +21,7 @@ export type ObjectiveTailorWaveOccupiedSlot = Readonly<{
   witness: ObjectiveTailorWaveCandidateWitness
   writerTaskId: string
   reviewerTaskId: string
+  correction?: ObjectiveTailorCorrectionInventory
 }>
 export type ObjectiveTailorWaveInventory = Readonly<{
   graphRevision: number
@@ -47,12 +49,14 @@ export async function readObjectiveTailorWaveInventory(
     return source && { ...source, sourceGraphRevision: source.graphRevision, occupiedSlots: [], occupiedJobIds: [], marker: null }
   }
   const parsed = parseObjectiveTailorGraph(marker, graph.snapshot.nodes)
+  const expectedRows = parsed?.slots.reduce((count, slot) => count + (slot.correction ? 4 : 2), 0)
   if (!parsed || !graph.state.objectiveTailor
     || canonicalTaskGraphJson(parsed) !== canonicalTaskGraphJson(graph.state.objectiveTailor)
-    || parsed.slots.some(slot => slot.correction) || rows.length !== parsed.slots.length * 2) return undefined
+    || rows.length !== expectedRows) return undefined
   const source = sourceInventory(graph, parsed.sourceNodeCount)
   if (!source) return undefined
-  const occupied: ObjectiveTailorWaveOccupiedSlot[] = [], jobs = new Set<string>(), analysts = new Map<string, ScheduledDraftAnalystProof>()
+  const occupied: ObjectiveTailorWaveOccupiedSlot[] = [], jobs = new Set<string>(), usedRows = new Set<string>()
+  const analysts = new Map<string, ScheduledDraftAnalystProof>()
   for (const slot of parsed.slots) {
     const writer = graph.snapshot.nodes.find(node => node.key === slot.writerNodeKey)
     const reviewer = graph.snapshot.nodes.find(node => node.key === slot.reviewerNodeKey)
@@ -72,6 +76,8 @@ export async function readObjectiveTailorWaveInventory(
       || graph.tasks.get(writer.taskId)?.status !== stateWriter.status || graph.tasks.get(reviewer.taskId)?.status !== stateReviewer.status
       || !matchesBaseContext(writerRow.context, pair.templatesByNodeKey.get(writer.key)?.context)
       || !matchesBaseContext(reviewerRow.context, pair.templatesByNodeKey.get(reviewer.key)?.context)) return undefined
+    if (usedRows.has(writer.taskId) || usedRows.has(reviewer.taskId)) return undefined
+    usedRows.add(writer.taskId); usedRows.add(reviewer.taskId)
     let proof = analysts.get(witness.sourceAnalystKeys[0])
     if (!proof) {
       const sourceNode = source.sourceSnapshot.nodes.find(node => node.key === witness.sourceAnalystKeys[0])
@@ -83,10 +89,15 @@ export async function readObjectiveTailorWaveInventory(
     const finding = proof.result.findings.filter(item => item.jobId === witness.candidate.jobId)
     if (sha256(proof.binding) !== witness.analystProofDigest || finding.length !== 1 || finding[0]?.score !== witness.candidate.score
       || proof.materialDigests.get(witness.candidate.jobId) !== witness.candidate.materialDigest) return undefined
+    const correction = slot.correction ? await readObjectiveTailorCorrectionInventory({ client, scope, loaded,
+      slot, witness, initialWriterTaskId: writer.taskId, initialReviewerTaskId: reviewer.taskId, rows }) : undefined
+    if (slot.correction && (!correction || usedRows.has(correction.writerTaskId) || usedRows.has(correction.reviewerTaskId))) return undefined
+    if (correction) { usedRows.add(correction.writerTaskId); usedRows.add(correction.reviewerTaskId) }
     jobs.add(witness.candidate.jobId)
     occupied.push({ slotId: slot.slotId, jobId: witness.candidate.jobId, sourceAnalystNodeKey: slot.sourceAnalystNodeKey,
-      witness, writerTaskId: writer.taskId, reviewerTaskId: reviewer.taskId })
+      witness, writerTaskId: writer.taskId, reviewerTaskId: reviewer.taskId, ...(correction ? { correction } : {}) })
   }
+  if (usedRows.size !== rows.length) return undefined
   const sourceGraphRevision = occupied[0]?.witness.sourceGraphRevision
   if (sourceGraphRevision === undefined || occupied.some(slot => slot.witness.sourceGraphRevision !== sourceGraphRevision)) return undefined
   return { graphRevision: graph.item.revision, sourceNodeCount: parsed.sourceNodeCount, sourceGraphRevision,

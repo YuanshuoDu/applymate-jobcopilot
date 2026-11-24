@@ -8,10 +8,17 @@ import { bindObjectiveTailorWaveCandidateWitness, makeObjectiveTailorWaveCandida
   objectiveTailorWavePairPlan } from "./objective-tailor-wave-witness.js"
 import type { GraphIdentityScope, LoadedGraph } from "./task-graph-pg-state.js"
 
-const mocks = vi.hoisted(() => ({ proof: vi.fn() }))
+const mocks = vi.hoisted(() => ({ proof: vi.fn(), receipt: vi.fn(), correction: vi.fn() }))
 vi.mock("./scheduled-draft-candidate-analyst-proof.js", async importOriginal => ({
   ...await importOriginal<typeof import("./scheduled-draft-candidate-analyst-proof.js")>(), readScheduledDraftAnalystProof: mocks.proof,
 }))
+vi.mock("../../db/agent-artifact-repo.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../../db/agent-artifact-repo.js")>(), findReviewReceiptWithClient: mocks.receipt,
+}))
+vi.mock("./objective-tailor-correction-inventory.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./objective-tailor-correction-inventory.js")>(), readObjectiveTailorCorrectionInventory: mocks.correction,
+}))
+import { bindObjectiveTailorCorrectionProof, objectiveTailorCorrectionNodeKeys } from "./objective-tailor-correction-proof.js"
 
 const scope: GraphIdentityScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
 const jobs = [
@@ -34,7 +41,7 @@ function sourceSnapshot() {
   ] })
 }
 function hash(value: unknown): string { return createHash("sha256").update(canonicalTaskGraphJson(value)).digest("hex") }
-function fixture(options: { revision?: number; corrections?: boolean; mismatch?: "row" | "witness" | "owner" | "job" | "material" } = {}) {
+function fixture(options: { revision?: number; corrections?: boolean | number; mismatch?: "row" | "witness" | "owner" | "job" | "material" | "correction-proof" | "prior" } = {}) {
   const base = sourceSnapshot(), sourceGraphDigest = hash(base)
   const sourceStatusDigest = hash([{ key: "scout-node", status: "completed" }, { key: "analyst-node", status: "completed" }])
   const witnesses = jobs.map((jobId, index) => {
@@ -53,7 +60,7 @@ function fixture(options: { revision?: number; corrections?: boolean; mismatch?:
     ["scout-task", { id: "scout-task", status: "completed", role: "scout", taskType: "job_discovery", failureReason: null, result: null }],
     ["analyst-task", { id: "analyst-task", status: "completed", role: "analyst", taskType: "job_analysis", failureReason: null, result: null }],
   ])
-  const rows: Record<string, unknown>[] = []
+  const rows: Record<string, unknown>[] = [], corrections = new Map<number, { writerNodeKey: string; reviewerNodeKey: string }>()
   for (const [index, pair] of pairs.entries()) {
     const writerKey = pair.witness.writerNodeKey, reviewerKey = pair.witness.reviewerNodeKey
     nodes.push({ ...pair.proposal.nodes[0], taskId: `writer-task-${index + 1}`, depth: 3 })
@@ -72,19 +79,29 @@ function fixture(options: { revision?: number; corrections?: boolean; mismatch?:
       role: "reviewer", taskType: "cover_letter_review", status: "waiting",
       context: options.mismatch === "witness" && index === 0 ? { ...reviewerContext as object, objectiveTailorCandidateWitness: { ...pair.witness, candidate: { ...pair.witness.candidate, score: 1 } } } : reviewerContext })
   }
-  let marker: { schemaVersion: string; sourceNodeCount: number; slots: Array<{ slotId: string; sourceAnalystNodeKey: string;
-    writerNodeKey: string; reviewerNodeKey: string; correction?: { writerNodeKey: string; reviewerNodeKey: string } }> } = {
-    schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, sourceNodeCount: 2,
-    slots: witnesses.map(witness => ({ slotId: witness.slotId, sourceAnalystNodeKey: "analyst-node",
-      writerNodeKey: witness.writerNodeKey, reviewerNodeKey: witness.reviewerNodeKey })) }
-  if (options.corrections) {
-    marker = { ...marker, slots: [{ ...marker.slots[0]!, correction: { writerNodeKey: "objective-tailor-correction-writer", reviewerNodeKey: "objective-tailor-correction-reviewer" } }, ...marker.slots.slice(1)] }
-    nodes.push({ key: "objective-tailor-correction-writer", taskId: "correction-writer", templateId: "cover_letter_writer", goal: "Correct", successCriteria: ["Correct"], dependsOn: [witnesses[0]!.reviewerNodeKey], depth: 5 })
-    nodes.push({ key: "objective-tailor-correction-reviewer", taskId: "correction-reviewer", templateId: "cover_letter_reviewer", goal: "Review", successCriteria: ["Review"], dependsOn: ["objective-tailor-correction-writer"], depth: 6 })
-    statuses.set("correction-writer", { status: "queued", failureReason: null }); statuses.set("correction-reviewer", { status: "waiting", failureReason: null })
-    tasks.set("correction-writer", { id: "correction-writer", status: "queued", role: "writer", taskType: "cover_letter_draft", failureReason: null, result: null })
-    tasks.set("correction-reviewer", { id: "correction-reviewer", status: "waiting", role: "reviewer", taskType: "cover_letter_review", failureReason: null, result: null })
+  const correctionCount = typeof options.corrections === "number" ? options.corrections : options.corrections ? 1 : 0
+  for (let index = 0; index < correctionCount; index += 1) {
+    const witness = witnesses[index]!, keys = objectiveTailorCorrectionNodeKeys(witness.slotId)!
+    const writerId = `correction-writer-${index + 1}`, reviewerId = `correction-reviewer-${index + 1}`
+    corrections.set(index, keys)
+    nodes.push({ key: keys.writerNodeKey, taskId: writerId, templateId: "cover_letter_writer", goal: "Correct",
+      successCriteria: ["Correct"], dependsOn: [witness.reviewerNodeKey], depth: 5 })
+    nodes.push({ key: keys.reviewerNodeKey, taskId: reviewerId, templateId: "cover_letter_reviewer", goal: "Review",
+      successCriteria: ["Review"], dependsOn: [keys.writerNodeKey], depth: 6 })
+    statuses.set(writerId, { status: "queued", failureReason: null }); statuses.set(reviewerId, { status: "waiting", failureReason: null })
+    tasks.set(writerId, { id: writerId, status: "queued", role: "writer", taskType: "cover_letter_draft", failureReason: null, result: null })
+    tasks.set(reviewerId, { id: reviewerId, status: "waiting", role: "reviewer", taskType: "cover_letter_review", failureReason: null, result: null })
+    const context = { objectiveTailorCandidateMode: true, objectiveTailorCandidateWitness: witness }
+    for (const [id, role, taskType, status] of [[writerId, "writer", "cover_letter_draft", "queued"],
+      [reviewerId, "reviewer", "cover_letter_review", "waiting"]] as const) {
+      rows.push({ id, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId,
+        userId: scope.userId, turnRootTaskId: scope.rootTaskId, turnUserId: scope.userId, role, taskType, status, context })
+    }
   }
+  const marker = { schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, sourceNodeCount: 2,
+    slots: witnesses.map(witness => ({ slotId: witness.slotId, sourceAnalystNodeKey: "analyst-node",
+      writerNodeKey: witness.writerNodeKey, reviewerNodeKey: witness.reviewerNodeKey,
+      ...(corrections.has(Number(witness.slotId.slice(-1)) - 1) ? { correction: corrections.get(Number(witness.slotId.slice(-1)) - 1) } : {}) })) }
   const snapshot = parseTaskGraphSnapshot({ ...base, nodes, objectiveTailor: marker })
   const revision = options.revision ?? 12
   const loaded: LoadedGraph = { rootTaskId: scope.rootTaskId, item: { id: taskGraphItemId(scope.rootTaskId), revision, content: snapshot, createdAt: new Date(0) },
@@ -95,7 +112,7 @@ function fixture(options: { revision?: number; corrections?: boolean; mismatch?:
   return { client, loaded, rows, witnesses }
 }
 
-beforeEach(() => vi.clearAllMocks())
+beforeEach(() => { vi.clearAllMocks(); mocks.correction.mockReset() })
 
 describe("Objective Tailor wave inventory", () => {
   it("opens V2 on an exact terminal typed source graph", async () => {
@@ -133,7 +150,24 @@ describe("Objective Tailor wave inventory", () => {
     expect(await readObjectiveTailorWaveInventory(client as never, scope, loaded)).toBeUndefined()
   })
 
-  it("rejects an unmarked legacy pair and unsupported correction proof shape", async () => {
+  it("retains two independent correction witnesses beside their initial slot pairs", async () => {
+    const { client, loaded } = fixture({ corrections: 2 })
+    mocks.correction.mockImplementation(async (input: { slot: { slotId: string } }) => ({
+      proof: { slotId: input.slot.slotId }, writerTaskId: `correction-writer-${input.slot.slotId.slice(-1)}`,
+      reviewerTaskId: `correction-reviewer-${input.slot.slotId.slice(-1)}`,
+    }))
+    const inventory = await readObjectiveTailorWaveInventory(client as never, scope, loaded)
+    expect(inventory?.occupiedSlots.map(slot => [slot.slotId, slot.writerTaskId, slot.reviewerTaskId,
+      slot.correction?.writerTaskId, slot.correction?.reviewerTaskId])).toEqual([
+      ["tailor-1", "writer-task-1", "reviewer-task-1", "correction-writer-1", "correction-reviewer-1"],
+      ["tailor-2", "writer-task-2", "reviewer-task-2", "correction-writer-2", "correction-reviewer-2"],
+      ["tailor-3", "writer-task-3", "reviewer-task-3", undefined, undefined],
+      ["tailor-4", "writer-task-4", "reviewer-task-4", undefined, undefined],
+    ])
+    expect(mocks.correction).toHaveBeenCalledTimes(2)
+  })
+
+  it("rejects a marked correction with unbound proof and an unmarked legacy pair", async () => {
     const corrected = fixture({ corrections: true })
     expect(await readObjectiveTailorWaveInventory(corrected.client as never, scope, corrected.loaded)).toBeUndefined()
     const legacy = fixture()
