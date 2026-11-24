@@ -73,7 +73,7 @@ import { parseStoredTaskGraphVerificationReport, TASK_GRAPH_EMPTY_ANALYST_VERIFI
 import { hasNoCurrentAttemptTaskGraphToolReceipts } from "./task-graph-empty-analyst-proof.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 // @ts-expect-error Fixture-only JavaScript module has no declaration; Vitest resolves the import at runtime.
-import { objectiveTailorCorrectionReceiptStatus, objectiveTailorWaveDiagnosticCode, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
+import { objectiveTailorCorrectionReceiptStatus, objectiveTailorCorrectionRetryEligible, objectiveTailorWaveDiagnosticCode, objectiveTailorWaveIdentity, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 import type { WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { readTaskGraphConfirmedLocationSteer } from "./task-graph-confirmed-location-steer.js"
@@ -7508,6 +7508,35 @@ describe("persisted TaskGraph wait scope", () => {
 })
 
 describe("compact TaskGraph wait failure diagnostics", () => {
+  it("retries only a newer revision mismatch for the exact correction slot and source", () => {
+    const call = { input: { correctionSlotId: "tailor-6", expectedRevision: 11 } }
+    const sourceKeys = ["scout-greenhouse", "scout-lever", "scout-workday", "analyst-greenhouse-a", "analyst-greenhouse-b", "analyst-lever", "analyst-workday"]
+    const analystKeys = sourceKeys.filter(key => key.startsWith("analyst-")), graph = { revision: 12,
+      nodes: sourceKeys.map(key => ({ key })), objectiveTailorWave: { slots: Array.from({ length: 8 }, (_, index) => ({
+        slotId: `tailor-${index + 1}`, sourceAnalystNodeKey: analystKeys[index % analystKeys.length],
+        initial: { writer: { taskId: `writer-${index + 1}` }, reviewer: { taskId: `reviewer-${index + 1}` } },
+        ...(index === 1 ? { correction: { writer: { taskId: "writer-correction-2" }, reviewer: { taskId: "reviewer-correction-2" } } } : {}),
+      })) } }
+    const identity = objectiveTailorWaveIdentity(graph, sourceKeys, analystKeys, 8, "tailor-6")
+    expect(identity?.slots).toHaveLength(8)
+    const denied = { error: true, value: { code: "revision_mismatch" } }
+    expect(objectiveTailorCorrectionRetryEligible(denied, call, graph, identity, identity, 1)).toBe(true)
+    expect(objectiveTailorCorrectionRetryEligible(denied, call, graph, identity, identity, 2)).toBe(true)
+    expect(objectiveTailorCorrectionRetryEligible(denied, call, graph, identity, identity, 0)).toBe(false)
+    expect(objectiveTailorCorrectionRetryEligible(denied, call, graph, identity, identity, 3)).toBe(false)
+    expect(objectiveTailorCorrectionRetryEligible(denied, call, { revision: 11 }, identity, identity, 1)).toBe(false)
+    expect(objectiveTailorCorrectionRetryEligible({ error: true, value: { code: "objective_tailor_correction_stale" } }, call, graph, identity, identity, 1)).toBe(false)
+    expect(objectiveTailorCorrectionRetryEligible(denied, { input: { ...call.input, correctionSlotId: "tailor-2" } }, graph, identity, identity, 1)).toBe(false)
+    expect(objectiveTailorCorrectionRetryEligible(denied, call, graph, identity, { ...identity, sourceKeys: ["other"] }, 1)).toBe(false)
+    const changedInitial = { ...graph, objectiveTailorWave: { slots: graph.objectiveTailorWave.slots.map(slot => slot.slotId === "tailor-6"
+      ? { ...slot, initial: { ...slot.initial, writer: { taskId: "writer-changed" } } } : slot) } }
+    expect(objectiveTailorCorrectionRetryEligible(denied, call, graph, identity,
+      objectiveTailorWaveIdentity(changedInitial, sourceKeys, analystKeys, 8, "tailor-6"), 1)).toBe(false)
+    const alreadyCorrected = { ...graph, objectiveTailorWave: { slots: graph.objectiveTailorWave.slots.map(slot => slot.slotId === "tailor-6"
+      ? { ...slot, correction: { writer: { taskId: "writer-6c" }, reviewer: { taskId: "reviewer-6c" } } } : slot) } }
+    expect(objectiveTailorWaveIdentity(alreadyCorrected, sourceKeys, analystKeys, 8, "tailor-6")).toBeUndefined()
+  })
+
   it("classifies correction receipts without retaining private error details", () => {
     const valid = { status: "accepted", revision: 11, nodes: [{}, {}], readyTaskIds: ["ready"] }
     expect(objectiveTailorCorrectionReceiptStatus(undefined, 10)).toBe("MISSING")

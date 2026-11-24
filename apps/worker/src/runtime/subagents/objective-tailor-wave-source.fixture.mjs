@@ -169,11 +169,15 @@ export function objectiveTailorCorrectionReceiptStatus(result, expectedRevision)
   if (!result) return "MISSING"
   if (result.error) return `DENIED ${objectiveTailorWaveDiagnosticCode(result.value?.code)}`
   const value = result.value
-  if (value?.status !== "accepted") return "INVALID_STATUS"
-  if (!Number.isSafeInteger(expectedRevision) || value.revision !== expectedRevision + 1) return "INVALID_REVISION"
+  if (value?.status !== "accepted") return "INVALID_STATUS"; if (!Number.isSafeInteger(expectedRevision) || value.revision !== expectedRevision + 1) return "INVALID_REVISION"
   if (!Array.isArray(value.nodes) || value.nodes.length !== 2) return "INVALID_NODES"
   if (value.readyTaskIds?.length !== 1) return "INVALID_READY"
   return "ACCEPTED"
+}
+export function objectiveTailorCorrectionRetryEligible(result, call, graph, priorIdentity, currentIdentity, attempts) {
+  return result?.error === true && result.value?.code === "revision_mismatch" && call?.input?.correctionSlotId === "tailor-6"
+    && attempts >= 1 && attempts < 3 && Number.isSafeInteger(call.input.expectedRevision) && Number.isSafeInteger(graph?.revision)
+    && graph.revision > call.input.expectedRevision && priorIdentity !== undefined && JSON.stringify(priorIdentity) === JSON.stringify(currentIdentity)
 }
 export function fixturePhaseReady(request, phase, turnId, say, waitPrefix) {
   const prefix = `${waitPrefix}${phase}-wait:${turnId}:`, calls = fixtureToolCalls(request, "agent.wait")
@@ -192,12 +196,12 @@ export function fixturePhaseReady(request, phase, turnId, say, waitPrefix) {
   const expected = calls.at(-1)?.input?.taskIds
   return Array.isArray(expected) && expected.length > 0 && fixtureAllTasksCompleted(result.value, expected)
 }
-export function objectiveTailorWaveIdentity(graph, sourceKeys, analystKeys) {
+export function objectiveTailorWaveIdentity(graph, sourceKeys, analystKeys, slotCount = 4, uncorrectedSlotId) {
   const graphKeys = Array.isArray(graph?.nodes) ? graph.nodes.map(node => node?.key).filter(key => typeof key === "string") : []
   const sortedKeys = graphKeys.sort(), expectedKeys = [...sourceKeys].sort()
   if (sortedKeys.length !== expectedKeys.length || sortedKeys.some((key, index) => key !== expectedKeys[index])) return undefined
   const slots = graph?.objectiveTailorWave?.slots
-  if (!Array.isArray(slots) || slots.length !== 4) return undefined
+  if (!Array.isArray(slots) || slots.length !== slotCount || uncorrectedSlotId && slots.find(slot => slot?.slotId === uncorrectedSlotId)?.correction !== undefined) return undefined
   const identity = slots.map(slot => [slot?.slotId, slot?.sourceAnalystNodeKey, slot?.initial?.writer?.taskId, slot?.initial?.reviewer?.taskId])
   if (identity.some((slot, index) => slot[0] !== `tailor-${index + 1}` || slot.some(value => typeof value !== "string")
     || !analystKeys.includes(slot[1]))) return undefined
@@ -239,12 +243,8 @@ function objectAt(text, start) {
   }
   return undefined
 }
-function emit(id, name, args) {
-  return [{ type: "tool_call_completed", callId: id, name, arguments: args }, { type: "completed", finishReason: "tool_calls" }]
-}
+function emit(id, name, args) { return [{ type: "tool_call_completed", callId: id, name, arguments: args }, { type: "completed", finishReason: "tool_calls" }] }
 function assertScope(request, expected) {
   if (request?.metadata?.userId !== expected.userId || request.metadata.sessionId !== expected.sessionId
-    || request.metadata.turnId !== expected.turnId || request.metadata.taskId !== expected.taskId) {
-    throw new Error("fixture_source_model_scope_mismatch")
-  }
+    || request.metadata.turnId !== expected.turnId || request.metadata.taskId !== expected.taskId) throw new Error("fixture_source_model_scope_mismatch")
 }
