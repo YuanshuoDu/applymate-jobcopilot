@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
-import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, VERIFIED_SHORTLIST_SELECTION_SCHEMA } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA, OBJECTIVE_APPLICATION_REVIEW_TURN_INTENT, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, VERIFIED_SHORTLIST_SELECTION_SCHEMA } from "@jobcopilot/agent-protocol"
 
 import { acceptInputFacts, assertExpectedTurn, commandEventKey, createRootTurn, fallbackDisposition, lockOpenSession, type CommandTransaction } from "./transaction"
 import { activeTurnChanged } from "./errors"
@@ -116,6 +116,26 @@ describe("Agent command transaction helpers", () => {
       aggregateId: command.sessionId,
       idempotencyKey: "turn-dispatch:turn_objective",
     }))
+  })
+
+  it("marks the exact Objective application review intent as canonical", async () => {
+    const agentTurn = { create: vi.fn().mockResolvedValue({ id: "turn_objective_review" }) }
+    const agentOutbox = { create: vi.fn().mockResolvedValue({}) }
+    const tx = { agentTurn, agentOutbox } as unknown as CommandTransaction
+    const command = { sessionId: "session_1", userId: "user_1", clientMessageId: "client_objective_review", source: "user" as const }
+    const intent = { ...OBJECTIVE_APPLICATION_REVIEW_TURN_INTENT, selection: {
+      schema: OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA, sourceTurnId: "source_turn", rootTaskId: "root_1",
+      graphItemId: "graph_1", graphRevision: 7, slotOrdinals: [2, 5],
+    } }
+
+    await createRootTurn(tx, command, [{ type: "text", text: "Review completed Objective materials" }], undefined, undefined, intent)
+
+    const data = agentTurn.create.mock.calls[0]?.[0]?.data
+    expect(data?.executionMode).toBe("canonical_task_graph")
+    expect(data?.input).toEqual(expect.objectContaining({ intent }))
+    expect(agentOutbox.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
+      topic: "agent.turn.dispatch", aggregateId: command.sessionId, idempotencyKey: "turn-dispatch:turn_objective_review",
+    }) }))
   })
 
   it("persists the gated Objective budget on the root Turn with its dispatch outbox", async () => {

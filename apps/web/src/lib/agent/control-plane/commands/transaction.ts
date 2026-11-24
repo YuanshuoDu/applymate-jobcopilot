@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 
 import { Prisma } from "@prisma/client"
-import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, REVIEWED_APPLICATION_REVIEW_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, type InputContentPart, type TurnSource, type VerifiedShortlistSelectionBinding } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_APPLICATION_REVIEW_TURN_INTENT, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, REVIEWED_APPLICATION_REVIEW_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, type InputContentPart, type TurnSource, type VerifiedShortlistSelectionBinding } from "@jobcopilot/agent-protocol"
 
 import { appendAgentEventWithOutboxInTransaction } from "../../session/fact-store"
 import { selectObjectiveTailorExecutionBudgetSnapshot } from "./objective-tailor-execution-budget"
@@ -21,13 +21,10 @@ export const ACTIVE_TURN_STATUSES = [
 
 /** Durable topic consumed by the Worker's canonical Turn queue. */
 export const TURN_DISPATCH_TOPIC = "agent.turn.dispatch"
-
 export function turnDispatchKey(turnId: string): string {
   return `turn-dispatch:${turnId}`
 }
-
 export type CommandTransaction = Prisma.TransactionClient
-
 export interface ActiveTurn {
   id: string
   source: string
@@ -35,7 +32,6 @@ export interface ActiveTurn {
   revision: number
   input?: unknown
 }
-
 export interface AcceptedCommandFacts {
   inputId: string
   turnId: string
@@ -99,6 +95,7 @@ export async function createRootTurn(
   const canonicalExecution = command.source === "user" && (selectedJobPreparation !== undefined
     || (intent?.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind && intent.version === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version)
     || (intent?.kind === REVIEWED_APPLICATION_REVIEW_INTENT.kind && intent.version === REVIEWED_APPLICATION_REVIEW_INTENT.version)
+    || (intent?.kind === OBJECTIVE_APPLICATION_REVIEW_TURN_INTENT.kind && intent.version === OBJECTIVE_APPLICATION_REVIEW_TURN_INTENT.version)
     || selectedJobBatch)
   const turn = await tx.agentTurn.create({
     data: {
