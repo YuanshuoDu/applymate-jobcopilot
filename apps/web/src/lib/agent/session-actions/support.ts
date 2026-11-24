@@ -3,6 +3,7 @@ import { redactAgentEvent } from "@jobcopilot/shared"
 import { hashApprovalNonce } from "@jobcopilot/agent-protocol"
 import { err, ok } from "@/lib/api-helpers"
 import { resolveLegacyApproval, type ScopedApprovalRecord } from "@/lib/agent/approval/legacy-receipt"
+import { parseReviewedSourceTurnId } from "@/lib/agent/approval/reviewed-fill-source-binding"
 import { db } from "@/lib/db"
 import { queueAutonomousApplication } from "@/lib/auto-apply"
 import { requireLegacyPolicy } from "@/lib/agent/policy/legacy"
@@ -15,6 +16,7 @@ export type ApprovalAction = {
   decision: ApprovalDecision
   body: string
   receiptNonce: string | null
+  reviewedSourceTurnId?: string
 }
 
 export type CreateAutomationAction = {
@@ -86,12 +88,15 @@ export function readBody(body: unknown): SessionAction | null {
   if (row.type !== "approval_response") return null
   const rawDecision = typeof row.decision === "string" ? row.decision : "review"
   const decision = isApprovalDecision(rawDecision) ? rawDecision : "review"
+  const reviewedSourceTurnId = parseReviewedSourceTurnId(row.reviewedSourceTurnId)
+  if (reviewedSourceTurnId === null || (reviewedSourceTurnId !== undefined && decision !== "approved")) return null
   return {
     type: row.type,
     approvalId: typeof row.approvalId === "string" && row.approvalId ? row.approvalId : null,
     decision,
     body: typeof row.body === "string" && row.body.trim() ? row.body.trim() : approvalBody(decision),
     receiptNonce: typeof row.receiptNonce === "string" && row.receiptNonce.trim() ? row.receiptNonce.trim() : null,
+    ...(reviewedSourceTurnId ? { reviewedSourceTurnId } : {}),
   }
 }
 
@@ -170,14 +175,12 @@ export function resumeTailoringPayload(value: unknown) {
   const jobId = text(payload.jobId)
   return resumeId && jobId ? { resumeId, jobId } : null
 }
-
 export function applicationPayload(value: unknown) {
   const payload = value && typeof value === "object" ? value as Record<string, unknown> : {}
   const applicationTaskId = text(payload.applicationTaskId)
   const jobId = text(payload.jobId)
   return applicationTaskId && jobId ? { applicationTaskId, jobId } : null
 }
-
 export async function replayConsumedSubmitApproval(input: {
   sessionId: string
   userId: string

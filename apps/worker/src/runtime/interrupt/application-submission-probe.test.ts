@@ -1,15 +1,18 @@
 import type { Pool } from "pg";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const withExactAttemptFence = vi.hoisted(() => vi.fn());
+const requestFence = vi.hoisted(() => vi.fn());
+const readTurnState = vi.hoisted(() => vi.fn());
 const appendFencedSubmitAudit = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 vi.mock("../../queue/application-submit-fence.js", () => ({
-  withExactAttemptFence,
   appendFencedSubmitAudit,
+}));
+vi.mock("../../db/reviewed-application-submit-request-fence.js", () => ({
+  withReviewedApplicationSubmitRequestFence: requestFence,
+  readSubmissionTurnState: readTurnState,
 }));
 
 import { acquireApplicationSubmissionStartFence, isApplicationSubmissionStopped, startApplicationSubmissionStopProbe } from "./application-submission-probe.js";
-import type { ApplicationSubmitIdentity } from "../../queue/application-submit-fence.js";
 
 const scope = {
   userId: "user_1", sessionId: "session_1", turnId: "turn_1", fillTurnId: "turn_1",
@@ -18,6 +21,7 @@ const scope = {
 };
 
 function fakePool(turnStatus = "in_progress", interrupted = false, markerRowCount = 1, markerCommitFails = false) {
+  readTurnState.mockResolvedValue({ sessionStatus: "running", turnStatus, interrupted });
   const clients: Array<{ role: "marker" | "boundary"; query: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }> = [];
   const connect = vi.fn(async () => {
     const role: "marker" | "boundary" = clients.length % 2 === 0 ? "marker" : "boundary";
@@ -43,11 +47,11 @@ function fakePool(turnStatus = "in_progress", interrupted = false, markerRowCoun
 }
 
 beforeEach(() => {
-  withExactAttemptFence.mockImplementation(async (
-    _client: unknown,
-    _identity: ApplicationSubmitIdentity,
+  requestFence.mockImplementation(async (
+    _client: unknown, _identity: unknown, _phase: unknown, expectedSourceTurnId: string | null | undefined,
     work: () => Promise<unknown>,
-  ) => ({ kind: "current", value: await work() }));
+  ) => ({ kind: "current", value: await work(), sourceTurnId: expectedSourceTurnId ?? null }));
+  readTurnState.mockResolvedValue({ sessionStatus: "running", turnStatus: "in_progress", interrupted: false });
   appendFencedSubmitAudit.mockClear();
 });
 afterEach(() => vi.useRealTimers());
@@ -62,20 +66,10 @@ describe("application submission Stop probe", () => {
     expect(fence.state).toBe("ready");
     expect(connect).toHaveBeenCalledTimes(2);
     expect(marker?.query.mock.calls.map(([sql]) => sql)).toEqual([
-      "BEGIN",
-      "SELECT set_config($1, $2, true)",
-      expect.stringContaining('FROM "agent_sessions"'),
-      expect.stringContaining('FROM "agent_turns"'),
-      expect.stringContaining("turn.interrupted"),
-      expect.stringContaining("submission_request_started"),
-      "COMMIT",
+      "BEGIN", "SELECT set_config($1, $2, true)", expect.stringContaining("submission_request_started"), "COMMIT",
     ]);
     expect(boundary?.query.mock.calls.map(([sql]) => sql)).toEqual([
-      "BEGIN",
-      "SELECT set_config($1, $2, true)",
-      expect.stringContaining('FROM "agent_sessions"'),
-      expect.stringContaining('FROM "agent_turns"'),
-      expect.stringContaining("turn.interrupted"),
+      "BEGIN", "SELECT set_config($1, $2, true)",
     ]);
     expect(marker?.release).toHaveBeenCalledOnce();
     expect(boundary?.release).not.toHaveBeenCalled();
@@ -125,7 +119,7 @@ describe("application submission Stop probe", () => {
 
   it("records superseded start callbacks without writing a marker or retaining a request fence", async () => {
     const { pool, clients, connect } = fakePool();
-    withExactAttemptFence.mockResolvedValueOnce({ kind: "superseded" });
+    requestFence.mockResolvedValueOnce({ kind: "superseded" });
 
     await expect(acquireApplicationSubmissionStartFence(pool, scope)).resolves.toMatchObject({ state: "inactive" });
 
@@ -148,15 +142,51 @@ describe("application submission Stop probe", () => {
     await fence.release(false);
   });
 
+  it("declines an invalid reviewed receipt before writing the durable request marker", async () => {
+    const { pool, clients, connect } = fakePool();
+    requestFence.mockResolvedValueOnce({ kind: "invalid" });
+
+    await expect(acquireApplicationSubmissionStartFence(pool, scope)).resolves.toMatchObject({ state: "inactive" });
+
+    expect(connect).toHaveBeenCalledOnce();
+    expect(clients[0]?.query).toHaveBeenLastCalledWith("ROLLBACK");
+    expect(clients[0]?.query).not.toHaveBeenCalledWith(expect.stringContaining("submission_request_started"), expect.anything());
+  });
+
+  it("keeps a post-marker proof rejection uncertain and never releases the request", async () => {
+    const { pool, clients } = fakePool();
+    requestFence.mockImplementationOnce(async (_client, _scope, _phase, _expected, work) => ({
+      kind: "current", value: await work(), sourceTurnId: "source-turn-1",
+    })).mockResolvedValueOnce({ kind: "invalid" });
+
+    const fence = await acquireApplicationSubmissionStartFence(pool, scope);
+
+    expect(fence.state).toBe("uncertain");
+    expect(clients[0]?.query).toHaveBeenCalledWith("COMMIT");
+    expect(clients[1]?.query).toHaveBeenLastCalledWith("ROLLBACK");
+    expect(clients.every(client => client.release.mock.calls.length === 1)).toBe(true);
+    await fence.release(false);
+  });
+
+  it("keeps a boundary verification error uncertain after the durable marker", async () => {
+    const { pool, clients } = fakePool();
+    requestFence.mockImplementationOnce(async (_client, _scope, _phase, _expected, work) => ({
+      kind: "current", value: await work(), sourceTurnId: "source-turn-1",
+    })).mockRejectedValueOnce(new Error("proof lookup failed"));
+
+    await expect(acquireApplicationSubmissionStartFence(pool, scope)).resolves.toMatchObject({ state: "uncertain" });
+
+    expect(clients[0]?.query).toHaveBeenCalledWith("COMMIT");
+    expect(clients[1]?.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(clients[1]?.release).toHaveBeenCalledOnce();
+  });
+
   it("checks scoped session, Turn, and interruption state", async () => {
     const { pool, clients } = fakePool();
 
     await expect(isApplicationSubmissionStopped(pool, scope)).resolves.toBe(false);
 
-    expect(clients[0]?.query).toHaveBeenCalledWith(
-      expect.stringContaining('"id" = $1 AND "sessionId" = $2 AND "userId" = $3'), ["turn_1", "session_1", "user_1"],
-    );
-    expect(clients[0]?.query).toHaveBeenCalledWith(expect.stringContaining("turn.interrupted"), ["session_1", "turn_1"]);
+    expect(readTurnState).toHaveBeenCalledWith(clients[0], scope);
     expect(clients[0]?.release).toHaveBeenCalledOnce();
   });
 

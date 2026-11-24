@@ -8,6 +8,15 @@ vi.mock('@/lib/hooks', () => ({ useApi: (url: string) => {
   return supervisorApi.responses.get(url) ?? { data: null, loading: false, error: null, refetch: () => undefined }
 } }))
 vi.mock('next-auth/react', () => ({ useSession: () => ({ data: null, status: 'unauthenticated' }) }))
+vi.mock('./SelectedJobDraftArtifact', async () => {
+  const react = await import('react')
+  return { SelectedJobDraftArtifact: ({ artifactRef, sourceTurnId }: {
+    artifactRef: { readonly artifactId: string; readonly version: number; readonly contentHash: string; readonly sourceDigest: string } | null
+    sourceTurnId?: string | null
+  }) => artifactRef ? react.createElement('div', {
+    'data-selected-job-draft': 'true', 'data-draft-version': artifactRef.version, 'data-source-turn-id': sourceTurnId ?? '',
+  }) : null }
+})
 
 import { translate } from '@/lib/i18n'
 import { AgentSupervisorPanel, EvidenceSummary, projectSelectedEvidence, selectedWorkerForNode } from './AgentSupervisorPanel'
@@ -242,6 +251,10 @@ describe('AgentSupervisorPanel selected evidence', () => {
       connection: 'connected', restoring: false, error: null,
     } satisfies AgentTimelineSnapshot
     const currentUrl = buildTaskGraphTaskLookupUrl('session-1', [graph, request], 'turn-current')!
+    const turnsUrl = '/api/agent/sessions/session-1/turns?limit=100'
+    const completedSource = { id: 'turn-current', sessionId: 'session-1', source: 'user', goal: 'Prepare job', status: 'completed', revision: 1,
+      activeStepId: null, finalItemId: null, createdAt: now, updatedAt: now, completedAt: now }
+    supervisorApi.responses.set(turnsUrl, { data: { turns: [completedSource] }, loading: false, error: null, refetch: () => undefined })
     const artifactRef = { artifactId: 'draft-current', version: 2, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` }
     supervisorApi.responses.set(currentUrl, { data: { tasks: [
       { id: 'root-current', sessionId: 'session-1', turnId: 'turn-current', rootTaskId: 'root-current', role: 'orchestrator', taskType: 'root', status: 'completed', goal: 'Current root', hasResult: false },
@@ -255,8 +268,17 @@ describe('AgentSupervisorPanel selected evidence', () => {
     expect(currentUrl).toContain('graphTurnId=turn-current')
     expect(html).toContain('data-selected-job-draft="true"')
     expect(html).toContain('data-draft-version="2"')
+    expect(html).toContain('data-source-turn-id="turn-current"')
     expect(html).not.toContain('data-draft-version="99"')
     expect(html).not.toContain('Plan for selected turn')
+
+    for (const source of [
+      { ...completedSource, status: 'running' },
+      { ...completedSource, sessionId: 'foreign-session' },
+    ]) {
+      supervisorApi.responses.set(turnsUrl, { data: { turns: [source] }, loading: false, error: null, refetch: () => undefined })
+      expect(renderToStaticMarkup(<AgentSupervisorPanel sessionId="session-1" timeline={timeline} />)).toContain('data-source-turn-id=""')
+    }
   })
 
   it('projects bounded audit metadata and renders only safe references', () => {

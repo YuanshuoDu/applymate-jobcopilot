@@ -43,7 +43,12 @@ export interface BrowserFillExecutorContext {
   pattern?: FormPatternRow | null;
   aiAvailable?: boolean;
   harnessConfig?: Omit<HarnessConfig, "dryRun" | "mode" | "maxTurns">;
+  /** Trusted, source-bound reviewed material; never part of model-visible input. */
+  reviewedCoverLetter?: Readonly<{ content: string }>;
+  reviewedPhaseObserver?: (phase: ReviewedFillExecutionPhase) => void;
 }
+
+export type ReviewedFillExecutionPhase = "executor_wait_clear" | "executor_wait_detected" | "deterministic_flow_started" | "deterministic_flow_review_ready" | "deterministic_flow_wait" | "deterministic_flow_other";
 
 export function parseFillFormInput(input: unknown): FillFormInput {
   assertValid(FillFormInputSchema, input, "browser.fill_form input");
@@ -63,14 +68,23 @@ export async function executeBrowserFill(input: unknown, context: BrowserFillExe
     review: value.review,
   };
 
+  if (context.reviewedCoverLetter && (strategy.kind !== "deterministic" || strategy.atsType !== "greenhouse")) {
+    return { status: "manual", error: "Reviewed material requires the bounded Greenhouse fill path.", durationMs: 0, reviewReady: false };
+  }
   if (strategy.kind === "budget") return { status: "manual", error: "AI fallback budget exhausted.", durationMs: 0, classification: "budget_exhausted", reviewReady: false };
   const wait = await detectBrowserWait(context.page);
+  observeReviewedPhase(context, wait ? "executor_wait_detected" : "executor_wait_clear");
   if (wait) {
     await Promise.resolve(context.harnessConfig?.onWait?.({ reason: wait.reason, jobId: value.jobId, message: wait.message })).catch(() => undefined);
     return { status: "manual", error: wait.message, durationMs: 0, classification: "waiting_for_user", waitReason: wait.reason };
   }
   if (strategy.kind === "pattern") return replayPatternForReview(context.page, strategy.pattern, value.persona);
-  if (strategy.kind === "deterministic") return withDeterministicEvidence(await runDeterministicFlow(strategy.atsType, context.page, task));
+  if (strategy.kind === "deterministic") {
+    observeReviewedPhase(context, "deterministic_flow_started");
+    const result = await runDeterministicFlow(strategy.atsType, context.page, task, context.reviewedCoverLetter?.content);
+    observeReviewedPhase(context, result.waitReason || result.classification === "waiting_for_user" ? "deterministic_flow_wait" : result.reviewReady ? "deterministic_flow_review_ready" : "deterministic_flow_other");
+    return withDeterministicEvidence(result);
+  }
 
   const harness = new AgentHarness({
     userId: context.harnessConfig?.userId ?? "runtime",
@@ -80,6 +94,10 @@ export async function executeBrowserFill(input: unknown, context: BrowserFillExe
     ...context.harnessConfig,
   });
   return harness.run(context.page, task);
+}
+
+function observeReviewedPhase(context: BrowserFillExecutorContext, phase: ReviewedFillExecutionPhase): void {
+  try { context.reviewedPhaseObserver?.(phase); } catch { /* diagnostics must not affect filling */ }
 }
 
 function withDeterministicEvidence(result: HarnessResult): HarnessResult {
@@ -95,9 +113,9 @@ function withDeterministicEvidence(result: HarnessResult): HarnessResult {
   return { ...result, ...(Object.keys(mappings).length ? { fieldMappings: mappings, mappingArtifact: createFormMappingArtifact(mappings, "deterministic") } : {}), ...(items.length ? { items } : {}) };
 }
 
-async function runDeterministicFlow(atsType: AtsSourceKey, page: Page, task: ApplyTask): Promise<HarnessResult> {
+async function runDeterministicFlow(atsType: AtsSourceKey, page: Page, task: ApplyTask, reviewedCoverLetter?: string): Promise<HarnessResult> {
   switch (atsType) {
-    case "greenhouse": return runGreenhouseFlow(page, task);
+    case "greenhouse": return runGreenhouseFlow(page, task, reviewedCoverLetter === undefined ? undefined : { reviewedCoverLetter });
     case "lever": return runLeverFlow(page, task);
     case "workday": return runWorkdayFlow(page, task);
     case "personio": return runPersonioFlow(page, task);

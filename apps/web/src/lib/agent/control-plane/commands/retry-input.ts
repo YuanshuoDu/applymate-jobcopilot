@@ -1,4 +1,4 @@
-import { TurnIntentSchema, validate, type InputContentPart, type TurnIntent } from '@jobcopilot/agent-protocol'
+import { REVIEWED_APPLICATION_REVIEW_INTENT, TurnIntentSchema, validate, type InputContentPart, type TurnIntent } from '@jobcopilot/agent-protocol'
 
 import { retryInputInvalid } from './errors'
 import {
@@ -53,6 +53,7 @@ export function parsePersistedRetryContent(turnId: string, value: unknown): {
   const hasIntent = Object.hasOwn(value, 'intent')
   const intent = hasIntent && validate(TurnIntentSchema, value.intent) ? value.intent as TurnIntent : undefined
   if (hasIntent && !intent) throw retryInputInvalid(turnId)
+  if (intent?.kind === REVIEWED_APPLICATION_REVIEW_INTENT.kind) throw retryInputInvalid(turnId)
   let verificationRequirements: ObjectiveVerificationRequirements | null | undefined
   if (Object.hasOwn(value, 'verificationRequirements')) {
     if (value.verificationRequirements === null) verificationRequirements = null

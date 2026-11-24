@@ -24,6 +24,7 @@ export async function reissueApprovalNonce(
   const nonceHash = await hashApprovalNonce(nonce)
 
   return db.$transaction(async (tx) => {
+    await lockReceiptSession(tx, input)
     const row = await tx.agentApproval.findFirst({
       where: { id: input.approvalId, sessionId: input.sessionId, userId: input.userId },
     })
@@ -68,6 +69,19 @@ export async function reissueApprovalNonce(
     })
     return { approvalId: row.id, receiptNonce: nonce, scopeHash, expiresAt: row.expiresAt.toISOString() }
   })
+}
+
+async function lockReceiptSession(
+  tx: Prisma.TransactionClient,
+  input: { sessionId: string; userId: string },
+): Promise<void> {
+  const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT "id" FROM "agent_sessions"
+    WHERE "id" = ${input.sessionId} AND "userId" = ${input.userId}
+      AND "status" NOT IN ('aborted', 'archived')
+    FOR UPDATE
+  `)
+  if (!rows[0]) throw new ApprovalStoreError("approval_not_found", "Approval receipt was not found")
 }
 
 function record(value: Prisma.JsonValue): Record<string, Prisma.JsonValue> {

@@ -1,12 +1,17 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import { hashApprovalScope } from "@jobcopilot/agent-protocol"
-import { hashAgentReceiptValue } from "@jobcopilot/shared"
+import { hashAgentReceiptValue, hashApplicationSubmissionMaterial } from "@jobcopilot/shared"
 import { protocolScope, type ApprovalScopeInput } from "../runtime/approval/types.js"
+import type { SelectedJobReviewedArtifact } from "../runtime/selected-job-reviewed-artifact-read.js"
 import { hashArtifactContent } from "../runtime/subagents/artifact-adapters.js"
 import * as artifactAdapters from "../runtime/subagents/artifact-adapters.js"
 import type { SubagentLease } from "../runtime/subagents/types.js"
 import { acknowledgeApplicationFillCancellation, completeApplicationFillForReview, failApplicationFillBeforeBrowser, persistApplicationFillWait } from "./application-task-completion.js"
+import { createReviewedApplicationFillReadback } from "./reviewed-application-fill-completion.js"
+
+const reviewedReader = vi.hoisted(() => ({ read: vi.fn() }))
+vi.mock("../runtime/selected-job-reviewed-artifact-read.js", () => ({ readSelectedJobReviewedArtifactWithClient: reviewedReader.read }))
 
 type FillTaskFixture = { id: string; jobId: string; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown }
 type ApprovalMismatch = "turn" | "user" | "session" | "task" | "legacy_child" | "job" | "scope" | "payload" | "consumed"
@@ -16,27 +21,37 @@ type ApprovalFixtureRow = {
   answersHash: string; scopeHash: string; nonceHash: string; revision: number; expiresAt: Date
 }
 
+const reviewedSource: SelectedJobReviewedArtifact = {
+  sourceTurnId: "source-turn", rootTaskId: "source-root", graphRevision: 4, jobId: "job-a", writerTaskId: "writer-task",
+  reviewerTaskId: "reviewer-task", reviewerToolCallId: "review-call", reviewHash: `sha256:${"1".repeat(64)}`,
+  artifactId: "draft-a", version: 2, contentHash: `sha256:${"2".repeat(64)}`, sourceDigest: `sha256:${"3".repeat(64)}`, content: "Private reviewed letter",
+}
+
 function taskPayload(task: FillTaskFixture) {
   return { applicationTaskId: task.id, jobId: task.jobId, resumeId: task.resumeId, coverLetterId: task.coverLetterId }
 }
 
-async function artifactFixture(task: FillTaskFixture, userId: string, mismatch = false) {
+async function artifactFixture(task: FillTaskFixture, userId: string, mismatch = false, reviewedCoverLetterHash?: string) {
   const payload = taskPayload(task), answersHash = await hashAgentReceiptValue("answers", task.confirmedAnswers ?? null)
-  const content = { schemaVersion: "agent-harness.application-submission.v1", ...payload, answersHash }
+  const content = reviewedCoverLetterHash ? { schemaVersion: "agent-harness.application-submission.v2", ...payload, reviewedCoverLetterHash, answersHash }
+    : { schemaVersion: "agent-harness.application-submission.v1", ...payload, answersHash }
+  const material = reviewedCoverLetterHash ? { ...payload, reviewedCoverLetterHash } : payload
+  const materialHash = reviewedCoverLetterHash ? await hashApplicationSubmissionMaterial(material) : await hashAgentReceiptValue("material", payload)
+  if (!materialHash) throw new Error("fixture material hash unavailable")
   const hash = hashArtifactContent(content), artifactId = `application:${task.id}`, taskRef = `application-task:${task.id}`
   return {
     id: artifactId, userId, jobId: task.jobId, artifactType: "application", lifecycle: "base", baseId: artifactId,
     baseHash: hash, content, hash: mismatch ? "sha256:wrong-artifact-hash" : hash,
     constraintHash: hashArtifactContent({ applicationTaskId: task.id, jobId: task.jobId }),
     provenanceRefs: [taskRef], evidenceRefs: [taskRef], previousHash: null, version: 1,
-    answersHash, payload, materialHash: await hashAgentReceiptValue("material", payload),
+    answersHash, payload, materialHash,
   }
 }
 
 async function approvalFixture(
-  task: FillTaskFixture, status: string, revision: number, mismatch?: ApprovalMismatch,
+  task: FillTaskFixture, status: string, revision: number, mismatch?: ApprovalMismatch, reviewedCoverLetterHash?: string,
 ): Promise<ApprovalFixtureRow> {
-  const artifact = await artifactFixture(task, "user-a")
+  const artifact = await artifactFixture(task, "user-a", false, reviewedCoverLetterHash)
   const row = {
     id: `application-fill:${task.id}:turn-a`, userId: "user-a", sessionId: "session-a", turnId: "turn-a", jobId: task.jobId,
     type: "submit_application", taskId: task.id, status, toolCallId: `application-submit:${task.id}`,
@@ -63,7 +78,8 @@ async function approvalFixture(
 
 function fixture(options: {
   subtaskLive?: boolean; subtaskOwnerUserId?: string; subtaskOwner?: string; subtaskAttempt?: number; subtaskInterrupted?: boolean; appStatus?: string; appCheckpoint?: string; appTurnId?: string; sessionStatus?: string
-  turnStatus?: string; turnMissing?: boolean; completionApprovalStatus?: string; approvalMismatch?: ApprovalMismatch; artifactMismatch?: boolean; initialQuestion?: unknown
+  turnStatus?: string; turnMissing?: boolean; turnInput?: unknown; turnHintInput?: unknown; browserStartEvents?: unknown[]; reviewedCoverLetterHash?: string
+  completionApprovalStatus?: string; approvalMismatch?: ApprovalMismatch; artifactMismatch?: boolean; initialQuestion?: unknown
 } = {}) {
   const lease = {
     id: "filler-task", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a", parentTaskId: "root-a",
@@ -73,7 +89,7 @@ function fixture(options: {
     constraints: [], successCriteria: [], allowedActions: [], context: {}, expectedOutputSchema: {}, result: null, failureReason: null,
     budgetSnapshot: {}, toolPolicySnapshot: {},
   } satisfies SubagentLease
-  const turn = { id: "turn-a", status: options.turnStatus ?? "in_progress", revision: options.turnStatus === "waiting_for_approval" ? 5 : 4 }
+  const turn = { id: "turn-a", status: options.turnStatus ?? "in_progress", revision: options.turnStatus === "waiting_for_approval" ? 5 : 4, input: options.turnInput ?? {} }
   const task = { id: "application-a", userId: "user-a", sessionId: "session-a", jobId: "job-a", fillTurnId: options.appTurnId ?? "turn-a",
     fillTurnSessionId: "session-a", fillTurnUserId: "user-a", status: options.appStatus ?? "filling",
     checkpoint: options.appCheckpoint ?? "browser_active", resumeId: "resume-a", coverLetterId: null, confirmedAnswers: { eligible: "yes" }, question: options.initialQuestion ?? null }
@@ -83,6 +99,8 @@ function fixture(options: {
       calls.push({ sql, values })
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 0 }
       if (sql.includes("set_config")) return { rows: [{ set_config: "user-a" }], rowCount: 1 }
+      if (sql.includes("pg_current_xact_id")) return { rows: [{ transaction_id: "123" }], rowCount: 1 }
+      if (sql.startsWith('SELECT "input" FROM "agent_turns"')) return options.turnMissing ? { rows: [], rowCount: 0 } : { rows: [{ input: options.turnHintInput ?? turn.input }], rowCount: 1 }
       if (sql.startsWith('SELECT "id" FROM "agent_sessions"') && sql.includes('"status" IN (')) return sql.includes(`'${options.sessionStatus ?? "running"}'`)
         ? { rows: [{ id: "session-a" }], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-a" }], rowCount: 1 }
@@ -96,6 +114,7 @@ function fixture(options: {
           ? { rows: [], rowCount: 0 } : { rows: [{ id: lease.id }], rowCount: 1 }
       }
       if (sql.includes('FROM "application_tasks"')) return { rows: [task], rowCount: 1 }
+      if (sql.includes('FROM "application_task_events"') && sql.includes("reviewed_application_fill_browser_started")) return { rows: options.browserStartEvents ?? [], rowCount: options.browserStartEvents?.length ?? 0 }
       if (sql.startsWith('UPDATE "application_tasks"')) {
         if (sql.includes("'turn_stopped_before_submit'")) { task.status = "cancelled"; task.checkpoint = "turn_stopped_before_submit" }
         else if (sql.includes("'fill_prestart_failed'")) { task.status = "failed"; task.checkpoint = "fill_prestart_failed" }
@@ -118,10 +137,10 @@ function fixture(options: {
           resourceHash, materialHash, answersHash, scopeHash, nonceHash, revision, expiresAt, decidedAt: null, consumedAt: null, createdAt: new Date() }], rowCount: 1 }
       }
       if (sql.includes('FROM "agent_artifact"')) return {
-        rows: [await artifactFixture(task, lease.userId, options.artifactMismatch)], rowCount: 1,
+        rows: [await artifactFixture(task, lease.userId, options.artifactMismatch, options.reviewedCoverLetterHash)], rowCount: 1,
       }
       if (sql.includes('FROM "agent_approvals"')) return options.completionApprovalStatus
-        ? { rows: [await approvalFixture(task, options.completionApprovalStatus, turn.revision - 1, options.approvalMismatch)], rowCount: 1 }
+        ? { rows: [await approvalFixture(task, options.completionApprovalStatus, turn.revision - 1, options.approvalMismatch, options.reviewedCoverLetterHash)], rowCount: 1 }
         : { rows: [], rowCount: 0 }
       if (sql.includes('SELECT "id" FROM "Job"')) return { rows: [{ id: "job-a" }], rowCount: 1 }
       if (sql.includes("UPDATE \"agent_turns\" SET \"status\" = 'waiting_for_approval'")) {
@@ -142,7 +161,85 @@ function fixture(options: {
   return { lease, turn, task, client, pool, calls }
 }
 
+function reviewedBrowserStart(lease: SubagentLease) {
+  return { actor: "worker", data: { schemaVersion: "agent-harness.v2.reviewed-application-fill-browser-start.v1", userId: lease.userId,
+    sessionId: lease.sessionId, fillTurnId: lease.turnId, jobId: "job-a", applicationTaskId: "application-a", fillerTaskId: lease.id,
+    attemptCount: lease.attemptCount, leaseOwner: lease.ownerId, leaseExpiresAt: lease.leaseExpiresAt.toISOString(), sourceTurnId: reviewedSource.sourceTurnId,
+    rootTaskId: reviewedSource.rootTaskId, graphRevision: reviewedSource.graphRevision, writerTaskId: reviewedSource.writerTaskId,
+    reviewerTaskId: reviewedSource.reviewerTaskId, reviewerToolCallId: reviewedSource.reviewerToolCallId, reviewHash: reviewedSource.reviewHash,
+    artifactId: reviewedSource.artifactId, version: reviewedSource.version, contentHash: reviewedSource.contentHash, sourceDigest: reviewedSource.sourceDigest } }
+}
+
+beforeEach(() => reviewedReader.read.mockResolvedValue(reviewedSource))
+
 describe("ApplicationTask fill completion", () => {
+  it("issues only the existing four-field approval payload with the exact reviewed commitment", async () => {
+    const marker = { reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: reviewedSource.sourceTurnId } }
+    const test = fixture({ turnInput: marker, browserStartEvents: [reviewedBrowserStart({ ...fixture().lease })] })
+    const readback = await createReviewedApplicationFillReadback(test.lease, test.task.id, reviewedSource)
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, reviewedFillReadback: readback ?? undefined })).resolves.toEqual({ status: "completed" })
+
+    const fence = test.calls.findIndex(call => call.sql.includes("pg_advisory_xact_lock"))
+    const firstRowLock = test.calls.findIndex(call => call.sql.includes("FOR UPDATE"))
+    const artifact = test.calls.find(call => call.sql.includes('INSERT INTO "agent_artifact"'))
+    const approval = test.calls.find(call => call.sql.includes('INSERT INTO "agent_approvals"'))
+    expect(fence).toBeGreaterThan(test.calls.findIndex(call => call.sql.startsWith('SELECT "input" FROM "agent_turns"')))
+    expect(fence).toBeLessThan(firstRowLock)
+    expect(JSON.parse(String(artifact?.values?.[5]))).toMatchObject({ schemaVersion: "agent-harness.application-submission.v2", reviewedCoverLetterHash: readback?.reviewedCoverLetterHash })
+    expect(JSON.parse(String(approval?.values?.[11]))).toEqual(taskPayload(test.task))
+    expect(approval?.values?.[13]).toBe(await hashApplicationSubmissionMaterial({ ...taskPayload(test.task), reviewedCoverLetterHash: readback!.reviewedCoverLetterHash }))
+    expect(JSON.stringify(test.calls)).not.toContain(reviewedSource.content)
+  })
+
+  it("turns changed current review evidence into a stale_review wait before issuing anything", async () => {
+    const marker = { reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: reviewedSource.sourceTurnId } }
+    const test = fixture({ turnInput: marker, browserStartEvents: [reviewedBrowserStart(fixture().lease)] })
+    const readback = await createReviewedApplicationFillReadback(test.lease, test.task.id, reviewedSource)
+    reviewedReader.read.mockResolvedValueOnce(null)
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, reviewedFillReadback: readback ?? undefined })).resolves.toEqual({ status: "waiting" })
+
+    expect(test.task.checkpoint).toBe("form_answer_required")
+    expect(test.calls.some(call => call.sql.includes("'form_filled'") && call.sql.includes("INSERT INTO \"application_task_events\""))).toBe(false)
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_artifact"') || call.sql.includes('INSERT INTO "agent_approvals"'))).toBe(false)
+    const waitEvent = test.calls.find(call => call.sql.includes("INSERT INTO \"application_task_events\"") && call.values?.[2] === "form_answer_required")
+    expect(JSON.parse(String(waitEvent?.values?.[4]))).toMatchObject({ reason: "stale_review", turnId: "turn-a", attemptCount: 2 })
+  })
+
+  it("fails closed when the locked selector differs from the nonlocking source hint", async () => {
+    const hint = { reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: reviewedSource.sourceTurnId } }
+    const locked = { reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "other-source" } }
+    const test = fixture({ turnInput: locked, turnHintInput: hint, browserStartEvents: [reviewedBrowserStart(fixture().lease)] })
+    const readback = await createReviewedApplicationFillReadback(test.lease, test.task.id, reviewedSource)
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, reviewedFillReadback: readback ?? undefined })).resolves.toEqual({ status: "waiting" })
+
+    expect(test.calls.some(call => call.sql.includes("pg_advisory_xact_lock"))).toBe(true)
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_artifact"') || call.sql.includes('INSERT INTO "agent_approvals"'))).toBe(false)
+  })
+
+  it("replays an unchanged reviewed approval from its exact historical browser binding", async () => {
+    const marker = { reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: reviewedSource.sourceTurnId } }
+    const seed = fixture(), readback = await createReviewedApplicationFillReadback(seed.lease, seed.task.id, reviewedSource)
+    const test = fixture({ turnInput: marker, appStatus: "waiting_for_authorization", appCheckpoint: "form_filled", turnStatus: "waiting_for_approval",
+      browserStartEvents: [reviewedBrowserStart(seed.lease)], completionApprovalStatus: "pending", reviewedCoverLetterHash: readback!.reviewedCoverLetterHash })
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease })).resolves.toEqual({ status: "completed" })
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_approvals"') || call.sql.includes('INSERT INTO "agent_artifact"'))).toBe(false)
+  })
+
+  it("does not mutate an already-issued approval when its current reviewed source is stale", async () => {
+    const marker = { reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: reviewedSource.sourceTurnId } }
+    const seed = fixture(), readback = await createReviewedApplicationFillReadback(seed.lease, seed.task.id, reviewedSource)
+    const test = fixture({ turnInput: marker, appStatus: "waiting_for_authorization", appCheckpoint: "form_filled", turnStatus: "waiting_for_approval",
+      browserStartEvents: [reviewedBrowserStart(seed.lease)], completionApprovalStatus: "pending", reviewedCoverLetterHash: readback!.reviewedCoverLetterHash })
+    reviewedReader.read.mockResolvedValueOnce(null)
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease })).resolves.toEqual({ status: "conflict" })
+    expect(test.calls.some(call => call.sql.includes('UPDATE "agent_approvals"') || call.sql.includes('INSERT INTO "agent_approvals"'))).toBe(false)
+  })
+
   it("rejects malformed artifact hashes and rolls back before issuing an approval", async () => {
     const test = fixture()
     const hash = vi.spyOn(artifactAdapters, "hashArtifactContent").mockReturnValueOnce(`sha256:${"a".repeat(64)}\n`)

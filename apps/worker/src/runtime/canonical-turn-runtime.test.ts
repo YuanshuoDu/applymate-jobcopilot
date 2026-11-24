@@ -885,6 +885,64 @@ async function routeCanonicalRootMutation(toolName: "agent.spawn" | "spawn_subag
 }
 
 describe("createCanonicalTurnRuntime", () => {
+  it("routes reviewed-application review Turns before configured models and tool registries", async () => {
+    const roots = rootStore(), events: RuntimeEvent[] = [], turnStore = store(events)
+    const executionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
+    const sessionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
+    const modelRuntimeFactory = vi.fn(async () => { throw new Error("review_turn_must_not_construct_model") })
+    const toolRuntimeFactory = vi.fn(() => { throw new Error("review_turn_must_not_construct_tools") })
+    const reviewedApplicationReviewIssuer = vi.fn(async () => ({ status: "waiting" as const,
+      approvalId: `reviewed-application-review:${lease.turnId}`, waitItemId: `agent-wait:approval:reviewed-application-review:${lease.turnId}` }))
+    const stateLoader = vi.fn(async () => state({ source: "user", rootInputId: "review-root-input",
+      intent: { kind: "reviewed_application_review", version: 1, sourceTurnId: "source-turn", jobId: "job-review" } }))
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: lease.ownerId, productionFlags: resolveProductionAgentFlags({
+        ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      }), stateLoader, rootTaskStore: roots as never, taskGraphCommandPort: {} as TaskGraphCommandPort,
+      reviewedApplicationReviewIssuer, modelRuntimeFactory, toolRuntimeFactory,
+      turnEngineStoreFactory: (() => turnStore) as TurnEngineStoreFactory,
+      executionProjection, sessionProjection,
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({
+      status: "waiting_for_approval", waitId: `reviewed-application-review:${lease.turnId}`,
+    })
+    expect(stateLoader).toHaveBeenCalledOnce()
+    expect(roots.ensure).toHaveBeenCalledWith(expect.objectContaining({ allowedActions: [] }))
+    expect(reviewedApplicationReviewIssuer).toHaveBeenCalledWith(expect.objectContaining({
+      lease, rootTaskId: "root-1", intent: { kind: "reviewed_application_review", version: 1, sourceTurnId: "source-turn", jobId: "job-review" },
+    }))
+    expect(events.map(event => event.type)).toEqual(["turn.started"])
+    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({ status: "waiting_for_approval", stepCount: 0, toolCallCount: 0 }),
+    }))
+    expect(executionProjection.start).toHaveBeenCalledOnce()
+    expect(executionProjection.finish).toHaveBeenCalledOnce()
+    expect(sessionProjection.start).toHaveBeenCalledOnce()
+    expect(sessionProjection.finish).toHaveBeenCalledOnce()
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+    expect(toolRuntimeFactory).not.toHaveBeenCalled()
+  })
+
+  it("fails closed on non-user or feature-disabled reviewed intents without falling into generic execution", async () => {
+    const roots = rootStore(), modelRuntimeFactory = vi.fn(async () => { throw new Error("review_turn_must_not_construct_model") })
+    const toolRuntimeFactory = vi.fn(() => { throw new Error("review_turn_must_not_construct_tools") })
+    const reviewedApplicationReviewIssuer = vi.fn(async () => ({ status: "denied" as const }))
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: lease.ownerId, stateLoader: async () => state({ source: "automation", automationRunMode: "scheduled",
+        intent: { kind: "reviewed_application_review", version: 1, sourceTurnId: "source-turn", jobId: "job-review" } }),
+      rootTaskStore: roots as never, reviewedApplicationReviewIssuer, modelRuntimeFactory, toolRuntimeFactory,
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toEqual({
+      status: "failed", summary: "reviewed_application_review_runtime_unavailable",
+    })
+    expect(roots.ensure).toHaveBeenCalledWith(expect.objectContaining({ allowedActions: [] }))
+    expect(reviewedApplicationReviewIssuer).not.toHaveBeenCalled()
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+    expect(toolRuntimeFactory).not.toHaveBeenCalled()
+  })
+
   it("rejects malformed scheduled automation context before registering planner tools or creating children", async () => {
     const roots = rootStore()
     const toolRuntimeFactory = vi.fn(() => { throw new Error("tool_runtime_registered_before_validation") })

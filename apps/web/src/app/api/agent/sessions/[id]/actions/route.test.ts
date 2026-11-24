@@ -31,6 +31,8 @@ const mocks = vi.hoisted(() => ({
   applicationTaskUpdateMany: vi.fn(),
   applicationTaskFindFirst: vi.fn(),
   applicationTaskEventCreate: vi.fn(),
+  readAcceptedReviewedFillSource: vi.fn(),
+  acceptedFillTurnMatchesReviewedSource: vi.fn(),
   queueApplicationFill: vi.fn(),
   confirmSubmissionNotReceived: vi.fn(),
   applicationFillTaskGraphEnabled: vi.fn(),
@@ -92,6 +94,12 @@ vi.mock("@/lib/agent/approval/legacy-receipt", () => ({
   issueLegacyReceipt: mocks.issueLegacyReceipt,
   resolveLegacyApproval: mocks.resolveLegacyApproval,
   validateLegacyReceipt: mocks.validateLegacyReceipt,
+}))
+vi.mock("@/lib/agent/approval/reviewed-fill-source-binding", () => ({
+  parseReviewedSourceTurnId: (value: unknown) => value === undefined ? undefined
+    : typeof value === "string" && value === value.trim() && value.length > 0 && value.length <= 256 ? value : null,
+  readAcceptedReviewedFillSource: mocks.readAcceptedReviewedFillSource,
+  acceptedFillTurnMatchesReviewedSource: mocks.acceptedFillTurnMatchesReviewedSource,
 }))
 vi.mock("@/lib/agent/approval/store", () => ({
   validatePendingApprovalReceipt: mocks.validatePendingApprovalReceipt,
@@ -179,6 +187,8 @@ describe("agent session actions API", () => {
     mocks.applicationTaskUpdateMany.mockReset()
     mocks.applicationTaskFindFirst.mockReset().mockResolvedValue(null)
     mocks.applicationTaskEventCreate.mockReset()
+    mocks.readAcceptedReviewedFillSource.mockReset().mockResolvedValue(undefined)
+    mocks.acceptedFillTurnMatchesReviewedSource.mockReset().mockResolvedValue(true)
     mocks.queueApplicationFill.mockReset()
     mocks.confirmSubmissionNotReceived.mockReset()
     mocks.applicationFillTaskGraphEnabled.mockReset().mockReturnValue(false)
@@ -249,7 +259,7 @@ describe("agent session actions API", () => {
     mocks.approvalFindFirst.mockReset()
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce(approvalRecord({ type: "review_application", payload: { applicationTaskId: "task_1", jobId: "job_1" } }))
+      .mockResolvedValueOnce(approvalRecord({ type: "review_application", status: "approved", payload: { applicationTaskId: "task_1", jobId: "job_1" } }))
     mocks.applicationTaskFindFirst.mockResolvedValueOnce({ fillTurnId: "turn_fill_1" })
 
     const post = callPost(postRequest({
@@ -736,7 +746,8 @@ describe("agent session actions API", () => {
     expect(turnStatus).toBe("interrupted")
     expect(applicationTaskStatus).toBe("cancelled")
     expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith({
-      where: { id: "task_1", userId: "user_1", status: "waiting_for_authorization" },
+      where: { id: "task_1", userId: "user_1", jobId: "job_1", sessionId: "session_1", fillTurnId: "turn_1",
+        status: "waiting_for_authorization", checkpoint: "form_filled" },
       data: {
         status: "waiting_for_authorization",
         checkpoint: "queue_retry",
@@ -758,6 +769,139 @@ describe("agent session actions API", () => {
     expect(mocks.transaction).not.toHaveBeenCalled()
     expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+  })
+
+  it("persists an explicit reviewed-source selector through the approval decision transaction", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      id: "reviewed-application-review:turn_1", type: "review_application", toolCallId: "review_application:turn_1",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("approved"))
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+      reviewedSourceTurnId: "source_turn_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    expect(mocks.resolveLegacyApproval).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      decision: "approved", receiptNonce: "nonce_1", reviewedSourceTurnId: "source_turn_1",
+    }), expect.anything())
+    expect(mocks.queueApplicationFill).not.toHaveBeenCalled()
+  })
+
+  it("forwards the supplied nonce for a marked reviewed approval when no source selector is present", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      id: "reviewed-application-review:turn_1", type: "review_application", toolCallId: "review_application:turn_1",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("approved"))
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "reviewed-application-review:turn_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    const resolutionInput = mocks.resolveLegacyApproval.mock.calls[0]?.[1]
+    expect(resolutionInput).toEqual(expect.objectContaining({ decision: "approved", receiptNonce: "nonce_1" }))
+    expect(resolutionInput).not.toHaveProperty("reviewedSourceTurnId")
+  })
+
+  it("keeps marked reviewed rejection canonical and sends no nonce", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      id: "reviewed-application-review:turn_1", type: "review_application", toolCallId: "review_application:turn_1",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("rejected"))
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "reviewed-application-review:turn_1", decision: "rejected",
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    const resolutionInput = mocks.resolveLegacyApproval.mock.calls[0]?.[1]
+    expect(resolutionInput).toEqual(expect.objectContaining({ decision: "rejected" }))
+    expect(resolutionInput).not.toHaveProperty("receiptNonce")
+  })
+
+  it("does not pass the new nonce field for ordinary approval types", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({ type: "send_gmail" }))
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("approved"))
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    const resolutionInput = mocks.resolveLegacyApproval.mock.calls[0]?.[1]
+    expect(resolutionInput).not.toHaveProperty("receiptNonce")
+  })
+
+  it("does not queue a reviewed selector through a legacy-only approval path", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      type: "review_application", payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
+    mocks.resolveLegacyApproval.mockRejectedValueOnce({ code: "reviewed_fill_source_unavailable" })
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+      reviewedSourceTurnId: "source_turn_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(409)
+    expect(mocks.queueApplicationFill).not.toHaveBeenCalled()
+  })
+
+  it("recovers the original reviewed-source binding on approved-fill replay without a selector", async () => {
+    mocks.approvalFindFirst.mockReset().mockResolvedValueOnce(null).mockResolvedValueOnce(approvalRecord({
+      type: "review_application", status: "approved", payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
+    mocks.applicationTaskFindFirst.mockResolvedValueOnce({ fillTurnId: null })
+    mocks.jobFindFirst.mockResolvedValueOnce({ url: "https://jobs.example/apply" })
+    mocks.readAcceptedReviewedFillSource.mockResolvedValueOnce({ sourceTurnId: "source_turn_1" })
+
+    const res = await callPost(postRequest({ type: "approval_response", approvalId: "approval_1", decision: "approved" }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    expect(mocks.readAcceptedReviewedFillSource).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      approvalId: "approval_1", applicationTaskId: "task_1", jobId: "job_1",
+    }))
+    expect(mocks.queueApplicationFill).toHaveBeenCalledWith(expect.objectContaining({
+      reviewedSourceTurnId: "source_turn_1", reviewedSourceApprovalId: "approval_1", applicationTaskId: "task_1",
+    }))
+  })
+
+  it("does not enqueue a consumed approval when its bound fill is absent", async () => {
+    mocks.approvalFindFirst.mockReset().mockResolvedValueOnce(null).mockResolvedValueOnce(approvalRecord({
+      type: "review_application", status: "consumed", payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
+    mocks.applicationTaskFindFirst.mockResolvedValueOnce({ fillTurnId: null })
+    mocks.readAcceptedReviewedFillSource.mockResolvedValueOnce({ sourceTurnId: "source_turn_1" })
+
+    const res = await callPost(postRequest({ type: "approval_response", approvalId: "approval_1", decision: "approved" }) as never, ctx)
+
+    expect(res.status).toBe(409)
+    expect(mocks.queueApplicationFill).not.toHaveBeenCalled()
+  })
+
+  it("acknowledges a consumed approval only when the exact reviewed fill marker matches", async () => {
+    mocks.approvalFindFirst.mockReset().mockResolvedValueOnce(null).mockResolvedValueOnce(approvalRecord({
+      type: "review_application", status: "consumed", payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
+    mocks.applicationTaskFindFirst.mockResolvedValueOnce({ fillTurnId: "fill_turn_1" })
+    mocks.readAcceptedReviewedFillSource.mockResolvedValueOnce({ sourceTurnId: "source_turn_1" })
+    mocks.acceptedFillTurnMatchesReviewedSource.mockResolvedValueOnce(true)
+
+    const res = await callPost(postRequest({ type: "approval_response", approvalId: "approval_1", decision: "approved" }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ turnId: "fill_turn_1", duplicate: true })
+    expect(mocks.queueApplicationFill).not.toHaveBeenCalled()
   })
 
   it("does not queue a duplicate canonical submission", async () => {

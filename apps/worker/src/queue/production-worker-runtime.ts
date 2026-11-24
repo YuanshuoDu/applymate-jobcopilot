@@ -4,6 +4,8 @@ import type { CanonicalTurnRuntimeOptions } from "../runtime/canonical-turn-runt
 import type { ProductionAgentFlags } from "../runtime/production-agent-flags.js"
 import type { ProductionChildRuntimeOptions } from "../runtime/subagents/production-child-runtime.js"
 import type { SubagentExecutor } from "./subagent-queue.js"
+import { createPostBootstrapStartupFence } from "./post-bootstrap-startup.js"
+import { startReviewedFillHandoffOutboxPublisher } from "./reviewed-fill-handoff-outbox.js"
 import type {
   ProductionAgentRuntimeStartupOptions,
   ProductionWorkerBootstrap,
@@ -27,6 +29,7 @@ export type ProductionWorkerRuntimeDependencies = {
   readonly startProductionAgentRuntime: (
     options: ProductionAgentRuntimeStartupOptions,
   ) => Promise<ProductionWorkerBootstrap>
+  readonly startReviewedFillHandoffOutboxPublisher?: (pool: pg.Pool) => { close(): Promise<void> }
 }
 
 export type ProductionWorkerRuntimeInput = {
@@ -46,28 +49,43 @@ export async function startProductionWorkerRuntime(
   const waitResolver = productionFlags.consumeWaitOutcomes ? {} : undefined
   let childExecutor: SubagentExecutor | undefined
 
-  return dependencies.startProductionAgentRuntime({
-    pool,
-    createRuntime: async () => {
-      const runtime = await dependencies.createCanonicalTurnRuntime(pool, {
-        workerId: input.workerId,
-        authorizeUsage: dependencies.createWorkerUsageAuthorizer(),
-        productionFlags,
-        executionProjection: dependencies.createCanonicalExecutionProjection(pool),
-        sessionProjection: dependencies.createCanonicalSessionProjection(pool),
-      })
-      childExecutor = dependencies.createOptionalProductionChildExecutor({
-        enabled: productionFlags.childExecutionEnabled,
-        pool,
-        subagentManager: () => runtime.manager,
-      })
-      return runtime
-    },
-    bootstrapOptions: () => ({
-      ...(childExecutor ? { subagents: { execute: childExecutor } } : {}),
-      ...(waitResolver ? { waitResolver } : {}),
-    }),
-    onBootstrapReady: input.onBootstrapReady,
-    startAgentRunWorker: input.startAgentRunWorker,
-  })
+  const startPublisher = dependencies.startReviewedFillHandoffOutboxPublisher ?? startReviewedFillHandoffOutboxPublisher
+  let wrappedBootstrap: ProductionWorkerBootstrap | undefined
+  const wrap = (bootstrap: ProductionWorkerBootstrap): ProductionWorkerBootstrap => {
+    const publisher = startPublisher(pool)
+    const close = createPostBootstrapStartupFence(() => [() => publisher.close(), () => bootstrap.close()])
+    wrappedBootstrap = { ...bootstrap, close: () => close.close() }
+    input.onBootstrapReady?.(wrappedBootstrap)
+    return wrappedBootstrap
+  }
+  try {
+    const bootstrap = await dependencies.startProductionAgentRuntime({
+      pool,
+      createRuntime: async () => {
+        const runtime = await dependencies.createCanonicalTurnRuntime(pool, {
+          workerId: input.workerId,
+          authorizeUsage: dependencies.createWorkerUsageAuthorizer(),
+          productionFlags,
+          executionProjection: dependencies.createCanonicalExecutionProjection(pool),
+          sessionProjection: dependencies.createCanonicalSessionProjection(pool),
+        })
+        childExecutor = dependencies.createOptionalProductionChildExecutor({
+          enabled: productionFlags.childExecutionEnabled,
+          pool,
+          subagentManager: () => runtime.manager,
+        })
+        return runtime
+      },
+      bootstrapOptions: () => ({
+        ...(childExecutor ? { subagents: { execute: childExecutor } } : {}),
+        ...(waitResolver ? { waitResolver } : {}),
+      }),
+      onBootstrapReady: ready => { wrap(ready) },
+      startAgentRunWorker: input.startAgentRunWorker,
+    })
+    return wrappedBootstrap ?? wrap(bootstrap)
+  } catch (error: unknown) {
+    await wrappedBootstrap?.close().catch(() => undefined)
+    throw error
+  }
 }

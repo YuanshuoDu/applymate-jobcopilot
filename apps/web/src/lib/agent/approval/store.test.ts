@@ -783,6 +783,27 @@ describe("Web approval receipt store", () => {
 
     const result = await reissueApprovalNonce(db, { approvalId: row.id, sessionId: row.sessionId, userId: row.userId })
 
+    const sessionLock = tx.$queryRaw.mock.calls[0]?.[0]
+    const sessionLockSql = sessionLock?.strings?.join(" ") ?? ""
+    expect(sessionLockSql).toContain('FROM "agent_sessions"')
+    expect(sessionLockSql).toContain('"userId"')
+    expect(sessionLockSql).toContain('"status" NOT IN')
+    expect(sessionLockSql).toContain("FOR UPDATE")
+    const sessionLockValues = (sessionLock as unknown as { values?: readonly unknown[] } | undefined)?.values ?? []
+    expect(sessionLockValues).toContain(row.sessionId)
+    expect(sessionLockValues).toContain(row.userId)
+    const sessionLockOrder = tx.$queryRaw.mock.invocationCallOrder[0] ?? 0
+    expect(sessionLockOrder).toBeGreaterThan(0)
+    for (const order of [
+      tx.agentApproval.findFirst.mock.invocationCallOrder[0],
+      tx.agentApproval.updateMany.mock.invocationCallOrder[0],
+      tx.agentItem.findFirst.mock.invocationCallOrder[0],
+      tx.agentItem.update.mock.invocationCallOrder[0],
+      tx.agentEvent.create.mock.invocationCallOrder[0],
+      tx.agentOutbox.create.mock.invocationCallOrder[0],
+    ]) {
+      expect(order).toBeGreaterThan(sessionLockOrder)
+    }
     expect(result).toMatchObject({ approvalId: row.id, receiptNonce: expect.any(String), scopeHash: expect.not.stringMatching(row.scopeHash!) })
     expect(tx.agentApproval.updateMany).toHaveBeenCalledWith({
       where: expect.objectContaining({ id: row.id, status: "pending", scopeHash: row.scopeHash, nonceHash: row.nonceHash }),
@@ -793,6 +814,30 @@ describe("Web approval receipt store", () => {
       data: { content: { approvalId: row.id, scopeHash: result.scopeHash } },
     })
     expect(tx.agentEvent.create).toHaveBeenCalledWith({ data: expect.objectContaining({ type: "approval.receipt_rotated" }) })
+  })
+
+  it("does not read or rotate an approval when the owner cannot lock an open Session", async () => {
+    const row = { ...(await approvalRow()), status: "pending" }
+    const { db, tx } = mockDb(row, { sessionPresent: false })
+
+    await expect(reissueApprovalNonce(db, { approvalId: row.id, sessionId: row.sessionId, userId: row.userId }))
+      .rejects.toMatchObject({ code: "approval_not_found" })
+
+    const lockQuery = tx.$queryRaw.mock.calls[0]?.[0]
+    const lockSql = lockQuery?.strings?.join(" ") ?? ""
+    expect(lockSql).toContain('FROM "agent_sessions"')
+    expect(lockSql).toContain('"userId"')
+    expect(lockSql).toContain('"status" NOT IN')
+    expect(lockSql).toContain("FOR UPDATE")
+    const lockValues = (lockQuery as unknown as { values?: readonly unknown[] } | undefined)?.values ?? []
+    expect(lockValues).toContain(row.sessionId)
+    expect(lockValues).toContain(row.userId)
+    expect(tx.agentApproval.findFirst).not.toHaveBeenCalled()
+    expect(tx.agentApproval.updateMany).not.toHaveBeenCalled()
+    expect(tx.agentItem.findFirst).not.toHaveBeenCalled()
+    expect(tx.agentItem.update).not.toHaveBeenCalled()
+    expect(tx.agentEvent.create).not.toHaveBeenCalled()
+    expect(tx.agentOutbox.create).not.toHaveBeenCalled()
   })
 
   it("serializes Gate receipt issuance and Stop in both Session-lock orders", async () => {

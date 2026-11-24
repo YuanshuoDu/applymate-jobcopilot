@@ -67,6 +67,7 @@ export interface TranscriptAction {
   receiptNonce?: string | null
   decision?: 'approved' | 'rejected' | 'cancelled' | 'review'
   body?: string
+  reviewedSourceTurnId?: string
   draft?: AutomationDraftAction
   prompt?: string
 }

@@ -104,13 +104,14 @@ export async function drainAgentWakeups(pool: PoolLike, batchSize = DEFAULT_BATC
     const rows = await selectPendingWakeups(pool, batchSize)
     if (rows.length === 0) return processed
     let retryPending = false
+    let deferredPending = false
     for (const row of rows) {
       const outcome = await processWakeupRow(pool, row)
       if (outcome === "published") processed += 1
-      if (outcome === "deferred") return processed
+      if (outcome === "deferred") deferredPending = true
       if (outcome === "retry") retryPending = true
     }
-    if (retryPending) return processed
+    if (retryPending || deferredPending) return processed
   }
 }
 

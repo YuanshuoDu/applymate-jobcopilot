@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { AgentApproval } from "@jobcopilot/agent-protocol"
 import type { PoolClient } from "pg"
 
@@ -7,10 +7,16 @@ import { createApplicationSubmitTool, type SubmissionApprovalStore, type Submiss
 import type { ApplicationTarget, SubmissionAttempt } from "../../db/application-submit-repo.js"
 import type { ApplicationSubmitIdentity } from "../../queue/application-submit-fence.js"
 import type { SubmissionRequestIntent } from "../../flows/submission-intent.js"
+import type { ReviewedApplicationFillSourceSelection } from "@jobcopilot/shared"
 
 const userId = "user-a"
 const jobId = "job-a"
 const constraintHash = "c".repeat(64)
+const reviewedRead = vi.hoisted(() => vi.fn())
+const reviewedArtifact = vi.hoisted(() => vi.fn())
+vi.mock("../../db/reviewed-application-submit-material.js", () => ({
+  readReviewedApplicationSubmitMaterial: reviewedRead, hasReviewedSubmissionArtifact: reviewedArtifact,
+}))
 const identity: ApplicationSubmitIdentity = { sessionId: "session-a", fillTurnId: "turn-a", applicationTaskId: "application-a", userId, jobId, approvalId: "receipt-a", constraintHash }
 function target(): ApplicationTarget { return { id: jobId, userId, jobId, company: "Acme", role: "Engineer", applyUrl: "https://jobs.example/apply", source: "greenhouse" } }
 function approval(resourceHash: string, status: "approved" | "consumed" = "approved"): AgentApproval {
@@ -26,16 +32,18 @@ class Attempts implements SubmissionAttemptStore {
   readonly rows = new Map<string, SubmissionAttempt>()
   superseded = false
   audit: string[] = []
-  async reserveAndConsume(attemptIdentity: ApplicationSubmitIdentity, authorize: (client: PoolClient, mode: "new" | "replay") => Promise<{ kind: "authorized"; artifactHash: string } | { kind: "fenced" }>) {
+  constructor(readonly source: ReviewedApplicationFillSourceSelection = { kind: "absent" }) {}
+  async reserveAndConsume(attemptIdentity: ApplicationSubmitIdentity, authorize: (client: PoolClient, mode: "new" | "replay", source: ReviewedApplicationFillSourceSelection) => Promise<{ kind: "authorized"; artifactHash: string; reviewedCoverLetter?: string } | { kind: "fenced" }>) {
     if (this.superseded) { this.audit.push("claim"); return { kind: "fenced" as const } }
     const existing = this.rows.get(attemptIdentity.approvalId)
-    const authorization = await authorize({} as PoolClient, existing ? "replay" : "new")
+    const authorization = await authorize({} as PoolClient, existing ? "replay" : "new", this.source)
     if (authorization.kind === "fenced") { this.audit.push("claim"); return { kind: "fenced" as const } }
     if (existing) return { kind: "replay" as const, attempt: existing, artifactHash: existing.artifactHash }
     const now = new Date()
     const attempt: SubmissionAttempt = { id: "attempt-a", userId: attemptIdentity.userId, jobId: attemptIdentity.jobId, receiptId: attemptIdentity.approvalId, constraintHash: attemptIdentity.constraintHash, artifactHash: authorization.artifactHash, state: "reserved", responseRef: null, errorCode: null, createdAt: now, updatedAt: now }
     this.rows.set(attemptIdentity.approvalId, attempt)
-    return { kind: "reserved" as const, attempt, artifactHash: authorization.artifactHash }
+    return { kind: "reserved" as const, attempt, artifactHash: authorization.artifactHash,
+      ...(authorization.reviewedCoverLetter ? { reviewedCoverLetter: authorization.reviewedCoverLetter } : {}) }
   }
   async isCurrent() { if (this.superseded) this.audit.push("pre_submit"); return !this.superseded }
   async markSubmitted(_identity: ApplicationSubmitIdentity, responseRef: string) {
@@ -57,10 +65,10 @@ function context(overrides: Record<string, unknown> = {}) {
   return { scope: { userId }, sessionId: identity.sessionId, turnId: identity.fillTurnId, stepId: "application.submit", taskId: identity.applicationTaskId, signal: new AbortController().signal, capabilities: ["submission"], reportProgress: vi.fn(), ...overrides }
 }
 function input(overrides: Record<string, unknown> = {}) { return { applicationTargetId: jobId, receiptId: identity.approvalId, constraintHash, ...overrides } }
-function harness(options: { resourceHash?: string; approvalError?: string; target?: ApplicationTarget | null } = {}) {
+function harness(options: { resourceHash?: string; approvalError?: string; target?: ApplicationTarget | null; source?: ReviewedApplicationFillSourceSelection } = {}) {
   const artifacts = new InMemoryArtifactToolStore()
   const base = artifacts.registerBase({ id: "artifact-a", type: "resume", jobId, userId, content: "verified resume" })
-  const attempts = new Attempts()
+  const attempts = new Attempts(options.source)
   const approvals: SubmissionApprovalStore = {
     inspectSubmissionInTransaction: vi.fn(async () => {
       if (options.approvalError) throw { code: options.approvalError }
@@ -79,6 +87,7 @@ function harness(options: { resourceHash?: string; approvalError?: string; targe
 }
 
 describe("application.submit typed tool", () => {
+  beforeEach(() => { reviewedRead.mockReset(); reviewedArtifact.mockReset() })
   it("matches the bare approved digest to the exact persisted artifact hash before submission", async () => {
     const tested = harness()
     await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "submitted", confirmationId: "confirmation-1" })
@@ -148,6 +157,50 @@ describe("application.submit typed tool", () => {
     const tested = harness()
     await expect(tested.tool.execute(context(), input({ formData: { email: "candidate@example.com" } }))).resolves.toMatchObject({ status: "failed", errorCode: "invalid_input", output: null })
     expect(tested.approvals.consumeSubmissionInTransaction).not.toHaveBeenCalled()
+  })
+
+  it("does not consume a reviewed approval through a provider without explicit material capability", async () => {
+    const tested = harness({ source: { kind: "selected", sourceTurnId: "source-turn" } })
+    await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "failed", errorCode: "submission_attempt_fenced" })
+    expect(tested.approvals.inspectSubmissionInTransaction).not.toHaveBeenCalled()
+    expect(tested.approvals.consumeSubmissionInTransaction).not.toHaveBeenCalled()
+    expect(tested.submit).not.toHaveBeenCalled()
+  })
+
+  it("does not downgrade an exact reviewed artifact to legacy mode when the Turn selector is absent", async () => {
+    const tested = harness()
+    reviewedArtifact.mockResolvedValue(true)
+    await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "failed", errorCode: "submission_attempt_fenced" })
+    expect(tested.approvals.consumeSubmissionInTransaction).not.toHaveBeenCalled()
+    expect(tested.submit).not.toHaveBeenCalled()
+  })
+
+  it("passes the transient reviewed cover letter only to a capability-aware provider after proof validation", async () => {
+    const tested = harness({ source: { kind: "selected", sourceTurnId: "source-turn" } })
+    Object.assign(tested.submit, { acceptsReviewedApplicationMaterial: true as const })
+    reviewedRead.mockResolvedValue({ artifactHash: tested.base.hash.slice("sha256:".length), reviewedCoverLetter: "verified letter" })
+    await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "submitted" })
+    expect(reviewedRead).toHaveBeenCalledWith(expect.objectContaining({
+      identity, sourceTurnId: "source-turn", currentSource: true,
+    }))
+    expect(tested.approvals.inspectSubmissionInTransaction).toHaveBeenCalledOnce()
+    expect(tested.approvals.consumeSubmissionInTransaction).toHaveBeenCalledOnce()
+    expect(tested.submit).toHaveBeenCalledWith(expect.objectContaining({ reviewedCoverLetter: "verified letter" }))
+  })
+
+  it("preserves a reviewed historical read-only replay without requiring provider capability", async () => {
+    const tested = harness({ source: { kind: "selected", sourceTurnId: "source-turn" } })
+    const artifactHash = tested.base.hash.slice("sha256:".length)
+    tested.attempts.rows.set(identity.approvalId, {
+      id: "attempt-a", userId, jobId, receiptId: identity.approvalId, constraintHash, artifactHash,
+      state: "submitted", responseRef: "prior-confirmation", errorCode: null, createdAt: new Date(), updatedAt: new Date(),
+    })
+    reviewedRead.mockResolvedValue({ artifactHash })
+    await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "replayed", confirmationId: "prior-confirmation" })
+    expect(tested.approvals.inspectSubmissionInTransaction).toHaveBeenCalledOnce()
+    expect(tested.approvals.consumeSubmissionInTransaction).not.toHaveBeenCalled()
+    expect(reviewedRead).toHaveBeenCalledWith(expect.objectContaining({ currentSource: false }))
+    expect(tested.submit).not.toHaveBeenCalled()
   })
 
   it("fails closed when the approved artifact hash is stale", async () => {

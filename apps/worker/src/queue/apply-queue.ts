@@ -257,6 +257,13 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
 
       if (operation === "submit" && submissionIdentity) {
         approvedTurnScope = await loadApprovedTurnScope(getPool(), submissionIdentity, executionId, workerTaskId);
+        const claim = await claimUnattendedSubmission(getPool(), submissionIdentity, workerTaskId);
+        if (claim === "superseded") { submissionSuperseded = true; return; }
+        if (claim !== "claimed") {
+          console.warn(`[apply-worker] Skipping stale or duplicate submit task for job=${jobId}`);
+          return;
+        }
+        submissionClaimed = true;
         if (await isApplicationSubmissionStopped(getPool(), approvedTurnScope)) {
           if (!await persistStoppedSubmission({ identity: submissionIdentity, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, startedAt })) {
             submissionSuperseded = true;
@@ -277,16 +284,6 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
             console.warn("[apply-worker] Agent turn state probe failed:", error instanceof Error ? error.message : String(error));
           },
         });
-      }
-
-      if (operation === "submit" && submissionIdentity) {
-        const claim = await claimUnattendedSubmission(getPool(), submissionIdentity, workerTaskId);
-        if (claim === "superseded") { submissionSuperseded = true; return; }
-        if (claim !== "claimed") {
-          console.warn(`[apply-worker] Skipping stale or duplicate submit task for job=${jobId}`);
-          return;
-        }
-        submissionClaimed = true;
       }
 
       const browserExecution = withCloakContext(userId, async (page) => {

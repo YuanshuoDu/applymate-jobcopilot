@@ -216,7 +216,7 @@ function SessionSupervisorPanel({ sessionId, timeline }: { readonly sessionId: s
           return result
         })}
         onReturnToCurrent={selectionControls.onReturnToCurrent} />
-      <SelectedJobDraftArtifact sessionId={sessionId} artifactRef={draftArtifactRef} />
+      <SelectedJobDraftArtifact sessionId={sessionId} artifactRef={draftArtifactRef} sourceTurnId={turns.find(turn => turn.id === selectedPreparationTurnId && turn.status === 'completed')?.id ?? null} />
       {timeline.cognitiveAgenda && <CognitiveAgendaCard agenda={timeline.cognitiveAgenda} agendas={timeline.cognitiveAgendas} taskLabels={agendaTaskLabels} />}
       {!loading && !nodes.length && !error && <p style={messageStyle}>{t('agent.noTaskRecords')}</p>}
       {!!nodes.length && <TaskTreePanel nodes={nodes} selectedId={selectedId} showHeading={false} onSelect={selectionControls.onSelect} />}

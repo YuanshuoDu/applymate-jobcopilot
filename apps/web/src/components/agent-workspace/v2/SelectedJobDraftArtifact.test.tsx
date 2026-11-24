@@ -15,6 +15,12 @@ describe('SelectedJobDraftArtifact', () => {
     const html = renderToStaticMarkup(<SelectedJobDraftArtifact sessionId="session-1" artifactRef={{ artifactId: 'draft-1', version: 1, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` }} />)
     expect(html).toContain('Cover letter draft v1')
     expect(html).not.toContain('data-draft-body')
+    expect(html).not.toContain('data-reviewed-application-review-request')
+  })
+
+  it('does not render an authenticated review action without a completed source Turn', () => {
+    const html = renderToStaticMarkup(<SelectedJobDraftArtifact sessionId="session-1" sourceTurnId={null} artifactRef={{ artifactId: 'draft-1', version: 1, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` }} />)
+    expect(html).not.toContain('data-reviewed-application-review-request')
   })
 
   it('fails closed on a malformed or identity-bearing artifact ref', () => {

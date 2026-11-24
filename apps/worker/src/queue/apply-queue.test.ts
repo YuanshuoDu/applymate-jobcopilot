@@ -942,6 +942,45 @@ describe("apply-queue (unit — mocked)", () => {
     expect(mockContext.close).not.toHaveBeenCalled();
   });
 
+  it("preserves the stopped outcome when the exact pre-marker attempt is claimed first", async () => {
+    const order: string[] = [];
+    const baseQuery = mockTurnClient.query.getMockImplementation();
+    mockTurnState.turnStatus = "interrupted";
+    mockTurnState.interrupted = true;
+    mockClaimUnattendedSubmission.mockImplementationOnce(async () => {
+      order.push("claim");
+      return "claimed";
+    });
+    mockTurnClient.query.mockImplementation(async (sql: string) => {
+      if (sql.includes('FROM "agent_turns"')) order.push("stop-check");
+      return baseQuery!(sql);
+    });
+
+    try {
+      await import("./apply-queue.js");
+      await mockProcessor({
+        data: {
+          applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1", sessionId: "agent-session-1", fillTurnId: "agent-turn-1",
+          applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+          receiptId: "approval-1", constraintHash: "c".repeat(64),
+        },
+      });
+    } finally {
+      if (baseQuery) mockTurnClient.query.mockImplementation(baseQuery);
+    }
+
+    expect(order).toEqual(["claim", "stop-check"]);
+    expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "failed" }));
+    expect(mockUpdateJobForSubmission).toHaveBeenCalledWith(expect.anything(), expectedSubmissionIdentity,
+      { status: "saved", workflowState: "ready_to_apply", expectedWorkflowStates: ["queued", "submitting"] },
+      "persist_stopped_submission");
+    expect(mockFinishApplicationTask).toHaveBeenCalledWith(expect.anything(), "application-task-1", "failed",
+      "turn_stopped_before_submit", expect.stringContaining("stopped before"), "submit", expectedSubmissionIdentity);
+    expect(mockMarkSubmissionRequestStarted).not.toHaveBeenCalled();
+    expect(mockWithCloakContext).not.toHaveBeenCalled();
+    expect(mockProviderSubmitClick).not.toHaveBeenCalled();
+  });
+
   it("aborts popup first requests at the intent URL and a different URL", async () => {
     configureMockBrowserSubmitTool();
     let allowed: boolean | undefined;
@@ -1271,6 +1310,7 @@ describe("apply-queue (unit — mocked)", () => {
 
   it("leaves an existing started marker untouched when the durable claim is unavailable", async () => {
     const task = { status: "filling", checkpoint: "submission_request_started" };
+    mockTurnState.turnStatus = "completed";
     mockClaimApplicationTask.mockResolvedValue(false);
     mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ status: task.status, checkpoint: task.checkpoint }] });
     mockClaimUnattendedSubmission.mockResolvedValue("unavailable");
@@ -1288,6 +1328,7 @@ describe("apply-queue (unit — mocked)", () => {
     expect(mockProviderSubmitClick).not.toHaveBeenCalled();
     expect(mockMarkSubmissionRequestStarted).not.toHaveBeenCalled();
     expect(mockClaimUnattendedSubmission).toHaveBeenCalledWith(expect.anything(), expectedSubmissionIdentity, "worker-task-test");
+    expect(mockTurnClient.query.mock.calls.some(([sql]) => String(sql).includes('FROM "agent_turns"'))).toBe(false);
     expect(mockFinishApplicationTask).not.toHaveBeenCalled();
     expect(mockUpdateJobForSubmission).not.toHaveBeenCalled();
     expect(mockInsertApplyResult).not.toHaveBeenCalled();

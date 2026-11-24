@@ -38,7 +38,7 @@ export {
 export type { ObjectiveLocationSteerReceipt, ObjectiveLocationSteerRequest } from './objective-location-steer.js'
 export { AgentTurnSchema, TurnSourceSchema, TurnStatusSchema } from './turn.js'
 export type { AgentTurn, TurnSource, TurnStatus } from './turn.js'
-export { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, TurnIntentSchema } from './turn-intent.js'
+export { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, REVIEWED_APPLICATION_REVIEW_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, TurnIntentSchema } from './turn-intent.js'
 export type { TurnIntent } from './turn-intent.js'
 export {
   VERIFIED_SHORTLIST_SELECTION_SCHEMA,

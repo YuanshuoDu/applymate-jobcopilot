@@ -40,6 +40,7 @@ export type ApprovalDecisionCommand = {
   expectedTurnId: string
   expectedRevision: number
   decision: "approved" | "rejected"
+  receiptNonce?: string
 }
 
 export type QuestionAnswerCommand = {
@@ -51,17 +52,22 @@ export type QuestionAnswerCommand = {
 
 export function parseApprovalDecision(bodyValue: unknown, request: Request): ApprovalDecisionCommand | NextResponse {
   const body = record(bodyValue)
-  if (!body || !allowed(body, ["schemaVersion", "clientMessageId", "expectedTurnId", "expectedRevision", "decision"])) {
+  if (!body || !allowed(body, ["schemaVersion", "clientMessageId", "expectedTurnId", "expectedRevision", "decision", "receiptNonce"])) {
     return invalid("Unsupported or forbidden approval decision field")
   }
   if (body.schemaVersion !== undefined && body.schemaVersion !== schemaVersion) return invalid("Unsupported command schema version")
   const clientMessageId = commandId(body, request)
   const expectedTurnId = text(body.expectedTurnId)
   const expectedRevision = revision(body.expectedRevision)
-  if (!clientMessageId || !expectedTurnId || expectedRevision === null || (body.decision !== "approved" && body.decision !== "rejected")) {
+  const hasReceiptNonce = body.receiptNonce !== undefined
+  const receiptNonce = typeof body.receiptNonce === "string" && /^[a-f0-9]{64}$/.test(body.receiptNonce)
+    ? body.receiptNonce : null
+  if (!clientMessageId || !expectedTurnId || expectedRevision === null || (body.decision !== "approved" && body.decision !== "rejected")
+    || hasReceiptNonce && (!receiptNonce || body.decision !== "approved")) {
     return invalid("Approval decision requires a command id, expected Turn revision, and decision")
   }
-  return { clientMessageId, expectedTurnId, expectedRevision, decision: body.decision }
+  return { clientMessageId, expectedTurnId, expectedRevision, decision: body.decision,
+    ...(receiptNonce ? { receiptNonce } : {}) }
 }
 
 export function parseQuestionAnswer(bodyValue: unknown, request: Request): QuestionAnswerCommand | NextResponse {

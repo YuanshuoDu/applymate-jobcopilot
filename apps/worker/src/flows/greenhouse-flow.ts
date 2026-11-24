@@ -26,9 +26,11 @@ const COVER_LETTER_SELECTORS = [
 
 export async function runGreenhouseFlow(
   page: Page,
-  task: ApplyTask
+  task: ApplyTask,
+  options?: { reviewedCoverLetter: string },
 ): Promise<HarnessResult> {
   const startedAt = Date.now();
+  if (options && !validReviewedCoverLetter(options.reviewedCoverLetter, task.persona.coverLetter)) return { status: "manual", error: "Reviewed cover letter could not be safely filled.", durationMs: Date.now() - startedAt, reviewReady: false, log: [] };
   if (task.dryRun) {
     console.log("[greenhouse-flow] Dry-run: skipping all fills and submit");
     return { status: "dry-run", turns: 1, durationMs: Date.now() - startedAt, log: [] };
@@ -36,6 +38,11 @@ export async function runGreenhouseFlow(
 
   const log: Array<{ field?: string; selector?: string; action: string }> = [];
   let filled = 0;
+
+  if (options && !await fillReviewedCoverLetter(page, options.reviewedCoverLetter, log)) {
+    return { status: "manual", error: "Reviewed cover letter could not be safely filled.", durationMs: Date.now() - startedAt, reviewReady: false, log };
+  }
+  if (options) filled++;
 
   // Fill personal info fields
   for (const field of PERSONAL_FIELDS) {
@@ -66,7 +73,7 @@ export async function runGreenhouseFlow(
     if (await uploadResume(page, RESUME_SELECTORS, task.resumePath, log)) filled++;
   }
 
-  if (task.persona.coverLetter) {
+  if (!options && task.persona.coverLetter) {
     if (await tryFill(page, COVER_LETTER_SELECTORS, task.persona.coverLetter.slice(0, 2000), "coverLetter", log)) filled++;
   }
 
@@ -75,7 +82,7 @@ export async function runGreenhouseFlow(
   await fillCustomQuestions(page, task.persona, log, task.confirmedAnswers);
 
   // Submit
-  if (task.allowSubmit !== true) {
+  if (options || task.allowSubmit !== true) {
     return { status: "manual", turns: 1, error: "Form filled and ready for user review.", durationMs: Date.now() - startedAt, log, reviewReady: true };
   }
   const submitSelectors = [
@@ -110,4 +117,19 @@ export async function runGreenhouseFlow(
     durationMs: Date.now() - startedAt,
     log,
   };
+}
+
+function validReviewedCoverLetter(content: string, personaValue: string | undefined): boolean {
+  return content.length > 0 && content.length <= 2000 && content === personaValue;
+}
+
+async function fillReviewedCoverLetter(page: Page, content: string, log: Array<{ field?: string; selector?: string; action: string }>): Promise<boolean> {
+  const selector = COVER_LETTER_SELECTORS.join(", ");
+  try {
+    const field = page.locator(selector);
+    if (await field.count() !== 1 || !await field.isVisible() || await field.inputValue() !== "") return false;
+    await field.fill(content);
+    log.push({ field: "coverLetter", selector, action: "fill" });
+    return true;
+  } catch { return false; }
 }

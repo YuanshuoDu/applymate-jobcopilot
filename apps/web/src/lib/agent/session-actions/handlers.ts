@@ -9,6 +9,7 @@ import { tailorResumeForAgent } from "@/lib/agent/resume-tailoring"
 import { applicationFillTaskGraphEnabled, queueApplicationFill } from "@/lib/auto-apply"
 import { assertActiveAccount, assertJobPreflight, assertUnattendedApplyEnabled, validateAutoApplyUrl } from "@/lib/auto-apply-guards"
 import { clientReceipt, consumeLegacyReceipt, issueLegacyReceipt, resolveLegacyApproval, validateLegacyReceipt } from "@/lib/agent/approval/legacy-receipt"
+import { readAcceptedReviewedFillSource } from "@/lib/agent/approval/reviewed-fill-source-binding"
 import { validatePendingApprovalReceipt } from "@/lib/agent/approval/store"
 import { ensureV2Turn } from "@/lib/agent/session/v2-turn"
 import { requireLegacyPolicy } from "@/lib/agent/policy/legacy"
@@ -220,7 +221,13 @@ export async function handleReviewApplicationApproval(sessionId: string, userId:
   const job = await db.job.findFirst({ where: { id: payload.jobId, userId }, select: { company: true, role: true, url: true } })
   if (!job) return err("Job not found", 404)
   try {
-    const queued = await queueApplicationFill({ userId, jobId: payload.jobId, applyUrl: job.url, applicationTaskId: payload.applicationTaskId, sessionId })
+    const binding = await readAcceptedReviewedFillSource(db, {
+      approvalId: approval.id, userId, sessionId, applicationTaskId: payload.applicationTaskId,
+      jobId: payload.jobId, ...(action.reviewedSourceTurnId ? { requestedSourceTurnId: action.reviewedSourceTurnId } : {}),
+    })
+    if (binding && !applicationFillTaskGraphEnabled()) return err("Reviewed material fill is unavailable while TaskGraph fill is disabled", 409)
+    const queued = await queueApplicationFill({ userId, jobId: payload.jobId, applyUrl: job.url, applicationTaskId: payload.applicationTaskId, sessionId,
+      ...(binding ? { reviewedSourceTurnId: binding.sourceTurnId } : {}) })
     const event = await db.agentTranscriptEvent.create({
       data: { sessionId, taskId: null, type: "application_queued", speaker: "Executor", title: "Form fill queued", durationMs: null, ...safeEventFields("application_queued", "The worker will fill this form without submitting it. Refresh this session when it is ready for final review.", { ...queued, jobId: payload.jobId, operation: "fill" }) },
     })

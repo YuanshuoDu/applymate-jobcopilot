@@ -69,7 +69,7 @@ export class CanonicalWaitFoundError extends Error {
 
 export async function resolveLegacyOnlyInTransaction(
   db: PrismaClient,
-  input: { approval: ScopedApprovalRecord; userId: string; sessionId: string; decision: "approved" | "rejected" },
+  input: { approval: ScopedApprovalRecord; userId: string; sessionId: string; decision: "approved" | "rejected"; reviewedSourceTurnId?: string },
   options: { beforeLegacyOnlyResolve?: () => Promise<void> },
 ): Promise<Extract<LegacyApprovalResolution, { disposition: "legacy_only" }>> {
   const approval = input.approval
@@ -113,6 +113,7 @@ export async function resolveLegacyOnlyInTransaction(
       sessionId: input.sessionId,
       decision: input.decision,
       now,
+      ...(input.reviewedSourceTurnId !== undefined ? { reviewedSourceTurnId: input.reviewedSourceTurnId } : {}),
     })
     await appendAgentEventWithOutboxInTransaction(tx, {
       sessionId: input.sessionId,

@@ -3,7 +3,7 @@ import { Prisma, PrismaClient } from "@prisma/client"
 import { appendAgentEventWithOutboxInTransaction } from "../session/fact-store"
 import { projectQuestionWaitInTransaction } from "./item-projector"
 import { waitItemId } from "./item-ids"
-import { resolvePendingApprovalInTransaction } from "../approval/decision"
+import { lockReviewedApprovalOwnersInTransaction, resolvePendingApprovalInTransaction, reviewedApplicationDecisionFields } from "../approval/decision"
 import { ApprovalStoreError } from "../approval/types"
 import {
   AgentWaitError,
@@ -24,6 +24,7 @@ import type {
 
 type Tx = Prisma.TransactionClient
 type JsonRecord = Record<string, unknown>
+type DuplicateWaitExpectation = { sessionId: string; turnId: string; waitKind: "approval" | "question"; waitId: string; status: "approved" | "rejected" | "answered" }
 
 const WAITING_STATUSES = new Set(["waiting_for_approval", "waiting_for_user"])
 
@@ -39,6 +40,14 @@ function commandKey(clientMessageId: string): string {
   return `agent-wait-command:${clientMessageId}`
 }
 
+function rethrowApprovalWaitError(error: unknown): never {
+  if (!(error instanceof ApprovalStoreError)) throw error
+  if (error.code === "approval_expired") throw waitExpired()
+  if (error.code === "approval_not_found") throw waitNotFound()
+  if (["approval_not_approved", "approval_already_consumed"].includes(error.code)) throw waitNotPending()
+  throw waitScopeMismatch()
+}
+
 async function lockSession(tx: Tx, sessionId: string, userId: string): Promise<void> {
   const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     SELECT "id" FROM "agent_sessions"
@@ -48,26 +57,24 @@ async function lockSession(tx: Tx, sessionId: string, userId: string): Promise<v
   if (!rows[0]) throw waitNotFound()
 }
 
-async function duplicateResult(tx: Tx, key: string): Promise<WaitCommandResult | null> {
-  const event = await tx.agentEvent.findFirst({
-    where: { idempotencyKey: key },
-    select: { sequence: true, payload: true },
-  })
+async function duplicateResult(tx: Tx, key: string, expected: DuplicateWaitExpectation): Promise<WaitCommandResult | null> {
+  const eventType = expected.waitKind === "approval" ? "approval.resolved" : "question.answered"
+  const event = await tx.agentEvent.findFirst({ where: { idempotencyKey: key, sessionId: expected.sessionId, turnId: expected.turnId,
+    type: eventType, correlationId: expected.waitId }, select: { sessionId: true, turnId: true, type: true, correlationId: true, sequence: true, payload: true } })
   if (!event) return null
   const payload = record(event.payload)
-  const kind = payload.waitKind === "approval" || payload.waitKind === "question" ? payload.waitKind : null
-  const waitId = typeof payload.waitId === "string" ? payload.waitId : null
-  const itemId = typeof payload.itemId === "string" ? payload.itemId : null
-  const turnId = typeof payload.turnId === "string" ? payload.turnId : null
-  if (!kind || !waitId || !itemId || !turnId) throw new AgentWaitError("wait_not_pending", "The previous wait command has incomplete state", 409)
+  const kind = payload.waitKind === expected.waitKind ? expected.waitKind : null, waitId = payload.waitId
+  const eventItemId = payload.itemId, turnId = payload.turnId
+  if (event.sessionId !== expected.sessionId || event.turnId !== expected.turnId || event.type !== eventType || event.correlationId !== expected.waitId
+    || kind !== expected.waitKind || waitId !== expected.waitId || eventItemId !== waitItemId(expected.waitKind, expected.waitId)
+    || turnId !== expected.turnId || payload.status !== expected.status) {
+    throw new AgentWaitError("wait_not_pending", "The previous wait command has incomplete state", 409)
+  }
   return {
-    waitKind: kind,
-    waitId,
-    itemId,
-    turnId,
+    waitKind: kind!, waitId: waitId as string, itemId: eventItemId as string, turnId: turnId as string,
     toolCallId: typeof payload.toolCallId === "string" ? payload.toolCallId : null,
     disposition: "duplicate",
-    status: payload.status === "answered" ? "answered" : payload.status === "rejected" ? "rejected" : "approved",
+    status: expected.status,
     nextTurnRevision: typeof payload.nextTurnRevision === "number" ? payload.nextTurnRevision : 0,
     sequence: event.sequence.toString(),
   }
@@ -184,8 +191,12 @@ export async function createQuestionWait(db: PrismaClient, input: QuestionWaitIn
 
 export async function decideApproval(db: PrismaClient, input: ApprovalDecisionInput): Promise<WaitCommandResult> {
   return db.$transaction(async (tx) => {
-    await lockSession(tx, input.sessionId, input.userId)
-    const duplicate = await duplicateResult(tx, commandKey(input.clientMessageId))
+    let reviewedOwnersLocked = false
+    try {
+      reviewedOwnersLocked = await lockReviewedApprovalOwnersInTransaction(tx, { approvalId: input.waitId, userId: input.userId, sessionId: input.sessionId, turnId: input.expectedTurnId })
+      if (!reviewedOwnersLocked) await lockSession(tx, input.sessionId, input.userId)
+    } catch (error) { rethrowApprovalWaitError(error) }
+    const duplicate = await duplicateResult(tx, commandKey(input.clientMessageId), { sessionId: input.sessionId, turnId: input.expectedTurnId, waitKind: "approval", waitId: input.waitId, status: input.decision })
     if (duplicate) return duplicate
     const itemId = waitItemId("approval", input.waitId)
     const { turn, item } = await activeWait(tx, { ...input, itemId }, "approval")
@@ -193,28 +204,19 @@ export async function decideApproval(db: PrismaClient, input: ApprovalDecisionIn
     const now = input.now ?? new Date()
     let approval
     try {
-      approval = await resolvePendingApprovalInTransaction(tx, {
-        id: input.waitId, userId: input.userId, sessionId: input.sessionId, decision: input.decision, now,
-      })
+      const decisionFields = await reviewedApplicationDecisionFields(tx, { userId: input.userId, sessionId: input.sessionId, approvalId: input.waitId,
+        turnId: turn.id, decision: input.decision, now, receiptNonce: input.receiptNonce, requestedSourceTurnId: input.reviewedSourceTurnId })
+      if (reviewedOwnersLocked !== Boolean(decisionFields.reviewedApplicationDecision)) throw waitScopeMismatch()
+      approval = await resolvePendingApprovalInTransaction(tx, { id: input.waitId, userId: input.userId, sessionId: input.sessionId, decision: input.decision, now, ...decisionFields })
     } catch (error) {
-      if (error instanceof ApprovalStoreError) {
-        if (error.code === "approval_expired") throw waitExpired()
-        if (error.code === "approval_not_found") throw waitNotFound()
-        if (error.code === "approval_not_approved" || error.code === "approval_already_consumed") throw waitNotPending()
-        throw waitScopeMismatch()
-      }
-      throw error
+      rethrowApprovalWaitError(error)
     }
     if (approval.turnId !== turn.id) throw waitScopeMismatch()
     const content = record(item.content)
     if (content.approvalId !== approval.id || content.toolCallId !== (approval.toolCallId ?? null) || content.scopeHash !== approval.scopeHash) throw waitScopeMismatch()
-    return finishWait(tx, {
-      sessionId: input.sessionId, userId: input.userId, waitKind: "approval", waitId: input.waitId, itemId, turnId: turn.id,
-      taskId: approval.taskId,
-      itemRevision: item.revision, turnRevision: turn.revision, toolCallId: approval.toolCallId,
-      status: input.decision, itemContent: { ...content, decision: input.decision, responseAvailable: true, respondedAt: now.toISOString() },
-      clientMessageId: input.clientMessageId,
-    })
+    return finishWait(tx, { sessionId: input.sessionId, userId: input.userId, waitKind: "approval", waitId: input.waitId, itemId, turnId: turn.id,
+      taskId: approval.taskId, itemRevision: item.revision, turnRevision: turn.revision, toolCallId: approval.toolCallId, status: input.decision,
+      itemContent: { ...content, decision: input.decision, responseAvailable: true, respondedAt: now.toISOString() }, clientMessageId: input.clientMessageId })
   })
 }
 
@@ -223,7 +225,7 @@ export async function answerQuestion(db: PrismaClient, input: QuestionAnswerInpu
   if (!answer || answer.length > 20_000) throw invalidAnswer("Answer must contain between 1 and 20,000 characters")
   return db.$transaction(async (tx) => {
     await lockSession(tx, input.sessionId, input.userId)
-    const duplicate = await duplicateResult(tx, commandKey(input.clientMessageId))
+    const duplicate = await duplicateResult(tx, commandKey(input.clientMessageId), { sessionId: input.sessionId, turnId: input.expectedTurnId, waitKind: "question", waitId: input.waitId, status: "answered" })
     if (duplicate) return duplicate
     const itemId = waitItemId("question", input.waitId)
     const { turn, item } = await activeWait(tx, { ...input, itemId }, "question")

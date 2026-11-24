@@ -6,20 +6,28 @@ import type { ApplicationSubmitIdentity } from "../queue/application-submit-fenc
 const identity: ApplicationSubmitIdentity = { sessionId: "session-a", fillTurnId: "turn-a", applicationTaskId: "application-a", userId: "user-a", jobId: "job-a", approvalId: "receipt-a", constraintHash: "c".repeat(64) }
 const savedAttempt: SubmissionAttempt = { id: "attempt-a", userId: identity.userId, jobId: identity.jobId, receiptId: identity.approvalId, constraintHash: identity.constraintHash, artifactHash: "a".repeat(64), state: "reserved", responseRef: null, errorCode: null, createdAt: new Date(), updatedAt: new Date() }
 
-function fixture(options: { fillTurnId?: string; attempt?: SubmissionAttempt | null } = {}) {
+function fixture(options: { fillTurnId?: string; attempt?: SubmissionAttempt | null; turnInputs?: unknown[]; missingInputRows?: boolean } = {}) {
   const calls: Array<{ sql: string; values?: unknown[] }> = []
   const audit: unknown[][] = []
   let attempt = options.attempt ?? null
+  let inputRead = 0
   const client = {
     query: vi.fn(async (sql: string, values?: unknown[]) => {
       calls.push({ sql, values })
       if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: identity.sessionId }], rowCount: 1 }
+      if (sql.startsWith('SELECT "input" FROM "agent_turns"')) {
+        const index = inputRead++
+        return options.missingInputRows ? { rows: [], rowCount: 0 }
+          : { rows: [{ input: options.turnInputs?.[index] ?? {} }], rowCount: 1 }
+      }
       if (sql.includes('FROM "agent_turns"')) return { rows: [{ id: identity.fillTurnId }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "filler-a" }], rowCount: 1 }
       if (sql.includes('INSERT INTO "application_task_events"')) { audit.push(values ?? []); return { rows: [], rowCount: 1 } }
       if (sql.includes('FROM "application_tasks"')) return { rows: [{ sessionId: identity.sessionId, fillTurnId: options.fillTurnId ?? identity.fillTurnId, fillTurnSessionId: options.fillTurnId === undefined ? identity.sessionId : "session-a", fillTurnUserId: identity.userId }], rowCount: 1 }
       if (sql.includes('FROM "Job"')) return { rows: [{ id: identity.jobId }], rowCount: 1 }
       if (sql === "SELECT set_config($1, $2, true)" || ["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [], rowCount: 1 }
+      if (sql.includes("pg_advisory_xact_lock")) return { rows: [{ transaction_id: "4" }], rowCount: 1 }
+      if (sql === "SELECT pg_current_xact_id()::text AS transaction_id") return { rows: [{ transaction_id: "4" }], rowCount: 1 }
       if (sql.includes('FROM "submission_attempt"')) return { rows: attempt ? [attempt] : [], rowCount: attempt ? 1 : 0 }
       if (sql.includes('INSERT INTO "submission_attempt"')) {
         attempt = { ...savedAttempt, id: String(values?.[0]), artifactHash: String(values?.[5]) }
@@ -58,12 +66,35 @@ describe("application submit pg repository", () => {
     expect(test.calls.map(call => call.sql)).toContain("COMMIT")
   })
 
+  it("takes the shared source fence before row locks for a marked Turn and passes the selection to authorization", async () => {
+    const marker = { reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source-turn" } }
+    const test = fixture({ turnInputs: [marker, marker] })
+    const authorize = vi.fn(async () => ({ kind: "authorized" as const, artifactHash: savedAttempt.artifactHash }))
+    await expect(test.repository.reserveAndConsume(identity, authorize)).resolves.toMatchObject({ kind: "reserved" })
+    const fenceIndex = test.calls.findIndex(call => call.sql.includes("pg_advisory_xact_lock"))
+    const sessionLockIndex = test.calls.findIndex(call => call.sql.includes('FROM "agent_sessions"') && call.sql.includes("FOR UPDATE"))
+    expect(fenceIndex).toBeGreaterThan(-1)
+    expect(fenceIndex).toBeLessThan(sessionLockIndex)
+    expect(authorize).toHaveBeenCalledWith(test.client, "new", { kind: "selected", sourceTurnId: "source-turn" })
+  })
+
+  it("does not authorize a changed selector or a selector whose exact owner row is missing", async () => {
+    const first = { reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source-a" } }
+    const second = { reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source-b" } }
+    const changed = fixture({ turnInputs: [first, second] }), authorize = vi.fn()
+    await expect(changed.repository.reserveAndConsume(identity, authorize)).resolves.toEqual({ kind: "fenced" })
+    expect(authorize).not.toHaveBeenCalled()
+    const missing = fixture({ missingInputRows: true })
+    await expect(missing.repository.reserveAndConsume(identity, authorize)).resolves.toEqual({ kind: "fenced" })
+    expect(authorize).not.toHaveBeenCalled()
+  })
+
   it("replays a matching receipt only after inspecting its approval in the same fenced transaction", async () => {
     const existing = { ...savedAttempt, state: "submitted" as const, responseRef: "confirmation-1" }
     const test = fixture({ attempt: existing })
     const authorize = vi.fn(async () => ({ kind: "authorized" as const, artifactHash: existing.artifactHash }))
     await expect(test.repository.reserveAndConsume(identity, authorize)).resolves.toMatchObject({ kind: "replay", attempt: existing })
-    expect(authorize).toHaveBeenCalledWith(test.client, "replay")
+    expect(authorize).toHaveBeenCalledWith(test.client, "replay", { kind: "absent" })
     expect(test.calls.some(call => call.sql.includes('INSERT INTO "submission_attempt"'))).toBe(false)
   })
 

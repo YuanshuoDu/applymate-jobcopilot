@@ -1,4 +1,4 @@
-import { NextRequest } from "next/server"
+import { NextRequest, NextResponse } from "next/server"
 
 import { decideApproval } from "@/lib/agent/broker/store"
 import { db } from "@/lib/db"
@@ -17,14 +17,14 @@ export const runtime = "nodejs"
 
 export async function GET(_request: NextRequest, context: RouteContext) {
   const auth = await requireAuth(_request)
-  if (isErrorResponse(auth)) return auth
+  if (isErrorResponse(auth)) return privateNoStore(auth)
   const { id: sessionId, approvalId } = await context.params
   try {
-    return ok(await reissueApprovalNonce(db, { approvalId, sessionId, userId: auth.userId }))
+    return privateNoStore(ok(await reissueApprovalNonce(db, { approvalId, sessionId, userId: auth.userId })))
   } catch (error: unknown) {
-    if (error instanceof ApprovalStoreError && error.code === "approval_expired") return err(error.message, 410)
-    if (error instanceof ApprovalStoreError && error.code === "approval_not_found") return err(error.message, 404)
-    return err(error instanceof Error ? error.message : "Approval receipt could not be refreshed", 409)
+    if (error instanceof ApprovalStoreError && error.code === "approval_expired") return privateNoStore(err(error.message, 410))
+    if (error instanceof ApprovalStoreError && error.code === "approval_not_found") return privateNoStore(err(error.message, 404))
+    return privateNoStore(err(error instanceof Error ? error.message : "Approval receipt could not be refreshed", 409))
   }
 }
 
@@ -36,6 +36,9 @@ export async function POST(request: NextRequest, context: RouteContext) {
   if (isResponse(body)) return body
   const command = parseApprovalDecision(body, request)
   if (command instanceof Response) return command
+  if (command.receiptNonce !== undefined && approvalId !== `reviewed-application-review:${command.expectedTurnId}`) {
+    return NextResponse.json({ error: { code: "wait_invalid_command", message: "Receipt is only accepted for a canonical reviewed application decision", details: {} } }, { status: 422 })
+  }
   try {
     const result = await decideApproval(db, {
       sessionId,
@@ -47,4 +50,9 @@ export async function POST(request: NextRequest, context: RouteContext) {
   } catch (error: unknown) {
     return waitErrorResponse(error)
   }
+}
+
+function privateNoStore<T extends Response>(response: T): T {
+  response.headers.set("Cache-Control", "private, no-store, max-age=0")
+  return response
 }

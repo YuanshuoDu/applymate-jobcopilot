@@ -1,6 +1,5 @@
 import type pg from "pg"
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, TurnIntentSchema, validate, type TenantScope, type RepositoryJsonValue, type TurnIntent, type TurnSource } from "@jobcopilot/agent-protocol"
-
 import { loadCanonicalTurnSnapshot } from "./context/canonical-turn-snapshot-loader.js"
 import type { SelectedJobMemoryRecord } from "./context/selected-job-memory.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
@@ -78,6 +77,7 @@ function turnIntent(value: unknown): CanonicalTurnIntent | undefined {
   if (parsed.kind === INTERACTIVE_DISCOVERY_INTENT.kind) return INTERACTIVE_DISCOVERY_INTENT
   if (parsed.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind) return OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT
   if (parsed.kind === SELECTED_JOB_BATCH_PREPARATION_INTENT.kind) return SELECTED_JOB_BATCH_PREPARATION_INTENT
+  if (parsed.kind === "reviewed_application_review") return parsed
   throw new Error("turn_intent_invalid")
 }
 

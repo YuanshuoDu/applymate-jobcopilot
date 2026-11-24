@@ -3,6 +3,26 @@ import { runGreenhouseFlow } from "./greenhouse-flow.js";
 import { detectFlow } from "./index.js";
 import type { Page } from "playwright-core";
 
+const COVER_LETTER_UNION = "textarea[name*='cover' i], textarea[id*='cover' i], textarea[placeholder*='cover' i]";
+
+function reviewedPage(options: { count?: number; visible?: boolean; value?: string } = {}) {
+  const field = {
+    count: vi.fn().mockResolvedValue(options.count ?? 1), isVisible: vi.fn().mockResolvedValue(options.visible ?? true),
+    inputValue: vi.fn().mockResolvedValue(options.value ?? ""), fill: vi.fn().mockResolvedValue(undefined),
+  };
+  const locator = { ...field, first: () => field };
+  const page = {
+    url: () => "https://boards.greenhouse.io/booking/jobs/123/applications/new",
+    locator: vi.fn(() => locator),
+    focus: vi.fn().mockResolvedValue(undefined), fill: vi.fn(), type: vi.fn(), click: vi.fn(), $$: vi.fn().mockResolvedValue([]),
+  } as unknown as Page;
+  return { page, field };
+}
+
+function reviewedTask(content: string) {
+  return { jobId: "job-1", applyUrl: "https://boards.greenhouse.io/booking/jobs/123", persona: { coverLetter: content }, jobTitle: "Engineer", jobCompany: "Booking", resumePath: "db:resume" };
+}
+
 function mockPage(url: string = "https://boards.greenhouse.io/booking/jobs/123/applications/new"): Page {
   return {
     url: () => url,
@@ -46,6 +66,61 @@ function mockPageNoSubmit(url = "https://boards.greenhouse.io/booking/jobs/789/a
 }
 
 describe("runGreenhouseFlow", () => {
+  it("fills exact reviewed text once into a unique visible empty textarea without submitting", async () => {
+    const content = "R".repeat(2000);
+    const { page, field } = reviewedPage();
+
+    const result = await runGreenhouseFlow(page, { ...reviewedTask(content), allowSubmit: true }, { reviewedCoverLetter: content });
+
+    expect(page.locator).toHaveBeenCalledTimes(1);
+    expect(page.locator).toHaveBeenCalledWith(COVER_LETTER_UNION);
+    expect(field.fill).toHaveBeenCalledTimes(1);
+    expect(field.fill).toHaveBeenCalledWith(content);
+    expect(result).toMatchObject({ status: "manual", reviewReady: true });
+    expect(result.log).toContainEqual({ field: "coverLetter", selector: COVER_LETTER_UNION, action: "fill" });
+    expect(page.fill).not.toHaveBeenCalled();
+    expect(page.type).not.toHaveBeenCalled();
+    expect(page.click).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["ambiguous", { count: 2 }], ["hidden", { visible: false }], ["pre-filled", { value: "candidate text" }],
+  ])("does not overwrite a %s field or fall back to generic typing", async (_name, options) => {
+    const { page, field } = reviewedPage(options);
+
+    const result = await runGreenhouseFlow(page, reviewedTask("Reviewed"), { reviewedCoverLetter: "Reviewed" });
+
+    expect(result).toMatchObject({ status: "manual", reviewReady: false });
+    expect(field.fill).not.toHaveBeenCalled();
+    expect(page.fill).not.toHaveBeenCalled();
+    expect(page.type).not.toHaveBeenCalled();
+    expect(page.click).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["over-limit", "R".repeat(2001), "R".repeat(2001)],
+    ["mismatched", "Reviewed", "Different"],
+  ])("rejects %s reviewed content without truncating or filling", async (_name, persona, reviewed) => {
+    const { page, field } = reviewedPage();
+
+    const result = await runGreenhouseFlow(page, reviewedTask(persona), { reviewedCoverLetter: reviewed });
+
+    expect(result).toMatchObject({ reviewReady: false });
+    expect(page.locator).not.toHaveBeenCalled();
+    expect(field.fill).not.toHaveBeenCalled();
+  });
+
+  it("preserves legacy cover-letter typing when no reviewed marker is supplied", async () => {
+    const { page, field } = reviewedPage();
+    const result = await runGreenhouseFlow(page, reviewedTask("Legacy"));
+
+    expect(result).toMatchObject({ reviewReady: true });
+    expect(page.fill).toHaveBeenCalledTimes(1);
+    expect(page.fill).toHaveBeenCalledWith(COVER_LETTER_UNION.split(", ")[0], "");
+    expect(page.type).toHaveBeenCalledTimes("Legacy".length);
+    expect(field.fill).not.toHaveBeenCalled();
+  });
+
   it("happy path: fields filled, submit clicked, URL matches → submitted", async () => {
     const page = mockPage();
     const result = await runGreenhouseFlow(page, {

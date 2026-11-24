@@ -1,8 +1,9 @@
 import type pg from "pg"
 
-import { createSelectedJobPreparation, type ArtifactSourceMaterial } from "../tools/artifact-tools.js"
+import type { ArtifactSourceMaterial } from "../tools/artifact-tools.js"
 import type { ArtifactToolRecord, ArtifactToolStore } from "../tools/artifact-tools.js"
-import { createPostgresReadToolDataSource } from "../tools/read-data-source.js"
+import { readAgentSelectedJobMaterial } from "@jobcopilot/shared"
+import { createPostgresAgentSelectedJobMaterialQueryClient } from "../tools/read-data-source.js"
 import type { SelectedJobPreparation } from "../tools/artifact-tools.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
@@ -132,37 +133,11 @@ export async function loadSelectedJobArtifactContext(
   userId: string,
   jobId: string,
 ): Promise<SelectedJobArtifactContextBundle> {
-  if (!userId.trim() || !jobId.trim()) throw new Error("selected_job_scope_invalid")
-  const source = createPostgresReadToolDataSource(pool)
-  const job = await source.getJob(userId, jobId)
-  if (!job) throw new Error("selected_job_not_found")
-  const [resumeResult, personaResult] = await Promise.all([
-    source.getBaseResume(userId, {}),
-    source.retrievePersona(userId, { useCase: "cover_letter" }),
-  ])
-  const resume = resumeResult.resume
-  if (!resume) throw new Error("selected_job_base_resume_missing")
-
-  const transientSources: ArtifactSourceMaterial[] = [
-    { sourceRef: `job:${job.id}`, content: job },
-    { sourceRef: `resume:${resume.id}`, content: resume.content },
-    ...personaResult.facts.map(fact => ({
-      sourceRef: `persona:${fact.id}`,
-      content: { id: fact.id, key: fact.key, value: fact.value, confidence: fact.confidence, sourceRef: fact.sourceRef },
-    })),
-  ]
-  const digestMaterials: ArtifactSourceMaterial[] = [
-    { sourceRef: `job:${job.id}`, content: job },
-    { sourceRef: `resume:${resume.id}`, content: resume },
-    ...personaResult.facts.map((fact, index) => ({
-      sourceRef: `persona:${fact.id}`,
-      content: { ...fact, rank: index + 1 },
-    })),
-  ]
+  const material = await readAgentSelectedJobMaterial(createPostgresAgentSelectedJobMaterialQueryClient(pool), { userId, jobId })
   return {
-    preparation: createSelectedJobPreparation(job.id, digestMaterials),
-    baseResumeId: resume.id,
-    transientSources,
+    preparation: material.preparation,
+    baseResumeId: material.baseResume.id,
+    transientSources: material.transientSources,
   }
 }
 

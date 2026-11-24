@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 
 import { Prisma } from "@prisma/client"
-import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, type InputContentPart, type TurnSource, type VerifiedShortlistSelectionBinding } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, REVIEWED_APPLICATION_REVIEW_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, type InputContentPart, type TurnSource, type VerifiedShortlistSelectionBinding } from "@jobcopilot/agent-protocol"
 
 import { appendAgentEventWithOutboxInTransaction } from "../../session/fact-store"
 import { selectObjectiveTailorExecutionBudgetSnapshot } from "./objective-tailor-execution-budget"
@@ -96,13 +96,16 @@ export async function createRootTurn(
   const goal = explicitGoal ?? (content.filter((part) => part.type === "text").map((part) => part.text).join("\n").trim() || "Process the provided content")
   const selectedJobBatch = command.source === "user" && intent?.kind === SELECTED_JOB_BATCH_PREPARATION_INTENT.kind && intent.version === SELECTED_JOB_BATCH_PREPARATION_INTENT.version && verifiedShortlistSelection !== undefined && selectedJobPreparation === undefined && verificationRequirements === undefined
   if ((intent?.kind === SELECTED_JOB_BATCH_PREPARATION_INTENT.kind || verifiedShortlistSelection !== undefined) && !selectedJobBatch) throw new Error("selected_job_batch_turn_binding_invalid")
+  const canonicalExecution = command.source === "user" && (selectedJobPreparation !== undefined
+    || (intent?.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind && intent.version === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version)
+    || (intent?.kind === REVIEWED_APPLICATION_REVIEW_INTENT.kind && intent.version === REVIEWED_APPLICATION_REVIEW_INTENT.version)
+    || selectedJobBatch)
   const turn = await tx.agentTurn.create({
     data: {
       id: randomUUID(),
       sessionId: command.sessionId,
       userId: command.userId,
-      ...(command.source === "user" && (selectedJobBatch || (intent?.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind
-        && intent.version === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version)) ? { executionMode: "canonical_task_graph" as const } : {}),
+      ...(canonicalExecution ? { executionMode: "canonical_task_graph" as const } : {}),
       status: "queued",
       source: command.source,
       input: json({

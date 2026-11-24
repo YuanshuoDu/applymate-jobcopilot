@@ -34,7 +34,45 @@ export { isSafeAiEndpoint } from "./safe-ai-endpoint.js";
 export { credentialContext, decryptSecret, encryptSecret, isEncryptedSecret, maskStoredSecret } from "./secret-crypto.js";
 export { pinnedFetch, validatePinnedUrl, type PinnedFetchOptions } from "./pinned-outbound.js";
 export { redactAgentEvent, redactSensitiveText, redactSensitiveValue } from "./agent-redaction.js";
+export {
+  REVIEWED_FILL_HANDOFF_SCHEMA,
+  REVIEWED_FILL_HANDOFF_TOPIC,
+  buildReviewedFillHandoffIntent,
+  buildReviewedFillHandoffOutboxData,
+  parseReviewedFillHandoffIntent,
+  parseReviewedFillHandoffOutboxRow,
+  reviewedFillHandoffIdempotencyKey,
+  type ReviewedFillHandoffIdentity,
+  type ReviewedFillHandoffIntent,
+  type ReviewedFillHandoffOutboxData,
+  type ReviewedFillHandoffOutboxRow,
+} from "./agent-reviewed-fill-handoff.js";
 export { hashAgentReceiptValue } from "./agent-receipt.js";
+export {
+  bindReviewedApplicationSubmissionMaterial,
+  buildApplicationSubmissionManifest,
+  hashApplicationSubmissionMaterial,
+  hashReviewedApplicationMaterialProof,
+  isApplicationSubmissionManifest,
+  isApplicationSubmissionMaterial,
+  matchesReviewedApplicationMaterialProof,
+  type ApplicationSubmissionManifest,
+  type ApplicationSubmissionMaterial,
+  type LegacyApplicationSubmissionManifest,
+  type LegacyApplicationSubmissionMaterial,
+  type ReviewedApplicationMaterialProof,
+  type ReviewedApplicationSubmissionManifest,
+  type ReviewedApplicationSubmissionMaterial,
+} from "./application-submission-material.js";
+export {
+  parseReviewedApplicationFillBrowserStartEvent,
+  parseReviewedApplicationFillSource,
+  REVIEWED_APPLICATION_FILL_BROWSER_START_SCHEMA,
+  REVIEWED_APPLICATION_FILL_SOURCE_SCHEMA,
+  type ReviewedApplicationFillBrowserStartBinding,
+  type ReviewedApplicationFillSourceSelection,
+} from "./application-reviewed-fill-proof.js";
+
 export {
   buildAgentSourceMaterialFenceKey,
   normalizeAgentSourceMaterialFenceError,
@@ -52,6 +90,20 @@ export {
   type ObjectiveApplicationResumeMaterial,
   type ObjectiveApplicationResumeWitness,
 } from "./agent-objective-application-resume-witness.js";
+export {
+  buildAgentSelectedJobMaterial,
+  readAgentSelectedJobBaseResume,
+  readAgentSelectedJobJob,
+  readAgentSelectedJobMaterial,
+  readAgentSelectedJobPersonaFacts,
+  type AgentSelectedJobJob,
+  type AgentSelectedJobMaterial,
+  type AgentSelectedJobMaterialQueryClient,
+  type AgentSelectedJobPersonaFact,
+  type AgentSelectedJobQueryParameter,
+  type AgentSelectedJobResume,
+  type AgentSelectedJobSourceMaterial,
+} from "./agent-selected-job-material.js";
 export {
   DISCOVERY_PERSONA_BYTE_LIMIT,
   DISCOVERY_PERSONA_FACT_LIMIT,

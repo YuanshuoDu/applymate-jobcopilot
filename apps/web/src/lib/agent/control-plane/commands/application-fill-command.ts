@@ -5,30 +5,33 @@ import { AgentCommandError, invalidCommand, isUniqueViolation } from "./errors"
 import { assertApplicationFillPreflight, assertApplicationFillRetryReady, lockApplicationFillTask } from "./application-fill-preflight"
 import { acceptInputFacts, createRootTurn, findActiveTurn, findExistingCommand, lockOpenSession, type CommandTransaction } from "./transaction"
 import type { CommandIdentity, CommandResult, InterruptCommand } from "./types"
+import { existingFillCommandResult, validateReviewedFillHandoff } from "../../approval/reviewed-fill-handoff"
+import { persistReviewedSourceOnFillTurn, reviewedSourceForExistingFillTurn, validateReviewedSourceForApplication } from "../../approval/reviewed-fill-source-binding"
 
 const START_CHECKPOINTS = ["materials_ready"]
 const CONTENT = [{ type: "text" as const, text: "Fill the server-bound application form for user review. Never submit it." }]
-
-async function existingFillResult(tx: CommandTransaction, turnId: string, identity: CommandIdentity): Promise<CommandResult> {
-  const turn = await tx.agentTurn.findFirst({
-    where: { id: turnId, sessionId: identity.sessionId, userId: identity.userId }, select: { id: true },
-  })
-  if (!turn) throw new AgentCommandError("retry_target_invalid", "The bound application fill Turn is unavailable", 409)
-  const input = await tx.agentInput.findFirst({
-    where: { sessionId: identity.sessionId, userId: identity.userId, targetTurnId: turnId },
-    orderBy: { createdAt: "asc" }, select: { id: true, acceptedSequence: true },
-  })
-  if (!input) throw new AgentCommandError("retry_target_invalid", "The bound application fill command is unavailable", 409)
-  return { inputId: input.id, turnId, disposition: "duplicate", originalDisposition: "started", sequence: input.acceptedSequence.toString() }
-}
 
 type FillCommand = {
   sessionId: string
   userId: string
   clientMessageId: string
   applicationTaskId: string
+  reviewedSourceTurnId?: string
+  reviewedSourceApprovalId?: string
+  reviewedSourcePredecessorTurnId?: string
   retry?: boolean
   resumeAfterUserInput?: boolean
+}
+
+async function acceptedReviewedSource(tx: CommandTransaction, command: FillCommand, identity: CommandIdentity): Promise<string | undefined> {
+  if (!command.reviewedSourceApprovalId) return undefined
+  return (await validateReviewedFillHandoff(tx, {
+    approvalId: command.reviewedSourceApprovalId,
+    ...(command.reviewedSourceTurnId ? { sourceTurnId: command.reviewedSourceTurnId } : {}),
+    ...(command.reviewedSourcePredecessorTurnId ? { predecessorTurnId: command.reviewedSourcePredecessorTurnId } : {}),
+    applicationTaskId: command.applicationTaskId, clientMessageId: identity.clientMessageId,
+    userId: identity.userId, sessionId: identity.sessionId,
+  })).sourceTurnId
 }
 
 export async function startApplicationFillForReview(db: PrismaClient, command: FillCommand): Promise<CommandResult> {
@@ -37,24 +40,31 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
     if (typeof value !== "string" || !value.trim() || value.length > 256) throw invalidCommand(`Application fill requires a valid ${name}`)
   }
   if ((command.retry !== undefined && typeof command.retry !== "boolean") || (command.resumeAfterUserInput !== undefined && typeof command.resumeAfterUserInput !== "boolean")
-    || (command.retry && command.resumeAfterUserInput)) throw invalidCommand("Application fill retry and user-input resume are separate actions")
+    || (command.retry && command.resumeAfterUserInput)
+    || (command.reviewedSourceTurnId && !command.reviewedSourceApprovalId)
+    || (command.reviewedSourcePredecessorTurnId && !command.reviewedSourceApprovalId)
+    || (command.reviewedSourceApprovalId && (command.retry || command.resumeAfterUserInput))) {
+    throw invalidCommand("Application fill retry and user-input resume are separate actions")
+  }
   const identity: CommandIdentity = { sessionId: command.sessionId, userId: command.userId, clientMessageId: command.clientMessageId, source: "user" }
   try {
     return await db.$transaction(async (tx) => {
       await lockOpenSession(tx, identity.sessionId, identity.userId)
-      if (!command.resumeAfterUserInput) {
-        const existing = await findExistingCommand(tx, identity.sessionId, identity.clientMessageId)
-        if (existing) {
-          if (!existing.targetTurnId) throw new AgentCommandError("turn_not_active", "Duplicate application fill has no target Turn", 409)
-          return { inputId: existing.id, turnId: existing.targetTurnId, disposition: "duplicate", originalDisposition: "started", sequence: existing.acceptedSequence.toString() }
-        }
+      const existing = command.resumeAfterUserInput ? null : await findExistingCommand(tx, identity.sessionId, identity.clientMessageId)
+      if (existing && !command.reviewedSourceApprovalId) {
+        if (!existing.targetTurnId) throw new AgentCommandError("turn_not_active", "Duplicate application fill has no target Turn", 409)
+        return existingFillCommandResult(tx, existing.targetTurnId, identity, undefined, existing)
       }
-
       const fillTaskLock = command.retry
         ? await lockApplicationFillTask(tx, command.applicationTaskId, identity, true, { explicitUserRetry: true })
         : await lockApplicationFillTask(tx, command.applicationTaskId, identity, false)
       const { task, stoppedRetryReady } = fillTaskLock
       if (!task) throw new AgentCommandError("agent_session_not_found", "Application task not found", 404)
+      const acceptedReviewedSourceTurnId = await acceptedReviewedSource(tx, command, identity)
+      if (existing) {
+        if (!existing.targetTurnId || existing.targetTurnId !== task.fillTurnId) throw new AgentCommandError("retry_target_invalid", "Duplicate reviewed fill has conflicting task state", 409)
+        return existingFillCommandResult(tx, existing.targetTurnId, identity, acceptedReviewedSourceTurnId, existing)
+      }
       if (command.resumeAfterUserInput) {
         if (task.fillTurnId && task.fillTurnSessionId === identity.sessionId && task.fillTurnUserId === identity.userId) {
           if (task.status !== "waiting_for_user" || task.checkpoint !== "form_answer_required") {
@@ -66,7 +76,7 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
             const existing = await findExistingCommand(tx, identity.sessionId, resumeIdentity.clientMessageId)
             if (existing) {
               if (!existing.targetTurnId || existing.targetTurnId !== task.fillTurnId) throw new AgentCommandError("retry_target_invalid", "The user-input resume command is bound to another Turn", 409)
-              return existingFillResult(tx, existing.targetTurnId, identity)
+              return existingFillCommandResult(tx, existing.targetTurnId, identity)
             }
             await assertApplicationFillPreflight(tx, command.applicationTaskId, identity)
             const interrupt: InterruptCommand = {
@@ -76,7 +86,11 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
               expectedRevision: resume.active.revision,
             }
             await interruptActiveTurn(tx, interrupt, resume.active, { taskGraphFillCancellation: "preserve" })
-            return await createFillTurn(tx, resumeIdentity, task, command.applicationTaskId, true)
+            const reviewedSourceTurnId = await reviewedSourceForExistingFillTurn(tx, {
+              turnId: task.fillTurnId, userId: identity.userId, sessionId: identity.sessionId,
+              applicationTaskId: command.applicationTaskId,
+            })
+            return await createFillTurn(tx, resumeIdentity, task, command.applicationTaskId, true, reviewedSourceTurnId)
           }
         }
         throw new AgentCommandError("retry_target_invalid", "Application task is not ready to resume after persisted user answers", 409)
@@ -85,9 +99,8 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
         if (task.fillTurnSessionId !== identity.sessionId || task.fillTurnUserId !== identity.userId) {
           throw new AgentCommandError("agent_session_not_found", "Application fill ownership did not match", 404)
         }
-        return existingFillResult(tx, task.fillTurnId, identity)
+        return existingFillCommandResult(tx, task.fillTurnId, identity, acceptedReviewedSourceTurnId)
       }
-
       if (command.retry) {
         if (!stoppedRetryReady) await assertApplicationFillRetryReady(tx, task, identity, { explicitUserRetry: true })
       } else if (task.status !== "waiting_for_user" || !START_CHECKPOINTS.includes(task.checkpoint ?? "")) {
@@ -96,7 +109,14 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
       const active = await findActiveTurn(tx, identity.sessionId, identity.userId)
       if (active) throw new AgentCommandError("retry_active_conflict", "Finish or stop the active Turn before starting an application fill", 409, { turnId: active.id })
       await assertApplicationFillPreflight(tx, command.applicationTaskId, identity)
-      return createFillTurn(tx, identity, task, command.applicationTaskId)
+      const reviewedSourceTurnId = acceptedReviewedSourceTurnId ?? (command.retry && task.fillTurnId
+        ? await reviewedSourceForExistingFillTurn(tx, { turnId: task.fillTurnId, userId: identity.userId,
+          sessionId: identity.sessionId, applicationTaskId: command.applicationTaskId }) : undefined)
+      if (reviewedSourceTurnId) await validateReviewedSourceForApplication(tx, {
+        sourceTurnId: reviewedSourceTurnId, userId: identity.userId, sessionId: identity.sessionId,
+        applicationTaskId: command.applicationTaskId,
+      })
+      return createFillTurn(tx, identity, task, command.applicationTaskId, false, reviewedSourceTurnId)
     })
   } catch (error: unknown) {
     if (!isUniqueViolation(error)) throw error
@@ -109,12 +129,13 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
       `)
       const task = rows[0]
       if (!task?.fillTurnId || task.fillTurnSessionId !== identity.sessionId || task.fillTurnUserId !== identity.userId) throw error
+      const acceptedReviewedSourceTurnId = await acceptedReviewedSource(tx, command, identity)
       if (command.resumeAfterUserInput) {
         const resumed = await existingResumedTurnResult(tx, task.fillTurnId, command.applicationTaskId, identity)
         if (!resumed) throw error
         return resumed
       }
-      return existingFillResult(tx, task.fillTurnId, identity)
+      return existingFillCommandResult(tx, task.fillTurnId, identity, acceptedReviewedSourceTurnId)
     })
   }
 }
@@ -125,8 +146,13 @@ async function createFillTurn(
   task: { id: string; status: string; checkpoint: string | null; fillTurnId: string | null },
   applicationTaskId: string,
   resumeSession = false,
+  reviewedSourceTurnId?: string,
 ): Promise<CommandResult> {
   const turn = await createRootTurn(tx, identity, CONTENT)
+  if (reviewedSourceTurnId) await persistReviewedSourceOnFillTurn(tx, {
+    turnId: turn.id, userId: identity.userId, sessionId: identity.sessionId,
+    clientMessageId: identity.clientMessageId, sourceTurnId: reviewedSourceTurnId,
+  })
   const accepted = await acceptInputFacts(tx, identity, CONTENT, turn, "follow_up", "started", true)
   const claim = await tx.applicationTask.updateMany({
     where: { id: applicationTaskId, userId: identity.userId, sessionId: identity.sessionId,
@@ -215,7 +241,7 @@ async function existingResumedTurnResult(
   const input = turn?.input && typeof turn.input === "object" && !Array.isArray(turn.input) ? turn.input as Record<string, unknown> : null
   const marker = input?.clientMessageId
   return typeof marker === "string" && marker.startsWith(`application-fill-resume:${applicationTaskId}:`)
-    ? existingFillResult(tx, turnId, identity) : null
+    ? existingFillCommandResult(tx, turnId, identity) : null
 }
 
 function hasConfirmedAnswers(value: unknown): boolean {

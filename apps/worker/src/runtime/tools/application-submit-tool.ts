@@ -6,6 +6,7 @@ import { assertSubmissionAuthorized } from "../../flows/helpers.js"
 import type { SubmissionRequestIntent } from "../../flows/submission-intent.js"
 import { createApplicationSubmitRepository, type ApplicationTarget, type SubmissionAttempt, type SubmissionClaim, type SubmissionClaimAuthorizer, type SubmissionAttemptWrite } from "../../db/application-submit-repo.js"
 import type { ApplicationSubmitIdentity } from "../../queue/application-submit-fence.js"
+import { hasReviewedSubmissionArtifact, readReviewedApplicationSubmitMaterial } from "../../db/reviewed-application-submit-material.js"
 import { createPgApprovalStore } from "../approval/pg-store.js"
 import { PgArtifactToolStore } from "./artifact-store-pg.js"
 import type { ArtifactToolRecord, ArtifactToolStore } from "./artifact-tools.js"
@@ -33,10 +34,11 @@ export interface SubmissionAttemptStore {
   markFailed(identity: ApplicationSubmitIdentity, errorCode: string): Promise<SubmissionAttemptWrite>
 }
 export type ApplicationSubmitProviderResult = { readonly confirmationId: string; readonly postSubmitUrl?: string | null }
-export type ApplicationSubmitProvider = (input: {
+export type ApplicationSubmitProvider = ((input: {
   readonly target: ApplicationTarget; readonly artifact: ArtifactToolRecord; readonly context: ToolExecutionContext
   readonly beforeSubmit: (intent?: SubmissionRequestIntent) => Promise<boolean>
-}) => Promise<ApplicationSubmitProviderResult>
+  readonly reviewedCoverLetter?: string
+}) => Promise<ApplicationSubmitProviderResult>) & { readonly acceptsReviewedApplicationMaterial?: true }
 export type ApplicationSubmitToolDependencies = {
   readonly identity: ApplicationSubmitIdentity; readonly targets: { findTarget(userId: string, applicationTargetId: string): Promise<ApplicationTarget | null> }
   readonly attempts: SubmissionAttemptStore; readonly approvals: SubmissionApprovalStore; readonly artifacts: ArtifactToolStore
@@ -104,11 +106,30 @@ export function createApplicationSubmitTool(deps: ApplicationSubmitToolDependenc
       try {
         const target = await deps.targets.findTarget(identity.userId, value.applicationTargetId)
         if (!target || target.userId !== identity.userId || target.jobId !== identity.jobId || target.id !== identity.jobId) return failed("target_not_found")
-        const authorize: SubmissionClaimAuthorizer = async (client, mode) => {
-          const approval = mode === "new"
-            ? await deps.approvals.consumeSubmissionInTransaction(client, identity.approvalId, identity, now)
-            : await deps.approvals.inspectSubmissionInTransaction(client, identity.approvalId, identity, now)
-          return approval ? { kind: "authorized", artifactHash: approval.scope.resourceHash } : { kind: "fenced" }
+        const authorize: SubmissionClaimAuthorizer = async (client, mode, source) => {
+          if (source.kind === "invalid") return { kind: "fenced" }
+          if (source.kind === "absent") {
+            if (mode === "new" && await hasReviewedSubmissionArtifact(client, identity)) return { kind: "fenced" }
+            const approval = mode === "new"
+              ? await deps.approvals.consumeSubmissionInTransaction(client, identity.approvalId, identity, now)
+              : await deps.approvals.inspectSubmissionInTransaction(client, identity.approvalId, identity, now)
+            return approval ? { kind: "authorized", artifactHash: approval.scope.resourceHash } : { kind: "fenced" }
+          }
+          if (mode === "new" && deps.submit.acceptsReviewedApplicationMaterial !== true) return { kind: "fenced" }
+          const approval = await deps.approvals.inspectSubmissionInTransaction(client, identity.approvalId, identity, now)
+          if (!approval) return { kind: "fenced" }
+          const reviewed = await readReviewedApplicationSubmitMaterial({ client, identity, sourceTurnId: source.sourceTurnId,
+            approval: { resourceHash: approval.scope.resourceHash, materialHash: approval.scope.materialHash, answersHash: approval.scope.answersHash },
+            currentSource: mode === "new" })
+          if (!reviewed) return { kind: "fenced" }
+          if (mode === "new") {
+            const consumed = await deps.approvals.consumeSubmissionInTransaction(client, identity.approvalId, identity, now)
+            if (!consumed || consumed.scope.resourceHash !== approval.scope.resourceHash
+              || consumed.scope.materialHash !== approval.scope.materialHash || consumed.scope.answersHash !== approval.scope.answersHash) {
+              throw Object.assign(new Error("Reviewed submission approval changed during validation."), { code: "submission_scope_mismatch" })
+            }
+          }
+          return { kind: "authorized", artifactHash: reviewed.artifactHash, ...(reviewed.reviewedCoverLetter ? { reviewedCoverLetter: reviewed.reviewedCoverLetter } : {}) }
         }
         const claim = await deps.attempts.reserveAndConsume(identity, authorize)
         if (claim.kind === "fenced") return failed("submission_attempt_fenced")
@@ -125,7 +146,9 @@ export function createApplicationSubmitTool(deps: ApplicationSubmitToolDependenc
           await deps.attempts.markFailed(identity, "submission_guard_denied")
           return failed("submission_guard_denied")
         }
-        const result = await deps.submit({ target, artifact, context, beforeSubmit })
+        const result = await deps.submit({ target, artifact, context, beforeSubmit,
+          ...(claim.kind === "reserved" && claim.reviewedCoverLetter !== undefined
+            && deps.submit.acceptsReviewedApplicationMaterial === true ? { reviewedCoverLetter: claim.reviewedCoverLetter } : {}) })
         if (!result.confirmationId.trim()) {
           await deps.attempts.markFailed(identity, "provider_invalid_response")
           return failed("provider_invalid_response")

@@ -14,6 +14,7 @@ import { evaluateUnattendedApplyControl } from "../../queue/unattended-apply-con
 import { checkRateLimit } from "../../rate-limit.js"
 import type { SubagentLease } from "./types.js"
 import { executeApplicationFillForReview, type ApplicationFillStageObservation } from "./application-fill-for-review.js"
+import { readSelectedJobReviewedArtifactWithClient, type SelectedJobReviewedArtifact } from "../selected-job-reviewed-artifact-read.js"
 
 vi.mock("node:fs", () => ({ unlinkSync: vi.fn() }))
 vi.mock("../../cloak/pool.js", () => ({ withCloakContext: vi.fn() }))
@@ -27,19 +28,32 @@ vi.mock("../../flows/helpers.js", () => ({ fillCustomQuestions: vi.fn() }))
 vi.mock("../../flows/index.js", () => ({ executeBrowserFill: vi.fn() }))
 vi.mock("../../queue/unattended-apply-control.js", () => ({ evaluateUnattendedApplyControl: vi.fn() }))
 vi.mock("../../rate-limit.js", () => ({ checkRateLimit: vi.fn() }))
+vi.mock("../selected-job-reviewed-artifact-read.js", () => ({ readSelectedJobReviewedArtifactWithClient: vi.fn() }))
 
 const browserPageMock = {
-  goto: vi.fn(async () => null),
+  goto: vi.fn(async (): Promise<Awaited<ReturnType<Page["goto"]>>> => null),
   close: vi.fn(async () => undefined),
+  setDefaultTimeout: vi.fn(),
   url: vi.fn(() => "https://boards.greenhouse.io/acme/jobs/123"),
+  locator: vi.fn(),
 }
 const browserPage = browserPageMock as unknown as Page
 
 type FillContextFixture = Record<string, unknown>
 type QueryResult = { rows: unknown[]; rowCount: number }
+const reviewedMaterial: SelectedJobReviewedArtifact = {
+  sourceTurnId: "source-turn-1", rootTaskId: "root-1", graphRevision: 2, jobId: "job-1", writerTaskId: "writer-1",
+  reviewerTaskId: "reviewer-1", reviewerToolCallId: "review-call-1", reviewHash: `sha256:${"a".repeat(64)}`,
+  artifactId: "artifact-1", version: 3, contentHash: `sha256:${"b".repeat(64)}`,
+  sourceDigest: `sha256:${"c".repeat(64)}`, content: "Exact reviewed letter\nSecond line.",
+}
+const reviewedTurnInput = { reviewedApplicationMaterialSource: {
+  schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: reviewedMaterial.sourceTurnId,
+} }
 
 function context(overrides: Record<string, unknown> = {}): FillContextFixture {
   return {
+    applicationTaskId: "application-task-1", jobId: "job-1", turnInput: {},
     applicationUserId: "user-1", applicationSessionId: "session-1", fillTurnId: "turn-1", fillTurnSessionId: "session-1", fillTurnUserId: "user-1",
     taskStatus: "filling", checkpoint: "taskgraph_fill_queued", resumeId: "resume-1", coverLetterId: null, confirmedAnswers: { salary: "€80,000" },
     jobUserId: "user-1", jobUrl: "https://boards.greenhouse.io/acme/jobs/123", jobTitle: "Engineer", jobCompany: "Acme", jobKeywords: "TypeScript",
@@ -66,19 +80,23 @@ function poolFor(row: FillContextFixture | null, options: { interruptBeforeStart
     if (sql === "BEGIN") { transactionStartedAt = Date.now(); return { rows: [], rowCount: 0 } }
     if (["COMMIT", "ROLLBACK"].includes(sql)) return { rows: [], rowCount: 0 }
     if (sql.includes("set_config")) return { rows: [], rowCount: 1 }
-    if (sql.includes('SELECT app."userId"')) return { rows: row ? [row] : [], rowCount: row ? 1 : 0 }
+    if (sql.includes("pg_advisory_xact_lock")) return { rows: [{ transaction_id: "123", lock_acquired: null }], rowCount: 1 }
+    if (sql === "SELECT pg_current_xact_id()::text AS transaction_id") return { rows: [{ transaction_id: "123" }], rowCount: 1 }
+    if (sql.includes('SELECT app."id" AS "applicationTaskId"')) return { rows: row ? [row] : [], rowCount: row ? 1 : 0 }
     if (sql.includes("SELECT status FROM agent_sessions")) {
       if (options.delaySessionLockMs) vi.setSystemTime(new Date(Date.now() + options.delaySessionLockMs))
       return { rows: [{ status: "running" }], rowCount: 1 }
     }
-    if (sql.includes("SELECT status FROM agent_turns")) return { rows: [{ status: typeof row?.turnStatus === "string" ? row.turnStatus : "in_progress" }], rowCount: 1 }
+    if (sql.includes('SELECT status, "input" FROM agent_turns')) return { rows: [{ status: typeof row?.turnStatus === "string" ? row.turnStatus : "in_progress", input: row?.turnInput ?? {} }], rowCount: 1 }
     if (sql.includes('SELECT sub."id"')) {
       const expiry = values?.[8] instanceof Date ? values[8].getTime() : Number.POSITIVE_INFINITY
       const checkedAt = sql.includes("clock_timestamp()") ? Date.now() : transactionStartedAt
       return options.interruptBeforeStart || expiry <= checkedAt ? { rows: [], rowCount: 0 } : { rows: [{ id: "child-1" }], rowCount: 1 }
     }
-    if (sql.includes('SELECT "status","checkpoint"')) return { rows: [{ status: "filling", checkpoint: "taskgraph_fill_queued" }], rowCount: 1 }
-    if (sql.startsWith("UPDATE application_tasks")) return { rows: [{ fillTurnId: "turn-1" }], rowCount: 1 }
+    if (sql.includes('SELECT "id", "jobId", "status", "checkpoint" FROM application_tasks')) return { rows: [{ id: row?.applicationTaskId ?? "application-task-1", jobId: row?.jobId ?? "job-1", status: "filling", checkpoint: row?.checkpoint ?? "taskgraph_fill_queued" }], rowCount: 1 }
+    if (sql.includes('FROM "application_task_events"')) return { rows: [], rowCount: 0 }
+    if (sql.includes('INSERT INTO "application_task_events"')) return { rows: [], rowCount: 1 }
+    if (sql.startsWith("UPDATE application_tasks")) return { rows: [{ id: "application-task-1" }], rowCount: 1 }
     throw new Error(`Unexpected query: ${sql}`)
   })
   const client = { query: queries, release: vi.fn() } as unknown as PoolClient
@@ -105,10 +123,36 @@ function setMocks(): void {
   vi.mocked(checkRateLimit).mockResolvedValue({ allowed: true } as Awaited<ReturnType<typeof checkRateLimit>>)
 }
 
-beforeEach(() => { vi.resetAllMocks(); setMocks() })
+function configureCoverLetterField(value: () => string, count = 1, tag = "textarea"): void {
+  browserPageMock.locator.mockImplementation(() => ({
+    count: vi.fn().mockResolvedValue(count),
+    evaluate: vi.fn(async (read: (element: Element) => unknown) => read({ tagName: tag, get value() { return value() } } as unknown as Element)),
+  } as never))
+}
+
+beforeEach(() => { vi.resetAllMocks(); setMocks(); vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(null) })
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers() })
 
 describe("executeApplicationFillForReview", () => {
+  it("sets a finite page-action timeout only after claiming reviewed material", async () => {
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    vi.mocked(detectBrowserWait).mockImplementation(async () => {
+      expect(browserPageMock.setDefaultTimeout).toHaveBeenCalledWith(30_000)
+      return null
+    })
+
+    await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(browserPageMock.setDefaultTimeout).toHaveBeenCalledOnce()
+    expect(detectBrowserWait).toHaveBeenCalledOnce()
+    browserPageMock.setDefaultTimeout.mockClear()
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(null)
+    vi.mocked(detectBrowserWait).mockResolvedValue(null)
+    await executeApplicationFillForReview({ pool: poolFor(context()).pool, lease: lease() })
+    expect(browserPageMock.setDefaultTimeout).not.toHaveBeenCalled()
+  })
+
   it.each([["role", { role: "analyst" }], ["task type", { taskType: "application_fill" }]])("rejects an unexpected exact %s before querying task context", async (_name, leaseOverride) => {
     const { pool, connects } = poolFor(context())
     const result = await executeApplicationFillForReview({ pool, lease: lease(leaseOverride as Partial<SubagentLease>) })
@@ -128,6 +172,31 @@ describe("executeApplicationFillForReview", () => {
     expect(stageObserver).toHaveBeenCalledWith({ stage: "entry_validation", outcome: "accepted", leaseLost: false, signalAborted: false })
     expect(stageObserver).toHaveBeenCalledWith({ stage: "completion", outcome: "completed", leaseLost: false, signalAborted: false })
     expect(Object.keys(observations[0]!).sort()).toEqual(["leaseLost", "outcome", "signalAborted", "stage"])
+  })
+
+  it("reports the closed reviewed browser acquisition phase sequence", async () => {
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    browserPageMock.goto.mockResolvedValueOnce({ ok: () => true } as unknown as Awaited<ReturnType<Page["goto"]>>)
+    const observations: ApplicationFillStageObservation[] = []
+    await executeApplicationFillForReview({ pool, lease: lease(), stageObserver: event => observations.push(event) })
+
+    expect(observations.filter(event => event.stage === "browser_acquisition").map(event => event.phase)).toEqual([
+      "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned",
+      "navigation_response_success", "destination_allowed", "wait_detection_returned", "outer_wait_clear", "executor_started", "fill_returned", "callback_settled", "context_returned",
+    ])
+    browserPageMock.url.mockReturnValueOnce("https://outside.example/")
+    const rejectedObservations: ApplicationFillStageObservation[] = []
+    await expect(executeApplicationFillForReview({ pool: poolFor(context({ turnInput: reviewedTurnInput })).pool,
+      lease: lease(), stageObserver: event => rejectedObservations.push(event) })).resolves.toMatchObject({ status: "waiting_for_user" })
+    expect(rejectedObservations.filter(event => event.stage === "browser_acquisition").map(event => event.phase)).toEqual([
+      "before_control_read", "before_pattern_read", "context_requested", "page_acquired", "navigation_returned",
+      "navigation_response_unavailable", "destination_rejected", "callback_settled", "context_returned",
+    ])
+    expect(executeBrowserFill).toHaveBeenCalledOnce()
+    const legacyObservations: ApplicationFillStageObservation[] = []
+    await executeApplicationFillForReview({ pool: poolFor(context()).pool, lease: lease(), stageObserver: event => legacyObservations.push(event) })
+    expect(legacyObservations.filter(event => event.stage === "browser_acquisition")).toEqual([])
   })
 
   it("distinguishes wait-persistence stale results from completion stale results", async () => {
@@ -189,10 +258,11 @@ describe("executeApplicationFillForReview", () => {
     })
     expect(JSON.stringify(fill)).not.toContain("attacker.test")
     expect(JSON.stringify(fill)).not.toContain("client-job")
+    expect(vi.mocked(executeBrowserFill).mock.calls[0]?.[1]).not.toHaveProperty("reviewedCoverLetter")
     expect(fillCustomQuestions).toHaveBeenCalledWith(browserPage, expect.objectContaining({ email: "db@example.test" }), [], { salary: "€80,000" })
     expect(vi.mocked(executeBrowserFill).mock.calls[0]?.[0]).not.toHaveProperty("confirmedAnswers")
     expect(JSON.stringify(vi.mocked(executeBrowserFill).mock.calls[0]?.[0])).not.toContain("€80,000")
-    expect(queries.mock.calls.find(([sql]) => sql.includes('SELECT app."userId"'))?.[1]).toEqual(["user-1", "session-1", "turn-1"])
+    expect(queries.mock.calls.find(([sql]) => sql.includes('SELECT app."id" AS "applicationTaskId"'))?.[1]).toEqual(["user-1", "session-1", "turn-1"])
     expect(completeApplicationFillForReview).toHaveBeenCalledWith(pool, { lease: expect.objectContaining({ turnId: "turn-1" }) })
     expect(executeBrowserFill).toHaveBeenCalledTimes(1)
   })
@@ -206,6 +276,132 @@ describe("executeApplicationFillForReview", () => {
     expect(withCloakContext).toHaveBeenCalledOnce()
     expect(executeBrowserFill).toHaveBeenCalledWith(expect.objectContaining({ submit: false }), expect.anything())
     expect(completeApplicationFillForReview).toHaveBeenCalledWith(pool, { lease: expect.objectContaining({ turnId: "turn-1" }) })
+  })
+
+  it("hands the exact current reviewed text to the private adapter despite stale legacy material", async () => {
+    const { pool, queries } = poolFor(context({
+      turnInput: reviewedTurnInput, coverLetterId: "legacy-letter", coverLetterContent: "Stale application letter",
+      jobCoverLetter: "Older job letter",
+    }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    let pageText = reviewedMaterial.content
+    configureCoverLetterField(() => pageText)
+    vi.mocked(executeBrowserFill).mockResolvedValue({ status: "manual", error: null, durationMs: 3, reviewReady: true, log: [{ field: "coverLetter", selector: "textarea#cover-letter", action: "fill" }] } as HarnessResult)
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+    const fill = vi.mocked(executeBrowserFill).mock.calls[0]?.[0] as Record<string, unknown>
+
+    expect(result).toMatchObject({ status: "completed", result: { status: "filled_for_user_review" } })
+    expect(fill).toMatchObject({ submit: false, persona: { coverLetter: reviewedMaterial.content } })
+    expect(fill).not.toHaveProperty("reviewedCoverLetter")
+    expect(vi.mocked(executeBrowserFill).mock.calls[0]?.[1]).toMatchObject({ reviewedCoverLetter: { content: reviewedMaterial.content } })
+    expect(browserPageMock.locator).toHaveBeenCalledWith("textarea#cover-letter")
+    expect(browserPageMock.locator.mock.results[0]?.value.evaluate).toHaveBeenCalledWith(expect.any(Function), undefined, { timeout: 1000 })
+    expect(JSON.stringify(queries.mock.calls)).not.toContain(reviewedMaterial.content)
+    const event = queries.mock.calls.find(([sql]) => String(sql).includes('INSERT INTO "application_task_events"'))
+    expect(event).toBeDefined()
+    expect(JSON.stringify(event)).not.toContain(reviewedMaterial.content)
+    expect(readSelectedJobReviewedArtifactWithClient).toHaveBeenCalledOnce()
+    const completion = vi.mocked(completeApplicationFillForReview).mock.calls[0]?.[1]
+    expect(completion?.reviewedFillReadback).toMatchObject({
+      schemaVersion: "agent-harness.v2.reviewed-application-fill-readback.v1", sourceTurnId: reviewedMaterial.sourceTurnId,
+      reviewedCoverLetterHash: expect.stringMatching(/^[a-f0-9]{64}$/), attemptCount: 1,
+    })
+    expect(JSON.stringify(completion?.reviewedFillReadback)).not.toContain(reviewedMaterial.content)
+  })
+
+  it("returns the stale_review wait produced by reviewed completion without claiming success", async () => {
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    configureCoverLetterField(() => reviewedMaterial.content)
+    vi.mocked(executeBrowserFill).mockResolvedValue({ status: "manual", error: null, durationMs: 3, reviewReady: true, log: [{ field: "coverLetter", selector: "textarea#cover-letter", action: "fill" }] } as HarnessResult)
+    vi.mocked(completeApplicationFillForReview).mockResolvedValue({ status: "waiting" })
+
+    await expect(executeApplicationFillForReview({ pool, lease: lease() })).resolves.toMatchObject({ status: "waiting_for_user", failureReason: "stale_review" })
+  })
+
+  it("does not claim the reviewed material was applied when the chosen form did not consume it", async () => {
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    vi.mocked(executeBrowserFill).mockResolvedValue({ status: "manual", error: null, durationMs: 3, reviewReady: true } as HarnessResult)
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(result).toMatchObject({ status: "waiting_for_user", failureReason: "review_required" })
+    expect(persistApplicationFillWait).toHaveBeenCalledWith(pool, expect.objectContaining({ checkpoint: "form_answer_required", detail: "review_required" }))
+    expect(completeApplicationFillForReview).not.toHaveBeenCalled()
+  })
+
+  it("waits when a supported flow truncates the reviewed letter", async () => {
+    const longLetter = "A".repeat(2501)
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue({ ...reviewedMaterial, content: longLetter })
+    configureCoverLetterField(() => longLetter.slice(0, 2000))
+    vi.mocked(executeBrowserFill).mockResolvedValue({ status: "manual", error: null, durationMs: 3, reviewReady: true, log: [{ field: "coverLetter", selector: "textarea#cover-letter", action: "fill" }] } as HarnessResult)
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(result).toMatchObject({ status: "waiting_for_user", failureReason: "review_required" })
+    expect(completeApplicationFillForReview).not.toHaveBeenCalled()
+  })
+
+  it("waits when a later custom-answer fill rewrites the reviewed letter", async () => {
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    let pageText = reviewedMaterial.content
+    configureCoverLetterField(() => pageText)
+    vi.mocked(fillCustomQuestions).mockImplementation(async () => { pageText = "overwritten by custom questions" })
+    vi.mocked(executeBrowserFill).mockResolvedValue({ status: "manual", error: null, durationMs: 3, reviewReady: true, log: [{ field: "coverLetter", selector: "textarea#cover-letter", action: "fill" }] } as HarnessResult)
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(result).toMatchObject({ status: "waiting_for_user", failureReason: "review_required" })
+    expect(fillCustomQuestions).toHaveBeenCalledOnce()
+    expect(completeApplicationFillForReview).not.toHaveBeenCalled()
+  })
+
+  it("requires a reliable successful selector from result.log and ignores result.items", async () => {
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    vi.mocked(executeBrowserFill).mockResolvedValue({
+      status: "manual", error: null, durationMs: 3, reviewReady: true,
+      items: [{ id: "browser-action:1", type: "browser_action", phase: "completed", action: "fill", selector: "textarea#cover-letter", field: "coverLetter", value: "[REDACTED]" }],
+    } as HarnessResult)
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(result).toMatchObject({ status: "waiting_for_user", failureReason: "review_required" })
+    expect(browserPageMock.locator).not.toHaveBeenCalled()
+    expect(completeApplicationFillForReview).not.toHaveBeenCalled()
+  })
+
+  it("waits when the exact selector is ambiguous or does not resolve to one input or textarea", async () => {
+    for (const option of [{ count: 2, tag: "textarea" }, { count: 1, tag: "div" }]) {
+      const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+      vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+      configureCoverLetterField(() => reviewedMaterial.content, option.count, option.tag)
+      vi.mocked(executeBrowserFill).mockResolvedValue({ status: "manual", error: null, durationMs: 3, reviewReady: true, log: [{ field: "coverLetter", selector: "textarea#cover-letter", action: "fill" }] } as HarnessResult)
+
+      const result = await executeApplicationFillForReview({ pool, lease: lease() })
+
+      expect(result).toMatchObject({ status: "waiting_for_user", failureReason: "review_required" })
+      expect(completeApplicationFillForReview).not.toHaveBeenCalled()
+      vi.resetAllMocks(); setMocks(); vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(null)
+    }
+  })
+
+  it("fails a stale reviewed selector before opening a browser and cannot fall back to legacy text", async () => {
+    const { pool, queries } = poolFor(context({ turnInput: reviewedTurnInput, coverLetterId: "legacy-letter", coverLetterContent: "Stale letter" }))
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(null)
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(result).toMatchObject({ status: "failed", failureReason: "fill_start_conflict" })
+    expect(readSelectedJobReviewedArtifactWithClient).toHaveBeenCalledOnce()
+    expect(withCloakContext).not.toHaveBeenCalled()
+    expect(executeBrowserFill).not.toHaveBeenCalled()
+    expect(queries.mock.calls.some(([sql]) => String(sql).includes('INSERT INTO "application_task_events"'))).toBe(false)
+    expect(queries.mock.calls.some(([sql]) => String(sql).startsWith("UPDATE application_tasks"))).toBe(false)
   })
 
   it("persists an uncertain wait when post-fill form inspection fails", async () => {
@@ -296,11 +492,14 @@ describe("executeApplicationFillForReview", () => {
     ["unknown_sensitive_field", "unknown_sensitive_field"], ["stale_review", "stale_review"],
   ])("maps %s to a fixed user wait", async (reason, detail) => {
     vi.mocked(detectBrowserWait).mockResolvedValue({ reason: reason as "captcha", message: "Never persist this page text" })
-    const { pool } = poolFor(context())
-    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+    vi.mocked(readSelectedJobReviewedArtifactWithClient).mockResolvedValue(reviewedMaterial)
+    const { pool } = poolFor(context({ turnInput: reviewedTurnInput }))
+    const observations: ApplicationFillStageObservation[] = []
+    const result = await executeApplicationFillForReview({ pool, lease: lease(), stageObserver: event => observations.push(event) })
     expect(result).toMatchObject({ status: "waiting_for_user", failureReason: detail })
     expect(persistApplicationFillWait).toHaveBeenCalledWith(pool, expect.objectContaining({ checkpoint: "form_answer_required", detail }))
     expect(JSON.stringify(vi.mocked(persistApplicationFillWait).mock.calls[0]?.[1])).not.toContain("Never persist this page text")
+    expect(observations).toContainEqual({ stage: "browser_acquisition", phase: "outer_wait_detected" })
     expect(executeBrowserFill).not.toHaveBeenCalled()
   })
 

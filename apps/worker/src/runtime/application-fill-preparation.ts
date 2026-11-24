@@ -1,5 +1,6 @@
 import type pg from "pg"
 import type { TurnLease } from "./turns/lease.js"
+import { reviewedApplicationFillSelector } from "./reviewed-application-fill-binding.js"
 
 /** A positive marker carries no ApplicationTask identity into model-visible context. */
 export type ApplicationFillPreparation = Readonly<{ available: true }>
@@ -7,9 +8,11 @@ export type ApplicationFillPreparation = Readonly<{ available: true }>
 type BoundApplicationTask = {
   id: string
   userId: string
+  jobId: string
   sessionId: string | null
   fillTurnSessionId: string | null
   fillTurnUserId: string | null
+  turnInput: unknown
   status: string
   checkpoint: string | null
 }
@@ -28,7 +31,8 @@ export async function loadApplicationFillPreparation(
     await client.query("BEGIN")
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", lease.userId])
     const bound = await client.query<BoundApplicationTask>(
-      `SELECT app."id", app."userId", app."sessionId", app."fillTurnSessionId", app."fillTurnUserId", app."status", app."checkpoint"
+      `SELECT app."id", app."userId", app."jobId", app."sessionId", app."fillTurnSessionId", app."fillTurnUserId", app."status", app."checkpoint",
+              turn."input" AS "turnInput"
        FROM "agent_turns" AS turn
        INNER JOIN "application_tasks" AS app ON app."fillTurnId" = turn."id"
        WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
@@ -48,6 +52,19 @@ export async function loadApplicationFillPreparation(
     }
     if (task.status !== "filling" || task.checkpoint !== "taskgraph_fill_queued") {
       throw new Error("application_fill_state_invalid")
+    }
+
+    const selector = reviewedApplicationFillSelector(task.turnInput)
+    if (selector.kind === "invalid") return await commitUnavailable(client, () => { committed = true })
+    if (selector.kind === "selected") {
+      // The terminal reader imports TaskGraph state; defer loading it until the marked path.
+      const { readSelectedJobReviewedArtifactWithClient } = await import("./selected-job-reviewed-artifact-read.js")
+      const proof = await readSelectedJobReviewedArtifactWithClient(client, {
+        userId: lease.userId, sessionId: lease.sessionId, jobId: task.jobId, sourceTurnId: selector.sourceTurnId,
+      })
+      if (!proof || proof.jobId !== task.jobId || proof.sourceTurnId !== selector.sourceTurnId) {
+        return await commitUnavailable(client, () => { committed = true })
+      }
     }
 
     const materials = await client.query<{ id: string }>(

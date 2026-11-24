@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from '@jobcopilot/agent-protocol'
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, REVIEWED_APPLICATION_REVIEW_INTENT } from '@jobcopilot/agent-protocol'
 
 import { isRetryableTurnStatus, parsePersistedRetryContent } from './retry-input'
 import { RETRY_LINEAGE_SCHEMA_VERSION } from './retry-lineage'
@@ -76,6 +76,16 @@ describe('persisted retry input', () => {
       intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
       verificationRequirements,
     })
+  })
+
+  it('does not replay an approval-producing reviewed application intent through generic Retry', () => {
+    expect(() => parsePersistedRetryContent('turn-review', {
+      goal: 'Review selected materials for application fill',
+      clientMessageId: 'review-message-1',
+      content: [{ type: 'text', text: 'Review the selected materials.' }],
+      selectedJobPreparation: { jobId: 'job_1' },
+      intent: { ...REVIEWED_APPLICATION_REVIEW_INTENT, sourceTurnId: 'source-turn-1' },
+    })).toThrow()
   })
 
   it('rejects location verification requirements when the capability gate is off', () => {

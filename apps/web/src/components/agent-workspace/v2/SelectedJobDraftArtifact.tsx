@@ -1,22 +1,30 @@
 'use client'
 
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { useSession } from 'next-auth/react'
 
 import { useI18n, type Lang } from '@/lib/i18n'
 
 import { parseDraftArtifactPayload, selectedDraftArtifactUrl, validArtifactRef, type DraftArtifactPayload, type DraftArtifactRef, type DraftEvidenceKind, type DraftEvidenceFreshness, type DraftReview } from './draft-artifact-projection'
+import { canRequestReviewedApplicationReview, isCurrentReviewedApplicationReviewRequest, postReviewedApplicationReview, reviewedApplicationReviewIdForSelection } from './reviewed-application-review-action'
 
 interface Snapshot { readonly key: string; readonly payload: DraftArtifactPayload | null; readonly loading: boolean; readonly error: boolean }
+interface RequestSnapshot { readonly key: string; readonly status: 'pending' | 'accepted' | 'failed' }
 
-export function SelectedJobDraftArtifact({ sessionId, artifactRef }: { readonly sessionId: string; readonly artifactRef: DraftArtifactRef | null }) {
+export function SelectedJobDraftArtifact({ sessionId, artifactRef, sourceTurnId = null }: { readonly sessionId: string; readonly artifactRef: DraftArtifactRef | null; readonly sourceTurnId?: string | null }) {
   const { data: authSession, status: authStatus } = useSession()
   const { lang } = useI18n()
   const userId = authStatus === 'authenticated' ? authSession?.user?.id ?? null : null
   const ref = artifactRef && validArtifactRef(artifactRef) ? artifactRef : null
-  const key = ref ? `${userId ?? 'anonymous'}:${sessionId}:${ref.artifactId}:${ref.version}:${ref.contentHash}:${ref.sourceDigest}` : `${userId ?? 'anonymous'}:${sessionId}:none`
+  const key = JSON.stringify([userId ?? 'anonymous', sessionId, sourceTurnId, ref?.artifactId, ref?.version, ref?.contentHash, ref?.sourceDigest])
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
+  const [requestSnapshot, setRequestSnapshot] = useState<RequestSnapshot | null>(null)
+  const requestLockRef = useRef<string | null>(null)
+  const requestIdsRef = useRef(new Map<string, string>())
+  const currentKeyRef = useRef(key)
+  currentKeyRef.current = key
   const visible = snapshot?.key === key ? snapshot : null
+  const requestStatus = requestSnapshot?.key === key ? requestSnapshot.status : null
 
   useEffect(() => {
     if (!userId || !ref) {
@@ -42,8 +50,28 @@ export function SelectedJobDraftArtifact({ sessionId, artifactRef }: { readonly 
 
   const payload = visible?.payload
   const copy = lang === 'zh'
-    ? { title: `${payload?.job.role ?? '求职信草稿'} · ${payload?.job.company ?? ''} v${ref.version}`, loading: '正在加载已保存的草稿…', unavailable: '此会话中无法读取该草稿。', historical: '此版本不是已确认的当前草稿；此前的审核结果已过期。', evidence: '引用', sourceEvidence: '来源证据', review: '审核', noReview: '尚无审核结果' }
-    : { title: `${payload ? `${payload.job.role} · ${payload.job.company}` : 'Cover letter draft'} v${ref.version}`, loading: 'Loading persisted draft…', unavailable: 'This draft is unavailable in this session.', historical: 'This is not the confirmed current draft; any prior review is stale.', evidence: 'References', sourceEvidence: 'Source evidence', review: 'Review', noReview: 'No review receipt yet' }
+    ? { title: `${payload?.job.role ?? '求职信草稿'} · ${payload?.job.company ?? ''} v${ref.version}`, loading: '正在加载已保存的草稿…', unavailable: '此会话中无法读取该草稿。', historical: '此版本不是已确认的当前草稿；此前的审核结果已过期。', evidence: '引用', sourceEvidence: '来源证据', review: '审核', noReview: '尚无审核结果', requestReview: '请求申请审核', requestingReview: '正在发起申请审核…', requestAccepted: '申请审核请求已开始。', requestFailed: '无法发起申请审核，请稍后重试。' }
+    : { title: `${payload ? `${payload.job.role} · ${payload.job.company}` : 'Cover letter draft'} v${ref.version}`, loading: 'Loading persisted draft…', unavailable: 'This draft is unavailable in this session.', historical: 'This is not the confirmed current draft; any prior review is stale.', evidence: 'References', sourceEvidence: 'Source evidence', review: 'Review', noReview: 'No review receipt yet', requestReview: 'Request application review', requestingReview: 'Starting application review…', requestAccepted: 'Application review request started.', requestFailed: 'Could not start the application review. Try again later.' }
+  const eligible = Boolean(payload && canRequestReviewedApplicationReview({
+    authenticated: Boolean(userId && authStatus === 'authenticated'), sourceTurnId,
+    isCurrentVersion: payload.isCurrentVersion, reviewStatus: payload.review?.status ?? null,
+    sourceFreshness: payload.sourceEvidence.freshness,
+  }))
+  const requestReview = () => {
+    if (!eligible || !userId || !sourceTurnId || requestLockRef.current === key || requestStatus === 'accepted' || requestStatus === 'pending') return
+    const requestKey = key
+    requestLockRef.current = requestKey
+    const idempotencyKey = reviewedApplicationReviewIdForSelection(requestIdsRef.current, requestKey)
+    setRequestSnapshot({ key: requestKey, status: 'pending' })
+    void postReviewedApplicationReview({ sessionId, sourceTurnId, idempotencyKey })
+      .then(() => {
+        if (isCurrentReviewedApplicationReviewRequest(currentKeyRef.current, requestKey)) setRequestSnapshot({ key: requestKey, status: 'accepted' })
+      })
+      .catch(() => {
+        if (isCurrentReviewedApplicationReviewRequest(currentKeyRef.current, requestKey)) setRequestSnapshot({ key: requestKey, status: 'failed' })
+      })
+      .finally(() => { if (requestLockRef.current === requestKey) requestLockRef.current = null })
+  }
 
   return (
     <article aria-label={copy.title} data-selected-job-draft="true" data-draft-version={ref.version} style={cardStyle}>
@@ -58,6 +86,13 @@ export function SelectedJobDraftArtifact({ sessionId, artifactRef }: { readonly 
         <div style={metadataStyle}><strong>{copy.review}: {payload.review ? localizedReviewStatus(payload.review.status, lang) : copy.noReview}</strong>
           {payload.review?.findings.map((finding, index) => <div key={`${finding.code}:${index}`} style={findingStyle}><span>{finding.severity} · {finding.code}: </span>{finding.message}{renderRefs(finding.evidenceRefs)}</div>)}
         </div>
+        {eligible && <section data-reviewed-application-review-request="true" style={requestStyle}>
+          <button type="button" onClick={requestReview} disabled={requestStatus === 'pending' || requestStatus === 'accepted'} style={requestButtonStyle}>
+            {requestStatus === 'pending' ? copy.requestingReview : copy.requestReview}
+          </button>
+          {requestStatus === 'accepted' && <p role="status" aria-live="polite" style={hintStyle}>{copy.requestAccepted}</p>}
+          {requestStatus === 'failed' && <p role="alert" style={hintStyle}>{copy.requestFailed}</p>}
+        </section>}
       </>}
     </article>
   )
@@ -117,3 +152,5 @@ const refsStyle: React.CSSProperties = { display: 'grid', gap: 2, maxHeight: 80,
 const hintStyle: React.CSSProperties = { margin: 0, color: 'var(--text-muted)', fontSize: 10, lineHeight: 1.4 }
 const findingStyle: React.CSSProperties = { margin: 0, lineHeight: 1.4, overflowWrap: 'anywhere' }
 const sourceEvidenceItemStyle: React.CSSProperties = { display: 'grid', gap: 3, minWidth: 0, padding: '6px 0', borderTop: '1px solid var(--border)', overflowWrap: 'anywhere' }
+const requestStyle: React.CSSProperties = { display: 'grid', gap: 5, paddingTop: 5 }
+const requestButtonStyle: React.CSSProperties = { border: '1px solid var(--border)', borderRadius: 7, padding: '7px 10px', background: 'var(--bg-secondary)', color: 'var(--primary)', cursor: 'pointer', font: 'inherit', fontSize: 11, fontWeight: 600 }
