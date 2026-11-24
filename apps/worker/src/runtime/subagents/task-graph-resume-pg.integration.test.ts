@@ -20523,7 +20523,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 writerCompleted: waitedWriter?.role === "writer" && waitedWriter.status === "completed",
                 reviewerCompleted: waitedReviewer?.role === "reviewer" && waitedReviewer.status === "completed",
               }
-              if (wait?.status !== "ready" || targetIds.length !== 2 || targetIds[0] !== writerTaskId || targetIds[1] !== reviewerTaskId
+              if (wait?.status !== "ready" || targetIds.length !== 2 || new Set(targetIds).size !== 2
+                || writerTaskId === reviewerTaskId || !targetIds.includes(writerTaskId) || !targetIds.includes(reviewerTaskId)
                 || matchedIds.length !== 2 || !matchedIds.includes(writerTaskId) || !matchedIds.includes(reviewerTaskId)
                 || waitedWriter?.role !== "writer" || waitedWriter.status !== "completed"
                 || waitedReviewer?.role !== "reviewer" || waitedReviewer.status !== "completed") await finalProjectionFailure("wait")
