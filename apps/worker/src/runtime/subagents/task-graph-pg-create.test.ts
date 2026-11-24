@@ -12,6 +12,8 @@ import { selectVerifiedScheduledDraftCandidate } from "./scheduled-draft-candida
 import * as pgCreate from "./pg-store-create.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
 import { templatesForInteractiveScoutDelegation } from "./nested-scout-profile.js"
+import { objectiveTailorNodeKeysForCandidate, objectiveTailorPlan } from "./objective-task-graph-child-authority.js"
+import { bindObjectiveTailorCandidateWitness, makeObjectiveTailorCandidateSelection } from "./objective-tailor-witness.js"
 
 vi.mock("./scheduled-draft-candidate.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./scheduled-draft-candidate.js")>()
@@ -885,6 +887,24 @@ describe("createGraphTasks", () => {
     const fullPlanParent = { budgetSnapshot: { subagentPolicy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 } } }
     await expect(createGraphTasks(fixture.client, fullTypedInput, fullPlanParent, createInitialTaskGraphState(), new Map()))
       .rejects.toMatchObject({ code: "node_limit" })
+    expect(fixture.query).not.toHaveBeenCalled()
+  })
+
+  it("denies the Objective Tailor pair when only one of eight graph slots remains", async () => {
+    const fixture = repairFixture({ additionalTypedNodes: 6, ordinaryOnly: true })
+    const selection = makeObjectiveTailorCandidateSelection({ scope: fixture.input.scope, sourceGraphRevision: fixture.current.revision,
+      sourceGraphDigest: "a".repeat(64), sourceStatusDigest: "b".repeat(64), analystProofDigest: "c".repeat(64),
+      candidate: { jobId: "f47ac10b-58cc-4372-a567-0e02b2c3d479", score: 8.4, materialDigest: `sha256:${"d".repeat(64)}` },
+      sourceAnalystKeys: ["filler-0"] })!
+    const keys = objectiveTailorNodeKeysForCandidate(selection.candidateRef)!
+    const witness = bindObjectiveTailorCandidateWitness(selection, { ...keys, admittedRevision: fixture.current.revision + 1 })!
+    const plan = objectiveTailorPlan(witness)!
+    const input: TaskGraphScheduleInput = { ...fixture.input, proposal: plan.proposal, templates: plan.templates }
+
+    expect(fixture.current.nodes).toHaveLength(TASK_GRAPH_LIMITS.maxNodes - 1)
+    expect(plan.proposal.nodes).toHaveLength(2)
+    await expect(createGraphTasks(fixture.client, input, fixture.parent, fixture.current, fixture.taskIds,
+      undefined, undefined, true, undefined, true)).rejects.toMatchObject({ code: "node_limit" })
     expect(fixture.query).not.toHaveBeenCalled()
   })
 

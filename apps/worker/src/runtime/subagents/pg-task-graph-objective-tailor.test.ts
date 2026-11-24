@@ -136,4 +136,26 @@ describe("Objective Tailor PostgreSQL command", () => {
     expect(mocks.create).not.toHaveBeenCalled()
     expect(mocks.write).not.toHaveBeenCalled()
   })
+
+  it("rejects a stale graph revision before resolving or creating children", async () => {
+    const selected = selection()
+    mocks.resolve.mockResolvedValue(selected)
+    const fake = client()
+    await expect(appendObjectiveTailorWithClient(fake.client, { scope, expectedRevision: 0, candidateRef: selected.candidateRef }))
+      .rejects.toMatchObject({ code: "revision_mismatch" })
+    expect(mocks.resolve).not.toHaveBeenCalled()
+    expect(mocks.currentDigest).not.toHaveBeenCalled()
+    expect(mocks.create).not.toHaveBeenCalled()
+    expect(mocks.write).not.toHaveBeenCalled()
+  })
+
+  it("rejects an unknown candidate without creating children or a receipt", async () => {
+    const candidateRef = `otc1_${"f".repeat(64)}`
+    const fake = client()
+    await expect(appendObjectiveTailorWithClient(fake.client, { scope, expectedRevision: 1, candidateRef }))
+      .rejects.toMatchObject({ code: "objective_tailor_candidate_stale" })
+    expect(mocks.resolve).toHaveBeenCalledWith(fake.client, scope, expect.any(Object), 1, candidateRef)
+    expect(mocks.create).not.toHaveBeenCalled()
+    expect(mocks.write).not.toHaveBeenCalled()
+  })
 })
