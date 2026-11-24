@@ -68,6 +68,7 @@ describe("scheduled draft Writer source admission", () => {
     const admitted = await loadSelectedJobArtifactContextForChild(pool as never, "user-1", jobId, scheduledContext(witness))
     expect(admitted?.context).toBe(source)
     expect(admitted?.assertCurrentDraftMaterial).toBeTypeOf("function")
+    expect(admitted?.allowOwnCorrectionSuccessor).toBeUndefined()
     const client = { query: vi.fn(async (sql: string) => {
       if (sql.includes('FROM "Job"')) return { rows: [job] }
       throw new Error("unexpected material fence query")

@@ -13,6 +13,7 @@ type DraftMaterialAssertion = (client: Pick<pg.PoolClient, "query">, userId: str
 export type SelectedJobArtifactContextForChild = Readonly<{
   context: SelectedJobArtifactContextBundle
   assertCurrentDraftMaterial?: DraftMaterialAssertion
+  allowOwnCorrectionSuccessor?: true
 }>
 
 export function createArtifactToolStoreForChild(
@@ -20,8 +21,9 @@ export function createArtifactToolStoreForChild(
   readCurrentSourceDigest: AgentArtifactSourceDigestReader,
   admission?: SelectedJobArtifactContextForChild,
 ): ArtifactToolStore {
-  return admission?.assertCurrentDraftMaterial
-    ? new PgArtifactToolStore(pool, readCurrentSourceDigest, admission.assertCurrentDraftMaterial)
+  return admission?.assertCurrentDraftMaterial || admission?.allowOwnCorrectionSuccessor === true
+    ? new PgArtifactToolStore(pool, readCurrentSourceDigest, admission.assertCurrentDraftMaterial,
+      admission.allowOwnCorrectionSuccessor === true)
     : createArtifactToolStore(pool, readCurrentSourceDigest)
 }
 
