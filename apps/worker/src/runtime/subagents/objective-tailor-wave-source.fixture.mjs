@@ -90,9 +90,11 @@ export function fixtureObservation(request, kind) {
     const parts = request.messages[messageIndex]?.content ?? []
     for (let partIndex = parts.length - 1; partIndex >= 0; partIndex -= 1) {
       const part = parts[partIndex]
-      if (part?.type !== "text" || typeof part.text !== "string" || !part.text.includes(`\"kind\":\"${kind}\"`)) continue
-      const marker = `\"kind\":\"${kind}\"`, start = part.text.lastIndexOf("{", part.text.indexOf(marker))
-      const value = start >= 0 ? objectAt(part.text, start) : undefined
+      if (part?.type !== "text" || typeof part.text !== "string") continue
+      const headerEnd = part.text.indexOf("]\n")
+      if (!part.text.startsWith("[harness context layer=tool_observation ") || headerEnd < 0
+        || !part.text.slice(0, headerEnd).endsWith("source=tool_or_subagent")) continue
+      const value = objectAt(part.text, headerEnd + 2)
       if (value?.kind === kind) return value
     }
   }
