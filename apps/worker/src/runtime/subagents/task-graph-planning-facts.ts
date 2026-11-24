@@ -1,6 +1,7 @@
 import { buildTaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
 import type { TaskGraphFinalSummary } from "./task-graph-final-summary.js"
 import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
+import { currentTaskGraph } from "./task-graph-pg-current-node.js"
 
 export type TaskGraphPlanningFacts = Readonly<{
   graphRevision: number
@@ -22,20 +23,41 @@ export type TaskGraphScoutOverlap = Readonly<{
 
 /** Projects bounded aggregate counts and Scout overlap from the already loaded current graph. */
 export function buildTaskGraphPlanningFacts(loaded: LoadedGraph): TaskGraphPlanningFacts | null {
-  const binding = buildTaskGraphFinalSummaryBinding(loaded)
+  const hasSnapshotMarker = loaded.snapshot ? Object.hasOwn(loaded.snapshot, "objectiveTailor") : false
+  const hasStateMarker = loaded.state ? Object.hasOwn(loaded.state, "objectiveTailor") : false
+  if (hasSnapshotMarker !== hasStateMarker) throw new Error("task_graph_objective_tailor_current_invalid")
+  if (hasSnapshotMarker && loaded.discoveryTurnEligibility !== "ordinary") {
+    throw new Error("task_graph_objective_tailor_current_invalid")
+  }
+  const marker = hasSnapshotMarker ? currentTaskGraph(loaded).objectiveTailor : undefined
+  if (hasSnapshotMarker && !marker) throw new Error("task_graph_objective_tailor_current_invalid")
+  const planningLoaded = marker ? sourcePrefixLoadedGraph(loaded, marker.sourceNodeCount) : loaded
+  const binding = buildTaskGraphFinalSummaryBinding(planningLoaded)
   if (!binding) return null
   const counts = binding.summary.counts
   return {
     graphRevision: binding.graphRevision,
-    scoutOverlap: buildScoutOverlapFacts(loaded, binding.summary),
+    scoutOverlap: buildScoutOverlapFacts(planningLoaded, binding.summary),
     counts: {
       discoveredJobs: copyCount(counts.discoveredJobs),
       analyzedJobs: copyCount(counts.analyzedJobs),
       prepareJobs: copyCount(counts.prepareJobs),
-      artifactReferences: copyCount(counts.artifactReferences),
-      reviewOutcomes: copyCount(counts.reviewOutcomes),
+      artifactReferences: marker ? unavailableCount() : copyCount(counts.artifactReferences),
+      reviewOutcomes: marker ? unavailableCount() : copyCount(counts.reviewOutcomes),
     },
   }
+}
+
+function sourcePrefixLoadedGraph(loaded: LoadedGraph, sourceNodeCount: number): LoadedGraph {
+  if (!loaded.item || !loaded.snapshot || !loaded.state || sourceNodeCount < 2 || sourceNodeCount >= loaded.snapshot.nodes.length) {
+    throw new Error("task_graph_objective_tailor_current_invalid")
+  }
+  const nodeIds = new Set(loaded.snapshot.nodes.slice(0, sourceNodeCount).map(node => node.taskId))
+  const { objectiveTailor: _snapshotMarker, ...snapshot } = loaded.snapshot
+  const { objectiveTailor: _stateMarker, ...state } = loaded.state
+  return { ...loaded, snapshot: { ...snapshot, nodes: snapshot.nodes.slice(0, sourceNodeCount) },
+    state: { ...state, nodes: state.nodes.slice(0, sourceNodeCount) },
+    tasks: new Map([...loaded.tasks].filter(([taskId]) => nodeIds.has(taskId))) }
 }
 
 function buildScoutOverlapFacts(loaded: LoadedGraph, summary: TaskGraphFinalSummary): TaskGraphScoutOverlap {
@@ -90,4 +112,7 @@ function buildScoutOverlapFacts(loaded: LoadedGraph, summary: TaskGraphFinalSumm
 
 function copyCount(count: TaskGraphFinalSummary["counts"]["discoveredJobs"]): TaskGraphFinalSummary["counts"]["discoveredJobs"] {
   return { knownCount: count.knownCount, coverage: count.coverage }
+}
+function unavailableCount(): TaskGraphFinalSummary["counts"]["artifactReferences"] {
+  return { knownCount: null, coverage: "unavailable" }
 }

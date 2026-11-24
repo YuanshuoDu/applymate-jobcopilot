@@ -13,6 +13,7 @@ import { SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import { SCHEDULED_GATE_TEMPLATE_ID } from "./scheduled-gate-contract.js"
 import { isScheduledTaskGraphSpecializedEnvelope } from "./task-graph-pg-specialized-envelope.js"
 import type { DiscoveryQueryFootprint } from "./child-discovery-query-footprint.js"
+import { parseObjectiveTailorGraph, type ObjectiveTailorGraph } from "@jobcopilot/agent-protocol"
 
 export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
   if (!loaded.state || !loaded.snapshot) return { revision: 0, nodes: [] }
@@ -75,7 +76,40 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
       failureReason: safeText(task.failureReason, 500), ...(structuredOutputFailureCategory ? { structuredOutputFailureCategory } : {}),
     }
   })
-  return { revision: loaded.state.revision, nodes, ...(hasOrdinaryQueryFootprint ? { discoveryTurnEligibility: "ordinary" } : {}) }
+  const objectiveTailor = objectiveTailorCurrentMarker(loaded, read)
+  return { revision: loaded.state.revision, nodes, ...(objectiveTailor ? { objectiveTailor } : {}),
+    ...(objectiveTailor || hasOrdinaryQueryFootprint ? { discoveryTurnEligibility: "ordinary" } : {}) }
+}
+
+function objectiveTailorCurrentMarker(loaded: LoadedGraph, read: readonly ReturnType<typeof deriveTaskGraphReadModel>[number][]): ObjectiveTailorGraph | undefined {
+  const snapshot = loaded.snapshot!, state = loaded.state!, snapshotHas = Object.hasOwn(snapshot, "objectiveTailor"), stateHas = Object.hasOwn(state, "objectiveTailor")
+  if (!snapshotHas && !stateHas) return undefined
+  if (!snapshotHas || !stateHas || loaded.discoveryTurnEligibility !== "ordinary" || !loaded.item
+    || loaded.item.revision !== state.revision || read.length !== snapshot.nodes.length) {
+    throw new Error("task_graph_objective_tailor_current_invalid")
+  }
+  if (snapshot.nodes.some((node, index) => {
+    const current = read[index]
+    return !current || node.key !== current.key || node.templateId !== current.templateId || node.taskId !== current.taskId
+      || node.goal !== current.goal || JSON.stringify(node.successCriteria) !== JSON.stringify(current.successCriteria)
+      || JSON.stringify(node.dependsOn) !== JSON.stringify(current.dependsOn)
+      || JSON.stringify(node.verification) !== JSON.stringify(current.verification)
+  })) throw new Error("task_graph_objective_tailor_current_invalid")
+  const marker = parseObjectiveTailorGraph(snapshot.objectiveTailor, snapshot.nodes)
+  const stateMarker = parseObjectiveTailorGraph(state.objectiveTailor, state.nodes)
+  const projection = parseObjectiveTailorGraph(snapshot.objectiveTailor, read.map((node, index) => ({ ...node,
+    verificationDisposition: snapshot.nodes[index]?.verificationDisposition })))
+  if (!marker || !stateMarker || !projection || JSON.stringify(marker) !== JSON.stringify(stateMarker)
+    || JSON.stringify(marker) !== JSON.stringify(projection)) throw new Error("task_graph_objective_tailor_current_invalid")
+  const expected = { scout: ["scout", "job_discovery"], analyst: ["analyst", "job_analysis"],
+    cover_letter_writer: ["writer", "cover_letter_draft"], cover_letter_reviewer: ["reviewer", "cover_letter_review"] } as const
+  for (const node of snapshot.nodes) {
+    const task = loaded.tasks.get(node.taskId), binding = expected[node.templateId as keyof typeof expected]
+    if (!task || task.id !== node.taskId || !binding || task.role !== binding[0] || task.taskType !== binding[1]) {
+      throw new Error("task_graph_objective_tailor_current_invalid")
+    }
+  }
+  return marker
 }
 
 function taskGraphProjectionSource(

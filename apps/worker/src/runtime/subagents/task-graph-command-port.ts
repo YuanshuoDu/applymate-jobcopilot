@@ -192,8 +192,8 @@ export type TaskGraphCurrentState = Readonly<{
   nodes: readonly TaskGraphCurrentNode[]
   rootSuccessCriteria?: readonly string[]
   planningFacts?: import("./task-graph-planning-facts.js").TaskGraphPlanningFacts
-  /** Internal owner-read provenance; stripped before model-facing observation construction. */
-  discoveryTurnEligibility?: "ordinary"
+  objectiveTailor?: import("@jobcopilot/agent-protocol").ObjectiveTailorGraph
+  /** Internal owner-read provenance; stripped before model-facing observation construction. */ discoveryTurnEligibility?: "ordinary"
 }>
 /** Private planning read; checkpoint data stays outside the model-facing state. */
 export type TaskGraphPlanningCurrentState = Readonly<{
