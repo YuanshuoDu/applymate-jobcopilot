@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest"
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
-import { isSelectedJobRootTool, loadTaskGraphCurrentObservation, mergeTaskGraphCurrentObservation, selectedJobSnapshot, selectedJobToolAllowed } from "./canonical-turn-task-graph-context.js"
+import { appendObjectiveTailorCandidateCatalog, isSelectedJobRootTool, loadTaskGraphCurrentObservation, mergeTaskGraphCurrentObservation, OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID, selectedJobSnapshot, selectedJobToolAllowed } from "./canonical-turn-task-graph-context.js"
+import { OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA } from "./subagents/objective-tailor-candidate.js"
 import type { TaskGraphCommandPort } from "./subagents/task-graph-command-port.js"
 import type { TaskGraphCurrentNode, TaskGraphCurrentState, TaskGraphVerificationReport } from "./subagents/task-graph-command-port.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./subagents/task-graph-command-port.js"
@@ -141,6 +142,37 @@ function projectedNode(row: Record<string, unknown>): Record<string, unknown> {
 }
 
 describe("TaskGraph turn observation", () => {
+  it("exposes only the bounded public tailoring catalog for the exact current graph revision", () => {
+    const candidateRef = `otc1_${"a".repeat(64)}`
+    const catalog = { schemaVersion: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA, graphRevision: 7,
+      candidates: [{ candidateRef, title: "Software Engineer", company: "Example GmbH", score: 8 }] }
+    const original = { ...snapshot(), taskGraphRevision: 7,
+      toolObservations: [...snapshot().toolObservations, { id: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID,
+        content: { secret: "STALE_PRIVATE_WITNESS" } }] }
+    const projected = appendObjectiveTailorCandidateCatalog(original, catalog, 7)
+    const observations = projected.toolObservations.filter(item => item.id === OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID)
+
+    expect(observations).toEqual([{ id: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID, content: {
+      kind: "objective_tailor_candidate_catalog", catalog,
+    } }])
+    expect(JSON.stringify(projected)).not.toContain("STALE_PRIVATE_WITNESS")
+    expect(JSON.stringify(projected)).not.toMatch(/jobId|materialDigest|sourceGraphDigest|analystProofDigest|writerNodeKey/)
+    expect(appendObjectiveTailorCandidateCatalog(original, catalog, 6).toolObservations.some(
+      item => item.id === OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID)).toBe(false)
+  })
+
+  it("removes stale or malformed tailoring catalog observations fail-closed", () => {
+    const original = { ...snapshot(), taskGraphRevision: 7,
+      toolObservations: [...snapshot().toolObservations, { id: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID,
+        content: { candidateRef: "model-spoof" } }] }
+    const malformed = { schemaVersion: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA, graphRevision: 7,
+      candidates: [{ candidateRef: "not-opaque", title: "Role", company: "Company", score: 8, jobId: "private-job-id" }] }
+    for (const value of [undefined, malformed]) {
+      expect(appendObjectiveTailorCandidateCatalog(original, value, 7).toolObservations.some(
+        item => item.id === OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID)).toBe(false)
+    }
+  })
+
   it("keeps selected-job root observations scoped to coordination and the current graph", () => {
     const original = {
       ...snapshot(),

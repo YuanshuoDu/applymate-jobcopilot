@@ -1,5 +1,6 @@
 export type ProductionAgentFlags = {
   readonly taskGraphPlanningEnabled: boolean
+  readonly objectiveTailorEnabled?: boolean
   readonly childExecutionEnabled: boolean
   readonly coordinationEnabled: boolean
   readonly consumeWaitOutcomes: boolean
@@ -19,8 +20,10 @@ export function resolveProductionAgentFlags(env: Record<string, string | undefin
   const taskGraphPlanningEnabled = env.ENABLE_AGENT_TASK_GRAPH_PLANNING === "1"
     && env.ENABLE_AGENT_CHILD_EXECUTION === "1"
     && env.ENABLE_AGENT_WAIT_RESOLVER === "1"
+  const objectiveTailorEnabled = env.ENABLE_AGENT_OBJECTIVE_TAILOR === "1" && taskGraphPlanningEnabled
   return {
     taskGraphPlanningEnabled,
+    objectiveTailorEnabled,
     childExecutionEnabled,
     coordinationEnabled,
     consumeWaitOutcomes: coordinationEnabled,

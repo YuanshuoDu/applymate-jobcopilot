@@ -1,5 +1,5 @@
 import type pg from "pg"
-import type { TenantScope } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, TurnIntentSchema, validate, type TenantScope } from "@jobcopilot/agent-protocol"
 import type { TurnEngineOptions } from "./turns/turn-engine-types.js"
 import type { TurnLease } from "./turns/lease.js"
 import { executionOwnerFence, type ExecutionOwnerFence } from "./execution-owner.js"
@@ -10,7 +10,9 @@ import type { HydrationScope } from "./context/steering-reconciliation-context.j
 import { injectSelectedJobMemory, type SelectedJobMemoryRecord } from "./context/selected-job-memory.js"
 import { createPgDirectSelectedJobHistoryStore } from "./context/selected-job-history-direct-store.js"
 import { createPgDirectRootTaskHistoryStore } from "./context/root-task-history-direct-store.js"
-import { selectedJobSnapshot } from "./canonical-turn-task-graph-context.js"
+import { appendObjectiveTailorCandidateCatalog, selectedJobSnapshot } from "./canonical-turn-task-graph-context.js"
+import type { ObjectiveTailorCandidateCatalog } from "./subagents/objective-tailor-candidate.js"
+import type { TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import {
   projectRootTaskGoalCriteria, rootTaskVerificationRequirementsObservation,
@@ -50,6 +52,8 @@ type Input = Readonly<{
   taskGraphTemplateRoles?: Readonly<Record<string, string>>
   planningEnabled: boolean
   selectedJobMode: boolean
+  objectiveTaskGraphMode?: boolean
+  readObjectiveTailorCatalog?: (scope: TaskGraphReadScope) => Promise<ObjectiveTailorCandidateCatalog | undefined>
   discoveryPersonaMemoryEnabled?: boolean
   selectedJobMemories?: readonly SelectedJobMemoryRecord[]
   selectedJobId?: string
@@ -81,6 +85,8 @@ export function canonicalSteeringHydrationScope(input: Pick<Input, "planningEnab
 }
 
 export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder {
+  const objectiveTailorCatalogReader = input.objectiveTaskGraphMode === true && input.planningEnabled && !input.selectedJobMode
+    && hasObjectiveTaskGraphIntent(input.turnInput) ? input.readObjectiveTailorCatalog : undefined
   const reconciliationScope = canonicalSteeringHydrationScope(input)
   const discoveryMemoryEnabled = input.discoveryPersonaMemoryEnabled === true && input.planningEnabled && !input.selectedJobMode
   const loadDiscoveryPersonaMemory = async (stepId: string) => {
@@ -112,7 +118,7 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
     objectiveProgressGoalRevision: () => input.rootTaskObjective
       ? rootTaskHistoryObjectiveDigest(input.turnInput, { goal: input.rootTaskObjective.goal, successCriteria: input.rootTaskObjective.successCriteria }) : undefined,
     build: async request => {
-      let snapshot: StepContextSnapshot = withoutCallerSearchFootprints(request.snapshot)
+      let snapshot: StepContextSnapshot = appendObjectiveTailorCandidateCatalog(withoutCallerSearchFootprints(request.snapshot), undefined, undefined)
       if (input.selectedJobMode) {
         snapshot = injectSelectedJobMemory({ snapshot: selectedJobSnapshot(snapshot), records: input.selectedJobMemories ?? [], jobId: input.selectedJobId, turnId: input.lease.turnId, rootTaskId: input.rootTaskId })
         if (directHistoryReader) snapshot = await appendCanonicalSelectedJobHistoryOutcomes({
@@ -161,6 +167,17 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
       })
       if (objectiveProgress) toolObservations.push(objectiveProgress)
       snapshot = { ...snapshot, rootTaskGoalCriteria, toolObservations }
+      if (objectiveTailorCatalogReader && snapshot.taskGraphRevision !== undefined) {
+        const readScope: TaskGraphReadScope = { userId: input.scope.userId, sessionId: input.lease.sessionId, turnId: input.lease.turnId,
+          rootTaskId: input.rootTaskId, parentTaskId: input.rootTaskId, turnLeaseOwner: input.lease.ownerId,
+          turnLeaseVersion: input.lease.leaseVersion, parentLeaseOwner: input.lease.ownerId, parentAttemptCount: input.rootAttemptCount }
+        try {
+          const catalog = await objectiveTailorCatalogReader(readScope)
+          snapshot = appendObjectiveTailorCandidateCatalog(snapshot, catalog, snapshot.taskGraphRevision)
+        } catch (error: unknown) {
+          if (error instanceof TurnLeaseError || error instanceof TurnEngineError) throw error
+        }
+      }
       let built: import("./context/step-context-builder.js").StepContext
       if (rootTaskHistoryReader && base.buildInTransaction && rootTaskHistoryReader.loadWithClient) {
         built = await buildCanonicalRootTaskHistoryContext({ pool: input.pool, scope: input.scope, lease: input.lease,
@@ -194,4 +211,14 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
       },
     } : {}),
   }
+}
+
+function hasObjectiveTaskGraphIntent(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const root = value as Record<string, unknown>
+  if (Object.hasOwn(root, "input")) return false
+  const descriptor = Object.getOwnPropertyDescriptor(root, "intent")
+  const intent = descriptor?.enumerable && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined
+  return validate(TurnIntentSchema, intent) && intent.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind
+    && intent.version === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version
 }

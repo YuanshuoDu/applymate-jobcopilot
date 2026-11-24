@@ -13,6 +13,7 @@ const planningTool: PolicyToolDescriptor = {
   name: "agent.plan", version: "1", risk: "internal_write", domain: "coordination",
   capabilities: ["coordination"], requiredCapabilities: ["coordination", "canManageChildren"],
 }
+const tailoringTool: PolicyToolDescriptor = { ...planningTool, name: "agent.tailor" }
 
 function coordinationTool(name: string, risk: "read" | "internal_write"): PolicyToolDescriptor {
   return {
@@ -49,9 +50,11 @@ describe("canonical root policy", () => {
   it("allows planning and steering keep only when both server gates are enabled", () => {
     const policy = createCanonicalPolicy({}, true, true)
     expect(policy.evaluate(context(planningTool, ["coordination", "canManageChildren"]))).toMatchObject({ outcome: "allow", reasonCode: "server_task_graph_planning_gate" })
+    expect(policy.evaluate(context(tailoringTool, ["coordination", "canManageChildren"]))).toMatchObject({ outcome: "allow", reasonCode: "server_task_graph_planning_gate" })
     expect(policy.evaluate(context({ ...planningTool, name: "agent.reconcile" }, ["coordination", "canManageChildren"]))).toMatchObject({ outcome: "allow", reasonCode: "server_task_graph_planning_gate" })
     for (const policyWithoutBothGates of [createCanonicalPolicy({}, false, true), createCanonicalPolicy({}, true, false)]) {
       expect(policyWithoutBothGates.evaluate(context(planningTool, ["coordination", "canManageChildren"]))).toMatchObject({ outcome: "deny" })
+      expect(policyWithoutBothGates.evaluate(context(tailoringTool, ["coordination", "canManageChildren"]))).toMatchObject({ outcome: "deny" })
     }
   })
 
@@ -66,6 +69,9 @@ describe("canonical root policy", () => {
     const explicit: PolicySnapshot = { version: "policy.v1", rules: [{ id: "deny-plan", roles: ["orchestrator"], tools: ["agent.plan"], outcome: "deny", reasonCode: "explicit_deny", reason: "Planning is disabled by policy" }] }
     const policy = createCanonicalPolicy(explicit, true, true)
     expect(policy.evaluate(context(planningTool, ["coordination", "canManageChildren"]))).toMatchObject({ outcome: "deny", reasonCode: "explicit_deny" })
+    const explicitTailor: PolicySnapshot = { version: "policy.v1", rules: [{ id: "deny-tailor", roles: ["orchestrator"], tools: ["agent.tailor"], outcome: "deny", reasonCode: "explicit_deny", reason: "Tailoring is disabled by policy" }] }
+    expect(createCanonicalPolicy(explicitTailor, true, true).evaluate(context(tailoringTool, ["coordination", "canManageChildren"])))
+      .toMatchObject({ outcome: "deny", reasonCode: "explicit_deny" })
   })
 
   it("keeps coordination writes denied when the server gate is off", () => {

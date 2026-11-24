@@ -16,6 +16,7 @@ import { parseTaskGraphCurrentDiscoveryAttemptHealth, parseTaskGraphCurrentDisco
   type TaskGraphDiscoveryTurnEligibility } from "./subagents/task-graph-discovery-attempt-health.js"
 import { withTaskGraphRootSourceIntent } from "./subagents/task-graph-source-intent-context.js"
 import { taskGraphReviewConflictObservation } from "./context/task-graph-review-conflicts.js"
+import { OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA, type ObjectiveTailorCandidateCatalog } from "./subagents/objective-tailor-candidate.js"
 const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user", "agent.reconcile"])
 
 export function isSelectedJobRootTool(definition: unknown): boolean {
@@ -37,6 +38,7 @@ export function selectedJobSnapshot(snapshot: StepContextSnapshot): StepContextS
 }
 
 const OBSERVATION_ID = "task-graph-current"
+export const OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID = "objective-tailor-candidate-catalog"
 const MAX_NODES = 16
 const MAX_TEXT = 160_000
 const MAX_RESULT_PROJECTION_TOTAL_BYTES = 16 * 1024
@@ -156,6 +158,56 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   if (JSON.stringify(content).length > MAX_TEXT) throw new Error("task_graph_current_state_too_large")
   return retireStaleTaskGraphRepair({ ...snapshot, taskGraphRevision: value.revision,
     toolObservations: [...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID), { id: OBSERVATION_ID, content }] }, value.revision)
+}
+
+/** Replaces any prior catalog observation with only a bounded public projection for the exact current graph revision. */
+export function appendObjectiveTailorCandidateCatalog(
+  snapshot: StepContextSnapshot, value: unknown, expectedRevision: number | undefined,
+): StepContextSnapshot {
+  const catalog = parseObjectiveTailorCandidateCatalog(value, expectedRevision)
+  return { ...snapshot, toolObservations: [
+    ...snapshot.toolObservations.filter(observation => observation.id !== OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID),
+    ...(catalog ? [{ id: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID,
+      content: { kind: "objective_tailor_candidate_catalog", catalog } }] : []),
+  ] }
+}
+
+function parseObjectiveTailorCandidateCatalog(value: unknown, expectedRevision: number | undefined): ObjectiveTailorCandidateCatalog | undefined {
+  try {
+    const row = exactDataObject(value, "candidates,graphRevision,schemaVersion")
+    if (!row || row.schemaVersion !== OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA || !Number.isSafeInteger(row.graphRevision)
+      || row.graphRevision !== expectedRevision || !Number.isSafeInteger(expectedRevision) || Number(expectedRevision) < 1
+      || !Array.isArray(row.candidates) || Object.getPrototypeOf(row.candidates) !== Array.prototype
+      || row.candidates.length > 8 || Reflect.ownKeys(row.candidates).length !== row.candidates.length + 1) return undefined
+    const candidates: ObjectiveTailorCandidateCatalog["candidates"][number][] = [], refs = new Set<string>()
+    for (let index = 0; index < row.candidates.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(row.candidates, String(index))
+      const candidate = descriptor?.enumerable && Object.hasOwn(descriptor, "value")
+        ? exactDataObject(descriptor.value, "candidateRef,company,score,title") : undefined
+      if (!candidate || typeof candidate.candidateRef !== "string" || !/^otc1_[a-f0-9]{64}$/.test(candidate.candidateRef)
+        || refs.has(candidate.candidateRef) || typeof candidate.title !== "string" || !candidate.title.trim()
+        || candidate.title.trim() !== candidate.title || candidate.title.length > 160 || typeof candidate.company !== "string"
+        || !candidate.company.trim() || candidate.company.trim() !== candidate.company || candidate.company.length > 160
+        || typeof candidate.score !== "number" || !Number.isFinite(candidate.score) || candidate.score < 0 || candidate.score > 10) return undefined
+      refs.add(candidate.candidateRef)
+      candidates.push({ candidateRef: candidate.candidateRef, title: candidate.title, company: candidate.company, score: candidate.score })
+    }
+    return { schemaVersion: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA, graphRevision: Number(row.graphRevision), candidates }
+  } catch { return undefined }
+}
+
+function exactDataObject(value: unknown, keys: string): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  try {
+    const actual = Reflect.ownKeys(value), expected = keys.split(",")
+    if ((Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
+      || actual.length !== expected.length || actual.some(key => typeof key !== "string" || !expected.includes(key))) return undefined
+    for (const key of expected) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return undefined
+    }
+    return value as Record<string, unknown>
+  } catch { return undefined }
 }
 
 export async function loadTaskGraphCurrentObservation(

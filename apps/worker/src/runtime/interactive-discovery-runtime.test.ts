@@ -12,6 +12,8 @@ describe("interactive discovery runtime", () => {
     const visible = ["agent.plan", "agent.ask_user", "agent.wait", "agent.list", "agent.reconcile"]
       .map(name => ({ name, risk: "internal_write" }))
     for (const name of visible.map(tool => tool.name)) expect(objectiveTaskGraphRootToolAllowed({ name, risk: "read" })).toBe(true)
+    expect(objectiveTaskGraphRootToolAllowed({ name: "agent.tailor" })).toBe(false)
+    expect(objectiveTaskGraphRootToolAllowed({ name: "agent.tailor" }, true)).toBe(true)
     for (const name of ["jobs.search", "persona.retrieve", "resume.get_base", "application.get", "agent.spawn", "spawn_subagent", "agent.followup", "scheduled.application.prepare", "tool_results.read"]) {
       expect(objectiveTaskGraphRootToolAllowed({ name, risk: "read", capabilities: ["read"] })).toBe(false)
     }
@@ -19,7 +21,7 @@ describe("interactive discovery runtime", () => {
     const validateArguments = vi.fn(() => true)
     const guards = createCanonicalRootToolGuards({ objectiveTaskGraphMode: true, objectiveRootTools: visible,
       interactiveDiscoveryMode: false, selectedJobMode: false, routeTool: routeTool as never, validateArguments })
-    for (const toolName of ["jobs.search", "persona.retrieve", "agent.spawn", "spawn_subagent", "agent.followup", "application.submit"]) {
+    for (const toolName of ["jobs.search", "persona.retrieve", "agent.spawn", "spawn_subagent", "agent.followup", "application.submit", "agent.tailor"]) {
       const request = { call: { id: toolName, toolName, toolVersion: "1", input: {} } } as never
       await expect(guards.executeTool(request)).resolves.toMatchObject({ status: "failed", errorCode: "objective_task_graph_root_tool_disabled" })
       expect(guards.validateToolArguments(toolName, {})).toBe("objective_task_graph_root_tool_disabled")

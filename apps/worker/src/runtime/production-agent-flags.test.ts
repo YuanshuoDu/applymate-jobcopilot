@@ -6,6 +6,7 @@ describe("production agent flags", () => {
   it("defaults all production gates to disabled", () => {
     expect(resolveProductionAgentFlags({})).toEqual({
       taskGraphPlanningEnabled: false,
+      objectiveTailorEnabled: false,
       childExecutionEnabled: false,
       coordinationEnabled: false,
       consumeWaitOutcomes: false,
@@ -62,7 +63,26 @@ describe("production agent flags", () => {
       taskGraphPlanningEnabled: false,
       childExecutionEnabled: false,
       coordinationEnabled: false,
+      objectiveTailorEnabled: false,
     })
+  })
+
+  it("enables Objective tailoring only behind its exact flag and TaskGraph prerequisites", () => {
+    const enabled = {
+      ENABLE_AGENT_OBJECTIVE_TAILOR: "1",
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1",
+      ENABLE_AGENT_CHILD_EXECUTION: "1",
+      ENABLE_AGENT_WAIT_RESOLVER: "1",
+    } as const
+    expect(resolveProductionAgentFlags(enabled).objectiveTailorEnabled).toBe(true)
+    expect(resolveProductionAgentFlags({ ENABLE_AGENT_OBJECTIVE_TAILOR: "1" }).objectiveTailorEnabled).toBe(false)
+    for (const key of Object.keys(enabled) as Array<keyof typeof enabled>) {
+      if (key === "ENABLE_AGENT_OBJECTIVE_TAILOR") continue
+      expect(resolveProductionAgentFlags({ ...enabled, [key]: "0" }).objectiveTailorEnabled).toBe(false)
+    }
+    for (const value of [undefined, "", "0", "true", "01", " 1", "1 "]) {
+      expect(resolveProductionAgentFlags({ ...enabled, ENABLE_AGENT_OBJECTIVE_TAILOR: value }).objectiveTailorEnabled).toBe(false)
+    }
   })
 
   it("enables canonical automation only with its exact server flag", () => {
@@ -93,6 +113,7 @@ describe("production agent flags", () => {
       ENABLE_AGENT_CANONICAL_AUTOMATION: "1",
     })).toEqual({
       taskGraphPlanningEnabled: true,
+      objectiveTailorEnabled: false,
       childExecutionEnabled: true,
       coordinationEnabled: true,
       consumeWaitOutcomes: true,
