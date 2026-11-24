@@ -89,6 +89,16 @@ export {
   type ReviewedApplicationFillBrowserStartBinding,
   type ReviewedApplicationFillSourceSelection,
 } from "./application-reviewed-fill-proof.js";
+export {
+  buildObjectiveApplicationSubmissionManifest,
+  hashObjectiveApplicationSubmissionMaterial,
+  parseObjectiveApplicationSubmissionManifest,
+  parseObjectiveApplicationSubmissionMaterial,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_SCHEMA,
+  OBJECTIVE_APPLICATION_SUBMISSION_MATERIAL_SCHEMA,
+  type ObjectiveApplicationSubmissionManifest,
+  type ObjectiveApplicationSubmissionMaterial,
+} from "./agent-objective-application-submit.js";
 
 export {
   buildAgentSourceMaterialFenceKey,
