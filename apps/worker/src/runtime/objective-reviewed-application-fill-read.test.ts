@@ -118,6 +118,23 @@ describe("Objective reviewed application Fill reader", () => {
     expect(JSON.stringify(result)).toContain(draft)
   })
 
+  it.each(["prepare", "browser_start"] as const)("accepts the exact waiting parent Turn during %s", async phase => {
+    const waitingParent = fixture({ fillStatus: "waiting_for_dependency" })
+    await expect(readObjectiveReviewedApplicationFillSource(waitingParent.client, input(fillInput, phase)))
+      .resolves.toMatchObject({ source, resumeContent: material.content })
+    for (const fillStatus of ["waiting_for_user", "waiting_for_approval", "completed"]) {
+      const wrongState = fixture({ fillStatus })
+      await expect(readObjectiveReviewedApplicationFillSource(wrongState.client, input(fillInput, phase))).resolves.toBeUndefined()
+    }
+  })
+
+  it("rejects an unknown phase before database reads", async () => {
+    const test = fixture()
+    const invalid = { ...input(), phase: "unknown" } as unknown as Parameters<typeof readObjectiveReviewedApplicationFillSource>[1]
+    await expect(readObjectiveReviewedApplicationFillSource(test.client, invalid)).resolves.toBeUndefined()
+    expect(test.calls).toHaveLength(0)
+  })
+
   it.each([
     ["wrong approved pointer", { eventRows: [{ id: "foreign-event", taskId: applicationTaskId, type: "objective_application_review_approved",
       actor: "user", body: "Objective application review approval recorded.", data: { ...approvedIntent, approvalId: "other-approval" } }] }],

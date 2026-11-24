@@ -27,6 +27,10 @@ import { acquireSourceMaterialFence } from "../db/source-material-fence.js"
 type Row = Record<string, unknown>
 type Queryable = Pick<PoolClient, "query">
 export type ObjectiveReviewedFillReadPhase = "prepare" | "browser_start" | "completion" | "completion_replay" | "authorize" | "marker" | "boundary"
+const CHILD_FILL_STATUSES = ["in_progress", "waiting_for_dependency"], APPROVAL_FILL_STATUSES = ["waiting_for_approval", "queued", "in_progress"]
+const FILL_TURN_STATUSES: Readonly<Record<ObjectiveReviewedFillReadPhase, readonly string[]>> = {
+  prepare: CHILD_FILL_STATUSES, browser_start: CHILD_FILL_STATUSES, completion: ["queued", "in_progress", "waiting_for_dependency"],
+  completion_replay: ["waiting_for_approval"], authorize: APPROVAL_FILL_STATUSES, marker: APPROVAL_FILL_STATUSES, boundary: APPROVAL_FILL_STATUSES }
 export type ObjectiveReviewedFillReadInput = Readonly<{ userId: string; sessionId: string; fillTurnId: string;
   applicationTaskId: string; jobId: string; turnInput: unknown; phase: ObjectiveReviewedFillReadPhase; now?: Date }>
 export type ObjectiveReviewedApplicationFillEvidence = Readonly<{
@@ -37,7 +41,6 @@ export type ObjectiveReviewedApplicationFillEvidence = Readonly<{
   resumeWitness: ObjectiveApplicationResumeWitness
   resumeContent: unknown
 }>
-
 /** Opens a fenced read transaction for the pre-PDF exact source snapshot. */
 export async function readObjectiveReviewedApplicationFillSourceFromPool(
   pool: Pick<Pool, "connect">, input: ObjectiveReviewedFillReadInput,
@@ -57,7 +60,6 @@ export async function readObjectiveReviewedApplicationFillSourceFromPool(
     return undefined
   } finally { client.release() }
 }
-
 /** Rebuilds one approved Objective slot on the caller's source-fenced fill transaction. */
 export async function readObjectiveReviewedApplicationFillSource(
   client: Queryable, input: ObjectiveReviewedFillReadInput,
@@ -154,9 +156,7 @@ async function approvalAndFillTurnValid(client: Queryable, input: ObjectiveRevie
   [intent.approvalId, input.userId, input.sessionId, intent.reviewTurnId, input.applicationTaskId, input.jobId, input.fillTurnId])
   const row = record(result.rows[0]), expires = date(row?.expiresAt), decided = date(row?.decidedAt)
   const created = date(row?.fillCreatedAt)
-  const expectedTurnStatus = input.phase === "completion_replay" ? ["waiting_for_approval"]
-    : ["authorize", "marker", "boundary"].includes(input.phase) ? ["waiting_for_approval", "queued", "in_progress"]
-      : input.phase === "completion" ? ["queued", "in_progress", "waiting_for_dependency"] : ["in_progress"]
+  const expectedTurnStatus = Object.hasOwn(FILL_TURN_STATUSES, input.phase) ? FILL_TURN_STATUSES[input.phase] : []
   return result.rows.length === 1 && row?.status === "approved" && row.materialHash === intent.materialProofHash
     && row.consumedAt === null && !!expires && !!decided && !!created && decided <= created && created <= expires
     && row.fillSource === "user" && row.fillExecutionMode === "canonical_task_graph"

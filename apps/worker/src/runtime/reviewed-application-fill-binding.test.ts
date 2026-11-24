@@ -41,7 +41,7 @@ function lease(): SubagentLease {
   } as SubagentLease
 }
 
-function fixture(options: { turnInput?: unknown; checkpoint?: string; subtaskFound?: boolean; priorEvents?: unknown[]; updateRowCount?: number } = {}) {
+function fixture(options: { turnInput?: unknown; turnStatus?: string; checkpoint?: string; subtaskFound?: boolean; priorEvents?: unknown[]; updateRowCount?: number } = {}) {
   const calls: Array<{ sql: string; values: readonly unknown[] }> = []
   const client = {
     query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
@@ -51,7 +51,7 @@ function fixture(options: { turnInput?: unknown; checkpoint?: string; subtaskFou
       if (sql.includes("pg_advisory_xact_lock")) return { rows: [{ transaction_id: "123", lock_acquired: null }], rowCount: 1 }
       if (sql === "SELECT pg_current_xact_id()::text AS transaction_id") return { rows: [{ transaction_id: "123" }], rowCount: 1 }
       if (sql.includes("FROM agent_sessions")) return { rows: [{ status: "running" }], rowCount: 1 }
-      if (sql.includes('FROM agent_turns WHERE')) return { rows: [{ status: "in_progress", input: options.turnInput ?? selectedTurnInput }], rowCount: 1 }
+      if (sql.includes('FROM agent_turns WHERE')) return { rows: [{ status: options.turnStatus ?? "in_progress", input: options.turnInput ?? selectedTurnInput }], rowCount: 1 }
       if (sql.includes("UPDATE application_tasks AS app")) { const count = options.updateRowCount ?? 1; return { rows: count === 1 ? [{ id: "application-a" }] : [], rowCount: count } }
       if (sql.includes("FROM sub_agent_tasks sub")) return options.subtaskFound === false ? { rows: [], rowCount: 0 } : { rows: [{ id: "filler-a" }], rowCount: 1 }
       if (sql.includes("FROM application_tasks")) return { rows: [{ id: "application-a", jobId: "job-a", status: "filling", checkpoint: options.checkpoint ?? "taskgraph_fill_queued" }], rowCount: 1 }
@@ -95,6 +95,30 @@ describe("reviewed application fill browser binding", () => {
       userId: "user-a", sessionId: "session-a", fillTurnId: "fill-turn-a", jobId: "job-a", artifactId: proof.artifactId })
     expect(Object.keys(data)).not.toContain("resumeContent")
     expect(JSON.stringify(data)).not.toContain(JSON.stringify(objectiveResume.content))
+  })
+
+  it("allows a waiting parent only with the exact live filler lease", async () => {
+    const currentLease = lease()
+    const waiting = fixture({ turnStatus: "waiting_for_dependency", turnInput: { reviewedApplicationMaterialSource: objectiveSource } })
+    const claimed = await claimApplicationFillBrowserStart({ pool: waiting.pool, lease: currentLease, expectedSelector: objectiveSelector,
+      expectedObjectiveResumeWitness: objectiveWitness, applicationTaskId: "application-a", jobId: "job-a" })
+    expect(claimed).toMatchObject({ status: "claimed", objectiveEvidence })
+    const leaseCheck = waiting.calls.find(call => call.sql.includes("FROM sub_agent_tasks sub"))!
+    expect(leaseCheck.sql).toContain('sub.status=\'running\' AND sub."leaseOwner"=$7 AND sub."attemptCount"=$8')
+    expect(leaseCheck.sql).toContain('sub."leaseExpiresAt">clock_timestamp() AND sub."interruptRequestedAt" IS NULL')
+    expect(leaseCheck.values).toEqual([currentLease.id, currentLease.sessionId, currentLease.turnId, currentLease.userId,
+      currentLease.role, currentLease.taskType, currentLease.ownerId, currentLease.attemptCount, currentLease.leaseExpiresAt])
+    expect(objectiveReader.read).toHaveBeenCalledWith(waiting.client, expect.objectContaining({ phase: "browser_start" }))
+
+    objectiveReader.read.mockClear()
+    const missingLease = fixture({ turnStatus: "waiting_for_dependency", subtaskFound: false,
+      turnInput: { reviewedApplicationMaterialSource: objectiveSource } })
+    await expect(claimApplicationFillBrowserStart({ pool: missingLease.pool, lease: lease(), expectedSelector: objectiveSelector,
+      expectedObjectiveResumeWitness: objectiveWitness, applicationTaskId: "application-a", jobId: "job-a" }))
+      .resolves.toEqual({ status: "stale" })
+    expect(objectiveReader.read).not.toHaveBeenCalled()
+    expect(missingLease.calls.some(call => call.sql.includes('INSERT INTO "application_task_events"'))).toBe(false)
+    expect(missingLease.calls.some(call => call.sql.includes("UPDATE application_tasks AS app"))).toBe(false)
   })
 
   it("does not claim Objective browser start after the Resume witness changes", async () => {
