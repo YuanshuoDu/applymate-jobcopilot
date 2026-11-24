@@ -22,6 +22,7 @@ describe("TaskGraph snapshot capacity and package reference parsing", () => {
   it("keeps ordinary snapshots at eight and admits only a complete bounded post-Gate graph above eight", () => {
     expect(taskGraphSnapshotCapacityValid(Array.from({ length: 8 }, (_, index) => node(`ordinary-${index}`, "scout", 1, [])))).toBe(true)
     expect(taskGraphSnapshotCapacityValid(Array.from({ length: 9 }, (_, index) => node(`ordinary-${index}`, "scout", 1, [])))).toBe(false)
+    expect(taskGraphSnapshotCapacityValid(Array.from({ length: 27 }, (_, index) => node(`generic-${index}`, "scout", 1, [])))).toBe(false)
     expect(taskGraphSnapshotCapacityValid(postGateGraph())).toBe(true)
     const malformed = postGateGraph()
     malformed[10] = node("scheduled.post_gate_audit", "scheduled.post_gate_audit", 6, ["execute-1"])
