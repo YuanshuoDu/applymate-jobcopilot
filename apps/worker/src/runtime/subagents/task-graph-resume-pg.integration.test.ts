@@ -21625,6 +21625,19 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(liveWriters.rows.map(row => row.id).sort()).toEqual(expectedWriterIds)
       expect(liveWriters.rows.every(row => row.role === "writer" && row.status === "running"
         && typeof row.leaseOwner === "string" && row.leaseLive)).toBe(true)
+      const writerStartEvents = await pool!.query<{ type: string }>(
+        `SELECT event."type" FROM "agent_events" AS event
+         JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+         JOIN "sub_agent_tasks" AS task ON task."id" = event."taskId" AND task."sessionId" = event."sessionId"
+           AND task."turnId" = event."turnId"
+         WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = ANY($3::text[])
+           AND event."type" IN ('model.started', 'tool_call.started')
+           AND session."userId" = $4 AND turn."userId" = $4 AND task."rootTaskId" = $5
+           AND task."parentTaskId" = $5 AND task."role" = 'writer' LIMIT 1`,
+        [value.sessionId, value.turnId, expectedWriterIds, value.userId, rootTaskId],
+      )
+      expect(writerStartEvents.rows).toEqual([])
 
       const queueIdentities = await readExactFixtureQueueJobs(pool!, [value], turnQueueName, childQueueName,
         selectedJobQueueName, value.sessionId)

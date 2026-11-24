@@ -1,4 +1,4 @@
-import { createObjectiveTailorWaveDraftModel } from "./objective-tailor-wave-draft.fixture.mjs"
+import { createObjectiveTailorWaveDraftModel, waitForObjectiveTailorWave1WriterGate } from "./objective-tailor-wave-draft.fixture.mjs"
 import { createObjectiveTailorWaveSourceModel, diagnoseObjectiveTailorWaveOne, diagnoseObjectiveTailorWaveOneReceipt,
   diagnoseObjectiveTailorWaveGraph, fixturePhaseReady, fixtureObservation,
   fixtureToolCalls, fixtureToolResult, objectiveTailorWaveDiagnosticCode, objectiveTailorWaveIdentity, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
@@ -13,16 +13,17 @@ const MODEL_PROFILE = { provider: "fixture", model: "objective-tailor-wave", nat
 
 export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnId, mode, say, waitForCommand }) {
   const blockedWriters = new Set()
+  const pauseWave1Writer = task => waitForObjectiveTailorWave1WriterGate({ task, mode, say, waitForCommand, blockedWriters, expectedScope: { userId, sessionId, turnId } })
   const phaseReady = (request, phase, activeTurnId) => fixturePhaseReady(request, phase, activeTurnId, say, WAIT_PREFIX)
   let wave1Identity
   let coverageFailureReported = false
-  const childModel = input => {
+  const childModel = async input => {
     if (input?.task?.role === "scout" || input?.task?.role === "analyst") {
       return createObjectiveTailorWaveSourceModel({ task: input.task, userId, sessionId, turnId, profile: MODEL_PROFILE,
         roleResultSchema: deps.roleResultSchema, say })
     }
-    return createObjectiveTailorWaveDraftModel({ deps, task: input?.task, userId, sessionId, turnId, profile: MODEL_PROFILE, mode,
-      say, waitForCommand, blockedWriters })
+    if (input?.task?.role === "writer") await pauseWave1Writer(input.task)
+    return createObjectiveTailorWaveDraftModel({ deps, task: input?.task, userId, sessionId, turnId, profile: MODEL_PROFILE })
   }
   const rootModel = ({ userId: requestUserId, state }) => {
     const scope = state?.scope

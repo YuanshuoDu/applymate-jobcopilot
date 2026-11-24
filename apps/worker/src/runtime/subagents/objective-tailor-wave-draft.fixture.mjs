@@ -1,12 +1,25 @@
-export function createObjectiveTailorWaveDraftModel({ deps, task, userId, sessionId, turnId, profile, mode, say, waitForCommand, blockedWriters }) {
+export async function waitForObjectiveTailorWave1WriterGate({ task, mode, say, waitForCommand, blockedWriters, expectedScope }) {
+  const slotId = task?.context?.objectiveTailorCandidateWitness?.slotId
+  if (mode !== "first" || task?.role !== "writer" || task.context?.objectiveTailorCandidateMode !== true
+    || task.userId !== expectedScope.userId || task.sessionId !== expectedScope.sessionId || task.turnId !== expectedScope.turnId
+    || typeof slotId !== "string" || !["tailor-1", "tailor-2", "tailor-3", "tailor-4"].includes(slotId)
+    || task.context?.objectiveTailorCorrectionProof
+    || (task.attemptCount !== undefined && task.attemptCount !== 1)
+    || typeof task.id !== "string" || blockedWriters.has(task.id)) return
+  blockedWriters.add(task.id)
+  if (blockedWriters.size === 4) say("TAILOR_WAVE1_WRITERS_PAUSED 4")
+  await waitForCommand("resume-wave1")
+}
+
+export function createObjectiveTailorWaveDraftModel({ deps, task, userId, sessionId, turnId, profile }) {
   if (task?.userId !== userId || task?.sessionId !== sessionId || task?.turnId !== turnId
     || !task.context?.objectiveTailorCandidateMode) throw new Error("fixture_draft_context_invalid")
-  if (task.role === "writer") return writerModel({ deps, task, userId, sessionId, turnId, profile, mode, say, waitForCommand, blockedWriters })
+  if (task.role === "writer") return writerModel({ deps, task, userId, sessionId, turnId, profile })
   if (task.role === "reviewer") return reviewerModel({ deps, task, userId, sessionId, turnId, profile })
   throw new Error("fixture_draft_role_unsupported")
 }
 
-function writerModel({ deps, task, userId, sessionId, turnId, profile, mode, say, waitForCommand, blockedWriters }) {
+function writerModel({ deps, task, userId, sessionId, turnId, profile }) {
   const jobId = task.context.selectedJobPreparation?.jobId
   const witness = task.context.objectiveTailorCandidateWitness
   if (typeof jobId !== "string" || witness?.candidate?.jobId !== jobId || typeof witness.slotId !== "string") {
@@ -18,11 +31,6 @@ function writerModel({ deps, task, userId, sessionId, turnId, profile, mode, say
   return { id: "objective-tailor-wave-writer-fixture", profile, async *stream(request) {
     assertScope(request, { userId, sessionId, turnId, taskId: task.id })
     const drafts = toolCalls(request, "cover_letter.draft"), prior = drafts.at(-1)
-    if (mode === "first" && !correction && !prior && !blockedWriters.has(task.id)) {
-      blockedWriters.add(task.id)
-      if (blockedWriters.size === 4) say("TAILOR_WAVE1_WRITERS_PAUSED 4")
-      await waitForCommand("resume-wave1")
-    }
     if (revision) {
       const reads = toolCalls(request, "artifact.version.read"), read = reads.at(-1)
       if (!read) { yield* emit(`read-${task.id}`, "artifact.version.read", { artifactRef: revision.artifactRef }); return }
