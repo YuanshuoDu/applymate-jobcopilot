@@ -492,6 +492,7 @@ const tlsPaths = ["AGENT_TEST_TLS_CERT_PATH", "AGENT_TEST_TLS_KEY_PATH", "AGENT_
 const testDb = new PrismaClient({ datasources: { db: { url: databaseUrl ?? DATABASE_URL } } })
 const workerRequire = createRequire(new URL("../../../../../../worker/package.json", import.meta.url))
 const { Queue } = workerRequire("bullmq") as { Queue: new (name: string, options: { connection: { host: string; port: number; db: number } }) => {
+  client: Promise<{ del(key: string): Promise<number>; get(key: string): Promise<string | null> }>
   getJobs(states: readonly string[], start: number, end: number): Promise<Array<{ id?: string; data: unknown; attemptsMade: number; attemptsStarted: number; stalledCounter: number; getState(): Promise<string>; remove(): Promise<void> }>>
   getJob(id: string): Promise<{ id?: string; data: unknown; attemptsMade: number; attemptsStarted: number; stalledCounter: number; getState(): Promise<string>; remove(): Promise<void> } | undefined>
   add(name: string, data: unknown, options: { jobId: string }): Promise<{ id?: string; getState(): Promise<string> }>
@@ -2619,6 +2620,10 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
   it("approves only a corrected Objective slot and fills its exact material without submission", async () => {
     const sessionId = `full-loop-objective-session-${runId}`
     const suffix = `full-loop-objective-${runId}`
+    const redis = await applyQueue!.client
+    const objectiveDomainQuotaKey = `ratelimit:domain:${ids.user}:boards.greenhouse.io`
+    await redis.del(objectiveDomainQuotaKey)
+    expect(await redis.get(objectiveDomainQuotaKey)).toBeNull()
     reviewedSessionIds.push(sessionId)
     await testDb.agentSession.create({ data: { id: sessionId, userId: ids.user,
       goal: "Prepare one verified Objective application for review", status: "running", source: "application_full_loop_objective" } })
