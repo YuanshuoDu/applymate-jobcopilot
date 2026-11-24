@@ -5354,6 +5354,100 @@ async function waitForProcessLine(child: ProcessFixtureChild, prefix: string, ti
   throw new Error("Timed out waiting for " + prefix + "; " + processFixtureDiagnostics(child))
 }
 
+async function waitForObjectiveTailorSourceGraph(
+  pool: Pool, child: ProcessFixtureChild, owner: Pick<Fixture, "userId" | "sessionId" | "turnId">,
+  timeoutMs = 180_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  let nextReadAt = 0
+  let progress: RecordValue = { available: false }
+  const failed = (reason: "turn_missing" | "turn_terminal" | "root_terminal" | "worker_exited" | "deadline") => {
+    const markers = ["TAILOR_WAVE_WORKER_READY first", "TAILOR_SOURCE_GRAPH_READY 7", "TAILOR_WAVE1_WRITERS_PAUSED 4"]
+    const rootStages = [
+      ["TAILOR_ROOT_FACTORY_ENTERED", "factory_entered"],
+      ["TAILOR_ROOT_FACTORY_BOUND", "factory_bound"],
+      ["TAILOR_ROOT_FACTORY_ROOT_UNAVAILABLE", "root_unavailable"],
+      ["TAILOR_ROOT_STREAM_ENTERED", "stream_entered"],
+      ["TAILOR_ROOT_REQUEST_SCOPE_OK", "request_scope_ok"],
+      ["TAILOR_ROOT_INITIAL_PLAN_REQUESTED", "initial_plan_requested"],
+      ["TAILOR_ROOT_SOURCE_WAIT_REQUESTED", "source_wait_requested"],
+      ["TAILOR_ROOT_ANALYST_PLAN_REQUESTED", "analyst_plan_requested"],
+      ["TAILOR_ROOT_STREAM_FAILED", "stream_failed"],
+    ] as const
+    const lastRootStage = [...child.output].reverse().flatMap(line => {
+      const stage = rootStages.find(([marker]) => marker === line)?.[1]
+      return stage ? [stage] : []
+    })[0] ?? "not_started"
+    throw new Error(`Objective Tailor source stage ${reason}: ${JSON.stringify({
+      ...progress,
+      reason,
+      lastRootStage,
+      workerExited: child.exitCode !== null || child.signalCode !== null,
+      stdoutLineCount: child.output.length,
+      stderrLineCount: child.errors.length,
+      workerReady: child.output.includes(markers[0]),
+      sourceGraphReady: child.output.includes(markers[1]),
+      writersPaused: child.output.includes(markers[2]),
+    })}`)
+  }
+
+  while (Date.now() < deadline) {
+    if (child.output.includes("TAILOR_SOURCE_GRAPH_READY 7")) return
+    if (child.exitCode !== null || child.signalCode !== null) failed("worker_exited")
+    if (Date.now() >= nextReadAt) {
+      nextReadAt = Date.now() + 750
+      try {
+        const result = await pool.query<{
+          turnStatus: string; rootStatus: string | null; rootTaskIdPresent: boolean; rootPresent: boolean; graphPresent: boolean
+          childCount: number; stepCount: number; dispatchCount: number; dispatchPublished: boolean
+        }>(`SELECT turn."status" AS "turnStatus", root."status" AS "rootStatus", turn."rootTaskId" IS NOT NULL AS "rootTaskIdPresent",
+              root."id" IS NOT NULL AS "rootPresent",
+              EXISTS (SELECT 1 FROM "agent_items" AS item WHERE item."sessionId" = turn."sessionId"
+                AND item."turnId" = turn."id" AND item."taskId" = turn."rootTaskId" AND item."type" = 'task_graph') AS "graphPresent",
+              (SELECT COUNT(*)::int FROM "sub_agent_tasks" AS childTask WHERE childTask."sessionId" = turn."sessionId"
+                AND childTask."turnId" = turn."id" AND childTask."rootTaskId" = turn."rootTaskId"
+                AND childTask."parentTaskId" = turn."rootTaskId") AS "childCount",
+              (SELECT COUNT(*)::int FROM "agent_steps" AS step WHERE step."sessionId" = turn."sessionId"
+                AND step."turnId" = turn."id" AND step."taskId" = turn."rootTaskId") AS "stepCount",
+              (SELECT COUNT(*)::int FROM "agent_outbox" AS dispatch WHERE dispatch."aggregateId" = turn."sessionId"
+                AND dispatch."topic" = 'agent.turn.dispatch' AND dispatch."idempotencyKey" = 'turn-dispatch:' || turn."id") AS "dispatchCount",
+              EXISTS (SELECT 1 FROM "agent_outbox" AS dispatch WHERE dispatch."aggregateId" = turn."sessionId"
+                AND dispatch."topic" = 'agent.turn.dispatch' AND dispatch."idempotencyKey" = 'turn-dispatch:' || turn."id"
+                AND dispatch."publishedAt" IS NOT NULL) AS "dispatchPublished"
+            FROM "agent_turns" AS turn
+            JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+            LEFT JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+              AND root."turnId" = turn."id" AND root."rootTaskId" = root."id" AND root."parentTaskId" IS NULL
+              AND root."role" = 'orchestrator' AND root."taskType" = 'root'
+            WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND session."userId" = $3`,
+        [owner.turnId, owner.sessionId, owner.userId])
+        const row = result.rows.length === 1 ? result.rows[0] : undefined
+        progress = row ? {
+          available: true,
+          turnStatus: diagnosticEnum(row.turnStatus, TURN_DIAGNOSTIC_STATUSES) ?? "other",
+          rootStatus: row.rootStatus === null ? "missing" : diagnosticEnum(row.rootStatus, TASK_DIAGNOSTIC_STATUSES) ?? "other",
+          rootTaskIdPresent: row.rootTaskIdPresent,
+          rootPresent: row.rootPresent,
+          graphPresent: row.graphPresent,
+          childCount: diagnosticBoundedCount(row.childCount),
+          stepCount: diagnosticBoundedCount(row.stepCount),
+          dispatchCount: diagnosticBoundedCount(row.dispatchCount),
+          dispatchPublished: row.dispatchPublished,
+        } : { available: true, turnPresent: false }
+      } catch {
+        // A bounded unavailable marker is safer than surfacing SQL or fixture data.
+        if (!("available" in progress)) progress = { available: false }
+      }
+      if (progress.turnPresent === false) failed("turn_missing")
+      if (["failed", "interrupted", "cancelled", "completed"].includes(String(progress.turnStatus))) failed("turn_terminal")
+      if (progress.rootPresent === true
+        && ["failed", "interrupted", "cancelled", "completed"].includes(String(progress.rootStatus))) failed("root_terminal")
+    }
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  failed("deadline")
+}
+
 function waitForProcessExit(child: ProcessFixtureChild, timeoutMs = 10_000): Promise<void> {
   return new Promise((resolve, reject) => {
     let timer: NodeJS.Timeout | undefined
@@ -21112,7 +21206,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
 
       firstWorker = startObjectiveTailorWaveWorker("first", value)
       await waitForProcessLine(firstWorker, "TAILOR_WAVE_WORKER_READY first", 60_000)
-      await waitForProcessLine(firstWorker, "TAILOR_SOURCE_GRAPH_READY 7", 180_000)
+      await waitForObjectiveTailorSourceGraph(pool!, firstWorker, value)
       await waitForProcessLine(firstWorker, "TAILOR_WAVE1_WRITERS_PAUSED 4", 180_000)
       const ordinaryPlanRejected = await waitForProcessLine(firstWorker, "TAILOR_ORDINARY_PLAN_REJECTED ", 120_000)
       const ordinaryPlanRevision = /^TAILOR_ORDINARY_PLAN_REJECTED ([1-9][0-9]*)$/.exec(ordinaryPlanRejected)?.[1]

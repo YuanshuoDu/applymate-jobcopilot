@@ -68,10 +68,40 @@ async function run() {
     import("../../queue/production-worker-runtime.ts"), import("./objective-tailor-wave-model.fixture.mjs"),
   ])
   closeRedisConnections = redis.closeSharedRedisConnections
+  pool = new pg.Pool({ connectionString: db, max: 16 })
   const deps = { roleResultSchema: roles.ROLE_RESULT_SCHEMA, writerArtifactReferenceFromTaskContext: dependency.writerArtifactReferenceFromTaskContext,
     writerReviewDependencyFromTaskContext: reviewFeedback.writerReviewDependencyFromTaskContext }
   const models = modelFixture.createObjectiveTailorWaveModels({ deps, ...scope, mode, say, waitForCommand })
-  pool = new pg.Pool({ connectionString: db, max: 16 })
+  const rootModelFactory = async input => {
+    const stateScope = input?.state?.scope
+    if (input?.userId !== scope.userId || stateScope?.userId !== scope.userId
+      || stateScope?.sessionId !== scope.sessionId || stateScope?.turnId !== scope.turnId) return models.rootModel(input)
+    say("TAILOR_ROOT_FACTORY_ENTERED")
+    let roots
+    try {
+      roots = await pool.query(`SELECT root."id" AS "rootTaskId" FROM "agent_turns" AS turn
+        JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+        JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+          AND root."turnId" = turn."id" AND root."rootTaskId" = root."id"
+        WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+          AND turn."executionMode" = 'canonical_task_graph' AND turn."status" = 'in_progress'
+          AND turn."leaseOwnerId" IS NOT NULL AND turn."leaseExpiresAt" > CURRENT_TIMESTAMP
+          AND root."parentTaskId" IS NULL AND root."role" = 'orchestrator' AND root."taskType" = 'root' AND root."status" = 'running'
+          AND root."leaseOwner" = turn."leaseOwnerId" AND root."leaseExpiresAt" > CURRENT_TIMESTAMP`,
+      [scope.turnId, scope.sessionId, scope.userId])
+    } catch {
+      say("TAILOR_ROOT_FACTORY_ROOT_UNAVAILABLE")
+      throw new Error("fixture_root_binding_unavailable")
+    }
+    const rootTaskId = roots.rows.length === 1 ? roots.rows[0]?.rootTaskId : undefined
+    if (typeof rootTaskId !== "string" || !rootTaskId
+      || (typeof input.state.rootTaskId === "string" && input.state.rootTaskId !== rootTaskId)) {
+      say("TAILOR_ROOT_FACTORY_ROOT_UNAVAILABLE")
+      throw new Error("fixture_root_binding_unavailable")
+    }
+    say("TAILOR_ROOT_FACTORY_BOUND")
+    return models.rootModel({ ...input, state: { ...input.state, rootTaskId } })
+  }
   const commandPort = graph.createPgTaskGraphCommandPort(pool)
   const authorizeUsage = async () => ({ outputReservationRequired: false, maxOutputTokens: null,
     settle: async () => undefined, settleUnknown: async () => undefined })
@@ -83,7 +113,7 @@ async function run() {
     createOptionalProductionChildExecutor: options => options.enabled ? child.createOptionalProductionChildExecutor({ ...options,
       authorizeUsage, modelRuntimeFactory: models.childModel }) : undefined,
     createCanonicalTurnRuntime: (runtimePool, productionOptions) => runtime.createCanonicalTurnRuntime(runtimePool, {
-      ...productionOptions, ...templates.taskGraphRuntimeOptions(commandPort), modelRuntimeFactory: models.rootModel, authorizeUsage,
+      ...productionOptions, ...templates.taskGraphRuntimeOptions(commandPort), modelRuntimeFactory: rootModelFactory, authorizeUsage,
     }),
     createWorkerUsageAuthorizer: () => authorizeUsage,
     createCanonicalExecutionProjection: execution.createCanonicalExecutionProjection,

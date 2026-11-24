@@ -29,15 +29,21 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
       return { adapter: { id: "objective-tailor-nontarget-guard", profile: MODEL_PROFILE,
         async *stream() { throw new Error("fixture_turn_scope_mismatch") } }, registry: {}, candidates: [] }
     }
+    const rootTaskId = state.rootTaskId
     return { adapter: { id: "objective-tailor-root-fixture", profile: MODEL_PROFILE, async *stream(request) {
-      assertRequestScope(request, { userId, sessionId, turnId, taskId: state.rootTaskId })
+      say("TAILOR_ROOT_STREAM_ENTERED")
+      try {
+      assertRequestScope(request, { userId, sessionId, turnId, taskId: rootTaskId })
+      say("TAILOR_ROOT_REQUEST_SCOPE_OK")
       const plans = fixtureToolCalls(request, "agent.plan"), waits = fixtureToolCalls(request, "agent.wait"), tailors = fixtureToolCalls(request, "agent.tailor")
-      if (!plans.length) { yield* emit(`p3-1336-source-plan:${turnId}`, "agent.plan", sourcePlan()); return }
+      if (!plans.length) { say("TAILOR_ROOT_INITIAL_PLAN_REQUESTED"); yield* emit(`p3-1336-source-plan:${turnId}`, "agent.plan", sourcePlan()); return }
       if (plans.length === 1 && !waits.length) {
         const receipt = acceptedReceipt(request, plans[0], 3)
+        say("TAILOR_ROOT_SOURCE_WAIT_REQUESTED")
         yield* emitWait(request, "wave-source", turnId, receipt.nodes.map(node => node.taskId)); return
       }
       if (plans.length === 1 && phaseReady(request, "wave-source", turnId)) {
+        say("TAILOR_ROOT_ANALYST_PLAN_REQUESTED")
         yield* emit(`p3-1336-analyst-plan:${turnId}`, "agent.plan", analystPlan(currentGraph(request).revision)); return
       }
       if (plans.length === 1 && hasPhase(request, "wave-source", turnId)) {
@@ -143,6 +149,10 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
         return
       }
       throw new Error("fixture_root_phase_unrecognized")
+      } catch {
+        say("TAILOR_ROOT_STREAM_FAILED")
+        throw new Error("fixture_root_stream_failed")
+      }
     } }, registry: {}, candidates: [] }
   }
   return { rootModel, childModel }
