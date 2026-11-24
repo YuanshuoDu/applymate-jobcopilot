@@ -58,7 +58,7 @@ function fixture(change?: "context" | "owner" | "initial-id" | "dependency" | "v
     row("correction-reviewer-task", "reviewer", "cover_letter_review", "waiting", correctionContext)]
   const version = { ...proof.prior.artifactVersion, userId: scope.userId, sessionId: scope.sessionId }
   const client = { query: vi.fn(async (sql: string) => ({ rows: change === "version" || !sql.includes('FROM "agent_artifact_version"') ? [] : [version] })) }
-  mocks.receipt.mockResolvedValue({ userId: scope.userId, sessionId: scope.sessionId, jobId,
+  mocks.receipt.mockResolvedValue({ userId: scope.userId, sessionId: scope.sessionId,
     ...proof.prior.reviewReceipt, ...(change === "receipt" ? { toolCallId: "different-review-call" } : {}) })
   const slot = { slotId: "tailor-1" as const, sourceAnalystNodeKey: "analyst-node", writerNodeKey: witness.writerNodeKey,
     reviewerNodeKey: witness.reviewerNodeKey, correction: keys }
