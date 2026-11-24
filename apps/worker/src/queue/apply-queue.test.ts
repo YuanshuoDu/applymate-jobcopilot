@@ -102,6 +102,7 @@ const submitToolMocks = vi.hoisted(() => ({
   create: vi.fn(),
   execute: vi.fn(),
 }));
+const materialModeMock = vi.hoisted(() => vi.fn().mockResolvedValue("ordinary"));
 
 vi.mock("ioredis", () => ({
   Redis: vi.fn().mockImplementation(() => ({
@@ -202,6 +203,7 @@ vi.mock("../db/form-patterns.js", () => ({
 }));
 
 vi.mock("../db/load-task-context.js", () => ({
+  readApplyQueueMaterialMode: materialModeMock,
   loadTaskContext: vi.fn().mockResolvedValue({
     applyUrl: "https://example.com/jobs/123/apply",
     persona: { fullName: "Jane Doe" },

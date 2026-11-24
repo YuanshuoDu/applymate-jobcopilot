@@ -30,13 +30,16 @@ const mocks = vi.hoisted(() => {
   const outcomeClient = { query: outcomeQuery, release: vi.fn() };
   const fakeContext = {
     close: vi.fn().mockResolvedValue(undefined),
+    pages: vi.fn(() => [fakePage]),
     route: vi.fn().mockResolvedValue(undefined),
     unroute: vi.fn().mockResolvedValue(undefined),
   };
   const fakePage = {
     goto: vi.fn().mockResolvedValue(undefined),
     url: vi.fn().mockReturnValue("https://jobs.example/apply/start/123"),
+    evaluate: vi.fn().mockResolvedValue(false),
     context: vi.fn(() => fakeContext),
+    mainFrame: vi.fn(() => ({ page: () => mocks.fakePage })),
     close: vi.fn().mockResolvedValue(undefined),
   };
 
@@ -62,6 +65,11 @@ const mocks = vi.hoisted(() => {
     outcomeTransaction,
     outcomeClient,
     loadTaskContext: vi.fn(),
+    readApplyQueueMaterialMode: vi.fn().mockResolvedValue("ordinary"),
+    objectiveSubmit: vi.fn().mockResolvedValue({ status: "submitted", durationMs: 7 }),
+    objectiveTargetSupported: vi.fn((url: unknown) => url === "https://boards.greenhouse.io/acme/jobs/123"),
+    objectiveMaterial: undefined as unknown,
+    gotoCountAtToolExecution: null as number | null,
     detectCaptcha: vi.fn().mockResolvedValue(false),
     detectFlow: vi.fn().mockReturnValue(null),
     runGreenhouseFlow: vi.fn(),
@@ -151,7 +159,10 @@ vi.mock("../db/form-patterns.js", () => ({
   recordPatternFailure: mocks.recordPatternFailure,
   upsertFormPattern: mocks.upsertFormPattern,
 }));
-vi.mock("../db/load-task-context.js", () => ({ loadTaskContext: mocks.loadTaskContext }));
+vi.mock("../db/load-task-context.js", () => ({
+  loadTaskContext: mocks.loadTaskContext,
+  readApplyQueueMaterialMode: mocks.readApplyQueueMaterialMode,
+}));
 vi.mock("../harness/agent-harness.js", () => ({ AgentHarness: mocks.AgentHarness }));
 vi.mock("../flows/index.js", () => ({ detectFlow: mocks.detectFlow }));
 vi.mock("../flows/greenhouse-flow.js", () => ({ runGreenhouseFlow: mocks.runGreenhouseFlow }));
@@ -198,11 +209,13 @@ vi.mock("../runtime/interrupt/application-submission-probe.js", () => ({
 }));
 vi.mock("../runtime/tools/application-submit-tool.js", () => ({
   createPgApplicationSubmitTool: submitToolMocks.create.mockImplementation((
-    { submit }: { submit: (input: { beforeSubmit: (intent?: unknown) => Promise<boolean> }) => Promise<unknown> },
+    { submit }: { submit: (input: { beforeSubmit: (intent?: unknown) => Promise<boolean>; objectiveMaterial?: unknown }) => Promise<unknown> },
   ) => ({
     execute: async () => {
       try {
-        await submit({ beforeSubmit: async () => true });
+        mocks.gotoCountAtToolExecution = mocks.fakePage.goto.mock.calls.length;
+        await submit({ beforeSubmit: async () => true,
+          ...(mocks.objectiveMaterial ? { objectiveMaterial: mocks.objectiveMaterial } : {}) });
         return { status: "submitted", confirmationId: "application:application-task-1", postSubmitUrl: null, errorCode: null, output: null };
       } catch (error) {
         const errorCode = error && typeof error === "object" && "code" in error && typeof error.code === "string"
@@ -212,6 +225,10 @@ vi.mock("../runtime/tools/application-submit-tool.js", () => ({
       }
     },
   })),
+}));
+vi.mock("./objective-application-submit-material.js", () => ({
+  objectiveApplicationSubmitTargetSupported: mocks.objectiveTargetSupported,
+  runObjectiveGreenhouseApplicationSubmit: mocks.objectiveSubmit,
 }));
 vi.mock("node:fs", () => ({ unlinkSync: vi.fn() }));
 
@@ -257,6 +274,11 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.updateJobForSubmission.mockReset().mockResolvedValue({ kind: "current", value: true });
     mocks.outcomeTransaction.nextId = 1000;
     mocks.outcomeTransaction.currentId = null;
+    mocks.readApplyQueueMaterialMode.mockReset().mockResolvedValue("ordinary");
+    mocks.objectiveSubmit.mockReset().mockResolvedValue({ status: "submitted", durationMs: 7 });
+    mocks.objectiveTargetSupported.mockReset().mockImplementation((url: unknown) => url === "https://boards.greenhouse.io/acme/jobs/123");
+    mocks.objectiveMaterial = undefined;
+    mocks.gotoCountAtToolExecution = null;
     mocks.outcomeQuery.mockClear();
     mocks.outcomeClient.release.mockClear();
     mocks.workerHandler = undefined;
@@ -277,6 +299,7 @@ describe("apply-queue Phase 5 pipeline", () => {
           : { rows: [], rowCount: 1 },
     }) : true);
     mocks.fakePage.goto.mockResolvedValue(undefined);
+    mocks.fakePage.url.mockReturnValue("https://jobs.example/apply/start/123");
     mocks.fakePage.context.mockClear();
     mocks.fakePage.close.mockReset().mockResolvedValue(undefined);
     mocks.fakeContext.close.mockReset().mockResolvedValue(undefined);
@@ -360,6 +383,69 @@ describe("apply-queue Phase 5 pipeline", () => {
       "worker-task-pipeline-1",
     );
     expect(mocks.withCloakContext).toHaveBeenCalledOnce();
+  }, 15_000);
+
+  it("uses only approved Objective material after the fresh tool claim and before navigating", async () => {
+    const approvedUrl = "https://boards.greenhouse.io/acme/jobs/123";
+    const material = { approvedApplyUrl: approvedUrl, reviewedResumeContent: { basics: { name: "Ada" } },
+      reviewedCoverLetter: "Reviewed letter", confirmedAnswers: { city: "Dublin" } };
+    mocks.readApplyQueueMaterialMode.mockResolvedValueOnce("objective");
+    mocks.loadTaskContext.mockResolvedValueOnce({ applyUrl: approvedUrl, persona: { fullName: "Ada Lovelace" },
+      coverLetterText: null, jobTitle: "Engineer", jobCompany: "Example", jobKeywords: "typescript",
+      confirmedAnswers: {}, resumeTempPath: undefined });
+    mocks.detectFlow.mockReturnValue("greenhouse");
+    mocks.fakePage.url.mockReturnValue(approvedUrl);
+    mocks.objectiveMaterial = material;
+    mocks.objectiveSubmit.mockImplementationOnce(async (input: {
+      task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> };
+      material: unknown;
+      page: unknown;
+    }) => {
+      expect(input.material).toEqual(material);
+      expect(input.page).toBe(mocks.fakePage);
+      expect(input.task.beforeSubmit).toEqual(expect.any(Function));
+      await expect(input.task.beforeSubmit?.({ url: `${approvedUrl}/application`, method: "POST" })).resolves.toBe(true);
+      return { status: "submitted", durationMs: 7 };
+    });
+
+    await expect(runApplyJob()).resolves.toBeUndefined();
+
+    expect(mocks.loadTaskContext).toHaveBeenCalledWith(expect.anything(), "user-1", "job-1", payload.applyUrl,
+      "application-task-1", { objectiveOnly: true });
+    expect(mocks.gotoCountAtToolExecution).toBe(0);
+    expect(mocks.fakePage.goto).toHaveBeenCalledWith(approvedUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    expect(mocks.objectiveSubmit).toHaveBeenCalledOnce();
+    expect(mocks.runGreenhouseFlow).not.toHaveBeenCalled();
+    expect(mocks.agentRun).not.toHaveBeenCalled();
+  }, 15_000);
+
+  it("blocks a removed Objective marker with V3 evidence before context loading or navigation", async () => {
+    mocks.readApplyQueueMaterialMode.mockResolvedValueOnce("blocked");
+
+    await expect(runApplyJob()).rejects.toThrow("Application material source is invalid or unavailable.");
+
+    expect(mocks.loadTaskContext).not.toHaveBeenCalled();
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
+    expect(mocks.claimUnattendedSubmission).not.toHaveBeenCalled();
+    expect(mocks.fakePage.goto).not.toHaveBeenCalled();
+    expect(submitToolMocks.create).not.toHaveBeenCalled();
+  }, 15_000);
+
+  it("blocks unsupported Objective ATS targets before consuming approval or opening a browser", async () => {
+    mocks.readApplyQueueMaterialMode.mockResolvedValueOnce("objective");
+    mocks.loadTaskContext.mockResolvedValueOnce({ applyUrl: "https://jobs.lever.co/acme/123", persona: { fullName: "Ada" },
+      coverLetterText: null, jobTitle: "Engineer", jobCompany: "Example", jobKeywords: "typescript",
+      confirmedAnswers: {}, resumeTempPath: undefined });
+    mocks.detectFlow.mockReturnValue("lever");
+
+    await expect(runApplyJob()).rejects.toThrow("Objective application target is not supported.");
+
+    expect(mocks.loadTaskContext).toHaveBeenCalledWith(expect.anything(), "user-1", "job-1", payload.applyUrl,
+      "application-task-1", { objectiveOnly: true });
+    expect(mocks.claimUnattendedSubmission).not.toHaveBeenCalled();
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
+    expect(mocks.fakePage.goto).not.toHaveBeenCalled();
+    expect(submitToolMocks.create).not.toHaveBeenCalled();
   }, 15_000);
 
   it("lets only one concurrent delivery reach browser setup before the submit-start marker", async () => {
