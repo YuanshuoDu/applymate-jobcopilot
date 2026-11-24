@@ -21861,20 +21861,86 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(dispatches.rows).toHaveLength(27)
       expect(new Set(dispatches.rows.map(row => row.idempotencyKey)).size).toBe(27)
       expect(dispatches.rows.every(row => row.publishedAt instanceof Date)).toBe(true)
-      const waits = await pool!.query<{ idempotencyKey: string; status: string; consumedAt: Date | null }>(
-        `SELECT "idempotencyKey", "status", "consumedAt" FROM "agent_wait_conditions"
+      const waits = await pool!.query<{
+        id: string; idempotencyKey: string; status: string; mode: string; targetTaskIds: unknown; matchedTaskIds: unknown
+        result: unknown; suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null
+      }>(
+        `SELECT "id", "idempotencyKey", "status", "mode", "targetTaskIds", "matchedTaskIds", "result",
+                "suspendedAt", "resolvedAt", "consumedAt" FROM "agent_wait_conditions"
          WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4
            AND "idempotencyKey" LIKE $5 ORDER BY "idempotencyKey"`,
         [value.userId, value.sessionId, value.turnId, rootTaskId, `p3-1336-%:${value.turnId}:%`],
       )
+      const exactIds = (value: unknown, allowEmpty = false): string[] | null => {
+        let parsed = value
+        if (typeof parsed === "string") {
+          try { parsed = JSON.parse(parsed) as unknown } catch { return null }
+        }
+        return stringIds(parsed, allowEmpty)
+      }
+      const immediateReadyWaitHasReceipt = async (wait: typeof waits.rows[number]): Promise<boolean> => {
+        const targets = exactIds(wait.targetTaskIds), matched = exactIds(wait.matchedTaskIds, true)
+        const persistedRequest = record(record(wait.result)?.request)
+        const persistedTargets = exactIds(persistedRequest?.targetTaskIds)
+        if (!targets || !matched || !persistedRequest || persistedRequest.mode !== "all"
+          || !sameUniqueIds(persistedTargets ?? [], targets) || !sameUniqueIds(matched, targets)) return false
+        const receipts = await pool!.query<{
+          callStatus: string; callContent: unknown; resultStatus: string | null; resultContent: unknown
+        }>(`SELECT call."status" AS "callStatus", call."content" AS "callContent",
+                   result."status" AS "resultStatus", result."content" AS "resultContent"
+            FROM "agent_items" AS call
+            JOIN "agent_turns" AS turn ON turn."id" = call."turnId" AND turn."sessionId" = call."sessionId"
+            JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+            LEFT JOIN "agent_items" AS result ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
+              AND result."taskId" = call."taskId" AND result."type" = 'tool_result'
+              AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
+            WHERE call."sessionId" = $1 AND call."turnId" = $2 AND turn."userId" = $3 AND session."userId" = $3
+              AND call."taskId" = $4 AND turn."rootTaskId" = $4 AND call."type" = 'tool_call'
+              AND call."content"->>'toolName' = 'agent.wait'
+              AND call."content"->'input'->>'idempotencyKey' = $5`,
+        [value.sessionId, value.turnId, value.userId, rootTaskId, wait.idempotencyKey])
+        if (receipts.rows.length !== 1) return false
+        const receipt = receipts.rows[0]!, call = record(receipt.callContent), input = record(call?.input)
+        const result = record(receipt.resultContent), output = record(result?.output)
+        const outputTargets = exactIds(output?.taskIds), outputMatched = exactIds(output?.matchedTaskIds, true)
+        const outputTasks = Array.isArray(output?.tasks) ? output.tasks.map(record) : null
+        const outputTaskIds = outputTasks?.map(task => task?.taskId).filter((id): id is string => typeof id === "string") ?? []
+        return receipt.callStatus === "completed" && receipt.resultStatus === "completed"
+          && call?.toolName === "agent.wait" && input?.idempotencyKey === wait.idempotencyKey
+          && input.mode === wait.mode && sameUniqueIds(exactIds(input.taskIds) ?? [], targets)
+          && result?.toolCallId === call.toolCallId && result?.errorCode === null
+          && output?.waitId === wait.id && output.status === "ready"
+          && sameUniqueIds(outputTargets ?? [], targets) && sameUniqueIds(outputMatched ?? [], matched)
+          && outputTasks !== null && outputTasks.length === targets.length && sameUniqueIds(outputTaskIds, targets)
+      }
+      const readyEvidence = new Map<string, boolean>(), waitStateValid = new Map<string, boolean>()
+      for (const wait of waits.rows) {
+        let validState = false, ready = false
+        if (wait.status === "ready" && wait.suspendedAt instanceof Date) {
+          validState = wait.resolvedAt instanceof Date && wait.consumedAt instanceof Date
+          ready = validState
+        } else if (wait.status === "ready" && wait.suspendedAt === null
+          && wait.resolvedAt === null && wait.consumedAt === null) {
+          ready = await immediateReadyWaitHasReceipt(wait)
+          validState = ready
+        } else if (wait.status === "waiting") {
+          validState = wait.consumedAt === null
+        }
+        readyEvidence.set(wait.id, ready)
+        waitStateValid.set(wait.id, validState)
+      }
       const phaseKeys = ["wave-source-wait", "wave-analyst-wait", "wave1-wait", "wave2-wait", "corrections-wait"]
       for (const phase of phaseKeys) {
-        expect(waits.rows.some(wait => wait.idempotencyKey.startsWith(`p3-1336-${phase}:${value.turnId}:`)
-          && wait.status === "ready" && wait.consumedAt instanceof Date)).toBe(true)
+        const phaseWaits = waits.rows.filter(wait => wait.idempotencyKey.startsWith(`p3-1336-${phase}:${value.turnId}:`))
+        expect(phaseWaits.length > 0 && phaseWaits.some(wait => readyEvidence.get(wait.id) === true)).toBe(true)
       }
+      const recoveredWave1Wait = waits.rows.find(wait => wait.id === firstWait.id)
+      expect(recoveredWave1Wait?.idempotencyKey === firstWaitKey
+        && recoveredWave1Wait?.status === "ready" && recoveredWave1Wait.suspendedAt instanceof Date
+        && recoveredWave1Wait.resolvedAt instanceof Date && recoveredWave1Wait.consumedAt instanceof Date
+        && readyEvidence.get(firstWait.id) === true).toBe(true)
       expect(waits.rows.every(wait => /^p3-1336-(?:wave-source|wave-analyst|wave1|wave2|corrections)-wait:[^:]+:[1-9][0-9]*$/.test(wait.idempotencyKey)
-        && ((wait.status === "ready" && wait.consumedAt instanceof Date)
-          || (wait.status === "waiting" && wait.consumedAt === null)))).toBe(true)
+        && waitStateValid.get(wait.id) === true)).toBe(true)
       const applicationEffects = await pool!.query<{ applicationTasks: string; approvals: string; submissions: string }>(
         `SELECT (SELECT COUNT(*)::text FROM application_tasks WHERE "userId" = $1 AND "jobId" = ANY($2::text[])) AS "applicationTasks",
           (SELECT COUNT(*)::text FROM "agent_approvals" WHERE "userId" = $1 AND "sessionId" = $3 AND "turnId" = $4) AS "approvals",
