@@ -73,9 +73,9 @@ async function run() {
     writerReviewDependencyFromTaskContext: reviewFeedback.writerReviewDependencyFromTaskContext }
   const models = modelFixture.createObjectiveTailorWaveModels({ deps, ...scope, mode, say, waitForCommand })
   const rootModelFactory = async input => {
-    const stateScope = input?.state?.scope
+    const state = input?.state, stateScope = state?.scope
     if (input?.userId !== scope.userId || stateScope?.userId !== scope.userId
-      || stateScope?.sessionId !== scope.sessionId || stateScope?.turnId !== scope.turnId) return models.rootModel(input)
+      || state?.snapshot?.goal?.id !== `turn-goal:${scope.turnId}`) return models.rootModel(input)
     say("TAILOR_ROOT_FACTORY_ENTERED")
     let roots
     try {

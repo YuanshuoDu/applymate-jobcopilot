@@ -24,8 +24,8 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
   }
   const rootModel = ({ userId: requestUserId, state }) => {
     const scope = state?.scope
-    if (requestUserId !== userId || scope?.userId !== userId || scope?.sessionId !== sessionId || scope?.turnId !== turnId
-      || typeof state?.rootTaskId !== "string") {
+    if (requestUserId !== userId || scope?.userId !== userId
+      || state?.snapshot?.goal?.id !== `turn-goal:${turnId}` || typeof state?.rootTaskId !== "string") {
       return { adapter: { id: "objective-tailor-nontarget-guard", profile: MODEL_PROFILE,
         async *stream() { throw new Error("fixture_turn_scope_mismatch") } }, registry: {}, candidates: [] }
     }
