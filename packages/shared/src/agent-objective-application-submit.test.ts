@@ -11,6 +11,11 @@ import {
   OBJECTIVE_APPLICATION_SUBMISSION_MATERIAL_SCHEMA,
   buildObjectiveApplicationSubmissionManifest,
   hashObjectiveApplicationSubmissionMaterial,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_ACTOR,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_BODY,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_SCHEMA,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_TYPE,
+  parseObjectiveApplicationSubmissionManifestEvent,
   parseObjectiveApplicationSubmissionManifest,
   parseObjectiveApplicationSubmissionMaterial,
 } from "./agent-objective-application-submit.js"
@@ -27,8 +32,45 @@ const material = (overrides: Record<string, unknown> = {}) => ({
   applicationTaskId: "application-task-1", jobId: "job-1", resumeId: "resume-1", coverLetterId: null,
   reviewedCoverLetterHash: hash("c"), objectiveSource: source(), ...overrides,
 })
+const manifestEvent = (overrides: Record<string, unknown> = {}) => ({
+  schemaVersion: OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_SCHEMA,
+  scope: { userId: "user-1", sessionId: "session-1", applicationTaskId: "application-1", jobId: "job-1", fillTurnId: "fill-turn-1" },
+  manifest: buildObjectiveApplicationSubmissionManifest(material(), hash("d")), hash: `sha256:${hash("e")}`, ...overrides,
+})
 
 describe("Objective application submission material", () => {
+  it("parses the exact persisted V3 event envelope without claiming its database authority", () => {
+    const value = manifestEvent()
+    const parsed = parseObjectiveApplicationSubmissionManifestEvent(value)
+    expect(parsed).toEqual(value)
+    expect(Object.isFrozen(parsed)).toBe(true)
+    expect(Object.isFrozen(parsed?.scope)).toBe(true)
+    expect(OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_TYPE).toBe("objective_submission_manifest_recorded")
+    expect(OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_ACTOR).toBe("worker")
+    expect(OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_BODY).toBe("Objective submission manifest recorded for this fill attempt.")
+  })
+
+  it.each([
+    ["extra envelope field", manifestEvent({ extra: true })],
+    ["wrong envelope schema", manifestEvent({ schemaVersion: "agent-harness.v2.wrong.v1" })],
+    ["extra scope field", manifestEvent({ scope: { userId: "user-1", sessionId: "session-1", applicationTaskId: "application-1",
+      jobId: "job-1", fillTurnId: "fill-turn-1", extra: true } })],
+    ["invalid owner identity", manifestEvent({ scope: { userId: "not an id", sessionId: "session-1", applicationTaskId: "application-1",
+      jobId: "job-1", fillTurnId: "fill-turn-1" } })],
+    ["unprefixed hash", manifestEvent({ hash: hash("e") })],
+    ["malformed manifest", manifestEvent({ manifest: { schemaVersion: OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_SCHEMA } })],
+  ])("rejects %s", (_name, value) => {
+    expect(parseObjectiveApplicationSubmissionManifestEvent(value)).toBeNull()
+  })
+
+  it("rejects event envelope accessors without invoking them", () => {
+    const value = manifestEvent()
+    const getter = vi.fn(() => "other-user")
+    Object.defineProperty(value.scope, "userId", { enumerable: true, get: getter })
+    expect(parseObjectiveApplicationSubmissionManifestEvent(value)).toBeNull()
+    expect(getter).not.toHaveBeenCalled()
+  })
+
   it("parses a closed Objective proof and builds a distinct V3 manifest", () => {
     const parsed = parseObjectiveApplicationSubmissionMaterial(material())
     expect(parsed).toMatchObject({ applicationTaskId: "application-task-1", resumeId: "resume-1", objectiveSource: source() })
