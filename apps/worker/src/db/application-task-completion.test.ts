@@ -64,8 +64,10 @@ async function approvalFixture(
 ): Promise<ApprovalFixtureRow> {
   const artifact = await artifactFixture(task, "user-a", false, reviewedCoverLetterHash)
   const objectiveManifest = objectiveMaterial && buildObjectiveApplicationSubmissionManifest(objectiveMaterial, artifact.answersHash)
+  if (objectiveMaterial && !objectiveManifest) throw new Error("fixture Objective manifest unavailable")
   const resourceHash = objectiveManifest ? hashArtifactContent(objectiveManifest) : artifact.hash
   const materialHash = objectiveMaterial ? await hashObjectiveApplicationSubmissionMaterial(objectiveMaterial) : artifact.materialHash
+  if (!materialHash) throw new Error("fixture material hash unavailable")
   const row = {
     id: `application-fill:${task.id}:turn-a`, userId: "user-a", sessionId: "session-a", turnId: "turn-a", jobId: task.jobId,
     type: "submit_application", taskId: task.id, status, toolCallId: `application-submit:${task.id}`,
