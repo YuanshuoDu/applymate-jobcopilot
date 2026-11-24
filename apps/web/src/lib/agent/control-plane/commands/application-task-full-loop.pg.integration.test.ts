@@ -1008,6 +1008,40 @@ async function waitForSubmissionTerminalProof(expected: {
   throw new Error(`Timed out waiting for one exact Worker submission terminal proof; count=${latestCount}`)
 }
 
+async function waitForSubmissionExecutionSettled(expected: {
+  taskId: string
+  userId: string
+  jobId: string
+  sessionId: string
+  fillTurnId: string
+  approvalId: string
+  constraintHash: unknown
+  workerTaskId: string
+  executionId: string
+}, timeoutMs = 120_000): Promise<void> {
+  const until = Date.now() + timeoutMs
+  while (Date.now() < until) {
+    const events = await testDb.applicationTaskEvent.findMany({ where: {
+      taskId: expected.taskId, type: "submission_execution_settled", actor: "worker",
+    }, select: { taskId: true, type: true, actor: true, body: true, data: true } })
+    const exact = events.filter(event => {
+      const data = jsonRecord(event.data)
+      return events.length === 1 && event.taskId === expected.taskId && event.type === "submission_execution_settled"
+        && event.actor === "worker" && event.body === "Submit execution settled"
+        && Object.keys(data ?? {}).sort().join(",") === ["applicationTaskId", "approvalId", "constraintHash", "executionId",
+          "fillTurnId", "jobId", "sessionId", "userId", "workerTaskId"].sort().join(",")
+        && data?.applicationTaskId === expected.taskId && data.userId === expected.userId && data.jobId === expected.jobId
+        && data.sessionId === expected.sessionId && data.fillTurnId === expected.fillTurnId
+        && data.approvalId === expected.approvalId && data.constraintHash === expected.constraintHash
+        && data.workerTaskId === expected.workerTaskId && data.executionId === expected.executionId
+    })
+    if (exact.length === 1) return
+    if (worker && exited(worker)) throw new Error("Worker exited before submission settlement was recorded")
+    await delay(100)
+  }
+  throw new Error("Timed out waiting for exact Objective submission settlement")
+}
+
 async function matchingQueueJobs(queue: InstanceType<typeof Queue> | undefined, field: "turnId" | "taskId", id: string) {
   if (!queue) return []
   const jobs = await queue.getJobs(["waiting", "active", "delayed", "completed", "failed", "paused", "waiting-children", "prioritized"], 0, -1)
@@ -3168,10 +3202,6 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(completedTask).toMatchObject({ id: applicationTaskId, resumeId: selectedResumeId,
         status: "submitted", checkpoint: "submission_verified", completedAt: expect.any(Date) })
       if (typeof completedTask.workerTaskId !== "string") throw new Error("Submitted Objective task has no Worker task identity")
-      const terminalSubmitProof = await waitForSubmissionTerminalProof({ taskId: applicationTaskId!, userId: ids.user,
-        jobId: selectedJobId, sessionId, fillTurnId, workerTaskId: completedTask.workerTaskId,
-        approvalId: submitApproval.id, constraintHash: submitApproval.scopeHash })
-      expect(terminalSubmitProof).toHaveLength(1)
       const completedJob = await testDb.job.findFirstOrThrow({ where: { id: selectedJobId, userId: ids.user } })
       expect(completedJob).toMatchObject({ status: "applied", workflowState: "submitted", appliedAt: expect.any(Date) })
       const consumedApproval = await testDb.agentApproval.findUniqueOrThrow({ where: { id: submitApproval.id } })
@@ -3187,6 +3217,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       if (!submitReceipt || typeof submitReceipt.applyResultId !== "number"
         || typeof submitReceipt.executionId !== "string" || typeof submitReceipt.workerTaskId !== "string"
         || typeof submitReceipt.attemptId !== "string") throw new Error("Objective submit result receipt is incomplete")
+      await waitForSubmissionExecutionSettled({ taskId: applicationTaskId!, userId: ids.user, jobId: selectedJobId,
+        sessionId, fillTurnId, approvalId: submitApproval.id, constraintHash: submitApproval.scopeHash,
+        workerTaskId: completedTask.workerTaskId, executionId: submitReceipt.executionId })
       const expectedSubmitResultId = `objective-application-submit-result:${hashContent([
         applicationTaskId, fillTurnId, submitApproval.id,
       ]).slice(7)}`
