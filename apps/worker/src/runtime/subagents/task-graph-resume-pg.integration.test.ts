@@ -20496,7 +20496,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               rootFinalDiagnosticStage = "pair_wait_receipt_validated"
               rootModelStage = "final"
               yield { type: "tool_call_completed", callId: pairWaitCallId, name: "agent.wait", arguments: {
-                idempotencyKey: pairWaitKey, taskIds: [expectedWriterTaskId, expectedReviewerTaskId], mode: "all", timeoutMs: 60_000,
+                idempotencyKey: pairWaitKey, taskIds: [expectedWriterTaskId, expectedReviewerTaskId], mode: "all", timeoutMs: 30_000,
               } }
               yield { type: "completed", finishReason: "tool_calls" }
               return
