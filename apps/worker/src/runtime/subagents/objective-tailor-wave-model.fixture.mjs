@@ -1,6 +1,6 @@
 import { createObjectiveTailorWaveDraftModel } from "./objective-tailor-wave-draft.fixture.mjs"
 import { createObjectiveTailorWaveSourceModel, diagnoseObjectiveTailorWaveOne, diagnoseObjectiveTailorWaveOneReceipt,
-  fixtureAllTasksCompleted, fixtureObservation, fixtureToolCalls, fixtureToolResult, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
+  diagnoseObjectiveTailorWaveGraph, fixtureAllTasksCompleted, fixtureObservation, fixtureToolCalls, fixtureToolResult, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
 
 const WAIT_PREFIX = "p3-1336-", SOURCE_KEYS = ["scout-greenhouse", "scout-lever", "scout-workday", "analyst-greenhouse-a", "analyst-greenhouse-b",
   "analyst-lever", "analyst-workday"]
@@ -152,7 +152,7 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
   return { rootModel, childModel }
 }
 function emitWave(turnId, phase, sourceRequest, count, say) {
-  const graph = currentGraph(sourceRequest)
+  const graph = phase === "wave1" ? diagnoseObjectiveTailorWaveGraph(sourceRequest, say) : currentGraph(sourceRequest)
   const catalog = phase === "wave1" ? diagnoseObjectiveTailorWaveOne(sourceRequest, graph.revision, say)
     : fixtureObservation(sourceRequest, "objective_tailor_wave_candidate_catalog")?.catalog
   const tool = sourceRequest.tools?.find(value => value?.name === "agent.tailor")

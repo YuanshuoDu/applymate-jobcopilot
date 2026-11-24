@@ -5359,6 +5359,7 @@ const OBJECTIVE_TAILOR_WAVE_DIAGNOSTIC_CODES = new Set([
   "objective_tailor_wave_stale", "idempotency_conflict", "task_graph_state_missing",
 ])
 const OBJECTIVE_TAILOR_WAVE1_MODEL_MARKERS = [
+  "GRAPH_CONTEXT_PARSED", "GRAPH_CONTEXT_UNAVAILABLE",
   "TOOL_ABSENT", "TOOL_AMBIGUOUS", "TOOL_VERSION_OTHER", "TOOL_V2", "CATALOG_MISSING", "CATALOG_INVALID",
   "CATALOG_COUNT_MATCH", "CATALOG_COUNT_MISMATCH", "CATALOG_REVISION_MATCH", "CATALOG_REVISION_MISMATCH",
   "CANDIDATE_REFS_INVALID", "TOOL_CALL_EMITTED", "RECEIPT_ACCEPTED", "RECEIPT_DENIED", "RECEIPT_DENIED_OTHER",
@@ -5408,7 +5409,7 @@ function objectiveTailorWaveMarkerDiagnostics(output: readonly string[]) {
   return {
     waveCatalogRead: catalogRead,
     waveAppend: append,
-    wave1ModelStages: OBJECTIVE_TAILOR_WAVE1_MODEL_MARKERS.filter(marker => output.includes(`TAILOR_WAVE1 ${marker}`)),
+    wave1ModelStages: OBJECTIVE_TAILOR_WAVE1_MODEL_MARKERS.filter(marker => output.includes(`TAILOR_WAVE1_${marker}`)),
     wave1CatalogCandidates: catalogCandidates,
   }
 }
@@ -5438,7 +5439,7 @@ async function waitForObjectiveTailorStage(
       ["TAILOR_WAVE1_WRITERS_PAUSED 4", "wave1_writers_paused"],
       ["TAILOR_WAVE1_WAIT_READY", "wave1_wait_ready"],
       ["TAILOR_WAVE1_REPLAY_MATCHED", "wave1_replay_matched"],
-      ...OBJECTIVE_TAILOR_WAVE1_MODEL_MARKERS.map(marker => [`TAILOR_WAVE1 ${marker}`, `wave1_${marker.toLowerCase()}`] as const),
+      ...OBJECTIVE_TAILOR_WAVE1_MODEL_MARKERS.map(marker => [`TAILOR_WAVE1_${marker}`, `wave1_${marker.toLowerCase()}`] as const),
       ["TAILOR_ROOT_STREAM_FAILED", "root_stream_failed"],
     ] as const
     const rootStages = [
@@ -7244,6 +7245,15 @@ describe("persisted TaskGraph wait scope", () => {
 })
 
 describe("compact TaskGraph wait failure diagnostics", () => {
+  it("recognizes the exact underscore-form wave model markers", () => {
+    const projected = objectiveTailorWaveMarkerDiagnostics([
+      "TAILOR_WAVE1_GRAPH_CONTEXT_UNAVAILABLE", "TAILOR_WAVE1_TOOL_V2",
+      "TAILOR_WAVE1_CATALOG_CANDIDATES 8", "TAILOR_WAVE1_CATALOG_REVISION_MATCH",
+    ])
+    expect(projected).toMatchObject({ wave1ModelStages: ["GRAPH_CONTEXT_UNAVAILABLE", "TOOL_V2", "CATALOG_REVISION_MATCH"],
+      wave1CatalogCandidates: 8 })
+  })
+
   it("projects restart child markers through the safe diagnostic allowlists", () => {
     const outcome = latestProcessFixtureJsonDiagnostic([
       `P3_CHILD_OUTCOME ${JSON.stringify({ role: "analyst", status: "failed", failureCode: "invalid_output", resultStatus: "missing", hasResult: false, hasStructuredResult: false, phase: "child_outcome", leaseUserMatchesFixture: true, leaseSessionMatchesFixture: false, leaseTurnMatchesFixture: true, taskId: "private task", prompt: "private" })}`,

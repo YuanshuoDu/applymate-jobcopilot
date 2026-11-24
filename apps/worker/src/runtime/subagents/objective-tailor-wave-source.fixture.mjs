@@ -99,6 +99,17 @@ export function fixtureObservation(request, kind) {
   throw new Error("fixture_observation_unavailable")
 }
 
+export function diagnoseObjectiveTailorWaveGraph(request, say) {
+  try {
+    const graph = fixtureObservation(request, "task_graph_current")
+    say("TAILOR_WAVE1_GRAPH_CONTEXT_PARSED")
+    return graph
+  } catch (error) {
+    say("TAILOR_WAVE1_GRAPH_CONTEXT_UNAVAILABLE")
+    throw error
+  }
+}
+
 export function diagnoseObjectiveTailorWaveOne(request, expectedRevision, say) {
   const matches = Array.isArray(request?.tools) ? request.tools.filter(tool => tool?.name === "agent.tailor") : []
   say(matches.length === 0 ? "TAILOR_WAVE1_TOOL_ABSENT"
