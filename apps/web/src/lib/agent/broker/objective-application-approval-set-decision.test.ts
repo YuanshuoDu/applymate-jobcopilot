@@ -196,7 +196,8 @@ describe("Objective application approval-set member decision", () => {
     const rows = await makeRows(Array(6).fill("pending")), fake = fixture(rows), edited = rows[5]!
     mocks.resume.mockImplementation(async (_tx: unknown, scope: { jobId: string }) =>
       resumeWitness(scope.jobId, scope.jobId === edited.jobId ? 4 : 3))
-    const callbacks = hooks()
+    const recordApprovedHandoff = vi.fn(async () => undefined)
+    const callbacks = hooks({ recordApprovedHandoff })
 
     for (const [index, member] of rows.slice(0, 5).entries()) {
       const result = await decideObjectiveApplicationApprovalSetMemberInTransaction(fake.tx as never, request(member), callbacks)
@@ -223,11 +224,11 @@ describe("Objective application approval-set member decision", () => {
     for (const privateField of ["resumeWitness", "resourceHash", "materialHash", "answersHash", "scopeHash"])
       expect(publicWrites).not.toContain(privateField)
 
-    const writes = { handoffs: callbacks.recordApprovedHandoff.mock.calls.length,
+    const writes = { handoffs: recordApprovedHandoff.mock.calls.length,
       approvals: fake.tx.agentApproval.updateMany.mock.calls.length, events: fake.events.length, outbox: fake.outbox.length }
     const duplicate = await decideObjectiveApplicationApprovalSetMemberInTransaction(fake.tx as never, request(rows[4]!), callbacks)
     expect(duplicate).toMatchObject({ disposition: "duplicate", status: "approved", setCompleted: true, nextTurnRevision: 6 })
-    expect({ handoffs: callbacks.recordApprovedHandoff.mock.calls.length,
+    expect({ handoffs: recordApprovedHandoff.mock.calls.length,
       approvals: fake.tx.agentApproval.updateMany.mock.calls.length, events: fake.events.length, outbox: fake.outbox.length }).toEqual(writes)
   })
 
