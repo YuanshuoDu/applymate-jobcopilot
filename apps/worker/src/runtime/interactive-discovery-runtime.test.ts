@@ -48,6 +48,33 @@ describe("interactive discovery runtime", () => {
     expect(validateArguments).not.toHaveBeenCalled()
   })
 
+  it("selects versions only for agent.tailor and explicitly rejects mixed visibility", async () => {
+    const validateArguments = vi.fn((_name: string, _value: unknown, version?: string) => version === "1" || version === "2" || version === undefined)
+    const routeTool = vi.fn(async request => ({ id: request.call.id, toolName: request.call.toolName, toolVersion: request.call.toolVersion, status: "completed" as const, errorCode: null }))
+    const guards = createCanonicalRootToolGuards({
+      interactiveDiscoveryMode: false, selectedJobMode: false, objectiveTaskGraphMode: true,
+      objectiveRootTools: [{ name: "agent.tailor", version: "2" }, { name: "agent.plan", version: "7" }],
+      routeTool: routeTool as never, validateArguments,
+    })
+    expect(guards.toolVersionForCall("agent.tailor")).toBe("2")
+    expect(guards.toolVersionForCall("agent.plan")).toBe("1")
+    expect(guards.validateToolArguments("agent.tailor", {})).toBe(true)
+    expect(validateArguments).toHaveBeenLastCalledWith("agent.tailor", {}, "2")
+    expect(guards.validateToolArguments("agent.plan", {})).toBe(true)
+    expect(validateArguments).toHaveBeenLastCalledWith("agent.plan", {}, "1")
+
+    const ambiguous = createCanonicalRootToolGuards({
+      interactiveDiscoveryMode: false, selectedJobMode: false, objectiveTaskGraphMode: true,
+      objectiveRootTools: [{ name: "agent.tailor", version: "1" }, { name: "agent.tailor", version: "2" }],
+      routeTool: routeTool as never, validateArguments,
+    })
+    expect(ambiguous.validateToolArguments("agent.tailor", {})).toBe("objective_tailor_tool_version_ambiguous")
+    await expect(ambiguous.executeTool({ call: { id: "ambiguous", toolName: "agent.tailor", toolVersion: "2", input: {} } } as never))
+      .resolves.toMatchObject({ status: "failed", errorCode: "objective_tailor_tool_version_ambiguous" })
+    expect(() => ambiguous.toolVersionForCall("agent.tailor")).toThrow("objective_tailor_tool_version_ambiguous")
+    expect(routeTool).not.toHaveBeenCalled()
+  })
+
   it("keeps provider discovery unavailable on the root interactive tool surface", async () => {
     const routeTool = vi.fn(async () => ({ id: "call-discover", toolName: "jobs.discover", toolVersion: "1", status: "completed" as const, errorCode: null }))
     const guards = createCanonicalRootToolGuards({

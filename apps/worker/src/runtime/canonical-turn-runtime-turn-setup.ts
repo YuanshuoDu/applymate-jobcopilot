@@ -22,7 +22,7 @@ import { PgCoordinationStore } from "./mailbox/store.js"
 import { createPgDurableWaitPort } from "./subagents/durable-wait-store.js"
 import type { RootTaskStore } from "./subagents/root-task-store.js"
 import { registerTaskGraphPlanningTool } from "./tools/planning-executors.js"
-import { registerAgentTailorTool } from "./tools/agent-tailor.js"
+import { registerCanonicalObjectiveTailorTool, type ObjectiveTailorToolVersion } from "./canonical-turn-objective-tailor-mode.js"
 import { assertCanonicalCoordinationSurface, assertCanonicalQuestionSurface, isNativeQuestionWaitEnabled } from "./turns/canonical-runtime-tool-recovery.js"
 import { failInteractiveDiscoveryUnavailable, failObjectiveTaskGraphUnavailable, objectiveTaskGraphRootToolAllowed, withInteractiveDiscoveryFinalResponse } from "./interactive-discovery-runtime.js"
 import { INTERACTIVE_DISCOVERY_TEMPLATES, rootTaskAllowedActions, rootToolSurface } from "./interactive-discovery-contract.js"
@@ -43,7 +43,7 @@ export type CanonicalTurnSetup = {
   readonly interactiveDiscoveryMode: boolean
   readonly objectiveTaskGraphMode: boolean
   readonly taskGraphPlanningEnabled: boolean
-  readonly selectedJobMode: boolean
+  readonly selectedJobMode: boolean; readonly objectiveTailorToolVersion?: ObjectiveTailorToolVersion
   readonly selectedJobBatch?: CanonicalSelectedJobBatchReady
   readonly scheduledDraftMode: boolean
   readonly selectedJobPreparation: TaskGraphRuntimeResult["selectedJobPreparation"]
@@ -184,15 +184,16 @@ export async function prepareCanonicalTurnSetup(input: {
     turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId,
     parentAttemptCount: () => lifecycle.taskGraphParentAttemptCount, rootInputId: state.rootInputId ?? null,
     ...(selectedJobBatch ? { selectedJobBatchSlots: selectedJobBatch.slots } : {}) })
-  const objectiveTailorRegistered = registerAgentTailorTool(toolRuntime.registry, options.taskGraphCommandPort,
-    () => options.productionFlags?.objectiveTailorEnabled === true && objectiveTaskGraphMode && state.source === "user" && state.automationRunMode !== "scheduled" && graph.enabled
-      && input.coordinationEnabled && input.childExecutionEnabled
-      && input.consumeWaitOutcomes && !selectedJobBatch && !graph.selectedJobMode && !graph.scheduledDraftMode,
-    { turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: () => lifecycle.taskGraphParentAttemptCount, rootInputId: state.rootInputId ?? null })
+  const objectiveTailorToolVersion = registerCanonicalObjectiveTailorTool({ registry: toolRuntime.registry,
+    commandPort: options.taskGraphCommandPort, budgetSnapshot: state.budgetSnapshot,
+    rootEligible: objectiveTaskGraphMode && state.source === "user" && state.automationRunMode !== "scheduled" && graph.enabled
+      && input.coordinationEnabled && input.childExecutionEnabled && input.consumeWaitOutcomes && !selectedJobBatch && !graph.selectedJobMode && !graph.scheduledDraftMode,
+    flags: options.productionFlags, options: { turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
+      parentLeaseOwner: lease.ownerId, parentAttemptCount: () => lifecycle.taskGraphParentAttemptCount, rootInputId: state.rootInputId ?? null } })
   if (input.coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities)
   if (nativeQuestionWaitEnabled) assertCanonicalQuestionSurface(toolRuntime.registry, toolCapabilities)
   const rootTools = rootToolSurface(toolRuntime.registry.list(toolCapabilities), graph.selectedJobMode, interactiveDiscoveryMode, isSelectedJobRootTool)
-    .filter(value => (!objectiveTaskGraphMode && !selectedJobBatch) || objectiveTaskGraphRootToolAllowed(value, objectiveTailorRegistered))
+    .filter(value => (!objectiveTaskGraphMode && !selectedJobBatch) || objectiveTaskGraphRootToolAllowed(value, objectiveTailorToolVersion !== undefined))
     .filter(value => verificationRequirements.status !== "valid" || !["agent.spawn", "spawn_subagent", "agent.followup"].includes(String(record(value).name ?? "")))
   const allowedActions = objectiveTaskGraphMode ? rootTaskAllowedActions(rootTools, undefined, false)
     : selectedJobBatch ? rootTaskAllowedActions(rootTools, turnTaskGraphTemplates, true)
@@ -202,7 +203,7 @@ export async function prepareCanonicalTurnSetup(input: {
   lifecycle.taskGraphParentAttemptCount = root.attemptCount
   turnCoordination.bindRoot(root)
   return {
-    state, interactiveDiscoveryMode, objectiveTaskGraphMode, taskGraphPlanningEnabled: graph.enabled, selectedJobMode: graph.selectedJobMode, ...(selectedJobBatch ? { selectedJobBatch } : {}), scheduledDraftMode: graph.scheduledDraftMode,
+    state, interactiveDiscoveryMode, objectiveTaskGraphMode, taskGraphPlanningEnabled: graph.enabled, selectedJobMode: graph.selectedJobMode, objectiveTailorToolVersion, ...(selectedJobBatch ? { selectedJobBatch } : {}), scheduledDraftMode: graph.scheduledDraftMode,
     selectedJobPreparation: graph.selectedJobPreparation, taskGraphTemplateRoles, turnCoordination, nativeQuestionWaitEnabled, toolCapabilities,
     durableWaitPort, lifecycle, toolRuntime, rootTools, root,
   }

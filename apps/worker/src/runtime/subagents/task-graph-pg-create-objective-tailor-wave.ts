@@ -3,8 +3,8 @@ import { appendObjectiveTailorTaskGraphProposal, TASK_GRAPH_LIMITS, type TaskGra
 import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 import type { TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import { objectiveTailorWavePairPlan, parseObjectiveTailorWaveCandidateWitness, type ObjectiveTailorWaveCandidateWitness } from "./objective-tailor-wave-witness.js"
+import { isObjectiveTailorWaveBudgetSnapshot } from "./objective-tailor-wave-profile.js"
 
-const WAVE_BUDGET_PROFILE = "agent-harness.v2.objective-tailor-execution-budget.v1"
 type Row = Record<string, unknown>
 export type ObjectiveTailorWaveCreatePlan = Readonly<{
   proposal: TaskGraphProposal
@@ -83,14 +83,12 @@ export function isRegisteredObjectiveTailorWaveChild(candidate: Row, nodeKey: st
 
 export function objectiveTailorWaveChildExecutionAllowed(value: unknown): boolean {
   const row = plainRecord(value), input = row && plainRecord(row.turnInput ?? row.input)
-  const budget = row && exactRecord(row.rootBudgetSnapshot, "limits,objectiveTailorProfile")
-  const limits = budget && exactRecord(budget.limits, "maxSteps")
   let actions: unknown = row?.rootAllowedActions
   if (typeof actions === "string") { try { actions = JSON.parse(actions) as unknown } catch { return false } }
   return Boolean(row && row.executionMode === "canonical_task_graph" && input
     && !Object.hasOwn(input, "selectedJobPreparation") && !Object.hasOwn(input, "verifiedShortlistSelection")
     && !Object.hasOwn(input, "selectedJobBatchPreparation")
-    && budget?.objectiveTailorProfile === WAVE_BUDGET_PROFILE && limits?.maxSteps === 96
+    && isObjectiveTailorWaveBudgetSnapshot(row.rootBudgetSnapshot)
     && Array.isArray(actions) && actions.includes("agent.tailor"))
 }
 
