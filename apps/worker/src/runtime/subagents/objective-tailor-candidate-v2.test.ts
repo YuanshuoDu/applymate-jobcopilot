@@ -91,8 +91,21 @@ describe("Objective Tailor V2 catalog", () => {
     expect(mocks.getJob.mock.calls.map(([, id]) => id)).not.toContain(ids[0])
     expect(catalog?.candidates).toHaveLength(2)
     const selected = catalog!.candidates.map(card => card.candidateRef)
-    expect(await resolveObjectiveTailorWaveCandidates({ query: vi.fn() } as never, scope, loaded, 12, selected)).toHaveLength(2)
+    expect((await resolveObjectiveTailorWaveCandidates({ query: vi.fn() } as never, scope, loaded, 12, selected))?.selections).toHaveLength(2)
     expect(await resolveObjectiveTailorWaveCandidates({ query: vi.fn() } as never, scope, loaded, 11, selected)).toBeUndefined()
+  })
+
+  it("returns selections with the exact inventory validated in that resolver pass", async () => {
+    configure()
+    const client = { query: vi.fn() }, inventory = { ...inventoryBase }
+    mocks.inventory.mockResolvedValue(inventory)
+    const catalog = await buildObjectiveTailorWaveCandidateCatalog(client as never, scope, loaded)
+    mocks.inventory.mockClear()
+    const resolved = await resolveObjectiveTailorWaveCandidates(client as never, scope, loaded, 12,
+      catalog!.candidates.map(card => card.candidateRef))
+    expect(resolved?.inventory).toBe(inventory)
+    expect(resolved?.selections).toHaveLength(2)
+    expect(mocks.inventory).toHaveBeenCalledTimes(1)
   })
 
   it("rejects malformed, duplicate, sparse, or oversized refs before inventory reads", async () => {

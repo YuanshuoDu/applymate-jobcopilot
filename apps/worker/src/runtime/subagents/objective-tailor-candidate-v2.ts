@@ -24,7 +24,12 @@ export type ObjectiveTailorWaveCandidateCatalog = Readonly<{
   candidates: readonly ObjectiveTailorWaveCandidateCard[]
 }>
 type Occurrence = Readonly<{ analystKey: string; score: number; materialDigest?: string; proof: ScheduledDraftAnalystProof }>
-type Pool = Readonly<{ catalog: ObjectiveTailorWaveCandidateCatalog; selections: readonly ObjectiveTailorWaveCandidateSelection[] }>
+type Pool = Readonly<{ inventory: ObjectiveTailorWaveInventory; catalog: ObjectiveTailorWaveCandidateCatalog;
+  selections: readonly ObjectiveTailorWaveCandidateSelection[] }>
+export type ResolvedObjectiveTailorWaveCandidates = Readonly<{
+  inventory: ObjectiveTailorWaveInventory
+  selections: readonly ObjectiveTailorWaveCandidateSelection[]
+}>
 
 /** Builds a public-only catalog from the frozen source prefix and exact occupied wave inventory. */
 export async function buildObjectiveTailorWaveCandidateCatalog(
@@ -36,13 +41,14 @@ export async function buildObjectiveTailorWaveCandidateCatalog(
 /** Re-resolves one bounded distinct wave against the current whole-graph CAS revision. */
 export async function resolveObjectiveTailorWaveCandidates(
   client: Queryable, scope: GraphIdentityScope, loaded: LoadedGraph, expectedRevision: unknown, candidateRefs: unknown,
-): Promise<readonly ObjectiveTailorWaveCandidateSelection[] | undefined> {
+): Promise<ResolvedObjectiveTailorWaveCandidates | undefined> {
   const refs = parseObjectiveTailorWaveCandidateRefs(candidateRefs)
   if (!Number.isSafeInteger(expectedRevision) || !refs) return undefined
   const pool = await candidatePool(client, scope, loaded)
   if (!pool || pool.catalog.graphRevision !== expectedRevision) return undefined
   const selected = refs.map(ref => pool.selections.find(selection => selection.candidateRef === ref))
-  return selected.every((value): value is ObjectiveTailorWaveCandidateSelection => Boolean(value)) ? selected : undefined
+  return selected.every((value): value is ObjectiveTailorWaveCandidateSelection => Boolean(value))
+    ? { inventory: pool.inventory, selections: selected } : undefined
 }
 
 async function candidatePool(client: Queryable, scope: GraphIdentityScope, loaded: LoadedGraph): Promise<Pool | undefined> {
@@ -88,7 +94,8 @@ async function candidatePool(client: Queryable, scope: GraphIdentityScope, loade
     cards.push({ candidateRef: selection.candidateRef, title: job.role.trim().slice(0, 160).trim(),
       company: job.company.trim().slice(0, 160).trim(), score: latest.score })
   }
-  return { catalog: { schemaVersion: OBJECTIVE_TAILOR_WAVE_CATALOG_SCHEMA, graphRevision: inventory.graphRevision, candidates: cards }, selections }
+  return { inventory, catalog: { schemaVersion: OBJECTIVE_TAILOR_WAVE_CATALOG_SCHEMA,
+    graphRevision: inventory.graphRevision, candidates: cards }, selections }
 }
 
 function latestOccurrence(rows: readonly Occurrence[], order: ReadonlyMap<string, number>): Occurrence | undefined {
