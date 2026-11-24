@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { hashApprovalScope } from "@jobcopilot/agent-protocol"
 import {
+  buildObjectiveReviewedFillHandoffOutboxData,
   buildObjectiveApplicationReviewMemberProof,
   buildObjectiveApplicationResumeWitness,
 } from "@jobcopilot/shared"
@@ -14,9 +15,9 @@ const reviewTurnId = "review-turn-objective"
 const sourceTurnId = "source-turn-objective"
 const jobId = "job-objective"
 const applicationTaskId = "application-task-objective"
-const approvalId = "approval-objective"
-const setId = "objective-review-set"
+const setId = `objective-review-${"a".repeat(40)}`
 const slotOrdinal = 2
+const approvalId = `objective-review:${setId}:${slotOrdinal}`
 const now = new Date("2026-11-24T12:00:00.000Z")
 const expiresAt = new Date("2026-11-24T13:00:00.000Z")
 
@@ -41,7 +42,8 @@ function scopeHash(materialHash: string, nonceHash: string) {
     revision: 5, expiresAt }, nonceHash))
 }
 
-async function fixture(overrides: Readonly<{ approval?: Record<string, unknown>; task?: Record<string, unknown>; events?: Record<string, unknown>[] }> = {}) {
+async function fixture(overrides: Readonly<{ approval?: Record<string, unknown>; task?: Record<string, unknown>;
+  events?: Record<string, unknown>[]; outboxes?: Record<string, unknown>[] }> = {}) {
   const memberProof = proof()
   const nonceHash = "f".repeat(64)
   const approval = {
@@ -56,6 +58,7 @@ async function fixture(overrides: Readonly<{ approval?: Record<string, unknown>;
   const task = { id: applicationTaskId, resumeId: "resume-objective", status: "waiting_for_user", checkpoint: "materials_ready",
     workerTaskId: null, fillTurnId: null, fillTurnSessionId: null, fillTurnUserId: null, startedAt: null, completedAt: null }
   const events = [...(overrides.events ?? [])]
+  const outboxes = [...(overrides.outboxes ?? [])]
   const tx = {
     $queryRaw: vi.fn(async () => [{ id: applicationTaskId }]),
     agentApproval: { findFirst: vi.fn(async () => ({ ...approval, ...(overrides.approval ?? {}) })) },
@@ -63,10 +66,19 @@ async function fixture(overrides: Readonly<{ approval?: Record<string, unknown>;
     applicationTaskEvent: {
       findMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) => events.filter(row => {
         const data = row.data as Record<string, unknown> | undefined
-        return row.taskId === where.taskId && row.type === where.type && data?.approvalId === "approval-objective"
+        return row.taskId === where.taskId && row.type === where.type && data?.approvalId === approvalId
       })),
       findUnique: vi.fn(async (): Promise<Record<string, unknown> | null> => null),
       create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => { events.push(data); return data }),
+    },
+    agentOutbox: {
+      findMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) =>
+        outboxes.filter(row => row.idempotencyKey === where.idempotencyKey).slice(0, 2)),
+      create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
+        const row = { id: "objective-handoff-outbox", ...data }
+        outboxes.push(row)
+        return row
+      }),
     },
   }
   const input: ObjectiveApprovalSetSourceInput = {
@@ -75,14 +87,14 @@ async function fixture(overrides: Readonly<{ approval?: Record<string, unknown>;
       toolCallId: "tool-objective", scopeHash: approval.scopeHash, revision: 5, expiresAt,
       proof: memberProof, resumeWitness: memberProof.resumeWitness },
   }
-  return { tx, input, approval, task, events, memberProof }
+  return { tx, input, approval, task, events, outboxes, memberProof }
 }
 
 describe("recordObjectiveApplicationApprovedIntent", () => {
   beforeEach(() => vi.clearAllMocks())
 
   it("records a deterministic private pointer after the exact approved receipt and ready task are re-read", async () => {
-    const { tx, input, events, memberProof } = await fixture()
+    const { tx, input, events, outboxes, memberProof } = await fixture()
     await recordObjectiveApplicationApprovedIntent(tx as never, input)
     expect(events).toHaveLength(1)
     expect(events[0]).toEqual({
@@ -100,15 +112,32 @@ describe("recordObjectiveApplicationApprovedIntent", () => {
     expect(tx.applicationTask.findFirst).toHaveBeenCalledWith(expect.objectContaining({
       where: { id: applicationTaskId, userId, sessionId, jobId },
     }))
+    const expectedOutbox = buildObjectiveReviewedFillHandoffOutboxData({
+      userId, sessionId, applicationTaskId, approvalId, predecessorTurnId: reviewTurnId,
+    })!
+    expect(outboxes).toEqual([{ id: expect.any(String), ...expectedOutbox }])
   })
 
   it("accepts only the exact deterministic event on transaction replay", async () => {
-    const { tx, input, events } = await fixture()
+    const { tx, input, events, outboxes } = await fixture()
     await recordObjectiveApplicationApprovedIntent(tx as never, input)
     const prior = events[0]!
-    const replay = await fixture({ events: [prior] })
+    const replay = await fixture({ events: [prior], outboxes })
     await recordObjectiveApplicationApprovedIntent(replay.tx as never, replay.input)
     expect(replay.tx.applicationTaskEvent.create).not.toHaveBeenCalled()
+    expect(replay.tx.agentOutbox.create).not.toHaveBeenCalled()
+  })
+
+  it("rejects an idempotency collision with a different durable Objective outbox payload", async () => {
+    const first = await fixture()
+    await recordObjectiveApplicationApprovedIntent(first.tx as never, first.input)
+    const prior = first.events[0]!
+    const conflicting = { ...first.outboxes[0]!, payload: { ...(first.outboxes[0]!.payload as object),
+      applicationTaskId: "another-task" } }
+    const replay = await fixture({ events: [prior], outboxes: [conflicting] })
+    await expect(recordObjectiveApplicationApprovedIntent(replay.tx as never, replay.input))
+      .rejects.toThrow("objective_application_approved_intent_invalid")
+    expect(replay.tx.agentOutbox.create).not.toHaveBeenCalled()
   })
 
   it("rejects a self-consistent row scope field whose hash does not verify", async () => {

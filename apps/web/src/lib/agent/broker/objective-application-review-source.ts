@@ -20,19 +20,18 @@ const REVIEW_GOAL = "Review the selected completed Objective materials for appli
 const HASH = /^[a-f0-9]{64}$/
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
 const FINAL_EVENT_PREFIX = "turn:"
-
 /** Rechecks the approved slot against its immutable completed source and current material in the caller's transaction. */
 export async function verifyObjectiveApplicationReviewSource(
-  tx: Tx, input: ObjectiveApprovalSetSourceInput,
+  tx: Tx, input: ObjectiveApprovalSetSourceInput, mode: "decision" | "completed_review" = "decision",
 ): Promise<"current" | "stale"> {
   const proof = parseObjectiveApplicationReviewMemberProof(input.member.proof)
   if (!proof || !objectiveApplicationReviewInputValid(input, proof)) return integrity()
-  const selection = await readReviewSelection(tx, input.member)
+  const selection = await readReviewSelection(tx, input.member, mode)
   if (!selection || selection.sourceTurnId !== input.sourceTurnId || selection.graphRevision !== proof.source.graphRevision
     || selection.rootTaskId !== proof.source.rootTaskId || selection.graphItemId !== proof.source.graphItemId
     || !selection.slotOrdinals.includes(input.slotOrdinal) || intentHash(selection) !== input.intentHash
     || setId(input.member.sessionId, input.member.turnId) !== input.setId) return integrity()
-  const set = await readSetItem(tx, input)
+  const set = await readSetItem(tx, input, mode)
   if (!set) return integrity()
   const source = await readSourceRoot(tx, input, proof)
   if (!source) return integrity()
@@ -62,27 +61,30 @@ export async function verifyObjectiveApplicationReviewSource(
   return "current"
 }
 
-async function readReviewSelection(tx: Tx, member: ObjectiveApprovalSetSourceInput["member"]) {
+async function readReviewSelection(tx: Tx, member: ObjectiveApprovalSetSourceInput["member"], mode: "decision" | "completed_review") {
   const turn = await tx.agentTurn.findFirst({ where: { id: member.turnId, userId: member.userId, sessionId: member.sessionId },
     select: { id: true, status: true, source: true, executionMode: true, input: true, rootTaskId: true } })
   const input = record(turn?.input), intent = exactRecord(input?.intent, ["kind", "selection", "version"])
   const selection = parseObjectiveApplicationReviewIntent(intent?.selection)
   if (!turn || !ID.test(String(turn.rootTaskId)) || turn.rootTaskId === selection?.rootTaskId
-    || turn.status !== "waiting_for_approval" || turn.source !== "user" || turn.executionMode !== "canonical_task_graph"
+    || turn.status !== (mode === "completed_review" ? "completed" : "waiting_for_approval")
+    || turn.source !== "user" || turn.executionMode !== "canonical_task_graph"
     || !input || !exactKeys(input, ["clientMessageId", "content", "goal", "intent"]) || input.goal !== REVIEW_GOAL
     || !validObjectiveApplicationReviewContent(input.content) || !text(input.clientMessageId) || !intent
     || intent.kind !== "objective_application_review" || intent.version !== 1 || !selection) return null
   return selection
 }
 
-async function readSetItem(tx: Tx, input: ObjectiveApprovalSetSourceInput) {
+async function readSetItem(tx: Tx, input: ObjectiveApprovalSetSourceInput, mode: "decision" | "completed_review") {
   const itemId = objectiveApplicationApprovalSetItemId(input.setId)
   const rows = await tx.$queryRaw<Row[]>(Prisma.sql`SELECT "id", "type", "status", "phase", "revision", "stepId", "taskId", "content"
     FROM "agent_items" WHERE "id"=${itemId} AND "sessionId"=${input.member.sessionId} AND "turnId"=${input.member.turnId}
       AND "type"='approval_request' FOR SHARE NOWAIT`)
   const item = rows[0], set = item && parseObjectiveApplicationApprovalSet(item.content)
-  return rows.length === 1 && item?.id === itemId && item.type === "approval_request" && item.status === "started"
-    && item.phase === "commentary" && item.revision === 0 && item.stepId === null && item.taskId === null
+  return rows.length === 1 && item?.id === itemId && item.type === "approval_request"
+    && item.status === (mode === "completed_review" ? "completed" : "started")
+    && item.phase === "commentary" && item.revision === (mode === "completed_review" ? 1 : 0)
+    && item.stepId === null && item.taskId === null
     && set?.setId === input.setId && set.sourceTurnId === input.sourceTurnId && set.intentHash === input.intentHash
     && set.members.some(member => member.slotOrdinal === input.slotOrdinal && member.approvalId === input.member.approvalId)
 }

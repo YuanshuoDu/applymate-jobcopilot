@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { Prisma, PrismaClient } from "@prisma/client"
 
-const { startFill, probeDuplicate, admitLaunch } = vi.hoisted(() => ({
-  startFill: vi.fn(), probeDuplicate: vi.fn(), admitLaunch: vi.fn(),
+const { startFill, probeDuplicate, admitLaunch, processObjective } = vi.hoisted(() => ({
+  startFill: vi.fn(), probeDuplicate: vi.fn(), admitLaunch: vi.fn(), processObjective: vi.fn(),
 }))
 
 vi.mock("../control-plane/commands/agent-command-service", () => ({
@@ -15,6 +15,7 @@ vi.mock("./reviewed-fill-admission", () => ({
   acknowledgeExistingReviewedFillHandoff: probeDuplicate,
   assertReviewedFillLaunchAllowed: admitLaunch,
 }))
+vi.mock("./objective-reviewed-fill-dispatch", () => ({ processObjectiveReviewedFillHandoffOutbox: processObjective }))
 
 import { AgentCommandError } from "../control-plane/commands/errors"
 import { AutoApplyError } from "@/lib/auto-apply-guards"
@@ -24,10 +25,12 @@ import {
   ReviewedFillHandoffOutboxNotFoundError,
 } from "./reviewed-fill-handoff-outbox"
 import { REVIEWED_FILL_SOURCE_SCHEMA } from "./reviewed-fill-source-binding"
-import { buildReviewedFillHandoffOutboxData } from "@jobcopilot/shared"
+import { buildObjectiveReviewedFillHandoffOutboxData, buildReviewedFillHandoffOutboxData } from "@jobcopilot/shared"
 
 const NOW = new Date("2026-11-20T12:00:00.000Z")
 const sourceId = "source_turn_1"
+const objectiveSetId = `objective-review-${"a".repeat(40)}`
+const objectiveApprovalId = `objective-review:${objectiveSetId}:2`
 const intentInput = {
   userId: "user_1", sessionId: "session_1", applicationTaskId: "task_1",
   approvalId: "approval_1", predecessorTurnId: "turn_1",
@@ -58,11 +61,18 @@ function makeOutboxRow(publishedAt: Date | null = null) {
   return { id: "outbox_1", ...built, publishedAt }
 }
 
+function makeObjectiveOutboxRow(publishedAt: Date | null = null) {
+  const built = buildObjectiveReviewedFillHandoffOutboxData({ userId: "user_1", sessionId: "session_1",
+    applicationTaskId: "task_1", approvalId: objectiveApprovalId, predecessorTurnId: "turn_1" })!
+  return { id: "objective_outbox_1", ...built, publishedAt }
+}
+
 describe("reviewed fill handoff outbox", () => {
   beforeEach(() => {
     startFill.mockReset()
     probeDuplicate.mockReset().mockResolvedValue({ kind: "none" })
     admitLaunch.mockReset().mockResolvedValue(undefined)
+    processObjective.mockReset().mockResolvedValue("queued")
   })
 
   it("enqueues only the exact approved private source binding", async () => {
@@ -137,5 +147,19 @@ describe("reviewed fill handoff outbox", () => {
     startFill.mockRejectedValueOnce(new Error("transient database failure"))
     await expect(processReviewedFillHandoffOutbox(db as unknown as PrismaClient, "outbox_1"))
       .rejects.toThrow("transient database failure")
+  })
+
+  it("routes only the registered Objective topic to the Objective processor", async () => {
+    const row = makeObjectiveOutboxRow()
+    const db = { agentOutbox: { findUnique: vi.fn(async () => row) } }
+    await expect(processReviewedFillHandoffOutbox(db as unknown as PrismaClient, row.id)).resolves.toBe("queued")
+    expect(processObjective).toHaveBeenCalledWith(db, expect.objectContaining({
+      id: row.id, topic: row.topic, aggregateId: row.aggregateId, idempotencyKey: row.idempotencyKey, payload: row.payload,
+    }))
+    expect(startFill).not.toHaveBeenCalled()
+    const published = makeObjectiveOutboxRow(new Date())
+    db.agentOutbox.findUnique.mockResolvedValue(published)
+    await expect(processReviewedFillHandoffOutbox(db as unknown as PrismaClient, published.id)).resolves.toBe("duplicate")
+    expect(processObjective).toHaveBeenCalledOnce()
   })
 })

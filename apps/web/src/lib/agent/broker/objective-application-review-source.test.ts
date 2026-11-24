@@ -29,6 +29,15 @@ describe("verifyObjectiveApplicationReviewSource", () => {
     await expect(verifyObjectiveApplicationReviewSource(tx as never, input)).resolves.toBe("current")
   })
 
+  it("revalidates an approved slot only after the review Turn and grouped Wait are completed", async () => {
+    const completed = fixture({ completedReview: true })
+    await expect(verifyObjectiveApplicationReviewSource(completed.tx as never, completed.input, "completed_review"))
+      .resolves.toBe("current")
+    const pending = fixture()
+    await expect(verifyObjectiveApplicationReviewSource(pending.tx as never, pending.input, "completed_review"))
+      .rejects.toThrow()
+  })
+
   it("marks changed selected material or exact current head as stale", async () => {
     const { tx, input } = fixture()
     material.sourceDigest = `sha256:${"f".repeat(64)}`
@@ -44,7 +53,7 @@ describe("verifyObjectiveApplicationReviewSource", () => {
   })
 })
 
-function fixture(options: { headVersion?: number; content?: unknown } = {}) {
+function fixture(options: { headVersion?: number; content?: unknown; completedReview?: boolean } = {}) {
   const witness = { schemaVersion: "agent-harness.v2.objective-tailor-wave-witness.v1", candidateRef: `otc2_${"1".repeat(64)}`,
     sourceGraphRevision: 2, sourceGraphDigest: "2".repeat(64), sourceStatusDigest: "3".repeat(64), analystProofDigest: "4".repeat(64),
     candidate: { jobId, score: 8, materialDigest: candidateDigest }, sourceAnalystKeys: ["analyst-node-key"], slotId: "tailor-1",
@@ -94,7 +103,7 @@ function fixture(options: { headVersion?: number; content?: unknown } = {}) {
   const finalContent = { text: "Done", final: { schemaVersion: "agent-harness.v2.final", response: "Done" }, taskGraphSources: manifest,
     objectiveTailorFinalOutcomes: { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA, slots: [{ ordinal: 1, status: "ready" }] } }
   const results: unknown[][] = [
-    [{ id: objectiveApplicationApprovalSetItemId(setId), type: "approval_request", status: "started", phase: "commentary", revision: 0,
+    [{ id: objectiveApplicationApprovalSetItemId(setId), type: "approval_request", status: options.completedReview ? "completed" : "started", phase: "commentary", revision: options.completedReview ? 1 : 0,
       stepId: null, taskId: null, content: itemContent }],
     [{ id: sourceTurnId, rootTaskId: sourceRootId, status: "completed", source: "user", executionMode: "canonical_task_graph",
       rootId: sourceRootId, rootStatus: "completed", rootRole: "orchestrator", rootTaskType: "root", depth: 0,
@@ -110,7 +119,7 @@ function fixture(options: { headVersion?: number; content?: unknown } = {}) {
       toolCallId, reviewHash }],
   ]
   const tx = {
-    agentTurn: { findFirst: vi.fn(async () => ({ id: reviewTurnId, status: "waiting_for_approval", source: "user",
+    agentTurn: { findFirst: vi.fn(async () => ({ id: reviewTurnId, status: options.completedReview ? "completed" : "waiting_for_approval", source: "user",
       executionMode: "canonical_task_graph", rootTaskId: reviewRootId, input: { clientMessageId: "review-command",
         goal: "Review the selected completed Objective materials for application preparation.",
         content: options.content ?? [{ type: "text", text: "Review the selected verified materials. This does not authorize an application or submission." }],

@@ -50,7 +50,9 @@ export async function acknowledgeExistingReviewedFillHandoff(
 }
 
 /** Applies the same product, URL, job and policy gates as the explicit fill entry. */
-export async function assertReviewedFillLaunchAllowed(intent: ReviewedFillHandoffIntent): Promise<void> {
+export async function assertReviewedFillLaunchAllowed(
+  intent: Pick<ReviewedFillHandoffIntent, "userId" | "sessionId" | "applicationTaskId">,
+): Promise<void> {
   await assertActiveAccount(intent.userId)
   await assertUnattendedApplyEnabled(intent.userId, { preserveUnexpectedErrors: true })
   const task = await db.applicationTask.findFirst({

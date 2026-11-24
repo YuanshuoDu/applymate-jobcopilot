@@ -1,6 +1,9 @@
+import { randomUUID } from "node:crypto"
 import { Prisma } from "@prisma/client"
 import {
+  buildObjectiveReviewedFillHandoffOutboxData,
   canonicalJson,
+  parseObjectiveReviewedFillHandoffOutboxRow,
   parseObjectiveApplicationReviewMemberProof,
   parseObjectiveApplicationResumeWitness,
 } from "@jobcopilot/shared"
@@ -95,6 +98,7 @@ export async function recordObjectiveApplicationApprovedIntent(
     const row = prior[0]!
     if (row.id !== id || row.taskId !== member.taskId || row.type !== EVENT_TYPE || row.actor !== "user"
       || row.body !== EVENT_BODY || canonicalJson(row.data) !== canonicalJson(intent)) deny()
+    await ensureObjectiveReviewedFillOutbox(tx, intent)
     return
   }
   const collision = await tx.applicationTaskEvent.findUnique({ where: { id } })
@@ -103,6 +107,23 @@ export async function recordObjectiveApplicationApprovedIntent(
     data: { id, taskId: member.taskId!, type: EVENT_TYPE, actor: "user", body: EVENT_BODY,
       data: intent as unknown as Prisma.InputJsonObject },
   })
+  await ensureObjectiveReviewedFillOutbox(tx, intent)
+}
+
+async function ensureObjectiveReviewedFillOutbox(tx: Tx, intent: ApprovedIntent): Promise<void> {
+  const expected = buildObjectiveReviewedFillHandoffOutboxData({ userId: intent.userId, sessionId: intent.sessionId,
+    applicationTaskId: intent.applicationTaskId, approvalId: intent.approvalId, predecessorTurnId: intent.reviewTurnId })
+  if (!expected) deny()
+  const rows = await tx.agentOutbox.findMany({ where: { idempotencyKey: expected.idempotencyKey }, take: 2,
+    select: { id: true, topic: true, aggregateId: true, idempotencyKey: true, payload: true } })
+  if (rows.length > 1) deny()
+  if (rows.length === 1) {
+    const actual = parseObjectiveReviewedFillHandoffOutboxRow(rows[0])
+    if (!actual || actual.topic !== expected.topic || actual.aggregateId !== expected.aggregateId
+      || actual.idempotencyKey !== expected.idempotencyKey || canonicalJson(actual.payload) !== canonicalJson(expected.payload)) deny()
+    return
+  }
+  await tx.agentOutbox.create({ data: { ...expected, id: randomUUID(), payload: expected.payload as Prisma.InputJsonValue } })
 }
 
 function validIds(input: ObjectiveApprovalSetSourceInput, reviewTurnId: string): boolean {
