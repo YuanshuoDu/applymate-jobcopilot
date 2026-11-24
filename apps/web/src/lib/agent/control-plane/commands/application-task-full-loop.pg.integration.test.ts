@@ -198,6 +198,89 @@ async function reviewedSourceTurnDiagnostics(sessionId: string, turnId: string) 
   return reviewedSourceDiagnosticSummary(turn, tasks, tools)
 }
 
+const OBJECTIVE_WAVE_CODES = new Set([
+  "revision_mismatch", "revision_limit", "idempotency_conflict", "task_graph_state_missing", "task_graph_objective_coverage_incomplete",
+  "objective_tailor_wave_not_eligible", "objective_tailor_wave_source_stale", "objective_tailor_wave_stale",
+  "objective_tailor_correction_stale", "objective_tailor_correction_source_stale", "objective_tailor_wave_failed",
+  "objective_tailor_wave_receipt_invalid", "fixture_root_stream_failed",
+])
+const OBJECTIVE_WAVE_MARKERS = [
+  "TAILOR_WAVE_WORKER_READY resume", "TAILOR_ROOT_FACTORY_ENTERED", "TAILOR_ROOT_FACTORY_BOUND",
+  "TAILOR_ROOT_FACTORY_ROOT_UNAVAILABLE", "TAILOR_ROOT_STREAM_ENTERED", "TAILOR_ROOT_REQUEST_SCOPE_OK",
+  "TAILOR_ROOT_INITIAL_PLAN_REQUESTED", "TAILOR_ROOT_SOURCE_WAIT_REQUESTED",
+  "TAILOR_PLAN_FAILED objective_coverage_incomplete", "TAILOR_SOURCE_GRAPH_READY 7", "TAILOR_WAVE1_GRAPH_CONTEXT_PARSED",
+  "TAILOR_WAVE1_GRAPH_CONTEXT_UNAVAILABLE", "TAILOR_WAVE1_TOOL_ABSENT", "TAILOR_WAVE1_TOOL_AMBIGUOUS", "TAILOR_WAVE1_TOOL_V2",
+  "TAILOR_WAVE1_TOOL_VERSION_OTHER", "TAILOR_WAVE1_CATALOG_MISSING", "TAILOR_WAVE1_CATALOG_INVALID",
+  "TAILOR_WAVE1_CATALOG_COUNT_MATCH", "TAILOR_WAVE1_CATALOG_COUNT_MISMATCH", "TAILOR_WAVE1_CATALOG_REVISION_MATCH",
+  "TAILOR_WAVE1_CATALOG_REVISION_MISMATCH", "TAILOR_WAVE1_CANDIDATE_REFS_INVALID", "TAILOR_WAVE1_TOOL_CALL_EMITTED",
+  "TAILOR_WAVE1_RECEIPT_ACCEPTED", "TAILOR_WAVE1_RECEIPT_DENIED", "TAILOR_WAVE1_RECEIPT_INVALID",
+  "TAILOR_WAVE1_POST_APPEND_GRAPH_OBSERVED", "TAILOR_WAVE1_POST_APPEND_GRAPH_UNAVAILABLE",
+  "TAILOR_WAVE1_POST_APPEND_IDENTITY_VALID", "TAILOR_WAVE1_POST_APPEND_IDENTITY_INVALID",
+  "TAILOR_WAVE1_ORDINARY_PLAN_PROBE_EMITTED", "TAILOR_WAVE1_WAIT_EMITTED", "TAILOR_WAVE1_WAIT_READY",
+  "TAILOR_WAVE1_REPLAY_EMITTED", "TAILOR_WAVE1_REPLAY_RESULT_PRESENT", "TAILOR_WAVE1_REPLAY_RESULT_MISSING",
+  "TAILOR_WAVE1_REPLAY_MATCHED", "TAILOR_WAVE2_WAIT_READY", "TAILOR_CORRECTIONS_WAIT_READY", "TAILOR_ROOT_STREAM_FAILED",
+] as const
+
+function objectiveWaveFixtureDiagnostics(lines: readonly string[], errors: readonly string[]) {
+  const catalog = [...lines].reverse().map(line => {
+    const result = /^TAILOR_WAVE_CATALOG_READ (?:[1-9]|1[0-6]) (returned|absent) ([0-8])$/.exec(line)
+    const failure = /^TAILOR_WAVE_CATALOG_READ (?:[1-9]|1[0-6]) failed ([a-z_]{1,64}) 0$/.exec(line)
+    return result ? { outcome: result[1], candidateCount: Number(result[2]) }
+      : failure ? { outcome: "failed", code: OBJECTIVE_WAVE_CODES.has(failure[1]!) ? failure[1] : "other", candidateCount: 0 }
+        : null
+  }).find((entry): entry is NonNullable<typeof entry> => entry !== null) ?? null
+  const append = [...lines].reverse().map(line => {
+    const result = /^TAILOR_WAVE_APPEND (accepted|duplicate|other) ([0-8])$/.exec(line)
+    const failure = /^TAILOR_WAVE_APPEND failed ([a-z_]{1,64})$/.exec(line)
+    return result ? { outcome: result[1], nodeCount: Number(result[2]) }
+      : failure ? { outcome: "failed", code: OBJECTIVE_WAVE_CODES.has(failure[1]!) ? failure[1] : "other", nodeCount: 0 }
+        : null
+  }).find((entry): entry is NonNullable<typeof entry> => entry !== null) ?? null
+  return { markers: Object.fromEntries(OBJECTIVE_WAVE_MARKERS.map(marker => [marker, lines.includes(marker)])),
+    catalog, append, workerFailed: errors.includes("TAILOR_WAVE_WORKER_FAILED") }
+}
+
+function objectiveSourceStatus(value: unknown): string {
+  return typeof value === "string" && ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval",
+    "waiting_for_user", "running", "completed", "failed", "cancelled", "interrupted"].includes(value) ? value : "other"
+}
+
+async function objectiveSourceFailureSnapshot(input: { sessionId: string; turnId: string; lines: readonly string[]; errors: readonly string[] }) {
+  const turn = await testDb.agentTurn.findFirst({ where: { id: input.turnId, sessionId: input.sessionId, userId: ids.user },
+    select: { id: true, status: true, error: true, rootTaskId: true } })
+  const rootId = typeof turn?.rootTaskId === "string" ? turn.rootTaskId : null
+  const [root, graphRow, tasks] = await Promise.all([
+    rootId ? testDb.subAgentTask.findFirst({ where: { id: rootId, sessionId: input.sessionId, turnId: input.turnId,
+      rootTaskId: rootId, parentTaskId: null, role: "orchestrator", taskType: "root" }, select: { status: true, failureReason: true } }) : null,
+    rootId ? testDb.agentItem.findFirst({ where: { sessionId: input.sessionId, turnId: input.turnId, taskId: rootId, type: "task_graph" },
+      select: { revision: true, content: true } }) : null,
+    rootId ? testDb.subAgentTask.findMany({ where: { sessionId: input.sessionId, turnId: input.turnId, rootTaskId: rootId },
+      take: 32, select: { role: true, status: true } }) : [],
+  ])
+  const content = jsonRecord(graphRow?.content), rawNodes = Array.isArray(content?.nodes) ? content.nodes : []
+  const marker = parseObjectiveTailorGraph(content?.objectiveTailor, content?.nodes)
+  const roleCounts = { scout: 0, analyst: 0, writer: 0, reviewer: 0, orchestrator: 0, other: 0 }
+  const statusCounts = { active: 0, completed: 0, failed: 0, terminal: 0, other: 0 }
+  for (const task of tasks) {
+    const role = task.role === "scout" || task.role === "analyst" || task.role === "writer" || task.role === "reviewer"
+      || task.role === "orchestrator" ? task.role : "other"
+    roleCounts[role]++
+    const status = typeof task.status === "string" ? task.status : ""
+    statusCounts[status === "completed" ? "completed" : status === "failed" ? "failed"
+      : ["pending", "queued", "running", "in_progress", "waiting", "waiting_for_dependency"].includes(status) ? "active"
+        : ["cancelled", "interrupted"].includes(status) ? "terminal" : "other"]++
+  }
+  return {
+    turn: { present: turn !== null, status: objectiveSourceStatus(turn?.status), errorCode: diagnosticMachineErrorCode(turn?.error) },
+    root: { present: root !== null, status: objectiveSourceStatus(root?.status), failureCode: diagnosticMachineErrorCode(root?.failureReason) },
+    graph: { present: graphRow !== null, revision: Number.isSafeInteger(graphRow?.revision) ? graphRow!.revision : null,
+      markerValid: Boolean(marker), sourceNodeCount: marker?.sourceNodeCount ?? null, slotCount: marker?.slots.length ?? null,
+      nodeCount: Math.min(32, rawNodes.length), nodeCountOverflow: rawNodes.length > 32 },
+    children: { count: Math.min(32, tasks.length), overflow: tasks.length === 32, roles: roleCounts, statuses: statusCounts },
+    fixture: objectiveWaveFixtureDiagnostics(input.lines, input.errors),
+  }
+}
+
 const SAFE_SUBMIT_OUTBOX_ERROR_CATEGORIES = [
   "queue_delivery_or_ack_failed",
   "terminal:invalid_intent_payload",
@@ -2299,7 +2382,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       worker = sourceWorker
       await waitLine(sourceWorker, "TAILOR_WAVE_WORKER_READY resume", 90_000)
       const sourceTerminal = await waitForAgentTurnTerminal(sourceTurnId, 240_000)
-      expect(sourceTerminal.status).toBe("completed")
+      if (sourceTerminal.status !== "completed") {
+        const diagnostic = await objectiveSourceFailureSnapshot({ sessionId, turnId: sourceTurnId,
+          lines: sourceWorker.lines, errors: sourceWorker.errors })
+        throw new Error(`Objective source Turn failed ${JSON.stringify(diagnostic)}`)
+      }
       const sourceTurn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: sourceTurnId } })
       expect(sourceTurn).toMatchObject({ userId: ids.user, sessionId, source: "user", status: "completed", executionMode: "canonical_task_graph" })
       const sourceRootTaskId = sourceTurn.rootTaskId
