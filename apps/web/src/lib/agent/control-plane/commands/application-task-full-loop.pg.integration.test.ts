@@ -78,6 +78,7 @@ const runId = randomUUID().replaceAll("-", "")
 const candidateName = "A B"
 const candidateEmail = `${runId.slice(0, 1)}@${runId.slice(1, 3)}.co`
 const reviewedCoverLetter = "SYNTHETIC REVIEWED COVER LETTER — isolated fill only."
+const objectiveCorrectedCoverLetter = "Synthetic corrected cover letter for confirmed engineering role tailor-2."
 const reviewedSourceGoal = "FULL_LOOP_REVIEWED_SOURCE: produce and review a selected-job cover letter"
 const reviewedFillBridgePath = "/__applymate-reviewed-fill"
 const reviewedFillEndpointUrl = `http://127.0.0.1:9443${reviewedFillBridgePath}`
@@ -438,6 +439,8 @@ type FixtureStats = {
   reviewedSubmitCount: number
   reviewedMaterialExactCount: number
   objectiveMaterialExactCount: number
+  objectiveSubmitReceipts: Array<{ slot: number; attempts: number; validAttempts: number; malformedAttempts: number; last: unknown }>
+  objectiveGetCounts: number[]
   reviewedGetCount: number
   blocked: string[]
   requests: string[]
@@ -2649,8 +2652,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     } finally { await sourcePool.end() }
     const jobIds = seeded.jobs.map(job => job.id)
     reviewedJobIds.push(...jobIds)
-    await testDb.job.updateMany({ where: { id: { in: jobIds }, userId: ids.user },
-      data: { url: "https://boards.greenhouse.io/example-reviewed/jobs/1" } })
+    for (const [index, job] of seeded.jobs.entries()) {
+      const updated = await testDb.job.updateMany({ where: { id: job.id, userId: ids.user },
+        data: { url: `https://boards.greenhouse.io/example-objective/jobs/${index + 1}` } })
+      expect(updated.count).toBe(1)
+    }
     const adaptedResumeByJob = new Map<string, string>()
     for (const [index, job] of seeded.jobs.entries()) {
       const resumeId = `full-loop-objective-adapted-${suffix}-${index}`
@@ -2813,6 +2819,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         status: "waiting_for_user", checkpoint: "materials_ready", fillTurnId: null })
       const staleTurnFence = await testDb.agentTurn.findUniqueOrThrow({ where: { id: staleReviewTurnId }, select: { revision: true } })
       const staleTraceBaseline = await requestFixtureStats()
+      expect(staleTraceBaseline.objectiveGetCounts[5]).toBe(0)
+      expect(staleTraceBaseline.objectiveSubmitReceipts.every(receipt => receipt.attempts === 0)).toBe(true)
       reviewedFillBridgeAttempts.length = 0
       dropNextReviewedFillAcknowledgement = false
       const deliveryHold = armObjectiveFillDeliveryHold(sessionId, staleApprovalId)
@@ -2895,6 +2903,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         expect(sessionTurns.filter(turn => jsonString(turn.input, "clientMessageId") === `agent-objective-reviewed-fill:${staleApprovalId}`)).toHaveLength(0)
         const staleTraceAfter = await requestFixtureStats()
         expect(staleTraceAfter.reviewedGetCount).toBe(staleTraceBaseline.reviewedGetCount)
+        expect(staleTraceAfter.objectiveGetCounts[5]).toBe(0)
         expect(staleTraceAfter.objectiveMaterialExactCount).toBe(staleTraceBaseline.objectiveMaterialExactCount)
         expect(staleTraceAfter.submitCount).toBe(staleTraceBaseline.submitCount)
         expect(staleTraceAfter.reviewedSubmitCount).toBe(0)
@@ -2938,6 +2947,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       } })
       const decisionKey = `objective-review-decision-slot-2-${runId}`
       const traceBaseline = await requestFixtureStats()
+      expect(traceBaseline.objectiveGetCounts[1]).toBe(0)
       const fillTraceOffset = worker?.lines.length ?? 0
       reviewedFillBridgeAttempts.length = 0
       dropNextReviewedFillAcknowledgement = true
@@ -3091,7 +3101,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(await testDb.agentArtifact.findUnique({ where: { id: `application:${applicationTaskId}` }, select: { id: true } }))
         .toBeNull()
       const finalStats = await requestFixtureStats()
-      expect(finalStats.reviewedGetCount).toBeGreaterThan(traceBaseline.reviewedGetCount)
+      expect(finalStats.reviewedGetCount).toBe(traceBaseline.reviewedGetCount)
+      expect(finalStats.objectiveGetCounts[1]).toBeGreaterThan(traceBaseline.objectiveGetCounts[1])
+      expect(finalStats.objectiveGetCounts[5]).toBe(0)
       expect(finalStats.objectiveMaterialExactCount).toBeGreaterThan(traceBaseline.objectiveMaterialExactCount)
       expect(finalStats.submitCount).toBe(traceBaseline.submitCount)
       expect(finalStats.reviewedSubmitCount).toBe(0)
@@ -3118,6 +3130,128 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         fillTurnId: null, workerTaskId: null })
       expect(await testDb.applicationTaskEvent.count({ where: { taskId: staleApplicationTaskId,
         type: "reviewed_application_fill_browser_started" } })).toBe(0)
+
+      const beforeFinalApproval = await requestFixtureStats()
+      expect(beforeFinalApproval.objectiveSubmitReceipts).toHaveLength(8)
+      expect(beforeFinalApproval.objectiveSubmitReceipts.every(receipt => receipt.attempts === 0
+        && receipt.validAttempts === 0 && receipt.malformedAttempts === 0)).toBe(true)
+      expect(beforeFinalApproval.objectiveSubmitReceipts[1]).toMatchObject({ slot: 2, attempts: 0, validAttempts: 0, malformedAttempts: 0 })
+      expect(beforeFinalApproval.objectiveGetCounts[1]).toBe(finalStats.objectiveGetCounts[1])
+      if (typeof submitApproval.scopeHash !== "string") throw new Error("Objective submit approval has no durable scope hash")
+      const { GET: getSubmitApproval } = await import("@/app/api/agent/sessions/[id]/approvals/[approvalId]/route")
+      const nonceResponse = await getSubmitApproval(apiRequest(
+        `/api/agent/sessions/${sessionId}/approvals/${submitApproval.id}`, token, "GET"),
+      { params: Promise.resolve({ id: sessionId, approvalId: submitApproval.id }) })
+      expect(nonceResponse.status).toBe(200)
+      const nonceBody = await jsonResponse(nonceResponse)
+      const receiptNonce = typeof nonceBody.receiptNonce === "string" ? nonceBody.receiptNonce
+        : typeof nonceBody.nonce === "string" ? nonceBody.nonce : ""
+      expect(receiptNonce.length).toBeGreaterThan(20)
+      const { POST: submitApprovalAction } = await import("@/app/api/agent/sessions/[id]/actions/route")
+      const approvalResponse = await submitApprovalAction(apiRequest(
+        `/api/agent/sessions/${sessionId}/actions`, token, "POST", {
+          type: "approval_response", approvalId: submitApproval.id, decision: "approved", receiptNonce,
+        }), { params: Promise.resolve({ id: sessionId }) })
+      expect(approvalResponse.status).toBe(200)
+      const submitDispatches = await testDb.agentOutbox.findMany({ where: {
+        aggregateId: sessionId, topic: "application.submit.dispatch",
+      }, select: { id: true, idempotencyKey: true, publishedAt: true, payload: true } })
+      expect(submitDispatches).toHaveLength(1)
+      const submitDispatch = submitDispatches[0]!
+      await waitForOutboxPublished(submitDispatch.id)
+
+      const submittedTask = await waitForReviewedApplicationTask(selectedJobId,
+        task => task.status === "submitted" && task.checkpoint === "submission_verified", 120_000)
+      expect(submittedTask).toMatchObject({ id: applicationTaskId, userId: ids.user, sessionId,
+        jobId: selectedJobId, fillTurnId, status: "submitted", checkpoint: "submission_verified" })
+      const completedTask = await testDb.applicationTask.findUniqueOrThrow({ where: { id: applicationTaskId! } })
+      expect(completedTask).toMatchObject({ id: applicationTaskId, resumeId: selectedResumeId,
+        status: "submitted", checkpoint: "submission_verified", completedAt: expect.any(Date) })
+      if (typeof completedTask.workerTaskId !== "string") throw new Error("Submitted Objective task has no Worker task identity")
+      const terminalSubmitProof = await waitForSubmissionTerminalProof({ taskId: applicationTaskId!, userId: ids.user,
+        jobId: selectedJobId, sessionId, fillTurnId, workerTaskId: completedTask.workerTaskId,
+        approvalId: submitApproval.id, constraintHash: submitApproval.scopeHash })
+      expect(terminalSubmitProof).toHaveLength(1)
+      const completedJob = await testDb.job.findFirstOrThrow({ where: { id: selectedJobId, userId: ids.user } })
+      expect(completedJob).toMatchObject({ status: "applied", workflowState: "submitted", appliedAt: expect.any(Date) })
+      const consumedApproval = await testDb.agentApproval.findUniqueOrThrow({ where: { id: submitApproval.id } })
+      expect(consumedApproval).toMatchObject({ id: submitApproval.id, userId: ids.user, sessionId,
+        turnId: fillTurnId, taskId: applicationTaskId, jobId: selectedJobId, type: "submit_application",
+        status: "consumed", consumedAt: expect.any(Date) })
+      const submitReceiptEvents = await testDb.applicationTaskEvent.findMany({ where: {
+        taskId: applicationTaskId!, type: "objective_application_submit_result_recorded", actor: "worker",
+      }, select: { id: true, taskId: true, type: true, actor: true, body: true, data: true, createdAt: true } })
+      expect(submitReceiptEvents).toHaveLength(1)
+      const submitReceiptEvent = submitReceiptEvents[0]!
+      const submitReceipt = jsonRecord(submitReceiptEvent.data)
+      if (!submitReceipt || typeof submitReceipt.applyResultId !== "number"
+        || typeof submitReceipt.executionId !== "string" || typeof submitReceipt.workerTaskId !== "string"
+        || typeof submitReceipt.attemptId !== "string") throw new Error("Objective submit result receipt is incomplete")
+      const expectedSubmitResultId = `objective-application-submit-result:${hashContent([
+        applicationTaskId, fillTurnId, submitApproval.id,
+      ]).slice(7)}`
+      expect(submitReceiptEvent).toMatchObject({ id: expectedSubmitResultId, taskId: applicationTaskId,
+        type: "objective_application_submit_result_recorded", actor: "worker",
+        body: "Objective browser-confirmed result recorded." })
+      expect(Object.keys(submitReceipt).sort()).toEqual([
+        "applicationTaskId", "approvalId", "applyResultId", "attemptId", "constraintHash", "executionId",
+        "fillTurnId", "jobId", "schemaVersion", "sessionId", "userId", "workerTaskId",
+      ].sort())
+      expect(submitReceipt).toMatchObject({ schemaVersion: "agent-harness.v2.objective-application-submit-result.v1",
+        applicationTaskId, userId: ids.user, jobId: selectedJobId, sessionId, fillTurnId,
+        approvalId: submitApproval.id, constraintHash: submitApproval.scopeHash, workerTaskId: completedTask.workerTaskId })
+      const applyResult = await testDb.applyResult.findUniqueOrThrow({ where: { id: submitReceipt.applyResultId } })
+      expect(applyResult).toMatchObject({ id: submitReceipt.applyResultId, userId: ids.user, jobId: selectedJobId,
+        mode: "unattended", atsType: "greenhouse", flowUsed: "application.submit", status: "submitted", error: null })
+      const attempts = await testDb.submissionAttempt.findMany({ where: {
+        userId: ids.user, jobId: selectedJobId, receiptId: submitApproval.id,
+      }, select: { id: true, state: true, responseRef: true, constraintHash: true } })
+      expect(attempts).toHaveLength(1)
+      expect(attempts[0]).toMatchObject({ id: submitReceipt.attemptId, state: "submitted",
+        constraintHash: submitApproval.scopeHash, responseRef: expect.any(String) })
+      const executionEvents = await testDb.applicationTaskEvent.findMany({ where: {
+        taskId: applicationTaskId!, type: { in: ["submission_execution_started", "submission_execution_settled"] }, actor: "worker",
+      }, select: { id: true, type: true, actor: true, body: true, data: true, createdAt: true } })
+      expect(executionEvents.map(event => event.type).sort()).toEqual(["submission_execution_settled", "submission_execution_started"])
+      const executionStarted = executionEvents.find(event => event.type === "submission_execution_started")!
+      const executionSettled = executionEvents.find(event => event.type === "submission_execution_settled")!
+      const executionData = jsonRecord(executionStarted.data)
+      expect(executionData).not.toBeNull()
+      expect(Object.keys(executionData ?? {}).sort()).toEqual([
+        "applicationTaskId", "approvalId", "constraintHash", "executionId", "fillTurnId", "jobId", "sessionId", "userId", "workerTaskId",
+      ].sort())
+      expect(executionData).toMatchObject({ applicationTaskId, userId: ids.user, jobId: selectedJobId, sessionId,
+        fillTurnId, approvalId: submitApproval.id, constraintHash: submitApproval.scopeHash,
+        executionId: submitReceipt.executionId, workerTaskId: submitReceipt.workerTaskId })
+      expect(executionStarted.id).toBe(`evt_${submitReceipt.executionId}`)
+      expect(executionStarted).toMatchObject({ body: "Submit execution started", data: executionData })
+      expect(executionSettled).toMatchObject({ body: "Submit execution settled", data: executionData })
+      expect(executionStarted.createdAt.getTime()).toBeLessThanOrEqual(submitReceiptEvent.createdAt.getTime())
+      expect(submitReceiptEvent.createdAt.getTime()).toBeLessThanOrEqual(executionSettled.createdAt.getTime())
+      expect(submitDispatch.publishedAt).toBeInstanceOf(Date)
+      expect(jsonRecord(submitDispatch.payload)).toMatchObject({ applicationTaskId, userId: ids.user,
+        jobId: selectedJobId, sessionId, fillTurnId, receiptId: submitApproval.id, workerTaskId: submitReceipt.workerTaskId,
+        submitPayload: { operation: "submit", applicationTaskId, jobId: selectedJobId, sessionId, fillTurnId } })
+
+      const objectiveSubmitLine = await waitLine(site!, "OBJECTIVE_SUBMIT_RECEIVED slot=2", 10_000)
+      expect(objectiveSubmitLine).toBe("OBJECTIVE_SUBMIT_RECEIVED slot=2")
+      const submittedStats = await requestFixtureStats()
+      expect(submittedStats.submitCount).toBe(beforeFinalApproval.submitCount)
+      expect(submittedStats.reviewedSubmitCount).toBe(0)
+      expect(submittedStats.objectiveGetCounts[1]).toBeGreaterThan(beforeFinalApproval.objectiveGetCounts[1])
+      expect(submittedStats.objectiveGetCounts[5]).toBe(0)
+      expect(submittedStats.objectiveMaterialExactCount).toBeGreaterThan(beforeFinalApproval.objectiveMaterialExactCount)
+      expect(submittedStats.objectiveSubmitReceipts[1]).toMatchObject({ slot: 2, attempts: 1, validAttempts: 1, malformedAttempts: 0,
+        last: { slot: 2, valid: true, code: "ok", objectiveLetterMatch: true,
+          resume: { attached: true, pdf: true, fileType: true }, coverLetter: { present: true } } })
+      const postedMaterial = jsonRecord(submittedStats.objectiveSubmitReceipts[1]?.last)
+      const postedResume = jsonRecord(postedMaterial?.resume)
+      const postedCoverLetter = jsonRecord(postedMaterial?.coverLetter)
+      expect(postedResume?.bytes).toBeGreaterThan(5)
+      expect(postedResume?.sha256).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/))
+      expect(postedCoverLetter?.sha256).toBe(createHash("sha256").update(objectiveCorrectedCoverLetter).digest("hex"))
+      expect(submittedStats.objectiveSubmitReceipts.filter(receipt => receipt.slot !== 2)
+        .every(receipt => receipt.attempts === 0 && receipt.validAttempts === 0 && receipt.malformedAttempts === 0)).toBe(true)
     } finally {
       if (priorWaveFlag === undefined) delete process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES
       else process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES = priorWaveFlag
