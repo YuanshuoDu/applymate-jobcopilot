@@ -1,6 +1,7 @@
 import { createObjectiveTailorWaveDraftModel } from "./objective-tailor-wave-draft.fixture.mjs"
 import { createObjectiveTailorWaveSourceModel, diagnoseObjectiveTailorWaveOne, diagnoseObjectiveTailorWaveOneReceipt,
-  diagnoseObjectiveTailorWaveGraph, fixtureAllTasksCompleted, fixtureObservation, fixtureToolCalls, fixtureToolResult, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
+  diagnoseObjectiveTailorWaveGraph, fixturePhaseReady, fixtureObservation,
+  fixtureToolCalls, fixtureToolResult, objectiveTailorWaveDiagnosticCode, objectiveTailorWaveIdentity, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
 
 const WAIT_PREFIX = "p3-1336-", SOURCE_KEYS = ["scout-greenhouse", "scout-lever", "scout-workday", "analyst-greenhouse-a", "analyst-greenhouse-b",
   "analyst-lever", "analyst-workday"]
@@ -12,6 +13,7 @@ const MODEL_PROFILE = { provider: "fixture", model: "objective-tailor-wave", nat
 
 export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnId, mode, say, waitForCommand }) {
   const blockedWriters = new Set()
+  const phaseReady = (request, phase, activeTurnId) => fixturePhaseReady(request, phase, activeTurnId, say, WAIT_PREFIX)
   let wave1Identity
   let coverageFailureReported = false
   const childModel = input => {
@@ -58,12 +60,15 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
       if (tailors.length === 1 && !plans.some(call => call.id === `p3-1336-ordinary-plan:${turnId}`)) {
         diagnoseObjectiveTailorWaveOneReceipt(request, tailors[0], say)
         const wave = acceptedTailorReceipt(request, tailors[0], 8)
-        wave1Identity = sourceAndSlotIdentity(currentGraph(request))
+        const graph = currentGraph(request)
+        wave1Identity = objectiveTailorWaveIdentity(graph, SOURCE_KEYS, ANALYST_KEYS)
+        diagnosePostAppendGraph(graph, wave1Identity, say)
         if (!wave1Identity) throw new Error("fixture_wave1_identity_unavailable")
+        const scoutProbe = sourcePlan().nodes[0]
+        say("TAILOR_WAVE1_ORDINARY_PLAN_PROBE_EMITTED")
         yield* emit(`p3-1336-ordinary-plan:${turnId}`, "agent.plan", {
           expectedRevision: currentGraph(request).revision,
-          nodes: [{ key: "ordinary-after-wave", templateId: "scout", goal: "This generic append must remain closed.",
-            successCriteria: ["Read a source"], dependsOn: [] }],
+          nodes: [{ ...scoutProbe, key: "ordinary-after-wave", goal: "Search greenhouse for saved roles" }],
         })
         void wave
         return
@@ -71,16 +76,22 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
       const ordinaryPlan = plans.find(call => call.id === `p3-1336-ordinary-plan:${turnId}`)
       if (tailors.length === 1 && ordinaryPlan && !hasPhase(request, "wave1", turnId)) {
         const error = fixtureToolResult(request, ordinaryPlan), graph = currentGraph(request)
-        const currentIdentity = sourceAndSlotIdentity(graph)
+        const receiptStatus = !error ? "MISSING" : error.error === true ? "DENIED"
+          : error.error === false ? "ACCEPTED" : "OTHER"
+        say(`TAILOR_WAVE1_ORDINARY_PLAN_RECEIPT_${receiptStatus}`)
+        say(`TAILOR_WAVE1_ORDINARY_PLAN_ERROR_CODE ${objectiveTailorWaveDiagnosticCode(error?.value)}`)
+        const currentIdentity = objectiveTailorWaveIdentity(graph, SOURCE_KEYS, ANALYST_KEYS)
         if (!error?.error || !currentIdentity || JSON.stringify(currentIdentity) !== JSON.stringify(wave1Identity)) {
           throw new Error("fixture_ordinary_plan_append_was_not_closed")
         }
         say(`TAILOR_ORDINARY_PLAN_REJECTED ${graph.revision}`)
         const wave = acceptedTailorReceipt(request, tailors[0], 8)
+        say("TAILOR_WAVE1_WAIT_EMITTED")
         yield* emitWait(request, "wave1", turnId, wave.nodes.map(node => node.taskId)); return
       }
       if (tailors.length === 1 && ordinaryPlan && hasPhase(request, "wave1", turnId) && !phaseReady(request, "wave1", turnId)) {
         const wave = acceptedTailorReceipt(request, tailors[0], 8)
+        say("TAILOR_WAVE1_WAIT_EMITTED")
         yield* emitWait(request, "wave1", turnId, wave.nodes.map(node => node.taskId)); return
       }
       if (tailors.length === 1 && phaseReady(request, "wave1", turnId)) {
@@ -143,7 +154,8 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
         return
       }
       throw new Error("fixture_root_phase_unrecognized")
-      } catch {
+      } catch (error) {
+        say(`TAILOR_ROOT_STREAM_FAILURE ${objectiveTailorWaveDiagnosticCode(error)}`)
         say("TAILOR_ROOT_STREAM_FAILED")
         throw new Error("fixture_root_stream_failed")
       }
@@ -178,15 +190,6 @@ function emitWait(request, phase, turnId, taskIds) {
   if (last && previous?.value?.status === "ready") return []
   const poll = calls.length + 1, key = `${prefix}${poll}`
   return emit(`${key}:call`, "agent.wait", { idempotencyKey: key, taskIds: [...taskIds], mode: "all", timeoutMs: 30_000 })
-}
-function phaseReady(request, phase, turnId) {
-  const prefix = `${WAIT_PREFIX}${phase}-wait:${turnId}:`, calls = fixtureToolCalls(request, "agent.wait")
-    .filter(call => typeof call.input?.idempotencyKey === "string" && call.input.idempotencyKey.startsWith(prefix))
-  const result = calls.length ? fixtureToolResult(request, calls.at(-1)) : undefined
-  if (result?.error) throw new Error("fixture_wait_result_error")
-  if (result?.value?.status !== "ready") return false
-  const expected = calls.at(-1)?.input?.taskIds
-  return Array.isArray(expected) && expected.length > 0 && fixtureAllTasksCompleted(result.value, expected)
 }
 function hasPhase(request, phase, turnId) {
   const prefix = `${WAIT_PREFIX}${phase}-wait:${turnId}:`
@@ -230,16 +233,9 @@ function assertReplayMatches(request, original, replay) {
     || JSON.stringify(first.readyTaskIds) !== JSON.stringify(duplicate.readyTaskIds)) throw new Error("fixture_wave_replay_identity_mismatch")
 }
 function currentGraph(request) { return fixtureObservation(request, "task_graph_current") }
-function graphKeys(graph) { return Array.isArray(graph.nodes) ? graph.nodes.map(node => node?.key).filter(key => typeof key === "string") : [] }
-function sourceAndSlotIdentity(graph) {
-  const sourceKeys = graphKeys(graph).sort(), expectedSourceKeys = [...SOURCE_KEYS].sort()
-  if (sourceKeys.length !== expectedSourceKeys.length || sourceKeys.some((key, index) => key !== expectedSourceKeys[index])) return undefined
-  const slots = graph?.objectiveTailorWave?.slots
-  if (!Array.isArray(slots) || slots.length !== 4) return undefined
-  const identity = slots.map(slot => [slot?.slotId, slot?.sourceAnalystNodeKey, slot?.initial?.writer?.taskId, slot?.initial?.reviewer?.taskId])
-  if (identity.some((slot, index) => slot[0] !== `tailor-${index + 1}` || slot.some(value => typeof value !== "string")
-    || !ANALYST_KEYS.includes(slot[1]))) return undefined
-  return { sourceKeys, slots: identity }
+function diagnosePostAppendGraph(graph, identity, say) {
+  say(Array.isArray(graph?.nodes) ? "TAILOR_WAVE1_POST_APPEND_GRAPH_OBSERVED" : "TAILOR_WAVE1_POST_APPEND_GRAPH_UNAVAILABLE")
+  say(identity ? "TAILOR_WAVE1_POST_APPEND_IDENTITY_VALID" : "TAILOR_WAVE1_POST_APPEND_IDENTITY_INVALID")
 }
 function emit(id, name, args) { return [{ type: "tool_call_completed", callId: id, name, arguments: args }, { type: "completed", finishReason: "tool_calls" }] }
 function assertRequestScope(request, expected) {

@@ -72,6 +72,8 @@ import { loadTaskGraph } from "./task-graph-pg-state.js"
 import { parseStoredTaskGraphVerificationReport, TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION } from "./task-graph-verification-report.js"
 import { hasNoCurrentAttemptTaskGraphToolReceipts } from "./task-graph-empty-analyst-proof.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
+// @ts-expect-error Fixture-only JavaScript module has no declaration; Vitest resolves the import at runtime.
+import { objectiveTailorWaveDiagnosticCode, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 import type { WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { readTaskGraphConfirmedLocationSteer } from "./task-graph-confirmed-location-steer.js"
@@ -5363,8 +5365,26 @@ const OBJECTIVE_TAILOR_WAVE1_MODEL_MARKERS = [
   "TOOL_ABSENT", "TOOL_AMBIGUOUS", "TOOL_VERSION_OTHER", "TOOL_V2", "CATALOG_MISSING", "CATALOG_INVALID",
   "CATALOG_COUNT_MATCH", "CATALOG_COUNT_MISMATCH", "CATALOG_REVISION_MATCH", "CATALOG_REVISION_MISMATCH",
   "CANDIDATE_REFS_INVALID", "TOOL_CALL_EMITTED", "RECEIPT_ACCEPTED", "RECEIPT_DENIED", "RECEIPT_DENIED_OTHER",
-  "RECEIPT_INVALID",
+  "RECEIPT_INVALID", "POST_APPEND_GRAPH_OBSERVED", "POST_APPEND_GRAPH_UNAVAILABLE",
+  "POST_APPEND_IDENTITY_VALID", "POST_APPEND_IDENTITY_INVALID",
+  "ORDINARY_PLAN_PROBE_EMITTED",
+  "ORDINARY_PLAN_RECEIPT_MISSING", "ORDINARY_PLAN_RECEIPT_DENIED", "ORDINARY_PLAN_RECEIPT_ACCEPTED",
+  "ORDINARY_PLAN_RECEIPT_OTHER", "WAIT_EMITTED", "WAIT_RECEIPT_READY", "WAIT_RECEIPT_WAITING", "WAIT_RECEIPT_ERROR",
+  "WAIT_RECEIPT_MISSING", "WAIT_RECEIPT_OTHER",
 ] as const
+const OBJECTIVE_TAILOR_MODEL_DIAGNOSTIC_CODES = new Set([
+  ...OBJECTIVE_TAILOR_WAVE_DIAGNOSTIC_CODES, "invalid_state", "task_graph_objective_coverage_incomplete",
+  "fixture_observation_unavailable", "fixture_wave1_identity_unavailable", "fixture_wave_catalog_unavailable",
+  "fixture_wave_receipt_invalid", "fixture_plan_receipt_invalid", "fixture_wait_result_error",
+  "fixture_ordinary_plan_append_was_not_closed", "fixture_root_phase_unrecognized",
+])
+
+function latestObjectiveTailorMarkerValue(output: readonly string[], prefix: string, allowed: ReadonlySet<string>): string {
+  const line = [...output].reverse().find(value => value.startsWith(prefix))
+  if (!line) return "none"
+  const value = line.slice(prefix.length)
+  return allowed.has(value) ? value : "other"
+}
 
 function objectiveTailorWaveMarkerDiagnostics(output: readonly string[]) {
   let catalogRead: RecordValue = { status: "none" }
@@ -5411,6 +5431,18 @@ function objectiveTailorWaveMarkerDiagnostics(output: readonly string[]) {
     waveAppend: append,
     wave1ModelStages: OBJECTIVE_TAILOR_WAVE1_MODEL_MARKERS.filter(marker => output.includes(`TAILOR_WAVE1_${marker}`)),
     wave1CatalogCandidates: catalogCandidates,
+    wave1PostAppendGraphObserved: output.includes("TAILOR_WAVE1_POST_APPEND_GRAPH_OBSERVED"),
+    wave1PostAppendIdentity: latestObjectiveTailorMarkerValue(output, "TAILOR_WAVE1_POST_APPEND_IDENTITY_", new Set(["VALID", "INVALID"])).toLowerCase(),
+    wave1OrdinaryPlanProbeEmitted: output.includes("TAILOR_WAVE1_ORDINARY_PLAN_PROBE_EMITTED"),
+    wave1OrdinaryPlanReceipt: latestObjectiveTailorMarkerValue(output, "TAILOR_WAVE1_ORDINARY_PLAN_RECEIPT_",
+      new Set(["MISSING", "DENIED", "ACCEPTED", "OTHER"])).toLowerCase(),
+    wave1OrdinaryPlanErrorCode: latestObjectiveTailorMarkerValue(output, "TAILOR_WAVE1_ORDINARY_PLAN_ERROR_CODE ",
+      OBJECTIVE_TAILOR_MODEL_DIAGNOSTIC_CODES),
+    wave1WaitEmitted: output.includes("TAILOR_WAVE1_WAIT_EMITTED"),
+    wave1WaitReceipt: latestObjectiveTailorMarkerValue(output, "TAILOR_WAVE1_WAIT_RECEIPT_",
+      new Set(["READY", "WAITING", "ERROR", "MISSING", "OTHER"])).toLowerCase(),
+    rootStreamFailureCode: latestObjectiveTailorMarkerValue(output, "TAILOR_ROOT_STREAM_FAILURE ",
+      OBJECTIVE_TAILOR_MODEL_DIAGNOSTIC_CODES),
   }
 }
 
@@ -7245,6 +7277,23 @@ describe("persisted TaskGraph wait scope", () => {
 })
 
 describe("compact TaskGraph wait failure diagnostics", () => {
+  it("uses the existing typed Scout verification shape for its ordinary-plan probe", () => {
+    expect(sourcePlan().nodes[0]).toMatchObject({
+      templateId: "scout",
+      verification: {
+        schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+        role: "scout",
+        criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+      },
+    })
+  })
+
+  it("keeps unknown fixture error text out of the safe category projection", () => {
+    expect(objectiveTailorWaveDiagnosticCode(new Error("synthetic-private-error-text"))).toBe("other")
+    expect(objectiveTailorWaveDiagnosticCode(new Error("fixture_observation_unavailable")))
+      .toBe("fixture_observation_unavailable")
+  })
+
   it("recognizes the exact underscore-form wave model markers", () => {
     const projected = objectiveTailorWaveMarkerDiagnostics([
       "TAILOR_WAVE1_GRAPH_CONTEXT_UNAVAILABLE", "TAILOR_WAVE1_TOOL_V2",
@@ -7252,6 +7301,21 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     ])
     expect(projected).toMatchObject({ wave1ModelStages: ["GRAPH_CONTEXT_UNAVAILABLE", "TOOL_V2", "CATALOG_REVISION_MATCH"],
       wave1CatalogCandidates: 8 })
+  })
+
+  it("projects post-append, ordinary-plan, wait, and root failure diagnostics through fixed enums", () => {
+    const secret = "synthetic-private-error-text"
+    const projected = objectiveTailorWaveMarkerDiagnostics([
+      "TAILOR_WAVE1_POST_APPEND_GRAPH_OBSERVED", "TAILOR_WAVE1_POST_APPEND_IDENTITY_VALID",
+      "TAILOR_WAVE1_ORDINARY_PLAN_PROBE_EMITTED", "TAILOR_WAVE1_ORDINARY_PLAN_RECEIPT_DENIED",
+      "TAILOR_WAVE1_ORDINARY_PLAN_ERROR_CODE invalid_state", "TAILOR_WAVE1_WAIT_EMITTED",
+      "TAILOR_WAVE1_WAIT_RECEIPT_READY", "TAILOR_ROOT_STREAM_FAILURE fixture_wave1_identity_unavailable",
+      `TAILOR_ROOT_STREAM_FAILURE ${secret}`,
+    ])
+    expect(projected).toMatchObject({ wave1PostAppendGraphObserved: true, wave1PostAppendIdentity: "valid",
+      wave1OrdinaryPlanProbeEmitted: true, wave1OrdinaryPlanReceipt: "denied", wave1OrdinaryPlanErrorCode: "invalid_state",
+      wave1WaitEmitted: true, wave1WaitReceipt: "ready", rootStreamFailureCode: "other" })
+    expect(JSON.stringify(projected)).not.toContain(secret)
   })
 
   it("projects restart child markers through the safe diagnostic allowlists", () => {

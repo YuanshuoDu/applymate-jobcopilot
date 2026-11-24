@@ -158,6 +158,47 @@ export function fixtureAllTasksCompleted(output, taskIds) {
     && Array.isArray(output.matchedTaskIds) && taskIds.every(id => output.matchedTaskIds.includes(id))
 }
 
+const SAFE_DIAGNOSTIC_CODES = new Set(["invalid_state", "revision_mismatch",
+  "task_graph_objective_coverage_incomplete", "revision_limit", "objective_tailor_wave_not_eligible", "objective_tailor_wave_source_stale", "objective_tailor_wave_stale",
+  "idempotency_conflict", "task_graph_state_missing", "fixture_observation_unavailable", "fixture_wave1_identity_unavailable",
+  "fixture_wave_catalog_unavailable", "fixture_wave_receipt_invalid", "fixture_plan_receipt_invalid",
+  "fixture_wait_result_error", "fixture_ordinary_plan_append_was_not_closed", "fixture_root_phase_unrecognized"])
+
+export function objectiveTailorWaveDiagnosticCode(value) {
+  const code = value && typeof value === "object" ? value.code ?? value.message : value
+  return SAFE_DIAGNOSTIC_CODES.has(code) ? code : "other"
+}
+
+export function fixturePhaseReady(request, phase, turnId, say, waitPrefix) {
+  const prefix = `${waitPrefix}${phase}-wait:${turnId}:`, calls = fixtureToolCalls(request, "agent.wait")
+    .filter(call => typeof call.input?.idempotencyKey === "string" && call.input.idempotencyKey.startsWith(prefix))
+  const result = calls.length ? fixtureToolResult(request, calls.at(-1)) : undefined
+  if (phase === "wave1") {
+    const expected = calls.at(-1)?.input?.taskIds
+    const status = !result ? "MISSING" : result.error ? "ERROR"
+      : result.value?.status === "ready" && Array.isArray(expected) && expected.length > 0
+        && fixtureAllTasksCompleted(result.value, expected) ? "READY"
+        : result.value?.status === "waiting" ? "WAITING" : "OTHER"
+    say(`TAILOR_WAVE1_WAIT_RECEIPT_${status}`)
+  }
+  if (result?.error) throw new Error("fixture_wait_result_error")
+  if (result?.value?.status !== "ready") return false
+  const expected = calls.at(-1)?.input?.taskIds
+  return Array.isArray(expected) && expected.length > 0 && fixtureAllTasksCompleted(result.value, expected)
+}
+
+export function objectiveTailorWaveIdentity(graph, sourceKeys, analystKeys) {
+  const graphKeys = Array.isArray(graph?.nodes) ? graph.nodes.map(node => node?.key).filter(key => typeof key === "string") : []
+  const sortedKeys = graphKeys.sort(), expectedKeys = [...sourceKeys].sort()
+  if (sortedKeys.length !== expectedKeys.length || sortedKeys.some((key, index) => key !== expectedKeys[index])) return undefined
+  const slots = graph?.objectiveTailorWave?.slots
+  if (!Array.isArray(slots) || slots.length !== 4) return undefined
+  const identity = slots.map(slot => [slot?.slotId, slot?.sourceAnalystNodeKey, slot?.initial?.writer?.taskId, slot?.initial?.reviewer?.taskId])
+  if (identity.some((slot, index) => slot[0] !== `tailor-${index + 1}` || slot.some(value => typeof value !== "string")
+    || !analystKeys.includes(slot[1]))) return undefined
+  return { sourceKeys: sortedKeys, slots: identity }
+}
+
 export function sourcePlan() {
   const scout = (source, objectiveCoverage = false) => ({ key: `scout-${source}`, templateId: "scout", goal: `Search ${source} for saved roles`,
     successCriteria: ["Return observed saved roles"], dependsOn: [], verification: {
