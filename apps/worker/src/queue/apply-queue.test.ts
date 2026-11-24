@@ -53,12 +53,13 @@ const mockContext = vi.hoisted(() => ({
   unroute: vi.fn().mockResolvedValue(undefined),
 }));
 const mockTurnState = vi.hoisted(() => ({ sessionStatus: "running", turnStatus: "in_progress", interrupted: false }));
+const objectiveSubmitResultModule = vi.hoisted(() => ({ eventType: null as string | null }));
 const mockPoolQuery = vi.hoisted(() => vi.fn().mockResolvedValue({ rowCount: 1, rows: [] }));
 const mockTurnClient = vi.hoisted(() => {
   const transaction = { nextId: 1000, currentId: null as string | null };
   return {
     transaction,
-    query: vi.fn(async (sql: string) => {
+    query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
       if (sql === "BEGIN") {
         transaction.currentId = String(transaction.nextId++);
         return { rows: [], rowCount: 1 };
@@ -70,7 +71,8 @@ const mockTurnClient = vi.hoisted(() => {
         transaction.currentId = null;
         return { rows: [], rowCount: 1 };
       }
-      if (sql.includes('SELECT "id" FROM "application_task_events"')) return { rows: [], rowCount: 0 };
+      if (sql.includes('SELECT "id" FROM "application_task_events"') && objectiveSubmitResultModule.eventType !== null
+        && values?.[2] === objectiveSubmitResultModule.eventType) return { rows: [], rowCount: 0 };
       if (sql.includes('SELECT "sessionId" FROM application_tasks')) return { rows: [{ sessionId: "agent-session-1" }], rowCount: 1 };
       if (sql.includes('SELECT "id", "fillTurnId", "sessionId"')) return { rows: [{ id: "application-task-1", fillTurnId: null, sessionId: "agent-session-1", status: "filling", checkpoint: "form_fill_queued" }], rowCount: 1 };
       if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "filler-1" }], rowCount: 1 };
@@ -156,10 +158,11 @@ vi.mock("../db/apply-results.js", () => ({
     connect: vi.fn().mockResolvedValue(mockTurnClient),
   }),
 }));
-vi.mock("../db/objective-application-submit-result.js", async importOriginal => ({
-  ...await importOriginal<typeof import("../db/objective-application-submit-result.js")>(),
-  recordObjectiveApplicationSubmitResult: mockRecordObjectiveSubmitResult,
-}));
+vi.mock("../db/objective-application-submit-result.js", async importOriginal => {
+  const original = await importOriginal<typeof import("../db/objective-application-submit-result.js")>();
+  objectiveSubmitResultModule.eventType = original.OBJECTIVE_APPLICATION_SUBMIT_RESULT_EVENT_TYPE;
+  return { ...original, recordObjectiveApplicationSubmitResult: mockRecordObjectiveSubmitResult };
+});
 
 vi.mock("../runtime/approval/pg-store.js", () => ({
   createPgApprovalStore: vi.fn(() => ({ inspectSubmission: approvalMocks.inspectSubmission })),
