@@ -5,6 +5,7 @@ import { objectiveApplicationApprovedIntentId, objectiveReviewedFillHandoffIdemp
 import { acquireSourceMaterialFence } from "../../source-material-fence"
 import { ReviewedFillHandoffDeferredError, existingFillCommandResult } from "../../approval/reviewed-fill-handoff"
 import { readObjectiveReviewedFillAuthority, verifyObjectiveReviewedFillFreshness } from "../../approval/objective-reviewed-fill-authority"
+import { verifyObjectiveReviewedFillContinuation } from "./objective-reviewed-application-fill-continuation"
 import { assertApplicationFillPreflight, hasObjectiveApplicationFillReservation, lockApplicationFillTask } from "./application-fill-preflight"
 import { AgentCommandError, invalidCommand } from "./errors"
 import { acceptInputFacts, createRootTurn, findActiveTurn, findExistingCommand, lockOpenSession } from "./transaction"
@@ -45,9 +46,10 @@ export async function startObjectiveReviewedApplicationFill(
     if (existing) return replayExisting(tx, existing, identity, intent)
 
     const session = await tx.agentSession.findFirst({
-      where: { id: intent.sessionId, userId: intent.userId }, select: { status: true },
+      where: { id: intent.sessionId, userId: intent.userId }, select: { id: true, status: true },
     })
-    if (session?.status !== "running") throw new ReviewedFillHandoffDeferredError()
+    if (!session || session.status !== "running" && session.status !== "waiting_for_user") throw new ReviewedFillHandoffDeferredError()
+    const needsContinuation = session.status === "waiting_for_user"
 
     const authority = await readObjectiveReviewedFillAuthority(tx, intent, now)
     const locked = await lockApplicationFillTask(tx, intent.applicationTaskId, identity, false)
@@ -64,6 +66,20 @@ export async function startObjectiveReviewedApplicationFill(
     if (active) throw new AgentCommandError("retry_active_conflict", "Finish the active Turn before starting an Objective fill", 409)
     await assertApplicationFillPreflight(tx, task.id, identity, { allowObjectiveReservation: true })
     await verifyObjectiveReviewedFillFreshness(tx, authority)
+    const continuation = await verifyObjectiveReviewedFillContinuation(tx, {
+      userId: intent.userId, sessionId: intent.sessionId, applicationTaskId: intent.applicationTaskId,
+      approvalId: intent.approvalId, setId: authority.input.setId, slotOrdinal: authority.input.slotOrdinal,
+      sourceTurnId: authority.input.sourceTurnId, reviewTurnId: intent.predecessorTurnId,
+    })
+    if (continuation === "deferred" || needsContinuation && continuation === "first") throw new ReviewedFillHandoffDeferredError()
+    if (continuation !== "ready" && continuation !== "first") throw unavailable()
+    if (needsContinuation) {
+      const resumed = await tx.agentSession.updateMany({
+        where: { id: intent.sessionId, userId: intent.userId, status: "waiting_for_user" },
+        data: { status: "running", completedAt: null },
+      })
+      if (resumed.count !== 1) throw new ReviewedFillHandoffDeferredError()
+    }
 
     const turn = await createRootTurn(tx, identity, CONTENT)
     const turnInput = { clientMessageId, content: CONTENT, goal: CONTENT[0]!.text, reviewedApplicationMaterialSource: authority.source }

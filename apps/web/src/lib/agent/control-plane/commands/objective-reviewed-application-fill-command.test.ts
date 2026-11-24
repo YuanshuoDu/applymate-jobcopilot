@@ -9,13 +9,16 @@ const calls: string[] = []
 const mocks = vi.hoisted(() => ({
   acquireFence: vi.fn(), readAuthority: vi.fn(), verifyFreshness: vi.fn(), assertPreflight: vi.fn(),
   hasReservation: vi.fn(), lockTask: vi.fn(), lockSession: vi.fn(), acceptFacts: vi.fn(),
-  createRoot: vi.fn(), findActive: vi.fn(), findExisting: vi.fn(), duplicateResult: vi.fn(),
+  createRoot: vi.fn(), findActive: vi.fn(), findExisting: vi.fn(), duplicateResult: vi.fn(), verifyContinuation: vi.fn(),
 }))
 
 vi.mock("../../source-material-fence", () => ({ acquireSourceMaterialFence: mocks.acquireFence }))
 vi.mock("../../approval/objective-reviewed-fill-authority", () => ({
   readObjectiveReviewedFillAuthority: mocks.readAuthority,
   verifyObjectiveReviewedFillFreshness: mocks.verifyFreshness,
+}))
+vi.mock("./objective-reviewed-application-fill-continuation", () => ({
+  verifyObjectiveReviewedFillContinuation: mocks.verifyContinuation,
 }))
 vi.mock("./application-fill-preflight", () => ({
   assertApplicationFillPreflight: mocks.assertPreflight,
@@ -54,6 +57,7 @@ function freshFixture(sessionStatus = "running") {
   mocks.readAuthority.mockImplementation(async () => { calls.push("set-and-approval"); return authority })
   mocks.lockTask.mockImplementation(async () => { calls.push("task-lock"); return { task } })
   mocks.hasReservation.mockResolvedValue(true)
+  mocks.verifyContinuation.mockResolvedValue("first")
   mocks.findActive.mockResolvedValue(null)
   mocks.assertPreflight.mockImplementation(async () => { calls.push("material-preflight") })
   mocks.verifyFreshness.mockImplementation(async () => { calls.push("freshness") })
@@ -62,7 +66,10 @@ function freshFixture(sessionStatus = "running") {
   mocks.findExisting.mockResolvedValue(null)
   const tx = {
     $queryRaw: vi.fn(async () => { calls.push("predecessor-lock"); return [{ id: predecessorTurnId, status: "completed" }] }),
-    agentSession: { findFirst: vi.fn(async () => { calls.push("session-status"); return { status: sessionStatus } }) },
+    agentSession: {
+      findFirst: vi.fn(async () => { calls.push("session-status"); return { id: sessionId, status: sessionStatus } }),
+      updateMany: vi.fn(async () => { calls.push("session-resume-cas"); return { count: 1 } }),
+    },
     agentTurn: {
       updateMany: vi.fn(async () => { calls.push("turn-binding"); return { count: 1 } }),
       findFirst: vi.fn(async (): Promise<unknown> => null),
@@ -113,6 +120,11 @@ describe("Objective reviewed fill command", () => {
     }))
     expect(tx.agentTurn.updateMany).toHaveBeenCalledOnce()
     expect(tx.applicationTask.updateMany).toHaveBeenCalledOnce()
+    expect(mocks.verifyContinuation).toHaveBeenCalledWith(tx, {
+      userId, sessionId, applicationTaskId, approvalId, setId, slotOrdinal: 1,
+      sourceTurnId: "source-turn-1", reviewTurnId: predecessorTurnId,
+    })
+    expect(tx.agentSession.updateMany).not.toHaveBeenCalled()
   })
 
   it("returns the persisted exact command replay before rechecking current expiry or material", async () => {
@@ -148,13 +160,53 @@ describe("Objective reviewed fill command", () => {
     expect(tx.agentTurn.updateMany).not.toHaveBeenCalled()
   })
 
+  it("reopens a waiting Session only after the continuation proof and in the same command transaction", async () => {
+    const { tx, db } = freshFixture("waiting_for_user")
+    mocks.verifyContinuation.mockResolvedValue("ready")
+    const now = new Date("2026-11-24T12:00:00.000Z")
+    await expect(startObjectiveReviewedApplicationFill(db as never, intent, now)).resolves.toMatchObject({
+      inputId: "input-1", turnId: "fill-turn", disposition: "started",
+    })
+    expect(mocks.verifyContinuation).toHaveBeenCalledWith(tx, {
+      userId, sessionId, applicationTaskId, approvalId, setId, slotOrdinal: 1,
+      sourceTurnId: "source-turn-1", reviewTurnId: predecessorTurnId,
+    })
+    expect(tx.agentSession.updateMany).toHaveBeenCalledWith({
+      where: { id: sessionId, userId, status: "waiting_for_user" },
+      data: { status: "running", completedAt: null },
+    })
+    expect(calls.indexOf("session-resume-cas")).toBeLessThan(calls.indexOf("root-turn"))
+  })
+
+  it("defers when the prior same-set Fill has not settled", async () => {
+    const { tx, db } = freshFixture("waiting_for_user")
+    mocks.verifyContinuation.mockResolvedValue("deferred")
+    await expect(startObjectiveReviewedApplicationFill(db as never, intent)).rejects.toMatchObject({
+      code: "reviewed_fill_handoff_deferred",
+    })
+    expect(tx.agentSession.updateMany).not.toHaveBeenCalled()
+    expect(mocks.createRoot).not.toHaveBeenCalled()
+    expect(tx.applicationTask.updateMany).not.toHaveBeenCalled()
+  })
+
+  it("does not start a Turn if the waiting Session CAS loses a race", async () => {
+    const { tx, db } = freshFixture("waiting_for_user")
+    tx.agentSession.updateMany = vi.fn(async () => ({ count: 0 }))
+    await expect(startObjectiveReviewedApplicationFill(db as never, intent)).rejects.toMatchObject({
+      code: "reviewed_fill_handoff_deferred",
+    })
+    expect(mocks.verifyContinuation).toHaveBeenCalledOnce()
+    expect(mocks.createRoot).not.toHaveBeenCalled()
+    expect(tx.applicationTask.updateMany).not.toHaveBeenCalled()
+  })
   it("defers a new Fill for a paused Session without writing a Turn or claiming the task", async () => {
     const { tx, db } = freshFixture("paused")
     await expect(startObjectiveReviewedApplicationFill(db as never, intent))
       .rejects.toMatchObject({ code: "reviewed_fill_handoff_deferred" })
     expect(tx.agentSession.findFirst).toHaveBeenCalledWith({
-      where: { id: sessionId, userId }, select: { status: true },
+      where: { id: sessionId, userId }, select: { id: true, status: true },
     })
+    expect(mocks.verifyContinuation).not.toHaveBeenCalled()
     expect(mocks.readAuthority).not.toHaveBeenCalled()
     expect(mocks.lockTask).not.toHaveBeenCalled()
     expect(mocks.createRoot).not.toHaveBeenCalled()
