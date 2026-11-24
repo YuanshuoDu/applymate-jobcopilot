@@ -5386,6 +5386,7 @@ async function waitForObjectiveTailorSourceGraph(
       stdoutLineCount: child.output.length,
       stderrLineCount: child.errors.length,
       workerReady: child.output.includes(markers[0]),
+      initialPlanCoverageRejected: child.output.includes("TAILOR_PLAN_FAILED objective_coverage_incomplete"),
       sourceGraphReady: child.output.includes(markers[1]),
       writersPaused: child.output.includes(markers[2]),
     })}`)

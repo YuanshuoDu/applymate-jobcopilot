@@ -105,23 +105,26 @@ export function fixtureAllTasksCompleted(output, taskIds) {
 }
 
 export function sourcePlan() {
-  const scout = source => ({ key: `scout-${source}`, templateId: "scout", goal: `Search ${source} for saved roles`,
+  const scout = (source, objectiveCoverage = false) => ({ key: `scout-${source}`, templateId: "scout", goal: `Search ${source} for saved roles`,
     successCriteria: ["Return observed saved roles"], dependsOn: [], verification: {
       schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
-      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+      criteria: [{ id: objectiveCoverage ? "candidate-count" : `candidate-count-${source}`,
+        check: { kind: "candidate_count_gte", minimum: 1 } }],
     } })
-  return { expectedRevision: 0, nodes: [scout("greenhouse"), scout("lever"), scout("workday")] }
+  return { expectedRevision: 0, nodes: [scout("greenhouse", true), scout("lever"), scout("workday"), ...analystPlan(0).nodes] }
 }
 
 export function analystPlan(expectedRevision) {
   const analyst = (source, group = "") => {
     const dependencyNodeKey = `scout-${source}`
-    return { key: `analyst-${source}${group ? `-${group.toLowerCase()}` : ""}`, templateId: "analyst",
+    const key = `analyst-${source}${group ? `-${group.toLowerCase()}` : ""}`
+    return { key, templateId: "analyst",
       goal: `Assess ${source} ${group ? `group ${group}` : "roles"} from its direct Scout`,
       successCriteria: ["Return findings bound to direct Scout candidates"], dependsOn: [dependencyNodeKey], verification: {
         schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
-        criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
-          { id: "scout-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey } }],
+        criteria: [{ id: source === "greenhouse" && group === "A" ? "finding-count" : `finding-count-${key}`,
+          check: { kind: "finding_count_gte", minimum: 1 } },
+          { id: `scout-membership-${key}`, check: { kind: "findings_from_scout_dependency", dependencyNodeKey } }],
       } }
   }
   return { expectedRevision, nodes: [analyst("greenhouse", "A"), analyst("greenhouse", "B"), analyst("lever"), analyst("workday")] }

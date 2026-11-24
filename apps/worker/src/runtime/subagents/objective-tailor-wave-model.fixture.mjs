@@ -1,5 +1,5 @@
 import { createObjectiveTailorWaveDraftModel } from "./objective-tailor-wave-draft.fixture.mjs"
-import { analystPlan, createObjectiveTailorWaveSourceModel, fixtureAllTasksCompleted, fixtureObservation, fixtureToolCalls, fixtureToolResult, sourcePlan }
+import { createObjectiveTailorWaveSourceModel, fixtureAllTasksCompleted, fixtureObservation, fixtureToolCalls, fixtureToolResult, sourcePlan }
   from "./objective-tailor-wave-source.fixture.mjs"
 
 const WAIT_PREFIX = "p3-1336-"
@@ -14,6 +14,7 @@ const MODEL_PROFILE = { provider: "fixture", model: "objective-tailor-wave", nat
 export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnId, mode, say, waitForCommand }) {
   const blockedWriters = new Set()
   let wave1Identity
+  let coverageFailureReported = false
   const childModel = input => {
     if (input?.task?.role === "scout" || input?.task?.role === "analyst") {
       return createObjectiveTailorWaveSourceModel({ task: input.task, userId, sessionId, turnId, profile: MODEL_PROFILE,
@@ -35,31 +36,24 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
       try {
       assertRequestScope(request, { userId, sessionId, turnId, taskId: rootTaskId })
       say("TAILOR_ROOT_REQUEST_SCOPE_OK")
-      const plans = fixtureToolCalls(request, "agent.plan"), waits = fixtureToolCalls(request, "agent.wait"), tailors = fixtureToolCalls(request, "agent.tailor")
+      const plans = fixtureToolCalls(request, "agent.plan"), tailors = fixtureToolCalls(request, "agent.tailor")
+      if (!coverageFailureReported && plans.some(call => {
+        const result = fixtureToolResult(request, call)
+        return result?.error === true && result.value?.code === "task_graph_objective_coverage_incomplete"
+      })) { coverageFailureReported = true; say("TAILOR_PLAN_FAILED objective_coverage_incomplete") }
       if (!plans.length) { say("TAILOR_ROOT_INITIAL_PLAN_REQUESTED"); yield* emit(`p3-1336-source-plan:${turnId}`, "agent.plan", sourcePlan()); return }
-      if (plans.length === 1 && !waits.length) {
-        const receipt = acceptedReceipt(request, plans[0], 3)
-        say("TAILOR_ROOT_SOURCE_WAIT_REQUESTED")
-        yield* emitWait(request, "wave-source", turnId, receipt.nodes.map(node => node.taskId)); return
-      }
-      if (plans.length === 1 && phaseReady(request, "wave-source", turnId)) {
-        say("TAILOR_ROOT_ANALYST_PLAN_REQUESTED")
-        yield* emit(`p3-1336-analyst-plan:${turnId}`, "agent.plan", analystPlan(currentGraph(request).revision)); return
-      }
-      if (plans.length === 1 && hasPhase(request, "wave-source", turnId)) {
-        const receipt = acceptedReceipt(request, plans[0], 3)
-        yield* emitWait(request, "wave-source", turnId, receipt.nodes.map(node => node.taskId)); return
-      }
-      if (plans.length === 2 && phaseReady(request, "wave-source", turnId) && !hasPhase(request, "wave-analyst", turnId)) {
-        const receipt = acceptedReceipt(request, plans[1], 4)
+      if (plans.length === 1 && !tailors.length) {
+        const receipt = acceptedReceipt(request, plans[0], 7)
+        const scouts = taskIdsForKeys(receipt, SOURCE_KEYS.filter(key => key.startsWith("scout-")))
+        const analysts = taskIdsForKeys(receipt, ANALYST_KEYS)
+        if (!phaseReady(request, "wave-source", turnId)) {
+          say("TAILOR_ROOT_SOURCE_WAIT_REQUESTED")
+          yield* emitWait(request, "wave-source", turnId, scouts); return
+        }
+        if (!phaseReady(request, "wave-analyst", turnId)) {
+          yield* emitWait(request, "wave-analyst", turnId, analysts); return
+        }
         say("TAILOR_SOURCE_GRAPH_READY 7")
-        yield* emitWait(request, "wave-analyst", turnId, receipt.nodes.map(node => node.taskId)); return
-      }
-      if (plans.length === 2 && hasPhase(request, "wave-analyst", turnId) && !tailors.length) {
-        const receipt = acceptedReceipt(request, plans[1], 4)
-        yield* emitWait(request, "wave-analyst", turnId, receipt.nodes.map(node => node.taskId)); return
-      }
-      if (plans.length === 2 && phaseReady(request, "wave-analyst", turnId) && !tailors.length) {
         yield* emitWave(turnId, "wave1", request, 4); return
       }
       if (tailors.length === 1 && !plans.some(call => call.id === `p3-1336-ordinary-plan:${turnId}`)) {
@@ -201,6 +195,11 @@ function acceptedReceipt(request, call, nodeCount) {
     throw new Error("fixture_plan_receipt_invalid")
   }
   return value
+}
+function taskIdsForKeys(receipt, keys) {
+  const ids = keys.map(key => receipt.nodes.find(node => node?.key === key)?.taskId)
+  if (ids.some(id => typeof id !== "string" || !id) || new Set(ids).size !== keys.length) throw new Error("fixture_source_plan_receipt_invalid")
+  return ids
 }
 function acceptedTailorReceipt(request, call, nodeCount) {
   const result = fixtureToolResult(request, call), value = result?.value
