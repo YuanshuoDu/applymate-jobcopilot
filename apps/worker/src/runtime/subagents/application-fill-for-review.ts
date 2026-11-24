@@ -15,7 +15,7 @@ import { checkRateLimit } from "../../rate-limit.js"
 import type { ObjectiveReviewedApplicationFillReadback, ReviewedApplicationFillReadback } from "../../db/reviewed-application-fill-completion.js"
 import { claimApplicationFillBrowserStart, reviewedApplicationFillSelector, type BrowserStartClaim } from "../reviewed-application-fill-binding.js"
 import { buildApplicationFillInput, isAllowedDestination, urlPattern, type ApplicationFillContext } from "../application-fill-preparation.js"
-import { readObjectiveReviewedApplicationFillSourceFromPool } from "../objective-reviewed-application-fill-read.js"
+import type { ObjectiveReviewedApplicationFillEvidence } from "../objective-reviewed-application-fill-read.js"
 import { objectiveReviewedMaterialWasFilled, reviewedMaterialWasFilled } from "./application-fill-reviewed-readback.js"
 import type { SubagentExecutionResult, SubagentLease } from "./types.js"
 type WaitDetail = "captcha_required" | "authentication_required" | "mfa_required" | "unknown_sensitive_field" | "required_field" | "stale_review" | "review_required" | "fill_outcome_uncertain" | "unattended_apply_unavailable" | "cancelled"; type WaitCheckpoint = "fill_outcome_uncertain" | "form_answer_required"
@@ -45,7 +45,7 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
   if (!context || !matchesLeaseScope(context, lease)) return failed("fill_scope_mismatch")
   const reviewedSelector = reviewedApplicationFillSelector(context.turnInput)
   if (reviewedSelector.kind === "invalid") return failed("fill_reviewed_source_invalid")
-  let objectiveEvidence: Awaited<ReturnType<typeof readObjectiveReviewedApplicationFillSourceFromPool>> = undefined
+  let objectiveEvidence: ObjectiveReviewedApplicationFillEvidence | undefined
   const observeAcquisitionPhase = (phase: ApplicationFillAcquisitionPhase) => {
     if (reviewedSelector.kind === "selected" || reviewedSelector.kind === "objective") observeStage(input.stageObserver, { stage: "browser_acquisition", phase })
   }
@@ -60,6 +60,7 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
   if (context.checkpoint !== "taskgraph_fill_queued") return failed("fill_checkpoint_invalid")
   if (!["running", "waiting_for_user"].includes(context.sessionStatus) || !["in_progress", "waiting_for_user", "waiting_for_dependency"].includes(context.turnStatus)) return failed("fill_turn_inactive")
   if (reviewedSelector.kind === "objective") {
+    const { readObjectiveReviewedApplicationFillSourceFromPool } = await import("../objective-reviewed-application-fill-read.js")
     objectiveEvidence = await readObjectiveReviewedApplicationFillSourceFromPool(pool, { userId: lease.userId,
       sessionId: lease.sessionId, fillTurnId: lease.turnId, applicationTaskId: context.applicationTaskId,
       jobId: context.jobId, turnInput: context.turnInput, phase: "prepare" })

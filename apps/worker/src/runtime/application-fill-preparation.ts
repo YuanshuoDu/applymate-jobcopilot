@@ -5,7 +5,7 @@ import type { FlowType } from "../flows/index.js"
 import { OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA, parseObjectiveReviewedFillSource } from "@jobcopilot/shared"
 import { acquireSourceMaterialFence } from "../db/source-material-fence.js"
 import { reviewedApplicationFillSelector } from "./reviewed-application-fill-binding.js"
-import { readObjectiveReviewedApplicationFillSource } from "./objective-reviewed-application-fill-read.js"
+import type { ObjectiveReviewedApplicationFillEvidence } from "./objective-reviewed-application-fill-read.js"
 
 /** A positive marker carries no ApplicationTask identity into model-visible context. */
 export type ApplicationFillPreparation = Readonly<{ available: true }>
@@ -76,7 +76,8 @@ export async function loadApplicationFillPreparation(
       const source = parseObjectiveReviewedFillSource(task.turnInput)
       if (!source) throw new Error("objective_application_fill_unavailable")
       await acquireSourceMaterialFence(client, [lease.userId])
-      const evidence = await readObjectiveReviewedApplicationFillSource(client, { userId: lease.userId,
+      const { readObjectiveReviewedApplicationFillSource } = await import("./objective-reviewed-application-fill-read.js")
+      const evidence: ObjectiveReviewedApplicationFillEvidence | undefined = await readObjectiveReviewedApplicationFillSource(client, { userId: lease.userId,
         sessionId: lease.sessionId, fillTurnId: lease.turnId, applicationTaskId: task.id, jobId: task.jobId,
         turnInput: task.turnInput, phase: "prepare", now })
       if (!evidence || evidence.source.approvalId !== source.approvalId

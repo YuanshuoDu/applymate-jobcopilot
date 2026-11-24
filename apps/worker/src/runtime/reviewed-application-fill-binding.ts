@@ -5,7 +5,7 @@ import { OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA, canonicalJson,
 import { acquireSourceMaterialFence } from "../db/source-material-fence.js"
 import type { SelectedJobReviewedArtifact } from "./selected-job-reviewed-artifact-read.js"
 import type { SubagentLease } from "./subagents/types.js"
-import { readObjectiveReviewedApplicationFillSource, type ObjectiveReviewedApplicationFillEvidence } from "./objective-reviewed-application-fill-read.js"
+import type { ObjectiveReviewedApplicationFillEvidence } from "./objective-reviewed-application-fill-read.js"
 
 const SELECTOR_SCHEMA = "agent-harness.v2.selected-job-reviewed-fill-source.v1"
 const BINDING_SCHEMA = "agent-harness.v2.reviewed-application-fill-browser-start.v1"
@@ -103,11 +103,15 @@ export async function claimApplicationFillBrowserStart(input: {
        AND "type"='reviewed_application_fill_browser_started' AND "data"->>'fillTurnId'=$2 LIMIT 2`, [app.rows[0]!.id, lease.turnId])
     if (prior.rows.length !== 0) return await txResult(client, "ROLLBACK", { status: "conflict" })
     let objectiveEvidence: ObjectiveReviewedApplicationFillEvidence | undefined
+    if (expectedSelector.kind === "objective") {
+      const { readObjectiveReviewedApplicationFillSource } = await import("./objective-reviewed-application-fill-read.js")
+      objectiveEvidence = await readObjectiveReviewedApplicationFillSource(client, {
+        userId: lease.userId, sessionId: lease.sessionId, fillTurnId, applicationTaskId: input.applicationTaskId,
+        jobId: input.jobId, turnInput: turn.rows[0]!.input, phase: "browser_start" })
+    }
     const reviewedMaterial = expectedSelector.kind === "selected"
       ? await readCurrentReviewedMaterial(client, lease, input.jobId, expectedSelector.sourceTurnId)
-      : expectedSelector.kind === "objective" ? (objectiveEvidence = await readObjectiveReviewedApplicationFillSource(client, {
-        userId: lease.userId, sessionId: lease.sessionId, fillTurnId, applicationTaskId: input.applicationTaskId,
-        jobId: input.jobId, turnInput: turn.rows[0]!.input, phase: "browser_start" }), objectiveEvidence?.reviewedArtifact) : undefined
+      : objectiveEvidence?.reviewedArtifact
     if (expectedSelector.kind === "selected" && !reviewedMaterial || expectedSelector.kind === "objective"
       && (!objectiveEvidence || !input.expectedObjectiveResumeWitness
         || canonicalJson(objectiveEvidence.resumeWitness) !== canonicalJson(input.expectedObjectiveResumeWitness))) {
