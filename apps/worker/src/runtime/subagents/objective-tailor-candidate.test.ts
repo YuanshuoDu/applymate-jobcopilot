@@ -5,6 +5,7 @@ import { taskGraphItemId, parseTaskGraphSnapshot, taskGraphState } from "./task-
 import { scheduledDraftJobMaterialDigest } from "./scheduled-draft-job-material.js"
 import { buildObjectiveTailorCandidateCatalog, resolveObjectiveTailorCandidate, revalidateObjectiveTailorCandidateWitness } from "./objective-tailor-candidate.js"
 import { bindObjectiveTailorCandidateWitness } from "./objective-tailor-witness.js"
+import { objectiveTailorNodeKeysForCandidate } from "./objective-task-graph-child-authority.js"
 import type { GraphIdentityScope, LoadedGraph } from "./task-graph-pg-state.js"
 
 const mocks = vi.hoisted(() => ({ proof: vi.fn(), dataSource: vi.fn(), getJob: vi.fn(), digest: vi.fn() }))
@@ -149,7 +150,8 @@ describe("ordinary Objective tailor candidate admission", () => {
     const initial = setup([{ jobId, score: 8 }])
     const catalog = await buildObjectiveTailorCandidateCatalog(initial.client as never, scope, initial.loaded)
     const selection = await resolveObjectiveTailorCandidate(initial.client as never, scope, initial.loaded, 4, catalog!.candidates[0]!.candidateRef)
-    const witness = bindObjectiveTailorCandidateWitness(selection!, { writerNodeKey: "tailor-writer", reviewerNodeKey: "tailor-reviewer", admittedRevision: 5 })!
+    const keys = objectiveTailorNodeKeysForCandidate(selection!.candidateRef)!
+    const witness = bindObjectiveTailorCandidateWitness(selection!, { ...keys, admittedRevision: 5 })!
     const original = initial.loaded.snapshot!
     const snapshot = parseTaskGraphSnapshot({ ...original, nodes: [...original.nodes,
       { key: witness.writerNodeKey, taskId: "writer-task", templateId: "cover_letter_writer", goal: "Tailor current candidate",

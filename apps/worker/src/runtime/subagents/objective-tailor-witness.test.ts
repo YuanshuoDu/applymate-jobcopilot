@@ -5,6 +5,7 @@ import {
   parseObjectiveTailorCandidateSelection,
   parseObjectiveTailorCandidateWitness,
 } from "./objective-tailor-witness.js"
+import { objectiveTailorNodeKeysForCandidate } from "./objective-task-graph-child-authority.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
 
 const scope: GraphIdentityScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
@@ -13,12 +14,17 @@ const selection = () => makeObjectiveTailorCandidateSelection({ scope, sourceGra
   sourceStatusDigest: "b".repeat(64), analystProofDigest: "c".repeat(64),
   candidate: { jobId: "f47ac10b-58cc-4372-a567-0e02b2c3d479", score: 8.5, materialDigest: `sha256:${"d".repeat(64)}` },
   sourceAnalystKeys: ["analyst-a", "analyst-b"] })!
+function pair(admittedRevision = 5) {
+  const selected = selection(), keys = objectiveTailorNodeKeysForCandidate(selected.candidateRef)!
+  return { selected, binding: { ...keys, admittedRevision } }
+}
 
 describe("objective tailor candidate witness", () => {
   it("creates a closed witness binding source proof, selected candidate and admitted pair revision", () => {
-    const witness = bindObjectiveTailorCandidateWitness(selection(), { writerNodeKey: "tailor-writer", reviewerNodeKey: "tailor-reviewer", admittedRevision: 5 })
+    const { selected, binding } = pair()
+    const witness = bindObjectiveTailorCandidateWitness(selected, binding)
     expect(witness).toMatchObject({ candidateRef: selection().candidateRef, sourceGraphRevision: 4, admittedRevision: 5,
-      writerNodeKey: "tailor-writer", reviewerNodeKey: "tailor-reviewer", sourceAnalystKeys: ["analyst-a", "analyst-b"] })
+      writerNodeKey: binding.writerNodeKey, reviewerNodeKey: binding.reviewerNodeKey, sourceAnalystKeys: ["analyst-a", "analyst-b"] })
     expect(parseObjectiveTailorCandidateWitness(witness)).toEqual(witness)
     expect(parseObjectiveTailorCandidateSelection(selection())).toEqual(selection())
   })
@@ -27,10 +33,15 @@ describe("objective tailor candidate witness", () => {
     { writerNodeKey: "tailor-writer", reviewerNodeKey: "tailor-reviewer", admittedRevision: 6 },
     { writerNodeKey: "analyst-a", reviewerNodeKey: "tailor-reviewer", admittedRevision: 5 },
     { writerNodeKey: "tailor-writer", reviewerNodeKey: "tailor-writer", admittedRevision: 5 },
-  ])("rejects a pair that is not a new exact successor", pair => expect(bindObjectiveTailorCandidateWitness(selection(), pair)).toBeUndefined())
+  ])("rejects a pair that is not a new exact successor", invalidPair => {
+    const { selected, binding } = pair()
+    expect(bindObjectiveTailorCandidateWitness(selected, invalidPair)).toBeUndefined()
+    expect(bindObjectiveTailorCandidateWitness(selected, binding)).toBeDefined()
+  })
 
   it("rejects unknown fields, altered refs, malformed evidence, and noncanonical key order", () => {
-    const witness = bindObjectiveTailorCandidateWitness(selection(), { writerNodeKey: "tailor-writer", reviewerNodeKey: "tailor-reviewer", admittedRevision: 5 })!
+    const { selected, binding } = pair()
+    const witness = bindObjectiveTailorCandidateWitness(selected, binding)!
     expect(parseObjectiveTailorCandidateWitness({ ...witness, extra: true })).toBeUndefined()
     expect(parseObjectiveTailorCandidateWitness({ ...witness, candidateRef: "unknown" })).toBeUndefined()
     expect(parseObjectiveTailorCandidateWitness({ ...witness, analystProofDigest: "not-a-digest" })).toBeUndefined()
