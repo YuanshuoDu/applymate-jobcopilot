@@ -1,6 +1,7 @@
 import { Prisma } from "@prisma/client"
 
 import { ACTIVE_TURN_STATUSES } from "../control-plane/commands/transaction"
+import { assertNotObjectiveApprovalSetMember } from "./objective-approval-set-member-guard"
 import { ApprovalStoreError, type ApprovalDecision } from "./types"
 
 type Tx = Prisma.TransactionClient
@@ -97,9 +98,10 @@ export async function resolvePendingApprovalInTransaction(
 ): Promise<ResolvedApprovalRow> {
   const row = await tx.agentApproval.findFirst({
     where: { id: input.id, userId: input.userId, sessionId: input.sessionId },
-    select: { id: true, sessionId: true, taskId: true, userId: true, turnId: true, toolCallId: true, type: true, status: true, scopeHash: true, revision: true, expiresAt: true },
+    select: { id: true, sessionId: true, taskId: true, userId: true, turnId: true, toolCallId: true, type: true, status: true, scopeHash: true, revision: true, expiresAt: true, payload: true },
   })
   if (!row) throw new ApprovalStoreError("approval_not_found", "Approval receipt was not found")
+  assertNotObjectiveApprovalSetMember(row.payload)
   const turnId = row.turnId
   if (typeof turnId !== "string" || turnId.length === 0) throw new ApprovalStoreError("approval_integrity_error", "Legacy approval records cannot become scoped receipts")
   if (row.status !== "pending") throw new ApprovalStoreError(row.status === "consumed" ? "approval_already_consumed" : "approval_not_approved", "Approval receipt is no longer pending")
@@ -110,5 +112,9 @@ export async function resolvePendingApprovalInTransaction(
     data: { status: input.decision, decidedAt: input.now },
   })
   if (updated.count !== 1) throw new ApprovalStoreError("approval_not_approved", "Approval receipt resolution raced with another decision")
-  return { ...row, turnId }
+  return {
+    id: row.id, sessionId: row.sessionId, taskId: row.taskId, userId: row.userId, turnId,
+    toolCallId: row.toolCallId, type: row.type, status: row.status, scopeHash: row.scopeHash,
+    revision: row.revision, expiresAt: row.expiresAt,
+  }
 }

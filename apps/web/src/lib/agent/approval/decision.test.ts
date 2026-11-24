@@ -12,6 +12,7 @@ function makeTransaction(
   freshness: FreshnessState = { hasRequest: true, hasGoalRevision: false },
   sessionPresent = true,
   turnStatus = "in_progress",
+  payload: unknown = { jobId: "job_1" },
 ) {
   const row = {
     id: "approval_1",
@@ -22,6 +23,7 @@ function makeTransaction(
     toolCallId: "call_1",
     type: "submit_application",
     status,
+    payload,
     scopeHash: "scope_hash",
     revision: 3,
     expiresAt: new Date("2026-09-01T01:00:00.000Z"),
@@ -85,12 +87,26 @@ describe("Web pending approval freshness", () => {
   it("resolves a fresh pending approval after locking its session", async () => {
     const fake = makeTransaction()
 
-    await expect(resolvePendingApprovalInTransaction(fake.tx, input)).resolves.toMatchObject({ id: input.id, status: "pending" })
+    const result = await resolvePendingApprovalInTransaction(fake.tx, input)
+    expect(result).toMatchObject({ id: input.id, status: "pending" })
+    expect(result).not.toHaveProperty("payload")
     expect(fake.tx.agentApproval.updateMany).toHaveBeenCalledWith({
       where: expect.objectContaining({ id: input.id, status: "pending", revision: 3 }),
       data: { status: "approved", decidedAt: NOW },
     })
     expect(fake.tx.$queryRaw).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    { schema: "objective-application-approval-set-member.v1" },
+    { schema: "objective-application-approval-set-member.v99" },
+    { schema: "objective-application-approval-set-member." },
+  ])("blocks grouped approval member payloads before legacy decision effects", async payload => {
+    const fake = makeTransaction("pending", undefined, true, "in_progress", payload)
+
+    await expect(resolvePendingApprovalInTransaction(fake.tx, input)).rejects.toMatchObject({ code: "approval_not_approved" })
+    expect(fake.tx.agentApproval.updateMany).not.toHaveBeenCalled()
+    expect(fake.tx.$queryRaw).not.toHaveBeenCalled()
   })
 
   it("preserves consumed receipt replay semantics without a freshness read", async () => {

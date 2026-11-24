@@ -4,7 +4,7 @@ import type { Prisma, PrismaClient } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
 
 import { cancelPendingWaitsInTransaction } from "../broker/interrupt"
-import { consumeApproval, consumeApprovalAndReserve, issueApprovalReceipt, validateApproval, validatePendingApprovalReceipt } from "./store"
+import { consumeApproval, consumeApprovalAndReserve, issueApprovalReceipt, resolveApproval, validateApproval, validatePendingApprovalReceipt } from "./store"
 import { reissueApprovalNonce } from "./receipt-rotation"
 import { protocolScope, ApprovalStoreError, type ApprovalScopeInput } from "./types"
 
@@ -680,6 +680,40 @@ describe("Web approval receipt store", () => {
 
     await expect(validatePendingApprovalReceipt(db, row.id, { ...scopeInput, nonce: "nonce_1" }, timeAt(1))).resolves.toMatchObject({ id: row.id, status: "pending" })
     await expect(validatePendingApprovalReceipt(db, row.id, { ...scopeInput, nonce: "wrong_nonce" }, timeAt(1))).rejects.toMatchObject({ code: "approval_nonce_mismatch" })
+  })
+
+  it.each([
+    "objective-application-approval-set-member.v1",
+    "objective-application-approval-set-member.v99",
+    "objective-application-approval-set-member.",
+  ])("blocks generic approval operations for reserved marker %s", async schema => {
+    const pendingRow = {
+      ...(await approvalRow()),
+      status: "pending",
+      payload: { schema, setId: "private-set" },
+    }
+    const pending = mockDb(pendingRow)
+    const approvalInput = { ...scopeInput, nonce: "nonce_1" }
+
+    await expect(validatePendingApprovalReceipt(pending.db, pendingRow.id, approvalInput, timeAt(1))).rejects.toMatchObject({ code: "approval_not_approved" })
+    await expect(resolveApproval(pending.db, { id: pendingRow.id, userId: pendingRow.userId, sessionId: pendingRow.sessionId, decision: "approved", now: timeAt(1) }))
+      .rejects.toMatchObject({ code: "approval_not_approved" })
+    await expect(reissueApprovalNonce(pending.db, { approvalId: pendingRow.id, sessionId: pendingRow.sessionId, userId: pendingRow.userId }))
+      .rejects.toMatchObject({ code: "approval_not_approved" })
+
+    const approvedRow = { ...pendingRow, status: "approved" }
+    const approved = mockDb(approvedRow)
+    await expect(validateApproval(approved.db, approvedRow.id, approvalInput, timeAt(1))).rejects.toMatchObject({ code: "approval_not_approved" })
+    await expect(consumeApprovalAndReserve(approved.db, approvedRow.id, approvalInput, { idempotencyKey: "submit:task_1" }, timeAt(1)))
+      .rejects.toMatchObject({ code: "approval_not_approved" })
+
+    for (const { tx } of [pending, approved]) {
+      expect(tx.agentApproval.updateMany).not.toHaveBeenCalled()
+      expect(tx.agentActionReservation.create).not.toHaveBeenCalled()
+      expect(tx.agentEvent.create).not.toHaveBeenCalled()
+      expect(tx.agentItem.update).not.toHaveBeenCalled()
+      expect(tx.$queryRaw).not.toHaveBeenCalled()
+    }
   })
 
   it("consumes exactly one approved receipt with its external reservation in one transaction", async () => {

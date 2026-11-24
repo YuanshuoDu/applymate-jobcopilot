@@ -3,6 +3,7 @@ import { createApprovalNonce, hashApprovalNonce, hashApprovalScope, type Approva
 
 import { waitItemId } from "../broker/item-ids"
 import { appendAgentEventWithOutboxInTransaction } from "../session/fact-store"
+import { assertNotObjectiveApprovalSetMember } from "./objective-approval-set-member-guard"
 import { ApprovalStoreError, protocolScope } from "./types"
 
 type ApprovalRow = Prisma.AgentApprovalGetPayload<{}>
@@ -27,6 +28,7 @@ export async function reissueApprovalNonce(
       where: { id: input.approvalId, sessionId: input.sessionId, userId: input.userId },
     })
     if (!row) throw new ApprovalStoreError("approval_not_found", "Approval receipt was not found")
+    assertNotObjectiveApprovalSetMember(row.payload)
     if (row.status !== "pending") throw new ApprovalStoreError("approval_not_approved", "Approval receipt is no longer pending")
     if (!row.turnId || !row.toolCallId || !row.jobId || !row.resourceHash || !row.materialHash || !row.answersHash || !row.scopeHash || !row.expiresAt || !row.nonceHash) {
       throw new ApprovalStoreError("approval_integrity_error", "Approval receipt is missing its immutable scope")

@@ -10,6 +10,7 @@ import {
 
 import { appendAgentEventWithOutboxInTransaction } from "../session/fact-store"
 import { assertApprovalFreshnessInTransaction, resolvePendingApprovalInTransaction } from "./decision"
+import { assertNotObjectiveApprovalSetMember } from "./objective-approval-set-member-guard"
 import {
   mapReplayApproval,
   scopeFromRow,
@@ -43,6 +44,7 @@ function mapApproval(row: ApprovalRow): AgentApproval {
 async function loadApproval(reader: ApprovalReader, id: string, userId: string): Promise<ApprovalRow> {
   const row = await reader.agentApproval.findFirst({ where: { id, userId } })
   if (!row) throw new ApprovalStoreError("approval_not_found", "Approval receipt was not found")
+  assertNotObjectiveApprovalSetMember(row.payload)
   return row
 }
 

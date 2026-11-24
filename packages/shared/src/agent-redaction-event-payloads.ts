@@ -81,8 +81,58 @@ export function validQuestionSourceEnvelope(type: string, payload: Row, route: R
     && route.itemId === `agent-wait:question:${source.id}` && route.correlationId === route.itemId && route.causationId === source.id
 }
 
+function approvalSetItemId(value: unknown, guards: AgentEventPayloadGuards): value is string {
+  return typeof value === "string" && value.startsWith("agent-wait:approval-set:")
+    && guards.opaqueId(value) && guards.opaqueId(value.slice("agent-wait:approval-set:".length))
+}
+
+function validApprovalSetEvent(type: string, row: Row, route: Route, guards: AgentEventPayloadGuards): string[] | null {
+  if (type === "approval.expired") {
+    const groupItemId = route.causationId
+    const base = ["approvalId", "action", "revision"]
+    const withDecision = [...base, "requestedDecision", "expectedTurnRevision"]
+    const baseShape = exactPayloadKeys(row, base)
+    if (!approvalSetItemId(groupItemId, guards) || route.itemId !== null
+      || (!baseShape && !exactPayloadKeys(row, withDecision))) return null
+    const decisionPair = baseShape || (row.requestedDecision === "approved" || row.requestedDecision === "rejected")
+      && Number.isSafeInteger(row.expectedTurnRevision) && (row.expectedTurnRevision as number) >= 0
+    return guards.opaqueId(row.approvalId) && row.approvalId === route.correlationId
+      && row.action === "review_application" && Number.isSafeInteger(row.revision) && (row.revision as number) >= 0
+      && decisionPair && guards.nullableId(route.taskId) && route.actor === "system"
+      && route.outboxTopic === "agent.session.event" ? ["approvalId"] : null
+  }
+  const itemId = row.itemId
+  if (!approvalSetItemId(itemId, guards) || itemId !== route.itemId) return null
+  if (type === "approval.resolved" && exactPayloadKeys(row, ["waitKind", "waitId", "itemId", "turnId", "toolCallId", "status", "nextTurnRevision"])) {
+    return row.waitKind === "approval" && guards.opaqueId(row.waitId) && row.waitId === route.correlationId
+      && row.turnId === route.turnId && guards.opaqueId(row.toolCallId)
+      && (row.status === "approved" || row.status === "rejected")
+      && Number.isSafeInteger(row.nextTurnRevision) && (row.nextTurnRevision as number) >= 1
+      && guards.nullableId(route.taskId) && route.actor === "user"
+      && route.causationId === itemId && route.outboxTopic === "agent.session.event"
+      ? ["waitId", "itemId", "turnId", "toolCallId"] : null
+  }
+  if (type === "item.completed" && exactPayloadKeys(row, ["itemId", "status"])) {
+    return row.status === "completed" && route.taskId === null && route.actor === "orchestrator"
+      && route.correlationId === itemId && route.causationId === itemId && route.outboxTopic === "agent.session.event"
+      ? ["itemId"] : null
+  }
+  if (type === "turn.wakeup" && exactPayloadKeys(row, ["waitKind", "waitId", "itemId", "turnId", "toolCallId", "status", "nextTurnRevision"])) {
+    return row.waitKind === "approval_set" && guards.opaqueId(row.waitId)
+      && itemId === `agent-wait:approval-set:${row.waitId}` && row.turnId === route.turnId
+      && row.toolCallId === null && row.status === "resolved"
+      && Number.isSafeInteger(row.nextTurnRevision) && (row.nextTurnRevision as number) >= 1
+      && route.taskId === null && route.actor === "user" && route.correlationId === route.turnId
+      && guards.opaqueId(route.causationId) && route.outboxTopic === "agent.turn.wakeup"
+      ? ["waitId", "itemId", "turnId", "toolCallId"] : null
+  }
+  return null
+}
+
 export function validatedPayloadFields(type: string, payload: Row, route: Route, guards: AgentEventPayloadGuards): string[] | null {
   const known = knownAgentEventPayloadFields(type, payload, route, guards.opaqueId)
+  const approvalSet = validApprovalSetEvent(type, payload, route, guards)
+  if (approvalSet) return approvalSet
   // Only the exact broker receipt contract may whitelist its false availability bit.
   if (type === "approval.resolved" && payload.waitKind === "approval" && payload.answerAvailable === false
     && exactPayloadKeys(payload, ["waitKind", "waitId", "itemId", "turnId", "toolCallId", "status", "nextTurnRevision", "answerAvailable"])

@@ -51,6 +51,17 @@ export {
 } from './verified-shortlist-selection.js'
 export type { VerifiedShortlistSelectionBinding, VerifiedShortlistSourceIdentity } from './verified-shortlist-selection.js'
 export {
+  OBJECTIVE_APPLICATION_APPROVAL_SET_SCHEMA,
+  objectiveApplicationApprovalSetItemId,
+  parseObjectiveApplicationApprovalSet,
+} from './objective-application-approval-set.js'
+export type { ObjectiveApplicationApprovalSet } from './objective-application-approval-set.js'
+export {
+  OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA,
+  parseObjectiveApplicationReviewIntent,
+} from './objective-application-review-intent.js'
+export type { ObjectiveApplicationReviewIntent } from './objective-application-review-intent.js'
+export {
   isSelectedJobBatchTemplateId,
   SELECTED_JOB_BATCH_SLOT_IDS,
   SELECTED_JOB_BATCH_TEMPLATE_CATALOG,

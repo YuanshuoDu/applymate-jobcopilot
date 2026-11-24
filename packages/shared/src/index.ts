@@ -45,6 +45,14 @@ export { normalizeExternalApiErrorCode, sharedExternalApiErrorCode, type Externa
 export { getAzureManagementToken, type AzureManagementTokenCredential } from "./azure-management.js";
 export { canonicalJson, CanonicalJsonError, hashContent } from "./canonical-json.js";
 export {
+  OBJECTIVE_APPLICATION_RESUME_WITNESS_SCHEMA,
+  buildObjectiveApplicationResumeWitness,
+  parseObjectiveApplicationResumeWitness,
+  sameObjectiveApplicationResumeWitness,
+  type ObjectiveApplicationResumeMaterial,
+  type ObjectiveApplicationResumeWitness,
+} from "./agent-objective-application-resume-witness.js";
+export {
   DISCOVERY_PERSONA_BYTE_LIMIT,
   DISCOVERY_PERSONA_FACT_LIMIT,
   DISCOVERY_PERSONA_PROJECTION_SCHEMA,

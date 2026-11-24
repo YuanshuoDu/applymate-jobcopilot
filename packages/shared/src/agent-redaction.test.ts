@@ -1067,3 +1067,77 @@ describe("agent event redaction", () => {
     }
   })
 })
+
+describe("objective approval-set event routing", () => {
+  const approvalId = "70463535-1444-4bba-ae3b-b80578d2dd21"
+  const setId = "70463535-1444-4bba-ae3b-b80578d2dd22"
+  const memberTaskId = "70463535-1444-4bba-ae3b-b80578d2dd23"
+  const completionEventId = "70463535-1444-4bba-ae3b-b80578d2dd24"
+  const groupItemId = `agent-wait:approval-set:${setId}`
+
+  function envelope(type: string, payload: Record<string, unknown>, overrides: Record<string, unknown> = {}) {
+    return {
+      schemaVersion: "agent-harness.v2", id: "70463535-1444-4bba-ae3b-b80578d2dd25", sessionId, turnId,
+      itemId: groupItemId, taskId: memberTaskId, sequence: "7046353541445", type, actor: "user",
+      correlationId: approvalId, causationId: groupItemId, idempotencyKey: "approval-set-event-1",
+      createdAt: "2026-10-06T17:30:00.000Z", payload, ...overrides,
+    }
+  }
+
+  it("preserves only the exact member, completion, and wake identities", () => {
+    const cases = [
+      envelope("approval.resolved", { waitKind: "approval", waitId: approvalId, itemId: groupItemId, turnId,
+        toolCallId, status: "approved", nextTurnRevision: 9 }),
+      envelope("approval.expired", { approvalId, action: "review_application", revision: 2,
+        requestedDecision: "approved", expectedTurnRevision: 8 }, { actor: "system", itemId: null }),
+      envelope("approval.expired", { approvalId, action: "review_application", revision: 2 }, {
+        actor: "system", itemId: null, taskId: null,
+      }),
+      envelope("item.completed", { itemId: groupItemId, status: "completed" }, {
+        taskId: null, actor: "orchestrator", correlationId: groupItemId, causationId: groupItemId,
+      }),
+      envelope("turn.wakeup", { waitKind: "approval_set", waitId: setId, itemId: groupItemId, turnId,
+        toolCallId: null, status: "resolved", nextTurnRevision: 9 }, {
+        taskId: null, actor: "user", correlationId: turnId, causationId: completionEventId,
+      }),
+    ]
+    for (const event of cases) {
+      const once = redactAgentEvent({ type: event.type, body: "", data: event }).data
+      const twice = redactAgentEvent({ type: event.type, body: "", data: once }).data as Record<string, unknown>
+      expect(twice.id).toBe(event.id)
+      expect(twice.itemId).toBe(event.type === "approval.expired" ? null : groupItemId)
+      expect(twice.turnId).toBe(turnId)
+      expect(twice.taskId).toBe(event.taskId)
+      if (event.type === "approval.expired") expect(twice.causationId).toBe(groupItemId)
+      const payload = twice.payload as Record<string, unknown>
+      if (event.type !== "approval.expired") expect(payload.itemId).toBe(groupItemId)
+      if (event.type === "approval.resolved") expect(payload.toolCallId).toBe(toolCallId)
+      if (event.type === "approval.expired") expect(payload.approvalId).toBe(approvalId)
+      if (event.type === "turn.wakeup") expect(payload.waitId).toBe(setId)
+    }
+  })
+
+  it("rejects extra, partial, and route-mismatched member data without preserving IDs", () => {
+    const valid = envelope("approval.expired", { approvalId, action: "review_application", revision: 2 }, { actor: "system", itemId: null })
+    const cases = [
+      { ...valid, payload: { ...(valid.payload as object), answer: "private@example.test" } },
+      { ...valid, payload: { ...(valid.payload as object), requestedDecision: "approved" } },
+      { ...valid, correlationId: setId },
+      envelope("item.completed", { itemId: groupItemId, status: "completed", content: {} }, {
+        taskId: null, actor: "orchestrator", correlationId: groupItemId, causationId: groupItemId,
+      }),
+    ]
+    for (const event of cases) {
+      const safe = redactAgentEvent({ type: event.type, body: "", data: event }).data as Record<string, unknown>
+      expect(safe.id).toBe("[REDACTED]")
+      if (event.type === "approval.expired") {
+        expect(safe.itemId).toBeNull()
+        expect(safe.causationId).toBe("[REDACTED]")
+      } else expect(safe.itemId).toBe("[REDACTED]")
+      const serialized = JSON.stringify(safe)
+      for (const id of [groupItemId, approvalId, setId, memberTaskId, completionEventId])
+        expect(serialized).not.toContain(id)
+      expect(serialized).not.toContain("private@example.test")
+    }
+  })
+})
