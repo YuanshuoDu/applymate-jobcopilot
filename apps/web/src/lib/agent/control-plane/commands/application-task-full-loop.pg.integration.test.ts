@@ -1152,7 +1152,7 @@ const OBJECTIVE_DECISION_ERROR_CODES = new Set([
 
 async function expectObjectiveDecisionAccepted(database: PrismaClient, response: Response, input: {
   turnId: string; approvalId: string; snapshotTurnRevision: unknown; snapshotReceiptRevision: unknown
-  expectedTurnRevision: number; expectedReceiptRevision: number
+  expectedTurnRevision: number; expectedReceiptRevision: unknown
 }): Promise<void> {
   let message = "Objective approval request should be accepted"
   if (response.status !== 202) {

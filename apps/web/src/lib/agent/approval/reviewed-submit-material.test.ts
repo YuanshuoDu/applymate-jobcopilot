@@ -2,10 +2,17 @@ import { hashApprovalNonce, hashApprovalScope, type ApprovalScope } from "@jobco
 import {
   bindReviewedApplicationSubmissionMaterial, buildApplicationSubmissionManifest, hashAgentReceiptValue,
   hashApplicationSubmissionMaterial, isApplicationSubmissionManifest, parseReviewedApplicationFillBrowserStartEvent,
-  REVIEWED_APPLICATION_FILL_BROWSER_START_SCHEMA, REVIEWED_APPLICATION_FILL_SOURCE_SCHEMA,
+  OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA, REVIEWED_APPLICATION_FILL_BROWSER_START_SCHEMA, REVIEWED_APPLICATION_FILL_SOURCE_SCHEMA,
 } from "@jobcopilot/shared"
 import { describe, expect, it, vi } from "vitest"
 import { hashArtifactContent } from "../artifacts/hash"
+
+const authorityMocks = vi.hoisted(() => ({ read: vi.fn() }))
+vi.mock("./objective-reviewed-fill-authority", async importOriginal => {
+  const actual = await importOriginal<typeof import("./objective-reviewed-fill-authority")>()
+  return { ...actual, readObjectiveReviewedFillAuthority: authorityMocks.read }
+})
+
 import { lockReviewedSubmitSourceScope, resolveReviewedSubmitMaterial, sameReviewedSubmitMaterialSnapshot } from "./reviewed-submit-material"
 
 const input = { userId: "user-1", sessionId: "session-1", applicationTaskId: "application-1", jobId: "job-1",
@@ -94,6 +101,29 @@ describe("resolveReviewedSubmitMaterial", () => {
     ])
   })
 
+  it("locks the completed review source and approval set before the Fill and submit scope", async () => {
+    const objectiveSource = { schemaVersion: OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA,
+      approvalId: `objective-review:objective-review-${"d".repeat(40)}:1`, reviewTurnId: "review-turn-1", materialProofHash: "e".repeat(64) }
+    const fillCreatedAt = new Date("2026-11-24T12:00:00.000Z")
+    authorityMocks.read.mockResolvedValueOnce({ jobId: input.jobId, source: objectiveSource })
+    const responses: unknown[][] = [[{ transaction_id: "41" }], [{ transaction_id: "41" }], [{ id: input.sessionId }],
+      [{ id: objectiveSource.reviewTurnId, status: "completed" }],
+      [{ id: input.fillTurnId, status: "waiting_for_approval", createdAt: fillCreatedAt }],
+      [{ id: input.applicationTaskId }], [{ id: input.jobId }], [{ id: input.approvalId }]]
+    const queryRaw = vi.fn(async (_query: unknown) => responses.shift() ?? [])
+    const expected = { mode: "reviewed", ready: true, resourceHash: "a", materialHash: "b", answersHash: "c",
+      objectiveSource, fillTurnCreatedAt: fillCreatedAt }
+    await expect(lockReviewedSubmitSourceScope({ $queryRaw: queryRaw } as never, input, expected as never)).resolves.toBe(true)
+    const statements = queryRaw.mock.calls.slice(2).map(([query]) => query as { sql: string; values: unknown[] })
+    const turnLocks = statements.filter(query => query.sql.includes('FROM "agent_turns"'))
+    expect(turnLocks.map(query => query.values[0])).toEqual([objectiveSource.reviewTurnId, input.fillTurnId])
+    expect(turnLocks[0]?.sql).toContain('"status"')
+    expect(turnLocks[1]?.sql).toContain('"createdAt"')
+    expect(authorityMocks.read).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      approvalId: objectiveSource.approvalId, predecessorTurnId: objectiveSource.reviewTurnId,
+    }), fillCreatedAt)
+  })
+
   it("does not treat a changed proof mode or signed hash as the same material snapshot", () => {
     expect(sameReviewedSubmitMaterialSnapshot({ mode: "legacy" }, { mode: "reviewed", ready: true,
       resourceHash: "r", materialHash: "m", answersHash: "a" })).toBe(false)
@@ -113,7 +143,7 @@ describe("resolveReviewedSubmitMaterial", () => {
     expect(state.fake.applicationTaskEvent.findMany).toHaveBeenCalledWith({ where: { taskId: input.applicationTaskId,
       type: "reviewed_application_fill_browser_started", data: { path: ["fillTurnId"], equals: input.fillTurnId } }, take: 1, select: { id: true } })
     expect([state.fake.agentTurn.findMany.mock.calls.length, state.fake.applicationTaskEvent.findMany.mock.calls.length,
-      state.fake.agentArtifact.findMany.mock.calls.length, state.fake.agentApproval.findMany.mock.calls.length]).toEqual([1, 1, 1, 0])
+      state.fake.agentArtifact.findMany.mock.calls.length, state.fake.agentApproval.findMany.mock.calls.length]).toEqual([1, 2, 1, 0])
     expect(result).toEqual({ mode: "legacy" })
   })
 
@@ -174,6 +204,20 @@ describe("resolveReviewedSubmitMaterial", () => {
     await expect(resolveReviewedSubmitMaterial(state.fake as never, input)).resolves.toEqual({ mode: "unavailable" })
     expect(state.fake.agentArtifact.findMany).toHaveBeenCalledWith({ where: { id: `application:${input.applicationTaskId}`,
       userId: input.userId, jobId: input.jobId }, take: 2, select: { content: true } })
+    expect(state.fake.agentApproval.findMany).not.toHaveBeenCalled()
+  })
+
+  it("does not downgrade an Objective selector without its V3 proof to the selected-job or legacy path", async () => {
+    const state = await fixture()
+    state.fake.applicationTask.findMany.mockResolvedValueOnce([{ ...state.task, status: "waiting_for_authorization", checkpoint: "form_filled" }] as never)
+    state.fake.agentTurn.findMany.mockResolvedValueOnce([{ id: input.fillTurnId, userId: input.userId, sessionId: input.sessionId,
+      source: "user", status: "waiting_for_approval", rootTaskId: fillRootTaskId, executionMode: "canonical_task_graph",
+      createdAt: new Date("2026-11-24T12:00:00.000Z"), input: { reviewedApplicationMaterialSource: {
+        schemaVersion: OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA, approvalId: `objective-review:objective-review-${"d".repeat(40)}:1`,
+        reviewTurnId: "review-turn-1", materialProofHash: "e".repeat(64),
+      } } }] as never)
+    await expect(resolveReviewedSubmitMaterial(state.fake as never, input)).resolves.toEqual({ mode: "unavailable" })
+    expect(state.fake.agentArtifact.findMany).not.toHaveBeenCalled()
     expect(state.fake.agentApproval.findMany).not.toHaveBeenCalled()
   })
 
