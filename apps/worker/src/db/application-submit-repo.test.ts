@@ -5,8 +5,12 @@ import type { ApplicationSubmitIdentity } from "../queue/application-submit-fenc
 
 const identity: ApplicationSubmitIdentity = { sessionId: "session-a", fillTurnId: "turn-a", applicationTaskId: "application-a", userId: "user-a", jobId: "job-a", approvalId: "receipt-a", constraintHash: "c".repeat(64) }
 const savedAttempt: SubmissionAttempt = { id: "attempt-a", userId: identity.userId, jobId: identity.jobId, receiptId: identity.approvalId, constraintHash: identity.constraintHash, artifactHash: "a".repeat(64), state: "reserved", responseRef: null, errorCode: null, createdAt: new Date(), updatedAt: new Date() }
+const objectiveSource = { reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v1",
+  approvalId: `objective-review:objective-review-${"a".repeat(40)}:2`, reviewTurnId: "review-turn-a", materialProofHash: "b".repeat(64) } }
+const objectiveMaterial = { reviewedResumeContent: { basics: { name: "Candidate" } }, reviewedCoverLetter: "Approved letter",
+  confirmedAnswers: { city: "Dublin" }, approvedApplyUrl: "https://boards.greenhouse.io/acme/jobs/123" }
 
-function fixture(options: { fillTurnId?: string; attempt?: SubmissionAttempt | null; turnInputs?: unknown[]; missingInputRows?: boolean } = {}) {
+function fixture(options: { fillTurnId?: string; attempt?: SubmissionAttempt | null; turnInputs?: unknown[]; missingInputRows?: boolean; objectiveEvidence?: boolean } = {}) {
   const calls: Array<{ sql: string; values?: unknown[] }> = []
   const audit: unknown[][] = []
   let attempt = options.attempt ?? null
@@ -19,6 +23,9 @@ function fixture(options: { fillTurnId?: string; attempt?: SubmissionAttempt | n
         const index = inputRead++
         return options.missingInputRows ? { rows: [], rowCount: 0 }
           : { rows: [{ input: options.turnInputs?.[index] ?? {} }], rowCount: 1 }
+      }
+      if (sql.includes('FROM "application_task_events" AS event') && sql.includes('JOIN "application_tasks" AS task')) {
+        return { rows: options.objectiveEvidence ? [{ id: "objective-manifest" }] : [], rowCount: options.objectiveEvidence ? 1 : 0 }
       }
       if (sql.includes('FROM "agent_turns"')) return { rows: [{ id: identity.fillTurnId }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "filler-a" }], rowCount: 1 }
@@ -76,6 +83,62 @@ describe("application submit pg repository", () => {
     expect(fenceIndex).toBeGreaterThan(-1)
     expect(fenceIndex).toBeLessThan(sessionLockIndex)
     expect(authorize).toHaveBeenCalledWith(test.client, "new", { kind: "selected", sourceTurnId: "source-turn" })
+  })
+
+  it("reads and binds the Objective marker under the source fence and returns only a reserved transient packet", async () => {
+    const test = fixture({ turnInputs: [objectiveSource, objectiveSource] })
+    const authorize = vi.fn(async (_client, _mode, source) => source.kind === "objective"
+      ? { kind: "authorized" as const, artifactHash: savedAttempt.artifactHash, objectiveMaterial }
+      : { kind: "fenced" as const })
+    await expect(test.repository.reserveAndConsume(identity, authorize)).resolves.toMatchObject({
+      kind: "reserved", objectiveMaterial, artifactHash: savedAttempt.artifactHash,
+    })
+    const fence = test.calls.findIndex(call => call.sql.includes("pg_advisory_xact_lock"))
+    const firstRowLock = test.calls.findIndex(call => call.sql.includes("FOR UPDATE"))
+    expect(fence).toBeGreaterThan(-1)
+    expect(fence).toBeLessThan(firstRowLock)
+    expect(authorize).toHaveBeenCalledWith(test.client, "new", expect.objectContaining({ kind: "objective", source: objectiveSource.reviewedApplicationMaterialSource }))
+  })
+
+  it("rejects a changed Objective proof marker between the initial hint and locked reread", async () => {
+    const changed = { reviewedApplicationMaterialSource: { ...objectiveSource.reviewedApplicationMaterialSource,
+      materialProofHash: "d".repeat(64) } }
+    const test = fixture({ turnInputs: [objectiveSource, changed] }), authorize = vi.fn()
+    await expect(test.repository.reserveAndConsume(identity, authorize)).resolves.toEqual({ kind: "fenced" })
+    expect(authorize).not.toHaveBeenCalled()
+  })
+
+  it("rejects a changed Objective selector schema between the initial hint and locked reread", async () => {
+    const changed = { reviewedApplicationMaterialSource: { ...objectiveSource.reviewedApplicationMaterialSource,
+      schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v2" } }
+    const test = fixture({ turnInputs: [objectiveSource, changed] }), authorize = vi.fn()
+    await expect(test.repository.reserveAndConsume(identity, authorize)).resolves.toEqual({ kind: "fenced" })
+    expect(authorize).not.toHaveBeenCalled()
+  })
+
+  it("does not downgrade a stripped Objective selector when the current task has a V3 manifest signal", async () => {
+    const test = fixture({ turnInputs: [{}, {}], objectiveEvidence: true }), authorize = vi.fn()
+    await expect(test.repository.reserveAndConsume(identity, authorize)).resolves.toEqual({ kind: "fenced" })
+    expect(authorize).not.toHaveBeenCalled()
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "submission_attempt"'))).toBe(false)
+  })
+
+  it("returns an exact Objective terminal replay after checking the durable receipt, without rereading material", async () => {
+    const existing = { ...savedAttempt, state: "submitted" as const, responseRef: "confirmed" }
+    const test = fixture({ attempt: existing, turnInputs: [objectiveSource, objectiveSource] })
+    const authorize = vi.fn(async () => ({ kind: "authorized" as const, artifactHash: existing.artifactHash }))
+    await expect(test.repository.reserveAndConsume(identity, authorize)).resolves.toEqual({ kind: "replay", attempt: existing, artifactHash: existing.artifactHash })
+    expect(authorize).toHaveBeenCalledWith(test.client, "replay", expect.objectContaining({ kind: "objective" }))
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "submission_attempt"'))).toBe(false)
+  })
+
+  it("keeps a stripped-selector Objective replay read-only after the exact receipt check", async () => {
+    const existing = { ...savedAttempt, state: "submitted" as const, responseRef: "confirmed" }
+    const test = fixture({ attempt: existing, turnInputs: [{}, {}], objectiveEvidence: true })
+    const authorize = vi.fn(async () => ({ kind: "authorized" as const, artifactHash: existing.artifactHash }))
+    await expect(test.repository.reserveAndConsume(identity, authorize)).resolves.toEqual({ kind: "replay", attempt: existing, artifactHash: existing.artifactHash })
+    expect(authorize).toHaveBeenCalledWith(test.client, "replay", { kind: "absent" })
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "submission_attempt"'))).toBe(false)
   })
 
   it("does not authorize a changed selector or a selector whose exact owner row is missing", async () => {

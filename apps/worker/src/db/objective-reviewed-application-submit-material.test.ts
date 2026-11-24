@@ -30,9 +30,10 @@ const leaseExpiresAt = "2026-11-24T11:30:00.000Z"
 
 async function fixture(options: { phase?: "authorize" | "marker" | "boundary"; answers?: unknown; eventData?: unknown;
   eventRows?: unknown[]; task?: Record<string, unknown>; filler?: Record<string, unknown>;
+  jobUrl?: unknown; jobRows?: Array<{ url: string }>;
   browserEvent?: { actor?: string; data?: unknown; createdAt?: Date | string } } = {}) {
   const phase = options.phase ?? "authorize"
-  const task = { resumeId: resumeWitness.resumeId, coverLetterId: null, confirmedAnswers: options.answers ?? { name: "Candidate" },
+  const task = { resumeId: resumeWitness.resumeId, coverLetterId: null, confirmedAnswers: options.answers === undefined ? { name: "Candidate" } : options.answers,
     status: "filling", checkpoint: phase === "boundary" ? "submission_request_started" : "browser_active", ...options.task }
   const filler = { id: "filler-1", attemptCount: 2, ...options.filler }
   const binding = browserData({ fillerTaskId: String(filler.id), attemptCount: Number(filler.attemptCount) })
@@ -41,6 +42,7 @@ async function fixture(options: { phase?: "authorize" | "marker" | "boundary"; a
   const query = vi.fn(async (sql: string, values: readonly unknown[] = []) => {
     queries.push({ sql, values })
     if (sql.includes('JOIN "application_tasks" AS task')) return { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "Job"')) return { rows: options.jobRows ?? [{ url: options.jobUrl ?? "https://boards.greenhouse.io/acme/jobs/123" }], rowCount: 1 }
     if (sql.includes('FROM "application_tasks"')) return { rows: [task], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [filler], rowCount: 1 }
     if (sql.includes('FROM "application_task_events"')) return { rows: options.eventRows ?? [event], rowCount: 1 }
@@ -71,9 +73,33 @@ describe("Objective reviewed application submit material", () => {
     const test = await fixture({ phase })
     await expect(readObjectiveReviewedApplicationSubmitMaterial({ client: test.client, identity, turnInput: test.turnInput,
       approval: test.approval, phase })).resolves.toEqual({ artifactHash: test.approval.resourceHash,
-        reviewedCoverLetter: coverLetter, reviewedResumeContent: resumeContent, objectiveSource: source })
+        objectiveSource: source, packet: { reviewedCoverLetter: coverLetter, reviewedResumeContent: resumeContent,
+          confirmedAnswers: { name: "Candidate" }, approvedApplyUrl: "https://boards.greenhouse.io/acme/jobs/123" } })
     expect(mocks.fill).toHaveBeenCalledWith(test.client, expect.objectContaining({ phase, turnInput: test.turnInput }))
-    expect(test.query).toHaveBeenCalledTimes(3)
+    expect(test.query).toHaveBeenCalledTimes(4)
+    const jobQuery = test.queries.find(query => query.sql.includes('FROM "Job"'))
+    expect(jobQuery?.values).toEqual([identity.jobId, identity.userId])
+  })
+
+  it.each(["http://boards.greenhouse.io/acme/jobs/123", "https://user:pass@boards.greenhouse.io/acme/jobs/123", " https://boards.greenhouse.io/acme/jobs/123"])(
+    "rejects a non-canonical approved Job URL without returning a provider packet", async jobUrl => {
+      const test = await fixture({ jobUrl })
+      await expect(readObjectiveReviewedApplicationSubmitMaterial({ client: test.client, identity, turnInput: test.turnInput,
+        approval: test.approval, phase: test.phase })).resolves.toBeNull()
+    })
+
+  it("hashes nullable answers as null but sends an empty closed answer map", async () => {
+    const test = await fixture({ answers: null })
+    const result = await readObjectiveReviewedApplicationSubmitMaterial({ client: test.client, identity, turnInput: test.turnInput,
+      approval: test.approval, phase: test.phase })
+    expect(result?.packet.confirmedAnswers).toEqual({})
+    expect(Object.getPrototypeOf(result?.packet.confirmedAnswers)).toBeNull()
+  })
+
+  it.each(["not-an-object", ["answer"], { city: 12 }, { city: "  " }])("rejects unsupported answer material without projection", async answers => {
+    const test = await fixture({ answers })
+    await expect(readObjectiveReviewedApplicationSubmitMaterial({ client: test.client, identity, turnInput: test.turnInput,
+      approval: test.approval, phase: test.phase })).resolves.toBeNull()
   })
 
   it.each([

@@ -17,10 +17,15 @@ type Input = Readonly<{ client: Client; identity: ApplicationSubmitIdentity; tur
 type Task = Readonly<{ resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown; status: string; checkpoint: string | null }>
 type Filler = Readonly<{ id: string; attemptCount: number }>
 type BrowserEvent = Readonly<{ actor: string; data: unknown; createdAt: Date | string }>
+export type ObjectiveReviewedApplicationSubmitPacket = Readonly<{
+  reviewedResumeContent: unknown
+  reviewedCoverLetter: string
+  confirmedAnswers: Readonly<Record<string, string>>
+  approvedApplyUrl: string
+}>
 export type ObjectiveReviewedApplicationSubmitMaterial = Readonly<{
   artifactHash: string
-  reviewedCoverLetter: string
-  reviewedResumeContent: unknown
+  packet: ObjectiveReviewedApplicationSubmitPacket
   objectiveSource: ObjectiveReviewedFillSource
 }>
 
@@ -46,10 +51,11 @@ export async function readObjectiveReviewedApplicationSubmitMaterial(input: Inpu
       jobId: identity.jobId, fillTurnId: identity.fillTurnId }
     const stored = await readObjectiveSubmissionManifestWithClient(client, scope)
     if (!stored || stored.hash !== `sha256:${approval.resourceHash}`) return null
-    const [task, filler, event] = await Promise.all([
+    const [task, filler, event, job] = await Promise.all([
       readCurrentTask(client, identity, phase), readCompletedFiller(client, identity), readBrowserStart(client, identity),
+      readCurrentJob(client, identity),
     ])
-    if (!task || !filler || !event || event.actor !== "worker") return null
+    if (!task || !filler || !event || event.actor !== "worker" || !job) return null
     const binding = parseObjectiveReviewedApplicationFillBrowserStartEvent(event.data)
     if (!binding || !sameBrowserStart(binding, identity, filler, objectiveSource, evidence, event.createdAt)) return null
     const manifest = stored.manifest, material = manifest.material
@@ -58,13 +64,16 @@ export async function readObjectiveReviewedApplicationSubmitMaterial(input: Inpu
       || task.resumeId !== evidence.resumeWitness.resumeId) return null
     const answerHash = await hashAgentReceiptValue("answers", task.confirmedAnswers ?? null)
     const materialHash = await hashObjectiveApplicationSubmissionMaterial(material)
+    const confirmedAnswers = projectConfirmedAnswers(task.confirmedAnswers)
     const reviewed = await bindReviewedApplicationSubmissionMaterial({ applicationTaskId: identity.applicationTaskId,
       jobId: identity.jobId, resumeId: task.resumeId, coverLetterId: task.coverLetterId }, binding.proof)
     if (!answerHash || answerHash !== manifest.answersHash || answerHash !== approval.answersHash
       || !materialHash || materialHash !== approval.materialHash || manifest.answersHash !== approval.answersHash
-      || !reviewed || reviewed.reviewedCoverLetterHash !== material.reviewedCoverLetterHash) return null
-    return { artifactHash: approval.resourceHash, reviewedCoverLetter: evidence.reviewedArtifact.content,
-      reviewedResumeContent: evidence.resumeContent, objectiveSource }
+      || !reviewed || reviewed.reviewedCoverLetterHash !== material.reviewedCoverLetterHash || !confirmedAnswers) return null
+    return { artifactHash: approval.resourceHash, objectiveSource, packet: {
+      reviewedCoverLetter: evidence.reviewedArtifact.content, reviewedResumeContent: evidence.resumeContent,
+      confirmedAnswers, approvedApplyUrl: job.url,
+    } }
   } catch { return null }
 }
 
@@ -92,6 +101,34 @@ async function readCurrentTask(client: Client, identity: ApplicationSubmitIdenti
   [identity.applicationTaskId, identity.userId, identity.sessionId, identity.jobId, identity.fillTurnId])
   const task = result.rows[0]
   return result.rows.length === 1 && task && task.status === "filling" && task.checkpoint === checkpoint ? task : null
+}
+
+async function readCurrentJob(client: Client, identity: ApplicationSubmitIdentity): Promise<{ url: string } | null> {
+  const result = await client.query<{ url: string }>(`SELECT url FROM "Job" WHERE "id"=$1 AND "userId"=$2 FOR SHARE`, [identity.jobId, identity.userId])
+  const url = result.rows[0]?.url
+  if (result.rows.length !== 1 || typeof url !== "string" || url.length > 2048 || url.trim() !== url) return null
+  try { const parsed = new URL(url); return parsed.protocol === "https:" && !parsed.username && !parsed.password ? { url } : null }
+  catch { return null }
+}
+
+function projectConfirmedAnswers(value: unknown): Readonly<Record<string, string>> | null {
+  if (value === null || value === undefined) return Object.freeze(Object.create(null) as Record<string, string>)
+  if (typeof value !== "object" || Array.isArray(value)) return null
+  try {
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype !== Object.prototype && prototype !== null) return null
+    const keys = Reflect.ownKeys(value)
+    if (keys.length > 65) return null
+    const answers = Object.create(null) as Record<string, string>
+    for (const key of keys) {
+      if (typeof key !== "string" || !key.trim() || key.length > 256) return null
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")
+        || typeof descriptor.value !== "string" || !descriptor.value.trim() || descriptor.value.length > 2000) return null
+      answers[key] = descriptor.value
+    }
+    return Object.freeze(answers)
+  } catch { return null }
 }
 
 async function readCompletedFiller(client: Client, identity: ApplicationSubmitIdentity): Promise<Filler | null> {

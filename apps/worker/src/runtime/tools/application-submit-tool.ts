@@ -4,8 +4,9 @@ import type { AgentApproval } from "@jobcopilot/agent-protocol"
 
 import { assertSubmissionAuthorized } from "../../flows/helpers.js"
 import type { SubmissionRequestIntent } from "../../flows/submission-intent.js"
-import { createApplicationSubmitRepository, type ApplicationTarget, type SubmissionAttempt, type SubmissionClaim, type SubmissionClaimAuthorizer, type SubmissionAttemptWrite } from "../../db/application-submit-repo.js"
+import { createApplicationSubmitRepository, type ApplicationTarget, type SubmissionAttempt, type SubmissionClaim, type SubmissionClaimAuthorizer, type SubmissionAttemptWrite, type SubmissionSourceSelection } from "../../db/application-submit-repo.js"
 import type { ApplicationSubmitIdentity } from "../../queue/application-submit-fence.js"
+import type { ObjectiveReviewedApplicationSubmitPacket } from "../../db/objective-reviewed-application-submit-material.js"
 import { hasReviewedSubmissionArtifact, readReviewedApplicationSubmitMaterial } from "../../db/reviewed-application-submit-material.js"
 import { createPgApprovalStore } from "../approval/pg-store.js"
 import { PgArtifactToolStore } from "./artifact-store-pg.js"
@@ -35,10 +36,15 @@ export interface SubmissionAttemptStore {
 }
 export type ApplicationSubmitProviderResult = { readonly confirmationId: string; readonly postSubmitUrl?: string | null }
 export type ApplicationSubmitProvider = ((input: {
-  readonly target: ApplicationTarget; readonly artifact: ArtifactToolRecord; readonly context: ToolExecutionContext
+  readonly target: ApplicationTarget; readonly artifact?: ArtifactToolRecord; readonly context: ToolExecutionContext
   readonly beforeSubmit: (intent?: SubmissionRequestIntent) => Promise<boolean>
   readonly reviewedCoverLetter?: string
-}) => Promise<ApplicationSubmitProviderResult>) & { readonly acceptsReviewedApplicationMaterial?: true }
+  readonly objectiveMaterial?: ObjectiveReviewedApplicationSubmitPacket
+}) => Promise<ApplicationSubmitProviderResult>) & {
+  readonly acceptsReviewedApplicationMaterial?: true
+  readonly acceptsObjectiveReviewedApplicationMaterial?: true
+  readonly supportsObjectiveApplicationSubmitTarget?: (url: unknown) => boolean
+}
 export type ApplicationSubmitToolDependencies = {
   readonly identity: ApplicationSubmitIdentity; readonly targets: { findTarget(userId: string, applicationTargetId: string): Promise<ApplicationTarget | null> }
   readonly attempts: SubmissionAttemptStore; readonly approvals: SubmissionApprovalStore; readonly artifacts: ArtifactToolStore
@@ -106,7 +112,7 @@ export function createApplicationSubmitTool(deps: ApplicationSubmitToolDependenc
       try {
         const target = await deps.targets.findTarget(identity.userId, value.applicationTargetId)
         if (!target || target.userId !== identity.userId || target.jobId !== identity.jobId || target.id !== identity.jobId) return failed("target_not_found")
-        const authorize: SubmissionClaimAuthorizer = async (client, mode, source) => {
+        const authorize: SubmissionClaimAuthorizer = async (client, mode, source: SubmissionSourceSelection) => {
           if (source.kind === "invalid") return { kind: "fenced" }
           if (source.kind === "absent") {
             if (mode === "new" && await hasReviewedSubmissionArtifact(client, identity)) return { kind: "fenced" }
@@ -114,6 +120,25 @@ export function createApplicationSubmitTool(deps: ApplicationSubmitToolDependenc
               ? await deps.approvals.consumeSubmissionInTransaction(client, identity.approvalId, identity, now)
               : await deps.approvals.inspectSubmissionInTransaction(client, identity.approvalId, identity, now)
             return approval ? { kind: "authorized", artifactHash: approval.scope.resourceHash } : { kind: "fenced" }
+          }
+          if (source.kind === "objective") {
+            if (mode === "new" && deps.submit.acceptsObjectiveReviewedApplicationMaterial !== true) return { kind: "fenced" }
+            const approval = await deps.approvals.inspectSubmissionInTransaction(client, identity.approvalId, identity, now)
+            if (!approval) return { kind: "fenced" }
+            if (mode === "replay") return { kind: "authorized", artifactHash: approval.scope.resourceHash }
+            const { readObjectiveReviewedApplicationSubmitMaterial } = await import("../../db/objective-reviewed-application-submit-material.js")
+            const reviewed = await readObjectiveReviewedApplicationSubmitMaterial({ client, identity,
+              turnInput: { reviewedApplicationMaterialSource: source.source },
+              approval: { resourceHash: approval.scope.resourceHash, materialHash: approval.scope.materialHash, answersHash: approval.scope.answersHash },
+              phase: "authorize", now })
+            if (!reviewed || deps.submit.acceptsObjectiveReviewedApplicationMaterial !== true
+              || deps.submit.supportsObjectiveApplicationSubmitTarget?.(reviewed.packet.approvedApplyUrl) !== true) return { kind: "fenced" }
+            const consumed = await deps.approvals.consumeSubmissionInTransaction(client, identity.approvalId, identity, now)
+            if (!consumed || consumed.scope.resourceHash !== approval.scope.resourceHash
+              || consumed.scope.materialHash !== approval.scope.materialHash || consumed.scope.answersHash !== approval.scope.answersHash) {
+              throw Object.assign(new Error("Objective submission approval changed during validation."), { code: "submission_scope_mismatch" })
+            }
+            return { kind: "authorized", artifactHash: reviewed.artifactHash, objectiveMaterial: reviewed.packet }
           }
           if (mode === "new" && deps.submit.acceptsReviewedApplicationMaterial !== true) return { kind: "fenced" }
           const approval = await deps.approvals.inspectSubmissionInTransaction(client, identity.approvalId, identity, now)
@@ -135,10 +160,16 @@ export function createApplicationSubmitTool(deps: ApplicationSubmitToolDependenc
         if (claim.kind === "fenced") return failed("submission_attempt_fenced")
         if (claim.kind === "replay") return matchesAttempt(claim.attempt, value, identity) ? fromAttempt(claim.attempt) : failed("idempotency_conflict")
         reserved = true
-        const artifact = await readFreshArtifact(deps.artifacts, identity.userId, identity.jobId, claim.artifactHash).catch(() => null)
-        if (!artifact || artifact.ownerUserId !== identity.userId || artifact.jobId !== identity.jobId || !matchesArtifactHash(artifact.hash, claim.artifactHash)) {
-          await deps.attempts.markFailed(identity, "stale_artifact")
-          return failed("stale_artifact")
+        let source: { readonly kind: "objective"; readonly material: ObjectiveReviewedApplicationSubmitPacket }
+          | { readonly kind: "legacy"; readonly artifact: ArtifactToolRecord }
+        if (claim.objectiveMaterial) source = { kind: "objective", material: claim.objectiveMaterial }
+        else {
+          const artifact = await readFreshArtifact(deps.artifacts, identity.userId, identity.jobId, claim.artifactHash).catch(() => null)
+          if (!artifact || artifact.ownerUserId !== identity.userId || artifact.jobId !== identity.jobId || !matchesArtifactHash(artifact.hash, claim.artifactHash)) {
+            await deps.attempts.markFailed(identity, "stale_artifact")
+            return failed("stale_artifact")
+          }
+          source = { kind: "legacy", artifact }
         }
         const beforeSubmit = async (_intent?: SubmissionRequestIntent): Promise<boolean> => !context.signal.aborted && deps.attempts.isCurrent(identity).catch(() => false)
         const authorization = await assertSubmissionAuthorized(beforeSubmit)
@@ -146,9 +177,20 @@ export function createApplicationSubmitTool(deps: ApplicationSubmitToolDependenc
           await deps.attempts.markFailed(identity, "submission_guard_denied")
           return failed("submission_guard_denied")
         }
-        const result = await deps.submit({ target, artifact, context, beforeSubmit,
-          ...(claim.kind === "reserved" && claim.reviewedCoverLetter !== undefined
-            && deps.submit.acceptsReviewedApplicationMaterial === true ? { reviewedCoverLetter: claim.reviewedCoverLetter } : {}) })
+        let result: ApplicationSubmitProviderResult
+        if (source.kind === "objective") {
+          if (deps.submit.acceptsObjectiveReviewedApplicationMaterial !== true
+            || deps.submit.supportsObjectiveApplicationSubmitTarget?.(source.material.approvedApplyUrl) !== true) {
+            await deps.attempts.markFailed(identity, "submission_attempt_fenced")
+            return failed("submission_attempt_fenced")
+          }
+          result = await deps.submit({ target: { ...target, applyUrl: source.material.approvedApplyUrl },
+            context, beforeSubmit, objectiveMaterial: source.material })
+        } else {
+          result = await deps.submit({ target, artifact: source.artifact, context, beforeSubmit,
+            ...(claim.reviewedCoverLetter !== undefined && deps.submit.acceptsReviewedApplicationMaterial === true
+              ? { reviewedCoverLetter: claim.reviewedCoverLetter } : {}) })
+        }
         if (!result.confirmationId.trim()) {
           await deps.attempts.markFailed(identity, "provider_invalid_response")
           return failed("provider_invalid_response")
