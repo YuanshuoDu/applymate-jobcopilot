@@ -1,10 +1,12 @@
 import { Buffer } from "node:buffer"
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, TurnIntentSchema, validate } from "@jobcopilot/agent-protocol"
-import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
+import { TASK_GRAPH_LIMITS, type TaskGraphProposal } from "../planning/task-graph.js"
 import type { SubagentTaskSpec } from "./types.js"
 import type { GraphScope } from "./task-graph-pg-state.js"
 import type { TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
+import { taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
+import { parseObjectiveTailorCandidateWitness, type ObjectiveTailorCandidateWitness } from "./objective-tailor-witness.js"
 import { templatesForInteractiveScoutDelegation } from "./nested-scout-profile.js"
 import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT } from "./task-graph-dependency-context.js"
@@ -54,7 +56,7 @@ function validDependencyContext(value: unknown): boolean {
 
 function registeredObjectiveChildSpec(candidate: Record<string, unknown>): boolean {
   try {
-    return Object.values(REGISTERED_OBJECTIVE_CHILDREN).flat().some(template => {
+    return registeredTailorChildSpec(candidate) || Object.values(REGISTERED_OBJECTIVE_CHILDREN).flat().some(template => {
       const expected = templateProjection(template) as Record<string, unknown> | null
       const context = plainRecord(candidate.context)
       if (!expected || !context) return false
@@ -91,6 +93,91 @@ export function isRegisteredObjectiveTaskGraphChildTemplate(templateId: string, 
   return registered.some(candidate => exactTemplate(template, candidate))
 }
 
+export function isRegisteredObjectiveTailorTaskGraphChildTemplate(templateId: string, template: TaskGraphTaskTemplate): boolean {
+  const context = plainRecord(template.context), witness = context && parseObjectiveTailorCandidateWitness(context.objectiveTailorCandidateWitness)
+  const expected = witness && objectiveTailorPlan(witness)?.templates[templateId]
+  return Boolean(expected && canonicalTaskGraphJson(template) === canonicalTaskGraphJson(expected))
+}
+
+const TAILOR_WRITER_GOAL = "Draft the current cover letter for the server-bound job."
+const TAILOR_REVIEWER_GOAL = "Review only the exact Writer artifact for this server-bound job."
+const TAILOR_REF = /^otc1_[a-f0-9]{64}$/
+
+export function objectiveTailorNodeKeysForCandidate(candidateRef: string): Readonly<{ writerNodeKey: string; reviewerNodeKey: string }> | undefined {
+  if (!TAILOR_REF.test(candidateRef)) return undefined
+  const suffix = candidateRef.slice(5)
+  return { writerNodeKey: `objective-tailor-writer-${suffix}`, reviewerNodeKey: `objective-tailor-reviewer-${suffix}` }
+}
+
+/** Build the only server-owned Writer/Reviewer pair admitted for an ordinary Objective. */
+export function objectiveTailorPlan(witnessValue: unknown): Readonly<{
+  witness: ObjectiveTailorCandidateWitness
+  proposal: TaskGraphProposal
+  templates: Readonly<Record<string, TaskGraphTaskTemplate>>
+}> | undefined {
+  const witness = parseObjectiveTailorCandidateWitness(witnessValue)
+  if (!witness) return undefined
+  const nodeKeys = objectiveTailorNodeKeysForCandidate(witness.candidateRef)
+  if (!nodeKeys || witness.writerNodeKey !== nodeKeys.writerNodeKey || witness.reviewerNodeKey !== nodeKeys.reviewerNodeKey) return undefined
+  const jobId = witness.candidate.jobId
+  const selected = taskGraphTemplatesForSelectedJob({ jobId })
+  const context = { objectiveTailorCandidateMode: true, selectedJobPreparation: { jobId }, objectiveTailorCandidateWitness: witness }
+  const templates = {
+    cover_letter_writer: { ...selected.cover_letter_writer!, context },
+    cover_letter_reviewer: { ...selected.cover_letter_reviewer!, context },
+  }
+  const proposal: TaskGraphProposal = {
+    expectedRevision: witness.sourceGraphRevision,
+    nodes: [
+      { key: witness.writerNodeKey, templateId: "cover_letter_writer", goal: TAILOR_WRITER_GOAL,
+        successCriteria: ["Save one current immutable cover letter artifact."], dependsOn: [...witness.sourceAnalystKeys] },
+      { key: witness.reviewerNodeKey, templateId: "cover_letter_reviewer", goal: TAILOR_REVIEWER_GOAL,
+        successCriteria: ["Persist a review receipt for the exact Writer artifact."], dependsOn: [witness.writerNodeKey] },
+    ],
+  }
+  return { witness, proposal, templates }
+}
+
+/** Recheck the closed pair at the shared create boundary; generic plan calls do not pass this authority. */
+export function objectiveTailorNodeKeys(
+  proposal: TaskGraphProposal, templates: Readonly<Record<string, TaskGraphTaskTemplate>>,
+): ReadonlySet<string> | undefined {
+  const context = plainRecord(templates.cover_letter_writer?.context)
+  const plan = context && objectiveTailorPlan(context.objectiveTailorCandidateWitness)
+  return plan && canonicalTaskGraphJson(plan.proposal) === canonicalTaskGraphJson(proposal)
+    && canonicalTaskGraphJson(plan.templates) === canonicalTaskGraphJson(templates)
+    ? new Set(plan.proposal.nodes.map(node => node.key)) : undefined
+}
+
+function registeredTailorChildSpec(candidate: Record<string, unknown>): boolean {
+  const context = plainRecord(candidate.context)
+  const witness = context && parseObjectiveTailorCandidateWitness(context.objectiveTailorCandidateWitness)
+  const templateId = candidate.role === "writer" && candidate.taskType === "cover_letter_draft" ? "cover_letter_writer"
+    : candidate.role === "reviewer" && candidate.taskType === "cover_letter_review" ? "cover_letter_reviewer" : undefined
+  if (!context || context.objectiveTailorCandidateMode !== true || !witness || !templateId) return false
+  const expectedPair = objectiveTailorPlan(witness), expected = expectedPair?.templates[templateId]
+  if (!expected) return false
+  const actualContext = { ...context }, dependencyContext = actualContext.taskGraphDependencyResults
+  delete actualContext.taskGraphDependencyResults
+  const actual = { ...candidate, context: actualContext }
+  if (canonicalTaskGraphJson(actual) !== canonicalTaskGraphJson(expected)) return false
+  if (templateId === "cover_letter_reviewer") return dependencyContext === undefined
+  return validTailorDependencyContext(dependencyContext, witness)
+}
+
+function validTailorDependencyContext(value: unknown, witness: ObjectiveTailorCandidateWitness): boolean {
+  const context = plainRecord(value)
+  if (!context || Object.keys(context).sort().join(",") !== "items,schemaVersion"
+    || context.schemaVersion !== "agent-harness.v2.task-graph.dependency-evidence"
+    || !Array.isArray(context.items) || context.items.length !== witness.sourceAnalystKeys.length
+    || Reflect.ownKeys(context.items).length !== context.items.length + 1) return false
+  return context.items.every((raw, index) => {
+    const item = plainRecord(raw)
+    return Boolean(item && item.dependencyKey === witness.sourceAnalystKeys[index]
+      && item.role === "analyst" && item.taskStatus === "completed")
+  })
+}
+
 function exactObjectiveIntent(value: unknown): boolean {
   const envelope = record(value)
   if (!envelope || Object.hasOwn(envelope, "input")) return false
@@ -99,6 +186,8 @@ function exactObjectiveIntent(value: unknown): boolean {
     && validate(TurnIntentSchema, intent)
     && canonicalTaskGraphJson(intent) === canonicalTaskGraphJson(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT))
 }
+
+export function isExactObjectiveTaskGraphIntent(value: unknown): boolean { return exactObjectiveIntent(value) }
 
 function record(value: unknown): Record<string, unknown> | null {
   return plainRecord(value)

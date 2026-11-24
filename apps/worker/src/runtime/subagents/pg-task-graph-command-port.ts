@@ -12,6 +12,7 @@ import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } fro
 import type { TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
 import type { TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
 import type { TaskGraphDiscoveryRecoveryPageRequest } from "./task-graph-discovery-recovery-page-contract.js"
+import { appendObjectiveTailor as appendTailor, readObjectiveTailorCatalog as readTailor } from "./pg-task-graph-objective-tailor.js"
 import { projectTaskGraphDiscoveryRecoveryPage } from "./task-graph-discovery-recovery-page.js"
 import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
 import { createPgRootTaskHistoryResultPageStore } from "../context/root-task-history-result-page-store.js"
@@ -36,6 +37,8 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     async appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt> {
       return transaction(pool, client => scheduleTaskGraph(client, input))
     },
+    readObjectiveTailorCatalog(scope) { return readTailor(pool, scope) },
+    appendObjectiveTailor(input) { return appendTailor(pool, input) },
     async appendScheduledPrepare(input: TaskGraphScheduledPrepareInput): Promise<TaskGraphScheduledPrepareReceipt> {
       return transaction(pool, client => appendScheduledPrepareCommand(client, input))
     },

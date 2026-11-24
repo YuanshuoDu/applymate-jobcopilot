@@ -21,6 +21,7 @@ import type { DiscoveryAttemptHealth } from "./child-discovery-attempt.js"
 import type { DiscoveryQueryFootprint } from "./child-discovery-query-footprint.js"
 import type { TaskGraphHistoricalDiscoveryPage, TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
 import type { TaskGraphSourceCheckpoint, TaskGraphSourceIntentNode } from "./task-graph-pg-source-provenance.js"
+import type { ObjectiveTailorCandidateCatalog } from "./objective-tailor-candidate.js"
 import type { TaskGraphScheduledAuditInput, TaskGraphScheduledAuditCompletionInput, TaskGraphScheduledAuditInvocationInput, TaskGraphScheduledAuditResumeInput, ScheduledAuditAppendReceipt, ScheduledAuditCompletionProof, ScheduledAuditInvocationProof, ScheduledAuditResumeContext } from "./scheduled-audit-contract.js"
 import type { ScheduledPostGatePlanningContext, TaskGraphScheduledPostGatePlanInput, TaskGraphScheduledPostGatePlanReadInput, ScheduledPostGateCompletionProof, ScheduledPostGateScheduleReceipt } from "./scheduled-post-gate-contract.js"
 export type { TaskGraphExecutionScope, TaskGraphScheduleInput, TaskGraphScheduleNode, TaskGraphScheduleReceipt, TaskGraphScheduledPrepareReceipt, TaskGraphTaskTemplate } from "./task-graph-schedule-input.js"
@@ -210,6 +211,8 @@ export class TaskGraphCommandError extends Error {
 export type TaskGraphKeepReconciliationReceipt = Readonly<{ decision: "keep"; revision: number; reconciledInputCount: number }>
 export type TaskGraphCommandPort = Readonly<{
   appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt>
+  readObjectiveTailorCatalog?(scope: TaskGraphReadScope): Promise<ObjectiveTailorCandidateCatalog | undefined>
+  appendObjectiveTailor?(input: Readonly<{ scope: TaskGraphExecutionScope; expectedRevision: number; candidateRef: string }>): Promise<TaskGraphScheduleReceipt>
   /** Scheduled-only same-root append; production callers must fail closed if absent. */
   appendScheduledPrepare?(input: TaskGraphScheduledPrepareInput): Promise<TaskGraphScheduledPrepareReceipt>
   /** Server-only fixed Gate registration; never exposed to model planning. */
