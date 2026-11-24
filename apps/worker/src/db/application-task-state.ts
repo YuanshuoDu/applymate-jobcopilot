@@ -126,7 +126,7 @@ async function refreshSessionStatus(pool: Pool | PoolClient, sessionId: string):
       : "completed";
   await pool.query(
     `UPDATE agent_sessions SET status = $2, "completedAt" = CASE WHEN $2 = 'completed' THEN NOW() ELSE NULL END, "updatedAt" = NOW()
-      WHERE id = $1 AND status NOT IN ('aborted', 'archived', 'completed', 'failed')`,
+      WHERE id = $1 AND status NOT IN ('aborted', 'archived', 'completed', 'failed') AND status <> 'paused'`,
     [sessionId, status],
   );
 }
@@ -198,7 +198,7 @@ export async function completeFillForReview(pool: Pool, taskId: string, userId: 
     [`evt_${randomId()}`, taskId, "Form filled without submission; final user authorization requested."],
   );
   await client.query(
-    `UPDATE agent_sessions SET status = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = NOW() WHERE id = $1`,
+    `UPDATE agent_sessions SET status = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = NOW() WHERE id = $1 AND status <> 'paused'`,
     [sessionId],
   );
   return true;
@@ -226,7 +226,7 @@ export async function pauseForFormInput(pool: Pool | PoolClient, taskId: string,
       `INSERT INTO agent_transcript_events (id, "sessionId", "taskId", type, speaker, title, body, "createdAt") VALUES ($1, $2, NULL, 'subagent_result', 'Executor', 'Information required', $3, NOW())`,
       [`evt_${randomId()}`, sessionId, redactSensitiveText(detail)],
     );
-    await pool.query(`UPDATE agent_sessions SET status = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = NOW() WHERE id = $1`, [sessionId]);
+    await pool.query(`UPDATE agent_sessions SET status = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = NOW() WHERE id = $1 AND status <> 'paused'`, [sessionId]);
   }
 }
 

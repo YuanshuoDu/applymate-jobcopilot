@@ -11,11 +11,12 @@ const lease = {
   context: {}, expectedOutputSchema: {}, result: null, failureReason: null, budgetSnapshot: {}, toolPolicySnapshot: {},
 } satisfies SubagentLease
 
-function client(turnRowCount = 1) {
+function client(turnRowCount = 1, sessionPaused = false) {
   const calls: Array<{ sql: string; values: readonly unknown[] }> = []
   const query = vi.fn(async (sql: string, values: readonly unknown[] = []) => {
     calls.push({ sql, values })
-    return { rows: [{ id: "row" }], rowCount: sql.includes('UPDATE "agent_turns"') ? turnRowCount : 1 }
+    const rowCount = sql.includes('UPDATE "agent_turns"') ? turnRowCount : sql.includes('UPDATE "agent_sessions"') && sessionPaused ? 0 : 1
+    return { rows: [{ id: "row" }], rowCount }
   })
   return { client: { query } as unknown as Pick<PoolClient, "query">, calls }
 }
@@ -36,6 +37,18 @@ describe("same-transaction application fill wait", () => {
     expect(String(event.values[3])).toContain("application changed during review")
     expect(JSON.stringify([event.values, transcript.values])).not.toContain("reviewedCoverLetterHash")
     expect(db.calls.find(call => call.sql.includes('UPDATE "agent_turns"'))?.values).toEqual(["turn-a", "session-a", 7, expect.any(Date)])
+    expect(db.calls.find(call => call.sql.includes('UPDATE "agent_sessions"'))?.sql).toContain('"status" <> \'paused\'')
+  })
+
+  it("keeps a paused Session paused while preserving the fill wait", async () => {
+    const db = client(1, true)
+    await expect(writeApplicationFillWaitWithClient(db.client, {
+      lease, applicationTaskId: "application-a", turnRevision: 7, checkpoint: "form_answer_required", detail: "stale_review",
+      now: new Date("2026-11-20T11:00:00.000Z"),
+    })).resolves.toBe("waiting")
+
+    expect(db.calls.find(call => call.sql.includes('UPDATE "agent_sessions"'))?.sql).toContain('"status" <> \'paused\'')
+    expect(db.calls.some(call => call.sql.includes('INSERT INTO "application_task_events"'))).toBe(true)
   })
 
   it("rolls back through the caller when the locked Turn revision changes", async () => {

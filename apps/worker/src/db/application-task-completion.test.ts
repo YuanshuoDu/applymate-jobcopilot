@@ -389,6 +389,15 @@ describe("ApplicationTask fill completion", () => {
     expect(test.calls.some(call => call.sql.includes('UPDATE "agent_sessions" SET "status" = \'waiting_for_user\''))).toBe(true)
   })
 
+  it("keeps the Session projection conditional while completing a fill", async () => {
+    const test = fixture()
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, now: new Date() })).resolves.toEqual({ status: "completed" })
+
+    const sessionUpdate = test.calls.find(call => call.sql.includes('UPDATE "agent_sessions" SET "status" = \'waiting_for_user\''))
+    expect(sessionUpdate?.sql).toContain('"status" <> \'paused\'')
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "application_task_events"') && call.sql.includes("'form_filled'"))).toBe(true)
+  })
+
   it("completes the exact bound fill while its parent Turn waits for the TaskGraph child", async () => {
     const test = fixture({ turnStatus: "waiting_for_dependency" })
 
@@ -626,6 +635,17 @@ describe("ApplicationTask fill completion", () => {
     expect(turnWait?.values).toEqual(["turn-a", "session-a", 4, expect.any(Date)])
     expect(test.calls.some(call => call.sql.includes('FROM "agent_turns"') && call.values?.[0] === "turn-a")).toBe(true)
     expect(test.calls.some(call => call.sql.includes("BEGIN"))).toBe(true)
+  })
+
+  it("keeps the Session projection conditional while persisting a durable fill wait", async () => {
+    const test = fixture()
+    await expect(persistApplicationFillWait(test.pool, {
+      lease: test.lease, checkpoint: "form_answer_required", detail: "required_field",
+    })).resolves.toEqual({ status: "waiting" })
+
+    const sessionUpdate = test.calls.find(call => call.sql.includes('UPDATE "agent_sessions" SET "status" = \'waiting_for_user\''))
+    expect(sessionUpdate?.sql).toContain('"status" <> \'paused\'')
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "application_task_events"'))).toBe(true)
   })
 
   it.each(["required_field", "captcha_required"] as const)("persists a %s user wait after the root Turn's dependency handoff", async detail => {

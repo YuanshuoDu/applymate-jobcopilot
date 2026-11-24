@@ -199,7 +199,7 @@ export async function completeApplicationFillForReview(pool: Pool, input: { read
       title: COMPLETION_TITLE, body: COMPLETION_BODY, impact: { externalSubmission: true, jobId: task.jobId }, payload, nonce: createApprovalNonce() }
     const receipt = await createPgApprovalStore(pool, { userId: lease.userId }).issueInTransaction(client, approvalInput)
     await client.query(`INSERT INTO "agent_transcript_events" ("id", "sessionId", "taskId", "type", "speaker", "title", "body", "data", "createdAt") VALUES ($1, $2, NULL, 'approval_request', 'Executor', $3, $4, jsonb_build_object('approval', jsonb_build_object('id', $5::text, 'type', 'submit_application', 'title', $3::text, 'body', $4::text, 'impact', jsonb_build_object('externalSubmission', true, 'jobId', $6::text), 'payload', $7::jsonb, 'scopeHash', $8::text, 'status', 'pending')), $9)`, [randomUUID(), lease.sessionId, COMPLETION_TITLE, COMPLETION_BODY, receipt.approval.id, task.jobId, JSON.stringify(payload), receipt.approval.scopeHash, now])
-    await client.query(`UPDATE "agent_sessions" SET "status" = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = $2 WHERE "id" = $1 AND "userId" = $3`, [lease.sessionId, now, lease.userId])
+    await client.query(`UPDATE "agent_sessions" SET "status" = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = $2 WHERE "id" = $1 AND "userId" = $3 AND "status" <> 'paused'`, [lease.sessionId, now, lease.userId])
     return { status: "completed" }
   })
 }

@@ -79,6 +79,7 @@ describe("finishApplicationTask", () => {
     const sessionRefresh = query.mock.calls[3]?.[0] as string;
     expect(sessionRefresh).toContain('"completedAt" = CASE WHEN $2 = \'completed\' THEN NOW() ELSE NULL END');
     expect(sessionRefresh).toContain("status NOT IN ('aborted', 'archived', 'completed', 'failed')");
+    expect(sessionRefresh).toContain("status <> 'paused'");
     expect(sessionRefresh.indexOf('"completedAt"')).toBeLessThan(sessionRefresh.indexOf("WHERE id = $1 AND status NOT IN"));
     expect(query.mock.calls[3]?.[1]).toEqual(["session_1", "waiting_for_user"]);
     expect(query).toHaveBeenCalledTimes(4);
@@ -180,7 +181,7 @@ describe("finishApplicationTask", () => {
       .mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: "session_1" }] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [] })
       .mockResolvedValueOnce({ rows: [{ status: "filling" }] })
-      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] });
 
     await finishApplicationTask(pool, "task_1", "submitted", "submission_verified", null, "submit", submissionIdentity);
 
@@ -189,6 +190,7 @@ describe("finishApplicationTask", () => {
     expect(query.mock.calls[0]?.[1]).toEqual(["task_1", "submitted", "submission_verified", null, "submit", "session_1", "turn_1"]);
     expect(query.mock.calls[1]?.[0]).toContain("INSERT INTO application_task_events");
     expect(query.mock.calls[1]?.[1]).toEqual(["task_1", "submitted", "submission_verified"]);
+    expect(String(query.mock.calls[3]?.[0])).toContain("status <> 'paused'");
     expect(query.mock.calls[3]?.[1]).toEqual(["session_1", "running"]);
     expect(query).toHaveBeenCalledTimes(4);
   });
@@ -316,6 +318,7 @@ describe("completeFillForReview", () => {
       coverLetterId: null,
       answersHash: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
+    expect(String(query.mock.calls[4]?.[0])).toContain("status <> 'paused'");
   });
 });
 
@@ -351,6 +354,19 @@ describe("applicationTaskStillActive", () => {
 });
 
 describe("pauseForFormInput", () => {
+  it("records the task wait without replacing an owner-paused session", async () => {
+    const { pool, query } = testPool();
+    query
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: "session_1" }] })
+      .mockResolvedValue({ rowCount: 1, rows: [] });
+
+    await pauseForFormInput(pool, "task_1", "Missing required field", { missing: [{ key: null, label: "Email" }], sensitive: [] });
+
+    const sessionUpdate = query.mock.calls.find(([sql]) => String(sql).includes("UPDATE agent_sessions"))?.[0];
+    expect(String(sessionUpdate)).toContain("status <> 'paused'");
+    expect(query.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO application_task_events"))).toBe(true);
+  });
+
   it("does not replace a committed submission marker or emit a stale handoff", async () => {
     const { pool, query } = testPool();
     query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
