@@ -1435,6 +1435,13 @@ jobs:
           test "$CUSTOM_AGENT_ROLE_PG_TEST_DISPOSABLE" = "true"
           test "$CUSTOM_AGENT_ROLE_PG_TEST_REQUIRED" = "true"
           pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism src/__tests__/custom-agent-role-migration.pg.integration.test.ts
+      - name: Verify Job and Resume material revisions on disposable PostgreSQL
+        run: |
+          test "$CI" = "true"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_custom_agent_role_ci"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_DISPOSABLE" = "true"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism src/__tests__/job-resume-material-revision.pg.integration.test.ts
       - name: Verify AgentSession idempotency races on disposable PostgreSQL
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_custom_agent_role_ci

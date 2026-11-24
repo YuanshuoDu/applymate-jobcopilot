@@ -280,6 +280,7 @@ model Job {
 
   // M1 extensions
   finalResumeId      String?
+  finalResumeAssignmentRevision Int @default(0)
   finalCoverLetterId String?
 
   user                 User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -493,6 +494,7 @@ model Resume {
   userId          String
   name            String
   content         Json // ResumeContent JSON (see types.ts)
+  materialRevision Int @default(0)
   templateId      String?
   templateOptions Json? // TemplateOptions JSON { accentColor, fontFamily, density }
   isDefault       Boolean  @default(false)

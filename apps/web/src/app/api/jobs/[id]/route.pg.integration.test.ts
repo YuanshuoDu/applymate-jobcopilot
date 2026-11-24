@@ -105,7 +105,8 @@ integration('Job PATCH and DELETE source fence with PostgreSQL', () => {
       "workflowState" "${schema}"."JobWorkflowState" NOT NULL DEFAULT 'draft',
       "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
       "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      "finalResumeId" TEXT, "finalCoverLetterId" TEXT
+      "finalResumeId" TEXT, "finalCoverLetterId" TEXT,
+      "finalResumeAssignmentRevision" INTEGER NOT NULL DEFAULT 0
     )`)
     vi.doMock('@/lib/api-helpers', () => ({
       requireAuth: async () => ({ userId: currentScope().userId }),

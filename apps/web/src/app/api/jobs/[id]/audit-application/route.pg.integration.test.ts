@@ -78,14 +78,16 @@ integration('application audit ordering with disposable PostgreSQL', () => {
       "keywords" TEXT, "appliedAt" TIMESTAMP(3), "followUpAt" TIMESTAMP(3),
       "workflowState" "${schema}"."JobWorkflowState" NOT NULL DEFAULT 'draft',
       "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      "finalResumeId" TEXT, "finalCoverLetterId" TEXT
+      "finalResumeId" TEXT, "finalCoverLetterId" TEXT,
+      "finalResumeAssignmentRevision" INTEGER NOT NULL DEFAULT 0
     )`)
     await clientA.$executeRawUnsafe(`CREATE TABLE "${schema}"."Resume" (
       "id" TEXT PRIMARY KEY, "userId" TEXT NOT NULL, "name" TEXT NOT NULL, "content" JSONB NOT NULL,
       "templateId" TEXT, "templateOptions" JSONB, "isDefault" BOOLEAN NOT NULL DEFAULT false,
       "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
       "directionId" TEXT, "kind" TEXT NOT NULL DEFAULT 'base', "parentResumeId" TEXT, "targetJobId" TEXT,
-      "origin" TEXT NOT NULL DEFAULT 'manual', "basicsDetached" BOOLEAN NOT NULL DEFAULT false
+      "origin" TEXT NOT NULL DEFAULT 'manual', "basicsDetached" BOOLEAN NOT NULL DEFAULT false,
+      "materialRevision" INTEGER NOT NULL DEFAULT 0
     )`)
     await clientA.$executeRawUnsafe(`CREATE TABLE "${schema}"."ResumeVersion" (
       "id" TEXT PRIMARY KEY, "resumeId" TEXT NOT NULL, "userId" TEXT NOT NULL, "content" JSONB NOT NULL,
