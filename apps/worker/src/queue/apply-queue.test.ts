@@ -70,6 +70,7 @@ const mockTurnClient = vi.hoisted(() => {
         transaction.currentId = null;
         return { rows: [], rowCount: 1 };
       }
+      if (sql.includes('SELECT "id" FROM "application_task_events"')) return { rows: [], rowCount: 0 };
       if (sql.includes('SELECT "sessionId" FROM application_tasks')) return { rows: [{ sessionId: "agent-session-1" }], rowCount: 1 };
       if (sql.includes('SELECT "id", "fillTurnId", "sessionId"')) return { rows: [{ id: "application-task-1", fillTurnId: null, sessionId: "agent-session-1", status: "filling", checkpoint: "form_fill_queued" }], rowCount: 1 };
       if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "filler-1" }], rowCount: 1 };
@@ -155,7 +156,8 @@ vi.mock("../db/apply-results.js", () => ({
     connect: vi.fn().mockResolvedValue(mockTurnClient),
   }),
 }));
-vi.mock("../db/objective-application-submit-result.js", () => ({
+vi.mock("../db/objective-application-submit-result.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../db/objective-application-submit-result.js")>(),
   recordObjectiveApplicationSubmitResult: mockRecordObjectiveSubmitResult,
 }));
 
