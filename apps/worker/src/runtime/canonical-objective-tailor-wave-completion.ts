@@ -84,7 +84,8 @@ async function verifyCompletion(input: Input): Promise<ObjectiveTailorWaveComple
     const receipt = reviewerProjection.reviewStatus === "stale"
       ? await readStaleReviewReceipt(input.client, { userId: scope.userId, sessionId: scope.sessionId, jobId: slot.jobId,
         artifactId: artifactRef.artifactId, version: artifactRef.version, contentHash: artifactRef.contentHash,
-        sourceDigest: artifactRef.sourceDigest, taskId: slot.reviewerTaskId, reviewHash: reviewerProjection.reviewHash })
+        sourceDigest: artifactRef.sourceDigest, status: reviewerProjection.reviewStatus,
+        taskId: slot.reviewerTaskId, reviewHash: reviewerProjection.reviewHash })
       : await findReviewReceiptWithClient(input.client, { userId: scope.userId, sessionId: scope.sessionId, jobId: slot.jobId,
         artifactId: artifactRef.artifactId, version: artifactRef.version, contentHash: artifactRef.contentHash,
         sourceDigest: artifactRef.sourceDigest, currentSourceDigest: artifactRef.sourceDigest,
@@ -100,26 +101,31 @@ async function verifyCompletion(input: Input): Promise<ObjectiveTailorWaveComple
       outcomes.push({ ...outcome(slot, "stale"), artifactRef, artifactVersion: version,
         reviewReceipt: receiptIdentity(receipt), currentSourceDigest }); continue
     }
-    let checkedReceipt: AgentArtifactReviewReceipt | null = null
+    const checkedReceipt: { value: AgentArtifactReviewReceipt | null } = { value: null }
     const checked = await selectedJobArtifactCompletionGateWithWitness({
       commandPort: { readCurrent: async () => ({ revision: inventory.graphRevision, nodes: [
         { key: writer.key, templateId: writer.templateId, goal: writer.goal, successCriteria: writer.successCriteria,
-          dependsOn: [], taskId: writer.taskId, status: writerTask.status, readiness: writerState.readiness,
+          dependsOn: [], taskId: writer.taskId, status: writerTask.status, readiness: "terminal",
           resultSummary: null, resultProjection: writerProjection, failureReason: null },
         { key: reviewer.key, templateId: reviewer.templateId, goal: reviewer.goal, successCriteria: reviewer.successCriteria,
-          dependsOn: [writer.key], taskId: reviewer.taskId, status: reviewerTask.status, readiness: reviewerState.readiness,
+          dependsOn: [writer.key], taskId: reviewer.taskId, status: reviewerTask.status, readiness: "terminal",
           resultSummary: null, resultProjection: reviewerProjection, failureReason: null },
       ] }) },
       lease: input.lease, root: input.root, selectedJobId: slot.jobId,
       readCurrentDraftHead: scope => findCurrentDraftHeadWithClient(input.client, scope),
       readCurrentSourceDigest: () => readSelectedJobSourceDigestWithClient(input.client, scope.userId, slot.jobId),
-      readCurrentReviewReceipt: async receiptScope => { checkedReceipt = await findReviewReceiptWithClient(input.client, receiptScope); return checkedReceipt },
+      readCurrentReviewReceipt: async receiptScope => {
+        const receipt = await findReviewReceiptWithClient(input.client, receiptScope)
+        checkedReceipt.value = receipt
+        return receipt
+      },
     })
-    if (!checked.ok || !checkedReceipt || checkedReceipt.taskId !== slot.reviewerTaskId || checkedReceipt.status !== reviewerProjection.reviewStatus
-      || checkedReceipt.reviewHash !== reviewerProjection.reviewHash || checkedReceipt.currentSourceDigest !== currentSourceDigest) return blocked(outcomes)
+    const verifiedReceipt = checkedReceipt.value
+    if (!checked.ok || !verifiedReceipt || verifiedReceipt.taskId !== slot.reviewerTaskId || verifiedReceipt.status !== reviewerProjection.reviewStatus
+      || verifiedReceipt.reviewHash !== reviewerProjection.reviewHash || verifiedReceipt.currentSourceDigest !== currentSourceDigest) return blocked(outcomes)
     const status = reviewerProjection.reviewStatus === "passed" ? "ready" : reviewerProjection.reviewStatus
     outcomes.push({ ...outcome(slot, status), artifactRef, artifactVersion: version,
-      reviewReceipt: receiptIdentity(checkedReceipt), currentSourceDigest })
+      reviewReceipt: receiptIdentity(verifiedReceipt), currentSourceDigest })
   }
   if (outcomes.some(value => value.status === "pending")) return input.acceptedWitness ? blocked(outcomes) : { status: "pending", outcomes }
   const witness: ObjectiveTailorWaveCompletionWitness = {

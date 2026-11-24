@@ -27,7 +27,7 @@ function witness(index: number, materialDigest = HASH): ObjectiveTailorWaveCandi
     sourceAnalystKeys: [`analyst-${index}`], slotId: `tailor-${index}`, writerNodeKey: `writer-${index}`,
     reviewerNodeKey: `reviewer-${index}`, admittedRevision: 2 }
 }
-function makeFixture(entries: readonly Readonly<{ index: number; writerStatus?: string; reviewerStatus?: string; review?: string; material?: string; source?: string }>[]) {
+function makeFixture(entries: { index: number; writerStatus?: string; reviewerStatus?: string; review?: string; material?: string; source?: string }[]) {
   const slots = entries.map(({ index }) => {
     const proof = witness(index)
     return { slotId: proof.slotId, jobId: proof.candidate.jobId, sourceAnalystNodeKey: `analyst-${index}`, witness: proof,
@@ -76,7 +76,7 @@ function makeFixture(entries: readonly Readonly<{ index: number; writerStatus?: 
   mocks.receipt.mockImplementation(async (_client: unknown, scope: Record<string, unknown>) => reviewReceipt(scope))
   mocks.gate.mockImplementation(async (input: Parameters<typeof selectedJobArtifactCompletionGateWithWitness>[0]) => {
     const index = Number(input.selectedJobId?.match(/[0-9]+$/)?.[0])
-    const status = byJob.get(input.selectedJobId ?? "")?.review ?? "passed"
+    const status = (byJob.get(input.selectedJobId ?? "")?.review ?? "passed") as AgentArtifactReviewReceipt["status"]
     const checkedReceipt = await input.readCurrentReviewReceipt?.({ userId: user, sessionId: session, jobId: `job-${index}`,
       artifactId: `artifact-${index}`, version: 1, contentHash: HASH, sourceDigest: HASH,
       currentSourceDigest: HASH, status, taskId: `reviewer-task-${index}`, reviewHash: HASH })
@@ -125,6 +125,7 @@ describe("canonical Objective Tailor V2 terminal evidence", () => {
     const fixture = makeFixture([{ index: 1, writerStatus: "failed", reviewerStatus: "running" }])
     const result = await verifyCanonicalObjectiveTailorWaveCompletion(input(fixture))
     expect(result.status).toBe("pending")
+    if (result.status !== "pending") return
     expect(result.outcomes[0]?.status).toBe("pending")
   })
 
@@ -134,9 +135,12 @@ describe("canonical Objective Tailor V2 terminal evidence", () => {
     const accepted = await verifyCanonicalObjectiveTailorWaveCompletion(args)
     expect(accepted.status).toBe("ready")
     if (accepted.status !== "ready") return
-    fixture.entries[1]!.source = changedHash
+    const entry = fixture.entries[1]
+    if (!entry) throw new Error("test fixture entry missing")
+    entry.source = changedHash
     const final = await verifyCanonicalObjectiveTailorWaveCompletion({ ...args, acceptedWitness: accepted.witness })
     expect(final.status).toBe("blocked")
+    if (final.status !== "blocked") return
     expect(final.outcomes[1]?.status).toBe("stale")
   })
 
@@ -145,6 +149,7 @@ describe("canonical Objective Tailor V2 terminal evidence", () => {
     const args = input(fixture)
     const result = await verifyCanonicalObjectiveTailorWaveCompletion(args)
     expect(result.status).toBe("ready")
+    if (result.status !== "ready") return
     expect(result.outcomes[0]?.status).toBe("stale")
   })
 
