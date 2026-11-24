@@ -2,6 +2,7 @@ import { db } from "@/lib/db"
 import { err, ok } from "@/lib/api-helpers"
 import { nextRunAtFromCron } from "@/lib/agent/automation-schedule"
 import { updateAgentSession } from "@/lib/agent/session/repository"
+import { acquireSourceMaterialFence } from "@/lib/agent/source-material-fence"
 import { loadUserAiConfig } from "@/lib/model-router"
 import { isFeatureAllowed, resolveAiAccess } from "@/lib/entitlements"
 import { tailorResumeForAgent } from "@/lib/agent/resume-tailoring"
@@ -172,16 +173,23 @@ export async function handleApprovedResumeTailoring(sessionId: string, userId: s
 export async function handleConfirmedTailoredResume(sessionId: string, userId: string, approval: ScopedApproval) {
   const payload = resumeTailoringPayload(approval.payload)
   if (!payload) return err("Final resume approval is missing its job or resume.", 400)
-  const resume = await db.resume.findFirst({ where: { id: payload.resumeId, userId, targetJobId: payload.jobId }, select: { id: true, name: true } })
-  const job = await db.job.findFirst({ where: { id: payload.jobId, userId }, select: { id: true, company: true, role: true, url: true, status: true } })
-  if (!resume || !job) return err("The tailored resume or job is no longer available.", 404)
-  if (job.status === "applied") return err("This job has already been submitted.", 409)
-  await db.job.update({ where: { id: job.id }, data: {
-    finalResumeId: resume.id, status: "saved", workflowState: "ready_to_apply",
-    analysisNote: job.url
-      ? "[Application ready] Open the employer form, use the ApplyMate extension to fill it, then review and submit it yourself."
-      : "[Application ready] Missing application URL.",
-  } })
+  const result = await db.$transaction(async tx => {
+    await acquireSourceMaterialFence(tx, [userId])
+    const resume = await tx.resume.findFirst({ where: { id: payload.resumeId, userId, targetJobId: payload.jobId }, select: { id: true, name: true } })
+    const job = await tx.job.findFirst({ where: { id: payload.jobId, userId }, select: { id: true, company: true, role: true, url: true, status: true } })
+    if (!resume || !job) return { kind: "unavailable" as const }
+    if (job.status === "applied") return { kind: "applied" as const }
+    await tx.job.update({ where: { id: job.id, userId }, data: {
+      finalResumeId: resume.id, status: "saved", workflowState: "ready_to_apply",
+      analysisNote: job.url
+        ? "[Application ready] Open the employer form, use the ApplyMate extension to fill it, then review and submit it yourself."
+        : "[Application ready] Missing application URL.",
+    } })
+    return { kind: "updated" as const, resume, job }
+  })
+  if (result.kind === "unavailable") return err("The tailored resume or job is no longer available.", 404)
+  if (result.kind === "applied") return err("This job has already been submitted.", 409)
+  const { resume, job } = result
   const event = await db.agentTranscriptEvent.create({
     data: {
       sessionId, taskId: null, type: "resume_finalized", speaker: "Reviewer", title: "Application pack ready", durationMs: null,
