@@ -7528,11 +7528,11 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     const projected = projectObjectiveTailorCorrectionWaitSnapshot(undefined, [
       "TAILOR_CORRECTION_SLOT6_RECEIPT_DENIED objective_tailor_correction_stale",
     ])
-    expect(record(projected.stages).correctionSlot6Receipt).toEqual({ status: "denied", code: "objective_tailor_correction_stale" })
+    expect(record(projected.stages)?.correctionSlot6Receipt).toEqual({ status: "denied", code: "objective_tailor_correction_stale" })
     const privateProjection = projectObjectiveTailorCorrectionWaitSnapshot(undefined, [
       "TAILOR_CORRECTION_SLOT6_RECEIPT_DENIED privatedatabasedetail",
     ])
-    expect(record(privateProjection.stages).correctionSlot6Receipt).toEqual({ status: "denied", code: "other" })
+    expect(record(privateProjection.stages)?.correctionSlot6Receipt).toEqual({ status: "denied", code: "other" })
     expect(JSON.stringify(privateProjection)).not.toContain("privatedatabasedetail")
   })
 
