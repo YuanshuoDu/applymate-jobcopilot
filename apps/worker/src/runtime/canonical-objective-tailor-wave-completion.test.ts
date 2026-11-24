@@ -17,7 +17,7 @@ vi.mock("./subagents/scheduled-draft-job-material.js", () => ({ readCurrentSched
 vi.mock("./selected-job-completion-gate.js", () => ({ selectedJobArtifactCompletionGateWithWitness: mocks.gate }))
 vi.mock("./subagents/task-graph-result-projection.js", () => ({ projectTaskGraphResult: mocks.project }))
 
-import { verifyCanonicalObjectiveTailorWaveCompletion } from "./canonical-objective-tailor-wave-completion.js"
+import { verifyCanonicalObjectiveTailorWaveCompletion, verifyCompletedObjectiveTailorWaveSlots } from "./canonical-objective-tailor-wave-completion.js"
 
 const HASH = `sha256:${"a".repeat(64)}`
 const changedHash = `sha256:${"b".repeat(64)}`
@@ -138,6 +138,25 @@ function addPendingCorrection(fixture: ReturnType<typeof makeFixture>, index: nu
 beforeEach(() => { vi.clearAllMocks() })
 
 describe("canonical Objective Tailor V2 terminal evidence", () => {
+  it("rebuilds only selected completed slots without a source Turn lease", async () => {
+    const fixture = makeFixture([{ index: 1 }, { index: 2, source: changedHash }]), args = input(fixture)
+    const result = await verifyCompletedObjectiveTailorWaveSlots({ client: args.client as PoolClient,
+      scope: { userId: user, sessionId: session, turnId: turn, rootTaskId: rootId, parentTaskId: rootId },
+      loaded: fixture.loaded, selectedSlotIds: ["tailor-1"] })
+    expect(result.status).toBe("ready")
+    if (result.status !== "ready") return
+    expect(result.outcomes.map(value => [value.slotId, value.status])).toEqual([["tailor-1", "ready"]])
+    expect(mocks.source.mock.calls.every(call => call[2] === jobIdForIndex(1))).toBe(true)
+  })
+
+  it("fails closed for noncanonical, duplicate, or unknown selected slot identities", async () => {
+    const fixture = makeFixture([{ index: 1 }, { index: 2 }]), client = input(fixture).client as PoolClient
+    const scope = { userId: user, sessionId: session, turnId: turn, rootTaskId: rootId, parentTaskId: rootId }
+    for (const selectedSlotIds of [["tailor-2", "tailor-1"], ["tailor-1", "tailor-1"], ["tailor-3"]]) {
+      await expect(verifyCompletedObjectiveTailorWaveSlots({ client, scope, loaded: fixture.loaded, selectedSlotIds })).resolves.toMatchObject({ status: "blocked" })
+    }
+  })
+
   it("keeps slot outcomes independent and in marker order", async () => {
     const fixture = makeFixture([
       { index: 1, review: "passed" }, { index: 2, source: changedHash }, { index: 3, review: "needs_revision" },
