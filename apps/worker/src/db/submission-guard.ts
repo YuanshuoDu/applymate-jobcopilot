@@ -61,7 +61,7 @@ export function withExactSubmissionWrite<T>(
  * The only source-changing submission wrapper: acquire the shared user fence
  * before any attempt/owner lock, and use only for Job status writes.
  */
-async function withExactSubmissionSourceWrite<T>(
+export async function withExactSubmissionSourceWrite<T>(
   pool: Pool,
   identity: ApplicationSubmitIdentity,
   phase: string,

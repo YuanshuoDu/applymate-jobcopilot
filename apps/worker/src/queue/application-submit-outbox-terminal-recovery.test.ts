@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import type { Pool } from "pg"
+import type { Pool, PoolClient } from "pg"
 import {
   ensureSubmitQueueJob,
   inspectSubmitDelivery,
@@ -12,7 +12,15 @@ import type { SubmitOutboxIntent, SubmitOutboxQueue } from "./application-submit
 
 const mockReconcile = vi.hoisted(() => vi.fn().mockResolvedValue(true))
 const mockProofQuery = vi.hoisted(() => vi.fn())
+const mockObjectiveCandidate = vi.hoisted(() => vi.fn().mockResolvedValue(false))
+const mockObjectiveCandidateWithClient = vi.hoisted(() => vi.fn().mockResolvedValue(false))
+const mockObjectiveRecovery = vi.hoisted(() => vi.fn().mockResolvedValue("not_recovered"))
 vi.mock("../db/submission-guard.js", () => ({ reconcileClaimedSubmissionUncertain: mockReconcile }))
+vi.mock("./objective-application-submit-terminal-recovery.js", () => ({
+  hasObjectiveSubmitResultCandidate: mockObjectiveCandidate,
+  hasObjectiveSubmitResultCandidateWithClient: mockObjectiveCandidateWithClient,
+  recoverObjectiveSubmitAfterTerminal: mockObjectiveRecovery,
+}))
 
 const identity = {
   applicationTaskId: "task-1", userId: "user-1", jobId: "job-1", sessionId: "session-1",
@@ -58,6 +66,9 @@ beforeEach(() => {
   terminalProofRows = []
   failTerminalProofInsert = false
   taskState = { status: "filling", checkpoint: "browser_active" }
+  mockObjectiveCandidate.mockReset().mockResolvedValue(false)
+  mockObjectiveCandidateWithClient.mockReset().mockResolvedValue(false)
+  mockObjectiveRecovery.mockReset().mockResolvedValue("not_recovered")
   mockProofQuery.mockReset().mockImplementation(async (sql: unknown, values?: unknown[]) => {
     const query = String(sql)
     if (query.includes('FROM "application_tasks"')) return { rows: [{ id: intent.applicationTaskId, ...taskState }], rowCount: 1 }
@@ -78,6 +89,64 @@ beforeEach(() => {
 })
 
 describe("claimed submit terminal recovery", () => {
+  it("cleans up a terminal queue job after an exact Objective result was durably repaired", async () => {
+    const job = makeJob("completed")
+    const { queue } = makeQueue({ job })
+    mockObjectiveCandidate.mockResolvedValue(true)
+    mockObjectiveRecovery.mockImplementation(async (_pool, _intent, observe) => {
+      const terminalKind = await observe({ query: mockProofQuery } as unknown as PoolClient)
+      if (!terminalKind) return "not_recovered"
+      taskState = { status: "submitted", checkpoint: "submission_verified" }
+      return "recovered"
+    })
+
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("reconciled")
+
+    expect(mockObjectiveCandidate).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ workerTaskId: intent.workerTaskId }))
+    expect(mockObjectiveRecovery).toHaveBeenCalledOnce()
+    expect(mockReconcile).not.toHaveBeenCalled()
+    expect(job.remove).toHaveBeenCalledOnce()
+    expect(terminalProofRows).toHaveLength(0)
+  })
+
+  it.each(["active", "locked", "mismatch"] as const)("does not trust an old callback after the live delivery becomes %s", async change => {
+    const job = makeJob("completed")
+    const { queue, redis } = makeQueue({ job })
+    mockObjectiveCandidate.mockResolvedValue(true)
+    mockObjectiveRecovery.mockImplementation(async (_pool, _intent, observe) => {
+      const terminalKind = await observe({ query: mockProofQuery } as unknown as PoolClient)
+      return terminalKind ? "recovered" : "not_recovered"
+    })
+    if (change === "active") job.getState.mockResolvedValueOnce("completed").mockResolvedValue("active")
+    if (change === "locked") redis.get.mockResolvedValueOnce(null).mockResolvedValue("lock")
+    if (change === "mismatch") {
+      const foreign = makeJob("completed", { data: { ...intent.submitPayload, constraintHash: "f".repeat(64) } })
+      queue.getJob = vi.fn().mockResolvedValueOnce(job).mockResolvedValue(foreign)
+    }
+    const result = await reconcileClaimedTerminalSubmit({} as Pool, queue, intent, {
+      terminalState: "completed", attemptsMade: 3, attempts: 3,
+    })
+
+    expect(result).toBe(change === "mismatch" ? "mismatch" : "deferred")
+    expect(taskState.status).toBe("filling")
+    expect(terminalProofRows).toHaveLength(0)
+    expect(job.remove).not.toHaveBeenCalled()
+  })
+
+  it("defers if the positive Objective result appears after its initial hint probe", async () => {
+    const job = makeJob("completed")
+    const { queue } = makeQueue({ job })
+    mockObjectiveCandidateWithClient.mockResolvedValue(true)
+
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("unchanged")
+
+    expect(mockObjectiveCandidate).toHaveBeenCalledOnce()
+    expect(mockObjectiveCandidateWithClient).toHaveBeenCalledOnce()
+    expect(mockReconcile).toHaveBeenCalledOnce()
+    expect(terminalProofRows).toHaveLength(0)
+    expect(job.remove).not.toHaveBeenCalled()
+  })
+
   it("reconciles only a matching completed delivery after its exact lock is absent", async () => {
     const job = makeJob("completed")
     const { queue, redis } = makeQueue({ job })
