@@ -117,7 +117,8 @@ function candidateContext(value: unknown, jobId: string, slot: ObjectiveTailorPr
   revision: number, correction: ObjectiveTailorProgressSnapshot["marker"]["slots"][number]["correction"]): CandidateWitness | undefined {
   const expected = correction ? "objectiveTailorCandidateMode,objectiveTailorCandidateWitness,objectiveTailorCorrectionProof,selectedJobPreparation"
     : "objectiveTailorCandidateMode,objectiveTailorCandidateWitness,selectedJobPreparation"
-  const context = record(value), selected = context && exactRecord(context.selectedJobPreparation, "jobId")
+  const rawContext = record(value), context = rawContext && objectiveContext(rawContext)
+  const selected = context && exactRecord(context.selectedJobPreparation, "jobId")
   const witness = context && candidateWitness(context.objectiveTailorCandidateWitness)
   const parsedCorrection = correctionContext(value)
   return context && exact(context, expected) && context.objectiveTailorCandidateMode === true && selected?.jobId === jobId
@@ -131,6 +132,47 @@ function candidateContext(value: unknown, jobId: string, slot: ObjectiveTailorPr
     ? witness : undefined
 }
 
+function objectiveContext(context: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (!Object.hasOwn(context, "taskGraphDependencyResults")) return context
+  if (!validDependencyResults(context.taskGraphDependencyResults)) return undefined
+  const base = { ...context }
+  delete base.taskGraphDependencyResults
+  return base
+}
+
+function validDependencyResults(value: unknown): boolean {
+  const envelope = exactRecord(value, "items,schemaVersion"), items = envelope?.items
+  let json: string | undefined
+  try { json = JSON.stringify(value) } catch { return false }
+  return envelope?.schemaVersion === "agent-harness.v2.task-graph.dependency-evidence" && Array.isArray(items)
+    && Object.getPrototypeOf(items) === Array.prototype && items.length > 0 && items.length <= 8
+    && Reflect.ownKeys(items).length === items.length + 1 && typeof json === "string"
+    && new TextEncoder().encode(json).length <= 8 * 1024 && items.every(validDependencyResult)
+}
+
+function validDependencyResult(value: unknown): boolean {
+  const row = record(value), result = row && record(row.result), role = row?.role
+  const allowed = "dependencyKey,dependencyTaskId,repairLineage,result,role,sourceIntent,taskStatus,verification".split(",")
+  if (!row || !result || !safeId(row.dependencyKey) || !["scout", "analyst", "writer", "reviewer"].includes(String(role))
+    || row.taskStatus !== "completed" || Object.keys(row).some(key => !allowed.includes(key))
+    || !["dependencyKey", "result", "role", "taskStatus"].every(key => Object.hasOwn(row, key))
+    || Object.hasOwn(row, "dependencyTaskId") && (role !== "reviewer" || !safeId(row.dependencyTaskId))
+    || Object.hasOwn(row, "verification") && !record(row.verification)
+    || Object.hasOwn(row, "sourceIntent") && !record(row.sourceIntent)
+    || Object.hasOwn(row, "repairLineage") && !denseRecords(row.repairLineage)) return false
+  const keys = role === "scout" ? "availability,candidateCount,candidates,evidenceCount,role,schemaVersion,status,trust"
+    : role === "analyst" ? "availability,evidenceCount,findingCount,findings,role,schemaVersion,status,trust"
+      : role === "writer" ? "artifactRef,availability,role,schemaVersion,status,trust"
+        : "artifactRef,availability,reviewHash,reviewStatus,role,schemaVersion,status,trust"
+  return exact(result, keys) && result.schemaVersion === "agent-harness.v2.task-graph.result-projection"
+    && result.trust === "untrusted" && result.availability === "available" && result.role === role
+    && (role === "scout" || role === "analyst" ? ["completed", "partial"].includes(String(result.status)) : result.status === "completed")
+}
+
+function denseRecords(value: unknown): boolean {
+  return Array.isArray(value) && Object.getPrototypeOf(value) === Array.prototype && value.length <= 8
+    && Reflect.ownKeys(value).length === value.length + 1 && value.every(item => !!record(item))
+}
 function candidateWitness(value: unknown): CandidateWitness | undefined {
   const row = exactRecord(value, "admittedRevision,analystProofDigest,candidate,candidateRef,reviewerNodeKey,schemaVersion,slotId,sourceAnalystKeys,sourceGraphDigest,sourceGraphRevision,sourceStatusDigest,writerNodeKey")
   const candidate = row && exactRecord(row.candidate, "jobId,materialDigest,score"), sources = denseStrings(row?.sourceAnalystKeys)

@@ -58,6 +58,10 @@ describe("objective application review source proof", () => {
     wrongPrior.writerTask.context = { ...context, objectiveTailorCorrectionProof: { ...correction,
       prior: { ...prior, reviewReceipt: { ...reviewReceipt, taskId: "foreign-reviewer" } } } }
     expect(objectiveApplicationReviewPairProof(wrongPrior)).toBeUndefined()
+    const malformedDependency = structuredClone(corrected.input)
+    malformedDependency.writerTask.context = { ...objectRecord(malformedDependency.writerTask.context),
+      taskGraphDependencyResults: { schemaVersion: "unknown", items: [] } }
+    expect(objectiveApplicationReviewPairProof(malformedDependency)).toBeUndefined()
   })
 
   it("binds the review input and source manifest, and parses only prefixed artifact head hashes", () => {
@@ -96,6 +100,10 @@ function makePair(corrected: boolean) {
   const initialArtifact = corrected ? priorArtifact : sourceArtifact
   const initialReviewStatus = corrected ? "needs_revision" : "passed"
   const initialReviewHash = corrected ? oldReviewHash : reviewHash
+  const currentWriterContext = corrected ? { ...currentContext, taskGraphDependencyResults: dependencyResults(
+    "reviewer", initialReviewerKey, initialReviewerId, priorArtifact, "needs_revision", oldReviewHash) } : currentContext
+  const currentReviewerContext = corrected ? { ...currentContext, taskGraphDependencyResults: dependencyResults(
+    "writer", correctionWriterKey, writerId, sourceArtifact) } : currentContext
   const graphNodes = [sourceNode("scout", "source-scout-key", "scout-task-id", []),
     sourceNode("analyst", "source-analyst-key", "analyst-task-id", ["source-scout-key"]),
     templateNode(initialWriterKey, initialWriterId, "cover_letter_writer", ["source-analyst-key"]),
@@ -114,9 +122,9 @@ function makePair(corrected: boolean) {
     [initialWriterId, task(initialWriterId, "writer", "completed", roleResult("writer", { artifactRef: initialArtifact }), baseContext)],
     [initialReviewerId, task(initialReviewerId, "reviewer", "completed", roleResult("reviewer", {
       artifactRef: initialArtifact, reviewStatus: initialReviewStatus, reviewHash: initialReviewHash }), baseContext)],
-    ...(corrected ? [[writerId, task(writerId, "writer", "completed", roleResult("writer", { artifactRef: sourceArtifact }), currentContext)],
+    ...(corrected ? [[writerId, task(writerId, "writer", "completed", roleResult("writer", { artifactRef: sourceArtifact }), currentWriterContext)],
       [reviewerId, task(reviewerId, "reviewer", "completed", roleResult("reviewer", {
-        artifactRef: sourceArtifact, reviewStatus: "passed", reviewHash }), currentContext)]] as const : []),
+        artifactRef: sourceArtifact, reviewStatus: "passed", reviewHash }), currentReviewerContext)]] as const : []),
   ])
   const source = { jobId, slotOrdinal: 1, writerTaskId: currentWriterId, reviewerTaskId: currentReviewerId,
     reviewerToolCallId: "review-call-current", artifactId, version: sourceArtifact.version,
@@ -144,6 +152,13 @@ function sourceNode(templateId: "scout" | "analyst", key: string, taskId: string
 function templateNode(key: string, taskId: string, templateId: "cover_letter_writer" | "cover_letter_reviewer", dependsOn: string[]) {
   return { key, taskId, templateId, goal: "Complete the selected job draft step", successCriteria: ["Persist an exact task result"],
     dependsOn, depth: templateId === "cover_letter_writer" ? 3 : 4, verificationDisposition: "specialized" }
+}
+function dependencyResults(role: "writer" | "reviewer", key: string, taskId: string, artifactRef: Record<string, unknown>,
+  reviewStatus?: string, reviewHash?: string) {
+  const result = { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available",
+    role, status: "completed", artifactRef, ...(role === "reviewer" ? { reviewStatus, reviewHash } : {}) }
+  return { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [{ dependencyKey: key, role,
+    taskStatus: "completed", result, ...(role === "reviewer" ? { dependencyTaskId: taskId } : {}) }] }
 }
 function task(id: string, role: string, status: string, result: unknown, context: unknown = {}) { return { id, role, status, result, context } }
 function roleResult(role: string, result: Record<string, unknown>) {
