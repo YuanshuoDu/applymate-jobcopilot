@@ -162,7 +162,8 @@ const SAFE_DIAGNOSTIC_CODES = new Set(["invalid_state", "revision_mismatch",
   "task_graph_objective_coverage_incomplete", "revision_limit", "objective_tailor_wave_not_eligible", "objective_tailor_wave_source_stale", "objective_tailor_wave_stale",
   "idempotency_conflict", "task_graph_state_missing", "fixture_observation_unavailable", "fixture_wave1_identity_unavailable",
   "fixture_wave_catalog_unavailable", "fixture_wave_receipt_invalid", "fixture_plan_receipt_invalid",
-  "fixture_wait_result_error", "fixture_ordinary_plan_append_was_not_closed", "fixture_root_phase_unrecognized"])
+  "fixture_wait_result_error", "fixture_ordinary_plan_append_was_not_closed", "fixture_root_phase_unrecognized",
+  "fixture_wave_replay_args_missing", "fixture_wave_replay_identity_mismatch"])
 
 export function objectiveTailorWaveDiagnosticCode(value) {
   const code = value && typeof value === "object" ? value.code ?? value.message : value

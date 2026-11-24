@@ -5368,6 +5368,7 @@ const OBJECTIVE_TAILOR_WAVE1_MODEL_MARKERS = [
   "RECEIPT_INVALID", "POST_APPEND_GRAPH_OBSERVED", "POST_APPEND_GRAPH_UNAVAILABLE",
   "POST_APPEND_IDENTITY_VALID", "POST_APPEND_IDENTITY_INVALID",
   "ORDINARY_PLAN_PROBE_EMITTED",
+  "REPLAY_EMITTED",
   "ORDINARY_PLAN_RECEIPT_MISSING", "ORDINARY_PLAN_RECEIPT_DENIED", "ORDINARY_PLAN_RECEIPT_ACCEPTED",
   "ORDINARY_PLAN_RECEIPT_OTHER", "WAIT_EMITTED", "WAIT_RECEIPT_READY", "WAIT_RECEIPT_WAITING", "WAIT_RECEIPT_ERROR",
   "WAIT_RECEIPT_MISSING", "WAIT_RECEIPT_OTHER",
@@ -5377,6 +5378,7 @@ const OBJECTIVE_TAILOR_MODEL_DIAGNOSTIC_CODES = new Set([
   "fixture_observation_unavailable", "fixture_wave1_identity_unavailable", "fixture_wave_catalog_unavailable",
   "fixture_wave_receipt_invalid", "fixture_plan_receipt_invalid", "fixture_wait_result_error",
   "fixture_ordinary_plan_append_was_not_closed", "fixture_root_phase_unrecognized",
+  "fixture_wave_replay_args_missing", "fixture_wave_replay_identity_mismatch",
 ])
 
 function latestObjectiveTailorMarkerValue(output: readonly string[], prefix: string, allowed: ReadonlySet<string>): string {
@@ -5387,6 +5389,8 @@ function latestObjectiveTailorMarkerValue(output: readonly string[], prefix: str
 }
 
 function objectiveTailorWaveMarkerDiagnostics(output: readonly string[]) {
+  const replayResult = latestObjectiveTailorMarkerValue(output, "TAILOR_WAVE1_REPLAY_RESULT_",
+    new Set(["PRESENT", "MISSING"])).toLowerCase()
   let catalogRead: RecordValue = { status: "none" }
   let append: RecordValue = { status: "none" }
   let catalogCandidates: number | "other" | null = null
@@ -5441,9 +5445,140 @@ function objectiveTailorWaveMarkerDiagnostics(output: readonly string[]) {
     wave1WaitEmitted: output.includes("TAILOR_WAVE1_WAIT_EMITTED"),
     wave1WaitReceipt: latestObjectiveTailorMarkerValue(output, "TAILOR_WAVE1_WAIT_RECEIPT_",
       new Set(["READY", "WAITING", "ERROR", "MISSING", "OTHER"])).toLowerCase(),
+    wave1ReplayEmitted: output.includes("TAILOR_WAVE1_REPLAY_EMITTED"),
+    wave1ReplayResult: replayResult,
     rootStreamFailureCode: latestObjectiveTailorMarkerValue(output, "TAILOR_ROOT_STREAM_FAILURE ",
       OBJECTIVE_TAILOR_MODEL_DIAGNOSTIC_CODES),
   }
+}
+
+const OBJECTIVE_TAILOR_ROOT_STATUSES = new Set(["queued", "running", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
+
+async function waitForObjectiveTailorReplayStage(
+  pool: Pool, child: ProcessFixtureChild, owner: Pick<Fixture, "userId" | "sessionId" | "turnId">,
+  rootTaskId: string, targetTaskIds: string[], writerTaskIds: string[], waitKeyPrefix: string, timeoutMs = 120_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  let nextReadAt = 0
+  let progress: RecordValue = { available: false }
+  const markers = () => {
+    const model = objectiveTailorWaveMarkerDiagnostics(child.output)
+    return {
+      rootFactoryEntered: child.output.includes("TAILOR_ROOT_FACTORY_ENTERED"),
+      rootFactoryBound: child.output.includes("TAILOR_ROOT_FACTORY_BOUND"),
+      rootStreamEntered: child.output.includes("TAILOR_ROOT_STREAM_ENTERED"),
+      rootRequestScopeOk: child.output.includes("TAILOR_ROOT_REQUEST_SCOPE_OK"),
+      wave1WaitReady: child.output.includes("TAILOR_WAVE1_WAIT_READY"),
+      replayEmitted: child.output.includes("TAILOR_WAVE1_REPLAY_EMITTED"),
+      replayResult: model.wave1ReplayResult,
+      replayMatched: child.output.includes("TAILOR_WAVE1_REPLAY_MATCHED"),
+      rootStreamFailed: child.output.includes("TAILOR_ROOT_STREAM_FAILED"),
+      rootStreamFailureCode: model.rootStreamFailureCode,
+    }
+  }
+  const fail = (reason: "worker_exited" | "turn_terminal" | "root_terminal" | "deadline") => {
+    const safe = { reason, workerExited: child.exitCode !== null || child.signalCode !== null,
+      stdoutLineCount: child.output.length, stderrLineCount: child.errors.length, ...progress, markers: markers() }
+    throw new Error(`Objective Tailor replay stage: ${boundedDiagnostic(JSON.stringify(safe), 1_600)}`)
+  }
+  while (Date.now() < deadline) {
+    if (child.output.includes("TAILOR_WAVE1_REPLAY_MATCHED")) return
+    if (child.exitCode !== null || child.signalCode !== null) fail("worker_exited")
+    if (Date.now() >= nextReadAt) {
+      nextReadAt = Date.now() + 750
+      try {
+        const result = await pool.query<{
+          turnStatus: string; turnLeaseOwnerPresent: boolean; rootStatus: string | null
+          rootStepStatus: string | null; rootStepAttempt: number | null
+          waitStatus: string | null; waitSuspended: boolean | null; waitResolved: boolean | null
+          waitConsumed: boolean | null; waitMatchedCount: number | null
+          childCount: number; queuedCount: number; runningCount: number; completedCount: number
+          failedCount: number; liveWriterCount: number
+          turnDispatchCount: number; turnDispatchPublishedCount: number; turnDispatchAttempt: number | null
+          childDispatchCount: number; childDispatchPublishedCount: number; childDispatchAttempt: number | null
+        }>(`SELECT turn."status" AS "turnStatus", turn."leaseOwnerId" IS NOT NULL AS "turnLeaseOwnerPresent",
+              root."status" AS "rootStatus", rootStep."status" AS "rootStepStatus", rootStep."attempt" AS "rootStepAttempt",
+              wait."status" AS "waitStatus", wait."suspendedAt" IS NOT NULL AS "waitSuspended",
+              wait."resolvedAt" IS NOT NULL AS "waitResolved", wait."consumedAt" IS NOT NULL AS "waitConsumed",
+              CASE WHEN jsonb_typeof(wait."matchedTaskIds") = 'array' THEN jsonb_array_length(wait."matchedTaskIds") ELSE 0 END AS "waitMatchedCount",
+              children."childCount", children."queuedCount", children."runningCount", children."completedCount",
+              children."failedCount", children."liveWriterCount",
+              turnDispatch."dispatchCount" AS "turnDispatchCount", turnDispatch."publishedCount" AS "turnDispatchPublishedCount",
+              turnDispatch."attemptCount" AS "turnDispatchAttempt", childDispatch."dispatchCount" AS "childDispatchCount",
+              childDispatch."publishedCount" AS "childDispatchPublishedCount", childDispatch."attemptCount" AS "childDispatchAttempt"
+            FROM "agent_turns" AS turn
+            JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+            LEFT JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+              AND root."turnId" = turn."id" AND root."rootTaskId" = root."id" AND root."parentTaskId" IS NULL
+              AND root."role" = 'orchestrator' AND root."taskType" = 'root'
+            LEFT JOIN LATERAL (SELECT step."status", step."attempt" FROM "agent_steps" AS step
+              WHERE step."sessionId" = turn."sessionId" AND step."turnId" = turn."id" AND step."taskId" = root."id"
+              ORDER BY step."ordinal" DESC LIMIT 1) AS rootStep ON TRUE
+            LEFT JOIN LATERAL (SELECT condition."status", condition."suspendedAt", condition."resolvedAt",
+                condition."consumedAt", condition."matchedTaskIds"
+              FROM "agent_wait_conditions" AS condition
+              WHERE condition."userId" = turn."userId" AND condition."sessionId" = turn."sessionId"
+                AND condition."turnId" = turn."id" AND condition."parentTaskId" = root."id"
+                AND left(condition."idempotencyKey", length($5)) = $5
+              ORDER BY condition."createdAt" DESC, condition."id" DESC LIMIT 1) AS wait ON TRUE
+            CROSS JOIN LATERAL (SELECT COUNT(*)::int AS "childCount",
+                COUNT(*) FILTER (WHERE task."status" = 'queued')::int AS "queuedCount",
+                COUNT(*) FILTER (WHERE task."status" = 'running')::int AS "runningCount",
+                COUNT(*) FILTER (WHERE task."status" = 'completed')::int AS "completedCount",
+                COUNT(*) FILTER (WHERE task."status" = 'failed')::int AS "failedCount",
+                COUNT(*) FILTER (WHERE task."id" = ANY($6::text[]) AND task."role" = 'writer'
+                  AND task."status" = 'running' AND task."leaseExpiresAt" > clock_timestamp())::int AS "liveWriterCount"
+              FROM "sub_agent_tasks" AS task WHERE task."sessionId" = turn."sessionId" AND task."turnId" = turn."id"
+                AND task."rootTaskId" = root."id" AND task."parentTaskId" = root."id" AND task."id" = ANY($4::text[])) AS children
+            CROSS JOIN LATERAL (SELECT COUNT(*)::int AS "dispatchCount",
+                COUNT(*) FILTER (WHERE dispatch."publishedAt" IS NOT NULL)::int AS "publishedCount",
+                MAX(dispatch."attemptCount")::int AS "attemptCount"
+              FROM "agent_outbox" AS dispatch WHERE dispatch."aggregateId" = turn."sessionId"
+                AND dispatch."topic" = 'agent.turn.dispatch' AND dispatch."idempotencyKey" = 'turn-dispatch:' || turn."id") AS turnDispatch
+            CROSS JOIN LATERAL (SELECT COUNT(*)::int AS "dispatchCount",
+                COUNT(*) FILTER (WHERE dispatch."publishedAt" IS NOT NULL)::int AS "publishedCount",
+                MAX(dispatch."attemptCount")::int AS "attemptCount"
+              FROM "sub_agent_tasks" AS task JOIN "agent_outbox" AS dispatch
+                ON dispatch."aggregateId" = task."sessionId" AND dispatch."topic" = 'agent.subagent.dispatch'
+                  AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
+              WHERE task."sessionId" = turn."sessionId" AND task."turnId" = turn."id"
+                AND task."rootTaskId" = root."id" AND task."parentTaskId" = root."id" AND task."id" = ANY($4::text[])) AS childDispatch
+            WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND session."userId" = $3
+              AND root."id" = $7 AND root."rootTaskId" = $7`,
+        [owner.turnId, owner.sessionId, owner.userId, targetTaskIds, waitKeyPrefix, writerTaskIds, rootTaskId])
+        const row = result.rows[0]
+        progress = row ? {
+          available: true,
+          turnStatus: diagnosticEnum(row.turnStatus, TURN_DIAGNOSTIC_STATUSES) ?? "other",
+          turnLeaseOwnerPresent: row.turnLeaseOwnerPresent === true,
+          rootStatus: row.rootStatus === null ? "missing" : diagnosticEnum(row.rootStatus, OBJECTIVE_TAILOR_ROOT_STATUSES) ?? "other",
+          rootStepStatus: row.rootStepStatus === null ? "missing" : diagnosticEnum(row.rootStepStatus, STEP_DIAGNOSTIC_STATUSES) ?? "other",
+          rootStepAttempt: boundedWorkerDiagnosticNumber(row.rootStepAttempt, 1, 100_000),
+          waitStatus: row.waitStatus === null ? "missing" : diagnosticEnum(row.waitStatus, WAIT_DIAGNOSTIC_STATUSES) ?? "other",
+          waitSuspended: row.waitSuspended === true, waitResolved: row.waitResolved === true,
+          waitConsumed: row.waitConsumed === true, waitMatchedCount: diagnosticBoundedCount(row.waitMatchedCount),
+          children: {
+            count: diagnosticBoundedCount(row.childCount), queued: diagnosticBoundedCount(row.queuedCount),
+            running: diagnosticBoundedCount(row.runningCount), completed: diagnosticBoundedCount(row.completedCount),
+            failed: diagnosticBoundedCount(row.failedCount), liveWriters: diagnosticBoundedCount(row.liveWriterCount),
+          },
+          turnDispatch: { count: diagnosticBoundedCount(row.turnDispatchCount), published: diagnosticBoundedCount(row.turnDispatchPublishedCount),
+            maxAttempt: boundedWorkerDiagnosticNumber(row.turnDispatchAttempt, 0, 100_000) },
+          childDispatch: { count: diagnosticBoundedCount(row.childDispatchCount), published: diagnosticBoundedCount(row.childDispatchPublishedCount),
+            maxAttempt: boundedWorkerDiagnosticNumber(row.childDispatchAttempt, 0, 100_000) },
+        } : { available: false }
+        const turnStatus = row?.turnStatus
+        const rootStatus = row?.rootStatus
+        if (turnStatus && ["completed", "failed", "interrupted", "cancelled"].includes(turnStatus)) fail("turn_terminal")
+        if (rootStatus && ["completed", "failed", "interrupted", "cancelled", "closed"].includes(rootStatus)) fail("root_terminal")
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith("Objective Tailor replay stage:")) throw error
+        progress = { available: false }
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  fail("deadline")
 }
 
 async function waitForObjectiveTailorStage(
@@ -21511,7 +21646,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
 
       resumedWorker = startObjectiveTailorWaveWorker("resume", value)
       await waitForProcessLine(resumedWorker, "TAILOR_WAVE_WORKER_READY resume", 60_000)
-      await waitForProcessLine(resumedWorker, "TAILOR_WAVE1_REPLAY_MATCHED", 120_000)
+      await waitForObjectiveTailorReplayStage(pool!, resumedWorker, value, rootTaskId, firstPairTaskIds,
+        expectedWriterIds, `p3-1336-wave1-wait:${value.turnId}:`, 120_000)
       await waitForProcessLine(resumedWorker, "TAILOR_WAVE1_WAIT_READY", 120_000)
       await waitForProcessLine(resumedWorker, "TAILOR_WAVE2_WAIT_READY", 120_000)
       await waitForProcessLine(resumedWorker, "TAILOR_WRONG_FEEDBACK_REJECTED", 120_000)

@@ -96,9 +96,12 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
       }
       if (tailors.length === 1 && phaseReady(request, "wave1", turnId)) {
         say("TAILOR_WAVE1_WAIT_READY")
+        say("TAILOR_WAVE1_REPLAY_EMITTED")
         yield* emitWaveReplay(request, turnId, tailors[0]); return
       }
       if (tailors.length === 2 && phaseReady(request, "wave1", turnId)) {
+        const replayResult = fixtureToolResult(request, tailors[1])
+        say(`TAILOR_WAVE1_REPLAY_RESULT_${replayResult ? "PRESENT" : "MISSING"}`)
         assertReplayMatches(request, tailors[0], tailors[1])
         say("TAILOR_WAVE1_REPLAY_MATCHED")
         yield* emitWave(turnId, "wave2", request, 4, say); return
