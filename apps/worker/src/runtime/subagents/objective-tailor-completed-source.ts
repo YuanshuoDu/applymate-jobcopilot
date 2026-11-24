@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import type { PoolClient } from "pg"
-import { parseObjectiveTailorFinalOutcomeSidecar } from "@jobcopilot/agent-protocol"
+import { parseObjectiveApplicationReviewIntent, parseObjectiveTailorFinalOutcomeSidecar } from "@jobcopilot/agent-protocol"
 import { verifyCompletedObjectiveTailorWaveSlots, type ObjectiveTailorWaveCompletionWitness, type ObjectiveTailorWaveSlotOutcome } from "../canonical-objective-tailor-wave-completion.js"
 import { readObjectiveTailorWaveInventory, type ObjectiveTailorWaveInventory } from "./objective-tailor-wave-inventory.js"
 import { loadTaskGraph, type GraphIdentityScope, type LoadedGraph } from "./task-graph-pg-state.js"
@@ -13,7 +13,7 @@ export type CompletedObjectiveTailorSourceEvidence = Readonly<{
   witness: ObjectiveTailorWaveCompletionWitness; outcomes: readonly ObjectiveTailorWaveSlotOutcome[]
 }>
 type Input = Readonly<{ userId: string; sessionId: string; reviewTurnId: string; sourceTurnId: string; rootTaskId: string;
-  graphItemId: string; graphRevision: number; selectedSlotIds: readonly string[] }>
+  graphItemId: string; graphRevision: number; selectedSlotIds: readonly string[]; reviewTurnMode?: "active" | "completed" }>
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
 const MANIFEST_V1 = "agent-harness.v2.task-graph-sources.v1"
 const MANIFEST_V2 = "agent-harness.v2.task-graph-sources.v2"
@@ -30,9 +30,16 @@ async function readSource(client: Queryable, input: Input): Promise<CompletedObj
   if (!one(await client.query(`SELECT "id" FROM "User" WHERE "id" = $1 FOR UPDATE NOWAIT`, [input.userId]), input.userId)) return undefined
   if (!one(await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted','archived') FOR SHARE NOWAIT`,
     [input.sessionId, input.userId]), input.sessionId)) return undefined
-  const review = await client.query(`SELECT "id", "status", "source" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR SHARE NOWAIT`,
+  const review = await client.query(`SELECT "id", "status", "source", "executionMode", "rootTaskId", "input" FROM "agent_turns"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR SHARE NOWAIT`,
     [input.reviewTurnId, input.sessionId, input.userId])
-  if (review.rows.length !== 1 || review.rows[0]?.id !== input.reviewTurnId || review.rows[0].status !== "in_progress" || review.rows[0].source !== "user") return undefined
+  const reviewTurn = review.rows[0] as Row | undefined, reviewMode = input.reviewTurnMode ?? "active"
+  if (reviewMode !== "active" && reviewMode !== "completed") return undefined
+  if (review.rows.length !== 1 || reviewTurn?.id !== input.reviewTurnId || reviewTurn.source !== "user"
+    || reviewTurn.status !== (reviewMode === "completed" ? "completed" : "in_progress")) return undefined
+  if (reviewMode === "completed" && (!safeId(reviewTurn.rootTaskId) || reviewTurn.rootTaskId === input.rootTaskId
+    || reviewTurn.executionMode !== "canonical_task_graph" || !reviewIntentMatches(reviewTurn.input, input)
+    || !await completedReviewRoot(client, input, reviewTurn.rootTaskId))) return undefined
   const source = await client.query(`SELECT "id", "rootTaskId", "status", "source", "executionMode" FROM "agent_turns"
     WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR SHARE NOWAIT`, [input.sourceTurnId, input.sessionId, input.userId])
   const turn = source.rows[0] as Row | undefined
@@ -167,6 +174,21 @@ function one(result: { rows: Row[] }, id: string): boolean { return result.rows.
 function validIds(value: Input): boolean {
   return [value.userId, value.sessionId, value.reviewTurnId, value.sourceTurnId, value.rootTaskId, value.graphItemId].every(safeId)
     && Number.isSafeInteger(value.graphRevision) && value.graphRevision > 0
+}
+function reviewIntentMatches(value: unknown, input: Input): boolean {
+  const turnInput = record(value), envelope = record(turnInput?.intent)
+  const selection = envelope?.kind === "objective_application_review" && envelope.version === 1
+    ? parseObjectiveApplicationReviewIntent(envelope.selection) : null
+  const ordinals = input.selectedSlotIds.map(slotId => Number(slotId.slice(7)))
+  return !!selection && selection.sourceTurnId === input.sourceTurnId && selection.rootTaskId === input.rootTaskId
+    && selection.graphItemId === input.graphItemId && selection.graphRevision === input.graphRevision
+    && selection.slotOrdinals.length === ordinals.length && selection.slotOrdinals.every((ordinal, index) => ordinal === ordinals[index])
+}
+async function completedReviewRoot(client: Queryable, input: Input, rootTaskId: string): Promise<boolean> {
+  const result = await client.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3
+    AND "rootTaskId"=$1 AND "parentTaskId" IS NULL AND "role"='orchestrator' AND "taskType"='root' AND "depth"=0
+    AND "status"='completed' FOR SHARE NOWAIT`, [rootTaskId, input.sessionId, input.reviewTurnId])
+  return one(result, rootTaskId)
 }
 function validSlots(value: readonly string[]): boolean {
   return Array.isArray(value) && value.length > 0 && value.length <= 8 && Reflect.ownKeys(value).length === value.length + 1

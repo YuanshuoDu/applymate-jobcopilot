@@ -1,9 +1,10 @@
 import type { Page } from "playwright-core"
 import { describe, expect, it, vi } from "vitest"
+import { OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA } from "@jobcopilot/shared"
 import type { HarnessResult } from "../../harness/agent-harness.js"
 import type { SelectedJobReviewedArtifact } from "../selected-job-reviewed-artifact-read.js"
 import type { SubagentLease } from "./types.js"
-import { reviewedMaterialWasFilled } from "./application-fill-reviewed-readback.js"
+import { objectiveReviewedMaterialWasFilled, reviewedMaterialWasFilled } from "./application-fill-reviewed-readback.js"
 
 const proof: SelectedJobReviewedArtifact = {
   sourceTurnId: "source-turn-1", rootTaskId: "root-1", graphRevision: 2, jobId: "job-1",
@@ -16,6 +17,8 @@ const lease = {
   id: "filler-1", userId: "user-1", sessionId: "session-1", turnId: "fill-turn-1",
   attemptCount: 2, leaseOwner: "worker-1", ownerId: "worker-1", leaseExpiresAt: new Date("2026-11-21T16:00:00.000Z"),
 } as unknown as SubagentLease
+const objectiveSource = { schemaVersion: OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA,
+  approvalId: `objective-review:objective-review-${"d".repeat(40)}:1`, reviewTurnId: "review-turn-1", materialProofHash: "e".repeat(64) }
 
 function surface(options: { count?: number; tag?: string; value?: string; fail?: boolean } = {}) {
   const element = { tagName: options.tag ?? "TEXTAREA", value: options.value ?? proof.content } as unknown as Element
@@ -49,6 +52,17 @@ describe("reviewed material browser readback", () => {
       userId: "user-1", sessionId: "session-1", fillTurnId: "fill-turn-1", applicationTaskId: "application-1",
       jobId: "job-1", fillerTaskId: "filler-1", attemptCount: 2, sourceTurnId: "source-turn-1",
     })
+    expect(locator.evaluate).toHaveBeenCalled()
+  })
+
+  it("binds the Objective selector to a readback only after the same exact cover-letter field", async () => {
+    const { page, locator } = surface()
+    const readback = await objectiveReviewedMaterialWasFilled(page, result([
+      { field: "coverLetter", selector: "textarea#cover-letter", action: "fill", phase: "completed" },
+    ]), proof, objectiveSource, lease, "application-1")
+    expect(readback).toMatchObject({ schemaVersion: "agent-harness.v2.objective-reviewed-fill-readback.v1",
+      userId: "user-1", sessionId: "session-1", fillTurnId: "fill-turn-1", applicationTaskId: "application-1",
+      jobId: "job-1", objectiveSource, sourceTurnId: "source-turn-1" })
     expect(locator.evaluate).toHaveBeenCalled()
   })
 

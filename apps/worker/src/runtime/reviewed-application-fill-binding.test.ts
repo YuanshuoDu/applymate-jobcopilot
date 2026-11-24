@@ -1,10 +1,16 @@
 import type { Pool, PoolClient } from "pg"
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA, buildObjectiveApplicationResumeWitness,
+  type ObjectiveApplicationResumeMaterial, type ObjectiveReviewedFillSource } from "@jobcopilot/shared"
 import { readSelectedJobReviewedArtifactWithClient, type SelectedJobReviewedArtifact } from "./selected-job-reviewed-artifact-read.js"
-import { claimApplicationFillBrowserStart, reviewedApplicationFillSelector } from "./reviewed-application-fill-binding.js"
+import { claimApplicationFillBrowserStart, OBJECTIVE_REVIEWED_FILL_BROWSER_START_SCHEMA,
+  reviewedApplicationFillSelector, sameReviewedApplicationFillSelector } from "./reviewed-application-fill-binding.js"
+import type { ObjectiveReviewedApplicationFillEvidence } from "./objective-reviewed-application-fill-read.js"
 import type { SubagentLease } from "./subagents/types.js"
 
 vi.mock("./selected-job-reviewed-artifact-read.js", () => ({ readSelectedJobReviewedArtifactWithClient: vi.fn() }))
+const objectiveReader = vi.hoisted(() => ({ read: vi.fn() }))
+vi.mock("./objective-reviewed-application-fill-read.js", () => ({ readObjectiveReviewedApplicationFillSource: objectiveReader.read }))
 
 const proof: SelectedJobReviewedArtifact = {
   sourceTurnId: "source-turn-a", rootTaskId: "root-a", graphRevision: 4, jobId: "job-a", writerTaskId: "writer-a",
@@ -16,6 +22,15 @@ const selector = { kind: "selected", sourceTurnId: "source-turn-a" } as const
 const selectedTurnInput = { reviewedApplicationMaterialSource: {
   schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source-turn-a",
 } }
+const objectiveSource: ObjectiveReviewedFillSource = { schemaVersion: OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA,
+  approvalId: `objective-review:objective-review-${"c".repeat(40)}:1`, reviewTurnId: "review-turn-a", materialProofHash: "d".repeat(64) }
+const objectiveSelector = { kind: "objective", source: objectiveSource } as const
+const objectiveResume: ObjectiveApplicationResumeMaterial = { name: "Tailored", content: { basics: { name: "Applicant" } },
+  templateId: "modern", templateOptions: null, kind: "adapted", targetJobId: "job-a", parentResumeId: null, basicsDetached: false }
+const objectiveWitness = buildObjectiveApplicationResumeWitness({ userId: "user-a", jobId: "job-a", resumeId: "resume-a",
+  finalResumeAssignmentRevision: 2, materialRevision: 3, material: objectiveResume })!
+const objectiveEvidence: ObjectiveReviewedApplicationFillEvidence = { source: objectiveSource, approvedIntent: {} as never,
+  proof: {} as never, reviewedArtifact: proof, resumeWitness: objectiveWitness, resumeContent: objectiveResume.content }
 
 function lease(): SubagentLease {
   return {
@@ -53,13 +68,44 @@ function fixture(options: { turnInput?: unknown; checkpoint?: string; subtaskFou
   return { calls, client, pool }
 }
 
-beforeEach(() => vi.mocked(readSelectedJobReviewedArtifactWithClient).mockReset().mockResolvedValue(proof))
+beforeEach(() => {
+  vi.mocked(readSelectedJobReviewedArtifactWithClient).mockReset().mockResolvedValue(proof)
+  objectiveReader.read.mockReset().mockResolvedValue(objectiveEvidence)
+})
 
 describe("reviewed application fill browser binding", () => {
   it("parses only the exact accepted source selector", () => {
     expect(reviewedApplicationFillSelector({})).toEqual({ kind: "absent" })
     expect(reviewedApplicationFillSelector(selectedTurnInput)).toEqual(selector)
+    expect(reviewedApplicationFillSelector({ reviewedApplicationMaterialSource: objectiveSource })).toEqual(objectiveSelector)
     expect(reviewedApplicationFillSelector({ reviewedApplicationMaterialSource: { ...selectedTurnInput.reviewedApplicationMaterialSource, extra: true } })).toEqual({ kind: "invalid" })
+    expect(sameReviewedApplicationFillSelector(objectiveSelector, { ...objectiveSelector, source: { ...objectiveSource, materialProofHash: "e".repeat(64) } })).toBe(false)
+  })
+
+  it("writes only the bounded Objective source proof with the browser-start event", async () => {
+    const test = fixture({ turnInput: { reviewedApplicationMaterialSource: objectiveSource } })
+    const result = await claimApplicationFillBrowserStart({ pool: test.pool, lease: lease(), expectedSelector: objectiveSelector,
+      expectedObjectiveResumeWitness: objectiveWitness, applicationTaskId: "application-a", jobId: "job-a" })
+    expect(result).toMatchObject({ status: "claimed", reviewedMaterial: proof, objectiveEvidence })
+    expect(objectiveReader.read).toHaveBeenCalledWith(test.client, expect.objectContaining({ phase: "browser_start",
+      userId: "user-a", sessionId: "session-a", fillTurnId: "fill-turn-a", applicationTaskId: "application-a", jobId: "job-a" }))
+    const event = test.calls.find(call => call.sql.includes('INSERT INTO "application_task_events"'))!
+    const data = JSON.parse(String(event.values[3])) as Record<string, unknown>
+    expect(data).toMatchObject({ schemaVersion: OBJECTIVE_REVIEWED_FILL_BROWSER_START_SCHEMA, objectiveSource,
+      userId: "user-a", sessionId: "session-a", fillTurnId: "fill-turn-a", jobId: "job-a", artifactId: proof.artifactId })
+    expect(Object.keys(data)).not.toContain("resumeContent")
+    expect(JSON.stringify(data)).not.toContain(JSON.stringify(objectiveResume.content))
+  })
+
+  it("does not claim Objective browser start after the Resume witness changes", async () => {
+    objectiveReader.read.mockResolvedValueOnce({ ...objectiveEvidence,
+      resumeWitness: { ...objectiveWitness, materialRevision: objectiveWitness.materialRevision + 1 } })
+    const test = fixture({ turnInput: { reviewedApplicationMaterialSource: objectiveSource } })
+    const result = await claimApplicationFillBrowserStart({ pool: test.pool, lease: lease(), expectedSelector: objectiveSelector,
+      expectedObjectiveResumeWitness: objectiveWitness, applicationTaskId: "application-a", jobId: "job-a" })
+    expect(result).toEqual({ status: "conflict" })
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "application_task_events"'))).toBe(false)
+    expect(test.calls.some(call => call.sql.includes("UPDATE application_tasks AS app"))).toBe(false)
   })
 
   it("fences and revalidates source proof before atomically writing the private binding event and browser checkpoint", async () => {

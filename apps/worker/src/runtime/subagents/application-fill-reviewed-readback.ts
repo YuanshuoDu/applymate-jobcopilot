@@ -1,6 +1,8 @@
 import type { Page } from "playwright-core"
+import type { ObjectiveReviewedFillSource } from "@jobcopilot/shared"
 import type { HarnessResult } from "../../harness/agent-harness.js"
-import { createReviewedApplicationFillReadback, type ReviewedApplicationFillReadback } from "../../db/reviewed-application-fill-completion.js"
+import { createObjectiveReviewedApplicationFillReadback, createReviewedApplicationFillReadback,
+  type ObjectiveReviewedApplicationFillReadback, type ReviewedApplicationFillReadback } from "../../db/reviewed-application-fill-completion.js"
 import type { SelectedJobReviewedArtifact } from "../selected-job-reviewed-artifact-read.js"
 import type { SubagentLease } from "./types.js"
 
@@ -12,6 +14,20 @@ export async function reviewedMaterialWasFilled(
   lease: SubagentLease,
   applicationTaskId: string,
 ): Promise<ReviewedApplicationFillReadback | null | false> {
+  const matched = await reviewedFieldWasFilled(page, result, proof)
+  return matched === true ? createReviewedApplicationFillReadback(lease, applicationTaskId, proof) : matched
+}
+
+/** Binds the exact Objective approval selector to the same observed cover-letter field. */
+export async function objectiveReviewedMaterialWasFilled(
+  page: Page, result: HarnessResult, proof: SelectedJobReviewedArtifact, source: ObjectiveReviewedFillSource,
+  lease: SubagentLease, applicationTaskId: string,
+): Promise<ObjectiveReviewedApplicationFillReadback | null | false> {
+  const matched = await reviewedFieldWasFilled(page, result, proof)
+  return matched === true ? createObjectiveReviewedApplicationFillReadback(lease, applicationTaskId, source, proof) : matched
+}
+
+async function reviewedFieldWasFilled(page: Page, result: HarnessResult, proof: SelectedJobReviewedArtifact): Promise<boolean | null | false> {
   const selectors: string[] = []
   for (const entry of result.log ?? []) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue
@@ -30,6 +46,6 @@ export async function reviewedMaterialWasFilled(
       const tag = element.tagName.toLowerCase()
       return tag === "input" || tag === "textarea" ? (element as HTMLInputElement | HTMLTextAreaElement).value : null
     }, undefined, { timeout: 1000 })
-    return current === proof.content ? createReviewedApplicationFillReadback(lease, applicationTaskId, proof) : null
+    return current === proof.content ? true : null
   } catch { return false }
 }

@@ -1,10 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { TurnLease } from "./turns/lease.js"
+import { OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA } from "@jobcopilot/shared"
 import { readSelectedJobReviewedArtifactWithClient, type SelectedJobReviewedArtifact } from "./selected-job-reviewed-artifact-read.js"
 import { loadApplicationFillPreparation } from "./application-fill-preparation.js"
 
 vi.mock("./selected-job-reviewed-artifact-read.js", () => ({ readSelectedJobReviewedArtifactWithClient: vi.fn() }))
+const objectiveReader = vi.hoisted(() => ({ read: vi.fn() }))
+vi.mock("./objective-reviewed-application-fill-read.js", () => ({ readObjectiveReviewedApplicationFillSource: objectiveReader.read }))
 
 type BoundRow = { id: string; userId: string; jobId: string; sessionId: string; fillTurnSessionId: string; fillTurnUserId: string; turnInput: unknown; status: string; checkpoint: string }
 const boundTask: BoundRow = {
@@ -18,8 +21,13 @@ const reviewedProof: SelectedJobReviewedArtifact = {
   artifactId: "artifact-a", version: 2, contentHash: `sha256:${"b".repeat(64)}`,
   sourceDigest: `sha256:${"c".repeat(64)}`, content: "reviewed draft",
 }
+const objectiveSource = { schemaVersion: OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA,
+  approvalId: `objective-review:objective-review-${"a".repeat(40)}:1`, reviewTurnId: "review-turn-a", materialProofHash: "b".repeat(64) }
 
-beforeEach(() => vi.mocked(readSelectedJobReviewedArtifactWithClient).mockReset().mockResolvedValue(null))
+beforeEach(() => {
+  vi.mocked(readSelectedJobReviewedArtifactWithClient).mockReset().mockResolvedValue(null)
+  objectiveReader.read.mockReset().mockResolvedValue(undefined)
+})
 
 function fixture(boundRows: BoundRow[] = [boundTask], materialRows: Array<{ id: string }> = [{ id: "application-a" }]) {
   const lease: TurnLease = {
@@ -32,6 +40,8 @@ function fixture(boundRows: BoundRow[] = [boundTask], materialRows: Array<{ id: 
       calls.push({ sql, values })
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 0 }
       if (sql.includes("set_config")) return { rows: [{ set_config: "user-a" }], rowCount: 1 }
+      if (sql.includes("pg_advisory_xact_lock")) return { rows: [{ transaction_id: "123", lock_acquired: null }], rowCount: 1 }
+      if (sql.includes("pg_current_xact_id")) return { rows: [{ transaction_id: "123" }], rowCount: 1 }
       if (sql.includes('FROM "agent_turns"')) return { rows: boundRows, rowCount: boundRows.length }
       if (sql.includes('FROM "application_tasks"')) return { rows: materialRows, rowCount: materialRows.length }
       throw new Error(`unexpected preparation query: ${sql}`)
@@ -83,6 +93,37 @@ describe("application-fill preparation", () => {
     expect(readSelectedJobReviewedArtifactWithClient).toHaveBeenCalledWith(test.client, {
       userId: "user-a", sessionId: "session-a", jobId: "job-a", sourceTurnId,
     })
+  })
+
+  it("admits an Objective Fill only after its source-fenced reader revalidates the exact marker", async () => {
+    const test = fixture([{ ...boundTask, turnInput: { reviewedApplicationMaterialSource: objectiveSource } }])
+    objectiveReader.read.mockImplementation(async () => {
+      test.calls.push({ sql: "OBJECTIVE_SOURCE_READ" })
+      return { source: objectiveSource }
+    })
+    await expect(loadApplicationFillPreparation(test.pool, test.lease)).resolves.toEqual({ available: true })
+    expect(test.calls.findIndex(call => call.sql.includes("pg_advisory_xact_lock"))).toBeLessThan(
+      test.calls.findIndex(call => call.sql === "OBJECTIVE_SOURCE_READ"))
+    expect(objectiveReader.read).toHaveBeenCalledWith(test.client, expect.objectContaining({ phase: "prepare",
+      userId: "user-a", sessionId: "session-a", fillTurnId: "turn-a", applicationTaskId: "application-a", jobId: "job-a" }))
+    expect(readSelectedJobReviewedArtifactWithClient).not.toHaveBeenCalled()
+  })
+
+  it("fails with a bounded error instead of generic task templates for stale or malformed Objective markers", async () => {
+    const valid = fixture([{ ...boundTask, turnInput: { reviewedApplicationMaterialSource: objectiveSource } }])
+    await expect(loadApplicationFillPreparation(valid.pool, valid.lease)).rejects.toThrow("objective_application_fill_unavailable")
+    const malformed = fixture([{ ...boundTask, turnInput: { reviewedApplicationMaterialSource: { ...objectiveSource, extra: true } } }])
+    await expect(loadApplicationFillPreparation(malformed.pool, malformed.lease)).rejects.toThrow("objective_application_fill_unavailable")
+    expect(malformed.calls.some(call => call.sql === "COMMIT")).toBe(false)
+    expect(malformed.calls.some(call => call.sql === "ROLLBACK")).toBe(true)
+  })
+
+  it("does not route a browser-active Objective Fill into generic interactive templates", async () => {
+    const test = fixture([{ ...boundTask, turnInput: { reviewedApplicationMaterialSource: objectiveSource }, checkpoint: "browser_active" }])
+    await expect(loadApplicationFillPreparation(test.pool, test.lease)).rejects.toThrow("objective_application_fill_unavailable")
+    expect(objectiveReader.read).not.toHaveBeenCalled()
+    expect(test.calls.some(call => call.sql === "COMMIT")).toBe(false)
+    expect(test.calls.some(call => call.sql === "ROLLBACK")).toBe(true)
   })
 
   it.each(["stale", "ambiguous"]) ("withholds the template when the terminal source reader reports %s evidence", async () => {

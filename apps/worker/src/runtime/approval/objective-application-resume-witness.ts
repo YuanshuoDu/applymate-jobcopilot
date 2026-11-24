@@ -6,6 +6,10 @@ import {
 } from "@jobcopilot/shared"
 
 export type ObjectiveApplicationResumeWitnessScope = Readonly<{ userId: string; jobId: string }>
+export type ObjectiveApplicationResumeMaterialRead = Readonly<{
+  witness: ObjectiveApplicationResumeWitness
+  resumeContent: unknown
+}>
 
 type ResumeRow = Readonly<{
   jobId: string; userId: string; finalResumeId: string | null; finalResumeAssignmentRevision: number
@@ -19,6 +23,14 @@ export async function readObjectiveApplicationResumeWitness(
   client: Pick<PoolClient, "query">,
   scope: ObjectiveApplicationResumeWitnessScope,
 ): Promise<ObjectiveApplicationResumeWitness | null> {
+  return (await readObjectiveApplicationResumeMaterial(client, scope))?.witness ?? null
+}
+
+/** Reads content and its revision/hash witness from the same exact Job-to-Resume row. */
+export async function readObjectiveApplicationResumeMaterial(
+  client: Pick<PoolClient, "query">,
+  scope: ObjectiveApplicationResumeWitnessScope,
+): Promise<ObjectiveApplicationResumeMaterialRead | null> {
   if (!validScope(scope)) return null
   const result = await client.query<ResumeRow>(`
     SELECT job."id" AS "jobId", job."userId", job."finalResumeId",
@@ -44,10 +56,11 @@ export async function readObjectiveApplicationResumeWitness(
     name: row.name, content: row.content, templateId: row.templateId, templateOptions: row.templateOptions,
     kind: row.kind, targetJobId: row.targetJobId, parentResumeId: row.parentResumeId, basicsDetached: row.basicsDetached,
   }
-  return buildObjectiveApplicationResumeWitness({
+  const witness = buildObjectiveApplicationResumeWitness({
     userId: scope.userId, jobId: scope.jobId, resumeId: row.resumeId,
     finalResumeAssignmentRevision: row.finalResumeAssignmentRevision, materialRevision: row.materialRevision, material,
   })
+  return witness && plainResumeContent(row.content) ? { witness, resumeContent: row.content } : null
 }
 
 function validScope(value: unknown): value is ObjectiveApplicationResumeWitnessScope {
@@ -66,4 +79,10 @@ function nullableString(value: unknown): value is string | null {
 
 function revision(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+}
+
+function plainResumeContent(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  try { return Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null }
+  catch { return false }
 }

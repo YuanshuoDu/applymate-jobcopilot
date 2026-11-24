@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { PoolClient } from "pg"
-import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA, OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA } from "@jobcopilot/agent-protocol"
 import type { ObjectiveTailorWaveCompletionWitness, ObjectiveTailorWaveSlotOutcome } from "../canonical-objective-tailor-wave-completion.js"
 import type { ObjectiveTailorWaveInventory } from "./objective-tailor-wave-inventory.js"
 import type { LoadedGraph } from "./task-graph-pg-state.js"
@@ -48,14 +48,17 @@ function finalContent(statuses: readonly string[] = ["ready", "stale"], revision
     objectiveTailorFinalOutcomes: { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA,
       slots: statuses.map((status, index) => ({ ordinal: index + 1, status })) } }
 }
-function makeClient(overrides: { reviewStatus?: string; sourceStatus?: string; sourceUserId?: string; eventCount?: number; itemCount?: number; content?: unknown } = {}) {
+function makeClient(overrides: { reviewStatus?: string; sourceStatus?: string; sourceUserId?: string; eventCount?: number; itemCount?: number;
+  content?: unknown; reviewInput?: unknown; reviewRootTaskId?: string } = {}) {
   const content = overrides.content ?? finalContent()
   const query = vi.fn(async (sql: string, values: unknown[] = []) => {
     if (sql.includes('FROM "User"')) return { rows: [{ id: ids.userId }] }
     if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: ids.sessionId }] }
     if (sql.includes('FROM "agent_turns"')) return { rows: [{ id: values[0], status: values[0] === ids.reviewTurnId ? overrides.reviewStatus ?? "in_progress" : overrides.sourceStatus ?? "completed",
-      source: "user", rootTaskId: ids.rootTaskId, executionMode: "canonical_task_graph" }] }
+      source: "user", rootTaskId: values[0] === ids.reviewTurnId ? overrides.reviewRootTaskId ?? "review-root-1" : ids.rootTaskId,
+      executionMode: "canonical_task_graph", input: overrides.reviewInput }] }
     if (sql.includes('task."attemptCount"')) return { rows: [{ id: ids.rootTaskId, attemptCount: 1, result: { status: "completed", finalItemId: "final-1" } }] }
+    if (sql.includes('SELECT "id" FROM "sub_agent_tasks"')) return { rows: [{ id: overrides.reviewRootTaskId ?? "review-root-1" }] }
     if (sql.includes('FOR SHARE OF task NOWAIT')) return { rows: [...tasks.values()] }
     if (sql.includes('FROM "agent_events"')) return { rows: Array.from({ length: overrides.eventCount ?? 1 }, () => ({ id: "terminal-event", itemId: "final-1", taskId: ids.rootTaskId,
       actor: "orchestrator", idempotencyKey: "turn:" + ids.sourceTurnId + ":event:turn-completed", payload: { turnId: ids.sourceTurnId, taskId: ids.rootTaskId, finalItemId: "final-1" } })) }
@@ -89,6 +92,22 @@ describe("completed Objective Tailor source reader", () => {
   it("keeps unselected stale outcomes from blocking a selected ready slot", async () => {
     const { client } = makeClient({ content: finalContent(["ready", "stale"]) })
     await expect(readCompletedObjectiveTailorSourceEvidence(client, input(["tailor-1"]))).resolves.toMatchObject({ outcomes: [{ slotId: "tailor-1", status: "ready" }] })
+  })
+
+  it("allows the exact completed review Turn selection while preserving the active issuance default", async () => {
+    const reviewInput = { intent: { kind: "objective_application_review", version: 1, selection: {
+      schema: OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA, sourceTurnId: ids.sourceTurnId, rootTaskId: ids.rootTaskId,
+      graphItemId: ids.graphItemId, graphRevision: ids.graphRevision, slotOrdinals: [1],
+    } } }
+    const completed = makeClient({ reviewStatus: "completed", reviewInput })
+    await expect(readCompletedObjectiveTailorSourceEvidence(completed.client, { ...input(), reviewTurnMode: "completed" }))
+      .resolves.toMatchObject({ outcomes: [{ slotId: "tailor-1", status: "ready" }] })
+    expect(completed.query.mock.calls.some(([sql]) => String(sql).includes('SELECT "id" FROM "sub_agent_tasks"'))).toBe(true)
+
+    const changedSelection = makeClient({ reviewStatus: "completed", reviewInput: { intent: { ...reviewInput.intent,
+      selection: { ...reviewInput.intent.selection, graphRevision: ids.graphRevision - 1 } } } })
+    await expect(readCompletedObjectiveTailorSourceEvidence(changedSelection.client, { ...input(), reviewTurnMode: "completed" }))
+      .resolves.toBeUndefined()
   })
 
   it.each([
