@@ -32,7 +32,7 @@ import { recoverExpired as recoverExpiredSubagentTasks } from "./pg-store-expiry
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
-import { TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT, materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
+import { TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT, materializeTaskGraphDependencyContext, writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.js"
 import { selectedJobArtifactCompletionGate, selectedJobArtifactCompletionGateWithWitness } from "../selected-job-completion-gate.js"
 import { selectedJobArtifactFinalizationGuard } from "../selected-job-finalization-guard.js"
 import { commitTurnTerminal } from "../turns/turn-engine-terminal-commit.js"
@@ -3460,6 +3460,45 @@ function latestToolResult(request: HarnessModelRequest, callId: string): unknown
     }
   }
   return null
+}
+
+function objectiveTailorCandidateFromRequest(request: HarnessModelRequest): { graphRevision: number; candidateRef: string } {
+  const catalogs: RecordValue[] = []
+  for (const message of request.messages) for (const part of message.content) {
+    if (part.type !== "text" || !part.text.includes("objective_tailor_candidate_catalog")) continue
+    const separator = part.text.indexOf("\n")
+    if (separator < 0) continue
+    try {
+      const observation = record(JSON.parse(part.text.slice(separator + 1)) as unknown)
+      const catalog = record(observation?.catalog)
+      if (observation?.kind === "objective_tailor_candidate_catalog"
+        && catalog?.schemaVersion === "agent-harness.v2.objective-tailor-candidate-catalog.v1") catalogs.push(catalog)
+    } catch { /* Ignore malformed historical observations; only a current closed catalog can be selected. */ }
+  }
+  const catalog = catalogs.at(-1)
+  const candidates = Array.isArray(catalog?.candidates) ? catalog.candidates.map(record) : []
+  const candidate = candidates[0]
+  if (!catalog || !Number.isSafeInteger(catalog.graphRevision) || candidates.length !== 1
+    || typeof candidate?.candidateRef !== "string" || !/^otc1_[a-f0-9]{64}$/.test(candidate.candidateRef)) {
+    throw new Error("Objective Tailor current candidate catalog was unavailable")
+  }
+  return { graphRevision: Number(catalog.graphRevision), candidateRef: candidate.candidateRef }
+}
+
+function childRuntimeContextFromRequest(request: HarnessModelRequest): RecordValue {
+  const contexts: RecordValue[] = []
+  for (const message of request.messages) for (const part of message.content) {
+    if (part.type !== "text" || !part.text.includes("\"runtimeContext\"")) continue
+    const separator = part.text.indexOf("\n")
+    if (separator < 0) continue
+    try {
+      const profile = record(JSON.parse(part.text.slice(separator + 1)) as unknown)
+      const context = record(profile?.runtimeContext)
+      if (context) contexts.push(context)
+    } catch { /* Other request text is not a child runtime projection. */ }
+  }
+  if (contexts.length !== 1) throw new Error("Objective Tailor child runtime context was unavailable")
+  return contexts[0]!
 }
 
 type ExactToolResultPair = Readonly<{
@@ -20079,7 +20118,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       releaseScoutExecution.resolve()
     }
   }, 60_000)
-  it("admits a registered Scout-to-Analyst plan from a typed finding ObjectiveStart", async () => {
+  it("runs ObjectiveStart through verified Analyst evidence and a production Tailor Writer/Reviewer pair", async () => {
     const value = objectiveAnalystAuthorityOwner
     const [workerQueue, canonical, subagentQueue, commandPortModule] = await Promise.all([
       import("../../queue/production-bootstrap.js"), import("../canonical-turn-runtime.js"),
@@ -20128,10 +20167,17 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       VALUES ($1, $2, 'Objective Analyst Fixture', 'Software Engineer', 'Dublin', 'saved',
         'https://jobs.example.invalid/objective-analyst', 'Build reliable services', 'greenhouse', CURRENT_TIMESTAMP)
       ON CONFLICT ("id") DO NOTHING`, [jobId, value.userId])
+    await pool!.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "updatedAt")
+      VALUES ($1, $2, 'Objective Tailor integration base', $3::jsonb, 'base', 'manual', TRUE, CURRENT_TIMESTAMP)`,
+    [`p3-1327-tailor-resume-${value.suffix}`, value.userId, JSON.stringify({ text: `Synthetic resume evidence ${value.suffix}` })])
+    await pool!.query(`INSERT INTO persona_facts
+      ("id", "userId", "key", "category", "value", "normalized_value", "source", "source_ref", "confidence", "status", "allowedUses", "updated_at")
+      VALUES ($1, $2, 'language', 'language', $3, 'english-c1', 'resume', $4, 0.98, 'confirmed', ARRAY['cover_letter']::text[], CURRENT_TIMESTAMP)`,
+    [`p3-1327-tailor-fact-${value.suffix}`, value.userId, `Synthetic confirmed profile fact ${value.suffix}`, `resume:p3-1327-tailor-resume-${value.suffix}:language`])
 
     const flags: ProductionAgentFlags = {
       taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
-      consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
+      consumeWaitOutcomes: true, objectiveTailorEnabled: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
     }
     const profile = {
       provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
@@ -20142,6 +20188,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const planCallId = `p3-1231-analyst-plan:${value.turnId}`
     const waitCallId = `p3-1231-analyst-wait:${value.turnId}`
     const waitKey = `p3-1231-analyst-wait:${value.turnId}`
+    const tailorCallId = `p3-1327-objective-tailor:${value.turnId}`
+    const pairWaitCallId = `p3-1327-tailor-pair-wait:${value.turnId}`
+    const pairWaitKey = `p3-1327-tailor-pair-wait:${value.turnId}`
     const rootToolNames = deferredSignal<string[]>()
     const planReceipt = deferredSignal<RecordValue>()
     const scoutReadObserved = deferredSignal<void>()
@@ -20150,11 +20199,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const analystReadObserved = deferredSignal<string>()
     let targetRootTaskId: string | null = null
     let expectedAnalystTaskId: string | null = null
+    let expectedWriterTaskId: string | null = null
+    let expectedReviewerTaskId: string | null = null
+    let expectedCandidateRef: string | null = null
+    let expectedCandidateRevision: number | null = null
     let analystExecutionStarted = false
     let rootFinalDiagnosticStage = "runtime_setup"
     let finalWaitCallDiagnostic: RepairWaitCallInputDiagnostic | null = null
     let finalWaitOutputDiagnostic: RecordValue = { available: false }
-    let rootModelStage: "plan" | "wait" | "final" | "done" = "plan"
+    let rootModelStage: "plan" | "wait" | "tailor" | "pair_wait" | "final" | "done" = "plan"
     const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags, authorizeUsage: authorizeUnreservedUsage,
       taskGraphTemplates: TASK_GRAPH_TEMPLATES, taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
@@ -20248,7 +20301,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expectedAnalystTaskId = analystTaskId
               planReceipt.resolve(plan)
               rootFinalDiagnosticStage = "wait_emitting"
-              rootModelStage = "final"
+              rootModelStage = "tailor"
               yield { type: "tool_call_completed", callId: waitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: waitKey, taskIds: [analystTaskId], mode: "all", timeoutMs: 30_000,
               } }
@@ -20256,8 +20309,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               rootFinalDiagnosticStage = "wait_completed"
               return
             }
-            if (rootModelStage === "final") {
-              rootFinalDiagnosticStage = "final_request_received"
+            if (rootModelStage === "tailor") {
+              rootFinalDiagnosticStage = "analyst_wait_outcome_received"
               const expectedAnalystId = expectedAnalystTaskId
               if (!expectedAnalystId) {
                 await finalProjectionFailure("wait")
@@ -20315,10 +20368,81 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 expectPassedVerificationReport(nodes[1]?.verificationReport, "finding-count", "findings-from-scout")
               } catch { await finalProjectionFailure("graph") }
               rootFinalDiagnosticStage = "graph_evidence_validated"
+              const selection = objectiveTailorCandidateFromRequest(request)
+              if (selection.graphRevision !== graph?.revision || !request.tools.some(tool => record(tool)?.name === "agent.tailor")) {
+                throw new Error("Objective Tailor catalog did not match the current graph or visible tool")
+              }
+              expectedCandidateRef = selection.candidateRef
+              expectedCandidateRevision = selection.graphRevision
+              rootModelStage = "pair_wait"
+              rootFinalDiagnosticStage = "tailor_emitting"
+              yield { type: "tool_call_completed", callId: tailorCallId, name: "agent.tailor", arguments: {
+                expectedRevision: selection.graphRevision, candidateRef: selection.candidateRef,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              rootFinalDiagnosticStage = "tailor_completed"
+              return
+            }
+            if (rootModelStage === "pair_wait") {
+              const candidateRef = expectedCandidateRef
+              const candidateRevision = expectedCandidateRevision
+              const tailorReceipt = record(latestToolResult(request, tailorCallId))
+              const tailorNodes = Array.isArray(tailorReceipt?.nodes) ? tailorReceipt.nodes.map(record) : []
+              if (!candidateRef || candidateRevision === null || tailorReceipt?.status !== "accepted"
+                || tailorReceipt.revision !== candidateRevision + 1 || tailorNodes.length !== 2
+                || tailorNodes[0]?.status !== "queued" || tailorNodes[1]?.status !== "waiting") {
+                throw new Error("Objective Tailor did not persist the expected Writer/Reviewer pair")
+              }
+              expectedWriterTaskId = typeof tailorNodes[0]?.taskId === "string" ? tailorNodes[0].taskId : null
+              expectedReviewerTaskId = typeof tailorNodes[1]?.taskId === "string" ? tailorNodes[1].taskId : null
+              if (!expectedWriterTaskId || !expectedReviewerTaskId) throw new Error("Objective Tailor pair task identities were missing")
+              rootModelStage = "final"
+              yield { type: "tool_call_completed", callId: pairWaitCallId, name: "agent.wait", arguments: {
+                idempotencyKey: pairWaitKey, taskIds: [expectedWriterTaskId, expectedReviewerTaskId], mode: "all", timeoutMs: 60_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (rootModelStage === "final") {
+              const writerTaskId = expectedWriterTaskId, reviewerTaskId = expectedReviewerTaskId
+              if (!writerTaskId || !reviewerTaskId) throw new Error("Objective Tailor pair was not bound before final review")
+              let wait: RecordValue | null = null
+              try { wait = repairWaitOutcomeFromRequest(request, pairWaitCallId, [writerTaskId, reviewerTaskId], undefined,
+                diagnostic => { finalWaitCallDiagnostic = diagnostic }) }
+              catch { await finalProjectionFailure("wait") }
+              const waitTasks = Array.isArray(wait?.tasks) ? wait.tasks.map(record) : []
+              const targetIds = Array.isArray(wait?.targetTaskIds) ? wait.targetTaskIds
+                : Array.isArray(wait?.taskIds) ? wait.taskIds : []
+              const matchedIds = Array.isArray(wait?.matchedTaskIds) ? wait.matchedTaskIds : []
+              const waitedWriter = waitTasks.find(task => task?.taskId === writerTaskId)
+              const waitedReviewer = waitTasks.find(task => task?.taskId === reviewerTaskId)
+              finalWaitOutputDiagnostic = {
+                available: wait !== null,
+                status: diagnosticEnum(wait?.status, WAIT_DIAGNOSTIC_STATUSES) ?? "other",
+                taskCount: diagnosticBoundedCount(waitTasks.length),
+                targetCount: diagnosticBoundedCount(targetIds.length),
+                matchedCount: diagnosticBoundedCount(matchedIds.length),
+                writerCompleted: waitedWriter?.role === "writer" && waitedWriter.status === "completed",
+                reviewerCompleted: waitedReviewer?.role === "reviewer" && waitedReviewer.status === "completed",
+              }
+              if (wait?.status !== "ready" || targetIds.length !== 2 || targetIds[0] !== writerTaskId || targetIds[1] !== reviewerTaskId
+                || matchedIds.length !== 2 || !matchedIds.includes(writerTaskId) || !matchedIds.includes(reviewerTaskId)
+                || waitedWriter?.role !== "writer" || waitedWriter.status !== "completed"
+                || waitedReviewer?.role !== "reviewer" || waitedReviewer.status !== "completed") await finalProjectionFailure("wait")
+              let graph: RecordValue | null = null
+              try { graph = record(currentGraphFromRequest(request)) } catch { await finalProjectionFailure("graph") }
+              const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              const writerNode = nodes.find(node => node?.taskId === writerTaskId)
+              const reviewerNode = nodes.find(node => node?.taskId === reviewerTaskId)
+              if (nodes.length !== 4 || nodes[0]?.key !== "scout" || nodes[0]?.status !== "completed"
+                || nodes[1]?.key !== "analyst" || nodes[1]?.status !== "completed"
+                || writerNode?.templateId !== "cover_letter_writer" || writerNode.status !== "completed"
+                || reviewerNode?.templateId !== "cover_letter_reviewer" || reviewerNode.status !== "completed") await finalProjectionFailure("graph")
+              rootFinalDiagnosticStage = "tailor_graph_validated"
               rootModelStage = "done"
               rootFinalDiagnosticStage = "final_text_emitting"
               yield { type: "text_delta", text: JSON.stringify({
-                schemaVersion: "agent-harness.v2.final", response: "The verified role was found and assessed.",
+                schemaVersion: "agent-harness.v2.final", response: "The verified role was found, assessed, drafted, and reviewed.",
               }) }
               rootFinalDiagnosticStage = "completion_emitting"
               yield { type: "completed", finishReason: "stop" }
@@ -20338,13 +20462,29 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           || task.rootTaskId !== targetRootTaskId || task.parentTaskId !== targetRootTaskId) {
           throw new Error("p3_1231_child_factory_scope_mismatch")
         }
+        if (task.role === "writer" || task.role === "reviewer") {
+          const context = record(task.context), selected = record(context?.selectedJobPreparation)
+          const witness = record(context?.objectiveTailorCandidateWitness)
+          if (selected?.jobId !== jobId || context?.objectiveTailorCandidateMode !== true
+            || !expectedCandidateRef || witness?.candidateRef !== expectedCandidateRef
+            || (task.role === "writer" && task.taskType !== "cover_letter_draft")
+            || (task.role === "reviewer" && task.taskType !== "cover_letter_review")) {
+            throw new Error("p3_1327_tailor_child_binding_mismatch")
+          }
+        }
         if (task.role === "analyst") {
           analystExecutionStarted = true
           analystDispatched.resolve(task.id)
         }
         let round = 0
         const callId = `p3-1231-read:${task.role}:${task.id}:${task.attemptCount}`
+        const draftCallId = `p3-1327-tailor-draft:${task.id}:${task.attemptCount}`
+        const versionReadCallId = `p3-1327-tailor-version-read:${task.id}:${task.attemptCount}`
+        const reviewCallId = `p3-1327-tailor-review:${task.id}:${task.attemptCount}`
         const searchInput = { target: "Software Engineer", location: "Dublin", limit: 10 }
+        let draftInput: RecordValue | null = null
+        let artifactRef: RecordValue | null = null
+        const reviewerArtifactRef = task.role === "reviewer" ? writerArtifactReferenceFromTaskContext(task.context, jobId) : null
         const adapter: ModelAdapter = {
           id: `p3-1231-${task.role}-child-fixture`, profile,
           async *stream(request) {
@@ -20353,6 +20493,67 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               throw new Error("p3_1231_child_model_request_scope_mismatch")
             }
             round += 1
+            if (task.role === "writer") {
+              const base = record(childRuntimeContextFromRequest(request).coverLetterBase)
+              if (round === 1) {
+                if (request.tools.map(tool => record(tool)?.name).includes("cover_letter.draft") !== true
+                  || typeof base?.artifactId !== "string" || typeof base.baseHash !== "string") {
+                  throw new Error("Objective Tailor Writer did not receive its server-resolved draft capability")
+                }
+                draftInput = { baseArtifactId: base.artifactId, baseHash: base.baseHash,
+                  content: "Synthetic fixture letter based on confirmed profile evidence.", constraints: { maxWords: 160 } }
+                yield { type: "tool_call_completed", callId: draftCallId, name: "cover_letter.draft", arguments: draftInput }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              const paired = draftInput && inspectToolResultForExactToolInput(request, "cover_letter.draft", draftInput)
+              const output = paired?.status === "paired" ? record(paired.pair.result) : null
+              artifactRef = record(output?.artifactRef)
+              if (round !== 2 || !artifactRef || typeof artifactRef.artifactId !== "string"
+                || artifactRef.version !== 1 || typeof artifactRef.contentHash !== "string" || typeof artifactRef.sourceDigest !== "string") {
+                throw new Error("Objective Tailor Writer did not persist an artifact version")
+              }
+              yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA,
+                role: "writer", status: "completed", artifactRef }) }
+              yield { type: "completed", finishReason: "stop" }
+              return
+            }
+            if (task.role === "reviewer") {
+              if (!reviewerArtifactRef) throw new Error("Objective Tailor Reviewer had no exact Writer reference")
+              const readInput = { artifactRef: reviewerArtifactRef }
+              const reviewInput = { artifactRef: reviewerArtifactRef, decision: "passed", findings: [] }
+              if (round === 1) {
+                if (request.tools.map(tool => record(tool)?.name).includes("artifact.version.read") !== true) {
+                  throw new Error("Objective Tailor Reviewer could not read its immutable Writer version")
+                }
+                yield { type: "tool_call_completed", callId: versionReadCallId, name: "artifact.version.read", arguments: readInput }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              if (round === 2) {
+                const paired = inspectToolResultForExactToolInput(request, "artifact.version.read", readInput)
+                const output = paired.status === "paired" ? record(paired.pair.result) : null
+                const readRef = record(output?.artifactRef)
+                if (!readRef || readRef.artifactId !== reviewerArtifactRef.artifactId
+                  || readRef.version !== reviewerArtifactRef.version || readRef.contentHash !== reviewerArtifactRef.contentHash
+                  || readRef.sourceDigest !== reviewerArtifactRef.sourceDigest || !Object.hasOwn(output ?? {}, "content")) {
+                  throw new Error("Objective Tailor Reviewer could not verify the exact immutable version")
+                }
+                yield { type: "tool_call_completed", callId: reviewCallId, name: "artifact.review", arguments: reviewInput }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              const paired = inspectToolResultForExactToolInput(request, "artifact.review", reviewInput)
+              const output = paired.status === "paired" ? record(paired.pair.result) : null
+              if (round !== 3 || output?.status !== "passed" || typeof output.reviewHash !== "string") {
+                throw new Error("Objective Tailor Reviewer did not persist a passed review receipt")
+              }
+              yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA,
+                role: "reviewer", status: "completed", artifactRef: reviewerArtifactRef,
+                reviewStatus: "passed", reviewHash: output.reviewHash }) }
+              yield { type: "completed", finishReason: "stop" }
+              return
+            }
             if (task.role === "scout") {
               if (round === 1) {
                 expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
@@ -20424,7 +20625,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     })
 
     try {
-      const expectedRootControls = ["agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.wait"]
+      const expectedRootControls = ["agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.tailor", "agent.wait"]
       let names: string[]
       try {
         names = await withinIntegrationDeadline(rootToolNames.promise, "ObjectiveStart Root did not request its tools", 30_000)
@@ -20558,34 +20759,40 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(await withinIntegrationDeadline(analystDispatched.promise, "Validated Scout did not release the Analyst", 30_000)).toBe(analystTaskId)
       expect(await withinIntegrationDeadline(analystReadObserved.promise, "Analyst did not read the bound Scout job", 30_000)).toBe(analystTaskId)
       try {
-        await waitForTurnStatus(pool!, value.turnId, "completed", 75_000, waitCallId)
+        await waitForTurnStatus(pool!, value.turnId, "completed", 75_000, pairWaitCallId)
       } catch (error) {
         const failure = waitForTurnStatusFailureDiagnostic(error)
         let progress = JSON.stringify({ available: false })
         try {
           progress = compactTurnProgressDiagnostics(
-            await turnProgressDiagnostics(pool!, value.turnId, waitCallId), 1_600,
+            await turnProgressDiagnostics(pool!, value.turnId, pairWaitCallId), 1_600,
           )
         } catch { /* Keep fixture failure output bounded if readback is unavailable. */ }
         throw new Error(`Objective Analyst completion failed at ${rootFinalDiagnosticStage}; status=${JSON.stringify(failure)}; waitCall=${JSON.stringify(finalWaitCallDiagnostic ?? { available: false })}; waitOutput=${JSON.stringify(finalWaitOutputDiagnostic)}; progress=${progress}`)
       }
 
-      const completedChildren = await pool!.query<{ id: string; role: string; status: string; result: unknown }>(
-        `SELECT child."id", child."role", child."status", child."result" FROM "sub_agent_tasks" AS child
+      if (!expectedWriterTaskId || !expectedReviewerTaskId || !expectedCandidateRef) throw new Error("Objective Tailor proof was not retained through terminal completion")
+      const completedChildren = await pool!.query<{ id: string; role: string; status: string; result: unknown; context: unknown }>(
+        `SELECT child."id", child."role", child."status", child."result", child."context" FROM "sub_agent_tasks" AS child
          JOIN "agent_sessions" AS session ON session."id" = child."sessionId"
          JOIN "agent_turns" AS turn ON turn."id" = child."turnId" AND turn."sessionId" = child."sessionId"
          WHERE child."id" = ANY($1::text[]) AND child."sessionId" = $2 AND child."turnId" = $3
            AND child."rootTaskId" = $4 AND child."parentTaskId" = $4 AND session."userId" = $5 AND turn."userId" = $5`,
-        [[scoutTaskId, analystTaskId], value.sessionId, value.turnId, persistedRootId, value.userId],
+        [[scoutTaskId, analystTaskId, expectedWriterTaskId, expectedReviewerTaskId], value.sessionId, value.turnId, persistedRootId, value.userId],
       )
-      expect(completedChildren.rows).toHaveLength(2)
+      expect(completedChildren.rows).toHaveLength(4)
       expect(completedChildren.rows.map(child => `${child.role}:${child.status}`).sort()).toEqual([
-        "analyst:completed", "scout:completed",
+        "analyst:completed", "reviewer:completed", "scout:completed", "writer:completed",
       ])
       const scoutResult = record(record(completedChildren.rows.find(child => child.role === "scout")?.result)?.structuredResult)
       const analystResult = record(record(completedChildren.rows.find(child => child.role === "analyst")?.result)?.structuredResult)
+      const writerResult = record(record(completedChildren.rows.find(child => child.role === "writer")?.result)?.structuredResult)
+      const reviewerResult = record(record(completedChildren.rows.find(child => child.role === "reviewer")?.result)?.structuredResult)
       expect(scoutResult).toMatchObject({ role: "scout", status: "completed", candidates: [{ jobId, source: "greenhouse" }] })
       expect(analystResult).toMatchObject({ role: "analyst", status: "completed", findings: [{ jobId, score: 8.5 }] })
+      expect(writerResult?.role === "writer" && writerResult.status === "completed"
+        && reviewerResult?.role === "reviewer" && reviewerResult.status === "completed"
+        && reviewerResult.reviewStatus === "passed").toBe(true)
       expect(scoutResult?.candidates).toEqual([{ jobId, source: "greenhouse", url: null, evidenceIds: [`read:job:${jobId}`] }])
       expect(analystResult?.findings).toEqual([{ jobId, score: 8.5, evidenceIds: [`read:job:${jobId}`] }])
       expect(scoutResult?.evidence).toEqual([{ id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "greenhouse" }])
@@ -20613,6 +20820,66 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       for (const field of ["nodeDigest", "resultDigest", "evidenceDigest", "reportDigest"] as const) {
         expect(sourceBindings[0]?.[field]).toMatch(/^[a-f0-9]{64}$/)
       }
+      const writerContext = record(completedChildren.rows.find(child => child.id === expectedWriterTaskId)?.context)
+      const reviewerContext = record(completedChildren.rows.find(child => child.id === expectedReviewerTaskId)?.context)
+      const writerWitness = record(writerContext?.objectiveTailorCandidateWitness)
+      const reviewerWitness = record(reviewerContext?.objectiveTailorCandidateWitness)
+      expect(writerContext?.objectiveTailorCandidateMode === true && reviewerContext?.objectiveTailorCandidateMode === true
+        && writerWitness?.candidateRef === expectedCandidateRef && reviewerWitness?.candidateRef === expectedCandidateRef
+        && writerWitness?.candidateRef === reviewerWitness?.candidateRef
+        && record(writerContext?.selectedJobPreparation)?.jobId === jobId
+        && record(reviewerContext?.selectedJobPreparation)?.jobId === jobId).toBe(true)
+      const writerArtifactRef = record(writerResult?.artifactRef), reviewerArtifactRef = record(reviewerResult?.artifactRef)
+      const versions = await pool!.query<{ artifactId: string; version: number; contentHash: string; sourceDigest: string; taskId: string; jobId: string }>(
+        `SELECT version."artifactId", version."version", version."contentHash", version."sourceDigest", version."taskId", version."jobId"
+         FROM "agent_artifact_version" AS version
+         JOIN "agent_sessions" AS session ON session."id" = version."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = $5 AND turn."sessionId" = version."sessionId"
+         WHERE version."sessionId" = $1 AND version."jobId" = $2 AND version."taskId" = $3
+           AND session."userId" = $4 AND turn."userId" = $4`,
+        [value.sessionId, jobId, expectedWriterTaskId, value.userId, value.turnId],
+      )
+      const reviews = await pool!.query<{ artifactId: string; version: number; status: string; reviewHash: string; taskId: string; jobId: string }>(
+        `SELECT review."artifactId", review."version", review."status", review."reviewHash", review."taskId", review."jobId"
+         FROM "agent_artifact_review" AS review
+         JOIN "agent_sessions" AS session ON session."id" = review."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = $5 AND turn."sessionId" = review."sessionId"
+         WHERE review."sessionId" = $1 AND review."jobId" = $2 AND review."taskId" = $3
+           AND session."userId" = $4 AND turn."userId" = $4`,
+        [value.sessionId, jobId, expectedReviewerTaskId, value.userId, value.turnId],
+      )
+      expect(versions.rows.length === 1 && reviews.rows.length === 1
+        && versions.rows[0]?.version === 1 && versions.rows[0]?.taskId === expectedWriterTaskId
+        && versions.rows[0]?.jobId === jobId && versions.rows[0]?.artifactId === writerArtifactRef?.artifactId
+        && versions.rows[0]?.contentHash === writerArtifactRef?.contentHash && versions.rows[0]?.sourceDigest === writerArtifactRef?.sourceDigest
+        && reviewerArtifactRef?.artifactId === writerArtifactRef?.artifactId && reviewerArtifactRef?.version === writerArtifactRef?.version
+        && reviewerArtifactRef?.contentHash === writerArtifactRef?.contentHash && reviewerArtifactRef?.sourceDigest === writerArtifactRef?.sourceDigest
+        && reviews.rows[0]?.status === "passed" && reviews.rows[0]?.taskId === expectedReviewerTaskId
+        && reviews.rows[0]?.jobId === jobId && reviews.rows[0]?.artifactId === writerArtifactRef?.artifactId
+        && reviews.rows[0]?.version === writerArtifactRef?.version
+        && reviews.rows[0]?.reviewHash === reviewerResult?.reviewHash).toBe(true)
+      const toolReceipts = await pool!.query<{ taskId: string; toolName: string; callStatus: string | null; resultStatus: string }>(
+        `SELECT call."taskId", call."content"->>'toolName' AS "toolName", call."content"->>'status' AS "callStatus", result."status" AS "resultStatus"
+         FROM "agent_items" AS call
+         JOIN "agent_items" AS result ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
+           AND result."taskId" = call."taskId" AND result."stepId" = call."stepId" AND result."type" = 'tool_result'
+           AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
+         JOIN "agent_sessions" AS session ON session."id" = call."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = call."turnId" AND turn."sessionId" = call."sessionId"
+         WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = ANY($3::text[])
+           AND call."type" = 'tool_call' AND session."userId" = $4 AND turn."userId" = $4`,
+        [value.sessionId, value.turnId, [expectedWriterTaskId, expectedReviewerTaskId], value.userId],
+      )
+      expect(toolReceipts.rows.map(row => `${row.taskId === expectedWriterTaskId ? "writer" : "reviewer"}:${row.toolName}:${row.callStatus}:${row.resultStatus}`).sort()).toEqual([
+        "reviewer:artifact.review:completed:completed", "reviewer:artifact.version.read:completed:completed", "writer:cover_letter.draft:completed:completed",
+      ])
+      const applicationEffects = await pool!.query<{ applicationTasks: string; approvals: string; submissions: string }>(
+        `SELECT (SELECT COUNT(*)::text FROM application_tasks WHERE "userId" = $1 AND "jobId" = $2) AS "applicationTasks",
+          (SELECT COUNT(*)::text FROM "AgentApproval" WHERE "userId" = $1 AND "sessionId" = $3 AND "turnId" = $4) AS "approvals",
+          (SELECT COUNT(*)::text FROM submission_attempt WHERE "userId" = $1 AND "jobId" = $2) AS "submissions"`,
+        [value.userId, jobId, value.sessionId, value.turnId],
+      )
+      expect(applicationEffects.rows[0]).toEqual({ applicationTasks: "0", approvals: "0", submissions: "0" })
       const completedTurn = await pool!.query<{ status: string; rootTaskId: string | null; finalResponse: string | null }>(
         `SELECT turn."status", turn."rootTaskId", turn."finalResponse" FROM "agent_turns" AS turn
          JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
@@ -20625,7 +20892,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const finalResponse = record(JSON.parse(completedTurn.rows[0]?.finalResponse ?? "null"))
       if (!finalResponse) throw new Error("Objective Analyst final response was not persisted")
       expect(finalResponse).toMatchObject({ schemaVersion: "agent-harness.v2.final", completed: true, terminalReason: "goal_satisfied" })
-      await expectGroundedTaskGraphFinalCopies(pool!, value, persistedRootId, finalResponse, "The verified role was found and assessed.")
+      await expectGroundedTaskGraphFinalCopies(pool!, value, persistedRootId, finalResponse, "The verified role was found, assessed, drafted, and reviewed.")
       expect(finalResponse.response).toContain("Search results: 1 unique job reported (complete coverage).")
       expect(finalResponse.response).toContain("Analysis results: 1 unique job with findings reported (complete coverage).")
       expect(finalResponse.summary).toContain("discovered jobs: 1")
