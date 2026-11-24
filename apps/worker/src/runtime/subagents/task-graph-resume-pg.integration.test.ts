@@ -93,6 +93,7 @@ const ARCHIVED_WAIT_CALL_ID = "p3-process-archived-wait-call"
 const ARCHIVED_WAIT_TAIL_CALL_ID = "p3-process-archived-wait-unexecuted-tail"
 const ARCHIVED_WAIT_FRESH_LIST_CALL_ID = "p3-process-archived-wait-fresh-list"
 const ARCHIVED_WAIT_IDEMPOTENCY_KEY = "p3-process-archived-wait"
+const OBJECTIVE_TAILOR_DIAGNOSTIC_CALL_PREFIX = "p3-1327-objective-tailor:"
 const DISCOVERY_RESTART_DIAGNOSTIC_CALL_IDS = new Set([
   DISCOVERY_RESTART_WAIT_CALL_ID, DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID, DISCOVERY_RESTART_ANALYST_WAIT_CALL_ID,
 ])
@@ -755,7 +756,48 @@ const ROOT_FAILURE_EVENT_TYPES = new Set(["turn.failed", "step.completed", "fina
 const TOOL_ITEM_TYPES = new Set(["tool_call", "tool_result"])
 const TOOL_RESULT_DIAGNOSTIC_STATUSES = new Set(["accepted", "duplicate", "waiting", "ready", "timed_out", "interrupted", "closed"])
 const WAIT_DIAGNOSTIC_STATUSES = new Set(["waiting", "ready", "timed_out", "consumed", "failed", "cancelled", "interrupted", "closed"])
-const TOOL_DIAGNOSTIC_NAMES = new Set(["agent.plan", "agent.wait", "jobs.search"])
+const TOOL_DIAGNOSTIC_NAMES = new Set(["agent.plan", "agent.tailor", "agent.wait", "jobs.search"])
+const OBJECTIVE_TAILOR_DATABASE_SQLSTATES = new Set(["42501", "42703", "23502", "23505", "40001", "40P01", "55P03"])
+const OBJECTIVE_TAILOR_COMMAND_FAILURE_CATEGORIES = new Map([
+  ["objective_tailor_root_only", "root_authority_rejected"], ["objective_tailor_not_eligible", "root_authority_rejected"],
+  ["task_graph_scope_unavailable", "root_authority_rejected"], ["task_graph_scope_invalid", "root_authority_rejected"],
+  ["task_graph_session_fenced", "root_authority_rejected"], ["task_graph_turn_fenced", "root_authority_rejected"],
+  ["task_graph_parent_fenced", "root_authority_rejected"], ["task_graph_step_fenced", "root_authority_rejected"],
+  ["objective_tailor_graph_scope_mismatch", "root_authority_rejected"], ["objective_tailor_terminal_scope_mismatch", "root_authority_rejected"],
+  ["task_graph_runtime_dependencies_unavailable", "root_authority_rejected"], ["task_graph_task_scope_invalid", "root_authority_rejected"],
+  ["steering_reconciliation_unavailable", "root_steering_rejected"], ["steering_reconciliation_operation_invalid", "root_steering_rejected"],
+  ["steering_reconciliation_root_policy_invalid", "root_steering_rejected"], ["steering_reconciliation_root_scope_invalid", "root_steering_rejected"],
+  ["steering_reconciliation_planning_root_invalid", "root_steering_rejected"], ["steering_reconciliation_pending", "root_steering_rejected"],
+  ["steering_reconciliation_pending_set_changed", "root_steering_rejected"],
+  ["node_limit", "graph_node_limit"], ["task_graph_application_filler_limit", "graph_node_limit"],
+  ["depth_limit", "graph_depth_limit"], ["subagent_depth_limit", "graph_depth_limit"],
+  ["task_graph_proposal_fan_out_limit", "graph_fan_out_limit"], ["subagent_fan_out_limit", "graph_fan_out_limit"],
+  ["missing_dependency", "graph_dependency_rejected"], ["dependency_cycle", "graph_dependency_rejected"],
+  ["dependencies_incomplete", "graph_dependency_rejected"], ["blocked_dependency", "graph_dependency_rejected"],
+  ["task_graph_dependency_unverified", "graph_dependency_rejected"], ["task_graph_dependency_blocked", "graph_dependency_rejected"],
+  ["task_graph_dependency_task_missing", "graph_dependency_rejected"], ["task_graph_template_policy_rejected", "child_action_policy_rejected"],
+  ["child_allowed_actions_exceed_parent_policy", "child_action_policy_rejected"],
+  ["node_not_found", "graph_node_rejected"], ["invalid_transition", "graph_node_rejected"],
+  ["verification_required", "graph_node_rejected"], ["verification_invalid", "graph_node_rejected"],
+  ["unsupported_verification_template", "graph_node_rejected"], ["repair_invalid", "graph_node_rejected"],
+  ["task_graph_objective_requirements_invalid", "objective_verification_rejected"],
+  ["task_graph_objective_coverage_incomplete", "objective_verification_rejected"],
+  ["task_graph_scheduled_draft_candidate_dependency_missing", "graph_dependency_rejected"],
+  ["objective_tailor_input_invalid", "candidate_input_invalid"], ["objective_tailor_unavailable", "tailor_unavailable"],
+  ["objective_tailor_source_material_stale", "candidate_source_stale"], ["objective_tailor_candidate_stale", "candidate_proof_stale"],
+  ["objective_tailor_pair_invalid", "candidate_pair_invalid"], ["revision_mismatch", "graph_revision_stale"],
+  ["revision_limit", "graph_revision_limit"], ["task_graph_state_missing", "graph_state_missing"],
+  ["idempotency_conflict", "idempotency_conflict"], ["task_graph_continuation_budget_required", "continuation_budget_required"],
+  ["task_graph_proposal_too_large", "graph_proposal_too_large"], ["task_graph_scheduled_application_filler_rejected", "graph_node_rejected"],
+  ["task_graph_repair_conflict", "graph_node_rejected"], ["invalid_shape", "graph_node_rejected"],
+  ["invalid_options", "graph_node_rejected"], ["invalid_state", "graph_state_invalid"], ["empty_proposal", "graph_node_rejected"],
+  ["duplicate_key", "graph_node_rejected"], ["unknown_template", "graph_node_rejected"],
+  ["task_graph_schedule_failed", "graph_schedule_failed"], ["objective_tailor_failed", "tailor_failed"],
+])
+const OBJECTIVE_TAILOR_COMMAND_FAILURE_MESSAGES = new Map([
+  ["Child allowed actions exceed parent policy", "child_action_policy_rejected"],
+  ["Subagent depth limit reached", "graph_depth_limit"], ["Subagent fan-out limit reached", "graph_fan_out_limit"],
+])
 const ERROR_DIAGNOSTIC_CODES = new Set([
   "final_unverified", "step_limit", "model_incomplete", "persistence_conflict", "invalid_output", "turn_execution_failed",
   "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "business_precondition_failed",
@@ -767,7 +809,16 @@ const ERROR_DIAGNOSTIC_CODES = new Set([
   "task_graph_schedule_failed", "task_graph_dispatch_conflict", "task_graph_dependency_blocked",
   "task_graph_dependency_task_missing", "task_graph_child_wait_state_failed", "revision_mismatch",
   "task_graph_revision_mismatch", "task_graph_verification_failed", "task_graph_verification_unverified",
-  "revision_limit", "idempotency_conflict",
+  "revision_limit", "idempotency_conflict", "objective_tailor_root_only", "objective_tailor_unavailable",
+  "objective_tailor_input_invalid", "objective_tailor_failed", "objective_tailor_source_material_stale",
+  "objective_tailor_candidate_stale", "objective_tailor_not_eligible", "objective_tailor_pair_invalid",
+  "objective_tailor_graph_scope_mismatch", "objective_tailor_terminal_scope_mismatch", "task_graph_task_scope_invalid",
+  "task_graph_runtime_dependencies_unavailable", "task_graph_turn_fenced", "task_graph_parent_fenced", "task_graph_step_fenced",
+  "steering_reconciliation_unavailable", "steering_reconciliation_operation_invalid", "steering_reconciliation_root_policy_invalid",
+  "steering_reconciliation_root_scope_invalid", "steering_reconciliation_planning_root_invalid", "steering_reconciliation_pending",
+  "steering_reconciliation_pending_set_changed", "task_graph_objective_requirements_invalid", "task_graph_objective_coverage_incomplete",
+  "task_graph_template_policy_rejected", "child_allowed_actions_exceed_parent_policy", "task_graph_scheduled_draft_candidate_missing",
+  "task_graph_scheduled_draft_candidate_dependency_missing", "task_graph_proposal_fan_out_limit",
 ])
 const CHILD_OUTCOME_STATUSES = new Set(["completed", "failed", "waiting", "waiting_for_user"])
 const CHILD_OUTCOME_RETRY_DISPOSITIONS = new Set(["terminal", "retryable"])
@@ -1120,6 +1171,18 @@ function diagnosticErrorCode(value: unknown): string | null {
   return /^task_graph_[a-z0-9_]{1,80}$/.test(value) ? "task_graph_other" : "other"
 }
 
+function objectiveTailorCommandFailureCategory(error: unknown): string {
+  const codeDescriptor = error && typeof error === "object" ? Object.getOwnPropertyDescriptor(error, "code") : undefined
+  const code = typeof codeDescriptor?.value === "string" ? codeDescriptor.value : null
+  const message = error instanceof Error ? error.message : null
+  const value = code ?? message
+  if (!value) return "other"
+  if (OBJECTIVE_TAILOR_DATABASE_SQLSTATES.has(value)) return value
+  if (/^[0-9A-Z]{5}$/.test(value)) return "database_sqlstate"
+  return OBJECTIVE_TAILOR_COMMAND_FAILURE_CATEGORIES.get(value)
+    ?? OBJECTIVE_TAILOR_COMMAND_FAILURE_MESSAGES.get(value) ?? "other"
+}
+
 function diagnosticErrorClass(value: unknown): string | null {
   if (typeof value !== "string" || value.length === 0) return null
   if (/^[0-9A-Z]{5}$/.test(value)) return "database"
@@ -1136,8 +1199,12 @@ function diagnosticErrorClass(value: unknown): string | null {
 }
 
 function diagnosticFixtureCallId(value: unknown): string | null {
-  return typeof value === "string" && DISCOVERY_RESTART_DIAGNOSTIC_CALL_IDS.has(value)
-    ? boundedDiagnostic(value, 128)
+  if (typeof value !== "string") return null
+  if (DISCOVERY_RESTART_DIAGNOSTIC_CALL_IDS.has(value)) return boundedDiagnostic(value, 128)
+  const suffix = value.startsWith(OBJECTIVE_TAILOR_DIAGNOSTIC_CALL_PREFIX)
+    ? value.slice(OBJECTIVE_TAILOR_DIAGNOSTIC_CALL_PREFIX.length) : ""
+  return suffix.length > 0 && suffix.length <= 128 && /^[A-Za-z0-9_-]+$/.test(suffix)
+    ? "objective-tailor-call"
     : null
 }
 
@@ -20207,10 +20274,29 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let rootFinalDiagnosticStage = "runtime_setup"
     let finalWaitCallDiagnostic: RepairWaitCallInputDiagnostic | null = null
     let finalWaitOutputDiagnostic: RecordValue = { available: false }
+    let tailorReceiptDiagnostic: RecordValue = { available: false }
+    const tailorCommandDiagnostic = { entered: false, returned: false, failureCategory: "none" }
     let rootModelStage: "plan" | "wait" | "tailor" | "pair_wait" | "final" | "done" = "plan"
+    const taskGraphCommandPort = commandPortModule.createPgTaskGraphCommandPort(pool!)
+    const appendObjectiveTailor = taskGraphCommandPort.appendObjectiveTailor
+    if (!appendObjectiveTailor) throw new Error("Production Objective Tailor command is unavailable")
+    const observedTaskGraphCommandPort = {
+      ...taskGraphCommandPort,
+      appendObjectiveTailor: async (input: Parameters<typeof appendObjectiveTailor>[0]) => {
+        tailorCommandDiagnostic.entered = true
+        try {
+          const receipt = await appendObjectiveTailor(input)
+          tailorCommandDiagnostic.returned = true
+          return receipt
+        } catch (error) {
+          tailorCommandDiagnostic.failureCategory = objectiveTailorCommandFailureCategory(error)
+          throw error
+        }
+      },
+    }
     const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags, authorizeUsage: authorizeUnreservedUsage,
-      taskGraphTemplates: TASK_GRAPH_TEMPLATES, taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
+      taskGraphTemplates: TASK_GRAPH_TEMPLATES, taskGraphCommandPort: observedTaskGraphCommandPort,
       modelRuntimeFactory: async ({ userId: factoryUserId, state }) => {
         const stateRootTaskId = typeof state.rootTaskId === "string" && state.rootTaskId.length > 0
           ? state.rootTaskId : null
@@ -20384,10 +20470,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (rootModelStage === "pair_wait") {
+              rootFinalDiagnosticStage = "pair_wait_request_received"
               const candidateRef = expectedCandidateRef
               const candidateRevision = expectedCandidateRevision
               const tailorReceipt = record(latestToolResult(request, tailorCallId))
               const tailorNodes = Array.isArray(tailorReceipt?.nodes) ? tailorReceipt.nodes.map(record) : []
+              tailorReceiptDiagnostic = {
+                available: tailorReceipt !== null,
+                status: diagnosticEnum(tailorReceipt?.status, new Set(["accepted", "duplicate", "failed"])),
+                revisionMatches: Number.isSafeInteger(tailorReceipt?.revision) && candidateRevision !== null
+                  ? tailorReceipt?.revision === candidateRevision + 1 : false,
+                nodeCount: diagnosticBoundedCount(tailorNodes.length),
+                nodeStatuses: tailorNodes.slice(0, 3).map(node => diagnosticEnum(node?.status, new Set(["queued", "waiting", "running", "completed", "failed"])) ?? "other"),
+                nodeTaskIdCount: diagnosticBoundedCount(tailorNodes.filter(node => typeof node?.taskId === "string").length),
+              }
+              rootFinalDiagnosticStage = "pair_wait_receipt_read"
               if (!candidateRef || candidateRevision === null || tailorReceipt?.status !== "accepted"
                 || tailorReceipt.revision !== candidateRevision + 1 || tailorNodes.length !== 2
                 || tailorNodes[0]?.status !== "queued" || tailorNodes[1]?.status !== "waiting") {
@@ -20396,6 +20493,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expectedWriterTaskId = typeof tailorNodes[0]?.taskId === "string" ? tailorNodes[0].taskId : null
               expectedReviewerTaskId = typeof tailorNodes[1]?.taskId === "string" ? tailorNodes[1].taskId : null
               if (!expectedWriterTaskId || !expectedReviewerTaskId) throw new Error("Objective Tailor pair task identities were missing")
+              rootFinalDiagnosticStage = "pair_wait_receipt_validated"
               rootModelStage = "final"
               yield { type: "tool_call_completed", callId: pairWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: pairWaitKey, taskIds: [expectedWriterTaskId, expectedReviewerTaskId], mode: "all", timeoutMs: 60_000,
@@ -20765,10 +20863,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         let progress = JSON.stringify({ available: false })
         try {
           progress = compactTurnProgressDiagnostics(
-            await turnProgressDiagnostics(pool!, value.turnId, pairWaitCallId), 1_600,
+            await turnProgressDiagnostics(pool!, value.turnId, pairWaitCallId, [tailorCallId]), 1_600,
           )
         } catch { /* Keep fixture failure output bounded if readback is unavailable. */ }
-        throw new Error(`Objective Analyst completion failed at ${rootFinalDiagnosticStage}; status=${JSON.stringify(failure)}; waitCall=${JSON.stringify(finalWaitCallDiagnostic ?? { available: false })}; waitOutput=${JSON.stringify(finalWaitOutputDiagnostic)}; progress=${progress}`)
+        throw new Error(`Objective Analyst completion failed at ${rootFinalDiagnosticStage}; status=${JSON.stringify(failure)}; waitCall=${JSON.stringify(finalWaitCallDiagnostic ?? { available: false })}; waitOutput=${JSON.stringify(finalWaitOutputDiagnostic)}; tailorReceipt=${JSON.stringify(tailorReceiptDiagnostic)}; tailorCommand=${JSON.stringify(tailorCommandDiagnostic)}; progress=${progress}`)
       }
 
       if (!expectedWriterTaskId || !expectedReviewerTaskId || !expectedCandidateRef) throw new Error("Objective Tailor proof was not retained through terminal completion")
