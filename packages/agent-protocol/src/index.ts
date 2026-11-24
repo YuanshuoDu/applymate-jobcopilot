@@ -50,6 +50,8 @@ export {
   sameVerifiedShortlistSelectionBinding,
 } from './verified-shortlist-selection.js'
 export type { VerifiedShortlistSelectionBinding, VerifiedShortlistSourceIdentity } from './verified-shortlist-selection.js'
+export { parseSelectedJobBatchGraph } from './selected-job-batch-graph.js'
+export type { SelectedJobBatchGraphNode, SelectedJobBatchGraphPair, SelectedJobBatchGraphSlot } from './selected-job-batch-graph.js'
 export {
   OBJECTIVE_APPLICATION_APPROVAL_SET_SCHEMA,
   objectiveApplicationApprovalSetItemId,
@@ -208,3 +210,15 @@ export type {
   ScheduledPipelineExecutionIdentity,
   ScheduledPipelinePrepareReceiptKeyBinding,
 } from './scheduled-pipeline-continuation-key-material.js'
+export {
+  OBJECTIVE_TAILOR_GRAPH_MAX_NODES,
+  OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION,
+  parseObjectiveTailorGraph,
+} from './objective-tailor-graph.js'
+export type { ObjectiveTailorGraph } from './objective-tailor-graph.js'
+export {
+  OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA,
+  OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_STATUSES,
+  parseObjectiveTailorFinalOutcomeSidecar,
+} from './objective-tailor-final-outcome-sidecar.js'
+export type { ObjectiveTailorFinalOutcomeSidecar, ObjectiveTailorFinalOutcomeSidecarStatus } from './objective-tailor-final-outcome-sidecar.js'

@@ -7,7 +7,7 @@ import {
   sameTaskGraphFinalSummaryBinding,
   TASK_GRAPH_FINAL_SUMMARY_BINDING,
 } from "./task-graph-final-summary-binding.js"
-import type { TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { taskGraphItemId, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 
 const scoutResult = (jobId: string) => ({
   schemaVersion: ROLE_RESULT_SCHEMA,
@@ -38,7 +38,7 @@ function graph(revision: number, nodeIds: readonly string[], rows: readonly Grap
   const taskTypes = new Map(rows.map(task => [task.id, task.taskType ?? "task"]))
   return {
     rootTaskId: "root-task",
-    item: { id: "task-graph:root-task", revision, content: {}, createdAt: new Date(0) },
+    item: { id: taskGraphItemId("root-task"), revision, content: {}, createdAt: new Date(0) },
     snapshot: { nodes: nodeIds.map((taskId, nodeIndex) => ({ taskId, key: `node-${nodeIndex}`, templateId: taskTypes.get(taskId) ?? "task" })) } as unknown as TaskGraphSnapshot,
     state: { revision: stateRevision } as LoadedGraph["state"],
     tasks: new Map(rows.map(task => [task.id, task])),
@@ -188,6 +188,27 @@ describe("current TaskGraph final-summary binding", () => {
     expect(readResolvedRepairTaskIds(stale)).toEqual(new Set())
     expect(sameTaskGraphFinalSummaryBinding(resolved, unresolved)).toBe(false)
     expect(sameTaskGraphFinalSummaryBinding(resolved, stale)).toBe(false)
+  })
+
+  it("compares exact Objective Tailor final outcomes and rejects malformed or mixed bindings", () => {
+    const base = buildTaskGraphFinalSummaryBinding(graph(9, ["source-scout", "source-analyst"], [
+      row("source-scout", "scout", "scout", null), row("source-analyst", "analyst", "analyst", null),
+    ]))!
+    const outcome = { schemaVersion: "agent-harness.v2.objective-tailor-final-outcome.v1" as const,
+      graphRevision: 9, rootAttemptCount: 2, graphDigest: "a".repeat(64), sourceNodeCount: 2,
+      sourceGraphDigest: "b".repeat(64), sourceStatusDigest: "c".repeat(64),
+      slots: [{ ordinal: 1, status: "ready" as const, evidenceDigest: "d".repeat(64) }] }
+    const bound = { ...base, objectiveTailorFinalOutcome: outcome }
+    const same = { ...bound, objectiveTailorFinalOutcome: { ...outcome, slots: [...outcome.slots] } }
+    const changed = { ...bound, objectiveTailorFinalOutcome: { ...outcome, slots: [{ ...outcome.slots[0]!, status: "stale" as const }] } }
+    const mismatchedRevision = { ...bound, objectiveTailorFinalOutcome: { ...outcome, graphRevision: 10 } }
+    const mixed = { ...base, objectiveTailorFinalOutcome: { ...outcome, unknown: true } }
+
+    expect(sameTaskGraphFinalSummaryBinding(bound, same)).toBe(true)
+    expect(sameTaskGraphFinalSummaryBinding(bound, changed)).toBe(false)
+    expect(sameTaskGraphFinalSummaryBinding(bound, mismatchedRevision)).toBe(false)
+    expect(sameTaskGraphFinalSummaryBinding(bound, mixed)).toBe(false)
+    expect(sameTaskGraphFinalSummaryBinding(bound, base)).toBe(false)
   })
 
   it("binds Prepare results to the persisted task attempt", () => {

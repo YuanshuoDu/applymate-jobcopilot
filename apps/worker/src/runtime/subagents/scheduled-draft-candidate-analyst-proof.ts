@@ -10,11 +10,13 @@ import { canonicalTaskGraphJson, type StoredTaskGraphNode, type TaskGraphSnapsho
 import { parseStoredTaskGraphVerificationReport, type TaskGraphVerificationDependencyBinding } from "./task-graph-verification-report.js"
 import { ROLE_RESULT_SCHEMA, validateRoleResult, type AnalystResult } from "./role-results.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
+import { readScheduledDraftJobMaterialDigests } from "./scheduled-draft-job-material.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 export type ScheduledDraftAnalystProof = Readonly<{
   result: AnalystResult
+  materialDigests: ReadonlyMap<string, string>
   binding: Readonly<{ nodeKey: string; taskId: string; attemptCount: number; resultDigest: string; evidenceDigest: string;
     reportDigest: string; scouts: readonly TaskGraphVerificationDependencyBinding[] }>
 }>
@@ -59,7 +61,9 @@ export async function readScheduledDraftAnalystProof(client: Queryable, scope: G
     || taskGraphResultDigest(result) !== report.resultDigest) return null
   const binding = { nodeKey: node.key, taskId: node.taskId, attemptCount: Number(task.attemptCount), resultDigest: proof.report.resultDigest!,
     evidenceDigest: proof.report.evidenceDigest!, reportDigest: digest(report), scouts: [...scouts.bindings].sort((a, b) => compareBytesText(a.nodeKey, b.nodeKey)) }
-  return { result, binding }
+  const materialDigests = await readScheduledDraftJobMaterialDigests(client,
+    { ...scope, taskId: node.taskId, attemptCount: Number(task.attemptCount) }, result.findings.map(finding => finding.jobId))
+  return { result, materialDigests, binding }
 }
 
 function parseCompletedEnvelope(value: unknown): { structuredResult: unknown; report: unknown } | undefined {

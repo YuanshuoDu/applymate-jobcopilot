@@ -116,9 +116,10 @@ export async function executeToolWithItems(
   onResultItemPersisted?: (receipt: PersistedToolExecutionReceipt) => void,
 ): Promise<TurnEngineToolResult> {
   const input = toRepositoryJson(call.arguments)
+  const toolVersion = options.toolVersionForCall?.(call.name) ?? "1"
   const callItem = await writer.startItem({
     id: itemId(options, `item:tool-call:${call.id}`), stepId: step.id, type: "tool_call", phase: null,
-    content: { toolCallId: call.id, toolName: call.name, toolVersion: "1", input }, now: now(),
+    content: { toolCallId: call.id, toolName: call.name, toolVersion, input }, now: now(),
   })
   onCallItemPersisted?.()
   const startKey = options.childWaitCallStartKey?.(step.id, call) ?? `tool-started:${call.id}`
@@ -137,14 +138,17 @@ export async function executeToolWithItems(
       scope: options.scope, sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
       taskId: options.identity.taskId, rootTaskId: options.identity.rootTaskId, actorRole: options.actorRole,
       signal: options.signal ?? new AbortController().signal, capabilities: options.capabilities,
-      call: { id: call.id, toolName: call.name, toolVersion: "1", input: call.arguments },
+      call: { id: call.id, toolName: call.name, toolVersion, input: call.arguments },
     })
   } catch (error: unknown) {
     if (signalWasInterrupted(options.signal ?? new AbortController().signal)) throw error
     if (isSessionPauseRequestedError(error)) {
       pauseError = error
-      result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed", errorCode: "session_pause_requested" }
-    } else result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed", errorCode: "tool_execution_failed" }
+      result = { id: call.id, toolName: call.name, toolVersion, status: "failed", errorCode: "session_pause_requested" }
+    } else result = { id: call.id, toolName: call.name, toolVersion, status: "failed", errorCode: "tool_execution_failed" }
+  }
+  if (toolVersion === "2" && (result.id !== call.id || result.toolName !== call.name || result.toolVersion !== toolVersion)) {
+    result = { id: call.id, toolName: call.name, toolVersion, status: "failed", errorCode: "tool_result_identity_mismatch" }
   }
   await writer.completeItem(callItem, {
     toolCallId: call.id, toolName: call.name, toolVersion: result.toolVersion,

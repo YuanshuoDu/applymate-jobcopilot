@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
+import { OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { createGraphTasks } from "./task-graph-pg-create.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, type TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import { createInitialTaskGraphState, TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphState } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
-import { parseTaskGraphSnapshot, taskGraphSnapshot } from "./task-graph-snapshot.js"
+import { parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphSnapshot } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
 import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
@@ -12,6 +13,12 @@ import { selectVerifiedScheduledDraftCandidate } from "./scheduled-draft-candida
 import * as pgCreate from "./pg-store-create.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
 import { templatesForInteractiveScoutDelegation } from "./nested-scout-profile.js"
+import * as objectiveTaskGraphAuthority from "./objective-task-graph-child-authority.js"
+import { bindObjectiveTailorCandidateWitness, makeObjectiveTailorCandidateSelection } from "./objective-tailor-witness.js"
+import { bindObjectiveTailorWaveCandidateWitness, makeObjectiveTailorWaveCandidateSelection } from "./objective-tailor-wave-witness.js"
+import { prepareObjectiveTailorWaveCreatePlan } from "./task-graph-pg-create-objective-tailor-wave.js"
+import { bindObjectiveTailorCorrectionProof } from "./objective-tailor-correction-proof.js"
+import { prepareObjectiveTailorCorrectionPlan } from "./objective-tailor-correction-plan.js"
 
 vi.mock("./scheduled-draft-candidate.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./scheduled-draft-candidate.js")>()
@@ -886,6 +893,229 @@ describe("createGraphTasks", () => {
     await expect(createGraphTasks(fixture.client, fullTypedInput, fullPlanParent, createInitialTaskGraphState(), new Map()))
       .rejects.toMatchObject({ code: "node_limit" })
     expect(fixture.query).not.toHaveBeenCalled()
+  })
+
+  it("denies the Objective Tailor pair when only one of eight graph slots remains", async () => {
+    const fixture = repairFixture({ additionalTypedNodes: 6, ordinaryOnly: true })
+    const selection = makeObjectiveTailorCandidateSelection({ scope: fixture.input.scope, sourceGraphRevision: fixture.current.revision,
+      sourceGraphDigest: "a".repeat(64), sourceStatusDigest: "b".repeat(64), analystProofDigest: "c".repeat(64),
+      candidate: { jobId: "f47ac10b-58cc-4372-a567-0e02b2c3d479", score: 8.4, materialDigest: `sha256:${"d".repeat(64)}` },
+      sourceAnalystKeys: ["filler-0"] })!
+    const keys = objectiveTaskGraphAuthority.objectiveTailorNodeKeysForCandidate(selection.candidateRef)!
+    const witness = bindObjectiveTailorCandidateWitness(selection, { ...keys, admittedRevision: fixture.current.revision + 1 })!
+    const plan = objectiveTaskGraphAuthority.objectiveTailorPlan(witness)!
+    const input: TaskGraphScheduleInput = { ...fixture.input, proposal: plan.proposal, templates: plan.templates }
+
+    expect(fixture.current.nodes).toHaveLength(TASK_GRAPH_LIMITS.maxNodes - 1)
+    expect(plan.proposal.nodes).toHaveLength(2)
+    await expect(createGraphTasks(fixture.client, input, fixture.parent, fixture.current, fixture.taskIds,
+      undefined, undefined, true, undefined, true)).rejects.toMatchObject({ code: "node_limit" })
+    expect(fixture.query).not.toHaveBeenCalled()
+  })
+
+  it("covers an Objective Tailor pair from the exact typed Scout and Analyst prefix", async () => {
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 }
+    const scoutWithLocation = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout", criteria: [
+      { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+      { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["dublin"] } },
+    ] } as const
+    const current: TaskGraphState = { revision: 2, appliedEvents: [], nodes: [
+      { key: "scout-source", templateId: "scout", goal: "Find matching jobs", successCriteria: ["Return candidates"], dependsOn: [],
+        depth: 1, status: "completed", taskId: "scout-task", verificationDisposition: "typed", verification: scoutWithLocation },
+      { key: "analyst-source", templateId: "analyst", goal: "Analyze matching jobs", successCriteria: ["Return findings"], dependsOn: ["scout-source"],
+        depth: 2, status: "completed", taskId: "analyst-task", verificationDisposition: "typed", verification: analystVerification },
+    ] }
+    const selection = makeObjectiveTailorCandidateSelection({ scope, sourceGraphRevision: current.revision,
+      sourceGraphDigest: "a".repeat(64), sourceStatusDigest: "b".repeat(64), analystProofDigest: "c".repeat(64),
+      candidate: { jobId: "f47ac10b-58cc-4372-a567-0e02b2c3d479", score: 8.4, materialDigest: `sha256:${"d".repeat(64)}` },
+      sourceAnalystKeys: ["analyst-source"] })!
+    const keys = objectiveTaskGraphAuthority.objectiveTailorNodeKeysForCandidate(selection.candidateRef)!
+    const witness = bindObjectiveTailorCandidateWitness(selection, { ...keys, admittedRevision: current.revision + 1 })!
+    const plan = objectiveTaskGraphAuthority.objectiveTailorPlan(witness)!
+    const input: TaskGraphScheduleInput = { scope, proposal: plan.proposal, templates: plan.templates,
+      verificationRequirements: { status: "valid", requirements: [
+        { id: "candidate-count", kind: "candidate_count_gte", minimum: 1 },
+        { id: "finding-count", kind: "finding_count_gte", minimum: 1 },
+        { id: "candidate-location", kind: "candidate_location_in", locations: ["dublin"] },
+      ] } }
+    const parent = { budgetSnapshot: { subagentPolicy: { maxConcurrency: 4, maxDepth: 4, maxFanOut: 4, maxAttempts: 2 } } }
+    const priorIds = new Map([["scout-source", "scout-task"], ["analyst-source", "analyst-task"]])
+    const analystResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [
+      { jobId: "f47ac10b-58cc-4372-a567-0e02b2c3d479", score: 8.4, evidenceIds: ["evidence-1"] },
+    ], evidence: [{ id: "evidence-1", kind: "job", ref: "f47ac10b-58cc-4372-a567-0e02b2c3d479", source: "greenhouse" }], summary: "Verified finding" }
+    const analystEnvelope = { finalItemId: "analyst-item", finalText: "Verified finding", status: "completed", stepCount: 1, toolCallCount: 1,
+      structuredResult: analystResult, taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed",
+        reasonCode: "criteria_met", criteria: [{ criterionId: "finding-count", status: "passed", reasonCode: "criteria_met" }],
+        evidenceDigest: "e".repeat(64), resultDigest: taskGraphResultDigest(analystResult) } }
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes('WHERE task."id" = ANY($1::text[])')) return { rows: [{
+        id: "analyst-task", status: "completed", role: "analyst", failureReason: null, attemptCount: 1,
+        taskType: "job_analysis", allowedActions: TASK_GRAPH_TEMPLATES.analyst.allowedActions,
+        expectedOutputSchema: TASK_GRAPH_TEMPLATES.analyst.expectedOutputSchema, result: analystEnvelope, context: {},
+        sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+        parentTaskId: scope.parentTaskId, userId: scope.userId,
+      }], rowCount: 1 }
+      if (sql.startsWith('INSERT INTO "agent_outbox"')) return { rows: [{ id: "outbox-1" }], rowCount: 1 }
+      return { rows: [], rowCount: 1 }
+    })
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const withoutScoutProof: TaskGraphState = { ...current, nodes: current.nodes.map(node => {
+      if (node.key !== "scout-source") return node
+      const { verification: _verification, ...legacy } = node
+      return { ...legacy, verificationDisposition: "legacy_unverified" as const }
+    }) }
+    const withoutAnalystProof: TaskGraphState = { ...current, nodes: current.nodes.map(node => {
+      if (node.key !== "analyst-source") return node
+      const { verification: _verification, ...legacy } = node
+      return { ...legacy, verificationDisposition: "legacy_unverified" as const }
+    }) }
+    await expect(createGraphTasks(client, input, parent, withoutScoutProof, priorIds, undefined, undefined, true, undefined, true))
+      .rejects.toMatchObject({ code: "task_graph_objective_coverage_incomplete", requirements: [
+        { id: "candidate-count", role: "scout" }, { id: "candidate-location", role: "scout" },
+      ] })
+    await expect(createGraphTasks(client, input, parent, withoutAnalystProof, priorIds, undefined, undefined, true, undefined, true))
+      .rejects.toMatchObject({ code: "task_graph_objective_coverage_incomplete", requirements: [{ id: "finding-count", role: "analyst" }] })
+    expect(query).not.toHaveBeenCalled()
+
+    const create = vi.spyOn(pgCreate, "createSubagentTask")
+      .mockResolvedValueOnce({ id: "writer-task", rootTaskId: scope.rootTaskId } as never)
+      .mockResolvedValueOnce({ id: "reviewer-task", rootTaskId: scope.rootTaskId } as never)
+    try {
+      const result = await createGraphTasks(client, input, parent, current, priorIds, undefined, undefined, true, undefined, true)
+      expect(result.created.map(node => [node.key, node.status])).toEqual([
+        [keys.writerNodeKey, "queued"], [keys.reviewerNodeKey, "waiting"],
+      ])
+      expect(result.state.nodes.filter(node => node.key === keys.writerNodeKey || node.key === keys.reviewerNodeKey)).toHaveLength(2)
+      expect(Object.keys(input.templates).sort()).toEqual(["cover_letter_reviewer", "cover_letter_writer"])
+      expect(input.templates).toEqual(plan.templates)
+      expect(create).toHaveBeenCalledTimes(2)
+      expect(query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(true)
+    } finally { create.mockRestore() }
+  })
+
+  it("passes each V2 wave Job context to the actual per-node row creation input", async () => {
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 }
+    const current: TaskGraphState = { revision: 1, appliedEvents: [], nodes: [
+      { key: "scout-source", templateId: "scout", goal: "Find candidates", successCriteria: ["Return candidates"], dependsOn: [], depth: 1,
+        status: "completed", taskId: "scout-task", verificationDisposition: "typed", verification: scoutVerification },
+      { key: "analyst-source", templateId: "analyst", goal: "Verify candidates", successCriteria: ["Return findings"], dependsOn: ["scout-source"], depth: 2,
+        status: "completed", taskId: "analyst-task", verificationDisposition: "typed", verification: analystVerification },
+    ] }
+    const jobIds = ["f47ac10b-58cc-4372-a567-0e02b2c3d471", "f47ac10b-58cc-4372-a567-0e02b2c3d472"]
+    const witnesses = jobIds.map((jobId, index) => {
+      const selection = makeObjectiveTailorWaveCandidateSelection({ scope, sourceGraphRevision: 1, sourceGraphDigest: "a".repeat(64),
+        sourceStatusDigest: "b".repeat(64), analystProofDigest: String(index + 1).repeat(64),
+        candidate: { jobId, score: 8.4, materialDigest: `sha256:${"d".repeat(64)}` }, sourceAnalystKey: "analyst-source" })!
+      return bindObjectiveTailorWaveCandidateWitness(selection, { slotId: `tailor-${index + 1}`, admittedRevision: 2 })!
+    })
+    const marker = { schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, sourceNodeCount: 2,
+      slots: witnesses.map(witness => ({ slotId: witness.slotId, sourceAnalystNodeKey: "analyst-source",
+        writerNodeKey: witness.writerNodeKey, reviewerNodeKey: witness.reviewerNodeKey })) }
+    const plan = prepareObjectiveTailorWaveCreatePlan({ current, witnesses, nextMarker: marker })!
+    const findings = jobIds.map((jobId, index) => ({ jobId, score: 8.4, evidenceIds: [`evidence-${index + 1}`] }))
+    const analystResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings,
+      evidence: jobIds.map((jobId, index) => ({ id: `evidence-${index + 1}`, kind: "job", ref: jobId, source: "greenhouse" })), summary: "Verified findings" }
+    const analystEnvelope = { finalItemId: "analyst-item", finalText: "Verified findings", status: "completed", stepCount: 1,
+      toolCallCount: 1, structuredResult: analystResult, taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
+        status: "passed", reasonCode: "criteria_met", criteria: [{ criterionId: "finding-count", status: "passed", reasonCode: "criteria_met" }],
+        evidenceDigest: "e".repeat(64), resultDigest: taskGraphResultDigest(analystResult) } }
+    const query = vi.fn(async (sql: string) => sql.includes('WHERE task."id" = ANY($1::text[])') ? { rows: [{ id: "analyst-task",
+      status: "completed", role: "analyst", failureReason: null, attemptCount: 1, taskType: "research",
+      allowedActions: TASK_GRAPH_TEMPLATES.analyst.allowedActions, expectedOutputSchema: TASK_GRAPH_TEMPLATES.analyst.expectedOutputSchema,
+      result: analystEnvelope, context: {}, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+      parentTaskId: scope.parentTaskId, userId: scope.userId }], rowCount: 1 } : { rows: [], rowCount: 1 })
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const admit = vi.spyOn(objectiveTaskGraphAuthority, "admitOwnedObjectiveTaskGraphChild").mockResolvedValue(true)
+    const create = vi.spyOn(pgCreate, "createSubagentTask")
+      .mockResolvedValueOnce({ id: "child-1", rootTaskId: scope.rootTaskId } as never)
+      .mockResolvedValueOnce({ id: "child-2", rootTaskId: scope.rootTaskId } as never)
+      .mockResolvedValueOnce({ id: "child-3", rootTaskId: scope.rootTaskId } as never)
+      .mockResolvedValueOnce({ id: "child-4", rootTaskId: scope.rootTaskId } as never)
+    try {
+      const result = await createGraphTasks(client, { scope, proposal: plan.proposal, templates: plan.templates,
+        verificationRequirements: { status: "valid", requirements: [] } },
+      { budgetSnapshot: { subagentPolicy: { maxConcurrency: 4, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 } } }, current,
+      new Map([["scout-source", "scout-task"], ["analyst-source", "analyst-task"]]), undefined, undefined, true, undefined, false,
+      { marker: plan.marker, templatesByNodeKey: plan.templatesByNodeKey })
+      const rowInputs = create.mock.calls.map(([, input]) => input.context as Record<string, unknown>)
+      const actualJobIds = rowInputs.map(context => (context.selectedJobPreparation as { jobId: string }).jobId)
+      expect(result.created.map(node => node.status)).toEqual(["queued", "waiting", "queued", "waiting"])
+      expect(actualJobIds).toEqual([jobIds[0], jobIds[0], jobIds[1], jobIds[1]])
+      expect(rowInputs.map(context => (context.objectiveTailorCandidateWitness as { candidate: { jobId: string } }).candidate.jobId))
+        .toEqual(actualJobIds)
+      expect(admit).toHaveBeenCalledTimes(4)
+    } finally { create.mockRestore(); admit.mockRestore() }
+  })
+
+  it("materializes a correction Writer from the exact Reviewer receipt without advisory source intent", async () => {
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 }
+    const jobId = "f47ac10b-58cc-4372-a567-0e02b2c3d479", materialDigest = `sha256:${"e".repeat(64)}`
+    const source: TaskGraphState = { revision: 1, appliedEvents: [], nodes: [
+      { key: "scout-source", templateId: "scout", goal: "Find candidates", successCriteria: ["Return candidates"], dependsOn: [],
+        depth: 1, status: "completed", taskId: "scout-task", verificationDisposition: "typed", verification: scoutVerification },
+      { key: "analyst-source", templateId: "analyst", goal: "Verify candidate", successCriteria: ["Return evidence"], dependsOn: ["scout-source"],
+        depth: 2, status: "completed", taskId: "analyst-task", verificationDisposition: "typed", verification: analystVerification },
+    ] }
+    const sourceTaskIds = new Map(source.nodes.map(node => [node.key, node.taskId!] as const))
+    const selection = makeObjectiveTailorWaveCandidateSelection({ scope, sourceGraphRevision: 1,
+      sourceGraphDigest: taskGraphFingerprint(taskGraphSnapshot(source, sourceTaskIds)),
+      sourceStatusDigest: taskGraphFingerprint(source.nodes.map(node => ({ key: node.key, status: node.status }))),
+      analystProofDigest: "c".repeat(64), candidate: { jobId, score: 8, materialDigest },
+      sourceAnalystKey: "analyst-source" })!
+    const witness = bindObjectiveTailorWaveCandidateWitness(selection, { slotId: "tailor-1", admittedRevision: 2 })!
+    const initial = prepareObjectiveTailorWaveCreatePlan({ current: source, witnesses: [witness], nextMarker: {
+      schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, sourceNodeCount: 2,
+      slots: [{ slotId: "tailor-1", sourceAnalystNodeKey: "analyst-source", writerNodeKey: witness.writerNodeKey,
+        reviewerNodeKey: witness.reviewerNodeKey }],
+    } })!
+    const initialWriterTaskId = "initial-writer", initialReviewerTaskId = "initial-reviewer"
+    const current: TaskGraphState = { revision: 2, objectiveTailor: initial.marker, appliedEvents: [], nodes: [...source.nodes,
+      { ...initial.proposal.nodes[0]!, depth: 3, status: "completed", taskId: initialWriterTaskId, verificationDisposition: "specialized" },
+      { ...initial.proposal.nodes[1]!, depth: 4, status: "completed", taskId: initialReviewerTaskId, verificationDisposition: "specialized" },
+    ] }
+    const artifactRef = { artifactId: "artifact-1", version: 3, contentHash: `sha256:${"d".repeat(64)}`, sourceDigest: materialDigest }
+    const proof = bindObjectiveTailorCorrectionProof({ graphRevision: 2, slotId: "tailor-1", candidateWitness: witness,
+      writerTaskId: initialWriterTaskId, reviewerTaskId: initialReviewerTaskId, artifactRef,
+      artifactVersion: { ...artifactRef, artifactType: "cover_letter", taskId: initialWriterTaskId, previousHash: null },
+      reviewReceipt: { jobId, ...artifactRef, currentSourceDigest: materialDigest, status: "needs_revision",
+        taskId: initialReviewerTaskId, toolCallId: "review-call", reviewHash: `sha256:${"f".repeat(64)}` },
+    })!
+    const plan = prepareObjectiveTailorCorrectionPlan({ current, proof })!
+    const reviewResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef,
+      reviewStatus: "needs_revision", reviewHash: proof.prior.reviewReceipt.reviewHash }
+    const reviewerTemplate = initial.templatesByNodeKey.get(witness.reviewerNodeKey)!
+    const query = vi.fn(async (sql: string) => sql.includes('WHERE task."id" = ANY($1::text[])') ? { rows: [{
+      id: initialReviewerTaskId, status: "completed", role: "reviewer", failureReason: null, attemptCount: 1,
+      taskType: "cover_letter_review", allowedActions: [], expectedOutputSchema: reviewerTemplate.expectedOutputSchema,
+      result: { finalItemId: null, finalText: "Review complete", status: "completed", stepCount: 1, toolCallCount: 1, structuredResult: reviewResult },
+      context: reviewerTemplate.context, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+      parentTaskId: scope.parentTaskId, userId: scope.userId,
+    }], rowCount: 1 } : { rows: [], rowCount: 1 })
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const admit = vi.spyOn(objectiveTaskGraphAuthority, "admitOwnedObjectiveTaskGraphChild").mockResolvedValue(true)
+    const create = vi.spyOn(pgCreate, "createSubagentTask").mockImplementation(async (_client, input) => ({
+      id: input.role === "writer" ? "correction-writer" : "correction-reviewer", rootTaskId: scope.rootTaskId,
+    } as never))
+    try {
+      const result = await createGraphTasks(client, { scope, proposal: plan.proposal, templates: plan.templates,
+        verificationRequirements: { status: "valid", requirements: [] } },
+      { budgetSnapshot: { subagentPolicy: { maxConcurrency: 4, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 } } }, current,
+      new Map([["scout-source", "scout-task"], ["analyst-source", "analyst-task"], [witness.writerNodeKey, initialWriterTaskId], [witness.reviewerNodeKey, initialReviewerTaskId]]),
+      { sourceInputCheckpointByNodeKey: new Map([[witness.reviewerNodeKey, { inputThroughSequence: 3n }]]), currentInputCheckpoint: { inputThroughSequence: 4n } },
+      undefined, true, undefined, false, { marker: plan.marker, templatesByNodeKey: plan.templatesByNodeKey })
+      const writerContext = create.mock.calls[0]?.[1].context as Record<string, unknown>
+      const evidence = writerContext.taskGraphDependencyResults as { items: Array<Record<string, unknown>> }
+      expect(result.created.map(item => [item.key, item.status])).toEqual([
+        [plan.proof.writerNodeKey, "queued"], [plan.proof.reviewerNodeKey, "waiting"],
+      ])
+      expect(evidence.items).toMatchObject([{ dependencyKey: witness.reviewerNodeKey, dependencyTaskId: initialReviewerTaskId,
+        role: "reviewer", taskStatus: "completed", result: { reviewStatus: "needs_revision", reviewHash: proof.prior.reviewReceipt.reviewHash } }])
+      expect(evidence.items[0]).not.toHaveProperty("sourceIntent")
+      expect(admit).toHaveBeenCalledTimes(2)
+    } finally { create.mockRestore(); admit.mockRestore() }
   })
 
   it("admits a mixed first-repair batch through the reserved eighth position", async () => {

@@ -46,6 +46,19 @@ describe('question hydration pump', () => {
     expect(onProjection).toHaveBeenCalledOnce()
   })
 
+  it('preserves only the closed Objective Tailor sidecar during final-item reconnect', async () => {
+    const sidecar = { schemaVersion: 'agent-harness.v2.objective-tailor-final-outcomes.v1', slots: [
+      { ordinal: 1, status: 'ready' }, { ordinal: 2, status: 'failed' },
+    ] }
+    const target = { itemId: 'turn:turn-1:item:final:step-1', turnId: 'turn-1' }
+    const item = await hydrateFinalItemFromResponse([finalItemDto({ content: { text: 'Answer', objectiveTailorFinalOutcomes: sidecar } })], target, 'session-1')
+    expect(item?.content).toEqual({ text: 'Answer', objectiveTailorFinalOutcomes: sidecar })
+    const malformed = await hydrateFinalItemFromResponse([finalItemDto({ content: {
+      text: 'Answer', objectiveTailorFinalOutcomes: { ...sidecar, privateProof: 'PRIVATE' },
+    } })], target, 'session-1')
+    expect(malformed?.content).toEqual({ text: 'Answer' })
+  })
+
   it('reports only bounded booleans for an accepted target completion', async () => {
     const diagnostics = {
       matchesTarget: vi.fn((sessionId: unknown, turnId: unknown) => sessionId === 'session-1' && turnId === 'turn-1'),

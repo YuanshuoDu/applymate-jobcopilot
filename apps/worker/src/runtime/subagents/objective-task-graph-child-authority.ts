@@ -1,10 +1,13 @@
 import { Buffer } from "node:buffer"
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, TurnIntentSchema, validate } from "@jobcopilot/agent-protocol"
-import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
+import { TASK_GRAPH_LIMITS, type TaskGraphProposal } from "../planning/task-graph.js"
 import type { SubagentTaskSpec } from "./types.js"
 import type { GraphScope } from "./task-graph-pg-state.js"
 import type { TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
+import { taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
+import { parseObjectiveTailorCandidateWitness, type ObjectiveTailorCandidateWitness } from "./objective-tailor-witness.js"
+import { isRegisteredObjectiveTailorWaveChild, objectiveTailorWaveChildExecutionAllowed } from "./task-graph-pg-create-objective-tailor-wave.js"
 import { templatesForInteractiveScoutDelegation } from "./nested-scout-profile.js"
 import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT } from "./task-graph-dependency-context.js"
@@ -54,7 +57,7 @@ function validDependencyContext(value: unknown): boolean {
 
 function registeredObjectiveChildSpec(candidate: Record<string, unknown>): boolean {
   try {
-    return Object.values(REGISTERED_OBJECTIVE_CHILDREN).flat().some(template => {
+    return registeredTailorChildSpec(candidate) || Object.values(REGISTERED_OBJECTIVE_CHILDREN).flat().some(template => {
       const expected = templateProjection(template) as Record<string, unknown> | null
       const context = plainRecord(candidate.context)
       if (!expected || !context) return false
@@ -91,18 +94,101 @@ export function isRegisteredObjectiveTaskGraphChildTemplate(templateId: string, 
   return registered.some(candidate => exactTemplate(template, candidate))
 }
 
+export function isRegisteredObjectiveTailorTaskGraphChildTemplate(templateId: string, template: TaskGraphTaskTemplate): boolean {
+  const context = plainRecord(template.context), witness = context && parseObjectiveTailorCandidateWitness(context.objectiveTailorCandidateWitness)
+  const expected = witness && objectiveTailorPlan(witness)?.templates[templateId]
+  return Boolean(expected && canonicalTaskGraphJson(template) === canonicalTaskGraphJson(expected))
+}
+
+const TAILOR_WRITER_GOAL = "Draft the current cover letter for the server-bound job."
+const TAILOR_REVIEWER_GOAL = "Review only the exact Writer artifact for this server-bound job."
+const TAILOR_REF = /^otc1_[a-f0-9]{64}$/
+
+export function objectiveTailorNodeKeysForCandidate(candidateRef: string): Readonly<{ writerNodeKey: string; reviewerNodeKey: string }> | undefined {
+  if (!TAILOR_REF.test(candidateRef)) return undefined
+  const suffix = candidateRef.slice(5)
+  return { writerNodeKey: `objective-tailor-writer-${suffix}`, reviewerNodeKey: `objective-tailor-reviewer-${suffix}` }
+}
+
+/** Build the only server-owned Writer/Reviewer pair admitted for an ordinary Objective. */
+export function objectiveTailorPlan(witnessValue: unknown): Readonly<{
+  witness: ObjectiveTailorCandidateWitness
+  proposal: TaskGraphProposal
+  templates: Readonly<Record<string, TaskGraphTaskTemplate>>
+}> | undefined {
+  const witness = parseObjectiveTailorCandidateWitness(witnessValue)
+  if (!witness) return undefined
+  const nodeKeys = objectiveTailorNodeKeysForCandidate(witness.candidateRef)
+  if (!nodeKeys || witness.writerNodeKey !== nodeKeys.writerNodeKey || witness.reviewerNodeKey !== nodeKeys.reviewerNodeKey) return undefined
+  const jobId = witness.candidate.jobId
+  const selected = taskGraphTemplatesForSelectedJob({ jobId })
+  const context = { objectiveTailorCandidateMode: true, selectedJobPreparation: { jobId }, objectiveTailorCandidateWitness: witness }
+  const templates = {
+    cover_letter_writer: { ...selected.cover_letter_writer!, context },
+    cover_letter_reviewer: { ...selected.cover_letter_reviewer!, context },
+  }
+  const proposal: TaskGraphProposal = {
+    expectedRevision: witness.sourceGraphRevision,
+    nodes: [
+      { key: witness.writerNodeKey, templateId: "cover_letter_writer", goal: TAILOR_WRITER_GOAL,
+        successCriteria: ["Save one current immutable cover letter artifact."], dependsOn: [...witness.sourceAnalystKeys] },
+      { key: witness.reviewerNodeKey, templateId: "cover_letter_reviewer", goal: TAILOR_REVIEWER_GOAL,
+        successCriteria: ["Persist a review receipt for the exact Writer artifact."], dependsOn: [witness.writerNodeKey] },
+    ],
+  }
+  return { witness, proposal, templates }
+}
+
+/** Recheck the closed pair at the shared create boundary; generic plan calls do not pass this authority. */
+export function objectiveTailorNodeKeys(
+  proposal: TaskGraphProposal, templates: Readonly<Record<string, TaskGraphTaskTemplate>>,
+): ReadonlySet<string> | undefined {
+  const context = plainRecord(templates.cover_letter_writer?.context)
+  const plan = context && objectiveTailorPlan(context.objectiveTailorCandidateWitness)
+  return plan && canonicalTaskGraphJson(plan.proposal) === canonicalTaskGraphJson(proposal)
+    && canonicalTaskGraphJson(plan.templates) === canonicalTaskGraphJson(templates)
+    ? new Set(plan.proposal.nodes.map(node => node.key)) : undefined
+}
+
+function registeredTailorChildSpec(candidate: Record<string, unknown>): boolean {
+  const context = plainRecord(candidate.context)
+  const witness = context && parseObjectiveTailorCandidateWitness(context.objectiveTailorCandidateWitness)
+  const templateId = candidate.role === "writer" && candidate.taskType === "cover_letter_draft" ? "cover_letter_writer"
+    : candidate.role === "reviewer" && candidate.taskType === "cover_letter_review" ? "cover_letter_reviewer" : undefined
+  if (!context || context.objectiveTailorCandidateMode !== true || !witness || !templateId) return false
+  const expectedPair = objectiveTailorPlan(witness), expected = expectedPair?.templates[templateId]
+  if (!expected) return false
+  const actualContext = { ...context }, dependencyContext = actualContext.taskGraphDependencyResults
+  delete actualContext.taskGraphDependencyResults
+  const actual = { ...candidate, context: actualContext }
+  if (canonicalTaskGraphJson(actual) !== canonicalTaskGraphJson(expected)) return false
+  if (templateId === "cover_letter_reviewer") return dependencyContext === undefined
+  return validTailorDependencyContext(dependencyContext, witness)
+}
+
+function validTailorDependencyContext(value: unknown, witness: ObjectiveTailorCandidateWitness): boolean {
+  const context = plainRecord(value)
+  if (!context || Object.keys(context).sort().join(",") !== "items,schemaVersion"
+    || context.schemaVersion !== "agent-harness.v2.task-graph.dependency-evidence"
+    || !Array.isArray(context.items) || context.items.length !== witness.sourceAnalystKeys.length
+    || Reflect.ownKeys(context.items).length !== context.items.length + 1) return false
+  return context.items.every((raw, index) => {
+    const item = plainRecord(raw)
+    return Boolean(item && item.dependencyKey === witness.sourceAnalystKeys[index]
+      && item.role === "analyst" && item.taskStatus === "completed")
+  })
+}
+
 function exactObjectiveIntent(value: unknown): boolean {
-  const envelope = record(value)
+  const envelope = plainRecord(value)
   if (!envelope || Object.hasOwn(envelope, "input")) return false
-  const intent = record(envelope.intent)
+  const intent = plainRecord(envelope.intent)
   return Boolean(intent && Object.keys(intent).sort().join(",") === "kind,version"
     && validate(TurnIntentSchema, intent)
     && canonicalTaskGraphJson(intent) === canonicalTaskGraphJson(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT))
 }
 
-function record(value: unknown): Record<string, unknown> | null {
-  return plainRecord(value)
-}
+export function isExactObjectiveTaskGraphIntent(value: unknown): boolean { return exactObjectiveIntent(value) }
 
 function matchingScope(scope: GraphScope, input: SubagentTaskSpec): boolean {
   return typeof scope.stepId === "string" && scope.stepId.trim().length > 0
@@ -116,7 +202,7 @@ function matchingScope(scope: GraphScope, input: SubagentTaskSpec): boolean {
 
 /** Reuses Session/Turn/Root/Step locks already held by the TaskGraph schedule transaction. */
 export async function admitOwnedObjectiveTaskGraphChild(
-  client: Queryable, input: SubagentTaskSpec, authority: GraphScope | undefined,
+  client: Queryable, input: SubagentTaskSpec, authority: (GraphScope & Readonly<{ objectiveTailorWaveNodeKey?: string }>) | undefined,
 ): Promise<boolean> {
   if (!authority || !matchingScope(authority, input)) return false
   let candidate: unknown
@@ -125,9 +211,11 @@ export async function admitOwnedObjectiveTaskGraphChild(
       constraints: input.constraints, context: input.context, expectedOutputSchema: input.expectedOutputSchema })
   } catch { return false }
   if (!candidate) return false
-  if (!registeredObjectiveChildSpec(candidate as Record<string, unknown>)) return false
+  const waveChild = Boolean(authority?.objectiveTailorWaveNodeKey
+    && isRegisteredObjectiveTailorWaveChild(candidate as Record<string, unknown>, authority.objectiveTailorWaveNodeKey))
+  if (!registeredObjectiveChildSpec(candidate as Record<string, unknown>) && !waveChild) return false
   const result = await client.query(`WITH live AS MATERIALIZED (SELECT clock_timestamp() AS "at")
-    SELECT turn."input", turn."executionMode" FROM live
+    SELECT turn."input", turn."executionMode", root."budgetSnapshot" AS "rootBudgetSnapshot", root."allowedActions" AS "rootAllowedActions" FROM live
     JOIN "agent_sessions" AS session ON session."id" = $1 AND session."userId" = $2
       AND session."status" NOT IN ('aborted', 'archived')
     JOIN "agent_turns" AS turn ON turn."id" = $3 AND turn."sessionId" = session."id" AND turn."userId" = session."userId"
@@ -146,9 +234,9 @@ export async function admitOwnedObjectiveTaskGraphChild(
     authority.turnLeaseVersion, authority.parentLeaseOwner, authority.parentAttemptCount, authority.stepId])
   if (result.rows.length !== 1) return false
   const turn = result.rows[0] as Record<string, unknown>
-  if (!exactObjectiveIntent(turn.input)) return false
+  if (!exactObjectiveIntent(turn.input) || waveChild && !objectiveTailorWaveChildExecutionAllowed(turn)) return false
   if (turn.executionMode === "canonical_task_graph") return true
-  if (turn.executionMode !== null) return false
+  if (turn.executionMode !== null || waveChild) return false
   const promoted = await client.query(`UPDATE "agent_turns" AS turn SET "executionMode" = 'canonical_task_graph'
     WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
       AND turn."source" = 'user' AND turn."status" = 'in_progress' AND turn."rootTaskId" = $4

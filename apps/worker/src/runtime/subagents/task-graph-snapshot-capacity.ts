@@ -1,11 +1,46 @@
+import type { TaskGraphRepairOf } from "../planning/task-graph.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { projectScheduledPipelineGraphAtCurrentStage } from "./scheduled-pipeline-graph-shape.js"
 
 const PACKAGE_REFS_NODE_KEYS = "dependsOn,depth,goal,key,packageRefs,successCriteria,taskId,templateId,verificationDisposition"
 const EXECUTE_TEMPLATE_ID = "scheduled.application.execute"
 
-function text(value: unknown, maxLength: number): value is string {
+export function taskGraphSnapshotText(value: unknown, maxLength = Number.MAX_SAFE_INTEGER): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength
+}
+
+export function taskGraphSnapshotObject(value: unknown): Record<string, unknown> | null {
+  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
+  const prototype = Object.getPrototypeOf(parsed)
+  return (prototype === Object.prototype || prototype === null) && Object.getOwnPropertySymbols(parsed).length === 0
+    ? parsed as Record<string, unknown>
+    : null
+}
+
+export function taskGraphSnapshotExactKeys(value: Record<string, unknown>, expected: string): boolean {
+  const keys = Reflect.ownKeys(value)
+  return keys.every((key): key is string => typeof key === "string") && keys.sort().join(",") === expected
+}
+
+export function taskGraphSnapshotOwnData(value: object, key: string): Readonly<{ present: boolean; valid: boolean; value?: unknown }> {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (!descriptor) return { present: false, valid: true }
+    return "value" in descriptor && descriptor.enumerable
+      ? { present: true, valid: true, value: descriptor.value }
+      : { present: true, valid: false }
+  } catch { return { present: true, valid: false } }
+}
+
+export function taskGraphSnapshotRepairOf(value: unknown, maxKeyLength: number, maxCriteria: number): TaskGraphRepairOf | undefined {
+  const row = taskGraphSnapshotObject(value)
+  if (!row || !taskGraphSnapshotExactKeys(row, "criterionIds,graphRootTaskId,nodeKey,taskId")
+    || !taskGraphSnapshotText(row.graphRootTaskId, maxKeyLength) || !taskGraphSnapshotText(row.nodeKey, maxKeyLength)
+    || !taskGraphSnapshotText(row.taskId, maxKeyLength)
+    || !taskGraphSnapshotStringList(row.criterionIds, maxCriteria, 64, false)
+    || new Set(row.criterionIds).size !== row.criterionIds.length) return undefined
+  return { graphRootTaskId: row.graphRootTaskId, nodeKey: row.nodeKey, taskId: row.taskId, criterionIds: [...row.criterionIds] }
 }
 
 export type TaskGraphSnapshotPackageRefs = Readonly<{
@@ -23,14 +58,14 @@ export function taskGraphSnapshotStringList(value: unknown, maxItems: number, ma
     if (typeof key !== "string") return false
     const index = Number(key)
     if (!Number.isSafeInteger(index) || index < 0 || index >= value.length || String(index) !== key
-      || !text(value[index], maxLength)) return false
+      || !taskGraphSnapshotText(value[index], maxLength)) return false
   }
   return true
 }
 
 export function parseTaskGraphSnapshotPackageRefs(value: Record<string, unknown>): TaskGraphSnapshotPackageRefs {
   const hasRefs = Object.hasOwn(value, "packageRefs"), isExecute = value.templateId === EXECUTE_TEMPLATE_ID
-  const shape = exactKeys(value, PACKAGE_REFS_NODE_KEYS)
+  const shape = taskGraphSnapshotExactKeys(value, PACKAGE_REFS_NODE_KEYS)
   if (!hasRefs && !isExecute) return { valid: true, shape: false }
   if (!hasRefs || !isExecute || !shape || value.verificationDisposition !== "specialized"
     || !taskGraphSnapshotStringList(value.packageRefs, TASK_GRAPH_LIMITS.maxScheduledPackageRefs, 256, true)) return { valid: false, shape }
@@ -48,9 +83,4 @@ export function taskGraphSnapshotCapacityValid(nodes: readonly Readonly<{
   if (nodes.length <= TASK_GRAPH_LIMITS.maxNodes && !hasPostGateNodes) return true
   const scheduled = projectScheduledPipelineGraphAtCurrentStage(nodes)
   return scheduled?.version === "v2" && scheduled.projection.stage === "audit" && scheduled.projection.executes.length > 0
-}
-
-function exactKeys(value: Record<string, unknown>, expected: string): boolean {
-  const keys = Reflect.ownKeys(value)
-  return keys.every((key): key is string => typeof key === "string") && keys.sort().join(",") === expected
 }

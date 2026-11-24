@@ -15,7 +15,7 @@ import { FINAL_EVIDENCE_RECOVERY_FEEDBACK, tagTaskGraphRepairRecovery, SCHEDULED
 import { canRecoverMissingEvidence } from "./final-evidence-recovery-eligibility.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
-import { buildTaskGraphFinalSourceManifest } from "../subagents/task-graph-final-source-manifest.js"
+import { buildTaskGraphFinalSidecars } from "../subagents/objective-tailor-final-sidecar.js"
 import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 import { TurnStateRefreshRetryError, isTurnStateRefreshRetryError } from "./turn-execution-question.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
@@ -165,13 +165,13 @@ export async function completeTurnCandidate(input: Readonly<{
     throw new TurnEngineError("persistence_conflict", "Atomic TaskGraph final source publication is unavailable")
   }
   let finalItemId: string | undefined
-  let taskGraphSources: ReturnType<typeof buildTaskGraphFinalSourceManifest> = null
+  let taskGraphSidecars: ReturnType<typeof buildTaskGraphFinalSidecars> = null
   if (summaryBinding) {
     finalItemId = options.idFactory?.(executionId(options.identity, `item:final:${step.id}`)) ?? executionId(options.identity, `item:final:${step.id}`)
     try {
       if (options.identity.kind !== "turn" || options.identity.taskId !== options.identity.rootTaskId
         || summaryBinding.rootTaskId !== options.identity.rootTaskId) throw new Error("task_graph_root_binding_mismatch")
-      taskGraphSources = buildTaskGraphFinalSourceManifest(summaryBinding, finalItemId)
+      taskGraphSidecars = buildTaskGraphFinalSidecars(summaryBinding, finalItemId)
     } catch {
       throw new TurnEngineError("persistence_conflict", "Atomic TaskGraph final source binding is inconsistent")
     }
@@ -187,7 +187,7 @@ export async function completeTurnCandidate(input: Readonly<{
     let terminal: void | AtomicTurnCompletionResult | AtomicTurnNoProgressResult
     try {
       terminal = await options.store.recordFinalResponse({ identity: options.identity, response: serializeFinalResponse(finalResponse), now: now(),
-        terminal: { stepId: step.id, finalItemId, finalContent: toRepositoryJson({ text: finalResponse.response, final: toRepositoryJson(finalResponse), ...(taskGraphSources ? { taskGraphSources } : {}) }),
+        terminal: { stepId: step.id, finalItemId, finalContent: toRepositoryJson({ text: finalResponse.response, final: toRepositoryJson(finalResponse), ...(taskGraphSidecars ?? {}) }),
           stepCount: input.stepCount, toolCallCount: input.toolCallCount, usage: finalResponse.usage,
           ...(summaryBinding ? { [TASK_GRAPH_FINAL_SUMMARY_BINDING]: summaryBinding } : {}) } })
     } catch (error: unknown) {

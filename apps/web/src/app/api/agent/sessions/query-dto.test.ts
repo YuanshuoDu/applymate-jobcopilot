@@ -190,6 +190,29 @@ describe("agent query DTO redaction", () => {
     }
   })
 
+  it('projects a marked wave as only its bounded progress hint', () => {
+    const source = (role: 'scout' | 'analyst', key: string, taskId: string, dependsOn: string[]) => ({
+      key, taskId, templateId: role, goal: 'PRIVATE_SOURCE_GOAL', successCriteria: ['PRIVATE_SOURCE_CRITERION'], dependsOn,
+      depth: role === 'scout' ? 1 : 2, verificationDisposition: 'typed',
+      verification: { schemaVersion: 'agent-harness.v2.task-graph-verification.v1', role,
+        criteria: [{ id: role === 'scout' ? 'candidate-count' : 'finding-count',
+          check: { kind: role === 'scout' ? 'candidate_count_gte' : 'finding_count_gte', minimum: 1 } }] },
+    })
+    const snapshot = { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+      source('scout', 'scout-key', 'scout-private-id', []), source('analyst', 'analyst-key', 'analyst-private-id', ['scout-key']),
+      { key: 'writer-key', taskId: 'writer-private-id', templateId: 'cover_letter_writer', goal: 'PRIVATE_DRAFT', successCriteria: ['PRIVATE'], dependsOn: ['analyst-key'], depth: 3, verificationDisposition: 'specialized' },
+      { key: 'reviewer-key', taskId: 'reviewer-private-id', templateId: 'cover_letter_reviewer', goal: 'PRIVATE_REVIEW', successCriteria: ['PRIVATE'], dependsOn: ['writer-key'], depth: 4, verificationDisposition: 'specialized' },
+    ], objectiveTailor: { schemaVersion: 'agent-harness.v2.objective-tailor-graph.v1', sourceNodeCount: 2, slots: [
+      { slotId: 'tailor-1', sourceAnalystNodeKey: 'analyst-key', writerNodeKey: 'writer-key', reviewerNodeKey: 'reviewer-key' },
+    ] } }
+    const dto = itemDto({ id: 'marked-graph', sessionId: 'session-1', turnId: 'turn-1', stepId: null, taskId: 'root-1', type: 'task_graph',
+      status: 'streaming', phase: 'commentary', revision: 4, content: snapshot, startedAt: null, completedAt: null, createdAt: date, updatedAt: date })
+    expect(dto.content).toEqual({ objectiveTailorProgressHint: {
+      schemaVersion: 'agent-harness.v2.objective-tailor-progress-hint.v1', sourceNodeCount: 2, slotCount: 1,
+    } })
+    expect(JSON.stringify(dto)).not.toMatch(/PRIVATE_|scout-private-id|analyst-private-id|writer-private-id|reviewer-private-id|jobId|digest/)
+  })
+
   it("projects only a bounded final agent summary beside redacted response text", () => {
     const row = {
       id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
@@ -263,6 +286,9 @@ describe("agent query DTO redaction", () => {
   })
 
   it("preserves only a canonical safe TaskGraph sibling on a completed final item", () => {
+    const objectiveTailorFinalOutcomes = { schemaVersion: 'agent-harness.v2.objective-tailor-final-outcomes.v1', slots: [
+      { ordinal: 1, status: 'ready' }, { ordinal: 2, status: 'needs_revision' },
+    ] }
     const source = {
       sourceKey: canonicalTaskGraphSourceKey("item_final", 3, 0), nodeIndex: 0,
       role: "scout", taskStatus: "completed", resultState: "missing",
@@ -272,17 +298,20 @@ describe("agent query DTO redaction", () => {
       id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
       type: "agent_message", status: "completed", phase: "final_answer", revision: 2,
       content: { text: "Answer stays intact.", final: { response: "Answer stays intact." }, taskGraphSources: manifest,
+        objectiveTailorFinalOutcomes,
         privateFinalField: "PRIVATE_RAW_RESULT" },
       startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
     }
     const projected = itemDto(base).content as Record<string, unknown>
-    expect(projected).toEqual({ text: "Answer stays intact.", taskGraphSources: manifest })
+    expect(projected).toEqual({ text: "Answer stays intact.", taskGraphSources: manifest, objectiveTailorFinalOutcomes })
     expect(JSON.stringify(projected)).not.toMatch(/taskId|graphItemId|sessionId|userId|jobId|artifactId|PRIVATE_RAW_RESULT/)
     expect(itemDto({ ...base, status: "running" }).content).toEqual({ text: "Answer stays intact." })
+    expect(itemDto({ ...base, content: { ...base.content, objectiveTailorFinalOutcomes: { ...objectiveTailorFinalOutcomes, privateId: "PRIVATE" } } }).content)
+      .toEqual({ text: "Answer stays intact.", taskGraphSources: manifest })
     expect(itemDto({ ...base, content: { ...base.content, taskGraphSources: { ...manifest, taskId: "PRIVATE_TASK" } } }).content)
-      .toEqual({ text: "Answer stays intact." })
+      .toEqual({ text: "Answer stays intact.", objectiveTailorFinalOutcomes })
     expect(itemDto({ ...base, content: { ...base.content, taskGraphSources: { ...manifest, sources: [{ ...source, sourceKey: "src_" + "A".repeat(43) }] } } }).content)
-      .toEqual({ text: "Answer stays intact." })
+      .toEqual({ text: "Answer stays intact.", objectiveTailorFinalOutcomes })
   })
 
   it("preserves legacy markers without an evidence field and strips markers when all evidence is rejected", () => {

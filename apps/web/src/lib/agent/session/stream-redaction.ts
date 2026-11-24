@@ -9,6 +9,8 @@ import { redactSensitiveText, redactSensitiveValue } from '@jobcopilot/shared'
 import { projectFinalAnswerContent } from './final-answer-evidence-projection'
 import { isCanonicalTaskGraphSourceManifest } from './final-task-graph-source-detail'
 import { parseFinalTaskGraphSourceManifest } from './final-task-graph-source-manifest'
+import { OBJECTIVE_TAILOR_FINAL_OUTCOMES_FIELD, parseObjectiveTailorFinalOutcomesFromContent, stripObjectiveTailorFinalOutcomes } from './objective-tailor-final-content'
+import { objectiveTailorProgressHint, parseObjectiveTailorProgressSnapshot } from './objective-tailor-progress-snapshot'
 
 const TASK_GRAPH_PROPOSAL_KEYS = ['kind', 'fingerprint', 'receipt', 'revision', 'item'] as const
 const TASK_GRAPH_PROPOSAL_CONTENT_KEYS = [...TASK_GRAPH_PROPOSAL_KEYS, 'content'] as const
@@ -53,13 +55,20 @@ export function redactStreamEventPayload(eventType: string, payload: unknown, id
   if (isPrivateNativeVerificationEventType(eventType)) return {}
   const finalContent = projectCompletedFinalContent(eventType, payload, identity)
   if (finalContent) return finalContent
-  const redacted = redactStreamValue(payload)
+  const redacted = stripObjectiveTailorFinalOutcomes(redactStreamValue(payload))
   if (eventType === 'turn.completed') return projectCompletedTurnIdentity(payload, redacted, identity)
   if (eventType !== 'item.started' && eventType !== 'item.delta') return redacted
 
-  const snapshot = taskGraphSnapshotFromEvent(eventType, payload, identity)
-  if (!snapshot || !isRecord(redacted) || !isRecord(redacted.item)) return redacted
-  const item = (payload as Record<string, unknown>).item as Record<string, unknown>
+  const graphEvent = taskGraphSnapshotFromEvent(eventType, payload, identity)
+  if (!graphEvent || !isRecord(redacted) || !isRecord(redacted.item)) return redacted
+  const item = graphEvent.item
+  if ('hint' in graphEvent) {
+    if (!isGeneratedRootTaskId(item.taskId, item.turnId) && redactSensitiveText(item.taskId as string) !== item.taskId) return redacted
+    return { kind: graphEvent.kind, revision: graphEvent.revision, item: { ...redacted.item, id: identity.itemId, sessionId: identity.sessionId, turnId: identity.turnId,
+      ...(isGeneratedRootTaskId(item.taskId, item.turnId) ? { taskId: item.taskId } : {}),
+      content: { objectiveTailorProgressHint: graphEvent.hint } } }
+  }
+  const snapshot = graphEvent.snapshot!
   const generatedTaskIds = isGeneratedRootTaskId(item.taskId, item.turnId)
     && snapshot.nodes.every(node => SUBAGENT_TASK_ID.test(node.taskId))
   // Noncanonical IDs may still be shown only when the ordinary redactor leaves them unchanged.
@@ -132,12 +141,14 @@ function projectCompletedFinalContent(eventType: string, payload: unknown, ident
   const text = ownDataValue(rawContent, 'text'), final = ownDataValue(rawContent, 'final')
   const content = projectFinalAnswerContent({ text, final })
   if (!content) {
-    if (!Object.hasOwn(rawContent, 'taskGraphSources')) return null
+    if (!Object.hasOwn(rawContent, 'taskGraphSources') && !Object.hasOwn(rawContent, OBJECTIVE_TAILOR_FINAL_OUTCOMES_FIELD)) return null
     return { itemId: identity.itemId, status: 'completed', content: { text: typeof text === 'string' ? redactSensitiveText(text) : '' } }
   }
   const manifest = parseFinalTaskGraphSourceManifest(ownDataValue(rawContent, 'taskGraphSources'))
   const taskGraphSources = manifest && isCanonicalTaskGraphSourceManifest(identity.itemId, manifest) ? manifest : undefined
-  return { itemId: identity.itemId, status: 'completed', content: { ...content, ...(taskGraphSources ? { taskGraphSources } : {}) } }
+  const objectiveTailorFinalOutcomes = parseObjectiveTailorFinalOutcomesFromContent(rawContent)
+  return { itemId: identity.itemId, status: 'completed', content: { ...content, ...(taskGraphSources ? { taskGraphSources } : {}),
+    ...(objectiveTailorFinalOutcomes ? { objectiveTailorFinalOutcomes } : {}) } }
 }
 
 function ownDataValue(value: Record<string, unknown>, key: string): unknown {
@@ -147,7 +158,9 @@ function ownDataValue(value: Record<string, unknown>, key: string): unknown {
   } catch { return undefined }
 }
 
-function taskGraphSnapshotFromEvent(eventType: string, payload: unknown, identity: StreamItemIdentity): TaskGraphSnapshot | null {
+function taskGraphSnapshotFromEvent(eventType: string, payload: unknown, identity: StreamItemIdentity):
+  | { item: Record<string, unknown>; kind: 'proposal' | 'lifecycle'; revision: number; hint: ReturnType<typeof objectiveTailorProgressHint> }
+  | { item: Record<string, unknown>; snapshot: TaskGraphSnapshot } | null {
   if (!isRecord(payload) || !identity.itemId || !identity.taskId) return null
   const proposal = payload.kind === 'proposal' && (isExactRecord(payload, TASK_GRAPH_PROPOSAL_KEYS)
     || (eventType === 'item.delta' && isExactRecord(payload, TASK_GRAPH_PROPOSAL_CONTENT_KEYS)))
@@ -157,14 +170,21 @@ function taskGraphSnapshotFromEvent(eventType: string, payload: unknown, identit
   if (item.schemaVersion !== AGENT_STREAM_SCHEMA_VERSION || item.id !== identity.itemId || item.sessionId !== identity.sessionId
     || item.turnId !== identity.turnId || !boundedText(item.taskId, TASK_GRAPH_MAX_IDENTIFIER_LENGTH)
     || item.type !== 'task_graph' || item.revision !== payload.revision) return null
+  const progress = parseObjectiveTailorProgressSnapshot(item.content)
+  if (progress) {
+    if (proposal) return item.taskId === identity.taskId ? { item, kind: 'proposal', revision: Number(payload.revision), hint: objectiveTailorProgressHint(progress) } : null
+    const event = payload.event
+    const node = isRecord(event) && typeof event.nodeKey === 'string' ? progress.nodes.find(candidate => candidate.key === event.nodeKey) : undefined
+    return node?.taskId === identity.taskId ? { item, kind: 'lifecycle', revision: Number(payload.revision), hint: objectiveTailorProgressHint(progress) } : null
+  }
   const snapshot = parseTaskGraphSnapshot(item.content)
   if (!snapshot) return null
-  if (proposal) return item.taskId === identity.taskId ? snapshot : null
+  if (proposal) return item.taskId === identity.taskId ? { item, snapshot } : null
 
   const event = payload.event
   if (!isRecord(event) || !Object.hasOwn(event, 'nodeKey') || typeof event.nodeKey !== 'string') return null
   const node = snapshot.nodes.find(candidate => candidate.key === event.nodeKey)
-  return node?.taskId === identity.taskId ? snapshot : null
+  return node?.taskId === identity.taskId ? { item, snapshot } : null
 }
 
 function redactTaskGraphSnapshot(snapshot: TaskGraphSnapshot, preserveGeneratedTaskIds: boolean): Record<string, unknown> {

@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from "vitest"
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 import type { GraphScope } from "./task-graph-pg-state.js"
-import { isRegisteredObjectiveTaskGraphChildTemplate, admitOwnedObjectiveTaskGraphChild } from "./objective-task-graph-child-authority.js"
+import { isRegisteredObjectiveTaskGraphChildTemplate, admitOwnedObjectiveTaskGraphChild, objectiveTailorNodeKeysForCandidate, objectiveTailorNodeKeys, objectiveTailorPlan } from "./objective-task-graph-child-authority.js"
+import { bindObjectiveTailorCandidateWitness, makeObjectiveTailorCandidateSelection } from "./objective-tailor-witness.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
 import { templatesForInteractiveScoutDelegation } from "./nested-scout-profile.js"
+import { bindObjectiveTailorWaveCandidateWitness, makeObjectiveTailorWaveCandidateSelection, objectiveTailorWavePairPlan } from "./objective-tailor-wave-witness.js"
+import { isRegisteredObjectiveTailorWaveChild } from "./task-graph-pg-create-objective-tailor-wave.js"
 
 const scope: GraphScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
   stepId: "step-1", turnLeaseOwner: "turn-worker", turnLeaseVersion: 3, parentLeaseOwner: "root-worker", parentAttemptCount: 2 }
@@ -31,6 +34,73 @@ function clientFor(rows: unknown[], casRows: unknown[] = [{ id: scope.turnId }])
 }
 
 describe("objective TaskGraph child authority", () => {
+  it("validates V2 per-node projection and profile without legacy mode promotion", async () => {
+    const selection = makeObjectiveTailorWaveCandidateSelection({ scope, sourceGraphRevision: 4,
+      sourceGraphDigest: "a".repeat(64), sourceStatusDigest: "b".repeat(64), analystProofDigest: "c".repeat(64),
+      candidate: { jobId: "f47ac10b-58cc-4372-a567-0e02b2c3d479", score: 8, materialDigest: `sha256:${"d".repeat(64)}` },
+      sourceAnalystKey: "analyst-source" })!
+    const witness = bindObjectiveTailorWaveCandidateWitness(selection, { slotId: "tailor-1", admittedRevision: 5 })!
+    const pair = objectiveTailorWavePairPlan(witness)!
+    const writer = pair.templatesByNodeKey.get(witness.writerNodeKey)!
+    const writerContext = { ...(writer.context as Record<string, unknown>), taskGraphDependencyResults: {
+      schemaVersion: "agent-harness.v2.task-graph.dependency-evidence",
+      items: [{ dependencyKey: "analyst-source", role: "analyst", taskStatus: "completed" }],
+    } }
+    const input = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, parentTaskId: scope.rootTaskId,
+      role: writer.role, taskType: writer.taskType, goal: "Draft", allowedActions: writer.allowedActions,
+      constraints: writer.constraints, context: writerContext, expectedOutputSchema: writer.expectedOutputSchema }
+    const liveBudget = { limits: { maxSteps: 96 }, objectiveTailorProfile: "agent-harness.v2.objective-tailor-execution-budget.v1" }
+    const accepted = clientFor([liveRow({ rootBudgetSnapshot: liveBudget, rootAllowedActions: ["agent.tailor"] })])
+
+    expect(isRegisteredObjectiveTailorWaveChild({ ...writer, context: writerContext }, witness.writerNodeKey)).toBe(true)
+    expect(isRegisteredObjectiveTailorWaveChild({ ...writer, context: writerContext }, witness.reviewerNodeKey)).toBe(false)
+    await expect(admitOwnedObjectiveTaskGraphChild(accepted.client, input, { ...scope, objectiveTailorWaveNodeKey: witness.writerNodeKey })).resolves.toBe(true)
+    expect(accepted.query.mock.calls[0]?.[0]).toContain('root."budgetSnapshot" AS "rootBudgetSnapshot"')
+    expect(accepted.query.mock.calls[0]?.[0]).toContain('root."allowedActions" AS "rootAllowedActions"')
+    const generic = clientFor([liveRow({ rootBudgetSnapshot: liveBudget, rootAllowedActions: ["agent.tailor"] })])
+    await expect(admitOwnedObjectiveTaskGraphChild(generic.client, input, scope)).resolves.toBe(false)
+    expect(generic.query).not.toHaveBeenCalled()
+
+    for (const overrides of [
+      { rootBudgetSnapshot: { limits: { maxSteps: 32 }, objectiveTailorProfile: liveBudget.objectiveTailorProfile } },
+      { rootAllowedActions: [] },
+      { executionMode: null },
+      { input: { ...objectiveInput, selectedJobPreparation: { jobId: witness.candidate.jobId } } },
+    ]) {
+      const denied = clientFor([liveRow({ rootBudgetSnapshot: liveBudget, rootAllowedActions: ["agent.tailor"], ...overrides })])
+      await expect(admitOwnedObjectiveTaskGraphChild(denied.client, input, { ...scope, objectiveTailorWaveNodeKey: witness.writerNodeKey })).resolves.toBe(false)
+      expect(denied.query).toHaveBeenCalledTimes(1)
+      expect(denied.query.mock.calls.some(([sql]) => sql.startsWith('UPDATE "agent_turns"'))).toBe(false)
+    }
+    const changedDependency = { ...input, context: { ...writerContext, taskGraphDependencyResults: {
+      schemaVersion: "agent-harness.v2.task-graph.dependency-evidence",
+      items: [{ dependencyKey: "another-analyst", role: "analyst", taskStatus: "completed" }],
+    } } }
+    expect(isRegisteredObjectiveTailorWaveChild({ ...input, context: changedDependency.context }, witness.writerNodeKey)).toBe(false)
+  })
+
+  it("synthesizes one closed Writer/Reviewer pair with exact source Analyst dependencies", () => {
+    const selection = makeObjectiveTailorCandidateSelection({ scope, sourceGraphRevision: 4, sourceGraphDigest: "a".repeat(64),
+      sourceStatusDigest: "b".repeat(64), analystProofDigest: "c".repeat(64),
+      candidate: { jobId: "f47ac10b-58cc-4372-a567-0e02b2c3d479", score: 8, materialDigest: `sha256:${"d".repeat(64)}` },
+      sourceAnalystKeys: ["analyst-a", "analyst-b"] })!
+    const keys = objectiveTailorNodeKeysForCandidate(selection.candidateRef)!
+    const witness = bindObjectiveTailorCandidateWitness(selection, { ...keys, admittedRevision: 5 })!
+    const plan = objectiveTailorPlan(witness)!
+    expect(plan.proposal.nodes).toMatchObject([
+      { key: keys.writerNodeKey, templateId: "cover_letter_writer", dependsOn: ["analyst-a", "analyst-b"] },
+      { key: keys.reviewerNodeKey, templateId: "cover_letter_reviewer", dependsOn: [keys.writerNodeKey] },
+    ])
+    expect(plan.templates.cover_letter_writer?.context).toMatchObject({ objectiveTailorCandidateMode: true,
+      selectedJobPreparation: { jobId: selection.candidate.jobId }, objectiveTailorCandidateWitness: witness })
+    expect(plan.templates.cover_letter_reviewer?.context).toEqual(plan.templates.cover_letter_writer?.context)
+    expect(objectiveTailorNodeKeys(plan.proposal, plan.templates)).toEqual(new Set([keys.writerNodeKey, keys.reviewerNodeKey]))
+    expect(keys.writerNodeKey.length).toBeLessThanOrEqual(128)
+    expect(isRegisteredObjectiveTaskGraphChildTemplate("cover_letter_writer", plan.templates.cover_letter_writer!)).toBe(false)
+    expect(objectiveTailorPlan({ ...witness, writerNodeKey: "arbitrary-writer" })).toBeUndefined()
+    expect(objectiveTailorNodeKeys({ ...plan.proposal, nodes: [...plan.proposal.nodes].reverse() }, plan.templates)).toBeUndefined()
+  })
+
   it("recognizes only exact registered Scout and canonical Analyst variants", () => {
     expect(isRegisteredObjectiveTaskGraphChildTemplate("scout", scout)).toBe(true)
     expect(isRegisteredObjectiveTaskGraphChildTemplate("scout", nestedScout)).toBe(true)

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { appendTaskGraphProposal, TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphProposal, type TaskGraphState } from "../planning/task-graph.js"
+import { appendObjectiveTailorTaskGraphProposal, appendTaskGraphProposal, TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphProposal, type TaskGraphState } from "../planning/task-graph.js"
 import { taskGraphCreateCapacityAllowed, type OperationalFailureCapacityReuse } from "./task-graph-pg-create-capacity.js"
 import { hasOverlappingTaskGraphRepair } from "./task-graph-repair-conflicts.js"
 import { APPLICATION_FILLER_TEMPLATE_ID, isApplicationFillerTemplate, isHarnessSubagentRole } from "./role-policy.js"
@@ -10,7 +10,7 @@ import { json, type Queryable } from "./pg-store-persistence.js"
 import { inheritSubagentPolicy, type SubagentTaskRecord } from "./types.js"
 import { policyFromTask } from "./manager-task-scope.js"
 import type { TaskGraphScheduleInput, TaskGraphTaskTemplate } from "./task-graph-command-port.js"
-import type { GraphParent, LoadedGraph } from "./task-graph-pg-state.js"
+import type { GraphParent, GraphScope, LoadedGraph } from "./task-graph-pg-state.js"
 import { canonicalTaskGraphJson, taskGraphSnapshot, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { materializeTaskGraphDependencyContext, type ScopedDependencyResult } from "./task-graph-dependency-context.js"
 import { validateTaskGraphRepairTargets } from "./task-graph-pg-create-repair-validation.js"
@@ -19,8 +19,10 @@ import { evaluateTaskGraphPlanObjectiveCoverage } from "./task-graph-plan-object
 import { isScheduledDraftTemplate, scheduledDraftPair, scheduledDraftTaskContext, selectVerifiedScheduledDraftCandidate, type ScheduledDraftCandidateBinding } from "./scheduled-draft-candidate.js"
 import { sourceIntentForTaskGraphNode } from "./task-graph-source-intent-context.js"
 import { scheduledScoutPlanCapacityAllowed } from "./scheduled-taskgraph-plan-capacity.js"
-import { isRegisteredObjectiveTaskGraphChildTemplate } from "./objective-task-graph-child-authority.js"
+import { admitOwnedObjectiveTaskGraphChild, isRegisteredObjectiveTaskGraphChildTemplate, objectiveTailorNodeKeys } from "./objective-task-graph-child-authority.js"
 import type { PreparedSteeringReconciliation } from "./steering-reconciliation-contract.js"
+import { assertWriterReviewPlan } from "./selected-job-batch-plan.js"
+import { assertSelectedJobBatchPlanAdmission } from "./selected-job-batch-correction-admission.js"
 
 const EXTERNAL_ACTION = /(?:^|[._-])(submit|send|publish|delete|mutate|execute)(?:$|[._-])/i
 const REGISTERED_NESTED_SCOUT = templatesForInteractiveScoutDelegation(TASK_GRAPH_TEMPLATES, TASK_GRAPH_TEMPLATES)?.scout
@@ -44,24 +46,12 @@ function safeProposalSize(proposal: TaskGraphProposal): void {
   if (Buffer.byteLength(JSON.stringify(proposal), "utf8") > TASK_GRAPH_LIMITS.maxProposalBytes) throw new Error("task_graph_proposal_too_large")
 }
 
-function assertWriterReviewPlan(nodes: readonly TaskGraphNodeProposal[]): void {
-  const byKey = new Map(nodes.map(node => [node.key, node] as const))
-  const usedReviewers = new Set<string>()
-  for (const writer of nodes) {
-    if (writer.templateId !== "cover_letter_writer") continue
-    const reviewers = writer.dependsOn.filter(key => byKey.get(key)?.templateId === "cover_letter_reviewer")
-    if (reviewers.length > 1 || reviewers.some(key => usedReviewers.has(key))) {
-      throw Object.assign(new Error("Selected-job Writer and Reviewer dependencies conflict"), { code: "task_graph_writer_review_conflict" })
-    }
-    reviewers.forEach(key => usedReviewers.add(key))
-  }
-}
-
 export async function createGraphTasks(
   client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent, current: TaskGraphState,
   priorTaskIds: ReadonlyMap<string, string>, provenance?: Pick<LoadedGraph, "sourceInputCheckpointByNodeKey" | "currentInputCheckpoint">,
   operationalFailureReuse?: OperationalFailureCapacityReuse, objectiveTaskGraphChildAuthority = false,
-  preparedReconciliation?: PreparedSteeringReconciliation,
+  preparedReconciliation?: PreparedSteeringReconciliation, objectiveTailorCommand = false,
+  objectiveTailorWave?: Readonly<{ marker: unknown; templatesByNodeKey: ReadonlyMap<string, TaskGraphTaskTemplate> }>,
 ): Promise<CreatedGraphTasks> {
   if (input.verificationRequirements?.status === "invalid") {
     throw Object.assign(new Error("Canonical objective verification requirements are invalid"), {
@@ -71,6 +61,11 @@ export async function createGraphTasks(
   const parentTask = { budgetSnapshot: parent.budgetSnapshot } as Pick<SubagentTaskRecord, "budgetSnapshot">
   const policy = policyFromTask(parentTask)
   safeProposalSize(input.proposal)
+  const tailorNodeKeys = objectiveTailorCommand ? objectiveTailorNodeKeys(input.proposal, input.templates) : undefined
+  if (objectiveTailorCommand && (!tailorNodeKeys || objectiveTailorWave)) throw new Error("objective_tailor_pair_invalid")
+  const coverageInput = tailorNodeKeys || objectiveTailorWave
+    ? { ...input, templates: { scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst, ...input.templates } }
+    : input
   if (input.proposal.nodes.length > policy.maxFanOut) throw new Error("task_graph_proposal_fan_out_limit")
   for (const [id, template] of Object.entries(input.templates)) safeTemplate(id, template)
   const applicationFillerCount = current.nodes.filter(node => node.templateId === APPLICATION_FILLER_TEMPLATE_ID).length + input.proposal.nodes.filter(node => node.templateId === APPLICATION_FILLER_TEMPLATE_ID).length
@@ -81,8 +76,12 @@ export async function createGraphTasks(
     maxNodes: TASK_GRAPH_LIMITS.maxNodes,
     maxDepth: Math.min(TASK_GRAPH_LIMITS.maxDepth, policy.maxDepth),
   }
-  const appended = appendTaskGraphProposal(current, input.proposal, options)
+  const appended = objectiveTailorWave ? appendObjectiveTailorTaskGraphProposal(current, input.proposal, options, objectiveTailorWave.marker) : appendTaskGraphProposal(current, input.proposal, options)
   if (!appended.ok) throw Object.assign(new Error(appended.error.message), { code: appended.error.code })
+  await assertSelectedJobBatchPlanAdmission({ client, scope: input.scope, current, proposedState: appended.state,
+    proposedNodes: input.proposal.nodes, templates: input.templates, priorTaskIds,
+    hasReplacementMode: !!(input.replaceUnstarted || input.replaceBranch || input.replaceOperationalFailure),
+    hasRootSuccessCriteria: input.rootSuccessCriteria !== undefined })
   if (!await scheduledScoutPlanCapacityAllowed(client, input.scope, appended.state.nodes)) {
     throw Object.assign(new Error("TaskGraph node limit exceeded"), { code: "node_limit" })
   }
@@ -93,7 +92,7 @@ export async function createGraphTasks(
     throw Object.assign(new Error("Scheduled draft Turns cannot create an application filler"), { code: "task_graph_scheduled_application_filler_rejected" })
   }
   if (hasOverlappingTaskGraphRepair(current.nodes, appended.addedNodes)) throw Object.assign(new Error("Overlapping TaskGraph repair"), { code: "task_graph_repair_conflict" })
-  if (!taskGraphCreateCapacityAllowed({ nodeCount: current.nodes.length, proposalCount: input.proposal.nodes.length,
+  if (!objectiveTailorWave && !taskGraphCreateCapacityAllowed({ nodeCount: current.nodes.length, proposalCount: input.proposal.nodes.length,
     hasTypedVerification: appended.state.nodes.some(node => (node.verification?.criteria.length ?? 0) > 0),
     repairRecorded: appended.state.nodes.some(node => node.repairOf !== undefined), operationalFailureReuse })) {
     throw Object.assign(new Error("TaskGraph node limit exceeded"), { code: "node_limit" })
@@ -127,7 +126,7 @@ export async function createGraphTasks(
     preflightStatuses.set(node.key, status); logicalStatuses.set(node.key, status)
   })
   await validateTaskGraphRepairTargets(client, input, current, priorTaskIds)
-  const coverage = await evaluateTaskGraphPlanObjectiveCoverage({ client, input, nodes: appended.state.nodes, provenance, prepared: preparedReconciliation })
+  const coverage = await evaluateTaskGraphPlanObjectiveCoverage({ client, input: coverageInput, nodes: appended.state.nodes, provenance, prepared: preparedReconciliation })
   if (coverage.status === "invalid") throw Object.assign(new Error("Canonical objective verification requirements are invalid"), {
     code: "task_graph_objective_requirements_invalid",
   })
@@ -139,7 +138,8 @@ export async function createGraphTasks(
   const sourceNodes = new Map(current.nodes.map(node => [node.key, node] as const))
   const completedDependencies = new Map(dependencyResults.map(item => {
     const sourceNode = sourceNodes.get(item.key)
-    const sourceIntent = provenance && sourceNode ? sourceIntentForTaskGraphNode(sourceNode,
+    const correctionReviewer = objectiveTailorWave && sourceNode?.templateId === "cover_letter_reviewer"
+    const sourceIntent = provenance && sourceNode && !correctionReviewer ? sourceIntentForTaskGraphNode(sourceNode,
       provenance?.sourceInputCheckpointByNodeKey?.get(item.key), provenance?.currentInputCheckpoint) : undefined
     return [item.key, sourceIntent ? { ...item, sourceIntent } : item] as const
   }))
@@ -168,7 +168,7 @@ export async function createGraphTasks(
   for (const key of satisfiedDependencies) logicalStatuses.set(key, "completed")
   for (const node of input.proposal.nodes) {
     if (node.dependsOn.some(key => hasFailedAncestor(key, dependencies, logicalStatuses, new Set()))) throw new Error("task_graph_dependency_blocked")
-    const template = input.templates[node.templateId]!
+    const template = objectiveTailorWave ? objectiveTailorWave.templatesByNodeKey.get(node.key)! : input.templates[node.templateId]!
     const dependenciesDone = node.dependsOn.every(key => satisfiedDependencies.has(key))
     const status = dependenciesDone ? "queued" : "waiting"
     const childPolicy = inheritSubagentPolicy(policy, template.maxAttempts === undefined ? {} : { maxAttempts: template.maxAttempts })
@@ -183,16 +183,17 @@ export async function createGraphTasks(
       : candidateContext
     const nestedScoutAuthority = node.templateId === "scout" && REGISTERED_NESTED_SCOUT
       && canonicalTaskGraphJson(template) === canonicalTaskGraphJson(REGISTERED_NESTED_SCOUT) ? "parent_template" as const : undefined
-    const child = await createSubagentTask(client, {
-      userId: input.scope.userId, sessionId: input.scope.sessionId, turnId: input.scope.turnId,
+    const spec = { userId: input.scope.userId, sessionId: input.scope.sessionId, turnId: input.scope.turnId,
       parentTaskId: input.scope.parentTaskId, role: template.role, taskType: template.taskType,
       goal: node.goal, constraints: template.constraints ?? [], successCriteria: node.successCriteria,
-      allowedActions: template.allowedActions, context,
-      expectedOutputSchema: template.expectedOutputSchema ?? {}, policy: childPolicy,
-    }, true, {
+      allowedActions: template.allowedActions, context, expectedOutputSchema: template.expectedOutputSchema ?? {} }
+    if (objectiveTailorWave && !await admitOwnedObjectiveTaskGraphChild(client, spec, { ...input.scope, objectiveTailorWaveNodeKey: node.key })) {
+      throw new Error("objective_tailor_wave_child_authority_rejected")
+    }
+    const child = await createSubagentTask(client, { ...spec, policy: childPolicy }, true, {
       preserveEmptyAllowedActions: isApplicationFillerTemplate(node.templateId, template.role, template.taskType),
       taskGraphChildDeadline: true,
-      ...(objectiveTaskGraphChildAuthority && isRegisteredObjectiveTaskGraphChildTemplate(node.templateId, template) ? { objectiveTaskGraphChildAuthority: input.scope } : {}),
+      ...(objectiveTaskGraphChildAuthority && (isRegisteredObjectiveTaskGraphChildTemplate(node.templateId, template) || tailorNodeKeys?.has(node.key) || objectiveTailorWave?.templatesByNodeKey.has(node.key)) ? { objectiveTaskGraphChildAuthority: objectiveTailorWave ? { ...input.scope, objectiveTailorWaveNodeKey: node.key } as GraphScope : input.scope } : {}),
       ...(nestedScoutAuthority ? { nestedScoutAuthority } : {}),
     })
     if (status === "waiting") {
@@ -215,7 +216,6 @@ export async function createGraphTasks(
   }
   return { state, snapshot: taskGraphSnapshot(state, taskIds), taskIds, created, readyTaskIds }
 }
-
 function isPreflightDependency(
   key: string,
   statuses: ReadonlyMap<string, string>,

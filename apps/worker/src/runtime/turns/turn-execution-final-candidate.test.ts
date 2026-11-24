@@ -6,7 +6,9 @@ import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK, tagTaskGraph
 import { completeTurnCandidate as runCompleteTurnCandidate, persistedFinalCandidate, stopForRepeatedTaskGraphDenial } from "./turn-execution-final-candidate.js"
 import type { StepContext } from "../context/step-context-builder.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
-import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
+import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
+import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA } from "../subagents/objective-tailor-final-summary-binding.js"
+import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA } from "@jobcopilot/agent-protocol"
 import type { GraphTaskRow, LoadedGraph } from "../subagents/task-graph-pg-state.js"
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
 import { taskGraphItemId, type TaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
@@ -17,6 +19,21 @@ import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
 type CandidateTestInput = Omit<Parameters<typeof runCompleteTurnCandidate>[0], "finalResponseText"> & { finalResponseText?: string }
 function completeWithTestDefaults(input: CandidateTestInput) {
   return runCompleteTurnCandidate({ ...input, finalResponseText: input.finalResponseText ?? input.output.text })
+}
+
+function objectiveWaveBinding(): TaskGraphFinalSummaryBinding {
+  const rootTaskId = "root-wave", graphRevision = 12
+  const taskRows: GraphTaskRow[] = ["source-a", "source-b"].map((id, index) => ({ id, role: "scout", taskType: "research",
+    status: "completed", failureReason: null, result: { status: "completed", structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA,
+      role: "scout", status: "completed", candidates: [], evidence: [], summary: `Source ${index + 1}.` } } }))
+  const loaded = { rootTaskId, item: { id: taskGraphItemId(rootTaskId), revision: graphRevision, content: {}, createdAt: new Date(0) },
+    snapshot: { nodes: taskRows.map((row, nodeIndex) => ({ taskId: row.id, key: `source-${nodeIndex + 1}`, templateId: "scout" })) },
+    state: { revision: graphRevision }, tasks: new Map(taskRows.map(row => [row.id, row])) } as unknown as LoadedGraph
+  const base = buildTaskGraphFinalSummaryBinding(loaded)
+  if (!base) throw new Error("Expected a current wave TaskGraph binding")
+  return { ...base, objectiveTailorFinalOutcome: { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA, graphRevision,
+    rootAttemptCount: 1, graphDigest: "a".repeat(64), sourceNodeCount: 2, sourceGraphDigest: "b".repeat(64), sourceStatusDigest: "c".repeat(64),
+    slots: [{ ordinal: 1, status: "ready", evidenceDigest: "d".repeat(64) }, { ordinal: 2, status: "needs_revision", evidenceDigest: "e".repeat(64) }] } }
 }
 
 describe("persistedFinalCandidate", () => {
@@ -33,6 +50,34 @@ describe("persistedFinalCandidate", () => {
 })
 
 describe("atomic TaskGraph finalization recovery", () => {
+  it("attaches only the server-bound Objective Tailor status sidecar to final item content", async () => {
+    const binding = objectiveWaveBinding(), saved: unknown[] = []
+    const recordFinalResponse = vi.fn(async (input: unknown) => {
+      saved.push(input)
+      return { status: "completed" as const, finalItemId: "final-wave", events: [] }
+    })
+    const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [{ id: "job-1", kind: "job" as const, ownerId: "user-1" }], toolObservations: [] }
+    const options = { identity: { kind: "turn" as const, taskId: "root-wave", rootTaskId: "root-wave", userId: "user-1", sessionId: "session-1",
+      turnId: "turn-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() }, goal: "Find roles", snapshot,
+      store: { updateStep: vi.fn(async () => undefined), recordFinalResponse },
+      completionGate: vi.fn(async () => ({ ok: true as const, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding })),
+      idFactory: (value: string) => value } as unknown as TurnExecutionOptions
+    const candidate = "Two source-backed roles were reviewed."
+    const outcome = await completeWithTestDefaults({ options, writer: { append: vi.fn(async () => ({ id: "event-1" })) } as unknown as TurnExecutionEventWriter,
+      step: { id: "step-1", ordinal: 0 }, output: { text: candidate, reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model",
+        finishReason: "stop", usage: null, continuation: null } satisfies ModelStepResult, snapshot,
+      stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      signal: new AbortController().signal, now: () => new Date(), onStepClosed: vi.fn() })
+
+    expect(outcome.kind).toBe("completed")
+    const recorded = saved[0] as { response: string; terminal: { finalContent: Record<string, unknown> } }
+    expect(recorded.terminal.finalContent.objectiveTailorFinalOutcomes).toEqual({ schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA,
+      slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }] })
+    expect(recorded.terminal.finalContent.final).not.toHaveProperty("objectiveTailorFinalOutcomes")
+    expect(JSON.parse(recorded.response)).not.toHaveProperty("objectiveTailorFinalOutcomes")
+    expect(JSON.stringify(recorded.terminal.finalContent.objectiveTailorFinalOutcomes)).not.toMatch(/root-wave|source-a|source-b|graphDigest|evidenceDigest/)
+  })
+
   it("rejects a completed receipt from the repeated-denial terminal store", async () => {
     const recordFinalResponse = vi.fn(async () => ({ status: "completed" as const, finalItemId: "final-item", events: [] }))
     const options = {

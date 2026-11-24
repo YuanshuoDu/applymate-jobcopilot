@@ -20,6 +20,7 @@ const reconciliationMocks = vi.hoisted(() => ({
   scheduledPrepare: vi.fn(), scheduledAuditAppend: vi.fn(), scheduledAuditCompletion: vi.fn(), scheduledAuditInvocation: vi.fn(),
   scheduledAuditResumeContext: vi.fn(), scheduledGateVerification: vi.fn(),
   operationalFailureReplacement: vi.fn(),
+  tailorCorrection: vi.fn(),
 }))
 vi.mock("./steering-reconciliation-ledger.js", () => ({
   prepareSteeringReconciliation: reconciliationMocks.prepare,
@@ -30,6 +31,7 @@ vi.mock("./task-graph-pg-create.js", () => ({ createGraphTasks: reconciliationMo
 vi.mock("./task-graph-pg-operational-failure-replacement.js", () => ({
   scheduleTaskGraphOperationalFailureReplacement: reconciliationMocks.operationalFailureReplacement,
 }))
+vi.mock("./pg-task-graph-objective-tailor-correction.js", () => ({ appendObjectiveTailorCorrection: reconciliationMocks.tailorCorrection }))
 vi.mock("./pg-scheduled-task-graph-prepare-command.js", () => ({ appendScheduledPrepare: reconciliationMocks.scheduledPrepare }))
 vi.mock("./pg-scheduled-task-graph-audit-command.js", () => ({ appendScheduledAudit: reconciliationMocks.scheduledAuditAppend,
   verifyScheduledAuditCompletion: reconciliationMocks.scheduledAuditCompletion,
@@ -307,6 +309,15 @@ function invalidSelectorProposal(kind: "unknown" | "indirect" | "wrong-template"
 
 describe("createPgTaskGraphCommandPort", () => {
   beforeEach(() => { vi.clearAllMocks() })
+  it("routes Objective correction through the dedicated atomic service without changing the public scope", async () => {
+    const fake = fakePool(scheduleInput()), input = { scope: scheduleInput().scope, expectedRevision: 6, correctionSlotId: "tailor-3" }
+    const receipt = { status: "accepted" as const, revision: 7, nodes: [], readyTaskIds: [] }
+    reconciliationMocks.tailorCorrection.mockResolvedValue(receipt)
+    const port = createPgTaskGraphCommandPort(fake.pool)
+    await expect(port.appendObjectiveTailorCorrection!(input)).resolves.toBe(receipt)
+    expect(reconciliationMocks.tailorCorrection).toHaveBeenCalledWith(fake.pool, input)
+  })
+
   it("routes the fixed Audit append and proof reads through owner-scoped transactions", async () => {
     const fake = fakePool(scheduleInput()), input = {} as never
     reconciliationMocks.scheduledAuditAppend.mockResolvedValue({ status: "accepted", revision: 13, nodes: [],

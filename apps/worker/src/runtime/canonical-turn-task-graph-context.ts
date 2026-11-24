@@ -16,6 +16,9 @@ import { parseTaskGraphCurrentDiscoveryAttemptHealth, parseTaskGraphCurrentDisco
   type TaskGraphDiscoveryTurnEligibility } from "./subagents/task-graph-discovery-attempt-health.js"
 import { withTaskGraphRootSourceIntent } from "./subagents/task-graph-source-intent-context.js"
 import { taskGraphReviewConflictObservation } from "./context/task-graph-review-conflicts.js"
+import { OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA, type ObjectiveTailorCandidateCatalog } from "./subagents/objective-tailor-candidate.js"
+import { OBJECTIVE_TAILOR_GRAPH_MAX_NODES } from "@jobcopilot/agent-protocol"
+import { projectObjectiveTailorWaveSourceIntent, projectObjectiveTailorWaveView } from "./canonical-turn-objective-tailor-wave-view.js"
 const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user", "agent.reconcile"])
 
 export function isSelectedJobRootTool(definition: unknown): boolean {
@@ -37,6 +40,7 @@ export function selectedJobSnapshot(snapshot: StepContextSnapshot): StepContextS
 }
 
 const OBSERVATION_ID = "task-graph-current"
+export const OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID = "objective-tailor-candidate-catalog"
 const MAX_NODES = 16
 const MAX_TEXT = 160_000
 const MAX_RESULT_PROJECTION_TOTAL_BYTES = 16 * 1024
@@ -106,16 +110,20 @@ function node(value: unknown, turn: TaskGraphDiscoveryTurnEligibility): TaskGrap
 
 /** Replace an old read with the server-fenced current graph, as untrusted model evidence. */
 export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, value: TaskGraphCurrentState & { sourceIntent?: unknown }): StepContextSnapshot {
-  const state = record(value)
-  if (!state || !Number.isSafeInteger(state.revision) || Number(state.revision) < 0 || !Array.isArray(state.nodes) || state.nodes.length > MAX_NODES) throw new Error("task_graph_current_state_invalid")
+  const state = record(value), wave = projectObjectiveTailorWaveView(value)
+  if (!state || wave.status === "invalid" || !Number.isSafeInteger(state.revision) || Number(state.revision) < 0
+    || !Array.isArray(state.nodes) || state.nodes.length > (wave.status === "valid" ? OBJECTIVE_TAILOR_GRAPH_MAX_NODES : MAX_NODES)) throw new Error("task_graph_current_state_invalid")
+  const visibleCount = wave.status === "valid" ? wave.sourceNodeCount : state.nodes.length
   const rootSuccessCriteria = readRootPlanCriteriaObservation(state)
   let verificationBytes = 0
   let queryFootprintBytes = 0
   const turn: TaskGraphDiscoveryTurnEligibility = ownEnumerableDataValue(state, "discoveryTurnEligibility") === "ordinary" ? "ordinary" : "unknown"
-  const nodes = state.nodes.map(value => {
+  const nodes = state.nodes.map((value, index) => {
     const item = node(value, turn)
-    verificationBytes += taskGraphCurrentVerificationMetadataBytes(item) + Math.max(0, taskGraphStructuredFailureCategoryBytes(item.structuredOutputFailureCategory) - 1) + (item.discoveryAttemptHealth ? Buffer.byteLength(JSON.stringify(item.discoveryAttemptHealth), "utf8") : 0)
-    if (item.discoveryQueryFootprint) queryFootprintBytes += Buffer.byteLength(JSON.stringify(item.discoveryQueryFootprint), "utf8")
+    if (index < visibleCount) {
+      verificationBytes += taskGraphCurrentVerificationMetadataBytes(item) + Math.max(0, taskGraphStructuredFailureCategoryBytes(item.structuredOutputFailureCategory) - 1) + (item.discoveryAttemptHealth ? Buffer.byteLength(JSON.stringify(item.discoveryAttemptHealth), "utf8") : 0)
+      if (item.discoveryQueryFootprint) queryFootprintBytes += Buffer.byteLength(JSON.stringify(item.discoveryQueryFootprint), "utf8")
+    }
     if (verificationBytes > MAX_VERIFICATION_CONTEXT_BYTES) throw new Error("task_graph_current_verification_too_large")
     return item
   })
@@ -124,10 +132,11 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   const prioritizedIndexes: number[] = []
   const ordinaryIndexes: number[] = []
   nodes.forEach((item, index) => {
+    if (index >= visibleCount) return
     if (item.verificationReport?.status === "failed" || item.verificationReport?.status === "unverified") prioritizedIndexes.push(index)
     else ordinaryIndexes.push(index)
   })
-  const projectedNodes = [...nodes]
+  const projectedNodes = nodes.map((item, index) => index < visibleCount ? item : { ...item, resultProjection: UNAVAILABLE_PROJECTION })
   for (const index of [...prioritizedIndexes, ...ordinaryIndexes]) {
     const item = nodes[index]!
     const bytes = taskGraphResultProjectionBytes(item.resultProjection!)
@@ -142,20 +151,76 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   const allocatedNodes = projectedNodes
   const keys = new Set(allocatedNodes.map(item => item.key))
   if (keys.size !== allocatedNodes.length || !validateTaskGraphCurrentVerificationGraph(allocatedNodes)) throw new Error("task_graph_current_state_invalid:dependencies")
-  const contextNodes = verificationBytes + queryFootprintBytes <= MAX_VERIFICATION_CONTEXT_BYTES ? allocatedNodes
-    : allocatedNodes.map(({ discoveryQueryFootprint: _omitted, ...item }) => item)
+  const sourceNodes = allocatedNodes.slice(0, visibleCount)
+  const contextNodes = verificationBytes + queryFootprintBytes <= MAX_VERIFICATION_CONTEXT_BYTES ? sourceNodes
+    : sourceNodes.map(({ discoveryQueryFootprint: _omitted, ...item }) => item)
   let planningFacts: unknown
   try { planningFacts = Object.getOwnPropertyDescriptor(state, "planningFacts")?.value } catch { planningFacts = undefined }
-  const baseContent = withTaskGraphCurrentPlanningObservation({
+  let baseContent: Record<string, unknown> = withTaskGraphCurrentPlanningObservation({
     kind: "task_graph_current", revision: Number(state.revision),
     ...(rootSuccessCriteria?.length ? { rootSuccessCriteria } : {}), ...taskGraphReviewConflictObservation(contextNodes), nodes: contextNodes,
-  }, planningFacts, Number(state.revision), allocatedNodes, MAX_TEXT)
+  }, planningFacts, Number(state.revision), sourceNodes, MAX_TEXT)
+  if (wave.status === "valid") {
+    const { nodeCapacity: _closedCapacity, ...withoutCapacity } = baseContent
+    baseContent = { ...withoutCapacity, objectiveTailorWave: wave.view }
+  }
   let sourceIntent: unknown
   try { sourceIntent = Object.getOwnPropertyDescriptor(state, "sourceIntent")?.value } catch { sourceIntent = undefined }
-  const content = withTaskGraphRootSourceIntent(baseContent, sourceIntent, MAX_TEXT)
+  const boundedIntent = wave.status === "valid" ? projectObjectiveTailorWaveSourceIntent(sourceIntent, new Set(sourceNodes.map(item => item.key))) : sourceIntent
+  const content = withTaskGraphRootSourceIntent(baseContent, boundedIntent, MAX_TEXT)
   if (JSON.stringify(content).length > MAX_TEXT) throw new Error("task_graph_current_state_too_large")
   return retireStaleTaskGraphRepair({ ...snapshot, taskGraphRevision: value.revision,
     toolObservations: [...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID), { id: OBSERVATION_ID, content }] }, value.revision)
+}
+
+/** Replaces any prior catalog observation with only a bounded public projection for the exact current graph revision. */
+export function appendObjectiveTailorCandidateCatalog(
+  snapshot: StepContextSnapshot, value: unknown, expectedRevision: number | undefined,
+): StepContextSnapshot {
+  const catalog = parseObjectiveTailorCandidateCatalog(value, expectedRevision)
+  return { ...snapshot, toolObservations: [
+    ...snapshot.toolObservations.filter(observation => observation.id !== OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID),
+    ...(catalog ? [{ id: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID,
+      content: { kind: "objective_tailor_candidate_catalog", catalog } }] : []),
+  ] }
+}
+
+function parseObjectiveTailorCandidateCatalog(value: unknown, expectedRevision: number | undefined): ObjectiveTailorCandidateCatalog | undefined {
+  try {
+    const row = exactDataObject(value, "candidates,graphRevision,schemaVersion")
+    if (!row || row.schemaVersion !== OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA || !Number.isSafeInteger(row.graphRevision)
+      || row.graphRevision !== expectedRevision || !Number.isSafeInteger(expectedRevision) || Number(expectedRevision) < 1
+      || !Array.isArray(row.candidates) || Object.getPrototypeOf(row.candidates) !== Array.prototype
+      || row.candidates.length > 8 || Reflect.ownKeys(row.candidates).length !== row.candidates.length + 1) return undefined
+    const candidates: ObjectiveTailorCandidateCatalog["candidates"][number][] = [], refs = new Set<string>()
+    for (let index = 0; index < row.candidates.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(row.candidates, String(index))
+      const candidate = descriptor?.enumerable && Object.hasOwn(descriptor, "value")
+        ? exactDataObject(descriptor.value, "candidateRef,company,score,title") : undefined
+      if (!candidate || typeof candidate.candidateRef !== "string" || !/^otc1_[a-f0-9]{64}$/.test(candidate.candidateRef)
+        || refs.has(candidate.candidateRef) || typeof candidate.title !== "string" || !candidate.title.trim()
+        || candidate.title.trim() !== candidate.title || candidate.title.length > 160 || typeof candidate.company !== "string"
+        || !candidate.company.trim() || candidate.company.trim() !== candidate.company || candidate.company.length > 160
+        || typeof candidate.score !== "number" || !Number.isFinite(candidate.score) || candidate.score < 0 || candidate.score > 10) return undefined
+      refs.add(candidate.candidateRef)
+      candidates.push({ candidateRef: candidate.candidateRef, title: candidate.title, company: candidate.company, score: candidate.score })
+    }
+    return { schemaVersion: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA, graphRevision: Number(row.graphRevision), candidates }
+  } catch { return undefined }
+}
+
+function exactDataObject(value: unknown, keys: string): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  try {
+    const actual = Reflect.ownKeys(value), expected = keys.split(",")
+    if ((Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
+      || actual.length !== expected.length || actual.some(key => typeof key !== "string" || !expected.includes(key))) return undefined
+    for (const key of expected) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return undefined
+    }
+    return value as Record<string, unknown>
+  } catch { return undefined }
 }
 
 export async function loadTaskGraphCurrentObservation(

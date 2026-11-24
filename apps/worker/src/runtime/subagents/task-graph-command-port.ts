@@ -21,6 +21,7 @@ import type { DiscoveryAttemptHealth } from "./child-discovery-attempt.js"
 import type { DiscoveryQueryFootprint } from "./child-discovery-query-footprint.js"
 import type { TaskGraphHistoricalDiscoveryPage, TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
 import type { TaskGraphSourceCheckpoint, TaskGraphSourceIntentNode } from "./task-graph-pg-source-provenance.js"
+import type { ObjectiveTailorCandidateCatalog } from "./objective-tailor-candidate.js"
 import type { TaskGraphScheduledAuditInput, TaskGraphScheduledAuditCompletionInput, TaskGraphScheduledAuditInvocationInput, TaskGraphScheduledAuditResumeInput, ScheduledAuditAppendReceipt, ScheduledAuditCompletionProof, ScheduledAuditInvocationProof, ScheduledAuditResumeContext } from "./scheduled-audit-contract.js"
 import type { ScheduledPostGatePlanningContext, TaskGraphScheduledPostGatePlanInput, TaskGraphScheduledPostGatePlanReadInput, ScheduledPostGateCompletionProof, ScheduledPostGateScheduleReceipt } from "./scheduled-post-gate-contract.js"
 export type { TaskGraphExecutionScope, TaskGraphScheduleInput, TaskGraphScheduleNode, TaskGraphScheduleReceipt, TaskGraphScheduledPrepareReceipt, TaskGraphTaskTemplate } from "./task-graph-schedule-input.js"
@@ -34,10 +35,8 @@ import type {
   TaskGraphScheduledGateResumeReceipt,
   TaskGraphScheduledPrepareInput,
 } from "./scheduled-gate-contract.js"
-export type {
-  ScheduledAnalyzeCheckpointHandoff, ScheduledTaskGraphExecutionOwner, TaskGraphScheduledGateCompletionInput,
-  TaskGraphScheduledGateInput, TaskGraphScheduledGateResumeInput, TaskGraphScheduledGateResumeReceipt, TaskGraphScheduledPrepareInput,
-} from "./scheduled-gate-contract.js"
+export type { ScheduledAnalyzeCheckpointHandoff, ScheduledTaskGraphExecutionOwner, TaskGraphScheduledGateCompletionInput,
+  TaskGraphScheduledGateInput, TaskGraphScheduledGateResumeInput, TaskGraphScheduledGateResumeReceipt, TaskGraphScheduledPrepareInput } from "./scheduled-gate-contract.js"
 export type { ScheduledPostGateCompletionProof, ScheduledPostGatePlanningContext, ScheduledPostGateScheduleReceipt,
   TaskGraphScheduledPostGatePlanInput, TaskGraphScheduledPostGatePlanReadInput } from "./scheduled-post-gate-contract.js"
 export type {
@@ -85,7 +84,6 @@ export function parseTaskGraphVerificationReport(value: unknown, criterionIds: r
   const stored = parseStoredTaskGraphVerificationReport(value, criterionIds)
   return stored ? publicTaskGraphVerificationReport(stored) : undefined
 }
-
 export function parseTaskGraphRepairOf(value: unknown): TaskGraphRepairOf | undefined {
   if (!exactRecord(value, "criterionIds,graphRootTaskId,nodeKey,taskId") || !boundedString(value.graphRootTaskId, 128)
     || !boundedString(value.nodeKey, 128) || !boundedString(value.taskId, 128)) return undefined
@@ -193,8 +191,8 @@ export type TaskGraphCurrentState = Readonly<{
   nodes: readonly TaskGraphCurrentNode[]
   rootSuccessCriteria?: readonly string[]
   planningFacts?: import("./task-graph-planning-facts.js").TaskGraphPlanningFacts
-  /** Internal owner-read provenance; stripped before model-facing observation construction. */
-  discoveryTurnEligibility?: "ordinary"
+  objectiveTailor?: import("@jobcopilot/agent-protocol").ObjectiveTailorGraph
+  /** Internal owner-read provenance; stripped before model-facing observation construction. */ discoveryTurnEligibility?: "ordinary"
 }>
 /** Private planning read; checkpoint data stays outside the model-facing state. */
 export type TaskGraphPlanningCurrentState = Readonly<{
@@ -210,6 +208,11 @@ export class TaskGraphCommandError extends Error {
 export type TaskGraphKeepReconciliationReceipt = Readonly<{ decision: "keep"; revision: number; reconciledInputCount: number }>
 export type TaskGraphCommandPort = Readonly<{
   appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt>
+  readObjectiveTailorCatalog?(scope: TaskGraphReadScope): Promise<ObjectiveTailorCandidateCatalog | undefined>
+  appendObjectiveTailor?(input: Readonly<{ scope: TaskGraphExecutionScope; expectedRevision: number; candidateRef: string }>): Promise<TaskGraphScheduleReceipt>
+  readObjectiveTailorWaveCatalog?(scope: TaskGraphReadScope): Promise<import("./objective-tailor-candidate-v2.js").ObjectiveTailorWaveCandidateCatalog | undefined>
+  appendObjectiveTailorWave?(input: Readonly<{ scope: TaskGraphExecutionScope; expectedRevision: number; candidateRefs: readonly string[] }>): Promise<TaskGraphScheduleReceipt>
+  appendObjectiveTailorCorrection?(input: Readonly<{ scope: TaskGraphExecutionScope; expectedRevision: number; correctionSlotId: string }>): Promise<TaskGraphScheduleReceipt>
   /** Scheduled-only same-root append; production callers must fail closed if absent. */
   appendScheduledPrepare?(input: TaskGraphScheduledPrepareInput): Promise<TaskGraphScheduledPrepareReceipt>
   /** Server-only fixed Gate registration; never exposed to model planning. */

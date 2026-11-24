@@ -1,5 +1,6 @@
 import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
 import { isCanonicalTaskGraphSourceManifestWeb, projectFinalAnswerWithTaskGraphSources } from '@/lib/agent/session/final-task-graph-source-manifest'
+import { contentWithoutObjectiveTailorFinalOutcomes, parseObjectiveTailorFinalOutcomesFromContent } from '@/lib/agent/session/objective-tailor-final-content'
 import { normalizeTimelineEvent, normalizeTimelineItem } from './timeline-reducer'
 import { getFinalAnswerDiagnostics } from './timeline-reducer-utils'
 
@@ -182,12 +183,15 @@ export async function hydrateFinalItemFromResponse(items: unknown[] | undefined,
   const item = normalizeTimelineItem(items[0]), content = item?.content
   if (!item || !safeId(target.itemId) || !safeId(target.turnId) || item.id !== target.itemId || item.sessionId !== sessionId ||
     item.turnId !== target.turnId || item.type !== 'agent_message' || item.status !== 'completed' || item.phase !== 'final_answer' || !isRecord(content)) return null
-  const projectedContent = projectFinalAnswerWithTaskGraphSources(content)
+  const objectiveTailorFinalOutcomes = parseObjectiveTailorFinalOutcomesFromContent(content)
+  const genericContent = contentWithoutObjectiveTailorFinalOutcomes(content)
+  const projectedContent = genericContent && projectFinalAnswerWithTaskGraphSources(genericContent)
   if (!projectedContent) return null
   onProjection?.()
   const { taskGraphSources, ...answerContent } = projectedContent
   const safeContent = taskGraphSources && await isCanonicalTaskGraphSourceManifestWeb(item.id, taskGraphSources)
-    ? { ...answerContent, taskGraphSources } : answerContent
+    ? { ...answerContent, taskGraphSources, ...(objectiveTailorFinalOutcomes ? { objectiveTailorFinalOutcomes } : {}) }
+    : { ...answerContent, ...(objectiveTailorFinalOutcomes ? { objectiveTailorFinalOutcomes } : {}) }
   return { ...item, content: safeContent }
 }
 

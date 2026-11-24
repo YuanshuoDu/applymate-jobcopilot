@@ -154,7 +154,7 @@ export class ToolLifecycle {
     if (call.toolName === "agent.list" && (pageCall || isTaskGraphResultPageLike(output))) {
       try { prepared = prepareTaskGraphResultPageOutput(output) }
       catch { throw new ToolExecutionError("task_graph_result_page_invalid", "TaskGraph result page is invalid") }
-    } else if (call.toolName === "agent.plan") {
+    } else if (call.toolName === "agent.plan" || call.toolName === "agent.tailor") {
       try {
         prepared = prepareTaskGraphPlanReceipt(output)
       } catch {
@@ -203,7 +203,7 @@ export class ToolLifecycle {
     }
     const inlineLimit = call.toolName === "jobs.discover" ? Math.min(this.maxEventBytes, 6 * 1024) : this.maxEventBytes
     if (prepared.sizeBytes <= inlineLimit) return prepared.safe
-    if (call.toolName === "agent.plan" || call.toolName === "agent.spawn" || call.toolName === "spawn_subagent" || nativeFollowup) {
+    if (call.toolName === "agent.plan" || call.toolName === "agent.tailor" || call.toolName === "agent.spawn" || call.toolName === "spawn_subagent" || nativeFollowup) {
       throw new ToolExecutionError("tool_result_too_large", "Agent receipt exceeds the lifecycle event limit")
     }
     if (!this.options.durableResults || !this.options.resolveOwner) {
@@ -226,7 +226,6 @@ export class ToolLifecycle {
       throw new ToolExecutionError(code, "Durable tool result storage failed")
     }
   }
-
   private async append(event: ToolLifecycleEvent): Promise<void> {
     await this.options.sink.append(event)
   }

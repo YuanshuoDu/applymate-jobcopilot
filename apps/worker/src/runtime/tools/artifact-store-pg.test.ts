@@ -75,6 +75,67 @@ describe("PgArtifactToolStore immutable persistence", () => {
     expect((await store.listForUser(scope.userId, scope.jobId)).find(row => row.lifecycle === "draft")).toMatchObject({ version: 1, hash: first.contentHash })
   })
 
+  it("checks scheduled material on the same client after staging the version and before commit", async () => {
+    const pool = new FakeArtifactPool()
+    let guardClient: Pick<import("pg").PoolClient, "query"> | undefined
+    const store = new PgArtifactToolStore(pool as unknown as Pool, undefined, async (client, userId, jobId) => {
+      guardClient = client
+      const result = await client.query("SELECT fake material guard", [userId, jobId])
+      return result.rows[0]?.current === true
+    })
+    const base = await store.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+
+    const version = await store.writeDraft(scope, {
+      baseArtifactId: base.id, baseHash: base.hash, content: "scheduled draft", constraints: {}, requestHash: hashArtifactContent("scheduled"),
+    })
+
+    const statements = pool.transactions.at(-1)!
+    const staged = statements.findIndex(sql => sql.startsWith('INSERT INTO "agent_artifact_version"'))
+    const jobLock = statements.findIndex(sql => sql.includes('FROM "Job"') && sql.endsWith("FOR SHARE"))
+    const guarded = statements.indexOf("SELECT fake material guard")
+    const leaseChecks = statements.flatMap((sql, index) => sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()') ? [index] : [])
+    expect(version.version).toBe(1)
+    expect(guardClient).toBe(pool.lastConnectedClient)
+    expect(staged).toBeGreaterThanOrEqual(0)
+    expect(jobLock).toBeGreaterThan(staged)
+    expect(guarded).toBeGreaterThan(jobLock)
+    expect(leaseChecks.at(-1)).toBeGreaterThan(guarded)
+    expect(statements.at(-1)).toBe("COMMIT")
+  })
+
+  it("rolls back a staged scheduled draft when current material is unavailable or stale", async () => {
+    const pool = new FakeArtifactPool()
+    const store = new PgArtifactToolStore(pool as unknown as Pool, undefined, async () => false)
+    const base = await store.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+
+    await expect(store.writeDraft(scope, {
+      baseArtifactId: base.id, baseHash: base.hash, content: "stale draft", constraints: {}, requestHash: hashArtifactContent("stale"),
+    })).rejects.toMatchObject({ code: "stale_source" })
+
+    expect(pool.transactions.at(-1)?.at(-1)).toBe("ROLLBACK")
+    expect(pool.transactions.at(-1)?.some(sql => sql.startsWith('INSERT INTO "agent_artifact_version"'))).toBe(true)
+    await expect(store.listForUser(scope.userId, scope.jobId)).resolves.toHaveLength(1)
+    await expect(store.readVersion(scope, { artifactId: `cover-letter:${hashArtifactContent({ userId: scope.userId, jobId: scope.jobId }).slice(7)}`,
+      version: 1, contentHash: hashArtifactContent("stale draft"), sourceDigest: prep.sourceDigest })).resolves.toBeNull()
+  })
+
+  it("rechecks task lease after a successful scheduled material guard", async () => {
+    const pool = new FakeArtifactPool()
+    const store = new PgArtifactToolStore(pool as unknown as Pool, undefined, async () => {
+      pool.fence.leaseExpiresAt = new Date(0)
+      return true
+    })
+    const base = await store.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+
+    await expect(store.writeDraft(scope, {
+      baseArtifactId: base.id, baseHash: base.hash, content: "expired draft", constraints: {}, requestHash: hashArtifactContent("expired"),
+    })).rejects.toMatchObject({ code: "task_fence_denied" })
+
+    expect(pool.transactions.at(-1)?.at(-1)).toBe("ROLLBACK")
+    expect(pool.transactions.at(-1)?.filter(sql => sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()')).length).toBe(2)
+    await expect(store.listForUser(scope.userId, scope.jobId)).resolves.toHaveLength(1)
+  })
+
   it("checks the expected version and hash under the locked current head", async () => {
     const pool = new FakeArtifactPool()
     const store = new PgArtifactToolStore(pool as unknown as Pool)
@@ -138,8 +199,18 @@ describe("PgArtifactToolStore immutable persistence", () => {
     await expect(store.readRevisionReview(scope, { ...revision, reviewHash: hashArtifactContent("wrong review") })).resolves.toBeNull()
     await expect(store.readRevisionReview(scope, { ...revision, currentSourceDigest: hashArtifactContent("changed source") })).resolves.toBeNull()
 
+    const correctionScope = scopeFor("correction-writer", "correction-write-call")
+    const corrected = await store.writeDraft(correctionScope, { baseArtifactId: base.id, baseHash: base.hash,
+      content: "corrected draft", constraints: {}, requestHash: hashArtifactContent("corrected draft"),
+      expectedPreviousVersion: version.version, expectedPreviousHash: version.contentHash })
+    expect(corrected).toMatchObject({ artifactId: version.artifactId, version: version.version + 1, previousHash: version.contentHash })
+    const recoveryStore = new PgArtifactToolStore(pool as unknown as Pool, readCurrentSourceDigest, undefined, true)
+    await expect(recoveryStore.readRevisionReview(correctionScope, revision)).resolves.toMatchObject({ id: review.id, status: "needs_revision" })
+    await expect(store.readRevisionReview(correctionScope, revision)).resolves.toBeNull()
+    await expect(recoveryStore.readRevisionReview(scopeFor("other-correction-writer", "other-write-call"), revision)).resolves.toBeNull()
+
     pool.fence.interruptRequestedAt = new Date()
-    await expect(store.readRevisionReview(scope, revision)).resolves.toBeNull()
+    await expect(recoveryStore.readRevisionReview(correctionScope, revision)).resolves.toBeNull()
   })
 
   it("rejects ambiguous review receipts and a review whose artifact head has advanced", async () => {
@@ -316,6 +387,8 @@ class FakeArtifactPool {
   conflictWinnerReads = 0
   private resolvingVersionConflict = false
   private advisoryLockTail: Promise<void> = Promise.resolve()
+  readonly transactions: string[][] = []
+  lastConnectedClient: object | undefined
   readonly fence = {
     leaseOwner: "worker-a", attemptCount: 1, status: "running", interruptRequestedAt: null as Date | null,
     leaseExpiresAt: new Date("2099-01-01T00:00:00Z"), sessionStatus: "active", turnStatus: "waiting",
@@ -325,7 +398,9 @@ class FakeArtifactPool {
   async connect() {
     let releaseLock: (() => void) | undefined
     let jobLockHeld = false
-    return {
+    let transactionStatements: string[] = []
+    let transactionSnapshot: ReturnType<FakeArtifactPool["snapshot"]> | undefined
+    const client = {
       query: async (sql: string, values?: unknown[]) => {
         if (sql.includes("hashtextextended($1::text, 0)")) return this.query(sql, values)
         if (sql.includes("pg_advisory_xact_lock(hashtext($1), hashtext($2))")) {
@@ -334,20 +409,32 @@ class FakeArtifactPool {
           this.advisoryLockTail = new Promise<void>(resolve => { releaseLock = resolve })
           await predecessor
           jobLockHeld = true
-          return this.empty()
+          transactionSnapshot = this.snapshot()
         }
+        if (sql === "BEGIN") transactionSnapshot = this.snapshot()
+        transactionStatements.push(sql)
         const result = await this.query(sql, values)
-        if (sql === "COMMIT" || sql === "ROLLBACK") { releaseLock?.(); releaseLock = undefined; jobLockHeld = false }
+        if (sql === "COMMIT" || sql === "ROLLBACK") {
+          if (sql === "ROLLBACK" && transactionSnapshot) this.restore(transactionSnapshot)
+          this.transactions.push(transactionStatements)
+          transactionStatements = []
+          transactionSnapshot = undefined
+          releaseLock?.(); releaseLock = undefined; jobLockHeld = false
+        }
         return result
       },
       release: () => { releaseLock?.(); releaseLock = undefined; jobLockHeld = false },
     }
+    this.lastConnectedClient = client
+    return client
   }
   async query(sql: string, values: unknown[] = []): Promise<Result> {
     if (sql.includes("pg_current_xact_id()::text AS transaction_id")) return this.one({ transaction_id: "42" })
     if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql) || sql.includes("set_config") || sql.includes("pg_advisory_xact_lock")) return { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "Job"') && sql.endsWith("FOR SHARE")) return this.one(values?.[0] === "job-a" && values?.[1] === "user-a" ? { id: "job-a" } : undefined)
+    if (sql === "SELECT fake material guard") return this.one({ current: values?.[0] === "user-a" && values?.[1] === "job-a" })
     if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("selectedJobPreparation")) {
-      const valid = (values[0] === "task-a" || values[0] === "review-task") && values[1] === "user-a" && values[2] === "session-a"
+      const valid = (values[0] === "task-a" || values[0] === "review-task" || values[0] === "correction-writer") && values[1] === "user-a" && values[2] === "session-a"
         && values[3] === "turn-a" && values[4] === "root-a" && values[5] === "root-a" && values[6] === this.fence.leaseOwner
         && values[7] === this.fence.attemptCount && values[8] === "job-a" && this.fence.status === "running"
         && this.fence.interruptRequestedAt === null && this.fence.leaseExpiresAt.getTime() > Date.now()
@@ -363,7 +450,7 @@ class FakeArtifactPool {
       return this.one(valid ? { id: values[0] } : undefined)
     }
     if (sql.includes('SELECT "leaseExpiresAt" > clock_timestamp() AS "live"') || sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()')) {
-      const live = (values[0] === "task-a" || values[0] === "review-task") && values[1] === "session-a" && values[2] === this.fence.leaseOwner
+      const live = (values[0] === "task-a" || values[0] === "review-task" || values[0] === "correction-writer") && values[1] === "session-a" && values[2] === this.fence.leaseOwner
         && values[3] === this.fence.attemptCount && this.fence.leaseExpiresAt.getTime() > Date.now()
       return this.one({ live })
     }
@@ -400,6 +487,18 @@ class FakeArtifactPool {
     if (sql.startsWith("SELECT") && sql.includes('FROM "agent_artifact_review"')) {
       const row = [...this.reviews.values()].find(value => value.userId === values[0] && value.sessionId === values[1] && value.jobId === values[2] && value.artifactId === values[3] && value.version === values[4] && value.contentHash === values[5] && value.sourceDigest === values[6])
       return this.one(row)
+    }
+    if (sql.includes('FROM "agent_artifact" AS artifact JOIN "agent_artifact_version" AS version_row')) {
+      const artifact = this.artifacts.get(`${values[1]}:${values[0]}`)
+      const version = this.versions.get(`${values[0]}:${Number(values[4]) + 1}`)
+      if (!artifact || !version) return this.empty()
+      const valid = artifact.jobId === values[2] && artifact.lifecycle === "draft" && artifact.version === Number(values[4]) + 1
+        && artifact.hash === version?.contentHash && artifact.previousHash === values[5]
+        && version?.sessionId === values[3] && version.taskId === values[6] && version.previousHash === values[5]
+        && version.sourceDigest === values[7]
+      return this.one(valid && artifact && version ? { artifactId: artifact.id, headVersion: artifact.version,
+        headHash: artifact.hash, version: version.version, contentHash: version.contentHash,
+        sourceDigest: version.sourceDigest, previousHash: version.previousHash, taskId: version.taskId } : undefined)
     }
     if (sql.startsWith("SELECT") && sql.includes('FROM "agent_artifact"') && sql.includes('"id" = $1')) return this.one(this.artifacts.get(`${values[1]}:${values[0]}`))
     if (sql.startsWith("SELECT") && sql.includes('FROM "agent_artifact"') && sql.includes('"jobId" = $2')) {
@@ -441,6 +540,15 @@ class FakeArtifactPool {
     if (!this.expireLeaseAfterReceiptRead) return
     this.expireLeaseAfterReceiptRead = false
     this.fence.leaseExpiresAt = new Date(0)
+  }
+  private snapshot() {
+    const clone = (values: Map<string, Row>) => new Map([...values].map(([key, value]) => [key, { ...value }]))
+    return { artifacts: clone(this.artifacts), versions: clone(this.versions), versionReceipts: clone(this.versionReceipts), reviews: clone(this.reviews), reviewReceipts: clone(this.reviewReceipts) }
+  }
+  private restore(snapshot: ReturnType<FakeArtifactPool["snapshot"]>) {
+    const restore = (target: Map<string, Row>, source: Map<string, Row>) => { target.clear(); for (const [key, value] of source) target.set(key, value) }
+    restore(this.artifacts, snapshot.artifacts); restore(this.versions, snapshot.versions); restore(this.versionReceipts, snapshot.versionReceipts)
+    restore(this.reviews, snapshot.reviews); restore(this.reviewReceipts, snapshot.reviewReceipts)
   }
   private empty(): Result { return { rows: [], rowCount: 0 } }
   private one(row?: Row): Result { return { rows: row ? [row] : [], rowCount: row ? 1 : 0 } }

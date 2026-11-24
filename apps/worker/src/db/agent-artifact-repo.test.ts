@@ -383,6 +383,7 @@ describe("agent artifact repository", () => {
     let live = true
     let currentSourceDigest = "source-a"
     let head: Record<string, unknown> = { id: expected.artifactId, userId: expected.userId, jobId: expected.jobId, artifactType: "cover_letter", lifecycle: "draft", version: 2, hash: "hash-a", constraintHash: "constraints", provenanceRefs: [], evidenceRefs: [], createdAt: new Date(), updatedAt: new Date() }
+    let correctionHeadRows: Record<string, unknown>[] = []
     const client = {
       query: vi.fn(async (sql: string, params: readonly unknown[] = []) => {
         values.push({ sql, params })
@@ -392,6 +393,7 @@ describe("agent artifact repository", () => {
         if (sql.includes('FROM "sub_agent_tasks" AS parent')) return { rows: [{ id: expected.taskFence.parentTaskId }], rowCount: 1 }
         if (sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()')) return { rows: [{ live }], rowCount: 1 }
         if (sql.includes('FROM "agent_artifact_review"')) return { rows: reviewRows, rowCount: reviewRows.length }
+        if (sql.includes('FROM "agent_artifact" AS artifact JOIN "agent_artifact_version"')) return { rows: correctionHeadRows, rowCount: correctionHeadRows.length }
         if (sql.startsWith("SELECT") && sql.includes('FROM "agent_artifact"')) return { rows: [head], rowCount: 1 }
         return { rows: [], rowCount: 0 }
       }),
@@ -426,6 +428,13 @@ describe("agent artifact repository", () => {
     await expect(repository.readRevisionReview(exactInput)).resolves.toBeNull()
     live = true
     head = { ...head, version: 3 }
+    await expect(repository.readRevisionReview(exactInput)).resolves.toBeNull()
+    head = { ...head, hash: "hash-next", previousHash: "hash-a" }
+    correctionHeadRows = [{ artifactId: expected.artifactId, headVersion: 3, headHash: "hash-next", version: 3,
+      contentHash: "hash-next", sourceDigest: "source-a", previousHash: "hash-a", taskId: expected.taskFence.taskId }]
+    await expect(repository.readRevisionReview({ ...exactInput, allowOwnCorrectionSuccessor: true })).resolves.toMatchObject({ id: "review-row" })
+    await expect(repository.readRevisionReview({ ...exactInput, taskFence: { ...expected.taskFence, taskId: "other-writer" },
+      allowOwnCorrectionSuccessor: true })).resolves.toBeNull()
     await expect(repository.readRevisionReview(exactInput)).resolves.toBeNull()
     head = { ...head, version: 2 }
     reviewRows = []

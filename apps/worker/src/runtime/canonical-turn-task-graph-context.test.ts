@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest"
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
-import { isSelectedJobRootTool, loadTaskGraphCurrentObservation, mergeTaskGraphCurrentObservation, selectedJobSnapshot, selectedJobToolAllowed } from "./canonical-turn-task-graph-context.js"
+import { appendObjectiveTailorCandidateCatalog, isSelectedJobRootTool, loadTaskGraphCurrentObservation, mergeTaskGraphCurrentObservation, OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID, selectedJobSnapshot, selectedJobToolAllowed } from "./canonical-turn-task-graph-context.js"
+import { OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA } from "./subagents/objective-tailor-candidate.js"
 import type { TaskGraphCommandPort } from "./subagents/task-graph-command-port.js"
 import type { TaskGraphCurrentNode, TaskGraphCurrentState, TaskGraphVerificationReport } from "./subagents/task-graph-command-port.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./subagents/task-graph-command-port.js"
+import type { ObjectiveTailorGraph } from "@jobcopilot/agent-protocol"
 import { taskGraphResultProjectionBytes, taskGraphResultProjectionItems } from "./canonical-turn-task-graph-node-projection.js"
 import { StepContextBuilder, type StepContextSnapshot } from "./context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction } from "./context/input-claim-store.js"
@@ -124,6 +126,40 @@ function resumeFailureNode(templateId: "scout" | "analyst", failureReason: strin
   }
 }
 
+function markedObjectiveTailorCurrent(): TaskGraphCurrentState & { sourceIntent: unknown } {
+  const nodes: Record<string, unknown>[] = []
+  const sourceCount = 7
+  for (let index = 0; index < sourceCount; index += 1) {
+    const key = index === 0 ? "source-scout" : `source-analyst-${index}`
+    const templateId = index === 0 ? "scout" : "analyst"
+    const criterionId = index === 0 ? "candidate-count" : `finding-count-${index}`
+    nodes.push({ key, templateId, goal: "SOURCE_GOAL", successCriteria: ["SOURCE_CRITERION"],
+      dependsOn: index === 0 ? [] : ["source-scout"], taskId: `source-task-${index}`,
+      status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+      verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: templateId,
+        criteria: [{ id: criterionId, check: index === 0 ? { kind: "candidate_count_gte", minimum: 1 } : { kind: "finding_count_gte", minimum: 1 } }] },
+      verificationCriterionIds: [criterionId] })
+  }
+  const slots: ObjectiveTailorGraph["slots"][number][] = []
+  for (let index = 1; index <= 8; index += 1) {
+    const sourceAnalystNodeKey = `source-analyst-${((index - 1) % 6) + 1}`
+    const writerNodeKey = `wave-writer-${index}`, reviewerNodeKey = `wave-reviewer-${index}`
+    slots.push({ slotId: `tailor-${index}` as ObjectiveTailorGraph["slots"][number]["slotId"], sourceAnalystNodeKey, writerNodeKey, reviewerNodeKey })
+    nodes.push({ key: writerNodeKey, templateId: "cover_letter_writer", goal: "PRIVATE_WRITER_GOAL", successCriteria: ["Write draft"],
+      dependsOn: [sourceAnalystNodeKey], taskId: `wave-writer-task-${index}`, status: index === 1 ? "running" : "queued",
+      readiness: index === 1 ? "active" : "waiting_for_dependencies", resultSummary: "PRIVATE_DRAFT", failureReason: null })
+    nodes.push({ key: reviewerNodeKey, templateId: "cover_letter_reviewer", goal: "PRIVATE_REVIEW_GOAL", successCriteria: ["Review draft"],
+      dependsOn: [writerNodeKey], taskId: `wave-reviewer-task-${index}`, status: "queued",
+      readiness: "waiting_for_dependencies", resultSummary: "PRIVATE_REVIEW", failureReason: null })
+  }
+  return { revision: 23, discoveryTurnEligibility: "ordinary", objectiveTailor: {
+    schemaVersion: "agent-harness.v2.objective-tailor-graph.v1", sourceNodeCount: sourceCount, slots,
+  }, nodes: nodes as unknown as TaskGraphCurrentNode[], sourceIntent: nodes.map((node, index) => ({
+    nodeKey: node.key, goal: index < sourceCount ? "SOURCE_INTENT" : "PRIVATE_TAIL_INTENT",
+    successCriteria: [index < sourceCount ? "SOURCE_INTENT_CRITERION" : "PRIVATE_TAIL_CRITERION"], inputRelation: "covers_current_inputs",
+  })) }
+}
+
 function deadlineFailureNode(templateId: "scout" | "analyst" = "scout"): Record<string, unknown> {
   return resumeFailureNode(templateId, TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON)
 }
@@ -141,6 +177,37 @@ function projectedNode(row: Record<string, unknown>): Record<string, unknown> {
 }
 
 describe("TaskGraph turn observation", () => {
+  it("exposes only the bounded public tailoring catalog for the exact current graph revision", () => {
+    const candidateRef = `otc1_${"a".repeat(64)}`
+    const catalog = { schemaVersion: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA, graphRevision: 7,
+      candidates: [{ candidateRef, title: "Software Engineer", company: "Example GmbH", score: 8 }] }
+    const original = { ...snapshot(), taskGraphRevision: 7,
+      toolObservations: [...snapshot().toolObservations, { id: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID,
+        content: { secret: "STALE_PRIVATE_WITNESS" } }] }
+    const projected = appendObjectiveTailorCandidateCatalog(original, catalog, 7)
+    const observations = projected.toolObservations.filter(item => item.id === OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID)
+
+    expect(observations).toEqual([{ id: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID, content: {
+      kind: "objective_tailor_candidate_catalog", catalog,
+    } }])
+    expect(JSON.stringify(projected)).not.toContain("STALE_PRIVATE_WITNESS")
+    expect(JSON.stringify(projected)).not.toMatch(/jobId|materialDigest|sourceGraphDigest|analystProofDigest|writerNodeKey/)
+    expect(appendObjectiveTailorCandidateCatalog(original, catalog, 6).toolObservations.some(
+      item => item.id === OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID)).toBe(false)
+  })
+
+  it("removes stale or malformed tailoring catalog observations fail-closed", () => {
+    const original = { ...snapshot(), taskGraphRevision: 7,
+      toolObservations: [...snapshot().toolObservations, { id: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID,
+        content: { candidateRef: "model-spoof" } }] }
+    const malformed = { schemaVersion: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA, graphRevision: 7,
+      candidates: [{ candidateRef: "not-opaque", title: "Role", company: "Company", score: 8, jobId: "private-job-id" }] }
+    for (const value of [undefined, malformed]) {
+      expect(appendObjectiveTailorCandidateCatalog(original, value, 7).toolObservations.some(
+        item => item.id === OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID)).toBe(false)
+    }
+  })
+
   it("keeps selected-job root observations scoped to coordination and the current graph", () => {
     const original = {
       ...snapshot(),
@@ -712,6 +779,42 @@ describe("TaskGraph turn observation", () => {
     const bounded = mergeTaskGraphCurrentObservation(snapshot(), { ...state, nodes: [{ ...state.nodes[0]!, resultSummary: "x".repeat(30_000) }] })
     expect((bounded.toolObservations.at(-1)?.content as { nodes: Array<{ resultSummary: string | null }> }).nodes[0]?.resultSummary).toBeNull()
     expect(() => mergeTaskGraphCurrentObservation(snapshot(), { ...state, nodes: [{ ...state.nodes[0]!, taskId: "x".repeat(129) }] })).toThrow("task_graph_current_state_invalid:taskId")
+  })
+
+  it("projects a compact exact 23-node marked Wave view while keeping the source prefix and revision", () => {
+    const current = markedObjectiveTailorCurrent()
+    const merged = mergeTaskGraphCurrentObservation(snapshot(), current)
+    const content = merged.toolObservations.find(item => item.id === "task-graph-current")?.content as Record<string, unknown>
+    const wave = content.objectiveTailorWave as Record<string, unknown>
+    const slots = wave.slots as Array<Record<string, unknown>>
+
+    expect(wave).toMatchObject({ graphRevision: 23, sourceNodeCount: 7, ordinaryPlanAppend: "closed" })
+    expect(content).not.toHaveProperty("nodeCapacity")
+    expect(content.nodes).toHaveLength(7)
+    expect((content.nodes as Array<Record<string, unknown>>).map(node => node.key)).toEqual([
+      "source-scout", "source-analyst-1", "source-analyst-2", "source-analyst-3", "source-analyst-4", "source-analyst-5", "source-analyst-6",
+    ])
+    expect(slots).toHaveLength(8)
+    expect(slots[0]).toMatchObject({ slotId: "tailor-1", initial: {
+      writer: { taskId: "wave-writer-task-1", status: "running", readiness: "active" },
+      reviewer: { taskId: "wave-reviewer-task-1", status: "queued", readiness: "waiting_for_dependencies" },
+    } })
+    expect(content.sourceIntent).toEqual([
+      { nodeKey: "source-scout", goal: "SOURCE_INTENT", successCriteria: ["SOURCE_INTENT_CRITERION"], inputRelation: "covers_current_inputs" },
+      { nodeKey: "source-analyst-1", goal: "SOURCE_INTENT", successCriteria: ["SOURCE_INTENT_CRITERION"], inputRelation: "covers_current_inputs" },
+      { nodeKey: "source-analyst-2", goal: "SOURCE_INTENT", successCriteria: ["SOURCE_INTENT_CRITERION"], inputRelation: "covers_current_inputs" },
+      { nodeKey: "source-analyst-3", goal: "SOURCE_INTENT", successCriteria: ["SOURCE_INTENT_CRITERION"], inputRelation: "covers_current_inputs" },
+      { nodeKey: "source-analyst-4", goal: "SOURCE_INTENT", successCriteria: ["SOURCE_INTENT_CRITERION"], inputRelation: "covers_current_inputs" },
+      { nodeKey: "source-analyst-5", goal: "SOURCE_INTENT", successCriteria: ["SOURCE_INTENT_CRITERION"], inputRelation: "covers_current_inputs" },
+      { nodeKey: "source-analyst-6", goal: "SOURCE_INTENT", successCriteria: ["SOURCE_INTENT_CRITERION"], inputRelation: "covers_current_inputs" },
+    ])
+    expect(JSON.stringify(content)).not.toMatch(/PRIVATE_|objectiveTailor\W|artifact|reviewHash/)
+  })
+
+  it("rejects marked graphs whose owner-read eligibility is not ordinary", () => {
+    expect(() => mergeTaskGraphCurrentObservation(snapshot(), {
+      ...markedObjectiveTailorCurrent(), discoveryTurnEligibility: undefined,
+    } as unknown as TaskGraphCurrentState & { sourceIntent: unknown })).toThrow("task_graph_current_state_invalid")
   })
 
   it("strictly preserves bounded verifier evidence and rejects mismatched criterion IDs", () => {

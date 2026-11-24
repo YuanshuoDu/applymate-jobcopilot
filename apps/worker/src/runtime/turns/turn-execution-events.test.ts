@@ -44,6 +44,33 @@ function options(owner: TurnExecutionIdentity, events: Array<{ id: string; type:
 }
 
 describe("TurnExecutionEventWriter", () => {
+  it("persists the selected v2 call identity and fails closed on a mismatched executor receipt", async () => {
+    const events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }> = []
+    const saved: unknown[] = []
+    const requests: unknown[] = []
+    const executionOptions: TurnExecutionOptions = {
+      ...options(identity("turn", "root-1"), events),
+      toolVersionForCall: name => name === "agent.tailor" ? "2" : "1",
+      executeTool: async request => {
+        requests.push(request.call)
+        return { id: "different-call", toolName: "agent.tailor", toolVersion: "1", status: "completed", output: { accepted: true }, errorCode: null }
+      },
+      store: {
+        ...options(identity("turn", "root-1"), events).store,
+        createItem: async input => { saved.push(input.content); return { id: input.itemId, revision: 0 } },
+        updateItem: async input => { saved.push(input.content); return { id: input.itemId, revision: input.expectedRevision + 1 } },
+      },
+    }
+    const result = await executeToolWithItems(executionOptions, new TurnExecutionEventWriter(executionOptions), { id: "step-1", ordinal: 0 }, {
+      id: "call-1", name: "agent.tailor", arguments: { expectedRevision: 1, candidateRefs: [] },
+    }, () => new Date())
+    expect(result).toMatchObject({ id: "call-1", toolName: "agent.tailor", toolVersion: "2", status: "failed", errorCode: "tool_result_identity_mismatch" })
+    expect(requests[0]).toMatchObject({ id: "call-1", toolName: "agent.tailor", toolVersion: "2" })
+    expect(saved[0]).toMatchObject({ toolCallId: "call-1", toolName: "agent.tailor", toolVersion: "2" })
+    expect(saved[1]).toMatchObject({ toolCallId: "call-1", toolName: "agent.tailor", toolVersion: "2", status: "failed", errorCode: "tool_result_identity_mismatch" })
+    expect(JSON.stringify(saved)).not.toContain("accepted")
+  })
+
   it("closes a tool item whose started event is denied by the pause fence without executing it", async () => {
     const events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }> = []
     const base = options(identity("turn", "root-1"), events)
