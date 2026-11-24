@@ -8,9 +8,9 @@ import {
   parseObjectiveReviewedApplicationFillBrowserStartEvent, parseObjectiveReviewedFillSource,
   type LegacyApplicationSubmissionMaterial, type ObjectiveReviewedFillSource,
 } from "@jobcopilot/shared"
-import type { ReviewedSubmitMaterialInput } from "./reviewed-submit-material.js"
+import type { ReviewedSubmitMaterialInput } from "./reviewed-submit-material"
 import { hashArtifactContent } from "../artifacts/hash"
-import { verifyObjectiveReviewedFillFreshness, type ObjectiveReviewedFillAuthority } from "./objective-reviewed-fill-authority.js"
+import { verifyObjectiveReviewedFillFreshness, type ObjectiveReviewedFillAuthority } from "./objective-reviewed-fill-authority"
 
 const START_EVENT = "reviewed_application_fill_browser_started"
 const START_BODY = "Reviewed application material bound to browser-start attempt."
