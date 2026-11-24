@@ -124,6 +124,16 @@ function fakeClient(scenario: Scenario) {
   return { query } as unknown as Parameters<typeof readObjectiveApplicationReviewSetState>[0]
 }
 
+function tamperFirstApprovalProof(scenario: Scenario, kind: "extra" | "proof_hash" | "row_hash"): Scenario {
+  return { ...scenario, approvals: scenario.approvals.map((approval, index) => {
+    if (index !== 0) return approval
+    const payload = approval.payload as Row, proof = payload.proof as Row
+    if (kind === "row_hash") return { ...approval, materialHash: "0".repeat(64) }
+    return { ...approval, payload: { ...payload, proof: kind === "extra"
+      ? { ...proof, unexpected: true } : { ...proof, materialProofHash: "0".repeat(64) } } }
+  }) }
+}
+
 describe("Worker Objective application review-set state", () => {
   it("retains a pending aggregate while some member decisions are already durable", async () => {
     const scenario = await makeScenario("pending")
@@ -155,6 +165,11 @@ describe("Worker Objective application review-set state", () => {
 
   it("rejects a command-expiry event with an empty command idempotency suffix", async () => {
     const scenario = await makeScenario("resolved", false, "empty")
+    await expect(readObjectiveApplicationReviewSetState(fakeClient(scenario), { userId, sessionId, turnId, selection, now })).resolves.toBeUndefined()
+  })
+
+  it.each(["extra", "proof_hash", "row_hash"] as const)("rejects a member proof with %s drift", async kind => {
+    const scenario = tamperFirstApprovalProof(await makeScenario("resolved"), kind)
     await expect(readObjectiveApplicationReviewSetState(fakeClient(scenario), { userId, sessionId, turnId, selection, now })).resolves.toBeUndefined()
   })
 })

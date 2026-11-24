@@ -1,7 +1,6 @@
-import { createHash } from "node:crypto"
 import type { Pool, PoolClient } from "pg"
 import { isApprovalHash, objectiveApplicationApprovalSetItemId, parseObjectiveApplicationReviewIntent, type ObjectiveApplicationReviewIntent } from "@jobcopilot/agent-protocol"
-import { canonicalJson } from "@jobcopilot/shared"
+import { buildObjectiveApplicationReviewMemberProof, canonicalJson } from "@jobcopilot/shared"
 import { acquireSourceMaterialFence } from "../db/source-material-fence.js"
 import { hashArtifactContent } from "./subagents/artifact-adapters.js"
 import { readCompletedObjectiveTailorSourceEvidence } from "./subagents/objective-tailor-completed-source.js"
@@ -21,7 +20,6 @@ type Client = Pick<PoolClient, "query">
 const TTL_MS = 15 * 60_000
 const TITLE = "Review application materials"
 const BODY = "Approve these reviewed materials for a later form fill. This approval does not authorize submission."
-const PROOF_SCHEMA = "objective-application-review-member-proof.v1"
 type Intent = ObjectiveApplicationReviewIntent
 export type ObjectiveApplicationReviewIssueResult = Readonly<{ status: "issued" | "waiting" | "resolved"; setId: string; itemId: string; intentHash: string;
   members: readonly ObjectiveApplicationReviewSetMember[] }>
@@ -136,8 +134,7 @@ function memberProof(evidence: NonNullable<Awaited<ReturnType<typeof readComplet
     graphItemId: evidence.graphItemId, graphRevision: evidence.graphRevision, finalItemId: evidence.finalItemId, slotOrdinal: ordinal,
     writerTaskId: outcome.writerTaskId, reviewerTaskId: outcome.reviewerTaskId, reviewerToolCallId: receipt.toolCallId,
     reviewHash: receipt.reviewHash, artifactId: ref.artifactId, version: ref.version, contentHash: ref.contentHash, sourceDigest: ref.sourceDigest }
-  const proof = { schema: PROOF_SCHEMA, source, resumeWitness }
-  return { ...proof, materialProofHash: createHash("sha256").update(canonicalJson(proof)).digest("hex") }
+  return buildObjectiveApplicationReviewMemberProof({ source, resumeWitness })
 }
 function approvalHashes(lease: TurnLease, applicationTaskId: string, jobId: string, ordinal: number, proof: ReturnType<typeof memberProof>) {
   if (!proof) return null

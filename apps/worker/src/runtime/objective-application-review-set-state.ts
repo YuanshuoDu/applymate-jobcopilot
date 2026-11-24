@@ -4,7 +4,8 @@ import {
   hashApprovalScope, isApprovalHash, objectiveApplicationApprovalSetItemId, parseObjectiveApplicationApprovalSet,
   parseObjectiveApplicationReviewIntent, type ObjectiveApplicationReviewIntent,
 } from "@jobcopilot/agent-protocol"
-import { canonicalJson, parseObjectiveApplicationResumeWitness, type ObjectiveApplicationResumeWitness } from "@jobcopilot/shared"
+import { canonicalJson, parseObjectiveApplicationReviewMemberProof, OBJECTIVE_APPLICATION_REVIEW_MEMBER_PROOF_SCHEMA,
+  type ObjectiveApplicationReviewMemberProof } from "@jobcopilot/shared"
 import { hashArtifactContent } from "./subagents/artifact-adapters.js"
 import { protocolScope } from "./approval/types.js"
 import { assertObjectiveApprovalSetItem, assertObjectiveApprovalSetWakeupEvent } from "./wakeup/resume-objective-approval-set.js"
@@ -13,18 +14,8 @@ import { parseWakeup, type AgentTurnWakeupPayload } from "./wakeup/types.js"
 type Row = Record<string, unknown>
 type Client = Pick<PoolClient, "query">
 const MEMBER_SCHEMA = "objective-application-approval-set-member.v1"
-const PROOF_SCHEMA = "objective-application-review-member-proof.v1"
-const HASH = /^[a-f0-9]{64}$/
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
 
-export type ObjectiveApplicationReviewMemberProof = Readonly<{
-  schema: typeof PROOF_SCHEMA
-  source: Readonly<{ jobId: string; sourceTurnId: string; rootTaskId: string; graphItemId: string; graphRevision: number; finalItemId: string;
-    slotOrdinal: number; writerTaskId: string; reviewerTaskId: string; reviewerToolCallId: string; reviewHash: string;
-    artifactId: string; version: number; contentHash: string; sourceDigest: string }>
-  resumeWitness: ObjectiveApplicationResumeWitness
-  materialProofHash: string
-}>
 export type ObjectiveApplicationReviewSetMember = Readonly<{
   slotOrdinal: number; approvalId: string; applicationTaskId: string; jobId: string
   status: "pending" | "approved" | "rejected" | "expired"; receiptRevision: number; proof: ObjectiveApplicationReviewMemberProof
@@ -78,7 +69,7 @@ export async function readObjectiveApplicationReviewSetState(client: Client, inp
   const members: ObjectiveApplicationReviewSetMember[] = []
   const jobs = new Set<string>(), tasks = new Set<string>(), calls = new Set<string>(), revisions = new Set<number>()
   for (const member of set.members) {
-    const approval = byId.get(member.approvalId), proof = approval && memberProof(approval.payload, setId, set.sourceTurnId, member.slotOrdinal)
+    const approval = byId.get(member.approvalId), proof = approval && memberProof(approval.payload, setId, set.sourceTurnId, member.slotOrdinal, input.userId)
     const expiresAt = date(approval?.expiresAt)
     if (!approval || !proof || !expiresAt || expiresAt.toISOString() !== set.expiresAt
       || approval.id !== member.approvalId || approval.userId !== input.userId || approval.sessionId !== input.sessionId
@@ -93,13 +84,11 @@ export async function readObjectiveApplicationReviewSetState(client: Client, inp
     if (!(approval.status === "pending" || approval.status === "approved" || approval.status === "rejected" || approval.status === "expired")
       || approval.consumedAt != null || approval.status === "pending" && approval.decidedAt != null
       || approval.status !== "pending" && approval.decidedAt == null) return undefined
-    const expectedMaterialHash = createHash("sha256").update(canonicalJson({ schema: proof.schema, source: proof.source,
-      resumeWitness: proof.resumeWitness })).digest("hex")
     const expectedResourceHash = bareHash(hashArtifactContent({ kind: "review_application", userId: input.userId, sessionId: input.sessionId,
       jobId: approval.jobId, applicationTaskId: approval.taskId, slotOrdinal: member.slotOrdinal }))
     const expectedAnswersHash = bareHash(hashArtifactContent({ kind: "review_application", formAnswers: null }))
     const requested = await requestEvent(client, input, approval)
-    if (!requested || approval.materialHash !== proof.materialProofHash || proof.materialProofHash !== expectedMaterialHash
+    if (!requested || approval.materialHash !== proof.materialProofHash
       || approval.resourceHash !== expectedResourceHash || approval.answersHash !== expectedAnswersHash
       || resolved && approval.status === "pending") return undefined
     jobs.add(approval.jobId); tasks.add(approval.taskId); calls.add(approval.toolCallId); revisions.add(Number(approval.revision))
@@ -194,22 +183,13 @@ async function scopeMatches(row: Row, expiresAt: Date): Promise<boolean> {
   return isApprovalHash(row.resourceHash) && isApprovalHash(row.materialHash) && isApprovalHash(row.answersHash)
     && row.scopeHash === await hashApprovalScope(scope)
 }
-function memberProof(value: unknown, setId: string, sourceTurnId: string, ordinal: number): ObjectiveApplicationReviewMemberProof | undefined {
-  const envelope = record(value), proof = record(envelope?.proof), source = record(proof?.source)
-  const witness = parseObjectiveApplicationResumeWitness(proof?.resumeWitness)
-  const sourceKeys = "artifactId,contentHash,finalItemId,graphItemId,graphRevision,jobId,reviewerTaskId,reviewerToolCallId,reviewHash,rootTaskId,slotOrdinal,sourceDigest,sourceTurnId,version,writerTaskId"
-  if (!envelope || !proof || !source || !witness || !exactKeys(envelope, "schema,setId,slotOrdinal,sourceTurnId,proof")
+function memberProof(value: unknown, setId: string, sourceTurnId: string, ordinal: number, userId: string): ObjectiveApplicationReviewMemberProof | undefined {
+  const envelope = record(value), proof = parseObjectiveApplicationReviewMemberProof(envelope?.proof)
+  if (!envelope || !proof || !exactKeys(envelope, "schema,setId,slotOrdinal,sourceTurnId,proof")
     || envelope.schema !== MEMBER_SCHEMA || envelope.setId !== setId || envelope.sourceTurnId !== sourceTurnId || envelope.slotOrdinal !== ordinal
-    || !exactKeys(proof, "materialProofHash,resumeWitness,schema,source") || proof.schema !== PROOF_SCHEMA
-    || !exactKeys(source, sourceKeys) || ![source.jobId, source.sourceTurnId, source.rootTaskId, source.graphItemId, source.finalItemId,
-      source.writerTaskId, source.reviewerTaskId, source.reviewerToolCallId, source.artifactId].every(safeId)
-    || !Number.isSafeInteger(source.graphRevision) || Number(source.graphRevision) < 1 || source.slotOrdinal !== ordinal
-    || !Number.isSafeInteger(source.version) || Number(source.version) < 1
-    || ![source.reviewHash, source.contentHash, source.sourceDigest].every(value => typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value))
-    || typeof proof.materialProofHash !== "string" || !HASH.test(proof.materialProofHash)
-    || witness.jobId !== source.jobId) return undefined
-  return { schema: PROOF_SCHEMA, source: source as ObjectiveApplicationReviewMemberProof["source"], resumeWitness: witness,
-    materialProofHash: proof.materialProofHash }
+    || proof.schema !== OBJECTIVE_APPLICATION_REVIEW_MEMBER_PROOF_SCHEMA || proof.source.slotOrdinal !== ordinal
+    || proof.resumeWitness.userId !== userId || proof.resumeWitness.jobId !== proof.source.jobId) return undefined
+  return proof
 }
 function row(value: unknown): Row | null { return record(value) }
 function record(value: unknown): Row | null {

@@ -83,6 +83,12 @@ export { normalizeExternalApiErrorCode, sharedExternalApiErrorCode, type Externa
 export { getAzureManagementToken, type AzureManagementTokenCredential } from "./azure-management.js";
 export { canonicalJson, CanonicalJsonError, hashContent } from "./canonical-json.js";
 export {
+  OBJECTIVE_APPLICATION_REVIEW_MEMBER_PROOF_SCHEMA,
+  buildObjectiveApplicationReviewMemberProof,
+  parseObjectiveApplicationReviewMemberProof,
+  type ObjectiveApplicationReviewMemberProof,
+} from "./objective-application-review-member-proof.js";
+export {
   OBJECTIVE_APPLICATION_RESUME_WITNESS_SCHEMA,
   buildObjectiveApplicationResumeWitness,
   parseObjectiveApplicationResumeWitness,
