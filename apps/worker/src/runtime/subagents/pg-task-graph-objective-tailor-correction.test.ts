@@ -6,7 +6,7 @@ import { appendCorrectionWithClient } from "./pg-task-graph-objective-tailor-cor
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 
 const mocks = vi.hoisted(() => ({ lock: vi.fn(), load: vi.fn(), turnChecks: vi.fn(), assertSteering: vi.fn(), proof: vi.fn(), plan: vi.fn(),
-  digest: vi.fn(), create: vi.fn(), budget: vi.fn(), hasReceipt: vi.fn(), write: vi.fn(), requirements: vi.fn(), inventory: vi.fn() }))
+  digest: vi.fn(), create: vi.fn(), budget: vi.fn(), hasReceipt: vi.fn(), write: vi.fn(), requirements: vi.fn(), inventory: vi.fn(), criteria: vi.fn() }))
 vi.mock("./task-graph-pg-state.js", () => ({ lockTaskGraphScope: mocks.lock, loadTaskGraph: mocks.load }))
 vi.mock("./pg-store-create.js", () => ({ assertPlanningRootHasNoUnresolvedSteering: mocks.assertSteering }))
 vi.mock("./objective-tailor-correction-proof.js", () => ({ verifyAndBindObjectiveTailorCorrectionProof: mocks.proof,
@@ -19,6 +19,7 @@ vi.mock("./task-graph-pg-create.js", () => ({ createGraphTasks: mocks.create }))
 vi.mock("./pg-task-graph-command-port-schedule.js", () => ({ requireTaskGraphContinuationBudget: mocks.budget, hasPersistedPlanReceipt: mocks.hasReceipt }))
 vi.mock("./task-graph-pg-events.js", () => ({ writePlanReceipt: mocks.write }))
 vi.mock("../context/root-task-objective.js", () => ({ resolveRootTaskVerificationRequirements: mocks.requirements }))
+vi.mock("./root-plan-criteria.js", () => ({ requireOwnedRootPlanCriteria: mocks.criteria }))
 
 const scope: TaskGraphExecutionScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
   stepId: "step-2", turnLeaseOwner: "turn-owner", turnLeaseVersion: 3, parentLeaseOwner: "root-owner", parentAttemptCount: 2 }
@@ -78,7 +79,7 @@ beforeEach(() => {
   mocks.turnChecks.mockResolvedValue(undefined); mocks.assertSteering.mockResolvedValue(undefined)
   mocks.proof.mockResolvedValue(proof); mocks.plan.mockReturnValue(plan); mocks.inventory.mockResolvedValue(undefined)
   mocks.digest.mockResolvedValue(proof.candidateWitness.candidate.materialDigest); mocks.create.mockResolvedValue(created)
-  mocks.budget.mockResolvedValue(undefined); mocks.hasReceipt.mockResolvedValue(false); mocks.write.mockResolvedValue(undefined)
+  mocks.budget.mockResolvedValue(undefined); mocks.hasReceipt.mockResolvedValue(false); mocks.write.mockResolvedValue(undefined); mocks.criteria.mockResolvedValue(undefined)
   mocks.requirements.mockReturnValue({ status: "valid", requirements: [] })
 })
 afterEach(() => vi.unstubAllEnvs())
@@ -86,6 +87,10 @@ afterEach(() => vi.unstubAllEnvs())
 describe("Objective Tailor correction PostgreSQL command", () => {
   it("fences the reviewed slot and atomically appends its exact successor pair", async () => {
     const fake = dbClient()
+    const persistedCriteria = ["Use verified source material"]
+    const graph = loaded()
+    mocks.load.mockResolvedValue({ ...graph, snapshot: { ...graph.snapshot, rootSuccessCriteria: persistedCriteria } })
+    mocks.criteria.mockResolvedValue(persistedCriteria)
     await expect(appendCorrectionWithClient(fake.client, { scope, expectedRevision: 4, correctionSlotId: "tailor-1" }))
       .resolves.toEqual({ status: "accepted", revision: 5, nodes, readyTaskIds: ["correction-writer"] })
     expect(fake.calls.some(call => call.sql.includes('JOIN "agent_steps"') && call.sql.includes("step.\"status\" = 'streaming'"))).toBe(true)
@@ -97,6 +102,7 @@ describe("Objective Tailor correction PostgreSQL command", () => {
     expect(headFence?.values).toEqual([ref.artifactId, scope.userId, "job-1", scope.sessionId, "initial-writer", ref.contentHash, ref.sourceDigest, null])
     expect(mocks.create).toHaveBeenCalledWith(fake.client, expect.objectContaining({ proposal: plan.proposal }), parent, expect.any(Object),
       expect.any(Map), expect.any(Object), undefined, true, undefined, false, expect.objectContaining({ marker: newMarker }))
+    expect(mocks.plan).toHaveBeenCalledWith({ current: expect.objectContaining({ rootSuccessCriteria: persistedCriteria }), proof })
     expect(mocks.write).toHaveBeenCalledWith(fake.client, expect.objectContaining({ expectedRevision: 4,
       idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 4), fingerprint: taskGraphFingerprint({
         kind: "objective_tailor_same_slot_correction", scope: { userId: scope.userId, sessionId: scope.sessionId,

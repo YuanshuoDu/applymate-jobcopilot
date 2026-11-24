@@ -54,7 +54,9 @@ export async function appendCorrectionWithClient(client: pg.PoolClient, raw: unk
   const proof = await verifyAndBindObjectiveTailorCorrectionProof({ client, lease,
     root: { id: scope.rootTaskId, attemptCount: scope.parentAttemptCount }, loaded, slotId: correctionSlotId, expectedRevision })
   if (!proof || proof.slotId !== correctionSlotId) throw stale()
-  const plan = prepareObjectiveTailorCorrectionPlan({ current: { ...loaded.state, rootSuccessCriteria: loaded.rootSuccessCriteria }, proof })
+  const current = loaded.snapshot.rootSuccessCriteria === undefined ? loaded.state
+    : { ...loaded.state, rootSuccessCriteria: loaded.snapshot.rootSuccessCriteria }
+  const plan = prepareObjectiveTailorCorrectionPlan({ current, proof })
   if (!plan || plan.proof.graphRevision !== expectedRevision || plan.proof.admittedRevision !== expectedRevision + 1) throw stale()
   const jobId = proof.candidateWitness.candidate.jobId
   if (await readCurrentScheduledDraftJobMaterialDigest(client, scope.userId, jobId) !== proof.candidateWitness.candidate.materialDigest) {
@@ -117,7 +119,7 @@ async function findExactReplay(client: Queryable, input: CorrectionInput, loaded
     || slot.writerTaskId !== proof.prior.writerTaskId || slot.reviewerTaskId !== proof.prior.reviewerTaskId
     || correction.writerTaskId === correction.reviewerTaskId || markerSlot.correction.writerNodeKey !== keys.writerNodeKey
     || markerSlot.correction.reviewerNodeKey !== keys.reviewerNodeKey) throw conflict()
-  const receipt = exact(payload.receipt, "nodes,readyTaskIds,revision,status"), expectedNodes = [
+  const receipt = exact(payload.receipt, "nodes,readyTaskIds,revision,status"), expectedNodes: TaskGraphScheduleReceipt["nodes"] = [
     { key: keys.writerNodeKey, taskId: correction.writerTaskId, status: "queued" },
     { key: keys.reviewerNodeKey, taskId: correction.reviewerTaskId, status: "waiting" },
   ]
