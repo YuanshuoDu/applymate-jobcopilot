@@ -1,11 +1,12 @@
 import { db } from "@/lib/db";
 import { Prisma } from "@prisma/client";
 import { hashAgentReceiptValue, matchesApplyTaskSubmitPayload, reviewedFillHandoffIdempotencyKey, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
-import { createSubmitIntent, enqueueApplyTask, isReplayableSubmitState, resolveExistingSubmitIntent } from "@/lib/apply-queue-client";
+import { createSubmitIntent, isReplayableSubmitState, resolveExistingSubmitIntent } from "@/lib/apply-queue-client";
 import { lockAndRereadReviewedSubmitMaterial, replayReceiptScopeMatches, resolveReviewedSubmitMaterial, submitMaterialHashesMatch } from "@/lib/agent/approval/reviewed-submit-material";
 import { AgentCommandService } from '@/lib/agent/control-plane/commands/agent-command-service'
 import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
 import { applicationFillTaskGraphEnabled, asRecord, assertActiveAccount, assertJobPreflight, assertUnattendedApplyEnabled, AutoApplyError, validateAutoApplyUrl } from "./auto-apply-guards";
+import { queueLegacyApplicationFill } from "./legacy-application-fill";
 
 export { AutoApplyError, applicationFillTaskGraphEnabled, validateAutoApplyUrl } from "./auto-apply-guards";
 
@@ -60,27 +61,7 @@ export async function queueApplicationFill(input: {
     })
     return { taskId: result.turnId, turnId: result.turnId, disposition: result.disposition }
   }
-  const claimed = await db.applicationTask.updateMany({
-    where: {
-      id: input.applicationTaskId,
-      userId: input.userId,
-      jobId: input.jobId,
-      status: "waiting_for_user",
-      checkpoint: input.resumeAfterUserInput ? "form_answer_required" : "materials_ready",
-    },
-    data: { status: "filling", checkpoint: "form_fill_queued", question: Prisma.DbNull, startedAt: new Date() },
-  });
-  if (claimed.count !== 1) throw new AutoApplyError("This application is no longer ready for the form-fill review pass.");
-
-  try {
-    const taskId = await enqueueApplyTask({ applicationTaskId: input.applicationTaskId, jobId: input.jobId, userId: input.userId, applyUrl, operation: "fill" });
-    await db.applicationTask.update({ where: { id: input.applicationTaskId }, data: { workerTaskId: taskId } });
-    await db.applicationTaskEvent.create({ data: { taskId: input.applicationTaskId, type: "form_fill_queued", actor: "reviewer", body: "Material review approved; worker will fill the form without submitting it.", data: { workerTaskId: taskId } } });
-    return { taskId };
-  } catch (error) {
-    await db.applicationTask.updateMany({ where: { id: input.applicationTaskId, status: "filling", checkpoint: "form_fill_queued" }, data: { status: "waiting_for_user", checkpoint: "materials_ready" } }).catch(() => undefined);
-    throw error;
-  }
+  return queueLegacyApplicationFill({ ...input, applyUrl });
 }
 
 export async function queueAutonomousApplication(input: {

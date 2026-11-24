@@ -5,6 +5,7 @@ import { hashAgentReceiptValue } from "@jobcopilot/shared";
 
 const mocks = vi.hoisted(() => ({
   approvalFindFirst: vi.fn(),
+  fillReservationFindFirst: vi.fn(),
   transaction: vi.fn(),
   transactionCommit: vi.fn(),
   txTaskFindFirst: vi.fn(),
@@ -121,9 +122,13 @@ describe("auto-apply authorization", () => {
       company: "Acme", description: "Join the platform team with Acme. Build products.", source: "lever", url: input.applyUrl,
     });
     mocks.userFindUnique.mockResolvedValue({ accountStatus: "active" });
-    mocks.approvalLock.mockResolvedValue([{ id: "approval_1" }]);
+    mocks.approvalLock.mockImplementation(async (query: { sql?: string }) => query.sql?.includes('FROM "application_tasks"')
+      ? [{ id: "application_1", sessionId: "session_1" }]
+      : [{ id: "approval_1" }]);
+    mocks.fillReservationFindFirst.mockResolvedValue(null);
     transactionClient = {
       applicationTask: { findFirst: mocks.txTaskFindFirst, updateMany: mocks.txTaskUpdateMany },
+      agentApproval: { findFirst: mocks.fillReservationFindFirst },
       resume: { findFirst: mocks.resumeFindFirst },
       coverLetter: { findFirst: mocks.coverLetterFindFirst },
       job: { updateMany: mocks.jobUpdateMany },
@@ -728,6 +733,17 @@ describe("auto-apply authorization", () => {
     await expect(queueApplicationFill(input)).resolves.toEqual({ taskId: "worker_1" });
     expect(mocks.enqueueApplyTask).toHaveBeenCalledWith(expect.objectContaining({ operation: "fill" }));
     expect(mocks.startApplicationFillForReview).not.toHaveBeenCalled();
+  });
+
+  it("denies a reserved Objective task before using the legacy ApplyQueue when TaskGraph is disabled", async () => {
+    mocks.fillReservationFindFirst.mockResolvedValueOnce({ id: `objective-review:objective-review-${"a".repeat(40)}:1` });
+    const { queueApplicationFill } = await import("./auto-apply");
+
+    await expect(queueApplicationFill(input)).rejects.toThrow("no longer ready");
+
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+    expect(mocks.taskEventCreate).not.toHaveBeenCalled();
   });
 
   it("never sends a reviewed-source fill through the legacy ApplyQueue path", async () => {
