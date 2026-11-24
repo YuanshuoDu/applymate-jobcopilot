@@ -1,7 +1,10 @@
 import type { Pool, QueryConfig, QueryResult, QueryResultRow } from "pg"
 import {
+  OBJECTIVE_REVIEWED_FILL_HANDOFF_TOPIC,
+  parseObjectiveReviewedFillHandoffOutboxRow,
   parseReviewedFillHandoffOutboxRow,
   REVIEWED_FILL_HANDOFF_TOPIC,
+  type ObjectiveReviewedFillHandoffOutboxRow,
   type ReviewedFillHandoffOutboxRow,
 } from "@jobcopilot/shared"
 
@@ -11,10 +14,12 @@ const DEFAULT_TIMEOUT_MS = 10_000
 const QUERY_TIMEOUT_MS = 5_000
 const MAX_BATCH_SIZE = 25
 const MAX_RESPONSE_BYTES = 1_024
+const HANDOFF_TOPICS = [REVIEWED_FILL_HANDOFF_TOPIC, OBJECTIVE_REVIEWED_FILL_HANDOFF_TOPIC] as const
 const cursors = new WeakMap<Pool, { createdAt: string; id: string }>()
 
 type SelectedRow = QueryResultRow & { id: string; topic: string; aggregateId: string; idempotencyKey: string; payload: unknown; createdAtCursor: string }
 type Ack = "queued" | "duplicate" | "terminal" | "deferred"
+type HandoffRow = ReviewedFillHandoffOutboxRow | ObjectiveReviewedFillHandoffOutboxRow
 export type ReviewedFillHandoffOutboxOptions = {
   endpointUrl?: string
   secret?: string
@@ -62,7 +67,7 @@ function exactAck(value: unknown): Ack | null {
   } catch { return null }
 }
 
-async function requestAck(row: ReviewedFillHandoffOutboxRow, config: Bridge, shutdown: AbortSignal): Promise<Ack | null> {
+async function requestAck(row: HandoffRow, config: Bridge, shutdown: AbortSignal): Promise<Ack | null> {
   try {
     const signal = AbortSignal.any([shutdown, AbortSignal.timeout(config.timeoutMs)])
     const response = await config.fetcher(config.url, {
@@ -102,10 +107,10 @@ async function selectPending(pool: Pool, limit: number): Promise<SelectedRow[]> 
   const cursor = cursors.get(pool)
   const select = (after?: { createdAt: string; id: string }) => query<SelectedRow>(pool, `SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload",
     to_char("createdAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS "createdAtCursor"
-    FROM "agent_outbox" WHERE "topic" = $1 AND "publishedAt" IS NULL
+    FROM "agent_outbox" WHERE "topic" = ANY($1::text[]) AND "publishedAt" IS NULL
     ${after ? `AND ("createdAt", "id") > ($2::timestamp, $3::text)` : ""}
     ORDER BY "createdAt" ASC, "id" ASC LIMIT $${after ? 4 : 2}`,
-  after ? [REVIEWED_FILL_HANDOFF_TOPIC, after.createdAt, after.id, limit] : [REVIEWED_FILL_HANDOFF_TOPIC, limit])
+  after ? [HANDOFF_TOPICS, after.createdAt, after.id, limit] : [HANDOFF_TOPICS, limit])
   let rows = (await select(cursor)).rows
   if (!rows.length && cursor) { cursors.delete(pool); rows = (await select()).rows }
   const last = rows.at(-1)
@@ -115,7 +120,7 @@ async function selectPending(pool: Pool, limit: number): Promise<SelectedRow[]> 
   return rows
 }
 
-async function markPublished(pool: Pool, row: ReviewedFillHandoffOutboxRow): Promise<boolean> {
+async function markPublished(pool: Pool, row: HandoffRow): Promise<boolean> {
   const result = await query(pool, `UPDATE "agent_outbox" SET "publishedAt" = CURRENT_TIMESTAMP,
     "attemptCount" = "attemptCount" + 1, "lastError" = NULL
     WHERE "id" = $1 AND "topic" = $2 AND "aggregateId" = $3 AND "idempotencyKey" = $4
@@ -124,9 +129,12 @@ async function markPublished(pool: Pool, row: ReviewedFillHandoffOutboxRow): Pro
   return result.rowCount === 1
 }
 
-function parsedRow(row: SelectedRow): ReviewedFillHandoffOutboxRow | null {
-  return parseReviewedFillHandoffOutboxRow({ id: row.id, topic: row.topic, aggregateId: row.aggregateId,
-    idempotencyKey: row.idempotencyKey, payload: row.payload })
+function parsedRow(row: SelectedRow): HandoffRow | null {
+  const selected = { id: row.id, topic: row.topic, aggregateId: row.aggregateId,
+    idempotencyKey: row.idempotencyKey, payload: row.payload }
+  if (row.topic === REVIEWED_FILL_HANDOFF_TOPIC) return parseReviewedFillHandoffOutboxRow(selected)
+  if (row.topic === OBJECTIVE_REVIEWED_FILL_HANDOFF_TOPIC) return parseObjectiveReviewedFillHandoffOutboxRow(selected)
+  return null
 }
 
 export async function drainReviewedFillHandoffOutbox(

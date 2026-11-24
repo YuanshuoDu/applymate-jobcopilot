@@ -47,6 +47,23 @@ export {
   type ReviewedFillHandoffOutboxData,
   type ReviewedFillHandoffOutboxRow,
 } from "./agent-reviewed-fill-handoff.js";
+export {
+  OBJECTIVE_REVIEWED_FILL_HANDOFF_SCHEMA,
+  OBJECTIVE_REVIEWED_FILL_HANDOFF_TOPIC,
+  OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA,
+  buildObjectiveReviewedFillHandoffOutboxData,
+  objectiveApplicationApprovedIntentId,
+  objectiveReviewedFillHandoffIdempotencyKey,
+  parseObjectiveApplicationApprovedIntent,
+  parseObjectiveReviewedFillHandoffOutboxRow,
+  parseObjectiveReviewedFillSource,
+  type ObjectiveApplicationApprovedIntent,
+  type ObjectiveReviewedFillHandoffIdentity,
+  type ObjectiveReviewedFillHandoffIntent,
+  type ObjectiveReviewedFillHandoffOutboxData,
+  type ObjectiveReviewedFillHandoffOutboxRow,
+  type ObjectiveReviewedFillSource,
+} from "./agent-objective-reviewed-fill.js";
 export { hashAgentReceiptValue } from "./agent-receipt.js";
 export {
   bindReviewedApplicationSubmissionMaterial,
