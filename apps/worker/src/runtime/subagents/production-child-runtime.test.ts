@@ -9,7 +9,7 @@ import type { SubagentLease } from "./types.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import type { TurnEngineStore } from "../turns/turn-engine-types.js"
 import type { PublicToolDefinition } from "../tools/types.js"
-import type { ChildToolRuntime } from "./child-executor.js"
+import type { ChildExecutorOptions, ChildToolRuntime } from "./child-executor.js"
 import type { ChildAttemptResume } from "./child-resume.js"
 import type { DurableWaitResume } from "./child-resume-observations.js"
 import { createJobDiscoveryClient, type JobDiscoveryRequest } from "../tools/job-discovery-client.js"
@@ -30,6 +30,8 @@ import { SCHEDULED_AUDIT_OUTPUT_SCHEMA, SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TA
 import { SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_AUDIT_ROLE, SCHEDULED_POST_GATE_AUDIT_TASK_TYPE,
   SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_EXECUTE_ROLE, SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE } from "./scheduled-post-gate-contract.js"
 import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
+import { makeObjectiveTailorCandidateSelection, bindObjectiveTailorCandidateWitness } from "./objective-tailor-witness.js"
+import { objectiveTailorNodeKeysForCandidate } from "./objective-task-graph-child-authority.js"
 
 const artifactStoreMock = vi.hoisted(() => ({ current: null as unknown, sourceDigestReader: null as unknown, draftMaterialAssertion: null as unknown }))
 const applicationFillExecutorMock = vi.hoisted(() => ({
@@ -292,6 +294,7 @@ function legacyInitialWriterPool() {
       graphQueries.push(sql)
       if (/^BEGIN(?:\s|$)/.test(sql) || sql === "COMMIT" || sql === "ROLLBACK") { transactionQueries.push(sql); return { rows: [] } }
       if (sql.includes("set_config('app.user_id', $1, true)")) { transactionQueries.push(sql); tenantScopeUserIds.push(values[0]); return { rows: [] } }
+      if (sql.includes("WITH live AS MATERIALIZED")) return { rows: [] }
       if (sql.includes('FROM "agent_items" AS item') || sql.includes('FROM "agent_events" AS event')) return { rows: [] }
       throw new Error(`unexpected legacy Writer graph query: ${sql}`)
     }),
@@ -330,6 +333,17 @@ function scheduledDraftCandidateWitness(jobMaterialDigest: string, jobId = "job-
         nodeDigest: digest, resultDigest: digest, evidenceDigest: digest, reportDigest: digest }] }],
     jobMaterialDigest,
   })
+}
+
+function objectiveTailorChildContext() {
+  const jobId = "f47ac10b-58cc-4372-a567-0e02b2c3d479", scope = taskScope()
+  const selection = makeObjectiveTailorCandidateSelection({ scope, sourceGraphRevision: 1,
+    sourceGraphDigest: "a".repeat(64), sourceStatusDigest: "b".repeat(64), analystProofDigest: "c".repeat(64),
+    candidate: { jobId, score: 8.5, materialDigest: `sha256:${"d".repeat(64)}` }, sourceAnalystKeys: ["analyst-1"] })!
+  const witness = bindObjectiveTailorCandidateWitness(selection, {
+    ...objectiveTailorNodeKeysForCandidate(selection.candidateRef)!, admittedRevision: 2,
+  })!
+  return { jobId, context: { objectiveTailorCandidateMode: true, selectedJobPreparation: { jobId }, objectiveTailorCandidateWitness: witness } }
 }
 
 function privateDraftPolicySnapshot(outcome: "deny" | "require_approval" | "require_user_input") {
@@ -377,13 +391,15 @@ function selectedJobExecutor(input: {
   readonly model: ModelAdapter
   readonly pool?: ReturnType<typeof selectedJobPool>
   readonly mailboxReader?: ChildMailboxReader
+  readonly modelRuntimeFactory?: ChildExecutorOptions["modelRuntimeFactory"]
 }) {
   artifactStoreMock.current = input.artifactStore
   artifactStoreMock.draftMaterialAssertion = null
   const pool = input.pool ?? selectedJobPool()
   const executor = createOptionalProductionChildExecutor({
     enabled: true, pool: pool as never, turnStore: input.persistence.engineStore, treeBudget: budget(),
-    authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => input.model,
+    authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
+    modelRuntimeFactory: input.modelRuntimeFactory ?? (() => input.model),
     resumeLoader: async () => undefined,
     ...(input.mailboxReader ? { mailboxReader: input.mailboxReader } : {}),
   })
@@ -1505,6 +1521,34 @@ describe("production child runtime", () => {
     expect(emittedTool(requests[0]!, "cover_letter.draft")).toBe(true)
     expect(emittedTool(requests[0]!, "artifact.version.read")).toBe(false)
     assertNoExternalTools(requests[0]!)
+  })
+
+  it("does not start an Objective Reviewer when its current source binding is unavailable", async () => {
+    const { jobId, context: baseContext } = objectiveTailorChildContext()
+    const context = { ...baseContext, taskGraphDependencyResults: { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [
+      { role: "writer", taskStatus: "completed", result: {
+        schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available",
+        role: "writer", status: "completed", artifactRef: { artifactId: "artifact-1", version: 1,
+          contentHash: `sha256:${"e".repeat(64)}`, sourceDigest: `sha256:${"f".repeat(64)}` },
+      } },
+    ] } }
+    const pool = legacyInitialWriterPool()
+    pool.job.id = jobId
+    const artifacts = new InMemoryArtifactToolStore(), reviewSpy = vi.spyOn(artifacts, "saveReview")
+    const persistence = recordingStore()
+    const model: ModelAdapter = { id: "fixture-model", profile, async *stream() {
+      throw new Error("model must not start without current Objective source")
+    } }
+    const modelRuntimeFactory = vi.fn(() => model)
+    const executor = selectedJobExecutor({ artifactStore: artifacts, persistence, model, pool, modelRuntimeFactory })
+
+    const result = await executor({ lease: { ...jobTask("reviewer", context), id: "objective-tailor-reviewer" } })
+
+    expect(result).toMatchObject({ status: "failed", failureReason: "writer_review_receipt_unavailable" })
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+    expect(reviewSpy).not.toHaveBeenCalled()
+    expect(persistence.writes).toEqual([])
+    expect(pool.transactionQueries).toContain("ROLLBACK")
   })
 
   it("admits a scheduled V2 Writer when its loaded Job matches the persisted material witness", async () => {
