@@ -146,6 +146,22 @@ describe("Objective Tailor TaskGraph append", () => {
     expect(wrongBoundary).toMatchObject({ ok: false, error: { code: "invalid_shape" } })
   })
 
+  it("requires a terminal source prefix and reads an existing marker only as own data", () => {
+    const active = sourceState()
+    const activeSource = { ...active, nodes: active.nodes.map(node => node.key === "analyst-1"
+      ? { ...node, status: "running" as const } : node) }
+    const slots = newSlots(1, 4)
+    expect(append(activeSource, initialPairs(slots), slots)).toMatchObject({ ok: false, error: { code: "invalid_state" } })
+
+    const marked = accepted(sourceState(2), initialPairs(newSlots(1, 1)), newSlots(1, 1))
+    const accessor = Object.defineProperty({ ...marked }, "objectiveTailor", {
+      enumerable: true, get() { throw new Error("marker_getter_must_not_run") },
+    }) as TaskGraphState
+    expect(appendObjectiveTailorTaskGraphProposal(accessor,
+      { expectedRevision: accessor.revision, nodes: [] }, options, marked.objectiveTailor))
+      .toMatchObject({ ok: false, error: { code: "invalid_state" } })
+  })
+
   it("preserves every admitted slot and allows only correction pairs for old slots", () => {
     let state = sourceState()
     const first = newSlots(1, 4)
