@@ -52,7 +52,10 @@ async function candidatePool(client: Queryable, scope: GraphIdentityScope, loade
   const analysts = sourceNodes.filter(node => node.templateId === "analyst" && node.verificationDisposition === "typed"
     && hasScheduledDraftMembershipRequirement(node.verification)
     && loaded.state?.nodes.find(current => current.key === node.key)?.status === "completed")
-  if (analysts.length > MAX_ANALYSTS || sourceNodes.some((node, index) => !isTaskGraphTerminal(loaded.state?.nodes[index]?.status ?? ""))) return undefined
+  if (analysts.length > MAX_ANALYSTS || sourceNodes.some(node => {
+    const status = loaded.state?.nodes.find(current => current.key === node.key)?.status
+    return status === undefined || !isTaskGraphTerminal(status)
+  })) return undefined
   const proofs = new Map<string, ScheduledDraftAnalystProof>()
   for (const node of analysts) {
     const proof = await readScheduledDraftAnalystProof(client, scope, inventory.sourceSnapshot, node)

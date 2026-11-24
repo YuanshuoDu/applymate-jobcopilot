@@ -1,6 +1,7 @@
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type pg from "pg"
-import { parseObjectiveTailorCandidateWitness } from "./objective-tailor-witness.js"
+import { OBJECTIVE_TAILOR_CANDIDATE_WITNESS_SCHEMA, parseObjectiveTailorCandidateWitness } from "./objective-tailor-witness.js"
+import { OBJECTIVE_TAILOR_WAVE_WITNESS_SCHEMA, parseObjectiveTailorWaveCandidateWitness } from "./objective-tailor-wave-witness.js"
 import { loadTaskGraph, type GraphIdentityScope } from "./task-graph-pg-state.js"
 import { loadObjectiveTailorChildSource } from "./objective-tailor-writer-source.js"
 import { loadSelectedJobArtifactContextForChild, type SelectedJobArtifactContextForChild } from "./scheduled-draft-writer-source.js"
@@ -47,7 +48,7 @@ export function projectChildTaskContext(task: SubagentTaskRecord): ChildTaskCont
   let selectedJobId = scheduledJobId
   if (hasObjectiveMode || hasObjectiveWitness) {
     const selection = source && plainRecord(source.selectedJobPreparation)
-    const witness = parseObjectiveTailorCandidateWitness(source?.objectiveTailorCandidateWitness)
+    const witness = parseObjectiveTailorChildWitness(source?.objectiveTailorCandidateWitness)
     if (scheduledJobId || !source || source.objectiveTailorCandidateMode !== true || !hasObjectiveWitness
       || (task.role !== "writer" && task.role !== "reviewer")
       || task.taskType !== (task.role === "writer" ? "cover_letter_draft" : "cover_letter_review")
@@ -121,6 +122,13 @@ function scheduledDraftJobId(source: Record<string, unknown> | undefined): strin
     throw new Error("scheduled_draft_child_context_invalid")
   }
   return selection.jobId
+}
+
+function parseObjectiveTailorChildWitness(value: unknown): { candidate: { jobId: string } } | undefined {
+  const witness = plainRecord(value)
+  if (witness?.schemaVersion === OBJECTIVE_TAILOR_CANDIDATE_WITNESS_SCHEMA) return parseObjectiveTailorCandidateWitness(value)
+  if (witness?.schemaVersion === OBJECTIVE_TAILOR_WAVE_WITNESS_SCHEMA) return parseObjectiveTailorWaveCandidateWitness(value)
+  return undefined
 }
 
 export function hasObjectiveTailorPrivateFields(value: unknown): boolean {

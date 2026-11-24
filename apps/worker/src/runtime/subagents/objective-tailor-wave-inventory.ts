@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 import type pg from "pg"
 import { parseObjectiveTailorGraph, type ObjectiveTailorGraph } from "@jobcopilot/agent-protocol"
 import { isTaskGraphTerminal } from "../planning/task-graph-transition-rules.js"
-import { readScheduledDraftAnalystProof } from "./scheduled-draft-candidate-analyst-proof.js"
+import { readScheduledDraftAnalystProof, type ScheduledDraftAnalystProof } from "./scheduled-draft-candidate-analyst-proof.js"
 import type { GraphIdentityScope, LoadedGraph } from "./task-graph-pg-state.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { makeObjectiveTailorWaveCandidateSelection, objectiveTailorWavePairPlan,
@@ -52,7 +52,7 @@ export async function readObjectiveTailorWaveInventory(
     || parsed.slots.some(slot => slot.correction) || rows.length !== parsed.slots.length * 2) return undefined
   const source = sourceInventory(graph, parsed.sourceNodeCount)
   if (!source) return undefined
-  const occupied: ObjectiveTailorWaveOccupiedSlot[] = [], jobs = new Set<string>(), analysts = new Map<string, Awaited<ReturnType<typeof readScheduledDraftAnalystProof>>>()
+  const occupied: ObjectiveTailorWaveOccupiedSlot[] = [], jobs = new Set<string>(), analysts = new Map<string, ScheduledDraftAnalystProof>()
   for (const slot of parsed.slots) {
     const writer = graph.snapshot.nodes.find(node => node.key === slot.writerNodeKey)
     const reviewer = graph.snapshot.nodes.find(node => node.key === slot.reviewerNodeKey)
@@ -73,14 +73,16 @@ export async function readObjectiveTailorWaveInventory(
       || !matchesBaseContext(writerRow.context, pair.templatesByNodeKey.get(writer.key)?.context)
       || !matchesBaseContext(reviewerRow.context, pair.templatesByNodeKey.get(reviewer.key)?.context)) return undefined
     let proof = analysts.get(witness.sourceAnalystKeys[0])
-    if (proof === undefined) {
+    if (!proof) {
       const sourceNode = source.sourceSnapshot.nodes.find(node => node.key === witness.sourceAnalystKeys[0])
-      proof = sourceNode && await readScheduledDraftAnalystProof(client, scope, source.sourceSnapshot, sourceNode) || null
+      if (!sourceNode) return undefined
+      proof = await readScheduledDraftAnalystProof(client, scope, source.sourceSnapshot, sourceNode) ?? undefined
       if (!proof) return undefined
       analysts.set(witness.sourceAnalystKeys[0], proof)
     }
     const finding = proof.result.findings.filter(item => item.jobId === witness.candidate.jobId)
-    if (sha256(proof.binding) !== witness.analystProofDigest || finding.length !== 1 || finding[0]?.score !== witness.candidate.score) return undefined
+    if (sha256(proof.binding) !== witness.analystProofDigest || finding.length !== 1 || finding[0]?.score !== witness.candidate.score
+      || proof.materialDigests.get(witness.candidate.jobId) !== witness.candidate.materialDigest) return undefined
     jobs.add(witness.candidate.jobId)
     occupied.push({ slotId: slot.slotId, jobId: witness.candidate.jobId, sourceAnalystNodeKey: slot.sourceAnalystNodeKey,
       witness, writerTaskId: writer.taskId, reviewerTaskId: reviewer.taskId })
