@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { ObjectiveApplicationApprovalSetIssueInput } from "./objective-application-approval-set-store.js"
 import { createPgObjectiveApplicationApprovalSetStore } from "./objective-application-approval-set-store.js"
@@ -74,6 +74,15 @@ function fakePool(failOnApprovalInsert = 0, sourceTurnCompleted = true) {
 }
 
 describe("Worker objective application approval-set store", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] })
+    vi.setSystemTime(now)
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   it("issues six private review receipts and one durable group wait on the same client", async () => {
     const fake = fakePool()
     const store = createPgObjectiveApplicationApprovalSetStore(fake.pool, { userId: "owner-1" })
