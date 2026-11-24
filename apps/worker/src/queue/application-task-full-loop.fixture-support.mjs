@@ -211,7 +211,6 @@ function fillTaskDisposition(waitStatus, matchedTaskIds, targetTaskId, taskStatu
     && (ACTIVE_FILL_TASK_STATUSES.has(taskStatus) || ACCEPTED_FILL_TASK_STATUSES.has(taskStatus))) return "pending"
   failModel("application_fill_child_terminal_status_invalid")
 }
-
 function fixtureModel(options = {}) {
   return {
     adapter: {
@@ -233,6 +232,7 @@ function fixtureModel(options = {}) {
           await options.beforeFinalResponse?.(request)
           yield { type: "text_delta", text: "The synthetic application fill reached its durable review boundary." }
           yield { type: "completed", finishReason: "stop" }
+          await options.afterFinalResponse?.(request)
           return
         }
         const nextWaitSequence = requestedCount + 1

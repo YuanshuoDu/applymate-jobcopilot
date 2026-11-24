@@ -99,6 +99,74 @@ function reviewedSourceDiagnosticStatus(value: unknown): string {
   return typeof value === "string" && REVIEWED_SOURCE_DIAGNOSTIC_STATUSES.has(value) ? value : "other"
 }
 
+function boundedPersistedCount(value: number): { count: number; overflow: boolean } {
+  return { count: Math.min(8, Math.max(0, value)), overflow: value > 8 }
+}
+
+function legacyFinalGateMarkerPresence(lines: readonly string[] | undefined) {
+  return {
+    resumed: lines?.includes("LEGACY_FINAL_RESPONSE_GATE_RESUMED") ?? false,
+    modelStreamCompleted: lines?.includes("LEGACY_FINAL_RESPONSE_MODEL_STREAM_COMPLETED") ?? false,
+  }
+}
+
+async function postReleaseFinalGateDiagnostics(turnId: string) {
+  const turn = await testDb.agentTurn.findFirst({ where: { id: turnId, sessionId: ids.session, userId: ids.user }, select: {
+    rootTaskId: true, status: true, finalResponse: true, error: true, leaseOwnerId: true, leaseExpiresAt: true,
+  } })
+  const [applicationTask, attempts] = await Promise.all([
+    gateTaskId ? testDb.applicationTask.findFirst({ where: {
+      id: gateTaskId, userId: ids.user, jobId: ids.job, sessionId: ids.session,
+    }, select: { status: true, checkpoint: true, error: true, workerTaskId: true } }) : null,
+    testDb.submissionAttempt.findMany({ where: { userId: ids.user, jobId: ids.job }, orderBy: { createdAt: "desc" }, take: 8,
+      select: { state: true, errorCode: true } }),
+  ])
+  const rootTaskId = turn?.rootTaskId
+  const root = rootTaskId ? await testDb.subAgentTask.findFirst({ where: {
+    id: rootTaskId, rootTaskId, sessionId: ids.session, turnId, parentTaskId: null, role: "orchestrator", taskType: "root",
+  }, select: { id: true, status: true } }) : null
+  const [lastStep, modelCompletionCount, finalItemCount, terminalEventCount] = root ? await Promise.all([
+    testDb.agentStep.findFirst({ where: { sessionId: ids.session, turnId, taskId: root.id }, orderBy: { ordinal: "desc" },
+      select: { ordinal: true, status: true, finishReason: true, errorCode: true } }),
+    testDb.agentEvent.count({ where: { sessionId: ids.session, turnId, taskId: root.id, type: "model.completed" } }),
+    testDb.agentItem.count({ where: { sessionId: ids.session, turnId, taskId: root.id, phase: "final_answer", status: "completed" } }),
+    testDb.agentEvent.count({ where: { sessionId: ids.session, turnId, taskId: root.id,
+      type: { in: ["turn.completed", "turn.failed", "turn.interrupted"] } } }),
+  ]) : [null, 0, 0, 0] as const
+  const finishReason = lastStep?.finishReason
+  const safeFinishReason = finishReason === "stop" || finishReason === "tool_calls" || finishReason === "length"
+    ? finishReason : finishReason == null ? null : "other"
+  return {
+    workerMarkers: legacyFinalGateMarkerPresence(worker?.lines),
+    applicationTask: applicationTask ? {
+      status: reviewedFillDiagnosticValue(applicationTask.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+      checkpoint: reviewedFillDiagnosticValue(applicationTask.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS),
+      errorPresent: Boolean(applicationTask.error), workerTaskPresent: Boolean(applicationTask.workerTaskId),
+    } : { present: false },
+    submissionAttempts: {
+      count: boundedPersistedCount(attempts.length),
+      states: attempts.map(attempt => ({
+        state: attempt.state === "reserved" || attempt.state === "submitted" || attempt.state === "failed" ? attempt.state : "other",
+        errorPresent: Boolean(attempt.errorCode),
+      })),
+    },
+    turn: turn ? {
+      status: reviewedSourceDiagnosticStatus(turn.status), finalResponsePresent: Boolean(turn.finalResponse),
+      errorPresent: Boolean(turn.error), leaseActive: Boolean(turn.leaseOwnerId && turn.leaseExpiresAt && turn.leaseExpiresAt > new Date()),
+    } : { present: false },
+    root: root ? { present: true, status: reviewedSourceDiagnosticStatus(root.status) } : { present: false },
+    lastStep: lastStep ? {
+      ordinal: Number.isSafeInteger(lastStep.ordinal) ? Math.max(0, Math.min(999, lastStep.ordinal)) : null,
+      status: reviewedSourceDiagnosticStatus(lastStep.status), finishReason: safeFinishReason, errorPresent: Boolean(lastStep.errorCode),
+    } : { present: false },
+    persisted: {
+      modelCompletionEvents: boundedPersistedCount(modelCompletionCount),
+      finalAnswerItems: boundedPersistedCount(finalItemCount),
+      terminalEvents: boundedPersistedCount(terminalEventCount),
+    },
+  }
+}
+
 function reviewedSourceDiagnosticSummary(
   turn: { status: unknown; error: unknown } | null,
   tasks: readonly { role: unknown; status: unknown; failureReason: unknown }[],
@@ -573,6 +641,24 @@ describe("ApplicationTask submission attempt diagnostic classifier", () => {
     expect(diagnosticSubmissionAttemptErrorCode(undefined)).toBeNull()
     expect(diagnosticSubmissionAttemptErrorCode("unlisted_attempt_detail")).toBe("other")
     expect(diagnosticSubmissionAttemptErrorCode({ message: "raw error detail" })).toBe("other")
+  })
+})
+
+describe("legacy final gate bounded diagnostics", () => {
+  it("recognizes only exact fixed post-release markers", () => {
+    expect(legacyFinalGateMarkerPresence([
+      "LEGACY_FINAL_RESPONSE_GATE_RESUMED",
+      "LEGACY_FINAL_RESPONSE_MODEL_STREAM_COMPLETED turnId=private",
+    ])).toEqual({ resumed: true, modelStreamCompleted: false })
+    expect(legacyFinalGateMarkerPresence([
+      "LEGACY_FINAL_RESPONSE_GATE_RESUMED",
+      "LEGACY_FINAL_RESPONSE_MODEL_STREAM_COMPLETED",
+    ])).toEqual({ resumed: true, modelStreamCompleted: true })
+  })
+
+  it("caps persisted counters and reports overflow without exposing records", () => {
+    expect(boundedPersistedCount(11)).toEqual({ count: 8, overflow: true })
+    expect(boundedPersistedCount(3)).toEqual({ count: 3, overflow: false })
   })
 })
 
@@ -1260,7 +1346,8 @@ const REVIEWED_FILL_DIAGNOSTIC_STATUSES = new Set([
 ])
 const REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS = new Set([
   "materials_ready", "taskgraph_fill_queued", "browser_active", "form_answer_required", "fill_outcome_uncertain",
-  "form_filled", "submission_authorized", "queue_retry", "turn_stopped_before_submit", "fill_prestart_failed",
+  "form_filled", "submission_authorized", "submission_request_started", "submission_uncertain", "submission_verified",
+  "queue_retry", "turn_stopped_before_submit", "fill_prestart_failed",
 ])
 
 function reviewedFillDiagnosticValue(value: unknown, allowed: ReadonlySet<string>): string {
@@ -1421,10 +1508,13 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
   }, 60_000)
 
   it("runs Gate → authenticated form answer → scoped submit approval → durable BullMQ/Worker with uncertain-submit no-replay", async () => {
+    let postReleaseDiagnosticTurnId: string | null = null
     onTestFailed(async () => {
       let snapshot: unknown
       try {
-        if (dbConnected) {
+        if (dbConnected && postReleaseDiagnosticTurnId) {
+          snapshot = await postReleaseFinalGateDiagnostics(postReleaseDiagnosticTurnId)
+        } else if (dbConnected) {
           const current = gateTaskId
             ? await testDb.applicationTask.findUnique({ where: { id: gateTaskId } }) as ApplicationTaskRow | null
             : null
@@ -1750,7 +1840,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       sessionId: ids.session, fillTurnId: successorTurnId, receiptId: submitApproval.id, operation: "submit" })
     const successorRootTaskId = await expectLegacyFillTurnLeased(successorTurnId)
     await releaseLegacyFinalResponseGate()
+    postReleaseDiagnosticTurnId = successorTurnId
     expect((await waitForAgentTurnTerminal(successorTurnId, 30_000)).status).toBe("completed")
+    postReleaseDiagnosticTurnId = null
     expect(await testDb.agentTurn.findUniqueOrThrow({ where: { id: successorTurnId }, select: {
       rootTaskId: true, status: true, completedAt: true, leaseOwnerId: true, leaseExpiresAt: true,
     } })).toMatchObject({

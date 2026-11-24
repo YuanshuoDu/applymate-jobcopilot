@@ -21,11 +21,12 @@ function armLegacyFinalResponseGate(turnId) {
   if (typeof turnId !== "string" || !turnId || turnId.length > 256 || turnId.trim() !== turnId || legacyFinalResponseGate) throw new Error("legacy_final_response_gate_arm_invalid")
   let release
   const released = new Promise(resolve => { release = resolve })
-  legacyFinalResponseGate = { turnId, release, released, claimed: false }
+  legacyFinalResponseGate = { turnId, release, released, claimed: false, acknowledged: false, resumed: false, streamCompleted: false }
 }
 function releaseLegacyFinalResponseGate(turnId) {
   const gate = legacyFinalResponseGate
   if (!gate || gate.turnId !== turnId) return false
+  gate.acknowledged = true
   gate.release()
   return true
 }
@@ -35,11 +36,15 @@ async function holdLegacyFinalResponse(turnId) {
   gate.claimed = true
   say(`LEGACY_FINAL_RESPONSE_GATE_REACHED turnId=${turnId}`)
   let timer
-  await Promise.race([gate.released, new Promise(resolve => {
-    timer = setTimeout(resolve, 45_000)
+  const outcome = await Promise.race([gate.released.then(() => "released"), new Promise(resolve => {
+    timer = setTimeout(() => resolve("timeout"), 45_000)
     timer.unref?.()
   })])
   if (timer) clearTimeout(timer)
+  if (outcome === "released" && gate.acknowledged) {
+    gate.resumed = true
+    say("LEGACY_FINAL_RESPONSE_GATE_RESUMED")
+  }
   gate.release()
 }
 const tls = async () => {
@@ -374,7 +379,15 @@ async function startWorker() {
       ? createOptionalProductionChildExecutor({ ...options, authorizeUsage, modelRuntimeFactory: ({ task }) => selectedModelRuntime(task), ...(stageObserver ? { applicationFillStageObserver: stageObserver } : {}) }) : undefined),
     createCanonicalTurnRuntime: (runtimePool, productionOptions) => createCanonicalTurnRuntime(runtimePool, {
       ...productionOptions, ...taskGraphTemplatesModule.taskGraphRuntimeOptions(taskGraphCommandPort),
-      modelRuntimeFactory: ({ state }) => state.goal.includes(REVIEWED_SOURCE_GOAL) ? reviewedRootModel() : fixtureModel({ beforeFinalResponse: request => holdLegacyFinalResponse(request.metadata.turnId) }), authorizeUsage,
+      modelRuntimeFactory: ({ state }) => state.goal.includes(REVIEWED_SOURCE_GOAL) ? reviewedRootModel() : fixtureModel({
+        beforeFinalResponse: request => holdLegacyFinalResponse(request.metadata.turnId),
+        afterFinalResponse: request => {
+          const gate = legacyFinalResponseGate
+          if (gate?.turnId !== request.metadata.turnId || !gate.resumed || gate.streamCompleted) return
+          gate.streamCompleted = true
+          say("LEGACY_FINAL_RESPONSE_MODEL_STREAM_COMPLETED")
+        },
+      }), authorizeUsage,
     }),
     createWorkerUsageAuthorizer: () => authorizeUsage,
     createCanonicalExecutionProjection: () => noOpProjection,
