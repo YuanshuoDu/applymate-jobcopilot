@@ -1412,6 +1412,16 @@ async function waitForReviewedFillBridgeRecoveryAttempts(outboxId: string, timeo
   return attempts
 }
 
+type SelectedJobFullLoopPhase = "cleanup_started" | "cleanup_completed" | "setup_started" | "setup_ready" | "source_started"
+  | "source_completed" | "review_start_started" | "review_turn_created" | "approval_wait_started" | "approval_observed"
+  | "approval_decision_started" | "approval_decision_accepted" | "review_terminal_wait_started" | "review_turn_completed"
+  | "handoff_retry_wait_started" | "handoff_published" | "fill_turn_wait_started" | "fill_turn_created"
+  | "fill_form_wait_started" | "fill_form_filled" | "final_checks_started" | "final_checks_completed"
+
+function selectedJobFullLoopPhase(phase: SelectedJobFullLoopPhase): void {
+  process.stdout.write(`SELECTED_JOB_FULL_LOOP_PHASE ${phase}\n`)
+}
+
 async function withObjectiveResumeAmbientAuth<T>(token: string, operation: () => Promise<T>): Promise<T> {
   const previous = objectiveResumeAmbientAuth.authorization
   objectiveResumeAmbientAuth.authorization = `Bearer ${token}`
@@ -1989,6 +1999,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
   }, 120_000)
 
   afterAll(async () => {
+    selectedJobFullLoopPhase("cleanup_started")
     let cleanupError: unknown
     if (objectiveFillDeliveryHold) releaseObjectiveFillDeliveryHold(objectiveFillDeliveryHold)
     try { await releaseLegacyFinalResponseGate() } catch (error) { cleanupError = error }
@@ -2012,6 +2023,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     }
     if (priorApplicationFillTaskGraph === undefined) delete process.env.ENABLE_APPLICATION_FILL_TASKGRAPH
     else process.env.ENABLE_APPLICATION_FILL_TASKGRAPH = priorApplicationFillTaskGraph
+    selectedJobFullLoopPhase("cleanup_completed")
     if (cleanupError) throw cleanupError
   }, 60_000)
 
@@ -2458,9 +2470,13 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
   }, 300_000)
 
   it("runs selected-job Writer → Reviewer → user approval → the same submit-disabled Fill Turn", async () => {
+    selectedJobFullLoopPhase("setup_started")
     const scenario = await createReviewedSourceScenario("positive", "Synthetic source description for reviewed fill integration.")
     const token = await signedBearer(ids.user)
+    selectedJobFullLoopPhase("setup_ready")
+    selectedJobFullLoopPhase("source_started")
     const source = await startSelectedJobSource({ ...scenario, token, key: `reviewed-source-positive-${runId}` })
+    selectedJobFullLoopPhase("source_completed")
     const sourceRootTaskId = source.turn.rootTaskId
     if (typeof sourceRootTaskId !== "string" || !sourceRootTaskId) throw new Error("reviewed_source_root_missing")
     const sourceGraph = await testDb.agentItem.findFirstOrThrow({ where: {
@@ -2513,6 +2529,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(exactReviewerReceipt).toBe(true)
 
     const reviewKey = `reviewed-review-positive-${runId}`
+    selectedJobFullLoopPhase("review_start_started")
     const firstRequest = await startReviewedApplicationReview({ ...scenario, sourceTurnId: source.turnId, token, key: reviewKey })
     expect(firstRequest.response.status).toBe(202)
     const reviewTurnValue = firstRequest.body.turnId
@@ -2521,9 +2538,12 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const duplicateRequest = await startReviewedApplicationReview({ ...scenario, sourceTurnId: source.turnId, token, key: reviewKey })
     expect([200, 202]).toContain(duplicateRequest.response.status)
     expect(duplicateRequest.body.turnId).toBe(reviewTurnId)
+    selectedJobFullLoopPhase("review_turn_created")
 
     const approvalId = `reviewed-application-review:${String(reviewTurnId)}`
+    selectedJobFullLoopPhase("approval_wait_started")
     const approval = await waitForReviewedApproval(approvalId)
+    selectedJobFullLoopPhase("approval_observed")
     expect(approval).toMatchObject({ id: approvalId, userId: ids.user, sessionId: scenario.sessionId,
       turnId: reviewTurnId, type: "review_application", status: "pending", jobId: scenario.jobId })
     const applicationTaskId = approval.taskId
@@ -2559,6 +2579,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const { POST: decideApprovalWait } = await import("@/app/api/agent/sessions/[id]/approvals/[approvalId]/route")
     const reviewedFillTraceOffset = worker?.lines.length ?? 0
     const reviewedGetBaseline = (await requestFixtureStats()).reviewedGetCount
+    selectedJobFullLoopPhase("approval_decision_started")
     const decision = await decideApprovalWait(apiRequest(
       `/api/agent/sessions/${scenario.sessionId}/approvals/${approvalId}`, token, "POST", {
         clientMessageId: decisionClientMessageId, expectedTurnId: reviewTurnId,
@@ -2567,7 +2588,10 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       params: Promise.resolve({ id: scenario.sessionId, approvalId }),
     })
     expect(decision.status).toBe(202)
+    selectedJobFullLoopPhase("approval_decision_accepted")
+    selectedJobFullLoopPhase("review_terminal_wait_started")
     expect((await waitForAgentTurnTerminal(String(reviewTurnId))).status).toBe("completed")
+    selectedJobFullLoopPhase("review_turn_completed")
     expect(await testDb.agentApproval.findUniqueOrThrow({ where: { id: approvalId }, select: { status: true } })).toEqual({ status: "approved" })
     expect(await testDb.agentItem.findUniqueOrThrow({ where: { id: waitId }, select: { status: true } })).toEqual({ status: "completed" })
 
@@ -2590,6 +2614,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(handoffPayload).toEqual({ schemaVersion: "agent-harness.v2.reviewed-fill-handoff.v1", userId: ids.user,
       sessionId: scenario.sessionId, applicationTaskId, approvalId, predecessorTurnId: reviewTurnId })
 
+    selectedJobFullLoopPhase("handoff_retry_wait_started")
     const bridgeAttempts = await waitForReviewedFillBridgeRecoveryAttempts(handoff.id)
     expect(bridgeAttempts.every(attempt => attempt.outboxId === handoff.id)).toBe(true)
     const deferredAttempts = bridgeAttempts.filter(attempt => attempt.acknowledgement === "deferred")
@@ -2603,7 +2628,10 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const publishedHandoff = await waitForOutboxPublished(handoff.id)
     expect(publishedHandoff.publishedAt).toBeInstanceOf(Date)
     expect(publishedHandoff.attemptCount).toBe(1)
+    selectedJobFullLoopPhase("handoff_published")
+    selectedJobFullLoopPhase("fill_turn_wait_started")
     const firstFill = await waitForReviewedApplicationTask(scenario.jobId, task => Boolean(task.fillTurnId))
+    selectedJobFullLoopPhase("fill_turn_created")
     const fillTurnId = firstFill.fillTurnId!
     const replayedTask = await testDb.applicationTask.findUniqueOrThrow({ where: { id: applicationTaskId! } })
     expect(replayedTask.fillTurnId).toBe(fillTurnId)
@@ -2617,14 +2645,17 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
 
     let completedFill: ApplicationTaskRow
     try {
+      selectedJobFullLoopPhase("fill_form_wait_started")
       completedFill = await waitForReviewedApplicationTask(scenario.jobId,
         task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", 180_000)
+      selectedJobFullLoopPhase("fill_form_filled")
     } catch {
       const snapshot = await reviewedFillTimeoutSnapshot({ sessionId: scenario.sessionId, jobId: scenario.jobId,
         applicationTaskId: applicationTaskId!, fillTurnId, traceOffset: reviewedFillTraceOffset, reviewedGetBaseline })
       throw new Error(`Reviewed fill timeout snapshot ${JSON.stringify(snapshot)}`)
     }
     expect(completedFill.fillTurnId).toBe(fillTurnId)
+    selectedJobFullLoopPhase("final_checks_started")
     const reviewedBrowserEvents = await testDb.applicationTaskEvent.findMany({ where: {
       taskId: applicationTaskId!, type: "reviewed_application_fill_browser_started", actor: "worker",
     }, select: { type: true, actor: true, data: true } })
@@ -2686,9 +2717,10 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(await testDb.agentOutbox.count({ where: { aggregateId: scenario.sessionId, topic: "application.submit.dispatch" } })).toBe(0)
     expect((await submitQueueJobs()).filter(job => jsonString(job.data, "applicationTaskId") === applicationTaskId)).toHaveLength(0)
     expect(fixtureStats.reviewedSubmitCount).toBe(0)
+    selectedJobFullLoopPhase("final_checks_completed")
   }, 300_000)
 
-  it("approves only a corrected Objective slot and fills its exact material without submission", async () => {
+  it("fills the corrected Objective slot without submission, then separately approves and verifies synthetic submission on the same Turn", async () => {
     const sessionId = `full-loop-objective-session-${runId}`
     const suffix = `full-loop-objective-${runId}`
     const redis = await applyQueue!.client
