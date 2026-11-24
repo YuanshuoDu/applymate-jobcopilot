@@ -1,14 +1,14 @@
 import type { PoolClient } from "pg"
-import {
-  bindReviewedApplicationSubmissionMaterial, hashReviewedApplicationMaterialProof,
-  parseObjectiveReviewedFillSource,
-  type LegacyApplicationSubmissionMaterial,
-  type ObjectiveReviewedFillSource,
-  type ReviewedApplicationMaterialProof, type ReviewedApplicationSubmissionMaterial,
-} from "@jobcopilot/shared"
+import { bindReviewedApplicationSubmissionMaterial, hashReviewedApplicationMaterialProof, buildObjectiveApplicationSubmissionManifest,
+  hashObjectiveApplicationSubmissionMaterial, parseObjectiveApplicationSubmissionMaterial, parseObjectiveReviewedFillSource,
+  type LegacyApplicationSubmissionMaterial, type ObjectiveApplicationSubmissionManifest, type ObjectiveApplicationSubmissionMaterial,
+  type ObjectiveReviewedFillSource, type ReviewedApplicationMaterialProof, type ReviewedApplicationSubmissionMaterial } from "@jobcopilot/shared"
 import type { SelectedJobReviewedArtifact } from "../runtime/selected-job-reviewed-artifact-read.js"
 import type { SubagentLease } from "../runtime/subagents/types.js"
 import { OBJECTIVE_REVIEWED_FILL_BROWSER_START_SCHEMA, type ReviewedApplicationFillSelector } from "../runtime/reviewed-application-fill-binding.js"
+import { hashArtifactContent } from "../runtime/subagents/artifact-adapters.js"
+import { readObjectiveSubmissionManifestWithClient, recordObjectiveSubmissionManifestWithClient,
+  type ObjectiveSubmissionManifestScope } from "./objective-submission-manifest-event.js"
 
 const READBACK_SCHEMA = "agent-harness.v2.reviewed-application-fill-readback.v1"
 const BINDING_SCHEMA = "agent-harness.v2.reviewed-application-fill-browser-start.v1"
@@ -32,6 +32,8 @@ export type ObjectiveReviewedApplicationFillReadback = Readonly<{
   sourceTurnId: string; reviewedCoverLetterHash: string
 }>
 export type ApplicationFillCompletionSelector = ReviewedApplicationFillSelector
+export type ApplicationFillCompletionMaterial = ReviewedApplicationSubmissionMaterial & Readonly<{ objectiveSubmissionMaterial?: ObjectiveApplicationSubmissionMaterial }>
+export type ObjectiveSubmissionRecord = Readonly<{ manifest: ObjectiveApplicationSubmissionManifest; hash: string; materialHash: string }>
 
 /** Minted only after the actual browser field has been read back and matched. */
 export async function createReviewedApplicationFillReadback(
@@ -66,7 +68,7 @@ export async function readObjectiveReviewedApplicationFillCompletionMaterial(
   client: Queryable,
   input: { lease: SubagentLease; applicationTaskId: string; jobId: string; source: ObjectiveReviewedFillSource; turnInput: unknown
     legacyMaterial: LegacyApplicationSubmissionMaterial; readback?: unknown; requireCurrentAttempt: boolean },
-): Promise<ReviewedApplicationSubmissionMaterial | null> {
+): Promise<ApplicationFillCompletionMaterial | null> {
   const { lease } = input
   const selected = parseObjectiveReviewedFillSource(input.turnInput)
   if (!lease.turnId || !validText(input.applicationTaskId) || !validText(input.jobId) || !selected
@@ -86,7 +88,41 @@ export async function readObjectiveReviewedApplicationFillCompletionMaterial(
   [input.applicationTaskId, lease.turnId])
   if (events.rows.length !== 1 || !sameObjectiveBinding(events.rows[0]!, lease, input, selected, proof, input.requireCurrentAttempt)) return null
   if (input.requireCurrentAttempt && !sameObjectiveReadback(input.readback, lease, input, selected, proof, material)) return null
-  return material
+  const objectiveSubmissionMaterial = parseObjectiveApplicationSubmissionMaterial({ schemaVersion: "agent-harness.v2.objective-application-submit-material.v1",
+    applicationTaskId: input.applicationTaskId, jobId: input.jobId, resumeId: evidence.resumeWitness.resumeId,
+    coverLetterId: input.legacyMaterial.coverLetterId, reviewedCoverLetterHash: material.reviewedCoverLetterHash, objectiveSource: selected })
+  if (!objectiveSubmissionMaterial || objectiveSubmissionMaterial.resumeId !== input.legacyMaterial.resumeId) return null
+  return { ...material, objectiveSubmissionMaterial }
+}
+
+/** Records the immutable V3 manifest as a private event in the caller's completion transaction. */
+export async function createObjectiveSubmissionRecordWithClient(client: Queryable, input: {
+  scope: ObjectiveSubmissionManifestScope
+  material: ObjectiveApplicationSubmissionMaterial
+  answersHash: string
+}): Promise<ObjectiveSubmissionRecord> {
+  const manifest = buildObjectiveApplicationSubmissionManifest(input.material, input.answersHash)
+  const materialHash = await hashObjectiveApplicationSubmissionMaterial(input.material)
+  if (!manifest || !materialHash) throw new Error("Objective submission manifest is invalid")
+  const hash = hashArtifactContent(manifest)
+  const recorded = await recordObjectiveSubmissionManifestWithClient(client, input.scope, manifest)
+  if (!recorded || recorded.hash !== hash) throw new Error("Objective submission manifest event conflicts")
+  return { manifest, hash, materialHash }
+}
+
+/** Requires the same V3 manifest event on replay; a V1/V2 artifact cannot satisfy this path. */
+export async function readObjectiveSubmissionRecordForReplayWithClient(client: Queryable, input: {
+  scope: ObjectiveSubmissionManifestScope
+  material: ObjectiveApplicationSubmissionMaterial
+  answersHash: string
+}): Promise<ObjectiveSubmissionRecord | null> {
+  const manifest = buildObjectiveApplicationSubmissionManifest(input.material, input.answersHash)
+  const materialHash = await hashObjectiveApplicationSubmissionMaterial(input.material)
+  if (!manifest || !materialHash) return null
+  const hash = hashArtifactContent(manifest)
+  const stored = await readObjectiveSubmissionManifestWithClient(client, input.scope)
+  if (!stored || stored.hash !== hash || hashArtifactContent(stored.manifest) !== hash) return null
+  return { manifest, hash, materialHash }
 }
 
 /** Rebinds the browser-start event and current source; no historical lease is recreated. */
@@ -116,7 +152,7 @@ export async function readApplicationFillCompletionMaterial(client: Queryable, i
   selector: ApplicationFillCompletionSelector; lease: SubagentLease; applicationTaskId: string; jobId: string; turnInput: unknown
   legacyMaterial: LegacyApplicationSubmissionMaterial; readback?: ReviewedApplicationFillReadback | ObjectiveReviewedApplicationFillReadback
   requireCurrentAttempt: boolean
-}): Promise<ReviewedApplicationSubmissionMaterial | null> {
+}): Promise<ApplicationFillCompletionMaterial | null> {
   if (input.selector.kind === "selected") return readReviewedApplicationFillCompletionMaterial(client, {
     lease: input.lease, applicationTaskId: input.applicationTaskId, jobId: input.jobId,
     sourceTurnId: input.selector.sourceTurnId, legacyMaterial: input.legacyMaterial,

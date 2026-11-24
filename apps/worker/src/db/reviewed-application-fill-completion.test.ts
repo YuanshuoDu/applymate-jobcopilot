@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import type { ObjectiveReviewedFillSource } from "@jobcopilot/shared"
+import { buildObjectiveApplicationResumeWitness, type ObjectiveReviewedFillSource } from "@jobcopilot/shared"
 import type { PoolClient } from "pg"
 import type { SubagentLease } from "../runtime/subagents/types.js"
 import {
@@ -24,6 +24,9 @@ const lease = {
   context: {}, expectedOutputSchema: {}, result: null, failureReason: null, budgetSnapshot: {}, toolPolicySnapshot: {},
 } satisfies SubagentLease
 const legacyMaterial = { applicationTaskId: "application-a", jobId: "job-a", resumeId: "resume-a", coverLetterId: null }
+const resumeWitness = buildObjectiveApplicationResumeWitness({ userId: "user-a", jobId: "job-a", resumeId: "resume-a",
+  finalResumeAssignmentRevision: 3, materialRevision: 2, material: { name: "Tailored", content: { basics: {} }, templateId: "modern",
+    templateOptions: {}, kind: "adapted", targetJobId: "job-a", parentResumeId: "resume-base", basicsDetached: false } })!
 const objectiveSource = {
   schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v1",
   approvalId: `objective-review:objective-review-${"a".repeat(40)}:1`,
@@ -61,7 +64,7 @@ function objectiveClient(rows = [objectiveEvent()]) {
 
 beforeEach(() => {
   source.read.mockResolvedValue(proof)
-  source.objectiveRead.mockResolvedValue({ source: objectiveSource, reviewedArtifact: proof })
+  source.objectiveRead.mockResolvedValue({ source: objectiveSource, reviewedArtifact: proof, resumeWitness, resumeContent: { basics: {} } })
 })
 
 describe("reviewed application fill completion proof", () => {
@@ -119,7 +122,8 @@ describe("reviewed application fill completion proof", () => {
       lease, applicationTaskId: "application-a", jobId: "job-a", source: objectiveSource,
       turnInput: { reviewedApplicationMaterialSource: objectiveSource }, legacyMaterial, readback, requireCurrentAttempt: true,
     })
-    expect(material).toMatchObject({ ...legacyMaterial, reviewedCoverLetterHash: expect.stringMatching(/^[a-f0-9]{64}$/) })
+    expect(material).toMatchObject({ ...legacyMaterial, reviewedCoverLetterHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      objectiveSubmissionMaterial: { applicationTaskId: "application-a", jobId: "job-a", resumeId: "resume-a", objectiveSource } })
     expect(source.objectiveRead).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ phase: "completion" }))
     await expect(readObjectiveReviewedApplicationFillCompletionMaterial(objectiveClient([objectiveEvent({ ...objectiveSource, approvalId: "other" })]), {
       lease, applicationTaskId: "application-a", jobId: "job-a", source: objectiveSource,

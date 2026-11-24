@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import { hashApprovalScope } from "@jobcopilot/agent-protocol"
-import { hashAgentReceiptValue, hashApplicationSubmissionMaterial } from "@jobcopilot/shared"
+import { buildObjectiveApplicationSubmissionManifest, hashAgentReceiptValue, hashApplicationSubmissionMaterial,
+  hashObjectiveApplicationSubmissionMaterial, type ObjectiveApplicationSubmissionMaterial } from "@jobcopilot/shared"
 import { protocolScope, type ApprovalScopeInput } from "../runtime/approval/types.js"
 import type { SelectedJobReviewedArtifact } from "../runtime/selected-job-reviewed-artifact-read.js"
 import { hashArtifactContent } from "../runtime/subagents/artifact-adapters.js"
@@ -11,8 +12,11 @@ import { acknowledgeApplicationFillCancellation, completeApplicationFillForRevie
 import { createObjectiveReviewedApplicationFillReadback, createReviewedApplicationFillReadback } from "./reviewed-application-fill-completion.js"
 
 const reviewedReader = vi.hoisted(() => ({ read: vi.fn(), objectiveRead: vi.fn() }))
+const objectiveManifestEvents = vi.hoisted(() => ({ read: vi.fn(), record: vi.fn() }))
 vi.mock("../runtime/selected-job-reviewed-artifact-read.js", () => ({ readSelectedJobReviewedArtifactWithClient: reviewedReader.read }))
 vi.mock("../runtime/objective-reviewed-application-fill-read.js", () => ({ readObjectiveReviewedApplicationFillSource: reviewedReader.objectiveRead }))
+vi.mock("./objective-submission-manifest-event.js", () => ({ readObjectiveSubmissionManifestWithClient: objectiveManifestEvents.read,
+  recordObjectiveSubmissionManifestWithClient: objectiveManifestEvents.record }))
 
 type FillTaskFixture = { id: string; jobId: string; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown }
 type ApprovalMismatch = "turn" | "user" | "session" | "task" | "legacy_child" | "job" | "scope" | "payload" | "consumed"
@@ -56,12 +60,16 @@ async function artifactFixture(task: FillTaskFixture, userId: string, mismatch =
 
 async function approvalFixture(
   task: FillTaskFixture, status: string, revision: number, mismatch?: ApprovalMismatch, reviewedCoverLetterHash?: string,
+  objectiveMaterial?: ObjectiveApplicationSubmissionMaterial,
 ): Promise<ApprovalFixtureRow> {
   const artifact = await artifactFixture(task, "user-a", false, reviewedCoverLetterHash)
+  const objectiveManifest = objectiveMaterial && buildObjectiveApplicationSubmissionManifest(objectiveMaterial, artifact.answersHash)
+  const resourceHash = objectiveManifest ? hashArtifactContent(objectiveManifest) : artifact.hash
+  const materialHash = objectiveMaterial ? await hashObjectiveApplicationSubmissionMaterial(objectiveMaterial) : artifact.materialHash
   const row = {
     id: `application-fill:${task.id}:turn-a`, userId: "user-a", sessionId: "session-a", turnId: "turn-a", jobId: task.jobId,
     type: "submit_application", taskId: task.id, status, toolCallId: `application-submit:${task.id}`,
-    payload: artifact.payload, resourceHash: artifact.hash.slice("sha256:".length), materialHash: artifact.materialHash, answersHash: artifact.answersHash,
+    payload: artifact.payload, resourceHash: resourceHash.slice("sha256:".length), materialHash, answersHash: artifact.answersHash,
     nonceHash: "d".repeat(64), revision, expiresAt: new Date("2099-11-01T00:00:00.000Z"), scopeHash: "",
   }
   if (mismatch === "turn") row.turnId = "foreign-turn"
@@ -86,6 +94,7 @@ function fixture(options: {
   subtaskLive?: boolean; subtaskOwnerUserId?: string; subtaskOwner?: string; subtaskAttempt?: number; subtaskInterrupted?: boolean; appStatus?: string; appCheckpoint?: string; appTurnId?: string; sessionStatus?: string
   turnStatus?: string; turnMissing?: boolean; turnInput?: unknown; turnHintInput?: unknown; browserStartEvents?: unknown[]; reviewedCoverLetterHash?: string
   completionApprovalStatus?: string; approvalMismatch?: ApprovalMismatch; artifactMismatch?: boolean; initialQuestion?: unknown
+  objectiveSubmissionMaterial?: ObjectiveApplicationSubmissionMaterial
 } = {}) {
   const lease = {
     id: "filler-task", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a", parentTaskId: "root-a",
@@ -146,7 +155,7 @@ function fixture(options: {
         rows: [await artifactFixture(task, lease.userId, options.artifactMismatch, options.reviewedCoverLetterHash)], rowCount: 1,
       }
       if (sql.includes('FROM "agent_approvals"')) return options.completionApprovalStatus
-        ? { rows: [await approvalFixture(task, options.completionApprovalStatus, turn.revision - 1, options.approvalMismatch, options.reviewedCoverLetterHash)], rowCount: 1 }
+        ? { rows: [await approvalFixture(task, options.completionApprovalStatus, turn.revision - 1, options.approvalMismatch, options.reviewedCoverLetterHash, options.objectiveSubmissionMaterial)], rowCount: 1 }
         : { rows: [], rowCount: 0 }
       if (sql.includes('SELECT "id" FROM "Job"')) return { rows: [{ id: "job-a" }], rowCount: 1 }
       if (sql.includes("UPDATE \"agent_turns\" SET \"status\" = 'waiting_for_approval'")) {
@@ -188,7 +197,10 @@ function objectiveBrowserStart(lease: SubagentLease) {
 
 beforeEach(() => {
   reviewedReader.read.mockResolvedValue(reviewedSource)
-  reviewedReader.objectiveRead.mockResolvedValue({ source: objectiveSource, reviewedArtifact: reviewedSource })
+  reviewedReader.objectiveRead.mockResolvedValue({ source: objectiveSource, reviewedArtifact: reviewedSource,
+    resumeWitness: { resumeId: "resume-a" }, resumeContent: { basics: {} } })
+  objectiveManifestEvents.record.mockImplementation(async (_client, _scope, manifest) => ({ manifest, hash: hashArtifactContent(manifest) }))
+  objectiveManifestEvents.read.mockResolvedValue(null)
 })
 
 describe("ApplicationTask fill completion", () => {
@@ -196,17 +208,67 @@ describe("ApplicationTask fill completion", () => {
     const seed = fixture(), readback = await createObjectiveReviewedApplicationFillReadback(seed.lease, seed.task.id, objectiveSource, reviewedSource)
     const marker = { reviewedApplicationMaterialSource: objectiveSource }
     const test = fixture({ turnInput: marker, browserStartEvents: [objectiveBrowserStart(seed.lease)], reviewedCoverLetterHash: readback!.reviewedCoverLetterHash })
+    const objectiveMaterial: ObjectiveApplicationSubmissionMaterial = { schemaVersion: "agent-harness.v2.objective-application-submit-material.v1",
+      applicationTaskId: test.task.id, jobId: test.task.jobId, resumeId: "resume-a", coverLetterId: null,
+      reviewedCoverLetterHash: readback!.reviewedCoverLetterHash, objectiveSource }
+    const manifestExpected = buildObjectiveApplicationSubmissionManifest(objectiveMaterial, await hashAgentReceiptValue("answers", test.task.confirmedAnswers))
 
     await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, reviewedFillReadback: readback ?? undefined })).resolves.toEqual({ status: "completed" })
 
     expect(reviewedReader.objectiveRead).toHaveBeenCalledWith(test.client, expect.objectContaining({ phase: "completion", turnInput: marker }))
-    const manifest = test.calls.find(call => call.sql.includes('INSERT INTO "agent_artifact"'))
     const submitApproval = test.calls.find(call => call.sql.includes('INSERT INTO "agent_approvals"'))
-    expect(JSON.parse(String(manifest?.values?.[5]))).toMatchObject({
-      schemaVersion: "agent-harness.application-submission.v2", reviewedCoverLetterHash: readback?.reviewedCoverLetterHash,
-    })
+    expect(test.calls.some(call => call.sql.includes('FROM "agent_artifact"') || call.sql.includes('INSERT INTO "agent_artifact"'))).toBe(false)
+    expect(objectiveManifestEvents.record).toHaveBeenCalledWith(test.client,
+      { userId: "user-a", sessionId: "session-a", applicationTaskId: "application-a", jobId: "job-a", fillTurnId: "turn-a" }, manifestExpected)
     expect(submitApproval?.values?.[7]).toBe("submit_application")
+    expect(submitApproval?.values?.[13]).toBe(await hashObjectiveApplicationSubmissionMaterial(objectiveMaterial))
+    expect(submitApproval?.values?.[12]).toBe(hashArtifactContent(manifestExpected).slice("sha256:".length))
     expect(JSON.stringify(test.calls)).not.toContain(reviewedSource.content)
+  })
+
+  it("replays Objective completion from the exact V3 manifest event without reading the legacy artifact", async () => {
+    const seed = fixture(), readback = await createObjectiveReviewedApplicationFillReadback(seed.lease, seed.task.id, objectiveSource, reviewedSource)
+    const material: ObjectiveApplicationSubmissionMaterial = { schemaVersion: "agent-harness.v2.objective-application-submit-material.v1",
+      applicationTaskId: seed.task.id, jobId: seed.task.jobId, resumeId: "resume-a", coverLetterId: null,
+      reviewedCoverLetterHash: readback!.reviewedCoverLetterHash, objectiveSource }
+    const answersHash = await hashAgentReceiptValue("answers", seed.task.confirmedAnswers)
+    const manifest = buildObjectiveApplicationSubmissionManifest(material, answersHash)!
+    objectiveManifestEvents.read.mockResolvedValue({ manifest, hash: hashArtifactContent(manifest) })
+    const test = fixture({ turnInput: { reviewedApplicationMaterialSource: objectiveSource }, appStatus: "waiting_for_authorization",
+      appCheckpoint: "form_filled", turnStatus: "waiting_for_approval", browserStartEvents: [objectiveBrowserStart(seed.lease)],
+      completionApprovalStatus: "pending", reviewedCoverLetterHash: readback!.reviewedCoverLetterHash, objectiveSubmissionMaterial: material })
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease })).resolves.toEqual({ status: "completed" })
+    expect(test.calls.some(call => call.sql.includes('FROM "agent_artifact"'))).toBe(false)
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_artifact"') || call.sql.includes('INSERT INTO "agent_approvals"'))).toBe(false)
+  })
+
+  it("does not fall back to a V2 artifact when the Objective manifest event is missing", async () => {
+    const seed = fixture(), readback = await createObjectiveReviewedApplicationFillReadback(seed.lease, seed.task.id, objectiveSource, reviewedSource)
+    const test = fixture({ turnInput: { reviewedApplicationMaterialSource: objectiveSource }, appStatus: "waiting_for_authorization",
+      appCheckpoint: "form_filled", turnStatus: "waiting_for_approval", browserStartEvents: [objectiveBrowserStart(seed.lease)],
+      completionApprovalStatus: "pending", reviewedCoverLetterHash: readback!.reviewedCoverLetterHash })
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease })).resolves.toEqual({ status: "conflict" })
+    expect(test.calls.some(call => call.sql.includes('FROM "agent_artifact"'))).toBe(false)
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_approvals"'))).toBe(false)
+  })
+
+  it("rejects a changed Objective manifest event before any legacy artifact lookup", async () => {
+    const seed = fixture(), readback = await createObjectiveReviewedApplicationFillReadback(seed.lease, seed.task.id, objectiveSource, reviewedSource)
+    const material: ObjectiveApplicationSubmissionMaterial = { schemaVersion: "agent-harness.v2.objective-application-submit-material.v1",
+      applicationTaskId: seed.task.id, jobId: seed.task.jobId, resumeId: "resume-a", coverLetterId: null,
+      reviewedCoverLetterHash: readback!.reviewedCoverLetterHash, objectiveSource }
+    const answersHash = await hashAgentReceiptValue("answers", seed.task.confirmedAnswers)
+    const manifest = buildObjectiveApplicationSubmissionManifest(material, answersHash)!
+    const changed = { ...manifest, answersHash: "f".repeat(64) }
+    objectiveManifestEvents.read.mockResolvedValue({ manifest: changed, hash: hashArtifactContent(changed) })
+    const test = fixture({ turnInput: { reviewedApplicationMaterialSource: objectiveSource }, appStatus: "waiting_for_authorization",
+      appCheckpoint: "form_filled", turnStatus: "waiting_for_approval", browserStartEvents: [objectiveBrowserStart(seed.lease)] })
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease })).resolves.toEqual({ status: "conflict" })
+    expect(test.calls.some(call => call.sql.includes('FROM "agent_artifact"') || call.sql.includes('INSERT INTO "agent_artifact"'))).toBe(false)
+    expect(test.calls.some(call => call.sql.includes('FROM "agent_approvals"'))).toBe(false)
   })
 
   it("fails closed on stale Objective source proof before creating a manifest or submit approval", async () => {

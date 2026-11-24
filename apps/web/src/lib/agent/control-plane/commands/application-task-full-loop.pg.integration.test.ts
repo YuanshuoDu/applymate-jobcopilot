@@ -11,7 +11,18 @@ import { setTimeout as delay } from "node:timers/promises"
 
 import { Prisma, PrismaClient } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope, objectiveApplicationApprovalSetItemId, parseObjectiveTailorGraph, schemaVersion } from "@jobcopilot/agent-protocol"
-import { hashReviewedApplicationMaterialProof } from "@jobcopilot/shared"
+import {
+  hashAgentReceiptValue,
+  hashContent,
+  hashObjectiveApplicationSubmissionMaterial,
+  hashReviewedApplicationMaterialProof,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_ACTOR,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_BODY,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_SCHEMA,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_TYPE,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_SCHEMA,
+  parseObjectiveApplicationSubmissionManifestEvent,
+} from "@jobcopilot/shared"
 import { SignJWT } from "jose"
 import { NextRequest } from "next/server"
 import { afterAll, beforeAll, describe, expect, it, onTestFailed, vi } from "vitest"
@@ -2808,11 +2819,46 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         reviewHash: correctionReviewerRow.reviewHash, artifactId: correctedRef.artifactId, version: correctedRef.version,
         contentHash: correctedRef.contentHash, sourceDigest: correctedRef.sourceDigest })
       expect(typeof reviewedProofHash).toBe("string")
-      const manifest = await testDb.agentArtifact.findUniqueOrThrow({ where: { id: `application:${applicationTaskId}` },
-        select: { content: true, userId: true, jobId: true, artifactType: true, lifecycle: true } })
-      expect(manifest).toMatchObject({ userId: ids.user, jobId: selectedJobId, artifactType: "application", lifecycle: "base" })
-      expect(jsonRecord(manifest.content)).toMatchObject({ schemaVersion: "agent-harness.application-submission.v2",
-        applicationTaskId, jobId: selectedJobId, reviewedCoverLetterHash: reviewedProofHash })
+      const submissionTask = await testDb.applicationTask.findFirstOrThrow({ where: {
+        id: applicationTaskId!, userId: ids.user, sessionId, jobId: selectedJobId, fillTurnId,
+      }, select: { resumeId: true, coverLetterId: true, confirmedAnswers: true } })
+      const manifestEvents = await testDb.applicationTaskEvent.findMany({ where: {
+        taskId: applicationTaskId!, type: OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_TYPE,
+      }, select: { id: true, taskId: true, type: true, actor: true, body: true, data: true } })
+      expect(manifestEvents).toHaveLength(1)
+      const manifestEvent = manifestEvents[0]!
+      const manifestEventData = parseObjectiveApplicationSubmissionManifestEvent(manifestEvent.data)
+      if (!manifestEventData) throw new Error("Objective submission manifest event is invalid")
+      const expectedManifestEventId = `objective-submission-manifest:${hashContent([applicationTaskId, fillTurnId]).slice(7)}`
+      expect(Object.keys(manifestEvent).sort()).toEqual(["actor", "body", "data", "id", "taskId", "type"])
+      expect(manifestEvent).toMatchObject({ id: expectedManifestEventId, taskId: applicationTaskId,
+        type: OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_TYPE,
+        actor: OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_ACTOR,
+        body: OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_BODY })
+      expect(Object.keys(manifestEventData).sort()).toEqual(["hash", "manifest", "schemaVersion", "scope"])
+      expect(manifestEventData).toMatchObject({
+        schemaVersion: OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_SCHEMA,
+        scope: { userId: ids.user, sessionId, applicationTaskId, jobId: selectedJobId, fillTurnId },
+      })
+      const submissionManifest = manifestEventData.manifest
+      expect(submissionManifest).toEqual({
+        schemaVersion: OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_SCHEMA,
+        material: {
+          schemaVersion: "agent-harness.v2.objective-application-submit-material.v1",
+          applicationTaskId, jobId: selectedJobId, resumeId: selectedResumeId,
+          coverLetterId: submissionTask.coverLetterId, reviewedCoverLetterHash: reviewedProofHash,
+          objectiveSource: { schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v1",
+            approvalId, reviewTurnId, materialProofHash },
+        },
+        answersHash: await hashAgentReceiptValue("answers", submissionTask.confirmedAnswers ?? null),
+      })
+      const expectedManifestHash = hashContent(submissionManifest)
+      expect(manifestEventData.hash).toBe(expectedManifestHash)
+      const objectiveMaterialHash = await hashObjectiveApplicationSubmissionMaterial(submissionManifest.material)
+      if (!objectiveMaterialHash) throw new Error("Objective submission material hash is invalid")
+      expect(objectiveMaterialHash).toMatch(/^[a-f0-9]{64}$/)
+      expect(await testDb.agentArtifact.findUnique({ where: { id: `application:${applicationTaskId}` }, select: { id: true } }))
+        .toBeNull()
       const finalStats = await requestFixtureStats()
       expect(finalStats.reviewedGetCount).toBeGreaterThan(traceBaseline.reviewedGetCount)
       expect(finalStats.objectiveMaterialExactCount).toBeGreaterThan(traceBaseline.objectiveMaterialExactCount)
@@ -2824,10 +2870,15 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         type: "submit_application", status: "pending",
       } })
       expect(submitApprovals).toHaveLength(1)
-      const submitWaitId = `agent-wait:approval:${submitApprovals[0]!.id}`
+      const submitApproval = submitApprovals[0]!
+      expect(submitApproval).toMatchObject({ id: `application-fill:${applicationTaskId}:${fillTurnId}`,
+        answersHash: submissionManifest.answersHash, materialHash: objectiveMaterialHash,
+        resourceHash: expectedManifestHash.slice(7), payload: { applicationTaskId, jobId: selectedJobId,
+          resumeId: selectedResumeId, coverLetterId: submissionTask.coverLetterId } })
+      const submitWaitId = `agent-wait:approval:${submitApproval.id}`
       expect(await testDb.agentItem.findUniqueOrThrow({ where: { id: submitWaitId } })).toMatchObject({
         id: submitWaitId, sessionId, turnId: fillTurnId, type: "approval_request", status: "started",
-        content: { waitKind: "approval", approvalId: submitApprovals[0]!.id, action: "submit_application" },
+        content: { waitKind: "approval", approvalId: submitApproval.id, action: "submit_application" },
       })
       expect(await testDb.agentOutbox.count({ where: { aggregateId: sessionId, topic: "application.submit.dispatch" } })).toBe(0)
       expect((await submitQueueJobs()).filter(job => jsonString(job.data, "applicationTaskId") === applicationTaskId)).toHaveLength(0)

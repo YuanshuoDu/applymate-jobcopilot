@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 import type { Pool, PoolClient } from "pg"
 import { createApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
-import { buildApplicationSubmissionManifest, hashAgentReceiptValue, hashApplicationSubmissionMaterial, type ReviewedApplicationSubmissionMaterial } from "@jobcopilot/shared"
+import { buildApplicationSubmissionManifest, hashAgentReceiptValue, hashApplicationSubmissionMaterial } from "@jobcopilot/shared"
 import type { FormReviewNeeds } from "../harness/form-review.js"
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js"
 import { protocolScope, type ApprovalScopeInput, type IssueApprovalReceiptInput } from "../runtime/approval/types.js"
@@ -10,7 +10,8 @@ import { hashArtifactContent } from "../runtime/subagents/artifact-adapters.js"
 import { acquireSourceMaterialFence } from "./source-material-fence.js"
 import { ensureSubmissionArtifactWithClient } from "./submission-artifact.js"
 import { reviewedApplicationFillSelector, sameReviewedApplicationFillSelector } from "../runtime/reviewed-application-fill-binding.js"
-import { readApplicationFillCompletionMaterial, type ObjectiveReviewedApplicationFillReadback, type ReviewedApplicationFillReadback } from "./reviewed-application-fill-completion.js"
+import { createObjectiveSubmissionRecordWithClient, readApplicationFillCompletionMaterial, readObjectiveSubmissionRecordForReplayWithClient,
+  type ApplicationFillCompletionMaterial, type ObjectiveReviewedApplicationFillReadback, type ReviewedApplicationFillReadback } from "./reviewed-application-fill-completion.js"
 import { isFillWaitDetail, writeApplicationFillWaitWithClient, type FillWaitCheckpoint } from "./application-task-fill-wait.js"
 
 type TurnRow = { id: string; status: string; revision: number; input: unknown }
@@ -91,42 +92,44 @@ async function inTransaction<T>(pool: Pool, userId: string, work: (client: PoolC
 function submissionPayload(task: ApplicationRow) {
   return { applicationTaskId: task.id, jobId: task.jobId, resumeId: task.resumeId, coverLetterId: task.coverLetterId }
 }
-
 function exactSubmissionPayload(value: unknown, expected: ReturnType<typeof submissionPayload>): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
   const payload = value as Record<string, unknown>
   return Object.getPrototypeOf(value) === Object.prototype && Object.keys(payload).sort().join(",") === "applicationTaskId,coverLetterId,jobId,resumeId"
     && payload.applicationTaskId === expected.applicationTaskId && payload.jobId === expected.jobId && payload.resumeId === expected.resumeId && payload.coverLetterId === expected.coverLetterId
 }
-
 function date(value: Date | string | null): Date | undefined { if (!value) return undefined; const parsed = value instanceof Date ? value : new Date(value); return Number.isFinite(parsed.getTime()) ? parsed : undefined }
-
 function approvalResourceHash(value: string): string | undefined {
   const match = /^sha256:([a-f0-9]{64})$/.exec(value)
   return match?.[0] === value ? match[1] : undefined
 }
-
-async function existingCompletion(client: Client, lease: SubagentLease, task: ApplicationRow, turn: TurnRow, approvedOnly = false, reviewed?: ReviewedApplicationSubmissionMaterial): Promise<boolean> {
+async function existingCompletion(client: Client, lease: SubagentLease, task: ApplicationRow, turn: TurnRow, approvedOnly = false, reviewed?: ApplicationFillCompletionMaterial): Promise<boolean> {
   const payload = submissionPayload(task), turnId = lease.turnId
   if (!turnId) return false
   const answersHash = await hashAgentReceiptValue("answers", task.confirmedAnswers ?? null)
-  const materialHash = reviewed ? await hashApplicationSubmissionMaterial(reviewed) : await hashAgentReceiptValue("material", payload)
-  const artifactContent = reviewed ? buildApplicationSubmissionManifest(reviewed, answersHash)
-    : { schemaVersion: "agent-harness.application-submission.v1", ...payload, answersHash }
-  if (!artifactContent || !materialHash) return false
-  let artifactHash: string
-  try { artifactHash = hashArtifactContent(artifactContent) } catch { return false }
-  const artifactId = `application:${task.id}`, taskRef = `application-task:${task.id}`
-  const artifacts = await client.query<ExistingArtifactRow>(`SELECT "id", "userId", "jobId", "artifactType", "lifecycle", "baseId", "baseHash", "content", "hash", "constraintHash", "provenanceRefs", "evidenceRefs", "previousHash", "version" FROM "agent_artifact" WHERE "id" = $1 AND "userId" = $2`, [artifactId, lease.userId])
-  const artifact = artifacts.rows[0]
-  let contentHash: string | undefined
-  try { if (artifact) contentHash = hashArtifactContent(artifact.content) } catch { return false }
-  const refsMatch = (value: unknown) => Array.isArray(value) && value.length === 1 && value[0] === taskRef
-  if (!artifact || artifact.id !== artifactId || artifact.userId !== lease.userId || artifact.jobId !== task.jobId
-    || artifact.artifactType !== "application" || artifact.lifecycle !== "base" || artifact.baseId !== artifactId
-    || artifact.baseHash !== artifactHash || artifact.hash !== artifactHash || artifact.constraintHash !== hashArtifactContent({ applicationTaskId: task.id, jobId: task.jobId })
-    || !refsMatch(artifact.provenanceRefs) || !refsMatch(artifact.evidenceRefs) || artifact.previousHash !== null || artifact.version !== 1
-    || contentHash !== artifactHash) return false
+  const objective = reviewed?.objectiveSubmissionMaterial
+  const objectiveReceipt = objective && await readObjectiveSubmissionRecordForReplayWithClient(client, { scope: { userId: lease.userId, sessionId: lease.sessionId,
+    applicationTaskId: task.id, jobId: task.jobId, fillTurnId: turnId }, material: objective, answersHash })
+  if (objective && !objectiveReceipt) return false
+  const materialHash = objectiveReceipt?.materialHash ?? (reviewed ? await hashApplicationSubmissionMaterial(reviewed) : await hashAgentReceiptValue("material", payload))
+  let artifactHash = objectiveReceipt?.hash
+  if (!objectiveReceipt) {
+    const artifactContent = reviewed ? buildApplicationSubmissionManifest(reviewed, answersHash) : { schemaVersion: "agent-harness.application-submission.v1", ...payload, answersHash }
+    if (!artifactContent || !materialHash) return false
+    try { artifactHash = hashArtifactContent(artifactContent) } catch { return false }
+    const artifactId = `application:${task.id}`, taskRef = `application-task:${task.id}`
+    const artifacts = await client.query<ExistingArtifactRow>(`SELECT "id", "userId", "jobId", "artifactType", "lifecycle", "baseId", "baseHash", "content", "hash", "constraintHash", "provenanceRefs", "evidenceRefs", "previousHash", "version" FROM "agent_artifact" WHERE "id" = $1 AND "userId" = $2`, [artifactId, lease.userId])
+    const artifact = artifacts.rows[0]
+    let contentHash: string | undefined
+    try { if (artifact) contentHash = hashArtifactContent(artifact.content) } catch { return false }
+    const refsMatch = (value: unknown) => Array.isArray(value) && value.length === 1 && value[0] === taskRef
+    if (!artifact || artifact.id !== artifactId || artifact.userId !== lease.userId || artifact.jobId !== task.jobId
+      || artifact.artifactType !== "application" || artifact.lifecycle !== "base" || artifact.baseId !== artifactId
+      || artifact.baseHash !== artifactHash || artifact.hash !== artifactHash || artifact.constraintHash !== hashArtifactContent({ applicationTaskId: task.id, jobId: task.jobId })
+      || !refsMatch(artifact.provenanceRefs) || !refsMatch(artifact.evidenceRefs) || artifact.previousHash !== null || artifact.version !== 1
+      || contentHash !== artifactHash) return false
+  }
+  if (!artifactHash || !materialHash) return false
   const resourceHash = approvalResourceHash(artifactHash)
   if (!resourceHash) return false
   const found = await client.query<ExistingApprovalRow>(`SELECT "id", "userId", "sessionId", "turnId", "jobId", "type", "taskId", "status", "toolCallId", "payload", "resourceHash", "materialHash", "answersHash", "scopeHash", "nonceHash", "revision", "expiresAt" FROM "agent_approvals" WHERE "id" = $1 AND "userId" = $2 AND "status" IN ('pending', 'approved')`, [`application-fill:${task.id}:${turnId}`, lease.userId])
@@ -158,13 +161,13 @@ export async function completeApplicationFillForReview(pool: Pool, input: { read
     const selector = reviewedApplicationFillSelector(turn.input)
     const awaitingApproval = task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", authorizedForSubmission = task.status === "filling" && task.checkpoint === "submission_authorized", queueRetry = task.status === "waiting_for_authorization" && task.checkpoint === "queue_retry"
     const replay = awaitingApproval || authorizedForSubmission || queueRetry
-    if (!sameSelector(hint, selector)) return !replay && canPersistStaleReviewWait(task, turn)
+    if (!sameReviewedApplicationFillSelector(hint, selector)) return !replay && canPersistStaleReviewWait(task, turn)
       ? writeStaleReviewWait(client, lease, task.id, turn.revision, now) : { status: "conflict" }
-    let reviewed: ReviewedApplicationSubmissionMaterial | undefined
+    let reviewed: ApplicationFillCompletionMaterial | undefined
     if (selector.kind !== "absent") {
       reviewed = await readApplicationFillCompletionMaterial(client, { selector, lease, applicationTaskId: task.id, jobId: task.jobId,
         turnInput: turn.input, legacyMaterial: submissionPayload(task), readback: input.reviewedFillReadback, requireCurrentAttempt: !replay }) ?? undefined
-      if (!reviewed) return !replay && canPersistStaleReviewWait(task, turn)
+      if (!reviewed || selector.kind === "objective" && !reviewed.objectiveSubmissionMaterial) return !replay && canPersistStaleReviewWait(task, turn)
         ? writeStaleReviewWait(client, lease, task.id, turn.revision, now) : { status: "conflict" }
     }
     if (replay) return turn.status === "waiting_for_approval"
@@ -174,13 +177,21 @@ export async function completeApplicationFillForReview(pool: Pool, input: { read
     if (transitioned.rowCount !== 1) return { status: "conflict" }
     await client.query(`INSERT INTO "application_task_events" ("id", "taskId", "type", "actor", "body", "data", "createdAt")
       VALUES ($1, $2, 'form_filled', 'worker', $3, $4::jsonb, $5)`, [randomUUID(), task.id, "Form filled without submission; final user authorization requested.", JSON.stringify({ turnId: lease.turnId }), now])
-    const answersHash = await hashAgentReceiptValue("answers", task.confirmedAnswers ?? null)
-    const artifact = await ensureSubmissionArtifactWithClient(client, { applicationTaskId: task.id, userId: lease.userId, jobId: task.jobId, resumeId: task.resumeId, coverLetterId: task.coverLetterId, answersHash,
-      ...(reviewed ? { reviewedCoverLetterHash: reviewed.reviewedCoverLetterHash } : {}) })
-    const resourceHash = approvalResourceHash(artifact.hash)
+    const answersHash = await hashAgentReceiptValue("answers", task.confirmedAnswers ?? null), payload = submissionPayload(task)
+    const objective = reviewed?.objectiveSubmissionMaterial
+    let artifactHash: string, materialHash: string | null
+    if (objective) {
+      const created = await createObjectiveSubmissionRecordWithClient(client, { scope: { userId: lease.userId, sessionId: lease.sessionId,
+        applicationTaskId: task.id, jobId: task.jobId, fillTurnId: turnId }, material: objective, answersHash })
+      artifactHash = created.hash; materialHash = created.materialHash
+    } else {
+      const artifact = await ensureSubmissionArtifactWithClient(client, { applicationTaskId: task.id, userId: lease.userId, jobId: task.jobId, resumeId: task.resumeId, coverLetterId: task.coverLetterId, answersHash,
+        ...(reviewed ? { reviewedCoverLetterHash: reviewed.reviewedCoverLetterHash } : {}) })
+      artifactHash = artifact.hash
+      materialHash = reviewed ? await hashApplicationSubmissionMaterial(reviewed) : await hashAgentReceiptValue("material", payload)
+    }
+    const resourceHash = approvalResourceHash(artifactHash)
     if (!resourceHash) throw new Error("Application submission artifact hash is invalid")
-    const payload = submissionPayload(task)
-    const materialHash = reviewed ? await hashApplicationSubmissionMaterial(reviewed) : await hashAgentReceiptValue("material", payload)
     if (!materialHash) throw new Error("Application submission material is invalid")
     const approvalInput: IssueApprovalReceiptInput = { approvalId: `application-fill:${task.id}:${turnId}`, taskId: task.id,
       scope: { userId: lease.userId, sessionId: lease.sessionId, turnId, jobId: task.jobId, toolCallId: `application-submit:${task.id}`, action: "submit_application", resourceHash,
@@ -191,10 +202,6 @@ export async function completeApplicationFillForReview(pool: Pool, input: { read
     await client.query(`UPDATE "agent_sessions" SET "status" = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = $2 WHERE "id" = $1 AND "userId" = $3`, [lease.sessionId, now, lease.userId])
     return { status: "completed" }
   })
-}
-
-function sameSelector(left: ReturnType<typeof reviewedApplicationFillSelector>, right: ReturnType<typeof reviewedApplicationFillSelector>): boolean {
-  return sameReviewedApplicationFillSelector(left, right)
 }
 function canPersistStaleReviewWait(task: ApplicationRow, turn: TurnRow): boolean {
   return task.status === "filling" && task.checkpoint === "browser_active" && ["in_progress", "waiting_for_user", "waiting_for_dependency"].includes(turn.status)
