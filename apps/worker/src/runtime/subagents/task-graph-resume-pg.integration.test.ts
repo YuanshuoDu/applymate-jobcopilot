@@ -20496,7 +20496,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               rootFinalDiagnosticStage = "pair_wait_receipt_validated"
               rootModelStage = "final"
               yield { type: "tool_call_completed", callId: pairWaitCallId, name: "agent.wait", arguments: {
-                idempotencyKey: pairWaitKey, taskIds: [expectedWriterTaskId, expectedReviewerTaskId], mode: "all", timeoutMs: 60_000,
+                idempotencyKey: pairWaitKey, taskIds: [expectedWriterTaskId, expectedReviewerTaskId], mode: "all", timeoutMs: 30_000,
               } }
               yield { type: "completed", finishReason: "tool_calls" }
               return
@@ -20523,7 +20523,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 writerCompleted: waitedWriter?.role === "writer" && waitedWriter.status === "completed",
                 reviewerCompleted: waitedReviewer?.role === "reviewer" && waitedReviewer.status === "completed",
               }
-              if (wait?.status !== "ready" || targetIds.length !== 2 || targetIds[0] !== writerTaskId || targetIds[1] !== reviewerTaskId
+              if (wait?.status !== "ready" || targetIds.length !== 2 || new Set(targetIds).size !== 2
+                || writerTaskId === reviewerTaskId || !targetIds.includes(writerTaskId) || !targetIds.includes(reviewerTaskId)
                 || matchedIds.length !== 2 || !matchedIds.includes(writerTaskId) || !matchedIds.includes(reviewerTaskId)
                 || waitedWriter?.role !== "writer" || waitedWriter.status !== "completed"
                 || waitedReviewer?.role !== "reviewer" || waitedReviewer.status !== "completed") await finalProjectionFailure("wait")
@@ -20973,7 +20974,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       ])
       const applicationEffects = await pool!.query<{ applicationTasks: string; approvals: string; submissions: string }>(
         `SELECT (SELECT COUNT(*)::text FROM application_tasks WHERE "userId" = $1 AND "jobId" = $2) AS "applicationTasks",
-          (SELECT COUNT(*)::text FROM "AgentApproval" WHERE "userId" = $1 AND "sessionId" = $3 AND "turnId" = $4) AS "approvals",
+          (SELECT COUNT(*)::text FROM "agent_approvals" WHERE "userId" = $1 AND "sessionId" = $3 AND "turnId" = $4) AS "approvals",
           (SELECT COUNT(*)::text FROM submission_attempt WHERE "userId" = $1 AND "jobId" = $2) AS "submissions"`,
         [value.userId, jobId, value.sessionId, value.turnId],
       )
