@@ -154,7 +154,8 @@ vi.mock("../db/apply-results.js", () => ({
   insertApplyResult: mocks.insertApplyResult,
   getPool: vi.fn(() => ({ query: mocks.query, connect: vi.fn().mockResolvedValue(mocks.outcomeClient) })),
 }));
-vi.mock("../db/objective-application-submit-result.js", () => ({
+vi.mock("../db/objective-application-submit-result.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../db/objective-application-submit-result.js")>(),
   recordObjectiveApplicationSubmitResult: mocks.recordObjectiveSubmitResult,
 }));
 vi.mock("./application-submit-fence.js", async importOriginal => ({
@@ -203,7 +204,8 @@ vi.mock("../db/application-task-state.js", () => ({
   pauseForFormInput: mocks.pauseForFormInput,
   needsUserTakeover: vi.fn(() => false),
 }));
-vi.mock("../db/submission-guard.js", () => ({
+vi.mock("../db/submission-guard.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../db/submission-guard.js")>(),
   claimUnattendedSubmission: mocks.claimUnattendedSubmission,
   reconcileClaimedSubmissionUncertain: mocks.reconcileClaimedSubmissionUncertain,
   releaseUncertainSubmission: mocks.releaseUncertainSubmission,

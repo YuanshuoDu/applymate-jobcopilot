@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { Pool } from "pg"
+import { OBJECTIVE_APPLICATION_SUBMIT_RESULT_EVENT_TYPE } from "../db/objective-application-submit-result.js"
 import { drainApplicationSubmitOutbox, APPLICATION_SUBMIT_OUTBOX_TOPIC } from "./application-submit-outbox.js"
 import type { ApplyTaskSubmitPayload } from "@jobcopilot/shared"
 
 const mockReconcileClaimedSubmissionUncertain = vi.hoisted(() => vi.fn().mockResolvedValue(true))
-vi.mock("../db/submission-guard.js", () => ({ reconcileClaimedSubmissionUncertain: mockReconcileClaimedSubmissionUncertain }))
+vi.mock("../db/submission-guard.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../db/submission-guard.js")>()
+  return { ...actual, reconcileClaimedSubmissionUncertain: mockReconcileClaimedSubmissionUncertain }
+})
 
 const identity = {
   applicationTaskId: "application-1", userId: "user-1", jobId: "job-1", sessionId: "session-1",
@@ -102,6 +106,9 @@ function makeFixture(options: FixtureOptions = {}) {
       if (sql.includes('FROM "agent_approvals"')) return options.approvalProblem ? result([], 0) : result([{ expired: options.approvalExpired ?? false }], 1)
       if (sql.includes('FROM "application_task_events"') && sql.includes("submission_terminal_observed")) {
         return result(terminalProof ? [{ data: terminalProof }] : [])
+      }
+      if (sql.includes('FROM "application_task_events"') && values[2] === OBJECTIVE_APPLICATION_SUBMIT_RESULT_EVENT_TYPE) {
+        return result([])
       }
       if (sql.includes('FROM "application_task_events"')) return result([{ id: "queued-event" }])
       if (sql.startsWith("UPDATE application_tasks SET status = 'waiting_for_authorization'")) {
