@@ -62,6 +62,9 @@ export async function createGraphTasks(
   safeProposalSize(input.proposal)
   const tailorNodeKeys = objectiveTailorCommand ? objectiveTailorNodeKeys(input.proposal, input.templates) : undefined
   if (objectiveTailorCommand && !tailorNodeKeys) throw new Error("objective_tailor_pair_invalid")
+  const coverageInput = tailorNodeKeys
+    ? { ...input, templates: { scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst, ...input.templates } }
+    : input
   if (input.proposal.nodes.length > policy.maxFanOut) throw new Error("task_graph_proposal_fan_out_limit")
   for (const [id, template] of Object.entries(input.templates)) safeTemplate(id, template)
   const applicationFillerCount = current.nodes.filter(node => node.templateId === APPLICATION_FILLER_TEMPLATE_ID).length + input.proposal.nodes.filter(node => node.templateId === APPLICATION_FILLER_TEMPLATE_ID).length
@@ -122,7 +125,7 @@ export async function createGraphTasks(
     preflightStatuses.set(node.key, status); logicalStatuses.set(node.key, status)
   })
   await validateTaskGraphRepairTargets(client, input, current, priorTaskIds)
-  const coverage = await evaluateTaskGraphPlanObjectiveCoverage({ client, input, nodes: appended.state.nodes, provenance, prepared: preparedReconciliation })
+  const coverage = await evaluateTaskGraphPlanObjectiveCoverage({ client, input: coverageInput, nodes: appended.state.nodes, provenance, prepared: preparedReconciliation })
   if (coverage.status === "invalid") throw Object.assign(new Error("Canonical objective verification requirements are invalid"), {
     code: "task_graph_objective_requirements_invalid",
   })
