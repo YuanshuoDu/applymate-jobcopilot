@@ -12,9 +12,11 @@ const [, , mode] = process.argv
 const SOCKET = process.env.APPLICATION_TASK_FULL_LOOP_SOCKET_PATH
 const REVIEWED_SOURCE_GOAL = "FULL_LOOP_REVIEWED_SOURCE: produce and review a selected-job cover letter"
 const REVIEWED_COVER_LETTER = "SYNTHETIC REVIEWED COVER LETTER — isolated fill only."
+const OBJECTIVE_CORRECTED_COVER_LETTER = "Synthetic corrected cover letter for confirmed engineering role tailor-2."
 const REVIEWED_SOURCE_SCHEMA = "agent-harness.v2.subagent.result"
 const REVIEWED_FILL_BRIDGE_PATH = "/__applymate-reviewed-fill"
 const reviewedHash = createHash("sha256").update(REVIEWED_COVER_LETTER).digest("hex")
+const objectiveCorrectedHash = createHash("sha256").update(OBJECTIVE_CORRECTED_COVER_LETTER).digest("hex")
 const stageObserver = process.env.APPLICATION_TASK_FULL_LOOP_STAGE_OBSERVER_TEST === "true" ? applicationFillStageTrace() : undefined
 let legacyFinalResponseGate
 function armLegacyFinalResponseGate(turnId) {
@@ -81,7 +83,7 @@ async function startSite() {
   if (!SOCKET) throw new Error("APPLICATION_TASK_FULL_LOOP_SOCKET_PATH_required")
   const reviewedFillRouteSocketPath = required("APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_SOCKET_PATH")
   await unlink(SOCKET).catch(() => undefined)
-  let submitCount = 0, reviewedSubmitCount = 0, reviewedMaterialExactCount = 0, reviewedGetCount = 0
+  let submitCount = 0, reviewedSubmitCount = 0, reviewedMaterialExactCount = 0, objectiveMaterialExactCount = 0, reviewedGetCount = 0
   const requests = []
   const browserTrace = []
   const browserProgress = []
@@ -107,6 +109,12 @@ async function startSite() {
           if (Number.isFinite(elapsedMs) && elapsedMs >= 0) browserProgress.push({ event, elapsedMs })
         } else if (event === "input" && field === "cover_letter" && trace.valueHash === reviewedHash) {
           reviewedMaterialExactCount += 1
+          browserTrace.push("input:cover_letter")
+          if (Number.isFinite(elapsedMs) && elapsedMs >= 0 && Number.isSafeInteger(length) && length >= 0) {
+            browserProgress.push({ event: "input:cover_letter", elapsedMs, length })
+          }
+        } else if (event === "input" && field === "cover_letter" && trace.valueHash === objectiveCorrectedHash) {
+          objectiveMaterialExactCount += 1
           browserTrace.push("input:cover_letter")
           if (Number.isFinite(elapsedMs) && elapsedMs >= 0 && Number.isSafeInteger(length) && length >= 0) {
             browserProgress.push({ event: "input:cover_letter", elapsedMs, length })
@@ -239,7 +247,7 @@ async function startSite() {
     const lines = buffer.split("\n")
     buffer = lines.pop() ?? ""
     for (const line of lines.map(value => value.trim())) {
-      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, reviewedSubmitCount, reviewedMaterialExactCount, reviewedGetCount, blocked, requests, browserTrace, browserProgress })}`)
+      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, reviewedSubmitCount, reviewedMaterialExactCount, objectiveMaterialExactCount, reviewedGetCount, blocked, requests, browserTrace, browserProgress })}`)
       if (line === "shutdown") {
         process.stdin.pause()
         for (const response of held) response.destroy()
