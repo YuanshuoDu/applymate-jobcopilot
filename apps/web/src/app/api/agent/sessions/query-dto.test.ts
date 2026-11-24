@@ -263,6 +263,9 @@ describe("agent query DTO redaction", () => {
   })
 
   it("preserves only a canonical safe TaskGraph sibling on a completed final item", () => {
+    const objectiveTailorFinalOutcomes = { schemaVersion: 'agent-harness.v2.objective-tailor-final-outcomes.v1', slots: [
+      { ordinal: 1, status: 'ready' }, { ordinal: 2, status: 'needs_revision' },
+    ] }
     const source = {
       sourceKey: canonicalTaskGraphSourceKey("item_final", 3, 0), nodeIndex: 0,
       role: "scout", taskStatus: "completed", resultState: "missing",
@@ -272,17 +275,20 @@ describe("agent query DTO redaction", () => {
       id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
       type: "agent_message", status: "completed", phase: "final_answer", revision: 2,
       content: { text: "Answer stays intact.", final: { response: "Answer stays intact." }, taskGraphSources: manifest,
+        objectiveTailorFinalOutcomes,
         privateFinalField: "PRIVATE_RAW_RESULT" },
       startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
     }
     const projected = itemDto(base).content as Record<string, unknown>
-    expect(projected).toEqual({ text: "Answer stays intact.", taskGraphSources: manifest })
+    expect(projected).toEqual({ text: "Answer stays intact.", taskGraphSources: manifest, objectiveTailorFinalOutcomes })
     expect(JSON.stringify(projected)).not.toMatch(/taskId|graphItemId|sessionId|userId|jobId|artifactId|PRIVATE_RAW_RESULT/)
     expect(itemDto({ ...base, status: "running" }).content).toEqual({ text: "Answer stays intact." })
+    expect(itemDto({ ...base, content: { ...base.content, objectiveTailorFinalOutcomes: { ...objectiveTailorFinalOutcomes, privateId: "PRIVATE" } } }).content)
+      .toEqual({ text: "Answer stays intact.", taskGraphSources: manifest })
     expect(itemDto({ ...base, content: { ...base.content, taskGraphSources: { ...manifest, taskId: "PRIVATE_TASK" } } }).content)
-      .toEqual({ text: "Answer stays intact." })
+      .toEqual({ text: "Answer stays intact.", objectiveTailorFinalOutcomes })
     expect(itemDto({ ...base, content: { ...base.content, taskGraphSources: { ...manifest, sources: [{ ...source, sourceKey: "src_" + "A".repeat(43) }] } } }).content)
-      .toEqual({ text: "Answer stays intact." })
+      .toEqual({ text: "Answer stays intact.", objectiveTailorFinalOutcomes })
   })
 
   it("preserves legacy markers without an evidence field and strips markers when all evidence is rejected", () => {

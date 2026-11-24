@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { canonicalTaskGraphItemId, canonicalTaskGraphSourceKey, projectFinalTaskGraphSourceDetail } from './final-task-graph-source-detail'
+import { canonicalTaskGraphItemId, canonicalTaskGraphSourceKey, projectFinalAnswerTaskGraphSourceContent, projectFinalTaskGraphSourceDetail } from './final-task-graph-source-detail'
 import { TASK_GRAPH_SOURCES_SCHEMA_VERSION, TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2 } from './final-task-graph-source-manifest'
 
 const sessionId = 'session_1', userId = 'user_1', finalItemId = 'final_1', turnId = 'turn_1', rootTaskId = 'root_1'
@@ -12,6 +12,20 @@ const content = { taskGraphSources: { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_V
   { sourceKey, nodeIndex: 0, role: 'scout', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed' },
 ] } }
 const updatedAt = new Date('2026-10-01T00:00:00.000Z')
+const finalOutcomes = { schemaVersion: 'agent-harness.v2.objective-tailor-final-outcomes.v1', slots: [{ ordinal: 1, status: 'ready' }] }
+
+it('projects only a valid Objective Tailor sidecar on completed final answers', () => {
+  expect(projectFinalAnswerTaskGraphSourceContent(finalItemId, 'final_answer', 'completed', 'Answer', undefined, null,
+    { text: 'Answer', final: { response: 'Answer' }, objectiveTailorFinalOutcomes: finalOutcomes }))
+    .toEqual({ text: 'Answer', objectiveTailorFinalOutcomes: finalOutcomes })
+  expect(projectFinalAnswerTaskGraphSourceContent(finalItemId, 'commentary', 'completed', 'Answer', undefined, null,
+    { objectiveTailorFinalOutcomes: finalOutcomes })).toEqual({ text: 'Answer' })
+  expect(projectFinalAnswerTaskGraphSourceContent(finalItemId, 'final_answer', 'completed', 'Answer', undefined, null,
+    { text: 'Answer', final: { response: 'Answer' }, objectiveTailorFinalOutcomes: { ...finalOutcomes, privateId: 'PRIVATE' } }))
+    .toEqual({ text: 'Answer' })
+  expect(projectFinalAnswerTaskGraphSourceContent(finalItemId, 'final_answer', 'completed', 'Fallback', undefined, null,
+    { text: 'Answer', final: { response: 'Different' }, objectiveTailorFinalOutcomes: finalOutcomes })).toEqual({ text: 'Fallback' })
+})
 
 function input(overrides: Record<string, unknown> = {}) {
   const childResult = { status: 'completed', stepCount: 1, toolCallCount: 1, finalItemId: 'PRIVATE_FINAL_ID',

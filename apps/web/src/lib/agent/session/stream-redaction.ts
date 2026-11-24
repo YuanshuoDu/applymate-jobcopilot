@@ -9,6 +9,7 @@ import { redactSensitiveText, redactSensitiveValue } from '@jobcopilot/shared'
 import { projectFinalAnswerContent } from './final-answer-evidence-projection'
 import { isCanonicalTaskGraphSourceManifest } from './final-task-graph-source-detail'
 import { parseFinalTaskGraphSourceManifest } from './final-task-graph-source-manifest'
+import { OBJECTIVE_TAILOR_FINAL_OUTCOMES_FIELD, parseObjectiveTailorFinalOutcomesFromContent, stripObjectiveTailorFinalOutcomes } from './objective-tailor-final-content'
 
 const TASK_GRAPH_PROPOSAL_KEYS = ['kind', 'fingerprint', 'receipt', 'revision', 'item'] as const
 const TASK_GRAPH_PROPOSAL_CONTENT_KEYS = [...TASK_GRAPH_PROPOSAL_KEYS, 'content'] as const
@@ -53,7 +54,7 @@ export function redactStreamEventPayload(eventType: string, payload: unknown, id
   if (isPrivateNativeVerificationEventType(eventType)) return {}
   const finalContent = projectCompletedFinalContent(eventType, payload, identity)
   if (finalContent) return finalContent
-  const redacted = redactStreamValue(payload)
+  const redacted = stripObjectiveTailorFinalOutcomes(redactStreamValue(payload))
   if (eventType === 'turn.completed') return projectCompletedTurnIdentity(payload, redacted, identity)
   if (eventType !== 'item.started' && eventType !== 'item.delta') return redacted
 
@@ -132,12 +133,14 @@ function projectCompletedFinalContent(eventType: string, payload: unknown, ident
   const text = ownDataValue(rawContent, 'text'), final = ownDataValue(rawContent, 'final')
   const content = projectFinalAnswerContent({ text, final })
   if (!content) {
-    if (!Object.hasOwn(rawContent, 'taskGraphSources')) return null
+    if (!Object.hasOwn(rawContent, 'taskGraphSources') && !Object.hasOwn(rawContent, OBJECTIVE_TAILOR_FINAL_OUTCOMES_FIELD)) return null
     return { itemId: identity.itemId, status: 'completed', content: { text: typeof text === 'string' ? redactSensitiveText(text) : '' } }
   }
   const manifest = parseFinalTaskGraphSourceManifest(ownDataValue(rawContent, 'taskGraphSources'))
   const taskGraphSources = manifest && isCanonicalTaskGraphSourceManifest(identity.itemId, manifest) ? manifest : undefined
-  return { itemId: identity.itemId, status: 'completed', content: { ...content, ...(taskGraphSources ? { taskGraphSources } : {}) } }
+  const objectiveTailorFinalOutcomes = parseObjectiveTailorFinalOutcomesFromContent(rawContent)
+  return { itemId: identity.itemId, status: 'completed', content: { ...content, ...(taskGraphSources ? { taskGraphSources } : {}),
+    ...(objectiveTailorFinalOutcomes ? { objectiveTailorFinalOutcomes } : {}) } }
 }
 
 function ownDataValue(value: Record<string, unknown>, key: string): unknown {

@@ -10,6 +10,7 @@ import type { TimelineItem } from './timeline-reducer'
 import { contentParts, itemText, type HarnessContentPart, type SuggestedActionCommand } from './harness-item-types'
 import { FinalAnswerEvidenceDisclosure } from './FinalAnswerEvidenceDisclosure'
 import { FinalTaskGraphSources } from './FinalTaskGraphSources'
+import { ObjectiveTailorFinalOutcomes } from './ObjectiveTailorFinalOutcomes'
 import { HarnessMarkdown } from './HarnessMarkdown'
 import { NativeVerificationFeedbackCard } from './NativeVerificationFeedbackCard'
 import { extractNativeVerificationFeedback, safeNativeFeedbackOutput } from './native-verification-feedback'
@@ -84,6 +85,8 @@ function renderItemBody(item: TimelineItem, t: (key: string) => string, lang: La
   const answerEvidence = finalAnswerEvidence(item)
   const taskGraphSources = item.type === 'agent_message' && item.phase === 'final_answer' && item.status === 'completed'
     ? <FinalTaskGraphSources content={item.content} sessionId={item.sessionId} finalItemId={item.id} lang={lang} /> : null
+  const objectiveTailorFinalOutcomes = item.type === 'agent_message' && item.phase === 'final_answer' && item.status === 'completed'
+    ? <ObjectiveTailorFinalOutcomes content={item.content} lang={lang} /> : null
   return <>
     <div style={{ display: 'grid', gap: 8 }}>
       {summary && <section aria-label={summaryLabel} data-agent-final-summary="true">
@@ -94,6 +97,7 @@ function renderItemBody(item: TimelineItem, t: (key: string) => string, lang: La
         ? <FinalAnswerContent parts={parts} evidence={answerEvidence} t={t} lang={lang} onSuggestedAction={onSuggestedAction} />
         : parts.map((part, index) => <ContentPart key={index} part={part} t={t} onSuggestedAction={onSuggestedAction} />)}
     </div>
+    {objectiveTailorFinalOutcomes}
     {taskGraphSources}
   </>
 }

@@ -351,21 +351,32 @@ describe("agent stream redaction", () => {
   })
 
   it("streams only a canonical TaskGraph source manifest beside the ordinary final answer", () => {
+    const objectiveTailorFinalOutcomes = { schemaVersion: 'agent-harness.v2.objective-tailor-final-outcomes.v1', slots: [
+      { ordinal: 1, status: 'ready' }, { ordinal: 2, status: 'rejected' },
+    ] }
     const source = { sourceKey: canonicalTaskGraphSourceKey("final-item", 3, 0), nodeIndex: 0,
       role: "scout", taskStatus: "completed", resultState: "missing" }
     const manifest = { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision: 3, sources: [source] }
     const payload = { itemId: "final-item", status: "completed", content: {
       text: "Safe answer", final: { response: "Safe answer" }, taskGraphSources: manifest,
+      objectiveTailorFinalOutcomes,
       taskId: "PRIVATE_TASK_ID", rawResult: "PRIVATE_RAW_RESULT",
     } }
     const projected = redactStreamEventPayload("item.completed", payload, { ...identity, itemId: "final-item" })
-    expect(projected).toEqual({ itemId: "final-item", status: "completed", content: { text: "Safe answer", taskGraphSources: manifest } })
+    expect(projected).toEqual({ itemId: "final-item", status: "completed", content: { text: "Safe answer", taskGraphSources: manifest, objectiveTailorFinalOutcomes } })
     expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_TASK_ID|PRIVATE_RAW_RESULT|sessionId|graphItemId/)
 
     const malformed = redactStreamEventPayload("item.completed", { ...payload, content: {
       ...payload.content, taskGraphSources: { ...manifest, sources: [{ ...source, sourceKey: `src_${"A".repeat(43)}` }] },
     } }, { ...identity, itemId: "final-item" })
-    expect(malformed).toEqual({ itemId: "final-item", status: "completed", content: { text: "Safe answer" } })
+    expect(malformed).toEqual({ itemId: "final-item", status: "completed", content: { text: "Safe answer", objectiveTailorFinalOutcomes } })
+
+    const invalidSidecar = redactStreamEventPayload('item.completed', { ...payload, content: {
+      ...payload.content, objectiveTailorFinalOutcomes: { ...objectiveTailorFinalOutcomes, privateProof: 'PRIVATE' },
+    } }, { ...identity, itemId: 'final-item' })
+    expect(invalidSidecar).toEqual({ itemId: 'final-item', status: 'completed', content: { text: 'Safe answer', taskGraphSources: manifest } })
+    const nonFinal = redactStreamEventPayload('item.delta', { content: { objectiveTailorFinalOutcomes: objectiveTailorFinalOutcomes } }, identity)
+    expect(JSON.stringify(nonFinal)).not.toContain('objectiveTailorFinalOutcomes')
   })
 
   it("redacts nested credential, resume, and raw payload keys", () => {
