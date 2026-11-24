@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { createRequire } from "node:module"
+import { isDeepStrictEqual } from "node:util"
 import { spawn, type ChildProcess } from "node:child_process"
 import { createServer, type Server } from "node:http"
 import { connect as connectSocket } from "node:net"
@@ -1882,6 +1883,19 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       where: { id: submitApproval.id }, select: { status: true },
     })).toEqual(approvalBeforeDuplicate)
     expect((await requestFixtureStats()).submitCount).toBe(1)
+    await waitLine(worker!, "LEGACY_APPLY_PROCESSOR_RESULT_HELD", 30_000)
+    const taskBeforeKill = await testDb.applicationTask.findUniqueOrThrow({
+      where: { id: gateTaskId! },
+      select: { userId: true, jobId: true, sessionId: true, fillTurnId: true, workerTaskId: true, status: true, checkpoint: true },
+    })
+    const jobBeforeKill = await applyQueue!.getJob(workerTaskId)
+    expect(Boolean(taskBeforeKill.userId === ids.user && taskBeforeKill.jobId === ids.job
+      && taskBeforeKill.sessionId === ids.session && taskBeforeKill.fillTurnId === successorTurnId
+      && taskBeforeKill.workerTaskId === workerTaskId && taskBeforeKill.status === "waiting_for_user"
+      && taskBeforeKill.checkpoint === "submission_uncertain"
+      && jobBeforeKill && jobBeforeKill.id === workerTaskId
+      && await jobBeforeKill.getState() === "active"
+      && isDeepStrictEqual(jobBeforeKill.data, intent.submitPayload))).toBe(true)
     worker!.kill("SIGKILL")
     expect(await waitExit(worker!, 5_000)).toBe(true)
     worker = spawnFixture("worker")

@@ -21,7 +21,8 @@ function armLegacyFinalResponseGate(turnId) {
   if (typeof turnId !== "string" || !turnId || turnId.length > 256 || turnId.trim() !== turnId || legacyFinalResponseGate) throw new Error("legacy_final_response_gate_arm_invalid")
   let release
   const released = new Promise(resolve => { release = resolve })
-  legacyFinalResponseGate = { turnId, release, released, claimed: false, acknowledged: false, resumed: false, streamCompleted: false }
+  legacyFinalResponseGate = { turnId, release, released, claimed: false, acknowledged: false, resumed: false,
+    streamCompleted: false, applyProcessorResultClaimed: false, releaseApplyProcessorResult: null }
 }
 function releaseLegacyFinalResponseGate(turnId) {
   const gate = legacyFinalResponseGate
@@ -46,6 +47,22 @@ async function holdLegacyFinalResponse(turnId) {
     say("LEGACY_FINAL_RESPONSE_GATE_RESUMED")
   }
   gate.release()
+}
+async function holdLegacyApplyProcessorResult(job) {
+  const gate = legacyFinalResponseGate
+  if (!gate || gate.applyProcessorResultClaimed || job?.data?.operation !== "submit"
+    || job?.data?.fillTurnId !== gate.turnId) return
+  gate.applyProcessorResultClaimed = true
+  say("LEGACY_APPLY_PROCESSOR_RESULT_HELD")
+  await new Promise(resolve => { gate.releaseApplyProcessorResult = resolve })
+  gate.releaseApplyProcessorResult = null
+}
+function releaseLegacyApplyProcessorResult() {
+  const gate = legacyFinalResponseGate
+  const release = gate?.releaseApplyProcessorResult
+  if (typeof release !== "function") return
+  gate.releaseApplyProcessorResult = null
+  release()
 }
 const tls = async () => {
   const cert = await readFile(required("AGENT_TEST_TLS_CERT_PATH"))
@@ -262,6 +279,13 @@ async function startWorker() {
     import("./apply-queue.ts"), import("./application-submit-outbox.ts"), import("./reviewed-fill-handoff-outbox.ts"),
     import("../cloak/pool.js"), import("../redis.ts"), import("../runtime/wakeup/consumer.ts"),
   ])
+  const originalApplyProcessor = queue.applyWorker.processFn
+  if (typeof originalApplyProcessor !== "function") throw new Error("application_task_full_loop_apply_processor_unavailable")
+  queue.applyWorker.processFn = async function (job, token, signal) {
+    const result = await originalApplyProcessor.call(this, job, token, signal)
+    await holdLegacyApplyProcessorResult(job)
+    return result
+  }
   const flags = { ...resolveProductionAgentFlags(), taskGraphPlanningEnabled: true, childExecutionEnabled: true,
     coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false }
   const taskGraphCommandPort = flags.taskGraphPlanningEnabled
@@ -448,6 +472,7 @@ async function startWorker() {
           say("LEGACY_FINAL_RESPONSE_GATE_RELEASED")
         }
       } else if (line === "shutdown") {
+        releaseLegacyApplyProcessorResult()
         process.stdin.pause()
         resolve()
         return
