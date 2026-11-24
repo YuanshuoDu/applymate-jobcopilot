@@ -101,7 +101,7 @@ beforeEach(() => {
         sourceDigest, currentSourceDigest: sourceDigest, toolCallId: proof.source.reviewerToolCallId, reviewHash: proof.source.reviewHash } }] })
 })
 
-function input(turnInput: unknown = fillInput, phase: "prepare" | "browser_start" | "completion" | "completion_replay" = "browser_start") {
+function input(turnInput: unknown = fillInput, phase: "prepare" | "browser_start" | "completion" | "completion_replay" | "authorize" | "marker" | "boundary" = "browser_start") {
   return { userId, sessionId, fillTurnId, applicationTaskId, jobId, turnInput, phase, now: new Date("2026-11-24T10:02:00.000Z") }
 }
 
@@ -175,6 +175,20 @@ describe("Objective reviewed application Fill reader", () => {
     await expect(readObjectiveReviewedApplicationFillSource(valid.client, input(fillInput, "completion_replay"))).resolves.toMatchObject({ source })
     const incomplete = fixture({ taskStatus: "filling", checkpoint: "browser_active", fillStatus: "waiting_for_approval" })
     await expect(readObjectiveReviewedApplicationFillSource(incomplete.client, input(fillInput, "completion_replay"))).resolves.toBeUndefined()
+  })
+
+  it.each(["authorize", "marker", "boundary"] as const)("rechecks exact Objective source at submit phase %s", async phase => {
+    const checkpoint = phase === "boundary" ? "submission_request_started" : "browser_active"
+    for (const fillStatus of ["waiting_for_approval", "queued", "in_progress"]) {
+      const valid = fixture({ taskStatus: "filling", checkpoint, fillStatus })
+      await expect(readObjectiveReviewedApplicationFillSource(valid.client, input(fillInput, phase))).resolves.toMatchObject({ source })
+    }
+    const dependencyWait = fixture({ taskStatus: "filling", checkpoint, fillStatus: "waiting_for_dependency" })
+    await expect(readObjectiveReviewedApplicationFillSource(dependencyWait.client, input(fillInput, phase))).resolves.toBeUndefined()
+    const terminal = fixture({ taskStatus: "filling", checkpoint, fillStatus: "completed" })
+    await expect(readObjectiveReviewedApplicationFillSource(terminal.client, input(fillInput, phase))).resolves.toBeUndefined()
+    const wrongCheckpoint = fixture({ taskStatus: "filling", checkpoint: phase === "boundary" ? "browser_active" : "submission_request_started" })
+    await expect(readObjectiveReviewedApplicationFillSource(wrongCheckpoint.client, input(fillInput, phase))).resolves.toBeUndefined()
   })
 
   it("rejects a malformed private Objective selector without database reads", async () => {

@@ -1,5 +1,6 @@
 import type { PoolClient } from "pg"
-import { parseReviewedApplicationFillSource, type ReviewedApplicationFillSourceSelection } from "@jobcopilot/shared"
+import { parseObjectiveReviewedFillSource, parseReviewedApplicationFillSource, type ObjectiveReviewedFillSource,
+  type ReviewedApplicationFillSourceSelection } from "@jobcopilot/shared"
 
 import { withExactAttemptFence } from "../queue/application-submit-fence.js"
 import type { ApplicationSubmissionStartScope } from "./application-task-state.js"
@@ -7,7 +8,10 @@ import { hasReviewedSubmissionArtifact, readReviewedApplicationSubmitMaterial } 
 import { acquireSourceMaterialFence } from "./source-material-fence.js"
 
 type Phase = "marker" | "boundary"
-type ProofResult<T> = { readonly kind: "current"; readonly value: T; readonly sourceTurnId: string | null } | { readonly kind: "superseded" } | { readonly kind: "invalid" }
+type SourceSelection = ReviewedApplicationFillSourceSelection | Readonly<{ kind: "objective"; source: ObjectiveReviewedFillSource }>
+type SourceRead = Readonly<{ selection: SourceSelection; turnInput: unknown }>
+export type ReviewedSubmitSourceExpectation = string | null | undefined | Readonly<{ kind: "objective"; source: ObjectiveReviewedFillSource }>
+type ProofResult<T> = { readonly kind: "current"; readonly value: T; readonly sourceTurnId: string | null; readonly objectiveSource?: ObjectiveReviewedFillSource } | { readonly kind: "superseded" } | { readonly kind: "invalid" }
 type ApprovalRow = {
   userId: string; sessionId: string; turnId: string | null; taskId: string | null; jobId: string | null; toolCallId: string | null
   type: string; status: string; payload: unknown; resourceHash: string | null; materialHash: string | null; answersHash: string | null
@@ -21,26 +25,35 @@ export async function withReviewedApplicationSubmitRequestFence<T>(
   client: PoolClient,
   scope: ApplicationSubmissionStartScope,
   phase: Phase,
-  expectedSourceTurnId: string | null | undefined,
+  expectedSourceTurnId: ReviewedSubmitSourceExpectation,
   work: (sourceTurnId?: string) => Promise<T>,
 ): Promise<ProofResult<T>> {
   const hinted = await readSource(client, scope)
   await acquireSourceMaterialFence(client, [scope.userId])
   const fenced = await withExactAttemptFence(client, scope, async () => {
     const current = await readSource(client, scope)
-    if (!sameSource(hinted, current) || !matchesExpectedSource(current, expectedSourceTurnId) || current.kind === "invalid") {
+    if (!sameSource(hinted.selection, current.selection) || !matchesExpectedSource(current.selection, expectedSourceTurnId) || current.selection.kind === "invalid") {
       return { valid: false as const }
     }
-    if (current.kind === "absent" && await hasReviewedSubmissionArtifact(client, scope)) return { valid: false as const }
-    if (current.kind === "selected" && !(await reviewedRequestIsCurrent(client, scope, phase, current.sourceTurnId))) {
+    if (current.selection.kind === "absent") {
+      const legacyEvidence = await hasReviewedSubmissionArtifact(client, scope)
+      const objectiveSubmit = await import("./objective-reviewed-application-submit-material.js")
+      const objectiveEvidence = await objectiveSubmit.hasObjectiveSubmissionManifestEvidence(client, scope)
+      if (legacyEvidence || objectiveEvidence) return { valid: false as const }
+    }
+    if ((current.selection.kind === "selected" || current.selection.kind === "objective")
+      && !(await reviewedRequestIsCurrent(client, scope, phase, current.selection, current.turnInput))) {
       return { valid: false as const }
     }
-    return { valid: true as const, value: await work(current.kind === "selected" ? current.sourceTurnId : undefined) }
+    return { valid: true as const, value: await work(current.selection.kind === "selected" ? current.selection.sourceTurnId : undefined), current }
   })
   if (fenced.kind === "superseded") return phase === "boundary"
-    && (hinted.kind !== "absent" || expectedSourceTurnId !== undefined && expectedSourceTurnId !== null) ? { kind: "invalid" } : fenced
-  return fenced.value.valid ? { kind: "current", value: fenced.value.value,
-    sourceTurnId: hinted.kind === "selected" ? hinted.sourceTurnId : null } : { kind: "invalid" }
+    && (hinted.selection.kind !== "absent" || expectedSourceTurnId !== undefined && expectedSourceTurnId !== null) ? { kind: "invalid" } : fenced
+  if (!fenced.value.valid) return { kind: "invalid" }
+  const selection = fenced.value.current.selection
+  return { kind: "current", value: fenced.value.value,
+    sourceTurnId: selection.kind === "selected" ? selection.sourceTurnId : null,
+    ...(selection.kind === "objective" ? { objectiveSource: selection.source } : {}) }
 }
 
 export async function readSubmissionTurnState(client: PoolClient, scope: ApplicationSubmissionStartScope): Promise<{
@@ -62,27 +75,34 @@ export async function readSubmissionTurnState(client: PoolClient, scope: Applica
   return { sessionStatus: session.rows[0]?.status, turnStatus: turn.rows[0]?.status, interrupted: interrupted.rows[0]?.stopped }
 }
 
-async function readSource(client: PoolClient, scope: ApplicationSubmissionStartScope): Promise<ReviewedApplicationFillSourceSelection> {
+async function readSource(client: PoolClient, scope: ApplicationSubmissionStartScope): Promise<SourceRead> {
   const result = await client.query<{ input: unknown }>(
     `SELECT "input" FROM "agent_turns" WHERE "id"=$1 AND "sessionId"=$2 AND "userId"=$3 LIMIT 2`,
     [scope.fillTurnId, scope.sessionId, scope.userId],
   )
-  return result.rows.length === 1 ? parseReviewedApplicationFillSource(result.rows[0]?.input) : { kind: "invalid" }
+  if (result.rows.length !== 1) return { selection: { kind: "invalid" }, turnInput: undefined }
+  const turnInput = result.rows[0]?.input
+  const objective = parseObjectiveReviewedFillSource(turnInput)
+  return { selection: objective ? { kind: "objective", source: objective } : parseReviewedApplicationFillSource(turnInput), turnInput }
 }
 
-function sameSource(left: ReviewedApplicationFillSourceSelection, right: ReviewedApplicationFillSourceSelection): boolean {
-  return left.kind === right.kind && (left.kind !== "selected" || right.kind === "selected" && left.sourceTurnId === right.sourceTurnId)
+function sameSource(left: SourceSelection, right: SourceSelection): boolean {
+  return left.kind === right.kind && (left.kind === "selected" ? right.kind === "selected" && left.sourceTurnId === right.sourceTurnId
+    : left.kind === "objective" ? right.kind === "objective" && sameObjectiveSource(left.source, right.source) : true)
 }
-function matchesExpectedSource(current: ReviewedApplicationFillSourceSelection, expected: string | null | undefined): boolean {
+function matchesExpectedSource(current: SourceSelection, expected: ReviewedSubmitSourceExpectation): boolean {
   return expected === undefined || expected === null && current.kind === "absent"
     || typeof expected === "string" && current.kind === "selected" && current.sourceTurnId === expected
+    || expected !== null && typeof expected === "object" && expected.kind === "objective" && current.kind === "objective"
+      && sameObjectiveSource(current.source, expected.source)
 }
 
 async function reviewedRequestIsCurrent(
   client: PoolClient,
   scope: ApplicationSubmissionStartScope,
   phase: Phase,
-  sourceTurnId: string,
+  selection: Exclude<SourceSelection, { kind: "absent" | "invalid" }>,
+  turnInput: unknown,
 ): Promise<boolean> {
   if (scope.turnId !== scope.fillTurnId) return false
   const expectedCheckpoint = phase === "marker" ? "browser_active" : "submission_request_started"
@@ -105,12 +125,20 @@ async function reviewedRequestIsCurrent(
   if (approvals.rows.length !== 1 || !approval || !validConsumedApproval(approval, scope)
     || attempt.artifactHash !== approval.resourceHash) return false
   if (phase === "marker" ? starts.rows.length !== 0 : starts.rows.length !== 1 || !matchesStartEvent(starts.rows[0]?.data, scope)) return false
-  const proof = await readReviewedApplicationSubmitMaterial({
-    client, identity: scope, sourceTurnId,
-    approval: { resourceHash: approval.resourceHash!, materialHash: approval.materialHash!, answersHash: approval.answersHash! },
-    currentSource: true,
-  })
+  const approvalHashes = { resourceHash: approval.resourceHash!, materialHash: approval.materialHash!, answersHash: approval.answersHash! }
+  if (selection.kind === "objective") {
+    const { readObjectiveReviewedApplicationSubmitMaterial } = await import("./objective-reviewed-application-submit-material.js")
+    const proof = await readObjectiveReviewedApplicationSubmitMaterial({ client, identity: scope, turnInput, approval: approvalHashes, phase })
+    return proof?.artifactHash === approval.resourceHash && sameObjectiveSource(proof.objectiveSource, selection.source)
+  }
+  const proof = await readReviewedApplicationSubmitMaterial({ client, identity: scope, sourceTurnId: selection.sourceTurnId,
+    approval: approvalHashes, currentSource: true })
   return proof?.artifactHash === approval.resourceHash
+}
+
+function sameObjectiveSource(left: ObjectiveReviewedFillSource, right: ObjectiveReviewedFillSource): boolean {
+  return left.schemaVersion === right.schemaVersion && left.approvalId === right.approvalId
+    && left.reviewTurnId === right.reviewTurnId && left.materialProofHash === right.materialProofHash
 }
 
 function validConsumedApproval(row: ApprovalRow, scope: ApplicationSubmissionStartScope): boolean {

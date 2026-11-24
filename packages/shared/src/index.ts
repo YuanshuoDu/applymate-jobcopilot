@@ -82,10 +82,13 @@ export {
   type ReviewedApplicationSubmissionMaterial,
 } from "./application-submission-material.js";
 export {
+  OBJECTIVE_REVIEWED_FILL_BROWSER_START_SCHEMA,
+  parseObjectiveReviewedApplicationFillBrowserStartEvent,
   parseReviewedApplicationFillBrowserStartEvent,
   parseReviewedApplicationFillSource,
   REVIEWED_APPLICATION_FILL_BROWSER_START_SCHEMA,
   REVIEWED_APPLICATION_FILL_SOURCE_SCHEMA,
+  type ObjectiveReviewedApplicationFillBrowserStartBinding,
   type ReviewedApplicationFillBrowserStartBinding,
   type ReviewedApplicationFillSourceSelection,
 } from "./application-reviewed-fill-proof.js";

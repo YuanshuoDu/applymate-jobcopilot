@@ -26,7 +26,7 @@ import { acquireSourceMaterialFence } from "../db/source-material-fence.js"
 
 type Row = Record<string, unknown>
 type Queryable = Pick<PoolClient, "query">
-export type ObjectiveReviewedFillReadPhase = "prepare" | "browser_start" | "completion" | "completion_replay"
+export type ObjectiveReviewedFillReadPhase = "prepare" | "browser_start" | "completion" | "completion_replay" | "authorize" | "marker" | "boundary"
 export type ObjectiveReviewedFillReadInput = Readonly<{ userId: string; sessionId: string; fillTurnId: string;
   applicationTaskId: string; jobId: string; turnInput: unknown; phase: ObjectiveReviewedFillReadPhase; now?: Date }>
 export type ObjectiveReviewedApplicationFillEvidence = Readonly<{
@@ -80,7 +80,6 @@ export async function readObjectiveReviewedApplicationFillSource(
       || selection.sourceTurnId !== intent.sourceTurnId || selection.slotOrdinals.length === 0
       || !selection.slotOrdinals.includes(intent.slotOrdinal)
       || objectiveApplicationReviewSetId(input.sessionId, intent.reviewTurnId) !== intent.setId) return undefined
-
     const setState = await readObjectiveApplicationReviewSetState(client, { userId: input.userId, sessionId: input.sessionId,
       turnId: intent.reviewTurnId, selection, now: input.now ?? new Date() })
     const member = setState?.members.find(value => value.slotOrdinal === intent.slotOrdinal)
@@ -90,7 +89,6 @@ export async function readObjectiveReviewedApplicationFillSource(
       || !member || member.status !== "approved" || member.approvalId !== intent.approvalId
       || member.applicationTaskId !== input.applicationTaskId || member.jobId !== input.jobId
       || member.proof.materialProofHash !== source.materialProofHash) return undefined
-
     const proof = parseObjectiveApplicationReviewMemberProof(member.proof)
     if (!proof || !matchesIntent(proof, intent, selection)
       || !await approvalAndFillTurnValid(client, input, intent, source)) return undefined
@@ -157,7 +155,8 @@ async function approvalAndFillTurnValid(client: Queryable, input: ObjectiveRevie
   const row = record(result.rows[0]), expires = date(row?.expiresAt), decided = date(row?.decidedAt)
   const created = date(row?.fillCreatedAt)
   const expectedTurnStatus = input.phase === "completion_replay" ? ["waiting_for_approval"]
-    : input.phase === "completion" ? ["queued", "in_progress", "waiting_for_dependency"] : ["in_progress"]
+    : ["authorize", "marker", "boundary"].includes(input.phase) ? ["waiting_for_approval", "queued", "in_progress"]
+      : input.phase === "completion" ? ["queued", "in_progress", "waiting_for_dependency"] : ["in_progress"]
   return result.rows.length === 1 && row?.status === "approved" && row.materialHash === intent.materialProofHash
     && row.consumedAt === null && !!expires && !!decided && !!created && decided <= created && created <= expires
     && row.fillSource === "user" && row.fillExecutionMode === "canonical_task_graph"
@@ -183,7 +182,8 @@ async function readApplicationTask(client: Queryable, input: ObjectiveReviewedFi
   [input.applicationTaskId, input.userId, input.sessionId, input.jobId])
   const row = record(result.rows[0])
   const expected = input.phase === "completion_replay" ? { status: "waiting_for_authorization", checkpoint: "form_filled" }
-    : input.phase === "completion" ? { status: "filling", checkpoint: "browser_active" }
+    : input.phase === "boundary" ? { status: "filling", checkpoint: "submission_request_started" }
+      : input.phase === "completion" || input.phase === "authorize" || input.phase === "marker" ? { status: "filling", checkpoint: "browser_active" }
       : { status: "filling", checkpoint: "taskgraph_fill_queued" }
   return result.rows.length === 1 && row?.id === input.applicationTaskId && safeId(row.resumeId)
     && row.fillTurnId === input.fillTurnId && row.fillTurnSessionId === input.sessionId && row.fillTurnUserId === input.userId
@@ -228,7 +228,7 @@ function sameOutcome(outcome: NonNullable<Awaited<ReturnType<typeof readComplete
 }
 function validInput(input: ObjectiveReviewedFillReadInput): boolean {
   return [input.userId, input.sessionId, input.fillTurnId, input.applicationTaskId, input.jobId].every(safeId)
-    && ["prepare", "browser_start", "completion", "completion_replay"].includes(input.phase)
+    && ["prepare", "browser_start", "completion", "completion_replay", "authorize", "marker", "boundary"].includes(input.phase)
     && (input.now === undefined || input.now instanceof Date && Number.isFinite(input.now.getTime()))
 }
 function record(value: unknown): Row | undefined {

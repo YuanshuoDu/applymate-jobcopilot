@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from "pg"
 import { markSubmissionRequestStarted, type ApplicationSubmissionStartScope } from "../../db/application-task-state.js"
-import { readSubmissionTurnState, withReviewedApplicationSubmitRequestFence } from "../../db/reviewed-application-submit-request-fence.js"
+import { readSubmissionTurnState, withReviewedApplicationSubmitRequestFence, type ReviewedSubmitSourceExpectation } from "../../db/reviewed-application-submit-request-fence.js"
 import { appendFencedSubmitAudit } from "../../queue/application-submit-fence.js"
 
 export const APPLICATION_SUBMISSION_STOP_POLL_MS = 250
@@ -49,7 +49,7 @@ export async function acquireApplicationSubmissionStartFence(
   let open = false
   let released = false
   let markerCommitted = false
-  let markerSourceTurnId: string | null = null
+  let markerExpectedSource: ReviewedSubmitSourceExpectation = undefined
   const releaseReservedMarkerClient = (): void => {
     const reserved = markerClient
     markerClient = undefined
@@ -91,7 +91,7 @@ export async function acquireApplicationSubmissionStartFence(
       releaseReservedMarkerClient()
       return declined(markerAttempt.value, releasePermitOnce)
     }
-    markerSourceTurnId = markerAttempt.sourceTurnId
+    markerExpectedSource = markerAttempt.objectiveSource ? { kind: "objective", source: markerAttempt.objectiveSource } : markerAttempt.sourceTurnId
     try {
       await markerConnection.query("COMMIT")
       markerCommitted = true
@@ -116,7 +116,7 @@ export async function acquireApplicationSubmissionStartFence(
     await boundary.query("BEGIN")
     open = true
     await boundary.query("SELECT set_config($1, $2, true)", ["app.user_id", scope.userId])
-    const boundaryAttempt = await withReviewedApplicationSubmitRequestFence(boundary, scope, "boundary", markerSourceTurnId, async () => {
+    const boundaryAttempt = await withReviewedApplicationSubmitRequestFence(boundary, scope, "boundary", markerExpectedSource, async () => {
       const state = await readSubmissionTurnState(boundary, scope)
       return isStopped(state.sessionStatus, state.turnStatus, state.interrupted) ? "stopped" as const : "ready" as const
     })
