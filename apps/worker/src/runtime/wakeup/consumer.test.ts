@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
+import { hashApprovalScope } from "@jobcopilot/agent-protocol"
+import { buildObjectiveApplicationResumeWitness } from "@jobcopilot/shared"
+import { protocolScope } from "../approval/types.js"
 
 import { drainAgentWakeups, resumeAgentTurn } from "./consumer.js"
 import type { AgentTurnWakeupPayload } from "./types.js"
@@ -11,6 +14,10 @@ const wakeup: AgentTurnWakeupPayload = {
 const approvalWakeup: AgentTurnWakeupPayload = {
   eventId: "event_approval", sessionId: "session_1", turnId: "turn_1", itemId: "agent-wait:approval:a1",
   waitKind: "approval", waitId: "a1", toolCallId: "call_approval", status: "approved", nextTurnRevision: 6,
+}
+const approvalSetWakeup: AgentTurnWakeupPayload = {
+  eventId: "event_approval_set", sessionId: "session_1", turnId: "turn_1", itemId: "agent-wait:approval-set:set_1",
+  waitKind: "approval_set", waitId: "set_1", toolCallId: null, status: "resolved", nextTurnRevision: 7,
 }
 
 type FakeOutboxRow = { id: string; aggregateId: string; payload: unknown; publishedAt?: Date | null }
@@ -27,6 +34,10 @@ type FakeOptions = {
   } | null
   item?: { status: string; taskId?: string | null; content: unknown } | null
   event?: { sessionId: string; turnId: string; itemId: string | null; type: string; payload: unknown } | null
+  approvalRows?: Array<Record<string, unknown>>
+  memberEvents?: Array<Record<string, unknown>>
+  sourceTurnPresent?: boolean
+  completionEventPresent?: boolean
   execution?: { userId: string; sessionId: string; status: string; error: string | null; completedAt: string | null } | null
   failEventOnce?: boolean
   failExecutionUpdateOnce?: boolean
@@ -44,21 +55,55 @@ function wakeupEnvelope(payload = wakeup) {
   }
 }
 
+async function approvalSetFixture() {
+  const expiresAt = new Date("2027-01-01T00:00:00.000Z")
+  const set = { schema: "objective-application-approval-set.v1", waitKind: "approval_set", setId: "set_1",
+    sourceTurnId: "source_turn", intentHash: "a".repeat(64), expiresAt: expiresAt.toISOString(),
+    members: [{ slotOrdinal: 1, approvalId: "approval_1" }, { slotOrdinal: 2, approvalId: "approval_2" }] }
+  const rows: Array<Record<string, unknown>> = []
+  const events: Array<Record<string, unknown>> = []
+  for (const [index, status] of ["approved", "rejected"].entries()) {
+    const id = `approval_${index + 1}`, jobId = `job_${index + 1}`, toolCallId = `call_${index + 1}`
+    const material = { name: "Tailored", content: { summary: "grounded" }, templateId: null, templateOptions: null,
+      kind: "adapted", targetJobId: jobId, parentResumeId: null, basicsDetached: false }
+    const resumeWitness = buildObjectiveApplicationResumeWitness({ userId: "user_1", jobId, resumeId: `resume_${index + 1}`,
+      finalResumeAssignmentRevision: 2, materialRevision: 3, material })!
+    const hashes = { resourceHash: "1".repeat(64), materialHash: "2".repeat(64), answersHash: "3".repeat(64), nonceHash: "4".repeat(64) }
+    const scope = { userId: "user_1", sessionId: "session_1", turnId: "turn_1", jobId, toolCallId,
+      action: "review_application" as const, ...hashes, revision: 5, expiresAt }
+    const scopeHash = await hashApprovalScope(protocolScope(scope, hashes.nonceHash))
+    rows.push({ id, sessionId: "session_1", turnId: "turn_1", userId: "user_1", taskId: null, jobId, toolCallId,
+      type: "review_application", status, payload: { schema: "objective-application-approval-set-member.v1", setId: "set_1",
+        sourceTurnId: "source_turn", slotOrdinal: index + 1, proof: { resumeWitness } }, ...hashes, scopeHash,
+      revision: 5, expiresAt, consumedAt: null })
+    events.push({ correlationId: id, type: "approval.resolved", actor: "user", itemId: approvalSetWakeup.itemId,
+      turnId: "turn_1", causationId: approvalSetWakeup.itemId, idempotencyKey: `objective-approval-set-command:cmd_${id}`,
+      payload: { waitKind: "approval", waitId: id, itemId: approvalSetWakeup.itemId, turnId: "turn_1", toolCallId,
+        status, nextTurnRevision: 6 } })
+  }
+  return { payload: approvalSetWakeup, item: { status: "completed", taskId: null, content: set }, approvalRows: rows,
+    memberEvents: events, sourceTurnPresent: true }
+}
+
 function fakePool(options: FakeOptions = {}) {
   const calls: Array<[string, unknown[] | undefined]> = []
   const currentWakeup = options.payload ?? wakeup
   const rows = new Map((options.rows ?? [{ id: "outbox_1", aggregateId: currentWakeup.sessionId, payload: wakeupEnvelope(currentWakeup) }]).map((row) => [row.id, { ...row, publishedAt: row.publishedAt ?? null }]))
   const outboxUpdates: Array<{ id: string; lastError: unknown }> = []
   let turn = options.turn === undefined ? {
-    userId: "user_1", status: currentWakeup.waitKind === "approval" ? "waiting_for_approval" : "waiting_for_user",
+    userId: "user_1", status: currentWakeup.waitKind !== "question" ? "waiting_for_approval" : "waiting_for_user",
     revision: currentWakeup.nextTurnRevision, source: "user", executionMode: "canonical_task_graph", input: {}, rootTaskId: null, hasLiveLease: false,
   } : options.turn
   const item = options.item === undefined
-    ? currentWakeup.waitKind === "approval"
+    ? currentWakeup.waitKind === "approval_set"
+      ? { status: "completed", taskId: null, content: null }
+      : currentWakeup.waitKind === "approval"
       ? { status: "completed", taskId: null, content: { waitKind: "approval", approvalId: "a1", toolCallId: "call_approval" } }
       : { status: "completed", taskId: null, content: { waitKind: "question", questionId: "q1", toolCallId: "call_1", answer: "secret-answer" } }
     : options.item
   const event = options.event === undefined ? { sessionId: currentWakeup.sessionId, turnId: currentWakeup.turnId, itemId: currentWakeup.itemId, type: "turn.wakeup", payload: wakeupEnvelope(currentWakeup).payload } : options.event
+  const wakeupEvent = event && currentWakeup.waitKind === "approval_set" ? { ...event, taskId: null, actor: "user", correlationId: currentWakeup.turnId,
+    causationId: "item_completed_event", idempotencyKey: `approval-set:${currentWakeup.waitId}:wakeup` } : event
   const execution = options.execution === undefined ? { userId: "user_1", sessionId: wakeup.sessionId, status: "waiting_for_user", error: "old error", completedAt: "old completion" } : options.execution
   let failEventOnce = options.failEventOnce ?? false
   let failExecutionUpdateOnce = options.failExecutionUpdateOnce ?? false
@@ -97,12 +142,30 @@ function fakePool(options: FakeOptions = {}) {
       if (sql.includes('SELECT "userId", "status" FROM "agent_sessions"')) {
         return { rows: [{ userId: "user_1", status: options.sessionStatus ?? "running" }], rowCount: 1 }
       }
+      if (sql.includes("'item.completed'")) {
+        const rows = options.completionEventPresent === false ? [] : [{ id: "item_completed_event", turnId: "turn_1",
+          itemId: currentWakeup.itemId, type: "item.completed", actor: "orchestrator", correlationId: currentWakeup.itemId,
+          causationId: currentWakeup.itemId, idempotencyKey: `agent-wait:${currentWakeup.itemId}:completed`,
+          taskId: null, payload: { itemId: currentWakeup.itemId, status: "completed" } }]
+        return { rows, rowCount: rows.length }
+      }
+      if (sql.includes('SELECT "correlationId"') && sql.includes("'approval.resolved'")) {
+        const rows = options.memberEvents ?? []
+        return { rows, rowCount: rows.length }
+      }
+      if (sql.includes('FROM "agent_approvals"')) {
+        const rows = options.approvalRows ?? []
+        return { rows, rowCount: rows.length }
+      }
+      if (sql.includes('SELECT "id" FROM "agent_turns"') && sql.includes("'completed'")) {
+        return options.sourceTurnPresent === false ? { rows: [], rowCount: 0 } : { rows: [{ id: "source_turn" }], rowCount: 1 }
+      }
       if (sql.includes('FROM "agent_events"')) {
         if (failEventOnce) {
           failEventOnce = false
           throw new Error("temporary database failure")
         }
-        return { rows: event ? [event] : [], rowCount: event ? 1 : 0 }
+        return { rows: wakeupEvent ? [wakeupEvent] : [], rowCount: wakeupEvent ? 1 : 0 }
       }
       if (sql.includes('SELECT "aggregateId", "topic" FROM "agent_outbox"')) {
         const row = dispatchRows.find(candidate => candidate.idempotencyKey === String(params?.[0]))
@@ -179,6 +242,60 @@ function hasWrite(calls: Array<[string, unknown[] | undefined]>): boolean {
 }
 
 describe("Agent wakeup consumer", () => {
+  it("resumes a closed approval set only after proving its complete same-owner member set", async () => {
+    const fixture = await approvalSetFixture()
+    const fake = fakePool(fixture)
+
+    await expect(resumeAgentTurn(fake.pool, fixture.payload)).resolves.toMatchObject({ status: "resumed", toolCallId: null })
+    await expect(resumeAgentTurn(fake.pool, fixture.payload)).resolves.toMatchObject({ status: "already_resumed" })
+    expect(fake.dispatchRows()).toHaveLength(1)
+    expect(fake.calls.filter(([sql, params]) => sql.includes('INSERT INTO "agent_outbox"') && params?.[1] === "agent.turn.dispatch")).toHaveLength(1)
+    expect(fake.dispatchRows()[0]?.payload).toEqual({ turnId: fixture.payload.turnId, sessionId: fixture.payload.sessionId, ownerId: `wakeup:${fixture.payload.eventId}` })
+    expect(fake.calls.some(([sql]) => sql.includes("FOR UPDATE") && sql.includes('"agent_approvals"'))).toBe(true)
+    expect(fake.calls.some(([sql]) => sql.includes("FOR SHARE") && sql.includes('"status" = \'completed\'') && sql.includes('"agent_turns"'))).toBe(true)
+    expect(fake.calls.find(([sql]) => sql.includes("SET \"status\" = 'queued'"))?.[1]).toContain(fixture.payload.nextTurnRevision)
+  })
+
+  it("fails closed on an incomplete member row or a member that is still pending", async () => {
+    const fixture = await approvalSetFixture()
+    const missing = fakePool({ ...fixture, approvalRows: fixture.approvalRows.slice(0, 1) })
+    await expect(resumeAgentTurn(missing.pool, fixture.payload)).rejects.toMatchObject({ code: "approval_set_lineage_mismatch" })
+    expect(missing.turn).toMatchObject({ status: "waiting_for_approval", revision: fixture.payload.nextTurnRevision })
+    expect(missing.dispatchRows()).toHaveLength(0)
+
+    const pendingRows = fixture.approvalRows.map(row => row.id === "approval_2" ? { ...row, status: "pending" } : row)
+    const pending = fakePool({ ...fixture, approvalRows: pendingRows })
+    await expect(resumeAgentTurn(pending.pool, fixture.payload)).rejects.toMatchObject({ code: "approval_set_lineage_mismatch" })
+    expect(pending.turn).toMatchObject({ status: "waiting_for_approval", revision: fixture.payload.nextTurnRevision })
+    expect(pending.dispatchRows()).toHaveLength(0)
+  })
+
+  it("requires the distinct completed source Turn for an approval set", async () => {
+    const fixture = await approvalSetFixture()
+    const fake = fakePool({ ...fixture, sourceTurnPresent: false })
+    await expect(resumeAgentTurn(fake.pool, fixture.payload)).rejects.toMatchObject({ code: "approval_set_lineage_mismatch" })
+    expect(fake.dispatchRows()).toHaveLength(0)
+    expect(fake.calls.some(([sql]) => sql.includes("SET \"status\" = 'queued'"))).toBe(false)
+  })
+
+  it("requires the wakeup to be caused by the exact completed aggregate item event", async () => {
+    const fixture = await approvalSetFixture()
+    const fake = fakePool({ ...fixture, completionEventPresent: false })
+    await expect(resumeAgentTurn(fake.pool, fixture.payload)).rejects.toMatchObject({ code: "event_lineage_mismatch" })
+    expect(fake.dispatchRows()).toHaveLength(0)
+    expect(fake.calls.some(([sql]) => sql.includes("SET \"status\" = 'queued'"))).toBe(false)
+  })
+
+  it("defers a valid approval-set wake while its owning Turn lease is live", async () => {
+    const fixture = await approvalSetFixture()
+    const fake = fakePool({ ...fixture, turn: { userId: "user_1", status: "waiting_for_approval",
+      revision: fixture.payload.nextTurnRevision, hasLiveLease: true } })
+    await expect(resumeAgentTurn(fake.pool, fixture.payload)).resolves.toMatchObject({ status: "deferred" })
+    expect(fake.turn).toMatchObject({ status: "waiting_for_approval", revision: fixture.payload.nextTurnRevision })
+    expect(fake.dispatchRows()).toHaveLength(0)
+    expect(fake.calls.some(([sql]) => sql.includes("UPDATE \"agent_executions\""))).toBe(false)
+  })
+
   it("resumes the same Turn and preserves the original toolCallId", async () => {
     const fake = fakePool()
     const result = await resumeAgentTurn(fake.pool, wakeup)

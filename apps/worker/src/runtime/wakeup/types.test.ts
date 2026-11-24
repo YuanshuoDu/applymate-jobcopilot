@@ -20,4 +20,14 @@ describe("Agent Turn wakeup protocol", () => {
     expect(parseWakeup({ ...payload, payload: { ...payload.payload, answer: "private" } })).not.toBeNull()
     expect(parseWakeup({ ...payload, type: "agent.session.event" })).toBeNull()
   })
+
+  it("accepts only the completed approval-set resolution outcome", () => {
+    const group = {
+      eventId: "event_2", sessionId: "session_1", turnId: "turn_1", itemId: "agent-wait:approval-set:set_1", type: "turn.wakeup",
+      payload: { waitKind: "approval_set", waitId: "set_1", itemId: "agent-wait:approval-set:set_1", turnId: "turn_1", toolCallId: null, status: "resolved", nextTurnRevision: 8 },
+    }
+    expect(parseWakeup(group)).toMatchObject({ waitKind: "approval_set", waitId: "set_1", status: "resolved", toolCallId: null, nextTurnRevision: 8 })
+    expect(parseWakeup({ ...group, payload: { ...group.payload, toolCallId: "call_1" } })).toBeNull()
+    expect(parseWakeup({ ...group, payload: { ...group.payload, status: "approved" } })).toBeNull()
+  })
 })
