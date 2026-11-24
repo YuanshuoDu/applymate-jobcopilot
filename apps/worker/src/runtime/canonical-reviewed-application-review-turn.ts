@@ -61,7 +61,7 @@ export async function runCanonicalReviewedApplicationReviewTurn(input: Canonical
   if (input.signal.aborted) return { status: "interrupted", stepCount: 0, toolCallCount: 0, errorCode: "turn_cancelled" }
   decision = { status: result.status, approvalId: result.approvalId, waitItemId: result.waitItemId }
 
-  const rootCheckpoint = await rootInputCheckpoint(input, owner, stepIdFor(owner.turnId), now())
+  const rootCheckpoint = await loadReviewedApplicationRootInputCheckpoint({ pool: input.pool, scope: input.scope, rootInputId: input.rootInputId }, owner, stepIdFor(owner.turnId), now())
   if (input.signal.aborted) return { status: "interrupted", stepCount: 0, toolCallCount: 0, errorCode: "turn_cancelled" }
   const stepId = `${STEP_PREFIX}${owner.turnId}`, step = await store.startStep({ owner, stepId, ordinal: 0, attempt: 1,
     inputThroughSequence: rootCheckpoint.inputThroughSequence, consumedInputIds: rootCheckpoint.consumedInputIds,
@@ -97,7 +97,9 @@ export async function runCanonicalReviewedApplicationReviewTurn(input: Canonical
   return { status: "completed", finalItemId, finalText: message, stepCount, toolCallCount }
 }
 
-async function rootInputCheckpoint(input: CanonicalReviewedApplicationReviewTurnInput, owner: ReviewOwner, stepId: string, now: Date) {
+export async function loadReviewedApplicationRootInputCheckpoint(input: {
+  pool: Pick<Pool, "connect">; scope: TenantScope; rootInputId: string
+}, owner: ReviewOwner, stepId: string, now: Date) {
   return createPgInputClaimStore(input.pool, input.scope).withTransaction(async transaction => {
     const lease = { ownerId: owner.ownerId, leaseVersion: owner.leaseVersion, now }
     const found = await transaction.loadRootInputContext?.({ sessionId: owner.sessionId, turnId: owner.turnId, inputId: input.rootInputId, lease })
