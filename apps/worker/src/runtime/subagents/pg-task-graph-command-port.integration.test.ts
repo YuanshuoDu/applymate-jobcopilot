@@ -1531,7 +1531,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     await adminPool.query(`GRANT SELECT ON "agent_tree_budget_reservations", "agent_native_semantic_rejections", "agent_mailbox_messages",
       "agent_mailbox_hydration_checkpoints", "agent_tool_result_references", "agent_wait_conditions", "agent_transcript_events",
       "agent_approvals", "agent_artifact_version", "agent_artifact_review", "application_tasks" TO "${roleName}"`)
-    await adminPool.query(`GRANT SELECT ("id", "userId", "company", "role", "location", "status", "score", "url", "source", "salary", "description", "keywords") ON "Job" TO "${roleName}"`)
+    await adminPool.query(`GRANT SELECT ("id", "userId", "company", "role", "location", "status", "score", "url", "source", "salary", "description", "keywords", "createdAt", "updatedAt") ON "Job" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("id") ON "agent_turns" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("id") ON "agent_steps" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO "${roleName}"`)
