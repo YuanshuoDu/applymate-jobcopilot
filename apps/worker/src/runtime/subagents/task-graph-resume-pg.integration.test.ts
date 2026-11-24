@@ -20973,7 +20973,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       ])
       const applicationEffects = await pool!.query<{ applicationTasks: string; approvals: string; submissions: string }>(
         `SELECT (SELECT COUNT(*)::text FROM application_tasks WHERE "userId" = $1 AND "jobId" = $2) AS "applicationTasks",
-          (SELECT COUNT(*)::text FROM "AgentApproval" WHERE "userId" = $1 AND "sessionId" = $3 AND "turnId" = $4) AS "approvals",
+          (SELECT COUNT(*)::text FROM "agent_approvals" WHERE "userId" = $1 AND "sessionId" = $3 AND "turnId" = $4) AS "approvals",
           (SELECT COUNT(*)::text FROM submission_attempt WHERE "userId" = $1 AND "jobId" = $2) AS "submissions"`,
         [value.userId, jobId, value.sessionId, value.turnId],
       )
