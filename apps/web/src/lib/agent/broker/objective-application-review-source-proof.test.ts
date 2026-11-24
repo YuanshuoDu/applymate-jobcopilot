@@ -1,4 +1,5 @@
-import { buildObjectiveApplicationReviewMemberProof, buildObjectiveApplicationResumeWitness } from "@jobcopilot/shared"
+import { createHash } from "node:crypto"
+import { buildObjectiveApplicationReviewMemberProof, buildObjectiveApplicationResumeWitness, canonicalJson } from "@jobcopilot/shared"
 import { describe, expect, it } from "vitest"
 import { canonicalTaskGraphSourceKey } from "../session/final-task-graph-source-detail"
 import { parseObjectiveTailorProgressSnapshot } from "../session/objective-tailor-progress-snapshot"
@@ -108,8 +109,8 @@ function makePair(corrected: boolean) {
   const snapshot = parseObjectiveTailorProgressSnapshot(rawSnapshot)!
   const currentWriterId = corrected ? writerId : initialWriterId, currentReviewerId = corrected ? reviewerId : initialReviewerId
   const tasks = new Map<string, Record<string, unknown>>([
-    ["scout-task-id", task("scout-task-id", "scout", "completed", roleResult("scout", { status: "completed" }))],
-    ["analyst-task-id", task("analyst-task-id", "analyst", "completed", roleResult("analyst", { status: "completed" }))],
+    ["scout-task-id", task("scout-task-id", "scout", "completed", typedSourceResult("scout", "candidate-count"))],
+    ["analyst-task-id", task("analyst-task-id", "analyst", "completed", typedSourceResult("analyst", "finding-count"))],
     [initialWriterId, task(initialWriterId, "writer", "completed", roleResult("writer", { artifactRef: initialArtifact }), baseContext)],
     [initialReviewerId, task(initialReviewerId, "reviewer", "completed", roleResult("reviewer", {
       artifactRef: initialArtifact, reviewStatus: initialReviewStatus, reviewHash: initialReviewHash }), baseContext)],
@@ -148,6 +149,12 @@ function task(id: string, role: string, status: string, result: unknown, context
 function roleResult(role: string, result: Record<string, unknown>) {
   return { finalItemId: null, finalText: "completed", status: "completed", stepCount: 1, toolCallCount: 1,
     structuredResult: { schemaVersion: "agent-harness.v2.subagent.result", role, status: "completed", ...result } }
+}
+function typedSourceResult(role: "scout" | "analyst", criterionId: string) {
+  const envelope = roleResult(role, {}), resultDigest = createHash("sha256").update(canonicalJson(envelope.structuredResult)).digest("hex")
+  return { ...envelope, taskGraphVerificationReport: { verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed",
+    reasonCode: "criteria_met", criteria: [{ criterionId, status: "passed", reasonCode: "criteria_met" }],
+    evidenceDigest: "a".repeat(64), resultDigest } }
 }
 function objectRecord(value: unknown): Record<string, unknown> { return value as Record<string, unknown> }
 function prefixed(character: string) { return `sha256:${character.repeat(64)}` }

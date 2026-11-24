@@ -82,8 +82,13 @@ function fixture(options: { headVersion?: number; content?: unknown; completedRe
       scopeHash: "a".repeat(64), revision: 0, expiresAt: new Date("2099-01-01T00:00:00.000Z"), proof: proof!, resumeWitness } }
   const itemContent = { schema: "objective-application-approval-set.v1", waitKind: "approval_set", setId, sourceTurnId,
     intentHash, expiresAt: "2099-01-01T00:00:00.000Z", members: [{ slotOrdinal: 1, approvalId }] }
-  const sourceResult = (role: string) => ({ finalItemId: null, finalText: "typed evidence", status: "completed", stepCount: 1, toolCallCount: 1,
-    structuredResult: { schemaVersion: "agent-harness.v2.subagent.result", role, status: "completed" } })
+  const sourceResult = (role: "scout" | "analyst") => {
+    const structuredResult = { schemaVersion: "agent-harness.v2.subagent.result", role, status: "completed" }
+    return { finalItemId: null, finalText: "typed evidence", status: "completed", stepCount: 1, toolCallCount: 1, structuredResult,
+      taskGraphVerificationReport: { verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed", reasonCode: "criteria_met",
+        criteria: [{ criterionId: role === "scout" ? "candidate-count" : "finding-count", status: "passed", reasonCode: "criteria_met" }],
+        evidenceDigest: "a".repeat(64), resultDigest: createHash("sha256").update(canonicalJson(structuredResult)).digest("hex") } }
+  }
   const writerResult = { finalItemId: null, finalText: "Draft", status: "completed", stepCount: 1, toolCallCount: 1,
     structuredResult: { schemaVersion: "agent-harness.v2.subagent.result", role: "writer", status: "completed", artifactRef } }
   const reviewerResult = { finalItemId: null, finalText: "Passed", status: "completed", stepCount: 1, toolCallCount: 1,

@@ -3,6 +3,7 @@ import { canonicalTaskGraphSourceKey } from "../session/final-task-graph-source-
 import type { FinalTaskGraphSourceManifest } from "../session/final-task-graph-source-manifest"
 import { parseObjectiveApplicationReviewMemberProof } from "@jobcopilot/shared"
 import type { ObjectiveApprovalSetSourceInput } from "./objective-application-approval-set-decision"
+import { parseObjectiveApplicationTypedSourceResult } from "./objective-application-review-source-verification"
 
 type Source = Readonly<{ slotOrdinal: number; writerTaskId: string; reviewerTaskId: string; artifactId: string; version: number;
   contentHash: string; sourceDigest: string; reviewHash: string }>
@@ -57,7 +58,9 @@ export function validObjectiveApplicationSourceManifest(manifest: FinalTaskGraph
   const indices = Array.from({ length: snapshot.marker.sourceNodeCount }, (_, index) => index).filter(index => !historical.includes(index))
   return indices.length === manifest.sources.length && manifest.sources.every((source, index) => {
     const nodeIndex = indices[index], node = nodeIndex === undefined ? undefined : snapshot.nodes[nodeIndex]
-    const task = node && record(tasks.get(node.taskId)), result = task && structured(task.result)
+    const task = node && record(tasks.get(node.taskId)), role = node?.templateId
+    const result = task && (role === "scout" || role === "analyst") && typeof task.id === "string"
+      ? parseObjectiveApplicationTypedSourceResult(task.result, role, task.id) : undefined
     return !!node && !!task && !!result && source.nodeIndex === nodeIndex
       && source.sourceKey === canonicalTaskGraphSourceKey(finalItemId, manifest.graphRevision, nodeIndex)
       && source.role === node.templateId && (source.role === "scout" || source.role === "analyst")
@@ -201,12 +204,5 @@ function record(value: unknown): Record<string, unknown> | undefined {
 }
 function denseStrings(value: unknown): string[] | undefined { return Array.isArray(value) && Object.getPrototypeOf(value) === Array.prototype
   && Reflect.ownKeys(value).length === value.length + 1 && value.length <= 1 && value.every(item => typeof item === "string" && TASK.test(item)) ? value : undefined }
-function structured(value: unknown): Record<string, unknown> | undefined {
-  const envelope = record(typeof value === "string" ? parseJson(value) : value), result = envelope && record(envelope.structuredResult)
-  return envelope && exact(envelope, "finalItemId,finalText,status,stepCount,structuredResult,toolCallCount")
-    && envelope.status === "completed" && result && typeof result.role === "string"
-    && (result.status === "completed" || result.status === "partial") ? result : undefined
-}
-function parseJson(value: string): unknown { try { return JSON.parse(value) as unknown } catch { return undefined } }
 function positive(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value > 0 }
 function safeId(value: unknown): value is string { return typeof value === "string" && ID.test(value) && value.trim() === value }
