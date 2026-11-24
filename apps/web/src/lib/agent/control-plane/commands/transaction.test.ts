@@ -118,6 +118,27 @@ describe("Agent command transaction helpers", () => {
     }))
   })
 
+  it("persists the gated Objective budget on the root Turn with its dispatch outbox", async () => {
+    vi.stubEnv("ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES", "1")
+    try {
+      const agentTurn = { create: vi.fn().mockResolvedValue({ id: "turn_objective_budget" }) }
+      const agentOutbox = { create: vi.fn().mockResolvedValue({}) }
+      const command = { sessionId: "session_1", userId: "user_1", clientMessageId: "client_objective_budget", source: "user" as const }
+
+      await createRootTurn({ agentTurn, agentOutbox } as unknown as CommandTransaction, command,
+        [{ type: "text", text: "Complete the objective" }], undefined, undefined, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
+
+      expect(agentTurn.create.mock.calls[0]?.[0]?.data.budgetSnapshot).toEqual({
+        limits: { maxSteps: 96 }, objectiveTailorProfile: "agent-harness.v2.objective-tailor-execution-budget.v1",
+      })
+      expect(agentOutbox.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
+        topic: "agent.turn.dispatch", aggregateId: command.sessionId, idempotencyKey: "turn-dispatch:turn_objective_budget",
+      }) }))
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
   it("marks only the exact user batch intent and verified binding as canonical", async () => {
     const agentTurn = { create: vi.fn().mockResolvedValue({ id: "turn_batch" }) }
     const agentOutbox = { create: vi.fn().mockResolvedValue({}) }

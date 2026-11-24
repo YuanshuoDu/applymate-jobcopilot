@@ -4,6 +4,7 @@ import { Prisma } from "@prisma/client"
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, type InputContentPart, type TurnSource, type VerifiedShortlistSelectionBinding } from "@jobcopilot/agent-protocol"
 
 import { appendAgentEventWithOutboxInTransaction } from "../../session/fact-store"
+import { selectObjectiveTailorExecutionBudgetSnapshot } from "./objective-tailor-execution-budget"
 import { activeTurnChanged, sessionNotFound } from "./errors"
 import type { CommandDisposition, CommandIdentity, InterruptDisposition, ObjectiveVerificationRequirements, SelectedJobPreparationScope, ServerAgentTurnIntent } from "./types"
 
@@ -115,7 +116,7 @@ export async function createRootTurn(
       }),
       modelProfileSnapshot: json({}),
       toolPolicySnapshot: json({}),
-      budgetSnapshot: json({}),
+      budgetSnapshot: json(selectObjectiveTailorExecutionBudgetSnapshot({ featureFlag: process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES, source: command.source, intent, hasSelectedJobBinding: selectedJobPreparation !== undefined || verifiedShortlistSelection !== undefined })),
     },
     select: { id: true },
   })
