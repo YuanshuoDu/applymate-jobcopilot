@@ -73,7 +73,7 @@ import { parseStoredTaskGraphVerificationReport, TASK_GRAPH_EMPTY_ANALYST_VERIFI
 import { hasNoCurrentAttemptTaskGraphToolReceipts } from "./task-graph-empty-analyst-proof.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 // @ts-expect-error Fixture-only JavaScript module has no declaration; Vitest resolves the import at runtime.
-import { objectiveTailorWaveDiagnosticCode, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
+import { objectiveTailorCorrectionReceiptStatus, objectiveTailorCorrectionRetryEligible, objectiveTailorWaveDiagnosticCode, objectiveTailorWaveIdentity, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 import type { WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { readTaskGraphConfirmedLocationSteer } from "./task-graph-confirmed-location-steer.js"
@@ -5488,7 +5488,9 @@ async function waitForProcessLine(child: ProcessFixtureChild, prefix: string, ti
 
 const OBJECTIVE_TAILOR_WAVE_DIAGNOSTIC_CODES = new Set([
   "revision_mismatch", "revision_limit", "objective_tailor_wave_not_eligible", "objective_tailor_wave_source_stale",
-  "objective_tailor_wave_stale", "idempotency_conflict", "task_graph_state_missing",
+  "objective_tailor_wave_stale", "idempotency_conflict", "task_graph_state_missing", "objective_tailor_correction_stale",
+  "objective_tailor_correction_source_stale", "task_graph_continuation_budget_required", "objective_tailor_wave_failed",
+  "objective_tailor_wave_receipt_invalid",
 ])
 const OBJECTIVE_TAILOR_WAVE1_MODEL_MARKERS = [
   "GRAPH_CONTEXT_PARSED", "GRAPH_CONTEXT_UNAVAILABLE",
@@ -5507,7 +5509,7 @@ const OBJECTIVE_TAILOR_MODEL_DIAGNOSTIC_CODES = new Set([
   ...OBJECTIVE_TAILOR_WAVE_DIAGNOSTIC_CODES, "invalid_state", "task_graph_objective_coverage_incomplete",
   "fixture_observation_unavailable", "fixture_wave1_identity_unavailable", "fixture_wave_catalog_unavailable",
   "fixture_wave_receipt_invalid", "fixture_plan_receipt_invalid", "fixture_wait_result_error",
-  "fixture_ordinary_plan_append_was_not_closed", "fixture_root_phase_unrecognized",
+  "fixture_correction_receipt_invalid", "fixture_ordinary_plan_append_was_not_closed", "fixture_root_phase_unrecognized",
   "fixture_wave_replay_args_missing", "fixture_wave_replay_identity_mismatch",
 ])
 
@@ -5516,6 +5518,20 @@ function latestObjectiveTailorMarkerValue(output: readonly string[], prefix: str
   if (!line) return "none"
   const value = line.slice(prefix.length)
   return allowed.has(value) ? value : "other"
+}
+
+function objectiveTailorSlot6ReceiptDiagnostic(output: readonly string[]): RecordValue {
+  const prefix = "TAILOR_CORRECTION_SLOT6_RECEIPT_"
+  const line = [...output].reverse().find(value => value.startsWith(prefix))
+  if (!line) return { status: "none" }
+  const value = line.slice(prefix.length)
+  const denied = /^DENIED ([a-z0-9_]{1,64})$/.exec(value)
+  if (denied) {
+    const code = denied[1]!
+    return { status: "denied", code: OBJECTIVE_TAILOR_MODEL_DIAGNOSTIC_CODES.has(code) ? code : "other" }
+  }
+  const statuses = new Set(["MISSING", "INVALID_REVISION", "INVALID_STATUS", "INVALID_NODES", "INVALID_READY", "ACCEPTED"])
+  return { status: statuses.has(value) ? value.toLowerCase() : "other" }
 }
 
 function objectiveTailorWaveMarkerDiagnostics(output: readonly string[]) {
@@ -5735,9 +5751,13 @@ function projectObjectiveTailorCorrectionWaitSnapshot(
       wave1WaitReady: output.includes("TAILOR_WAVE1_WAIT_READY"),
       wave2WaitReady: output.includes("TAILOR_WAVE2_WAIT_READY"),
       wrongFeedbackRejected: output.includes("TAILOR_WRONG_FEEDBACK_REJECTED"),
+      correctionSlot2ReceiptAccepted: output.includes("TAILOR_CORRECTION_SLOT2_RECEIPT_ACCEPTED"),
+      correctionSlot6Receipt: objectiveTailorSlot6ReceiptDiagnostic(output),
       correctionsWaitReady: output.includes("TAILOR_CORRECTIONS_WAIT_READY"),
       rootStreamFailed: output.includes("TAILOR_ROOT_STREAM_FAILED"),
     },
+    rootStreamFailureCode: latestObjectiveTailorMarkerValue(output, "TAILOR_ROOT_STREAM_FAILURE ",
+      OBJECTIVE_TAILOR_MODEL_DIAGNOSTIC_CODES),
   }
 }
 
@@ -7618,6 +7638,63 @@ describe("persisted TaskGraph wait scope", () => {
 })
 
 describe("compact TaskGraph wait failure diagnostics", () => {
+  it("retries only a newer revision mismatch for the exact correction slot and source", () => {
+    const call = { input: { correctionSlotId: "tailor-6", expectedRevision: 11 } }
+    const sourceKeys = ["scout-greenhouse", "scout-lever", "scout-workday", "analyst-greenhouse-a", "analyst-greenhouse-b", "analyst-lever", "analyst-workday"]
+    const analystKeys = sourceKeys.filter(key => key.startsWith("analyst-")), graph = { revision: 12,
+      nodes: sourceKeys.map(key => ({ key })), objectiveTailorWave: { slots: Array.from({ length: 8 }, (_, index) => ({
+        slotId: `tailor-${index + 1}`, sourceAnalystNodeKey: analystKeys[index % analystKeys.length],
+        initial: { writer: { taskId: `writer-${index + 1}` }, reviewer: { taskId: `reviewer-${index + 1}` } },
+        ...(index === 1 ? { correction: { writer: { taskId: "writer-correction-2" }, reviewer: { taskId: "reviewer-correction-2" } } } : {}),
+      })) } }
+    const identity = objectiveTailorWaveIdentity(graph, sourceKeys, analystKeys, 8, "tailor-6")
+    expect(identity?.slots).toHaveLength(8)
+    const denied = { error: true, value: { code: "revision_mismatch" } }
+    expect(objectiveTailorCorrectionRetryEligible(denied, call, graph, identity, identity, 1)).toBe(true)
+    expect(objectiveTailorCorrectionRetryEligible(denied, call, graph, identity, identity, 2)).toBe(true)
+    expect(objectiveTailorCorrectionRetryEligible(denied, call, graph, identity, identity, 0)).toBe(false)
+    expect(objectiveTailorCorrectionRetryEligible(denied, call, graph, identity, identity, 3)).toBe(false)
+    expect(objectiveTailorCorrectionRetryEligible(denied, call, { revision: 11 }, identity, identity, 1)).toBe(false)
+    expect(objectiveTailorCorrectionRetryEligible({ error: true, value: { code: "objective_tailor_correction_stale" } }, call, graph, identity, identity, 1)).toBe(false)
+    expect(objectiveTailorCorrectionRetryEligible(denied, { input: { ...call.input, correctionSlotId: "tailor-2" } }, graph, identity, identity, 1)).toBe(false)
+    expect(objectiveTailorCorrectionRetryEligible(denied, call, graph, identity, { ...identity, sourceKeys: ["other"] }, 1)).toBe(false)
+    const changedInitial = { ...graph, objectiveTailorWave: { slots: graph.objectiveTailorWave.slots.map(slot => slot.slotId === "tailor-6"
+      ? { ...slot, initial: { ...slot.initial, writer: { taskId: "writer-changed" } } } : slot) } }
+    expect(objectiveTailorCorrectionRetryEligible(denied, call, graph, identity,
+      objectiveTailorWaveIdentity(changedInitial, sourceKeys, analystKeys, 8, "tailor-6"), 1)).toBe(false)
+    const alreadyCorrected = { ...graph, objectiveTailorWave: { slots: graph.objectiveTailorWave.slots.map(slot => slot.slotId === "tailor-6"
+      ? { ...slot, correction: { writer: { taskId: "writer-6c" }, reviewer: { taskId: "reviewer-6c" } } } : slot) } }
+    expect(objectiveTailorWaveIdentity(alreadyCorrected, sourceKeys, analystKeys, 8, "tailor-6")).toBeUndefined()
+  })
+
+  it("classifies correction receipts without retaining private error details", () => {
+    const valid = { status: "accepted", revision: 11, nodes: [{}, {}], readyTaskIds: ["ready"] }
+    expect(objectiveTailorCorrectionReceiptStatus(undefined, 10)).toBe("MISSING")
+    expect(objectiveTailorCorrectionReceiptStatus({ error: true, value: { code: "objective_tailor_correction_stale" } }, 10))
+      .toBe("DENIED objective_tailor_correction_stale")
+    expect(objectiveTailorCorrectionReceiptStatus({ error: true, value: { code: "privatedatabasedetail" } }, 10))
+      .toBe("DENIED other")
+    expect(objectiveTailorCorrectionReceiptStatus({ error: false, value: { ...valid, status: "waiting" } }, 10))
+      .toBe("INVALID_STATUS")
+    expect(objectiveTailorCorrectionReceiptStatus({ error: false, value: { ...valid, revision: 12 } }, 10))
+      .toBe("INVALID_REVISION")
+    expect(objectiveTailorCorrectionReceiptStatus({ error: false, value: { ...valid, nodes: [{}] } }, 10))
+      .toBe("INVALID_NODES")
+    expect(objectiveTailorCorrectionReceiptStatus({ error: false, value: { ...valid, readyTaskIds: [] } }, 10))
+      .toBe("INVALID_READY")
+    expect(objectiveTailorCorrectionReceiptStatus({ error: false, value: valid }, 10)).toBe("ACCEPTED")
+
+    const projected = projectObjectiveTailorCorrectionWaitSnapshot(undefined, [
+      "TAILOR_CORRECTION_SLOT6_RECEIPT_DENIED objective_tailor_correction_stale",
+    ])
+    expect(record(projected.stages)?.correctionSlot6Receipt).toEqual({ status: "denied", code: "objective_tailor_correction_stale" })
+    const privateProjection = projectObjectiveTailorCorrectionWaitSnapshot(undefined, [
+      "TAILOR_CORRECTION_SLOT6_RECEIPT_DENIED privatedatabasedetail",
+    ])
+    expect(record(privateProjection.stages)?.correctionSlot6Receipt).toEqual({ status: "denied", code: "other" })
+    expect(JSON.stringify(privateProjection)).not.toContain("privatedatabasedetail")
+  })
+
   it("projects correction wait state through fixed statuses, counts, and stage booleans", () => {
     const secretId = "synthetic-private-task-id"
     const projected = projectObjectiveTailorCorrectionWaitSnapshot({
@@ -7630,9 +7707,27 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       available: true, turnStatus: "waiting_for_dependency", rootStatus: "waiting",
       wait: { status: "waiting", mode: "all", targetCount: 16, matchedCount: 3, suspended: true },
       correctionTasks: { count: 4, queued: 1, running: 2, completed: 1, failed: 0, other: 0 },
-      stages: { wave1WaitReady: true, wave2WaitReady: false, wrongFeedbackRejected: true, correctionsWaitReady: false },
+      stages: { wave1WaitReady: true, wave2WaitReady: false, wrongFeedbackRejected: true,
+        correctionSlot2ReceiptAccepted: false, correctionsWaitReady: false },
+      rootStreamFailureCode: "none",
     })
     expect(JSON.stringify(projected)).not.toContain(secretId)
+  })
+
+  it("retains only the allowlisted root failure code and correction receipt stage", () => {
+    const projected = projectObjectiveTailorCorrectionWaitSnapshot(undefined, [
+      "TAILOR_CORRECTION_SLOT2_RECEIPT_ACCEPTED", "TAILOR_ROOT_STREAM_FAILURE fixture_correction_receipt_invalid",
+      "TAILOR_ROOT_STREAM_FAILURE synthetic-private-error-text",
+    ])
+    expect(projected).toMatchObject({
+      available: false,
+      stages: { correctionSlot2ReceiptAccepted: true, rootStreamFailed: false },
+      rootStreamFailureCode: "other",
+    })
+    expect(JSON.stringify(projected)).not.toContain("synthetic-private-error-text")
+    expect(projectObjectiveTailorCorrectionWaitSnapshot(undefined, [
+      "TAILOR_ROOT_STREAM_FAILURE fixture_correction_receipt_invalid",
+    ]).rootStreamFailureCode).toBe("fixture_correction_receipt_invalid")
   })
 
   it("uses the existing typed Scout verification shape for its ordinary-plan probe", () => {
@@ -7650,6 +7745,8 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     expect(objectiveTailorWaveDiagnosticCode(new Error("synthetic-private-error-text"))).toBe("other")
     expect(objectiveTailorWaveDiagnosticCode(new Error("fixture_observation_unavailable")))
       .toBe("fixture_observation_unavailable")
+    expect(objectiveTailorWaveDiagnosticCode(new Error("fixture_correction_receipt_invalid")))
+      .toBe("fixture_correction_receipt_invalid")
   })
 
   it("recognizes the exact underscore-form wave model markers", () => {
@@ -21920,8 +22017,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       })
       const firstWaitResult = await pool!.query<{
         id: string; status: string; mode: string; targetTaskIds: unknown; matchedTaskIds: unknown
-        suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null
-      }>(`SELECT "id", "status", "mode", "targetTaskIds", "matchedTaskIds", "suspendedAt", "resolvedAt", "consumedAt"
+        createdAt: Date; suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null
+      }>(`SELECT "id", "status", "mode", "targetTaskIds", "matchedTaskIds", "createdAt", "suspendedAt", "resolvedAt", "consumedAt"
           FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3
             AND "parentTaskId" = $4 AND "idempotencyKey" = $5`,
       [value.userId, value.sessionId, value.turnId, rootTaskId, firstWaitKey])
@@ -22194,10 +22291,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(dispatches.rows.every(row => row.publishedAt instanceof Date)).toBe(true)
       const waits = await pool!.query<{
         id: string; idempotencyKey: string; status: string; mode: string; targetTaskIds: unknown; matchedTaskIds: unknown
-        result: unknown; suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null
+        stepId: string; result: unknown; createdAt: Date; deadlineAt: Date; updatedAt: Date
+        suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null
       }>(
-        `SELECT "id", "idempotencyKey", "status", "mode", "targetTaskIds", "matchedTaskIds", "result",
-                "suspendedAt", "resolvedAt", "consumedAt" FROM "agent_wait_conditions"
+        `SELECT "id", "idempotencyKey", "status", "mode", "targetTaskIds", "matchedTaskIds", "stepId", "result",
+                "createdAt", "deadlineAt", "updatedAt", "suspendedAt", "resolvedAt", "consumedAt" FROM "agent_wait_conditions"
          WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4
            AND "idempotencyKey" LIKE $5 ORDER BY "idempotencyKey"`,
         [value.userId, value.sessionId, value.turnId, rootTaskId, `p3-1336-%:${value.turnId}:%`],
@@ -22209,21 +22307,33 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         }
         return stringIds(parsed, allowEmpty)
       }
-      const immediateReadyWaitHasReceipt = async (wait: typeof waits.rows[number]): Promise<boolean> => {
+      const waitHasExactToolReceipt = async (wait: typeof waits.rows[number]): Promise<boolean> => {
         const targets = exactIds(wait.targetTaskIds), matched = exactIds(wait.matchedTaskIds, true)
-        const persistedRequest = record(record(wait.result)?.request)
+        const persisted = record(wait.result), persistedRequest = record(persisted?.request)
         const persistedTargets = exactIds(persistedRequest?.targetTaskIds)
-        if (!targets || !matched || !persistedRequest || persistedRequest.mode !== "all"
-          || !sameUniqueIds(persistedTargets ?? [], targets) || !sameUniqueIds(matched, targets)) return false
+        if (!targets || !matched || !persistedRequest || persistedRequest.mode !== wait.mode || wait.mode !== "all"
+          || !sameUniqueIds(persistedTargets ?? [], targets) || matched.some(id => !targets.includes(id))) return false
+        if (wait.consumedAt instanceof Date) {
+          const outcome = record(persisted?.outcome)
+          const outcomeTargets = exactIds(outcome?.targetTaskIds), outcomeMatched = exactIds(outcome?.matchedTaskIds, true)
+          const outcomeTasks = Array.isArray(outcome?.tasks) ? outcome.tasks.map(record) : null
+          const outcomeTaskIds = outcomeTasks?.map(task => task?.taskId).filter((id): id is string => typeof id === "string") ?? []
+          if (outcome?.waitId !== wait.id || outcome.status !== wait.status
+            || !sameUniqueIds(outcomeTargets ?? [], targets) || !sameUniqueIds(outcomeMatched ?? [], matched)
+            || outcomeTasks === null || outcomeTasks.length !== targets.length || !sameUniqueIds(outcomeTaskIds, targets)) return false
+        }
         const receipts = await pool!.query<{
-          callStatus: string; callContent: unknown; resultStatus: string | null; resultContent: unknown
+          callStatus: string; callStepId: string; callContent: unknown
+          resultStatus: string | null; resultStepId: string | null; resultContent: unknown
         }>(`SELECT call."status" AS "callStatus", call."content" AS "callContent",
-                   result."status" AS "resultStatus", result."content" AS "resultContent"
+                   call."stepId" AS "callStepId", result."status" AS "resultStatus",
+                   result."stepId" AS "resultStepId", result."content" AS "resultContent"
             FROM "agent_items" AS call
             JOIN "agent_turns" AS turn ON turn."id" = call."turnId" AND turn."sessionId" = call."sessionId"
             JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
             LEFT JOIN "agent_items" AS result ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
               AND result."taskId" = call."taskId" AND result."type" = 'tool_result'
+              AND result."stepId" = call."stepId"
               AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
             WHERE call."sessionId" = $1 AND call."turnId" = $2 AND turn."userId" = $3 AND session."userId" = $3
               AND call."taskId" = $4 AND turn."rootTaskId" = $4 AND call."type" = 'tool_call'
@@ -22236,12 +22346,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         const outputTargets = exactIds(output?.taskIds), outputMatched = exactIds(output?.matchedTaskIds, true)
         const outputTasks = Array.isArray(output?.tasks) ? output.tasks.map(record) : null
         const outputTaskIds = outputTasks?.map(task => task?.taskId).filter((id): id is string => typeof id === "string") ?? []
+        const outputDeadline = typeof output?.deadlineAt === "string" ? Date.parse(output.deadlineAt) : NaN
+        const suspendedReceipt = wait.suspendedAt instanceof Date
+        const originalStatus = suspendedReceipt ? "waiting" : wait.status
+        const originalMatchesValid = outputMatched !== null && outputMatched.every(id => outputTargets?.includes(id))
+        const originalMatchesCurrent = suspendedReceipt ? originalMatchesValid : sameUniqueIds(outputMatched ?? [], matched)
         return receipt.callStatus === "completed" && receipt.resultStatus === "completed"
+          && receipt.callStepId === wait.stepId && receipt.resultStepId === wait.stepId
+          && typeof call?.toolCallId === "string" && call.toolCallId.length > 0
           && call?.toolName === "agent.wait" && input?.idempotencyKey === wait.idempotencyKey
           && input.mode === wait.mode && sameUniqueIds(exactIds(input.taskIds) ?? [], targets)
+          && Object.keys(result ?? {}).sort().join(",") === "errorCode,output,toolCallId"
           && result?.toolCallId === call.toolCallId && result?.errorCode === null
-          && output?.waitId === wait.id && output.status === "ready"
-          && sameUniqueIds(outputTargets ?? [], targets) && sameUniqueIds(outputMatched ?? [], matched)
+          && output?.waitId === wait.id && output.status === originalStatus
+          && Number.isFinite(outputDeadline) && outputDeadline === wait.deadlineAt.getTime()
+          && sameUniqueIds(outputTargets ?? [], targets) && originalMatchesValid && originalMatchesCurrent
           && outputTasks !== null && outputTasks.length === targets.length && sameUniqueIds(outputTaskIds, targets)
       }
       const readyEvidence = new Map<string, boolean>(), waitStateValid = new Map<string, boolean>()
@@ -22249,11 +22368,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         let validState = false, ready = false
         if (wait.status === "ready" && wait.suspendedAt instanceof Date) {
           validState = wait.resolvedAt instanceof Date && wait.consumedAt instanceof Date
+            && wait.consumedAt >= wait.resolvedAt && await waitHasExactToolReceipt(wait)
           ready = validState
         } else if (wait.status === "ready" && wait.suspendedAt === null
           && wait.resolvedAt === null && wait.consumedAt === null) {
-          ready = await immediateReadyWaitHasReceipt(wait)
+          ready = await waitHasExactToolReceipt(wait)
           validState = ready
+        } else if (wait.status === "timed_out") {
+          const deadlineElapsed = wait.createdAt instanceof Date && wait.deadlineAt instanceof Date
+            && wait.deadlineAt > wait.createdAt && wait.resolvedAt instanceof Date
+            && wait.resolvedAt >= wait.deadlineAt && wait.updatedAt >= wait.resolvedAt
+          const terminalized = wait.suspendedAt instanceof Date
+            ? wait.resolvedAt instanceof Date && wait.suspendedAt <= wait.resolvedAt
+              && wait.consumedAt instanceof Date && wait.consumedAt >= wait.resolvedAt
+            : wait.suspendedAt === null && wait.consumedAt === null
+          validState = deadlineElapsed && terminalized && await waitHasExactToolReceipt(wait)
         } else if (wait.status === "waiting") {
           validState = wait.consumedAt === null
         }
@@ -22266,10 +22395,53 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         expect(phaseWaits.length > 0 && phaseWaits.some(wait => readyEvidence.get(wait.id) === true)).toBe(true)
       }
       const recoveredWave1Wait = waits.rows.find(wait => wait.id === firstWait.id)
-      expect(recoveredWave1Wait?.idempotencyKey === firstWaitKey
-        && recoveredWave1Wait?.status === "ready" && recoveredWave1Wait.suspendedAt instanceof Date
-        && recoveredWave1Wait.resolvedAt instanceof Date && recoveredWave1Wait.consumedAt instanceof Date
-        && readyEvidence.get(firstWait.id) === true).toBe(true)
+      const otherWave1Waits = waits.rows.filter(wait => wait.id !== firstWait.id
+        && wait.idempotencyKey.startsWith(`p3-1336-wave1-wait:${value.turnId}:`))
+      const wave1Poll = (key: string): number => {
+        const prefix = `p3-1336-wave1-wait:${value.turnId}:`
+        const suffix = key.startsWith(prefix) ? key.slice(prefix.length) : ""
+        return /^[1-9][0-9]*$/.test(suffix) ? Number(suffix) : 0
+      }
+      const firstTargets = exactIds(firstWait.targetTaskIds)
+      const laterReadyWave1Wait = otherWave1Waits.find(wait => wave1Poll(wait.idempotencyKey) > wave1Poll(firstWaitKey)
+        && firstWait.createdAt instanceof Date && wait.createdAt instanceof Date && wait.createdAt >= firstWait.createdAt
+        && firstTargets !== null && sameUniqueIds(exactIds(wait.targetTaskIds) ?? [], firstTargets)
+        && readyEvidence.get(wait.id) === true && waitStateValid.get(wait.id) === true)
+      const boundedWaitCount = (count: number) => Math.min(count, 16)
+      const safeWaitStatus = (status: string | undefined) =>
+        status === "waiting" || status === "ready" || status === "timed_out" || status === "interrupted"
+          ? status : "other"
+      const firstWaitDiagnostic = {
+        beforeRestart: {
+          status: safeWaitStatus(firstWait.status), suspended: firstWait.suspendedAt instanceof Date,
+          resolved: firstWait.resolvedAt instanceof Date, consumed: firstWait.consumedAt instanceof Date,
+        },
+        afterRestart: {
+          present: recoveredWave1Wait !== undefined, status: safeWaitStatus(recoveredWave1Wait?.status),
+          suspended: recoveredWave1Wait?.suspendedAt instanceof Date,
+          resolved: recoveredWave1Wait?.resolvedAt instanceof Date,
+          consumed: recoveredWave1Wait?.consumedAt instanceof Date,
+          timeoutDeadlineElapsed: recoveredWave1Wait?.status === "timed_out"
+            && recoveredWave1Wait.deadlineAt instanceof Date && recoveredWave1Wait.resolvedAt instanceof Date
+            ? recoveredWave1Wait.resolvedAt >= recoveredWave1Wait.deadlineAt : false,
+          laterSameTargetReadyWait: laterReadyWave1Wait !== undefined,
+          stateValid: recoveredWave1Wait ? waitStateValid.get(recoveredWave1Wait.id) === true : false,
+          readyEvidence: recoveredWave1Wait ? readyEvidence.get(recoveredWave1Wait.id) === true : false,
+        },
+        otherWave1Waits: {
+          count: boundedWaitCount(otherWave1Waits.length), truncated: otherWave1Waits.length > 16,
+          readyStatusCount: boundedWaitCount(otherWave1Waits.filter(wait => wait.status === "ready").length),
+          readyEvidenceCount: boundedWaitCount(otherWave1Waits.filter(wait => readyEvidence.get(wait.id) === true).length),
+          waitingCount: boundedWaitCount(otherWave1Waits.filter(wait => wait.status === "waiting").length),
+          timedOutCount: boundedWaitCount(otherWave1Waits.filter(wait => wait.status === "timed_out").length),
+        },
+      }
+      const firstWaitRecovered = recoveredWave1Wait?.idempotencyKey === firstWaitKey
+        && (recoveredWave1Wait.status === "ready" || recoveredWave1Wait.status === "timed_out")
+        && recoveredWave1Wait.suspendedAt instanceof Date && recoveredWave1Wait.resolvedAt instanceof Date
+        && recoveredWave1Wait.consumedAt instanceof Date && waitStateValid.get(firstWait.id) === true
+        && (recoveredWave1Wait.status !== "timed_out" || laterReadyWave1Wait !== undefined)
+      expect(firstWaitRecovered, `Objective Tailor first wait recovery: ${JSON.stringify(firstWaitDiagnostic)}`).toBe(true)
       expect(waits.rows.every(wait => /^p3-1336-(?:wave-source|wave-analyst|wave1|wave2|corrections)-wait:[^:]+:[1-9][0-9]*$/.test(wait.idempotencyKey)
         && waitStateValid.get(wait.id) === true)).toBe(true)
       const applicationEffects = await pool!.query<{ applicationTasks: string; approvals: string; submissions: string }>(

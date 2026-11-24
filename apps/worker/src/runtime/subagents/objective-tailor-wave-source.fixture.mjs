@@ -72,7 +72,6 @@ async function* analystStream(request, { task, source, roleResultSchema }) {
     evidence, summary: "Assessed two observed synthetic roles from the required Scout source." }
   yield { type: "text_delta", text: JSON.stringify(value) }; yield { type: "completed", finishReason: "stop" }
 }
-
 export function fixtureToolCalls(request, name) {
   return (request.messages ?? []).flatMap(message => (message.content ?? [])
     .filter(part => message.role === "assistant" && part?.type === "tool_use" && part.name === name))
@@ -100,7 +99,6 @@ export function fixtureObservation(request, kind) {
   }
   throw new Error("fixture_observation_unavailable")
 }
-
 export function diagnoseObjectiveTailorWaveGraph(request, say) {
   try {
     const graph = fixtureObservation(request, "task_graph_current")
@@ -111,7 +109,6 @@ export function diagnoseObjectiveTailorWaveGraph(request, say) {
     throw error
   }
 }
-
 export function diagnoseObjectiveTailorWaveOne(request, expectedRevision, say) {
   const matches = Array.isArray(request?.tools) ? request.tools.filter(tool => tool?.name === "agent.tailor") : []
   say(matches.length === 0 ? "TAILOR_WAVE1_TOOL_ABSENT"
@@ -134,7 +131,6 @@ export function diagnoseObjectiveTailorWaveOne(request, expectedRevision, say) {
   return matches.length === 1 && matches[0]?.version === "2" && revisionMatches && catalog.candidates.length === 8
     ? catalog : undefined
 }
-
 export function diagnoseObjectiveTailorWaveOneReceipt(request, call, say) {
   const result = fixtureToolResult(request, call), value = result?.value
   if (!result) { say("TAILOR_WAVE1_RECEIPT_INVALID"); return undefined }
@@ -162,14 +158,27 @@ const SAFE_DIAGNOSTIC_CODES = new Set(["invalid_state", "revision_mismatch",
   "task_graph_objective_coverage_incomplete", "revision_limit", "objective_tailor_wave_not_eligible", "objective_tailor_wave_source_stale", "objective_tailor_wave_stale",
   "idempotency_conflict", "task_graph_state_missing", "fixture_observation_unavailable", "fixture_wave1_identity_unavailable",
   "fixture_wave_catalog_unavailable", "fixture_wave_receipt_invalid", "fixture_plan_receipt_invalid",
-  "fixture_wait_result_error", "fixture_ordinary_plan_append_was_not_closed", "fixture_root_phase_unrecognized",
-  "fixture_wave_replay_args_missing", "fixture_wave_replay_identity_mismatch"])
-
+  "fixture_wait_result_error", "fixture_correction_receipt_invalid", "fixture_ordinary_plan_append_was_not_closed", "fixture_root_phase_unrecognized",
+  "fixture_wave_replay_args_missing", "fixture_wave_replay_identity_mismatch", "objective_tailor_correction_stale",
+  "objective_tailor_correction_source_stale", "task_graph_continuation_budget_required", "objective_tailor_wave_failed", "objective_tailor_wave_receipt_invalid"])
 export function objectiveTailorWaveDiagnosticCode(value) {
   const code = value && typeof value === "object" ? value.code ?? value.message : value
   return SAFE_DIAGNOSTIC_CODES.has(code) ? code : "other"
 }
-
+export function objectiveTailorCorrectionReceiptStatus(result, expectedRevision) {
+  if (!result) return "MISSING"
+  if (result.error) return `DENIED ${objectiveTailorWaveDiagnosticCode(result.value?.code)}`
+  const value = result.value
+  if (value?.status !== "accepted") return "INVALID_STATUS"; if (!Number.isSafeInteger(expectedRevision) || value.revision !== expectedRevision + 1) return "INVALID_REVISION"
+  if (!Array.isArray(value.nodes) || value.nodes.length !== 2) return "INVALID_NODES"
+  if (value.readyTaskIds?.length !== 1) return "INVALID_READY"
+  return "ACCEPTED"
+}
+export function objectiveTailorCorrectionRetryEligible(result, call, graph, priorIdentity, currentIdentity, attempts) {
+  return result?.error === true && result.value?.code === "revision_mismatch" && call?.input?.correctionSlotId === "tailor-6"
+    && attempts >= 1 && attempts < 3 && Number.isSafeInteger(call.input.expectedRevision) && Number.isSafeInteger(graph?.revision)
+    && graph.revision > call.input.expectedRevision && priorIdentity !== undefined && JSON.stringify(priorIdentity) === JSON.stringify(currentIdentity)
+}
 export function fixturePhaseReady(request, phase, turnId, say, waitPrefix) {
   const prefix = `${waitPrefix}${phase}-wait:${turnId}:`, calls = fixtureToolCalls(request, "agent.wait")
     .filter(call => typeof call.input?.idempotencyKey === "string" && call.input.idempotencyKey.startsWith(prefix))
@@ -187,19 +196,17 @@ export function fixturePhaseReady(request, phase, turnId, say, waitPrefix) {
   const expected = calls.at(-1)?.input?.taskIds
   return Array.isArray(expected) && expected.length > 0 && fixtureAllTasksCompleted(result.value, expected)
 }
-
-export function objectiveTailorWaveIdentity(graph, sourceKeys, analystKeys) {
+export function objectiveTailorWaveIdentity(graph, sourceKeys, analystKeys, slotCount = 4, uncorrectedSlotId) {
   const graphKeys = Array.isArray(graph?.nodes) ? graph.nodes.map(node => node?.key).filter(key => typeof key === "string") : []
   const sortedKeys = graphKeys.sort(), expectedKeys = [...sourceKeys].sort()
   if (sortedKeys.length !== expectedKeys.length || sortedKeys.some((key, index) => key !== expectedKeys[index])) return undefined
   const slots = graph?.objectiveTailorWave?.slots
-  if (!Array.isArray(slots) || slots.length !== 4) return undefined
+  if (!Array.isArray(slots) || slots.length !== slotCount || uncorrectedSlotId && slots.find(slot => slot?.slotId === uncorrectedSlotId)?.correction !== undefined) return undefined
   const identity = slots.map(slot => [slot?.slotId, slot?.sourceAnalystNodeKey, slot?.initial?.writer?.taskId, slot?.initial?.reviewer?.taskId])
   if (identity.some((slot, index) => slot[0] !== `tailor-${index + 1}` || slot.some(value => typeof value !== "string")
     || !analystKeys.includes(slot[1]))) return undefined
   return { sourceKeys: sortedKeys, slots: identity }
 }
-
 export function sourcePlan() {
   const scout = (source, objectiveCoverage = false) => ({ key: `scout-${source}`, templateId: "scout", goal: `Search ${source} for saved roles`,
     successCriteria: ["Return observed saved roles"], dependsOn: [], verification: {
@@ -236,12 +243,8 @@ function objectAt(text, start) {
   }
   return undefined
 }
-function emit(id, name, args) {
-  return [{ type: "tool_call_completed", callId: id, name, arguments: args }, { type: "completed", finishReason: "tool_calls" }]
-}
+function emit(id, name, args) { return [{ type: "tool_call_completed", callId: id, name, arguments: args }, { type: "completed", finishReason: "tool_calls" }] }
 function assertScope(request, expected) {
   if (request?.metadata?.userId !== expected.userId || request.metadata.sessionId !== expected.sessionId
-    || request.metadata.turnId !== expected.turnId || request.metadata.taskId !== expected.taskId) {
-    throw new Error("fixture_source_model_scope_mismatch")
-  }
+    || request.metadata.turnId !== expected.turnId || request.metadata.taskId !== expected.taskId) throw new Error("fixture_source_model_scope_mismatch")
 }

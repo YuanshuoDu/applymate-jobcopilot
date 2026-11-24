@@ -1,7 +1,8 @@
 import { createObjectiveTailorWaveDraftModel, waitForObjectiveTailorWave1WriterGate } from "./objective-tailor-wave-draft.fixture.mjs"
 import { createObjectiveTailorWaveSourceModel, diagnoseObjectiveTailorWaveOne, diagnoseObjectiveTailorWaveOneReceipt,
   diagnoseObjectiveTailorWaveGraph, fixturePhaseReady, fixtureObservation,
-  fixtureToolCalls, fixtureToolResult, objectiveTailorWaveDiagnosticCode, objectiveTailorWaveIdentity, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
+  fixtureToolCalls, fixtureToolResult, objectiveTailorCorrectionReceiptStatus, objectiveTailorWaveDiagnosticCode,
+  objectiveTailorCorrectionRetryEligible, objectiveTailorWaveIdentity, sourcePlan } from "./objective-tailor-wave-source.fixture.mjs"
 
 const WAIT_PREFIX = "p3-1336-", SOURCE_KEYS = ["scout-greenhouse", "scout-lever", "scout-workday", "analyst-greenhouse-a", "analyst-greenhouse-b",
   "analyst-lever", "analyst-workday"]
@@ -15,7 +16,7 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
   const blockedWriters = new Set()
   const pauseWave1Writer = task => waitForObjectiveTailorWave1WriterGate({ task, mode, say, waitForCommand, blockedWriters, expectedScope: { userId, sessionId, turnId } })
   const phaseReady = (request, phase, activeTurnId) => fixturePhaseReady(request, phase, activeTurnId, say, WAIT_PREFIX)
-  let wave1Identity
+  let wave1Identity, correctionSourceIdentity
   let coverageFailureReported = false
   const childModel = async input => {
     if (input?.task?.role === "scout" || input?.task?.role === "analyst") {
@@ -38,7 +39,7 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
       try {
       assertRequestScope(request, { userId, sessionId, turnId, taskId: rootTaskId })
       say("TAILOR_ROOT_REQUEST_SCOPE_OK")
-      const plans = fixtureToolCalls(request, "agent.plan"), tailors = fixtureToolCalls(request, "agent.tailor")
+      const plans = fixtureToolCalls(request, "agent.plan"), tailors = fixtureToolCalls(request, "agent.tailor"), slot6Calls = tailors.filter(call => call.input?.correctionSlotId === "tailor-6")
       if (!coverageFailureReported && plans.some(call => {
         const result = fixtureToolResult(request, call)
         return result?.error === true && result.value?.code === "task_graph_objective_coverage_incomplete"
@@ -133,29 +134,28 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
         yield* emit(`p3-1336-correct-slot-2:${turnId}`, "agent.tailor", { expectedRevision: graph.revision, correctionSlotId: "tailor-2" })
         return
       }
-      if (tailors.length === 5 && !tailors.some(call => call.input?.correctionSlotId === "tailor-6")) {
-        const receipt = acceptedCorrectionReceipt(request, tailors[4])
+      if (tailors.length === 5 && !slot6Calls.length) {
+        acceptedCorrectionReceipt(request, tailors[4], say, "SLOT2")
         const graph = currentGraph(request)
-        yield* emit(`p3-1336-correct-slot-6:${turnId}`, "agent.tailor", { expectedRevision: graph.revision, correctionSlotId: "tailor-6" })
-        void receipt
-        return
+        correctionSourceIdentity = objectiveTailorWaveIdentity(graph, SOURCE_KEYS, ANALYST_KEYS, 8, "tailor-6")
+        if (!correctionSourceIdentity) throw new Error("fixture_correction_receipt_invalid")
+        yield* emit(`p3-1336-correct-slot-6-attempt-1:${turnId}`, "agent.tailor", { expectedRevision: graph.revision, correctionSlotId: "tailor-6" }); return
       }
-      if (tailors.length === 6 && !hasPhase(request, "corrections", turnId)) {
-        const first = acceptedCorrectionReceipt(request, tailors[4])
-        const second = acceptedCorrectionReceipt(request, tailors[5])
-        yield* emitWait(request, "corrections", turnId, [...first.nodes, ...second.nodes].map(node => node.taskId)); return
+      const lastSlot6 = slot6Calls.at(-1), lastSlot6Result = lastSlot6 && fixtureToolResult(request, lastSlot6)
+      if (lastSlot6Result?.error) {
+        const graph = currentGraph(request), currentIdentity = objectiveTailorWaveIdentity(graph, SOURCE_KEYS, ANALYST_KEYS, 8, "tailor-6")
+        if (!objectiveTailorCorrectionRetryEligible(lastSlot6Result, lastSlot6, graph, correctionSourceIdentity, currentIdentity, slot6Calls.length)) throw new Error("fixture_correction_receipt_invalid")
+        say("TAILOR_CORRECTION_SLOT6_RETRY_REVISION_MISMATCH")
+        yield* emit(`p3-1336-correct-slot-6-attempt-${slot6Calls.length + 1}:${turnId}`, "agent.tailor", { expectedRevision: graph.revision, correctionSlotId: "tailor-6" }); return
       }
-      if (tailors.length === 6 && hasPhase(request, "corrections", turnId) && !phaseReady(request, "corrections", turnId)) {
-        const first = acceptedCorrectionReceipt(request, tailors[4])
-        const second = acceptedCorrectionReceipt(request, tailors[5])
-        yield* emitWait(request, "corrections", turnId, [...first.nodes, ...second.nodes].map(node => node.taskId)); return
-      }
-      if (phaseReady(request, "corrections", turnId)) {
+      if (slot6Calls.length) {
+        const first = acceptedCorrectionReceipt(request, tailors[4], say, "SLOT2"), accepted = slot6Calls.filter(call => objectiveTailorCorrectionReceiptStatus(fixtureToolResult(request, call), call.input?.expectedRevision) === "ACCEPTED")
+        if (tailors[4]?.input?.correctionSlotId !== "tailor-2" || accepted.length !== 1) throw new Error("fixture_correction_receipt_invalid")
+        const second = acceptedCorrectionReceipt(request, accepted[0], say, "SLOT6")
+        if (!phaseReady(request, "corrections", turnId)) { yield* emitWait(request, "corrections", turnId, [...first.nodes, ...second.nodes].map(node => node.taskId)); return }
         say("TAILOR_CORRECTIONS_WAIT_READY")
         say("TAILOR_FINAL_OUTCOME 6 2")
-        yield { type: "text_delta", text: "The eight source-backed roles were reviewed: six are ready, and two were rejected." }
-        yield { type: "completed", finishReason: "stop" }
-        return
+        yield { type: "text_delta", text: "The eight source-backed roles were reviewed: six are ready, and two were rejected." }; yield { type: "completed", finishReason: "stop" }; return
       }
       throw new Error("fixture_root_phase_unrecognized")
       } catch (error) {
@@ -223,12 +223,11 @@ function acceptedTailorReceipt(request, call, nodeCount) {
     || value.readyTaskIds?.length !== 4) throw new Error("fixture_wave_receipt_invalid")
   return value
 }
-function acceptedCorrectionReceipt(request, call) {
+function acceptedCorrectionReceipt(request, call, say, slot) {
   const result = fixtureToolResult(request, call), value = result?.value
-  const expectedRevision = call.input?.expectedRevision
-  if (!result || result.error || value?.status !== "accepted" || !Number.isSafeInteger(expectedRevision)
-    || value.revision !== expectedRevision + 1
-    || !Array.isArray(value.nodes) || value.nodes.length !== 2 || value.readyTaskIds?.length !== 1) throw new Error("fixture_correction_receipt_invalid")
+  const status = objectiveTailorCorrectionReceiptStatus(result, call.input?.expectedRevision)
+  say(`TAILOR_CORRECTION_${slot}_RECEIPT_${status}`)
+  if (status !== "ACCEPTED") throw new Error("fixture_correction_receipt_invalid")
   return value
 }
 function assertReplayMatches(request, original, replay) {
