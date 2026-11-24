@@ -150,8 +150,8 @@ async function currentObjectiveProof(tx: Tx, input: { userId: string; sessionId:
   ])
   const result = record(roots[0]?.result), graphRow = graphs[0], graph = record(graphRow?.content), nodes = graph?.nodes
   const parsed = graph && parseObjectiveTailorGraph(graph.objectiveTailor, nodes), slot = parsed?.slots[source.slotOrdinal - 1]
-  const nodeRows = Array.isArray(nodes) ? nodes.map(record) : [], writer = nodeRows.find(node => node?.key === slot?.writerNodeKey)
-  const reviewer = nodeRows.find(node => node?.key === slot?.reviewerNodeKey), final = record(finals[0]?.content)
+  const nodeRows = Array.isArray(nodes) ? nodes.map(record) : [], writer = nodeRows.find(node => node?.key === (slot?.correction?.writerNodeKey ?? slot?.writerNodeKey))
+  const reviewer = nodeRows.find(node => node?.key === (slot?.correction?.reviewerNodeKey ?? slot?.reviewerNodeKey)), final = record(finals[0]?.content)
   const answer = record(final?.final), sidecar = parseObjectiveTailorFinalOutcomeSidecar(final?.objectiveTailorFinalOutcomes)
   return roots.length === 1 && result?.status === "completed" && result.finalItemId === source.finalItemId
     && graphs.length === 1 && graphRow?.id === graphId && graphRow.revision === source.graphRevision && !!slot
