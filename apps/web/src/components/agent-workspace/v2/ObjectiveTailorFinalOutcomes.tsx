@@ -1,25 +1,125 @@
-import React from 'react'
-import type { ObjectiveTailorFinalOutcomeSidecarStatus } from '@jobcopilot/agent-protocol'
+'use client'
+
+import React, { useRef, useState } from 'react'
+import { OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA, parseObjectiveApplicationReviewIntent, sha256Hex, type ObjectiveTailorFinalOutcomeSidecarStatus } from '@jobcopilot/agent-protocol'
 import { parseObjectiveTailorFinalOutcomesFromContent } from '@/lib/agent/session/objective-tailor-final-content'
+import { parseFinalTaskGraphSourceManifest } from '@/lib/agent/session/final-task-graph-source-manifest'
 import type { Lang } from '@/lib/i18n'
 
 const LABELS: Record<ObjectiveTailorFinalOutcomeSidecarStatus, Readonly<{ en: string; zh: string }>> = {
-  ready: { en: 'Ready', zh: '已就绪' },
-  needs_revision: { en: 'Needs revision', zh: '需要修改' },
-  rejected: { en: 'Rejected', zh: '未通过' },
-  stale: { en: 'Out of date', zh: '已过期' },
-  failed: { en: 'Failed', zh: '失败' },
+  ready: { en: 'Ready', zh: '已就绪' }, needs_revision: { en: 'Needs revision', zh: '需要修改' },
+  rejected: { en: 'Rejected', zh: '未通过' }, stale: { en: 'Out of date', zh: '已过期' }, failed: { en: 'Failed', zh: '失败' },
 }
+type RequestState = 'pending' | 'accepted' | 'failed'
+type SelectionState = Readonly<{ identity: string; ordinals: readonly number[] }>
 
-export function ObjectiveTailorFinalOutcomes({ content, lang }: { content: unknown; lang: Lang }) {
+export function ObjectiveTailorFinalOutcomes({ content, lang, sessionId, sourceTurnId, rootTaskId }: {
+  content: unknown; lang: Lang; sessionId?: string; sourceTurnId?: string; rootTaskId?: string | null
+}) {
   const sidecar = parseObjectiveTailorFinalOutcomesFromContent(content)
+  const contentRow = record(content), manifest = parseFinalTaskGraphSourceManifest(contentRow?.taskGraphSources)
+  const graphRevision = manifest?.graphRevision ?? null
+  const identity = JSON.stringify([sessionId ?? null, sourceTurnId ?? null, rootTaskId ?? null, graphRevision])
+  const [selection, setSelection] = useState<SelectionState>({ identity: '', ordinals: [] })
+  const [requestState, setRequestState] = useState<{ identity: string; status: RequestState } | null>(null)
+  const requestKeys = useRef(new Map<string, string>())
+  const pendingIntent = useRef<string | null>(null)
+  const currentIntent = useRef('')
+  const ordinals = selection.identity === identity ? selection.ordinals : []
+  const intentKey = JSON.stringify([identity, ordinals])
+  currentIntent.current = intentKey
+  const canRequest = Boolean(graphRevision && safeId(sessionId) && safeId(sourceTurnId) && safeId(rootTaskId))
+  const copy = lang === 'zh' ? zh : en
+
+  const select = (ordinal: number, checked: boolean) => {
+    setSelection(previous => {
+      const current = previous.identity === identity ? [...previous.ordinals] : []
+      const next = checked ? [...new Set([...current, ordinal])].sort((left, right) => left - right)
+        : current.filter(value => value !== ordinal)
+      return { identity, ordinals: next }
+    })
+    setRequestState(null)
+  }
+  const requestReview = async () => {
+    if (!sidecar || !canRequest || !graphRevision || !sessionId || !sourceTurnId || !rootTaskId
+      || ordinals.length === 0 || pendingIntent.current === intentKey) return
+    pendingIntent.current = intentKey
+    setRequestState({ identity, status: 'pending' })
+    try {
+      const graphItemId = 'task-graph-' + await sha256Hex(rootTaskId)
+      const selected = buildObjectiveApplicationReviewSelection({ sourceTurnId, rootTaskId, graphItemId, graphRevision, slotOrdinals: ordinals })
+      if (!selected) throw new Error('invalid selection')
+      let idempotencyKey = requestKeys.current.get(intentKey)
+      if (!idempotencyKey) {
+        idempotencyKey = objectiveReviewCommandKeyForIntent(requestKeys.current, intentKey)
+      }
+      const response = await fetch('/api/agent/sessions/' + encodeURIComponent(sessionId) + '/objective-application-review', {
+        method: 'POST', credentials: 'same-origin', cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idempotencyKey, selection: selected }),
+      })
+      const result = await response.json().catch(() => null) as unknown
+      if (!response.ok || !validCommandResult(result)) throw new Error('review request failed')
+      requestKeys.current.delete(intentKey)
+      if (currentIntent.current === intentKey) {
+        setSelection({ identity, ordinals: [] })
+        setRequestState({ identity, status: 'accepted' })
+      }
+    } catch {
+      if (currentIntent.current === intentKey) setRequestState({ identity, status: 'failed' })
+    } finally { if (pendingIntent.current === intentKey) pendingIntent.current = null }
+  }
+
   if (!sidecar) return null
-  const heading = lang === 'zh' ? '职位定制结果' : 'Tailoring outcomes'
-  const job = lang === 'zh' ? '职位' : 'Job'
-  return <details aria-label={heading} data-agent-objective-tailor-final-outcomes="true">
-    <summary>{heading}</summary>
+  const status = requestState?.identity === identity ? requestState.status : null
+  return <details aria-label={copy.heading} data-agent-objective-tailor-final-outcomes='true'>
+    <summary>{copy.heading}</summary>
     <ul>{sidecar.slots.map(slot => <li key={slot.ordinal} data-tailor-outcome={slot.status}>
-      {job} {slot.ordinal}: {LABELS[slot.status][lang === 'zh' ? 'zh' : 'en']}
+      {copy.job} {slot.ordinal}: {LABELS[slot.status][lang === 'zh' ? 'zh' : 'en']}
+      {slot.status === 'ready' && canRequest && <label style={choiceStyle}>
+        <input type='checkbox' checked={ordinals.includes(slot.ordinal)} onChange={event => select(slot.ordinal, event.target.checked)} />
+        {copy.select} {copy.job.toLowerCase()} {slot.ordinal}
+      </label>}
     </li>)}</ul>
+    {canRequest && sidecar.slots.some(slot => slot.status === 'ready') && <div style={requestStyle}>
+      <button type='button' disabled={ordinals.length === 0 || status === 'pending'} onClick={() => void requestReview()}>
+        {status === 'pending' ? copy.requesting : copy.request}
+      </button>
+      {status === 'accepted' && <p role='status'>{copy.accepted}</p>}
+      {status === 'failed' && <p role='alert'>{copy.failed}</p>}
+    </div>}
   </details>
 }
+
+export function buildObjectiveApplicationReviewSelection(input: {
+  sourceTurnId: string; rootTaskId: string; graphItemId: string; graphRevision: number; slotOrdinals: readonly number[]
+}) {
+  return parseObjectiveApplicationReviewIntent({ schema: OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA,
+    ...input, slotOrdinals: [...input.slotOrdinals].sort((left, right) => left - right) })
+}
+
+export function objectiveReviewCommandKeyForIntent(keys: Map<string, string>, intentKey: string): string {
+  const current = keys.get(intentKey)
+  if (current) return current
+  const randomId = typeof globalThis.crypto?.randomUUID === 'function' ? globalThis.crypto.randomUUID()
+    : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2)
+  const next = 'objective-review-command-' + randomId
+  keys.set(intentKey, next)
+  return next
+}
+
+function validCommandResult(value: unknown): boolean {
+  const row = record(value)
+  return Boolean(row && Object.keys(row).sort().join(',') === 'disposition,turnId'
+    && safeId(row.turnId) && (row.disposition === 'started' || row.disposition === 'duplicate'))
+}
+function safeId(value: unknown): value is string { return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value) }
+function record(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  try { return Object.getPrototypeOf(value) === Object.prototype ? value as Record<string, unknown> : null } catch { return null }
+}
+const en = { heading: 'Tailoring outcomes', job: 'Job', select: 'Select', request: 'Request application review',
+  requesting: 'Starting review…', accepted: 'Review request started.', failed: 'Could not start review. Retry to safely check the same request.' }
+const zh = { heading: '职位定制结果', job: '职位', select: '选择', request: '请求申请审核',
+  requesting: '正在发起审核…', accepted: '审核请求已开始。', failed: '无法发起审核。重试会安全地检查同一请求。' }
+const choiceStyle: React.CSSProperties = { display: 'inline-flex', gap: 4, marginLeft: 8, alignItems: 'center' }
+const requestStyle: React.CSSProperties = { display: 'grid', justifyItems: 'start', gap: 4 }

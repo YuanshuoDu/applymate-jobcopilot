@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { hashApprovalScope, parseObjectiveApplicationApprovalSet, objectiveApplicationApprovalSetItemId } from "@jobcopilot/agent-protocol"
-import { buildObjectiveApplicationResumeWitness, redactAgentEvent } from "@jobcopilot/shared"
+import { buildObjectiveApplicationResumeWitness, buildObjectiveApplicationReviewMemberProof, redactAgentEvent } from "@jobcopilot/shared"
 import { protocolScope } from "../approval/types"
 import { decideObjectiveApplicationApprovalSetMemberInTransaction } from "./objective-application-approval-set-decision"
 
@@ -64,9 +64,15 @@ function resumeWitness(jobId: string, materialRevision = 3) {
 async function makeRows(statuses: readonly string[]) {
   return Promise.all(setContent.members.map(async (member, index) => {
     const jobId = "job-" + (index + 1), toolCallId = "call-" + (index + 1)
+    const proof = buildObjectiveApplicationReviewMemberProof({ resumeWitness: resumeWitness(jobId), source: {
+      jobId, sourceTurnId, rootTaskId: "source-root-1", graphItemId: "source-graph-1", graphRevision: 9,
+      finalItemId: "source-final-1", slotOrdinal: index + 1, writerTaskId: `writer-${index + 1}`, reviewerTaskId: `reviewer-${index + 1}`,
+      reviewerToolCallId: `review-call-${index + 1}`, reviewHash: `sha256:${"a".repeat(64)}`, artifactId: `artifact-${index + 1}`,
+      version: 4, contentHash: `sha256:${"b".repeat(64)}`, sourceDigest: `sha256:${"c".repeat(64)}`,
+    } })!
     const nonceHash = "sha256:" + String(index + 1).padStart(64, "0")
     const scope = { userId, sessionId, turnId, jobId, toolCallId, action: "review_application" as const,
-      resourceHash: "sha256:" + "b".repeat(64), materialHash: "sha256:" + "c".repeat(64),
+      resourceHash: "sha256:" + "b".repeat(64), materialHash: proof.materialProofHash,
       answersHash: "sha256:" + "d".repeat(64), revision: 4, expiresAt }
     const scopeHash = await hashApprovalScope(protocolScope(scope, nonceHash))
     return { id: member.approvalId, userId, sessionId, turnId, taskId: null, jobId, toolCallId,
@@ -74,7 +80,7 @@ async function makeRows(statuses: readonly string[]) {
       resourceHash: scope.resourceHash, materialHash: scope.materialHash, answersHash: scope.answersHash,
       expiresAt, createdAt: now, updatedAt: now, decidedAt: statuses[index] === "approved" ? now : null, consumedAt: null,
       payload: { schema: "objective-application-approval-set-member.v1", setId, sourceTurnId, slotOrdinal: index + 1,
-        proof: { resumeWitness: resumeWitness(jobId) } },
+        proof },
     }
   }))
 }

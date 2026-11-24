@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import { hashApprovalScope, parseObjectiveApplicationApprovalSet } from "@jobcopilot/agent-protocol"
-import { buildObjectiveApplicationResumeWitness } from "@jobcopilot/shared"
+import { buildObjectiveApplicationResumeWitness, buildObjectiveApplicationReviewMemberProof } from "@jobcopilot/shared"
 import { protocolScope } from "../approval/types"
 import { loadLockedObjectiveApprovalSetMembers, parseObjectiveApprovalSetMemberEnvelope } from "./objective-approval-set-decision-data"
 
@@ -23,12 +23,22 @@ function witness(jobId: string) {
   })!
 }
 
+function memberProof(jobId: string, ordinal: number) {
+  return buildObjectiveApplicationReviewMemberProof({ resumeWitness: witness(jobId), source: {
+    jobId, sourceTurnId, rootTaskId: "source-root-1", graphItemId: "source-graph-1", graphRevision: 9,
+    finalItemId: "source-final-1", slotOrdinal: ordinal, writerTaskId: `writer-${ordinal}`, reviewerTaskId: `reviewer-${ordinal}`,
+    reviewerToolCallId: `review-call-${ordinal}`, reviewHash: `sha256:${"a".repeat(64)}`, artifactId: `artifact-${ordinal}`,
+    version: 4, contentHash: `sha256:${"b".repeat(64)}`, sourceDigest: `sha256:${"c".repeat(64)}`,
+  } })!
+}
+
 async function rows() {
   return Promise.all(setContent.members.map(async member => {
     const jobId = "job-" + member.slotOrdinal, toolCallId = "call-" + member.slotOrdinal
+    const proof = memberProof(jobId, member.slotOrdinal)
     const nonceHash = "sha256:" + String(member.slotOrdinal).padStart(64, "0")
     const scope = { userId, sessionId, turnId, jobId, toolCallId, action: "review_application" as const,
-      resourceHash: "sha256:" + "b".repeat(64), materialHash: "sha256:" + "c".repeat(64),
+      resourceHash: "sha256:" + "b".repeat(64), materialHash: proof.materialProofHash,
       answersHash: "sha256:" + "d".repeat(64), revision: 4, expiresAt }
     const scopeHash = await hashApprovalScope(protocolScope(scope, nonceHash))
     return { id: member.approvalId, userId, sessionId, turnId, taskId: null, jobId, toolCallId,
@@ -36,18 +46,20 @@ async function rows() {
       resourceHash: scope.resourceHash, materialHash: scope.materialHash, answersHash: scope.answersHash,
       expiresAt, createdAt: new Date(), updatedAt: new Date(), decidedAt: null, consumedAt: null,
       payload: { schema: "objective-application-approval-set-member.v1", setId: setContent.setId, sourceTurnId,
-        slotOrdinal: member.slotOrdinal, proof: { resumeWitness: witness(jobId) } },
+        slotOrdinal: member.slotOrdinal, proof },
     }
   }))
 }
 
 describe("Objective approval-set decision data", () => {
   it("parses only the closed member envelope", () => {
-    const valid = { schema: "objective-application-approval-set-member.v1", setId: "set-1", sourceTurnId, slotOrdinal: 1, proof: { resumeWitness: {} } }
+    const proof = memberProof("job-1", 1)
+    const valid = { schema: "objective-application-approval-set-member.v1", setId: "set-1", sourceTurnId, slotOrdinal: 1, proof }
     expect(parseObjectiveApprovalSetMemberEnvelope(valid)).toEqual(valid)
     expect(parseObjectiveApprovalSetMemberEnvelope({ ...valid, scopeHash: "private" })).toBeNull()
     expect(parseObjectiveApprovalSetMemberEnvelope({ ...valid, slotOrdinal: 0 })).toBeNull()
     expect(parseObjectiveApprovalSetMemberEnvelope({ ...valid, proof: {} })).toBeNull()
+    expect(parseObjectiveApprovalSetMemberEnvelope({ ...valid, proof: { ...proof, materialProofHash: "0".repeat(64) } })).toBeNull()
   })
 
   it("locks and validates every member scope and witness", async () => {

@@ -22,7 +22,7 @@ function seed() {
 }
 
 describe("Objective application review member proof", () => {
-  it("preserves the exact R18 canonical material hash and matches a stored approval hash", () => {
+  it("preserves the exact version-1 canonical material hash and matches a stored approval hash", () => {
     const value = seed(), proof = buildObjectiveApplicationReviewMemberProof(value)!
     const legacyBytes = canonicalJson({ schema: OBJECTIVE_APPLICATION_REVIEW_MEMBER_PROOF_SCHEMA, ...value })
     const legacyHash = createHash("sha256").update(legacyBytes).digest("hex")

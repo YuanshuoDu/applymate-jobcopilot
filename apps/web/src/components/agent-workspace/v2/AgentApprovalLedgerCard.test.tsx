@@ -1,10 +1,15 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider, translate } from '@/lib/i18n'
 
-import { AgentApprovalLedgerCard, isApprovalActionDisabled } from './AgentApprovalLedgerCard'
+vi.mock('./ObjectiveApplicationReviewSetCard', async () => {
+  const React = await import('react')
+  return { ObjectiveApplicationReviewSetCard: ({ turnId }: { turnId: string }) => React.createElement('div', { 'data-review-set-turn': turnId }) }
+})
+
+import { AgentApprovalLedgerCard, isApprovalActionDisabled, objectiveReviewTurnIds } from './AgentApprovalLedgerCard'
 import { createApprovalLedgerState, reduceApprovalLedger, selectApprovalLedgerProjection } from './approval-ledger-view'
 
 const turns = [{
@@ -89,5 +94,21 @@ describe('AgentApprovalLedgerCard', () => {
     expect(isApprovalActionDisabled(false, false, 'accepted')).toBe(true)
     expect(isApprovalActionDisabled(false, false, 'duplicate')).toBe(true)
     expect(isApprovalActionDisabled(false, false, 'failed')).toBe(false)
+  })
+
+  it('mounts one group card per reserved review Turn and suppresses legacy per-receipt controls', () => {
+    const setId = 'objective-review-' + 'a'.repeat(40)
+    let state = createApprovalLedgerState('session-1')
+    for (const ordinal of [1, 2]) state = reduceApprovalLedger(state, {
+      schemaVersion: 'agent-harness.v2', id: 'group-request-' + ordinal, sessionId: 'session-1',
+      turnId: 'review-turn-1', itemId: null, taskId: null, type: 'approval.requested', actor: 'orchestrator', sequence: String(ordinal),
+      payload: { approvalId: 'objective-review:' + setId + ':' + ordinal, action: 'review_application', scopeHash: 'sha256:' + 'c'.repeat(64), revision: 3 },
+    })
+    const projection = selectApprovalLedgerProjection(state)
+    const html = renderToStaticMarkup(<I18nProvider><AgentApprovalLedgerCard {...cardProps(projection)} /></I18nProvider>)
+    expect(objectiveReviewTurnIds(projection.pendingActions)).toEqual(['review-turn-1'])
+    expect(html).toContain('data-review-set-turn="review-turn-1"')
+    expect(html).not.toContain('<button')
+    expect(html).not.toContain(setId)
   })
 })

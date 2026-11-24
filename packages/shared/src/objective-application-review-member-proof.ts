@@ -33,16 +33,17 @@ const HASH = /^[a-f0-9]{64}$/
 const SOURCE_HASH = /^sha256:[a-f0-9]{64}$/
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
 
-/** Builds the exact R18 proof bytes used as the approval's materialHash. */
+/** Builds the exact version-1 proof bytes used as the approval's materialHash. */
 export function buildObjectiveApplicationReviewMemberProof(input: Readonly<{ source: unknown; resumeWitness: unknown }>): ObjectiveApplicationReviewMemberProof | null {
-  const source = parseSource(input.source), resumeWitness = parseObjectiveApplicationResumeWitness(input.resumeWitness)
+  const seed = exactRecord(input, ["source", "resumeWitness"])
+  const source = parseSource(seed?.source), resumeWitness = parseObjectiveApplicationResumeWitness(seed?.resumeWitness)
   if (!source || !resumeWitness || source.jobId !== resumeWitness.jobId) return null
   const materialProofHash = digest(source, resumeWitness)
   return parseObjectiveApplicationReviewMemberProof({ schema: OBJECTIVE_APPLICATION_REVIEW_MEMBER_PROOF_SCHEMA,
     source, resumeWitness, materialProofHash })
 }
 
-/** Parses a closed immutable member proof and recomputes its R18 material hash. */
+/** Parses a closed immutable member proof and recomputes its version-1 material hash. */
 export function parseObjectiveApplicationReviewMemberProof(value: unknown): ObjectiveApplicationReviewMemberProof | null {
   const proof = exactRecord(value, ["schema", "source", "resumeWitness", "materialProofHash"])
   const source = parseSource(proof?.source), resumeWitness = parseObjectiveApplicationResumeWitness(proof?.resumeWitness)

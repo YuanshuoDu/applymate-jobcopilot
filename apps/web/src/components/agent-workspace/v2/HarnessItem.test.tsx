@@ -106,14 +106,18 @@ describe('HarnessItem renderers', () => {
   })
 
   it('shows Objective Tailor outcomes only on completed final answers', () => {
-    const content = { text: 'Answer', objectiveTailorFinalOutcomes: {
-      schemaVersion: 'agent-harness.v2.objective-tailor-final-outcomes.v1', slots: [{ ordinal: 1, status: 'ready' }],
-    } }
-    const final = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ phase: 'final_answer', content })} /></I18nProvider>)
-    const running = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ phase: 'final_answer', status: 'running', content })} /></I18nProvider>)
+    const content = { text: 'Answer',
+      objectiveTailorFinalOutcomes: { schemaVersion: 'agent-harness.v2.objective-tailor-final-outcomes.v1', slots: [{ ordinal: 1, status: 'ready' }] },
+      taskGraphSources: { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision: 2, sources: [
+        { sourceKey: 'src_' + 'C'.repeat(43), nodeIndex: 0, role: 'scout', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed' },
+      ] },
+    }
+    const final = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ phase: 'final_answer', taskId: 'root-1', content })} /></I18nProvider>)
+    const running = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ phase: 'final_answer', status: 'running', taskId: 'root-1', content })} /></I18nProvider>)
     const commentary = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ phase: 'commentary', content })} /></I18nProvider>)
     expect(final).toContain('data-agent-objective-tailor-final-outcomes="true"')
     expect(final).toContain('Job 1: Ready')
+    expect(final).toContain('Request application review')
     expect(running).not.toContain('data-agent-objective-tailor-final-outcomes')
     expect(commentary).not.toContain('data-agent-objective-tailor-final-outcomes')
   })
