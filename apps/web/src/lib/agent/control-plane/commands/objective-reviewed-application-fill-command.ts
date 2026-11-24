@@ -44,6 +44,11 @@ export async function startObjectiveReviewedApplicationFill(
     const existing = await findExistingCommand(tx, intent.sessionId, clientMessageId)
     if (existing) return replayExisting(tx, existing, identity, intent)
 
+    const session = await tx.agentSession.findFirst({
+      where: { id: intent.sessionId, userId: intent.userId }, select: { status: true },
+    })
+    if (session?.status !== "running") throw new ReviewedFillHandoffDeferredError()
+
     const authority = await readObjectiveReviewedFillAuthority(tx, intent, now)
     const locked = await lockApplicationFillTask(tx, intent.applicationTaskId, identity, false)
     if (!locked.task) throw new AgentCommandError("agent_session_not_found", "Application task not found", 404)

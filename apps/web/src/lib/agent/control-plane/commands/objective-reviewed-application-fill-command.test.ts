@@ -47,7 +47,7 @@ const authority = { jobId, resumeId, source: { schemaVersion: OBJECTIVE_REVIEWED
 const task = { id: applicationTaskId, jobId, resumeId, status: "waiting_for_user", checkpoint: "materials_ready",
   fillTurnId: null, fillTurnSessionId: null, fillTurnUserId: null, workerTaskId: null, startedAt: null, completedAt: null }
 
-function freshFixture() {
+function freshFixture(sessionStatus = "running") {
   calls.length = 0
   mocks.acquireFence.mockImplementation(async () => { calls.push("source-fence") })
   mocks.lockSession.mockImplementation(async () => { calls.push("session-lock") })
@@ -62,6 +62,7 @@ function freshFixture() {
   mocks.findExisting.mockResolvedValue(null)
   const tx = {
     $queryRaw: vi.fn(async () => { calls.push("predecessor-lock"); return [{ id: predecessorTurnId, status: "completed" }] }),
+    agentSession: { findFirst: vi.fn(async () => { calls.push("session-status"); return { status: sessionStatus } }) },
     agentTurn: {
       updateMany: vi.fn(async () => { calls.push("turn-binding"); return { count: 1 } }),
       findFirst: vi.fn(async (): Promise<unknown> => null),
@@ -92,6 +93,7 @@ describe("Objective reviewed fill command", () => {
     expect(calls.indexOf("source-fence")).toBeLessThan(calls.indexOf("session-lock"))
     expect(calls.indexOf("session-lock")).toBeLessThan(calls.indexOf("predecessor-lock"))
     expect(calls.indexOf("predecessor-lock")).toBeLessThan(calls.indexOf("set-and-approval"))
+    expect(calls.indexOf("session-status")).toBeLessThan(calls.indexOf("set-and-approval"))
     expect(calls.indexOf("set-and-approval")).toBeLessThan(calls.indexOf("task-lock"))
     expect(calls.indexOf("task-lock")).toBeLessThan(calls.indexOf("material-preflight"))
     expect(calls.indexOf("material-preflight")).toBeLessThan(calls.indexOf("freshness"))
@@ -114,7 +116,7 @@ describe("Objective reviewed fill command", () => {
   })
 
   it("returns the persisted exact command replay before rechecking current expiry or material", async () => {
-    const { tx, db } = freshFixture()
+    const { tx, db } = freshFixture("paused")
     const approved = { schemaVersion: "objective-application-review-approved-intent.v1", userId, sessionId,
       reviewTurnId: predecessorTurnId, applicationTaskId, jobId, approvalId, setId, slotOrdinal: 1,
       sourceTurnId: "source-turn-1", materialProofHash }
@@ -133,12 +135,31 @@ describe("Objective reviewed fill command", () => {
     tx.applicationTask.findFirst = vi.fn(async () => priorTask)
     tx.applicationTaskEvent.findMany = vi.fn(async () => [{ id: objectiveApplicationApprovedIntentId(setId, 1),
       taskId: applicationTaskId, type: "objective_application_review_approved", actor: "user", data: approved }])
+    await expect(startObjectiveReviewedApplicationFill(db as never, intent)).resolves.toMatchObject({
+      turnId: "fill-turn", disposition: "duplicate",
+    })
     await expect(acknowledgeExistingObjectiveReviewedFill(db as never, intent)).resolves.toMatchObject({
       kind: "duplicate", result: { turnId: "fill-turn", disposition: "duplicate" },
     })
+    expect(tx.agentSession.findFirst).not.toHaveBeenCalled()
     expect(mocks.readAuthority).not.toHaveBeenCalled()
     expect(mocks.verifyFreshness).not.toHaveBeenCalled()
     expect(tx.applicationTask.updateMany).not.toHaveBeenCalled()
     expect(tx.agentTurn.updateMany).not.toHaveBeenCalled()
+  })
+
+  it("defers a new Fill for a paused Session without writing a Turn or claiming the task", async () => {
+    const { tx, db } = freshFixture("paused")
+    await expect(startObjectiveReviewedApplicationFill(db as never, intent))
+      .rejects.toMatchObject({ code: "reviewed_fill_handoff_deferred" })
+    expect(tx.agentSession.findFirst).toHaveBeenCalledWith({
+      where: { id: sessionId, userId }, select: { status: true },
+    })
+    expect(mocks.readAuthority).not.toHaveBeenCalled()
+    expect(mocks.lockTask).not.toHaveBeenCalled()
+    expect(mocks.createRoot).not.toHaveBeenCalled()
+    expect(mocks.acceptFacts).not.toHaveBeenCalled()
+    expect(tx.agentTurn.updateMany).not.toHaveBeenCalled()
+    expect(tx.applicationTask.updateMany).not.toHaveBeenCalled()
   })
 })
