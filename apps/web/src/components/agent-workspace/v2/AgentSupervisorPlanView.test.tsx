@@ -20,6 +20,7 @@ import type { SupervisorTaskSummary, SupervisorTurnSummary } from './task-tree-p
 import type { TaskTreeNode } from './types'
 import { TaskTreePanel } from './TaskTreePanel'
 import { buildTaskGraphTaskLookupUrl, selectedTaskGraphIdentity } from './task-graph-plan-query'
+import { buildObjectiveTailorProgressUrl, type ObjectiveTailorProgressIdentity } from './ObjectiveTailorProgress'
 
 function graph(turnId: string, rootTaskId: string, childTaskId: string, graphItemId: string, revision: number): TimelineItem {
   const now = '2026-10-01T12:00:00.000Z'
@@ -42,6 +43,27 @@ function graphWithChildren(turnId: string, rootTaskId: string, childTaskIds: rea
       dependsOn: [], depth: 1, taskId: childTaskId,
     })) },
     startedAt: null, completedAt: null, createdAt: now, updatedAt: now, source: 'replay', sequence: null,
+  }
+}
+
+function objectiveTailorGraph(turnId: string, rootTaskId: string, graphItemId: string, revision: number): TimelineItem {
+  return {
+    ...graph(turnId, rootTaskId, 'scout-current', graphItemId, revision),
+    content: { objectiveTailorProgressHint: {
+      schemaVersion: 'agent-harness.v2.objective-tailor-progress-hint.v1', sourceNodeCount: 7, slotCount: 8,
+    } },
+  }
+}
+
+function objectiveTailorProgress(identity: ObjectiveTailorProgressIdentity) {
+  return {
+    progress: {
+      schemaVersion: 'agent-harness.v2.objective-tailor-progress.v1', identity,
+      sources: Array.from({ length: 7 }, (_, index) => ({
+        ordinal: index + 1, role: index < 3 ? 'scout' : 'analyst', status: index === 0 ? 'completed' : 'pending',
+      })),
+      slots: Array.from({ length: 8 }, (_, index) => ({ ordinal: index + 1, phase: index === 0 ? 'completed' : 'awaiting_draft' })),
+    },
   }
 }
 
@@ -148,6 +170,23 @@ describe('AgentSupervisorPlanView', () => {
     ]))
     expect(historical).toContain('Return to current plan')
     expect(historical).toContain('Loading selected job progress…')
+  })
+
+  it('wires the V2 progress hint to the exact active Objective Tailor graph identity', () => {
+    const tailor = objectiveTailorGraph('turn-current', 'root-tailor', 'graph-tailor', 27)
+    const visibleItems = [oldGraph, tailor]
+    const identity = { sessionId: 'session-1', turnId: 'turn-current', graphItemId: 'graph-tailor', rootTaskId: 'root-tailor', revision: 27 }
+    const url = buildObjectiveTailorProgressUrl(identity)
+    api.responses.set(url, { data: objectiveTailorProgress(identity), loading: false, error: null, refetch: () => undefined })
+    const html = renderToStaticMarkup(view(undefined, undefined, visibleItems, tasks, turns, {
+      activeTurnId: 'turn-current', activeTurn: { id: 'turn-current', status: 'in_progress' },
+    }))
+
+    expect(html).toContain('Objective tailoring progress')
+    expect(html).toContain('Scout 1: Completed')
+    expect(html).toContain('Slot 1: Review complete')
+    expect(html).not.toContain('root-tailor')
+    expect(api.calls).toContainEqual({ url, enabled: true })
   })
 
   it('suppresses stale session, Turn, graph, or revision responses instead of showing another plan', () => {
