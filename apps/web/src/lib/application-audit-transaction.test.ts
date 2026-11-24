@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const mocks = vi.hoisted(() => ({ transaction: vi.fn(), query: vi.fn() }))
+const mocks = vi.hoisted(() => ({ transaction: vi.fn(), query: vi.fn(), sourceFence: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: { $transaction: mocks.transaction } }))
+vi.mock('@/lib/agent/source-material-fence', () => ({ acquireSourceMaterialFence: mocks.sourceFence }))
 import { AuditMaterialBusyError, lockApplicationAuditMaterials, withApplicationAuditLock } from './application-audit-transaction'
 
 const scope = { userId: 'user_1', jobId: 'job_1' }
@@ -9,6 +10,7 @@ const scope = { userId: 'user_1', jobId: 'job_1' }
 describe('application audit transaction', () => {
   beforeEach(() => {
     vi.resetAllMocks()
+    mocks.sourceFence.mockResolvedValue(undefined)
     mocks.transaction.mockImplementation((callback: (tx: unknown) => unknown) => callback({ $queryRaw: mocks.query }))
   })
 
@@ -16,9 +18,37 @@ describe('application audit transaction', () => {
     mocks.query.mockResolvedValue([{ id: 'job_1' }])
     const decision = vi.fn().mockResolvedValue('locked')
     await expect(withApplicationAuditLock(scope, decision)).resolves.toBe('locked')
+    expect(mocks.sourceFence).not.toHaveBeenCalled()
     expect(mocks.query.mock.calls[0][0].strings.join('?')).toContain('FOR UPDATE')
     expect(mocks.query.mock.calls[0][0].values).toEqual(['job_1', 'user_1'])
     expect(decision).toHaveBeenCalledTimes(1)
+  })
+
+  it('acquires the optional source fence before the owned job lock and callback', async () => {
+    const order: string[] = []
+    mocks.sourceFence.mockImplementation(async (_tx: unknown, userIds: readonly string[]) => {
+      expect(userIds).toEqual(['user_1'])
+      order.push('source_fence')
+    })
+    mocks.query.mockImplementation(async () => { order.push('job_lock'); return [{ id: 'job_1' }] })
+    const decision = vi.fn(async () => { order.push('callback'); return 'locked' })
+
+    await expect(withApplicationAuditLock(scope, decision, { sourceMaterialFence: true })).resolves.toBe('locked')
+
+    expect(order).toEqual(['source_fence', 'job_lock', 'callback'])
+    expect(mocks.sourceFence).toHaveBeenCalledTimes(1)
+    expect(mocks.query.mock.calls[0][0].values).toEqual(['job_1', 'user_1'])
+  })
+
+  it('does not read the job or run the callback when the optional source fence fails', async () => {
+    const failure = new Error('source fence unavailable')
+    mocks.sourceFence.mockRejectedValue(failure)
+    const decision = vi.fn()
+
+    await expect(withApplicationAuditLock(scope, decision, { sourceMaterialFence: true })).rejects.toBe(failure)
+
+    expect(mocks.query).not.toHaveBeenCalled()
+    expect(decision).not.toHaveBeenCalled()
   })
 
   it('does not run a decision for an absent or foreign job', async () => {

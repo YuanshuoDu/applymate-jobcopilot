@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   resumeUpdateMany: vi.fn(),
   resumeVersionCreate: vi.fn(),
   transaction: vi.fn(),
+  auditLock: vi.fn(),
   activityCreate: vi.fn(),
   hasEffectiveEntitlement: vi.fn(),
   readAudit: vi.fn(),
@@ -67,7 +68,7 @@ vi.mock('@/lib/application-audit-operation', () => ({
   auditMaterialBasisHash: () => 'material-hash',
 }))
 vi.mock('@/lib/application-audit-transaction', () => ({
-  withApplicationAuditLock: async (_scope: unknown, callback: (tx: unknown) => Promise<unknown>) => mocks.transaction(callback),
+  withApplicationAuditLock: mocks.auditLock,
   lockApplicationAuditMaterials: mocks.lockMaterials,
   AuditMaterialBusyError: class AuditMaterialBusyError extends Error {},
 }))
@@ -95,6 +96,7 @@ describe('tailor resume API', () => {
     mocks.resumeUpdateMany.mockReset()
     mocks.resumeVersionCreate.mockReset()
     mocks.transaction.mockReset()
+    mocks.auditLock.mockReset()
     mocks.activityCreate.mockReset()
     mocks.hasEffectiveEntitlement.mockReset()
     mocks.readAudit.mockReset()
@@ -120,6 +122,7 @@ describe('tailor resume API', () => {
     mocks.failAudit.mockResolvedValue(true)
     mocks.lockMaterials.mockResolvedValue(true)
     mocks.transaction.mockImplementation(callback => callback(fixtureTx()))
+    mocks.auditLock.mockImplementation(async (_scope: unknown, callback: (tx: unknown) => Promise<unknown>) => mocks.transaction(callback))
   })
 
   it('reuses the tailored resume already linked to the job without calling the AI', async () => {
@@ -382,6 +385,31 @@ describe('tailor resume API', () => {
     expect(mocks.modelChat).toHaveBeenCalledTimes(1)
     expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('SECTION: summary')
     expect(mocks.resumeUpdateMany).toHaveBeenCalledWith({ where: { id: 'resume_tailored', userId: 'user_1', targetJobId: 'job_1', kind: 'adapted', origin: 'ai-adapted', parentResumeId: 'resume_base', updatedAt: new Date('2026-01-01T00:00:00Z'), content: { equals: current } }, data: { content: { ...current, summary: 'Corrected summary' } } })
+    expect(mocks.auditLock).toHaveBeenCalledTimes(2)
+    expect(mocks.auditLock).toHaveBeenNthCalledWith(1, { userId: 'user_1', jobId: 'job_1' }, expect.any(Function), { sourceMaterialFence: true })
+    expect(mocks.auditLock).toHaveBeenNthCalledWith(2, { userId: 'user_1', jobId: 'job_1' }, expect.any(Function), { sourceMaterialFence: true })
+  })
+
+  it('fails closed before model work when the fenced audit read cannot start', async () => {
+    const current = { summary: 'Current' }
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_tailored', content: current })
+      .mockResolvedValueOnce({ id: 'resume_tailored', parentResumeId: 'resume_base', content: current, name: 'Tailored' })
+    mocks.jobFindFirst.mockResolvedValueOnce({ id: 'job_1', description: 'Build reliable systems.' })
+    mocks.auditLock.mockRejectedValueOnce(new Error('source material fence transaction verification failed'))
+    const { POST } = await import('./route')
+
+    const response = await POST(new NextRequest('http://localhost/api/jobs/job_1/tailor-resume', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resumeId: 'resume_tailored', forceRetailor: true, auditReceiptSignature: fixtureSignature, auditOperationId: fixtureOperationId }),
+    }) as never, { params: Promise.resolve({ id: 'job_1' }) })
+
+    expect(response?.status).toBe(503)
+    expect(mocks.auditLock).toHaveBeenCalledTimes(1)
+    expect(mocks.auditLock).toHaveBeenCalledWith({ userId: 'user_1', jobId: 'job_1' }, expect.any(Function), { sourceMaterialFence: true })
+    expect(mocks.readAudit).not.toHaveBeenCalled()
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.resumeUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
   })
 
   it('uses trusted review findings instead of client-supplied corrections', async () => {

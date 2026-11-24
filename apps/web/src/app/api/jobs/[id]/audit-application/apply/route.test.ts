@@ -185,6 +185,7 @@ describe('POST /api/jobs/[id]/audit-application/apply', () => {
     expect(body.audit.findings[0]).toMatchObject({ applied: true, target: 'summary', proposedValue: 'Supported summary.' })
     expect(mocks.resumeVersionCreate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ resumeId: 'resume_final', content: resumeContent }) }))
     expect(mocks.resumeUpdate).toHaveBeenCalledWith(expect.objectContaining({ data: { content: { ...resumeContent, summary: 'Supported summary.' } } }))
+    expect(mocks.withLock).toHaveBeenCalledWith(scope, expect.any(Function), { sourceMaterialFence: true })
     const stored = await readAuditOperation({ activity: { findFirst: mocks.activityFindFirst, findUnique: mocks.activityFindUnique } } as never, scope)
     expect(stored.kind).toBe('completed')
     if (stored.kind !== 'completed') throw new Error('Expected completed correction')
@@ -301,6 +302,24 @@ describe('POST /api/jobs/[id]/audit-application/apply', () => {
     expect(await response.json()).toMatchObject({ error: expect.stringContaining('being changed') })
     expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
     expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+  })
+
+  it('does not write materials or audit history when the fenced correction transaction fails', async () => {
+    await seedCurrentAudit(audit())
+    const normalLock = mocks.withLock.getMockImplementation()!
+    mocks.withLock.mockImplementationOnce(normalLock).mockRejectedValueOnce(new Error('source fence unavailable'))
+    const { POST } = await import('./route')
+
+    const response = (await POST(request({ resumeId: 'resume_final', findingIndex: 0 }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+
+    expect(response.status).toBe(503)
+    expect(mocks.withLock).toHaveBeenNthCalledWith(2, scope, expect.any(Function), { sourceMaterialFence: true })
+    expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
+    expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+    expect(mocks.coverLetterUpdate).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+    expect(mocks.activityUpsert).not.toHaveBeenCalled()
+    expect(mocks.activityUpdate).not.toHaveBeenCalled()
   })
 
   it('generates a safe replacement when the audit did not provide one', async () => {

@@ -1,5 +1,6 @@
 import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
+import { acquireSourceMaterialFence } from '@/lib/agent/source-material-fence'
 
 type AuditScope = { userId: string; jobId: string }
 
@@ -14,9 +15,14 @@ function lockNotAvailable(error: unknown): boolean {
 }
 
 /** A short tenant-scoped transaction serializes decisions for one application. */
-export async function withApplicationAuditLock<T>(scope: AuditScope, run: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T | null> {
+export async function withApplicationAuditLock<T>(
+  scope: AuditScope,
+  run: (tx: Prisma.TransactionClient) => Promise<T>,
+  options?: Readonly<{ sourceMaterialFence?: true }>,
+): Promise<T | null> {
   try {
     return await db.$transaction(async tx => {
+      if (options?.sourceMaterialFence) await acquireSourceMaterialFence(tx, [scope.userId])
       const jobs = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
         SELECT "id" FROM "Job" WHERE "id" = ${scope.jobId} AND "userId" = ${scope.userId} FOR UPDATE
       `)

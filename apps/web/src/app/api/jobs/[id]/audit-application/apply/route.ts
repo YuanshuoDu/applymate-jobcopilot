@@ -178,7 +178,7 @@ export async function POST(req: NextRequest, { params }: Params) {
         throw new Error('Could not persist audit correction')
       }
       return ok({ audit: updatedAudit, operationId: nextOperation, target, appliedContent: proposedValue, resume: updatedResume, coverLetter: updatedCoverLetter, resumeUpdatedAt, coverLetterUpdatedAt })
-    })
+    }, { sourceMaterialFence: true })
     return result ?? err('Job not found', 404)
   } catch (error) {
     return error instanceof AuditMaterialBusyError
