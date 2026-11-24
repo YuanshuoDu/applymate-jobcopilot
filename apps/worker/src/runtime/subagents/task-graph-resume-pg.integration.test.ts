@@ -5581,6 +5581,82 @@ async function waitForObjectiveTailorReplayStage(
   fail("deadline")
 }
 
+function projectObjectiveTailorCorrectionWaitSnapshot(
+  row: RecordValue | undefined, output: readonly string[],
+): RecordValue {
+  const status = (value: unknown, allowed: ReadonlySet<string>) => value === null || value === undefined
+    ? "missing" : diagnosticEnum(value, allowed) ?? "other"
+  const count = (value: unknown) => diagnosticBoundedCount(value)
+  return {
+    available: row !== undefined,
+    turnStatus: status(row?.turnStatus, TURN_DIAGNOSTIC_STATUSES),
+    rootStatus: status(row?.rootStatus, OBJECTIVE_TAILOR_ROOT_STATUSES),
+    wait: {
+      status: status(row?.waitStatus, WAIT_DIAGNOSTIC_STATUSES),
+      mode: row?.waitMode === "all" || row?.waitMode === "any" ? row.waitMode : row?.waitMode == null ? "missing" : "other",
+      targetCount: count(row?.targetCount), matchedCount: count(row?.matchedCount),
+      suspended: row?.waitSuspended === true, resolved: row?.waitResolved === true, consumed: row?.waitConsumed === true,
+    },
+    correctionTasks: {
+      count: count(row?.correctionCount), queued: count(row?.correctionQueued), running: count(row?.correctionRunning),
+      completed: count(row?.correctionCompleted), failed: count(row?.correctionFailed), other: count(row?.correctionOther),
+    },
+    stages: {
+      wave1WaitReady: output.includes("TAILOR_WAVE1_WAIT_READY"),
+      wave2WaitReady: output.includes("TAILOR_WAVE2_WAIT_READY"),
+      wrongFeedbackRejected: output.includes("TAILOR_WRONG_FEEDBACK_REJECTED"),
+      correctionsWaitReady: output.includes("TAILOR_CORRECTIONS_WAIT_READY"),
+      rootStreamFailed: output.includes("TAILOR_ROOT_STREAM_FAILED"),
+    },
+  }
+}
+
+async function waitForObjectiveTailorCorrectionsReady(
+  pool: Pool, child: ProcessFixtureChild, owner: Pick<Fixture, "userId" | "sessionId" | "turnId">, rootTaskId: string,
+): Promise<void> {
+  try {
+    await waitForProcessLine(child, "TAILOR_CORRECTIONS_WAIT_READY", 120_000)
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.startsWith("Timed out waiting for TAILOR_CORRECTIONS_WAIT_READY;")) throw error
+    let progress: RecordValue
+    try {
+      const result = await pool.query<RecordValue>(`SELECT turn."status" AS "turnStatus", root."status" AS "rootStatus",
+          wait."status" AS "waitStatus", wait."mode" AS "waitMode",
+          CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN jsonb_array_length(wait."targetTaskIds") ELSE 0 END AS "targetCount",
+          CASE WHEN jsonb_typeof(wait."matchedTaskIds") = 'array' THEN jsonb_array_length(wait."matchedTaskIds") ELSE 0 END AS "matchedCount",
+          wait."suspendedAt" IS NOT NULL AS "waitSuspended", wait."resolvedAt" IS NOT NULL AS "waitResolved",
+          wait."consumedAt" IS NOT NULL AS "waitConsumed",
+          corrections."correctionCount", corrections."correctionQueued", corrections."correctionRunning",
+          corrections."correctionCompleted", corrections."correctionFailed", corrections."correctionOther"
+        FROM "agent_turns" AS turn
+        JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+        LEFT JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."id" = $5
+          AND root."sessionId" = turn."sessionId" AND root."turnId" = turn."id"
+          AND root."rootTaskId" = root."id" AND root."parentTaskId" IS NULL AND root."role" = 'orchestrator' AND root."taskType" = 'root'
+        LEFT JOIN LATERAL (SELECT condition."status", condition."mode", condition."targetTaskIds", condition."matchedTaskIds",
+            condition."suspendedAt", condition."resolvedAt", condition."consumedAt"
+          FROM "agent_wait_conditions" AS condition WHERE condition."userId" = turn."userId"
+            AND condition."sessionId" = turn."sessionId" AND condition."turnId" = turn."id"
+            AND condition."parentTaskId" = root."id" AND left(condition."idempotencyKey", length($4)) = $4
+          ORDER BY condition."createdAt" DESC, condition."id" DESC LIMIT 1) AS wait ON TRUE
+        CROSS JOIN LATERAL (SELECT COUNT(*)::int AS "correctionCount",
+            COUNT(*) FILTER (WHERE task."status" = 'queued')::int AS "correctionQueued",
+            COUNT(*) FILTER (WHERE task."status" = 'running')::int AS "correctionRunning",
+            COUNT(*) FILTER (WHERE task."status" = 'completed')::int AS "correctionCompleted",
+            COUNT(*) FILTER (WHERE task."status" = 'failed')::int AS "correctionFailed",
+            COUNT(*) FILTER (WHERE task."status" NOT IN ('queued','running','completed','failed'))::int AS "correctionOther"
+          FROM "sub_agent_tasks" AS task WHERE task."sessionId" = turn."sessionId" AND task."turnId" = turn."id"
+            AND task."rootTaskId" = $5 AND task."parentTaskId" = $5
+            AND task."context"->'objectiveTailorCorrectionProof' IS NOT NULL
+            AND task."context"->'objectiveTailorCorrectionProof' <> 'null'::jsonb) AS corrections
+        WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND session."userId" = $3`,
+      [owner.turnId, owner.sessionId, owner.userId, `p3-1336-corrections-wait:${owner.turnId}:`, rootTaskId])
+      progress = projectObjectiveTailorCorrectionWaitSnapshot(result.rows[0], child.output)
+    } catch { progress = projectObjectiveTailorCorrectionWaitSnapshot(undefined, child.output) }
+    throw new Error(`Objective Tailor corrections wait: ${boundedDiagnostic(JSON.stringify(progress), 1_400)}`)
+  }
+}
+
 async function waitForObjectiveTailorStage(
   pool: Pool, child: ProcessFixtureChild, owner: Pick<Fixture, "userId" | "sessionId" | "turnId">,
   stage: "source_graph" | "wave1_writers",
@@ -7412,6 +7488,23 @@ describe("persisted TaskGraph wait scope", () => {
 })
 
 describe("compact TaskGraph wait failure diagnostics", () => {
+  it("projects correction wait state through fixed statuses, counts, and stage booleans", () => {
+    const secretId = "synthetic-private-task-id"
+    const projected = projectObjectiveTailorCorrectionWaitSnapshot({
+      turnStatus: "waiting_for_dependency", rootStatus: "waiting", waitStatus: "waiting", waitMode: "all",
+      targetCount: 16, matchedCount: 3, waitSuspended: true, waitResolved: false, waitConsumed: false,
+      correctionCount: 4, correctionQueued: 1, correctionRunning: 2, correctionCompleted: 1,
+      correctionFailed: 0, correctionOther: 0, rawId: secretId,
+    }, ["TAILOR_WAVE1_WAIT_READY", "TAILOR_WRONG_FEEDBACK_REJECTED"])
+    expect(projected).toMatchObject({
+      available: true, turnStatus: "waiting_for_dependency", rootStatus: "waiting",
+      wait: { status: "waiting", mode: "all", targetCount: 16, matchedCount: 3, suspended: true },
+      correctionTasks: { count: 4, queued: 1, running: 2, completed: 1, failed: 0, other: 0 },
+      stages: { wave1WaitReady: true, wave2WaitReady: false, wrongFeedbackRejected: true, correctionsWaitReady: false },
+    })
+    expect(JSON.stringify(projected)).not.toContain(secretId)
+  })
+
   it("uses the existing typed Scout verification shape for its ordinary-plan probe", () => {
     expect(sourcePlan().nodes[0]).toMatchObject({
       templateId: "scout",
@@ -21664,7 +21757,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForProcessLine(resumedWorker, "TAILOR_WAVE1_WAIT_READY", 120_000)
       await waitForProcessLine(resumedWorker, "TAILOR_WAVE2_WAIT_READY", 120_000)
       await waitForProcessLine(resumedWorker, "TAILOR_WRONG_FEEDBACK_REJECTED", 120_000)
-      await waitForProcessLine(resumedWorker, "TAILOR_CORRECTIONS_WAIT_READY", 120_000)
+      await waitForObjectiveTailorCorrectionsReady(pool!, resumedWorker, value, rootTaskId)
       const finalMarker = await waitForProcessLine(resumedWorker, "TAILOR_FINAL_OUTCOME 6 2", 180_000)
       expect(finalMarker).toBe("TAILOR_FINAL_OUTCOME 6 2")
       await waitForTurnStatus(pool!, value.turnId, "completed", 60_000)
