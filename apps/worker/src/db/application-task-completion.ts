@@ -9,8 +9,8 @@ import type { SubagentLease } from "../runtime/subagents/types.js"
 import { hashArtifactContent } from "../runtime/subagents/artifact-adapters.js"
 import { acquireSourceMaterialFence } from "./source-material-fence.js"
 import { ensureSubmissionArtifactWithClient } from "./submission-artifact.js"
-import { reviewedApplicationFillSelector } from "../runtime/reviewed-application-fill-binding.js"
-import { readReviewedApplicationFillCompletionMaterial, type ReviewedApplicationFillReadback } from "./reviewed-application-fill-completion.js"
+import { reviewedApplicationFillSelector, sameReviewedApplicationFillSelector } from "../runtime/reviewed-application-fill-binding.js"
+import { readApplicationFillCompletionMaterial, type ObjectiveReviewedApplicationFillReadback, type ReviewedApplicationFillReadback } from "./reviewed-application-fill-completion.js"
 import { isFillWaitDetail, writeApplicationFillWaitWithClient, type FillWaitCheckpoint } from "./application-task-fill-wait.js"
 
 type TurnRow = { id: string; status: string; revision: number; input: unknown }
@@ -144,7 +144,7 @@ async function existingCompletion(client: Client, lease: SubagentLease, task: Ap
 }
 
 /** Commits the review checkpoint, immutable manifest, approval, Turn wait, and Session projection together. */
-export async function completeApplicationFillForReview(pool: Pool, input: { readonly lease: SubagentLease; readonly now?: Date; readonly onStaleGate?: StaleGateObserver; readonly reviewedFillReadback?: ReviewedApplicationFillReadback }): Promise<FillStatus> {
+export async function completeApplicationFillForReview(pool: Pool, input: { readonly lease: SubagentLease; readonly now?: Date; readonly onStaleGate?: StaleGateObserver; readonly reviewedFillReadback?: ReviewedApplicationFillReadback | ObjectiveReviewedApplicationFillReadback }): Promise<FillStatus> {
   const { lease } = input, now = input.now ?? new Date()
   if (!validLease(lease, now) || !lease.turnId) { if (input.onStaleGate) reportStaleGate(input.onStaleGate, "lease_input_invalid"); return { status: "stale" } }
   const turnId = lease.turnId
@@ -162,10 +162,8 @@ export async function completeApplicationFillForReview(pool: Pool, input: { read
       ? writeStaleReviewWait(client, lease, task.id, turn.revision, now) : { status: "conflict" }
     let reviewed: ReviewedApplicationSubmissionMaterial | undefined
     if (selector.kind !== "absent") {
-      if (selector.kind === "selected") reviewed = await readReviewedApplicationFillCompletionMaterial(client, {
-        lease, applicationTaskId: task.id, jobId: task.jobId, sourceTurnId: selector.sourceTurnId,
-        legacyMaterial: submissionPayload(task), readback: input.reviewedFillReadback, requireCurrentAttempt: !replay,
-      }) ?? undefined
+      reviewed = await readApplicationFillCompletionMaterial(client, { selector, lease, applicationTaskId: task.id, jobId: task.jobId,
+        turnInput: turn.input, legacyMaterial: submissionPayload(task), readback: input.reviewedFillReadback, requireCurrentAttempt: !replay }) ?? undefined
       if (!reviewed) return !replay && canPersistStaleReviewWait(task, turn)
         ? writeStaleReviewWait(client, lease, task.id, turn.revision, now) : { status: "conflict" }
     }
@@ -196,7 +194,7 @@ export async function completeApplicationFillForReview(pool: Pool, input: { read
 }
 
 function sameSelector(left: ReturnType<typeof reviewedApplicationFillSelector>, right: ReturnType<typeof reviewedApplicationFillSelector>): boolean {
-  return left.kind === right.kind && (left.kind !== "selected" || (right.kind === "selected" && left.sourceTurnId === right.sourceTurnId))
+  return sameReviewedApplicationFillSelector(left, right)
 }
 function canPersistStaleReviewWait(task: ApplicationRow, turn: TurnRow): boolean {
   return task.status === "filling" && task.checkpoint === "browser_active" && ["in_progress", "waiting_for_user", "waiting_for_dependency"].includes(turn.status)

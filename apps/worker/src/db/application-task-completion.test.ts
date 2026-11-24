@@ -8,10 +8,11 @@ import { hashArtifactContent } from "../runtime/subagents/artifact-adapters.js"
 import * as artifactAdapters from "../runtime/subagents/artifact-adapters.js"
 import type { SubagentLease } from "../runtime/subagents/types.js"
 import { acknowledgeApplicationFillCancellation, completeApplicationFillForReview, failApplicationFillBeforeBrowser, persistApplicationFillWait } from "./application-task-completion.js"
-import { createReviewedApplicationFillReadback } from "./reviewed-application-fill-completion.js"
+import { createObjectiveReviewedApplicationFillReadback, createReviewedApplicationFillReadback } from "./reviewed-application-fill-completion.js"
 
-const reviewedReader = vi.hoisted(() => ({ read: vi.fn() }))
+const reviewedReader = vi.hoisted(() => ({ read: vi.fn(), objectiveRead: vi.fn() }))
 vi.mock("../runtime/selected-job-reviewed-artifact-read.js", () => ({ readSelectedJobReviewedArtifactWithClient: reviewedReader.read }))
+vi.mock("../runtime/objective-reviewed-application-fill-read.js", () => ({ readObjectiveReviewedApplicationFillSource: reviewedReader.objectiveRead }))
 
 type FillTaskFixture = { id: string; jobId: string; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown }
 type ApprovalMismatch = "turn" | "user" | "session" | "task" | "legacy_child" | "job" | "scope" | "payload" | "consumed"
@@ -26,6 +27,11 @@ const reviewedSource: SelectedJobReviewedArtifact = {
   reviewerTaskId: "reviewer-task", reviewerToolCallId: "review-call", reviewHash: `sha256:${"1".repeat(64)}`,
   artifactId: "draft-a", version: 2, contentHash: `sha256:${"2".repeat(64)}`, sourceDigest: `sha256:${"3".repeat(64)}`, content: "Private reviewed letter",
 }
+const objectiveSource = {
+  schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v1",
+  approvalId: `objective-review:objective-review-${"a".repeat(40)}:1`,
+  reviewTurnId: "review-turn", materialProofHash: "4".repeat(64),
+} as const
 
 function taskPayload(task: FillTaskFixture) {
   return { applicationTaskId: task.id, jobId: task.jobId, resumeId: task.resumeId, coverLetterId: task.coverLetterId }
@@ -170,9 +176,50 @@ function reviewedBrowserStart(lease: SubagentLease) {
     artifactId: reviewedSource.artifactId, version: reviewedSource.version, contentHash: reviewedSource.contentHash, sourceDigest: reviewedSource.sourceDigest } }
 }
 
-beforeEach(() => reviewedReader.read.mockResolvedValue(reviewedSource))
+function objectiveBrowserStart(lease: SubagentLease) {
+  return { actor: "worker", data: { schemaVersion: "agent-harness.v2.objective-reviewed-fill-browser-start.v1", userId: lease.userId,
+    sessionId: lease.sessionId, fillTurnId: lease.turnId, jobId: "job-a", applicationTaskId: "application-a", fillerTaskId: lease.id,
+    attemptCount: lease.attemptCount, leaseOwner: lease.ownerId, leaseExpiresAt: lease.leaseExpiresAt.toISOString(), sourceTurnId: reviewedSource.sourceTurnId,
+    rootTaskId: reviewedSource.rootTaskId, graphRevision: reviewedSource.graphRevision, writerTaskId: reviewedSource.writerTaskId,
+    reviewerTaskId: reviewedSource.reviewerTaskId, reviewerToolCallId: reviewedSource.reviewerToolCallId, reviewHash: reviewedSource.reviewHash,
+    artifactId: reviewedSource.artifactId, version: reviewedSource.version, contentHash: reviewedSource.contentHash,
+    sourceDigest: reviewedSource.sourceDigest, objectiveSource } }
+}
+
+beforeEach(() => {
+  reviewedReader.read.mockResolvedValue(reviewedSource)
+  reviewedReader.objectiveRead.mockResolvedValue({ source: objectiveSource, reviewedArtifact: reviewedSource })
+})
 
 describe("ApplicationTask fill completion", () => {
+  it("completes an Objective fill from its exact browser readback and leaves final submit authorization pending", async () => {
+    const seed = fixture(), readback = await createObjectiveReviewedApplicationFillReadback(seed.lease, seed.task.id, objectiveSource, reviewedSource)
+    const marker = { reviewedApplicationMaterialSource: objectiveSource }
+    const test = fixture({ turnInput: marker, browserStartEvents: [objectiveBrowserStart(seed.lease)], reviewedCoverLetterHash: readback!.reviewedCoverLetterHash })
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, reviewedFillReadback: readback ?? undefined })).resolves.toEqual({ status: "completed" })
+
+    expect(reviewedReader.objectiveRead).toHaveBeenCalledWith(test.client, expect.objectContaining({ phase: "completion", turnInput: marker }))
+    const manifest = test.calls.find(call => call.sql.includes('INSERT INTO "agent_artifact"'))
+    const submitApproval = test.calls.find(call => call.sql.includes('INSERT INTO "agent_approvals"'))
+    expect(JSON.parse(String(manifest?.values?.[5]))).toMatchObject({
+      schemaVersion: "agent-harness.application-submission.v2", reviewedCoverLetterHash: readback?.reviewedCoverLetterHash,
+    })
+    expect(submitApproval?.values?.[7]).toBe("submit_application")
+    expect(JSON.stringify(test.calls)).not.toContain(reviewedSource.content)
+  })
+
+  it("fails closed on stale Objective source proof before creating a manifest or submit approval", async () => {
+    const seed = fixture(), readback = await createObjectiveReviewedApplicationFillReadback(seed.lease, seed.task.id, objectiveSource, reviewedSource)
+    const test = fixture({ turnInput: { reviewedApplicationMaterialSource: objectiveSource },
+      browserStartEvents: [objectiveBrowserStart(seed.lease)], reviewedCoverLetterHash: readback!.reviewedCoverLetterHash })
+    reviewedReader.objectiveRead.mockResolvedValueOnce(undefined)
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, reviewedFillReadback: readback ?? undefined })).resolves.toEqual({ status: "waiting" })
+
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_artifact"') || call.sql.includes('INSERT INTO "agent_approvals"'))).toBe(false)
+  })
+
   it("issues only the existing four-field approval payload with the exact reviewed commitment", async () => {
     const marker = { reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: reviewedSource.sourceTurnId } }
     const test = fixture({ turnInput: marker, browserStartEvents: [reviewedBrowserStart({ ...fixture().lease })] })
