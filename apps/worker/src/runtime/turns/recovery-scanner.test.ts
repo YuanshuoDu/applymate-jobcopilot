@@ -1,9 +1,34 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA } from "@jobcopilot/shared"
 
 const sessionControlRecovery = vi.hoisted(() => ({ run: vi.fn() }))
+const objectiveRecovery = vi.hoisted(() => ({ settlement: vi.fn(), inspectWake: vi.fn(), hasEvidence: vi.fn(), eventId: vi.fn(), receipt: vi.fn(),
+  hasPublishedWake: vi.fn(), rootMatches: vi.fn(), parseRootWait: vi.fn(), parkedWait: vi.fn(), persistWakeupDispatch: vi.fn() }))
 
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
 vi.mock("../session-control/pause-recovery.js", () => ({ reconcilePendingSessionControls: sessionControlRecovery.run }))
+vi.mock("../../db/objective-application-submit-settlement.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../db/objective-application-submit-settlement.js")>()),
+  readObjectiveApplicationSubmitSettlement: objectiveRecovery.settlement,
+}))
+vi.mock("../wakeup/resume-objective-final-submit-wait.js", () => ({ inspectObjectiveFinalSubmitWake: objectiveRecovery.inspectWake }))
+vi.mock("./recovery-scanner-objective-submit.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("./recovery-scanner-objective-submit.js")>()),
+  hasObjectiveApplicationSubmitFinalizationEvidenceWithClient: objectiveRecovery.hasEvidence,
+  objectiveApplicationSubmitFinalizationEventId: objectiveRecovery.eventId,
+  objectiveApplicationSubmitFinalizationReceiptFor: objectiveRecovery.receipt,
+  hasPublishedObjectiveSubmitWakeWithClient: objectiveRecovery.hasPublishedWake,
+  objectiveSubmitRootWaitMatchesApproval: objectiveRecovery.rootMatches,
+  parseObjectiveSubmitRootWait: objectiveRecovery.parseRootWait,
+  hasParkedObjectiveRootWaitWithClient: objectiveRecovery.parkedWait,
+}))
+vi.mock("./recovery-scanner-storage.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("./recovery-scanner-storage.js")>()),
+  persistWakeupTurnDispatchInTransaction: objectiveRecovery.persistWakeupDispatch,
+}))
+
+const reviewedSource = { schemaVersion: OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA,
+  approvalId: `objective-review:objective-review-${"a".repeat(40)}:1`, reviewTurnId: "review-turn-1", materialProofHash: "b".repeat(64) }
 
 import { dispatchPendingTurnOutbox, persistTurnDispatch, reclaimExpiredTurns, repairLegacyTurnDispatchAggregates, recoverTurnQueue, turnJobId } from "./recovery-scanner.js"
 import { markTurnDispatchClaimed } from "./turn-queue.js"
@@ -59,6 +84,16 @@ function pool(rows: unknown[] = [], sessionStatus: string | null = "running", qu
 describe("Turn recovery scanner", () => {
   beforeEach(() => {
     sessionControlRecovery.run.mockReset().mockResolvedValue({ scanned: 0, reconciled: 0, failed: 0 })
+    objectiveRecovery.settlement.mockReset()
+    objectiveRecovery.inspectWake.mockReset().mockResolvedValue("acknowledge")
+    objectiveRecovery.hasEvidence.mockReset().mockResolvedValue(false)
+    objectiveRecovery.eventId.mockReset().mockReturnValue("finalization-event-1")
+    objectiveRecovery.receipt.mockReset().mockReturnValue({ schemaVersion: "objective-finalization" })
+    objectiveRecovery.hasPublishedWake.mockReset().mockResolvedValue(true)
+    objectiveRecovery.rootMatches.mockReset().mockReturnValue(true)
+    objectiveRecovery.parseRootWait.mockReset().mockReturnValue({ kind: "explicit_approval", waitId: "approval-1" })
+    objectiveRecovery.parkedWait.mockReset().mockResolvedValue(true)
+    objectiveRecovery.persistWakeupDispatch.mockReset().mockResolvedValue(true)
   })
 
   it("includes pause and resume reconciliation in each root recovery pass", async () => {
@@ -79,6 +114,60 @@ describe("Turn recovery scanner", () => {
 
     expect(log).toHaveBeenCalledWith("[turn-recovery] session control scan failed:", error)
     log.mockRestore()
+  })
+
+  it("timestamps a recovered finalization receipt at insert time, after the settled result", async () => {
+    const tick = new Date("2026-11-20T10:00:00.000Z"), sessionId = "session_1", turnId = "turn_1", rootTaskId = "root_1"
+    const task = { id: "application_1", userId: "user_1", jobId: "job_1", sessionId, fillTurnId: turnId,
+      fillTurnSessionId: sessionId, fillTurnUserId: "user_1", workerTaskId: "bull-1", status: "submitted",
+      checkpoint: "submission_verified", completedAt: new Date("2026-11-20T10:01:00.000Z") }
+    const approvalId = `application-fill:${task.id}:${turnId}`, constraintHash = "a".repeat(64)
+    const wakeItemId = `agent-wait:approval:${approvalId}`
+    const wakeEvent = { eventId: "wake-event-1", sessionId, turnId, itemId: wakeItemId, type: "turn.wakeup",
+      payload: { waitKind: "approval", waitId: approvalId, itemId: wakeItemId, turnId,
+        toolCallId: `application-submit:${task.id}`, status: "approved", nextTurnRevision: 4 } }
+    const calls: Array<[string, unknown[]?]> = []
+    const client = { query: vi.fn(async (sql: string, values?: unknown[]) => {
+      calls.push([sql, values])
+      if (sql.includes('FROM "agent_sessions" AS session') && sql.includes("reviewedApplicationMaterialSource")) {
+        return { rows: [{ userId: "user_1", sessionId, turnId, rootTaskId, updatedAt: tick }], rowCount: 1 }
+      }
+      if (sql.includes('FROM "agent_sessions"') && sql.includes('"status" IN (\'running\',\'waiting_for_user\') FOR UPDATE')) {
+        return { rows: [{ id: sessionId, status: "running" }], rowCount: 1 }
+      }
+      if (sql.includes('FROM "agent_events" AS pause')) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_turns" WHERE "id"=$1')) return { rows: [{ id: turnId, rootTaskId, source: "user",
+        executionMode: "canonical_task_graph", input: { reviewedApplicationMaterialSource: reviewedSource }, status: "waiting_for_approval", revision: 4,
+        leaseOwnerId: null, leaseExpiresAt: null, leaseStartedAt: null }], rowCount: 1 }
+      if (sql.includes('FROM "agent_turns" WHERE "sessionId"=$1')) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes('"attemptCount"')) return { rows: [{ id: rootTaskId, status: "waiting_for_user",
+        attemptCount: 1, result: {}, failureReason: null, leaseOwner: null, leaseExpiresAt: null,
+        interruptRequestedAt: null, closedAt: null }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "filler_1", status: "completed", leaseOwner: null,
+        leaseExpiresAt: null, interruptRequestedAt: null }], rowCount: 1 }
+      if (sql.includes('FROM "application_tasks"')) return { rows: [task], rowCount: 1 }
+      if (sql.includes('FROM "Job"')) return { rows: [{ id: task.jobId, status: "applied", workflowState: "submitted", appliedAt: tick }], rowCount: 1 }
+      if (sql.includes('FROM "agent_events"') && sql.includes('"payload"')) return { rows: [wakeEvent], rowCount: 1 }
+      if (sql.includes("submission_execution_settled")) return { rows: [{ id: "settled_1", actor: "worker", body: "Submit execution settled",
+        data: { applicationTaskId: task.id, userId: task.userId, jobId: task.jobId, sessionId, fillTurnId: turnId,
+          approvalId, constraintHash, workerTaskId: task.workerTaskId, executionId: "execution_1" } }], rowCount: 1 }
+      if (sql.includes('INSERT INTO "application_task_events"')) return { rows: [{ id: values?.[0] }], rowCount: 1 }
+      if (sql.includes('UPDATE "agent_turns"')) return { rows: [], rowCount: 1 }
+      return { rows: [], rowCount: 0 }
+    }), release: vi.fn() }
+    const fakePool = { connect: vi.fn().mockResolvedValue(client) }
+    objectiveRecovery.settlement.mockResolvedValue({ resultLinkEventId: "result-link-1", fillTurnStatus: "waiting_for_approval" })
+    objectiveRecovery.eventId.mockReturnValue("finalization-event-1")
+    objectiveRecovery.parseRootWait.mockReturnValue({ kind: "explicit_approval", waitId: approvalId })
+
+    await recoverTurnQueue(fakePool as never, { add: vi.fn() }, "scanner_1", tick)
+
+    const insert = calls.find(([sql]) => sql.includes('INSERT INTO "application_task_events"'))
+    expect(insert?.[0]).toContain("clock_timestamp()")
+    expect(insert?.[0]).not.toContain("$6")
+    expect(insert?.[1]).toHaveLength(5)
+    const turnUpdate = calls.find(([sql]) => sql.includes('UPDATE "agent_turns"'))
+    expect(turnUpdate?.[1]?.[0]).toBe(tick)
   })
 
   it("rejects an invalid dispatch batch size before touching the database", async () => {

@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto"
 import type pg from "pg"
 import { OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA, parseObjectiveReviewedFillSource } from "@jobcopilot/shared"
-
 import { getPool } from "../../db/apply-results.js"
 import { readObjectiveApplicationSubmitSettlement } from "../../db/objective-application-submit-settlement.js"
 import type { ApplicationSubmissionExecution } from "../../queue/application-submit-fence.js"
@@ -29,7 +28,6 @@ import {
   reclaimExpiredTurns,
   repairLegacyTurnDispatchAggregates,
 } from "./recovery-scanner-storage.js"
-
 export { TURN_DISPATCH_TOPIC, TURN_DISPATCH_MAX_BATCH, turnDispatchKey, turnJobId } from "./recovery-scanner-common.js"
 export type { TurnDispatchQueue } from "./recovery-scanner-common.js"
 export { dispatchPendingTurnOutbox } from "./recovery-scanner-delivery.js"
@@ -40,16 +38,12 @@ export {
   reclaimExpiredTurns,
   repairLegacyTurnDispatchAggregates,
 } from "./recovery-scanner-storage.js"
-
 export const TURN_DISPATCH_POLL_MS = 30_000
-
 export type RecoveryReport = { reclaimed: number; repaired: number; dispatched: number }
-
 type Row = Record<string, unknown>
 type ObjectiveCandidate = { userId: string; sessionId: string; turnId: string; rootTaskId: string; updatedAt: Date | string }
 type CandidateCursor = { updatedAt: string; turnId: string }
 let objectiveCursor: CandidateCursor | null = null
-
 export async function recoverTurnQueue(
   pool: LeasePool,
   queue: TurnDispatchQueue,
@@ -69,7 +63,6 @@ export async function recoverTurnQueue(
   const dispatched = await dispatchPendingTurnOutbox(pool, queue)
   return { reclaimed: reclaimed.length, repaired, dispatched }
 }
-
 async function recoverObjectiveSubmitFinalizations(pool: LeasePool, limit: number, now: Date): Promise<number> {
   let candidates: ObjectiveCandidate[]
   try {
@@ -86,7 +79,6 @@ async function recoverObjectiveSubmitFinalizations(pool: LeasePool, limit: numbe
   }
   return queued
 }
-
 async function readObjectiveCandidates(pool: LeasePool, limit: number): Promise<ObjectiveCandidate[]> {
   const result = await withTransaction(pool, async client => client.query<ObjectiveCandidate>(`SELECT turn."userId",turn."sessionId",turn."id" AS "turnId",
       turn."rootTaskId",turn."updatedAt" FROM "agent_sessions" AS session
@@ -175,8 +167,8 @@ async function queueObjectiveCandidate(pool: LeasePool, candidate: ObjectiveCand
     if (await hasObjectiveApplicationSubmitFinalizationEvidenceWithClient(client, execution)) return false
     const receipt = objectiveApplicationSubmitFinalizationReceiptFor(execution, settlement)
     const inserted = await client.query(`INSERT INTO "application_task_events" ("id","taskId","type","actor","body","data","createdAt")
-      VALUES ($1,$2,$3,'worker',$4,$5::jsonb,$6) ON CONFLICT ("id") DO NOTHING RETURNING "id"`,
-    [eventId, task.id, OBJECTIVE_APPLICATION_SUBMIT_FINALIZATION_EVENT_TYPE, OBJECTIVE_APPLICATION_SUBMIT_FINALIZATION_EVENT_BODY, JSON.stringify(receipt), now])
+      VALUES ($1,$2,$3,'worker',$4,$5::jsonb,clock_timestamp()) ON CONFLICT ("id") DO NOTHING RETURNING "id"`,
+    [eventId, task.id, OBJECTIVE_APPLICATION_SUBMIT_FINALIZATION_EVENT_TYPE, OBJECTIVE_APPLICATION_SUBMIT_FINALIZATION_EVENT_BODY, JSON.stringify(receipt)])
     if (inserted.rowCount !== 1) throw new Error("objective_submit_finalization_event_conflict")
     if (session.rows[0]?.status === "waiting_for_user") {
       const resumed = await client.query(`UPDATE "agent_sessions" SET "status"='running',"updatedAt"=$1 WHERE "id"=$2 AND "userId"=$3 AND "status"='waiting_for_user'`,
