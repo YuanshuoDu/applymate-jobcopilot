@@ -14,6 +14,7 @@ import { formatObjectiveLocationSteerMessage } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import {
   OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+  parseObjectiveTailorFinalOutcomeSidecar,
   PLAN_LEDGER_SCHEMA_VERSION,
   parsePlanLedger,
   projectPlanLedger,
@@ -74,6 +75,7 @@ import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 import type { WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { readTaskGraphConfirmedLocationSteer } from "./task-graph-confirmed-location-steer.js"
+import { parseObjectiveTailorWaveCandidateWitness } from "./objective-tailor-wave-witness.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const authorizeUnreservedUsage = async () => ({
@@ -4953,6 +4955,8 @@ async function readExactFixtureQueueJobs(
 }
 
 const processRestartFixturePath = fileURLToPath(new URL("./task-graph-resume-process-restart.fixture.mjs", import.meta.url))
+const objectiveTailorWaveProcessFixturePath = fileURLToPath(new URL("./objective-tailor-wave-process.fixture.mjs", import.meta.url))
+const objectiveTailorWaveSourceFixturePath = fileURLToPath(new URL("./objective-tailor-wave-source.fixture.mjs", import.meta.url))
 const processRestartWorkerCwd = fileURLToPath(new URL("../../../", import.meta.url))
 const DISCOVERY_TURN_WORKER_MARKER = "P3_DISCOVERY_TURN_WORKER "
 const DISCOVERY_TURN_WORKER_NAMES = new Set(["worker2", "worker3"])
@@ -5037,6 +5041,40 @@ function startTaskGraphRestartWorker(
   fixtureProcessChildren.add(child)
   let stdout = ""
   let stderr = ""
+  child.stdout?.setEncoding("utf8")
+  child.stderr?.setEncoding("utf8")
+  child.stdout?.on("data", (chunk: string) => {
+    stdout += chunk
+    const lines = stdout.split("\n")
+    stdout = lines.pop() ?? ""
+    child.output.push(...lines.map(line => line.trim()).filter(Boolean))
+  })
+  child.stderr?.on("data", (chunk: string) => {
+    stderr += chunk
+    const lines = stderr.split("\n")
+    stderr = lines.pop() ?? ""
+    child.errors.push(...lines.map(line => line.trim()).filter(Boolean))
+  })
+  return child
+}
+
+function startObjectiveTailorWaveWorker(mode: "first" | "resume", owner: Pick<Fixture, "userId" | "sessionId" | "turnId">): ProcessFixtureChild {
+  const scope = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId }
+  const child = spawn(process.execPath, ["--import", "tsx", objectiveTailorWaveProcessFixturePath, mode, JSON.stringify(scope)], {
+    cwd: processRestartWorkerCwd,
+    env: { ...process.env, ...(redisUrl ? { REDIS_URL: redisUrl, AGENT_TURN_REDIS_TEST_URL: redisUrl } : {}),
+      ...(databaseUrl ? { DATABASE_URL: databaseUrl, AGENT_RUNTIME_PG_TEST_URL: databaseUrl } : {}),
+      RUN_AGENT_TURN_REDIS_INTEGRATION: "1", ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "1" },
+    stdio: ["pipe", "pipe", "pipe"],
+  }) as ProcessFixtureChild
+  child.output = []
+  child.errors = []
+  child.fixtureMode = `objective-tailor-wave-${mode}`
+  child.fixtureScopes = fixtureProcessScopes({ sessionId: owner.sessionId, turnId: owner.turnId })
+  child.terminationSignal = null
+  child.staleBullJobKeys = new Set()
+  fixtureProcessChildren.add(child)
+  let stdout = "", stderr = ""
   child.stdout?.setEncoding("utf8")
   child.stderr?.setEncoding("utf8")
   child.stdout?.on("data", (chunk: string) => {
@@ -9030,6 +9068,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const scoutUnionOwner = fixture()
   const objectiveScoutAuthorityOwner = fixture()
   const objectiveAnalystAuthorityOwner = fixture()
+  const objectiveTailorWaveOwner = fixture()
   const objectiveEmptySearchOwner = fixture()
   const emptyAnalystOwner = fixture()
   const emptyAnalystOrphanOwner = fixture()
@@ -9129,7 +9168,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       locationRepairOwner, locationMismatchOwner, locationConflictOwner, locationForeignOwner, replanApplicabilityOwner, supersededReadOnlyScoutOwner, leaseRecoveryOwner,
       coverageRepairOwner, scoutUnionOwner, emptyAnalystOwner, emptyAnalystOrphanOwner, emptyAnalystCurrentReceiptOwner,
       emptyAnalystMutationOwner, rootRecoveryScanOwner, archivedWaitOwner, objectiveScoutAuthorityOwner,
-      objectiveAnalystAuthorityOwner, objectiveEmptySearchOwner]
+      objectiveAnalystAuthorityOwner, objectiveTailorWaveOwner, objectiveEmptySearchOwner]
     const allFixtureWorkersExited = [...fixtureProcessChildren].every(processFixtureExited)
     if (!allFixtureWorkersExited) cleanupFailures.push("fixture process Workers are not proven exited; queue cleanup was refused")
     let ownerRowsMayBeDeleted = false
@@ -21000,6 +21039,421 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       releaseScoutResult.resolve()
     }
   }, 120_000)
+
+  it("restarts an Objective Tailor V2 wave without losing exact source or correction evidence", async () => {
+    const value = objectiveTailorWaveOwner
+    const [{ TURN_QUEUE_NAME }, subagentQueue] = await Promise.all([
+      import("../turns/turn-queue.js"), import("../../queue/subagent-queue.js"),
+    ])
+    turnQueueName = TURN_QUEUE_NAME
+    childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
+    const sourceFixture = await import(objectiveTailorWaveSourceFixturePath) as unknown as {
+      seedObjectiveTailorWaveSource(pool: Pool, owner: Fixture, jobIdForSlot: (suffix: string, slot: number) => string): Promise<{
+        jobs: readonly Readonly<{ id: string; source: string }>[]
+      }>
+    }
+    let firstWorker: ProcessFixtureChild | undefined
+    let resumedWorker: ProcessFixtureChild | undefined
+    let service: Awaited<ReturnType<typeof createDisposableWebObjectiveStartService>> | undefined
+    let priorFeatureFlag: string | undefined
+    let featureFlagCaptured = false
+    let rootTaskId: string | undefined
+    try {
+      await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`,
+        [value.userId, `${value.userId}@example.invalid`])
+      await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+        VALUES ($1, $2, 'Objective Tailor wave restart fixture', 'running', 'test', CURRENT_TIMESTAMP)`, [value.sessionId, value.userId])
+      const seeded = await sourceFixture.seedObjectiveTailorWaveSource(pool!, value, fixtureJobId)
+      const jobIds = seeded.jobs.map(job => job.id)
+      expect(seeded.jobs.map(job => job.source)).toEqual([
+        "greenhouse", "greenhouse", "greenhouse", "lever", "lever", "lever", "workday", "workday",
+      ])
+      expect(new Set(jobIds).size).toBe(8)
+
+      const objective = "Find and assess current software engineering roles, then prepare tailored cover letters for the strongest matches"
+      const requirements = {
+        schemaVersion: "agent-harness.v2.objective-requirements.v1",
+        requirements: [
+          { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+          { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+        ],
+      } as const satisfies ObjectiveStartFixtureCommand["verificationRequirements"]
+      service = await createDisposableWebObjectiveStartService(databaseUrl!)
+      let started: ObjectiveStartFixtureResult | undefined
+      priorFeatureFlag = process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES
+      featureFlagCaptured = true
+      try {
+        process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES = "1"
+        started = await service.commands.start({
+          sessionId: value.sessionId, userId: value.userId, clientMessageId: `p3-1336-objective-start:${value.suffix}`,
+          source: "user", objective, content: [{ type: "text", text: objective }], verificationRequirements: requirements,
+        })
+      } finally {
+        if (priorFeatureFlag === undefined) delete process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES
+        else process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES = priorFeatureFlag
+        await service.prisma.$disconnect()
+        service = undefined
+      }
+      if (!started) throw new Error("Objective Tailor ObjectiveStart did not return a Turn")
+      expect(started.disposition).toBe("started")
+      value.turnId = started.turnId
+      const startedTurn = await pool!.query<{ input: unknown; executionMode: string | null; budgetSnapshot: unknown }>(
+        `SELECT "input", "executionMode", "budgetSnapshot" FROM "agent_turns"
+         WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [value.turnId, value.sessionId, value.userId],
+      )
+      expect(startedTurn.rows).toHaveLength(1)
+      expect(startedTurn.rows[0]?.executionMode).toBe("canonical_task_graph")
+      expect(record(startedTurn.rows[0]?.input)).toMatchObject({
+        intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, verificationRequirements: requirements,
+      })
+      expect(record(startedTurn.rows[0]?.budgetSnapshot)).toMatchObject({
+        limits: { maxSteps: 96 }, objectiveTailorProfile: "agent-harness.v2.objective-tailor-execution-budget.v1",
+      })
+
+      firstWorker = startObjectiveTailorWaveWorker("first", value)
+      await waitForProcessLine(firstWorker, "TAILOR_WAVE_WORKER_READY first", 60_000)
+      await waitForProcessLine(firstWorker, "TAILOR_SOURCE_GRAPH_READY 7", 180_000)
+      await waitForProcessLine(firstWorker, "TAILOR_WAVE1_WRITERS_PAUSED 4", 180_000)
+      const ordinaryPlanRejected = await waitForProcessLine(firstWorker, "TAILOR_ORDINARY_PLAN_REJECTED ", 120_000)
+      const ordinaryPlanRevision = /^TAILOR_ORDINARY_PLAN_REJECTED ([1-9][0-9]*)$/.exec(ordinaryPlanRejected)?.[1]
+      expect(ordinaryPlanRevision).toBeDefined()
+      expect(firstWorker.output.filter(line => line.startsWith("TAILOR_ORDINARY_PLAN_REJECTED "))).toHaveLength(1)
+      const root = await pool!.query<{ id: string; role: string; taskType: string }>(
+        `SELECT root."id", root."role", root."taskType" FROM "agent_turns" AS turn
+         JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+         JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
+         WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND session."userId" = $3
+           AND root."rootTaskId" = root."id" AND root."parentTaskId" IS NULL AND root."role" = 'orchestrator'
+           AND root."taskType" = 'root'`, [value.turnId, value.sessionId, value.userId],
+      )
+      expect(root.rows).toHaveLength(1)
+      rootTaskId = root.rows[0]!.id
+
+      const firstGraphResult = await pool!.query<{ id: string; revision: number; content: unknown }>(
+        `SELECT item."id", item."revision", item."content" FROM "agent_items" AS item
+         JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+         JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+         WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
+           AND item."type" = 'task_graph' AND turn."userId" = $5 AND session."userId" = $5`,
+        [taskGraphItemId(rootTaskId), value.sessionId, value.turnId, rootTaskId, value.userId],
+      )
+      expect(firstGraphResult.rows).toHaveLength(1)
+      const firstSnapshot = parseTaskGraphSnapshot(firstGraphResult.rows[0]?.content)
+      expect(firstGraphResult.rows[0]?.revision).toBeGreaterThanOrEqual(Number(ordinaryPlanRevision))
+      const firstMarker = firstSnapshot.objectiveTailor
+      if (!firstMarker) throw new Error("Objective Tailor first-wave graph marker was not persisted")
+      expect(firstSnapshot.nodes).toHaveLength(15)
+      expect(firstSnapshot.nodes.some(node => node.key === "ordinary-after-wave")).toBe(false)
+      expect(firstMarker.sourceNodeCount).toBe(7)
+      expect(firstMarker.slots.map(slot => slot.slotId)).toEqual(["tailor-1", "tailor-2", "tailor-3", "tailor-4"])
+      const sourceNodes = firstSnapshot.nodes.slice(0, firstMarker.sourceNodeCount)
+      expect(sourceNodes.filter(node => node.templateId === "scout")).toHaveLength(3)
+      expect(sourceNodes.filter(node => node.templateId === "analyst")).toHaveLength(4)
+      expect(sourceNodes.every(node => node.verificationDisposition === "typed")).toBe(true)
+      const firstNodeByKey = new Map(firstSnapshot.nodes.map(node => [node.key, node] as const))
+      const firstPairTaskIds = firstMarker.slots.flatMap(slot => {
+        const writerTaskId = firstNodeByKey.get(slot.writerNodeKey)?.taskId
+        const reviewerTaskId = firstNodeByKey.get(slot.reviewerNodeKey)?.taskId
+        return writerTaskId && reviewerTaskId ? [writerTaskId, reviewerTaskId] : []
+      })
+      if (firstPairTaskIds.length !== 8) throw new Error("Objective Tailor first wave omitted a durable pair task")
+      const firstWaitKey = `p3-1336-wave1-wait:${value.turnId}:1`
+      await waitForPersistedTaskWait(pool!, value.turnId, firstWaitKey, 45_000, undefined, undefined, undefined, {
+        userId: value.userId, sessionId: value.sessionId, parentTaskId: rootTaskId,
+      })
+      const firstWaitResult = await pool!.query<{
+        id: string; status: string; mode: string; targetTaskIds: unknown; matchedTaskIds: unknown
+        suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null
+      }>(`SELECT "id", "status", "mode", "targetTaskIds", "matchedTaskIds", "suspendedAt", "resolvedAt", "consumedAt"
+          FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3
+            AND "parentTaskId" = $4 AND "idempotencyKey" = $5`,
+      [value.userId, value.sessionId, value.turnId, rootTaskId, firstWaitKey])
+      expect(firstWaitResult.rows).toHaveLength(1)
+      const firstWait = firstWaitResult.rows[0]!
+      const waitTargets = typeof firstWait.targetTaskIds === "string"
+        ? JSON.parse(firstWait.targetTaskIds) as unknown : firstWait.targetTaskIds
+      const waitMatches = typeof firstWait.matchedTaskIds === "string"
+        ? JSON.parse(firstWait.matchedTaskIds) as unknown : firstWait.matchedTaskIds
+      expect(firstWait).toMatchObject({ status: "waiting", mode: "all", resolvedAt: null, consumedAt: null })
+      expect(firstWait.suspendedAt).toBeInstanceOf(Date)
+      expect(Array.isArray(waitTargets) ? [...waitTargets].sort() : []).toEqual([...firstPairTaskIds].sort())
+      expect(Array.isArray(waitMatches) ? waitMatches : []).toHaveLength(0)
+      const firstTurn = await pool!.query<{ status: string; rootTaskId: string | null }>(
+        `SELECT "status", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+        [value.turnId, value.sessionId, value.userId],
+      )
+      expect(firstTurn.rows[0]).toMatchObject({ status: "waiting_for_dependency", rootTaskId })
+
+      const liveWriters = await pool!.query<{ id: string; status: string; role: string; leaseOwner: string | null; leaseLive: boolean }>(
+        `SELECT task."id", task."status", task."role", task."leaseOwner",
+                task."leaseExpiresAt" > clock_timestamp() AS "leaseLive"
+         FROM "sub_agent_tasks" AS task
+         JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+         WHERE task."sessionId" = $1 AND task."turnId" = $2 AND task."rootTaskId" = $3 AND task."parentTaskId" = $3
+           AND task."id" = ANY($4::text[]) AND session."userId" = $5 AND turn."userId" = $5
+         ORDER BY task."id"`,
+        [value.sessionId, value.turnId, rootTaskId, firstMarker.slots.map(slot => firstNodeByKey.get(slot.writerNodeKey)?.taskId), value.userId],
+      )
+      const expectedWriterIds = firstMarker.slots.map(slot => firstNodeByKey.get(slot.writerNodeKey)!.taskId).sort()
+      expect(liveWriters.rows.map(row => row.id).sort()).toEqual(expectedWriterIds)
+      expect(liveWriters.rows.every(row => row.role === "writer" && row.status === "running"
+        && typeof row.leaseOwner === "string" && row.leaseLive)).toBe(true)
+
+      const queueIdentities = await readExactFixtureQueueJobs(pool!, [value], turnQueueName, childQueueName,
+        selectedJobQueueName, value.sessionId)
+      const turnIdentity = queueIdentities.find(identity => identity.kind === "turn" && identity.currentGeneration)
+      if (!turnIdentity || turnIdentity.kind !== "turn") throw new Error("Objective Tailor active Turn dispatch identity was not persisted")
+      const turnQueue = new Queue(turnQueueName, { connection: redis!, skipVersionCheck: true })
+      try {
+        await turnQueue.waitUntilReady()
+        const queuedTurn = await turnQueue.getJob(turnIdentity.jobId)
+        if (!queuedTurn) throw new Error("Objective Tailor Turn dispatch was not present in its real queue")
+        const dispatchPayload = parseTurnJobPayload(queuedTurn.data)
+        expect(dispatchPayload?.sessionId === value.sessionId && dispatchPayload.turnId === value.turnId).toBe(true)
+        if (await queuedTurn.getState() === "active") {
+          expect(typeof await redis!.get(turnQueue.toKey(turnIdentity.jobId) + ":lock")).toBe("string")
+        }
+      } finally { await turnQueue.close() }
+      noteFixtureSigkillTurnJob(firstWorker, turnIdentity.queueName, turnIdentity.jobId)
+      await killProcessFixture(firstWorker, "SIGKILL")
+
+      resumedWorker = startObjectiveTailorWaveWorker("resume", value)
+      await waitForProcessLine(resumedWorker, "TAILOR_WAVE_WORKER_READY resume", 60_000)
+      await waitForProcessLine(resumedWorker, "TAILOR_WAVE1_REPLAY_MATCHED", 120_000)
+      await waitForProcessLine(resumedWorker, "TAILOR_WAVE1_WAIT_READY", 120_000)
+      await waitForProcessLine(resumedWorker, "TAILOR_WAVE2_WAIT_READY", 120_000)
+      await waitForProcessLine(resumedWorker, "TAILOR_WRONG_FEEDBACK_REJECTED", 120_000)
+      await waitForProcessLine(resumedWorker, "TAILOR_CORRECTIONS_WAIT_READY", 120_000)
+      const finalMarker = await waitForProcessLine(resumedWorker, "TAILOR_FINAL_OUTCOME 6 2", 180_000)
+      expect(finalMarker).toBe("TAILOR_FINAL_OUTCOME 6 2")
+      await waitForTurnStatus(pool!, value.turnId, "completed", 60_000)
+
+      const finalTurn = await pool!.query<{ status: string; rootTaskId: string | null; finalResponse: string | null }>(
+        `SELECT turn."status", turn."rootTaskId", turn."finalResponse" FROM "agent_turns" AS turn
+         JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
+         WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND session."userId" = $3`,
+        [value.turnId, value.sessionId, value.userId],
+      )
+      expect(finalTurn.rows).toHaveLength(1)
+      expect(finalTurn.rows[0]).toMatchObject({ status: "completed", rootTaskId })
+      const finalResponse = record(JSON.parse(finalTurn.rows[0]?.finalResponse ?? "null"))
+      expect(finalResponse).toMatchObject({ schemaVersion: "agent-harness.v2.final", completed: true, terminalReason: "goal_satisfied" })
+      const finalRoot = await pool!.query<{ status: string }>(
+        `SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3
+          AND "rootTaskId" = $1 AND "parentTaskId" IS NULL AND "role" = 'orchestrator' AND "taskType" = 'root'`,
+        [rootTaskId, value.sessionId, value.turnId],
+      )
+      expect(finalRoot.rows).toEqual([{ status: "completed" }])
+      const finalGraphResult = await pool!.query<{ id: string; revision: number; content: unknown }>(
+        `SELECT item."id", item."revision", item."content" FROM "agent_items" AS item
+         JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+         JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+         WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
+           AND item."type" = 'task_graph' AND turn."userId" = $5 AND session."userId" = $5`,
+        [taskGraphItemId(rootTaskId), value.sessionId, value.turnId, rootTaskId, value.userId],
+      )
+      expect(finalGraphResult.rows).toHaveLength(1)
+      const finalSnapshot = parseTaskGraphSnapshot(finalGraphResult.rows[0]?.content)
+      const finalTailor = finalSnapshot.objectiveTailor
+      if (!finalTailor) throw new Error("Objective Tailor final graph marker was missing")
+      expect(finalSnapshot.nodes).toHaveLength(27)
+      expect(finalTailor.sourceNodeCount).toBe(7)
+      expect(finalTailor.slots.map(slot => slot.slotId)).toEqual(Array.from({ length: 8 }, (_, index) => `tailor-${index + 1}`))
+      expect(finalSnapshot.nodes.slice(0, 7).map(node => [node.key, node.taskId, node.templateId, node.verificationDisposition]))
+        .toEqual(firstSnapshot.nodes.slice(0, 7).map(node => [node.key, node.taskId, node.templateId, node.verificationDisposition]))
+      const firstSlotIdentity = (slot: typeof firstMarker.slots[number]) => [slot.slotId, slot.sourceAnalystNodeKey, slot.writerNodeKey, slot.reviewerNodeKey]
+      expect(finalTailor.slots.slice(0, 4).map(firstSlotIdentity)).toEqual(firstMarker.slots.map(firstSlotIdentity))
+      expect(finalTailor.slots.map(slot => Boolean(slot.correction))).toEqual([false, true, false, false, false, true, false, false])
+      expect(finalTailor.slots[1]?.correction?.writerNodeKey).toBeTruthy()
+      expect(finalTailor.slots[5]?.correction?.reviewerNodeKey).toBeTruthy()
+
+      const finalItem = await pool!.query<{ content: unknown }>(
+        `SELECT item."content" FROM "agent_items" AS item
+         JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+         JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+         WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3
+           AND item."type" = 'agent_message' AND item."phase" = 'final_answer' AND item."status" = 'completed'
+           AND turn."userId" = $4 AND session."userId" = $4 ORDER BY item."createdAt" DESC LIMIT 1`,
+        [value.sessionId, value.turnId, rootTaskId, value.userId],
+      )
+      expect(finalItem.rows).toHaveLength(1)
+      const finalContent = record(finalItem.rows[0]?.content)
+      const sidecar = parseObjectiveTailorFinalOutcomeSidecar(finalContent?.objectiveTailorFinalOutcomes)
+      expect(sidecar?.slots.map(slot => [slot.ordinal, slot.status])).toEqual([
+        [1, "ready"], [2, "ready"], [3, "rejected"], [4, "ready"],
+        [5, "ready"], [6, "ready"], [7, "ready"], [8, "rejected"],
+      ])
+      expect(record(finalContent?.final)).not.toHaveProperty("objectiveTailorFinalOutcomes")
+
+      const nodeByKey = new Map(finalSnapshot.nodes.map(node => [node.key, node] as const))
+      const taskIds = finalSnapshot.nodes.map(node => node.taskId)
+      const tasks = await pool!.query<{
+        id: string; role: string; taskType: string; status: string; result: unknown; context: unknown; failureReason: string | null
+      }>(`SELECT task."id", task."role", task."taskType", task."status", task."result", task."context", task."failureReason"
+          FROM "sub_agent_tasks" AS task
+          JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+          JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+          WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3
+            AND task."rootTaskId" = $4 AND task."parentTaskId" = $4
+            AND session."userId" = $5 AND turn."userId" = $5 ORDER BY task."id"`,
+      [taskIds, value.sessionId, value.turnId, rootTaskId, value.userId])
+      expect(tasks.rows).toHaveLength(27)
+      expect(tasks.rows.every(task => task.status === "completed" && task.failureReason === null)).toBe(true)
+      const taskById = new Map(tasks.rows.map(task => [task.id, task] as const))
+      expect(new Set(taskIds).size).toBe(27)
+
+      const expectedInitialReview = ["passed", "needs_revision", "rejected", "passed", "passed", "needs_revision", "passed", "rejected"]
+      const pairFacts: Array<Readonly<{ slotId: string; jobId: string; initialWriter: string; initialReviewer: string; correctionWriter?: string; correctionReviewer?: string }>> = []
+      for (const slot of finalTailor.slots) {
+        const writerNode = nodeByKey.get(slot.writerNodeKey), reviewerNode = nodeByKey.get(slot.reviewerNodeKey)
+        if (!writerNode || !reviewerNode) throw new Error("Objective Tailor final graph lost an initial pair node")
+        const initialWriter = taskById.get(writerNode.taskId), initialReviewer = taskById.get(reviewerNode.taskId)
+        if (!initialWriter || !initialReviewer) throw new Error("Objective Tailor initial pair task was not owner-bound")
+        const writerContext = record(initialWriter.context), reviewerContext = record(initialReviewer.context)
+        const witness = parseObjectiveTailorWaveCandidateWitness(writerContext?.objectiveTailorCandidateWitness)
+        const reviewerWitness = parseObjectiveTailorWaveCandidateWitness(reviewerContext?.objectiveTailorCandidateWitness)
+        if (!witness || !reviewerWitness) throw new Error("Objective Tailor initial pair did not retain its closed witness")
+        const selectedJob = record(writerContext?.selectedJobPreparation)?.jobId
+        expect(initialWriter.role === "writer" && initialWriter.taskType === "cover_letter_draft"
+          && initialReviewer.role === "reviewer" && initialReviewer.taskType === "cover_letter_review"
+          && writerContext?.objectiveTailorCandidateMode === true && reviewerContext?.objectiveTailorCandidateMode === true
+          && witness.slotId === slot.slotId && witness.sourceAnalystKeys[0] === slot.sourceAnalystNodeKey
+          && reviewerWitness.candidateRef === witness.candidateRef && selectedJob === witness.candidate.jobId
+          && record(reviewerContext?.selectedJobPreparation)?.jobId === witness.candidate.jobId).toBe(true)
+        const sourceAnalyst = nodeByKey.get(slot.sourceAnalystNodeKey)
+        const analystTask = sourceAnalyst ? taskById.get(sourceAnalyst.taskId) : undefined
+        const findings = record(record(analystTask?.result)?.structuredResult)?.findings
+        expect(Array.isArray(findings) && findings.map(record).some(finding => finding?.jobId === witness.candidate.jobId)).toBe(true)
+        const initialReview = record(record(initialReviewer.result)?.structuredResult)
+        expect(initialReview?.reviewStatus).toBe(expectedInitialReview[Number(slot.slotId.slice(-1)) - 1])
+        let correctionWriter: string | undefined, correctionReviewer: string | undefined
+        if (slot.correction) {
+          const correctionWriterNode = nodeByKey.get(slot.correction.writerNodeKey)
+          const correctionReviewerNode = nodeByKey.get(slot.correction.reviewerNodeKey)
+          if (!correctionWriterNode || !correctionReviewerNode) throw new Error("Objective Tailor correction graph node was missing")
+          correctionWriter = correctionWriterNode.taskId
+          correctionReviewer = correctionReviewerNode.taskId
+          const writerTask = taskById.get(correctionWriter), reviewerTask = taskById.get(correctionReviewer)
+          if (!writerTask || !reviewerTask) throw new Error("Objective Tailor correction task was not owner-bound")
+          const correctionWriterContext = record(writerTask.context), correctionReviewerContext = record(reviewerTask.context)
+          const correctionWitness = parseObjectiveTailorWaveCandidateWitness(correctionWriterContext?.objectiveTailorCandidateWitness)
+          const correctionReviewerWitness = parseObjectiveTailorWaveCandidateWitness(correctionReviewerContext?.objectiveTailorCandidateWitness)
+          const correctionProof = record(correctionWriterContext?.objectiveTailorCorrectionProof)
+          const reviewerProof = record(correctionReviewerContext?.objectiveTailorCorrectionProof)
+          expect(writerTask.role === "writer" && writerTask.taskType === "cover_letter_draft"
+            && reviewerTask.role === "reviewer" && reviewerTask.taskType === "cover_letter_review"
+            && correctionWriterContext?.objectiveTailorCandidateMode === true && correctionReviewerContext?.objectiveTailorCandidateMode === true
+            && correctionWitness?.candidateRef === witness.candidateRef && correctionReviewerWitness?.candidateRef === witness.candidateRef
+            && record(correctionWriterContext?.selectedJobPreparation)?.jobId === witness.candidate.jobId
+            && correctionWitness?.slotId === slot.slotId && correctionProof?.slotId === slot.slotId
+            && JSON.stringify(correctionProof) === JSON.stringify(reviewerProof)).toBe(true)
+          expect(record(record(reviewerTask.result)?.structuredResult)?.reviewStatus).toBe("passed")
+        }
+        pairFacts.push({ slotId: slot.slotId, jobId: witness.candidate.jobId, initialWriter: writerNode.taskId,
+          initialReviewer: reviewerNode.taskId, ...(correctionWriter ? { correctionWriter } : {}),
+          ...(correctionReviewer ? { correctionReviewer } : {}) })
+      }
+      expect(pairFacts.map(slot => slot.jobId).sort()).toEqual([...jobIds].sort())
+
+      const writerTaskIds = pairFacts.flatMap(slot => [slot.initialWriter, ...(slot.correctionWriter ? [slot.correctionWriter] : [])])
+      const reviewerTaskIds = pairFacts.flatMap(slot => [slot.initialReviewer, ...(slot.correctionReviewer ? [slot.correctionReviewer] : [])])
+      const versions = await pool!.query<{
+        artifactId: string; version: number; contentHash: string; sourceDigest: string; previousHash: string | null; taskId: string; jobId: string
+      }>(`SELECT version."artifactId", version."version", version."contentHash", version."sourceDigest", version."previousHash", version."taskId", version."jobId"
+          FROM "agent_artifact_version" AS version
+          JOIN "agent_sessions" AS session ON session."id" = version."sessionId"
+          JOIN "agent_turns" AS turn ON turn."id" = $4 AND turn."sessionId" = version."sessionId"
+          WHERE version."sessionId" = $1 AND version."taskId" = ANY($2::text[]) AND session."userId" = $3 AND turn."userId" = $3
+          ORDER BY version."taskId"`, [value.sessionId, writerTaskIds, value.userId, value.turnId])
+      const reviews = await pool!.query<{
+        artifactId: string; version: number; contentHash: string; sourceDigest: string; currentSourceDigest: string
+        status: string; reviewHash: string; taskId: string; jobId: string
+      }>(`SELECT review."artifactId", review."version", review."contentHash", review."sourceDigest", review."currentSourceDigest",
+                 review."status", review."reviewHash", review."taskId", review."jobId"
+          FROM "agent_artifact_review" AS review
+          JOIN "agent_sessions" AS session ON session."id" = review."sessionId"
+          JOIN "agent_turns" AS turn ON turn."id" = $4 AND turn."sessionId" = review."sessionId"
+          WHERE review."sessionId" = $1 AND review."taskId" = ANY($2::text[]) AND session."userId" = $3 AND turn."userId" = $3
+          ORDER BY review."taskId"`, [value.sessionId, reviewerTaskIds, value.userId, value.turnId])
+      expect(versions.rows).toHaveLength(10)
+      expect(reviews.rows).toHaveLength(10)
+      expect(new Set(versions.rows.map(row => row.taskId)).size).toBe(10)
+      expect(new Set(reviews.rows.map(row => row.taskId)).size).toBe(10)
+      const versionByTask = new Map(versions.rows.map(row => [row.taskId, row] as const))
+      const reviewByTask = new Map(reviews.rows.map(row => [row.taskId, row] as const))
+      for (const slot of pairFacts) {
+        const initialVersion = versionByTask.get(slot.initialWriter), initialReview = reviewByTask.get(slot.initialReviewer)
+        const initialResult = record(record(taskById.get(slot.initialWriter)?.result)?.structuredResult)
+        const reviewResult = record(record(taskById.get(slot.initialReviewer)?.result)?.structuredResult)
+        if (!initialVersion || !initialReview) throw new Error("Objective Tailor initial artifact proof was not persisted")
+        const initialRef = record(initialResult?.artifactRef)
+        expect(initialVersion.version === 1 && initialVersion.previousHash === null && initialVersion.jobId === slot.jobId
+          && initialVersion.artifactId === initialRef?.artifactId && initialVersion.contentHash === initialRef?.contentHash
+          && initialVersion.sourceDigest === initialRef?.sourceDigest && initialReview.status === expectedInitialReview[Number(slot.slotId.slice(-1)) - 1]
+          && initialReview.artifactId === initialVersion.artifactId && initialReview.version === initialVersion.version
+          && initialReview.contentHash === initialVersion.contentHash && initialReview.sourceDigest === initialVersion.sourceDigest
+          && initialReview.currentSourceDigest === initialVersion.sourceDigest && initialReview.jobId === slot.jobId
+          && initialReview.reviewHash === reviewResult?.reviewHash).toBe(true)
+        if (slot.correctionWriter && slot.correctionReviewer) {
+          const correctedVersion = versionByTask.get(slot.correctionWriter), correctedReview = reviewByTask.get(slot.correctionReviewer)
+          const correctedResult = record(record(taskById.get(slot.correctionWriter)?.result)?.structuredResult)
+          const correctedReviewResult = record(record(taskById.get(slot.correctionReviewer)?.result)?.structuredResult)
+          const correctedRef = record(correctedResult?.artifactRef)
+          if (!correctedVersion || !correctedReview) throw new Error("Objective Tailor correction proof was not persisted")
+          expect(correctedVersion.version === initialVersion.version + 1 && correctedVersion.artifactId === initialVersion.artifactId
+            && correctedVersion.previousHash === initialVersion.contentHash && correctedVersion.jobId === slot.jobId
+            && correctedVersion.contentHash === correctedRef?.contentHash && correctedVersion.sourceDigest === initialVersion.sourceDigest
+            && correctedReview.status === "passed" && correctedReview.artifactId === correctedVersion.artifactId
+            && correctedReview.version === correctedVersion.version && correctedReview.contentHash === correctedVersion.contentHash
+            && correctedReview.sourceDigest === correctedVersion.sourceDigest
+            && correctedReview.currentSourceDigest === correctedVersion.sourceDigest
+            && correctedReview.jobId === slot.jobId && correctedReview.reviewHash === correctedReviewResult?.reviewHash).toBe(true)
+        }
+      }
+
+      const dispatches = await pool!.query<{ idempotencyKey: string; publishedAt: Date | null }>(
+        `SELECT "idempotencyKey", "publishedAt" FROM "agent_outbox"
+         WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch'
+           AND "idempotencyKey" = ANY($2::text[]) ORDER BY "idempotencyKey"`,
+        [value.sessionId, taskIds.map(taskId => `subagent-dispatch:${taskId}`)],
+      )
+      expect(dispatches.rows).toHaveLength(27)
+      expect(new Set(dispatches.rows.map(row => row.idempotencyKey)).size).toBe(27)
+      expect(dispatches.rows.every(row => row.publishedAt instanceof Date)).toBe(true)
+      const waits = await pool!.query<{ idempotencyKey: string; status: string; consumedAt: Date | null }>(
+        `SELECT "idempotencyKey", "status", "consumedAt" FROM "agent_wait_conditions"
+         WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4
+           AND "idempotencyKey" LIKE $5 ORDER BY "idempotencyKey"`,
+        [value.userId, value.sessionId, value.turnId, rootTaskId, `p3-1336-%:${value.turnId}:%`],
+      )
+      const phaseKeys = ["wave-source-wait", "wave-analyst-wait", "wave1-wait", "wave2-wait", "corrections-wait"]
+      for (const phase of phaseKeys) {
+        expect(waits.rows.some(wait => wait.idempotencyKey.startsWith(`p3-1336-${phase}:${value.turnId}:`)
+          && wait.status === "ready" && wait.consumedAt instanceof Date)).toBe(true)
+      }
+      expect(waits.rows.every(wait => /^p3-1336-(?:wave-source|wave-analyst|wave1|wave2|corrections)-wait:[^:]+:[1-9][0-9]*$/.test(wait.idempotencyKey)
+        && ((wait.status === "ready" && wait.consumedAt instanceof Date)
+          || (wait.status === "waiting" && wait.consumedAt === null)))).toBe(true)
+      const applicationEffects = await pool!.query<{ applicationTasks: string; approvals: string; submissions: string }>(
+        `SELECT (SELECT COUNT(*)::text FROM application_tasks WHERE "userId" = $1 AND "jobId" = ANY($2::text[])) AS "applicationTasks",
+          (SELECT COUNT(*)::text FROM "agent_approvals" WHERE "userId" = $1 AND "sessionId" = $3 AND "turnId" = $4) AS "approvals",
+          (SELECT COUNT(*)::text FROM submission_attempt WHERE "userId" = $1 AND "jobId" = ANY($2::text[])) AS "submissions"`,
+        [value.userId, jobIds, value.sessionId, value.turnId],
+      )
+      expect(applicationEffects.rows[0]).toEqual({ applicationTasks: "0", approvals: "0", submissions: "0" })
+    } finally {
+      if (featureFlagCaptured) {
+        if (priorFeatureFlag === undefined) delete process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES
+        else process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES = priorFeatureFlag
+      }
+      await service?.prisma.$disconnect().catch(() => undefined)
+      if (firstWorker && !processFixtureExited(firstWorker)) await killProcessFixture(firstWorker).catch(() => undefined)
+      if (resumedWorker && !processFixtureExited(resumedWorker)) {
+        await stopProcessFixture(resumedWorker).catch(async () => killProcessFixture(resumedWorker!).catch(() => undefined))
+      }
+    }
+  }, 300_000)
 
   it("routes a typed empty jobs.search shortfall into an ordinary Scout repair", async () => {
     const value = objectiveEmptySearchOwner
