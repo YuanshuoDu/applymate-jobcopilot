@@ -134,10 +134,10 @@ export function createObjectiveTailorWaveModels({ deps, userId, sessionId, turnI
         return
       }
       if (tailors.length === 5 && !tailors.some(call => call.input?.correctionSlotId === "tailor-6")) {
-        const receipt = acceptedCorrectionReceipt(request, tailors[4])
+        acceptedCorrectionReceipt(request, tailors[4])
+        say("TAILOR_CORRECTION_SLOT2_RECEIPT_ACCEPTED")
         const graph = currentGraph(request)
         yield* emit(`p3-1336-correct-slot-6:${turnId}`, "agent.tailor", { expectedRevision: graph.revision, correctionSlotId: "tailor-6" })
-        void receipt
         return
       }
       if (tailors.length === 6 && !hasPhase(request, "corrections", turnId)) {

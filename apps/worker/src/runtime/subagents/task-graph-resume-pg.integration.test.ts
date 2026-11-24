@@ -5377,7 +5377,7 @@ const OBJECTIVE_TAILOR_MODEL_DIAGNOSTIC_CODES = new Set([
   ...OBJECTIVE_TAILOR_WAVE_DIAGNOSTIC_CODES, "invalid_state", "task_graph_objective_coverage_incomplete",
   "fixture_observation_unavailable", "fixture_wave1_identity_unavailable", "fixture_wave_catalog_unavailable",
   "fixture_wave_receipt_invalid", "fixture_plan_receipt_invalid", "fixture_wait_result_error",
-  "fixture_ordinary_plan_append_was_not_closed", "fixture_root_phase_unrecognized",
+  "fixture_correction_receipt_invalid", "fixture_ordinary_plan_append_was_not_closed", "fixture_root_phase_unrecognized",
   "fixture_wave_replay_args_missing", "fixture_wave_replay_identity_mismatch",
 ])
 
@@ -5605,9 +5605,12 @@ function projectObjectiveTailorCorrectionWaitSnapshot(
       wave1WaitReady: output.includes("TAILOR_WAVE1_WAIT_READY"),
       wave2WaitReady: output.includes("TAILOR_WAVE2_WAIT_READY"),
       wrongFeedbackRejected: output.includes("TAILOR_WRONG_FEEDBACK_REJECTED"),
+      correctionSlot2ReceiptAccepted: output.includes("TAILOR_CORRECTION_SLOT2_RECEIPT_ACCEPTED"),
       correctionsWaitReady: output.includes("TAILOR_CORRECTIONS_WAIT_READY"),
       rootStreamFailed: output.includes("TAILOR_ROOT_STREAM_FAILED"),
     },
+    rootStreamFailureCode: latestObjectiveTailorMarkerValue(output, "TAILOR_ROOT_STREAM_FAILURE ",
+      OBJECTIVE_TAILOR_MODEL_DIAGNOSTIC_CODES),
   }
 }
 
@@ -7500,9 +7503,27 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       available: true, turnStatus: "waiting_for_dependency", rootStatus: "waiting",
       wait: { status: "waiting", mode: "all", targetCount: 16, matchedCount: 3, suspended: true },
       correctionTasks: { count: 4, queued: 1, running: 2, completed: 1, failed: 0, other: 0 },
-      stages: { wave1WaitReady: true, wave2WaitReady: false, wrongFeedbackRejected: true, correctionsWaitReady: false },
+      stages: { wave1WaitReady: true, wave2WaitReady: false, wrongFeedbackRejected: true,
+        correctionSlot2ReceiptAccepted: false, correctionsWaitReady: false },
+      rootStreamFailureCode: "none",
     })
     expect(JSON.stringify(projected)).not.toContain(secretId)
+  })
+
+  it("retains only the allowlisted root failure code and correction receipt stage", () => {
+    const projected = projectObjectiveTailorCorrectionWaitSnapshot(undefined, [
+      "TAILOR_CORRECTION_SLOT2_RECEIPT_ACCEPTED", "TAILOR_ROOT_STREAM_FAILURE fixture_correction_receipt_invalid",
+      "TAILOR_ROOT_STREAM_FAILURE synthetic-private-error-text",
+    ])
+    expect(projected).toMatchObject({
+      available: false,
+      stages: { correctionSlot2ReceiptAccepted: true, rootStreamFailed: false },
+      rootStreamFailureCode: "other",
+    })
+    expect(JSON.stringify(projected)).not.toContain("synthetic-private-error-text")
+    expect(projectObjectiveTailorCorrectionWaitSnapshot(undefined, [
+      "TAILOR_ROOT_STREAM_FAILURE fixture_correction_receipt_invalid",
+    ]).rootStreamFailureCode).toBe("fixture_correction_receipt_invalid")
   })
 
   it("uses the existing typed Scout verification shape for its ordinary-plan probe", () => {
@@ -7520,6 +7541,8 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     expect(objectiveTailorWaveDiagnosticCode(new Error("synthetic-private-error-text"))).toBe("other")
     expect(objectiveTailorWaveDiagnosticCode(new Error("fixture_observation_unavailable")))
       .toBe("fixture_observation_unavailable")
+    expect(objectiveTailorWaveDiagnosticCode(new Error("fixture_correction_receipt_invalid")))
+      .toBe("fixture_correction_receipt_invalid")
   })
 
   it("recognizes the exact underscore-form wave model markers", () => {
