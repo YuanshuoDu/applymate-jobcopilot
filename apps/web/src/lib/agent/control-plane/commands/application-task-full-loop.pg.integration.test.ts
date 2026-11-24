@@ -1645,6 +1645,38 @@ async function waitForReviewedApplicationTask(jobId: string, predicate: (task: A
   throw new Error(`Reviewed ApplicationTask did not reach the expected state; status=${latest?.status ?? "missing"}; checkpoint=${latest?.checkpoint ?? "missing"}`)
 }
 
+async function waitForObjectiveFillerCompletion(input: {
+  sessionId: string; fillTurnId: string; fillRootTaskId: string; fillerTaskId: string; attemptCount: number
+}, timeoutMs = 60_000) {
+  const until = Date.now() + timeoutMs
+  while (Date.now() < until) {
+    const rows = await testDb.subAgentTask.findMany({ where: {
+      sessionId: input.sessionId, turnId: input.fillTurnId, rootTaskId: input.fillRootTaskId,
+      role: "application_filler", taskType: "application_fill_for_review", session: { userId: ids.user },
+    }, take: 4, select: { id: true, status: true, attemptCount: true, completedAt: true,
+      leaseOwner: true, leaseExpiresAt: true, interruptRequestedAt: true } })
+    const filler = rows[0]
+    if (rows.length > 1) throw new Error("Objective Fill Root has duplicate Filler children")
+    if (rows.length === 1 && filler?.id === input.fillerTaskId && filler.status === "completed"
+      && filler.attemptCount === input.attemptCount && filler.completedAt instanceof Date
+      && filler.leaseOwner === null && filler.leaseExpiresAt === null && filler.interruptRequestedAt === null) return filler
+    if (worker && exited(worker)) throw new Error("Worker exited before the Objective Filler released its lease")
+    await delay(100)
+  }
+  throw new Error("Objective Filler did not reach exact completed and lease-free state")
+}
+
+function objectiveSubmitApprovalErrorCategory(value: unknown): string {
+  switch (value) {
+    case "A current, explicit approval is required before this application can be submitted.": return "reviewed_material_invalid"
+    case "The approved submission receipt changed before its intent was committed.": return "receipt_changed"
+    case "This application is no longer ready for the approved submission step.": return "application_not_ready"
+    case "Submission authorization is missing its task.": return "submission_task_missing"
+    case "Job not found": return "job_missing"
+    default: return "other"
+  }
+}
+
 const REVIEWED_FILL_DIAGNOSTIC_STATUSES = new Set([
   "queued", "in_progress", "running", "waiting", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency",
   "waiting_for_authorization", "filling", "completed", "submitted", "failed", "cancelled", "interrupted", "retrying",
@@ -3171,6 +3203,19 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         && receipt.validAttempts === 0 && receipt.malformedAttempts === 0)).toBe(true)
       expect(beforeFinalApproval.objectiveSubmitReceipts[1]).toMatchObject({ slot: 2, attempts: 0, validAttempts: 0, malformedAttempts: 0 })
       expect(beforeFinalApproval.objectiveGetCounts[1]).toBe(finalStats.objectiveGetCounts[1])
+      const fillerTaskId = typeof browserBinding?.fillerTaskId === "string" ? browserBinding.fillerTaskId : ""
+      const fillerAttemptCount = browserBinding?.attemptCount
+      if (!fillerTaskId || typeof fillerAttemptCount !== "number" || !Number.isSafeInteger(fillerAttemptCount)) {
+        throw new Error("Objective browser binding omitted its exact Filler identity")
+      }
+      const fillTurnBeforeApproval = await testDb.agentTurn.findFirst({ where: {
+        id: fillTurnId, userId: ids.user, sessionId,
+      }, select: { status: true, revision: true, rootTaskId: true } })
+      if (!fillTurnBeforeApproval?.rootTaskId) throw new Error("Objective Fill Turn has no canonical Root")
+      expect(fillTurnBeforeApproval.status).toBe("waiting_for_approval")
+      const fillRootTaskId = fillTurnBeforeApproval.rootTaskId
+      await waitForObjectiveFillerCompletion({ sessionId, fillTurnId, fillRootTaskId,
+        fillerTaskId, attemptCount: fillerAttemptCount })
       if (typeof submitApproval.scopeHash !== "string") throw new Error("Objective submit approval has no durable scope hash")
       const { GET: getSubmitApproval } = await import("@/app/api/agent/sessions/[id]/approvals/[approvalId]/route")
       const nonceResponse = await getSubmitApproval(apiRequest(
@@ -3186,6 +3231,56 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         `/api/agent/sessions/${sessionId}/actions`, token, "POST", {
           type: "approval_response", approvalId: submitApproval.id, decision: "approved", receiptNonce,
         }), { params: Promise.resolve({ id: sessionId }) })
+      if (approvalResponse.status !== 200) {
+        const responseBody = await jsonResponse(approvalResponse).catch(() => null)
+        const errorCategory = objectiveSubmitApprovalErrorCategory(jsonRecord(responseBody)?.error)
+        let snapshot: Record<string, unknown> = { available: false }
+        try {
+          const turn = await testDb.agentTurn.findFirst({ where: { id: fillTurnId, userId: ids.user, sessionId },
+            select: { status: true, revision: true, rootTaskId: true } })
+          const [task, currentApproval, fillers, browserStartCount] = await Promise.all([
+            testDb.applicationTask.findFirst({ where: { id: applicationTaskId!, userId: ids.user,
+              sessionId, jobId: selectedJobId, fillTurnId }, select: { status: true, checkpoint: true } }),
+            testDb.agentApproval.findUnique({ where: { id: submitApproval.id },
+              select: { status: true, revision: true, userId: true, sessionId: true, taskId: true, turnId: true, jobId: true, type: true } }),
+            testDb.subAgentTask.findMany({ where: { sessionId, turnId: fillTurnId,
+              rootTaskId: turn?.rootTaskId ?? fillRootTaskId, role: "application_filler", taskType: "application_fill_for_review",
+              session: { userId: ids.user } }, take: 4, select: { id: true, status: true, attemptCount: true,
+              completedAt: true, leaseOwner: true, leaseExpiresAt: true, interruptRequestedAt: true } }),
+            testDb.applicationTaskEvent.count({ where: { taskId: applicationTaskId!,
+              type: "reviewed_application_fill_browser_started", actor: "worker" } }),
+          ])
+          const turnRevision = turn?.revision ?? null
+          const approvalRevision = currentApproval?.revision ?? null
+          snapshot = {
+            available: true,
+            task: { status: reviewedFillDiagnosticValue(task?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+              checkpoint: reviewedFillDiagnosticValue(task?.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS) },
+            browserStartCount: Math.min(browserStartCount, 4),
+            fillerCount: Math.min(fillers.length, 4),
+            soleFillerCompletedLeaseFree: fillers.length === 1 && fillers[0]?.id === fillerTaskId
+              && fillers[0]?.status === "completed"
+              && fillers[0]?.attemptCount === fillerAttemptCount && fillers[0]?.completedAt instanceof Date
+              && fillers[0]?.leaseOwner === null && fillers[0]?.leaseExpiresAt === null
+              && fillers[0]?.interruptRequestedAt === null,
+            turnStatus: reviewedFillDiagnosticValue(turn?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+            turnRevision, approvalRevision,
+            approvalRevisionRelation: typeof turnRevision !== "number" || typeof approvalRevision !== "number"
+              ? "missing" : turnRevision === approvalRevision ? "equal"
+                : turnRevision > approvalRevision ? "turn_ahead" : "approval_ahead",
+            fillRootStable: turn?.rootTaskId === fillRootTaskId,
+            turnRevisionStable: turnRevision === fillTurnBeforeApproval.revision,
+            approvalScopeMatches: Boolean(currentApproval && currentApproval.userId === ids.user
+              && currentApproval.sessionId === sessionId && currentApproval.taskId === applicationTaskId
+              && currentApproval.turnId === fillTurnId && currentApproval.jobId === selectedJobId
+              && currentApproval.type === "submit_application"),
+            approvalStatus: reviewedFillDiagnosticValue(currentApproval?.status, new Set(["pending", "approved", "consumed", "rejected", "expired"])),
+          }
+        } catch {
+          snapshot = { available: false }
+        }
+        throw new Error(`Objective final approval rejected: ${JSON.stringify({ status: approvalResponse.status, errorCategory, snapshot })}`)
+      }
       expect(approvalResponse.status).toBe(200)
       const submitDispatches = await testDb.agentOutbox.findMany({ where: {
         aggregateId: sessionId, topic: "application.submit.dispatch",
