@@ -22109,15 +22109,20 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         const outputTasks = Array.isArray(output?.tasks) ? output.tasks.map(record) : null
         const outputTaskIds = outputTasks?.map(task => task?.taskId).filter((id): id is string => typeof id === "string") ?? []
         const outputDeadline = typeof output?.deadlineAt === "string" ? Date.parse(output.deadlineAt) : NaN
+        const suspendedReceipt = wait.suspendedAt instanceof Date
+        const originalStatus = suspendedReceipt ? "waiting" : wait.status
+        const originalMatchesValid = outputMatched !== null && outputMatched.every(id => outputTargets?.includes(id))
+        const originalMatchesCurrent = suspendedReceipt ? originalMatchesValid : sameUniqueIds(outputMatched ?? [], matched)
         return receipt.callStatus === "completed" && receipt.resultStatus === "completed"
           && receipt.callStepId === wait.stepId && receipt.resultStepId === wait.stepId
           && typeof call?.toolCallId === "string" && call.toolCallId.length > 0
           && call?.toolName === "agent.wait" && input?.idempotencyKey === wait.idempotencyKey
           && input.mode === wait.mode && sameUniqueIds(exactIds(input.taskIds) ?? [], targets)
-          && result?.toolCallId === call.toolCallId && result?.toolName === "agent.wait" && result?.errorCode === null
-          && output?.waitId === wait.id && output.status === wait.status
+          && Object.keys(result ?? {}).sort().join(",") === "errorCode,output,toolCallId"
+          && result?.toolCallId === call.toolCallId && result?.errorCode === null
+          && output?.waitId === wait.id && output.status === originalStatus
           && Number.isFinite(outputDeadline) && outputDeadline === wait.deadlineAt.getTime()
-          && sameUniqueIds(outputTargets ?? [], targets) && sameUniqueIds(outputMatched ?? [], matched)
+          && sameUniqueIds(outputTargets ?? [], targets) && originalMatchesValid && originalMatchesCurrent
           && outputTasks !== null && outputTasks.length === targets.length && sameUniqueIds(outputTaskIds, targets)
       }
       const readyEvidence = new Map<string, boolean>(), waitStateValid = new Map<string, boolean>()
