@@ -2405,9 +2405,16 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     }
     const sourcePool = new Pool({ connectionString: databaseUrl! })
     let seeded: Awaited<ReturnType<typeof sourceFixture.seedObjectiveTailorWaveSource>>
+    const objectiveJobIds = Array.from({ length: 8 }, () => randomUUID())
+    expect(new Set(objectiveJobIds).size).toBe(8)
     try {
       seeded = await sourceFixture.seedObjectiveTailorWaveSource(sourcePool, { userId: ids.user, suffix },
-        (ownerSuffix, slot) => `full-loop-objective-job-${ownerSuffix}-${slot}`)
+        (ownerSuffix, slot) => {
+          if (ownerSuffix !== suffix) throw new Error("Objective Tailor Job fixture owner scope changed")
+          const id = objectiveJobIds[slot]
+          if (!id) throw new Error("Objective Tailor Job fixture slot is unsupported")
+          return id
+        })
     } finally { await sourcePool.end() }
     const jobIds = seeded.jobs.map(job => job.id)
     reviewedJobIds.push(...jobIds)
