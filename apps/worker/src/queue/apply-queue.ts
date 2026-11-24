@@ -5,6 +5,7 @@ import { checkRateLimit } from "../rate-limit.js";
 import { withCloakContext } from "../cloak/pool.js";
 import { detectCaptcha } from "../cloak/captcha.js";
 import { insertApplyResult, getPool, type InsertApplyResult } from "../db/apply-results.js";
+import { recordObjectiveApplicationSubmitResult } from "../db/objective-application-submit-result.js";
 import * as legacyFillOutcomes from "./legacy-apply-outcomes.js";
 import {
   claimUnattendedSubmission,
@@ -112,6 +113,10 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     let approvedTurnScope: ApplicationSubmissionStartScope | null = null;
     let turnStopped = false;
     let submissionRequestStarted = false;
+    let submissionRequestForwarded = false;
+    let objectiveRunnerReportedSuccess = false;
+    let objectiveResultCorrelationRequired = false;
+    let objectiveRunnerConfirmationId: string | null = null;
     let submissionExecutionStartAttempted = false;
     let submissionContextCloseConfirmed = false;
     let submissionPageCloseConfirmed = false;
@@ -587,6 +592,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                       await releaseSubmissionFence(true);
                       await continuation;
                       if (continuationFailed) throw continuationFailure;
+                      submissionRequestForwarded = true;
                     } catch (error: unknown) {
                       submissionFenceUnavailable = true;
                       console.warn(
@@ -859,6 +865,10 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           }
           if (queueCatchStarted) return;
           usedFlow = "application.submit";
+          if (objectiveMode && toolResult.status === "submitted") {
+            objectiveRunnerReportedSuccess = true;
+            objectiveRunnerConfirmationId = toolResult.confirmationId;
+          }
           harnessResult = toolResult.status === "submitted" || toolResult.status === "replayed"
             ? { status: "submitted", turns: toolResult.status === "replayed" ? 0 : 1, durationMs: Date.now() - startedAt, error: null, log: [] }
             : {
@@ -878,6 +888,8 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           harnessResult = await runBrowserFlow();
         }
         if (queueCatchStarted || submissionSuperseded) return;
+
+        if (objectiveMode && objectiveRunnerReportedSuccess && submissionRouteState.work) await submissionRouteState.work;
 
         if (turnStopped && !submissionRequestStarted && harnessResult.status !== "submitted") {
           harnessResult = { ...harnessResult, status: "failed", error: TURN_STOPPED_MESSAGE };
@@ -930,19 +942,30 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         }
 
         const durationMs = Date.now() - startedAt;
+        const recordObjectiveSuccess = objectiveMode && objectiveRunnerReportedSuccess && harnessResult.status === "submitted";
+        if (objectiveMode && harnessResult.status === "submitted" && !recordObjectiveSuccess) {
+          submissionSuperseded = true;
+          return;
+        }
+        objectiveResultCorrelationRequired = recordObjectiveSuccess;
         resultWriteStarted = true;
         try {
-          const resultId = await insertApplyResult({
-            userId,
-            jobId,
-            status: harnessResult.status as InsertApplyResult["status"],
-            mode: "unattended",
-            atsType: flow ?? "unknown",
-            flowUsed: usedFlow,
-            error: harnessResult.error ?? null,
-            durationMs,
-            submissionIdentity: submissionIdentity!,
-          });
+          const resultId = recordObjectiveSuccess
+            ? await recordObjectiveApplicationSubmitResult({ pool: getPool(),
+                execution: { ...submissionIdentity!, workerTaskId, executionId }, runnerStatus: "submitted",
+                confirmationId: objectiveRunnerConfirmationId, durationMs, requestStarted: submissionRequestStarted,
+                requestContinued: submissionRequestForwarded, fenceUnavailable: submissionFenceUnavailable })
+            : await insertApplyResult({
+                userId,
+                jobId,
+                status: harnessResult.status as InsertApplyResult["status"],
+                mode: "unattended",
+                atsType: flow ?? "unknown",
+                flowUsed: usedFlow,
+                error: harnessResult.error ?? null,
+                durationMs,
+                submissionIdentity: submissionIdentity!,
+              });
           if (resultId === null) { submissionSuperseded = true; return; }
           resultWritten = true;
         } catch (error: unknown) {
@@ -1079,7 +1102,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         resultWritten = true;
       } else {
         const status = mayHaveOpenedBrowser || browserAttemptStarted ? "manual" : "failed";
-        if (!resultWritten && !resultWriteStarted) {
+        if (!resultWritten && !resultWriteStarted && !objectiveResultCorrelationRequired) {
           resultWriteStarted = true;
           try {
             const resultId = await insertApplyResult({

@@ -72,7 +72,7 @@ export async function insertApplyResult(
   }
 }
 
-async function insertApplyResultWithClient(
+export async function insertApplyResultWithClient(
   client: Pick<pg.PoolClient, "query">,
   result: InsertApplyResult,
 ): Promise<number> {

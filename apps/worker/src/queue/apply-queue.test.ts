@@ -4,6 +4,7 @@ const mockProcessor = vi.fn();
 const mockUpsertFormPattern = vi.fn().mockResolvedValue(undefined);
 const mockIncrementBudget = vi.fn().mockResolvedValue(undefined);
 const mockInsertApplyResult = vi.fn().mockResolvedValue(1);
+const mockRecordObjectiveSubmitResult = vi.fn().mockResolvedValue(1);
 const mockCompleteFillForReview = vi.fn().mockResolvedValue(undefined);
 const mockFinishApplicationTask = vi.fn().mockResolvedValue(undefined);
 const mockClaimApplicationTask = vi.fn().mockResolvedValue(true);
@@ -153,6 +154,9 @@ vi.mock("../db/apply-results.js", () => ({
     query: mockPoolQuery,
     connect: vi.fn().mockResolvedValue(mockTurnClient),
   }),
+}));
+vi.mock("../db/objective-application-submit-result.js", () => ({
+  recordObjectiveApplicationSubmitResult: mockRecordObjectiveSubmitResult,
 }));
 
 vi.mock("../runtime/approval/pg-store.js", () => ({
@@ -334,6 +338,7 @@ function terminalSubmitJob(attemptsMade = 3, attempts = 3, overrides: Record<str
 describe("apply-queue (unit — mocked)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockRecordObjectiveSubmitResult.mockReset().mockResolvedValue(1);
     mockRedisExists.mockResolvedValue(0);
     mockQueueIsPaused.mockResolvedValue(false);
     mockQueueGetJob.mockReset().mockImplementation(async (id: string) => {
@@ -649,6 +654,7 @@ describe("apply-queue (unit — mocked)", () => {
     expect(mockProviderSubmitClick).toHaveBeenCalledOnce();
     expect(mockHarnessRun).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ allowSubmit: true }));
     expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "submitted", flowUsed: "application.submit" }));
+    expect(mockRecordObjectiveSubmitResult).not.toHaveBeenCalled();
     expect(mockPage.close).toHaveBeenCalledOnce();
     expect(mockContext.close).not.toHaveBeenCalled();
   });
