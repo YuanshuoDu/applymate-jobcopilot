@@ -33,6 +33,7 @@ import { protocolScope, type ApprovalScopeInput } from "@/lib/agent/approval/typ
 import type { ApplicationPackage, PipelineCtx } from "@/lib/agent/types"
 
 const objectiveResumeAmbientAuth = vi.hoisted(() => ({ authorization: null as string | null }))
+const objectiveDecisionTrace = vi.hoisted(() => ({ calls: 0, threw: false, frames: [] as Array<{ source: string; line: number }> }))
 
 vi.mock("next/headers", async importOriginal => {
   const actual = await importOriginal<typeof import("next/headers")>()
@@ -45,6 +46,31 @@ vi.mock("next/headers", async importOriginal => {
 })
 
 vi.mock("@/lib/safe-auth", () => ({ safeAuth: async () => null }))
+
+vi.mock("@/lib/agent/broker/objective-application-review-decision-service", async importOriginal => {
+  const actual = await importOriginal<typeof import("@/lib/agent/broker/objective-application-review-decision-service")>()
+  return {
+    ...actual,
+    decideObjectiveApplicationReviewMember: async (...args: Parameters<typeof actual.decideObjectiveApplicationReviewMember>) => {
+      objectiveDecisionTrace.calls = Math.min(1000, objectiveDecisionTrace.calls + 1)
+      try { return await actual.decideObjectiveApplicationReviewMember(...args) }
+      catch (error: unknown) {
+        objectiveDecisionTrace.threw = true
+        const stack = error && typeof error === "object" && "stack" in error && typeof error.stack === "string" ? error.stack : ""
+        const allowed = new Set([
+          "objective-application-review-decision-service.ts", "objective-application-approval-set-decision.ts",
+          "objective-application-review-source.ts", "objective-application-approved-intent.ts",
+        ])
+        objectiveDecisionTrace.frames = stack.split("\n").flatMap(line => {
+          const match = /(?:^|[/\\])((?:objective-application-review-decision-service|objective-application-approval-set-decision|objective-application-review-source|objective-application-approved-intent)\.ts):(\d{1,5}):\d{1,5}/.exec(line)
+          if (!match || !allowed.has(match[1]!)) return []
+          return [{ source: match[1]!, line: Math.min(Number(match[2]), 10000) }]
+        }).slice(0, 4)
+        throw error
+      }
+    },
+  }
+})
 
 const DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
 const REDIS_URL = "redis://127.0.0.1:6379/15"
@@ -1167,6 +1193,7 @@ async function expectObjectiveDecisionAccepted(database: PrismaClient, response:
     } catch { /* Keep the failure diagnostic bounded when the response is not JSON. */ }
     message = JSON.stringify({
       responseStatus: response.status, code,
+      decisionService: { calls: objectiveDecisionTrace.calls, threw: objectiveDecisionTrace.threw, frames: objectiveDecisionTrace.frames },
       snapshotTurnRevision: revisionDiagnosticValue(input.snapshotTurnRevision),
       expectedTurnRevision: revisionDiagnosticValue(input.expectedTurnRevision),
       databaseTurnRevision: revisionDiagnosticValue(turn?.revision),
@@ -2783,6 +2810,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const deliveryHold = armObjectiveFillDeliveryHold(sessionId, staleApprovalId)
       try {
         const { POST: decideObjectiveReview } = await import("@/app/api/agent/sessions/[id]/objective-application-review/[turnId]/route")
+        objectiveDecisionTrace.calls = 0
+        objectiveDecisionTrace.threw = false
+        objectiveDecisionTrace.frames = []
         const staleDecision = await decideObjectiveReview(apiRequest(
           `/api/agent/sessions/${sessionId}/objective-application-review/${staleReviewTurnId}`, token, "POST", {
             approvalId: staleApprovalId, expectedRevision: staleTurnFence.revision,
