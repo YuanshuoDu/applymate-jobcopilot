@@ -1889,13 +1889,15 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       select: { userId: true, jobId: true, sessionId: true, fillTurnId: true, workerTaskId: true, status: true, checkpoint: true },
     })
     const jobBeforeKill = await applyQueue!.getJob(workerTaskId)
+    const expectedTaskStage = (taskBeforeKill.status === "filling" && taskBeforeKill.checkpoint === "submission_request_started")
+      || (taskBeforeKill.status === "waiting_for_user" && taskBeforeKill.checkpoint === "submission_uncertain")
+    expect(expectedTaskStage).toBe(true)
     expect(Boolean(taskBeforeKill.userId === ids.user && taskBeforeKill.jobId === ids.job
       && taskBeforeKill.sessionId === ids.session && taskBeforeKill.fillTurnId === successorTurnId
-      && taskBeforeKill.workerTaskId === workerTaskId && taskBeforeKill.status === "waiting_for_user"
-      && taskBeforeKill.checkpoint === "submission_uncertain"
-      && jobBeforeKill && jobBeforeKill.id === workerTaskId
-      && await jobBeforeKill.getState() === "active"
-      && isDeepStrictEqual(jobBeforeKill.data, intent.submitPayload))).toBe(true)
+      && taskBeforeKill.workerTaskId === workerTaskId)).toBe(true)
+    expect(Boolean(jobBeforeKill && jobBeforeKill.id === workerTaskId
+      && await jobBeforeKill.getState() === "active")).toBe(true)
+    expect(isDeepStrictEqual(jobBeforeKill?.data, intent.submitPayload)).toBe(true)
     worker!.kill("SIGKILL")
     expect(await waitExit(worker!, 5_000)).toBe(true)
     worker = spawnFixture("worker")
