@@ -20,7 +20,8 @@ export function registerCanonicalObjectiveTailorTool(input: Readonly<{
 }>): ObjectiveTailorToolVersion | undefined {
   const port = input.commandPort
   const v1Available = typeof port?.readObjectiveTailorCatalog === "function" && typeof port.appendObjectiveTailor === "function"
-  const v2Available = typeof port?.readObjectiveTailorWaveCatalog === "function" && typeof port.appendObjectiveTailorWave === "function"
+  const v2Available = typeof port?.readObjectiveTailorWaveCatalog === "function"
+    && typeof port.appendObjectiveTailorWave === "function" && typeof port.appendObjectiveTailorCorrection === "function"
   const profile = objectiveTailorWaveBudgetDisposition(input.budgetSnapshot)
   if (!input.registry.register || !input.rootEligible || profile === "invalid") return undefined
   if (profile === "wave") {

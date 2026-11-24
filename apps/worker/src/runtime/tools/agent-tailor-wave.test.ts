@@ -32,7 +32,12 @@ describe("agent.tailor v2 wave wrapper", () => {
     expect(tool.version).toBe("2")
     expect(tool.risk).toBe("internal_write")
     expect(tool.requiredCapabilities).toEqual(["coordination", "canManageChildren"])
+    expect(tool.inputSchema).toMatchObject({ type: "object", oneOf: expect.any(Array) })
     expect(registry.validateArguments("agent.tailor", input, "2")).toBe(true)
+    expect(registry.validateArguments("agent.tailor", { expectedRevision: 4, correctionSlotId: "tailor-2" }, "2")).toBe(true)
+    expect(registry.validateArguments("agent.tailor", { expectedRevision: 4, correctionSlotId: "tailor-9" }, "2")).not.toBe(true)
+    expect(registry.validateArguments("agent.tailor", { ...input, correctionSlotId: "tailor-2" }, "2")).not.toBe(true)
+    expect(registry.validateArguments("agent.tailor", { expectedRevision: 4 }, "2")).not.toBe(true)
     expect(registry.validateArguments("agent.tailor", { ...input, jobId: "private-job" }, "2")).not.toBe(true)
     expect(registry.validateArguments("agent.tailor", { ...input, candidateRefs: [refs[0], refs[0]] }, "2")).not.toBe(true)
     expect(registry.validateArguments("agent.tailor", { expectedRevision: 4, candidateRefs: ["otc1_" + "a".repeat(64)] }, "2")).not.toBe(true)
@@ -49,8 +54,25 @@ describe("agent.tailor v2 wave wrapper", () => {
     expect(appendObjectiveTailorWave).toHaveBeenCalledWith({
       scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1",
         rootTaskId: "root-1", parentTaskId: "root-1", turnLeaseOwner: "worker-1", turnLeaseVersion: 3,
-        parentLeaseOwner: "worker-1", parentAttemptCount: 2, rootInputId: "root-input" },
+        parentLeaseOwner: "worker-1", parentAttemptCount: 2 },
       expectedRevision: 4, candidateRefs: refs,
+    })
+  })
+
+  it("dispatches one slot correction with the whole current revision and only the bounded pair receipt", async () => {
+    const correction = { expectedRevision: 7, correctionSlotId: "tailor-2" }
+    const correctionReceipt = { status: "accepted" as const, revision: 8,
+      nodes: [
+        { key: "objective-tailor-wave-correction-writer-tailor-2", taskId: "correction-writer", status: "queued" as const },
+        { key: "objective-tailor-wave-correction-reviewer-tailor-2", taskId: "correction-reviewer", status: "waiting" as const },
+      ], readyTaskIds: ["correction-writer"] }
+    const appendObjectiveTailorCorrection = vi.fn(async () => ({ ...correctionReceipt, privateProof: "PRIVATE" }))
+    const tool = createAgentTailorWaveTool({ appendObjectiveTailorCorrection } as never, options)
+    await expect(tool.execute(context(), correction)).resolves.toEqual(correctionReceipt)
+    expect(appendObjectiveTailorCorrection).toHaveBeenCalledWith({
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1",
+        rootTaskId: "root-1", parentTaskId: "root-1", turnLeaseOwner: "worker-1", turnLeaseVersion: 3,
+        parentLeaseOwner: "worker-1", parentAttemptCount: 2 }, ...correction,
     })
   })
 

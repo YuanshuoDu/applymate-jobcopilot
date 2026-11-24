@@ -138,7 +138,8 @@ export async function createGraphTasks(
   const sourceNodes = new Map(current.nodes.map(node => [node.key, node] as const))
   const completedDependencies = new Map(dependencyResults.map(item => {
     const sourceNode = sourceNodes.get(item.key)
-    const sourceIntent = provenance && sourceNode ? sourceIntentForTaskGraphNode(sourceNode,
+    const correctionReviewer = objectiveTailorWave && sourceNode?.templateId === "cover_letter_reviewer"
+    const sourceIntent = provenance && sourceNode && !correctionReviewer ? sourceIntentForTaskGraphNode(sourceNode,
       provenance?.sourceInputCheckpointByNodeKey?.get(item.key), provenance?.currentInputCheckpoint) : undefined
     return [item.key, sourceIntent ? { ...item, sourceIntent } : item] as const
   }))
@@ -215,7 +216,6 @@ export async function createGraphTasks(
   }
   return { state, snapshot: taskGraphSnapshot(state, taskIds), taskIds, created, readyTaskIds }
 }
-
 function isPreflightDependency(
   key: string,
   statuses: ReadonlyMap<string, string>,

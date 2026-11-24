@@ -4,6 +4,8 @@ import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 import type { TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import { objectiveTailorWavePairPlan, parseObjectiveTailorWaveCandidateWitness, type ObjectiveTailorWaveCandidateWitness } from "./objective-tailor-wave-witness.js"
 import { isObjectiveTailorWaveBudgetSnapshot } from "./objective-tailor-wave-profile.js"
+import { parseObjectiveTailorCorrectionProof } from "./objective-tailor-correction-proof.js"
+import { taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 
 type Row = Record<string, unknown>
 export type ObjectiveTailorWaveCreatePlan = Readonly<{
@@ -68,7 +70,9 @@ export function prepareObjectiveTailorWaveCreatePlan(input: Readonly<{
 
 /** Used by the existing child-action gate; does not confer or bypass its owner/lease checks. */
 export function isRegisteredObjectiveTailorWaveChild(candidate: Row, nodeKey: string): boolean {
-  const context = plainRecord(candidate.context), plan = context && objectiveTailorWavePairPlan(context.objectiveTailorCandidateWitness)
+  const context = plainRecord(candidate.context)
+  if (context && Object.hasOwn(context, "objectiveTailorCorrectionProof")) return isRegisteredObjectiveTailorCorrectionChild(candidate, nodeKey)
+  const plan = context && objectiveTailorWavePairPlan(context.objectiveTailorCandidateWitness)
   const roleKey = candidate.role === "writer" && candidate.taskType === "cover_letter_draft" ? plan?.witness.writerNodeKey
     : candidate.role === "reviewer" && candidate.taskType === "cover_letter_review" ? plan?.witness.reviewerNodeKey : undefined
   const expected = roleKey && plan?.templatesByNodeKey.get(roleKey)
@@ -79,6 +83,24 @@ export function isRegisteredObjectiveTailorWaveChild(candidate: Row, nodeKey: st
   return candidate.role === "writer"
     ? validDependencyContext(dependencyContext, plan.witness)
     : dependencyContext === undefined
+}
+
+/** Admits a correction only with its closed prior-review proof and direct Reviewer dependency. */
+export function isRegisteredObjectiveTailorCorrectionChild(candidate: Row, nodeKey: string): boolean {
+  const context = plainRecord(candidate.context), proof = context && parseObjectiveTailorCorrectionProof(context.objectiveTailorCorrectionProof)
+  const roleKey = candidate.role === "writer" && candidate.taskType === "cover_letter_draft" ? proof?.writerNodeKey
+    : candidate.role === "reviewer" && candidate.taskType === "cover_letter_review" ? proof?.reviewerNodeKey : undefined
+  const base = proof && taskGraphTemplatesForSelectedJob({ jobId: proof.candidateWitness.candidate.jobId })
+  const template = roleKey && base ? base[candidate.role === "writer" ? "cover_letter_writer" : "cover_letter_reviewer"] : undefined
+  if (!context || !proof || !template || roleKey !== nodeKey || context.objectiveTailorCandidateMode !== true
+    || canonicalTaskGraphJson(context.objectiveTailorCandidateWitness) !== canonicalTaskGraphJson(proof.candidateWitness)) return false
+  const actual = { ...context }, dependencyContext = actual.taskGraphDependencyResults
+  delete actual.taskGraphDependencyResults
+  const expectedContext = { objectiveTailorCandidateMode: true,
+    selectedJobPreparation: { jobId: proof.candidateWitness.candidate.jobId },
+    objectiveTailorCandidateWitness: proof.candidateWitness, objectiveTailorCorrectionProof: proof }
+  if (canonicalTaskGraphJson({ ...candidate, context: actual }) !== canonicalTaskGraphJson({ ...template, context: expectedContext })) return false
+  return candidate.role === "writer" ? validCorrectionDependency(dependencyContext, proof) : dependencyContext === undefined
 }
 
 export function objectiveTailorWaveChildExecutionAllowed(value: unknown): boolean {
@@ -100,6 +122,21 @@ function validDependencyContext(value: unknown, witness: ObjectiveTailorWaveCand
     const item = plainRecord(raw)
     return item?.dependencyKey === witness.sourceAnalystKeys[index] && item.role === "analyst" && item.taskStatus === "completed"
   })
+}
+
+function validCorrectionDependency(value: unknown, proof: import("./objective-tailor-correction-proof.js").ObjectiveTailorCorrectionProof): boolean {
+  const context = exactRecord(value, "items,schemaVersion")
+  if (!context || context.schemaVersion !== "agent-harness.v2.task-graph.dependency-evidence" || !dense(context.items, 1)
+    || context.items.length !== 1) return false
+  const item = exactRecord(context.items[0], "dependencyKey,dependencyTaskId,result,role,taskStatus")
+  const result = item && exactRecord(item.result, "artifactRef,availability,reviewHash,reviewStatus,role,schemaVersion,status,trust")
+  const ref = proof.prior.artifactRef
+  return !!item && item.dependencyKey === proof.candidateWitness.reviewerNodeKey
+    && item.dependencyTaskId === proof.prior.reviewerTaskId && item.role === "reviewer" && item.taskStatus === "completed"
+    && !!result && result.schemaVersion === "agent-harness.v2.task-graph.result-projection" && result.trust === "untrusted"
+    && result.availability === "available" && result.role === "reviewer" && result.status === "completed"
+    && result.reviewStatus === "needs_revision" && result.reviewHash === proof.prior.reviewReceipt.reviewHash
+    && canonicalTaskGraphJson(result.artifactRef) === canonicalTaskGraphJson(ref)
 }
 
 function dense(value: unknown, maximum: number): value is unknown[] {

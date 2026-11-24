@@ -9,6 +9,7 @@ const options = { turnLeaseOwner: "worker-1", turnLeaseVersion: 1, parentLeaseOw
 const port = {
   readObjectiveTailorCatalog: vi.fn(async () => undefined), appendObjectiveTailor: vi.fn(async () => ({})),
   readObjectiveTailorWaveCatalog: vi.fn(async () => undefined), appendObjectiveTailorWave: vi.fn(async () => ({})),
+  appendObjectiveTailorCorrection: vi.fn(async () => ({})),
 } as unknown as TaskGraphCommandPort
 function register(budgetSnapshot: unknown, overrides: Partial<Parameters<typeof registerCanonicalObjectiveTailorTool>[0]> = {}) {
   const definitions: unknown[] = []
@@ -39,6 +40,8 @@ describe("canonical Objective Tailor tool version", () => {
       { flags: { objectiveTailorEnabled: true, objectiveTailorWavesEnabled: false } }).definitions).toHaveLength(0)
     expect(register({ limits: { maxSteps: 96 }, objectiveTailorProfile: OBJECTIVE_TAILOR_WAVE_BUDGET_PROFILE },
       { commandPort: { readObjectiveTailorWaveCatalog: vi.fn() } as unknown as TaskGraphCommandPort }).definitions).toHaveLength(0)
+    expect(register({ limits: { maxSteps: 96 }, objectiveTailorProfile: OBJECTIVE_TAILOR_WAVE_BUDGET_PROFILE },
+      { commandPort: { readObjectiveTailorWaveCatalog: vi.fn(), appendObjectiveTailorWave: vi.fn() } as unknown as TaskGraphCommandPort }).definitions).toHaveLength(0)
     expect(register({}, { rootEligible: false }).definitions).toHaveLength(0)
   })
 

@@ -5,7 +5,7 @@ import { createGraphTasks } from "./task-graph-pg-create.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, type TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import { createInitialTaskGraphState, TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphState } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
-import { parseTaskGraphSnapshot, taskGraphSnapshot } from "./task-graph-snapshot.js"
+import { parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphSnapshot } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
 import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
@@ -17,6 +17,8 @@ import * as objectiveTaskGraphAuthority from "./objective-task-graph-child-autho
 import { bindObjectiveTailorCandidateWitness, makeObjectiveTailorCandidateSelection } from "./objective-tailor-witness.js"
 import { bindObjectiveTailorWaveCandidateWitness, makeObjectiveTailorWaveCandidateSelection } from "./objective-tailor-wave-witness.js"
 import { prepareObjectiveTailorWaveCreatePlan } from "./task-graph-pg-create-objective-tailor-wave.js"
+import { bindObjectiveTailorCorrectionProof } from "./objective-tailor-correction-proof.js"
+import { prepareObjectiveTailorCorrectionPlan } from "./objective-tailor-correction-plan.js"
 
 vi.mock("./scheduled-draft-candidate.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./scheduled-draft-candidate.js")>()
@@ -1044,6 +1046,75 @@ describe("createGraphTasks", () => {
       expect(rowInputs.map(context => (context.objectiveTailorCandidateWitness as { candidate: { jobId: string } }).candidate.jobId))
         .toEqual(actualJobIds)
       expect(admit).toHaveBeenCalledTimes(4)
+    } finally { create.mockRestore(); admit.mockRestore() }
+  })
+
+  it("materializes a correction Writer from the exact Reviewer receipt without advisory source intent", async () => {
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 }
+    const jobId = "f47ac10b-58cc-4372-a567-0e02b2c3d479", materialDigest = `sha256:${"e".repeat(64)}`
+    const source: TaskGraphState = { revision: 1, appliedEvents: [], nodes: [
+      { key: "scout-source", templateId: "scout", goal: "Find candidates", successCriteria: ["Return candidates"], dependsOn: [],
+        depth: 1, status: "completed", taskId: "scout-task", verificationDisposition: "typed", verification: scoutVerification },
+      { key: "analyst-source", templateId: "analyst", goal: "Verify candidate", successCriteria: ["Return evidence"], dependsOn: ["scout-source"],
+        depth: 2, status: "completed", taskId: "analyst-task", verificationDisposition: "typed", verification: analystVerification },
+    ] }
+    const sourceTaskIds = new Map(source.nodes.map(node => [node.key, node.taskId!] as const))
+    const selection = makeObjectiveTailorWaveCandidateSelection({ scope, sourceGraphRevision: 1,
+      sourceGraphDigest: taskGraphFingerprint(taskGraphSnapshot(source, sourceTaskIds)),
+      sourceStatusDigest: taskGraphFingerprint(source.nodes.map(node => ({ key: node.key, status: node.status }))),
+      analystProofDigest: "c".repeat(64), candidate: { jobId, score: 8, materialDigest },
+      sourceAnalystKey: "analyst-source" })!
+    const witness = bindObjectiveTailorWaveCandidateWitness(selection, { slotId: "tailor-1", admittedRevision: 2 })!
+    const initial = prepareObjectiveTailorWaveCreatePlan({ current: source, witnesses: [witness], nextMarker: {
+      schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, sourceNodeCount: 2,
+      slots: [{ slotId: "tailor-1", sourceAnalystNodeKey: "analyst-source", writerNodeKey: witness.writerNodeKey,
+        reviewerNodeKey: witness.reviewerNodeKey }],
+    } })!
+    const initialWriterTaskId = "initial-writer", initialReviewerTaskId = "initial-reviewer"
+    const current: TaskGraphState = { revision: 2, objectiveTailor: initial.marker, appliedEvents: [], nodes: [...source.nodes,
+      { ...initial.proposal.nodes[0]!, depth: 3, status: "completed", taskId: initialWriterTaskId, verificationDisposition: "specialized" },
+      { ...initial.proposal.nodes[1]!, depth: 4, status: "completed", taskId: initialReviewerTaskId, verificationDisposition: "specialized" },
+    ] }
+    const artifactRef = { artifactId: "artifact-1", version: 3, contentHash: `sha256:${"d".repeat(64)}`, sourceDigest: materialDigest }
+    const proof = bindObjectiveTailorCorrectionProof({ graphRevision: 2, slotId: "tailor-1", candidateWitness: witness,
+      writerTaskId: initialWriterTaskId, reviewerTaskId: initialReviewerTaskId, artifactRef,
+      artifactVersion: { ...artifactRef, artifactType: "cover_letter", taskId: initialWriterTaskId, previousHash: null },
+      reviewReceipt: { jobId, ...artifactRef, currentSourceDigest: materialDigest, status: "needs_revision",
+        taskId: initialReviewerTaskId, toolCallId: "review-call", reviewHash: `sha256:${"f".repeat(64)}` },
+    })!
+    const plan = prepareObjectiveTailorCorrectionPlan({ current, proof })!
+    const reviewResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef,
+      reviewStatus: "needs_revision", reviewHash: proof.prior.reviewReceipt.reviewHash }
+    const reviewerTemplate = initial.templatesByNodeKey.get(witness.reviewerNodeKey)!
+    const query = vi.fn(async (sql: string) => sql.includes('WHERE task."id" = ANY($1::text[])') ? { rows: [{
+      id: initialReviewerTaskId, status: "completed", role: "reviewer", failureReason: null, attemptCount: 1,
+      taskType: "cover_letter_review", allowedActions: [], expectedOutputSchema: reviewerTemplate.expectedOutputSchema,
+      result: { finalItemId: null, finalText: "Review complete", status: "completed", stepCount: 1, toolCallCount: 1, structuredResult: reviewResult },
+      context: reviewerTemplate.context, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+      parentTaskId: scope.parentTaskId, userId: scope.userId,
+    }], rowCount: 1 } : { rows: [], rowCount: 1 })
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const admit = vi.spyOn(objectiveTaskGraphAuthority, "admitOwnedObjectiveTaskGraphChild").mockResolvedValue(true)
+    const create = vi.spyOn(pgCreate, "createSubagentTask").mockImplementation(async (_client, input) => ({
+      id: input.role === "writer" ? "correction-writer" : "correction-reviewer", rootTaskId: scope.rootTaskId,
+    } as never))
+    try {
+      const result = await createGraphTasks(client, { scope, proposal: plan.proposal, templates: plan.templates,
+        verificationRequirements: { status: "valid", requirements: [] } },
+      { budgetSnapshot: { subagentPolicy: { maxConcurrency: 4, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 } } }, current,
+      new Map([["scout-source", "scout-task"], ["analyst-source", "analyst-task"], [witness.writerNodeKey, initialWriterTaskId], [witness.reviewerNodeKey, initialReviewerTaskId]]),
+      { sourceInputCheckpointByNodeKey: new Map([[witness.reviewerNodeKey, { inputThroughSequence: 3n }]]), currentInputCheckpoint: { inputThroughSequence: 4n } },
+      undefined, true, undefined, false, { marker: plan.marker, templatesByNodeKey: plan.templatesByNodeKey })
+      const writerContext = create.mock.calls[0]?.[1].context as Record<string, unknown>
+      const evidence = writerContext.taskGraphDependencyResults as { items: Array<Record<string, unknown>> }
+      expect(result.created.map(item => [item.key, item.status])).toEqual([
+        [plan.proof.writerNodeKey, "queued"], [plan.proof.reviewerNodeKey, "waiting"],
+      ])
+      expect(evidence.items).toMatchObject([{ dependencyKey: witness.reviewerNodeKey, dependencyTaskId: initialReviewerTaskId,
+        role: "reviewer", taskStatus: "completed", result: { reviewStatus: "needs_revision", reviewHash: proof.prior.reviewReceipt.reviewHash } }])
+      expect(evidence.items[0]).not.toHaveProperty("sourceIntent")
+      expect(admit).toHaveBeenCalledTimes(2)
     } finally { create.mockRestore(); admit.mockRestore() }
   })
 

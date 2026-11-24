@@ -3,6 +3,7 @@ import { OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protoco
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import type { TaskGraphState } from "../planning/task-graph.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
+import { bindObjectiveTailorCorrectionProof } from "./objective-tailor-correction-proof.js"
 import { bindObjectiveTailorWaveCandidateWitness, makeObjectiveTailorWaveCandidateSelection, objectiveTailorWavePairPlan } from "./objective-tailor-wave-witness.js"
 import { isRegisteredObjectiveTailorWaveChild, objectiveTailorWaveChildExecutionAllowed, prepareObjectiveTailorWaveCreatePlan } from "./task-graph-pg-create-objective-tailor-wave.js"
 
@@ -104,4 +105,36 @@ describe("Objective Tailor per-node PG create adapter", () => {
     expect(objectiveTailorWaveChildExecutionAllowed({ ...validLive, rootAllowedActions: [] })).toBe(false)
     expect(objectiveTailorWaveChildExecutionAllowed({ ...validLive, input: { ...validLive.input, verifiedShortlistSelection: {} } })).toBe(false)
   })
+
+  it("admits a correction pair only with its exact prior Reviewer and needs-revision evidence", () => {
+    const candidate = witness(1, "tailor-1"), sha = (value: string) => `sha256:${value.repeat(64)}`
+    const ref = { artifactId: "cover-letter-1", version: 3, contentHash: sha("a"), sourceDigest: sha("b") }
+    const proof = bindObjectiveTailorCorrectionProof({ graphRevision: 4, slotId: candidate.slotId, candidateWitness: candidate,
+      writerTaskId: "initial-writer", reviewerTaskId: "initial-reviewer", artifactRef: ref,
+      artifactVersion: { ...ref, artifactType: "cover_letter", taskId: "initial-writer", previousHash: sha("c") },
+      reviewReceipt: { jobId: candidate.candidate.jobId, ...ref, currentSourceDigest: ref.sourceDigest,
+        status: "needs_revision", taskId: "initial-reviewer", toolCallId: "review-call", reviewHash: sha("d") } })!
+    const context = { objectiveTailorCandidateMode: true, selectedJobPreparation: { jobId: candidate.candidate.jobId },
+      objectiveTailorCandidateWitness: candidate, objectiveTailorCorrectionProof: proof }
+    const dependency = { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [{
+      dependencyKey: candidate.reviewerNodeKey, dependencyTaskId: proof.prior.reviewerTaskId, role: "reviewer", taskStatus: "completed",
+      result: { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available",
+        role: "reviewer", status: "completed", artifactRef: ref, reviewStatus: "needs_revision", reviewHash: proof.prior.reviewReceipt.reviewHash },
+    }] }
+    const writerTemplate = planFor(candidate).templatesByNodeKey.get(candidate.writerNodeKey)!
+    const writer = { role: writerTemplate.role, taskType: writerTemplate.taskType, allowedActions: writerTemplate.allowedActions,
+      constraints: writerTemplate.constraints ?? [], context: { ...context, taskGraphDependencyResults: dependency },
+      expectedOutputSchema: writerTemplate.expectedOutputSchema ?? {} }
+    expect(isRegisteredObjectiveTailorWaveChild(writer, proof.writerNodeKey)).toBe(true)
+    expect(isRegisteredObjectiveTailorWaveChild({ ...writer, context: { ...writer.context, taskGraphDependencyResults: {
+      ...dependency, items: [{ ...dependency.items[0], dependencyKey: "other-reviewer" }],
+    } } }, proof.writerNodeKey)).toBe(false)
+    expect(isRegisteredObjectiveTailorWaveChild({ ...writer, context: { ...writer.context, taskGraphDependencyResults: {
+      ...dependency, items: [{ ...dependency.items[0], result: { ...dependency.items[0].result, reviewStatus: "passed" } }],
+    } } }, proof.writerNodeKey)).toBe(false)
+  })
 })
+
+function planFor(value: ReturnType<typeof witness>) {
+  return objectiveTailorWavePairPlan(value)!
+}
