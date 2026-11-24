@@ -224,6 +224,94 @@ describe("auto-apply authorization", () => {
     expect(mocks.approvalLock.mock.calls[0]?.[0]?.values).toContain(approval.materialHash);
   });
 
+  it("queues a saved Objective V3 Job from draft only after the exact locked proof", async () => {
+    const approval = await makeApproval();
+    const proof = { mode: "reviewed" as const, ready: true as const, resourceHash: approval.resourceHash,
+      materialHash: approval.materialHash, answersHash: approval.answersHash,
+      objectiveSource: { schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v1" as const,
+        approvalId: "objective-review:set_1:6", reviewTurnId: "review_turn_1", materialProofHash: "d".repeat(64) },
+      fillTurnCreatedAt: new Date("2026-11-24T12:00:00Z") };
+    mocks.approvalFindFirst.mockResolvedValueOnce(approval);
+    mocks.reviewedSubmitMaterial.mockResolvedValueOnce(proof);
+    mocks.jobUpdateMany.mockImplementationOnce(async ({ where }: { where: Record<string, unknown> }) => {
+      expect(where).toMatchObject({ id: input.jobId, userId: input.userId, url: input.applyUrl, status: "saved",
+        workflowState: { in: ["draft", "ready_to_apply"] }, appliedAt: null });
+      return { count: 1 };
+    });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).resolves.toMatchObject({ taskId: expect.stringMatching(/^apply-submit-/) });
+
+    expect(mocks.lockAndRereadReviewedSubmitMaterial).toHaveBeenCalledWith(expect.anything(), expect.anything(), proof);
+    expect(mocks.txTaskEventCreate).toHaveBeenCalledOnce();
+    expect(mocks.outboxCreate).toHaveBeenCalledOnce();
+  });
+
+  it.each(["legacy", "selected ordinary"] as const)("keeps %s material ready-only when a Job is still draft", async mode => {
+    const approval = await makeApproval();
+    const proof = mode === "legacy" ? { mode: "legacy" as const } : { mode: "reviewed" as const, ready: true as const,
+      resourceHash: approval.resourceHash, materialHash: approval.materialHash, answersHash: approval.answersHash };
+    mocks.approvalFindFirst.mockResolvedValueOnce(approval);
+    mocks.reviewedSubmitMaterial.mockResolvedValueOnce(proof);
+    mocks.jobUpdateMany.mockImplementationOnce(async ({ where }: { where: Record<string, unknown> }) => {
+      expect(where.workflowState).toBe("ready_to_apply");
+      expect(where.appliedAt).toBeUndefined();
+      return { count: 0 };
+    });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("no longer ready");
+
+    expect(mocks.transactionCommit).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+  });
+
+  it("does not queue a draft Job when the locked Objective proof is stale", async () => {
+    const approval = await makeApproval();
+    const proof = { mode: "reviewed" as const, ready: true as const, resourceHash: approval.resourceHash,
+      materialHash: approval.materialHash, answersHash: approval.answersHash,
+      objectiveSource: { schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v1" as const,
+        approvalId: "objective-review:set_1:6", reviewTurnId: "review_turn_1", materialProofHash: "d".repeat(64) },
+      fillTurnCreatedAt: new Date("2026-11-24T12:00:00Z") };
+    mocks.approvalFindFirst.mockResolvedValueOnce(approval);
+    mocks.reviewedSubmitMaterial.mockResolvedValueOnce(proof);
+    mocks.lockAndRereadReviewedSubmitMaterial.mockResolvedValueOnce(false);
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("no longer ready");
+
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["already applied", { status: "applied", workflowState: "submitted", appliedAt: new Date() }],
+    ["already queued", { status: "saved", workflowState: "queued", appliedAt: null }],
+  ] as const)("does not queue an Objective Job that is %s", async (_label, currentJob) => {
+    const approval = await makeApproval();
+    const proof = { mode: "reviewed" as const, ready: true as const, resourceHash: approval.resourceHash,
+      materialHash: approval.materialHash, answersHash: approval.answersHash,
+      objectiveSource: { schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v1" as const,
+        approvalId: "objective-review:set_1:6", reviewTurnId: "review_turn_1", materialProofHash: "d".repeat(64) },
+      fillTurnCreatedAt: new Date("2026-11-24T12:00:00Z") };
+    mocks.approvalFindFirst.mockResolvedValueOnce(approval);
+    mocks.reviewedSubmitMaterial.mockResolvedValueOnce(proof);
+    mocks.jobUpdateMany.mockImplementationOnce(async ({ where }: { where: Record<string, unknown> }) => {
+      const workflow = where.workflowState as string | { in?: readonly string[] };
+      const workflowMatches = typeof workflow === "string" ? workflow === currentJob.workflowState
+        : workflow.in?.includes(currentJob.workflowState) === true;
+      const appliedMatches = !Object.hasOwn(where, "appliedAt") || currentJob.appliedAt === null;
+      return { count: where.status === currentJob.status && workflowMatches && appliedMatches ? 1 : 0 };
+    });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("no longer ready");
+
+    expect(mocks.txTaskEventCreate).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+  });
+
   it("rejects unavailable or mismatched reviewed proof before opening the transaction", async () => {
     const { queueAutonomousApplication } = await import("./auto-apply");
     mocks.reviewedSubmitMaterial.mockResolvedValueOnce({ mode: "unavailable" });

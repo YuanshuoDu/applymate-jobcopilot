@@ -214,8 +214,11 @@ export async function queueAutonomousApplication(input: {
       return raced?.workerTaskId === intent.payload.workerTaskId && isReplayableSubmitState(raced.status, raced.checkpoint)
         ? resolveExistingSubmitIntent(tx, intent) : false;
     }
+    const objectiveReviewed = materialProof.mode === "reviewed" && Boolean(materialProof.objectiveSource)
     const job = await tx.job.updateMany({
-      where: { id: input.jobId, userId: input.userId, ...(expectedJobUrl ? { url: expectedJobUrl } : {}), status: "saved", workflowState: "ready_to_apply" },
+      where: { id: input.jobId, userId: input.userId, ...(expectedJobUrl ? { url: expectedJobUrl } : {}), status: "saved",
+        workflowState: objectiveReviewed ? { in: ["draft", "ready_to_apply"] } : "ready_to_apply",
+        ...(objectiveReviewed ? { appliedAt: null } : {}) },
       data: { workflowState: "queued", analysisNote: "[Approved submission] Applying in the background after explicit user authorization." },
     });
     if (job.count !== 1) throw new AutoApplyError("This application is no longer ready for the approved submission step.");
