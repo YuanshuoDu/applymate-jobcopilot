@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { createRequire } from "node:module"
 import { isDeepStrictEqual } from "node:util"
 import { spawn, type ChildProcess } from "node:child_process"
@@ -10,7 +10,8 @@ import { join, resolve } from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 
 import { Prisma, PrismaClient } from "@prisma/client"
-import { hashApprovalNonce, hashApprovalScope, objectiveApplicationApprovalSetItemId, parseObjectiveTailorGraph, schemaVersion } from "@jobcopilot/agent-protocol"
+import { hashApprovalNonce, hashApprovalScope, objectiveApplicationApprovalSetItemId, parseObjectiveApplicationApprovalSet,
+  parseObjectiveTailorGraph, schemaVersion } from "@jobcopilot/agent-protocol"
 import {
   hashAgentReceiptValue,
   hashContent,
@@ -112,6 +113,14 @@ const REVIEWED_SOURCE_DIAGNOSTIC_STATUSES = new Set([
 ])
 const REVIEWED_SOURCE_DIAGNOSTIC_TOOLS = new Set([
   "agent.plan", "agent.wait", "cover_letter.draft", "artifact.version.read", "artifact.review",
+])
+const OBJECTIVE_REVIEW_DIAGNOSTIC_FAILURE_CODES = new Set([
+  "objective_application_review_denied", "objective_application_review_decision_missing",
+  "objective_application_review_root_input_missing", "objective_application_review_root_input_unclaimed",
+  "objective_application_review_runtime_unavailable", "objective_application_review_scope_invalid",
+  "objective_application_review_set_identity_invalid", "objective_application_review_set_incomplete",
+  "objective_application_review_terminal_missing", "objective_application_review_unverified",
+  "objective_application_review_verification_failed", "turn_execution_failed", "model_execution_failed", "turn_cancelled",
 ])
 
 function diagnosticMachineErrorCode(value: unknown): string | null {
@@ -507,6 +516,7 @@ async function assertEgressBlocked(): Promise<void> {
 }
 
 function spawnFixture(mode: "site" | "worker"): Child {
+  const objectiveTailorWorker = mode === "worker" && process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES === "1"
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode], {
     cwd: workerCwd,
     env: {
@@ -520,7 +530,9 @@ function spawnFixture(mode: "site" | "worker"): Child {
       APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_SOCKET_PATH: reviewedFillRouteSocketPath,
       ...(mode === "worker" ? { AGENT_WEB_URL: "", WEB_APP_URL: "", APPLYMATE_WEB_URL: "", AGENT_WORKER_SECRET: "",
         APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_ENDPOINT_URL: reviewedFillEndpointUrl,
-        APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_SECRET: reviewedFillBridgeSecret } : {}),
+        APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_SECRET: reviewedFillBridgeSecret,
+        ...(objectiveTailorWorker ? { ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1",
+          ENABLE_AGENT_WAIT_RESOLVER: "1" } : {}) } : {}),
       BULLMQ_STALLED_INTERVAL_MS: "30000",
       ...(mode === "worker" ? { APPLICATION_TASK_FULL_LOOP_USER_ID: ids.user } : {}),
     },
@@ -1661,17 +1673,152 @@ async function readObjectiveApplicationReviewSnapshot(input: { sessionId: string
 
 async function waitForObjectiveApplicationReviewSnapshot(
   input: { sessionId: string; turnId: string; token: string }, predicate: (snapshot: Record<string, unknown>) => boolean,
-  timeoutMs = 120_000,
+  timeoutMs = 120_000, targetSlotOrdinal = 0,
 ): Promise<Record<string, unknown>> {
   const until = Date.now() + timeoutMs
+  const statusCounts = { ok: 0, notFound: 0, auth: 0, clientError: 0, serverError: 0, other: 0 }
+  let lastGet: ObjectiveReviewGetDiagnostic = { status: "other", snapshotPresent: false, errorPresent: false,
+    setStatus: null, memberCount: 0, memberOverflow: false, memberStatuses: emptyObjectiveReviewStatusCounts(),
+    pendingCount: 0, pendingDecisionAvailableCount: 0, target: { present: false, pending: false,
+      decisionAvailable: null, approvalIdPresent: false, resumeIdPresent: false, artifactRefPresent: false } }
+  let lastTurnCheckAt = 0
   while (Date.now() < until) {
     const current = await readObjectiveApplicationReviewSnapshot(input)
     const snapshot = jsonRecord(current.body.snapshot)
+    const key = objectiveReviewHttpStatus(current.response.status)
+    statusCounts[key] = Math.min(2000, statusCounts[key] + 1)
+    lastGet = objectiveReviewGetDiagnostic(current.response.status, current.body, targetSlotOrdinal)
     if (current.response.status === 200 && snapshot && predicate(snapshot)) return snapshot
+    if (Date.now() - lastTurnCheckAt >= 1_000) {
+      lastTurnCheckAt = Date.now()
+      const turn = await testDb.agentTurn.findFirst({ where: {
+        id: input.turnId, sessionId: input.sessionId, userId: ids.user,
+      }, select: { status: true } })
+      if (turn?.status === "failed") {
+        const diagnostic = await objectiveApplicationReviewFailureDiagnostics(input, targetSlotOrdinal, statusCounts, lastGet)
+        throw new Error(`Objective review snapshot terminal failure ${JSON.stringify(diagnostic)}`)
+      }
+    }
     if (worker && exited(worker)) throw new Error("Worker exited while waiting for Objective review snapshot")
     await delay(100)
   }
-  throw new Error("Objective review snapshot did not reach the expected state")
+  const diagnostic = await objectiveApplicationReviewFailureDiagnostics(input, targetSlotOrdinal, statusCounts, lastGet)
+  throw new Error(`Objective review snapshot timeout ${JSON.stringify(diagnostic)}`)
+}
+
+type ObjectiveReviewGetDiagnostic = {
+  status: string; snapshotPresent: boolean; errorPresent: boolean; setStatus: "pending" | "resolved" | null
+  memberCount: number; memberOverflow: boolean; memberStatuses: Record<string, number>
+  pendingCount: number; pendingDecisionAvailableCount: number
+  target: { present: boolean; pending: boolean; decisionAvailable: boolean | null; approvalIdPresent: boolean; resumeIdPresent: boolean; artifactRefPresent: boolean }
+}
+
+function objectiveReviewHttpStatus(status: number): "ok" | "notFound" | "auth" | "clientError" | "serverError" | "other" {
+  if (status === 200) return "ok"
+  if (status === 404) return "notFound"
+  if (status === 401 || status === 403) return "auth"
+  if (status >= 400 && status < 500) return "clientError"
+  if (status >= 500 && status < 600) return "serverError"
+  return "other"
+}
+
+function emptyObjectiveReviewStatusCounts(): Record<string, number> {
+  return { pending: 0, approved: 0, rejected: 0, expired: 0, other: 0 }
+}
+
+function objectiveReviewGetDiagnostic(status: number, bodyValue: unknown, targetSlotOrdinal: number): ObjectiveReviewGetDiagnostic {
+  const body = jsonRecord(bodyValue), snapshot = jsonRecord(body?.snapshot)
+  const rawMembers = Array.isArray(snapshot?.members) ? snapshot.members : []
+  const members = rawMembers.slice(0, 8).map(jsonRecord)
+  const memberStatuses = emptyObjectiveReviewStatusCounts()
+  let pendingCount = 0, pendingDecisionAvailableCount = 0
+  for (const member of members) {
+    const memberStatus = member?.status === "pending" || member?.status === "approved"
+      || member?.status === "rejected" || member?.status === "expired" ? member.status : "other"
+    memberStatuses[memberStatus] = (memberStatuses[memberStatus] ?? 0) + 1
+    if (memberStatus === "pending") {
+      pendingCount++
+      if (member?.decisionAvailable === true) pendingDecisionAvailableCount++
+    }
+  }
+  const target = members.find(member => member?.slotOrdinal === targetSlotOrdinal)
+  const artifactRef = jsonRecord(target?.artifactRef)
+  return {
+    status: objectiveReviewHttpStatus(status), snapshotPresent: snapshot !== null, errorPresent: Boolean(body?.error),
+    setStatus: snapshot?.setStatus === "pending" || snapshot?.setStatus === "resolved" ? snapshot.setStatus : null,
+    memberCount: Math.min(8, rawMembers.length), memberOverflow: rawMembers.length > 8, memberStatuses,
+    pendingCount, pendingDecisionAvailableCount,
+    target: { present: target !== undefined, pending: target?.status === "pending",
+      decisionAvailable: typeof target?.decisionAvailable === "boolean" ? target.decisionAvailable : null,
+      approvalIdPresent: typeof target?.approvalId === "string", resumeIdPresent: typeof target?.resumeId === "string",
+      artifactRefPresent: Boolean(artifactRef && typeof artifactRef.artifactId === "string"
+        && Number.isSafeInteger(artifactRef.version) && typeof artifactRef.contentHash === "string"
+        && typeof artifactRef.sourceDigest === "string") },
+  }
+}
+
+async function objectiveApplicationReviewFailureDiagnostics(
+  input: { sessionId: string; turnId: string }, targetSlotOrdinal: number,
+  statusCounts: Record<string, number>, lastGet: ObjectiveReviewGetDiagnostic,
+) {
+  try {
+    const turns = await testDb.agentTurn.findMany({ where: { id: input.turnId, sessionId: input.sessionId, userId: ids.user }, take: 2,
+      select: { id: true, rootTaskId: true, status: true, error: true, revision: true } })
+    const turn = turns.length === 1 ? turns[0] : undefined
+    const rootId = typeof turn?.rootTaskId === "string" ? turn.rootTaskId : null
+    const setId = `objective-review-${createHash("sha256").update(
+      `objective-application-review-set.v1\0${input.sessionId}\0${input.turnId}`).digest("hex").slice(0, 40)}`
+    const itemId = objectiveApplicationApprovalSetItemId(setId)
+    const [roots, items] = await Promise.all([
+      rootId ? testDb.subAgentTask.findMany({ where: { id: rootId, sessionId: input.sessionId, turnId: input.turnId,
+        rootTaskId: rootId, parentTaskId: null, role: "orchestrator", taskType: "root" }, take: 2,
+        select: { status: true, failureReason: true } }) : Promise.resolve([]),
+      testDb.agentItem.findMany({ where: { id: itemId, sessionId: input.sessionId, turnId: input.turnId,
+        type: "approval_request", stepId: null, taskId: null }, take: 2,
+        select: { status: true, phase: true, revision: true, completedAt: true, content: true } }),
+    ])
+    const item = items.length === 1 ? items[0] : undefined
+    const set = item && parseObjectiveApplicationApprovalSet(item.content)
+    const validSet = Boolean(set && set.setId === setId && set.members.every(member =>
+      member.approvalId === `objective-review:${setId}:${member.slotOrdinal}`))
+    const approvals = set && validSet ? await testDb.agentApproval.findMany({ where: { userId: ids.user, sessionId: input.sessionId,
+      turnId: input.turnId, type: "review_application", id: { in: set.members.map(member => member.approvalId) } }, take: 9,
+      select: { id: true, status: true, revision: true, decidedAt: true } }) : []
+    const approvalStatuses = emptyObjectiveReviewStatusCounts()
+    for (const approval of approvals) {
+      const status = approval.status === "pending" || approval.status === "approved"
+        || approval.status === "rejected" || approval.status === "expired" ? approval.status : "other"
+      approvalStatuses[status] = (approvalStatuses[status] ?? 0) + 1
+    }
+    const targetApprovalId = set?.members.find(member => member.slotOrdinal === targetSlotOrdinal)?.approvalId
+    const targetApproval = approvals.find(approval => approval.id === targetApprovalId)
+    const root = roots.length === 1 ? roots[0] : undefined
+    const failureCode = (value: unknown) => value == null ? null
+      : typeof value === "string" && OBJECTIVE_REVIEW_DIAGNOSTIC_FAILURE_CODES.has(value) ? value : "other"
+    const turnStatus = objectiveSourceStatus(turn?.status)
+    const itemStatus = item?.status === "started" || item?.status === "completed" || item?.status === "failed"
+      || item?.status === "cancelled" ? item.status : item ? "other" : null
+    return {
+      get: { polls: Math.min(2000, Object.values(statusCounts).reduce((sum, count) => sum + count, 0)), statusCounts, last: lastGet },
+      turn: { present: turn !== undefined, status: turnStatus, revision: Number.isSafeInteger(turn?.revision) ? turn!.revision : null,
+        failureCode: failureCode(turn?.error) },
+      root: { present: root !== undefined, status: objectiveSourceStatus(root?.status), failureCode: failureCode(root?.failureReason) },
+      approvalSetItem: { present: item !== undefined, contentValid: validSet,
+        status: itemStatus, phase: item?.phase === "commentary" ? "commentary" : item ? "other" : null,
+        revision: Number.isSafeInteger(item?.revision) ? item!.revision : null,
+        completed: item?.completedAt instanceof Date, memberCount: validSet ? set!.members.length : 0,
+        targetMemberPresent: Boolean(validSet && targetApprovalId) },
+      approvals: { count: Math.min(8, approvals.length), overflow: approvals.length > 8, statusCounts: approvalStatuses,
+        targetPresent: targetApproval !== undefined,
+        targetStatus: targetApproval?.status === "pending" || targetApproval?.status === "approved"
+          || targetApproval?.status === "rejected" || targetApproval?.status === "expired" ? targetApproval.status : targetApproval ? "other" : null,
+        targetRevision: Number.isSafeInteger(targetApproval?.revision) ? targetApproval!.revision : null,
+        targetDecided: targetApproval?.decidedAt instanceof Date },
+    }
+  } catch {
+    return { get: { polls: Math.min(2000, Object.values(statusCounts).reduce((sum, count) => sum + count, 0)), statusCounts, last: lastGet },
+      diagnosticsAvailable: false }
+  }
 }
 
 describeWithServices("ApplicationTask production full-loop PostgreSQL integration", () => {
@@ -2576,7 +2723,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         const member = jsonRecord(members[0])
         return snapshot.setStatus === "pending" && members.length === 1 && member?.status === "pending"
           && member.decisionAvailable === true
-      })
+      }, 120_000, 6)
       const staleMember = jsonRecord(Array.isArray(stalePendingSnapshot.members) ? stalePendingSnapshot.members[0] : null)
       const staleApprovalId = typeof staleMember?.approvalId === "string" ? staleMember.approvalId : ""
       if (!staleMember || !staleApprovalId) throw new Error("Objective slot 6 has no pending durable approval")
@@ -2686,7 +2833,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const pendingSnapshot = await waitForObjectiveApplicationReviewSnapshot({ sessionId, turnId: reviewTurnId, token }, snapshot => {
         const members = Array.isArray(snapshot.members) ? snapshot.members : []
         return snapshot.setStatus === "pending" && members.length === 1 && jsonRecord(members[0])?.status === "pending"
-      })
+      }, 120_000, 2)
       const members = Array.isArray(pendingSnapshot.members) ? pendingSnapshot.members : []
       const pendingMember = jsonRecord(members[0])
       const approvalId = typeof pendingMember?.approvalId === "string" ? pendingMember.approvalId : ""
