@@ -5,6 +5,7 @@ import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summar
 import { buildGroundedTaskGraphFinalResponse } from "./subagents/task-graph-final-response.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING, sameTaskGraphFinalSummaryBinding, type TaskGraphFinalSummaryBinding } from "./subagents/task-graph-final-summary-binding.js"
 import { buildTaskGraphFinalSourceManifest } from "./subagents/task-graph-final-source-manifest.js"
+import { objectiveTailorFinalOutcomeSidecarMatches, readObjectiveTailorFinalOutcomeSidecar } from "./subagents/objective-tailor-final-sidecar.js"
 
 export type FinalTerminalReason = "goal_satisfied" | "partial_result" | "budget_exhausted" | "no_progress" | "unrecoverable_error" | "final_unverified"
 
@@ -81,8 +82,16 @@ export function taskGraphFinalSummaryCopiesMatch(expected: TaskGraphFinalSummary
   finalContent: unknown, response: string, finalItemId: string): boolean {
   const content = record(finalContent)
   if (!expected || !current) return expected === undefined && current === undefined
-    && !Object.hasOwn(content, "taskGraphSources") && !hasResponseSourceField(content.final) && !hasSerializedSources(response)
+    && !Object.hasOwn(content, "taskGraphSources") && !Object.hasOwn(content, "objectiveTailorFinalOutcomes")
+    && !hasMisplacedResponseSourceField(content) && !hasSerializedSources(response)
   if (!sameTaskGraphFinalSummaryBinding(expected, current)) return false
+  const expectedOutcome = readObjectiveTailorFinalOutcomeSidecar(expected), currentOutcome = readObjectiveTailorFinalOutcomeSidecar(current)
+  if (expectedOutcome.status === "invalid" || currentOutcome.status === "invalid" || expectedOutcome.status !== currentOutcome.status) return false
+  const hasOutcomeSidecar = Object.hasOwn(content, "objectiveTailorFinalOutcomes")
+  if (expectedOutcome.status === "ready"
+    ? !hasOutcomeSidecar || !objectiveTailorFinalOutcomeSidecarMatches(expected, content.objectiveTailorFinalOutcomes)
+      || !objectiveTailorFinalOutcomeSidecarMatches(current, content.objectiveTailorFinalOutcomes)
+    : hasOutcomeSidecar) return false
   let saved: unknown
   try { saved = JSON.parse(response) as unknown } catch { return false }
   let projectedResponse: string
@@ -90,7 +99,7 @@ export function taskGraphFinalSummaryCopiesMatch(expected: TaskGraphFinalSummary
   if (content.text !== projectedResponse || record(content.final).response !== projectedResponse || record(saved).response !== projectedResponse) return false
   let manifest: ReturnType<typeof buildTaskGraphFinalSourceManifest>
   try { manifest = buildTaskGraphFinalSourceManifest(expected, finalItemId) } catch { return false }
-  if (hasSerializedSources(response) || hasResponseSourceField(content.final)) return false
+  if (hasSerializedSources(response) || hasMisplacedResponseSourceField(content)) return false
   if (manifest ? !sameJson(content.taskGraphSources, manifest) : Object.hasOwn(content, "taskGraphSources")) return false
   const summary = formatTaskGraphFinalSummary(expected.summary)
   return record(saved).summary === summary && record(content.final).summary === summary
@@ -101,8 +110,15 @@ function hasSerializedSources(response: string): boolean {
 }
 function hasResponseSourceField(value: unknown): boolean {
   const response = record(value)
-  return Object.hasOwn(response, "taskGraphSources") || Object.hasOwn(record(response.answerEvidence), "taskGraphSources")
-    || (Array.isArray(response.evidenceRefs) && response.evidenceRefs.some(item => Object.hasOwn(record(item), "taskGraphSources")))
+  return hasOutcomeSourceField(response) || hasOutcomeSourceField(record(response.answerEvidence))
+    || (Array.isArray(response.evidenceRefs) && response.evidenceRefs.some(item => hasOutcomeSourceField(record(item))))
+}
+function hasMisplacedResponseSourceField(content: Record<string, unknown>): boolean {
+  return hasResponseSourceField(content.final) || hasResponseSourceField(content.answerEvidence)
+    || (Array.isArray(content.evidenceRefs) && content.evidenceRefs.some(item => hasOutcomeSourceField(record(item))))
+}
+function hasOutcomeSourceField(value: Record<string, unknown>): boolean {
+  return Object.hasOwn(value, "taskGraphSources") || Object.hasOwn(value, "objectiveTailorFinalOutcomes")
 }
 function sameJson(left: unknown, right: unknown): boolean {
   try {

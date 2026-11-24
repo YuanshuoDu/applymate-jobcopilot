@@ -4,7 +4,9 @@ import { finalizeTurn, nativeFinalCandidateMatches, serializeFinalResponse, task
 import { buildGroundedTaskGraphFinalResponse } from "./subagents/task-graph-final-response.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "./subagents/task-graph-final-summary-binding.js"
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
-import { buildTaskGraphFinalSourceManifest } from "./subagents/task-graph-final-source-manifest.js"
+import { buildTaskGraphFinalSidecars } from "./subagents/objective-tailor-final-sidecar.js"
+import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA } from "./subagents/objective-tailor-final-summary-binding.js"
+import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA } from "@jobcopilot/agent-protocol"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
 import { taskGraphItemId } from "./subagents/task-graph-snapshot.js"
 import type { GraphTaskRow, LoadedGraph } from "./subagents/task-graph-pg-state.js"
@@ -49,14 +51,30 @@ function followUpGraphBinding(): TaskGraphFinalSummaryBinding {
   return binding
 }
 
+function waveGraphBinding(): TaskGraphFinalSummaryBinding {
+  const rootTaskId = "root-wave", taskRows: GraphTaskRow[] = ["source-a", "source-b"].map((id, index) => ({
+    id, role: "scout", taskType: "research", status: "completed", failureReason: null,
+    result: { status: "completed", structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+      candidates: [], evidence: [], summary: `Source ${index + 1}.` } },
+  }))
+  const graphRevision = 12, loaded = { rootTaskId, item: { id: taskGraphItemId(rootTaskId), revision: graphRevision, content: {}, createdAt: new Date(0) },
+    snapshot: { nodes: taskRows.map((row, nodeIndex) => ({ taskId: row.id, key: `source-${nodeIndex + 1}`, templateId: "scout" })) },
+    state: { revision: graphRevision }, tasks: new Map(taskRows.map(row => [row.id, row])) } as unknown as LoadedGraph
+  const base = buildTaskGraphFinalSummaryBinding(loaded)
+  if (!base) throw new Error("Expected a current wave TaskGraph binding")
+  return { ...base, objectiveTailorFinalOutcome: { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA, graphRevision,
+    rootAttemptCount: 1, graphDigest: "a".repeat(64), sourceNodeCount: 2, sourceGraphDigest: "b".repeat(64), sourceStatusDigest: "c".repeat(64),
+    slots: [{ ordinal: 1, status: "ready", evidenceDigest: "d".repeat(64) }, { ordinal: 2, status: "needs_revision", evidenceDigest: "e".repeat(64) }] } }
+}
+
 function boundTerminal(binding: TaskGraphFinalSummaryBinding, responseText: string, finalItemId = "final-item-1") {
   const summary = formatTaskGraphFinalSummary(binding.summary)
   const final = finalizeTurn({ goal: "Find a role", verification: { ok: true, evidenceRefs: [], businessChecks: [] },
     terminalReason: "goal_satisfied", response: responseText, summaryOverride: summary,
     usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 }, stepCount: 1, toolCallCount: 0 })
-  const taskGraphSources = buildTaskGraphFinalSourceManifest(binding, finalItemId)
-  if (!taskGraphSources) throw new Error("Expected a current TaskGraph source manifest")
-  const finalContent = { text: responseText, final, taskGraphSources }
+  const sidecars = buildTaskGraphFinalSidecars(binding, finalItemId)
+  if (!sidecars?.taskGraphSources) throw new Error("Expected a current TaskGraph source manifest")
+  const finalContent = { text: responseText, final, ...sidecars }
   const response = serializeFinalResponse(final)
   return { finalItemId, finalContent, response, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding }
 }
@@ -129,6 +147,27 @@ describe("deterministic finalizer", () => {
     expect(saved.summary).toBe(formatTaskGraphFinalSummary(binding.summary))
   })
 
+  it("persists only the bound settled slot statuses and rejects missing or misplaced sidecars", () => {
+    const binding = waveGraphBinding(), responseText = buildGroundedTaskGraphFinalResponse(binding), terminal = boundTerminal(binding, responseText)
+    const sidecar = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA,
+      slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }] }
+    expect(terminal.finalContent.objectiveTailorFinalOutcomes).toEqual(sidecar)
+    expect(terminal.finalContent.final).not.toHaveProperty("objectiveTailorFinalOutcomes")
+    expect(JSON.parse(terminal.response)).not.toHaveProperty("objectiveTailorFinalOutcomes")
+    expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), terminal.finalContent, terminal.response, terminal.finalItemId)).toBe(true)
+    expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent, objectiveTailorFinalOutcomes: undefined }, terminal.response, terminal.finalItemId)).toBe(false)
+    expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
+      objectiveTailorFinalOutcomes: { ...sidecar, slots: [{ ordinal: 1, status: "failed" }, { ordinal: 2, status: "needs_revision" }] } }, terminal.response, terminal.finalItemId)).toBe(false)
+    expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
+      final: { ...terminal.finalContent.final, objectiveTailorFinalOutcomes: sidecar } }, terminal.response, terminal.finalItemId)).toBe(false)
+    expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
+      answerEvidence: { objectiveTailorFinalOutcomes: sidecar } }, terminal.response, terminal.finalItemId)).toBe(false)
+    expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
+      evidenceRefs: [{ objectiveTailorFinalOutcomes: sidecar }] }, terminal.response, terminal.finalItemId)).toBe(false)
+    const injectedResponse = JSON.stringify({ ...JSON.parse(terminal.response), objectiveTailorFinalOutcomes: sidecar })
+    expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), terminal.finalContent, injectedResponse, terminal.finalItemId)).toBe(false)
+  })
+
   it("rejects matching but noncanonical copies even when the bound summary remains correct", () => {
     const binding = graphBinding()
     const groundedResponse = buildGroundedTaskGraphFinalResponse(binding)
@@ -163,5 +202,6 @@ describe("deterministic finalizer", () => {
     expect(nativeFinalCandidateMatches(terminal, rawModelCandidate, rawModelCandidate)).toBe(true)
     expect(nativeFinalCandidateMatches(terminal, "different persisted text", rawModelCandidate)).toBe(false)
     expect(taskGraphFinalSummaryCopiesMatch(undefined, undefined, finalContent, response, "final-item-1")).toBe(true)
+    expect(taskGraphFinalSummaryCopiesMatch(undefined, undefined, { ...finalContent, objectiveTailorFinalOutcomes: { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA, slots: [{ ordinal: 1, status: "ready" }] } }, response, "final-item-1")).toBe(false)
   })
 })
