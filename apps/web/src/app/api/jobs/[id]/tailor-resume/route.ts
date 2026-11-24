@@ -14,8 +14,9 @@ import { personaEvidenceContext } from '@/lib/persona-evidence'
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import type { ApplicationAuditFinding } from '@/lib/types'
 import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
-import { auditJobBasisHash, auditMaterialBasisHash, readAuditOperation, registerAuditOperation, staleAuditOperation } from '@/lib/application-audit-operation'
-import { AuditMaterialBusyError, lockApplicationAuditMaterials, withApplicationAuditLock } from '@/lib/application-audit-transaction'
+import { auditJobBasisHash, registerAuditOperation, staleAuditOperation } from '@/lib/application-audit-operation'
+import { AuditMaterialBusyError, withApplicationAuditLock } from '@/lib/application-audit-transaction'
+import { guardedRepairBasis, RESUME_TAILOR_SECTIONS as SECTIONS, sectionsForAuditRepair } from './repair'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -31,30 +32,6 @@ type TailoredSection = {
   after?: unknown
   reason?: string
 }
-
-// Caller holds the scoped Job lock. Material rows are locked after it, in the
-// same order as audit generation and individual correction.
-async function guardedRepairBasis(tx: Prisma.TransactionClient, scope: { userId: string; jobId: string }, resumeId: string, signature: string, operationId: string) {
-  const operation = await readAuditOperation(tx, scope)
-  if (operation.kind !== 'completed' || operation.operationId !== operationId || operation.audit.receipt?.signature !== signature || operation.audit.resumeId !== resumeId) return null
-  if (!await lockApplicationAuditMaterials(tx, scope, resumeId, operation.audit.coverLetterId)) return null
-  const [job, resume, letter] = await Promise.all([
-    tx.job.findFirst({ where: { id: scope.jobId, userId: scope.userId } }),
-    tx.resume.findFirst({ where: { id: resumeId, userId: scope.userId } }),
-    operation.audit.coverLetterId ? tx.coverLetter.findFirst({ where: { id: operation.audit.coverLetterId, jobId: scope.jobId, userId: scope.userId } }) : null,
-  ])
-  const iso = (value: Date | undefined) => value instanceof Date && Number.isFinite(value.getTime()) ? value.toISOString() : null
-  if (!job || !resume || (operation.audit.coverLetterId && !letter)
-    || (job.finalResumeId && job.finalResumeId !== resumeId)
-    || (job.finalCoverLetterId ?? null) !== operation.audit.coverLetterId
-    || !operation.audit.resumeUpdatedAt || iso(resume.updatedAt) !== operation.audit.resumeUpdatedAt
-    || (letter ? !operation.audit.coverLetterUpdatedAt || iso(letter.updatedAt) !== operation.audit.coverLetterUpdatedAt : Boolean(operation.audit.coverLetterUpdatedAt))
-    || operation.jobBasisHash !== auditJobBasisHash(job)
-    || operation.materialBasisHash !== auditMaterialBasisHash(resume, letter)) return null
-  return { operation, job, resume, letter }
-}
-
-const SECTIONS = ['summary', 'skills', 'experience', 'education', 'projects', 'certifications'] as const
 
 function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
@@ -78,31 +55,6 @@ function sameSectionShape(before: unknown, after: unknown): boolean {
   if (Array.isArray(before)) return Array.isArray(after)
   if (before && typeof before === 'object') return Boolean(after && typeof after === 'object' && !Array.isArray(after))
   return after !== null && typeof before === typeof after
-}
-
-function sectionsForAuditRepair(findings: ApplicationAuditFinding[]) {
-  const matches: Array<typeof SECTIONS[number]> = []
-  for (const finding of findings.filter(item => item && item.area === 'resume' && item.severity !== 'pass')) {
-    if (finding.target) {
-      if (!SECTIONS.includes(finding.target as typeof SECTIONS[number])) return null
-      matches.push(finding.target as typeof SECTIONS[number])
-      continue
-    }
-    const text = `${finding.title} ${finding.evidence} ${finding.action}`.toLowerCase()
-    const inferred: Array<typeof SECTIONS[number]> = []
-    const add = (section: typeof SECTIONS[number], terms: string[]) => {
-      if (terms.some(term => text.includes(term))) inferred.push(section)
-    }
-    add('experience', ['experience', 'employer', 'employment', 'company', 'role', 'title', 'date', 'duration'])
-    add('summary', ['summary', 'profile', 'headline'])
-    add('skills', ['skill', 'technology', 'tooling'])
-    add('education', ['education', 'degree', 'university'])
-    add('projects', ['project', 'portfolio'])
-    add('certifications', ['certification', 'certificate', 'credential'])
-    if (inferred.length !== 1) return null
-    matches.push(inferred[0])
-  }
-  return matches.length ? [...new Set(matches)] : null
 }
 
 export async function POST(req: NextRequest, { params }: Params) {
@@ -146,7 +98,7 @@ export async function POST(req: NextRequest, { params }: Params) {
   if (forceRetailor) {
     if (typeof auditReceiptSignature !== 'string' || !/^[a-f0-9]{64}$/.test(auditReceiptSignature)
       || typeof auditOperationId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(auditOperationId)) return err('Run the independent audit again before applying a correction.', 409)
-    try { repairBasis = await withApplicationAuditLock(scope, tx => guardedRepairBasis(tx, scope, resumeId, auditReceiptSignature, auditOperationId)) }
+    try { repairBasis = await withApplicationAuditLock(scope, tx => guardedRepairBasis(tx, scope, resumeId, auditReceiptSignature, auditOperationId), { sourceMaterialFence: true }) }
     catch (error) { return error instanceof AuditMaterialBusyError ? err('The application materials are being changed. Refresh before applying a correction.', 409) : err('The review status could not be read. Refresh before applying a correction.', 503) }
     if (!repairBasis || repairBasis.resume.updatedAt.getTime() !== resume.updatedAt.getTime()
       || auditJobBasisHash(repairBasis.job) !== auditJobBasisHash(job) || repairBasis.job.keywords !== job.keywords) return err('The audit or application materials changed. Run the audit again.', 409)
@@ -252,7 +204,7 @@ export async function POST(req: NextRequest, { params }: Params) {
         const invalidation = await registerAuditOperation(tx, scope)
         if (!await staleAuditOperation(tx, scope, invalidation)) throw new Error('Could not invalidate the previous audit')
         return true
-      })
+      }, { sourceMaterialFence: true })
       if (!updated) return err('The resume changed during correction. Refresh and review the latest version.', 409)
       adapted = existing
     } catch {
