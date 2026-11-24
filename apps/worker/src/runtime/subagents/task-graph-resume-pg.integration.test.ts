@@ -22096,10 +22096,38 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         expect(phaseWaits.length > 0 && phaseWaits.some(wait => readyEvidence.get(wait.id) === true)).toBe(true)
       }
       const recoveredWave1Wait = waits.rows.find(wait => wait.id === firstWait.id)
-      expect(recoveredWave1Wait?.idempotencyKey === firstWaitKey
+      const otherWave1Waits = waits.rows.filter(wait => wait.id !== firstWait.id
+        && wait.idempotencyKey.startsWith(`p3-1336-wave1-wait:${value.turnId}:`))
+      const boundedWaitCount = (count: number) => Math.min(count, 16)
+      const safeWaitStatus = (status: string | undefined) =>
+        status === "waiting" || status === "ready" || status === "timed_out" || status === "interrupted"
+          ? status : "other"
+      const firstWaitDiagnostic = {
+        beforeRestart: {
+          status: safeWaitStatus(firstWait.status), suspended: firstWait.suspendedAt instanceof Date,
+          resolved: firstWait.resolvedAt instanceof Date, consumed: firstWait.consumedAt instanceof Date,
+        },
+        afterRestart: {
+          present: recoveredWave1Wait !== undefined, status: safeWaitStatus(recoveredWave1Wait?.status),
+          suspended: recoveredWave1Wait?.suspendedAt instanceof Date,
+          resolved: recoveredWave1Wait?.resolvedAt instanceof Date,
+          consumed: recoveredWave1Wait?.consumedAt instanceof Date,
+          stateValid: recoveredWave1Wait ? waitStateValid.get(recoveredWave1Wait.id) === true : false,
+          readyEvidence: recoveredWave1Wait ? readyEvidence.get(recoveredWave1Wait.id) === true : false,
+        },
+        otherWave1Waits: {
+          count: boundedWaitCount(otherWave1Waits.length), truncated: otherWave1Waits.length > 16,
+          readyStatusCount: boundedWaitCount(otherWave1Waits.filter(wait => wait.status === "ready").length),
+          readyEvidenceCount: boundedWaitCount(otherWave1Waits.filter(wait => readyEvidence.get(wait.id) === true).length),
+          waitingCount: boundedWaitCount(otherWave1Waits.filter(wait => wait.status === "waiting").length),
+          timedOutCount: boundedWaitCount(otherWave1Waits.filter(wait => wait.status === "timed_out").length),
+        },
+      }
+      const firstWaitRecovered = recoveredWave1Wait?.idempotencyKey === firstWaitKey
         && recoveredWave1Wait?.status === "ready" && recoveredWave1Wait.suspendedAt instanceof Date
         && recoveredWave1Wait.resolvedAt instanceof Date && recoveredWave1Wait.consumedAt instanceof Date
-        && readyEvidence.get(firstWait.id) === true).toBe(true)
+        && readyEvidence.get(firstWait.id) === true
+      expect(firstWaitRecovered, `Objective Tailor first wait recovery: ${JSON.stringify(firstWaitDiagnostic)}`).toBe(true)
       expect(waits.rows.every(wait => /^p3-1336-(?:wave-source|wave-analyst|wave1|wave2|corrections)-wait:[^:]+:[1-9][0-9]*$/.test(wait.idempotencyKey)
         && waitStateValid.get(wait.id) === true)).toBe(true)
       const applicationEffects = await pool!.query<{ applicationTasks: string; approvals: string; submissions: string }>(
