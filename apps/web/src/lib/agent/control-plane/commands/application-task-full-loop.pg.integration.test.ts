@@ -20,6 +20,18 @@ import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } fr
 import { protocolScope, type ApprovalScopeInput } from "@/lib/agent/approval/types"
 import type { ApplicationPackage, PipelineCtx } from "@/lib/agent/types"
 
+const objectiveResumeAmbientAuth = vi.hoisted(() => ({ authorization: null as string | null }))
+
+vi.mock("next/headers", async importOriginal => {
+  const actual = await importOriginal<typeof import("next/headers")>()
+  return {
+    ...actual,
+    headers: async () => objectiveResumeAmbientAuth.authorization
+      ? new Headers({ authorization: objectiveResumeAmbientAuth.authorization })
+      : await actual.headers(),
+  }
+})
+
 vi.mock("@/lib/safe-auth", () => ({ safeAuth: async () => null }))
 
 const DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
@@ -390,6 +402,14 @@ type ReviewedFillBridgeAttempt = {
   predecessorStatus: string | null
   acknowledgementDropped: boolean
 }
+type ObjectiveFillDeliveryHold = {
+  sessionId: string
+  approvalId: string
+  outboxId: string | null
+  reached: boolean
+  release: (() => void) | null
+  released: Promise<void>
+}
 type ApplicationFillExecutorTrace = {
   attemptCount: number | null
   executorInvocationOrdinal: number
@@ -443,6 +463,7 @@ const reviewedFillBridgeAttempts: ReviewedFillBridgeAttempt[] = []
 let reviewedFillBridgeServer: Server | undefined
 let reviewedFillRouteDb: PrismaClient | undefined
 let dropNextReviewedFillAcknowledgement = false
+let objectiveFillDeliveryHold: ObjectiveFillDeliveryHold | undefined
 let priorAgentWorkerSecret: string | undefined
 let priorDatabaseUrl: string | undefined
 let agentWorkerSecretOverridden = false
@@ -1150,6 +1171,20 @@ async function startReviewedFillRouteBridge(): Promise<void> {
       const requestBody = Buffer.concat(chunks).toString("utf8")
       const body = jsonRecord(JSON.parse(requestBody))
       const outboxId = typeof body?.outboxId === "string" ? body.outboxId : null
+      const hold = objectiveFillDeliveryHold
+      const objectiveOutbox = hold && outboxId ? await testDb.agentOutbox.findUnique({ where: { id: outboxId },
+        select: { id: true, topic: true, aggregateId: true, idempotencyKey: true, payload: true } }) : null
+      const objectivePayload = jsonRecord(objectiveOutbox?.payload)
+      if (hold && outboxId && objectiveOutbox?.topic === "agent.objective-reviewed-fill.dispatch"
+        && objectiveOutbox.aggregateId === hold.sessionId
+        && objectiveOutbox.idempotencyKey === `agent-objective-reviewed-fill:${hold.approvalId}`
+        && objectivePayload?.sessionId === hold.sessionId && objectivePayload.approvalId === hold.approvalId) {
+        if (!hold.reached) {
+          hold.outboxId = outboxId
+          hold.reached = true
+        }
+        await hold.released
+      }
       const headers = new Headers()
       for (const name of ["content-type", "x-agent-worker-secret"] as const) {
         const value = incoming.headers[name]
@@ -1210,6 +1245,30 @@ async function stopReviewedFillRouteBridge(): Promise<void> {
   if (closeError) throw closeError
 }
 
+function armObjectiveFillDeliveryHold(sessionId: string, approvalId: string): ObjectiveFillDeliveryHold {
+  let release: (() => void) | null = null
+  const released = new Promise<void>(resolveRelease => { release = resolveRelease })
+  const hold: ObjectiveFillDeliveryHold = { sessionId, approvalId, outboxId: null, reached: false, release, released }
+  objectiveFillDeliveryHold = hold
+  return hold
+}
+
+async function waitForObjectiveFillDeliveryHold(hold: ObjectiveFillDeliveryHold, timeoutMs = 60_000): Promise<string> {
+  const until = Date.now() + timeoutMs
+  while (!hold.reached && Date.now() < until) {
+    if (worker && exited(worker)) throw new Error("Worker exited before the exact Objective handoff was held")
+    await delay(50)
+  }
+  if (!hold.reached || !hold.outboxId) throw new Error("Exact Objective handoff did not reach the delivery hold")
+  return hold.outboxId
+}
+
+function releaseObjectiveFillDeliveryHold(hold: ObjectiveFillDeliveryHold): void {
+  hold.release?.()
+  hold.release = null
+  if (objectiveFillDeliveryHold === hold) objectiveFillDeliveryHold = undefined
+}
+
 async function waitForReviewedFillBridgeRecoveryAttempts(outboxId: string, timeoutMs = 30_000): Promise<ReviewedFillBridgeAttempt[]> {
   const until = Date.now() + timeoutMs
   let attempts = reviewedFillBridgeAttempts.filter(attempt => attempt.outboxId === outboxId)
@@ -1222,6 +1281,13 @@ async function waitForReviewedFillBridgeRecoveryAttempts(outboxId: string, timeo
     throw new Error("reviewed_fill_publisher_retry_timeout")
   }
   return attempts
+}
+
+async function withObjectiveResumeAmbientAuth<T>(token: string, operation: () => Promise<T>): Promise<T> {
+  const previous = objectiveResumeAmbientAuth.authorization
+  objectiveResumeAmbientAuth.authorization = `Bearer ${token}`
+  try { return await operation() }
+  finally { objectiveResumeAmbientAuth.authorization = previous }
 }
 
 async function waitForOutboxPublished(outboxId: string, timeoutMs = 30_000) {
@@ -1626,6 +1692,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
 
   afterAll(async () => {
     let cleanupError: unknown
+    if (objectiveFillDeliveryHold) releaseObjectiveFillDeliveryHold(objectiveFillDeliveryHold)
     try { await releaseLegacyFinalResponseGate() } catch (error) { cleanupError = error }
     try { await stopFixture(worker) } catch (error) { cleanupError ??= error }
     try { await stopFixture(site) } catch (error) { cleanupError ??= error }
@@ -2451,10 +2518,146 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       }, select: { status: true } })
       expect(initialReview).toEqual({ status: "needs_revision" })
       expect(correctedReview).toEqual({ status: "passed" })
+      const staleSlot = marker.slots.find(slot => slot.slotId === "tailor-6")
+      if (!staleSlot?.correction) throw new Error("Corrected Objective slot 6 is missing")
+      const staleWriterNode = nodeForKey(staleSlot.correction.writerNodeKey)
+      const staleReviewerNode = nodeForKey(staleSlot.correction.reviewerNodeKey)
+      const staleWriterTaskId = jsonString(staleWriterNode, "taskId")
+      const staleReviewerTaskId = jsonString(staleReviewerNode, "taskId")
+      if (!staleWriterTaskId || !staleReviewerTaskId) throw new Error("Corrected Objective slot 6 omitted task identities")
+      const staleTaskRows = await testDb.subAgentTask.findMany({ where: {
+        id: { in: [staleWriterTaskId, staleReviewerTaskId] }, sessionId, turnId: sourceTurnId, rootTaskId: sourceRootTaskId,
+      }, select: { id: true, role: true, taskType: true, status: true, context: true, result: true } })
+      expect(staleTaskRows.map(task => [task.id, task.role, task.taskType, task.status]).sort((left, right) =>
+        String(left[1]).localeCompare(String(right[1])))).toEqual([
+        [staleWriterTaskId, "writer", "cover_letter_draft", "completed"],
+        [staleReviewerTaskId, "reviewer", "cover_letter_review", "completed"],
+      ].sort((left, right) => String(left[1]).localeCompare(String(right[1]))))
+      const staleWriter = staleTaskRows.find(task => task.id === staleWriterTaskId)!
+      const staleReviewer = staleTaskRows.find(task => task.id === staleReviewerTaskId)!
+      const staleWriterResult = await reviewedSourceStructuredResult(staleWriter.status, staleWriter.result, "writer")
+      const staleReviewerResult = await reviewedSourceStructuredResult(staleReviewer.status, staleReviewer.result, "reviewer")
+      expect(staleReviewerResult.reviewStatus).toBe("passed")
+      const staleArtifactRef = jsonRecord(staleWriterResult.artifactRef)
+      const staleJobId = jsonString(jsonRecord(staleWriter.context)?.selectedJobPreparation, "jobId")
+      const staleResumeId = staleJobId ? adaptedResumeByJob.get(staleJobId) : undefined
+      if (!staleArtifactRef || !staleJobId || !staleResumeId) throw new Error("Corrected Objective slot 6 source binding is incomplete")
       await stopFixture(sourceWorker)
       worker = undefined
       worker = spawnFixture("worker")
       await waitLine(worker, "WORKER_READY", 90_000)
+
+      const staleSelection = { schema: "agent-harness.v2.objective-application-review-intent.v1", sourceTurnId,
+        rootTaskId: sourceRootTaskId, graphItemId: graphRow.id, graphRevision: graphRow.revision, slotOrdinals: [6] }
+      const staleReview = await startObjectiveApplicationReview({ sessionId, token, key: `objective-review-slot-6-${runId}`, selection: staleSelection })
+      expect(staleReview.response.status).toBe(202)
+      const staleReviewTurnId = typeof staleReview.body.turnId === "string" ? staleReview.body.turnId : ""
+      if (!staleReviewTurnId) throw new Error("Objective slot 6 review returned no review Turn")
+      const stalePendingSnapshot = await waitForObjectiveApplicationReviewSnapshot({ sessionId, turnId: staleReviewTurnId, token }, snapshot => {
+        const members = Array.isArray(snapshot.members) ? snapshot.members : []
+        const member = jsonRecord(members[0])
+        return snapshot.setStatus === "pending" && members.length === 1 && member?.status === "pending"
+          && member.decisionAvailable === true
+      })
+      const staleMember = jsonRecord(Array.isArray(stalePendingSnapshot.members) ? stalePendingSnapshot.members[0] : null)
+      const staleApprovalId = typeof staleMember?.approvalId === "string" ? staleMember.approvalId : ""
+      if (!staleMember || !staleApprovalId) throw new Error("Objective slot 6 has no pending durable approval")
+      expect(staleMember).toMatchObject({ slotOrdinal: 6, status: "pending", decisionAvailable: true, resumeId: staleResumeId,
+        artifactRef: { artifactId: staleArtifactRef.artifactId, version: staleArtifactRef.version,
+          contentHash: staleArtifactRef.contentHash, sourceDigest: staleArtifactRef.sourceDigest } })
+      const staleApproval = await waitForReviewedApproval(staleApprovalId)
+      expect(staleApproval).toMatchObject({ userId: ids.user, sessionId, turnId: staleReviewTurnId,
+        type: "review_application", status: "pending", jobId: staleJobId })
+      const staleApplicationTaskId = staleApproval.taskId
+      if (!staleApplicationTaskId) throw new Error("Objective slot 6 approval has no ApplicationTask")
+      const staleApplicationTask = await testDb.applicationTask.findUniqueOrThrow({ where: { id: staleApplicationTaskId } })
+      expect(staleApplicationTask).toMatchObject({ userId: ids.user, sessionId, jobId: staleJobId, resumeId: staleResumeId,
+        status: "waiting_for_user", checkpoint: "materials_ready", fillTurnId: null })
+      const staleTurnFence = await testDb.agentTurn.findUniqueOrThrow({ where: { id: staleReviewTurnId }, select: { revision: true } })
+      const staleTraceBaseline = await requestFixtureStats()
+      reviewedFillBridgeAttempts.length = 0
+      dropNextReviewedFillAcknowledgement = false
+      const deliveryHold = armObjectiveFillDeliveryHold(sessionId, staleApprovalId)
+      try {
+        const { POST: decideObjectiveReview } = await import("@/app/api/agent/sessions/[id]/objective-application-review/[turnId]/route")
+        const staleDecision = await decideObjectiveReview(apiRequest(
+          `/api/agent/sessions/${sessionId}/objective-application-review/${staleReviewTurnId}`, token, "POST", {
+            approvalId: staleApprovalId, expectedRevision: staleTurnFence.revision,
+            expectedReceiptRevision: staleMember.receiptRevision, idempotencyKey: `objective-review-decision-slot-6-${runId}`,
+            decision: "approved",
+          }), { params: Promise.resolve({ id: sessionId, turnId: staleReviewTurnId }) })
+        expect(staleDecision.status).toBe(202)
+        const staleOutboxId = await waitForObjectiveFillDeliveryHold(deliveryHold)
+        expect(await waitForAgentTurnTerminal(staleReviewTurnId)).toMatchObject({ status: "completed" })
+        const approvedStaleReceipt = await testDb.agentApproval.findUniqueOrThrow({ where: { id: staleApprovalId },
+          select: { status: true, payload: true } })
+        expect(approvedStaleReceipt.status).toBe("approved")
+        const staleIntentEvents = await testDb.applicationTaskEvent.findMany({ where: {
+          taskId: staleApplicationTaskId, type: "objective_application_review_approved", actor: "user",
+        }, select: { type: true, actor: true, data: true } })
+        expect(staleIntentEvents).toHaveLength(1)
+        expect(staleIntentEvents[0]).toMatchObject({ type: "objective_application_review_approved", actor: "user",
+          data: { approvalId: staleApprovalId, sessionId, reviewTurnId: staleReviewTurnId, applicationTaskId: staleApplicationTaskId,
+            jobId: staleJobId, slotOrdinal: 6, sourceTurnId, materialProofHash: expect.stringMatching(/^[a-f0-9]{64}$/) } })
+        const heldOutbox = await testDb.agentOutbox.findUniqueOrThrow({ where: { id: staleOutboxId } })
+        expect(heldOutbox).toMatchObject({ topic: "agent.objective-reviewed-fill.dispatch", aggregateId: sessionId,
+          idempotencyKey: `agent-objective-reviewed-fill:${staleApprovalId}`, publishedAt: null })
+        expect(heldOutbox.payload).toEqual({ schemaVersion: "agent-harness.v2.objective-reviewed-fill-handoff.v1",
+          userId: ids.user, sessionId, applicationTaskId: staleApplicationTaskId, approvalId: staleApprovalId,
+          predecessorTurnId: staleReviewTurnId })
+        const unfilledBeforeEdit = await testDb.applicationTask.findUniqueOrThrow({ where: { id: staleApplicationTaskId } })
+        expect(unfilledBeforeEdit).toMatchObject({ status: "waiting_for_user", checkpoint: "materials_ready", fillTurnId: null })
+
+        const { PATCH: patchResume } = await import("@/app/api/resume/[id]/route")
+        const resumeEdit = await withObjectiveResumeAmbientAuth(token, () => patchResume(apiRequest(
+          `/api/resume/${staleResumeId}`, token, "PATCH", {
+            content: { text: "Synthetic authorized Resume edit after Objective review approval." },
+          }), { params: Promise.resolve({ id: staleResumeId }) }))
+        expect(resumeEdit.status).toBe(200)
+        const editedResume = await testDb.resume.findFirstOrThrow({ where: { id: staleResumeId, userId: ids.user },
+          select: { content: true, targetJobId: true, kind: true } })
+        expect(editedResume).toMatchObject({ targetJobId: staleJobId, kind: "adapted",
+          content: { text: "Synthetic authorized Resume edit after Objective review approval." } })
+        const staleReceiptAfterEdit = await testDb.agentApproval.findUniqueOrThrow({ where: { id: staleApprovalId }, select: { payload: true } })
+        const boundResumeWitness = jsonRecord(jsonRecord(staleReceiptAfterEdit.payload)?.proof)?.resumeWitness
+        const { readObjectiveApplicationResumeWitness } = await import("@/lib/agent/approval/objective-application-resume-witness")
+        const { acquireSourceMaterialFence } = await import("@/lib/agent/source-material-fence")
+        const currentResumeWitness = await testDb.$transaction(async tx => {
+          await acquireSourceMaterialFence(tx, [ids.user])
+          return readObjectiveApplicationResumeWitness(tx, { userId: ids.user, jobId: staleJobId })
+        })
+        expect(boundResumeWitness).toBeDefined()
+        expect(currentResumeWitness).not.toEqual(boundResumeWitness)
+
+        releaseObjectiveFillDeliveryHold(deliveryHold)
+        await waitForOutboxPublished(staleOutboxId)
+        const staleBridgeAttempts = reviewedFillBridgeAttempts.filter(attempt => attempt.outboxId === staleOutboxId)
+        expect(staleBridgeAttempts.length).toBeGreaterThan(0)
+        expect(staleBridgeAttempts.every(attempt => attempt.outboxId === staleOutboxId && attempt.status === 200
+          && (attempt.acknowledgement === "terminal" || attempt.acknowledgement === "deferred")
+          && attempt.predecessorStatus === "completed"
+          && attempt.acknowledgementDropped === false)).toBe(true)
+        expect(staleBridgeAttempts.some(attempt => attempt.acknowledgement === "terminal")).toBe(true)
+        const stalePublishedOutbox = await testDb.agentOutbox.findUniqueOrThrow({ where: { id: staleOutboxId },
+          select: { attemptCount: true, publishedAt: true } })
+        expect(stalePublishedOutbox).toMatchObject({ attemptCount: 1, publishedAt: expect.any(Date) })
+        const staleTaskAfterDelivery = await testDb.applicationTask.findUniqueOrThrow({ where: { id: staleApplicationTaskId } })
+        expect(staleTaskAfterDelivery).toMatchObject({ status: "waiting_for_user", checkpoint: "materials_ready",
+          fillTurnId: null, workerTaskId: null })
+        expect(await testDb.applicationTaskEvent.count({ where: { taskId: staleApplicationTaskId,
+          type: "reviewed_application_fill_browser_started" } })).toBe(0)
+        const sessionTurns = await testDb.agentTurn.findMany({ where: { userId: ids.user, sessionId }, select: { input: true } })
+        expect(sessionTurns.filter(turn => jsonString(turn.input, "clientMessageId") === `agent-objective-reviewed-fill:${staleApprovalId}`)).toHaveLength(0)
+        const staleTraceAfter = await requestFixtureStats()
+        expect(staleTraceAfter.reviewedGetCount).toBe(staleTraceBaseline.reviewedGetCount)
+        expect(staleTraceAfter.objectiveMaterialExactCount).toBe(staleTraceBaseline.objectiveMaterialExactCount)
+        expect(staleTraceAfter.submitCount).toBe(staleTraceBaseline.submitCount)
+        expect(staleTraceAfter.reviewedSubmitCount).toBe(0)
+        expect(staleTraceAfter.requests).toEqual(staleTraceBaseline.requests)
+      } finally {
+        releaseObjectiveFillDeliveryHold(deliveryHold)
+      }
+
       const selection = { schema: "agent-harness.v2.objective-application-review-intent.v1", sourceTurnId,
         rootTaskId: sourceRootTaskId, graphItemId: graphRow.id, graphRevision: graphRow.revision, slotOrdinals: [2] }
       const reviewKey = `objective-review-slot-2-${runId}`
@@ -2483,7 +2686,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const initialTask = await testDb.applicationTask.findUniqueOrThrow({ where: { id: applicationTaskId! } })
       expect(initialTask).toMatchObject({ userId: ids.user, sessionId, jobId: selectedJobId, resumeId: selectedResumeId,
         status: "waiting_for_user", checkpoint: "materials_ready" })
-      expect(await testDb.applicationTask.count({ where: { userId: ids.user, sessionId, jobId: { in: jobIds } } })).toBe(1)
+      expect(await testDb.applicationTask.count({ where: { userId: ids.user, sessionId, jobId: { in: jobIds } } })).toBe(2)
       expect(await testDb.agentApproval.count({ where: { userId: ids.user, sessionId, turnId: reviewTurnId, type: "review_application" } })).toBe(1)
       const turnFence = await testDb.agentTurn.findUniqueOrThrow({ where: { id: reviewTurnId }, select: {
         id: true, userId: true, sessionId: true, revision: true,
@@ -2621,6 +2824,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       })
       expect(await testDb.agentOutbox.count({ where: { aggregateId: sessionId, topic: "application.submit.dispatch" } })).toBe(0)
       expect((await submitQueueJobs()).filter(job => jsonString(job.data, "applicationTaskId") === applicationTaskId)).toHaveLength(0)
+      const staleSlotTaskAfterValidSiblingFill = await testDb.applicationTask.findUniqueOrThrow({ where: { id: staleApplicationTaskId } })
+      expect(staleSlotTaskAfterValidSiblingFill).toMatchObject({ status: "waiting_for_user", checkpoint: "materials_ready",
+        fillTurnId: null, workerTaskId: null })
+      expect(await testDb.applicationTaskEvent.count({ where: { taskId: staleApplicationTaskId,
+        type: "reviewed_application_fill_browser_started" } })).toBe(0)
     } finally {
       if (priorWaveFlag === undefined) delete process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES
       else process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES = priorWaveFlag
