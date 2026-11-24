@@ -192,6 +192,45 @@ describe("Objective application approval-set member decision", () => {
     expect(outboxApproval?.payload.payload).toEqual(expired?.payload)
   })
 
+  it("retires a pre-edited member on the first valid command while the other five finish the set", async () => {
+    const rows = await makeRows(Array(6).fill("pending")), fake = fixture(rows), edited = rows[5]!
+    mocks.resume.mockImplementation(async (_tx: unknown, scope: { jobId: string }) =>
+      resumeWitness(scope.jobId, scope.jobId === edited.jobId ? 4 : 3))
+    const callbacks = hooks()
+
+    for (const [index, member] of rows.slice(0, 5).entries()) {
+      const result = await decideObjectiveApplicationApprovalSetMemberInTransaction(fake.tx as never, request(member), callbacks)
+      expect(result.status).toBe("approved")
+      if (index === 0) {
+        expect(result).toMatchObject({ setCompleted: false, nextTurnRevision: 5 })
+        expect(rows.map(row => row.status)).toEqual(["approved", "pending", "pending", "pending", "pending", "expired"])
+        expect(fake.tx.agentItem.updateMany).not.toHaveBeenCalled()
+        expect(fake.tx.agentTurn.updateMany).not.toHaveBeenCalled()
+        expect(fake.outbox.filter(row => row.topic === "agent.turn.wakeup")).toHaveLength(0)
+      }
+      if (index === 4) expect(result).toMatchObject({ setCompleted: true, nextTurnRevision: 6 })
+    }
+
+    expect(rows.map(row => row.status)).toEqual(["approved", "approved", "approved", "approved", "approved", "expired"])
+    expect(fake.tx.agentItem.updateMany).toHaveBeenCalledOnce()
+    expect(fake.tx.agentTurn.updateMany).toHaveBeenCalledOnce()
+    expect(callbacks.verifySource).toHaveBeenCalledTimes(5)
+    expect(callbacks.recordApprovedHandoff).toHaveBeenCalledTimes(5)
+    expect(fake.events.filter(event => event.type === "approval.resolved")).toHaveLength(5)
+    expect(fake.events.filter(event => event.type === "approval.expired")).toHaveLength(1)
+    expect(fake.outbox.filter(row => row.topic === "agent.turn.wakeup")).toHaveLength(1)
+    const publicWrites = JSON.stringify({ events: fake.events, outbox: fake.outbox })
+    for (const privateField of ["resumeWitness", "resourceHash", "materialHash", "answersHash", "scopeHash"])
+      expect(publicWrites).not.toContain(privateField)
+
+    const writes = { handoffs: callbacks.recordApprovedHandoff.mock.calls.length,
+      approvals: fake.tx.agentApproval.updateMany.mock.calls.length, events: fake.events.length, outbox: fake.outbox.length }
+    const duplicate = await decideObjectiveApplicationApprovalSetMemberInTransaction(fake.tx as never, request(rows[4]!), callbacks)
+    expect(duplicate).toMatchObject({ disposition: "duplicate", status: "approved", setCompleted: true, nextTurnRevision: 6 })
+    expect({ handoffs: callbacks.recordApprovedHandoff.mock.calls.length,
+      approvals: fake.tx.agentApproval.updateMany.mock.calls.length, events: fake.events.length, outbox: fake.outbox.length }).toEqual(writes)
+  })
+
   it("rolls back without member events or handoff when the exact source verifier fails", async () => {
     const rows = await makeRows(Array(6).fill("pending")), fake = fixture(rows), selected = rows[0]!
     mocks.resume.mockImplementation(async (_tx: unknown, scope: { jobId: string }) => resumeWitness(scope.jobId))
