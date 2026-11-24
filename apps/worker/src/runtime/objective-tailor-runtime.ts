@@ -12,6 +12,8 @@ import type { TurnLease } from "./turns/lease.js"
 import type { TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
 import { selectedJobArtifactCompletionGateWithWitness, type SelectedJobCompletionGraphWitness } from "./selected-job-completion-gate.js"
 import { selectedJobArtifactFinalizationGuard } from "./selected-job-finalization-guard.js"
+import { verifyCanonicalObjectiveTailorWaveCompletion, type ObjectiveTailorWaveCompletionWitness } from "./canonical-objective-tailor-wave-completion.js"
+import type { LoadedGraph } from "./subagents/task-graph-pg-state.js"
 
 type Accepted = Readonly<{ status: "absent" }> | Readonly<{
   status: "bound"
@@ -19,7 +21,7 @@ type Accepted = Readonly<{ status: "absent" }> | Readonly<{
   writerTaskId: string
   reviewerTaskId: string
   graphWitness: SelectedJobCompletionGraphWitness
-}>
+}> | Readonly<{ status: "wave"; witness: ObjectiveTailorWaveCompletionWitness }>
 type Input = Readonly<{
   pool: Pick<pg.Pool, "connect">
   lease: TurnLease
@@ -68,6 +70,14 @@ export function createCanonicalObjectiveTailorRuntime(input: Input): Readonly<{
       const readScope = scope()
       await lockTaskGraphScope(txClient, readScope, true)
       const loaded = await loadTaskGraph(txClient, identity(readScope), true)
+      if (hasWaveMarker(loaded)) {
+        const result = await verifyCanonicalObjectiveTailorWaveCompletion({ client: txClient, lease: input.lease,
+          root: input.root, loaded, allowAbsent: false })
+        if (result.status !== "ready") return undefined
+        await txClient.query("COMMIT")
+        committed = true
+        return { status: "wave", witness: result.witness }
+      }
       const binding = await readCurrentObjectiveTailorBinding(txClient, identity(readScope), loaded)
       if (binding.status === "invalid") return undefined
       if (binding.status === "absent") {
@@ -112,6 +122,13 @@ export function createCanonicalObjectiveTailorRuntime(input: Input): Readonly<{
       if (!prior || !input.commandPort) return BLOCKED
       try {
         const readScope = scope(), loaded = await loadTaskGraph(client, identity(readScope), true)
+        if (prior.status === "wave") {
+          if (!hasWaveMarker(loaded)) return BLOCKED
+          const result = await verifyCanonicalObjectiveTailorWaveCompletion({ client, lease: input.lease,
+            root: input.root, loaded, allowAbsent: false, acceptedWitness: prior.witness })
+          return result.status === "ready" ? { ok: true } : BLOCKED
+        }
+        if (hasWaveMarker(loaded)) return BLOCKED
         const binding = await readCurrentObjectiveTailorBinding(client, identity(readScope), loaded)
         if (prior.status === "absent") return binding.status === "absent" ? { ok: true } : BLOCKED
         if (binding.status !== "bound" || binding.writerTaskId !== prior.writerTaskId
@@ -136,4 +153,12 @@ export function createCanonicalObjectiveTailorRuntime(input: Input): Readonly<{
       }
     },
   }
+}
+
+function hasWaveMarker(loaded: LoadedGraph): boolean {
+  return hasOwn(loaded.snapshot, "objectiveTailor") || hasOwn(loaded.state, "objectiveTailor")
+}
+
+function hasOwn(value: unknown, key: string): boolean {
+  return value !== null && typeof value === "object" && Object.hasOwn(value, key)
 }

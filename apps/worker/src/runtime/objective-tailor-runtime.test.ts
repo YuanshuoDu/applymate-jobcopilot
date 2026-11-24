@@ -7,12 +7,14 @@ import type { ObjectiveTailorCurrentBinding } from "./subagents/objective-tailor
 import type { SelectedJobArtifactCompletionGateWithWitnessResult } from "./selected-job-completion-gate.js"
 import type { SelectedJobArtifactFinalizationGuardInput } from "./selected-job-finalization-guard.js"
 import type { TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
+import type { ObjectiveTailorWaveCompletionWitness, ObjectiveTailorWaveCompletionResult } from "./canonical-objective-tailor-wave-completion.js"
 
 const deps = vi.hoisted(() => ({
   lock: vi.fn(async (..._args: unknown[]) => ({})),
   load: vi.fn(async (..._args: unknown[]): Promise<LoadedGraph> => ({} as LoadedGraph)),
   graph: vi.fn((): TaskGraphCurrentState => ({ revision: 1, nodes: [] })),
   binding: vi.fn(async (..._args: unknown[]): Promise<ObjectiveTailorCurrentBinding> => ({ status: "absent" })),
+  wave: vi.fn(async (..._args: unknown[]): Promise<ObjectiveTailorWaveCompletionResult> => ({ status: "blocked", outcomes: [] })),
   candidateGate: vi.fn(async (..._args: unknown[]): Promise<SelectedJobArtifactCompletionGateWithWitnessResult> => ({
     ok: true, witness: { revision: 1, nodes: [] },
   })),
@@ -24,6 +26,7 @@ vi.mock("./subagents/task-graph-pg-state.js", () => ({
   lockTaskGraphScope: deps.lock, loadTaskGraph: deps.load, currentTaskGraph: deps.graph,
 }))
 vi.mock("./subagents/objective-tailor-current-binding.js", () => ({ readCurrentObjectiveTailorBinding: deps.binding }))
+vi.mock("./canonical-objective-tailor-wave-completion.js", () => ({ verifyCanonicalObjectiveTailorWaveCompletion: deps.wave }))
 vi.mock("./selected-job-completion-gate.js", () => ({ selectedJobArtifactCompletionGateWithWitness: deps.candidateGate }))
 vi.mock("./selected-job-finalization-guard.js", () => ({ selectedJobArtifactFinalizationGuard: deps.finalize }))
 vi.mock("../db/agent-artifact-repo.js", () => ({
@@ -45,7 +48,11 @@ const witness: ObjectiveTailorCandidateWitness = {
   writerNodeKey: `objective-tailor-writer-${"a".repeat(64)}`, reviewerNodeKey: `objective-tailor-reviewer-${"a".repeat(64)}`, admittedRevision: 2,
 }
 const bound = { status: "bound" as const, witness, writerTaskId: "writer-1", reviewerTaskId: "reviewer-1" }
+const waveWitness = { graphRevision: 3, graphDigest: "a".repeat(64), marker: { schemaVersion: "agent-harness.v2.objective-tailor-graph.v1",
+  sourceNodeCount: 2, slots: [] }, sourceGraphRevision: 1, sourceGraphDigest: "b".repeat(64), sourceStatusDigest: "c".repeat(64),
+  outcomes: [] } as unknown as ObjectiveTailorWaveCompletionWitness
 const graph: TaskGraphCurrentState = { revision: 2, nodes: [] }
+const waveLoaded = { snapshot: { objectiveTailor: waveWitness.marker }, state: { objectiveTailor: waveWitness.marker } } as unknown as LoadedGraph
 const client = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })), release: vi.fn() } as never as PoolClient
 const commandPort = { appendAndSchedule: vi.fn(), readCurrent: vi.fn(), readCurrentWithClient: vi.fn() } as never
 const pool = { connect: vi.fn(async () => client) } as never
@@ -56,6 +63,7 @@ beforeEach(() => {
   deps.load.mockResolvedValue({} as LoadedGraph)
   deps.graph.mockReturnValue(graph)
   deps.binding.mockResolvedValue({ status: "absent" })
+  deps.wave.mockResolvedValue({ status: "blocked", outcomes: [] })
   deps.candidateGate.mockResolvedValue({ ok: true, witness: graph })
   deps.finalize.mockResolvedValue({ ok: true })
 })
@@ -125,5 +133,46 @@ describe("createCanonicalObjectiveTailorRuntime", () => {
     expect(client.query).toHaveBeenCalledWith("ROLLBACK")
     expect(client.query).not.toHaveBeenCalledWith("COMMIT")
     expect(client.release).toHaveBeenCalledOnce()
+  })
+
+  it("routes an exact marked wave through the V2 witness and revalidates it on the terminal client", async () => {
+    deps.load.mockResolvedValue(waveLoaded)
+    deps.wave.mockResolvedValue({ status: "ready", outcomes: [], witness: waveWitness })
+    const runtime = createCanonicalObjectiveTailorRuntime({ pool, lease, root, commandPort })
+
+    await expect(runtime.complete()).resolves.toEqual({ ok: true })
+    await expect(runtime.finalize(client)).resolves.toEqual({ ok: true })
+    expect(deps.binding).not.toHaveBeenCalled()
+    expect(deps.candidateGate).not.toHaveBeenCalled()
+    expect(deps.wave).toHaveBeenNthCalledWith(1, expect.objectContaining({ client, loaded: waveLoaded, allowAbsent: false }))
+    expect(deps.wave).toHaveBeenNthCalledWith(2, expect.objectContaining({ client, loaded: waveLoaded,
+      allowAbsent: false, acceptedWitness: waveWitness }))
+  })
+
+  it("blocks pending or changed marked evidence without falling back to the V1 binding", async () => {
+    deps.load.mockResolvedValue(waveLoaded)
+    deps.wave.mockResolvedValueOnce({ status: "pending", outcomes: [] })
+    const pending = createCanonicalObjectiveTailorRuntime({ pool, lease, root, commandPort })
+    await expect(pending.complete()).resolves.toMatchObject({ ok: false })
+    expect(deps.binding).not.toHaveBeenCalled()
+
+    deps.wave.mockResolvedValueOnce({ status: "ready", outcomes: [], witness: waveWitness })
+      .mockResolvedValueOnce({ status: "blocked", outcomes: [] })
+    const changed = createCanonicalObjectiveTailorRuntime({ pool, lease, root, commandPort })
+    await changed.complete()
+    await expect(changed.finalize(client)).resolves.toMatchObject({ ok: false })
+    expect(deps.binding).not.toHaveBeenCalled()
+    expect(deps.finalize).not.toHaveBeenCalled()
+  })
+
+  it("rejects a wave marker appearing after an unmarked V1 absence was accepted", async () => {
+    deps.load.mockResolvedValueOnce({} as LoadedGraph).mockResolvedValueOnce(waveLoaded)
+    deps.binding.mockResolvedValueOnce({ status: "absent" })
+    const runtime = createCanonicalObjectiveTailorRuntime({ pool, lease, root, commandPort })
+
+    await expect(runtime.complete()).resolves.toEqual({ ok: true })
+    await expect(runtime.finalize(client)).resolves.toMatchObject({ ok: false })
+    expect(deps.binding).toHaveBeenCalledOnce()
+    expect(deps.wave).not.toHaveBeenCalled()
   })
 })
