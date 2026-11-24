@@ -3,6 +3,7 @@ import type pg from "pg"
 import type { CanonicalExecutionProjection } from "./canonical-execution-projection.js"
 import type { CanonicalSessionProjection } from "./canonical-session-projection.js"
 import { loadAndDispatchCanonicalReviewedApplicationReview } from "./canonical-reviewed-application-review-dispatch.js"
+import { finalizeCanonicalObjectiveApplicationSubmit } from "./canonical-objective-application-submit-finalizer.js"
 import { createCanonicalSelectedJobBatchRuntime, prepareCanonicalSelectedJobBatchRuntime } from "./canonical-selected-job-batch-runtime.js"
 import { prepareCanonicalTurnSetup, type CanonicalTurnSetup } from "./canonical-turn-runtime-turn-setup.js"
 import type { CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
@@ -39,6 +40,14 @@ export async function prepareCanonicalTurnReviewedBatchSetup(input: {
 }): Promise<CanonicalTurnReviewedBatchSetupResult> {
   const review = await loadAndDispatchCanonicalReviewedApplicationReview(input)
   if (review.result) return { earlyResult: review.result }
+
+  const state = await review.setupOptions.stateLoader()
+  const submitFinalization = await finalizeCanonicalObjectiveApplicationSubmit({
+    pool: input.pool, lease: input.lease, state, signal: input.signal, rootTasks: input.rootTasks,
+    executionProjection: input.executionProjection, sessionProjection: input.sessionProjection, now: input.now,
+    storeFactory: input.options.turnEngineStoreFactory,
+  })
+  if (submitFinalization) return { earlyResult: submitFinalization }
 
   const setup = await prepareCanonicalTurnSetup({ ...input, options: review.setupOptions,
     batchCompletionGate: createCanonicalSelectedJobBatchRuntime })

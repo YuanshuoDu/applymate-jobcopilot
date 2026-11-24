@@ -440,6 +440,8 @@ describe("apply-queue Phase 5 pipeline", () => {
     expect(mocks.objectiveSubmit).toHaveBeenCalledOnce();
     expect(mocks.recordObjectiveSubmitResult).toHaveBeenCalledWith(expect.objectContaining({ runnerStatus: "submitted",
       requestStarted: true, requestContinued: true, fenceUnavailable: false }));
+    expect(mocks.finishApplicationTask).toHaveBeenCalledWith(expect.anything(), "application-task-1", "submitted",
+      "submission_verified", null, "submit", expect.anything(), { preserveRunnableSession: true });
     expect(mocks.insertApplyResult).not.toHaveBeenCalled();
     expect(mocks.runGreenhouseFlow).not.toHaveBeenCalled();
     expect(mocks.agentRun).not.toHaveBeenCalled();

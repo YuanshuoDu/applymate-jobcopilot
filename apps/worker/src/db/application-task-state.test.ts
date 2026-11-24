@@ -47,6 +47,7 @@ import {
   USER_TAKEOVER_CHECKPOINT,
   isUserActive,
   markSubmissionRequestStarted,
+  projectObjectiveSessionAfterFillTerminal,
   pauseForFormInput,
 } from "./application-task-state.js";
 
@@ -56,6 +57,33 @@ function testPool() {
 }
 
 describe("finishApplicationTask", () => {
+  it("keeps the exact confirmed Objective Fill Session runnable for its canonical terminal commit", async () => {
+    const { pool, query } = testPool();
+    query.mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: "session_1" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+    await finishApplicationTask(pool, "task_1", "submitted", "submission_verified", null, "submit", submissionIdentity,
+      { preserveRunnableSession: true });
+
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(String(query.mock.calls[0]?.[0])).toContain('"fillTurnId" = $7');
+    expect(query.mock.calls[1]?.[0]).toContain("INSERT INTO application_task_events");
+  });
+
+  it("does not preserve Session status for a non-success callback", async () => {
+    const { pool, query } = testPool();
+    query.mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: "session_1" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] })
+      .mockResolvedValueOnce({ rows: [{ status: "waiting_for_authorization" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+    await finishApplicationTask(pool, "task_1", "waiting_for_user", "submission_uncertain", "uncertain", "submit", submissionIdentity,
+      { preserveRunnableSession: true });
+
+    expect(query).toHaveBeenCalledTimes(4);
+    expect(query.mock.calls[3]?.[1]).toEqual(["session_1", "waiting_for_user"]);
+  });
+
   it("keeps submission uncertainty durable without reopening a stopped or terminal session", async () => {
     const { pool, query } = testPool();
     query
@@ -246,6 +274,25 @@ describe("finishApplicationTask", () => {
     )).resolves.toBe("superseded");
 
     expect(query).not.toHaveBeenCalled();
+  });
+});
+
+describe("projectObjectiveSessionAfterFillTerminal", () => {
+  it("uses the exact terminal projection gates while the canonical Session lock is held", async () => {
+    const { pool, query } = testPool();
+
+    await projectObjectiveSessionAfterFillTerminal(pool as unknown as PoolClient,
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1" });
+
+    const sql = String(query.mock.calls[0]?.[0]);
+    expect(sql).toContain('session."status"=\'running\'');
+    expect(sql).toContain('sourceTurn."source"=\'user\'');
+    expect(sql).toContain('sourceTurn."executionMode"=\'canonical_task_graph\'');
+    expect(sql).not.toContain('session."source"=\'user\'');
+    expect(sql).toContain("session.pause_requested");
+    expect(sql).toContain("delivery\"='follow_up'");
+    expect(sql).toContain("'waiting_for_dependency','waiting_for_approval','waiting_for_user'");
+    expect(query.mock.calls[0]?.[1]).toEqual(["session_1", "user_1", "turn_1"]);
   });
 });
 

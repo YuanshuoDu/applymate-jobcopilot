@@ -27,7 +27,7 @@ function matchingLegacyRows(rows: unknown[]): unknown[] {
   })
 }
 
-function pool(rows: unknown[] = [], sessionStatus: string | null = "running", queuedRows: unknown[] = [], legacyRows: unknown[] = [], lineageRows: readonly unknown[] = [{ id: "turn_1" }]) {
+function pool(rows: unknown[] = [], sessionStatus: string | null = "running", queuedRows: unknown[] = [], legacyRows: unknown[] = [], lineageRows: readonly unknown[] = [{ id: "turn_1" }], objectiveError: Error | null = null) {
   const calls: Array<[string, unknown[]?]> = []
   const open = sessionStatus !== null && !["aborted", "archived"].includes(sessionStatus)
   const client = {
@@ -37,6 +37,11 @@ function pool(rows: unknown[] = [], sessionStatus: string | null = "running", qu
       if (sql.includes("WITH candidates AS")) {
         const candidates = matchingLegacyRows(legacyRows)
         return open ? { rows: candidates, rowCount: candidates.length } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('FROM "agent_sessions" AS session') && sql.includes('JOIN "agent_turns" AS turn')
+        && sql.includes("reviewedApplicationMaterialSource")) {
+        if (objectiveError) throw objectiveError
+        return { rows: [], rowCount: 0 }
       }
       if (sql.includes('WHERE turn."id" = $1') && sql.includes("FOR UPDATE OF turn, session")) return { rows: lineageRows, rowCount: lineageRows.length }
       if (sql.includes('WHERE turn."id" = $1') && sql.includes("FOR UPDATE OF turn, turnSession")) return { rows: lineageRows, rowCount: lineageRows.length }
@@ -176,6 +181,72 @@ describe("Turn recovery scanner", () => {
     expect(legacyIndex).toBeGreaterThanOrEqual(0)
     expect(legacyIndex).toBeLessThan(reclaimIndex)
     expect(legacyIndex).toBeLessThan(queuedIndex)
+  })
+
+  it("continues ordinary dispatch when Objective submit candidate discovery fails", async () => {
+    const fake = pool(
+      [{ id: "dispatch_normal", aggregateId: "session_1", payload: { turnId: "turn_2", sessionId: "session_1", ownerId: "owner_1" }, attemptCount: 0 }],
+      "running", [{ id: "turn_2", sessionId: "session_1" }], [], [{ id: "turn_1" }, { id: "turn_2" }], new Error("private database detail"),
+    )
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined)
+
+    const report = await recoverTurnQueue(fake.pool, queue, "owner_1", new Date("2026-09-01T00:00:00.000Z"))
+
+    expect(report).toMatchObject({ reclaimed: 1, repaired: 1, dispatched: 1 })
+    expect(queue.add).toHaveBeenCalledWith("turn", { turnId: "turn_2", sessionId: "session_1", ownerId: "owner_1" },
+      { jobId: turnJobId("turn_2", 0), attempts: 5 })
+    expect(log).toHaveBeenCalledWith("[turn-recovery] objective submit discovery failed")
+    expect(log.mock.calls.flat()).not.toContain("private database detail")
+    log.mockRestore()
+  })
+
+  it("discovers both healthy Objective Root projections after approval", async () => {
+    const fake = pool()
+    await recoverTurnQueue(fake.pool, { add: vi.fn() }, "owner_1", new Date("2026-09-01T00:00:00.000Z"))
+    const sql = fake.calls.find(([text]) => text.includes("reviewedApplicationMaterialSource"))?.[0] ?? ""
+    expect(sql).toContain(`root."status" IN ('waiting','waiting_for_user')`)
+  })
+
+  it("contains one Objective candidate failure and continues with other candidates and dispatch", async () => {
+    let sessionLocks = 0
+    const candidateRows = [
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_bad", rootTaskId: "root_bad", updatedAt: new Date("2026-09-01T00:00:00Z") },
+      { userId: "user_2", sessionId: "session_2", turnId: "turn_next", rootTaskId: "root_next", updatedAt: new Date("2026-09-01T00:01:00Z") },
+    ]
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes("WITH candidates AS") || sql.includes("WITH stale")) return { rows: [], rowCount: 0 }
+        if (sql.includes('FROM "agent_sessions" AS session') && sql.includes('JOIN "agent_turns" AS turn')
+          && sql.includes("reviewedApplicationMaterialSource")) return { rows: candidateRows, rowCount: 2 }
+        if (sql.includes('SELECT "id","status" FROM "agent_sessions"')) {
+          sessionLocks += 1
+          if (sessionLocks === 1) throw new Error("private candidate detail")
+          return { rows: [], rowCount: 0 }
+        }
+        if (sql.includes('LEFT JOIN "agent_outbox" AS dispatch')) return { rows: [{ id: "turn_normal", sessionId: "session_1", dispatchId: null }] }
+        if (sql.includes('SELECT dispatch."id", dispatch."aggregateId"')) return { rows: [{ id: "outbox_normal", aggregateId: "session_1",
+          payload: { turnId: "turn_normal", sessionId: "session_1", ownerId: "recovery_owner" }, attemptCount: 0 }] }
+        if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return { rows: [{ id: "session_1" }] }
+        if (sql.includes('SELECT dispatch."id" FROM "agent_outbox"')) return { rows: [{ id: "outbox_normal" }] }
+        if (sql.includes('SELECT turn."id", turn."source"')) return { rows: [{ id: "turn_normal", source: "user", executionMode: "interactive" }] }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const fakePool = { connect: vi.fn().mockResolvedValue(client) }
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined)
+
+    const report = await recoverTurnQueue(fakePool, queue, "recovery_owner", new Date("2026-09-01T00:02:00Z"))
+
+    expect(sessionLocks).toBe(2)
+    expect(report).toMatchObject({ reclaimed: 0, repaired: 1, dispatched: 1 })
+    expect(queue.add).toHaveBeenCalledWith("turn", { turnId: "turn_normal", sessionId: "session_1", ownerId: "recovery_owner" },
+      { jobId: turnJobId("turn_normal", 0), attempts: 5 })
+    expect(log).toHaveBeenCalledWith("[turn-recovery] objective submit candidate failed")
+    expect(log.mock.calls.flat()).not.toContain("private candidate detail")
+    log.mockRestore()
   })
 
   it("repairs a published legacy aggregate before rearming an expired Turn", async () => {

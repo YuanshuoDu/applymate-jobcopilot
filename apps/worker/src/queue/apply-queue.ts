@@ -1030,6 +1030,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
             isSubmitted ? "submitted" : submissionUncertain || requiresUserTakeover ? "waiting_for_user" : isSubmissionBlocked ? "waiting_for_authorization" : "failed",
             isSubmitted ? "submission_verified" : submissionUncertain ? "submission_uncertain" : turnStopped && !submissionRequestStarted ? "turn_stopped_before_submit" : isSubmissionBlocked ? "submission_blocked" : requiresUserTakeover ? USER_TAKEOVER_CHECKPOINT : "execution_failed",
             harnessResult.error ?? null, operation === "submit" ? "submit" : "fill", submissionIdentity ?? undefined,
+            ...(recordObjectiveSuccess ? [{ preserveRunnableSession: true }] as const : []),
           );
           if (taskWrite === "superseded") { submissionSuperseded = true; return; }
           applicationTaskFinalized = true;

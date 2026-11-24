@@ -57,7 +57,7 @@ export async function claimApplicationTask(
 }
 export async function finishApplicationTask(
   pool: Pool | PoolClient, taskId: string, status: TerminalStatus, checkpoint: string, error: string | null,
-  operation: "fill" | "submit", identity?: ApplicationSubmitIdentity,
+  operation: "fill" | "submit", identity?: ApplicationSubmitIdentity, options?: { preserveRunnableSession?: true },
 ): Promise<"current" | "superseded"> {
   if (operation === "submit" && !identity) throw new Error("Submit task results require an exact application attempt identity.");
   const write = async (client: Pick<PoolClient, "query">): Promise<void> => {
@@ -86,7 +86,7 @@ export async function finishApplicationTask(
     [taskId, status, redactSensitiveText(error ?? checkpoint)],
   );
   const sessionId = transitioned.rows[0]?.sessionId;
-  if (sessionId) await refreshSessionStatus(client as PoolClient, sessionId);
+  if (sessionId && !(options?.preserveRunnableSession && operation === "submit" && status === "submitted" && checkpoint === "submission_verified")) await refreshSessionStatus(client as PoolClient, sessionId);
   };
   if (operation === "fill") {
     await write(pool as PoolClient);
@@ -97,6 +97,27 @@ export async function finishApplicationTask(
     ? await withExactSubmissionWrite(pool as Pool, attempt, "finish_application_task", client => write(client))
     : await withExactSubmissionClientWrite(pool as PoolClient, attempt, "finish_application_task", () => write(pool as PoolClient));
   return outcome.kind;
+}
+
+/** Called only by the Objective terminal guard while its Session row is already locked. */
+export async function projectObjectiveSessionAfterFillTerminal(client: PoolClient, identity: { userId: string; sessionId: string; turnId: string }): Promise<void> {
+  await client.query(`UPDATE "agent_sessions" AS session SET "status"=CASE
+    WHEN EXISTS (SELECT 1 FROM application_tasks WHERE "userId"=$2 AND "sessionId"=$1 AND "status"='filling') THEN 'running'
+    WHEN EXISTS (SELECT 1 FROM application_tasks WHERE "userId"=$2 AND "sessionId"=$1 AND "status" IN ('waiting_for_user','waiting_for_authorization')) THEN 'waiting_for_user'
+    ELSE 'completed' END, "completedAt"=CASE WHEN NOT EXISTS (SELECT 1 FROM application_tasks WHERE "userId"=$2 AND "sessionId"=$1
+      AND "status" IN ('filling','waiting_for_user','waiting_for_authorization')) THEN NOW() ELSE NULL END, "updatedAt"=NOW()
+    WHERE session."id"=$1 AND session."userId"=$2 AND session."status"='running'
+      AND EXISTS (SELECT 1 FROM "agent_turns" sourceTurn WHERE sourceTurn."id"=$3 AND sourceTurn."sessionId"=$1
+        AND sourceTurn."userId"=$2 AND sourceTurn."source"='user' AND sourceTurn."executionMode"='canonical_task_graph')
+      AND NOT EXISTS (SELECT 1 FROM "agent_events" pause WHERE pause."sessionId"=$1 AND pause."type"='session.pause_requested'
+        AND NOT EXISTS (SELECT 1 FROM "agent_events" resumed WHERE resumed."sessionId"=pause."sessionId" AND resumed."turnId"=pause."turnId"
+          AND resumed."type"='session.resume_requested' AND resumed."sequence">pause."sequence"))
+      AND NOT EXISTS (SELECT 1 FROM "agent_inputs" follow_up WHERE follow_up."sessionId"=$1 AND follow_up."userId"=$2
+        AND follow_up."targetTurnId" IS NOT NULL AND follow_up."delivery"='follow_up' AND follow_up."status" IN ('accepted','queued')
+        AND follow_up."consumedByStepId" IS NULL AND follow_up."consumedAt" IS NULL AND follow_up."cancelledAt" IS NULL)
+      AND NOT EXISTS (SELECT 1 FROM "agent_turns" sibling WHERE sibling."sessionId"=$1 AND sibling."userId"=$2 AND sibling."id"<>$3
+        AND sibling."status" IN ('queued','in_progress','waiting_for_dependency','waiting_for_approval','waiting_for_user'))`,
+  [identity.sessionId, identity.userId, identity.turnId])
 }
 
 export async function applicationTaskStillActive(
