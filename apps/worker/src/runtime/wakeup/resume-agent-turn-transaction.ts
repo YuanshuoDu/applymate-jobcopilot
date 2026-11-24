@@ -3,11 +3,12 @@ import { persistWakeupTurnDispatchInTransaction } from "../turns/recovery-scanne
 import type { AgentTurnWakeupPayload, WakeupResult } from "./types.js"
 import { appendResumeEvent, hasMatchingWakeupEvent, hasReviewedApplicationReviewIntent, wakeupLeaseDisposition } from "./resume-projection.js"
 import { assertObjectiveApprovalSetItem, assertObjectiveApprovalSetWakeupEvent } from "./resume-objective-approval-set.js"
+import { inspectObjectiveFinalSubmitWake } from "./resume-objective-final-submit-wait.js"
 
 type Client = pg.PoolClient
 type PoolLike = Pick<pg.Pool, "connect">
 type RecordValue = Record<string, unknown>
-type TerminalWakeupErrorCode = "schema_invalid_payload" | "outbox_scope_mismatch" | "event_lineage_mismatch" | "item_lineage_mismatch" | "tool_lineage_mismatch" | "turn_revision_conflict" | "wait_scope_mismatch" | "approval_set_lineage_mismatch"
+type TerminalWakeupErrorCode = "schema_invalid_payload" | "outbox_scope_mismatch" | "event_lineage_mismatch" | "item_lineage_mismatch" | "tool_lineage_mismatch" | "turn_revision_conflict" | "wait_scope_mismatch" | "approval_set_lineage_mismatch" | "objective_final_submit_wait_mismatch"
 export class TerminalWakeupError extends Error {
   constructor(readonly code: TerminalWakeupErrorCode, message: string) { super(message); this.name = "TerminalWakeupError" }
 }
@@ -58,6 +59,9 @@ export async function resumeAgentTurnInTransaction(client: Client, payload: Agen
   } else if (!await hasMatchingWakeupEvent(client, payload)) {
     fail(reviewedReview ? "wait_scope_mismatch" : "event_lineage_mismatch", "Agent wakeup event lineage does not match payload")
   }
+  const objectiveFinalSubmit = await inspectObjectiveFinalSubmitWake(client, payload, turn, session.userId)
+  if (objectiveFinalSubmit === "mismatch") fail("objective_final_submit_wait_mismatch", "Objective submission approval wakeup evidence does not match")
+  if (objectiveFinalSubmit === "acknowledge") return { status: "ignored", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
   if (turn.status === "queued" || turn.status === "in_progress") return { status: "already_resumed", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
   if (turn.status !== "waiting_for_approval" && turn.status !== "waiting_for_user") return { status: "ignored", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
   const expected = payload.waitKind === "question" ? "waiting_for_user" : "waiting_for_approval"
