@@ -721,10 +721,10 @@ describe("Web approval receipt store", () => {
     expect(sessionLockSql).toContain('"id" =')
     expect(sessionLockSql).toContain('"userId" =')
     expect(sessionLockSql).toContain('"status" NOT IN')
+    expect(sessionLockSql).toContain("'aborted', 'archived'")
     expect(sessionLockSql).toContain("FOR UPDATE")
     const sessionLockValues = (sessionLock as unknown as { values?: readonly unknown[] } | undefined)?.values ?? []
-    expect(sessionLockValues).toContain(pendingRow.sessionId)
-    expect(sessionLockValues).toContain(pendingRow.userId)
+    expect(sessionLockValues).toEqual([pendingRow.sessionId, pendingRow.userId])
     expect(pending.tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(pending.tx.agentApproval.findFirst.mock.invocationCallOrder.at(-1)!)
     expect(approved.tx.$queryRaw).not.toHaveBeenCalled()
   })
