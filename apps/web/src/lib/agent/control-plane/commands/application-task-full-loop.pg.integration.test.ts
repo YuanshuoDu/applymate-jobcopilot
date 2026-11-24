@@ -1145,6 +1145,44 @@ async function waitForWorkerRedelivery(child: Child, jobId: string, timeoutMs = 
   throw new Error(`BullMQ did not redeliver ${jobId}; matchingEventCount=${matchingEvents.length}; maxAttemptsStarted=${maxAttemptsStarted}; maxStalledCounter=${maxStalledCounter}`)
 }
 
+const OBJECTIVE_DECISION_ERROR_CODES = new Set([
+  "wait_not_found", "wait_not_pending", "wait_scope_mismatch", "wait_revision_mismatch", "wait_expired",
+  "wait_invalid_answer", "wait_invalid_command", "internal_error",
+])
+
+async function expectObjectiveDecisionAccepted(database: PrismaClient, response: Response, input: {
+  turnId: string; approvalId: string; snapshotTurnRevision: unknown; snapshotReceiptRevision: unknown
+  expectedTurnRevision: number; expectedReceiptRevision: number
+}): Promise<void> {
+  let message = "Objective approval request should be accepted"
+  if (response.status !== 202) {
+    const [turn, receipt] = await Promise.all([
+      database.agentTurn.findUnique({ where: { id: input.turnId }, select: { status: true, revision: true } }).catch(() => null),
+      database.agentApproval.findUnique({ where: { id: input.approvalId }, select: { status: true, revision: true } }).catch(() => null),
+    ])
+    let code = "other"
+    try {
+      const body = jsonRecord(await response.clone().json()), error = jsonRecord(body?.error), value = error?.code
+      if (typeof value === "string" && OBJECTIVE_DECISION_ERROR_CODES.has(value)) code = value
+    } catch { /* Keep the failure diagnostic bounded when the response is not JSON. */ }
+    message = JSON.stringify({
+      responseStatus: response.status, code,
+      snapshotTurnRevision: revisionDiagnosticValue(input.snapshotTurnRevision),
+      expectedTurnRevision: revisionDiagnosticValue(input.expectedTurnRevision),
+      databaseTurnRevision: revisionDiagnosticValue(turn?.revision),
+      snapshotReceiptRevision: revisionDiagnosticValue(input.snapshotReceiptRevision),
+      expectedReceiptRevision: revisionDiagnosticValue(input.expectedReceiptRevision),
+      databaseReceiptRevision: revisionDiagnosticValue(receipt?.revision),
+      turnWaitingForApproval: turn?.status === "waiting_for_approval", receiptPending: receipt?.status === "pending",
+    })
+  }
+  expect(response.status, message).toBe(202)
+}
+
+function revisionDiagnosticValue(value: unknown): number | null {
+  return Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : null
+}
+
 function jsonString(value: unknown, key: string): string | undefined {
   const field = jsonRecord(value)?.[key]
   return typeof field === "string" ? field : undefined
@@ -2751,7 +2789,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
             expectedReceiptRevision: staleMember.receiptRevision, idempotencyKey: `objective-review-decision-slot-6-${runId}`,
             decision: "approved",
           }), { params: Promise.resolve({ id: sessionId, turnId: staleReviewTurnId }) })
-        expect(staleDecision.status).toBe(202)
+        await expectObjectiveDecisionAccepted(testDb, staleDecision, {
+          turnId: staleReviewTurnId, approvalId: staleApprovalId, snapshotTurnRevision: stalePendingSnapshot.turnRevision,
+          snapshotReceiptRevision: staleMember.receiptRevision, expectedTurnRevision: staleTurnFence.revision,
+          expectedReceiptRevision: staleMember.receiptRevision,
+        })
         const staleOutboxId = await waitForObjectiveFillDeliveryHold(deliveryHold)
         expect(await waitForAgentTurnTerminal(staleReviewTurnId)).toMatchObject({ status: "completed" })
         const approvedStaleReceipt = await testDb.agentApproval.findUniqueOrThrow({ where: { id: staleApprovalId },
@@ -2867,7 +2909,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           approvalId, expectedRevision: turnFence.revision, expectedReceiptRevision: pendingMember.receiptRevision,
           idempotencyKey: decisionKey, decision: "approved",
         }), { params: Promise.resolve({ id: sessionId, turnId: reviewTurnId }) })
-      expect(decision.status).toBe(202)
+      await expectObjectiveDecisionAccepted(testDb, decision, {
+        turnId: reviewTurnId, approvalId, snapshotTurnRevision: pendingSnapshot.turnRevision,
+        snapshotReceiptRevision: pendingMember.receiptRevision, expectedTurnRevision: turnFence.revision,
+        expectedReceiptRevision: pendingMember.receiptRevision,
+      })
       expect((await waitForAgentTurnTerminal(reviewTurnId)).status).toBe("completed")
       const approvedReceipt = await testDb.agentApproval.findUniqueOrThrow({ where: { id: approvalId } })
       expect(approvedReceipt).toMatchObject({ id: approvalId, userId: ids.user, sessionId, turnId: reviewTurnId,
