@@ -4302,10 +4302,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const initialReport = jsonRecord(initialReportEnvelope.report)
       if (!initialReport) throw new Error("Objective journey source report is unavailable")
       expect(Object.keys(initialReport).sort()).toEqual([
-        "finalItemId", "graphRevision", "reviewCoverage", "schemaVersion", "slots", "sourceCounts",
+        "finalItemId", "graphRevision", "reportedScoreFloor", "reviewCoverage", "schemaVersion", "slots", "sourceCounts",
       ])
-      expect(initialReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v1",
+      expect(initialReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v2",
         finalItemId, graphRevision: graphRow.revision, reviewCoverage: "complete" })
+      expect(initialReport.reportedScoreFloor).toEqual({ status: "not_requested" })
       const expectedSourceCounts = jsonRecord(jsonRecord(finalContent?.objectiveTailorFinalOutcomes)?.sourceCounts)
         ?? { discoveredJobs: { knownCount: null, coverage: "unavailable" }, analyzedJobs: { knownCount: null, coverage: "unavailable" } }
       expect(initialReport.sourceCounts).toEqual(expectedSourceCounts)
@@ -4553,10 +4554,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const journeyReport = jsonRecord(journeyReportEnvelope.report)
       if (!journeyReport) throw new Error("Objective journey review report is unavailable")
       expect(Object.keys(journeyReport).sort()).toEqual([
-        "finalItemId", "graphRevision", "reviewCoverage", "schemaVersion", "slots", "sourceCounts",
+        "finalItemId", "graphRevision", "reportedScoreFloor", "reviewCoverage", "schemaVersion", "slots", "sourceCounts",
       ])
-      expect(journeyReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v1",
+      expect(journeyReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v2",
         finalItemId, graphRevision: graphRow.revision, sourceCounts: expectedSourceCounts, reviewCoverage: "complete" })
+      expect(journeyReport.reportedScoreFloor).toEqual({ status: "not_requested" })
       const journeySlots = Array.isArray(journeyReport.slots) ? journeyReport.slots.map(jsonRecord) : []
       expect(journeySlots).toHaveLength(8)
       expect(journeySlots.map(slot => [slot?.ordinal, slot?.tailoringStatus, slot?.reviewStatus,
