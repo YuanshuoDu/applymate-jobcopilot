@@ -1,4 +1,5 @@
 export const OBJECTIVE_JOURNEY_REPORT_SCHEMA = "agent-harness.v2.objective-journey-report.v1" as const
+export const OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2 = "agent-harness.v2.objective-journey-report.v2" as const
 
 export const OBJECTIVE_JOURNEY_TAILORING_STATUSES = ["ready", "needs_revision", "rejected", "stale", "failed"] as const
 export const OBJECTIVE_JOURNEY_REVIEW_STATUSES = ["not_requested", "pending", "approved", "rejected", "expired", "unknown"] as const
@@ -7,14 +8,24 @@ export const OBJECTIVE_JOURNEY_RETIREMENT_REASONS = ["approval_ttl_reached", "ap
 const COVERAGES = ["complete", "partial", "unavailable", "not_requested"] as const
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
 
-export type ObjectiveJourneyReport = Readonly<{
-  schemaVersion: typeof OBJECTIVE_JOURNEY_REPORT_SCHEMA
+type ReportFields = Readonly<{
   finalItemId: string
   graphRevision: number
   sourceCounts: Readonly<{ discoveredJobs: Count; analyzedJobs: Count }>
   reviewCoverage: "complete" | "partial" | "unavailable"
   slots: readonly Slot[]
 }>
+export type ObjectiveJourneyReportedScoreFloor = Readonly<
+  | { status: "not_requested" }
+  | { status: "unavailable" }
+  | { status: "complete"; minimumScore: number; qualifyingJobCount: number }
+>
+export type ObjectiveJourneyReportV1 = ReportFields & Readonly<{ schemaVersion: typeof OBJECTIVE_JOURNEY_REPORT_SCHEMA }>
+export type ObjectiveJourneyReportV2 = ReportFields & Readonly<{
+  schemaVersion: typeof OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2
+  reportedScoreFloor: ObjectiveJourneyReportedScoreFloor
+}>
+export type ObjectiveJourneyReport = ObjectiveJourneyReportV1 | ObjectiveJourneyReportV2
 type Coverage = typeof COVERAGES[number]
 type Count = Readonly<{ knownCount: number | null; coverage: Coverage }>
 type Slot = Readonly<{
@@ -31,8 +42,12 @@ type Slot = Readonly<{
 /** Accepts only the bounded owner-facing report DTO; it carries no proof or mutation authority. */
 export function parseObjectiveJourneyReport(value: unknown): ObjectiveJourneyReport | undefined {
   const row = record(value)
-  if (!row || !exact(row, "finalItemId,graphRevision,reviewCoverage,schemaVersion,slots,sourceCounts")
-    || row.schemaVersion !== OBJECTIVE_JOURNEY_REPORT_SCHEMA || !id(row.finalItemId) || !positive(row.graphRevision)
+  const v1 = row?.schemaVersion === OBJECTIVE_JOURNEY_REPORT_SCHEMA
+  const v2 = row?.schemaVersion === OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2
+  if (!row || !v1 && !v2 || !exact(row, v1
+    ? "finalItemId,graphRevision,reviewCoverage,schemaVersion,slots,sourceCounts"
+    : "finalItemId,graphRevision,reportedScoreFloor,reviewCoverage,schemaVersion,slots,sourceCounts")
+    || !id(row.finalItemId) || !positive(row.graphRevision)
     || !oneOf(row.reviewCoverage, ["complete", "partial", "unavailable"])) return undefined
   const counts = record(row.sourceCounts), slots = dense(row.slots)
   if (!counts || !exact(counts, "analyzedJobs,discoveredJobs") || !slots) return undefined
@@ -50,9 +65,22 @@ export function parseObjectiveJourneyReport(value: unknown): ObjectiveJourneyRep
     parsed.push(slot)
   }
   if (row.reviewCoverage === "complete" && parsed.some(slot => slot.reviewStatus === "unknown")) return undefined
-  return { schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA, finalItemId: row.finalItemId,
+  const common = { finalItemId: row.finalItemId,
     graphRevision: Number(row.graphRevision), sourceCounts: { discoveredJobs, analyzedJobs },
     reviewCoverage: row.reviewCoverage, slots: parsed }
+  if (v1) return { schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA, ...common }
+  const reportedScoreFloor = parseReportedScoreFloor(row.reportedScoreFloor, analyzedJobs)
+  return reportedScoreFloor ? { schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2, ...common, reportedScoreFloor } : undefined
+}
+
+function parseReportedScoreFloor(value: unknown, analyzed: Count): ObjectiveJourneyReportedScoreFloor | undefined {
+  const row = record(value)
+  if (!row || !oneOf(row.status, ["complete", "unavailable", "not_requested"])) return undefined
+  if (row.status !== "complete") return exact(row, "status") ? { status: row.status } : undefined
+  return exact(row, "minimumScore,qualifyingJobCount,status") && finiteScore(row.minimumScore)
+    && nonnegative(row.qualifyingJobCount) && analyzed.coverage === "complete"
+    && analyzed.knownCount !== null && row.qualifyingJobCount <= analyzed.knownCount
+    ? { status: "complete", minimumScore: row.minimumScore, qualifyingJobCount: row.qualifyingJobCount } : undefined
 }
 
 function parseSlot(value: unknown, ordinal: number, sourceFinalItemId: string): Slot | undefined {
@@ -138,3 +166,4 @@ function idText(value: unknown, limit: number): value is string {
 }
 function positive(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
 function nonnegative(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
+function finiteScore(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 10 }

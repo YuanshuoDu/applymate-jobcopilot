@@ -1,12 +1,16 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA as schema,
   OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA as schemaV2,
+  OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA as schemaV3,
 } from '@jobcopilot/agent-protocol'
 import { buildObjectiveApplicationReviewSelection, objectiveReviewCommandKeyForIntent, ObjectiveTailorFinalOutcomes } from './ObjectiveTailorFinalOutcomes'
+
+const reportApi = vi.hoisted(() => ({ state: { data: null as unknown, loading: false, error: null as unknown, refetch: vi.fn() } }))
+vi.mock('@/lib/hooks', () => ({ useApi: () => reportApi.state }))
 
 const sidecar = { schemaVersion: schema, slots: [
   { ordinal: 1, status: 'ready' }, { ordinal: 2, status: 'needs_revision' }, { ordinal: 3, status: 'ready' },
@@ -76,6 +80,24 @@ describe('ObjectiveTailorFinalOutcomes', () => {
     expect(en).toContain('Not requested')
     expect(zh).toContain('不可用')
     expect(zh).toContain('未请求')
+  })
+
+  it('binds V3 floor evidence to the matching report while preserving slots', () => {
+    const sourceCounts = { discoveredJobs: { knownCount: 3, coverage: 'complete' as const },
+      analyzedJobs: { knownCount: 3, coverage: 'complete' as const } }
+    const floor = { status: 'not_requested' as const }
+    const v3 = { schemaVersion: schemaV3, graphRevision: 9, slots: sidecar.slots, sourceCounts, reportedScoreFloor: floor }
+    const reportSlots = sidecar.slots.map(slot => ({ ordinal: slot.ordinal, tailoringStatus: slot.status, job: null,
+      reviewStatus: 'not_requested' as const, reviewTurnId: null, retirementReason: null,
+      applicationStatus: 'not_started' as const, submissionEvidence: null }))
+    reportApi.state = { data: { report: { schemaVersion: 'agent-harness.v2.objective-journey-report.v2', finalItemId: 'final-item',
+      graphRevision: 9, sourceCounts, reviewCoverage: 'complete', reportedScoreFloor: floor, slots: reportSlots } },
+      loading: false, error: null, refetch: vi.fn() }
+    const html = renderToStaticMarkup(<ObjectiveTailorFinalOutcomes content={{ objectiveTailorFinalOutcomes: v3,
+      taskGraphSources: manifest }} lang="en" {...reviewProps} finalItemId="final-item" />)
+    expect(html).toContain('Analyst-reported score floor')
+    expect(html).toContain('Not requested')
+    expect(html).toContain('Job 2: Needs revision')
   })
 
   it('hides malformed sidecars and does not render private extra fields', () => {

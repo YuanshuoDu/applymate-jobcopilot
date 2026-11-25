@@ -2,7 +2,7 @@
 
 import React, { useRef, useState } from 'react'
 import {
-  OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA, OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
+  OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA, OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA,
   parseObjectiveApplicationReviewIntent, sha256Hex,
   type ObjectiveTailorFinalOutcomeSidecarStatus, type ObjectiveTailorFinalOutcomeSidecarV2,
 } from '@jobcopilot/agent-protocol'
@@ -77,12 +77,15 @@ export function ObjectiveTailorFinalOutcomes({ content, lang, sessionId, sourceT
 
   if (!sidecar) return null
   const status = requestState?.identity === identity ? requestState.status : null
-  const v2Sidecar = sidecar.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA ? sidecar : undefined
-  const sourceCounts = v2Sidecar?.sourceCounts
-  const journeyReport = manifest && (!v2Sidecar || v2Sidecar.graphRevision === manifest.graphRevision)
+  const versionedSidecar = "sourceCounts" in sidecar ? sidecar : undefined
+  const v3Sidecar = sidecar.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA ? sidecar : undefined
+  const sourceCounts = versionedSidecar?.sourceCounts
+  const reportedScoreFloor = v3Sidecar?.reportedScoreFloor
+  const journeyReport = manifest && (!versionedSidecar || versionedSidecar.graphRevision === manifest.graphRevision)
     && safeId(sessionId) && safeId(finalItemId)
     ? <ObjectiveJourneyReport sessionId={sessionId} finalItemId={finalItemId} graphRevision={manifest.graphRevision}
-      sourceCounts={sourceCounts} slots={sidecar.slots.map(slot => ({ ordinal: slot.ordinal, tailoringStatus: slot.status }))}
+      sourceCounts={sourceCounts} reportedScoreFloor={reportedScoreFloor}
+      slots={sidecar.slots.map(slot => ({ ordinal: slot.ordinal, tailoringStatus: slot.status }))}
       lang={lang} enabled={expanded} />
     : null
   return <details aria-label={copy.heading} data-agent-objective-tailor-final-outcomes='true'

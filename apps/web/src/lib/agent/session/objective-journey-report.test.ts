@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2 } from "./objective-journey-report-contract"
 import { readObjectiveJourneyReport } from "./objective-journey-report"
 
 const mocks = vi.hoisted(() => ({
@@ -39,11 +40,21 @@ describe("readObjectiveJourneyReport", () => {
 
   it("composes slot facts from the same repeatable snapshot and exposes only confirmed evidence", async () => {
     const report = await readObjectiveJourneyReport({ userId: "user-1", sessionId: "session-1", finalItemId: "final-1" })
+    expect(report?.schemaVersion).not.toBe(OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2)
     expect(report).toMatchObject({ graphRevision: 12, reviewCoverage: "partial", slots: [
       { ordinal: 1, reviewStatus: "approved", applicationStatus: "submitted", submissionEvidence: { fillTurnId: "fill-1", finalItemId: "submit-final" } },
       { ordinal: 2, tailoringStatus: "stale", reviewStatus: "unknown", applicationStatus: "unknown", job: null },
     ] })
     expect(mocks.application.mock.calls.map(call => call[1])).toEqual([binding])
+  })
+
+  it("carries a verified V3 complete floor into report V2, including numeric zero", async () => {
+    mocks.source.mockResolvedValue({ ...source, sourceCounts: { ...source.sourceCounts,
+      analyzedJobs: { knownCount: 6, coverage: "complete" } },
+      reportedScoreFloor: { status: "complete", minimumScore: 0, qualifyingJobCount: 0 } })
+    const report = await readObjectiveJourneyReport({ userId: "user-1", sessionId: "session-1", finalItemId: "final-1" })
+    expect(report).toMatchObject({ schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2,
+      reportedScoreFloor: { status: "complete", minimumScore: 0, qualifyingJobCount: 0 } })
   })
 
   it("fails closed on sparse, reordered, or duplicated slot projections", async () => {

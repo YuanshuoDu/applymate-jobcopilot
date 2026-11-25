@@ -14,7 +14,8 @@ vi.mock('@/lib/hooks', () => ({
   },
 }))
 
-import { OBJECTIVE_JOURNEY_REPORT_SCHEMA } from '@/lib/agent/session/objective-journey-report-contract'
+import { OBJECTIVE_JOURNEY_REPORT_SCHEMA, OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2,
+  type ObjectiveJourneyReport as JourneyReport } from '@/lib/agent/session/objective-journey-report-contract'
 import {
   buildObjectiveJourneyReportUrl,
   focusObjectiveFillEvidence,
@@ -27,6 +28,8 @@ const sourceCounts = {
   analyzedJobs: { knownCount: 3, coverage: 'partial' as const },
 }
 const slots = [{ ordinal: 1, tailoringStatus: 'ready' as const }, { ordinal: 2, tailoringStatus: 'stale' as const }]
+const completeSourceCounts = { discoveredJobs: { knownCount: 4, coverage: 'complete' as const },
+  analyzedJobs: { knownCount: 3, coverage: 'complete' as const } }
 const journey = {
   schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA, finalItemId: identity.finalItemId, graphRevision: identity.graphRevision,
   sourceCounts, reviewCoverage: 'partial', slots: [
@@ -38,9 +41,11 @@ const journey = {
       submissionEvidence: null },
   ],
 }
+const floor = { status: 'complete' as const, minimumScore: 7.5, qualifyingJobCount: 0 }
+const journeyWithFloor = { ...journey, schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2, sourceCounts: completeSourceCounts, reportedScoreFloor: floor }
 
-function view() {
-  return <ObjectiveJourneyReport {...identity} sourceCounts={sourceCounts} slots={slots} lang="en" />
+function view(reportedScoreFloor?: typeof floor | { status: 'not_requested' | 'unavailable' }, counts: JourneyReport['sourceCounts'] = sourceCounts) {
+  return <ObjectiveJourneyReport {...identity} sourceCounts={counts} reportedScoreFloor={reportedScoreFloor} slots={slots} lang="en" />
 }
 
 describe('ObjectiveJourneyReport', () => {
@@ -83,6 +88,30 @@ describe('ObjectiveJourneyReport', () => {
     expect(html).toContain('data-objective-journey-report="available"')
     expect(html).toContain('Example Company — Engineer')
     expect(html).toContain('Submission confirmed with verified fill evidence.')
+  })
+
+  it('shows the inclusive Analyst-reported floor and preserves a complete zero count', () => {
+    api.state = { data: { report: journeyWithFloor }, loading: false, error: null, refetch: vi.fn() }
+    const html = renderToStaticMarkup(view(floor, completeSourceCounts))
+    expect(html).toContain('Analyst-reported score floor')
+    expect(html).toContain('≥ 7.5: 0 qualifying jobs')
+    expect(html).not.toContain('Not requested')
+  })
+
+  it('renders requested and unavailable floor states without inventing a count', () => {
+    for (const value of [{ status: 'not_requested' as const }, { status: 'unavailable' as const }]) {
+      api.state = { data: { report: { ...journey, schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2,
+        reportedScoreFloor: value } }, loading: false, error: null, refetch: vi.fn() }
+      const html = renderToStaticMarkup(view(value))
+      expect(html).toContain(value.status === 'not_requested' ? 'Not requested' : 'Unavailable')
+      expect(html).not.toContain('qualifying jobs')
+    }
+  })
+
+  it('hides a report when the expected V3 floor differs from its server report', () => {
+    api.state = { data: { report: { ...journeyWithFloor, reportedScoreFloor: { status: 'not_requested' } } },
+      loading: false, error: null, refetch: vi.fn() }
+    expect(renderToStaticMarkup(view(floor))).toContain('data-objective-journey-report="unavailable"')
   })
 
   it('shows observed confirmations and an unresolved count when some application states are unknown', () => {
