@@ -17,6 +17,7 @@ type Row = Record<string, unknown>
 export type ScheduledDraftAnalystProof = Readonly<{
   result: AnalystResult
   materialDigests: ReadonlyMap<string, string>
+  evidenceIds: readonly string[]
   binding: Readonly<{ nodeKey: string; taskId: string; attemptCount: number; resultDigest: string; evidenceDigest: string;
     reportDigest: string; scouts: readonly TaskGraphVerificationDependencyBinding[] }>
 }>
@@ -60,10 +61,11 @@ export async function readScheduledDraftAnalystProof(client: Queryable, scope: G
     || proof.report.evidenceDigest !== report.evidenceDigest || proof.report.resultDigest !== report.resultDigest
     || taskGraphResultDigest(result) !== report.resultDigest) return null
   const binding = { nodeKey: node.key, taskId: node.taskId, attemptCount: Number(task.attemptCount), resultDigest: proof.report.resultDigest!,
-    evidenceDigest: proof.report.evidenceDigest!, reportDigest: digest(report), scouts: [...scouts.bindings].sort((a, b) => compareBytesText(a.nodeKey, b.nodeKey)) }
+    evidenceDigest: proof.report.evidenceDigest!, reportDigest: digest(report),
+    scouts: [...scouts.bindings].sort((a, b) => compareBytesText(a.nodeKey, b.nodeKey)) }
   const materialDigests = await readScheduledDraftJobMaterialDigests(client,
     { ...scope, taskId: node.taskId, attemptCount: Number(task.attemptCount) }, result.findings.map(finding => finding.jobId))
-  return { result, materialDigests, binding }
+  return { result, materialDigests, binding, evidenceIds: [...proof.projection.evidenceIds] }
 }
 
 function parseCompletedEnvelope(value: unknown): { structuredResult: unknown; report: unknown } | undefined {
