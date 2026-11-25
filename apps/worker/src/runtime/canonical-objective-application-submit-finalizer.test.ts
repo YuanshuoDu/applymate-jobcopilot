@@ -117,6 +117,48 @@ describe("finalizeCanonicalObjectiveApplicationSubmit", () => {
     expect(fixture.executionProjection.start).toHaveBeenCalledOnce()
   })
 
+  it("passes a valid selected-job source marker to ordinary Fill setup", async () => {
+    const db = poolFor([]), fixture = input(db.pool, { clientMessageId: "application-fill:task:turn",
+      reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source-turn-1" } })
+    await expect(finalizeCanonicalObjectiveApplicationSubmit(fixture.value as never)).resolves.toBeUndefined()
+    expect(db.pool.connect).not.toHaveBeenCalled()
+    expect(fixture.rootTasks.ensure).not.toHaveBeenCalled()
+  })
+
+  it("fails closed on whitespace or accessor-backed selected-job source fields", async () => {
+    const malformed = Object.defineProperty({ schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1" },
+      "sourceTurnId", { enumerable: true, get: () => "source-turn-1" })
+    for (const selectedSource of [
+      { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: " source-turn-1 " },
+      malformed,
+    ]) {
+      const db = poolFor([]), fixture = input(db.pool, { clientMessageId: "application-fill:task:turn",
+        reviewedApplicationMaterialSource: selectedSource })
+      await expect(finalizeCanonicalObjectiveApplicationSubmit(fixture.value as never)).resolves.toMatchObject({
+        status: "waiting_for_user", summary: "objective_submit_finalization_unavailable",
+      })
+      expect(fixture.rootTasks.finish).toHaveBeenCalledOnce()
+    }
+  })
+
+  it("fails closed when a reserved Objective key carries a selected-job marker", async () => {
+    const db = poolFor([]), fixture = input(db.pool, { clientMessageId: "agent-objective-reviewed-fill:approval",
+      reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source-turn-1" } })
+    await expect(finalizeCanonicalObjectiveApplicationSubmit(fixture.value as never)).resolves.toMatchObject({
+      status: "waiting_for_user", summary: "objective_submit_finalization_unavailable",
+    })
+    expect(fixture.rootTasks.finish).toHaveBeenCalledOnce()
+  })
+
+  it("fails closed on an unknown reserved Objective source schema", async () => {
+    const db = poolFor([]), fixture = input(db.pool, { clientMessageId: "agent-objective-reviewed-fill:approval",
+      reviewedApplicationMaterialSource: { ...source, schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v99" } })
+    await expect(finalizeCanonicalObjectiveApplicationSubmit(fixture.value as never)).resolves.toMatchObject({
+      status: "waiting_for_user", summary: "objective_submit_finalization_unavailable",
+    })
+    expect(fixture.rootTasks.finish).toHaveBeenCalledOnce()
+  })
+
   it("does not reinterpret ordinary user Turns as Objective submit finalization", async () => {
     const db = poolFor(), fixture = input(db.pool, { goal: "ordinary" })
     await expect(finalizeCanonicalObjectiveApplicationSubmit(fixture.value as never)).resolves.toBeUndefined()

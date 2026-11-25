@@ -1,5 +1,5 @@
 import type { Pool, PoolClient } from "pg"
-import { parseObjectiveReviewedFillSource } from "@jobcopilot/shared"
+import { parseObjectiveReviewedFillSource, parseReviewedApplicationFillSource } from "@jobcopilot/shared"
 import type { ApplicationSubmissionExecution } from "../queue/application-submit-fence.js"
 import { projectObjectiveSessionAfterFillTerminal } from "../db/application-task-state.js"
 import {
@@ -241,7 +241,9 @@ function objectiveMarker(value: unknown): ObjectiveMarker {
     const reservedKey = !!key && Object.hasOwn(key, "value") && typeof key.value === "string"
       && key.value.startsWith(OBJECTIVE_FILL_KEY_PREFIX)
     if (!marker && !reservedKey) return "absent"
-    if (!marker?.enumerable || !Object.hasOwn(marker, "value") || !parseObjectiveReviewedFillSource(value)) return "invalid"
-    return "valid"
+    if (!marker?.enumerable || !Object.hasOwn(marker, "value")) return "invalid"
+    if (reservedKey) return parseObjectiveReviewedFillSource(value) ? "valid" : "invalid"
+    if (parseObjectiveReviewedFillSource(value)) return "valid"
+    return parseReviewedApplicationFillSource(value).kind === "selected" ? "absent" : "invalid"
   } catch { return "invalid" }
 }
