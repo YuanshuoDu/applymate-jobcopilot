@@ -2,6 +2,8 @@ import { createHash } from "node:crypto"
 import { canonicalTaskGraphReceiptJson } from "./task-graph-receipt-json.js"
 
 export { canonicalTaskGraphReceiptJson } from "./task-graph-receipt-json.js"
+export { validateTaskGraphVerificationItems, type TaskGraphVerificationItemsScope } from "./task-graph-verification-items.js"
+export { restoreToolCallState, type TaskGraphPersistedToolCallRecovery, type TaskGraphToolObservation, type TaskGraphToolResult } from "./task-graph-persisted-tool-call-state.js"
 
 type Row = Record<string, unknown>
 export type TaskGraphToolVerificationScope = Readonly<{

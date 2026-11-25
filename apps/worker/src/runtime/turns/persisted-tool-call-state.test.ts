@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { restoreToolCallState as restoreSharedToolCallState } from "@jobcopilot/shared/task-graph-tool-receipt-verification"
 
 import { restoreToolCallState } from "./persisted-tool-call-state.js"
 
@@ -22,9 +23,12 @@ function legacyFailure(phase: "failed" | "cancelled" = "failed") {
 
 describe("restoreToolCallState", () => {
   it("returns an unfinished persisted call for registry-based restart recovery", () => {
-    const restored = restoreToolCallState([
+    const items = [
       { id: "call-item", stepId: "step-0", type: "tool_call", status: "started", revision: 0, content: { toolCallId: "call-1", toolName: "jobs.search", input: { location: "Dublin" } } },
-    ], [{ type: "tool_call.started", payload: { toolCallId: "call-1", toolName: "jobs.search" } }])
+    ]
+    const events = [{ type: "tool_call.started", payload: { toolCallId: "call-1", toolName: "jobs.search" } }]
+    const restored = restoreToolCallState(items, events)
+    expect(restored).toEqual(restoreSharedToolCallState(items, events))
 
     expect(restored.pending).toEqual([{
       call: { id: "call-1", name: "jobs.search", arguments: { location: "Dublin" } }, toolVersion: "1", stepId: "step-0",
