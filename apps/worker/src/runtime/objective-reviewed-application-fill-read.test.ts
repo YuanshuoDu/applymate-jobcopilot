@@ -112,10 +112,25 @@ describe("Objective reviewed application Fill reader", () => {
     expect(result).toMatchObject({ source, approvedIntent, proof, resumeWitness, resumeContent: material.content,
       reviewedArtifact: { sourceTurnId, rootTaskId: sourceRootId, graphRevision, jobId, content: draft } })
     expect(mocks.readSource).toHaveBeenCalledWith(test.client, expect.objectContaining({ reviewTurnMode: "completed",
-      selectedSlotIds: ["tailor-2"], graphRevision, graphItemId, rootTaskId: sourceRootId }))
+      selectedSlotIds: ["tailor-2", "tailor-4"], evidenceSlotId: "tailor-2", graphRevision, graphItemId, rootTaskId: sourceRootId }))
     expect(mocks.readResume).toHaveBeenCalledWith(test.client, { userId, jobId })
     expect(test.calls[0]?.values).toEqual([applicationTaskId, userId, sessionId, jobId, approvalId])
     expect(JSON.stringify(result)).toContain(draft)
+  })
+
+  it("selects the exact authorized outcome instead of the first sibling result", async () => {
+    const test = fixture()
+    mocks.readSource.mockResolvedValueOnce({ sourceTurnId, reviewTurnId, sourceRootTaskId: sourceRootId, graphItemId,
+      graphRevision, finalItemId: "final-source", outcomes: [
+        { slotId: "tailor-4", jobId: "job-4", writerTaskId: "writer-task-4", reviewerTaskId: "reviewer-task-4", status: "stale" },
+        { slotId: "tailor-2", jobId, writerTaskId: proof.source.writerTaskId, reviewerTaskId: proof.source.reviewerTaskId,
+          status: "ready", artifactRef: { artifactId, version, contentHash, sourceDigest },
+          reviewReceipt: { taskId: proof.source.reviewerTaskId, status: "passed", artifactId, version, contentHash,
+            sourceDigest, currentSourceDigest: sourceDigest, toolCallId: proof.source.reviewerToolCallId, reviewHash: proof.source.reviewHash } },
+      ] })
+    await expect(readObjectiveReviewedApplicationFillSource(test.client, input())).resolves.toMatchObject({ source, reviewedArtifact: { content: draft } })
+    expect(mocks.readSource).toHaveBeenCalledWith(test.client, expect.objectContaining({
+      selectedSlotIds: ["tailor-2", "tailor-4"], evidenceSlotId: "tailor-2" }))
   })
 
   it.each(["prepare", "browser_start"] as const)("accepts the exact waiting parent Turn during %s", async phase => {

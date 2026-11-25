@@ -34,6 +34,12 @@ const inventory = { graphRevision: 6, sourceNodeCount: 2, sourceGraphRevision: 2
   sourceSnapshot: { schemaVersion: "agent-harness.v2.task-graph.v1", nodes }, occupiedSlots: marker.slots.map((slot, index) => ({
     ...slot, jobId: `job-${index + 1}`, writerTaskId: `writer-row-${index + 1}`, reviewerTaskId: `reviewer-row-${index + 1}`, candidateWitness: {},
   })), occupiedJobIds: ["job-1", "job-2"], marker } as unknown as ObjectiveTailorWaveInventory
+const gappedOrdinals = [1, 2, 4, 5, 6, 7] as const
+const gappedMarker = { ...marker, slots: Array.from({ length: 8 }, (_, index) => ({ ...marker.slots[0]!,
+  slotId: `tailor-${index + 1}`, writerNodeKey: `writer-${index + 1}`, reviewerNodeKey: `reviewer-${index + 1}` })) }
+const gappedInventory = { ...inventory, marker: gappedMarker, occupiedSlots: gappedMarker.slots.map((slot, index) => ({
+  ...slot, jobId: `job-${index + 1}`, writerTaskId: `writer-row-${index + 1}`, reviewerTaskId: `reviewer-row-${index + 1}`, candidateWitness: {},
+})), occupiedJobIds: Array.from({ length: 8 }, (_, index) => `job-${index + 1}`) } as unknown as ObjectiveTailorWaveInventory
 const witness = { graphRevision: 6, graphDigest: "c".repeat(64), marker, sourceGraphRevision: 2, sourceGraphDigest: "a".repeat(64), sourceStatusDigest: "b".repeat(64), outcomes: [] } as unknown as ObjectiveTailorWaveCompletionWitness
 function outcome(ordinal: number, status: ObjectiveTailorWaveSlotOutcome["status"] = "ready"): ObjectiveTailorWaveSlotOutcome {
   return { slotId: `tailor-${ordinal}`, jobId: `job-${ordinal}`, writerTaskId: `writer-row-${ordinal}`,
@@ -67,7 +73,9 @@ function makeClient(overrides: { reviewStatus?: string; sourceStatus?: string; s
   })
   return { client: { query } as unknown as PoolClient, query }
 }
-function input(selectedSlotIds: string[] = ["tailor-1"]) { return { ...ids, selectedSlotIds } }
+function input(selectedSlotIds: string[] = ["tailor-1"], evidenceSlotId?: string) {
+  return { ...ids, selectedSlotIds, ...(evidenceSlotId ? { evidenceSlotId } : {}) }
+}
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -108,6 +116,34 @@ describe("completed Objective Tailor source reader", () => {
       selection: { ...reviewInput.intent.selection, graphRevision: ids.graphRevision - 1 } } } })
     await expect(readCompletedObjectiveTailorSourceEvidence(changedSelection.client, { ...input(), reviewTurnMode: "completed" }))
       .resolves.toBeUndefined()
+  })
+
+  it("keeps full gapped selection lineage but rechecks only the exact authorized completed slot", async () => {
+    const slotOrdinals = [...gappedOrdinals], reviewInput = { intent: { kind: "objective_application_review", version: 1, selection: {
+      schema: OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA, sourceTurnId: ids.sourceTurnId, rootTaskId: ids.rootTaskId,
+      graphItemId: ids.graphItemId, graphRevision: ids.graphRevision, slotOrdinals,
+    } } }
+    const statuses = ["ready", "ready", "rejected", "ready", "ready", "ready", "ready", "rejected"]
+    const { client } = makeClient({ reviewStatus: "completed", reviewInput, content: finalContent(statuses) })
+    mocks.inventory.mockResolvedValueOnce(gappedInventory)
+    mocks.verify.mockResolvedValueOnce({ status: "ready", outcomes: [outcome(4)], witness })
+    await expect(readCompletedObjectiveTailorSourceEvidence(client, { ...input(slotOrdinals.map(value => `tailor-${value}`), "tailor-4"),
+      reviewTurnMode: "completed" })).resolves.toMatchObject({ outcomes: [{ slotId: "tailor-4", status: "ready" }] })
+    expect(mocks.verify).toHaveBeenCalledWith(expect.objectContaining({ selectedSlotIds: ["tailor-4"] }))
+  })
+
+  it("rejects an unselected evidence slot, changed full order, or active-mode override", async () => {
+    const ordinals = [...gappedOrdinals], reviewInput = { intent: { kind: "objective_application_review", version: 1, selection: {
+      schema: OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA, sourceTurnId: ids.sourceTurnId, rootTaskId: ids.rootTaskId,
+      graphItemId: ids.graphItemId, graphRevision: ids.graphRevision, slotOrdinals: ordinals,
+    } } }
+    const { client } = makeClient({ reviewStatus: "completed", reviewInput, content: finalContent(Array(8).fill("ready")) })
+    for (const request of [
+      { ...input(ordinals.map(value => `tailor-${value}`), "tailor-3"), reviewTurnMode: "completed" as const },
+      { ...input(["tailor-1", "tailor-2", "tailor-4"], "tailor-4"), reviewTurnMode: "completed" as const },
+      input(["tailor-1"], "tailor-1"),
+    ]) await expect(readCompletedObjectiveTailorSourceEvidence(client, request)).resolves.toBeUndefined()
+    expect(mocks.verify).not.toHaveBeenCalled()
   })
 
   it.each([
