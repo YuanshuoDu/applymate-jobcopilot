@@ -131,8 +131,54 @@ describe('HarnessItem renderers', () => {
     expect(final).toContain('data-agent-objective-tailor-final-outcomes="true"')
     expect(final).toContain('Job 1: Ready')
     expect(final).toContain('Request application review')
+    expect(final).not.toContain('View related task evidence')
     expect(running).not.toContain('data-agent-objective-tailor-final-outcomes')
     expect(commentary).not.toContain('data-agent-objective-tailor-final-outcomes')
+  })
+
+  it('pairs per-card source links with unique UI targets when an item is rendered twice', () => {
+    const content = { text: 'Answer', objectiveTailorFinalOutcomes: {
+      schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA, graphRevision: 2,
+      slots: [{ ordinal: 1, status: 'ready' }], sourceCounts: {
+        discoveredJobs: { knownCount: 1, coverage: 'complete' },
+        analyzedJobs: { knownCount: 1, coverage: 'complete' },
+      },
+    }, taskGraphSources: { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision: 2, sources: [
+      { sourceKey: 'src_' + 'D'.repeat(43), nodeIndex: 0, role: 'analyst', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed' },
+    ] } }
+    const duplicate = item({ id: 'same-final-item', sessionId: 'session-1', turnId: 'source-turn-1', taskId: 'root-1',
+      phase: 'final_answer', content })
+    const html = renderToStaticMarkup(<I18nProvider><><HarnessItem item={duplicate} /><HarnessItem item={duplicate} /></></I18nProvider>)
+    const links = [...html.matchAll(/<a href="#([^"]+)">View related task evidence<\/a>/g)].map(match => match[1])
+    const targets = [...html.matchAll(/<section\b([^>]*data-agent-related-task-sources="true"[^>]*)>/g)]
+      .map(match => /(?:^|\s)id="([^"]+)"/.exec(match[1]!)?.[1])
+    expect(links).toHaveLength(2)
+    expect(new Set(links).size).toBe(2)
+    expect(targets).toEqual(links)
+    expect(links.every(id => /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id!) && decodeURIComponent(id!) === id)).toBe(true)
+    expect(links.every(id => !id?.includes('same-final-item'))).toBe(true)
+  })
+
+  it('omits source navigation when source counts or their same-revision manifest are invalid', () => {
+    const sidecar = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA, graphRevision: 2,
+      slots: [{ ordinal: 1, status: 'ready' }], sourceCounts: {
+        discoveredJobs: { knownCount: 1, coverage: 'complete' }, analyzedJobs: { knownCount: 1, coverage: 'complete' },
+      } }
+    const sourceManifest = { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision: 2, sources: [
+      { sourceKey: 'src_' + 'E'.repeat(43), nodeIndex: 0, role: 'analyst', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed' },
+    ] }
+    const cases = [
+      { objectiveTailorFinalOutcomes: sidecar },
+      { objectiveTailorFinalOutcomes: sidecar, taskGraphSources: { ...sourceManifest, graphRevision: 1 } },
+      { objectiveTailorFinalOutcomes: sidecar, taskGraphSources: { ...sourceManifest, sources: [] } },
+      { objectiveTailorFinalOutcomes: { ...sidecar, graphRevision: 1 }, taskGraphSources: sourceManifest },
+      { objectiveTailorFinalOutcomes: sidecar, taskGraphSources: { ...sourceManifest, sources: [{ ...sourceManifest.sources[0], sourceKey: 'invalid' }] } },
+    ]
+    for (const content of cases) {
+      const html = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ id: 'final-card', phase: 'final_answer', content })} /></I18nProvider>)
+      expect(html).not.toContain('View related task evidence')
+      expect(html).not.toMatch(/data-agent-related-task-sources="true"[^>]*id="related-task-sources-/)
+    }
   })
 
   it('mounts the reloadable Objective journey reader from the persisted final-item identity', () => {
