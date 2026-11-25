@@ -54,6 +54,7 @@ type ProjectionBarrierInput = Readonly<{
 }>
 
 export type ObjectiveJobProjectionBarrier = Readonly<{
+  readWaiterCount(): Promise<number>
   waitUntilBlocked(): Promise<void>
   waitUntilUnblocked(): Promise<void>
   release(): Promise<void>
@@ -129,14 +130,16 @@ export async function installObjectiveJobProjectionBarrier(
     if (result.rows[0]?.released !== true) throw new Error("objective_wave_projection_barrier_lock_missing")
     released = true
   }
-  const waitForWaiters = (expected: 0 | 1) => waitForObjectiveProjectionWaiters(async () => {
+  const readWaiterCount = async () => {
     const result = await input.client.query(
       "SELECT count(*)::int AS waiters FROM pg_locks WHERE locktype='advisory' AND classid=(($1::bigint >> 32) & 4294967295)::oid AND objid=($1::bigint & 4294967295)::oid AND objsubid=1 AND NOT granted",
       [lockKey],
     )
     return Number(result.rows[0]?.waiters)
-  }, expected)
+  }
+  const waitForWaiters = (expected: 0 | 1) => waitForObjectiveProjectionWaiters(readWaiterCount, expected)
   return {
+    readWaiterCount,
     waitUntilBlocked: () => waitForWaiters(1),
     waitUntilUnblocked: () => waitForWaiters(0),
     release,

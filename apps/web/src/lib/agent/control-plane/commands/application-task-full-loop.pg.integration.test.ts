@@ -1747,7 +1747,7 @@ type SelectedJobFullLoopPhase = "cleanup_started" | "cleanup_completed" | "setup
   | "handoff_retry_wait_started" | "handoff_published" | "fill_turn_wait_started" | "fill_turn_created"
   | "objective_single_source_completed" | "objective_single_worker_ready" | "objective_single_review_started"
   | "objective_single_approval_pending" | "objective_single_approval_accepted" | "objective_single_handoff_published"
-  | "objective_single_fill_ready" | "objective_single_submit_approved" | "objective_single_completed"
+  | "objective_single_fill_ready" | "objective_single_submit_approved" | "objective_single_receipt_verified" | "objective_single_completed"
   | "objective_wave_source_ready" | "objective_wave_set_issued" | "objective_wave_stale_retired"
   | "objective_wave_five_decided" | "objective_wave_first_handoff" | "objective_wave_completed"
   | "fill_form_wait_started" | "fill_form_filled" | "final_checks_started" | "final_checks_completed"
@@ -4113,7 +4113,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(Object.keys(finalizationReceipt ?? {}).sort()).toEqual([
         "approvalId", "applicationTaskId", "applyResultId", "attemptId", "constraintHash", "executionId", "fillTurnId",
         "jobId", "resultLinkEventId", "schemaVersion", "sessionId", "userId", "workerTaskId",
-      ])
+      ].sort())
       expect(finalizationReceipt).toEqual({ schemaVersion: "agent-harness.v2.objective-application-submit-finalization-queued.v1",
         userId: ids.user, sessionId, jobId: selectedJobId, applicationTaskId, fillTurnId, approvalId: submitApproval.id,
         constraintHash: submitConstraintHash, workerTaskId: submitReceipt.workerTaskId, executionId: submitReceipt.executionId,
@@ -4128,6 +4128,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(closureStats.objectiveSubmitReceipts).toEqual(submittedStats.objectiveSubmitReceipts)
       expect(closureStats.submitCount).toBe(submittedStats.submitCount)
       expect(closureStats.reviewedSubmitCount).toBe(submittedStats.reviewedSubmitCount)
+      selectedJobFullLoopPhase("objective_single_receipt_verified")
       selectedJobFullLoopPhase("objective_single_completed")
     } finally {
       if (sourceWorker && worker === sourceWorker && !exited(sourceWorker)) {
@@ -4647,7 +4648,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         return { task, fillTurnId, approval, scopeHash, ...filler }
       }
       type ApprovedObjectiveSubmission = Awaited<ReturnType<typeof prepareFilledSlot>> & {
-        scopeHash: string; siteLineCursor: number
+        scopeHash: string; siteLineCursor: number; dispatchId: string
       }
       const approveFinalSubmission = async (slot: typeof submissionSlots[number], prepared: Awaited<ReturnType<typeof prepareFilledSlot>>) => {
         const freshToken = await signedBearer(userId)
@@ -4679,7 +4680,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         }
         const dispatch = await waitForOutboxPublished(dispatchId)
         if (dispatch.attemptCount !== 1 || !dispatch.publishedAt) throw new Error("Objective submit dispatch was not acknowledged once")
-        return { scopeHash: rotatedScopeHash, siteLineCursor }
+        return { scopeHash: rotatedScopeHash, siteLineCursor, dispatchId }
       }
       const completeSubmittedSlot = async (slot: typeof submissionSlots[number], handoff: ObjectiveWaveHandoffProof,
         prepared: ApprovedObjectiveSubmission, restartCount: 0 | 1) => {
@@ -4883,6 +4884,117 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
             if (!captured || exited(captured)) throw new Error("Objective pre-submit Worker is unavailable")
             let connection: InstanceType<typeof Client> | undefined
             let committed: { eventId: string; attemptId: string; applyResultId: number } | undefined
+            const captureWaitTimeout = async ({ waiterCount, workerAlive }: { waiterCount: number; workerAlive: boolean }):
+              Promise<Readonly<Record<string, string | number | boolean | null>>> => {
+              const boundaryApproval = approved
+              if (!boundaryApproval) return { available: false, waiterCount, workerAlive }
+              try {
+                const [task, turn, job, approval, attempts, resultEvents, executionEvents, browserStarts,
+                  submitDispatches, stats] = await Promise.all([
+                  testDb.applicationTask.findFirst({ where: { id: slot.applicationTaskId, userId, sessionId,
+                    jobId: slot.jobId, fillTurnId: prepared.fillTurnId }, select: {
+                    status: true, checkpoint: true, workerTaskId: true, fillTurnId: true,
+                  } }),
+                  testDb.agentTurn.findFirst({ where: { id: prepared.fillTurnId, userId, sessionId }, select: { status: true } }),
+                  testDb.job.findFirst({ where: { id: slot.jobId, userId }, select: { status: true, workflowState: true, appliedAt: true } }),
+                  testDb.agentApproval.findFirst({ where: { id: prepared.approval.id, userId, sessionId,
+                    turnId: prepared.fillTurnId, taskId: slot.applicationTaskId, jobId: slot.jobId,
+                    type: "submit_application" }, select: { status: true, scopeHash: true, resourceHash: true, consumedAt: true } }),
+                  testDb.submissionAttempt.findMany({ where: { userId, jobId: slot.jobId,
+                    receiptId: prepared.approval.id, constraintHash: boundaryApproval.scopeHash }, take: 3,
+                    select: { id: true, state: true, artifactHash: true, responseRef: true } }),
+                  testDb.applicationTaskEvent.findMany({ where: { taskId: slot.applicationTaskId,
+                    type: "objective_application_submit_result_recorded", actor: "worker" }, take: 3,
+                    select: { id: true, data: true } }),
+                  testDb.applicationTaskEvent.findMany({ where: { taskId: slot.applicationTaskId,
+                    type: { in: ["submission_execution_started", "submission_execution_settled"] }, actor: "worker" }, take: 5,
+                    select: { id: true, type: true, body: true, data: true } }),
+                  testDb.applicationTaskEvent.count({ where: { taskId: slot.applicationTaskId,
+                    type: "reviewed_application_fill_browser_started", actor: "worker" } }),
+                  testDb.agentOutbox.findMany({ where: { aggregateId: sessionId, topic: "application.submit.dispatch" },
+                    take: 12, select: { id: true, payload: true, publishedAt: true, attemptCount: true } }),
+                  requestFixtureStats(500).catch(() => null),
+                ])
+                const exactDispatches = submitDispatches.filter(row => jsonString(row.payload, "applicationTaskId") === slot.applicationTaskId
+                  && jsonString(row.payload, "constraintHash") === boundaryApproval.scopeHash
+                  && row.id === boundaryApproval.dispatchId)
+                const exactAttemptState = attempts.length === 1
+                  ? diagnosticSubmissionAttemptState(attempts[0]?.state) ?? "missing"
+                  : attempts.length === 0 ? "missing" : "other"
+                const resultData = resultEvents.length === 1 ? jsonRecord(resultEvents[0]?.data) : null
+                const resultKeys = ["applicationTaskId", "approvalId", "applyResultId", "attemptId", "constraintHash",
+                  "executionId", "fillTurnId", "jobId", "schemaVersion", "sessionId", "userId", "workerTaskId"].sort().join(",")
+                const expectedResultId = `objective-application-submit-result:${hashContent([
+                  slot.applicationTaskId, prepared.fillTurnId, prepared.approval.id,
+                ]).slice(7)}`
+                const exactResultReceipt = Boolean(resultData && Object.keys(resultData).sort().join(",") === resultKeys
+                  && resultEvents[0]?.id === expectedResultId
+                  && resultData.schemaVersion === "agent-harness.v2.objective-application-submit-result.v1"
+                  && resultData.applicationTaskId === slot.applicationTaskId && resultData.userId === userId
+                  && resultData.jobId === slot.jobId && resultData.sessionId === sessionId
+                  && resultData.fillTurnId === prepared.fillTurnId && resultData.approvalId === prepared.approval.id
+                  && resultData.constraintHash === boundaryApproval.scopeHash && resultData.workerTaskId === task?.workerTaskId
+                  && typeof resultData.executionId === "string" && typeof resultData.attemptId === "string"
+                  && Number.isSafeInteger(resultData.applyResultId))
+                const resultAttemptMatch = Boolean(exactResultReceipt && attempts.length === 1 && resultData
+                  && resultData.attemptId === attempts[0]?.id && attempts[0]?.state === "submitted"
+                  && attempts[0]?.artifactHash === approval?.resourceHash
+                  && typeof attempts[0]?.responseRef === "string")
+                const applyResult = exactResultReceipt && typeof resultData?.applyResultId === "number"
+                  ? await testDb.applyResult.findUnique({ where: { id: resultData.applyResultId }, select: {
+                    userId: true, jobId: true, mode: true, atsType: true, flowUsed: true, status: true, error: true,
+                  } })
+                  : null
+                const started = executionEvents.filter(event => event.type === "submission_execution_started")
+                const settled = executionEvents.filter(event => event.type === "submission_execution_settled")
+                const startData = started.length === 1 ? jsonRecord(started[0]?.data) : null
+                const startExecutionId = typeof startData?.executionId === "string" ? startData.executionId : ""
+                const exactStartMarker = Boolean(task && started.length === 1 && startExecutionId.length > 0
+                  && started[0]?.id === `evt_${startExecutionId}` && started[0]?.body === "Submit execution started"
+                  && startData?.applicationTaskId === slot.applicationTaskId && startData.userId === userId
+                  && startData.jobId === slot.jobId && startData.sessionId === sessionId
+                  && startData.fillTurnId === prepared.fillTurnId && startData.approvalId === prepared.approval.id
+                  && startData.constraintHash === boundaryApproval.scopeHash && startData.workerTaskId === task.workerTaskId)
+                const receipt = stats?.objectiveSubmitReceipts[slot.routeOrdinal - 1]
+                const lineMarker = `OBJECTIVE_SUBMIT_RECEIVED slot=${slot.routeOrdinal}`
+                const receiverLineCount = site && Number.isSafeInteger(boundaryApproval.siteLineCursor)
+                  ? Math.min(2, site.lines.slice(boundaryApproval.siteLineCursor).filter(line => line === lineMarker).length) : 0
+                const capped = (value: number | undefined) => Number.isSafeInteger(value) ? Math.min(2, Math.max(0, Number(value))) : null
+                const jobStatus = reviewedFillDiagnosticValue(job?.status, OBJECTIVE_JOB_DIAGNOSTIC_STATUSES)
+                const jobWorkflowState = reviewedFillDiagnosticValue(job?.workflowState, OBJECTIVE_JOB_DIAGNOSTIC_WORKFLOW_STATES)
+                return {
+                  available: true, waiterCount, workerAlive,
+                  taskStatus: task ? reviewedFillDiagnosticValue(task.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES) : "missing",
+                  taskCheckpoint: task ? reviewedFillDiagnosticValue(task.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS) : "missing",
+                  taskBindingMatches: Boolean(task && task.fillTurnId === prepared.fillTurnId
+                    && typeof task.workerTaskId === "string"),
+                  fillTurnStatus: turn ? reviewedFillDiagnosticValue(turn.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES) : "missing",
+                  jobStatus: job ? jobStatus : "missing", jobWorkflowState: job ? jobWorkflowState : "missing",
+                  jobProjectionStillPreSubmit: Boolean(job && job.status === "saved" && job.workflowState === "submitting" && job.appliedAt === null),
+                  submitOutboxCount: Math.min(2, exactDispatches.length),
+                  submitOutboxPublished: exactDispatches.length === 1 && exactDispatches[0]?.publishedAt instanceof Date
+                    && exactDispatches[0]?.attemptCount === 1,
+                  approvalConsumed: Boolean(approval?.status === "consumed" && approval.consumedAt instanceof Date
+                    && approval.scopeHash === boundaryApproval.scopeHash),
+                  attemptCount: Math.min(2, attempts.length), attemptState: exactAttemptState,
+                  resultAttemptMatch,
+                  browserStartCount: Math.min(2, browserStarts),
+                  resultReceiptCount: Math.min(2, resultEvents.length), exactResultReceipt,
+                  applyResultStatus: applyResult?.userId === userId && applyResult.jobId === slot.jobId
+                    && applyResult.mode === "unattended" && applyResult.atsType === "greenhouse"
+                    && applyResult.flowUsed === "application.submit" && applyResult.status === "submitted" && applyResult.error === null
+                    ? "submitted" : applyResult ? "other" : "missing",
+                  executionStartCount: Math.min(2, started.length), exactStartMarker,
+                  executionSettledCount: Math.min(2, settled.length),
+                  receiverAttempts: receipt ? capped(receipt.attempts - handoff.routePostAttemptsBefore) : null,
+                  receiverValid: receipt ? capped(receipt.validAttempts - handoff.routePostValidBefore) : null,
+                  receiverMalformed: receipt ? capped(receipt.malformedAttempts - handoff.routePostMalformedBefore) : null,
+                  receiverLineCount,
+                }
+              } catch {
+                return { available: false, waiterCount, workerAlive }
+              }
+            }
             try {
               const replacement = await restartObjectiveWorkerAtProjectionBarrier({
                 installBarrier: async () => {
@@ -4896,6 +5008,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
                 },
                 worker: captured,
                 waitForExit: waitExit,
+                captureWaitTimeout,
                 async assertCommittedResult(phase) {
                   if (!approved) throw new Error("Objective crash recovery omitted the approved submit attempt")
                   const next = await proveCommittedResult(slot, handoff, approved, phase, committed)

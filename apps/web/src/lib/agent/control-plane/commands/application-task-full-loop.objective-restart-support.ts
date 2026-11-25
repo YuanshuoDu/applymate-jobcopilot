@@ -17,6 +17,8 @@ type ProjectionRestartInput<Worker extends ObjectiveRestartWorker> = Readonly<{
   worker: Worker
   waitForExit(worker: Worker, timeoutMs: number): Promise<boolean>
   assertCommittedResult(phase: "blocked" | "crashed"): Promise<void>
+  captureWaitTimeout?(input: Readonly<{ waiterCount: number; workerAlive: boolean }>):
+    Promise<Readonly<Record<string, string | number | boolean | null>>>
   startExactlyOneWorker(): Worker
   waitUntilReady(worker: Worker, timeoutMs: number): Promise<void>
 }>
@@ -46,7 +48,22 @@ export async function restartObjectiveWorkerAtProjectionBarrier<Worker extends O
   try {
     barrier = await input.installBarrier()
     await input.publishFinalApproval()
-    await barrier.waitUntilBlocked()
+    try {
+      await barrier.waitUntilBlocked()
+    } catch (error) {
+      if (error instanceof Error && error.message === "objective_wave_projection_barrier_wait_timeout"
+        && input.captureWaitTimeout) {
+        let diagnostic: Readonly<Record<string, string | number | boolean | null>> = { available: false }
+        try {
+          const rawWaiters = await barrier.readWaiterCount()
+          const waiterCount = Number.isSafeInteger(rawWaiters) && rawWaiters >= 0 ? Math.min(2, rawWaiters) : 2
+          diagnostic = { ...await input.captureWaitTimeout({ waiterCount, workerAlive: !isExited(input.worker) }),
+            waiterCount, workerAlive: !isExited(input.worker) }
+        } catch { /* Keep the original bounded timeout and do not expose diagnostic errors. */ }
+        throw new Error(`objective_wave_projection_barrier_wait_timeout:${JSON.stringify(diagnostic)}`)
+      }
+      throw error
+    }
     await input.assertCommittedResult("blocked")
     await terminate(input.worker, input.waitForExit)
     await barrier.waitUntilUnblocked()
