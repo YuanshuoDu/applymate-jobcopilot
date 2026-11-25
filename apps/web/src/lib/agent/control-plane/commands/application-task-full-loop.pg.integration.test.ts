@@ -4670,7 +4670,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       ])
       expect(journeyReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v2",
         finalItemId, graphRevision: graphRow.revision, sourceCounts: expectedSourceCounts, reviewCoverage: "complete" })
-      expect(journeyReport.reportedScoreFloor).toEqual({ status: "not_requested" })
+      expect(journeyReport.reportedScoreFloor).toEqual({ status: "complete", minimumScore: 8, qualifyingJobCount: 8 })
       const journeySlots = Array.isArray(journeyReport.slots) ? journeyReport.slots.map(jsonRecord) : []
       expect(journeySlots).toHaveLength(8)
       expect(journeySlots.map(slot => [slot?.ordinal, slot?.tailoringStatus, slot?.reviewStatus,
