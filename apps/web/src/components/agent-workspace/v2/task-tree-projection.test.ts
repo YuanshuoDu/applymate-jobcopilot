@@ -65,6 +65,27 @@ describe('projectSupervisorTree', () => {
     expect(nodes[0]?.itemId).toBe('item-1')
   })
 
+  it('classifies only same-session failed paginated children without their Turn', () => {
+    const paginated = task('paged-child', { turnId: 'older-turn', rootTaskId: 'root-1', parentTaskId: 'root-1',
+      role: 'scout', taskType: 'scout', status: 'failed', failureReason: 'task_graph_child_deadline_exceeded' })
+    const foreign = task('foreign-paged', { sessionId: 'session-2', turnId: 'older-turn', rootTaskId: 'root-1', parentTaskId: 'root-1',
+      role: 'scout', taskType: 'scout', status: 'failed', failureReason: 'task_graph_child_deadline_exceeded' })
+    const unknown = task('unknown-paged', { turnId: 'older-turn', rootTaskId: 'root-1', parentTaskId: 'root-1',
+      role: 'scout', taskType: 'scout', status: 'failed', failureReason: 'private provider failure' })
+    const active = task('active-paged', { turnId: 'older-turn', rootTaskId: 'root-1', parentTaskId: 'root-1',
+      role: 'scout', taskType: 'scout', status: 'running', failureReason: 'task_graph_child_deadline_exceeded' })
+    const find = (nodes: TaskTreeNode[], id: string) => nodes.find(node => node.id === `task:${id}`)
+
+    const nodes = projectSupervisorTree({ turns: [], items: [], tasks: [paginated, foreign, unknown, active], expectedSessionId: 'session-1' })
+    expect(find(nodes, paginated.id)).toMatchObject({ childFailure: 'deadline_exceeded' })
+    for (const id of [foreign.id, unknown.id, active.id]) {
+      expect(find(nodes, id)).not.toHaveProperty('childFailure')
+      expect(find(nodes, id)).not.toHaveProperty('detail')
+    }
+    expect(JSON.stringify(nodes)).not.toContain('private provider failure')
+    expect(find(projectSupervisorTree({ turns: [], items: [], tasks: [paginated] }), paginated.id)).not.toHaveProperty('childFailure')
+  })
+
   it('marks a tool result available from the redacted output summary shape', () => {
     const nodes = projectSupervisorTree({
       turns: [turn()],

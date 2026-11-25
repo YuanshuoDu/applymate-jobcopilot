@@ -44,6 +44,7 @@ export interface SupervisorTreeInput {
   readonly turns: readonly SupervisorTurnSummary[]
   readonly items: readonly TimelineItem[]
   readonly tasks?: readonly SupervisorTaskSummary[]
+  readonly expectedSessionId?: string
   readonly labels?: SupervisorTreeLabels
 }
 
@@ -82,7 +83,7 @@ export function projectSelectedTaskInterrupt(tasks: readonly SupervisorTaskSumma
 }
 
 /** Projects authoritative turns plus timeline evidence into a read-only tree. */
-export function projectSupervisorTree({ turns, items, tasks = [], labels = DEFAULT_LABELS }: SupervisorTreeInput): TaskTreeNode[] {
+export function projectSupervisorTree({ turns, items, tasks = [], expectedSessionId, labels = DEFAULT_LABELS }: SupervisorTreeInput): TaskTreeNode[] {
   const itemsByTurn = groupBy(items, item => item.turnId)
   const tasksByTurn = groupBy(tasks, task => task.turnId ?? '')
   const turnNodes = [...turns].sort(compareCreated).map(turn => {
@@ -107,7 +108,7 @@ export function projectSupervisorTree({ turns, items, tasks = [], labels = DEFAU
       itemId: latestItem(orphanItems)?.id, children: projectEvidence(orphanItems, null, 'unknown', labels),
     })
   }
-  return [...turnNodes, ...projectTaskTree(orphanTasks, labels, orphanItems)]
+  return [...turnNodes, ...projectTaskTree(orphanTasks, labels, orphanItems, expectedSessionId)]
 }
 
 function projectEvidence(items: readonly TimelineItem[], activeStepId: string | null, turnStatus: string, labels: SupervisorTreeLabels): TaskTreeNode[] {
