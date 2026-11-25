@@ -1,11 +1,12 @@
 import type { Prisma } from "@prisma/client"
-import { parseObjectiveTailorFinalOutcomeSidecar, type ObjectiveTailorGraph } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA, parseObjectiveTailorFinalOutcomeSidecar,
+  type ObjectiveTailorGraph } from "@jobcopilot/agent-protocol"
 import { objectiveApplicationReviewPairProof, validObjectiveApplicationSourceManifest } from "../broker/objective-application-review-source-proof"
 import { canonicalTaskGraphItemId, canonicalTaskGraphSourceKey, isCanonicalTaskGraphSourceManifest } from "./final-task-graph-source-detail"
 import { parseFinalTaskGraphSourceManifest } from "./final-task-graph-source-manifest"
 import { readFinalTaskGraphSourceSnapshot } from "./objective-tailor-final-source-graph"
 import { parseObjectiveTailorProgressSnapshot } from "./objective-tailor-progress-snapshot"
-import type { ObjectiveJourneyReport } from "./objective-journey-report-contract"
+import type { ObjectiveJourneyReport, ObjectiveJourneyReportedScoreFloor } from "./objective-journey-report-contract"
 
 type Tx = Prisma.TransactionClient
 type Row = Record<string, unknown>
@@ -16,7 +17,7 @@ type SlotSource = Readonly<{
 }>
 export type ObjectiveJourneySource = Readonly<{
   userId: string; sessionId: string; sourceTurnId: string; rootTaskId: string; finalItemId: string; graphRevision: number
-  sourceCounts: ObjectiveJourneyReport["sourceCounts"]; slots: readonly SlotSource[]
+  sourceCounts: ObjectiveJourneyReport["sourceCounts"]; slots: readonly SlotSource[]; reportedScoreFloor?: ObjectiveJourneyReportedScoreFloor
 }>
 
 /** Reads a completed Objective source from one owner-scoped transaction; no current graph means no report. */
@@ -111,8 +112,11 @@ async function readSlots(tx: Tx, input: { userId: string; sessionId: string; fin
   const sourceCounts = "sourceCounts" in sidecar ? sidecar.sourceCounts : {
     discoveredJobs: { knownCount: null, coverage: "unavailable" as const }, analyzedJobs: { knownCount: null, coverage: "unavailable" as const },
   }
+  const reportedScoreFloor = sidecar.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA
+    ? sidecar.reportedScoreFloor : undefined
   return { userId: input.userId, sessionId: input.sessionId, sourceTurnId,
-    rootTaskId, finalItemId: input.finalItemId, graphRevision, sourceCounts, slots }
+    rootTaskId, finalItemId: input.finalItemId, graphRevision, sourceCounts, slots,
+    ...(reportedScoreFloor ? { reportedScoreFloor } : {}) }
 }
 
 function candidateForSlot(slot: ObjectiveTailorGraph["slots"][number], ordinal: number, revision: number,

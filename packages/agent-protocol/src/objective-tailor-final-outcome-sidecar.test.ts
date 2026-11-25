@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import {
   OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA,
   OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
+  OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA,
   parseObjectiveTailorFinalOutcomeSidecar,
 } from "./objective-tailor-final-outcome-sidecar.js"
 
@@ -11,6 +12,10 @@ const validV2 = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEM
   slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "rejected" }], sourceCounts: {
     discoveredJobs: { knownCount: 0, coverage: "complete" }, analyzedJobs: { knownCount: null, coverage: "unavailable" },
   } }
+const validV3 = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA, graphRevision: 8,
+  slots: [{ ordinal: 1, status: "ready" }], sourceCounts: {
+    discoveredJobs: { knownCount: 4, coverage: "complete" }, analyzedJobs: { knownCount: 3, coverage: "complete" },
+  }, reportedScoreFloor: { status: "complete", minimumScore: 7.5, qualifyingJobCount: 2 } }
 
 describe("parseObjectiveTailorFinalOutcomeSidecar", () => {
   it("preserves the historical V1 slot-only representation", () => {
@@ -22,6 +27,24 @@ describe("parseObjectiveTailorFinalOutcomeSidecar", () => {
     expect(parsed).toEqual(validV2)
     expect(parsed).not.toBe(validV2)
     expect(parsed?.slots).not.toBe(validV2.slots)
+  })
+
+  it("accepts V3 floor counts only against the complete analyzed denominator", () => {
+    expect(parseObjectiveTailorFinalOutcomeSidecar(validV3)).toEqual(validV3)
+    for (const reportedScoreFloor of [
+      { status: "complete", minimumScore: 7.5, qualifyingJobCount: 4 },
+      { status: "complete", minimumScore: 11, qualifyingJobCount: 1 },
+      { status: "complete", minimumScore: Number.NaN, qualifyingJobCount: 1 },
+      { status: "unavailable", qualifyingJobCount: 0 },
+      { status: "not_requested", minimumScore: 7.5 },
+      { status: "unknown" },
+    ]) expect(parseObjectiveTailorFinalOutcomeSidecar({ ...validV3, reportedScoreFloor })).toBeUndefined()
+    expect(parseObjectiveTailorFinalOutcomeSidecar({ ...validV3,
+      sourceCounts: { ...validV3.sourceCounts, analyzedJobs: { knownCount: 3, coverage: "partial" } } })).toBeUndefined()
+    expect(parseObjectiveTailorFinalOutcomeSidecar({ ...validV3,
+      reportedScoreFloor: { status: "unavailable" } })).toMatchObject({ reportedScoreFloor: { status: "unavailable" } })
+    expect(parseObjectiveTailorFinalOutcomeSidecar({ ...validV3,
+      reportedScoreFloor: { status: "not_requested" } })).toMatchObject({ reportedScoreFloor: { status: "not_requested" } })
   })
 
   it("distinguishes complete zero, partial evidence, and unavailable counts", () => {

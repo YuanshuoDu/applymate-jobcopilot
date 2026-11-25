@@ -1,5 +1,6 @@
 export const OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA = "agent-harness.v2.objective-tailor-final-outcomes.v1" as const
 export const OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA = "agent-harness.v2.objective-tailor-final-outcomes.v2" as const
+export const OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA = "agent-harness.v2.objective-tailor-final-outcomes.v3" as const
 export const OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_STATUSES = ["ready", "needs_revision", "rejected", "stale", "failed"] as const
 const OBJECTIVE_TAILOR_FINAL_OUTCOME_COVERAGES = ["complete", "partial", "unavailable", "not_requested"] as const
 
@@ -17,7 +18,16 @@ export type ObjectiveTailorFinalOutcomeSidecarV2 = Readonly<{
   slots: readonly Slot[]
   sourceCounts: Readonly<{ discoveredJobs: ObjectiveTailorFinalOutcomeCount; analyzedJobs: ObjectiveTailorFinalOutcomeCount }>
 }>
-export type ObjectiveTailorFinalOutcomeSidecar = ObjectiveTailorFinalOutcomeSidecarV1 | ObjectiveTailorFinalOutcomeSidecarV2
+export type ObjectiveTailorReportedScoreFloor = Readonly<{ status: "not_requested" | "unavailable" }>
+  | Readonly<{ status: "complete"; minimumScore: number; qualifyingJobCount: number }>
+export type ObjectiveTailorFinalOutcomeSidecarV3 = Readonly<{
+  schemaVersion: typeof OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA
+  graphRevision: number
+  slots: readonly Slot[]
+  sourceCounts: Readonly<{ discoveredJobs: ObjectiveTailorFinalOutcomeCount; analyzedJobs: ObjectiveTailorFinalOutcomeCount }>
+  reportedScoreFloor: ObjectiveTailorReportedScoreFloor
+}>
+export type ObjectiveTailorFinalOutcomeSidecar = ObjectiveTailorFinalOutcomeSidecarV1 | ObjectiveTailorFinalOutcomeSidecarV2 | ObjectiveTailorFinalOutcomeSidecarV3
 
 /** Reads the current closed projection while keeping historical V1 slot-only items valid. */
 export function parseObjectiveTailorFinalOutcomeSidecar(value: unknown): ObjectiveTailorFinalOutcomeSidecar | undefined {
@@ -25,6 +35,7 @@ export function parseObjectiveTailorFinalOutcomeSidecar(value: unknown): Objecti
   if (!row) return undefined
   if (row.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA) return parseV1(row)
   if (row.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA) return parseV2(row)
+  if (row.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA) return parseV3(row)
   return undefined
 }
 
@@ -43,6 +54,31 @@ function parseV2(row: Record<string, unknown>): ObjectiveTailorFinalOutcomeSidec
   if (!discoveredJobs || !analyzedJobs) return undefined
   return { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA, graphRevision: row.graphRevision,
     slots, sourceCounts: { discoveredJobs, analyzedJobs } }
+}
+
+function parseV3(row: Record<string, unknown>): ObjectiveTailorFinalOutcomeSidecarV3 | undefined {
+  if (!exactKeys(row, "graphRevision,reportedScoreFloor,schemaVersion,slots,sourceCounts")) return undefined
+  const base = parseV2({ schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
+    graphRevision: row.graphRevision, slots: row.slots, sourceCounts: row.sourceCounts })
+  const scoreFloor = parseReportedScoreFloor(row.reportedScoreFloor)
+  if (!base || !scoreFloor || scoreFloor.status === "complete"
+    && (base.sourceCounts.analyzedJobs.coverage !== "complete"
+      || base.sourceCounts.analyzedJobs.knownCount === null
+      || scoreFloor.qualifyingJobCount > base.sourceCounts.analyzedJobs.knownCount)) return undefined
+  return { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA, graphRevision: base.graphRevision,
+    slots: base.slots, sourceCounts: base.sourceCounts, reportedScoreFloor: scoreFloor }
+}
+
+function parseReportedScoreFloor(value: unknown): ObjectiveTailorReportedScoreFloor | undefined {
+  const row = record(value)
+  if (!row) return undefined
+  if (row.status === "not_requested" || row.status === "unavailable") {
+    return exactKeys(row, "status") ? { status: row.status } : undefined
+  }
+  return exactKeys(row, "minimumScore,qualifyingJobCount,status") && row.status === "complete"
+    && typeof row.minimumScore === "number" && Number.isFinite(row.minimumScore) && row.minimumScore >= 0 && row.minimumScore <= 10
+    && nonnegativeSafeInteger(row.qualifyingJobCount)
+    ? { status: "complete", minimumScore: row.minimumScore, qualifyingJobCount: row.qualifyingJobCount } : undefined
 }
 
 function parseSlots(value: unknown): readonly Slot[] | undefined {
@@ -71,7 +107,7 @@ function record(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
   try {
     const keys = Reflect.ownKeys(value), prototype = Object.getPrototypeOf(value)
-    if (keys.length > 4 || prototype !== Object.prototype && prototype !== null || keys.some(key => typeof key !== "string")) return undefined
+    if (keys.length > 5 || prototype !== Object.prototype && prototype !== null || keys.some(key => typeof key !== "string")) return undefined
     for (const key of keys) {
       const descriptor = Object.getOwnPropertyDescriptor(value, key)
       if (!descriptor?.enumerable || !("value" in descriptor)) return undefined

@@ -4,6 +4,7 @@ import React, { useState } from 'react'
 import { useApi } from '@/lib/hooks'
 import {
   parseObjectiveJourneyReport,
+  type ObjectiveJourneyReportedScoreFloor,
   type ObjectiveJourneyReport as Report,
 } from '@/lib/agent/session/objective-journey-report-contract'
 import type { Lang } from '@/lib/i18n'
@@ -15,11 +16,12 @@ export function buildObjectiveJourneyReportUrl(sessionId: string, finalItemId: s
   return `/api/agent/sessions/${encodeURIComponent(sessionId)}/final-items/${encodeURIComponent(finalItemId)}/objective-report`
 }
 
-export function ObjectiveJourneyReport({ sessionId, finalItemId, graphRevision, sourceCounts, slots, lang, enabled = true }: {
+export function ObjectiveJourneyReport({ sessionId, finalItemId, graphRevision, sourceCounts, reportedScoreFloor, slots, lang, enabled = true }: {
   readonly sessionId: string
   readonly finalItemId: string
   readonly graphRevision: number
   readonly sourceCounts?: ExpectedCounts
+  readonly reportedScoreFloor?: ObjectiveJourneyReportedScoreFloor
   readonly slots: readonly ExpectedSlot[]
   readonly lang: Lang
   readonly enabled?: boolean
@@ -29,7 +31,7 @@ export function ObjectiveJourneyReport({ sessionId, finalItemId, graphRevision, 
   const query = useApi<unknown>(url, { enabled: validIdentity && enabled, cache: false })
   const response = record(query.data)
   const parsed = response ? parseObjectiveJourneyReport(response.report) : undefined
-  const report = parsed && !query.error && sameReport(parsed, { finalItemId, graphRevision, sourceCounts, slots }) ? parsed : null
+  const report = parsed && !query.error && sameReport(parsed, { finalItemId, graphRevision, sourceCounts, reportedScoreFloor, slots }) ? parsed : null
   const copy = lang === 'zh' ? zh : en
   const [missingEvidenceOrdinal, setMissingEvidenceOrdinal] = useState<number | null>(null)
 
@@ -50,6 +52,7 @@ export function ObjectiveJourneyReport({ sessionId, finalItemId, graphRevision, 
         <div><dt>{copy.shortlisted}</dt><dd>{report.slots.length}</dd></div>
         <div><dt>{copy.ready}</dt><dd>{report.slots.filter(slot => slot.tailoringStatus === 'ready').length}</dd></div>
         <div><dt>{copy.submitted}</dt><dd>{submittedSummary(report, copy)}</dd></div>
+        {'reportedScoreFloor' in report && <div><dt>{copy.scoreFloor}</dt><dd>{scoreFloorSummary(report.reportedScoreFloor, copy)}</dd></div>}
         <div><dt>{copy.unresolved}</dt><dd>{report.slots.filter(isUnresolved).length}</dd></div>
         <div><dt>{copy.materialChanged}</dt><dd>{report.slots.filter(slot => slot.retirementReason === 'resume_material_changed'
           || slot.retirementReason === 'completed_source_changed').length}</dd></div>
@@ -96,13 +99,28 @@ export function focusObjectiveFillEvidence(finalItemId: string, root?: Document)
 }
 
 function sameReport(report: Report, expected: {
-  finalItemId: string; graphRevision: number; sourceCounts?: ExpectedCounts; slots: readonly ExpectedSlot[]
+  finalItemId: string; graphRevision: number; sourceCounts?: ExpectedCounts
+  reportedScoreFloor?: ObjectiveJourneyReportedScoreFloor; slots: readonly ExpectedSlot[]
 }): boolean {
+  const actualFloor = 'reportedScoreFloor' in report ? report.reportedScoreFloor : undefined
   return report.finalItemId === expected.finalItemId && report.graphRevision === expected.graphRevision
     && (!expected.sourceCounts || sameCounts(report.sourceCounts, expected.sourceCounts))
+    && sameScoreFloor(actualFloor, expected.reportedScoreFloor)
     && report.slots.length === expected.slots.length
     && report.slots.every((slot, index) => slot.ordinal === expected.slots[index]?.ordinal
       && slot.tailoringStatus === expected.slots[index]?.tailoringStatus)
+}
+
+function sameScoreFloor(actual: ObjectiveJourneyReportedScoreFloor | undefined, expected: ObjectiveJourneyReportedScoreFloor | undefined): boolean {
+  if (!actual || !expected) return actual === expected
+  return actual.status === expected.status && (actual.status !== 'complete' || expected.status === 'complete'
+    && actual.minimumScore === expected.minimumScore && actual.qualifyingJobCount === expected.qualifyingJobCount)
+}
+
+function scoreFloorSummary(floor: ObjectiveJourneyReportedScoreFloor, copy: typeof en): string {
+  if (floor.status === 'not_requested') return copy.floorNotRequested
+  if (floor.status === 'unavailable') return copy.floorUnavailable
+  return `≥ ${floor.minimumScore}: ${floor.qualifyingJobCount} ${copy.qualifyingJobs}`
 }
 
 function sameCounts(left: ExpectedCounts, right: ExpectedCounts): boolean {
@@ -151,6 +169,7 @@ const en = {
   confirmedSubmission: 'Submission confirmed with verified fill evidence.', viewFillEvidence: 'View fill evidence',
   evidenceNotVisible: 'The submission is confirmed, but its fill record is not visible in the current transcript.',
   overview: 'Journey totals', shortlisted: 'Shortlisted', ready: 'Ready', submitted: 'Site-confirmed', unresolved: 'Unresolved',
+  scoreFloor: 'Analyst-reported score floor', floorNotRequested: 'Not requested', floorUnavailable: 'Unavailable', qualifyingJobs: 'qualifying jobs',
   materialChanged: 'Material changed',
   outcomeUnavailableSuffix: ' observed; some outcomes unavailable',
   nextFormReview: 'Review the filled form before deciding.', checkEmployer: 'Check the employer site before any retry.',
@@ -171,6 +190,7 @@ const zh = {
   confirmedSubmission: '已通过验证确认提交。', viewFillEvidence: '查看填写记录',
   evidenceNotVisible: '已确认提交，但当前对话记录中没有显示填写记录。',
   overview: '申请进度', shortlisted: '已列入清单', ready: '已就绪', submitted: '网站已确认', unresolved: '待确认',
+  scoreFloor: '分析师报告的评分下限', floorNotRequested: '未请求', floorUnavailable: '不可用', qualifyingJobs: '个符合条件的职位',
   materialChanged: '材料已变更',
   outcomeUnavailableSuffix: ' 条已确认；部分结果不可用',
   nextFormReview: '请先检查已填写的表单。', checkEmployer: '重试前请先查看雇主网站。',

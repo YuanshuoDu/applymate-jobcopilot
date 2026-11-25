@@ -29,6 +29,16 @@ describe("Objective journey report route", () => {
     expect(mocks.read).toHaveBeenCalledWith({ userId: "user-1", sessionId: "session-1", finalItemId: "final-1" })
   })
 
+  it("passes the closed reported score floor through the private report response", async () => {
+    const { GET } = await import("./route")
+    const reportV2 = { ...report, schemaVersion: "agent-harness.v2.objective-journey-report.v2",
+      reportedScoreFloor: { status: "not_requested" } }
+    mocks.read.mockResolvedValue(reportV2)
+    const response = await GET(request() as never, context)
+    expect(response.headers.get("Cache-Control")).toBe("private, no-store, max-age=0")
+    expect(await response.json()).toEqual({ report: reportV2 })
+  })
+
   it("conceals invalid, missing, and unsupported query selections", async () => {
     const { GET } = await import("./route")
     mocks.read.mockResolvedValue(undefined)

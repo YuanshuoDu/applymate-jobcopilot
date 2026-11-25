@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA } from "@jobcopilot/agent-protocol"
 import { canonicalTaskGraphItemId, canonicalTaskGraphSourceKey } from "./final-task-graph-source-detail"
 import { readFinalTaskGraphSourceSnapshot } from "./objective-tailor-final-source-graph"
 import { parseObjectiveTailorProgressSnapshot } from "./objective-tailor-progress-snapshot"
@@ -37,9 +38,20 @@ describe("readObjectiveJourneySource", () => {
     const result = await readObjectiveJourneySource(fixture.client as never, { userId, sessionId, finalItemId: finalId })
     expect(result).toBeNull()
   })
+
+  it("projects only the closed V3 reported floor from the verified final sidecar", async () => {
+    const floor = { status: "complete", minimumScore: 0, qualifyingJobCount: 0 }
+    const fixture = sourceFixture({ schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA, graphRevision: 9,
+      slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }],
+      sourceCounts: { discoveredJobs: { knownCount: 4, coverage: "complete" },
+        analyzedJobs: { knownCount: 3, coverage: "complete" } }, reportedScoreFloor: floor })
+    const result = await readObjectiveJourneySource(fixture.client as never, { userId, sessionId, finalItemId: finalId })
+    expect(result?.reportedScoreFloor).toEqual(floor)
+  })
 })
 
-function sourceFixture() {
+function sourceFixture(sidecar: unknown = { schemaVersion: "agent-harness.v2.objective-tailor-final-outcomes.v1",
+  slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }] }) {
   const verify = (role: "scout" | "analyst") => ({ schemaVersion: "agent-harness.v2.task-graph-verification.v1", role,
     criteria: [{ id: role === "scout" ? "candidate-count" : "finding-count",
       check: { kind: role === "scout" ? "candidate_count_gte" : "finding_count_gte", minimum: 1 } }] })
@@ -75,8 +87,7 @@ function sourceFixture() {
     taskGraphSources: { schemaVersion: "agent-harness.v2.task-graph-sources.v1", graphRevision: 9,
       sources: sources.map((source, nodeIndex) => ({ sourceKey: canonicalTaskGraphSourceKey(finalId, 9, nodeIndex), nodeIndex,
         role: source.templateId, taskStatus: "completed", resultState: "valid", roleResultStatus: "completed" })) },
-    objectiveTailorFinalOutcomes: { schemaVersion: "agent-harness.v2.objective-tailor-final-outcomes.v1",
-      slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }] } }
+    objectiveTailorFinalOutcomes: sidecar }
   const graphContent = { schemaVersion: "agent-harness.v2.task-graph", nodes: [...sources, ...suffix],
     objectiveTailor: { schemaVersion: "agent-harness.v2.objective-tailor-graph.v1", sourceNodeCount: sources.length, slots } }
   const itemRows = (where: Record<string, unknown>) => where.id === finalId ? [{ id: finalId, sessionId, turnId, taskId: rootId,

@@ -2,7 +2,8 @@ import { Prisma } from "@prisma/client"
 import { db } from "@/lib/db"
 import { readObjectiveJourneyReportApplication } from "./objective-journey-report-application"
 import { readObjectiveJourneyReportApprovals } from "./objective-journey-report-approvals"
-import { parseObjectiveJourneyReport, OBJECTIVE_JOURNEY_REPORT_SCHEMA, type ObjectiveJourneyReport } from "./objective-journey-report-contract"
+import { parseObjectiveJourneyReport, OBJECTIVE_JOURNEY_REPORT_SCHEMA, OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2,
+  type ObjectiveJourneyReport } from "./objective-journey-report-contract"
 import { readObjectiveJourneySource } from "./objective-journey-report-source"
 
 type Input = Readonly<{ userId: string; sessionId: string; finalItemId: string }>
@@ -30,9 +31,12 @@ export async function readObjectiveJourneyReport(input: Input): Promise<Objectiv
           retirementReason: approval.retirementReason, ...application })
       }
       const known = slots.filter(slot => slot.reviewStatus !== "unknown").length
-      const report = parseObjectiveJourneyReport({ schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA,
-        finalItemId: source.finalItemId, graphRevision: source.graphRevision, sourceCounts: source.sourceCounts,
-        reviewCoverage: known === slots.length ? "complete" : known ? "partial" : "unavailable", slots })
+      const common = { finalItemId: source.finalItemId, graphRevision: source.graphRevision, sourceCounts: source.sourceCounts,
+        reviewCoverage: known === slots.length ? "complete" : known ? "partial" : "unavailable", slots }
+      const projection = source.reportedScoreFloor === undefined
+        ? { schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA, ...common }
+        : { schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2, ...common, reportedScoreFloor: source.reportedScoreFloor }
+      const report = parseObjectiveJourneyReport(projection)
       return report
     }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead })
   } catch { return undefined }

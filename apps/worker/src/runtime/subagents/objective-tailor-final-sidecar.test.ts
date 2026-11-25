@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA, OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
+import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA, OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA,
   parseObjectiveTailorFinalOutcomeSidecar } from "@jobcopilot/agent-protocol"
 import { taskGraphItemId } from "./task-graph-snapshot.js"
 import type { TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
@@ -37,9 +37,10 @@ function ordinaryBinding(): TaskGraphFinalSummaryBinding {
 describe("objective-tailor-final-sidecar", () => {
   it("projects only exact slot ordinals and settled statuses from the private binding", () => {
     const read = readObjectiveTailorFinalOutcomeSidecar(binding())
-    expect(read).toEqual({ status: "ready", sidecar: { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
+    expect(read).toEqual({ status: "ready", sidecar: { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA,
       graphRevision: 7, slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }],
-      sourceCounts: { discoveredJobs: { knownCount: 1, coverage: "complete" }, analyzedJobs: { knownCount: 1, coverage: "complete" } } } })
+      sourceCounts: { discoveredJobs: { knownCount: 1, coverage: "complete" }, analyzedJobs: { knownCount: 1, coverage: "complete" } },
+      reportedScoreFloor: { status: "unavailable" } } })
     expect(JSON.stringify(read)).not.toMatch(/root-private|task-private|graphDigest|evidenceDigest|sha256|sourceStatusDigest/)
   })
 
@@ -49,9 +50,10 @@ describe("objective-tailor-final-sidecar", () => {
   })
 
   it("matches only the exact public projection and fails closed on an injected sidecar", () => {
-    const exact = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA, graphRevision: 7,
+    const exact = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA, graphRevision: 7,
       slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }],
-      sourceCounts: { discoveredJobs: { knownCount: 1, coverage: "complete" }, analyzedJobs: { knownCount: 1, coverage: "complete" } } }
+      sourceCounts: { discoveredJobs: { knownCount: 1, coverage: "complete" }, analyzedJobs: { knownCount: 1, coverage: "complete" } },
+      reportedScoreFloor: { status: "unavailable" } }
     expect(objectiveTailorFinalOutcomeSidecarMatches(binding(), exact)).toBe(true)
     expect(objectiveTailorFinalOutcomeSidecarMatches(binding(), { ...exact, slots: [{ ordinal: 1, status: "ready" }] })).toBe(false)
     expect(objectiveTailorFinalOutcomeSidecarMatches(binding(), { ...exact, taskId: "injected" })).toBe(false)
@@ -60,6 +62,8 @@ describe("objective-tailor-final-sidecar", () => {
       sourceCounts: { ...exact.sourceCounts, discoveredJobs: { knownCount: 2, coverage: "complete" } } })).toBe(false)
     expect(objectiveTailorFinalOutcomeSidecarMatches(binding(), { ...exact,
       sourceCounts: { ...exact.sourceCounts, analyzedJobs: { knownCount: 1, coverage: "partial" } } })).toBe(false)
+    expect(objectiveTailorFinalOutcomeSidecarMatches(binding(), { ...exact,
+      reportedScoreFloor: { status: "complete", minimumScore: 7, qualifyingJobCount: 1 } })).toBe(false)
     expect(objectiveTailorFinalOutcomeSidecarMatches(binding(), { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA,
       slots: exact.slots })).toBe(false)
     expect(objectiveTailorFinalOutcomeSidecarMatches(binding(), exact)).toBe(true)
@@ -75,5 +79,19 @@ describe("objective-tailor-final-sidecar", () => {
     const legacy = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA,
       slots: [{ ordinal: 1, status: "ready" }] }
     expect(parseObjectiveTailorFinalOutcomeSidecar(legacy)).toEqual(legacy)
+  })
+
+  it("binds the inclusive Analyst floor and distinct count to the private final projection", () => {
+    const privateFloor = { ...privateOutcome, reportedScoreFloor: { status: "complete", minimumScore: 7,
+      minimumFindings: 1, aggregation: "any", qualifyingJobCount: 1 } }
+    const exact = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA, graphRevision: 7,
+      slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }],
+      sourceCounts: { discoveredJobs: { knownCount: 1, coverage: "complete" }, analyzedJobs: { knownCount: 1, coverage: "complete" } },
+      reportedScoreFloor: { status: "complete", minimumScore: 7, qualifyingJobCount: 1 } }
+    const bound = binding(privateFloor)
+    expect(readObjectiveTailorFinalOutcomeSidecar(bound)).toEqual({ status: "ready", sidecar: exact })
+    expect(objectiveTailorFinalOutcomeSidecarMatches(bound, exact)).toBe(true)
+    expect(objectiveTailorFinalOutcomeSidecarMatches(bound, { ...exact, reportedScoreFloor: { ...exact.reportedScoreFloor, qualifyingJobCount: 0 } })).toBe(false)
+    expect(objectiveTailorFinalOutcomeSidecarMatches(bound, { ...exact, reportedScoreFloor: { ...exact.reportedScoreFloor, minimumScore: 8 } })).toBe(false)
   })
 })

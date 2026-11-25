@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { OBJECTIVE_JOURNEY_REPORT_SCHEMA, parseObjectiveJourneyReport } from "./objective-journey-report-contract"
+import { OBJECTIVE_JOURNEY_REPORT_SCHEMA, OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2, parseObjectiveJourneyReport } from "./objective-journey-report-contract"
 
 const count = { knownCount: 3, coverage: "complete" }
 const baseSlot = {
@@ -19,6 +19,32 @@ describe("parseObjectiveJourneyReport", () => {
     expect(parseObjectiveJourneyReport({ ...report, sourceCounts: {
       discoveredJobs: { knownCount: 0, coverage: "partial" }, analyzedJobs: { knownCount: null, coverage: "not_requested" },
     } })?.sourceCounts.analyzedJobs).toEqual({ knownCount: null, coverage: "not_requested" })
+  })
+
+  it("accepts closed score-floor states and preserves a complete numeric zero", () => {
+    const base = { ...report, schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2,
+      sourceCounts: { discoveredJobs: count, analyzedJobs: { knownCount: 3, coverage: "complete" } } }
+    const complete = { status: "complete", minimumScore: 7.5, qualifyingJobCount: 0 }
+    expect(parseObjectiveJourneyReport({ ...base, reportedScoreFloor: complete })).toMatchObject({
+      schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2, reportedScoreFloor: complete,
+    })
+    expect(parseObjectiveJourneyReport({ ...base, reportedScoreFloor: { status: "not_requested" } }))
+      .toMatchObject({ reportedScoreFloor: { status: "not_requested" } })
+    expect(parseObjectiveJourneyReport({ ...base, reportedScoreFloor: { status: "unavailable" } }))
+      .toMatchObject({ reportedScoreFloor: { status: "unavailable" } })
+  })
+
+  it("rejects score floors without exact closed evidence or a complete denominator", () => {
+    const base = { ...report, schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2,
+      sourceCounts: { discoveredJobs: count, analyzedJobs: { knownCount: 3, coverage: "complete" } } }
+    for (const floor of [undefined, { status: "not_requested", qualifyingJobCount: 0 },
+      { status: "unavailable", minimumScore: 4 }, { status: "unknown" },
+      { status: "complete", minimumScore: 4, qualifyingJobCount: 4 },
+      { status: "complete", minimumScore: 11, qualifyingJobCount: 1 }]) {
+      expect(parseObjectiveJourneyReport({ ...base, reportedScoreFloor: floor })).toBeUndefined()
+    }
+    expect(parseObjectiveJourneyReport({ ...base, sourceCounts: report.sourceCounts,
+      reportedScoreFloor: { status: "complete", minimumScore: 4, qualifyingJobCount: 1 } })).toBeUndefined()
   })
 
   it("accepts only dense one-to-eight ordered slots", () => {
