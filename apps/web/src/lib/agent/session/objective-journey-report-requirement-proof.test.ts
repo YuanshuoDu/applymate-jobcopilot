@@ -31,6 +31,23 @@ describe("verifyObjectiveJourneyRequirementProof", () => {
     expect(verifyObjectiveJourneyRequirementProof(value.source, value.slot, value.read)).toEqual({ checked: true, hasVerifiedRequirements: true })
   })
 
+  it.each([
+    ["a non-completed persisted result row", (value: ReturnType<typeof fixture>) => {
+      value.read = { ...value.read, items: value.read.items.map(item => item.type === "tool_result" ? { ...item, status: "failed" } : item) }
+    }],
+    ["a non-completed lifecycle outcome", (value: ReturnType<typeof fixture>) => {
+      value.read = { ...value.read, outcomes: new Map([["call-1", "failed"]]) }
+    }],
+    ["an invented result-content status", (value: ReturnType<typeof fixture>) => {
+      value.read = { ...value.read, items: value.read.items.map(item => item.type === "tool_result"
+        ? { ...item, content: { ...(item.content as Record<string, unknown>), status: "completed" } } : item) }
+    }],
+  ])("rejects %s before normalizing the Worker result", (_name, mutate) => {
+    const value = fixture(true)
+    mutate(value)
+    expect(verifyObjectiveJourneyRequirementProof(value.source, value.slot, value.read)).toEqual({ checked: false, hasVerifiedRequirements: false })
+  })
+
   it("counts a valid Analyst with no proposals as checked but not positive", () => {
     const value = fixture(false)
     expect(verifyObjectiveJourneyRequirementProof(value.source, value.slot, value.read)).toEqual({ checked: true, hasVerifiedRequirements: false })
@@ -53,7 +70,7 @@ describe("verifyObjectiveJourneyRequirementProof", () => {
 function fixture(citation: boolean, dependencyKeys = ["scout-1"]) {
   const scope = { userId, sessionId, turnId: "source-turn", rootTaskId: "source-root", parentTaskId: "source-root", taskId: "analyst-1", attemptCount: 2 }
   const callContent = { toolCallId: "call-1", toolName: "jobs.get", toolVersion: "1", input: { jobId }, status: "completed", errorCode: null }
-  const resultContent = { toolCallId: "call-1", output: { job }, status: "completed", errorCode: null }
+  const resultContent = { toolCallId: "call-1", output: { job }, errorCode: null }
   const items = [
     { id: "call-item", sessionId, turnId: scope.turnId, taskId: scope.taskId, stepId: "step-1", type: "tool_call", status: "completed", revision: 0,
       content: callContent, joinedStepId: "step-1", stepStatus: "completed", attempt: 2, ordinal: 0, rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId },

@@ -148,20 +148,27 @@ function deliveryCandidates(read: ObjectiveJourneyRequirementRead): Row[] | unde
     const resultContent = record(result?.content), outputJob = record(resultContent?.output)?.job
     const inputId = input?.jobId, outputId = record(outputJob)?.id
     if (inputId !== read.currentJob.id && outputId !== read.currentJob.id) continue
+    const normalizedResult = normalizeCompletedResult(call, result, content, resultContent, read.outcomes)
     if (!input || !exact(input, "jobId") || !text(input.jobId) || !result || !resultContent || !callContentValid(content)
-      || !resultFieldsValid(result, call) || !exact(resultContent, "errorCode,output,status,toolCallId")
-      || resultContent.status !== "completed" || resultContent.errorCode !== null
-      || resultContent.toolCallId !== content.toolCallId || read.outcomes.get(String(content.toolCallId)) !== "completed") return undefined
-    const replay = replayByCall.get(String(content.toolCallId)), rawResult = result as Row, rawResultContent = record(rawResult.content)!
+      || !normalizedResult) return undefined
+    const replay = replayByCall.get(String(content.toolCallId)), rawResult = result
     output.push({ call: { id: call.id, stepId: call.stepId, attempt: call.attempt, ordinal: call.ordinal, revision: call.revision },
       callContent: { toolCallId: content.toolCallId, toolName: content.toolName, toolVersion: content.toolVersion, input,
         status: content.status, errorCode: content.errorCode }, outcome: "completed",
       result: { id: rawResult.id, stepId: rawResult.stepId, attempt: rawResult.attempt, ordinal: rawResult.ordinal, revision: rawResult.revision },
-      resultContent: { toolCallId: rawResultContent.toolCallId, output: rawResultContent.output, status: rawResultContent.status,
-        errorCode: rawResultContent.errorCode }, replay: replay ? { currentCallId: replay.currentCallId,
+      resultContent: normalizedResult, replay: replay ? { currentCallId: replay.currentCallId,
           sourceCallItemId: replay.sourceCallItem[0], sourceResultItemId: replay.sourceResultItem[0] } : null })
   }
   return output
+}
+
+function normalizeCompletedResult(call: Row, result: Row | undefined, callContent: Row, resultContent: Row | undefined,
+  outcomes: ReadonlyMap<string, "completed" | "failed">): Row | undefined {
+  if (!result || !resultContent || result.status !== "completed" || !resultFieldsValid(result, call)
+    || !exact(resultContent, "errorCode,output,toolCallId") || resultContent.toolCallId !== callContent.toolCallId
+    || resultContent.errorCode !== callContent.errorCode || call.status !== "completed" || callContent.status !== "completed"
+    || callContent.errorCode !== null || outcomes.get(String(callContent.toolCallId)) !== "completed") return undefined
+  return { toolCallId: resultContent.toolCallId, output: resultContent.output, status: "completed", errorCode: resultContent.errorCode }
 }
 
 function exactJob(value: Row): Row | undefined {
