@@ -89,7 +89,7 @@ describe("Objective rootless Fill failure recovery", () => {
     expect(test.calls.some(call => call.sql.includes('UPDATE "agent_turns"') || call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 
-  it.each([
+  const invalidOptions: Array<[string, Options]> = [
     ["a noncanonical command key", { turn: { input: { ...turnInput, clientMessageId: "other-command" } } }],
     ["an open marker shape", { turn: { input: { ...turnInput, reviewedApplicationMaterialSource: { ...source, extra: true } } } }],
     ["a nonfailed Turn", { turn: { status: "completed" } }],
@@ -100,7 +100,8 @@ describe("Objective rootless Fill failure recovery", () => {
     ["browser-start evidence", { evidence: [{ id: "browser-event" }] }],
     ["an existing submission approval", { approvals: [{ id: "approval" }] }],
     ["an existing submission attempt", { attempts: [{ id: "attempt" }] }],
-  ] as const)("leaves state unchanged for %s", async (_label, options) => {
+  ]
+  it.each(invalidOptions)("leaves state unchanged for %s", async (_label, options) => {
     const test = fixture(options)
     await expect(recoverObjectiveFillPrestartFailures(test.pool, 50, now)).resolves.toBe(0)
     expect(test.task).toMatchObject({ status: "filling", checkpoint: options.task?.checkpoint ?? "taskgraph_fill_queued" })
