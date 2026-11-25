@@ -11,7 +11,7 @@ import { setTimeout as delay } from "node:timers/promises"
 
 import { Prisma, PrismaClient } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope, objectiveApplicationApprovalSetItemId, parseObjectiveApplicationApprovalSet,
-  parseObjectiveTailorGraph, schemaVersion } from "@jobcopilot/agent-protocol"
+  parseObjectiveTailorGraph, parseObjectiveTailorFinalOutcomeSidecar, schemaVersion } from "@jobcopilot/agent-protocol"
 import {
   hashAgentReceiptValue,
   hashContent,
@@ -397,6 +397,8 @@ const SAFE_SUBMISSION_ATTEMPT_ERROR_CODES = [
   "submission_guard_denied",
   "provider_invalid_response",
   "provider_error",
+  "objective_submit_control_unavailable",
+  "objective_submit_confirmation_missing",
 ] as const
 const SAFE_SUBMISSION_ATTEMPT_ERROR_CODE_SET: ReadonlySet<string> = new Set(SAFE_SUBMISSION_ATTEMPT_ERROR_CODES)
 type SafeSubmissionAttemptErrorCode = typeof SAFE_SUBMISSION_ATTEMPT_ERROR_CODES[number]
@@ -406,6 +408,11 @@ function diagnosticSubmissionAttemptErrorCode(value: unknown): null | "other" | 
   return typeof value === "string" && SAFE_SUBMISSION_ATTEMPT_ERROR_CODE_SET.has(value)
     ? value as SafeSubmissionAttemptErrorCode
     : "other"
+}
+
+function diagnosticSubmissionAttemptState(value: unknown): null | "reserved" | "submitted" | "failed" | "other" {
+  return value === "reserved" || value === "submitted" || value === "failed" ? value
+    : value === null || value === undefined ? null : "other"
 }
 
 function serviceUrl(value: string | undefined, kind: "postgres" | "redis"): string | null {
@@ -462,6 +469,15 @@ type ObjectiveFillDeliveryHold = {
   release: (() => void) | null
   released: Promise<void>
 }
+type ObjectiveFillWaveGate = {
+  userId: string
+  sessionId: string
+  reviewTurnId: string
+  approvalIds: ReadonlySet<string>
+  applicationTaskIdByApprovalId: ReadonlyMap<string, string>
+  releasedApprovalIds: Set<string>
+  outboxIdsByApprovalId: Map<string, string>
+}
 type ApplicationFillExecutorTrace = {
   attemptCount: number | null
   executorInvocationOrdinal: number
@@ -511,12 +527,15 @@ let subagentQueue: InstanceType<typeof Queue> | undefined
 let createdUsers: string[] = []
 const reviewedSessionIds: string[] = []
 const reviewedJobIds: string[] = []
+const reviewedSessionOwners = new Map<string, string>()
+const reviewedJobOwners = new Map<string, string>()
 const reviewedFillBridgeSecret = `application-task-full-loop-${runId}`
 const reviewedFillBridgeAttempts: ReviewedFillBridgeAttempt[] = []
 let reviewedFillBridgeServer: Server | undefined
 let reviewedFillRouteDb: PrismaClient | undefined
 let dropNextReviewedFillAcknowledgement = false
 let objectiveFillDeliveryHold: ObjectiveFillDeliveryHold | undefined
+let objectiveFillWaveGate: ObjectiveFillWaveGate | undefined
 let priorAgentWorkerSecret: string | undefined
 let priorDatabaseUrl: string | undefined
 let agentWorkerSecretOverridden = false
@@ -548,7 +567,7 @@ async function assertEgressBlocked(): Promise<void> {
   }
 }
 
-function spawnFixture(mode: "site" | "worker"): Child {
+function spawnFixture(mode: "site" | "worker", workerUserId = ids.user): Child {
   const objectiveTailorWorker = mode === "worker" && process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES === "1"
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode], {
     cwd: workerCwd,
@@ -567,7 +586,7 @@ function spawnFixture(mode: "site" | "worker"): Child {
         ...(objectiveTailorWorker ? { ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1",
           ENABLE_AGENT_WAIT_RESOLVER: "1" } : {}) } : {}),
       BULLMQ_STALLED_INTERVAL_MS: "30000",
-      ...(mode === "worker" ? { APPLICATION_TASK_FULL_LOOP_USER_ID: ids.user } : {}),
+      ...(mode === "worker" ? { APPLICATION_TASK_FULL_LOOP_USER_ID: workerUserId } : {}),
     },
     stdio: ["pipe", "pipe", "pipe"],
   }) as Child
@@ -1301,9 +1320,16 @@ async function startReviewedFillRouteBridge(): Promise<void> {
       const body = jsonRecord(JSON.parse(requestBody))
       const outboxId = typeof body?.outboxId === "string" ? body.outboxId : null
       const hold = objectiveFillDeliveryHold
-      const objectiveOutbox = hold && outboxId ? await testDb.agentOutbox.findUnique({ where: { id: outboxId },
+      const waveGate = objectiveFillWaveGate
+      const objectiveOutbox = (hold || waveGate) && outboxId ? await testDb.agentOutbox.findUnique({ where: { id: outboxId },
         select: { id: true, topic: true, aggregateId: true, idempotencyKey: true, payload: true } }) : null
       const objectivePayload = jsonRecord(objectiveOutbox?.payload)
+      const headers = new Headers()
+      for (const name of ["content-type", "x-agent-worker-secret"] as const) {
+        const value = incoming.headers[name]
+        if (typeof value === "string") headers.set(name, value)
+        else if (Array.isArray(value)) headers.set(name, value.join(","))
+      }
       if (hold && outboxId && objectiveOutbox?.topic === "agent.objective-reviewed-fill.dispatch"
         && objectiveOutbox.aggregateId === hold.sessionId
         && objectiveOutbox.idempotencyKey === `agent-objective-reviewed-fill:${hold.approvalId}`
@@ -1314,11 +1340,17 @@ async function startReviewedFillRouteBridge(): Promise<void> {
         }
         await hold.released
       }
-      const headers = new Headers()
-      for (const name of ["content-type", "x-agent-worker-secret"] as const) {
-        const value = incoming.headers[name]
-        if (typeof value === "string") headers.set(name, value)
-        else if (Array.isArray(value)) headers.set(name, value.join(","))
+      const waveApprovalId = waveGate && headers.get("x-agent-worker-secret") === reviewedFillBridgeSecret
+        ? objectiveFillWaveApprovalForOutbox(waveGate, objectiveOutbox) : undefined
+      if (waveGate && waveApprovalId && !waveGate.releasedApprovalIds.has(waveApprovalId) && outboxId) {
+        waveGate.outboxIdsByApprovalId.set(waveApprovalId, outboxId)
+        const predecessor = await testDb.agentTurn.findFirst({ where: {
+          id: waveGate.reviewTurnId, userId: waveGate.userId, sessionId: waveGate.sessionId,
+        }, select: { status: true } })
+        reviewedFillBridgeAttempts.push({ outboxId, status: 200, acknowledgement: "deferred",
+          predecessorStatus: predecessor?.status ?? null, acknowledgementDropped: false })
+        outgoing.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ status: "deferred" }))
+        return
       }
       const routeResponse = await reviewedFillRoute(new NextRequest(new URL(incoming.url ?? "/", "http://127.0.0.1"), {
         method: "POST", headers, body: requestBody,
@@ -1398,6 +1430,51 @@ function releaseObjectiveFillDeliveryHold(hold: ObjectiveFillDeliveryHold): void
   if (objectiveFillDeliveryHold === hold) objectiveFillDeliveryHold = undefined
 }
 
+function armObjectiveFillWaveGate(input: {
+  userId: string; sessionId: string; reviewTurnId: string; applicationTaskIdByApprovalId: ReadonlyMap<string, string>
+}): ObjectiveFillWaveGate {
+  const approvalIds = new Set(input.applicationTaskIdByApprovalId.keys())
+  if (objectiveFillWaveGate || approvalIds.size < 1 || approvalIds.size > 8
+    || [...input.applicationTaskIdByApprovalId.values()].some(value => !value)) {
+    throw new Error("objective_fill_wave_gate_identity_invalid")
+  }
+  const gate: ObjectiveFillWaveGate = { ...input, approvalIds, releasedApprovalIds: new Set(), outboxIdsByApprovalId: new Map() }
+  objectiveFillWaveGate = gate
+  return gate
+}
+
+function objectiveFillWaveApprovalForOutbox(
+  gate: ObjectiveFillWaveGate,
+  outbox: { id: string; topic: string; aggregateId: string; idempotencyKey: string; payload: unknown } | null,
+): string | undefined {
+  if (!outbox || outbox.topic !== "agent.objective-reviewed-fill.dispatch" || outbox.aggregateId !== gate.sessionId) return undefined
+  const payload = jsonRecord(outbox.payload), approvalId = jsonString(payload, "approvalId")
+  if (!payload || !approvalId || !gate.approvalIds.has(approvalId)
+    || Object.keys(payload).sort().join(",") !== "approvalId,applicationTaskId,predecessorTurnId,schemaVersion,sessionId,userId"
+    || outbox.idempotencyKey !== `agent-objective-reviewed-fill:${approvalId}`
+    || payload.schemaVersion !== "agent-harness.v2.objective-reviewed-fill-handoff.v1"
+    || payload.userId !== gate.userId || payload.sessionId !== gate.sessionId
+    || payload.applicationTaskId !== gate.applicationTaskIdByApprovalId.get(approvalId)
+    || payload.predecessorTurnId !== gate.reviewTurnId) return undefined
+  return approvalId
+}
+
+async function waitForObjectiveFillWaveDeferred(
+  gate: ObjectiveFillWaveGate, approvalIds: readonly string[], timeoutMs = 60_000,
+): Promise<void> {
+  const until = Date.now() + timeoutMs
+  const allDeferred = () => approvalIds.every(approvalId => {
+    const outboxId = gate.outboxIdsByApprovalId.get(approvalId)
+    return Boolean(outboxId && reviewedFillBridgeAttempts.some(attempt =>
+      attempt.outboxId === outboxId && attempt.status === 200 && attempt.acknowledgement === "deferred"))
+  })
+  while (!allDeferred() && Date.now() < until) {
+    if (worker && exited(worker)) throw new Error("Worker exited before all Objective handoffs were deferred")
+    await delay(50)
+  }
+  if (!allDeferred()) throw new Error("objective_fill_wave_deferred_handoff_timeout")
+}
+
 async function waitForReviewedFillBridgeRecoveryAttempts(outboxId: string, timeoutMs = 30_000): Promise<ReviewedFillBridgeAttempt[]> {
   const until = Date.now() + timeoutMs
   let attempts = reviewedFillBridgeAttempts.filter(attempt => attempt.outboxId === outboxId)
@@ -1416,6 +1493,8 @@ type SelectedJobFullLoopPhase = "cleanup_started" | "cleanup_completed" | "setup
   | "source_completed" | "review_start_started" | "review_turn_created" | "approval_wait_started" | "approval_observed"
   | "approval_decision_started" | "approval_decision_accepted" | "review_terminal_wait_started" | "review_turn_completed"
   | "handoff_retry_wait_started" | "handoff_published" | "fill_turn_wait_started" | "fill_turn_created"
+  | "objective_wave_source_ready" | "objective_wave_set_issued" | "objective_wave_stale_retired"
+  | "objective_wave_five_decided"
   | "fill_form_wait_started" | "fill_form_filled" | "final_checks_started" | "final_checks_completed"
 
 function selectedJobFullLoopPhase(phase: SelectedJobFullLoopPhase): void {
@@ -1603,10 +1682,13 @@ async function cleanRunArtifacts(): Promise<void> {
   ])
   const failedQueueCleanup = queueCleanup.some(result => result.status === "rejected")
   await testDb.agentOutbox.deleteMany({ where: { aggregateId: { in: sessionIds } } })
-  if (reviewedJobIds.length) {
-    await testDb.agentArtifact.deleteMany({ where: { userId: ids.user, jobId: { in: reviewedJobIds } } })
-    await testDb.agentSession.deleteMany({ where: { id: { in: reviewedSessionIds }, userId: ids.user } })
-    await testDb.job.deleteMany({ where: { id: { in: reviewedJobIds }, userId: ids.user } })
+  const cleanupOwners = new Set([ids.user, ...reviewedJobOwners.values(), ...reviewedSessionOwners.values()])
+  for (const ownerId of cleanupOwners) {
+    const ownerJobIds = reviewedJobIds.filter(jobId => (reviewedJobOwners.get(jobId) ?? ids.user) === ownerId)
+    const ownerSessionIds = reviewedSessionIds.filter(sessionId => (reviewedSessionOwners.get(sessionId) ?? ids.user) === ownerId)
+    if (ownerJobIds.length) await testDb.agentArtifact.deleteMany({ where: { userId: ownerId, jobId: { in: ownerJobIds } } })
+    if (ownerSessionIds.length) await testDb.agentSession.deleteMany({ where: { id: { in: ownerSessionIds }, userId: ownerId } })
+    if (ownerJobIds.length) await testDb.job.deleteMany({ where: { id: { in: ownerJobIds }, userId: ownerId } })
   }
   if (createdUsers.length) await testDb.user.deleteMany({ where: { id: { in: createdUsers } } })
   await unlink(socketPath).catch(() => undefined)
@@ -1660,7 +1742,7 @@ async function objectiveSubmitTimeoutSnapshot(input: {
   constraintHash: string; workerTaskId: string; slotOrdinal: number; routeGetBaseline: number
 }) {
   try {
-    const [task, approval, starts, stats] = await Promise.all([
+    const [task, approval, starts, attempts, stats] = await Promise.all([
       testDb.applicationTask.findFirst({ where: { id: input.applicationTaskId, userId: ids.user,
         sessionId: input.sessionId, jobId: input.jobId, fillTurnId: input.fillTurnId } }),
       testDb.agentApproval.findFirst({ where: { id: input.approvalId, userId: ids.user, sessionId: input.sessionId,
@@ -1668,6 +1750,9 @@ async function objectiveSubmitTimeoutSnapshot(input: {
       testDb.applicationTaskEvent.findMany({ where: { taskId: input.applicationTaskId,
         type: "submission_execution_started", actor: "worker" }, take: 2,
         select: { id: true, taskId: true, type: true, actor: true, body: true, data: true } }),
+      testDb.submissionAttempt.findMany({ where: { userId: ids.user, jobId: input.jobId, receiptId: input.approvalId,
+        constraintHash: input.constraintHash }, take: 2,
+        select: { state: true, errorCode: true, constraintHash: true } }),
       requestFixtureStats(500).catch(() => null),
     ])
     const taskErrorCategory = await objectiveSubmitTaskErrorCategory(task?.error)
@@ -1693,6 +1778,13 @@ async function objectiveSubmitTimeoutSnapshot(input: {
         ? Math.min(1000, Math.max(0, Number(observedGets) - input.routeGetBaseline)) : null,
       post: receipt ? { attempted: Math.min(1000, Math.max(0, receipt.attempts)),
         valid: Math.min(1000, Math.max(0, receipt.validAttempts)), rejected: Math.min(1000, Math.max(0, receipt.malformedAttempts)) } : null,
+      receiptOutcome: { present: approval !== null,
+        status: approval ? reviewedFillDiagnosticValue(approval.status, new Set(["pending", "approved", "consumed", "rejected", "expired"])) : null,
+        consumedAtValid: approval?.consumedAt instanceof Date, sameScopeHash: approval?.scopeHash === input.constraintHash },
+      submissionAttempt: { count: Math.min(2, attempts.length),
+        state: attempts.length === 1 ? diagnosticSubmissionAttemptState(attempts[0]?.state) : attempts.length > 1 ? "other" : null,
+        errorCategory: attempts.length === 1 ? diagnosticSubmissionAttemptErrorCode(attempts[0]?.errorCode) : null,
+        sameScopeHash: attempts.length === 1 && attempts[0]?.constraintHash === input.constraintHash },
       consumedReceipt: Boolean(approval && approval.status === "consumed" && approval.consumedAt instanceof Date
         && approval.scopeHash === input.constraintHash),
       exactSubmissionStartMarker: exactStartMarker,
@@ -1705,7 +1797,8 @@ async function objectiveSubmitTimeoutSnapshot(input: {
 
 async function objectiveSubmitTaskErrorCategory(value: unknown): Promise<string | null> {
   if (value === "browser_manual") return "browser_manual"
-  const { CAPTCHA_USER_TAKEOVER_MESSAGE, CHALLENGE_DETECTION_FAILED_MESSAGE } = await import("../../../../../../worker/src/db/application-task-state")
+  const { CAPTCHA_USER_TAKEOVER_MESSAGE, CHALLENGE_DETECTION_FAILED_MESSAGE } =
+    await import("../../../../../../worker/src/db/application-task-state")
   if (value === CAPTCHA_USER_TAKEOVER_MESSAGE) return "captcha_user_takeover"
   if (value === CHALLENGE_DETECTION_FAILED_MESSAGE) return "challenge_detection_failed"
   return diagnosticMachineErrorCode(value)
@@ -1750,7 +1843,7 @@ const REVIEWED_FILL_DIAGNOSTIC_STATUSES = new Set([
 const REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS = new Set([
   "materials_ready", "taskgraph_fill_queued", "browser_active", "form_answer_required", "fill_outcome_uncertain",
   "form_filled", "submission_authorized", "submission_request_started", "submission_uncertain", "submission_verified",
-  "queue_retry", "turn_stopped_before_submit", "fill_prestart_failed",
+  "queue_retry", "turn_stopped_before_submit", "fill_prestart_failed", "user_takeover",
 ])
 const OBJECTIVE_JOB_DIAGNOSTIC_STATUSES = new Set(["saved", "applied", "interview", "offer", "rejected"])
 const OBJECTIVE_JOB_DIAGNOSTIC_WORKFLOW_STATES = new Set(["draft", "ready_to_apply", "queued", "submitting", "submitted"])
@@ -1820,6 +1913,8 @@ async function createReviewedSourceScenario(label: "positive" | "stale", descrip
   const sessionId = `full-loop-reviewed-session-${runId}-${label}`
   reviewedJobIds.push(jobId)
   reviewedSessionIds.push(sessionId)
+  reviewedJobOwners.set(jobId, ids.user)
+  reviewedSessionOwners.set(sessionId, ids.user)
   await testDb.job.create({ data: {
     id: jobId, userId: ids.user, company: "ApplyMate Synthetic Fixture Employer", role: "Software Engineer", location: "Dublin",
     url: "https://boards.greenhouse.io/example-reviewed/jobs/1", description, keywords: "TypeScript", score: 92,
@@ -1878,7 +1973,7 @@ async function readObjectiveApplicationReviewSnapshot(input: { sessionId: string
 }
 
 async function waitForObjectiveApplicationReviewSnapshot(
-  input: { sessionId: string; turnId: string; token: string }, predicate: (snapshot: Record<string, unknown>) => boolean,
+  input: { userId?: string; sessionId: string; turnId: string; token: string }, predicate: (snapshot: Record<string, unknown>) => boolean,
   timeoutMs = 120_000, targetSlotOrdinal = 0,
 ): Promise<Record<string, unknown>> {
   const until = Date.now() + timeoutMs
@@ -1898,7 +1993,7 @@ async function waitForObjectiveApplicationReviewSnapshot(
     if (Date.now() - lastTurnCheckAt >= 1_000) {
       lastTurnCheckAt = Date.now()
       const turn = await testDb.agentTurn.findFirst({ where: {
-        id: input.turnId, sessionId: input.sessionId, userId: ids.user,
+        id: input.turnId, sessionId: input.sessionId, userId: input.userId ?? ids.user,
       }, select: { status: true } })
       if (turn?.status === "failed") {
         const diagnostic = await objectiveApplicationReviewFailureDiagnostics(input, targetSlotOrdinal, statusCounts, lastGet)
@@ -1964,11 +2059,12 @@ function objectiveReviewGetDiagnostic(status: number, bodyValue: unknown, target
 }
 
 async function objectiveApplicationReviewFailureDiagnostics(
-  input: { sessionId: string; turnId: string }, targetSlotOrdinal: number,
+  input: { userId?: string; sessionId: string; turnId: string }, targetSlotOrdinal: number,
   statusCounts: Record<string, number>, lastGet: ObjectiveReviewGetDiagnostic,
 ) {
   try {
-    const turns = await testDb.agentTurn.findMany({ where: { id: input.turnId, sessionId: input.sessionId, userId: ids.user }, take: 2,
+    const userId = input.userId ?? ids.user
+    const turns = await testDb.agentTurn.findMany({ where: { id: input.turnId, sessionId: input.sessionId, userId }, take: 2,
       select: { id: true, rootTaskId: true, status: true, error: true, revision: true } })
     const turn = turns.length === 1 ? turns[0] : undefined
     const rootId = typeof turn?.rootTaskId === "string" ? turn.rootTaskId : null
@@ -1987,7 +2083,7 @@ async function objectiveApplicationReviewFailureDiagnostics(
     const set = item && parseObjectiveApplicationApprovalSet(item.content)
     const validSet = Boolean(set && set.setId === setId && set.members.every(member =>
       member.approvalId === `objective-review:${setId}:${member.slotOrdinal}`))
-    const approvals = set && validSet ? await testDb.agentApproval.findMany({ where: { userId: ids.user, sessionId: input.sessionId,
+    const approvals = set && validSet ? await testDb.agentApproval.findMany({ where: { userId, sessionId: input.sessionId,
       turnId: input.turnId, type: "review_application", id: { in: set.members.map(member => member.approvalId) } }, take: 9,
       select: { id: true, status: true, revision: true, decidedAt: true } }) : []
     const approvalStatuses = emptyObjectiveReviewStatusCounts()
@@ -2060,6 +2156,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     if (objectiveFillDeliveryHold) releaseObjectiveFillDeliveryHold(objectiveFillDeliveryHold)
     try { await releaseLegacyFinalResponseGate() } catch (error) { cleanupError = error }
     try { await stopFixture(worker) } catch (error) { cleanupError ??= error }
+    if (!worker || exited(worker)) objectiveFillWaveGate = undefined
     try { await stopFixture(site) } catch (error) { cleanupError ??= error }
     try { await stopReviewedFillRouteBridge() } catch (error) { cleanupError ??= error }
     try { await cleanRunArtifacts() } catch (error) { cleanupError ??= error }
@@ -3654,6 +3751,399 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       }
     }
   }, 360_000)
+
+  it("issues one six-slot Objective review set, retires only the edited Resume, and approves the five current slots", async () => {
+    const userId = `${ids.user}-objective-wave`
+    const sessionId = `full-loop-objective-wave-session-${runId}`
+    const suffix = `full-loop-objective-wave-${runId}`
+    const selectedOrdinals = [1, 2, 4, 5, 6, 7] as const
+    const staleOrdinal = 6
+    const currentOrdinals = [1, 2, 4, 5, 7] as const
+    const objectiveDomainQuotaKey = `ratelimit:domain:${userId}:boards.greenhouse.io`
+    const redis = await applyQueue!.client
+    expect(await redis.get(objectiveDomainQuotaKey)).toBeNull()
+    reviewedSessionIds.push(sessionId)
+    reviewedSessionOwners.set(sessionId, userId)
+    const priorWaveFlag = process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES
+    let sourceWorker: Child | undefined
+    let gate: ObjectiveFillWaveGate | undefined
+    try {
+      const waveUser = await testDb.user.create({ data: { id: userId, email: `${userId}@example.test`,
+        name: "Synthetic Objective Wave Candidate", plan: "pro", phone: "+353000000000", location: "Dublin",
+        personaFields: [{ key: "firstName", value: "A" }, { key: "lastName", value: "B" }] } })
+      createdUsers.push(waveUser.id)
+      await testDb.agentSession.create({ data: { id: sessionId, userId, goal: "Prepare six verified Objective applications for review",
+        status: "running", source: "application_full_loop_objective_wave" } })
+
+      const { Pool } = workerRequire("pg") as { Pool: new (options: { connectionString: string }) => { end(): Promise<void> } }
+      const sourceFixture = await import(objectiveTailorWaveSourceFixturePath) as unknown as {
+        seedObjectiveTailorWaveSource(pool: unknown, owner: { userId: string; suffix: string },
+          jobIdForSlot: (suffix: string, slot: number) => string): Promise<{
+            jobs: readonly Readonly<{ id: string; source: string }>[]; resumeId: string
+          }>
+      }
+      const sourcePool = new Pool({ connectionString: databaseUrl! })
+      const objectiveJobIds = Array.from({ length: 8 }, () => randomUUID())
+      let seeded: Awaited<ReturnType<typeof sourceFixture.seedObjectiveTailorWaveSource>>
+      try {
+        seeded = await sourceFixture.seedObjectiveTailorWaveSource(sourcePool, { userId, suffix }, (ownerSuffix, slot) => {
+          if (ownerSuffix !== suffix) throw new Error("Objective wave source owner scope changed")
+          const id = objectiveJobIds[slot]
+          if (!id) throw new Error("Objective wave source slot is unsupported")
+          return id
+        })
+      } finally { await sourcePool.end() }
+      const jobIds = seeded.jobs.map(job => job.id)
+      reviewedJobIds.push(...jobIds)
+      for (const jobId of jobIds) reviewedJobOwners.set(jobId, userId)
+      const adaptedResumeByJob = new Map<string, string>()
+      for (const [index, job] of seeded.jobs.entries()) {
+        const url = `https://boards.greenhouse.io/example-objective/jobs/${index + 1}`
+        const updated = await testDb.job.updateMany({ where: { id: job.id, userId }, data: { url } })
+        expect(updated.count).toBe(1)
+        const resumeId = `full-loop-objective-wave-adapted-${suffix}-${index}`
+        await testDb.resume.create({ data: { id: resumeId, userId, name: `Synthetic wave role ${index + 1}`,
+          content: { text: "Synthetic confirmed engineering experience for this exact role." }, kind: "adapted", origin: "manual",
+          targetJobId: job.id, parentResumeId: seeded.resumeId, isDefault: false, materialRevision: 1 } })
+        await testDb.job.update({ where: { id: job.id }, data: { finalResumeId: resumeId, finalResumeAssignmentRevision: 1 } })
+        adaptedResumeByJob.set(job.id, resumeId)
+      }
+
+      const token = await signedBearer(userId)
+      const objective = "Find and assess current software engineering roles, then prepare tailored cover letters for the strongest matches"
+      const startKey = `objective-wave-six-start-${runId}`
+      const requirements = { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+        { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+      ] }
+      const { POST: startObjective } = await import("@/app/api/agent/sessions/[id]/start-objective/route")
+      await stopFixture(worker)
+      worker = undefined
+      process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES = "1"
+      const startResponse = await startObjective(apiRequest(`/api/agent/sessions/${sessionId}/start-objective`, token, "POST", {
+        schemaVersion, clientMessageId: startKey, objective, content: [{ type: "text", text: objective }],
+        verificationRequirements: requirements,
+      }, { "idempotency-key": startKey }), { params: Promise.resolve({ id: sessionId }) })
+      expect(startResponse.status).toBe(202)
+      const started = await jsonResponse(startResponse), sourceTurnId = typeof started.turnId === "string" ? started.turnId : ""
+      if (!sourceTurnId) throw new Error("Objective wave start returned no source Turn")
+      sourceWorker = spawnObjectiveTailorWaveFixture({ userId, sessionId, turnId: sourceTurnId })
+      worker = sourceWorker
+      await waitLine(sourceWorker, "TAILOR_WAVE_WORKER_READY resume", 90_000)
+      const sourceTerminal = await waitForAgentTurnTerminal(sourceTurnId, 240_000)
+      if (sourceTerminal.status !== "completed") {
+        const diagnostic = await objectiveSourceFailureSnapshot({ sessionId, turnId: sourceTurnId,
+          lines: sourceWorker.lines, errors: sourceWorker.errors })
+        throw new Error(`Objective wave source failed ${JSON.stringify(diagnostic)}`)
+      }
+      const sourceTurn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: sourceTurnId } })
+      expect(sourceTurn).toMatchObject({ userId, sessionId, source: "user", status: "completed", executionMode: "canonical_task_graph" })
+      const sourceRootTaskId = sourceTurn.rootTaskId
+      if (typeof sourceRootTaskId !== "string" || !sourceRootTaskId) throw new Error("Objective wave Root is missing")
+      const graphRow = await testDb.agentItem.findFirstOrThrow({ where: {
+        sessionId, turnId: sourceTurnId, taskId: sourceRootTaskId, type: "task_graph",
+      }, select: { id: true, revision: true, content: true } })
+      const graphContent = jsonRecord(graphRow.content), marker = parseObjectiveTailorGraph(graphContent?.objectiveTailor, graphContent?.nodes)
+      if (!marker || marker.slots.length !== 8) throw new Error("Objective wave graph has no exact eight-slot marker")
+      const sourceCompletedEvent = await testDb.agentEvent.findFirstOrThrow({ where: {
+        id: `turn:${sourceTurnId}:event:turn-completed`, sessionId, turnId: sourceTurnId,
+      }, select: { payload: true } })
+      const finalItemId = jsonString(sourceCompletedEvent.payload, "finalItemId")
+      if (!finalItemId) throw new Error("Objective wave source has no final item")
+      const finalItem = await testDb.agentItem.findFirstOrThrow({ where: { id: finalItemId, sessionId, turnId: sourceTurnId,
+        taskId: sourceRootTaskId, type: "agent_message", status: "completed", phase: "final_answer" }, select: { content: true } })
+      const finalContent = jsonRecord(finalItem.content)
+      const sidecar = parseObjectiveTailorFinalOutcomeSidecar(finalContent?.objectiveTailorFinalOutcomes)
+      expect(sidecar?.slots.map(slot => [slot.ordinal, slot.status])).toEqual([
+        [1, "ready"], [2, "ready"], [3, "rejected"], [4, "ready"],
+        [5, "ready"], [6, "ready"], [7, "ready"], [8, "rejected"],
+      ])
+      selectedJobFullLoopPhase("objective_wave_source_ready")
+
+      const graphNodes = Array.isArray(graphContent?.nodes) ? graphContent.nodes : []
+      const nodeForKey = (key: string) => graphNodes.find(node => jsonString(node, "key") === key)
+      const sourceTaskIds = marker.slots.flatMap(slot => [slot.writerNodeKey, slot.reviewerNodeKey,
+        ...(slot.correction ? [slot.correction.writerNodeKey, slot.correction.reviewerNodeKey] : [])]
+        .map(key => jsonString(nodeForKey(key), "taskId"))).filter((id): id is string => Boolean(id))
+      expect(new Set(sourceTaskIds).size).toBe(sourceTaskIds.length)
+      const sourceTasks = await testDb.subAgentTask.findMany({ where: { id: { in: sourceTaskIds }, sessionId,
+        turnId: sourceTurnId, rootTaskId: sourceRootTaskId }, select: { id: true, role: true, taskType: true, status: true, context: true, result: true } })
+      const taskById = new Map(sourceTasks.map(task => [task.id, task] as const))
+      const candidates: Array<{ ordinal: number; jobId: string; resumeId: string; routeOrdinal: number;
+        writerTaskId: string; reviewerTaskId: string; artifactRef: { artifactId: string; version: number; contentHash: string; sourceDigest: string };
+        expectedCoverLetterSha256: string; corrected: boolean }> = []
+      for (const ordinal of selectedOrdinals) {
+        const slot = marker.slots.find(value => value.slotId === `tailor-${ordinal}`)
+        if (!slot || (ordinal === 2 || ordinal === 6) !== Boolean(slot.correction)) throw new Error("Objective wave correction shape is invalid")
+        const writerKey = slot.correction?.writerNodeKey ?? slot.writerNodeKey
+        const reviewerKey = slot.correction?.reviewerNodeKey ?? slot.reviewerNodeKey
+        const writerTaskId = jsonString(nodeForKey(writerKey), "taskId"), reviewerTaskId = jsonString(nodeForKey(reviewerKey), "taskId")
+        if (!writerTaskId || !reviewerTaskId) throw new Error("Objective wave final pair omitted task identities")
+        const writer = taskById.get(writerTaskId), reviewer = taskById.get(reviewerTaskId)
+        if (!writer || !reviewer || writer.status !== "completed" || reviewer.status !== "completed"
+          || writer.role !== "writer" || reviewer.role !== "reviewer" || writer.taskType !== "cover_letter_draft"
+          || reviewer.taskType !== "cover_letter_review") throw new Error("Objective wave final pair is incomplete")
+        const writerResult = await reviewedSourceStructuredResult(writer.status, writer.result, "writer")
+        const reviewerResult = await reviewedSourceStructuredResult(reviewer.status, reviewer.result, "reviewer")
+        expect(reviewerResult.reviewStatus).toBe("passed")
+        const ref = jsonRecord(writerResult.artifactRef), jobId = jsonString(jsonRecord(writer.context)?.selectedJobPreparation, "jobId")
+        const resumeId = jobId ? adaptedResumeByJob.get(jobId) : undefined
+        if (!ref || !jobId || !resumeId || !Number.isSafeInteger(ref.version)
+          || typeof ref.artifactId !== "string" || typeof ref.contentHash !== "string" || typeof ref.sourceDigest !== "string") {
+          throw new Error("Objective wave final artifact binding is incomplete")
+        }
+        const job = await testDb.job.findFirstOrThrow({ where: { id: jobId, userId }, select: { url: true } })
+        const routeMatch = typeof job.url === "string"
+          ? /^https:\/\/boards\.greenhouse\.io\/example-objective\/jobs\/(\d+)$/.exec(job.url) : null
+        if (!routeMatch) throw new Error("Objective wave Job URL has no exact synthetic route")
+        const routeOrdinal = Number(routeMatch[1])
+        const [artifact, review] = await Promise.all([
+          testDb.agentArtifactVersion.findFirstOrThrow({ where: { userId, sessionId, jobId, taskId: writerTaskId,
+            artifactId: ref.artifactId, version: Number(ref.version) }, select: { content: true, contentHash: true, sourceDigest: true } }),
+          testDb.agentArtifactReview.findFirstOrThrow({ where: { userId, sessionId, jobId, taskId: reviewerTaskId,
+            artifactId: ref.artifactId, version: Number(ref.version), status: "passed" }, select: { status: true } }),
+        ])
+        if (typeof artifact.content !== "string") throw new Error("Objective wave approved artifact has no exact letter text")
+        expect(artifact).toMatchObject({ contentHash: ref.contentHash, sourceDigest: ref.sourceDigest })
+        expect(review.status).toBe("passed")
+        candidates.push({ ordinal, jobId, resumeId, routeOrdinal, writerTaskId, reviewerTaskId,
+          artifactRef: { artifactId: ref.artifactId, version: Number(ref.version), contentHash: ref.contentHash, sourceDigest: ref.sourceDigest },
+          expectedCoverLetterSha256: createHash("sha256").update(artifact.content).digest("hex"),
+          corrected: Boolean(slot.correction) })
+      }
+      expect(candidates.map(candidate => candidate.ordinal)).toEqual(selectedOrdinals)
+      expect(new Set(candidates.map(candidate => candidate.jobId)).size).toBe(6)
+
+      if (sourceWorker && !exited(sourceWorker)) await stopFixture(sourceWorker)
+      worker = spawnFixture("worker", userId)
+      await waitLine(worker, "WORKER_READY", 90_000)
+      const selection = { schema: "agent-harness.v2.objective-application-review-intent.v1", sourceTurnId,
+        rootTaskId: sourceRootTaskId, graphItemId: graphRow.id, graphRevision: graphRow.revision,
+        slotOrdinals: [...selectedOrdinals] }
+      const startedReview = await startObjectiveApplicationReview({ sessionId, token,
+        key: `objective-review-six-${runId}`, selection })
+      expect(startedReview.response.status).toBe(202)
+      const reviewTurnId = typeof startedReview.body.turnId === "string" ? startedReview.body.turnId : ""
+      if (!reviewTurnId) throw new Error("Six-slot Objective review returned no Turn")
+      const pendingSnapshot = await waitForObjectiveApplicationReviewSnapshot({ userId, sessionId, turnId: reviewTurnId, token }, snapshot => {
+        const members = Array.isArray(snapshot.members) ? snapshot.members.map(jsonRecord) : []
+        return snapshot.setStatus === "pending" && members.length === 6 && members.every(member =>
+          member?.status === "pending" && member.decisionAvailable === true)
+      }, 180_000)
+      const pendingMembers = (pendingSnapshot.members as unknown[]).map(jsonRecord)
+      const currentByOrdinal = new Map(candidates.map(candidate => [candidate.ordinal, candidate] as const))
+      const approvalIdByOrdinal = new Map<number, string>(), applicationTaskIdByApprovalId = new Map<string, string>()
+      for (const candidate of candidates) {
+        const member = pendingMembers.find(value => value?.slotOrdinal === candidate.ordinal)
+        const approvalId = typeof member?.approvalId === "string" ? member.approvalId : ""
+        if (!member || !approvalId) throw new Error("Six-slot Objective review omitted a pending member")
+        expect(member).toMatchObject({ slotOrdinal: candidate.ordinal, status: "pending", decisionAvailable: true,
+          resumeId: candidate.resumeId, artifactRef: candidate.artifactRef })
+        const approval = await waitForReviewedApproval(approvalId)
+        expect(approval).toMatchObject({ userId, sessionId, turnId: reviewTurnId, jobId: candidate.jobId,
+          type: "review_application", status: "pending" })
+        if (!approval.taskId) throw new Error("Six-slot Objective approval omitted its ApplicationTask")
+        const applicationTask = await testDb.applicationTask.findFirstOrThrow({ where: {
+          id: approval.taskId, userId, sessionId, jobId: candidate.jobId,
+        }, select: { id: true, resumeId: true, status: true, checkpoint: true, fillTurnId: true, workerTaskId: true } })
+        expect(applicationTask).toMatchObject({ resumeId: candidate.resumeId, status: "waiting_for_user",
+          checkpoint: "materials_ready", fillTurnId: null, workerTaskId: null })
+        approvalIdByOrdinal.set(candidate.ordinal, approvalId)
+        if (candidate.ordinal !== staleOrdinal) applicationTaskIdByApprovalId.set(approvalId, applicationTask.id)
+      }
+      expect(await testDb.agentApproval.count({ where: { userId, sessionId, turnId: reviewTurnId,
+        type: "review_application", status: "pending" } })).toBe(6)
+      expect(currentByOrdinal.size).toBe(6)
+      selectedJobFullLoopPhase("objective_wave_set_issued")
+
+      const statsBeforeDecisions = await requestFixtureStats()
+      expect(statsBeforeDecisions.objectiveGetCounts).toHaveLength(8)
+      expect(statsBeforeDecisions.objectiveSubmitReceipts.every(receipt => receipt.attempts === 0
+        && receipt.validAttempts === 0 && receipt.malformedAttempts === 0)).toBe(true)
+      const staleCandidate = currentByOrdinal.get(staleOrdinal)!, staleApprovalId = approvalIdByOrdinal.get(staleOrdinal)!
+      const staleApplicationTaskId = (await testDb.agentApproval.findUniqueOrThrow({ where: { id: staleApprovalId }, select: { taskId: true } })).taskId
+      if (!staleApplicationTaskId) throw new Error("Stale Objective member has no ApplicationTask")
+      const { PATCH: patchResume } = await import("@/app/api/resume/[id]/route")
+      const resumeEdit = await withObjectiveResumeAmbientAuth(token, () => patchResume(apiRequest(
+        `/api/resume/${staleCandidate.resumeId}`, token, "PATCH", {
+          content: { text: "Synthetic authorized Resume edit after six-slot Objective review." },
+        }), { params: Promise.resolve({ id: staleCandidate.resumeId }) }))
+      expect(resumeEdit.status).toBe(200)
+      const editedResume = await testDb.resume.findFirstOrThrow({ where: { id: staleCandidate.resumeId, userId },
+        select: { content: true, targetJobId: true, kind: true } })
+      expect(editedResume).toMatchObject({ targetJobId: staleCandidate.jobId, kind: "adapted",
+        content: { text: "Synthetic authorized Resume edit after six-slot Objective review." } })
+      const staleApproval = await testDb.agentApproval.findUniqueOrThrow({ where: { id: staleApprovalId }, select: { payload: true } })
+      const boundResumeWitness = jsonRecord(jsonRecord(staleApproval.payload)?.proof)?.resumeWitness
+      const { readObjectiveApplicationResumeWitness } = await import("@/lib/agent/approval/objective-application-resume-witness")
+      const { acquireSourceMaterialFence } = await import("@/lib/agent/source-material-fence")
+      const currentResumeWitness = await testDb.$transaction(async tx => {
+        await acquireSourceMaterialFence(tx, [userId])
+        return readObjectiveApplicationResumeWitness(tx, { userId, jobId: staleCandidate.jobId })
+      })
+      expect(boundResumeWitness).toBeDefined()
+      expect(currentResumeWitness).not.toEqual(boundResumeWitness)
+
+      const currentApprovals = currentOrdinals.map(ordinal => approvalIdByOrdinal.get(ordinal)!)
+      gate = armObjectiveFillWaveGate({ userId, sessionId, reviewTurnId, applicationTaskIdByApprovalId })
+      expect(gate.approvalIds.size).toBe(5)
+      reviewedFillBridgeAttempts.length = 0
+      const { POST: decideObjectiveReview } = await import("@/app/api/agent/sessions/[id]/objective-application-review/[turnId]/route")
+      for (const ordinal of currentOrdinals) {
+        const approvalId = approvalIdByOrdinal.get(ordinal)!
+        const snapshot = await readObjectiveApplicationReviewSnapshot({ sessionId, turnId: reviewTurnId, token })
+        expect(snapshot.response.status).toBe(200)
+        const currentSnapshot = jsonRecord(snapshot.body.snapshot), members = Array.isArray(currentSnapshot?.members)
+          ? currentSnapshot.members.map(jsonRecord) : []
+        const member = members.find(value => value?.slotOrdinal === ordinal)
+        if (!member || member.status !== "pending" || member.decisionAvailable !== true
+          || !Number.isSafeInteger(member.receiptRevision)) throw new Error("Current Objective approval receipt is unavailable")
+        const turnFence = await testDb.agentTurn.findFirstOrThrow({ where: { id: reviewTurnId, userId, sessionId }, select: { revision: true } })
+        const decisionKey = `objective-review-six-${ordinal}-${runId}`
+        const decision = await decideObjectiveReview(apiRequest(
+          `/api/agent/sessions/${sessionId}/objective-application-review/${reviewTurnId}`, token, "POST", {
+            approvalId, expectedRevision: turnFence.revision, expectedReceiptRevision: member.receiptRevision,
+            idempotencyKey: decisionKey, decision: "approved",
+          }), { params: Promise.resolve({ id: sessionId, turnId: reviewTurnId }) })
+        await expectObjectiveDecisionAccepted(testDb, decision, { turnId: reviewTurnId, approvalId,
+          snapshotTurnRevision: currentSnapshot?.turnRevision, snapshotReceiptRevision: member.receiptRevision,
+          expectedTurnRevision: turnFence.revision, expectedReceiptRevision: member.receiptRevision })
+        if (ordinal === currentOrdinals[0]) {
+          const afterRetirement = await waitForObjectiveApplicationReviewSnapshot({ userId, sessionId, turnId: reviewTurnId, token }, value => {
+            const rows = Array.isArray(value.members) ? value.members.map(jsonRecord) : []
+            return value.setStatus === "pending" && rows.some(row => row?.slotOrdinal === staleOrdinal && row.status === "expired")
+          }, 30_000, staleOrdinal)
+          expect((afterRetirement.members as unknown[]).map(jsonRecord).find(row => row?.slotOrdinal === staleOrdinal))
+            .toMatchObject({ status: "expired", decisionAvailable: false })
+          expect(await testDb.agentApproval.findUniqueOrThrow({ where: { id: staleApprovalId }, select: { status: true } }))
+            .toEqual({ status: "expired" })
+          selectedJobFullLoopPhase("objective_wave_stale_retired")
+        }
+      }
+      const terminal = await waitForAgentTurnTerminal(reviewTurnId, 90_000)
+      expect(terminal.status).toBe("completed")
+      const resolvedSnapshot = await waitForObjectiveApplicationReviewSnapshot({ userId, sessionId, turnId: reviewTurnId, token }, value => {
+        const rows = Array.isArray(value.members) ? value.members.map(jsonRecord) : []
+        return value.setStatus === "resolved" && rows.length === 6
+          && rows.filter(row => row?.status === "approved").length === 5
+          && rows.filter(row => row?.status === "expired").length === 1
+      }, 60_000, staleOrdinal)
+      const resolvedMembers = (resolvedSnapshot.members as unknown[]).map(jsonRecord)
+      expect(resolvedMembers.map(member => [member?.slotOrdinal, member?.status])).toEqual([
+        [1, "approved"], [2, "approved"], [4, "approved"], [5, "approved"], [6, "expired"], [7, "approved"],
+      ])
+      const finalApprovalRows = await testDb.agentApproval.findMany({ where: {
+        id: { in: [...approvalIdByOrdinal.values()] }, userId, sessionId, turnId: reviewTurnId, type: "review_application",
+      }, select: { id: true, status: true } })
+      expect(finalApprovalRows).toHaveLength(6)
+      const finalApprovalStatusByOrdinal = new Map([...approvalIdByOrdinal].map(([ordinal, approvalId]) =>
+        [ordinal, finalApprovalRows.find(row => row.id === approvalId)?.status] as const))
+      expect([...finalApprovalStatusByOrdinal]).toEqual([
+        [1, "approved"], [2, "approved"], [4, "approved"], [5, "approved"], [6, "expired"], [7, "approved"],
+      ])
+      const approvedIntentEvents = await testDb.applicationTaskEvent.findMany({ where: {
+        taskId: { in: [...applicationTaskIdByApprovalId.values()] }, type: "objective_application_review_approved", actor: "user",
+      }, select: { taskId: true, data: true } })
+      expect(approvedIntentEvents).toHaveLength(5)
+      const intentByApprovalId = new Map(approvedIntentEvents.map(event => {
+        const data = jsonRecord(event.data)
+        return [jsonString(data, "approvalId") ?? "", data] as const
+      }))
+      const setIds = new Set<string>()
+      for (const ordinal of currentOrdinals) {
+        const approvalId = approvalIdByOrdinal.get(ordinal)!, candidate = currentByOrdinal.get(ordinal)!
+        const data = intentByApprovalId.get(approvalId)
+        expect(data).toMatchObject({ schemaVersion: "objective-application-review-approved-intent.v1", userId,
+          sessionId, reviewTurnId, applicationTaskId: applicationTaskIdByApprovalId.get(approvalId),
+          jobId: candidate.jobId, approvalId, slotOrdinal: ordinal, sourceTurnId,
+          materialProofHash: expect.stringMatching(/^[a-f0-9]{64}$/) })
+        const setId = jsonString(data, "setId")
+        if (!setId) throw new Error("Approved Objective member has no group-set identity")
+        setIds.add(setId)
+        expect(JSON.stringify(data)).not.toContain("Synthetic authorized Resume edit")
+      }
+      expect(setIds.size).toBe(1)
+      const setId = [...setIds][0]!
+      const setItemId = objectiveApplicationApprovalSetItemId(setId)
+      expect(await testDb.agentItem.findUniqueOrThrow({ where: { id: setItemId } }))
+        .toMatchObject({ id: setItemId, sessionId, turnId: reviewTurnId, type: "approval_request", status: "completed", revision: 1 })
+      const [completedEvents, wakeEvents] = await Promise.all([
+        testDb.agentEvent.findMany({ where: { sessionId, turnId: reviewTurnId, idempotencyKey: `agent-wait:${setItemId}:completed` },
+          select: { id: true, type: true, actor: true, itemId: true, correlationId: true, causationId: true, payload: true } }),
+        testDb.agentEvent.findMany({ where: { sessionId, turnId: reviewTurnId, idempotencyKey: `approval-set:${setId}:wakeup` },
+          select: { id: true, type: true, actor: true, itemId: true, correlationId: true, causationId: true, payload: true } }),
+      ])
+      expect(completedEvents).toHaveLength(1)
+      expect(wakeEvents).toHaveLength(1)
+      expect(completedEvents[0]).toMatchObject({ type: "item.completed", actor: "orchestrator", itemId: setItemId,
+        correlationId: setItemId, causationId: setItemId, payload: { itemId: setItemId, status: "completed" } })
+      expect(wakeEvents[0]).toMatchObject({ type: "turn.wakeup", actor: "user", itemId: setItemId,
+        correlationId: reviewTurnId, causationId: completedEvents[0]?.id,
+        payload: { waitKind: "approval_set", waitId: setId, itemId: setItemId, turnId: reviewTurnId,
+          toolCallId: null, status: "resolved" } })
+
+      const handoffs = await testDb.agentOutbox.findMany({ where: {
+        topic: "agent.objective-reviewed-fill.dispatch", aggregateId: sessionId,
+      }, select: { id: true, topic: true, aggregateId: true, idempotencyKey: true, payload: true, publishedAt: true, attemptCount: true } })
+      expect(handoffs).toHaveLength(5)
+      const outboxIdByApprovalId = new Map<string, string>()
+      for (const row of handoffs) {
+        const approvalId = jsonString(row.payload, "approvalId")
+        if (!approvalId || !currentApprovals.includes(approvalId)) throw new Error("Unexpected Objective member handoff")
+        expect(row.idempotencyKey).toBe(`agent-objective-reviewed-fill:${approvalId}`)
+        expect(row.publishedAt).toBeNull()
+        expect(row.attemptCount).toBe(0)
+        expect(objectiveFillWaveApprovalForOutbox(gate, row)).toBe(approvalId)
+        outboxIdByApprovalId.set(approvalId, row.id)
+      }
+      expect(outboxIdByApprovalId.size).toBe(5)
+      expect(await testDb.agentOutbox.count({ where: { topic: "agent.objective-reviewed-fill.dispatch", aggregateId: sessionId,
+        idempotencyKey: `agent-objective-reviewed-fill:${approvalIdByOrdinal.get(staleOrdinal)}` } })).toBe(0)
+      const staleIntentCount = await testDb.applicationTaskEvent.count({ where: {
+        taskId: staleApplicationTaskId, type: "objective_application_review_approved", actor: "user",
+      } })
+      expect(staleIntentCount).toBe(0)
+      const currentApprovalIds = currentOrdinals.map(ordinal => approvalIdByOrdinal.get(ordinal)!)
+      await waitForObjectiveFillWaveDeferred(gate, currentApprovalIds)
+      for (const approvalId of currentApprovalIds) {
+        const outboxId = outboxIdByApprovalId.get(approvalId)!
+        const attempts = reviewedFillBridgeAttempts.filter(attempt => attempt.outboxId === outboxId)
+        expect(attempts.length).toBeGreaterThan(0)
+        expect(attempts.every(attempt => attempt.status === 200 && attempt.acknowledgement === "deferred")).toBe(true)
+        expect(await testDb.agentOutbox.findUniqueOrThrow({ where: { id: outboxId }, select: { publishedAt: true, attemptCount: true } }))
+          .toEqual({ publishedAt: null, attemptCount: 0 })
+      }
+      const tasksAfterDeferral = await testDb.applicationTask.findMany({ where: {
+        id: { in: [...applicationTaskIdByApprovalId.values()] }, userId, sessionId,
+      }, select: { id: true, status: true, checkpoint: true, fillTurnId: true, workerTaskId: true } })
+      expect(tasksAfterDeferral).toHaveLength(5)
+      expect(tasksAfterDeferral.every(task => task.status === "waiting_for_user" && task.checkpoint === "materials_ready"
+        && task.fillTurnId === null && task.workerTaskId === null)).toBe(true)
+      const postApprovalTurns = await testDb.agentTurn.findMany({ where: { sessionId, userId }, select: { input: true } })
+      expect(postApprovalTurns.filter(turn => jsonString(turn.input, "clientMessageId")
+        ?.startsWith("agent-objective-reviewed-fill:")).length).toBe(0)
+      const staleTaskAfterRetirement = await testDb.applicationTask.findUniqueOrThrow({ where: { userId_jobId: {
+        userId, jobId: staleCandidate.jobId,
+      } }, select: { status: true, checkpoint: true, fillTurnId: true, workerTaskId: true } })
+      expect(staleTaskAfterRetirement).toMatchObject({ status: "waiting_for_user", checkpoint: "materials_ready",
+        fillTurnId: null, workerTaskId: null })
+      const statsAfterDeferral = await requestFixtureStats()
+      expect(statsAfterDeferral.objectiveGetCounts).toEqual(statsBeforeDecisions.objectiveGetCounts)
+      expect(statsAfterDeferral.objectiveSubmitReceipts).toEqual(statsBeforeDecisions.objectiveSubmitReceipts)
+      expect(statsAfterDeferral.objectiveMaterialExactCount).toBe(statsBeforeDecisions.objectiveMaterialExactCount)
+      expect(statsAfterDeferral.submitCount).toBe(statsBeforeDecisions.submitCount)
+      expect(statsAfterDeferral.reviewedSubmitCount).toBe(statsBeforeDecisions.reviewedSubmitCount)
+      selectedJobFullLoopPhase("objective_wave_five_decided")
+    } finally {
+      if (sourceWorker && worker !== sourceWorker && !exited(sourceWorker)) await stopFixture(sourceWorker)
+      if (worker && !exited(worker)) await stopFixture(worker)
+      worker = undefined
+      if (priorWaveFlag === undefined) delete process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES
+      else process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES = priorWaveFlag
+      worker = spawnFixture("worker")
+      await waitLine(worker, "WORKER_READY", 90_000)
+    }
+  }, 900_000)
 
   it("denies reviewed approval when the selected-job source changes after Writer and Reviewer finish", async () => {
     const scenario = await createReviewedSourceScenario("stale", "Original synthetic source description.")
