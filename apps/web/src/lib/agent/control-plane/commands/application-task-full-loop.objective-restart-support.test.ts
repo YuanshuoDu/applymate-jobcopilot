@@ -34,7 +34,8 @@ function worker(events: string[], name: string): FakeWorker {
   }
 }
 
-function input(events: string[], options: { failBlocked?: boolean; failWait?: boolean; failReady?: boolean; failCleanup?: boolean } = {}) {
+function input(events: string[], options: { failBlocked?: boolean; failWait?: boolean; failReady?: boolean;
+  failCleanup?: boolean; failReceiver?: boolean } = {}) {
   const original = worker(events, "first")
   const successor = worker(events, "second")
   const projectionBarrier = barrier(events, { failCleanup: options.failCleanup, failWait: options.failWait })
@@ -50,13 +51,17 @@ function input(events: string[], options: { failBlocked?: boolean; failWait?: bo
     args: {
       installBarrier: async () => { events.push("install"); return projectionBarrier },
       publishFinalApproval: async () => { events.push("approve") },
+      waitForReceiver: async () => {
+        events.push("receiver")
+        if (options.failReceiver) throw new Error("objective_wave_receiver_wait_timeout")
+      },
       worker: original,
       waitForExit,
       assertCommittedResult: async (phase: "blocked" | "crashed") => {
         events.push(`result-${phase}`)
         if (phase === "blocked" && options.failBlocked) throw new Error("receipt check failed")
       },
-      ...(options.failWait ? { captureWaitTimeout: async ({ waiterCount, workerAlive }: { waiterCount: number; workerAlive: boolean }) => {
+      ...(options.failWait || options.failReceiver ? { captureWaitTimeout: async ({ waiterCount, workerAlive }: { waiterCount: number; workerAlive: boolean }) => {
         events.push("diagnostic")
         return { available: true, waiterCount, workerAlive, attemptState: "submitted" }
       } } : {}),
@@ -77,7 +82,7 @@ describe("Objective projection restart support", () => {
     const result = await restartObjectiveWorkerAtProjectionBarrier(scenario.args)
     expect(result).toBe(scenario.successor)
     expect(events).toEqual([
-      "install", "approve", "blocked", "result-blocked", "first:SIGKILL", "first-exit",
+      "install", "approve", "receiver", "blocked", "result-blocked", "first:SIGKILL", "first-exit",
       "unblocked", "result-crashed", "cleanup", "spawn", "ready",
     ])
     expect(scenario.waitForExit).toHaveBeenCalledOnce()
@@ -88,7 +93,7 @@ describe("Objective projection restart support", () => {
     const scenario = input(events, { failBlocked: true })
     await expect(restartObjectiveWorkerAtProjectionBarrier(scenario.args)).rejects.toThrow("receipt check failed")
     expect(events).toEqual([
-      "install", "approve", "blocked", "result-blocked", "first:SIGKILL", "first-exit", "unblocked", "cleanup",
+      "install", "approve", "receiver", "blocked", "result-blocked", "first:SIGKILL", "first-exit", "unblocked", "cleanup",
     ])
   })
 
@@ -117,7 +122,20 @@ describe("Objective projection restart support", () => {
     await expect(restartObjectiveWorkerAtProjectionBarrier(scenario.args)).rejects.toThrow(
       'objective_wave_projection_barrier_wait_timeout:{"available":true,"waiterCount":0,"workerAlive":true,"attemptState":"submitted"}',
     )
-    expect(events).toEqual(["install", "approve", "blocked", "read-waiters", "diagnostic", "first:SIGKILL", "first-exit", "unblocked", "cleanup"])
+    expect(events).toEqual(["install", "approve", "receiver", "blocked", "read-waiters", "diagnostic", "first:SIGKILL", "first-exit", "unblocked", "cleanup"])
+  })
+
+  it("reports a distinct receiver timeout and cleans the barrier without starting a successor", async () => {
+    const events: string[] = []
+    const scenario = input(events, { failReceiver: true })
+    await expect(restartObjectiveWorkerAtProjectionBarrier(scenario.args)).rejects.toThrow(
+      'objective_wave_receiver_wait_timeout:{"available":true,"waiterCount":0,"workerAlive":true,"attemptState":"submitted"}',
+    )
+    expect(events).toEqual([
+      "install", "approve", "receiver", "read-waiters", "diagnostic", "first:SIGKILL", "first-exit", "unblocked", "cleanup",
+    ])
+    expect(events).not.toContain("blocked")
+    expect(events).not.toContain("spawn")
   })
 
   it("waits for the exact expected waiter count and rejects ambiguous counts", async () => {

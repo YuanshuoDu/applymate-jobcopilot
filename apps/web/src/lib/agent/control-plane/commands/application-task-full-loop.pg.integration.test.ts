@@ -5099,6 +5099,18 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
                 publishFinalApproval: async () => {
                   approved = { ...prepared, ...await approveFinalSubmission(slot, prepared) }
                 },
+                async waitForReceiver() {
+                  if (!approved || !Number.isSafeInteger(approved.siteLineCursor)) {
+                    throw new Error("Objective receiver wait has no approval cursor")
+                  }
+                  const marker = `OBJECTIVE_SUBMIT_RECEIVED slot=${slot.routeOrdinal}`
+                  let received: string
+                  try { received = await waitLine(site!, marker, 180_000, approved.siteLineCursor) } catch {
+                    throw new Error(exited(captured) ? "objective_wave_worker_exited_before_receiver"
+                      : "objective_wave_receiver_wait_timeout")
+                  }
+                  if (received !== marker) throw new Error("objective_wave_receiver_marker_invalid")
+                },
                 worker: captured,
                 waitForExit: waitExit,
                 captureWaitTimeout,
