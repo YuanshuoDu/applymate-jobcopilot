@@ -18,8 +18,9 @@ const LABELS: Record<ObjectiveTailorFinalOutcomeSidecarStatus, Readonly<{ en: st
 type RequestState = 'pending' | 'accepted' | 'failed'
 type SelectionState = Readonly<{ identity: string; ordinals: readonly number[] }>
 
-export function ObjectiveTailorFinalOutcomes({ content, lang, sessionId, sourceTurnId, rootTaskId, finalItemId }: {
+export function ObjectiveTailorFinalOutcomes({ content, lang, sessionId, sourceTurnId, rootTaskId, finalItemId, relatedTaskSourcesId }: {
   content: unknown; lang: Lang; sessionId?: string; sourceTurnId?: string; rootTaskId?: string | null; finalItemId?: string
+  relatedTaskSourcesId?: string
 }) {
   const [expanded, setExpanded] = useState(false)
   const sidecar = parseObjectiveTailorFinalOutcomesFromContent(content)
@@ -80,6 +81,7 @@ export function ObjectiveTailorFinalOutcomes({ content, lang, sessionId, sourceT
   const versionedSidecar = "sourceCounts" in sidecar ? sidecar : undefined
   const v3Sidecar = sidecar.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA ? sidecar : undefined
   const sourceCounts = versionedSidecar?.sourceCounts
+  const canNavigateToSources = Boolean(sourceCounts && safeId(finalItemId) && safeId(relatedTaskSourcesId))
   const reportedScoreFloor = v3Sidecar?.reportedScoreFloor
   const journeyReport = manifest && (!versionedSidecar || versionedSidecar.graphRevision === manifest.graphRevision)
     && safeId(sessionId) && safeId(finalItemId)
@@ -97,6 +99,7 @@ export function ObjectiveTailorFinalOutcomes({ content, lang, sessionId, sourceT
         <div><dt>{copy.foundJobs}</dt><dd>{sourceCountLabel(sourceCounts.discoveredJobs, lang)}</dd></div>
         <div><dt>{copy.analyzedJobs}</dt><dd>{sourceCountLabel(sourceCounts.analyzedJobs, lang)}</dd></div>
       </dl>
+      {canNavigateToSources && <a href={`#${relatedTaskSourcesId}`}>{copy.relatedEvidence}</a>}
     </section>}
     <ul>{sidecar.slots.map(slot => <li key={slot.ordinal} data-tailor-outcome={slot.status}>
       {copy.job} {slot.ordinal}: {LABELS[slot.status][lang === 'zh' ? 'zh' : 'en']}
@@ -154,9 +157,9 @@ function record(value: unknown): Record<string, unknown> | null {
 }
 const en = { heading: 'Tailoring outcomes', job: 'Job', select: 'Select', request: 'Request application review',
   requesting: 'Starting review…', accepted: 'Review request started.', failed: 'Could not start review. Retry to safely check the same request.',
-  sourceCounts: 'Source counts', foundJobs: 'Found jobs', analyzedJobs: 'Analyzed jobs' }
+  sourceCounts: 'Source counts', foundJobs: 'Found jobs', analyzedJobs: 'Analyzed jobs', relatedEvidence: 'View related task evidence' }
 const zh = { heading: '职位定制结果', job: '职位', select: '选择', request: '请求申请审核',
   requesting: '正在发起审核…', accepted: '审核请求已开始。', failed: '无法发起审核。重试会安全地检查同一请求。',
-  sourceCounts: '来源统计', foundJobs: '已发现职位', analyzedJobs: '已分析职位' }
+  sourceCounts: '来源统计', foundJobs: '已发现职位', analyzedJobs: '已分析职位', relatedEvidence: '查看相关任务证据' }
 const choiceStyle: React.CSSProperties = { display: 'inline-flex', gap: 4, marginLeft: 8, alignItems: 'center' }
 const requestStyle: React.CSSProperties = { display: 'grid', justifyItems: 'start', gap: 4 }

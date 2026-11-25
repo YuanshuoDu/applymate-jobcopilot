@@ -5,6 +5,8 @@ import type { AnswerEvidence, AnswerEvidenceSource } from '@jobcopilot/agent-pro
 import { redactSensitiveValue } from '@jobcopilot/shared/agent-redaction'
 import { projectAnswerEvidence } from '@/lib/agent/session/final-answer-evidence-projection'
 import { projectFinalSummary } from '@/lib/agent/session/final-summary-projection'
+import { parseFinalTaskGraphSourceManifest } from '@/lib/agent/session/final-task-graph-source-manifest'
+import { parseObjectiveTailorFinalOutcomesFromContent } from '@/lib/agent/session/objective-tailor-final-content'
 import { useI18n, type Lang } from '@/lib/i18n'
 import type { TimelineItem } from './timeline-reducer'
 import { contentParts, itemText, type HarnessContentPart, type SuggestedActionCommand } from './harness-item-types'
@@ -29,6 +31,8 @@ export interface PlanStep {
 
 export function HarnessItem({ item, highlightedFinal = false, onSuggestedAction }: HarnessItemProps) {
   const { t, lang } = useI18n()
+  const reactId = React.useId()
+  const relatedTaskSourcesId = hasMatchingObjectiveSourceCounts(item) ? relatedTaskSourcesFragmentId(reactId) : undefined
   const final = item.phase === 'final_answer'
   const accent = final ? 'var(--c-success)' : item.type === 'reasoning_summary' ? '#7c3aed' : 'var(--primary)'
   const title = itemTitle(item.type, t)
@@ -52,7 +56,7 @@ export function HarnessItem({ item, highlightedFinal = false, onSuggestedAction 
         <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>{title}</span>
         {final && <span data-agent-final-label="true" style={{ marginLeft: 'auto', color: accent, fontSize: 10, fontWeight: 700 }}>{t('agent.finalAnswer')}</span>}
       </div>
-      {renderItemBody(item, t, lang, onSuggestedAction)}
+      {renderItemBody(item, t, lang, onSuggestedAction, relatedTaskSourcesId)}
       <div style={{ marginTop: 11, paddingTop: 8, borderTop: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: 10 }}>
         {t('agent.itemStatus')}: {itemStatusLabel(item.status, t)}
       </div>
@@ -72,7 +76,8 @@ export function reducePlanSteps(value: unknown): PlanStep[] {
   }).filter((step): step is PlanStep => step !== null)
 }
 
-function renderItemBody(item: TimelineItem, t: (key: string) => string, lang: Lang, onSuggestedAction?: HarnessItemProps['onSuggestedAction']) {
+function renderItemBody(item: TimelineItem, t: (key: string) => string, lang: Lang,
+  onSuggestedAction?: HarnessItemProps['onSuggestedAction'], relatedTaskSourcesId?: string) {
   if (item.type === 'plan') return <PlanBody item={item} t={t} />
   if (item.type === 'tool_call' || item.type === 'tool_result') return <ToolLifecycleCard item={item} t={t} lang={lang} />
   if (item.type === 'reasoning_summary') {
@@ -84,10 +89,11 @@ function renderItemBody(item: TimelineItem, t: (key: string) => string, lang: La
   const parts = contentParts(item.content)
   const answerEvidence = finalAnswerEvidence(item)
   const taskGraphSources = item.type === 'agent_message' && item.phase === 'final_answer' && item.status === 'completed'
-    ? <FinalTaskGraphSources content={item.content} sessionId={item.sessionId} finalItemId={item.id} lang={lang} /> : null
+    ? <FinalTaskGraphSources content={item.content} sessionId={item.sessionId} finalItemId={item.id} lang={lang}
+      navigationTargetId={relatedTaskSourcesId} /> : null
   const objectiveTailorFinalOutcomes = item.type === 'agent_message' && item.phase === 'final_answer' && item.status === 'completed'
     ? <ObjectiveTailorFinalOutcomes content={item.content} lang={lang} sessionId={item.sessionId} sourceTurnId={item.turnId}
-      rootTaskId={item.taskId} finalItemId={item.id} /> : null
+      rootTaskId={item.taskId} finalItemId={item.id} relatedTaskSourcesId={relatedTaskSourcesId} /> : null
   return <>
     <div style={{ display: 'grid', gap: 8 }}>
       {summary && <section aria-label={summaryLabel} data-agent-final-summary="true">
@@ -101,6 +107,21 @@ function renderItemBody(item: TimelineItem, t: (key: string) => string, lang: La
     {objectiveTailorFinalOutcomes}
     {taskGraphSources}
   </>
+}
+
+function hasMatchingObjectiveSourceCounts(item: TimelineItem): boolean {
+  if (item.schemaVersion !== 'agent-harness.v2' || item.type !== 'agent_message' || item.phase !== 'final_answer'
+    || item.status !== 'completed' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(item.id)) return false
+  const sidecar = parseObjectiveTailorFinalOutcomesFromContent(item.content)
+  const content = isRecord(item.content) ? item.content : null
+  const manifest = parseFinalTaskGraphSourceManifest(content?.taskGraphSources)
+  return Boolean(sidecar && 'sourceCounts' in sidecar && manifest?.sources.length
+    && sidecar.graphRevision === manifest.graphRevision)
+}
+
+function relatedTaskSourcesFragmentId(reactId: string): string {
+  const encoded = Array.from(reactId, character => character.codePointAt(0)!.toString(16)).join('-')
+  return `related-task-sources-${encoded}`
 }
 
 function finalAnswerEvidence(item: TimelineItem): AnswerEvidence | null {

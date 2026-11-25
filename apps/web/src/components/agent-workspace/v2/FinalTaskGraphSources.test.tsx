@@ -33,6 +33,18 @@ describe('FinalTaskGraphSources', () => {
     for (const privateValue of [sourceKey, 'private-session-id', 'private-final-item-id', 'graphRevision']) expect(html).not.toContain(privateValue)
   })
 
+  it('exposes a focusable target only when the Objective card provides its generated id', () => {
+    const matching = renderToStaticMarkup(<I18nProvider><FinalTaskGraphSources content={{ taskGraphSources: manifest }}
+      sessionId="session" finalItemId="item" lang="en"
+      navigationTargetId="related-task-sources-:R1:" /></I18nProvider>)
+    expect(matching).toContain('data-agent-related-task-sources="true" id="related-task-sources-:R1:" tabindex="-1"')
+
+    const withoutNavigation = renderToStaticMarkup(<I18nProvider><FinalTaskGraphSources content={{ taskGraphSources: manifest }}
+      sessionId="session" finalItemId="item" lang="en" /></I18nProvider>)
+    expect(withoutNavigation).not.toContain('id="related-task-sources-')
+    expect(withoutNavigation).not.toContain('tabindex="-1"')
+  })
+
   it('omits the panel when the manifest is absent or malformed', () => {
     for (const content of [{ text: 'Answer' }, { taskGraphSources: { ...manifest, taskId: 'private' } }]) {
       const html = renderToStaticMarkup(<I18nProvider><FinalTaskGraphSources

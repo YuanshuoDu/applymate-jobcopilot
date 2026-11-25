@@ -32,11 +32,12 @@ type RequestState = RequestIdentity & (Readonly<{ state: 'loading' | 'unavailabl
   state: 'ready'; detail: FinalTaskGraphSourceDetail
 }>)
 
-export function FinalTaskGraphSources({ content, sessionId, finalItemId, lang }: {
+export function FinalTaskGraphSources({ content, sessionId, finalItemId, lang, navigationTargetId }: {
   readonly content: unknown
   readonly sessionId: string
   readonly finalItemId: string
   readonly lang: Lang
+  readonly navigationTargetId?: string
 }) {
   const manifest = parseFinalTaskGraphSourceManifest(record(content)?.taskGraphSources)
   const disclosureId = React.useId()
@@ -58,7 +59,8 @@ export function FinalTaskGraphSources({ content, sessionId, finalItemId, lang }:
   const label = (key: TaskGraphPlanLabelKey) => taskGraphPlanLabel(lang, key)
   const selected = manifest.sources.find(source => source.sourceKey === selectedKey)
   const activeRequest = selected && requestMatchesIdentity(request, { sessionId, finalItemId, sourceKey: selected.sourceKey }) ? request : null
-  return <section aria-label={label('agent.taskGraph.sources.title')} data-agent-related-task-sources="true" style={sectionStyle}>
+  return <section aria-label={label('agent.taskGraph.sources.title')} data-agent-related-task-sources="true"
+    id={navigationTargetId} tabIndex={navigationTargetId ? -1 : undefined} style={sectionStyle}>
     <h3 style={headingStyle}>{label('agent.taskGraph.sources.title')}</h3>
     <p style={noteStyle}>{label('agent.taskGraph.sources.disclaimer')}</p>
     <ul style={listStyle}>{manifest.sources.map(source => {

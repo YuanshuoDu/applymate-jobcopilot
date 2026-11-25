@@ -69,6 +69,21 @@ describe('ObjectiveTailorFinalOutcomes', () => {
     expect(zh).toContain('职位 2: 需要修改')
   })
 
+  it('links localized source counts only to a matching same-revision source list', () => {
+    const v2 = { schemaVersion: schemaV2, graphRevision: 9, slots: sidecar.slots, sourceCounts: {
+      discoveredJobs: { knownCount: 3, coverage: 'complete' },
+      analyzedJobs: { knownCount: 2, coverage: 'partial' },
+    } }
+    const content = { objectiveTailorFinalOutcomes: v2, taskGraphSources: manifest }
+    const identity = { finalItemId: 'final-item', relatedTaskSourcesId: 'related-task-sources-:R1:' }
+    const en = renderToStaticMarkup(<ObjectiveTailorFinalOutcomes content={content} lang="en" {...identity} />)
+    const zh = renderToStaticMarkup(<ObjectiveTailorFinalOutcomes content={content} lang="zh" {...identity} />)
+    expect(en).toContain('<a href="#related-task-sources-:R1:">View related task evidence</a>')
+    expect(zh).toContain('查看相关任务证据')
+    const noTarget = renderToStaticMarkup(<ObjectiveTailorFinalOutcomes content={content} lang="en" finalItemId="final-item" />)
+    expect(noTarget).not.toContain('View related task evidence')
+  })
+
   it('distinguishes unavailable from not requested in both languages', () => {
     const v2 = { schemaVersion: schemaV2, graphRevision: 5, slots: sidecar.slots, sourceCounts: {
       discoveredJobs: { knownCount: null, coverage: 'unavailable' },
