@@ -22,7 +22,9 @@ import {
   OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_SCHEMA,
   OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_TYPE,
   OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_SCHEMA,
+  buildObjectiveReviewedFillHandoffOutboxData,
   parseObjectiveApplicationSubmissionManifestEvent,
+  parseObjectiveReviewedFillHandoffOutboxRow,
 } from "@jobcopilot/shared"
 import { SignJWT } from "jose"
 import { NextRequest } from "next/server"
@@ -449,11 +451,19 @@ type FixtureStats = {
   objectiveMaterialExactCount: number
   objectiveSubmitReceipts: Array<{ slot: number; attempts: number; validAttempts: number; malformedAttempts: number; last: unknown }>
   objectiveGetCounts: number[]
+  objectiveBrowserEvents: ObjectiveBrowserEventStats[]
   reviewedGetCount: number
   blocked: string[]
   requests: string[]
   browserTrace: string[]
   browserProgress: Array<{ event: string; elapsedMs: number; length?: number }>
+}
+type ObjectiveBrowserEventStats = {
+  buttonClicks: number
+  formSubmits: number
+  invalidResume: number
+  invalidCoverLetter: number
+  invalidOther: number
 }
 type ReviewedFillBridgeAttempt = {
   outboxId: string | null
@@ -870,6 +880,63 @@ describe("legacy final gate bounded diagnostics", () => {
   })
 })
 
+describe("Objective fill wave outbox gate", () => {
+  const userId = "wave-test-user"
+  const sessionId = "wave-test-session"
+  const reviewTurnId = "wave-test-review-turn"
+  const applicationTaskId = "wave-test-task"
+  const setId = `objective-review-${"a".repeat(40)}`
+  const approvalId = `objective-review:${setId}:1`
+
+  function gate(): ObjectiveFillWaveGate {
+    return {
+      userId, sessionId, reviewTurnId,
+      approvalIds: new Set([approvalId]),
+      applicationTaskIdByApprovalId: new Map([[approvalId, applicationTaskId]]),
+      releasedApprovalIds: new Set(), outboxIdsByApprovalId: new Map(),
+    }
+  }
+
+  function row(overrides: { userId?: string; approvalId?: string } = {}) {
+    const data = buildObjectiveReviewedFillHandoffOutboxData({
+      userId: overrides.userId ?? userId, sessionId, applicationTaskId,
+      approvalId: overrides.approvalId ?? approvalId, predecessorTurnId: reviewTurnId,
+    })
+    if (!data) throw new Error("objective_fill_wave_test_handoff_invalid")
+    return { id: "outbox-wave-1", ...data, publishedAt: new Date(), attemptCount: 1 }
+  }
+
+  it("accepts the production handoff payload after projecting exact outbox fields", () => {
+    expect(objectiveFillWaveApprovalForOutbox(gate(), row())).toBe(approvalId)
+  })
+
+  it.each([
+    ["foreign owner", { userId: "wave-foreign-user" }],
+    ["unlisted approval", { approvalId: `objective-review:${setId}:2` }],
+  ] as const)("rejects a %s", (_label, overrides) => {
+    expect(objectiveFillWaveApprovalForOutbox(gate(), row(overrides))).toBeUndefined()
+  })
+})
+
+describe("Objective browser event diagnostic window", () => {
+  const baseline: ObjectiveBrowserEventStats = {
+    buttonClicks: 2, formSubmits: 1, invalidResume: 0, invalidCoverLetter: 1, invalidOther: 0,
+  }
+
+  it("returns only bounded fixed counters for the selected slot after the baseline", () => {
+    expect(objectiveBrowserEventDelta({ buttonClicks: 3, formSubmits: 2, invalidResume: 1,
+      invalidCoverLetter: 1, invalidOther: 2 }, baseline)).toEqual({
+      buttonClicks: 1, formSubmits: 1, invalidResume: 1, invalidCoverLetter: 0, invalidOther: 2,
+    })
+  })
+
+  it("fails closed on extra fields, malformed counts, or a reset counter", () => {
+    expect(objectiveBrowserEventDelta({ ...baseline, privateValue: "hidden" }, baseline)).toBeNull()
+    expect(objectiveBrowserEventDelta({ ...baseline, invalidOther: -1 }, baseline)).toBeNull()
+    expect(objectiveBrowserEventDelta({ ...baseline, buttonClicks: 1 }, baseline)).toBeNull()
+  })
+})
+
 async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Promise<string> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
@@ -1283,6 +1350,29 @@ function jsonRecord(value: unknown): Record<string, unknown> | null {
     : null
 }
 
+const OBJECTIVE_BROWSER_EVENT_KEYS = [
+  "buttonClicks", "formSubmits", "invalidResume", "invalidCoverLetter", "invalidOther",
+] as const
+
+function objectiveBrowserEventDelta(current: unknown, baseline: unknown): ObjectiveBrowserEventStats | null {
+  const currentRecord = jsonRecord(current), baselineRecord = jsonRecord(baseline)
+  const exactCounters = (value: Record<string, unknown>) =>
+    Object.keys(value).sort().join(",") === [...OBJECTIVE_BROWSER_EVENT_KEYS].sort().join(",")
+  if (!currentRecord || !baselineRecord || !exactCounters(currentRecord) || !exactCounters(baselineRecord)) return null
+  const delta = (key: keyof ObjectiveBrowserEventStats): number | null => {
+    const after = currentRecord[key], before = baselineRecord[key]
+    if (!Number.isSafeInteger(after) || Number(after) < 0 || !Number.isSafeInteger(before)
+      || Number(before) < 0 || Number(after) < Number(before)) return null
+    return Math.min(8, Number(after) - Number(before))
+  }
+  const buttonClicks = delta("buttonClicks"), formSubmits = delta("formSubmits")
+  const invalidResume = delta("invalidResume"), invalidCoverLetter = delta("invalidCoverLetter")
+  const invalidOther = delta("invalidOther")
+  if ([buttonClicks, formSubmits, invalidResume, invalidCoverLetter, invalidOther].some(value => value === null)) return null
+  return { buttonClicks: buttonClicks!, formSubmits: formSubmits!, invalidResume: invalidResume!,
+    invalidCoverLetter: invalidCoverLetter!, invalidOther: invalidOther! }
+}
+
 async function reviewedSourceStructuredResult(taskStatus: string, value: unknown, role: "writer" | "reviewer") {
   const { projectTaskGraphResult } = await import("../../../../../../worker/src/runtime/subagents/task-graph-result-projection")
   const projection = projectTaskGraphResult(role, taskStatus, value)
@@ -1449,12 +1539,15 @@ function objectiveFillWaveApprovalForOutbox(
   gate: ObjectiveFillWaveGate,
   outbox: { id: string; topic: string; aggregateId: string; idempotencyKey: string; payload: unknown } | null,
 ): string | undefined {
-  if (!outbox || outbox.topic !== "agent.objective-reviewed-fill.dispatch" || outbox.aggregateId !== gate.sessionId) return undefined
-  const payload = jsonRecord(outbox.payload), approvalId = jsonString(payload, "approvalId")
-  if (!payload || !approvalId || !gate.approvalIds.has(approvalId)
-    || Object.keys(payload).sort().join(",") !== "approvalId,applicationTaskId,predecessorTurnId,schemaVersion,sessionId,userId"
-    || outbox.idempotencyKey !== `agent-objective-reviewed-fill:${approvalId}`
-    || payload.schemaVersion !== "agent-harness.v2.objective-reviewed-fill-handoff.v1"
+  if (!outbox) return undefined
+  const parsed = parseObjectiveReviewedFillHandoffOutboxRow({
+    id: outbox.id, topic: outbox.topic, aggregateId: outbox.aggregateId,
+    idempotencyKey: outbox.idempotencyKey, payload: outbox.payload,
+  })
+  if (!parsed) return undefined
+  const payload = parsed.payload
+  const approvalId = payload.approvalId
+  if (parsed.aggregateId !== gate.sessionId || !gate.approvalIds.has(approvalId)
     || payload.userId !== gate.userId || payload.sessionId !== gate.sessionId
     || payload.applicationTaskId !== gate.applicationTaskIdByApprovalId.get(approvalId)
     || payload.predecessorTurnId !== gate.reviewTurnId) return undefined
@@ -1768,6 +1861,7 @@ async function waitForReviewedApplicationTask(jobId: string, predicate: (task: A
 async function objectiveSubmitTimeoutSnapshot(input: {
   sessionId: string; jobId: string; applicationTaskId: string; fillTurnId: string; approvalId: string
   constraintHash: string; workerTaskId: string; slotOrdinal: number; routeGetBaseline: number
+  browserEventBaseline: ObjectiveBrowserEventStats | undefined
 }) {
   try {
     const [task, approval, starts, attempts, stats] = await Promise.all([
@@ -1804,6 +1898,8 @@ async function objectiveSubmitTimeoutSnapshot(input: {
         errorCategory: taskErrorCategory } : null,
       selectedRouteGetDelta: Number.isSafeInteger(observedGets)
         ? Math.min(1000, Math.max(0, Number(observedGets) - input.routeGetBaseline)) : null,
+      objectiveBrowserEvents: objectiveBrowserEventDelta(
+        stats?.objectiveBrowserEvents?.[input.slotOrdinal - 1], input.browserEventBaseline),
       post: receipt ? { attempted: Math.min(1000, Math.max(0, receipt.attempts)),
         valid: Math.min(1000, Math.max(0, receipt.validAttempts)), rejected: Math.min(1000, Math.max(0, receipt.malformedAttempts)) } : null,
       receiptOutcome: { present: approval !== null,
@@ -3590,7 +3686,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         const diagnostic = await objectiveSubmitTimeoutSnapshot({ sessionId, jobId: selectedJobId,
           applicationTaskId: applicationTaskId!, fillTurnId, approvalId: submitApproval.id,
           constraintHash: submitConstraintHash, workerTaskId: submitWorkerTaskId, slotOrdinal: selectedFixtureOrdinal,
-          routeGetBaseline: beforeFinalApproval.objectiveGetCounts[selectedFixtureOrdinal - 1] ?? 0 })
+          routeGetBaseline: beforeFinalApproval.objectiveGetCounts[selectedFixtureOrdinal - 1] ?? 0,
+          browserEventBaseline: beforeFinalApproval.objectiveBrowserEvents[selectedFixtureOrdinal - 1] })
         throw new Error(`Objective final submit timeout snapshot ${JSON.stringify(diagnostic)}`)
       }
       expect(submittedTask).toMatchObject({ id: applicationTaskId, userId: ids.user, sessionId,
