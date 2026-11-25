@@ -97,8 +97,8 @@ export async function readObjectiveReviewedApplicationFillSource(
     const evidence = await readCompletedObjectiveTailorSourceEvidence(client, { userId: input.userId, sessionId: input.sessionId,
       reviewTurnId: intent.reviewTurnId, reviewTurnMode: "completed", sourceTurnId: intent.sourceTurnId,
       rootTaskId: proof.source.rootTaskId, graphItemId: proof.source.graphItemId, graphRevision: proof.source.graphRevision,
-      selectedSlotIds: [`tailor-${intent.slotOrdinal}`] })
-    const outcome = evidence?.outcomes[0]
+      selectedSlotIds: selection.slotOrdinals.map(ordinal => `tailor-${ordinal}`), evidenceSlotId: `tailor-${intent.slotOrdinal}` })
+    const outcome = evidence?.outcomes.find(value => value.slotId === `tailor-${intent.slotOrdinal}`)
     if (!evidence || evidence.sourceTurnId !== intent.sourceTurnId || evidence.reviewTurnId !== intent.reviewTurnId
       || evidence.sourceRootTaskId !== proof.source.rootTaskId || evidence.graphItemId !== proof.source.graphItemId
       || evidence.graphRevision !== proof.source.graphRevision || evidence.finalItemId !== proof.source.finalItemId
